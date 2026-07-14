@@ -69,7 +69,7 @@ import {
     buildYieldReport,
 } from './scheduler-diagnostics';
 import { PF_HALT_TARGET } from '../bootloader';
-import { grantSrwOnWake } from '../../modules/kernel32/srw-lock';
+import { grantSrwOnWake, ensureSrwWaitEvent } from '../../modules/kernel32/srw-lock';
 import type { WinMM } from '../../modules/winmm';
 
 // Max virtual-time advance per idle pollTimeouts() pump. Bounds the jump when the
@@ -1350,7 +1350,7 @@ export class Scheduler {
         this.traceAsyncRestore(source, cpu, detail);
         this.dumpSchedulerAsyncState(source, cpu, kind, detail, 'error');
 
-        if (this.isMainThreadId(thread.id)) {
+        if (this.isMainThread(thread.id)) {
             Logger.error(LogCategory.THREAD,
                 `performSwitch: cannot save MAIN T${thread.id} at EIP=${hx(eip)} ESP=${hx(esp)}; fatal guard`);
             this.reportFatalGuard(0x4100, eip, thread.id);
@@ -1644,6 +1644,23 @@ export class Scheduler {
     exitThread(exitCode: number): void {
         const thread = this.getCurrentThread();
         if (!thread) return;
+        this.terminateThread(thread.id, exitCode);
+        this.requestSwitch();
+    }
+
+    /**
+     * Unhandled CPU exception (#GP/#UD) on a worker thread: terminate ONLY the
+     * faulting thread (exit code = NT status) and reschedule. The dispatcher has
+     * already redirected the fault frame's IRET to the spin loop, so the dead
+     * thread never executes guest code again; performSwitch skips a TERMINATED
+     * current and picks the next runnable at the next boundary.
+     */
+    terminateCurrentThreadForFault(exitCode: number, detail: string): void {
+        const thread = this.getCurrentThread();
+        if (!thread || thread.state === ThreadState.TERMINATED) return;
+        Logger.error(LogCategory.THREAD,
+            `terminateCurrentThreadForFault: T${thread.id} ${detail} — ` +
+            `terminating with exit code 0x${(exitCode >>> 0).toString(16)}`);
         this.terminateThread(thread.id, exitCode);
         this.requestSwitch();
     }
@@ -2391,13 +2408,12 @@ export class Scheduler {
         );
 
         if (!this.hasOtherRunnableThreads(thread.id)) {
-            const mustPark = timeoutMs === INFINITE || this.hasWaitingThreadsWithPendingTimeouts(thread.id);
-            if (mustPark) {
-                this.requestYieldToHost(this.computeYieldMs(timeoutMs), "sleepCV");
-                return WAIT_BLOCKED_NO_SWITCH;
-            }
-            this.requestYieldToHost(Math.min(timeoutMs, 50), "sleepCVTO");
-            return 0;
+            // The thread is already parked (blockThread above) — the guest must NOT
+            // keep executing past the wait, or the eventual wake would rewind it onto
+            // a stack it has since overwritten. Always report the park; the timeout
+            // wheel delivers the timed-out wake.
+            this.requestYieldToHost(this.computeYieldMs(timeoutMs), "sleepCV");
+            return WAIT_BLOCKED_NO_SWITCH;
         }
 
         this.requestSwitch();
@@ -2461,13 +2477,10 @@ export class Scheduler {
         );
 
         if (!this.hasOtherRunnableThreads(thread.id)) {
-            const mustPark = timeoutMs === INFINITE || this.hasWaitingThreadsWithPendingTimeouts(thread.id);
-            if (mustPark) {
-                this.requestYieldToHost(this.computeYieldMs(timeoutMs), "sleepCVcs");
-                return WAIT_BLOCKED_NO_SWITCH;
-            }
-            this.requestYieldToHost(Math.min(timeoutMs, 50), "sleepCVcsTO");
-            return 0;
+            // Same park contract as the SRW variant: the thread is already blocked,
+            // so the guest must not run past the wait.
+            this.requestYieldToHost(this.computeYieldMs(timeoutMs), "sleepCVcs");
+            return WAIT_BLOCKED_NO_SWITCH;
         }
 
         this.requestSwitch();
@@ -3527,7 +3540,7 @@ export class Scheduler {
             `consume T${threadId}/g${expected}->g${thread.asyncParkGeneration >>> 0}`);
     }
 
-    private isMainThreadId(threadId: number): boolean {
+    isMainThread(threadId: number): boolean {
         return threadId === this.mainThreadId || (this.mainThreadId === 0 && threadId === 1);
     }
 
@@ -3596,7 +3609,7 @@ export class Scheduler {
         if (reason.startsWith('stale-generation') || reason.startsWith('terminated-thread')) return;
         if (thread.waitInfo?.reason !== WaitReason.ASYNC_THUNK && thread.state !== ThreadState.RUNNING) return;
 
-        if (this.isMainThreadId(thread.id)) {
+        if (this.isMainThread(thread.id)) {
             this.reportFatalGuard(0x4101, thread.id, thread.id);
             return;
         }
@@ -3686,6 +3699,27 @@ export class Scheduler {
         }
     }
 
+    /** A woken thread whose SRW lock is contended stays WAITING, re-registered
+     *  on the lock's wait event; the eventual ReleaseSRWLock* wake retries the
+     *  grant. `pendingEax` preserves a CV BOOL result across the second wait. */
+    private requeueSrwWait(thread: Thread, lockPtr: number, exclusive: boolean, pendingEax?: number): void {
+        this.waitEngine.unregisterWait(thread);
+        const waitEvent = ensureSrwWaitEvent(lockPtr, this);
+        thread.waitInfo = {
+            reason: WaitReason.SRW_LOCK,
+            handles: [waitEvent],
+            waitAll: false,
+            timeoutTimerId: 0,
+            alertable: false,
+            csAddress: lockPtr,
+            srwWantExclusive: exclusive,
+            pendingEax: pendingEax ?? thread.waitInfo?.pendingEax,
+        };
+        this.waitEngine.registerWait(thread);
+        Logger.verbose(LogCategory.THREAD,
+            `wakeThread: SRW contended on wake — T${thread.id} requeued on lock=0x${lockPtr.toString(16)} (exclusive=${exclusive})`);
+    }
+
     private wakeThread(thread: Thread, result: number): void {
         if (!thread.context) {
             Logger.error(LogCategory.THREAD, `wakeThread: T${thread.id} has no context`);
@@ -3709,9 +3743,10 @@ export class Scheduler {
             const lockPtr = thread.waitInfo.csAddress;
             const exclusive = thread.waitInfo.srwWantExclusive;
             if (!grantSrwOnWake(lockPtr, thread.id, exclusive)) {
-                Logger.warn(LogCategory.THREAD,
-                    `wakeThread: SRW grant failed lock=0x${lockPtr.toString(16)} T${thread.id} exclusive=${exclusive}`);
+                this.requeueSrwWait(thread, lockPtr, exclusive);
+                return;
             }
+            if (thread.waitInfo.pendingEax !== undefined) result = thread.waitInfo.pendingEax;
         } else if (thread.waitInfo?.cvReacquireCs && thread.waitInfo?.csAddress) {
             // SleepConditionVariableCS wake: re-take the critical section (uncontended fast
             // path) and return TRUE on signal / FALSE on timeout.
@@ -3725,8 +3760,10 @@ export class Scheduler {
             const lockPtr = thread.waitInfo.csAddress;
             const exclusive = thread.waitInfo.srwWantExclusive;
             if (!grantSrwOnWake(lockPtr, thread.id, exclusive)) {
-                Logger.warn(LogCategory.THREAD,
-                    `wakeThread: CV-SRW re-acquire failed lock=0x${lockPtr.toString(16)} T${thread.id} exclusive=${exclusive}`);
+                // SleepConditionVariableSRW returns only WITH the lock re-taken:
+                // morph the CV wake into a contended SRW acquire, carrying the BOOL.
+                this.requeueSrwWait(thread, lockPtr, exclusive, result === WAIT_OBJECT_0 ? 1 : 0);
+                return;
             }
             result = result === WAIT_OBJECT_0 ? 1 : 0;
         }

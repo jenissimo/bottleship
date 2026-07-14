@@ -1322,13 +1322,15 @@ const syncModule = (() => {
         const sched = getScheduler();
         const tid = sched.getCurrentThreadId();
 
-        if (sharedHeld) releaseSrwShared(lockPtr, tid);
-        else releaseSrwExclusive(lockPtr, tid);
+        // Same wake contract as ReleaseSRWLock*: threads queued on the lock must
+        // be signalled when this wait releases it, or they sleep on a free lock.
+        const srwWake = sharedHeld ? releaseSrwShared(lockPtr, tid) : releaseSrwExclusive(lockPtr, tid);
+        releaseSrwAndWake(lockPtr, srwWake);
 
         const cvEvent = ensureSrwWaitEvent(cvPtr, sched);
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         const returnAddr = view.getUint32(ctx.esp, true);
-        const postReturnEsp = ctx.esp + 16;
+        const postReturnEsp = ctx.esp + 20;  // 4 (ret addr) + 16 (4 args stdcall)
         const waitResult = sched.sleepConditionVariableSrwWithContext(
             cvEvent,
             lockPtr,

@@ -117,6 +117,9 @@ export interface WaitInfo {
     /** SleepConditionVariableCS: on wake, re-acquire the critical section at csAddress
      *  (instead of the SRW lock) and map WAIT_OBJECT_0→1, WAIT_TIMEOUT→0. */
     cvReacquireCs?: boolean;
+    /** EAX to deliver on the FINAL wake when a CV wake was requeued as a contended
+     *  SRW acquire (the CV BOOL result must survive the second wait). */
+    pendingEax?: number;
 }
 
 // ─── APC ────────────────────────────────────────────────────────────────────────
