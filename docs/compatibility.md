@@ -32,6 +32,8 @@ playable). Your mileage will vary with the exact build/version you own.
 | Tomb Raider II | playable | ✓ |
 | The Elder Scrolls III: Morrowind | playable | ✓ |
 | Nuclear Titbit (Ядерный Титбит) | playable | |
+| Airfix Dogfighter (demo) | playable | |
+| The Blackwell Legacy | playable | ✓ |
 
 \* retail has an intermittent mode-switch hiccup; the demo does not.
 
