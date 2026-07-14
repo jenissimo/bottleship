@@ -465,7 +465,7 @@ const deviceMethodSpecs = [
     { name: "GetFrontBufferData", args: 3 },
     { name: "StretchRect", args: 6 },
     { name: "ColorFill", args: 4 },
-    { name: "CreateOffscreenPlainSurface", args: 8 },
+    { name: "CreateOffscreenPlainSurface", args: 7 },
     { name: "SetRenderTarget", args: 3 },
     { name: "GetRenderTarget", args: 3 },
     { name: "SetDepthStencilSurface", args: 2 },

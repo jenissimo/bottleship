@@ -40,8 +40,15 @@ const TAIL_START = HEADER_FLOATS + LIGHT_FLOATS * FFP_MAX_LIGHTS; // 292
 const OFF_WORLD = TAIL_START;      // mat4x4 — WORLD only (D3DTS_WORLD), for world-space clipping
 const OFF_CLIP_PLANES = OFF_WORLD + 16; // 308: array<vec4, 6> = 24 floats (raw plane equations)
 const CLIP_PLANE_COUNT = 6;
-export const FFP_UNIFORM_FLOATS = OFF_CLIP_PLANES + CLIP_PLANE_COUNT * 4; // 332
-export const FFP_UNIFORM_BYTES = FFP_UNIFORM_FLOATS * 4; // 1328
+// Texture stage 0 ops/args + TEXTUREFACTOR (D3DTSS_* / D3DRS_TEXTUREFACTOR).
+const OFF_STAGE0A = OFF_CLIP_PLANES + CLIP_PLANE_COUNT * 4; // 332: colorOp, colorArg1, colorArg2, alphaOp
+const OFF_STAGE0B = OFF_STAGE0A + 4;                        // 336: alphaArg1, alphaArg2, texOpaqueAlpha, 0
+const OFF_TFACTOR = OFF_STAGE0B + 4;                        // 340: TEXTUREFACTOR rgba
+/** stage0b float index — the per-draw writer sets .z (sampled texture is an
+ *  alpha-less D3D format → shader must read alpha as 1.0, like real D3D9). */
+export const FFP_OFF_STAGE0B = OFF_STAGE0B;
+export const FFP_UNIFORM_FLOATS = OFF_TFACTOR + 4; // 344
+export const FFP_UNIFORM_BYTES = FFP_UNIFORM_FLOATS * 4; // 1376
 
 const OFF_VIEWPORT = 0;        // vec4: w, h, 0, 0
 const OFF_MVP = 4;             // mat4x4
@@ -123,6 +130,11 @@ export interface FfpUniformParams {
     hasNormal: boolean;
     /** Enabled lights, in ascending index order; only the first FFP_MAX_LIGHTS are used. */
     lights: FfpLightInput[];
+    /** Texture stage 0 combiner (D3DTSS_COLOROP/COLORARG1/COLORARG2/ALPHAOP/ALPHAARG1/ALPHAARG2).
+     *  The caller resolves the D3D stage-0 defaults. */
+    stage0: { colorOp: number; colorArg1: number; colorArg2: number; alphaOp: number; alphaArg1: number; alphaArg2: number };
+    /** D3DRS_TEXTUREFACTOR, resolved to rgba. */
+    tfactor: FfpColor;
 }
 
 /** Transform a world-space point by a D3D row-major matrix (row-vector × matrix). */
@@ -187,6 +199,16 @@ export function packFfpUniforms(out: Float32Array, p: FfpUniformParams): void {
     // shader reads them only when clipPlaneEnable != 0, so an all-zero default stays inert.
     out.set(p.world.subarray(0, 16), OFF_WORLD);
     out.set(p.clipPlanes.subarray(0, CLIP_PLANE_COUNT * 4), OFF_CLIP_PLANES);
+
+    // Texture stage 0 combiner + TEXTUREFACTOR.
+    const s0 = p.stage0;
+    out[OFF_STAGE0A] = s0.colorOp;
+    out[OFF_STAGE0A + 1] = s0.colorArg1;
+    out[OFF_STAGE0A + 2] = s0.colorArg2;
+    out[OFF_STAGE0A + 3] = s0.alphaOp;
+    out[OFF_STAGE0B] = s0.alphaArg1;
+    out[OFF_STAGE0B + 1] = s0.alphaArg2;
+    writeColor(out, OFF_TFACTOR, p.tfactor);
 }
 
 const IDENTITY4 = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
@@ -293,6 +315,9 @@ struct Uniforms {
     // Tail block (appended after the light array so light offsets never shift):
     world: mat4x4<f32>,                 // WORLD only — FFP clip planes evaluate in world space
     clipPlanes: array<vec4<f32>, ${CLIP_PLANE_COUNT}>, // raw world-space plane equations
+    stage0a: vec4<f32>,    // colorOp, colorArg1, colorArg2, alphaOp
+    stage0b: vec4<f32>,    // alphaArg1, alphaArg2, texOpaqueAlpha, 0
+    tfactor: vec4<f32>,    // D3DRS_TEXTUREFACTOR rgba
 }
 `;
 

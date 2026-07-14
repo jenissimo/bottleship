@@ -14,12 +14,13 @@ import { D3D9Device } from '../../backends/webgpu/d3d9/d3d9-device';
 import { WebGPUBackend } from '../../backends/webgpu/webgpu-backend';
 import { writeDeviceCaps9 } from './caps';
 import { getVTables, devices, createComObject, resourceToDevice, deviceToD3D9 } from './shared-state';
-import { deviceBoundDepthStencil, surfaceMeta } from './resource-registry';
+import { deviceBoundDepthStencil, deviceBoundRenderTarget, surfaceMeta } from './resource-registry';
 
 const D3DFMT_X8R8G8B8 = 22;
 const D3DFMT_R5G6B5 = 23;
 
 const D3DRTYPE_SURFACE = 1;
+const D3DUSAGE_RENDERTARGET = 0x1;
 const D3DUSAGE_DEPTHSTENCIL = 0x2;
 const D3DPOOL_DEFAULT = 0;
 const D3DFMT_D24S8 = 75;
@@ -32,6 +33,23 @@ const PP_AUTO_DEPTHSTENCIL_FORMAT = 40;
 
 function formatForBpp(bpp: number): number {
     return bpp <= 16 ? D3DFMT_R5G6B5 : D3DFMT_X8R8G8B8;
+}
+
+/** Register real backbuffer geometry for a fabricated implicit-backbuffer surface so
+ *  GetDesc reports the true mode instead of a fallback. Deliberately NO texturePtr —
+ *  SetRenderTarget resolves texturePtr 0 to the swap-chain. */
+function registerImplicitBackbufferMeta(surfacePtr: number): void {
+    const cfg = EmulatorConfig.getInstance().screenResolution;
+    surfaceMeta.set(surfacePtr, {
+        format: formatForBpp(cfg.bpp),
+        type: D3DRTYPE_SURFACE,
+        usage: D3DUSAGE_RENDERTARGET,
+        pool: D3DPOOL_DEFAULT,
+        multiSampleType: 0,
+        multiSampleQuality: 0,
+        width: cfg.width,
+        height: cfg.height,
+    });
 }
 
 /**
@@ -255,17 +273,31 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         const face = meta?.face ?? -1;
         device.noteRtResolve(surfacePtr, !!meta, texturePtr);
         Logger.verbose(LogCategory.D3D9, `SetRenderTarget(index=${args[1]}, surface=0x${surfacePtr.toString(16)} -> tex=0x${texturePtr.toString(16)} face=${face})`);
+        if ((args[1] >>> 0) === 0) deviceBoundRenderTarget.set(args[0] >>> 0, surfacePtr);
         device.setRenderTarget(args[1] >>> 0, texturePtr >>> 0, face);
         return D3D_OK;
     };
 
     exports['IDirect3DDevice9_GetRenderTarget'] = (_ctx, mem, args) => {
-        const device = devices.get(args[0]);
+        const devicePtr = args[0] >>> 0;
+        const device = devices.get(devicePtr);
         const ppRenderTarget = args[2];
         if (!device || !ppRenderTarget) return D3DERR_INVALIDCALL;
-        // Return NULL: games that save/restore the RT pass this back to SetRenderTarget, where
-        // texturePtr 0 correctly restores the swap-chain backbuffer.
-        return Mem.writeUint32(ppRenderTarget, 0) ? D3D_OK : D3DERR_INVALIDCALL;
+        // Return the surface currently bound as RT0. Games save this and pass it back
+        // to SetRenderTarget (a NULL here becomes a NULL-vtable call in the guest).
+        // With no explicit RT bound, hand out a stable implicit-backbuffer surface
+        // object (meta carries real geometry but no texturePtr → SetRenderTarget
+        // still resolves it to the swap-chain).
+        let rt = deviceBoundRenderTarget.get(devicePtr) ?? 0;
+        if (!rt) {
+            const vtableAddr = getVTables()['IDirect3DSurface9']?.address;
+            if (!vtableAddr) return D3DERR_INVALIDCALL;
+            rt = createComObject(vtableAddr);
+            resourceToDevice.set(rt, device);
+            registerImplicitBackbufferMeta(rt);
+            deviceBoundRenderTarget.set(devicePtr, rt);
+        }
+        return Mem.writeUint32(ppRenderTarget, rt) ? D3D_OK : D3DERR_INVALIDCALL;
     };
 
     exports['IDirect3DDevice9_BeginScene'] = (ctx, mem, args) => {
@@ -321,6 +353,73 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         // Clear expects ARGB color as single number
         device.clear(Flags, Color, Z, Stencil);
         return D3D_OK;
+    };
+
+    // ColorFill(pSurface, pRect, color). The common use (AGS et al.) is a full
+    // fill of the backbuffer between scenes — expressed as a color-only Clear.
+    // The clear applies at render-pass START, so it is only safe while nothing has
+    // been recorded this frame — otherwise it would reorder before pending draws.
+    // Partial-rect / offscreen-surface fills need a scissored fill pipeline the
+    // D3D9 backend doesn't have yet; dropping the fill beats painting wrong pixels.
+    let colorFillWarned = false;
+    exports['IDirect3DDevice9_ColorFill'] = (_ctx, _mem, args) => {
+        const device = devices.get(args[0]);
+        const pSurface = args[1] >>> 0;
+        const pRect = args[2] >>> 0;
+        const color = args[3] >>> 0;
+        if (!device || !pSurface) return D3DERR_INVALIDCALL;
+
+        const meta = surfaceMeta.get(pSurface);
+        const isBackbuffer = !meta || !(meta.texturePtr ?? 0);
+        let fullRect = !pRect;
+        if (pRect) {
+            const left = Mem.readInt32(pRect) ?? 0;
+            const top = Mem.readInt32(pRect + 4) ?? 0;
+            const right = Mem.readInt32(pRect + 8) ?? 0;
+            const bottom = Mem.readInt32(pRect + 12) ?? 0;
+            const bb = EmulatorConfig.getInstance().screenResolution;
+            const width = meta?.width ?? bb.width;
+            const height = meta?.height ?? bb.height;
+            fullRect = left <= 0 && top <= 0 && right >= width && bottom >= height;
+        }
+
+        if (isBackbuffer && fullRect && !device.hasPendingWork()) {
+            const D3DCLEAR_TARGET = 1;
+            device.clear(D3DCLEAR_TARGET, color, 1, 0);
+            return D3D_OK;
+        }
+        if (!colorFillWarned) {
+            colorFillWarned = true;
+            Logger.warn(LogCategory.D3D9,
+                `ColorFill: unsupported target (surface=0x${pSurface.toString(16)}, backbuffer=${isBackbuffer}, fullRect=${fullRect}, pendingWork=${device.hasPendingWork()}) — fill dropped`);
+        }
+        return D3D_OK;
+    };
+
+    exports['IDirect3DDevice9_SetScissorRect'] = (_ctx, _mem, args) => {
+        const device = devices.get(args[0]);
+        const pRect = args[1] >>> 0;
+        if (!device || !pRect) return D3DERR_INVALIDCALL;
+        device.setScissorRect(
+            Mem.readInt32(pRect) ?? 0,
+            Mem.readInt32(pRect + 4) ?? 0,
+            Mem.readInt32(pRect + 8) ?? 0,
+            Mem.readInt32(pRect + 12) ?? 0,
+        );
+        return D3D_OK;
+    };
+
+    exports['IDirect3DDevice9_GetScissorRect'] = (_ctx, _mem, args) => {
+        const device = devices.get(args[0]);
+        const pRect = args[1] >>> 0;
+        if (!device || !pRect) return D3DERR_INVALIDCALL;
+        const r = device.getScissorRect();
+        const ok =
+            Mem.writeUint32(pRect, r.left >>> 0) &&
+            Mem.writeUint32(pRect + 4, r.top >>> 0) &&
+            Mem.writeUint32(pRect + 8, r.right >>> 0) &&
+            Mem.writeUint32(pRect + 12, r.bottom >>> 0);
+        return ok ? D3D_OK : D3DERR_INVALIDCALL;
     };
 
     exports['IDirect3DDevice9_Present'] = (ctx, mem, args) => {
@@ -474,9 +573,10 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         }
 
         const surfacePtr = createComObject(vtableAddr);
-        
+
         // Register surface with device for method calls
         resourceToDevice.set(surfacePtr, device);
+        registerImplicitBackbufferMeta(surfacePtr);
 
         if (ppBackBuffer) {
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);

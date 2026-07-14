@@ -334,6 +334,70 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         return Mem.writeUint32(ppSurface, surfacePtr) ? D3D_OK : D3DERR_INVALIDCALL;
     };
 
+    // Lockable CPU-side surface backed by a hidden 1-level texture so the existing
+    // Surface9 LockRect/UnlockRect/GetDesc paths (which route via meta.texturePtr)
+    // work unchanged. Used by games for GetRenderTargetData readback staging.
+    exports['IDirect3DDevice9_CreateOffscreenPlainSurface'] = (_ctx, _mem, args) => {
+        const pDevice = args[0];
+        const width = Math.max(1, args[1] >>> 0);
+        const height = Math.max(1, args[2] >>> 0);
+        const format = args[3] >>> 0;
+        const pool = args[4] >>> 0;
+        const ppSurface = args[5];
+
+        if (!ppSurface) return D3DERR_INVALIDCALL;
+        initReturnPtr(ppSurface);
+        if (format === D3DFMT_UNKNOWN || isDxExclusiveFormat(format, 9)) return D3DERR_INVALIDCALL;
+
+        const device = devices.get(pDevice);
+        if (!device) return D3DERR_INVALIDCALL;
+
+        const vtables = getVTables();
+        const texVt = vtables['IDirect3DTexture9']?.address;
+        const surfVt = vtables['IDirect3DSurface9']?.address;
+        if (!texVt || !surfVt) return D3DERR_INVALIDCALL;
+
+        const texPtr = createComObject(texVt);
+        const guestPtr = device.createTexture(texPtr, width, height, 1, format, 0);
+        if (guestPtr === 0) return D3DERR_INVALIDCALL;
+        resourceToDevice.set(texPtr, device);
+        textureMeta.set(texPtr, { width, height, levels: 1, usage: 0, pool, format });
+
+        const surfacePtr = createComObject(surfVt);
+        resourceToDevice.set(surfacePtr, device);
+        surfaceMeta.set(surfacePtr, {
+            format,
+            type: D3DRTYPE_SURFACE,
+            usage: 0,
+            pool,
+            multiSampleType: D3DMULTISAMPLE_NONE,
+            multiSampleQuality: 0,
+            width,
+            height,
+            texturePtr: texPtr,
+            level: 0,
+        });
+
+        Logger.log(LogCategory.D3D9,
+            `CreateOffscreenPlainSurface(${width}x${height}, Format=${format}, Pool=${pool}) -> 0x${surfacePtr.toString(16)}`);
+        return Mem.writeUint32(ppSurface, surfacePtr) ? D3D_OK : D3DERR_INVALIDCALL;
+    };
+
+    // GetRenderTargetData(pRenderTarget, pDestSurface): GPU→CPU readback into the
+    // destination surface's guest store. Async (WebGPU map) — the dispatcher awaits.
+    exports['IDirect3DDevice9_GetRenderTargetData'] = (_ctx, _mem, args) => {
+        const pDevice = args[0];
+        const pRenderTarget = args[1] >>> 0;
+        const pDestSurface = args[2] >>> 0;
+
+        const device = devices.get(pDevice);
+        const srcMeta = surfaceMeta.get(pRenderTarget);
+        const dstMeta = surfaceMeta.get(pDestSurface);
+        if (!device || !srcMeta?.texturePtr || !dstMeta?.texturePtr) return D3DERR_INVALIDCALL;
+
+        return device.readTextureIntoGuestTexture(srcMeta.texturePtr, dstMeta.texturePtr);
+    };
+
     exports['IDirect3DDevice9_CreateQuery'] = (_ctx, _mem, args) => {
         const pDevice = args[0];
         const _type = args[1];

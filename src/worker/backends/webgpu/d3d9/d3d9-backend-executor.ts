@@ -6,7 +6,7 @@
  */
 
 import { WebGPUBackend } from "../webgpu-backend";
-import { RenderFrame, RenderCommandType, ProgrammableDrawState } from "../render-frame";
+import { RenderFrame, RenderCommandType, ProgrammableDrawState, FfpDrawState } from "../render-frame";
 import { frameProfiler } from "../../../core/frame-profiler";
 import { statsOverlay } from "../../../core/stats-overlay";
 import { PROG_BIND } from "./shader";
@@ -151,6 +151,7 @@ export class D3D9BackendExecutor {
     private progLayouts: Map<number, { bindGroupLayout: GPUBindGroupLayout; pipelineLayout: GPUPipelineLayout }> = new Map();
     private vsArena: UniformArena | null = null;
     private psArena: UniformArena | null = null;
+    private ffpArena: UniformArena | null = null;
 
     // Material-keyed programmable bind-group cache. With dynamic offsets, the only
     // per-draw-varying part of the bind group is the uniform offset (passed at
@@ -405,6 +406,13 @@ export class D3D9BackendExecutor {
                 }
             }
 
+            // Pre-size the per-draw FFP uniform arena for this frame.
+            if (frame.ffpStateCount > 0) {
+                if (!this.ffpArena) this.ffpArena = new UniformArena(device, "ffp-draw-arena");
+                const blockBytes = alignUp(Math.max(16, frame.ffpStates[0].blockLen * 4), UNIFORM_ALIGN);
+                this.ffpArena.begin(blockBytes * frame.ffpStateCount + UNIFORM_ALIGN);
+            }
+
             // Ensure offscreen target (swap-chain path only; RT passes bring their own views).
             if (!target) this.ensureOffscreenTarget();
 
@@ -456,6 +464,12 @@ export class D3D9BackendExecutor {
                     case RenderCommandType.BindProgrammable: {
                         const ds = frame.drawStates[frame.commandA[i]];
                         if (ds) this.bindProgrammable(renderPass, queue, ds);
+                        break;
+                    }
+
+                    case RenderCommandType.BindFfp: {
+                        const fs = frame.ffpStates[frame.commandA[i]];
+                        if (fs) this.bindFfpDrawState(renderPass, queue, device, fs);
                         break;
                     }
 
@@ -832,6 +846,32 @@ export class D3D9BackendExecutor {
      * Build and bind the programmable bind group for one draw: per-draw VS/PS
      * constant blocks (written into the frame arenas) plus bound textures.
      */
+    /** Bind one FFP draw's uniform block + stage-0 texture. The block is bump-written
+     *  into a per-frame arena and bound as an explicit-range buffer entry; overrides
+     *  the frame-level FFP bind that SetPipeline installed. */
+    private bindFfpDrawState(
+        renderPass: GPURenderPassEncoder,
+        queue: GPUQueue,
+        device: GPUDevice,
+        fs: FfpDrawState,
+    ): void {
+        if (this.currentPipelineId === null || !this.ffpArena) return;
+        const info = this.pipelineInfo[this.currentPipelineId];
+        const offset = this.ffpArena.write(queue, fs.block, fs.blockLen);
+
+        const pipeline = this.pipelines[this.currentPipelineId];
+        const layout = pipeline.getBindGroupLayout(0);
+        const entries: GPUBindGroupEntry[] = [
+            { binding: 0, resource: { buffer: this.ffpArena.buffer!, offset, size: Math.max(16, fs.blockLen * 4) } },
+        ];
+        if (info?.hasTexture) {
+            entries.push({ binding: 1, resource: fs.sampler ?? this.getSampler() });
+            entries.push({ binding: 2, resource: fs.texture ?? this.getFallbackTextureView() });
+        }
+        const bindGroup = device.createBindGroup({ layout, entries });
+        this.setBindGroup0(renderPass, bindGroup);
+    }
+
     private bindProgrammable(
         renderPass: GPURenderPassEncoder,
         queue: GPUQueue,

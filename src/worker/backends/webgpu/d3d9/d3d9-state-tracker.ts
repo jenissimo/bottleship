@@ -94,6 +94,7 @@ export class D3D9StateTracker {
         this.renderStates[209] = D3DBLENDOP_ADD; // D3DRS_BLENDOPALPHA
         this.renderStates[168] = ALL_CHANNELS;   // D3DRS_COLORWRITEENABLE
         this.renderStates[190] = ALL_CHANNELS;   // D3DRS_COLORWRITEENABLE1
+        this.renderStates[60] = 0xFFFFFFFF;      // D3DRS_TEXTUREFACTOR (opaque white)
         this.renderStates[191] = ALL_CHANNELS;   // D3DRS_COLORWRITEENABLE2
         this.renderStates[192] = ALL_CHANNELS;   // D3DRS_COLORWRITEENABLE3
         // FFP lighting defaults (D3DMCS_*: MATERIAL=0, COLOR1=1, COLOR2=2). These let

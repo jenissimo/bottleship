@@ -24,6 +24,8 @@ export interface DrawCommand {
     startVertex: number;
     /** Programmable (VS/PS) per-draw state index, or undefined for FFP. */
     bindStateIndex?: number;
+    /** FFP per-draw state index (uniform block + stage-0 texture), or undefined. */
+    ffpStateIndex?: number;
     /** Streams beyond 0 — bound with setVertexBuffer(slot, …) before the draw. */
     extraStreams?: StreamVertexBinding[];
 }
@@ -39,6 +41,7 @@ export interface DrawIndexedCommand {
     startIndex: number;
     baseVertex: number;
     bindStateIndex?: number;
+    ffpStateIndex?: number;
     /** Streams beyond 0 — bound with setVertexBuffer(slot, …) before the draw. */
     extraStreams?: StreamVertexBinding[];
 }
@@ -85,6 +88,9 @@ export class D3D9CommandRecorder {
             this.frame.pushBindProgrammable(cmd.bindStateIndex);
             this.currentBindStateIndex = cmd.bindStateIndex;
         }
+        if (cmd.ffpStateIndex !== undefined) {
+            this.frame.pushBindFfp(cmd.ffpStateIndex);
+        }
         this.frame.pushSetVertexBuffer(cmd.gpuBuffer, cmd.bufferOffset, cmd.bufferSize);
         if (cmd.extraStreams) {
             for (const s of cmd.extraStreams) {
@@ -108,6 +114,9 @@ export class D3D9CommandRecorder {
         if (cmd.bindStateIndex !== undefined && cmd.bindStateIndex !== this.currentBindStateIndex) {
             this.frame.pushBindProgrammable(cmd.bindStateIndex);
             this.currentBindStateIndex = cmd.bindStateIndex;
+        }
+        if (cmd.ffpStateIndex !== undefined) {
+            this.frame.pushBindFfp(cmd.ffpStateIndex);
         }
         this.frame.pushSetVertexBuffer(cmd.vbGpuBuffer, cmd.vbOffset, cmd.vbSize);
         if (cmd.extraStreams) {

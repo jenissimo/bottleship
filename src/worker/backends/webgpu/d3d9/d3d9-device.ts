@@ -47,6 +47,7 @@ import {
     FFP_SELECT_COLOR_WGSL,
     emitFfpComputeLighting,
     FFP_UNIFORM_FLOATS,
+    FFP_OFF_STAGE0B,
     FFP_MAX_LIGHTS,
     packFfpUniforms,
     type FfpLightInput,
@@ -66,6 +67,10 @@ import {
     type StateBlockEntry,
 } from "./d3d9-state-block";
 import { d3d9WasmArena, isWasmPathEnabled, isArenaVerifyDrainEnabled } from "./d3d9-wasm-arena";
+
+/** D3DFORMATs without an alpha channel — sampling them returns alpha 1.0 on real
+ *  D3D9 (R8G8B8, X8R8G8B8, R5G6B5, X1R5G5B5, X4R4G4B4, X8B8G8R8, P8, L8). */
+const D3D_ALPHALESS_FORMATS = new Set([20, 22, 23, 24, 30, 33, 41, 50]);
 
 const D3DPT_POINTLIST = 1;
 const D3DPT_LINELIST = 2;
@@ -1247,6 +1252,91 @@ export class D3D9Device {
         return 0;
     }
 
+    /** GetRenderTargetData: read the src texture's GPU pixels back into the dst
+     *  texture's CPU/guest store, converted to the dst's D3D format layout.
+     *  Resolves 0 (D3D_OK) or D3DERR_INVALIDCALL. */
+    async readTextureIntoGuestTexture(srcTexPtr: number, dstTexPtr: number): Promise<number> {
+        const D3DERR_INVALIDCALL = 0x8876086c;
+        const srcIdx = this.textures.getIndex(srcTexPtr);
+        const dstIdx = this.textures.getIndex(dstTexPtr);
+        if (srcIdx === null || dstIdx === null) return D3DERR_INVALIDCALL;
+        const gpuTex = this.textures.getGpuTexture(srcIdx);
+        const device = this.backend.getDevice();
+        const queue = this.backend.getQueue();
+        if (!gpuTex || !device || !queue) return D3DERR_INVALIDCALL;
+
+        const width = Math.min(this.textures.getWidth(srcIdx), this.textures.getWidth(dstIdx));
+        const height = Math.min(this.textures.getHeight(srcIdx), this.textures.getHeight(dstIdx));
+        if (width <= 0 || height <= 0) return D3DERR_INVALIDCALL;
+
+        // 21/22 = [A|X]R8G8B8, 23 = R5G6B5, 24 = X1R5G5B5.
+        const dstFormat = this.textures.getFormat(dstIdx);
+        const dstIs32 = dstFormat === 21 || dstFormat === 22;
+        if (!dstIs32 && dstFormat !== 23 && dstFormat !== 24) return D3DERR_INVALIDCALL;
+
+        // Flush pending recorded draws so the readback sees this frame's rendering
+        // (no-op when the recorder is empty).
+        this.submitFrame(false);
+
+        const unpadded = width * 4;
+        const padded = Math.ceil(unpadded / 256) * 256;
+        const readback = device.createBuffer({
+            size: padded * height,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
+        try {
+            const encoder = device.createCommandEncoder();
+            encoder.copyTextureToBuffer(
+                { texture: gpuTex },
+                { buffer: readback, bytesPerRow: padded },
+                { width, height, depthOrArrayLayers: 1 },
+            );
+            queue.submit([encoder.finish()]);
+            await readback.mapAsync(GPUMapMode.READ);
+            const mapped = new Uint8Array(readback.getMappedRange());
+
+            const dstData = this.textures.getData(dstIdx);
+            if (!dstData) return D3DERR_INVALIDCALL;
+            const dstPitch = this.textures.getPitch(dstIdx);
+            if (dstIs32) {
+                // rgba8 → D3D 32-bit [A|X]RGB byte order (B,G,R,A little-endian).
+                for (let y = 0; y < height; y++) {
+                    const srcRow = y * padded;
+                    const dstRow = y * dstPitch;
+                    for (let x = 0; x < width; x++) {
+                        const s = srcRow + x * 4;
+                        const d = dstRow + x * 4;
+                        dstData[d] = mapped[s + 2];
+                        dstData[d + 1] = mapped[s + 1];
+                        dstData[d + 2] = mapped[s];
+                        dstData[d + 3] = mapped[s + 3];
+                    }
+                }
+            } else {
+                // rgba8 → R5G6B5 / X1R5G5B5, little-endian 16-bit.
+                const is565 = dstFormat === 23;
+                for (let y = 0; y < height; y++) {
+                    const srcRow = y * padded;
+                    const dstRow = y * dstPitch;
+                    for (let x = 0; x < width; x++) {
+                        const s = srcRow + x * 4;
+                        const r = mapped[s], g = mapped[s + 1], b = mapped[s + 2];
+                        const packed = is565
+                            ? ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
+                            : ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
+                        const d = dstRow + x * 2;
+                        dstData[d] = packed & 0xff;
+                        dstData[d + 1] = (packed >> 8) & 0xff;
+                    }
+                }
+            }
+            readback.unmap();
+            return 0;
+        } finally {
+            readback.destroy();
+        }
+    }
+
     lockTexture(texPtr: number, level: number): { ptr: number; pitch: number } | null {
         const index = this.textures.getIndex(texPtr);
         if (index === null) return null;
@@ -1758,6 +1848,16 @@ export class D3D9Device {
         }
 
         const ambientVal = rs(D3DRS_AMBIENT) >>> 0;
+        // has() form so an explicitly-set 0 (e.g. COLOROP=DISABLE) is honored.
+        const tss = (type: number, dflt: number) =>
+            this.textureStageStates.has(this.makeStageStateKey(0, type)) ? this.getTextureStageState(0, type) : dflt;
+        // With no texture bound at stage 0, a D3DTA_TEXTURE selector resolves to D3DTA_DIFFUSE
+        // (MSDN D3DTSS_COLORARG1: the default argument when no texture is set); modifier bits kept.
+        const noTex0 = this.stateTracker.getTexture(0) === null;
+        const tssArg = (type: number, dflt: number) => {
+            const v = tss(type, dflt);
+            return noTex0 && (v & 0xf) === 2 ? (v & ~0xf) >>> 0 : v;
+        };
         const params: FfpUniformParams = {
             viewportW: vpW,
             viewportH: vpH,
@@ -1783,9 +1883,27 @@ export class D3D9Device {
             emissiveSrc: this.effectiveColorSource(rs(D3DRS_EMISSIVEMATERIALSOURCE), colorVertex, hasColor, hasSpecular),
             hasNormal,
             lights,
+            stage0: {
+                colorOp: tss(1, 4),      // D3DTSS_COLOROP (default MODULATE)
+                colorArg1: tssArg(2, 2), // COLORARG1 (default TEXTURE)
+                colorArg2: tssArg(3, 1), // COLORARG2 (default CURRENT)
+                alphaOp: tss(4, 2),      // ALPHAOP (default SELECTARG1)
+                alphaArg1: tssArg(5, 2), // ALPHAARG1 (default TEXTURE)
+                alphaArg2: tssArg(6, 1), // ALPHAARG2 (default CURRENT)
+            },
+            tfactor: (() => {
+                const tf = rs(60) >>> 0; // D3DRS_TEXTUREFACTOR (tracker seeds the white default)
+                return { r: ((tf >> 16) & 0xff) / 255, g: ((tf >> 8) & 0xff) / 255, b: (tf & 0xff) / 255, a: ((tf >> 24) & 0xff) / 255 };
+            })(),
         };
         packFfpUniforms(this.ffpUniformBlock, params);
         return this.ffpUniformBlock;
+    }
+
+    /** True once the current frame has recorded work (clear/draws/uploads).
+     *  Lets HLE callers know a fill-as-clear would be reordered before pending draws. */
+    hasPendingWork(): boolean {
+        return this.commandRecorder.hasWork();
     }
 
     clear(flags: number, color: number, z: number, stencil: number): number {
@@ -1861,6 +1979,18 @@ export class D3D9Device {
 
     getViewport(): typeof this.viewport {
         return this.viewport;
+    }
+
+    // Scissor state is tracked but not yet applied to draws (needs
+    // D3DRS_SCISSORTESTENABLE plumbing into the render pass).
+    private scissorRect = { left: 0, top: 0, right: 0, bottom: 0 };
+
+    setScissorRect(left: number, top: number, right: number, bottom: number): void {
+        this.scissorRect = { left, top, right, bottom };
+    }
+
+    getScissorRect(): { left: number; top: number; right: number; bottom: number } {
+        return this.scissorRect;
     }
 
     /** Harness CaptureBus producer for D3D9. D3D9's programmable path has
@@ -2037,9 +2167,11 @@ export class D3D9Device {
         device.queue.writeBuffer(gpuBuffer, 0, view);
 
         const pipelineId = this.getPointSpritePipelineId(outFvf);
+        const ffpStateIndex = this.captureFfpDrawState();
         this.commandRecorder.recordDraw({
             pipelineId, gpuBuffer, bufferOffset: 0, bufferSize: outBytes,
             vertexCount: outVerts, startVertex: 0,
+            ffpStateIndex,
         });
         this.commandRecorder.registerPooledBuffer(gpuBuffer);
         this.drawCount += 1;
@@ -2058,6 +2190,9 @@ export class D3D9Device {
                 if (this.tryDrawPointSprites(vb.subarray(off), primitiveCount, ss.stride, this.stateTracker.getFVF())) return 0;
             }
             return 0;
+        }
+        if (primitiveType === D3DPT_TRIANGLESTRIP || primitiveType === D3DPT_TRIANGLEFAN) {
+            return this.drawStreamAsTriangleList(primitiveType, startVertex, primitiveCount);
         }
         if (primitiveType !== D3DPT_TRIANGLELIST) return 0;
         const streamSource = this.stateTracker.getStreamSource();
@@ -2099,12 +2234,14 @@ export class D3D9Device {
 
         let pipelineId: number;
         let bindStateIndex: number | undefined;
+        let ffpStateIndex: number | undefined;
         if (this.isProgrammable()) {
             pipelineId = this.resolveProgrammablePipeline("triangle-list", false, undefined, arenaKey);
             if (pipelineId < 0) return 0;
             bindStateIndex = this.captureDrawState();
         } else {
             pipelineId = this.getPipelineId();
+            ffpStateIndex = this.captureFfpDrawState();
         }
         this.commandRecorder.recordDraw({
             pipelineId,
@@ -2114,6 +2251,7 @@ export class D3D9Device {
             vertexCount: primitiveCount * 3,
             startVertex,
             bindStateIndex,
+            ffpStateIndex,
         });
         this.drawCount += 1;
 
@@ -2138,6 +2276,83 @@ export class D3D9Device {
             this.frameSnapshot.frameCounters.vertexBytes += this.vertexBuffers.getSize(vbIndex) - streamSource.offset;
         }
 
+        return 0;
+    }
+
+    /** Stream-source D3DPT_TRIANGLESTRIP/TRIANGLEFAN: convert to a triangle list
+     *  (WebGPU has no fan; strips would need pipeline-topology plumbing) and draw
+     *  via the same pooled-VB flow as drawPrimitiveUP. Sprite quads (AGS et al.)
+     *  arrive as 2-primitive strips on this path. */
+    private drawStreamAsTriangleList(primitiveType: number, startVertex: number, primitiveCount: number): number {
+        if (primitiveCount <= 0) return 0;
+        const ss = this.stateTracker.getStreamSource();
+        if (!ss || ss.stride <= 0) return 0;
+        const vb = this.vertexBuffers.getData(ss.index);
+        if (!vb) return 0;
+        const device = this.backend.getDevice();
+        if (!device) return 0;
+
+        const stride = ss.stride;
+        const srcVertexCount = primitiveCount + 2;
+        const off = ss.offset + startVertex * stride;
+        if (off + srcVertexCount * stride > vb.byteLength) return 0;
+        const srcData = vb.subarray(off, off + srcVertexCount * stride);
+
+        const finalVertexCount = primitiveCount * 3;
+        const finalData = this.ensureConversionBuffer(finalVertexCount * stride);
+        if (primitiveType === D3DPT_TRIANGLEFAN) {
+            for (let i = 0; i < primitiveCount; i++) {
+                finalData.set(srcData.subarray(0, stride), i * 3 * stride);
+                finalData.set(srcData.subarray((i + 1) * stride, (i + 2) * stride), (i * 3 + 1) * stride);
+                finalData.set(srcData.subarray((i + 2) * stride, (i + 3) * stride), (i * 3 + 2) * stride);
+            }
+        } else {
+            for (let i = 0; i < primitiveCount; i++) {
+                if (i % 2 === 0) {
+                    finalData.set(srcData.subarray(i * stride, (i + 1) * stride), i * 3 * stride);
+                    finalData.set(srcData.subarray((i + 1) * stride, (i + 2) * stride), (i * 3 + 1) * stride);
+                    finalData.set(srcData.subarray((i + 2) * stride, (i + 3) * stride), (i * 3 + 2) * stride);
+                } else {
+                    finalData.set(srcData.subarray((i + 1) * stride, (i + 2) * stride), i * 3 * stride);
+                    finalData.set(srcData.subarray(i * stride, (i + 1) * stride), (i * 3 + 1) * stride);
+                    finalData.set(srcData.subarray((i + 2) * stride, (i + 3) * stride), (i * 3 + 2) * stride);
+                }
+            }
+        }
+
+        const bufferSize = Math.max(16, finalData.byteLength);
+        if (!this.vbPool) this.vbPool = new DynamicVbPool(device);
+        const gpuBuffer = this.vbPool.acquire(bufferSize);
+        device.queue.writeBuffer(gpuBuffer, 0, finalData);
+
+        // Cull none: the strip/fan → list rewind alternates winding.
+        let pipelineId: number;
+        let bindStateIndex: number | undefined;
+        let ffpStateIndex: number | undefined;
+        if (this.isProgrammable()) {
+            pipelineId = this.resolveProgrammablePipeline("triangle-list", true, stride, undefined);
+            if (pipelineId < 0) { this.commandRecorder.registerPooledBuffer(gpuBuffer); return 0; }
+            bindStateIndex = this.captureDrawState();
+        } else {
+            pipelineId = this.getPipelineIdForTopology("triangle-list", true);
+            ffpStateIndex = this.captureFfpDrawState();
+        }
+
+        this.commandRecorder.recordDraw({
+            pipelineId,
+            gpuBuffer,
+            bufferOffset: 0,
+            bufferSize: finalData.byteLength,
+            vertexCount: finalVertexCount,
+            startVertex: 0,
+            bindStateIndex,
+            ffpStateIndex,
+        });
+        this.commandRecorder.registerPooledBuffer(gpuBuffer);
+        this.drawCount += 1;
+        if (this.frameSnapshot.frameCounters) {
+            this.frameSnapshot.frameCounters.vertexBytes += finalData.byteLength;
+        }
         return 0;
     }
 
@@ -2260,12 +2475,14 @@ export class D3D9Device {
         // Force cull none for UP draws - D3D9 and WebGPU have different winding conventions
         let pipelineId: number;
         let bindStateIndex: number | undefined;
+        let ffpStateIndex: number | undefined;
         if (this.isProgrammable()) {
             pipelineId = this.resolveProgrammablePipeline(topology, true, stride, arenaKey);
             if (pipelineId < 0) { this.commandRecorder.registerPooledBuffer(gpuBuffer); return 0; }
             bindStateIndex = this.captureDrawState();
         } else {
             pipelineId = this.getPipelineIdForTopology(topology, true);
+            ffpStateIndex = this.captureFfpDrawState();
         }
 
         this.commandRecorder.recordDraw({
@@ -2276,6 +2493,7 @@ export class D3D9Device {
             vertexCount: finalVertexCount,
             startVertex: 0,
             bindStateIndex,
+            ffpStateIndex,
         });
 
         this.commandRecorder.registerPooledBuffer(gpuBuffer);
@@ -2373,12 +2591,14 @@ export class D3D9Device {
 
         let pipelineId: number;
         let bindStateIndex: number | undefined;
+        let ffpStateIndex: number | undefined;
         if (this.isProgrammable()) {
             pipelineId = this.resolveProgrammablePipeline("triangle-list", false, undefined, arenaKey);
             if (pipelineId < 0) return 0;
             bindStateIndex = this.captureDrawState();
         } else {
             pipelineId = this.getPipelineId();
+            ffpStateIndex = this.captureFfpDrawState();
         }
         this.commandRecorder.recordDrawIndexed({
             pipelineId,
@@ -2391,6 +2611,7 @@ export class D3D9Device {
             startIndex,
             baseVertex: baseVertexIndex,
             bindStateIndex,
+            ffpStateIndex,
         });
         this.drawCount += 1;
 
@@ -2894,6 +3115,57 @@ export class D3D9Device {
             if (flags & D3DTTFF_PROJECTED) key |= (1 << stage);
         }
         return key;
+    }
+
+    /** Snapshot the full FFP uniform block + stage-0 texture for one draw. The
+     *  guest mutates transforms/stage-ops/TFACTOR/texture between draws, so
+     *  FFP draws can't share the frame-level uniform buffer. */
+    private captureFfpDrawState(): number {
+        const { w, h } = this.getCurrentTargetSize();
+        const block = this.buildFfpUniformBlock(w, h);
+        const frame = this.commandRecorder.getCurrentFrame();
+        const index = frame.nextFfpState(block.length);
+        const slot = frame.ffpStates[index];
+        slot.block.set(block);
+        slot.texture = this.resolveCurrentTexture();
+        slot.sampler = this.resolveStage0Sampler();
+
+        const ti = this.stateTracker.getTexture(0);
+        if (ti !== null && D3D_ALPHALESS_FORMATS.has(this.textures.getFormat(ti))) {
+            slot.block[FFP_OFF_STAGE0B + 2] = 1;
+        }
+        return index;
+    }
+
+    // Per-(addressU, addressV, mag, min) GPUSampler cache for the FFP per-draw path.
+    private ffpSamplerCache = new Map<number, GPUSampler>();
+
+    /** Build the stage-0 sampler from the guest's D3DSAMP_* state (D3D9 defaults:
+     *  WRAP addressing, POINT filtering). */
+    private resolveStage0Sampler(): GPUSampler | null {
+        const dev = this.backend.getDevice();
+        if (!dev) return null;
+        const ss = (type: number, dflt: number) => this.samplerStates.get(this.makeStageStateKey(0, type)) ?? dflt;
+        const au = ss(1, 1);   // D3DSAMP_ADDRESSU (default WRAP)
+        const av = ss(2, 1);   // D3DSAMP_ADDRESSV
+        const mag = ss(5, 1);  // D3DSAMP_MAGFILTER (default POINT)
+        const min = ss(6, 1);  // D3DSAMP_MINFILTER
+        const key = (au & 7) | ((av & 7) << 3) | ((mag & 7) << 6) | ((min & 7) << 9);
+        let s = this.ffpSamplerCache.get(key);
+        if (!s) {
+            const addr = (m: number): GPUAddressMode =>
+                m === 2 ? "mirror-repeat" : (m >= 3 ? "clamp-to-edge" : "repeat");
+            const filt = (f: number): GPUFilterMode => (f >= 2 ? "linear" : "nearest");
+            s = dev.createSampler({
+                addressModeU: addr(au),
+                addressModeV: addr(av),
+                addressModeW: "repeat",
+                magFilter: filt(mag),
+                minFilter: filt(min),
+            });
+            this.ffpSamplerCache.set(key, s);
+        }
+        return s;
     }
 
     /** Snapshot the current VS/PS constants + bound textures for one draw. */
@@ -3870,10 +4142,54 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     return out;
 }
 
+fn ffpStageArg(sel: u32, texC: vec4<f32>, diff: vec4<f32>, tf: vec4<f32>) -> vec4<f32> {
+    // D3DTA base selector (modifier bits D3DTA_COMPLEMENT/ALPHAREPLICATE handled below).
+    let base = sel & 0xfu;
+    var c = diff;                          // 0 = DIFFUSE (also 4 = SPECULAR fallback)
+    if (base == 1u) { c = diff; }          // 1 = CURRENT (stage 0: current == diffuse)
+    if (base == 2u) { c = texC; }          // 2 = TEXTURE
+    if (base == 3u) { c = tf; }            // 3 = TFACTOR
+    if ((sel & 0x10u) != 0u) { c = vec4<f32>(1.0) - c; }         // D3DTA_COMPLEMENT
+    if ((sel & 0x20u) != 0u) { c = vec4<f32>(c.a, c.a, c.a, c.a); } // D3DTA_ALPHAREPLICATE
+    return c;
+}
+
+fn ffpStageOp(op: u32, a1: vec4<f32>, a2: vec4<f32>, fallback: vec4<f32>) -> vec4<f32> {
+    if (op == 2u) { return a1; }                        // SELECTARG1
+    if (op == 3u) { return a2; }                        // SELECTARG2
+    if (op == 4u) { return a1 * a2; }                   // MODULATE
+    if (op == 5u) { return a1 * a2 * 2.0; }             // MODULATE2X
+    if (op == 6u) { return a1 * a2 * 4.0; }             // MODULATE4X
+    if (op == 7u) { return a1 + a2; }                   // ADD
+    if (op == 8u) { return a1 + a2 - vec4<f32>(0.5); }  // ADDSIGNED
+    if (op == 13u) { return a1 * a1.a + a2 * (1.0 - a1.a); } // BLENDTEXTUREALPHA (a1=tex)
+    return fallback;
+}
+
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     ${clipFsBody}
-    var _c = ${d.hasTex ? "textureSample(tex, texSampler, input.uv) * input.color" : "input.color"};
+    var _texC = ${d.hasTex ? "textureSample(tex, texSampler, input.uv)" : "vec4<f32>(1.0)"};
+    // Alpha-less D3D formats (X8R8G8B8 & friends, incl. RTs) read alpha as 1.0 on
+    // real hardware; our GPU RTs carry a live alpha channel that must be masked.
+    if (u.stage0b.z > 0.5) { _texC = vec4<f32>(_texC.rgb, 1.0); }
+    let _diff = input.color;
+    var _c: vec4<f32>;
+    // Texture stage 0 combiner (COLOROP == DISABLE(1) turns texturing off entirely).
+    if (u32(u.stage0a.x) == 1u) {
+        _c = _diff;
+    } else {
+        let _ca1 = ffpStageArg(u32(u.stage0a.y), _texC, _diff, u.tfactor);
+        let _ca2 = ffpStageArg(u32(u.stage0a.z), _texC, _diff, u.tfactor);
+        let _rgb = ffpStageOp(u32(u.stage0a.x), _ca1, _ca2, _texC * _diff);
+        var _a = _diff.a;
+        if (u32(u.stage0a.w) != 1u) {
+            let _aa1 = ffpStageArg(u32(u.stage0b.x), _texC, _diff, u.tfactor);
+            let _aa2 = ffpStageArg(u32(u.stage0b.y), _texC, _diff, u.tfactor);
+            _a = ffpStageOp(u32(u.stage0a.w), _aa1, _aa2, _texC).a;
+        }
+        _c = vec4<f32>(clamp(_rgb.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), clamp(_a, 0.0, 1.0));
+    }
     ${d.lit ? "_c = vec4<f32>(clamp(_c.rgb + input.specular, vec3<f32>(0.0), vec3<f32>(1.0)), _c.a);" : ""}
     ${alphaTestSnippet(d.alphaTest, "_c.a")}
     return _c;

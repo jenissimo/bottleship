@@ -7,6 +7,17 @@ export const enum RenderCommandType {
     SetIndexBuffer = 4,
     DrawIndexed = 5,
     BindProgrammable = 6,
+    BindFfp = 7,
+}
+
+/** Per-draw fixed-function state: a snapshot of the FFP uniform block (the guest
+ *  changes transforms/stage-ops/TFACTOR between draws) + the stage-0 texture view. */
+export interface FfpDrawState {
+    block: Float32Array;
+    blockLen: number;
+    texture: GPUTextureView | null;
+    /** Stage-0 sampler built from the guest's D3DSAMP_* state (null = executor default). */
+    sampler: GPUSampler | null;
 }
 
 export type RenderClear = {
@@ -68,6 +79,9 @@ export class RenderFrame {
      *  so steady-state capture allocates nothing (see nextDrawState). */
     drawStates: ProgrammableDrawState[] = [];
     drawStateCount = 0;
+    /** Pooled per-draw FFP state slots (same lifetime discipline as drawStates). */
+    ffpStates: FfpDrawState[] = [];
+    ffpStateCount = 0;
 
     reset(): void {
         this.hasClear = false;
@@ -85,6 +99,7 @@ export class RenderFrame {
         // constant scratch + texture arrays for reuse). Stale texture refs in
         // slots beyond drawStateCount are overwritten on reuse by nextDrawState's filler.
         this.drawStateCount = 0;
+        this.ffpStateCount = 0;
     }
 
     setClear(color: GPUColor, depth: number, flags: number): void {
@@ -191,6 +206,29 @@ export class RenderFrame {
 
     pushBindProgrammable(stateIndex: number): void {
         this.commandTypes.push(RenderCommandType.BindProgrammable);
+        this.commandA.push(stateIndex);
+        this.commandB.push(0);
+        this.commandC.push(0);
+        this.commandD.push(0);
+    }
+
+    /** Acquire a pooled FFP draw-state slot; caller fills block/texture.
+     *  Returns the slot's frame-local index. */
+    nextFfpState(blockLen: number): number {
+        let s = this.ffpStates[this.ffpStateCount];
+        if (!s) {
+            s = { block: new Float32Array(Math.max(4, blockLen)), blockLen: 0, texture: null, sampler: null };
+            this.ffpStates[this.ffpStateCount] = s;
+        }
+        if (s.block.length < blockLen) s.block = new Float32Array(blockLen);
+        s.blockLen = blockLen;
+        s.texture = null;
+        s.sampler = null;
+        return this.ffpStateCount++;
+    }
+
+    pushBindFfp(stateIndex: number): void {
+        this.commandTypes.push(RenderCommandType.BindFfp);
         this.commandA.push(stateIndex);
         this.commandB.push(0);
         this.commandC.push(0);
