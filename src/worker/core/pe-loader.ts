@@ -2,6 +2,7 @@
 // Portably parses Win32 PE files and loads them into emulator memory
 
 import { ThunkGenerator } from './thunking/thunk-generator';
+import { deriveStackCleanupFromMangledName } from './thunking/msvc-mangling';
 import { APIRegistry } from './api-registry';
 import { System } from './system';
 import { Logger, LogCategory } from './logger';
@@ -486,6 +487,7 @@ export class PELoader {
         // Mark as loading to detect circular dependencies
         this.loadingDlls.add(dllNameLower);
 
+        let registered = false;
         try {
             // Open and read DLL from VFS
             const handle = await this.vfs.open(dllPath, 0x80000000, 3); // GENERIC_READ, OPEN_EXISTING
@@ -576,6 +578,7 @@ export class PELoader {
                 sections
             };
             this.moduleRegistry.register(module);
+            registered = true;
 
             // Static Library HLE detection for this DLL's image (same reason as EXE path).
             try {
@@ -629,6 +632,18 @@ export class PELoader {
             }
 
             return module;
+        } catch (e) {
+            // LoadLibrary is all-or-nothing: a half-linked module must not stay
+            // resolvable, or a later LoadLibrary returns its base with an unpatched
+            // IAT and the guest jumps wild. Memory stays allocated (harmless leak);
+            // the registry entry must go so subsequent loads report NOT FOUND.
+            if (registered) {
+                this.moduleRegistry.unregister(dllNameLower);
+                this.pendingDllInits = this.pendingDllInits.filter(p => p.name !== dllNameLower);
+                Logger.warn(LogCategory.SYSTEM,
+                    `[PE] Load of "${dllName}" failed after registration — unregistered half-linked module: ${e}`);
+            }
+            throw e;
         } finally {
             this.loadingDlls.delete(dllNameLower);
         }
@@ -1085,8 +1100,39 @@ export class PELoader {
 
             // Check if this DLL is thunked (has API registry entries).
             // Video DLLs are excluded when native loading is enabled — they fall through to VFS.
-            const isThunked = this.apiRegistry.hasModule(dllName) &&
+            let isThunked = this.apiRegistry.hasModule(dllName) &&
                 !(EMU_NATIVE_VIDEO_DLLS && VIDEO_DLL_NAMES.has(dllName));
+
+            // A thunked module must cover every requested import — stdcall stubs need
+            // argCount or stackCleanupBytes, and generateStubDll throws otherwise.
+            // A registry module name can collide with an unrelated real DLL a game ships
+            // (same filename, different library): if the registry cannot satisfy some
+            // imports but the real file exists in the VFS, load it natively instead.
+            // Aliased DLLs keep their trap-stub handling for unknown imports; DLLs the
+            // native loader refuses (HLE-only video/d3dx9) stay thunked.
+            if (isThunked && !aliasTarget &&
+                !(!EMU_NATIVE_VIDEO_DLLS && VIDEO_DLL_NAMES.has(dllName)) &&
+                !isD3dx9VersionedDll(dllName)) {
+                const uncovered = functions.filter(f => {
+                    if (f.name) {
+                        const cc = this.apiRegistry.getCallingConvention(dllName, f.name);
+                        return (!cc || cc === 'stdcall') &&
+                            this.apiRegistry.getArgCount(dllName, f.name) === undefined &&
+                            this.apiRegistry.getStackCleanupBytes(dllName, f.name) === undefined &&
+                            deriveStackCleanupFromMangledName(f.name) === undefined;
+                    }
+                    return f.ordinal !== undefined &&
+                        this.apiRegistry.getArgCountByOrdinal(dllName, f.ordinal) === undefined;
+                });
+                if (uncovered.length > 0 && this.findDllPath(dllName) !== null) {
+                    const names = uncovered.slice(0, 5).map(f => f.name || `ord_${f.ordinal}`).join(', ');
+                    Logger.warn(LogCategory.SYSTEM,
+                        `[PE] Thunked module "${dllName}" cannot cover ${uncovered.length}/${functions.length} ` +
+                        `imports of ${dllNameRaw} (${names}${uncovered.length > 5 ? ', …' : ''}); ` +
+                        `real DLL exists in VFS — loading natively instead of thunking`);
+                    isThunked = false;
+                }
+            }
 
             // Log ALL DLLs and their functions
             const importedNames = functions.map(f => f.name || `ord_${f.ordinal}`);

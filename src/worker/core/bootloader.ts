@@ -218,8 +218,8 @@ export function createBootloader(
         createHaltHandlerBytes(0xdead00ee, true),
         hGenericOff
     );
-    finalBuffer.set(createHaltHandlerBytes(0xdead0006, true), hUdOff); // #UD
-    finalBuffer.set(createHaltHandlerBytes(0xdead000d, true), hGpOff); // #GP
+    finalBuffer.set(createRecoverableFaultHandler(0xdead0006, true), hUdOff); // #UD - recoverable via IRET
+    finalBuffer.set(createRecoverableFaultHandler(0xdead000d, false), hGpOff); // #GP - recoverable via IRET
     finalBuffer.set(createRecoverablePfHandler(), hPfOff); // #PF - recoverable via IRET
     finalBuffer.set(
         createHaltHandlerBytes(0xdead02ee, false),
@@ -314,6 +314,40 @@ function createRecoverableHandlerBytes(thunkId: number): Uint8Array {
         0xef,                           // OUT DX, EAX
         0xcf,                           // IRET
     ]);
+}
+
+/**
+ * Creates a recoverable #UD/#GP handler: save EAX/EDX, OUT to JS, restore,
+ * pop the error code, IRET. Same frame shape as the #PF handler during the OUT:
+ *   [ESP+0]=saved_EDX, [ESP+4]=saved_EAX, [ESP+8]=ErrCode, [ESP+12]=EIP
+ * #UD pushes no error code, so its handler pushes a dummy 0 first
+ * (pushDummyErrorCode) to keep the frame uniform for the JS side.
+ * The JS handler decides the outcome by rewriting [ESP+12] (the IRET target):
+ * SEH handler address, spin loop (thread terminated), or PF_HALT_TARGET (fatal).
+ * Sizes: 21 bytes (#UD) / 19 bytes (#GP) — both fit the 25-byte handler slot.
+ */
+function createRecoverableFaultHandler(
+    thunkId: number,
+    pushDummyErrorCode: boolean
+): Uint8Array {
+    const bytes: number[] = [];
+    if (pushDummyErrorCode) bytes.push(0x6a, 0x00); // PUSH 0 (fake error code)
+    bytes.push(
+        0x50,                           // PUSH EAX     (save — clobbered by MOV below)
+        0x52,                           // PUSH EDX     (save — clobbered by MOV below)
+        0xb8,                           // MOV EAX, thunkId
+        thunkId & 0xff,
+        (thunkId >> 8) & 0xff,
+        (thunkId >> 16) & 0xff,
+        (thunkId >> 24) & 0xff,
+        0xba, 0x77, 0xb0, 0x00, 0x00,  // MOV EDX, 0xB077
+        0xef,                           // OUT DX, EAX  (JS handler runs synchronously)
+        0x5a,                           // POP EDX      (restore)
+        0x58,                           // POP EAX      (restore)
+        0x83, 0xc4, 0x04,              // ADD ESP, 4   (pop error code — IRET won't pop it)
+        0xcf,                           // IRET
+    );
+    return new Uint8Array(bytes);
 }
 
 /**

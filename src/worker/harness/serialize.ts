@@ -313,6 +313,8 @@ export function readCallSnapshot(name: string, eip: number, esp: number): unknow
             }));
         }
     } catch { /* */ }
+    let es = -1;
+    try { const c = cpu() as any; if (c?.sreg) es = c.sreg[0] & 0xffff; } catch { /* */ }
     return {
         name,
         eip: eip >>> 0,
@@ -322,6 +324,7 @@ export function readCallSnapshot(name: string, eip: number, esp: number): unknow
         callerSym: symbolize(r(0)),
         args: [r(4), r(8), r(12), r(16)],
         threadId,
+        es,
         lastThunks: recent,
         backtrace,
     };

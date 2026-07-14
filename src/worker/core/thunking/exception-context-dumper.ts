@@ -98,13 +98,19 @@ function reportFatalExecutionEscape(
     });
 }
 
-export function dumpExceptionContext(d: any, marker: number, cpu: any): void {
+/**
+ * `espOverride`: recoverable #GP/#UD handlers PUSH EAX/EDX (and #UD a dummy error
+ * code) before the OUT, so the live ESP no longer points at the fault frame the
+ * offsets below assume. The caller passes the adjusted ESP (error-code slot for
+ * error-code vectors, EIP slot otherwise); halt handlers omit it.
+ */
+export function dumpExceptionContext(d: any, marker: number, cpu: any, espOverride?: number): void {
         if (!cpu) return;
 
         const regs = cpu.reg32;
         const eip = (cpu.instruction_pointer?.[0] ?? 0) >>> 0;
         const eflags = (cpu.flags?.[0] ?? 0) >>> 0;
-        const esp = regs[4] >>> 0;
+        const esp = (espOverride ?? regs[4]) >>> 0;
         // Read faulting EIP early so we can avoid false "stack corruption" when fault is in guest code
         // Exceptions with error code (EIP at [ESP+4]): #DF(8), #TS(0xA), #NP(0xB), #SS(0xC), #GP(0xD), #PF(0xE), #AC(0x11)
         // All others including software INTs: no error code > faulting EIP at [ESP+0]

@@ -403,9 +403,20 @@ export class HypercallDataManager {
     private lastInsnSnapshot = 0;
     private lastWallSnapshot = 0;
 
-    // Process-global FLS mirror used by WASM FlsGetValue hypercall.
+    // FLS mirror used by WASM FlsGetValue hypercall. Allocation bitmap is
+    // process-global (indices are), but VALUES are per-thread (fiber-local ==
+    // thread-local without fibers): the UCRT stores each thread's _ptd in one
+    // shared slot index — a global value table hands thread A's _ptd to thread B.
+    // The page holds the CURRENT thread's values; syncThreadData swaps them.
     private readonly flsAllocatedShadow = new Uint8Array(HC_FLS_SLOT_COUNT);
-    private readonly flsValuesShadow = new Uint32Array(HC_FLS_SLOT_COUNT);
+    private readonly flsValuesByThread = new Map<number, Uint32Array>();
+    private flsCurrentTid = 0;
+
+    private flsValuesFor(tid: number): Uint32Array {
+        let v = this.flsValuesByThread.get(tid);
+        if (!v) { v = new Uint32Array(HC_FLS_SLOT_COUNT); this.flsValuesByThread.set(tid, v); }
+        return v;
+    }
     // Kernel event mirror for WASM SetEvent fast path (indexed by handle slot).
     private readonly eventMirrorShadow = new Uint8Array(EVENT_TABLE_SLOTS);
     // Mutex mirror lives in guest RAM (2048 × u32); pointer stored at OFF_HC_MUTEX_MIRROR_PTR.
@@ -532,27 +543,42 @@ export class HypercallDataManager {
 
     private writeFlsSharedState(): void {
         if (!this.view) return;
+        const values = this.flsValuesFor(this.flsCurrentTid);
         for (let i = 0; i < HC_FLS_SLOT_COUNT; i++) {
             this.view.setUint8(this.hpBase + OFF_HC_FLS_ALLOCATED + i, this.flsAllocatedShadow[i]);
-            this.view.setUint32(this.hpBase + OFF_HC_FLS_VALUES + i * 4, this.flsValuesShadow[i] >>> 0, true);
+            this.view.setUint32(this.hpBase + OFF_HC_FLS_VALUES + i * 4, values[i] >>> 0, true);
         }
     }
 
-    setFlsSlot(index: number, allocated: boolean, value: number): void {
+    setFlsSlot(index: number, allocated: boolean, value: number, tid = this.flsCurrentTid): void {
         if (index < 0 || index >= HC_FLS_SLOT_COUNT) return;
 
         this.flsAllocatedShadow[index] = allocated ? 1 : 0;
-        this.flsValuesShadow[index] = value >>> 0;
+        if (allocated) {
+            this.flsValuesFor(tid)[index] = value >>> 0;
+        } else {
+            for (const values of this.flsValuesByThread.values()) values[index] = 0;
+        }
 
         this.refreshViews();
         if (!this.view || this.hpBase === 0) return;
         this.view.setUint8(this.hpBase + OFF_HC_FLS_ALLOCATED + index, this.flsAllocatedShadow[index]);
-        this.view.setUint32(this.hpBase + OFF_HC_FLS_VALUES + index * 4, this.flsValuesShadow[index] >>> 0, true);
+        if (tid === this.flsCurrentTid || !allocated) {
+            this.view.setUint32(this.hpBase + OFF_HC_FLS_VALUES + index * 4,
+                this.flsValuesFor(this.flsCurrentTid)[index] >>> 0, true);
+        }
+    }
+
+    getFlsSlot(index: number, tid = this.flsCurrentTid): number {
+        if (index < 0 || index >= HC_FLS_SLOT_COUNT) return 0;
+        if (!this.flsAllocatedShadow[index]) return 0;
+        return this.flsValuesFor(tid)[index] >>> 0;
     }
 
     clearFlsSlots(): void {
         this.flsAllocatedShadow.fill(0);
-        this.flsValuesShadow.fill(0);
+        this.flsValuesByThread.clear();
+        this.flsCurrentTid = 0;
 
         this.refreshViews();
         if (!this.view || this.hpBase === 0) return;
@@ -1110,6 +1136,16 @@ export class HypercallDataManager {
         this.view.setUint32(this.hpBase + OFF_HC_LAST_ERROR, lastError >>> 0, true);
         this.view.setUint32(this.hpBase + OFF_HC_TEB_BASE, tebBase >>> 0, true);
         this.view.setUint32(this.hpBase + OFF_HC_CURRENT_THREAD_ID, threadId >>> 0, true);
+
+        // FLS values are per-thread — swap the page-resident table (read by the
+        // WASM FlsGetValue fast path) to the incoming thread's set.
+        if (threadId !== this.flsCurrentTid) {
+            this.flsCurrentTid = threadId;
+            const values = this.flsValuesFor(threadId);
+            for (let i = 0; i < HC_FLS_SLOT_COUNT; i++) {
+                this.view.setUint32(this.hpBase + OFF_HC_FLS_VALUES + i * 4, values[i] >>> 0, true);
+            }
+        }
     }
 
     /** Read lastError back from WASM (WASM may have modified via SetLastError) */

@@ -4450,6 +4450,14 @@ export class ThunkDispatcher {
             return;
         }
 
+        // Recoverable #UD (vector 6) / #GP (vector 13) — handler uses IRET; the JS
+        // side picks the outcome (SEH dispatch / thread termination / halt) by
+        // rewriting the frame's return EIP.
+        if (marker === 0x0006 || marker === 0x000D) {
+            this._handleRecoverableCpuException(marker, cpu);
+            return;
+        }
+
         // DllMain result reporter (from bootloader hook)
         if (marker === 0x000a) {
             const result = cpu.reg32[1] >>> 0; // ECX holds the result
@@ -4462,8 +4470,6 @@ export class ThunkDispatcher {
             0x0002: "GDT loaded (16-bit)",
             0x0003: "Entered 32-bit protected mode + IDT loaded!",
             0x0004: "Segments configured, jumping to PE entry",
-            0x0006: "EXCEPTION: #UD (Invalid Opcode, vector 6)",
-            0x000D: "EXCEPTION: #GP (General Protection Fault, vector 13)",
             0x00EE: "EXCEPTION: Generic/Unknown vector",
             0x0080: "EXCEPTION: int 0x80 (Linux syscall)",
             0x02EE: "EXCEPTION: int 0x2E (Windows syscall/NT)",
@@ -4566,12 +4572,8 @@ export class ThunkDispatcher {
         } else {
             // Unhandled — all handlers returned ContinueSearch.
             // Try UnhandledExceptionFilter before halting.
-            // Stash the unrecoverable fault EIP (covers BOTH the UEF and halt paths) so it
-            // can be read live from the derailed worker — the streamed log routinely drops
-            // the crash line. Read via:
-            //   bun tools/cdp-worker-eval.ts "globalThis.__lastFaultEip?.toString(16)"
-            (globalThis as any).__lastFaultEip = faultingEip >>> 0;
-            ((globalThis as any).__faultEipHist ??= []).push(faultingEip >>> 0);
+            // Covers BOTH the UEF and halt paths.
+            this._recordFaultEip(faultingEip);
             Logger.warn(LogCategory.SYSTEM,
                 `SEH dispatch: unhandled result=${result} lastDisposition=0x${lastHandlerResult.toString(16)} ` +
                 `lastFrame=0x${lastHandlerFrame.toString(16)} lastHandler=0x${lastHandlerAddr.toString(16)}`);
@@ -4639,6 +4641,7 @@ export class ThunkDispatcher {
         savedEax: number,
         savedEdx: number,
         view: DataView,
+        exceptionCode: number = 0xC0000005,
     ): boolean {
         const mem = this.cachedMem8;
         if (!mem) return false;
@@ -4650,15 +4653,16 @@ export class ThunkDispatcher {
         const preFaultEsp = (esp + 24) >>> 0;
         const uefAddr = this.unhandledExceptionFilterAddr;
 
-        // Build EXCEPTION_RECORD in scratch area
+        // Build EXCEPTION_RECORD in scratch area (params: AV carries 2, others 0)
+        const numParams = exceptionCode === 0xC0000005 ? 2 : 0;
         const excRec = scratchAddr + SEH_SCRATCH_LAYOUT.EXCEPTION_RECORD;
-        view.setUint32(excRec + 0, 0xC0000005, true);        // ExceptionCode
+        view.setUint32(excRec + 0, exceptionCode, true);      // ExceptionCode
         view.setUint32(excRec + 4, 0, true);                  // ExceptionFlags
         view.setUint32(excRec + 8, 0, true);                  // ExceptionRecord
         view.setUint32(excRec + 12, faultingEip, true);       // ExceptionAddress
-        view.setUint32(excRec + 16, 2, true);                 // NumberParameters
-        view.setUint32(excRec + 20, isWrite ? 1 : 0, true);  // [0] = read/write
-        view.setUint32(excRec + 24, faultAddr, true);         // [1] = fault address
+        view.setUint32(excRec + 16, numParams, true);         // NumberParameters
+        view.setUint32(excRec + 20, numParams ? (isWrite ? 1 : 0) : 0, true); // [0] = read/write
+        view.setUint32(excRec + 24, numParams ? faultAddr : 0, true);         // [1] = fault address
 
         // Build minimal CONTEXT
         const ctxBase = scratchAddr + SEH_SCRATCH_LAYOUT.CONTEXT;
@@ -4709,6 +4713,231 @@ export class ThunkDispatcher {
     }
 
     /**
+     * Fault-time SEH dispatch-stack hygiene, shared by the #PF and #UD/#GP paths.
+     * Pops contexts left stale by a longjmp catch, then blocks pathological loops:
+     * fault at dispatch depth >= 2, or the exact same fault signature repeating at
+     * the same generation (infinite retry). On block, redirects the frame's IRET
+     * target ([ESP+12]) to the halt stub and returns false; the crash funnel fires
+     * via the scheduler's halt watch. Returns true when dispatch may proceed.
+     */
+    private _sehFaultDispatchGuard(
+        esp: number,
+        faultingEip: number,
+        faultAddr: number,
+        view: DataView | null,
+    ): boolean {
+        if (this.sehDispatchStack.length > 0) {
+            // preFaultEsp = esp + 24 (undo PUSH EDX + PUSH EAX + error code + EIP + CS + EFLAGS).
+            // A dispatch context whose ESP is below it was already caught via longjmp — stale.
+            const preFaultEsp = (esp + 24) >>> 0;
+            while (this.sehDispatchStack.length > 0) {
+                const staleTop = this.sehDispatchStack[this.sehDispatchStack.length - 1];
+                if (staleTop.startEsp !== 0 && preFaultEsp > staleTop.startEsp) {
+                    Logger.warn(LogCategory.SYSTEM,
+                        `SEH dispatch stale: fault at ESP=0x${preFaultEsp.toString(16)} above dispatch ESP=0x${staleTop.startEsp.toString(16)} ` +
+                        `(gen=${staleTop.generation}) — handler caught, popping context`);
+                    this.sehDispatchStack.pop();
+                    this._leaveSehCriticalRuntime('stale_context_at_fault', staleTop.generation);
+                } else {
+                    break;
+                }
+            }
+        }
+
+        if (this.sehDispatchStack.length > 0) {
+            const top = this.sehDispatchStack[this.sehDispatchStack.length - 1];
+            const currentSig: SehFaultSignature = {
+                faultEip: faultingEip >>> 0,
+                faultAddr: faultAddr >>> 0,
+                generation: top.generation >>> 0,
+            };
+            const prevSig = top.lastFaultSignature;
+            const isRepeat = !!prevSig &&
+                prevSig.generation === currentSig.generation &&
+                prevSig.faultEip === currentSig.faultEip &&
+                prevSig.faultAddr === currentSig.faultAddr;
+            top.lastFaultSignature = currentSig;
+
+            // Fault-inside-fault at depth >= 2 is pathological — halt
+            if (this.sehDispatchStack.length >= 2) {
+                Logger.error(LogCategory.SYSTEM,
+                    `Fault inside active SEH dispatch (depth=${this.sehDispatchStack.length}, gen=${top.generation}) ` +
+                    `faultEIP=0x${faultingEip.toString(16)} faultAddr=0x${faultAddr.toString(16)} ` +
+                    `${isRepeat ? '[repeat signature]' : '[nested signature]'} - halting (max depth)`);
+                this._logSehCorruptionProtocol(
+                    'seh_nested_fault_max_depth',
+                    faultingEip,
+                    faultAddr
+                );
+                this._setSehDispatchIdle('nested_fault_max_depth');
+                if (view && esp + 16 <= this.memLength) {
+                    view.setUint32(esp + 12, PF_HALT_TARGET, true);
+                }
+                return false;
+            }
+
+            // Repeat same fault signature at same generation — infinite retry
+            if (isRepeat) {
+                Logger.error(LogCategory.SYSTEM,
+                    `Fault inside active SEH dispatch (gen=${top.generation}) ` +
+                    `faultEIP=0x${faultingEip.toString(16)} faultAddr=0x${faultAddr.toString(16)} ` +
+                    `[repeat signature] - halting`);
+                this._logSehCorruptionProtocol('seh_repeat_fault_signature', faultingEip, faultAddr);
+                this._setSehDispatchIdle('repeat_fault');
+                if (view && esp + 16 <= this.memLength) {
+                    view.setUint32(esp + 12, PF_HALT_TARGET, true);
+                }
+                return false;
+            }
+
+            // Single nesting (depth 0→1): allow — this is the AV→CxxThrow pattern.
+            Logger.warn(LogCategory.SYSTEM,
+                `Fault inside active SEH dispatch (gen=${top.generation}, depth=${this.sehDispatchStack.length}) ` +
+                `faultEIP=0x${faultingEip.toString(16)} faultAddr=0x${faultAddr.toString(16)} ` +
+                `- allowing nested dispatch`);
+        }
+        return true;
+    }
+
+    /**
+     * Stash the fault EIP in globals readable live from the derailed worker
+     * (the streamed log routinely drops the crash line). Read via:
+     *   bun tools/cdp-worker-eval.ts "globalThis.__lastFaultEip?.toString(16)"
+     */
+    private _recordFaultEip(faultingEip: number): void {
+        const g = globalThis as any;
+        g.__lastFaultEip = faultingEip >>> 0;
+        const hist: number[] = (g.__faultEipHist ??= []);
+        hist.push(faultingEip >>> 0);
+        if (hist.length > 64) hist.splice(0, hist.length - 64);
+    }
+
+    /**
+     * Handle recoverable #UD (vector 6) / #GP (vector 13) from guest code.
+     *
+     * Frame during the OUT (the #UD handler pushes a dummy error code so both
+     * vectors share the #PF frame shape):
+     *   [ESP+0]  = saved EDX
+     *   [ESP+4]  = saved EAX
+     *   [ESP+8]  = error code (real for #GP, 0 for #UD)
+     *   [ESP+12] = faulting EIP (IRET return target)
+     *   [ESP+16] = CS
+     *   [ESP+20] = EFLAGS
+     *
+     * Outcome hierarchy (Windows-faithful order): SEH chain dispatch with the
+     * vector's NT status (#UD → STATUS_ILLEGAL_INSTRUCTION, #GP → the
+     * STATUS_ACCESS_VIOLATION/0xFFFFFFFF form Windows reports for user-mode #GP),
+     * then UnhandledExceptionFilter, then termination: the whole process when the
+     * MAIN thread faulted (IRET → halt stub → scheduler halt watch → crash funnel),
+     * or just the faulting WORKER thread (terminate + IRET → spin loop + immediate
+     * reschedule) so the rest of the VM keeps running instead of freezing at CLI;HLT.
+     */
+    private _handleRecoverableCpuException(vector: number, cpu: any): void {
+        const esp = cpu.reg32[4] >>> 0;
+        const view = this.cachedDataView;
+        const vecName = vector === 0x06 ? '#UD' : '#GP';
+        if (!this.cachedMem8 || !this.isDataViewValid() || !view || esp + 24 > this.memLength) {
+            Logger.error(LogCategory.SYSTEM,
+                `${vecName}: fault frame unreadable at ESP=0x${esp.toString(16)} — cannot recover`);
+            return;
+        }
+
+        const savedEdx = view.getUint32(esp, true) >>> 0;
+        const savedEax = view.getUint32(esp + 4, true) >>> 0;
+        const errorCode = view.getUint32(esp + 8, true) >>> 0;
+        const faultingEip = view.getUint32(esp + 12, true) >>> 0;
+
+        const isUd = vector === 0x06;
+        const exceptionCode = isUd ? 0xC000001D : 0xC0000005;
+        const faultAddr = isUd ? faultingEip : 0xFFFFFFFF;
+
+        // Live EAX/EDX hold the OUT scratch; the handler tail POPs the real values
+        // back from the frame, so restoring them here only fixes the forensics below.
+        cpu.reg32[0] = savedEax | 0;
+        cpu.reg32[2] = savedEdx | 0;
+
+        this._recordFaultEip(faultingEip);
+
+        const moduleRegistry = System.getInstance().process?.moduleRegistry;
+        const mod = moduleRegistry?.getModuleContainingAddress(faultingEip);
+        Logger.error(LogCategory.SYSTEM,
+            `${vecName} at EIP=0x${faultingEip.toString(16)}` +
+            `${mod ? ` (${mod.name}+0x${(faultingEip - mod.baseAddress).toString(16)})` : ''} ` +
+            `error_code=0x${errorCode.toString(16)} last_thunk=${this.lastThunkName || 'unknown'}`);
+
+        // Full forensic dump. The dumper expects ESP at the error-code slot for
+        // error-code vectors and at the EIP slot otherwise — see espOverride.
+        dumpExceptionContext(this, vector, cpu, isUd ? esp + 12 : esp + 8);
+
+        const sys = System.getInstance();
+        if (sys.isExiting) {
+            // The dump escalated to the crash funnel (bootloader/stack escape) —
+            // the process is tearing down; park the frame on the halt stub.
+            view.setUint32(esp + 12, PF_HALT_TARGET, true);
+            return;
+        }
+
+        // Durable fault record (harness `faults()` verb / fault-event payload).
+        const r = cpu.reg32;
+        const gameEsp = (esp + 24) >>> 0;
+        const stackDump: number[] = [];
+        if (gameEsp + 128 <= this.memLength) {
+            for (let i = 0; i < 32; i++) stackDump.push(view.getUint32(gameEsp + i * 4, true) >>> 0);
+        }
+        const scheduler = this.ensureScheduler();
+        const currentThread = scheduler.getCurrentThread?.() ?? null;
+        faultRecorder.record({
+            ts: performance.now(),
+            eip: faultingEip >>> 0,
+            faultAddr: faultAddr >>> 0,
+            errorCode: exceptionCode >>> 0,
+            threadId: currentThread?.id ?? null,
+            lastThunk: this.lastThunkName || 'unknown',
+            kind: "unhandled",
+            regs: { ecx: r[1] >>> 0, ebx: r[3] >>> 0, esp: r[4] >>> 0, ebp: r[5] >>> 0, esi: r[6] >>> 0, edi: r[7] >>> 0 },
+            recentCalls: this.winApiRing?.getCrashTraceLines?.(48) ?? [],
+            gameEsp,
+            stackDump,
+        });
+
+        if (!this._sehFaultDispatchGuard(esp, faultingEip, faultAddr, view)) return;
+
+        const dispatched = this._tryDispatchAccessViolation(
+            cpu, faultAddr, faultingEip, false, esp, savedEax, savedEdx, view, exceptionCode
+        );
+        if (dispatched) return;
+
+        if (this.unhandledExceptionFilterAddr !== 0) {
+            const uefDispatched = this._setupUnhandledExceptionFilterCall(
+                cpu, faultAddr, faultingEip, false, esp, savedEax, savedEdx, view, exceptionCode
+            );
+            if (uefDispatched) return;
+        }
+
+        if (!currentThread || scheduler.isMainThread(currentThread.id)) {
+            Logger.error(LogCategory.SYSTEM,
+                `${vecName}: unhandled on ${currentThread ? 'MAIN thread' : 'unknown thread'} — fatal, ` +
+                `redirecting IRET to halt stub (fault EIP=0x${faultingEip.toString(16)})`);
+            view.setUint32(esp + 12, PF_HALT_TARGET, true);
+            return;
+        }
+
+        Logger.error(LogCategory.SYSTEM,
+            `${vecName}: unhandled on worker T${currentThread.id} — terminating thread ` +
+            `with 0x${exceptionCode.toString(16)}, VM continues (fault EIP=0x${faultingEip.toString(16)})`);
+        sys.reportGuestThreadFault({
+            reason: `Unhandled ${vecName} (${isUd ? 'illegal instruction' : 'general protection'}) on worker thread — thread terminated`,
+            eip: faultingEip,
+            threadId: currentThread.id,
+            exceptionCode,
+        });
+        scheduler.terminateCurrentThreadForFault(exceptionCode,
+            `${vecName} at EIP=0x${faultingEip.toString(16)}`);
+        view.setUint32(esp + 12, this.spinLoopAddress, true);
+        preemptionManager.requestImmediateExit();
+    }
+
+    /**
      * Handle recoverable #PF (Page Fault).
      * The #PF handler saves EAX/EDX, does OUT, restores, pops error code, then IRET.
      *
@@ -4750,78 +4979,7 @@ export class ThunkDispatcher {
             }
         }
 
-        if (this.sehDispatchStack.length > 0) {
-            // Detect stale contexts: if game ESP (before #PF frame) is above dispatch ESP,
-            // the handler already caught via longjmp — context is stale. Pop before proceeding.
-            // preFaultEsp = esp + 24 (undo PUSH EDX + PUSH EAX + error code + EIP + CS + EFLAGS)
-            const preFaultEsp = (esp + 24) >>> 0;
-            while (this.sehDispatchStack.length > 0) {
-                const staleTop = this.sehDispatchStack[this.sehDispatchStack.length - 1];
-                if (staleTop.startEsp !== 0 && preFaultEsp > staleTop.startEsp) {
-                    Logger.warn(LogCategory.SYSTEM,
-                        `SEH dispatch stale: #PF at ESP=0x${preFaultEsp.toString(16)} above dispatch ESP=0x${staleTop.startEsp.toString(16)} ` +
-                        `(gen=${staleTop.generation}) — handler caught, popping context`);
-                    this.sehDispatchStack.pop();
-                    this._leaveSehCriticalRuntime('stale_context_at_fault', staleTop.generation);
-                } else {
-                    break;
-                }
-            }
-        }
-
-        if (this.sehDispatchStack.length > 0) {
-            const top = this.sehDispatchStack[this.sehDispatchStack.length - 1];
-            const currentSig: SehFaultSignature = {
-                faultEip: faultingEip >>> 0,
-                faultAddr: faultAddr >>> 0,
-                generation: top.generation >>> 0,
-            };
-            const prevSig = top.lastFaultSignature;
-            const isRepeat = !!prevSig &&
-                prevSig.generation === currentSig.generation &&
-                prevSig.faultEip === currentSig.faultEip &&
-                prevSig.faultAddr === currentSig.faultAddr;
-            top.lastFaultSignature = currentSig;
-
-            // AV-inside-AV at depth >= 2 is pathological — halt
-            if (this.sehDispatchStack.length >= 2) {
-                Logger.error(LogCategory.SYSTEM,
-                    `#PF inside active SEH dispatch (depth=${this.sehDispatchStack.length}, gen=${top.generation}) ` +
-                    `faultEIP=0x${faultingEip.toString(16)} faultAddr=0x${faultAddr.toString(16)} ` +
-                    `${isRepeat ? '[repeat signature]' : '[nested signature]'} - halting (max depth)`);
-                this._logSehCorruptionProtocol(
-                    'seh_nested_fault_max_depth',
-                    faultingEip,
-                    faultAddr
-                );
-                this._setSehDispatchIdle('nested_fault_max_depth');
-                if (view && esp + 16 <= this.memLength) {
-                    view.setUint32(esp + 12, PF_HALT_TARGET, true);
-                }
-                return;
-            }
-
-            // Repeat same fault signature at same generation — infinite retry
-            if (isRepeat) {
-                Logger.error(LogCategory.SYSTEM,
-                    `#PF inside active SEH dispatch (gen=${top.generation}) ` +
-                    `faultEIP=0x${faultingEip.toString(16)} faultAddr=0x${faultAddr.toString(16)} ` +
-                    `[repeat signature] - halting`);
-                this._logSehCorruptionProtocol('seh_repeat_fault_signature', faultingEip, faultAddr);
-                this._setSehDispatchIdle('repeat_fault');
-                if (view && esp + 16 <= this.memLength) {
-                    view.setUint32(esp + 12, PF_HALT_TARGET, true);
-                }
-                return;
-            }
-
-            // Single nesting (depth 0→1): allow — this is the AV→CxxThrow pattern.
-            // The nested dispatch will be handled by _tryDispatchAccessViolation below.
-            Logger.warn(LogCategory.SYSTEM,
-                `#PF inside active SEH dispatch (gen=${top.generation}, depth=${this.sehDispatchStack.length}) ` +
-                `faultEIP=0x${faultingEip.toString(16)} faultAddr=0x${faultAddr.toString(16)} ` +
-                `- allowing nested dispatch`);
-        }
+        if (!this._sehFaultDispatchGuard(esp, faultingEip, faultAddr, view)) return;
         const isWrite = !!(errorCode & 0x02);
         const isPresent = !!(errorCode & 0x01); // 0 = not-present, 1 = protection violation
 
@@ -4976,6 +5134,7 @@ export class ThunkDispatcher {
         savedEax: number,
         savedEdx: number,
         view: DataView,
+        exceptionCode: number = 0xC0000005,
     ): boolean {
         const mem = this.cachedMem8;
         if (!mem) return false;
@@ -5081,7 +5240,7 @@ export class ThunkDispatcher {
                 }
 
                 // Try to evaluate the filter statically
-                const filterResult = this._evaluateSimpleFilter(mem, filterAddr, 0xC0000005);
+                const filterResult = this._evaluateSimpleFilter(mem, filterAddr, exceptionCode);
 
                 if (filterResult === 1) {
                     // EXCEPTION_EXECUTE_HANDLER — jump to except block (fast path)
@@ -5130,7 +5289,7 @@ export class ThunkDispatcher {
 
         // --- Slow path: collect ALL frames and use static dispatch stub ---
         return this._setupSehDispatchStub(
-            cpu, faultAddr, faultingEip, isWrite, esp, savedEax, savedEdx, view, tebAddr, sehHead
+            cpu, faultAddr, faultingEip, isWrite, esp, savedEax, savedEdx, view, tebAddr, sehHead, exceptionCode
         );
     }
 
@@ -5155,6 +5314,7 @@ export class ThunkDispatcher {
         view: DataView,
         tebAddr: number,
         sehHead: number,
+        exceptionCode: number = 0xC0000005,
     ): boolean {
         if (this.sehScratchAddr === 0) {
             Logger.error(LogCategory.SYSTEM, `SEH dispatch stub: scratch area not initialized`);
@@ -5187,13 +5347,16 @@ export class ThunkDispatcher {
         const regs = cpu.reg32;
 
         // --- Build EXCEPTION_RECORD ---
-        view.setUint32(scratchAddr + SEH_SCRATCH_LAYOUT.EXCEPTION_RECORD + 0, 0xC0000005, true);
+        // AVs carry 2 ExceptionInformation params (read/write flag + address);
+        // other statuses (e.g. STATUS_ILLEGAL_INSTRUCTION) carry none.
+        const numParams = exceptionCode === 0xC0000005 ? 2 : 0;
+        view.setUint32(scratchAddr + SEH_SCRATCH_LAYOUT.EXCEPTION_RECORD + 0, exceptionCode, true);
         view.setUint32(scratchAddr + SEH_SCRATCH_LAYOUT.EXCEPTION_RECORD + 4, 0, true);
         view.setUint32(scratchAddr + SEH_SCRATCH_LAYOUT.EXCEPTION_RECORD + 8, 0, true);
         view.setUint32(scratchAddr + SEH_SCRATCH_LAYOUT.EXCEPTION_RECORD + 12, faultingEip, true);
-        view.setUint32(scratchAddr + SEH_SCRATCH_LAYOUT.EXCEPTION_RECORD + 16, 2, true);
-        view.setUint32(scratchAddr + SEH_SCRATCH_LAYOUT.EXCEPTION_RECORD + 20, isWrite ? 1 : 0, true);
-        view.setUint32(scratchAddr + SEH_SCRATCH_LAYOUT.EXCEPTION_RECORD + 24, faultAddr, true);
+        view.setUint32(scratchAddr + SEH_SCRATCH_LAYOUT.EXCEPTION_RECORD + 16, numParams, true);
+        view.setUint32(scratchAddr + SEH_SCRATCH_LAYOUT.EXCEPTION_RECORD + 20, numParams ? (isWrite ? 1 : 0) : 0, true);
+        view.setUint32(scratchAddr + SEH_SCRATCH_LAYOUT.EXCEPTION_RECORD + 24, numParams ? faultAddr : 0, true);
 
         // --- Build minimal CONTEXT ---
         const ctxBase = scratchAddr + SEH_SCRATCH_LAYOUT.CONTEXT;

@@ -1,6 +1,8 @@
 // thunk-generator.ts
 // Generates x86 stubs that trigger UD2 exceptions for WinAPI interception
 
+import { deriveStackCleanupFromMangledName } from "./msvc-mangling";
+
 export interface ThunkStub {
     address: number;
     dllName: string;
@@ -45,6 +47,21 @@ export class ThunkGenerator {
     private normalizedNameToStubs: Map<string, ThunkStub[]> = new Map();
     /** Data exports: dll:name -> guest memory address. No thunk stub generated; IAT points directly to data. */
     private dataExportAddresses: Map<string, number> = new Map();
+
+    /** stdcall RET-N bytes: explicit override → argCount×4 → MSVC-mangled-name derivation. */
+    private resolveBytesToPop(
+        exportName: string,
+        isStdcall: boolean,
+        argCount?: number,
+        stackCleanupBytes?: number
+    ): number | undefined {
+        let bytesToPop = stackCleanupBytes ?? (argCount !== undefined && argCount >= 0 ? argCount * 4 : undefined);
+        if (isStdcall && bytesToPop === undefined && exportName.startsWith('?')) {
+            // MSVC C++ mangling encodes the convention + parameter list (0 for __cdecl).
+            bytesToPop = deriveStackCleanupFromMangledName(exportName);
+        }
+        return bytesToPop;
+    }
 
     private appendStubIndex(index: Map<string, ThunkStub[]>, key: string, stub: ThunkStub): void {
         const existing = index.get(key);
@@ -174,7 +191,7 @@ export class ThunkGenerator {
             // cdecl: caller cleans stack, use C3 (RET)
             // stdcall: callee cleans stack, use C2 NN NN (RET N). Prefer stackCleanupBytes when decoration is wrong.
             const isStdcall = !info.callingConvention || info.callingConvention === 'stdcall';
-            const bytesToPop = info.stackCleanupBytes ?? (info.argCount !== undefined && info.argCount >= 0 ? info.argCount * 4 : undefined);
+            const bytesToPop = this.resolveBytesToPop(exportName, isStdcall, info.argCount, info.stackCleanupBytes);
 
             if (isStdcall) {
                 if (bytesToPop === undefined || bytesToPop < 0) {
@@ -240,7 +257,7 @@ export class ThunkGenerator {
         const stubAddress = this.currentAddress;
         const functionId = this.nextFunctionId++;
         const isStdcall = !callingConvention || callingConvention === 'stdcall';
-        const bytesToPop = stackCleanupBytes ?? (argCount !== undefined && argCount >= 0 ? argCount * 4 : undefined);
+        const bytesToPop = this.resolveBytesToPop(exportName, isStdcall, argCount, stackCleanupBytes);
         if (isStdcall && bytesToPop === undefined) {
             throw new Error(
                 `[ThunkGenerator] allocateOneStub requires argCount or stackCleanupBytes for stdcall: ${dllName}:${exportName}`

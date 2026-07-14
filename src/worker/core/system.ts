@@ -310,10 +310,17 @@ export class System {
             return dispatcher.threadOwnsSuspendedFrame(threadId);
         };
         this.scheduler.onUnhandledGuestFault = (threadId, eip) => {
-            // Faithful: an unhandled access violation terminates the PROCESS (not an
-            // infinite one-thread spin that freezes the whole emulator). The #PF
-            // handler already populated faultRecorder; reportGuestCrash merges it in.
-            this.reportGuestCrash({ reason: "Unhandled access violation", eip, threadId });
+            // Faithful: an unhandled exception on the main thread terminates the
+            // PROCESS (not an infinite one-thread spin that freezes the whole
+            // emulator). The fault handler already populated faultRecorder;
+            // reportGuestCrash merges it in.
+            const status = faultRecorder.last()?.errorCode ?? 0;
+            const reason = status === 0xC000001D
+                ? "Unhandled illegal instruction"
+                : status === 0xC0000005
+                    ? "Unhandled general protection fault"
+                    : "Unhandled access violation";
+            this.reportGuestCrash({ reason, eip, threadId });
         };
 
         Logger.log(LogCategory.SYSTEM, 'System initialized');
@@ -410,6 +417,41 @@ export class System {
         } catch { /* not in a worker context (tests) */ }
 
         // Harness: one event for every crash class, not just #PF AVs.
+        try { harnessBus.emit('fault', fault); } catch { /* */ }
+    }
+
+    /**
+     * Non-fatal sibling of reportGuestCrash: an unhandled #GP/#UD on a WORKER
+     * thread terminated that thread but the process keeps running. Emits the same
+     * fault-grade payload on the harness bus (so `waitForEvent('fault')` and
+     * `faults()` see it) WITHOUT tearing the process down or notifying the host.
+     */
+    reportGuestThreadFault(opts: {
+        reason: string;
+        eip: number;
+        threadId: number | null;
+        exceptionCode: number;
+    }): void {
+        const rec = faultRecorder.last();
+        const fault: CrashFaultPayload = {
+            reason: opts.reason,
+            eip: opts.eip >>> 0,
+            faultAddr: (rec?.faultAddr ?? 0) >>> 0,
+            errorCode: opts.exceptionCode >>> 0,
+            threadId: opts.threadId ?? rec?.threadId ?? null,
+            lastThunk: rec?.lastThunk ?? "",
+            regs: rec?.regs ?? null,
+            recentCalls: rec?.recentCalls ?? [],
+            gameEsp: (rec?.gameEsp ?? 0) >>> 0,
+            stackDump: rec?.stackDump ?? [],
+        };
+        this.enrichFaultReport(fault);
+
+        Logger.error(LogCategory.SYSTEM,
+            `Thread fault (survivable): ${fault.reason} — EIP=0x${fault.eip.toString(16)} ` +
+            `status=0x${fault.errorCode.toString(16)} thread=T${fault.threadId ?? "?"} ` +
+            `lastThunk=${fault.lastThunk || "unknown"}`);
+
         try { harnessBus.emit('fault', fault); } catch { /* */ }
     }
 
