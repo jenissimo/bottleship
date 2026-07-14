@@ -11,7 +11,8 @@ import { DESKTOP_HWND } from '../../runtime/windowing/window-manager';
 import { getWindowClass, getWindowClassByName } from './class';
 import { Marshaler } from '../../core/memory/marshaler';
 import { Mem } from '../../core/memory/mem-accessor';
-import { WindowInfo, windows, incrementNextWindowId, getCursorDisplayCount, updateCursorDisplayCount, getAbsoluteWindowPosition, markGuestCustomPaint, killWindowTimers, registerWindowDestroyFinalizer, reorderChildInParent, setLockWindowUpdate, isWindowUpdateLocked } from './shared-state';
+import { WindowInfo, windows, incrementNextWindowId, getCursorDisplayCount, updateCursorDisplayCount, isGuestCursorVisible, isCurrentCursorCustom, installCursorAndUpdateHostVisibility, getAbsoluteWindowPosition, markGuestCustomPaint, killWindowTimers, registerWindowDestroyFinalizer, reorderChildInParent, setLockWindowUpdate, isWindowUpdateLocked } from './shared-state';
+import { isGameScreenOwned } from './dialog-overlay';
 import {
     invalidateWindow,
     validateWindow,
@@ -852,10 +853,18 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         }
 
         if (Msg === WM_SETCURSOR) {
-            // Default WM_SETCURSOR: if hit-test is HTCLIENT, the OS sets the cursor
-            // to the class cursor (hCursor from RegisterClass). Most games handle
-            // WM_SETCURSOR themselves or register with hCursor=NULL, so this is
-            // primarily for correctness. We return TRUE to indicate "cursor was set".
+            // Default WM_SETCURSOR: on HTCLIENT install the class cursor (hCursor from
+            // RegisterClass). This re-shows the pointer after SetCursor(NULL) — only
+            // SetCursor writes currentCursorHandle, so without it NULL sticks forever.
+            if ((lParam & 0xFFFF) === HTCLIENT) {
+                const classInfo = win?.classId !== undefined
+                    ? getWindowClass(win.classId)
+                    : (win?.nativeClassName ? getWindowClassByName(win.nativeClassName) : undefined);
+                const classCursor = (classInfo?.hCursor ?? 0) >>> 0;
+                if (classCursor !== 0) {
+                    installCursorAndUpdateHostVisibility(classCursor, isGameScreenOwned());
+                }
+            }
             return 1;
         }
 
@@ -1144,7 +1153,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         const bShow = args[0] !== 0;
         const prevCount = getCursorDisplayCount();
         const nextCount = updateCursorDisplayCount(bShow ? 1 : -1);
-        const visible = nextCount >= 0;
+        const visible = isGuestCursorVisible() && !(isCurrentCursorCustom() && isGameScreenOwned());
         System.getInstance().requestHostCursorVisible(visible);
         Logger.verbose(LogCategory.USER32, `ShowCursor(${bShow ? 1 : 0}) -> ${nextCount} (prev=${prevCount}), visible=${visible}`);
         return nextCount;

@@ -353,6 +353,47 @@ export function getCursorDisplayCount(): number {
     return cursorDisplayCount;
 }
 
+// Current cursor handle (SetCursor). A NULL cursor hides the pointer over the
+// window regardless of the ShowCursor display count — SDL2 hides its cursor
+// this way (WIN_ShowCursor → SetCursor(NULL)), never touching ShowCursor.
+let currentCursorHandle = 1;
+// SetCursor installed a game-authored cursor image (CreateIconIndirect/CreateCursor
+// user object) rather than a system shape. The host arrow misrepresents it.
+let currentCursorIsCustom = false;
+
+export function setCurrentCursorHandle(hCursor: number, isCustom = false): number {
+    const prev = currentCursorHandle;
+    currentCursorHandle = hCursor >>> 0;
+    currentCursorIsCustom = isCustom && hCursor !== 0;
+    return prev;
+}
+
+export function isCurrentCursorCustom(): boolean {
+    return currentCursorIsCustom;
+}
+
+/** Effective host-cursor visibility: display count ≥ 0 AND a non-NULL cursor set. */
+export function isGuestCursorVisible(): boolean {
+    return cursorDisplayCount >= 0 && currentCursorHandle !== 0;
+}
+
+/**
+ * SetCursor semantics shared by user32 SetCursor and DefWindowProc WM_SETCURSOR:
+ * install the handle (custom = game-authored CURSOR user object) and recompute
+ * host-cursor visibility. `gameScreenOwned` is passed in (dialog-overlay's
+ * isGameScreenOwned) to avoid an import cycle.
+ */
+export function installCursorAndUpdateHostVisibility(
+    hCursor: number,
+    gameScreenOwned: boolean
+): { prev: number; custom: boolean; hostVisible: boolean } {
+    const custom = System.getInstance().resourceProvider.getUserObject?.(hCursor)?.type === 'CURSOR';
+    const prev = setCurrentCursorHandle(hCursor, custom);
+    const hostVisible = isGuestCursorVisible() && !(isCurrentCursorCustom() && gameScreenOwned);
+    System.getInstance().requestHostCursorVisible(hostVisible);
+    return { prev, custom, hostVisible };
+}
+
 export function updateCursorDisplayCount(delta: number): number {
     cursorDisplayCount += delta;
     // Clamp to -1 minimum: on real Windows the counter can go deeply negative,
@@ -398,6 +439,8 @@ export function resetUser32SharedState(): void {
     nextWindowId = 1;
     cursorDisplayCount = 0;
     cursorClipped = false;
+    currentCursorHandle = 1;
+    currentCursorIsCustom = false;
     lastLoadStringHint = null;
     capturedHwnd = 0;
     buttonCheckStates.clear();

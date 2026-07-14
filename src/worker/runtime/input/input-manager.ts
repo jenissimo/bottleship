@@ -11,6 +11,8 @@ import { getWindowByHandle } from '../../modules/user32/window';
 import { vkToDik } from '../../modules/dinput/dinput-vk-dik';
 
 // Windows message constants
+const WM_SETCURSOR     = 0x0020;
+const HTCLIENT         = 1;
 const WM_MOUSEMOVE     = 0x0200;
 const WM_LBUTTONDOWN   = 0x0201;
 const WM_LBUTTONUP     = 0x0202;
@@ -602,6 +604,12 @@ export class InputManager {
         if (mouseX !== this.lastMouseX || mouseY !== this.lastMouseY) {
             if (enqueue && !buttonChanged) {
                 const wParam = this.buttonsToWParam(buttons);
+                // Windows sends WM_SETCURSOR (hit-test HTCLIENT, trigger message in the
+                // high word) ahead of client-area mouse messages — apps re-assert their
+                // cursor there (SDL2 applies SDL_ShowCursor state ONLY in this handler,
+                // so without it a hidden/blank cursor request is never observed).
+                this.windowManager.postMessage(mouseTargetHwnd, WM_SETCURSOR, mouseTargetHwnd,
+                    (HTCLIENT | (WM_MOUSEMOVE << 16)) >>> 0, screenX, screenY, 0, keyStateSnapshot);
                 this.windowManager.postMessage(mouseTargetHwnd, WM_MOUSEMOVE, wParam, mouseLParam, screenX, screenY, 0, keyStateSnapshot);
                 Logger.verbose(LogCategory.SYSTEM, `Input: MouseMove (${clientX}, ${clientY})`);
             }

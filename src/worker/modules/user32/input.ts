@@ -561,9 +561,14 @@ export function createInputExports(): Record<string, ThunkImplementation> {
     };
 
     // BOOL RegisterRawInputDevices(PCRAWINPUTDEVICE, UINT uiNumDevices, UINT cbSize)
+    // Must FAIL: we never deliver WM_INPUT, and claiming success makes SDL2 (2.0.18+)
+    // switch focused-window mouse motion to the raw-input path and ignore
+    // WM_MOUSEMOVE coordinates — frozen in-game cursor. A failed registration is
+    // the honest contract; callers fall back to normal window messages.
     exports['RegisterRawInputDevices'] = (ctx, mem, args) => {
-        Logger.verbose(LogCategory.USER32, `RegisterRawInputDevices(uiNumDevices=${args[1] >>> 0})`);
-        return 1; // TRUE — accept the registration (we just don't deliver WM_INPUT)
+        Logger.verbose(LogCategory.USER32, `RegisterRawInputDevices(uiNumDevices=${args[1] >>> 0}) -> FALSE (no WM_INPUT delivery)`);
+        System.getInstance().scheduler.setLastError(120); // ERROR_CALL_NOT_IMPLEMENTED
+        return 0;
     };
 
     // UINT GetRegisteredRawInputDevices(PRAWINPUTDEVICE, PUINT puiNumDevices, UINT cbSize)

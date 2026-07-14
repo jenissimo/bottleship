@@ -28,7 +28,9 @@ import {
     noteLoadStringForDialog,
     windows,
     getAbsoluteWindowPosition,
+    installCursorAndUpdateHostVisibility,
 } from './shared-state';
+import { isGameScreenOwned } from './dialog-overlay';
 
 // System color table (COLORREF: 0x00BBGGRR) — mutable via SetSysColors
 const sysColors = new Map<number, number>([
@@ -1201,13 +1203,16 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
 
     // SetCursor - set cursor shape
     exports['SetCursor'] = (ctx, mem, args) => {
-        const hCursor = args[0];
-
-        Logger.verbose(LogCategory.USER32, `SetCursor(0x${hCursor.toString(16)})`);
-
-        // For now, just return the cursor handle
-        // In a full implementation, we would change the actual cursor shape
-        return hCursor;
+        const hCursor = args[0] >>> 0;
+        // SetCursor(NULL) hides the pointer (SDL2 hides its cursor this way, never
+        // calling ShowCursor). A game-authored cursor image (CreateIconIndirect user
+        // object) over a game-owned screen also hides the HOST arrow: the game draws
+        // its own cursor shape, and a second host pointer misrepresents the screen —
+        // this is also the signal that arms the pointer-lock intent for grab/relative
+        // mouse games (AGS mouse-speed control, UE warpers).
+        const { prev, custom, hostVisible } = installCursorAndUpdateHostVisibility(hCursor, isGameScreenOwned());
+        Logger.verbose(LogCategory.USER32, `SetCursor(0x${hCursor.toString(16)}) custom=${custom} hostVisible=${hostVisible} -> prev=0x${prev.toString(16)}`);
+        return prev;
     };
 
     // SystemParametersInfo - retrieves or sets system-wide parameters
@@ -1541,12 +1546,17 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         return 1;
     };
 
+    // Bumped on every clipboard content change (EmptyClipboard/SetClipboardData),
+    // mirroring the real counter's "changed since last check" contract.
+    let clipboardSequence = 1;
+
     exports['EmptyClipboard'] = (ctx, mem, args) => {
         if (!isClipboardOpen()) {
             System.getInstance().scheduler.setLastError(1418); // ERROR_CLIPBOARD_NOT_OPEN
             return 0;
         }
         emptyClipboardState();
+        clipboardSequence++;
         System.getInstance().scheduler.setLastError(0);
         return 1;
     };
@@ -1561,9 +1571,12 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         }
 
         clipboardDataByFormat.set(uFormat, hMem);
+        clipboardSequence++;
         System.getInstance().scheduler.setLastError(0);
         return hMem;
     };
+
+    exports['GetClipboardSequenceNumber'] = () => clipboardSequence;
 
     exports['GetClipboardData'] = (ctx, mem, args) => {
         const uFormat = args[0] >>> 0;
