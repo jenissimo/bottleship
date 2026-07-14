@@ -180,6 +180,10 @@ const WHDR_INQUEUE = 0x00000010;
 const WAVE_FORMAT_QUERY  = 0x0001;
 const WAVE_FORMAT_DIRECT = 0x0008;
 
+// Target queued-ahead depth (ms of audio in the SAB ring past the play cursor)
+// maintained by early-completing interior buffers — see checkCompletions.
+const WAVEOUT_DEVICE_LEAD_MS = 60;
+
 const TIME_MS = 0x0001;
 const TIME_SAMPLES = 0x0002;
 const TIME_BYTES = 0x0004;
@@ -631,18 +635,22 @@ export class WinMM implements IModule {
 
         this.updatePlayedBytes(device);
 
-        // Look-ahead: complete buffers slightly before the play cursor reaches their
-        // exact end. waveOutWrite already copied data to the ring, so WHDR_DONE just
-        // means "you can reuse your guest buffer." The look-ahead compensates for the
-        // ~5ms poller interval — without it, each buffer's completion is delayed by
-        // 0-5ms, and over 16 buffers this causes ~10% audio underrun.
-        // 5ms of audio data at the device's byte rate matches the poller interval.
+        // WHDR_DONE = mixer-consumed (WDM contract), clocked by the real play cursor.
+        // A buffer with a queued successor may complete up to WAVEOUT_DEVICE_LEAD_MS
+        // early to absorb our completion-delivery latency; the LAST pending buffer
+        // completes only at true playback end, so drain semantics stay exact.
+        const ringBytes = getCtrl(device.sab, CTRL_BUFFER_BYTES);
         const lookAheadBytes = Math.ceil(device.format.avgBytesPerSec * 0.005);
+        const leadBytes = Math.min(
+            Math.ceil(device.format.avgBytesPerSec * (WAVEOUT_DEVICE_LEAD_MS / 1000)),
+            ringBytes >> 2,
+        );
 
         while (device.pendingBuffers.length > 0) {
             const pending = device.pendingBuffers[0];
-            const completionThreshold = Math.max(0, pending.endOffset - lookAheadBytes);
-            if (device.playedBytes >= completionThreshold) {
+            const unplayedThroughEnd = pending.endOffset - device.playedBytes;
+            const threshold = device.pendingBuffers.length > 1 ? leadBytes : lookAheadBytes;
+            if (unplayedThroughEnd <= threshold) {
                 device.pendingBuffers.shift();
 
                 // Set WHDR_DONE, clear WHDR_INQUEUE in guest memory
