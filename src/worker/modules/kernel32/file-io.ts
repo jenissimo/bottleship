@@ -666,14 +666,10 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         return exports['OpenFile']!(ctx, mem, [lpPathName, 0, iReadWrite]);
     };
 
-    exports['CreateFileW'] = async (ctx, mem, args) => {
+    exports['CreateFileW'] = (ctx, mem, args) => {
         const lpFileName = args[0];
         const dwDesiredAccess = args[1];
-        const dwShareMode = args[2];
-        const lpSecurityAttributes = args[3]; // unused
         const dwCreationDisposition = args[4];
-        const dwFlagsAndAttributes = args[5];
-        const hTemplateFile = args[6]; // unused
 
         // For simplicity, convert wide string to ASCII
         const filename = lpFileName ? readStringW(mem, lpFileName) : '';
@@ -694,31 +690,51 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             return handleId;
         }
 
-        try {
-            const vfs = System.getInstance().fileSystem;
-            let vfsHandle = await vfs.open(filename, dwDesiredAccess, dwCreationDisposition);
+        const vfs = System.getInstance().fileSystem;
 
-            // Generic UE1 first-run: OPEN_EXISTING read-miss on Detected.ini / a
-            // config-ini → materialize/seed into the overlay, then retry (gated on ue1).
-            if (!vfsHandle && await tryUe1FirstRunMaterialize(filename, dwDesiredAccess, dwCreationDisposition)) {
-                vfsHandle = await vfs.open(filename, dwDesiredAccess, dwCreationDisposition);
-            }
-
-            if (!vfsHandle) {
-                Logger.verbose(LogCategory.KERNEL32, `CreateFileW: file not found or cannot be opened`);
-                System.getInstance().scheduler.setLastError(ERROR_FILE_NOT_FOUND);
-                return INVALID_HANDLE_VALUE;
-            }
-
-            const handle = new FileHandleWrapper(vfsHandle, vfs);
-            const resourceProvider = System.getInstance().resourceProvider;
-            const handleId = resourceProvider.registerFileHandle(handle);
-            Logger.verbose(LogCategory.KERNEL32, `CreateFileW: opened file handle 0x${handleId.toString(16)}`);
+        // Fast path: resolve synchronously (matches CreateFileA and the synchronous
+        // Win32 CreateFile contract). Returning a Promise here would make the thunk
+        // ASYNC and park the thread mid-open — which corrupts the CRT's in-flight fd
+        // allocation (VC2005 __sopen allocates an fd BEFORE CreateFileW), leaving a
+        // FILE* with _file=-1 that later _close(-1)s → _invalid_parameter throw.
+        const syncHandle = vfs.openSync(filename, dwDesiredAccess, dwCreationDisposition);
+        if (syncHandle !== null) {
+            const handle = new FileHandleWrapper(syncHandle, vfs);
+            const handleId = System.getInstance().resourceProvider.registerFileHandle(handle);
+            Logger.log(LogCategory.KERNEL32, `CreateFileW: OK "${filename}" handle=0x${handleId.toString(16)} (sync, source=${syncHandle.source})`);
+            System.getInstance().scheduler.setLastError(0);
             return handleId;
-        } catch (error) {
-            Logger.error(LogCategory.KERNEL32, `CreateFileW failed: ${error}`);
+        }
+
+        const openFailure = vfs.classifyOpenFailure(filename, dwCreationDisposition);
+        const disp = dwCreationDisposition >>> 0;
+        // OPEN_EXISTING miss / path-not-found: fail synchronously, exactly like CreateFileA.
+        if (disp === 3 || openFailure === ERROR_PATH_NOT_FOUND || (disp === 1 && openFailure === 0xB7 /* ERROR_ALREADY_EXISTS */)) {
+            Logger.verbose(LogCategory.KERNEL32, `CreateFileW: FAILED "${filename}" disposition=${disp} err=${openFailure}`);
+            System.getInstance().scheduler.setLastError(openFailure);
             return INVALID_HANDLE_VALUE;
         }
+
+        // Async path: overlay files / create dispositions that must write.
+        return (async () => {
+            try {
+                let vfsHandle = await vfs.open(filename, dwDesiredAccess, dwCreationDisposition);
+                if (!vfsHandle && await tryUe1FirstRunMaterialize(filename, dwDesiredAccess, dwCreationDisposition)) {
+                    vfsHandle = await vfs.open(filename, dwDesiredAccess, dwCreationDisposition);
+                }
+                if (!vfsHandle) {
+                    System.getInstance().scheduler.setLastError(openFailure || ERROR_FILE_NOT_FOUND);
+                    return INVALID_HANDLE_VALUE;
+                }
+                const handle = new FileHandleWrapper(vfsHandle, vfs);
+                const handleId = System.getInstance().resourceProvider.registerFileHandle(handle);
+                Logger.verbose(LogCategory.KERNEL32, `CreateFileW: opened file handle 0x${handleId.toString(16)} source=${vfsHandle.source}`);
+                return handleId;
+            } catch (error) {
+                Logger.error(LogCategory.KERNEL32, `CreateFileW failed: ${error}`);
+                return INVALID_HANDLE_VALUE;
+            }
+        })();
     };
 
     const copyFileImpl = async (srcPath: string, dstPath: string, bFailIfExists: boolean): Promise<number> => {
@@ -925,6 +941,38 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             ? `MoveFileW: OK "${srcPath}" -> "${dstPath}"`
             : `MoveFileW: FAILED delete-source "${srcPath}" -> "${dstPath}" err=${System.getInstance().scheduler.getLastError()}`);
         return deleteResult;
+    };
+
+    // MoveFileEx(lpExisting, lpNew, dwFlags). Unlike MoveFile it can overwrite an
+    // existing destination when MOVEFILE_REPLACE_EXISTING is set — several installers
+    // and self-test paths (Worms Armageddon's startup FS check) rely on the Ex form.
+    const MOVEFILE_REPLACE_EXISTING = 0x1;
+    const moveFileExImpl = async (srcPath: string, dstPath: string, dwFlags: number, tag: string): Promise<number> => {
+        const failIfExists = (dwFlags & MOVEFILE_REPLACE_EXISTING) === 0;
+        Logger.log(LogCategory.KERNEL32, `${tag}("${srcPath}" -> "${dstPath}", flags=0x${(dwFlags >>> 0).toString(16)})`);
+        await discardStaleRomRenameTemp(srcPath, dstPath);
+        const copyResult = await copyFileImpl(srcPath, dstPath, failIfExists);
+        if (!copyResult) {
+            Logger.log(LogCategory.KERNEL32, `${tag}: FAILED copy "${srcPath}" -> "${dstPath}" err=${System.getInstance().scheduler.getLastError()}`);
+            return 0;
+        }
+        const deleteResult = await deleteFileImpl(srcPath);
+        Logger.log(LogCategory.KERNEL32, deleteResult
+            ? `${tag}: OK "${srcPath}" -> "${dstPath}"`
+            : `${tag}: FAILED delete-source "${srcPath}" -> "${dstPath}" err=${System.getInstance().scheduler.getLastError()}`);
+        return deleteResult;
+    };
+
+    exports['MoveFileExA'] = async (ctx, mem, args) => {
+        const srcPath = args[0] ? readStringA(mem, args[0]) : '';
+        const dstPath = args[1] ? readStringA(mem, args[1]) : '';
+        return moveFileExImpl(srcPath, dstPath, args[2] >>> 0, 'MoveFileExA');
+    };
+
+    exports['MoveFileExW'] = async (ctx, mem, args) => {
+        const srcPath = args[0] ? readStringW(mem, args[0]) : '';
+        const dstPath = args[1] ? readStringW(mem, args[1]) : '';
+        return moveFileExImpl(srcPath, dstPath, args[2] >>> 0, 'MoveFileExW');
     };
 
     exports['CreateFileMappingA'] = (ctx, mem, args) => {

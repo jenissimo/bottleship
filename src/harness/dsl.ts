@@ -135,6 +135,7 @@ export class HarnessChain {
 
     // ── filesystem / registry ──
     fsRead(path: string): this { return this.push("fsRead", [path]); }
+    fsDelete(path: string): this { return this.push("fsDelete", [path]); }
     fsList(path: string): this { return this.push("fsList", [path]); }
     fsStat(path: string): this { return this.push("fsStat", [path]); }
     regGet(root: string, key: string, value?: string): this { return this.push("regGet", [root, key, value]); }

@@ -88,6 +88,15 @@ export function registerFsCommands(svc: HarnessService): void {
         return { path, exists, isDir, size: handle ? fsx.getFileSize(path) : null, source: handle?.source ?? null, inRom: fsx.hasRomFile?.(path) ?? null };
     });
 
+    /** fsDelete(path) — remove a file from the CoW overlay (reproduces a first-run
+     *  state after a seed/write; does not touch ROM). */
+    svc.register("fsDelete", async (args) => {
+        const path = String(args[0] ?? "");
+        if (!path) throw new HarnessError("fsDelete needs a path", HarnessErrorCode.BAD_ARGS);
+        const deleted = await vfs().deleteFile(path);
+        return { path, deleted };
+    });
+
     /** fsFlush() — durable flush (closes OPFS writers). The record/replay teardown barrier. */
     svc.register("fsFlush", async () => {
         await vfs().flushAll();
