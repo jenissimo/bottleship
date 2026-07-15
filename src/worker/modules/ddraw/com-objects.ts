@@ -121,6 +121,17 @@ export type SurfaceFormat = {
     aMask: number;
 };
 
+/** Device-held COM reference swap: AddRef the incoming object, Release the one it
+ *  replaces. Devices cache guest addresses (parent D3, current viewport); the real
+ *  device holds a reference on each, so a compliant guest Release can never free
+ *  an object the device still points at. */
+function swapDeviceComRef(oldAddr: number, newAddr: number): void {
+    if (oldAddr === newAddr) return;
+    const rp = SystemResourceProvider.getInstance();
+    if (newAddr) rp.getComObjectByAddress(newAddr)?.addRef();
+    if (oldAddr) rp.getComObjectByAddress(oldAddr)?.release();
+}
+
 // ============================================================================
 // SURFACE TYPE SYSTEM - Big Bang Architectural Refactor
 // ============================================================================
@@ -911,6 +922,7 @@ export class Direct3DDevice3Object extends BaseComObject {
     }
 
     setParentD3(addr: number): void {
+        swapDeviceComRef(this.parentD3Addr, addr);
         this.parentD3Addr = addr;
     }
 
@@ -927,6 +939,7 @@ export class Direct3DDevice3Object extends BaseComObject {
     }
 
     setCurrentViewport(addr: number): void {
+        swapDeviceComRef(this.currentViewportAddr, addr);
         this.currentViewportAddr = addr;
     }
 
@@ -1131,6 +1144,16 @@ export class Direct3DDevice3Object extends BaseComObject {
                 rtObj.release();
             }
             this.renderTargetAddr = 0;
+        }
+
+        // Release device-held refs on the current viewport and parent D3
+        if (this.currentViewportAddr) {
+            resourceProvider.getComObjectByAddress(this.currentViewportAddr)?.release();
+            this.currentViewportAddr = 0;
+        }
+        if (this.parentD3Addr) {
+            resourceProvider.getComObjectByAddress(this.parentD3Addr)?.release();
+            this.parentD3Addr = 0;
         }
 
         Logger.log(LogCategory.COM, "Direct3DDevice3Object cascade destroy complete");
@@ -1471,6 +1494,7 @@ export class Direct3DDevice7Object extends BaseComObject implements FFPLightingS
     }
 
     setParentD3(addr: number): void {
+        swapDeviceComRef(this.parentD3Addr, addr);
         this.parentD3Addr = addr;
     }
 
@@ -1487,6 +1511,7 @@ export class Direct3DDevice7Object extends BaseComObject implements FFPLightingS
     }
 
     setCurrentViewport(addr: number): void {
+        swapDeviceComRef(this.currentViewportAddr, addr);
         this.currentViewportAddr = addr;
     }
 

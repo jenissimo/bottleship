@@ -1,13 +1,13 @@
 import { Logger, LogCategory } from '../logger';
 import { Mem } from '../memory/mem-accessor';
-import type { RegionKind } from '../memory/address-space';
 
 export const COM_OBJECT_SIZE = 0x100;
 export const COM_GUARD_SIZE = 16;
 export const COM_GUARD_VALUE = 0xDEADBEEF;
+const COM_TOTAL_SIZE = COM_GUARD_SIZE + COM_OBJECT_SIZE + COM_GUARD_SIZE;
 
 interface ComMemoryFree {
-    free(ptr: number): void;
+    freeSystemBlock(addr: number, size: number): void;
 }
 
 /**
@@ -15,22 +15,19 @@ interface ComMemoryFree {
  * Layout: [GUARD 16b] [VTABLE_PTR 4b] [DATA...] [GUARD 16b]
  * Returns the address of the VTable pointer (the object's 'this' pointer).
  *
- * COM objects live in THUNK_DATA, NOT the game's HEAP bucket. On real Windows,
- * system DLLs (ddraw etc.) allocate from their own heap — a block the game frees
- * keeps its contents until the GAME reuses it. If our COM churn recycled game-freed
- * HEAP blocks, the zero-fill below would scribble ghost objects that use-after-free
- * games still virtual-call through (harmless on real Windows, NULL-vtable crash here).
+ * COM objects live in the system-object pool (MemoryManager.allocSystemBlock),
+ * NOT the game's HEAP bucket. On real Windows, system DLLs (ddraw etc.) allocate
+ * from their own heap: a block the game frees keeps its contents until the GAME
+ * reuses it, and a released COM object's memory survives until the next
+ * same-class system allocation claims it. The pool reproduces both properties.
  */
 export const allocateComObject = (
     memory: any,
     mem8: Uint8Array,
     vtableAddr: number,
-    kind: RegionKind = 'THUNK_DATA',
 ): number => {
-    // Allocate space for guard + vtable ptr + object data + guard
-    // Total size = COM_GUARD_SIZE + COM_OBJECT_SIZE + COM_GUARD_SIZE
-    const totalSize = COM_GUARD_SIZE + COM_OBJECT_SIZE + COM_GUARD_SIZE;
-    const addr = memory.alloc(totalSize, kind);
+    const totalSize = COM_TOTAL_SIZE;
+    const addr = memory.allocSystemBlock(totalSize);
 
     // Get fresh memory view after potential grow during alloc
     const freshMem8 = Mem.getView();
@@ -55,10 +52,10 @@ export const allocateComObject = (
     return objAddr;
 };
 
-/** Frees the backing allocation for a COM object returned by allocateComObject. */
+/** Returns the backing block of a COM object to the system-object pool. */
 export function freeComObject(memory: ComMemoryFree, objAddr: number): void {
     if (!objAddr) return;
-    memory.free((objAddr - COM_GUARD_SIZE) >>> 0);
+    memory.freeSystemBlock((objAddr - COM_GUARD_SIZE) >>> 0, COM_TOTAL_SIZE);
 };
 
 /**

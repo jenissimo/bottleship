@@ -78,6 +78,38 @@ export class MemoryManager {
         return (value + (align - 1)) & ~(align - 1);
     }
 
+    // System-object pool — the "system DLL's own heap" for COM objects. Fixed-size
+    // blocks carved from slab arenas (top-down, outside the guest bump frontier) and
+    // recycled via exact-size free stacks. A freed block keeps its bytes until the
+    // next same-size allocation claims it — the same reuse pattern as a real
+    // size-class system heap, which benign use-after-release guests depend on.
+    private static readonly SYS_POOL_ARENA_SIZE = 0x100000; // 1MB, grown on demand
+    private sysPoolArena: { next: number; limit: number } | null = null;
+    private sysPoolFree: Map<number, number[]> = new Map();
+
+    allocSystemBlock(size: number): number {
+        const aligned = this.alignUp(size, 16);
+        const free = this.sysPoolFree.get(aligned);
+        if (free && free.length > 0) return free.pop()!;
+        if (!this.sysPoolArena || this.sysPoolArena.next + aligned > this.sysPoolArena.limit) {
+            const arenaSize = Math.max(MemoryManager.SYS_POOL_ARENA_SIZE, this.alignUp(aligned, 0x10000));
+            const base = this.allocSlabArena(arenaSize);
+            this.sysPoolArena = { next: base, limit: base + arenaSize };
+        }
+        const addr = this.sysPoolArena.next;
+        this.sysPoolArena.next += aligned;
+        return addr;
+    }
+
+    /** Return a block from allocSystemBlock to its size-class free stack.
+     *  Intentionally does NOT clear the bytes (see pool comment above). */
+    freeSystemBlock(addr: number, size: number): void {
+        const aligned = this.alignUp(size, 16);
+        let free = this.sysPoolFree.get(aligned);
+        if (!free) { free = []; this.sysPoolFree.set(aligned, free); }
+        free.push(addr >>> 0);
+    }
+
     /** Record a ≥64KB block lifecycle event with a lightweight caller backtrace. */
     private logLargeEvent(op: 'alloc' | 'free' | 'alias', addr: number, size: number): void {
         if (size < MemoryManager.LARGE_ALLOC_THRESHOLD) return;
@@ -479,8 +511,11 @@ export class MemoryManager {
     reset(): void {
         this.allocations.clear();
         this.freeBlocks.clear();
+        this.largeFreeBlocks.clear();
         this.allocBucket.clear();
         this.reservedAddresses.clear();
+        this.sysPoolArena = null;
+        this.sysPoolFree.clear();
         this.totalAllocated = 0;
         this.currentBytes = 0;
         this.peakBytes = 0;

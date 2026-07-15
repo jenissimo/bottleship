@@ -1099,7 +1099,7 @@ export class Ole32 implements IModule {
         }
 
         // Allocate COM object: [vtablePtr]
-        const objAddr = allocateComObject(process.memory, mem, this.blowfishVtableAddr, 'THUNK_DATA');
+        const objAddr = allocateComObject(process.memory, mem, this.blowfishVtableAddr);
 
         // Create Blowfish state
         this.blowfishInstances.set(objAddr, { refCount: 1, cipher: new BlowfishCipher() });

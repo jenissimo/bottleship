@@ -12,6 +12,7 @@ import { ResourceTable } from '../resource-table';
 import { BaseComObject } from '../com/base-com-object';
 import { Logger, LogCategory } from '../logger';
 import { checkComGuard } from '../../modules/ddraw/constants';
+import { freeComObject } from '../com/com-memory';
 import { System } from '../system';
 
 export enum ResourceType {
@@ -246,14 +247,18 @@ export class SystemResourceProvider {
     unregisterComObject(handle: number): BaseComObject | null {
         const obj = this.comObjects.release(handle);
         if (obj) {
-            // Also cleanup address mapping
+            // Drop ALL address mappings for this handle (QueryInterface tear-offs and
+            // sub-objects map extra guest blocks to the same handle) and return each
+            // backing block to the system-object pool — real COM frees the object
+            // memory on final Release.
+            const memory = System.getInstance().process?.memory;
             for (const [addr, h] of this.addressToHandle.entries()) {
                 if (h === handle) {
                     this.addressToHandle.delete(addr);
-                    this.handleToAddress.delete(handle);
-                    break;
+                    if (memory) freeComObject(memory, addr);
                 }
             }
+            this.handleToAddress.delete(handle);
 
             // OPTIMIZATION: Cleanup surfacePtr index (O(1) using reverse mapping)
             const surfacePtr = this.handleToSurfacePtr.get(handle);

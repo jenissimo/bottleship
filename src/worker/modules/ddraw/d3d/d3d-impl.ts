@@ -133,6 +133,8 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
 
         obj.setParentD3(args[0]);
         obj.setRenderTarget(lpDDS);
+        // Device holds a reference on its render target from creation (released in destroy).
+        if (lpDDS) resourceProvider.getComObjectByAddress(lpDDS)?.addRef();
 
         const objAddr = allocateComObject(context.process.memory, mem, vtableAddr);
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
@@ -238,6 +240,8 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
 
         obj.setParentD3(args[0]);
         obj.setRenderTarget(lpDDS);
+        // Device holds a reference on its render target from creation (released in destroy).
+        if (lpDDS) resourceProvider.getComObjectByAddress(lpDDS)?.addRef();
 
         const objAddr = allocateComObject(context.process.memory, mem, vtableAddr);
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
@@ -715,6 +719,8 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
 
         obj.setParentD3(args[0]);
         if (lpDDS) obj.setRenderTarget(lpDDS);
+        // Device holds a reference on its render target from creation (released in destroy).
+        if (lpDDS) resourceProvider.getComObjectByAddress(lpDDS)?.addRef();
 
         const objAddr = allocateComObject(context.process.memory, mem, vtableAddr);
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);

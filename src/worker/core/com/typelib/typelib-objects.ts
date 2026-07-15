@@ -129,7 +129,7 @@ export class TypeLibRuntime {
         if (!this.typeLibVtableAddr) return E_OUTOFMEMORY;
         const process = this.process;
         const libAttrAddr = this.allocLibAttr(desc);
-        const objAddr = allocateComObject(process.memory, process.getCurrentMemory(), this.typeLibVtableAddr, "THUNK_DATA");
+        const objAddr = allocateComObject(process.memory, process.getCurrentMemory(), this.typeLibVtableAddr);
         this.typeLibInstances.set(objAddr, { refCount: 1, descriptor: desc, libAttrAddr });
         Mem.writeUint32(pptlib, objAddr);
         Logger.log(
@@ -174,8 +174,7 @@ export class TypeLibRuntime {
         const objAddr = allocateComObject(
             this.process.memory,
             this.process.getCurrentMemory(),
-            this.typeInfoVtableAddr,
-            "THUNK_DATA"
+            this.typeInfoVtableAddr
         );
         this.typeInfoInstances.set(objAddr, { refCount: 1, entry, libPtr, index, typeAttrAddr });
         return objAddr;

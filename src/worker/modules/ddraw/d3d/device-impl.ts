@@ -340,6 +340,8 @@ export const createDeviceExports = (
 
         const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DDevice7Object | null;
         const rt = obj ? obj.getRenderTarget() : 0;
+        // GetRenderTarget increments the surface's reference count.
+        if (rt) resourceProvider.getComObjectByAddress(rt)?.addRef();
 
         const view = getDataView(mem); // OPTIMIZED: Use cached DataView
         view.setUint32(lplpRT, rt, true);
@@ -1388,6 +1390,8 @@ export const createDeviceExports = (
 
         const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DDevice3Object | null;
         const rt = obj ? obj.getRenderTarget() : 0;
+        // GetRenderTarget increments the surface's reference count.
+        if (rt) resourceProvider.getComObjectByAddress(rt)?.addRef();
         const view = getDataView(mem);
         view.setUint32(lplpDDS, rt, true);
         return D3D_OK;
@@ -1411,6 +1415,8 @@ export const createDeviceExports = (
 
         const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DDevice3Object | null;
         const vp = obj ? obj.getCurrentViewport() : 0;
+        // GetCurrentViewport increments the viewport's reference count.
+        if (vp) resourceProvider.getComObjectByAddress(vp)?.addRef();
         const view = getDataView(mem);
         view.setUint32(lplpViewport, vp, true);
         return D3D_OK;
@@ -1800,8 +1806,25 @@ export const createDeviceExports = (
         const vpObj = resourceProvider.getComObjectByAddress(lpViewport) as Direct3DViewport3Object | null;
         if (vpObj) {
             vpObj.setDevice(thisPtr);
+            // The device's viewport list holds a reference until DeleteViewport.
+            vpObj.addRef();
         }
         Logger.log(LogCategory.SYSTEM, `IDirect3DDevice3_AddViewport: device=0x${thisPtr.toString(16)} vp=0x${lpViewport.toString(16)}`);
+        return D3D_OK;
+    };
+
+    exports["IDirect3DDevice3_DeleteViewport"] = (ctx, mem, args) => {
+        const thisPtr = args[0];
+        const lpViewport = args[1];
+        const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DDevice3Object | null;
+        const vpObj = resourceProvider.getComObjectByAddress(lpViewport) as Direct3DViewport3Object | null;
+        if (!vpObj) return D3DERR_INVALIDCALL;
+        // Deleting the current viewport leaves the device with none (real behavior).
+        if (obj && obj.getCurrentViewport() === lpViewport) {
+            obj.setCurrentViewport(0);
+        }
+        vpObj.release();
+        Logger.log(LogCategory.SYSTEM, `IDirect3DDevice3_DeleteViewport: device=0x${thisPtr.toString(16)} vp=0x${lpViewport.toString(16)}`);
         return D3D_OK;
     };
 
