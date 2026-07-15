@@ -30,7 +30,11 @@ function alignUp(n: number, a: number): number { return Math.ceil(n / a) * a; }
 // offset varies per draw (see bindProgrammable / acquireProgBindGroup).
 const VS_BIND_SIZE = 256 * 4 * 4; // 4096 bytes
 const PS_BIND_SIZE = 224 * 4 * 4; // 3584 bytes
-const PROG_CACHE_N = 64;          // material-keyed programmable bind-group cache slots
+// Material-keyed programmable bind-group cache slots (default; __progCacheN overrides).
+// Sized to hold a full track/level material working set: slots grow on demand
+// (progCacheLen), so small sets scan short regardless of the cap; an undersized cap
+// round-robin-thrashes and pays createBindGroup + GC on every evicted re-reference.
+const PROG_CACHE_N = 1024;
 const PROG_CONST_CACHE_N = 64;    // frame-local per-draw constant dynamic-offset cache slots
 
 /** A growable per-frame uniform ring written at 256-aligned offsets. */
@@ -159,8 +163,11 @@ export class D3D9BackendExecutor {
     // same (sampler + bound texture views). Direct compare on object identity →
     // correct-by-construction (a recreated view is a new object → miss → rebuild).
     // Invalidated only when an arena buffer is recreated (cached groups bind it).
+    // Slot count is boot-time tunable (harness setWorkerFlag('__progCacheN', N) before
+    // load_bundle) so capacity A/Bs need a reload, not a rebuild. Read once per executor.
+    private readonly progCacheN = ((globalThis as Record<string, unknown>).__progCacheN as number >>> 0) || PROG_CACHE_N;
     private progCacheSampler: (GPUSampler | null)[] = [];
-    private progCacheViews: (GPUTextureView | null)[] = new Array(PROG_CACHE_N * PROG_BIND.MAX_TEX).fill(null);
+    private progCacheViews: (GPUTextureView | null)[] = new Array(this.progCacheN * PROG_BIND.MAX_TEX).fill(null);
     private progCacheGroup: GPUBindGroup[] = [];
     // Per-slot cube mask: a bind group built for one layout (cube mask) is incompatible with a
     // pipeline using a different mask, so the mask is part of the cache identity.
@@ -1026,9 +1033,9 @@ export class D3D9BackendExecutor {
         }
         const bindGroup = device.createBindGroup({ layout: bindGroupLayout, entries });
 
-        const slot = this.progCacheLen < PROG_CACHE_N
+        const slot = this.progCacheLen < this.progCacheN
             ? this.progCacheLen++
-            : (this.progCacheCursor = (this.progCacheCursor + 1) % PROG_CACHE_N);
+            : (this.progCacheCursor = (this.progCacheCursor + 1) % this.progCacheN);
         this.progCacheSampler[slot] = sampler;
         this.progCacheCubeMask[slot] = cubeMask;
         const base = slot * MAX;
