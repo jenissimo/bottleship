@@ -454,7 +454,17 @@ function cmdPatchManifest(wgbPath: string, jsonPath: string, valueStr: string) {
     });
 
     let value: unknown;
-    try { value = JSON.parse(valueStr); } catch { value = valueStr; }
+    try { value = JSON.parse(valueStr); } catch {
+        // Looks like JSON but doesn't parse — almost always shell quoting mangling
+        // (e.g. Git Bash on Windows collapsing \\ in argv). Storing it as a raw
+        // string would silently break array/object manifest fields at load time.
+        if (/^[[{"]/.test(valueStr.trim())) {
+            console.error(`Value looks like JSON but failed to parse: ${valueStr}\n` +
+                `Fix the shell quoting (tip: use forward slashes in paths) or pass a plain string.`);
+            process.exit(1);
+        }
+        value = valueStr;
+    }
 
     const keys = jsonPath.split(".");
     let obj = manifest;

@@ -587,7 +587,10 @@ export class EmulatorConfig {
         }
 
         // Apply createDirs list (installer-created empty dirs lost by ZIP packing)
-        if (config.createDirs && config.createDirs.length > 0) {
+        if (config.createDirs && !Array.isArray(config.createDirs)) {
+            Logger.error(LogCategory.SYSTEM,
+                `EmulatorConfig: createDirs must be an array of paths, got ${typeof config.createDirs} — ignored`);
+        } else if (config.createDirs && config.createDirs.length > 0) {
             this.createDirs = config.createDirs
                 .filter((d) => typeof d === "string" && d.trim().length > 0);
             Logger.log(
