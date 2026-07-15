@@ -34,6 +34,7 @@ playable). Your mileage will vary with the exact build/version you own.
 | Nuclear Titbit (Ядерный Титбит) | playable | |
 | Airfix Dogfighter (demo) | playable | |
 | The Blackwell Legacy | playable | ✓ |
+| Sea Dogs | playable | ✓ |
 
 \* retail has an intermittent mode-switch hiccup; the demo does not.
 
@@ -44,7 +45,6 @@ playable). Your mileage will vary with the exact build/version you own.
 | XIII | in progress | ✓ |
 | The Longest Journey | in progress | ✓ |
 | Blade of Darkness | in progress | ✓ |
-| Sea Dogs | in progress † | ✓ |
 | Grand Theft Auto III | in progress | |
 | Harry Potter and the Chamber of Secrets | in progress ‡ | |
 | Red Faction | in progress | ✓ |
@@ -52,7 +52,6 @@ playable). Your mileage will vary with the exact build/version you own.
 | Half-Life | in progress | |
 | Serious Sam | in progress | ✓ |
 
-† Sea Dogs: reaches gameplay, but in-game text is not yet rendered.
 ‡ Chamber of Secrets: launches and runs, with graphical artifacts.
 
 ## Reporting compatibility
