@@ -6,6 +6,7 @@ import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { Marshaler } from '../../core/memory/marshaler';
 import { encodeAnsi } from '../codepage-utils';
+import { addFontResource, removeFontResource } from './font-resource';
 
 let nextMetafileHandle = 0x50000;
 
@@ -140,7 +141,7 @@ export function registerPaintingMiscExports(exports: Record<string, ThunkImpleme
     };
 
     // int AddFontResourceA(LPCSTR pszFilename)
-    exports['AddFontResourceA'] = (ctx, mem, args): number => {
+    exports['AddFontResourceA'] = (ctx, mem, args): number | Promise<number> => {
         const path = args[0] ? Marshaler.readString(mem, args[0]) : '';
         Logger.verbose(LogCategory.GDI32, `AddFontResourceA("${path}")`);
 
@@ -148,21 +149,36 @@ export function registerPaintingMiscExports(exports: Record<string, ThunkImpleme
 
         const vfs = System.getInstance().fileSystem;
         const resolved = vfs.resolvePath(path);
-        const exists = vfs.hasRomFile(resolved) || (vfs as any).overlay?.hasFile(resolved);
-        if (!exists) {
+        const size = vfs.getFileSize(resolved);
+        if (size <= 0) {
             Logger.verbose(LogCategory.GDI32, `AddFontResourceA: file not found "${path}"`);
             return 0;
         }
 
-        // Browser uses bundled web fonts; report one font added so callers proceed.
-        return 1;
+        // Async thunk: blocks the calling guest thread until the FontFace is
+        // installed — faithful to AddFontResource returning with the font usable.
+        return (async (): Promise<number> => {
+            try {
+                const GENERIC_READ = 0x80000000;
+                const OPEN_EXISTING = 3;
+                const handle = await vfs.open(resolved, GENERIC_READ, OPEN_EXISTING);
+                if (!handle) return 0;
+                const data = await vfs.read(handle, size);
+                return await addFontResource(resolved, data);
+            } catch (e) {
+                Logger.warn(LogCategory.GDI32, `AddFontResourceA: read failed for "${path}": ${e}`);
+                return 0;
+            }
+        })();
     };
 
     // BOOL RemoveFontResourceA(LPCSTR pszFilename)
     exports['RemoveFontResourceA'] = (ctx, mem, args): number => {
         const path = args[0] ? Marshaler.readString(mem, args[0]) : '';
         Logger.verbose(LogCategory.GDI32, `RemoveFontResourceA("${path}")`);
-        return 1;
+        if (!path) return 0;
+        const vfs = System.getInstance().fileSystem;
+        return removeFontResource(vfs.resolvePath(path)) ? 1 : 0;
     };
 
     // BOOL GetICMProfileW(HDC hdc, LPDWORD pBufSize, LPWSTR pszFilename)

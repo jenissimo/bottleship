@@ -32,7 +32,7 @@ console `await window.__BS__.harness.chain()....run()`):
 import { harness } from "../harness";
 await harness()
   .streamLogs(["SYSTEM","DDRAW"])
-  .openWgb("blade-of-darkness")            // /apps/external-wgb/<id>.wgb (local WGB drop-folder)
+  .openWgb(process.env.WGB ?? "/apps/external-wgb/<id>.wgb") // abs path (streamed off disk) or drop-folder URL — take it from env, don't hardcode local paths
   .waitForEvent("dialogShow")              // event-driven wait (HarnessEventBus)
   .click("Play Game")                      // faithful click by label (global coords)
   .tickFrames(120)                         // wait N presents after the click
@@ -52,6 +52,8 @@ manually-opened browser; automation uses the autoplay flag.
   a screenshot is ground truth; the main thread can't read it).
 - `textures()` + `dumpSurface(ptr|'primary')` — gallery + per-surface PNG to `logs/debug/`.
 - `surfacePixels(sel)` / `expectSurfaceNonBlack(sel)` — cheap liveness from a subsampled readback.
+- Dump PNGs preserve ALPHA: an area that looks WHITE in a viewer but BLACK on the canvas is
+  transparent (a=0), not white — sample the RGBA (readSurfaceRGBA) before concluding a color.
 
 ## 4. Diagnose
 

@@ -18,6 +18,7 @@ import {
     DDSCAPS_3DDEVICE,
     DDSCAPS_TEXTURE,
     D3DCLEAR_TARGET,
+    DDCKEY_COLORSPACE,
     DDCKEY_SRCBLT,
     DDCKEY_DESTBLT,
     DDBLT_KEYSRC,
@@ -586,7 +587,9 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
 
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         const low = view.getUint32(lpColorKey, true);
-        const high = view.getUint32(lpColorKey + 4, true);
+        // Without DDCKEY_COLORSPACE the key is a single color: dwColorSpaceHighValue
+        // is ignored by DirectDraw (games routinely leave it as stack garbage).
+        const high = (dwFlags & DDCKEY_COLORSPACE) !== 0 ? view.getUint32(lpColorKey + 4, true) : low;
 
         if (dwFlags & DDCKEY_SRCBLT) {
             state.srcColorKey = { low, high };

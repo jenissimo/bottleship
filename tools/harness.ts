@@ -70,9 +70,21 @@ async function waitForHarnessReady(session: CdpSession): Promise<void> {
     ).catch(() => {});
 }
 
-/** Hard-reload ?game=dev and wait for a fresh worker + harness facade. */
+/** Hard-reload ?game=dev and wait for a fresh worker + harness facade.
+ *  A marker on the pre-reload document distinguishes it from the fresh one —
+ *  polling readiness alone races navigation commit and can match the OLD page. */
 async function reloadPageAndWait(session: CdpSession): Promise<void> {
+    await pageEval(session, "window.__bs_pre_reload__ = 1, 'ok'", { timeoutMs: 5000 }).catch(() => {});
     await session.send("Page.reload", { ignoreCache: true });
+    for (let i = 0; i < 120; i++) {
+        const fresh = await pageEval(
+            session,
+            "!window.__bs_pre_reload__ && !!(window.__BS__ && window.__BS__.harness && window.loadApp)",
+            { timeoutMs: 5000 },
+        ).catch(() => false);
+        if (fresh) break;
+        await Bun.sleep(500);
+    }
     await waitForHarnessReady(session);
 }
 

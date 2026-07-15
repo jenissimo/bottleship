@@ -46,6 +46,12 @@ export class MemoryManager {
 
     // Free list: bucketKind → sorted array of {addr, size} blocks
     private freeBlocks: Map<RegionKind, Array<{ addr: number; size: number }>> = new Map();
+    // Released VirtualAlloc-class (≥LARGE_ALLOC_FRESH_THRESHOLD) ranges, kept apart from
+    // the small-block free list. Reused FIRST-FIT BY ADDRESS and zeroed, mirroring real
+    // VirtualAlloc: a same-size realloc sequence lands on the SAME addresses. Games lean
+    // on that determinism — e.g. an engine that re-creates its UI pools on re-entry and
+    // still holds stale pointers into the old (identically re-laid-out) pool.
+    private largeFreeBlocks: Map<RegionKind, Array<{ addr: number; size: number }>> = new Map();
     // Track which bucket kind each allocation belongs to
     private allocBucket: Map<number, RegionKind> = new Map();
 
@@ -61,6 +67,9 @@ export class MemoryManager {
     // tell UAF-reuse (alloc→free→alloc) from double-hand-out (alloc→alloc, no free)
     // from corruption (address only ever allocated by one subsystem).
     private static readonly LARGE_ALLOC_THRESHOLD = 0x10000; // 64KB = VirtualAlloc granularity
+    // NT-heap VirtualAlloc forwarding threshold (~508KB): requests at/above this size
+    // are served from fresh bump space, never from the free list (see allocateInBucket).
+    private static readonly LARGE_ALLOC_FRESH_THRESHOLD = 0x80000;
     private static readonly LARGE_ALLOC_LOG_SIZE = 4096;
     private largeAllocLog: Array<{ op: 'alloc' | 'free' | 'alias'; addr: number; size: number; time: number; bt: string }> = [];
     private largeAllocLogIdx = 0;
@@ -280,7 +289,13 @@ export class MemoryManager {
 
         if (bucketKind) {
             this.allocBucket.delete(ptr);
-            this.releaseToFreeList(bucketKind, ptr, size);
+            if (size >= MemoryManager.LARGE_ALLOC_FRESH_THRESHOLD) {
+                // VirtualAlloc-class blocks release into their own list, never the
+                // small-block free list (see allocateLargeFromReleased).
+                this.releaseLargeBlock(bucketKind, ptr, size);
+            } else {
+                this.releaseToFreeList(bucketKind, ptr, size);
+            }
         }
         this.logLargeEvent('free', ptr, size);
 
@@ -474,61 +489,148 @@ export class MemoryManager {
         this.refreshLayoutBuckets();
     }
 
-    private allocateInBucket(bucket: BucketState, size: number, alignment: number = 8, bucketKind?: RegionKind): number {
-        // Try free list first: find a block that fits (best-fit), then SPLIT the
-        // remainder back into the list. Pre-split behaviour used the entire block
-        // even when much larger than needed — a 4 MB freed block picked for a
-        // 256 KB alloc lost 3.75 MB until the game happened to free an exact-size
-        // block next to it. With splitting, NB scene churn converges: the first
-        // wave of allocs+frees establishes a free-list "shape" that all later
-        // scene loads can reuse without touching the bump pointer.
-        if (bucketKind) {
-            const list = this.freeBlocks.get(bucketKind);
-            if (list && list.length > 0) {
-                let bestIdx = -1;
-                let bestWaste = Infinity;
-                for (let i = 0; i < list.length; i++) {
-                    const block = list[i];
-                    const alignedAddr = this.alignUp(block.addr, alignment);
-                    const usable = block.size - (alignedAddr - block.addr);
-                    if (usable >= size) {
-                        const waste = usable - size;
-                        if (waste < bestWaste) {
-                            bestWaste = waste;
-                            bestIdx = i;
-                        }
-                    }
-                }
-                if (bestIdx >= 0) {
-                    const block = list[bestIdx];
-                    list.splice(bestIdx, 1);
-                    const alignedAddr = this.alignUp(block.addr, alignment);
-                    const preWaste = alignedAddr - block.addr;
-                    const tailStart = alignedAddr + size;
-                    const tailSize = block.addr + block.size - tailStart;
-                    // Push back unused head (alignment padding) and tail.
-                    // Threshold: 16 bytes — smaller fragments not worth tracking
-                    // and would inflate the free-list search cost.
-                    if (preWaste >= 16) {
-                        this.releaseToFreeList(bucketKind, block.addr, preWaste);
-                    }
-                    if (tailSize >= 16) {
-                        this.releaseToFreeList(bucketKind, tailStart, tailSize);
-                    }
-                    // Hand out zeroed memory. Strictly, Win32 HeapAlloc without HEAP_ZERO_MEMORY
-                    // leaves a reused block dirty — but this best-fit free list reuses far more
-                    // aggressively than the real heap (which prefers per-size-class fresh commits,
-                    // whose pages come zeroed via the VirtualAlloc/MEM_COMMIT guarantee). A guest
-                    // that reads a just-allocated field expecting the zero a fresh commit would have
-                    // given (a very common pattern) otherwise sees our stale reuse — the Re-Volt
-                    // "garbage vertex / wild index" corruption. Zeroing matches that observable
-                    // fresh-memory contract and is safe: correct code never relies on reused-dirty.
-                    this.addressSpace.fill(alignedAddr, size, 0);
-                    return alignedAddr;
+    /** Release a VirtualAlloc-class range into the large list (sorted, coalescing
+     *  ONLY with adjacent large ranges — never merged into the small free list). */
+    private releaseLargeBlock(bucketKind: RegionKind, addr: number, size: number): void {
+        let list = this.largeFreeBlocks.get(bucketKind);
+        if (!list) { list = []; this.largeFreeBlocks.set(bucketKind, list); }
+        let lo = 0, hi = list.length;
+        while (lo < hi) {
+            const mid = (lo + hi) >>> 1;
+            if (list[mid].addr < addr) lo = mid + 1; else hi = mid;
+        }
+        // Coalesce with neighbors when contiguous.
+        if (lo > 0 && list[lo - 1].addr + list[lo - 1].size === addr) {
+            list[lo - 1].size += size;
+            if (lo < list.length && list[lo - 1].addr + list[lo - 1].size === list[lo].addr) {
+                list[lo - 1].size += list[lo].size;
+                list.splice(lo, 1);
+            }
+            return;
+        }
+        if (lo < list.length && addr + size === list[lo].addr) {
+            list[lo].addr = addr;
+            list[lo].size += size;
+            return;
+        }
+        list.splice(lo, 0, { addr, size });
+    }
+
+    /** First-fit (lowest address) over released VirtualAlloc-class ranges. Returns the
+     *  zeroed head of the first range that fits, or 0. Address-ordered first-fit is the
+     *  real VirtualAlloc search order — a same-size release/re-allocate sequence yields
+     *  the SAME base address, which stale-pointer-holding games depend on. */
+    private allocateLargeFromReleased(bucketKind: RegionKind, size: number, alignment: number): number {
+        const list = this.largeFreeBlocks.get(bucketKind);
+        if (!list || list.length === 0) return 0;
+        for (let i = 0; i < list.length; i++) {
+            const block = list[i];
+            const alignedAddr = this.alignUp(block.addr, alignment);
+            const usable = block.size - (alignedAddr - block.addr);
+            if (usable < size) continue;
+            const preWaste = alignedAddr - block.addr;
+            const tailStart = alignedAddr + size;
+            const tailSize = block.addr + block.size - tailStart;
+            list.splice(i, 1);
+            if (preWaste >= 16) this.releaseLargeBlock(bucketKind, block.addr, preWaste);
+            if (tailSize >= 16) this.releaseLargeBlock(bucketKind, tailStart, tailSize);
+            // Fresh-commit contract: VirtualAlloc'd pages always read zero.
+            this.addressSpace.fill(alignedAddr, size, 0);
+            return alignedAddr;
+        }
+        return 0;
+    }
+
+    /** Best-fit carve from the small free list, rejecting blocks whose leftover
+     *  exceeds maxWaste. Returns the zeroed allocation address, or 0 if no block
+     *  qualifies. Carves from the TAIL of the block, not the head: correct programs
+     *  can't tell the difference, but it preserves the HEAD bytes of a freed block —
+     *  where a use-after-free ghost's vtable/header live. Real Windows heaps
+     *  segregate reuse by size class, so a freed object's start typically survives
+     *  until a same-class allocation claims it; games with benign UAFs (an engine
+     *  list still holding a deleted object) rely on that. */
+    private carveFromFreeList(bucketKind: RegionKind, size: number, alignment: number, maxWaste: number): number {
+        const list = this.freeBlocks.get(bucketKind);
+        if (!list || list.length === 0) return 0;
+        let bestIdx = -1;
+        let bestWaste = Infinity;
+        for (let i = 0; i < list.length; i++) {
+            const block = list[i];
+            const alignedAddr = this.alignUp(block.addr, alignment);
+            const usable = block.size - (alignedAddr - block.addr);
+            if (usable >= size) {
+                const waste = usable - size;
+                if (waste < bestWaste && waste <= maxWaste) {
+                    bestWaste = waste;
+                    bestIdx = i;
                 }
             }
         }
+        if (bestIdx < 0) return 0;
+        const block = list[bestIdx];
+        list.splice(bestIdx, 1);
+        let alignedAddr = (block.addr + block.size - size) & ~(alignment - 1);
+        if (alignedAddr < block.addr) alignedAddr = this.alignUp(block.addr, alignment);
+        const preWaste = alignedAddr - block.addr;
+        const tailStart = alignedAddr + size;
+        const tailSize = block.addr + block.size - tailStart;
+        // Push back unused head (now the bulk of an oversized block) and any
+        // tail alignment slack. Threshold: 16 bytes — smaller fragments not
+        // worth tracking and would inflate the free-list search cost.
+        if (preWaste >= 16) {
+            this.releaseToFreeList(bucketKind, block.addr, preWaste);
+        }
+        if (tailSize >= 16) {
+            this.releaseToFreeList(bucketKind, tailStart, tailSize);
+        }
+        // Hand out zeroed memory. Strictly, Win32 HeapAlloc without HEAP_ZERO_MEMORY
+        // leaves a reused block dirty — but this best-fit free list reuses far more
+        // aggressively than the real heap (which prefers per-size-class fresh commits,
+        // whose pages come zeroed via the VirtualAlloc/MEM_COMMIT guarantee). A guest
+        // that reads a just-allocated field expecting the zero a fresh commit would
+        // have given (a very common pattern) otherwise sees our stale reuse as
+        // garbage. Zeroing matches that observable fresh-memory contract and is
+        // safe: correct code never relies on reused-dirty.
+        this.addressSpace.fill(alignedAddr, size, 0);
+        return alignedAddr;
+    }
 
+    private allocateInBucket(bucket: BucketState, size: number, alignment: number = 8, bucketKind?: RegionKind): number {
+        // Try free list first: find a block that fits (best-fit), then SPLIT the
+        // remainder back into the list so oversized freed blocks aren't consumed whole.
+        // Large requests (≥512KB) never reuse free-list blocks — bump-allocate fresh.
+        // Real NT heaps forward allocations above the VirtualAlloc threshold straight
+        // to VirtualAlloc: fresh zeroed pages that never land on freed heap blocks
+        // (which may still hold use-after-free ghosts games benignly touch).
+        // LIFO large churn (video buffers) is reclaimed by the bump-retreat coalescing,
+        // so this does not grow the bucket for the common alloc→free→alloc pattern.
+        const reuseFreeList = size < MemoryManager.LARGE_ALLOC_FRESH_THRESHOLD;
+        if (bucketKind && reuseFreeList) {
+            // Size-class gate: only reuse a block reasonably CLOSE to the request
+            // (waste ≤ max(4KB, size/4)). Real Windows heaps serve reuse from
+            // per-size-class lists — a 64KB buffer never lands mid-way into a
+            // coalesced multi-hundred-KB hole full of freed (but still ghost-
+            // referenced) objects. Oversized holes wait for a similar-sized
+            // request; small requests carve only near-fit blocks.
+            const reused = this.carveFromFreeList(bucketKind, size, alignment, Math.max(0x1000, size >> 2));
+            if (reused !== 0) return reused;
+        }
+
+        // VirtualAlloc-class requests: first try the released-large list (first-fit by
+        // address, zeroed — see largeFreeBlocks), then fall back to fresh space ABOVE
+        // the high-water mark. Never the small free list and never a retreated frontier:
+        // serving a big buffer from freed heap space lands it on (and re-zeroes) blocks
+        // still ghost-referenced by UAF games — real VirtualAlloc never reuses heap
+        // holes. The skipped bump range goes back to the free list for small requests.
+        if (!reuseFreeList && bucketKind) {
+            const reused = this.allocateLargeFromReleased(bucketKind, size, alignment);
+            if (reused !== 0) return reused;
+            if (bucket.everMax > bucket.next) {
+                const skipped = bucket.everMax - bucket.next;
+                if (skipped >= 16) this.releaseToFreeList(bucketKind, bucket.next, skipped);
+                bucket.next = bucket.everMax;
+            }
+        }
         let alignedStart = this.alignUp(bucket.next, alignment);
 
         // Skip over any PE-image or other foreign regions that already occupy this range.
@@ -565,6 +667,12 @@ export class MemoryManager {
 
             const expandedSize = this.addressSpace.expandLayoutBucket(bucketKind, newSize);
             if (expandedSize === 0) {
+                // Last resort before OOM: any fitting hole (ignoring the size-class
+                // gate) beats a spurious overflow. Try the small free list any-fit,
+                // then released VirtualAlloc-class ranges.
+                const fallback = this.carveFromFreeList(bucketKind, size, alignment, Infinity)
+                    || this.allocateLargeFromReleased(bucketKind, size, alignment);
+                if (fallback !== 0) return fallback;
                 throw new Error(
                     `MemoryManager: bucket overflow (requested 0x${size.toString(16)} ` +
                     `in 0x${bucket.base.toString(16)}..0x${bucket.limit.toString(16)})`

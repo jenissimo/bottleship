@@ -74,6 +74,10 @@ export class HarnessChain {
 
     // ── input ──
     click(target: string | number): this { return this.push("click", [target]); }
+    /** Click at guest-pixel coordinates (DDraw/D3D-composed UIs with no Win32 controls to target by label). */
+    clickAt(x: number, y: number, button?: number): this { return this.push("clickAt", [x, y, button]); }
+    /** Press + hold at guest coords, release on a timer — for low-fps state-polling guests that miss a synchronous click. */
+    clickHold(x: number, y: number, holdMs?: number, button?: number): this { return this.push("clickHold", [x, y, holdMs, button]); }
     key(vk: number | string, opts?: { down?: boolean; up?: boolean }): this { return this.push("key", [vk, opts]); }
     /** Press + hold a key across real frames, release on a timer — the keyboard twin of
      *  clickHold. A synchronous key tap is invisible to low-fps state-polling guests

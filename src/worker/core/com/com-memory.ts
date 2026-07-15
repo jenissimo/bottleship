@@ -14,12 +14,18 @@ interface ComMemoryFree {
  * Allocates a COM object with guard bytes and proper layout.
  * Layout: [GUARD 16b] [VTABLE_PTR 4b] [DATA...] [GUARD 16b]
  * Returns the address of the VTable pointer (the object's 'this' pointer).
+ *
+ * COM objects live in THUNK_DATA, NOT the game's HEAP bucket. On real Windows,
+ * system DLLs (ddraw etc.) allocate from their own heap — a block the game frees
+ * keeps its contents until the GAME reuses it. If our COM churn recycled game-freed
+ * HEAP blocks, the zero-fill below would scribble ghost objects that use-after-free
+ * games still virtual-call through (harmless on real Windows, NULL-vtable crash here).
  */
 export const allocateComObject = (
     memory: any,
     mem8: Uint8Array,
     vtableAddr: number,
-    kind: RegionKind = 'HEAP',
+    kind: RegionKind = 'THUNK_DATA',
 ): number => {
     // Allocate space for guard + vtable ptr + object data + guard
     // Total size = COM_GUARD_SIZE + COM_OBJECT_SIZE + COM_GUARD_SIZE

@@ -23,6 +23,7 @@ const KNOWN_NON_LUT_FORMATS: PixelFormat[] = [
     PixelFormat.RGB565,
     PixelFormat.RGB555,
     PixelFormat.ARGB1555,
+    PixelFormat.ARGB4444,
     PixelFormat.ARGB8888,
     PixelFormat.XRGB8888,
 ];
@@ -212,6 +213,16 @@ function generateTextureConverterShader(format: PixelFormat, textureFormat: GPUT
     let g8 = (g5 * 255u + 15u) / 31u;
     let b8 = (b5 * 255u + 15u) / 31u;
     let a8 = select(0u, 255u, a1 != 0u);
+`;
+            break;
+
+        case PixelFormat.ARGB4444:
+            conversionCode = `
+    // ARGB4444: AAAARRRRGGGGBBBB — each nibble expanded ×17 (n*255/15)
+    let r8 = ((pixel >> 8u) & 0xFu) * 17u;
+    let g8 = ((pixel >> 4u) & 0xFu) * 17u;
+    let b8 = (pixel & 0xFu) * 17u;
+    let a8 = ((pixel >> 12u) & 0xFu) * 17u;
 `;
             break;
 

@@ -34,6 +34,12 @@ export const RGB555_TO_RGBA = new Uint32Array(32768);
 export const ARGB1555_TO_RGBA = new Uint32Array(65536);
 
 /**
+ * ARGB4444 to RGBA8888 lookup table (65536 entries × 4 bytes = 256KB)
+ * Format: 0xAABBGGRR
+ */
+export const ARGB4444_TO_RGBA = new Uint32Array(65536);
+
+/**
  * REVERSE LOOKUPS: RGBA8888 to Surface Formats
  * Used for GDI/ReleaseDC sync (GDI → Surface memory)
  * 
@@ -103,6 +109,15 @@ const EXPAND_6_TO_8 = new Uint8Array(64);
         const b8 = EXPAND_5_TO_8[b5];
 
         ARGB1555_TO_RGBA[pixel] = (a8 << 24) | (b8 << 16) | (g8 << 8) | r8;
+    }
+
+    // ARGB4444: AAAARRRRGGGGBBBB — each nibble expanded to 8 bits (n*17 = n*255/15).
+    for (let pixel = 0; pixel < 65536; pixel++) {
+        const a8 = ((pixel >> 12) & 0xF) * 17;
+        const r8 = ((pixel >> 8) & 0xF) * 17;
+        const g8 = ((pixel >> 4) & 0xF) * 17;
+        const b8 = (pixel & 0xF) * 17;
+        ARGB4444_TO_RGBA[pixel] = (a8 << 24) | (b8 << 16) | (g8 << 8) | r8;
     }
 })();
 
@@ -582,6 +597,30 @@ function convertARGB1555ToRGBA(
     }
 }
 
+/** ARGB4444 → RGBA (internal). Alpha nibble drives transparency (fonts: 0 bg / f glyph). */
+function convertARGB4444ToRGBA(
+    src: Uint8Array,
+    srcOffset: number,
+    srcPitch: number,
+    dst: Uint32Array,
+    width: number,
+    height: number,
+    skipBoundsCheck: boolean = false
+): void {
+    let dstIdx = 0;
+    for (let y = 0; y < height; y++) {
+        const rowOffset = srcOffset + y * srcPitch;
+        for (let x = 0; x < width; x++) {
+            const pixelOffset = rowOffset + x * 2;
+            if (skipBoundsCheck || (pixelOffset >= 0 && pixelOffset + 1 < src.length)) {
+                dst[dstIdx++] = ARGB4444_TO_RGBA[src[pixelOffset] | (src[pixelOffset + 1] << 8)];
+            } else {
+                dst[dstIdx++] = 0xFF000000;
+            }
+        }
+    }
+}
+
 /** RGB888 → RGBA (internal) */
 function convertRGB888ToRGBA(
     src: Uint8Array,
@@ -1025,6 +1064,10 @@ export function convertSurfaceToRGBA(
 
         case PixelFormat.ARGB1555:
             convertARGB1555ToRGBA(mem, surfacePtr, pitch, rgba32, width, height, inBounds);
+            break;
+
+        case PixelFormat.ARGB4444:
+            convertARGB4444ToRGBA(mem, surfacePtr, pitch, rgba32, width, height, inBounds);
             break;
 
         case PixelFormat.RGB888:

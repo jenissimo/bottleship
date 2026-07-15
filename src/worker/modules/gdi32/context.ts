@@ -42,6 +42,7 @@ export interface GDIObject {
     lfWidth?: number;
     lfWeight?: number;
     lfItalic?: number;
+    lfQuality?: number;
     faceName?: string;
 }
 
@@ -68,7 +69,9 @@ export class GDIContext {
         bkColor: string;
         font: string;
         fontSize: number; // Cached font size to avoid regex parsing
+        fontQuality: number; // LOGFONT lfQuality of the selected font
         textEscapement: number; // Rotation angle in tenths of degrees (Windows format)
+        textAlign: number; // TA_* flags (SetTextAlign); 0 = TA_LEFT|TA_TOP|TA_NOUPDATECP
         appliedFont: string; // The font currently set on the canvas context
         appliedFillStyle: string; // The fillStyle currently set on the canvas context
         hBrush: number; // Current selected brush handle
@@ -394,7 +397,9 @@ export class GDIContext {
             bkColor: '#FFFFFF',
             font: '16px sans-serif',
             fontSize: 16,
+            fontQuality: 0,
             textEscapement: 0,
+            textAlign: 0,
             appliedFont: '',
             appliedFillStyle: '',
             hBrush: defaultBrush,
@@ -450,7 +455,9 @@ export class GDIContext {
             bkColor: '#FFFFFF',
             font: '16px sans-serif',
             fontSize: 16,
+            fontQuality: 0,
             textEscapement: 0,
+            textAlign: 0,
             appliedFont: '',
             appliedFillStyle: '',
             hBrush: defaultBrush,
@@ -499,7 +506,9 @@ export class GDIContext {
             bkColor: '#FFFFFF',
             font: '16px sans-serif',
             fontSize: 16,
+            fontQuality: 0,
             textEscapement: 0,
+            textAlign: 0,
             appliedFont: '',
             appliedFillStyle: '',
             hBrush: defaultBrush,
@@ -549,7 +558,9 @@ export class GDIContext {
             bkColor: '#FFFFFF',
             font: '16px sans-serif',
             fontSize: 16,
+            fontQuality: 0,
             textEscapement: 0,
+            textAlign: 0,
             appliedFont: '',
             appliedFillStyle: '',
             hBrush: defaultBrush,
@@ -897,7 +908,9 @@ export class GDIContext {
             bkColor: '#FFFFFF',
             font: '16px sans-serif',
             fontSize: 16,
+            fontQuality: 0,
             textEscapement: 0,
+            textAlign: 0,
             appliedFont: '',
             appliedFillStyle: '',
             hBrush: defaultBrush,
@@ -1265,6 +1278,7 @@ export class GDIContext {
             // Use cached font size from object (parsed once in createFont)
             // Fallback to 16 if not cached (shouldn't happen, but safety check)
             state.fontSize = obj.fontSize ?? 16;
+            state.fontQuality = obj.lfQuality ?? 0;
             // Mark font as not applied so it will be applied on next textOut
             state.appliedFont = '';
             return previousHandle;
@@ -1282,8 +1296,8 @@ export class GDIContext {
         return getSelectedFontFaceImpl(this, hdc);
     }
 
-    createFont(height: number, width: number, weight: number, italic: boolean, faceName: string, escapement?: number): number {
-        return createFontImpl(this, height, width, weight, italic, faceName, escapement);
+    createFont(height: number, width: number, weight: number, italic: boolean, faceName: string, escapement?: number, quality?: number): number {
+        return createFontImpl(this, height, width, weight, italic, faceName, escapement, quality);
     }
 
     /** CSS font string for an HFONT. */
@@ -1392,6 +1406,19 @@ export class GDIContext {
         return previous;
     }
 
+    setTextAlign(hdc: number, align: number): number {
+        if (!this.contexts.has(hdc)) return 0xFFFFFFFF; // GDI_ERROR
+        const state = this.ensureState(hdc);
+        const previous = state.textAlign;
+        state.textAlign = align >>> 0;
+        return previous;
+    }
+
+    getTextAlign(hdc: number): number {
+        if (!this.contexts.has(hdc)) return 0xFFFFFFFF; // GDI_ERROR
+        return this.ensureState(hdc).textAlign;
+    }
+
     textOut(hdc: number, x: number, y: number, text: string): boolean {
         return textOutImpl(this, hdc, x, y, text);
     }
@@ -1408,7 +1435,9 @@ export class GDIContext {
         bkColor: string;
         font: string;
         fontSize: number;
+        fontQuality: number;
         textEscapement: number;
+        textAlign: number;
         appliedFont: string;
         appliedFillStyle: string;
         hBrush: number;
@@ -1438,7 +1467,9 @@ export class GDIContext {
                 bkColor: '#FFFFFF',
                 font: '16px sans-serif',
                 fontSize: 16,
+                fontQuality: 0,
                 textEscapement: 0,
+                textAlign: 0,
                 appliedFont: '',
                 appliedFillStyle: '',
                 hBrush: defaultBrush,

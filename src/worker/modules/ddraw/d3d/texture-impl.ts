@@ -13,7 +13,7 @@ import {
     isRenderSurface,
     isBitmapTexture,
 } from "../com-objects";
-import { DDSCAPS_SYSTEMMEMORY } from "../constants";
+import { DDSCAPS_SYSTEMMEMORY, DDSCAPS_ALLOCONLOAD } from "../constants";
 import { setAuthorityCpu, setAuthorityGpu, syncActiveGdiContext, surfaceSyncManager } from "../surface-sync";
 import { propagateSurfaceStateToRegistry } from "./texture-manager";
 import { D3DExports, D3D_OK, D3DERR_INVALIDCALL, TextureManager } from "./types";
@@ -66,11 +66,36 @@ export const createTextureExports = (
 
         // Helper: pixel copy + finalization + mipmap recursion (all sync except mipmap may return Promise)
         const doCopyAndFinalize = (): void | Promise<void> => {
-            const formatMismatch = srcState.format.bpp !== dstState.format.bpp ||
+            let formatMismatch = srcState.format.bpp !== dstState.format.bpp ||
                 srcState.format.rMask !== dstState.format.rMask ||
                 srcState.format.gMask !== dstState.format.gMask ||
                 srcState.format.bMask !== dstState.format.bMask ||
                 srcState.format.aMask !== dstState.format.aMask;
+
+            // D3D6 ALLOCONLOAD semantics: a DDSCAPS_ALLOCONLOAD texture has no storage of
+            // its own until Texture::Load — the load allocates it with the SOURCE's
+            // attributes, including pixel format. Games create the VIDMEM dest with no
+            // DDSD_PIXELFORMAT (it transiently inherits the display format) and an
+            // explicit-format SYSMEM source (e.g. an inverted-alpha ARGB4444 font atlas);
+            // converting to the inherited format would silently drop the alpha channel.
+            // Adopt the source format and copy bits raw. Real DDraw clears the flag on
+            // the first Load.
+            if (formatMismatch && (dstState.caps & DDSCAPS_ALLOCONLOAD) !== 0) {
+                if (srcState.format.bpp === dstState.format.bpp) {
+                    Logger.log(LogCategory.DDRAW,
+                        `Texture Load${tag}: ALLOCONLOAD dest 0x${dstState.surfacePtr.toString(16)} adopts source format ` +
+                        `(bpp=${srcState.format.bpp} A=0x${srcState.format.aMask.toString(16)} R=0x${srcState.format.rMask.toString(16)} ` +
+                        `G=0x${srcState.format.gMask.toString(16)} B=0x${srcState.format.bMask.toString(16)}; ` +
+                        `was A=0x${dstState.format.aMask.toString(16)} R=0x${dstState.format.rMask.toString(16)})`);
+                    dstState.format = { ...srcState.format };
+                    formatMismatch = false;
+                } else {
+                    Logger.warn(LogCategory.DDRAW,
+                        `Texture Load${tag}: ALLOCONLOAD dest 0x${dstState.surfacePtr.toString(16)} bpp mismatch ` +
+                        `(src=${srcState.format.bpp} dst=${dstState.format.bpp}) — falling back to format conversion`);
+                }
+            }
+            dstState.caps &= ~DDSCAPS_ALLOCONLOAD;
 
             const height = Math.min(srcState.height, dstState.height);
             const width = Math.min(srcState.width, dstState.width);

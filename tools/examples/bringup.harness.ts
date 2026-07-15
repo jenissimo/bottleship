@@ -14,7 +14,7 @@ import { harness } from "../harness";
 
 const result = await harness()
     .streamLogs(["SYSTEM", "DDRAW", "USER32"])     // observe the worker log stream
-    .openWgb("C:\\wgb\\my-game.wgb")               // absolute path → streamed off disk (dev)
+    .openWgb(process.env.WGB ?? "/apps/external-wgb/my-game.wgb") // abs path (env) → streamed off disk; else drop-folder URL
     .waitForEvent("dialogShow", { timeoutMs: 60000 }) // wait for the launcher dialog
     .click("Play Game")                            // faithful click by label (global coords)
     .watchFrames(true)                             // enable frameRendered events

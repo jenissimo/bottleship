@@ -82,3 +82,9 @@ demos/**/*.exe
 # ReactOS-sourced headers are re-fetchable via `bun run fetch-reference-headers`; proprietary
 # ones (mss.h) are BYO. Only the derived, fact-only *.sig.json are tracked and shipped.
 tools/reference/**/*.h
+
+# Perf/investigation plan docs — local scratch, not shipped
+/plan/
+
+# Throwaway bring-up/debug probe scripts — local scratch; durable scenarios live in tools/examples/
+/tools/probes/

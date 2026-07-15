@@ -197,7 +197,7 @@ export function getObject(gdi: GDIContext, hgdiobj: number, cbBuffer: number, lp
         mem[lpvObject + 23] = 0;                              // +23 lfCharSet (DEFAULT_CHARSET=1, ANSI=0)
         mem[lpvObject + 24] = 0;                              // +24 lfOutPrecision
         mem[lpvObject + 25] = 0;                              // +25 lfClipPrecision
-        mem[lpvObject + 26] = 0;                              // +26 lfQuality
+        mem[lpvObject + 26] = obj.lfQuality ?? 0;             // +26 lfQuality
         mem[lpvObject + 27] = 0;                              // +27 lfPitchAndFamily (DEFAULT_PITCH | FF_DONTCARE)
         // Face name area starts at +28. Both A and W zero the entire array first
         // (LOGFONTA uses 32 bytes, LOGFONTW uses 64 bytes), then write the name.
@@ -399,14 +399,14 @@ export function getSelectedFontFace(gdi: GDIContext, hdc: number): string {
     return 'System';
 }
 
-export function createFont(gdi: GDIContext, height: number, width: number, weight: number, italic: boolean, faceName: string, escapement?: number): number {
+export function createFont(gdi: GDIContext, height: number, width: number, weight: number, italic: boolean, faceName: string, escapement?: number, quality?: number): number {
     // lfHeight/lfWidth are signed LONGs. CreateFontA/W pass the raw (unsigned) thunk
     // arg, so a negative em-height (e.g. -11) arrives as 0xFFFFFFF5 — coerce to signed
     // or `height < 0` fails and the size balloons to billions of px (off-canvas text).
     height = height | 0;
     width = width | 0;
     const resolvedName = resolveWindowsFontName(faceName);
-    const cacheKey = `${height}-${width}-${weight}-${italic}-${resolvedName}-${escapement || 0}`;
+    const cacheKey = `${height}-${width}-${weight}-${italic}-${resolvedName}-${escapement || 0}-${quality || 0}`;
 
     // Check cache with LRU tracking
     const cachedHandle = gdi.fontCache.get(cacheKey);
@@ -444,6 +444,7 @@ export function createFont(gdi: GDIContext, height: number, width: number, weigh
         lfWidth: width,
         lfWeight: weight,
         lfItalic: italic ? 1 : 0,
+        lfQuality: quality ?? 0,
         faceName: resolvedName,
     });
 

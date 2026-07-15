@@ -39,6 +39,13 @@ const handleToPathCache = new Map<number, string>();
 const getProcAddressCache = new Map<string, number>();
 const getProcAddressPointerCache = new Map<string, number>();
 const loggedUnknownModuleHandles = new Set<number>();
+// FreeLibrary refcounting. Modules that appear in the registry WITHOUT a dynamic
+// LoadLibrary ref (the EXE + its static import closure, and static-import
+// dependencies auto-loaded while mapping a dynamic DLL) are PINNED — a static
+// import holds a permanent reference on real Windows, so FreeLibrary never unloads
+// them. Only explicitly LoadLibrary'd modules unload at refcount 0.
+const pinnedModuleBases = new Set<number>();
+const dynamicLoadRefs = new Map<number, number>();
 let cacheOwnerProcess: any = null;
 let cacheOwnerResetGeneration = -1;
 
@@ -59,6 +66,20 @@ function ensureProcessLocalCaches(): void {
     getProcAddressPointerCache.clear();
     loggedUnknownModuleHandles.clear();
     getProcAddressRegistry.clear();
+    pinnedModuleBases.clear();
+    dynamicLoadRefs.clear();
+}
+
+/** Pin every registered module that holds no dynamic LoadLibrary ref (see
+ *  pinnedModuleBases). Must run BEFORE the current call registers anything new —
+ *  i.e. at the top of each LoadLibrary/FreeLibrary handler — so a module being
+ *  dynamically loaded right now is never mistaken for a static one. */
+function pinUntrackedModules(): void {
+    const registry = System.getInstance().process?.moduleRegistry;
+    for (const m of registry?.getAllModules?.() ?? []) {
+        const base = m.baseAddress >>> 0;
+        if (!dynamicLoadRefs.has(base)) pinnedModuleBases.add(base);
+    }
 }
 
 /**
@@ -199,6 +220,7 @@ function rememberLoadLibraryHandle(name: string, handle: number): void {
     if (fullNoExt) loadLibraryHandleCache.set(fullNoExt, value);
     if (baseNoExt) loadLibraryHandleCache.set(baseNoExt, value);
     rememberModuleHandlePath(value, name);
+    dynamicLoadRefs.set(value, (dynamicLoadRefs.get(value) ?? 0) + 1);
 }
 
 function syncHandlePathCacheFromRegistry(): void {
@@ -282,7 +304,12 @@ function getCachedLoadLibraryHandle(name: string): number | undefined {
     if (!normalized) return undefined;
     const fullNoExt = stripDllExtension(normalized);
     const baseNoExt = stripDllExtension(normalized.split("\\").pop() ?? normalized);
-    return loadLibraryHandleCache.get(fullNoExt) ?? loadLibraryHandleCache.get(baseNoExt);
+    const handle = loadLibraryHandleCache.get(fullNoExt) ?? loadLibraryHandleCache.get(baseNoExt);
+    if (handle !== undefined) {
+        // Repeat LoadLibrary on a live module takes another reference.
+        dynamicLoadRefs.set(handle, (dynamicLoadRefs.get(handle) ?? 0) + 1);
+    }
+    return handle;
 }
 
 function buildGetProcCacheKey(hModule: number, procName: string, isOrdinal: boolean, ordinal: number): string {
@@ -867,6 +894,9 @@ function initModuleFunctions(): void {
             lpLibFileName ? Marshaler.readStringW(mem, lpLibFileName) : ""
         );
 
+        ensureProcessLocalCaches();
+        pinUntrackedModules();
+
         const system = System.getInstance();
         const moduleRegistry = system.process?.moduleRegistry;
         const loader = system.process?.loader;
@@ -940,6 +970,9 @@ function initModuleFunctions(): void {
         const dllName = canonicalizeLibraryRequest(
             lpLibFileName ? Marshaler.readString(mem, lpLibFileName) : ""
         );
+
+        ensureProcessLocalCaches();
+        pinUntrackedModules();
 
         const system = System.getInstance();
         const moduleRegistry = system.process?.moduleRegistry;
@@ -1015,6 +1048,7 @@ function initModuleFunctions(): void {
         const verbose = Logger.isEnabled(LogCategory.KERNEL32, LogLevel.VERBOSE);
 
         ensureProcessLocalCaches();
+        pinUntrackedModules();
         const cached = getCachedLoadLibraryHandle(dllName);
         if (cached !== undefined) {
             return { value: cached, stackCleanup: 4 };
@@ -1086,6 +1120,7 @@ function initModuleFunctions(): void {
         const thunkedName = getThunkedModuleName(dllName);
 
         ensureProcessLocalCaches();
+        pinUntrackedModules();
         const cached = getCachedLoadLibraryHandle(dllName);
         if (cached !== undefined) {
             return { value: cached, stackCleanup: 4 };
@@ -1174,11 +1209,49 @@ function initModuleFunctions(): void {
     };
 
     exports['FreeLibrary'] = (ctx, mem, args) => {
-        const hModule = args[0];
+        const hModule = args[0] >>> 0;
+        ensureProcessLocalCaches();
+        pinUntrackedModules();
 
-        // Don't actually unload - just return success
-        // Real unloading would require calling DllMain(DLL_PROCESS_DETACH)
-        Logger.verbose(LogCategory.KERNEL32, `FreeLibrary(0x${hModule.toString(16)}) -> 1 (stub)`);
+        const registry = System.getInstance().process?.moduleRegistry;
+        const mod = registry?.getByBase?.(hModule);
+
+        // Pinned (EXE + static imports), thunked pseudo-bases, and unknown handles:
+        // report success without unloading (a static import holds a permanent ref).
+        if (!mod || pinnedModuleBases.has(hModule)) {
+            Logger.verbose(LogCategory.KERNEL32, `FreeLibrary(0x${hModule.toString(16)}) -> 1 (pinned/unknown)`);
+            return { value: 1, stackCleanup: 4 };
+        }
+
+        const refs = (dynamicLoadRefs.get(hModule) ?? 1) - 1;
+        if (refs > 0) {
+            dynamicLoadRefs.set(hModule, refs);
+            Logger.verbose(LogCategory.KERNEL32, `FreeLibrary(0x${hModule.toString(16)}) -> 1 (refs=${refs})`);
+            return { value: 1, stackCleanup: 4 };
+        }
+        dynamicLoadRefs.delete(hModule);
+
+        // Refcount hit zero: drop the module from the registry and all handle caches so
+        // the NEXT LoadLibrary maps a FRESH image (clean .data/.bss, DllMain re-run) —
+        // games rely on statics resetting across an unload/reload cycle (e.g. a UI DLL
+        // whose static object lists must not survive into the next menu session). The
+        // old image bytes stay mapped: safer than a real unmap, and any straggler
+        // pointer into the old code keeps working instead of faulting.
+        registry!.unregister(mod.name);
+        for (const [k, v] of loadLibraryHandleCache) {
+            if (v === hModule) loadLibraryHandleCache.delete(k);
+        }
+        handleToPathCache.delete(hModule);
+        const prefix = `${hModule}:`;
+        const ordPrefix = `${hModule}#`;
+        for (const k of getProcAddressCache.keys()) {
+            if (k.startsWith(prefix) || k.startsWith(ordPrefix)) getProcAddressCache.delete(k);
+        }
+        for (const k of getProcAddressPointerCache.keys()) {
+            if (k.startsWith(prefix) || k.startsWith(ordPrefix)) getProcAddressPointerCache.delete(k);
+        }
+        Logger.log(LogCategory.KERNEL32,
+            `FreeLibrary(0x${hModule.toString(16)}): unloaded "${mod.name}" (image left mapped; next LoadLibrary maps fresh)`);
         return { value: 1, stackCleanup: 4 };
     };
 
