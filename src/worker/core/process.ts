@@ -442,6 +442,18 @@ export class MemoryManager {
     }
 
     /**
+     * Current bump frontier (`next`) of a layout bucket, or undefined if the bucket
+     * doesn't exist. Everything at/above this within the bucket's reserved span is
+     * virgin territory that was never handed out; every live allocation sits below it
+     * (the frontier only retreats when the block at the top is freed). VirtualQuery
+     * uses it to tell a live SURFACE pixel buffer from the vast unallocated reserved
+     * pool, so a page-walker skips the empty tail in one MEM_FREE step.
+     */
+    getBucketFrontier(kind: RegionKind): number | undefined {
+        return this.bucketState.get(kind)?.next;
+    }
+
+    /**
      * Snapshot of live HEAP-bucket allocations for a faithful HeapWalk.
      *
      * Third-party heap managers that coexist with the Win32 heap (SmartHeap/Shw32

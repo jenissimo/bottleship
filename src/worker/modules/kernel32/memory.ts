@@ -1053,9 +1053,18 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             // and comparing AllocationBase/Type against their pool registry; coalescing the whole
             // heap into one region with AllocationBase=HEAP_BASE makes SmartHeap reject every
             // pointer as MEM_BAD_POINTER. We ONLY coalesce *free* gaps (see below).
+            //
+            // SURFACE is a large reserved pool (320MB) of which only the bump arena below the
+            // frontier is real pixel memory; the virgin tail must NOT report per-page COMMIT or
+            // a walker (addr = BaseAddress + RegionSize) storms every 4KB page of the pool. Only
+            // pages below the SURFACE frontier are backed — the rest fall through to the free-gap
+            // coalescing and are skipped in one MEM_FREE step (ROM stays whole-span: PE images
+            // there are already coalesced by the MEM_IMAGE branch above).
+            const surfaceFrontier = system.process?.memory?.getBucketFrontier('SURFACE') ?? (MEM_SURFACE_BASE + MEM_SURFACE_SIZE);
             const isBackedInterval = (a: number): boolean =>
                 (a >= MEM_HEAP_BASE && a < MEM_THUNK_DATA_BASE + MEM_THUNK_DATA_SIZE) ||
-                (a >= MEM_ROM_BASE && a < MEM_SURFACE_BASE + MEM_SURFACE_SIZE);
+                (a >= MEM_ROM_BASE && a < MEM_SURFACE_BASE) ||
+                (a >= MEM_SURFACE_BASE && a < surfaceFrontier);
 
             // 1) PE module image — report the whole image as one MEM_IMAGE region.
             const mod = moduleRegistry?.getModuleContainingAddress(lpAddress) ?? null;
