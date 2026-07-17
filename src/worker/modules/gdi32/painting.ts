@@ -753,6 +753,7 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
     exports['SetBkColor'] = (ctx, mem, args): number => {
         const hdc = args[0];
         const color = args[1];
+        Logger.verbose(LogCategory.GDI32, `SetBkColor(hdc=0x${hdc.toString(16)}, color=0x${(color >>> 0).toString(16)})`);
         return System.getInstance().gdiContext.setBkColor(hdc, color);
     };
 
@@ -1259,16 +1260,19 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
             return 0;
         }
 
-        // Get bitmap from SystemResourceProvider
+        // Get bitmap from SystemResourceProvider. DIBSections carry dibPalette
+        // (0xAARRGGBB — the SetDIBColorTable/resolveBitmapRgba layout); LoadImage
+        // bitmaps may carry the legacy palette field (0xAABBGGRR) instead.
         const userObj = SystemResourceProvider.getInstance().getUserObject(hBitmap);
-        if (!userObj || userObj.type !== 'BITMAP' || !userObj.palette) {
-            Logger.verbose(LogCategory.GDI32, `GetDIBColorTable: Bitmap 0x${hBitmap.toString(16)} has no palette (type=${userObj?.type}, hasPalette=${!!userObj?.palette})`);
+        const dibPalette = userObj?.type === 'BITMAP' ? userObj.dibPalette as Uint32Array | undefined : undefined;
+        const legacyPalette = userObj?.type === 'BITMAP' ? userObj.palette as Uint32Array | undefined : undefined;
+        const palette = dibPalette ?? legacyPalette;
+        if (!palette) {
+            Logger.verbose(LogCategory.GDI32, `GetDIBColorTable: Bitmap 0x${hBitmap.toString(16)} has no color table (type=${userObj?.type})`);
             return 0;
         }
-
-        const palette = userObj.palette as Uint32Array;
         const paletteSize = palette.length;
-        
+
         // Validate indices
         if (uStartIndex >= paletteSize) {
             Logger.warn(LogCategory.GDI32, `GetDIBColorTable: Start index ${uStartIndex} >= palette size ${paletteSize}`);
@@ -1281,25 +1285,18 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
             return 0;
         }
 
-        // Write RGBQUAD entries (4 bytes each: B, G, R, reserved)
-        // Our palette is stored as 0xAABBGGRR (RGBA), need to convert to RGBQUAD (BGR + reserved)
-        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        // Write RGBQUAD entries (B, G, R, reserved).
+        const isArgb = palette === dibPalette; // 0xAARRGGBB; legacy is 0xAABBGGRR
         for (let i = 0; i < actualCount; i++) {
-            const paletteIndex = uStartIndex + i;
-            const color = palette[paletteIndex];
-            
-            // Extract RGBA from 0xAABBGGRR format
-            const r = (color) & 0xFF;
+            const color = palette[uStartIndex + i];
+            const r = (isArgb ? color >> 16 : color) & 0xFF;
             const g = (color >> 8) & 0xFF;
-            const b = (color >> 16) & 0xFF;
-            // const a = (color >> 24) & 0xFF; // Not used in RGBQUAD
-            
-            // Write as RGBQUAD: B, G, R, reserved (0)
+            const b = (isArgb ? color : color >> 16) & 0xFF;
             const offset = pColors + i * 4;
-            mem[offset] = b;     // Blue
-            mem[offset + 1] = g; // Green
-            mem[offset + 2] = r; // Red
-            mem[offset + 3] = 0; // Reserved (always 0)
+            mem[offset] = b;
+            mem[offset + 1] = g;
+            mem[offset + 2] = r;
+            mem[offset + 3] = 0;
         }
 
         Logger.verbose(LogCategory.GDI32, `GetDIBColorTable: Returned ${actualCount} palette entries (start=${uStartIndex}, total=${paletteSize})`);
@@ -1326,22 +1323,36 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         if (!hBitmap) return 0;
 
         const userObj = SystemResourceProvider.getInstance().getUserObject(hBitmap);
-        if (!userObj || userObj.type !== 'BITMAP' || !userObj.palette) {
-            return cEntries; // 32bpp DIBs have no palette — return count as if set
+        if (!userObj || userObj.type !== 'BITMAP') {
+            return cEntries;
         }
+        const palette = userObj.dibPalette as Uint32Array | undefined;
+        if (!palette) {
+            return cEntries; // 16/24/32bpp DIBs have no color table — report success
+        }
+        if (uStartIndex >= palette.length) return 0;
 
-        const palette = userObj.palette as Uint32Array;
-        const paletteSize = palette.length;
-        if (uStartIndex >= paletteSize) return 0;
+        const actualCount = Math.min(cEntries, palette.length - uStartIndex);
 
-        const actualCount = Math.min(cEntries, paletteSize - uStartIndex);
-
+        // Same 0xAARRGGBB layout resolveBitmapRgba decodes.
         for (let i = 0; i < actualCount; i++) {
             const offset = pColors + i * 4;
             const b = mem[offset];
             const g = mem[offset + 1];
             const r = mem[offset + 2];
-            palette[uStartIndex + i] = (0xFF << 24) | (b << 16) | (g << 8) | r;
+            palette[uStartIndex + i] = 0xff000000 | (r << 16) | (g << 8) | b;
+        }
+
+        // The bitmap may already be selected into this DC — re-materialize so
+        // reads through the DC see the new color table.
+        gdiContext.refreshDibSectionCanvas(hBitmap);
+        const dcCtx = (gdiContext as any).contexts?.get(hdc);
+        const bmpDC = (gdiContext as any).bitmapDCCache?.get(hBitmap);
+        const bmpCtx = bmpDC !== undefined ? (gdiContext as any).contexts?.get(bmpDC) : undefined;
+        if (dcCtx && bmpCtx && hdcState.hBitmap === hBitmap) {
+            dcCtx.clearRect(0, 0, dcCtx.canvas.width, dcCtx.canvas.height);
+            dcCtx.drawImage(bmpCtx.canvas, 0, 0);
+            (gdiContext as any).invalidateImageDataCache?.(hdc);
         }
 
         return actualCount;
@@ -1614,12 +1625,14 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
             view.setUint32(ppvBits, bitsPtr >>> 0, true);
         }
 
+        // Real DIBSections have a fixed-size color table (1 << bpp); biClrUsed only
+        // bounds how many entries the caller's BITMAPINFO initializes.
         let dibPalette: Uint32Array | undefined;
         if (bpp <= 8) {
-            const numColors = biClrUsed === 0 ? (1 << bpp) : Math.min(biClrUsed, 256);
+            dibPalette = new Uint32Array(1 << bpp);
+            const numColors = biClrUsed === 0 ? (1 << bpp) : Math.min(biClrUsed, 1 << bpp);
             const paletteOffset = pbmi + biSize;
             if (paletteOffset + numColors * 4 <= mem.length) {
-                dibPalette = new Uint32Array(numColors);
                 for (let i = 0; i < numColors; i++) {
                     const co = paletteOffset + i * 4;
                     const b = mem[co];
@@ -2023,6 +2036,27 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
             pixels[i + 3] = 0xFF; // alpha
         }
 
+        // Initial bits: 1bpp is the canonical case (masks/patterns); rows are
+        // WORD-aligned, bit 7 = leftmost pixel, 1 = white.
+        let initialized = false;
+        if (lpBits && nPlanes === 1 && nBitCount === 1) {
+            const stride = ((nWidth + 15) >> 4) * 2;
+            if (lpBits + stride * nHeight <= mem.length) {
+                for (let y = 0; y < nHeight; y++) {
+                    for (let x = 0; x < nWidth; x++) {
+                        const bit = (mem[lpBits + y * stride + (x >> 3)] >> (7 - (x & 7))) & 1;
+                        if (bit) {
+                            const o = (y * nWidth + x) * 4;
+                            pixels[o] = pixels[o + 1] = pixels[o + 2] = 0xFF;
+                        }
+                    }
+                }
+                initialized = true;
+            }
+        } else if (lpBits) {
+            Logger.warn(LogCategory.GDI32, `CreateBitmap: initial bits for ${nBitCount}bpp not decoded`);
+        }
+
         const handle = SystemResourceProvider.getInstance().registerUserObject({
             type: 'BITMAP',
             name: 0,
@@ -2030,6 +2064,11 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
             height: nHeight,
             loading: false,
             pixels,
+            bmBpp: nBitCount,
+            // Without initial bits the contents are undefined at birth (like a
+            // DDB); the drawn canvas is then the truth for reads
+            // (resolveBitmapRgba compatibleEmpty path).
+            compatibleEmpty: !initialized,
         });
         Logger.verbose(LogCategory.GDI32, `CreateBitmap(${nWidth}x${nHeight}) -> 0x${handle.toString(16)}`);
         return handle;

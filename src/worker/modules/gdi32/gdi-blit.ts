@@ -14,8 +14,110 @@ import { convertRGBAToSurface } from "../ddraw/gpu-texture-utils";
 import { setAuthorityCpu, surfaceHasActiveWriteLease } from "../ddraw/surface-sync";
 import { DDSCAPS_SYSTEMMEMORY, DDSCAPS_PRIMARYSURFACE, DDSCAPS_BACKBUFFER } from "../ddraw/constants";
 import { applyRopCode } from './gdi-raster';
-import { DEFAULT_BITMAP_HANDLE } from './gdi-objects';
+import { DEFAULT_BITMAP_HANDLE, cssToColor } from './gdi-objects';
+import { resolveDibSectionRectRgba } from './bitmap-resolve';
 import type { GDIContext } from './context';
+
+/**
+ * DIBSection bits live in guest memory and are written by the app directly
+ * (no API call to observe) — re-mirror the blitted source rect into the source
+ * DC canvas before the blit reads it. Rect-limited: full-bitmap conversion per
+ * blit would dominate frame time on DIB-backbuffer engines. No-op for
+ * non-DIBSection sources.
+ */
+function syncDibSourceDc(
+    gdi: GDIContext,
+    hdcSrc: number,
+    srcCtx: OffscreenCanvasRenderingContext2D | undefined,
+    srcState: { hBitmap?: number } | undefined,
+    xSrc: number,
+    ySrc: number,
+    width: number,
+    height: number,
+): void {
+    const hBmp = srcState?.hBitmap;
+    if (!hBmp || hBmp === DEFAULT_BITMAP_HANDLE || !srcCtx) return;
+    const mem = System.getInstance().process?.getCurrentMemory?.();
+    if (!mem) return;
+    const fresh = resolveDibSectionRectRgba(hBmp, mem, xSrc, ySrc, width, height);
+    if (!fresh) return;
+    srcCtx.putImageData(new (ImageData as any)(fresh.data, fresh.width, fresh.height), fresh.x, fresh.y);
+    gdi.invalidateImageDataCache(hdcSrc);
+}
+
+/** DC bkColor CSS → [r,g,b] via the shared parser (COLORREF is 0x00BBGGRR). */
+function bkColorToRgb(css: string | undefined): [number, number, number] {
+    const c = cssToColor(css ?? '#ffffff');
+    return [c & 0xff, (c >> 8) & 0xff, (c >> 16) & 0xff];
+}
+
+/**
+ * Real GDI color→mono (nt5src ylateobj.cxx): a source pixel equal to the
+ * SOURCE DC's background color maps to 1 (white); all others map to 0 (black).
+ * Our 1bpp bitmaps are RGBA canvases, so the conversion is emulated in RGB.
+ */
+function blitColorToMono(
+    destCtx: OffscreenCanvasRenderingContext2D,
+    srcCtx: OffscreenCanvasRenderingContext2D,
+    x: number, y: number, width: number, height: number,
+    xSrc: number, ySrc: number,
+    srcBk: [number, number, number],
+): boolean {
+    try {
+        const src = srcCtx.getImageData(xSrc, ySrc, width, height);
+        const out = new ImageData(width, height);
+        const s = src.data, d = out.data;
+        for (let i = 0; i < s.length; i += 4) {
+            const white = s[i] === srcBk[0] && s[i + 1] === srcBk[1] && s[i + 2] === srcBk[2];
+            const v = white ? 255 : 0;
+            d[i] = d[i + 1] = d[i + 2] = v;
+            d[i + 3] = 255;
+        }
+        destCtx.putImageData(out, x, y);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * A DIBSection's pixel surface IS its guest bits — GDI draws must land there
+ * (apps read the bits back and post-process them, e.g. WA writes cursor alpha
+ * over GDI-blitted RGB). Mirrors the dest-canvas rect into 32bpp DIBSection
+ * bits as B,G,R, preserving the reserved/alpha byte the app owns.
+ */
+function writeBackDib32(
+    gdi: GDIContext,
+    destCtx: OffscreenCanvasRenderingContext2D,
+    destState: { hBitmap?: number } | undefined,
+    x: number, y: number, width: number, height: number,
+): void {
+    const hBmp = destState?.hBitmap;
+    if (!hBmp || hBmp === DEFAULT_BITMAP_HANDLE) return;
+    const obj = SystemResourceProvider.getInstance().getUserObject(hBmp);
+    if (!obj || obj.type !== 'BITMAP' || !obj.bitsPtr || obj.dibStride <= 0 || (obj.dibBpp ?? 32) !== 32) return;
+    const mem: Uint8Array | undefined = System.getInstance().process?.getCurrentMemory?.();
+    if (!mem) return;
+    const bw = obj.width ?? 0, bh = obj.height ?? 0;
+    const cx = Math.max(0, x | 0), cy = Math.max(0, y | 0);
+    const cw = Math.min(width | 0, bw - cx), ch = Math.min(height | 0, bh - cy);
+    if (cw <= 0 || ch <= 0) return;
+    // Raw writes below — validate the whole section range once (§3.1).
+    if (obj.bitsPtr + obj.dibStride * bh > mem.length) return;
+    let img: ImageData;
+    try { img = destCtx.getImageData(cx, cy, cw, ch); } catch { return; }
+    const src = img.data;
+    for (let ry = 0; ry < ch; ry++) {
+        const dibY = obj.dibTopDown ? cy + ry : bh - 1 - (cy + ry);
+        let o = obj.bitsPtr + dibY * obj.dibStride + cx * 4;
+        let si = ry * cw * 4;
+        for (let rx = 0; rx < cw; rx++, o += 4, si += 4) {
+            mem[o] = src[si + 2];
+            mem[o + 1] = src[si + 1];
+            mem[o + 2] = src[si];
+        }
+    }
+}
 
 export function bitBlt(gdi: GDIContext, hdcDest: number, x: number, y: number, width: number, height: number,
        hdcSrc: number, xSrc: number, ySrc: number, rop: number): boolean {
@@ -46,6 +148,7 @@ export function bitBlt(gdi: GDIContext, hdcDest: number, x: number, y: number, w
 
     const destState = gdi.hdcStates.get(hdcDest);
     const srcState = gdi.hdcStates.get(hdcSrc);
+    if (needsSource) syncDibSourceDc(gdi, hdcSrc, srcCtx, srcState, xSrc, ySrc, width, height);
     // HL launcher: WM_PAINT BitBlt from fresh CreateCompatibleBitmap (all white, no art).
     const sourceHasSelectedBitmap = !!srcState?.hBitmap && srcState.hBitmap !== DEFAULT_BITMAP_HANDLE;
     if (rop === SRCCOPY && srcState?.pristine && destState?.windowBlit) {
@@ -64,6 +167,7 @@ export function bitBlt(gdi: GDIContext, hdcDest: number, x: number, y: number, w
         if (rop === BLACKNESS) {
             destCtx.fillStyle = '#000000';
             destCtx.fillRect(x, y, width, height);
+            writeBackDib32(gdi, destCtx, destState, x, y, width, height);
             gdi.expandDirtyRect(hdcDest, x, y, width, height);
             gdi.markDirty(hdcDest);
             gdi.invalidateImageDataCache(hdcDest);
@@ -71,6 +175,7 @@ export function bitBlt(gdi: GDIContext, hdcDest: number, x: number, y: number, w
         } else if (rop === WHITENESS) {
             destCtx.fillStyle = '#FFFFFF';
             destCtx.fillRect(x, y, width, height);
+            writeBackDib32(gdi, destCtx, destState, x, y, width, height);
             gdi.expandDirtyRect(hdcDest, x, y, width, height);
             gdi.markDirty(hdcDest);
             gdi.invalidateImageDataCache(hdcDest);
@@ -108,7 +213,18 @@ export function bitBlt(gdi: GDIContext, hdcDest: number, x: number, y: number, w
         // Save current composite operation
         const savedCompositeOp = destCtx.globalCompositeOperation;
 
-        if (rop === SRCCOPY) {
+        // Color→mono: dest has a 1bpp bitmap selected (CreateBitmap planes=1).
+        let monoConverted = false;
+        if (rop === SRCCOPY && destState?.hBitmap) {
+            const destBmp = SystemResourceProvider.getInstance().getUserObject(destState.hBitmap);
+            if (destBmp?.type === 'BITMAP' && destBmp.bmBpp === 1) {
+                monoConverted = blitColorToMono(destCtx, srcCtx, x, y, width, height, xSrc, ySrc, bkColorToRgb(srcState?.bkColor));
+            }
+        }
+
+        if (monoConverted) {
+            // handled above
+        } else if (rop === SRCCOPY) {
             // Simple copy (default behavior)
             destCtx.drawImage(
                 srcCanvas,
@@ -168,13 +284,17 @@ export function bitBlt(gdi: GDIContext, hdcDest: number, x: number, y: number, w
         // Invalidate image data cache after drawing
         gdi.invalidateImageDataCache(hdcDest);
 
+        writeBackDib32(gdi, destCtx, destState, x, y, width, height);
+
         // If dest is a memory DC with linked bitmap, update the bitmap canvas
         const linkedBitmap = (destCtx.canvas as any).__bitmapCanvas;
         if (linkedBitmap) {
             const bitmapCtx = linkedBitmap.getContext('2d');
             if (bitmapCtx) {
                 // Apply same operation to bitmap canvas
-                if (rop === SRCCOPY) {
+                if (monoConverted) {
+                    bitmapCtx.drawImage(destCtx.canvas, x, y, width, height, x, y, width, height);
+                } else if (rop === SRCCOPY) {
                     bitmapCtx.drawImage(srcCanvas, xSrc, ySrc, width, height, x, y, width, height);
                 } else if (rop === SRCINVERT || rop === SRCAND || rop === SRCPAINT) {
                     applyRopCode(
@@ -265,6 +385,8 @@ export function stretchBlt(gdi: GDIContext, hdcDest: number, xDest: number, yDes
 
         return false;
     }
+
+    if (needsSource) syncDibSourceDc(gdi, hdcSrc, srcCtx, gdi.hdcStates.get(hdcSrc), xSrc, ySrc, wSrc, hSrc);
 
     // Handle source-less ROPs early if no source context
     if (!srcCtx) {

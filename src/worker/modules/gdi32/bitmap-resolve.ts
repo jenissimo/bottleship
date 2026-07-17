@@ -37,6 +37,7 @@ interface BitmapUserObj {
     dibPalette?: Uint32Array;
     isTopDown?: boolean;
     loading?: boolean;
+    compatibleEmpty?: boolean;
 }
 
 /** True when the JS RGBA shadow was filled by LoadImage/parseBMP (not a CreateDIBSection placeholder). */
@@ -69,7 +70,9 @@ function pixelsValid(obj: BitmapUserObj): boolean {
     return bitmapPixelsPopulated(obj);
 }
 
-/** Read 32bpp BGRA from guest DIBSection bits into RGBA. */
+/** Read 32bpp BGRA from guest DIBSection bits into RGBA.
+ *  rawAlpha=false coerces the DIB reserved byte to opaque (normal painting);
+ *  rawAlpha=true returns it as-is (XP+ alpha-cursor detection). */
 function readDibSectionRgba(
     mem: Uint8Array,
     bitsPtr: number,
@@ -77,6 +80,7 @@ function readDibSectionRgba(
     h: number,
     dibStride: number,
     dibTopDown: boolean,
+    rawAlpha = false,
 ): Uint8ClampedArray | null {
     if (!bitsPtr || w <= 0 || h <= 0 || dibStride <= 0) return null;
     const out = new Uint8ClampedArray(w * h * 4);
@@ -89,11 +93,106 @@ function readDibSectionRgba(
             out[di] = mem[srcOff + 2];
             out[di + 1] = mem[srcOff + 1];
             out[di + 2] = mem[srcOff];
-            out[di + 3] = mem[srcOff + 3] || 255;
+            out[di + 3] = rawAlpha ? mem[srcOff + 3] : (mem[srcOff + 3] || 255);
             srcOff += 4;
         }
     }
     return out;
+}
+
+/**
+ * Read a sub-rect of a DIBSection's guest bits as RGBA (blit-source liveness:
+ * the app writes bits directly, so blits must see the CURRENT bytes, but only
+ * the blitted rect needs converting — full-bitmap reads per blit are wasted).
+ * Returns null (with the clamped rect untouched) for non-DIBSection bitmaps.
+ */
+export function resolveDibSectionRectRgba(
+    hBitmap: number,
+    mem: Uint8Array,
+    rx: number,
+    ry: number,
+    rw: number,
+    rh: number,
+): { data: Uint8ClampedArray; x: number; y: number; width: number; height: number } | null {
+    const obj = unwrapBitmapObj(hBitmap);
+    if (!obj || !obj.bitsPtr || !obj.dibStride) return null;
+    const bw = obj.width ?? 0, bh = obj.height ?? 0;
+    const x = Math.max(0, rx | 0), y = Math.max(0, ry | 0);
+    const w = Math.min(rw | 0, bw - x), h = Math.min(rh | 0, bh - y);
+    if (w <= 0 || h <= 0) return null;
+    const bpp = obj.dibBpp ?? 32;
+    const out = new Uint8ClampedArray(w * h * 4);
+    const palette = obj.dibPalette;
+    for (let row = 0; row < h; row++) {
+        const srcY = obj.dibTopDown ? y + row : bh - 1 - (y + row);
+        const srcRow = obj.bitsPtr + srcY * obj.dibStride;
+        const dstOff = row * w * 4;
+        if (bpp === 32) {
+            let so = srcRow + x * 4;
+            for (let c = 0; c < w; c++, so += 4) {
+                const di = dstOff + c * 4;
+                out[di] = mem[so + 2];
+                out[di + 1] = mem[so + 1];
+                out[di + 2] = mem[so];
+                out[di + 3] = mem[so + 3] || 255;
+            }
+        } else if (bpp === 24) {
+            let so = srcRow + x * 3;
+            for (let c = 0; c < w; c++, so += 3) {
+                const di = dstOff + c * 4;
+                out[di] = mem[so + 2];
+                out[di + 1] = mem[so + 1];
+                out[di + 2] = mem[so];
+                out[di + 3] = 255;
+            }
+        } else if (bpp === 16) {
+            for (let c = 0; c < w; c++) {
+                const v = mem[srcRow + (x + c) * 2] | (mem[srcRow + (x + c) * 2 + 1] << 8);
+                const di = dstOff + c * 4;
+                out[di] = ((v >> 11) & 0x1F) * 255 / 31;
+                out[di + 1] = ((v >> 5) & 0x3F) * 255 / 63;
+                out[di + 2] = (v & 0x1F) * 255 / 31;
+                out[di + 3] = 255;
+            }
+        } else if (bpp === 8 && palette && palette.length > 0) {
+            for (let c = 0; c < w; c++) {
+                const color = palette[mem[srcRow + x + c]] ?? 0xff000000;
+                const di = dstOff + c * 4;
+                out[di] = (color >> 16) & 0xff;
+                out[di + 1] = (color >> 8) & 0xff;
+                out[di + 2] = color & 0xff;
+                out[di + 3] = (color >>> 24) & 0xff;
+            }
+        } else {
+            return null;
+        }
+    }
+    return { data: out, x, y, width: w, height: h };
+}
+
+/**
+ * Raw-alpha 32bpp DIBSection read for XP+ alpha-cursor detection: returns the
+ * pixels honoring the alpha byte, or null when the bits carry no alpha at all
+ * (or the bitmap is not a 32bpp DIBSection).
+ */
+export function resolveDib32RawAlphaRgba(
+    hBitmap: number,
+    mem: Uint8Array,
+): { data: Uint8ClampedArray; width: number; height: number } | null {
+    const obj = unwrapBitmapObj(hBitmap);
+    if (!obj || !obj.bitsPtr || !obj.dibStride || (obj.dibBpp ?? 0) !== 32) return null;
+    const w = obj.width ?? 0, h = obj.height ?? 0;
+    if (w <= 0 || h <= 0) return null;
+    let hasAlpha = false;
+    for (let y = 0; y < h && !hasAlpha; y++) {
+        let o = obj.bitsPtr + y * obj.dibStride + 3;
+        for (let x = 0; x < w; x++, o += 4) {
+            if (mem[o] !== 0) { hasAlpha = true; break; }
+        }
+    }
+    if (!hasAlpha) return null;
+    const data = readDibSectionRgba(mem, obj.bitsPtr, w, h, obj.dibStride, !!obj.dibTopDown, true);
+    return data ? { data, width: w, height: h } : null;
 }
 
 /** Read 4/8/16/24/32 bpp DIBSection row data into RGBA (best-effort). */
@@ -182,6 +281,15 @@ export function resolveBitmapRgba(hBitmap: number, mem?: Uint8Array): ResolvedBi
             mem, obj.bitsPtr, w, h, obj.dibStride, !!obj.dibTopDown, bpp, obj.dibPalette,
         );
         if (rgba) return { data: rgba, width: w, height: h };
+    }
+
+    // DDB (CreateCompatibleBitmap): stored pixels are only a birth snapshot —
+    // everything drawn since lives on the rendered canvas, which is the truth.
+    if (obj.compatibleEmpty) {
+        const rendered = System.getInstance().gdiContext.getBitmapRenderedPixels(hBitmap);
+        if (rendered && rendered.length >= w * h * 4) {
+            return { data: rendered.subarray(0, w * h * 4), width: w, height: h };
+        }
     }
 
     if (pixelsValid(obj)) {

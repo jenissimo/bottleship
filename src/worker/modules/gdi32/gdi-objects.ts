@@ -161,11 +161,90 @@ export function getObject(gdi: GDIContext, hgdiobj: number, cbBuffer: number, lp
 
     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
 
+    // Palettized (≤8bpp) bitmap loaded with LR_CREATEDIBSECTION: expose a real
+    // DIBSECTION so guest sprite loaders can read the 8-bit source + palette
+    // (biBitCount, bmBits). GetObject(h, sizeof(DIBSECTION)=0x54) triggers this;
+    // GetObject(h, sizeof(BITMAP)=24) still gets the plain BITMAP below.
+    if (obj.type === 'BITMAP' && cbBuffer >= 0x54 && obj.data?.dibBits && (obj.data.bitCount ?? 32) <= 8) {
+        const width = obj.data.width || 0;
+        const height = obj.data.height || 0;
+        const bitCount = obj.data.bitCount as number;
+        const stride = (obj.data.dibStride as number) || (((width * bitCount + 31) >> 5) << 2);
+        const dibBits = obj.data.dibBits as Uint8Array;
+        // Materialize the DIB bits into guest memory once (cached on the object).
+        let bmBitsPtr = obj.data.dibBitsPtr as number | undefined;
+        if (!bmBitsPtr) {
+            const proc = System.getInstance().process;
+            bmBitsPtr = proc?.memory.alloc(dibBits.length, "HEAP", "rw") ?? 0;
+            if (bmBitsPtr) {
+                mem.set(dibBits, bmBitsPtr);
+                obj.data.dibBitsPtr = bmBitsPtr;
+            }
+        }
+        // The file rows are bottom-up unless top-down; report biHeight sign to match
+        // so the loader walks rows in the right direction.
+        const biHeight = obj.data.dibTopDown ? -height : height;
+        // DIBSECTION: dsBm(24) + dsBmih(40) + dsBitfields(12) + dshSection(4) + dsOffset(4).
+        view.setUint32(lpvObject + 0x00, 0, true);           // dsBm.bmType
+        view.setInt32(lpvObject + 0x04, width, true);        // dsBm.bmWidth
+        view.setInt32(lpvObject + 0x08, height, true);       // dsBm.bmHeight (always +ve here)
+        view.setUint32(lpvObject + 0x0C, stride, true);      // dsBm.bmWidthBytes
+        view.setUint16(lpvObject + 0x10, 1, true);           // dsBm.bmPlanes
+        view.setUint16(lpvObject + 0x12, bitCount, true);    // dsBm.bmBitsPixel
+        view.setUint32(lpvObject + 0x14, bmBitsPtr >>> 0, true); // dsBm.bmBits
+        view.setUint32(lpvObject + 0x18, 40, true);          // dsBmih.biSize
+        view.setInt32(lpvObject + 0x1C, width, true);        // biWidth
+        view.setInt32(lpvObject + 0x20, biHeight, true);     // biHeight (sign = orientation)
+        view.setUint16(lpvObject + 0x24, 1, true);           // biPlanes
+        view.setUint16(lpvObject + 0x26, bitCount, true);    // biBitCount
+        view.setUint32(lpvObject + 0x28, 0, true);           // biCompression = BI_RGB
+        view.setUint32(lpvObject + 0x2C, stride * height, true); // biSizeImage
+        view.setInt32(lpvObject + 0x30, 0, true);            // biXPelsPerMeter
+        view.setInt32(lpvObject + 0x34, 0, true);            // biYPelsPerMeter
+        view.setUint32(lpvObject + 0x38, obj.data.palette ? (obj.data.palette as Uint32Array).length : 0, true); // biClrUsed
+        view.setUint32(lpvObject + 0x3C, 0, true);           // biClrImportant
+        view.setUint32(lpvObject + 0x40, 0, true);           // dsBitfields[0]
+        view.setUint32(lpvObject + 0x44, 0, true);           // dsBitfields[1]
+        view.setUint32(lpvObject + 0x48, 0, true);           // dsBitfields[2]
+        view.setUint32(lpvObject + 0x4C, 0, true);           // dshSection
+        view.setUint32(lpvObject + 0x50, 0, true);           // dsOffset
+        Logger.verbose(LogCategory.GDI32, `getObject DIBSECTION: ${width}x${height} ${bitCount}bpp stride=${stride} bmBits=0x${bmBitsPtr.toString(16)}`);
+        return 0x54;
+    }
+
     if (obj.type === 'BITMAP' && cbBuffer >= 24) {
-        // Write BITMAP structure
-        // bmType, bmWidth, bmHeight, bmWidthBytes, bmPlanes, bmBitsPixel, bmBits
+        // Write BITMAP structure: bmType, bmWidth, bmHeight, bmWidthBytes, bmPlanes,
+        // bmBitsPixel, bmBits.
         const width = obj.data?.width || 0;
         const height = obj.data?.height || 0;
+        // A bitmap loaded as a DIBSECTION (LR_CREATEDIBSECTION) exposes its pixel bits:
+        // Win32 GetObject(hDib, sizeof(BITMAP)) fills bmBits with the DIB rows and reports
+        // the DIB's own depth (not a synthetic 32bpp). Sprite loaders that GetObject a DIB
+        // and memcpy bmBits (e.g. WA's FUN_004cf820) get a zero-filled → black sprite if
+        // bmBits is NULL. Materialize the palettized rows once (shared with the 0x54 path).
+        if (obj.data?.dibBits && (obj.data.bitCount ?? 32) <= 8) {
+            const bitCount = obj.data.bitCount as number;
+            const stride = (obj.data.dibStride as number) || (((width * bitCount + 31) >> 5) << 2);
+            const dibBits = obj.data.dibBits as Uint8Array;
+            let bmBitsPtr = obj.data.dibBitsPtr as number | undefined;
+            if (!bmBitsPtr) {
+                const proc = System.getInstance().process;
+                bmBitsPtr = proc?.memory.alloc(dibBits.length, "HEAP", "rw") ?? 0;
+                if (bmBitsPtr) {
+                    mem.set(dibBits, bmBitsPtr);
+                    obj.data.dibBitsPtr = bmBitsPtr;
+                }
+            }
+            view.setUint32(lpvObject, 0, true);                 // bmType
+            view.setInt32(lpvObject + 4, width, true);          // bmWidth
+            view.setInt32(lpvObject + 8, height, true);         // bmHeight
+            view.setUint32(lpvObject + 12, stride, true);       // bmWidthBytes
+            view.setUint16(lpvObject + 16, 1, true);            // bmPlanes
+            view.setUint16(lpvObject + 18, bitCount, true);     // bmBitsPixel
+            view.setUint32(lpvObject + 20, bmBitsPtr >>> 0, true); // bmBits
+            Logger.verbose(LogCategory.GDI32, `getObject BITMAP(DIB): ${width}x${height} ${bitCount}bpp stride=${stride} bmBits=0x${(bmBitsPtr ?? 0).toString(16)}`);
+            return 24;
+        }
         const widthBytes = width * 4; // RGBA = 4 bytes per pixel
         view.setUint32(lpvObject, 0, true); // bmType = 0
         view.setUint32(lpvObject + 4, width, true); // bmWidth
@@ -236,6 +315,12 @@ export function deleteObject(gdi: GDIContext, hgdiobj: number): boolean {
         // Remove from ImageBitmap caches
         gdi.bitmapImageBitmapCache.delete(hgdiobj);
         gdi.bitmapImageBitmapReady.delete(hgdiobj);
+
+        // Free the guest-heap bmBits materialization (GetObject DIBSECTION path)
+        if (userObj?.dibBitsPtr) {
+            System.getInstance().process?.memory.free(userObj.dibBitsPtr);
+            userObj.dibBitsPtr = 0;
+        }
 
         // Notify DDraw to invalidate bitmapToSurfaceCache
         const system = System.getInstance();

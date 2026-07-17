@@ -749,6 +749,35 @@ export class GDIContext {
     }
 
     /**
+     * Re-materialize a DIBSection-backed bitmap's canvas from live guest bits.
+     * The app writes DIB bits directly in guest memory (no API call to observe),
+     * so any read of the bitmap through GDI must see the CURRENT bits — real GDI
+     * has no copy at all; the canvas is our mirror and must be refreshed at use.
+     * Returns the refreshed pixels, or null when not DIBSection-backed.
+     */
+    refreshDibSectionCanvas(hbitmap: number): { data: Uint8ClampedArray; width: number; height: number } | null {
+        const userObj = SystemResourceProvider.getInstance().getUserObject(hbitmap);
+        if (!userObj || userObj.type !== 'BITMAP' || !userObj.bitsPtr || !userObj.dibStride) return null;
+        const mem = System.getInstance().process?.v86?.mem8
+            ?? System.getInstance().process?.v86?.v86?.cpu?.mem8;
+        if (!mem) return null;
+        const fresh = resolveBitmapRgba(hbitmap, mem);
+        if (!fresh) return null;
+        const data = fresh.data.buffer instanceof ArrayBuffer
+            ? fresh.data
+            : new Uint8ClampedArray(fresh.data);
+        const bitmapDC = this.bitmapDCCache.get(hbitmap);
+        const bitmapCtx = bitmapDC !== undefined ? this.contexts.get(bitmapDC) : undefined;
+        if (bitmapCtx) {
+            bitmapCtx.putImageData(new (ImageData as any)(data, fresh.width, fresh.height), 0, 0);
+            this.invalidateImageDataCache(bitmapDC!);
+        }
+        this.bitmapImageBitmapReady.delete(hbitmap);
+        this.bitmapVersions.set(hbitmap, (this.bitmapVersions.get(hbitmap) || 0) + 1);
+        return { data, width: fresh.width, height: fresh.height };
+    }
+
+    /**
      * Create a memory DC with a BITMAP object loaded from SystemResourceProvider
      * Used when SelectObject is called with a bitmap handle from LoadImageA
      * OPTIMIZATION: Results are cached in bitmapDCCache to avoid recreation on every SelectObject
@@ -773,14 +802,15 @@ export class GDIContext {
             return null;
         }
 
+        // DIBSection truth lives in guest memory — read it for the canvas but do
+        // NOT persist into userObj.pixels: a snapshot taken before the app writes
+        // the bits would shadow every later guest write.
+        let seededPixels: Uint8ClampedArray | null = null;
         if (!bitmapPixelsPopulated(userObj)) {
             const mem = System.getInstance().process?.v86?.mem8
                 ?? System.getInstance().process?.v86?.v86?.cpu?.mem8;
             if (mem && userObj.bitsPtr && userObj.dibStride) {
-                const seeded = resolveBitmapRgba(hbitmap, mem);
-                if (seeded) {
-                    userObj.pixels = new Uint8Array(seeded.data.buffer, seeded.data.byteOffset, seeded.data.byteLength);
-                }
+                seededPixels = resolveBitmapRgba(hbitmap, mem)?.data ?? null;
             }
         }
 
@@ -809,8 +839,8 @@ export class GDIContext {
         // Create ImageData from RGBA pixels
         // Try using the original buffer directly first, only copy if needed
         let pixelsArray: Uint8ClampedArray;
-        const sourcePixels = userObj.pixels;
-        
+        const sourcePixels = userObj.pixels ?? seededPixels ?? new Uint8ClampedArray(width * height * 4);
+
         if (sourcePixels instanceof Uint8ClampedArray) {
             // Already Uint8ClampedArray - use directly if buffer is ArrayBuffer
             if (sourcePixels.buffer instanceof ArrayBuffer) {
@@ -1208,11 +1238,20 @@ export class GDIContext {
                             needsRedraw = true;
                         }
 
+                        // DIBSection bits are written directly by the guest (no API to
+                        // observe, no version bump) — re-materialize from live memory
+                        // on every select so reads see the current surface.
+                        const isDibSection = !!(userObj.bitsPtr && userObj.dibStride);
+                        if (isDibSection) {
+                            this.refreshDibSectionCanvas(hgdiobj);
+                        }
+
                         // PERFORMANCE OPTIMIZATION: Track bitmap versions to skip redundant drawImage
                         // Only copy bitmap content if the bitmap has changed since last sync
                         const bitmapVersion = this.bitmapVersions.get(hgdiobj) || 0;
                         const syncState = this.dcBitmapSyncState.get(hdc);
                         const needsSync = needsRedraw ||
+                            isDibSection ||
                             !syncState ||
                             syncState.hbitmap !== hgdiobj ||
                             syncState.version !== bitmapVersion;
@@ -1397,6 +1436,22 @@ export class GDIContext {
             return 0xFFFFFFFF; // CLR_INVALID
         }
         return this.cssToColor(state.bkColor);
+    }
+
+    /** CSS text color set on hdc (WM_CTLCOLOR* capture). */
+    getTextColorCss(hdc: number): string | null {
+        return this.hdcStates.get(hdc)?.textColor ?? null;
+    }
+
+    /** CSS background color set on hdc (WM_CTLCOLOR* capture). */
+    getBkColorCss(hdc: number): string | null {
+        return this.hdcStates.get(hdc)?.bkColor ?? null;
+    }
+
+    /** Solid-brush CSS color for an HBRUSH; null for patterns/unknown handles. */
+    getBrushCss(hBrush: number): string | null {
+        const obj = this.objects.get(hBrush);
+        return obj?.type === 'BRUSH' && typeof obj.data === 'string' ? obj.data : null;
     }
 
     setBkMode(hdc: number, mode: number): number {
