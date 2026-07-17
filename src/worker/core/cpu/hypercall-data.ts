@@ -569,6 +569,27 @@ export class HypercallDataManager {
         }
     }
 
+    /**
+     * Adopt `tid` as the thread whose FLS values the guest page holds. Normally
+     * syncThreadData does this on context switch, but a single-threaded process
+     * may never switch — leaving flsCurrentTid at its initial 0 so every
+     * setFlsSlot(tid=1) skips the guest-page write and the WASM FlsGetValue
+     * hypercall reads 0 forever (CRT then rebuilds its per-thread data on every
+     * _getptd call and loses all state stored in it).
+     */
+    ensureFlsCurrentThread(tid: number): void {
+        if (tid === this.flsCurrentTid) return;
+        Logger.warn(LogCategory.SYSTEM,
+            `FLS: adopting thread ${tid} as page-resident (was ${this.flsCurrentTid}, no context switch seen)`);
+        this.flsCurrentTid = tid;
+        this.refreshViews();
+        if (!this.view || this.hpBase === 0) return;
+        const values = this.flsValuesFor(tid);
+        for (let i = 0; i < HC_FLS_SLOT_COUNT; i++) {
+            this.view.setUint32(this.hpBase + OFF_HC_FLS_VALUES + i * 4, values[i] >>> 0, true);
+        }
+    }
+
     getFlsSlot(index: number, tid = this.flsCurrentTid): number {
         if (index < 0 || index >= HC_FLS_SLOT_COUNT) return 0;
         if (!this.flsAllocatedShadow[index]) return 0;

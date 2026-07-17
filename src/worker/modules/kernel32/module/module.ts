@@ -7,7 +7,7 @@ import { Marshaler } from '../../../core/memory/marshaler';
 import { Logger, LogCategory, LogLevel } from '../../../core/logger';
 import { APIRegistry } from '../../../core/api-registry';
 import { EMU_NATIVE_VIDEO_DLLS } from '../../../core/cpu/emulator-config';
-import { EmulatorConfig } from '../../../core/emulator-config-manager';
+import { EmulatorConfig, VER_PLATFORM_WIN32_WINDOWS } from '../../../core/emulator-config-manager';
 import { encodeAnsi } from '../../codepage-utils';
 import { resolveThunkedDllAlias } from '../../../core/dll-aliases';
 import { THUNKED_DLL_PSEUDO_BASE } from '../../../core/hle-system-catalog';
@@ -1281,6 +1281,17 @@ function initModuleFunctions(): void {
         return { value: 11, stackCleanup: 8 };
     };
 
+    // APIs that do NOT exist on Win9x kernel32 (XP SP2+ pointer obfuscation).
+    // Era software feature-detects them via GetProcAddress and switches behavior on
+    // the result — e.g. the VS2005 CRT treats __encoded_null() as 0 when EncodePointer
+    // is absent, and __crtMessageBoxA's NT-only statics stay raw 0 on Win9x: presence
+    // of EncodePointer while GetVersion says Win98 is a hybrid no real code was
+    // written for (decodes a raw-0 slot into the XOR cookie and calls it).
+    // Static PE imports are unaffected — this gates only dynamic lookups.
+    const WIN9X_ABSENT_APIS = new Set([
+        'encodepointer', 'decodepointer', 'encodesystempointer', 'decodesystempointer',
+    ]);
+
     const getProcAddressImpl = (ctx: any, mem: Uint8Array, args: number[]): any => {
         const hModule = args[0] >>> 0;
         const lpProcName = args[1] >>> 0;
@@ -1321,6 +1332,17 @@ function initModuleFunctions(): void {
             getProcAddressRegistry.record(hModule, procName, address >>> 0, readCaller());
             return { value: address >>> 0, stackCleanup: 8 };
         };
+
+        if (!isOrdinal
+            && EmulatorConfig.getInstance().osVersion.platformId === VER_PLATFORM_WIN32_WINDOWS
+            && WIN9X_ABSENT_APIS.has(procName.toLowerCase())) {
+            system.process!.lastError = 127; // ERROR_PROC_NOT_FOUND
+            if (verbose) {
+                Logger.verbose(LogCategory.KERNEL32,
+                    `GetProcAddress("${procName}") -> NULL (absent on Win9x)`);
+            }
+            return finish(0);
+        }
 
         const cacheKey = buildGetProcCacheKey(hModule, procName, isOrdinal, ordinal);
         const cached = getProcAddressCache.get(cacheKey);

@@ -671,6 +671,9 @@ const syncModule = (() => {
         if (name) {
             namedObjects.register('event', name, handle);
         }
+        // A NEW named object sets last-error to ERROR_SUCCESS; apps single-instance-guard
+        // on GetLastError()==ERROR_ALREADY_EXISTS, so a stale prior error must not leak.
+        sched.setLastError(0);
         Logger.log(
             LogCategory.KERNEL32,
             `CreateEventA(manual=${bManualReset ? 1 : 0},initial=${bInitialState ? 1 : 0},name="${name}") -> 0x${handle.toString(16)} ret=0x${returnAddr.toString(16)}`
@@ -703,6 +706,7 @@ const syncModule = (() => {
         if (name) {
             namedObjects.register('event', name, handle);
         }
+        sched.setLastError(0); // ERROR_SUCCESS — newly created (see CreateEventA)
         Logger.log(
             LogCategory.KERNEL32,
             `CreateEventW(manual=${bManualReset ? 1 : 0},initial=${bInitialState ? 1 : 0},name="${name}") -> 0x${handle.toString(16)} ret=0x${returnAddr.toString(16)}`
@@ -856,6 +860,7 @@ const syncModule = (() => {
         if (name) {
             namedObjects.register('mutex', name, handle);
         }
+        sched.setLastError(0); // ERROR_SUCCESS — newly created (see CreateEventA)
         return handle;
     };
 
@@ -877,6 +882,7 @@ const syncModule = (() => {
         if (name) {
             namedObjects.register('mutex', name, handle);
         }
+        sched.setLastError(0); // ERROR_SUCCESS — newly created (see CreateEventA)
         return handle;
     };
 
@@ -934,6 +940,7 @@ const syncModule = (() => {
         if (name) {
             namedObjects.register('semaphore', name, handle);
         }
+        sched.setLastError(0); // ERROR_SUCCESS — newly created (see CreateEventA)
         return handle;
     };
 
@@ -956,6 +963,7 @@ const syncModule = (() => {
         if (name) {
             namedObjects.register('semaphore', name, handle);
         }
+        sched.setLastError(0); // ERROR_SUCCESS — newly created (see CreateEventA)
         return handle;
     };
 

@@ -39,6 +39,7 @@ export const exports: Record<string, ThunkImplementation> = {
         if (nextSlot > MAX_SLOTS) return FLS_OUT_OF_INDEXES;
         const index = nextSlot++;
         allocated.add(index);
+        hypercallDataManager.ensureFlsCurrentThread(currentTid());
         hypercallDataManager.setFlsSlot(index, true, 0, currentTid());
         return index;
     },
@@ -59,6 +60,7 @@ export const exports: Record<string, ThunkImplementation> = {
         let values = valuesByThread.get(tid);
         if (!values) { values = new Map(); valuesByThread.set(tid, values); }
         values.set(dwFlsIndex, lpFlsData >>> 0);
+        hypercallDataManager.ensureFlsCurrentThread(tid);
         hypercallDataManager.setFlsSlot(dwFlsIndex, true, lpFlsData >>> 0, tid);
         return 1;
     },
