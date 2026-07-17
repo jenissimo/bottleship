@@ -95,6 +95,15 @@ export interface CrashFaultPayload {
     sehDispatchTrace?: string[];
 }
 
+/** Guest cursor shape forwarded to the host (RGBA pixels + hotspot). */
+export interface HostCursorImage {
+    width: number;
+    height: number;
+    pixels: Uint8Array;
+    hotspotX: number;
+    hotspotY: number;
+}
+
 export class System {
     private static instance: System;
     public process: Process | null = null;
@@ -263,6 +272,7 @@ export class System {
     private hostResize: ((width: number, height: number) => void) | null = null;
     private hostCursorVisibility: ((visible: boolean) => void) | null = null;
     private hostCursorVisibleState: boolean | null = null;
+    private hostCursorImage: ((image: HostCursorImage | null) => void) | null = null;
     private hostMouseCapture: ((capture: boolean) => void) | null = null;
     private hostMouseCaptureState: boolean | null = null;
     private hostWindowTitle: ((title: string) => void) | null = null;
@@ -533,6 +543,22 @@ export class System {
         this.hostCursorVisibleState = visible;
         if (this.hostCursorVisibility) {
             this.hostCursorVisibility(visible);
+        }
+    }
+
+    setHostCursorImageCallback(callback: (image: HostCursorImage | null) => void): void {
+        this.hostCursorImage = callback;
+    }
+
+    /**
+     * Forward the installed cursor's image to the host so it renders the guest's
+     * pointer shape (real Windows: the system draws whatever SetCursor installed).
+     * Dedup lives with the cursor-state owner (user32 shared-state) — this is
+     * pure transport. null = no shape installed.
+     */
+    requestHostCursorImage(image: HostCursorImage | null): void {
+        if (this.hostCursorImage) {
+            this.hostCursorImage(image);
         }
     }
 

@@ -10,11 +10,13 @@ import { Marshaler } from '../../core/memory/marshaler';
 import { System } from '../../core/system';
 import { WindowInfo, windows, buttonCheckStates, getOrCreateListState, getOrCreateTrackbarState, controlImageHandles } from './shared-state';
 import { handleAnimateMessage } from './animate-control';
+import { handleEditMessage } from './edit-control';
+import { setScrollPos, getScrollPos, setScrollRange, getScrollRange, applyScrollInfo, readScrollInfo } from './scroll-state';
 import { paintSystemControl, clampListTopIndex } from './controls';
 import { repaintDialogAfterContentChange, restampOwnedPopupsAbove } from './dialog-paint';
 import { closeOpenComboboxes } from './control-interaction';
 import { getBitmapObjectDimensions, getIconObjectDimensions } from '../gdi32/bitmap-resolve';
-import { encodeAnsi } from '../codepage-utils';
+import { encodeAnsi, readAnsiOrWideFromGuest } from '../codepage-utils';
 
 const SS_TYPEMASK = 0x001F;
 const SS_BITMAP = 0x000E;
@@ -78,28 +80,13 @@ export function handleSystemControlMessage(
     const anim = handleAnimateMessage(child.handle, msg, wParam, lParam, mem);
     if (anim !== null) return anim;
 
-    const readAnsiOrWideString = (ptr: number): string => {
-        if (!ptr) return '';
-        const maxProbeChars = 16;
-        let probed = 0;
-        let zeroHighBytes = 0;
+    // EDIT owns EM_* plus text-editing WM_SETTEXT/WM_CHAR/WM_KEYDOWN semantics.
+    if ((child.systemControlClass ?? '').trim().toLowerCase() === 'edit') {
+        const editResult = handleEditMessage(child, msg, wParam, lParam, mem);
+        if (editResult !== null) return editResult;
+    }
 
-        for (let i = 0; i < maxProbeChars; i++) {
-            const loIdx = ptr + i * 2;
-            const hiIdx = loIdx + 1;
-            if (hiIdx >= mem.length) break;
-            const lo = mem[loIdx];
-            const hi = mem[hiIdx];
-            if (lo === 0 && hi === 0) break;
-            probed++;
-            if (hi === 0) zeroHighBytes++;
-        }
-
-        const looksWide = probed > 0 && (zeroHighBytes / probed) >= 0.75;
-        return looksWide
-            ? Marshaler.readWideString(mem, ptr)
-            : Marshaler.readString(mem, ptr);
-    };
+    const readAnsiOrWideString = (ptr: number): string => readAnsiOrWideFromGuest(mem, ptr);
 
     const WM_SETTEXT = 0x000C;
     const WM_GETTEXT = 0x000D;
@@ -208,6 +195,12 @@ export function handleSystemControlMessage(
         const cls = (child.systemControlClass ?? '').trim().toLowerCase();
         if (cls === 'msctls_trackbar32') return handleTrackbarMessage(child, msg, wParam, lParam);
         if (cls === 'msctls_progress32') return handleProgressMessage(child, msg, wParam, lParam);
+    }
+
+    // SBM_* (0x00E0..0x00EA) on a ScrollBar-class control (SB_CTL protocol).
+    if (msg >= 0x00E0 && msg <= 0x00EA
+        && (child.systemControlClass ?? '').trim().toLowerCase() === 'scrollbar') {
+        return handleScrollBarControlMessage(child, msg, wParam, lParam, mem);
     }
 
     const LB_GETTOPINDEX = 0x018E;
@@ -561,6 +554,54 @@ function handleTrackbarMessage(child: WindowInfo, msg: number, wParam: number, l
         }
         case TBM_GETLINESIZE:
             return state.lineSize;
+        default:
+            return 0;
+    }
+}
+
+/** ScrollBar-class control SBM_* handler (state keyed as SB_CTL on the control's hwnd). */
+function handleScrollBarControlMessage(
+    child: WindowInfo, msg: number, wParam: number, lParam: number, mem: Uint8Array,
+): number {
+    const SB_CTL = 2;
+    const SBM_SETPOS = 0x00E0;
+    const SBM_GETPOS = 0x00E1;
+    const SBM_SETRANGE = 0x00E2;
+    const SBM_GETRANGE = 0x00E3;
+    const SBM_ENABLE_ARROWS = 0x00E4;
+    const SBM_SETRANGEREDRAW = 0x00E6;
+    const SBM_SETSCROLLINFO = 0x00E9;
+    const SBM_GETSCROLLINFO = 0x00EA;
+
+    const repaint = () => {
+        if (child.parent) repaintDialogAfterContentChange(child.parent);
+    };
+
+    switch (msg) {
+        case SBM_SETPOS: {
+            const prev = setScrollPos(child.handle, SB_CTL, wParam | 0);
+            if (lParam) repaint();
+            return prev;
+        }
+        case SBM_GETPOS:
+            return getScrollPos(child.handle, SB_CTL);
+        case SBM_SETRANGE:
+        case SBM_SETRANGEREDRAW:
+            setScrollRange(child.handle, SB_CTL, wParam | 0, lParam | 0);
+            if (msg === SBM_SETRANGEREDRAW) repaint();
+            return 0;
+        case SBM_GETRANGE:
+            getScrollRange(mem, child.handle, SB_CTL, wParam, lParam);
+            return 0;
+        case SBM_ENABLE_ARROWS:
+            return 1;
+        case SBM_SETSCROLLINFO: {
+            const prev = applyScrollInfo(mem, child.handle, SB_CTL, lParam);
+            if (wParam) repaint();
+            return prev;
+        }
+        case SBM_GETSCROLLINFO:
+            return readScrollInfo(mem, child.handle, SB_CTL, lParam) ? 1 : 0;
         default:
             return 0;
     }

@@ -13,6 +13,8 @@ import type { WindowInfo } from './shared-state';
 import { resolveBitmapRgba, resolveIconRgba, layoutStaticControlImage, blitStaticControlImage } from '../gdi32/bitmap-resolve';
 import { Logger, LogCategory } from '../../core/logger';
 import { fillTextWithMnemonic, measureMnemonicText } from '../win32-text';
+import { getEditVisualState } from './edit-control';
+import { getControlColorOverride } from './control-colors';
 
 // Window styles
 const WS_DISABLED = 0x08000000;
@@ -72,6 +74,8 @@ const COLOR_WINDOW = '#FFFFFF';
 const COLOR_WINDOWTEXT = '#000000';
 const COLOR_BTNTEXT = '#000000';
 const COLOR_GRAYTEXT = '#808080';
+const COLOR_HIGHLIGHT = '#0A246A';
+const COLOR_HIGHLIGHTTEXT = '#FFFFFF';
 
 // Font used for control labels
 const CONTROL_FONT = "11px 'Liberation Sans', sans-serif";
@@ -485,14 +489,15 @@ function paintCheckableButton(
     // double-struck. Static/group-box text has the same exposure; fixing the
     // control most visibly affected (checkboxes repaint far more often, on every
     // click/content-change) first.
+    const colors = getControlColorOverride(child.handle);
     const labelX = indicatorX + indicatorSize + 6;
-    ctx.fillStyle = COLOR_BTNFACE;
+    ctx.fillStyle = colors?.brush ?? colors?.bk ?? COLOR_BTNFACE;
     ctx.fillRect(labelX - 1, y, Math.max(1, x + w - labelX + 1), h);
 
     ctx.font = getWindowFont(child);
     ctx.textAlign = 'left';
     ctx.textBaseline = 'middle';
-    ctx.fillStyle = disabled ? COLOR_GRAYTEXT : COLOR_WINDOWTEXT;
+    ctx.fillStyle = disabled ? COLOR_GRAYTEXT : (colors?.text ?? COLOR_WINDOWTEXT);
     fillTextWithMnemonic(ctx, label, labelX, y + h / 2);
     ctx.textBaseline = 'top';
 }
@@ -704,6 +709,15 @@ function paintStatic(
 
     drawStaticShape(ctx, x, y, w, h, styleType);
 
+    const isTextType = styleType === SS_LEFT || styleType === SS_CENTER || styleType === SS_RIGHT
+        || styleType === SS_SIMPLE || styleType === SS_LEFTNOWORDWRAP;
+    const colors = getControlColorOverride(child.handle);
+    if (isTextType && (colors?.brush ?? colors?.bk)) {
+        // WM_CTLCOLORSTATIC returned a background brush — the static is opaque.
+        ctx.fillStyle = (colors.brush ?? colors.bk)!;
+        ctx.fillRect(x, y, w, h);
+    }
+
     const text = child.title || '';
     if (!text) return;
 
@@ -712,7 +726,7 @@ function paintStatic(
     const disabled = isControlDisabled(child);
 
     ctx.font = getWindowFont(child);
-    ctx.fillStyle = disabled ? COLOR_GRAYTEXT : COLOR_WINDOWTEXT;
+    ctx.fillStyle = disabled ? COLOR_GRAYTEXT : (colors?.text ?? COLOR_WINDOWTEXT);
     ctx.textBaseline = 'top';
 
     // SS_LEFT/SS_CENTER/SS_RIGHT word-wrap to the control width (real Win32); only
@@ -771,15 +785,18 @@ function paintEdit(
     h: number,
 ): void {
     const disabled = isControlDisabled(child);
+    const colors = getControlColorOverride(child.handle);
 
-    ctx.fillStyle = disabled ? COLOR_BTNFACE : COLOR_WINDOW;
+    ctx.fillStyle = disabled ? COLOR_BTNFACE : (colors?.brush ?? colors?.bk ?? COLOR_WINDOW);
     ctx.fillRect(x, y, w, h);
     drawSunkenEdge(ctx, x, y, w, h);
 
-    const text = child.title || '';
-    if (!text) return;
+    const visual = getEditVisualState(child);
+    const textColor = disabled ? COLOR_GRAYTEXT : (colors?.text ?? COLOR_WINDOWTEXT);
+    const text = visual.passwordChar
+        ? String.fromCharCode(visual.passwordChar).repeat(child.title.length)
+        : (child.title || '');
 
-    ctx.fillStyle = disabled ? COLOR_GRAYTEXT : COLOR_WINDOWTEXT;
     ctx.font = getWindowFont(child);
     ctx.textAlign = 'left';
     ctx.textBaseline = 'middle';
@@ -799,7 +816,33 @@ function paintEdit(
             ty += lineHeight;
         }
     } else {
-        ctx.fillText(text, x + 4, y + h / 2);
+        const tx = x + 4;
+        const ty = y + h / 2;
+        const selLo = Math.min(visual.selStart, visual.selEnd);
+        const selHi = Math.max(visual.selStart, visual.selEnd);
+
+        if (visual.focused && selLo !== selHi) {
+            const x0 = tx + ctx.measureText(text.slice(0, selLo)).width;
+            const x1 = tx + ctx.measureText(text.slice(0, selHi)).width;
+            ctx.fillStyle = COLOR_HIGHLIGHT;
+            ctx.fillRect(x0, y + 3, Math.max(1, x1 - x0), h - 6);
+            ctx.fillStyle = textColor;
+            if (text) ctx.fillText(text.slice(0, selLo), tx, ty);
+            ctx.fillStyle = COLOR_HIGHLIGHTTEXT;
+            ctx.fillText(text.slice(selLo, selHi), x0, ty);
+            ctx.fillStyle = textColor;
+            ctx.fillText(text.slice(selHi), x1, ty);
+        } else {
+            if (text) {
+                ctx.fillStyle = textColor;
+                ctx.fillText(text, tx, ty);
+            }
+            if (visual.focused && !disabled) {
+                const caretX = tx + ctx.measureText(text.slice(0, visual.selEnd)).width;
+                ctx.fillStyle = COLOR_WINDOWTEXT;
+                ctx.fillRect(Math.round(caretX), y + 3, 1, h - 6);
+            }
+        }
     }
     ctx.restore();
     ctx.textBaseline = 'top';
@@ -941,8 +984,9 @@ function paintListBox(
     h: number,
 ): void {
     const disabled = isControlDisabled(child);
+    const colors = getControlColorOverride(child.handle);
 
-    ctx.fillStyle = disabled ? COLOR_BTNFACE : COLOR_WINDOW;
+    ctx.fillStyle = disabled ? COLOR_BTNFACE : (colors?.brush ?? colors?.bk ?? COLOR_WINDOW);
     ctx.fillRect(x, y, w, h);
     drawSunkenEdge(ctx, x, y, w, h);
 
@@ -972,7 +1016,7 @@ function paintListBox(
             ctx.fillRect(x + LIST_INSET, iy, Math.max(1, itemW), LIST_ITEM_H);
             ctx.fillStyle = COLOR_BTNHILIGHT;
         } else {
-            ctx.fillStyle = disabled ? COLOR_GRAYTEXT : COLOR_WINDOWTEXT;
+            ctx.fillStyle = disabled ? COLOR_GRAYTEXT : (colors?.text ?? COLOR_WINDOWTEXT);
         }
         ctx.fillText(state.items[idx].text, x + 4, iy + 1);
     }

@@ -23,6 +23,8 @@ import { handleSystemControlMouseAtScreen, resetControlInteractionState } from '
 import { noteDialogOverlayCandidate, resolveMouseTargetHwnd, eraseDialogOverlay, registerOverlayPaintRepair } from './dialog-overlay';
 import { paintDialogToOverlay, finalizeDialogPaint, repaintDialogOverlayIfVisible, repaintDialogAfterContentChange } from './dialog-paint';
 import { handleSystemControlMessage, applyStaticSetImageAutoSize } from './dialog-control-messages';
+import { getDefWindowProcAddress } from './system-classes';
+import { isEditContentMessage } from './edit-control';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { emitDialogShow } from '../../core/debug/dbg-commands';
 import {
@@ -156,50 +158,6 @@ function hasGuestDestroyProc(wi: WindowInfo): boolean {
 const COLOR_DLGFACE = 0x00C8D0D4;
 
 /**
- * Cached DefWindowProcA thunk address. Lazily resolved from the ThunkGenerator.
- * System controls use this as their wndProc Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р вЂ Р В РІР‚С™Р РЋРЎС™ it's a real x86 thunk stub, so
- * GetWindowLong(GWL_WNDPROC), CallWindowProcA, direct CALL all work correctly.
- * When the thunk fires, DefWindowProcA handler runs in JS (no-op for most messages).
- */
-let cachedDefWindowProcAddr = 0;
-
-function getDefWindowProcAddress(): number {
-    if (cachedDefWindowProcAddr) return cachedDefWindowProcAddr;
-    const system = System.getInstance();
-    const dispatcher = system.process?.dispatcher as any;
-    const tg = dispatcher?.thunkGenerator;
-    if (tg) {
-        // Try existing stub first (generated during PE import processing)
-        let addr = tg.getExportAddress('user32:defwindowproca') ?? tg.getExportAddress('defwindowproca');
-        if (!addr) {
-            // No PE imported DefWindowProcA Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р вЂ Р В РІР‚С™Р РЋРЎС™ allocate a stub on demand.
-            // DefWindowProcA is stdcall with 4 args (hWnd, Msg, wParam, lParam).
-            try {
-                const { address, code } = tg.allocateOneStub('user32', 'DefWindowProcA', 4, 'stdcall');
-                const memArray = system.process?.getCurrentMemory();
-                if (memArray && address + code.length <= memArray.length) {
-                    memArray.set(code, address);
-                    dispatcher.applyPendingRegistrations?.();
-                    addr = address;
-                    Logger.log(LogCategory.USER32,
-                        `Allocated DefWindowProcA stub on demand at 0x${address.toString(16)}`);
-                }
-            } catch (e) {
-                Logger.warn(LogCategory.USER32, `Failed to allocate DefWindowProcA stub: ${e}`);
-            }
-        }
-        if (addr) {
-            cachedDefWindowProcAddr = addr;
-            Logger.log(LogCategory.USER32,
-                `Resolved DefWindowProcA thunk address: 0x${addr.toString(16)}`);
-            return addr;
-        }
-    }
-    Logger.warn(LogCategory.USER32, 'Could not resolve DefWindowProcA thunk address');
-    return 0;
-}
-
-/**
  * Look up a child control by controlId in the given dialog's children.
  */
 export function findChildByControlId(
@@ -257,7 +215,8 @@ export function isContentChangingMessage(msg: number): boolean {
         || (msg >= CB_ADDSTRING && msg <= CB_SETCURSEL)
         || (msg >= LB_ADDSTRING && msg <= LB_SETCURSEL)
         || (msg >= TBM_SETPOS && msg <= TBM_SETRANGEMAX)
-        || (msg >= 0x0401 && msg <= 0x0406); // PBM_SETRANGE..PBM_SETRANGE32 overlap
+        || (msg >= 0x0401 && msg <= 0x0406) // PBM_SETRANGE..PBM_SETRANGE32 overlap
+        || isEditContentMessage(msg); // EM_*/WM_CHAR/WM_KEYDOWN on an edit (caller gates class)
 }
 
 function createDialogTemplateFont(parsed: ParsedDlgTemplate | null): number {
@@ -1069,7 +1028,12 @@ function runModalDialog(
         }
 
         // --- System control handling (JS-managed Button/Static/Edit/etc.) ---
-        if (targetInfo?.isSystemControl) {
+        // A guest-subclassed control (SetWindowLong GWL_WNDPROC) is no longer JS-managed:
+        // its window procedure IS the guest's, so fall through to the x86 dispatch below so
+        // app-defined messages reach the guest message map (mirrors the SendMessage /
+        // DispatchMessage `!wndProcSubclassed` guard). Without this, a subclassed control in
+        // a MODAL dialog has its custom messages swallowed by handleSystemControlMessage.
+        if (targetInfo?.isSystemControl && !targetInfo.wndProcSubclassed) {
             if (message === WM_LBUTTONDOWN || message === WM_LBUTTONUP) {
                 const { x: screenX, y: screenY } = clientLParamToScreen(hwnd, lParam);
                 dispatchSystemControlClick(label, dialogHwnd, message, wParam, screenX, screenY);

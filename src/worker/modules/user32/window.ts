@@ -11,8 +11,7 @@ import { DESKTOP_HWND } from '../../runtime/windowing/window-manager';
 import { getWindowClass, getWindowClassByName } from './class';
 import { Marshaler } from '../../core/memory/marshaler';
 import { Mem } from '../../core/memory/mem-accessor';
-import { WindowInfo, windows, incrementNextWindowId, getCursorDisplayCount, updateCursorDisplayCount, isGuestCursorVisible, isCurrentCursorCustom, installCursorAndUpdateHostVisibility, getAbsoluteWindowPosition, markGuestCustomPaint, killWindowTimers, registerWindowDestroyFinalizer, reorderChildInParent, setLockWindowUpdate, isWindowUpdateLocked } from './shared-state';
-import { isGameScreenOwned } from './dialog-overlay';
+import { WindowInfo, windows, incrementNextWindowId, getCursorDisplayCount, updateCursorDisplayCount, isGuestCursorVisible, syncHostCursorToGuestState, installCursorAndUpdateHostVisibility, getAbsoluteWindowPosition, markGuestCustomPaint, killWindowTimers, registerWindowDestroyFinalizer, reorderChildInParent, setLockWindowUpdate, isWindowUpdateLocked, hasSystemControlChildren } from './shared-state';
 import {
     invalidateWindow,
     validateWindow,
@@ -31,6 +30,8 @@ import { registerWindowQueryExports } from './window-query';
 import { registerWindowPropExports } from './window-props';
 import { GDIContext } from '../gdi32/context';
 import { ensureAnimateControlClasses, clearAnimateState, onAnimateShowWindow, isAnimateControlWindow } from './animate-control';
+import { getBuiltinSystemClass } from './system-classes';
+import { invalidateControlColors } from './control-colors';
 import { applyScrollInfo, setScrollPos as setScrollBarPos } from './scroll-state';
 import { repaintDialogOverlayIfVisible, repaintDialogAfterContentChange, isSentinelWndProc, handleSystemControlMessage, isContentChangingMessage, requestGuestDialogPaint } from './dialog';
 import { noteDialogOverlayCandidate, eraseDialogOverlay } from './dialog-overlay';
@@ -65,7 +66,9 @@ function isDialogLikeWindow(window: WindowInfo): boolean {
         || (window.nativeClassName ?? '').toLowerCase() === '#32770';
 }
 
-/** Repaint dialog overlay when a system child (static/logo) moves or resizes. */
+/** Repaint the parent's overlay when a system child (static/logo) moves or resizes.
+ *  The parent needn't be a dialog — repaintDialogAfterContentChange handles any
+ *  window hosting system controls (plain launcher/menu windows included). */
 function repaintParentDialogIfSystemControlGeometryChanged(
     window: WindowInfo,
     moved: boolean,
@@ -74,7 +77,7 @@ function repaintParentDialogIfSystemControlGeometryChanged(
     if (!window.isSystemControl || !window.parent || (!moved && !resized)) return;
     const parentHwnd = window.parent;
     const parent = windows.get(parentHwnd);
-    if (!parent || !isDialogLikeWindow(parent)) return;
+    if (!parent) return;
     Logger.verbose(LogCategory.USER32,
         `repaint parent dialog 0x${parentHwnd.toString(16)} after child ` +
         `0x${window.handle.toString(16)} id=${window.controlId ?? '?'} ` +
@@ -142,7 +145,8 @@ function trySuspendForSyncWindowMessage(
     existingFrameId?: number,
 ): { suspended: true; callbackId: number } | { suspended: false } {
     const win = windows.get(hWnd);
-    if (!win || win.isSystemControl) return { suspended: false };
+    // A subclassed system control's wndproc IS the guest's — sync messages must reach it.
+    if (!win || (win.isSystemControl && !win.wndProcSubclassed)) return { suspended: false };
 
     // Win32 does not re-enter WM_PAINT while WM_CREATE / WM_INITDIALOG is running.
     if (msg === WM_PAINT_GEO && isWindowInitInProgress(hWnd)) {
@@ -197,7 +201,8 @@ function trySuspendForSyncGeometryNotify(
 ): { suspended: true; callbackId: number } | { suspended: false } {
     if (uFlags & SWP_NOSENDCHANGING_GEO) return { suspended: false };
     const win = windows.get(hWnd);
-    if (!win || win.isSystemControl) return { suspended: false };
+    // A subclassed system control's wndproc IS the guest's — sync messages must reach it.
+    if (!win || (win.isSystemControl && !win.wndProcSubclassed)) return { suspended: false };
 
     const wndProc = resolveGuestWndProc(win);
     if (!wndProc || isSentinelWndProc(wndProc)) return { suspended: false };
@@ -375,13 +380,15 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             postInitialActivationMessages(windowInfo.handle);
         }
 
-        system.windowManager.postMessage(windowInfo.handle, WM_SHOWWINDOW, 1, 0);
-        system.windowManager.postMessage(
-            windowInfo.handle,
-            WM_SIZE,
-            SIZE_RESTORED,
-            makeLParam(windowInfo.width, windowInfo.height)
-        );
+        if (!windowInfo.createSyncVisibleDelivered) {
+            system.windowManager.postMessage(windowInfo.handle, WM_SHOWWINDOW, 1, 0);
+            system.windowManager.postMessage(
+                windowInfo.handle,
+                WM_SIZE,
+                SIZE_RESTORED,
+                makeLParam(windowInfo.width, windowInfo.height)
+            );
+        }
         system.windowManager.postMessage(windowInfo.handle, WM_PAINT, 0, 0);
     };
 
@@ -427,10 +434,24 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             classInfo = { lpfnWndProc: 0 };
         }
 
-        const size = resolveSize(nWidth, nHeight);
+        // Built-in user32 control class (Button/Static/Edit/...) not shadowed by an
+        // app-registered class: create a JS-driven system control, same machinery as
+        // dialog-template children.
+        const builtinDescr = (typeof className === 'string' && classInfo?.isBuiltinSystemClass)
+            ? getBuiltinSystemClass(className)
+            : undefined;
+
+        const WS_CHILD = 0x40000000;
+        const isChildWindow = (dwStyle & WS_CHILD) !== 0;
+
+        // CW_USEDEFAULT / zero-size defaults are a top-level concept; a child control
+        // keeps its requested size (games create 0-sized or tiny controls on purpose).
+        const size = (builtinDescr && isChildWindow)
+            ? { width: Math.max(0, nWidth | 0), height: Math.max(0, nHeight | 0) }
+            : resolveSize(nWidth, nHeight);
 
         const resolvedClassName = typeof className === 'string'
-            ? className
+            ? (builtinDescr?.name ?? className)
             : (classInfo?.className ?? 'Static');
 
         // Create in system WindowManager FIRST to get the canonical hwnd
@@ -443,8 +464,6 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         // with a non-zero Y and never MoveWindow'd — discarding its Y pinned it to the top
         // instead of over the title. (Owner-draw buttons survive the old 0,0 because HL
         // MoveWindows them afterward, which overrides this.)
-        const WS_CHILD = 0x40000000;
-        const isChildWindow = (dwStyle & WS_CHILD) !== 0;
         const xUseDefault = (X | 0) === (0x80000000 | 0) || (X >>> 0) === 0x80000000;
         const yUseDefault = (Y | 0) === (0x80000000 | 0) || (Y >>> 0) === 0x80000000;
         const resolvedX = (isChildWindow && !xUseDefault) ? (X | 0) : 0;
@@ -489,6 +508,14 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             nativeClassName: resolvedClassName,
         };
 
+        if (builtinDescr?.controlClass) {
+            windowInfo.isSystemControl = true;
+            windowInfo.systemControlClass = builtinDescr.controlClass;
+            // For a WS_CHILD window the hMenu argument is the control id.
+            if (isChildWindow) windowInfo.controlId = hMenu >>> 0;
+            windowInfo.fontHandle = windows.get(hWndParent)?.fontHandle;
+        }
+
         windows.set(windowInfo.handle, windowInfo);
 
         // Add to parent's children list
@@ -496,6 +523,12 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             const parent = windows.get(hWndParent);
             if (parent) {
                 parent.children.push(windowInfo.handle);
+                // A visible plain window gaining its first system control while the
+                // game owns the screen becomes an overlay candidate (controls are
+                // usually created AFTER the parent was shown).
+                if (windowInfo.isSystemControl) {
+                    noteDialogOverlayCandidate(parent);
+                }
             }
         }
 
@@ -522,7 +555,12 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         const cbtHooks = callbackManager ? getHooksOfType(WH_CBT) : [];
         const totalCbtHooks = cbtHooks.length;
 
-        if (!callbackManager || (!windowInfo.wndProc && totalCbtHooks === 0)) {
+        // JS-driven system controls have a DefWindowProc thunk wndProc; WM_NCCREATE /
+        // WM_CREATE into it is a guest round-trip for a no-op (dialog children skip it
+        // the same way). CBT hooks still fire below when present.
+        const hasGuestCreateProc = !!windowInfo.wndProc && !windowInfo.isSystemControl;
+
+        if (!callbackManager || (!hasGuestCreateProc && totalCbtHooks === 0)) {
             postInitialVisibleWindowMessages(windowInfo);
             return windowInfo.handle;
         }
@@ -590,7 +628,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
                 // Fall through: all CBT hooks done, now WM_NCCREATE
             }
 
-            if (phase <= totalCbtHooks && windowInfo.wndProc) {
+            if (phase <= totalCbtHooks && hasGuestCreateProc) {
                 // WM_NCCREATE phase
                 phase = totalCbtHooks + 1;
                 try {
@@ -611,7 +649,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
                 }
             }
 
-            if (phase === totalCbtHooks + 1 && windowInfo.wndProc) {
+            if (phase === totalCbtHooks + 1 && hasGuestCreateProc) {
                 // WM_CREATE phase
                 phase = totalCbtHooks + 2;
                 try {
@@ -632,6 +670,60 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
                 }
             }
 
+            // Win32 CreateWindowEx(WS_VISIBLE) delivers WM_SHOWWINDOW/WM_SIZE synchronously
+            // (via the initial show-SetWindowPos) BEFORE returning; only WM_PAINT arrives via
+            // the queue. Deliver them here for guest-proc windows — including system controls
+            // subclassed by a CBT hook above — so post-Create guest code observes the WM_SIZE
+            // side effects in real user32 order (a deferred WM_SIZE lands AFTER the caller's
+            // post-Create setup and can wipe its state).
+            const guestVisibleProc = windowInfo.visible
+                && !!windowInfo.wndProc
+                && (!windowInfo.isSystemControl || !!windowInfo.wndProcSubclassed)
+                && !isSentinelWndProc(windowInfo.wndProc);
+
+            if (phase < totalCbtHooks + 3) {
+                phase = totalCbtHooks + 3;
+                if (guestVisibleProc) {
+                    windowInfo.createSyncVisibleDelivered = true;
+                    try {
+                        callbackManager.invokeCallback(
+                            windowInfo.wndProc,
+                            [windowInfo.handle, WM_SHOWWINDOW, 1, 0],
+                            0,
+                            completeThunk,
+                            false,
+                            `${label}:WM_SHOWWINDOW`,
+                            frameId
+                        );
+                        return null;
+                    } catch (e) {
+                        Logger.warn(LogCategory.USER32, `${label}: WM_SHOWWINDOW invoke failed: ${e}`);
+                    }
+                }
+            }
+
+            if (phase < totalCbtHooks + 4) {
+                phase = totalCbtHooks + 4;
+                if (guestVisibleProc) {
+                    windowInfo.createSyncVisibleDelivered = true;
+                    try {
+                        callbackManager.invokeCallback(
+                            windowInfo.wndProc,
+                            [windowInfo.handle, WM_SIZE, SIZE_RESTORED,
+                                makeLParam(windowInfo.width, windowInfo.height)],
+                            0,
+                            completeThunk,
+                            false,
+                            `${label}:WM_SIZE`,
+                            frameId
+                        );
+                        return null;
+                    } catch (e) {
+                        Logger.warn(LogCategory.USER32, `${label}: WM_SIZE invoke failed: ${e}`);
+                    }
+                }
+            }
+
             return finishCreateWindowCallbacks(windowInfo);
         };
 
@@ -647,7 +739,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
                 frameId
             );
             return { value: windowInfo.handle, suspendedForCallback: true, callbackId: first.callbackId, stackCleanup };
-        } else if (windowInfo.wndProc) {
+        } else if (hasGuestCreateProc) {
             // No CBT hooks — start directly with WM_NCCREATE (phase = totalCbtHooks = 0)
             phase = totalCbtHooks; // = 0, will match `phase <= totalCbtHooks` in completeThunk
             const first = callbackManager.invokeCallback(
@@ -862,7 +954,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
                     : (win?.nativeClassName ? getWindowClassByName(win.nativeClassName) : undefined);
                 const classCursor = (classInfo?.hCursor ?? 0) >>> 0;
                 if (classCursor !== 0) {
-                    installCursorAndUpdateHostVisibility(classCursor, isGameScreenOwned());
+                    installCursorAndUpdateHostVisibility(classCursor);
                 }
             }
             return 1;
@@ -995,6 +1087,11 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         }
 
         System.getInstance().windowManager.postMessage(hWnd, WM_PAINT, 0, 0);
+        // Plain window hosting system controls: the guest may not paint at all —
+        // recomposite the controls regardless.
+        if (win && hasSystemControlChildren(win)) {
+            repaintDialogAfterContentChange(hWnd);
+        }
         System.getInstance().scheduler.wakeMessageWaiters();
         return 1; // TRUE
     };
@@ -1153,9 +1250,8 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         const bShow = args[0] !== 0;
         const prevCount = getCursorDisplayCount();
         const nextCount = updateCursorDisplayCount(bShow ? 1 : -1);
-        const visible = isGuestCursorVisible() && !(isCurrentCursorCustom() && isGameScreenOwned());
-        System.getInstance().requestHostCursorVisible(visible);
-        Logger.verbose(LogCategory.USER32, `ShowCursor(${bShow ? 1 : 0}) -> ${nextCount} (prev=${prevCount}), visible=${visible}`);
+        syncHostCursorToGuestState();
+        Logger.verbose(LogCategory.USER32, `ShowCursor(${bShow ? 1 : 0}) -> ${nextCount} (prev=${prevCount}), visible=${isGuestCursorVisible()}`);
         return nextCount;
     };
 
@@ -1189,11 +1285,15 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
 
         const win = windows.get(hWnd);
         if (win?.isSystemControl && win.parent) {
+            invalidateControlColors(hWnd); // next EndPaint chain re-queries WM_CTLCOLOR*
             repaintDialogAfterContentChange(win.parent);
         } else if (win && isDialogLikeWindow(win)) {
             repaintDialogOverlayIfVisible(hWnd);
         } else if (win) {
             System.getInstance().windowManager.postMessage(hWnd, WM_PAINT, 0, 0);
+            if (hasSystemControlChildren(win)) {
+                repaintDialogAfterContentChange(hWnd);
+            }
         }
         // Win32: InvalidateRect marks invalid; WM_PAINT delivered on pump / UpdateWindow.
 

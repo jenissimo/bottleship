@@ -2,6 +2,8 @@ import { Logger, LogCategory } from "../../core/logger";
 import { System } from "../../core/system";
 import { resetHooks } from "./hooks";
 import { resetOwnerDrawScratch } from "./owner-draw";
+import { resetSystemCursorHandles } from "./system-cursors";
+import { resetUser32Classes } from "./class";
 
 // Window storage
 export interface WindowInfo {
@@ -43,6 +45,9 @@ export interface WindowInfo {
      *  — i.e. it paints itself (MFC subclassing). We deliver WM_PAINT to it instead of
      *  drawing default chrome, exactly like Windows runs the control's own window proc. */
     wndProcSubclassed?: boolean;
+    /** WM_SHOWWINDOW/WM_SIZE were delivered synchronously inside CreateWindowEx
+     *  (Win32 order); the post-create path must not queue duplicates. */
+    createSyncVisibleDelivered?: boolean;
     /** False until WM_ACTIVATE is delivered (CreateDialog top-level); gates RDW_UPDATENOW paint. */
     activationDelivered?: boolean;
     /** True while WM_INITDIALOG callback is in flight (nested pump). */
@@ -106,6 +111,12 @@ let windowDestroyFinalizer: ((hwnd: number) => void) | null = null;
 export function registerWindowDestroyFinalizer(fn: (hwnd: number) => void): void {
     windowDestroyFinalizer = fn;
 }
+/** Extra per-HWND state stores (edit-control, ...) registered to avoid import cycles. */
+const extraControlStatePurgers: Array<(hwnd: number) => void> = [];
+export function registerControlStatePurger(fn: (hwnd: number) => void): void {
+    extraControlStatePurgers.push(fn);
+}
+
 /** Purge per-HWND control state so HWND reuse cannot inherit stale check/list/dropdown. */
 export function purgeControlState(hwnd: number): void {
     const h = hwnd >>> 0;
@@ -113,6 +124,7 @@ export function purgeControlState(hwnd: number): void {
     listControlStates.delete(h);
     trackbarStates.delete(h);
     controlImageHandles.delete(h);
+    for (const purge of extraControlStatePurgers) purge(h);
 }
 
 export function finalizeWindowDestroy(hwnd: number): void {
@@ -201,6 +213,14 @@ export function getChildZOrderSibling(hwnd: number, direction: 'next' | 'prev'):
 }
 
 /** Children in paint order: back → front (topmost painted last). */
+/** True when any direct child is a JS-driven system control. */
+export function hasSystemControlChildren(win: WindowInfo): boolean {
+    for (const h of win.children) {
+        if (windows.get(h)?.isSystemControl) return true;
+    }
+    return false;
+}
+
 export function getChildrenInPaintOrder(parentHwnd: number): number[] {
     const parent = windows.get(parentHwnd);
     if (!parent) return [];
@@ -357,19 +377,11 @@ export function getCursorDisplayCount(): number {
 // window regardless of the ShowCursor display count — SDL2 hides its cursor
 // this way (WIN_ShowCursor → SetCursor(NULL)), never touching ShowCursor.
 let currentCursorHandle = 1;
-// SetCursor installed a game-authored cursor image (CreateIconIndirect/CreateCursor
-// user object) rather than a system shape. The host arrow misrepresents it.
-let currentCursorIsCustom = false;
 
-export function setCurrentCursorHandle(hCursor: number, isCustom = false): number {
+export function setCurrentCursorHandle(hCursor: number): number {
     const prev = currentCursorHandle;
     currentCursorHandle = hCursor >>> 0;
-    currentCursorIsCustom = isCustom && hCursor !== 0;
     return prev;
-}
-
-export function isCurrentCursorCustom(): boolean {
-    return currentCursorIsCustom;
 }
 
 /** Effective host-cursor visibility: display count ≥ 0 AND a non-NULL cursor set. */
@@ -377,21 +389,48 @@ export function isGuestCursorVisible(): boolean {
     return cursorDisplayCount >= 0 && currentCursorHandle !== 0;
 }
 
+// Last cursor user object forwarded to the host — identity dedup (handles are
+// pool-reused, so dedup by handle value would go stale; see the ddraw
+// GetAttachedSurface cache for the same failure mode).
+let lastForwardedCursorImageObj: unknown = null;
+
+/**
+ * Single sync point for the guest pointer → host: pushes visibility and the
+ * installed shape. Real Windows draws whatever image SetCursor installed
+ * whenever the cursor is visible — a game that renders its own pointer hides
+ * the system one first (SetCursor(NULL) or ShowCursor to a negative count), so
+ * a visible custom cursor means the HOST renders its image. Every cursor-state
+ * mutator (SetCursor, ShowCursor, dialog forcing) must end here — do not
+ * re-derive visibility at call sites.
+ */
+export function syncHostCursorToGuestState(): void {
+    const sys = System.getInstance();
+    sys.requestHostCursorVisible(isGuestCursorVisible());
+    const obj = sys.resourceProvider.getUserObject?.(currentCursorHandle);
+    const image = (obj?.type === 'CURSOR'
+        && obj.pixels instanceof Uint8Array
+        && obj.width > 0 && obj.height > 0
+        && obj.pixels.length >= obj.width * obj.height * 4)
+        ? obj : null;
+    if (lastForwardedCursorImageObj === image) return;
+    lastForwardedCursorImageObj = image;
+    sys.requestHostCursorImage(image ? {
+        width: image.width,
+        height: image.height,
+        pixels: image.pixels,
+        hotspotX: image.xHotspot ?? 0,
+        hotspotY: image.yHotspot ?? 0,
+    } : null);
+}
+
 /**
  * SetCursor semantics shared by user32 SetCursor and DefWindowProc WM_SETCURSOR:
- * install the handle (custom = game-authored CURSOR user object) and recompute
- * host-cursor visibility. `gameScreenOwned` is passed in (dialog-overlay's
- * isGameScreenOwned) to avoid an import cycle.
+ * install the handle and sync the host pointer. Returns the previous handle.
  */
-export function installCursorAndUpdateHostVisibility(
-    hCursor: number,
-    gameScreenOwned: boolean
-): { prev: number; custom: boolean; hostVisible: boolean } {
-    const custom = System.getInstance().resourceProvider.getUserObject?.(hCursor)?.type === 'CURSOR';
-    const prev = setCurrentCursorHandle(hCursor, custom);
-    const hostVisible = isGuestCursorVisible() && !(isCurrentCursorCustom() && gameScreenOwned);
-    System.getInstance().requestHostCursorVisible(hostVisible);
-    return { prev, custom, hostVisible };
+export function installCursorAndUpdateHostVisibility(hCursor: number): number {
+    const prev = setCurrentCursorHandle(hCursor);
+    syncHostCursorToGuestState();
+    return prev;
 }
 
 export function updateCursorDisplayCount(delta: number): number {
@@ -431,7 +470,8 @@ export function emptyClipboard(): void {
 /** GDI dialogs need a visible host cursor; games may leave ShowCursor count negative after DDraw init. */
 export function ensureHostCursorForDialog(): void {
     if (cursorDisplayCount < 0) cursorDisplayCount = 0;
-    System.getInstance().requestHostCursorVisible(true);
+    if (currentCursorHandle === 0) currentCursorHandle = 1;
+    syncHostCursorToGuestState();
 }
 
 export function resetUser32SharedState(): void {
@@ -440,7 +480,9 @@ export function resetUser32SharedState(): void {
     cursorDisplayCount = 0;
     cursorClipped = false;
     currentCursorHandle = 1;
-    currentCursorIsCustom = false;
+    lastForwardedCursorImageObj = null;
+    resetSystemCursorHandles();
+    resetUser32Classes();
     lastLoadStringHint = null;
     capturedHwnd = 0;
     buttonCheckStates.clear();

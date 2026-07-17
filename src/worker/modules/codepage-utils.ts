@@ -47,6 +47,39 @@ export function writeAnsiToGuest(mem: Uint8Array, addr: number, str: string, max
  * Encode a JS string to ANSI bytes using the active code page (no null terminator).
  * Drop-in replacement for `new TextEncoder().encode(str)` when writing to guest memory.
  */
+/**
+ * Read a guest string whose width is unknown (WM_SETTEXT & friends arrive via
+ * both A and W entry points): probe the first chars — mostly-zero high bytes
+ * means UTF-16. A single probed char proves nothing (an ANSI "5\0" probes
+ * identically to L"5"), and a 1-char wide string decodes the same either way —
+ * so wide requires at least two probed chars.
+ */
+export function readAnsiOrWideFromGuest(mem: Uint8Array, ptr: number): string {
+    if (!ptr) return '';
+    const maxProbeChars = 16;
+    let probed = 0;
+    let zeroHighBytes = 0;
+    for (let i = 0; i < maxProbeChars; i++) {
+        const loIdx = ptr + i * 2;
+        const hiIdx = loIdx + 1;
+        if (hiIdx >= mem.length) break;
+        const lo = mem[loIdx];
+        const hi = mem[hiIdx];
+        if (lo === 0 && hi === 0) break;
+        probed++;
+        if (hi === 0) zeroHighBytes++;
+    }
+    const looksWide = probed >= 2 && (zeroHighBytes / probed) >= 0.75;
+    if (!looksWide) return readAnsiFromGuest(mem, ptr);
+    let out = '';
+    for (let p = ptr; p + 1 < mem.length; p += 2) {
+        const code = mem[p] | (mem[p + 1] << 8);
+        if (code === 0) break;
+        out += String.fromCharCode(code);
+    }
+    return out;
+}
+
 export function encodeAnsi(str: string): Uint8Array {
     return encodeAnsiString(str, EmulatorConfig.getInstance().ansiCodePage);
 }

@@ -11,11 +11,27 @@ import { Mem } from '../../core/memory/mem-accessor';
 import { System } from '../../core/system';
 import { getWindowByHandle } from './window';
 import { encodeAnsi } from '../codepage-utils';
+import { getBuiltinSystemClass, getDefWindowProcAddress, resetDefWindowProcCache } from './system-classes';
+import { getSystemCursorHandle } from './system-cursors';
 
 // Store for registered window classes
 const windowClasses: Map<number, any> = new Map();
 const windowClassesByName: Map<string, number> = new Map();
 let nextClassId = 1;
+
+/**
+ * Bundle-switch reset: app classes carry WNDPROC pointers into the old process
+ * image, and the builtin materialization cache holds cursor handles / the
+ * DefWindowProc thunk address from the old layout — all stale after an
+ * in-worker game switch.
+ */
+export function resetUser32Classes(): void {
+    windowClasses.clear();
+    windowClassesByName.clear();
+    nextClassId = 1;
+    builtinClassInfoCache.clear();
+    resetDefWindowProcCache();
+}
 
 /**
  * Internal helper to register a window class
@@ -787,10 +803,40 @@ const SYSTEM_CLASS_STUB = Object.freeze({
     className: '',
 });
 
+// Materialized descriptors for built-in user32 classes (Button/Static/Edit/...).
+// Cached so SetClassLong mutations stick, like the real per-process global class.
+const builtinClassInfoCache = new Map<string, any>();
+
+function getBuiltinClassInfo(nameLower: string): any | undefined {
+    const cached = builtinClassInfoCache.get(nameLower);
+    if (cached) return cached;
+    const descr = getBuiltinSystemClass(nameLower);
+    if (!descr) return undefined;
+    const info = {
+        className: descr.name,
+        style: descr.style,
+        lpfnWndProc: getDefWindowProcAddress(),
+        cbClsExtra: 0,
+        cbWndExtra: descr.cbWndExtra,
+        hInstance: 0,
+        hIcon: 0,
+        hCursor: getSystemCursorHandle(descr.idcCursor),
+        hbrBackground: 0,
+        lpszMenuName: 0,
+        isBuiltinSystemClass: true,
+    };
+    builtinClassInfoCache.set(nameLower, info);
+    return info;
+}
+
 export function getWindowClassByName(name: string) {
     const nameLower = name.toLowerCase();
     const classId = windowClassesByName.get(nameLower);
     if (classId) return windowClasses.get(classId);
+    // Built-in user32 control classes — pre-registered by the real OS, an
+    // app-registered class of the same name shadows them (checked above).
+    const builtin = getBuiltinClassInfo(nameLower);
+    if (builtin) return builtin;
     // Built-in common controls (registered lazily by comctl32 / CreateWindowEx)
     if (nameLower === 'sysanimate32' || nameLower === 'sysanimate32_class') {
         return SYSTEM_CLASS_STUB;

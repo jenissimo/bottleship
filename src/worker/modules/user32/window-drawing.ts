@@ -8,7 +8,7 @@ import { System } from '../../core/system';
 import { Marshaler } from '../../core/memory/marshaler';
 import { loadBitmapFromPeResource } from '../kernel32/bitmap-extractor';
 import { loadIconFromPeResource } from '../kernel32/icon-extractor';
-import { resolveBitmapRgba, resolveIconRgba } from '../gdi32/bitmap-resolve';
+import { resolveBitmapRgba, resolveIconRgba, resolveDib32RawAlphaRgba } from '../gdi32/bitmap-resolve';
 import { desktopBackground } from '../../runtime/desktop-background';
 import { asArrayBufferView } from '../../../dom-buffer';
 
@@ -53,20 +53,38 @@ function composeIconFromBitmaps(
     hbmColor: number,
     hbmMask: number,
 ): { width: number; height: number; pixels: Uint8Array } | null {
+    // XP+ per-pixel-alpha cursor (nt5src curseng.cxx): a 32bpp color DIBSection
+    // whose guest bits carry any nonzero alpha is drawn alpha-blended, mask
+    // ignored (apps write the alpha into the bits directly over GDI-blitted RGB).
+    if (hbmColor) {
+        const alphaCursor = resolveDib32RawAlphaRgba(hbmColor, mem);
+        if (alphaCursor) {
+            return {
+                width: alphaCursor.width,
+                height: alphaCursor.height,
+                pixels: new Uint8Array(alphaCursor.data.buffer, alphaCursor.data.byteOffset, alphaCursor.data.byteLength),
+            };
+        }
+    }
+
     const color = hbmColor ? resolveBitmapRgba(hbmColor, mem) : null;
     const mask = hbmMask ? resolveBitmapRgba(hbmMask, mem) : null;
 
     if (color) {
         const pixels = new Uint8Array(color.data);
-        if (mask && mask.height >= color.height * 2 && mask.width >= color.width) {
+        // AND-mask semantics (nt5src sprite.cxx): screen = (screen AND mask) XOR
+        // color — mask 1 (white) keeps the screen (transparent), 0 shows the
+        // color pixel. A double-height mask stacks AND on TOP, XOR below
+        // (ICONINFO layout); a same-size mask is the AND plane alone.
+        const isDouble = !!mask && mask.height >= color.height * 2 && mask.width >= color.width;
+        if (mask && (isDouble || (mask.width >= color.width && mask.height >= color.height))) {
             const w = color.width;
             const h = color.height;
-            const andStart = mask.height / 2;
             for (let y = 0; y < h; y++) {
                 for (let x = 0; x < w; x++) {
-                    const mi = ((andStart + y) * mask.width + x) * 4;
+                    const mi = (y * mask.width + x) * 4;
                     const pi = (y * w + x) * 4;
-                    if (mask.data[mi] < 128) pixels[pi + 3] = 0;
+                    if (mask.data[mi] >= 128) pixels[pi + 3] = 0;
                 }
             }
         }
@@ -74,23 +92,24 @@ function composeIconFromBitmaps(
     }
 
     if (mask && mask.height >= 2 && mask.width > 0) {
+        // B/W icon: double-height 1bpp mask, AND on TOP, XOR below (ICONINFO).
+        // and=1,xor=0 → transparent; and=1,xor=1 → screen-invert (approximated
+        // opaque black); and=0 → xor value paints white/black directly.
         const w = mask.width;
         const h = Math.floor(mask.height / 2);
         const pixels = new Uint8Array(w * h * 4);
         for (let y = 0; y < h; y++) {
             for (let x = 0; x < w; x++) {
-                const xorI = (y * w + x) * 4;
-                const andI = ((h + y) * w + x) * 4;
+                const andI = (y * w + x) * 4;
+                const xorI = ((h + y) * w + x) * 4;
                 const pi = (y * w + x) * 4;
-                const xorOn = mask.data[xorI] > 128;
                 const andOn = mask.data[andI] > 128;
-                if (andOn) {
+                const xorOn = mask.data[xorI] > 128;
+                if (andOn && !xorOn) {
                     pixels[pi + 3] = 0;
-                } else if (xorOn) {
-                    pixels[pi] = pixels[pi + 1] = pixels[pi + 2] = 0;
-                    pixels[pi + 3] = 255;
                 } else {
-                    pixels[pi] = pixels[pi + 1] = pixels[pi + 2] = 255;
+                    const v = !andOn && xorOn ? 255 : 0;
+                    pixels[pi] = pixels[pi + 1] = pixels[pi + 2] = v;
                     pixels[pi + 3] = 255;
                 }
             }
@@ -357,8 +376,13 @@ export function registerWindowDrawingExports(exports: Record<string, ThunkImplem
             ...(fIcon ? {} : { xHotspot, yHotspot }),
         });
 
-        Logger.verbose(LogCategory.USER32,
-            `CreateIconIndirect(${fIcon ? 'icon' : 'cursor'}, ${width}x${height}) -> 0x${handle.toString(16)}`);
+        Logger.verboseLazy(LogCategory.USER32, () => {
+            let opaque = 0, lit = 0;
+            for (let i = 0; i < pixels.length; i += 4) {
+                if (pixels[i + 3] > 0) { opaque++; if (pixels[i] | pixels[i + 1] | pixels[i + 2]) lit++; }
+            }
+            return `CreateIconIndirect(${fIcon ? 'icon' : 'cursor'}, ${width}x${height}, color=0x${hbmColor.toString(16)}, mask=0x${hbmMask.toString(16)}, hot=${xHotspot},${yHotspot}, composed=${!!composed}, opaque=${opaque}, lit=${lit}) -> 0x${handle.toString(16)}`;
+        });
         return handle;
     };
 

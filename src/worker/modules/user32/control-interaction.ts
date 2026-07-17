@@ -32,6 +32,7 @@ import {
     LIST_SCROLLBAR_W,
     COMBO_DROP_MAX_VISIBLE,
 } from './controls';
+import { setEditCaretFromPoint } from './edit-control';
 
 const WM_MOUSEMOVE   = 0x0200;
 const WM_LBUTTONDOWN = 0x0201;
@@ -41,6 +42,7 @@ const WM_HSCROLL     = 0x0114;
 const WM_VSCROLL     = 0x0115;
 
 const MK_LBUTTON = 0x0001;
+const WS_DISABLED_CI = 0x08000000;
 
 const BN_CLICKED    = 0;
 const LBN_SELCHANGE = 1;
@@ -424,6 +426,14 @@ export function handleSystemControlMouseAtScreen(
     const controlClass = normalizedControlClass(control);
     const parentHwnd = control.parent ?? hostHwnd;
 
+    // Clicking an interactive control gives it focus (statics/groupboxes never take it).
+    if (message === WM_LBUTTONDOWN
+        && (control.style & WS_DISABLED_CI) === 0
+        && (controlClass === 'edit' || controlClass === 'listbox' || controlClass === 'combobox'
+            || (controlClass === 'button' && isButtonSystemControl(control)))) {
+        System.getInstance().windowManager.setFocus(control.handle);
+    }
+
     // Subclassing (MFC's DDX_Control/SubclassDlgItem — SetWindowLong(GWL_WNDPROC))
     // replaces a control's wndproc for MESSAGE ROUTING/programmatic access; it does
     // NOT reimplement the underlying system control class's default input behavior
@@ -512,6 +522,14 @@ export function handleSystemControlMouseAtScreen(
                 state.topIndex = Math.max(0, Math.min(sel - visibleCount + 1, maxTop));
                 repaintHost(control, hostHwnd);
             }
+            return true;
+        }
+
+        case 'edit': {
+            if (message !== WM_LBUTTONDOWN) return message === WM_LBUTTONUP;
+            const { x: absX } = getAbsoluteWindowPosition(control);
+            setEditCaretFromPoint(control, screenX - absX);
+            repaintHost(control, hostHwnd);
             return true;
         }
 

@@ -18,7 +18,13 @@ import { System } from '../../core/system';
 import type { Process } from '../../core/process';
 import type { ThunkResult } from '../../core/thunking/thunk-dispatcher';
 import { windows, buttonCheckStates, type WindowInfo } from './shared-state';
-import { isButtonSystemControl } from './controls';
+import { isButtonSystemControl, repaintChildControls } from './controls';
+import {
+    enumerateCtlColorChildren,
+    ctlColorMessageFor,
+    presetCtlColorDC,
+    captureCtlColorResult,
+} from './control-colors';
 
 const WM_DRAWITEM = 0x002B;
 const WM_PAINT = 0x000F;
@@ -145,10 +151,11 @@ export interface OwnerDrawDeps {
     flushChildDC: (childDc: number) => void;
 }
 
-/** One guest-paint task: an owner-draw button (WM_DRAWITEM into a DC we supply) or a
- *  subclassed control (WM_PAINT to its own proc, which BeginPaint/EndPaints itself). */
+/** One guest-paint task: an owner-draw button (WM_DRAWITEM into a DC we supply), a
+ *  subclassed control (WM_PAINT to its own proc, which BeginPaint/EndPaints itself),
+ *  or a WM_CTLCOLOR* color query to the parent (result cached, control repainted). */
 interface PaintTask {
-    kind: 'drawitem' | 'paint';
+    kind: 'drawitem' | 'paint' | 'ctlcolor';
     child: WindowInfo;
 }
 
@@ -196,12 +203,38 @@ function runGuestPaintChain(
     const scratchPtr = getDrawItemScratchPtr(process);
     let taskIndex = 0;
     let pendingDc = 0; // DC of the owner-draw button whose WM_DRAWITEM is in flight
+    let pendingCtlColor: WindowInfo | null = null; // control whose WM_CTLCOLOR* is in flight
+    let ctlColorsChanged = false;
 
     // Returns the invokeCallback callbackId (non-zero) if a task was dispatched, or 0 if
     // no further task could be dispatched (chain finished).
     const dispatchNext = (): number => {
         while (taskIndex < tasks.length) {
             const { kind, child } = tasks[taskIndex++];
+
+            if (kind === 'ctlcolor') {
+                const msg = ctlColorMessageFor(child);
+                if (msg === null) continue;
+                const queryDc = deps.createChildDC(child.handle);
+                if (!queryDc) continue;
+                presetCtlColorDC(child, queryDc, msg);
+                pendingDc = queryDc;
+                pendingCtlColor = child;
+                const inv = callbackManager.invokeCallback(
+                    drawItemTarget.wndProc,
+                    [drawItemTarget.hwnd, msg, queryDc, child.handle],
+                    0,
+                    onTaskComplete,
+                    false,
+                    `${thunkName}-WM_CTLCOLOR`,
+                    frameId,
+                );
+                if (inv.callbackId !== 0) return inv.callbackId;
+                deps.flushChildDC(pendingDc);
+                pendingDc = 0;
+                pendingCtlColor = null;
+                continue;
+            }
 
             if (kind === 'paint') {
                 // The control paints itself: deliver WM_PAINT to its own wndProc. The
@@ -247,13 +280,23 @@ function runGuestPaintChain(
         return 0;
     };
 
-    const onTaskComplete = (_ret: number): number | null => {
-        // Composite the owner-draw button's DC (no-op for self-painting controls).
+    const onTaskComplete = (ret: number): number | null => {
+        // WM_CTLCOLOR* answer: cache the DC's text/bk colors + returned HBRUSH.
+        if (pendingCtlColor) {
+            if (captureCtlColorResult(pendingCtlColor, pendingDc, ret >>> 0)) {
+                ctlColorsChanged = true;
+            }
+            pendingCtlColor = null;
+        }
+        // Composite the owner-draw button's DC (no-op for self-painting controls;
+        // a ctlcolor query DC was seeded from the overlay, so this is a visual no-op).
         if (pendingDc) {
             deps.flushChildDC(pendingDc);
             pendingDc = 0;
         }
         if (dispatchNext() !== 0) return null; // suspended for the next task
+        // Apply freshly-captured guest colors in the same paint sequence.
+        if (ctlColorsChanged) repaintChildControls(drawItemTarget.hwnd);
         return 1; // all tasks done — calling thunk returns TRUE
     };
 
@@ -286,6 +329,7 @@ export function tryEndPaintOwnerDrawChain(
 ): ThunkResult | null {
     if (!window.wndProc) return null;
     const tasks: PaintTask[] = [
+        ...enumerateCtlColorChildren(hWnd).map((child): PaintTask => ({ kind: 'ctlcolor', child })),
         ...enumerateOwnerDrawChildren(hWnd).map((child): PaintTask => ({ kind: 'drawitem', child })),
         ...enumerateGuestPaintedControls(hWnd).map((child): PaintTask => ({ kind: 'paint', child })),
     ];

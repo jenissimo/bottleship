@@ -1287,8 +1287,13 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
             const animateResult = handleAnimateMessage(hWnd, msg, wParam, lParam, mem);
             if (animateResult !== null) return animateResult;
 
-            // System controls: delegate all messages
-            if (targetWindow.isSystemControl) {
+            // System controls: delegate all messages to our built-in control behavior —
+            // UNLESS the guest has subclassed the control (SetWindowLong GWL_WNDPROC). Once
+            // subclassed, the control's window procedure IS the guest's; SendMessage must
+            // invoke it so app-defined messages (e.g. MFC message-map broadcasts via
+            // SendMessageToDescendants) reach the guest. Mirrors the `!wndProcSubclassed`
+            // guard the DispatchMessage/postMessage path uses.
+            if (targetWindow.isSystemControl && !targetWindow.wndProcSubclassed) {
                 const result = handleSystemControlMessage(targetWindow, msg, wParam, lParam, mem);
                 // Repaint content changes done outside the HLE modal pump (games that
                 // pump their own messages and SendMessage TBM_SETPOS / LB_ADDSTRING /
