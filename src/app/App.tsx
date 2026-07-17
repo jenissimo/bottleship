@@ -256,6 +256,9 @@ export default function App() {
   }, []);
   const canvasRectRef = useRef<DOMRect | null>(null);
   const cursorVisibleRef = useRef(true);
+  // CSS cursor for the guest's installed custom cursor image (SetCursor with a
+  // CreateIconIndirect/LoadImage shape) — null when the guest uses a system shape.
+  const cursorCssRef = useRef<string | null>(null);
   const isCanvasHoveredRef = useRef(false);
   const [gamesCatalog, setGamesCatalog] = useState<GameEntry[] | null>(null);
   useEffect(() => {
@@ -655,11 +658,17 @@ export default function App() {
 
     const updateCanvasCursor = (forceHovered?: boolean) => {
       const hovered = forceHovered ?? isCanvasHoveredRef.current;
-      if (!cursorVisibleRef.current && hovered) {
-        canvas.style.cursor = "none";
-      } else {
+      if (!hovered) {
         canvas.style.cursor = "";
+        return;
       }
+      if (!cursorVisibleRef.current) {
+        canvas.style.cursor = "none";
+        return;
+      }
+      // Guest cursor visible: render whatever shape the guest installed (the
+      // worker forwards system-theme cursors through the same channel).
+      canvas.style.cursor = cursorCssRef.current ?? "default";
     };
 
     // 1. Initialize Worker (only once)
@@ -1138,6 +1147,28 @@ export default function App() {
         updateCanvasCursor();
         // Engage/release pointer-lock on the faithful relative signal (hidden OR clipped).
         updatePointerLockIntent();
+      }
+      if (event.data?.type === "cursor_image") {
+        // Guest installed a cursor shape: null pixels = system shape (classic arrow).
+        const px = event.data?.pixels as ArrayBuffer | null;
+        const w = Number(event.data?.width) | 0;
+        const h = Number(event.data?.height) | 0;
+        cursorCssRef.current = null;
+        if (px && w > 0 && h > 0 && px.byteLength >= w * h * 4) {
+          try {
+            const cnv = document.createElement("canvas");
+            cnv.width = w;
+            cnv.height = h;
+            const c2d = cnv.getContext("2d");
+            if (c2d) {
+              c2d.putImageData(new ImageData(new Uint8ClampedArray(px, 0, w * h * 4), w, h), 0, 0);
+              const hx = Math.min(Math.max(Number(event.data?.hotspotX) | 0, 0), w - 1);
+              const hy = Math.min(Math.max(Number(event.data?.hotspotY) | 0, 0), h - 1);
+              cursorCssRef.current = `url("${cnv.toDataURL()}") ${hx} ${hy}, default`;
+            }
+          } catch { /* malformed image — classic arrow fallback */ }
+        }
+        updateCanvasCursor();
       }
       if (event.data?.type === "clip_cursor") {
         // Guest ClipCursor(rect) confines the cursor (relative/captured mouse, e.g. Unreal

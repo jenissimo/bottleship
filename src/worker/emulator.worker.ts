@@ -1890,6 +1890,22 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       system.setHostCursorVisibilityCallback((visible) => {
         self.postMessage({ type: "cursor_visibility", visible });
       });
+      system.setHostCursorImageCallback((image) => {
+        if (image) {
+          // Copy the pixels — the user object keeps owning its buffer.
+          const pixels = image.pixels.slice().buffer;
+          (self as unknown as Worker).postMessage({
+            type: "cursor_image",
+            width: image.width,
+            height: image.height,
+            hotspotX: image.hotspotX,
+            hotspotY: image.hotspotY,
+            pixels,
+          }, [pixels]);
+        } else {
+          self.postMessage({ type: "cursor_image", pixels: null });
+        }
+      });
       system.setHostMouseCaptureCallback((capture) => {
         self.postMessage({ type: "mouse_capture", capture });
       });
