@@ -29,6 +29,7 @@ import {
     windows,
     getAbsoluteWindowPosition,
     installCursorAndUpdateHostVisibility,
+    noteCursorWarpForCapture,
 } from './shared-state';
 import { getSystemCursorHandle } from './system-cursors';
 
@@ -243,6 +244,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         System.getInstance().inputManager.setMousePosition(x, y);
         // Notify host so it can update virtual cursor position during pointer lock
         self.postMessage({ type: "set_cursor_pos", x, y });
+        noteCursorWarpForCapture();
         Logger.verbose(LogCategory.USER32, `SetCursorPos(${x}, ${y})`);
         return 1;
     };

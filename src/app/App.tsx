@@ -492,9 +492,10 @@ export default function App() {
   // Cooldown after exitPointerLock — browser rejects re-acquire for ~1 frame after exit
   const pointerLockCooldownRef = useRef(false);
   // Faithful relative-mouse engagement = (cursor hidden via ShowCursor) OR (ClipCursor confined)
-  // OR (DirectInput exclusive-mode mouse acquired). cursorVisibleRef tracks ShowCursor;
-  // cursorClippedRef tracks ClipCursor; mouseCapturedRef tracks exclusive DInput acquire.
+  // OR (DirectInput exclusive-mode mouse acquired) OR (SetCursorPos warp burst — AGS/UE
+  // re-centering emulates relative mouse; we can honor warps only under pointer lock).
   const cursorClippedRef = useRef(false);
+  const cursorWarpingRef = useRef(false);
   const mouseCapturedRef = useRef(false);
   // Right Ctrl deliberately released the lock — suppress auto re-acquire until the next
   // explicit re-engage gesture (a canvas click).
@@ -512,7 +513,8 @@ export default function App() {
   // only attempt an opportunistic acquire (succeeds inside a gesture, otherwise armed for the
   // next click via handlePointerDown). Releasing happens immediately when intent drops.
   const updatePointerLockIntent = () => {
-    const wants = !cursorVisibleRef.current || cursorClippedRef.current || mouseCapturedRef.current;
+    const wants = !cursorVisibleRef.current || cursorClippedRef.current
+      || mouseCapturedRef.current || cursorWarpingRef.current;
     wantsPointerLockRef.current = wants;
     if (wants) {
       const c = canvasRef.current;
@@ -1182,6 +1184,12 @@ export default function App() {
         // implicitly captures the cursor (relative mode) with no ShowCursor/ClipCursor call,
         // so feed it into the same intent to engage/release pointer-lock.
         mouseCapturedRef.current = event.data?.capture === true;
+        updatePointerLockIntent();
+      }
+      if (event.data?.type === "cursor_warp") {
+        // Guest is warp-bursting SetCursorPos (relative-mouse emulation) — SetCursorPos can
+        // only be honored under pointer lock, so treat it as a capture signal.
+        cursorWarpingRef.current = event.data?.active === true;
         updatePointerLockIntent();
       }
       if (event.data?.type === "set_cursor_pos") {

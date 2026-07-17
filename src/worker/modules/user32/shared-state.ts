@@ -433,6 +433,40 @@ export function installCursorAndUpdateHostVisibility(hCursor: number): number {
     return prev;
 }
 
+// Cursor-warp capture detection. On real Windows SetCursorPos moves the real
+// pointer; we can honor that only under pointer lock. A steady warp stream is
+// how relative-mouse emulators work (AGS mouse-speed re-centering, UE warpers),
+// so a burst of warps is the faithful "this app needs the pointer captured"
+// signal — one-shot warps (dialog snap-to-default, level-start centering) stay
+// below the threshold.
+const WARP_BURST_COUNT = 3;
+const WARP_BURST_WINDOW_MS = 1500;
+// Long release: re-acquiring pointer lock needs a user gesture, so flapping on
+// short warp pauses would strand the mouse unlocked until the next click.
+const WARP_RELEASE_MS = 10000;
+let warpTimes: number[] = [];
+let warpModeActive = false;
+let warpReleaseTimer: ReturnType<typeof setTimeout> | null = null;
+
+export function noteCursorWarpForCapture(): void {
+    const now = Date.now();
+    warpTimes.push(now);
+    if (warpTimes.length > 8) warpTimes.shift();
+    if (!warpModeActive
+        && warpTimes.filter((t) => now - t < WARP_BURST_WINDOW_MS).length >= WARP_BURST_COUNT) {
+        warpModeActive = true;
+        System.getInstance().requestHostCursorWarpMode(true);
+    }
+    if (warpReleaseTimer) clearTimeout(warpReleaseTimer);
+    warpReleaseTimer = setTimeout(() => {
+        warpReleaseTimer = null;
+        if (warpModeActive) {
+            warpModeActive = false;
+            System.getInstance().requestHostCursorWarpMode(false);
+        }
+    }, WARP_RELEASE_MS);
+}
+
 export function updateCursorDisplayCount(delta: number): number {
     cursorDisplayCount += delta;
     // Clamp to -1 minimum: on real Windows the counter can go deeply negative,
@@ -481,6 +515,9 @@ export function resetUser32SharedState(): void {
     cursorClipped = false;
     currentCursorHandle = 1;
     lastForwardedCursorImageObj = null;
+    warpTimes = [];
+    warpModeActive = false;
+    if (warpReleaseTimer) { clearTimeout(warpReleaseTimer); warpReleaseTimer = null; }
     resetSystemCursorHandles();
     resetUser32Classes();
     lastLoadStringHint = null;

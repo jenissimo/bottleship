@@ -273,6 +273,8 @@ export class System {
     private hostCursorVisibility: ((visible: boolean) => void) | null = null;
     private hostCursorVisibleState: boolean | null = null;
     private hostCursorImage: ((image: HostCursorImage | null) => void) | null = null;
+    private hostCursorWarpMode: ((active: boolean) => void) | null = null;
+    private hostCursorWarpModeState = false;
     private hostMouseCapture: ((capture: boolean) => void) | null = null;
     private hostMouseCaptureState: boolean | null = null;
     private hostWindowTitle: ((title: string) => void) | null = null;
@@ -548,6 +550,19 @@ export class System {
 
     setHostCursorImageCallback(callback: (image: HostCursorImage | null) => void): void {
         this.hostCursorImage = callback;
+    }
+
+    setHostCursorWarpModeCallback(callback: (active: boolean) => void): void {
+        this.hostCursorWarpMode = callback;
+    }
+
+    /** Cursor-warp capture (user32 warp-burst detection) → host pointer-lock intent. */
+    requestHostCursorWarpMode(active: boolean): void {
+        if (this.hostCursorWarpModeState === active) return;
+        this.hostCursorWarpModeState = active;
+        if (this.hostCursorWarpMode) {
+            this.hostCursorWarpMode(active);
+        }
     }
 
     /**

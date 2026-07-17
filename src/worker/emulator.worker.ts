@@ -1909,6 +1909,9 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       system.setHostMouseCaptureCallback((capture) => {
         self.postMessage({ type: "mouse_capture", capture });
       });
+      system.setHostCursorWarpModeCallback((active) => {
+        self.postMessage({ type: "cursor_warp", active });
+      });
       system.setHostWindowTitleCallback((title) => {
         self.postMessage({ type: "window_title", title });
       });
