@@ -309,14 +309,39 @@ export function hasLiveDialogOverlay(): boolean {
     return getLiveDialogOverlayRects().length > 0;
 }
 
+/** True if any ancestor of hwnd is itself a live overlay-on-flip window. */
+function hasOverlayFlipAncestor(hwnd: number): boolean {
+    let cur = windows.get(hwnd)?.parent ?? 0;
+    const seen = new Set<number>();
+    while (cur && !seen.has(cur)) {
+        seen.add(cur);
+        const w = windows.get(cur);
+        if (!w) break;
+        if (w.overlayOnFlipScreen) return true;
+        cur = w.parent ?? 0;
+    }
+    return false;
+}
+
 /**
  * Visual-bounds rects of live overlay dialogs (composited from the GDI overlay
  * canvas onto a DDraw flip frame). Sorted back→front for correct stacking.
+ *
+ * Only ROOT overlay windows produce rects — a window's visual bounds already
+ * include all its descendant controls, so a child control that also got flagged
+ * (noteDialogOverlayCandidate flags any system-control host) must NOT composite
+ * as its own rect. Otherwise the fullscreen-flip-host verdict, which the game's
+ * own DDraw render depends on (WA owner-draws its whole frontend, controls and
+ * all), is decided per-control: the full-screen dialog is correctly excluded
+ * but a sub-region child (e.g. a Barracks ListBox) slips through and our overlay
+ * render of it is blitted over the game's own render of the same control —
+ * two renders fighting = flicker.
  */
 export function getLiveDialogOverlayRects(): DialogOverlayRect[] {
     const entries: Array<{ rect: DialogOverlayRect; rank: number }> = [];
     for (const win of windows.values()) {
         if (!win.overlayOnFlipScreen || !win.visible || win.pendingDestroy) continue;
+        if (hasOverlayFlipAncestor(win.handle)) continue;
         const b = getWindowVisualBounds(win.handle);
         if (!b) continue;
         if (dialogIsFullscreenFlipHost(win.handle, b)) continue;
