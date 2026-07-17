@@ -329,8 +329,16 @@ export class GlideBackendExecutor extends Legacy3DExecutor {
             this.backend.blit(input.videoOverlayCanvas, targetView, encoder);
         }
 
+        // GDI overlay per the shared plan (input.gdiOverlayRects): undefined = whole overlay
+        // (windowed); [] = nothing (game owns screen, no live dialog); [rects] = only live
+        // modal dialog rects composited over the Glide frame.
         if (input.gdiOverlayCanvas) {
-            this.backend.blit(input.gdiOverlayCanvas, targetView, encoder);
+            const rects = input.gdiOverlayRects;
+            if (rects === undefined) {
+                this.backend.blit(input.gdiOverlayCanvas, targetView, encoder);
+            } else if (rects.length) {
+                this.backend.blitRects(input.gdiOverlayCanvas, targetView, encoder, rects);
+            }
         }
 
         // Stats overlay

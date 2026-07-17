@@ -42,6 +42,12 @@ export interface GlideFrameInput {
     lfbPitch?: number;
     videoOverlayCanvas?: OffscreenCanvas | null;
     gdiOverlayCanvas?: OffscreenCanvas | null;
+    /**
+     * GDI overlay composite plan (getOverlayCompositePlan): undefined = whole overlay
+     * ('full', windowed); [] = composite nothing ('none', game owns screen, no live dialog);
+     * [rects] = only those live modal dialog rects. Same encoding as the D3D9 executor.
+     */
+    gdiOverlayRects?: Array<{ x: number; y: number; w: number; h: number }>;
 }
 
 export interface GlideExecutorMetrics {

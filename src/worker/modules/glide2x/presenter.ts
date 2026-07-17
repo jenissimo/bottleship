@@ -23,6 +23,7 @@ import {
     GR_LFBWRITEMODE_ZA16,
 } from "./constants";
 import { GlideContext, GlideLfbSurfaceState } from "./context";
+import { getOverlayCompositePlan } from "../user32/dialog-overlay";
 
 function packRgb565ToRgba(raw: number): [number, number, number, number] {
     const r = ((raw >>> 11) & 0x1f) * 255 / 31;
@@ -278,6 +279,17 @@ export class GlidePresenter implements RenderActive {
         const videoOverlayCanvas = videoOverlayService.hasContent() ? videoOverlayService.getCanvas() : null;
         const gdiOverlayCanvas = system.gdiContext.hasOverlayContent() ? system.gdiContext.getOverlayCanvas() : null;
 
+        // GDI overlay follows the single shared policy (getOverlayCompositePlan). Glide always
+        // owns the screen (suppressGdiOverlay), so plan.mode is 'none' (nothing) or 'rects'
+        // (only live modal dialogs) — never the whole overlay. rects encoding matches D3D9:
+        // undefined = whole overlay ('full'); [] = nothing; [rects] = those dialog rects.
+        let gdiOverlayRects: Array<{ x: number; y: number; w: number; h: number }> | undefined;
+        if (gdiOverlayCanvas) {
+            const plan = getOverlayCompositePlan(this);
+            if (plan.mode === 'rects') gdiOverlayRects = plan.rects;
+            else if (plan.mode === 'none') gdiOverlayRects = [];
+        }
+
         this.context.executor.executeFrame({
             stream: this.context.stream,
             width: this.context.width,
@@ -294,6 +306,7 @@ export class GlidePresenter implements RenderActive {
             lfbPitch: this.context.width * 4,
             videoOverlayCanvas,
             gdiOverlayCanvas,
+            gdiOverlayRects,
         });
 
         if (videoOverlayCanvas) {

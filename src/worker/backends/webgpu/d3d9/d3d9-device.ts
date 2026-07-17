@@ -22,8 +22,7 @@ import {
 import { TimeService } from "../../../runtime/time";
 import { System } from "../../../core/system";
 import * as frameCapture from "../../../modules/ddraw/frame-capture";
-import { shouldSuppress3DGdiOverlay } from "../../../modules/ddraw/gdi-visibility";
-import { hasLiveDialogOverlay, getLiveDialogOverlayRects } from "../../../modules/user32/dialog-overlay";
+import { getOverlayCompositePlan } from "../../../modules/user32/dialog-overlay";
 import { Logger, LogCategory } from "../../../core/logger";
 import {
     d3d9PerfInc, d3d9PerfSkip, d3d9PerfBackendInc,
@@ -3341,18 +3340,19 @@ export class D3D9Device {
         const composit = present && !target;
         const videoOverlayCanvas = composit && videoOverlayService.hasContent() ? videoOverlayService.getCanvas() : null;
         const gdiOverlayCanvas = composit && gdiContext?.hasOverlayContent() ? gdiContext.getOverlayCanvas() : null;
-        // When this 3D renderer owns the screen, GDI windows BEHIND the opaque fullscreen
-        // device window are occluded on real Windows (a leftover loading-splash #32770).
-        // Composite ONLY live dialogs shown OVER the running game (overlayOnFlipScreen),
-        // never the whole overlay. undefined = whole overlay (windowed / GDI desktop owns
-        // screen); [] = 3D-owned with no live dialog → composite nothing. Mirrors the D3D8
-        // adapter, the gdiPresentLoop screen3DOwned branch, and the DDraw presenter plan.
+        // GDI overlay compositing follows the single shared policy (getOverlayCompositePlan):
+        // when this 3D renderer owns the screen, GDI windows behind the opaque fullscreen
+        // device window are occluded on real Windows (a leftover loading-splash #32770), so
+        // only live modal dialog rects composite, never the whole overlay. The executor's
+        // rect param encodes the plan: undefined = whole overlay ('full', windowed); [] =
+        // composite nothing ('none'); [rects] = only those dialog rects. Passing `this` keys
+        // the 3D-owned check off this device.
         let gdiOverlayRects: Array<{ x: number; y: number; w: number; h: number }> | undefined;
         if (gdiOverlayCanvas) {
-            const ddrawCtx = (system.process?.getModule("ddraw") as any)?.context;
-            if (shouldSuppress3DGdiOverlay(this, ddrawCtx)) {
-                gdiOverlayRects = hasLiveDialogOverlay() ? getLiveDialogOverlayRects() : [];
-            }
+            const plan = getOverlayCompositePlan(this);
+            if (plan.mode === 'rects') gdiOverlayRects = plan.rects;
+            else if (plan.mode === 'none') gdiOverlayRects = [];
+            // plan.mode === 'full' → leave undefined (composite the whole overlay)
         }
 
         // Optional verify-only exercise of the executor's arena-drain code path (diagnostic

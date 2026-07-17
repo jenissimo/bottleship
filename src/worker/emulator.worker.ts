@@ -15,8 +15,7 @@ import { WinMM } from "./modules/winmm";
 import { Ole32 } from "./modules/ole32";
 import { Oleaut32 } from "./modules/oleaut32";
 import { DDraw } from "./modules/ddraw";
-import { shouldSuppress3DGdiOverlay } from "./modules/ddraw/gdi-visibility";
-import { hasLiveDialogOverlay, getLiveDialogOverlayRects } from "./modules/user32/dialog-overlay";
+import { getOverlayCompositePlan } from "./modules/user32/dialog-overlay";
 import { DInput } from "./modules/dinput";
 import { DPlayX } from "./modules/dplayx";
 import { MSS32 } from "./modules/mss32";
@@ -313,27 +312,30 @@ const gdiPresentLoop = () => {
     const videoCanvas = videoOverlay.hasContent() ? videoOverlay.getCanvas() : null;
     const gdiDirty = gdi.isOverlayDirty();
 
-    // When a hardware 3D renderer owns exclusive fullscreen, GDI/video overlays are
-    // not visible — do not composite them over the 3D frame. Re-present the last 3D
-    // frame at display rate so the canvas does not go black between low-fps presents.
-    const ddrawCtx = (system.process?.getModule("ddraw") as any)?.context;
-    const screen3DOwned = shouldSuppress3DGdiOverlay(renderActive, ddrawCtx);
+    // This rAF loop is one of several GDI-over-frame compositors (alongside the DDraw
+    // presenter's drawFrame/2D/phase-blend paths and the D3D8/D3D9/Glide present paths).
+    // It applies the SAME single policy — getOverlayCompositePlan — so it can never
+    // diverge from them. When the game owns the screen (DDraw exclusive fullscreen OR a
+    // hardware-3D renderer presenting), GDI window output is NOT visible on real Windows,
+    // so plan.mode is 'none' (nothing) or 'rects' (only live modal dialogs); never the
+    // whole overlay. Without this, the loop would blit stale GDI over the game — e.g. WA
+    // renders its frontend via DDraw sprites, and its full-screen MFC host dialog's gray
+    // WM_ERASEBKGND would otherwise be composited over every frame.
+    const plan = getOverlayCompositePlan(renderActive);
 
-    if (screen3DOwned) {
-      // Drop stale dirty flags so they don't accumulate and so a later composite
-      // (e.g. after returning to the launcher) starts clean. Then re-present the last
-      // 3D frame so the canvas keeps showing it at the display rate (the renderer
-      // presents at ~8-12fps and the WebGPU canvas otherwise goes black between
-      // presents). Nothing overlays the 3D frame in this mode — EXCEPT live native
-      // dialogs shown while the flip chain owns the screen (dialog-overlay.ts):
-      // their rects composite on top, exactly like the DDraw presenter path.
+    if (plan.mode !== 'full') {
+      // Game owns the screen. Drop stale dirty flags so a later composite (e.g. after
+      // returning to the launcher) starts clean, then re-present the last frame so the
+      // canvas keeps showing it at display rate (a 3D renderer presents at ~8-12fps and
+      // the WebGPU canvas otherwise goes black between presents; the DDraw presenter lacks
+      // repaintLastFrame and re-presents each Flip, so this is a no-op there). The only GDI
+      // that overlays the frame here is live modal dialog rects (plan.mode === 'rects').
       if (gdiDirty) gdi.clearOverlayDirty();
       if (videoOverlay.isDirty()) videoOverlay.consumeDirty();
-      (renderActive as { repaintLastFrame?(): void }).repaintLastFrame?.();
-      if (backend.compositeRects && hasLiveDialogOverlay()) {
+      (renderActive as { repaintLastFrame?(): void } | null)?.repaintLastFrame?.();
+      if (plan.mode === 'rects' && backend.compositeRects) {
         const overlayCanvas = gdi.getOverlayCanvas();
-        const rects = overlayCanvas ? getLiveDialogOverlayRects() : [];
-        if (overlayCanvas && rects.length) backend.compositeRects(overlayCanvas, rects);
+        if (overlayCanvas) backend.compositeRects(overlayCanvas, plan.rects);
       }
       gdiPresentRafId = requestAnimationFrame(gdiPresentLoop);
       return;

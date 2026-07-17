@@ -221,8 +221,7 @@ export class DDrawPresenter implements RenderActive {
             // cover the game. See getOverlayCompositePlan: this is intentionally NOT gated
             // on gdiSurfaceVisible (a single-buffered primary never Flips, so that flag
             // sticks `true` after FlipToGDISurface and used to leave a ghost over video).
-            const ddrawCtx = (system.process?.getModule("ddraw") as any)?.context;
-            const plan = getOverlayCompositePlan(ddrawCtx);
+            const plan = getOverlayCompositePlan(this);
             const dialogRects = plan.mode === 'rects' ? plan.rects : null;
             const overlay = plan.mode === 'none' ? null : system.gdiContext.getOverlayCanvas();
 
@@ -558,8 +557,7 @@ export class DDrawPresenter implements RenderActive {
         const system = System.getInstance();
         const videoOverlayService = system.videoRouting.getOverlayService();
         const videoOverlay = videoOverlayService.getCanvas();
-        const ddrawCtx = (system.process?.getModule("ddraw") as any)?.context;
-        const plan = getOverlayCompositePlan(ddrawCtx);
+        const plan = getOverlayCompositePlan(this);
         const dialogRects = plan.mode === 'rects' ? plan.rects : null;
         const overlay = plan.mode === 'none' ? null : system.gdiContext.getOverlayCanvas();
 

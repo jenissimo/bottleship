@@ -24,8 +24,7 @@ import { profiler } from '../../../core/profiler';
 import { statsOverlay } from '../../../core/stats-overlay';
 import { WebGPUBackend } from '../webgpu-backend';
 import { EmulatorConfig } from '../../../core/emulator-config-manager';
-import { shouldSuppress3DGdiOverlay } from '../../../modules/ddraw/gdi-visibility';
-import { hasLiveDialogOverlay, getLiveDialogOverlayRects } from '../../../modules/user32/dialog-overlay';
+import { getOverlayCompositePlan } from '../../../modules/user32/dialog-overlay';
 import {
     D3DRENDERSTATE_ALPHABLENDENABLE,
     D3DRENDERSTATE_ALPHAFUNC,
@@ -1993,20 +1992,18 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
                 true // nearest-neighbor: pixel-perfect present (no bilinear stretch)
             );
 
-            // Composite GDI overlay (cursor / text / dialogs drawn via GDI on top of D3D8).
-            // When this 3D renderer owns the screen, GDI windows BEHIND the opaque fullscreen
-            // device window are occluded on real Windows (e.g. a UE2 loading-splash #32770 left
-            // visible after the engine switches to D3D). Composite ONLY live dialogs shown OVER
-            // the running game (flagged overlayOnFlipScreen), never the whole overlay, so a
-            // leftover splash cannot cover the frame. Mirrors the gdiPresentLoop screen3DOwned
-            // branch (emulator.worker.ts) and the DDraw presenter's getOverlayCompositePlan.
+            // Composite GDI overlay (cursor / text / dialogs drawn via GDI on top of D3D8)
+            // per the single shared policy (getOverlayCompositePlan): when this 3D renderer
+            // owns the screen, GDI windows behind the opaque fullscreen device window are
+            // occluded on real Windows (e.g. a UE2 loading-splash #32770), so only live modal
+            // dialog rects composite ('rects'), never the whole overlay ('none'); windowed →
+            // whole overlay ('full'). Passing `this` keys the 3D-owned check off this device.
             const overlay = system.gdiContext.getOverlayCanvas();
             if (overlay && system.gdiContext.hasOverlayContent()) {
-                const ddrawCtx = (system.process?.getModule('ddraw') as any)?.context;
-                if (shouldSuppress3DGdiOverlay(this, ddrawCtx)) {
-                    const rects = hasLiveDialogOverlay() ? getLiveDialogOverlayRects() : [];
-                    if (rects.length) webgpu.blitRects(overlay, targetView, encoder, rects);
-                } else {
+                const plan = getOverlayCompositePlan(this);
+                if (plan.mode === 'rects') {
+                    webgpu.blitRects(overlay, targetView, encoder, plan.rects);
+                } else if (plan.mode === 'full') {
                     webgpu.blit(overlay, targetView, encoder);
                 }
                 if (system.gdiContext.isOverlayDirty()) {
