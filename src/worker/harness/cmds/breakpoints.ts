@@ -200,6 +200,68 @@ export function registerBreakpointCommands(svc: HarnessService): void {
         return { paused: false };
     });
 
+    /** captureAt(eip, specs, label?) — non-pausing EIP breakpoint that records register-relative
+     *  memory into globalThis.__bpcap on every hit (read via worker-eval). Sidesteps the
+     *  pause-wedge: JIT is OFF (eip bp) but the guest keeps running. Each spec:
+     *  { reg:'edi', off?:0, count?:1, deref?:false, sample?:0 } — base=reg+off; ptr=deref?*(base):base;
+     *  reads `count` dwords at ptr; if `sample`>0, counts non-zero bytes in [ptr, ptr+sample). */
+    svc.register("captureAt", (args, ctx) => {
+        const addr = toAddr(args[0] as number | string);
+        assertNotSpinLoop(addr);
+        interface CapSpec { reg: string; off?: number; count?: number; deref?: boolean; sample?: number; postOff?: number; eq?: number; ne?: number; ge?: number; lt?: number; path?: number[] }
+        const specs = (args[1] ?? []) as CapSpec[];
+        const label = String(args[2] ?? "cap");
+        const RI: Record<string, number> = { eax: 0, ecx: 1, edx: 2, ebx: 3, esp: 4, ebp: 5, esi: 6, edi: 7 };
+        dbg.enable(); dbg.bp(addr);
+        dbg.maxDumps(1_000_000);   // hot-address captures blow the 4000-line default silently
+        const g = globalThis as any;
+        const id = eipBreaks.arm(addr, {
+            runId: ctx.runId, once: false, pause: false,
+            onHit: () => {
+                try {
+                    const c: any = proc()?.v86?.cpu ?? (proc() as any)?.v86?.v86?.cpu;
+                    const m: Uint8Array | undefined = (proc() as any)?.getCurrentMemory?.();
+                    if (!c?.reg32 || !m) return;
+                    const dv = new DataView(m.buffer, m.byteOffset, m.byteLength);
+                    const rU = (a: number) => (a >>> 0) + 4 <= m.length ? dv.getUint32(a >>> 0, true) >>> 0 : -1;
+                    const rec: any = { label, seq: (g.__seq = (g.__seq || 0) + 1) };
+                    for (const s of specs) {
+                        // Address resolution: `path` walks a deref chain (cur = *(cur+p) per hop);
+                        // legacy form is reg+off with one optional deref. postOff shifts the final ptr.
+                        let ptr: number;
+                        let key: string;
+                        if (s.path && s.path.length) {
+                            let cur = c.reg32[RI[s.reg]] >>> 0;
+                            for (const p of s.path) cur = rU((cur + (p | 0)) >>> 0) >>> 0;
+                            ptr = (cur + ((s.postOff ?? 0) | 0)) >>> 0;
+                            key = s.reg + "[" + s.path.join(",") + "]+" + ((s.postOff ?? 0) | 0);
+                        } else {
+                            const base = ((c.reg32[RI[s.reg]] >>> 0) + ((s.off ?? 0) | 0)) >>> 0;
+                            ptr = (((s.deref ? rU(base) : base) >>> 0) + ((s.postOff ?? 0) | 0)) >>> 0;
+                            key = s.reg + "+" + ((s.off ?? 0) | 0) + (s.deref ? "*" : "") + "+" + ((s.postOff ?? 0) | 0);
+                        }
+                        // eq/ne/ge/lt on a spec make it a FILTER: value at ptr must match or the whole hit is dropped.
+                        if (s.eq !== undefined || s.ne !== undefined || s.ge !== undefined || s.lt !== undefined) {
+                            const v = rU(ptr) >>> 0;
+                            if (s.eq !== undefined && v !== (s.eq >>> 0)) return;
+                            if (s.ne !== undefined && v === (s.ne >>> 0)) return;
+                            if (s.ge !== undefined && v < (s.ge >>> 0)) return;
+                            if (s.lt !== undefined && v >= (s.lt >>> 0)) return;
+                        }
+                        const vals: string[] = [];
+                        for (let k = 0; k < (s.count ?? 1); k++) vals.push("0x" + (rU((ptr + k * 4) >>> 0) >>> 0).toString(16));
+                        let nz: number | null = null;
+                        if (s.sample && ptr > 0x1000 && (ptr + s.sample) < m.length) { nz = 0; for (let i = 0; i < s.sample; i++) if (m[(ptr + i) >>> 0]) nz++; }
+                        rec[key] = { ptr: "0x" + (ptr >>> 0).toString(16), vals, nz };
+                    }
+                    (g.__bpcap ??= []).push(rec);
+                    if (g.__bpcap.length > 6000) g.__bpcap.shift();
+                } catch { /* */ }
+            },
+        });
+        return { armed: true, id, addr: addr >>> 0, note: "records to globalThis.__bpcap (JIT off, non-pausing)" };
+    });
+
     /** breaks() — list all armed breakpoints. */
     svc.register("breaks", () => ({ api: apiBreaks.list(), eip: eipBreaks.list(), symbolMaps: symbolMap.loaded() }));
 

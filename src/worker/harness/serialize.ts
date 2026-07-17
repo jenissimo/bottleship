@@ -314,7 +314,19 @@ export function readCallSnapshot(name: string, eip: number, esp: number): unknow
         }
     } catch { /* */ }
     let es = -1;
-    try { const c = cpu() as any; if (c?.sreg) es = c.sreg[0] & 0xffff; } catch { /* */ }
+    let regs: Record<string, number> | undefined;
+    try {
+        const c = cpu() as any;
+        if (c?.sreg) es = c.sreg[0] & 0xffff;
+        // General-purpose regs at the hit instant — many WA methods are register-based
+        // (this=ESI/ECX, index=EDI), so the caller-of-interest's context often lives here.
+        if (c?.reg32) {
+            regs = {
+                eax: c.reg32[0] >>> 0, ecx: c.reg32[1] >>> 0, edx: c.reg32[2] >>> 0, ebx: c.reg32[3] >>> 0,
+                esp: c.reg32[4] >>> 0, ebp: c.reg32[5] >>> 0, esi: c.reg32[6] >>> 0, edi: c.reg32[7] >>> 0,
+            };
+        }
+    } catch { /* */ }
     return {
         name,
         eip: eip >>> 0,
@@ -325,6 +337,7 @@ export function readCallSnapshot(name: string, eip: number, esp: number): unknow
         args: [r(4), r(8), r(12), r(16)],
         threadId,
         es,
+        regs,
         lastThunks: recent,
         backtrace,
     };

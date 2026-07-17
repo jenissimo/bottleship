@@ -65,6 +65,9 @@ export class HarnessChain {
 
     // ── waits / determinism ──
     waitForEvent(name: string, opts?: { timeoutMs?: number }): this { return this.push("waitForEvent", [name, opts]); }
+    /** onModal(pattern?, reply?) — auto-answer MessageBox prompts (default: any → "ok")
+     *  so unattended runs don't wedge on a modal that parks the guest thread. */
+    onModal(pattern?: string, reply?: number | string): this { return this.push("onModal", [pattern ?? ".*", reply ?? "ok"]); }
     // These can run >60s; give the RPC envelope a deadline derived from the verb's
     // own (so the default 60s timeout doesn't spuriously abort long bring-up waits).
     waitUntil(predicate: () => boolean, opts?: { timeoutMs?: number; pollMs?: number }): this { return this.pushTimed("waitUntil", [predicate, opts], (opts?.timeoutMs ?? 30_000) + 5_000); }

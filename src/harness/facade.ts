@@ -28,7 +28,7 @@ import { isSerializedFn } from "./types";
 import { HarnessChain } from "./dsl";
 
 /** Verbs handled page-side (browser-only) rather than forwarded to the worker. */
-const BROWSER_ONLY = new Set(["openWgb", "loadPe", "audioGesture", "waitForEvent"]);
+const BROWSER_ONLY = new Set(["openWgb", "loadPe", "audioGesture", "waitForEvent", "onModal"]);
 
 export interface HarnessFacade {
     /** Low-level: invoke any worker command, await the {ok,result|error} reply. */
@@ -255,6 +255,7 @@ export function installHarnessFacade(worker: Worker): HarnessFacade {
         if (step.cmd === "loadPe") return loadPe(step.args[0] as string);
         if (step.cmd === "audioGesture") return audioGesture();
         if (step.cmd === "waitForEvent") return waitForEvent(step.args[0] as string, step.args[1] as any);
+        if (step.cmd === "onModal") { onMessageBox((step.args[0] as string) ?? ".*", (step.args[1] as string | number) ?? "ok"); return { armed: true, pattern: step.args[0] ?? ".*" }; }
         // Predicate args (waitUntil) are pre-serialized as {__fn} — pass through;
         // the worker reconstructs and evaluates them in its own context.
         return rpc(step.cmd, step.args, step.opts);
