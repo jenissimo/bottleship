@@ -2498,9 +2498,11 @@ export function registerFastPathSurfaceFunctions(dispatcher: any, context: DDraw
 
     const resourceProvider = context.resourceProvider;
 
-    // Cache: source surface address → { target address, target COM object }
-    // Populated on first call, invalidated only on surface destruction.
-    const attachedCache = new Map<string, { addr: number; obj: { addRef(): number } }>();
+    // Cache: source surface address → { source object, target address, target COM object }.
+    // COM iface addresses are pool-reused after Release, so a hit is valid only while BOTH
+    // addresses still resolve to the SAME objects (a recreated flip chain can land on the old
+    // primary's address — returning the old backbuffer then sends every frame to a zombie surface).
+    const attachedCache = new Map<string, { srcObj: unknown; addr: number; obj: { addRef(): number } }>();
 
     const fastPathGetAttachedSurface = (cpu: any, mem8: Uint8Array): number | null => {
         const esp = cpu.reg32[4];
@@ -2521,18 +2523,21 @@ export function registerFastPathSurfaceFunctions(dispatcher: any, context: DDraw
 
         if (!lplpDDSurface || lplpDDSurface + 4 > mem8.length) return null;
 
-        // Fast path — no diagnostic logging (was TEMP DEBUG)
+        const obj = resourceProvider.getComObjectByAddressFast(thisPtr) as DirectDrawSurfaceObject | null;
 
-        // Check cache first
+        // Check cache first; a hit must still map to the same live objects at both addresses
         const cached = attachedCache.get(cacheKey);
         if (cached) {
-            cached.obj.addRef();
-            view.setUint32(lplpDDSurface, cached.addr, true);
-            return DD_OK;
+            if (obj === cached.srcObj
+                && resourceProvider.getComObjectByAddressFast(cached.addr) === cached.obj) {
+                cached.obj.addRef();
+                view.setUint32(lplpDDSurface, cached.addr, true);
+                return DD_OK;
+            }
+            attachedCache.delete(cacheKey);
         }
 
         // Cache miss — resolve and cache for future calls
-        const obj = resourceProvider.getComObjectByAddressFast(thisPtr) as DirectDrawSurfaceObject | null;
         if (!obj) return null; // fallthrough to slow path
 
         const targetAddr = resolveGetAttachedSurfaceTarget(
@@ -2554,7 +2559,7 @@ export function registerFastPathSurfaceFunctions(dispatcher: any, context: DDraw
         }
 
         // Cache the mapping
-        attachedCache.set(cacheKey, { addr: targetAddr, obj: targetObj });
+        attachedCache.set(cacheKey, { srcObj: obj, addr: targetAddr, obj: targetObj });
 
         targetObj.addRef();
         view.setUint32(lplpDDSurface, targetAddr, true);
@@ -2566,6 +2571,4 @@ export function registerFastPathSurfaceFunctions(dispatcher: any, context: DDraw
     dispatcher.registerFastPath('ddraw', 'IDirectDrawSurface_GetAttachedSurface', fastPathGetAttachedSurface);
     dispatcher.registerFastPath('ddraw', 'IDirectDrawSurface4_GetAttachedSurface', fastPathGetAttachedSurface);
 
-    // Expose cache invalidation for surface destruction
-    (context as any)._attachedSurfaceCache = attachedCache;
 }
