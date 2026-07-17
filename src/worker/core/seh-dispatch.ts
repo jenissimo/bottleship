@@ -113,7 +113,7 @@ export interface CxxExceptionRecord {
     throwEip: number;
     throwModule: string;    // module label of the throw site
     isRethrow: boolean;     // true for `throw;` (pObj=0)
-    outcome: 'pending' | 'caught' | 'unhandled';
+    outcome: 'pending' | 'caught' | 'unhandled' | 'deferred-x86';
     caughtBy: string;       // module label of the catching frame (when outcome=caught)
 }
 const cxxExceptionRing: CxxExceptionRecord[] = [];
@@ -1796,6 +1796,21 @@ export function dispatchLongjmpUnwind(
 }
 
 /**
+ * Returned when the JS walk hits a registration it cannot parse as MSVC C++ EH
+ * (e.g. a __try/__except frame via _except_handler4) BEFORE finding a catch.
+ * Windows RtlDispatchException calls EVERY handler in chain order — such a frame's
+ * filter may claim the exception, so the caller must re-dispatch the whole
+ * exception through x86 SEH (guest handlers) instead of trusting the JS scan.
+ * Carries the rethrow-resolved object/throwInfo so the x86 record can be
+ * completed when the active exception was tracked only on the JS side.
+ */
+export interface CxxDispatchDefer {
+    deferToX86: true;
+    pExceptionObject: number;
+    pThrowInfo: number;
+}
+
+/**
  * Walk the SEH chain and dispatch a C++ exception to the first matching catch block.
  */
 export function dispatchCxxException(
@@ -1804,7 +1819,7 @@ export function dispatchCxxException(
     pExceptionObject: number,
     pThrowInfo: number,
     thunkCleanupBytes: number,
-): ThunkResult | null {
+): ThunkResult | CxxDispatchDefer | null {
     const dv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
     const tebAddr = cpu.segment_offsets[4];
     let sehHead = dv.getUint32(tebAddr, true);
@@ -2081,8 +2096,21 @@ export function dispatchCxxException(
             }
         }
 
-        Logger.log(LogCategory.SYSTEM, `  -> skipped (no MSVC FuncInfo found)`);
-        sehHead = next;
+        // Not a recognizable C++ EH frame — likely a __try/__except registration
+        // (__except_handler4: shared handler, cookie-XORed scope table). Its filter
+        // may claim this exception (Windows calls every handler in chain order), so
+        // stop guessing and let the guest's own handlers dispatch it natively.
+        if (pendingExitActions.length > 0) {
+            Logger.warn(LogCategory.SYSTEM,
+                `SEH dispatch: dropping ${pendingExitActions.length} queued catch-exit action(s) on x86 defer`);
+        }
+        Logger.warn(LogCategory.SYSTEM,
+            `  -> frame handler=0x${handlerAddr.toString(16)} is not MSVC C++ EH — ` +
+            `deferring dispatch to x86 SEH so its filter runs faithfully`);
+        if (currentThrowRecord && currentThrowRecord.outcome === 'pending') {
+            currentThrowRecord.outcome = 'deferred-x86';
+        }
+        return { deferToX86: true, pExceptionObject, pThrowInfo };
     }
 
     // No guest catch found — this throw will fall through to UnhandledExceptionFilter →

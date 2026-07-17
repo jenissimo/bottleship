@@ -5516,11 +5516,18 @@ export class ThunkDispatcher {
 
         const sehHead = view.getUint32(tebAddr, true);
 
-        // For nested dispatch, place scratch data on the game stack to avoid
-        // overwriting the outer dispatch's scratch area.
-        const scratchAddr = isNested
-            ? ((thunkEsp - 0x800) & ~0xF) >>> 0   // game stack, 16-byte aligned
-            : this.sehScratchAddr;
+        // Place the per-dispatch block (EXCEPTION_RECORD/CONTEXT/frame list/stub state)
+        // on the game stack just below the raise site — mirroring where RtlRaiseException
+        // keeps the record on real Windows. A fixed scratch address ALIASES records
+        // across dispatches: guest CRT state (ptd->_curexception set on catch entry)
+        // keeps pointing at the old record, and a `throw;` inside that catch builds its
+        // new record over it — native FindHandler then reads pThrowInfo==NULL from both
+        // and terminates ("rethrow with no active exception"). Distinct stack depths per
+        // throw keep every live record unique.
+        let scratchAddr = ((thunkEsp - 0x800) & ~0xF) >>> 0;   // game stack, 16-byte aligned
+        if (scratchAddr < 0x10000) {
+            scratchAddr = this.sehScratchAddr;
+        }
 
         // --- Build EXCEPTION_RECORD for C++ exception ---
         const eip = (cpu.instruction_pointer?.[0] ?? 0) >>> 0;
@@ -5558,9 +5565,10 @@ export class ThunkDispatcher {
         view.setUint32(epPtr + 4, ctxBase, true);         // Context*
 
         // --- Store metadata ---
-        // Use game stack for dispatch (512 bytes below thunk ESP), not the safe stack.
+        // Dispatch runs on the game stack BELOW the per-dispatch block, so handler /
+        // catch-funclet execution can never grow down into the live EXCEPTION_RECORD.
         view.setUint32(scratchAddr + SEH_SCRATCH_LAYOUT.FAULT_EIP, eip, true);
-        const dispatchEsp = (thunkEsp - 0x200) >>> 0;
+        const dispatchEsp = (scratchAddr < thunkEsp ? (scratchAddr - 0x10) : (thunkEsp - 0x200)) >>> 0;
         view.setUint32(scratchAddr + SEH_SCRATCH_LAYOUT.SAFE_ESP, dispatchEsp, true);
         view.setUint32(scratchAddr + SEH_SCRATCH_LAYOUT.DISPATCH_RESULT, 1, true);
         view.setUint32(scratchAddr + SEH_SCRATCH_LAYOUT.LAST_HANDLER_RESULT, 0, true);

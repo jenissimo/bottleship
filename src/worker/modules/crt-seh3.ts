@@ -328,7 +328,22 @@ export function registerCrtSeh3Exports(exports: Record<string, ThunkImplementati
 
         // _CxxThrowException is cdecl(obj, throwInfo): thunk RET 8.
         const result = dispatchCxxException(mem, cpu, pExceptionObject, pThrowInfo, 8);
-        if (result) return result;
+        if (result && !('deferToX86' in result)) return result;
+
+        if (result) {
+            // JS walk met a non-C++ frame (__try/__except) whose filter must run
+            // natively. Synthesize the RaiseException parameter array the x86 record
+            // is built from (consumed synchronously by setupCxxExceptionX86Dispatch,
+            // so a spot just below the live stack is safe).
+            const dv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            const argsPtr = ((ctx.esp >>> 0) - 0x40) & ~3;
+            dv.setUint32(argsPtr, 0x19930520, true);
+            dv.setUint32(argsPtr + 4, result.pExceptionObject, true);
+            dv.setUint32(argsPtr + 8, result.pThrowInfo, true);
+            const x86Result = host.process.dispatcher.setupCxxExceptionX86Dispatch(
+                cpu, mem, ctx.esp >>> 0, 0xe06d7363, 0x1, 3, argsPtr, 8);
+            if (x86Result) return x86Result;
+        }
 
         Logger.error(LogCategory.SYSTEM,
             `_CxxThrowException: NO catch handler found. "${exMsg}"`);

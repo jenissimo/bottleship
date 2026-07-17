@@ -350,7 +350,27 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             if (cpu) {
                 // RaiseException is stdcall(code, flags, nArgs, lpArgs): thunk RET 16.
                 const result = dispatchCxxException(mem, cpu, objPtr, throwInfoPtr, 16);
-                if (result) return result;
+                if (result && !('deferToX86' in result)) return result;
+
+                if (result) {
+                    // JS walk met a non-C++ frame (__try/__except) whose filter must run
+                    // natively. For a rethrow tracked only on the JS side, complete the
+                    // record's parameters so guest __CxxFrameHandler can type-match
+                    // without CRT per-thread state.
+                    if (objPtr === 0 && throwInfoPtr === 0 && result.pExceptionObject !== 0) {
+                        view.setUint32(lpArguments + 4, result.pExceptionObject, true);
+                        view.setUint32(lpArguments + 8, result.pThrowInfo, true);
+                    }
+                    return dispatchRaiseExceptionViaSeh(
+                        mem,
+                        ctx,
+                        dwExceptionCode,
+                        dwExceptionFlags,
+                        nNumberOfArguments,
+                        lpArguments,
+                        `C++ defer obj=0x${result.pExceptionObject.toString(16)}, throwInfo=0x${result.pThrowInfo.toString(16)}`,
+                    );
+                }
 
                 // JS-side parser couldn't recognize the handler FuncInfo layout (e.g. modern MSVC).
                 // Fall back to x86-based dispatch: call real handlers via static SEH stub.
