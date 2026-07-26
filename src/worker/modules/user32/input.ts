@@ -11,6 +11,7 @@ import { Marshaler } from '../../core/memory/marshaler';
 import { System } from '../../core/system';
 import { getWindowByHandle } from './window';
 import { getCapture, setCursorClipped, windows } from './shared-state';
+import { GUEST_INPUT_FLAG } from '../../../input/sab-layout';
 
 export function createInputExports(): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
@@ -61,6 +62,7 @@ export function createInputExports(): Record<string, ThunkImplementation> {
         const wasPressedSince = inputManager.consumeKeyPressedSince(vKey);
         const result = (isPressed ? 0x8000 : 0) | (wasPressedSince ? 0x0001 : 0);
 
+        inputManager.noteGuestKeyRead(vKey, isPressed);
         return result;
     };
 
@@ -69,7 +71,9 @@ export function createInputExports(): Record<string, ThunkImplementation> {
 
         Logger.verbose(LogCategory.USER32, `GetKeyState(${nVirtKey})`);
 
-        const result = System.getInstance().inputManager.getKeyState(nVirtKey);
+        const inputManager = System.getInstance().inputManager;
+        const result = inputManager.getKeyState(nVirtKey);
+        inputManager.noteGuestKeyRead(nVirtKey, (result & 0x8000) !== 0);
         return result;
     };
 
@@ -88,6 +92,7 @@ export function createInputExports(): Record<string, ThunkImplementation> {
             packed[vk] = ((state & 0x8000) ? 0x80 : 0) | (state & 0x01);
         }
 
+        inputManager.noteGuestInputFlag(GUEST_INPUT_FLAG.bulkKeyboard);
         const written = Mem.writeBytes(lpKeyState, packed);
         return written === packed.length ? 1 : 0;
     };

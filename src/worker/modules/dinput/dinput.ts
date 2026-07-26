@@ -6,6 +6,7 @@ import { System } from "../../core/system";
 import { createVTablesFromDescriptor, VTableInfo } from "../../api/adapters/module-adapter";
 import { dinputModule } from "../../api/dinput.api";
 import { InterfaceRegistry } from "../../core/com/interface-registry";
+import { readGuidFromMem } from "../../core/com/typelib/typelib-types";
 import { BaseComObject, ComObjectFactory } from "../../core/com/base-com-object";
 import { SystemResourceProvider } from "../../core/resources/system-resource-provider";
 import { Mem } from "../../core/memory/mem-accessor";
@@ -20,6 +21,8 @@ import {
     pollActionMapEntries,
 } from "./dinput-action-helpers";
 import { DIK_TO_VK, vkToDik } from "./dinput-vk-dik";
+import { resetLosableDevices, trackLosableDevice, untrackLosableDevice } from "./device-presence";
+import { GUEST_INPUT_FLAG } from "../../../input/sab-layout";
 
 // DirectInput error codes (HRESULT = MAKE_HRESULT(ERROR, FACILITY_WIN32, win32err))
 const DI_OK = 0x00000000;
@@ -210,6 +213,21 @@ const IID_IDIRECTINPUTDEVICE8W = "54d41081-dc15-4833-a41b-748f73a38179";
 const IID_IDIRECTINPUT8A = "bf798030-483a-4da2-aa99-5d64ed369700";
 const IID_IDIRECTINPUT8W = "bf798031-483a-4da2-aa99-5d64ed369700";
 
+// Every IID a real dinput device object answers to: the whole ANSI chain, the whole UNICODE
+// chain, and IUnknown. Both families are served by one object here because the two vtable
+// layouts are identical — only the string flavour of the info/enum methods differs.
+const DEVICE_QI_IIDS = new Set([
+    "00000000-0000-0000-c000-000000000046", // IUnknown
+    "5944e680-c92e-11cf-bfc7-444553540000", // IDirectInputDeviceA
+    "5944e682-c92e-11cf-bfc7-444553540000", // IDirectInputDevice2A
+    "57d7c6bc-2356-11d3-8e9d-00c04f6844ae", // IDirectInputDevice7A
+    IID_IDIRECTINPUTDEVICE8A,
+    "5944e681-c92e-11cf-bfc7-444553540000", // IDirectInputDeviceW
+    "5944e683-c92e-11cf-bfc7-444553540000", // IDirectInputDevice2W
+    "57d7c6bd-2356-11d3-8e9d-00c04f6844ae", // IDirectInputDevice7W
+    IID_IDIRECTINPUTDEVICE8W,
+]);
+
 // One mapped action recorded from SetActionMap (see dinput-action-helpers.ts ActionMapEntry).
 
 interface SavedActionBinding {
@@ -247,11 +265,23 @@ class DirectInputObject extends BaseComObject {
 /**
  * DirectInputDevice COM object implementation
  */
+type DeviceKind = "keyboard" | "mouse" | "joystick" | "gamepad" | "unknown";
+
 class DirectInputDeviceObject extends BaseComObject {
-    public deviceType: "keyboard" | "mouse" | "joystick" | "gamepad" | "unknown" = "unknown";
-    public dataFormat: "keyboard" | "mouse" | "joystick" | "gamepad" | "unknown" = "unknown";
+    private _deviceType: DeviceKind = "unknown";
+    /** Assignment keeps the hot-plug tracker in sync: only a joystick/gamepad has
+     *  backing hardware that can vanish mid-session. */
+    get deviceType(): DeviceKind { return this._deviceType; }
+    set deviceType(kind: DeviceKind) {
+        this._deviceType = kind;
+        if (kind === "joystick" || kind === "gamepad") trackLosableDevice(this);
+        else untrackLosableDevice(this);
+    }
+    public dataFormat: DeviceKind = "unknown";
     public dataSize = 0;
     public acquired = false;
+    /** Set when the pad was unplugged while acquired; cleared by Acquire. */
+    public inputLost = false;
     public exclusive = false;  // DISCL_EXCLUSIVE requested via SetCooperativeLevel
     public lastMouseX = 0;
     public lastMouseY = 0;
@@ -271,6 +301,7 @@ class DirectInputDeviceObject extends BaseComObject {
     }
 
     protected destroy(): void {
+        untrackLosableDevice(this);
         Logger.verbose(LogCategory.COM, "DirectInputDeviceObject destroyed");
     }
 }
@@ -692,7 +723,10 @@ export class DInput implements IModule {
 
         this.exports["IDirectInputDeviceA_Acquire"] = (ctx, mem, args) => {
             const device = this.getDevice(args[0]);
-            if (device) device.acquired = true;
+            if (device) {
+                device.acquired = true;
+                device.inputLost = false; // re-Acquire is how an app clears DIERR_INPUTLOST
+            }
             // Exclusive-mode mouse acquire captures the cursor (relative mode) — faithful
             // Windows hides+confines it here without the app calling ShowCursor/ClipCursor.
             if (device && device.deviceType === "mouse" && device.exclusive) {
@@ -857,12 +891,14 @@ export class DInput implements IModule {
                 Logger.warn(LogCategory.SYSTEM, `IDirectInputDeviceA_GetDeviceState: not acquired this=0x${thisPtr.toString(16)}`);
                 return DIERR_NOTACQUIRED;
             }
+            if (device?.inputLost) return DIERR_INPUTLOST;
 
             const inputManager = System.getInstance().inputManager;
             const format = device?.dataFormat ?? device?.deviceType ?? "unknown";
             Logger.verbose(LogCategory.SYSTEM, `IDirectInputDeviceA_GetDeviceState: this=0x${thisPtr.toString(16)} cbData=${cbData} format=${format}`);
 
             if (format === "keyboard" || cbData === DIKEYBOARDSTATE_SIZE) {
+                inputManager.noteGuestInputFlag(GUEST_INPUT_FLAG.dinputKeyboard);
                 const keyStates = inputManager.getKeyboardStateVk();
                 mem.fill(0, lpvData, lpvData + Math.min(cbData, DIKEYBOARDSTATE_SIZE));
                 for (let vk = 0; vk < keyStates.length; vk++) {
@@ -969,46 +1005,10 @@ export class DInput implements IModule {
             const freshMem = this.getMemory();
             const view = new DataView(freshMem.buffer, freshMem.byteOffset, freshMem.byteLength);
 
-            // Read IID from guest memory
-            const iid = [];
-            for (let i = 0; i < 16; i++) iid.push(freshMem[riidPtr + i]);
-            const iidStr = iid.map(b => b.toString(16).padStart(2, '0')).join('');
+            const iidStr = readGuidFromMem(freshMem, riidPtr);
+            Logger.verbose(LogCategory.COM, `IDirectInputDeviceA_QueryInterface: iid=${iidStr}`);
 
-            // IID_IDirectInputDeviceA:  80e64459-2ec9-11cf-bfc7-444553540000
-            // IID_IDirectInputDevice2A: 82e64459-2ec9-11cf-bfc7-444553540000
-            // IID_IDirectInputDevice8A: 54d41080-dc15-4833-a41b-748f73a38179
-            // GUID memory layout: DWORD + WORD + WORD stored little-endian, tail 8 bytes as-is.
-            // So for 80e64459-2ec9-11cf-...: bytes [59 44 e6 80 c9 2e cf 11 ...]
-            const tailMatches =
-                iid[2] === 0xe6 && iid[1] === 0x44 && iid[0] === 0x59 &&
-                iid[5] === 0x2e && iid[4] === 0xc9 &&
-                iid[7] === 0x11 && iid[6] === 0xcf;
-            const isDeviceA = tailMatches && iid[3] === 0x80;
-            const isDevice2A = tailMatches && iid[3] === 0x82;
-            // IID_IDirectInputDevice7A: 57D7C6BC-2356-11D3-8E9D-00C04F6844AE
-            const isDevice7A =
-                iid[0] === 0xbc && iid[1] === 0xc6 && iid[2] === 0xd7 && iid[3] === 0x57 &&
-                iid[4] === 0x56 && iid[5] === 0x23 &&
-                iid[6] === 0xd3 && iid[7] === 0x11;
-            // IID_IDirectInputDevice8A: 54d41080-dc15-4833-a41b-748f73a38179
-            const isDevice8A =
-                iid[0] === 0x80 && iid[1] === 0x10 && iid[2] === 0xd4 && iid[3] === 0x54 &&
-                iid[4] === 0x15 && iid[5] === 0xdc &&
-                iid[6] === 0x33 && iid[7] === 0x48;
-            // IID_IDirectInputDevice8W: 54d41081-dc15-4833-a41b-748f73a38179
-            const isDevice8W =
-                iid[0] === 0x81 && iid[1] === 0x10 && iid[2] === 0xd4 && iid[3] === 0x54 &&
-                iid[4] === 0x15 && iid[5] === 0xdc &&
-                iid[6] === 0x33 && iid[7] === 0x48;
-            // IID_IUnknown: 00000000-0000-0000-C000-000000000046
-            const isIUnknown =
-                iid[0] === 0 && iid[1] === 0 && iid[2] === 0 && iid[3] === 0 &&
-                iid[4] === 0 && iid[5] === 0 && iid[6] === 0 && iid[7] === 0 &&
-                iid[8] === 0xc0;
-
-            Logger.verbose(LogCategory.COM, `IDirectInputDeviceA_QueryInterface: iid=${iidStr} isA=${isDeviceA} is2A=${isDevice2A}`);
-
-            if (isDeviceA || isDevice2A || isDevice7A || isDevice8A || isDevice8W || isIUnknown) {
+            if (DEVICE_QI_IIDS.has(iidStr)) {
                 if (ppvObject) view.setUint32(ppvObject, thisPtr, true);
                 obj.addRef();
                 return DI_OK;
@@ -1279,6 +1279,7 @@ export class DInput implements IModule {
 
             const device = this.getDevice(thisPtr);
             const im = System.getInstance().inputManager;
+            if (device?.inputLost) return DIERR_INPUTLOST;
 
             // DI8 action-mapped device (keyboard): replay key-state edges as buffered
             // DIDEVICEOBJECTDATA events carrying the app's uAppData. This is the path NFSU's
@@ -1373,7 +1374,8 @@ export class DInput implements IModule {
 
         // IDirectInputDevice2A_Poll - specifically log this as it's a hot path
         this.exports["IDirectInputDevice2A_Poll"] = (ctx, mem, args) => {
-            // Logger.verbose(LogCategory.SYSTEM, `IDirectInputDevice2A_Poll called for 0x${args[0].toString(16)}`);
+            const device = this.getDevice(args[0]);
+            if (device?.inputLost) return DIERR_INPUTLOST;
             return DI_OK;
         };
 
@@ -1774,6 +1776,7 @@ export class DInput implements IModule {
         device.actionMap = map;
         device.isActionMapped = true;
         device.seq = 0;
+        this.noteActionMapKeys(map);
 
         const save = (user.length > 0 || (dwFlags & DIDSAM_FORCESAVE) !== 0) && toSave.length > 0;
         if (save) {
@@ -1782,6 +1785,22 @@ export class DInput implements IModule {
 
         Logger.log(LogCategory.SYSTEM, `IDirectInputDevice8A_SetActionMap: this=0x${args[0].toString(16)} type=${devType} boundActions=${map.length}/${numActions}`);
         return DI_OK;
+    }
+
+    /**
+     * Publish the keys an action map binds (DIK → VK) as observed-pressed telemetry.
+     * A DirectInput-only title never calls GetAsyncKeyState, so its action map is the
+     * only statement it makes about which keys it steers with.
+     */
+    private noteActionMapKeys(map: ActionMapEntry[]): void {
+        const inputManager = System.getInstance().inputManager;
+        for (const e of map) {
+            for (const dik of [e.dik, e.dikNeg, e.dikPos]) {
+                if (dik === undefined) continue;
+                const vk = DIK_TO_VK[dik];
+                if (vk !== undefined) inputManager.noteGuestKeyRead(vk, true);
+            }
+        }
     }
 
     private freshView(): DataView {
@@ -1972,7 +1991,7 @@ export class DInput implements IModule {
     }
 
     reset(): void {
-        // Clear module state
+        resetLosableDevices();
     }
 
     recreateVTables(): void {

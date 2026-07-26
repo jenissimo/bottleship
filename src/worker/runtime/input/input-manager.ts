@@ -9,6 +9,19 @@ import { Logger, LogCategory } from '../../core/logger';
 import { getCapture, getAbsoluteWindowPosition } from '../../modules/user32/shared-state';
 import { getWindowByHandle } from '../../modules/user32/window';
 import { vkToDik } from '../../modules/dinput/dinput-vk-dik';
+import { TimeService } from '../time';
+import { markJoystickInputLost } from '../../modules/dinput/device-presence';
+import { broadcastGamepadDeviceChange } from '../../modules/user32/device-notify';
+import { GamepadPresenceTracker } from './gamepad-presence';
+import {
+    GUEST_POLLED_KEYS_BASE,
+    GUEST_POLLED_KEYS_COUNT,
+    INPUT_INDEX,
+    KEY_BITFIELD_BASE,
+    KEY_BITFIELD_COUNT,
+    beginInputWrite,
+    endInputWrite,
+} from '../../../input/sab-layout';
 
 // Windows message constants
 const WM_SETCURSOR     = 0x0020;
@@ -52,37 +65,6 @@ const DIJOFS_RX = 12;
 const DIJOFS_RY = 16;
 const DIJOFS_BUTTON0 = 48;
 
-// Input buffer indices (must match App.tsx)
-const INPUT_INDEX = {
-    seq: 0,
-    mouseX: 1,
-    mouseY: 2,
-    buttons: 3,
-    keyCode: 4,       // deprecated (legacy single-event slot)
-    keyState: 5,      // deprecated (legacy single-event slot)
-    gamepadConnected: 6,
-    gamepadButtons: 7,
-    gamepadAxis0: 8,
-    gamepadAxis1: 9,
-    gamepadAxis2: 10,
-    gamepadAxis3: 11,
-    mouseWheel: 12,
-    mouseInside: 13,  // 1 = cursor inside canvas, 0 = outside
-    dinputDX: 14,     // accumulated DInput raw movementX delta
-    dinputDY: 15      // accumulated DInput raw movementY delta
-    // 16..23 reserved for the keyboard bitfield (see KEY_BITFIELD_BASE)
-} as const;
-
-// Keyboard bitfield: 256 virtual keys as 8 x Int32 = 256 bits
-const KEY_BITFIELD_BASE  = 16;
-const KEY_BITFIELD_COUNT = 8;
-
-// Monotonic counter the worker bumps whenever the GUEST reads a joystick/gamepad
-// device (DInput Acquire/GetDeviceState or winmm joyGetPosEx). The host watches it
-// to distinguish "a pad is plugged into the browser" from "the game is actually
-// using it" — drives the input-status overlay next to the canvas. Lives past the
-// key bitfield (16..23) so it never collides.
-const GUEST_GAMEPAD_SEQ_INDEX = 24;
 const KEY_STATE_BYTES = 256;
 
 // Mouse button flags
@@ -150,6 +132,15 @@ const VK_TO_SCAN: Record<number, number> = {
     0x7B: 0x58, // F12
     0x90: 0x45, // VK_NUMLOCK
     0x91: 0x46, // VK_SCROLL
+    // Side-distinguished modifiers. Same make code as the physical key; the RIGHT
+    // variants differ only by the extended bit (see EXTENDED_VK), exactly as
+    // DIK_RCONTROL/DIK_RMENU are DIK_LCONTROL/DIK_LMENU + 0xE0.
+    0xA0: 0x2A, // VK_LSHIFT
+    0xA1: 0x36, // VK_RSHIFT (own make code, NOT extended)
+    0xA2: 0x1D, // VK_LCONTROL
+    0xA3: 0x1D, // VK_RCONTROL (extended)
+    0xA4: 0x38, // VK_LMENU
+    0xA5: 0x38, // VK_RMENU (extended)
     // OEM keys (US layout)
     0xBA: 0x27, // OEM_1 (;:)
     0xBB: 0x0D, // OEM_PLUS (=+)
@@ -173,6 +164,7 @@ const EXTENDED_VK = new Set([
     0x6F,                   // Numpad Divide (only numpad key that's extended)
     0x90,                   // NumLock
     0x2C,                   // PrintScreen
+    0xA3, 0xA5,             // RControl, RMenu (right modifiers are E0-prefixed)
 ]);
 
 // Letter scan codes (VK 0x41='A' .. 0x5A='Z'), set-1 make codes in PHYSICAL QWERTY
@@ -205,6 +197,29 @@ function isToggleKey(vk: number): boolean {
     return vk === VK_CAPITAL || vk === VK_NUMLOCK || vk === VK_SCROLL;
 }
 
+// Modifiers never own the typematic schedule (Windows does not auto-repeat them),
+// but holding one must not cancel the repeat of the letter it modifies.
+const MODIFIER_VK = new Set([
+    0x10, 0x11, 0x12,       // Shift, Control, Menu (side-agnostic)
+    0x5B, 0x5C,             // LWin, RWin
+    0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, // L/R Shift, Control, Menu
+]);
+
+// Typematic defaults: SPI_GETKEYBOARDDELAY 1 (500ms) then SPI_GETKEYBOARDSPEED ~31/s.
+const TYPEMATIC_DELAY_MS  = 500;
+const TYPEMATIC_PERIOD_MS = 33;
+
+/**
+ * Typematic runs on the GUEST clock, not wall clock. A game measures its own repeat
+ * interval with GetTickCount/timeGetTime, and virtual time is what those return: on the
+ * host clock a worker stall (long GPU op, a thunk crediting virtual time) makes the
+ * repeats it then sees arrive at an interval it never asked for. Manual/deterministic
+ * time mode gets reproducible repeats for free.
+ */
+function typematicNowMs(): number {
+    return TimeService.getInstance().nowMs();
+}
+
 // Double-click detection thresholds
 const DBLCLK_TIME_MS = 500;
 const DBLCLK_DIST_PX = 4;
@@ -235,6 +250,7 @@ export class InputManager {
     private gamepadConnected = false;
     private gamepadButtons = 0;
     private gamepadAxes: [number, number, number, number] = [0, 0, 0, 0];
+    private readonly gamepadPresence = new GamepadPresenceTracker();
 
     // Previous state for change detection
     private lastSeq = 0;
@@ -264,6 +280,13 @@ export class InputManager {
     private dinputGamepadPrevAxes: [number, number, number, number] = [0, 0, 0, 0];
 
     private prevKeyBitfield = new Int32Array(KEY_BITFIELD_COUNT);
+    /** Key bitfield copied inside the seqlock-validated region (see poll()). */
+    private keyBitfieldSnapshot = new Int32Array(KEY_BITFIELD_COUNT);
+
+    // Typematic auto-repeat schedule (Windows generates repeat in the input stack,
+    // not in the device). -1 = idle; only ONE key repeats at a time — the latest press.
+    private repeatVk = -1;
+    private repeatNextAt = 0;
 
     // Double-click tracking per button [left, right, middle]
     private lastDownTime = [0, 0, 0];
@@ -284,6 +307,7 @@ export class InputManager {
     private deterministicMode = false;
     /** When set, WM_* are only enqueued when this returns true (e.g. guest is in GetMessage). State (keyStates, mouse) is always updated. */
     private shouldEnqueueMessages: (() => boolean) | null = null;
+    private hostInputReset: (() => void) | null = null;
 
     constructor(windowManager: WindowManager) {
         this.windowManager = windowManager;
@@ -293,11 +317,18 @@ export class InputManager {
         this.shouldEnqueueMessages = getter;
     }
 
+    /** Notifies the host that it must drop everything its producers are holding. */
+    setHostInputResetCallback(callback: () => void): void {
+        this.hostInputReset = callback;
+    }
+
     /**
      * Set the input buffer from SharedArrayBuffer
      */
     setInputBuffer(buffer: SharedArrayBuffer | null): void {
         this.inputView = buffer ? new Int32Array(buffer) : null;
+        // A new buffer carries an unknown initial pad level — seed, never announce.
+        this.gamepadPresence.reset();
         if (this.inputView) {
             Logger.log(LogCategory.SYSTEM, 'InputManager: buffer connected');
         }
@@ -379,6 +410,11 @@ export class InputManager {
     poll(forceEnqueue = false): void {
         if (!this.inputView) return;
 
+        // Typematic is time-driven, not seq-driven: a held key produces no new SAB
+        // record, so it must run BEFORE the seq gate below (which returns early on
+        // every quiet poll).
+        this.pumpTypematic(forceEnqueue);
+
         // SAB input seqlock (reader/acquire side; writers = host App.tsx +
         // the worker injectors below, both bracket payload with begin/end so
         // seq goes even→odd→even per update). An ODD seq means a writer is
@@ -402,6 +438,13 @@ export class InputManager {
         const gamepadAxis1     = this.inputView[INPUT_INDEX.gamepadAxis1];
         const gamepadAxis2     = this.inputView[INPUT_INDEX.gamepadAxis2];
         const gamepadAxis3     = this.inputView[INPUT_INDEX.gamepadAxis3];
+        // The key bitfield is part of the record and must be copied INSIDE the
+        // validated region like every other slot: read after the re-check below and
+        // a bracket that sets a modifier (word 0) and a letter (word 2) is observable
+        // half-applied, so a chord arrives as two unrelated keystrokes.
+        for (let word = 0; word < KEY_BITFIELD_COUNT; word++) {
+            this.keyBitfieldSnapshot[word] = this.inputView[KEY_BITFIELD_BASE + word];
+        }
 
         if (Atomics.load(this.inputView, INPUT_INDEX.seq) !== seq) return;
         this.lastSeq = seq;
@@ -433,6 +476,7 @@ export class InputManager {
         this.gamepadConnected = gamepadConnected;
         this.gamepadButtons   = gamepadButtons;
         this.gamepadAxes      = [gamepadAxis0, gamepadAxis1, gamepadAxis2, gamepadAxis3];
+        this.announceGamepadPresence(gamepadConnected);
         if (this.dinputGamepadBufferSize > 0) {
             this._bufferDInputGamepadEvents(gamepadButtons, this.gamepadAxes, gamepadConnected);
         }
@@ -454,7 +498,7 @@ export class InputManager {
         // This runs BEFORE targetWin check so keyStates are always current
         let keyboardChanged = false;
         for (let word = 0; word < KEY_BITFIELD_COUNT; word++) {
-            const curr = this.inputView[KEY_BITFIELD_BASE + word];
+            const curr = this.keyBitfieldSnapshot[word];
             const prev = this.prevKeyBitfield[word];
             if (curr !== prev) {
                 keyboardChanged = true;
@@ -481,6 +525,16 @@ export class InputManager {
                         if (this.hasQueuedKeyState) {
                             this.queuedKeyState[vk] = (nowPressed ? 0x80 : 0x00) | (this.toggleStates[vk] & 0x01);
                         }
+                        // Typematic arms here (before the no-target-window early return)
+                        // so a key held from before the window existed still repeats.
+                        if (nowPressed) {
+                            if (!MODIFIER_VK.has(vk) && !isToggleKey(vk)) {
+                                this.repeatVk = vk;
+                                this.repeatNextAt = typematicNowMs() + TYPEMATIC_DELAY_MS;
+                            }
+                        } else if (vk === this.repeatVk) {
+                            this.repeatVk = -1;
+                        }
                     }
                 }
             }
@@ -498,9 +552,7 @@ export class InputManager {
         const targetWin = this.windowManager.getKeyboardTargetWindow();
         if (!targetWin) {
             // Save bitfield state even when no window
-            for (let w = 0; w < KEY_BITFIELD_COUNT; w++) {
-                this.prevKeyBitfield[w] = this.inputView[KEY_BITFIELD_BASE + w];
-            }
+            this.prevKeyBitfield.set(this.keyBitfieldSnapshot);
             return;
         }
 
@@ -593,16 +645,15 @@ export class InputManager {
         const wasRightDown  = (this.lastButtons & 2) !== 0;
         const wasMiddleDown = (this.lastButtons & 4) !== 0;
 
-        const buttonChanged = (leftDown !== wasLeftDown) ||
-            (rightDown !== wasRightDown) ||
-            (middleDown !== wasMiddleDown);
         const wParamButtons = this.buttonsToWParam(buttons);
 
-        // Mouse movement - can be coalesced/skipped when busy.
-        // HLE policy: if button edge is present in this poll snapshot, prioritize the click edge
-        // and defer move delivery to avoid a synthetic move-before-click ordering artifact.
+        // Mouse movement - can be coalesced/skipped when busy. Emitted BEFORE the
+        // button edges below because Windows always delivers move-then-down: dropping
+        // the move when a snapshot carries both loses the position permanently
+        // (lastMouseX/Y advance regardless), so a guest that hover-tests from the last
+        // move acts on the previously hovered item.
         if (mouseX !== this.lastMouseX || mouseY !== this.lastMouseY) {
-            if (enqueue && !buttonChanged) {
+            if (enqueue) {
                 const wParam = this.buttonsToWParam(buttons);
                 // Windows sends WM_SETCURSOR (hit-test HTCLIENT, trigger message in the
                 // high word) ahead of client-area mouse messages — apps re-assert their
@@ -695,7 +746,7 @@ export class InputManager {
         if (keyboardChanged) {
             const newKeyEvents: Array<{ vk: number; pressed: boolean; lParam: number }> = [];
             for (let word = 0; word < KEY_BITFIELD_COUNT; word++) {
-                const curr = this.inputView[KEY_BITFIELD_BASE + word];
+                const curr = this.keyBitfieldSnapshot[word];
                 const prev = this.prevKeyBitfield[word];
                 if (curr === prev) continue;
                 const changed = curr ^ prev;
@@ -737,10 +788,50 @@ export class InputManager {
         }
 
         // Update prevKeyBitfield
-        for (let w = 0; w < KEY_BITFIELD_COUNT; w++) {
-            this.prevKeyBitfield[w] = this.inputView[KEY_BITFIELD_BASE + w];
-        }
+        this.prevKeyBitfield.set(this.keyBitfieldSnapshot);
 
+    }
+
+    /**
+     * Typematic auto-repeat: re-post WM_KEYDOWN for the held key with lParam bit 30
+     * (previous key state = down) and NO intervening WM_KEYUP, which is how Win32
+     * name-entry / list UIs see a held key.
+     *
+     * The SAB level bit is deliberately never touched: GetAsyncKeyState/GetKeyState
+     * read it straight out of the bitfield (readKeyLevelFromSab), so a host-side
+     * bit toggle would be observable to the guest as "not pressed".
+     */
+    private pumpTypematic(forceEnqueue: boolean): void {
+        if (this.repeatVk < 0) return;
+        // The level is the authority: a release the diff hasn't reached yet still
+        // stops the repeat this instant.
+        if (!this.readKeyLevelFromSab(this.repeatVk)) {
+            this.repeatVk = -1;
+            return;
+        }
+        const now = typematicNowMs();
+        // Virtual time can step backwards (manual/deterministic mode), which would strand
+        // the schedule in the future for as long as the key stays down. Re-arm instead.
+        if (this.repeatNextAt - now > TYPEMATIC_DELAY_MS) this.repeatNextAt = now + TYPEMATIC_DELAY_MS;
+        if (now < this.repeatNextAt) return;
+        const targetWin = this.windowManager.getKeyboardTargetWindow();
+        if (!targetWin) return;
+        if (!(forceEnqueue || (this.shouldEnqueueMessages?.() ?? true))) return;
+
+        // Repeats that could not be delivered on time coalesce into the repeat count,
+        // matching how Windows folds a backed-up queue into one WM_KEYDOWN.
+        const repeatCount = Math.min(1 + Math.floor((now - this.repeatNextAt) / TYPEMATIC_PERIOD_MS), 0xFFFF);
+        this.repeatNextAt = now + TYPEMATIC_PERIOD_MS;
+
+        const vk = this.repeatVk;
+        const scan = vkToScanCode(vk);
+        const ext = isExtendedKey(vk) ? 0x01000000 : 0;
+        const lParam = ((repeatCount & 0xFFFF) | (scan << 16) | ext | 0x40000000) >>> 0;
+        this.windowManager.postMessage(
+            targetWin.hwnd, WM_KEYDOWN, vk, lParam, 0, 0, 0,
+            this.buildPackedKeyState(this.packedKeyStateScratch),
+        );
+        Logger.verbose(LogCategory.SYSTEM, `Input: KeyDown vk=${vk} (repeat x${repeatCount})`);
     }
 
     /**
@@ -849,6 +940,7 @@ export class InputManager {
         this.gamepadConnected = false;
         this.gamepadButtons = 0;
         this.gamepadAxes = [0, 0, 0, 0];
+        this.gamepadPresence.reset();
         this.keyStates.fill(0);
         this.toggleStates.fill(0);
         this.queuedKeyState.fill(0);
@@ -856,6 +948,8 @@ export class InputManager {
         this.hasQueuedKeyState = false;
         this.keyPressedSinceLastQuery.fill(0);
         this.prevKeyBitfield.fill(0);
+        this.repeatVk = -1;
+        this.repeatNextAt = 0;
         this.lastDownTime = [0, 0, 0];
         this.lastDownX    = [0, 0, 0];
         this.lastDownY    = [0, 0, 0];
@@ -863,6 +957,19 @@ export class InputManager {
         this.tmeHoverMap.clear();
         this.pendingKeyEvents = [];
         this.lastMouseInside = true;
+        // Zero only the slots this side owns. The host-owned payload must be cleared
+        // by the host: it holds the seqlock, and prevKeyBitfield is now all zeros, so
+        // any key still down in the SAB would be re-diffed as a fresh WM_KEYDOWN in
+        // the next game.
+        if (this.inputView) {
+            Atomics.store(this.inputView, INPUT_INDEX.guestGamepadSeq, 0);
+            Atomics.store(this.inputView, INPUT_INDEX.guestInputSeq, 0);
+            Atomics.store(this.inputView, INPUT_INDEX.guestInputFlags, 0);
+            for (let w = 0; w < GUEST_POLLED_KEYS_COUNT; w++) {
+                Atomics.store(this.inputView, GUEST_POLLED_KEYS_BASE + w, 0);
+            }
+        }
+        this.hostInputReset?.();
         // Note: Don't stop polling here, it should continue running
         Logger.log(LogCategory.SYSTEM, 'InputManager reset');
     }
@@ -1099,29 +1206,18 @@ export class InputManager {
      * wndProc. Used by dbg.dlgClick() to drive dialogs directly instead of guessing canvas
      * pixels. Returns false if no input buffer is connected. Clobbers the live cursor position.
      */
-    // SAB input seqlock (writer side, mirrors App.tsx). Every injector brackets
-    // its payload writes: begin bumps seq even→ODD (writer in progress), end bumps
-    // ODD→even (publish). A bare single +1 would leave seq odd forever, which the
-    // seqlock reader in poll() treats as "writer mid-update" and skips permanently.
-    private beginInputWrite(view: Int32Array): void {
-        Atomics.add(view, INPUT_INDEX.seq, 1);
-    }
-    private endInputWrite(view: Int32Array): void {
-        Atomics.add(view, INPUT_INDEX.seq, 1);
-    }
-
     injectClickAtScreen(screenX: number, screenY: number): boolean {
         const view = this.inputView;
         if (!view) return false;
         const x = screenX | 0;
         const y = screenY | 0;
         const step = (buttons: number): void => {
-            this.beginInputWrite(view);
+            beginInputWrite(view);
             view[INPUT_INDEX.mouseX] = x;
             view[INPUT_INDEX.mouseY] = y;
             view[INPUT_INDEX.mouseInside] = 1;
             view[INPUT_INDEX.buttons] = buttons;
-            this.endInputWrite(view);
+            endInputWrite(view);
             this.poll(true);
         };
         step(0); // move onto the control
@@ -1147,11 +1243,11 @@ export class InputManager {
     injectMoveAtScreen(screenX: number, screenY: number): boolean {
         const view = this.inputView;
         if (!view) return false;
-        this.beginInputWrite(view);
+        beginInputWrite(view);
         view[INPUT_INDEX.mouseX] = screenX | 0;
         view[INPUT_INDEX.mouseY] = screenY | 0;
         view[INPUT_INDEX.mouseInside] = 1;
-        this.endInputWrite(view);
+        endInputWrite(view);
         this.poll(true);
         return true;
     }
@@ -1161,12 +1257,12 @@ export class InputManager {
         const view = this.inputView;
         if (!view) return false;
         const mask = this.mouseMaskFor(button);
-        this.beginInputWrite(view);
+        beginInputWrite(view);
         view[INPUT_INDEX.mouseX] = screenX | 0;
         view[INPUT_INDEX.mouseY] = screenY | 0;
         view[INPUT_INDEX.mouseInside] = 1;
         view[INPUT_INDEX.buttons] = down ? (view[INPUT_INDEX.buttons] | mask) : (view[INPUT_INDEX.buttons] & ~mask);
-        this.endInputWrite(view);
+        endInputWrite(view);
         this.poll(true);
         return true;
     }
@@ -1190,12 +1286,12 @@ export class InputManager {
     injectWheelAtScreen(screenX: number, screenY: number, delta: number): boolean {
         const view = this.inputView;
         if (!view) return false;
-        this.beginInputWrite(view);
+        beginInputWrite(view);
         view[INPUT_INDEX.mouseX] = screenX | 0;
         view[INPUT_INDEX.mouseY] = screenY | 0;
         view[INPUT_INDEX.mouseInside] = 1;
         Atomics.store(view, INPUT_INDEX.mouseWheel, delta | 0); // poll() consumes + resets it
-        this.endInputWrite(view);
+        endInputWrite(view);
         this.poll(true);
         return true;
     }
@@ -1209,9 +1305,9 @@ export class InputManager {
         const word = v >> 5;
         const bit = v & 31;
         const idx = KEY_BITFIELD_BASE + word;
-        this.beginInputWrite(view);
+        beginInputWrite(view);
         view[idx] = down ? (view[idx] | (1 << bit)) : (view[idx] & ~(1 << bit));
-        this.endInputWrite(view);
+        endInputWrite(view);
         this.poll(true);
         return true;
     }
@@ -1231,6 +1327,49 @@ export class InputManager {
     }
 
     /**
+     * Announce a pad hot-plug the way Windows does: WM_DEVICECHANGE to the guest,
+     * plus DirectInput's DIERR_INPUTLOST on every acquired joystick when the pad
+     * leaves. The first observation after setInputBuffer/reset only seeds the
+     * tracker (see GamepadPresenceTracker).
+     */
+    private announceGamepadPresence(connected: boolean): void {
+        const event = this.gamepadPresence.observe(connected);
+        if (!event) return;
+        if (event === 'removal') markJoystickInputLost();
+        broadcastGamepadDeviceChange(event === 'arrival');
+    }
+
+    /** Announced pad arrivals + removals so far (harness/diagnostics). */
+    getGamepadPresenceTransitions(): number {
+        return this.gamepadPresence.transitionCount;
+    }
+
+    /**
+     * Instrumentation: simulate plugging/unplugging the pad by driving the SAB slot
+     * through the normal seqlock + poll() path, so the edge detector, the
+     * WM_DEVICECHANGE senders and the DirectInput lost-state all run exactly as they
+     * do for a real host gamepad event. `announced` is false when this was the first
+     * observation of the slot (seeded, not an edge).
+     */
+    injectGamepadPresence(connected: boolean): { ok: boolean; connected: boolean; announced: boolean } {
+        const view = this.inputView;
+        if (!view) return { ok: false, connected, announced: false };
+        const before = this.gamepadPresence.transitionCount;
+        beginInputWrite(view);
+        view[INPUT_INDEX.gamepadConnected] = connected ? 1 : 0;
+        if (!connected) {
+            view[INPUT_INDEX.gamepadButtons] = 0;
+            view[INPUT_INDEX.gamepadAxis0] = 0;
+            view[INPUT_INDEX.gamepadAxis1] = 0;
+            view[INPUT_INDEX.gamepadAxis2] = 0;
+            view[INPUT_INDEX.gamepadAxis3] = 0;
+        }
+        endInputWrite(view);
+        this.poll(true);
+        return { ok: true, connected, announced: this.gamepadPresence.transitionCount !== before };
+    }
+
+    /**
      * Signal to the host that guest code just touched the joystick/gamepad API
      * (DInput Acquire/GetDeviceState on a joystick, or winmm joyGetPosEx). The host
      * polls this counter to tell "pad plugged in" apart from "game is reading it"
@@ -1239,7 +1378,38 @@ export class InputManager {
      */
     noteGuestGamepadRead(): void {
         if (this.inputView) {
-            Atomics.add(this.inputView, GUEST_GAMEPAD_SEQ_INDEX, 1);
+            Atomics.add(this.inputView, INPUT_INDEX.guestGamepadSeq, 1);
         }
+    }
+
+    /**
+     * Record that the guest observed a key as PRESSED (GetAsyncKeyState/GetKeyState
+     * returning down, or a DI action map binding it). Answers "which keys does this
+     * title steer with" for the host's control-layout auto-select, without knowing
+     * the game.
+     *
+     * Only a read that RETURNED pressed sets a bit: bulk GetAsyncKeyState scans over
+     * a wide VK range are routine in this era and would otherwise light every bit and
+     * make the signal a constant.
+     *
+     * Plain non-atomic OR/increment on purpose — this rides the two hottest polled
+     * thunks, and the bitmap is monotonic set-only, so a lost OR delays detection by
+     * one poll and nothing more.
+     */
+    noteGuestKeyRead(vk: number, wasPressed: boolean): void {
+        if (!wasPressed) return;
+        const v = this.inputView;
+        if (!v) return;
+        const k = vk & 0xFF;
+        v[GUEST_POLLED_KEYS_BASE + (k >> 5)] |= 1 << (k & 31);
+        v[INPUT_INDEX.guestInputSeq]++;
+    }
+
+    /** GUEST_INPUT_FLAG_* — a guest input read that carries no single VK to attribute. */
+    noteGuestInputFlag(flag: number): void {
+        const v = this.inputView;
+        if (!v) return;
+        v[INPUT_INDEX.guestInputFlags] |= flag;
+        v[INPUT_INDEX.guestInputSeq]++;
     }
 }

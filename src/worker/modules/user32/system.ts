@@ -12,7 +12,7 @@ import { Mem } from '../../core/memory/mem-accessor';
 import { System } from '../../core/system';
 import { EMU_NATIVE_VIDEO_DLLS } from '../../core/cpu/emulator-config';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
-import { encodeAnsi, getCodePageDecoder, decodeAnsiString, writeAnsiToGuest, encodeAnsiString } from '../codepage-utils';
+import { encodeAnsi, getAnsiCodePage, getCodePageDecoder, decodeAnsiString, readAnsiFromGuest, writeAnsiToGuest, encodeAnsiString } from '../codepage-utils';
 import { findResourceInPE } from '../kernel32/resource';
 import { loadBitmapFromPeResource } from '../kernel32/bitmap-extractor';
 import { loadIconFromPeResource } from '../kernel32/icon-extractor';
@@ -29,9 +29,10 @@ import {
     windows,
     getAbsoluteWindowPosition,
     installCursorAndUpdateHostVisibility,
-    noteCursorWarpForCapture,
+    warpGuestCursorTo,
 } from './shared-state';
 import { getSystemCursorHandle } from './system-cursors';
+import { registerDeviceNotification, unregisterDeviceNotification } from './device-notify';
 
 // System color table (COLORREF: 0x00BBGGRR) — mutable via SetSysColors
 const sysColors = new Map<number, number>([
@@ -50,8 +51,6 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
     let mouseButtonsSwapped = false;
     let doubleClickTimeMs = 500;
-    const deviceNotifications = new Set<number>();
-    let nextDeviceNotification = 0x00021000;
     const registeredClipboardFormats = new Map<string, number>();
     let nextRegisteredClipboardFormat = 0xC000;
 
@@ -241,10 +240,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
     exports['SetCursorPos'] = (ctx, mem, args) => {
         const x = args[0] | 0;
         const y = args[1] | 0;
-        System.getInstance().inputManager.setMousePosition(x, y);
-        // Notify host so it can update virtual cursor position during pointer lock
-        self.postMessage({ type: "set_cursor_pos", x, y });
-        noteCursorWarpForCapture();
+        warpGuestCursorTo(x, y);
         Logger.verbose(LogCategory.USER32, `SetCursorPos(${x}, ${y})`);
         return 1;
     };
@@ -576,43 +572,84 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         return loadIconCommon(mem, hInstance, lpIconName, true);
     };
 
-    // wsprintfA - variadic string formatting function (direct-write: no JS string concat, no TextEncoder)
-    exports['wsprintfA'] = (ctx, mem, args) => {
-        const lpOut = args[0];
-        const lpFmt = args[1];
+    // wsprintfA/W - variadic string formatting (direct-write: no JS string concat, no TextEncoder).
+    // `wide` selects the code-unit size of BOTH the format string and the output buffer; the
+    // h/l/w length modifiers then select the width of each %s/%c argument independently, per
+    // the WPRINTF_ParseFormat{A,W} tables (wine dlls/user32/wsprintf.c).
+    const wsprintfCore = (mem: Uint8Array, args: number[], wide: boolean): number => {
+        const lpOut = args[0] >>> 0;
+        const lpFmt = args[1] >>> 0;
 
         if (!lpOut || !lpFmt) {
-            Logger.warn(LogCategory.USER32, 'wsprintfA: NULL pointer');
+            Logger.warn(LogCategory.USER32, `wsprintf${wide ? 'W' : 'A'}: NULL pointer`);
             return -1;
         }
 
+        const unit = wide ? 2 : 1;
+        const memEnd = mem.length;
+        // Real wsprintf formats through wvsnprintf with a hard 1024 code-unit budget INCLUDING
+        // the terminator, and reports 1024 when it overflows. Callers size their buffer to that
+        // documented maximum, so an unbounded formatter writes past a correctly-sized buffer.
+        // This bounds WRITES only — the format string and %s arguments may live anywhere.
+        const WSPRINTF_MAX_UNITS = 1024;
+        const outEnd = Math.min(memEnd, lpOut + (WSPRINTF_MAX_UNITS - 1) * unit);
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+
         // Write cursor into guest memory
         let out = lpOut;
-        const memEnd = mem.length;
 
-        // Helper: write a single byte
-        const writeByte = (b: number): void => { if (out < memEnd) mem[out++] = b; };
+        // Helper: read one code unit of the format string
+        const fmtAt = (p: number): number =>
+            wide ? (p + 2 <= memEnd ? view.getUint16(p, true) : 0) : (p < memEnd ? mem[p] : 0);
 
-        // Helper: write a JS string as ANSI bytes directly to mem
+        // Helper: write a single output code unit
+        const writeUnit = (c: number): void => {
+            if (out + unit > outEnd) return;
+            if (wide) { view.setUint16(out, c & 0xFFFF, true); out += 2; }
+            else mem[out++] = c & 0xFF;
+        };
+
+        // Helper: write a JS string directly to mem in the output's code-unit width
         const writeStr = (s: string): void => {
+            if (wide) {
+                for (let i = 0; i < s.length; i++) writeUnit(s.charCodeAt(i));
+                return;
+            }
             const encoded = encodeAnsi(s);
-            const writeLen = Math.min(encoded.length, memEnd - out);
+            const writeLen = Math.min(encoded.length, outEnd - out);
             if (writeLen > 0) {
                 mem.set(encoded.subarray(0, writeLen), out);
                 out += writeLen;
             }
         };
 
-        // Helper: copy guest string (mem-to-mem) with optional max length
-        const writeGuestStr = (addr: number, maxLen: number): void => {
-            let j = 0;
-            while (j < maxLen && addr + j < memEnd) {
-                const b = mem[addr + j];
-                if (b === 0) break;
-                if (out >= memEnd) break;
-                mem[out++] = b;
-                j++;
+        // Helper: length of a guest string in its own code units, bounded by precision
+        const guestStrLen = (addr: number, srcWide: boolean, maxChars: number): number => {
+            let n = 0;
+            if (srcWide) {
+                while (n < maxChars && addr + n * 2 + 2 <= memEnd && view.getUint16(addr + n * 2, true) !== 0) n++;
+            } else {
+                while (n < maxChars && addr + n < memEnd && mem[addr + n] !== 0) n++;
             }
+            return n;
+        };
+
+        // Helper: copy a guest string; same-width stays mem-to-mem (no decode round-trip)
+        const writeGuestStr = (addr: number, srcWide: boolean, len: number): void => {
+            if (srcWide === wide) {
+                if (wide) {
+                    const n = Math.min(len, (outEnd - out) >> 1, (memEnd - addr) >> 1);
+                    for (let j = 0; j < n; j++) view.setUint16(out + j * 2, view.getUint16(addr + j * 2, true), true);
+                    out += n * 2;
+                } else {
+                    const n = Math.min(len, outEnd - out, memEnd - addr);
+                    if (n > 0) { mem.set(mem.subarray(addr, addr + n), out); out += n; }
+                }
+                return;
+            }
+            writeStr(srcWide
+                ? Marshaler.readWideString(mem, addr).slice(0, len)
+                : readAnsiFromGuest(mem, addr, len));
         };
 
         // Helper: format a number and write directly
@@ -644,32 +681,40 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
             const totalLen = (sign ? 1 : 0) + str.length;
             // Right-align with spaces if needed
             if (width > totalLen) {
-                for (let p = totalLen; p < width; p++) writeByte(0x20);
+                for (let p = totalLen; p < width; p++) writeUnit(0x20);
             }
-            if (sign) writeByte(sign);
+            if (sign) writeUnit(sign);
             writeStr(str);
+        };
+
+        // Helper: write one character argument, converting if its width differs from the output's
+        const writeChar = (raw: number, srcWide: boolean): void => {
+            if (srcWide === wide) { writeUnit(srcWide ? raw & 0xFFFF : raw & 0xFF); return; }
+            writeStr(srcWide
+                ? String.fromCharCode(raw & 0xFFFF)
+                : getCodePageDecoder(getAnsiCodePage()).decode(Uint8Array.of(raw & 0xFF)));
         };
 
         // Parse format string directly from guest memory
         let fi = lpFmt;
         let argIndex = 2;
 
-        while (fi < memEnd) {
-            const ch = mem[fi];
+        while (fi + unit <= memEnd) {
+            const ch = fmtAt(fi);
             if (ch === 0) break;
 
             if (ch !== 0x25 /* '%' */) {
-                writeByte(ch);
-                fi++;
+                writeUnit(ch);
+                fi += unit;
                 continue;
             }
 
-            fi++; // skip '%'
-            if (fi >= memEnd || mem[fi] === 0) break;
+            fi += unit; // skip '%'
+            if (fmtAt(fi) === 0) break;
 
-            if (mem[fi] === 0x25) { // %%
-                writeByte(0x25);
-                fi++;
+            if (fmtAt(fi) === 0x25) { // %%
+                writeUnit(0x25);
+                fi += unit;
                 continue;
             }
 
@@ -677,56 +722,62 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
             let width = 0;
             let precision: number | null = null;
 
-            if (mem[fi] === 0x30) { // '0'
+            if (fmtAt(fi) === 0x30) { // '0'
                 zeroPad = true;
-                fi++;
+                fi += unit;
             }
 
-            while (fi < memEnd && mem[fi] >= 0x30 && mem[fi] <= 0x39) {
-                width = (width * 10) + (mem[fi] - 0x30);
-                fi++;
+            while (fmtAt(fi) >= 0x30 && fmtAt(fi) <= 0x39) {
+                width = (width * 10) + (fmtAt(fi) - 0x30);
+                fi += unit;
             }
 
-            if (fi < memEnd && mem[fi] === 0x2E) { // '.'
-                fi++;
+            if (fmtAt(fi) === 0x2E) { // '.'
+                fi += unit;
                 precision = 0;
-                while (fi < memEnd && mem[fi] >= 0x30 && mem[fi] <= 0x39) {
-                    precision = (precision * 10) + (mem[fi] - 0x30);
-                    fi++;
+                while (fmtAt(fi) >= 0x30 && fmtAt(fi) <= 0x39) {
+                    precision = (precision * 10) + (fmtAt(fi) - 0x30);
+                    fi += unit;
                 }
             }
 
-            // Skip length modifiers
-            if (fi < memEnd && (mem[fi] === 0x68 || mem[fi] === 0x6C)) { // 'h' or 'l'
-                const mod = mem[fi]; fi++;
-                if (fi < memEnd && mem[fi] === mod) fi++; // hh, ll
-            } else if (fi < memEnd && (mem[fi] === 0x4C || mem[fi] === 0x77)) { // 'L' or 'w'
-                fi++;
-            } else if (fi < memEnd && mem[fi] === 0x49) { // 'I'
-                fi++;
-                if (fi < memEnd && (mem[fi] === 0x33 || mem[fi] === 0x36)) { // '3' or '6'
-                    fi++;
-                    if (fi < memEnd && mem[fi] >= 0x30 && mem[fi] <= 0x39) fi++;
+            // Length modifiers: they pick the argument width for %s/%S/%c/%C
+            let modShort = false, modLong = false, modWide = false;
+            const mod = fmtAt(fi);
+            if (mod === 0x68 || mod === 0x6C) { // 'h' or 'l'
+                if (mod === 0x68) modShort = true; else modLong = true;
+                fi += unit;
+                if (fmtAt(fi) === mod) fi += unit; // hh, ll
+            } else if (mod === 0x4C || mod === 0x77) { // 'L' or 'w'
+                if (mod === 0x77) modWide = true;
+                fi += unit;
+            } else if (mod === 0x49) { // 'I'
+                fi += unit;
+                if (fmtAt(fi) === 0x33 || fmtAt(fi) === 0x36) { // '3' or '6'
+                    fi += unit;
+                    if (fmtAt(fi) >= 0x30 && fmtAt(fi) <= 0x39) fi += unit;
                 }
             }
 
-            if (fi >= memEnd || mem[fi] === 0) break;
-            const spec = mem[fi];
-            fi++;
+            const spec = fmtAt(fi);
+            if (spec === 0) break;
+            fi += unit;
 
             switch (spec) {
                 case 0x73: // 's'
+                case 0x53: // 'S' — the opposite width of the function's own
                     if (argIndex < args.length) {
-                        const strAddr = args[argIndex++];
+                        const isBigS = spec === 0x53;
+                        const srcWide = wide
+                            ? (isBigS ? (modLong || modWide) : !(modShort && !modWide))
+                            : (isBigS ? !(modShort || modWide) : (modLong || modWide));
+                        const strAddr = args[argIndex++] >>> 0;
                         if (strAddr) {
-                            // Measure guest string length (for width padding)
-                            let slen = 0;
-                            let maxCopy = precision !== null ? precision : 0x7FFFFFFF;
-                            while (slen < maxCopy && strAddr + slen < memEnd && mem[strAddr + slen] !== 0) slen++;
+                            const slen = guestStrLen(strAddr, srcWide, precision !== null ? precision : 0x7FFFFFFF);
                             if (width > slen) {
-                                for (let p = slen; p < width; p++) writeByte(0x20);
+                                for (let p = slen; p < width; p++) writeUnit(0x20);
                             }
-                            writeGuestStr(strAddr, slen);
+                            writeGuestStr(strAddr, srcWide, slen);
                         }
                     }
                     break;
@@ -752,30 +803,40 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
                     }
                     break;
                 case 0x63: // 'c'
+                case 0x43: // 'C' — the opposite width of the function's own
                     if (argIndex < args.length) {
-                        const charVal = args[argIndex++] & 0xFF;
+                        const isBigC = spec === 0x43;
+                        const srcWide = wide ? (isBigC ? modLong : !modShort) : (isBigC ? !modShort : modLong);
+                        const charVal = args[argIndex++];
                         if (width > 1) {
-                            for (let p = 1; p < width; p++) writeByte(0x20);
+                            for (let p = 1; p < width; p++) writeUnit(0x20);
                         }
-                        writeByte(charVal);
+                        writeChar(charVal, srcWide);
                     }
                     break;
                 case 0x25: // '%'
-                    writeByte(0x25);
+                    writeUnit(0x25);
                     break;
                 default:
-                    writeByte(0x25);
-                    writeByte(spec);
+                    writeUnit(0x25);
+                    writeUnit(spec);
             }
         }
 
-        // Null terminator
-        if (out < memEnd) mem[out] = 0;
-        const charsWritten = out - lpOut;
+        // Null terminator — memEnd reserves the slot for it, so this always fits unless the
+        // caller's buffer was already past the end of guest memory.
+        if (out + unit <= mem.length) {
+            if (wide) view.setUint16(out, 0, true); else mem[out] = 0;
+        }
+        const charsWritten = (out - lpOut) / unit;
+        const truncated = charsWritten >= WSPRINTF_MAX_UNITS - 1;
 
-        Logger.verbose(LogCategory.USER32, `wsprintfA: ${charsWritten} chars written to 0x${lpOut.toString(16)}`);
-        return charsWritten;
+        Logger.verbose(LogCategory.USER32, `wsprintf${wide ? 'W' : 'A'}: ${charsWritten} chars written to 0x${lpOut.toString(16)}`);
+        return truncated ? WSPRINTF_MAX_UNITS : charsWritten;
     };
+
+    exports['wsprintfA'] = (_ctx, mem, args) => wsprintfCore(mem, args, false);
+    exports['wsprintfW'] = (_ctx, mem, args) => wsprintfCore(mem, args, true);
 
     // wvsprintfA - va_list variant of wsprintfA
     // Hot path: called thousands of times per frame by some games.
@@ -974,17 +1035,19 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         ]) as number;
     };
 
-    // int GetKeyNameTextA(LONG lParam, LPSTR lpString, int cchSize)
-    exports['GetKeyNameTextA'] = (ctx, mem, args) => {
-        const lParam = args[0];
-        const lpString = args[1] >>> 0;
-        const cchSize = args[2];
-
-        if (!lpString || cchSize <= 0) return 0;
-
-        // Extract scan code from bits 16-23, extended flag from bit 24
+    // Decode a WM_KEYDOWN-style lParam into a Set 1 / US-layout key name.
+    // Bit 24 = extended, bit 25 = "don't care about left vs. right" (nt5 xlate.c _GetKeyNameText):
+    // right Shift folds onto left Shift, and the extended bit is dropped for Ctrl/Alt only —
+    // Win95 compatibility keeps it for the other extended keys (cursor pad, numpad Enter).
+    const resolveKeyName = (lParam: number): { name: string; scanCode: number; extended: number } => {
         let scanCode = (lParam >> 16) & 0xFF;
         let extended = (lParam >> 24) & 0x01;
+
+        if (lParam & 0x02000000) {
+            if (scanCode === 0x36) scanCode = 0x2A;
+            if (extended && (scanCode === 0x1D || scanCode === 0x38)) extended = 0;
+        }
+
         // DirectInput games (Max Payne et al.) pass DIK_* scan codes where the
         // extended keys are folded as 0x80|base (DIK_UP=0xC8, DIK_RCONTROL=0x9D…).
         // Recover the base make code + extended flag so the table below names them.
@@ -1022,16 +1085,39 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
             0x57: 'F11', 0x58: 'F12',
         };
 
-        const name = keyNames[scanCode] ?? `Scan ${scanCode}`;
-        const maxLen = Math.min(name.length, cchSize - 1);
-        for (let i = 0; i < maxLen; i++) {
-            mem[lpString + i] = name.charCodeAt(i);
-        }
-        mem[lpString + maxLen] = 0;
-
-        Logger.verbose(LogCategory.USER32, `GetKeyNameTextA(scan=0x${scanCode.toString(16)}, ext=${extended}) -> "${name}"`);
-        return maxLen;
+        return { name: keyNames[scanCode] ?? `Scan ${scanCode}`, scanCode, extended };
     };
+
+    // int GetKeyNameTextA(LONG lParam, LPSTR lpString, int cchSize)
+    // int GetKeyNameTextW(LONG lParam, LPWSTR lpString, int cchSize)
+    // cchSize is the buffer size INCLUDING the terminator; the name is truncated to cchSize-1 and
+    // the return value is the character count written, excluding the terminator.
+    const getKeyNameText = (mem: Uint8Array, args: number[], wide: boolean): number => {
+        const lParam = args[0];
+        const lpString = args[1] >>> 0;
+        const cchSize = args[2] | 0;
+
+        if (!lpString) return 0;
+
+        // cchSize < 1 makes the kernel bail without touching the buffer, but the ANSI client
+        // wrapper terminates its output unconditionally afterwards (nt5 client/ntcftxt.h), so A
+        // still stores a NUL where W leaves the caller's buffer alone.
+        if (cchSize <= 0) {
+            if (!wide) Marshaler.writeString(mem, lpString, '', 1);
+            return 0;
+        }
+
+        const { name, scanCode, extended } = resolveKeyName(lParam);
+        const text = name.slice(0, cchSize - 1);
+        if (wide) Marshaler.writeWideString(mem, lpString, text, cchSize);
+        else Marshaler.writeString(mem, lpString, text, cchSize);
+
+        Logger.verbose(LogCategory.USER32, `GetKeyNameText${wide ? 'W' : 'A'}(scan=0x${scanCode.toString(16)}, ext=${extended}) -> "${text}"`);
+        return text.length;
+    };
+
+    exports['GetKeyNameTextA'] = (_ctx, mem, args) => getKeyNameText(mem, args, false);
+    exports['GetKeyNameTextW'] = (_ctx, mem, args) => getKeyNameText(mem, args, true);
 
     const loadImageCommon = async (
         ctx: any,
@@ -2384,24 +2470,19 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
     exports['SetProcessDPIAware'] = () => 1;
     exports['IsProcessDPIAware'] = () => 1;
 
-    // HDEVNOTIFY RegisterDeviceNotificationA/W — no device-change delivery in emulator.
-    const registerDeviceNotification = (_ctx: unknown, _mem: unknown, _args: number[]) => {
-        const handle = nextDeviceNotification++;
-        deviceNotifications.add(handle);
-        return handle;
-    };
-    exports['RegisterDeviceNotificationA'] = registerDeviceNotification;
-    exports['RegisterDeviceNotificationW'] = registerDeviceNotification;
+    // UINT GetDpiForSystem(VOID) — the virtual desktop is unscaled, so this must agree with
+    // the LOGPIXELSX/Y that gdi32 GetDeviceCaps reports (USER_DEFAULT_SCREEN_DPI).
+    exports['GetDpiForSystem'] = () => 96;
+
+    // HDEVNOTIFY RegisterDeviceNotificationA/W(HANDLE hRecipient, LPVOID NotificationFilter, DWORD Flags)
+    exports['RegisterDeviceNotificationA'] = (ctx, mem, args) =>
+        registerDeviceNotification(mem, args[0] >>> 0, args[1] >>> 0, args[2] >>> 0, false);
+    exports['RegisterDeviceNotificationW'] = (ctx, mem, args) =>
+        registerDeviceNotification(mem, args[0] >>> 0, args[1] >>> 0, args[2] >>> 0, true);
 
     // BOOL UnregisterDeviceNotification(HDEVNOTIFY Handle)
-    exports['UnregisterDeviceNotification'] = (_ctx, _mem, args) => {
-        const handle = args[0] >>> 0;
-        if (!handle || !deviceNotifications.delete(handle)) {
-            System.getInstance().scheduler.setLastError(6); // ERROR_INVALID_HANDLE
-            return 0;
-        }
-        return 1;
-    };
+    exports['UnregisterDeviceNotification'] = (_ctx, _mem, args) =>
+        unregisterDeviceNotification(args[0] >>> 0) ? 1 : 0;
 
     return exports;
 }

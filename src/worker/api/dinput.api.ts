@@ -148,7 +148,7 @@ export const IDirectInputDevice2A: InterfaceDescriptor = {
 // gap). NFSU's keyboard setup is exactly Build×N + SetActionMap on this interface.
 export const IDirectInputDevice8A: InterfaceDescriptor = {
     name: "IDirectInputDevice8A",
-    inherits: "IDirectInputDevice2A",
+    inherits: "IDirectInputDevice7A",
     iid: "54d41080-dc15-4833-a41b-748f73a38179",
     methods: [
         ...IDirectInputDevice2A.methods.map(m => ({ ...m, name: m.name })),
@@ -161,9 +161,11 @@ export const IDirectInputDevice8A: InterfaceDescriptor = {
 };
 
 // IDirectInputDevice8W — returned by IDirectInput8W::CreateDevice / EnumDevicesBySemantics.
+// Vtable layout is identical to the A form; the ANSI/UNICODE families are separate inheritance
+// chains (…DeviceW → …Device2W → …Device7W → …Device8W), so the parent must stay W-side.
 export const IDirectInputDevice8W: InterfaceDescriptor = {
     name: "IDirectInputDevice8W",
-    inherits: "IDirectInputDevice2A",
+    inherits: "IDirectInputDevice7W",
     iid: "54d41081-dc15-4833-a41b-748f73a38179",
     methods: IDirectInputDevice8A.methods.map(m => ({ ...m, name: m.name })),
 };

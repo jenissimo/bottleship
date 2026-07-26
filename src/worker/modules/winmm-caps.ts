@@ -6,6 +6,7 @@
  */
 import { ThunkImplementation } from '../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../core/logger';
+import { virtualCd } from '../core/audio/virtual-cd';
 
 const MMSYSERR_NOERROR = 0;
 const MMSYSERR_BADDEVICEID = 2;
@@ -279,6 +280,11 @@ export function registerWinmmCapsExports(exports: Record<string, ThunkImplementa
             return MMSYSERR_BADDEVICEID;
         }
         auxVolume = dwVolume;
+        // wTechnology is AUXCAPS_CDAUDIO: this line IS the drive's CD-audio output
+        // level, so games that dim the music with the aux slider must be heard.
+        const left = dwVolume & 0xFFFF;
+        const right = (dwVolume >>> 16) & 0xFFFF;
+        virtualCd().setVolume(Math.max(left, right) / 0xFFFF);
         return MMSYSERR_NOERROR;
     };
 }

@@ -75,6 +75,7 @@ export const user32Module: ModuleDescriptor = {
         makeFunc("ToAscii", 5),
         makeFunc("ToUnicode", 6),
         makeFunc("GetKeyNameTextA", 3),
+        makeFunc("GetKeyNameTextW", 3),
         makeFunc("GetKeyboardType", 1),
         makeFunc("GetKeyboardLayout", 1),
         makeFunc("GetKeyboardLayoutNameA", 1),
@@ -506,7 +507,7 @@ export const user32Module: ModuleDescriptor = {
         makeFunc("GetClipboardViewer", 0),
         makeFunc("GetComboBoxInfo", 2),
         makeFunc("GetDoubleClickTime", 0),
-        makeFunc("GetDpiForSystem", 1),
+        makeFunc("GetDpiForSystem", 0),
         makeFunc("GetDpiForWindow", 1),
         makeFunc("GetIconInfoExA", 2),
         makeFunc("GetIconInfoExW", 2),
@@ -573,6 +574,6 @@ export const user32Module: ModuleDescriptor = {
         makeFunc("SetWindowWord", 3),
         makeFunc("ShowWindowAsync", 2),
         makeFunc("TranslateMDISysAccel", 2),
-        makeFunc("wsprintfW", 3),
+        makeFunc("wsprintfW", 16, { callingConvention: "cdecl" }),
     ]
 };

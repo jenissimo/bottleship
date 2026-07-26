@@ -4,6 +4,7 @@ import { resetHooks } from "./hooks";
 import { resetOwnerDrawScratch } from "./owner-draw";
 import { resetSystemCursorHandles } from "./system-cursors";
 import { resetUser32Classes } from "./class";
+import { resetDeviceNotifications } from "./device-notify";
 
 // Window storage
 export interface WindowInfo {
@@ -467,6 +468,19 @@ export function noteCursorWarpForCapture(): void {
     }, WARP_RELEASE_MS);
 }
 
+/**
+ * Single sink for a guest-driven pointer warp: moves the input-manager pointer, tells the
+ * host (virtual cursor under pointer lock) and feeds the warp-burst capture detector.
+ * Shared by user32 SetCursorPos and IDirect3DDevice9::SetCursorPosition — both move the
+ * one real pointer on Windows (wined3d's cursor-position path calls SetCursorPos for a
+ * hardware cursor, which is the cursor kind D3DCAPS9.CursorCaps advertises).
+ */
+export function warpGuestCursorTo(x: number, y: number): void {
+    System.getInstance().inputManager.setMousePosition(x, y);
+    self.postMessage({ type: "set_cursor_pos", x, y });
+    noteCursorWarpForCapture();
+}
+
 export function updateCursorDisplayCount(delta: number): number {
     cursorDisplayCount += delta;
     // Clamp to -1 minimum: on real Windows the counter can go deeply negative,
@@ -530,5 +544,6 @@ export function resetUser32SharedState(): void {
     clipboardOpenOwner = null;
     resetOwnerDrawScratch();
     resetHooks();
+    resetDeviceNotifications();
     Logger.log(LogCategory.USER32, 'User32 shared state reset');
 }

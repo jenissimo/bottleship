@@ -25,6 +25,7 @@ export const winmmModule: ModuleDescriptor = {
         makeFunc("timeSetEvent", 5),
         makeFunc("timeKillEvent", 1),
         makeFunc("mciSendStringA", 4),
+        makeFunc("mciSendStringW", 4),
         // Wave output functions
         makeFunc("waveOutOpen", 6),
         makeFunc("waveOutClose", 1),
@@ -63,7 +64,13 @@ export const winmmModule: ModuleDescriptor = {
         // Joystick functions
         makeFunc("joyGetNumDevs", 0),
         makeFunc("joyGetDevCapsA", 3),
+        makeFunc("joyGetDevCapsW", 3),
+        makeFunc("joyGetPos", 2),
         makeFunc("joyGetPosEx", 2),
+        makeFunc("joyGetThreshold", 2),
+        makeFunc("joySetThreshold", 2),
+        makeFunc("joySetCapture", 4),
+        makeFunc("joyReleaseCapture", 1),
         // MCI (Media Control Interface) functions
         makeFunc("mciGetDeviceIDA", 1),
         makeFunc("mciSendCommandA", 4),
