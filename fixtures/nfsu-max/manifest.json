@@ -1,0 +1,11 @@
+{
+  "container": "app-nfs-underground",
+  "files": [
+    "/overlay/C/NFS Underground/Rage_autosave.ugd",
+    "/overlay/C/NFS Underground/Rage0.ugd",
+    "/overlay/C/NFS Underground/Rage.opt",
+    "/overlay/C/NFS Underground/Rage.cfg",
+    "/overlay/C/NFS Underground/Profiles.usr"
+  ],
+  "note": "NFSU max-detail graphics profile. Rage.cfg holds the settings; Profiles.usr + the .ugd saves keep a career profile so boot navigation is reproducible. registry-access.log was dropped (diagnostic only; this container has no registry.json - NFSU keeps its settings entirely in the overlay)."
+}

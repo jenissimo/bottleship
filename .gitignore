@@ -88,3 +88,12 @@ tools/reference/**/*.h
 
 # Throwaway bring-up/debug probe scripts — local scratch; durable scenarios live in tools/examples/
 /tools/probes/
+
+# bench-v86 local caches
+tools/bench-v86/images/
+tools/bench-v86/engines/
+tools/bench-v86/results/
+
+# AOT capture/compile outputs — per-machine, keyed to one engine binary
+tools/aot/jobs/
+tools/aot/units/
