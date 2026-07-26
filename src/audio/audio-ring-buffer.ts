@@ -90,15 +90,6 @@ export const STATE_PAUSED = 2;
 export const FLAG_CIRCULAR = 1;
 /** Streaming flag: worklet outputs silence when caught up to write cursor instead of wrapping */
 export const FLAG_STREAMING = 2;
-/** DSound pull-model loop-stream (set by dsound once a looping buffer is classified as
- *  actively refilled): CTRL_WRITE_CURSOR carries the guest's committed write frontier.
- *  Unlike FLAG_STREAMING there is NO caught-up stall — cursors keep advancing (delta-
- *  driven refill pumps read the play cursor to size their next write, so parking it
- *  deadlocks them, and frontier==play is ambiguous between full and empty). Instead the
- *  worklet MUTES output once the frontier has been stale (no new commits) for
- *  STALE_FRONTIER_SEC and play has swept past it — the drained-mixer-queue silence of
- *  the real software mixer — and unmutes as soon as the frontier moves again. */
-export const FLAG_LOOP_STREAM = 4;
 
 // ─── Listener SAB field indices (Int32Array element offsets) ─────────────────
 

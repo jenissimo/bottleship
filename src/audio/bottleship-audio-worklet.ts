@@ -29,7 +29,6 @@ const CTRL_BLOCK_BYTES = 128;
 const STATE_PLAYING = 1;
 const FLAG_CIRCULAR = 1;
 const FLAG_STREAMING = 2;
-const FLAG_LOOP_STREAM = 4;
 
 // ─── 3D per-buffer control fields ───────────────────────────────────────────
 
@@ -100,13 +99,6 @@ const DISC_THRESHOLD = 0.5;
 // committing — set to 0 to disable.
 const CONCEAL_FADE_FRAMES = 64;
 
-// FLAG_LOOP_STREAM staleness grace: if the committed write frontier (CTRL_WRITE_CURSOR,
-// producer-owned for loop-stream buffers) hasn't moved for this long, the guest has
-// stopped feeding the loop — mute once play sweeps past the frozen frontier (the real
-// software mixer's drained-queue silence) instead of droning the stale ring. A healthy
-// refill pump commits every few tens of ms, so this never engages mid-stream.
-const STALE_FRONTIER_SEC = 0.25;
-
 // DS3D mode constants
 const DS3DMODE_NORMAL = 0;
 const DS3DMODE_HEAD_RELATIVE = 1;
@@ -133,12 +125,6 @@ type RingBufferSource = {
   data: DataView;       // SAB data region view (includes ctrl block — use CTRL_BLOCK_BYTES offset)
   position: number;     // Fractional frame position (float)
   loopsCompleted: number;
-  // FLAG_LOOP_STREAM state: last observed committed write frontier (bytes), when it
-  // last changed (worklet currentTime), and whether output is muted because play swept
-  // past a stale frontier. Muting never parks the cursors — see STALE_FRONTIER_SEC.
-  lastFrontier: number;
-  frontierChangedAt: number;
-  mutedPastFrontier: boolean;
 };
 
 class BottleShipAudioProcessor extends AudioWorkletProcessor {
@@ -204,9 +190,6 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
           data: new DataView(sab),
           position: 0,
           loopsCompleted: 0,
-          lastFrontier: -1,
-          frontierChangedAt: currentTime,
-          mutedPastFrontier: false,
         });
         return;
       }
@@ -426,8 +409,6 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
         Atomics.store(ctrl, CTRL_PLAY_CURSOR, 0);
         rb.position = 0;
         rb.loopsCompleted = 0;
-        rb.mutedPastFrontier = false;
-        rb.frontierChangedAt = currentTime;
         continue;
       }
 
@@ -451,10 +432,6 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
         const seekFrame = Math.floor(seekBytes / blockAlignSeek) % totalFramesSeek;
         rb.position = seekFrame;
         rb.loopsCompleted = 0;
-        // Seek/replay: fresh staleness grace so a re-Played loop-stream isn't
-        // insta-muted before its pump commits the first write.
-        rb.frontierChangedAt = currentTime;
-        rb.mutedPastFrontier = false;
         if (bufferBytesSeek > 0) {
           Atomics.store(ctrl, CTRL_PLAY_CURSOR, (seekFrame * blockAlignSeek) % bufferBytesSeek);
         }
@@ -687,32 +664,11 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
       const writeCursorBytes = isStreaming ? Atomics.load(ctrl, CTRL_WRITE_CURSOR) : 0;
       const writeCursorFrame = isStreaming ? Math.floor(writeCursorBytes / blockAlign) : 0;
 
-      // Loop-stream (dsound): track the committed write frontier + staleness. While
-      // the guest commits regularly the frontier changes every pump tick and playback
-      // is untouched. A frozen frontier = the guest abandoned this loop; once play
-      // sweeps past it, mute (drained-mixer silence) but KEEP the cursors advancing —
-      // delta-driven refill pumps size their next write from the play cursor, so
-      // parking it would deadlock them (and frontier==play is ambiguous full/empty,
-      // which is why the FLAG_STREAMING caught-up stall cannot be reused here).
-      const isLoopStream = (flags & FLAG_LOOP_STREAM) !== 0;
-      let frontierStale = false;
-      let muteAtPos = Infinity;
-      if (isLoopStream) {
-        const fr = Atomics.load(ctrl, CTRL_WRITE_CURSOR);
-        if (fr !== rb.lastFrontier) {
-          rb.lastFrontier = fr;
-          rb.frontierChangedAt = currentTime;
-          rb.mutedPastFrontier = false;
-        }
-        frontierStale = currentTime - rb.frontierChangedAt > STALE_FRONTIER_SEC;
-        if (!frontierStale) {
-          rb.mutedPastFrontier = false;
-        } else if (!rb.mutedPastFrontier) {
-          const frontierFrame = Math.floor(((fr >>> 0) % bufferBytes) / blockAlign) % totalFrames;
-          const playFrame = Math.floor(pos) % totalFrames;
-          muteAtPos = Math.floor(pos) + ((frontierFrame - playFrame + totalFrames) % totalFrames);
-        }
-      }
+      // A looping dsound buffer whose guest stopped refilling it keeps mixing the stale
+      // ring — that is what the real software mixer does. Its position math derives
+      // entirely from the primary buffer's cursor and it records nothing about how far
+      // the app has written (nt5 dsound CGrace::GetBytePosition), so there is no
+      // drained-queue silence to imitate and no legitimate pump cadence to misjudge.
 
       for (let i = 0; i < frames; i++) {
         // Handle end-of-data
@@ -747,25 +703,6 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
           }
         }
         if (!alive) break;
-
-        // Loop-stream mute: play swept past a stale committed frontier — the guest
-        // abandoned this loop. Silence from here on, cursors keep advancing.
-        if (isLoopStream && frontierStale && !rb.mutedPastFrontier && pos >= muteAtPos) {
-          rb.mutedPastFrontier = true;
-          if (CONCEAL_FADE_FRAMES > 0 && (concealLast0 !== 0 || concealLast1 !== 0)) {
-            const fade = Math.min(frames - i, CONCEAL_FADE_FRAMES);
-            for (let f = 0; f < fade; f++) {
-              const g = 1 - (f + 1) / fade;
-              output[0][i + f] += concealLast0 * g;
-              if (outChannels > 1) output[1][i + f] += concealLast1 * g;
-            }
-          }
-        }
-        if (rb.mutedPastFrontier) {
-          // Advance the rest of the block silently (wrap handled at loop top / next block).
-          pos += (frames - i) * rate;
-          break;
-        }
 
         // Streaming: check if play position has caught up to write cursor
         // Output silence (don't advance pos) until app writes more data
@@ -842,14 +779,12 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
         // right as the play head swept the region, so ~half the bytes played were one
         // ring-pass stale → constant 20ms-periodic splices / audible crackle
         // (proven by dsound lockTrace: play_at_unlock == lockOff + bytes on every tick).
-        // Loop-stream buffers: CTRL_WRITE_CURSOR is the PRODUCER's committed frontier
-        // (the staleness signal) — never overwrite it here.
-        if (!isStreaming && !isLoopStream) {
-          // Match dsound GetCurrentPosition's initial software-mixer premix lead
-          // (30 ms at the buffer's source rate; see dsound.ts dsoundLeadBytes). The
-          // guest-visible cursor is computed there — this SAB copy is debug-only.
+        if (!isStreaming) {
+          // Match dsound GetCurrentPosition's premix lead at its floor (45 ms at the
+          // buffer's source rate; see dsound.ts dsoundLeadBytes, which ramps from there).
+          // The guest-visible cursor is computed there — this SAB copy is debug-only.
           const leadFrames = Math.min(
-            Math.max(64, Math.round(sourceSampleRate * 0.030)),
+            Math.max(64, Math.round(sourceSampleRate * 0.045)),
             Math.max(1, totalFrames - 1),
           );
           const writeCursorFrame2 = (Math.floor(pos) + leadFrames) % totalFrames;

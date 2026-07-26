@@ -18,6 +18,13 @@ export type AudioPlayEncodedPayload = {
   volume: number;
   pan?: number;
   loopCount?: number;
+  /** Begin at this offset into the stream (CD "play from"). Loops restart here too. */
+  startOffsetMs?: number;
+  /** End playback here instead of at the stream's end (CD "play to"). */
+  endOffsetMs?: number;
+  /** Force the streaming path regardless of container — for sources that must not
+   *  be decoded into a PCM buffer (a CD track is tens of MB decoded). */
+  stream?: boolean;
 };
 
 export type AudioUpdatePayload = {
@@ -56,6 +63,10 @@ type EncodedSource = {
   loopsRemaining: number;
   sampleRate?: number;
   positionHandler?: () => void;
+  /** Loop/seek origin in seconds (payload.startOffsetMs). */
+  startTime: number;
+  /** Stop here instead of at the stream's end; null = play to the end. */
+  endTime: number | null;
 };
 
 class LruCache<K, V> {
@@ -322,7 +333,7 @@ export class AudioEngine {
       try {
         await this.play({
           id: payload.id,
-          data: cached.data.slice(),
+          data: this.applyEncodedOffsets(cached, payload).slice(),
           channels: cached.channels,
           sampleRate: cached.sampleRate,
           playbackRate,
@@ -361,9 +372,10 @@ export class AudioEngine {
       this.pendingDecodes.delete(payload.id);
       const playbackRate = this.resolvePlaybackRate(payload, decoded.sampleRate);
       const decodedBytes = decoded.data.byteLength;
+      const shaped = this.applyEncodedOffsets(decoded, payload);
       await this.play({
         id: payload.id,
-        data: decodedBytes <= MAX_CACHE_BYTES ? decoded.data.slice() : decoded.data,
+        data: shaped === decoded.data && decodedBytes > MAX_CACHE_BYTES ? decoded.data : shaped.slice(),
         channels: decoded.channels,
         sampleRate: decoded.sampleRate,
         playbackRate,
@@ -589,6 +601,24 @@ export class AudioEngine {
     }
   }
 
+  /** Trim a decoded buffer to the payload's start/end offsets (the worklet path has
+   *  no transport of its own, so the window is baked into the samples it gets). */
+  private applyEncodedOffsets(decoded: DecodedAudio, payload: AudioPlayEncodedPayload): Float32Array {
+    const startMs = payload.startOffsetMs ?? 0;
+    const endMs = payload.endOffsetMs;
+    if (startMs <= 0 && endMs == null) return decoded.data;
+
+    const channels = Math.max(1, decoded.channels);
+    const totalFrames = Math.floor(decoded.data.length / channels);
+    const toFrame = (ms: number): number =>
+      Math.max(0, Math.min(totalFrames, Math.round((ms * decoded.sampleRate) / 1000)));
+
+    const from = toFrame(startMs);
+    const to = endMs != null && endMs > startMs ? toFrame(endMs) : totalFrames;
+    if (to <= from) return new Float32Array(0);
+    return decoded.data.subarray(from * channels, to * channels);
+  }
+
   private resolvePlaybackRate(payload: AudioPlayEncodedPayload, sampleRate: number): number {
     if (payload.playbackRateHz && sampleRate > 0) {
       return payload.playbackRateHz / sampleRate;
@@ -622,6 +652,7 @@ export class AudioEngine {
   }
 
   private shouldStreamEncoded(payload: AudioPlayEncodedPayload): boolean {
+    if (payload.stream) return true;
     const mime = (payload.mimeType ?? "").toLowerCase();
     if (mime.includes("audio/mpeg") || mime.includes("audio/mp3")) {
       return true;
@@ -668,10 +699,22 @@ export class AudioEngine {
       element.playbackRate = payload.playbackRate ?? 1;
     }
 
+    const startTime = Math.max(0, (payload.startOffsetMs ?? 0) / 1000);
+    const endTime = typeof payload.endOffsetMs === "number"
+      && payload.endOffsetMs > (payload.startOffsetMs ?? 0)
+      ? payload.endOffsetMs / 1000
+      : null;
+
     const reportPosition = () => {
-      const rate = this.encodedSources.get(payload.id)?.sampleRate ?? this.context?.sampleRate ?? 44100;
+      const source = this.encodedSources.get(payload.id);
+      const rate = source?.sampleRate ?? this.context?.sampleRate ?? 44100;
       if (this.onPosition && Number.isFinite(element.currentTime)) {
         this.onPosition(payload.id, Math.floor(element.currentTime * rate));
+      }
+      // A "play to" boundary inside the stream is the end of playback as far as
+      // the caller is concerned — the element itself would keep going.
+      if (source?.endTime != null && element.currentTime >= source.endTime) {
+        this.handleEncodedEnded(payload.id);
       }
     };
 
@@ -684,6 +727,8 @@ export class AudioEngine {
       loopsRemaining,
       sampleRate: sampleRate ?? undefined,
       positionHandler: reportPosition,
+      startTime,
+      endTime,
     });
 
     element.addEventListener("ended", () => {
@@ -691,6 +736,18 @@ export class AudioEngine {
     });
     element.addEventListener("timeupdate", reportPosition);
     element.addEventListener("seeking", reportPosition);
+
+    if (startTime > 0) {
+      const applyStartOffset = () => {
+        try {
+          element.currentTime = startTime;
+        } catch {
+          // Seek before the browser has a seekable range — the media is played from 0.
+        }
+      };
+      if (element.readyState >= 1) applyStartOffset();
+      else element.addEventListener("loadedmetadata", applyStartOffset, { once: true });
+    }
 
     // Resume AudioContext if suspended (user likely already clicked to start the game).
     // Without this the browser logs "AudioContext was not allowed to start" and element.play()
@@ -722,7 +779,7 @@ export class AudioEngine {
     if (source.loopsRemaining === Infinity) return;
     if (source.loopsRemaining > 1) {
       source.loopsRemaining -= 1;
-      source.element.currentTime = 0;
+      source.element.currentTime = source.startTime;
       void source.element.play();
       return;
     }

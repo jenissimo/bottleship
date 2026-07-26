@@ -139,7 +139,8 @@ export const IDirectSound3DListener: InterfaceDescriptor = {
         makeMethod("GetAllParameters", 2),
         makeMethod("GetDistanceFactor", 2),
         makeMethod("GetDopplerFactor", 2),
-        makeMethod("GetOrientation", 2),
+        // GetOrientation returns front and top as two SEPARATE D3DVECTOR out-pointers.
+        makeMethod("GetOrientation", 3),
         makeMethod("GetPosition", 2),
         makeMethod("GetRolloffFactor", 2),
         makeMethod("GetVelocity", 2),

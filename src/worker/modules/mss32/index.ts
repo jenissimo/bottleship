@@ -268,6 +268,11 @@ export class MSS32 implements IModule {
         ctx.waveOuts.clear();
         ctx.fileHandles.clear();
         ctx.sequences.clear();
+        // Dropping the handles is the whole of this module's claim on the drive. The drive
+        // itself is shared with MCI's `cdaudio`, and resetting it from one of its two front
+        // ends is not this module's call: WinmmMci.reset() owns that (stop + eject + TOC
+        // invalidate) and runs in the same module sweep, so playback is already stopped.
+        ctx.redbookHandles.clear();
         for (const ptr of ctx.memAllocatedByMss) {
             ctx.process.memory.free(ptr);
         }

@@ -63,18 +63,12 @@ export interface MSSListener3D {
     dopplerFactor: number;
 }
 
-// Redbook (CD Audio) handle - maps CD track positions to OGG files in VFS
+// Redbook (CD Audio) handle — a Miles-side view of the shared VirtualCdAudio drive,
+// which owns the table of contents and the transport.
 export interface RedbookHandle {
     id: number;                    // Unique handle ID
-    tracks: { file: string; startMs: number; endMs: number }[];
     volume: number;                // 0-127
-    status: number;                // 1=STOPPED, 2=PLAYING, 3=PAUSED
-    currentTrackIdx: number;       // Which track is playing (-1 = none)
-    startTime: number;             // performance.now() when play started
-    playStartMs: number;           // startmsec passed to play()
-    playEndMs: number;             // endmsec passed to play()
-    audioId: number;               // Audio engine playback ID (from nextRedbookAudioId)
-    pauseElapsedMs: number;        // Elapsed ms when paused (for resume)
+    playToken: number;             // VirtualCdAudio token of the request this handle issued
 }
 
 // Wave output device handle

@@ -26,7 +26,6 @@ import {
     CTRL_RESERVED,
     CTRL_BLOCK_BYTES,
     FLAG_CIRCULAR,
-    FLAG_LOOP_STREAM,
     STATE_STOPPED,
     STATE_PLAYING,
     STATE_PAUSED,
@@ -175,15 +174,20 @@ function defaultDs3dState(): Ds3dState {
     };
 }
 
-/** Software-mixer premix block duration (ms). Windows' software mixer consumed app
- *  buffers ahead of playback in 10 ms mix blocks; the DSound write cursor of a
- *  LOCSOFTWARE buffer is that consumption frontier, so the write-cursor lead over
- *  play moves in these quanta. */
-const MIX_QUANTUM_MS = 10;
-/** Initial premix queue depth (write lead = depth × MIX_QUANTUM_MS = 30 ms). */
-const MIX_QUANTA_START = 3;
-/** Premix queue depth ceiling under starvation (80 ms lead). */
-const MIX_QUANTA_MAX = 8;
+// Software-mixer premix depth. On a LOCSOFTWARE buffer the reported write cursor leads
+// play by exactly the premixed region — GetCurrentPosition derives the secondary's write
+// cursor from the distance between the primary's write cursor and the mixer's next-mix
+// position (nt5 dsound CGrace::GetBytePosition, "the region from the write cursor to the
+// mix cursor is the premixed region"). So these bounds ARE the write-cursor lead.
+//
+// The mixer thread (nt5 dsound CNaGrace::MixThread) ramps that depth on a timer:
+// MIXER_MINPREMIX after a remix, then `premix += step; step += 2` per refresh up to
+// MIXER_MAXPREMIX — 45, 47, 51, 57, 65, 75, 87, 101, 117, 135, 155, 177, 200. Sleep
+// between refreshes is min(premixed/2, nextNotify) clamped to [MIN/2, MAX/2].
+const PREMIX_MIN_MS = 45;
+const PREMIX_MAX_MS = 200;
+/** Ramp increment growth per refresh: step starts here and grows by the same amount. */
+const PREMIX_STEP_MS = 2;
 
 type SoundBuffer = {
     id: number;
@@ -216,19 +220,16 @@ type SoundBuffer = {
      *  Used to classify a continuously-refilled STREAM (crosses the buffer size many
      *  times) apart from a write-once static loop (engine/ambience SFX). */
     cumulativeWritten?: number;
-    /** Classified as an actively-streamed looping buffer (FLAG_LOOP_STREAM): the SAB
-     *  write cursor carries the guest's committed frontier and the worklet MUTES when
-     *  that frontier goes stale and play sweeps past it (drained-mixer silence), so an
-     *  abandoned music loop (e.g. race→menu) stops droning its stale ring. Cursors keep
-     *  advancing so delta-driven refill pumps stay alive; a write-once static loop is
-     *  never classified and keeps looping its whole buffer. */
+    /** Classified as an actively-refilled looping buffer rather than a write-once static
+     *  loop. Diagnostics only — see updateStreamFrontier. */
     streamed?: boolean;
-    /** Software-mixer premix queue depth in MIX_QUANTUM_MS quanta; the write cursor
-     *  leads play by this much. Deepens when a guest write overlaps the play cursor
-     *  (pump losing the race); see dsoundLeadBytes. */
-    mixAheadQuanta?: number;
-    /** Host time (performance.now) of the last premix-depth bump — rate limiter. */
-    lastLeadBumpMs?: number;
+    /** Software-mixer premix depth in ms; the reported write cursor leads play by it.
+     *  Ramped on a timer and reset by a remix — see dsoundLeadBytes. */
+    premixMs?: number;
+    /** Current ramp increment (grows by PREMIX_STEP_MS per refresh). */
+    premixStepMs?: number;
+    /** Host time (performance.now) the ramp last advanced. */
+    premixAdvancedAtMs?: number;
     // Ring buffer (SAB)
     sab: SharedArrayBuffer | null;
     registered: boolean;
@@ -695,6 +696,10 @@ export class DSound implements IModule {
             const obj = this.objects.get(ptr);
             if (!obj) return 0;
             obj.refCount -= 1;
+            if (obj.buffer) {
+                this.recordLife("release", obj.buffer.id, undefined,
+                    `obj=${obj.refCount} buf=${obj.buffer.bufferRefCount} ptr=0x${(ptr >>> 0).toString(16)}`);
+            }
             if (obj.refCount <= 0) {
                 if (ptr === this.primaryBufferPtr) {
                     this.primaryBufferPtr = 0;
@@ -880,16 +885,20 @@ export class DSound implements IModule {
             return DS_OK;
         };
         this.exports["idirectsound3dlistener_getorientation"] = (ctx, mem, args) => {
-            const outPtr = args[1];
-            if (outPtr) {
-                const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-                const ls = this.listenerState;
-                view.setFloat32(outPtr, ls.frontX, true);
-                view.setFloat32(outPtr + 4, ls.frontY, true);
-                view.setFloat32(outPtr + 8, ls.frontZ, true);
-                view.setFloat32(outPtr + 12, ls.topX, true);
-                view.setFloat32(outPtr + 16, ls.topY, true);
-                view.setFloat32(outPtr + 20, ls.topZ, true);
+            // Two independent D3DVECTOR out-pointers, not one 6-float block.
+            const frontPtr = args[1];
+            const topPtr = args[2];
+            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            const ls = this.listenerState;
+            if (frontPtr) {
+                view.setFloat32(frontPtr, ls.frontX, true);
+                view.setFloat32(frontPtr + 4, ls.frontY, true);
+                view.setFloat32(frontPtr + 8, ls.frontZ, true);
+            }
+            if (topPtr) {
+                view.setFloat32(topPtr, ls.topX, true);
+                view.setFloat32(topPtr + 4, ls.topY, true);
+                view.setFloat32(topPtr + 8, ls.topZ, true);
             }
             return DS_OK;
         };
@@ -1744,24 +1753,6 @@ export class DSound implements IModule {
                 const overlapPlay = buffer.isPlaying && this.cursorInRange(offset, totalWritten, play, buffer.bytes);
                 if (totalWritten >= buffer.bytes) this.dbgAudioCalls.fullUnlock++;
                 if (overlapPlay) this.dbgAudioCalls.overlapUnlock++;
-                if (overlapPlay && totalWritten < buffer.bytes) {
-                    // A partial write span containing the live play cursor means the
-                    // guest's streaming pump lost the race against playback. The real
-                    // software mixer's response to starvation was to deepen its premix
-                    // queue, which pushes the reported write cursor (and thus where the
-                    // app writes next) further ahead of play. Mirror that: one quantum
-                    // per event, rate-limited so a single stall's burst of late writes
-                    // doesn't overshoot the depth. Full-buffer rewrites are excluded —
-                    // they always overlap play and signal nothing about pump cadence.
-                    const nowHost = performance.now();
-                    const depth = buffer.mixAheadQuanta ?? MIX_QUANTA_START;
-                    if (depth < MIX_QUANTA_MAX && nowHost - (buffer.lastLeadBumpMs ?? -Infinity) >= 100) {
-                        buffer.mixAheadQuanta = depth + 1;
-                        buffer.lastLeadBumpMs = nowHost;
-                        Logger.log(LogCategory.SYSTEM,
-                            `dsound: premix depth ${depth + 1}×${MIX_QUANTUM_MS}ms on buffer id=${buffer.id} (late write overlapped play)`);
-                    }
-                }
                 this.dbgLockTrace.push({
                     t: Math.round(performance.now()),
                     off: offset,
@@ -1809,6 +1800,9 @@ export class DSound implements IModule {
             const wasStopped = !buffer.isPlaying;
             buffer.isPlaying = true;
             buffer.isLooping = isLooping;
+            // A starting source premixes from MIXER_MINPREMIX like any remix does; a Play on
+            // an already-running buffer changes nothing about the premixed region.
+            if (wasStopped) this.signalRemix(buffer);
             this.recordLife("play", buffer.id, isLooping, `wasStopped=${wasStopped} bytes=${buffer.bytes}`);
 
             // §B#5 deterministic-audio anchor: pin the virtual-time baseline from which the
@@ -1887,6 +1881,7 @@ export class DSound implements IModule {
             if (buffer.sab) {
                 setCtrl(buffer.sab, CTRL_VOLUME, buffer.volumeDb);
             }
+            this.signalRemix(buffer);
             return DS_OK;
         };
 
@@ -1901,6 +1896,7 @@ export class DSound implements IModule {
             if (buffer.sab) {
                 setCtrl(buffer.sab, CTRL_FREQUENCY, freq);
             }
+            this.signalRemix(buffer);
             return DS_OK;
         };
 
@@ -2088,6 +2084,7 @@ export class DSound implements IModule {
             if (buffer.sab) {
                 setCtrl(buffer.sab, CTRL_PAN, buffer.pan);
             }
+            this.signalRemix(buffer);
             return DS_OK;
         };
         this.exports["idirectsoundbuffer8_restore"] = (ctx, mem, args) => {
@@ -2320,6 +2317,11 @@ export class DSound implements IModule {
                 sabState, sabPlay, sabWrite,
                 apiPlayCursor: apiPlay,
                 apiWriteCursor: apiWrite,
+                // Lifetime bookkeeping: an orphan surviving a guest Release shows up here
+                // as a live objRefCount/bufferRefCount pair with no matching lifeRing entry.
+                objRefCount: obj.refCount,
+                bufferRefCount: b.bufferRefCount,
+                streamed: !!b.streamed,
                 lastUnlockCursor: b.lastUnlockCursor ?? null,
                 notifyCount: b.notifications?.length ?? 0,
                 lastNotifyCursor: b.lastNotifyCursor ?? null,
@@ -2427,49 +2429,86 @@ export class DSound implements IModule {
         return normalizedCursor >= normalizedStart || normalizedCursor < end;
     }
 
-    /** Update the loop-stream classification + committed write frontier after a guest
-     *  Unlock. A LOCSOFTWARE looping buffer the guest has refilled past twice its own
-     *  size is a genuine stream (a write-once static loop never gets there); once
-     *  classified, its SAB is flagged FLAG_LOOP_STREAM and CTRL_WRITE_CURSOR tracks the
-     *  guest's committed frontier. The worklet keeps cursors advancing (delta-driven
-     *  pumps size their next write from the play cursor — stalling it deadlocks them,
-     *  and frontier==play is ambiguous full/empty) but MUTES once the frontier goes
-     *  stale and play sweeps past it — the real mixer's drained-queue silence — instead
-     *  of looping the stale ring forever (the race→menu "stuck sample" drone). Static
-     *  loops (engine/ambience SFX) are never classified and keep whole-buffer looping. */
+    /** Classify a LOCSOFTWARE looping buffer the guest has refilled past twice its own
+     *  size as a genuine stream (a write-once static loop never gets there). Diagnostics
+     *  only — it tells a stalled music pump apart from an ambience loop in `dbgSnapshot`.
+     *  Playback does not consult it: the mixer treats both the same, because the real one
+     *  does. */
     private updateStreamFrontier(buffer: SoundBuffer, justWritten: number): void {
         if (!buffer.sab || buffer.bytes < 4096) return;
         buffer.cumulativeWritten = (buffer.cumulativeWritten ?? 0) + justWritten;
         if (!buffer.streamed && buffer.cumulativeWritten >= buffer.bytes * 2) {
             buffer.streamed = true;
-            setCtrl(buffer.sab, CTRL_FLAGS, getCtrl(buffer.sab, CTRL_FLAGS) | FLAG_LOOP_STREAM);
-            Logger.log(LogCategory.SYSTEM,
-                `dsound: buffer id=${buffer.id} classified LOOP_STREAM (mute on stale write frontier)`);
-        }
-        if (buffer.streamed && buffer.lastUnlockCursor !== undefined) {
-            // Committed frontier — the worklet's staleness signal. While the guest keeps
-            // feeding, this changes every pump tick and playback is untouched; when the
-            // guest abandons the buffer it freezes, and the worklet mutes after grace.
-            setCtrl(buffer.sab, CTRL_WRITE_CURSOR, buffer.lastUnlockCursor);
+            Logger.log(LogCategory.SYSTEM, `dsound: buffer id=${buffer.id} classified LOOP_STREAM`);
         }
     }
 
+    /**
+     * Advance the premix ramp to `now`. Time-driven, exactly like the mixer thread:
+     * the depth grows on its own refresh schedule whether or not the guest is late.
+     * (An earlier model only deepened when a write was caught overlapping play, so the
+     * lead could only grow AFTER the pump had already been starved once — the real mixer
+     * has no starvation feedback at all, it just ramps.) Advanced lazily from
+     * dsoundLeadBytes rather than on a timer: every cursor read is a refresh point, and
+     * a buffer nobody queries needs no depth.
+     */
+    private advancePremix(buffer: SoundBuffer, now: number): number {
+        let premix = buffer.premixMs ?? PREMIX_MIN_MS;
+        let step = buffer.premixStepMs ?? PREMIX_STEP_MS;
+        const last = buffer.premixAdvancedAtMs;
+        if (last === undefined) {
+            buffer.premixMs = premix;
+            buffer.premixStepMs = step;
+            buffer.premixAdvancedAtMs = now;
+            return premix;
+        }
+        // Refresh interval = min(premixed/2, nextNotify) clamped to [MIN/2, MAX/2]. We
+        // have no notify deadline to shorten it, so the premixed half-life is the term.
+        let elapsed = now - last;
+        let advancedAt = last;
+        while (premix < PREMIX_MAX_MS) {
+            const interval = Math.min(PREMIX_MAX_MS / 2, Math.max(PREMIX_MIN_MS / 2, premix / 2));
+            if (elapsed < interval) break;
+            elapsed -= interval;
+            advancedAt += interval;
+            premix = Math.min(PREMIX_MAX_MS, premix + step);
+            step += PREMIX_STEP_MS;
+        }
+        buffer.premixMs = premix;
+        buffer.premixStepMs = step;
+        // At the ceiling the schedule no longer matters; keep the clock current so a
+        // later reset restarts from now instead of replaying the whole idle gap.
+        buffer.premixAdvancedAtMs = premix >= PREMIX_MAX_MS ? now : advancedAt;
+        return premix;
+    }
+
+    /**
+     * A remix rewinds the mixer's next-mix position back to the write cursor and rebuilds
+     * the premixed region from PREMIX_MIN_MS (nt5 dsound CGrace::Refresh with fRemix, plus
+     * the MixThread branch that resets dtimePremix). The reported write cursor therefore
+     * dips back toward play and re-ramps. Raised by the same things the real one is:
+     * volume/pan/frequency changed on a PLAYING, unmuted buffer.
+     */
+    private signalRemix(buffer: SoundBuffer): void {
+        if (!buffer.isPlaying) return;
+        buffer.premixMs = PREMIX_MIN_MS;
+        buffer.premixStepMs = PREMIX_STEP_MS;
+        // Clearing the anchor rather than stamping it here keeps one clock owner: the next
+        // advancePremix re-seeds from whatever `now` it is given, so the ramp cannot see a
+        // reset stamped on a different time base than the one it measures against.
+        buffer.premixAdvancedAtMs = undefined;
+    }
+
     private dsoundLeadBytes(buffer: SoundBuffer): number {
-        // Software-mixer (KMixer) premix-queue lead. All our buffers report
-        // DSBSTATUS_LOCSOFTWARE, and on that path the real write cursor is the
-        // kernel mixer's CONSUMPTION frontier: how far it has already premixed the
-        // app's data into its queue of 10 ms mix blocks (play is derived backward
-        // from it by the premixed-but-unplayed backlog). The queue starts 3 blocks
-        // deep (30 ms) and deepens under starvation up to 8 (80 ms) — NOT the
-        // ~15 ms figure of the hardware-buffer path, which we never take.
-        // Streaming pumps calibrated against that mixer (write-anchored Lock +
-        // Sleep(50) cadence) need this headroom: at a 12 ms lead a 50 ms-period
-        // pump leaves the play cursor in already-consumed data ~40% of the time
-        // (audible ~19 Hz crackle). The adaptive bump lives in the Unlock handler
-        // (guest write span overlapping the live play cursor = pump lost the race).
+        // All our buffers report DSBSTATUS_LOCSOFTWARE, so the write cursor is the software
+        // mixer's premix frontier, NOT the ~15 ms figure of the hardware-buffer path we
+        // never take. Streaming pumps are calibrated against that frontier: at a 12 ms lead
+        // a 50 ms-period pump leaves the play cursor in already-consumed data ~40% of the
+        // time (audible ~19 Hz crackle), and a pump slower than the ceiling crackles no
+        // matter what it does — which is why the ceiling has to be the real 200 ms.
         const blockAlign = Math.max(1, buffer.format.blockAlign);
-        const quanta = Math.min(MIX_QUANTA_MAX, buffer.mixAheadQuanta ?? MIX_QUANTA_START);
-        const leadFrames = Math.max(64, Math.round((buffer.format.sampleRate * MIX_QUANTUM_MS * quanta) / 1000));
+        const premixMs = this.advancePremix(buffer, performance.now());
+        const leadFrames = Math.max(64, Math.round((buffer.format.sampleRate * premixMs) / 1000));
         return Math.min(leadFrames * blockAlign, Math.floor(buffer.bytes / 4));
     }
 
@@ -2532,7 +2571,7 @@ export class DSound implements IModule {
                 : getCtrl(buffer.sab, CTRL_PLAY_CURSOR);
             const playCursor = rawCursor % buffer.bytes;
             // Faithful DSound: the write cursor LEADS the play cursor by the software
-            // mixer's premix-queue depth (30 ms, adaptive to 80 ms; see dsoundLeadBytes).
+            // mixer's premixed region (45 ms ramping to 200 ms; see dsoundLeadBytes).
             // The span [play, write) is committed to the mixer and unsafe to
             // overwrite; a streaming app writes AHEAD of
             // `write`. Write-cursor-driven mixers (UE1/Galaxy) splice at
@@ -2554,6 +2593,10 @@ export class DSound implements IModule {
 
     private destroySoundBuffer(buffer: SoundBuffer): void {
         this.recordLife("destroy", buffer.id, undefined, `wasPlaying=${buffer.isPlaying} bytes=${buffer.bytes}`);
+        // A destroyed buffer is not playing: drop the state before the ring goes away so
+        // nothing (notification pump, debug snapshot) can read it back as live.
+        buffer.isPlaying = false;
+        buffer.isLooping = false;
         if (buffer.registered) {
             self.postMessage({ type: "audio_unregister", payload: { id: buffer.id } });
             buffer.registered = false;

@@ -27,7 +27,6 @@ export interface MSSContext {
     nextFileHandleId: number;
     nextTimerId: number;
     nextRedbookId: number;
-    nextRedbookAudioId: number;
     nextSequenceId: number;
 
     initialized: boolean;
@@ -104,7 +103,6 @@ export function createMSSContext(process: Process, memory: Uint8Array): MSSConte
         nextFileHandleId: 0x50000000,
         nextTimerId: 1,
         nextRedbookId: 0x52420001,
-        nextRedbookAudioId: 0x00CD0001,
         nextSequenceId: 1,
 
         initialized: false,
