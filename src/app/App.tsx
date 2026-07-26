@@ -39,6 +39,24 @@ import type {
   PresentMode,
   UiSettings,
 } from "../ui-settings";
+import { INPUT_BUFFER_SIZE, INPUT_INDEX } from "../input/sab-layout";
+import { inputDevice } from "../input/virtual-device";
+import { relativeIntent } from "../input/relative-intent";
+import { touchDriver } from "../input/touch/driver";
+import { TouchControlLayer, type TouchControlsHandle } from "./TouchControlLayer";
+import { TouchHud } from "./TouchHud";
+import { VirtualKeyboardSheet } from "./VirtualKeyboardSheet";
+import { useActiveLayout, type ManifestTouch } from "../input/controls/use-active-layout";
+import {
+  detectCoarsePrimary, shouldShowTouchHud, shouldShowTouchUi, type PointerKind,
+} from "../input/touch-ui-visibility";
+import {
+  getPointerKind, installPointerKindWatcher, kindOfPointerType, notePointerKind,
+  subscribePointerKind,
+} from "../input/pointer-kind";
+import { setHapticsEnabled } from "../input/haptics";
+import { TouchFirstRunHint } from "./TouchFirstRunHint";
+import type { HostAction } from "../input/bindings";
 
 async function writeOpfsFile(dir: FileSystemDirectoryHandle, name: string, blob: Blob): Promise<void> {
   const handle = await dir.getFileHandle(name, { create: true });
@@ -75,32 +93,6 @@ async function stageFilesAndLaunch(files: File[]): Promise<void> {
   for (const f of files) await writeOpfsFile(ingestDir, f.name, f);
   window.location.assign(`?game=dev&ingest=1`);
 }
-
-const INPUT_BUFFER_SIZE = 1024;
-const INPUT_INDEX = {
-  seq: 0,
-  mouseX: 1,
-  mouseY: 2,
-  buttons: 3,
-  keyCode: 4,
-  keyState: 5,
-  gamepadConnected: 6,
-  gamepadButtons: 7,
-  gamepadAxis0: 8,
-  gamepadAxis1: 9,
-  gamepadAxis2: 10,
-  gamepadAxis3: 11,
-  mouseWheel: 12,
-  mouseInside: 13,  // 1 = cursor inside canvas, 0 = outside
-  dinputDX: 14,     // accumulated DInput raw movementX delta (Atomics.add / exchange)
-  dinputDY: 15,     // accumulated DInput raw movementY delta
-  // 16..23 reserved for the keyboard bitfield (KEY_BITFIELD_BASE)
-  guestGamepadSeq: 24  // worker bumps when the GAME reads the joystick/gamepad API
-} as const;
-
-// Keyboard bitfield: 256 virtual keys as 8 x Int32 = 256 bits
-const KEY_BITFIELD_BASE = 16;
-const KEY_BITFIELD_COUNT = 8;
 
 type WorkerStatus = "idle" | "ready" | "error";
 
@@ -168,36 +160,24 @@ let isRecording = false;
 let recordStart = 0;
 let recordedInputs: InputSample[] = [];
 
-// Track currently pressed keys as a Set; serialized to bitfield in SharedArrayBuffer
-const pressedKeys = new Set<number>();
-
-function syncKeyBitfield(inputView: Int32Array): void {
-    for (let word = 0; word < KEY_BITFIELD_COUNT; word++) {
-        let bits = 0;
-        const base = word * 32;
-        for (const vk of pressedKeys) {
-            if (vk >= base && vk < base + 32) bits |= (1 << (vk - base));
-        }
-        inputView[KEY_BITFIELD_BASE + word] = bits;
-    }
-}
-
-// --- SAB input seqlock (writer side) ---------------------------------------
-// The input record spans many Int32 slots but is published via the single `seq`
-// counter. Plain payload writes with only a trailing Atomics bump let the worker
-// reader observe a HALF-updated record (torn read). Bracket every payload update
-// in a seqlock: bump seq to ODD before touching payload (writer-in-progress),
-// write the payload slots, then bump seq to EVEN to publish. Atomics.add is a
-// sequentially-consistent RMW, so it fences the plain payload stores between the
-// two markers; the reader's paired Atomics.load(seq) acquire sees either an odd
-// value (retry/skip) or a stable even snapshot. seq stays even between updates,
-// so the reader's "changed since lastSeq" gate is unaffected (each update = +2).
-// Zero-alloc, hot-path cheap: two atomic increments per input event.
-function beginInputWrite(inputView: Int32Array): void {
-    Atomics.add(inputView, INPUT_INDEX.seq, 1); // even -> odd: writer in progress
-}
-function endInputWrite(inputView: Int32Array): void {
-    Atomics.add(inputView, INPUT_INDEX.seq, 1); // odd -> even: publish (release)
+/** Capture the published record for playRecording(). No-op unless recording. */
+function recordSample(inputView: Int32Array, keyCode = 0, keyState = 0): void {
+    if (!isRecording) return;
+    recordedInputs.push({
+        t: performance.now() - recordStart,
+        mouseX: inputView[INPUT_INDEX.mouseX],
+        mouseY: inputView[INPUT_INDEX.mouseY],
+        buttons: inputView[INPUT_INDEX.buttons],
+        keyCode,
+        keyState,
+        gamepadConnected: inputView[INPUT_INDEX.gamepadConnected],
+        gamepadButtons: inputView[INPUT_INDEX.gamepadButtons],
+        gamepadAxis0: inputView[INPUT_INDEX.gamepadAxis0],
+        gamepadAxis1: inputView[INPUT_INDEX.gamepadAxis1],
+        gamepadAxis2: inputView[INPUT_INDEX.gamepadAxis2],
+        gamepadAxis3: inputView[INPUT_INDEX.gamepadAxis3],
+        mouseWheel: inputView[INPUT_INDEX.mouseWheel] ?? 0,
+    });
 }
 
 // Win32 MessageBox button tables + the dev-mode modal live in ./MessageBoxModal.tsx.
@@ -290,6 +270,28 @@ export default function App() {
   const [editingKey, setEditingKey] = useState<string | null>(null);
   const [opfsToolOpen, setOpfsToolOpen] = useState(false);
   const [storageOpen, setStorageOpen] = useState(false);
+  /** Chrome-free presentation where the Fullscreen API does not exist (iPhone Safari). */
+  const [immersive, setImmersive] = useState(false);
+  const [oskOpen, setOskOpen] = useState(false);
+  const [controlsHidden, setControlsHidden] = useState(false);
+  /** What last drove the app — decides whether the touch UI belongs on screen.
+   *  Seeded from the app-global latch, which the library screen has already been
+   *  feeding: by the time a game mounts, the launch tap is in. */
+  const [lastPointerKind, setLastPointerKind] = useState<PointerKind | null>(getPointerKind);
+  const [coarsePrimary] = useState(detectCoarsePrimary);
+  /** Manifest gameId — the per-game key for a saved control layout. */
+  const [gameId, setGameId] = useState<string | null>(null);
+  const [manifestTouch, setManifestTouch] = useState<ManifestTouch | null>(null);
+  const touchControlsRef = useRef<TouchControlsHandle | null>(null);
+  /** Guest pixels per CSS pixel — the widget layer scales relative motion by it. */
+  const guestPerCss = useCallback(() => {
+    const rect = canvasRectRef.current;
+    const space = mouseCoordinateModeRef.current === "guest"
+      ? guestResolutionRef.current
+      : resolutionRef.current;
+    if (!rect || rect.width <= 0 || rect.height <= 0) return { x: 1, y: 1 };
+    return { x: space.width / rect.width, y: space.height / rect.height };
+  }, []);
   const [mainSettingsOpen, setMainSettingsOpen] = useState(false);
   const [registryToolOpen, setRegistryToolOpen] = useState(false);
   const [logViewerOpen, setLogViewerOpen] = useState(false);
@@ -332,6 +334,57 @@ export default function App() {
   // Current UI settings, readable from non-React callbacks (e.g. the audio-engine
   // creation path, which may run after the settings-apply effect has fired).
   const uiSettingsRef = useRef<UiSettings>(uiSettings);
+  /**
+   * On a touch device the virtual pad is permanently available — it is simply not
+   * drawn yet. Titles of this era enumerate joysticks ONCE at startup, so waiting
+   * for the overlay to appear means the game has already taken its "no controller"
+   * branch and will never look again. Advertise it like a controller left plugged in.
+   */
+  const assertVirtualPad = useCallback(() => {
+    if (typeof navigator === "undefined") return;
+    // The same test that decides whether the pad is DRAWN, minus `hidden` — a
+    // collapsed overlay does not unplug it. Gating on touch hardware alone would
+    // advertise a joystick to every desktop with a touchscreen, and a game that
+    // finds one stops offering the keyboard.
+    if (!shouldShowTouchHud({
+      maxTouchPoints: navigator.maxTouchPoints,
+      coarsePrimary,
+      lastPointer: getPointerKind(),
+      mode: uiSettingsRef.current.touchMode,
+      hidden: false,
+    })) return;
+    inputDevice.publishPad({ connected: true, buttons: 0, axes: [0, 0, 0, 0] }, "touch");
+    inputDevice.commit({ immediate: true });
+  }, [coarsePrimary]);
+
+  // Mounted on every screen INCLUDING the library, which returns before the emulator
+  // exists: the launch tap is the evidence, and it has to be in before the guest
+  // enumerates its devices.
+  useEffect(() => {
+    const uninstall = installPointerKindWatcher();
+    const unsubscribe = subscribePointerKind((kind) => {
+      pointerSourceRef.current = kind;
+      setLastPointerKind(kind);
+      assertVirtualPad();
+    });
+    return () => { uninstall(); unsubscribe(); };
+  }, [assertVirtualPad]);
+
+  const touchUiSignals = {
+    maxTouchPoints: typeof navigator === "undefined" ? 0 : navigator.maxTouchPoints,
+    coarsePrimary,
+    lastPointer: lastPointerKind,
+    mode: uiSettings.touchMode,
+    hidden: controlsHidden,
+  };
+  const showTouchControls = shouldShowTouchUi(touchUiSignals);
+  const showTouchHud = shouldShowTouchHud(touchUiSignals);
+  const activeLayout = useActiveLayout(
+    gameId,
+    manifestTouch,
+    () => globalInputView,
+    workerStatus === "ready" && uiSettings.touchMode !== "off",
+  );
   // Live pause state for the long-lived I/O effect's callbacks. Read via ref so
   // toggling pause does NOT tear down and recreate the whole worker/input/audio
   // effect (see the core-I/O effect's deps) — only this cheap sync effect runs.
@@ -487,16 +540,10 @@ export default function App() {
 
   // Pointer lock state for FPS-style relative mouse input
   const pointerLockedRef   = useRef(false);
-  const wantsPointerLockRef = useRef(false);
-  const virtualMouseRef    = useRef({ x: 0, y: 0 });
   // Cooldown after exitPointerLock — browser rejects re-acquire for ~1 frame after exit
   const pointerLockCooldownRef = useRef(false);
-  // Faithful relative-mouse engagement = (cursor hidden via ShowCursor) OR (ClipCursor confined)
-  // OR (DirectInput exclusive-mode mouse acquired) OR (SetCursorPos warp burst — AGS/UE
-  // re-centering emulates relative mouse; we can honor warps only under pointer lock).
-  const cursorClippedRef = useRef(false);
-  const cursorWarpingRef = useRef(false);
-  const mouseCapturedRef = useRef(false);
+  /** Which kind of pointer is driving us; decides how relative intent is delivered. */
+  const pointerSourceRef = useRef<PointerKind>(getPointerKind() ?? "mouse");
   // Right Ctrl deliberately released the lock — suppress auto re-acquire until the next
   // explicit re-engage gesture (a canvas click).
   const userReleasedLockRef = useRef(false);
@@ -505,17 +552,19 @@ export default function App() {
 
   const requestPointerLockSafe = (canvas: HTMLCanvasElement) => {
     if (pointerLockCooldownRef.current) return;
+    // Allow-list, not a !== "touch" deny-list: a pen reports "pen" and has neither
+    // Pointer Lock nor meaningful movementX/Y, so it belongs on the touch transport.
+    if (pointerSourceRef.current !== "mouse") return;
     Promise.resolve(canvas.requestPointerLock()).catch(() => {});
   };
 
-  // Recompute the relative-mouse intent (OR of the two faithful signals) and engage/release
-  // pointer-lock to match. Engaging always requires a user gesture, so when not yet locked we
-  // only attempt an opportunistic acquire (succeeds inside a gesture, otherwise armed for the
-  // next click via handlePointerDown). Releasing happens immediately when intent drops.
+  // Pointer Lock is the MOUSE transport for relative intent. Engaging always requires a
+  // user gesture, so when not yet locked we only attempt an opportunistic acquire
+  // (succeeds inside a gesture, otherwise armed for the next click via handlePointerDown).
+  // Releasing happens immediately when intent drops. The touch transport subscribes to
+  // the same store independently.
   const updatePointerLockIntent = () => {
-    const wants = !cursorVisibleRef.current || cursorClippedRef.current
-      || mouseCapturedRef.current || cursorWarpingRef.current;
-    wantsPointerLockRef.current = wants;
+    const wants = relativeIntent.get();
     if (wants) {
       const c = canvasRef.current;
       if (c && document.hasFocus() && !pointerLockedRef.current && !userReleasedLockRef.current) {
@@ -544,6 +593,7 @@ export default function App() {
   const resolutionRef = useRef({ width: 0, height: 0 });
 
   useEffect(() => {
+    setHapticsEnabled(uiSettings.touchHaptics);
     mouseCoordinateModeRef.current = uiSettings.mouseCoordinateMode;
     presentModeRef.current = uiSettings.presentMode;
     uiSettingsRef.current = uiSettings;
@@ -704,7 +754,7 @@ export default function App() {
       // AI-agent harness facade: window.__BS__.harness. Thin page-side
       // forwarder over harness_rpc + the normalized event bus; logic lives in the
       // worker HarnessService. Coexists with the legacy window.dbg Proxy below.
-      installHarnessFacade(globalWorker);
+      installHarnessFacade(globalWorker, () => globalInputView);
 
       // Guest debugger bridge: window.dbg.<cmd>(...args) -> worker {type:"dbg"} ->
       // handleDbgCommand() -> wasm dbg_* primitives. Output flows back via console.
@@ -823,6 +873,8 @@ export default function App() {
       setIsBufferInitialized(true);
     }
     const inputBuffer = globalSab;
+    inputDevice.attach(globalInputView!, () => globalWorker?.postMessage({ type: "input_tick" }));
+    assertVirtualPad();
     if (!audioEngine) {
       audioEngine = new AudioEngine();
       // Apply the persisted output prefs to the fresh engine (volume/mute are stored
@@ -961,6 +1013,8 @@ export default function App() {
       if (event.data?.type === "bundle_meta") {
         const name = typeof event.data.name === "string" ? event.data.name.trim() : "";
         if (name) setBundleDisplayName(name);
+        setGameId(typeof event.data.gameId === "string" ? event.data.gameId : null);
+        setManifestTouch((event.data.touch as ManifestTouch | null) ?? null);
       }
       if (event.data?.type === "loading_progress") {
         const { phase, percent, label } = event.data;
@@ -1147,7 +1201,7 @@ export default function App() {
         const visible = event.data?.visible !== false;
         cursorVisibleRef.current = visible;
         updateCanvasCursor();
-        // Engage/release pointer-lock on the faithful relative signal (hidden OR clipped).
+        relativeIntent.set("cursorHidden", !visible);
         updatePointerLockIntent();
       }
       if (event.data?.type === "cursor_image") {
@@ -1176,32 +1230,39 @@ export default function App() {
         // Guest ClipCursor(rect) confines the cursor (relative/captured mouse, e.g. Unreal
         // SetMouseCapture); ClipCursor(NULL) releases it. Feed it into the same intent as
         // ShowCursor so confined-but-visible games also engage pointer-lock.
-        cursorClippedRef.current = event.data?.clip === true;
+        relativeIntent.set("clipped", event.data?.clip === true);
         updatePointerLockIntent();
       }
       if (event.data?.type === "mouse_capture") {
         // Guest acquired/released an exclusive-mode DirectInput mouse. On real Windows this
         // implicitly captures the cursor (relative mode) with no ShowCursor/ClipCursor call,
         // so feed it into the same intent to engage/release pointer-lock.
-        mouseCapturedRef.current = event.data?.capture === true;
+        relativeIntent.set("captured", event.data?.capture === true);
         updatePointerLockIntent();
       }
       if (event.data?.type === "cursor_warp") {
         // Guest is warp-bursting SetCursorPos (relative-mouse emulation) — SetCursorPos can
         // only be honored under pointer lock, so treat it as a capture signal.
-        cursorWarpingRef.current = event.data?.active === true;
+        relativeIntent.set("warping", event.data?.active === true);
+        updatePointerLockIntent();
+      }
+      if (event.data?.type === "input_reset") {
+        // Game switch: the worker's key/button diff baselines are back to zero, so a
+        // level we are still holding would arrive in the next game as a fresh press.
+        inputDevice.releaseAllSources();
+        touchControlsRef.current?.releaseAll();
+        assertVirtualPad();
+        inputDevice.commit({ immediate: true });
+        relativeIntent.reset();
         updatePointerLockIntent();
       }
       if (event.data?.type === "set_cursor_pos") {
         // Guest called SetCursorPos — update virtual cursor so next movement continues from here
         const x = Number(event.data.x) | 0;
         const y = Number(event.data.y) | 0;
-        virtualMouseRef.current = { x, y };
-        if (pointerLockedRef.current && globalInputView) {
-          beginInputWrite(globalInputView);
-          globalInputView[INPUT_INDEX.mouseX] = x;
-          globalInputView[INPUT_INDEX.mouseY] = y;
-          endInputWrite(globalInputView);
+        if (pointerLockedRef.current) {
+          inputDevice.setPointerAbsolute(x, y);
+          inputDevice.commit({ immediate: true });
         }
       }
       if (event.data?.type === "show_message_box") {
@@ -1234,8 +1295,12 @@ export default function App() {
         // the space clickAt() injects into — onto the on-screen canvas rect.
         ((window as any).__BS__ ??= {}).guestResolution = { width, height };
         if (canvas) {
-          canvas.style.width = `${width}px`;
-          canvas.style.height = `${height}px`;
+          // No inline size: the canvas ATTRIBUTES already carry the guest resolution, so
+          // width/height:auto resolve to it and max-*:100% fits it into the panel with
+          // the aspect ratio intact. A definite inline size makes the clamp one-sided —
+          // the short axis shrinks, the long one stays, and the picture stretches.
+          canvas.style.width = "";
+          canvas.style.height = "";
           canvasRectRef.current = canvas.getBoundingClientRect();
           if (mouseCoordinateModeRef.current === "guest") {
             worker.postMessage({ type: "resize", width, height });
@@ -1323,12 +1388,34 @@ export default function App() {
     resize();
     window.addEventListener("resize", resize);
     window.visualViewport?.addEventListener("resize", resize);
+    // A pinch-pan moves the visual viewport without resizing it, and every mapped
+    // coordinate is measured against the canvas rect — stale rect, wrong cursor.
+    window.visualViewport?.addEventListener("scroll", resize);
     document.addEventListener("fullscreenchange", resize);
     const resizeObserver = new ResizeObserver(resize);
     resizeObserver.observe(canvas);
 
+    const detachTouch = panelRef.current
+      ? touchDriver.attach(panelRef.current, {
+          getCanvasRect: () => canvasRectRef.current ?? canvas.getBoundingClientRect(),
+          getPointerSpace: () =>
+            mouseCoordinateModeRef.current === "guest"
+              ? guestResolutionRef.current
+              : resolutionRef.current,
+          getSettings: () => uiSettingsRef.current,
+          hitTest: (x, y, id, phase) => touchControlsRef.current?.hitTest(x, y, id, phase) ?? false,
+        })
+      : () => {};
+
     // 5. Input Handlers
+    // The canvas handlers are the MOUSE path only. Touch and pen belong to the touch
+    // driver on the panel; letting both consume the same contact publishes two
+    // contradictory records per event.
+
     const writePointer = (event: PointerEvent) => {
+      if (event.pointerType !== "mouse") return;
+      // Latch back to mouse: a tablet with a Bluetooth mouse switches both ways.
+      notePointerKind("mouse");
       const inputView = globalInputView;
       if (!inputView) return;
 
@@ -1338,7 +1425,7 @@ export default function App() {
       // reliable path is the canvas click in handlePointerDown. Guarded so a rejection is silent.
       if (
         !pointerLockedRef.current &&
-        wantsPointerLockRef.current &&
+        relativeIntent.get() &&
         !userReleasedLockRef.current &&
         !pointerLockCooldownRef.current &&
         document.hasFocus()
@@ -1346,37 +1433,31 @@ export default function App() {
         try { requestPointerLockSafe(canvas); } catch { /* not a valid gesture in this browser */ }
       }
 
+      const pointerSpace =
+        mouseCoordinateModeRef.current === "guest"
+          ? guestResolutionRef.current
+          : resolutionRef.current;
+      const width  = Math.max(1, pointerSpace.width);
+      const height = Math.max(1, pointerSpace.height);
+      inputDevice.setPointerBounds(width, height);
+      const rect = canvasRectRef.current ?? canvas.getBoundingClientRect();
+
       // --- Pointer Lock mode: use relative movementX/Y, skip canvas bounds check ---
       if (pointerLockedRef.current) {
-        const pointerSpace =
-          mouseCoordinateModeRef.current === "guest"
-            ? guestResolutionRef.current
-            : resolutionRef.current;
-        const width  = Math.max(1, pointerSpace.width);
-        const height = Math.max(1, pointerSpace.height);
-        const rect   = canvasRectRef.current ?? canvas.getBoundingClientRect();
         const scaleX = width  / Math.max(1, rect.width);
         const scaleY = height / Math.max(1, rect.height);
-        const virt   = virtualMouseRef.current;
-        virt.x = Math.max(0, Math.min(width  - 1, virt.x + event.movementX * scaleX));
-        virt.y = Math.max(0, Math.min(height - 1, virt.y + event.movementY * scaleY));
-        beginInputWrite(inputView);
-        inputView[INPUT_INDEX.mouseX]  = Math.round(virt.x);
-        inputView[INPUT_INDEX.mouseY]  = Math.round(virt.y);
-        inputView[INPUT_INDEX.buttons] = event.buttons;
-        // DirectInput reports RAW device deltas (relative axes), NOT canvas-scaled — feed the
-        // accumulator unscaled movementX/Y. The virtual cursor above stays scaled (CSS→guest).
-        // (dinputDX/DY are independent atomic accumulators, not part of the seqlock snapshot.)
-        Atomics.add(inputView, INPUT_INDEX.dinputDX, Math.round(event.movementX));
-        Atomics.add(inputView, INPUT_INDEX.dinputDY, Math.round(event.movementY));
-        endInputWrite(inputView);
-        globalWorker?.postMessage({ type: "input_tick" });
+        // DirectInput reports RAW device deltas (relative axes), NOT canvas-scaled;
+        // the virtual cursor stays scaled (CSS→guest). Same delta, two consumers.
+        inputDevice.addPointerRelative(
+          event.movementX * scaleX, event.movementY * scaleY,
+          event.movementX, event.movementY,
+        );
+        inputDevice.setButtonsMask(event.buttons, "hw-mouse");
+        inputDevice.commit();
         return;
       }
 
       // --- Normal absolute mode ---
-      const rect = canvasRectRef.current ?? canvas.getBoundingClientRect();
-
       // When pointer is captured (button held), process events even outside canvas
       const hasCaptured = canvas.hasPointerCapture(event.pointerId);
       const insideCanvas = event.clientX >= rect.left &&
@@ -1390,60 +1471,31 @@ export default function App() {
         return;
       }
 
-      const pointerSpace =
-        mouseCoordinateModeRef.current === "guest"
-          ? guestResolutionRef.current
-          : resolutionRef.current;
-      const width = Math.max(1, pointerSpace.width);
-      const height = Math.max(1, pointerSpace.height);
-
       // Coordinate scaling: mouse events are in client/CSS pixels
       // We map them to the virtual resolution [0..width/height]
       const scaleX = width / rect.width;
       const scaleY = height / rect.height;
-      const x = Math.max(0, Math.min(width, (event.clientX - rect.left) * scaleX));
-      const y = Math.max(0, Math.min(height, (event.clientY - rect.top) * scaleY));
-
-      beginInputWrite(inputView);
-      inputView[INPUT_INDEX.mouseX] = Math.round(x);
-      inputView[INPUT_INDEX.mouseY] = Math.round(y);
-      inputView[INPUT_INDEX.buttons] = event.buttons;
+      inputDevice.setPointerAbsolute(
+        (event.clientX - rect.left) * scaleX,
+        (event.clientY - rect.top) * scaleY,
+      );
+      inputDevice.setButtonsMask(event.buttons, "hw-mouse");
       Atomics.add(inputView, INPUT_INDEX.dinputDX, Math.round(event.movementX * scaleX));
       Atomics.add(inputView, INPUT_INDEX.dinputDY, Math.round(event.movementY * scaleY));
-      endInputWrite(inputView);
-      globalWorker?.postMessage({ type: "input_tick" });
-      if (isRecording) {
-        recordedInputs.push({
-          t: performance.now() - recordStart,
-          mouseX: inputView[INPUT_INDEX.mouseX],
-          mouseY: inputView[INPUT_INDEX.mouseY],
-          buttons: inputView[INPUT_INDEX.buttons],
-          keyCode: inputView[INPUT_INDEX.keyCode],
-          keyState: inputView[INPUT_INDEX.keyState],
-          gamepadConnected: inputView[INPUT_INDEX.gamepadConnected],
-          gamepadButtons: inputView[INPUT_INDEX.gamepadButtons],
-          gamepadAxis0: inputView[INPUT_INDEX.gamepadAxis0],
-          gamepadAxis1: inputView[INPUT_INDEX.gamepadAxis1],
-          gamepadAxis2: inputView[INPUT_INDEX.gamepadAxis2],
-          gamepadAxis3: inputView[INPUT_INDEX.gamepadAxis3],
-          mouseWheel: inputView[INPUT_INDEX.mouseWheel] ?? 0,
-        });
-      }
+      inputDevice.commit();
+      recordSample(inputView);
     };
 
-    const handlePointerEnter = () => {
+    const handlePointerEnter = (event?: PointerEvent) => {
+      if (event && event.pointerType !== "mouse") return;
       isCanvasHoveredRef.current = true;
       updateCanvasCursor(true);
-      const inputView = globalInputView;
-      if (inputView && inputView[INPUT_INDEX.mouseInside] === 0) {
-        beginInputWrite(inputView);
-        inputView[INPUT_INDEX.mouseInside] = 1;
-        endInputWrite(inputView);
-        globalWorker?.postMessage({ type: "input_tick" });
-      }
+      inputDevice.setMouseInside(true, "hw-mouse");
+      inputDevice.commit();
     };
 
     const handlePointerLeave = (event?: PointerEvent) => {
+      if (event && event.pointerType !== "mouse") return;
       if (!isCanvasHoveredRef.current) return;
       // Don't leave if pointer is captured (button held down while moving outside)
       if (event && canvas.hasPointerCapture(event.pointerId)) return;
@@ -1453,33 +1505,12 @@ export default function App() {
       const inputView = globalInputView;
       if (!inputView) return;
 
-      // Always signal mouse-outside so InputManager can fire WM_MOUSELEAVE
-      const insideChanged  = inputView[INPUT_INDEX.mouseInside] !== 0;
-      const buttonsChanged = inputView[INPUT_INDEX.buttons] !== 0;
-      if (insideChanged || buttonsChanged) {
-        beginInputWrite(inputView);
-        if (insideChanged)  inputView[INPUT_INDEX.mouseInside] = 0;
-        if (buttonsChanged) inputView[INPUT_INDEX.buttons] = 0;
-        endInputWrite(inputView);
-        globalWorker?.postMessage({ type: "input_tick" });
-      }
-      if (isRecording) {
-        recordedInputs.push({
-          t: performance.now() - recordStart,
-          mouseX: inputView[INPUT_INDEX.mouseX],
-          mouseY: inputView[INPUT_INDEX.mouseY],
-          buttons: inputView[INPUT_INDEX.buttons],
-          keyCode: inputView[INPUT_INDEX.keyCode],
-          keyState: inputView[INPUT_INDEX.keyState],
-          gamepadConnected: inputView[INPUT_INDEX.gamepadConnected],
-          gamepadButtons: inputView[INPUT_INDEX.gamepadButtons],
-          gamepadAxis0: inputView[INPUT_INDEX.gamepadAxis0],
-          gamepadAxis1: inputView[INPUT_INDEX.gamepadAxis1],
-          gamepadAxis2: inputView[INPUT_INDEX.gamepadAxis2],
-          gamepadAxis3: inputView[INPUT_INDEX.gamepadAxis3],
-          mouseWheel: inputView[INPUT_INDEX.mouseWheel] ?? 0,
-        });
-      }
+      // Always signal mouse-outside so InputManager can fire WM_MOUSELEAVE, and drop
+      // the buttons with it — a press that ends off-canvas has no up event to release it.
+      inputDevice.setMouseInside(false, "hw-mouse");
+      inputDevice.setButtonsMask(0, "hw-mouse");
+      inputDevice.commit();
+      recordSample(inputView);
     };
 
     const handleKey = (event: KeyboardEvent, state: number) => {
@@ -1528,39 +1559,10 @@ export default function App() {
         void audioEngine?.resume();
       }
 
-      // Update pressed keys set and serialize to bitfield
       const vk = event.keyCode & 0xff;
-      if (state === 1) {
-        pressedKeys.add(vk);
-      } else {
-        pressedKeys.delete(vk);
-      }
-      beginInputWrite(inputView);
-      syncKeyBitfield(inputView);
-
-      // Clear legacy single-event slots (deprecated)
-      inputView[INPUT_INDEX.keyCode] = 0;
-      inputView[INPUT_INDEX.keyState] = 0;
-
-      endInputWrite(inputView);
-      globalWorker?.postMessage({ type: "input_tick" });
-      if (isRecording) {
-        recordedInputs.push({
-          t: performance.now() - recordStart,
-          mouseX: inputView[INPUT_INDEX.mouseX],
-          mouseY: inputView[INPUT_INDEX.mouseY],
-          buttons: inputView[INPUT_INDEX.buttons],
-          keyCode: vk,
-          keyState: state,
-          gamepadConnected: inputView[INPUT_INDEX.gamepadConnected],
-          gamepadButtons: inputView[INPUT_INDEX.gamepadButtons],
-          gamepadAxis0: inputView[INPUT_INDEX.gamepadAxis0],
-          gamepadAxis1: inputView[INPUT_INDEX.gamepadAxis1],
-          gamepadAxis2: inputView[INPUT_INDEX.gamepadAxis2],
-          gamepadAxis3: inputView[INPUT_INDEX.gamepadAxis3],
-          mouseWheel: inputView[INPUT_INDEX.mouseWheel] ?? 0,
-        });
-      }
+      inputDevice.setKey(vk, state === 1, "hw-key");
+      inputDevice.commit();
+      recordSample(inputView, vk, state);
     };
 
 
@@ -1568,6 +1570,8 @@ export default function App() {
     const handleKeyUp = (event: KeyboardEvent) => handleKey(event, 0);
 
     const handlePointerDown = (event: PointerEvent) => {
+      notePointerKind(kindOfPointerType(event.pointerType));
+      if (event.pointerType !== "mouse") return;
       // Capture pointer to receive events even when cursor leaves canvas.
       // Guarded: throws InvalidStateError if the pointer was released before
       // this handler ran (fast tap, synthetic events, etc.) — safe to ignore.
@@ -1576,7 +1580,7 @@ export default function App() {
       // host-release suppression so lock can be re-acquired.
       userReleasedLockRef.current = false;
       // If cursor is hidden by guest, request pointer lock (user click = valid gesture)
-      if (wantsPointerLockRef.current && !pointerLockedRef.current) {
+      if (relativeIntent.get() && !pointerLockedRef.current) {
         requestPointerLockSafe(canvas);
         // Still forward this click — before pointer lock is acquired, absolute coords
         // are still valid (pointermove has been syncing them). Without forwarding,
@@ -1591,6 +1595,7 @@ export default function App() {
     };
 
     const handlePointerUp = (event: PointerEvent) => {
+      if (event.pointerType !== "mouse") return;
       // Release capture (usually automatic, but be explicit)
       if (canvas.hasPointerCapture(event.pointerId)) {
         canvas.releasePointerCapture(event.pointerId);
@@ -1629,12 +1634,11 @@ export default function App() {
 
       const scaleX = width / rect.width;
       const scaleY = height / rect.height;
-      const x = Math.max(0, Math.min(width, (event.clientX - rect.left) * scaleX));
-      const y = Math.max(0, Math.min(height, (event.clientY - rect.top) * scaleY));
-
-      beginInputWrite(inputView);
-      inputView[INPUT_INDEX.mouseX] = Math.round(x);
-      inputView[INPUT_INDEX.mouseY] = Math.round(y);
+      inputDevice.setPointerBounds(width, height);
+      inputDevice.setPointerAbsolute(
+        (event.clientX - rect.left) * scaleX,
+        (event.clientY - rect.top) * scaleY,
+      );
       // Normalize deltaY to CSS pixel equivalent regardless of deltaMode:
       //   DOM_DELTA_PIXEL (0): use as-is (~100px per notch → InputManager * 1.2 ≈ 120 WHEEL_DELTA)
       //   DOM_DELTA_LINE  (1): ~33px per line; 3 lines/notch → 99px → * 1.2 ≈ 120
@@ -1645,27 +1649,10 @@ export default function App() {
         case 2: pixelDelta = event.deltaY * 500; break; // DOM_DELTA_PAGE
         default: pixelDelta = event.deltaY;              // DOM_DELTA_PIXEL
       }
-      inputView[INPUT_INDEX.mouseWheel] = Math.round(pixelDelta);
-      endInputWrite(inputView);
-      globalWorker?.postMessage({ type: "input_tick" });
-      if (isRecording) {
-        recordedInputs.push({
-          t: performance.now() - recordStart,
-          mouseX: inputView[INPUT_INDEX.mouseX],
-          mouseY: inputView[INPUT_INDEX.mouseY],
-          buttons: inputView[INPUT_INDEX.buttons],
-          keyCode: inputView[INPUT_INDEX.keyCode],
-          keyState: inputView[INPUT_INDEX.keyState],
-          gamepadConnected: inputView[INPUT_INDEX.gamepadConnected],
-          gamepadButtons: inputView[INPUT_INDEX.gamepadButtons],
-          gamepadAxis0: inputView[INPUT_INDEX.gamepadAxis0],
-          gamepadAxis1: inputView[INPUT_INDEX.gamepadAxis1],
-          gamepadAxis2: inputView[INPUT_INDEX.gamepadAxis2],
-          gamepadAxis3: inputView[INPUT_INDEX.gamepadAxis3],
-          mouseWheel: inputView[INPUT_INDEX.mouseWheel],
-        });
-      }
-      
+      inputDevice.addWheel(pixelDelta);
+      inputDevice.commit({ immediate: true });
+      recordSample(inputView);
+
       // Prevent default scrolling behavior when over canvas
       event.preventDefault();
     };
@@ -1685,29 +1672,15 @@ export default function App() {
     const handlePointerLockChange = () => {
       pointerLockedRef.current = document.pointerLockElement === canvas;
       if (pointerLockedRef.current) {
-        const iv = globalInputView;
-        if (iv) {
-          // Seed from the last absolute position already in the SAB
-          virtualMouseRef.current = {
-            x: iv[INPUT_INDEX.mouseX],
-            y: iv[INPUT_INDEX.mouseY],
-          };
-        } else {
-          // Fallback: center of guest resolution
-          const guest = guestResolutionRef.current;
-          virtualMouseRef.current = {
-            x: Math.round(guest.width / 2),
-            y: Math.round(guest.height / 2),
-          };
-        }
-        // No SAB write needed — position hasn't changed
+        // The device already holds the last absolute position, which is exactly the
+        // seed we want; nothing to publish because the position has not changed.
       } else {
         // Lock was lost (commonly ESC, which is also Unreal's menu key — the browser
         // force-exits lock on ESC). If the guest still wants relative mouse and the user did
         // NOT deliberately release via Right Ctrl, arm a re-acquire. handlePointerDown
         // re-requests on the next click (the reliable gesture); we also opportunistically
         // attempt on the next pointermove via writePointer.
-        if (wantsPointerLockRef.current && !userReleasedLockRef.current) {
+        if (relativeIntent.get() && !userReleasedLockRef.current) {
           // ESC force-exit briefly rejects re-acquire; cooldown gates the click/move retries.
           pointerLockCooldownRef.current = true;
           setTimeout(() => { pointerLockCooldownRef.current = false; }, 32);
@@ -1722,19 +1695,14 @@ export default function App() {
     };
     window.addEventListener("pointerdown", unlockAudio, { passive: true });
 
-    // Clear all pressed keys on focus loss to prevent stuck keys
+    // Nothing any producer holds may survive focus loss — a key or button still down
+    // when the tab goes away has no release event coming.
     const handleBlur = () => {
-      pressedKeys.clear();
-      const inputView = globalInputView;
-      if (inputView) {
-        beginInputWrite(inputView);
-        syncKeyBitfield(inputView); // all zeros
-        inputView[INPUT_INDEX.buttons] = 0; // mouse buttons too
-        inputView[INPUT_INDEX.keyCode] = 0;
-        inputView[INPUT_INDEX.keyState] = 0;
-        endInputWrite(inputView);
-        globalWorker?.postMessage({ type: "input_tick" });
-      }
+      inputDevice.releaseAllSources();
+      touchControlsRef.current?.releaseAll();
+      // Losing focus releases what was held; it does not unplug the controller.
+      assertVirtualPad();
+      inputDevice.commit({ immediate: true });
     };
     const handleVisibilityChange = () => {
       if (document.hidden) handleBlur();
@@ -1811,23 +1779,17 @@ export default function App() {
     };
 
     const applyInputSample = (sample: InputSample) => {
-      const inputView = globalInputView;
-      if (!inputView) return;
-      beginInputWrite(inputView);
-      inputView[INPUT_INDEX.mouseX] = sample.mouseX;
-      inputView[INPUT_INDEX.mouseY] = sample.mouseY;
-      inputView[INPUT_INDEX.buttons] = sample.buttons;
-      inputView[INPUT_INDEX.keyCode] = sample.keyCode;
-      inputView[INPUT_INDEX.keyState] = sample.keyState;
-      inputView[INPUT_INDEX.gamepadConnected] = sample.gamepadConnected;
-      inputView[INPUT_INDEX.gamepadButtons] = sample.gamepadButtons;
-      inputView[INPUT_INDEX.gamepadAxis0] = sample.gamepadAxis0;
-      inputView[INPUT_INDEX.gamepadAxis1] = sample.gamepadAxis1;
-      inputView[INPUT_INDEX.gamepadAxis2] = sample.gamepadAxis2;
-      inputView[INPUT_INDEX.gamepadAxis3] = sample.gamepadAxis3;
-      inputView[INPUT_INDEX.mouseWheel] = sample.mouseWheel ?? 0;
-      endInputWrite(inputView);
-      globalWorker?.postMessage({ type: "input_tick" });
+      if (!globalInputView) return;
+      inputDevice.setPointerAbsolute(sample.mouseX, sample.mouseY);
+      inputDevice.setButtonsMask(sample.buttons, "replay");
+      if (sample.keyCode) inputDevice.setKey(sample.keyCode, sample.keyState === 1, "replay");
+      inputDevice.publishPad({
+        connected: sample.gamepadConnected === 1,
+        buttons: sample.gamepadButtons,
+        axes: [sample.gamepadAxis0, sample.gamepadAxis1, sample.gamepadAxis2, sample.gamepadAxis3],
+      }, "replay");
+      if (sample.mouseWheel) inputDevice.addWheel(sample.mouseWheel);
+      inputDevice.commit({ immediate: true });
     };
 
     (window as any).startRecording = () => {
@@ -2055,8 +2017,10 @@ export default function App() {
     return () => {
       window.removeEventListener("resize", resize);
       window.visualViewport?.removeEventListener("resize", resize);
+      window.visualViewport?.removeEventListener("scroll", resize);
       document.removeEventListener("fullscreenchange", resize);
       resizeObserver.disconnect();
+      detachTouch();
       canvas.removeEventListener("pointermove", writePointer);
       canvas.removeEventListener("pointerdown", handlePointerDown);
       canvas.removeEventListener("pointerup", handlePointerUp);
@@ -2135,14 +2099,12 @@ export default function App() {
           axes[3] !== lastGamepadAxes[3];
 
         if (changed) {
-          beginInputWrite(inputView);
-          inputView[INPUT_INDEX.gamepadConnected] = connected;
-          inputView[INPUT_INDEX.gamepadButtons] = buttonsMask;
-          inputView[INPUT_INDEX.gamepadAxis0] = axes[0];
-          inputView[INPUT_INDEX.gamepadAxis1] = axes[1];
-          inputView[INPUT_INDEX.gamepadAxis2] = axes[2];
-          inputView[INPUT_INDEX.gamepadAxis3] = axes[3];
-          endInputWrite(inputView);
+          inputDevice.publishPad({
+            connected: connected === 1,
+            buttons: buttonsMask,
+            axes: [axes[0], axes[1], axes[2], axes[3]],
+          }, "hw-pad");
+          inputDevice.commit({ immediate: true });
           lastGamepadConnected = connected;
           lastGamepadButtons = buttonsMask;
           lastGamepadAxes = axes;
@@ -2248,6 +2210,49 @@ export default function App() {
     }
   }, [isPaused]);
 
+  // A running game is not user activity as far as the OS is concerned, so the screen
+  // dims mid-session on a phone or tablet. The lock is dropped by the browser on tab
+  // hide and must be re-taken when we come back.
+  useEffect(() => {
+    if (workerStatus !== "ready" || isPaused) return;
+    const nav = navigator as Navigator & {
+      wakeLock?: { request: (type: "screen") => Promise<{ release: () => Promise<void> }> };
+    };
+    if (!nav.wakeLock) return;
+
+    let sentinel: { release: () => Promise<void> } | null = null;
+    let cancelled = false;
+    const acquire = () => {
+      if (cancelled || document.hidden) return;
+      nav.wakeLock!.request("screen")
+        .then((s) => { if (cancelled) void s.release(); else sentinel = s; })
+        .catch(() => { /* denied (battery saver, no gesture yet) — not worth surfacing */ });
+    };
+    acquire();
+    const onVisible = () => { if (!document.hidden) acquire(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      cancelled = true;
+      document.removeEventListener("visibilitychange", onVisible);
+      void sentinel?.release().catch(() => {});
+    };
+  }, [workerStatus, isPaused]);
+
+  const handleHostAction = useCallback((action: HostAction) => {
+    switch (action) {
+      case "fullscreen": toggleFullscreenRef.current(); break;
+      case "pause": setIsPaused((p) => !p); break;
+      case "keyboard": setOskOpen((v) => !v); break;
+      case "toggleControls": setControlsHidden((v) => !v); break;
+      case "releaseRelative":
+        // The touch equivalent of Right Ctrl: give the cursor back without a keyboard.
+        userReleasedLockRef.current = true;
+        if (document.pointerLockElement) document.exitPointerLock();
+        break;
+      case "editLayout": break;
+    }
+  }, []);
+
   const toggleFullscreen = useCallback(async () => {
     const panel = panelRef.current;
     const target = panel ?? canvasRef.current;
@@ -2260,6 +2265,13 @@ export default function App() {
     const element = target as HTMLElement & {
       webkitRequestFullscreen?: () => Promise<void> | void;
     };
+
+    // iPhone Safari has no element Fullscreen API at all. Fall back to an immersive
+    // CSS mode rather than resolving to undefined and appearing to do nothing.
+    if (!target.requestFullscreen && !element.webkitRequestFullscreen) {
+      setImmersive((v) => !v);
+      return;
+    }
 
     try {
       if (doc.fullscreenElement || doc.webkitFullscreenElement) {
@@ -2276,6 +2288,12 @@ export default function App() {
       } else {
         await element.webkitRequestFullscreen?.();
       }
+      // These games are landscape. Best-effort: unimplemented on iOS Safari and
+      // rejected on Android outside real fullscreen, and neither is an error here.
+      const orientation = screen.orientation as ScreenOrientation & {
+        lock?: (o: string) => Promise<void>;
+      };
+      void orientation?.lock?.("landscape").catch(() => {});
     } catch (err) {
       setErrorMessage(`Fullscreen failed: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -2359,6 +2377,7 @@ export default function App() {
           unsupportedMessage={browserUnsupportedMessage}
         />
         {settingsDrawer}
+        <VirtualKeyboardSheet open={oskOpen} onClose={() => setOskOpen(false)} />
         <StorageManagerModal isOpen={storageOpen} onClose={() => setStorageOpen(false)} />
         <WgbWizardModal
           isOpen={addGameOpen}
@@ -2512,7 +2531,7 @@ export default function App() {
 
   return (
     <div
-      className={cx(s, "app", uiSettings.lockFullscreenAspect ? "app--fullscreen-aspect-lock" : "app--fullscreen-aspect-free", uiSettings.integerScaling && "app--fullscreen-integer")}
+      className={cx(s, "app", uiSettings.lockFullscreenAspect ? "app--fullscreen-aspect-lock" : "app--fullscreen-aspect-free", uiSettings.integerScaling && "app--fullscreen-integer", immersive && "app--immersive")}
       style={
         {
           ["--fullscreen-aspect-w" as string]: String(fullscreenAspect.w),
@@ -2611,7 +2630,25 @@ export default function App() {
           className={cx(s, "app__canvas", uiSettings.canvasFiltering === "pixelated" && "app__canvas--pixelated")}
           style={{ aspectRatio: `${guestResolution.width} / ${guestResolution.height}` }}
         />
+        {workerStatus === "ready" && showTouchControls && (
+          <TouchControlLayer
+            ref={touchControlsRef}
+            layout={activeLayout.layout}
+            getPointerScale={guestPerCss}
+            sensitivity={uiSettings.touchSensitivity}
+            idleFade={uiSettings.touchIdleFade}
+          />
+        )}
         {workerStatus === "ready" && <InputStatusOverlay status={inputStatus} />}
+        {workerStatus === "ready" && showTouchHud && (
+          <TouchHud onHostAction={handleHostAction} />
+        )}
+        {workerStatus === "ready" && (
+          <TouchFirstRunHint
+            active={showTouchControls}
+            trackpad={activeLayout.mode === "trackpad"}
+          />
+        )}
         {loadingProgress && !errorMessage && !exitInfo && (() => {
           const activeStage = loadPhaseStageIndex(loadingProgress.phase);
           const status = loadPhaseStatus(loadingProgress.phase, gameDisplayName);

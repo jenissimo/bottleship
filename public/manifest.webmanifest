@@ -1,0 +1,19 @@
+{
+  "name": "BottleShip",
+  "short_name": "BottleShip",
+  "description": "Play classic Windows games in the browser.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "landscape",
+  "background_color": "#080d10",
+  "theme_color": "#080d10",
+  "icons": [
+    {
+      "src": "/bottleship_logo.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

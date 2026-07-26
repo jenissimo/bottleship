@@ -6,13 +6,19 @@
   --fullscreen-integer-h: 480px;
   display: flex;
   flex-direction: column;
-  height: 100vh;
+  height: 100dvh;
   overflow: hidden;
+  overscroll-behavior: none;
 }
 
 .app__panel {
   flex: 1;
   position: relative;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
   min-height: 0;
   background: #000;
   display: flex;
@@ -26,6 +32,10 @@
   max-height: 100%;
   width: auto;
   height: auto;
+  /* Flex items default to min-*: auto, which floors them at the canvas's intrinsic
+     size — the height then clamps alone and the picture stretches. */
+  min-width: 0;
+  min-height: 0;
   background: #000;
   touch-action: none;
   position: relative;
@@ -58,6 +68,18 @@
 }
 
 /* Fullscreen */
+.app--immersive .app__panel {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+}
+
+.app--immersive .emu-topbar,
+.app--immersive .emu-info-strip {
+  display: none;
+}
+
+.app--immersive .app__panel,
 .app__panel:fullscreen,
 .app__panel:-webkit-full-screen {
   padding: 0;
@@ -69,6 +91,7 @@
   justify-content: center;
 }
 
+.app--immersive.app--fullscreen-aspect-lock .app__panel .app__canvas,
 .app--fullscreen-aspect-lock .app__panel:fullscreen .app__canvas,
 .app--fullscreen-aspect-lock .app__panel:-webkit-full-screen .app__canvas {
   width: min(100vw, calc(100dvh * (var(--fullscreen-aspect-w) / var(--fullscreen-aspect-h)))) !important;
@@ -77,6 +100,7 @@
   border-radius: 0;
 }
 
+.app--immersive.app--fullscreen-aspect-free .app__panel .app__canvas,
 .app--fullscreen-aspect-free .app__panel:fullscreen .app__canvas,
 .app--fullscreen-aspect-free .app__panel:-webkit-full-screen .app__canvas {
   width: 100vw !important;
@@ -85,12 +109,14 @@
   border-radius: 0;
 }
 
+.app--immersive.app--fullscreen-integer .app__panel .app__canvas,
 .app--fullscreen-integer .app__panel:fullscreen .app__canvas,
 .app--fullscreen-integer .app__panel:-webkit-full-screen .app__canvas {
   width: var(--fullscreen-integer-w) !important;
   height: var(--fullscreen-integer-h) !important;
 }
 
+.app--immersive .app__warning,
 .app__panel:fullscreen .app__warning,
 .app__panel:-webkit-full-screen .app__warning {
   display: none;
@@ -446,7 +472,7 @@
   font-weight: 600;
 }
 
-@media (max-width: 720px) {
+@media (max-width: 720px) and (orientation: portrait) {
   .app {
     padding-bottom: max(12px, env(safe-area-inset-bottom));
   }
@@ -454,6 +480,25 @@
   .app__canvas {
     height: 52dvh;
     min-height: 220px;
+  }
+}
+
+@media (max-height: 560px) and (orientation: landscape) {
+  .app__panel {
+    padding: env(safe-area-inset-top) env(safe-area-inset-right)
+             env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+
+  .app__canvas {
+    max-height: 100%;
+  }
+}
+
+/* A fixed, full-screen background repaints on every scroll/resize on mobile and
+   steals compositor budget from the frame loop. */
+@media (pointer: coarse) {
+  .app {
+    background-attachment: scroll;
   }
 }
 

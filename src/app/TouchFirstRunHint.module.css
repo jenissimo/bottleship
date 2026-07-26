@@ -1,0 +1,41 @@
+/* Sits above the control layer (3) and the status chip (4), below modals. */
+.hint {
+  position: absolute;
+  left: 50%;
+  bottom: max(16px, env(safe-area-inset-bottom, 0px));
+  transform: translateX(-50%);
+  z-index: 6;
+  max-width: min(92%, 420px);
+  padding: 12px 16px;
+  border-radius: var(--r-md, 10px);
+  border: 1px solid var(--line-2, #23404c);
+  background: rgba(7, 13, 17, 0.92);
+  backdrop-filter: blur(10px);
+  box-shadow: var(--sh-2, 0 12px 30px rgba(0, 0, 0, 0.5));
+  color: var(--fg-1, #e9f4f4);
+  animation: hint-in 220ms ease-out;
+}
+
+.hint__list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: var(--fs-sm, 0.82rem);
+  line-height: 1.6;
+}
+
+.hint__dismiss {
+  display: block;
+  margin-top: 8px;
+  font-size: var(--fs-xs, 0.72rem);
+  color: var(--fg-3, #7f97a3);
+  text-align: center;
+}
+
+@keyframes hint-in {
+  from { opacity: 0; transform: translate(-50%, 8px); }
+  to { opacity: 1; transform: translate(-50%, 0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hint { animation: none; }
+}
