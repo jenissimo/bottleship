@@ -1,6 +1,7 @@
 import { System } from "../../core/system";
 import { Mem } from "../../core/memory/mem-accessor";
 import { Logger, LogCategory } from "../../core/logger";
+import { DirectDrawSurfaceObject } from "./com-objects";
 
 export const bytesToGuid = (bytes: Uint8Array): string => {
     const data1 = (bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24)) >>> 0;
@@ -133,4 +134,25 @@ export const readBytesAbs = (mem: Uint8Array, abs: number, length: number): Uint
     const r = absToRel(mem, abs);
     if (r < 0 || r + length > mem.length) return null;
     return mem.subarray(r, r + length);
+};
+
+/**
+ * Typed surface lookup. COM object addresses are recycled: once a surface is
+ * released its slot can be handed to a device / execute buffer / texture, so a
+ * cached address (ctx.surfaces.primary, an attached-surface link, a mip parent)
+ * may resolve to an object that is NOT a surface. Casting blindly and calling
+ * getState() throws deep inside an unrelated call. Resolve through this instead.
+ */
+export const surfaceAt = (
+    provider: { getComObjectByAddress(addr: number): unknown },
+    addr: number,
+): DirectDrawSurfaceObject | null => {
+    if (!addr) return null;
+    const obj = provider.getComObjectByAddress(addr);
+    if (obj instanceof DirectDrawSurfaceObject) return obj;
+    if (obj) {
+        Logger.verbose(LogCategory.DDRAW,
+            `surfaceAt: 0x${addr.toString(16)} now holds ${obj.constructor.name}, not a surface`);
+    }
+    return null;
 };

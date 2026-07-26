@@ -11,7 +11,21 @@
 import { OpenGLFrameInput } from "./opengl-types";
 import { OpenGLPipelineConfig, pipelineConfigKey } from "./opengl-pipeline-factory";
 import { EmulatorConfig } from "../../../core/emulator-config-manager";
-import { GLCommand, GLDrawCommand, GLDrawCommandType, GLTextureObject, VERT_FLOATS } from "../../../modules/opengl32/context";
+import {
+    GLCommandStream, GLDrawCommandType, GLTextureObject, VERT_FLOATS,
+    CMD_I32, CMD_F32, CI_TYPE,
+    CI_MODE, CI_VERT_OFFSET, CI_VERT_COUNT, CI_FLAGS, CI_DEPTH_FUNC, CI_BLEND_SRC, CI_BLEND_DST,
+    CI_ALPHA_FUNC, CI_CULL_FACE, CI_FRONT_FACE, CI_TEX_ID0, CI_TEX_ID1, CI_TEXENV0, CI_TEXENV1,
+    CI_FOG_MODE, CI_POLYGON_MODE, CI_STENCIL_FUNC, CI_STENCIL_REF, CI_STENCIL_MASK,
+    CI_STENCIL_FAIL, CI_STENCIL_ZFAIL, CI_STENCIL_ZPASS, CI_STENCIL_WRITE_MASK,
+    CI_SCISSOR_X, CI_SCISSOR_Y, CI_SCISSOR_W, CI_SCISSOR_H, CI_VP_X, CI_VP_Y, CI_VP_W, CI_VP_H,
+    CI_CLEAR_MASK, CI_CLEAR_STENCIL,
+    CF_ALPHA_REF, CF_FOG_R, CF_FOG_G, CF_FOG_B, CF_FOG_A, CF_FOG_DENSITY, CF_FOG_START, CF_FOG_END,
+    CF_DEPTH_RANGE_NEAR, CF_DEPTH_RANGE_FAR,
+    CF_CLEAR_R, CF_CLEAR_G, CF_CLEAR_B, CF_CLEAR_A, CF_CLEAR_DEPTH,
+    DF_DEPTH_TEST, DF_DEPTH_MASK, DF_BLEND, DF_ALPHA_TEST, DF_CULL, DF_FOG,
+    DF_COLOR_MASK_R, DF_COLOR_MASK_G, DF_COLOR_MASK_B, DF_COLOR_MASK_A, DF_STENCIL_TEST, DF_SCISSOR,
+} from "../../../modules/opengl32/context";
 import {
     GL_ADD,
     GL_ALWAYS,
@@ -91,6 +105,14 @@ interface PreparedDrawData {
     byteLength: number;
 }
 
+/** Vertices selected for a draw: a (buffer, first-vertex, count) window. */
+interface SelectedVertices {
+    data: Float32Array;
+    first: number;
+    count: number;
+    topology: OpenGLTopology;
+}
+
 const VERTEX_FLOAT_STRIDE = 12; // pos.xyz + color.rgba + uv0.xy + uv1.xy + pad
 const VERTEX_BYTE_STRIDE = VERTEX_FLOAT_STRIDE * 4;
 const UNIFORM_BLOCK_SIZE = 96;
@@ -126,6 +148,8 @@ export class OpenGLBackendExecutor {
     private vertexBufferSize = 0;
     private vertexUploadCursor = 0;
     private vertexScratch = new Float32Array(0);
+    /** Staging for polygon-mode wireframe / line-loop closing expansions. */
+    private expandScratch = new Float32Array(0);
 
     private uniformBuffer: GPUBuffer | null = null;
     private uniformStride = 256;
@@ -222,19 +246,25 @@ export class OpenGLBackendExecutor {
             return renderPass;
         };
 
-        for (const command of input.commands) {
-            switch (command.type) {
+        const stream = input.commands;
+        const I = stream.i32;
+        const F = stream.f32;
+
+        for (let c = 0; c < stream.count; c++) {
+            const i = c * CMD_I32;
+            const f = c * CMD_F32;
+            switch (I[i + CI_TYPE]) {
                 case GLDrawCommandType.CLEAR: {
                     endPass();
                     if (this.encodeClearPass(
                         encoder,
-                        command.mask,
-                        command.r,
-                        command.g,
-                        command.b,
-                        command.a,
-                        command.depth,
-                        command.stencil,
+                        I[i + CI_CLEAR_MASK] >>> 0,
+                        F[f + CF_CLEAR_R],
+                        F[f + CF_CLEAR_G],
+                        F[f + CF_CLEAR_B],
+                        F[f + CF_CLEAR_A],
+                        F[f + CF_CLEAR_DEPTH],
+                        I[i + CI_CLEAR_STENCIL] >>> 0,
                         colorHasContent,
                         depthStencilHasContent,
                     )) {
@@ -244,18 +274,23 @@ export class OpenGLBackendExecutor {
                     break;
                 }
                 case GLDrawCommandType.DRAW: {
-                    const cmd = command as GLDrawCommand;
-                    if (cmd.vertCount <= 0) break;
-                    if (cmd.cullEnabled && cmd.cullFace === GL_FRONT_AND_BACK) break;
+                    const vertCount = I[i + CI_VERT_COUNT];
+                    if (vertCount <= 0) break;
+                    const flags = I[i + CI_FLAGS];
+                    const cullEnabled = (flags & DF_CULL) !== 0;
+                    const cullFace = I[i + CI_CULL_FACE] >>> 0;
+                    if (cullEnabled && cullFace === GL_FRONT_AND_BACK) break;
 
-                    const prepared = this.prepareDrawData(cmd);
+                    const prepared = this.prepareDrawData(
+                        input.vertArena, I[i + CI_VERT_OFFSET], vertCount,
+                        I[i + CI_MODE] >>> 0, I[i + CI_POLYGON_MODE] >>> 0);
                     if (!prepared || prepared.vertexCount <= 0) break;
 
                     const vertexOffset = this.uploadVertices(queue, prepared.data, prepared.byteLength);
                     if (vertexOffset < 0) break;
 
-                    const tex0 = this.resolveTexture(device, queue, input.textures, cmd.textureId0);
-                    const tex1 = this.resolveTexture(device, queue, input.textures, cmd.textureId1);
+                    const tex0 = this.resolveTexture(device, queue, input.textures, I[i + CI_TEX_ID0]);
+                    const tex1 = this.resolveTexture(device, queue, input.textures, I[i + CI_TEX_ID1]);
                     const useTex0 = !!tex0;
                     const useTex1 = !!tex1;
 
@@ -273,55 +308,50 @@ export class OpenGLBackendExecutor {
                     const uniformOffset = this.allocateUniformSlot();
                     if (uniformOffset < 0) break;
 
-                    this.writeUniforms(
-                        queue,
-                        uniformOffset,
-                        renderW,
-                        renderH,
-                        cmd,
-                        useTex0,
-                        useTex1,
-                    );
+                    this.writeUniforms(queue, uniformOffset, renderW, renderH, I, F, i, f, useTex0, useTex1);
 
+                    const stencilTest = (flags & DF_STENCIL_TEST) !== 0;
                     const pipelineCfg: OpenGLPipelineConfig = {
                         topology: prepared.topology,
-                        blendEnabled: cmd.blendEnabled,
-                        blendSrc: cmd.blendSrc,
-                        blendDst: cmd.blendDst,
-                        depthTest: cmd.depthTest,
-                        depthWrite: cmd.depthMask,
-                        depthFunc: cmd.depthFunc,
-                        cullEnabled: cmd.cullEnabled,
-                        cullFace: cmd.cullFace,
-                        frontFace: cmd.frontFace,
-                        colorMaskR: cmd.colorMaskR,
-                        colorMaskG: cmd.colorMaskG,
-                        colorMaskB: cmd.colorMaskB,
-                        colorMaskA: cmd.colorMaskA,
-                        stencilTest: cmd.stencilTest,
-                        stencilFunc: cmd.stencilFunc,
-                        stencilMask: cmd.stencilMask,
-                        stencilWriteMask: cmd.stencilWriteMask,
-                        stencilFail: cmd.stencilFail,
-                        stencilZFail: cmd.stencilZFail,
-                        stencilZPass: cmd.stencilZPass,
+                        blendEnabled: (flags & DF_BLEND) !== 0,
+                        blendSrc: I[i + CI_BLEND_SRC] >>> 0,
+                        blendDst: I[i + CI_BLEND_DST] >>> 0,
+                        depthTest: (flags & DF_DEPTH_TEST) !== 0,
+                        depthWrite: (flags & DF_DEPTH_MASK) !== 0,
+                        depthFunc: I[i + CI_DEPTH_FUNC] >>> 0,
+                        cullEnabled,
+                        cullFace,
+                        frontFace: I[i + CI_FRONT_FACE] >>> 0,
+                        colorMaskR: (flags & DF_COLOR_MASK_R) !== 0,
+                        colorMaskG: (flags & DF_COLOR_MASK_G) !== 0,
+                        colorMaskB: (flags & DF_COLOR_MASK_B) !== 0,
+                        colorMaskA: (flags & DF_COLOR_MASK_A) !== 0,
+                        stencilTest,
+                        stencilFunc: I[i + CI_STENCIL_FUNC] >>> 0,
+                        stencilMask: I[i + CI_STENCIL_MASK] >>> 0,
+                        stencilWriteMask: I[i + CI_STENCIL_WRITE_MASK] >>> 0,
+                        stencilFail: I[i + CI_STENCIL_FAIL] >>> 0,
+                        stencilZFail: I[i + CI_STENCIL_ZFAIL] >>> 0,
+                        stencilZPass: I[i + CI_STENCIL_ZPASS] >>> 0,
                     };
 
                     const pipeline = this.getOrCreatePipeline(device, pipelineCfg);
                     const bindGroup = this.getOrCreateBindGroup(device, sampler0, view0, sampler1, view1);
                     const pass = beginDrawPass();
-                    if (!this.applyScissor(pass, cmd, renderW, renderH)) break;
+                    if (!this.applyScissor(pass, I, i, flags, renderW, renderH)) break;
 
                     // OpenGL Y-up → WebGPU Y-down; render at the app's viewport resolution.
-                    const vpW = cmd.vpW > 0 ? cmd.vpW : renderW;
-                    const vpH = cmd.vpH > 0 ? cmd.vpH : renderH;
-                    const vpX = cmd.vpX;
-                    const vpY = renderH - cmd.vpY - vpH;
-                    pass.setViewport(vpX, vpY, vpW, vpH, cmd.depthRangeNear, cmd.depthRangeFar);
+                    const cmdVpW = I[i + CI_VP_W];
+                    const cmdVpH = I[i + CI_VP_H];
+                    const vpW = cmdVpW > 0 ? cmdVpW : renderW;
+                    const vpH = cmdVpH > 0 ? cmdVpH : renderH;
+                    const vpX = I[i + CI_VP_X];
+                    const vpY = renderH - I[i + CI_VP_Y] - vpH;
+                    pass.setViewport(vpX, vpY, vpW, vpH, F[f + CF_DEPTH_RANGE_NEAR], F[f + CF_DEPTH_RANGE_FAR]);
 
                     pass.setPipeline(pipeline);
-                    if (cmd.stencilTest) {
-                        pass.setStencilReference(cmd.stencilRef >>> 0);
+                    if (stencilTest) {
+                        pass.setStencilReference(I[i + CI_STENCIL_REF] >>> 0);
                     }
                     pass.setBindGroup(0, bindGroup, [uniformOffset]);
                     pass.setVertexBuffer(0, this.vertexBuffer!, vertexOffset, prepared.byteLength);
@@ -358,16 +388,10 @@ export class OpenGLBackendExecutor {
                 this.compositeStatsOverlay(targetView, encoder, screenW, screenH);
                 queue.submit([encoder.finish()]);
                 this.offscreenInitialized = false;
-                const cmdSummary = input.commands.map(c => {
-                    if (c.type === GLDrawCommandType.CLEAR) return `CLEAR(m=0x${(c as any).mask?.toString(16)})`;
-                    if (c.type === GLDrawCommandType.VIEWPORT) return `VP(${(c as any).w}x${(c as any).h})`;
-                    if (c.type === GLDrawCommandType.SCISSOR) return `SCISSOR`;
-                    if (c.type === GLDrawCommandType.DRAW) return `DRAW(v=${(c as any).vertCount})`;
-                    return `?${(c as any).type}`;
-                }).join(',');
                 Logger.log(
                     LogCategory.SYSTEM,
-                    `OpenGL fallback present: tex=${fallbackTex.id} ${fallbackTex.width}x${fallbackTex.height} draws=0 cmds=${input.commands.length} [${cmdSummary}]`,
+                    `OpenGL fallback present: tex=${fallbackTex.id} ${fallbackTex.width}x${fallbackTex.height} draws=0 ` +
+                    `cmds=${stream.count} [${this.summarizeCommands(stream)}]`,
                 );
                 return;
             }
@@ -398,7 +422,7 @@ export class OpenGLBackendExecutor {
 
         Logger.verbose(
             LogCategory.SYSTEM,
-            `OpenGL frame: cmds=${input.commands.length} draws=${drawCount} viewport=${input.viewportW}x${input.viewportH}`,
+            `OpenGL frame: cmds=${stream.count} draws=${drawCount} viewport=${input.viewportW}x${input.viewportH}`,
         );
     }
 
@@ -596,26 +620,55 @@ export class OpenGLBackendExecutor {
         }
     }
 
-    private countDrawCommands(commands: GLCommand[]): number {
+    private countDrawCommands(stream: GLCommandStream): number {
         let count = 0;
-        for (const cmd of commands) {
-            if (cmd.type === GLDrawCommandType.DRAW) count++;
+        for (let c = 0; c < stream.count; c++) {
+            if (stream.i32[c * CMD_I32 + CI_TYPE] === GLDrawCommandType.DRAW) count++;
         }
         return count;
     }
 
-    private estimateVertexBytes(commands: GLCommand[]): number {
+    private estimateVertexBytes(stream: GLCommandStream): number {
+        const I = stream.i32;
         let totalVertices = 0;
-        for (const cmd of commands) {
-            if (cmd.type !== GLDrawCommandType.DRAW) continue;
-            let count = cmd.vertCount;
-            if (cmd.mode === GL_LINE_LOOP) count += 1;
-            if (cmd.polygonMode === GL_LINE && this.isTriangleLikeMode(cmd.mode)) {
+        for (let c = 0; c < stream.count; c++) {
+            const i = c * CMD_I32;
+            if (I[i + CI_TYPE] !== GLDrawCommandType.DRAW) continue;
+            const mode = I[i + CI_MODE] >>> 0;
+            let count = I[i + CI_VERT_COUNT];
+            if (mode === GL_LINE_LOOP) count += 1;
+            if ((I[i + CI_POLYGON_MODE] >>> 0) === GL_LINE && this.isTriangleLikeMode(mode)) {
                 count *= 2;
             }
             totalVertices += count;
         }
         return Math.max(1, totalVertices * VERTEX_BYTE_STRIDE);
+    }
+
+    private summarizeCommands(stream: GLCommandStream): string {
+        const I = stream.i32;
+        const parts: string[] = [];
+        for (let c = 0; c < stream.count; c++) {
+            const i = c * CMD_I32;
+            switch (I[i + CI_TYPE]) {
+                case GLDrawCommandType.CLEAR:
+                    parts.push(`CLEAR(m=0x${(I[i + CI_CLEAR_MASK] >>> 0).toString(16)})`);
+                    break;
+                case GLDrawCommandType.VIEWPORT:
+                    parts.push(`VP(${I[i + CI_VP_W]}x${I[i + CI_VP_H]})`);
+                    break;
+                case GLDrawCommandType.SCISSOR:
+                    parts.push('SCISSOR');
+                    break;
+                case GLDrawCommandType.DRAW:
+                    parts.push(`DRAW(v=${I[i + CI_VERT_COUNT]})`);
+                    break;
+                default:
+                    parts.push(`?${I[i + CI_TYPE]}`);
+                    break;
+            }
+        }
+        return parts.join(',');
     }
 
     private ensureUniformCapacity(device: GPUDevice, drawCount: number): void {
@@ -670,21 +723,27 @@ export class OpenGLBackendExecutor {
         return offset;
     }
 
-    private prepareDrawData(cmd: GLDrawCommand): PreparedDrawData | null {
-        const selected = this.selectFlatVertices(cmd);
+    private prepareDrawData(
+        arena: Float32Array,
+        vertOffset: number,
+        vertCount: number,
+        mode: number,
+        polygonMode: number,
+    ): PreparedDrawData | null {
+        const selected = this.selectFlatVertices(arena, vertOffset, vertCount, mode, polygonMode);
         if (!selected || selected.count <= 0) return null;
 
-        const vertexCount = selected.count;
-        const floatCount = vertexCount * VERTEX_FLOAT_STRIDE;
+        const count = selected.count;
+        const floatCount = count * VERTEX_FLOAT_STRIDE;
         if (this.vertexScratch.length < floatCount) {
             this.vertexScratch = new Float32Array(this.nextPow2(floatCount));
         }
         const out = this.vertexScratch.subarray(0, floatCount);
 
         const src = selected.data;
+        let si = selected.first;
         let idx = 0;
-        for (let i = 0; i < vertexCount; i++) {
-            const si = i * VERT_FLOATS;
+        for (let i = 0; i < count; i++) {
             out[idx++] = src[si];       // clip.x
             out[idx++] = src[si+1];     // clip.y
             out[idx++] = src[si+2];     // clip.z
@@ -697,70 +756,81 @@ export class OpenGLBackendExecutor {
             out[idx++] = src[si+12];    // t0
             out[idx++] = src[si+13];    // s1
             out[idx++] = src[si+14];    // t1
+            si += VERT_FLOATS;
         }
 
         return {
             topology: selected.topology,
-            vertexCount,
+            vertexCount: count,
             data: out,
-            byteLength: vertexCount * VERTEX_BYTE_STRIDE,
+            byteLength: count * VERTEX_BYTE_STRIDE,
         };
     }
 
-    private selectFlatVertices(cmd: GLDrawCommand): { data: Float32Array; count: number; topology: OpenGLTopology } | null {
-        let topology: OpenGLTopology = "triangle-list";
-        let data = cmd.vertData;
-        let count = cmd.vertCount;
+    /** Scratch big enough for `floats`, preserving nothing. */
+    private expandBuffer(floats: number): Float32Array {
+        if (this.expandScratch.length < floats) {
+            this.expandScratch = new Float32Array(this.nextPow2(floats));
+        }
+        return this.expandScratch;
+    }
 
-        if (cmd.polygonMode === GL_LINE && this.isTriangleLikeMode(cmd.mode)) {
-            const triCount = (count / 3) | 0;
+    private selectFlatVertices(
+        arena: Float32Array,
+        vertOffset: number,
+        vertCount: number,
+        mode: number,
+        polygonMode: number,
+    ): SelectedVertices | null {
+        if (polygonMode === GL_LINE && this.isTriangleLikeMode(mode)) {
+            const triCount = (vertCount / 3) | 0;
             if (triCount <= 0) return null;
             const wireCount = triCount * 6;
-            const wire = new Float32Array(wireCount * VERT_FLOATS);
+            const wire = this.expandBuffer(wireCount * VERT_FLOATS);
             let wi = 0;
-            for (let i = 0; i + 2 < count; i += 3) {
-                const ai = i * VERT_FLOATS, bi = (i+1) * VERT_FLOATS, ci = (i+2) * VERT_FLOATS;
-                wire.set(data.subarray(ai, ai+VERT_FLOATS), (wi++) * VERT_FLOATS);
-                wire.set(data.subarray(bi, bi+VERT_FLOATS), (wi++) * VERT_FLOATS);
-                wire.set(data.subarray(bi, bi+VERT_FLOATS), (wi++) * VERT_FLOATS);
-                wire.set(data.subarray(ci, ci+VERT_FLOATS), (wi++) * VERT_FLOATS);
-                wire.set(data.subarray(ci, ci+VERT_FLOATS), (wi++) * VERT_FLOATS);
-                wire.set(data.subarray(ai, ai+VERT_FLOATS), (wi++) * VERT_FLOATS);
+            for (let i = 0; i + 2 < vertCount; i += 3) {
+                const a = vertOffset + i * VERT_FLOATS;
+                const b = a + VERT_FLOATS;
+                const c = b + VERT_FLOATS;
+                wi = this.copyVertTo(arena, a, wire, wi);
+                wi = this.copyVertTo(arena, b, wire, wi);
+                wi = this.copyVertTo(arena, b, wire, wi);
+                wi = this.copyVertTo(arena, c, wire, wi);
+                wi = this.copyVertTo(arena, c, wire, wi);
+                wi = this.copyVertTo(arena, a, wire, wi);
             }
-            data = wire;
-            count = wireCount;
-            topology = "line-list";
-        } else if (cmd.polygonMode === GL_POINT && this.isTriangleLikeMode(cmd.mode)) {
-            topology = "point-list";
-        } else {
-            switch (cmd.mode) {
-                case GL_POINTS:
-                    topology = "point-list";
-                    break;
-                case GL_LINES:
-                    topology = "line-list";
-                    break;
-                case GL_LINE_STRIP:
-                    topology = "line-strip";
-                    break;
-                case GL_LINE_LOOP: {
-                    if (count < 2) return null;
-                    // Append first vertex to close the loop
-                    const looped = new Float32Array((count + 1) * VERT_FLOATS);
-                    looped.set(data.subarray(0, count * VERT_FLOATS));
-                    looped.set(data.subarray(0, VERT_FLOATS), count * VERT_FLOATS);
-                    data = looped;
-                    count = count + 1;
-                    topology = "line-strip";
-                    break;
-                }
-                default:
-                    topology = "triangle-list";
-                    break;
-            }
+            return { data: wire, first: 0, count: wireCount, topology: "line-list" };
         }
 
-        return { data, count, topology };
+        if (polygonMode === GL_POINT && this.isTriangleLikeMode(mode)) {
+            return { data: arena, first: vertOffset, count: vertCount, topology: "point-list" };
+        }
+
+        switch (mode) {
+            case GL_POINTS:
+                return { data: arena, first: vertOffset, count: vertCount, topology: "point-list" };
+            case GL_LINES:
+                return { data: arena, first: vertOffset, count: vertCount, topology: "line-list" };
+            case GL_LINE_STRIP:
+                return { data: arena, first: vertOffset, count: vertCount, topology: "line-strip" };
+            case GL_LINE_LOOP: {
+                if (vertCount < 2) return null;
+                // Append the first vertex to close the loop.
+                const floats = (vertCount + 1) * VERT_FLOATS;
+                const looped = this.expandBuffer(floats);
+                for (let k = 0; k < vertCount * VERT_FLOATS; k++) looped[k] = arena[vertOffset + k];
+                this.copyVertTo(arena, vertOffset, looped, vertCount * VERT_FLOATS);
+                return { data: looped, first: 0, count: vertCount + 1, topology: "line-strip" };
+            }
+            default:
+                return { data: arena, first: vertOffset, count: vertCount, topology: "triangle-list" };
+        }
+    }
+
+    /** Copy one VERT_FLOATS vertex; returns the advanced destination index. */
+    private copyVertTo(src: Float32Array, s: number, dst: Float32Array, d: number): number {
+        for (let k = 0; k < VERT_FLOATS; k++) dst[d + k] = src[s + k];
+        return d + VERT_FLOATS;
     }
 
     private isTriangleLikeMode(mode: number): boolean {
@@ -1029,54 +1099,67 @@ export class OpenGLBackendExecutor {
         offset: number,
         _screenW: number,
         _screenH: number,
-        cmd: GLDrawCommand,
+        I: Int32Array,
+        F: Float32Array,
+        i: number,
+        f: number,
         useTex0: boolean,
         useTex1: boolean,
     ): void {
         this.uniformScratchF32.fill(0);
+        const flags = I[i + CI_FLAGS];
+        const vpW = I[i + CI_VP_W];
+        const vpH = I[i + CI_VP_H];
 
         // 0..16 — use the viewport dimensions that were active when vertices were
         // transformed (in transformVertices), NOT the canvas size. The vertex shader
         // reverses the viewport transform: ndcX = (pos.x / screen.x) * 2 - 1, so
         // screen.x must match the viewportW used in the JS-side viewport transform.
-        this.uniformScratchF32[0] = cmd.vpW > 0 ? cmd.vpW : _screenW;
-        this.uniformScratchF32[1] = cmd.vpH > 0 ? cmd.vpH : _screenH;
-        this.uniformScratchF32[2] = this.clamp01(cmd.alphaRef);
+        this.uniformScratchF32[0] = vpW > 0 ? vpW : _screenW;
+        this.uniformScratchF32[1] = vpH > 0 ? vpH : _screenH;
+        this.uniformScratchF32[2] = this.clamp01(F[f + CF_ALPHA_REF]);
 
         // 16..48 (u32s)
-        this.uniformScratchU32[4] = cmd.alphaFunc >>> 0;
-        this.uniformScratchU32[5] = cmd.texEnvMode0 >>> 0;
-        this.uniformScratchU32[6] = cmd.texEnvMode1 >>> 0;
-        this.uniformScratchU32[7] = cmd.alphaTest ? 1 : 0;
+        this.uniformScratchU32[4] = I[i + CI_ALPHA_FUNC] >>> 0;
+        this.uniformScratchU32[5] = I[i + CI_TEXENV0] >>> 0;
+        this.uniformScratchU32[6] = I[i + CI_TEXENV1] >>> 0;
+        this.uniformScratchU32[7] = (flags & DF_ALPHA_TEST) !== 0 ? 1 : 0;
         this.uniformScratchU32[8] = useTex0 ? 1 : 0;
         this.uniformScratchU32[9] = useTex1 ? 1 : 0;
-        this.uniformScratchU32[10] = cmd.fogEnabled ? 1 : 0;
-        this.uniformScratchU32[11] = cmd.fogMode >>> 0;
+        this.uniformScratchU32[10] = (flags & DF_FOG) !== 0 ? 1 : 0;
+        this.uniformScratchU32[11] = I[i + CI_FOG_MODE] >>> 0;
 
         // 48..64
-        this.uniformScratchF32[12] = Math.max(0, cmd.fogDensity);
-        this.uniformScratchF32[13] = cmd.fogStart;
-        this.uniformScratchF32[14] = cmd.fogEnd;
+        this.uniformScratchF32[12] = Math.max(0, F[f + CF_FOG_DENSITY]);
+        this.uniformScratchF32[13] = F[f + CF_FOG_START];
+        this.uniformScratchF32[14] = F[f + CF_FOG_END];
 
         // 64..80 fogColor
-        this.uniformScratchF32[16] = this.clamp01(cmd.fogR);
-        this.uniformScratchF32[17] = this.clamp01(cmd.fogG);
-        this.uniformScratchF32[18] = this.clamp01(cmd.fogB);
-        this.uniformScratchF32[19] = this.clamp01(cmd.fogA);
+        this.uniformScratchF32[16] = this.clamp01(F[f + CF_FOG_R]);
+        this.uniformScratchF32[17] = this.clamp01(F[f + CF_FOG_G]);
+        this.uniformScratchF32[18] = this.clamp01(F[f + CF_FOG_B]);
+        this.uniformScratchF32[19] = this.clamp01(F[f + CF_FOG_A]);
 
         queue.writeBuffer(this.uniformBuffer!, offset, this.uniformScratchBuffer, 0, UNIFORM_BLOCK_SIZE);
     }
 
-    private applyScissor(pass: GPURenderPassEncoder, cmd: GLDrawCommand, screenW: number, screenH: number): boolean {
-        if (!cmd.scissorEnabled) {
+    private applyScissor(
+        pass: GPURenderPassEncoder,
+        I: Int32Array,
+        i: number,
+        flags: number,
+        screenW: number,
+        screenH: number,
+    ): boolean {
+        if ((flags & DF_SCISSOR) === 0) {
             pass.setScissorRect(0, 0, screenW, screenH);
             return true;
         }
 
-        const sx = Math.round(cmd.scissorX);
-        const sy = Math.round(cmd.scissorY);
-        const sw = Math.max(0, Math.round(cmd.scissorW));
-        const sh = Math.max(0, Math.round(cmd.scissorH));
+        const sx = I[i + CI_SCISSOR_X];
+        const sy = I[i + CI_SCISSOR_Y];
+        const sw = Math.max(0, I[i + CI_SCISSOR_W]);
+        const sh = Math.max(0, I[i + CI_SCISSOR_H]);
 
         // OpenGL scissor origin is lower-left, WebGPU scissor origin is top-left.
         const x = this.clampInt(sx, 0, screenW);

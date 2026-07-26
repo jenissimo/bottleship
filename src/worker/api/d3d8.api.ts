@@ -280,7 +280,7 @@ const textureMethods = textureMethodSpecs.map((spec) =>
 
 export const IDirect3DTexture8: InterfaceDescriptor = {
     name: "IDirect3DTexture8",
-    inherits: "IUnknown",
+    inherits: "IDirect3DBaseTexture8",
     methods: [
         ...IUnknown.methods.map(m => ({ ...m })),
         ...textureMethods,
@@ -288,7 +288,10 @@ export const IDirect3DTexture8: InterfaceDescriptor = {
 };
 
 // =========================================================================
-// IDirect3DSurface8
+// IDirect3DSurface8 — derives straight from IUnknown (it is NOT an
+// IDirect3DResource8: it repeats the private-data methods but has no
+// SetPriority/PreLoad/GetType). 11 slots, ending at UnlockRect —
+// GetDC/ReleaseDC are D3D9-era additions and must not appear here.
 // =========================================================================
 
 const surfaceMethodSpecs = [
@@ -298,10 +301,8 @@ const surfaceMethodSpecs = [
     { name: "FreePrivateData", args: 2 },
     { name: "GetContainer", args: 3 },
     { name: "GetDesc", args: 2 },
-    { name: "LockRect", args: 4 },  // D3D8: no Flags param? Actually it's (this, pLockedRect, pRect, Flags) = 4 args
+    { name: "LockRect", args: 4 },  // this, pLockedRect, pRect, Flags
     { name: "UnlockRect", args: 1 },
-    { name: "GetDC", args: 2 },
-    { name: "ReleaseDC", args: 2 },
 ];
 
 export const IDirect3DSurface8: InterfaceDescriptor = {
@@ -341,7 +342,7 @@ const vbMethodSpecs = [
 
 export const IDirect3DVertexBuffer8: InterfaceDescriptor = {
     name: "IDirect3DVertexBuffer8",
-    inherits: "IUnknown",
+    inherits: "IDirect3DResource8",
     methods: [
         ...IUnknown.methods.map(m => ({ ...m })),
         ...vbMethodSpecs.map((spec) => vbMethodOverrides[spec.name] ?? makeMethod(spec.name, spec.args)),
@@ -350,6 +351,7 @@ export const IDirect3DVertexBuffer8: InterfaceDescriptor = {
 
 // =========================================================================
 // IDirect3DIndexBuffer8
+// Inheritance: IUnknown → IDirect3DResource8 → IDirect3DIndexBuffer8
 // =========================================================================
 
 const ibMethodSpecs = [
@@ -370,7 +372,7 @@ const ibMethodSpecs = [
 
 export const IDirect3DIndexBuffer8: InterfaceDescriptor = {
     name: "IDirect3DIndexBuffer8",
-    inherits: "IUnknown",
+    inherits: "IDirect3DResource8",
     methods: [
         ...IUnknown.methods.map(m => ({ ...m })),
         ...ibMethodSpecs.map((spec) => vbMethodOverrides[spec.name] ?? makeMethod(spec.name, spec.args)),

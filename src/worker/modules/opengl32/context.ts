@@ -35,76 +35,167 @@ export const enum GLDrawCommandType {
     SCISSOR = 3,
 }
 
-export interface GLClearCommand {
-    type: GLDrawCommandType.CLEAR;
-    mask: number;
-    r: number; g: number; b: number; a: number;
-    depth: number;
-    stencil: number;
+// ---- Flat (SoA) command stream ----
+//
+// A frame's commands are fixed-size records over two parallel typed arrays: one
+// Int32Array for enums/handles/bit flags, one Float32Array for the float state.
+// Vertices are NOT owned by a command — they live in the per-frame GLVertexArena
+// and a DRAW references them as (CI_VERT_OFFSET, CI_VERT_COUNT). Both the stream
+// and the arena are reset (not reallocated) at present, so nothing may retain a
+// command or an arena slice past executeFrame().
+
+/** Int32 slots per command record. */
+export const CMD_I32 = 33;
+/** Float32 slots per command record. */
+export const CMD_F32 = 10;
+
+export const CI_TYPE = 0;
+
+// DRAW — integer state
+export const CI_MODE = 1;
+/** Float index of the first vertex inside the frame vertex arena. */
+export const CI_VERT_OFFSET = 2;
+export const CI_VERT_COUNT = 3;
+export const CI_FLAGS = 4;
+export const CI_DEPTH_FUNC = 5;
+export const CI_BLEND_SRC = 6;
+export const CI_BLEND_DST = 7;
+export const CI_ALPHA_FUNC = 8;
+export const CI_CULL_FACE = 9;
+export const CI_FRONT_FACE = 10;
+export const CI_TEX_ID0 = 11;
+export const CI_TEX_ID1 = 12;
+export const CI_TEXENV0 = 13;
+export const CI_TEXENV1 = 14;
+export const CI_SHADE_MODEL = 15;
+export const CI_FOG_MODE = 16;
+export const CI_POLYGON_MODE = 17;
+export const CI_STENCIL_FUNC = 18;
+export const CI_STENCIL_REF = 19;
+export const CI_STENCIL_MASK = 20;
+export const CI_STENCIL_FAIL = 21;
+export const CI_STENCIL_ZFAIL = 22;
+export const CI_STENCIL_ZPASS = 23;
+export const CI_STENCIL_WRITE_MASK = 24;
+export const CI_SCISSOR_X = 25;
+export const CI_SCISSOR_Y = 26;
+export const CI_SCISSOR_W = 27;
+export const CI_SCISSOR_H = 28;
+/** Viewport active when the draw was emitted; also the VIEWPORT command payload. */
+export const CI_VP_X = 29;
+export const CI_VP_Y = 30;
+export const CI_VP_W = 31;
+export const CI_VP_H = 32;
+
+// CLEAR — aliases over the same slots (a record is only ever one command type)
+export const CI_CLEAR_MASK = 1;
+export const CI_CLEAR_STENCIL = 2;
+
+// DRAW — float state
+export const CF_ALPHA_REF = 0;
+export const CF_FOG_R = 1;
+export const CF_FOG_G = 2;
+export const CF_FOG_B = 3;
+export const CF_FOG_A = 4;
+export const CF_FOG_DENSITY = 5;
+export const CF_FOG_START = 6;
+export const CF_FOG_END = 7;
+export const CF_DEPTH_RANGE_NEAR = 8;
+export const CF_DEPTH_RANGE_FAR = 9;
+
+// CLEAR — float aliases
+export const CF_CLEAR_R = 0;
+export const CF_CLEAR_G = 1;
+export const CF_CLEAR_B = 2;
+export const CF_CLEAR_A = 3;
+export const CF_CLEAR_DEPTH = 4;
+
+/** DRAW boolean state, packed into CI_FLAGS. */
+export const DF_DEPTH_TEST = 1 << 0;
+export const DF_DEPTH_MASK = 1 << 1;
+export const DF_BLEND = 1 << 2;
+export const DF_ALPHA_TEST = 1 << 3;
+export const DF_CULL = 1 << 4;
+export const DF_FOG = 1 << 5;
+export const DF_COLOR_MASK_R = 1 << 6;
+export const DF_COLOR_MASK_G = 1 << 7;
+export const DF_COLOR_MASK_B = 1 << 8;
+export const DF_COLOR_MASK_A = 1 << 9;
+export const DF_STENCIL_TEST = 1 << 10;
+export const DF_SCISSOR = 1 << 11;
+
+export class GLCommandStream {
+    count = 0;
+    i32: Int32Array;
+    f32: Float32Array;
+    private capacity: number;
+
+    constructor(capacity = 2048) {
+        this.capacity = capacity;
+        this.i32 = new Int32Array(capacity * CMD_I32);
+        this.f32 = new Float32Array(capacity * CMD_F32);
+    }
+
+    /** Reserve one record and return its index. Slots are NOT cleared — the
+     *  emitter writes every slot its command type reads. */
+    alloc(type: GLDrawCommandType): number {
+        if (this.count === this.capacity) this.grow();
+        const idx = this.count++;
+        this.i32[idx * CMD_I32 + CI_TYPE] = type;
+        return idx;
+    }
+
+    /** Drop the most recently allocated record (used when a draw merges backwards). */
+    pop(): void {
+        if (this.count > 0) this.count--;
+    }
+
+    typeAt(idx: number): number {
+        return this.i32[idx * CMD_I32 + CI_TYPE];
+    }
+
+    reset(): void {
+        this.count = 0;
+    }
+
+    private grow(): void {
+        const capacity = this.capacity * 2;
+        const i32 = new Int32Array(capacity * CMD_I32);
+        i32.set(this.i32);
+        const f32 = new Float32Array(capacity * CMD_F32);
+        f32.set(this.f32);
+        this.i32 = i32;
+        this.f32 = f32;
+        this.capacity = capacity;
+    }
 }
 
-export interface GLDrawCommand {
-    type: GLDrawCommandType.DRAW;
-    mode: number;
-    vertData: Float32Array;
-    vertCount: number;
-    depthTest: boolean;
-    depthFunc: number;
-    depthMask: boolean;
-    blendEnabled: boolean;
-    blendSrc: number;
-    blendDst: number;
-    alphaTest: boolean;
-    alphaFunc: number;
-    alphaRef: number;
-    cullEnabled: boolean;
-    cullFace: number;
-    frontFace: number;
-    textureId0: number;
-    textureId1: number;
-    texEnvMode0: number;
-    texEnvMode1: number;
-    shadeModel: number;
-    fogEnabled: boolean;
-    fogMode: number;
-    fogR: number; fogG: number; fogB: number; fogA: number;
-    fogDensity: number;
-    fogStart: number;
-    fogEnd: number;
-    polygonMode: number;
-    colorMaskR: boolean;
-    colorMaskG: boolean;
-    colorMaskB: boolean;
-    colorMaskA: boolean;
-    stencilTest: boolean;
-    stencilFunc: number;
-    stencilRef: number;
-    stencilMask: number;
-    stencilFail: number;
-    stencilZFail: number;
-    stencilZPass: number;
-    stencilWriteMask: number;
-    scissorEnabled: boolean;
-    scissorX: number; scissorY: number;
-    scissorW: number; scissorH: number;
-    /** Viewport active when this draw was emitted */
-    vpX: number; vpY: number;
-    vpW: number; vpH: number;
-    depthRangeNear: number;
-    depthRangeFar: number;
-}
+/** Growable per-frame vertex store. Draw commands hold (offset, count) into it. */
+export class GLVertexArena {
+    data: Float32Array;
+    /** Write cursor, in floats. */
+    used = 0;
 
-export interface GLViewportCommand {
-    type: GLDrawCommandType.VIEWPORT;
-    x: number; y: number; w: number; h: number;
-}
+    constructor(vertexCapacity = 65536) {
+        this.data = new Float32Array(vertexCapacity * VERT_FLOATS);
+    }
 
-export interface GLScissorCommand {
-    type: GLDrawCommandType.SCISSOR;
-    x: number; y: number; w: number; h: number;
-}
+    /** Guarantee room for `vertexCount` more vertices at the cursor. Doubles on
+     *  overflow and preserves written data — earlier commands hold offsets into it. */
+    reserve(vertexCount: number): void {
+        const need = this.used + vertexCount * VERT_FLOATS;
+        if (need <= this.data.length) return;
+        let capacity = this.data.length;
+        while (capacity < need) capacity *= 2;
+        const next = new Float32Array(capacity);
+        next.set(this.data.subarray(0, this.used));
+        this.data = next;
+    }
 
-export type GLCommand = GLClearCommand | GLDrawCommand | GLViewportCommand | GLScissorCommand;
+    reset(): void {
+        this.used = 0;
+    }
+}
 
 // ---- Texture state ----
 
@@ -297,8 +388,9 @@ export interface OpenGLContext {
     compilingCommands: Array<{ fn: string; args: number[] }>;
     replayingList: boolean;
 
-    // Command stream for backend
-    commands: GLCommand[];
+    // Command stream for backend + the vertex arena its DRAW records point into
+    commands: GLCommandStream;
+    vertArena: GLVertexArena;
 
     // Frame stats
     frameSnapshot: GLFrameSnapshot;
@@ -530,7 +622,8 @@ export function createOpenGLContext(process: Process): OpenGLContext {
         compilingCommands: [],
         replayingList: false,
 
-        commands: [],
+        commands: new GLCommandStream(),
+        vertArena: new GLVertexArena(),
 
         frameSnapshot: { frameId: 0, drawCalls: 0, presents: 0, texUploads: 0, clearCalls: 0, vertexCount: 0 },
         frameId: 0,
@@ -577,7 +670,8 @@ export function createOpenGLContext(process: Process): OpenGLContext {
 
 export function resetOpenGLContext(ctx: OpenGLContext): void {
     ctx.error = 0;
-    ctx.commands.length = 0;
+    ctx.commands.reset();
+    ctx.vertArena.reset();
     ctx.textures.clear();
     ctx.displayLists.clear();
     ctx.compilingList = null;

@@ -10,6 +10,10 @@ import { isValidAddress } from "../../core/memory/address-guard";
 import { gammaService } from "../../core/gamma-service";
 import type { DDrawContext } from "./context";
 
+// ddraw.h aliases DDERR_INVALIDPARAMS onto E_INVALIDARG; DDERR_INVALIDOBJECT is MAKE_DDHRESULT(130).
+const DDERR_INVALIDPARAMS = 0x80070057;
+const DDERR_INVALIDOBJECT = 0x88760082;
+
 export function createSurfaceStubsExports(context: DDrawContext): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
     const stubMethods = [
@@ -24,9 +28,6 @@ export function createSurfaceStubsExports(context: DDrawContext): Record<string,
         "UpdateOverlay",
         "UpdateOverlayDisplay",
         "UpdateOverlayZOrder",
-        "GetDDInterface",
-        "PageLock",
-        "PageUnlock",
         "SetPrivateData",
         "GetPrivateData",
         "FreePrivateData",
@@ -65,6 +66,33 @@ export function createSurfaceStubsExports(context: DDrawContext): Record<string,
             };
         }
     }
+
+    // GetDDInterface(lplpDD) — hands back the very IDirectDraw interface the surface was
+    // created through, AddRef'd. The version matters: a surface from
+    // IDirectDraw::CreateSurface must yield an IDirectDraw, never an IDirectDraw7,
+    // or the caller invokes v7 slots through a 23-slot table.
+    exports["IDirectDrawSurface7_GetDDInterface"] = (ctx, mem, args) => {
+        const lplpDD = args[1];
+        if (!lplpDD || !isValidAddress(mem, lplpDD, 4)) return DDERR_INVALIDPARAMS;
+
+        const obj = context.resourceProvider.getComObjectByAddress(args[0]) as DirectDrawSurfaceObject | null;
+        const ownerAddr = obj?.getDDrawOwnerAddr() ?? 0;
+        const ownerObj = ownerAddr ? context.resourceProvider.getComObjectByAddress(ownerAddr) : null;
+        if (!ownerObj) {
+            Logger.warn(LogCategory.DDRAW,
+                `IDirectDrawSurface7_GetDDInterface: no owning IDirectDraw for surface 0x${args[0].toString(16)}`);
+            return DDERR_INVALIDOBJECT;
+        }
+
+        ownerObj.addRef();
+        new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setUint32(lplpDD, ownerAddr, true);
+        return DD_OK;
+    };
+
+    // PageLock/PageUnlock pin a sysmem surface against the Windows pager. Nothing here is
+    // pageable, so both succeed unconditionally — real ddraw does not validate dwFlags either.
+    exports["IDirectDrawSurface7_PageLock"] = () => DD_OK;
+    exports["IDirectDrawSurface7_PageUnlock"] = () => DD_OK;
 
     // =========================================================================
     // IDirectDrawGammaControl stubs

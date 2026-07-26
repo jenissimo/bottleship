@@ -6,6 +6,8 @@ import {
     DDSD_CAPS,
     DDSD_HEIGHT,
     DDSD_LPSURFACE,
+    DDSD_CKSRCBLT,
+    DDSD_CKDESTBLT,
     DDSD_PITCH,
     DDSD_PIXELFORMAT,
     DDSD_REFRESHRATE,
@@ -205,11 +207,16 @@ export const readSurfaceDesc = (mem: Uint8Array, address: number): SurfaceDesc |
     // Read colorkey fields if structure is large enough (DDCOLORKEY = 8 bytes each)
     let srcColorKey: { low: number; high: number } | undefined;
     let destColorKey: { low: number; high: number } | undefined;
+    // DDSD_CK*BLT is what makes the field valid — and it is the ONLY way to state a
+    // BLACK key, which is the era's default for sprite sheets. Falling back to
+    // "nonzero means present" alone silently drops key=0x0, so a DX2/3 title that
+    // creates its UI textures with a black source key renders every keyed texel as
+    // an opaque black box. The nonzero fallback stays for descs that fill the field
+    // without setting the flag.
     if (hasField(DDSURFACEDESC2_OFFSETS.ddckCKSrcBlt, 8)) {
         const srcLow = view.getUint32(address + DDSURFACEDESC2_OFFSETS.ddckCKSrcBlt, true);
         const srcHigh = view.getUint32(address + DDSURFACEDESC2_OFFSETS.ddckCKSrcBlt + 4, true);
-        // Only store if not zero (0x0-0x0 means "no colorkey")
-        if (srcLow !== 0 || srcHigh !== 0) {
+        if ((flags & DDSD_CKSRCBLT) !== 0 || srcLow !== 0 || srcHigh !== 0) {
             srcColorKey = { low: srcLow, high: srcHigh };
             Logger.verbose(LogCategory.DDRAW,
                 `readSurfaceDesc: Found srcColorKey 0x${srcLow.toString(16)}-0x${srcHigh.toString(16)}`
@@ -219,7 +226,7 @@ export const readSurfaceDesc = (mem: Uint8Array, address: number): SurfaceDesc |
     if (hasField(DDSURFACEDESC2_OFFSETS.ddckCKDestBlt, 8)) {
         const destLow = view.getUint32(address + DDSURFACEDESC2_OFFSETS.ddckCKDestBlt, true);
         const destHigh = view.getUint32(address + DDSURFACEDESC2_OFFSETS.ddckCKDestBlt + 4, true);
-        if (destLow !== 0 || destHigh !== 0) {
+        if ((flags & DDSD_CKDESTBLT) !== 0 || destLow !== 0 || destHigh !== 0) {
             destColorKey = { low: destLow, high: destHigh };
             Logger.verbose(LogCategory.DDRAW,
                 `readSurfaceDesc: Found destColorKey 0x${destLow.toString(16)}-0x${destHigh.toString(16)}`

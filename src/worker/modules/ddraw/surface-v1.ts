@@ -81,4 +81,18 @@ export function registerSurfaceV1Exports(
     exports["IDirectDrawSurface_UpdateOverlay"] = () => DD_OK;
     exports["IDirectDrawSurface_UpdateOverlayDisplay"] = () => DD_OK;
     exports["IDirectDrawSurface_UpdateOverlayZOrder"] = () => DD_OK;
+
+    // Slots 36-39 belong to IDirectDrawSurface2/3, which a guest reaches by QI'ing this
+    // same object; they live in the v1 table because v2/v3 append to it.
+    exports["IDirectDrawSurface_GetDDInterface"] = (ctx, mem, args) => {
+        return exports["IDirectDrawSurface7_GetDDInterface"]?.(ctx, mem, args) ?? DD_OK;
+    };
+    exports["IDirectDrawSurface_PageLock"] = () => DD_OK;
+    exports["IDirectDrawSurface_PageUnlock"] = () => DD_OK;
+    // v3 marshals DDSURFACEDESC, not DDSURFACEDESC2 — the two agree on every field up to
+    // ddsCaps (offset 104), and SetSurfaceDesc only consumes dwFlags and lpSurface, both
+    // inside that shared prefix.
+    exports["IDirectDrawSurface_SetSurfaceDesc"] = (ctx, mem, args) => {
+        return exports["IDirectDrawSurface7_SetSurfaceDesc"]?.(ctx, mem, args) ?? DD_OK;
+    };
 }

@@ -1,6 +1,16 @@
 import { ThunkImplementation, WriteBufHandler } from "../../core/thunking/thunk-dispatcher";
 import {
-    OpenGLContext, GLDrawVertex, GLDrawCommand, GLDrawCommandType, mat4Multiply, VERT_FLOATS
+    OpenGLContext, GLDrawVertex, GLDrawCommandType, mat4Multiply, VERT_FLOATS,
+    CMD_I32, CMD_F32,
+    CI_MODE, CI_VERT_OFFSET, CI_VERT_COUNT, CI_FLAGS, CI_DEPTH_FUNC, CI_BLEND_SRC, CI_BLEND_DST,
+    CI_ALPHA_FUNC, CI_CULL_FACE, CI_FRONT_FACE, CI_TEX_ID0, CI_TEX_ID1, CI_TEXENV0, CI_TEXENV1,
+    CI_SHADE_MODEL, CI_FOG_MODE, CI_POLYGON_MODE, CI_STENCIL_FUNC, CI_STENCIL_REF, CI_STENCIL_MASK,
+    CI_STENCIL_FAIL, CI_STENCIL_ZFAIL, CI_STENCIL_ZPASS, CI_STENCIL_WRITE_MASK,
+    CI_SCISSOR_X, CI_SCISSOR_Y, CI_SCISSOR_W, CI_SCISSOR_H, CI_VP_X, CI_VP_Y, CI_VP_W, CI_VP_H,
+    CF_ALPHA_REF, CF_FOG_R, CF_FOG_G, CF_FOG_B, CF_FOG_A, CF_FOG_DENSITY, CF_FOG_START, CF_FOG_END,
+    CF_DEPTH_RANGE_NEAR, CF_DEPTH_RANGE_FAR,
+    DF_DEPTH_TEST, DF_DEPTH_MASK, DF_BLEND, DF_ALPHA_TEST, DF_CULL, DF_FOG,
+    DF_COLOR_MASK_R, DF_COLOR_MASK_G, DF_COLOR_MASK_B, DF_COLOR_MASK_A, DF_STENCIL_TEST, DF_SCISSOR,
 } from "./context";
 import {
     GL_TRIANGLES, GL_TRIANGLE_STRIP, GL_TRIANGLE_FAN, GL_QUADS, GL_QUAD_STRIP,
@@ -21,7 +31,7 @@ export function bitsToF32(bits: number): number {
 
 // Module-level scratch buffers — zero allocations on hot paths
 const _mvpScratch = new Float32Array(16);
-const _asmBuf = new Float32Array(131072 * VERT_FLOATS); // 128K vertices max
+let _bridgeBuf = new Float32Array(4096 * VERT_FLOATS);
 
 // Cached DataView for guest memory — recreate only when buffer changes
 let _cachedDVBuf: ArrayBuffer | null = null;
@@ -77,50 +87,96 @@ export function pushVertexObj(ctx: OpenGLContext, v: GLDrawVertex): void {
     ctx.immediateFlatCount++;
 }
 
-export function assembleFlatVerts(src: Float32Array, srcCount: number, mode: number, dst: Float32Array): number {
-    let dc = 0;
-    function cp(d: number, s: number): void {
-        dst.set(src.subarray(s * VERT_FLOATS, s * VERT_FLOATS + VERT_FLOATS), d * VERT_FLOATS);
+/** Copy one 15-float vertex. Explicit stores, not subarray()/set(): the view pair
+ *  allocated per vertex dominated primitive assembly. */
+function copyVert(src: Float32Array, srcVert: number, dst: Float32Array, d: number): void {
+    const s = srcVert * VERT_FLOATS;
+    dst[d]    = src[s];    dst[d+1]  = src[s+1];  dst[d+2]  = src[s+2];  dst[d+3]  = src[s+3];
+    dst[d+4]  = src[s+4];  dst[d+5]  = src[s+5];  dst[d+6]  = src[s+6];  dst[d+7]  = src[s+7];
+    dst[d+8]  = src[s+8];  dst[d+9]  = src[s+9];  dst[d+10] = src[s+10];
+    dst[d+11] = src[s+11]; dst[d+12] = src[s+12]; dst[d+13] = src[s+13]; dst[d+14] = src[s+14];
+}
+
+/**
+ * Exact assembled vertex count for `mode`/`srcCount`. MUST stay in lockstep with
+ * assembleFlatVerts' loop bounds — the arena reserve is sized from it.
+ */
+export function assembledVertCount(mode: number, srcCount: number): number {
+    switch (mode) {
+        case GL_TRIANGLES:      return srcCount - (srcCount % 3);
+        case GL_TRIANGLE_STRIP:
+        case GL_TRIANGLE_FAN:
+        case GL_POLYGON:        return srcCount >= 3 ? (srcCount - 2) * 3 : 0;
+        case GL_QUADS:          return ((srcCount / 4) | 0) * 6;
+        case GL_QUAD_STRIP:     return srcCount >= 4 ? (((srcCount - 2) / 2) | 0) * 6 : 0;
+        default:                return srcCount;
     }
+}
+
+export function assembleFlatVerts(
+    src: Float32Array, srcCount: number, mode: number, dst: Float32Array, dstOffset = 0,
+): number {
+    const V = VERT_FLOATS;
+    let d = dstOffset;
     switch (mode) {
         case GL_TRIANGLES:
             for (let i = 0; i + 2 < srcCount; i += 3) {
-                cp(dc++, i); cp(dc++, i+1); cp(dc++, i+2);
+                copyVert(src, i, dst, d); d += V;
+                copyVert(src, i+1, dst, d); d += V;
+                copyVert(src, i+2, dst, d); d += V;
             }
             break;
         case GL_TRIANGLE_STRIP:
             for (let i = 0; i + 2 < srcCount; i++) {
-                if (i % 2 === 0) { cp(dc++, i); cp(dc++, i+1); cp(dc++, i+2); }
-                else             { cp(dc++, i+1); cp(dc++, i); cp(dc++, i+2); }
+                if ((i & 1) === 0) {
+                    copyVert(src, i, dst, d); d += V;
+                    copyVert(src, i+1, dst, d); d += V;
+                } else {
+                    copyVert(src, i+1, dst, d); d += V;
+                    copyVert(src, i, dst, d); d += V;
+                }
+                copyVert(src, i+2, dst, d); d += V;
             }
             break;
         case GL_TRIANGLE_FAN:
         case GL_POLYGON:
-            for (let i = 1; i + 1 < srcCount; i++) { cp(dc++, 0); cp(dc++, i); cp(dc++, i+1); }
+            for (let i = 1; i + 1 < srcCount; i++) {
+                copyVert(src, 0, dst, d); d += V;
+                copyVert(src, i, dst, d); d += V;
+                copyVert(src, i+1, dst, d); d += V;
+            }
             break;
         case GL_QUADS:
             for (let i = 0; i + 3 < srcCount; i += 4) {
-                cp(dc++, i); cp(dc++, i+1); cp(dc++, i+2);
-                cp(dc++, i); cp(dc++, i+2); cp(dc++, i+3);
+                copyVert(src, i, dst, d); d += V;
+                copyVert(src, i+1, dst, d); d += V;
+                copyVert(src, i+2, dst, d); d += V;
+                copyVert(src, i, dst, d); d += V;
+                copyVert(src, i+2, dst, d); d += V;
+                copyVert(src, i+3, dst, d); d += V;
             }
             break;
         case GL_QUAD_STRIP:
             for (let i = 0; i + 3 < srcCount; i += 2) {
-                cp(dc++, i); cp(dc++, i+1); cp(dc++, i+2);
-                cp(dc++, i+2); cp(dc++, i+1); cp(dc++, i+3);
+                copyVert(src, i, dst, d); d += V;
+                copyVert(src, i+1, dst, d); d += V;
+                copyVert(src, i+2, dst, d); d += V;
+                copyVert(src, i+2, dst, d); d += V;
+                copyVert(src, i+1, dst, d); d += V;
+                copyVert(src, i+3, dst, d); d += V;
             }
             break;
         default:
             // GL_POINTS, GL_LINES, GL_LINE_STRIP, GL_LINE_LOOP: pass through
-            for (let i = 0; i < srcCount; i++) cp(dc++, i);
+            for (let i = 0; i < srcCount; i++) { copyVert(src, i, dst, d); d += V; }
             break;
     }
-    return dc;
+    return (d - dstOffset) / V;
 }
 
 let transformDiagCount = 0;
 
-export function transformFlatVerts(ctx: OpenGLContext, buf: Float32Array, count: number): void {
+export function transformFlatVerts(ctx: OpenGLContext, buf: Float32Array, offset: number, count: number): void {
     const mv = ctx.modelviewStack.stack[ctx.modelviewStack.top];
     const proj = ctx.projectionStack.stack[ctx.projectionStack.top];
     mat4Multiply(_mvpScratch, proj, mv);
@@ -128,7 +184,7 @@ export function transformFlatVerts(ctx: OpenGLContext, buf: Float32Array, count:
 
     if (transformDiagCount < 2 && count > 0) {
         transformDiagCount++;
-        const b0 = 0;
+        const b0 = offset;
         Logger.log(LogCategory.SYSTEM,
             `[GL TRANSFORM] verts=${count} viewport=(${ctx.viewportX},${ctx.viewportY},${ctx.viewportW}x${ctx.viewportH}) ` +
             `obj_v0=(${buf[b0].toFixed(1)},${buf[b0+1].toFixed(1)},${buf[b0+2].toFixed(1)},${buf[b0+3].toFixed(1)})`);
@@ -143,7 +199,7 @@ export function transformFlatVerts(ctx: OpenGLContext, buf: Float32Array, count:
     // Output clip-space coordinates directly — GPU handles perspective divide,
     // near/far plane clipping, and viewport transform via setViewport().
     for (let i = 0; i < count; i++) {
-        const b = i * VERT_FLOATS;
+        const b = offset + i * VERT_FLOATS;
         const x = buf[b], y = buf[b+1], z = buf[b+2], w = buf[b+3];
         buf[b]   = m[0]*x + m[4]*y + m[8]*z  + m[12]*w;  // clip.x
         buf[b+1] = m[1]*x + m[5]*y + m[9]*z  + m[13]*w;  // clip.y
@@ -181,7 +237,7 @@ function computeTexGenCoordFlat(
     }
 }
 
-export function applyTexGenFlat(ctx: OpenGLContext, buf: Float32Array, count: number): void {
+export function applyTexGenFlat(ctx: OpenGLContext, buf: Float32Array, offset: number, count: number): void {
     const genS = ctx.enableFlags.has(GL_TEXTURE_GEN_S);
     const genT = ctx.enableFlags.has(GL_TEXTURE_GEN_T);
     if (!genS && !genT) return;
@@ -189,7 +245,7 @@ export function applyTexGenFlat(ctx: OpenGLContext, buf: Float32Array, count: nu
     const mv = ctx.modelviewStack.stack[ctx.modelviewStack.top];
 
     for (let i = 0; i < count; i++) {
-        const b = i * VERT_FLOATS;
+        const b = offset + i * VERT_FLOATS;
         const ox = buf[b], oy = buf[b+1], oz = buf[b+2], ow = buf[b+3];
         const onx = buf[b+8], ony = buf[b+9], onz = buf[b+10];
 
@@ -210,100 +266,179 @@ export function applyTexGenFlat(ctx: OpenGLContext, buf: Float32Array, count: nu
     }
 }
 
-function pushGLDrawCommand(ctx: OpenGLContext, mode: number, vertData: Float32Array, vertCount: number): void {
+/**
+ * Merging two consecutive draws concatenates their vertex ranges into one draw.
+ * That is only equivalent for topologies whose primitives are self-contained:
+ * a line strip/loop would gain a segment joining the two ranges. Everything else
+ * (points, line lists, and every triangle-ish mode — assembleFlatVerts has already
+ * expanded those to triangle lists) is safe.
+ */
+function isMergeableMode(mode: number): boolean {
+    return mode !== GL_LINE_STRIP && mode !== GL_LINE_LOOP;
+}
+
+/**
+ * Vertices per primitive in the assembled stream. Concatenation is only safe on a
+ * primitive boundary — an odd-length GL_LINES range would otherwise gain a segment
+ * joining its dangling vertex to the next range's first.
+ */
+function mergePrimStride(mode: number): number {
+    if (mode === GL_POINTS) return 1;
+    if (mode === GL_LINES) return 2;
+    return 3; // every triangle-ish mode has been expanded to a triangle list
+}
+
+/** True when two DRAW records differ only in their vertex range. */
+function drawStateEqual(i32: Int32Array, f32: Float32Array, a: number, b: number): boolean {
+    const ai = a * CMD_I32, bi = b * CMD_I32;
+    if (i32[ai + CI_MODE] !== i32[bi + CI_MODE]) return false;
+    for (let k = CI_FLAGS; k < CMD_I32; k++) {
+        if (i32[ai + k] !== i32[bi + k]) return false;
+    }
+    const af = a * CMD_F32, bf = b * CMD_F32;
+    for (let k = 0; k < CMD_F32; k++) {
+        if (f32[af + k] !== f32[bf + k]) return false;
+    }
+    return true;
+}
+
+function pushGLDrawCommand(ctx: OpenGLContext, mode: number, vertOffset: number, vertCount: number): void {
     const unit0 = ctx.textureUnits[0];
     const unit1 = ctx.textureUnits[1];
     const fc = ctx.fogColor;
+    const en = ctx.enableFlags;
 
-    const cmd: GLDrawCommand = {
-        type: GLDrawCommandType.DRAW,
-        mode,
-        vertData,
-        vertCount,
-        depthTest: ctx.enableFlags.has(0x0B71),
-        depthFunc: ctx.depthFunc,
-        depthMask: ctx.depthMask,
-        blendEnabled: ctx.enableFlags.has(0x0BE2),
-        blendSrc: ctx.blendSrc,
-        blendDst: ctx.blendDst,
-        alphaTest: ctx.enableFlags.has(0x0BC0),
-        alphaFunc: ctx.alphaFunc,
-        alphaRef: ctx.alphaRef,
-        cullEnabled: ctx.enableFlags.has(0x0B44),
-        cullFace: ctx.cullFace,
-        frontFace: ctx.frontFace,
-        textureId0: unit0.enabled2d ? unit0.boundTexture : 0,
-        textureId1: unit1.enabled2d ? unit1.boundTexture : 0,
-        texEnvMode0: unit0.texEnvMode,
-        texEnvMode1: unit1.texEnvMode,
-        shadeModel: ctx.shadeModel,
-        fogEnabled: ctx.enableFlags.has(0x0B60),
-        fogMode: ctx.fogMode,
-        fogR: fc[0], fogG: fc[1], fogB: fc[2], fogA: fc[3],
-        fogDensity: ctx.fogDensity,
-        fogStart: ctx.fogStart,
-        fogEnd: ctx.fogEnd,
-        polygonMode: ctx.polygonModeFront,
-        colorMaskR: ctx.colorMaskR,
-        colorMaskG: ctx.colorMaskG,
-        colorMaskB: ctx.colorMaskB,
-        colorMaskA: ctx.colorMaskA,
-        stencilTest: ctx.enableFlags.has(GL_STENCIL_TEST),
-        stencilFunc: ctx.stencilFunc,
-        stencilRef: ctx.stencilRef,
-        stencilMask: ctx.stencilMask,
-        stencilFail: ctx.stencilFail,
-        stencilZFail: ctx.stencilZFail,
-        stencilZPass: ctx.stencilZPass,
-        stencilWriteMask: ctx.stencilWriteMask,
-        scissorEnabled: ctx.enableFlags.has(0x0C11),
-        scissorX: ctx.scissorX, scissorY: ctx.scissorY, scissorW: ctx.scissorW, scissorH: ctx.scissorH,
-        vpX: ctx.viewportX, vpY: ctx.viewportY, vpW: ctx.viewportW, vpH: ctx.viewportH,
-        depthRangeNear: ctx.depthRangeNear,
-        depthRangeFar: ctx.depthRangeFar,
-    };
+    let flags = 0;
+    if (en.has(0x0B71)) flags |= DF_DEPTH_TEST;
+    if (ctx.depthMask) flags |= DF_DEPTH_MASK;
+    if (en.has(0x0BE2)) flags |= DF_BLEND;
+    if (en.has(0x0BC0)) flags |= DF_ALPHA_TEST;
+    if (en.has(0x0B44)) flags |= DF_CULL;
+    if (en.has(0x0B60)) flags |= DF_FOG;
+    if (ctx.colorMaskR) flags |= DF_COLOR_MASK_R;
+    if (ctx.colorMaskG) flags |= DF_COLOR_MASK_G;
+    if (ctx.colorMaskB) flags |= DF_COLOR_MASK_B;
+    if (ctx.colorMaskA) flags |= DF_COLOR_MASK_A;
+    if (en.has(GL_STENCIL_TEST)) flags |= DF_STENCIL_TEST;
+    if (en.has(0x0C11)) flags |= DF_SCISSOR;
 
-    ctx.commands.push(cmd);
-    ctx.frameSnapshot.drawCalls++;
+    const stream = ctx.commands;
+    const idx = stream.alloc(GLDrawCommandType.DRAW);
+    const I = stream.i32, F = stream.f32;
+    const i = idx * CMD_I32;
+    const f = idx * CMD_F32;
+
+    I[i + CI_MODE] = mode;
+    I[i + CI_VERT_OFFSET] = vertOffset;
+    I[i + CI_VERT_COUNT] = vertCount;
+    I[i + CI_FLAGS] = flags;
+    I[i + CI_DEPTH_FUNC] = ctx.depthFunc;
+    I[i + CI_BLEND_SRC] = ctx.blendSrc;
+    I[i + CI_BLEND_DST] = ctx.blendDst;
+    I[i + CI_ALPHA_FUNC] = ctx.alphaFunc;
+    I[i + CI_CULL_FACE] = ctx.cullFace;
+    I[i + CI_FRONT_FACE] = ctx.frontFace;
+    I[i + CI_TEX_ID0] = unit0.enabled2d ? unit0.boundTexture : 0;
+    I[i + CI_TEX_ID1] = unit1.enabled2d ? unit1.boundTexture : 0;
+    I[i + CI_TEXENV0] = unit0.texEnvMode;
+    I[i + CI_TEXENV1] = unit1.texEnvMode;
+    I[i + CI_SHADE_MODEL] = ctx.shadeModel;
+    I[i + CI_FOG_MODE] = ctx.fogMode;
+    I[i + CI_POLYGON_MODE] = ctx.polygonModeFront;
+    I[i + CI_STENCIL_FUNC] = ctx.stencilFunc;
+    I[i + CI_STENCIL_REF] = ctx.stencilRef;
+    I[i + CI_STENCIL_MASK] = ctx.stencilMask;
+    I[i + CI_STENCIL_FAIL] = ctx.stencilFail;
+    I[i + CI_STENCIL_ZFAIL] = ctx.stencilZFail;
+    I[i + CI_STENCIL_ZPASS] = ctx.stencilZPass;
+    I[i + CI_STENCIL_WRITE_MASK] = ctx.stencilWriteMask;
+    I[i + CI_SCISSOR_X] = ctx.scissorX;
+    I[i + CI_SCISSOR_Y] = ctx.scissorY;
+    I[i + CI_SCISSOR_W] = ctx.scissorW;
+    I[i + CI_SCISSOR_H] = ctx.scissorH;
+    I[i + CI_VP_X] = ctx.viewportX;
+    I[i + CI_VP_Y] = ctx.viewportY;
+    I[i + CI_VP_W] = ctx.viewportW;
+    I[i + CI_VP_H] = ctx.viewportH;
+
+    F[f + CF_ALPHA_REF] = ctx.alphaRef;
+    F[f + CF_FOG_R] = fc[0];
+    F[f + CF_FOG_G] = fc[1];
+    F[f + CF_FOG_B] = fc[2];
+    F[f + CF_FOG_A] = fc[3];
+    F[f + CF_FOG_DENSITY] = ctx.fogDensity;
+    F[f + CF_FOG_START] = ctx.fogStart;
+    F[f + CF_FOG_END] = ctx.fogEnd;
+    F[f + CF_DEPTH_RANGE_NEAR] = ctx.depthRangeNear;
+    F[f + CF_DEPTH_RANGE_FAR] = ctx.depthRangeFar;
+
     ctx.frameSnapshot.vertexCount += vertCount;
+
+    // Fold into the previous draw when it is state-identical and its vertices end
+    // exactly where ours begin — the concatenated range is the same draw.
+    if (idx > 0 && isMergeableMode(mode) && stream.typeAt(idx - 1) === GLDrawCommandType.DRAW) {
+        const p = (idx - 1) * CMD_I32;
+        if (I[p + CI_VERT_OFFSET] + I[p + CI_VERT_COUNT] * VERT_FLOATS === vertOffset &&
+            I[p + CI_VERT_COUNT] % mergePrimStride(mode) === 0 &&
+            drawStateEqual(I, F, idx - 1, idx)) {
+            I[p + CI_VERT_COUNT] += vertCount;
+            stream.pop();
+            return;
+        }
+    }
+
+    ctx.frameSnapshot.drawCalls++;
 }
 
 export function emitDrawCommandFlat(ctx: OpenGLContext, mode: number, src: Float32Array, srcCount: number): void {
-    const asmCount = assembleFlatVerts(src, srcCount, mode, _asmBuf);
+    const expected = assembledVertCount(mode, srcCount);
+    if (expected === 0) return;
+
+    const arena = ctx.vertArena;
+    arena.reserve(expected);
+    const base = arena.used;
+    const asmCount = assembleFlatVerts(src, srcCount, mode, arena.data, base);
     if (asmCount === 0) return;
+    arena.used = base + asmCount * VERT_FLOATS;
 
     if (ctx.enableFlags.has(GL_TEXTURE_GEN_S) || ctx.enableFlags.has(GL_TEXTURE_GEN_T)) {
-        applyTexGenFlat(ctx, _asmBuf, asmCount);
+        applyTexGenFlat(ctx, arena.data, base, asmCount);
     }
+    transformFlatVerts(ctx, arena.data, base, asmCount);
 
-    // Snapshot — command owns its data
-    const vertData = new Float32Array(asmCount * VERT_FLOATS);
-    vertData.set(_asmBuf.subarray(0, asmCount * VERT_FLOATS));
-    transformFlatVerts(ctx, vertData, asmCount);
-
-    pushGLDrawCommand(ctx, mode, vertData, asmCount);
+    pushGLDrawCommand(ctx, mode, base, asmCount);
 }
 
 /** For pre-baked display list items — data is already triangle-assembled, apply texgen + transform now */
 export function emitDrawCommandFromPrebaked(ctx: OpenGLContext, mode: number, flatVerts: Float32Array, count: number): void {
     if (count === 0) return;
 
-    const vertData = new Float32Array(count * VERT_FLOATS);
-    vertData.set(flatVerts.subarray(0, count * VERT_FLOATS));
+    const arena = ctx.vertArena;
+    arena.reserve(count);
+    const base = arena.used;
+    const floats = count * VERT_FLOATS;
+    if (flatVerts.length === floats) arena.data.set(flatVerts, base);
+    else arena.data.set(flatVerts.subarray(0, floats), base);
+    arena.used = base + floats;
 
     if (ctx.enableFlags.has(GL_TEXTURE_GEN_S) || ctx.enableFlags.has(GL_TEXTURE_GEN_T)) {
-        applyTexGenFlat(ctx, vertData, count);
+        applyTexGenFlat(ctx, arena.data, base, count);
     }
-    transformFlatVerts(ctx, vertData, count);
+    transformFlatVerts(ctx, arena.data, base, count);
 
-    pushGLDrawCommand(ctx, mode, vertData, count);
+    pushGLDrawCommand(ctx, mode, base, count);
 }
 
 /** Bridge for arrays.ts: accepts GLDrawVertex[] objects and converts to flat format */
 export function emitDrawCommand(ctx: OpenGLContext, mode: number, verts: GLDrawVertex[]): void {
     const count = verts.length;
     if (count === 0) return;
-    const tmpBuf = new Float32Array(count * VERT_FLOATS);
+    if (_bridgeBuf.length < count * VERT_FLOATS) {
+        let len = _bridgeBuf.length;
+        while (len < count * VERT_FLOATS) len *= 2;
+        _bridgeBuf = new Float32Array(len);
+    }
+    const tmpBuf = _bridgeBuf;
     for (let i = 0; i < count; i++) {
         const v = verts[i];
         const b = i * VERT_FLOATS;
@@ -1009,6 +1144,21 @@ export function registerWriteBufferGLFunctions(dispatcher: any, ctx: OpenGLConte
                 tc[1] = bitsToF32(mem32[(ptr + 4) >> 2]);
             });
     }
+
+    // --- glBegin (mode) ---
+    // Safe on the ring even though glEnd stays an OUT trap: the ring is FIFO and
+    // glEnd's trap drains it before running, so Begin still precedes its vertices.
+    reg('glBegin', 1,
+        (m32, p) => [m32[p >> 2]],
+        (_mem8, mem32, ptr) => {
+            if (ctx.immediateMode) {
+                ctx.error = GL_INVALID_OPERATION;
+                return;
+            }
+            ctx.immediateMode = true;
+            ctx.immediatePrimMode = mem32[ptr >> 2] >>> 0;
+            ctx.immediateFlatCount = 0;
+        });
 
     // --- glVertex3f (x, y, z) ---
     reg('glVertex3f', 3,

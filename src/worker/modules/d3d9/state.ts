@@ -8,6 +8,8 @@ import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { Mem } from '../../core/memory/mem-accessor';
 import { devices, getVTables, createComObject, stateBlocks } from './shared-state';
+import { vertexBufferMeta } from './resource-registry';
+import { stubRegistry } from '../../core/diagnostics/stub-registry';
 import { RawVertexElement } from '../../backends/webgpu/d3d9/shader';
 import type { D3D9StateBlockData } from '../../backends/webgpu/d3d9/d3d9-state-block';
 import { classifyStateBlockCoverage, tryAttachWasmBlockSlot } from '../../backends/webgpu/d3d9/d3d9-state-block';
@@ -189,6 +191,52 @@ export function createStateExports(): Record<string, ThunkImplementation> {
 
         Logger.verbose(LogCategory.D3D9, `SetStreamSource(Stream=${StreamNumber}, Offset=${OffsetInBytes}, Stride=${Stride})`);
         device.setStreamSource(StreamNumber, pStreamData, OffsetInBytes, Stride);
+        return D3D_OK;
+    };
+
+    // GetStreamSource(StreamNumber, ppStreamData, pOffsetInBytes, pStride). ppStreamData is
+    // mandatory; the other two out-params are optional. Real D3D9 AddRefs the returned buffer —
+    // a no-op here, since d3d9 COM objects are not reference counted (AddRef/Release above are
+    // constant stubs), exactly like GetRenderTarget/GetBackBuffer in this module.
+    exports['IDirect3DDevice9_GetStreamSource'] = (_ctx, _mem, args) => {
+        const device = devices.get(args[0]);
+        const ppStreamData = args[2];
+        if (!device || !ppStreamData) return D3DERR_INVALIDCALL;
+
+        const binding = device.getStreamBinding(args[1] >>> 0);
+        if (!binding) {
+            Logger.warn(LogCategory.D3D9, `GetStreamSource: stream ${args[1] >>> 0} out of range`);
+            return D3DERR_INVALIDCALL;
+        }
+        if (!Mem.writeUint32(ppStreamData, binding.ptr)) return D3DERR_INVALIDCALL;
+        if (args[3] && !Mem.writeUint32(args[3], binding.offset)) return D3DERR_INVALIDCALL;
+        if (args[4] && !Mem.writeUint32(args[4], binding.stride)) return D3DERR_INVALIDCALL;
+        return D3D_OK;
+    };
+
+    // ProcessVertices(SrcStartIndex, DestIndex, VertexCount, pDestBuffer, pVertexDecl, Flags):
+    // software T&L of the bound streams into a destination vertex buffer.
+    let processVerticesWarned = false;
+    exports['IDirect3DDevice9_ProcessVertices'] = (ctx, _mem, args) => {
+        const device = devices.get(args[0]);
+        const pDestBuffer = args[4] >>> 0;
+        if (!device || !pDestBuffer || !vertexBufferMeta.has(pDestBuffer)) return D3DERR_INVALIDCALL;
+        if ((args[3] >>> 0) === 0) return D3D_OK;
+
+        // The real runtime succeeds here even on a hardware-VP device (wine's own
+        // dlls/d3d9/tests/visual.c asserts D3D_OK after D3DCREATE_HARDWARE_VERTEXPROCESSING,
+        // and dxvk returns D3D_OK when it cannot emulate SWVP), so returning an error would
+        // push the guest down a branch real hardware never takes. We have no CPU vertex
+        // pipeline — the FFP is WGSL and runs on the GPU — so the destination buffer keeps
+        // whatever it held. Recording the miss keeps the gap answerable from harness stubs()
+        // instead of surfacing later as unexplained geometry.
+        if (!processVerticesWarned) {
+            processVerticesWarned = true;
+            Logger.error(LogCategory.D3D9,
+                'ProcessVertices: no CPU vertex pipeline — destination buffer left untouched');
+        }
+        stubRegistry.record('d3d9', 'IDirect3DDevice9_ProcessVertices', 0,
+            (Mem.readUint32(ctx.esp) ?? 0) >>> 0);
         return D3D_OK;
     };
 

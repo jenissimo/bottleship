@@ -39,10 +39,16 @@ import {
     DDLOCK_WRITEONLY,
     DDLOCK_DISCARDCONTENTS,
     IID_IDirectDrawGammaControl,
+    IID_IDirect3DDevice3,
+    IID_IDirect3DHALDevice,
+    IID_IDirect3DRGBDevice,
+    IID_IDirect3DRampDevice,
+    IID_IDirect3DMMXDevice,
+    D3DRENDERSTATE_COLORKEYENABLE,
 } from "./constants";
 import { bytesToGuid, readRect, Rect, absToRel, readU16Abs, readU32Abs } from "./helpers";
 import { writeSurfaceDescV1 } from "./structs";
-import { DirectDrawSurfaceObject, DirectDrawSurfaceState, Direct3DTextureObject, Direct3DTexture2Object, DirectDrawGammaControlObject, DirectDrawClipperObject, isBitmapTexture, isRenderSurface } from "./com-objects";
+import { DirectDrawSurfaceObject, DirectDrawSurfaceState, Direct3DTextureObject, Direct3DTexture2Object, DirectDrawGammaControlObject, DirectDrawClipperObject, Direct3DDevice3Object, isBitmapTexture, isRenderSurface } from "./com-objects";
 import { writePixelFormat, writeSurfaceDesc } from "./structs";
 import { isValidAddress, isSafeSurfaceAddress, overlapsThunkCode } from "../../core/memory/address-guard";
 import { ComObjectFactory } from "../../core/com/base-com-object";
@@ -525,6 +531,45 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
 
             Logger.log(LogCategory.DDRAW,
                 `IDirectDrawSurface7_QueryInterface -> Created IDirectDrawGammaControl at 0x${objAddr.toString(16)}`);
+            return DD_OK;
+        }
+
+        // Device GUID on a surface = the DX2/3 way to create a D3D device, with THIS
+        // surface as the render target (IDirect3D::CreateDevice only arrived in DX5).
+        // Every rasterizer GUID lands on the same device; we have one renderer.
+        if (
+            normalizedIid === IID_IDirect3DHALDevice.toLowerCase() ||
+            normalizedIid === IID_IDirect3DRGBDevice.toLowerCase() ||
+            normalizedIid === IID_IDirect3DRampDevice.toLowerCase() ||
+            normalizedIid === IID_IDirect3DMMXDevice.toLowerCase()
+        ) {
+            if (!ppvObject || !isValidAddress(mem, ppvObject, 4)) return E_POINTER;
+
+            const vtableAddr = context.vtables.IDirect3DDevice?.address;
+            if (!vtableAddr) return E_NOINTERFACE;
+
+            // Device3Object for the full state (transforms/render states/viewport),
+            // presented over the v1 vtable — same split as IDirect3D2_CreateDevice.
+            const devObj = ComObjectFactory.create(IID_IDirect3DDevice3, vtableAddr) as Direct3DDevice3Object | null;
+            if (!devObj) return E_FAIL;
+
+            devObj.setRenderTarget(thisPtr);
+            obj.addRef(); // the device holds a reference on its render target
+
+            // D3DRENDERSTATE_COLORKEYENABLE did not exist before DX5: on a v1 device a
+            // texture that carries a source colour key IS keyed, with no state to turn
+            // that off. Gating on the render state (default 0) makes every keyed sprite
+            // of an execute-buffer title paint its key colour as an opaque block.
+            devObj.setRenderState(D3DRENDERSTATE_COLORKEYENABLE, 1);
+
+            const objAddr = allocateComObject(context.process.memory, mem, vtableAddr);
+            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            view.setUint32(ppvObject, objAddr, true);
+            context.resourceProvider.mapAddressToHandle(objAddr, devObj.handle);
+
+            Logger.log(LogCategory.DDRAW,
+                `IDirectDrawSurface7_QueryInterface -> Created IDirect3DDevice (v1) at 0x${objAddr.toString(16)} ` +
+                `rt=0x${thisPtr.toString(16)} iid=${iidStr}`);
             return DD_OK;
         }
 

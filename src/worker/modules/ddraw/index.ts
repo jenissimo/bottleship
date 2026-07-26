@@ -1,3 +1,4 @@
+import { surfaceAt } from "./helpers";
 import { IModule } from '../../core/module';
 import { Process } from '../../core/process';
 import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
@@ -38,6 +39,7 @@ import {
     IID_IDirect3D7,
     IID_IDirect3DDevice,
     IID_IDirect3DDevice2,
+    IID_IDirect3DExecuteBuffer,
     IID_IDirect3DDevice3,
     IID_IDirect3DDevice7,
     IID_IDirect3DTexture,
@@ -47,6 +49,7 @@ import {
     IID_IDirect3DViewport3,
     IID_IDirectDrawGammaControl,
     IID_IDirect3DLight,
+    IID_IDirect3DMaterial,
     IID_IDirect3DMaterial3,
     IID_IDirect3DVertexBuffer,
     allocateComObject,
@@ -72,6 +75,7 @@ import {
     DirectDrawGammaControlObject,
     Direct3DLightObject,
     Direct3DMaterial3Object,
+    Direct3DExecuteBufferObject,
     Direct3DVertexBufferObject,
     DirectDrawSurfaceState,
     SurfaceFormat,
@@ -371,7 +375,7 @@ export class DDraw implements IModule {
             return created;
         }
 
-        const surfaceObj = this.context.resourceProvider.getComObjectByAddress(cached) as DirectDrawSurfaceObject | null;
+        const surfaceObj = surfaceAt(this.context.resourceProvider, cached);
         if (!surfaceObj) {
             Logger.warn(LogCategory.DDRAW, `updateTextureFromBitmap: Cached surface 0x${cached.toString(16)} not found, recreating`);
             return this.createTextureFromBitmap(bitmapHandle, gdiObj);
@@ -646,7 +650,9 @@ export class DDraw implements IModule {
         ComObjectFactory.register(IID_IDirect3DDevice7, Direct3DDevice7Object);
         ComObjectFactory.register(IID_IDirectDrawGammaControl, DirectDrawGammaControlObject);
         ComObjectFactory.register(IID_IDirect3DLight, Direct3DLightObject);
+        ComObjectFactory.register(IID_IDirect3DMaterial, Direct3DMaterial3Object); // v1 material — same state, different vtable
         ComObjectFactory.register(IID_IDirect3DMaterial3, Direct3DMaterial3Object);
+        ComObjectFactory.register(IID_IDirect3DExecuteBuffer, Direct3DExecuteBufferObject);
         ComObjectFactory.register(IID_IDirect3DVertexBuffer, Direct3DVertexBufferObject);
 
 
@@ -674,7 +680,7 @@ export class DDraw implements IModule {
             if (!ctx) return;
             const primaryAddr = ctx.surfaces.primary;
             if (!primaryAddr) return;
-            const primaryObj = ctx.resourceProvider.getComObjectByAddress(primaryAddr) as DirectDrawSurfaceObject | null;
+            const primaryObj = surfaceAt(ctx.resourceProvider, primaryAddr);
             if (!primaryObj) return;
             const state = primaryObj.getState();
             // Gate on write-lock: normal games release the lock before Flip
@@ -1107,8 +1113,11 @@ export class DDraw implements IModule {
                 const visited = new Set<number>();
                 while (currentAddr && !visited.has(currentAddr)) {
                     visited.add(currentAddr);
-                    const currentObj = resourceProvider.getComObjectByAddress(currentAddr) as DirectDrawSurfaceObject | null;
-                    if (!currentObj) break;
+                    // A released surface's slot can be reused by any COM object, so a
+                    // stale attachedSurfaceAddr may resolve to a device / execute buffer —
+                    // check the type instead of assuming (the backward walk below does too).
+                    const currentObj = resourceProvider.getComObjectByAddress(currentAddr);
+                    if (!(currentObj instanceof DirectDrawSurfaceObject)) break;
                     const currentState = currentObj.getState();
                     if (currentState.attachedSurfaceAddr === primaryAddr || currentState.attachedSurfaceAddr === backBufferAddr) {
                         isPrimaryChain = true;
@@ -1140,8 +1149,8 @@ export class DDraw implements IModule {
                                     isPrimaryChain = true;
                                     break;
                                 }
-                                const checkObj = resourceProvider.getComObjectByAddress(checkAddr) as DirectDrawSurfaceObject | null;
-                                if (!checkObj) break;
+                                const checkObj = resourceProvider.getComObjectByAddress(checkAddr);
+                                if (!(checkObj instanceof DirectDrawSurfaceObject)) break;
                                 const checkState = checkObj.getState();
                                 if (checkState.attachedSurfaceAddr === 0) break;
                                 checkAddr = checkState.attachedSurfaceAddr;
@@ -1198,7 +1207,7 @@ export class DDraw implements IModule {
     async getSurfacePreview(surfaceAddr: number, maxSize: number = 512): Promise<{ data: string; width: number; height: number } | null> {
         if (!this.context) return null;
         
-        const obj = this.context.resourceProvider.getComObjectByAddress(surfaceAddr) as DirectDrawSurfaceObject | null;
+        const obj = surfaceAt(this.context.resourceProvider, surfaceAddr);
         if (!obj) return null;
         
         const state = obj.getState();

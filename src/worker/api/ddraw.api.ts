@@ -15,9 +15,11 @@ import {
     IID_IDirect3D2,
     IID_IDirect3D3,
     IID_IDirect3D7,
+    IID_IDirect3DDevice,
     IID_IDirect3DDevice2,
     IID_IDirect3DDevice3V5,
     IID_IDirect3DDevice7,
+    IID_IDirect3DExecuteBuffer,
     IID_IDirect3DTexture,
     IID_IDirect3DTexture2,
     IID_IDirect3DViewport2,
@@ -32,8 +34,11 @@ import {
     IID_IDirectDrawSurface7,
     IID_IDirectDrawGammaControl,
     IID_IDirect3DLight,
+    IID_IDirect3DMaterial,
+    IID_IDirect3DMaterial2,
     IID_IDirect3DMaterial3,
     IID_IDirect3DVertexBuffer,
+    IID_IDirect3DVertexBuffer7,
 } from "../modules/ddraw/constants";
 
 const buildParams = (count: number): ParameterDescriptor[] => {
@@ -123,7 +128,11 @@ export const IDirectDraw2: InterfaceDescriptor = {
     ],
 };
 
-// IDirectDrawSurface (v1) interface
+// IDirectDrawSurface (v1) interface — also the table handed out for
+// IID_IDirectDrawSurface2/3. v2 and v3 extend v1 by strict append and share the
+// v1 semantics for slots 0..35 (all three marshal DDSURFACEDESC, not
+// DDSURFACEDESC2), so the trailing v2/v3 slots must live here: a v1-created
+// surface QI'd as v2 calls PageLock through THIS table.
 // Method order must match ddraw.h exactly!
 // argCount = cParams + 1 (for this pointer)
 export const IDirectDrawSurface: InterfaceDescriptor = {
@@ -165,6 +174,10 @@ export const IDirectDrawSurface: InterfaceDescriptor = {
         makeMethod("UpdateOverlay", 6),         // cParams=5, +1=6
         makeMethod("UpdateOverlayDisplay", 2),  // cParams=1, +1=2
         makeMethod("UpdateOverlayZOrder", 3),   // cParams=2, +1=3
+        makeMethod("GetDDInterface", 2),        // Slot 36 — IDirectDrawSurface2
+        makeMethod("PageLock", 2),              // Slot 37 — IDirectDrawSurface2
+        makeMethod("PageUnlock", 2),            // Slot 38 — IDirectDrawSurface2
+        makeMethod("SetSurfaceDesc", 3),        // Slot 39 — IDirectDrawSurface3 (LPDDSURFACEDESC v1)
     ],
 };
 
@@ -465,6 +478,40 @@ export const IDirect3DLight: InterfaceDescriptor = {
     ],
 };
 
+// IDirect3DMaterial (v1) interface — DirectX 2/3.
+// NOT prefix-compatible with Material2/3: v1 carries Initialize at slot 3, so every
+// later method sits one slot higher. Handing a Material3 vtable to a v1 client turns
+// SetMaterial into GetMaterial and runs GetHandle off the end of the table.
+export const IDirect3DMaterial: InterfaceDescriptor = {
+    name: "IDirect3DMaterial",
+    inherits: "IUnknown",
+    iid: IID_IDirect3DMaterial,
+    methods: [
+        ...IUnknown.methods.map(m => ({ ...m, name: m.name })),
+        makeMethod("Initialize", 2),     // Slot 3
+        makeMethod("SetMaterial", 2),    // Slot 4
+        makeMethod("GetMaterial", 2),    // Slot 5
+        makeMethod("GetHandle", 3),      // Slot 6
+        makeMethod("Reserve", 1),        // Slot 7 — never implemented, DDERR_UNSUPPORTED
+        makeMethod("Unreserve", 1),      // Slot 8 — never implemented, DDERR_UNSUPPORTED
+    ],
+};
+
+// IDirect3DMaterial2 interface — DirectX 5. Same shape as Material3 (GetHandle
+// takes an IDirect3DDevice2 instead of a Device3; identical ABI), but a distinct
+// IID, so it needs its own table for QueryInterface to hand back.
+export const IDirect3DMaterial2: InterfaceDescriptor = {
+    name: "IDirect3DMaterial2",
+    inherits: "IUnknown",
+    iid: IID_IDirect3DMaterial2,
+    methods: [
+        ...IUnknown.methods.map(m => ({ ...m, name: m.name })),
+        makeMethod("SetMaterial", 2),    // Slot 3
+        makeMethod("GetMaterial", 2),    // Slot 4
+        makeMethod("GetHandle", 3),      // Slot 5
+    ],
+};
+
 // IDirect3DMaterial3 interface
 // Vtable: QI, AddRef, Release, SetMaterial, GetMaterial, GetHandle
 export const IDirect3DMaterial3: InterfaceDescriptor = {
@@ -491,6 +538,72 @@ export const IDirect3DVertexBuffer: InterfaceDescriptor = {
         makeMethod("ProcessVertices", 8),
         makeMethod("GetVertexBufferDesc", 2),
         makeMethod("Optimize", 3),
+    ],
+};
+
+// IDirect3DVertexBuffer7 interface (DX7). Slots 0-7 match the DX6 buffer, but the
+// table is one longer — ProcessVerticesStrided is only on v7.
+export const IDirect3DVertexBuffer7: InterfaceDescriptor = {
+    name: "IDirect3DVertexBuffer7",
+    inherits: "IUnknown",
+    iid: IID_IDirect3DVertexBuffer7,
+    methods: [
+        ...IUnknown.methods.map(m => ({ ...m, name: m.name })),
+        makeMethod("Lock", 4),
+        makeMethod("Unlock", 1),
+        makeMethod("ProcessVertices", 8),
+        makeMethod("GetVertexBufferDesc", 2),
+        makeMethod("Optimize", 3),
+        makeMethod("ProcessVerticesStrided", 8), // Slot 8
+    ],
+};
+
+// IDirect3DDevice (v1) interface - DirectX 2/3 SDK, still the device DX5-era titles
+// get from IDirectDrawSurface::QueryInterface(IID_IDirect3D*Device). Execute-buffer
+// era: no DrawPrimitive, and matrices are device-side handles.
+// Method order MUST match d3d.h vtable exactly!
+export const IDirect3DDevice: InterfaceDescriptor = {
+    name: "IDirect3DDevice",
+    inherits: "IUnknown",
+    iid: IID_IDirect3DDevice,
+    methods: [
+        ...IUnknown.methods.map(m => ({ ...m, name: m.name })),
+        makeMethod("Initialize", 4),           // Slot 3: (this, lpD3D, lpGUID, lpd3ddvdesc)
+        makeMethod("GetCaps", 3),              // Slot 4
+        makeMethod("SwapTextureHandles", 3),   // Slot 5
+        makeMethod("CreateExecuteBuffer", 4),  // Slot 6
+        makeMethod("GetStats", 2),             // Slot 7
+        makeMethod("Execute", 4),              // Slot 8
+        makeMethod("AddViewport", 2),          // Slot 9
+        makeMethod("DeleteViewport", 2),       // Slot 10
+        makeMethod("NextViewport", 4),         // Slot 11
+        makeMethod("Pick", 5),                 // Slot 12
+        makeMethod("GetPickRecords", 3),       // Slot 13
+        makeMethod("EnumTextureFormats", 3),   // Slot 14
+        makeMethod("CreateMatrix", 2),         // Slot 15
+        makeMethod("SetMatrix", 3),            // Slot 16
+        makeMethod("GetMatrix", 3),            // Slot 17
+        makeMethod("DeleteMatrix", 2),         // Slot 18
+        makeMethod("BeginScene", 1),           // Slot 19
+        makeMethod("EndScene", 1),             // Slot 20
+        makeMethod("GetDirect3D", 2),          // Slot 21
+    ],
+};
+
+// IDirect3DExecuteBuffer interface - DirectX 2/3 SDK
+export const IDirect3DExecuteBuffer: InterfaceDescriptor = {
+    name: "IDirect3DExecuteBuffer",
+    inherits: "IUnknown",
+    iid: IID_IDirect3DExecuteBuffer,
+    methods: [
+        ...IUnknown.methods.map(m => ({ ...m, name: m.name })),
+        makeMethod("Initialize", 3),      // Slot 3
+        makeMethod("Lock", 2),            // Slot 4
+        makeMethod("Unlock", 1),          // Slot 5
+        makeMethod("SetExecuteData", 2),  // Slot 6
+        makeMethod("GetExecuteData", 2),  // Slot 7
+        makeMethod("Validate", 5),        // Slot 8: (this, lpdwOffset, lpFunc, lpUserArg, dwReserved)
+        makeMethod("Optimize", 2),        // Slot 9
     ],
 };
 
@@ -648,6 +761,7 @@ export const IDirect3DTexture: InterfaceDescriptor = {
         makeMethod("GetHandle", 3),
         makeMethod("PaletteChanged", 3),
         makeMethod("Load", 2),
+        makeMethod("Unload", 1),
     ],
 };
 
@@ -813,8 +927,10 @@ export const ddrawModule: ModuleDescriptor = {
         IDirect3D,
         IDirect3D2,
         IDirect3D3,
+        IDirect3DDevice,
         IDirect3DDevice2,
         IDirect3DDevice3,
+        IDirect3DExecuteBuffer,
         IDirect3DViewport3,
         IDirect3DViewport2,
         IDirect3DTexture,
@@ -823,7 +939,10 @@ export const ddrawModule: ModuleDescriptor = {
         IDirect3DDevice7,
         IDirectDrawGammaControl,
         IDirect3DLight,
+        IDirect3DMaterial,
+        IDirect3DMaterial2,
         IDirect3DMaterial3,
         IDirect3DVertexBuffer,
+        IDirect3DVertexBuffer7,
     ],
 };

@@ -171,8 +171,22 @@ export class VideoEngine {
             Logger.log(LogCategory.SYSTEM, `[VideoEngine] Fetching ${url} …`);
             const resp = await fetch(url);
             if (!resp.ok) throw new Error(`fetch ${url} → ${resp.status}`);
-            const bytes  = await resp.arrayBuffer();
-            const result = await WebAssembly.instantiate(bytes, WASI_IMPORTS as WebAssembly.Imports);
+            // Streaming form so V8's implicit wasm code cache engages (keyed by URL, only fires
+            // for *Streaming, ~128 KB threshold — this module is ~3 MB). Falls back to the
+            // buffered compile when streaming is unavailable, e.g. a host serving the wrong
+            // MIME type: this is a startup-latency optimization, never a correctness dependency.
+            let result: WebAssembly.WebAssemblyInstantiatedSource;
+            try {
+                result = await WebAssembly.instantiateStreaming(resp, WASI_IMPORTS as WebAssembly.Imports);
+            } catch (streamErr) {
+                Logger.warn(
+                    LogCategory.SYSTEM,
+                    `[VideoEngine] streaming instantiate failed (${streamErr instanceof Error ? streamErr.message : String(streamErr)}); ` +
+                    `falling back to buffered compile — wasm code cache will not engage`,
+                );
+                const bytes = await (await fetch(url)).arrayBuffer();
+                result = await WebAssembly.instantiate(bytes, WASI_IMPORTS as WebAssembly.Imports);
+            }
             this.instance = result.instance;
             this.memView  = new Uint8Array((this.instance.exports.memory as WebAssembly.Memory).buffer);
             Logger.log(LogCategory.SYSTEM, "[VideoEngine] WASM loaded successfully");

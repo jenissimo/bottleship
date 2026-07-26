@@ -71,7 +71,8 @@ export function registerDirectDraw2Exports(
         return internalCreateSurface(mem, lpDDSurfaceDesc, lplpDDSurface, "IDirectDrawSurface", {
             threadId,
             enableDiagnostics: true,
-            surfaceIid: IID_IDirectDrawSurface
+            surfaceIid: IID_IDirectDrawSurface,
+            ownerAddr: args[0]
         });
     };
 

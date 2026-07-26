@@ -16,6 +16,7 @@ import { createD3DInterfaceExports } from "./d3d-impl";
 import { createDeviceExports } from "./device-impl";
 import { createTextureExports } from "./texture-impl";
 import { createLightMaterialExports } from "./light-material-impl";
+import { createExecuteBufferExports } from "./execute-buffer-impl";
 
 // D3D_OK constant
 const D3D_OK = 0;
@@ -34,13 +35,17 @@ export const createD3DExports = (context: DDrawContext): Record<string, ThunkImp
     sharedDrawHandler = drawHandler;
 
     // 2. Combine exports from all modules
-    return {
+    const exports: Record<string, ThunkImplementation> = {
         ...createViewportExports(context),
         ...createD3DInterfaceExports(context),
         ...createDeviceExports(context, textureManager, drawHandler),
         ...createTextureExports(context, textureManager),
         ...createLightMaterialExports(context),
     };
+    // The execute-buffer interpreter replays opcodes onto the handlers above,
+    // so it is wired last and takes the merged table.
+    Object.assign(exports, createExecuteBufferExports(context, drawHandler, exports));
+    return exports;
 };
 
 /**

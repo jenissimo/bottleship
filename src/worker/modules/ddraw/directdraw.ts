@@ -88,7 +88,7 @@ import {
     DDSCL_EXCLUSIVE,
     DDSCL_FULLSCREEN,
 } from "./constants";
-import { bytesToGuid } from "./helpers";
+import { bytesToGuid, surfaceAt } from "./helpers";
 import { isValidAddress, isSafeSurfaceAddress, overlapsThunkCode } from "../../core/memory/address-guard";
 import { computePitch, normalizeSurfaceDesc, readSurfaceDesc, readSurfaceDescV1, writeDisplayModeDesc, writeDisplayModeDescV1, writeSurfaceDesc, writeSurfaceDescV1 } from "./structs";
 import { DirectDrawSurfaceObject, DirectDrawSurfaceState, DirectDrawPaletteObject } from "./com-objects";
@@ -355,11 +355,14 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         lpDesc: number, 
         lplpSurf: number, 
         vtableName: string,
-        options?: { threadId?: number; enableDiagnostics?: boolean; surfaceIid?: string }
+        options?: { threadId?: number; enableDiagnostics?: boolean; surfaceIid?: string; ownerAddr?: number }
     ): number => {
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         const threadId = options?.threadId ?? 0;
         const enableDiagnostics = options?.enableDiagnostics ?? false;
+        // Every surface of the chain remembers the IDirectDraw interface it came from,
+        // so GetDDInterface can hand back that same version.
+        const ownerAddr = options?.ownerAddr ?? 0;
 
         if (!lplpSurf || !isValidAddress(mem, lplpSurf, 4)) return E_POINTER;
         initReturnPtr(lplpSurf);
@@ -845,6 +848,7 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
             view.setUint32(lplpSurf, 0, true);
             return E_FAIL;
         }
+        obj.setDDrawOwnerAddr(ownerAddr);
 
         const objAddr = allocateComObject(context.process.memory, mem, vtableAddr);
         view.setUint32(lplpSurf, objAddr, true);
@@ -951,13 +955,14 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
                     Logger.warn(LogCategory.DDRAW, `CreateSurface: Failed to create COM object for mip level ${level}, stopping mip chain`);
                     break;
                 }
+                mipObj.setDDrawOwnerAddr(ownerAddr);
                 surfaceState.mipSublevels.push(mipState);
 
                 const mipAddr = allocateComObject(context.process.memory, mem, vtableAddr);
                 context.resourceProvider.mapAddressToHandle(mipAddr, mipObj.handle);
                 context.resourceProvider.registerSurfacePtr(mipObj.handle, mipSurfacePtr);
 
-                const prevObj = context.resourceProvider.getComObjectByAddress(prevAddr) as DirectDrawSurfaceObject | null;
+                const prevObj = surfaceAt(context.resourceProvider, prevAddr);
                 if (!prevObj) {
                     Logger.warn(LogCategory.DDRAW, `CreateSurface: Missing previous mip object at 0x${prevAddr.toString(16)}, stopping mip chain`);
                     break;
@@ -1054,10 +1059,11 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
                 ) as DirectDrawSurfaceObject | null;
 
                 if (backbufferObj) {
+                    backbufferObj.setDDrawOwnerAddr(ownerAddr);
                     const backbufferAddr = allocateComObject(context.process.memory, mem, vtableAddr);
                     context.resourceProvider.mapAddressToHandle(backbufferAddr, backbufferObj.handle);
 
-                    const prevObj = context.resourceProvider.getComObjectByAddress(lastAddr) as DirectDrawSurfaceObject | null;
+                    const prevObj = surfaceAt(context.resourceProvider, lastAddr);
                     if (prevObj) {
                         prevObj.setAttachedSurface(backbufferAddr);
                     }
@@ -1290,9 +1296,8 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
 
     exports["IDirectDraw_CreateSurface"] = (ctx, mem, args) => {
         // v1: CreateSurface(this, lpDDSurfaceDesc, lplpDDSurface, pUnkOuter) - 4 args
-        // Uses DDSURFACEDESC (108 bytes) but internalCreateSurface handles dwSize
-        // Use IDirectDrawSurface7 vtable — same slot layout for first 36 methods,
-        // and IDirectDrawSurface7 has full method implementations
+        // Uses DDSURFACEDESC (108 bytes) but internalCreateSurface handles dwSize.
+        // The surface gets the v1 vtable, which also serves a QI to IDirectDrawSurface2/3.
         const lpDDSurfaceDesc = args[1];
         const lplpDDSurface = args[2];
         const threadId = System.getInstance().scheduler?.getCurrentThreadId?.() ?? 0;
@@ -1305,7 +1310,8 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         return internalCreateSurface(mem, lpDDSurfaceDesc, lplpDDSurface, "IDirectDrawSurface", {
             threadId,
             enableDiagnostics: true,
-            surfaceIid: IID_IDirectDrawSurface
+            surfaceIid: IID_IDirectDrawSurface,
+            ownerAddr: args[0]
         });
     };
 
@@ -1403,7 +1409,8 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         return internalCreateSurface(mem, lpDDSurfaceDesc, lplpDDSurface, "IDirectDrawSurface4", {
             threadId,
             enableDiagnostics: false,
-            surfaceIid: IID_IDirectDrawSurface4
+            surfaceIid: IID_IDirectDrawSurface4,
+            ownerAddr: args[0]
         });
     };
 
@@ -1616,7 +1623,8 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         return internalCreateSurface(mem, lpDDSurfaceDesc, lplpDDSurface, "IDirectDrawSurface7", {
             threadId,
             enableDiagnostics: false,
-            surfaceIid: IID_IDirectDrawSurface7
+            surfaceIid: IID_IDirectDrawSurface7,
+            ownerAddr: args[0]
         });
     };
 
@@ -2079,7 +2087,7 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
             return DDERR_NOTFOUND;
         }
 
-        const primaryObj = context.resourceProvider.getComObjectByAddress(primaryAddr) as DirectDrawSurfaceObject | null;
+        const primaryObj = surfaceAt(context.resourceProvider, primaryAddr);
         if (!primaryObj) {
             Logger.verbose(LogCategory.DDRAW, `FlipToGDISurface: primary missing at 0x${primaryAddr.toString(16)}`);
             return DDERR_NOTFOUND;
@@ -2122,7 +2130,7 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
             return DDERR_NOTFOUND;
         }
 
-        const primaryObj = context.resourceProvider.getComObjectByAddress(primaryAddr) as DirectDrawSurfaceObject | null;
+        const primaryObj = surfaceAt(context.resourceProvider, primaryAddr);
         if (!primaryObj) {
             Logger.verbose(LogCategory.DDRAW, `FlipToGDISurface: primary missing at 0x${primaryAddr.toString(16)}`);
             return DDERR_NOTFOUND;

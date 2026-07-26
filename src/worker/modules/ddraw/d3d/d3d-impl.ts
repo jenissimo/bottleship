@@ -34,6 +34,10 @@ import { computeFvfStride } from "../../../backends/webgpu/ddraw/compute/vertex-
 import { EmulatorConfig } from "../../../core/emulator-config-manager";
 import { initReturnPtr } from "../../../backends/webgpu/shared/dx-com-helpers";
 
+// ddraw.h aliases these onto the standard COM codes, not MAKE_DDHRESULT values.
+const DDERR_INVALIDPARAMS = 0x80070057; // E_INVALIDARG
+const DDERR_UNSUPPORTED = 0x80004001;   // E_NOTIMPL
+
 export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => {
     const exports: D3DExports = {};
     const resourceProvider = context.resourceProvider;
@@ -69,12 +73,15 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
         return exports["IDirect3D3_EnumDevices"]!(ctx, mem, args);
     };
 
-    exports["IDirect3D_CreateViewport"] = () => D3D_OK;
+    exports["IDirect3D_CreateViewport"] = (ctx, mem, args) => {
+        return exports["IDirect3D3_CreateViewport"]!(ctx, mem, args);
+    };
     exports["IDirect3D_CreateLight"] = (ctx, mem, args) => {
         return exports["IDirect3D3_CreateLight"]!(ctx, mem, args);
     };
+    // v1 gets the v1 material vtable — Material3's layout is one slot short (no Initialize).
     exports["IDirect3D_CreateMaterial"] = (ctx, mem, args) => {
-        return exports["IDirect3D3_CreateMaterial"]!(ctx, mem, args);
+        return createMaterial(mem, args[1], "IDirect3DMaterial");
     };
     exports["IDirect3D_FindDevice"] = (ctx, mem, args) => {
         return exports["IDirect3D3_FindDevice"]!(ctx, mem, args);
@@ -477,14 +484,14 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
     };
 
     // IDirect3D3::CreateMaterial(this, lplpMaterial, pUnkOuter)
-    exports["IDirect3D3_CreateMaterial"] = (ctx, mem, args) => {
-        const lplpMaterial = args[1];
+    /** Shared by every IDirect3D*::CreateMaterial — only the vtable layout differs. */
+    const createMaterial = (mem: Uint8Array, lplpMaterial: number, vtableKey: "IDirect3DMaterial" | "IDirect3DMaterial3"): number => {
         if (!lplpMaterial) return 0x80004003; // E_POINTER
         initReturnPtr(lplpMaterial);
 
-        const vtableAddr = context.vtables.IDirect3DMaterial3?.address;
+        const vtableAddr = context.vtables[vtableKey]?.address;
         if (!vtableAddr) {
-            Logger.error(LogCategory.SYSTEM, `IDirect3D3_CreateMaterial: IDirect3DMaterial3 vtable not found!`);
+            Logger.error(LogCategory.SYSTEM, `CreateMaterial: ${vtableKey} vtable not found!`);
             return 0x80004002;
         }
 
@@ -499,8 +506,12 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
         view.setUint32(lplpMaterial, objAddr, true);
         resourceProvider.mapAddressToHandle(objAddr, obj.handle);
 
-        Logger.log(LogCategory.SYSTEM, `IDirect3D3_CreateMaterial -> 0x${objAddr.toString(16)} (handle=0x${obj.handle.toString(16)})`);
+        Logger.log(LogCategory.SYSTEM, `CreateMaterial(${vtableKey}) -> 0x${objAddr.toString(16)} (handle=0x${obj.handle.toString(16)})`);
         return D3D_OK;
+    };
+
+    exports["IDirect3D3_CreateMaterial"] = (ctx, mem, args) => {
+        return createMaterial(mem, args[1], "IDirect3DMaterial3");
     };
 
     // IDirect3D3::FindDevice(this, lpD3DFDS, lpD3DFDR)
@@ -655,6 +666,39 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
     };
 
     exports["IDirect3DVertexBuffer_Optimize"] = () => D3D_OK;
+
+    // --- IDirect3DVertexBuffer7 ---
+    // Slots 0-7 are the DX6 buffer verbatim; only the ProcessVerticesStrided tail is new.
+    const vertexBuffer7SharedMethods = [
+        "QueryInterface", "AddRef", "Release", "Lock", "Unlock",
+        "ProcessVertices", "GetVertexBufferDesc", "Optimize",
+    ];
+    for (const method of vertexBuffer7SharedMethods) {
+        const v6key = `IDirect3DVertexBuffer_${method}`;
+        if (exports[v6key]) exports[`IDirect3DVertexBuffer7_${method}`] = exports[v6key];
+    }
+
+    // ProcessVerticesStrided(this, dwVertexOp, dwDestIndex, dwCount, lpStrideData,
+    //                        dwVertexTypeDesc, lpD3DDevice, dwFlags)
+    // Gathering the strided arrays is only half the contract — D3DVOP_TRANSFORM et al.
+    // must also run the FFP into the destination FVF, and we have no vertex-processing
+    // stage on this path. Report it unimplemented rather than returning D3D_OK over a
+    // destination buffer we never wrote.
+    exports["IDirect3DVertexBuffer7_ProcessVerticesStrided"] = (ctx, mem, args) => {
+        const thisPtr = args[0];
+        const dwDestIndex = args[2];
+        const dwCount = args[3];
+        const lpStrideData = args[4];
+
+        const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DVertexBufferObject | null;
+        if (!obj || !lpStrideData) return DDERR_INVALIDPARAMS;
+        if (dwDestIndex + dwCount > obj.getNumVertices()) return DDERR_INVALIDPARAMS;
+
+        Logger.warn(LogCategory.SYSTEM,
+            `IDirect3DVertexBuffer7_ProcessVerticesStrided: op=0x${args[1].toString(16)} dest=${dwDestIndex} ` +
+            `count=${dwCount} fvf=0x${args[5].toString(16)} -> DDERR_UNSUPPORTED (no vertex-processing stage)`);
+        return DDERR_UNSUPPORTED;
+    };
 
     // --- IDirect3D7 ---
 
@@ -963,10 +1007,9 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
             return 0x8876017c; // DDERR_OUTOFMEMORY
         }
 
-        // Reuse the DX6 IDirect3DVertexBuffer vtable — methods are identical
-        const vtableAddr = context.vtables.IDirect3DVertexBuffer?.address;
+        const vtableAddr = context.vtables.IDirect3DVertexBuffer7?.address;
         if (!vtableAddr) {
-            Logger.error(LogCategory.SYSTEM, `IDirect3D7_CreateVertexBuffer: no vtable for IDirect3DVertexBuffer`);
+            Logger.error(LogCategory.SYSTEM, `IDirect3D7_CreateVertexBuffer: no vtable for IDirect3DVertexBuffer7`);
             return 0x80004002;
         }
 

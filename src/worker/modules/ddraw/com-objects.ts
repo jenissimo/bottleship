@@ -10,6 +10,7 @@ import {
     IID_IDirect3D7,
     IID_IDirect3DDevice,
     IID_IDirect3DDevice2,
+    IID_IDirect3DExecuteBuffer,
     IID_IDirect3DDevice3,
     IID_IDirect3DDevice3V5,
     IID_IDirect3DDevice7,
@@ -336,6 +337,12 @@ export class DirectDrawSurfaceObject extends BaseComObject {
     // Cache for texture interface objects (COM Identity: same surface -> same texture interface)
     private cachedTexture2Handle: number = 0;
     private cachedTextureHandle: number = 0;
+    /**
+     * Guest address of the IDirectDraw interface this surface was created through.
+     * GetDDInterface must return that exact interface version — a surface made via
+     * IDirectDraw::CreateSurface hands back an IDirectDraw, never an IDirectDraw7.
+     */
+    private ddrawOwnerAddr: number = 0;
 
     constructor(vtableAddress: number, state: DirectDrawSurfaceState) {
         super(IID_IDirectDrawSurface7, vtableAddress);
@@ -364,6 +371,14 @@ export class DirectDrawSurfaceObject extends BaseComObject {
 
     setCachedTextureHandle(handle: number): void {
         this.cachedTextureHandle = handle;
+    }
+
+    getDDrawOwnerAddr(): number {
+        return this.ddrawOwnerAddr;
+    }
+
+    setDDrawOwnerAddr(addr: number): void {
+        this.ddrawOwnerAddr = addr;
     }
 
     /**
@@ -1923,6 +1938,54 @@ export class Direct3DDeviceObject extends BaseComObject {
 
     protected destroy(): void {
         Logger.verbose(LogCategory.COM, "Direct3DDeviceObject destroyed");
+    }
+}
+
+/** D3DEXECUTEDATA — where the vertices and the instruction stream sit inside the buffer. */
+export interface ExecuteData {
+    vertexOffset: number;
+    vertexCount: number;
+    instructionOffset: number;
+    instructionLength: number;
+    hVertexOffset: number;
+}
+
+/**
+ * Direct3DExecuteBuffer COM object — a guest-visible byte buffer plus the
+ * D3DEXECUTEDATA describing it. The guest Locks it, writes vertices and an
+ * opcode stream, then hands it to IDirect3DDevice::Execute.
+ */
+export class Direct3DExecuteBufferObject extends BaseComObject {
+    private dataAddr = 0;
+    private dataSize = 0;
+    private locked = false;
+    private execData: ExecuteData = {
+        vertexOffset: 0, vertexCount: 0, instructionOffset: 0, instructionLength: 0, hVertexOffset: 0,
+    };
+
+    constructor(vtableAddress: number) {
+        super(IID_IDirect3DExecuteBuffer, vtableAddress);
+    }
+
+    setData(addr: number, size: number): void {
+        this.dataAddr = addr;
+        this.dataSize = size;
+    }
+    getDataAddr(): number { return this.dataAddr; }
+    getDataSize(): number { return this.dataSize; }
+
+    setLocked(v: boolean): void { this.locked = v; }
+    isLocked(): boolean { return this.locked; }
+
+    setExecuteData(d: ExecuteData): void { this.execData = d; }
+    getExecuteData(): ExecuteData { return this.execData; }
+
+    protected destroy(): void {
+        if (this.dataAddr) {
+            System.getInstance().process?.memory?.free(this.dataAddr);
+            this.dataAddr = 0;
+        }
+        Logger.verbose(LogCategory.COM, "Direct3DExecuteBufferObject destroyed");
     }
 }
 

@@ -136,7 +136,7 @@ export function createWglExports(ctx: OpenGLContext): Record<string, ThunkImplem
 
     exports['wglSwapBuffers'] = (_c, _m, args): number => {
         const hdc = args[0] >>> 0;
-        Logger.log(LogCategory.GDI32, `wglSwapBuffers(hdc=0x${hdc.toString(16)}) cmds=${ctx.commands.length} texs=${ctx.textures.size}`);
+        Logger.verbose(LogCategory.GDI32, `wglSwapBuffers(hdc=0x${hdc.toString(16)}) cmds=${ctx.commands.count} texs=${ctx.textures.size}`);
         // Present the frame
         if (ctx.presenter && typeof ctx.presenter.present === 'function') {
             ctx.presenter.present();

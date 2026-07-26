@@ -17,6 +17,8 @@ import { DDSCAPS_SYSTEMMEMORY, DDSCAPS_ALLOCONLOAD } from "../constants";
 import { setAuthorityCpu, setAuthorityGpu, syncActiveGdiContext, surfaceSyncManager } from "../surface-sync";
 import { propagateSurfaceStateToRegistry } from "./texture-manager";
 import { D3DExports, D3D_OK, D3DERR_INVALIDCALL, TextureManager } from "./types";
+
+const DDERR_UNSUPPORTED = 0x8000ffff;
 import { convertRGBAToSurface } from "../gpu-texture-utils";
 import {
     decodeSurfaceFormatToRgba8,
@@ -434,6 +436,11 @@ export const createTextureExports = (
         }
         return markDirtyAndFinish();
     };
+
+    // Slot 7 of IDirect3DTexture — the DX5 SDK documents it as never implemented, and the
+    // retail driver returns DDERR_UNSUPPORTED. Games call it when tearing textures down for a
+    // mode change, so the slot must exist even though it does nothing.
+    exports["IDirect3DTexture_Unload"] = () => DDERR_UNSUPPORTED;
 
     // --- IDirect3DTexture2 ---
 

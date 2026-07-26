@@ -30,6 +30,8 @@ import { statsOverlay } from "../../core/stats-overlay";
 export class DDrawPresenter implements RenderActive {
     private process: Process;
     private canvas: OffscreenCanvas | null = null;
+    /** Last frame handed to the canvas — the source captureFrame() reads back. */
+    private lastPresented: { view: GPUTextureView; width: number; height: number } | null = null;
     private ctx: OffscreenCanvasRenderingContext2D | null = null;
     private counters: Record<string, number> = { frames: 0 };
     private lastPresentLog = 0;
@@ -86,6 +88,7 @@ export class DDrawPresenter implements RenderActive {
         );
         this.canvas = null;
         this.ctx = null;
+        this.lastPresented = null;
         this.counters = { frames: 0 };
         // Reset diagnostic counters as well
         this.lastPresentLog = 0;
@@ -119,11 +122,88 @@ export class DDrawPresenter implements RenderActive {
         };
     }
 
+    /**
+     * PNG of what was last presented. `this.canvas` is only the CPU path's 2D
+     * scratch surface — a title whose frames live in GPU_ONLY surfaces (any 3D
+     * DDraw game) never draws into it, so capturing it hands back a blank image.
+     * Read the presented GPU texture back instead, and force the alpha channel
+     * opaque: the guest primary is an RGB565/555 display mode with no alpha, so
+     * whatever the 3D blend modes left in those bits is not part of the frame.
+     */
     async captureFrame(): Promise<Blob> {
+        const gpu = this.lastPresented;
+        if (gpu) {
+            const blob = await this.captureFromGpu(gpu);
+            if (blob) return blob;
+        }
         if (!this.canvas) {
             return new Blob();
         }
         return this.canvas.convertToBlob();
+    }
+
+    private async captureFromGpu(src: { view: GPUTextureView; width: number; height: number }): Promise<Blob | null> {
+        const backend = System.getInstance().services?.render?.getBackend?.() as WebGPUBackend | undefined;
+        const device = backend?.getDevice?.();
+        const queue = backend?.getQueue?.();
+        const format = backend?.getFormat?.();
+        if (!device || !queue || !format) return null;
+
+        const { width, height } = src;
+        if (!width || !height) return null;
+
+        // Blit through the same present path (post-fx included) into a copyable
+        // target — the canvas texture itself is not readable after present.
+        const target = device.createTexture({
+            size: { width, height, depthOrArrayLayers: 1 },
+            format,
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+        });
+        const bytesPerRow = Math.ceil((width * 4) / 256) * 256;
+        const readback = device.createBuffer({
+            size: bytesPerRow * height,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
+        try {
+            const encoder = device.createCommandEncoder();
+            backend!.drawTexture(src.view, target.createView(), encoder, true, undefined, undefined, undefined, undefined,
+                { srcW: width, srcH: height, outW: width, outH: height });
+            encoder.copyTextureToBuffer(
+                { texture: target },
+                { buffer: readback, bytesPerRow },
+                { width, height, depthOrArrayLayers: 1 },
+            );
+            queue.submit([encoder.finish()]);
+            await queue.onSubmittedWorkDone();
+            await readback.mapAsync(GPUMapMode.READ);
+
+            const mapped = new Uint8Array(readback.getMappedRange());
+            const pixels = new Uint8ClampedArray(width * height * 4);
+            const swapRB = format === "bgra8unorm";
+            for (let y = 0; y < height; y++) {
+                let s = y * bytesPerRow;
+                let d = y * width * 4;
+                for (let x = 0; x < width; x++, s += 4, d += 4) {
+                    pixels[d] = mapped[s + (swapRB ? 2 : 0)]!;
+                    pixels[d + 1] = mapped[s + 1]!;
+                    pixels[d + 2] = mapped[s + (swapRB ? 0 : 2)]!;
+                    pixels[d + 3] = 255;
+                }
+            }
+            readback.unmap();
+
+            const canvas = new OffscreenCanvas(width, height);
+            const ctx = canvas.getContext("2d");
+            if (!ctx) return null;
+            ctx.putImageData(new ImageData(pixels, width, height), 0, 0);
+            return await canvas.convertToBlob({ type: "image/png" });
+        } catch (err) {
+            Logger.warn(LogCategory.SYSTEM, `DDrawPresenter.captureFrame: GPU readback failed — ${(err as Error).message}`);
+            return null;
+        } finally {
+            readback.destroy();
+            target.destroy();
+        }
     }
 
     async present(surface: DirectDrawSurfaceState, mem: Uint8Array, options: { throttle?: boolean; frameAlreadyMarked?: boolean; snapshotTextureView?: GPUTextureView } = {}): Promise<void> {
@@ -377,6 +457,7 @@ export class DDrawPresenter implements RenderActive {
                         // integer/aspect scaling + FXAA texel sizing.
                         { srcW: surface.width, srcH: surface.height, outW: canvasTex.width, outH: canvasTex.height }
                     );
+                    this.lastPresented = { view: presentTextureView, width: surface.width, height: surface.height };
 
                     // Composite overlays (video plane → GDI → worker FPS). Shared with presentBlend.
                     this.compositeFrameOverlays(webgpu, targetView, encoder, surface.width, surface.height);

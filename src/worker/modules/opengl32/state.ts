@@ -4,7 +4,20 @@
  */
 
 import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
-import { OpenGLContext, GLDrawCommandType, GLDrawCommand, GLTexGenState, mat4Multiply } from "./context";
+import {
+    OpenGLContext, GLDrawCommandType, GLTexGenState, mat4Multiply, VERT_FLOATS,
+    CMD_I32, CMD_F32,
+    CI_MODE, CI_VERT_OFFSET, CI_VERT_COUNT, CI_FLAGS, CI_DEPTH_FUNC, CI_BLEND_SRC, CI_BLEND_DST,
+    CI_ALPHA_FUNC, CI_CULL_FACE, CI_FRONT_FACE, CI_TEX_ID0, CI_TEX_ID1, CI_TEXENV0, CI_TEXENV1,
+    CI_SHADE_MODEL, CI_FOG_MODE, CI_POLYGON_MODE, CI_STENCIL_FUNC, CI_STENCIL_REF, CI_STENCIL_MASK,
+    CI_STENCIL_FAIL, CI_STENCIL_ZFAIL, CI_STENCIL_ZPASS, CI_STENCIL_WRITE_MASK,
+    CI_SCISSOR_X, CI_SCISSOR_Y, CI_SCISSOR_W, CI_SCISSOR_H, CI_VP_X, CI_VP_Y, CI_VP_W, CI_VP_H,
+    CI_CLEAR_MASK, CI_CLEAR_STENCIL,
+    CF_ALPHA_REF, CF_FOG_R, CF_FOG_G, CF_FOG_B, CF_FOG_A, CF_FOG_DENSITY, CF_FOG_START, CF_FOG_END,
+    CF_DEPTH_RANGE_NEAR, CF_DEPTH_RANGE_FAR,
+    CF_CLEAR_R, CF_CLEAR_G, CF_CLEAR_B, CF_CLEAR_A, CF_CLEAR_DEPTH,
+    DF_BLEND, DF_COLOR_MASK_R, DF_COLOR_MASK_G, DF_COLOR_MASK_B, DF_COLOR_MASK_A, DF_SCISSOR,
+} from "./context";
 import {
     GL_RGBA, GL_UNSIGNED_BYTE, GL_QUADS,
     GL_NO_ERROR, GL_INVALID_ENUM, GL_INVALID_VALUE,
@@ -189,22 +202,30 @@ export function createStateExports(ctx: OpenGLContext): Record<string, ThunkImpl
             ctx.viewportY = args[1] | 0;
             ctx.viewportW = args[2] | 0;
             ctx.viewportH = args[3] | 0;
-            ctx.commands.push({
-                type: GLDrawCommandType.VIEWPORT,
-                x: ctx.viewportX, y: ctx.viewportY,
-                w: ctx.viewportW, h: ctx.viewportH,
-            });
+            {
+                const stream = ctx.commands;
+                const i = stream.alloc(GLDrawCommandType.VIEWPORT) * CMD_I32;
+                stream.i32[i + CI_VP_X] = ctx.viewportX;
+                stream.i32[i + CI_VP_Y] = ctx.viewportY;
+                stream.i32[i + CI_VP_W] = ctx.viewportW;
+                stream.i32[i + CI_VP_H] = ctx.viewportH;
+            }
             return 0;
         },
 
         // Clear
         glClear: (_c, _m, args) => {
-            ctx.commands.push({
-                type: GLDrawCommandType.CLEAR,
-                mask: args[0] >>> 0,
-                r: ctx.clearR, g: ctx.clearG, b: ctx.clearB, a: ctx.clearA,
-                depth: ctx.clearDepth, stencil: ctx.clearStencil,
-            });
+            const stream = ctx.commands;
+            const idx = stream.alloc(GLDrawCommandType.CLEAR);
+            const i = idx * CMD_I32;
+            const f = idx * CMD_F32;
+            stream.i32[i + CI_CLEAR_MASK] = args[0] | 0;
+            stream.i32[i + CI_CLEAR_STENCIL] = ctx.clearStencil | 0;
+            stream.f32[f + CF_CLEAR_R] = ctx.clearR;
+            stream.f32[f + CF_CLEAR_G] = ctx.clearG;
+            stream.f32[f + CF_CLEAR_B] = ctx.clearB;
+            stream.f32[f + CF_CLEAR_A] = ctx.clearA;
+            stream.f32[f + CF_CLEAR_DEPTH] = ctx.clearDepth;
             ctx.frameSnapshot.clearCalls++;
             return 0;
         },
@@ -726,8 +747,12 @@ export function createStateExports(ctx: OpenGLContext): Record<string, ThunkImpl
 
             // Two triangles forming a quad — convert window-space to clip-space
             // since the shader now expects clip-space and GPU does viewport transform.
-            const VF = 15;
-            const vertData = new Float32Array(6 * VF);
+            const VF = VERT_FLOATS;
+            const arena = ctx.vertArena;
+            arena.reserve(6);
+            const vertBase = arena.used;
+            const vertData = arena.data;
+            arena.used = vertBase + 6 * VF;
             const zv = ctx.rasterPosZ;
             const vpX = ctx.viewportX, vpY = ctx.viewportY;
             const vpW = ctx.viewportW, vpH = ctx.viewportH;
@@ -747,7 +772,7 @@ export function createStateExports(ctx: OpenGLContext): Record<string, ThunkImpl
                 [rX,       rY + h,   u0, v1],
             ];
             for (let vi = 0; vi < 6; vi++) {
-                const b = vi * VF;
+                const b = vertBase + vi * VF;
                 const qv = quadverts[vi];
                 vertData[b]    = toClipX(qv[0]); vertData[b+1] = toClipY(qv[1]); vertData[b+2] = clipZ; vertData[b+3] = 1;
                 vertData[b+4]  = 1;     vertData[b+5]  = 1;     vertData[b+6]  = 1;  vertData[b+7]  = 1;
@@ -755,61 +780,64 @@ export function createStateExports(ctx: OpenGLContext): Record<string, ThunkImpl
                 vertData[b+11] = qv[2]; vertData[b+12] = qv[3]; vertData[b+13] = 0;  vertData[b+14] = 0;
             }
 
-            const cmd: GLDrawCommand = {
-                type: GLDrawCommandType.DRAW,
-                mode: GL_QUADS,
-                vertData,
-                vertCount: 6,
-                depthTest: false,
-                depthFunc: ctx.depthFunc,
-                depthMask: false,
-                blendEnabled: ctx.enableFlags.has(0x0BE2), // GL_BLEND
-                blendSrc: ctx.blendSrc,
-                blendDst: ctx.blendDst,
-                alphaTest: false,
-                alphaFunc: ctx.alphaFunc,
-                alphaRef: ctx.alphaRef,
-                cullEnabled: false,
-                cullFace: ctx.cullFace,
-                frontFace: ctx.frontFace,
-                textureId0: DRAWPIXELS_TEX_ID,
-                textureId1: 0,
-                texEnvMode0: 0x1E01, // GL_REPLACE
-                texEnvMode1: 0,
-                shadeModel: ctx.shadeModel,
-                fogEnabled: false,
-                fogMode: ctx.fogMode,
-                fogR: ctx.fogColor[0], fogG: ctx.fogColor[1], fogB: ctx.fogColor[2], fogA: ctx.fogColor[3],
-                fogDensity: ctx.fogDensity,
-                fogStart: ctx.fogStart,
-                fogEnd: ctx.fogEnd,
-                polygonMode: 0x1B02, // GL_FILL
-                colorMaskR: ctx.colorMaskR,
-                colorMaskG: ctx.colorMaskG,
-                colorMaskB: ctx.colorMaskB,
-                colorMaskA: ctx.colorMaskA,
-                stencilTest: false,
-                stencilFunc: ctx.stencilFunc,
-                stencilRef: ctx.stencilRef,
-                stencilMask: ctx.stencilMask,
-                stencilFail: ctx.stencilFail,
-                stencilZFail: ctx.stencilZFail,
-                stencilZPass: ctx.stencilZPass,
-                stencilWriteMask: ctx.stencilWriteMask,
-                scissorEnabled: ctx.enableFlags.has(0x0C11), // GL_SCISSOR_TEST
-                scissorX: ctx.scissorX,
-                scissorY: ctx.scissorY,
-                scissorW: ctx.scissorW,
-                scissorH: ctx.scissorH,
-                vpX: ctx.viewportX,
-                vpY: ctx.viewportY,
-                vpW: ctx.viewportW,
-                vpH: ctx.viewportH,
-                depthRangeNear: ctx.depthRangeNear,
-                depthRangeFar: ctx.depthRangeFar,
-            };
+            // Depth/alpha/stencil test and culling stay OFF for the raster quad, so
+            // only the flags glDrawPixels actually honours are set.
+            let flags = 0;
+            if (ctx.enableFlags.has(0x0BE2)) flags |= DF_BLEND;       // GL_BLEND
+            if (ctx.enableFlags.has(0x0C11)) flags |= DF_SCISSOR;     // GL_SCISSOR_TEST
+            if (ctx.colorMaskR) flags |= DF_COLOR_MASK_R;
+            if (ctx.colorMaskG) flags |= DF_COLOR_MASK_G;
+            if (ctx.colorMaskB) flags |= DF_COLOR_MASK_B;
+            if (ctx.colorMaskA) flags |= DF_COLOR_MASK_A;
 
-            ctx.commands.push(cmd);
+            const stream = ctx.commands;
+            const cmdIdx = stream.alloc(GLDrawCommandType.DRAW);
+            const ci = cmdIdx * CMD_I32;
+            const cf = cmdIdx * CMD_F32;
+            const I = stream.i32, F = stream.f32;
+            I[ci + CI_MODE] = GL_QUADS;
+            I[ci + CI_VERT_OFFSET] = vertBase;
+            I[ci + CI_VERT_COUNT] = 6;
+            I[ci + CI_FLAGS] = flags;
+            I[ci + CI_DEPTH_FUNC] = ctx.depthFunc;
+            I[ci + CI_BLEND_SRC] = ctx.blendSrc;
+            I[ci + CI_BLEND_DST] = ctx.blendDst;
+            I[ci + CI_ALPHA_FUNC] = ctx.alphaFunc;
+            I[ci + CI_CULL_FACE] = ctx.cullFace;
+            I[ci + CI_FRONT_FACE] = ctx.frontFace;
+            I[ci + CI_TEX_ID0] = DRAWPIXELS_TEX_ID;
+            I[ci + CI_TEX_ID1] = 0;
+            I[ci + CI_TEXENV0] = 0x1E01; // GL_REPLACE
+            I[ci + CI_TEXENV1] = 0;
+            I[ci + CI_SHADE_MODEL] = ctx.shadeModel;
+            I[ci + CI_FOG_MODE] = ctx.fogMode;
+            I[ci + CI_POLYGON_MODE] = 0x1B02; // GL_FILL
+            I[ci + CI_STENCIL_FUNC] = ctx.stencilFunc;
+            I[ci + CI_STENCIL_REF] = ctx.stencilRef;
+            I[ci + CI_STENCIL_MASK] = ctx.stencilMask;
+            I[ci + CI_STENCIL_FAIL] = ctx.stencilFail;
+            I[ci + CI_STENCIL_ZFAIL] = ctx.stencilZFail;
+            I[ci + CI_STENCIL_ZPASS] = ctx.stencilZPass;
+            I[ci + CI_STENCIL_WRITE_MASK] = ctx.stencilWriteMask;
+            I[ci + CI_SCISSOR_X] = ctx.scissorX;
+            I[ci + CI_SCISSOR_Y] = ctx.scissorY;
+            I[ci + CI_SCISSOR_W] = ctx.scissorW;
+            I[ci + CI_SCISSOR_H] = ctx.scissorH;
+            I[ci + CI_VP_X] = ctx.viewportX;
+            I[ci + CI_VP_Y] = ctx.viewportY;
+            I[ci + CI_VP_W] = ctx.viewportW;
+            I[ci + CI_VP_H] = ctx.viewportH;
+            F[cf + CF_ALPHA_REF] = ctx.alphaRef;
+            F[cf + CF_FOG_R] = ctx.fogColor[0];
+            F[cf + CF_FOG_G] = ctx.fogColor[1];
+            F[cf + CF_FOG_B] = ctx.fogColor[2];
+            F[cf + CF_FOG_A] = ctx.fogColor[3];
+            F[cf + CF_FOG_DENSITY] = ctx.fogDensity;
+            F[cf + CF_FOG_START] = ctx.fogStart;
+            F[cf + CF_FOG_END] = ctx.fogEnd;
+            F[cf + CF_DEPTH_RANGE_NEAR] = ctx.depthRangeNear;
+            F[cf + CF_DEPTH_RANGE_FAR] = ctx.depthRangeFar;
+
             ctx.frameSnapshot.drawCalls++;
             ctx.frameSnapshot.vertexCount += 6;
             ctx.frameSnapshot.texUploads++;

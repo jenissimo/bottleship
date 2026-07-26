@@ -2,6 +2,7 @@
  * IDirect3DDevice3 and IDirect3DDevice7 implementations
  */
 import { Logger, LogCategory, LogLevel } from "../../../core/logger";
+import { ThunkImplementation } from "../../../core/thunking/thunk-dispatcher";
 import { System } from "../../../core/system";
 import { DDrawContext } from "../context";
 import { bytesToGuid } from "../helpers";
@@ -2075,7 +2076,7 @@ export const createDeviceExports = (
     // — the callback receives a full 108-byte DDSURFACEDESC with DDPIXELFORMAT embedded at offset 72.
     // DX6 IDirect3DDevice3::EnumTextureFormats callback: HRESULT CALLBACK(LPDDPIXELFORMAT, LPVOID)
     // — only the 32-byte pixel format struct is passed.
-    exports["IDirect3DDevice2_EnumTextureFormats"] = (ctx, mem, args) => {
+    const enumTextureFormatsDx5: ThunkImplementation = (ctx, mem, args) => {
         const lpCallback = args[1];
         const lpContext  = args[2];
 
@@ -2199,6 +2200,28 @@ export const createDeviceExports = (
 
     // SwapTextureHandles (Device2-only, no Device3 equivalent) — stub
     exports["IDirect3DDevice2_SwapTextureHandles"] = () => D3D_OK;
+
+    // --- IDirect3DDevice (v1) ---
+    // The device a DX2/3-era title gets from IDirectDrawSurface::QueryInterface(IID_IDirect3D*Device).
+    // Backed by the same Device3 state object; only the vtable layout differs. Execute-buffer
+    // methods stay unregistered on purpose — an UNIMPLEMENTED stub names itself in stubs(),
+    // where a D3D_OK lie would send the guest off with a null buffer.
+    const device1Methods = [
+        "QueryInterface", "AddRef", "Release", "GetCaps",
+        "AddViewport", "DeleteViewport", "NextViewport",
+        "BeginScene", "EndScene", "GetDirect3D",
+    ];
+    for (const method of device1Methods) {
+        const d3key = `IDirect3DDevice3_${method}`;
+        if (exports[d3key]) exports[`IDirect3DDevice_${method}`] = exports[d3key];
+    }
+    // v1 and Device2 share the DX5 LPDDSURFACEDESC enumeration callback.
+    exports["IDirect3DDevice2_EnumTextureFormats"] = enumTextureFormatsDx5;
+    exports["IDirect3DDevice_EnumTextureFormats"] = enumTextureFormatsDx5;
+    exports["IDirect3DDevice_SwapTextureHandles"] = () => D3D_OK;
+    exports["IDirect3DDevice_GetStats"] = () => D3D_OK;
+    // Initialize is a no-op for an already-created device (DDERR_ALREADYINITIALIZED).
+    exports["IDirect3DDevice_Initialize"] = () => 0x88000005;
 
     // Device2 draw calls take a D3DVERTEXTYPE enum (1=VERTEX, 2=LVERTEX, 3=TLVERTEX),
     // not an FVF. The Device3 handler would misread D3DVT_TLVERTEX=3 as FVF XYZ

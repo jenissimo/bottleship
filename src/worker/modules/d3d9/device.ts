@@ -14,10 +14,13 @@ import { D3D9Device } from '../../backends/webgpu/d3d9/d3d9-device';
 import { WebGPUBackend } from '../../backends/webgpu/webgpu-backend';
 import { writeDeviceCaps9 } from './caps';
 import { getVTables, devices, createComObject, resourceToDevice, deviceToD3D9 } from './shared-state';
-import { deviceBoundDepthStencil, deviceBoundRenderTarget, surfaceMeta } from './resource-registry';
+import { deviceBoundDepthStencil, deviceBoundRenderTarget, deviceCursorProperties, surfaceMeta } from './resource-registry';
+import { warpGuestCursorTo } from '../user32/shared-state';
 
 const D3DFMT_X8R8G8B8 = 22;
 const D3DFMT_R5G6B5 = 23;
+const D3DFMT_A8R8G8B8 = 21;
+const D3DFMT_INDEX32 = 102;
 
 const D3DRTYPE_SURFACE = 1;
 const D3DUSAGE_RENDERTARGET = 0x1;
@@ -111,6 +114,62 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
     exports['IDirect3DDevice9_GetGammaRamp'] = (_ctx, mem, args) => {
         gammaService.writeToGuest(mem, args[2]);
         return D3D_OK;
+    };
+
+    // Cursor — SetCursorProperties(XHotSpot, YHotSpot, pCursorBitmap). The bitmap contract is
+    // strict on real D3D9: A8R8G8B8 only, power-of-two extents, hotspot inside the bitmap, and
+    // the extents are checked against the DISPLAY MODE rather than the backbuffer.
+    exports['IDirect3DDevice9_SetCursorProperties'] = (_ctx, _mem, args) => {
+        const pDevice = args[0] >>> 0;
+        const xHotSpot = args[1] >>> 0;
+        const yHotSpot = args[2] >>> 0;
+        const pCursorBitmap = args[3] >>> 0;
+
+        if (!devices.has(pDevice) || !pCursorBitmap) return D3DERR_INVALIDCALL;
+        const meta = surfaceMeta.get(pCursorBitmap);
+        if (!meta || meta.format !== D3DFMT_A8R8G8B8) return D3DERR_INVALIDCALL;
+        if ((meta.width & (meta.width - 1)) !== 0 || (meta.height & (meta.height - 1)) !== 0) return D3DERR_INVALIDCALL;
+        if (xHotSpot >= meta.width || yHotSpot >= meta.height) return D3DERR_INVALIDCALL;
+
+        const cfg = EmulatorConfig.getInstance().screenResolution;
+        if (meta.width > cfg.width || meta.height > cfg.height) return D3DERR_INVALIDCALL;
+
+        deviceCursorProperties.set(pDevice, { hotspotX: xHotSpot, hotspotY: yHotSpot, surfacePtr: pCursorBitmap });
+        Logger.log(LogCategory.D3D9,
+            `SetCursorProperties(${meta.width}x${meta.height}, hotspot ${xHotSpot},${yHotSpot}) surface=0x${pCursorBitmap.toString(16)}`);
+        return D3D_OK;
+    };
+
+    // SetCursorPosition(X, Y, Flags) is STDMETHOD_(void, ...) — the guest ignores the return
+    // value. D3DCURSOR_IMMEDIATE_UPDATE is moot: our warp is always immediate.
+    exports['IDirect3DDevice9_SetCursorPosition'] = (_ctx, _mem, args) => {
+        if (!devices.has(args[0] >>> 0)) return 0;
+        warpGuestCursorTo(args[1] | 0, args[2] | 0);
+        return 0;
+    };
+
+    // GetRasterStatus(iSwapChain, pRasterStatus) → D3DRASTER_STATUS { BOOL InVBlank; UINT ScanLine }.
+    // No real RAMDAC exists here, so sweep a synthetic raster off the guest clock at the mode's
+    // refresh rate: a frozen value would spin any app that polls for a vblank edge or waits for
+    // the scanline to advance. ScanLine reads 0 whenever the raster is inside the blank.
+    const VBLANK_LINES = 45;
+    exports['IDirect3DDevice9_GetRasterStatus'] = (_ctx, _mem, args) => {
+        const pRasterStatus = args[2] >>> 0;
+        if (!devices.has(args[0] >>> 0)) return D3DERR_INVALIDCALL;
+        if ((args[1] >>> 0) !== 0 || !pRasterStatus) return D3DERR_INVALIDCALL;
+
+        const cfg = EmulatorConfig.getInstance().screenResolution;
+        const visibleLines = Math.max(1, cfg.height >>> 0);
+        const totalLines = visibleLines + VBLANK_LINES;
+        const framePeriodMs = 1000 / (cfg.refreshRate || 60);
+        const phase = (System.getInstance().services.time.nowMs() % framePeriodMs) / framePeriodMs;
+        const line = Math.min(totalLines - 1, Math.floor(phase * totalLines));
+        const inVBlank = line >= visibleLines;
+
+        const ok =
+            Mem.writeUint32(pRasterStatus + 0, inVBlank ? 1 : 0) &&
+            Mem.writeUint32(pRasterStatus + 4, inVBlank ? 0 : line);
+        return ok ? D3D_OK : D3DERR_INVALIDCALL;
     };
 
     exports['IDirect3DDevice9_TestCooperativeLevel'] = (_ctx, _mem, args) => {
@@ -474,6 +533,32 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
 
         Logger.verbose(LogCategory.D3D9, `DrawIndexedPrimitive(Type=${PrimitiveType}, Base=${BaseVertexIndex}, Start=${startIndex}, Count=${primCount})`);
         device.drawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, primCount);
+        return D3D_OK;
+    };
+
+    // DrawIndexedPrimitiveUP(this, PrimitiveType, MinVertexIndex, NumVertices, PrimitiveCount,
+    //                        pIndexData, IndexDataFormat, pVertexStreamZeroData, Stride)
+    exports['IDirect3DDevice9_DrawIndexedPrimitiveUP'] = (_ctx, _mem, args) => {
+        const device = devices.get(args[0]);
+        if (!device) return D3DERR_INVALIDCALL;
+
+        const stride = args[8] >>> 0;
+        const pIndexData = args[5] >>> 0;
+        const pVertexData = args[7] >>> 0;
+        if (!stride || !pIndexData || !pVertexData) return D3DERR_INVALIDCALL;
+
+        const primitiveCount = args[4] >>> 0;
+        const numVertices = args[3] >>> 0;
+        // A zero-primitive / zero-vertex call is a legal no-op, not an error.
+        if (!primitiveCount || !numVertices) return D3D_OK;
+
+        Logger.verbose(LogCategory.D3D9,
+            `DrawIndexedPrimitiveUP(Type=${args[1]}, MinVtx=${args[2]}, NumVtx=${numVertices}, Count=${primitiveCount}, Stride=${stride})`);
+        device.drawIndexedPrimitiveUP(
+            args[1] >>> 0, args[2] >>> 0, numVertices, primitiveCount,
+            pIndexData, (args[6] >>> 0) === D3DFMT_INDEX32,
+            pVertexData, stride,
+        );
         return D3D_OK;
     };
 

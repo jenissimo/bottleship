@@ -26,16 +26,17 @@ export class OpenGLPresenter implements RenderActive {
         if (!ctx.executor) {
             Logger.warn(LogCategory.SYSTEM,
                 `OpenGL present: no executor (frame=${ctx.frameId} backend=${!!ctx.backend})`);
-        } else if (ctx.commands.length === 0 && ctx.textures.size === 0) {
+        } else if (ctx.commands.count === 0 && ctx.textures.size === 0) {
             Logger.warn(LogCategory.SYSTEM, `OpenGL present: 0 commands, 0 textures (frame=${ctx.frameId})`);
         } else if (ctx.frameId <= 3) {
             Logger.verbose(LogCategory.SYSTEM,
-                `OpenGL present: cmds=${ctx.commands.length} texs=${ctx.textures.size} frame=${ctx.frameId}`);
+                `OpenGL present: cmds=${ctx.commands.count} texs=${ctx.textures.size} frame=${ctx.frameId}`);
         }
 
-        if (ctx.executor && (ctx.commands.length > 0 || ctx.textures.size > 0)) {
+        if (ctx.executor && (ctx.commands.count > 0 || ctx.textures.size > 0)) {
             ctx.executor.executeFrame({
                 commands: ctx.commands,
+                vertArena: ctx.vertArena.data,
                 textures: ctx.textures,
                 viewportX: ctx.viewportX,
                 viewportY: ctx.viewportY,
@@ -44,8 +45,10 @@ export class OpenGLPresenter implements RenderActive {
             });
         }
 
-        // Clear command buffer for next frame
-        ctx.commands = [];
+        // Commands and the vertex arena they point into are frame-scoped: reuse the
+        // storage, never hand a command or an arena slice past this point.
+        ctx.commands.reset();
+        ctx.vertArena.reset();
 
         // Notify render service
         const system = System.getInstance();

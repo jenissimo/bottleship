@@ -328,6 +328,15 @@ export class D3D9Device {
     // Reusable buffer for vertex conversion to avoid GC pressure
     private vertexConversionBuffer: Uint8Array | null = null;
     private vertexConversionBufferSize: number = 0;
+    /** Widened index scratch for the de-indexing UP path (16- and 32-bit indices share it). */
+    private indexScratch: Uint32Array | null = null;
+    private dipUpIndexRangeWarned = false;
+
+    /** D3DCAPS9.MaxStreams from the caps blob we report (caps.ts, offset 188). */
+    static readonly MAX_STREAMS = 16;
+    private streamBindingPtr = new Uint32Array(D3D9Device.MAX_STREAMS);
+    private streamBindingOffset = new Uint32Array(D3D9Device.MAX_STREAMS);
+    private streamBindingStride = new Uint32Array(D3D9Device.MAX_STREAMS);
     /** Reuse pool for DrawPrimitiveUP vertex buffers (lazily created — needs the device). */
     private vbPool: DynamicVbPool | null = null;
 
@@ -936,6 +945,13 @@ export class D3D9Device {
 
     setStreamSource(streamNumber: number, vbPtr: number, offset: number, stride: number): number {
         d3d9PerfInc("setStreamSource");
+        // Record the guest-visible binding for every stream — GetStreamSource must report
+        // back exactly what was set even for streams the draw path below ignores.
+        if (streamNumber < D3D9Device.MAX_STREAMS) {
+            this.streamBindingPtr[streamNumber] = vbPtr >>> 0;
+            this.streamBindingOffset[streamNumber] = offset >>> 0;
+            this.streamBindingStride[streamNumber] = stride >>> 0;
+        }
         // We only support stream 0 for now
         if (streamNumber !== 0) return 0;
 
@@ -948,6 +964,17 @@ export class D3D9Device {
         if (d3d9WasmArena.isInitialized()) d3d9WasmArena.setStreamSource(index, offset, stride);
         if (!this.stateTracker.setStreamSource(index, offset, stride)) d3d9PerfSkip("setStreamSource");
         return 0;
+    }
+
+    /** Vertex buffer COM ptr / offset / stride last bound to a stream (all zero = unbound).
+     *  null for a stream index beyond the MaxStreams we advertise. */
+    getStreamBinding(streamNumber: number): { ptr: number; offset: number; stride: number } | null {
+        if (streamNumber >= D3D9Device.MAX_STREAMS) return null;
+        return {
+            ptr: this.streamBindingPtr[streamNumber]!,
+            offset: this.streamBindingOffset[streamNumber]!,
+            stride: this.streamBindingStride[streamNumber]!,
+        };
     }
 
     /** Tail-guard canary written past every VB/IB guest allocation and
@@ -2319,21 +2346,36 @@ export class D3D9Device {
             }
         }
 
+        return this.recordConvertedDraw(finalData, finalVertexCount, stride, "triangle-list");
+    }
+
+    /** Upload a host-built vertex blob to a pooled VB and record one draw. Cull is forced off:
+     *  every caller has already rewound strips/fans (or de-indexed), which alternates winding.
+     *  The arena is deliberately not offered a key — the bytes drawn are CPU-converted and no
+     *  longer match any contiguous guest range it could capture. */
+    private recordConvertedDraw(
+        finalData: Uint8Array,
+        finalVertexCount: number,
+        stride: number,
+        topology: "triangle-list" | "line-list",
+    ): number {
+        const device = this.backend.getDevice();
+        if (!device) return 0;
+
         const bufferSize = Math.max(16, finalData.byteLength);
         if (!this.vbPool) this.vbPool = new DynamicVbPool(device);
         const gpuBuffer = this.vbPool.acquire(bufferSize);
         device.queue.writeBuffer(gpuBuffer, 0, finalData);
 
-        // Cull none: the strip/fan → list rewind alternates winding.
         let pipelineId: number;
         let bindStateIndex: number | undefined;
         let ffpStateIndex: number | undefined;
         if (this.isProgrammable()) {
-            pipelineId = this.resolveProgrammablePipeline("triangle-list", true, stride, undefined);
+            pipelineId = this.resolveProgrammablePipeline(topology, true, stride, undefined);
             if (pipelineId < 0) { this.commandRecorder.registerPooledBuffer(gpuBuffer); return 0; }
             bindStateIndex = this.captureDrawState();
         } else {
-            pipelineId = this.getPipelineIdForTopology("triangle-list", true);
+            pipelineId = this.getPipelineIdForTopology(topology, true);
             ffpStateIndex = this.captureFfpDrawState();
         }
 
@@ -2353,6 +2395,114 @@ export class D3D9Device {
             this.frameSnapshot.frameCounters.vertexBytes += finalData.byteLength;
         }
         return 0;
+    }
+
+    /** DrawIndexedPrimitiveUP: both vertices and indices live in app memory, no VB/IB bound.
+     *  De-indexes into a flat triangle/line list (the pooled-VB UP flow is non-indexed and
+     *  WebGPU has no fan topology) and records one draw. Indices are absolute vertex numbers;
+     *  minVertexIndex/numVertices only bound the range the app guarantees is readable. */
+    drawIndexedPrimitiveUP(
+        primitiveType: number,
+        minVertexIndex: number,
+        numVertices: number,
+        primitiveCount: number,
+        indexDataPtr: number,
+        indexIs32: boolean,
+        vertexDataPtr: number,
+        stride: number,
+    ): number {
+        d3d9PerfInc("drawIndexedPrimitiveUP");
+        if (primitiveCount <= 0 || numVertices <= 0 || stride <= 0) return 0;
+        this.captureDrawIfArmed(primitiveType, primitiveCount);
+
+        let idxCount: number;
+        let finalVertexCount: number;
+        let topology: "triangle-list" | "line-list";
+        switch (primitiveType) {
+            case D3DPT_TRIANGLELIST:
+                idxCount = primitiveCount * 3; finalVertexCount = idxCount; topology = "triangle-list"; break;
+            case D3DPT_TRIANGLESTRIP:
+            case D3DPT_TRIANGLEFAN:
+                idxCount = primitiveCount + 2; finalVertexCount = primitiveCount * 3; topology = "triangle-list"; break;
+            case D3DPT_LINELIST:
+                idxCount = primitiveCount * 2; finalVertexCount = idxCount; topology = "line-list"; break;
+            case D3DPT_LINESTRIP:
+                idxCount = primitiveCount + 1; finalVertexCount = primitiveCount * 2; topology = "line-list"; break;
+            default:
+                return 0; // D3DPT_POINTLIST — no point-sprite expansion on the indexed path.
+        }
+
+        const idxSize = indexIs32 ? 4 : 2;
+        const vertexLimit = minVertexIndex + numVertices;
+        if (!isValidAddress(this.memory, indexDataPtr, idxCount * idxSize)) return 0;
+        if (!isValidAddress(this.memory, vertexDataPtr, vertexLimit * stride)) return 0;
+
+        // One scratch, two spans: [0, idxCount) holds the app's indices, [idxCount, …) the
+        // per-output-vertex source index after the strip/fan rewind.
+        const scratch = this.ensureIndexScratch(idxCount + finalVertexCount);
+        const mem = this.memory;
+        for (let i = 0; i < idxCount; i++) {
+            const p = indexDataPtr + i * idxSize;
+            const v = indexIs32
+                ? (mem[p]! | (mem[p + 1]! << 8) | (mem[p + 2]! << 16) | (mem[p + 3]! << 24)) >>> 0
+                : mem[p]! | (mem[p + 1]! << 8);
+            // An index past the declared range reads outside what the app guaranteed readable —
+            // drop the draw rather than upload neighbouring heap bytes as geometry.
+            if (v >= vertexLimit) {
+                if (!this.dipUpIndexRangeWarned) {
+                    this.dipUpIndexRangeWarned = true;
+                    Logger.warn(LogCategory.D3D9,
+                        `DrawIndexedPrimitiveUP: index ${v} >= MinVertexIndex+NumVertices (${vertexLimit}) — draw dropped`);
+                }
+                return 0;
+            }
+            scratch[i] = v;
+        }
+
+        const o = idxCount;
+        switch (primitiveType) {
+            case D3DPT_TRIANGLEFAN:
+                for (let i = 0; i < primitiveCount; i++) {
+                    scratch[o + i * 3] = scratch[0]!;
+                    scratch[o + i * 3 + 1] = scratch[i + 1]!;
+                    scratch[o + i * 3 + 2] = scratch[i + 2]!;
+                }
+                break;
+            case D3DPT_TRIANGLESTRIP:
+                // Odd triangles swap the first two vertices to keep a consistent winding.
+                for (let i = 0; i < primitiveCount; i++) {
+                    const even = (i % 2) === 0;
+                    scratch[o + i * 3] = scratch[even ? i : i + 1]!;
+                    scratch[o + i * 3 + 1] = scratch[even ? i + 1 : i]!;
+                    scratch[o + i * 3 + 2] = scratch[i + 2]!;
+                }
+                break;
+            case D3DPT_LINESTRIP:
+                for (let i = 0; i < primitiveCount; i++) {
+                    scratch[o + i * 2] = scratch[i]!;
+                    scratch[o + i * 2 + 1] = scratch[i + 1]!;
+                }
+                break;
+            default: // TRIANGLELIST / LINELIST — index order is already primitive order.
+                for (let i = 0; i < finalVertexCount; i++) scratch[o + i] = scratch[i]!;
+                break;
+        }
+
+        const finalData = this.ensureConversionBuffer(finalVertexCount * stride);
+        for (let i = 0; i < finalVertexCount; i++) {
+            const src = vertexDataPtr + scratch[o + i]! * stride;
+            finalData.set(mem.subarray(src, src + stride), i * stride);
+        }
+
+        this.frameSnapshot.drawCalls++;
+        this.frameSnapshot.frameId = ++this.frameIdCounter;
+        this.frameSnapshot.lastDraw = {
+            api: "d3d9",
+            primitiveType,
+            numVerts: finalVertexCount,
+            timestamp: performance.now(),
+        };
+        return this.recordConvertedDraw(finalData, finalVertexCount, stride, topology);
     }
 
     drawPrimitiveUP(primitiveType: number, primitiveCount: number, vertexDataPtr: number, stride: number): number {
@@ -2907,7 +3057,9 @@ export class D3D9Device {
         }
 
         const pipeline = gpuDevice.createRenderPipeline({
-            layout: "auto",
+            // Shared explicit layout when the FFP dynamic-offset shape is on (one cached bind
+            // group serves every FFP draw); WebGPU's implicit per-pipeline layout otherwise.
+            layout: this.backendExecutor.getFfpPipelineLayout(),
             vertex: {
                 module: shaderModule,
                 entryPoint: "vs_main",
@@ -3659,6 +3811,13 @@ export class D3D9Device {
             this.vertexConversionBufferSize = size;
         }
         return this.vertexConversionBuffer.subarray(0, size);
+    }
+
+    private ensureIndexScratch(count: number): Uint32Array {
+        if (!this.indexScratch || this.indexScratch.length < count) {
+            this.indexScratch = new Uint32Array(count);
+        }
+        return this.indexScratch;
     }
 
     private getGdiContext() {

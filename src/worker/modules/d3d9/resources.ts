@@ -36,6 +36,7 @@ const D3DRTYPE_SURFACE = 1;
 const D3DRTYPE_TEXTURE = 3;
 const D3DRTYPE_CUBETEXTURE = 5;
 const D3DPOOL_DEFAULT = 0;
+const D3DPOOL_SYSTEMMEM = 2;
 const D3DMULTISAMPLE_NONE = 0;
 const D3DUSAGE_DEPTHSTENCIL = 0x00000002;
 
@@ -381,6 +382,85 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         Logger.log(LogCategory.D3D9,
             `CreateOffscreenPlainSurface(${width}x${height}, Format=${format}, Pool=${pool}) -> 0x${surfacePtr.toString(16)}`);
         return Mem.writeUint32(ppSurface, surfacePtr) ? D3D_OK : D3DERR_INVALIDCALL;
+    };
+
+    // UpdateSurface(pSourceSurface, pSourceRect, pDestinationSurface, pDestPoint): sub-rect copy
+    // from a SYSTEMMEM surface into a DEFAULT one. The pool pair, the matching formats and the
+    // non-multisampled requirement are the real runtime's contract, not our simplification.
+    // Both surfaces must be texture-backed — that is the only pixel store we can address.
+    exports['IDirect3DDevice9_UpdateSurface'] = (_ctx, _mem, args) => {
+        const device = devices.get(args[0]);
+        const pSrcSurface = args[1] >>> 0;
+        const pSrcRect = args[2] >>> 0;
+        const pDstSurface = args[3] >>> 0;
+        const pDstPoint = args[4] >>> 0;
+        if (!device || !pSrcSurface || !pDstSurface) return D3DERR_INVALIDCALL;
+
+        const src = surfaceMeta.get(pSrcSurface);
+        const dst = surfaceMeta.get(pDstSurface);
+        if (!src || !dst) return D3DERR_INVALIDCALL;
+        if (src.format !== dst.format) return D3DERR_INVALIDCALL;
+        if (src.multiSampleType !== D3DMULTISAMPLE_NONE || dst.multiSampleType !== D3DMULTISAMPLE_NONE) {
+            return D3DERR_INVALIDCALL;
+        }
+        if (src.pool !== D3DPOOL_SYSTEMMEM || dst.pool !== D3DPOOL_DEFAULT) return D3DERR_INVALIDCALL;
+        // Cube faces keep their pixels in a separate per-face store the level accessors below
+        // cannot reach; a surface with no parent texture (the implicit backbuffer) has no
+        // CPU-side pixels at all.
+        if (!src.texturePtr || !dst.texturePtr || src.face !== undefined || dst.face !== undefined) {
+            Logger.warn(LogCategory.D3D9,
+                `UpdateSurface: unsupported surface pair (src tex=0x${(src.texturePtr ?? 0).toString(16)} face=${src.face ?? -1}, ` +
+                `dst tex=0x${(dst.texturePtr ?? 0).toString(16)} face=${dst.face ?? -1})`);
+            return D3DERR_INVALIDCALL;
+        }
+
+        let left = 0, top = 0, right = src.width, bottom = src.height;
+        if (pSrcRect) {
+            left = Mem.readInt32(pSrcRect) ?? 0;
+            top = Mem.readInt32(pSrcRect + 4) ?? 0;
+            right = Mem.readInt32(pSrcRect + 8) ?? 0;
+            bottom = Mem.readInt32(pSrcRect + 12) ?? 0;
+        }
+        const dstX = pDstPoint ? (Mem.readInt32(pDstPoint) ?? 0) : 0;
+        const dstY = pDstPoint ? (Mem.readInt32(pDstPoint + 4) ?? 0) : 0;
+
+        const w = right - left;
+        const h = bottom - top;
+        if (left < 0 || top < 0 || w <= 0 || h <= 0) return D3DERR_INVALIDCALL;
+        if (right > src.width || bottom > src.height) return D3DERR_INVALIDCALL;
+        if (dstX < 0 || dstY < 0 || dstX + w > dst.width || dstY + h > dst.height) return D3DERR_INVALIDCALL;
+
+        // Block-compressed surfaces move whole blocks; D3D9 rejects unaligned coordinates and
+        // only tolerates a ragged extent when it is the full mip extent.
+        const layout = getD3DTextureLayout(src.format, src.width, src.height);
+        const blockW = layout.compressed ? 4 : 1;
+        const blockH = layout.compressed ? 4 : 1;
+        if (left % blockW || dstX % blockW || top % blockH || dstY % blockH) return D3DERR_INVALIDCALL;
+        if ((w % blockW || h % blockH) && (w !== src.width || h !== src.height)) return D3DERR_INVALIDCALL;
+
+        const srcLevel = src.level ?? 0;
+        const dstLevel = dst.level ?? 0;
+        const srcPix = device.getTextureLevelPixels(src.texturePtr, srcLevel);
+        const dstPix = device.getTextureLevelPixels(dst.texturePtr, dstLevel);
+        if (!srcPix || !dstPix) return D3DERR_INVALIDCALL;
+
+        const unitBytes = layout.compressed ? layout.blockBytes : layout.pitch / Math.max(1, src.width);
+        const rowBytes = Math.ceil(w / blockW) * unitBytes;
+        const srcCol = (left / blockW) * unitBytes;
+        const dstCol = (dstX / blockW) * unitBytes;
+        const rows = Math.ceil(h / blockH);
+        for (let r = 0; r < rows; r++) {
+            const s = (top / blockH + r) * srcPix.pitch + srcCol;
+            const d = (dstY / blockH + r) * dstPix.pitch + dstCol;
+            dstPix.data.set(srcPix.data.subarray(s, s + rowBytes), d);
+        }
+        if (!device.setTextureLevelPixels(dst.texturePtr, dstLevel, dstPix.data, dstPix.pitch)) {
+            return D3DERR_INVALIDCALL;
+        }
+
+        Logger.verbose(LogCategory.D3D9,
+            `UpdateSurface(${w}x${h} from ${left},${top} -> ${dstX},${dstY}) fmt=${src.format}`);
+        return D3D_OK;
     };
 
     // GetRenderTargetData(pRenderTarget, pDestSurface): GPU→CPU readback into the

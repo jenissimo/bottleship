@@ -649,7 +649,10 @@ export const IID_IDirect3DTexture2 = "93281502-8cf8-11d0-89ab-00a0c9054129";
 // Device GUIDs for EnumDevices/CreateDevice
 export const IID_IDirect3DRGBDevice = "a4665c60-2673-11cf-a31a-00aa00b93356";
 export const IID_IDirect3DHALDevice = "84e63de0-46aa-11cf-816f-0000c020156e";
+export const IID_IDirect3DRampDevice = "f2086b20-259f-11cf-a31a-00aa00b93356";
+export const IID_IDirect3DMMXDevice = "881949a1-d6f3-11d0-89ab-00a0c9054129";
 export const IID_IDirect3DTnLHalDevice = "f5049e78-4861-11d2-a407-00a0c90629a8";
+export const IID_IDirect3DExecuteBuffer = "4417c145-33ad-11cf-816f-0000c020156e";
 export const IID_IDirect3DLight = "4417c142-33ad-11cf-816f-0000c020156e";
 export const IID_IDirect3DMaterial = "4417c144-33ad-11cf-816f-0000c020156e";
 export const IID_IDirect3DMaterial2 = "93281503-8cf8-11d0-89ab-00a0c9054129";
