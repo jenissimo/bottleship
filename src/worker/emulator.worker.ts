@@ -74,7 +74,7 @@ import {
   EMU_AUDIO_SAMPLE_UPDATE_INTERVAL_MS,
   EMU_NATIVE_VIDEO_DLLS
 } from "./core/cpu/emulator-config";
-import { WgbLoader, buildRomIndex, readEntrypointBytes, type WgbWriteFileSpec } from "./runtime/filesystem/wgb-loader";
+import { WgbLoader, buildRomIndex, readEntrypointBytes, type WgbManifest, type WgbWriteFileSpec } from "./runtime/filesystem/wgb-loader";
 import { WgbCache } from "./runtime/filesystem/wgb-cache";
 import { detectFormat, sniffBlobHead } from "@bottleship/repack/detect";
 import { installerBytesToWgb } from "@bottleship/repack/installer-to-wgb";
@@ -85,12 +85,14 @@ import { SabIoSource } from "./runtime/filesystem/sab-io-source";
 import { UnpackDecoder } from "@bottleship/formats/unpack";
 import { RegistryPersistence } from "./runtime/filesystem/registry-persistence";
 import { resolveGameId, gameIdToContainerDir } from "@bottleship/formats/wgb/container-id";
+import { aotCache } from "./core/cpu/aot-cache";
 import { PathPolicy } from "./runtime/filesystem/path-policy";
 import { detectUe1, detectUe2PcPackages, pinUeEngineIni, UE1_RENDER_DEVICE as UE1_RENDER_DEVICE_NAME } from "./runtime/filesystem/ue1-firstrun";
 import { buildStagedBundle, inspectBundle, finalizeBundle, readStagedEntry, type BuildSource, type FinalizeDestination } from "./runtime/filesystem/wgb-build";
 import { TimeService } from "./runtime/time";
 import { resolveMessageBox } from "./runtime/dialog-bridge";
 import { Logger, LogLevel, LogCategory } from "./core/logger";
+import { createStreamingWasmLoader } from "./core/wasm-loader";
 import { WebGPUBackend } from "./backends/webgpu/webgpu-backend";
 import { profiler } from "./core/profiler";
 import { frameProfiler } from "./core/frame-profiler";
@@ -1184,6 +1186,24 @@ const prepareFullGameSwitch = async (): Promise<void> => {
   bootMark("system-reset-done");
 };
 
+/**
+ * The single host-facing "what bundle is this" post. Both load paths (load_bundle and
+ * the pendingBundle path inside initV86) go through here — the host keys per-game touch
+ * layouts on `gameId` and reads the authored `emulator.touch` tier from this message, so
+ * a site that posts one field and not the other silently substitutes auto-detect for an
+ * authored layout on that path.
+ */
+const postBundleMeta = (manifest: WgbManifest, gameId: string): void => {
+  const title = typeof manifest.title === "string" ? manifest.title.trim() : "";
+  const name = typeof manifest.name === "string" ? manifest.name.trim() : "";
+  self.postMessage({
+    type: "bundle_meta",
+    name: title || name,
+    gameId,
+    touch: manifest.emulator?.touch ?? null,
+  });
+};
+
 const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?: Blob; blobs?: File[] }) => {
   const system = System.getInstance();
   if (!system.process) {
@@ -1484,16 +1504,16 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
     Logger.log(LogCategory.SYSTEM, `WGB: gameId="${gameId}" container="${gameIdToContainerDir(gameId)}"`);
     // Host overlay/title: surface the manifest display name as soon as we know it
     // (covers ?game=dev&load=… where the shell would otherwise keep saying "Dev").
-    {
-      const title = typeof bundle.manifest.title === "string" ? bundle.manifest.title.trim() : "";
-      const name = typeof bundle.manifest.name === "string" ? bundle.manifest.name.trim() : "";
-      const displayName = title || name;
-      if (displayName) {
-        self.postMessage({ type: "bundle_meta", name: displayName, gameId });
-      }
-    }
+    postBundleMeta(bundle.manifest, gameId);
     await system.fileSystem.initOverlay(gameId);
     await system.fileSystem.ensureOverlayIndex();
+    // Read + compile the AOT units NOW, concurrently with the rest of the bundle load. They
+    // cannot be published until the guest image is final (see the pe-loaded hook), but the
+    // expensive half — OPFS reads and megabytes of wasm compilation — needs no guest memory
+    // and has no business sitting on the critical path.
+    const aotPrepared = (globalThis as Record<string, unknown>).__aotAutoLoad
+      ? aotCache.prepare(gameId).catch((e) => ({ error: String(e) }))
+      : null;
     // Install the per-game persist/ephemeral policy (#12): ephemeral writes stay in memory, never OPFS.
     system.fileSystem.setPathPolicy(new PathPolicy({
         ephemeral: bundle.manifest.emulator?.ephemeral,
@@ -1716,6 +1736,34 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
     await loadPeData(bundle.entrypointBytes, true);
     bootMark("pe-loaded");
 
+    // AOT units must be published BEFORE the JIT claims their pages — jit_register_aot_module
+    // refuses a page the live JIT already owns (rc 2), and that is the whole ordering problem
+    // of the track. This is the earliest point where the image is in memory. Registration is
+    // gated on the per-page SHA-256, so a page that gets patched after this (hle-lib) simply
+    // fails the check and keeps the ordinary JIT path. Opt-in until measured.
+    //
+    // loadPeData has just called resumeEmulator(), and publishing awaits — so without the
+    // pause the 1 ms scheduler tick runs the guest through every await and the JIT takes
+    // pages out from under us (that is where the rc-2 refusals came from). v86.run() only
+    // schedules, so nothing has executed yet at this point in the microtask.
+    if (aotPrepared) {
+      try {
+        const t0 = performance.now();
+        pauseEmulator();
+        const loaded = await aotPrepared;
+        const replayed = "loaded" in loaded && loaded.loaded > 0 ? await aotCache.replay() : null;
+        const ms = (performance.now() - t0) | 0;
+        // Also parked where a probe can read it: this line is emitted during the load
+        // firehose and streaming does not reliably survive the reload that precedes it.
+        (globalThis as Record<string, unknown>).__aotBoot = { loaded, replayed, ms };
+        Logger.log(LogCategory.SYSTEM, `[AOT] boot: ${JSON.stringify(loaded)} ${JSON.stringify(replayed)} in ${ms}ms`);
+      } catch (e) {
+        Logger.warn(LogCategory.SYSTEM, `[AOT] boot load failed (falling back to JIT): ${e}`);
+      } finally {
+        resumeEmulator();
+      }
+    }
+
     // Signal host that loading is done and the game is starting
     self.postMessage({ type: "loading_progress", phase: "done", percent: 100, label: "" });
     // Arm the first-present hook HERE (not at load start): the host has just switched
@@ -1771,18 +1819,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       const emulatorConfig = EmulatorConfig.getInstance();
       emulatorConfig.reset();
       emulatorConfig.applyFromManifest(bundle.manifest);
-      {
-        const title = typeof bundle.manifest.title === "string" ? bundle.manifest.title.trim() : "";
-        const name = typeof bundle.manifest.name === "string" ? bundle.manifest.name.trim() : "";
-        const displayName = title || name;
-        if (displayName) {
-          self.postMessage({
-            type: "bundle_meta",
-            name: displayName,
-            gameId: resolveGameId(bundle.manifest),
-          });
-        }
-      }
+      postBundleMeta(bundle.manifest, resolveGameId(bundle.manifest));
       if (bundle.manifest.emulator?.memory?.ram !== undefined) {
         ramSize = emulatorConfig.memory.ram;
         Logger.log(
@@ -1796,13 +1833,23 @@ const initV86 = async (canvas: OffscreenCanvas) => {
     }
   }
 
+  // Streaming instantiation of the core module so V8's implicit wasm code cache can engage
+  // across cold starts (it is keyed by URL and only fires for the *Streaming entry points —
+  // v86's own loader uses the buffer form and therefore always recompiles). Falls back to the
+  // buffered path by itself, so this can never be load-bearing for correctness.
+  const wasmPath = import.meta.env?.DEV ? `/v86.wasm?t=${Date.now()}` : "/v86.wasm";
+  const wasmLoader = createStreamingWasmLoader(wasmPath);
+
   // v86 settings
   const settings = {
     canvas: canvas,
+    wasm_fn: wasmLoader.wasmFn,
     // DEV cache-bust: the worker's wasm fetch is NOT covered by a hard-reload's cache bypass,
     // so a rebuilt /v86.wasm would otherwise keep loading from the browser cache. Unique URL per
     // worker load forces a fresh fetch in dev. (Prod keeps the stable URL for HTTP caching.)
-    wasm_path: import.meta.env?.DEV ? `/v86.wasm?t=${Date.now()}` : "/v86.wasm",
+    // Kept for the fallback inside v86 (and any path that re-reads it); the actual fetch is
+    // performed by wasm_fn above.
+    wasm_path: wasmPath,
     memory_size: ramSize,
     vga_memory_size: EMU_VGA_MEMORY_SIZE,
     bios: { url: "/bios/seabios.bin" },
@@ -1814,6 +1861,10 @@ const initV86 = async (canvas: OffscreenCanvas) => {
   try {
     const v86 = new V86(settings);
     const thunkGenerator = new ThunkGenerator();
+
+    // v86 sets `wasm_source` itself only on its own loading path; with a custom wasm_fn it
+    // stays undefined. Restore it so the zstd helper-worker path keeps working.
+    wasmLoader.sourceBytes.then(bytes => { if (bytes) (v86 as unknown as { wasm_source?: ArrayBuffer }).wasm_source = bytes; });
 
     v86.add_listener("emulator-ready", async () => {
       bootMark("v86-emulator-ready");
@@ -1911,6 +1962,9 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       });
       system.setHostCursorWarpModeCallback((active) => {
         self.postMessage({ type: "cursor_warp", active });
+      });
+      system.setHostInputResetCallback(() => {
+        self.postMessage({ type: "input_reset" });
       });
       system.setHostWindowTitleCallback((title) => {
         self.postMessage({ type: "window_title", title });
