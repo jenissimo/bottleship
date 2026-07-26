@@ -40,6 +40,18 @@ import { isGdiSurfaceHidden } from '../../modules/ddraw/gdi-visibility';
 import { hpFreezeWatchdog } from './hp-freeze-watchdog';
 import { setGuestMemoryStaleGuard, isGuestMemoryStaleGuardEnabled } from '../memory/guest-memory';
 import { MEM_GUARD_BASE, MEM_GUARD_SIZE } from '../cpu/emulator-config';
+import { aotCache } from '../cpu/aot-cache';
+
+/** Namespaced gameId the registry persists under — the same key AOT units are stored by,
+ *  so a unit can never be read back for a different game. */
+function aotGameId(): string {
+    return (System.getInstance().registry as unknown as { gameId?: string })?.gameId ?? "unknown";
+}
+
+// JIT module table geometry — mirrors vendor/v86/src/const.js (WASM_TABLE_SIZE /
+// WASM_TABLE_OFFSET). Slot i of the JIT lives at i + OFFSET in cpu.wm.wasm_table.
+const WASM_TABLE_SIZE = 900;
+const WASM_TABLE_OFFSET = 1024;
 
 interface DbgConfig {
     enabled: boolean;
@@ -289,6 +301,42 @@ export const dbg = {
         const g = (i: number) => (w.get_jit_config ? (w.get_jit_config(i) >>> 0) : -1);
         console.log(`[dbg] set_jit_config(${index},${value}) + clear. now: DISABLED=${g(0)} MAX_PAGES=${g(1)} LOOP_SAFETY=${g(2)} MAX_EXTRA_BB=${g(3)} BLOCK_CHAINING=${g(4)} DEAD_FLAG_ELISION=${g(5)} INDIRECT_REGIONS=${g(6)} REGION_PAGES=${g(8)} FASTMEM_READS=${g(9)} X87_LOCALS=${g(10)} PUSH_RUN=${g(11)}`);
     },
+    /** Dead-flag elision compile-time census (profiler slots 8/9, always-on — unlike the
+     *  dispatch counters these need no dispatchStatsEnable). candidate = instructions that
+     *  fully overwrite the flags, elided = those whose flag computation was actually
+     *  dropped. elided/candidate is the only honest answer to "does idx 5 do anything on
+     *  this workload"; both are cumulative since boot. */
+    deadFlagStats(): { enabled: boolean; candidate: number; elided: number; elidedPct: number } | null {
+        const w = wasm(); const dget = w?.["profiler_dispatch_stat_get"];
+        if (typeof dget !== "function") return null;
+        const candidate = Number(dget(8)), elided = Number(dget(9));
+        const s = {
+            enabled: w.get_jit_config ? !!(w.get_jit_config(5) >>> 0) : false,
+            candidate, elided,
+            elidedPct: candidate > 0 ? +(100 * elided / candidate).toFixed(2) : 0,
+        };
+        console.log(`[dbg][deadflag][JSON] ${JSON.stringify(s)}`);
+        return s;
+    },
+    /** Read-only census of every jit config knob, by name. The companion to jitcfg: an A/B
+     *  arm that never verifies the flag actually took is unfalsifiable, and the shape flags
+     *  reset to their Rust defaults on every v86 init (PreemptionManager re-applies them). */
+    jitConfig(): Record<string, number> {
+        const w = wasm(); if (!w?.get_jit_config) return {};
+        const names: Array<[string, number]> = [
+            ["jitDisabled", 0], ["maxPages", 1], ["loopSafety", 2], ["maxExtraBasicBlocks", 3],
+            ["deadFlagElision", 5], ["indirectRegions", 6], ["regionMinSharePct", 7],
+            ["regionMaxPages", 8], ["fastmemReads", 9], ["x87Locals", 10],
+            ["pushRunCoalescing", 11], ["retChaining", 12], ["retSpeculation", 13],
+            ["retSpecMaxInstr", 14], ["tier2Threshold", 15], ["tier2RetSpecMaxInstr", 16],
+            ["tier2MaxPages", 17], ["fastmemReadSplit", 18], ["fastmemWrites", 19],
+            ["flagLocals", 21], ["branchHints", 22], ["branchHintOffsetFuzz", 23],
+        ];
+        const out: Record<string, number> = {};
+        for (const [name, idx] of names) out[name] = w.get_jit_config(idx) >>> 0;
+        console.log(`[dbg][jitcfg][JSON] ${JSON.stringify(out)}`);
+        return out;
+    },
     /** RET/AbsoluteEip dynamic chaining (set_jit_config idx 12). Default ON — routed through
      *  PreemptionManager so the choice survives a game reload. Clears the JIT cache so
      *  blocks recompile with/without the chain attempt. Read hit/miss via
@@ -300,6 +348,21 @@ export const dbg = {
         else { w.set_jit_config(12, on ? 1 : 0); if (w.jit_clear_cache_js) w.jit_clear_cache_js(); }
         const g = w.get_jit_config ? (w.get_jit_config(12) >>> 0) : -1;
         console.log(`[dbg] JIT_RET_CHAINING=${g} (authoritative — survives reload) + cache cleared`);
+    },
+    /** Count CHAINED module entries toward tier-2 hotness (set_jit_config idx 20, default ON).
+     *  A chained edge jumps module→module without passing through cycle_internal, so without
+     *  this a large share of entries is invisible to hotness and promotions arrive late.
+     *
+     *  Changes NO emitted code (unlike idx 12), so arms are directly comparable and no cache
+     *  clear is needed — that is what separates idx 12's CODE effect from its COUNTER effect.
+     *  Read the census with dbg.tier2Stats(). The tier-2 page set is insert-only and saturates
+     *  at 256, so a STEADY-STATE promotion rate is cap-limited, not counter-limited; the
+     *  counter effect is only visible from a cold JIT. */
+    chainTier2Accounting(on = true): void {
+        const w = wasm(); if (!w?.set_jit_config) return;
+        w.set_jit_config(20, on ? 1 : 0);
+        const g = w.get_jit_config ? (w.get_jit_config(20) >>> 0) : -1;
+        console.log(`[dbg] JIT_CHAIN_TIER2_ACCOUNTING=${g} (no cache clear — accounting only)`);
     },
     /** RET-target speculation / superblock lite (set_jit_config idx 13,
      *  budget idx 14 = max leaf instructions). Default ON — routed through PreemptionManager.
@@ -340,14 +403,111 @@ export const dbg = {
             console.warn("[dbg] jit_get_tier2_page_count missing — rebuild vendor/v86 (build-wasm.sh)");
             return null;
         }
+        // Entry census split by arrival path. chainShare is the fraction of module entries
+        // arriving through a CHAINED edge; with idx 20 off, that share is invisible to hotness
+        // and the tier-2 counter advances 1/(1-chainShare) times slower.
+        const chain = w.jit_get_tier2_chain_entries ? w.jit_get_tier2_chain_entries() : 0;
+        const direct = w.jit_get_tier2_direct_entries ? w.jit_get_tier2_direct_entries() : 0;
         const s = {
             pageCount: w.jit_get_tier2_page_count() >>> 0,
             promotions: w.jit_get_tier2_promotions() >>> 0,
             blockedByCap: w.jit_get_tier2_blocked_by_cap() >>> 0,
             threshold: w.get_jit_config ? (w.get_jit_config(15) >>> 0) : -1,
+            chainEntries: chain,
+            directEntries: direct,
+            chainShare: chain + direct ? +(chain / (chain + direct)).toFixed(4) : 0,
+            chainAccounting: w.get_jit_config ? (w.get_jit_config(20) >>> 0) : -1,
+            pendingDropped: w.jit_get_tier2_pending_dropped ? (w.jit_get_tier2_pending_dropped() >>> 0) : -1,
         };
-        console.log(`[dbg] tier2: pages=${s.pageCount}/256 promotions=${s.promotions} blockedByCap=${s.blockedByCap} threshold=${s.threshold}`);
+        console.log(`[dbg] tier2: pages=${s.pageCount}/256 promotions=${s.promotions} blockedByCap=${s.blockedByCap} threshold=${s.threshold} chainShare=${(100 * s.chainShare).toFixed(1)}% (accounting=${s.chainAccounting}, droppedPending=${s.pendingDropped})`);
         return s;
+    },
+    /**
+     * V8 wasm-tier census over the JIT module table, WEIGHTED BY GUEST EXECUTION.
+     *
+     * Module counts answer "how many modules sit in baseline"; the question that gates
+     * the branch-hint and module-churn tracks is "what share of EXECUTION never reaches
+     * the optimizing tier" — hints are only read by the optimizing tier. So each live
+     * slot's entry delta (jit_get_module_entry_total) is attributed to the tier observed
+     * for that slot, and the shares are over entries, not modules.
+     *
+     * Each call reports the delta since the PREVIOUS call, so the usage is:
+     * jitTierStats() → let the game run → jitTierStats(). A negative per-slot delta means
+     * the slot was recycled (free zeroes the counter); its entries are attributed to the
+     * new occupant and counted in `recycled`.
+     *
+     * The tier probe needs Chrome launched with --js-flags=--allow-natives-syntax
+     * (BS_CHROME_FLAGS in cdp-core). Without it tiers read `unknown` and only the churn
+     * counters are meaningful — `nativesSyntax:false` says which mode you got.
+     */
+    jitTierStats(): any {
+        const w = wasm(); if (!w?.jit_get_module_entry_total) {
+            console.warn("[dbg] jit_get_module_entry_total missing — rebuild vendor/v86 (build-wasm.sh)");
+            return null;
+        }
+        const proc: any = System.getInstance().process;
+        const cpu = proc?.v86?.cpu ?? proc?.v86?.v86?.cpu;
+        const table = cpu?.wm?.wasm_table;
+        if (!table) { console.warn("[dbg] wasm_table unreachable (v86 not ready)"); return null; }
+
+        // Built once: with --allow-natives-syntax this compiles, otherwise it throws a
+        // SyntaxError and we degrade to churn-only.
+        const g = globalThis as any;
+        if (g.__jitTierProbe === undefined) {
+            try {
+                g.__jitTierProbe = new Function("f", "return %IsLiftoffFunction(f) ? 1 : (%IsTurboFanFunction(f) ? 2 : 0);");
+            } catch { g.__jitTierProbe = null; }
+        }
+        const probe: ((f: any) => number) | null = g.__jitTierProbe;
+
+        const prev: Map<number, number> = g.__jitTierPrev ?? new Map<number, number>();
+        const cur = new Map<number, number>();
+        const entries = { liftoff: 0, turbofan: 0, unknown: 0 };
+        const modules = { liftoff: 0, turbofan: 0, unknown: 0, empty: 0 };
+        let recycled = 0;
+
+        for (let i = 0; i < WASM_TABLE_SIZE; i++) {
+            const f = table.get(i + WASM_TABLE_OFFSET);
+            if (!f) { modules.empty++; continue; }
+            const total = w.jit_get_module_entry_total(i) >>> 0;
+            cur.set(i, total);
+            const before = prev.get(i) ?? 0;
+            let delta = total - before;
+            if (delta < 0) { delta = total; recycled++; }   // slot recycled since last call
+
+            let tier: keyof typeof entries = "unknown";
+            if (probe) {
+                try {
+                    const t = probe(f);
+                    tier = t === 1 ? "liftoff" : t === 2 ? "turbofan" : "unknown";
+                } catch { /* not a wasm function / probe unavailable */ }
+            }
+            entries[tier] += delta;
+            modules[tier]++;
+        }
+        g.__jitTierPrev = cur;
+
+        const totalEntries = entries.liftoff + entries.turbofan + entries.unknown;
+        const pct = (n: number) => totalEntries ? +(100 * n / totalEntries).toFixed(2) : 0;
+        const churn = {
+            promotions: w.jit_get_tier2_promotions ? w.jit_get_tier2_promotions() >>> 0 : -1,
+            blockedByCap: w.jit_get_tier2_blocked_by_cap ? w.jit_get_tier2_blocked_by_cap() >>> 0 : -1,
+            doubleFreeSkipped: w.jit_get_double_free_skipped ? w.jit_get_double_free_skipped() >>> 0 : -1,
+            freeListCount: w.jit_get_wasm_table_index_free_list_count ? w.jit_get_wasm_table_index_free_list_count() >>> 0 : -1,
+            cacheSize: w.jit_get_cache_size ? w.jit_get_cache_size() >>> 0 : -1,
+            tier2Pages: w.jit_get_tier2_page_count ? w.jit_get_tier2_page_count() >>> 0 : -1,
+            // blockedByCap counts ATTEMPTS; this counts distinct starved pages. The two
+            // together say whether the cap needs raising or the policy needs eviction.
+            blockedDistinct: w.jit_get_tier2_blocked_distinct ? w.jit_get_tier2_blocked_distinct() >>> 0 : -1,
+        };
+        const out = {
+            nativesSyntax: !!probe,
+            entries, modules, recycled, totalEntries,
+            share: { liftoff: pct(entries.liftoff), turbofan: pct(entries.turbofan), unknown: pct(entries.unknown) },
+            churn,
+        };
+        console.log(`[dbg][jittier] natives=${out.nativesSyntax} entries L=${out.share.liftoff}% T=${out.share.turbofan}% ?=${out.share.unknown}% (n=${totalEntries}) modules L=${modules.liftoff} T=${modules.turbofan} ?=${modules.unknown} empty=${modules.empty} recycled=${recycled} promotions=${churn.promotions} blockedByCap=${churn.blockedByCap}`);
+        return out;
     },
     /** Fastmem read speculation. Default ON; clears JIT cache so blocks recompile. */
     fastmemReads(on = true): void {
@@ -438,6 +598,111 @@ export const dbg = {
         const g = w.get_jit_config ? (w.get_jit_config(21) >>> 0) : -1;
         console.log(`[dbg][flaglocals] enabled=${g} (authoritative - survives reload) + cache cleared`);
     },
+    /**
+     * AOT unit cache (MS-A stage 1). End-to-end proof in one session:
+     *   dbg.aot("arm")      — capture module bytes for the engine's hot (tier-2) pages
+     *   …let the game run…
+     *   dbg.aot("snapshot") — pair bytes with the engine's entry points + page SHA-256
+     *   dbg.aot("drop")     — clear the JIT cache, so nothing compiled is left
+     *   dbg.aot("replay")   — republish the captured units as AOT modules
+     *   dbg.aot("status")   — registered count
+     * If the guest keeps running correctly after "replay", the coexistence contract holds
+     * (registration / dispatch entry / exit / content binding), which is what stage 1 is for.
+     */
+    aot(action = "status", pages?: number[]): any {
+        const w = wasm();
+        switch (action) {
+            case "arm": return aotCache.arm(pages);
+            case "disarm": aotCache.disarm(); return { disarmed: true };
+            case "snapshot": return aotCache.snapshot();
+            case "replay": return aotCache.replay();
+            case "version": return aotCache.version();
+            case "verify": return aotCache.verify();
+            case "compileStats": {
+                const g = globalThis as Record<string, any>;
+                if (!g.__jitCompileStats) g.__jitCompileStats = { count: 0, bytes: 0 };
+                return { ...g.__jitCompileStats };
+            }
+            case "compileReset": {
+                (globalThis as Record<string, any>).__jitCompileStats = { count: 0, bytes: 0 };
+                return { reset: true };
+            }
+            case "bootStats": return (globalThis as Record<string, any>).__aotBoot ?? null;
+            case "save": return aotCache.save(aotGameId());
+            case "load": return aotCache.load(aotGameId());
+            case "clear": aotCache.clear(); return { cleared: true };
+            case "drop":
+                if (w?.jit_clear_cache_js) w.jit_clear_cache_js();
+                return { cleared: true, cacheSize: w?.jit_get_cache_size ? w.jit_get_cache_size() >>> 0 : -1 };
+            default:
+                return {
+                    units: aotCache.getUnits().map((u) => ({
+                        entry: `0x${u.entryPage.toString(16)}`,
+                        pages: u.pages.map((p) => `0x${p.physPage.toString(16)}`),
+                        entries: u.pages.reduce((a, p) => a + p.entries.length, 0),
+                        bytes: u.bytes.length,
+                    })),
+                    registered: w?.jit_aot_registered_count ? w.jit_aot_registered_count() >>> 0 : -1,
+                };
+        }
+    },
+    /** Are the published units STILL OURS and being entered? Two failure modes this must
+     *  separate: a unit that owns a page but is never entered (the guest runs that code
+     *  interpreted AND the JIT cannot compile the page, because ctx.pages already has an
+     *  owner), and a unit that has since been evicted — tier-2 promotion and compile-time
+     *  overwrite both free the module and recycle its slot, so counting entries by page
+     *  alone credits AOT with a JIT module's work. */
+    aotEntered(): any {
+        const w = wasm(); if (!w?.jit_aot_page_table_index) return null;
+        return aotCache.entered();
+    },
+    /**
+     * Toggle the EAGL token-dispatch hook's guest-side gate.
+     *
+     * The hook's entry filter is `cmp byte [cfg+0x34], 0 ; jz .orig`, so clearing that byte
+     * routes every dispatch to the ORIGINAL guest function and setting it routes back — at
+     * guest speed, reversibly. `hleUnpatch` is one-way, so this is the only way to get a
+     * PAIRED A/B rotation of the hook against the guest code it replaces.
+     */
+    eaglGate(on = true): any {
+        const stats = (globalThis as any).eaglTokenDispatchStats?.();
+        const cfgAddr = stats?.cfgAddr >>> 0;
+        if (!cfgAddr) return { error: "eagl token-dispatch not armed (no cfg block)" };
+        const mem = System.getInstance().process?.getCurrentMemory();
+        if (!mem) return { error: "no guest memory" };
+        const off = (cfgAddr + 0x34) >>> 0;
+        mem[off] = on ? 1 : 0;
+        console.log(`[dbg][eagl] token-dispatch gate=${mem[off]} (cfg=0x${cfgAddr.toString(16)})`);
+        return { gate: mem[off], armed: stats?.armed === true, cfgAddr: `0x${cfgAddr.toString(16)}` };
+    },
+    /** Boundary-crossing census for the EAGL token hook (handler 132), cumulative since boot.
+     *  An end-to-end FPS A/B cannot tell a few cheap crossings from a million expensive ones.
+     *  `enter` is one OUT trap per TOKEN — divide by frames for the crossing rate, and read
+     *  `skipPct` as the share of crossings that did nothing but compare a shadow (pure
+     *  batching upside). */
+    eaglTokenCounts(): any {
+        const w = wasm(); if (!w?.eagl_token_enter_count) return null;
+        const enter = w.eagl_token_enter_count(), handled = w.eagl_token_handled_count();
+        const decline = w.eagl_token_decline_count(), skip = w.eagl_token_skip_count();
+        const out = {
+            enter, handled, decline, skip,
+            handledPct: enter > 0 ? +(100 * handled / enter).toFixed(2) : 0,
+            skipPct: enter > 0 ? +(100 * skip / enter).toFixed(2) : 0,
+        };
+        console.log(`[dbg][eagl][JSON] ${JSON.stringify(out)}`);
+        return out;
+    },
+    /** Wasm branch hints on guard slow paths (idx 22). MASK, not a boolean:
+     *  bit0 = memory/TLB guards, bit1 = x87 guards. Default 0 (off). Only the optimizing
+     *  tier reads the hint section, so the effect tracks the Turboshaft share. */
+    branchHints(mask = 1): void {
+        const w = wasm(); if (!w?.set_jit_config) return;
+        const pm = (globalThis as any).preemption;
+        if (pm?.setBranchHints) pm.setBranchHints(mask);
+        else { w.set_jit_config(22, mask >>> 0); if (w.jit_clear_cache_js) w.jit_clear_cache_js(); }
+        const g = w.get_jit_config ? (w.get_jit_config(22) >>> 0) : -1;
+        console.log(`[dbg][branchhints] mask=${g} (authoritative - survives reload) + cache cleared`);
+    },
     /** Fastmem counters: generation, compiled raw-load sites, lazy deopts, source bump counts. */
     fastmemStats(): any {
         const w = wasm(); if (!w?.fastmem_get_generation) return null;
@@ -492,14 +757,26 @@ export const dbg = {
         else { w.set_jit_config(10, on ? 1 : 0); if (w.jit_clear_cache_js) w.jit_clear_cache_js(); }
         console.log(`[dbg][x87] locals=${w.get_jit_config ? (w.get_jit_config(10) >>> 0) : (on ? 1 : 0)} (authoritative - survives reload) + cache cleared`);
     },
+    /** Compile-site counts AND — after dbg.dispatchStatsEnable() — the RUNTIME census.
+     *  The compile counts only say the shape was emitted; hit/fill/invalidate say whether
+     *  the bet pays. hitPct near zero with invalidations outnumbering uses means the cache
+     *  is wiped faster than it is read, which is the whole cost with none of the benefit. */
     x87LocalStats(): any {
         const w = wasm(); if (!w) return null;
+        const dget = w["profiler_dispatch_stat_get"];
+        const rt = typeof dget === "function"
+            ? { hit: Number(dget(13)), fill: Number(dget(14)), invalidate: Number(dget(15)) }
+            : null;
         const s = {
             enabled: w.get_jit_config ? !!(w.get_jit_config(10) >>> 0) : false,
-            // Compile-site counts (not runtime hit/fill — see the Rust comment).
             cacheLoadSitesCompiled: w.x87_locals_get_cache_load_sites_compiled ? (w.x87_locals_get_cache_load_sites_compiled() >>> 0) : 0,
             cacheStoresCompiled: w.x87_locals_get_cache_stores_compiled ? (w.x87_locals_get_cache_stores_compiled() >>> 0) : 0,
             cacheInvalidatesCompiled: w.x87_locals_get_cache_invalidates_compiled ? (w.x87_locals_get_cache_invalidates_compiled() >>> 0) : 0,
+            runtime: rt && {
+                ...rt,
+                hitPct: rt.hit + rt.fill > 0 ? +(100 * rt.hit / (rt.hit + rt.fill)).toFixed(1) : null,
+                invalidatePerUse: rt.hit + rt.fill > 0 ? +(rt.invalidate / (rt.hit + rt.fill)).toFixed(2) : null,
+            },
         };
         console.log(`[dbg][x87][JSON] ${JSON.stringify(s)}`);
         return s;
@@ -512,12 +789,22 @@ export const dbg = {
         else { w.set_jit_config(11, on ? 1 : 0); if (w.jit_clear_cache_js) w.jit_clear_cache_js(); }
         console.log(`[dbg][pushrun] coalescing=${w.get_jit_config ? (w.get_jit_config(11) >>> 0) : (on ? 1 : 0)} (authoritative - survives reload) + cache cleared`);
     },
+    /** Compile-site counts AND — after dbg.dispatchStatsEnable() — the RUNTIME reuse rate.
+     *  hit = a push that reused the previous push's TLB entry, fill = one that had to do
+     *  the lookup anyway. hitPct is the only number that says whether the extra compare in
+     *  front of EVERY push32 buys anything. */
     pushRunStats(): any {
         const w = wasm(); if (!w) return null;
+        const dget = w["profiler_dispatch_stat_get"];
+        const rt = typeof dget === "function" ? { hit: Number(dget(16)), fill: Number(dget(17)) } : null;
         const s = {
             enabled: w.get_jit_config ? !!(w.get_jit_config(11) >>> 0) : false,
             sitesCompiled: w.push_run_get_sites_compiled ? (w.push_run_get_sites_compiled() >>> 0) : 0,
             reuseBranchesCompiled: w.push_run_get_reuse_branches_compiled ? (w.push_run_get_reuse_branches_compiled() >>> 0) : 0,
+            runtime: rt && {
+                ...rt,
+                hitPct: rt.hit + rt.fill > 0 ? +(100 * rt.hit / (rt.hit + rt.fill)).toFixed(1) : null,
+            },
         };
         console.log(`[dbg][pushrun][JSON] ${JSON.stringify(s)}`);
         return s;
@@ -1746,10 +2033,18 @@ export const dbg = {
             console.log(`[dbg][fastpath][JSON] ${JSON.stringify({ windowMs: durationMs, rows })}`);
         }, durationMs);
     },
+    /** Retired-instruction counter (the JIT's own, 32-bit wrapping). The denominator for
+     *  any "share of guest execution" claim — a trace2 page weight is only a share once it
+     *  is divided by the GLOBAL count over the same window, not by the watched subset. */
+    insnCount(): number | null {
+        const proc: any = System.getInstance().process;
+        const cpu = proc?.v86?.cpu ?? proc?.v86?.v86?.cpu;
+        return cpu?.instruction_counter ? cpu.instruction_counter[0] >>> 0 : null;
+    },
     /** Dump all loaded PE modules (name/base/size, sorted by base) as JSON. If `addr`
      *  is given, also resolve which module+RVA it falls in. Use to identify an opaque
      *  code address (e.g. a thunk caller) → module:rva for Ghidra. */
-    mods(addr?: number | string): void {
+    mods(addr?: number | string): any {
         try {
             const mreg = System.getInstance().process?.moduleRegistry as any;
             const map: Map<string, any> = mreg?.modules;
@@ -1768,7 +2063,10 @@ export const dbg = {
                 hit = m ? { addr: `0x${a.toString(16)}`, module: m.name, rva: `0x${((a - m.baseAddress) >>> 0).toString(16)}` } : { addr: `0x${a.toString(16)}`, module: '(none)' };
             }
             console.log(`[dbg][mods][JSON] ${JSON.stringify({ count: list.length, resolve: hit, modules: list })}`);
-        } catch (e) { console.warn('[dbg] mods err', e); }
+            // Returned as well as logged: a probe that needs a live load base should not have
+            // to scrape the log ring for it.
+            return { count: list.length, resolve: hit, modules: list };
+        } catch (e) { console.warn('[dbg] mods err', e); return null; }
     },
     /** Dump a guest memory range as base64 (one console line) so a packed/unparseable
      *  module's RUNTIME (unpacked) image can be reconstructed offline and fed to Ghidra

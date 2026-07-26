@@ -54,6 +54,13 @@ export class PreemptionManager {
      *  dbg.flagLocals(false). Toggle clears the JIT cache (shape baked into modules). */
     private flagLocalsEnabled = false;          // config idx 21
 
+    /** Wasm branch hints on guard slow paths (config idx 22) — a BITMASK of hint groups,
+     *  not a boolean: bit0 = memory/TLB guards, bit1 = x87 guards. Only the optimizing tier
+     *  reads the hint section, so the payoff tracks the Turboshaft share (dbg.jitTierStats).
+     *  Default is bit0 only; bit1 is unmeasured on its own. Baked into emitted modules ⇒
+     *  toggle clears the JIT cache. Kill-switch: dbg.branchHints(0). */
+    private branchHintMask = 1;                 // config idx 22
+
     /** Dynamic dispatch wave, default ON. Both paths respect the
      *  budget/in_hlt guard so async-park is honored. Kill-switches:
      *  setRetChaining/setRetSpeculation(false) or dbg.jitRetChain/jitRetSpec(false). */
@@ -135,6 +142,16 @@ export class PreemptionManager {
         if (ex?.jit_clear_cache_js) ex.jit_clear_cache_js();
     }
     isFlagLocalsEnabled(): boolean { return this.flagLocalsEnabled; }
+
+    /** Branch-hint mask (idx 22). Authoritative (survives game reload); clears the JIT
+     *  cache so guard-bearing blocks re-emit with/without the hint section. */
+    setBranchHints(mask: number): void {
+        this.branchHintMask = mask >>> 0;
+        const ex = this.wasmExports;
+        if (ex?.set_jit_config) ex.set_jit_config(22, this.branchHintMask);
+        if (ex?.jit_clear_cache_js) ex.jit_clear_cache_js();
+    }
+    getBranchHintMask(): number { return this.branchHintMask; }
 
     setX87Locals(on: boolean): void {
         this.x87LocalsEnabled = on;
@@ -231,7 +248,10 @@ export class PreemptionManager {
             // Flag-locals idx 21 — re-applied per init (wasm default OFF). Applied at
             // boot = cold cache, recompile free.
             this.wasmExports.set_jit_config(21, this.flagLocalsEnabled ? 1 : 0);
-            console.log(`[PERF] fastmem-wave: reads=${this.fastmemReadsEnabled ? "on" : "off"} x87Locals=${this.x87LocalsEnabled ? "on" : "off"} pushRun=${this.pushRunCoalescingEnabled ? "on" : "off"} readSplit=${this.fastmemReadSplitEnabled ? "on" : "off"} writes=${this.fastmemWritesEnabled ? "on" : "off"} flagLocals=${this.flagLocalsEnabled ? "on" : "off"}`);
+            // Branch hints idx 22 — re-applied per init (wasm default OFF). Applied at
+            // boot = cold cache, so the implied re-emit is free.
+            this.wasmExports.set_jit_config(22, this.branchHintMask);
+            console.log(`[PERF] fastmem-wave: reads=${this.fastmemReadsEnabled ? "on" : "off"} x87Locals=${this.x87LocalsEnabled ? "on" : "off"} pushRun=${this.pushRunCoalescingEnabled ? "on" : "off"} readSplit=${this.fastmemReadSplitEnabled ? "on" : "off"} writes=${this.fastmemWritesEnabled ? "on" : "off"} flagLocals=${this.flagLocalsEnabled ? "on" : "off"} branchHints=${this.branchHintMask || "off"}`);
 
             // Dynamic-dispatch wave (idx 12/13) — default ON, re-applied per init (wasm
             // codegen defaults are OFF). Applied at boot = cold cache, so the implied
@@ -240,9 +260,8 @@ export class PreemptionManager {
             this.wasmExports.set_jit_config(13, this.retSpeculationEnabled ? 1 : 0);
             console.log(`[PERF] dynamic dispatch: retChain=${this.retChainingEnabled ? "on" : "off"} retSpec=${this.retSpeculationEnabled ? "on" : "off"}`);
 
-            // Hotness tiering (idx 15) — the Rust static defaults ON (300K); OVERRIDE it every
-            // init with the TS authority (default 0 = OFF, see tier2Threshold above — the
-            // promotion invalidation bug crashes Discworld Noir with "null function").
+            // Hotness tiering (idx 15) — re-applied every init; the TS field is the
+            // authority (wasm statics reset per game load).
             this.wasmExports.set_jit_config(15, this.tier2Threshold);
             console.log(`[PERF] B3 tiering: threshold=${this.tier2Threshold || "OFF"}`);
         }

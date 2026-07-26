@@ -33,6 +33,16 @@ export const MEM_THUNK_DATA_SIZE = 0x01000000;  // 16MB
 // NOACCESS region to catch buffer overruns
 export const MEM_GUARD_BASE = 0x23000000;       // After THUNK_DATA
 export const MEM_GUARD_SIZE = 0x01000000;       // 16MB
+// (mirrored in Rust as FASTMEM_GUARD_BASE/SIZE — change both or fastmem refuses to arm)
+
+// PAGE_TABLES: x86 page directory (4KB) + 1024 page tables (4MB) for the identity map,
+// parked in the upper half of the red zone. It has to live somewhere no PE image can
+// reach: an EXE mapped at ImageBase 0x00400000 with a multi-MB BSS covers the whole low
+// gap, and an overlap is silent and lethal — the page walker's A/D-bit writes land in the
+// guest's globals and the guest's writes land in our PTEs. The red zone is already
+// NOACCESS, never allocated from, and excluded from the fastmem envelope.
+export const MEM_PAGETABLE_BASE = 0x23800000;
+export const MEM_PAGETABLE_SIZE = 0x00801000;   // PD + 1024 PTs
 
 // ROM/MODULES: PE executables and DLLs
 // Games typically load at 0x00400000 or 0x10000000+ ImageBase
