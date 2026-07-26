@@ -395,8 +395,17 @@ export function registerStateCommands(svc: HarnessService): void {
             threadId: f.threadId,
             lastThunk: f.lastThunk,
             kind: f.kind,
+            // false ⇒ no instruction at `eip` addresses CR2; the jit only materializes
+            // eip's low 12 bits, so read CR2/cr2Candidates instead of chasing that EIP.
+            eipTrusted: f.eipTrusted,
+            cr2Candidates: f.cr2Candidates,
+            badCall: f.badCall,
+            outcome: f.outcome,
             regs: {
-                ecx: hx(f.regs.ecx), ebx: hx(f.regs.ebx), esp: hx(f.regs.esp),
+                eax: f.regs.eax !== undefined ? hx(f.regs.eax) : undefined,
+                ecx: hx(f.regs.ecx),
+                edx: f.regs.edx !== undefined ? hx(f.regs.edx) : undefined,
+                ebx: hx(f.regs.ebx), esp: hx(f.regs.esp),
                 ebp: hx(f.regs.ebp), esi: hx(f.regs.esi), edi: hx(f.regs.edi),
             },
             recentCalls: f.recentCalls,

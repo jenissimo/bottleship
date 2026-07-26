@@ -18,7 +18,9 @@ import { registerScreenCommands } from "./cmds/screen";
 import { registerBreakpointCommands } from "./cmds/breakpoints";
 import { registerTextureCommands } from "./cmds/textures";
 import { registerFsCommands } from "./cmds/fs";
+import { registerFixtureCommands } from "./cmds/fixture";
 import { registerRegistryCommands } from "./cmds/reg";
+import { registerWmTraceCommands } from "./cmds/wm-trace";
 import { registerAssertCommands } from "./cmds/assert";
 import { registerRecordCommands } from "./cmds/record";
 import { registerMemTrapCommands } from "./cmds/memtrap";
@@ -26,6 +28,7 @@ import { registerPerfCommands } from "./cmds/perf";
 import { registerFadeProbeCommands } from "./cmds/fadeprobe";
 import { registerAudioCommands } from "./cmds/audio";
 import { registerDbgCommands } from "./cmds/dbg";
+import { registerCodegenCommands } from "./cmds/codegen";
 
 let installed = false;
 
@@ -41,7 +44,9 @@ export function installHarnessCommands(): void {
     registerBreakpointCommands(harnessService);
     registerTextureCommands(harnessService);
     registerFsCommands(harnessService);
+    registerFixtureCommands(harnessService);
     registerRegistryCommands(harnessService);
+    registerWmTraceCommands(harnessService);
     registerAssertCommands(harnessService);
     registerRecordCommands(harnessService);
     registerMemTrapCommands(harnessService);
@@ -49,6 +54,7 @@ export function installHarnessCommands(): void {
     registerFadeProbeCommands(harnessService);
     registerAudioCommands(harnessService);
     registerDbgCommands(harnessService);
+    registerCodegenCommands(harnessService);
 }
 
 // Install on import so a bare `import './harness/commands'` is sufficient.

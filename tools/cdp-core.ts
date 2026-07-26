@@ -7,10 +7,11 @@
  * extracts all of it once.
  *
  * Exports: launchOrAttachChrome, findTab, findOrCreateTab, closeStaleTabs,
- * connect (-> CdpSession), pageEval, workerEval, screenshot, health.
+ * connect (-> CdpSession), pageEval, workerEval, screenshot, captureTrace, health.
  *
  * Bun script (top-level await, Bun.spawnSync, global fetch/WebSocket).
  */
+import { gzipSync } from "node:zlib";
 
 export const DEFAULT_CDP_PORT = 9333;
 export const DEFAULT_DEV_URL = "http://localhost:5174/?game=dev";
@@ -53,8 +54,17 @@ export async function launchOrAttachChrome(opts: { port?: number; profile?: stri
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-features=Translate",
+        // Touch feature detection ('ontouchstart' in window, maxTouchPoints > 0) at
+        // page load — before any Emulation override — so startup-time capability
+        // checks see a touch device in automation.
+        "--touch-events=enabled",
         ...(autoplay ? ["--autoplay-policy=no-user-gesture-required"] : []),
         "--window-size=1400,1050",
+        // Escape hatch for measurement runs that need engine flags the default launch
+        // must not carry, e.g. BS_CHROME_FLAGS="--js-flags=--allow-natives-syntax" to
+        // classify JIT modules by V8 tier. Space-separated; only honored on a cold
+        // launch, so kill a running instance first for it to take effect.
+        ...(process.env.BS_CHROME_FLAGS ? process.env.BS_CHROME_FLAGS.split(" ").filter(Boolean) : []),
         "about:blank",
     ];
     if (IS_MAC) {
@@ -176,6 +186,45 @@ export class CdpSession {
     close(): void {
         try { this.ws.close(); } catch { /* */ }
     }
+}
+
+/**
+ * Capture a Chrome performance trace and write it gzipped for tools/analyze-trace.ts.
+ *
+ * Tracing is a BROWSER-level domain (not per-page), so this opens its own session on the
+ * browser endpoint rather than reusing a page session. The v8.cpu_profiler category is the
+ * load-bearing one — without it the trace has no Profile/ProfileChunk events and the
+ * analyzer reports nothing.
+ */
+export async function captureTrace(
+    outFile: string,
+    seconds: number,
+    opts: { port?: number; categories?: string[] } = {},
+): Promise<{ file: string; events: number; bytes: number }> {
+    const port = opts.port ?? DEFAULT_CDP_PORT;
+    const version = await fetchJson(port, "/json/version");
+    const session = await CdpSession.connect(version.webSocketDebuggerUrl);
+    const categories = opts.categories ?? [
+        "disabled-by-default-v8.cpu_profiler",
+        "v8", "v8.execute", "devtools.timeline", "blink.user_timing", "toplevel",
+    ];
+    const events: any[] = [];
+    session.on("Tracing.dataCollected", (p) => { if (p?.value) events.push(...p.value); });
+    const complete = new Promise<void>((resolve) => session.on("Tracing.tracingComplete", () => resolve()));
+
+    await session.send("Tracing.start", {
+        traceConfig: { includedCategories: categories, recordMode: "recordAsMuchAsPossible" },
+        transferMode: "ReportEvents",
+    });
+    await new Promise((r) => setTimeout(r, seconds * 1000));
+    await session.send("Tracing.end");
+    await Promise.race([complete, new Promise((r) => setTimeout(r, 120_000))]);
+    session.close();
+
+    const json = JSON.stringify({ traceEvents: events });
+    const gz = gzipSync(Buffer.from(json));
+    await Bun.write(outFile, gz);
+    return { file: outFile, events: events.length, bytes: gz.byteLength };
 }
 
 /** Connect to the game=dev page target. */

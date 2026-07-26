@@ -19,8 +19,8 @@ bun tools/harness.ts up
 Launches/attaches Chrome with `--autoplay-policy=no-user-gesture-required` (so
 **audio unlocks with no gesture** — no canvas click needed in automation), opens
 `http://localhost:5174/?game=dev`, arms log streaming, and probes Vite(:5174
-`/health`) + log-server(:3001 `/health`) + Chrome(:9333). Bring the dev servers
-up first: `bun run dev` and `bun run dev:logs` (start the log
+`/health`) + dev-sidecar(:3001 `/health`) + Chrome(:9333). Bring the dev servers
+up first: `bun run dev` and `bun run dev:sidecar` (`dev:logs` still works; start the
 server BEFORE streaming). `bun tools/harness.ts health` re-probes.
 
 ## 2. Drive
@@ -44,6 +44,12 @@ await harness()
 
 Skip intros with the bundle's `skipVideo`. `audioGesture()` exists **only** for a
 manually-opened browser; automation uses the autoplay flag.
+
+Touch/mobile runs the same way — `.device('phone-landscape'|'tablet-landscape'|'desktop')`
+then `.tap(x,y)` / `.touchDrag(x0,y0,x1,y1,ms)` / `.longPress(x,y,ms)` / `.twoFingerTap(x,y)` /
+`.pinch(x,y,scale)`, all in GUEST px. These execute CDP-side, so keep `.device()` and its
+gestures in ONE chain: the emulation override is owned by the CDP session and a separate
+CLI invocation reconnects without it.
 
 ## 3. Observe
 

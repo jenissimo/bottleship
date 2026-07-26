@@ -47,6 +47,25 @@ export class HarnessService {
     private handlers = new Map<string, HarnessHandler>();
     private inFlight = new Map<number, InFlight>();
 
+    constructor() {
+        // A fatal guest crash ends every wait NOW. Without this a script that was
+        // parked in tickFrames/waitForEvent sits out its full timeout after the
+        // process is already dead, and reports a TIMEOUT instead of the crash.
+        harnessBus.onLocal("fault", (data) => {
+            const fault = data as { fatal?: boolean; reason?: string } | null;
+            if (!fault?.fatal) return; // per-thread faults leave the process running
+            this.abortAll(new HarnessError(
+                `guest crashed: ${fault.reason ?? "unknown"} — see report()`,
+                HarnessErrorCode.CRASHED,
+            ));
+        });
+    }
+
+    /** Abort every in-flight call (crash teardown). */
+    private abortAll(err: HarnessError): void {
+        for (const f of this.inFlight.values()) f.controller.abort(err);
+    }
+
     /** Register a command handler. Re-registration overwrites (last wins). */
     register(name: string, handler: HarnessHandler): void {
         this.handlers.set(name, handler);

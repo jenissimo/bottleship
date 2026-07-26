@@ -88,6 +88,8 @@ export const HarnessErrorCode = {
     NO_MODULE: "NO_MODULE",
     NOT_FOUND: "NOT_FOUND",
     UNSUPPORTED: "UNSUPPORTED",
+    /** The guest process died while the command was waiting — no point waiting out the timeout. */
+    CRASHED: "CRASHED",
     INTERNAL: "INTERNAL",
 } as const;
 export type HarnessErrorCodeName = (typeof HarnessErrorCode)[keyof typeof HarnessErrorCode];

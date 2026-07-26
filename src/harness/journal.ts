@@ -12,12 +12,17 @@ import { isSerializedFn } from "./types";
 const NAMED_VERBS = new Set([
     "reload", "openWgb", "loadPe", "audioGesture", "streamLogs", "logs", "logStats", "markLog", "logsSince",
     "watchLog", "logAgg", "logAggStats", "waitForEvent", "waitUntil",
-    "tickFrames", "watchFrames", "sleep", "click", "key", "type", "move", "drag", "wheel",
+    "tickFrames", "watchFrames", "sleep", "click", "inputSab", "clickAt", "clickHold", "key", "keyHold",
+    "type", "move", "drag", "wheel", "padPlug", "wmTrace",
+    "device", "tap", "touchDrag", "longPress", "twoFingerTap", "pinch",
     "state", "shot", "captureFrame", "textures", "dumpTexture", "dumpSurface", "time",
     "perfProfile", "perfSpikes", "perfStats", "profilerStats",
     "breakOn", "breakOnExport", "breakOnSymbol", "breakOnApi", "watchMem", "pause", "resume",
-    "fsRead", "fsList", "fsStat", "regGet", "expectDialog", "expectSurfaceNonBlack",
-    "expectThread", "expectFileExists",
+    "fsRead", "fsWrite", "fsDelete", "fsList", "fsStat", "fsFlush", "regGet",
+    "containerList", "containerRead", "containerWrite", "containerDelete",
+    "hostRecord", "hostRecordStop", "hostReplay",
+    "expectDialog", "expectSurfaceNonBlack",
+    "expectThread", "expectFileExists", "expectMessages",
 ]);
 
 function renderArg(a: unknown): string {

@@ -11,6 +11,7 @@ import { apiCensus } from "../core/diagnostics/api-census";
 import { getCxxExceptionRing, getSehDispatchTrace } from "../core/seh-dispatch";
 import { getStackGuardViolations } from "../core/memory/stack-write-guard";
 import { hypercallDataManager } from "../core/cpu/hypercall-data";
+import { loadDiagnostics } from "../core/diagnostics/load-diagnostics";
 
 const hx = (v: number) => "0x" + (v >>> 0).toString(16);
 
@@ -42,7 +43,13 @@ export interface HarnessReport {
         module: string; proc: string; addr: string | null;
         caller: string; callerSym: string | null;
     }>;
-    faults: Array<{ eip: string; faultAddr: string; lastThunk: string; threadId: number | null }>;
+    /** `eipTrusted:false` ⇒ no instruction at `eip` addresses CR2 (the jit materializes only
+     *  eip's low 12 bits) — read `cr2Candidates`/`badCall` instead of chasing that EIP. */
+    faults: Array<{
+        eip: string; eipTrusted?: boolean; faultAddr: string; cr2Candidates?: string[];
+        badCall?: { callSite: number; slotAddr: number; slotValue: number; operand: string };
+        lastThunk: string; threadId: number | null; outcome?: string;
+    }>;
     /** Recent C++ (0xe06d7363) exceptions: decoded type/message + caught/unhandled outcome.
      *  The usual root cause of an MSVC/UE "Runtime Error! terminate" is an `unhandled` entry. */
     cxxExceptions: Array<{ seq: number; threadId: number; type: string; thrown: string; throwModule: string; rethrow: boolean; outcome: string; caughtBy: string }>;
@@ -67,6 +74,13 @@ export interface HarnessReport {
     stackGuardViolations: string[];
     /** Recent SEH catch dispatches (newest last) with descent windows + WILD-EBP notes. */
     sehDispatchTrace: string[];
+    /** The crash that ended the run, INCLUDING one raised before any guest code ran
+     *  (PE link failure) — where every live-state field below is legitimately empty. */
+    crash: { reason: string; eip: string; faultAddr: string; threadId: number | null; lastThunk: string } | null;
+    /** Imports with no known arity. A fatal one aborts the link ("Stub requires
+     *  argCount..."); the rest are latent stack-cleanup corruption. Fix in the
+     *  module's `*.api.ts` (or tools/reference/win32) — see the crash reason. */
+    unknownArgCounts: Array<{ api: string; aliasedFrom: string | null; count: number }>;
 }
 
 function readStackWords(esp: number, count = 4): string[] {
@@ -160,9 +174,13 @@ export function buildHarnessReport(esp?: number): HarnessReport {
         })),
         faults: faultRecorder.recent(8).map((f) => ({
             eip: hx(f.eip),
+            eipTrusted: f.eipTrusted,
             faultAddr: hx(f.faultAddr),
+            cr2Candidates: f.cr2Candidates,
+            badCall: f.badCall,
             lastThunk: f.lastThunk,
             threadId: f.threadId,
+            outcome: f.outcome,
         })),
         cxxExceptions: getCxxExceptionRing().slice(-12).map((e) => ({
             seq: e.seq,
@@ -183,5 +201,20 @@ export function buildHarnessReport(esp?: number): HarnessReport {
         slab: hypercallDataManager.getSlabStats(),
         stackGuardViolations: getStackGuardViolations(),
         sehDispatchTrace: getSehDispatchTrace(),
+        crash: (() => {
+            const f = loadDiagnostics.lastFailure();
+            return f && {
+                reason: f.reason,
+                eip: hx(f.eip),
+                faultAddr: hx(f.faultAddr),
+                threadId: f.threadId,
+                lastThunk: f.lastThunk,
+            };
+        })(),
+        unknownArgCounts: loadDiagnostics.list().map((u) => ({
+            api: u.key,
+            aliasedFrom: u.aliasedFrom,
+            count: u.count,
+        })),
     };
 }

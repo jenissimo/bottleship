@@ -55,6 +55,12 @@ export class HarnessChain {
 
     // ── logging ──
     streamLogs(categories?: string[]): this { return this.push("streamLogs", [categories]); }
+    /** Stop shipping log batches to the sidecar. **Bracket every measured window with this**:
+     *  streaming costs real time on the WORKER thread — the exact thread a perf window is
+     *  measuring — and its volume varies with what the guest happens to log, so it adds bias
+     *  as well as noise. The in-memory ring keeps filling, so `logs`/`logsSince`/`report`
+     *  still work; only the postMessage + WS shipping stops. Re-arm with `streamLogs()`. */
+    stopLogs(): this { return this.push("stopLogs", []); }
     logs(count?: number, filter?: string): this { return this.push("logs", [count, filter]); }
     logStats(count?: number, top?: number): this { return this.push("logStats", [count, top]); }
     markLog(label: string): this { return this.push("markLog", [label]); }
@@ -79,6 +85,8 @@ export class HarnessChain {
     click(target: string | number): this { return this.push("click", [target]); }
     /** Click at guest-pixel coordinates (DDraw/D3D-composed UIs with no Win32 controls to target by label). */
     clickAt(x: number, y: number, button?: number): this { return this.push("clickAt", [x, y, button]); }
+    /** Host-side snapshot of the published input record (the other half of state(["input"])). */
+    inputSab(): this { return this.push("inputSab", []); }
     /** Press + hold at guest coords, release on a timer — for low-fps state-polling guests that miss a synchronous click. */
     clickHold(x: number, y: number, holdMs?: number, button?: number): this { return this.push("clickHold", [x, y, holdMs, button]); }
     key(vk: number | string, opts?: { down?: boolean; up?: boolean }): this { return this.push("key", [vk, opts]); }
@@ -90,6 +98,23 @@ export class HarnessChain {
     move(x: number, y: number): this { return this.push("move", [x, y]); }
     drag(x0: number, y0: number, x1: number, y1: number, button?: number): this { return this.push("drag", [x0, y0, x1, y1, button]); }
     wheel(x: number, y: number, delta: number): this { return this.push("wheel", [x, y, delta]); }
+    /** Plug (true) or unplug (false) the gamepad: drives the SAB presence slot through the
+     *  normal poll, so the guest gets the real WM_DEVICECHANGE / DIERR_INPUTLOST sequence. */
+    padPlug(connected = true): this { return this.push("padPlug", [connected]); }
+    /** Record the pointer/keyboard WM_* the input layer posts — the ring expectMessages asserts over. */
+    wmTrace(action: "start" | "stop" | "read" | "clear" = "read"): this { return this.push("wmTrace", [action]); }
+
+    // ── touch (CDP-side: device emulation + synthetic contacts; coords are GUEST px) ──
+    /** Emulate a device profile — 'phone-landscape' | 'tablet-landscape' | 'desktop' (clears the override) — before the touch verbs. */
+    device(profile: string): this { return this.push("device", [profile]); }
+    tap(x: number, y: number): this { return this.push("tap", [x, y]); }
+    /** One contact along a line over `ms`, with interpolated moves so a recognizer sees a real motion trail. */
+    touchDrag(x0: number, y0: number, x1: number, y1: number, ms?: number): this { return this.push("touchDrag", [x0, y0, x1, y1, ms]); }
+    /** Contact held for `ms` of REAL time — the RMB gesture. */
+    longPress(x: number, y: number, ms?: number): this { return this.push("longPress", [x, y, ms]); }
+    twoFingerTap(x: number, y: number, spread?: number): this { return this.push("twoFingerTap", [x, y, spread]); }
+    /** Two contacts straddling (x,y) moving symmetrically to `scale`× their span (<1 in, >1 out). */
+    pinch(x: number, y: number, scale: number, ms?: number): this { return this.push("pinch", [x, y, scale, ms]); }
 
     // ── observe ──
     state(sections?: string[]): this { return this.push("state", [sections]); }
@@ -101,6 +126,8 @@ export class HarnessChain {
     report(esp?: number): this { return this.push("report", [esp]); }
     /** Recent guest page faults (EIP / fault addr / thread / last thunk / regs). */
     faults(n?: number): this { return this.push("faults", [n]); }
+    /** Raw guest memory as hex — read a struct, a stack frame, or unpacked code. */
+    readBytes(addr: number | string, len?: number): this { return this.push("readBytes", [addr, len]); }
     shot(opts?: { save?: string }): this { return this.push("shot", [opts]); }
     captureFrame(opts?: { dumpTargets?: boolean }): this { return this.push("captureFrame", [opts]); }
     textures(): this { return this.push("textures", []); }
@@ -131,17 +158,30 @@ export class HarnessChain {
     pause(): this { return this.push("pause", []); }
     resume(): this { return this.push("resume", []); }
 
-    // ── record / replay (present-serial gated) ──
+    // ── record / replay (present-serial gated; harness-injected input only) ──
     record(): this { return this.push("record", []); }
     recordStop(): this { return this.push("recordStop", []); }
     replay(recording: unknown): this { return this.pushTimed("replay", [recording], 0); }
 
+    // ── host record / replay (captures MANUAL play: the human's SAB publications) ──
+    hostRecord(): this { return this.push("hostRecord", []); }
+    hostRecordStop(): this { return this.push("hostRecordStop", []); }
+    hostReplay(samples: unknown, opts?: { deterministic?: boolean }): this { return this.pushTimed("hostReplay", [samples, opts], 0); }
+
     // ── filesystem / registry ──
     fsRead(path: string): this { return this.push("fsRead", [path]); }
+    fsWrite(path: string, content: string, opts?: { encoding?: "utf8" | "base64" }): this { return this.push("fsWrite", [path, content, opts]); }
     fsDelete(path: string): this { return this.push("fsDelete", [path]); }
     fsList(path: string): this { return this.push("fsList", [path]); }
     fsStat(path: string): this { return this.push("fsStat", [path]); }
+    fsFlush(): this { return this.push("fsFlush", []); }
     regGet(root: string, key: string, value?: string): this { return this.push("regGet", [root, key, value]); }
+
+    // ── OPFS container fixtures (keyed by container; usable before a bundle loads) ──
+    containerList(container: string): this { return this.push("containerList", [container]); }
+    containerRead(container: string, path: string): this { return this.push("containerRead", [container, path]); }
+    containerWrite(container: string, path: string, base64: string): this { return this.push("containerWrite", [container, path, base64]); }
+    containerDelete(container: string, path?: string): this { return this.push("containerDelete", [container, path]); }
 
     // ── assertions (worker rejects -> chain aborts) ──
     expect(cmd: string, ...args: unknown[]): this { return this.push(cmd, args); }
@@ -149,6 +189,9 @@ export class HarnessChain {
     expectSurfaceNonBlack(sel?: string): this { return this.push("expectSurfaceNonBlack", [sel]); }
     expectThread(opts: { state?: string; eip?: number }): this { return this.push("expectThread", [opts]); }
     expectFileExists(path: string): this { return this.push("expectFileExists", [path]); }
+    /** Ordered SUBSEQUENCE over the wmTrace ring. Patterns: 'WM_MOUSEMOVE@400,300',
+     *  'WM_KEYDOWN vk=0x57', 'WM_KEYDOWN vk=0x57 repeat'. */
+    expectMessages(patterns: string[]): this { return this.push("expectMessages", [patterns]); }
 
     /** Execute the chain; returns one accumulated POJO. */
     run(): Promise<HarnessRunResult> {

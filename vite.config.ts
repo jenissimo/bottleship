@@ -6,6 +6,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { execSync } from "node:child_process";
+import type { ServerResponse } from "node:http";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -76,6 +77,17 @@ function harnessHealthPlugin(): Plugin {
 // lives in the repo tree, so no cleanup can ever recurse into a real drive again. Full HTTP
 // Range support (206, suffix `bytes=-N`) so the worker's synchronous on-demand streaming
 // loader (SyncHttpRangeSource) works — a server that ignores Range is exactly what breaks it.
+// A ROM read is one Range request, so a bundle boot issues hundreds of them against a
+// multi-GB file. `.pipe(res)` alone leaks the descriptor whenever the client goes away
+// before the body is drained (aborted prefetch, page reload mid-load) — the stream stays
+// open with nothing consuming it, and a long-lived dev server accumulates them until
+// every further read crawls. Destroy the stream when the response closes.
+function pipeAndCleanup(stream: fs.ReadStream, res: ServerResponse): void {
+  res.on("close", () => stream.destroy());
+  stream.on("error", () => { stream.destroy(); if (!res.writableEnded) res.end(); });
+  stream.pipe(res);
+}
+
 function serveWgbFromDisk(): Plugin {
   const ROUTE = "/__wgb/";
   return {
@@ -114,13 +126,13 @@ function serveWgbFromDisk(): Plugin {
           res.setHeader("Content-Range", `bytes ${start}-${end}/${size}`);
           res.setHeader("Content-Length", String(end - start + 1));
           if (req.method === "HEAD") { res.end(); return; }
-          fs.createReadStream(file, { start, end }).pipe(res);
+          pipeAndCleanup(fs.createReadStream(file, { start, end }), res);
           return;
         }
         res.statusCode = 200;
         res.setHeader("Content-Length", String(size));
         if (req.method === "HEAD") { res.end(); return; }
-        fs.createReadStream(file).pipe(res);
+        pipeAndCleanup(fs.createReadStream(file), res);
       });
     },
   };

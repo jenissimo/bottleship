@@ -17,7 +17,9 @@
  *                    .expectSurfaceNonBlack("primary").state(["surfaces"]).run();
  *
  * The builder is pure sugar over harness_rpc: `.run()` ships the serialized step
- * list to `window.__BS__.harness.__runSteps` in the page over a single CDP eval.
+ * list to `window.__BS__.harness.__runSteps` in the page over a single CDP eval —
+ * except the CDP_STEPS verbs (reload + the touch/device verbs), which the CLI runs
+ * itself against the browser and splices back into the same ordered result.
  */
 
 import {
@@ -28,12 +30,15 @@ import {
     workerEval,
     workerStack,
     screenshot,
+    captureTrace,
     health,
     CdpSession,
     DEFAULT_DEV_URL,
 } from "./cdp-core";
+import { readCanvasGeometry } from "./cdp-geometry";
+import { applyDevice, tap, touchDrag, longPress, twoFingerTap, pinch } from "./cdp-touch";
 import { HarnessChain } from "../src/harness/dsl";
-import type { HarnessStep, HarnessRunResult } from "../src/harness/types";
+import type { HarnessStep, HarnessRunResult, HarnessStepResult } from "../src/harness/types";
 import { runResultToJournal } from "../src/harness/journal";
 
 let _session: CdpSession | null = null;
@@ -90,50 +95,77 @@ async function reloadPageAndWait(session: CdpSession): Promise<void> {
 
 let _journalSeq = 0;
 
-/** CLI-side step executor: ship the step list to the page and return its POJO,
- *  then write a re-runnable journal artifact. */
-async function execViaCdp(steps: HarnessStep[]): Promise<HarnessRunResult> {
-    const session = await ensureSession();
-    const pageSteps = steps.filter((s) => s.cmd !== "reload");
-    const preflight: HarnessRunResult = { ok: true, steps: [], named: {} };
+/** Verbs the CLI executes over CDP itself instead of shipping to the page: the
+ *  page can neither reload itself mid-chain nor synthesize trusted touch input. */
+const CDP_STEPS = new Set(["reload", "device", "tap", "touchDrag", "longPress", "twoFingerTap", "pinch"]);
 
-    if (steps.some((s) => s.cmd === "reload")) {
-        const t0 = Date.now();
-        try {
-            await reloadPageAndWait(session);
-            const sr = { cmd: "reload", ok: true as const, result: { reloaded: true }, ms: Date.now() - t0 };
-            preflight.steps.push(sr);
-            preflight.named.reload = sr.result;
-        } catch (err) {
-            const e = err as Error;
-            preflight.ok = false;
-            preflight.steps.push({
-                cmd: "reload",
-                ok: false,
-                error: { message: e.message },
-                ms: Date.now() - t0,
-            });
-            preflight.error = { message: e.message, atStep: 0, cmd: "reload" };
-            return preflight;
-        }
+async function runCdpStep(session: CdpSession, step: HarnessStep): Promise<unknown> {
+    const a = step.args as (number | string | undefined)[];
+    const n = (i: number) => Number(a[i]);
+    const opt = (i: number) => (a[i] === undefined || a[i] === null ? undefined : Number(a[i]));
+    switch (step.cmd) {
+        case "reload": await reloadPageAndWait(session); return { reloaded: true };
+        case "device": return applyDevice(session, String(a[0]));
+        case "tap": return tap(session, n(0), n(1));
+        case "touchDrag": return touchDrag(session, n(0), n(1), n(2), n(3), opt(4));
+        case "longPress": return longPress(session, n(0), n(1), opt(2));
+        case "twoFingerTap": return twoFingerTap(session, n(0), n(1), opt(2));
+        case "pinch": return pinch(session, n(0), n(1), n(2), { ms: opt(3) });
     }
+    throw new Error(`no CDP handler for step '${step.cmd}'`);
+}
 
-    if (pageSteps.length === 0) return preflight;
-
+/** Ship a contiguous run of page steps to `__runSteps` in one eval. */
+async function runPageSteps(session: CdpSession, steps: HarnessStep[]): Promise<HarnessRunResult> {
     // Double-stringify so the steps reach the page as a string the page JSON.parses
     // (avoids brittle expression escaping).
-    const payload = JSON.stringify(JSON.stringify(pageSteps));
+    const payload = JSON.stringify(JSON.stringify(steps));
     const expr = `window.__BS__ && window.__BS__.harness ? window.__BS__.harness.__runSteps(JSON.parse(${payload})) : Promise.reject(new Error('harness facade not installed (open ?game=dev)'))`;
     // Generous timeout: chains can include long waits (tickFrames, waitForEvent).
-    const result = (await pageEval(session, expr, { timeoutMs: 300_000 })) as HarnessRunResult;
-    if (preflight.steps.length > 0) {
-        result.steps = [...preflight.steps, ...result.steps];
-        result.named = { ...preflight.named, ...result.named };
-        if (preflight.error) {
+    return (await pageEval(session, expr, { timeoutMs: 300_000 })) as HarnessRunResult;
+}
+
+/** CLI-side step executor: run CDP verbs here, batch everything else into the page,
+ *  splice both back into ONE ordered result, then write a re-runnable journal.
+ *  Order is preserved step-by-step — a chain may interleave the two freely
+ *  (`.device(..).openWgb(..).tap(..).state(..)`). */
+async function execViaCdp(steps: HarnessStep[]): Promise<HarnessRunResult> {
+    const session = await ensureSession();
+    const result: HarnessRunResult = { ok: true, steps: [], named: {} };
+
+    for (let i = 0; i < steps.length;) {
+        const step = steps[i];
+        if (CDP_STEPS.has(step.cmd)) {
+            const t0 = Date.now();
+            try {
+                const r = await runCdpStep(session, step);
+                const sr: HarnessStepResult = { cmd: step.cmd, label: step.label, ok: true, result: r, ms: Date.now() - t0 };
+                result.steps.push(sr);
+                result.named[step.cmd] = r;
+            } catch (err) {
+                const e = err as Error;
+                result.steps.push({ cmd: step.cmd, label: step.label, ok: false, error: { message: e.message }, ms: Date.now() - t0 });
+                result.ok = false;
+                result.error = { message: e.message, atStep: i, cmd: step.cmd };
+                break;
+            }
+            i++;
+            continue;
+        }
+        const start = i;
+        while (i < steps.length && !CDP_STEPS.has(steps[i].cmd)) i++;
+        const sub = await runPageSteps(session, steps.slice(start, i));
+        result.steps.push(...(sub.steps ?? []));
+        Object.assign(result.named, sub.named ?? {});
+        if (!sub.ok) {
             result.ok = false;
-            result.error = preflight.error;
+            // The page numbers steps within its batch; re-base onto the whole chain.
+            result.error = sub.error ? { ...sub.error, atStep: start + sub.error.atStep } : { message: "page batch failed", atStep: start, cmd: steps[start].cmd };
+            if (sub.faultSnapshot !== undefined) result.faultSnapshot = sub.faultSnapshot;
+            break;
         }
     }
+
     try {
         const file = `logs/harness/run-${++_journalSeq}.harness.ts`;
         await Bun.write(file, runResultToJournal(steps, result));
@@ -222,6 +254,65 @@ async function cmdStack(samplesArg?: string): Promise<void> {
     });
 }
 
+/**
+ * fixture save|restore <name> [--container C] — a game's persisted profile (its
+ * OPFS CoW overlay) as a checked-in artifact.
+ *
+ * Why the disk half lives here and not in a harness verb: the worker can reach
+ * OPFS but not the filesystem, and the dev sidecar's writer is jailed to the log
+ * dir (resolveSafeLogPath), so it can neither address fixtures/ nor keep a path
+ * component containing a space.
+ *
+ * RESTORE BEFORE LOADING THE BUNDLE — a running game holds these files open.
+ */
+async function cmdFixture(mode: string, name: string, args: string[]): Promise<void> {
+    if (!name) throw new Error("usage: fixture <save|restore> <name> [--container <id>]");
+    const dir = `fixtures/${name}`;
+    const flagAt = args.indexOf("--container");
+    const flagContainer = flagAt >= 0 ? args[flagAt + 1] : "";
+    const manifestPath = `${dir}/manifest.json`;
+
+    if (mode === "save") {
+        const container = flagContainer
+            || (await Bun.file(manifestPath).exists() ? JSON.parse(await Bun.file(manifestPath).text()).container : "");
+        if (!container) throw new Error("fixture save needs --container <id> (no manifest to inherit it from)");
+        const listed = await harness().containerList(container).run();
+        if (!listed.ok) throw new Error(`containerList failed: ${listed.error?.message}`);
+        const files = (listed.named.containerList as { files: Array<{ path: string; size: number }> }).files;
+        const saved: Array<{ path: string; bytes: number }> = [];
+        for (const f of files) {
+            const r = await harness().containerRead(container, f.path).run();
+            if (!r.ok) throw new Error(`containerRead ${f.path} failed: ${r.error?.message}`);
+            const { content } = r.named.containerRead as { content: string };
+            await Bun.write(`${dir}${f.path}`, Buffer.from(content, "base64"));
+            saved.push({ path: f.path, bytes: f.size });
+        }
+        const prior = await Bun.file(manifestPath).exists() ? JSON.parse(await Bun.file(manifestPath).text()) : {};
+        await Bun.write(manifestPath, JSON.stringify(
+            { container, files: files.map((f) => f.path), ...(prior.note ? { note: prior.note } : {}) }, null, 2,
+        ) + "\n");
+        console.log(JSON.stringify({ mode, container, dir, saved }, null, 2));
+        return;
+    }
+
+    if (mode === "restore") {
+        if (!(await Bun.file(manifestPath).exists())) throw new Error(`no fixture at ${manifestPath}`);
+        const man = JSON.parse(await Bun.file(manifestPath).text()) as { container: string; files: string[] };
+        const container = flagContainer || man.container;
+        const done: Array<{ path: string; written: number }> = [];
+        for (const p of man.files) {
+            const bytes = new Uint8Array(await Bun.file(`${dir}${p}`).arrayBuffer());
+            const r = await harness().containerWrite(container, p, Buffer.from(bytes).toString("base64")).run();
+            if (!r.ok) throw new Error(`containerWrite ${p} failed: ${r.error?.message}`);
+            done.push({ path: p, written: (r.named.containerWrite as { written: number }).written });
+        }
+        console.log(JSON.stringify({ mode, container, dir, done }, null, 2));
+        return;
+    }
+
+    throw new Error(`unknown fixture mode '${mode}' (save|restore)`);
+}
+
 /** shot [out.png] — page screenshot to a file (replaces cdp-shot). */
 async function cmdShot(out: string): Promise<void> {
     const session = await ensureSession();
@@ -242,29 +333,23 @@ async function cmdShot(out: string): Promise<void> {
 async function cmdGridShot(out: string, stepArg?: string): Promise<void> {
     const session = await ensureSession();
     const step = stepArg ? Number(stepArg) : 0;
+    // Same guest↔CSS mapping the touch verbs aim with (cdp-geometry) — the grid
+    // labels would otherwise be a second, drifting copy of it.
+    const geo = await readCanvasGeometry(session);
     const inject = `(() => {
-        const cv = document.querySelector('.app__canvas');
-        if (!cv) return { error: 'no .app__canvas element' };
-        const r = cv.getBoundingClientRect();
-        // Guest surface dims (the space clickAt injects into). Prefer the explicit
-        // global; fall back to the inline style.width/height App sets to guest px
-        // (a transferred OffscreenCanvas reports width=0 on the main thread).
-        const styW = parseFloat(cv.style.width) || 0, styH = parseFloat(cv.style.height) || 0;
-        const gr = (window.__BS__ && window.__BS__.guestResolution) || (styW && styH ? { width: styW, height: styH } : { width: cv.width || 1024, height: cv.height || 768 });
-        const gw = Math.max(1, gr.width), gh = Math.max(1, gr.height);
+        const r = ${JSON.stringify(geo.rect)}, sx = ${geo.scale.x}, sy = ${geo.scale.y};
+        const gw = ${geo.guest.w}, gh = ${geo.guest.h}, dpr = ${geo.dpr};
         const old = document.getElementById('__bs_grid_overlay'); if (old) old.remove();
         const niceStep = (n) => { const t = n / 12; for (const s of [10,20,25,50,100,200,250,500]) if (s >= t) return s; return 1000; };
         const stp = ${step} > 0 ? ${step} : niceStep(Math.max(gw, gh));
         const ov = document.createElement('canvas'); ov.id = '__bs_grid_overlay';
-        Object.assign(ov.style, { position:'fixed', left:r.left+'px', top:r.top+'px', width:r.width+'px', height:r.height+'px', pointerEvents:'none', zIndex:2147483647 });
-        const dpr = window.devicePixelRatio || 1;
-        ov.width = Math.round(r.width*dpr); ov.height = Math.round(r.height*dpr);
+        Object.assign(ov.style, { position:'fixed', left:r.x+'px', top:r.y+'px', width:r.w+'px', height:r.h+'px', pointerEvents:'none', zIndex:2147483647 });
+        ov.width = Math.round(r.w*dpr); ov.height = Math.round(r.h*dpr);
         const c = ov.getContext('2d'); c.scale(dpr, dpr);
-        const sx = r.width/gw, sy = r.height/gh;
         c.font = '11px monospace'; c.textBaseline = 'top'; c.lineWidth = 1;
-        for (let gx=0; gx<=gw; gx+=stp) { const px=gx*sx; c.strokeStyle='rgba(0,234,255,0.30)'; c.beginPath(); c.moveTo(px,0); c.lineTo(px,r.height); c.stroke();
+        for (let gx=0; gx<=gw; gx+=stp) { const px=gx*sx; c.strokeStyle='rgba(0,234,255,0.30)'; c.beginPath(); c.moveTo(px,0); c.lineTo(px,r.h); c.stroke();
             c.fillStyle='rgba(0,0,0,0.6)'; c.fillRect(px+1,0,String(gx).length*7+2,12); c.fillStyle='#0ef'; c.fillText(String(gx), px+2, 1); }
-        for (let gy=0; gy<=gh; gy+=stp) { const py=gy*sy; c.strokeStyle='rgba(0,234,255,0.30)'; c.beginPath(); c.moveTo(0,py); c.lineTo(r.width,py); c.stroke();
+        for (let gy=0; gy<=gh; gy+=stp) { const py=gy*sy; c.strokeStyle='rgba(0,234,255,0.30)'; c.beginPath(); c.moveTo(0,py); c.lineTo(r.w,py); c.stroke();
             c.fillStyle='rgba(0,0,0,0.6)'; c.fillRect(0,py+1,String(gy).length*7+2,12); c.fillStyle='#0ef'; c.fillText(String(gy), 1, py+2); }
         let controls = [];
         // dialogs() may be async (RPC) → only use a synchronously-available array.
@@ -279,7 +364,7 @@ async function cmdGridShot(out: string, stepArg?: string): Promise<void> {
             c.fillStyle='#fd0'; c.beginPath(); c.arc(cx*sx, cy*sy, 3, 0, 7); c.fill();
         }
         document.body.appendChild(ov);
-        return { ok:true, rect:{ x:r.left, y:r.top, w:r.width, h:r.height }, guest:{ w:gw, h:gh }, step:stp, controls:controls.length };
+        return { ok:true, step:stp, controls:controls.length };
     })()`;
     const meta = (await pageEval(session, inject, { timeoutMs: 10_000 })) as any;
     if (!meta || meta.error) { console.error("gridShot:", meta?.error || "failed"); return; }
@@ -287,14 +372,25 @@ async function cmdGridShot(out: string, stepArg?: string): Promise<void> {
     // scale that brings the output up to ~guest resolution so the px labels stay
     // crisp even when the on-screen canvas is shrunk to fit the viewport.
     const pad = 14;
-    const scale = Math.max(1, Math.min(3, Math.round((meta.guest.w / Math.max(1, meta.rect.w)) * 10) / 10));
-    const clip = { x: Math.max(0, meta.rect.x), y: Math.max(0, meta.rect.y - pad), width: meta.rect.w, height: meta.rect.h + pad, scale };
+    const scale = Math.max(1, Math.min(3, Math.round((geo.guest.w / Math.max(1, geo.rect.w)) * 10) / 10));
+    const clip = { x: Math.max(0, geo.rect.x), y: Math.max(0, geo.rect.y - pad), width: geo.rect.w, height: geo.rect.h + pad, scale };
     const shot = await session.send("Page.captureScreenshot", { format: "png", clip });
     const file = out || "logs/harness-gridshot.png";
     await Bun.write(file, Buffer.from(shot.result?.data ?? "", "base64"));
     await pageEval(session, "(()=>{const o=document.getElementById('__bs_grid_overlay');if(o)o.remove();return 1})()", { timeoutMs: 5000 }).catch(() => {});
-    console.log(`gridShot -> ${file}  guest=${meta.guest.w}x${meta.guest.h} step=${meta.step}px controls=${meta.controls}`);
+    console.log(`gridShot -> ${file}  guest=${geo.guest.w}x${geo.guest.h} step=${meta.step}px controls=${meta.controls}`);
     console.log(`  read a feature's (x,y) off the grid (GUEST pixels), then: bun tools/harness.ts clickAt <x> <y>`);
+}
+
+/** trace <seconds> [out.json.gz] — capture a Chrome perf trace for tools/analyze-trace.ts.
+ *  Drive the game into the state you want FIRST; this only records. */
+async function cmdTrace(secondsArg?: string, out?: string): Promise<void> {
+    const seconds = Number(secondsArg ?? 10);
+    const file = out ?? `logs/trace-${seconds}s.json.gz`;
+    console.log(`tracing ${seconds}s -> ${file} …`);
+    const r = await captureTrace(file, seconds);
+    console.log(`  ${r.events} events, ${(r.bytes / 1024 / 1024).toFixed(1)} MB`);
+    console.log(`  analyze: bun tools/analyze-trace.ts ${file} --thread worker --top 40`);
 }
 
 /** reload — hard-reload the page (replaces cdp-reload; HMR is off, so reload to pick up worker edits). */
@@ -327,11 +423,13 @@ async function main(): Promise<void> {
         case "eval": await cmdEval(rest.join(" ")); break;
         case "worker-eval": await cmdWorkerEval(rest.join(" ")); break;
         case "stack": await cmdStack(rest[0]); break;
+        case "fixture": await cmdFixture(rest[0], rest[1], rest.slice(2)); break;
         case "shot": await cmdShot(rest[0]); break;
         case "gridShot": case "gridshot": await cmdGridShot(rest[0], rest[1]); break;
+        case "trace": await cmdTrace(rest[0], rest[1]); break;
         case "reload": await cmdReload(); break;
         case undefined:
-            console.log("usage: bun tools/harness.ts <up|run <script>|repl|health|eval <expr>|worker-eval <expr>|shot [out.png]|gridShot [out.png] [step]|reload|<any-harness-command> [args...]>");
+            console.log("usage: bun tools/harness.ts <up|run <script>|repl|health|eval <expr>|worker-eval <expr>|fixture <save|restore> <name> [--container <id>]|shot [out.png]|gridShot [out.png] [step]|trace <sec> [out.json.gz]|reload|device <profile>|tap <x> <y>|<any-harness-command> [args...]>");
             process.exit(0);
             break;
         // Any other token is dispatched as a harness RPC command (report, stubs, backtrace,

@@ -10,6 +10,7 @@ import type { HarnessService } from "../service";
 import { HarnessError, HarnessErrorCode } from "../rpc";
 import { sys } from "../serialize";
 import { windows } from "../../modules/user32/shared-state";
+import { getDeviceNotifications } from "../../modules/user32/device-notify";
 import { describeDlgControl, findDlgControl } from "../dlg";
 import { recorder } from "../recorder";
 
@@ -74,7 +75,7 @@ function input() {
 
 /** Input commands that mutate guest state — recorded by the present-serial
  *  recorder and replayable. (dialogs/findControl are read-only queries, excluded.) */
-export const RECORDABLE_INPUT = new Set(["click", "clickAt", "move", "drag", "wheel", "key", "type"]);
+export const RECORDABLE_INPUT = new Set(["click", "clickAt", "move", "drag", "wheel", "key", "type", "padPlug"]);
 
 /**
  * Apply one input command — the single implementation shared by the registered
@@ -130,6 +131,18 @@ export function applyInput(cmd: string, args: unknown[]): any {
             else if (opts.up && !opts.down) ok = im.injectKey(vk, false);
             else ok = im.injectKeyTap(vk);
             return { ok, vk };
+        }
+        case "padPlug": {
+            // Drives the SAB pad-present slot through poll(), so the arrival/removal
+            // edge, WM_DEVICECHANGE and the DirectInput lost-state take the real path.
+            // announced=false means this was the first observation of the slot (seeded,
+            // not an edge) — plug the opposite level first to get an event.
+            const connected = args[0] === undefined ? true : Boolean(args[0]);
+            const r = im.injectGamepadPresence(connected);
+            if (!r.ok) throw new HarnessError("no input buffer connected (SAB not wired)", HarnessErrorCode.UNSUPPORTED);
+            // `listeners` answers which mechanism this title uses: empty means it can
+            // only ever see the DBT_DEVNODES_CHANGED broadcast.
+            return { ...r, listeners: getDeviceNotifications() };
         }
         case "type": {
             const text = String(args[0] ?? "");

@@ -327,6 +327,15 @@ export function readCallSnapshot(name: string, eip: number, esp: number): unknow
             };
         }
     } catch { /* */ }
+    // Raw window around ESP — the caller's saved registers and ITS return slot sit
+    // just past the arguments, which is where stack-corruption bugs show up (a
+    // clobbered return address is invisible to the symbolized backtrace, since the
+    // walker skips words that don't look like code).
+    const stackWords: string[] = [];
+    for (let off = -8; off <= 40; off += 4) {
+        stackWords.push(`[ESP${off < 0 ? "-" : "+"}0x${Math.abs(off).toString(16)}]=0x${r(off).toString(16)}`);
+    }
+
     return {
         name,
         eip: eip >>> 0,
@@ -335,6 +344,7 @@ export function readCallSnapshot(name: string, eip: number, esp: number): unknow
         caller: r(0),
         callerSym: symbolize(r(0)),
         args: [r(4), r(8), r(12), r(16)],
+        stackWords,
         threadId,
         es,
         regs,

@@ -26,9 +26,14 @@ import {
 import type { HarnessStep, HarnessRunResult, HarnessStepResult } from "./types";
 import { isSerializedFn } from "./types";
 import { HarnessChain } from "./dsl";
+import { INPUT_INDEX, KEY_BITFIELD_BASE, KEY_BITFIELD_COUNT } from "../input/sab-layout";
+import { relativeIntent } from "../input/relative-intent";
 
 /** Verbs handled page-side (browser-only) rather than forwarded to the worker. */
-const BROWSER_ONLY = new Set(["openWgb", "loadPe", "audioGesture", "waitForEvent", "onModal"]);
+const BROWSER_ONLY = new Set([
+    "openWgb", "loadPe", "audioGesture", "waitForEvent", "onModal", "inputSab",
+    "hostRecord", "hostRecordStop", "hostReplay",
+]);
 
 export interface HarnessFacade {
     /** Low-level: invoke any worker command, await the {ok,result|error} reply. */
@@ -46,6 +51,15 @@ export interface HarnessFacade {
     openWgb(idOrUrl: string, opts?: { hle?: boolean; logOnly?: boolean }): Promise<unknown>;
     loadPe(url: string): Promise<unknown>;
     audioGesture(): Promise<unknown>;
+    /** Host-side snapshot of the published input record + touch transport state. */
+    inputSab(): Promise<unknown>;
+    /** Arm the page recorder so MANUAL play is captured (the worker's recorder
+     *  only sees harness-injected input). */
+    hostRecord(): Promise<unknown>;
+    /** Disarm and return the captured samples. */
+    hostRecordStop(): Promise<unknown>;
+    /** Re-apply captured samples; deterministic replays from the sample stamps. */
+    hostReplay(samples: unknown, opts?: { deterministic?: boolean }): Promise<unknown>;
     /** Auto-answer matching MessageBox prompts; returns a disposer. */
     onMessageBox(pattern: RegExp | string, reply?: number | string): () => void;
     /** Resolver App.tsx consults for a prompt; buttonId to auto-answer, null to defer. */
@@ -58,7 +72,7 @@ let facade: HarnessFacade | null = null;
 
 /** Install the facade onto window.__BS__.harness. Called once from App.tsx with
  *  the worker handle. Idempotent. */
-export function installHarnessFacade(worker: Worker): HarnessFacade {
+export function installHarnessFacade(worker: Worker, getInputView?: () => Int32Array | null): HarnessFacade {
     if (facade) return facade;
 
     let nextId = 1;
@@ -126,6 +140,16 @@ export function installHarnessFacade(worker: Worker): HarnessFacade {
             eventWaiters[name] = [];
             for (const w of ws) w(data);
         }
+        // A dead process will never deliver the event anyone is waiting for —
+        // release every waiter instead of letting each sit out its timeout.
+        if (name === "fault" && (data as { fatal?: boolean } | null)?.fatal) {
+            for (const other of Object.keys(eventWaiters)) {
+                const waiters = eventWaiters[other];
+                if (!waiters?.length) continue;
+                eventWaiters[other] = [];
+                for (const w of waiters) w(null);
+            }
+        }
     }
 
     function rpc(cmd: string, args: unknown[] = [], opts?: HarnessCallOpts): Promise<unknown> {
@@ -191,15 +215,39 @@ export function installHarnessFacade(worker: Worker): HarnessFacade {
 
     /* ───────────────────────── browser-only verbs ───────────────────────── */
 
-    function resolveBundlePath(idOrUrl: string): string {
+    /** Dev-sidecar bundle route — see serveWgb in tools/dev-sidecar. Probed once
+     *  per session; null until probed, false when the sidecar is not running. */
+    let wgbSidecar: boolean | null = null;
+
+    async function sidecarAvailable(): Promise<boolean> {
+        if (wgbSidecar !== null) return wgbSidecar;
+        try {
+            const r = await fetch("http://localhost:3001/health", { method: "GET" });
+            wgbSidecar = r.ok;
+        } catch { wgbSidecar = false; }
+        return wgbSidecar;
+    }
+
+    async function resolveBundlePath(idOrUrl: string): Promise<string> {
         if (/^https?:\/\//i.test(idOrUrl)) return idOrUrl;
-        // Absolute disk path (Windows "X:\…"/"X:/…" or a POSIX "/…*.wgb") → dev disk-stream
-        // route: serveWgbFromDisk (vite.config) streams it straight off disk via Range, so
-        // the agent/make-wgb can hand a raw path — no symlink, no hardcoded folder.
+        // Absolute disk path (Windows "X:\…"/"X:/…" or a POSIX "/…*.wgb") → stream it straight
+        // off disk via Range, so the agent/make-wgb can hand a raw path — no symlink, no
+        // hardcoded folder.
+        //
+        // Prefer the dev sidecar over Vite's /__wgb/ route: a bundle read is the hot path of
+        // every boot (8 MB ranges while the guest thread is parked on a 30 s deadline), and
+        // Vite's throughput on that route decays over a long-lived dev server until the
+        // deadline blows ("SabIoSource: read timed out"). Falls back to the Vite route when
+        // the sidecar is not running.
         const isWinAbs = /^[a-zA-Z]:[\\/]/.test(idOrUrl);
         const isPosixAbsWgb = idOrUrl.startsWith("/") && !idOrUrl.startsWith("/apps/")
             && !idOrUrl.startsWith("/__wgb/") && idOrUrl.toLowerCase().endsWith(".wgb");
-        if (isWinAbs || isPosixAbsWgb) return `/__wgb/?path=${encodeURIComponent(idOrUrl)}`;
+        if (isWinAbs || isPosixAbsWgb) {
+            const enc = encodeURIComponent(idOrUrl);
+            return (await sidecarAvailable())
+                ? `http://localhost:3001/wgb?path=${enc}`
+                : `/__wgb/?path=${enc}`;
+        }
         if (idOrUrl.includes("/")) return idOrUrl;                       // already a URL (/apps/…, /__wgb/…)
         // Bare id → a bundled demo served statically from public/apps.
         if (idOrUrl.toLowerCase().endsWith(".wgb")) return `/apps/${idOrUrl}`;
@@ -207,7 +255,7 @@ export function installHarnessFacade(worker: Worker): HarnessFacade {
     }
 
     async function openWgb(idOrUrl: string, opts?: { hle?: boolean; logOnly?: boolean; reload?: boolean }): Promise<unknown> {
-        const path = resolveBundlePath(idOrUrl);
+        const path = await resolveBundlePath(idOrUrl);
         const w = window as any;
         const loadDone = waitForWorkerMessage(
             (m) => m?.type === "loading_progress" && m.phase === "done",
@@ -232,6 +280,80 @@ export function installHarnessFacade(worker: Worker): HarnessFacade {
         return { url, loaded: !!(await loadDone) };
     }
 
+    /**
+     * What the host last PUBLISHED into the input SAB, plus the state that decides how
+     * a contact is translated. The guest-side view is `state(["input"])`; this is the
+     * other half — it answers "did the host even see that gesture" without a game loaded.
+     */
+    async function inputSab(): Promise<unknown> {
+        const view = getInputView?.();
+        if (!view) return { attached: false };
+        const keys: number[] = [];
+        for (let w = 0; w < KEY_BITFIELD_COUNT; w++) {
+            const bits = view[KEY_BITFIELD_BASE + w];
+            for (let b = 0; b < 32; b++) if (bits & (1 << b)) keys.push(w * 32 + b);
+        }
+        return {
+            attached: true,
+            seq: Atomics.load(view, INPUT_INDEX.seq),
+            mouse: {
+                x: view[INPUT_INDEX.mouseX],
+                y: view[INPUT_INDEX.mouseY],
+                buttons: view[INPUT_INDEX.buttons],
+                inside: view[INPUT_INDEX.mouseInside] !== 0,
+                wheel: view[INPUT_INDEX.mouseWheel],
+                dinputDX: view[INPUT_INDEX.dinputDX],
+                dinputDY: view[INPUT_INDEX.dinputDY],
+            },
+            keysDown: keys,
+            pad: {
+                connected: view[INPUT_INDEX.gamepadConnected] === 1,
+                buttons: view[INPUT_INDEX.gamepadButtons],
+                axes: [
+                    view[INPUT_INDEX.gamepadAxis0], view[INPUT_INDEX.gamepadAxis1],
+                    view[INPUT_INDEX.gamepadAxis2], view[INPUT_INDEX.gamepadAxis3],
+                ],
+            },
+            relativeIntent: { active: relativeIntent.get(), reasons: relativeIntent.reasons() },
+            pointerLocked: document.pointerLockElement !== null,
+            maxTouchPoints: navigator.maxTouchPoints,
+        };
+    }
+
+    /* ── host input capture ───────────────────────────────────────────────────
+     * The HUMAN's mouse/keyboard reaches the guest through the page's SAB
+     * publication, not through applyInput — so the worker's present-serial
+     * recorder never sees manual play. These forward to the page recorder, which
+     * captures the published SAB record; that makes "play it once by hand" a
+     * re-runnable artifact instead of something only a person can reproduce.
+     * Samples are edge-recorded and level-applied, so a key held across many
+     * samples replays as held. */
+
+    async function hostRecord(): Promise<unknown> {
+        const start = (window as any).startRecording;
+        if (typeof start !== "function") throw new Error("host recorder unavailable (App not mounted)");
+        start();
+        return { recording: true };
+    }
+
+    async function hostRecordStop(): Promise<unknown> {
+        const stop = (window as any).stopRecording;
+        if (typeof stop !== "function") throw new Error("host recorder unavailable (App not mounted)");
+        const samples = stop() ?? [];
+        return { recording: false, samples, count: samples.length };
+    }
+
+    /** hostReplay(samples, {deterministic?}) — deterministic drives manual virtual
+     *  time from the sample stamps, so replay does not depend on host wall-clock. */
+    async function hostReplay(samples: unknown, opts?: { deterministic?: boolean }): Promise<unknown> {
+        const play = (window as any).playRecording;
+        if (typeof play !== "function") throw new Error("host replay unavailable (App not mounted)");
+        const list = Array.isArray(samples) ? samples : [];
+        if (!list.length) throw new Error("hostReplay: empty recording");
+        play(list, opts);
+        return { replaying: true, count: list.length, deterministic: opts?.deterministic ?? true };
+    }
+
     async function audioGesture(): Promise<unknown> {
         // Manual-mode only: a synthetic event can't satisfy the
         // autoplay policy — automation should launch Chrome with
@@ -254,6 +376,10 @@ export function installHarnessFacade(worker: Worker): HarnessFacade {
         if (step.cmd === "openWgb") return openWgb(step.args[0] as string, step.args[1] as any);
         if (step.cmd === "loadPe") return loadPe(step.args[0] as string);
         if (step.cmd === "audioGesture") return audioGesture();
+        if (step.cmd === "inputSab") return inputSab();
+        if (step.cmd === "hostRecord") return hostRecord();
+        if (step.cmd === "hostRecordStop") return hostRecordStop();
+        if (step.cmd === "hostReplay") return hostReplay(step.args[0], step.args[1] as any);
         if (step.cmd === "waitForEvent") return waitForEvent(step.args[0] as string, step.args[1] as any);
         if (step.cmd === "onModal") { onMessageBox((step.args[0] as string) ?? ".*", (step.args[1] as string | number) ?? "ok"); return { armed: true, pattern: step.args[0] ?? ".*" }; }
         // Predicate args (waitUntil) are pre-serialized as {__fn} — pass through;
@@ -297,6 +423,10 @@ export function installHarnessFacade(worker: Worker): HarnessFacade {
         openWgb,
         loadPe,
         audioGesture,
+        inputSab,
+        hostRecord,
+        hostRecordStop,
+        hostReplay,
         onMessageBox,
         autoModalReply,
     };

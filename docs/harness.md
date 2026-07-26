@@ -52,10 +52,14 @@ far too much log output to grep. So the harness gives you structured views inste
   branch. The stub registry names exactly which unimplemented call it was and who called it.
 - **Log tools.** Instead of grepping the stream: a template-deduped summary
   (`the same stub called 10,000× becomes one ranked row`), signal→event watchers that block
-  until a specific message appears, and time-windowed captures. A durable log-server archives
+  until a specific message appears, and time-windowed captures. A durable dev sidecar (`tools/dev-sidecar`, :3001) archives
   the stream to disk.
 - **Surfaces & textures.** Dump a specific guest surface or texture to a PNG when a screenshot
   of the composited canvas isn't enough.
+- **Emitted JIT code.** `jitBytes` captures the wasm module bytes the JIT emits for a set of hot
+  guest pages and diffs two captures — per-section sizes, declared locals, first differing
+  offset. It is the decisive test for any codegen flag: if the bytes don't change, the flag is
+  dead on that workload, and no timing measurement can say otherwise.
 
 ## Reverse-engineering the guest
 

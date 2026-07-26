@@ -208,7 +208,8 @@ Drive the emulator through the project's own CDP harness (`tools/harness.ts` / `
 NOT a browser MCP — the harness owns the Chrome instance; a second CDP client conflicts with it. Load-bearing facts the harness encodes (and the manual `dbg.*` fallback still needs):
   - Dev: `bun run dev` (:5174 plain HTTP by default — automation needn't clear a self-signed cert;
     `bun run dev:ssl` opts into HTTPS) +
-    `bun run dev:logs` (:3001 log server; start it BEFORE streaming). Kill a stale Vite via PowerShell
+    `bun run dev:sidecar` (:3001 dev sidecar — log archive + file writer + Range delivery of `.wgb`
+    via `GET /wgb?path=`; `dev:logs` is an alias. Start it BEFORE streaming). Kill a stale Vite via PowerShell
     `Get-CimInstance Win32_Process | ? CommandLine -match 'vite'` (git-bash `pkill` won't kill it).
   - `?game=dev` = the bare emulator exposing `window.loadApp/worker/dbg/__BS__`.
   - Audio: needs a real gesture OR Chrome's `--autoplay-policy=no-user-gesture-required` (which
@@ -216,7 +217,7 @@ NOT a browser MCP — the harness owns the Chrome instance; a second CDP client 
     logic stalls silently (frames render but the game never advances).
   - SEE pixels via screenshot / `harness shot()` — the canvas is an OffscreenCanvas the main thread
     can't read. A specific guest surface/texture: `dumpSurface`/`textures` (or `__gdibDumpName` →
-    GetDIBits PNG → `debug_png_dump` → log server `logs/debug/`).
+    GetDIBits PNG → `debug_png_dump` → sidecar `logs/debug/`).
   - Intros: a bundle's `skipVideo` makes MCI/Bink/Smack complete instantly.
   - ANY non-standard situation (froze / vanished / black frame / unexpected exit / wild EIP) → FIRST
     pull `report()` (CLI: `bun tools/harness.ts report`). One firehose-immune POJO with: CPU regs, the
@@ -229,7 +230,9 @@ NOT a browser MCP — the harness owns the Chrome instance; a second CDP client 
     `breakOnApi('kernel32:ExitProcess')` (its snapshot carries `backtrace`+`lastThunks`) or `report()`.
   - Logs (megabytes/sec): don't grep the firehose — `logStats` (template-dedup summary), `watchLog(/re/)`
     (signal→event), `markLog`/`logsSince` (windows); the fault snapshot carries the log-ring tail. The
-    log server (:3001) is the durable archive tier, managed by `harness up`.
+    dev sidecar (:3001) is the durable archive tier, managed by `harness up`. It also serves
+    bundles by Range (`/wgb?path=`) — deliberately NOT through Vite, whose dev server degrades on
+    that route over a session and blows the io-worker's 30 s deadline (`SabIoSource: read timed out`).
   - RE the guest: the warm RE service (`tools/re/`, §14) — `re decompile/resolve/exportSymbolMap`
     (Ghidra headless writes to a file; stdout is lost). `re resolve <eip> --base <liveBase>` closes the
     wild-EIP→function loop; `re exportSymbolMap` feeds `loadSymbols`/`breakOnSymbol`.

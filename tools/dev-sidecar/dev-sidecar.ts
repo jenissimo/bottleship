@@ -1,3 +1,18 @@
+/**
+ * BottleShip dev sidecar (:3001) — the local process that does the things the browser cannot,
+ * for both the app and the agent harness. Four roles:
+ *
+ *  - **log archive** — the durable tier behind the in-worker ring (`log-hub.ts`): WS ingest,
+ *    per-game rotation, size/age pruning.
+ *  - **file writer** — `write_file` / `write_file_b64`, how surface and GetDIBits dumps reach
+ *    `logs/debug/` (a page cannot write to the repo).
+ *  - **bundle delivery** — `GET /wgb?path=…` with Range, deliberately NOT via the Vite dev
+ *    server (see serveWgb below).
+ *  - **liveness** — `/health`, one of the three services `harness up` probes.
+ *
+ * `bun run dev:sidecar` (`dev:logs` is kept as an alias so existing docs and scripts still work).
+ */
+
 import { appendFile, readdir, unlink, stat, mkdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { existsSync } from "node:fs";
@@ -130,11 +145,102 @@ class LogManager {
 
 const logger = new LogManager();
 
+/**
+ * `GET /wgb?path=<absolute .wgb>` — Range-capable delivery of a bundle straight off disk.
+ *
+ * A bundle read is the hot path of every boot: the io-worker pulls it in 8 MB ranges while the
+ * guest thread is parked on `Atomics.wait` with a 30 s deadline
+ * (`src/worker/runtime/filesystem/sab-io-source.ts`). Vite's middleware stack degrades that
+ * route's throughput by orders of magnitude over a long-lived dev server, blowing the deadline
+ * (`SabIoSource: read timed out`), so the bundle must not go through it. It lives here because
+ * the sidecar is already started and probed by `harness up` — no new process, no new port.
+ *
+ * The page is cross-origin isolated (it needs SharedArrayBuffer), so a cross-origin fetch needs
+ * `Cross-Origin-Resource-Policy` as well as CORS — and because `Range` is not a CORS-safelisted
+ * request header, the browser preflights, so OPTIONS must be answered too.
+ */
+/**
+ * The route hands out whole files by ABSOLUTE path (bundles legitimately live outside the repo,
+ * e.g. a WGB drop folder), so the only thing standing between it and "any page you visit can read
+ * files off this machine" is the origin. `*` would hand that away — CORS is the access control
+ * here, not a formality.
+ */
+const DEV_ORIGINS = new Set([
+  "http://localhost:5174", "https://localhost:5174",
+  "http://127.0.0.1:5174", "https://127.0.0.1:5174",
+]);
+
+function wgbHeaders(req: Request): Record<string, string> {
+  const origin = req.headers.get("origin");
+  const h: Record<string, string> = {
+    "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+    "Access-Control-Allow-Headers": "Range",
+    "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges",
+    "Cross-Origin-Resource-Policy": "cross-origin",
+    Vary: "Origin",
+  };
+  // No Origin at all = a same-origin or non-browser fetch (curl, the harness): nothing to grant.
+  if (origin && DEV_ORIGINS.has(origin)) h["Access-Control-Allow-Origin"] = origin;
+  return h;
+}
+
+async function serveWgb(req: Request, url: URL): Promise<Response> {
+  const cors = wgbHeaders(req);
+  if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
+
+  const abs = url.searchParams.get("path");
+  if (!abs) return new Response("missing ?path=<absolute .wgb path>", { status: 400, headers: cors });
+  const file = resolve(abs);
+  if (!file.toLowerCase().endsWith(".wgb")) {
+    return new Response("only .wgb files", { status: 403, headers: cors });
+  }
+
+  const f = Bun.file(file);
+  // Deliberately does not echo the resolved path — that would turn 404s into a
+  // file-existence oracle for anything the caller cares to probe.
+  if (!(await f.exists())) return new Response("not found", { status: 404, headers: cors });
+  const size = f.size;
+
+  const headers: Record<string, string> = {
+    ...cors,
+    "Accept-Ranges": "bytes",
+    "Content-Type": "application/octet-stream",
+  };
+
+  const range = req.headers.get("range");
+  const m = range ? /^bytes=(\d*)-(\d*)$/.exec(range.trim()) : null;
+  if (m) {
+    let start: number, end: number;
+    if (m[1] === "" && m[2] !== "") { start = Math.max(0, size - parseInt(m[2], 10)); end = size - 1; }
+    else { start = parseInt(m[1], 10); end = m[2] === "" ? size - 1 : Math.min(parseInt(m[2], 10), size - 1); }
+    if (Number.isNaN(start) || start > end || start >= size) {
+      return new Response(null, { status: 416, headers: { ...headers, "Content-Range": `bytes */${size}` } });
+    }
+    headers["Content-Range"] = `bytes ${start}-${end}/${size}`;
+    headers["Content-Length"] = String(end - start + 1);
+    if (req.method === "HEAD") return new Response(null, { status: 206, headers });
+    return new Response(f.slice(start, end + 1), { status: 206, headers });
+  }
+
+  headers["Content-Length"] = String(size);
+  if (req.method === "HEAD") return new Response(null, { status: 200, headers });
+  return new Response(f, { status: 200, headers });
+}
+
 const server = Bun.serve({
   port: CONFIG.PORT,
   fetch(req, server) {
     if (server.upgrade(req)) return;
-    return new Response(req.url.endsWith("/health") ? "OK" : "BottleShip Log Server");
+    const url = new URL(req.url);
+    if (url.pathname === "/wgb") return serveWgb(req, url);
+    // CORS/CORP on EVERY response, not just /wgb: the page is cross-origin isolated
+    // (COOP/COEP, for SharedArrayBuffer), and under COEP a cross-origin response without
+    // Cross-Origin-Resource-Policy is blocked outright. Without this the /health probe the
+    // loader uses to decide "is the sidecar up?" fails with "Failed to fetch" and the loader
+    // silently falls back to the Vite route it is supposed to be avoiding.
+    return new Response(url.pathname.endsWith("/health") ? "OK" : "BottleShip dev sidecar", {
+        headers: wgbHeaders(req),
+    });
   },
   websocket: {
     open(ws) {

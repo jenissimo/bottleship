@@ -31,6 +31,7 @@ class HarnessEventBus {
      *  synchronously during a command carry that command's request id as runId. */
     private currentRunId: number | null = null;
     private ring: HarnessEventMsg[] = [];
+    private localSubs = new Map<string, Array<(data: unknown) => void>>();
 
     /** Set/clear the ambient runId for the duration of a command dispatch. */
     setRunId(id: number | null): void {
@@ -64,6 +65,21 @@ class HarnessEventBus {
                are responsible for passing POJOs. Swallow so a bad emit can't wedge
                the caller. */
         }
+        for (const cb of this.localSubs.get(event) ?? []) {
+            try { cb(data); } catch { /* a listener must never break the producer */ }
+        }
+    }
+
+    /** Worker-side subscription — for reactions that must happen in the worker
+     *  (the service aborting waiters on a crash), not just on the page. */
+    onLocal(event: string, cb: (data: unknown) => void): () => void {
+        const subs = this.localSubs.get(event) ?? [];
+        subs.push(cb);
+        this.localSubs.set(event, subs);
+        return () => {
+            const cur = this.localSubs.get(event);
+            if (cur) this.localSubs.set(event, cur.filter((f) => f !== cb));
+        };
     }
 
     /** Recent events (oldest..newest), optionally filtered by name. */
