@@ -26,6 +26,17 @@ function detectOsPreset(os: any): string {
   return m?.id ?? "";
 }
 
+// Touch-control presets (src/input/controls/presets.ts). "" = let the host auto-detect
+// from what the game does — the right answer for almost every title.
+const TOUCH_PRESETS: Array<{ id: string; label: string }> = [
+  { id: "", label: "(auto-detect)" },
+  { id: "pointer", label: "Pointer (tap to click)" },
+  { id: "pointer-rmb", label: "Pointer + right-click / wheel" },
+  { id: "wasd-look", label: "WASD + look pad" },
+  { id: "dpad-buttons", label: "D-pad + buttons" },
+  { id: "pad", label: "Gamepad" },
+];
+
 interface FormState {
   name: string;
   entrypoint: string;
@@ -37,9 +48,10 @@ interface FormState {
   os: string;
   cdPath: string;
   skipVideo: boolean;
+  touchLayout: string;
 }
 
-const EMPTY: FormState = { name: "", entrypoint: "", args: "", ramMB: "", resW: "", resH: "", resBpp: "", os: "", cdPath: "", skipVideo: false };
+const EMPTY: FormState = { name: "", entrypoint: "", args: "", ramMB: "", resW: "", resH: "", resBpp: "", os: "", cdPath: "", skipVideo: false, touchLayout: "" };
 
 export default function ManifestEditorModal({ gameKey, onClose, onSaved }: ManifestEditorModalProps) {
   const [form, setForm] = useState<FormState>(EMPTY);
@@ -66,6 +78,9 @@ export default function ManifestEditorModal({ gameKey, onClose, onSaved }: Manif
           os: detectOsPreset(e.osVersion),
           cdPath: e.cdPath ?? "",
           skipVideo: !!e.skipVideo,
+          // Only a preset id is editable here; an authored ControlLayout object is left
+          // untouched by the select (the layout editor owns that form).
+          touchLayout: typeof e.touch?.layout === "string" ? e.touch.layout : "",
         });
       })
       .catch((err) => setError(`Failed to read manifest: ${err?.message ?? err}`))
@@ -90,6 +105,7 @@ export default function ManifestEditorModal({ gameKey, onClose, onSaved }: Manif
     if (preset?.v) emulator.osVersion = preset.v;
     if (form.cdPath.trim()) emulator.cdPath = form.cdPath.trim();
     emulator.skipVideo = form.skipVideo;
+    if (form.touchLayout) emulator.touch = { layout: form.touchLayout };
 
     const patch: ManifestOverride = { emulator };
     if (form.name.trim()) patch.name = form.name.trim();
@@ -183,6 +199,12 @@ export default function ManifestEditorModal({ gameKey, onClose, onSaved }: Manif
               <label className={s["medit-row"]}>
                 <span className={s["medit-label"]}>CD redirect (D:)</span>
                 <input className={s["addgame__field"]} value={form.cdPath} spellCheck={false} placeholder="e.g. C:\Game\CD1" onChange={(e) => set("cdPath", e.target.value)} />
+              </label>
+              <label className={s["medit-row"]}>
+                <span className={s["medit-label"]}>Touch controls</span>
+                <select className={s["addgame__field"]} value={form.touchLayout} onChange={(e) => set("touchLayout", e.target.value)}>
+                  {TOUCH_PRESETS.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
+                </select>
               </label>
               <label className={cx(s, "medit-row", "medit-row--check")}>
                 <span className={s["medit-label"]}>Skip intro video</span>

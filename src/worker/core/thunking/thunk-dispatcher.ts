@@ -25,7 +25,7 @@ import { thunkChecksumManager } from '../memory/thunk-checksum';
 import { hypercallDataManager } from '../cpu/hypercall-data';
 import { preemptionManager } from '../cpu/preemption-manager';
 import { PF_HALT_TARGET } from '../bootloader';
-import { faultRecorder } from '../memory/fault-recorder';
+import { faultRecorder, cr2RegisterCandidates, isFaultEipConsistent, analyzeIndirectCallFault } from '../memory/fault-recorder';
 import { stubRegistry } from '../diagnostics/stub-registry';
 import { apiCensus } from '../diagnostics/api-census';
 import { MEM_THUNK_CODE_BASE, MEM_THUNK_DATA_BASE, MEM_THUNK_DATA_SIZE } from '../cpu/emulator-config';
@@ -5010,6 +5010,26 @@ export class ThunkDispatcher {
         if (view && faultGameEsp > 0 && faultGameEsp + 128 <= this.memLength) {
             for (let i = 0; i < 32; i++) faultStackDump.push(view.getUint32(faultGameEsp + i * 4, true) >>> 0);
         }
+        // EAX/EDX live in the #PF stub's saved copies, not cpu.reg32 (the stub's
+        // MOV EAX,id / MOV EDX,port clobbered them before the OUT).
+        let savedEax = 0, savedEdx = 0;
+        if (view && esp + 8 <= this.memLength) {
+            savedEdx = view.getUint32(esp, true) >>> 0;
+            savedEax = view.getUint32(esp + 4, true) >>> 0;
+        }
+        const faultRegs = {
+            eax: savedEax, ecx: r[1] >>> 0, edx: savedEdx, ebx: r[3] >>> 0,
+            esp: r[4] >>> 0, ebp: r[5] >>> 0, esi: r[6] >>> 0, edi: r[7] >>> 0,
+        };
+        const cr2Candidates = cr2RegisterCandidates(faultAddr, faultRegs);
+        const eipConsistent = this.cachedMem8
+            ? isFaultEipConsistent(this.cachedMem8, faultingEip, faultAddr, faultRegs)
+            : null;
+        // No register explains CR2 ⇒ likely an instruction-fetch fault from an indirect
+        // CALL whose slot (vtable/IAT) held a bad target. Name the slot.
+        const badCall = (this.cachedMem8 && cr2Candidates.length === 0 && eipConsistent !== true)
+            ? analyzeIndirectCallFault(this.cachedMem8, faultGameEsp, faultRegs)
+            : null;
         faultRecorder.record({
             ts: performance.now(),
             eip: faultingEip >>> 0,
@@ -5018,24 +5038,38 @@ export class ThunkDispatcher {
             threadId: System.getInstance().scheduler?.getCurrentThread?.()?.id ?? null,
             lastThunk: this.lastThunkName || 'unknown',
             kind: "unhandled",
-            regs: { ecx: r[1] >>> 0, ebx: r[3] >>> 0, esp: r[4] >>> 0, ebp: r[5] >>> 0, esi: r[6] >>> 0, edi: r[7] >>> 0 },
+            regs: faultRegs,
+            cr2Candidates,
+            eipTrusted: eipConsistent ?? undefined,
+            badCall: badCall ?? undefined,
             recentCalls: this.winApiRing?.getCrashTraceLines?.(48) ?? [],
             gameEsp: faultGameEsp,
             stackDump: faultStackDump,
         });
 
-        // Dump registers (read saved EAX/EDX from stack, not clobbered cpu.reg32)
-        let savedEax = 0, savedEdx = 0;
-        if (view && esp + 8 <= this.memLength) {
-            savedEdx = view.getUint32(esp, true) >>> 0;
-            savedEax = view.getUint32(esp + 4, true) >>> 0;
-        }
         const regs = cpu.reg32;
         Logger.error(LogCategory.SYSTEM,
             `  EAX=0x${savedEax.toString(16)} ECX=0x${(regs[1] >>> 0).toString(16)} ` +
             `EDX=0x${savedEdx.toString(16)} EBX=0x${(regs[3] >>> 0).toString(16)}\n` +
             `  ESP=0x${esp.toString(16)} EBP=0x${(regs[5] >>> 0).toString(16)} ` +
             `ESI=0x${(regs[6] >>> 0).toString(16)} EDI=0x${(regs[7] >>> 0).toString(16)}`);
+        if (cr2Candidates.length) {
+            Logger.error(LogCategory.SYSTEM, `  CR2 = ${cr2Candidates.join(' | ')}`);
+        }
+        if (eipConsistent === false) {
+            Logger.error(LogCategory.SYSTEM,
+                `  !! reported EIP does NOT address CR2 — v86 materializes only eip's low 12 bits on a jit ` +
+                `fault, so the page (and sometimes the offset) can be stale. Trust CR2 + registers, not this EIP.`);
+        }
+        if (badCall) {
+            const mod = moduleRegistry?.getModuleContainingAddress(badCall.callSite);
+            Logger.error(LogCategory.SYSTEM,
+                `  !! BAD INDIRECT CALL: call ${badCall.operand} at 0x${badCall.callSite.toString(16)}` +
+                `${mod ? ` (${mod.name}+0x${(badCall.callSite - mod.baseAddress).toString(16)})` : ''} ` +
+                `fetched target 0x${badCall.slotValue.toString(16)} from slot 0x${badCall.slotAddr.toString(16)} ` +
+                `— the CALL pushed its return address and the FETCH faulted. Inspect that slot's owner ` +
+                `(COM vtable / IAT), not the reported EIP.`);
+        }
 
         // Dump instruction bytes at faulting EIP and stack contents
         if (view && faultingEip > 0 && faultingEip + 16 <= this.memLength) {
@@ -5248,6 +5282,10 @@ export class ThunkDispatcher {
                         `SEH dispatch (fast): ACCESS_VIOLATION at 0x${faultAddr.toString(16)} ` +
                         `(EIP=0x${faultingEip.toString(16)}) caught by handler at 0x${handlerAddr.toString(16)} ` +
                         `(frame=0x${walkHead.toString(16)} trylevel=${level})`);
+                    // A guest __except that swallows an AV turns a crash into a clean-looking
+                    // quit; record it so the exit trace can name the fault it descended from.
+                    faultRecorder.annotateLast(
+                        `ACCESS_VIOLATION caught by guest __except handler 0x${handlerAddr.toString(16)}`);
 
                     view.setUint32(esp, savedEdx, true);
                     view.setUint32(esp + 4, savedEax, true);
@@ -5445,6 +5483,9 @@ export class ThunkDispatcher {
             `SEH dispatch: static stub at 0x${this.sehDispatchStubAddress.toString(16)}, ` +
             `${frameCount} frame(s), dispatchEsp=0x${dispatchEsp.toString(16)} ` +
             `faultEIP=0x${faultingEip.toString(16)} gen=${this.sehDispatchGeneration} depth=${this.sehDispatchStack.length}`);
+        // Same reason as the fast path: a guest that swallows its own AV exits looking clean,
+        // so the exit trace must be able to name the fault it descended from.
+        faultRecorder.annotateLast(`dispatched to ${frameCount} guest SEH frame(s)`);
 
         // Log frame list
         let listAddr = scratchAddr + SEH_SCRATCH_LAYOUT.FRAME_LIST;

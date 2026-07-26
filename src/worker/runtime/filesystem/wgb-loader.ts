@@ -226,6 +226,18 @@ export interface WgbManifest {
         persistOnly?: boolean;
         /** Allowlist patterns when `persistOnly` is true. */
         persist?: string[];
+        /**
+         * Authored on-screen touch controls. `layout` is a preset id from
+         * src/input/controls/presets.ts or a full ControlLayout object (validated
+         * host-side by validateLayout — kept structural here so the worker carries no
+         * UI type). Host-only data: it rides `bundle_meta` and is deliberately NOT
+         * routed through EmulatorConfig.applyFromManifest, which the worker would then
+         * have to remember to clear in reset() (the cdPath precedent).
+         */
+        touch?: {
+            layout?: string | Record<string, unknown>;
+            mode?: "auto" | "direct" | "trackpad";
+        };
     };
 }
 

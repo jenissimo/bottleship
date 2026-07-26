@@ -647,9 +647,13 @@ export class EmulatorConfig {
     getVersionValue(): number {
         const { major, minor, build, platformId } = this.osVersion;
         if (platformId === VER_PLATFORM_WIN32_WINDOWS) {
-            // Win9x format: 0x80000000 | (build << 16) | (minor << 8) | major
-            // Note: Bit 31 is set for Win9x. Build is often just high word.
-            return 0x80000000 | ((build & 0x7fff) << 16) | ((minor & 0xff) << 8) | (major & 0xff);
+            // Win9x format: 0xC000|build in the high word, minor/major in the low word
+            // (Win95 4.0.950 -> 0xC3B60004, Win98 4.10.2222 -> 0xC8AE0A04).
+            // BOTH top bits must be set: bit31 alone (bit30 clear) is the Win32s
+            // encoding, and the era's runtimes test exactly that — a Watcom CRT
+            // reading 0x80000000 goes looking for W32SKRNL.DLL's module table
+            // instead of walking its own PE headers, then calls into garbage.
+            return (0xc0000000 | ((build & 0x3fff) << 16) | ((minor & 0xff) << 8) | (major & 0xff)) >>> 0;
         } else {
             // WinNT format: (build << 16) | (minor << 8) | major
             // Bit 31 is clear for NT. Low word is minor/major. High word is build.

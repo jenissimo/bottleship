@@ -47,7 +47,7 @@ function formatWarning(warning: any): string {
     return `  \x1b[33m⚠ ${warning.type}\x1b[0m: ${warning.message}`;
 }
 
-function main(): void {
+async function main(): Promise<void> {
     const args = process.argv.slice(2);
     
     let apiDir = path.join(process.cwd(), 'src/worker/api');
@@ -185,7 +185,7 @@ Examples:
             for (const apiFile of apiFiles) {
                 if (!fs.existsSync(apiFile)) continue;
                 
-                const result = validateReferenceSignatures(apiFile, referenceDir);
+                const result = await validateReferenceSignatures(apiFile, referenceDir);
                 totalStats.interfacesChecked += result.stats.interfacesChecked || 0;
                 totalStats.methodsChecked += result.stats.methodsChecked || 0;
                 totalStats.functionsChecked += result.stats.functionsChecked || 0;

@@ -6,6 +6,14 @@
  * to catch silent ABI bugs (wrong offsets = memory corruption in guest).
  */
 
+// Offsets imported from the implementation are checked against the SDK sizes
+// hardcoded below, so a drift in the shipped table is a build failure, not a
+// silently malformed guest struct.
+import {
+    DEV_BROADCAST_DEVICEINTERFACE_OFFSETS,
+    DEV_BROADCAST_HDR_OFFSETS,
+} from '../src/worker/modules/user32/dev-broadcast';
+
 // --- Known Win32 struct sizes (x86, default 8-byte alignment unless noted) ---
 interface StructSpec {
     name: string;
@@ -191,6 +199,20 @@ const STRUCT_SPECS: StructSpec[] = [
             dwWHQLLevel: 1064,
         },
         lastField: { name: 'dwWHQLLevel', size: 8 }, // 4 bytes + 4 bytes trailing alignment padding
+    },
+    {
+        name: 'DEV_BROADCAST_HDR',
+        expectedSize: 12,
+        offsets: { ...DEV_BROADCAST_HDR_OFFSETS },
+        lastField: { name: 'dbch_reserved', size: 4 },
+    },
+    {
+        name: 'DEV_BROADCAST_DEVICEINTERFACE',
+        expectedSize: 32,
+        offsets: { ...DEV_BROADCAST_DEVICEINTERFACE_OFFSETS },
+        // dbcc_name is char[1]/WCHAR[1] in the header; the real name follows inline
+        // and dbcc_size covers it. sizeof() is the padded 32.
+        lastField: { name: 'dbcc_name', size: 1 },
     },
 ];
 

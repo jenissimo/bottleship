@@ -1,7 +1,7 @@
 import { IModule } from "../core/module";
 import { Process } from "../core/process";
 import { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
-import { registerWinmmJoystickExports } from "./winmm-joystick";
+import { registerWinmmJoystickExports, resetWinmmJoystick } from "./winmm-joystick";
 import { registerWinmmCapsExports } from "./winmm-caps";
 import { registerWinmmMciExports } from "./winmm-mci";
 import type { WinmmMci } from "./winmm-mci";
@@ -930,6 +930,17 @@ export class WinMM implements IModule {
         return Mem.writeBytes(ptr + copyLen, new Uint8Array([0])) === 1;
     }
 
+    private readWideString(ptr: number, maxLen: number): string {
+        if (!ptr || maxLen <= 0) return "";
+        let out = "";
+        for (let i = 0; i < maxLen; i++) {
+            const ch = Mem.readUint16(ptr + i * 2);
+            if (ch == null || ch === 0) break;
+            out += String.fromCharCode(ch);
+        }
+        return out;
+    }
+
     private writeWideString(ptr: number, cch: number, value: string): boolean {
         if (!ptr) return true;
         if (cch <= 0) return false;
@@ -1686,6 +1697,8 @@ export class WinMM implements IModule {
         this.mci = registerWinmmMciExports(this.exports, {
             readAnsiString: (ptr, maxLen) => this.readAnsiString(ptr, maxLen),
             writeAnsiString: (ptr, cch, value) => this.writeAnsiString(ptr, cch, value),
+            readWideString: (ptr, maxLen) => this.readWideString(ptr, maxLen),
+            writeWideString: (ptr, cch, value) => this.writeWideString(ptr, cch, value),
         });
 
         // ==================== Sound Functions ====================
@@ -2058,6 +2071,7 @@ export class WinMM implements IModule {
         }
         this.mmioHandles.clear();
         this.mci?.reset();
+        resetWinmmJoystick();
     }
 
     /** Diagnostic snapshot for paint-time guest-state logging. */

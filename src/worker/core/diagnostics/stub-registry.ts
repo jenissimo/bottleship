@@ -29,7 +29,9 @@ export interface StubHit {
 class StubRegistry {
     private map = new Map<string, StubHit>();
 
-    /** Record one missing-implementation dispatch. Cheap; dedups by key. */
+    /** Record one missing-implementation dispatch — no handler at all, or a handler that
+     *  returns the real API's success code without being able to fulfil its contract.
+     *  Cheap; dedups by key. */
     record(dll: string, func: string, functionId: number, caller: number): void {
         const key = func ? `${dll || "?"}:${func}` : `id_0x${(functionId >>> 0).toString(16)}`;
         const ts = TimeService.getInstance().nowMs();

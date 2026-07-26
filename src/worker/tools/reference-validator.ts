@@ -7,10 +7,35 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { pathToFileURL } from 'url';
 import * as ts from 'typescript';
 import { InterfaceDescriptor, FunctionDescriptor, ModuleDescriptor } from '../api/types';
 
 type CallingConvention = "stdcall" | "cdecl" | "thiscall";
+
+const IUNKNOWN_SLOTS = ["queryinterface", "addref", "release"];
+
+function startsWithIUnknown(methods: FunctionDescriptor[]): boolean {
+    return methods.length >= 3
+        && IUNKNOWN_SLOTS.every((n, i) => methods[i].name.toLowerCase() === n);
+}
+
+/**
+ * Trailing slots we declare on purpose beyond what the reference lists, with the reason.
+ *
+ * These are reported as warnings rather than errors so a genuine misalignment still fails the
+ * run. Only TRAILING additions are ever legitimate: a slot inserted in the middle shifts every
+ * later slot and is always a bug. Each entry needs a reason a reviewer can check, and anything
+ * not listed here stays an error.
+ */
+const INTENTIONAL_EXTRA_METHODS: Record<string, { methods: string[]; reason: string }> = {
+    IDirectDrawSurface: {
+        methods: ["GetDDInterface", "PageLock", "PageUnlock", "SetSurfaceDesc"],
+        reason: "this table is also handed out for IID_IDirectDrawSurface2/3, whose vtables extend "
+            + "v1 by strict append and share its DDSURFACEDESC marshalling — the reference "
+            + "describes v1 alone",
+    },
+};
 
 interface MethodSignature {
     name: string;
@@ -37,7 +62,7 @@ interface ValidationError {
     interface?: string;
     function?: string;
     method?: string;
-    type: 'argCount_mismatch' | 'calling_convention_mismatch' | 'missing_method' | 'extra_method' | 'vtable_order' | 'iid_mismatch' | 'missing_function' | 'extra_function';
+    type: 'argCount_mismatch' | 'calling_convention_mismatch' | 'missing_method' | 'extra_method' | 'vtable_order' | 'iid_mismatch' | 'missing_function' | 'extra_function' | 'extraction_degraded';
     message: string;
     expected?: any;
     actual?: any;
@@ -156,6 +181,40 @@ export class ReferenceSignatureValidator {
         if (/^_.*@\d+$/.test(ref.name) || /^@.*@\d+$/.test(ref.name)) return "stdcall";
         if (/^_/.test(ref.name)) return "cdecl";
         return null;
+    }
+
+    /**
+     * Extract interface descriptors by importing the API module.
+     *
+     * This is the accurate path: the descriptor arrays are evaluated exactly as the vtable
+     * builder will see them, so any composition form (spread of a local method array, a
+     * `specs.map(makeMethod)`, an overrides lookup) is resolved for free. The AST path below
+     * has to re-implement a slice of TypeScript and silently yields ZERO methods for any form
+     * it does not recognise — which reads as "the whole interface is missing" downstream.
+     *
+     * Returns null when the module cannot be evaluated standalone (e.g. an import cycle with a
+     * module-eval side effect), leaving the caller to fall back and flag the degradation.
+     */
+    private async extractInterfacesViaImport(filePath: string): Promise<Map<string, InterfaceDescriptor> | null> {
+        let mod: Record<string, unknown>;
+        try {
+            mod = await import(pathToFileURL(filePath).href) as Record<string, unknown>;
+        } catch {
+            return null;
+        }
+
+        const interfaces = new Map<string, InterfaceDescriptor>();
+        for (const value of Object.values(mod)) {
+            const iface = value as InterfaceDescriptor | undefined;
+            if (!iface || typeof iface !== 'object') continue;
+            if (typeof iface.name !== 'string' || !Array.isArray(iface.methods)) continue;
+            if (iface.methods.some(m => !m || typeof m.name !== 'string' || !Array.isArray(m.params))) continue;
+            // Reference vtableIndex is relative to the interface's OWN methods, so drop the
+            // inherited IUnknown triad to put both sides on the same numbering.
+            const methods = startsWithIUnknown(iface.methods) ? iface.methods.slice(3) : iface.methods;
+            interfaces.set(iface.name, { ...iface, methods });
+        }
+        return interfaces;
     }
 
     /**
@@ -466,8 +525,9 @@ export class ReferenceSignatureValidator {
     private validateInterface(
         descriptor: InterfaceDescriptor,
         reference: InterfaceSignature
-    ): ValidationError[] {
+    ): { errors: ValidationError[]; warnings: ValidationError[] } {
         const errors: ValidationError[] = [];
+        const warnings: ValidationError[] = [];
         
         // Check IID
         if (reference.iid && descriptor.iid) {
@@ -508,17 +568,26 @@ export class ReferenceSignatureValidator {
         }
         
         // Check for extra methods (critical for vtable alignment)
+        const declaredExtras = INTENTIONAL_EXTRA_METHODS[descriptor.name];
         for (const descMethod of descMethodsArray) {
             const name = descMethod.name;
-            if (!refMethods.has(name)) {
-                errors.push({
+            if (refMethods.has(name)) continue;
+            if (declaredExtras?.methods.includes(name)) {
+                warnings.push({
                     interface: descriptor.name,
                     method: name,
                     type: 'extra_method',
-                    message: `Method ${name} exists in ${descriptor.name} but not in reference (vtable misalignment!)`,
-                    actual: descMethod
+                    message: `${descriptor.name}.${name} is a declared deviation: ${declaredExtras.reason}`,
                 });
+                continue;
             }
+            errors.push({
+                interface: descriptor.name,
+                method: name,
+                type: 'extra_method',
+                message: `Method ${name} exists in ${descriptor.name} but not in reference (vtable misalignment!)`,
+                actual: descMethod
+            });
         }
         
         // Check argCount and vtable order for existing methods, by index.
@@ -553,7 +622,7 @@ export class ReferenceSignatureValidator {
             }
         }
         
-        return errors;
+        return { errors, warnings };
     }
 
     /**
@@ -637,12 +706,24 @@ export class ReferenceSignatureValidator {
     /**
      * Validate API file against reference signatures
      */
-    validate(apiFilePath: string): ValidationResult {
+    async validate(apiFilePath: string): Promise<ValidationResult> {
         const errors: ValidationError[] = [];
         const warnings: ValidationError[] = [];
-        
-        // Try to extract interfaces first (DirectX)
-        const interfaces = this.extractInterfacesFromApiFile(apiFilePath);
+
+        // Try to extract interfaces first (DirectX). Prefer evaluating the module; only fall
+        // back to the lossy AST reader when it cannot load, and say so — a file silently
+        // degrading to the fallback is how phantom "missing method" reports get manufactured.
+        let interfaces = await this.extractInterfacesViaImport(apiFilePath);
+        if (!interfaces) {
+            interfaces = this.extractInterfacesFromApiFile(apiFilePath);
+            if (interfaces.size > 0) {
+                warnings.push({
+                    type: 'extraction_degraded',
+                    message: `${path.basename(apiFilePath)}: module could not be imported; fell back to AST extraction. `
+                        + `Method lists composed via spreads are read as empty, so "missing method" errors from this file may be phantom.`
+                });
+            }
+        }
         let interfacesChecked = 0;
         let methodsChecked = 0;
         
@@ -661,8 +742,9 @@ export class ReferenceSignatureValidator {
             interfacesChecked++;
             methodsChecked += descriptor.methods.length;
             
-            const interfaceErrors = this.validateInterface(descriptor, reference);
-            errors.push(...interfaceErrors);
+            const interfaceResult = this.validateInterface(descriptor, reference);
+            errors.push(...interfaceResult.errors);
+            warnings.push(...interfaceResult.warnings);
         }
 
         // Try to extract module (functions)
@@ -710,7 +792,7 @@ export class ReferenceSignatureValidator {
 export function validateReferenceSignatures(
     apiFilePath: string,
     referenceDir: string = path.join(process.cwd(), 'tools/reference')
-): ValidationResult {
+): Promise<ValidationResult> {
     const validator = new ReferenceSignatureValidator(referenceDir);
     return validator.validate(apiFilePath);
 }

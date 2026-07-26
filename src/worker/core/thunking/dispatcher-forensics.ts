@@ -11,6 +11,7 @@
 import { Logger, LogCategory } from '../logger';
 import { System } from '../system';
 import { memoryEventBuffer } from '../memory/memory-event-buffer';
+import { faultRecorder } from '../memory/fault-recorder';
 import {
     SEH_SCRATCH_LAYOUT,
     SEH_FRAME_LIST_MAX,
@@ -83,11 +84,38 @@ export function logCallbackForensics(d: any, reason: string): void {
         }
 }
 
+/**
+ * A guest that catches its own AV and calls exit(0) leaves an exit trace that reads
+ * exactly like a clean quit. Replay the fault it descended from so the tail can never
+ * be mistaken for a normal shutdown again.
+ */
+function dumpPrecedingFault(): void {
+        const rec = faultRecorder.last();
+        if (!rec) return;
+        const ageMs = performance.now() - rec.ts;
+        if (ageMs > 10_000) return;
+        Logger.error(LogCategory.SYSTEM,
+            `[EXIT-TRACE] PRECEDED BY FAULT ${ageMs.toFixed(0)}ms earlier: ` +
+            `${(rec.errorCode & 2) ? 'write' : 'read'} to 0x${rec.faultAddr.toString(16)} ` +
+            `at EIP=0x${rec.eip.toString(16)}${rec.eipTrusted === false ? ' (EIP UNRELIABLE — does not address CR2)' : ''} ` +
+            `T${rec.threadId ?? '?'} lastThunk=${rec.lastThunk}` +
+            `${rec.outcome ? ` → ${rec.outcome}` : ''}`);
+        if (rec.cr2Candidates?.length) {
+            Logger.error(LogCategory.SYSTEM, `[EXIT-TRACE]   CR2 = ${rec.cr2Candidates.join(' | ')}`);
+        }
+        if (rec.badCall) {
+            Logger.error(LogCategory.SYSTEM,
+                `[EXIT-TRACE]   bad indirect call ${rec.badCall.operand} at 0x${rec.badCall.callSite.toString(16)} ` +
+                `→ target 0x${rec.badCall.slotValue.toString(16)} from slot 0x${rec.badCall.slotAddr.toString(16)}`);
+        }
+}
+
 export function dumpExitCallStack(d: any, reason: string, esp?: number): void {
         try {
             const bt = d.getGuestCallStack(esp);
             Logger.error(LogCategory.SYSTEM,
                 `[EXIT-TRACE] ${reason} lastThunk=${bt.lastThunk || 'none'} thunkCount=${d.thunkCount} esp=0x${bt.esp.toString(16)}`);
+            dumpPrecedingFault();
             if (bt.recent.length) {
                 Logger.error(LogCategory.SYSTEM, `[EXIT-TRACE] recent WinAPI: ${bt.recent.join(' | ')}`);
             }

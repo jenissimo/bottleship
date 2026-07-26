@@ -24,7 +24,7 @@ Public dev/build tooling. Game-specific RE/debug one-offs live in
 - **cdp-trace.ts** — capture a browser-level performance trace (works even when the worker pump is starved) → feed analyze-trace.ts.
 - **cdp-pausestack.ts** — pause a hard-pinned worker via CDP and dump its JS call stack.
 - **analyze-trace.ts** — Chrome trace → per-thread self/total time, WASM/JIT breakdown, timeline. Primary perf tool.
-- **log-manager.ts** — manage the log-server archive (`logs`, `logs:clean`, `logs:stats`).
+- **log-manager.ts** — manage the dev-sidecar log archive (`logs`, `logs:clean`, `logs:stats`).
 - **re/** — warm RE service (Ghidra headless behind an HTTP daemon): decompile / resolve / exportSymbolMap.
 - **pe-disas.py** — lightweight PE disassembler/xref helper (capstone + pefile), Ghidra-down fallback.
 - **examples/** — harness script template (`bringup.harness.ts`) and a worked diagnostic example (`diagnose-eip.harness.ts`).

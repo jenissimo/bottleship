@@ -579,19 +579,28 @@ export class WindowManager {
      */
     postDisplayChange(width: number, height: number, bpp: number): void {
         const lParam = (((height & 0xFFFF) << 16) | (width & 0xFFFF)) >>> 0;
-        const wParam = bpp >>> 0;
+        const count = this.broadcastToTopLevel(WM_DISPLAYCHANGE, bpp >>> 0, lParam);
+        Logger.log(LogCategory.SYSTEM,
+            `WindowManager: WM_DISPLAYCHANGE broadcast ${width}x${height}x${bpp} to ${count} top-level window(s)`);
+    }
+
+    /**
+     * Post a message to every top-level window (the HWND_BROADCAST target set) and
+     * return how many got it. Enumerates the Z-order list plus any tracked top-level
+     * window not yet in it, so a newly-created hidden window still hears the broadcast.
+     */
+    broadcastToTopLevel(msg: number, wParam: number, lParam: number): number {
         const seen = new Set<number>();
         const broadcast = (hwnd: number): void => {
             if (seen.has(hwnd)) return;
             const win = this.windows.get(hwnd);
-            if (!win || (win.style & WS_CHILD) !== 0) return; // top-level only
+            if (!win || (win.style & WS_CHILD) !== 0) return;
             seen.add(hwnd);
-            this.postMessage(hwnd, WM_DISPLAYCHANGE, wParam, lParam);
+            this.postMessage(hwnd, msg, wParam, lParam);
         };
         for (const hwnd of this.zOrder) broadcast(hwnd);
         for (const win of this.windows.values()) broadcast(win.hwnd);
-        Logger.log(LogCategory.SYSTEM,
-            `WindowManager: WM_DISPLAYCHANGE broadcast ${width}x${height}x${bpp} to ${seen.size} top-level window(s)`);
+        return seen.size;
     }
 
     /**

@@ -656,6 +656,34 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 
     registerGuestCommitNotifier(clearDecommittedRange);
 
+    /**
+     * MEM_COMMIT over a range that may already be committed. Win32: "if the memory is
+     * already committed, the function does not change its contents" — only pages that
+     * were never committed (or were decommitted) come back zeroed. Blanket-zeroing here
+     * destroys live data for the very common allocator shape that re-commits its whole
+     * arena from the base on every bump (Quake II's Hunk_Alloc: each allocation wipes
+     * everything loaded before it), while the decommit→recommit cycle storm.dll's SBH
+     * depends on still re-zeroes.
+     */
+    function commitPreservingCommitted(base: number, size: number): void {
+        const proc = System.getInstance().process;
+        if (!proc) return;
+        const ptm = proc.pageTableManager;
+        if (ptm?.isPagingEnabled()) {
+            ptm.ensurePagesCommitted(base, size);   // zeroes only non-present pages
+            return;
+        }
+        // No page tables to consult: the decommit map is the only record of which pages
+        // lost their contents. Reserved-but-never-committed memory is already zero (the
+        // allocator hands out zeroed blocks), so zeroing the rest would only destroy data.
+        const end = base + size;
+        for (const [dcBase, dcSize] of decommittedPages) {
+            const from = Math.max(base, dcBase);
+            const to = Math.min(end, dcBase + dcSize);
+            if (from < to) proc.addressSpace.fill(from, to - from, 0);
+        }
+    }
+
     function findTrackedAllocRange(address: number, size: number): [number, number] | null {
         const end = address + size;
         for (const [base, regionSize] of virtualAllocRegions) {
@@ -1760,12 +1788,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 ([base, size]) => effectiveAddress >= base && effectiveAddress < base + size
             );
             if (inReserved) {
-                const ptm = process.pageTableManager;
-                if (ptm?.isPagingEnabled()) {
-                    ptm.commitPages(effectiveAddress, alignedSize);
-                } else {
-                    process.addressSpace.fill(effectiveAddress, alignedSize, 0);
-                }
+                commitPreservingCommitted(effectiveAddress, alignedSize);
                 clearDecommittedRange(effectiveAddress, alignedSize);
                 Logger.verbose(LogCategory.KERNEL32, `VirtualAlloc -> 0x${effectiveAddress.toString(16)} (COMMIT in reserved, size=${alignedSize})`);
                 return effectiveAddress;
@@ -1773,12 +1796,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             // Fallback: region may already be mapped by a prior RESERVE|COMMIT (reservedPages can be out of sync).
             const region = process.addressSpace.getRegion(effectiveAddress);
             if (region && region.kind === 'HEAP' && effectiveAddress + alignedSize <= region.base + region.size) {
-                const ptm = process.pageTableManager;
-                if (ptm?.isPagingEnabled()) {
-                    ptm.commitPages(effectiveAddress, alignedSize);
-                } else {
-                    process.addressSpace.fill(effectiveAddress, alignedSize, 0);
-                }
+                commitPreservingCommitted(effectiveAddress, alignedSize);
                 clearDecommittedRange(effectiveAddress, alignedSize);
                 Logger.verbose(LogCategory.KERNEL32, `VirtualAlloc -> 0x${effectiveAddress.toString(16)} (COMMIT in HEAP, size=${alignedSize})`);
                 return effectiveAddress;

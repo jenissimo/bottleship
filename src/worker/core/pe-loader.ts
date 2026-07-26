@@ -17,6 +17,7 @@ import { normalizeDllBaseName, resolveThunkedDllAlias } from './dll-aliases';
 import { installCw3220Stdio } from '../modules/cw3220/cw3220-stdio';
 import { writeHeapSlabStubs } from '../modules/kernel32/heap-slab-stubs';
 import { writeCrtSlabStubs, writeCaseFoldStubs } from '../modules/crt-slab-stubs';
+import { loadDiagnostics } from './diagnostics/load-diagnostics';
 
 function isD3dx9VersionedDll(dllNameLower: string): boolean {
     return resolveThunkedDllAlias(normalizeDllBaseName(dllNameLower)) === 'd3dx9';
@@ -420,20 +421,30 @@ export class PELoader {
                 `VS=0x${virtualSize.toString(16)}, Raw=0x${rawDataSize.toString(16)}, ` +
                 `RawPtr=0x${rawDataPtr.toString(16)}, Target=0x${targetAddr.toString(16)}`);
 
+            // A NULL PointerToRawData means the section has NO file content, however
+            // large SizeOfRawData claims to be — Watcom describes .bss that way
+            // (VirtualSize 0, SizeOfRawData 0x6b600, RawPtr 0). Copying that many
+            // bytes "from offset 0" silently fills the guest's uninitialized data
+            // with a copy of the image header + code, so every global it expects to
+            // be zero reads back garbage.
+            const hasFileData = rawDataPtr !== 0 && rawDataSize > 0;
+            // Old linkers leave VirtualSize 0; the mapped extent is then SizeOfRawData.
+            const mappedSize = virtualSize || rawDataSize;
+
             // 1. Copy raw data from file
-            if (rawDataSize > 0) {
-                const sectionData = peData.subarray(rawDataPtr, rawDataPtr + rawDataSize);
-                this.memory.set(sectionData, targetAddr);
+            const copySize = hasFileData ? Math.min(rawDataSize, Math.max(0, peData.length - rawDataPtr)) : 0;
+            if (copySize > 0) {
+                this.memory.set(peData.subarray(rawDataPtr, rawDataPtr + copySize), targetAddr);
             }
 
-            // 2. Zero-fill remainder if virtualSize > rawDataSize (BSS-like behavior)
+            // 2. Zero-fill the rest of the mapped extent (BSS-like behavior)
             // This is REQUIRED by PE spec - uninitialized global variables depend on this
-            if (virtualSize > rawDataSize) {
-                const fillStart = targetAddr + rawDataSize;
-                const fillSize = virtualSize - rawDataSize;
-                this.memory.fill(0, fillStart, fillStart + fillSize);
+            const fillStart = targetAddr + copySize;
+            const fillEnd = targetAddr + Math.max(mappedSize, copySize);
+            if (fillEnd > fillStart) {
+                this.memory.fill(0, fillStart, fillEnd);
                 Logger.log(LogCategory.SYSTEM,
-                    `[PE] Section ${sectionName}: zero-filled ${fillSize} bytes at 0x${fillStart.toString(16)}`);
+                    `[PE] Section ${sectionName}: zero-filled ${fillEnd - fillStart} bytes at 0x${fillStart.toString(16)}`);
             }
         }
         return sections;
@@ -1171,6 +1182,7 @@ export class PELoader {
 
                     if (argCount === undefined) {
                         Logger.warn(LogCategory.SYSTEM, `[PE] Unknown arg count for ${dllName}:${name}${aliasTarget ? ` (aliased from ${dllNameRaw})` : ''}`);
+                        loadDiagnostics.noteUnknownArgCount(dllName, name, aliasTarget ? dllNameRaw : null);
                         if (aliasTarget) {
                             // For aliased DLLs, unknown functions get trap stubs instead of throwing
                             unknownFunctions.add(name.toLowerCase());
@@ -1534,6 +1546,7 @@ export class PELoader {
 
             if (argCount === undefined) {
                 Logger.warn(LogCategory.SYSTEM, `[PE] Unknown arg count for ${dllName}:${name}`);
+                loadDiagnostics.noteUnknownArgCount(dllName, name);
             }
 
             return { name, argCount, stackCleanupBytes, callingConvention };

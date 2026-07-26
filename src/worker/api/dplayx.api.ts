@@ -46,7 +46,7 @@ export const IDirectPlayLobby3A: InterfaceDescriptor = {
         makeMethod("Connect", 4),
         makeMethod("CreateAddress", 7),
         makeMethod("EnumAddresses", 5),
-        makeMethod("EnumAddressTypes", 4),
+        makeMethod("EnumAddressTypes", 5),
         makeMethod("EnumLocalApplications", 4),
 
         // IDirectPlayLobby3::GetConnectionSettings(dwAppID, lpData, lpdwDataSize) = 3 args + this = 4.
@@ -55,13 +55,13 @@ export const IDirectPlayLobby3A: InterfaceDescriptor = {
 
         makeMethod("ReceiveLobbyMessage", 6),
         makeMethod("RunApplication", 5),
-        makeMethod("SendLobbyMessage", 6),
-        makeMethod("SetConnectionSettings", 5),
-        makeMethod("SetLobbyMessageEvent", 3),
+        makeMethod("SendLobbyMessage", 5),
+        makeMethod("SetConnectionSettings", 4),
+        makeMethod("SetLobbyMessageEvent", 4),
         makeMethod("CreateCompoundAddress", 5),
         makeMethod("ConnectEx", 5),
         makeMethod("RegisterApplication", 3),
-        makeMethod("UnregisterApplication", 2),
+        makeMethod("UnregisterApplication", 3),
         makeMethod("WaitForConnectionSettings", 2),
     ],
 };
@@ -80,7 +80,7 @@ export const IDirectPlayLobbyCompatA: InterfaceDescriptor = {
         makeMethod("Connect", 4),
         makeMethod("CreateAddress", 5),
         makeMethod("EnumAddresses", 5),
-        makeMethod("EnumAddressTypes", 4),
+        makeMethod("EnumAddressTypes", 5),
         makeMethod("EnumLocalApplications", 3),
 
         // Same as Lobby3A: 3 args + this = 4.
@@ -88,13 +88,13 @@ export const IDirectPlayLobbyCompatA: InterfaceDescriptor = {
 
         makeMethod("ReceiveLobbyMessage", 6),
         makeMethod("RunApplication", 5),
-        makeMethod("SendLobbyMessage", 6),
-        makeMethod("SetConnectionSettings", 5),
-        makeMethod("SetLobbyMessageEvent", 3),
+        makeMethod("SendLobbyMessage", 5),
+        makeMethod("SetConnectionSettings", 4),
+        makeMethod("SetLobbyMessageEvent", 4),
         makeMethod("CreateCompoundAddress", 5),
         makeMethod("ConnectEx", 5),
         makeMethod("RegisterApplication", 3),
-        makeMethod("UnregisterApplication", 2),
+        makeMethod("UnregisterApplication", 3),
         makeMethod("WaitForConnectionSettings", 2),
     ],
 };
@@ -165,33 +165,35 @@ export const IDirectPlay4A: InterfaceDescriptor = {
 };
 
 // IDirectPlayLobby interface (original)
-// IID: {af461240-a3a1-11cf-8602-00a0245d918b}
+// IID_IDirectPlayLobby: {af465c71-9588-11cf-a020-00aa006157ac}
+// The ANSI variant IID_IDirectPlayLobbyA shares this exact vtable shape, so the object
+// answers both (see DirectPlayLobbyObjectV1.queryAdditionalInterfaces).
 export const IDirectPlayLobby: InterfaceDescriptor = {
     name: "IDirectPlayLobby",
     inherits: "IUnknown",
-    iid: "af461240-a3a1-11cf-8602-00a0245d918b",
+    iid: "af465c71-9588-11cf-a020-00aa006157ac",
     methods: [
         ...IUnknown.methods.map(m => ({ ...m, name: m.name })),
         makeMethod("Connect", 4),
         makeMethod("CreateAddress", 7),
         makeMethod("EnumAddresses", 5),
-        makeMethod("EnumAddressTypes", 4),
+        makeMethod("EnumAddressTypes", 5),
         makeMethod("EnumLocalApplications", 4),
         makeMethod("GetConnectionSettings", 4),
         makeMethod("ReceiveLobbyMessage", 6),
         makeMethod("RunApplication", 5),
-        makeMethod("SendLobbyMessage", 6),
-        makeMethod("SetConnectionSettings", 5),
-        makeMethod("SetLobbyMessageEvent", 3),
+        makeMethod("SendLobbyMessage", 5),
+        makeMethod("SetConnectionSettings", 4),
+        makeMethod("SetLobbyMessageEvent", 4),
     ],
 };
 
 // IDirectPlay interface (original)
-// IID: {279afa83-4981-11ce-a521-0020af0be560}
+// IID_IDirectPlay: {5454e9a0-db65-11ce-921c-00aa006c4972}
 export const IDirectPlay: InterfaceDescriptor = {
     name: "IDirectPlay",
     inherits: "IUnknown",
-    iid: "279afa83-4981-11ce-a521-0020af0be560",
+    iid: "5454e9a0-db65-11ce-921c-00aa006c4972",
     methods: [
         ...IUnknown.methods.map(m => ({ ...m, name: m.name })),
         makeMethod("AddPlayerToGroup", 3),
@@ -205,7 +207,7 @@ export const IDirectPlay: InterfaceDescriptor = {
         makeMethod("EnumGroupPlayers", 5),
         makeMethod("EnumGroups", 5),
         makeMethod("EnumPlayers", 5),
-        makeMethod("EnumSessions", 5),
+        makeMethod("EnumSessions", 6),
         makeMethod("GetCaps", 2),
         makeMethod("GetMessageCount", 3),
         makeMethod("GetPlayerCaps", 3),
@@ -220,11 +222,13 @@ export const IDirectPlay: InterfaceDescriptor = {
 };
 
 // DirectPlay 8 Lobby Client (DX8/DX9)
-// IID: {819074a3-016c-11d3-ae14-006097b01411}
+// IID_IDirectPlay8LobbyClient: {819074a2-016c-11d3-ae14-006097b01411}
+// Not to be confused with IID_IDirectPlay8LobbiedApplication ({819074a3-...}), a distinct
+// 12-slot interface (RegisterProgram/UnRegisterProgram/SetAppAvailable/UpdateStatus).
 export const IDirectPlay8LobbyClient: InterfaceDescriptor = {
     name: "IDirectPlay8LobbyClient",
     inherits: "IUnknown",
-    iid: "819074a3-016c-11d3-ae14-006097b01411",
+    iid: "819074a2-016c-11d3-ae14-006097b01411",
     methods: [
         ...IUnknown.methods.map(m => ({ ...m, name: m.name })),
         makeMethod("Initialize", 4, { params: [p("this"), p("pvUserContext"), p("pfn"), u("dwFlags")] }),

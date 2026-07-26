@@ -18,6 +18,7 @@ import { profiler, Profiler } from "./profiler";
 import { leaseRegistry } from "./memory/lease-registry";
 import { memoryEventBuffer } from "./memory/memory-event-buffer";
 import { faultRecorder } from "./memory/fault-recorder";
+import { loadDiagnostics } from "./diagnostics/load-diagnostics";
 import { serializeCpu } from "../harness/serialize";
 import { buildHarnessReport, type HarnessReport } from "../harness/build-report";
 import { frameProfiler } from "./frame-profiler";
@@ -73,6 +74,8 @@ export interface CrashFaultPayload {
      *  with ESP + [esp]. Isolated from a busy peer thread that floods the global ring;
      *  reveals a wild/corrupt ESP directly. */
     crashThreadCalls?: string[];
+    /** True for a process-fatal crash; absent for a per-thread fault the process survived. */
+    fatal?: boolean;
     /** Set when the crashing thread entered a thunk with ESP outside its stack
      *  (stack/control-flow corruption tripwire). */
     wildEsp?: string | null;
@@ -408,6 +411,16 @@ export class System {
 
         this.enrichFaultReport(fault);
 
+        // Outlives the teardown below so harness.report() can still name the cause
+        // even when the crash predates any guest execution (e.g. PE link failure).
+        loadDiagnostics.noteFailure({
+            reason: fault.reason,
+            eip: fault.eip,
+            faultAddr: fault.faultAddr,
+            threadId: fault.threadId,
+            lastThunk: fault.lastThunk,
+        });
+
         Logger.error(LogCategory.SYSTEM,
             `Process crash: ${fault.reason} — EIP=0x${fault.eip.toString(16)} ` +
             `addr=0x${fault.faultAddr.toString(16)} thread=T${fault.threadId ?? "?"} ` +
@@ -428,8 +441,10 @@ export class System {
             });
         } catch { /* not in a worker context (tests) */ }
 
-        // Harness: one event for every crash class, not just #PF AVs.
-        try { harnessBus.emit('fault', fault); } catch { /* */ }
+        // Harness: one event for every crash class, not just #PF AVs. `fatal`
+        // separates this from reportGuestThreadFault, whose process keeps running —
+        // only the fatal one may abort a script's waits.
+        try { harnessBus.emit('fault', { ...fault, fatal: true }); } catch { /* */ }
     }
 
     /**
@@ -581,6 +596,11 @@ export class System {
         this.hostMouseCapture = callback;
     }
 
+    /** Game switch: the host must release every input producer it owns. */
+    setHostInputResetCallback(callback: () => void): void {
+        this.inputManager.setHostInputResetCallback(callback);
+    }
+
     /**
      * Assert/release relative-mouse capture independently of ShowCursor/ClipCursor.
      * Driven by DirectInput exclusive-mode mouse Acquire/Unacquire — on real Windows an
@@ -679,6 +699,7 @@ export class System {
         this.isCleaningUp = false;
         this._releaseCount = 0;
         this._crashReported = false; // fresh game → allow a new crash report
+        loadDiagnostics.reset();
 
         // Reset all subsystems
         this.windowManager.reset();

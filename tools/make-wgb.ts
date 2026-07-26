@@ -37,6 +37,12 @@
  *                        The worker recreates them at boot (mkdir -p) so the game's own
  *                        fopen("wb") into e.g. user\rosters succeeds. Backslash or forward
  *                        slash both work. Example: --create-dirs "user\rosters,user\save\photos"
+ *   --touch-layout <v>   On-screen touch controls for this title: either a preset id
+ *                        (pointer | pointer-rmb | wasd-look | dpad-buttons | pad) or a
+ *                        path to a .json ControlLayout exported from the layout editor.
+ *                        Sets emulator.touch.layout; without it the host auto-detects.
+ *   --touch-mode <m>     auto | direct | trackpad (default auto = follow the guest's
+ *                        relative-mouse intent). Sets emulator.touch.mode.
  *
  * Examples:
  *   bun tools/make-wgb.ts C:/Share/THPS2 E:/wgb/thps2-demo.wgb \
@@ -279,6 +285,40 @@ if (emptyDirs.size > 0) {
     console.log(`  empty dirs: auto-detected ${emptyDirs.size} (added to createDirs): ${[...emptyDirs].sort().join(', ')}`);
 }
 
+// Touch controls (host-side data; the worker only forwards it in bundle_meta).
+// A preset id stays a string; a .json path is parsed here so a malformed layout fails
+// at pack time instead of silently degrading to auto-detect on a phone.
+const TOUCH_PRESETS = ['pointer', 'pointer-rmb', 'wasd-look', 'dpad-buttons', 'pad'];
+const touchLayoutArg = get('--touch-layout');
+let touchLayout: string | Record<string, unknown> | undefined;
+if (touchLayoutArg) {
+    if (/\.json$/i.test(touchLayoutArg)) {
+        if (!existsSync(touchLayoutArg)) {
+            console.error(`Error: --touch-layout file not found: ${touchLayoutArg}`);
+            process.exit(1);
+        }
+        try {
+            touchLayout = JSON.parse(readFileSync(touchLayoutArg, 'utf8'));
+        } catch (err) {
+            console.error(`Error: --touch-layout "${touchLayoutArg}" is not valid JSON: ${err}`);
+            process.exit(1);
+        }
+    } else if (TOUCH_PRESETS.includes(touchLayoutArg)) {
+        touchLayout = touchLayoutArg;
+    } else {
+        console.error(`Error: unknown --touch-layout "${touchLayoutArg}". Valid presets: ${TOUCH_PRESETS.join(', ')} (or a .json file).`);
+        process.exit(1);
+    }
+}
+const touchModeArg = get('--touch-mode');
+if (touchModeArg && !['auto', 'direct', 'trackpad'].includes(touchModeArg)) {
+    console.error(`Error: unknown --touch-mode "${touchModeArg}". Valid: auto, direct, trackpad.`);
+    process.exit(1);
+}
+const touch = (touchLayout !== undefined || touchModeArg)
+    ? { ...(touchLayout !== undefined ? { layout: touchLayout } : {}), ...(touchModeArg ? { mode: touchModeArg } : {}) }
+    : undefined;
+
 const manifest: Record<string, unknown> = {
     formatVersion: 2,
     gameId,
@@ -295,6 +335,7 @@ const manifest: Record<string, unknown> = {
         ...(get('--oem-codepage') ? { oemCodepage: parseInt(get('--oem-codepage')!, 10) } : {}),
         ...(get('--lcid') ? { lcid: parseInt(get('--lcid')!, 16) } : {}),
         ...(createDirs.length > 0 ? { createDirs } : {}),
+        ...(touch ? { touch } : {}),
     },
 };
 if (args) (manifest as any).args = args;

@@ -2,6 +2,7 @@
 // lifecycle events (ended/started/error/position) that are forwarded to the
 // owning audio modules (mss32/bass/galaxy/quartz).
 import { System } from "../core/system";
+import { virtualCd } from "../core/audio/virtual-cd";
 import type { MSS32 } from "../modules/mss32";
 import type { Bass } from "../modules/bass";
 import type { Galaxy } from "../modules/galaxy";
@@ -12,6 +13,9 @@ export function handleAudioBridgeMessage(message: any): boolean {
   if (message?.type === "audio_ended") {
     const system = System.getInstance();
     const id = Number(message.id) || 0;
+    // The virtual CD drive owns its own id range and drives every CD-audio surface
+    // (MCI cdaudio / AIL_redbook / aux), so it gets first refusal.
+    if (virtualCd().handleAudioEnded(id)) return true;
     const mss32 = system.process?.getModule("mss32") as MSS32 | undefined;
     if (mss32?.handleAudioEnded) {
       mss32.handleAudioEnded(id);
