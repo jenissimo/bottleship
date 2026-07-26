@@ -11,6 +11,7 @@ import { frameProfiler } from "../../../core/frame-profiler";
 import { statsOverlay } from "../../../core/stats-overlay";
 import { PROG_BIND } from "./shader";
 import { d3d9WasmArena, ArenaCommandType } from "./d3d9-wasm-arena";
+import { FFP_UNIFORM_BYTES } from "./ffp-lighting";
 
 export interface PipelineInfo {
     pipeline: GPURenderPipeline;
@@ -36,6 +37,16 @@ const PS_BIND_SIZE = 224 * 4 * 4; // 3584 bytes
 // round-robin-thrashes and pays createBindGroup + GC on every evicted re-reference.
 const PROG_CACHE_N = 1024;
 const PROG_CONST_CACHE_N = 64;    // frame-local per-draw constant dynamic-offset cache slots
+
+// FFP per-draw binding, dynamic-offset shape (boot flag __ffpDynOffset).
+// The FFP uniform block is a fixed-layout struct (ffp-lighting.ts owns it), so the
+// binding window is exactly its size and never varies per draw — which is what lets a
+// bind group be cached across draws with only the offset supplied at setBindGroup,
+// exactly as the programmable path does. Without it the FFP pipeline uses an implicit
+// ("auto") layout, where hasDynamicOffset cannot be declared and every FFP draw must
+// therefore build a throwaway bind group.
+const FFP_BIND_SIZE = FFP_UNIFORM_BYTES;
+const FFP_CACHE_N = 256;          // (sampler, texture) pairs — an FFP frame's material set is small
 
 /** A growable per-frame uniform ring written at 256-aligned offsets. */
 class UniformArena {
@@ -174,6 +185,14 @@ export class D3D9BackendExecutor {
     private progCacheCubeMask: number[] = [];
     private progCacheLen = 0;
     private progCacheCursor = 0;
+    // Hash index over the slots. Without it the lookup is a linear scan, so raising the slot
+    // cap to fix the HIT RATE just converts the cost into scan length — at ~2k draws/frame
+    // against a full 1024-slot cache that is millions of identity compares per frame, and it
+    // made acquireProgBindGroup the hottest JS function in the worker.
+    private progCacheHash: number[] = [];
+    private progCacheIndex = new Map<number, number[]>();
+    private gpuIds = new WeakMap<object, number>();
+    private nextGpuId = 1;
     private progCacheVsBuffer: GPUBuffer | null = null;
     private progCachePsBuffer: GPUBuffer | null = null;
     /** Reused [vsOffset, psOffset] dynamic-offset scratch (avoids a per-draw array alloc). */
@@ -191,6 +210,24 @@ export class D3D9BackendExecutor {
     private lastBoundBindGroup: GPUBindGroup | null = null;
     private lastBindOffset0 = -1;
     private lastBindOffset1 = -1;
+    /** How many dynamic offsets the last bind carried (0/1/2). Part of the bind identity:
+     *  an FFP bind (1 offset) must never false-hit a programmable one (2) on the same group. */
+    private lastBindDynCount = 0;
+
+    // ── FFP per-draw path, dynamic-offset shape ───────────────────────────
+    // Boot-time flag (harness setWorkerFlag('__ffpDynOffset', true) before load_bundle): the
+    // choice is baked into every FFP pipeline at creation, so it must not change while
+    // pipelines are cached. Read once, like __progCacheN.
+    private readonly ffpDynOffsetEnabled = (globalThis as Record<string, unknown>).__ffpDynOffset === true;
+    private ffpLayout: { bindGroupLayout: GPUBindGroupLayout; pipelineLayout: GPUPipelineLayout } | null = null;
+    private ffpCacheSampler: (GPUSampler | null)[] = [];
+    private ffpCacheView: (GPUTextureView | null)[] = [];
+    private ffpCacheGroup: GPUBindGroup[] = [];
+    private ffpCacheLen = 0;
+    private ffpCacheCursor = 0;
+    private ffpCacheBuffer: GPUBuffer | null = null;
+    /** Reused single-element dynamic-offset scratch (avoids a per-draw array alloc). */
+    private ffpDynOffsets: number[] = [0];
 
     /**
      * Shared, explicit bind-group/pipeline layout for programmable pipelines, parameterised by
@@ -220,6 +257,69 @@ export class D3D9BackendExecutor {
             this.progLayouts.set(cubeMask, layout);
         }
         return layout;
+    }
+
+    /**
+     * Shared, explicit bind-group/pipeline layout for FFP pipelines. One layout serves every
+     * FFP shader variant: binding 0 is the fixed-size uniform block with a dynamic offset,
+     * bindings 1/2 are the stage-0 sampler + texture. Variants that sample no texture simply
+     * do not declare 1/2 — a pipeline layout may be a superset of what the shader uses, and
+     * the bind group supplies fallbacks. Because the layout is shared (not per-pipeline as
+     * with "auto"), one cached bind group is compatible with all FFP pipelines.
+     */
+    private getFfpLayout(): { bindGroupLayout: GPUBindGroupLayout; pipelineLayout: GPUPipelineLayout } {
+        if (!this.ffpLayout) {
+            const device = this.backend.getDevice()!;
+            const bindGroupLayout = device.createBindGroupLayout({
+                entries: [
+                    // Read by both stages (vertex: transform/lighting; fragment: stage-0 ops, fog, clip).
+                    { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform", hasDynamicOffset: true } },
+                    { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
+                    { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
+                ],
+            });
+            const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] });
+            this.ffpLayout = { bindGroupLayout, pipelineLayout };
+        }
+        return this.ffpLayout;
+    }
+
+    /** Layout for FFP render pipelines: the shared explicit one when the dynamic-offset shape
+     *  is enabled, else WebGPU's implicit per-pipeline layout (the historical behaviour). */
+    getFfpPipelineLayout(): GPUPipelineLayout | GPUAutoLayoutMode {
+        return this.ffpDynOffsetEnabled ? this.getFfpLayout().pipelineLayout : "auto";
+    }
+
+    /**
+     * Get-or-build the FFP bind group for a (sampler, stage-0 texture) pair. Same shape as
+     * acquireProgBindGroup: object-identity compare over a small ring, zero-alloc on a hit,
+     * correct-by-construction (a recreated texture yields a new view → miss → rebuild). The
+     * uniform binding covers the fixed FFP_BIND_SIZE window at offset 0; the per-draw offset
+     * is supplied as a dynamic offset by the caller.
+     */
+    private acquireFfpBindGroup(sampler: GPUSampler, view: GPUTextureView): GPUBindGroup {
+        for (let s = 0; s < this.ffpCacheLen; s++) {
+            if (this.ffpCacheSampler[s] === sampler && this.ffpCacheView[s] === view) {
+                this.metrics.bindGroupCacheHits++;
+                return this.ffpCacheGroup[s];
+            }
+        }
+        const device = this.backend.getDevice()!;
+        const bindGroup = device.createBindGroup({
+            layout: this.getFfpLayout().bindGroupLayout,
+            entries: [
+                { binding: 0, resource: { buffer: this.ffpArena!.buffer!, offset: 0, size: FFP_BIND_SIZE } },
+                { binding: 1, resource: sampler },
+                { binding: 2, resource: view },
+            ],
+        });
+        const slot = this.ffpCacheLen < FFP_CACHE_N
+            ? this.ffpCacheLen++
+            : (this.ffpCacheCursor = (this.ffpCacheCursor + 1) % FFP_CACHE_N);
+        this.ffpCacheSampler[slot] = sampler;
+        this.ffpCacheView[slot] = view;
+        this.ffpCacheGroup[slot] = bindGroup;
+        return bindGroup;
     }
 
     /**
@@ -408,6 +508,8 @@ export class D3D9BackendExecutor {
                 if (this.vsArena.buffer !== this.progCacheVsBuffer || this.psArena.buffer !== this.progCachePsBuffer) {
                     this.progCacheLen = 0;
                     this.progCacheCursor = 0;
+                    this.progCacheIndex.clear();
+                    this.progCacheHash.length = 0;
                     this.progCacheVsBuffer = this.vsArena.buffer;
                     this.progCachePsBuffer = this.psArena.buffer;
                 }
@@ -417,7 +519,18 @@ export class D3D9BackendExecutor {
             if (frame.ffpStateCount > 0) {
                 if (!this.ffpArena) this.ffpArena = new UniformArena(device, "ffp-draw-arena");
                 const blockBytes = alignUp(Math.max(16, frame.ffpStates[0].blockLen * 4), UNIFORM_ALIGN);
-                this.ffpArena.begin(blockBytes * frame.ffpStateCount + UNIFORM_ALIGN);
+                // With the dynamic-offset shape, pad by one full binding window so the last
+                // block's range [offset, offset + FFP_BIND_SIZE) stays inside the buffer.
+                this.ffpArena.begin(blockBytes * frame.ffpStateCount
+                    + (this.ffpDynOffsetEnabled ? FFP_BIND_SIZE : UNIFORM_ALIGN));
+
+                // Cached FFP bind groups bind the arena buffer; if begin() recreated it, the
+                // cache is stale → drop it (mirrors the programmable arenas above).
+                if (this.ffpArena.buffer !== this.ffpCacheBuffer) {
+                    this.ffpCacheLen = 0;
+                    this.ffpCacheCursor = 0;
+                    this.ffpCacheBuffer = this.ffpArena.buffer;
+                }
             }
 
             // Ensure offscreen target (swap-chain path only; RT passes bring their own views).
@@ -831,12 +944,16 @@ export class D3D9BackendExecutor {
         } else {
             // Build bind group
             const pipeline = this.pipelines[pipelineId];
-            const layout = pipeline.getBindGroupLayout(0);
+            // Under the shared FFP layout the group must fill every declared slot — including
+            // the sampler/texture a textureless variant never samples; with "auto" only the
+            // slots the shader itself declares exist, so filling them would be invalid.
+            const shared = this.ffpDynOffsetEnabled;
+            const layout = shared ? this.getFfpLayout().bindGroupLayout : pipeline.getBindGroupLayout(0);
             const entries: GPUBindGroupEntry[] = [
                 { binding: 0, resource: { buffer: activeBuffer } }
             ];
 
-            if (info?.hasTexture) {
+            if (shared || info?.hasTexture) {
                 const texture = textureView ?? this.getFallbackTextureView();
                 entries.push({ binding: 1, resource: this.getSampler() });
                 entries.push({ binding: 2, resource: texture });
@@ -846,7 +963,10 @@ export class D3D9BackendExecutor {
             this.bindGroupCache.set(cacheKey, { bindGroup, textureView });
         }
 
-        this.setBindGroup0(renderPass, bindGroup);
+        // Binding 0 carries a dynamic offset under the shared layout. This frame-level bind
+        // always addresses the head of its buffer; per-draw offsets arrive via BindFfp.
+        if (this.ffpDynOffsetEnabled) this.setBindGroup0(renderPass, bindGroup, 0, -1, 1);
+        else this.setBindGroup0(renderPass, bindGroup);
     }
 
     /**
@@ -865,6 +985,18 @@ export class D3D9BackendExecutor {
         if (this.currentPipelineId === null || !this.ffpArena) return;
         const info = this.pipelineInfo[this.currentPipelineId];
         const offset = this.ffpArena.write(queue, fs.block, fs.blockLen);
+
+        if (this.ffpDynOffsetEnabled) {
+            // Shared explicit layout ⇒ the group depends only on (sampler, texture); the
+            // per-draw block is reached by the dynamic offset. Textureless variants bind the
+            // fallback view: the layout declares slot 2 even where the shader ignores it.
+            const bindGroup = this.acquireFfpBindGroup(
+                fs.sampler ?? this.getSampler(),
+                fs.texture ?? this.getFallbackTextureView(),
+            );
+            this.setBindGroup0(renderPass, bindGroup, offset, -1, 1);
+            return;
+        }
 
         const pipeline = this.pipelines[this.currentPipelineId];
         const layout = pipeline.getBindGroupLayout(0);
@@ -907,17 +1039,22 @@ export class D3D9BackendExecutor {
         bindGroup: GPUBindGroup,
         offset0 = -1,
         offset1 = -1,
+        dynCount = offset0 >= 0 ? 2 : 0,
     ): void {
         if (
             this.lastBoundBindGroup === bindGroup &&
             this.lastBindOffset0 === offset0 &&
-            this.lastBindOffset1 === offset1
+            this.lastBindOffset1 === offset1 &&
+            this.lastBindDynCount === dynCount
         ) {
             this.metrics.bindGroupSetSkips++;
             return;
         }
 
-        if (offset0 >= 0) {
+        if (dynCount === 1) {
+            this.ffpDynOffsets[0] = offset0;
+            renderPass.setBindGroup(0, bindGroup, this.ffpDynOffsets);
+        } else if (dynCount === 2) {
             this.dynOffsets[0] = offset0;
             this.dynOffsets[1] = offset1;
             renderPass.setBindGroup(0, bindGroup, this.dynOffsets);
@@ -927,6 +1064,7 @@ export class D3D9BackendExecutor {
         this.lastBoundBindGroup = bindGroup;
         this.lastBindOffset0 = offset0;
         this.lastBindOffset1 = offset1;
+        this.lastBindDynCount = dynCount;
         this.metrics.bindGroupSets++;
     }
 
@@ -1003,16 +1141,54 @@ export class D3D9BackendExecutor {
      * rebuild). The VS/PS uniform bindings use the fixed *_BIND_SIZE window at
      * offset 0; the per-draw offset is supplied as a dynamic offset by the caller.
      */
+    /** Drop `slot` from its hash bucket (no-op for a slot that was never indexed). */
+    private unindexProgSlot(slot: number): void {
+        const prev = this.progCacheHash[slot];
+        if (prev === undefined) return;
+        const bucket = this.progCacheIndex.get(prev);
+        if (bucket === undefined) return;
+        const at = bucket.indexOf(slot);
+        if (at >= 0) bucket.splice(at, 1);
+        if (bucket.length === 0) this.progCacheIndex.delete(prev);
+    }
+
+    /** Stable small integer per GPU object, so a bind-group key can be hashed instead of
+     *  compared. WeakMap rather than a stamped property: these are host objects and must not
+     *  be mutated. */
+    private gpuId(o: object | null): number {
+        if (o === null) return 0;
+        let id = this.gpuIds.get(o);
+        if (id === undefined) { id = this.nextGpuId++; this.gpuIds.set(o, id); }
+        return id;
+    }
+
+    private progKeyHash(sampler: GPUSampler, textures: (GPUTextureView | null)[], cubeMask: number): number {
+        // FNV-1a over the identity ids. Collisions are fine — the bucket is verified by
+        // identity below, so the hash only has to be cheap and well-spread.
+        let h = 0x811c9dc5;
+        h = Math.imul(h ^ this.gpuId(sampler), 0x01000193);
+        h = Math.imul(h ^ cubeMask, 0x01000193);
+        for (let n = 0; n < PROG_BIND.MAX_TEX; n++) {
+            h = Math.imul(h ^ this.gpuId(textures[n] ?? null), 0x01000193);
+        }
+        return h >>> 0;
+    }
+
     private acquireProgBindGroup(sampler: GPUSampler, textures: (GPUTextureView | null)[], cubeMask: number = 0): GPUBindGroup {
         const MAX = PROG_BIND.MAX_TEX;
-        for (let s = 0; s < this.progCacheLen; s++) {
-            if (this.progCacheSampler[s] !== sampler || this.progCacheCubeMask[s] !== cubeMask) continue;
-            const base = s * MAX;
-            let match = true;
-            for (let n = 0; n < MAX; n++) {
-                if (this.progCacheViews[base + n] !== (textures[n] ?? null)) { match = false; break; }
+        const hash = this.progKeyHash(sampler, textures, cubeMask);
+        const bucket = this.progCacheIndex.get(hash);
+        if (bucket !== undefined) {
+            for (let i = 0; i < bucket.length; i++) {
+                const s = bucket[i]!;
+                if (this.progCacheSampler[s] !== sampler || this.progCacheCubeMask[s] !== cubeMask) continue;
+                const base = s * MAX;
+                let match = true;
+                for (let n = 0; n < MAX; n++) {
+                    if (this.progCacheViews[base + n] !== (textures[n] ?? null)) { match = false; break; }
+                }
+                if (match) { this.metrics.bindGroupCacheHits++; return this.progCacheGroup[s]; }
             }
-            if (match) { this.metrics.bindGroupCacheHits++; return this.progCacheGroup[s]; }
         }
 
         // Miss → build a new bind group and insert it (append, then round-robin evict). The
@@ -1036,6 +1212,12 @@ export class D3D9BackendExecutor {
         const slot = this.progCacheLen < this.progCacheN
             ? this.progCacheLen++
             : (this.progCacheCursor = (this.progCacheCursor + 1) % this.progCacheN);
+        // Round-robin eviction reuses a live slot — unindex it first or the old hash keeps
+        // pointing at a slot that now holds a different material.
+        this.unindexProgSlot(slot);
+        this.progCacheHash[slot] = hash;
+        const b = this.progCacheIndex.get(hash);
+        if (b === undefined) this.progCacheIndex.set(hash, [slot]); else b.push(slot);
         this.progCacheSampler[slot] = sampler;
         this.progCacheCubeMask[slot] = cubeMask;
         const base = slot * MAX;
