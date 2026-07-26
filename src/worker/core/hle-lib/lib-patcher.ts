@@ -18,6 +18,7 @@
  * the overwritten bytes.
  */
 
+import { Logger, LogCategory } from '../logger';
 import { Mem } from '../memory/mem-accessor';
 import type { LoadedPEModule } from '../module-registry';
 import type { ThunkDispatcher, ThunkImplementation } from '../thunking/thunk-dispatcher';
@@ -120,7 +121,7 @@ export function validatePrologueBytes(bytes: Uint8Array): string | null {
 export function applyPatch(ctx: PatchContext, req: PatchRequest): PatchHandle | null {
     const mem = ctx.getMemory();
     if (!mem) {
-        console.warn(
+        Logger.warn(LogCategory.SYSTEM, 
             `[HLE-lib] applyPatch: guest memory not yet available, skipping ${req.libId}:${req.functionName}`);
         return null;
     }
@@ -134,7 +135,7 @@ export function applyPatch(ctx: PatchContext, req: PatchRequest): PatchHandle | 
     // requests that violate the invariant. Checked FIRST — nothing is mutated yet.
     const overwriteBytes = req.overwriteBytes ?? (req.prologueLen !== undefined ? 5 : 11);
     if (req.prologueLen !== undefined && overwriteBytes > req.prologueLen) {
-        console.error(
+        Logger.error(LogCategory.SYSTEM, 
             `[HLE-lib] applyPatch: overwriteBytes ${overwriteBytes} > prologueLen ${req.prologueLen} ` +
             `for ${req.libId}:${req.functionName} — the trampoline would re-enter clobbered bytes; refusing`);
         return null;
@@ -156,14 +157,14 @@ export function applyPatch(ctx: PatchContext, req: PatchRequest): PatchHandle | 
         stubAddress = allocated.address;
         stubCode = allocated.code;
     } catch (e) {
-        console.error(
+        Logger.error(LogCategory.SYSTEM, 
             `[HLE-lib] applyPatch: allocateOneStub failed for ${req.libId}:${req.functionName}: ${e}`);
         return null;
     }
 
     // 2. Write stub bytes to guest memory.
     if (stubAddress + stubCode.length > mem.length) {
-        console.error(
+        Logger.error(LogCategory.SYSTEM, 
             `[HLE-lib] applyPatch: stub 0x${stubAddress.toString(16)} overruns memory`);
         return null;
     }
@@ -187,14 +188,14 @@ export function applyPatch(ctx: PatchContext, req: PatchRequest): PatchHandle | 
         const prologue = originalBytes.slice(0, pl);
         const reason = validatePrologueBytes(prologue);
         if (reason) {
-            console.error(
+            Logger.error(LogCategory.SYSTEM, 
                 `[HLE-lib] applyPatch: trampoline refused for ${req.libId}:${req.functionName}: ${reason} ` +
                 `(bytes: ${Array.from(prologue).map(x => x.toString(16).padStart(2, '0')).join(' ')})`);
             return null;
         }
         trampolineAddress = ctx.thunkGenerator.allocateRawCodeArea(pl + 5);
         if (trampolineAddress + pl + 5 > mem.length) {
-            console.error(`[HLE-lib] applyPatch: trampoline 0x${trampolineAddress.toString(16)} overruns memory`);
+            Logger.error(LogCategory.SYSTEM, `[HLE-lib] applyPatch: trampoline 0x${trampolineAddress.toString(16)} overruns memory`);
             return null;
         }
         mem.set(prologue, trampolineAddress);
@@ -211,7 +212,7 @@ export function applyPatch(ctx: PatchContext, req: PatchRequest): PatchHandle | 
     let jmpTarget = stubAddress;
     if (req.entryFilter) {
         if (trampolineAddress === undefined) {
-            console.error(
+            Logger.error(LogCategory.SYSTEM, 
                 `[HLE-lib] applyPatch: entryFilter for ${req.libId}:${req.functionName} requires prologueLen ` +
                 `(the trampoline is its decline path); refusing`);
             return null;
@@ -226,11 +227,11 @@ export function applyPatch(ctx: PatchContext, req: PatchRequest): PatchHandle | 
                 allocCode: (size: number) => ctx.thunkGenerator.allocateRawCodeArea(size),
             });
         } catch (e) {
-            console.error(`[HLE-lib] applyPatch: entryFilter threw for ${req.libId}:${req.functionName}: ${e}`);
+            Logger.error(LogCategory.SYSTEM, `[HLE-lib] applyPatch: entryFilter threw for ${req.libId}:${req.functionName}: ${e}`);
             filterAddr = null;
         }
         if (filterAddr === null || filterAddr <= 0 || filterAddr >= mem.length) {
-            console.error(
+            Logger.error(LogCategory.SYSTEM, 
                 `[HLE-lib] applyPatch: entryFilter refused/invalid for ${req.libId}:${req.functionName} — aborting patch`);
             return null;
         }
@@ -258,11 +259,11 @@ export function applyPatch(ctx: PatchContext, req: PatchRequest): PatchHandle | 
         if (cpu && cpu["jit_dirty_cache"]) {
             cpu["jit_dirty_cache"](req.targetAddress, req.targetAddress + 16);
         } else {
-            console.warn(
+            Logger.warn(LogCategory.SYSTEM, 
                 `[HLE-lib] applyPatch: cpu not ready, JIT invalidation may be delayed for ${req.libId}:${req.functionName}`);
         }
     } catch (e) {
-        console.warn(`[HLE-lib] applyPatch: jit_dirty_cache threw: ${e}`);
+        Logger.warn(LogCategory.SYSTEM, `[HLE-lib] applyPatch: jit_dirty_cache threw: ${e}`);
     }
 
     const stubInfo = ctx.thunkGenerator.getStubByAddress?.(stubAddress);

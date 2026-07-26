@@ -8,6 +8,7 @@
  *     → record in `matches` for diagnostics
  */
 
+import { Logger, LogCategory } from '../logger';
 import { System } from '../system';
 import { hypercallDataManager } from '../cpu/hypercall-data';
 
@@ -116,7 +117,7 @@ class LibHleManager {
     /** Entry point from pe-loader. Safe to call before initialize — will no-op. */
     onModuleLoaded(module: LoadedPEModule): void {
         if (!this.init) {
-            console.log(`[HLE-lib] onModuleLoaded(${module.name}) — manager not yet initialized, skipping`);
+            Logger.log(LogCategory.SYSTEM, `[HLE-lib] onModuleLoaded(${module.name}) — manager not yet initialized, skipping`);
             return;
         }
         const cfg = EmulatorConfig.getInstance().hleLibs;
@@ -124,13 +125,13 @@ class LibHleManager {
 
         const descriptors = libRegistry.getAll();
         if (descriptors.length === 0) {
-            console.warn(`[HLE-lib] onModuleLoaded(${module.name}) — no descriptors registered; did libs/*/index.ts import?`);
+            Logger.warn(LogCategory.SYSTEM, `[HLE-lib] onModuleLoaded(${module.name}) — no descriptors registered; did libs/*/index.ts import?`);
             return;
         }
 
         const sectionSummary = (module.sections ?? []).map(s =>
             `${s.name}(${s.virtualSize}B@0x${s.virtualAddress.toString(16)})`).join(', ');
-        console.log(`[HLE-lib] onModuleLoaded ${module.name} base=0x${module.baseAddress.toString(16)} size=${module.size} sections=[${sectionSummary}]`);
+        Logger.log(LogCategory.SYSTEM, `[HLE-lib] onModuleLoaded ${module.name} base=0x${module.baseAddress.toString(16)} size=${module.size} sections=[${sectionSummary}]`);
 
         for (const desc of descriptors) {
             // Per-library opt-out.
@@ -140,16 +141,16 @@ class LibHleManager {
             const threshold = cfg.minConfidence ?? desc.minConfidence;
             const match = runDetector(desc, module);
             if (!match) {
-                console.log(`[HLE-lib] ${desc.id} in ${module.name}: no detection (0 hits or required function missing)`);
+                Logger.log(LogCategory.SYSTEM, `[HLE-lib] ${desc.id} in ${module.name}: no detection (0 hits or required function missing)`);
                 continue;
             }
             if (match.confidence < threshold) {
                 const hits = match.signatureHits.map(h => `${h.signatureId}(+${h.weight})`).join(', ');
-                console.log(`[HLE-lib] ${desc.id} in ${module.name}: confidence ${match.confidence} < threshold ${threshold}. Hits: [${hits}]`);
+                Logger.log(LogCategory.SYSTEM, `[HLE-lib] ${desc.id} in ${module.name}: confidence ${match.confidence} < threshold ${threshold}. Hits: [${hits}]`);
                 continue;
             }
 
-            console.log(
+            Logger.log(LogCategory.SYSTEM, 
                 `[HLE-lib] Detected '${desc.id}' in ${module.name} (confidence ${match.confidence}, ` +
                 `${match.functionMatches.length} functions resolved` +
                 (match.missingFunctions.length > 0 ? `, ${match.missingFunctions.length} missing: ${match.missingFunctions.join(', ')}` : '') +
@@ -158,11 +159,11 @@ class LibHleManager {
             // Record the match for diagnostics regardless of logOnly.
             if (!this.matches.has(desc.id)) this.matches.set(desc.id, new Map());
             this.matches.get(desc.id)!.set(module.name, match);
-            console.log(`[HLE-lib] ${desc.id} function addresses:`,
+            Logger.log(LogCategory.SYSTEM, `[HLE-lib] ${desc.id} function addresses: ` +
                 match.functionMatches.map(f => `${f.name}=0x${f.address.toString(16)}`).join(' '));
 
             if (cfg.logOnly) {
-                console.log(`[HLE-lib] logOnly=true — '${desc.id}' detected but NOT patching`);
+                Logger.log(LogCategory.SYSTEM, `[HLE-lib] logOnly=true — '${desc.id}' detected but NOT patching`);
                 continue;
             }
 
@@ -196,7 +197,7 @@ class LibHleManager {
             const needsTrampoline = decl.shadow?.validateInGame === true;
             if (decl.shadow) {
                 if (needsTrampoline && decl.prologueLen === undefined) {
-                    console.error(
+                    Logger.error(LogCategory.SYSTEM, 
                         `[HLE-lib] ${descriptor.id}:${fm.name} sets validateInGame but no prologueLen — ` +
                         `the original-call path is impossible; skipping hook`);
                     continue;
@@ -211,7 +212,7 @@ class LibHleManager {
                         const h = this.patches.get(descriptor.id)?.get(fm.name);
                         if (decl.hypercallHandlerId !== undefined && h && h.functionId >= 0) {
                             hypercallDataManager.registerRawHandler(h.functionId, decl.hypercallHandlerId);
-                            console.log(
+                            Logger.log(LogCategory.SYSTEM, 
                                 `[HLE-shadow] ${descriptor.id}:${fm.name} promoted to WASM handler ` +
                                 `${decl.hypercallHandlerId} (funcId ${h.functionId})`);
                         }
@@ -226,11 +227,11 @@ class LibHleManager {
                 handler = this.buildShadowHandler(runtime, decl, descriptor.id, fm.name);
             }
             if (!handler) {
-                console.warn(`[HLE-lib] ${descriptor.id}: no handler for '${fm.name}' — skipping patch`);
+                Logger.warn(LogCategory.SYSTEM, `[HLE-lib] ${descriptor.id}: no handler for '${fm.name}' — skipping patch`);
                 continue;
             }
             if (decl.entryFilter && decl.prologueLen === undefined) {
-                console.error(
+                Logger.error(LogCategory.SYSTEM, 
                     `[HLE-lib] ${descriptor.id}:${fm.name} declares entryFilter but no prologueLen — ` +
                     `the filter's decline path (trampoline) is impossible; skipping hook`);
                 continue;
@@ -247,7 +248,7 @@ class LibHleManager {
             });
             if (handle) {
                 if (needsTrampoline && handle.trampolineAddress === undefined) {
-                    console.error(
+                    Logger.error(LogCategory.SYSTEM, 
                         `[HLE-lib] ${descriptor.id}:${fm.name}: validateInGame hook patched without ` +
                         `trampoline — unpatching`);
                     this.unpatch(descriptor.id, fm.name);
@@ -270,7 +271,7 @@ class LibHleManager {
                     hypercallDataManager.registerRawHandler(handle.functionId, decl.hypercallHandlerId);
                 }
 
-                console.log(
+                Logger.log(LogCategory.SYSTEM, 
                     `[HLE-lib] Patched ${descriptor.id}:${fm.name} at 0x${fm.address.toString(16)} ` +
                     `→ stub 0x${handle.stubAddress.toString(16)}` +
                     (decl.hypercallHandlerId !== undefined ? ` [WASM handler ${decl.hypercallHandlerId}]` : '') +
@@ -284,7 +285,7 @@ class LibHleManager {
         try {
             descriptor.onActivated?.(match);
         } catch (e) {
-            console.warn(`[HLE-lib] ${descriptor.id}.onActivated threw: ${e}`);
+            Logger.warn(LogCategory.SYSTEM, `[HLE-lib] ${descriptor.id}.onActivated threw: ${e}`);
         }
     }
 
@@ -338,7 +339,7 @@ class LibHleManager {
             //    compared before the guest's own EAX goes back to the caller. ──
             const handle = this.patches.get(libId)?.get(fnName);
             if (!handle || handle.trampolineAddress === undefined) {
-                console.warn(`[HLE-shadow] ${libId}:${fnName} called without trampoline — returning 0`);
+                Logger.warn(LogCategory.SYSTEM, `[HLE-shadow] ${libId}:${fnName} called without trampoline — returning 0`);
                 return 0;
             }
             // The dispatcher hands the handler a FIXED-SIZE args buffer (32
@@ -403,13 +404,13 @@ class LibHleManager {
         const res = this.runOriginalSync(decl, handle, callArgs);
         if (res.ok) {
             try { onReturn?.(res.eax); }
-            catch (e) { console.error(`[HLE-shadow] compare threw for ${handle.libId}:${handle.functionName}: ${e}`); }
+            catch (e) { Logger.error(LogCategory.SYSTEM, `[HLE-shadow] compare threw for ${handle.libId}:${handle.functionName}: ${e}`); }
             return { value: res.eax };
         }
         if (res.reason === 'no-export') {
             if (!this.warnedNoExport) {
                 this.warnedNoExport = true;
-                console.error(
+                Logger.error(LogCategory.SYSTEM, 
                     `[HLE-shadow] run_guest_until export missing (stale v86 wasm?) — ` +
                     `in-game validation impossible; hooks go kernel-live UNVALIDATED ` +
                     `(equivalent to validateInGame:false)`);
@@ -424,7 +425,7 @@ class LibHleManager {
         try {
             return { value: spec.kernel(liveView, callArgs) >>> 0 };
         } catch (e) {
-            console.error(`[HLE-shadow] live-kernel completion threw for ${handle.libId}:${handle.functionName}: ${e}`);
+            Logger.error(LogCategory.SYSTEM, `[HLE-shadow] live-kernel completion threw for ${handle.libId}:${handle.functionName}: ${e}`);
             return 0;
         }
     }
@@ -496,7 +497,7 @@ class LibHleManager {
         if (!handle) return false;
         const mem = this.init?.getMemory() ?? null;
         if (!mem) {
-            console.warn(`[HLE-lib] unpatch: guest memory unavailable for ${libId}:${functionName}`);
+            Logger.warn(LogCategory.SYSTEM, `[HLE-lib] unpatch: guest memory unavailable for ${libId}:${functionName}`);
             return false;
         }
         mem.set(handle.originalBytes, handle.targetAddress);
@@ -506,7 +507,7 @@ class LibHleManager {
                 cpu["jit_dirty_cache"](handle.targetAddress, handle.targetAddress + handle.originalBytes.length);
             }
         } catch (e) {
-            console.warn(`[HLE-lib] unpatch: jit_dirty_cache threw: ${e}`);
+            Logger.warn(LogCategory.SYSTEM, `[HLE-lib] unpatch: jit_dirty_cache threw: ${e}`);
         }
         // Drop the WASM dispatch binding too, so a bailed-out hook stops being
         // served in WASM (the original guest bytes are back — no stub to reach).
@@ -514,7 +515,7 @@ class LibHleManager {
             hypercallDataManager.unregisterRawHandler(handle.functionId);
         }
         libPatches!.delete(functionName);
-        console.log(
+        Logger.log(LogCategory.SYSTEM, 
             `[HLE-lib] Unpatched ${libId}:${functionName} at 0x${handle.targetAddress.toString(16)} ` +
             `— restored ${handle.originalBytes.length} original bytes`,
         );
@@ -580,15 +581,15 @@ class LibHleManager {
     dumpReport(): void {
         const rows = this.getReport();
         if (rows.length === 0) {
-            console.log(`[HLE-lib] No library matches recorded`);
+            Logger.log(LogCategory.SYSTEM, `[HLE-lib] No library matches recorded`);
             return;
         }
         for (const r of rows) {
-            console.log(
+            Logger.log(LogCategory.SYSTEM, 
                 `[HLE-lib] ${r.lib} @ ${r.module} (confidence=${r.confidence}, patches=${r.patches.length}` +
                 (r.missing.length > 0 ? `, missing=${r.missing.join(',')}` : '') + `)`);
             for (const p of r.patches) {
-                console.log(`           ${p.name}  target=${p.addr}  hits=${p.hits}`);
+                Logger.log(LogCategory.SYSTEM, `           ${p.name}  target=${p.addr}  hits=${p.hits}`);
             }
         }
     }

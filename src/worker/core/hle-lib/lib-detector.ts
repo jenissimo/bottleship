@@ -4,6 +4,7 @@
  * for big sections.
  */
 
+import { Logger, LogCategory } from '../logger';
 import { Mem } from '../memory/mem-accessor';
 import type { LoadedPEModule, PESection } from '../module-registry';
 import type {
@@ -87,29 +88,72 @@ function scanU32Table(module: LoadedPEModule, section: PESection, values: number
  * Scan for a masked byte pattern. `mask` must be same length as `pattern`;
  * 'x' means exact match, any other char (typically '?') is a wildcard.
  */
+/**
+ * Why the last scanBytes() call failed — the longest prefix it got and where.
+ *
+ * A byte-exact prologue probe that misses is otherwise a silent no-op: the hook
+ * simply never installs, and nothing downstream can tell "this build differs" from
+ * "these bytes were already patched" from "the pattern is wrong". The near-miss
+ * address plus expected-vs-actual bytes distinguishes all three at a glance, and
+ * costs one comparison per candidate position on a scan that runs once per module.
+ */
+export interface ScanMiss {
+    bestLen: number;
+    bestAddr: number;
+    expected: Uint8Array;
+    actual: Uint8Array | null;
+    /** The section itself could not be read (paging) — not a pattern mismatch at all. */
+    unreadable?: boolean;
+}
+
+let lastScanMiss: ScanMiss | null = null;
+
+const hex = (b: Uint8Array | null) =>
+    b ? Array.from(b).map(v => v.toString(16).padStart(2, '0')).join(' ') : '<unreadable>';
+
 function scanBytes(module: LoadedPEModule, section: PESection, pattern: Uint8Array, mask: string): number {
+    lastScanMiss = null;
     if (pattern.length !== mask.length) {
-        console.error('[HLE-lib] scanBytes: pattern/mask length mismatch');
+        Logger.error(LogCategory.SYSTEM, '[HLE-lib] scanBytes: pattern/mask length mismatch');
         return -1;
     }
     const base = module.baseAddress + section.virtualAddress;
     const size = section.virtualSize;
     const bytes = Mem.readBytes(base, size);
-    if (!bytes) return -1;
+    if (!bytes) {
+        // Distinct from a pattern mismatch: nothing was compared at all. Silently
+        // treating this as "function absent" is how a paging/ordering hiccup turns
+        // into a permanently missing hook.
+        lastScanMiss = { bestLen: -1, bestAddr: base, expected: pattern, actual: null, unreadable: true };
+        return -1;
+    }
 
     const plen = pattern.length;
     const limit = size - plen;
+    let bestLen = -1;
+    let bestIdx = -1;
     for (let i = 0; i <= limit; i++) {
-        let match = true;
-        for (let j = 0; j < plen; j++) {
-            if (mask[j] === 'x' && bytes[i + j] !== pattern[j]) {
-                match = false;
-                break;
-            }
+        let j = 0;
+        for (; j < plen; j++) {
+            if (mask[j] === 'x' && bytes[i + j] !== pattern[j]) break;
         }
-        if (match) return base + i;
+        if (j === plen) return base + i;
+        if (j > bestLen) { bestLen = j; bestIdx = i; }
     }
+    lastScanMiss = {
+        bestLen,
+        bestAddr: bestIdx >= 0 ? base + bestIdx : 0,
+        expected: pattern,
+        actual: bestIdx >= 0 ? bytes.slice(bestIdx, bestIdx + plen) : null,
+    };
     return -1;
+}
+
+/** Consume the near-miss record left by the most recent failed prologue scan. */
+export function takeLastScanMiss(): ScanMiss | null {
+    const m = lastScanMiss;
+    lastScanMiss = null;
+    return m;
 }
 
 function evaluateSignature(module: LoadedPEModule, id: string, sig: Signature): SignatureHit | null {
@@ -408,7 +452,7 @@ function resolveXrefCallerEntry(
             `0x${c.entry.toString(16)} score=${c.score} callers=${c.incomingCalls} ` +
             `args=[${c.usage.arg1 ? '1' : ''}${c.usage.arg2 ? '2' : ''}${c.usage.arg3 ? '3' : ''}${c.usage.arg4 ? '4' : ''}]`,
         ).join(' | ');
-        console.log(`[HLE-lib] xrefCaller candidates for 0x${signatureAddr.toString(16)}: ${summary}`);
+        Logger.log(LogCategory.SYSTEM, `[HLE-lib] xrefCaller candidates for 0x${signatureAddr.toString(16)}: ${summary}`);
     }
 
     return candidates[0].entry;
@@ -473,12 +517,21 @@ export function runDetector(descriptor: LibDescriptor, module: LoadedPEModule): 
             functionMatches.push({ name, address: addr });
         } else {
             missingFunctions.push(name);
-            if (decl.required) {
-                console.warn(
-                    `[HLE-lib] ${descriptor.id}: required function '${name}' not found in ${module.name} - aborting`,
-                );
-                return null;
-            }
+            // A miss silently removes a hook that may carry a large share of guest
+            // exec-weight, so it must never be an invisible state — name it with the
+            // evidence needed to tell a build difference from an already-patched
+            // prologue (CLAUDE.md §3.4 observability).
+            const miss = takeLastScanMiss();
+            Logger.warn(LogCategory.SYSTEM,
+                `[HLE-lib] ${descriptor.id}: function '${name}' NOT FOUND in ${module.name}` +
+                `${decl.required ? ' (required — aborting)' : ' (optional — hook will NOT install)'}` +
+                (!miss
+                    ? ''
+                    : miss.unreadable
+                        ? `; SECTION UNREADABLE at 0x${miss.bestAddr.toString(16)} — nothing was compared (paging/ordering, not a build difference)`
+                        : `; best prologue match ${miss.bestLen}/${miss.expected.length} bytes at ` +
+                          `0x${miss.bestAddr.toString(16)}\n    expected: ${hex(miss.expected)}\n    actual:   ${hex(miss.actual)}`));
+            if (decl.required) return null;
         }
     }
 
@@ -491,13 +544,13 @@ export function runDetector(descriptor: LibDescriptor, module: LoadedPEModule): 
                 getSection: (name: string) => getSection(module, name),
             });
         } catch (e) {
-            console.warn(`[HLE-lib] ${descriptor.id}.resolveAdditionalFunctions threw: ${e}`);
+            Logger.warn(LogCategory.SYSTEM, `[HLE-lib] ${descriptor.id}.resolveAdditionalFunctions threw: ${e}`);
         }
         const already = new Set(functionMatches.map(m => m.name));
         for (const m of extras) {
             if (already.has(m.name)) continue;
             if (!descriptor.functions[m.name]) {
-                console.warn(
+                Logger.warn(LogCategory.SYSTEM, 
                     `[HLE-lib] ${descriptor.id}: resolver produced '${m.name}' but it is not declared in functions{}`,
                 );
                 continue;

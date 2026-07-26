@@ -3,7 +3,9 @@
  *
  * Target: NFSU retail `FUN_005c97cb` — the per-token commit switch that
  * translates an EAGL token node into IDirect3DDevice9 calls. In-race at max
- * settings: 1.15M calls/s, 36.9% of hot guest exec-weight; token-class census:
+ * settings the dispatcher's pages are 22.5% of ALL guest execution and the hook
+ * removes 81% of that (measured, plan/experiments/e18 — an earlier "36.9%" in
+ * this header was a share of watched hot pages, not of execution). Token-class census:
  * class 8 SetSamplerState 46.6%, class 1 SetRenderState 31.8%, class 2
  * SetTextureStageState 1.9% — the three pure-state-set classes = 80.4% of all
  * dispatches.
@@ -45,6 +47,7 @@
  *   unreachable on these paths)
  */
 
+import { Logger, LogCategory } from '../../../logger';
 import { Mem } from '../../../memory/mem-accessor';
 import { System } from '../../../system';
 import { hypercallDataManager } from '../../../cpu/hypercall-data';
@@ -123,7 +126,7 @@ function ensureCfg(dv: DataView): boolean {
     if (cfgAddr !== 0) return true;
     const memMgr = System.getInstance().process?.memory;
     if (!memMgr) {
-        console.error('[HLE-eagl] no process memory for config block — refusing filter');
+        Logger.error(LogCategory.SYSTEM, '[HLE-eagl] no process memory for config block — refusing filter');
         return false;
     }
     cfgAddr = memMgr.alloc(CFG_SIZE) >>> 0;
@@ -161,7 +164,7 @@ export function buildTokenDispatchFilter(info: EntryFilterInfo): number | null {
     // opcode check so a layout drift refuses the hook instead of mis-reading.
     if (mem[targetAddress + TOKEN_TABLE_MOV_OFF] !== 0x8b ||
         mem[targetAddress + TOKEN_TABLE_MOV_OFF + 1] !== 0x88) {
-        console.error(
+        Logger.error(LogCategory.SYSTEM,
             `[HLE-eagl] token-dispatch: expected 8B 88 (mov ecx,[eax+disp32]) at +0x${TOKEN_TABLE_MOV_OFF.toString(16)}, ` +
             `found ${mem[targetAddress + TOKEN_TABLE_MOV_OFF]?.toString(16)} ${mem[targetAddress + TOKEN_TABLE_MOV_OFF + 1]?.toString(16)} — refusing filter`);
         return null;
@@ -180,7 +183,7 @@ export function buildTokenDispatchFilter(info: EntryFilterInfo): number | null {
     const code = assembleTokenDispatchFilter(
         filterAddr, cfgAddr, tokenTableBase, stubAddress, trampolineAddress);
     mem.set(code, filterAddr);
-    console.log(
+    Logger.log(LogCategory.SYSTEM,
         `[HLE-eagl] token-dispatch filter @0x${filterAddr.toString(16)} (${code.length}B) ` +
         `tokenTable=0x${tokenTableBase.toString(16)} cfg=0x${cfgAddr.toString(16)} (disarmed until D3D9 WBUF ready)`);
     return filterAddr;
@@ -194,6 +197,14 @@ export function buildTokenDispatchFilter(info: EntryFilterInfo): number | null {
 export function armTokenDispatchWhenReady(): void {
     if (armPollTimer !== null) { clearInterval(armPollTimer); armPollTimer = null; }
     armed = false;
+    // The guest filter gates on cfg RAM, not on `armed` — so a re-arm must close the
+    // gate too, or the filter keeps routing dispatches into the WASM handler against
+    // the PREVIOUS config (stale function ids, ring and shadow addresses) until the
+    // poll happens to succeed. tryArm() re-opens it once the snapshot is valid again.
+    if (cfgAddr !== 0) {
+        Mem.writeUint8(cfgAddr + CFG_ENABLED_FLAG, 0);
+        hypercallDataManager.setEaglTokenConfigPtr(0);
+    }
     armPollTimer = setInterval(() => {
         if (cfgAddr === 0) { clearInterval(armPollTimer!); armPollTimer = null; return; }
         if (tryArm()) {
@@ -246,7 +257,7 @@ function tryArm(): boolean {
     Mem.writeUint8(cfgAddr + CFG_ENABLED_FLAG, 1); // guest filter gate
     hypercallDataManager.setEaglTokenConfigPtr(cfgAddr);
     armed = true;
-    console.log(
+    Logger.log(LogCategory.SYSTEM,
         `[HLE-eagl] token-dispatch ARMED (v${CFG_VERSION_VALUE}): cfg=0x${cfgAddr.toString(16)} ring=0x${ring.ctrlAddr.toString(16)} ` +
         `srs=${stubs.srs.functionId}${srsShadow ? '(shadowed)' : '(plain)'} samp=${stubs.samp.functionId}${sampShadow ? '(shadowed)' : '(plain)'} ` +
         `tss=${stubs.tss.functionId} fvf=${stubs.fvf.functionId} svs=${stubs.svs.functionId} sps=${stubs.sps.functionId} ` +
@@ -296,7 +307,7 @@ export const tokenDispatchHandler: ThunkImplementation = (ctx, memory, args) => 
     const bail = (why: string): number => {
         if (!structuralBailDone) {
             structuralBailDone = true;
-            console.error(`[HLE-eagl] token-dispatch STRUCTURAL BAIL (${why}) — completing via sync original, then unpatching`);
+            Logger.error(LogCategory.SYSTEM, `[HLE-eagl] token-dispatch STRUCTURAL BAIL (${why}) — completing via sync original, then unpatching`);
             const res = libHleManager.callOriginalSync(LIB_ID, FN_NAME, [node, stage], 'stdcall', true);
             libHleManager.unpatch(LIB_ID, FN_NAME);
             Mem.writeUint8(cfgAddr + CFG_ENABLED_FLAG, 0);
@@ -375,7 +386,7 @@ export const tokenDispatchHandler: ThunkImplementation = (ctx, memory, args) => 
         if (head < 0 || head >= cap - 36) {
             // Should not happen post-drain; complete this ONE call via the
             // original (no unpatch — transient).
-            console.warn('[HLE-eagl] token-dispatch: ring full after drain — completing via sync original');
+            Logger.warn(LogCategory.SYSTEM, '[HLE-eagl] token-dispatch: ring full after drain — completing via sync original');
             const res = libHleManager.callOriginalSync(LIB_ID, FN_NAME, [node, stage], 'stdcall', true);
             return res.ok ? res.eax : 0;
         }
