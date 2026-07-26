@@ -35,6 +35,7 @@ playable). Your mileage will vary with the exact build/version you own.
 | Airfix Dogfighter (demo) | playable | |
 | The Blackwell Legacy | playable | ✓ |
 | Sea Dogs | playable | ✓ |
+| Overboard! / Shipwreckers! (demo) | playable | |
 
 \* retail has an intermittent mode-switch hiccup; the demo does not.
 
