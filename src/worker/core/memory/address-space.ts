@@ -237,7 +237,9 @@ export class AddressSpace {
             allowOverlap: true,  // Allow sub-allocations
         });
 
-        // GUARD: Red zone between THUNK and MODULES
+        // GUARD: Red zone between THUNK and MODULES. Its upper half also hosts the
+        // page directory + page tables (MEM_PAGETABLE_BASE) — NOACCESS to the guest,
+        // written only by PageTableManager's raw accessors and the CPU's page walker.
         const guardBase = MEM_GUARD_BASE;
         const guardLimit = Math.min(linearSize, MEM_GUARD_BASE + MEM_GUARD_SIZE);
         if (guardLimit > guardBase) {

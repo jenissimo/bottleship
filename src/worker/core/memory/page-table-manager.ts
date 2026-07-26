@@ -12,24 +12,20 @@
  * beyond the configured size (e.g., reading uninitialized pointers). Without full
  * mapping, these accesses would #PF — but before paging they silently succeeded.
  *
- * Guest memory layout (in the 15MB gap between LOW_MEM and HEAP):
- *   Page Directory: 0x00B00000 (4KB, 1024 PDEs)
- *   Page Tables:    0x00B01000 (~4MB for 1024 PTs covering full 4GB)
- *   Total:          ~4.004MB (0x00B00000 - 0x00F01000)
- *
- * Must NOT overlap with PE image region (0x00400000 + sizeOfImage).
- * The old location (0x00100000) overlapped with typical PE loads at 0x00400000,
- * causing page table initialization to overwrite game code/data → #GP on startup.
+ * Tables live at MEM_PAGETABLE_BASE (inside the NOACCESS red zone), never in the low
+ * gap below HEAP: that gap is PE-image territory — an EXE at ImageBase 0x00400000 with
+ * a multi-MB BSS reaches well past 11MB, and an overlap is silent and lethal (the
+ * walker's A/D-bit writes land in the guest's globals, the guest's writes in our PTEs).
+ * Layout: page directory 4KB, then 1024 page tables (4MB) covering the full 4GB.
  */
 
 import { Logger, LogCategory } from '../logger';
 import { setWriteMapBase } from './address-space';
-import { MEM_THUNK_CODE_BASE, MEM_THUNK_CODE_SIZE } from '../cpu/emulator-config';
+import { MEM_THUNK_CODE_BASE, MEM_THUNK_CODE_SIZE, MEM_PAGETABLE_BASE, MEM_PAGETABLE_SIZE } from '../cpu/emulator-config';
 
 // Page table constants
-// Placed at 11MB (still below HEAP at 16MB) to avoid overlap with larger PE images.
-const PAGE_DIR_ADDR = 0x00B00000;
-const PAGE_TABLES_ADDR = 0x00B01000;
+const PAGE_DIR_ADDR = MEM_PAGETABLE_BASE;
+const PAGE_TABLES_ADDR = MEM_PAGETABLE_BASE + 0x1000;
 const PAGE_SIZE = 0x1000; // 4KB
 const ENTRIES_PER_TABLE = 1024;
 const PAGES_PER_TABLE = 1024; // Each PT covers 4MB
@@ -71,6 +67,15 @@ export class PageTableManager {
     initialize(totalMemoryBytes: number, win9x = false): void {
         const mem = this.getMemory();
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+
+        // The tables must stay inside their reserved window: anything else means the
+        // layout moved under us and the PTEs would land in some other region's memory.
+        const ptEnd = PAGE_TABLES_ADDR + FULL_PD_ENTRIES * PAGE_SIZE;
+        if (PAGE_DIR_ADDR < MEM_PAGETABLE_BASE || ptEnd > MEM_PAGETABLE_BASE + MEM_PAGETABLE_SIZE) {
+            throw new Error(
+                `PageTableManager: tables 0x${PAGE_DIR_ADDR.toString(16)}-0x${ptEnd.toString(16)} ` +
+                `outside reserved window 0x${MEM_PAGETABLE_BASE.toString(16)}+0x${MEM_PAGETABLE_SIZE.toString(16)}`);
+        }
 
         // Zero page directory (4KB)
         mem.fill(0, PAGE_DIR_ADDR, PAGE_DIR_ADDR + PAGE_SIZE);
