@@ -192,6 +192,22 @@ export default defineConfig({
     strictPort: true,
     ...useSsl ? { https: true } : {},
     hmr: false,
+    watch: {
+      // Chokidar registers one fs.watch (one OS handle) PER FILE, and its default
+      // ignores are only .git/node_modules/the cache dir — so it was watching
+      // logs/ (80k+ files, appended continuously by the dev sidecar), agent
+      // worktrees under .claude/, and tmp/. Registering those ~90k watches
+      // saturates the libuv threadpool for minutes after listen: measured 147 s
+      // (node) / 78 s (bun) until the first transform answered, with a single
+      // fs read of main.tsx queued for 71 s — while the whole 798-module graph
+      // transforms in under 1 s once the watcher settles. None of these trees
+      // contain importable modules; ignoring them is pure win.
+      // Forward slashes: picomatch treats backslashes as escapes, so a
+      // path.resolve() result would never match on Windows.
+      ignored: ["logs", ".claude", "tmp", ".ghidra-home"].map(
+        (d) => path.resolve(__dirname, d).replace(/\\/g, "/") + "/**"
+      )
+    },
     headers: coopCoepHeaders
   },
   preview: {
@@ -234,18 +250,15 @@ export default defineConfig({
     // re-hit the Windows failure where its output is left in `node_modules/.vite-temp` and
     // never renamed into `.vite/deps`, after which every dep request 504s. Once per
     // dependency change is survivable; every start was not.
-    // `noDiscovery` skips the dependency SCANNER entirely, and the scanner is the cost:
-    // it crawls the whole import graph from index.html, which here means ~700 worker
-    // modules that import no npm package at all (the worker's only bare specifier is
-    // `v86`, and that is an alias to a local file). Measured before: 116 s cold, 89 s
-    // warm — the warm case still paid for the crawl, which is why a dependency cache
-    // alone barely helped.
+    // Listing what we import keeps the scanner from discovering a dep mid-session, which
+    // would re-optimize and then need a page reload it cannot request (HMR is off below).
+    // These are every bare import in the browser tree; the typescript/fs/path hits under
+    // src/ belong to tooling no browser entry reaches.
     //
-    // The price is that `include` must be COMPLETE: nothing is auto-discovered, and a
-    // CJS package left out will not work in dev. These four are every bare import in the
-    // browser tree (the `typescript`/`fs`/`path` hits under src/ are tooling, not part of
-    // any browser entry). Add here when adding a dependency.
-    noDiscovery: true,
-    include: ["react", "react-dom", "react-dom/client", "@phosphor-icons/react", "pako"]
+    // `noDiscovery: true` was tried here and REVERTED: the measurement that appeared to
+    // show a 12 s cold start turned out to be an old server answering, and while it was
+    // set the worker's `pako` request 504'd. Startup cost is still unexplained — see
+    // docs/development.md.
+    include: ["react", "react-dom", "@phosphor-icons/react", "pako"]
   }
 });
