@@ -59,6 +59,7 @@ import { recordSurfaceOp } from "./surface-op-log";
 import { propagateSurfaceStateToRegistry } from "./d3d/texture-manager";
 import { thunkChecksumManager } from "../../core/memory/thunk-checksum";
 import { leaseRegistry } from "../../core/memory/lease-registry";
+import { toPlainGuestMemory } from "../../core/memory/guest-memory";
 import { Mem } from "../../core/memory/mem-accessor";
 import { lockTracker } from "../../core/lock-tracker";
 import { getLastGetDIBitsBuffer } from "../gdi32/painting";
@@ -92,6 +93,7 @@ const captureActiveLeaseSnapshot = (
     clearActiveLeaseSnapshot(state);
     const lease = leaseRegistry.validateLease(leaseId);
     if (!lease || lease.perms === "r") return;
+    mem = toPlainGuestMemory(mem);
     if (lease.base < 0 || lease.size <= 0 || lease.base + lease.size > mem.length) return;
 
     const snapshot = new Uint8Array(lease.size);
@@ -99,6 +101,40 @@ const captureActiveLeaseSnapshot = (
     state.activeLeaseSnapshot = snapshot;
     state.activeLeaseSnapshotBase = lease.base;
     state.activeLeaseSnapshotSize = lease.size;
+};
+
+/**
+ * Byte-identical? Word-wide where alignment allows. A staging-texture lease is the
+ * whole surface (256×256×32bpp = 256 KiB is typical), and the loop only exits early
+ * when it finds a difference — a sprite whose leading rows stay transparent is scanned
+ * in full. Both operands must be plain views: per-element reads through v86's guest
+ * Proxy cost ~200ns each (guest-memory.ts), which is what made this the whole cost of
+ * Unlock. The scan is synchronous and executes no guest code, so the plain view of
+ * `mem` cannot go stale under it.
+ */
+const leaseRegionUnchanged = (
+    mem: Uint8Array,
+    base: number,
+    snapshot: Uint8Array,
+    size: number
+): boolean => {
+    const byteBase = mem.byteOffset + base;
+    if ((byteBase & 3) === 0 && (snapshot.byteOffset & 3) === 0) {
+        const words = size >>> 2;
+        const src32 = new Uint32Array(mem.buffer, byteBase, words);
+        const snap32 = new Uint32Array(snapshot.buffer, snapshot.byteOffset, words);
+        for (let i = 0; i < words; i++) {
+            if (src32[i] !== snap32[i]) return false;
+        }
+        for (let i = words << 2; i < size; i++) {
+            if (mem[base + i] !== snapshot[i]) return false;
+        }
+        return true;
+    }
+    for (let i = 0; i < size; i++) {
+        if (mem[base + i] !== snapshot[i]) return false;
+    }
+    return true;
 };
 
 const consumeActiveLeaseWriteState = (
@@ -132,6 +168,7 @@ const consumeActiveLeaseWriteState = (
     const snapshot = state.activeLeaseSnapshot;
     const base = state.activeLeaseSnapshotBase;
     const size = state.activeLeaseSnapshotSize;
+    mem = toPlainGuestMemory(mem);
     if (!snapshot || base === undefined || size === undefined ||
         base !== lease.base || size !== lease.size ||
         base < 0 || size <= 0 || base + size > mem.length) {
@@ -139,13 +176,7 @@ const consumeActiveLeaseWriteState = (
         return { hadLease: true, wasReadOnly: false, changed: true };
     }
 
-    let changed = false;
-    for (let i = 0; i < size; i++) {
-        if (mem[base + i] !== snapshot[i]) {
-            changed = true;
-            break;
-        }
-    }
+    const changed = !leaseRegionUnchanged(mem, base, snapshot, size);
     clearActiveLeaseSnapshot(state);
     return { hadLease: true, wasReadOnly: false, changed };
 };
@@ -1364,7 +1395,9 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         if (obj) {
             const state = obj.getState();
             const isTexture = (state.caps & DDSCAPS_TEXTURE) !== 0;
+            profiler.start("Unlock:leaseCompare");
             const leaseWriteState = consumeActiveLeaseWriteState(mem, state);
+            profiler.end("Unlock:leaseCompare");
             const wasReadOnly = leaseWriteState.wasReadOnly;
             const didWritePixels = leaseWriteState.changed;
             const previousSurfaceEverWritten = state.surfaceEverWritten;

@@ -1186,6 +1186,10 @@ export function convertRGBAToSurface(
     format: FormatInfo,
     options?: { clearAlphaBit?: boolean }
 ): void {
+    // Write leg of convertSurfaceToRGBA — same argument, same fix: every branch below
+    // stores `mem[i]` per pixel (2–4 Proxy set-traps per texel), and the loops execute
+    // no guest code, so the plain view cannot be invalidated under them.
+    mem = toPlainGuestMemory(mem);
     const pixelFormat = detectPixelFormat(format);
     const bytesPerPixel = Math.max(1, Math.floor(format.bpp / 8));
     const totalSize = pitch * height;
