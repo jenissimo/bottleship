@@ -130,6 +130,52 @@ export function registerTextureCommands(svc: HarnessService): void {
         return { ptr: "0x" + ptr.toString(16), w: width, h: height, bpp, distinct: hist.size, top };
     });
 
+    /** surfaceScan({caps?, onlyEmpty?}) — one line per DDraw surface saying whether its
+     *  GUEST PIXEL MEMORY holds anything, next to the state that should reflect it
+     *  (version / gpuDirty / everLocked). Answers "the game created and bound N textures
+     *  — which of them ever received CPU-side pixels?" in one call instead of N
+     *  dumpSurface round trips.
+     *
+     *  `empty` is about the CPU copy ONLY. A GPU-authored surface (a render target, or
+     *  one the guest painted through GetDC/StretchDIBits) legitimately reads empty while
+     *  showing a full picture — cross-check those with dumpSurface, which reads the GPU
+     *  texture. The pair is the useful signal: empty on both = never filled; empty here
+     *  but not on the GPU = GPU-authored; filled here with gpuDirty = filled but not yet
+     *  uploaded. */
+    svc.register("surfaceScan", (args) => {
+        const opts = (args[0] ?? {}) as { caps?: number; onlyEmpty?: boolean };
+        const memory = guestMem();
+        if (!memory) throw new HarnessError("guest memory unavailable (no process loaded?)", HarnessErrorCode.NO_PROCESS);
+        const rows: unknown[] = [];
+        let empty = 0;
+        for (const s of serializeSurfaces() as any[]) {
+            if (opts.caps !== undefined && (s.caps & opts.caps) !== opts.caps) continue;
+            const ptr = s.ptr >>> 0;
+            const bytesPer = Math.max(1, s.bpp >> 3);
+            // Sample every 4th row; a texture the guest filled is non-zero long before the end.
+            let nonZero = 0;
+            let sampled = 0;
+            for (let y = 0; y < s.height && nonZero === 0; y += 4) {
+                let off = ptr + y * s.pitch;
+                if (off < 0 || off + s.width * bytesPer > memory.length) break;
+                for (let x = 0; x < s.width; x++, off += bytesPer) {
+                    sampled++;
+                    for (let b = 0; b < bytesPer; b++) if (memory[off + b] !== 0) { nonZero++; break; }
+                    if (nonZero) break;
+                }
+            }
+            const isEmpty = sampled > 0 && nonZero === 0;
+            if (isEmpty) empty++;
+            if (opts.onlyEmpty && !isEmpty) continue;
+            rows.push({
+                ptr: "0x" + ptr.toString(16), size: `${s.width}x${s.height}`, bpp: s.bpp,
+                caps: "0x" + (s.caps >>> 0).toString(16), mode: s.mode,
+                empty: isEmpty, version: s.version, gpuDirty: s.gpuDirty, everLocked: s.everLocked,
+            });
+        }
+        return { total: rows.length, empty, surfaces: rows };
+    });
+
     /** surfacePixels(sel) — the existing luminance/grid stats (no PNG). */
     svc.register("surfacePixels", async (args) => {
         const ptr = resolvePtr(args[0] ?? "primary");
