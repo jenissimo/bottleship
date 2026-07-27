@@ -216,7 +216,24 @@ export default defineConfig({
     copyPublicDir: false
   },
   optimizeDeps: {
-    force: true, // Force re-optimization of dependencies to avoid stale cache issues
-    include: ["react", "react-dom"]
+    // Pre-bundling is not optional here: @phosphor-icons/react is a 4543-module barrel and
+    // react/react-dom are CJS needing an ESM wrapper, so unbundled a single dev page load
+    // would be thousands of requests.
+    //
+    // List what we IMPORT, and only that — `include` forces esbuild to bundle a package
+    // whole, so naming an unused one is pure cost. (lucide-react is a dependency with zero
+    // imports in the tree; it belongs out of package.json, not in here.)
+    //
+    // A dep the scanner discovers mid-session triggers a re-optimization, after which Vite
+    // must tell the browser to reload — over the HMR channel, which is disabled below.
+    // Without that signal the page keeps requesting the previous `?v=<hash>` URLs, which no
+    // longer exist: the server looks alive (static and cached modules still answer 200)
+    // while every fresh module hangs.
+    //
+    // No `force`. It discarded a VALID cache on every start, so the optimizer re-ran — and
+    // re-hit the Windows failure where its output is left in `node_modules/.vite-temp` and
+    // never renamed into `.vite/deps`, after which every dep request 504s. Once per
+    // dependency change is survivable; every start was not.
+    include: ["react", "react-dom", "@phosphor-icons/react", "pako"]
   }
 });
