@@ -33,6 +33,18 @@ const warnedUnknownFormats = new Set<PixelFormat>();
 const WORKGROUP_SIZE_X = 16;
 const WORKGROUP_SIZE_Y = 16;
 
+/** GPU objects a single convertFromTexture readback needs, reused across calls. */
+interface ReverseConvertResources {
+    outputBuffer: GPUBuffer;
+    paramsBuffer: GPUBuffer;
+    stagingBuffer: GPUBuffer;
+    bindGroup: GPUBindGroup;
+    /** A readback currently owns this set. */
+    busy: boolean;
+    /** In the pool (false ⇒ throwaway set, destroyed on release). */
+    pooled: boolean;
+}
+
 // ============================================================================
 // REVERSE CONVERSION SHADERS (GPU Texture → Surface Format)
 // Used for fast GPU→CPU readback with format conversion on GPU
@@ -668,6 +680,10 @@ export class TextureConverter {
 
     // Buffers to destroy after next queue.submit() (avoid "used in submit while destroyed")
     private pendingDestroyBuffers: GPUBuffer[] = [];
+
+    // Reusable GPU objects for convertFromTexture, per source texture and readback shape.
+    // Keyed by texture so a destroyed surface's set becomes unreachable with it.
+    private reverseResources = new WeakMap<GPUTexture, Map<string, ReverseConvertResources>>();
 
     // Debug mode: 0 = normal, 1 = format, 2 = raw, 3 = UV grid
     private debugMode: number = 0;
@@ -1549,6 +1565,80 @@ fn main(@builtin(global_invocation_id) global_id: vec3u) {
         return pipeline;
     }
 
+    /** Reusable GPU objects for one (texture, format, size, pitch) readback shape.
+     *  `pooled` is false for the set handed out while another readback of the same
+     *  shape is still holding the pooled one — that set is destroyed on release. */
+    private acquireReverseResources(
+        texture: GPUTexture,
+        textureFormat: GPUTextureFormat,
+        targetFormat: PixelFormat,
+        width: number,
+        height: number,
+        pitch: number,
+        outputBufferSize: number
+    ): ReverseConvertResources {
+        const key = `${textureFormat}|${targetFormat}|${width}x${height}|${pitch}|${outputBufferSize}`;
+        let perTexture = this.reverseResources.get(texture);
+        if (!perTexture) {
+            perTexture = new Map();
+            this.reverseResources.set(texture, perTexture);
+        }
+        const existing = perTexture.get(key);
+        if (existing && !existing.busy) {
+            existing.busy = true;
+            return existing;
+        }
+
+        const outputBuffer = this.device.createBuffer({
+            size: outputBufferSize,
+            // COPY_DST required for the encoder-side zero clear of 16-bit atomic targets.
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+        });
+        const paramsBuffer = this.device.createBuffer({
+            size: 16, // 4 x u32
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        this.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([width, height, pitch, 0]));
+        const stagingBuffer = this.device.createBuffer({
+            size: outputBufferSize,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
+        const bindGroup = this.device.createBindGroup({
+            layout: this.getReverseBindGroupLayout(),
+            entries: [
+                { binding: 0, resource: { buffer: paramsBuffer } },
+                { binding: 1, resource: texture.createView() },
+                { binding: 2, resource: { buffer: outputBuffer } },
+            ],
+        });
+
+        const created: ReverseConvertResources = {
+            outputBuffer,
+            paramsBuffer,
+            stagingBuffer,
+            bindGroup,
+            busy: true,
+            pooled: !existing, // a busy incumbent keeps the pool slot
+        };
+        if (created.pooled) perTexture.set(key, created);
+        return created;
+    }
+
+    /** Unmap the staging buffer and either return the set to the pool or destroy it. */
+    private releaseReverseResources(res: ReverseConvertResources): void {
+        try {
+            res.stagingBuffer.unmap();
+        } catch {
+            // Never mapped (failure before mapAsync) — nothing to unmap.
+        }
+        res.busy = false;
+        if (!res.pooled) {
+            res.stagingBuffer.destroy();
+            res.outputBuffer.destroy();
+            res.paramsBuffer.destroy();
+        }
+    }
+
     /**
      * Convert GPU texture to surface format using compute shader.
      * This is MUCH faster than CPU conversion for readback operations.
@@ -1574,7 +1664,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3u) {
         height: number,
         pitch: number
     ): Promise<Uint8Array | null> {
-        profiler.start("TextureConverter.convertFromTexture");
+        // Token span: this method awaits the GPU, so concurrent readbacks would
+        // corrupt each other under the Map-keyed start/end.
+        const convertToken = profiler.startToken("TextureConverter.convertFromTexture");
+        let acquired: ReverseConvertResources | null = null;
 
         try {
             const bytesPerPixel = targetFormat === PixelFormat.RGB565 || targetFormat === PixelFormat.RGB555
@@ -1589,45 +1682,31 @@ fn main(@builtin(global_invocation_id) global_id: vec3u) {
                 : pixelCount;
             const outputBufferSize = wordCount * 4; // Always 32-bit words
 
-            // Create output storage buffer
-            const outputBuffer = this.device.createBuffer({
-                size: outputBufferSize,
-                // COPY_DST required because we zero-init via queue.writeBuffer for 16-bit atomics
-                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-            });
+            // The reverse shader writes pixels TIGHTLY PACKED (output index = y*width + x),
+            // i.e. the output buffer has a row stride of `width * bytesPerPixel`, NOT `pitch`.
+            // Stage exactly that tight payload, then de-pad into the pitch-strided surface buffer.
+            const tightRowBytes = width * bytesPerPixel;
 
-            // For 16-bit atomic writes, we need to zero-initialize the buffer
-            if (bytesPerPixel === 2) {
-                const zeros = new Uint32Array(wordCount);
-                this.queue.writeBuffer(outputBuffer, 0, zeros);
-            }
-
-            // Create params uniform buffer
-            const paramsBuffer = this.device.createBuffer({
-                size: 16, // 4 x u32
-                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-            });
-            const paramsData = new Uint32Array([width, height, pitch, 0]);
-            this.queue.writeBuffer(paramsBuffer, 0, paramsData);
-
-            // Create texture view
-            const textureView = texture.createView();
-
-            // Get pipeline
+            // Pooled per (texture, shape): the three buffers + bind group + view are
+            // identical for every readback of the same surface at the same size, so
+            // creating and destroying them per call was pure churn.
+            const resources = this.acquireReverseResources(
+                texture, textureFormat, targetFormat, width, height, pitch, outputBufferSize
+            );
+            acquired = resources;
+            const { outputBuffer, stagingBuffer, bindGroup } = resources;
             const pipeline = this.getOrCreateReversePipeline(targetFormat, textureFormat);
-
-            // Create bind group
-            const bindGroup = this.device.createBindGroup({
-                layout: this.getReverseBindGroupLayout(),
-                entries: [
-                    { binding: 0, resource: { buffer: paramsBuffer } },
-                    { binding: 1, resource: textureView },
-                    { binding: 2, resource: { buffer: outputBuffer } },
-                ],
-            });
 
             // Encode compute pass
             const encoder = this.device.createCommandEncoder();
+
+            // 16-bit targets pack two pixels per word with atomic ORs, so the output must
+            // start zeroed. Clearing on the GPU avoids re-uploading a whole surface of
+            // zeros through queue.writeBuffer on every readback.
+            if (bytesPerPixel === 2) {
+                encoder.clearBuffer(outputBuffer, 0, outputBufferSize);
+            }
+
             const pass = encoder.beginComputePass();
             pass.setPipeline(pipeline);
             pass.setBindGroup(0, bindGroup);
@@ -1637,30 +1716,17 @@ fn main(@builtin(global_invocation_id) global_id: vec3u) {
             pass.dispatchWorkgroups(workgroupsX, workgroupsY);
             pass.end();
 
-            // The reverse shader writes pixels TIGHTLY PACKED (output index = y*width + x),
-            // i.e. the output buffer has a row stride of `width * bytesPerPixel`, NOT `pitch`.
-            // Stage exactly that tight payload, then de-pad into the pitch-strided surface buffer.
-            const tightRowBytes = width * bytesPerPixel;
-            const stagingBuffer = this.device.createBuffer({
-                size: outputBufferSize,
-                usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-            });
-
             // Copy output to staging
             encoder.copyBufferToBuffer(outputBuffer, 0, stagingBuffer, 0, outputBufferSize);
 
             // Submit
             this.queue.submit([encoder.finish()]);
 
-            // Wait for GPU to finish
-            profiler.start("convertFromTexture:gpuWait");
-            await this.queue.onSubmittedWorkDone();
-            profiler.end("convertFromTexture:gpuWait");
-
-            // Map and read staging buffer
-            profiler.start("convertFromTexture:mapAsync");
+            // mapAsync already resolves after the submitted work that writes this buffer;
+            // an onSubmittedWorkDone() fence in front of it waits on the same event twice.
+            const mapAsyncToken = profiler.startToken("convertFromTexture:mapAsync");
             await stagingBuffer.mapAsync(GPUMapMode.READ);
-            profiler.end("convertFromTexture:mapAsync");
+            profiler.endToken(mapAsyncToken);
 
             const mapped = new Uint8Array(stagingBuffer.getMappedRange());
             // Output is pitch*height so the caller can write it straight into surface
@@ -1677,13 +1743,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3u) {
                 }
             }
 
-            // Cleanup
-            stagingBuffer.unmap();
-            stagingBuffer.destroy();
-            outputBuffer.destroy();
-            paramsBuffer.destroy();
+            // Return the pooled set (unmap only — the buffers outlive the call).
+            this.releaseReverseResources(resources);
 
-            profiler.end("TextureConverter.convertFromTexture");
+            profiler.endToken(convertToken);
 
             Logger.log(LogCategory.DDRAW,
                 `TextureConverter.convertFromTexture: ${width}x${height} ${textureFormat} → ` +
@@ -1692,7 +1755,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3u) {
             return result;
         } catch (e) {
             Logger.warn(LogCategory.SYSTEM, `TextureConverter.convertFromTexture failed: ${e}`);
-            profiler.end("TextureConverter.convertFromTexture");
+            // Must free the pool slot: a set left `busy` forces every later readback of
+            // this surface onto throwaway buffers.
+            if (acquired) this.releaseReverseResources(acquired);
+            profiler.endToken(convertToken);
             return null;
         }
     }

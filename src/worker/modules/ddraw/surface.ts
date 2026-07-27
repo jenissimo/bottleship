@@ -54,7 +54,7 @@ import { isValidAddress, isSafeSurfaceAddress, overlapsThunkCode } from "../../c
 import { ComObjectFactory } from "../../core/com/base-com-object";
 
 import { convertRGBAToSurface, uploadToGPUTexture, convertSurfaceToRGBA } from "./gpu-texture-utils";
-import { setAuthorityCpu, setAuthorityGpu, markCpuSyncedFromGpu, syncActiveGdiContext, surfaceSyncManager, logSurfaceState, demoteSurfaceToCpu } from "./surface-sync";
+import { setAuthorityCpu, setAuthorityGpu, markCpuSyncedFromGpu, invalidateCpuSyncedVersion, syncActiveGdiContext, surfaceSyncManager, logSurfaceState, demoteSurfaceToCpu } from "./surface-sync";
 import { recordSurfaceOp } from "./surface-op-log";
 import { propagateSurfaceStateToRegistry } from "./d3d/texture-manager";
 import { thunkChecksumManager } from "../../core/memory/thunk-checksum";
@@ -988,7 +988,10 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
     // and IDirect3DTexture_Load.
     exports["IDirectDrawSurface7_Lock"] = (ctx, mem, args): ThunkResult | Promise<ThunkResult> => {
         const lockStart = performance.now();
-        profiler.start("Lock");
+        // Token span: this handler returns a Promise when a GPU readback is needed, so two
+        // Locks overlap across the await and a Map-keyed start/end would attribute one
+        // lock's start time to the other's end.
+        const lockToken = profiler.startToken("Lock");
         profiler.start("Lock:setup");
 
         const thisPtr = args[0];
@@ -1008,17 +1011,17 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         const obj = context.resourceProvider.getComObjectByAddress(thisPtr) as DirectDrawSurfaceObject | null;
         if (!obj) {
             profiler.end("Lock:setup");
-            profiler.end("Lock");
+            profiler.endToken(lockToken);
             return { value: E_FAIL, stackCleanup: 20 };
         }
         if (!lpDDSurfaceDesc) {
             profiler.end("Lock:setup");
-            profiler.end("Lock");
+            profiler.endToken(lockToken);
             return { value: E_POINTER, stackCleanup: 20 };
         }
         if (!isValidAddress(mem, lpDDSurfaceDesc, 4)) {
             profiler.end("Lock:setup");
-            profiler.end("Lock");
+            profiler.endToken(lockToken);
             return { value: E_POINTER, stackCleanup: 20 };
         }
 
@@ -1031,6 +1034,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         const isWriteOnly = (dwFlags & DDLOCK_WRITEONLY) !== 0;
         const isDiscard = (dwFlags & DDLOCK_DISCARDCONTENTS) !== 0;
 
+        profiler.start("Lock:gdiSync");
         const system = System.getInstance();
         const gdiContext = system.gdiContext;
         const hdc = gdiContext.getHDCBySurface(thisPtr);
@@ -1137,7 +1141,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                 `size=0x${estimatedSize.toString(16)} is not safe for surface use! ` +
                 `This would allow game to corrupt protected memory. surface=0x${thisPtr.toString(16)} size=${state.width}x${state.height}`);
             profiler.end("Lock:validation");
-            profiler.end("Lock");
+            profiler.endToken(lockToken);
             return { value: E_FAIL, stackCleanup: 20 };
         }
 
@@ -1147,7 +1151,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                 `IDirectDrawSurface7_Lock: CORRUPTED surfacePtr=0x${state.surfacePtr.toString(16)} detected, refusing to expose to game`
             );
             profiler.end("Lock:validation");
-            profiler.end("Lock");
+            profiler.endToken(lockToken);
             return { value: E_FAIL, stackCleanup: 20 };
         }
         profiler.end("Lock:validation");
@@ -1183,6 +1187,8 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                     `🚨 IDirectDrawSurface7_Lock: integer overflow in rect offset calculation! ` +
                     `rect.top=${rect.top} rect.left=${rect.left} pitch=${state.pitch} bpp=${bytesPerPixel} ` +
                     `offsetTop=0x${offsetTop.toString(16)} offsetLeft=0x${offsetLeft.toString(16)}`);
+                profiler.end("Lock:rectCalc");
+                profiler.endToken(lockToken);
                 return { value: E_FAIL, stackCleanup: 20 };
             }
 
@@ -1194,6 +1200,8 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                     `🚨 IDirectDrawSurface7_Lock: pointer addition overflow! ` +
                     `base=0x${state.surfacePtr.toString(16)} offsetTop=0x${offsetTop.toString(16)} ` +
                     `offsetLeft=0x${offsetLeft.toString(16)} result=0x${calculatedPtr.toString(16)}`);
+                profiler.end("Lock:rectCalc");
+                profiler.endToken(lockToken);
                 return { value: E_FAIL, stackCleanup: 20 };
             }
 
@@ -1206,7 +1214,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                     `size=0x${adjustedSize.toString(16)} is not safe for surface use! ` +
                     `base=0x${state.surfacePtr.toString(16)} rect=(${rect.left},${rect.top},${rect.right},${rect.bottom})`);
                 profiler.end("Lock:rectCalc");
-                profiler.end("Lock");
+                profiler.endToken(lockToken);
                 return { value: E_FAIL, stackCleanup: 20 };
             }
 
@@ -1219,7 +1227,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                     `IDirectDrawSurface7_Lock: adjusted surfacePtr overlaps protected region`
                 );
                 profiler.end("Lock:rectCalc");
-                profiler.end("Lock");
+                profiler.endToken(lockToken);
                 return { value: E_FAIL, stackCleanup: 20 };
             }
         }
@@ -1241,7 +1249,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                     `IDirectDrawSurface7_Lock: surfacePtr overlaps thunk region`
                 );
                 profiler.end("Lock:regions");
-                profiler.end("Lock");
+                profiler.endToken(lockToken);
                 return { value: E_FAIL, stackCleanup: 20 };
             }
         }
@@ -1263,7 +1271,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                 `This is a BUG in writeSurfaceDesc or desc.surfacePtr calculation! ` +
                 `surface=0x${thisPtr.toString(16)} lpDDSurfaceDesc=0x${lpDDSurfaceDesc.toString(16)} ` +
                 `desc.surfacePtr=0x${desc.surfacePtr.toString(16)} writtenLpSurface=0x${writtenLpSurface.toString(16)}`);
-            profiler.end("Lock");
+            profiler.endToken(lockToken);
             return { value: E_FAIL, stackCleanup: 20 };
         }
 
@@ -1334,17 +1342,17 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         // Kept for parity with the other _Unlock validation gates. Runs fire-and-forget so
         // this handler stays synchronous; violations still log an error.
         if (ENABLE_LOCK_THUNK_VALIDATION) {
-            profiler.start("Lock:thunkValidation");
+            const validationToken = profiler.startToken("Lock:thunkValidation");
             void Promise.resolve(thunkChecksumManager.validateThunkRegion(mem, "IDirectDrawSurface7_Lock"))
                 .then((valid) => {
-                    profiler.end("Lock:thunkValidation");
+                    profiler.endToken(validationToken);
                     if (!valid) {
                         Logger.error(LogCategory.DDRAW, "🚨 Thunk corruption detected AFTER Lock!");
                     }
                 });
         }
 
-        profiler.end("Lock");
+        profiler.endToken(lockToken);
 
         // Record lock event for variance diagnostics
         if (frameVarianceDiagnostics.isEnabled()) {
@@ -2135,6 +2143,9 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                                         // Invalidate ephemeral rgbaScratch cache
                                         otherState.rgbaScratch = undefined;
                                         otherState.rgbaScratchVersion = undefined;
+                                        // version was ASSIGNED from a sibling, so it can land on a
+                                        // number this surface already read back — drop the memo.
+                                        invalidateCpuSyncedVersion(otherState);
                                     }
                                     if (gpuTex && otherState.gpuTexture !== gpuTex) {
                                         otherState.gpuTexture = gpuTex;
@@ -2207,6 +2218,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                                             otherState.gpuDirty = true; // CPU writes, mark GPU as stale
                                             otherState.version = state.version;
                                             otherState.surfaceEverWritten = true;
+                                            invalidateCpuSyncedVersion(otherState);
                                         }
                                         // BitmapTextureSurface doesn't need authority updates (immutable)
                                     }

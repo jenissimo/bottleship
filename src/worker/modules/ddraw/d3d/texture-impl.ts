@@ -14,7 +14,7 @@ import {
     isBitmapTexture,
 } from "../com-objects";
 import { DDSCAPS_SYSTEMMEMORY, DDSCAPS_ALLOCONLOAD } from "../constants";
-import { setAuthorityCpu, setAuthorityGpu, syncActiveGdiContext, surfaceSyncManager } from "../surface-sync";
+import { setAuthorityCpu, setAuthorityGpu, invalidateCpuSyncedVersion, syncActiveGdiContext, surfaceSyncManager } from "../surface-sync";
 import { propagateSurfaceStateToRegistry } from "./texture-manager";
 import { D3DExports, D3D_OK, D3DERR_INVALIDCALL, TextureManager } from "./types";
 
@@ -651,6 +651,9 @@ export const createTextureExports = (
                     if (isRenderSurface(otherState)) {
                         otherState.gpuDirty = isRenderSurface(dstState) ? dstState.gpuDirty : true;
                         otherState.version = versionAfter;
+                        // version was ASSIGNED, not incremented — the readback memo keys on
+                        // this surface's own version numbering and must be dropped.
+                        invalidateCpuSyncedVersion(otherState);
                         // lastUploadVersion stays as-is until markGpuSyncedFromCpu
                     }
                 }

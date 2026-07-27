@@ -316,6 +316,14 @@ export interface RenderSurface extends BaseSurfaceState {
     rgbaScratch?: Uint8Array;
     /** Version of data currently in rgbaScratch. */
     rgbaScratchVersion?: number;
+
+    /** Version whose GPU content is already present in guest memory at surfacePtr
+     *  (set when a GPU→CPU readback completes). needsCPUSync returns false while it
+     *  matches `version`, so N Locks between two GPU writes cost ONE round trip.
+     *  Every writer bumps `version`, which invalidates this by construction; the paths
+     *  that assign `version` across surfaces (flip rotation, sibling propagation) must
+     *  carry or clear it explicitly. */
+    cpuSyncedVersion?: number;
 }
 
 /**

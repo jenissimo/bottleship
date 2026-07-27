@@ -17,6 +17,7 @@
 import type { HarnessService } from "../service";
 import { frameProfiler, type BadFrameCapture, type FrameSample } from "../../core/frame-profiler";
 import { profiler } from "../../core/profiler";
+import { readbackCounters } from "../../modules/ddraw/surface-sync";
 
 /** Compact a category record to ms (drop zero buckets) for terse output. */
 function categoriesMs(categories: Record<string, number>): Record<string, number> {
@@ -120,6 +121,25 @@ export function registerPerfCommands(svc: HarnessService): void {
     svc.register("perfThunks", (args) => {
         const opts = (args[0] ?? {}) as { top?: number; filter?: string };
         return frameProfiler.getThunkReport(opts.top ?? 20, opts.filter);
+    });
+
+    /** readbackStats({reset?}) — GPU→CPU surface readback accounting. Duration hides the
+     *  cost model; the honest metric is `roundTrips` (one full CPU/GPU serialisation each)
+     *  measured against `calls` (locks that wanted the pixels). `memoHits` counts the ones
+     *  the cpuSyncedVersion memo removed; `redundant` MUST be 0 — it means two readbacks of
+     *  the same surface at the same version both reached the GPU, i.e. the memo eroded.
+     *  Per-frame rate: readbackStats({reset:true}) → tickFrames(N) → readbackStats(). */
+    svc.register("readbackStats", (args) => {
+        const opts = (args[0] ?? {}) as { reset?: boolean };
+        const snapshot = {
+            calls: readbackCounters.calls,
+            roundTrips: readbackCounters.roundTrips,
+            memoHits: readbackCounters.memoHits,
+            scratchHits: readbackCounters.scratchHits,
+            redundant: readbackCounters.redundant,
+        };
+        if (opts.reset) readbackCounters.reset();
+        return snapshot;
     });
 
     /** perfStats() — latest + average frame sample (no per-frame thunk detail). */

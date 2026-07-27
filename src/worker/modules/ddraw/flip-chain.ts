@@ -50,6 +50,7 @@ interface SurfaceStorage {
     dirtyRegion?: Rect;
     rgbaScratch?: Uint8Array;
     rgbaScratchVersion?: number;
+    cpuSyncedVersion?: number;
 }
 
 function takeStorage(s: DirectDrawSurfaceState): SurfaceStorage {
@@ -79,6 +80,7 @@ function takeStorage(s: DirectDrawSurfaceState): SurfaceStorage {
         st.dirtyRegion = s.dirtyRegion;
         st.rgbaScratch = s.rgbaScratch;
         st.rgbaScratchVersion = s.rgbaScratchVersion;
+        st.cpuSyncedVersion = s.cpuSyncedVersion;
     }
     return st;
 }
@@ -108,6 +110,7 @@ function putStorage(s: DirectDrawSurfaceState, st: SurfaceStorage): void {
         s.dirtyRegion = st.dirtyRegion;
         s.rgbaScratch = st.rgbaScratch;
         s.rgbaScratchVersion = st.rgbaScratchVersion;
+        s.cpuSyncedVersion = st.cpuSyncedVersion;
     }
 }
 
