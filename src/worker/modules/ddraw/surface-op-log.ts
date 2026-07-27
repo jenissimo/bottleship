@@ -30,8 +30,14 @@ export interface SurfaceOpRecord {
     dstVersion: number;
 }
 
+// A real ring: fixed slots plus a write index. The obvious `push` + `shift` costs O(n)
+// per record once full, and at 200k slots and thousands of ops per second that makes the
+// instrument dominate the frame it is supposed to be measuring — the timing it reports
+// would be its own.
 let capacity = 0;
-let ring: SurfaceOpRecord[] = [];
+let ring: (SurfaceOpRecord | undefined)[] = [];
+let head = 0;
+let filled = 0;
 let seq = 0;
 
 /** Zero-cost guard for the hot paths: a single boolean test when disarmed. */
@@ -41,14 +47,24 @@ export function surfaceOpsArmed(): boolean {
 
 export function armSurfaceOps(n: number): { armed: number } {
     capacity = Math.max(0, Math.min(n | 0, 200_000));
-    ring = [];
+    ring = new Array<SurfaceOpRecord | undefined>(capacity);
+    head = 0;
+    filled = 0;
     seq = 0;
     return { armed: capacity };
 }
 
+/** Oldest-first, so a caller reads the window in the order the ops happened. */
 export function takeSurfaceOps(): SurfaceOpRecord[] {
-    const out = ring;
-    ring = [];
+    const out: SurfaceOpRecord[] = [];
+    const start = filled === capacity ? head : 0;
+    for (let i = 0; i < filled; i++) {
+        const r = ring[(start + i) % capacity];
+        if (r) out.push(r);
+    }
+    ring = new Array<SurfaceOpRecord | undefined>(capacity);
+    head = 0;
+    filled = 0;
     return out;
 }
 
@@ -66,9 +82,8 @@ export function recordSurfaceOp(
     srcRect: Rect | null
 ): void {
     if (capacity <= 0) return;
-    if (ring.length >= capacity) ring.shift();
     const render = isRenderSurface(dst);
-    ring.push({
+    ring[head] = {
         seq: seq++,
         op,
         path,
@@ -79,5 +94,7 @@ export function recordSurfaceOp(
         dstMode: render ? dst.mode : "bitmap",
         dstGpuDirty: render ? dst.gpuDirty : false,
         dstVersion: render ? dst.version : -1,
-    });
+    };
+    head = (head + 1) % capacity;
+    if (filled < capacity) filled++;
 }
