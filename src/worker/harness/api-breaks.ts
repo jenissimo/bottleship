@@ -13,6 +13,15 @@
 import { harnessBus } from "./event-bus";
 import { readCallSnapshot } from "./serialize";
 
+/** Break only when a stack argument equals a value — `{ index, value }`, index 0-based
+ *  over the cdecl/stdcall args at [ESP+4].. . Without it a breakpoint on a hot API
+ *  (LoadString, Blt, SendMessage) fires on the first of hundreds of uninteresting
+ *  calls and never on the one you are actually hunting. */
+export interface ApiArgFilter {
+    index: number;
+    value: number;
+}
+
 interface ApiBreakEntry {
     id: number;
     pattern: string;
@@ -20,6 +29,7 @@ interface ApiBreakEntry {
     runId: number | null;
     continuous: boolean;
     hits: number;
+    argEq?: ApiArgFilter;
     onHit?: (snapshot: unknown) => void;
 }
 
@@ -40,7 +50,7 @@ class ApiBreakRegistry {
     private entries: ApiBreakEntry[] = [];
     private nextId = 1;
 
-    arm(pattern: string, opts: { runId?: number | null; continuous?: boolean; onHit?: (s: unknown) => void } = {}): number {
+    arm(pattern: string, opts: { runId?: number | null; continuous?: boolean; argEq?: ApiArgFilter; onHit?: (s: unknown) => void } = {}): number {
         const id = this.nextId++;
         this.entries.push({
             id,
@@ -49,6 +59,7 @@ class ApiBreakRegistry {
             runId: opts.runId ?? null,
             continuous: !!opts.continuous,
             hits: 0,
+            argEq: opts.argEq,
             onHit: opts.onHit,
         });
         this.active = true;
@@ -81,8 +92,12 @@ class ApiBreakRegistry {
         // Iterate a copy so a one-shot disarm during the loop is safe.
         for (const e of [...this.entries]) {
             if (!e.regex.test(thunkName)) continue;
-            e.hits++;
             if (snapshot === undefined) snapshot = readCallSnapshot(thunkName, eip, esp);
+            if (e.argEq) {
+                const args = (snapshot as { args?: number[] }).args ?? [];
+                if ((args[e.argEq.index] >>> 0) !== (e.argEq.value >>> 0)) continue;
+            }
+            e.hits++;
             harnessBus.emit("apiBreak", snapshot, e.runId);
             if (e.onHit) e.onHit(snapshot);
             if (!e.continuous) this.disarm(e.id);

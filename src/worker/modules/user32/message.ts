@@ -1312,7 +1312,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
                         Logger.log(LogCategory.USER32, `SendMessage WM_SETTEXT hwnd=0x${hWnd.toString(16)} -> "${targetWindow.title}"`);
                         // Sync tab title for top-level windows (matches SetWindowTextA/W behavior)
                         if (!targetWindow.parent) {
-                            System.getInstance().notifyWindowTitle(targetWindow.title);
+                            System.getInstance().notifyWindowTitle(targetWindow.title, 'WM_SETTEXT');
                         }
                     }
                     return 1;

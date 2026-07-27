@@ -781,7 +781,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         const windowInfo = createInternal(className, windowName, dwStyle, dwExStyle, X, Y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam);
         if (!windowInfo) return 0;
         if (windowName && !hWndParent) {
-            System.getInstance().notifyWindowTitle(windowName);
+            System.getInstance().notifyWindowTitle(windowName, 'CreateWindowEx');
         }
 
         return fireCreateWindowCallbacks(ctx, windowInfo, lpParam, hInstance, hMenu, hWndParent, dwStyle, lpWindowName, lpClassName, dwExStyle, 'CreateWindowExA');
@@ -809,7 +809,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         const windowInfo = createInternal(className, windowName, dwStyle, dwExStyle, X, Y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam);
         if (!windowInfo) return 0;
         if (windowName && !hWndParent) {
-            System.getInstance().notifyWindowTitle(windowName);
+            System.getInstance().notifyWindowTitle(windowName, 'CreateWindowEx');
         }
 
         return fireCreateWindowCallbacks(ctx, windowInfo, lpParam, hInstance, hMenu, hWndParent, dwStyle, lpWindowName, lpClassName, dwExStyle, 'CreateWindowExW');

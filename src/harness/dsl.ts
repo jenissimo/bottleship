@@ -156,7 +156,8 @@ export class HarnessChain {
     breakOn(eip: number | string, opts?: { continuous?: boolean; pause?: boolean }): this { return this.pushTimed("breakOn", [eip, opts], 0); }
     breakOnExport(name: string, opts?: { continuous?: boolean; pause?: boolean }): this { return this.pushTimed("breakOnExport", [name, opts], 0); }
     breakOnSymbol(name: string, opts?: { continuous?: boolean; pause?: boolean }): this { return this.pushTimed("breakOnSymbol", [name, opts], 0); }
-    breakOnApi(pattern: string, opts?: { continuous?: boolean }): this { return this.pushTimed("breakOnApi", [pattern, opts], 0); }
+    /** `argEq` breaks only when a stack argument matches — the way to hit ONE call of a hot API. */
+    breakOnApi(pattern: string, opts?: { continuous?: boolean; argEq?: { index: number; value: number } }): this { return this.pushTimed("breakOnApi", [pattern, opts], 0); }
     watchMem(addr: number | string, opts?: { onWrite?: boolean }): this { return this.push("watchMem", [addr, opts]); }
     pause(): this { return this.push("pause", []); }
     resume(): this { return this.push("resume", []); }

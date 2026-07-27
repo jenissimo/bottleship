@@ -92,15 +92,21 @@ export function registerBreakpointCommands(svc: HarnessService): void {
         return armEip(addr, ctx, (args[1] ?? {}) as any, { kind: "symbol", symbol: name });
     });
 
-    /** breakOnApi('d3d9.*' | '*DrawPrimitive*' | 'Direct3DCreate9') — JS layer, no JIT off. */
+    /** breakOnApi('d3d9.*' | '*DrawPrimitive*' | 'Direct3DCreate9') — JS layer, no JIT off.
+     *  `argEq: {index, value}` narrows to one call among many (`breakOnApi('user32:LoadStringA',
+     *  {argEq:{index:1, value:137}})` catches the one interesting string id out of 400). */
     svc.register("breakOnApi", (args, ctx) => {
         const pattern = String(args[0] ?? "");
         if (!pattern) throw new HarnessError("breakOnApi expects a pattern", HarnessErrorCode.BAD_ARGS);
-        const opts = (args[1] ?? {}) as { continuous?: boolean };
+        const opts = (args[1] ?? {}) as { continuous?: boolean; argEq?: { index: number; value: number } };
+        if (opts.argEq && (typeof opts.argEq.index !== "number" || typeof opts.argEq.value !== "number")) {
+            throw new HarnessError("breakOnApi argEq expects {index:number, value:number}", HarnessErrorCode.BAD_ARGS);
+        }
         return new Promise((resolve) => {
             const id = apiBreaks.arm(pattern, {
                 runId: ctx.runId,
                 continuous: !!opts.continuous,
+                argEq: opts.argEq,
                 onHit: opts.continuous ? undefined : (snap) => resolve({ hit: snap, pattern }),
             });
             if (opts.continuous) resolve({ armed: true, id, pattern, continuous: true });

@@ -187,7 +187,7 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
         const window = windows.get(hWnd);
         if (window) {
             window.title = text;
-            if (!window.parent) System.getInstance().notifyWindowTitle(text);
+            if (!window.parent) System.getInstance().notifyWindowTitle(text, 'SetWindowText');
         }
         Logger.log(LogCategory.USER32, `SetWindowTextA(0x${hWnd.toString(16)}, "${text}")`);
         return 1; // TRUE
@@ -200,7 +200,7 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
         const window = windows.get(hWnd);
         if (window) {
             window.title = text;
-            if (!window.parent) System.getInstance().notifyWindowTitle(text);
+            if (!window.parent) System.getInstance().notifyWindowTitle(text, 'SetWindowText');
         }
         Logger.log(LogCategory.USER32, `SetWindowTextW(0x${hWnd.toString(16)}, "${text}")`);
         return 1; // TRUE

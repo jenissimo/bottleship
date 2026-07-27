@@ -551,7 +551,11 @@ export class System {
         this.hostWindowTitle = callback;
     }
 
-    notifyWindowTitle(title: string): void {
+    /** Single choke point for every top-level title change (CreateWindow, WM_SETTEXT,
+     *  SetWindowText). Logged because a whole class of engines reports fatal asserts
+     *  by rewriting the frame title, and that is otherwise invisible to `watchLog`. */
+    notifyWindowTitle(title: string, source = "?"): void {
+        Logger.log(LogCategory.USER32, `[WINDOW-TITLE] via=${source} ${JSON.stringify(title)}`);
         if (this.hostWindowTitle) this.hostWindowTitle(title);
     }
 
