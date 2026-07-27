@@ -59,6 +59,22 @@ export function isGameScreenOwned(renderActive?: RenderActive | null): boolean {
 }
 
 /**
+ * True for the window that OWNS the screen — the one passed to
+ * SetCooperativeLevel(DDSCL_EXCLUSIVE|DDSCL_FULLSCREEN). In exclusive fullscreen its
+ * client area IS the primary surface: GDI painting of that window lands in the primary
+ * the game renders into, it is not a plane layered over the frame. So it can never be
+ * an overlay composited on top of the game — it is the game. Games whose fullscreen
+ * window happens to host a system-control child (a Static/Button the engine parents to
+ * the main window) would otherwise be mistaken for live UI, and their WM_ERASEBKGND
+ * background fill would cover every frame.
+ */
+export function isScreenOwnerWindow(hwnd: number): boolean {
+    const ddrawCtx = getDDrawContext();
+    if (!hwnd || !isDDrawExclusiveFullscreen(ddrawCtx)) return false;
+    return (ddrawCtx?.cooperative?.hwnd ?? 0) === hwnd;
+}
+
+/**
  * Flag a dialog as a live game-screen overlay if it just became visible while the
  * game owns the screen (DDraw exclusive fullscreen OR a hardware-3D renderer is
  * presenting). Call on dialog creation and on ShowWindow.
@@ -83,6 +99,7 @@ export function noteDialogOverlayCandidate(win: WindowInfo | undefined): void {
     // options window built via CreateWindowEx("BUTTON"...) is real UI, not a stray
     // helper window) — both must composite over a game-owned screen.
     if (win.nativeClassName !== '#32770' && !hasSystemControlChildren(win)) return;
+    if (isScreenOwnerWindow(win.handle)) return;
     if (!isGameScreenOwned()) return;
     if (!win.overlayOnFlipScreen) {
         win.overlayOnFlipScreen = true;
@@ -356,6 +373,34 @@ function dialogGroupIsGameOwnerDrawn(root: number): boolean {
     return false;
 }
 
+const WS_CAPTION = 0x00c00000;
+
+/**
+ * True if the overlay actually holds pixels for this dialog group: an OS-drawn
+ * control, guest GDI output flushed into the overlay, or a caption bar we draw.
+ *
+ * A #32770 with none of those is a message-routing shell — a window the game
+ * creates for focus/modality while painting the visuals itself into the game's
+ * own surface (TLJ's "#dialog"). All our overlay render can contribute there is
+ * the invented dialog face, so compositing it over a game-owned screen is pure
+ * occlusion: it hides the frame and shows an empty gray box.
+ */
+function dialogGroupHasOverlayContent(root: number): boolean {
+    const stack = [root];
+    const seen = new Set<number>();
+    while (stack.length) {
+        const h = stack.pop()!;
+        if (seen.has(h)) continue;
+        seen.add(h);
+        const w = windows.get(h);
+        if (!w) continue;
+        if (w.isSystemControl || w.guestCustomPaint) return true;
+        if ((w.style & WS_CAPTION) === WS_CAPTION) return true;
+        for (const c of w.children) stack.push(c);
+    }
+    return false;
+}
+
 /**
  * Visual-bounds rects of live overlay dialogs (composited from the GDI overlay
  * canvas onto a DDraw flip frame). Sorted back→front for correct stacking.
@@ -367,17 +412,32 @@ function dialogGroupIsGameOwnerDrawn(root: number): boolean {
  * Failed" modal buried under an empty gray box).
  */
 export function getLiveDialogOverlayRects(): DialogOverlayRect[] {
-    const entries: Array<{ rect: DialogOverlayRect; rank: number }> = [];
+    return getLiveDialogOverlays().map(e => e.rect);
+}
+
+/** getLiveDialogOverlayRects with the owning window — the diagnostic form (harness `overlay`). */
+export function getLiveDialogOverlays(): Array<{ hwnd: number; title: string; cls: string; rect: DialogOverlayRect }> {
+    const entries: Array<{ hwnd: number; title: string; cls: string; rect: DialogOverlayRect; rank: number }> = [];
     for (const win of windows.values()) {
         if (!win.overlayOnFlipScreen || !win.visible || win.pendingDestroy) continue;
+        // A window flagged before the app took exclusive fullscreen can become the
+        // screen owner afterwards; re-check here, the one place the rects are consumed.
+        if (isScreenOwnerWindow(win.handle)) continue;
         if (getDialogRoot(win.handle) !== win.handle) continue;
         if (dialogGroupIsGameOwnerDrawn(win.handle)) continue;
+        if (!dialogGroupHasOverlayContent(win.handle)) continue;
         const b = getWindowVisualBounds(win.handle);
         if (!b) continue;
-        entries.push({ rect: b, rank: getOverlayWindowZRank(win.handle) });
+        entries.push({
+            hwnd: win.handle,
+            title: win.title ?? '',
+            cls: win.nativeClassName ?? '',
+            rect: b,
+            rank: getOverlayWindowZRank(win.handle),
+        });
     }
     entries.sort((a, b) => a.rank - b.rank);
-    return entries.map(e => e.rect);
+    return entries.map(({ hwnd, title, cls, rect }) => ({ hwnd, title, cls, rect }));
 }
 
 /**

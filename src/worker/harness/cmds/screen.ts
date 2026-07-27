@@ -8,6 +8,7 @@
 import type { HarnessService } from "../service";
 import { HarnessError, HarnessErrorCode } from "../rpc";
 import { sys } from "../serialize";
+import { getOverlayCompositePlan, isGameScreenOwned, getLiveDialogOverlays } from "../../modules/user32/dialog-overlay";
 
 /** Base64-encode bytes (chunked to avoid String.fromCharCode arg overflow). */
 export function bytesToBase64(bytes: Uint8Array): string {
@@ -47,6 +48,38 @@ export function registerScreenCommands(svc: HarnessService): void {
         const active: any = sys().services?.render?.getActive?.();
         if (!active?.getFrameLog) throw new HarnessError("active presenter has no frameLog (not D3D9, or nothing rendered yet)", HarnessErrorCode.UNSUPPORTED);
         return active.getFrameLog(n);
+    });
+
+    /**
+     * overlay() — the GDI overlay plane as a PNG (logs/debug/) plus the compositing
+     * DECISION that the presenter applies to it (getOverlayCompositePlan). The canvas
+     * is the sum of the DDraw/3D frame AND this plane, so "the game renders but the
+     * screen is wrong" always splits into: which layer holds the pixels, and does the
+     * plan composite it. Alpha is preserved — transparent reads as a=0, not white.
+     */
+    svc.register("overlay", async (args) => {
+        const opts = (args[0] ?? {}) as { save?: string };
+        const gdi: any = sys().gdiContext;
+        const canvas: OffscreenCanvas | null = gdi?.getOverlayCanvas?.() ?? null;
+        const plan = getOverlayCompositePlan();
+        const info = {
+            plan,
+            hasContent: !!gdi?.hasOverlayContent?.(),
+            dirty: !!gdi?.isOverlayDirty?.(),
+            gameOwnsScreen: isGameScreenOwned(),
+            liveDialogs: getLiveDialogOverlays(),
+            width: canvas?.width ?? 0,
+            height: canvas?.height ?? 0,
+            saved: null as string | null,
+        };
+        if (!canvas) return info;
+        const blob = await canvas.convertToBlob({ type: "image/png" });
+        const name = (opts.save ?? "gdi_overlay").replace(/\.png$/i, "");
+        (self as unknown as Worker).postMessage({
+            type: "debug_png_dump", name, base64: bytesToBase64(new Uint8Array(await blob.arrayBuffer())),
+        });
+        info.saved = `logs/debug/${name}.png`;
+        return info;
     });
 
     /** rtDebug() — D3D9 render-target diagnostics: recent SetRenderTarget surface→texture
