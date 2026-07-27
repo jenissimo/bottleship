@@ -21,6 +21,7 @@
  *
  * Flags:
  *   --queue          queue-wide summary table only
+ *   --tree           print the shipped-module load graph (depth + who pulls each one in)
  *   --json           emit JSON (per bundle, or an array with --queue)
  *   --top N          entries per section in the text report (default 12)
  *   --all-exes       analyze every EXE, not just the manifest entrypoint
@@ -68,18 +69,20 @@ interface Options {
     json: boolean;
     top: number;
     allExes: boolean;
+    tree: boolean;
     maxBytes: number;
     out: string | null;
 }
 
 function parseArgs(argv: string[]): { targets: string[]; opts: Options } {
     const targets: string[] = [];
-    const opts: Options = { queue: false, json: false, top: 12, allExes: false, maxBytes: 64 << 20, out: null };
+    const opts: Options = { queue: false, json: false, tree: false, top: 12, allExes: false, maxBytes: 64 << 20, out: null };
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i];
         if (a === '--queue') opts.queue = true;
         else if (a === '--json') opts.json = true;
         else if (a === '--all-exes') opts.allExes = true;
+        else if (a === '--tree') opts.tree = true;
         else if (a === '--top') opts.top = parseInt(argv[++i], 10) || 12;
         else if (a === '--max-mb') opts.maxBytes = (parseInt(argv[++i], 10) || 64) << 20;
         else if (a === '--out') opts.out = argv[++i];
@@ -91,8 +94,8 @@ function parseArgs(argv: string[]): { targets: string[]; opts: Options } {
 }
 
 function printUsage(): void {
-    console.log(`Usage: bun tools/api-census.ts <bundle.wgb|dir> [...] [--queue] [--json] [--top N]
-                                   [--all-exes] [--max-mb N] [--out FILE]`);
+    console.log(`Usage: bun tools/api-census.ts <bundle.wgb|dir> [...] [--queue] [--json] [--tree]
+                                   [--top N] [--all-exes] [--max-mb N] [--out FILE]`);
 }
 
 function expandTargets(targets: string[]): string[] {
@@ -164,11 +167,17 @@ async function censusBundle(bundlePath: string, index: ApiCoverageIndex, opts: O
         const shipped = new Map<string, ShippedDll>();
         const analyzed: BundleCensus['analyzed'] = [];
         const opaque: BundleCensus['opaque'] = [];
-        /** base name (no ext) → the imports that PE declares, for the reachability walk. */
+        /**
+         * Bundle PATH → that PE's imports and outgoing edges. Keyed by path, never by base
+         * name: Quake2 ships thirteen different `gamex86.dll` (one per mod directory) with
+         * different import sets, and a name-keyed map silently keeps only the last.
+         */
         const perPe = new Map<string, {
             entry: ZipEntry; isEntry: boolean; refs: ImportRef[];
-            deps: Set<string>; depPatterns: RegExp[]; isExe: boolean;
+            deps: Set<string>; depPatterns: RegExp[]; isExe: boolean; name: string;
         }>();
+        /** base name → every shipped path carrying it (a dep name can match several). */
+        const byName = new Map<string, string[]>();
 
         for (const entry of candidates) {
             const isEntry = entry.name.replace(/\\/g, '/').toLowerCase() === entryLower;
@@ -219,10 +228,12 @@ async function censusBundle(bundlePath: string, index: ApiCoverageIndex, opts: O
                     });
                 }
             }
-            perPe.set(baseNoExt(entry.name), {
-                entry, isEntry, refs: peRefs, deps, depPatterns: mentions.patterns,
+            const name = baseNoExt(entry.name);
+            perPe.set(entry.name, {
+                entry, isEntry, refs: peRefs, deps, depPatterns: mentions.patterns, name,
                 isExe: path.extname(entry.name).toLowerCase() === '.exe',
             });
+            (byName.get(name) ?? byName.set(name, []).get(name)!).push(entry.name);
 
             if (packer || imports.truncated) {
                 opaque.push({
@@ -243,9 +254,9 @@ async function censusBundle(bundlePath: string, index: ApiCoverageIndex, opts: O
         // not be ranked. That only holds while our module covers every import made OF it: the
         // loader falls back to the real file otherwise, and then that file's imports are live.
         const shadowed = new Set<string>();
-        for (const [base, pe] of perPe) {
-            if (pe.isEntry || !index.isThunked(base)) continue;
-            const canonical = index.canonicalModule(base);
+        for (const [, pe] of perPe) {
+            if (pe.isEntry || !index.isThunked(pe.name) || shadowed.has(pe.name)) continue;
+            const canonical = index.canonicalModule(pe.name);
             let fullyCovered = true;
             outer: for (const other of perPe.values()) {
                 if (other === pe) continue;
@@ -257,7 +268,7 @@ async function censusBundle(bundlePath: string, index: ApiCoverageIndex, opts: O
                     if (!cov) { fullyCovered = false; break outer; }
                 }
             }
-            if (fullyCovered) shadowed.add(base);
+            if (fullyCovered) shadowed.add(pe.name);
         }
 
         // Only count what the entrypoint can actually reach: a bundle routinely ships
@@ -266,37 +277,55 @@ async function censusBundle(bundlePath: string, index: ApiCoverageIndex, opts: O
         // import graph from the entrypoint; anything outside the closure is reported
         // separately rather than ranked.
         const reachable = new Set<string>();
+        const depthOf = new Map<string, number>();
+        const viaOf = new Map<string, string>();
         // Roots: the manifest entrypoint, plus every EXE when --all-exes is in force (which
         // is also how a packed launcher is handled — it can tell us nothing about the game
         // it starts, so each EXE becomes a root in its own right).
-        const queue = [...perPe.entries()]
+        let frontier = [...perPe.entries()]
             .filter(([, v]) => v.isEntry || (opts.allExes && v.isExe))
             .map(([k]) => k);
-        if (queue.length === 0) queue.push(...perPe.keys()); // no manifest entrypoint: take everything
-        while (queue.length) {
-            const cur = queue.pop()!;
-            if (reachable.has(cur)) continue;
-            reachable.add(cur);
-            const node = perPe.get(cur);
-            if (!node) continue;
-            for (const dep of node.deps) if (!reachable.has(dep)) queue.push(dep);
-            for (const rx of node.depPatterns) {
-                for (const name of perPe.keys()) if (!reachable.has(name) && rx.test(name)) queue.push(name);
+        if (frontier.length === 0) frontier = [...perPe.keys()]; // no manifest entrypoint: take everything
+        for (const root of frontier) { reachable.add(root); depthOf.set(root, 0); }
+        // Breadth-first so `depth`/`via` describe the SHORTEST load path, which is what a
+        // human reads to answer "why is this DLL in the census at all?". An edge names a
+        // module, not a file, and we cannot know which copy the search order would pick —
+        // so every shipped copy of that name is reached.
+        for (let d = 1; frontier.length; d++) {
+            const next: string[] = [];
+            const visit = (depName: string, from: string): void => {
+                for (const p of byName.get(depName) ?? []) {
+                    if (reachable.has(p)) continue;
+                    reachable.add(p);
+                    depthOf.set(p, d);
+                    viaOf.set(p, from);
+                    next.push(p);
+                }
+            };
+            for (const cur of frontier) {
+                const node = perPe.get(cur);
+                if (!node) continue;
+                for (const dep of node.deps) visit(dep, node.name);
+                for (const rx of node.depPatterns) {
+                    for (const name of byName.keys()) if (rx.test(name)) visit(name, node.name);
+                }
             }
+            frontier = next;
         }
-        for (const [base, pe] of perPe) {
-            if (shadowed.has(base)) {
-                opaque.push({ path: pe.entry.name, reason: 'shadowed by our HLE module — never mapped' });
-            } else if (reachable.has(base)) {
+        for (const [pePath, pe] of perPe) {
+            if (shadowed.has(pe.name)) {
+                opaque.push({ path: pePath, reason: 'shadowed by our HLE module — never mapped' });
+            } else if (reachable.has(pePath)) {
                 refs.push(...pe.refs);
             } else {
-                opaque.push({ path: pe.entry.name, reason: 'not reachable from the entrypoint — imports not ranked' });
+                opaque.push({ path: pePath, reason: 'not reachable from the entrypoint — imports not ranked' });
             }
         }
         for (const a of analyzed) {
-            const base = baseNoExt(a.path);
-            a.shadowed = shadowed.has(base) || undefined;
-            a.unreachable = (!a.shadowed && !reachable.has(base)) || undefined;
+            a.shadowed = shadowed.has(baseNoExt(a.path)) || undefined;
+            a.unreachable = (!a.shadowed && !reachable.has(a.path)) || undefined;
+            a.depth = depthOf.get(a.path);
+            a.via = viaOf.get(a.path);
         }
 
         return buildCensus(path.basename(bundlePath), refs, index, shipped, {
@@ -325,7 +354,61 @@ function renderEntry(e: BundleCensus['workOrder'][number]): string {
     return `    ${statusColor(e.status)}${e.dll}:${e.name}${OFF}  ${DIM}${uses}, ${where}${delay}${OFF}${impl}`;
 }
 
-function renderReport(r: BundleCensus, top: number): string {
+/**
+ * The shipped-module load graph the census walked: which DLLs the entrypoint actually
+ * pulls in, at what depth, and through whom. Answers "why is this DLL counted, and why is
+ * that one not?" - and makes a broken chain obvious, since a packed launcher reaches
+ * nothing at all.
+ */
+function renderTree(r: BundleCensus): string {
+    const L: string[] = [];
+    const reached = r.analyzed.filter(a => a.depth !== undefined);
+    L.push('', `  ${BOLD}LOAD GRAPH${OFF} ${DIM}(${reached.length}/${r.analyzed.length} shipped PEs reachable)${OFF}`);
+
+    const nameOf = (p: string): string => path.basename(p);
+    const keyOf = (p: string): string => nameOf(p).replace(/\.[^.]*$/, '').toLowerCase();
+
+    // Group same-named copies: Quake2 ships gamex86.dll thirteen times, one per mod dir,
+    // and thirteen identical lines hide the shape of the graph rather than showing it.
+    type Group = { name: string; depth: number; copies: typeof reached };
+    const groups = new Map<string, Group>();
+    for (const a of reached) {
+        const k = `${a.via ?? ''}|${keyOf(a.path)}`;
+        const g = groups.get(k) ?? { name: nameOf(a.path), depth: a.depth!, copies: [] };
+        g.copies.push(a);
+        groups.set(k, g);
+    }
+
+    const childrenOf = new Map<string, Group[]>();
+    const roots: Group[] = [];
+    for (const [k, g] of groups) {
+        const via = k.split('|')[0];
+        if (!via || g.depth === 0) roots.push(g);
+        else (childrenOf.get(via) ?? childrenOf.set(via, []).get(via)!).push(g);
+    }
+
+    const emit = (g: Group, indent: string, last: boolean, isRoot: boolean): void => {
+        const imports = g.copies.reduce((n, c) => n + c.imports, 0);
+        const dup = g.copies.length > 1 ? ` ${DIM}\u00d7${g.copies.length}${OFF}` : '';
+        const tag = g.copies[0].shadowed ? ` ${DIM}[shadowed by HLE]${OFF}` : '';
+        L.push(`    ${indent}${isRoot ? '' : (last ? '\u2514\u2500 ' : '\u251c\u2500 ')}`
+            + `${g.name}${dup}  ${DIM}${imports} imports${OFF}${tag}`);
+        const kids = (childrenOf.get(keyOf(g.copies[0].path)) ?? [])
+            .sort((a, b) => a.name.localeCompare(b.name));
+        const nextIndent = isRoot ? indent : indent + (last ? '   ' : '\u2502  ');
+        kids.forEach((k, i) => emit(k, nextIndent, i === kids.length - 1, false));
+    };
+    roots.sort((a, b) => a.name.localeCompare(b.name))
+        .forEach(g => emit(g, '', true, true));
+
+    const orphans = r.analyzed.filter(a => a.depth === undefined);
+    if (orphans.length) {
+        L.push(`    ${DIM}unreached (${orphans.length}): ${orphans.map(a => nameOf(a.path)).join(', ')}${OFF}`);
+    }
+    return L.join('\n');
+}
+
+function renderReport(r: BundleCensus, top: number, tree = false): string {
     const L: string[] = [];
     L.push('', `${BOLD}${r.bundle}${OFF}${r.title ? ` — ${r.title}` : ''}`);
     L.push(`  entrypoint: ${r.entrypoint ?? '(unknown)'}   PEs analyzed: ${r.analyzed.length}   distinct imports: ${r.totals.distinct}`);
@@ -368,6 +451,7 @@ function renderReport(r: BundleCensus, top: number): string {
             L.push(`    ${d.dll.padEnd(14)} ${String(d.missing).padStart(3)} missing  [${tag}]  ${DIM}${d.top.join(', ')}${OFF}`);
         }
     }
+    if (tree) L.push(renderTree(r));
     if (r.opaque.length) {
         L.push('', `  ${DIM}not statically readable:${OFF}`);
         for (const o of r.opaque) L.push(`    ${o.path} — ${o.reason}`);
@@ -436,7 +520,7 @@ async function main(): Promise<void> {
     }
 
     if (opts.queue) console.log(renderQueue(reports));
-    else for (const r of reports) console.log(renderReport(r, opts.top));
+    else for (const r of reports) console.log(renderReport(r, opts.top, opts.tree));
 }
 
 main();

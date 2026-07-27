@@ -469,6 +469,8 @@ export async function screenshot(session: CdpSession): Promise<string> {
 
 export interface HealthReport {
     vite: boolean;
+    /** Vite still TRANSFORMS source, not just serves cached static replies. */
+    viteTransform: boolean;
     logServer: boolean;
     chrome: boolean;
     devTab: boolean;
@@ -504,7 +506,15 @@ export async function reloadDevPage(opts: { url?: string; port?: number; settleM
     throw new Error("harness not ready after page reload");
 }
 
-/** Probe all three services (Vite has no /health — GET the dev URL instead). */
+/** A module Vite must run through its transform pipeline to answer — the root and
+ *  index.html come back from a static/cached path even when the transform pipeline
+ *  is wedged, so `vite: true` alone cannot distinguish "serving" from "working". */
+const VITE_TRANSFORM_PROBE = "/src/app/App.tsx";
+
+/** Probe all three services (Vite has no /health — GET the dev URL instead).
+ *  `viteTransform` is the load-bearing one: a wedged Vite still answers 200 on the
+ *  root while every real module request hangs, which presents as "the page loads but
+ *  nothing renders / the guest never boots" and sends you hunting inside the game. */
 export async function health(opts: { port?: number } = {}): Promise<HealthReport> {
     const port = opts.port ?? DEFAULT_CDP_PORT;
     const probe = async (url: string, init?: RequestInit) => {
@@ -512,6 +522,13 @@ export async function health(opts: { port?: number } = {}): Promise<HealthReport
     };
     const viteOrigin = new URL(DEFAULT_DEV_URL).origin;
     const vite = (await probe(`${viteOrigin}/health`)) || (await probe(DEFAULT_DEV_URL));
+    // Needs its own deadline: the wedged mode HANGS rather than erroring.
+    const viteTransform = await (async () => {
+        try {
+            const r = await fetch(`${viteOrigin}${VITE_TRANSFORM_PROBE}`, { signal: AbortSignal.timeout(15_000) });
+            return r.ok;
+        } catch { return false; }
+    })();
     const logServer = await (async () => {
         try { return (await (await fetch(`http://localhost:${SIDECAR_PORT}/health`)).text()).trim() === "OK"; } catch { return false; }
     })();
@@ -522,5 +539,5 @@ export async function health(opts: { port?: number } = {}): Promise<HealthReport
         await findTab(GAME_DEV_FILTER, { port });
         devTab = true;
     } catch { /* */ }
-    return { vite, logServer, chrome, devTab };
+    return { vite, viteTransform, logServer, chrome, devTab };
 }

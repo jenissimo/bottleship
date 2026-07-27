@@ -109,6 +109,10 @@ export interface BundleCensus {
         unreachable?: boolean;
         /** Shipped but shadowed by an HLE module, so it is never mapped. */
         shadowed?: boolean;
+        /** Hops from the entrypoint along the load graph; undefined ⇒ never reached. */
+        depth?: number;
+        /** Base name of the module that pulls this one in (import or LoadLibrary edge). */
+        via?: string;
     }>;
     /** PEs we could not statically read (packed / truncated import table). */
     opaque: Array<{ path: string; reason: string }>;

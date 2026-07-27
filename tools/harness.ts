@@ -207,6 +207,9 @@ async function cmdUp(): Promise<void> {
     await waitForHarnessReady(session);
     const h = await health();
     console.log("[harness up] services:", JSON.stringify(h));
+    if (h.vite && !h.viteTransform) {
+        console.warn("[harness up] WARNING: Vite answers the root but will not transform modules — the page will load and render nothing. Restart the dev server (wait for :5174 to be released first); do not debug the guest until this is green.");
+    }
     const ping = await pageEval(session, "window.__BS__.harness.ping()", { timeoutMs: 8000 }).catch((e) => ({ error: String(e) }));
     console.log("[harness up] worker ping:", JSON.stringify(ping));
     console.log(`[harness up] ready — tab ${tab.id} (${tab.url})`);
