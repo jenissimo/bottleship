@@ -289,7 +289,8 @@ export class PELoader {
 
         // --- Clear image region before loading ---
         // Zero out the image region to prevent stale data from previous loads.
-        this.memory.fill(0, baseAddress, baseAddress + sizeOfImage + 0x10000); // +64KB buffer
+        const clearedBytes = sizeOfImage + 0x10000; // +64KB buffer
+        this.memory.fill(0, baseAddress, baseAddress + clearedBytes);
 
         // --- Copy PE headers to memory ---
         // The headers (DOS header, PE header, optional header, section headers) must be
@@ -307,9 +308,11 @@ export class PELoader {
             this.applyRelocations(peData, baseAddress);
         }
 
-        // Relocation fixups rewrite bytes inside already-written code; one image-wide
-        // invalidation covers them and any address reused by a previous tenant.
-        invalidateGuestCode(baseAddress, sizeOfImage);
+        // Relocation fixups rewrite bytes inside already-written code; one invalidation
+        // covers them and any address reused by a previous tenant. It must span everything
+        // the load TOUCHED, not just the image — the clear runs 64KB past SizeOfImage, and
+        // a previous tenant's compiled blocks in that tail would otherwise survive the zeroing.
+        invalidateGuestCode(baseAddress, clearedBytes);
 
         // Process Imports (now async to support real DLL loading)
         const importDirRVA = peView.getUint32(optHeaderPtr + 104, true);
