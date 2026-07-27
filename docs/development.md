@@ -62,6 +62,12 @@ bun tools/make-stand.ts my-stand.json      # → <out>/{server.ts,docker-compose
 The generated `dist/games-catalog.json` lists exactly the games in the config, and only their
 box art ships — useful for a private stand that should not expose the public library.
 
+A catalog entry can also set `"preload": true` (stand config: per game, or once for all of them):
+the bundle is downloaded to OPFS before the game starts instead of being streamed on demand.
+Streaming wins on a fast local origin — a big game boots after fetching only what the boot path
+reads — but it costs one round trip per read, so a game that keeps pulling files at runtime
+crawls over a high-latency link. Preloading trades a wait up front for no stalls afterwards.
+
 ## Quality gate
 
 Run before sending a change — in this order:

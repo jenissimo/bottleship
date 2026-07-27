@@ -18,6 +18,7 @@ import { installCw3220Stdio } from '../modules/cw3220/cw3220-stdio';
 import { writeHeapSlabStubs } from '../modules/kernel32/heap-slab-stubs';
 import { writeCrtSlabStubs, writeCaseFoldStubs } from '../modules/crt-slab-stubs';
 import { loadDiagnostics } from './diagnostics/load-diagnostics';
+import { writeGuestCode, invalidateGuestCode } from './memory/guest-code';
 
 function isD3dx9VersionedDll(dllNameLower: string): boolean {
     return resolveThunkedDllAlias(normalizeDllBaseName(dllNameLower)) === 'd3dx9';
@@ -295,7 +296,7 @@ export class PELoader {
         // present in memory for FindResource, GetModuleHandle, and other APIs to work.
         // SizeOfHeaders is at offset 60 from optional header start.
         const sizeOfHeaders = peView.getUint32(optHeaderPtr + 60, true);
-        this.memory.set(peData.subarray(0, sizeOfHeaders), baseAddress);
+        writeGuestCode(this.memory, peData.subarray(0, sizeOfHeaders), baseAddress);
         Logger.log(LogCategory.SYSTEM, `[PE] Copied ${sizeOfHeaders} bytes of headers to 0x${baseAddress.toString(16)}`);
 
         // Load Sections
@@ -305,6 +306,10 @@ export class PELoader {
         if (baseAddress !== imageBase) {
             this.applyRelocations(peData, baseAddress);
         }
+
+        // Relocation fixups rewrite bytes inside already-written code; one image-wide
+        // invalidation covers them and any address reused by a previous tenant.
+        invalidateGuestCode(baseAddress, sizeOfImage);
 
         // Process Imports (now async to support real DLL loading)
         const importDirRVA = peView.getUint32(optHeaderPtr + 104, true);
@@ -434,7 +439,7 @@ export class PELoader {
             // 1. Copy raw data from file
             const copySize = hasFileData ? Math.min(rawDataSize, Math.max(0, peData.length - rawDataPtr)) : 0;
             if (copySize > 0) {
-                this.memory.set(peData.subarray(rawDataPtr, rawDataPtr + copySize), targetAddr);
+                writeGuestCode(this.memory, peData.subarray(rawDataPtr, rawDataPtr + copySize), targetAddr);
             }
 
             // 2. Zero-fill the rest of the mapped extent (BSS-like behavior)
@@ -559,13 +564,14 @@ export class PELoader {
 
             // Copy PE headers to memory (needed for resource access, etc.)
             const sizeOfHeaders = peView.getUint32(optHeaderPtr + 60, true);
-            this.memory.set(peData.subarray(0, sizeOfHeaders), baseAddress);
+            writeGuestCode(this.memory, peData.subarray(0, sizeOfHeaders), baseAddress);
 
             // Load sections
             const sections = this.loadSections(peData, peView, optHeaderPtr, sizeOfOptionalHeader, numberOfSections, baseAddress);
 
             // Apply base relocations (MUST be done after sections are loaded, before imports)
             this.applyRelocations(peData, baseAddress);
+            invalidateGuestCode(baseAddress, sizeOfImage);
 
             // Process TLS directory (implicit __declspec(thread) variables)
             // Must be after sections+relocations so guest memory has correct VAs.
@@ -1346,7 +1352,7 @@ export class PELoader {
                     } catch (e) {
                         // If already reserved, that's fine
                     }
-                    this.memory.set(stubDll.stubCode, stubDll.baseAddress);
+                    writeGuestCode(this.memory, stubDll.stubCode, stubDll.baseAddress);
                     Logger.log(LogCategory.SYSTEM, `[PE] Stub DLL for ${dllName} written at 0x${stubDll.baseAddress.toString(16)}, size: ${stubDll.stubCode.length}`);
                 } else {
                     Logger.verbose(LogCategory.SYSTEM, `[PE] All stubs for ${dllName} reused from existing (no new code written)`);
@@ -1391,7 +1397,7 @@ export class PELoader {
 
                     // Write stub code
                     if (stubDll.stubCode.length > 0) {
-                        this.memory.set(stubDll.stubCode, stubDll.baseAddress);
+                        writeGuestCode(this.memory, stubDll.stubCode, stubDll.baseAddress);
                     }
 
                     Logger.log(LogCategory.SYSTEM,
@@ -1578,7 +1584,7 @@ export class PELoader {
         } catch (e) {
             // If already reserved, that's fine
         }
-        this.memory.set(stubDll.stubCode, stubDll.baseAddress);
+        writeGuestCode(this.memory, stubDll.stubCode, stubDll.baseAddress);
 
         Logger.log(LogCategory.SYSTEM, `[PE] Stub DLL for ${dllName} written at 0x${stubDll.baseAddress.toString(16)}, size: ${stubDll.stubCode.length}`);
     }

@@ -16,6 +16,7 @@
 import type { HarnessService } from "../service";
 import { dbg } from "../../core/debug/dbg-commands";
 import { System } from "../../core/system";
+import { guestCodeInvalidationStats } from "../../core/memory/guest-code";
 
 /** Decode a generated thunk stub (`B8 <id32> BA 77 B0 00 00 EF C2 <cleanup16>`). */
 function decodeStub(mem: Uint8Array, addr: number, names: Record<number, string> | undefined) {
@@ -68,6 +69,18 @@ export function registerDbgCommands(svc: HarnessService): void {
 
         return iface ? out[0] : out;
     });
+
+    /**
+     * codeInvalidations() — is the guest-code JIT-invalidation path actually wired, and
+     * how much has it dropped?
+     *
+     * v86 cannot see a JS write, so every JS publication of guest-executable bytes must
+     * call jit_dirty_cache or the CPU keeps running the block it compiled from the old
+     * bytes (wrong thunk dispatched / ESP drift / wild ret). `wired:false` or a flat
+     * `ranges` while stubs are being published means the invariant is silently off —
+     * check that BEFORE theorising about the guest.
+     */
+    svc.register("codeInvalidations", () => guestCodeInvalidationStats());
 
     /** dbgCall(name, ...args) — invoke dbg[name](...args), return its result. */
     svc.register("dbgCall", (args) => {

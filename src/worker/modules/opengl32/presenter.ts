@@ -4,6 +4,7 @@ import { System } from "../../core/system";
 import { Logger, LogCategory } from "../../core/logger";
 import { frameProfiler } from "../../core/frame-profiler";
 import { statsOverlay } from "../../core/stats-overlay";
+import { captureGLFrameIfArmed } from "./frame-capture";
 
 export class OpenGLPresenter implements RenderActive {
     readonly suppressGdiOverlay = true;
@@ -34,14 +35,12 @@ export class OpenGLPresenter implements RenderActive {
         }
 
         if (ctx.executor && (ctx.commands.count > 0 || ctx.textures.size > 0)) {
+            const [dw, dh] = ctx.executor.getDrawableSize();
+            captureGLFrameIfArmed(ctx, dw, dh);
             ctx.executor.executeFrame({
                 commands: ctx.commands,
                 vertArena: ctx.vertArena.data,
                 textures: ctx.textures,
-                viewportX: ctx.viewportX,
-                viewportY: ctx.viewportY,
-                viewportW: ctx.viewportW,
-                viewportH: ctx.viewportH,
             });
         }
 

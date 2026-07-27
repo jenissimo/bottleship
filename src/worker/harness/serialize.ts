@@ -10,7 +10,15 @@
 
 import { System } from "../core/system";
 import { HarnessError, HarnessErrorCode } from "./rpc";
-import { windows, getAbsoluteWindowPosition } from "../modules/user32/shared-state";
+import {
+    windows,
+    getAbsoluteWindowPosition,
+    getCurrentCursorHandle,
+    getCursorDisplayCount,
+    isCursorClipped,
+    isGuestCursorVisible,
+} from "../modules/user32/shared-state";
+import { getActiveDeviceCursor, isDeviceCursorVisible } from "../core/device-cursor";
 import { leaseRegistry } from "../core/memory/lease-registry";
 import { memoryEventBuffer } from "../core/memory/memory-event-buffer";
 import { THREAD_STATE_NAMES, WAIT_REASON_NAMES } from "../core/scheduler/types";
@@ -144,6 +152,12 @@ export function serializeSurfaces(): unknown {
             mode: st.mode ?? null,
             version: st.version ?? null,
             gpuDirty: st.gpuDirty ?? null,
+            lastUploadVersion: st.lastUploadVersion ?? null,
+            // A source colour key changes what a Blt of this surface MEANS; without it
+            // "the texture is black" and "the texture is fully keyed" look identical.
+            srcColorKey: st.srcColorKey
+                ? "0x" + u32(st.srcColorKey.low).toString(16) + "-0x" + u32(st.srcColorKey.high).toString(16)
+                : null,
             hasGpuTexture: !!st.gpuTexture,
             gpuTextureFormat: st.gpuTextureFormat ?? null,
             mipMapCount: st.mipMapCount ?? null,
@@ -232,6 +246,40 @@ export function serializeVideo(): unknown {
     // VideoEngine doesn't expose "which session is active"; report load state and
     // let callers drill into a specific handle via the video.info verb.
     return { loaded: !!videoEngine?.isLoaded?.() };
+}
+
+/**
+ * Guest pointer state — the whole "why is there no cursor" question in one POJO.
+ * A game hides the system pointer either with SetCursor(NULL) (handle 0) or by
+ * driving the display count negative, and is then expected to draw its own; the
+ * shape the host renders comes from the CURSOR user object behind the handle.
+ * `visible` is what the host is told, so it separates "we hid it" from "we kept
+ * it but the shape never arrived".
+ */
+export function serializeCursor(): unknown {
+    const handle = getCurrentCursorHandle();
+    const obj: any = sys().resourceProvider?.getUserObject?.(handle);
+    const hasPixels = obj?.type === "CURSOR"
+        && obj.pixels instanceof Uint8Array
+        && obj.width > 0 && obj.height > 0;
+    const device = getActiveDeviceCursor();
+    return {
+        // What the host is actually told to draw: the D3D device cursor outranks the
+        // Win32 one, so `visible: false` with a live device cursor is not a hidden pointer.
+        visible: !!device || isGuestCursorVisible(),
+        displayCount: getCursorDisplayCount(),
+        handle,
+        handleHex: "0x" + handle.toString(16),
+        clipped: isCursorClipped(),
+        image: hasPixels
+            ? { width: obj.width, height: obj.height, hotspotX: obj.xHotspot ?? 0, hotspotY: obj.yHotspot ?? 0 }
+            : null,
+        objType: obj?.type ?? null,
+        deviceCursor: device
+            ? { width: device.width, height: device.height, hotspotX: device.hotspotX, hotspotY: device.hotspotY }
+            : null,
+        deviceCursorVisible: isDeviceCursorVisible(),
+    };
 }
 
 export function serializeScreen(): unknown {
@@ -365,4 +413,5 @@ export const STATE_SECTIONS: Record<string, () => unknown> = {
     audio: serializeAudio,
     video: serializeVideo,
     screen: serializeScreen,
+    cursor: serializeCursor,
 };

@@ -8,6 +8,7 @@
  */
 
 import { IModule } from '../core/module';
+import { writeGuestCode } from '../core/memory/guest-code';
 import { Process } from '../core/process';
 import { ThunkImplementation } from '../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../core/logger';
@@ -52,7 +53,7 @@ export class IFC20 implements IModule {
         );
 
         // Write stub code to guest memory
-        mem.set(stubDll.stubCode, stubDll.baseAddress);
+        writeGuestCode(mem, stubDll.stubCode, stubDll.baseAddress);
 
         // Allocate vtable array (7 entries × 4 bytes = 28 bytes)
         this.mouseVtableAddr = tg.allocateVTableMemory(MOUSE_VTABLE_METHODS.length * 4);

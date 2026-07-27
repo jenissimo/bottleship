@@ -1,5 +1,6 @@
 import { Logger, LogCategory } from "../../core/logger";
 import { System } from "../../core/system";
+import { getActiveDeviceCursor } from "../../core/device-cursor";
 import { resetHooks } from "./hooks";
 import { resetOwnerDrawScratch } from "./owner-draw";
 import { resetSystemCursorHandles } from "./system-cursors";
@@ -385,6 +386,10 @@ export function setCurrentCursorHandle(hCursor: number): number {
     return prev;
 }
 
+export function getCurrentCursorHandle(): number {
+    return currentCursorHandle;
+}
+
 /** Effective host-cursor visibility: display count ≥ 0 AND a non-NULL cursor set. */
 export function isGuestCursorVisible(): boolean {
     return cursorDisplayCount >= 0 && currentCursorHandle !== 0;
@@ -406,6 +411,18 @@ let lastForwardedCursorImageObj: unknown = null;
  */
 export function syncHostCursorToGuestState(): void {
     const sys = System.getInstance();
+    // The D3D device cursor is composited by the runtime over the frame, independent
+    // of the Win32 pointer: an app that enables it hides the Win32 one and still
+    // expects a pointer, so while it is on it IS the pointer.
+    const deviceCursor = getActiveDeviceCursor();
+    if (deviceCursor) {
+        sys.requestHostCursorVisible(true);
+        if (lastForwardedCursorImageObj !== deviceCursor) {
+            lastForwardedCursorImageObj = deviceCursor;
+            sys.requestHostCursorImage(deviceCursor);
+        }
+        return;
+    }
     sys.requestHostCursorVisible(isGuestCursorVisible());
     const obj = sys.resourceProvider.getUserObject?.(currentCursorHandle);
     const image = (obj?.type === 'CURSOR'

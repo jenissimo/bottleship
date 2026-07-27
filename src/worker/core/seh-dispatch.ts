@@ -23,6 +23,7 @@
  */
 
 import { ThunkResult } from './thunking/thunk-dispatcher';
+import { invalidateGuestCode } from './memory/guest-code';
 import { Logger, LogCategory } from './logger';
 import { System } from './system';
 import { debugSession } from './debug/debug-session';
@@ -389,6 +390,9 @@ class X86Emit {
     jmpAbs(target: number): void { this.dv.setUint8(this.off, 0xE9); this.dv.setInt32(this.off + 1, (target - (this.off + 5)) | 0, true); this.off += 5; }
     jmpEax(): void { this.dv.setUint8(this.off, 0xFF); this.dv.setUint8(this.off + 1, 0xE0); this.off += 2; }
     size(): number { return this.off - this.base; }
+    /** Publish the emitted bytes: these trampolines live on the guest stack, so the same
+     *  address carries different code on every dispatch — v86 must drop the old block. */
+    commit(): number { invalidateGuestCode(this.base, this.off - this.base); return this.size(); }
 }
 
 /** Emit the action sequence (inside a PUSHAD/POPAD window when non-empty). */
@@ -1212,6 +1216,7 @@ function emitCatchDispatch(
             e.jmpAbs(d.target);
         }
     }
+    e.commit();
 
     // Thunk RET N lands here: EIP = [retSlot] = codeBase, ESP = retSlot+4+N (< codeBase,
     // irrelevant — the first trampoline instruction re-bases ESP).
@@ -1294,6 +1299,7 @@ export function sehOnCatchCompletion(cpu: any): void {
     e.movEbpImm(rec.catchEbp);
     e.movEaxImm(continuation);
     e.jmpEax();
+    e.commit();
     guardStackWrite(esp, 4, 'seh:completionEaxPatch', rec.stubHome);
     dv.setUint32(esp, rec.stubHome >>> 0, true); // gadget pops this into EAX → jmp stub
 
@@ -1607,6 +1613,7 @@ export function dispatchFinallyUnwind(
 
     // JMP retAddr (rel32) — return to caller of RtlUnwind
     dv.setUint8(off, 0xE9); dv.setInt32(off + 1, retAddr - (off + 5), true); off += 5;
+    invalidateGuestCode(trampolineAddr, off - trampolineAddr);
 
     Logger.warn(LogCategory.SYSTEM,
         `[SEH-FINALLY] Trampoline at 0x${trampolineAddr.toString(16)} size=${off - trampolineAddr} ` +
@@ -1773,6 +1780,7 @@ export function dispatchLongjmpUnwind(
     dv.setUint8(off, 0xBC); dv.setUint32(off + 1, callerEsp, true); off += 5;
     // JMP retAddr — resume the caller (which will perform the actual longjmp).
     dv.setUint8(off, 0xE9); dv.setInt32(off + 1, retAddr - (off + 5), true); off += 5;
+    invalidateGuestCode(trampolineAddr, off - trampolineAddr);
 
     Logger.warn(LogCategory.SYSTEM,
         `[CXX-LONGJMP] Trampoline at 0x${trampolineAddr.toString(16)} size=${off - trampolineAddr} ` +

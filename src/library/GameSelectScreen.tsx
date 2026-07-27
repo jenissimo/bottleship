@@ -34,6 +34,10 @@ export interface GameEntry {
   render?: string;
   status?: "ready" | "setup" | "save";
   gogUrl?: string;
+  /** Download the bundle to OPFS before starting instead of streaming it on demand.
+   *  Worth it wherever range round-trips are expensive (self-hosted stand behind a
+   *  reverse proxy, high-RTT link): one sequential download beats hundreds of reads. */
+  preload?: boolean;
 }
 
 interface GameSelectScreenProps {

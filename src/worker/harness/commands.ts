@@ -17,6 +17,7 @@ import { registerLogCommands } from "./cmds/logs";
 import { registerScreenCommands } from "./cmds/screen";
 import { registerBreakpointCommands } from "./cmds/breakpoints";
 import { registerTextureCommands } from "./cmds/textures";
+import { registerGlCommands } from "./cmds/gl";
 import { registerFsCommands } from "./cmds/fs";
 import { registerFixtureCommands } from "./cmds/fixture";
 import { registerRegistryCommands } from "./cmds/reg";
@@ -43,6 +44,7 @@ export function installHarnessCommands(): void {
     registerScreenCommands(harnessService);
     registerBreakpointCommands(harnessService);
     registerTextureCommands(harnessService);
+    registerGlCommands(harnessService);
     registerFsCommands(harnessService);
     registerFixtureCommands(harnessService);
     registerRegistryCommands(harnessService);

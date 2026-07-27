@@ -853,20 +853,23 @@ fn main(@builtin(global_invocation_id) global_id: vec3u) {
         }
     }
 
+    // Keying clears ALPHA ONLY, like the other two converter shaders: the colour-key Blt
+    // shader and the D3D COLORKEYENABLE path re-test the SAMPLED colour against the key,
+    // so a zeroed texel can never match and blits as opaque black.
+    var colorkeyMatch = false;
     if (params.hasColorkey != 0u) {
         let pm = pixel & params.colorkeyMask;
         let ckLowM = params.colorkeyLow & params.colorkeyMask;
         let ckHighM = params.colorkeyHigh & params.colorkeyMask;
-        if (pm >= ckLowM && pm <= ckHighM) {
-            let dstIdx = dstRowOffset + x;
-            dstData[dstIdx] = 0u;
-            return;
-        }
+        colorkeyMatch = (pm >= ckLowM && pm <= ckHighM);
     }
 
     // Palette canonical format: RGBA (0xAABBGGRR), same as LUT
     // Output in format matching texture format
     var rgba = paletteData[pixel];
+    if (colorkeyMatch) {
+        rgba = rgba & 0x00FFFFFFu;
+    }
     var pixelData: u32;
     if (params.textureFormat == 1u) {
         // bgra8unorm: convert RGBA to BGRA

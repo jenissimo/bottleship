@@ -8,6 +8,7 @@ import { Logger, LogCategory } from '../../core/logger';
 import { profiler } from '../../core/profiler';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { SystemResourceProvider } from '../../core/resources/system-resource-provider';
+import { toPlainGuestMemory } from '../../core/memory/guest-memory';
 // Track GetPixel HDC usage for profiling
 const getPixelHdcStats = new Map<number, { count: number; maxX: number; maxY: number }>();
 
@@ -123,6 +124,13 @@ function dibToCanvas(
     scan?: DibScanRange,
 ): boolean {
     if (!lpBmi || !lpBits) return false;
+
+    // Leaf hot loop: the per-pixel DIB→RGBA conversion below indexes guest memory a
+    // million times per blit, and the dispatcher hands us v86's always-live Proxy
+    // (which it must keep — see ThunkDispatcher.updateMemoryCache). Every `mem[i]`
+    // through that Proxy is a trap V8 cannot JIT. Nothing here re-enters the guest,
+    // so a plain view cannot go stale mid-call.
+    mem = toPlainGuestMemory(mem);
 
     const gdi = System.getInstance().gdiContext;
     const dcCtx = (gdi as any).contexts?.get(hdc) as OffscreenCanvasRenderingContext2D | undefined;

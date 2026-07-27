@@ -22,6 +22,7 @@ import { guardStackWrite } from '../memory/stack-write-guard';
 import * as DispatcherForensics from './dispatcher-forensics';
 import { ERROR_NOT_SUPPORTED } from './thunk-errors';
 import { thunkChecksumManager } from '../memory/thunk-checksum';
+import { invalidateGuestCode } from '../memory/guest-code';
 import { hypercallDataManager } from '../cpu/hypercall-data';
 import { preemptionManager } from '../cpu/preemption-manager';
 import { PF_HALT_TARGET } from '../bootloader';
@@ -264,7 +265,6 @@ export class ThunkDispatcher {
     private cachedWasmBuffer: ArrayBufferLike | null = null;
 
     // Deferred JIT invalidations for WBUF stubs patched before cachedCpu was available
-    private pendingJitInvalidations: number[] = [];
 
     private v86: any;
     private thunkGenerator: ThunkGenerator;
@@ -1077,16 +1077,6 @@ export class ThunkDispatcher {
             this.cachedFlagsRaw      = new Int32Array(this.cachedMem8.buffer, 120, 1);
             this.cachedIpRaw         = new Int32Array(this.cachedMem8.buffer, 556, 1);
             this.cachedSegOffsetsRaw = new Int32Array(this.cachedMem8.buffer, 736, 8);
-        }
-
-        // Flush deferred JIT invalidations for WBUF stubs patched before CPU was available
-        if (this.pendingJitInvalidations.length > 0 && cpu["jit_dirty_cache"]) {
-            for (const stubAddr of this.pendingJitInvalidations) {
-                cpu["jit_dirty_cache"](stubAddr, stubAddr + 16);
-            }
-            Logger.log(LogCategory.THUNK,
-                `[WBUF] Flushed ${this.pendingJitInvalidations.length} deferred JIT invalidations`);
-            this.pendingJitInvalidations.length = 0;
         }
 
         // Cache scheduler reference (lazy - set on first use since scheduler may init later)
@@ -3125,19 +3115,8 @@ export class ThunkDispatcher {
         mem8[stubAddr + 14] = 0x90;
         mem8[stubAddr + 15] = 0x90;
 
-        // Invalidate v86 JIT cache for the patched stub range so the new JMP bytes
-        // are re-compiled instead of executing the cached OUT trap block.
-        let jitDirtied = false;
-        try {
-            const cpu = this.cachedCpu;
-            if (cpu && cpu["jit_dirty_cache"]) {
-                cpu["jit_dirty_cache"](stubAddr, stubAddr + 16);
-                jitDirtied = true;
-            } else {
-                // CPU not yet available (early init) — defer invalidation to setupPortHook
-                this.pendingJitInvalidations.push(stubAddr);
-            }
-        } catch { /* non-fatal */ }
+        // Drop the cached OUT-trap block so the new JMP bytes are re-compiled.
+        const jitDirtied = invalidateGuestCode(stubAddr, 16);
 
         // Register the drain handler
         const id = stub.functionId;
@@ -3442,13 +3421,7 @@ export class ThunkDispatcher {
         mem8[stubAddr + 14] = 0x90;
         mem8[stubAddr + 15] = 0x90;
 
-        // Invalidate v86 JIT cache
-        try {
-            const cpu = this.cachedCpu;
-            if (cpu && cpu["jit_dirty_cache"]) {
-                cpu["jit_dirty_cache"](stubAddr, stubAddr + 16);
-            }
-        } catch { /* non-fatal */ }
+        invalidateGuestCode(stubAddr, 16);
 
         // Register drain handler — floatCount is the argCount for stride calculation
         const id = stub.functionId;
@@ -3522,14 +3495,7 @@ export class ThunkDispatcher {
         mem8[stubAddr + 14] = 0x90;
         mem8[stubAddr + 15] = 0x90;
 
-        try {
-            const cpu = this.cachedCpu;
-            if (cpu && cpu["jit_dirty_cache"]) {
-                cpu["jit_dirty_cache"](stubAddr, stubAddr + 16);
-            } else {
-                this.pendingJitInvalidations.push(stubAddr);
-            }
-        } catch { /* non-fatal */ }
+        invalidateGuestCode(stubAddr, 16);
 
         const id = stub.functionId;
         this.writeBufHandlerTable[id]  = handler;
@@ -3558,11 +3524,7 @@ export class ThunkDispatcher {
         mem8[stubAddr + 8] = (rel32 >> 16) & 0xFF;
         mem8[stubAddr + 9] = (rel32 >> 24) & 0xFF;
         for (let i = 10; i < 16; i++) mem8[stubAddr + i] = 0x90;
-        try {
-            const cpu = this.cachedCpu;
-            if (cpu && cpu["jit_dirty_cache"]) cpu["jit_dirty_cache"](stubAddr, stubAddr + 16);
-            else this.pendingJitInvalidations.push(stubAddr);
-        } catch { /* non-fatal */ }
+        invalidateGuestCode(stubAddr, 16);
         return stub.functionId;
     }
 
@@ -3661,11 +3623,7 @@ export class ThunkDispatcher {
         mem8[a + 6] = popBytes & 0xFF;
         mem8[a + 7] = (popBytes >> 8) & 0xFF;
         for (let i = 8; i < 16; i++) mem8[a + i] = 0x90;
-        try {
-            const cpu = this.cachedCpu;
-            if (cpu && cpu["jit_dirty_cache"]) cpu["jit_dirty_cache"](a, a + 16);
-            else this.pendingJitInvalidations.push(a);
-        } catch { /* non-fatal */ }
+        invalidateGuestCode(a, 16);
         Logger.log(LogCategory.THUNK,
             `[WBUF] Constant-return stub [${stub.functionId}] ${dllName}:${funcName} = ${value} (ret ${popBytes}, stub=0x${a.toString(16)})`);
     }

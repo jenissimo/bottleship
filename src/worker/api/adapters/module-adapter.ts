@@ -2,6 +2,7 @@ import { ModuleDescriptor } from "../types";
 import { generateModuleVTables } from "../codegen";
 import { Process } from "../../core/process";
 import { Logger, LogCategory } from "../../core/logger";
+import { writeGuestCode } from "../../core/memory/guest-code";
 
 export type VTableInfo = {
     address: number;
@@ -43,7 +44,7 @@ export function createVTablesFromDescriptor(
             // Already reserved or overlapping - ThunkGenerator should handle its own space
         }
         
-        currentMemory.set(stubDll.stubCode, stubAddress);
+        writeGuestCode(currentMemory, stubDll.stubCode, stubAddress);
 
         // Update export table with addresses (exportTable already has correct addresses from thunkGenerator)
         const updatedExportTable = stubDll.exportTable;

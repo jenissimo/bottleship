@@ -48,6 +48,7 @@
  */
 
 import { Logger, LogCategory } from '../../../logger';
+import { writeGuestCode } from '../../../memory/guest-code';
 import { Mem } from '../../../memory/mem-accessor';
 import { System } from '../../../system';
 import { hypercallDataManager } from '../../../cpu/hypercall-data';
@@ -182,7 +183,7 @@ export function buildTokenDispatchFilter(info: EntryFilterInfo): number | null {
     if (!filterAddr || filterAddr + size > mem.length) return null;
     const code = assembleTokenDispatchFilter(
         filterAddr, cfgAddr, tokenTableBase, stubAddress, trampolineAddress);
-    mem.set(code, filterAddr);
+    writeGuestCode(mem, code, filterAddr);
     Logger.log(LogCategory.SYSTEM,
         `[HLE-eagl] token-dispatch filter @0x${filterAddr.toString(16)} (${code.length}B) ` +
         `tokenTable=0x${tokenTableBase.toString(16)} cfg=0x${cfgAddr.toString(16)} (disarmed until D3D9 WBUF ready)`);

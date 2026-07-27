@@ -11,6 +11,7 @@ import { Logger, LogCategory } from './logger';
 import { ModuleRegistry } from './module-registry';
 import { memoryEventBuffer, MemoryEventType } from './memory/memory-event-buffer';
 import { ensureGuestPagesCommitted } from './memory/guest-page-commit';
+import { invalidateGuestCode } from './memory/guest-code';
 import type { PageTableManager } from './memory/page-table-manager';
 import { SEH_SCRATCH_TOTAL_SIZE } from './thunking/seh-layout';
 
@@ -32,6 +33,25 @@ interface BucketState {
 }
 
 const BUCKET_KINDS: RegionKind[] = ['HEAP', 'SURFACE', 'THUNK_CODE', 'THUNK_DATA'];
+
+/**
+ * Drop v86's compiled blocks for a freshly handed-out executable range.
+ *
+ * A bump allocator re-hands-out addresses whose pages may still carry blocks compiled from a
+ * previous tenant (a freed stub region, a DLL image unloaded and reloaded at the same base),
+ * and the JS write that fills the new allocation is invisible to v86 — see memory/guest-code.
+ * Doing it here means an x86 emitter cannot obtain executable guest memory without the
+ * invalidation happening, whether or not it remembers to ask.
+ *
+ * HEAP is the hot path (every HeapAlloc) and is never executable, so it short-circuits first.
+ */
+function maybeInvalidateExecutableRange(kind: RegionKind, perms: RegionPerms, addr: number, size: number): void {
+    if (kind === 'HEAP') return;
+    const executable = kind === 'THUNK_CODE' || kind === 'CALLBACK_STUB' || kind === 'SPIN_LOOP'
+        || perms === 'rx' || perms === 'rwx';
+    if (!executable) return;
+    invalidateGuestCode(addr, size);
+}
 
 export class MemoryManager {
     constructor(private addressSpace: AddressSpace) {
@@ -225,6 +245,8 @@ export class MemoryManager {
             ensureGuestPagesCommitted(addr, aligned);
         }
 
+        maybeInvalidateExecutableRange(finalKind, finalPerms, addr, aligned);
+
         return addr;
     }
 
@@ -302,6 +324,7 @@ export class MemoryManager {
         if (bucketKind === 'HEAP' || bucketKind === 'SURFACE') {
             ensureGuestPagesCommitted(addr, aligned);
         }
+        maybeInvalidateExecutableRange(finalKind, finalPerms, addr, aligned);
         return addr;
     }
 

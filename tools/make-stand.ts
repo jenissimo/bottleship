@@ -29,10 +29,15 @@ interface StandGame {
     genre: string;
     wgb: string;
     cover: string;
+    preload?: boolean;
 }
 
 interface StandConfig {
     out?: string;
+    /** Default for every game: download bundles to OPFS before starting (no on-demand
+     *  streaming). Worth it wherever range round-trips cost real latency. Per-game
+     *  `preload` overrides it. */
+    preload?: boolean;
     games: StandGame[];
 }
 
@@ -82,6 +87,7 @@ const catalog = config.games.map((g) => {
         description: g.description,
         year: g.year,
         genre: g.genre,
+        preload: g.preload ?? config.preload ?? false,
         enabled: true,
     };
 });

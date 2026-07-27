@@ -36,6 +36,7 @@ import {
     type SyncCallResult,
 } from './sync-guest-call';
 import { preemptionManager } from '../cpu/preemption-manager';
+import { writeGuestCode } from '../memory/guest-code';
 import { MEM_THUNK_CODE_BASE, MEM_ROM_BASE } from '../cpu/emulator-config';
 import type { HleReportEntry, HookedFunction, LibMatch, PatchHandle, ShadowHookStatus, ShadowSpec } from './types';
 
@@ -178,7 +179,6 @@ class LibHleManager {
         const patchCtx: PatchContext = {
             dispatcher: this.init.dispatcher,
             thunkGenerator: this.init.thunkGenerator,
-            cpu: this.init.getCpu(),
             getMemory: this.init.getMemory,
         };
 
@@ -500,15 +500,7 @@ class LibHleManager {
             Logger.warn(LogCategory.SYSTEM, `[HLE-lib] unpatch: guest memory unavailable for ${libId}:${functionName}`);
             return false;
         }
-        mem.set(handle.originalBytes, handle.targetAddress);
-        try {
-            const cpu = this.init?.getCpu();
-            if (cpu && cpu["jit_dirty_cache"]) {
-                cpu["jit_dirty_cache"](handle.targetAddress, handle.targetAddress + handle.originalBytes.length);
-            }
-        } catch (e) {
-            Logger.warn(LogCategory.SYSTEM, `[HLE-lib] unpatch: jit_dirty_cache threw: ${e}`);
-        }
+        writeGuestCode(mem, handle.originalBytes, handle.targetAddress);
         // Drop the WASM dispatch binding too, so a bailed-out hook stops being
         // served in WASM (the original guest bytes are back — no stub to reach).
         if (handle.functionId >= 0) {

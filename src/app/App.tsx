@@ -507,7 +507,10 @@ export default function App() {
       return;
     }
 
-    (window as any).loadApp?.(selectedGame.id === "dev" ? loadParam : selectedGame.wgbUrl);
+    (window as any).loadApp?.(
+      selectedGame.id === "dev" ? loadParam : selectedGame.wgbUrl,
+      { preload: selectedGame.preload === true },
+    );
   }, [browserSupport.supported, selectedGame, workerStatus, webgpuProbe]);
 
   // Cover the worker/v86 boot phase too: before the worker posts "ready" there is no
@@ -1748,7 +1751,9 @@ export default function App() {
       return (window as any).loadApp(path);
     };
 
-    (window as any).loadApp = async (path: string) => {
+    // opts.preload: download the whole bundle to OPFS before starting instead of
+    // streaming it on demand (catalog entry `preload`) — see the worker's URL path.
+    (window as any).loadApp = async (path: string, opts?: { preload?: boolean }) => {
       console.log(`BottleShip: Loading App from ${path}`);
       rotateLogFile(path.split(/[\\/]/).pop()?.replace(/\.wgb$/i, "") || "game");
       ensurePersistentStorageRequested();
@@ -1766,7 +1771,7 @@ export default function App() {
       const lower = path.toLowerCase();
       if (lower.endsWith(".wgb")) {
         setLoadingProgress({ phase: "loading", percent: 0, label: "" });
-        globalWorker.postMessage({ type: "load_bundle", url: path });
+        globalWorker.postMessage({ type: "load_bundle", url: path, preload: opts?.preload === true });
         return;
       }
       try {

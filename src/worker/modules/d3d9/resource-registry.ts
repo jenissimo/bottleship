@@ -8,6 +8,7 @@ import { devices, getVTables, createComObject, resourceToDevice } from './shared
 import { D3D9Device } from '../../backends/webgpu/d3d9/d3d9-device';
 import { initReturnPtr, D3DFMT_UNKNOWN, normalizePalettizedTexturePool } from '../../backends/webgpu/shared/dx-com-helpers';
 import { isDxExclusiveFormat } from '../../backends/webgpu/shared/dx-format-support';
+import { resetDeviceCursor } from '../../core/device-cursor';
 
 export type TextureMeta = {
     width: number;
@@ -184,6 +185,7 @@ export function clearResourceRegistry(): void {
     deviceBoundDepthStencil.clear();
     deviceBoundRenderTarget.clear();
     deviceCursorProperties.clear();
+    resetDeviceCursor();
     textureLevelSurfaces.clear();
     cubeFaceSurfaces.clear();
 }

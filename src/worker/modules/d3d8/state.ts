@@ -13,9 +13,14 @@ import { bindAutoDepthStencil, invalidateDevicePresentationSurfaces, resizeFulls
 import { isBitmapTexture } from '../ddraw/com-objects';
 import { D3DMaterial7Data, D3DLight7Data } from '../ddraw/d3d/types';
 import { gammaService } from '../../core/gamma-service';
+import { setDeviceCursorImage, showDeviceCursor } from '../../core/device-cursor';
+import { syncHostCursorToGuestState, warpGuestCursorTo } from '../user32/shared-state';
+import { decodeSurfaceFormatToRgba8 } from '../../backends/webgpu/shared/texture-formats';
+import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { D3D8_MAX_STREAMS } from '../../backends/webgpu/d3d8/vsd-constants';
 
 const D3D_OK = 0;
+const D3DFMT_A8R8G8B8 = 21;
 const D3DERR_INVALIDCALL = 0x8876086c;
 const E_NOTIMPL = 0x80004001;
 
@@ -380,10 +385,48 @@ export function createStateExports(): Record<string, ThunkImplementation> {
         return D3D_OK;
     };
 
-    // Cursor
-    exports['IDirect3DDevice8_SetCursorProperties'] = () => D3D_OK;
-    exports['IDirect3DDevice8_SetCursorPosition'] = () => D3D_OK;
-    exports['IDirect3DDevice8_ShowCursor'] = () => 0; // Return previous visibility (FALSE)
+    // Cursor — the device cursor is the pointer for a game that hides the Win32 one
+    // (see core/device-cursor). Validation mirrors wined3d: 2D A8R8G8B8, both extents
+    // powers of two, and (d3d8 layer) no larger than the display mode.
+    exports['IDirect3DDevice8_SetCursorProperties'] = (_ctx, mem, args) => {
+        const pDevice = args[0] >>> 0;
+        const xHotSpot = args[1] >>> 0;
+        const yHotSpot = args[2] >>> 0;
+        const pCursorBitmap = args[3] >>> 0;
+
+        if (!devices.has(pDevice) || !pCursorBitmap) return D3DERR_INVALIDCALL;
+        const info = surfaceInfo.get(pCursorBitmap);
+        if (!info || info.d3dFormat !== D3DFMT_A8R8G8B8) return D3DERR_INVALIDCALL;
+
+        const surface = info.surface;
+        const { width, height } = surface;
+        if (!width || !height) return D3DERR_INVALIDCALL;
+        if ((width & (width - 1)) !== 0 || (height & (height - 1)) !== 0) return D3DERR_INVALIDCALL;
+        const mode = EmulatorConfig.getInstance().screenResolution;
+        if (width > mode.width || height > mode.height) return D3DERR_INVALIDCALL;
+
+        // Snapshot the pixels: real D3D does not addref the surface, so the app is free
+        // to release or reuse it the moment this returns.
+        const rgba = decodeSurfaceFormatToRgba8(mem, surface.surfacePtr, width, height, surface.pitch, surface.format);
+        setDeviceCursorImage({ width, height, pixels: new Uint8Array(rgba), hotspotX: xHotSpot, hotspotY: yHotSpot });
+        syncHostCursorToGuestState();
+        Logger.log(LogCategory.D3D9, `D3D8 SetCursorProperties(${width}x${height}, hotspot ${xHotSpot},${yHotSpot})`);
+        return D3D_OK;
+    };
+
+    // STDMETHOD_(void, ...) — the guest ignores the return value.
+    exports['IDirect3DDevice8_SetCursorPosition'] = (_ctx, _mem, args) => {
+        if (!devices.has(args[0] >>> 0)) return 0;
+        warpGuestCursorTo(args[1] | 0, args[2] | 0);
+        return 0;
+    };
+
+    exports['IDirect3DDevice8_ShowCursor'] = (_ctx, _mem, args) => {
+        if (!devices.has(args[0] >>> 0)) return 0;
+        const prev = showDeviceCursor(!!args[1]);
+        syncHostCursorToGuestState();
+        return prev ? 1 : 0;
+    };
 
     // Swap chain / reset
     exports['IDirect3DDevice8_CreateAdditionalSwapChain'] = () => D3DERR_INVALIDCALL;

@@ -12,6 +12,7 @@
  */
 
 import { frameVarianceDiagnostics } from './frame-variance-diagnostics';
+import { invalidateGuestCode, writeGuestCode } from './memory/guest-code';
 import { framePacer } from './frame-pacer';
 import { frameProfiler } from './frame-profiler';
 import { drawCostProfiler } from '../backends/webgpu/ddraw/draw-cost-profiler';
@@ -904,7 +905,7 @@ if (typeof globalThis !== 'undefined') {
         if (narrHookActive) {
             // Unhook: restore original bytes
             for (const entry of narrHookSaved) {
-                mem.set(entry.bytes, entry.addr);
+                writeGuestCode(mem, entry.bytes, entry.addr);
                 console.log(`[NarrHook] Restored ${entry.label} at 0x${entry.addr.toString(16)}`);
             }
             narrHookSaved.length = 0;
@@ -954,6 +955,7 @@ if (typeof globalThis !== 'undefined') {
             mem[addr + 7] = (funcId >> 8) & 0xFF;
             mem[addr + 8] = (funcId >> 16) & 0xFF;
             mem[addr + 9] = (funcId >> 24) & 0xFF;
+            invalidateGuestCode(addr, 10);
 
             console.log(`[NarrHook] Patched ${label} @ 0x${addr.toString(16)} → canary write id=${funcId}`);
         }

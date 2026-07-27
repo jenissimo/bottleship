@@ -3,6 +3,7 @@ import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../../core/logger";
 import { System } from "../../core/system";
 import { writeGetcStub } from "../crt-slab-stubs";
+import { writeGuestCode } from "../../core/memory/guest-code";
 
 // ----------------------------------------------------------------------------
 // CW3220.DLL stdio HLE (partial override of a real DLL)
@@ -107,7 +108,7 @@ export function installCw3220Stdio(process: Process): Map<string, number> | null
             Logger.error(LogCategory.SYSTEM, `[cw3220] stub write OOB at 0x${stubDll.baseAddress.toString(16)}`);
             return null;
         }
-        mem.set(stubDll.stubCode, stubDll.baseAddress);
+        writeGuestCode(mem, stubDll.stubCode, stubDll.baseAddress);
     }
 
     // Inline x86 getc fast path. The Tin3 LZSS decompressor calls __fgetc(FILE*) as a

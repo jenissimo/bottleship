@@ -20,6 +20,7 @@
 
 import { Logger, LogCategory } from '../logger';
 import { Mem } from '../memory/mem-accessor';
+import { invalidateGuestCode, writeGuestCode } from '../memory/guest-code';
 import type { LoadedPEModule } from '../module-registry';
 import type { ThunkDispatcher, ThunkImplementation } from '../thunking/thunk-dispatcher';
 import type { ThunkGenerator } from '../thunking/thunk-generator';
@@ -28,8 +29,6 @@ import type { EntryFilterInfo, PatchHandle } from './types';
 export interface PatchContext {
     dispatcher: ThunkDispatcher;
     thunkGenerator: ThunkGenerator;
-    /** Fresh `cpu` handle (from `process.v86`) for `jit_dirty_cache`; may be null early. */
-    cpu: any;
     getMemory: () => Uint8Array | null;
 }
 
@@ -168,7 +167,7 @@ export function applyPatch(ctx: PatchContext, req: PatchRequest): PatchHandle | 
             `[HLE-lib] applyPatch: stub 0x${stubAddress.toString(16)} overruns memory`);
         return null;
     }
-    mem.set(stubCode, stubAddress);
+    writeGuestCode(mem, stubCode, stubAddress);
 
     // 3. Register handler under the virtual module id.
     ctx.dispatcher.register(virtualModuleId, req.functionName, req.handler);
@@ -198,13 +197,14 @@ export function applyPatch(ctx: PatchContext, req: PatchRequest): PatchHandle | 
             Logger.error(LogCategory.SYSTEM, `[HLE-lib] applyPatch: trampoline 0x${trampolineAddress.toString(16)} overruns memory`);
             return null;
         }
-        mem.set(prologue, trampolineAddress);
+        writeGuestCode(mem, prologue, trampolineAddress);
         const back = (req.targetAddress + pl - (trampolineAddress + pl + 5)) | 0;
         mem[trampolineAddress + pl]     = 0xE9;
         mem[trampolineAddress + pl + 1] = back & 0xFF;
         mem[trampolineAddress + pl + 2] = (back >> 8)  & 0xFF;
         mem[trampolineAddress + pl + 3] = (back >> 16) & 0xFF;
         mem[trampolineAddress + pl + 4] = (back >> 24) & 0xFF;
+        invalidateGuestCode(trampolineAddress, pl + 5);
     }
 
     // 4c. Guest-side entry filter (partial hooks): emit the classifier and
@@ -251,19 +251,11 @@ export function applyPatch(ctx: PatchContext, req: PatchRequest): PatchHandle | 
         mem[req.targetAddress + i] = 0x90;
     }
 
-    // 6. Invalidate JIT cache for the patched prologue so v86 re-compiles from
-    //    new bytes rather than replaying the cached pre-patch block. Covering
-    //    the full 16-byte range is cheap and defensive.
-    try {
-        const cpu = ctx.cpu;
-        if (cpu && cpu["jit_dirty_cache"]) {
-            cpu["jit_dirty_cache"](req.targetAddress, req.targetAddress + 16);
-        } else {
-            Logger.warn(LogCategory.SYSTEM, 
-                `[HLE-lib] applyPatch: cpu not ready, JIT invalidation may be delayed for ${req.libId}:${req.functionName}`);
-        }
-    } catch (e) {
-        Logger.warn(LogCategory.SYSTEM, `[HLE-lib] applyPatch: jit_dirty_cache threw: ${e}`);
+    // 6. Drop the cached pre-patch block for the rewritten prologue. Covering the full
+    //    16-byte range is cheap and defensive.
+    if (!invalidateGuestCode(req.targetAddress, 16)) {
+        Logger.warn(LogCategory.SYSTEM,
+            `[HLE-lib] applyPatch: no wasm instance, JIT invalidation deferred for ${req.libId}:${req.functionName}`);
     }
 
     const stubInfo = ctx.thunkGenerator.getStubByAddress?.(stubAddress);

@@ -126,7 +126,7 @@ export class OpenGLBackendExecutor {
     private depthView: GPUTextureView | null = null;
     private offscreenSize: { width: number; height: number } | null = null;
     private offscreenInitialized = false;
-    /** Last frame render resolution (GL viewport); may be smaller than the canvas. */
+    /** Last frame's default-framebuffer resolution (the GL drawable). */
     private presentSourceW = 0;
     private presentSourceH = 0;
     private targetFormat: GPUTextureFormat | null = null;
@@ -167,6 +167,12 @@ export class OpenGLBackendExecutor {
         this.backend = backend;
     }
 
+    /** Default-framebuffer size: the presentation surface a WGL context owns. */
+    getDrawableSize(): [number, number] {
+        const canvas = this.backend.getContext()?.canvas as OffscreenCanvas | undefined;
+        return [canvas?.width ?? 0, canvas?.height ?? 0];
+    }
+
     executeFrame(input: OpenGLFrameInput): void {
         const device = this.backend.getDevice();
         const queue = this.backend.getQueue();
@@ -187,8 +193,13 @@ export class OpenGLBackendExecutor {
         }
 
         const format = this.backend.getFormat() ?? "bgra8unorm";
-        const renderW = input.viewportW > 0 ? input.viewportW : screenW;
-        const renderH = input.viewportH > 0 ? input.viewportH : screenH;
+        // The default framebuffer is sized by the DRAWABLE (here: the presentation
+        // surface a WGL context always owns), never by glViewport — glViewport only
+        // maps NDC onto a rectangle inside it. A frame whose last viewport is a
+        // sub-rect (a portal, a HUD strip, a letterboxed 2D pass) must still render
+        // at full drawable resolution.
+        const renderW = screenW;
+        const renderH = screenH;
         this.presentSourceW = renderW;
         this.presentSourceH = renderH;
         this.ensureStaticResources(device);
@@ -340,7 +351,7 @@ export class OpenGLBackendExecutor {
                     const pass = beginDrawPass();
                     if (!this.applyScissor(pass, I, i, flags, renderW, renderH)) break;
 
-                    // OpenGL Y-up → WebGPU Y-down; render at the app's viewport resolution.
+                    // OpenGL Y-up → WebGPU Y-down, inside the drawable-sized target.
                     const cmdVpW = I[i + CI_VP_W];
                     const cmdVpH = I[i + CI_VP_H];
                     const vpW = cmdVpW > 0 ? cmdVpW : renderW;
@@ -422,7 +433,7 @@ export class OpenGLBackendExecutor {
 
         Logger.verbose(
             LogCategory.SYSTEM,
-            `OpenGL frame: cmds=${stream.count} draws=${drawCount} viewport=${input.viewportW}x${input.viewportH}`,
+            `OpenGL frame: cmds=${stream.count} draws=${drawCount} drawable=${renderW}x${renderH}`,
         );
     }
 

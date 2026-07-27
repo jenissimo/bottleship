@@ -3,6 +3,7 @@ import { ThunkImplementation } from "../thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../logger";
 import { Mem } from "../memory/mem-accessor";
 import { verifyComVtableSlot } from "./com-memory";
+import { writeGuestCode } from "../memory/guest-code";
 
 export interface ComVtableMethod {
     name: string;
@@ -60,7 +61,7 @@ export function installComVtable(process: Process, options: InstallComVtableOpti
         Logger.error(LogCategory.COM, `${logLabel}: stub write OOB stubBase=0x${stubBase.toString(16)} len=${stubDll.stubCode.length}`);
         return null;
     }
-    mem.set(stubDll.stubCode, stubBase);
+    writeGuestCode(mem, stubDll.stubCode, stubBase);
 
     const vtableAddr = process.memory.alloc(methods.length * 4, "THUNK_DATA", "rw");
     mem = process.getCurrentMemory();

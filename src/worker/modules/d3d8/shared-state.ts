@@ -9,6 +9,7 @@ import { d3d8Module } from '../../api/d3d8.api';
 import { D3D8DeviceAdapter } from '../../backends/webgpu/d3d8/d3d8-device-adapter';
 import { Logger, LogCategory } from '../../core/logger';
 import { allocateComObject as allocateGuardedComObject } from '../../core/com/com-memory';
+import { resetDeviceCursor } from '../../core/device-cursor';
 import type { BitmapTextureSurface, DirectDrawSurfaceState } from '../../modules/ddraw/com-objects';
 
 let vtables: Record<string, VTableInfo> | null = null;
@@ -203,6 +204,7 @@ export function resolveD3D8TextureSurface(addr: number): BitmapTextureSurface | 
 }
 
 export function resetD3D8SharedState(): void {
+    resetDeviceCursor();
     vtables = null;
     devices.clear();
     resourceToDevice.clear();

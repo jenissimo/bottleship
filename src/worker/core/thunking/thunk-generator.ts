@@ -2,6 +2,7 @@
 // Generates x86 stubs that trigger UD2 exceptions for WinAPI interception
 
 import { deriveStackCleanupFromMangledName } from "./msvc-mangling";
+import { invalidateGuestCode, writeGuestCode } from "../memory/guest-code";
 
 export interface ThunkStub {
     address: number;
@@ -108,6 +109,21 @@ export class ThunkGenerator {
     }
 
     /**
+     * Bump the code cursor and drop v86's compiled blocks for the handed-out range.
+     *
+     * Invalidating at hand-out (not after the caller's write) is what makes the invariant
+     * hard to forget: the guest cannot execute between a JS allocation and the JS write that
+     * fills it — the worker only re-enters v86 once the whole JS turn is done — so a callee
+     * that assembles bytes in place is covered without knowing this file exists.
+     */
+    private bumpCode(size: number): number {
+        const address = this.currentAddress;
+        this.currentAddress += size;
+        invalidateGuestCode(address, size);
+        return address;
+    }
+
+    /**
      * Address of the shared trap stub (UD2). IAT entries for unknown imports must point here
      * so the app fails predictably instead of calling into garbage.
      */
@@ -134,8 +150,7 @@ export class ThunkGenerator {
     writeTrapStub(mem: Uint8Array): boolean {
         const addr = this.getTrapStubAddress();
         if (addr <= 0 || addr + TRAP_STUB_SIZE > mem.length) return false;
-        mem.set(this.getTrapStubCode(), addr);
-        return true;
+        return writeGuestCode(mem, this.getTrapStubCode(), addr);
     }
 
     generateStubDll(dllName: string, exports: { name: string, argCount?: number, stackCleanupBytes?: number, callingConvention?: string }[]): {
@@ -235,6 +250,9 @@ export class ThunkGenerator {
             this.currentAddress += 16;
         }
 
+        // One invalidation for the whole handed-out span (see bumpCode).
+        invalidateGuestCode(dllBase, this.currentAddress - dllBase);
+
         return {
             baseAddress: dllBase,
             stubCode: new Uint8Array(codeChunks),
@@ -254,7 +272,7 @@ export class ThunkGenerator {
         callingConvention?: string,
         stackCleanupBytes?: number
     ): { address: number; code: Uint8Array } {
-        const stubAddress = this.currentAddress;
+        const stubAddress = this.bumpCode(16);
         const functionId = this.nextFunctionId++;
         const isStdcall = !callingConvention || callingConvention === 'stdcall';
         const bytesToPop = this.resolveBytesToPop(exportName, isStdcall, argCount, stackCleanupBytes);
@@ -294,7 +312,6 @@ export class ThunkGenerator {
         const nameLower = exportName.toLowerCase();
         this.nameToAddress.set(buildQualifiedThunkKey(dllName, exportName), stubAddress);
         this.nameToAddress.set(nameLower, stubAddress);
-        this.currentAddress += 16;
         return { address: stubAddress, code };
     }
 
@@ -306,10 +323,7 @@ export class ThunkGenerator {
      * base address of the reserved area.
      */
     allocateRawCodeArea(sizeBytes: number): number {
-        const address = this.currentAddress;
-        const slots = Math.ceil(sizeBytes / 16);
-        this.currentAddress += slots * 16;
-        return address;
+        return this.bumpCode(Math.ceil(sizeBytes / 16) * 16);
     }
 
     getStubById(id: number): ThunkStub | undefined {
@@ -377,11 +391,9 @@ export class ThunkGenerator {
      * Returns the address where vtable should be written.
      */
     allocateVTableMemory(sizeInBytes: number): number {
-        // Align to 16 bytes for consistency
-        const alignedSize = (sizeInBytes + 15) & ~15;
-        const addr = this.currentAddress;
-        this.currentAddress += alignedSize;
-        return addr;
+        // Align to 16 bytes for consistency. Bumped through bumpCode because the area shares
+        // 4 KiB pages with real stubs — page-granular JIT invalidation covers both.
+        return this.bumpCode((sizeInBytes + 15) & ~15);
     }
 
     /**

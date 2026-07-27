@@ -14,8 +14,9 @@ import { D3D9Device } from '../../backends/webgpu/d3d9/d3d9-device';
 import { WebGPUBackend } from '../../backends/webgpu/webgpu-backend';
 import { writeDeviceCaps9 } from './caps';
 import { getVTables, devices, createComObject, resourceToDevice, deviceToD3D9 } from './shared-state';
-import { deviceBoundDepthStencil, deviceBoundRenderTarget, deviceCursorProperties, surfaceMeta } from './resource-registry';
-import { warpGuestCursorTo } from '../user32/shared-state';
+import { deviceBoundDepthStencil, deviceBoundRenderTarget, deviceCursorProperties, resolveSurfaceInfo, surfaceMeta } from './resource-registry';
+import { syncHostCursorToGuestState, warpGuestCursorTo } from '../user32/shared-state';
+import { setDeviceCursorImage, showDeviceCursor } from '../../core/device-cursor';
 
 const D3DFMT_X8R8G8B8 = 22;
 const D3DFMT_R5G6B5 = 23;
@@ -99,6 +100,22 @@ function bindAutoDepthStencil(device: D3D9Device, devicePtr: number, mem: Uint8A
     Logger.log(LogCategory.D3D9, `auto depth-stencil ${w}x${h} fmt=${format} -> 0x${surfacePtr.toString(16)} (bound)`);
 }
 
+/** A8R8G8B8 texture bytes (B,G,R,A little-endian) → tightly packed RGBA. */
+function bgraToRgba(src: Uint8Array, width: number, height: number, pitch: number): Uint8Array {
+    const out = new Uint8Array(width * height * 4);
+    for (let y = 0; y < height; y++) {
+        let s = y * pitch;
+        let d = y * width * 4;
+        for (let x = 0; x < width; x++, s += 4, d += 4) {
+            out[d] = src[s + 2];
+            out[d + 1] = src[s + 1];
+            out[d + 2] = src[s];
+            out[d + 3] = src[s + 3];
+        }
+    }
+    return out;
+}
+
 export function createDeviceExports(): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
 
@@ -135,9 +152,32 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         if (meta.width > cfg.width || meta.height > cfg.height) return D3DERR_INVALIDCALL;
 
         deviceCursorProperties.set(pDevice, { hotspotX: xHotSpot, hotspotY: yHotSpot, surfacePtr: pCursorBitmap });
+        // Snapshot the pixels for the host pointer: real D3D does not addref the
+        // surface, so the app may release or reuse it as soon as this returns.
+        const resolved = resolveSurfaceInfo(pCursorBitmap);
+        const pixels = resolved?.device.getTextureLevelPixels(resolved.texturePtr, resolved.level);
+        setDeviceCursorImage(pixels ? {
+            width: meta.width,
+            height: meta.height,
+            // Format is A8R8G8B8 (validated above) = B,G,R,A bytes little-endian.
+            pixels: bgraToRgba(pixels.data, meta.width, meta.height, pixels.pitch),
+            hotspotX: xHotSpot,
+            hotspotY: yHotSpot,
+        } : null);
+        syncHostCursorToGuestState();
         Logger.log(LogCategory.D3D9,
             `SetCursorProperties(${meta.width}x${meta.height}, hotspot ${xHotSpot},${yHotSpot}) surface=0x${pCursorBitmap.toString(16)}`);
         return D3D_OK;
+    };
+
+    // ShowCursor(bShow) — returns the PREVIOUS visibility. The device cursor is drawn
+    // by the runtime over the frame, so enabling it gives the app a pointer even while
+    // it keeps the Win32 one hidden (core/device-cursor).
+    exports['IDirect3DDevice9_ShowCursor'] = (_ctx, _mem, args) => {
+        if (!devices.has(args[0] >>> 0)) return 0;
+        const prev = showDeviceCursor(!!args[1]);
+        syncHostCursorToGuestState();
+        return prev ? 1 : 0;
     };
 
     // SetCursorPosition(X, Y, Flags) is STDMETHOD_(void, ...) — the guest ignores the return

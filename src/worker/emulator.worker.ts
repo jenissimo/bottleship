@@ -101,6 +101,7 @@ import { framePacer } from "./core/frame-pacer";
 import { EmulatorConfig } from "./core/emulator-config-manager";
 import { videoEngine } from "../video/video-engine";
 import { preemptionManager } from "./core/cpu/preemption-manager";
+import { writeGuestCode } from "./core/memory/guest-code";
 import { statsOverlay } from "./core/stats-overlay";
 import { hypercallDataManager } from "./core/cpu/hypercall-data";
 import { d3d9WasmArena } from "./backends/webgpu/d3d9/d3d9-wasm-arena";
@@ -936,7 +937,7 @@ const loadPeData = async (peData: Uint8Array, skipReset: boolean = false) => {
     const { code: bootCode, loadAddress, startAddress } = createBootloader(module.entryPoint, stackPointer, pendingDllInits);
 
     // Write bootloader at 0x7C00 (includes code + boot sig + GDT at 0x7E00)
-    mem8.set(bootCode, loadAddress);
+    writeGuestCode(mem8, bootCode, loadAddress);
     Logger.log(LogCategory.SYSTEM, `Bootloader+GDT written at 0x${loadAddress.toString(16)}, size: ${bootCode.length}`);
 
     // Initialize page tables in guest memory (identity-mapped).
@@ -1204,7 +1205,7 @@ const postBundleMeta = (manifest: WgbManifest, gameId: string): void => {
   });
 };
 
-const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?: Blob; blobs?: File[] }) => {
+const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?: Blob; blobs?: File[]; preload?: boolean }) => {
   const system = System.getInstance();
   if (!system.process) {
     pendingBundle = payload;
@@ -1239,7 +1240,11 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
       // Pages sets COOP/COEP; the dev server too) and a Range-honoring origin (the R2
       // Pages Function serves 206). create() probes both, so any failure throws and we
       // fall through to the OPFS-download/staging path below, unchanged.
-      const streamCapable = (globalThis as unknown as { crossOriginIsolated?: boolean }).crossOriginIsolated === true;
+      // `preload` (catalog entry) opts a deployment out of on-demand streaming: one
+      // sequential download into OPFS beats hundreds of range round-trips wherever
+      // per-request latency is the cost (self-hosted stand behind a reverse proxy).
+      const streamCapable = (globalThis as unknown as { crossOriginIsolated?: boolean }).crossOriginIsolated === true
+        && payload.preload !== true;
       if (streamCapable) {
         try {
           // Preferred: serve the guest's synchronous reads from a dedicated I/O
@@ -1789,7 +1794,7 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
   }
 };
 
-const loadBundle = (payload: { data?: Uint8Array; url?: string; blob?: Blob; blobs?: File[] }) => {
+const loadBundle = (payload: { data?: Uint8Array; url?: string; blob?: Blob; blobs?: File[]; preload?: boolean }) => {
   loadBundleChain = loadBundleChain
     .then(() => loadBundleImpl(payload))
     .catch(err => Logger.error(LogCategory.SYSTEM, `load_bundle failed: ${err}`));
@@ -1895,7 +1900,6 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       hookRegistry.initialize({
         dispatcher: process.dispatcher,
         thunkGenerator,
-        getCpu: () => v86?.cpu || v86?.v86?.cpu,
         getMemory: () => v86.mem8 || (v86.v86 && v86.v86.cpu.mem8) || null,
       });
 
@@ -2808,7 +2812,7 @@ self.onmessage = (event: MessageEvent) => {
       cfg.logOnly = !!message.hleLogOnly;
       Logger.log(LogCategory.SYSTEM, `[HLE-lib] enabled via load_bundle (logOnly=${cfg.logOnly})`);
     }
-    loadBundle({ data: message.data, url: message.url, blob: message.blob, blobs: message.blobs });
+    loadBundle({ data: message.data, url: message.url, blob: message.blob, blobs: message.blobs, preload: message.preload });
   }
 
   // --- WGB wizard build service (Stage 1) — additive, separate from the boot path above. -----

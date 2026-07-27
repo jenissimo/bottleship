@@ -10,6 +10,7 @@ import { allocateComObject } from "../core/com/com-memory";
 import { installComVtable, ComVtableMethod } from "../core/com/install-com-vtable";
 import { tryInprocCoCreateInstance, startInprocFromFactory } from "../core/com/inproc-com";
 import { Mem } from "../core/memory/mem-accessor";
+import { writeGuestCode } from "../core/memory/guest-code";
 import { MEM_THUNK_CODE_BASE, MEM_THUNK_CODE_SIZE } from "../core/cpu/emulator-config";
 
 // COM error codes
@@ -642,7 +643,7 @@ export class Ole32 implements IModule {
         // Allocate memory for stub code
         const stubAddress = this.process.memory.alloc(stubDll.stubCode.length);
         const currentMemory = this.process.getCurrentMemory();
-        currentMemory.set(stubDll.stubCode, stubAddress);
+        writeGuestCode(currentMemory, stubDll.stubCode, stubAddress);
 
         Logger.verbose(LogCategory.COM, `OLE32: Allocated ${stubDll.stubCode.length} bytes for IUnknown stubs at 0x${stubAddress.toString(16)}`);
 

@@ -52,9 +52,38 @@ Legacy Graphics (DirectDraw, D3D3-9). You bridge x86 Windows internals with mode
   - Red zone (NOACCESS, kind RESERVED) sits between THUNK and ROM at MEM_GUARD_BASE; SURFACE is placed
     LAST in the layout so it can grow without colliding.
 - Permission Model:
-  - Enforce RX (read-execute), RW (read-write), NOACCESS at both JS accessor layer (Mem) and CPU page level.
-  - THUNK_CODE is immutable (RX only) — any write is a fatal corruption bug.
-  - Use #PF handler to catch illegal writes; fallback to checksums if page protection unreliable.
+  - RX / RW / NOACCESS are the GUEST's view, enforced at the CPU page level (PageTableManager) and
+    validated for guest-supplied pointers at the JS accessor layer (Mem). They do NOT constrain the
+    HLE layer: JS is the loader/linker and legitimately publishes executable bytes into THUNK_CODE,
+    CALLBACK_STUB, ROM (PE images) and occasionally HEAP.
+  - THUNK_CODE is MUTABLE by design — the ThunkGenerator bump arena grows for the life of the
+    process and ThunkDispatcher rewrites live stubs in place. Only the static sub-regions
+    (callback-stub pool, spin loop) are write-once, and those alone are checksum-guarded; a write
+    into the generator arena is normal operation, not corruption.
+  - GUEST-CODE COHERENCE — the binding rule. v86 caches compiled blocks per 4 KiB PHYSICAL page and
+    drops them only when it observes a GUEST store (TLB_HAS_CODE → jit_dirty_page). A JS write
+    through mem8 is invisible to it. Every JS write of bytes the guest may execute MUST go through
+    writeGuestCode() / invalidateGuestCode() (core/memory/guest-code.ts), and the invalidation must
+    be in the SAME JS TURN as the write — an await in between lets other guest threads re-JIT the
+    page. LoadLibrary* handlers are async, so PE loading is a run-time activity concurrent with
+    other threads, not a quiescent load-time one. Invalidation is page-granular, so one call covers
+    the whole write. Guest self-modifying code needs nothing from us. This depends on the identity
+    map (linear == physical); if paging ever stops being identity, every call site becomes wrong.
+  - #PF / MemWriteTrap catch GUEST illegal writes and are diagnostic. They cannot see a JS write —
+    there is no host mechanism that can (no MMU, and the one trapping Proxy we had cost ~50x).
+    Do not design as if there were. Rationale and migration: plan/guest-code-coherence.md.
+  - guest-code.ts is the SINGLE OWNER of cpu["jit_dirty_cache"] — never call it directly;
+    validate-guest-code-writes.ts (gate step 4) enforces that ownership, which is what stops the
+    chokepoint eroding back into scattered copies. It checks ownership, not coverage: deciding
+    whether `mem[addr+i] = b` targets executable memory needs dataflow, so coverage is enforced
+    structurally instead — the two allocators that hand out executable guest memory
+    (ThunkGenerator's bump, MemoryManager for THUNK_CODE/CALLBACK_STUB/SPIN_LOOP or rx/rwx)
+    invalidate what they hand out, so an in-place emitter is covered without knowing this file
+    exists.
+  - Diagnostics: harness `codeInvalidations` (wired? how much dropped?);
+    `setWorkerFlag('__noCodeInvalidate', true)` reproduces the stale-block failure on demand, and
+    `__codeInvalidateGlobal` escalates every publication to a full clear — if that makes a title
+    work, a JS write of guest code is still missing its invalidation somewhere.
 - Safe Memory Accessors:
   - All HLE modules must use Mem.read*/write* instead of direct mem8[...] access in new/changed code.
   - Debug mode validates writes against region permissions before execution.
@@ -146,6 +175,10 @@ Legacy Graphics (DirectDraw, D3D3-9). You bridge x86 Windows internals with mode
   This class survives pipeline-level bisects — suspect context switching first.
 - Self-restore optimization: if performSwitch picks the same thread, skip restore entirely —
   CPU state is already correct, RET N executes naturally.
+- JS and the guest CPU share one worker thread, so a JS mem.set is atomic w.r.t. the guest —
+  code writes need no locking. The hazard is INTERLEAVING: every await inside an async thunk is a
+  yield point at which other guest threads execute over the address space being modified. Never
+  split a guest-code write from its JIT invalidation across an await (see §3.1 coherence rule).
 
 3.7 WASM Hypercall Tiers
 
@@ -258,7 +291,8 @@ Quality Gate (mandatory order):
   1. bun tools/generate-index.ts
   2. bun tools/validate-signatures.ts
   3. bun tools/validate-struct-offsets.ts
-  4. bun run typecheck
+  4. bun tools/validate-guest-code-writes.ts
+  5. bun run typecheck
 
 Tooling:
   - analyze-trace.ts  — Chrome profiler trace → self/total time per thread, WASM breakdown

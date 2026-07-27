@@ -10,6 +10,7 @@
  */
 
 import { System } from '../../core/system';
+import { writeGuestCode } from '../../core/memory/guest-code';
 import { Logger, LogCategory } from '../../core/logger';
 import { IDC_ARROW, IDC_IBEAM } from './system-cursors';
 
@@ -77,7 +78,7 @@ export function getDefWindowProcAddress(): number {
                 const { address, code } = tg.allocateOneStub('user32', 'DefWindowProcA', 4, 'stdcall');
                 const memArray = system.process?.getCurrentMemory();
                 if (memArray && address + code.length <= memArray.length) {
-                    memArray.set(code, address);
+                    writeGuestCode(memArray, code, address);
                     dispatcher.applyPendingRegistrations?.();
                     addr = address;
                     Logger.log(LogCategory.USER32,

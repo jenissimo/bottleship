@@ -5,8 +5,4 @@ export interface OpenGLFrameInput {
     /** Backing store of the frame vertex arena; DRAW records index into it. */
     vertArena: Float32Array;
     textures: Map<number, GLTextureObject>;
-    viewportX: number;
-    viewportY: number;
-    viewportW: number;
-    viewportH: number;
 }

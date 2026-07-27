@@ -12,6 +12,7 @@
  */
 
 import { Logger, LogCategory } from '../logger';
+import { invalidateGuestCode } from '../memory/guest-code';
 import { Process } from '../process';
 import { preemptionManager } from '../cpu/preemption-manager';
 import { MEM_THUNK_CODE_BASE, MEM_ROM_BASE } from '../cpu/emulator-config';
@@ -4226,5 +4227,6 @@ export class Scheduler {
         mem[this.threadExitStubAddr + off++] = 0x00;
         mem[this.threadExitStubAddr + off++] = 0xEF; // OUT DX, EAX
         while (off < this.threadExitStubSize) mem[this.threadExitStubAddr + off++] = 0x90; // NOP
+        invalidateGuestCode(this.threadExitStubAddr, this.threadExitStubSize);
     }
 }
