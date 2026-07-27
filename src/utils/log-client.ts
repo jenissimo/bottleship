@@ -10,12 +10,29 @@
  * - Automatic flush on connect
  */
 
+import { sessionFromLocation, sessionLogPath, sessionRelPath } from "../harness/session";
+
 type LogEntry = {
   timestamp: number;
   category: string;
   level: number;
   message: string;
 };
+
+/** The dev sidecar this page talks to. VITE_SIDECAR_PORT points a second dev stack at its
+ *  own sidecar (see BS_SIDECAR_PORT) instead of the first stack's logs/. */
+export const SIDECAR_PORT = Number(import.meta.env?.VITE_SIDECAR_PORT ?? 3001);
+
+/** This tab's harness session (`?bs=<name>`), or "" for the default single-tab one. */
+function pageSession(): string {
+  return typeof location === "undefined" ? "" : sessionFromLocation(location.search);
+}
+
+/** Where a logs-relative artifact this tab writes actually lands on disk. Use it for the
+ *  message you print, so an agent is never pointed at another tab's evidence. */
+export function logArtifactPath(rel: string): string {
+  return sessionLogPath(rel, pageSession());
+}
 
 const CONFIG = {
   MAX_BUFFER_SIZE: 10000,      // Max entries to buffer when disconnected
@@ -31,6 +48,9 @@ class LogClient {
   private reconnectDelay = 1000; // Start with 1 second
   private isEnabled = false;
   private url: string;
+  /** Harness session of the tab this client runs in — the archive and every debug file
+   *  it writes are scoped to it, so parallel guests don't interleave into one stream. */
+  private session = pageSession();
 
   // Buffering and batching
   private buffer: LogEntry[] = [];
@@ -40,7 +60,7 @@ class LogClient {
   private backpressureCallback: ((isHeavy: boolean) => void) | null = null;
   private backpressureState = false;
 
-  constructor(port: number = 3001) {
+  constructor(port: number = SIDECAR_PORT) {
     this.url = `ws://localhost:${port}`;
   }
 
@@ -228,6 +248,11 @@ class LogClient {
         this.reconnectAttempts = 0;
         this.reconnectDelay = 1000;
         console.log("[LogClient] Connected to log server");
+        // Claim our own archive file BEFORE the first batch — the sidecar keeps one
+        // log stream per session, and an unclaimed connection lands in the shared one.
+        if (this.session) {
+          try { this.ws?.send(JSON.stringify({ type: "log_session", session: this.session })); } catch { /* best-effort */ }
+        }
         // Flush any buffered logs
         this.flushBuffer();
       };
@@ -311,7 +336,7 @@ class LogClient {
       return false;
     }
     try {
-      this.ws.send(JSON.stringify({ type: "write_file", path: filename, content }));
+      this.ws.send(JSON.stringify({ type: "write_file", path: sessionRelPath(filename, this.session), content }));
       return true;
     } catch {
       return false;
@@ -328,7 +353,7 @@ class LogClient {
       return false;
     }
     try {
-      this.ws.send(JSON.stringify({ type: "write_file_b64", path: filename, base64 }));
+      this.ws.send(JSON.stringify({ type: "write_file_b64", path: sessionRelPath(filename, this.session), base64 }));
       return true;
     } catch {
       return false;

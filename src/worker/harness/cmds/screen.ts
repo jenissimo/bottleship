@@ -8,7 +8,15 @@
 import type { HarnessService } from "../service";
 import { HarnessError, HarnessErrorCode } from "../rpc";
 import { sys } from "../serialize";
+import { sessionLogPath } from "../../../harness/session";
 import { getOverlayCompositePlan, isGameScreenOwned, isFlipScreenOwned, getLiveDialogOverlays } from "../../modules/user32/dialog-overlay";
+
+/** Where a `debug_png_dump` we post actually lands: the host writes it under its own
+ *  session directory, so a `saved` path that ignored the session would point an agent
+ *  at another tab's file. `__bsSession` is seeded by the host at worker init. */
+export function debugDumpPath(name: string): string {
+    return sessionLogPath(`debug/${name}.png`, ((globalThis as any).__bsSession as string) ?? "");
+}
 
 /** Base64-encode bytes (chunked to avoid String.fromCharCode arg overflow). */
 export function bytesToBase64(bytes: Uint8Array): string {
@@ -32,7 +40,7 @@ export function registerScreenCommands(svc: HarnessService): void {
         if (opts.save) {
             const name = opts.save.replace(/\.png$/i, "");
             (self as unknown as Worker).postMessage({ type: "debug_png_dump", name, base64 });
-            saved = `logs/debug/${name}.png`;
+            saved = debugDumpPath(name);
         }
         return { bytes: bytes.length, base64, saved };
     });
@@ -92,7 +100,7 @@ export function registerScreenCommands(svc: HarnessService): void {
         (self as unknown as Worker).postMessage({
             type: "debug_png_dump", name, base64: bytesToBase64(new Uint8Array(await blob.arrayBuffer())),
         });
-        info.saved = `logs/debug/${name}.png`;
+        info.saved = debugDumpPath(name);
         return info;
     });
 

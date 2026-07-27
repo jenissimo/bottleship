@@ -205,13 +205,22 @@ happened" loop in fluent, self-judging verbs. Invoke the `/bringup` skill (`.cla
 for the operational checklist; `bun tools/harness.ts up` does cold-to-ready, then e.g.
 `harness().openWgb(..).waitForEvent('dialogShow').click('Play').tickFrames(120).expectSurfaceNonBlack('primary').state([..]).run()`.
 Drive the emulator through the project's own CDP harness (`tools/harness.ts` / `window.__BS__.harness`),
-NOT a browser MCP — the harness owns the Chrome instance; a second CDP client conflicts with it. Load-bearing facts the harness encodes (and the manual `dbg.*` fallback still needs):
+NOT a browser MCP — an uncoordinated second CDP client fights the harness for the same tab. Several
+HARNESS agents may share the one Chrome: `BS_TAB=<name>` (below) gives each its own tab. Load-bearing
+facts the harness encodes (and the manual `dbg.*` fallback still needs):
   - Dev: `bun run dev` (:5174 plain HTTP by default — automation needn't clear a self-signed cert;
     `bun run dev:ssl` opts into HTTPS) +
     `bun run dev:sidecar` (:3001 dev sidecar — log archive + file writer + Range delivery of `.wgb`
     via `GET /wgb?path=`; `dev:logs` is an alias. Start it BEFORE streaming). Kill a stale Vite via PowerShell
-    `Get-CimInstance Win32_Process | ? CommandLine -match 'vite'` (git-bash `pkill` won't kill it).
+    `Get-CimInstance Win32_Process | ? CommandLine -match 'vite'` (git-bash `pkill` won't kill it) — but
+    match the PID, not the pattern, when other agents are working: that filter kills EVERY Vite on the box.
   - `?game=dev` = the bare emulator exposing `window.loadApp/worker/dbg/__BS__`.
+  - PARALLEL bring-up (the queue is mostly WAITING — a bundle load is gigabytes, a boot is minutes):
+    `BS_TAB=<name>` binds every harness command to its own `?game=dev&bs=<name>` tab of the SAME Chrome
+    and re-roots that run's evidence under `logs/<name>/` (screenshots, journals, dumps, and the sidecar's
+    log archive). Two agents with different names never touch each other's tab or files; with `BS_TAB`
+    unset everything is exactly as it was. Bring-up ONLY — parallel guests share the CPU, so every
+    measurement (`trace`, any A/B timing) must run with one tab open; `harness trace` refuses otherwise.
   - Audio: needs a real gesture OR Chrome's `--autoplay-policy=no-user-gesture-required` (which
     `harness up` sets). Without it AudioContext stays SUSPENDED → SAB play cursor frozen → audio-gated
     logic stalls silently (frames render but the game never advances).

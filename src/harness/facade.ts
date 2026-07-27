@@ -26,6 +26,7 @@ import {
 import type { HarnessStep, HarnessRunResult, HarnessStepResult } from "./types";
 import { isSerializedFn } from "./types";
 import { HarnessChain } from "./dsl";
+import { SIDECAR_PORT } from "../utils/log-client";
 import { INPUT_INDEX, KEY_BITFIELD_BASE, KEY_BITFIELD_COUNT } from "../input/sab-layout";
 import { relativeIntent } from "../input/relative-intent";
 
@@ -222,7 +223,7 @@ export function installHarnessFacade(worker: Worker, getInputView?: () => Int32A
     async function sidecarAvailable(): Promise<boolean> {
         if (wgbSidecar !== null) return wgbSidecar;
         try {
-            const r = await fetch("http://localhost:3001/health", { method: "GET" });
+            const r = await fetch(`http://localhost:${SIDECAR_PORT}/health`, { method: "GET" });
             wgbSidecar = r.ok;
         } catch { wgbSidecar = false; }
         return wgbSidecar;
@@ -245,7 +246,7 @@ export function installHarnessFacade(worker: Worker, getInputView?: () => Int32A
         if (isWinAbs || isPosixAbsWgb) {
             const enc = encodeURIComponent(idOrUrl);
             return (await sidecarAvailable())
-                ? `http://localhost:3001/wgb?path=${enc}`
+                ? `http://localhost:${SIDECAR_PORT}/wgb?path=${enc}`
                 : `/__wgb/?path=${enc}`;
         }
         if (idOrUrl.includes("/")) return idOrUrl;                       // already a URL (/apps/…, /__wgb/…)

@@ -23,6 +23,27 @@ Launches/attaches Chrome with `--autoplay-policy=no-user-gesture-required` (so
 up first: `bun run dev` and `bun run dev:sidecar` (`dev:logs` still works; start the
 server BEFORE streaming). `bun tools/harness.ts health` re-probes.
 
+### Parallel bring-up — one tab per agent
+
+Set `BS_TAB=<name>` (once, for every harness command you run) when another agent is
+already using the emulator:
+
+```
+BS_TAB=alpha bun tools/harness.ts up     # opens/claims ?game=dev&bs=alpha
+BS_TAB=alpha bun tools/harness.ts run my.harness.ts
+BS_TAB=alpha bun tools/harness.ts report
+```
+
+The name picks that tab and ONLY that tab, and re-roots this run's evidence under
+`logs/alpha/` — screenshots, `run-N.harness.ts` journals, `dumpSurface`/`shot({save})`
+PNGs, and the sidecar's log archive. Never read `logs/` at the top level while a
+session is set; that is somebody else's guest.
+
+Rules: pick a name nobody else is using; never close a tab you did not open; and
+**do not measure** — parallel guests share the CPU, so `trace` refuses to run while
+a second guest tab is open, and A/B timing needs a single tab. With `BS_TAB` unset
+everything behaves exactly as it always has.
+
 ## 2. Drive
 
 A fluent chain (`bun tools/harness.ts run <script.harness.ts>`, or in the browser

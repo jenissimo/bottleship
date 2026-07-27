@@ -2631,6 +2631,13 @@ self.onmessage = (event: MessageEvent) => {
     return;
   }
 
+  if (message?.type === "set_session") {
+    // This tab's harness session (?bs=<name>) — see src/harness/session.ts. Only used to
+    // report the real on-disk path of the dumps we emit; the host does the writing.
+    (globalThis as any).__bsSession = typeof message.session === "string" ? message.session : "";
+    return;
+  }
+
   if (message?.type === HARNESS_RPC) {
     // AI-agent harness RPC: {id,cmd,args} -> {id,ok,result|error}. All logic
     // lives in src/worker/harness/ (one-line route, no inline logic).

@@ -30,6 +30,7 @@ import { HarnessError, HarnessErrorCode } from "../rpc";
 import { sys } from "../serialize";
 import { harnessBus } from "../event-bus";
 import { encodePngBase64 } from "./textures";
+import { debugDumpPath } from "./screen";
 import { readSurfaceStateRGBA } from "../../modules/ddraw/gpu-texture-utils";
 import type { DrawObservation } from "../../backends/webgpu/ddraw/ddraw-backend-executor";
 import type { DirectDrawSurfaceState } from "../../modules/ddraw/com-objects";
@@ -176,7 +177,7 @@ export function registerFadeProbeCommands(svc: HarnessService): void {
         const name = (o.save ?? `fadequad_${ptrHex}_${r.w}x${r.h}`).replace(/\.png$/i, "");
         const base64 = await encodePngBase64(r.rgba, r.w, r.h);
         (self as unknown as Worker).postMessage({ type: "debug_png_dump", name, base64 });
-        return { saved: `logs/debug/${name}.png`, w: r.w, h: r.h, source: r.source, texPtr: "0x" + ptrHex };
+        return { saved: debugDumpPath(name), w: r.w, h: r.h, source: r.source, texPtr: "0x" + ptrHex };
     });
 
     svc.register("fadeProbeOff", () => {

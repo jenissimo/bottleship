@@ -20,11 +20,18 @@
  * list to `window.__BS__.harness.__runSteps` in the page over a single CDP eval —
  * except the CDP_STEPS verbs (reload + the touch/device verbs), which the CLI runs
  * itself against the browser and splices back into the same ordered result.
+ *
+ * Parallel agents: `BS_TAB=<name>` binds every command to the `?game=dev&bs=<name>` tab
+ * and re-roots this run's artifacts under `logs/<name>/`. Several agents can then bring up
+ * several games in one Chrome without reading each other's evidence. Unset = unchanged.
+ * Bring-up only — `trace` refuses to measure while a second guest is running.
  */
 
 import {
     launchOrAttachChrome,
     findOrCreateTab,
+    listSessionTabs,
+    cdpSession,
     connect,
     pageEval,
     workerEval,
@@ -40,8 +47,18 @@ import { applyDevice, tap, touchDrag, longPress, twoFingerTap, pinch } from "./c
 import { HarnessChain } from "../src/harness/dsl";
 import type { HarnessStep, HarnessRunResult, HarnessStepResult } from "../src/harness/types";
 import { runResultToJournal } from "../src/harness/journal";
+import { sessionArtifactPath } from "../src/harness/session";
 
 let _session: CdpSession | null = null;
+
+/** The tab this process drives (`BS_TAB`); "" = the default single-tab session. */
+const SESSION = cdpSession();
+
+/** Re-root a default artifact path under `logs/<session>/` so two tabs never overwrite
+ *  each other's evidence. An explicitly passed output path is left alone. */
+function artifact(path: string): string {
+    return sessionArtifactPath(path, SESSION);
+}
 
 async function ensureSession(): Promise<CdpSession> {
     if (_session) return _session;
@@ -167,7 +184,7 @@ async function execViaCdp(steps: HarnessStep[]): Promise<HarnessRunResult> {
     }
 
     try {
-        const file = `logs/harness/run-${++_journalSeq}.harness.ts`;
+        const file = artifact(`logs/harness/run-${++_journalSeq}.harness.ts`);
         await Bun.write(file, runResultToJournal(steps, result));
         console.log(`[harness] journal -> ${file} (${result.ok ? "ok" : "FAILED at step " + result.error?.atStep})`);
     } catch { /* logs/ may not exist; non-fatal */ }
@@ -193,6 +210,7 @@ async function cmdUp(): Promise<void> {
     const ping = await pageEval(session, "window.__BS__.harness.ping()", { timeoutMs: 8000 }).catch((e) => ({ error: String(e) }));
     console.log("[harness up] worker ping:", JSON.stringify(ping));
     console.log(`[harness up] ready — tab ${tab.id} (${tab.url})`);
+    if (SESSION) console.log(`[harness up] session '${SESSION}' — artifacts under logs/${SESSION}/`);
 }
 
 async function cmdRun(scriptPath: string): Promise<void> {
@@ -317,7 +335,7 @@ async function cmdFixture(mode: string, name: string, args: string[]): Promise<v
 async function cmdShot(out: string): Promise<void> {
     const session = await ensureSession();
     const b64 = await screenshot(session);
-    const file = out || "logs/harness-shot.png";
+    const file = out || artifact("logs/harness-shot.png");
     await Bun.write(file, Buffer.from(b64, "base64"));
     console.log(`screenshot -> ${file} (${b64.length} b64 chars)`);
 }
@@ -375,7 +393,7 @@ async function cmdGridShot(out: string, stepArg?: string): Promise<void> {
     const scale = Math.max(1, Math.min(3, Math.round((geo.guest.w / Math.max(1, geo.rect.w)) * 10) / 10));
     const clip = { x: Math.max(0, geo.rect.x), y: Math.max(0, geo.rect.y - pad), width: geo.rect.w, height: geo.rect.h + pad, scale };
     const shot = await session.send("Page.captureScreenshot", { format: "png", clip });
-    const file = out || "logs/harness-gridshot.png";
+    const file = out || artifact("logs/harness-gridshot.png");
     await Bun.write(file, Buffer.from(shot.result?.data ?? "", "base64"));
     await pageEval(session, "(()=>{const o=document.getElementById('__bs_grid_overlay');if(o)o.remove();return 1})()", { timeoutMs: 5000 }).catch(() => {});
     console.log(`gridShot -> ${file}  guest=${geo.guest.w}x${geo.guest.h} step=${meta.step}px controls=${meta.controls}`);
@@ -383,10 +401,23 @@ async function cmdGridShot(out: string, stepArg?: string): Promise<void> {
 }
 
 /** trace <seconds> [out.json.gz] — capture a Chrome perf trace for tools/analyze-trace.ts.
- *  Drive the game into the state you want FIRST; this only records. */
+ *  Drive the game into the state you want FIRST; this only records.
+ *
+ *  Refuses to run while a second guest is open: tracing is a BROWSER-level domain (it
+ *  records every renderer), and two guests share the CPU, so both the trace contents and
+ *  any timing read off it describe a machine nobody was measuring. Parallel sessions are
+ *  a bring-up tool; measurement is single-tab. `BS_ALLOW_PARALLEL_TRACE=1` to override. */
 async function cmdTrace(secondsArg?: string, out?: string): Promise<void> {
     const seconds = Number(secondsArg ?? 10);
-    const file = out ?? `logs/trace-${seconds}s.json.gz`;
+    const tabs = await listSessionTabs().catch(() => []);
+    if (tabs.length > 1 && process.env.BS_ALLOW_PARALLEL_TRACE !== "1") {
+        throw new Error(
+            `refusing to trace: ${tabs.length} guest tabs are open (${tabs.map((t) => t.url.slice(-40)).join(", ")}).\n` +
+            "  A Chrome trace is browser-wide and parallel guests share the CPU — the numbers would be noise.\n" +
+            "  Close the other sessions' tabs, or set BS_ALLOW_PARALLEL_TRACE=1 if you really only want the trace shape.",
+        );
+    }
+    const file = out ?? artifact(`logs/trace-${seconds}s.json.gz`);
     console.log(`tracing ${seconds}s -> ${file} …`);
     const r = await captureTrace(file, seconds);
     console.log(`  ${r.events} events, ${(r.bytes / 1024 / 1024).toFixed(1)} MB`);

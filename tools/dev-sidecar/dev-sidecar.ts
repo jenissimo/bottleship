@@ -3,9 +3,10 @@
  * for both the app and the agent harness. Four roles:
  *
  *  - **log archive** — the durable tier behind the in-worker ring (`log-hub.ts`): WS ingest,
- *    per-game rotation, size/age pruning.
+ *    per-game rotation, size/age pruning. One archive per harness session (the page announces
+ *    its `?bs=<name>` with `log_session`), so parallel agents' guests never interleave.
  *  - **file writer** — `write_file` / `write_file_b64`, how surface and GetDIBits dumps reach
- *    `logs/debug/` (a page cannot write to the repo).
+ *    `logs/debug/` (a page cannot write to the repo). The client prefixes its session dir.
  *  - **bundle delivery** — `GET /wgb?path=…` with Range, deliberately NOT via the Vite dev
  *    server (see serveWgb below).
  *  - **liveness** — `/health`, one of the three services `harness up` probes.
@@ -16,9 +17,12 @@
 import { appendFile, readdir, unlink, stat, mkdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { existsSync } from "node:fs";
+import { normalizeSession, sessionLogDir } from "../../src/harness/session";
 
 const CONFIG = {
-  PORT: 3001,
+  // BS_SIDECAR_PORT lets a SECOND dev stack (an isolated worktree, a test) run without
+  // writing into the first one's logs/. Pair it with VITE_SIDECAR_PORT on the page.
+  PORT: Number(process.env.BS_SIDECAR_PORT ?? 3001),
   LOG_DIR: "logs",
   MAX_SIZE: 50 * 1024 * 1024,  // 50MB per file (increased from 20MB)
   MAX_FILES: 5,                 // Keep only 5 files (reduced from 20)
@@ -51,11 +55,17 @@ class LogManager {
   private timer: Timer | null = null;
   private dirReady = false;
   private flushing = false; // Prevent concurrent flushes
+  private readonly dir: string;
 
-  constructor() {
+  /** `session` scopes the archive to its own directory: parallel guests would otherwise
+   *  interleave into one file, and a firehose that mixes two games is worse than none. */
+  constructor(session = "") {
+    this.dir = sessionLogDir(CONFIG.LOG_DIR, session);
     this.ensureDir().then(() => {
       this.dirReady = true;
-      this.rotate();
+      // A client can rotate (naming the file after its game) before mkdir resolves —
+      // don't stomp that name with the default one.
+      if (!this.currentPath) this.rotate();
     });
     setInterval(() => this.cleanup(), 3600000);
   }
@@ -65,15 +75,15 @@ class LogManager {
   }
 
   async ensureDir(): Promise<void> {
-    if (!existsSync(CONFIG.LOG_DIR)) {
-      await mkdir(CONFIG.LOG_DIR, { recursive: true });
+    if (!existsSync(this.dir)) {
+      await mkdir(this.dir, { recursive: true });
     }
   }
 
   private rotate(game?: string) {
     const stamp = new Date().toISOString().replace(/[:T]/g, "-").slice(0, 19).replace(/-(\d\d)-(\d\d)$/, "-$1$2");
     const suffix = game ? "-" + game.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 40) : "";
-    this.currentPath = join(CONFIG.LOG_DIR, `bottleship-${stamp}${suffix}.log`);
+    this.currentPath = join(this.dir, `bottleship-${stamp}${suffix}.log`);
     this.currentSize = 0;
   }
 
@@ -125,9 +135,9 @@ class LogManager {
 
   async cleanup() {
     try {
-      const files = (await readdir(CONFIG.LOG_DIR))
+      const files = (await readdir(this.dir))
         .filter(f => f.startsWith("bottleship-"))
-        .map(f => join(CONFIG.LOG_DIR, f));
+        .map(f => join(this.dir, f));
 
       const stats = await Promise.all(files.map(async path => ({ path, s: await stat(path) })));
       const now = Date.now();
@@ -143,7 +153,15 @@ class LogManager {
   }
 }
 
-const logger = new LogManager();
+/** One archive per harness session (`?bs=<name>` on the page). "" is the default
+ *  single-tab session and keeps writing straight to `logs/`. */
+const loggers = new Map<string, LogManager>([["", new LogManager()]]);
+
+function loggerFor(session: string): LogManager {
+  let m = loggers.get(session);
+  if (!m) { m = new LogManager(session); loggers.set(session, m); }
+  return m;
+}
 
 /**
  * `GET /wgb?path=<absolute .wgb>` — Range-capable delivery of a bundle straight off disk.
@@ -165,10 +183,10 @@ const logger = new LogManager();
  * files off this machine" is the origin. `*` would hand that away — CORS is the access control
  * here, not a formality.
  */
-const DEV_ORIGINS = new Set([
-  "http://localhost:5174", "https://localhost:5174",
-  "http://127.0.0.1:5174", "https://127.0.0.1:5174",
-]);
+const DEV_PORTS = [5174, ...(process.env.BS_VITE_PORT ? [Number(process.env.BS_VITE_PORT)] : [])];
+const DEV_ORIGINS = new Set(DEV_PORTS.flatMap((p) =>
+  ["http", "https"].flatMap((s) => [`${s}://localhost:${p}`, `${s}://127.0.0.1:${p}`]),
+));
 
 function wgbHeaders(req: Request): Record<string, string> {
   const origin = req.headers.get("origin");
@@ -227,10 +245,14 @@ async function serveWgb(req: Request, url: URL): Promise<Response> {
   return new Response(f, { status: 200, headers });
 }
 
-const server = Bun.serve({
+/** Per-connection state: which session's archive this client's lines belong to.
+ *  Set by the `log_session` message the page sends on connect. */
+interface SocketData { session: string }
+
+const server = Bun.serve<SocketData>({
   port: CONFIG.PORT,
   fetch(req, server) {
-    if (server.upgrade(req)) return;
+    if (server.upgrade(req, { data: { session: "" } })) return;
     const url = new URL(req.url);
     if (url.pathname === "/wgb") return serveWgb(req, url);
     // CORS/CORP on EVERY response, not just /wgb: the page is cross-origin isolated
@@ -252,12 +274,20 @@ const server = Bun.serve({
     async message(ws, msg) {
       try {
         const data = JSON.parse(String(msg));
+        if (data.type === "log_session") {
+          // A tab claiming its own archive file (multi-agent parallel bring-up).
+          ws.data.session = normalizeSession(data.session);
+          loggerFor(ws.data.session);
+          console.log(`[WS] Client session -> '${ws.data.session || "(default)"}'`);
+          return;
+        }
+        const log = loggerFor(ws.data.session);
         if (data.type === "log_entry") {
-          logger.add(data.entry);
+          log.add(data.entry);
         } else if (data.type === "log_batch" && Array.isArray(data.entries)) {
           console.log(`[WS] Received batch: ${data.entries.length} entries`);
           for (const entry of data.entries) {
-            logger.add(entry);
+            log.add(entry);
           }
         } else if (data.type === "write_file" && typeof data.path === "string" && typeof data.content === "string") {
           const fullPath = resolveSafeLogPath(data.path);
@@ -265,7 +295,7 @@ const server = Bun.serve({
             ws.send(JSON.stringify({ type: "write_file_error", error: "invalid_path" }));
             return;
           }
-          await logger.ensureDir();
+          await log.ensureDir();
           await mkdir(dirname(fullPath), { recursive: true });
           await writeFile(fullPath, data.content, "utf8");
           console.log(`[FS] Wrote debug file: ${fullPath} (${data.content.length} bytes)`);
@@ -277,14 +307,14 @@ const server = Bun.serve({
             return;
           }
           const raw = Buffer.from(data.base64, "base64");
-          await logger.ensureDir();
+          await log.ensureDir();
           await mkdir(dirname(fullPath), { recursive: true });
           await writeFile(fullPath, raw);
           console.log(`[FS] Wrote debug binary file: ${fullPath} (${raw.byteLength} bytes)`);
           ws.send(JSON.stringify({ type: "write_file_ok", path: fullPath }));
         } else if (data.type === "log_rotate") {
-          await logger.rotateForGame(typeof data.game === "string" && data.game ? data.game : undefined);
-          ws.send(JSON.stringify({ type: "log_rotate_ok", path: logger.currentPathPublic }));
+          await log.rotateForGame(typeof data.game === "string" && data.game ? data.game : undefined);
+          ws.send(JSON.stringify({ type: "log_rotate_ok", path: log.currentPathPublic }));
         } else if (data.type === "ping") {
           ws.send(JSON.stringify({ type: "pong" }));
         }
@@ -295,7 +325,7 @@ const server = Bun.serve({
 
 const shutdown = async () => {
   console.log("Shutting down...");
-  await logger.flush();
+  await Promise.all([...loggers.values()].map((l) => l.flush()));
   server.stop();
   process.exit(0);
 };

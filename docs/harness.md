@@ -20,6 +20,27 @@ silently otherwise), opens the bare emulator page, and waits until everything is
 
 In the browser console the same capability is on `window.__BS__.harness`.
 
+## Several games at once
+
+Bringing a game up is mostly *waiting* — a bundle is gigabytes, a boot is minutes — so the harness
+supports several agents driving several tabs of the **same** Chrome:
+
+```bash
+BS_TAB=alpha bun tools/harness.ts up     # -> ?game=dev&bs=alpha, artifacts under logs/alpha/
+BS_TAB=bravo bun tools/harness.ts up     # -> ?game=dev&bs=bravo, artifacts under logs/bravo/
+```
+
+A session name selects (or opens) its own tab and re-roots everything that run produces —
+screenshots, journals, surface dumps, and the sidecar's log archive — under `logs/<name>/`. Two
+sessions can therefore never read each other's evidence, which is the whole point: a diagnostic
+that silently describes the wrong guest is worse than no diagnostic. With `BS_TAB` unset nothing
+changes: the same tab, the same paths as always.
+
+**Limits.** This is a bring-up facility, not a measurement one. Parallel guests share CPU and GPU,
+so any timing you read while two are running is noise — `harness trace` refuses to record while a
+second guest tab is open. Each tab also costs a full emulator (its own worker, SAB and VRAM), so
+memory, not CPU, sets the ceiling; 2-3 concurrent bring-ups is the sane range on a normal desktop.
+
 ## Driving a game
 
 The harness exposes a fluent, self-checking DSL. A bring-up script reads like the steps a human

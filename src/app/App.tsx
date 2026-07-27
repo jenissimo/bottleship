@@ -11,7 +11,8 @@ import DebugGPUPanel from '../debug/DebugGPUPanel';
 import FrameAnalysisPanel from '../debug/FrameAnalysisPanel';
 import { InputStatusOverlay, type InputStatus } from './InputStatusOverlay';
 import { AudioEngine, AudioPlayEncodedPayload, AudioPlayPayload, AudioUpdatePayload } from "../audio/audio-engine";
-import { getLogClient, sendLogToServer, writeDebugFile, writeDebugFileBase64, rotateLogFile } from "../utils/log-client";
+import { getLogClient, sendLogToServer, writeDebugFile, writeDebugFileBase64, rotateLogFile, logArtifactPath } from "../utils/log-client";
+import { sessionFromLocation } from "../harness/session";
 import { installHarnessFacade } from "../harness/facade";
 import { getCachedGamepadMeta, initGamepadCache, readLiveGamepad, rescanGamepads } from "../gamepad-cache";
 import GameSelectScreen, { type GameEntry } from "../library/GameSelectScreen";
@@ -733,6 +734,11 @@ export default function App() {
       // Expose worker to console for debugging
       (window as any).worker = globalWorker;
 
+      // Harness session of this tab (?bs=<name>): the worker returns disk paths for the
+      // dumps it emits, and those must name the session's own directory — an agent sent
+      // to logs/debug/ while its PNG went to logs/alpha/debug/ reads a sibling's evidence.
+      globalWorker.postMessage({ type: "set_session", session: sessionFromLocation(window.location.search) });
+
       // Persisted debug flags (e.g. __noHeapSlab to A/B the WASM heap slab). Replayed to
       // the worker on EVERY page load BEFORE any game loads, so a toggle survives F5.
       // Set from the console: dbgFlag('__noHeapSlab', true)  → persists + applies live.
@@ -963,18 +969,19 @@ export default function App() {
           const manifestOk = writeDebugFile(`${base}.json`, JSON.stringify(manifest, null, 2));
           const dumpOk = writeDebugFileBase64(`${base}.bin`, bytesToBase64(new Uint8Array(bytes)));
           if (manifestOk && dumpOk) {
-            console.log(`BottleShip: SEH runtime dump saved -> logs/${base}.{json,bin}`);
+            console.log(`BottleShip: SEH runtime dump saved -> ${logArtifactPath(base)}.{json,bin}`);
           } else {
             console.warn(`BottleShip: SEH runtime dump not persisted (log server disconnected?) -> ${base}`);
           }
         }
       } else if (event.data?.type === "debug_png_dump") {
-        // Worker-side bitmap dump for visual debugging: base64 PNG -> logs/debug/<name>.png
+        // Worker-side bitmap dump for visual debugging: base64 PNG -> logs/[<session>/]debug/<name>.png
         const name = typeof event.data?.name === "string" ? event.data.name : "dump";
         const base64 = typeof event.data?.base64 === "string" ? event.data.base64 : "";
         if (base64) {
-          const ok = writeDebugFileBase64(`debug/${name}.png`, base64);
-          console.log(`BottleShip: debug PNG ${ok ? "saved" : "NOT saved (log server?)"} -> logs/debug/${name}.png`);
+          const rel = `debug/${name}.png`;
+          const ok = writeDebugFileBase64(rel, base64);
+          console.log(`BottleShip: debug PNG ${ok ? "saved" : "NOT saved (log server?)"} -> ${logArtifactPath(rel)}`);
         }
       }
 

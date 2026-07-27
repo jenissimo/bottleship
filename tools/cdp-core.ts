@@ -6,15 +6,27 @@
  * Map request loop, and the Target.setAutoAttach worker-session dance. This file
  * extracts all of it once.
  *
- * Exports: launchOrAttachChrome, findTab, findOrCreateTab, closeStaleTabs,
- * connect (-> CdpSession), pageEval, workerEval, screenshot, captureTrace, health.
+ * Exports: launchOrAttachChrome, findTab, findOrCreateTab, closeStaleTabs, listTargets,
+ * listSessionTabs, connect (-> CdpSession), pageEval, workerEval, screenshot,
+ * captureTrace, health.
+ *
+ * Target discovery is session-scoped (src/harness/session.ts): `BS_TAB=<name>` pins every
+ * lookup to the `?game=dev&bs=<name>` tab, so several agents can drive several tabs of one
+ * Chrome. Unset = the historical single-tab behaviour.
  *
  * Bun script (top-level await, Bun.spawnSync, global fetch/WebSocket).
  */
 import { gzipSync } from "node:zlib";
+import { closeSync, openSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pickSessionTab, sessionFromEnv, sessionOwnsUrl, sessionUrl } from "../src/harness/session";
 
-export const DEFAULT_CDP_PORT = 9333;
-export const DEFAULT_DEV_URL = "http://localhost:5174/?game=dev";
+export const DEFAULT_CDP_PORT = Number(process.env.BS_CDP_PORT ?? 9333);
+/** BS_DEV_URL / BS_SIDECAR_PORT point the tools at a SECOND dev stack (an isolated
+ *  worktree, a test rig) so it never drives or writes into the first one's. */
+export const DEFAULT_DEV_URL = process.env.BS_DEV_URL ?? "http://localhost:5174/?game=dev";
+export const SIDECAR_PORT = Number(process.env.BS_SIDECAR_PORT ?? 3001);
 export const GAME_DEV_FILTER = "game=dev";
 const IS_MAC = process.platform === "darwin";
 const CHROME_PATH = IS_MAC
@@ -38,6 +50,46 @@ async function fetchJson(port: number, path: string): Promise<any> {
     return r.json();
 }
 
+/** The session this process drives (`BS_TAB`); "" = the default single-tab session. */
+export function cdpSession(): string {
+    return sessionFromEnv(process.env);
+}
+
+/**
+ * Cross-process guard so two concurrent `harness up` runs don't each launch Chrome on
+ * the same port. Machine-global (os tmpdir, keyed by port) — parallel agents work from
+ * separate git worktrees, so anything under cwd would not be shared. A lock older than
+ * the launch timeout is stolen: a crashed launcher must not wedge the port forever.
+ */
+const LAUNCH_LOCK_TTL_MS = 45_000;
+
+function acquireLaunchLock(port: number): (() => void) | null {
+    const path = join(tmpdir(), `bottleship-cdp-launch-${port}.lock`);
+    for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+            closeSync(openSync(path, "wx"));
+            return () => { try { rmSync(path); } catch { /* already gone */ } };
+        } catch {
+            try {
+                if (Date.now() - statSync(path).mtimeMs > LAUNCH_LOCK_TTL_MS) { rmSync(path); continue; }
+            } catch { continue; }
+            return null;
+        }
+    }
+    return null;
+}
+
+async function waitForChrome(port: number, tries: number): Promise<any> {
+    for (let i = 0; i < tries; i++) {
+        try {
+            return await fetchJson(port, "/json/version");
+        } catch {
+            await Bun.sleep(300);
+        }
+    }
+    throw new Error(`Chrome did not come up on :${port} within ${Math.round(tries * 0.3)}s`);
+}
+
 /** Probe Chrome's debug endpoint; launch a DETACHED instance if it's down. */
 export async function launchOrAttachChrome(opts: { port?: number; profile?: string; autoplay?: boolean } = {}): Promise<any> {
     const port = opts.port ?? DEFAULT_CDP_PORT;
@@ -47,6 +99,24 @@ export async function launchOrAttachChrome(opts: { port?: number; profile?: stri
         return await fetchJson(port, "/json/version");
     } catch {
         /* not running — launch below */
+    }
+    const release = acquireLaunchLock(port);
+    // Someone else is already launching this port: wait for THEIR Chrome instead of
+    // racing a second one onto the same profile directory.
+    if (!release) return waitForChrome(port, 100);
+    try {
+        return await launchChrome(port, profile, autoplay);
+    } finally {
+        release();
+    }
+}
+
+async function launchChrome(port: number, profile: string, autoplay: boolean): Promise<any> {
+    // Re-probe under the lock — the winner may have finished between our probe and here.
+    try {
+        return await fetchJson(port, "/json/version");
+    } catch {
+        /* still down — launch */
     }
     const args = [
         `--remote-debugging-port=${port}`,
@@ -80,39 +150,47 @@ export async function launchOrAttachChrome(opts: { port?: number; profile?: stri
         const psArgs = args.map((a) => `'${a}'`).join(",");
         Bun.spawnSync(["powershell", "-NoProfile", "-Command", `Start-Process -FilePath '${CHROME_PATH}' -ArgumentList ${psArgs}`]);
     }
-    for (let i = 0; i < 50; i++) {
-        try {
-            return await fetchJson(port, "/json/version");
-        } catch {
-            await Bun.sleep(300);
-        }
-    }
-    throw new Error(`Chrome did not come up on :${port} within 15s`);
+    return waitForChrome(port, 50);
 }
 
-/** Find the first target matching a url substring + type (default page/game=dev).
- *  Multi-agent isolation: when env `BS_TAB` is set, the match additionally requires the url to
- *  contain that marker — so two agents can each pin their own `?game=dev&<marker>` tab without
- *  stealing each other's. With BS_TAB unset the behaviour is unchanged (first game=dev tab). */
-export async function findTab(urlMatch = GAME_DEV_FILTER, opts: { type?: string; port?: number } = {}): Promise<CdpTarget> {
+/** Every target Chrome reports (page, worker, iframe…). */
+export async function listTargets(opts: { port?: number } = {}): Promise<CdpTarget[]> {
+    return fetchJson(opts.port ?? DEFAULT_CDP_PORT, "/json/list");
+}
+
+/** The `?game=dev` page tabs, one per harness session that has one open. */
+export async function listSessionTabs(opts: { port?: number } = {}): Promise<CdpTarget[]> {
+    const list = await listTargets(opts);
+    return list.filter((t) => t.type === "page" && t.url.includes(GAME_DEV_FILTER));
+}
+
+/** Find the target this session drives (default page/game=dev).
+ *  Multi-agent isolation: with `BS_TAB=<name>` set, only a tab carrying the matching
+ *  `?bs=<name>` token matches, so two agents never steal each other's. With BS_TAB unset
+ *  an UNMARKED tab wins (a named sibling's tab is not hijacked), falling back to the first
+ *  game=dev tab — which is the unchanged behaviour when no session is in play. */
+export async function findTab(urlMatch = GAME_DEV_FILTER, opts: { type?: string; port?: number; strict?: boolean } = {}): Promise<CdpTarget> {
     const port = opts.port ?? DEFAULT_CDP_PORT;
     const type = opts.type ?? "page";
-    const marker = (process.env.BS_TAB ?? "").trim();
+    const session = cdpSession();
     const list: CdpTarget[] = await fetchJson(port, "/json/list");
-    const hit = list.find((t) => t.type === type && t.url.includes(urlMatch) && (!marker || t.url.includes(marker)));
+    const hit = pickSessionTab(list, session, { type, urlMatch, strict: opts.strict });
     if (!hit) {
         const avail = list.map((t) => `${t.type}:${t.url.slice(-60)}`).join("\n  ");
-        throw new Error(`no ${type} tab matching '${urlMatch}'${marker ? ` + BS_TAB '${marker}'` : ""}. Open tabs:\n  ${avail}`);
+        throw new Error(`no ${type} tab matching '${urlMatch}'${session ? ` + BS_TAB '${session}'` : ""}. Open tabs:\n  ${avail}`);
     }
     return hit;
 }
 
+/** Close this session's game=dev tabs. Tabs belonging to another session are left
+ *  alone — a sibling agent's guest must survive our teardown. */
 export async function closeStaleTabs(urlMatch = GAME_DEV_FILTER, opts: { port?: number } = {}): Promise<number> {
     const port = opts.port ?? DEFAULT_CDP_PORT;
+    const session = cdpSession();
     const list: CdpTarget[] = await fetchJson(port, "/json/list");
     let closed = 0;
     for (const t of list) {
-        if (t.type === "page" && t.url.includes(urlMatch)) {
+        if (t.type === "page" && t.url.includes(urlMatch) && sessionOwnsUrl(t.url, session)) {
             try {
                 await fetch(`http://localhost:${port}/json/close/${t.id}`);
                 closed++;
@@ -122,18 +200,20 @@ export async function closeStaleTabs(urlMatch = GAME_DEV_FILTER, opts: { port?: 
     return closed;
 }
 
-/** Find an existing game=dev tab, or open one at `url` (PUT then GET fallback). */
+/** Find this session's game=dev tab, or open one at `url` (PUT then GET fallback).
+ *  Creation is strict: rather open our own tab than adopt one another session owns. */
 export async function findOrCreateTab(url = DEFAULT_DEV_URL, opts: { port?: number } = {}): Promise<CdpTarget> {
     const port = opts.port ?? DEFAULT_CDP_PORT;
     try {
-        return await findTab(GAME_DEV_FILTER, { port });
+        return await findTab(GAME_DEV_FILTER, { port, strict: true });
     } catch { /* create below */ }
-    const newUrl = `http://localhost:${port}/json/new?${encodeURIComponent(url)}`;
+    const target = sessionUrl(url, cdpSession());
+    const newUrl = `http://localhost:${port}/json/new?${encodeURIComponent(target)}`;
     for (const method of ["PUT", "GET"]) {
         const r = await fetch(newUrl, { method });
         if (r.ok) return r.json();
     }
-    throw new Error(`failed to open tab ${url} (PUT and GET both rejected)`);
+    throw new Error(`failed to open tab ${target} (PUT and GET both rejected)`);
 }
 
 /** A live CDP WebSocket session with id-correlated requests + event fan-out. */
@@ -430,9 +510,10 @@ export async function health(opts: { port?: number } = {}): Promise<HealthReport
     const probe = async (url: string, init?: RequestInit) => {
         try { return (await fetch(url, init)).ok; } catch { return false; }
     };
-    const vite = (await probe("http://localhost:5174/health")) || (await probe(DEFAULT_DEV_URL));
+    const viteOrigin = new URL(DEFAULT_DEV_URL).origin;
+    const vite = (await probe(`${viteOrigin}/health`)) || (await probe(DEFAULT_DEV_URL));
     const logServer = await (async () => {
-        try { return (await (await fetch("http://localhost:3001/health")).text()).trim() === "OK"; } catch { return false; }
+        try { return (await (await fetch(`http://localhost:${SIDECAR_PORT}/health`)).text()).trim() === "OK"; } catch { return false; }
     })();
     let chrome = false, devTab = false;
     try {

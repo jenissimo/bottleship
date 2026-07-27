@@ -15,7 +15,7 @@
 import type { HarnessService, HarnessCtx } from "../service";
 import { HarnessError, HarnessErrorCode } from "../rpc";
 import { getModule, guestMem, serializeSurfaces, sys } from "../serialize";
-import { bytesToBase64 } from "./screen";
+import { bytesToBase64, debugDumpPath } from "./screen";
 import { devices as d3d9Devices } from "../../modules/d3d9/shared-state";
 import { startCapture as frameCaptureStart } from "../../modules/ddraw/frame-capture";
 import { asArrayBufferView } from "../../../dom-buffer";
@@ -75,7 +75,7 @@ export function registerTextureCommands(svc: HarnessService): void {
         const name = (opts.save ?? `surf_${ptr.toString(16)}_${r.w}x${r.h}`).replace(/\.png$/i, "");
         const base64 = await encodePngBase64(r.rgba, r.w, r.h);
         (self as unknown as Worker).postMessage({ type: "debug_png_dump", name, base64 });
-        return { saved: `logs/debug/${name}.png`, ptr: "0x" + ptr.toString(16), w: r.w, h: r.h, source: r.source };
+        return { saved: debugDumpPath(name), ptr: "0x" + ptr.toString(16), w: r.w, h: r.h, source: r.source };
     };
     svc.register("dumpSurface", dump);
     svc.register("dumpTexture", dump);
