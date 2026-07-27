@@ -13,6 +13,7 @@ import { resolveThunkedDllAlias } from '../../../core/dll-aliases';
 import { THUNKED_DLL_PSEUDO_BASE } from '../../../core/hle-system-catalog';
 import { getProcAddressRegistry, type GetProcResolution } from '../../../core/diagnostics/get-proc-address-registry';
 import { SILENT_STUBS } from '../../../core/diagnostics/api-census';
+import { resolveHleExportAddress } from '../../../core/thunking/export-resolver';
 
 export const exports: Record<string, ThunkImplementation> = {};
 
@@ -322,79 +323,7 @@ function buildGetProcPointerCacheKey(hModule: number, lpProcName: number): strin
     return `${hModule >>> 0}@${lpProcName >>> 0}`;
 }
 
-/**
- * Resolve a thunked DLL export by name, creating an on-demand stub when needed.
- * Used by GetProcAddress and boot-time warmup for dynamic-only exports.
- */
-function resolveThunkedExportAddress(
-    dispatcher: any,
-    dllName: string,
-    exportName: string,
-    verbose = false,
-): number {
-    const system = System.getInstance();
-    const apiRegistry = APIRegistry.getInstance();
-    const tg = dispatcher?.thunkGenerator;
-    if (!tg) return 0;
-
-    const dataAddr = tg.getDataExportAddress(dllName, exportName);
-    if (dataAddr !== undefined) return dataAddr >>> 0;
-
-    const byQualifiedName = tg.getExportAddress(`${dllName}:${exportName}`);
-    if (byQualifiedName !== undefined) return byQualifiedName >>> 0;
-    const byShortName = tg.getExportAddress(exportName);
-    if (byShortName !== undefined) return byShortName >>> 0;
-
-    const inApi = apiRegistry.hasExportedFunction(dllName, exportName);
-    const pendingKey = `${dllName}:${exportName}`.toLowerCase();
-    const hasPending = !!dispatcher?.pendingRegistrations?.has(pendingKey);
-    if (!apiRegistry.hasModule(dllName) && !hasPending) return 0;
-
-    const argCount = apiRegistry.getArgCount(dllName, exportName);
-    const stackCleanupBytes = apiRegistry.getStackCleanupBytes(dllName, exportName);
-    if (!inApi && !hasPending && argCount === undefined && stackCleanupBytes === undefined) {
-        return 0;
-    }
-
-    const callingConv = apiRegistry.getCallingConvention(dllName, exportName);
-    try {
-        const { address: stubAddr, code } = tg.allocateOneStub(
-            dllName,
-            exportName,
-            argCount ?? 0,
-            callingConv || 'stdcall',
-            stackCleanupBytes ?? 0,
-        );
-
-        const memArray = system.process?.getCurrentMemory();
-        if (memArray && stubAddr + code.length <= memArray.length) {
-            memArray.set(code, stubAddr);
-            if (typeof dispatcher.bindPendingRegistrationsForFunctionId === "function") {
-                dispatcher.bindPendingRegistrationsForFunctionId(tg.getStubByAddress(stubAddr)?.functionId ?? 0);
-            } else {
-                dispatcher.applyPendingRegistrations();
-            }
-            if (verbose) {
-                Logger.verbose(
-                    LogCategory.KERNEL32,
-                    `GetProcAddress: created stub ${dllName}:${exportName} at 0x${stubAddr.toString(16)}`
-                );
-            }
-            Logger.log(
-                LogCategory.KERNEL32,
-                `GetProcAddress: created on-demand stub ${dllName}:${exportName} -> 0x${stubAddr.toString(16)}`
-            );
-            return stubAddr >>> 0;
-        }
-        Logger.warn(
-            LogCategory.KERNEL32,
-            `GetProcAddress: stub ${dllName}:${exportName} at 0x${stubAddr.toString(16)} exceeds guest mem (len=${memArray?.length ?? 0})`
-        );
-    } catch (e) {
-        Logger.warn(LogCategory.KERNEL32, `GetProcAddress: stub creation failed for ${dllName}:${exportName}: ${e}`);
-    }
-    return 0;
-}
+const resolveThunkedExportAddress = resolveHleExportAddress;
 
 /** Boot-time warmup for exports resolved only via GetProcAddress (not PE imports). */
 export function ensureGetProcAddressDynamicExports(

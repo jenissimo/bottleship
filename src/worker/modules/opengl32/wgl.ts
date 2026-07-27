@@ -4,6 +4,7 @@ import { Logger, LogCategory } from "../../core/logger";
 import { OpenGLBackendExecutor } from "../../backends/webgpu/opengl/opengl-backend-executor";
 import { System } from "../../core/system";
 import { gammaService } from "../../core/gamma-service";
+import { resolveHleExportAddress } from "../../core/thunking/export-resolver";
 
 interface WGLContextBinding {
     hglrc: number;
@@ -92,8 +93,19 @@ export function createWglExports(ctx: OpenGLContext): Record<string, ThunkImplem
         const name = new TextDecoder().decode(mem.subarray(namePtr, end));
         if (!name) return 0;
 
-        // Try to find in module registry
-        const addr = ctx.process.moduleRegistry?.getExportAddress("opengl32", name) ?? 0;
+        // No current context => NULL, per the WGL contract (an entry point is only
+        // meaningful for the pixel format/context it was queried against).
+        if (!currentHglrc) {
+            Logger.verbose(LogCategory.GDI32, `wglGetProcAddress("${name}") -> 0 (no current context)`);
+            return 0;
+        }
+
+        // Our GL entry points are thunk stubs, not PE exports — resolve through the
+        // same registry GetProcAddress uses so the two can never disagree. Extension
+        // entry points are absent from the boot-time stub set, so this is also what
+        // creates them on demand.
+        const dispatcher = (ctx.process as any)?.dispatcher;
+        const addr = resolveHleExportAddress(dispatcher, "opengl32", name) >>> 0;
         if (addr) {
             Logger.verbose(LogCategory.GDI32, `wglGetProcAddress("${name}") -> 0x${addr.toString(16)}`);
             return addr;
@@ -116,14 +128,11 @@ export function createWglExports(ctx: OpenGLContext): Record<string, ThunkImplem
             'glCompressedTexSubImage2DARB': 'glCompressedTexSubImage2D',
             'glCompressedTexSubImage3DARB': 'glCompressedTexSubImage3D',
             'glGetCompressedTexImageARB': 'glGetCompressedTexImage',
-            'glLockArraysEXT': 'glLockArraysEXT',
-            'glUnlockArraysEXT': 'glUnlockArraysEXT',
-            'wglGetExtensionsStringARB': 'wglGetExtensionsStringARB',
         };
 
         const mapped = aliasMap[name];
-        if (mapped) {
-            const mappedAddr = ctx.process.moduleRegistry?.getExportAddress("opengl32", mapped) ?? 0;
+        if (mapped && mapped !== name) {
+            const mappedAddr = resolveHleExportAddress(dispatcher, "opengl32", mapped) >>> 0;
             if (mappedAddr) {
                 Logger.verbose(LogCategory.GDI32, `wglGetProcAddress("${name}") -> 0x${mappedAddr.toString(16)} (alias: ${mapped})`);
                 return mappedAddr;
