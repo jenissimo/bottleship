@@ -942,7 +942,10 @@ export class PELoader {
      * Find DLL path in VFS (case-insensitive search)
      * Search order: 1. Application directory (same as EXE), 2. C:\ root, 3. Windows system directories
      */
-    private findDllPath(dllName: string): string | null {
+    /** VFS path of a DLL by the Windows search order, or null. Public because HLE
+     *  modules that shadow a shipped DLL still need the file (e.g. to read its
+     *  version resource and match that build's ABI). */
+    findDllPath(dllName: string): string | null {
         if (!this.vfs) return null;
 
         const dllNameLower = dllName.toLowerCase();

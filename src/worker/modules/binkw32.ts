@@ -4,13 +4,10 @@
  * Decodes .BIK video files via the FFmpeg WASM video engine.
  * Falls back to stub (return 0) when the WASM module is unavailable.
  *
- * BinkHandle struct layout in guest memory (at alloc'd ptr):
- *   +0   Width        DWORD
- *   +4   Height       DWORD
- *   +8   Frames       DWORD   ← games check this to decide whether to play
- *   +12  FrameNum     DWORD   ← current frame, updated by BinkNextFrame
- *   +16  FrameRate    DWORD   ← fps numerator (e.g. 15)
- *   +20  FrameRateDiv DWORD   ← fps denominator (usually 1)
+ * The HBINK struct handed to the guest follows the ABI of the binkw32.dll the title
+ * ships (bink-struct.ts): RAD moved Frames/FrameNum/rects between SDK releases, and
+ * the guest reads them at the offsets its own header declared. The layout is resolved
+ * once per session from that DLL's version resource.
  *
  * Allocation is oversized (2048 bytes, zero-filled) because games read internal
  * fields at higher offsets (rect pointers, frame buffers, etc.).  Without enough
@@ -34,6 +31,8 @@ import { Mem } from "../core/memory/mem-accessor";
 import { overlapsThunkCode } from "../core/memory/address-guard";
 import { Glide2x } from "./glide2x";
 import { VideoFrameViews } from "../video/video-routing-types";
+import { readPeVersionString } from "../core/pe-version";
+import { BinkStructLayout, BINK_LAYOUT_DEFAULT, selectBinkLayout } from "./bink-struct";
 
 // Real HBINK structs are 300-500+ bytes depending on SDK version.  Games read
 // internal fields (rect pointers, frame buffer ptrs) at offsets well beyond our
@@ -183,6 +182,10 @@ export class BinkW32 implements IModule {
 
     /** Surface bpp determined by BinkDDSurfaceType (0 = not yet called) */
     private lastSurfaceBpp: number = 0;
+
+    /** HBINK field offsets for the binkw32.dll this title ships (see bink-struct.ts). */
+    private layout: BinkStructLayout = BINK_LAYOUT_DEFAULT;
+    private layoutResolved = false;
     private nextBufferHandle = 0x7800;
     private binkBuffers = new Map<number, BinkBufferSession>();
 
@@ -438,25 +441,23 @@ export class BinkW32 implements IModule {
             if (t >= 0) s.audioBaselineMs = t;
         }
 
+        const L = this.layout;
         if (!ok) {
             s.eof = true;
             const m = this.getMemory();
-            const frames = this.readU32(m, bink + 8);
-            this.writeU32(m, bink + 12, frames);
+            const frames = this.readU32(m, bink + L.frames);
+            this.writeU32(m, bink + L.frameNum, frames);
             console.log(`[BINK] BinkDoFrame(0x${bink.toString(16)}): EOF (set FrameNum=${frames})`);
         } else {
-            // Populate dirty rects in HBINK struct so the game knows what changed.
-            // HoMM3's FUN_005979d0 calls BinkGetRects then reads:
-            //   +0x30 (48): rect X      +0x34 (52): rect Y
-            //   +0x38 (56): rect Width  +0x3C (60): rect Height
-            //   +0xB0 (176): rect count
-            // With zeros, the game blits a 0x0 region → video invisible.
+            // Publish one whole-frame dirty rect (BINKRECT {Left,Top,Width,Height}) plus
+            // NumRects. Games call BinkGetRects and blit exactly this region — left zero,
+            // they blit a 0x0 area and the video is invisible.
             const m = this.getMemory();
-            this.writeU32(m, bink + 48, 0);          // rect X
-            this.writeU32(m, bink + 52, 0);          // rect Y
-            this.writeU32(m, bink + 56, s.width);    // rect Width
-            this.writeU32(m, bink + 60, s.height);   // rect Height
-            this.writeU32(m, bink + 176, 1);         // 1 dirty rect
+            this.writeU32(m, bink + L.frameRects + 0, 0);
+            this.writeU32(m, bink + L.frameRects + 4, 0);
+            this.writeU32(m, bink + L.frameRects + 8, s.width);
+            this.writeU32(m, bink + L.frameRects + 12, s.height);
+            this.writeU32(m, bink + L.numRects, 1);
         }
     }
 
@@ -464,38 +465,33 @@ export class BinkW32 implements IModule {
      * Zero out the dirty-rect fields written by _decodeFrame so the game sees
      * no changed region and skips the blit — the video-off equivalent of
      * "nothing decoded this frame".
-     * Layout written by _decodeFrame:
-     *   +48  rect X    +52  rect Y    +56  rect W    +60  rect H    +176  count
      */
     private clearBinkDirtyRects(bink: number): void {
         const m = this.getMemory();
-        this.writeU32(m, bink + 48, 0);
-        this.writeU32(m, bink + 52, 0);
-        this.writeU32(m, bink + 56, 0);
-        this.writeU32(m, bink + 60, 0);
-        this.writeU32(m, bink + 176, 0);
+        const L = this.layout;
+        this.writeU32(m, bink + L.frameRects + 0, 0);
+        this.writeU32(m, bink + L.frameRects + 4, 0);
+        this.writeU32(m, bink + L.frameRects + 8, 0);
+        this.writeU32(m, bink + L.frameRects + 12, 0);
+        this.writeU32(m, bink + L.numRects, 0);
     }
 
     /**
      * Sync the native-ABI compat fields in the guest HBINK struct that real
-     * Bink sets when BinkSetVideoOnOff / BinkSetIOSize change state.
-     *
-     * Real HBINK layout (confirmed across SDK versions via reversing):
-     *   +32  flags   bit 0x20000 = video-disabled flag
-     *
-     * We write the flag into the flags word so games that read it directly
-     * (e.g. to decide whether to call CopyToBuffer) get the right value.
+     * Bink sets when BinkSetVideoOnOff / BinkSetIOSize change state: bit 0x20000
+     * of OpenFlags is the video-disabled flag. Games that read it directly (e.g.
+     * to decide whether to call CopyToBuffer) then see the right value.
      */
     private writeBinkCompatState(bink: number, s: BinkSession): void {
         const m = this.getMemory();
-        let flags = this.readU32(m, bink + 32);
+        let flags = this.readU32(m, bink + this.layout.openFlags);
         const VIDEO_OFF_FLAG = 0x00020000;
         if (s.videoOn) {
             flags &= ~VIDEO_OFF_FLAG;
         } else {
             flags |= VIDEO_OFF_FLAG;
         }
-        this.writeU32(m, bink + 32, flags);
+        this.writeU32(m, bink + this.layout.openFlags, flags);
     }
 
     private readCString(mem: Uint8Array, ptr: number, maxLen = 520): string {
@@ -530,6 +526,30 @@ export class BinkW32 implements IModule {
             Logger.error(LogCategory.SYSTEM, `[BinkW32] readVfsFile("${path}") error: ${e}`);
             return null;
         }
+    }
+
+    /**
+     * Resolve the HBINK ABI from the binkw32.dll the bundle ships. We stand in for that
+     * DLL, so its SDK release — not the .bik file — decides where the guest looks for
+     * Frames/FrameNum/dirty rects. Resolved once per session, before the first HBINK is
+     * built; a missing/unreadable DLL keeps the default layout.
+     */
+    private async ensureLayout(): Promise<void> {
+        if (this.layoutResolved) return;
+        this.layoutResolved = true;
+        const path = System.getInstance().process?.loader?.findDllPath("binkw32");
+        if (!path) {
+            Logger.warn(LogCategory.SYSTEM,
+                `[BinkW32] binkw32.dll not found in the bundle — assuming Bink ${this.layout.id} struct layout`);
+            return;
+        }
+        const image = await this.readVfsFile(path);
+        const version = image ? readPeVersionString(image, "FileVersion") : null;
+        this.layout = selectBinkLayout(version);
+        Logger.log(LogCategory.SYSTEM,
+            `[BinkW32] ${path}: FileVersion="${version ?? "?"}" → HBINK layout ${this.layout.id} ` +
+            `(Frames@0x${this.layout.frames.toString(16)} FrameNum@0x${this.layout.frameNum.toString(16)} ` +
+            `rects@0x${this.layout.frameRects.toString(16)})`);
     }
 
     initialize(process: Process): void {
@@ -681,6 +701,8 @@ export class BinkW32 implements IModule {
                 return 0;
             }
 
+            await this.ensureLayout();
+
             // BINKFILEHANDLE: arg0 is a Win32 HANDLE, not a string pointer.
             // Different Bink SDK versions use different flag bits:
             //   Bink 1.x: 0x00800000, some versions: 0x08000000
@@ -780,15 +802,20 @@ export class BinkW32 implements IModule {
                 if (!info) { videoEngine.close(engineHandle); return 0; }
 
                 /* Allocate guest BinkHandle struct */
+                const L = this.layout;
                 const guestPtr = process.memory.alloc(BINK_HANDLE_SIZE);
                 const m = this.getMemory();
                 m.fill(0, guestPtr, guestPtr + BINK_HANDLE_SIZE);
-                this.writeU32(m, guestPtr +  0, info.width);
-                this.writeU32(m, guestPtr +  4, info.height);
-                this.writeU32(m, guestPtr +  8, info.frameCount);
-                this.writeU32(m, guestPtr + 12, info.currentFrame);
-                this.writeU32(m, guestPtr + 16, Math.round(info.fps));
-                this.writeU32(m, guestPtr + 20, 1);
+                this.writeU32(m, guestPtr + L.width, info.width);
+                this.writeU32(m, guestPtr + L.height, info.height);
+                if (L.widthAlt !== null) this.writeU32(m, guestPtr + L.widthAlt, info.width);
+                if (L.heightAlt !== null) this.writeU32(m, guestPtr + L.heightAlt, info.height);
+                this.writeU32(m, guestPtr + L.frames, info.frameCount);
+                this.writeU32(m, guestPtr + L.frameNum, info.currentFrame);
+                if (L.lastFrameNum !== null) this.writeU32(m, guestPtr + L.lastFrameNum, info.currentFrame);
+                this.writeU32(m, guestPtr + L.frameRate, Math.round(info.fps));
+                this.writeU32(m, guestPtr + L.frameRateDiv, 1);
+                this.writeU32(m, guestPtr + L.size, bytes.length);
 
                 const session: BinkSession = {
                     guestPtr, engineHandle,
@@ -1096,12 +1123,17 @@ export class BinkW32 implements IModule {
                     explicitGlideSink: null,
                 });
             }
+            const m0 = this.getMemory();
+            const prevFrame = this.readU32(m0, bink + this.layout.frameNum);
             videoEngine.nextFrame(s.engineHandle);
-            /* Update FrameNum in guest struct */
+            /* Update FrameNum / LastFrameNum in guest struct */
             const info = videoEngine.getInfo(s.engineHandle);
             if (info) {
                 const m = this.getMemory();
-                this.writeU32(m, bink + 12, info.currentFrame);
+                this.writeU32(m, bink + this.layout.frameNum, info.currentFrame);
+                if (this.layout.lastFrameNum !== null) {
+                    this.writeU32(m, bink + this.layout.lastFrameNum, prevFrame);
+                }
             }
             return 0;
         };
@@ -1160,7 +1192,7 @@ export class BinkW32 implements IModule {
             videoEngine.gotoFrame(s.engineHandle, frame);
             s.eof = false; // seeking resets EOF state
             const m = this.getMemory();
-            this.writeU32(m, bink + 12, frame);
+            this.writeU32(m, bink + this.layout.frameNum, frame);
             return 0;
         };
 
