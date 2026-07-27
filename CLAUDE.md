@@ -80,10 +80,18 @@ Legacy Graphics (DirectDraw, D3D3-9). You bridge x86 Windows internals with mode
     (ThunkGenerator's bump, MemoryManager for THUNK_CODE/CALLBACK_STUB/SPIN_LOOP or rx/rwx)
     invalidate what they hand out, so an in-place emitter is covered without knowing this file
     exists.
-  - Diagnostics: harness `codeInvalidations` (wired? how much dropped?);
-    `setWorkerFlag('__noCodeInvalidate', true)` reproduces the stale-block failure on demand, and
-    `__codeInvalidateGlobal` escalates every publication to a full clear — if that makes a title
-    work, a JS write of guest code is still missing its invalidation somewhere.
+  - Diagnostics: harness `codeAudit` is the COVERAGE check — it hashes executable pages and names
+    any that changed without a covering invalidateGuestCode, which is what the gate structurally
+    cannot do. `codeInvalidations` (wired? how much dropped?);
+    `setWorkerFlag('__noCodeInvalidate', true)` reproduces the stale-block failure on demand.
+    `__codeInvalidateGlobal` escalates every publication to a full clear — but a title surviving
+    ONLY under it does NOT imply a missing call site. jit_clear_cache is literally
+    jit_dirty_page_ctx over every page with code (v86 jit.rs:4434), so it cannot reach anything a
+    ranged dirty leaves behind on the SAME page; what it also does is keep the JIT permanently
+    cold, and that is a separate property some titles survive on. Before concluding "a site is
+    missing": confirm with `codeAudit` (names the page) and rule out tiering with
+    `dbgCall('jitTier2', 0)` — JIT on, invalidation unchanged, promotion off. House of 1000 Doors
+    read as a missing site on this flag alone and was neither.
 - Safe Memory Accessors:
   - All HLE modules must use Mem.read*/write* instead of direct mem8[...] access in new/changed code.
   - Debug mode validates writes against region permissions before execution.
