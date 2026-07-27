@@ -12,6 +12,7 @@ import {
 import { isValidAddress } from '../../../core/memory/address-guard';
 import { ThreadState } from '../../../core/scheduler/types';
 import { Mem } from '../../../core/memory/mem-accessor';
+import { invalidateGuestCode, invalidateAllGuestCode } from '../../../core/memory/guest-code';
 import { Marshaler } from '../../../core/memory/marshaler';
 import { SystemResourceProvider } from '../../../core/resources/system-resource-provider';
 import { encodeAnsi } from '../../codepage-utils';
@@ -1349,7 +1350,16 @@ export const exports: Record<string, ThunkImplementation> = {
 
     ...versionVerifyExports,
 
+    // BOOL FlushInstructionCache(HANDLE hProcess, LPCVOID lpBaseAddress, SIZE_T dwSize)
+    // A no-op on real x86 (the pipeline is coherent), but here it is the guest telling us
+    // exactly which bytes it just rewrote — and v86's block cache is not coherent with a
+    // write it did not see (a JS-side patch, or a store through an alias). Honour it.
+    // dwSize 0 / NULL base means "the whole process" per the SDK.
     'FlushInstructionCache': (ctx, mem, args) => {
+        const lpBaseAddress = args[1] >>> 0;
+        const dwSize = args[2] >>> 0;
+        if (lpBaseAddress && dwSize) invalidateGuestCode(lpBaseAddress, dwSize);
+        else invalidateAllGuestCode();
         return 1; // TRUE
     },
 
@@ -1953,9 +1963,24 @@ export const exports: Record<string, ThunkImplementation> = {
         }
 
         const isVirtualChild = isVirtualChildProcessHandle(hProcess) && pid !== null;
-        const copied = isVirtualChild
-            ? writeVirtualProcessMemory(pid, lpBaseAddress, source)
-            : Mem.writeBytes(lpBaseAddress, new Uint8Array(source));
+        let copied: number;
+        if (isVirtualChild) {
+            copied = writeVirtualProcessMemory(pid, lpBaseAddress, source);
+        } else {
+            // Self-write: the canonical use of WriteProcessMemory is patching live code
+            // (import hooks, entry-point detours, allocator interposition). This is a JS
+            // write, which v86 cannot observe, so the range must be invalidated in the same
+            // turn or the CPU keeps running the blocks it compiled from the pre-patch bytes
+            // (§3.1 guest-code coherence).
+            copied = Mem.writeBytes(lpBaseAddress, new Uint8Array(source));
+            if (copied > 0) invalidateGuestCode(lpBaseAddress, copied);
+            // Low volume and always interesting: a self-patch names the detour being installed.
+            Logger.log(
+                LogCategory.KERNEL32,
+                `WriteProcessMemory self-patch dst=0x${lpBaseAddress.toString(16)} size=${copied} ` +
+                `bytes=${Array.from(new Uint8Array(source).subarray(0, 8)).map(b => b.toString(16).padStart(2, '0')).join(' ')}`
+            );
+        }
         if (isVirtualChild) {
             Logger.verbose(
                 LogCategory.KERNEL32,

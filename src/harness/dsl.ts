@@ -130,6 +130,12 @@ export class HarnessChain {
     apiCoverage(limit?: number): this { return this.push("apiCoverage", [limit]); }
     /** One-shot incident report: cpu + backtrace + last thunks + stubs + faults + threads. The go-to for ANY anomaly (freeze/crash/exit/black frame). */
     report(esp?: number): this { return this.push("report", [esp]); }
+    /** Guest-code invalidation COVERAGE (the gate only checks ownership): pages of
+     *  executable memory whose bytes changed without a covering invalidateGuestCode since
+     *  the previous sweep. First call arms + baselines; call it between tickFrames batches
+     *  to bracket a suspect write in time. Positive control: `setWorkerFlag('__noCodeInvalidate', true)`
+     *  must make it light up. */
+    codeAudit(opts?: { dump?: boolean; kinds?: string[]; wholeImage?: boolean }): this { return this.push("codeAudit", [opts]); }
     /** Recent guest page faults (EIP / fault addr / thread / last thunk / regs). */
     faults(n?: number): this { return this.push("faults", [n]); }
     /** Raw guest memory as hex — read a struct, a stack frame, or unpacked code. */

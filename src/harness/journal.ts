@@ -16,7 +16,7 @@ const NAMED_VERBS = new Set([
     "type", "move", "drag", "wheel", "padPlug", "wmTrace",
     "device", "tap", "touchDrag", "longPress", "twoFingerTap", "pinch",
     "state", "shot", "captureFrame", "textures", "dumpTexture", "dumpSurface", "time",
-    "perfProfile", "perfSpikes", "perfStats", "perfThunks", "profilerStats",
+    "perfProfile", "perfSpikes", "perfStats", "perfThunks", "profilerStats", "readbackStats",
     "breakOn", "breakOnExport", "breakOnSymbol", "breakOnApi", "watchMem", "pause", "resume",
     "fsRead", "fsWrite", "fsDelete", "fsList", "fsStat", "fsFlush", "regGet",
     "containerList", "containerRead", "containerWrite", "containerDelete",

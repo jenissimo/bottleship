@@ -72,6 +72,32 @@ export function registerTimeCommands(svc: HarnessService): void {
         return { mode: ts.getMode(), nowMs: ts.nowMs(), nowUnixMs: ts.nowUnixMs() };
     });
 
+    /** guestTime({sampleMs}) — what the GUEST's clock does relative to wall clock.
+     *
+     *  GetTickCount/timeGetTime/QPC all read TimeService's virtual clock, which only
+     *  advances while the guest executes instructions plus the explicit credits
+     *  (heavy-thunk deficit, capped per §3.5; idle pump; video decode). A frame spent
+     *  inside one long thunk therefore generates almost no game time, and a title whose
+     *  logic is dt-driven runs in slow motion while audio and input run on wall clock.
+     *  `rate` is Δvirtual/Δwall over the sample: 1.0 = tracking, <1 = guest time is
+     *  losing, >1 = running fast. `behindMs` is the accumulated lead of wall over
+     *  virtual, which never recovers (the clock has no drift correction by design). */
+    svc.register("guestTime", async (args, ctx: HarnessCtx) => {
+        const sampleMs = Math.max(1, Number((args[0] as { sampleMs?: number } | undefined)?.sampleMs ?? 1000));
+        const ts = TimeService.getInstance();
+        const v0 = ts.nowMs(), w0 = performance.now();
+        await delay(sampleMs, ctx.signal);
+        const v1 = ts.nowMs(), w1 = performance.now();
+        const dv = v1 - v0, dw = w1 - w0;
+        return {
+            virtualTimeActive: ts.isVirtualTimeActive(),
+            sampleMs: +dw.toFixed(1),
+            virtualDeltaMs: +dv.toFixed(1),
+            rate: +(dv / dw).toFixed(3),
+            behindMs: +(w1 - v1).toFixed(1),
+        };
+    });
+
     /** watchFrames(on?) — enable/disable the per-present frameRendered event
      *  (off by default to keep the present path zero-cost). */
     svc.register("watchFrames", (args) => {

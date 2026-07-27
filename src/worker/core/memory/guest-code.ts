@@ -30,6 +30,21 @@ let invalidatedRanges = 0;
 let invalidatedBytes = 0;
 
 /**
+ * Audit mode (harness `codeAudit`): the set of 4 KiB pages this chokepoint has dirtied
+ * since the last audit sweep. A page whose bytes changed WITHOUT appearing here was
+ * written by something that bypassed the chokepoint — i.e. the missing call site.
+ * Off (null) unless the sweep armed it, so the hot path pays one null check.
+ */
+let auditCovered: Set<number> | null = null;
+
+/** Arm/disarm the audit page set. Returns the pages covered since the previous call. */
+export function takeGuestCodeAuditPages(arm: boolean): number[] {
+    const prev = auditCovered ? [...auditCovered] : [];
+    auditCovered = arm ? new Set() : null;
+    return prev;
+}
+
+/**
  * Resolve `jit_dirty_cache` fresh on every call. v86 is re-created per game load, so a cached
  * function object would dirty a dead wasm instance's JIT state while the live one keeps its
  * stale blocks. Bracket notation is mandatory — Closure Compiler renames dot-notation
@@ -58,18 +73,42 @@ export function invalidateGuestCode(address: number, length: number): boolean {
     const end = (start + length) >>> 0;
     if (end <= start) return true; // 4 GiB wrap — nothing sane to dirty
 
-    // Diagnostic A/B: escalate every publication to a full cache clear. If a title
-    // survives this but not the ranged dirty, the call sites are right and the fork's
-    // page-level invalidation is leaving something behind (chained/speculated edges).
+    if (auditCovered) {
+        for (let p = start >>> 12; p <= (end - 1) >>> 12; p++) auditCovered.add(p);
+    }
+
+    // Diagnostic A/B: escalate every publication to a full cache clear.
+    //
+    // Read the result NARROWLY. `jit_clear_cache` is literally `jit_dirty_page_ctx` over
+    // every page that has code, so it cannot invalidate anything a ranged dirty leaves
+    // behind on the SAME page — the only two things it adds are (a) pages nobody named and
+    // (b) a JIT that never stays warm. (b) is not a coherence property: a title that
+    // survives only under this flag may simply be one whose hot modules never reach the
+    // tier-2 re-entry threshold, and free-running tiering is what actually breaks it.
+    // Before concluding "a call site is missing", confirm with `codeAudit` (which names the
+    // page and the writer) and rule out tiering with `dbgCall('jitTier2', 0)` — JIT ON,
+    // invalidation unchanged, promotion off. House of 1000 Doors read as a missing call
+    // site on this flag alone and was neither.
     if ((globalThis as { __codeInvalidateGlobal?: boolean }).__codeInvalidateGlobal) {
         const exports = preemptionManager.getWasmExports();
         const clear = exports && exports["jit_clear_cache_js"];
         if (typeof clear === "function") { clear(); invalidatedRanges++; return true; }
     }
 
+    // Diagnostic A/B (`setWorkerFlag('__codeInvalidatePadPages', n)`): widen every dirty by
+    // n pages on each side. Separates "the written page was dirtied but the code that
+    // depended on it lives in a module spanning NEIGHBOURING pages" from the two things a
+    // full clear also does (drop unrelated pages, keep the JIT permanently cold). A title
+    // that needs the pad but not the full clear is describing a page→module bookkeeping
+    // gap, not a missing call site.
+    const pad = (globalThis as { __codeInvalidatePadPages?: number }).__codeInvalidatePadPages;
+    const padded = typeof pad === "number" && pad > 0;
+    const lo = padded ? Math.max(0, start - pad * 0x1000) >>> 0 : start;
+    const hi = padded ? (end + pad * 0x1000) >>> 0 : end;
+
     const dirty = resolveDirtyCache();
     if (!dirty) {
-        if (pending.length < PENDING_CAP) pending.push(start, end);
+        if (pending.length < PENDING_CAP) pending.push(lo, hi);
         return false;
     }
 
@@ -79,12 +118,26 @@ export function invalidateGuestCode(address: number, length: number): boolean {
     pending.length = 0;
 
     try {
-        dirty(start, end);
+        dirty(lo, hi);
     } catch {
         return false;
     }
     invalidatedRanges++;
     invalidatedBytes += end - start;
+    return true;
+}
+
+/**
+ * Drop every compiled block. Only for the case where the caller genuinely does not know the
+ * range — `FlushInstructionCache(h, NULL, 0)` means "the whole process" per the SDK. Prefer
+ * {@link invalidateGuestCode}: a full clear costs the guest every hot block it had.
+ */
+export function invalidateAllGuestCode(): boolean {
+    const exports = preemptionManager.getWasmExports();
+    const clear = exports && exports["jit_clear_cache_js"];
+    if (typeof clear !== "function") return false;
+    try { clear(); } catch { return false; }
+    invalidatedRanges++;
     return true;
 }
 

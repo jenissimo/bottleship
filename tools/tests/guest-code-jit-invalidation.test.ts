@@ -8,7 +8,10 @@
  * different stub — the dispatcher then runs the wrong WinAPI handler.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
+    invalidateAllGuestCode,
     invalidateGuestCode,
     resetGuestCodeInvalidationState,
     writeGuestCode,
@@ -19,6 +22,7 @@ import { ThunkGenerator } from "../../src/worker/core/thunking/thunk-generator";
 type Range = [number, number];
 
 let dirtied: Range[];
+let cleared: number;
 let savedExports: unknown;
 
 /** Stand in for the wasm instance; v86 asserts start < end, so mirror that here. */
@@ -28,6 +32,7 @@ function installFakeWasm(): void {
             if (!(start < end)) throw new Error(`jit_dirty_cache called with start >= end (${start}, ${end})`);
             dirtied.push([start >>> 0, end >>> 0]);
         },
+        jit_clear_cache_js: () => { cleared++; },
     };
 }
 
@@ -41,6 +46,7 @@ function covers(address: number, length: number): boolean {
 
 beforeEach(() => {
     dirtied = [];
+    cleared = 0;
     savedExports = (preemptionManager as unknown as { wasmExports: unknown }).wasmExports;
     resetGuestCodeInvalidationState();
     installFakeWasm();
@@ -94,6 +100,51 @@ describe("invalidateGuestCode", () => {
         installFakeWasm();
         expect(invalidateGuestCode(0x3000, 16)).toBe(true);
         expect(dirtied).toEqual([[0x2000, 0x2010], [0x3000, 0x3010]]);
+    });
+});
+
+describe("invalidateAllGuestCode", () => {
+    test("drops every compiled block (FlushInstructionCache with no range)", () => {
+        expect(invalidateAllGuestCode()).toBe(true);
+        expect(cleared).toBe(1);
+        expect(dirtied).toEqual([]);
+    });
+
+    test("reports failure rather than throwing when no wasm instance exists", () => {
+        removeFakeWasm();
+        expect(invalidateAllGuestCode()).toBe(false);
+    });
+});
+
+/**
+ * The two kernel32 entry points whose whole purpose is publishing bytes the guest will
+ * execute. WriteProcessMemory into our own process is how allocator interposers and detour
+ * libraries patch live code (SmartHeap's shi_PatchMallocs is one); FlushInstructionCache is
+ * the guest telling us which bytes it just rewrote. Both are JS-side writes/declarations that
+ * v86 cannot observe, so both must route through guest-code.ts. Structural, like the
+ * ownership gate: the handlers pull in System/Mem and are not unit-instantiable.
+ */
+describe("kernel32 code-publication entry points route through guest-code", () => {
+    const src = readFileSync(
+        join(import.meta.dir, "..", "..", "src", "worker", "modules", "kernel32", "process", "process.ts"),
+        "utf8",
+    );
+
+    function bodyOf(name: string): string {
+        const start = src.indexOf(`'${name}': (ctx, mem, args)`);
+        expect(start).toBeGreaterThan(-1);
+        const next = src.indexOf("\n    '", start + 1);
+        return src.slice(start, next === -1 ? src.length : next);
+    }
+
+    test("WriteProcessMemory invalidates the bytes it wrote", () => {
+        expect(bodyOf("WriteProcessMemory")).toContain("invalidateGuestCode(lpBaseAddress, copied)");
+    });
+
+    test("FlushInstructionCache honours the guest's declared range", () => {
+        const body = bodyOf("FlushInstructionCache");
+        expect(body).toContain("invalidateGuestCode(lpBaseAddress, dwSize)");
+        expect(body).toContain("invalidateAllGuestCode()");
     });
 });
 
