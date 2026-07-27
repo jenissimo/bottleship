@@ -6,6 +6,8 @@ import {
     GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T, GL_TEXTURE_MAG_FILTER, GL_TEXTURE_MIN_FILTER,
     GL_INVALID_ENUM, GL_INVALID_VALUE,
     GL_REPEAT, GL_NEAREST,
+    GL_RGB, GL_R3_G3_B2, GL_RGB4, GL_RGB5, GL_RGB8, GL_RGB10, GL_RGB12, GL_RGB16,
+    GL_LUMINANCE, GL_LUMINANCE4, GL_LUMINANCE8, GL_LUMINANCE12, GL_LUMINANCE16,
 } from "./constants";
 import { Logger, LogCategory } from "../../core/logger";
 import {
@@ -39,6 +41,38 @@ export function convertPixelsToRGBA8(
         unpackSkipPixels,
         unpackSkipRows,
     );
+}
+
+/**
+ * Does this internal format keep an alpha component?
+ *
+ * The internal format — not the client format — decides what the texture STORES.
+ * Uploading GL_RGBA client pixels into a GL_RGB texture discards their alpha, and
+ * sampling then yields A = 1.0 (GL 1.x §3.8.7). Engines rely on this to hand the
+ * driver a padded 4-byte-per-texel buffer whose 4th byte is meaningless: id Tech 3's
+ * RE_StretchRaw uploads every cinematic frame as `internalFormat = 3` (GL_RGB) with
+ * `format = GL_RGBA` and A = 0. Keeping that alpha renders the whole video invisible.
+ *
+ * GL 1.0 also allows a bare component COUNT (1/2/3/4) in place of an enum.
+ */
+export function internalFormatHasAlpha(internalFormat: number): boolean {
+    switch (internalFormat >>> 0) {
+        // Component counts (GL 1.0): 1 = luminance, 2 = luminance+alpha, 3 = rgb, 4 = rgba.
+        case 1: case 3:
+        case GL_RGB: case GL_R3_G3_B2: case GL_RGB4: case GL_RGB5:
+        case GL_RGB8: case GL_RGB10: case GL_RGB12: case GL_RGB16:
+        case GL_LUMINANCE: case GL_LUMINANCE4: case GL_LUMINANCE8:
+        case GL_LUMINANCE12: case GL_LUMINANCE16:
+            return false;
+        default:
+            return true;
+    }
+}
+
+/** Opaque-ify in place when the internal format has no alpha channel. */
+function applyInternalFormatAlpha(data: Uint8Array, internalFormat: number): void {
+    if (internalFormatHasAlpha(internalFormat)) return;
+    for (let i = 3; i < data.length; i += 4) data[i] = 255;
 }
 
 export function createTextureExports(ctx: OpenGLContext): Record<string, ThunkImplementation> {
@@ -222,6 +256,7 @@ export function createTextureExports(ctx: OpenGLContext): Record<string, ThunkIm
                 mem, pixels, width, height, format, type,
                 ctx.unpackAlignment, ctx.unpackRowLength, ctx.unpackSkipPixels, ctx.unpackSkipRows
             );
+            applyInternalFormatAlpha(tex.data, internalformat);
             tex.dirty = true;
             tex.gpuVersion++;
             ctx.frameSnapshot.texUploads++;
@@ -241,6 +276,7 @@ export function createTextureExports(ctx: OpenGLContext): Record<string, ThunkIm
             }
         } else {
             tex.data = new Uint8Array(width * height * 4);
+            applyInternalFormatAlpha(tex.data, internalformat);
         }
         return 0;
     };
@@ -267,6 +303,7 @@ export function createTextureExports(ctx: OpenGLContext): Record<string, ThunkIm
             mem, pixels, width, height, format, type,
             ctx.unpackAlignment, ctx.unpackRowLength, ctx.unpackSkipPixels, ctx.unpackSkipRows
         );
+        applyInternalFormatAlpha(sub, tex.internalFormat);
 
         for (let y = 0; y < height; y++) {
             for (let x = 0; x < width; x++) {

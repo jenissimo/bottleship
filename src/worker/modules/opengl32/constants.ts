@@ -390,6 +390,13 @@ export const GL_RGB5_A1 = 0x8057;
 export const GL_RGBA4 = 0x8056;
 export const GL_RGB5 = 0x8050;
 export const GL_R3_G3_B2 = 0x2A10;
+export const GL_RGB4 = 0x804F;
+export const GL_RGB10 = 0x8052;
+export const GL_RGB12 = 0x8053;
+export const GL_RGB16 = 0x8054;
+export const GL_LUMINANCE4 = 0x803F;
+export const GL_LUMINANCE12 = 0x8041;
+export const GL_LUMINANCE16 = 0x8042;
 
 // OpenGL 1.2
 export const GL_UNSIGNED_BYTE_3_3_2 = 0x8032;
