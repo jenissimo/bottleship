@@ -30,6 +30,7 @@
 import {
     launchOrAttachChrome,
     ensureVite,
+    reloadDevPage,
     findOrCreateTab,
     listSessionTabs,
     cdpSession,
@@ -215,7 +216,19 @@ async function cmdUp(): Promise<void> {
     if (h.vite && !h.viteTransform) {
         console.warn("[harness up] WARNING: Vite answers the root but will not transform modules — the page will load and render nothing. Restart the dev server (wait for :5174 to be released first); do not debug the guest until this is green.");
     }
-    const ping = await pageEval(session, "window.__BS__.harness.ping()", { timeoutMs: 8000 }).catch((e) => ({ error: String(e) }));
+    let ping = await pageEval(session, "window.__BS__.harness.ping()", { timeoutMs: 8000 }).catch((e) => ({ error: String(e) }));
+    // A tab opened while Vite was wedged holds a dead page forever: the module graph never
+    // loaded, so there is no harness facade and no worker — while `health()` still reports
+    // devTab true, because the tab EXISTS. Reload once rather than hand back a green report
+    // over a tab nothing can drive.
+    if ((ping as { error?: string }).error) {
+        console.log("[harness up] no harness in the tab — reloading it once");
+        await reloadDevPage();
+        const tab2 = await findOrCreateTab(DEFAULT_DEV_URL);
+        _session = await CdpSession.connect(tab2.webSocketDebuggerUrl);
+        await waitForHarnessReady(_session);
+        ping = await pageEval(_session, "window.__BS__.harness.ping()", { timeoutMs: 8000 }).catch((e) => ({ error: String(e) }));
+    }
     console.log("[harness up] worker ping:", JSON.stringify(ping));
     console.log(`[harness up] ready — tab ${tab.id} (${tab.url})`);
     if (SESSION) console.log(`[harness up] session '${SESSION}' — artifacts under logs/${SESSION}/`);
