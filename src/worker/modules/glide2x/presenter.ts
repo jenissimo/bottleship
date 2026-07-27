@@ -204,8 +204,17 @@ export class GlidePresenter implements RenderActive {
         };
     }
 
+    /** PNG of the screen. The executor's own capture reads the offscreen texture, which
+     *  predates the video/GDI/stats composite done straight onto the canvas — canvas first. */
     async captureFrame(): Promise<Blob> {
+        const screen = await System.getInstance().services.render.tryCaptureScreen();
+        if (screen) return screen;
         return this.context.executor?.captureFrame() ?? new Blob();
+    }
+
+    /** The Glide offscreen render target alone — before the canvas composite. */
+    async capturePresentedLayer(): Promise<Blob | null> {
+        return (await this.context.executor?.captureFrame()) ?? null;
     }
 
     presentFrame(swapInterval: number): boolean {

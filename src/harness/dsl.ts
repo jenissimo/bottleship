@@ -134,7 +134,9 @@ export class HarnessChain {
     faults(n?: number): this { return this.push("faults", [n]); }
     /** Raw guest memory as hex — read a struct, a stack frame, or unpacked code. */
     readBytes(addr: number | string, len?: number): this { return this.push("readBytes", [addr, len]); }
-    shot(opts?: { save?: string }): this { return this.push("shot", [opts]); }
+    /** PNG of the SCREEN (canvas, overlays composited). `source:'layer'` asks for the
+     *  presenter's pre-composite game layer instead — labelled `composited:false`. */
+    shot(opts?: { save?: string; source?: "screen" | "layer" }): this { return this.push("shot", [opts]); }
     captureFrame(opts?: { dumpTargets?: boolean }): this { return this.push("captureFrame", [opts]); }
     textures(): this { return this.push("textures", []); }
     dumpTexture(sel: string | { stage: number }): this { return this.push("dumpTexture", [sel]); }
@@ -158,9 +160,15 @@ export class HarnessChain {
     perfThunks(opts?: { top?: number; filter?: string }): this { return this.push("perfThunks", [opts]); }
     /** Named-bucket sub-phase timings (avg/total/max/count). filter by substring; maxMs = worst single call. */
     profilerStats(opts?: { filter?: string; top?: number; sort?: "max" | "total" | "avg" }): this { return this.push("profilerStats", [opts]); }
+    /** GPU→CPU readback accounting: roundTrips (the real cost), memoHits, scratchHits,
+     *  redundant (must be 0). {reset:true} zeroes after reading, so bracketing a
+     *  tickFrames(N) gives round trips per frame. */
+    readbackStats(opts?: { reset?: boolean }): this { return this.push("readbackStats", [opts]); }
 
     // ── time ──
     time(action: "freeze" | "advance" | "realtime", ms?: number): this { return this.push("time", [action, ms]); }
+    /** Sample the guest clock against wall clock — `rate` <1 means game time is losing. */
+    guestTime(opts?: { sampleMs?: number }): this { return this.pushTimed("guestTime", [opts], (opts?.sampleMs ?? 1000) + 5_000); }
 
     // ── breakpoints / exec control ──
     // Breakpoints block until hit — unbounded RPC envelope (the CLI's CDP budget /

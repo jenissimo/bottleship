@@ -11,7 +11,7 @@ firehose.
 ```bash
 bun tools/harness.ts up        # cold start: launch Chrome + dev servers, reach "ready"
 bun tools/harness.ts report    # one structured snapshot of the whole machine state
-bun tools/harness.ts shot      # screenshot the (offscreen) canvas
+bun tools/harness.ts shot      # screenshot the page (add --verify to cross-check the worker's own capture)
 ```
 
 `up` starts the dev server and a log server, launches Chrome with the flags the engine needs

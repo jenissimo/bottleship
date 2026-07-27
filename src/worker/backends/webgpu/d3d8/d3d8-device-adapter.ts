@@ -2091,24 +2091,11 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         }
     }
 
-    /**
-     * Screenshot the composited D3D8 frame as a PNG (harness `shot`).
-     * Mirrors the DDraw presenter: the on-screen OffscreenCanvas is captured via
-     * convertToBlob(), which snapshots the LAST presented frame — so it works
-     * while the emulator is paused (pause-and-inspect), and it captures the final
-     * composited screen (RT + GDI/video/stats overlays), not just the raw RT.
-     * The WebGPU swapchain texture is configured without COPY_SRC, so a
-     * copyTextureToBuffer readback is unavailable; convertToBlob is the correct
-     * canvas-capture path and needs no COPY_SRC.
-     */
+    /** PNG of the screen — the canvas, i.e. the final composite (RT + GDI/video/stats
+     *  overlays), snapshotted from the last present so it works while paused. */
     async captureFrame(): Promise<Blob> {
-        const empty = new Blob([], { type: "image/png" });
-        const backend = System.getInstance().services.render.getBackend();
-        if (!backend || backend.kind !== "webgpu") return empty;
-        const context = (backend as WebGPUBackend).getContext();
-        const canvas = context?.canvas as OffscreenCanvas | undefined;
-        if (!canvas || typeof canvas.convertToBlob !== "function") return empty;
-        return canvas.convertToBlob({ type: "image/png" });
+        return (await System.getInstance().services.render.tryCaptureScreen())
+            ?? new Blob([], { type: "image/png" });
     }
 
     getCounters(): Record<string, number> {

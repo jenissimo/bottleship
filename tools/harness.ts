@@ -352,13 +352,99 @@ async function cmdFixture(mode: string, name: string, args: string[]): Promise<v
     throw new Error(`unknown fixture mode '${mode}' (save|restore)`);
 }
 
-/** shot [out.png] — page screenshot to a file (replaces cdp-shot). */
-async function cmdShot(out: string): Promise<void> {
+/** shot [out.png] [--verify] — page screenshot to a file (browser-side ground truth).
+ *  With --verify it also pulls the worker's own `shot` (the canvas read from inside the
+ *  worker) and compares the two, so the screenshot verb can report its own failure
+ *  instead of handing back a plausible image. */
+async function cmdShot(out: string, ...flags: string[]): Promise<void> {
     const session = await ensureSession();
     const b64 = await screenshot(session);
-    const file = out || artifact("logs/harness-shot.png");
+    const file = out && !out.startsWith("--") ? out : artifact("logs/harness-shot.png");
     await Bun.write(file, Buffer.from(b64, "base64"));
     console.log(`screenshot -> ${file} (${b64.length} b64 chars)`);
+    if (out?.startsWith("--") || flags.includes("--verify")) await verifyShot(session);
+}
+
+/** Mean/max |Δluma| between two PNGs, both downscaled to a 32x32 grid in the page
+ *  (the browser is the only decoder on hand, and it decodes both the same way). */
+async function comparePngs(session: CdpSession, aB64: string, bB64: string): Promise<{ mean: number; max: number } | null> {
+    const r = (await pageEval(session, `(async () => {
+        const grid = async (b64) => {
+            const bin = atob(b64); const u8 = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+            const bmp = await createImageBitmap(new Blob([u8], { type: 'image/png' }));
+            const c = new OffscreenCanvas(32, 32); const x = c.getContext('2d');
+            x.drawImage(bmp, 0, 0, 32, 32);
+            const d = x.getImageData(0, 0, 32, 32).data; const g = new Float64Array(1024);
+            for (let i = 0; i < 1024; i++) g[i] = 0.299*d[i*4] + 0.587*d[i*4+1] + 0.114*d[i*4+2];
+            return g;
+        };
+        const [a, b] = await Promise.all([grid(${JSON.stringify(aB64)}), grid(${JSON.stringify(bB64)})]);
+        let sum = 0, max = 0;
+        for (let i = 0; i < 1024; i++) { const d = Math.abs(a[i] - b[i]); sum += d; if (d > max) max = d; }
+        return { mean: sum / 1024, max };
+    })()`, { timeoutMs: 20_000, awaitPromise: true })) as { mean: number; max: number; error?: string } | null;
+    return r && !r.error ? r : null;
+}
+
+/**
+ * Cross-check every route to "the screen" against the browser's own capture of the
+ * canvas: the worker `shot` (source 'screen') and, when the presenter has one, its
+ * pre-composite layer (source 'layer').
+ *
+ * Why it exists: the worker capture and the CDP capture are INDEPENDENT routes to the
+ * same pixels, so a disagreement means the worker route is not looking at the screen —
+ * the failure that let `shot()` show a game frame while the canvas held a grey dialog.
+ * The 'layer' line is the standing proof that the check can go red: a composited frame
+ * MUST show the layer disagreeing while the screen agrees.
+ */
+async function verifyShot(session: CdpSession): Promise<void> {
+    const geo = await readCanvasGeometry(session);
+    // Freeze the guest so every capture describes the SAME frame; a moving picture
+    // would produce a difference that says nothing about the capture route.
+    const paused = await execViaCdp([{ cmd: "pause", args: [] } as unknown as HarnessStep])
+        .then((r) => r.ok).catch(() => false);
+    try {
+        type Shot = { base64?: string; source?: string; width?: number; height?: number };
+        const runShot = async (args: Record<string, unknown>): Promise<Shot | string> => {
+            const r = await execViaCdp([{ cmd: "shot", args: [args] } as unknown as HarnessStep]);
+            return r.steps?.[0]?.ok ? (r.steps[0].result as Shot) : (r.steps?.[0]?.error?.message ?? "failed");
+        };
+        const screen = await runShot({});
+        const clip = { x: Math.max(0, geo.rect.x), y: Math.max(0, geo.rect.y), width: geo.rect.w, height: geo.rect.h, scale: 1 };
+        const shotPage = async () => (await session.send("Page.captureScreenshot", { format: "png", clip })).result?.data ?? "";
+        // Two CDP captures back to back measure how much the screen moves on its own
+        // (a paused guest can still re-present, and an animated overlay never stops). That
+        // churn is the noise floor: below it no comparison can decide anything, and an
+        // instrument that ignores it reports "DISAGREE" for a screen that merely moved.
+        const pageA = await shotPage();
+        const pageB64 = await shotPage();
+        if (!pageB64 || !pageA) { console.log("verify: CDP capture returned nothing"); return; }
+        const churn = (await comparePngs(session, pageA, pageB64)) ?? { mean: 0, max: 0 };
+        const moving = churn.mean >= 8 || churn.max >= 48;
+        console.log(`verify: screen churn between two CDP captures — mean|d|=${churn.mean.toFixed(1)} max|d|=${churn.max.toFixed(1)}` +
+            (moving ? " (screen is MOVING — comparisons below can only be inconclusive; pause presents for a decisive check)" : ""));
+
+        // mean 8/255 tolerates PNG/CSS rescaling of the whole frame; the max threshold is
+        // what catches a LOCALIZED difference — a composited dialog or panel covering a
+        // few cells barely moves the mean, and that is exactly the failure class here.
+        // Identical images measure 0.0 on both, so the headroom is large.
+        const line = async (label: string, shot: Shot | string) => {
+            if (typeof shot === "string" || !shot.base64) { console.log(`verify: ${label} — unavailable (${shot})`); return; }
+            const cmp = await comparePngs(session, shot.base64, pageB64);
+            if (!cmp) { console.log(`verify: ${label} — compare failed`); return; }
+            const agree = cmp.mean < 8 && cmp.max < 48;
+            const verdict = agree ? "AGREE"
+                : moving || cmp.mean <= churn.mean * 1.5 ? "INCONCLUSIVE (difference is within the screen's own churn)"
+                    : "DISAGREE (this is NOT what is on screen)";
+            console.log(`verify: ${label} (${shot.width}x${shot.height}) vs CDP canvas capture — ` +
+                `mean|d|=${cmp.mean.toFixed(1)} max|d|=${cmp.max.toFixed(1)} → ${verdict}`);
+        };
+        await line("shot() source=screen", screen);
+        await line("shot({source:'layer'}) pre-composite", await runShot({ source: "layer" }));
+    } finally {
+        if (paused) await execViaCdp([{ cmd: "resume", args: [] } as unknown as HarnessStep]).catch(() => {});
+    }
 }
 
 /**
@@ -476,12 +562,12 @@ async function main(): Promise<void> {
         case "worker-eval": await cmdWorkerEval(rest.join(" ")); break;
         case "stack": await cmdStack(rest[0]); break;
         case "fixture": await cmdFixture(rest[0], rest[1], rest.slice(2)); break;
-        case "shot": await cmdShot(rest[0]); break;
+        case "shot": await cmdShot(rest[0], ...rest.slice(1)); break;
         case "gridShot": case "gridshot": await cmdGridShot(rest[0], rest[1]); break;
         case "trace": await cmdTrace(rest[0], rest[1]); break;
         case "reload": await cmdReload(); break;
         case undefined:
-            console.log("usage: bun tools/harness.ts <up|run <script>|repl|health|eval <expr>|worker-eval <expr>|fixture <save|restore> <name> [--container <id>]|shot [out.png]|gridShot [out.png] [step]|trace <sec> [out.json.gz]|reload|device <profile>|tap <x> <y>|<any-harness-command> [args...]>");
+            console.log("usage: bun tools/harness.ts <up|run <script>|repl|health|eval <expr>|worker-eval <expr>|fixture <save|restore> <name> [--container <id>]|shot [out.png] [--verify]|gridShot [out.png] [step]|trace <sec> [out.json.gz]|reload|device <profile>|tap <x> <y>|<any-harness-command> [args...]>");
             process.exit(0);
             break;
         // Any other token is dispatched as a harness RPC command (report, stubs, backtrace,

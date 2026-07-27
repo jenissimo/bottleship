@@ -75,8 +75,15 @@ CLI invocation reconnects without it.
 ## 3. Observe
 
 - `state([...])` — windows/surfaces/memory/threads/rings/audio/video/modules/cpu/screen as one POJO.
-- `shot({save})` — PNG of the on-screen frame (the canvas is an OffscreenCanvas —
-  a screenshot is ground truth; the main thread can't read it).
+- `shot({save})` — PNG of the SCREEN: the frame that reached the canvas, every overlay
+  (video plane, live GDI dialog rects, stats) composited, read from the mirror the present
+  path keeps. `shot({source:'layer'})` asks for the presenter's pre-composite game layer
+  instead — the split between "which layer holds the pixels" and "does the composite show
+  it" — and is always labelled `composited:false`. A capture that cannot see the screen
+  errors out; it never returns a plausible substitute.
+- `bun tools/harness.ts shot [file] --verify` — the browser's own capture of the canvas,
+  plus a cross-check of every worker-side route against it (with the screen's own churn as
+  the noise floor). Run it when a screenshot and the tab seem to disagree.
 - `textures()` + `dumpSurface(ptr|'primary')` — gallery + per-surface PNG to `logs/debug/`.
 - `surfacePixels(sel)` / `expectSurfaceNonBlack(sel)` — cheap liveness from a subsampled readback.
 - Dump PNGs preserve ALPHA: an area that looks WHITE in a viewer but BLACK on the canvas is

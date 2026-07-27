@@ -29,10 +29,24 @@ export interface RenderBackend {
         blue: Float32Array,
         isIdentity: boolean,
     ): void;
+    /** The canvas that IS the screen (the one the host transferred). Source of truth for screenshots. */
+    getScreenCanvas?(): OffscreenCanvas | null;
+    /** Copy the frame just submitted to the canvas into a readable mirror (screenshots). */
+    mirrorPresentedFrame?(): void;
+    /** PNG of that mirror; null until a frame has been mirrored. */
+    captureMirroredFrame?(): Promise<Blob | null>;
 }
 
 export interface RenderActive {
+    /** PNG of the SCREEN — canvas first (overlays composited), presenter source only as fallback. */
     captureFrame(): Promise<Blob>;
+    /**
+     * PNG of the presenter's OWN frame source — the game layer as it exists before the
+     * canvas composite (how far "before" is backend-dependent). Splits "which layer holds
+     * the pixels" from "does the composite put it on screen"; never a substitute for
+     * captureFrame(). Null/absent when the presenter has no readable source of its own.
+     */
+    capturePresentedLayer?(): Promise<Blob | null>;
     getCounters(): Record<string, number>;
     /**
      * True for hardware 3D presenters (OpenGL/Glide/D3D) that own the whole screen
@@ -79,6 +93,13 @@ export class RenderService {
     // --- Flip-cadence instrument (inter-present intervals) for frame-variance diagnosis.
     //     Always-on ring buffer; ~1 perf.now() + push per present (≈ display rate) = negligible.
     //     Read via flipCadence() / scope a window with flipCadenceReset() (diagnostics-commands). ---
+    // Screenshot mirror: kept up to date from every present, because a screenshot must be
+    // available for the frame ALREADY on screen — arming it lazily means the first capture
+    // (typically of a frozen screen worth looking at) has nothing to read. Cost is one
+    // full-screen texture copy per present, the same snapshot the D3D9 executor already
+    // takes for repaintLastFrame.
+    private screenMirrorSerial = 0;
+
     private flipLastMs = 0;
     private flipIntervals: number[] = [];
     private static readonly FLIP_CADENCE_CAP = 1200;
@@ -89,6 +110,49 @@ export class RenderService {
 
     getBackend(): RenderBackend | null {
         return this.backend;
+    }
+
+    /**
+     * PNG of the SCREEN — the canvas itself, every overlay already composited.
+     *
+     * A presenter's own captureFrame() reads back the texture it drew FROM, and the
+     * video plane / GDI dialog rects / stats overlay are blitted onto the canvas
+     * AFTER that texture is recorded — so a presenter capture is blind to exactly the
+     * compositing bugs a screenshot is asked to settle. Read the canvas instead.
+     *
+     * The mirror is the ONLY route. Reading the canvas back looks like it should work and
+     * does not: a WebGPU canvas hands its presented image to the compositor, so
+     * convertToBlob() throws "Readback of the source image has failed" and
+     * createImageBitmap() returns either a 0x0 bitmap or a BLANK one — the current
+     * (undrawn) swap texture rather than the frame on screen. It happened to match while a
+     * game presented every frame, which is exactly how a wrong screenshot stays believed;
+     * on a static screen (a launcher dialog, anything paused) it silently returns empty.
+     *
+     * Null when there is no backend/canvas at all; THROWS when nothing has ever been
+     * presented — different diagnoses, and a caller that collapses them sends the reader
+     * elsewhere.
+     */
+    async captureScreen(): Promise<Blob | null> {
+        if (!this.backend?.getScreenCanvas?.()) return null;
+        const mirrored = await this.backend?.captureMirroredFrame?.();
+        if (mirrored) return mirrored;
+        throw new Error("no frame has been presented to the canvas yet — nothing to screenshot");
+    }
+
+    /** Presents since the mirrored frame — 0 means the mirror IS the current screen. */
+    screenMirrorAge(): number {
+        return this.screenMirrorSerial > 0 ? this.presentSerial - this.screenMirrorSerial : -1;
+    }
+
+    /** captureScreen() that degrades to null instead of throwing — for presenters that
+     *  have their own fallback source. */
+    async tryCaptureScreen(): Promise<Blob | null> {
+        try {
+            return await this.captureScreen();
+        } catch (err) {
+            Logger.warn(LogCategory.SYSTEM, `RenderService.captureScreen failed — ${(err as Error).message}`);
+            return null;
+        }
     }
 
     setActive(active: RenderActive | null): void {
@@ -122,6 +186,10 @@ export class RenderService {
     notifyPresent(presenterKind: PresenterKind): void {
         this.presentSerial += 1;
         this.lastPresenterKind = presenterKind;
+        // Screenshot mirror: encoded here because EVERY present path funnels through
+        // notifyPresent, so no backend can silently miss it and leave a stale image.
+        this.backend?.mirrorPresentedFrame?.();
+        this.screenMirrorSerial = this.presentSerial;
         if (!this.firstPresentFired) {
             this.firstPresentFired = true;
             try { this.firstPresentCb?.(); } catch { /* host bridge must never break the present path */ }

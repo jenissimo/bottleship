@@ -73,8 +73,11 @@ export class OpenGLPresenter implements RenderActive {
         this.ctx.executor?.repaintLastFrame();
     }
 
+    /** PNG of the screen (canvas, overlays composited). The GL executor renders straight
+     *  into the swap-chain texture, which has no COPY_SRC, so the canvas is the only
+     *  readable source; an empty blob means nothing was presented yet, not a black frame. */
     async captureFrame(): Promise<Blob> {
-        return new Blob([], { type: "image/png" });
+        return (await System.getInstance().services.render.tryCaptureScreen()) ?? new Blob([], { type: "image/png" });
     }
 
     getCounters(): Record<string, number> {

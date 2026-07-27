@@ -2849,7 +2849,16 @@ export class D3D9Device {
         return 0;
     }
 
+    /** PNG of the screen (canvas, post-fx and every overlay included); the executor's
+     *  own readback of the presented offscreen is the fallback. */
     async captureFrame(): Promise<Blob> {
+        const screen = await System.getInstance().services.render.tryCaptureScreen();
+        if (screen) return screen;
+        return (await this.capturePresentedLayer()) ?? new Blob();
+    }
+
+    /** The presented offscreen target — the 3D frame before it reaches the canvas. */
+    async capturePresentedLayer(): Promise<Blob | null> {
         this.submitFrame(false);
         return this.backendExecutor.captureFrame();
     }

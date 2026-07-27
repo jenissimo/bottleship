@@ -142,6 +142,12 @@ Legacy Graphics (DirectDraw, D3D3-9). You bridge x86 Windows internals with mode
   TimeService.advanceVirtualTime() (gated on a >0.5ms deficit, capped at 16ms per credit).
   Without this, games accelerate because no x86 instructions were generated during the
   thunk (dt starvation).
+  The 16ms cap bounds ONE credit, NOT the delta a game observes between two clock reads:
+  the credit runs per sync thunk and is not rate-limited, so a 210ms deficit drains in ~14
+  successive thunks and games issue hundreds per frame. Guest-visible time is wall-clock
+  with a 2ms leash (MAX_AHEAD_MS, runtime/time.ts), and the only real bound on guest dt is
+  MAX_DELTA_MS = 60_000. A game whose state machine assumes small frame deltas can be
+  handed multi-second ones when WE stall. See plan/virtual-time.md.
 - lastExpectedEspAfterReturn is set only for sync thunks, never async.
 
 3.6 Thread Safety Rules
@@ -257,9 +263,12 @@ facts the harness encodes (and the manual `dbg.*` fallback still needs):
   - Audio: needs a real gesture OR Chrome's `--autoplay-policy=no-user-gesture-required` (which
     `harness up` sets). Without it AudioContext stays SUSPENDED → SAB play cursor frozen → audio-gated
     logic stalls silently (frames render but the game never advances).
-  - SEE pixels via screenshot / `harness shot()` — the canvas is an OffscreenCanvas the main thread
-    can't read. A specific guest surface/texture: `dumpSurface`/`textures` (or `__gdibDumpName` →
-    GetDIBits PNG → `debug_png_dump` → sidecar `logs/debug/`).
+  - SEE pixels via `harness shot()` — the SCREEN (overlays composited), read from the mirror the
+    present path keeps, because a presented WebGPU canvas is no longer readable and a presenter's
+    own capture predates the composite. `shot({source:'layer'})` is the pre-composite game layer,
+    labelled as such; `bun tools/harness.ts shot --verify` cross-checks every route against the
+    browser's own capture. A specific guest surface/texture: `dumpSurface`/`textures` (or
+    `__gdibDumpName` → GetDIBits PNG → `debug_png_dump` → sidecar `logs/debug/`).
   - Intros: a bundle's `skipVideo` makes MCI/Bink/Smack complete instantly.
   - ANY non-standard situation (froze / vanished / black frame / unexpected exit / wild EIP) → FIRST
     pull `report()` (CLI: `bun tools/harness.ts report`). One firehose-immune POJO with: CPU regs, the

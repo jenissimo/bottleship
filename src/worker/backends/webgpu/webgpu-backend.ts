@@ -11,6 +11,8 @@ export class WebGPUBackend implements RenderBackend {
     private context: GPUCanvasContext | null = null;
     private format: GPUTextureFormat | null = null;
     private bcSupported = false;
+    /** Readable copy of the last presented canvas image (see mirrorPresentedFrame). */
+    private screenMirror: GPUTexture | null = null;
 
     // Compositing resources
     private overlayPipeline: GPURenderPipeline | null = null;
@@ -92,7 +94,10 @@ export class WebGPUBackend implements RenderBackend {
             device: this.device,
             format: this.format,
             alphaMode: "opaque",
-            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
+            // COPY_SRC so the presented frame can be mirrored into a readable texture:
+            // once presented, the canvas image belongs to the compositor and is no longer
+            // reliably readable (see mirrorPresentedFrame).
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC,
         });
 
         this.postFx = new PostFxChain(this.device, () => EmulatorConfig.getInstance().quality);
@@ -112,7 +117,10 @@ export class WebGPUBackend implements RenderBackend {
             device: this.device,
             format: this.format,
             alphaMode: "opaque",
-            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
+            // COPY_SRC so the presented frame can be mirrored into a readable texture:
+            // once presented, the canvas image belongs to the compositor and is no longer
+            // reliably readable (see mirrorPresentedFrame).
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC,
         });
         // Invalidate bind group caches — old texture views are now stale
         this.bindGroupCache = new WeakMap();
@@ -130,6 +138,89 @@ export class WebGPUBackend implements RenderBackend {
 
     getContext(): GPUCanvasContext | null {
         return this.context;
+    }
+
+    getScreenCanvas(): OffscreenCanvas | null {
+        return (this.context?.canvas as OffscreenCanvas | undefined) ?? null;
+    }
+
+    /**
+     * Copy the frame just submitted to the canvas into a mirror texture we own.
+     *
+     * A presented WebGPU canvas is NOT reliably readable: once the compositor takes the
+     * swap image, createImageBitmap() yields a 0x0 bitmap and convertToBlob() throws
+     * "Readback of the source image has failed" — measured on a static GDI screen and on
+     * every paused frame. This copy, encoded while the texture is still the current one,
+     * is the only exact record of what the user saw. Called from RenderService.notifyPresent
+     * (every present path funnels through it) and only while a screenshot consumer has
+     * armed it, so a normal run pays nothing.
+     */
+    mirrorPresentedFrame(): void {
+        const device = this.device, queue = this.queue, ctx = this.context, format = this.format;
+        if (!device || !queue || !ctx || !format) return;
+        let tex: GPUTexture;
+        try {
+            tex = ctx.getCurrentTexture();
+        } catch {
+            return; // canvas unconfigured this frame
+        }
+        if (!tex.width || !tex.height) return;
+        if (!this.screenMirror || this.screenMirror.width !== tex.width || this.screenMirror.height !== tex.height) {
+            this.screenMirror?.destroy();
+            this.screenMirror = device.createTexture({
+                size: { width: tex.width, height: tex.height, depthOrArrayLayers: 1 },
+                format,
+                usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC | GPUTextureUsage.RENDER_ATTACHMENT,
+            });
+        }
+        const encoder = device.createCommandEncoder();
+        encoder.copyTextureToTexture(
+            { texture: tex }, { texture: this.screenMirror },
+            { width: tex.width, height: tex.height, depthOrArrayLayers: 1 },
+        );
+        queue.submit([encoder.finish()]);
+    }
+
+    /** PNG of the mirrored frame (see mirrorPresentedFrame); null until one was mirrored. */
+    async captureMirroredFrame(): Promise<Blob | null> {
+        const device = this.device, queue = this.queue, mirror = this.screenMirror;
+        if (!device || !queue || !mirror) return null;
+        const width = mirror.width, height = mirror.height;
+        const bytesPerRow = Math.ceil((width * 4) / 256) * 256;
+        const readback = device.createBuffer({
+            size: bytesPerRow * height,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
+        try {
+            const encoder = device.createCommandEncoder();
+            encoder.copyTextureToBuffer(
+                { texture: mirror }, { buffer: readback, bytesPerRow },
+                { width, height, depthOrArrayLayers: 1 },
+            );
+            queue.submit([encoder.finish()]);
+            await queue.onSubmittedWorkDone();
+            await readback.mapAsync(GPUMapMode.READ);
+            const mapped = new Uint8Array(readback.getMappedRange());
+            const pixels = new Uint8ClampedArray(width * height * 4);
+            const swapRB = this.format === "bgra8unorm";
+            for (let y = 0; y < height; y++) {
+                let s = y * bytesPerRow, d = y * width * 4;
+                for (let x = 0; x < width; x++, s += 4, d += 4) {
+                    pixels[d] = mapped[s + (swapRB ? 2 : 0)]!;
+                    pixels[d + 1] = mapped[s + 1]!;
+                    pixels[d + 2] = mapped[s + (swapRB ? 0 : 2)]!;
+                    pixels[d + 3] = 255; // the canvas is alphaMode:"opaque"
+                }
+            }
+            readback.unmap();
+            const canvas = new OffscreenCanvas(width, height);
+            const ctx2d = canvas.getContext("2d");
+            if (!ctx2d) return null;
+            ctx2d.putImageData(new ImageData(pixels, width, height), 0, 0);
+            return await canvas.convertToBlob({ type: "image/png" });
+        } finally {
+            readback.destroy();
+        }
     }
 
     getFormat(): GPUTextureFormat | null {

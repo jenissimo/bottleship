@@ -123,23 +123,29 @@ export class DDrawPresenter implements RenderActive {
     }
 
     /**
-     * PNG of what was last presented. `this.canvas` is only the CPU path's 2D
-     * scratch surface — a title whose frames live in GPU_ONLY surfaces (any 3D
-     * DDraw game) never draws into it, so capturing it hands back a blank image.
-     * Read the presented GPU texture back instead, and force the alpha channel
-     * opaque: the guest primary is an RGB565/555 display mode with no alpha, so
-     * whatever the 3D blend modes left in those bits is not part of the frame.
+     * PNG of the screen. The canvas is the only source that includes the overlays
+     * compositeFrameOverlays() blits on AFTER lastPresented is recorded (video plane,
+     * live GDI dialog rects, stats) — capturing lastPresented shows the game layer
+     * with a dialog missing, which reads as a plausible but wrong screenshot.
+     *
+     * Fallbacks, in order: the presented GPU texture (game layer only, alpha forced
+     * opaque — the guest primary is an RGB565/555 mode with no alpha), then the CPU
+     * path's 2D scratch canvas, which is blank for any GPU_ONLY (3D DDraw) title.
      */
     async captureFrame(): Promise<Blob> {
-        const gpu = this.lastPresented;
-        if (gpu) {
-            const blob = await this.captureFromGpu(gpu);
-            if (blob) return blob;
-        }
+        const screen = await System.getInstance().services.render.tryCaptureScreen();
+        if (screen) return screen;
+        const layer = await this.capturePresentedLayer();
+        if (layer) return layer;
         if (!this.canvas) {
             return new Blob();
         }
         return this.canvas.convertToBlob();
+    }
+
+    /** The presented guest surface alone — no video plane, no GDI dialog rects, no stats. */
+    async capturePresentedLayer(): Promise<Blob | null> {
+        return this.lastPresented ? this.captureFromGpu(this.lastPresented) : null;
     }
 
     private async captureFromGpu(src: { view: GPUTextureView; width: number; height: number }): Promise<Blob | null> {

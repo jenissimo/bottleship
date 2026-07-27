@@ -1,8 +1,15 @@
 /**
- * shot() — capture the on-screen frame as a PNG. Worker-side wrap of
- * RenderActive.captureFrame() (the active presenter's screenshot), returned as
- * base64 through the RPC contract (POJO-friendly). With opts.save it also routes
- * the PNG to the log server via the existing debug_png_dump channel (logs/debug/).
+ * shot() — capture the SCREEN as a PNG, returned as base64 through the RPC contract
+ * (POJO-friendly). With opts.save it also routes the PNG to the log server via the
+ * existing debug_png_dump channel (logs/debug/).
+ *
+ * The capture reads the canvas itself (RenderService.captureScreen), NOT the active
+ * presenter's source texture: the video plane, GDI dialog rects and the stats overlay
+ * are composited onto the canvas after the presenter records what it drew from, so a
+ * presenter capture shows the game WITHOUT the overlay — blind to precisely the
+ * compositing bugs a screenshot is asked to settle. Every result is labelled with the
+ * source it came from, and a capture that cannot see the composite says so instead of
+ * returning a plausible wrong PNG.
  */
 
 import type { HarnessService } from "../service";
@@ -28,13 +35,97 @@ export function bytesToBase64(bytes: Uint8Array): string {
     return btoa(bin);
 }
 
+/** PNG dimensions straight out of the IHDR — so a capture always states the size it
+ *  actually has (guest surface vs. canvas is the tell that a wrong source was used). */
+function pngSize(bytes: Uint8Array): { width: number; height: number } | null {
+    if (bytes.length < 24 || bytes[0] !== 0x89 || bytes[1] !== 0x50) return null;
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    return { width: dv.getUint32(16), height: dv.getUint32(20) };
+}
+
+/** What a `layer` capture is blind to — it is NOT the screen. */
+const LAYER_BLIND_SPOT =
+    "presenter layer: the frame source BEFORE the video plane / live GDI dialog rects / stats overlay " +
+    "are composited onto the canvas — it cannot show a compositing bug. The screen is source:'screen'.";
+
 export function registerScreenCommands(svc: HarnessService): void {
+    /**
+     * shot({ save?, source? }) — PNG of the screen.
+     *  - "screen" (default): the canvas, every overlay composited — what the user sees.
+     *  - "layer": the active presenter's own frame source (pre-composite game layer),
+     *    for splitting "which layer holds the pixels" from "does the composite show it".
+     *    Always labelled `composited:false`; never a substitute for the screen.
+     * Result carries `source`/`composited`/`width`/`height` (+ `warning` whenever the
+     * image is not the composite), so a caller cannot mistake one for the other.
+     */
     svc.register("shot", async (args) => {
-        const opts = (args[0] ?? {}) as { save?: string };
-        const active: any = sys().services?.render?.getActive?.();
-        if (!active?.captureFrame) throw new HarnessError("no active presenter (nothing rendered yet)", HarnessErrorCode.UNSUPPORTED);
-        const blob: Blob = await active.captureFrame();
-        const bytes = new Uint8Array(await blob.arrayBuffer());
+        const opts = (args[0] ?? {}) as { save?: string; source?: "screen" | "layer" };
+        const want = opts.source ?? "screen";
+        const render: any = sys().services?.render;
+        const active: any = render?.getActive?.();
+
+        let blob: Blob | null = null;
+        let source: "screen" | "layer" = "screen";
+        let warning: string | null = null;
+
+        if (want === "layer") {
+            if (!active?.capturePresentedLayer) {
+                throw new HarnessError(
+                    `active presenter (${active?.constructor?.name ?? "none"}) has no separate frame source to capture` +
+                    " — it renders straight to the canvas. Use the default source:'screen'.",
+                    HarnessErrorCode.UNSUPPORTED,
+                );
+            }
+            blob = await active.capturePresentedLayer();
+            source = "layer";
+            warning = LAYER_BLIND_SPOT;
+        } else {
+            // Say WHICH way it failed — "no canvas at all" and "nothing mirrored yet" are
+            // different diagnoses, and neither may be answered with a different image.
+            try {
+                blob = await render?.captureScreen?.();
+            } catch (err) {
+                // First capture on a screen that is not repainting: the mirror (armed by
+                // that very call) is still empty. Nudge one repaint — a dirty GDI overlay
+                // or a presenter re-present — and retry, rather than reporting a screen we
+                // simply never asked the compositor for.
+                sys().gdiContext?.setOverlayDirty?.(true);
+                active?.repaintLastFrame?.();
+                for (let i = 0; i < 4 && !blob; i++) {
+                    await new Promise<void>((r) => requestAnimationFrame(() => r()));
+                    blob = await render?.captureScreen?.().catch(() => null);
+                }
+                if (!blob) {
+                    throw new HarnessError(
+                        `screen capture failed: ${(err as Error).message}. Nudging a repaint did not produce a frame` +
+                        " either — `bun tools/harness.ts shot` (CDP page capture) is the independent route to the same" +
+                        " pixels; overlay()/dumpSurface('primary') see the guest layers.",
+                        HarnessErrorCode.UNSUPPORTED,
+                    );
+                }
+            }
+            if (!blob) {
+                throw new HarnessError(
+                    "cannot see the screen: no render backend/canvas yet (nothing presented?)." +
+                    " `bun tools/harness.ts shot` (CDP page capture) sees the page regardless;" +
+                    " dumpSurface('primary') / overlay() see the guest layers.",
+                    HarnessErrorCode.UNSUPPORTED,
+                );
+            }
+        }
+
+        const bytes = blob ? new Uint8Array(await blob.arrayBuffer()) : new Uint8Array(0);
+        const size = pngSize(bytes);
+        // An empty/undecodable blob is a capture that FAILED. Handing it back as a PNG is
+        // the lie — an agent reads "0 bytes" as a black screen and chases a rendering bug.
+        if (!bytes.length || !size) {
+            throw new HarnessError(
+                `${source} capture produced no image (${bytes.length} bytes)` +
+                ` — presenter ${active?.constructor?.name ?? "unknown"} has nothing to read back.` +
+                " Use `bun tools/harness.ts shot` (CDP page capture) or dumpSurface('primary').",
+                HarnessErrorCode.UNSUPPORTED,
+            );
+        }
         const base64 = bytesToBase64(bytes);
         let saved: string | null = null;
         if (opts.save) {
@@ -42,7 +133,15 @@ export function registerScreenCommands(svc: HarnessService): void {
             (self as unknown as Worker).postMessage({ type: "debug_png_dump", name, base64 });
             saved = debugDumpPath(name);
         }
-        return { bytes: bytes.length, base64, saved };
+        // presentsSinceCapture: 0 = the mirrored frame IS the current screen, N = the
+        // screen moved on N presents while we read it back, -1 = read off the canvas.
+        return {
+            bytes: bytes.length, base64, saved, source,
+            composited: source === "screen",
+            width: size.width, height: size.height,
+            ...(source === "screen" ? { presentsSinceCapture: render?.screenMirrorAge?.() ?? -1 } : {}),
+            ...(warning ? { warning } : {}),
+        };
     });
 
     /**
