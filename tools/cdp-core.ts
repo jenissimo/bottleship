@@ -17,7 +17,7 @@
  * Bun script (top-level await, Bun.spawnSync, global fetch/WebSocket).
  */
 import { gzipSync } from "node:zlib";
-import { closeSync, openSync, rmSync, statSync } from "node:fs";
+import { closeSync, existsSync, openSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pickSessionTab, sessionFromEnv, sessionOwnsUrl, sessionUrl } from "../src/harness/session";
@@ -63,15 +63,19 @@ export function cdpSession(): string {
  */
 const LAUNCH_LOCK_TTL_MS = 45_000;
 
-function acquireLaunchLock(port: number): (() => void) | null {
-    const path = join(tmpdir(), `bottleship-cdp-launch-${port}.lock`);
+function acquireLaunchLock(port: number, kind = "cdp", ttlMs = LAUNCH_LOCK_TTL_MS): (() => void) | null {
+    const path = join(tmpdir(), `bottleship-${kind}-launch-${port}.lock`);
+    return acquireLockAt(path, ttlMs);
+}
+
+function acquireLockAt(path: string, ttlMs: number): (() => void) | null {
     for (let attempt = 0; attempt < 2; attempt++) {
         try {
             closeSync(openSync(path, "wx"));
             return () => { try { rmSync(path); } catch { /* already gone */ } };
         } catch {
             try {
-                if (Date.now() - statSync(path).mtimeMs > LAUNCH_LOCK_TTL_MS) { rmSync(path); continue; }
+                if (Date.now() - statSync(path).mtimeMs > ttlMs) { rmSync(path); continue; }
             } catch { continue; }
             return null;
         }
@@ -515,6 +519,97 @@ const VITE_TRANSFORM_PROBE = "/src/app/App.tsx";
  *  `viteTransform` is the load-bearing one: a wedged Vite still answers 200 on the
  *  root while every real module request hangs, which presents as "the page loads but
  *  nothing renders / the guest never boots" and sends you hunting inside the game. */
+/**
+ * Vite's cold start in this project is ~2 minutes (measured: 116 s cold, 89 s warm), which
+ * is long enough that a live server is repeatedly mistaken for a hung one and killed.
+ * Everything below exists so nobody has to make that judgement by eye.
+ */
+const VITE_COLD_START_MS = 300_000;
+/** Long TTL for the same reason: stealing this lock mid-cold-start starts a second Vite. */
+const VITE_LOCK_TTL_MS = 360_000;
+
+async function viteTransformOk(timeoutMs = 20_000): Promise<boolean> {
+    try {
+        const origin = new URL(DEFAULT_DEV_URL).origin;
+        return (await fetch(`${origin}${VITE_TRANSFORM_PROBE}`, { signal: AbortSignal.timeout(timeoutMs) })).ok;
+    } catch { return false; }
+}
+
+/**
+ * Vite pre-bundles deps into `node_modules/.vite-temp` and renames it to `.vite/deps`.
+ * When that rename does not happen — which it does under concurrent starts — every dep
+ * request 504s forever and no amount of waiting recovers it. The half-state is precisely
+ * detectable, so detect and clear it rather than asking a human to notice.
+ */
+function repairViteDepCache(): boolean {
+    const temp = join(process.cwd(), "node_modules", ".vite-temp");
+    const deps = join(process.cwd(), "node_modules", ".vite", "deps");
+    if (!existsSync(temp) || existsSync(deps)) return false;
+    rmSync(temp, { recursive: true, force: true });
+    rmSync(join(process.cwd(), "node_modules", ".vite"), { recursive: true, force: true });
+    return true;
+}
+
+function killWedgedVite(): void {
+    if (IS_MAC) { Bun.spawnSync(["pkill", "-f", "vite"]); return; }
+    // By PID via the listening socket — matching 'vite' on the command line kills every
+    // Vite on the machine, including other agents' and other checkouts'.
+    const port = new URL(DEFAULT_DEV_URL).port || "5174";
+    Bun.spawnSync(["powershell", "-NoProfile", "-Command",
+        `Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | ` +
+        `ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }`]);
+}
+
+/**
+ * Make sure exactly one healthy Vite is serving, starting or repairing it if not.
+ *
+ * The lock is the point: several agents each running `harness up` used to start several
+ * Vites, and they share one dep-optimizer cache directory — which is how the rename above
+ * gets lost in the first place. A loser of the lock waits for the winner instead of
+ * starting a competitor.
+ */
+export async function ensureVite(): Promise<{ ok: boolean; action: string }> {
+    if (await viteTransformOk(8_000)) return { ok: true, action: "already-serving" };
+
+    const port = Number(new URL(DEFAULT_DEV_URL).port || 5174);
+    const release = acquireLaunchLock(port, "vite", VITE_LOCK_TTL_MS);
+    if (!release) {
+        // Someone else is starting it; a cold start is minutes, so wait rather than race.
+        const deadline = Date.now() + VITE_COLD_START_MS;
+        while (Date.now() < deadline) {
+            if (await viteTransformOk(10_000)) return { ok: true, action: "waited-for-other-starter" };
+            await Bun.sleep(3_000);
+        }
+        return { ok: false, action: "timed-out-waiting-for-other-starter" };
+    }
+
+    try {
+        const listening = await (async () => { try { return (await fetch(new URL(DEFAULT_DEV_URL).origin, { signal: AbortSignal.timeout(5_000) })).ok; } catch { return false; } })();
+        const repaired = repairViteDepCache();
+        // Serving static but not transforming = wedged; it will never recover on its own.
+        if (listening || repaired) {
+            killWedgedVite();
+            for (let i = 0; i < 30 && await portInUse(port); i++) await Bun.sleep(1_000);
+        }
+        Bun.spawnSync(["powershell", "-NoProfile", "-Command",
+            `Start-Process -FilePath 'bun' -ArgumentList 'run','dev' -WorkingDirectory '${process.cwd()}' -WindowStyle Hidden`]);
+        const deadline = Date.now() + VITE_COLD_START_MS;
+        while (Date.now() < deadline) {
+            if (await viteTransformOk(10_000)) {
+                return { ok: true, action: repaired ? "repaired-and-restarted" : "started" };
+            }
+            await Bun.sleep(3_000);
+        }
+        return { ok: false, action: "started-but-not-ready" };
+    } finally {
+        release();
+    }
+}
+
+async function portInUse(port: number): Promise<boolean> {
+    try { await fetch(`http://localhost:${port}/`, { signal: AbortSignal.timeout(2_000) }); return true; } catch { return false; }
+}
+
 export async function health(opts: { port?: number } = {}): Promise<HealthReport> {
     const port = opts.port ?? DEFAULT_CDP_PORT;
     const probe = async (url: string, init?: RequestInit) => {

@@ -55,6 +55,7 @@ import { ComObjectFactory } from "../../core/com/base-com-object";
 
 import { convertRGBAToSurface, uploadToGPUTexture, convertSurfaceToRGBA } from "./gpu-texture-utils";
 import { setAuthorityCpu, setAuthorityGpu, markCpuSyncedFromGpu, syncActiveGdiContext, surfaceSyncManager, logSurfaceState, demoteSurfaceToCpu } from "./surface-sync";
+import { recordSurfaceOp } from "./surface-op-log";
 import { propagateSurfaceStateToRegistry } from "./d3d/texture-manager";
 import { thunkChecksumManager } from "../../core/memory/thunk-checksum";
 import { leaseRegistry } from "../../core/memory/lease-registry";
@@ -1368,6 +1369,8 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
             const didWritePixels = leaseWriteState.changed;
             const previousSurfaceEverWritten = state.surfaceEverWritten;
             const previousWriteGeneration = state.writeGeneration;
+            recordSurfaceOp("unlock", wasReadOnly ? "readonly" : didWritePixels ? "wrote" : "nochange",
+                state, null, null, null);
             if (!leaseWriteState.hadLease) {
                 Logger.warn(LogCategory.DDRAW,
                     `Unlock: surface=0x${thisPtr.toString(16)} without active Lock lease; ignoring CPU write commit`);

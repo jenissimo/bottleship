@@ -62,6 +62,9 @@ export class HarnessChain {
      *  still work; only the postMessage + WS shipping stops. Re-arm with `streamLogs()`. */
     stopLogs(): this { return this.push("stopLogs", []); }
     logs(count?: number, filter?: string): this { return this.push("logs", [count, filter]); }
+    /** Widen the in-memory log ring (default 50) BEFORE a repro so the tail that led to a
+     *  fault is still there when `logs`/`report` run. Resizing clears the ring. */
+    logRing(size: number): this { return this.push("logRing", [size]); }
     logStats(count?: number, top?: number): this { return this.push("logStats", [count, top]); }
     markLog(label: string): this { return this.push("markLog", [label]); }
     logsSince(label: string, opts?: { filter?: string; count?: number }): this { return this.push("logsSince", [label, opts]); }

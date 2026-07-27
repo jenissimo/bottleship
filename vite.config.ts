@@ -234,6 +234,18 @@ export default defineConfig({
     // re-hit the Windows failure where its output is left in `node_modules/.vite-temp` and
     // never renamed into `.vite/deps`, after which every dep request 504s. Once per
     // dependency change is survivable; every start was not.
-    include: ["react", "react-dom", "@phosphor-icons/react", "pako"]
+    // `noDiscovery` skips the dependency SCANNER entirely, and the scanner is the cost:
+    // it crawls the whole import graph from index.html, which here means ~700 worker
+    // modules that import no npm package at all (the worker's only bare specifier is
+    // `v86`, and that is an alias to a local file). Measured before: 116 s cold, 89 s
+    // warm — the warm case still paid for the crawl, which is why a dependency cache
+    // alone barely helped.
+    //
+    // The price is that `include` must be COMPLETE: nothing is auto-discovered, and a
+    // CJS package left out will not work in dev. These four are every bare import in the
+    // browser tree (the `typescript`/`fs`/`path` hits under src/ are tooling, not part of
+    // any browser entry). Add here when adding a dependency.
+    noDiscovery: true,
+    include: ["react", "react-dom", "react-dom/client", "@phosphor-icons/react", "pako"]
   }
 });

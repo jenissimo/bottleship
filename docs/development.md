@@ -36,7 +36,31 @@ bun run deploy/server.ts      # static server: COOP/COEP + HTTP Range (for WGB s
 The server must send `Cross-Origin-Opener-Policy: same-origin` and
 `Cross-Origin-Embedder-Policy: require-corp` (SAB) and honor HTTP `Range` requests (so large
 `.wgb` bundles stream instead of fully downloading). `deploy/server.ts` does both; any static
-host works as long as it sets those headers and supports ranges.
+host works as long as it sets those headers and supports ranges. A reverse proxy in front must
+not buffer or cache these responses — a proxy that turns a `206` into a `200` breaks bundle
+streaming.
+
+Optional env, all off by default:
+
+| Variable | Effect |
+| --- | --- |
+| `BS_DIST_DIR` | serve a build from elsewhere (default `../dist`) |
+| `BS_APPS_DIR` | serve `/apps/*.wgb` off a separate mount — the self-hosted equivalent of the R2 bucket behind `functions/apps/[[path]].ts`, so multi-GB bundles stay out of `dist` |
+| `BS_AUTH_USER` + `BS_AUTH_PASS` | HTTP Basic auth over the whole site (private stands). `/healthz` stays open for container probes |
+
+### Containers
+
+`deploy/docker-compose.yml` runs the stock `oven/bun` image over a bind-mounted payload —
+`server.ts` needs no dependencies, so updating a deployment is an rsync, not an image rebuild.
+`tools/make-stand.ts` assembles that payload from a build plus a JSON config naming the games:
+
+```bash
+bun run build
+bun tools/make-stand.ts my-stand.json      # → <out>/{server.ts,docker-compose.yml,dist/,apps/}
+```
+
+The generated `dist/games-catalog.json` lists exactly the games in the config, and only their
+box art ships — useful for a private stand that should not expose the public library.
 
 ## Quality gate
 

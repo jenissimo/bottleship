@@ -1,0 +1,54 @@
+# Self-hosted BottleShip stand — stock Bun image over a bind-mounted payload.
+#
+# Host layout (upload once; updating the stand is an rsync, not an image rebuild):
+#   ${BS_ROOT}/server.ts   copy of deploy/server.ts
+#   ${BS_ROOT}/dist/       output of `bun run build` (with the catalog/covers you want)
+#   ${BS_ROOT}/apps/       the .wgb bundles the catalog's wgbUrl entries point at
+#
+# server.ts pulls in nothing but Bun + node:path/node:crypto, so there is no install
+# and no build step in the container — it serves the prebuilt dist straight off the mount.
+# Set BS_AUTH_USER/BS_AUTH_PASS (stack environment variables, or a .env next to this
+# file) to put the whole stand behind HTTP Basic auth.
+
+services:
+  bottleship-stand:
+    image: oven/bun:1.2.22-alpine
+    container_name: ${BS_CONTAINER:-bottleship-stand}
+    working_dir: /app
+    environment:
+      - NODE_ENV=production
+      - PORT=5173
+      - BS_DIST_DIR=/app/dist
+      - BS_APPS_DIR=/app/apps
+      - BS_AUTH_USER=${BS_AUTH_USER:-}
+      - BS_AUTH_PASS=${BS_AUTH_PASS:-}
+      - BS_AUTH_REALM=${BS_AUTH_REALM:-BottleShip}
+    volumes:
+      - ${BS_ROOT:-/srv/bottleship}:/app:ro
+    networks:
+      - proxy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:5173/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    # Fail loudly on a half-uploaded payload instead of serving 404s to the visitor.
+    command: |
+      sh -eu -c '
+        echo ">>> ls /app"; ls -la /app | head -n 40
+        test -f /app/server.ts       || { echo "!! no /app/server.ts";  exit 1; }
+        test -f /app/dist/index.html || { echo "!! no /app/dist — payload not built (tools/make-stand.ts)"; exit 1; }
+        ls /app/apps/*.wgb >/dev/null 2>&1 || { echo "!! no .wgb bundles in /app/apps"; exit 1; }
+        exec bun /app/server.ts
+      '
+    # No published port: the reverse proxy reaches the container by name on the shared
+    # network (forward host = the container name, port 5173). Publishing to 127.0.0.1
+    # would NOT work for a proxy that is itself a container — its loopback is its own.
+    # ports:
+    #   - "8090:5173"
+
+networks:
+  proxy:
+    external: true
+    name: ${BS_PROXY_NETWORK:-proxy}

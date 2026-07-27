@@ -18,6 +18,7 @@ import { getModule, guestMem, serializeSurfaces, sys } from "../serialize";
 import { bytesToBase64, debugDumpPath } from "./screen";
 import { devices as d3d9Devices } from "../../modules/d3d9/shared-state";
 import { startCapture as frameCaptureStart } from "../../modules/ddraw/frame-capture";
+import { armSurfaceOps, takeSurfaceOps } from "../../modules/ddraw/surface-op-log";
 import { asArrayBufferView } from "../../../dom-buffer";
 
 function ddraw(): any {
@@ -61,6 +62,23 @@ export function registerTextureCommands(svc: HarnessService): void {
             for (const t of info) d3d9.push({ ...t, backend: "d3d9", device: ptr >>> 0 });
         }
         return { ddraw: ddrawSurfaces, d3d9 };
+    });
+
+    /** surfaceOps({arm}) — arm the DDraw composition-op ring for the next `arm` ops;
+     *  call again with no argument to take what was recorded.
+     *
+     *  Each row is one Blt/BltFast/Flip/ColorFill: the rectangle, the source, the PATH
+     *  it actually took (`gpu*` / `cpu*` / `skip:lease`) and the destination's authority
+     *  afterwards. That is the only view that answers "the art is positioned correctly
+     *  but half of it is black" — the missing rects are the ones whose op never ran, or
+     *  ran into the representation the next Flip did not read. */
+    svc.register("surfaceOps", (args) => {
+        const opts = (args[0] ?? {}) as { arm?: number };
+        if (typeof opts.arm === "number") return armSurfaceOps(opts.arm);
+        const ops = takeSurfaceOps();
+        const byPath: Record<string, number> = {};
+        for (const o of ops) byPath[`${o.op}:${o.path}`] = (byPath[`${o.op}:${o.path}`] ?? 0) + 1;
+        return { count: ops.length, byPath, ops };
     });
 
     /** dumpSurface(sel, {save?}) — DDraw surface -> PNG. */

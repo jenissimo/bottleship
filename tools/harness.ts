@@ -29,6 +29,7 @@
 
 import {
     launchOrAttachChrome,
+    ensureVite,
     findOrCreateTab,
     listSessionTabs,
     cdpSession,
@@ -200,6 +201,10 @@ export function harness(): HarnessChain {
 
 async function cmdUp(): Promise<void> {
     console.log("[harness up] probing services…");
+    // Before Chrome: a wedged Vite makes every guest look broken, and several agents each
+    // starting their own Vite is what wedges it. ensureVite locks, repairs and waits.
+    const v = await ensureVite();
+    console.log(`[harness up] vite: ${v.action}${v.ok ? "" : " — NOT SERVING"}`);
     await launchOrAttachChrome({ autoplay: true });
     const tab = await findOrCreateTab(DEFAULT_DEV_URL);
     const session = await CdpSession.connect(tab.webSocketDebuggerUrl);

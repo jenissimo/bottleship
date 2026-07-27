@@ -53,6 +53,20 @@ export function registerLogCommands(svc: HarnessService): void {
         return { ok: true };
     });
 
+    /**
+     * logRing(size) — resize the in-memory log ring (default 50).
+     *
+     * The post-mortem workflow is "reproduce, then read the log tail that led to
+     * the fault", but 50 entries is a fraction of one boot's SYSTEM chatter, so
+     * the interesting lines are gone before `logs()` runs. Widen it BEFORE the
+     * repro. Resizing drops the current contents (the ring is reallocated).
+     */
+    svc.register("logRing", (args) => {
+        const size = typeof args[0] === "number" ? Math.max(50, Math.min(200000, args[0] as number)) : 50;
+        Logger.setBufferSize(size);
+        return { size };
+    });
+
     svc.register("logs", (args) => {
         const count = typeof args[0] === "number" ? (args[0] as number) : 200;
         const filter = typeof args[1] === "string" ? (args[1] as string).toLowerCase() : null;
