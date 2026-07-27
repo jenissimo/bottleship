@@ -703,6 +703,85 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
         return 0;
     };
 
+    // ---- 3D getters -------------------------------------------------------
+    // Out-parameter twins of the setters above; each writes back exactly what the
+    // matching setter stored. An engine that keeps no copy of its own spatial state
+    // reads these back per frame, and a handler that leaves the pointers untouched
+    // hands it whatever was on the stack — garbage distances and pans.
+
+    /** Write up to three F32 out-parameters, skipping the NULL ones MSS allows. */
+    const writeF32Outs = (mem: Uint8Array, ptrs: number[], values: number[]): void => {
+        const view = makeView(mem);
+        for (let i = 0; i < ptrs.length; i++) {
+            const p = ptrs[i] >>> 0;
+            if (!p || !MemoryGuard.isValidRange(mem, p, 4)) continue;
+            view.setFloat32(p, values[i], true);
+        }
+    };
+
+    /** Spatial state of a 3D object — a sample, or the listener. */
+    const spatialOf = (obj: number): {
+        pos: [number, number, number]; vel: [number, number, number];
+        front: [number, number, number]; top: [number, number, number];
+        maxDist: number; minDist: number;
+    } | null => {
+        if (isListener(obj)) {
+            const ls = ctx.listener3D!;
+            return {
+                pos: [ls.posX, ls.posY, ls.posZ],
+                vel: [ls.velX, ls.velY, ls.velZ],
+                front: [ls.frontX, ls.frontY, ls.frontZ],
+                top: [ls.topX, ls.topY, ls.topZ],
+                maxDist: 0, minDist: 0,
+            };
+        }
+        const s = ctx.samples.get(obj);
+        if (!s) return null;
+        const p = s.pos3D ?? { x: 0, y: 0, z: 0 };
+        const v = s.vel3D ?? { x: 0, y: 0, z: 0 };
+        const c = s.cone3D;
+        return {
+            pos: [p.x, p.y, p.z],
+            vel: [v.x, v.y, v.z],
+            // A sample's "face" vector is its sound cone's orientation; it has no up vector.
+            front: [c?.oriX ?? 0, c?.oriY ?? 0, c?.oriZ ?? 1],
+            top: [0, 1, 0],
+            maxDist: s.maxDist3D ?? 0,
+            minDist: s.minDist3D ?? 0,
+        };
+    };
+
+    // _AIL_3D_position@16(obj, F32* X, F32* Y, F32* Z)
+    exports["_AIL_3D_position@16"] = (ctxThunk, mem, args) => {
+        const sp = spatialOf(args[0]);
+        writeF32Outs(mem, [args[1], args[2], args[3]], sp ? sp.pos : [0, 0, 0]);
+        return 0;
+    };
+
+    // _AIL_3D_velocity@16(obj, F32* dX, F32* dY, F32* dZ)
+    exports["_AIL_3D_velocity@16"] = (ctxThunk, mem, args) => {
+        const sp = spatialOf(args[0]);
+        writeF32Outs(mem, [args[1], args[2], args[3]], sp ? sp.vel : [0, 0, 0]);
+        return 0;
+    };
+
+    // _AIL_3D_orientation@28(obj, F32* X_face, Y_face, Z_face, X_up, Y_up, Z_up)
+    exports["_AIL_3D_orientation@28"] = (ctxThunk, mem, args) => {
+        const sp = spatialOf(args[0]);
+        const f = sp ? sp.front : [0, 0, 1];
+        const u = sp ? sp.top : [0, 1, 0];
+        writeF32Outs(mem, [args[1], args[2], args[3], args[4], args[5], args[6]],
+            [f[0], f[1], f[2], u[0], u[1], u[2]]);
+        return 0;
+    };
+
+    // _AIL_3D_sample_distances@12(S3D, F32* max_dist, F32* min_dist)
+    exports["_AIL_3D_sample_distances@12"] = (ctxThunk, mem, args) => {
+        const sp = spatialOf(args[0]);
+        writeF32Outs(mem, [args[1], args[2]], sp ? [sp.maxDist, sp.minDist] : [0, 0]);
+        return 0;
+    };
+
     // _AIL_set_3D_sample_cone@16(S3D, inner_angle, outer_angle, outer_volume_0_127)
     exports["_AIL_set_3D_sample_cone@16"] = (ctxThunk, mem, args) => {
         const s = ctx.samples.get(args[0]);

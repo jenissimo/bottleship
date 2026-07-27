@@ -94,6 +94,27 @@ function readComp(v: GuestViews, addr: number, type: number): number {
     }
 }
 
+/**
+ * Factor that maps a raw integer component onto the normalised range GL defines for
+ * COLOUR and NORMAL arrays: unsigned types span [0,1], signed types [-1,1], both by
+ * dividing by the type's largest positive value. Float and double components are
+ * already in GL's units and pass through at scale 1, as do unrecognised types.
+ *
+ * Position and texture-coordinate arrays are NOT normalised — an integer there is the
+ * coordinate itself — so they must never use this.
+ */
+export function normScale(type: number): number {
+    switch (type) {
+        case GL_UNSIGNED_BYTE: return 1 / 255;
+        case GL_BYTE: return 1 / 127;
+        case GL_UNSIGNED_SHORT: return 1 / 65535;
+        case GL_SHORT: return 1 / 32767;
+        case GL_UNSIGNED_INT: return 1 / 4294967295;
+        case GL_INT: return 1 / 2147483647;
+        default: return 1;
+    }
+}
+
 /** Byte stride between consecutive elements of `arr` (stride 0 means tightly packed). */
 function arrayStride(arr: GLArrayPointer, comps: number): number {
     return arr.stride > 0 ? arr.stride : comps * elemSize(arr.type);
@@ -235,16 +256,18 @@ function gatherColor(
     const stride = arrayStride(arr, size);
     const V = VERT_FLOATS;
     const has1 = size >= 1, has2 = size >= 2, has3 = size >= 3, has4 = size >= 4;
+    // An absent component defaults to 1.0 — already normalised, so never scaled.
+    const sc = normScale(type);
 
     if (type === GL_UNSIGNED_BYTE) {
-        const u = v.u8, inv = 1 / 255;
+        const u = v.u8;
         for (let i = 0; i < count; i++) {
             const a = ptr + idx[i] * stride;
             const b = dstBase + i * V;
-            dst[b + 4] = has1 ? u[a] * inv : 1;
-            dst[b + 5] = has2 ? u[a + 1] * inv : 1;
-            dst[b + 6] = has3 ? u[a + 2] * inv : 1;
-            dst[b + 7] = has4 ? u[a + 3] * inv : 1;
+            dst[b + 4] = has1 ? u[a] * sc : 1;
+            dst[b + 5] = has2 ? u[a + 1] * sc : 1;
+            dst[b + 6] = has3 ? u[a + 2] * sc : 1;
+            dst[b + 7] = has4 ? u[a + 3] * sc : 1;
         }
         return;
     }
@@ -252,10 +275,10 @@ function gatherColor(
     for (let i = 0; i < count; i++) {
         const a = ptr + idx[i] * stride;
         const b = dstBase + i * V;
-        dst[b + 4] = has1 ? readComp(v, a, type) : 1;
-        dst[b + 5] = has2 ? readComp(v, a + es, type) : 1;
-        dst[b + 6] = has3 ? readComp(v, a + 2 * es, type) : 1;
-        dst[b + 7] = has4 ? readComp(v, a + 3 * es, type) : 1;
+        dst[b + 4] = has1 ? readComp(v, a, type) * sc : 1;
+        dst[b + 5] = has2 ? readComp(v, a + es, type) * sc : 1;
+        dst[b + 6] = has3 ? readComp(v, a + 2 * es, type) * sc : 1;
+        dst[b + 7] = has4 ? readComp(v, a + 3 * es, type) * sc : 1;
     }
 }
 
@@ -279,12 +302,13 @@ function gatherNormal(
         return;
     }
 
+    const sc = normScale(type);
     for (let i = 0; i < count; i++) {
         const a = ptr + idx[i] * stride;
         const b = dstBase + i * V;
-        dst[b + 8] = readComp(v, a, type);
-        dst[b + 9] = readComp(v, a + es, type);
-        dst[b + 10] = readComp(v, a + 2 * es, type);
+        dst[b + 8] = readComp(v, a, type) * sc;
+        dst[b + 9] = readComp(v, a + es, type) * sc;
+        dst[b + 10] = readComp(v, a + 2 * es, type) * sc;
     }
 }
 

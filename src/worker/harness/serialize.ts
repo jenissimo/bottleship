@@ -282,6 +282,15 @@ export function serializeCursor(): unknown {
     };
 }
 
+/**
+ * Buffered-DirectInput production trail. A DI game that ignores our synthetic input
+ * looks identical from the WM side (wmTrace shows a perfect sequence) whether the
+ * DI queue got the event or not — this is the other half of that question.
+ */
+export function serializeDInput(): unknown {
+    return sys().inputManager?.getDInputDiagnostics?.() ?? null;
+}
+
 export function serializeScreen(): unknown {
     let primaryPtr = 0, w = 0, h = 0;
     try {
@@ -414,4 +423,5 @@ export const STATE_SECTIONS: Record<string, () => unknown> = {
     video: serializeVideo,
     screen: serializeScreen,
     cursor: serializeCursor,
+    dinput: serializeDInput,
 };

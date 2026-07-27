@@ -58,6 +58,16 @@ export interface DInputBufferedEvent {
 /** @deprecated use DInputBufferedEvent */
 export type DInputMouseEvent = DInputBufferedEvent;
 
+/** One entry of the DI production trail the harness `dinput` state section reads. */
+export interface DInputTrailEntry {
+    dev: "mouse" | "keyboard" | "gamepad";
+    ofs: number;
+    data: number;
+    seq: number;
+}
+
+const DINPUT_TRAIL_MAX = 64;
+
 // DIJOFS_* within DIJOYSTATE (matches dinput.h / our GetDeviceState layout)
 const DIJOFS_X = 0;
 const DIJOFS_Y = 4;
@@ -278,6 +288,11 @@ export class InputManager {
     private dinputGamepadSeq = 0;
     private dinputGamepadPrevButtons = 0;
     private dinputGamepadPrevAxes: [number, number, number, number] = [0, 0, 0, 0];
+
+    /** Newest-last trail of buffered DI events actually produced. The guest drains the
+     *  queues faster than a snapshot can read them, so pending counts alone cannot tell
+     *  "we never generated it" from "the guest already took it" — this can. */
+    private dinputTrail: DInputTrailEntry[] = [];
 
     private prevKeyBitfield = new Int32Array(KEY_BITFIELD_COUNT);
     /** Key bitfield copied inside the seqlock-validated region (see poll()). */
@@ -984,6 +999,41 @@ export class InputManager {
         return was !== 0;
     }
 
+    private _noteDInputTrail(dev: DInputTrailEntry["dev"], ofs: number, data: number, seq: number): void {
+        if (this.dinputTrail.length >= DINPUT_TRAIL_MAX) this.dinputTrail.shift();
+        this.dinputTrail.push({ dev, ofs, data, seq });
+    }
+
+    /**
+     * Buffered-DirectInput diagnostics: what each device's queue is configured for,
+     * what is still pending, and the trail of events we actually produced. Read-only.
+     */
+    getDInputDiagnostics(): unknown {
+        return {
+            mouse: {
+                bufferSize: this.dinputMouseBufferSize,
+                pending: this.dinputMouseEvents.length,
+                produced: this.dinputMouseSeq,
+                prevX: this.dinputPrevMouseX,
+                prevY: this.dinputPrevMouseY,
+                prevButtons: this.dinputPrevButtons,
+                wheelAccum: this.dinputWheelAccum,
+            },
+            keyboard: {
+                bufferSize: this.dinputKeyboardBufferSize,
+                pending: this.dinputKeyboardEvents.length,
+                produced: this.dinputKeyboardSeq,
+            },
+            gamepad: {
+                bufferSize: this.dinputGamepadBufferSize,
+                pending: this.dinputGamepadEvents.length,
+                produced: this.dinputGamepadSeq,
+            },
+            cursor: { x: this.currentMouseX, y: this.currentMouseY, buttons: this.currentButtons },
+            trail: this.dinputTrail.slice(),
+        };
+    }
+
     /** Buffer mouse events for DirectInput GetDeviceData. Called from poll(). */
     private _bufferDInputMouseEvents(mouseX: number, mouseY: number, buttons: number, mouseWheel: number): void {
         const ts = performance.now() | 0;
@@ -992,7 +1042,9 @@ export class InputManager {
 
         const pushEvent = (dwOfs: number, dwData: number): void => {
             if (events.length >= maxBuf) events.shift(); // overflow: drop oldest
-            events.push({ dwOfs, dwData, dwTimeStamp: ts, dwSequence: ++this.dinputMouseSeq });
+            const seq = ++this.dinputMouseSeq;
+            events.push({ dwOfs, dwData, dwTimeStamp: ts, dwSequence: seq });
+            this._noteDInputTrail("mouse", dwOfs, dwData, seq);
         };
 
         // Movement deltas
@@ -1033,7 +1085,9 @@ export class InputManager {
 
         const pushEvent = (dwOfs: number, dwData: number): void => {
             if (events.length >= maxBuf) events.shift();
-            events.push({ dwOfs, dwData, dwTimeStamp: ts, dwSequence: ++this.dinputKeyboardSeq });
+            const seq = ++this.dinputKeyboardSeq;
+            events.push({ dwOfs, dwData, dwTimeStamp: ts, dwSequence: seq });
+            this._noteDInputTrail("keyboard", dwOfs, dwData, seq);
         };
 
         for (let vk = 0; vk < 256; vk++) {
@@ -1058,7 +1112,9 @@ export class InputManager {
 
         const pushEvent = (dwOfs: number, dwData: number): void => {
             if (events.length >= maxBuf) events.shift();
-            events.push({ dwOfs, dwData, dwTimeStamp: ts, dwSequence: ++this.dinputGamepadSeq });
+            const seq = ++this.dinputGamepadSeq;
+            events.push({ dwOfs, dwData, dwTimeStamp: ts, dwSequence: seq });
+            this._noteDInputTrail("gamepad", dwOfs, dwData, seq);
         };
 
         const axisOfs = [DIJOFS_X, DIJOFS_Y, DIJOFS_RX, DIJOFS_RY] as const;
@@ -1212,6 +1268,7 @@ export class InputManager {
         const x = screenX | 0;
         const y = screenY | 0;
         const step = (buttons: number): void => {
+            this.accumulateInjectedPointerDelta(view, x, y);
             beginInputWrite(view);
             view[INPUT_INDEX.mouseX] = x;
             view[INPUT_INDEX.mouseY] = y;
@@ -1232,6 +1289,21 @@ export class InputManager {
      * poll(true) so routing goes capture→WindowFromPoint→WM_* exactly like a real
      * event. poll() is seq-gated, so every injected event MUST bump seq.
      */
+    /**
+     * Feed the DirectInput raw-delta accumulators for an injected pointer position.
+     * A real pointermove carries movementX/Y and App.tsx adds it here; an injected
+     * one only knows where it landed, so the delta is measured against the position
+     * the SAB still holds — call BEFORE overwriting mouseX/mouseY. Without this a
+     * relative-mode DirectInput guest (GetDeviceState lX/lY) never sees the motion,
+     * even though the absolute slots and every WM_MOUSEMOVE look perfect.
+     */
+    private accumulateInjectedPointerDelta(view: Int32Array, x: number, y: number): void {
+        const dx = x - view[INPUT_INDEX.mouseX];
+        const dy = y - view[INPUT_INDEX.mouseY];
+        if (dx) Atomics.add(view, INPUT_INDEX.dinputDX, dx);
+        if (dy) Atomics.add(view, INPUT_INDEX.dinputDY, dy);
+    }
+
     private mouseMaskFor(button: number): number {
         // poll() decodes the `buttons` SAB slot as BROWSER flags (left=1, right=2,
         // middle=4) — NOT Win32 MK_* masks (MK_MBUTTON=0x10 would set bit4, which
@@ -1243,6 +1315,7 @@ export class InputManager {
     injectMoveAtScreen(screenX: number, screenY: number): boolean {
         const view = this.inputView;
         if (!view) return false;
+        this.accumulateInjectedPointerDelta(view, screenX | 0, screenY | 0);
         beginInputWrite(view);
         view[INPUT_INDEX.mouseX] = screenX | 0;
         view[INPUT_INDEX.mouseY] = screenY | 0;
@@ -1257,6 +1330,7 @@ export class InputManager {
         const view = this.inputView;
         if (!view) return false;
         const mask = this.mouseMaskFor(button);
+        this.accumulateInjectedPointerDelta(view, screenX | 0, screenY | 0);
         beginInputWrite(view);
         view[INPUT_INDEX.mouseX] = screenX | 0;
         view[INPUT_INDEX.mouseY] = screenY | 0;
@@ -1286,6 +1360,7 @@ export class InputManager {
     injectWheelAtScreen(screenX: number, screenY: number, delta: number): boolean {
         const view = this.inputView;
         if (!view) return false;
+        this.accumulateInjectedPointerDelta(view, screenX | 0, screenY | 0);
         beginInputWrite(view);
         view[INPUT_INDEX.mouseX] = screenX | 0;
         view[INPUT_INDEX.mouseY] = screenY | 0;

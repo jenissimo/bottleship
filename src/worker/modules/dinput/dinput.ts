@@ -1280,6 +1280,11 @@ export class DInput implements IModule {
             const device = this.getDevice(thisPtr);
             const im = System.getInstance().inputManager;
             if (device?.inputLost) return DIERR_INPUTLOST;
+            // An unacquired device yields DIERR_NOTACQUIRED, exactly as GetDeviceState does.
+            // Engines poll the buffered queue and treat that error as "(re)acquire now" —
+            // handing them events instead leaves the device unacquired forever, and any
+            // input the engine gates on its own acquired flag is then silently dropped.
+            if (device && !device.acquired) return DIERR_NOTACQUIRED;
 
             // DI8 action-mapped device (keyboard): replay key-state edges as buffered
             // DIDEVICEOBJECTDATA events carrying the app's uAppData. This is the path NFSU's

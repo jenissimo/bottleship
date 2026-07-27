@@ -12,7 +12,9 @@ import {
 } from "../../src/worker/modules/opengl32/client-arrays";
 import { VERT_FLOATS, mat4Identity, type OpenGLContext } from "../../src/worker/modules/opengl32/context";
 
+const GL_BYTE = 0x1400;
 const GL_FLOAT = 0x1406;
+const GL_INT = 0x1404;
 const GL_SHORT = 0x1402;
 const GL_UNSIGNED_BYTE = 0x1401;
 const GL_UNSIGNED_SHORT = 0x1403;
@@ -147,6 +149,138 @@ describe("flat gather", () => {
         gatherVertices(ctx, idx, 1, dst, 2 * VERT_FLOATS, true);
         expect(dst[0]).toBe(-1);
         expect(vert(dst, 2).slice(0, 4)).toEqual([9, 9, 9, 1]);
+    });
+});
+
+describe("integer component conversion", () => {
+    /** Gather one vertex with `write` having staged the guest bytes and array state. */
+    function gatherOne(setup: (ctx: OpenGLContext, dv: DataView, mem: Uint8Array) => void): number[] {
+        const { ctx, mem } = makeCtx();
+        setup(ctx, new DataView(mem.buffer, mem.byteOffset), mem);
+        const dst = new Float32Array(VERT_FLOATS);
+        gatherVertices(ctx, sequentialIndices(0, 1), 1, dst, 0, false);
+        return vert(dst, 0);
+    }
+
+    // Colour: every integer type spans [0,1] (unsigned) or [-1,1] (signed) after
+    // dividing by the type's largest positive value. Feeding the raw integer through
+    // instead makes anything but UNSIGNED_BYTE render blown-out white.
+    it("normalises an UNSIGNED_SHORT colour array", () => {
+        const v = gatherOne((ctx, dv) => {
+            dv.setUint16(0x2000, 65535, true); dv.setUint16(0x2002, 0, true);
+            dv.setUint16(0x2004, 32768, true); dv.setUint16(0x2006, 16383, true);
+            ctx.colorArray = { size: 4, type: GL_UNSIGNED_SHORT, stride: 0, pointer: 0x2000, enabled: true };
+        });
+        expect(v[4]).toBe(1);
+        expect(v[5]).toBe(0);
+        expect(v[6]).toBeCloseTo(0.50001, 4);
+        expect(v[7]).toBeCloseTo(16383 / 65535, 6);
+    });
+
+    it("normalises a SHORT colour array onto [-1,1]", () => {
+        const v = gatherOne((ctx, dv) => {
+            dv.setInt16(0x2000, 32767, true); dv.setInt16(0x2002, -32767, true);
+            dv.setInt16(0x2004, 0, true); dv.setInt16(0x2006, 16384, true);
+            ctx.colorArray = { size: 4, type: GL_SHORT, stride: 0, pointer: 0x2000, enabled: true };
+        });
+        expect(v[4]).toBe(1);
+        expect(v[5]).toBe(-1);
+        expect(v[6]).toBe(0);
+        expect(v[7]).toBeCloseTo(16384 / 32767, 6);
+    });
+
+    it("normalises a BYTE colour array", () => {
+        const v = gatherOne((ctx, _dv, mem) => {
+            mem.set([127, 0xFF /* -1 */, 0x81 /* -127 */, 0], 0x2000);
+            ctx.colorArray = { size: 4, type: GL_BYTE, stride: 0, pointer: 0x2000, enabled: true };
+        });
+        expect(v[4]).toBe(1);
+        expect(v[5]).toBeCloseTo(-1 / 127, 6);
+        expect(v[6]).toBe(-1);
+        expect(v[7]).toBe(0);
+    });
+
+    it("normalises UNSIGNED_INT and INT colour arrays", () => {
+        const u = gatherOne((ctx, dv) => {
+            dv.setUint32(0x2000, 0xFFFFFFFF, true); dv.setUint32(0x2004, 0, true);
+            dv.setUint32(0x2008, 0x80000000, true); dv.setUint32(0x200C, 0xFFFFFFFF, true);
+            ctx.colorArray = { size: 4, type: GL_UNSIGNED_INT, stride: 0, pointer: 0x2000, enabled: true };
+        });
+        expect(u[4]).toBe(1);
+        expect(u[5]).toBe(0);
+        expect(u[6]).toBeCloseTo(0.5, 6);
+
+        const s = gatherOne((ctx, dv) => {
+            dv.setInt32(0x2000, 2147483647, true); dv.setInt32(0x2004, -2147483647, true);
+            dv.setInt32(0x2008, 0, true); dv.setInt32(0x200C, 2147483647, true);
+            ctx.colorArray = { size: 4, type: GL_INT, stride: 0, pointer: 0x2000, enabled: true };
+        });
+        expect(s[4]).toBe(1);
+        expect(s[5]).toBe(-1);
+        expect(s[6]).toBe(0);
+    });
+
+    it("passes a FLOAT colour array through unscaled", () => {
+        const v = gatherOne((ctx, dv) => {
+            for (const [i, c] of [0.25, 2.5, -1.5, 1].entries()) dv.setFloat32(0x2000 + i * 4, c, true);
+            ctx.colorArray = { size: 4, type: GL_FLOAT, stride: 0, pointer: 0x2000, enabled: true };
+        });
+        expect(v.slice(4, 8)).toEqual([0.25, 2.5, -1.5, 1]);
+    });
+
+    it("defaults an absent colour component to 1.0, not to a scaled zero", () => {
+        const v = gatherOne((ctx, dv) => {
+            dv.setUint16(0x2000, 65535, true); dv.setUint16(0x2002, 0, true); dv.setUint16(0x2004, 0, true);
+            ctx.colorArray = { size: 3, type: GL_UNSIGNED_SHORT, stride: 0, pointer: 0x2000, enabled: true };
+        });
+        expect(v[7]).toBe(1);
+    });
+
+    // Normals normalise on the same table.
+    it("normalises BYTE and SHORT normal arrays", () => {
+        const b = gatherOne((ctx, _dv, mem) => {
+            mem.set([0, 0x81 /* -127 */, 127], 0x3000);
+            ctx.normalArray = { size: 3, type: GL_BYTE, stride: 0, pointer: 0x3000, enabled: true };
+        });
+        expect(b.slice(8, 11)).toEqual([0, -1, 1]);
+
+        const s = gatherOne((ctx, dv) => {
+            dv.setInt16(0x3000, 32767, true); dv.setInt16(0x3002, 0, true); dv.setInt16(0x3004, -32767, true);
+            ctx.normalArray = { size: 3, type: GL_SHORT, stride: 0, pointer: 0x3000, enabled: true };
+        });
+        expect(s.slice(8, 11)).toEqual([1, 0, -1]);
+    });
+
+    // Positions and texcoords are coordinates, not normalised quantities: an integer
+    // there means literally that integer.
+    it("leaves INT positions and SHORT texcoords unnormalised", () => {
+        const v = gatherOne((ctx, dv) => {
+            dv.setInt32(0x1000, 100, true); dv.setInt32(0x1004, -200, true); dv.setInt32(0x1008, 300, true);
+            ctx.vertexArray = { size: 3, type: GL_INT, stride: 0, pointer: 0x1000, enabled: true };
+            dv.setInt16(0x4000, 2, true); dv.setInt16(0x4002, -3, true);
+            ctx.texCoordArrays[0] = { size: 2, type: GL_SHORT, stride: 0, pointer: 0x4000, enabled: true };
+        });
+        expect(v.slice(0, 4)).toEqual([100, -200, 300, 1]);
+        expect(v.slice(11, 13)).toEqual([2, -3]);
+    });
+
+    it("normalises identically through the compiled-vertex-array cache", () => {
+        const { ctx, mem } = makeCtx();
+        const dv = new DataView(mem.buffer, mem.byteOffset);
+        writeF32(mem, 0x1000, [1, 0, 0, 2, 0, 0]);
+        ctx.vertexArray = { size: 3, type: GL_FLOAT, stride: 0, pointer: 0x1000, enabled: true };
+        dv.setUint16(0x2000, 65535, true); dv.setUint16(0x2002, 0, true);
+        dv.setUint16(0x2004, 65535, true); dv.setUint16(0x2006, 65535, true);
+        ctx.colorArray = { size: 4, type: GL_UNSIGNED_SHORT, stride: 0, pointer: 0x2000, enabled: true };
+
+        const direct = new Float32Array(2 * VERT_FLOATS);
+        gatherVertices(ctx, sequentialIndices(0, 2), 2, direct, 0, true);
+        cvaLock(ctx, 0, 2);
+        const cached = new Float32Array(2 * VERT_FLOATS);
+        gatherVertices(ctx, sequentialIndices(0, 2), 2, cached, 0, true);
+
+        expect(Array.from(cached.subarray(4, 8))).toEqual([1, 0, 1, 1]);
+        expect(Array.from(cached.subarray(4, 8))).toEqual(Array.from(direct.subarray(4, 8)));
     });
 });
 

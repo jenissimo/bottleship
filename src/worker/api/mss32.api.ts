@@ -142,6 +142,12 @@ export const mss32Module: ModuleDescriptor = {
         makeFunc("_AIL_set_3D_velocity@20", 5),
         makeFunc("_AIL_set_3D_velocity_vector@16", 4),
         makeFunc("_AIL_set_3D_orientation@28", 7),
+        // 3D getters — out-parameter twins of the setters above. An engine that
+        // keeps no copy of what it set reads these back every frame.
+        makeFunc("_AIL_3D_position@16", 4),
+        makeFunc("_AIL_3D_velocity@16", 4),
+        makeFunc("_AIL_3D_orientation@28", 7),
+        makeFunc("_AIL_3D_sample_distances@12", 3),
         makeFunc("_AIL_set_3D_sample_volume@8", 2),
         makeFunc("_AIL_set_3D_sample_distances@12", 3),
         makeFunc("_AIL_set_3D_sample_cone@16", 4),
