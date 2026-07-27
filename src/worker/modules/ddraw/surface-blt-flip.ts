@@ -48,12 +48,11 @@ import { isValidAddress } from "../../core/memory/address-guard";
 import { markGpuSyncedFromCpu } from "./surface-sync";
 import { onFrameEnd as frameCaptureOnFrameEnd } from "./frame-capture";
 import { recordSurfaceOp } from "./surface-op-log";
+import { collectFlipChain, rotateFlipChain, warnOnLockedFlip } from "./flip-chain";
 
 // Module-level rect pool to reduce allocations in hot paths
 const rectPool = new RectPool(8);
 
-// Diagnostic counter for GPU Flip error scopes (first 5 only)
-let flipGpuCopyDiagCount = 0;
 const missingFormatWarnedSurfacePtrs = new Set<number>();
 
 /**
@@ -407,131 +406,43 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
             });
         };
 
-        // Copy phase
-        if (srcState.surfacePtr !== dstState.surfacePtr) {
-            const srcRect = buildFullRect(srcState);
-            const dstRect = buildFullRect(dstState);
-            const backend = context.backend;
-            const canGpuCopy = !!(backend && srcState.gpuTexture && dstState.gpuTexture);
+        // Flip phase — rotate storage around the chain (DirectDraw renames surfaces,
+        // it does not copy pixels; see flip-chain.ts).
+        profiler.start('Flip:rotate');
+        // A pending render pass still targets the pre-rotation texture.
+        if (context.executor) context.executor.flush();
 
-            // Check if GPU copy is appropriate: source has authoritative GPU data.
-            const srcHasGpuData = isRenderSurface(srcState) &&
-                srcState.gpuWrittenVersion === srcState.version && !srcState.gpuDirty;
-            const shouldUseGpuCopy = canGpuCopy && srcHasGpuData;
+        const frontAddr = ((state.caps & DDSCAPS_BACKBUFFER) && attachedAddr) ? attachedAddr : thisPtr;
+        const ring = collectFlipChain(frontAddr, (a) =>
+            context.resourceProvider.getComObjectByAddress(a) as DirectDrawSurfaceObject | null);
 
-            if (shouldUseGpuCopy) {
-                profiler.start('Flip:copy:gpu');
-                Logger.verbose(LogCategory.DDRAW, `IDirectDrawSurface7_Flip: [FAST] GPU Copy 0x${srcState.surfacePtr.toString(16)} -> 0x${dstState.surfacePtr.toString(16)}`);
-                if (context.executor) context.executor.flush();
-                const device = backend!.getDevice();
-                if (device) {
-                    const srcFormat = srcState.gpuTextureFormat ?? "rgba8unorm";
-                    const dstFormat = dstState.gpuTextureFormat ?? "rgba8unorm";
-                    const formatsMatch = srcFormat === dstFormat;
-
-                    if (formatsMatch) {
-                        const useFlipErrorScope = flipGpuCopyDiagCount < 5;
-                        if (useFlipErrorScope) {
-                            device.pushErrorScope("validation");
-                        }
-                        const encoder = device.createCommandEncoder();
-                        encoder.copyTextureToTexture(
-                            { texture: srcState.gpuTexture!, origin: { x: 0, y: 0, z: 0 } },
-                            { texture: dstState.gpuTexture!, origin: { x: 0, y: 0, z: 0 } },
-                            { width: srcState.width, height: srcState.height, depthOrArrayLayers: 1 }
-                        );
-                        backend!.getQueue()?.submit([encoder.finish()]);
-                        flipGpuCopyDiagCount++;
-                        if (useFlipErrorScope) {
-                            device.popErrorScope().then(err => {
-                                if (err) Logger.error(LogCategory.DDRAW, `[FLIP] GPU copy validation error: ${err.message}`);
-                            });
-                        }
-                    } else {
-                        Logger.verbose(LogCategory.DDRAW,
-                            `IDirectDrawSurface7_Flip: Format mismatch (src=${srcFormat}, dst=${dstFormat}), using shader copy`);
-                        if (context.executor) {
-                            const w = Math.min(srcState.width, dstState.width);
-                            const h = Math.min(srcState.height, dstState.height);
-                            context.executor.blitWithShaderCopy(
-                                srcState, dstState,
-                                { left: 0, top: 0, right: w, bottom: h },
-                                { left: 0, top: 0, right: w, bottom: h }
-                            );
-                            context.executor.flush();
-                        }
-                    }
-                    setAuthorityGpu(dstState);
-                }
-                recordSurfaceOp("flip", "gpu", dstState, srcState, null, null);
-                profiler.end('Flip:copy:gpu');
-            } else {
-                profiler.start('Flip:copy:cpu');
-                const srcModeStr = isRenderSurface(srcState) ? srcState.mode : "bitmap_texture";
-                Logger.verbose(LogCategory.DDRAW, `IDirectDrawSurface7_Flip: [SLOW] CPU Copy 0x${srcState.surfacePtr.toString(16)} -> 0x${dstState.surfacePtr.toString(16)} (srcMode=${srcModeStr})`);
-
-                // Fix: If source has authoritative GPU data, readback before CPU copy
-                if (context.executor) {
-                    const readbackDecision = surfaceSyncManager.needsCPUSync(srcState);
-                    if (readbackDecision.needed) {
-                        if (context.executor.syncSurfaceToMemoryFromScratch(srcState, mem)) {
-                            Logger.verbose(LogCategory.DDRAW,
-                                `IDirectDrawSurface7_Flip: CPU path synchronized src=0x${srcState.surfacePtr.toString(16)} from cached rgbaScratch`);
-                        } else {
-                            const ds: any = dstState, ss: any = srcState;
-                            Logger.log(LogCategory.DDRAW,
-                                `READBACK-DIAG Flip-readback src=0x${srcState.surfacePtr.toString(16)} ` +
-                                `src(${ss.width}x${ss.height} caps=0x${ss.caps.toString(16)} mode=${ss.mode} gpuTex=${!!ss.gpuTexture} fmt=${ss.gpuTextureFormat}) ` +
-                                `dst=0x${dstState.surfacePtr.toString(16)} dst(caps=0x${ds.caps.toString(16)} mode=${ds.mode} gpuTex=${!!ds.gpuTexture} fmt=${ds.gpuTextureFormat} everLocked=${ds.everLocked})`);
-                            Logger.log(LogCategory.DDRAW,
-                                `IDirectDrawSurface7_Flip: CPU path requires GPU→CPU readback for src=0x${srcState.surfacePtr.toString(16)}`);
-                            // Async: readback then continue with CPU copy + finish
-                            return context.executor.syncSurfaceToMemory(srcState).then(() => {
-                                copySurfaceRegion(mem, srcState, dstState, srcRect, dstRect);
-                                setAuthorityCpu(dstState);
-
-                                if (isRenderSurface(dstState) && dstState.mode === "GPU_ONLY") {
-                                    dstState.mode = "CPU";
-                                    dstState.everLocked = true;
-                                    Logger.log(LogCategory.DDRAW,
-                                        `IDirectDrawSurface7_Flip: Demoted GPU_ONLY dst to CPU surface=0x${dstState.surfacePtr.toString(16)}`);
-                                }
-
-                                if (isBitmapTexture(srcState) && isRenderSurface(dstState)) {
-                                    dstState.rgbaScratch = new Uint8Array(srcState.rgbaScratch);
-                                    dstState.rgbaScratchVersion = dstState.version;
-                                }
-                                recordSurfaceOp("flip", "cpu:readback", dstState, srcState, null, null);
-                                profiler.end('Flip:copy:cpu');
-                                return finishFlip();
-                            });
-                        }
-                    }
-                }
-
-                copySurfaceRegion(mem, srcState, dstState, srcRect, dstRect);
-                setAuthorityCpu(dstState);
-
-                if (isRenderSurface(dstState) && dstState.mode === "GPU_ONLY") {
-                    dstState.mode = "CPU";
-                    dstState.everLocked = true;
-                    Logger.log(LogCategory.DDRAW,
-                        `IDirectDrawSurface7_Flip: Demoted GPU_ONLY dst to CPU (CPU data written via Flip) ` +
-                        `surface=0x${dstState.surfacePtr.toString(16)}`);
-                }
-
-                if (isBitmapTexture(srcState) && isRenderSurface(dstState)) {
-                    dstState.rgbaScratch = new Uint8Array(srcState.rgbaScratch);
-                    dstState.rgbaScratchVersion = dstState.version;
-                }
-
-                recordSurfaceOp("flip", "cpu", dstState, srcState, null, null);
-                profiler.end('Flip:copy:cpu');
+        let rotated: DirectDrawSurfaceState[] | null = null;
+        let rotateCount = 0;
+        if (ring && ring.length >= 2) {
+            rotated = ring.map((e) => e.state);
+            rotateCount = rotated.length;
+            // Flip(target) rotates only the span up to that surface (the rest of a longer
+            // chain keeps its contents), matching IDirectDrawSurface7::Flip's override.
+            if (lpDDSurfaceTargetOverride) {
+                const idx = ring.findIndex((e) => e.addr === (lpDDSurfaceTargetOverride >>> 0));
+                if (idx > 0) rotateCount = idx + 1;
             }
+        } else if (srcState.surfacePtr !== dstState.surfacePtr) {
+            // Links do not close into a ring (primary + a back buffer we only know via
+            // context.surfaces): rotate the resolved pair so the exchange still happens.
+            rotated = [dstState, srcState];
+            rotateCount = 2;
+        }
+
+        if (rotated) {
+            warnOnLockedFlip(rotated.slice(0, rotateCount));
+            rotateFlipChain(rotated, rotateCount);
+            recordSurfaceOp("flip", `rotate:${rotateCount}`, dstState, srcState, null, null);
         } else {
-            Logger.warn(LogCategory.DDRAW, `IDirectDrawSurface7_Flip: No-op flip detected (Src==Dst). Visual updates may fail.`);
+            Logger.warn(LogCategory.DDRAW, `IDirectDrawSurface7_Flip: no flip target (Src==Dst); nothing to rotate.`);
             recordSurfaceOp("flip", "noop", dstState, srcState, null, null);
         }
+        profiler.end('Flip:rotate');
 
         return finishFlip();
     };
@@ -937,7 +848,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
             if (surfaceHasActiveWriteLease(dstState)) {
                 Logger.warn(LogCategory.DDRAW,
                     `IDirectDrawSurface7_Blt: SKIP CPU blit - dst 0x${dstState.surfacePtr.toString(16)} is locked for writing (active write lease)`);
-                recordSurfaceOp("blt", "skip:lease", dstState, srcState, effDstRect, effSrcRect);
+                recordSurfaceOp("blt", "skip:lease", dstState, srcState, effDstRect, effSrcRect, colorKey);
                 profiler.end("Blt:cpuPath");
                 return;
             }
@@ -959,7 +870,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
             (dstState as { surfaceEverWritten?: boolean }).surfaceEverWritten = true;
             recordSurfaceOp("blt",
                 rop3 !== undefined ? "cpu:rop" : useColorKey ? "cpu:colorkey" : isStretch ? "cpu:stretch" : "cpu",
-                dstState, srcState, effDstRect, effSrcRect);
+                dstState, srcState, effDstRect, effSrcRect, colorKey);
             profiler.end("Blt:cpuPath");
         };
 
@@ -997,7 +908,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
             }
             recordSurfaceOp("blt",
                 useColorKey ? "gpu:colorkey" : formatMismatch ? "gpu:shadercopy" : "gpu",
-                dstState, srcState, effDstRect, effSrcRect);
+                dstState, srcState, effDstRect, effSrcRect, colorKey);
         };
 
         if (willUseGpu) {
@@ -1035,7 +946,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
                 // Lease guard: CPU fallback writes dst pixels — skip while locked.
                 Logger.warn(LogCategory.DDRAW,
                     `IDirectDrawSurface7_Blt: SKIP CPU fallback - dst 0x${dstState.surfacePtr.toString(16)} is locked for writing (active write lease)`);
-                recordSurfaceOp("blt", "skip:lease", dstState, srcState, effDstRect, effSrcRect);
+                recordSurfaceOp("blt", "skip:lease", dstState, srcState, effDstRect, effSrcRect, colorKey);
             } else {
                 if (useColorKey && colorKey) {
                     copySurfaceRegionWithColorKey(mem, srcState, dstState, effSrcRect, effDstRect, colorKey);
@@ -1044,7 +955,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
                 }
                 setAuthorityCpu(dstState);
                 (dstState as { surfaceEverWritten?: boolean }).surfaceEverWritten = true;
-                recordSurfaceOp("blt", "cpu:nogpu", dstState, srcState, effDstRect, effSrcRect);
+                recordSurfaceOp("blt", "cpu:nogpu", dstState, srcState, effDstRect, effSrcRect, colorKey);
             }
             profiler.end("Blt:gpuPath");
         } else if (isStretch && hasBackend && noRop && !useColorKey && context.executor) {
@@ -1064,17 +975,17 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
                 context.executor.blitWithShaderCopy(srcState, dstState, effSrcRect, effDstRect);
                 context.executor.flush();
                 setAuthorityGpu(dstState);
-                recordSurfaceOp("blt", "gpu:stretch", dstState, srcState, effDstRect, effSrcRect);
+                recordSurfaceOp("blt", "gpu:stretch", dstState, srcState, effDstRect, effSrcRect, colorKey);
             } else if (surfaceHasActiveWriteLease(dstState)) {
                 // Lease guard: CPU nearest-neighbor writes dst pixels — skip while locked.
                 Logger.warn(LogCategory.DDRAW,
                     `IDirectDrawSurface7_Blt: SKIP CPU stretch fallback - dst 0x${dstState.surfacePtr.toString(16)} is locked for writing (active write lease)`);
-                recordSurfaceOp("blt", "skip:lease", dstState, srcState, effDstRect, effSrcRect);
+                recordSurfaceOp("blt", "skip:lease", dstState, srcState, effDstRect, effSrcRect, colorKey);
             } else {
                 // Fallback to CPU nearest-neighbor if GPU promotion failed
                 copySurfaceRegion(mem, srcState, dstState, effSrcRect, effDstRect);
                 setAuthorityCpu(dstState);
-                recordSurfaceOp("blt", "cpu:stretch", dstState, srcState, effDstRect, effSrcRect);
+                recordSurfaceOp("blt", "cpu:stretch", dstState, srcState, effDstRect, effSrcRect, colorKey);
             }
             (dstState as { surfaceEverWritten?: boolean }).surfaceEverWritten = true;
             profiler.end("Blt:gpuStretch");
@@ -1103,7 +1014,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
                         }
                         context.executor!.flush();
                         setAuthorityGpu(dstState);
-                        recordSurfaceOp("blt", "gpu:mixed", dstState, srcState, effDstRect, effSrcRect);
+                        recordSurfaceOp("blt", useColorKey ? "gpu:mixed:colorkey" : "gpu:mixed", dstState, srcState, effDstRect, effSrcRect, colorKey);
                         profiler.end("Blt:mixedGpuPath");
                         return finishBlt();
                     });
@@ -1118,7 +1029,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
             }
             context.executor.flush();
             setAuthorityGpu(dstState);
-            recordSurfaceOp("blt", "gpu:mixed", dstState, srcState, effDstRect, effSrcRect);
+            recordSurfaceOp("blt", useColorKey ? "gpu:mixed:colorkey" : "gpu:mixed", dstState, srcState, effDstRect, effSrcRect, colorKey);
             profiler.end("Blt:mixedGpuPath");
         } else {
             profiler.start("Blt:cpuPath");
@@ -1213,7 +1124,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
             if (surfaceHasActiveWriteLease(dstState)) {
                 Logger.warn(LogCategory.DDRAW,
                     `IDirectDrawSurface7_BltFast: SKIP - dst 0x${dstState.surfacePtr.toString(16)} is locked for writing (active write lease)`);
-                recordSurfaceOp("bltfast", "skip:lease", dstState, srcState, dstRect, srcRect);
+                recordSurfaceOp("bltfast", "skip:lease", dstState, srcState, dstRect, srcRect, srcState.srcColorKey);
                 return DD_OK;
             }
             if (useColorKey && srcState.srcColorKey) {
@@ -1223,7 +1134,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
             }
             setAuthorityCpu(dstState);
             (dstState as { surfaceEverWritten?: boolean }).surfaceEverWritten = true;
-            recordSurfaceOp("bltfast", useColorKey ? "cpu:colorkey" : "cpu", dstState, srcState, dstRect, srcRect);
+            recordSurfaceOp("bltfast", useColorKey ? "cpu:colorkey" : "cpu", dstState, srcState, dstRect, srcRect, useColorKey ? srcState.srcColorKey : undefined);
 
             // BltFast to primary triggers present (same as Blt to primary).
             // Many 2D games use BltFast exclusively for rendering.

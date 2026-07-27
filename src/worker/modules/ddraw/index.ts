@@ -549,7 +549,7 @@ export class DDraw implements IModule {
      *  the authoritative CPU rgbaScratch (zero GPU work, for bitmap textures), else
      *  GPU-reads the texture, de-pads rows, and applies the bgra->rgba swizzle so
      *  the bytes are straight top-down RGBA8 ready for PNG encoding. */
-    async readSurfaceRGBA(ptrLike: number | string): Promise<{ w: number; h: number; rgba: Uint8Array; source: string } | { err: string }> {
+    async readSurfaceRGBA(ptrLike: number | string, from: "auto" | "gpu" | "scratch" = "auto"): Promise<{ w: number; h: number; rgba: Uint8Array; source: string } | { err: string }> {
         const want = (typeof ptrLike === "string" ? parseInt(ptrLike, 16) : ptrLike) >>> 0;
         if (!this.context) return { err: "no ddraw context" };
         let state: DirectDrawSurfaceState | null = null;
@@ -560,7 +560,7 @@ export class DDraw implements IModule {
             if (s && (s.surfacePtr >>> 0) === want) { state = s; break; }
         }
         if (!state) return { err: `surface 0x${want.toString(16)} not found` };
-        return readSurfaceStateRGBA(state, this.context.backend ?? null, () => this.context.executor?.flush());
+        return readSurfaceStateRGBA(state, this.context.backend ?? null, () => this.context.executor?.flush(), from);
     }
 
     initialize(process: Process): void {
