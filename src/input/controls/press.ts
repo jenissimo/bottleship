@@ -84,14 +84,21 @@ export class BindingPresser {
         inputDevice.commit();
     }
 
-    /** Nothing this presser holds may survive a detach, a cancel or a layout swap. */
-    releaseAll(): void {
+    /**
+     * Nothing this presser holds may survive a detach, a cancel or a layout swap.
+     *
+     * `flush: false` when the caller has more state to restore before the world is
+     * published — releasing and committing here would otherwise publish the intermediate
+     * frame, and a caller that re-asserts gamepad presence right after would have already
+     * announced a disconnect (DIERR_INPUTLOST on every acquired DirectInput joystick).
+     */
+    releaseAll(flush = true): void {
         for (const e of this.entries.values()) {
             if (e.timer) clearTimeout(e.timer);
         }
         this.entries.clear();
         inputDevice.releaseSource(this.source);
-        inputDevice.commit({ immediate: true });
+        if (flush) inputDevice.commit({ immediate: true });
     }
 }
 

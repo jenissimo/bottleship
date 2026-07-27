@@ -29,19 +29,21 @@ function alreadySeen(): boolean {
 export const TouchFirstRunHint: React.FC<TouchFirstRunHintProps> = ({ active, trackpad }) => {
     const [dismissed, setDismissed] = useState(alreadySeen);
 
-    useEffect(() => {
-        if (!active || dismissed) return;
-        // Auto-retire it even if untouched: it has been read or it has not.
-        const t = window.setTimeout(() => setDismissed(true), 9000);
-        return () => window.clearTimeout(t);
-    }, [active, dismissed]);
-
-    if (!active || dismissed) return null;
-
     const dismiss = (): void => {
         setDismissed(true);
         try { localStorage.setItem(SEEN_KEY, "1"); } catch { /* nothing to persist to */ }
     };
+
+    useEffect(() => {
+        if (!active || dismissed) return;
+        // Auto-retire it even if untouched: it has been read or it has not. Persist the same
+        // way an explicit dismissal does — timing out is still "seen", and not recording it
+        // brought the card back on every launch, which is what a first-run hint must not do.
+        const t = window.setTimeout(dismiss, 9000);
+        return () => window.clearTimeout(t);
+    }, [active, dismissed]);
+
+    if (!active || dismissed) return null;
 
     return (
         <div

@@ -32,7 +32,8 @@ export interface TouchControlsHandle {
     /** Re-measure the panel; the ResizeObserver covers the ordinary cases. */
     refresh(): void;
     /** Drop every level this layer holds (blur, game switch, layout edit). */
-    releaseAll(): void;
+    /** `flush: false` lets the caller publish once after restoring the rest of the world. */
+    releaseAll(flush?: boolean): void;
 }
 
 export interface TouchControlLayerProps {
@@ -476,9 +477,9 @@ export const TouchControlLayer = forwardRef<TouchControlsHandle, TouchControlLay
         useImperativeHandle(ref, (): TouchControlsHandle => ({
             hitTest,
             refresh: measure,
-            releaseAll: () => {
+            releaseAll: (flush = true) => {
                 contactsRef.current.clear();
-                presser.releaseAll();
+                presser.releaseAll(flush);
             },
         }), [hitTest, measure, presser]);
 

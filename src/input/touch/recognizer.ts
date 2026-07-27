@@ -66,6 +66,8 @@ export const WHEEL_NOTCH_DELTA_PX = 100;
 
 /** Concurrent contacts tracked. Past this a contact is ignored outright. */
 const MAX_CONTACTS = 10;
+/** A contact untouched this long has lost its lift; well past any real hold. */
+const STALE_CONTACT_MS = 30_000;
 
 export const Phase = {
     /** No contacts, nothing owed. */
@@ -107,6 +109,8 @@ export interface RecognizerState {
     /** Live slot indices in arrival order; order[0] is the primary. */
     order: Int32Array;
     count: number;
+    /** Last time each slot was seen, so a contact whose lift never arrived can be reaped. */
+    seenT: Float64Array;
 
     /** Primary touchdown time, and its previous sample time (for instantaneous speed). */
     startT: number;
@@ -159,6 +163,7 @@ export function createRecognizer(cfg: RecognizerConfig): RecognizerState {
         cx: new Float64Array(MAX_CONTACTS),
         cy: new Float64Array(MAX_CONTACTS),
         order: new Int32Array(MAX_CONTACTS),
+        seenT: new Float64Array(MAX_CONTACTS),
         count: 0,
         startT: 0,
         lastT: 0,
@@ -400,12 +405,28 @@ function updateWheel(s: RecognizerState, out: TouchIntent[]): void {
     }
 }
 
+/**
+ * Drop contacts whose lift never arrived. A pointerup/pointercancel CAN be lost (the
+ * element goes away mid-gesture, the browser drops capture), and the slot table is
+ * fixed-size: without this, MAX_CONTACTS lost lifts leave touch permanently dead with no
+ * way back. Reaped through the cancel path so nothing is resolved as a tap.
+ */
+function reapStaleContacts(s: RecognizerState, now: number, out: TouchIntent[]): void {
+    for (let i = s.count - 1; i >= 0; i--) {
+        const slot = s.order[i]!;
+        if (now - s.seenT[slot]! < STALE_CONTACT_MS) continue;
+        onCancel(s, { id: s.id[slot]!, phase: "cancel", x: s.cx[slot]!, y: s.cy[slot]! }, now, out);
+    }
+}
+
 // ─── Event handlers ─────────────────────────────────────────────────────────
 
 function onDown(s: RecognizerState, ev: TouchEvent2, now: number, out: TouchIntent[]): void {
     flushOwedRelease(s, now, out);
+    reapStaleContacts(s, now, out);
     const slot = addContact(s, ev.id, ev.x, ev.y);
     if (slot < 0) return;
+    s.seenT[slot] = now;
 
     if (s.phase === Phase.drain) return; // waiting for the previous gesture's fingers to clear
 
@@ -441,6 +462,7 @@ function onMove(s: RecognizerState, ev: TouchEvent2, now: number, out: TouchInte
     const dy = ev.y - s.cy[slot]!;
     s.cx[slot] = ev.x;
     s.cy[slot] = ev.y;
+    s.seenT[slot] = now;
 
     if (s.phase === Phase.multi) {
         updateWheel(s, out);

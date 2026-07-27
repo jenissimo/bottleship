@@ -5,7 +5,7 @@
 // observed as pressed. All three are properties visible at our own API boundary, so a
 // title nobody has ever run gets a sane layout on its first boot.
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
     GUEST_POLLED_KEYS_BASE,
     GUEST_POLLED_KEYS_COUNT,
@@ -83,6 +83,14 @@ export function useActiveLayout(
         };
     }, []);
 
+    // Read through a ref, NOT from the deps: callers pass an inline arrow, so a dep would
+    // rebuild the interval on every parent re-render and reset `fired`/`padPolls` with it.
+    // During boot those re-renders arrive faster than DEBOUNCE_MS, so the pick never fired
+    // at all, and readsPad — which needs PAD_POLL_WINDOWS separate observations — could
+    // never latch.
+    const getInputViewRef = useRef(getInputView);
+    useEffect(() => { getInputViewRef.current = getInputView; }, [getInputView]);
+
     useEffect(() => {
         if (!enabled || isPinned(gameId)) return;
         // Sticky per game: presets are supersets (wasd-look still taps fine in a menu),
@@ -93,7 +101,7 @@ export function useActiveLayout(
         let lastSeq = -1;
         let padPolls: PadPollTracker = newPadPollTracker();
         const timer = window.setInterval(() => {
-            const view = getInputView();
+            const view = getInputViewRef.current();
             if (!view) return;
             const seq = Atomics.load(view, INPUT_INDEX.guestInputSeq);
             const padSeq = Atomics.load(view, INPUT_INDEX.guestGamepadSeq);
@@ -118,7 +126,7 @@ export function useActiveLayout(
             setPick({ id: gameId, value: { presetId: picked.presetId, mode: picked.mode } });
         }, DEBOUNCE_MS);
         return () => window.clearInterval(timer);
-    }, [enabled, gameId, getInputView, orientation]);
+    }, [enabled, gameId, orientation]);
 
     return useMemo(() => {
         const resolved = resolveActiveLayout<ControlLayout>({

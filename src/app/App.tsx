@@ -1250,7 +1250,8 @@ export default function App() {
         // Game switch: the worker's key/button diff baselines are back to zero, so a
         // level we are still holding would arrive in the next game as a fresh press.
         inputDevice.releaseAllSources();
-        touchControlsRef.current?.releaseAll();
+        // No flush until the pad is re-asserted — see handleBlur.
+        touchControlsRef.current?.releaseAll(false);
         assertVirtualPad();
         inputDevice.commit({ immediate: true });
         relativeIntent.reset();
@@ -1699,7 +1700,10 @@ export default function App() {
     // when the tab goes away has no release event coming.
     const handleBlur = () => {
       inputDevice.releaseAllSources();
-      touchControlsRef.current?.releaseAll();
+      // Do NOT let the presser publish here: its own immediate commit would ship the
+      // frame where the pad is released but not yet re-asserted, which reads as a
+      // controller unplug on every tab hide.
+      touchControlsRef.current?.releaseAll(false);
       // Losing focus releases what was held; it does not unplug the controller.
       assertVirtualPad();
       inputDevice.commit({ immediate: true });
@@ -2637,6 +2641,7 @@ export default function App() {
             getPointerScale={guestPerCss}
             sensitivity={uiSettings.touchSensitivity}
             idleFade={uiSettings.touchIdleFade}
+            onHostAction={handleHostAction}
           />
         )}
         {workerStatus === "ready" && <InputStatusOverlay status={inputStatus} />}
@@ -2649,6 +2654,9 @@ export default function App() {
             trackpad={activeLayout.mode === "trackpad"}
           />
         )}
+        {/* The HUD's keyboard action only exists on this screen, so the sheet has to be
+            mounted here too — not only in the library return. */}
+        <VirtualKeyboardSheet open={oskOpen} onClose={() => setOskOpen(false)} />
         {loadingProgress && !errorMessage && !exitInfo && (() => {
           const activeStage = loadPhaseStageIndex(loadingProgress.phase);
           const status = loadPhaseStatus(loadingProgress.phase, gameDisplayName);
