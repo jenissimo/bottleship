@@ -230,6 +230,19 @@ export function installHarnessFacade(worker: Worker, getInputView?: () => Int32A
     }
 
     async function resolveBundlePath(idOrUrl: string): Promise<string> {
+        // A Windows path in a double-quoted JS literal is a trap: "g:\WGB\todo\bod.wgb"
+        // is really `g:WGB<TAB>odo<BACKSPACE>od.wgb` — \t and \b are escapes and \W just
+        // loses its backslash. The fetch then 404s and the ZIP reader reports "EOCD not
+        // found", which sends the reader hunting for a corrupt bundle. Fail here, naming
+        // the actual problem.
+        const ctrl = idOrUrl.match(/[\x00-\x1f]/);
+        if (ctrl) {
+            const shown = [...idOrUrl].map((c) => (c.charCodeAt(0) < 32 ? `<${c.charCodeAt(0)}>` : c)).join("");
+            throw new Error(
+                `bundle path contains a control character (${shown}) — a "\\t"/"\\b"-style escape in a ` +
+                `double-quoted literal. Use forward slashes ("g:/WGB/todo/x.wgb") or a raw string.`,
+            );
+        }
         if (/^https?:\/\//i.test(idOrUrl)) return idOrUrl;
         // Absolute disk path (Windows "X:\…"/"X:/…" or a POSIX "/…*.wgb") → stream it straight
         // off disk via Range, so the agent/make-wgb can hand a raw path — no symlink, no
