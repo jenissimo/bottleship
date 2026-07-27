@@ -14,7 +14,7 @@
 
 import type { HarnessService, HarnessCtx } from "../service";
 import { HarnessError, HarnessErrorCode } from "../rpc";
-import { getModule, guestMem, serializeSurfaces } from "../serialize";
+import { getModule, guestMem, serializeSurfaces, sys } from "../serialize";
 import { bytesToBase64 } from "./screen";
 import { devices as d3d9Devices } from "../../modules/d3d9/shared-state";
 import { startCapture as frameCaptureStart } from "../../modules/ddraw/frame-capture";
@@ -174,6 +174,37 @@ export function registerTextureCommands(svc: HarnessService): void {
             });
         }
         return { total: rows.length, empty, surfaces: rows };
+    });
+
+    /** surfaceFormats({caps?}) — the DDPIXELFORMAT every surface hands back through
+     *  Lock/GetSurfaceDesc/GetPixelFormat, as the 8 raw little-endian DWORDs the guest
+     *  memcmps. Era D3D wrappers classify a surface by an EXACT 32-byte compare against
+     *  their own format table, so one fabricated field (an invented RGB mask on a
+     *  paletted format, a stale dwFlags, a non-zero dwFourCC) silently demotes the
+     *  surface to "unsupported" and the game skips the texel upload — a bug that looks
+     *  like "textures bind but stay black". Compare `bytes` against the game's table. */
+    svc.register("surfaceFormats", (args) => {
+        const opts = (args[0] ?? {}) as { caps?: number };
+        const provider: any = sys().resourceProvider as any;
+        const objs: any[] = provider?.getAllComObjects?.() ?? [];
+        const rows: unknown[] = [];
+        for (const o of objs) {
+            const st = o?.getState?.();
+            if (!st?.format || typeof st.surfacePtr !== "number") continue;
+            if (opts.caps !== undefined && ((st.caps >>> 0) & opts.caps) !== opts.caps) continue;
+            const f = st.format;
+            const dw = [32, f.flags >>> 0, (f.fourCC ?? 0) >>> 0, f.bpp >>> 0,
+                        f.rMask >>> 0, f.gMask >>> 0, f.bMask >>> 0, f.aMask >>> 0];
+            rows.push({
+                ptr: "0x" + (st.surfacePtr >>> 0).toString(16),
+                size: `${st.width}x${st.height}`,
+                caps: "0x" + ((st.caps >>> 0)).toString(16),
+                dwords: dw.map((v) => "0x" + v.toString(16)),
+                bytes: dw.map((v) => v.toString(16).padStart(8, "0")
+                    .match(/../g)!.reverse().join("")).join(""),
+            });
+        }
+        return { total: rows.length, surfaces: rows };
     });
 
     /** surfacePixels(sel) — the existing luminance/grid stats (no PNG). */

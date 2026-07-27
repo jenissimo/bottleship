@@ -207,6 +207,21 @@ export interface BaseSurfaceState {
     lastLoadSourceGeneration?: number;
     /** surfacePtr of the source used in last Load() (for multi-source invalidation). */
     lastLoadSourcePtr?: number;
+    /** GUID-keyed application data attached with SetPrivateData. Per-surface and
+     *  opaque to us: engines round-trip their own bookkeeping (source image size,
+     *  mip level, wrapper object) through it, so dropping it silently corrupts
+     *  whatever they read back. Freed with the surface. */
+    privateData?: Map<string, PrivateDataEntry>;
+}
+
+/** One SetPrivateData entry: either a byte blob or a (ref-counted) IUnknown pointer. */
+export interface PrivateDataEntry {
+    /** dwSize as the app set it — GetPrivateData reports exactly this. */
+    size: number;
+    /** Blob payload (absent for DDSPD_IUNKNOWNPOINTER entries). */
+    bytes?: Uint8Array;
+    /** Guest IUnknown pointer for DDSPD_IUNKNOWNPOINTER entries (we hold one ref). */
+    unknownPtr?: number;
 }
 
 /**
@@ -460,6 +475,15 @@ export class DirectDrawSurfaceObject extends BaseComObject {
                 `Surface destroyed while locked! Auto-revoking lease ${this.state.activeLeaseId}`);
             leaseRegistry.revokeLease(this.state.activeLeaseId);
             this.state.activeLeaseId = undefined;
+        }
+
+        // SetPrivateData entries die with the surface, releasing any IUnknown they hold.
+        if (this.state.privateData) {
+            const provider = System.getInstance().resourceProvider as any;
+            for (const entry of this.state.privateData.values()) {
+                if (entry.unknownPtr) provider?.getComObjectByAddress?.(entry.unknownPtr)?.release?.();
+            }
+            this.state.privateData = undefined;
         }
 
         // Unbind this surface from all active devices before destroying GPU resources

@@ -63,6 +63,7 @@ import { lockTracker } from "../../core/lock-tracker";
 import { getLastGetDIBitsBuffer } from "../gdi32/painting";
 import { clipRect } from "./surface-helpers";
 import { createSurfaceStubsExports } from "./surface-stubs";
+import { createSurfacePrivateDataExports } from "./surface-private-data";
 import { createSurfaceBltFlipExports } from "./surface-blt-flip";
 
 // Performance: Texture diagnostics are expensive (scan 1000+ pixels per Unlock).
@@ -2461,6 +2462,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
     };
 
     Object.assign(exports, createSurfaceStubsExports(context));
+    Object.assign(exports, createSurfacePrivateDataExports(context));
 
     // IDirectDrawSurface (v1) stub methods - delegate to v7 where possible
     // Note: QueryInterface, AddRef, Release, Lock, GetSurfaceDesc are already implemented
