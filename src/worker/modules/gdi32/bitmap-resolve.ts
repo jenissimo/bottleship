@@ -1,11 +1,18 @@
 /**
  * Resolve a GDI/user BITMAP handle to RGBA pixels for overlay painting.
  * Tries: stored pixels → live DC canvas → CreateDIBSection bitsPtr.
+ *
+ * Every exported entry unwraps its `mem` once (toPlainGuestMemory): callers hand us
+ * v86's always-live Proxy, and the DIBSection readers below index it per pixel, which
+ * that Proxy's get-trap makes ~140x slower than a typed array. The readers are pure —
+ * they only fill a freshly allocated host buffer — so no plain view outlives a guest
+ * re-entry or a WASM growth here.
  */
 
 import { System } from '../../core/system';
 import { SystemResourceProvider } from '../../core/resources/system-resource-provider';
 import { asArrayBufferView } from '../../../dom-buffer';
+import { toPlainGuestMemory } from '../../core/memory/guest-memory';
 
 export interface ResolvedBitmapRgba {
     data: Uint8ClampedArray;
@@ -114,6 +121,7 @@ export function resolveDibSectionRectRgba(
     rw: number,
     rh: number,
 ): { data: Uint8ClampedArray; x: number; y: number; width: number; height: number } | null {
+    mem = toPlainGuestMemory(mem);
     const obj = unwrapBitmapObj(hBitmap);
     if (!obj || !obj.bitsPtr || !obj.dibStride) return null;
     const bw = obj.width ?? 0, bh = obj.height ?? 0;
@@ -179,6 +187,7 @@ export function resolveDib32RawAlphaRgba(
     hBitmap: number,
     mem: Uint8Array,
 ): { data: Uint8ClampedArray; width: number; height: number } | null {
+    mem = toPlainGuestMemory(mem);
     const obj = unwrapBitmapObj(hBitmap);
     if (!obj || !obj.bitsPtr || !obj.dibStride || (obj.dibBpp ?? 0) !== 32) return null;
     const w = obj.width ?? 0, h = obj.height ?? 0;
@@ -267,6 +276,7 @@ function readDibSectionRgbaGeneric(
  */
 export function resolveBitmapRgba(hBitmap: number, mem?: Uint8Array): ResolvedBitmapRgba | null {
     if (!hBitmap) return null;
+    mem = toPlainGuestMemory(mem);
 
     const obj = unwrapBitmapObj(hBitmap);
     if (!obj) return null;

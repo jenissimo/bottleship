@@ -107,6 +107,21 @@ export function registerPerfCommands(svc: HarnessService): void {
         };
     });
 
+    /** perfThunks({top?=20, filter?}) — session-wide per-thunk cost (totalMs, avgUs,
+     *  msPerFrame, share of the thunk slice), accumulated over every profiled frame
+     *  rather than the 5-frame worst-frame ring. The instrument for an A/B on ONE
+     *  thunk's cost: per-call figures survive CPU contention that makes FPS useless.
+     *  `noBorrowMs`/`noBorrowAvgUs` isolate the calls that never took a plain guest-memory
+     *  view — a big, slow noBorrow row is the signature of a leaf indexing v86's Proxy
+     *  per element (guest-memory.ts), the ~140x class. Heuristic, not proof: sync thunks
+     *  only, and one Mem.read* anywhere in the call clears the flag — it under-reports
+     *  rather than cries wolf. Confirm a suspect with `dbg.memProxyBench` (A/B both arms in
+     *  one session) and price the loop with `dbg.memBench` (ns per Proxy access here). */
+    svc.register("perfThunks", (args) => {
+        const opts = (args[0] ?? {}) as { top?: number; filter?: string };
+        return frameProfiler.getThunkReport(opts.top ?? 20, opts.filter);
+    });
+
     /** perfStats() — latest + average frame sample (no per-frame thunk detail). */
     svc.register("perfStats", () => {
         const snap = frameProfiler.getSnapshot();

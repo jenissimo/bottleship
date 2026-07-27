@@ -19,6 +19,7 @@ import { BusyWaitDetector } from './busy-wait-detector';
 import { WinApiCallRing } from './winapi-call-ring';
 import { dumpExceptionContext } from './exception-context-dumper';
 import { guardStackWrite } from '../memory/stack-write-guard';
+import { guestMemoryBorrowCount } from '../memory/guest-memory';
 import * as DispatcherForensics from './dispatcher-forensics';
 import { ERROR_NOT_SUPPORTED } from './thunk-errors';
 import { thunkChecksumManager } from '../memory/thunk-checksum';
@@ -162,6 +163,8 @@ interface SehDispatchContext {
 }
 
 // Configuration
+/** A sync thunk at/above this is recorded exactly (and attributed) instead of 1-in-16 sampled. */
+const HEAVY_THUNK_MS = 0.5;
 const MAX_THUNK_ID = 65536; // Adjust based on your max expected ID
 const DEFAULT_ARGS_COUNT = 16;
 const SPIN_LOOP_ADDR_DEFAULT = 0x01F80000;
@@ -1584,6 +1587,7 @@ export class ThunkDispatcher {
         this.thunkCount++;
 
         let result: any;
+        let memBorrowsBefore = 0;
         frameProfiler.markThunkStart();
         const thunkStart = frameProfiler.startTimer();
         // PERF: Capture wall-clock time for virtual time compensation.
@@ -1614,6 +1618,11 @@ export class ThunkDispatcher {
                 ? this.cachedDataView.getUint32(espAtEntry, true) >>> 0 : 0;
             apiCensus.record(thunkName, impl.length, censusCaller);
 
+            // `cachedMem8` is the Proxy (see updateMemoryCache); a leaf that indexes it per
+            // element instead of borrowing a plain view is ~140x slower. Sampling the borrow
+            // counter across the call is how a slow thunk that never borrowed gets NAMED
+            // (perfThunks `noBorrowMs`) rather than re-discovered by hand.
+            memBorrowsBefore = guestMemoryBorrowCount();
             result = impl(ctx, this.cachedMem8, this.reusableArgs);
         } catch (e) {
             this._slowPathHandleThunkError(functionId, thunkName, e, cpu);
@@ -1631,7 +1640,15 @@ export class ThunkDispatcher {
             this._handleAsyncResult(result, functionId, thunkName, cpu, espAtEntry, argCount, thunkStart);
         } else {
             const dur = frameProfiler.endTimer("thunk", thunkStart);
-            if ((this.thunkCount & 0xF) === 0) frameProfiler.recordThunk(thunkName, dur * 16);
+            // Heavy calls are rare, so record them EXACTLY — µs/call for a hot leaf (the
+            // A/B figure that survives CPU contention) is meaningless if a 250ms blit is
+            // sampled 1-in-16. The cheap majority stays sampled, but weighted, so `count`
+            // estimates the real call count instead of 1/16 of it.
+            if (dur >= HEAVY_THUNK_MS) {
+                frameProfiler.recordThunk(thunkName, dur, 1, memBorrowsBefore === guestMemoryBorrowCount());
+            } else if ((this.thunkCount & 0xF) === 0) {
+                frameProfiler.recordThunk(thunkName, dur * 16, 16);
+            }
             frameProfiler.markThunkEnd();
             this._handleSyncResult(result, functionId, thunkName, cpu, this.reusableContext, argCount, espAtEntry);
 

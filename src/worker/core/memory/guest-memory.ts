@@ -25,7 +25,38 @@
 let _lastBuffer: ArrayBufferLike | null = null;
 let _lastPlain: Uint8Array | null = null;
 
+/** Bumped on every borrow. The dispatcher samples it around each thunk to tell a slow
+ *  thunk that DID ask for a fast view from one that indexed the Proxy per element —
+ *  see FrameProfiler.recordThunk's `noBorrow` columns. */
+let _borrows = 0;
+
+/** Monotonic count of toPlainGuestMemory/borrowGuestMemory calls (diagnostic only). */
+export function guestMemoryBorrowCount(): number {
+    return _borrows;
+}
+
+/** Dev A/B switch — see setGuestMemoryBorrowBypass. */
+let _bypass = false;
+
+/**
+ * Hand back v86's raw Proxy instead of a plain view, restoring the ~140x-slower
+ * per-element trap everywhere at once. The only way to A/B an unwrap HONESTLY: both
+ * arms then run in ONE session on ONE scene, so the µs/call comparison isn't confounded
+ * by a different game state (and, unlike FPS, survives CPU contention). Never on in
+ * normal operation. `dbg.memProxyBench(true)`.
+ */
+export function setGuestMemoryBorrowBypass(enabled: boolean): void {
+    _bypass = enabled;
+    if (enabled) { _lastBuffer = null; _lastPlain = null; }
+}
+
+export function isGuestMemoryBorrowBypassed(): boolean {
+    return _bypass;
+}
+
 export function toPlainGuestMemory<T extends Uint8Array | null | undefined>(raw: T): T {
+    _borrows++;
+    if (_bypass) return raw;
     if (!raw) return raw;
     // Already a canonical Uint8Array (non-proxy / post-fix steady state) — nothing to do.
     if (raw.constructor === Uint8Array) return raw;

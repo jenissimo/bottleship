@@ -8,6 +8,7 @@
 import { Logger, LogCategory } from "../../core/logger";
 import { SystemResourceProvider } from "../../core/resources/system-resource-provider";
 import { System } from "../../core/system";
+import { toPlainGuestMemory } from "../../core/memory/guest-memory";
 import type { DirectDrawSurfaceState } from "../ddraw/com-objects";
 import { isRenderSurface } from "../ddraw/com-objects";
 import { convertRGBAToSurface } from "../ddraw/gpu-texture-utils";
@@ -96,7 +97,10 @@ function writeBackDib32(
     if (!hBmp || hBmp === DEFAULT_BITMAP_HANDLE) return;
     const obj = SystemResourceProvider.getInstance().getUserObject(hBmp);
     if (!obj || obj.type !== 'BITMAP' || !obj.bitsPtr || obj.dibStride <= 0 || (obj.dibBpp ?? 32) !== 32) return;
-    const mem: Uint8Array | undefined = System.getInstance().process?.getCurrentMemory?.();
+    // Per-pixel write-back below; getCurrentMemory() hands out v86's Proxy, whose
+    // per-element trap V8 cannot JIT. Nothing here re-enters the guest, so the plain
+    // view cannot go stale mid-call.
+    const mem: Uint8Array | undefined = toPlainGuestMemory(System.getInstance().process?.getCurrentMemory?.());
     if (!mem) return;
     const bw = obj.width ?? 0, bh = obj.height ?? 0;
     const cx = Math.max(0, x | 0), cy = Math.max(0, y | 0);

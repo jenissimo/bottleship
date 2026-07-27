@@ -51,6 +51,10 @@ export type FrameSample = {
 export type ThunkAggregate = {
     count: number;
     totalMs: number;
+    /** Of `totalMs`, the part spent in calls that never borrowed a plain guest-memory view
+     *  (see recordThunk's `noBorrow`). High here = a leaf indexing v86's Proxy per element. */
+    noBorrowMs: number;
+    noBorrowCount: number;
 };
 
 export type BadFrameCapture = {
@@ -102,6 +106,13 @@ export class FrameProfiler {
 
     // Track thunk aggregates for current frame
     private currentThunkAggregates = new Map<string, ThunkAggregate>();
+
+    // Session-wide thunk aggregate. currentThunkAggregates is cleared every frame and
+    // only survives in the 5-frame badFrames ring, so per-call cost of a thunk can only
+    // be read off the WORST frames. This one spans the whole enabled window, which is
+    // what an A/B on a single thunk's µs/call needs (see getThunkReport).
+    private sessionThunkAggregates = new Map<string, ThunkAggregate>();
+    private sessionFrames = 0;
 
     // Track bad frames (spikes or slow frames)
     private badFrames: BadFrameCapture[] = [];
@@ -161,6 +172,8 @@ export class FrameProfiler {
         this.badFrames = [];
         this.rollingAvgFrameMs = 16.67;
         this.lastThunkEndTime = 0;
+        this.sessionThunkAggregates.clear();
+        this.sessionFrames = 0;
         this.currentThreadSwitchCount = 0;
         this.currentActiveThreadCount = 0;
         for (const sample of this.samples) {
@@ -217,16 +230,33 @@ export class FrameProfiler {
 
     /**
      * Records an individual thunk call's duration and count.
+     *
+     * `noBorrow` marks a call that ran without borrowing a plain guest-memory view. A thunk
+     * that is BOTH slow and never borrowed is the signature of a leaf indexing v86's Proxy
+     * per element (~140x the cost of a typed array) — getThunkReport ranks those so the
+     * class gets re-found by measurement instead of by another manual audit.
      */
-    recordThunk(name: string, ms: number, countWeight: number = 1): void {
+    recordThunk(name: string, ms: number, countWeight: number = 1, noBorrow: boolean = false): void {
         if (!this.enabled || ms < 0) return;
         let agg = this.currentThunkAggregates.get(name);
         if (!agg) {
-            agg = { count: 0, totalMs: 0 };
+            agg = { count: 0, totalMs: 0, noBorrowMs: 0, noBorrowCount: 0 };
             this.currentThunkAggregates.set(name, agg);
         }
         agg.count += countWeight;
         agg.totalMs += ms;
+
+        let sess = this.sessionThunkAggregates.get(name);
+        if (!sess) {
+            sess = { count: 0, totalMs: 0, noBorrowMs: 0, noBorrowCount: 0 };
+            this.sessionThunkAggregates.set(name, sess);
+        }
+        sess.count += countWeight;
+        sess.totalMs += ms;
+        if (noBorrow) {
+            agg.noBorrowMs += ms; agg.noBorrowCount += countWeight;
+            sess.noBorrowMs += ms; sess.noBorrowCount += countWeight;
+        }
     }
 
     /**
@@ -326,6 +356,7 @@ export class FrameProfiler {
 
         this.sampleIndex = (this.sampleIndex + 1) % this.samples.length;
         this.sampleCount = Math.min(this.sampleCount + 1, this.samples.length);
+        this.sessionFrames++;
         this.currentCategories.fill(0);
         this.currentThunkAggregates.clear();
         this.currentThreadSwitchCount = 0;
@@ -441,6 +472,43 @@ export class FrameProfiler {
             rollingAvgMs: +this.rollingAvgFrameMs.toFixed(1),
             classes,
             worst,
+        };
+    }
+
+    /**
+     * Session-wide per-thunk cost, ranked by total time — the A/B instrument for
+     * "is this thunk cheaper now?".
+     *
+     * `avgUs` is real µs per call. Cheap calls are sampled (1 in 16 generic, 1 in 32 fast
+     * path) but the dispatcher scales BOTH the recorded ms and the count by the stride, so
+     * the ratio is unbiased; calls at/above HEAVY_THUNK_MS are recorded exactly, which is
+     * what keeps a rare multi-ms blit from being averaged out of existence. Per-call
+     * figures are far less contention-sensitive than FPS, which is why an A/B belongs here
+     * rather than in a frame-rate comparison.
+     */
+    getThunkReport(top: number = 20, filter?: string) {
+        let totalMs = 0;
+        for (const agg of this.sessionThunkAggregates.values()) totalMs += agg.totalMs;
+        const rows = Array.from(this.sessionThunkAggregates.entries())
+            .filter(([name]) => !filter || name.toLowerCase().includes(filter.toLowerCase()))
+            .map(([name, agg]) => ({
+                name,
+                count: agg.count,
+                totalMs: +agg.totalMs.toFixed(2),
+                avgUs: agg.count > 0 ? +((agg.totalMs * 1000) / agg.count).toFixed(1) : 0,
+                msPerFrame: this.sessionFrames > 0 ? +(agg.totalMs / this.sessionFrames).toFixed(3) : 0,
+                shareOfThunkPct: totalMs > 0 ? +((agg.totalMs / totalMs) * 100).toFixed(1) : 0,
+                // Slow AND never borrowed a plain view ⇒ prime suspect for a Proxy-indexed leaf.
+                noBorrowMs: +agg.noBorrowMs.toFixed(2),
+                noBorrowAvgUs: agg.noBorrowCount > 0 ? +((agg.noBorrowMs * 1000) / agg.noBorrowCount).toFixed(1) : 0,
+            }))
+            .sort((a, b) => b.totalMs - a.totalMs)
+            .slice(0, top);
+        return {
+            enabled: this.enabled,
+            frames: this.sessionFrames,
+            thunkTotalMs: +totalMs.toFixed(2),
+            rows,
         };
     }
 

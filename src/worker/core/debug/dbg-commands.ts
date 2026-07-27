@@ -38,7 +38,7 @@ import { dialogNeedsPointMouseRouting } from '../../modules/user32/dialog-overla
 import { repaintDialogOverlayIfVisible } from '../../modules/user32/dialog';
 import { isGdiSurfaceHidden } from '../../modules/ddraw/gdi-visibility';
 import { hpFreezeWatchdog } from './hp-freeze-watchdog';
-import { setGuestMemoryStaleGuard, isGuestMemoryStaleGuardEnabled } from '../memory/guest-memory';
+import { setGuestMemoryStaleGuard, isGuestMemoryStaleGuardEnabled, setGuestMemoryBorrowBypass, isGuestMemoryBorrowBypassed } from '../memory/guest-memory';
 import { MEM_GUARD_BASE, MEM_GUARD_SIZE } from '../cpu/emulator-config';
 import { aotCache } from '../cpu/aot-cache';
 
@@ -979,6 +979,45 @@ export const dbg = {
     memGuard(on = true): void {
         setGuestMemoryStaleGuard(on);
         console.log(`[dbg] memGuard=${on ? 1 : 0} (guest-memory stale-view guard ${on ? "ON — slow, throws on stale access" : "OFF — fast plain views"})`);
+    },
+    /** Cost of indexing guest memory through v86's Proxy vs a plain view, measured on THIS
+     *  engine over `bytes` sequential reads (default one 640x480x24bpp blit). Turns the
+     *  "the Proxy is ~140x" rule into a number anyone can re-check before deciding whether
+     *  a given leaf loop is worth unwrapping. */
+    memBench(bytes = 921600): Record<string, number> | null {
+        const raw = System.getInstance().process?.getCurrentMemory?.();
+        if (!raw) { console.warn('[dbg] memBench: no process memory'); return null; }
+        const plain = new Uint8Array(raw.buffer, raw.byteOffset, raw.length);
+        const n = Math.min(bytes, plain.length);
+        const time = (read: (i: number) => number): number => {
+            const t0 = performance.now();
+            let acc = 0;
+            for (let i = 0; i < n; i++) acc += read(i);
+            const ms = performance.now() - t0;
+            if (acc === -1) console.log('');  // defeat DCE without perturbing the loop
+            return ms;
+        };
+        const proxyMs = time((i) => raw[i]!);
+        const plainMs = time((i) => plain[i]!);
+        const out = {
+            bytes: n,
+            proxyMs: +proxyMs.toFixed(1),
+            plainMs: +plainMs.toFixed(1),
+            ratio: +(proxyMs / Math.max(plainMs, 1e-6)).toFixed(1),
+            proxyNsPerAccess: +((proxyMs * 1e6) / n).toFixed(1),
+        };
+        console.log(`[dbg] memBench ${JSON.stringify(out)}`);
+        return out;
+    },
+    /** A/B a guest-memory unwrap: ON puts every borrow back on v86's Proxy (~140x per
+     *  element), so both arms can be measured in ONE session on ONE scene via
+     *  `perfThunks` µs/call. Bench only — leaving it on is a global slowdown. */
+    memProxyBench(on = true): void {
+        setGuestMemoryBorrowBypass(on);
+        console.log(`[dbg] memProxyBench=${on ? 1 : 0} (guest-memory borrows ${on ? "BYPASSED — raw v86 Proxy, slow arm" : "normal — plain views"})`);
+    },
+    memProxyBenchStatus(): boolean {
+        return isGuestMemoryBorrowBypassed();
     },
     /** Report whether the guest-memory stale-view guard is currently enabled. */
     memGuardStatus(): boolean {

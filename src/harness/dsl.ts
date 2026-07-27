@@ -153,6 +153,9 @@ export class HarnessChain {
     perfSpikes(opts?: { top?: number; minMs?: number }): this { return this.push("perfSpikes", [opts]); }
     /** Latest + average frame sample + spike count. */
     perfStats(): this { return this.push("perfStats", []); }
+    /** Session-wide per-thunk cost (totalMs / avgUs / msPerFrame / share of the thunk slice).
+     *  Use this — not FPS — to A/B one thunk's cost; per-call figures tolerate CPU contention. */
+    perfThunks(opts?: { top?: number; filter?: string }): this { return this.push("perfThunks", [opts]); }
     /** Named-bucket sub-phase timings (avg/total/max/count). filter by substring; maxMs = worst single call. */
     profilerStats(opts?: { filter?: string; top?: number; sort?: "max" | "total" | "avg" }): this { return this.push("profilerStats", [opts]); }
 

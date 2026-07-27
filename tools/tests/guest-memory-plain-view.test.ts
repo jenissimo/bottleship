@@ -10,7 +10,12 @@
  * Blade of Darkness's menu at 3.5 FPS.
  */
 import { describe, expect, it } from "bun:test";
-import { toPlainGuestMemory } from "../../src/worker/core/memory/guest-memory";
+import {
+    toPlainGuestMemory,
+    guestMemoryBorrowCount,
+    setGuestMemoryBorrowBypass,
+    isGuestMemoryBorrowBypassed,
+} from "../../src/worker/core/memory/guest-memory";
 
 /** Stand-in for vendor/v86/src/lib.js `view()`: element access goes through a trap. */
 function v86StyleProxy(view: Uint8Array): Uint8Array {
@@ -74,5 +79,54 @@ describe("toPlainGuestMemory", () => {
     it("tolerates null/undefined so callers need no guard", () => {
         expect(toPlainGuestMemory(null)).toBe(null);
         expect(toPlainGuestMemory(undefined)).toBe(undefined);
+    });
+
+    it("counts every borrow, so the dispatcher can name a thunk that never took one", () => {
+        // The counter is what turns "slow thunk" into "slow thunk that indexed the Proxy":
+        // it must tick even on the pass-through and the null paths, or a leaf that borrows
+        // once and then loops would read as never having borrowed.
+        const before = guestMemoryBorrowCount();
+        toPlainGuestMemory(v86StyleProxy(new Uint8Array(8)));
+        toPlainGuestMemory(new Uint8Array(8));
+        toPlainGuestMemory(null);
+        expect(guestMemoryBorrowCount()).toBe(before + 3);
+    });
+
+    describe("borrow bypass (dev A/B switch)", () => {
+        it("hands back the Proxy untouched while on, and restores plain views when off", () => {
+            const backing = new Uint8Array(64);
+            backing[3] = 0x5a;
+            const proxied = v86StyleProxy(backing);
+
+            setGuestMemoryBorrowBypass(true);
+            try {
+                expect(isGuestMemoryBorrowBypassed()).toBe(true);
+                const bypassed = toPlainGuestMemory(proxied);
+                // Same object, still not a view — that IS the slow arm being measured.
+                expect(bypassed).toBe(proxied);
+                expect(ArrayBuffer.isView(bypassed)).toBe(false);
+                // Slow, but never wrong: the bytes are identical either way.
+                expect(bypassed[3]).toBe(0x5a);
+            } finally {
+                setGuestMemoryBorrowBypass(false);
+            }
+
+            expect(isGuestMemoryBorrowBypassed()).toBe(false);
+            const plain = toPlainGuestMemory(proxied);
+            expect(ArrayBuffer.isView(plain)).toBe(true);
+            expect(plain[3]).toBe(0x5a);
+        });
+
+        it("drops the cached view on entry so the fast arm cannot serve a bypass-era stale one", () => {
+            const first = new Uint8Array(16);
+            toPlainGuestMemory(v86StyleProxy(first));
+            setGuestMemoryBorrowBypass(true);
+            const grown = new Uint8Array(32);
+            toPlainGuestMemory(v86StyleProxy(grown));   // bypassed: cache must not be primed
+            setGuestMemoryBorrowBypass(false);
+            const after = toPlainGuestMemory(v86StyleProxy(grown));
+            expect(after.buffer).toBe(grown.buffer);
+            expect(after.length).toBe(32);
+        });
     });
 });

@@ -1060,6 +1060,10 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
             return 0;
         }
 
+        // Leaf hot loop: the RGBA→DIB write-back below stores 3-4 bytes per pixel through
+        // `mem`, which the dispatcher hands us as v86's always-live Proxy. Nothing between
+        // here and the loop re-enters the guest, so a plain view cannot go stale.
+        mem = toPlainGuestMemory(mem);
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
 
         // Read requested biHeight from caller's BITMAPINFO
