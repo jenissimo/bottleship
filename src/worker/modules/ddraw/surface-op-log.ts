@@ -28,6 +28,13 @@ export interface SurfaceOpRecord {
     dstMode: string;
     dstGpuDirty: boolean;
     dstVersion: number;
+    /** Source colour key in effect for THIS op ("none" when the blit is opaque).
+     *  A keyed op reads the source's ORIGINAL texels; an opaque one does not — so
+     *  "correct art, black rectangle" is unanswerable without it. */
+    key: string;
+    /** Source authority at the time of the op — which representation was sampled. */
+    srcVersion: number;
+    srcGpuDirty: boolean;
 }
 
 // A real ring: fixed slots plus a write index. The obvious `push` + `shift` costs O(n)
@@ -79,10 +86,12 @@ export function recordSurfaceOp(
     dst: DirectDrawSurfaceState,
     src: DirectDrawSurfaceState | null,
     dstRect: Rect | null,
-    srcRect: Rect | null
+    srcRect: Rect | null,
+    colorKey?: { low: number; high: number }
 ): void {
     if (capacity <= 0) return;
     const render = isRenderSurface(dst);
+    const srcRender = src ? isRenderSurface(src) : false;
     ring[head] = {
         seq: seq++,
         op,
@@ -94,6 +103,9 @@ export function recordSurfaceOp(
         dstMode: render ? dst.mode : "bitmap",
         dstGpuDirty: render ? dst.gpuDirty : false,
         dstVersion: render ? dst.version : -1,
+        key: colorKey ? `${hex(colorKey.low)}-${hex(colorKey.high)}` : "none",
+        srcVersion: srcRender ? (src as { version: number }).version : -1,
+        srcGpuDirty: srcRender ? (src as { gpuDirty: boolean }).gpuDirty : false,
     };
     head = (head + 1) % capacity;
     if (filled < capacity) filled++;

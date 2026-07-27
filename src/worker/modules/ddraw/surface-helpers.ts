@@ -304,8 +304,15 @@ export const copySurfaceRegionWithColorKey = (
     if (width <= 0 || height <= 0) return;
 
     const memSize = mem.length;
-    const ckLow = colorKey.low >>> 0;
-    const ckHigh = colorKey.high >>> 0;
+    // The key is expressed in the surface's pixel format and only its COLOUR bits are
+    // significant — the padding/alpha bits of an X8R8G8B8 or X1R5G5B5 surface are
+    // don't-care. Games write SetColorKey(0x00ff00ff) while the surface holds
+    // 0xffff00ff, so a raw full-DWORD compare never matches and the "transparent"
+    // texels are copied opaque. Paletted formats carry no RGB masks; there the key IS
+    // the raw index, so fall back to the full value.
+    const ckMask = ((src.format.rMask | src.format.gMask | src.format.bMask) >>> 0) || 0xffffffff;
+    const ckLow = ((colorKey.low >>> 0) & ckMask) >>> 0;
+    const ckHigh = ((colorKey.high >>> 0) & ckMask) >>> 0;
 
     for (let y = 0; y < height; y++) {
         const srcAbsOffset = src.surfacePtr + (srcRect.top + y) * src.pitch + srcRect.left * bytesPerPixel;
@@ -337,7 +344,8 @@ export const copySurfaceRegionWithColorKey = (
             }
 
             // Check colorkey - skip if pixel matches colorkey range
-            if (pixel >= ckLow && pixel <= ckHigh) {
+            const pixelKeyBits = (pixel & ckMask) >>> 0;
+            if (pixelKeyBits >= ckLow && pixelKeyBits <= ckHigh) {
                 continue; // Transparent - don't copy
             }
 

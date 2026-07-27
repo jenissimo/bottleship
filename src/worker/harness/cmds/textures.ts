@@ -81,13 +81,18 @@ export function registerTextureCommands(svc: HarnessService): void {
         return { count: ops.length, byPath, ops };
     });
 
-    /** dumpSurface(sel, {save?}) — DDraw surface -> PNG. */
+    /** dumpSurface(sel, {save?, from?}) — DDraw surface -> PNG.
+     *  `from` picks the representation: "scratch" (guest CPU pixels), "gpu" (the texture
+     *  the blit/present paths actually sample), or "auto" (scratch when present). Dumping
+     *  both is how you tell "the guest never filled this" from "the guest filled it but we
+     *  sample a blank texture" — the second blits a black rectangle at the right place. */
     const dump = async (args: unknown[]) => {
         const ptr = resolvePtr(args[0]);
         if (!ptr) throw new HarnessError("surface pointer is 0 (no such surface / not initialized)", HarnessErrorCode.NOT_FOUND);
         const dd = ddraw();
         if (!dd?.readSurfaceRGBA) throw new HarnessError("ddraw module not loaded (D3D9-only games not yet supported for surface dump)", HarnessErrorCode.UNSUPPORTED);
-        const r = await dd.readSurfaceRGBA(ptr);
+        const opts0 = (args[1] ?? {}) as { save?: string; from?: "auto" | "gpu" | "scratch" };
+        const r = await dd.readSurfaceRGBA(ptr, opts0.from ?? "auto");
         if ("err" in r) throw new HarnessError(`readSurfaceRGBA: ${r.err}`, HarnessErrorCode.INTERNAL);
         const opts = (args[1] ?? {}) as { save?: string };
         const name = (opts.save ?? `surf_${ptr.toString(16)}_${r.w}x${r.h}`).replace(/\.png$/i, "");
@@ -188,7 +193,8 @@ export function registerTextureCommands(svc: HarnessService): void {
             rows.push({
                 ptr: "0x" + ptr.toString(16), size: `${s.width}x${s.height}`, bpp: s.bpp,
                 caps: "0x" + (s.caps >>> 0).toString(16), mode: s.mode,
-                empty: isEmpty, version: s.version, gpuDirty: s.gpuDirty, everLocked: s.everLocked,
+                empty: isEmpty, version: s.version, uploaded: s.lastUploadVersion,
+                gpuDirty: s.gpuDirty, everLocked: s.everLocked, srcColorKey: s.srcColorKey,
             });
         }
         return { total: rows.length, empty, surfaces: rows };

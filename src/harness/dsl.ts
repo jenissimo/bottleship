@@ -139,6 +139,12 @@ export class HarnessChain {
     textures(): this { return this.push("textures", []); }
     dumpTexture(sel: string | { stage: number }): this { return this.push("dumpTexture", [sel]); }
     dumpSurface(sel: string): this { return this.push("dumpSurface", [sel]); }
+    /** One COMPLETED GL frame, decoded per draw: drawable size, the viewport/scissor that
+     *  were active, and each draw's NDC + resulting screen box. Separates "wrong quad" from
+     *  "wrong viewport/render target" without guessing. */
+    glFrame(opts?: { timeoutMs?: number }): this { return this.push("glFrame", [opts]); }
+    glTextures(): this { return this.push("glTextures", []); }
+    glDumpTexture(id: number): this { return this.push("glDumpTexture", [id]); }
 
     // ── perf (frame profiler / worst-frames, POJO equivalent of the System Profiler) ──
     /** Arm (default) / disarm + optionally reset the worker frame profiler. */

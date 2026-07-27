@@ -1106,6 +1106,16 @@ export function convertSurfaceToRGBA(
         const bytesPerPixel = Math.max(1, format.bpp >> 3);
         // LEGACY: classic DirectDraw treats black (0x0000) as transparent under any colorkey.
 
+        // Keying clears ALPHA ONLY and preserves RGB — never `= 0`. SetColorKey does not
+        // modify a surface's pixels; the key is a per-OPERATION modifier, and every consumer
+        // applies it by comparing the SAMPLED COLOUR against the key: the colour-key Blt
+        // shader (generateColorKeyBlitShaderCode) and the D3D COLORKEYENABLE path
+        // (prepareDraw). Zeroing RGB here overwrites exactly the texels those comparisons
+        // need, so the key can never match again and the "transparent" region is blitted as
+        // OPAQUE BLACK. It also corrupts guest pixels, because this buffer is cached as
+        // rgbaScratch and written BACK through syncToCPUFromScratch.
+        // Matches applyColorKeyToRGBA and the compute converter, which already do this.
+
         // PERF: read the source through a plain typed-array VIEW over the underlying buffer.
         // Guest `mem` is a "bound Uint8Array" whose indexed reads are deoptimized ~50× — the
         // old per-pixel `mem[off]` byte loop here cost ~225ms on an 800×600 colorkeyed surface
@@ -1123,7 +1133,7 @@ export function convertSurfaceToRGBA(
                 for (let x = 0; x < width; x++) {
                     const pv = src16[ro + x];
                     const pm = pv & ckMask;
-                    if ((pm >= ckLowM && pm <= ckHighM) || pv === 0) rgba32[rr + x] = 0;
+                    if ((pm >= ckLowM && pm <= ckHighM) || pv === 0) rgba32[rr + x] &= 0x00FFFFFF;
                 }
             }
         } else if (regionInBounds && bytesPerPixel === 4 && (byteBase & 3) === 0 && (pitch & 3) === 0) {
@@ -1135,7 +1145,7 @@ export function convertSurfaceToRGBA(
                 for (let x = 0; x < width; x++) {
                     const pv = src32[ro + x] >>> 0;
                     const pm = (pv & ckMask) >>> 0;
-                    if ((pm >= ckLowM && pm <= ckHighM) || pv === 0) rgba32[rr + x] = 0;
+                    if ((pm >= ckLowM && pm <= ckHighM) || pv === 0) rgba32[rr + x] &= 0x00FFFFFF;
                 }
             }
         } else {
@@ -1152,7 +1162,7 @@ export function convertSurfaceToRGBA(
                     else if (bytesPerPixel === 4) pixelValue = (mem[pixelOffset] | (mem[pixelOffset + 1] << 8) | (mem[pixelOffset + 2] << 16) | (mem[pixelOffset + 3] << 24)) >>> 0;
                     else pixelValue = mem[pixelOffset];
                     const pixelM = (pixelValue & ckMask) >>> 0;
-                    if ((pixelM >= ckLowM && pixelM <= ckHighM) || pixelValue === 0) rgba32[rgbaRowOffset + x] = 0;
+                    if ((pixelM >= ckLowM && pixelM <= ckHighM) || pixelValue === 0) rgba32[rgbaRowOffset + x] &= 0x00FFFFFF;
                 }
             }
         }
@@ -1413,13 +1423,17 @@ export async function readSurfaceStateRGBA(
     state: DirectDrawSurfaceState,
     backend: { getDevice(): GPUDevice | null; getQueue(): GPUQueue | null } | null,
     flush?: () => void,
+    from: "auto" | "gpu" | "scratch" = "auto",
 ): Promise<{ w: number; h: number; rgba: Uint8Array; source: string } | { err: string }> {
     const w = state.width, h = state.height;
     if (!(w > 0 && h > 0)) return { err: `bad surface dims ${w}x${h}` };
     const scratch = (state as { rgbaScratch?: Uint8Array }).rgbaScratch;
-    if (scratch && scratch.length >= w * h * 4) {
+    // `from` forces which representation is read. The pair is the diagnostic: a surface
+    // whose CPU copy is full while the texture we actually sample is blank blits black.
+    if (from !== "gpu" && scratch && scratch.length >= w * h * 4) {
         return { w, h, rgba: scratch.slice(0, w * h * 4), source: "scratch" };
     }
+    if (from === "scratch") return { err: "no rgbaScratch" };
     if (!state.gpuTexture || !backend) return { err: "no gpuTexture and no rgbaScratch" };
     const device = backend.getDevice();
     const queue = backend.getQueue();
