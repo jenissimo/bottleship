@@ -4,14 +4,17 @@ export const E_FAIL = 0x80004005;
 export const E_NOINTERFACE = 0x80004002;
 export const E_INVALIDARG = 0x80070057;
 
-// DirectDraw error codes
+// DirectDraw error codes. MAKE_DDHRESULT(n) = 0x88760000 | n; a few DDERR_* names
+// are plain aliases of the COM codes in ddraw.h and must keep those exact values.
 export const DDERR_NOTFOUND = 0x887600FF;
 export const DDERR_OUTOFVIDEOMEMORY = 0x887600E1;
-export const DDERR_INVALIDPARAMS = 0x88760006;
+export const DDERR_INVALIDPARAMS = 0x80070057; // alias of E_INVALIDARG
 export const DDERR_SURFACELOST = 0x887601C2;
 export const DDERR_NOEXCLUSIVEMODE = 0x887601B6;
 export const DDERR_WASSTILLDRAWING = 0x8876021C;
-export const DDERR_NOCLIPPER = 0x88760249;
+export const DDERR_NOCLIPPERATTACHED = 0x88760238;  // MAKE_DDHRESULT(568)
+export const DDERR_NOPALETTEATTACHED = 0x8876023C;  // MAKE_DDHRESULT(572)
+export const DDERR_CANTDUPLICATE = 0x88760247;      // MAKE_DDHRESULT(583)
 
 // SetCooperativeLevel flags (DDSCL_* from ddraw.h)
 export const DDSCL_FULLSCREEN     = 0x00000001;

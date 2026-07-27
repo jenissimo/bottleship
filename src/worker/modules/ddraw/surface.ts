@@ -9,7 +9,7 @@ import {
     DD_OK,
     DDERR_NOTFOUND,
     DDERR_INVALIDPARAMS,
-    DDERR_NOCLIPPER,
+    DDERR_NOCLIPPERATTACHED,
     DDSCAPS_BACKBUFFER,
     DDSCAPS_FLIP,
     DDSCAPS_PRIMARYSURFACE,
@@ -1850,7 +1850,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         return enumAttachedSurfacesImpl(ctx, mem, args, true);
     };
 
-    registerSurfaceV1Exports(exports, enumAttachedSurfacesImpl);
+    registerSurfaceV1Exports(exports, context, enumAttachedSurfacesImpl);
 
     exports["IDirectDrawSurface7_GetCaps"] = (ctx, mem, args) => {
         const thisPtr = args[0];
@@ -2381,19 +2381,19 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
 
         const state = obj.getState();
         if (state.clipperHandle === undefined) {
-            return DDERR_NOCLIPPER;
+            return DDERR_NOCLIPPERATTACHED;
         }
 
         const clipperObj = context.resourceProvider.getComObject(state.clipperHandle);
         if (!clipperObj) {
             state.clipperHandle = undefined;
-            return DDERR_NOCLIPPER;
+            return DDERR_NOCLIPPERATTACHED;
         }
 
         const clipperAddr = context.resourceProvider.getAddressForHandle(state.clipperHandle);
         if (!clipperAddr) {
             state.clipperHandle = undefined;
-            return DDERR_NOCLIPPER;
+            return DDERR_NOCLIPPERATTACHED;
         }
 
         Mem.writeUint32(lplpDDClipper, clipperAddr);

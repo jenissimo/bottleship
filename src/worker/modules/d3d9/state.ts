@@ -810,10 +810,15 @@ export function createStateExports(): Record<string, ThunkImplementation> {
         return writeComPtrOut(args[1], meta.devicePtr, mem) ? D3D_OK : D3DERR_INVALIDCALL;
     };
 
+    // GetDeclaration(pElement, pNumElements). The reported count INCLUDES the trailing
+    // D3DDECL_END entry that writeVertexElements appends — the query-then-fill idiom
+    // (`GetDeclaration(d, NULL, &n); malloc(n * 8); GetDeclaration(d, e, &n);`) sizes the
+    // caller's buffer from this number, so reporting the stored count (which stops at the
+    // sentinel) overflows it by exactly one element.
     exports['IDirect3DVertexDeclaration9_GetDeclaration'] = (_ctx, mem, args) => {
         const meta = resolveVertexDeclComPtr(args[0]);
         if (!meta) return D3DERR_INVALIDCALL;
-        if (args[2] && !Mem.writeUint32(args[2], meta.elements.length)) return D3DERR_INVALIDCALL;
+        if (args[2] && !Mem.writeUint32(args[2], meta.elements.length + 1)) return D3DERR_INVALIDCALL;
         if (args[1] && !writeVertexElements(args[1], meta.elements, mem)) return D3DERR_INVALIDCALL;
         return D3D_OK;
     };

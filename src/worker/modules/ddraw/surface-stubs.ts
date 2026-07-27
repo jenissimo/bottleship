@@ -4,7 +4,7 @@
  */
 import type { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../../core/logger";
-import { DD_OK, DDSCAPS_TEXTURE, DDGAMMARAMP_SIZE } from "./constants";
+import { DD_OK, DDSCAPS_TEXTURE, DDGAMMARAMP_SIZE, DDERR_NOPALETTEATTACHED } from "./constants";
 import { DirectDrawSurfaceObject } from "./com-objects";
 import { isValidAddress } from "../../core/memory/address-guard";
 import { gammaService } from "../../core/gamma-service";
@@ -22,7 +22,6 @@ export function createSurfaceStubsExports(context: DDrawContext): Record<string,
         "DeleteAttachedSurface",
         "EnumOverlayZOrders",
         "GetOverlayPosition",
-        "GetPalette",
         "Initialize",
         "SetOverlayPosition",
         "UpdateOverlay",
@@ -42,7 +41,7 @@ export function createSurfaceStubsExports(context: DDrawContext): Record<string,
                 Logger.log(LogCategory.SYSTEM, `IDirectDrawSurface7_BltBatch: this=0x${args[0].toString(16)}`);
                 return DD_OK;
             };
-        } else if (method === "GetPalette" || method === "SetLOD" || method === "GetLOD") {
+        } else if (method === "SetLOD" || method === "GetLOD") {
             exports[`IDirectDrawSurface7_${method}`] = (ctx, mem, args) => {
                 const thisPtr = args[0];
                 const obj = context.resourceProvider.getComObjectByAddress(thisPtr) as DirectDrawSurfaceObject | null;
@@ -83,6 +82,34 @@ export function createSurfaceStubsExports(context: DDrawContext): Record<string,
 
         ownerObj.addRef();
         new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setUint32(lplpDD, ownerAddr, true);
+        return DD_OK;
+    };
+
+    // GetPalette(lplpDDPalette) — the attached palette, AddRef'd, mirroring GetClipper.
+    // Without a palette the out-pointer is NULLed and the call fails: returning DD_OK
+    // over an untouched out-pointer had the caller invoke a vtable on stack garbage.
+    exports["IDirectDrawSurface7_GetPalette"] = (ctx, mem, args) => {
+        const lplpDDPalette = args[1];
+        if (!lplpDDPalette || !isValidAddress(mem, lplpDDPalette, 4)) return DDERR_INVALIDPARAMS;
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        view.setUint32(lplpDDPalette, 0, true);
+
+        const obj = context.resourceProvider.getComObjectByAddress(args[0]) as DirectDrawSurfaceObject | null;
+        if (!obj) return DDERR_INVALIDOBJECT;
+
+        const state = obj.getState();
+        const paletteObj = state.paletteHandle !== undefined
+            ? context.resourceProvider.getComObject(state.paletteHandle)
+            : null;
+        if (!paletteObj) {
+            state.paletteHandle = undefined;
+            return DDERR_NOPALETTEATTACHED;
+        }
+        const paletteAddr = context.resourceProvider.getAddressForHandle(paletteObj.handle);
+        if (!paletteAddr) return DDERR_NOPALETTEATTACHED;
+
+        paletteObj.addRef();
+        view.setUint32(lplpDDPalette, paletteAddr, true);
         return DD_OK;
     };
 

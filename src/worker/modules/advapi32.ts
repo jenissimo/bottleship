@@ -1075,12 +1075,6 @@ export class Advapi32 implements IModule {
             const lpName = args[2];
             const cchName = args[3];
 
-            // Write cchName into a temp location so RegEnumKeyExA can read/write it
-            const lpcName = lpName ? lpName + cchName + 4 : 0; // scratch space past buffer
-            if (lpcName && isValidAddress(mem, lpcName, 4, "rw")) {
-                Mem.writeUint32(lpcName, cchName);
-            }
-
             const root = resolveRoot(hKey);
             if (!root) {
                 return { value: 6, stackCleanup: 16 }; // ERROR_INVALID_HANDLE

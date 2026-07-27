@@ -19,6 +19,7 @@ interface DirectDraw2Deps {
     commonQueryInterface: (thisPtr: number, riidPtr: number, ppvObject: number, mem: Uint8Array) => number;
     internalCreateSurface: (...a: any[]) => any;
     enumDisplayModesImpl: (...a: any[]) => any;
+    enumSurfacesImpl: (...a: any[]) => any;
 }
 
 export function registerDirectDraw2Exports(
@@ -26,7 +27,7 @@ export function registerDirectDraw2Exports(
     context: DDrawContext,
     deps: DirectDraw2Deps,
 ): void {
-    const { commonQueryInterface, internalCreateSurface, enumDisplayModesImpl } = deps;
+    const { commonQueryInterface, internalCreateSurface, enumDisplayModesImpl, enumSurfacesImpl } = deps;
     // ===== IDirectDraw2 methods =====
     // IDirectDraw2 = IDirectDraw + GetAvailableVidMem (24 methods total)
     // Must have its own vtable — IDirectDraw vtable has 23 slots,
@@ -50,6 +51,11 @@ export function registerDirectDraw2Exports(
 
     exports["IDirectDraw2_EnumDisplayModes"] = (ctx, mem, args) => {
         return enumDisplayModesImpl(ctx, mem, args, true);
+    };
+
+    // v1/v2 hand the callback a DDSURFACEDESC (108 bytes); only v4/v7 use DDSURFACEDESC2.
+    exports["IDirectDraw2_EnumSurfaces"] = (ctx, mem, args) => {
+        return enumSurfacesImpl(ctx, mem, args, true);
     };
 
     exports["IDirectDraw2_SetDisplayMode"] = (ctx, mem, args) => {

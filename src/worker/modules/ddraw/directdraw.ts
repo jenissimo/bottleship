@@ -87,6 +87,7 @@ import { bytesToGuid, surfaceAt } from "./helpers";
 import { resolveDDrawTearOff } from "./com-tearoff";
 import { isValidAddress, isSafeSurfaceAddress, overlapsThunkCode } from "../../core/memory/address-guard";
 import { computePitch, normalizeSurfaceDesc, readSurfaceDesc, readSurfaceDescV1, writeDisplayModeDesc, writeDisplayModeDescV1, writeSurfaceDesc, writeSurfaceDescV1 } from "./structs";
+import { rasterStatusAt } from "./raster-status";
 import { DirectDrawSurfaceObject, DirectDrawSurfaceState, DirectDrawPaletteObject } from "./com-objects";
 import { createGPUTexture, convertRGBAToSurface } from "./gpu-texture-utils";
 import { setAuthorityCpu, setAuthorityGpu, syncActiveGdiContext } from "./surface-sync";
@@ -1256,14 +1257,12 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         });
     };
 
-    exports["IDirectDraw_DuplicateSurface"] = () => DD_OK;
-
     exports["IDirectDraw_EnumDisplayModes"] = (ctx, mem, args) => {
         return enumDisplayModesImpl(ctx, mem, args, true);
     };
 
     exports["IDirectDraw_EnumSurfaces"] = (ctx, mem, args) => {
-        return exports["IDirectDraw7_EnumSurfaces"]?.(ctx, mem, args) ?? DD_OK;
+        return enumSurfacesImpl(ctx, mem, args, true);
     };
 
     exports["IDirectDraw_GetCaps"] = (ctx, mem, args) => {
@@ -1274,10 +1273,11 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         return exports["IDirectDraw7_GetDisplayMode"]?.(ctx, mem, args) ?? DD_OK;
     };
 
-    exports["IDirectDraw_GetFourCCCodes"] = () => DD_OK;
-    exports["IDirectDraw_GetMonitorFrequency"] = () => DD_OK;
-    exports["IDirectDraw_GetScanLine"] = () => DD_OK;
-    exports["IDirectDraw_GetVerticalBlankStatus"] = () => DD_OK;
+    // GetFourCCCodes / GetMonitorFrequency / GetScanLine / GetVerticalBlankStatus /
+    // DuplicateSurface are NOT overridden here: v1 takes exactly the v7 parameters, so
+    // the delegation loop below routes them to the single v7 implementation. Overriding
+    // them with `() => DD_OK` left the out-parameters holding stack garbage — a caller
+    // spinning on GetVerticalBlankStatus then never sees the flag change.
     exports["IDirectDraw_Initialize"] = () => DD_OK;
 
     exports["IDirectDraw_RestoreDisplayMode"] = (ctx, mem, args) => {
@@ -1808,7 +1808,9 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
     // ========================================================================
     // IDirectDraw7::EnumSurfaces
     // ========================================================================
-    exports["IDirectDraw7_EnumSurfaces"] = (ctx, mem, args) => {
+    // useV1Desc=true for IDirectDraw/IDirectDraw2 (callback receives DDSURFACEDESC,
+    // 108 bytes), false for IDirectDraw4/IDirectDraw7 (DDSURFACEDESC2, 124 bytes).
+    const enumSurfacesImpl = (ctx: any, mem: Uint8Array, args: number[], useV1Desc: boolean) => {
         const thisPtr = args[0];
         const dwFlags = args[1];
         const lpDDSD2 = args[2];
@@ -1893,14 +1895,14 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
                 if (index >= matchingSurfaces.length) return;
                 const { address: surfAddr, state } = matchingSurfaces[index++];
 
-                // Allocate and fill a DDSURFACEDESC2 for this surface
-                const descAddr = context.process.memory.alloc(DDSURFACEDESC2_SIZE);
+                const descSize = useV1Desc ? DDSURFACEDESC_SIZE : DDSURFACEDESC2_SIZE;
+                const descAddr = context.process.memory.alloc(descSize);
                 allocatedMemory.push(descAddr);
-                mem.fill(0, descAddr, descAddr + DDSURFACEDESC2_SIZE);
-                view.setUint32(descAddr, DDSURFACEDESC2_SIZE, true); // dwSize
+                mem.fill(0, descAddr, descAddr + descSize);
+                view.setUint32(descAddr, descSize, true); // dwSize
 
                 const surfDesc: import("./structs").SurfaceDesc = {
-                    size: DDSURFACEDESC2_SIZE,
+                    size: descSize,
                     flags: DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT | DDSD_PITCH | DDSD_PIXELFORMAT,
                     width: state.width,
                     height: state.height,
@@ -1911,7 +1913,8 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
                     surfacePtr: state.surfacePtr,
                     pixelFormat: state.format,
                 };
-                writeSurfaceDesc(mem, descAddr, surfDesc);
+                if (useV1Desc) writeSurfaceDescV1(mem, descAddr, surfDesc);
+                else writeSurfaceDesc(mem, descAddr, surfDesc);
 
                 // NOTE: Not calling AddRef here — many games don't
                 // Release the surface in their EnumSurfaces callback, so AddRef would leak refs.
@@ -1997,6 +2000,8 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
             stackCleanup: STACK_CLEANUP_ENUMSURFACES
         };
     };
+
+    exports["IDirectDraw7_EnumSurfaces"] = (ctx, mem, args) => enumSurfacesImpl(ctx, mem, args, false);
 
     exports["IDirectDraw7_GetDisplayMode"] = (ctx, mem, args) => {
         const thisPtr = args[0];
@@ -2266,14 +2271,12 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         const lpdwScanLine = args[1];
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         if (lpdwScanLine && isValidAddress(mem, lpdwScanLine, 4)) {
-            // Synthetic scanline based on wall-clock position within frame.
-            // Games that poll scanline for timing get a reasonable progression.
-            const height = context.display.height || 480;
-            const frameDurationMs = 16.67; // ~60Hz
-            const now = performance.now();
-            const posInFrame = (now % frameDurationMs) / frameDurationMs;
-            const scanline = Math.floor(posInFrame * height);
-            view.setUint32(lpdwScanLine, scanline, true);
+            const status = rasterStatusAt(
+                performance.now(),
+                context.display.height,
+                context.display.refresh || 60,
+            );
+            view.setUint32(lpdwScanLine, status.scanLine, true);
         }
         const now = performance.now();
         scanlineCount += 1;
@@ -2293,13 +2296,12 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         const lpbIsInVB = args[1];
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         if (lpbIsInVB && isValidAddress(mem, lpbIsInVB, 4)) {
-            // Emulate VBlank with alternating status to prevent infinite loops
-            // 60 FPS = 16.67ms per frame, VBlank typically lasts ~2ms
-            const frameTime = 16.67; // 60 FPS = 16.67ms per frame
-            const vblankDuration = 2; // ~2ms VBlank duration
-            const now = performance.now();
-            const inVBlank = (now % frameTime) < vblankDuration;
-            view.setUint32(lpbIsInVB, inVBlank ? 1 : 0, true);
+            const status = rasterStatusAt(
+                performance.now(),
+                context.display.height,
+                context.display.refresh || 60,
+            );
+            view.setUint32(lpbIsInVB, status.inVBlank ? 1 : 0, true);
         }
         const now = performance.now();
         vblankStatusCount += 1;
@@ -2366,6 +2368,6 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         }
     }
 
-    registerDirectDraw2Exports(exports, context, { commonQueryInterface, internalCreateSurface, enumDisplayModesImpl });
+    registerDirectDraw2Exports(exports, context, { commonQueryInterface, internalCreateSurface, enumDisplayModesImpl, enumSurfacesImpl });
     return exports;
 };

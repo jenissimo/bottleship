@@ -12,6 +12,8 @@ import { devices, getVTables, createComObject, resourceToDevice } from './shared
 import {
     textureMeta,
     surfaceMeta,
+    vertexBufferMeta,
+    indexBufferMeta,
     computeMipLevelCount,
     getTextureLevelDims,
     ensureTextureLevelSurface,
@@ -39,6 +41,9 @@ const D3DPOOL_DEFAULT = 0;
 const D3DPOOL_SYSTEMMEM = 2;
 const D3DMULTISAMPLE_NONE = 0;
 const D3DUSAGE_DEPTHSTENCIL = 0x00000002;
+const D3DRTYPE_VERTEXBUFFER = 6;
+const D3DRTYPE_INDEXBUFFER = 7;
+const D3DFMT_VERTEXDATA = 100;
 
 function writeSurfaceDesc(pDesc: number, meta: SurfaceMeta): boolean {
     return (
@@ -110,10 +115,31 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
             return D3DERR_INVALIDCALL;
         }
         resourceToDevice.set(vbPtr, device);
+        vertexBufferMeta.set(vbPtr, {
+            size: Length >>> 0,
+            usage: Usage >>> 0,
+            pool: Pool >>> 0,
+            fvf: FVF >>> 0,
+        });
 
         Mem.writeUint32(ppVertexBuffer, vbPtr);
 
         return D3D_OK;
+    };
+
+    // GetDesc(pDesc) — D3DVERTEXBUFFER_DESC {Format, Type, Usage, Pool, Size, FVF}.
+    exports['IDirect3DVertexBuffer9_GetDesc'] = (_ctx, _mem, args) => {
+        const meta = vertexBufferMeta.get(args[0] >>> 0);
+        const pDesc = args[1];
+        if (!meta || !pDesc) return D3DERR_INVALIDCALL;
+        const ok =
+            Mem.writeUint32(pDesc + 0, D3DFMT_VERTEXDATA) &&
+            Mem.writeUint32(pDesc + 4, D3DRTYPE_VERTEXBUFFER) &&
+            Mem.writeUint32(pDesc + 8, meta.usage) &&
+            Mem.writeUint32(pDesc + 12, meta.pool) &&
+            Mem.writeUint32(pDesc + 16, meta.size) &&
+            Mem.writeUint32(pDesc + 20, meta.fvf ?? 0);
+        return ok ? D3D_OK : D3DERR_INVALIDCALL;
     };
 
     exports['IDirect3DDevice9_CreateIndexBuffer'] = (ctx, mem, args) => {
@@ -149,10 +175,31 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
             return D3DERR_INVALIDCALL;
         }
         resourceToDevice.set(ibPtr, device);
+        indexBufferMeta.set(ibPtr, {
+            size: Length >>> 0,
+            usage: Usage >>> 0,
+            pool: Pool >>> 0,
+            format: Format >>> 0,
+        });
 
         Mem.writeUint32(ppIndexBuffer, ibPtr);
 
         return D3D_OK;
+    };
+
+    // GetDesc(pDesc) — D3DINDEXBUFFER_DESC {Format, Type, Usage, Pool, Size}: as
+    // D3DVERTEXBUFFER_DESC without the trailing FVF.
+    exports['IDirect3DIndexBuffer9_GetDesc'] = (_ctx, _mem, args) => {
+        const meta = indexBufferMeta.get(args[0] >>> 0);
+        const pDesc = args[1];
+        if (!meta || !pDesc) return D3DERR_INVALIDCALL;
+        const ok =
+            Mem.writeUint32(pDesc + 0, meta.format ?? 0) &&
+            Mem.writeUint32(pDesc + 4, D3DRTYPE_INDEXBUFFER) &&
+            Mem.writeUint32(pDesc + 8, meta.usage) &&
+            Mem.writeUint32(pDesc + 12, meta.pool) &&
+            Mem.writeUint32(pDesc + 16, meta.size);
+        return ok ? D3D_OK : D3DERR_INVALIDCALL;
     };
 
     exports['IDirect3DDevice9_CreateTexture'] = (ctx, mem, args) => {
