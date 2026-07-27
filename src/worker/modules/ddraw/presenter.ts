@@ -295,12 +295,10 @@ export class DDrawPresenter implements RenderActive {
 
             // Exclusive-fullscreen screen ownership (real Windows): in DDSCL_EXCLUSIVE|
             // FULLSCREEN, DirectDraw owns the screen and GDI windows are NOT visible —
-            // EXCEPT live native modal dialogs shown over the game (TS "Select Campaign",
-            // BOD Setup), which real Windows composites over the primary. Only their rects
-            // are composited (not the whole overlay), so stale pre-dialog/menu GDI cannot
-            // cover the game. See getOverlayCompositePlan: this is intentionally NOT gated
-            // on gdiSurfaceVisible (a single-buffered primary never Flips, so that flag
-            // sticks `true` after FlipToGDISurface and used to leave a ghost over video).
+            // EXCEPT live native modal dialogs over a primary GDI still paints into
+            // (TS "Select Campaign", BOD Setup). Only their rects are composited, never
+            // the whole overlay, so stale pre-dialog/menu GDI cannot cover the game.
+            // getOverlayCompositePlan owns the decision (see dialogOverlayComposites).
             const plan = getOverlayCompositePlan(this);
             const dialogRects = plan.mode === 'rects' ? plan.rects : null;
             const overlay = plan.mode === 'none' ? null : system.gdiContext.getOverlayCanvas();
