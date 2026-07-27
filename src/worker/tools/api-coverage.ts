@@ -32,6 +32,7 @@ import { SignatureValidator } from './signature-validator';
 import { SILENT_STUBS } from '../core/diagnostics/api-census';
 import { REFERENCE_ARG_COUNTS } from '../reference-argcounts.generated';
 import { resolveThunkedDllAlias } from '../core/dll-aliases';
+import { EMU_NATIVE_VIDEO_DLLS, VIDEO_DLL_NAMES } from '../core/cpu/emulator-config';
 import { deriveStackCleanupFromMangledName } from '../core/thunking/msvc-mangling';
 
 /**
@@ -75,6 +76,12 @@ interface ImplRecord {
     file: string;
     line: number;
 }
+
+/**
+ * Mirrors PELoader.DLL_FORCE_STUB — DLLs stubbed even when the bundle ships a real one.
+ * Kept in sync by name; the loader's copy is private.
+ */
+const FORCE_STUB_DLLS = new Set(['ifc20', 'ifc21', 'ifc22', 'mscoree']);
 
 function toPosix(p: string): string {
     return p.replace(/\\/g, '/');
@@ -329,6 +336,23 @@ export class ApiCoverageIndex {
     /** True when this DLL is intercepted by an HLE module (the PE loader "THUNKED" path). */
     isThunked(dllName: string): boolean {
         return this.modules.has(this.canonicalModule(dllName));
+    }
+
+    /**
+     * DLLs the loader refuses to map natively NO MATTER WHAT the bundle ships — the HLE
+     * module always wins. Distinct from the coverage-based fallback: `loadDll` returns
+     * null for these before any import is examined, so a shipped copy is dead weight.
+     *   - VIDEO_DLL_NAMES while EMU_NATIVE_VIDEO_DLLS is false (smackw32, binkw32)
+     *   - every versioned d3dx9 redist
+     *   - DLL_FORCE_STUB (ifc2x force-feedback, mscoree)
+     * Missing this reads a shipped smackw32.dll as "the guest's own decoder runs", which
+     * points a video bug at exactly the wrong layer.
+     */
+    isAlwaysHle(dllName: string): boolean {
+        const base = this.canonicalModule(dllName);
+        if (!EMU_NATIVE_VIDEO_DLLS && VIDEO_DLL_NAMES.has(base)) return true;
+        if (base === 'd3dx9') return true;
+        return FORCE_STUB_DLLS.has(base);
     }
 
     getModule(dllName: string): ModuleCoverage | undefined {

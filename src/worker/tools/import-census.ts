@@ -216,8 +216,9 @@ function classify(
         // A thunked module that does not name this export cannot generate a stub for it.
         // The loader's own escape hatch is per-DLL, not per-export: when the bundle ships
         // the real file it abandons the HLE module for the whole DLL and loads it natively
-        // (how a side-by-side msvcr90 gets used). Anything else must be synthesized.
-        if (ship) return { status: 'guest-dll' };
+        // (how a side-by-side msvcr90 gets used). Anything else must be synthesized —
+        // and for the always-HLE set there is no escape hatch at all.
+        if (ship && !index.isAlwaysHle(ref.dll)) return { status: 'guest-dll' };
         return unresolved();
     }
 

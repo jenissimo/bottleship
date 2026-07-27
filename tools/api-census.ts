@@ -256,6 +256,8 @@ async function censusBundle(bundlePath: string, index: ApiCoverageIndex, opts: O
         const shadowed = new Set<string>();
         for (const [, pe] of perPe) {
             if (pe.isEntry || !index.isThunked(pe.name) || shadowed.has(pe.name)) continue;
+            // No coverage test for the always-HLE set: loadDll refuses these outright.
+            if (index.isAlwaysHle(pe.name)) { shadowed.add(pe.name); continue; }
             const canonical = index.canonicalModule(pe.name);
             let fullyCovered = true;
             outer: for (const other of perPe.values()) {
