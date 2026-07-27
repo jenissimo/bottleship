@@ -59,12 +59,7 @@ import {
     E_POINTER,
     HIGH_MEMORY_COM_AREA,
     DDPF_ALPHAPIXELS,
-    IID_IDirect3D,
-    IID_IDirect3D2,
-    IID_IDirect3D3,
-    IID_IDirect3D7,
     IID_IDirectDraw,
-    IID_IDirectDraw2,
     IID_IDirectDraw4,
     IID_IDirectDraw7,
     IID_IDirectDrawClipper,
@@ -89,6 +84,7 @@ import {
     DDSCL_FULLSCREEN,
 } from "./constants";
 import { bytesToGuid, surfaceAt } from "./helpers";
+import { resolveDDrawTearOff } from "./com-tearoff";
 import { isValidAddress, isSafeSurfaceAddress, overlapsThunkCode } from "../../core/memory/address-guard";
 import { computePitch, normalizeSurfaceDesc, readSurfaceDesc, readSurfaceDescV1, writeDisplayModeDesc, writeDisplayModeDescV1, writeSurfaceDesc, writeSurfaceDescV1 } from "./structs";
 import { DirectDrawSurfaceObject, DirectDrawSurfaceState, DirectDrawPaletteObject } from "./com-objects";
@@ -284,68 +280,13 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         const iidStr = bytesToGuid(mem.slice(riidPtr, riidPtr + 16));
         const iidNorm = iidStr.replace(/[{}]/g, "").toLowerCase();
 
-        // Mapping DDraw versions (tear-off)
-        // Each version MUST have its own vtable — method counts differ!
-        // IDirectDraw=23 methods, IDirectDraw2=24, IDirectDraw4=25, IDirectDraw7=27
-        // Using wrong vtable causes OOB reads when game calls version-specific methods
-        const interfaceMap: Record<string, string> = {
-            [IID_IDirectDraw2.toLowerCase()]: "IDirectDraw2",
-            [IID_IDirectDraw4.toLowerCase()]: "IDirectDraw4",
-            [IID_IDirectDraw7.toLowerCase()]: "IDirectDraw7",
-        };
-
-        if (interfaceMap[iidNorm]) {
-            const vtable = getVTable(interfaceMap[iidNorm]);
-            if (!vtable) return E_NOINTERFACE;
-            const addr = allocateComObject(context.process.memory, mem, vtable);
-            new DataView(mem.buffer, mem.byteOffset).setUint32(ppvObject, addr, true);
-            context.resourceProvider.mapAddressToHandle(addr, obj.handle);
-            obj.addRef();
-            return DD_OK;
-        }
-
-        // Check D3D Interfaces (Common logic via helper)
-        const d3dResult = queryD3DInterface(iidNorm, ppvObject, mem);
-        if (d3dResult !== null) return d3dResult;
+        // Every DirectDraw generation and the Direct3D interface of that generation live on
+        // this one object; each needs its own vtable (method counts differ: IDirectDraw=23,
+        // IDirectDraw2=24, IDirectDraw4=25, IDirectDraw7=27) but the same identity.
+        const tearOff = resolveDDrawTearOff(context, obj, iidNorm, ppvObject, mem);
+        if (tearOff !== null) return tearOff;
 
         return obj.queryInterface(iidStr, ppvObject, mem);
-    };
-
-    // Helper function to handle common D3D interface queries (DRY principle)
-    // Returns DD_OK if handled, null if not a D3D interface
-    const queryD3DInterface = (
-        iidNormalized: string,
-        ppvObject: number,
-        mem: Uint8Array
-    ): number | null => {
-        const d3dInterfaces: Record<string, string> = {
-            [IID_IDirect3D.toLowerCase()]: "IDirect3D",
-            [IID_IDirect3D2.toLowerCase()]: "IDirect3D2",
-            [IID_IDirect3D3.toLowerCase()]: "IDirect3D3",
-            [IID_IDirect3D7.toLowerCase()]: "IDirect3D7",
-        };
-
-        if (d3dInterfaces[iidNormalized]) {
-            const name = d3dInterfaces[iidNormalized];
-            const vtableAddr = (context.vtables as any)[name]?.address;
-
-            if (!vtableAddr) {
-                Logger.warn(LogCategory.SYSTEM, `QueryInterface: requested ${name} but vtable not found`);
-                return E_NOINTERFACE;
-            }
-
-            const d3dObj = ComObjectFactory.create(iidNormalized, vtableAddr);
-            if (!d3dObj) return E_FAIL;
-
-            const objAddr = allocateComObject(context.process.memory, mem, vtableAddr);
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            view.setUint32(ppvObject, objAddr, true);
-            context.resourceProvider.mapAddressToHandle(objAddr, d3dObj.handle);
-
-            Logger.log(LogCategory.SYSTEM, `QueryInterface -> Created ${name} at 0x${objAddr.toString(16)} (handle=0x${d3dObj.handle.toString(16)})`);
-            return DD_OK;
-        }
-        return null;
     };
 
     // --- Unified surface creation (v1-v7) ---

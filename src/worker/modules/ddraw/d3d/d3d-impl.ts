@@ -6,6 +6,7 @@ import { ComObjectFactory } from "../../../core/com/base-com-object";
 import { Marshaler } from "../../../core/memory/marshaler";
 import { DDrawContext } from "../context";
 import { bytesToGuid } from "../helpers";
+import { resolveDDrawTearOff } from "../com-tearoff";
 import {
     IID_IDirect3DDevice3,
     IID_IDirect3DDevice3V5,
@@ -42,20 +43,34 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
     const exports: D3DExports = {};
     const resourceProvider = context.resourceProvider;
 
-    // --- IDirect3D (v1) ---
-
-    exports["IDirect3D_QueryInterface"] = (ctx, mem, args) => {
+    /**
+     * IDirect3D* is an interface ON the DirectDraw object, so it must resolve the whole
+     * DirectDraw/Direct3D family — notably back to IDirectDraw7, which is how a DX7 app
+     * recovers the DirectDraw it needs to create texture surfaces (GetDirect3D, QI, Release).
+     */
+    const d3dQueryInterface = (iface: string, mem: Uint8Array, args: number[]): number => {
         const thisPtr = args[0];
         const riidPtr = args[1];
         const ppvObject = args[2];
+
         const obj = resourceProvider.getComObjectByAddress(thisPtr);
         const iidBytes = new Uint8Array(16);
         for (let i = 0; i < 16; i++) iidBytes[i] = mem[riidPtr + i];
         const iidStr = bytesToGuid(iidBytes);
-        Logger.log(LogCategory.COM, `IDirect3D_QueryInterface: this=0x${thisPtr.toString(16)} iid=${iidStr}`);
+
+        Logger.log(LogCategory.COM, `${iface}_QueryInterface: this=0x${thisPtr.toString(16)} iid=${iidStr} obj=${obj ? obj.constructor.name : "null"}`);
         if (!obj) return 0x80004002;
+        if (!ppvObject) return 0x80004003;
+
+        const tearOff = resolveDDrawTearOff(context, obj, iidStr.replace(/[{}]/g, "").toLowerCase(), ppvObject, mem);
+        if (tearOff !== null) return tearOff;
+
         return obj.queryInterface(iidStr, ppvObject, mem);
     };
+
+    // --- IDirect3D (v1) ---
+
+    exports["IDirect3D_QueryInterface"] = (ctx, mem, args) => d3dQueryInterface("IDirect3D", mem, args);
 
     exports["IDirect3D_AddRef"] = (ctx, mem, args) => {
         const obj = resourceProvider.getComObjectByAddress(args[0]);
@@ -89,18 +104,7 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
 
     // --- IDirect3D2 ---
 
-    exports["IDirect3D2_QueryInterface"] = (ctx, mem, args) => {
-        const thisPtr = args[0];
-        const riidPtr = args[1];
-        const ppvObject = args[2];
-        const obj = resourceProvider.getComObjectByAddress(thisPtr);
-        const iidBytes = new Uint8Array(16);
-        for (let i = 0; i < 16; i++) iidBytes[i] = mem[riidPtr + i];
-        const iidStr = bytesToGuid(iidBytes);
-        Logger.log(LogCategory.COM, `IDirect3D2_QueryInterface: this=0x${thisPtr.toString(16)} iid=${iidStr}`);
-        if (!obj) return 0x80004002;
-        return obj.queryInterface(iidStr, ppvObject, mem);
-    };
+    exports["IDirect3D2_QueryInterface"] = (ctx, mem, args) => d3dQueryInterface("IDirect3D2", mem, args);
 
     exports["IDirect3D2_AddRef"] = (ctx, mem, args) => {
         const obj = resourceProvider.getComObjectByAddress(args[0]);
@@ -166,34 +170,7 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
 
     // --- IDirect3D3 ---
 
-    exports["IDirect3D3_QueryInterface"] = (ctx, mem, args) => {
-        const thisPtr = args[0];
-        const riidPtr = args[1];
-        const ppvObject = args[2];
-
-        const obj = resourceProvider.getComObjectByAddress(thisPtr);
-
-        const iidBytes = new Uint8Array(16);
-        for (let i = 0; i < 16; i++) {
-            iidBytes[i] = mem[riidPtr + i];
-        }
-        const iidStr = bytesToGuid(iidBytes);
-
-        Logger.log(LogCategory.COM, `IDirect3D3_QueryInterface: this=0x${thisPtr.toString(16)} iid=${iidStr} ppvObject=0x${ppvObject.toString(16)} obj=${obj ? obj.constructor.name : 'null'}`);
-
-        if (!obj) {
-            Logger.warn(LogCategory.COM, `IDirect3D3_QueryInterface: Object not found for thisPtr=0x${thisPtr.toString(16)}`);
-            return 0x80004002;
-        }
-
-        const result = obj.queryInterface(iidStr, ppvObject, mem);
-        if (ppvObject) {
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            const returnedAddr = view.getUint32(ppvObject, true);
-            Logger.log(LogCategory.COM, `IDirect3D3_QueryInterface: result=0x${result.toString(16)} returnedAddr=0x${returnedAddr.toString(16)}`);
-        }
-        return result;
-    };
+    exports["IDirect3D3_QueryInterface"] = (ctx, mem, args) => d3dQueryInterface("IDirect3D3", mem, args);
 
     exports["IDirect3D3_AddRef"] = (ctx, mem, args) => {
         const obj = resourceProvider.getComObjectByAddress(args[0]);
@@ -702,34 +679,7 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
 
     // --- IDirect3D7 ---
 
-    exports["IDirect3D7_QueryInterface"] = (ctx, mem, args) => {
-        const thisPtr = args[0];
-        const riidPtr = args[1];
-        const ppvObject = args[2];
-
-        const obj = resourceProvider.getComObjectByAddress(thisPtr);
-
-        const iidBytes = new Uint8Array(16);
-        for (let i = 0; i < 16; i++) {
-            iidBytes[i] = mem[riidPtr + i];
-        }
-        const iidStr = bytesToGuid(iidBytes);
-
-        Logger.log(LogCategory.COM, `IDirect3D7_QueryInterface: this=0x${thisPtr.toString(16)} iid=${iidStr} ppvObject=0x${ppvObject.toString(16)} obj=${obj ? obj.constructor.name : 'null'}`);
-
-        if (!obj) {
-            Logger.warn(LogCategory.COM, `IDirect3D7_QueryInterface: Object not found for thisPtr=0x${thisPtr.toString(16)}`);
-            return 0x80004002;
-        }
-
-        const result = obj.queryInterface(iidStr, ppvObject, mem);
-        if (ppvObject) {
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            const returnedAddr = view.getUint32(ppvObject, true);
-            Logger.log(LogCategory.COM, `IDirect3D7_QueryInterface: result=0x${result.toString(16)} returnedAddr=0x${returnedAddr.toString(16)}`);
-        }
-        return result;
-    };
+    exports["IDirect3D7_QueryInterface"] = (ctx, mem, args) => d3dQueryInterface("IDirect3D7", mem, args);
 
     exports["IDirect3D7_AddRef"] = (ctx, mem, args) => {
         const obj = resourceProvider.getComObjectByAddress(args[0]);
