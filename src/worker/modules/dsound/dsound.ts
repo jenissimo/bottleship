@@ -15,6 +15,8 @@ import {
     getCtrl,
     CTRL_PLAY_CURSOR,
     CTRL_WRITE_CURSOR,
+    CTRL_SAMPLE_RATE,
+    CTRL_BLOCK_ALIGN,
     CTRL_STATE,
     CTRL_LOOP_MODE,
     CTRL_VOLUME,

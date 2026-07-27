@@ -120,4 +120,86 @@ export function registerAudioCommands(svc: HarnessService): void {
         const ds: any = getModule("dsound");
         return ds?.getAudioDebugState?.() ?? { error: "no dsound module" };
     });
+
+    /** audioSignal({reset?}) — "is there sound?" answered end-to-end, without ears.
+     *
+     *  Cursors advancing prove the pump runs; they do NOT prove anything is audible.
+     *  Three things have to hold and each is a different bug: the ring must CARRY
+     *  signal (ringPeak — PCM amplitude the guest actually wrote), the mixer must
+     *  SELECT the buffer (worklet.activeRing — a source whose ctrl block fails the
+     *  worklet's format sanity is skipped outright), and the mix must REACH the
+     *  output (worklet.peakMilli). Silence with ringPeak>0 and activeRing=0 is a
+     *  ctrl-block/format bug; ringPeak=0 is a guest/decode bug; both non-zero with
+     *  peakMilli=0 is gain (volume/pan/3D).
+     *
+     *  ctrl is the raw SAB control block decoded — the format fields the worklet
+     *  actually reads, not the worker's private SoundBuffer.format copy. The two
+     *  disagreeing IS the failure mode this verb exists to catch. */
+    svc.register("audioSignal", async (args) => {
+        const opts = (args[0] ?? {}) as { reset?: boolean };
+        const ds: any = getModule("dsound");
+
+        const statsSab = (globalThis as any).__audioStatsSab as SharedArrayBuffer | undefined;
+        let worklet: Record<string, number> | null = null;
+        if (statsSab) {
+            const s = new Int32Array(statsSab, 0, 16);
+            worklet = {
+                proc: Atomics.load(s, 0), frames: Atomics.load(s, 1),
+                activeRing: Atomics.load(s, 2), activeLegacy: Atomics.load(s, 10),
+                clip: Atomics.load(s, 3), limited: Atomics.load(s, 4),
+                peakMilli: Atomics.load(s, 5),
+                disc: Atomics.load(s, 6), maxJumpMilli: Atomics.load(s, 7),
+                underrunMid: Atomics.load(s, 8), starvedBlocks: Atomics.load(s, 9),
+            };
+            if (opts.reset) Atomics.store(s, 15, 1);
+        }
+
+        const CTRL_BLOCK_BYTES = 128;
+        const NAMES: Record<number, string> = {
+            0: "playCursor", 1: "writeCursor", 2: "bufferBytes", 3: "channels",
+            4: "sampleRate", 5: "bitsPerSample", 6: "blockAlign", 7: "state",
+            8: "loopMode", 9: "volumeCb", 10: "pan", 11: "frequency",
+            12: "dataLength", 13: "stopRequested", 14: "flags", 15: "reserved",
+            24: "d3Mode", 31: "d3Flags",
+        };
+
+        const buffers: unknown[] = [];
+        const seen = new Set<unknown>();
+        for (const obj of (ds?.objects?.values?.() ?? [])) {
+            const buf: any = (obj as any)?.buffer;
+            if (!buf?.sab || seen.has(buf.id)) continue;
+            seen.add(buf.id);
+            const ctrlArr = new Int32Array(buf.sab, 0, 32);
+            const ctrl: Record<string, number> = {};
+            for (const [idx, name] of Object.entries(NAMES)) ctrl[name] = Atomics.load(ctrlArr, Number(idx));
+
+            // Peak |sample| over the ring's PCM, subsampled. Reads the SAB data region
+            // exactly as the worklet does, so a silent ring is distinguishable from a
+            // ring the mixer merely refuses to play.
+            const bits = ctrl.bitsPerSample || buf.format?.bitsPerSample || 16;
+            const view = new DataView(buf.sab, CTRL_BLOCK_BYTES);
+            const step = Math.max(1, Math.floor(view.byteLength / (4096 * (bits >> 3))) * (bits >> 3));
+            let peak = 0;
+            for (let o = 0; o + 4 <= view.byteLength; o += step) {
+                const s = bits === 8 ? (view.getUint8(o) - 128) / 128
+                    : bits === 32 ? view.getFloat32(o, true)
+                        : view.getInt16(o, true) / 32768;
+                const a = Math.abs(s);
+                if (a > peak) peak = a;
+            }
+
+            buffers.push({
+                id: buf.id, bytes: buf.bytes, isPlaying: !!buf.isPlaying, isLooping: !!buf.isLooping,
+                streamed: !!buf.streamed, has3D: !!buf.has3D,
+                fmt: buf.format ? {
+                    channels: buf.format.channels, sampleRate: buf.format.sampleRate,
+                    bitsPerSample: buf.format.bitsPerSample, blockAlign: buf.format.blockAlign,
+                } : null,
+                ctrl,
+                ringPeak: Math.round(peak * 1000) / 1000,
+            });
+        }
+
+        return { worklet, buffers };
+    });
 }
