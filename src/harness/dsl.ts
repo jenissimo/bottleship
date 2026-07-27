@@ -122,6 +122,9 @@ export class HarnessChain {
     backtrace(esp?: number): this { return this.push("backtrace", [esp]); }
     /** Deduplicated registry of UNIMPLEMENTED thunks the guest called (id + count + caller). Firehose-immune stub finder. */
     stubs(): this { return this.push("stubs", []); }
+    /** Runtime API coverage: GetProcAddress resolutions (and what each ACTUALLY resolved to),
+     *  COM/vtable calls, silent stubs — the half `bun tools/api-census.ts` cannot see statically. */
+    apiCoverage(limit?: number): this { return this.push("apiCoverage", [limit]); }
     /** One-shot incident report: cpu + backtrace + last thunks + stubs + faults + threads. The go-to for ANY anomaly (freeze/crash/exit/black frame). */
     report(esp?: number): this { return this.push("report", [esp]); }
     /** Recent guest page faults (EIP / fault addr / thread / last thunk / regs). */

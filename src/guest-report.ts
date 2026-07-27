@@ -36,8 +36,12 @@ export interface CrashFault {
   }>;
   silentStubs?: Array<{ api: string; count: number; arity?: number; lastCaller: number | string; lastCallerSym: string | null }>;
   recentGetProc?: Array<{
-    module: string; proc: string; addr: string | null;
+    module: string; proc: string; addr: string | null; kind?: string;
     caller: string; callerSym: string | null;
+  }>;
+  getProcStubbed?: Array<{
+    module: string; proc: string; kind: string; count: number;
+    lastCaller: number | string; lastCallerSym: string | null;
   }>;
   faults?: Array<{ eip: string; faultAddr: string; lastThunk: string; threadId: number | null }>;
   cxxExceptions?: Array<{ seq: number; threadId: number; type: string; thrown: string; throwModule: string; rethrow: boolean; outcome: string; caughtBy: string }>;
@@ -196,7 +200,12 @@ export function formatGuestReport(f: CrashFault, gameName: string, crashed: bool
   if (f.recentGetProc?.length) {
     lines.push(``, `recent GetProcAddress (${f.recentGetProc.length}, newest last):`,
       ...f.recentGetProc.map((h) =>
-        `  ${h.module}:"${h.proc}" → ${h.addr ?? "NULL"}  caller=${h.caller}${h.callerSym ? ` ${h.callerSym}` : ""}`));
+        `  ${h.module}:"${h.proc}" → ${h.addr ?? "NULL"}${h.kind ? ` [${h.kind}]` : ""}  caller=${h.caller}${h.callerSym ? ` ${h.callerSym}` : ""}`));
+  }
+  if (f.getProcStubbed?.length) {
+    lines.push(``, `GetProcAddress resolved to a stub (${f.getProcStubbed.length}) — the guest was told these exist:`,
+      ...f.getProcStubbed.map((h) =>
+        `  ${h.module}:"${h.proc}" [${h.kind}] ×${h.count}  last@${hx(h.lastCaller)}${h.lastCallerSym ? ` ${h.lastCallerSym}` : ""}`));
   }
   if (f.silentStubs?.length) {
     lines.push(``, `suspected silent stubs (implemented but ignore args) (${f.silentStubs.length}):`,

@@ -291,6 +291,68 @@ export function registerStateCommands(svc: HarnessService): void {
     });
 
     /**
+     * apiCoverage() — the RUNTIME half of the pre-flight census, in one POJO: what this
+     * session actually reached for, and how much of it we really answered.
+     *
+     * The static census (`bun tools/api-census.ts <bundle.wgb>`) reads the import tables
+     * and says what a title links against. Two whole classes of use are invisible there
+     * and only observable here:
+     *   - GetProcAddress — a dynamic resolution appears in no import table, and legacy
+     *     titles hide their optional/versioned behaviour behind exactly that. `dynamic`
+     *     reports each distinct lookup with what the returned address LEADS to, and
+     *     `unsatisfied` is the subset the guest could not use (NULL / stub / silent).
+     *   - COM vtable slots — never imports at all. They arrive through the same thunk
+     *     dispatch as flat exports ("d3d9:IDirect3DDevice9_DrawPrimitive"), so `com`
+     *     counts them out of the call census and `missing` picks up the unimplemented
+     *     slots from the stub registry.
+     *
+     * Ranked by call count, so the output is a work order rather than a wall of names.
+     * `silent` is listed separately and first on purpose: a handler that returns success
+     * without doing the work is worse than a missing one — the guest is told it worked.
+     */
+    svc.register("apiCoverage", (args) => {
+        const limit = typeof args[0] === "number" ? Math.max(1, args[0] as number) : 25;
+        const hex = (v: number): string => "0x" + (v >>> 0).toString(16);
+
+        const called = apiCensus.list();
+        const com = called.filter((c) => c.name.includes("_"));
+        const dynamic = getProcAddressRegistry.list();
+
+        return {
+            byKind: getProcAddressRegistry.byKind(),
+            totals: {
+                apisCalled: called.length,
+                comMethodsCalled: com.length,
+                dynamicLookups: dynamic.length,
+                silentStubsCalled: apiCensus.suspectStubs().length,
+                unimplementedHit: stubRegistry.list().length,
+            },
+            /** Handlers that ran, reported success, and did nothing. Fix these first. */
+            silent: apiCensus.suspectStubs().slice(0, limit).map((s) => ({
+                api: s.name, count: s.count, arity: s.arity,
+                lastCaller: hex(s.lastCaller), lastCallerSym: symbolize(s.lastCaller),
+            })),
+            /** Called with no handler at all — includes COM vtable slots. */
+            missing: stubRegistry.list()
+                .sort((a, b) => b.count - a.count).slice(0, limit)
+                .map((s) => ({
+                    api: s.key, count: s.count,
+                    lastCaller: hex(s.lastCaller), lastCallerSym: symbolize(s.lastCaller),
+                })),
+            /** GetProcAddress results the guest cannot use, most-requested first. */
+            unsatisfied: getProcAddressRegistry.unsatisfied().slice(0, limit).map((h) => ({
+                proc: h.procName, dll: h.dll ?? hex(h.hModule), kind: h.kind, count: h.count,
+                lastCaller: hex(h.lastCaller), lastCallerSym: symbolize(h.lastCaller),
+            })),
+            /** Every distinct dynamic resolution, with what the address leads to. */
+            dynamic: dynamic.slice(0, limit).map((h) => ({
+                proc: h.procName, dll: h.dll ?? hex(h.hModule), kind: h.kind,
+                addr: hex(h.address), count: h.count,
+            })),
+        };
+    });
+
+    /**
      * apiCensus() — EVERY unique DX/COM/WinAPI method the guest has called this session
      * (deduped, hit-count + last guest caller), newest-hit first. Unlike stubs() (no
      * handler) this lists what's ACTUALLY exercised — the triage list for "where is the

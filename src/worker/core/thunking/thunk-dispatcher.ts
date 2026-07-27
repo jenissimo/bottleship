@@ -485,6 +485,22 @@ export class ThunkDispatcher {
     }
 
     /**
+     * What a thunk id will actually do when called: the handler's declared parameter
+     * count and the export's declared argument count, or null when nothing is
+     * registered (the dispatcher would answer ERROR_NOT_SUPPORTED).
+     *
+     * Lets a caller that only holds an ADDRESS — GetProcAddress handing a stub back to
+     * the guest — say whether that address leads to a real handler, to a stub, or to a
+     * handler that ignores the arguments it was given. Read-only; no dispatch effects.
+     */
+    public getImplementationInfo(functionId: number): { arity: number; argCount: number } | null {
+        const impl = this.dispatchTable[functionId];
+        if (!impl) return null;
+        const argCount = this.argCountsTable[functionId];
+        return { arity: impl.length, argCount: argCount < 0 ? -1 : argCount };
+    }
+
+    /**
      * Call this whenever emulator memory buffer might have changed (resize/init)
      */
     public updateMemoryCache(): void {

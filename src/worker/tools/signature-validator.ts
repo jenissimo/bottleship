@@ -761,7 +761,13 @@ export class SignatureValidator {
         return interfaces;
     }
 
-    private extractApiFunctions(apiFile: string, apiContent: string): Record<string, number> {
+    /**
+     * Name → argCount for everything an `*.api.ts` declares. By default this covers
+     * both `ModuleDescriptor.functions` (flat DLL exports) and `InterfaceDescriptor`
+     * methods (keyed `Iface_Method`); `modulesOnly` restricts it to the DLL exports,
+     * which is what a PE import table can actually name.
+     */
+    public extractApiFunctions(apiFile: string, apiContent: string, opts?: { modulesOnly?: boolean }): Record<string, number> {
         const apiFunctions: Record<string, number> = {};
         const sourceFile = ts.createSourceFile(apiFile, apiContent, ts.ScriptTarget.Latest, true);
 
@@ -920,7 +926,7 @@ export class SignatureValidator {
                         : null;
                 const varName = ts.isIdentifier(node.name) ? node.name.text : null;
 
-                if (typeName === 'InterfaceDescriptor') {
+                if (typeName === 'InterfaceDescriptor' && !opts?.modulesOnly) {
                     let interfaceName = varName ?? '';
                     for (const prop of node.initializer.properties) {
                         if (!ts.isPropertyAssignment(prop)) continue;

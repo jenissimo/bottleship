@@ -7,6 +7,8 @@
  * cannot help there — an HLE'd DLL is never mapped.
  */
 
+import { readPeHeaders, rvaToFileOffset, PE_DATA_DIRECTORY, type PeHeaders } from "@bottleship/formats/pe";
+
 const RT_VERSION = 16;
 
 function align4(n: number): number {
@@ -67,37 +69,11 @@ function* versionChildren(buf: Uint8Array, view: DataView, parent: VersionBlock,
     }
 }
 
-/** Map an RVA to a file offset using the PE section table. */
-function rvaToFileOffset(view: DataView, peOff: number, rva: number): number | null {
-    const numSections = view.getUint16(peOff + 6, true);
-    const optSize = view.getUint16(peOff + 20, true);
-    const secTable = peOff + 24 + optSize;
-    for (let i = 0; i < numSections; i++) {
-        const s = secTable + i * 40;
-        const vaddr = view.getUint32(s + 12, true);
-        const vsize = view.getUint32(s + 8, true);
-        const rawSize = view.getUint32(s + 16, true);
-        const rawPtr = view.getUint32(s + 20, true);
-        const span = Math.max(vsize, rawSize);
-        if (rva >= vaddr && rva < vaddr + span) {
-            const delta = rva - vaddr;
-            return delta < rawSize ? rawPtr + delta : null;
-        }
-    }
-    return null;
-}
-
 /** File offset + byte size of the first RT_VERSION resource, or null. */
-function findVersionResource(buf: Uint8Array, view: DataView): { off: number; size: number } | null {
-    if (buf.length < 0x40 || view.getUint16(0, true) !== 0x5a4d) return null;
-    const peOff = view.getUint32(0x3c, true);
-    if (peOff + 24 > buf.length || view.getUint32(peOff, true) !== 0x00004550) return null;
-
-    const magic = view.getUint16(peOff + 24, true);
-    const dirOff = peOff + 24 + (magic === 0x20b ? 112 : 96);
-    const resRva = view.getUint32(dirOff + 2 * 8, true);
+function findVersionResource(buf: Uint8Array, view: DataView, headers: PeHeaders): { off: number; size: number } | null {
+    const resRva = headers.dataDirectories[PE_DATA_DIRECTORY.RESOURCE]?.rva ?? 0;
     if (!resRva) return null;
-    const resBase = rvaToFileOffset(view, peOff, resRva);
+    const resBase = rvaToFileOffset(headers, resRva);
     if (resBase === null) return null;
 
     // Three levels: type -> name -> language. Take RT_VERSION, then the first entry at
@@ -127,7 +103,7 @@ function findVersionResource(buf: Uint8Array, view: DataView): { off: number; si
     if (dataEntry + 8 > buf.length) return null;
     const dataRva = view.getUint32(dataEntry, true);
     const size = view.getUint32(dataEntry + 4, true);
-    const off = rvaToFileOffset(view, peOff, dataRva);
+    const off = rvaToFileOffset(headers, dataRva);
     if (off === null || off + size > buf.length) return null;
     return { off, size };
 }
@@ -139,8 +115,10 @@ function findVersionResource(buf: Uint8Array, view: DataView): { off: number; si
 export function readPeVersionString(image: Uint8Array, key: string): string | null {
     let res: { off: number; size: number } | null;
     try {
+        const headers = readPeHeaders(image);
+        if (!headers) return null;
         const probe = new DataView(image.buffer, image.byteOffset, image.byteLength);
-        res = findVersionResource(image, probe);
+        res = findVersionResource(image, probe, headers);
     } catch {
         return null;
     }

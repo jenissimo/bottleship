@@ -40,8 +40,18 @@ export interface HarnessReport {
         lastCaller: string; lastCallerSym: string | null;
     }>;
     recentGetProc: Array<{
-        module: string; proc: string; addr: string | null;
+        module: string; proc: string; addr: string | null; kind: string;
         caller: string; callerSym: string | null;
+    }>;
+    /**
+     * GetProcAddress lookups that RESOLVED but to nothing usable — a stub with no
+     * handler, or a handler that ignores its arguments. Deliberately separate from
+     * `getProcMisses`: a NULL makes the guest take its fallback path, whereas one of
+     * these tells the guest it succeeded and then does nothing.
+     */
+    getProcStubbed: Array<{
+        module: string; proc: string; kind: string; count: number;
+        lastCaller: string; lastCallerSym: string | null;
     }>;
     /** `eipTrusted:false` ⇒ no instruction at `eip` addresses CR2 (the jit materializes only
      *  eip's low 12 bits) — read `cr2Candidates`/`badCall` instead of chasing that EIP. */
@@ -169,9 +179,21 @@ export function buildHarnessReport(esp?: number): HarnessReport {
             module: hx(h.hModule),
             proc: h.procName,
             addr: h.address !== 0 ? hx(h.address) : null,
+            kind: h.kind,
             caller: hx(h.caller),
             callerSym: symbolize(h.caller),
         })),
+        getProcStubbed: getProcAddressRegistry.unsatisfied()
+            .filter((h) => h.kind !== 'null')
+            .slice(0, 12)
+            .map((h) => ({
+                module: h.dll ?? hx(h.hModule),
+                proc: h.procName,
+                kind: h.kind,
+                count: h.count,
+                lastCaller: hx(h.lastCaller),
+                lastCallerSym: symbolize(h.lastCaller),
+            })),
         faults: faultRecorder.recent(8).map((f) => ({
             eip: hx(f.eip),
             eipTrusted: f.eipTrusted,

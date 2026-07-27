@@ -11,7 +11,8 @@ import { EmulatorConfig, VER_PLATFORM_WIN32_WINDOWS } from '../../../core/emulat
 import { encodeAnsi } from '../../codepage-utils';
 import { resolveThunkedDllAlias } from '../../../core/dll-aliases';
 import { THUNKED_DLL_PSEUDO_BASE } from '../../../core/hle-system-catalog';
-import { getProcAddressRegistry } from '../../../core/diagnostics/get-proc-address-registry';
+import { getProcAddressRegistry, type GetProcResolution } from '../../../core/diagnostics/get-proc-address-registry';
+import { SILENT_STUBS } from '../../../core/diagnostics/api-census';
 
 export const exports: Record<string, ThunkImplementation> = {};
 
@@ -1328,8 +1329,29 @@ function initModuleFunctions(): void {
             if (!esp || esp + 4 > mem.length) return 0;
             return new DataView(mem.buffer, mem.byteOffset, mem.byteLength).getUint32(esp, true) >>> 0;
         };
+        /**
+         * What the address we are about to hand back actually leads to. A dynamic
+         * resolution is invisible to the import table, so without this the census can
+         * see THAT a game asked for an export but not whether it got anything usable —
+         * and "resolved to a stub" is the failure mode that reads as success.
+         */
+        const classifyResolution = (address: number): { kind: GetProcResolution; dll?: string } => {
+            if (address === 0) return { kind: 'null' };
+            const dispatcher = system.process?.dispatcher as any;
+            const stub = dispatcher?.thunkGenerator?.getStubByAddress?.(address >>> 0);
+            if (!stub) return { kind: 'guest' };
+            const info = dispatcher?.getImplementationInfo?.(stub.functionId) ?? null;
+            if (!info) return { kind: 'stub', dll: stub.dllName };
+            // Arity 0 only condemns a handler when the export takes arguments it is
+            // therefore provably ignoring — GetTickCount legitimately needs none.
+            const silent = (info.arity === 0 && info.argCount > 0)
+                || SILENT_STUBS.has(`${stub.dllName}:${stub.functionName}`);
+            return { kind: silent ? 'silent-stub' : 'hle', dll: stub.dllName };
+        };
         const finish = (address: number): { value: number; stackCleanup: number } => {
-            getProcAddressRegistry.record(hModule, procName, address >>> 0, readCaller());
+            const resolution = classifyResolution(address >>> 0);
+            getProcAddressRegistry.record(
+                hModule, procName, address >>> 0, readCaller(), resolution.kind, resolution.dll);
             return { value: address >>> 0, stackCleanup: 8 };
         };
 
