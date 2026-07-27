@@ -5,6 +5,7 @@
 
 import { Process } from "../../core/process";
 import { WebGPUBackend } from "../../backends/webgpu/webgpu-backend";
+import { GLCvaState, createCvaState, cvaUnlock } from "./client-arrays";
 import { GL_MODELVIEW, GL_LESS, GL_ONE, GL_ZERO, GL_ALWAYS, GL_BACK, GL_CCW, GL_SMOOTH,
          GL_FILL, GL_LINEAR, GL_MODULATE, GL_NEAREST, GL_REPEAT, GL_TEXTURE0,
          GL_EYE_LINEAR } from "./constants";
@@ -13,14 +14,6 @@ import { GL_MODELVIEW, GL_LESS, GL_ONE, GL_ZERO, GL_ALWAYS, GL_BACK, GL_CCW, GL_
 
 /** Floats per vertex in the flat buffer: [x,y,z,w, r,g,b,a, nx,ny,nz, s0,t0,s1,t1] */
 export const VERT_FLOATS = 15;
-
-export interface GLDrawVertex {
-    x: number; y: number; z: number; w: number;
-    r: number; g: number; b: number; a: number;
-    nx: number; ny: number; nz: number;
-    s0: number; t0: number;
-    s1: number; t1: number;
-}
 
 // ---- Pre-baked display list types ----
 
@@ -378,6 +371,8 @@ export interface OpenGLContext {
     normalArray: GLArrayPointer;
     colorArray: GLArrayPointer;
     texCoordArrays: GLArrayPointer[];
+    /** EXT_compiled_vertex_array: gathered/transformed cache for the locked range. */
+    cva: GLCvaState;
 
     // Display lists
     displayLists: Map<number, GLDisplayList>;
@@ -613,6 +608,7 @@ export function createOpenGLContext(process: Process): OpenGLContext {
         normalArray: defaultArrayPointer(),
         colorArray: defaultArrayPointer(),
         texCoordArrays: [defaultArrayPointer(), defaultArrayPointer()],
+        cva: createCvaState(),
 
         displayLists: new Map(),
         nextListId: 1,
@@ -672,6 +668,7 @@ export function resetOpenGLContext(ctx: OpenGLContext): void {
     ctx.error = 0;
     ctx.commands.reset();
     ctx.vertArena.reset();
+    cvaUnlock(ctx);
     ctx.textures.clear();
     ctx.displayLists.clear();
     ctx.compilingList = null;

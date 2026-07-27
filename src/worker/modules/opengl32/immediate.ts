@@ -1,6 +1,6 @@
 import { ThunkImplementation, WriteBufHandler } from "../../core/thunking/thunk-dispatcher";
 import {
-    OpenGLContext, GLDrawVertex, GLDrawCommandType, mat4Multiply, VERT_FLOATS,
+    OpenGLContext, GLDrawCommandType, mat4Multiply, VERT_FLOATS,
     CMD_I32, CMD_F32,
     CI_MODE, CI_VERT_OFFSET, CI_VERT_COUNT, CI_FLAGS, CI_DEPTH_FUNC, CI_BLEND_SRC, CI_BLEND_DST,
     CI_ALPHA_FUNC, CI_CULL_FACE, CI_FRONT_FACE, CI_TEX_ID0, CI_TEX_ID1, CI_TEXENV0, CI_TEXENV1,
@@ -31,7 +31,6 @@ export function bitsToF32(bits: number): number {
 
 // Module-level scratch buffers — zero allocations on hot paths
 const _mvpScratch = new Float32Array(16);
-let _bridgeBuf = new Float32Array(4096 * VERT_FLOATS);
 
 // Cached DataView for guest memory — recreate only when buffer changes
 let _cachedDVBuf: ArrayBuffer | null = null;
@@ -69,22 +68,17 @@ function pushVertex(ctx: OpenGLContext, x: number, y: number, z: number, w: numb
     ctx.immediateFlatCount++;
 }
 
-/** Write a GLDrawVertex object into the flat immediate buffer. Used by arrays.ts bridge. */
-export function pushVertexObj(ctx: OpenGLContext, v: GLDrawVertex): void {
-    let buf = ctx.immediateFlatBuf;
+/** Reserve one vertex in the immediate buffer and return its float offset; the caller
+ *  writes all VERT_FLOATS slots. Used by glArrayElement, which gathers straight in. */
+export function immediateReserveVertex(ctx: OpenGLContext): number {
     const base = ctx.immediateFlatCount * VERT_FLOATS;
-    if (base + VERT_FLOATS > buf.length) {
-        const newBuf = new Float32Array(buf.length * 2);
-        newBuf.set(buf);
+    if (base + VERT_FLOATS > ctx.immediateFlatBuf.length) {
+        const newBuf = new Float32Array(ctx.immediateFlatBuf.length * 2);
+        newBuf.set(ctx.immediateFlatBuf);
         ctx.immediateFlatBuf = newBuf;
-        buf = newBuf;
     }
-    const b = ctx.immediateFlatCount * VERT_FLOATS;
-    buf[b]    = v.x;  buf[b+1]  = v.y;  buf[b+2]  = v.z;  buf[b+3]  = v.w;
-    buf[b+4]  = v.r;  buf[b+5]  = v.g;  buf[b+6]  = v.b;  buf[b+7]  = v.a;
-    buf[b+8]  = v.nx; buf[b+9]  = v.ny; buf[b+10] = v.nz;
-    buf[b+11] = v.s0; buf[b+12] = v.t0; buf[b+13] = v.s1; buf[b+14] = v.t1;
     ctx.immediateFlatCount++;
+    return base;
 }
 
 /** Copy one 15-float vertex. Explicit stores, not subarray()/set(): the view pair
@@ -390,7 +384,9 @@ function pushGLDrawCommand(ctx: OpenGLContext, mode: number, vertOffset: number,
     ctx.frameSnapshot.drawCalls++;
 }
 
-export function emitDrawCommandFlat(ctx: OpenGLContext, mode: number, src: Float32Array, srcCount: number): void {
+export function emitDrawCommandFlat(
+    ctx: OpenGLContext, mode: number, src: Float32Array, srcCount: number, preTransformed = false,
+): void {
     const expected = assembledVertCount(mode, srcCount);
     if (expected === 0) return;
 
@@ -399,14 +395,35 @@ export function emitDrawCommandFlat(ctx: OpenGLContext, mode: number, src: Float
     const base = arena.used;
     const asmCount = assembleFlatVerts(src, srcCount, mode, arena.data, base);
     if (asmCount === 0) return;
-    arena.used = base + asmCount * VERT_FLOATS;
+    emitArenaDraw(ctx, mode, base, asmCount, preTransformed);
+}
 
-    if (ctx.enableFlags.has(GL_TEXTURE_GEN_S) || ctx.enableFlags.has(GL_TEXTURE_GEN_T)) {
-        applyTexGenFlat(ctx, arena.data, base, asmCount);
+/** Reserve room for `vertCount` vertices in the frame arena and return the float offset
+ *  to write them at. Read `ctx.vertArena.data` AFTER this — reserve may reallocate, and
+ *  `used` only advances once emitArenaDraw publishes the range. */
+export function arenaReserve(ctx: OpenGLContext, vertCount: number): number {
+    ctx.vertArena.reserve(vertCount);
+    return ctx.vertArena.used;
+}
+
+/** Publish an already-assembled arena range as one DRAW. `preTransformed` means the
+ *  positions are already in clip space (compiled vertex arrays), which also implies
+ *  texgen is off — the caller only takes that path when nothing needs object space. */
+export function emitArenaDraw(
+    ctx: OpenGLContext, mode: number, base: number, count: number, preTransformed = false,
+): void {
+    if (count === 0) return;
+    const arena = ctx.vertArena;
+    arena.used = base + count * VERT_FLOATS;
+
+    if (!preTransformed) {
+        if (ctx.enableFlags.has(GL_TEXTURE_GEN_S) || ctx.enableFlags.has(GL_TEXTURE_GEN_T)) {
+            applyTexGenFlat(ctx, arena.data, base, count);
+        }
+        transformFlatVerts(ctx, arena.data, base, count);
     }
-    transformFlatVerts(ctx, arena.data, base, asmCount);
 
-    pushGLDrawCommand(ctx, mode, base, asmCount);
+    pushGLDrawCommand(ctx, mode, base, count);
 }
 
 /** For pre-baked display list items — data is already triangle-assembled, apply texgen + transform now */
@@ -427,27 +444,6 @@ export function emitDrawCommandFromPrebaked(ctx: OpenGLContext, mode: number, fl
     transformFlatVerts(ctx, arena.data, base, count);
 
     pushGLDrawCommand(ctx, mode, base, count);
-}
-
-/** Bridge for arrays.ts: accepts GLDrawVertex[] objects and converts to flat format */
-export function emitDrawCommand(ctx: OpenGLContext, mode: number, verts: GLDrawVertex[]): void {
-    const count = verts.length;
-    if (count === 0) return;
-    if (_bridgeBuf.length < count * VERT_FLOATS) {
-        let len = _bridgeBuf.length;
-        while (len < count * VERT_FLOATS) len *= 2;
-        _bridgeBuf = new Float32Array(len);
-    }
-    const tmpBuf = _bridgeBuf;
-    for (let i = 0; i < count; i++) {
-        const v = verts[i];
-        const b = i * VERT_FLOATS;
-        tmpBuf[b]=v.x; tmpBuf[b+1]=v.y; tmpBuf[b+2]=v.z; tmpBuf[b+3]=v.w;
-        tmpBuf[b+4]=v.r; tmpBuf[b+5]=v.g; tmpBuf[b+6]=v.b; tmpBuf[b+7]=v.a;
-        tmpBuf[b+8]=v.nx; tmpBuf[b+9]=v.ny; tmpBuf[b+10]=v.nz;
-        tmpBuf[b+11]=v.s0; tmpBuf[b+12]=v.t0; tmpBuf[b+13]=v.s1; tmpBuf[b+14]=v.t1;
-    }
-    emitDrawCommandFlat(ctx, mode, tmpBuf, count);
 }
 
 export function createImmediateExports(ctx: OpenGLContext): Record<string, ThunkImplementation> {
