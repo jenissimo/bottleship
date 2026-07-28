@@ -394,6 +394,97 @@ export const dbg = {
         const g = (i: number) => (w.get_jit_config ? (w.get_jit_config(i) >>> 0) : -1);
         console.log(`[dbg] JIT_TIER2_THRESHOLD=${g(15)} tier2SpecBudget=${g(16)} tier2MaxPages=${g(17)} (runtime knob, no cache clear)`);
     },
+    /** JIT bookkeeping health — the counters that catch slot-recycling/stale-dispatch
+     *  corruption (the silent wrong-entry class). doubleFreeSkipped > 0 means a wasm
+     *  table slot was pushed to the free list twice and only the release guard stopped
+     *  two modules sharing it; slabOverflows > 0 means dispatch pages went unpublished. */
+    jitHealth(): Record<string, unknown> | null {
+        const w = wasm(); if (!w) return null;
+        const g = (n: string) => (typeof w[n] === "function" ? w[n]() >>> 0 : -1);
+        const s = {
+            doubleFreeSkipped: g("jit_get_double_free_skipped"),
+            slabOverflows: g("dispatch_slab_overflows"),
+            slabHighWater: g("dispatch_slab_high_water"),
+            freeSlots: g("jit_debug_free_slots"),
+            moduleCount: g("jit_debug_module_count"),
+            pageCount: g("jit_debug_page_count"),
+            hiddenCount: g("jit_debug_hidden_count"),
+            // Wrong-entry detector (diagnostic v86 build only; -1 = not instrumented)
+            wrongEntryDirect: g("jit_get_wrong_entry_direct"),
+            wrongEntryChain: g("jit_get_wrong_entry_chain"),
+            retMemoMismatch: g("jit_get_ret_memo_mismatch"),
+            retMemoStaleLive: g("jit_get_ret_memo_stale_live"),
+            retMemoStaleDead: g("jit_get_ret_memo_stale_dead"),
+            staleMetaAtFree: g("jit_get_stale_meta_at_free"),
+            staleMetaTlbLive: g("jit_get_stale_meta_tlb_live"),
+            staleMetaTlbDead: g("jit_get_stale_meta_tlb_dead"),
+            // Guest-corrupted heap-arena structures caught before a raw write escaped the
+            // slab (the DISPATCH_SLABS-stomp root cause). >0 with a clean pool = fix working.
+            hcSlabPoisoned: g("hc_slab_poisoned_count"),
+            // Raw writes that tried to land OUTSIDE guest RAM (would have hit the wasm
+            // module's own statics). [addr, size, eip, value] of the most recent one.
+            oobWrites: g("memory_get_oob_writes"),
+            oobLast: typeof w.memory_get_oob_info === "function"
+                ? [0, 1, 2, 3].map((i) => (w.memory_get_oob_info(i) >>> 0).toString(16)).join("/")
+                : null,
+            wrongEntryRefuse: typeof w.get_jit_config === "function" ? w.get_jit_config(24) >>> 0 : -1,
+            wrongEntryEip: typeof w.jit_get_wrong_entry_info === "function" ? w.jit_get_wrong_entry_info(0) >>> 0 : -1,
+        } as Record<string, unknown>;
+        if (typeof w.jit_get_wrong_entry_ring_len === "function") {
+            const n = w.jit_get_wrong_entry_ring_len() >>> 0;
+            const ring: string[] = [];
+            for (let i = 0; i < n; i++) {
+                const rec = [0, 1, 2, 3].map((f) => (w.jit_get_wrong_entry_ring(i, f) >>> 0).toString(16));
+                ring.push(rec[3] === "2"
+                    ? `memo eip=${rec[0]} cached=${rec[1]} fresh=${rec[2]}`
+                    : rec[3] === "3"
+                    ? `staleMeta vpage=${rec[0]} idx=${rec[1]} tlb=${rec[2]}`
+                    : rec[3] === "4"
+                    ? `slab v|n=${rec[0]} p0=${rec[1]} p1=${rec[2]}`
+                    : rec[3] === "5"
+                    ? `list p|n=${rec[0]} p0=${rec[1]} p1=${rec[2]}`
+                    : rec[3] === "6"
+                    ? `share slab|cnt=${rec[0]} v0=${rec[1]} v1=${rec[2]}`
+                    : `entry eip=${rec[0]} phys=${rec[1]} got=${rec[2]} want=${rec[3]}`);
+            }
+            (s as Record<string, unknown>).ring = ring;
+        }
+        console.log(`[dbg] jitHealth ${JSON.stringify(s)}`);
+        return s;
+    },
+    /** Dispatch-slab integrity audit: slabs whose live-cell count no longer matches
+     *  what the JIT published — i.e. cells overwritten by something outside the JIT.
+     *  Nonzero = memory corruption reaching DISPATCH_SLABS (the wrong-entry class). */
+    jitSlabAudit(): unknown {
+        const w = wasm();
+        if (!w?.jit_slab_audit) return null;
+        const damaged = w.jit_slab_audit() >>> 0;
+        const last = [0, 1, 2].map((i) => w.jit_slab_audit_last(i) >>> 0);
+        const r = { damagedSlabs: damaged, lastSlab: last[0].toString(16), published: last[1], live: last[2] };
+        console.log(`[dbg] jitSlabAudit ${JSON.stringify(r)}`);
+        return r;
+    },
+    /** Linear-memory layout of the JIT statics vs the JS-writable D3D9 arena. */
+    jitStaticsMap(): unknown {
+        const w = wasm();
+        if (!w?.jit_get_dispatch_slabs_ptr) return null;
+        const slabs = w.jit_get_dispatch_slabs_ptr() >>> 0;
+        const slabsLen = w.jit_get_dispatch_slabs_len() >>> 0;
+        const meta = w.jit_get_dispatch_meta_ptr() >>> 0;
+        const arena = typeof w.get_d3d9_arena_ptr === "function" ? w.get_d3d9_arena_ptr() >>> 0 : -1;
+        const wmap = typeof w.fastmem_write_map_base === "function" ? w.fastmem_write_map_base() >>> 0 : -1;
+        const hp = typeof w.get_hypercall_page_ptr === "function" ? w.get_hypercall_page_ptr() >>> 0 : -1;
+        const r = {
+            dispatchSlabs: `0x${slabs.toString(16)}..0x${(slabs + slabsLen).toString(16)}`,
+            dispatchMeta: `0x${meta.toString(16)}`,
+            d3d9Arena: `0x${arena.toString(16)}`,
+            arenaMinusSlabsEnd: arena - (slabs + slabsLen),
+            fastmemWriteMap: `0x${wmap.toString(16)}`,
+            hypercallPage: `0x${hp.toString(16)}`,
+        };
+        console.log(`[dbg] jitStaticsMap ${JSON.stringify(r)}`);
+        return r;
+    },
     /** Hotness-tiering observability: pages currently tier-2-marked, successful promotions,
      *  and promotions REFUSED because the page-set cap (256) was full. blockedByCap > 0
      *  with a saturated pageCount means the hot set outgrew the cap — the exact failure
