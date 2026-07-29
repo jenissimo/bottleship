@@ -37,7 +37,6 @@ const PTE_RW = 0x02;
 const PTE_USER = 0x04;
 const PTE_DEFAULT = PTE_PRESENT | PTE_RW | PTE_USER; // 0x07
 const FASTMEM_BUMP_PAGE_TABLE_DECOMMIT = 5;
-const FASTMEM_BUMP_PAGE_TABLE_COMMIT = 6;
 const FASTMEM_BUMP_PAGE_TABLE_PROTECT = 7;
 
 // CR0 bits
@@ -56,6 +55,29 @@ export class PageTableManager {
 
     private bumpFastmemGeneration(source: number): void {
         this.getWasmExports()?.fastmem_bump_generation?.(source >>> 0);
+    }
+
+    /**
+     * A mapping change that only makes pages MORE accessible (absent → present) must NOT
+     * bump the fastmem generation.
+     *
+     * The generation is a global version tag, and every fastmem-speculating module carries
+     * an entry guard: generation mismatch → `fastmem_deopt_jit_unit` + exit to the
+     * interpreter. So one bump deoptimises EVERY speculating module — the whole compiled
+     * working set — and it all has to be re-emitted. Commit is not rare: a guest allocator
+     * that commits a few times a second (UE1 via VirtualAlloc) then throws the JIT away a
+     * few times a second. Measured on Harry Potter CoS: 9 bumps / 6 s, ~128 k speculated
+     * load sites re-compiled per 6 s, and 1.4 fps with speculation live vs 15.1 fps with it
+     * off — the JIT was a 11x net LOSS purely from this churn. (v86's own thrash latch does
+     * not save us: it needs 240 bumps per 50M instructions and this rate is ~5.)
+     *
+     * Safety: only present → absent (decommit) or RW → RO (protect) can make a speculated
+     * load WRONG, and those still bump. A unit compiled while a page was absent either
+     * guards and faults into the slow accessor or was emitted slow in the first place; once
+     * the page is present both remain correct, merely un-optimised until natural recompile.
+     */
+    private noteCommitOnlyMappingChange(): void {
+        // Intentionally no generation bump — see the contract above.
     }
 
     /**
@@ -131,7 +153,7 @@ export class PageTableManager {
         // Flush TLB. Paging-enable installs the identity map (all pages present) —
         // a commit-class mapping change, not a decommit.
         const exports = this.getWasmExports();
-        this.bumpFastmemGeneration(FASTMEM_BUMP_PAGE_TABLE_COMMIT);
+        this.noteCommitOnlyMappingChange();
         if (exports?.full_clear_tlb) {
             exports.full_clear_tlb();
         }
@@ -189,11 +211,10 @@ export class PageTableManager {
             view.setUint32(pteOffset, physAddr | PTE_DEFAULT, true);
         }
 
-        // Flush TLB. full_clear_tlb no longer bumps the fastmem generation (routine
-        // churn), so commit must bump explicitly — a recommitted page changes read
-        // validity for any unit that speculated over it while decommitted.
+        // Flush TLB. Commit only ADDS mappings, so it does not bump the fastmem
+        // generation (noteCommitOnlyMappingChange explains why, and what it costs).
         const exports = this.getWasmExports();
-        this.bumpFastmemGeneration(FASTMEM_BUMP_PAGE_TABLE_COMMIT);
+        this.noteCommitOnlyMappingChange();
         if (exports?.full_clear_tlb) {
             exports.full_clear_tlb();
         }
@@ -241,7 +262,7 @@ export class PageTableManager {
         if (recommitted === 0) return;
 
         const exports = this.getWasmExports();
-        this.bumpFastmemGeneration(FASTMEM_BUMP_PAGE_TABLE_COMMIT);
+        this.noteCommitOnlyMappingChange();
         if (exports?.full_clear_tlb) {
             exports.full_clear_tlb();
         }

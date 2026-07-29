@@ -1338,10 +1338,8 @@ export class Msvcrt implements IModule {
     private memmove(dest: number, src: number, length: number): number {
         const size = length >>> 0;
         if (!dest || !src || size === 0) return dest >>> 0;
-        const srcBytes = Mem.readBytes(src, size);
-        if (!srcBytes) return dest >>> 0;
-        const copy = new Uint8Array(srcBytes);
-        Mem.writeBytes(dest, copy);
+        // One native memmove — Mem.memmove is overlap-correct, so no staging copy.
+        Mem.memmove(dest, src, size);
         return dest >>> 0;
     }
 
