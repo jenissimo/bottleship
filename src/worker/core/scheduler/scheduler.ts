@@ -335,6 +335,56 @@ export class Scheduler {
     // Switch request flag
     private switchRequested = false;
 
+    /** Wall-clock bound on the callback pin's power to defer a switch (below). */
+    private static readonly PIN_STARVATION_MAX_MS = 8;
+    /** When the pin first refused a switch with peers already queued (0 = not deferring). */
+    private pinDeferSinceMs = 0;
+    private pinDeferCount = 0;
+    public pinStarvationForced = 0;
+
+    /**
+     * Does the callback pin justify skipping THIS switch?
+     *
+     * The pin exists so a JS-invoked guest callback (WndProc, EnumWindows, …) is not
+     * preempted mid-chain. It was never meant to stop OTHER threads: on Windows a
+     * synchronous callback runs on the calling thread, it does not make the machine
+     * single-threaded. UE1 runs its whole engine tick inside DispatchMessage, so the pin
+     * is held for the entire frame — and when guest code inside that callback waits on a
+     * peer (Core.dll's `while(lock) Sleep(0)` spinlock), deferring forever is a deadlock:
+     * the holder can never be scheduled to release it. Observed on Harry Potter CoS as a
+     * hard freeze with runQueue=[3,2] and ZERO context switches.
+     *
+     * So the deferral is BOUNDED, the same shape as the non-preemptible-stub valve below:
+     * a fast callback (microseconds) is never split, while a callback that starves queued
+     * peers past PIN_STARVATION_MAX_MS loses the privilege. The switch is safe at this
+     * point for the same reason it is safe for a pinned thread that blocked — per-thread
+     * context and the frame's own thread-keyed bookkeeping survive the round trip.
+     */
+    private pinDefersSwitch(current: Thread): boolean {
+        if (current.kernelPinCount <= 0 || current.state !== ThreadState.RUNNING) {
+            this.pinDeferSinceMs = 0;
+            this.pinDeferCount = 0;
+            return false;
+        }
+        const now = performance.now();
+        if (this.pinDeferSinceMs === 0) {
+            this.pinDeferSinceMs = now;
+            this.pinDeferCount = 1;
+            return true;
+        }
+        this.pinDeferCount++;
+        if (now - this.pinDeferSinceMs < Scheduler.PIN_STARVATION_MAX_MS) return true;
+
+        Logger.warn(LogCategory.THREAD,
+            `PIN_STARVATION: T${current.id} held the callback pin for ` +
+            `${(now - this.pinDeferSinceMs).toFixed(1)}ms over ${this.pinDeferCount} deferred switches ` +
+            `while ${this.runQueue.length} thread(s) were READY — forcing the switch`);
+        this.pinStarvationForced++;
+        this.pinDeferSinceMs = 0;
+        this.pinDeferCount = 0;
+        return false;
+    }
+
     /** New threads run until their first blocking wait so SetEvent cannot be missed. */
     private bootstrapUntilFirstWait = new Set<number>();
 
@@ -700,9 +750,10 @@ export class Scheduler {
             // pinned WndProc deadlocks: the switch is deferred, WaitForSingleObject's
             // RET resumes guest code on the WAITING thread, and the read returns short
             // → D2 "File Read Error / Archive.cpp:143". Only defer while RUNNING.
-            if (current && current.kernelPinCount > 0 && current.state === ThreadState.RUNNING) {
-                // Pinned for callback chain — defer preemptive switch until chain completes.
-                // Same-thread async restores are handled at step 1 above.
+            if (current && this.pinDefersSwitch(current)) {
+                // Pinned for callback chain — defer preemptive switch until chain completes
+                // (bounded: see pinDefersSwitch). Same-thread async restores are handled at
+                // step 1 above.
                 return;
             }
             if (this.shouldDeferSwitchForCriticalRuntime(cpu, kind)) {
@@ -905,7 +956,9 @@ export class Scheduler {
                 // handled at step 1 (onPollAsyncRestores) which runs before this check.
                 // Exception: a thread that voluntarily BLOCKED (WAITING) has yielded the CPU
                 // and cannot run — its peers must be allowed to proceed (see onThunkBoundary).
-                if (current.kernelPinCount > 0 && current.state === ThreadState.RUNNING) return;
+                // The deferral is bounded so a frame-long callback cannot starve them (see
+                // pinDefersSwitch).
+                if (this.pinDefersSwitch(current)) return;
                 // Retired-instruction quantum (deterministic), not wall-clock — see quantumExpired().
                 if (this.switchRequested || this.quantumExpired(current, cpu)) {
                     if (this.shouldDeferSwitchForCriticalRuntime(cpu, ThunkBoundaryKind.GUEST_CODE)) {
@@ -2953,6 +3006,16 @@ export class Scheduler {
 
     unpinCurrentThread(): void {
         const t = this.getCurrentThread();
+        if (t && t.kernelPinCount > 0) t.kernelPinCount--;
+    }
+
+    /** Release a pin taken by a specific thread. Callers that pin a thread and release the
+     *  pin later MUST use this: the current thread at release time is not necessarily the
+     *  one that was pinned (a pinned thread that blocks still switches away), and unpinning
+     *  "current" then leaves the owner pinned for the rest of its life — permanently
+     *  unpreemptible, which starves every peer. */
+    unpinThread(threadId: number): void {
+        const t = this.threads.get(threadId >>> 0);
         if (t && t.kernelPinCount > 0) t.kernelPinCount--;
     }
 

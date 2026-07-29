@@ -817,6 +817,8 @@ export class CallbackManager {
             }
         }
 
+        const pinnedThreadId = this.frameThreadId[slot];
+
         this.frameActive[slot] = 0;
         this.frameIdRing[slot] = 0;
         this.frameThreadId[slot] = 0;
@@ -827,9 +829,12 @@ export class CallbackManager {
         this.frameCallbackId[slot] = 0;
         this.frameSource[slot] = '';
 
-        // Unpin the thread (balanced with pin in allocateSuspendedFrame)
+        // Unpin the thread that took the pin in allocateSuspendedFrame — NOT whoever is
+        // current now. A pinned thread that blocks does switch away, so releasing the frame
+        // from another thread would decrement the wrong counter and leave the owner pinned
+        // (never preemptible) for good.
         try {
-            System.getInstance().scheduler.unpinCurrentThread();
+            System.getInstance().scheduler.unpinThread(pinnedThreadId);
         } catch { /* scheduler not ready yet */ }
 
         this.notifyIdleIfReady();
@@ -841,7 +846,7 @@ export class CallbackManager {
             const scheduler = System.getInstance().scheduler;
             for (let i = 0; i < SUSPENDED_FRAME_RING_SIZE; i++) {
                 if (this.frameActive[i] === 1) {
-                    scheduler.unpinCurrentThread();
+                    scheduler.unpinThread(this.frameThreadId[i]);
                 }
             }
         } catch { /* scheduler not ready */ }

@@ -36,6 +36,7 @@ import {
     createPostReturnContext,
 } from "../../src/worker/core/scheduler/scheduler-context";
 import { TARGET_INSN_PER_MS } from "../../src/worker/core/scheduler/timing";
+import { DEFAULT_SCHEDULER_CONFIG } from "../../src/worker/core/scheduler/types";
 import { hypercallDataManager } from "../../src/worker/core/cpu/hypercall-data";
 import { hasFpuSimdDirtyFlag } from "../../src/worker/core/fpu-helper";
 
@@ -1140,13 +1141,72 @@ describe("scheduler/non-preemptible slab-stub region", () => {
     });
 });
 
+// The callback pin (WndProc / Enum* chains) may delay a preemptive switch, but it may not
+// starve queued peers forever: guest code inside such a callback can wait on a peer thread
+// (UE1 runs its whole engine tick inside DispatchMessage and Core.dll spins `while(lock)
+// Sleep(0)`), and an unbounded defer makes that wait unsatisfiable — a hard freeze with a
+// non-empty run queue and zero context switches.
+describe("scheduler/callback pin cannot starve queued peers forever", () => {
+    function setup() {
+        const s = new Scheduler();
+        (s as any).process = { id: 1, getModule: () => undefined, getCurrentMemory: () => new Uint8Array(0x100) };
+        (s as any).lastDeadlockCheckMs = Number.MAX_SAFE_INTEGER;
+        const t1 = inject(s, mkThread(1, ThreadState.RUNNING), { current: true });
+        const t2 = mkThread(2, ThreadState.READY);
+        (t2 as any).tebAddress = 0x00050000;
+        t2.context = createInitialContext(0x00402000, 0x00290000);
+        inject(s, t2, { runnable: true });
+        t1.kernelPinCount = 1;                                  // inside a callback chain
+        return { s, t1, t2, cpu: fakeCpu({ eip: 0x00401000, esp: 0x0028ff00 }) };
+    }
+
+    test("a short pinned callback is NOT split", () => {
+        const { s, cpu } = setup();
+        (s as any).preemptAtTickBoundary(cpu);
+        expect((s as any).currentThreadId).toBe(1);             // pin honored
+        expect((s as any).pinStarvationForced).toBe(0);
+    });
+
+    test("past the starvation bound the switch is forced", () => {
+        const { s, cpu } = setup();
+        (s as any).preemptAtTickBoundary(cpu);                  // starts the defer window
+        expect((s as any).currentThreadId).toBe(1);
+        // Backdate the window past the bound — the guest has held the pin too long.
+        (s as any).pinDeferSinceMs -= (Scheduler as any).PIN_STARVATION_MAX_MS + 1;
+        (s as any).preemptAtTickBoundary(cpu);
+        expect((s as any).currentThreadId).toBe(2);             // peer finally runs
+        expect((s as any).pinStarvationForced).toBe(1);
+    });
+
+    test("releasing the pin ends the defer window", () => {
+        const { s, t1, cpu } = setup();
+        (s as any).preemptAtTickBoundary(cpu);
+        expect((s as any).pinDeferSinceMs).toBeGreaterThan(0);
+        t1.kernelPinCount = 0;
+        (s as any).preemptAtTickBoundary(cpu);
+        expect((s as any).currentThreadId).toBe(2);
+        expect((s as any).pinDeferSinceMs).toBe(0);
+        expect((s as any).pinStarvationForced).toBe(0);         // not a starvation escape
+    });
+
+    test("unpinThread releases the OWNER's pin, not the current thread's", () => {
+        const { s, t1, t2 } = setup();
+        t2.kernelPinCount = 0;
+        (s as any).currentThreadId = 2;                         // owner is no longer current
+        s.unpinThread(1);
+        expect(t1.kernelPinCount).toBe(0);                      // owner released
+        expect(t2.kernelPinCount).toBe(0);                      // and nobody else charged
+    });
+});
+
 // The preemption quantum is measured in RETIRED GUEST INSTRUCTIONS (cpu.instruction_counter),
 // not performance.now(). This makes the switch point a deterministic function of guest state —
 // identical on Mac and PC — which removes the platform-dependent interleaving that shifted the
-// async/JIT OUT+RET-N window into the Re-Volt mac wild-ESP/EBP corruption. minQuantumMs=1 default
-// → 100_000-instruction budget (TARGET_INSN_PER_MS).
+// async/JIT OUT+RET-N window into the Re-Volt mac wild-ESP/EBP corruption. The budget is
+// minQuantumMs * TARGET_INSN_PER_MS — derived here, not restated, so retuning the quantum for
+// fidelity cannot silently invalidate these assertions.
 describe("scheduler/preemption quantum is instruction-based (deterministic)", () => {
-    const QUANTUM = TARGET_INSN_PER_MS; // minQuantumMs(1) * TARGET_INSN_PER_MS
+    const QUANTUM = DEFAULT_SCHEDULER_CONFIG.minQuantumMs * TARGET_INSN_PER_MS;
 
     test("not expired below the instruction budget; expired at/above it", () => {
         const s = new Scheduler();

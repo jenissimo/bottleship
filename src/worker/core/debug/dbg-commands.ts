@@ -1032,7 +1032,9 @@ export const dbg = {
         if (!s) { console.warn("[dbg] scheduler.roundTripStats missing — reload worker for new build"); return null; }
         const pct = (n: number, d: number) => d > 0 ? (n / d * 100).toFixed(1) + "%" : "n/a";
         const honestQuantum = Math.max(0, s.ticks - s.urgentTicks);
-        const out = { ...s, honestQuantum, fpu,
+        // pinStarvation > 0 means a callback pin (WndProc/Enum*) was overriding preemption long
+        // enough to starve queued peers — each one is a freeze the bound turned into a hiccup.
+        const out = { ...s, honestQuantum, fpu, pinStarvationForced: sched?.pinStarvationForced ?? -1,
             urgentPct: pct(s.urgentTicks, s.ticks),
             urgentNoReadyPct: pct(s.urgentNoReady, s.ticks),
             selfReschedulePct: pct(s.selfReschedule, s.selfReschedule + s.realSwitch),
@@ -1041,7 +1043,7 @@ export const dbg = {
             `[dbg] round-trips ticks=${s.ticks}\n` +
             `      urgent(WAITING sched)=${s.urgentTicks}(${out.urgentPct}) of which NO-other-READY=${s.urgentNoReady}(${out.urgentNoReadyPct} of ticks) <-- pure recoverable waste\n` +
             `      honest-quantum(urgentExit=false)=${honestQuantum}(${out.honestQuantumPct}) <-- irrecoverable (lengthening quantum hurts latency)\n` +
-            `      switches: self-reschedule=${s.selfReschedule}(${out.selfReschedulePct}) real=${s.realSwitch} noRunnable=${s.noRunnable}\n` +
+            `      switches: self-reschedule=${s.selfReschedule}(${out.selfReschedulePct}) real=${s.realSwitch} noRunnable=${s.noRunnable} pinStarvationForced=${out.pinStarvationForced}\n` +
             `      fpu/simd: saves=${fpu?.saves ?? "n/a"} skippedClean=${fpu?.savesSkippedClean ?? "n/a"} ` +
             `dirty=${fpu?.savesDirty ?? "n/a"} noFlag=${fpu?.savesNoDirtyFlag ?? "n/a"} ` +
             `restores=${fpu?.restores ?? "n/a"} skippedOwner=${fpu?.restoresSkippedOwner ?? "n/a"} ` +

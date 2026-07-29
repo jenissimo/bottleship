@@ -374,6 +374,9 @@ export class ThunkDispatcher {
     private sehDispatchStack: SehDispatchContext[] = [];
     private sehDispatchGeneration = 0;
     private sehRuntimePinned = false;
+    /** Thread that took the SEH pin — the pin must be released on IT, not on whoever is
+     *  current when the dispatch unwinds. */
+    private sehRuntimePinnedThreadId = 0;
     private unhandledExceptionFilterAddr = 0;
     private callbackStubPoolBase = 0;
     private callbackStubPoolEnd = 0;
@@ -3980,6 +3983,7 @@ export class ThunkDispatcher {
         if (!this.sehRuntimePinned) {
             sched.pinCurrentThread();
             this.sehRuntimePinned = true;
+            this.sehRuntimePinnedThreadId = ownerThreadId >>> 0;
         }
     }
 
@@ -3998,8 +4002,11 @@ export class ThunkDispatcher {
         } else {
             this._clearSehTransientRanges();
             if (this.sehRuntimePinned) {
-                sched.unpinCurrentThread();
+                // Release the pin on its OWNER: the SEH dispatch may unwind on a different
+                // current thread, and unpinning "current" would strand the owner pinned.
+                sched.unpinThread(this.sehRuntimePinnedThreadId);
                 this.sehRuntimePinned = false;
+                this.sehRuntimePinnedThreadId = 0;
             }
         }
     }
@@ -6733,8 +6740,9 @@ export class ThunkDispatcher {
         this.nextChecksumAt = 0;
         this.checksumInProgress = false;
         if (this.sehRuntimePinned) {
-            try { this.ensureScheduler().unpinCurrentThread(); } catch { }
+            try { this.ensureScheduler().unpinThread(this.sehRuntimePinnedThreadId); } catch { }
             this.sehRuntimePinned = false;
+            this.sehRuntimePinnedThreadId = 0;
         }
         try { this._clearSehTransientRanges(); } catch { }
         try {
