@@ -1071,11 +1071,51 @@ const pinGuestEngineIni = async (
 ): Promise<void> => {
   if (vfs.getFileSize(iniPath) <= 0) return;
   try {
-    const handle = await vfs.open(iniPath, 0x80000000, 3); // GENERIC_READ, OPEN_EXISTING
-    if (!handle) return;
     const size = vfs.getFileSize(iniPath);
-    const bytes = size > 0 ? await vfs.read(handle, size) : new Uint8Array(0);
+    // Read the WHOLE file, and prove it. A short read here used to be indistinguishable
+    // from an empty config: pinUeEngineIni("") synthesizes a bare [Engine.Engine] (exactly
+    // 136 bytes) and the write below then replaced the 10 KB factory config with it — in the
+    // CoW overlay, which shadows ROM, so one transient short read poisoned every later boot.
+    // The engine then had no [Core.System] at all: no Language, so it asked for
+    // `Splash.bmp` / `EALogo(null).bmp` instead of `splasheng.bmp` and died in InitEngine
+    // (`Assertion failed: Bitmap.LoadFile`). A config we could not read whole is a config we
+    // must not rewrite — leave it alone and say so loudly.
+    // read() is allowed to return less than asked (it serves whatever window it has), so
+    // "read to completion" means looping until the file is consumed or a read stops making
+    // progress — the latter is the real failure and the only case that must not pin.
+    const readWhole = async (): Promise<Uint8Array | null> => {
+      const handle = await vfs.open(iniPath, 0x80000000, 3); // GENERIC_READ, OPEN_EXISTING
+      if (!handle) return null;
+      const out = new Uint8Array(size);
+      let got = 0;
+      while (got < size) {
+        const chunk = await vfs.read(handle, size - got);
+        if (chunk.length === 0) return null;   // no progress → truncated/failed read
+        out.set(chunk.subarray(0, Math.min(chunk.length, size - got)), got);
+        got += chunk.length;
+      }
+      return out;
+    };
+    // One retry: the loss is transient (streamed ROM / OPFS hiccup), not a property of the file.
+    const bytes = (await readWhole()) ?? (await readWhole());
+    if (!bytes) {
+      Logger.error(LogCategory.SYSTEM,
+        `UE1: refusing to pin ${iniPath} — could not read all ${size} bytes (short read). ` +
+        `Leaving the config untouched; overwriting it with a synthesized stub would strip ` +
+        `[Core.System] (Language/Paths) and break the engine on every later boot.`);
+      return;
+    }
     const text = new TextDecoder("utf-8").decode(bytes);
+    // A factory UE config always carries [Core.System] (Language, Paths). Its absence means
+    // this overlay copy is a stub a poisoned earlier boot left behind, not a real config —
+    // name it, because the downstream symptom (engine asks for an unsuffixed Splash.bmp and
+    // asserts) points nowhere near here.
+    if (!/^\s*\[Core\.System\]/im.test(text)) {
+      Logger.warn(LogCategory.SYSTEM,
+        `UE1: ${iniPath} (${size} bytes) has no [Core.System] section — the engine will have no ` +
+        `Language/Paths. If this game previously failed to load a config, clear its OPFS overlay ` +
+        `so the factory config in the bundle is used again.`);
+    }
     const pinned = pinUeEngineIni(text, { hasPcPackages });
     if (pinned !== text) {
       await writeVfsOverride(iniPath, new TextEncoder().encode(pinned));

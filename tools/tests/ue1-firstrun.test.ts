@@ -258,3 +258,35 @@ describe("path helpers", () => {
         expect(baseOfWindowsPath("HP.ini")).toBe("HP.ini");
     });
 });
+
+// Why the caller must read the config to COMPLETION before pinning: fed an empty string
+// (what a short read decodes to), the pin cannot tell "no config" from "config we failed to
+// read" and synthesizes a bare stub. Written into the CoW overlay it shadows the bundle's
+// factory config on every later boot, and the engine loses [Core.System] — no Language, so
+// it asks for an unsuffixed `Splash.bmp` and dies in InitEngine. The guard lives in
+// pinGuestEngineIni (emulator.worker.ts); this pins down what it is guarding against.
+describe("pinUeEngineIni on an empty config — the short-read trap", () => {
+    test("an empty source yields a stub with NO [Core.System]", () => {
+        const stub = pinUeEngineIni("", {});
+        expect(stub).toContain("[Engine.Engine]");
+        expect(stub).toContain(UE1_RENDER_DEVICE);
+        expect(/\[Core\.System\]/i.test(stub)).toBe(false);   // Language/Paths are gone
+        expect(stub.length).toBe(136);                        // the exact byte count observed
+    });
+
+    test("a real config keeps [Core.System] verbatim while the device is pinned", () => {
+        const factory = [
+            "[Core.System]",
+            "Paths=..\System\*.u",
+            "Language=int",
+            "",
+            "[Engine.Engine]",
+            "GameRenderDevice=SoftDrv.SoftwareRenderDevice",
+        ].join("\r\n");
+        const pinned = pinUeEngineIni(factory, {});
+        expect(pinned).toContain("Language=int");
+        expect(pinned).toContain("Paths=..\System\*.u");
+        expect(pinned).toContain(`GameRenderDevice=${UE1_RENDER_DEVICE}`);
+        expect(pinned).not.toContain("SoftDrv.SoftwareRenderDevice");
+    });
+});
