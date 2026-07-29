@@ -38,6 +38,9 @@ export class PreemptionManager {
      *  x87-locals is a no-op under strict/PC=24 FPU (codegen self-gates). */
     private fastmemReadsEnabled = true;         // config idx 9
     private fastmemReadSplitEnabled = true;     // config idx 18 (split-range read shape)
+    /** idx 10 — measured NEUTRAL on FP-heavy code (nbench FOURIER +0.2 %, LU −0.9 %: both
+     *  inside the noise floor), so it is kept ON for the shapes it was written for rather
+     *  than re-litigated per title. */
     private x87LocalsEnabled = true;            // config idx 10
     private pushRunCoalescingEnabled = true;    // config idx 11
 
@@ -49,9 +52,12 @@ export class PreemptionManager {
      *  setFastmemWrites(false) / dbg.fastmemWrites(false). */
     private fastmemWritesEnabled = false;       // config idx 19
 
-    /** Lazy-flag tuple in wasm locals (config idx 21). Default OFF until the in-race
-     *  A/B gate passes. Kill-switch: setFlagLocals(false) /
-     *  dbg.flagLocals(false). Toggle clears the JIT cache (shape baked into modules). */
+    /** Lazy-flag tuple in wasm locals (config idx 21). Default OFF — the gate has now RUN and
+     *  it is a LOSS on FP-heavy code: tools/bench-v86 nbench (relaxed FPU, prod flags) gives
+     *  FOURIER 5617 vs 6362 and LU 180.3 vs 199.4 with it on, i.e. −10…−12 %, far outside the
+     *  ~3.6 % noise floor. Don't re-flip it without an integer-workload case.
+     *  Kill-switch: setFlagLocals(false) / dbg.flagLocals(false). Toggle clears the JIT cache
+     *  (shape baked into modules). */
     private flagLocalsEnabled = false;          // config idx 21
 
     /** Wasm branch hints on guard slow paths (config idx 22) — a BITMASK of hint groups,

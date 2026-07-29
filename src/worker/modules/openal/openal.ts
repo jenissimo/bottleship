@@ -18,6 +18,7 @@ import {
     createAudioRingBuffer,
     writeRingData,
     setCtrl,
+    getCtrl,
     setCtrlFloat,
     CTRL_STATE,
     CTRL_DATA_LENGTH,
@@ -127,6 +128,24 @@ interface ALSource {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * Fold the worklet's playback state into `src.state` before it is reported.
+ *
+ * A real OpenAL source that reaches the end of a non-looping buffer transitions to
+ * AL_STOPPED on its own; nothing has to call alSourceStop. We only ever WROTE CTRL_STATE,
+ * so a source stayed AL_PLAYING for life and every voice looked busy forever — an engine
+ * that hunts for a free/finished voice (UE1's ALAudio Update → FindLeastImportantSound)
+ * then spins waiting for a state that can never arrive.
+ *
+ * The worklet stores STATE_STOPPED when it finishes the last loop, so the completion is
+ * already published; this reads it back. Looping sources never stop by themselves, and a
+ * source with no SAB has no playback to report — both keep their bookkeeping state.
+ */
+function syncSourceState(src: ALSource): void {
+    if (src.state !== AL_PLAYING || !src.sab) return;
+    if (getCtrl(src.sab, CTRL_STATE) === STATE_STOPPED) src.state = AL_STOPPED;
+}
 
 function writeString(process: Process, str: string): number {
     const bytes = new TextEncoder().encode(str + "\0");
@@ -380,6 +399,7 @@ export class OpenAL implements IModule {
             const dv = new DataView(mem.buffer, mem.byteOffset);
             let value = 0;
             if (src) {
+                if (param === AL_SOURCE_STATE) syncSourceState(src);
                 switch (param) {
                     case AL_SOURCE_STATE: value = src.state; break;
                     case AL_BUFFERS_QUEUED: value = src.queuedBuffers.length; break;
@@ -394,7 +414,10 @@ export class OpenAL implements IModule {
         };
 
         this.exports["alGetSource3i"] = () => 0;
-        this.exports["alGetSourceiv"] = () => 0;
+        // Same contract as alGetSourcei for every single-valued property (which is all of
+        // the ones above) — returning a bare 0 would report AL_SOURCE_STATE as "not a state"
+        // and re-open the never-finishes hole through the other entry point.
+        this.exports["alGetSourceiv"] = this.exports["alGetSourcei"];
 
         // ── Source playback ──────────────────────────────────────────────
 

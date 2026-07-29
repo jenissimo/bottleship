@@ -18,6 +18,9 @@ import type { HarnessService } from "../service";
 import { frameProfiler, type BadFrameCapture, type FrameSample } from "../../core/frame-profiler";
 import { profiler } from "../../core/profiler";
 import { readbackCounters } from "../../modules/ddraw/surface-sync";
+import { drawCostProfiler } from "../../backends/webgpu/ddraw/draw-cost-profiler";
+import { cpu, sys, symbolize } from "../serialize";
+import { HarnessError, HarnessErrorCode } from "../rpc";
 
 /** Compact a category record to ms (drop zero buckets) for terse output. */
 function categoriesMs(categories: Record<string, number>): Record<string, number> {
@@ -140,6 +143,22 @@ export function registerPerfCommands(svc: HarnessService): void {
         };
         if (opts.reset) readbackCounters.reset();
         return snapshot;
+    });
+
+    /**
+     * drawCost({enable?, reset?}) — per-draw CPU breakdown inside the ddraw draw handler
+     * (resolve / prepare / vconvert / ringup / submit / tail), off by default and zero-cost
+     * while off. `perfThunks` prices a draw thunk as one number; this says WHICH phase of it
+     * is expensive, which is the difference between "the guest draws a lot" and "our
+     * per-draw resolve work is the cost". Flow: drawCost({enable:true,reset:true}) →
+     * tickFrames(N) → drawCost().
+     */
+    svc.register("drawCost", (args) => {
+        const opts = (args[0] ?? {}) as { enable?: boolean; reset?: boolean };
+        if (opts.enable === true) drawCostProfiler.enable();
+        else if (opts.enable === false) drawCostProfiler.disable();
+        else if (opts.reset) drawCostProfiler.reset();
+        return { enabled: drawCostProfiler.isEnabled(), ...drawCostProfiler.report() };
     });
 
     /** perfStats() — latest + average frame sample (no per-frame thunk detail). */

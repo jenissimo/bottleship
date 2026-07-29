@@ -25,6 +25,12 @@ import { getContainerDir } from "../../runtime/filesystem/container-store";
 
 /** v86 places JIT slot i at wasm_table[i + WASM_TABLE_OFFSET] (vendor/v86/src/const.js). */
 const WASM_TABLE_OFFSET = 1024;
+/** Legal JIT slots are 1..WASM_TABLE_SIZE-1 (jit.rs: `(1..=(WASM_TABLE_SIZE - 1))`). The
+ *  engine's own registration only rejects >= 0xFFFF, so THIS is the bound that decides
+ *  whether a persisted index is a slot at all — checking 0xFFFF instead would let a
+ *  corrupted index.json through to the reservation, where the miss reads as "slot-taken"
+ *  and hides a malformed cache behind a plausible refusal. */
+const WASM_TABLE_SIZE = 900;
 const PAGE_SIZE = 4096;
 
 /** One published page of a unit: its own entry points, state flags and content hash. */
@@ -428,7 +434,7 @@ export class AotCache {
             // With no pages the publication loop would publish nothing and still count as a
             // success. snapshot() never produces that; a truncated index.json could.
             if (!u.pages?.length) { no("no-pages"); continue; }
-            if (!(u.tableIndex > 0 && u.tableIndex < 0xFFFF)) { no("no-table-index"); continue; }
+            if (!(u.tableIndex > 0 && u.tableIndex < WASM_TABLE_SIZE)) { no("no-table-index"); continue; }
             let contentOk = true;
             for (const p of u.pages) {
                 if ((await sha256Page(mem, p.physPage * PAGE_SIZE)) !== p.sha) { contentOk = false; break; }

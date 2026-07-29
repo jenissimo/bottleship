@@ -140,8 +140,12 @@ async function runPageSteps(session: CdpSession, steps: HarnessStep[]): Promise<
     // (avoids brittle expression escaping).
     const payload = JSON.stringify(JSON.stringify(steps));
     const expr = `window.__BS__ && window.__BS__.harness ? window.__BS__.harness.__runSteps(JSON.parse(${payload})) : Promise.reject(new Error('harness facade not installed (open ?game=dev)'))`;
-    // Generous timeout: chains can include long waits (tickFrames, waitForEvent).
-    return (await pageEval(session, expr, { timeoutMs: 300_000 })) as HarnessRunResult;
+    // The batch outlives its slowest step, so the CLI budget is the SUM of the per-step
+    // budgets the chain asked for (tickFrames/waitUntil set theirs explicitly) plus slack.
+    // A flat cap would abandon the eval while the chain is still legitimately running — and
+    // the page keeps going, so the run reads as a timeout while the guest is mid-load.
+    const budget = steps.reduce((sum, s) => sum + (s.opts?.timeoutMs ?? 30_000), 0);
+    return (await pageEval(session, expr, { timeoutMs: Math.max(300_000, budget + 60_000) })) as HarnessRunResult;
 }
 
 /** CLI-side step executor: run CDP verbs here, batch everything else into the page,

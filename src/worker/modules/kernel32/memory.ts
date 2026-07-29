@@ -11,6 +11,7 @@ import { System } from '../../core/system';
 import { bumpFastmemGeneration, type RegionPerms } from '../../core/memory/address-space';
 import { Mem } from '../../core/memory/mem-accessor';
 import { registerGuestCommitNotifier } from '../../core/memory/guest-page-commit';
+import { profiler } from '../../core/profiler';
 import { hypercallDataManager } from '../../core/cpu/hypercall-data';
 import {
     MEM_HEAP_BASE,
@@ -1784,12 +1785,17 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         // When lpAddress=0, Windows implicitly reserves+commits — fall through to the allocation path.
         const commitOnly = (flAllocationType & MEM_COMMIT) && !(flAllocationType & MEM_RESERVE) && effectiveAddress !== 0;
         if (commitOnly) {
-            const inReserved = Array.from(reservedPages.entries()).some(
-                ([base, size]) => effectiveAddress >= base && effectiveAddress < base + size
-            );
+            profiler.start("VirtualAlloc:reserveScan");
+            let inReserved = false;
+            for (const [base, size] of reservedPages) {
+                if (effectiveAddress >= base && effectiveAddress < base + size) { inReserved = true; break; }
+            }
+            profiler.end("VirtualAlloc:reserveScan");
             if (inReserved) {
+                profiler.start("VirtualAlloc:commitInReserved");
                 commitPreservingCommitted(effectiveAddress, alignedSize);
                 clearDecommittedRange(effectiveAddress, alignedSize);
+                profiler.end("VirtualAlloc:commitInReserved");
                 Logger.verbose(LogCategory.KERNEL32, `VirtualAlloc -> 0x${effectiveAddress.toString(16)} (COMMIT in reserved, size=${alignedSize})`);
                 return effectiveAddress;
             }
@@ -1807,6 +1813,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             return 0;
         }
 
+        profiler.start("VirtualAlloc:alloc");
         try {
             if (address === 0) {
                 // Align to 64KB allocation granularity (not just 4KB page).
@@ -1820,10 +1827,12 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 process.memory.allocAt(address, alignedSize, 'HEAP', perms);
             }
         } catch (error) {
+            profiler.end("VirtualAlloc:alloc");
             System.getInstance().scheduler.setLastError(ERROR_INVALID_ADDRESS);
             Logger.warn(LogCategory.KERNEL32, `VirtualAlloc: Allocation failed: ${error}`);
             return 0;
         }
+        profiler.end("VirtualAlloc:alloc");
 
         if (flAllocationType & MEM_RESERVE) {
             reservedPages.set(address, alignedSize);
@@ -1836,12 +1845,14 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         }
 
         if (flAllocationType & MEM_COMMIT) {
+            profiler.start("VirtualAlloc:commit");
             const ptm = process.pageTableManager;
             if (ptm?.isPagingEnabled()) {
                 ptm.commitPages(address, alignedSize);
             } else {
                 process.addressSpace.fill(address, alignedSize, 0);
             }
+            profiler.end("VirtualAlloc:commit");
             Logger.verbose(LogCategory.KERNEL32, `VirtualAlloc: Committed ${alignedSize} bytes at 0x${address.toString(16)} perms=${perms}`);
         }
 
