@@ -24,6 +24,8 @@ export const G = {
     mxcsr: 824,             // :57
     reg_xmm: 832,           // :59
     fpu_stack_ptr: 1032,    // :64
+    fpu_control_word: 1036, // :65
+    fpu_status_word: 1040,  // :66
     fpu_st: 1152,           // :75
     fastmem_generation: 1280, // :78
 };
@@ -32,6 +34,9 @@ export const reg32Offset = (i) => G.reg32 + i * 4;
 /** vendor/v86/src/rust/cpu/cpu.rs:84-124 */
 export const FLAG = {
     SUB: -0x8000_0000, CARRY: 1, PARITY: 4, ADJUST: 16, ZERO: 64, SIGN: 128, OVERFLOW: 2048,
+    // Not arithmetic, and therefore NOT in FLAGS_ALL: DF lives only in `flags` (contract N106),
+    // which is why CLD/STD are read-modify-writes over that word (jit_instructions.rs:4400).
+    DIRECTION: 1024,        // cpu/cpu.rs:92
 };
 export const FLAGS_ALL = FLAG.CARRY | FLAG.PARITY | FLAG.ADJUST | FLAG.ZERO | FLAG.SIGN | FLAG.OVERFLOW;
 export const OPSIZE_8 = 7, OPSIZE_16 = 15, OPSIZE_32 = 31;
@@ -72,4 +77,38 @@ export const HELPERS = {
     safe_read_write32s_slow_jit: "ii_i",
     trigger_fault_end_jit: "v_v",
     test_p: "v_v_ret",   // placeholder, unused in this slice
+};
+
+/**
+ * Checklist C5 / contract N26, discharged by proving its PREMISE false.
+ *
+ * C5 says `previous_ip@560` must be materialized before any instruction lowered to a
+ * potentially-faulting INTERPRETER helper, because those helpers do
+ * `*instruction_pointer = *previous_ip` (cpu.rs:3539-3585) — unlike the `*_jit` triggers, which
+ * rebuild EIP from a compile-time immediate and never read it (cpu.rs:2363-2392). v86 keeps that
+ * sound structurally: every such instruction is a block boundary, which makes the block an `Exit`
+ * block, which materializes `previous_ip`.
+ *
+ * This slice instead makes the premise false: it imports no helper that can raise a fault at all.
+ * The list below is the ALLOWLIST that claim rests on — one entry per name, with the reason it
+ * cannot fault — and `verify.mjs` refuses any import outside it (plus the `*_slow_jit` family,
+ * which faults through the two-phase `#PF` protocol of N65 and demonstrably does not consult
+ * `previous_ip`). So adding a faulting helper to the slice is a build refusal rather than a
+ * silent wrong EIP in a guest exception frame months later.
+ */
+export const HELPERS_NONFAULTING = {
+    // 8-bit ALU/unary: pure arithmetic over i32 args + the lazy-flag globals (cpu/arith.rs).
+    adc8: "no memory access", sbb8: "no memory access",
+    inc8: "no memory access", dec8: "no memory access",
+    not8: "no memory access", neg8: "no memory access",
+    // 8-bit shifts/rotates and the 32-bit rotates (cpu/shift.rs) — value in, value out.
+    rol8: "no memory access", ror8: "no memory access", rcl8: "no memory access",
+    rcr8: "no memory access", shl8: "no memory access", shr8: "no memory access",
+    sar8: "no memory access",
+    rol32: "no memory access", ror32: "no memory access", rcl32: "no memory access",
+    rcr32: "no memory access",
+    // Bit scan (cpu/bitops.rs): sets ZF and returns the index; no memory, no trap.
+    bsf32: "no memory access", bsr32: "no memory access",
+    // The PF condition (cpu/misc_instr.rs): reads the lazy tuple only.
+    test_p: "reads the flag tuple only", test_np: "reads the flag tuple only",
 };

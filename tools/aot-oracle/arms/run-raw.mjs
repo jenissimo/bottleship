@@ -23,15 +23,13 @@ import * as L from "../corpus/layout.mjs";
 import { getCase } from "../corpus/cases.mjs";
 import { insPerOuter } from "../corpus/image.mjs";
 import { readCandidateStateBlock } from "../lib/state.mjs";
+import { parseArgs, usageExit } from "../lib/args.mjs";
 
-const args = {};
-for (let i = 2; i < process.argv.length; i++) {
-    const a = process.argv[i];
-    if (!a.startsWith("--")) continue;
-    const next = process.argv[i + 1];
-    if (next !== undefined && !next.startsWith("--")) { args[a.slice(2)] = next; i++; }
-    else args[a.slice(2)] = "1";
-}
+// No --flags / --relaxed here on purpose: a foreign module has no codegen shape to set, so
+// accepting one would mean silently applying it to nothing.
+const KNOWN = ["case", "candidate", "mode", "outer", "warmup-calls", "chunk", "fault"];
+let args;
+try { args = parseArgs(process.argv, KNOWN); } catch (e) { usageExit(e); }
 
 const c = getCase(args.case || "k1");
 const n1 = Number(args.outer || 20000);
@@ -59,6 +57,12 @@ if (declaredImports.length) {
 const instance = new WebAssembly.Instance(module, {});
 const ex = instance.exports;
 if (typeof ex.guest_base !== "function") { console.error("candidate exports no guest_base()"); process.exit(2); }
+// A case may exist for the v86-hosted arms only (no foreign-module entry point). Say which case
+// and why, instead of dereferencing null and reporting a crash the caller has to decode.
+if (!c.raw) {
+    console.error(`case ${c.id} declares no raw entry point — it is a unit-only case; run it with arms/run-v86.mjs`);
+    process.exit(2);
+}
 const entryName = c.raw.fn;
 if (typeof ex[entryName] !== "function") { console.error(`candidate exports no ${entryName}() for case ${c.id}`); process.exit(2); }
 const base = ex.guest_base();

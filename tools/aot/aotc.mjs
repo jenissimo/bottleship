@@ -48,6 +48,9 @@ try {
     unit = compileUnit({
         pageBase, pageBytes, entryAddrs,
         stateFlags: job.page.stateFlags, jitConfig: job.jitConfig,
+        // --loop-bound lowers B7's bound so a short kernel REACHES it; the differential stand then
+        // proves the guard is taken and that taking it changes nothing. Production never sets it.
+        loopCounter: args["loop-bound"] === undefined ? undefined : Number(args["loop-bound"]),
     });
 }
 catch (e) {
@@ -80,6 +83,8 @@ fs.writeFileSync(path.join(path.dirname(outPrefix), wasmName), Buffer.from(unit.
 const manifest = {
     tool: "aot/aotc", slice: "integer-core", case: job.case,
     jit_flags: job.jitConfig, relaxed_fpu: job.relaxedFpu,
+    // B7's bound, recorded so a lowered (experiment-only) bound cannot ship unnoticed.
+    loop_counter: unit.loopCounter,
     engine_sha256: job.engine.sha256,
     // Values the loader patches in; the body carries a padded LEB placeholder at each site.
     relocations: { tlb_data: job.engine.tlbDataBase },
@@ -111,6 +116,9 @@ console.log(JSON.stringify({
         blocks: unit.blocks.length,
         blockKinds: unit.blocks.reduce((a, b) => (a[b.ty] = (a[b.ty] ?? 0) + 1, a), {}),
         unsupported: unit.unsupported,
+        // Empty is the healthy value: a call whose return point is not a published entry
+        // dispatches to a miss on return and the JIT then displaces the unit (design §4.2/K5).
+        callReturnPointsUnpublished: unit.callReturnPointsUnpublished.map((a) => "0x" + a.toString(16)),
     },
     module: {
         bytes: unit.bytes.length, bodyBytes: stats.bytes, wasmInstructions: stats.instructions,

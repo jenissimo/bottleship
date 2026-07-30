@@ -25,6 +25,11 @@ export const OP = {
     I32GTU: 0x4b, I32LES: 0x4c, I32LEU: 0x4d, I32GES: 0x4e, I32GEU: 0x4f,
     I32ADD: 0x6a, I32SUB: 0x6b, I32MUL: 0x6c,
     I32AND: 0x71, I32OR: 0x72, I32XOR: 0x73, I32SHL: 0x74, I32SHRS: 0x75, I32SHRU: 0x76,
+    I32ROTL: 0x77, I32ROTR: 0x78,
+    // The i64 subset the 32x32->64 multiplies need (mul32/imul32/imul3_reg32).
+    I64EQ: 0x51, I64NE: 0x52,
+    I64MUL: 0x7e, I64SHRU: 0x88,
+    I32WRAPI64: 0xa7, I64EXTENDI32S: 0xac, I64EXTENDI32U: 0xad,
     I32EXTEND8S: 0xc0, I32EXTEND16S: 0xc1,
 };
 export const TYPE = { I32: 0x7f, I64: 0x7e, VOID_BLOCK: 0x40, FUNC: 0x60, ANYFUNC: 0x70 };
@@ -58,6 +63,7 @@ const FT = [
     { key: "v_v", params: [], results: [] },
     { key: "i_v", params: [TYPE.I32], results: [] },
     { key: "v_i", params: [], results: [TYPE.I32] },
+    { key: "i_i", params: [TYPE.I32], results: [TYPE.I32] },
     { key: "ii_i", params: [TYPE.I32, TYPE.I32], results: [TYPE.I32] },
     { key: "iii_i", params: [TYPE.I32, TYPE.I32, TYPE.I32], results: [TYPE.I32] },
 ];
@@ -70,6 +76,7 @@ export class ModuleBuilder {
         this.importIndex = new Map();
         this.localTypes = [];       // types of locals beyond the single i32 argument
         this.freeI32 = [];
+        this.freeI64 = [];
         this.labelStack = [];       // innermost last
         this.relocs = [];           // {kind, at, width, note}
         this.marks = [];            // {offset, tag} — provenance for the verifier
@@ -90,17 +97,22 @@ export class ModuleBuilder {
     }
 
     // ── locals ──────────────────────────────────────────────────────────────
-    allocLocal() {
-        if (this.freeI32.length) return this.freeI32.pop();
+    allocLocal() { return this.#alloc(TYPE.I32, this.freeI32); }
+    freeLocal(i) { if (i !== 0) this.freeI32.push(i); }
+    /** i64 scratch: only the 32x32->64 multiply shapes need it (jit_instructions.rs:2009, :2087). */
+    allocLocal64() { return this.#alloc(TYPE.I64, this.freeI64); }
+    freeLocal64(i) { this.freeI64.push(i); }
+
+    #alloc(type, freeList) {
+        if (freeList.length) return freeList.pop();
         // local 0 is the module argument (the dispatcher target), contract N4.
         const idx = 1 + this.localTypes.length;
-        this.localTypes.push(TYPE.I32);
+        this.localTypes.push(type);
         // wasm_builder.rs:717 pushes local indices as a single raw byte; keep the same ceiling
         // so a body produced here stays byte-compatible with the engine's own decoder habits.
         if (idx > 127) throw new Error("local index > 127 (design §S4 hard budget)");
         return idx;
     }
-    freeLocal(i) { if (i !== 0) this.freeI32.push(i); }
 
     // ── raw emit ────────────────────────────────────────────────────────────
     u8(b) { this.body.push(b & 0xff); return this; }
@@ -222,8 +234,15 @@ export class ModuleBuilder {
         const bodyStart = { value: 0 };
         {
             const p = [];
+            // Run-length groups in declaration order — local indices follow that order, so an
+            // interleaved i32/i64 allocation sequence stays consistent with the indices handed
+            // out by #alloc. With i32 only this collapses to the single group it always was.
             const locals = [];
-            if (this.localTypes.length) locals.push([this.localTypes.length, TYPE.I32]);
+            for (const t of this.localTypes) {
+                const last = locals[locals.length - 1];
+                if (last && last[1] === t) last[0]++;
+                else locals.push([1, t]);
+            }
             const fn = [];
             lebU(fn, locals.length);
             for (const [count, t] of locals) { lebU(fn, count); fn.push(t); }

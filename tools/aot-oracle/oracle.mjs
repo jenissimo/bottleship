@@ -9,9 +9,11 @@
 // Runs headless in Node: no Chrome, no harness, no dev server, no game, no bundle.
 //
 //   node oracle.mjs --candidate unit:auto --case k1 --check
-//   node oracle.mjs --candidate unit:./units/k1.json --case k1 --reps 5
-//   node oracle.mjs --candidate raw:../probes/aot-spike/variant-b/target/.../aot_spike_b.wasm#b1 --case k1,k2
-//   node oracle.mjs --self-test
+//   node oracle.mjs --candidate unit:../aot/units/k3.json --case k3 --check
+//   node oracle.mjs --candidate unit:auto --case k1 --check --flags "5=0"   # an ablation, gated
+//   node oracle.mjs --candidate unit:auto --case k1 --reps 5 --outer 40000 --warmup 200000
+//   node oracle.mjs --self-test      the comparator and the gates, in-process
+//   node oracle.mjs --shape-check    proof that --flags reaches the emitter (needs the engine)
 //
 // Candidate specs:
 //   unit:<manifest.json>  a contract-shaped AOT module (export f(i32)->(), imports from "e"),
@@ -36,33 +38,183 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import url from "node:url";
+import crypto from "node:crypto";
 import { compareRegions, compareState, describeFirst } from "./lib/compare.mjs";
-import { evaluateGates, median, spreadPct, steady } from "./lib/gates.mjs";
+import { evaluateGates, median, spreadPct, steady, timingProblems } from "./lib/gates.mjs";
 import { CASES } from "./corpus/cases.mjs";
 import { runSelfTest } from "./lib/selftest.mjs";
+import { parseArgs, parseFlagOverrides, usageExit } from "./lib/args.mjs";
 
 const __dirname = url.fileURLToPath(new URL(".", import.meta.url));
 
-const args = {};
-for (let i = 2; i < process.argv.length; i++) {
-    const a = process.argv[i];
-    if (!a.startsWith("--")) continue;
-    const next = process.argv[i + 1];
-    if (next !== undefined && !next.startsWith("--")) { args[a.slice(2)] = next; i++; }
-    else args[a.slice(2)] = "1";
-}
+const KNOWN = ["self-test", "shape-check", "prove", "candidate", "case", "check", "reps", "outer",
+    "warmup", "warmup-calls", "fault", "flags", "relaxed", "workdir", "out", "v8", "baseline-flags"];
+let args;
+try { args = parseArgs(process.argv, KNOWN); } catch (e) { usageExit(e); }
 
 if (args["self-test"]) {
     const r = runSelfTest();
     for (const t of r.tests) process.stderr.write(`${t.ok ? "pass" : "FAIL"}  ${t.name}${t.ok ? "" : " — " + t.detail}\n`);
     process.stderr.write(`\nself-test: ${r.passed}/${r.tests.length} passed\n`);
+    process.stderr.write("(the shape knob's plumbing needs the engine: node oracle.mjs --shape-check)\n");
     console.log(JSON.stringify({ verdict: r.ok ? "SELFTEST_PASS" : "SELFTEST_FAIL", ...r }, null, 2));
     process.exit(r.ok ? 0 : 1);
 }
 
+const workdir = args.workdir || fs.mkdtempSync(path.join(os.tmpdir(), "aot-oracle-"));
+fs.mkdirSync(workdir, { recursive: true });
+
+const nodeFlags = args.v8 ? String(args.v8).split(/[, ]+/).filter(Boolean).map((f) => (f.startsWith("--") ? f : "--" + f)) : [];
+
+// An arm that refuses — a shape knob that did not take, a manifest that does not match the live
+// engine, a missing engine build — has already printed WHY on its own stderr. Surface that as the
+// documented "an arm failed" exit code (3) rather than letting execFileSync throw: a Node stack
+// trace and an undocumented exit 1 is not a verdict a caller can act on.
+function run(script, extra) {
+    const argv = [...nodeFlags, path.join(__dirname, script), ...extra];
+    const fail = (why, detail) => {
+        process.stderr.write(`arm ${script} ${why}\n  ${argv.slice(nodeFlags.length + 1).join(" ")}\n`
+            + (detail ? `${String(detail).trim()}\n` : ""));
+        process.exit(3);
+    };
+    let out;
+    try { out = execFileSync(process.execPath, argv, { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 }); }
+    catch (e) { fail(`failed (exit ${e.status ?? "?"}${e.signal ? ", signal " + e.signal : ""})`, e.stderr); }
+    const line = out.trim().split("\n").pop();
+    try { return JSON.parse(line); }
+    catch { fail("produced no JSON result on its last stdout line", line?.slice(0, 400)); }
+}
+
+// The codegen shape (`--flags`) reaches the emitter, or this tool says so.
+//
+// An ablation is only an ablation if the knob changed the produced code. This mode captures the
+// JIT's own module for one case under two shapes and asserts (a) each arm read its shape back
+// out of the engine, (b) the two recorded shapes differ in the requested index, and (c) the
+// module BYTES differ. Design F-d is what it regression-tests.
+//
+//   node oracle.mjs --shape-check [--case k1] [--flags 5=0] [--baseline-flags ""]
+if (args["shape-check"]) {
+    const caseId = args.case || "k1";
+    if (!CASES[caseId]) usageExit(new Error(`unknown case ${caseId}`));
+    if (args.flags === "1") usageExit(new Error('--flags needs a value, e.g. --flags "5=0"'));
+    const ablation = args.flags ?? "5=0";
+    let overrides;
+    try { overrides = parseFlagOverrides(ablation); } catch (e) { usageExit(e); }
+    const baseline = args["baseline-flags"] === "1" ? "" : (args["baseline-flags"] ?? "");
+    const outerN = String(Number(args.outer || 2000)), warmupN = String(Number(args.warmup || 2000));
+
+    const capture = (label, flags) => {
+        const prefix = path.join(workdir, `shape-${label}`);
+        const a = ["--case", caseId, "--outer", outerN, "--warmup", warmupN, "--capture", prefix];
+        if (flags) a.push("--flags", flags);
+        const r = run("arms/run-v86.mjs", a);
+        if (r.status !== "ok" || !r.capture?.units) throw new Error(`capture "${label}" produced no unit (status ${r.status})`);
+        const manifest = JSON.parse(fs.readFileSync(r.capture.file, "utf8"));
+        const bytes = fs.readFileSync(path.join(path.dirname(prefix), manifest.units[0].file));
+        return { flags_requested: flags || null, jit_flags: manifest.jit_flags, bytes: bytes.length,
+            sha256: crypto.createHash("sha256").update(bytes).digest("hex") };
+    };
+
+    const problems = [];
+    let A, B;
+    try { A = capture("base", baseline); B = capture("ablated", ablation); }
+    catch (e) { process.stderr.write(`${e.message}\n`); process.exit(3); }
+
+    for (const [i, v] of overrides) {
+        if (B.jit_flags[i] !== v) problems.push(`the ablated arm read flag ${i} back as ${B.jit_flags[i]}, not the requested ${v} — the knob never reached the engine`);
+        if (A.jit_flags[i] === v) problems.push(`the baseline arm already had flag ${i} = ${v} — this pair is not an ablation; pick a knob the default shape does not already set`);
+    }
+    if (A.sha256 === B.sha256) {
+        problems.push(`both shapes produced the SAME module bytes (${A.sha256.slice(0, 16)}, ${A.bytes} B) — either the knob does not change this case's codegen (pick another --case/--flags) or the shape is not being applied`);
+    }
+    const ok = problems.length === 0;
+    for (const p of problems) process.stderr.write(`FAIL  ${p}\n`);
+    process.stderr.write(`${ok ? "pass" : "FAIL"}  shape-check ${caseId}: base ${A.bytes} B ${A.sha256.slice(0, 12)} vs `
+        + `${ablation} ${B.bytes} B ${B.sha256.slice(0, 12)}\n`);
+    console.log(JSON.stringify({ verdict: ok ? "SHAPE_CHECK_PASS" : "SHAPE_CHECK_FAIL",
+        case: caseId, baseline: A, ablated: B, problems }, null, 2));
+    process.exit(ok ? 0 : 1);
+}
+
+// Prove the ORACLE, not a candidate: for every case, the opt-0 identity candidate must come out
+// CORRECT, and every fault the case declares must come out DIVERGENT with a named first
+// divergence. Both halves are needed. A case that only ever agrees has never been shown to be
+// able to fail; a comparator that only ever disagrees would also "pass" a negative control.
+//
+//   node oracle.mjs --prove [--case k1,k7] [--candidate unit:../aot/units/{case}.json]
+//
+// `--candidate` defaults to `unit:auto` (the capture-and-republish producer, design S-1), which
+// proves the ORACLE. Pass a template containing `{case}` to prove a real PRODUCER instead: the
+// same two halves are then asserted about the compiler's own units, which is the artifact a slice
+// report has to carry. Without it a report can only quote hand-assembled per-case runs, and a
+// missing negative control is invisible.
+if (args.prove) {
+    const ids = (args.case || Object.keys(CASES).join(",")).split(",").map((s) => s.trim()).filter(Boolean);
+    for (const k of ids) if (!CASES[k]) usageExit(new Error(`unknown case ${k}`));
+    const outerN = String(Number(args.outer || 2000)), warmupN = String(Number(args.warmup || 2000));
+
+    /**
+     * Run one --check through a child oracle and return its per-case summary.
+     *
+     * DIVERGENT (exit 5) and INVALID (exit 4) are RESULTS here, not crashes, so the child's
+     * nonzero status must not be read as a failure — its JSON verdict is. The child prints one
+     * pretty-printed JSON document on stdout, so the whole stream is parsed; taking the last
+     * line (which is what the ARM protocol uses) yields a bare "}".
+     */
+    const candTemplate = args.candidate || "unit:auto";
+    const candFor = (caseId) => candTemplate.replace(/\{case\}/g, caseId);
+    const once = (caseId, faultName) => {
+        const shown = ["--check", "--case", caseId, "--candidate", candFor(caseId),
+            ...(faultName ? ["--fault", faultName] : [])];
+        const a = [...shown, "--outer", outerN, "--warmup", warmupN,
+            "--workdir", path.join(workdir, `prove-${caseId}-${faultName ?? "clean"}`)];
+        let stdout;
+        try {
+            stdout = execFileSync(process.execPath, [...nodeFlags, path.join(__dirname, "oracle.mjs"), ...a],
+                { encoding: "utf8", maxBuffer: 256 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
+        } catch (e) { stdout = String(e.stdout ?? ""); if (!stdout.trim()) throw e; }
+        const per = JSON.parse(stdout).cases?.[caseId];
+        if (!per) throw new Error(`child reported no result for ${caseId}`);
+        return { cmd: shown.join(" "), ...per };
+    };
+    const rows = [];
+    const attempt = (caseId, faultName) => {
+        try { return once(caseId, faultName); }
+        catch (e) {
+            return { verdict: "ARM_FAILED", cmd: `--check --case ${caseId} --candidate ${candFor(caseId)}`
+                + (faultName ? ` --fault ${faultName}` : ""), why: String(e.stderr ?? e.message ?? e).slice(-400) };
+        }
+    };
+    for (const caseId of ids) {
+        const clean = attempt(caseId, null);
+        rows.push({ case: caseId, kind: `positive control (${candFor(caseId)})`, expected: "CORRECT", ...clean,
+            ok: clean.verdict === "CORRECT" });
+        for (const faultName of Object.keys(CASES[caseId].faults ?? {})) {
+            const r = attempt(caseId, faultName);
+            rows.push({ case: caseId, kind: `negative control (--fault ${faultName})`, expected: "DIVERGENT", ...r,
+                // A divergence with no named address would be a hash comparison wearing a diff's
+                // name, and one that never reached `output_identical` would mean the gate list
+                // does not carry it — so both are part of the pass condition.
+                ok: r.verdict === "DIVERGENT" && !!r.first_divergence
+                    && (r.gates_failed ?? []).includes("output_identical") });
+        }
+    }
+    const failed = rows.filter((r) => !r.ok);
+    for (const r of rows) {
+        process.stderr.write(`${r.ok ? "pass" : "FAIL"}  ${r.case.padEnd(3)} ${r.kind.padEnd(34)} `
+            + `${String(r.verdict).padEnd(9)} ${r.first_divergence ?? ""}\n`);
+    }
+    process.stderr.write(`\nprove: ${rows.length - failed.length}/${rows.length} — every case shown to AGREE and to be able to FAIL\n`);
+    console.log(JSON.stringify({ verdict: failed.length ? "PROVE_FAIL" : "PROVE_PASS",
+        candidate: candTemplate, checks: rows.length, failed: failed.length, rows }, null, 2));
+    process.exit(failed.length ? 1 : 0);
+}
+
 const spec = args.candidate;
 if (!spec) {
-    process.stderr.write("usage: node oracle.mjs --candidate <unit:auto|unit:file.json|raw:file.wasm#mode> [--case k1,k2] [--check] [--reps N] [--fault name]\n");
+    process.stderr.write("usage: node oracle.mjs --candidate <unit:auto|unit:file.json|raw:file.wasm#mode> [--case k1,k2] [--check] [--reps N] [--fault name] [--flags 5=0] [--relaxed 0]\n"
+        + "       node oracle.mjs --self-test          the oracle's own logic (no engine)\n"
+        + "       node oracle.mjs --shape-check        prove --flags reaches the emitter\n");
     process.exit(2);
 }
 const m = /^(unit|raw):(.+)$/.exec(spec);
@@ -85,22 +237,31 @@ const outer = Number(args.outer || (check ? 2000 : 40000));
 const warmup = Number(args.warmup || (check ? 2000 : 200000));
 const warmupCalls = Number(args["warmup-calls"] || (check ? 2000 : 50000));
 const fault = args.fault || null;
-const workdir = args.workdir || fs.mkdtempSync(path.join(os.tmpdir(), "aot-oracle-"));
-fs.mkdirSync(workdir, { recursive: true });
 
-const nodeFlags = args.v8 ? String(args.v8).split(/[, ]+/).filter(Boolean).map((f) => (f.startsWith("--") ? f : "--" + f)) : [];
-
-function run(script, extra) {
-    const out = execFileSync(process.execPath, [...nodeFlags, path.join(__dirname, script), ...extra],
-        { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
-    const line = out.trim().split("\n").pop();
-    return JSON.parse(line);
+// The codegen shape is FORWARDED to both v86 arms and gated afterwards (shape.as_requested /
+// shape.arms_agree). It used to be parsed here and dropped, so every `--flags` run measured the
+// default shape while the report called it an ablation (design F-d).
+if (args.flags === "1") usageExit(new Error('--flags needs a value, e.g. --flags "5=0"'));
+const flags = args.flags ?? null;
+let flagOverrides = new Map();
+try { flagOverrides = parseFlagOverrides(flags); } catch (e) { usageExit(e); }
+const relaxed = args.relaxed === undefined ? null : Number(args.relaxed);
+if (relaxed !== null && relaxed !== 0 && relaxed !== 1) usageExit(new Error(`--relaxed must be 0 or 1, got ${args.relaxed}`));
+if (candClass === "raw" && (flags || relaxed !== null)) {
+    // A raw module has no codegen shape: applying one would move the REFERENCE arm only, and the
+    // ratio would be a shape difference wearing a candidate's name.
+    usageExit(new Error("--flags/--relaxed cannot be used with a raw: candidate — the shape would apply to the reference arm only"));
 }
+const shapeArgs = [
+    ...(flags ? ["--flags", flags] : []),
+    ...(relaxed !== null ? ["--relaxed", String(relaxed)] : []),
+];
 
 const report = {
     tool: "aot-oracle", started_at: new Date().toISOString(), node: process.version,
     candidate: { class: candClass, target: candTarget, mode: candMode },
-    params: { cases, reps, outer, warmup, warmupCalls, check, fault, workdir },
+    params: { cases, reps, outer, warmup, warmupCalls, check, fault, workdir,
+        flags, flag_overrides: Object.fromEntries([...flagOverrides]), relaxed },
     cases: {}, verdict: null,
 };
 
@@ -118,9 +279,9 @@ function assertManifestCase(file, caseId) {
 }
 
 for (const caseId of cases) {
-    const refArgs = ["--case", caseId, "--outer", String(outer), "--warmup", String(warmup)];
+    const refArgs = ["--case", caseId, "--outer", String(outer), "--warmup", String(warmup), ...shapeArgs];
     const candArgsBase = candClass === "unit"
-        ? ["--case", caseId, "--outer", String(outer), "--warmup", String(warmup)]
+        ? ["--case", caseId, "--outer", String(outer), "--warmup", String(warmup), ...shapeArgs]
         : ["--case", caseId, "--candidate", candTarget, "--mode", String(candMode ?? "b1"),
             "--outer", String(outer), "--warmup-calls", String(warmupCalls)];
     // The fault, when asked for, is injected into the CANDIDATE arm only: it is the negative
@@ -156,9 +317,18 @@ for (const caseId of cases) {
         const regionCmp = compareRegions(ref.regions, cand.regions);
         const stateCmp = compareState(ref.state, cand.state);
         reps_.push({ rep, ref, cand, regionCmp, stateCmp });
+        // A per-rep progress line, before any gate has run. It is the one place a raw ratio is
+        // printed, so it says so: an ungated number copied out of a scrolling log is how a run
+        // that ends INVALID still gets quoted as a result. `timingProblems` is named here rather
+        // than left to the gate summary because a negative or non-finite slope makes the printed
+        // ratio meaningless on its face.
+        const nonRate = [...timingProblems(ref).map((p) => `ref.${p.field}=${p.value}`),
+            ...timingProblems(cand).map((p) => `cand.${p.field}=${p.value}`)];
         process.stderr.write(
             `rep ${rep} ${caseId}: ref ${ref.ns_per_outer.toFixed(0)} ns/outer | cand ${cand.ns_per_outer.toFixed(0)}` +
-            ` | ratio ${(ref.ns_per_outer / cand.ns_per_outer).toFixed(2)}x` +
+            (nonRate.length
+                ? ` | NOT A RATE (${nonRate.join(" ")}): ratio withheld`
+                : ` | ratio ${(ref.ns_per_outer / cand.ns_per_outer).toFixed(2)}x (ungated)`) +
             ` | mem ${regionCmp.identical ? "identical" : "DIVERGENT"}` +
             ` | state ${stateCmp.available ? (stateCmp.identical ? "identical" : "DIVERGENT") : "uncompared"}\n`);
     }
@@ -178,12 +348,23 @@ for (const caseId of cases) {
     const refNs = good.map((r) => r.ref.ns_per_outer);
     const candNs = good.map((r) => r.cand.ns_per_outer);
     const reportsNumber = !check && memDiverged.length === 0 && stateDiverged.length === 0;
+    const divergent = memDiverged.length > 0 || stateDiverged.length > 0;
+    const first = memDiverged[0]?.regionCmp.first ?? null;
+    const firstState = stateDiverged[0]?.stateCmp.first ?? null;
     const gateResult = evaluateGates({
         refRuns: good.map((r) => r.ref), candRuns: good.map((r) => r.cand),
         candClass, reportsNumber,
+        // The comparator's result is a GATE, not only the verdict: `gates_failed` has to name the
+        // equality failure, or a consumer reading that array calls a divergent run fully gated.
+        comparison: {
+            memory_identical: memDiverged.length === 0,
+            state_compared: !stateUncompared,
+            state_identical: stateDiverged.length === 0 ? (stateUncompared ? null : true) : false,
+            first: divergent ? describeFirst(first, firstState) : null,
+        },
+        requestedFlags: Object.fromEntries([...flagOverrides]), requestedRelaxed: relaxed,
     });
 
-    const divergent = memDiverged.length > 0 || stateDiverged.length > 0;
     // Two classes, two meanings. A failed DIFFERENTIAL gate says the candidate arm did not
     // run the candidate — identical output then proves nothing (a unit refused for a
     // content-hash mismatch compares the JIT with itself), so --check must not report CORRECT.
@@ -198,9 +379,6 @@ for (const caseId of cases) {
     else verdict = measGatesFailed ? "INVALID" : "VALID";
     if (divergent) anyDivergent = true;
     if (diffGatesFailed || (!check && measGatesFailed)) anyInvalid = true;
-
-    const first = memDiverged[0]?.regionCmp.first ?? null;
-    const firstState = stateDiverged[0]?.stateCmp.first ?? null;
 
     report.cases[caseId] = {
         verdict,
@@ -217,6 +395,11 @@ for (const caseId of cases) {
         },
         gates: gateResult.gates,
         gates_enforced: { differential: "always", measurement: gateResult.measurementEnforced },
+        // What the arms actually ran, read back from the engine — never a copy of the request.
+        shape: {
+            reference: { jit_flags: good[0].ref.jit_flags ?? null, relaxed_fpu: good[0].ref.relaxed_fpu ?? null },
+            candidate: { jit_flags: good[0].cand.jit_flags ?? null, relaxed_fpu: good[0].cand.relaxed_fpu ?? null },
+        },
         // A number is published only when nothing diverged AND every gate passed. Otherwise
         // the raw timings stay here, under a name that cannot be mistaken for a result.
         measurement: (verdict === "VALID") ? {

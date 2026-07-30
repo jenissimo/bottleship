@@ -73,6 +73,31 @@ const WALK_LIMIT = 8;   // jit.rs:1326 FLAG_LIVENESS_WALK_LIMIT
  * @param {number[]} entryAddrs guest addresses the dispatcher may enter at
  * @returns {{blocks:object[], byAddr:Map<number,object>, unsupported:object[]}}
  */
+/** MAX_INSTRUCTION_LENGTH (vendor/v86/src/rust/jit.rs:1267). */
+const MAX_INSTRUCTION_LENGTH = 16;
+
+/**
+ * v86's `is_near_end_of_page` (jit.rs:1599-1601), and the reason it must be reproduced here.
+ *
+ * Every EIP this producer publishes is `(eip & ~0xFFF) | (addr & 0xFFF)`. That encoding is
+ * faithful ONLY while no published address can land on the next page — and v86 guarantees
+ * exactly that by excluding the last 16 bytes of every page from compilation: no block may
+ * start there (jit.rs:2234), the linear run is cut there (jit.rs:2478), a conditional's
+ * fallthrough is dropped there (jit.rs:2331), no entry point is recorded there (jit.rs:4520),
+ * and codegen asserts it (jit.rs:4359). Together with `instruction_length < 16` that makes
+ * `end_addr < pageEnd` a theorem, which is what makes `stop_addr & 0xFFF` sound.
+ *
+ * Without the cut-off a block could end AT `pageBase + 0x1000`, whose low 12 bits are 0, so
+ * the exit EIP, an off-page jump target, and — worst — a `call rel32`'s pushed RETURN ADDRESS
+ * all came out one page too low: the guest resumes at the top of the wrong page with an intact
+ * stack, silently. Three independent reviews reproduced it by execution, and it passed all 36
+ * verifier checks, because C4/D9 proves the high 20 bits are PRESERVED and cannot see that the
+ * low 12 denote the wrong address. Refusing the zone makes the class unrepresentable instead.
+ */
+function isNearEndOfPage(addr) {
+    return (addr & (PAGE - 1)) >= PAGE - MAX_INSTRUCTION_LENGTH;
+}
+
 export function discoverBlocks(pageBytes, pageBase, entryAddrs) {
     const pageEnd = pageBase + PAGE;
     const starts = new Set(entryAddrs);
@@ -89,6 +114,9 @@ export function discoverBlocks(pageBytes, pageBase, entryAddrs) {
         if (seen.has(a)) continue;
         for (;;) {
             if (a < pageBase || a >= pageEnd) break;
+            // The end-of-page margin: nothing in it is decoded, so no block starts there and
+            // every linear run stops before it (see isNearEndOfPage).
+            if (isNearEndOfPage(a)) break;
             if (seen.has(a)) break;
             seen.add(a);
             const ins = decodeOne(pageBytes, a - pageBase, a);
@@ -105,6 +133,23 @@ export function discoverBlocks(pageBytes, pageBase, entryAddrs) {
             }
             else if (t.type === "jmp") {
                 if (t.target >= pageBase && t.target < pageEnd) { starts.add(t.target); work.push(t.target); }
+            }
+            else if (t.type === "call") {
+                // The callee's target AND the return point are both block heads — the engine's
+                // analyzer registers the next instruction too (no `no_next_instruction`), and
+                // the totality law (design §4.2) makes publishing it mandatory, not optional.
+                if (t.target >= pageBase && t.target < pageEnd) { starts.add(t.target); work.push(t.target); }
+                starts.add(t.next);
+                work.push(t.next);
+            }
+            else if (t.type === "absolute" && t.next !== undefined) {
+                // Indirect near CALL (FF /2): the target is dynamic, so nothing follows it in
+                // THIS unit — but the guest returns to `next`, and if that address is not a
+                // published entry the return dispatches to a miss, the interpreter records it as
+                // a new entry point and the JIT then displaces this unit (design §4.2). So the
+                // return point is a head for exactly the same reason `call rel32`'s is.
+                starts.add(t.next);
+                work.push(t.next);
             }
             break;   // terminator ends the linear run
         }
@@ -124,12 +169,22 @@ export function discoverBlocks(pageBytes, pageBase, entryAddrs) {
             if (t) {
                 if (t.type === "cond") ty = { type: "cond", cond: ins.cond, target: t.target, fall: end, ins };
                 else if (t.type === "jmp") ty = { type: "jmp", target: t.target, ins };
+                else if (t.type === "call") ty = { type: "call", target: t.target, next: t.next, ins };
                 else ty = { type: "absolute", ins };
                 a = end; break;
             }
             if (starts.has(end) && end !== start) { ty = { type: "fall", next: end }; a = end; break; }
             a = end;
-            if (a >= pageEnd) { ty = { type: "exit", eip: a }; break; }
+            // Same cut as pass 1: end the block BEFORE the margin, so `endAddr & 0xFFF`
+            // always denotes an address on this page (see isNearEndOfPage).
+            if (a >= pageEnd || isNearEndOfPage(a)) { ty = { type: "exit", eip: a }; break; }
+        }
+        // Fail closed rather than emit an EIP that loses its page. Pass 1 makes this
+        // unreachable; it is here because the emitter's `& 0xFFF` correctness depends on it
+        // and a future edit to the walk above must not be able to break that silently.
+        if (a >= pageEnd) {
+            throw new Error(`cfg: block 0x${start.toString(16)} ends at 0x${a.toString(16)}, not on its own page — ` +
+                `every EIP derived from it would lose a page (isNearEndOfPage margin violated)`);
         }
         blocks.set(start, {
             addr: start, endAddr: a, lastInsAddr: lastAddr, numInstructions: count, ty,

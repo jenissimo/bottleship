@@ -24,6 +24,7 @@ import { buildImage } from "../corpus/image.mjs";
 import * as L from "../corpus/layout.mjs";
 import { getCase } from "../corpus/cases.mjs";
 import { readV86State } from "../lib/state.mjs";
+import { parseArgs, parseFlagOverrides, usageExit } from "../lib/args.mjs";
 import { findTlbDataBase, ORACLE_PROBE_PAGES } from "../../aot/lib/tlb-base.mjs";
 
 const __dirname = url.fileURLToPath(new URL(".", import.meta.url));
@@ -31,14 +32,9 @@ const REPO = path.resolve(__dirname, "../../..");
 const WASM_TABLE_OFFSET = 1024;   // vendor/v86/src/const.js
 const PAGE_SIZE = 4096;
 
-const args = {};
-for (let i = 2; i < process.argv.length; i++) {
-    const a = process.argv[i];
-    if (!a.startsWith("--")) continue;
-    const next = process.argv[i + 1];
-    if (next !== undefined && !next.startsWith("--")) { args[a.slice(2)] = next; i++; }
-    else args[a.slice(2)] = "1";
-}
+const KNOWN = ["case", "outer", "warmup", "timeout", "aot", "capture", "fault", "flags", "relaxed"];
+let args;
+try { args = parseArgs(process.argv, KNOWN); } catch (e) { usageExit(e); }
 
 const c = getCase(args.case || "k1");
 const n1 = Number(args.outer || 20000);
@@ -54,12 +50,11 @@ if (n1 < 1 || warmup < 1) { console.error("--outer/--warmup must be >= 1"); proc
 const JIT_FLAGS = new Map([
     [5, 1], [9, 1], [10, 1], [11, 1], [12, 1], [13, 1], [18, 1], [19, 0], [21, 0], [15, 300000],
 ]);
-for (const pair of (args.flags || "").split(",").filter(Boolean)) {
-    const [i, v] = pair.split("=").map(Number);
-    if (!Number.isFinite(i) || !Number.isFinite(v)) { console.error(`bad --flags ${pair}`); process.exit(2); }
-    JIT_FLAGS.set(i, v);
-}
+let FLAG_OVERRIDES;
+try { FLAG_OVERRIDES = parseFlagOverrides(args.flags); } catch (e) { usageExit(e); }
+for (const [i, v] of FLAG_OVERRIDES) JIT_FLAGS.set(i, v);
 const relaxed = args.relaxed === undefined ? 1 : Number(args.relaxed);
+if (relaxed !== 0 && relaxed !== 1) { console.error(`--relaxed must be 0 or 1, got ${args.relaxed}`); process.exit(2); }
 
 const libv86Path = path.join(REPO, "vendor/v86/build/libv86.mjs");
 const wasmPath = path.join(REPO, "vendor/v86/build/v86.wasm");
@@ -88,10 +83,51 @@ if (args.capture) globalThis["__wasmDump"] = { pages: codePages, out: [], keepLa
 
 let aot = null;          // what we published, for liveness at the end
 let relocApplied = null; // relocation values taken from the manifest, audited at the end
+// The codegen shape READ BACK OUT of the engine, never the shape we asked for: the reported
+// value has to be the measured one, or a knob that silently failed to take would be reported
+// as if it had (see applyShape()).
+let effectiveFlags = null, effectiveRelaxed = null;
 const timer = setTimeout(() => finish("TIMEOUT"), timeoutMs);
 
 const sha256 = (buf) => crypto.createHash("sha256").update(buf).digest("hex");
 const shaPage = (mem, addr) => sha256(Buffer.from(mem.subarray(addr, addr + PAGE_SIZE)));
+
+/**
+ * Install the codegen shape and PROVE it took.
+ *
+ * `set_jit_config` on an index the engine does not know is a no-op in a release build
+ * (`jit.rs` `_ => dbg_assert!(false)`), and a boolean knob silently normalizes any nonzero to
+ * 1 — so "we called the setter" is not evidence the shape is what the report will claim. Every
+ * value is read back through `get_jit_config` and a mismatch aborts the arm, because the
+ * alternative is a run that measures one shape and is labelled another (design F-d).
+ */
+function applyShape(ex) {
+    for (const fn of ["set_jit_config", "get_jit_config", "set_relaxed_fpu", "get_relaxed_fpu"]) {
+        if (typeof ex[fn] !== "function") {
+            console.error(`engine lacks ${fn} — not the BottleShip fork, or too old to verify its own codegen shape`);
+            process.exit(2);
+        }
+    }
+    const eff = {};
+    for (const [i, v] of JIT_FLAGS) {
+        ex.set_jit_config(i, v);
+        const got = ex.get_jit_config(i) >>> 0;
+        if (got !== (v >>> 0)) {
+            console.error(`set_jit_config(${i}, ${v}) read back ${got} — the knob did not take `
+                + `(unknown index, or a boolean normalised); refusing to run a shape nobody asked for`);
+            process.exit(2);
+        }
+        eff[i] = got;
+    }
+    ex.set_relaxed_fpu(relaxed);
+    const gotRelaxed = ex.get_relaxed_fpu() >>> 0;
+    if (gotRelaxed !== relaxed) {
+        console.error(`set_relaxed_fpu(${relaxed}) read back ${gotRelaxed}`);
+        process.exit(2);
+    }
+    effectiveFlags = eff;
+    effectiveRelaxed = gotRelaxed;
+}
 
 function jitFacts(cpu) {
     const ex = cpu.wm.exports;
@@ -302,8 +338,10 @@ function finish(status) {
             regions: regions(cpu),
             state: readV86State(cpu),
             paging_on: ((cpu.cr[0] >>> 0) & 0x80000000) !== 0,
-            jit_flags: Object.fromEntries([...JIT_FLAGS]),
-            relaxed_fpu: cpu.wm.exports.get_relaxed_fpu ? cpu.wm.exports.get_relaxed_fpu() : null,
+            // Read back out of the engine, not copied from the request (applyShape).
+            jit_flags: effectiveFlags,
+            jit_flag_overrides: Object.fromEntries([...FLAG_OVERRIDES]),
+            relaxed_fpu: effectiveRelaxed,
             capture_eip: "0x" + image.captureEip.toString(16),
         };
     }
@@ -317,8 +355,10 @@ function finish(status) {
             fs.writeFileSync(path.join(path.dirname(base), file), u.bytes);
             return { entryPage: u.entryPage, tableIndex: u.tableIndex, pages: u.pages, file, bytes: u.bytes.length };
         });
+        // The manifest records the shape THAT PRODUCED THESE BYTES (read back from the engine),
+        // because that is what makes it valid or invalid to replay them later (AotVersion F1).
         fs.writeFileSync(base + ".json", JSON.stringify({
-            case: c.id, jit_flags: Object.fromEntries([...JIT_FLAGS]), relaxed_fpu: relaxed,
+            case: c.id, jit_flags: effectiveFlags, relaxed_fpu: effectiveRelaxed,
             engine_sha256: sha256(fs.readFileSync(wasmPath)), units: index,
         }, null, 2));
         result.capture = { file: base + ".json", units: index.length };
@@ -340,13 +380,7 @@ emulator.add_listener("emulator-loaded", () => {
     cpu.reset_memory();
     cpu.load_multiboot(image.buf.buffer);
 
-    const ex = cpu.wm.exports;
-    if (!ex.set_jit_config || !ex.set_relaxed_fpu) {
-        console.error("engine lacks set_jit_config/set_relaxed_fpu — not the BottleShip fork?");
-        process.exit(2);
-    }
-    for (const [i, v] of JIT_FLAGS) ex.set_jit_config(i, v);
-    ex.set_relaxed_fpu(relaxed);
+    applyShape(cpu.wm.exports);
     if (cpu.jit_clear_cache) cpu.jit_clear_cache();
 
     if (args.aot) {

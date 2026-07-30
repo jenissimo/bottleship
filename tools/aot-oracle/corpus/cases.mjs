@@ -12,6 +12,9 @@
 
 import * as L from "./layout.mjs";
 import { KERNELS } from "./kernels.mjs";
+import { buildK6, selfCheck as k6SelfCheck } from "./k6-conformance.mjs";
+
+const K6 = buildK6();
 
 /**
  * @typedef {object} Case
@@ -27,6 +30,16 @@ import { KERNELS } from "./kernels.mjs";
  * @property {{fn:string, args:(outer:number, mode:number)=>number[]}} raw foreign-module entry
  * @property {object} provenance
  */
+
+/** Overwrite one byte of a case's source data. */
+function setByte(addr, value) {
+    return (dv, origin) => {
+        const o = addr - origin;
+        const cur = dv.getUint8(o);
+        dv.setUint8(o, value);
+        return `0x${addr.toString(16)}: 0x${cur.toString(16)} -> 0x${value.toString(16)}`;
+    };
+}
 
 /** Flip the source word that feeds the LAST inner iteration of the LAST call. */
 function flipWord(addr) {
@@ -189,6 +202,117 @@ export const CASES = {
         },
         raw: { fn: "run_k4", args: (outer, mode) => [outer, mode, L.FRAME3] },
         provenance: { va: KERNELS.k4.va, sha256: KERNELS.k4.sha256, from: "NFSU Speed.exe" },
+    },
+    // K5 — charset-bitmap builder, VA 0x674b94: the 8-BIT family (8-bit load, 8-bit shift by
+    // CL, an 8-bit read-modify-write to memory, an 8-bit self-test as the loop condition).
+    // Chosen for the shapes it exercises, not for its dynamic weight — the five hot pages carry
+    // 8-bit ALU sites (597 of them, tools/aot/slice-census.mjs) but none of them inside a
+    // self-contained position-independent loop.
+    k5: {
+        id: "k5",
+        body: KERNELS.k5.bytes,
+        codeAddr: L.K5_ADDR,
+        insPerIter: KERNELS.k5.insPerIter,
+        insStatic: KERNELS.k5.insStatic,
+        iters: L.K5_LEN + 1,          // the NUL byte is processed, then the loop falls through
+        calls: [
+            {
+                off: 0,
+                // esi = string cursor, edi = 7 (bit-index mask, popped in the real prologue),
+                // ebp = frame whose [-0x24] is the bitmap; ebx/edx are seeded because the loop
+                // only ever writes their LOW BYTE and the rest survives to the capture point.
+                prologue: [
+                    ["mov", "esi", L.STR5], ["mov", "edi", 7], ["mov", "ebp", L.FRAME5],
+                    ["mov", "ebx", 0], ["mov", "edx", 0],
+                ],
+            },
+        ],
+        regions: [
+            // 0x28 rather than 0x24: four bytes past the bitmap, so a stray write is a diff.
+            { name: "BITS5", addr: L.K5_BITMAP, len: 0x28 },
+            STATE_REGION,
+        ],
+        faults: {
+            // Byte 96 -> 200: the bitmap loses one bit and gains another (every byte is
+            // distinct, so no other byte can be setting either). Registers are unaffected.
+            "src-last": setByte(L.STR5 + L.K5_LEN - 1, 200),
+            // An early NUL: changes the bitmap AND esi/eax/ecx/edx at the capture point.
+            "src-term": setByte(L.STR5 + 48, 0),
+        },
+        raw: { fn: "run_k5", args: (outer, mode) => [outer, mode, L.STR5, L.FRAME5] },
+        provenance: { va: KERNELS.k5.va, sha256: KERNELS.k5.sha256, from: "NFSU Speed.exe" },
+    },
+
+    // K6 — SYNTHETIC slice-conformance vector (corpus/k6-conformance.mjs): every instruction
+    // form the compiler's slice claims, once, straight-line. Not retail code and not a
+    // performance case — it exists because the retail corpus cannot cover a slice, and a form
+    // that was never differentially executed is a form nobody has verified.
+    k6: {
+        id: "k6",
+        body: K6.bytes,
+        codeAddr: L.K6_ADDR,
+        // Both are the STATIC count. Since stage 2 added four self-loops and a skipped `inc`, the
+        // RETIRED count per pass is higher — so this is a reporting denominator, not a fact about
+        // the run. Nothing consumes it (grep: only this file), and the authority on retired
+        // instructions is the compared `state.instruction_counter`, which is what caught a
+        // deliberate `numInstructions + 1` injection at `ref 0x226675 vs candidate 0x261013`.
+        insPerIter: K6.lines.length,
+        insStatic: K6.lines.length,
+        iters: 1,
+        calls: [
+            {
+                off: 0,
+                prologue: [
+                    ["mov", "ebp", L.FRAME6], ["mov", "esi", L.STR5], ["mov", "edi", 0x0000000F],
+                    ["mov", "edx", 0x00000077], ["mov", "ebx", 0x00FF0011],
+                ],
+            },
+        ],
+        regions: [
+            { name: "SCR6", addr: L.FRAME6, len: 0xA0 },
+            { name: "ABS6", addr: L.SAVE6, len: 0x20 },
+            STATE_REGION,
+        ],
+        faults: {
+            // `adc eax, [esi]` is the body's only unseeded input; perturbing it moves every
+            // downstream adc/sbb/rotate result and the four registers spilled at the end.
+            "src-first": setByte(L.STR5, 0xA5),
+        },
+        raw: { fn: "run_k6", args: (outer, mode) => [outer, mode, L.FRAME6] },
+        provenance: { va: null, sha256: null, from: "synthetic (corpus/k6-conformance.mjs)",
+            generator: { build: buildK6, selfCheck: k6SelfCheck } },
+    },
+
+    // K7 — the REGISTER-ONLY channel: the only case whose fault moves an architectural register
+    // while leaving every compared DATA region byte-identical, which is the one divergence class a
+    // memory-only differential cannot see. `eax` is loaded from an input that is never stored,
+    // `ecx` from one that is, and the inputs (IN7) are deliberately not a compared region. Every
+    // other case's negative control perturbs data first, so this is what keeps the register half
+    // of the assertion exercised on the engine and not only in the self-test.
+    k7: {
+        id: "k7",
+        // +0  8B 06        mov eax, [esi]        ; register-only: read, never stored
+        // +2  8B 4E 04     mov ecx, [esi+4]
+        // +5  89 4D 00     mov [ebp+0], ecx      ; the memory channel
+        // +8  4A           dec edx
+        // +9  75 F5        jnz +0                ; a counted self-loop, so the page gets compiled
+        body: new Uint8Array([0x8B, 0x06, 0x8B, 0x4E, 0x04, 0x89, 0x4D, 0x00, 0x4A, 0x75, 0xF5]),
+        codeAddr: L.K7_ADDR,
+        insPerIter: 5, insStatic: 5,
+        iters: L.K7_ITERS,
+        calls: [{ off: 0, prologue: [["mov", "ebp", L.FRAME7], ["mov", "esi", L.IN7],
+            ["mov", "edx", L.K7_ITERS]] }],
+        // IN7 is deliberately NOT a compared region: that is what makes "reg-only" register-only.
+        regions: [{ name: "FRAME7", addr: L.FRAME7, len: 0x20 }, STATE_REGION],
+        faults: {
+            // Memory identical, eax different. A memory-only differential passes this; the
+            // oracle must report DIVERGENT at STATE.eax.
+            "reg-only": flipWord(L.IN7 + 0x00),
+            // The control for the control: the same shape of perturbation that DOES reach memory.
+            "reg-and-mem": flipWord(L.IN7 + 0x04),
+        },
+        raw: null,
+        provenance: { va: null, sha256: null, from: "synthetic (hand-assembled, corpus/cases.mjs)" },
     },
 };
 

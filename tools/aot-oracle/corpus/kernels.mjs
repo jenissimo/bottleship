@@ -189,6 +189,45 @@ export const KERNELS = {
             0x0c, 0x83, 0x45, 0x10, 0x40, 0xff, 0x4d, 0xec, 0x75, 0xae,
         ]),
     },
+    // ── K5: charset-bitmap builder, VA 0x00674b94 ─────────────────────────────
+    // The 8-BIT family, which k1/k3/k4 do not contain a single instance of: an 8-bit load, an
+    // 8-bit shift by CL (a helper call in v86 — jit_instructions.rs:3547), an 8-bit OR to
+    // MEMORY (the BYTE two-phase read-modify-write shape, contract D3/N40 at a size the corpus
+    // never exercised) and an 8-bit self-TEST as the loop condition. 12 instructions, one basic
+    // block, terminates on the string's NUL.
+    //
+    // Its own function zeroes the bitmap and loads the mask right before the loop, which is
+    // what fixes the two seeded inputs — this is read off the binary, not assumed:
+    //   00674b83  6a 08 59        push 8 / pop ecx        ; 8 dwords
+    //   00674b8a  8d 7d dc        lea edi, [ebp-0x24]     ; the 32-byte bitmap
+    //   00674b8d  6a 07           push 7
+    //   00674b8f  f3 ab           rep stosd               ; bitmap := 0
+    //   00674b93  5f              pop edi                 ; edi = 7  (the bit-index mask)
+    //
+    // 00674b94  8a16       mov dl, [esi]           ; next character
+    // 00674b96  0fb6ca     movzx ecx, dl
+    // 00674b99  8bc1       mov eax, ecx
+    // 00674b9b  23cf       and ecx, edi            ; bit index  = c & 7
+    // 00674b9d  b301       mov bl, 1
+    // 00674b9f  d2e3       shl bl, cl              ; bit mask   = 1 << (c & 7)
+    // 00674ba1  c1e803     shr eax, 3              ; byte index = c >> 3
+    // 00674ba4  8d4405dc   lea eax, [ebp+eax-0x24]
+    // 00674ba8  0818       or [eax], bl            ; bitmap[c>>3] |= 1 << (c&7)
+    // 00674baa  46         inc esi
+    // 00674bab  84d2       test dl, dl
+    // 00674bad  75e5       jne 0x674b94
+    k5: {
+        va: 0x00674b94,
+        fileOff: 0x00274b94,
+        sha256: "8ee6d7d49e82fced24f27391b9c3a73714a1e402f6ee11cb7b65489805ab2297",
+        insStatic: 12,
+        insPerIter: 12,
+        bytes: new Uint8Array([
+            0x8a, 0x16, 0x0f, 0xb6, 0xca, 0x8b, 0xc1, 0x23, 0xcf, 0xb3, 0x01, 0xd2,
+            0xe3, 0xc1, 0xe8, 0x03, 0x8d, 0x44, 0x05, 0xdc, 0x08, 0x18, 0x46, 0x84,
+            0xd2, 0x75, 0xe5,
+        ]),
+    },
 };
 
 /** Re-extract from the real binary if present; throws on mismatch. */

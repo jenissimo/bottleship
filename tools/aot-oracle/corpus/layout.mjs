@@ -25,6 +25,9 @@ export const K1_ADDR   = 0x00101000;   // kernel 1 wrapper + body (own page)
 export const K2_ADDR   = 0x00102000;   // kernel 2 wrapper + body (own page)
 export const K3_ADDR   = 0x00103000;   // kernel 3 (integer core) — own page
 export const K4_ADDR   = 0x00104000;   // kernel 4 (nested loops + RMW) — own page
+export const K5_ADDR   = 0x00105000;   // kernel 5 (the 8-bit family) — own page
+export const K6_ADDR   = 0x00106000;   // kernel 6 (synthetic slice conformance) — own page
+export const K7_ADDR   = 0x00107000;   // kernel 7 (the register-only channel) — own page
 export const PD_ADDR   = 0x00108000;
 export const PT0_ADDR  = 0x00109000;   // identity 0..4MB
 export const PT1_ADDR  = 0x0010A000;   // identity 4..8MB
@@ -47,6 +50,18 @@ export const DST1      = DATA + 0x2000;   // COUNT * 4
 export const SRC2      = DATA + 0x3000;   // VCOUNT * 16
 export const DST2      = DATA + 0x4000;   // VCOUNT * 16
 export const FRAME3    = DATA + 0x0500;   // ebp for K4 (uses -0x14 .. +0x14)
+export const STR5      = DATA + 0x0600;   // K5: NUL-terminated byte string
+export const FRAME5    = DATA + 0x0700;   // ebp for K5 (32-byte bitmap at -0x24)
+export const FRAME6    = DATA + 0x0800;   // ebp for K6 (scratch at +0x00 .. +0x20)
+export const SAVE6     = DATA + 0x0900;   // K6's absolute-addressed slots (moffs + ESP save)
+// K7 — the register-only channel. FRAME7 is compared; IN7 is an input that is NOT, so perturbing
+// IN7+0 moves an architectural register at the capture point and nothing in any compared region.
+export const FRAME7    = DATA + 0x0A00;   // ebp for K7 (compared, 0x20)
+export const IN7       = DATA + 0x0A40;   // K7 inputs (NOT compared)
+// Not a benchmark parameter: hotness accrues in RETIRED INSTRUCTIONS against
+// JIT_THRESHOLD = 200_000 (jit.rs:1254, cpu.rs:3284), so a three-instruction body is never
+// compiled at any plausible outer count and the case reports ARM_FAILED with an empty capture.
+export const K7_ITERS  = 64;
 export const DST3      = DATA + 0x4800;   // K3: COUNT * 4
 export const DST4      = DATA + 0x4900;   // K4: OUTER * MID * INNER * 4
 export const IMAGE_END = DATA + 0x5000;
@@ -58,6 +73,12 @@ export const K4_MID   = 3;
 export const K4_INNER = 8;
 export const K4_ROW_DWORDS = 8;                    // edx; edi = edx * 4 = dst row stride
 export const K4_SRC_ADVANCE = K4_MID * K4_INNER * 4;  // eax; added to [ebp+0xc] per outer pass
+
+// K5's string length. Every byte is DISTINCT (1..K5_LEN) so that flipping one is guaranteed to
+// change the bitmap — a negative control whose divergence cannot be masked by another byte
+// having already set the same bit.
+export const K5_LEN = 96;
+export const K5_BITMAP = FRAME5 - 0x24;
 
 /**
  * STATE layout. Offsets are the comparison contract: a byte that differs inside this region
@@ -164,6 +185,26 @@ export function writeDataImage(dv, origin) {
     for (let i = 0; i < COUNT; i++) w32(DST3 + i * 4, 0);
     for (let i = 0; i < K4_OUTER * K4_MID * K4_INNER; i++) w32(DST4 + i * 4, 0);
     for (let off = -0x14; off <= 0x14; off += 4) w32(FRAME3 + off, 0);
+
+    // ── K5 charset bitmap ──────────────────────────────────────────────────
+    // Distinct non-zero bytes, then the NUL the loop stops on. The bitmap starts zeroed exactly
+    // as the kernel's own function leaves it (rep stosd at 0x674b8f); the loop only ORs, so
+    // repeated calls over the same image are idempotent.
+    const w8 = (addr, v) => dv.setUint8(addr - origin, v & 0xFF);
+    for (let i = 0; i < K5_LEN; i++) w8(STR5 + i, i + 1);
+    w8(STR5 + K5_LEN, 0);
+    for (let off = 0; off < 0x28; off++) w8(K5_BITMAP + off, 0);
+
+    // ── K6 scratch (the conformance body seeds every slot it reads) ─────────
+    // 0x98 landing slots (stage 2 added imul/mul/bswap/bit-scan/cmov/flag-op/loop results).
+    for (let off = 0; off < 0xA0; off += 4) w32(FRAME6 + off, 0);
+    for (let off = 0; off < 0x20; off += 4) w32(SAVE6 + off, 0);
+
+    // ── K7: one input word that ends in a register only, one that ends in memory ──
+    // Both non-zero, so `flipWord` on either is guaranteed to be a real change.
+    w32(IN7 + 0x00, 0x51EEDCA7);      // -> eax at the capture point, stored nowhere
+    w32(IN7 + 0x04, 0x0BADF00D);      // -> ecx AND [FRAME7+0]
+    for (let off = 0; off < 0x20; off += 4) w32(FRAME7 + off, 0);
 
     // STATE starts zeroed: a candidate that never flushes its register file diverges on
     // STATE+0 rather than passing quietly.

@@ -21,6 +21,32 @@ export const steady = (r) => {
     return { ratio, ok: ratio > 1.8 && ratio < 2.25 };
 };
 
+/**
+ * `ns_per_outer` is a two-point slope, `(t2 - t1) / (n2 - n1)`. That is a RATE only if the
+ * second phase — which does twice the work — cost at least as much wall time as the first.
+ * When it did not (compilation inflating phase 1, a scheduler stall, `--outer 0` making the
+ * denominator zero) the result comes out zero, negative or non-finite: a number that cannot
+ * describe a duration.
+ *
+ * Today that condition also fails `steady_state` arithmetically (ns <= 0 implies p2/p1 <= 1),
+ * so this gate adds no coverage — it adds the *statement*. `steady_state`'s remedy ("raise
+ * --warmup") misdiagnoses a timer that went backwards, and an invariant an instrument relies
+ * on without asserting is the failure mode this project keeps paying for.
+ * @returns {{field:string, value:unknown}[]} empty when the arm's timing is a rate
+ */
+export const timingProblems = (r) => {
+    const bad = [];
+    const pos = (field, v) => {
+        if (!(typeof v === "number" && Number.isFinite(v) && v > 0)) {
+            bad.push({ field, value: typeof v === "number" ? v : (v ?? null) });
+        }
+    };
+    pos("phase_ns.p1", r.phase_ns?.p1);
+    pos("phase_ns.p2", r.phase_ns?.p2);
+    pos("ns_per_outer", r.ns_per_outer);
+    return bad;
+};
+
 export const median = (xs) => {
     const s = [...xs].sort((a, b) => a - b);
     return s.length % 2 ? s[(s.length - 1) / 2] : (s[s.length / 2 - 1] + s[s.length / 2]) / 2;
@@ -37,12 +63,95 @@ export const spreadPct = (xs) => {
  * @param {object[]} p.candRuns candidate-arm results, one per rep
  * @param {"unit"|"raw"} p.candClass
  * @param {boolean} p.reportsNumber whether a ratio is being claimed
+ * @param {{memory_identical:boolean, state_compared:boolean, state_identical:boolean|null,
+ *          first:string|null}} p.comparison the comparator's verdict — REQUIRED
+ * @param {Record<string,number>} [p.requestedFlags] `--flags` overrides the run asked for
+ * @param {number|null} [p.requestedRelaxed] `--relaxed` the run asked for, or null
  * @param {number} [p.maxSpreadPct]
  * @returns {{gates:object[], failedDifferential:object[], failedMeasurement:object[], measurementEnforced:boolean}}
  */
-export function evaluateGates({ refRuns, candRuns, candClass, reportsNumber, maxSpreadPct = 10 }) {
+export function evaluateGates({ refRuns, candRuns, candClass, reportsNumber, comparison,
+    requestedFlags = {}, requestedRelaxed = null, maxSpreadPct = 10 }) {
     const gates = [];
     const add = (id, cls, ok, value, why) => gates.push({ id, class: cls, ok, value, why });
+
+    // ── the differential's own result is a gate, not only a verdict ───────────
+    // The equality assertion belongs in the gate list with every other validity condition:
+    // a consumer that decides usability from `gates_failed` must find the divergence there and
+    // not only in a separate verdict field. Refusing an absent `comparison` is the same rule one
+    // level up — a caller that forgets to pass it must not receive a green gate list.
+    if (comparison === undefined || comparison === null) {
+        throw new Error("evaluateGates: `comparison` is required — a gate list assembled without "
+            + "the comparator's result would report a divergent run as fully gated");
+    }
+    const memOk = comparison.memory_identical === true;
+    // `state_compared: false` means the candidate class publishes no host-side state (a raw
+    // module). That channel is then reported as UNCOMPARED and gated by state.spilled; it is
+    // never silently counted as agreement here.
+    const stateOk = comparison.state_compared ? comparison.state_identical === true : true;
+    add("output_identical", "differential", memOk && stateOk,
+        { memory_identical: comparison.memory_identical,
+            state_compared: comparison.state_compared,
+            state_identical: comparison.state_identical ?? null,
+            first_divergence: comparison.first ?? null },
+        "the guest memory and/or the architectural register file differ between the arms ⇒ the "
+        + "candidate computed something else; the first divergent address/register is in `value`");
+
+    // ── the codegen shape is part of the experiment's identity ───────────────
+    // A shape knob that never reached the engine turns an ablation into a rerun of the default,
+    // and nothing else in the report can tell. The arms publish the shape they READ BACK, and it
+    // is gated in the differential class — enforced even under --check, because "CORRECT under
+    // 5=0" is a false claim if 5 was 1.
+    const hosted = [["reference", refRuns]];
+    if (candClass === "unit") hosted.push(["candidate", candRuns]);
+    const shapeProblems = [];
+    for (const [name, runs] of hosted) {
+        runs.forEach((r, rep) => {
+            if (!r.jit_flags) { shapeProblems.push({ arm: name, rep, why: "arm reported no jit_flags" }); return; }
+            for (const [i, v] of Object.entries(requestedFlags)) {
+                const got = r.jit_flags[i];
+                if (got !== v) shapeProblems.push({ arm: name, rep, flag: Number(i), requested: v, effective: got ?? null });
+            }
+            if (requestedRelaxed !== null && r.relaxed_fpu !== requestedRelaxed) {
+                shapeProblems.push({ arm: name, rep, relaxed_requested: requestedRelaxed, effective: r.relaxed_fpu ?? null });
+            }
+        });
+    }
+    add("shape.as_requested", "differential", shapeProblems.length === 0, shapeProblems,
+        "a v86-hosted arm did not run the codegen shape the command line asked for ⇒ the run is not the experiment it is labelled as");
+
+    // ── the register half of the differential must not be vacuous ────────────
+    // STATE is compared like any other guest region, so if NEITHER arm ever spilled its
+    // register file the comparison is two blocks of zeros reporting "identical". The image
+    // zero-fills STATE precisely so that failure is detectable — this is where it is detected.
+    const spill = [];
+    for (const [name, runs] of [["reference", refRuns], ["candidate", candRuns]]) {
+        runs.forEach((r, rep) => {
+            const st = (r.regions ?? []).find((x) => x.name === "STATE");
+            if (!st) { spill.push({ arm: name, rep, why: "no STATE region: this case does not compare the register file at all" }); return; }
+            if (!/[1-9a-f]/.test(String(st.hex ?? ""))) {
+                spill.push({ arm: name, rep, why: "STATE is all zeros: the register file was never spilled, so 'registers identical' proves nothing" });
+            }
+        });
+    }
+    add("state.spilled", "differential", spill.length === 0, spill,
+        "an arm published no spilled register file ⇒ the register half of the differential is vacuous");
+
+    if (candClass === "unit") {
+        const disagree = [];
+        const n = Math.min(refRuns.length, candRuns.length);
+        for (let rep = 0; rep < n; rep++) {
+            const a = refRuns[rep], b = candRuns[rep];
+            if (JSON.stringify(a.jit_flags ?? null) !== JSON.stringify(b.jit_flags ?? null)) {
+                disagree.push({ rep, reference: a.jit_flags ?? null, candidate: b.jit_flags ?? null });
+            }
+            if ((a.relaxed_fpu ?? null) !== (b.relaxed_fpu ?? null)) {
+                disagree.push({ rep, reference_relaxed: a.relaxed_fpu ?? null, candidate_relaxed: b.relaxed_fpu ?? null });
+            }
+        }
+        add("shape.arms_agree", "differential", disagree.length === 0, disagree,
+            "the two arms ran DIFFERENT codegen shapes ⇒ any difference between them is attributable to the shape, not to the candidate");
+    }
 
     // ── differential validity ───────────────────────────────────────────────
     if (candClass === "unit") {
@@ -72,6 +181,13 @@ export function evaluateGates({ refRuns, candRuns, candClass, reportsNumber, max
 
     // ── measurement believability ───────────────────────────────────────────
     for (const [name, runs] of [["reference", refRuns], ["candidate", candRuns]]) {
+        const nonRate = runs
+            .map((r, i) => ({ rep: i, problems: timingProblems(r) }))
+            .filter((x) => x.problems.length > 0);
+        add(`timing_is_a_rate.${name}`, "measurement", nonRate.length === 0, nonRate,
+            "a phase wall time or ns_per_outer was zero, negative or non-finite ⇒ the two-point "
+            + "slope is not a rate (phase 2 does 2x the work and must not cost less than phase 1); "
+            + "no ratio can be built from it");
         const bad = runs.map((r, i) => ({ rep: i, ...steady(r) })).filter((s) => !s.ok);
         add(`steady_state.${name}`, "measurement", bad.length === 0, bad,
             "phase2/phase1 must be 1.8..2.25 — raise --warmup / --warmup-calls");

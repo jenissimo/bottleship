@@ -30,6 +30,24 @@ for (let i = 2; i < process.argv.length; i++) {
     else args[a.slice(2)] = "1";
 }
 
+/**
+ * Decode a hand-assembled body end to end with the compiler's own decoder. Refuses an
+ * unsupported form and refuses a body whose last instruction runs past its end — either would
+ * mean a unit that exits early, which leaves CORRECT memory behind and proves nothing.
+ */
+async function decodeWholeBody(body, addr) {
+    const { decodeOne } = await import("../aot/lib/decode.mjs");
+    let off = 0, n = 0;
+    while (off < body.length) {
+        const ins = decodeOne(body, off, addr + off);
+        if (ins.kind === "unsupported") throw new Error(`+0x${off.toString(16)} is outside the slice (${ins.why})`);
+        if (!(ins.len > 0)) throw new Error(`+0x${off.toString(16)} decoded to length ${ins.len}`);
+        off += ins.len; n++;
+    }
+    if (off !== body.length) throw new Error(`decode overran the body: ${off} != ${body.length}`);
+    return { instructions: n, bytes: body.length };
+}
+
 const exePath = path.resolve(REPO, args.exe || "tmp/nfsu/Speed.exe");
 const sha = (b) => crypto.createHash("sha256").update(b).digest("hex");
 const out = { exe: exePath, exe_present: fs.existsSync(exePath), cases: {}, ok: true };
@@ -40,6 +58,37 @@ for (const [id, c] of Object.entries(CASES)) {
     const k = KERNELS[id];
     const rec = { va: "0x" + (c.provenance?.va ?? 0).toString(16), bytes: c.body.length,
         declared_sha256: c.provenance?.sha256 ?? null };
+
+    // A SYNTHETIC case has no binary to re-extract from, so its provenance guard is a different
+    // question with the same shape: does the body still decode, completely and in-slice, into the
+    // instructions its generator claims? That is checked (and refused) rather than skipped —
+    // otherwise a generated case could rot into "the compiler bails on instruction 3" and still
+    // report CORRECT, because a unit that exits early leaves correct memory behind.
+    if (c.provenance?.sha256 == null) {
+        rec.embedded_sha256 = sha(Buffer.from(c.body));
+        rec.synthetic = c.provenance?.from ?? "synthetic";
+        try {
+            // A GENERATED body is re-derived from the generator the case itself names (no path
+            // string here: the case hands over the functions, so a second synthetic case cannot
+            // be silently checked against the first one's generator). A HAND-ASSEMBLED body has
+            // no generator to disagree with, so its guard is the other half of the same check —
+            // it must still decode completely and in-slice with the compiler's own decoder.
+            const gen = c.provenance?.generator;
+            if (gen) {
+                const built = gen.build();
+                if (Buffer.compare(Buffer.from(built.bytes), Buffer.from(c.body)) !== 0) {
+                    throw new Error("the case body is not what its generator produces");
+                }
+                rec.decode = await gen.selfCheck(built.bytes, built.lines, c.codeAddr);
+            } else {
+                rec.decode = await decodeWholeBody(c.body, c.codeAddr);
+            }
+            rec.status = "VERIFIED_SYNTHETIC";
+        }
+        catch (e) { rec.status = "SYNTHETIC_SELFCHECK_FAILED"; rec.why = e.message; out.ok = false; }
+        out.cases[id] = rec;
+        continue;
+    }
 
     // 1. The declared hash must describe the bytes the corpus actually ships, binary or not.
     rec.embedded_sha256 = sha(Buffer.from(c.body));

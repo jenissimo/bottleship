@@ -10,6 +10,7 @@ import crypto from "node:crypto";
 import { compareRegions, compareState, describeFirst } from "./compare.mjs";
 import { evaluateGates } from "./gates.mjs";
 import { readCandidateStateBlock, STATE_BLOCK_MAGIC, STATE_BLOCK_ABI, REG_NAMES } from "./state.mjs";
+import { parseArgs, parseFlagOverrides } from "./args.mjs";
 import * as L from "../corpus/layout.mjs";
 
 const sha = (b) => crypto.createHash("sha256").update(b).digest("hex");
@@ -183,44 +184,168 @@ export function runSelfTest() {
     const okRun = (over = {}) => ({
         phase_ns: { p1: 1000, p2: 2000 }, ns_per_outer: 100,
         jit: { tier2Promotions: 3, fastmemLoadsCompiled: 12 },
+        // The shape the arm READ BACK out of the engine; the shape gates compare this with what
+        // the command line asked for, and with the other arm's.
+        jit_flags: { 5: 1, 9: 1, 19: 0, 21: 0 }, relaxed_fpu: 1,
+        // A spilled register file: without one, "registers identical" is two zero blocks.
+        regions: [{ name: "STATE", addr: L.STATE, len: L.STATE_LEN, hex: "01000000".repeat(9) }],
         aot: { registered: true, alive: true, entered: true }, ...over,
     });
     // Both classes together: a self-test must not care WHICH bucket a gate failed in, only
     // that it failed. (The two buckets differ in when they are ENFORCED — oracle.mjs's job.)
     const gateIds = (g) => [...g.failedDifferential, ...g.failedMeasurement].map((x) => x.id);
 
+    // Every gate call must carry the comparator's result (gates.mjs refuses one that does not),
+    // so the gate tests supply an "everything agreed" comparison unless they are testing the
+    // equality gate itself.
+    const CMP_IDENTICAL = { memory_identical: true, state_compared: true, state_identical: true, first: null };
+    const gatesOf = (p) => evaluateGates({ comparison: CMP_IDENTICAL, ...p });
+
     t("a clean run fails no gate", () => {
-        const g = evaluateGates({ refRuns: [okRun()], candRuns: [okRun()], candClass: "unit", reportsNumber: true });
+        const g = gatesOf({ refRuns: [okRun()], candRuns: [okRun()], candClass: "unit", reportsNumber: true });
         eq(gateIds(g).length, 0, "failed gates");
     });
+    t("a memory divergence fails the output_identical gate and the gate names the address", () => {
+        const g = gatesOf({ refRuns: [okRun()], candRuns: [okRun()], candClass: "unit", reportsNumber: true,
+            comparison: { memory_identical: false, state_compared: true, state_identical: true,
+                first: "DST3 @ guest 0x1108fc: ref 0x1 vs candidate 0x0" } });
+        const ids = g.failedDifferential.map((x) => x.id);
+        if (!ids.includes("output_identical")) throw new Error(ids.join(","));
+        const v = g.gates.find((x) => x.id === "output_identical").value;
+        if (!String(v.first_divergence).includes("0x1108fc")) throw new Error(JSON.stringify(v));
+        return v.first_divergence;
+    });
+    t("a register-only divergence fails the same gate (memory identical is not enough)", () => {
+        const g = gatesOf({ refRuns: [okRun()], candRuns: [okRun()], candClass: "unit", reportsNumber: true,
+            comparison: { memory_identical: true, state_compared: true, state_identical: false,
+                first: "STATE.esi (guest 0x10c318): ref 0x10c240 vs candidate 0x10c230" } });
+        if (!g.failedDifferential.map((x) => x.id).includes("output_identical")) throw new Error(gateIds(g).join(","));
+    });
+    t("host state the candidate cannot publish is not counted as agreement either way", () => {
+        // A raw candidate publishes no host-side state: that channel is UNCOMPARED (reported,
+        // and gated by state.spilled), so it must neither pass nor fail output_identical.
+        const g = gatesOf({ refRuns: [okRun()], candRuns: [okRun({ aot: null })], candClass: "raw", reportsNumber: true,
+            comparison: { memory_identical: true, state_compared: false, state_identical: null, first: null } });
+        eq(gateIds(g).length, 0, "failed gates");
+        eq(g.gates.find((x) => x.id === "output_identical").value.state_compared, false, "state_compared");
+    });
+    t("a gate list assembled without the comparator's result is refused, not reported green", () => {
+        let threw = null;
+        try { evaluateGates({ refRuns: [okRun()], candRuns: [okRun()], candClass: "unit", reportsNumber: true }); }
+        catch (e) { threw = e; }
+        if (!threw) throw new Error("a missing `comparison` produced a gate list");
+        if (!threw.message.includes("comparison")) throw new Error(threw.message);
+        return threw.message.split(" — ")[0];
+    });
     t("not-steady-state fails the gate", () => {
-        const g = evaluateGates({ refRuns: [okRun({ phase_ns: { p1: 1000, p2: 1200 } })], candRuns: [okRun()], candClass: "raw", reportsNumber: true });
+        const g = gatesOf({ refRuns: [okRun({ phase_ns: { p1: 1000, p2: 1200 } })], candRuns: [okRun()], candClass: "raw", reportsNumber: true });
         if (!gateIds(g).includes("steady_state.reference")) throw new Error(gateIds(g).join(","));
     });
+    t("a negative ns/outer is refused as 'not a rate', not diagnosed as warm-up", () => {
+        // The condition observed on k6: phase 2 (2x the work) came back CHEAPER than phase 1, so
+        // the slope is negative. steady_state also fails here, but its remedy is the wrong one.
+        const g = gatesOf({ refRuns: [okRun({ phase_ns: { p1: 2000, p2: 1000 }, ns_per_outer: -857 })],
+            candRuns: [okRun()], candClass: "raw", reportsNumber: true });
+        const ids = gateIds(g);
+        if (!ids.includes("timing_is_a_rate.reference")) throw new Error(ids.join(","));
+        const v = g.gates.find((x) => x.id === "timing_is_a_rate.reference").value;
+        return JSON.stringify(v[0].problems.map((p) => p.field));
+    });
+    t("a zero-denominator (non-finite) ns/outer is refused too", () => {
+        const g = gatesOf({ refRuns: [okRun()], candRuns: [okRun({ ns_per_outer: Infinity })],
+            candClass: "raw", reportsNumber: true });
+        if (!gateIds(g).includes("timing_is_a_rate.candidate")) throw new Error(gateIds(g).join(","));
+    });
     t("tier2Promotions == 0 fails the gate (tier-1 code was measured)", () => {
-        const g = evaluateGates({ refRuns: [okRun({ jit: { tier2Promotions: 0, fastmemLoadsCompiled: 9 } })], candRuns: [okRun()], candClass: "raw", reportsNumber: true });
+        const g = gatesOf({ refRuns: [okRun({ jit: { tier2Promotions: 0, fastmemLoadsCompiled: 9 } })], candRuns: [okRun()], candClass: "raw", reportsNumber: true });
         if (!gateIds(g).includes("tier2Promotions.reference")) throw new Error(gateIds(g).join(","));
     });
     t("fastmemLoadsCompiled == 0 fails the gate (TLB shape, not production)", () => {
-        const g = evaluateGates({ refRuns: [okRun({ jit: { tier2Promotions: 2, fastmemLoadsCompiled: 0 } })], candRuns: [okRun()], candClass: "raw", reportsNumber: true });
+        const g = gatesOf({ refRuns: [okRun({ jit: { tier2Promotions: 2, fastmemLoadsCompiled: 0 } })], candRuns: [okRun()], candClass: "raw", reportsNumber: true });
         if (!gateIds(g).includes("fastmemLoadsCompiled.reference")) throw new Error(gateIds(g).join(","));
     });
     t("spread > 10% over reps fails the gate", () => {
-        const g = evaluateGates({ refRuns: [okRun(), okRun({ ns_per_outer: 130 })], candRuns: [okRun(), okRun()], candClass: "raw", reportsNumber: true });
+        const g = gatesOf({ refRuns: [okRun(), okRun({ ns_per_outer: 130 })], candRuns: [okRun(), okRun()], candClass: "raw", reportsNumber: true });
         if (!gateIds(g).includes("spread_pct.reference")) throw new Error(gateIds(g).join(","));
     });
     t("an evicted unit fails the aot.alive gate (a corpse is not a measurement)", () => {
-        const g = evaluateGates({ refRuns: [okRun()], candRuns: [okRun({ aot: { registered: true, alive: false, entered: false } })], candClass: "unit", reportsNumber: true });
+        const g = gatesOf({ refRuns: [okRun()], candRuns: [okRun({ aot: { registered: true, alive: false, entered: false } })], candClass: "unit", reportsNumber: true });
         const ids = gateIds(g);
         if (!ids.includes("aot.alive") || !ids.includes("aot.entered")) throw new Error(ids.join(","));
     });
     t("a never-entered unit fails the aot.entered gate (JIT vs JIT)", () => {
-        const g = evaluateGates({ refRuns: [okRun()], candRuns: [okRun({ aot: { registered: true, alive: true, entered: false } })], candClass: "unit", reportsNumber: true });
+        const g = gatesOf({ refRuns: [okRun()], candRuns: [okRun({ aot: { registered: true, alive: true, entered: false } })], candClass: "unit", reportsNumber: true });
         if (!gateIds(g).includes("aot.entered")) throw new Error(gateIds(g).join(","));
     });
     t("aot gates do not apply to a raw candidate", () => {
-        const g = evaluateGates({ refRuns: [okRun()], candRuns: [okRun({ aot: null })], candClass: "raw", reportsNumber: true });
+        const g = gatesOf({ refRuns: [okRun()], candRuns: [okRun({ aot: null })], candClass: "raw", reportsNumber: true });
         eq(gateIds(g).length, 0, "failed gates");
+    });
+
+    t("an all-zero STATE region fails a gate (a vacuous 'registers identical')", () => {
+        const zeroed = okRun({ regions: [{ name: "STATE", addr: L.STATE, len: L.STATE_LEN, hex: "00".repeat(L.STATE_LEN) }] });
+        const g = gatesOf({ refRuns: [zeroed], candRuns: [zeroed], candClass: "unit", reportsNumber: true });
+        if (!gateIds(g).includes("state.spilled")) throw new Error(gateIds(g).join(","));
+    });
+    t("an arm that publishes no STATE region at all fails the same gate", () => {
+        const g = gatesOf({ refRuns: [okRun({ regions: [] })], candRuns: [okRun()], candClass: "unit", reportsNumber: true });
+        if (!gateIds(g).includes("state.spilled")) throw new Error(gateIds(g).join(","));
+    });
+
+    // ── codegen shape (design F-d: an ablation that silently ran the default) ─
+    t("a shape override the engine honoured passes", () => {
+        const ablated = okRun({ jit_flags: { 5: 0, 9: 1, 19: 0, 21: 0 } });
+        const g = gatesOf({ refRuns: [ablated], candRuns: [ablated], candClass: "unit",
+            reportsNumber: true, requestedFlags: { 5: 0 } });
+        eq(gateIds(g).length, 0, "failed gates");
+    });
+    t("a requested --flags override the arm did not run FAILS a differential gate", () => {
+        // Exactly F-d: --flags 5=0 asked for, both arms ran 5=1, everything else looks perfect.
+        const g = gatesOf({ refRuns: [okRun()], candRuns: [okRun()], candClass: "unit",
+            reportsNumber: true, requestedFlags: { 5: 0 } });
+        if (!g.failedDifferential.map((x) => x.id).includes("shape.as_requested")) throw new Error(gateIds(g).join(","));
+        const v = g.gates.find((x) => x.id === "shape.as_requested").value;
+        eq(v[0].flag, 5, "named flag"); eq(v[0].requested, 0, "requested"); eq(v[0].effective, 1, "effective");
+        return `${v.length} problems, first: flag 5 requested 0 effective 1`;
+    });
+    t("an arm that reports no shape at all is not credited with the requested one", () => {
+        const g = gatesOf({ refRuns: [okRun({ jit_flags: undefined })], candRuns: [okRun()],
+            candClass: "unit", reportsNumber: true, requestedFlags: { 5: 0 } });
+        if (!gateIds(g).includes("shape.as_requested")) throw new Error(gateIds(g).join(","));
+    });
+    t("arms running DIFFERENT shapes fail a differential gate", () => {
+        const g = gatesOf({ refRuns: [okRun()], candRuns: [okRun({ jit_flags: { 5: 0, 9: 1, 19: 0, 21: 0 } })],
+            candClass: "unit", reportsNumber: true });
+        if (!gateIds(g).includes("shape.arms_agree")) throw new Error(gateIds(g).join(","));
+    });
+    t("a relaxed-FPU mismatch against the request fails a differential gate", () => {
+        const g = gatesOf({ refRuns: [okRun()], candRuns: [okRun()], candClass: "unit",
+            reportsNumber: true, requestedRelaxed: 0 });
+        if (!gateIds(g).includes("shape.as_requested")) throw new Error(gateIds(g).join(","));
+    });
+    t("arms with different relaxed-FPU modes fail a differential gate", () => {
+        const g = gatesOf({ refRuns: [okRun()], candRuns: [okRun({ relaxed_fpu: 0 })],
+            candClass: "unit", reportsNumber: true });
+        if (!gateIds(g).includes("shape.arms_agree")) throw new Error(gateIds(g).join(","));
+    });
+
+    // ── command line ────────────────────────────────────────────────────────
+    t("an unknown option is refused, not ignored", () => {
+        let threw = null;
+        try { parseArgs(["node", "x", "--flagz", "5=0"], ["flags"]); } catch (e) { threw = e; }
+        if (!threw) throw new Error("--flagz was accepted");
+        if (!threw.message.includes("--flagz")) throw new Error(`message does not name the option: ${threw.message}`);
+        return threw.message.split("\n")[0];
+    });
+    t("a known option is parsed with its value", () => {
+        const a = parseArgs(["node", "x", "--flags", "5=0", "--check"], ["flags", "check"]);
+        eq(a.flags, "5=0", "flags"); eq(a.check, "1", "check");
+    });
+    t("--flags is parsed into integer overrides and refuses garbage", () => {
+        eq([...parseFlagOverrides("5=0,21=1")].map((p) => p.join(":")).join(","), "5:0,21:1", "overrides");
+        let threw = false;
+        try { parseFlagOverrides("five=0"); } catch { threw = true; }
+        eq(threw, true, "threw");
     });
 
     const passed = tests.filter((x) => x.ok).length;
