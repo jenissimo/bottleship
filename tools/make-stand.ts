@@ -34,6 +34,11 @@ interface StandGame {
 
 interface StandConfig {
     out?: string;
+    /** Restrict this stand to specific browsers (names as detectBrowserName reports them,
+     *  e.g. "Google Chrome"). Omit to keep the capability-based gate alone. */
+    allowedBrowsers?: string[];
+    /** Copy shown to a visitor on a browser this stand does not admit. */
+    blockedMessage?: string;
     /** Default for every game: download bundles to OPFS before starting (no on-demand
      *  streaming). Worth it wherever range round-trips cost real latency. Per-game
      *  `preload` overrides it. */
@@ -93,6 +98,15 @@ const catalog = config.games.map((g) => {
 });
 
 fs.writeFileSync(path.join(distOut, "games-catalog.json"), JSON.stringify(catalog, null, 2) + "\n");
+
+// Deployment policy (src/deployment-config.ts). Only written when the stand asks for one —
+// the public build ships no such file and stays capability-gated.
+if (config.allowedBrowsers?.length) {
+    fs.writeFileSync(
+        path.join(distOut, "deployment.json"),
+        JSON.stringify({ allowedBrowsers: config.allowedBrowsers, blockedMessage: config.blockedMessage }, null, 2) + "\n",
+    );
+}
 fs.copyFileSync(path.join(REPO, "deploy", "server.ts"), path.join(out, "server.ts"));
 // The compose file is deployment-local config once it lands (passwords, host paths,
 // network name), so ship the template only when the stand doesn't have one yet.

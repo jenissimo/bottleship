@@ -109,8 +109,23 @@ Legacy Graphics (DirectDraw, D3D3-9). You bridge x86 Windows internals with mode
 
 - Implement kernel32, user32, gdi32, advapi32 with strict adherence to Windows PE/ABI specifications.
 - Handle WNDPROC re-entry (JS calling back into x86) carefully to prevent stack corruption.
+- STUB TABLES NEVER SHADOW A REAL HANDLER. A module's export table is one flat
+  `Record<"Interface_Method", impl>` built by several factories; merging a `*-stubs.ts`
+  table with `Object.assign` replaces every real handler registered before it with
+  `() => S_OK`, and the guest then reads an untouched out-param — which, on an
+  identity-mapped address space, dereferences linear 0 without a #PF and jumps into
+  garbage. Merge with `assignStubsOnce` (core/thunking/stub-merge.ts) so the real
+  implementation wins regardless of order; `tools/validate-stub-tables.ts` (gate step 5)
+  fails on a stub name that is also implemented.
 - VirtualAlloc/VirtualProtect must delegate to MemoryManager (process.memory) for allocation and
   AddressSpace.protect for perm changes.
+- A VfsFileHandle's `position` is the FILE OBJECT's state, owned by vfs.ts plus the two handle
+  layers (kernel32 FileHandleWrapper, the CRT FILE*/fd tables). Anything else that needs to read
+  a file takes its OWN cursor via `vfs.duplicateHandle()` — MapViewOfFile/FlushViewOfFile do,
+  because Win32 mapping calls do not touch the file pointer and a save/restore across an await
+  silently reverts a seek the guest made during the yield. `position +=` is banned outright
+  (read-modify-write across a yield = double advance, served silently at full length); advances
+  go through the single named mutation. `tools/validate-file-cursor.ts` (gate step 6) enforces both.
 
 3.3 Graphics Strategy
 
@@ -309,14 +324,29 @@ Quality Gate (mandatory order):
   2. bun tools/validate-signatures.ts
   3. bun tools/validate-struct-offsets.ts
   4. bun tools/validate-guest-code-writes.ts
-  5. bun run typecheck
+  5. bun tools/validate-stub-tables.ts
+  6. bun tools/validate-file-cursor.ts
+  7. bun run typecheck
 
 Tooling:
   - analyze-trace.ts  — Chrome profiler trace → self/total time per thread, WASM breakdown
     (JIT blocks, io_port_write32, hypercall annotation), 2s-bucket timeline. Primary perf tool.
     Usage: bun tools/analyze-trace.ts <trace.json.gz> [--top N] [--thread worker|main|audio]
+           [--budget-ms 33.34] [--range A-Bs] [--map blocks.json]
     Interpreting output: io_port_write32 in top → heavy thunks; jit_find_cache_entry → indirect
     jump pressure; wasm% > 85% → CPU bound in guest code, not JS overhead.
+    FRAME TAIL: the render-frame stats (p50/p95/p99, frames over budget) come from the SAME
+    module as the live harness `frameReport` (src/worker/core/frame-time-distribution.ts) — one
+    definition, two callers, so a trace and a live window cannot disagree by rounding. Budget is
+    `--budget-ms` or DERIVED from the observed cadence (never a hardcoded 30/60 fps); a
+    percentile whose rank has no observation behind it prints `n/a`, not a number. WORST FRAMES
+    adds per-frame stack attribution (JS/wasm split + leaf functions) — that, and GC, are what
+    the trace can see and the live profiler cannot.
+    GUEST ATTRIBUTION needs the `bottleship.hotblocks` mark to resolve `wasm-function[N]` →
+    `module:rva` (v86 table indices ≠ Chrome's numbering, so the join is SAMPLED, never
+    computed). `bun tools/harness.ts trace <sec>` now emits it inside the recording window; a
+    trace without it prints an explicit "GUEST ATTRIBUTION: UNAVAILABLE" section rather than
+    degrading silently to bare indices.
   - make-wgb — HIGH-LEVEL bundle creator. Takes a raw game dir + CLI flags, generates
     manifest.json + registry.json via JSON.stringify (guarantees correct \\ escaping),
     packs everything in one step. Use this instead of wgb.ts for creating new bundles.

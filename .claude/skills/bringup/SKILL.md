@@ -88,6 +88,13 @@ CLI invocation reconnects without it.
 - `surfacePixels(sel)` / `expectSurfaceNonBlack(sel)` — cheap liveness from a subsampled readback.
 - Dump PNGs preserve ALPHA: an area that looks WHITE in a viewer but BLACK on the canvas is
   transparent (a=0), not white — sample the RGBA (readSurfaceRGBA) before concluding a color.
+- A Win32 FRONT-END presents nothing — its dialogs run before the render device does. Gate on
+  `waitForControl("New Game")`, never `tickFrames`, or you wait on presents that never come and
+  it reads exactly like a hang.
+- BLANK control / unpainted dialog → `paintTrace("start")` … `paintTrace("read")`. The chain has
+  many links (posted → pump filter → dispatched → BeginPaint/EndPaint+flush → owner-draw chain
+  with its task counts → per-flush child-window exclusions) and the pixels look identical
+  whichever one dropped it; the trace names the link and its reason.
 
 ## 4. Diagnose
 
@@ -118,6 +125,7 @@ one-off probes**; keep only reusable harness verbs.
 
 - **Quality gate order** (CLAUDE.md): `bun tools/generate-index.ts` →
   `bun tools/validate-signatures.ts` → `bun tools/validate-struct-offsets.ts` →
+  `bun tools/validate-guest-code-writes.ts` → `bun tools/validate-stub-tables.ts` →
   `bun run typecheck`.
 - **Reload, not HMR**, after editing `src/worker` (HMR doesn't reload the worker
   entry and hangs the game). The harness ships in the worker bundle — iterate via

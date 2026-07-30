@@ -17,6 +17,7 @@ import { HarnessError, HarnessErrorCode } from "../rpc";
 import { sys } from "../serialize";
 import { sessionLogPath } from "../../../harness/session";
 import { getOverlayCompositePlan, isGameScreenOwned, isFlipScreenOwned, getLiveDialogOverlays } from "../../modules/user32/dialog-overlay";
+import { ddrawShowsContent } from "../../modules/ddraw/gdi-visibility";
 
 /** Where a `debug_png_dump` we post actually lands: the host writes it under its own
  *  session directory, so a `saved` path that ignored the session would point an agent
@@ -178,6 +179,14 @@ export function registerScreenCommands(svc: HarnessService): void {
             plan,
             hasContent: !!gdi?.hasOverlayContent?.(),
             dirty: !!gdi?.isOverlayDirty?.(),
+            // True while a guest paint sequence is being withheld from compositors
+            // (GDIContext.beginOverlayPublish) — the plane has half-painted pixels.
+            publishHeld: !!gdi?.isOverlayPublishHeld?.(),
+            // The bracket's own books: nesting depth, time left on the fail-open
+            // deadline (negative = overdue), and lifetime begins/ends/expiries. A held
+            // bracket is only a bug once `begins - ends` stops coming back to zero, and
+            // `expiries` is the proof the deadline is alive rather than merely written.
+            publish: gdi?.overlayPublishStats?.() ?? null,
             gameOwnsScreen: isGameScreenOwned(),
             screenOwner: {
                 coopHwnd: dd?.cooperative?.hwnd ?? 0,
@@ -185,6 +194,11 @@ export function registerScreenCommands(svc: HarnessService): void {
                 exclusive: !!dd?.cooperative?.exclusive,
                 gdiSurfaceVisible: dd ? dd.gdiSurfaceVisible : null,
                 flipScreenOwned: isFlipScreenOwned(),
+                // Exclusive rights + a primary are not content: an app that took exclusive
+                // mode for the display mode and paints with GDI never presents, and its UI
+                // lives entirely in the overlay.
+                ddrawShowsContent: ddrawShowsContent(dd),
+                ddrawFramesPresented: (dd?.presenter as { getCounters?(): Record<string, number> } | undefined)?.getCounters?.().frames ?? null,
                 primary: `0x${((dd?.surfaces?.primary ?? 0) >>> 0).toString(16)}`,
                 backBuffer: `0x${((dd?.surfaces?.backBuffer ?? 0) >>> 0).toString(16)}`,
             },
@@ -201,6 +215,209 @@ export function registerScreenCommands(svc: HarnessService): void {
         });
         info.saved = debugDumpPath(name);
         return info;
+    });
+
+    /**
+     * wedgeOverlayPublish() — open a GDI publish bracket and deliberately never close
+     * it, i.e. inject the exact failure the fail-open deadline exists for.
+     *
+     * A deadline nothing has been seen to trip is not a deadline. This makes it
+     * testable: wedge, then watch `overlay().publish.expiries` tick and the screen come
+     * back on its own. Diagnostic only — no guest state is touched.
+     */
+    svc.register("wedgeOverlayPublish", () => {
+        const gdi: any = sys().gdiContext;
+        if (!gdi?.beginOverlayPublish) {
+            throw new HarnessError("no GDI context", HarnessErrorCode.UNSUPPORTED);
+        }
+        gdi.beginOverlayPublish();
+        return { wedged: true, publish: gdi.overlayPublishStats?.() ?? null };
+    });
+
+    /**
+     * flicker(n?, { save?, source? }) — turn "the screen flickers" into a number.
+     *
+     * Samples the display over `n` frames and reports, per sample, how much it changed
+     * against the previous one AND the compositing state that produced it (plan mode,
+     * overlay dirty/content, DDraw presents, present serial). A flicker is a high-diff
+     * oscillation with a period of a frame or two; the sample that is 90% different and
+     * 3% bright is the erase frame, and the row next to it names what the compositor
+     * decided at that moment. Reasoning about DC topology cannot see this; two
+     * consecutive captures can.
+     *
+     * source:
+     *  - "overlay" (default): the GDI plane, read straight off its 2D canvas. Synchronous,
+     *    so it really does sample CONSECUTIVE display frames, and it reports `holePct` —
+     *    fully transparent pixels, i.e. an erase that has not been repainted yet. This is
+     *    the route that can see a one-frame flash.
+     *  - "screen": the composited canvas via the present mirror. Authoritative about what
+     *    the user sees, but a PNG encode + decode per sample costs ~3 display frames, so it
+     *    ALIASES anything shorter than that. Use it to confirm, not to hunt.
+     */
+    svc.register("flicker", async (args) => {
+        const n = Math.max(2, Math.min(240, typeof args[0] === "number" ? (args[0] as number) : 30));
+        const opts = (args[1] ?? {}) as { save?: string; source?: "screen" | "overlay" };
+        const source = opts.source ?? "overlay";
+        const render: any = sys().services?.render;
+        const gdi: any = sys().gdiContext;
+        const dd: any = (sys().process?.getModule("ddraw") as any)?.context;
+        const overlayCanvas: OffscreenCanvas | null = gdi?.getOverlayCanvas?.() ?? null;
+        if (source === "overlay" && !overlayCanvas) {
+            throw new HarnessError(
+                "no GDI overlay canvas — nothing has used a window DC yet. Use source:'screen'.",
+                HarnessErrorCode.UNSUPPORTED,
+            );
+        }
+
+        // 64x48 is enough to catch a full-screen erase or a control-sized flash while
+        // keeping a sample well inside one display frame.
+        const SW = 64, SH = 48;
+        const scratch = new OffscreenCanvas(SW, SH);
+        const sctx = scratch.getContext("2d", { willReadFrequently: true });
+        if (!sctx) throw new HarnessError("no 2d context for the sampler", HarnessErrorCode.UNSUPPORTED);
+
+        interface Sample {
+            i: number; plan: string; overlayDirty: boolean; overlayContent: boolean;
+            publishHeld: boolean;
+            ddrawFrames: number | null; presentSerial: number;
+            luma: number; holePct: number; diffPct: number | null; blank: boolean;
+            /** [x,y,w,h] of what changed since the previous sample, in screen pixels. */
+            bbox?: [number, number, number, number];
+        }
+        const samples: Sample[] = [];
+        const sigs: Uint8ClampedArray[] = [];
+        let prev: Uint8ClampedArray | null = null;
+        let firstBlob: Blob | null = null;
+        let flashBlob: Blob | null = null;
+        let flashIndex = -1;
+        let maxDiff = 0;
+
+        for (let i = 0; i < n; i++) {
+            await new Promise<void>((r) => requestAnimationFrame(() => r()));
+            // Read the compositing state BEFORE the capture: a screen capture awaits, and
+            // the flags it reports must belong to the frame the pixels came from.
+            const plan = getOverlayCompositePlan();
+            const row: Sample = {
+                i,
+                plan: plan.mode,
+                overlayDirty: !!gdi?.isOverlayDirty?.(),
+                overlayContent: !!gdi?.hasOverlayContent?.(),
+                publishHeld: !!gdi?.isOverlayPublishHeld?.(),
+                ddrawFrames: (dd?.presenter as { getCounters?(): Record<string, number> } | undefined)?.getCounters?.().frames ?? null,
+                presentSerial: (render?.["presentSerial"] as number) ?? -1,
+                luma: 0, holePct: 0, diffPct: null, blank: false,
+            };
+
+            let px: Uint8ClampedArray;
+            if (source === "overlay") {
+                sctx.clearRect(0, 0, SW, SH);
+                sctx.drawImage(overlayCanvas!, 0, 0, SW, SH);
+                px = sctx.getImageData(0, 0, SW, SH).data;
+            } else {
+                const blob: Blob | null = await render?.tryCaptureScreen?.();
+                if (!blob) { samples.push(row); continue; }
+                if (!firstBlob) firstBlob = blob;
+                const bmp = await createImageBitmap(blob);
+                sctx.clearRect(0, 0, SW, SH);
+                sctx.drawImage(bmp, 0, 0, SW, SH);
+                bmp.close();
+                px = sctx.getImageData(0, 0, SW, SH).data;
+                if (flashIndex === i - 1 || flashIndex < 0) flashBlob = blob;
+            }
+
+            let sum = 0;
+            let holes = 0;
+            for (let p = 0; p < px.length; p += 4) {
+                sum += (px[p] + px[p + 1] + px[p + 2]) / 3;
+                if (px[p + 3] < 8) holes++;
+            }
+            row.luma = Math.round((sum / (SW * SH)) * 10) / 10;
+            row.holePct = Math.round((holes / (SW * SH)) * 1000) / 10;
+            row.blank = row.luma < 4;
+
+            if (prev) {
+                let changed = 0;
+                let x0 = SW, y0 = SH, x1 = -1, y1 = -1;
+                for (let p = 0; p < px.length; p += 4) {
+                    if (Math.abs(px[p] - prev[p]) + Math.abs(px[p + 1] - prev[p + 1]) + Math.abs(px[p + 2] - prev[p + 2]) <= 24) continue;
+                    changed++;
+                    const c = (p >> 2) % SW, r = (p >> 2) / SW | 0;
+                    if (c < x0) x0 = c; if (c > x1) x1 = c;
+                    if (r < y0) y0 = r; if (r > y1) y1 = r;
+                }
+                row.diffPct = Math.round((changed / (SW * SH)) * 1000) / 10;
+                // Where it changed, in screen pixels — that is what names the control.
+                if (x1 >= 0) {
+                    const sx = (overlayCanvas?.width ?? SW) / SW, sy = (overlayCanvas?.height ?? SH) / SH;
+                    row.bbox = [Math.round(x0 * sx), Math.round(y0 * sy), Math.round((x1 - x0 + 1) * sx), Math.round((y1 - y0 + 1) * sy)];
+                }
+                if (row.diffPct > maxDiff) { maxDiff = row.diffPct; flashIndex = i; }
+            }
+            prev = new Uint8ClampedArray(px);
+            sigs.push(prev);
+            samples.push(row);
+        }
+
+        // Oscillation: a sample that differs a lot from its neighbour but matches the one
+        // before it is a two-state flip, not a transition to a new screen.
+        const diffOf = (a: Uint8ClampedArray, b: Uint8ClampedArray): number => {
+            let changed = 0;
+            for (let p = 0; p < a.length; p += 4) {
+                if (Math.abs(a[p] - b[p]) + Math.abs(a[p + 1] - b[p + 1]) + Math.abs(a[p + 2] - b[p + 2]) > 24) changed++;
+            }
+            return (changed / (SW * SH)) * 100;
+        };
+        let oscillating = 0;
+        for (let i = 2; i < sigs.length; i++) {
+            if (diffOf(sigs[i], sigs[i - 1]) > 10 && diffOf(sigs[i], sigs[i - 2]) < 2) oscillating++;
+        }
+
+        const changedSamples = samples.filter((s) => (s.diffPct ?? 0) > 2).length;
+        const saved: Record<string, string> = {};
+        const dump = async (blob: Blob | null, name: string): Promise<void> => {
+            if (!blob) return;
+            (self as unknown as Worker).postMessage({
+                type: "debug_png_dump", name,
+                base64: bytesToBase64(new Uint8Array(await blob.arrayBuffer())),
+            });
+            saved[name] = debugDumpPath(name);
+        };
+        if (opts.save) {
+            const stem = opts.save.replace(/\.png$/i, "");
+            if (source === "screen") {
+                await dump(firstBlob, `${stem}-first`);
+                await dump(flashBlob, `${stem}-flash`);
+            } else {
+                // The sweep kept only the 64x48 signatures (full-res blobs would have cost
+                // the frame-accuracy this route exists for). They are thumbnails, but they
+                // show WHERE the flash was, which is the question.
+                const emit = async (sig: Uint8ClampedArray | undefined, name: string): Promise<void> => {
+                    if (!sig) return;
+                    const img = sctx.createImageData(SW, SH);
+                    img.data.set(sig);
+                    sctx.putImageData(img, 0, 0);
+                    await dump(await scratch.convertToBlob({ type: "image/png" }), name);
+                };
+                await emit(sigs[0], `${stem}-first`);
+                if (flashIndex >= 0) await emit(sigs[flashIndex], `${stem}-flash`);
+            }
+        }
+
+        return {
+            samples,
+            summary: {
+                frames: samples.length,
+                changedSamples,
+                oscillating,
+                blankSamples: samples.filter((s) => s.blank).length,
+                maxDiffPct: samples.reduce((m, s) => Math.max(m, s.diffPct ?? 0), 0),
+                maxHolePct: samples.reduce((m, s) => Math.max(m, s.holePct), 0),
+                planModes: [...new Set(samples.map((s) => s.plan))],
+                firstFlashSample: flashIndex,
+                source,
+            },
+            saved,
+        };
     });
 
     /** rtDebug() — D3D9 render-target diagnostics: recent SetRenderTarget surface→texture

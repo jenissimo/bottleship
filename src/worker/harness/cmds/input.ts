@@ -82,6 +82,23 @@ export const RECORDABLE_INPUT = new Set(["click", "clickAt", "move", "drag", "wh
  * RPC verbs AND the record/replay engine (so a replayed input takes the exact
  * same faithful path). Returns the command's result POJO.
  */
+/** Shortest press a human hand produces; long enough to span a guest frame at 30-60 fps. */
+const CLICK_HOLD_MS = 80;
+
+/** Pending releases per button, so back-to-back clicks cannot leave a button stuck down. */
+const pendingRelease = new Map<number, ReturnType<typeof setTimeout>>();
+
+function pressAndRelease(im: any, x: number, y: number, button: number, holdMs: number): void {
+    const armed = pendingRelease.get(button);
+    if (armed !== undefined) { clearTimeout(armed); pendingRelease.delete(button); }
+    im.injectMoveAtScreen(x, y);
+    im.injectButtonAtScreen(x, y, button, true);
+    pendingRelease.set(button, setTimeout(() => {
+        pendingRelease.delete(button);
+        try { im.injectButtonAtScreen(x, y, button, false); } catch { /* torn down */ }
+    }, Math.max(1, holdMs)));
+}
+
 export function applyInput(cmd: string, args: unknown[]): any {
     const im = input();
     switch (cmd) {
@@ -94,8 +111,15 @@ export function applyInput(cmd: string, args: unknown[]): any {
             return { ok, ...c };
         }
         case "clickAt": {
+            // A click has DURATION. Pressing and releasing inside one JS turn gives the guest
+            // a press that occupies no guest time at all: the input layer's latch guarantees a
+            // level-polling API still observes it (input-manager consumeMouseButtonLatch), but
+            // a UI state machine that samples the button on its own slower tick can still be
+            // between samples for the whole press — exactly as a 0 ms click would be on real
+            // hardware. So release on a timer, like clickHold, just with a short human default.
             const x = Number(args[0]) | 0, y = Number(args[1]) | 0;
-            return { ok: im.injectClickAtScreen(x, y), x, y };
+            pressAndRelease(im, x, y, 0, CLICK_HOLD_MS);
+            return { ok: true, x, y, holdMs: CLICK_HOLD_MS };
         }
         case "clickHold": {
             // Press and HOLD the button for `holdMs` of wall-clock, then release on a
@@ -106,9 +130,7 @@ export function applyInput(cmd: string, args: unknown[]): any {
             const x = Number(args[0]) | 0, y = Number(args[1]) | 0;
             const holdMs = Number(args[2] ?? 200) | 0;
             const button = Number(args[3] ?? 0) | 0;
-            im.injectMoveAtScreen(x, y);
-            im.injectButtonAtScreen(x, y, button, true);
-            setTimeout(() => { try { im.injectButtonAtScreen(x, y, button, false); } catch { /* torn down */ } }, Math.max(1, holdMs));
+            pressAndRelease(im, x, y, button, holdMs);
             return { ok: true, x, y, holdMs, button };
         }
         case "move": {
@@ -242,6 +264,14 @@ export function registerInputCommands(svc: HarnessService): void {
                 }
                 return s;
             };
+            // The latched read is what a level-polling guest actually observes; without it
+            // a trace shows getMouseState()'s level and misses every sub-poll press.
+            probe.originals.consumeMouseButtonLatch = im.consumeMouseButtonLatch.bind(im);
+            im.consumeMouseButtonLatch = () => {
+                const v = probe!.originals.consumeMouseButtonLatch() as number;
+                if (v) push({ k: "latchRead", buttons: v }); // 0 is every quiet frame — noise
+                return v;
+            };
             probe.originals.getKeyboardStateVk = im.getKeyboardStateVk.bind(im);
             im.getKeyboardStateVk = (target?: Uint8Array) => {
                 const ks = probe!.originals.getKeyboardStateVk(target) as Uint8Array;
@@ -281,5 +311,37 @@ export function registerInputCommands(svc: HarnessService): void {
     svc.register("findControl", (args) => {
         const found = findDlgControl(args[0] as string | number);
         return found ? describeDlgControl(found.hwnd, found.win) : null;
+    });
+
+    /**
+     * waitForControl(target, {timeoutMs, pollMs, visible}) — block until a control
+     * exists (and is visible unless told otherwise), then describe it.
+     *
+     * The gate a front-end bring-up actually wants. `tickFrames` cannot serve: a Win32
+     * front-end runs its dialogs BEFORE the render device presents anything, so waiting
+     * on presents there waits forever and reads exactly like a hang. Throws NOT_FOUND on
+     * timeout so a chain aborts at the real cause instead of clicking into empty space.
+     */
+    svc.register("waitForControl", async (args, ctx) => {
+        const target = args[0] as string | number;
+        const opts = (args[1] ?? {}) as { timeoutMs?: number; pollMs?: number; visible?: boolean };
+        const needVisible = opts.visible !== false;
+        const pollMs = Math.max(1, opts.pollMs ?? 100);
+        const t0 = performance.now();
+        const deadline = t0 + (opts.timeoutMs ?? 120_000);
+        for (;;) {
+            const found = findDlgControl(target);
+            if (found && (!needVisible || found.win.visible)) {
+                return { ...describeDlgControl(found.hwnd, found.win), waitedMs: performance.now() - t0 };
+            }
+            if (performance.now() > deadline) {
+                throw new HarnessError(
+                    `waitForControl: '${String(target)}' not ${needVisible ? "visible" : "present"} ` +
+                    `after ${Math.round(performance.now() - t0)}ms`,
+                    HarnessErrorCode.NOT_FOUND);
+            }
+            if (ctx.signal.aborted) throw ctx.signal.reason ?? new HarnessError("aborted", HarnessErrorCode.CANCELLED);
+            await new Promise((r) => setTimeout(r, pollMs));
+        }
     });
 }

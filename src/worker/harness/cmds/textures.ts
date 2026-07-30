@@ -243,15 +243,58 @@ export function registerTextureCommands(svc: HarnessService): void {
      *  agnostic now: DDraw/D3D7 (full FFP), D3D8 (full FFP via the shared executor),
      *  D3D9 (backend-tagged minimal draws). Resolves at the next present (onFrameEnd). */
     svc.register("captureFrame", async (args, ctx: HarnessCtx) => {
-        const opts = (args[0] ?? {}) as { timeoutMs?: number };
+        const opts = (args[0] ?? {}) as { timeoutMs?: number; backend?: string; dumpTargets?: boolean };
         const timeoutMs = opts.timeoutMs ?? 5000;
         const frame = await Promise.race([
-            frameCaptureStart(),
+            frameCaptureStart(opts.backend),
             new Promise((_res, rej) => {
                 const t = setTimeout(() => rej(new HarnessError(`no frame presented within ${timeoutMs}ms`, HarnessErrorCode.TIMEOUT)), timeoutMs);
                 ctx.signal.addEventListener("abort", () => { clearTimeout(t); rej(ctx.signal.reason ?? new HarnessError("aborted", HarnessErrorCode.CANCELLED)); }, { once: true });
             }),
-        ]);
-        return frame;
+        ]) as { drawCalls: Array<{ rtSurfacePtr: number; rtWidth: number; rtHeight: number; rtFormat?: string | null }> };
+        if (!opts.dumpTargets) return frame;
+        // The distinct attachments the frame drew into, in first-use order. A frame split
+        // across render targets (render-to-texture, an inset view) is otherwise only visible
+        // by diffing rtSurfacePtr across every draw by hand.
+        const targets = new Map<number, { rtSurfacePtr: string; width: number; height: number; format: string | null; draws: number }>();
+        for (const d of frame.drawCalls) {
+            const key = d.rtSurfacePtr >>> 0;
+            const row = targets.get(key);
+            if (row) { row.draws++; continue; }
+            targets.set(key, {
+                rtSurfacePtr: "0x" + key.toString(16),
+                width: d.rtWidth, height: d.rtHeight,
+                format: d.rtFormat ?? null, draws: 1,
+            });
+        }
+        return { ...frame, targets: [...targets.values()] };
+    });
+
+    /** gpuToggle(name, enabled, value?) — flip one of the render backends' DebugFlags.
+     *
+     *  These are the A/B knobs for "the draws are issued but nothing is visible": each
+     *  one removes exactly one stage from the pipeline, so the first toggle that makes
+     *  the image appear NAMES the stage. `forceDisableAlphaTest` / `forceDisableAlphaBlend`
+     *  (is the texel being discarded?), `forceDisableZTest` (depth?), `forceTextureResync`
+     *  (is the GPU copy of the texture stale?), `forceMissingTextureMagenta` (is a texture
+     *  bound at all?), `textureConverterDebugMode` (1 = paint every converted texture a
+     *  flat colour by source bit-depth, so a black texture becomes visibly green/blue).
+     *  Reading the same answer out of the log firehose is not possible — the flags change
+     *  the picture, and the picture is the measurement.
+     *
+     *  Call with no name to read the current flags. Toggles are sticky; clear them when
+     *  done or every later observation inherits them. */
+    svc.register("gpuToggle", (args) => {
+        const name = args[0] as string | undefined;
+        const exec = ddraw()?.context?.executor;
+        if (!exec) throw new HarnessError("ddraw executor not available (no DDraw/D3D7 backend)", HarnessErrorCode.UNSUPPORTED);
+        if (name === undefined) return exec.getDebugFlags?.() ?? null;
+        if (typeof exec.setDebugToggle !== "function") {
+            throw new HarnessError("executor has no setDebugToggle", HarnessErrorCode.UNSUPPORTED);
+        }
+        const enabled = args[1] === undefined ? true : !!args[1];
+        const value = args[2] as number | undefined;
+        exec.setDebugToggle(name, enabled, value);
+        return { toggle: name, enabled, value: value ?? null, flags: exec.getDebugFlags?.() ?? null };
     });
 }

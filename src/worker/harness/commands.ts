@@ -22,6 +22,7 @@ import { registerFsCommands } from "./cmds/fs";
 import { registerFixtureCommands } from "./cmds/fixture";
 import { registerRegistryCommands } from "./cmds/reg";
 import { registerWmTraceCommands } from "./cmds/wm-trace";
+import { registerPaintTraceCommands } from "./cmds/paint-trace";
 import { registerAssertCommands } from "./cmds/assert";
 import { registerRecordCommands } from "./cmds/record";
 import { registerMemTrapCommands } from "./cmds/memtrap";
@@ -30,6 +31,8 @@ import { registerFadeProbeCommands } from "./cmds/fadeprobe";
 import { registerAudioCommands } from "./cmds/audio";
 import { registerDbgCommands } from "./cmds/dbg";
 import { registerCodegenCommands } from "./cmds/codegen";
+import { registerResourceCommands } from "./cmds/resources";
+import { registerHeapCommands } from "./cmds/heap";
 
 let installed = false;
 
@@ -49,6 +52,7 @@ export function installHarnessCommands(): void {
     registerFixtureCommands(harnessService);
     registerRegistryCommands(harnessService);
     registerWmTraceCommands(harnessService);
+    registerPaintTraceCommands(harnessService);
     registerAssertCommands(harnessService);
     registerRecordCommands(harnessService);
     registerMemTrapCommands(harnessService);
@@ -57,6 +61,8 @@ export function installHarnessCommands(): void {
     registerAudioCommands(harnessService);
     registerDbgCommands(harnessService);
     registerCodegenCommands(harnessService);
+    registerResourceCommands(harnessService);
+    registerHeapCommands(harnessService);
 }
 
 // Install on import so a bare `import './harness/commands'` is sufficient.

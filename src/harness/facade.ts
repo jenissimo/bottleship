@@ -23,6 +23,7 @@ import {
     type HarnessReply,
     type HarnessEventMsg,
 } from "../worker/harness/rpc";
+import { sessionFromLocation } from "./session";
 import type { HarnessStep, HarnessRunResult, HarnessStepResult } from "./types";
 import { isSerializedFn } from "./types";
 import { HarnessChain } from "./dsl";
@@ -286,6 +287,42 @@ export function installHarnessFacade(worker: Worker, getInputView?: () => Int32A
         return { path, loaded: !!done, progress: done ?? null };
     }
 
+    /**
+     * Set a worker A/B flag so it SURVIVES a reload.
+     *
+     * The worker-side verb only assigns `globalThis[key]` in the CURRENT worker, and
+     * `openWgb()` reloads the page before loading (fresh worker + code) — so a chain of
+     * `setWorkerFlag(...).openWgb(...)` silently lost the flag and every `__no*` A/B
+     * measured the DEFAULT path while reporting success. (Observed: __noHeapSlab left
+     * the slab counters byte-identical.) Persist through the same localStorage channel
+     * the host replays on every worker init, BEFORE any game loads, then forward the RPC
+     * so the flag also applies to the live worker.
+     */
+    async function setWorkerFlag(key: string, value: unknown): Promise<unknown> {
+        if (typeof key !== "string" || !key.startsWith("__")) {
+            throw new Error(`setWorkerFlag: refusing non-dunder flag '${String(key)}'`);
+        }
+        // Session-scoped store when this tab has a ?bs=<name>: localStorage is origin-wide,
+        // so a global flag would silently apply to every parallel agent's tab too.
+        const session = sessionFromLocation(window.location.search);
+        const store = session ? `bs_debug_flags:${session}` : "bs_debug_flags";
+        let persisted = false;
+        try {
+            const flags = JSON.parse(localStorage.getItem(store) || "{}");
+            if (value === undefined || value === null) delete flags[key]; else flags[key] = value;
+            localStorage.setItem(store, JSON.stringify(flags));
+            persisted = true;
+        } catch (e) {
+            // Fail LOUDLY: a silently-unpersisted flag is worse than no flag, because the
+            // A/B that follows looks like it ran.
+            throw new Error(`setWorkerFlag('${key}'): could not persist to localStorage ` +
+                `(${(e as Error).message}) — the flag would be lost by openWgb's reload, ` +
+                `so the A/B would measure the default path. Refusing.`);
+        }
+        const live = await rpc("setWorkerFlag", [key, value]);
+        return { ...(live as object), persisted, survivesReload: persisted, store };
+    }
+
     async function loadPe(url: string): Promise<unknown> {
         const w = window as any;
         if (typeof w.loadApp !== "function") throw new Error("window.loadApp not available");
@@ -330,6 +367,9 @@ export function installHarnessFacade(worker: Worker, getInputView?: () => Int32A
             },
             relativeIntent: { active: relativeIntent.get(), reasons: relativeIntent.reasons() },
             pointerLocked: document.pointerLockElement !== null,
+            // Under Pointer Lock the OS pointer is hidden and the guest cursor is ours to
+            // draw; `drawn:false` while locked with a visible guest cursor = no pointer.
+            cursorOverlay: (window as any).__BS__?.cursorOverlay ?? { drawn: false },
             maxTouchPoints: navigator.maxTouchPoints,
         };
     }
@@ -387,6 +427,7 @@ export function installHarnessFacade(worker: Worker, getInputView?: () => Int32A
     /* ─────────────────────── serialized step executor ───────────────────── */
 
     async function runOneStep(step: HarnessStep): Promise<unknown> {
+        if (step.cmd === "setWorkerFlag") return setWorkerFlag(step.args[0] as string, step.args[1]);
         if (step.cmd === "openWgb") return openWgb(step.args[0] as string, step.args[1] as any);
         if (step.cmd === "loadPe") return loadPe(step.args[0] as string);
         if (step.cmd === "audioGesture") return audioGesture();

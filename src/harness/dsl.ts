@@ -86,6 +86,12 @@ export class HarnessChain {
 
     // ── input ──
     click(target: string | number): this { return this.push("click", [target]); }
+    /** Block until a control exists and is visible, then describe it. THE gate for a Win32
+     *  front-end: its dialogs run before the render device presents, so tickFrames there
+     *  waits on presents that never come and reads exactly like a hang. */
+    waitForControl(target: string | number, opts?: { timeoutMs?: number; pollMs?: number; visible?: boolean }): this {
+        return this.pushTimed("waitForControl", [target, opts], (opts?.timeoutMs ?? 120_000) + 10_000);
+    }
     /** Click at guest-pixel coordinates (DDraw/D3D-composed UIs with no Win32 controls to target by label). */
     clickAt(x: number, y: number, button?: number): this { return this.push("clickAt", [x, y, button]); }
     /** Host-side snapshot of the published input record (the other half of state(["input"])). */
@@ -104,8 +110,20 @@ export class HarnessChain {
     /** Plug (true) or unplug (false) the gamepad: drives the SAB presence slot through the
      *  normal poll, so the guest gets the real WM_DEVICECHANGE / DIERR_INPUTLOST sequence. */
     padPlug(connected = true): this { return this.push("padPlug", [connected]); }
+    /** Engage/release Pointer Lock (CDP-side: needs user activation + a focused tab, which
+     *  no page-side verb can grant). The gate for every relative-mouse behaviour: honored
+     *  SetCursorPos warps, DirectInput deltas, and the host-drawn cursor. */
+    pointerLock(engage = true): this { return this.push("pointerLock", [engage]); }
     /** Record the pointer/keyboard WM_* the input layer posts — the ring expectMessages asserts over. */
     wmTrace(action: "start" | "stop" | "read" | "clear" = "read"): this { return this.push("wmTrace", [action]); }
+    /** THE instrument for a BLANK control / an unpainted dialog: records every link of the
+     *  paint chain (posted → pump filter → dispatched → BeginPaint/EndPaint → owner-draw
+     *  chain + its task counts) with the REASON each link bailed, so "never posted",
+     *  "filtered out", "flushed nothing" and "chain ran with 0 tasks" stop looking alike.
+     *  Optional `hwnds` also admits non-paint messages for those windows. */
+    paintTrace(action: "start" | "stop" | "read" | "clear" = "read", hwnds?: number[]): this {
+        return this.push("paintTrace", [action, hwnds]);
+    }
 
     // ── touch (CDP-side: device emulation + synthetic contacts; coords are GUEST px) ──
     /** Emulate a device profile — 'phone-landscape' | 'tablet-landscape' | 'desktop' (clears the override) — before the touch verbs. */
@@ -143,7 +161,15 @@ export class HarnessChain {
     /** PNG of the SCREEN (canvas, overlays composited). `source:'layer'` asks for the
      *  presenter's pre-composite game layer instead — labelled `composited:false`. */
     shot(opts?: { save?: string; source?: "screen" | "layer" }): this { return this.push("shot", [opts]); }
-    captureFrame(opts?: { dumpTargets?: boolean }): this { return this.push("captureFrame", [opts]); }
+    /** One-frame per-draw capture. `backend` ("ddraw"|"d3d8"|"d3d9") pins WHICH render path's
+     *  frame boundary ends it — without it, a title where two paths present returns the other
+     *  path's empty frame and that reads exactly like "no draws happened". `dumpTargets` adds
+     *  the distinct render attachments the frame drew into. */
+    captureFrame(opts?: { dumpTargets?: boolean; backend?: "ddraw" | "d3d8" | "d3d9"; timeoutMs?: number }): this { return this.push("captureFrame", [opts]); }
+    /** Flip one render-backend DebugFlag (alpha test/blend, z test, texture resync, converter
+     *  debug colours...). The first toggle that makes an invisible draw appear names the stage
+     *  that was dropping it. Omit `name` to read the currently-armed flags. Sticky — clear them. */
+    gpuToggle(name?: string, enabled?: boolean, value?: number): this { return this.push("gpuToggle", [name, enabled, value]); }
     textures(): this { return this.push("textures", []); }
     dumpTexture(sel: string | { stage: number }): this { return this.push("dumpTexture", [sel]); }
     dumpSurface(sel: string): this { return this.push("dumpSurface", [sel]); }
@@ -159,13 +185,46 @@ export class HarnessChain {
     perfProfile(opts?: { enable?: boolean; reset?: boolean }): this { return this.push("perfProfile", [opts]); }
     /** Worst frames (frameMs desc) with category + hottest-thunk breakdown — names the cause of a stall. */
     perfSpikes(opts?: { top?: number; minMs?: number }): this { return this.push("perfSpikes", [opts]); }
-    /** Latest + average frame sample + spike count. */
+    /** Latest + average frame sample, spike counts, and the frame-time tail summary. */
     perfStats(): this { return this.push("perfStats", []); }
+    /** THE frame instrument: distribution tail (p50/p95/p99 + frames over BUDGET, never a
+     *  hardcoded 16.7) + budget-missing frames coalesced into ranked classes with one
+     *  representative each + window counter deltas (scheduler / fastmem-JIT / hypercalls) +
+     *  a cross-check against the independent flip-cadence instrument + the trace join seam.
+     *  A window that was not really measured returns a STATE, never percentiles.
+     *  Flow: frameReport({reset:true, budgetMs:33.34}) -> play -> frameReport(). */
+    frameReport(opts?: { budgetMs?: number; refreshMs?: number; top?: number; reset?: boolean; maxBuckets?: number }): this {
+        return this.push("frameReport", [opts]);
+    }
+    /** WHICH GUEST CODE is hot, by two independent channels: sampled EIPs (time-weighted,
+     *  resolved to module+rva) and trace2 block census (count-weighted, exec x instructions).
+     *  A disagreement between them is reported, not reconciled. The counted channel zeroes and
+     *  arms the recorder itself and publishes the window it covers, or refuses — it never ranks
+     *  counters of unknown age. Arming SLOWS the guest, so take timings from a clean window.
+     *  Split the window by hand with {phase:'arm'} ... {phase:'read'}. */
+    guestBlocks(opts?: {
+        ms?: number; intervalMs?: number; top?: number;
+        phase?: "arm" | "read"; maxPages?: number; keepArmed?: boolean;
+    }): this {
+        return this.pushTimed("guestBlocks", [opts], (opts?.phase ? 0 : (opts?.ms ?? 2000)) + 30_000);
+    }
+    /** Emit the `bottleship.hotblocks` mark inside an active trace so analyze-trace can resolve
+     *  wasm frames to module:rva. `harness trace` does this for you. */
+    hotBlocksMark(opts?: { ms?: number; intervalMs?: number }): this {
+        return this.pushTimed("hotBlocksMark", [opts], (opts?.ms ?? 3000) + 30_000);
+    }
     /** Session-wide per-thunk cost (totalMs / avgUs / msPerFrame / share of the thunk slice).
      *  Use this — not FPS — to A/B one thunk's cost; per-call figures tolerate CPU contention. */
     perfThunks(opts?: { top?: number; filter?: string }): this { return this.push("perfThunks", [opts]); }
     /** Named-bucket sub-phase timings (avg/total/max/count). filter by substring; maxMs = worst single call. */
     profilerStats(opts?: { filter?: string; top?: number; sort?: "max" | "total" | "avg" }): this { return this.push("profilerStats", [opts]); }
+    /** Where the GUEST burns CPU: symbolized EIP/page histogram over a sampling window.
+     *  The instrument for a stall the thunk profiler can't see (level loads, decode loops) —
+     *  a Chrome trace only says `wasm-function[N]`, this says `module+0xrva`. Read
+     *  `stoppedPct` first: high means the guest was parked, not computing. */
+    eipProfile(opts?: { ms?: number; intervalMs?: number; top?: number }): this {
+        return this.pushTimed("eipProfile", [opts], (opts?.ms ?? 3000) + 10_000);
+    }
     /** GPU→CPU readback accounting: roundTrips (the real cost), memoHits, scratchHits,
      *  redundant (must be 0). {reset:true} zeroes after reading, so bracketing a
      *  tickFrames(N) gives round trips per frame. */

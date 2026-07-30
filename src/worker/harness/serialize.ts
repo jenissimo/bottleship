@@ -140,9 +140,16 @@ export function serializeSurfaces(): unknown {
     for (const o of objs) {
         const st = o?.getState?.();
         if (!st || typeof st.surfacePtr !== "number" || typeof st.width !== "number") continue;
+        // The guest COM address, so a breakOnApi this-ptr can be named. Without it a
+        // break snapshot's args and this list share no key and cannot be joined at all.
+        let comAddr = 0;
+        try { comAddr = u32(provider?.getAddressForHandle?.(o._handle ?? o.handle)); } catch { /* not registered */ }
         out.push({
             ptr: st.surfacePtr >>> 0,
             ptrHex: "0x" + (st.surfacePtr >>> 0).toString(16),
+            comAddrHex: comAddr ? "0x" + comAddr.toString(16) : null,
+            attachedSurfaceAddrHex: st.attachedSurfaceAddr ? "0x" + u32(st.attachedSurfaceAddr).toString(16) : null,
+            zOwnerSurfaces: st.zOwnerSurfaces?.map((a: number) => "0x" + u32(a).toString(16)) ?? null,
             width: st.width,
             height: st.height,
             pitch: st.pitch ?? 0,
@@ -300,11 +307,18 @@ export function serializeScreen(): unknown {
         h = ctx?.display?.height ?? 0;
     } catch { /* */ }
     const render: any = sys().services?.render;
+    // The CANVAS size is a separate fact from the DDraw display mode above, and a
+    // mismatch is exactly the bug class that reads as "cropped/squished pixels" — so
+    // report both rather than letting `width/height` stand in for "the resolution".
+    const canvas: any = (sys().process as any)?.canvas;
     return {
         primaryPtr,
         primaryPtrHex: "0x" + primaryPtr.toString(16),
+        /** DDraw display mode (SetDisplayMode/ChangeDisplaySettings), NOT the canvas. */
         width: w,
         height: h,
+        canvasWidth: canvas?.width ?? 0,
+        canvasHeight: canvas?.height ?? 0,
         presenter: render?.getLastPresenterKind?.() ?? null,
         presentSerial: render?.getPresentSerial?.() ?? 0,
     };
@@ -343,7 +357,46 @@ export function faultSnapshot(): unknown {
     return { eip, eipSym: symbolize(eip), esp, bytes, stack, recent, logTail, cpu: serializeCpu(), threads: serializeThreads() };
 }
 
-/** Read up to 4 stack args (esp+4..esp+0x10) + return address (esp) — for apiBreak. */
+/**
+ * A pointer argument decoded as text, or null. Most bring-up questions about a
+ * call are "WHICH one" — which file, which resource name, which class — and the
+ * answer is behind the pointer, not in the number. The stack is gone by the time
+ * a script could read it back (apiBreak does not pause the guest), so decode at
+ * the hit instant. ANSI first, then UTF-16LE; anything not fully printable and
+ * NUL-terminated inside the window is reported as null rather than guessed at.
+ */
+function decodeStringArg(mem: Uint8Array | null, ptr: number): string | null {
+    const p = ptr >>> 0;
+    if (!mem || p < 0x1000 || p + 2 > mem.length) return null;
+    const printable = (c: number): boolean => c === 9 || (c >= 0x20 && c !== 0x7f);
+    const limit = Math.min(mem.length, p + 260);
+    // ANSI
+    let ansi = "";
+    for (let a = p; a < limit; a++) {
+        const c = mem[a]!;
+        if (c === 0) break;
+        if (!printable(c)) { ansi = ""; break; }
+        ansi += String.fromCharCode(c);
+    }
+    if (ansi.length >= 2) return ansi;
+    // UTF-16LE (mem[p+1] === 0 with a printable lead byte is the giveaway)
+    let wide = "";
+    for (let a = p; a + 1 < limit; a += 2) {
+        const c = mem[a]! | (mem[a + 1]! << 8);
+        if (c === 0) break;
+        if (c > 0xff || !printable(c)) { wide = ""; break; }
+        wide += String.fromCharCode(c);
+    }
+    if (wide.length >= 2) return wide;
+    return ansi.length ? ansi : null;
+}
+
+/** Read up to 8 stack args (esp+4..esp+0x20) + return address (esp) — for apiBreak.
+ *  Eight, not four: COM methods routinely take 6-7 (IDirect3D9::CreateDevice's
+ *  pPresentationParameters is arg 5), and a snapshot that silently stops at 4 hands the
+ *  reader a `0` that is indistinguishable from a real NULL pointer. */
+const ARG_OFFSETS = [4, 8, 12, 16, 20, 24, 28, 32];
+
 export function readCallSnapshot(name: string, eip: number, esp: number): unknown {
     const mem = guestMem();
     const r = (off: number): number => {
@@ -400,7 +453,8 @@ export function readCallSnapshot(name: string, eip: number, esp: number): unknow
         esp: esp >>> 0,
         caller: r(0),
         callerSym: symbolize(r(0)),
-        args: [r(4), r(8), r(12), r(16)],
+        args: ARG_OFFSETS.map(r),
+        argStrings: ARG_OFFSETS.map(r).map((a) => decodeStringArg(mem, a)),
         stackWords,
         threadId,
         es,

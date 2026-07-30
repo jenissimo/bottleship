@@ -177,6 +177,7 @@ export function registerStateCommands(svc: HarnessService): void {
         const d = proc()?.dispatcher as {
             getActiveAsyncThunks?: () => Array<{ functionId: number; functionName?: string; startTime: number; threadId?: number; esp?: number; returnAddr?: number }>;
             getPendingAsyncRestores?: () => Array<{ threadId?: number; completionName: string; returnAddr?: number; esp?: number }>;
+            getDeferredFrameCompletions?: () => Array<{ threadId: number; frameId: number; source: string; value: number }>;
         } | undefined;
         if (!d?.getActiveAsyncThunks) {
             throw new HarnessError("dispatcher unavailable (no process loaded?)", HarnessErrorCode.BAD_ARGS);
@@ -253,7 +254,25 @@ export function registerStateCommands(svc: HarnessService): void {
                 : pending.length
                     ? `${pending.length} resolved restore(s) not applied — safe-point apply not reached`
                     : "no stuck async parks";
-        return { now: Math.round(now), parkedTids, inFlight, pending, orphanParkedTids, hint };
+        // A frame completion deferred to its owner thread (JS-driven pump whose terminal
+        // step landed on a sibling). Stuck here = the owner never reached its safe point,
+        // which looks exactly like a spin-loop hang from the outside.
+        const deferredCompletions = (d.getDeferredFrameCompletions?.() ?? []);
+        const deferredHint = deferredCompletions.length
+            ? `${deferredCompletions.length} deferred frame completion(s) awaiting owner ` +
+              `(tids ${deferredCompletions.map((c) => c.threadId).join(",")}) — owner not at a safe point`
+            : null;
+        // The scheduler's park/complete/restore ring. A STALL needs this as much as a fault
+        // does (it is only dumped on a fatal guard otherwise): when a thread sits at the spin
+        // loop with no in-flight async and no pending restore, these lines are the only
+        // record of which thunk parked it and whether its completion ever fired.
+        const sched = sys().scheduler as unknown as { getAsyncRestoreTrace?: () => string[] };
+        const asyncTrace = sched?.getAsyncRestoreTrace?.().slice(-24) ?? [];
+        return {
+            now: Math.round(now), parkedTids, inFlight, pending, orphanParkedTids,
+            deferredCompletions, asyncTrace,
+            hint: deferredHint ?? hint,
+        };
     });
 
     /**

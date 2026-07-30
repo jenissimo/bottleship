@@ -17,6 +17,8 @@
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { gunzipSync } from "node:zlib";
+// ONE definition of the frame-time statistic, shared with the live worker profiler.
+import { frameTailFromSamples, type FrameTail } from "../src/worker/core/frame-time-distribution";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -98,22 +100,17 @@ interface RenderFrameInterval {
   frameMs: number;
 }
 
-interface RenderFrameStats {
-  count: number;
-  minMs: number;
-  maxMs: number;
-  avgMs: number;
-  p50Ms: number;
-  p95Ms: number;
-  p99Ms: number;
-  fps: number;
-  slow30Count: number;
-}
+/** The SHARED statistic (src/worker/core/frame-time-distribution.ts) — a discriminated union,
+ *  so a window with nothing measured in it cannot present percentile fields at all. */
+type RenderFrameStats = FrameTail;
 
 interface RenderFrameAnalysis {
   markCount: number;
   intervals: RenderFrameInterval[];
   stats: RenderFrameStats;
+  budgetMs?: number;
+  /** Set when --range narrowed these intervals, so the header can say so. */
+  scopedTo?: string;
 }
 
 const TIMELINE_BUCKET_US = 2_000_000;
@@ -249,6 +246,21 @@ function extractEmbeddedHotBlocks(events: any[]): any[] | null {
   return best;
 }
 
+/** The harness window's UserTiming marks (`frameReport({reset:true})` … `frameReport()`). */
+function extractPerfWindow(events: TraceEvent[]): { beginTsUs: number | null; endTsUs: number | null } | null {
+  let beginTsUs: number | null = null;
+  let endTsUs: number | null = null;
+  for (const ev of events) {
+    const name = (ev as any)?.name;
+    if (name !== "bottleship.perfwindow.begin" && name !== "bottleship.perfwindow.end") continue;
+    const ts = (ev as any).ts;
+    if (!Number.isFinite(ts)) continue;
+    if (name.endsWith("begin")) beginTsUs = beginTsUs === null ? ts : Math.min(beginTsUs, ts);
+    else endTsUs = endTsUs === null ? ts : Math.max(endTsUs, ts);
+  }
+  return beginTsUs === null && endTsUs === null ? null : { beginTsUs, endTsUs };
+}
+
 function loadJitBlockMap(path: string): void {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const fs = require("fs") as typeof import("fs");
@@ -373,49 +385,20 @@ function readTrace(path: string): { events: TraceEvent[]; rawSize: number; gzipS
 
 // ─── Thread Name Extraction ───────────────────────────────────────────────────
 
-function emptyRenderFrameStats(): RenderFrameStats {
-  return {
-    count: 0,
-    minMs: 0,
-    maxMs: 0,
-    avgMs: 0,
-    p50Ms: 0,
-    p95Ms: 0,
-    p99Ms: 0,
-    fps: 0,
-    slow30Count: 0,
-  };
+/**
+ * Frame-interval statistics — computed by the SHARED distribution (`frameTailFromSamples`),
+ * the same code the live worker profiler runs. The old local implementation hardcoded
+ * "> 33.33ms" as the definition of a slow frame (i.e. 30fps as the only budget) and indexed
+ * percentiles one rank high, so at n=100 its p99 was literally the max. Both were dialects of
+ * a statistic that now has one definition: the budget is the caller's or is derived from the
+ * observed cadence, percentiles are bucket upper bounds, and a rank with no observation behind
+ * it is withheld instead of interpolated.
+ */
+function computeRenderFrameStats(intervals: RenderFrameInterval[], budgetMs?: number): RenderFrameStats {
+  return frameTailFromSamples(intervals.map(i => i.frameMs), { budgetMs, maxBuckets: 24 });
 }
 
-function percentile(sorted: number[], pctValue: number): number {
-  if (sorted.length === 0) return 0;
-  const idx = Math.min(sorted.length - 1, Math.floor(sorted.length * pctValue));
-  return sorted[idx] ?? 0;
-}
-
-function computeRenderFrameStats(intervals: RenderFrameInterval[]): RenderFrameStats {
-  if (intervals.length === 0) return emptyRenderFrameStats();
-
-  const sorted = intervals.map(i => i.frameMs).sort((a, b) => a - b);
-  const count = sorted.length;
-  const sum = sorted.reduce((acc, value) => acc + value, 0);
-  const avgMs = sum / count;
-  const slow30Count = sorted.filter(value => value > 33.33).length;
-
-  return {
-    count,
-    minMs: sorted[0]!,
-    maxMs: sorted[count - 1]!,
-    avgMs,
-    p50Ms: percentile(sorted, 0.50),
-    p95Ms: percentile(sorted, 0.95),
-    p99Ms: percentile(sorted, 0.99),
-    fps: avgMs > 0 ? 1000 / avgMs : 0,
-    slow30Count,
-  };
-}
-
-function extractRenderFrameAnalysis(events: TraceEvent[]): RenderFrameAnalysis | null {
+function extractRenderFrameAnalysis(events: TraceEvent[], budgetMs?: number): RenderFrameAnalysis | null {
   const marks = events
     .filter(ev => (ev as any)?.name === "bottleship.flip" && Number.isFinite((ev as any).ts))
     .map(ev => (ev as any).ts as number)
@@ -437,10 +420,13 @@ function extractRenderFrameAnalysis(events: TraceEvent[]): RenderFrameAnalysis |
   }
 
   if (intervals.length === 0) return null;
+  const stats = computeRenderFrameStats(intervals, budgetMs);
   return {
     markCount: marks.length,
     intervals,
-    stats: computeRenderFrameStats(intervals),
+    stats,
+    // Budget actually used: explicit, or the one the distribution derived from this window.
+    budgetMs: budgetMs ?? (stats.ok && stats.budget ? stats.budget.ms : undefined),
   };
 }
 
@@ -449,14 +435,46 @@ function renderStatsForBucket(
   workerProfile: MergedProfile,
   bucket: TimelineBucket
 ): RenderFrameStats {
-  if (!renderFrames || !Number.isFinite(workerProfile.startTs)) return emptyRenderFrameStats();
+  if (!renderFrames || !Number.isFinite(workerProfile.startTs)) return computeRenderFrameStats([]);
 
   const startTsUs = workerProfile.startTs + bucket.startUs;
   const endTsUs = workerProfile.startTs + bucket.endUs;
   const intervals = renderFrames.intervals.filter(interval =>
     interval.endTsUs >= startTsUs && interval.endTsUs < endTsUs
   );
-  return computeRenderFrameStats(intervals);
+  // The whole-window budget, so per-bucket columns are comparable to each other and to the
+  // summary — a per-bucket derived budget would silently move the goal every 2 seconds.
+  return computeRenderFrameStats(intervals, renderFrames.budgetMs);
+}
+
+/**
+ * Category + leaf-function attribution for an arbitrary absolute time range — the same walk
+ * buildTimeline does, but for a window the caller chooses (one worst frame, or a perfwindow).
+ * `coveragePct` is the instrument's own limit: Chrome samples at ~1ms, so a short frame is
+ * attributed from few samples and says so rather than implying precision.
+ */
+function attributeRange(profile: MergedProfile, startTsUs: number, endTsUs: number, topFns: number) {
+  const byCategory: Record<Category, number> = { wasm: 0, js: 0, idle: 0, native: 0 };
+  const fns = new Map<string, number>();
+  let cumulativeUs = 0;
+  let totalUs = 0;
+  for (let i = 0; i < profile.samples.length; i++) {
+    const dt = profile.timeDeltas[i] ?? 0;
+    cumulativeUs += dt;
+    const abs = profile.startTs + cumulativeUs;
+    if (abs < startTsUs || abs >= endTsUs) continue;
+    const node = profile.nodes.get(profile.samples[i]!);
+    if (!node) continue;
+    byCategory[classifyFrame(node.callFrame)] += dt;
+    const label = frameLabel(node.callFrame, false);
+    fns.set(label, (fns.get(label) ?? 0) + dt);
+    totalUs += dt;
+  }
+  const top = Array.from(fns.entries()).sort((a, b) => b[1] - a[1]).slice(0, topFns);
+  const spanUs = Math.max(1, endTsUs - startTsUs);
+  // Clamped: a sample's whole delta is charged to the window it lands in, so the raw ratio can
+  // exceed 1 at the edges. It is a confidence hint, not an accounting identity.
+  return { totalUs, byCategory, top, coveragePct: Math.min(100, (totalUs / spanUs) * 100) };
 }
 
 function extractThreadNames(events: TraceEvent[]): Map<string, string> {
@@ -649,7 +667,11 @@ function sliceProfileByRange(
     samples,
     timeDeltas,
     startTime: profile.startTime,
-    startTs: profile.startTs,
+    // Cumulative time in the sliced profile restarts at the range's start, so startTs must
+    // advance with it — every consumer reconstructs absolute trace time as
+    // `startTs + cumulative` (timeline buckets, per-frame attribution). Without this the
+    // sliced report attributes samples to the wrong wall-clock instant.
+    startTs: profile.startTs + startUs,
   };
 }
 
@@ -1053,6 +1075,11 @@ function fmtFrameMs(ms: number): string {
   return `${ms.toFixed(2)}ms`;
 }
 
+/** A percentile that has no observation behind it prints as its reason, never as a number. */
+function fmtTail(ms: number | null): string {
+  return ms === null ? "n/a" : fmtFrameMs(ms);
+}
+
 function reportRenderFrames(renderFrames: RenderFrameAnalysis | null): string | null {
   if (!renderFrames) return null;
 
@@ -1061,14 +1088,67 @@ function reportRenderFrames(renderFrames: RenderFrameAnalysis | null): string | 
   lines.push(`\n${sep("═")}`);
   lines.push(`RENDER FRAME TIMING`);
   lines.push(sep("═"));
-  lines.push(`Source: bottleship.flip UserTiming marks (app-level present cadence)`);
-  lines.push(`Marks: ${num(renderFrames.markCount)}  Intervals: ${num(s.count)}`);
+  lines.push(`Source: bottleship.flip UserTiming marks (app-level present cadence)`
+    + (renderFrames.scopedTo ? `  [scoped to --range ${renderFrames.scopedTo}]` : ""));
+  lines.push(`Marks: ${num(renderFrames.markCount)}  Intervals: ${num(s.sampleCount)}`);
+  if (!s.ok) {
+    lines.push(`No distribution: ${s.status} — ${s.note}`);
+    return lines.join("\n");
+  }
   lines.push(
-    `Avg: ${fmtFrameMs(s.avgMs)} (${s.fps.toFixed(1)} FPS)  ` +
-    `P50: ${fmtFrameMs(s.p50Ms)}  P95: ${fmtFrameMs(s.p95Ms)}  ` +
-    `P99: ${fmtFrameMs(s.p99Ms)}  Max: ${fmtFrameMs(s.maxMs)}`
+    `Avg: ${fmtFrameMs(s.meanMs)} (${(s.meanMs > 0 ? 1000 / s.meanMs : 0).toFixed(1)} FPS)  ` +
+    `P50: ${fmtTail(s.p50Ms)}  P95: ${fmtTail(s.p95Ms)}  ` +
+    `P99: ${fmtTail(s.p99Ms)}  Max: ${fmtFrameMs(s.maxMs)}`
   );
-  lines.push(`Slow frames >33.33ms: ${num(s.slow30Count)} (${pct(s.slow30Count, s.count)})`);
+  lines.push(`  (percentiles are bucket UPPER BOUNDS, same definition as the live harness frameReport)`);
+  for (const why of s.unavailable) lines.push(`  ${why}`);
+  if (s.budget) {
+    const b = s.budget;
+    lines.push(
+      `Budget ${fmtFrameMs(b.ms)} (${b.source}): over ${num(b.overFrames)} (${b.overPct.toFixed(1)}%)  ` +
+      `>2x budget: ${num(b.over2xFrames)}  lost ~${b.excessMsApprox.toFixed(0)}ms  p99/budget: ${b.p99OverBudget ?? "n/a"}`
+    );
+    if (b.straddleFrames > 0) lines.push(`  ${num(b.straddleFrames)} frames sit in the bucket the budget falls inside (unclassifiable either way)`);
+  } else if (s.budgetNote) {
+    lines.push(`Budget: ${s.budgetNote}`);
+  }
+  lines.push(`  --budget-ms <n> to judge against the title's own cadence instead of the derived one.`);
+  return lines.join("\n");
+}
+
+/**
+ * WORST FRAMES with stack attribution — the trace's advantage over the live profiler, which
+ * can only name thunks. Slices the worker profile to each worst interval, so a spike is
+ * answered with JS/wasm split and leaf functions (GC shows up here as "(garbage collector)";
+ * `wasm-function[N]` frames are compiled guest blocks — resolvable to module:rva when the
+ * bottleship.hotblocks mark is present).
+ */
+function reportWorstFrames(
+  renderFrames: RenderFrameAnalysis | null,
+  workerProfile: MergedProfile | null,
+  topN: number
+): string | null {
+  if (!renderFrames || !workerProfile || !Number.isFinite(workerProfile.startTs)) return null;
+  const worst = renderFrames.intervals.slice().sort((a, b) => b.frameMs - a.frameMs).slice(0, topN);
+  if (worst.length === 0) return null;
+
+  const lines: string[] = [];
+  lines.push(`\n${sep("═")}`);
+  lines.push(`WORST FRAMES (by inter-flip interval) — stack attribution per frame`);
+  lines.push(sep("═"));
+  lines.push(`  ${"at".padStart(8)} ${"ms".padStart(9)} ${"cov".padStart(5)} ${"js".padStart(5)} ${"wasm".padStart(5)} ${"idle".padStart(5)}  hot leaves`);
+  for (const iv of worst) {
+    const a = attributeRange(workerProfile, iv.startTsUs, iv.endTsUs, 3);
+    const rel = (iv.endTsUs - workerProfile.startTs) / 1_000_000;
+    const share = (v: number) => (a.totalUs > 0 ? `${((v / a.totalUs) * 100).toFixed(0)}%` : "-");
+    const leaves = a.top.map(([fn, us]) => `${fn} ${(us / 1000).toFixed(1)}ms`).join(", ") || "(no samples in window)";
+    lines.push(
+      `  ${`${rel.toFixed(2)}s`.padStart(8)} ${fmtFrameMs(iv.frameMs).padStart(9)} ` +
+      `${`${a.coveragePct.toFixed(0)}%`.padStart(5)} ${share(a.byCategory.js).padStart(5)} ` +
+      `${share(a.byCategory.wasm).padStart(5)} ${share(a.byCategory.idle).padStart(5)}  ${leaves}`
+    );
+  }
+  lines.push(`  cov = share of the frame the profiler actually sampled (Chrome samples ~1ms; a short frame is attributed from few samples).`);
   return lines.join("\n");
 }
 
@@ -1482,13 +1562,16 @@ async function main() {
     console.log("  bun tools/analyze-trace.ts <file> --top 50           # more functions");
     console.log("  bun tools/analyze-trace.ts <file> --thread worker    # worker only");
     console.log("  bun tools/analyze-trace.ts <file> --range 0-7s       # slice profile to time window");
+    console.log("  bun tools/analyze-trace.ts <file> --budget-ms 33.34  # judge frames against the title's cadence");
     console.log("  bun tools/analyze-trace.ts <file> --map blocks.json  # annotate wasm-function[N] with guest addr");
     console.log("  bun tools/analyze-trace.ts <file> --no-auto-map      # skip hot-block sidecar discovery");
     console.log("");
     console.log("--range accepts: A-Bs (seconds) or Ams-Bms (milliseconds). Times are relative to profile start.");
     console.log("--map expects JSON produced by worker-side dumpHotJitBlocks() (array of {wasm_fn, phys_addr, module}).");
     console.log("Traces with embedded bottleship.hotblocks marks are annotated automatically without --map.");
-    console.log("Traces with bottleship.flip marks report FPS and inter-frame p95/p99 automatically.");
+    console.log("Traces with bottleship.flip marks report FPS, inter-frame p50/p95/p99 (same shared definition as the");
+    console.log("harness frameReport verb), frames over budget, and a WORST FRAMES table with per-frame stack attribution.");
+    console.log("--budget-ms sets the frame budget; without it the budget is DERIVED from the observed cadence.");
     console.log("Without --map or embedded hot-blocks, the analyzer auto-discovers hot-block sidecars next to the trace.");
     process.exit(0);
   }
@@ -1497,6 +1580,18 @@ async function main() {
   const topN = (() => {
     const i = args.indexOf("--top");
     return i >= 0 ? parseInt(args[i + 1] ?? "25", 10) : 25;
+  })();
+  /** Frame budget in ms — the title's own cadence. Omitted: derived from the observed
+   *  cadence (never a hardcoded 30fps, which is what the old slow30Count assumed). */
+  const budgetMs = (() => {
+    const i = args.indexOf("--budget-ms");
+    if (i < 0) return undefined;
+    const v = parseFloat(args[i + 1] ?? "");
+    if (!(v > 0)) {
+      console.error(`Invalid --budget-ms "${args[i + 1]}". Example: --budget-ms 33.34 (30fps)`);
+      process.exit(1);
+    }
+    return v;
   })();
   const mapIdx = args.indexOf("--map");
   const autoMapEnabled = !args.includes("--no-auto-map");
@@ -1533,7 +1628,8 @@ async function main() {
   // Read trace
   console.log(`Reading ${filePath} ...`);
   const { events, rawSize, gzipSize } = readTrace(filePath);
-  const renderFrames = extractRenderFrameAnalysis(events);
+  let renderFrames = extractRenderFrameAnalysis(events, budgetMs);
+  const perfWindow = extractPerfWindow(events);
 
   // Embedded hot-blocks (Level-3): always extract for the HOT GUEST PAGES report,
   // and additionally build the annotation map if no explicit --map was given.
@@ -1601,6 +1697,24 @@ async function main() {
     const name = threadNames.get(key) ?? `Thread ${key}`;
     const sliced = range ? sliceProfileByRange(profile, range.startUs, range.endUs) : profile;
     analyses.push(analyzeThread(key, name, sliced));
+  }
+
+  // --range must scope the FRAME statistics too. A sliced report whose frame tail silently
+  // covered the whole trace is the exact failure mode this instrument exists to avoid.
+  if (range && renderFrames) {
+    const base = Array.from(profiles.values()).find((p) => Number.isFinite(p.startTs))?.startTs;
+    if (Number.isFinite(base)) {
+      const lo = (base as number) + range.startUs;
+      const hi = (base as number) + range.endUs;
+      const intervals = renderFrames.intervals.filter((iv) => iv.endTsUs >= lo && iv.endTsUs < hi);
+      renderFrames = {
+        markCount: intervals.length > 0 ? intervals.length + 1 : 0,
+        intervals,
+        stats: computeRenderFrameStats(intervals, budgetMs),
+        budgetMs: renderFrames.budgetMs,
+        scopedTo: range.raw,
+      };
+    }
   }
 
   // Sort by total samples descending
@@ -1687,6 +1801,41 @@ async function main() {
     console.log(renderFrameReport);
   }
 
+  const worstFrameReport = reportWorstFrames(renderFrames, workerThreads[0]?.profile ?? null, 10);
+  if (worstFrameReport) {
+    console.log(worstFrameReport);
+  }
+
+  // The join seam: a live `frameReport({reset:true})` publishes its window as UserTiming
+  // marks, so a trace taken across it can be sliced to exactly that window.
+  if (perfWindow) {
+    const base = workerThreads[0]?.profile?.startTs;
+    const rel = (ts: number) => (Number.isFinite(base) ? `${((ts - (base as number)) / 1_000_000).toFixed(2)}s` : `${(ts / 1000).toFixed(0)}ms(abs)`);
+    console.log(`\n${sep("═")}`);
+    console.log(`HARNESS PERF WINDOW (join seam)`);
+    console.log(sep("═"));
+    console.log(`  begin: ${perfWindow.beginTsUs !== null ? rel(perfWindow.beginTsUs) : "(no begin mark)"}`
+      + `  end: ${perfWindow.endTsUs !== null ? rel(perfWindow.endTsUs) : "(no end mark)"}`);
+    if (perfWindow.beginTsUs !== null && perfWindow.endTsUs !== null && Number.isFinite(base)) {
+      const a = ((perfWindow.beginTsUs - (base as number)) / 1000).toFixed(0);
+      const b = ((perfWindow.endTsUs - (base as number)) / 1000).toFixed(0);
+      console.log(`  slice this trace to exactly the harness window:  --range ${a}ms-${b}ms`);
+    }
+  }
+
+  // NAMED CONDITION, not a scrolled-past warning: without the hotblocks mark (or a sidecar)
+  // every wasm frame stays an opaque wasm-function[N] and guest attribution is unavailable.
+  if (!embeddedHotBlocks && !JIT_BLOCK_MAP) {
+    console.log(`\n${sep("═")}`);
+    console.log(`GUEST ATTRIBUTION: UNAVAILABLE (no bottleship.hotblocks mark in this trace)`);
+    console.log(sep("═"));
+    console.log(`  wasm-function[N] frames cannot be resolved to module:rva — v86's table indices do NOT match`);
+    console.log(`  Chrome's numbering, so the mapping is established by SAMPLING, never computed.`);
+    console.log(`  Fix: capture with \`bun tools/harness.ts trace <sec>\` (it arms the mark automatically), or call`);
+    console.log(`  \`bun tools/harness.ts hotBlocksMark\` while your own Tracing.start window is open.`);
+    console.log(`  Count-weighted alternative that needs no trace: \`bun tools/harness.ts guestBlocks '{"arm":true}'\`.`);
+  }
+
   const hotPagesReport = reportHotGuestPages(embeddedHotBlocks);
   if (hotPagesReport) {
     console.log(hotPagesReport);
@@ -1709,7 +1858,11 @@ async function main() {
         if (renderFrames) {
           tlines.push(
             `  ${"Time".padEnd(8)} ${"idle".padStart(6)} ${"js".padStart(6)} ${"wasm".padStart(6)} ${"nat".padStart(6)} ` +
-            `${"FPS".padStart(6)} ${"avg".padStart(8)} ${"p95".padStart(8)} ${"p99".padStart(8)} ${"fr".padStart(4)}  Hot function`
+            `${"FPS".padStart(6)} ${"avg".padStart(8)} ${"p95".padStart(8)} ${"p99".padStart(8)} ${"fr".padStart(4)} ${"over".padStart(5)}  Hot function`
+          );
+          tlines.push(
+            `  (p95 needs >=20 and p99 >=100 frames in the bucket; "-" means the rank had no observation, not that it was fast. ` +
+            `over = frames past the ${renderFrames.budgetMs ? `${renderFrames.budgetMs.toFixed(2)}ms` : "derived"} budget)`
           );
         } else {
           tlines.push(
@@ -1734,11 +1887,12 @@ async function main() {
           if (renderFrames) {
             const fs = renderStatsForBucket(renderFrames, worker.profile, bucket);
             rowParts.push(
-              pad(fs.count > 0 ? fs.fps.toFixed(1) : "-", 6, true),
-              pad(fs.count > 0 ? fmtFrameMs(fs.avgMs) : "-", 8, true),
-              pad(fs.count > 0 ? fmtFrameMs(fs.p95Ms) : "-", 8, true),
-              pad(fs.count > 0 ? fmtFrameMs(fs.p99Ms) : "-", 8, true),
-              pad(fs.count > 0 ? String(fs.count) : "-", 4, true),
+              pad(fs.ok ? (1000 / fs.meanMs).toFixed(1) : "-", 6, true),
+              pad(fs.ok ? fmtFrameMs(fs.meanMs) : "-", 8, true),
+              pad(fs.ok && fs.p95Ms !== null ? fmtFrameMs(fs.p95Ms) : "-", 8, true),
+              pad(fs.ok && fs.p99Ms !== null ? fmtFrameMs(fs.p99Ms) : "-", 8, true),
+              pad(fs.ok ? String(fs.sampleCount) : "-", 4, true),
+              pad(fs.ok && fs.budget ? String(fs.budget.overFrames) : "-", 5, true),
             );
           }
           const row = [

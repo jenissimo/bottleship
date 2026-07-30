@@ -14,9 +14,18 @@ import { sys } from "../serialize";
 
 const MAX_ENTRIES = 512;
 
-/** Traced message ids → name. Anything not listed here is not recorded. */
+/** Traced message ids → name. Anything not listed here is not recorded.
+ *  The control NOTIFICATIONS belong here as much as the raw input does: "the button
+ *  got a clean DOWN/UP and nothing happened" is only half an observation until you
+ *  can see whether the class proc turned it into WM_COMMAND(BN_CLICKED) — and for
+ *  whom. */
 const TRACED_MSG: Record<number, string> = {
     0x0020: "WM_SETCURSOR",
+    0x004E: "WM_NOTIFY",
+    0x0111: "WM_COMMAND",
+    0x0112: "WM_SYSCOMMAND",
+    0x0114: "WM_HSCROLL",
+    0x0115: "WM_VSCROLL",
     0x0100: "WM_KEYDOWN",
     0x0101: "WM_KEYUP",
     0x0102: "WM_CHAR",

@@ -40,6 +40,10 @@
   touch-action: none;
   position: relative;
   z-index: 1;
+  /* The guest's pointer is drawn by us (see app/guest-cursor.ts), so the OS one is
+     never wanted over the canvas — and Pointer Lock would hide it anyway. It still
+     takes over the moment the pointer leaves. */
+  cursor: none;
   /* The canvas is programmatically focused (tabIndex -1) to capture keyboard input;
      suppress the browser focus ring — it's just visual noise around the game. */
   outline: none;
@@ -51,6 +55,19 @@
 
 .app__canvas--pixelated {
   image-rendering: pixelated;
+}
+
+/* The guest's pointer. Rasterized at device resolution by the renderer and moved by
+   transform only, so a mouse move costs a compositor update and no layout. */
+.app__cursor {
+  display: none;
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 20;
+  pointer-events: none;
+  image-rendering: pixelated;
+  will-change: transform;
 }
 
 .app__warning {

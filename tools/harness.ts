@@ -43,6 +43,7 @@ import {
     health,
     CdpSession,
     DEFAULT_DEV_URL,
+    setPointerLock,
 } from "./cdp-core";
 import { readCanvasGeometry } from "./cdp-geometry";
 import { applyDevice, tap, touchDrag, longPress, twoFingerTap, pinch } from "./cdp-touch";
@@ -116,7 +117,7 @@ let _journalSeq = 0;
 
 /** Verbs the CLI executes over CDP itself instead of shipping to the page: the
  *  page can neither reload itself mid-chain nor synthesize trusted touch input. */
-const CDP_STEPS = new Set(["reload", "device", "tap", "touchDrag", "longPress", "twoFingerTap", "pinch"]);
+const CDP_STEPS = new Set(["reload", "device", "tap", "touchDrag", "longPress", "twoFingerTap", "pinch", "pointerLock"]);
 
 async function runCdpStep(session: CdpSession, step: HarnessStep): Promise<unknown> {
     const a = step.args as (number | string | undefined)[];
@@ -130,6 +131,7 @@ async function runCdpStep(session: CdpSession, step: HarnessStep): Promise<unkno
         case "longPress": return longPress(session, n(0), n(1), opt(2));
         case "twoFingerTap": return twoFingerTap(session, n(0), n(1), opt(2));
         case "pinch": return pinch(session, n(0), n(1), n(2), { ms: opt(3) });
+        case "pointerLock": return setPointerLock(session, a[0] !== false && a[0] !== 0);
     }
     throw new Error(`no CDP handler for step '${step.cmd}'`);
 }
@@ -272,7 +274,9 @@ async function cmdHealth(): Promise<void> {
 
 async function cmdEval(expr: string): Promise<void> {
     const session = await ensureSession();
-    console.log(JSON.stringify(await pageEval(session, expr, { timeoutMs: 60_000 }), null, 2));
+    // Hand-typed evals stand in for a human at the keyboard: carry user activation so
+    // gesture-gated APIs (pointer lock, fullscreen) are reachable from the CLI.
+    console.log(JSON.stringify(await pageEval(session, expr, { timeoutMs: 60_000, userGesture: true }), null, 2));
 }
 
 /** worker-eval <expr> — eval in the WORKER context (replaces cdp-worker-eval). */
@@ -530,8 +534,25 @@ async function cmdTrace(secondsArg?: string, out?: string): Promise<void> {
     }
     const file = out ?? artifact(`logs/trace-${seconds}s.json.gz`);
     console.log(`tracing ${seconds}s -> ${file} …`);
-    const r = await captureTrace(file, seconds);
+    // Arm the guest-attribution mark INSIDE the window: without bottleship.hotblocks every
+    // wasm frame in the artifact stays an opaque wasm-function[N] (v86's table indices do not
+    // match Chrome's numbering, so the join is sampled, never computed) and the trace analyses
+    // shallow while looking complete.
+    let hotBlocks: { blocks?: number; marked?: boolean; note?: string } | null = null;
+    const sampleMs = Math.min(3000, Math.max(800, (seconds * 1000) / 4));
+    const r = await captureTrace(file, seconds, {
+        during: async () => {
+            try {
+                const res = await execViaCdp([{ cmd: "hotBlocksMark", args: [{ ms: sampleMs }], opts: { timeoutMs: sampleMs + 30_000 } } as unknown as HarnessStep]);
+                hotBlocks = (res.steps?.[0]?.result ?? null) as typeof hotBlocks;
+            } catch (e) {
+                console.warn(`  hotBlocksMark failed (guest attribution will be unavailable): ${e}`);
+            }
+        },
+    });
     console.log(`  ${r.events} events, ${(r.bytes / 1024 / 1024).toFixed(1)} MB`);
+    if (hotBlocks?.marked) console.log(`  bottleship.hotblocks: ${hotBlocks.blocks} blocks — wasm frames resolve to module:rva`);
+    else console.log(`  bottleship.hotblocks: NOT emitted${hotBlocks?.note ? ` (${hotBlocks.note})` : ""} — guest attribution will read UNAVAILABLE`);
     console.log(`  analyze: bun tools/analyze-trace.ts ${file} --thread worker --top 40`);
 }
 

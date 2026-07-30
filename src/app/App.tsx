@@ -28,6 +28,7 @@ import ManifestEditorModal from "../wizard/ManifestEditorModal";
 import { listAddedGames, removeAddedGame, type AddedGame } from "../wgb-library";
 import { ensurePersistentStorageRequested } from "../storage-manager";
 import { loadGamesCatalog } from "../games-catalog";
+import { browserPolicyBlock, loadDeploymentConfig } from "../deployment-config";
 import { DEFAULT_QUALITY, mergeQuality } from "../worker/core/quality-config";
 import type { QualityConfig } from "../worker/core/quality-config";
 import {
@@ -41,6 +42,7 @@ import type {
   UiSettings,
 } from "../ui-settings";
 import { INPUT_BUFFER_SIZE, INPUT_INDEX } from "../input/sab-layout";
+import { GuestCursorRenderer } from "./guest-cursor";
 import { inputDevice } from "../input/virtual-device";
 import { relativeIntent } from "../input/relative-intent";
 import { touchDriver } from "../input/touch/driver";
@@ -149,6 +151,10 @@ function loadQuality(): QualityConfig {
 // gate) live in ./browser-support.ts.
 
 // Persistent state outside the component scope to survive re-mounts
+/** sessionStorage key holding a pending self re-exec across the page reload it triggers. */
+const REEXEC_KEY = "bs_pending_reexec";
+/** Bundle URL a pending re-exec must re-open once window.loadApp exists (dev/harness boots). */
+let reExecBundleUrl: string | null = null;
 let globalWorker: Worker | null = null;
 let globalSab: SharedArrayBuffer | null = null;
 let globalInputView: Int32Array | null = null;
@@ -236,11 +242,15 @@ export default function App() {
     );
   }, []);
   const canvasRectRef = useRef<DOMRect | null>(null);
-  const cursorVisibleRef = useRef(true);
-  // CSS cursor for the guest's installed custom cursor image (SetCursor with a
-  // CreateIconIndirect/LoadImage shape) — null when the guest uses a system shape.
-  const cursorCssRef = useRef<string | null>(null);
+  // The cursor element is positioned inside the panel, so its transforms are relative
+  // to this rect; cached alongside the canvas rect and invalidated by the same events.
+  const panelRectRef = useRef<DOMRect | null>(null);
+  const cursorCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const isCanvasHoveredRef = useRef(false);
+  /** Hit-tested against the canvas rect — the one input to whether we draw the pointer. */
+  const isPointerOverCanvasRef = useRef(false);
+  /** Sprite position of a SOFTWARE D3D device cursor; null = draw at the pointer. */
+  const deviceCursorPosRef = useRef<{ x: number; y: number } | null>(null);
   const [gamesCatalog, setGamesCatalog] = useState<GameEntry[] | null>(null);
   useEffect(() => {
     loadGamesCatalog().then(setGamesCatalog);
@@ -432,11 +442,23 @@ export default function App() {
   }, [gameIdFromUrl, selectedGame]);
   const gameDisplayName = bundleDisplayName ?? displayGame?.name ?? "Game";
   const browserSupport = useMemo(() => detectBrowserSupport(), []);
+  // A deployment may admit only the browser it was rehearsed on (see deployment-config).
+  // undefined = policy not loaded yet; null = allowed.
+  const [policyBlock, setPolicyBlock] = useState<string | null | undefined>(undefined);
+  useEffect(() => {
+    let cancelled = false;
+    loadDeploymentConfig().then(
+      (cfg) => { if (!cancelled) setPolicyBlock(browserPolicyBlock(cfg, browserSupport.detectedBrowser)); },
+      () => { if (!cancelled) setPolicyBlock(null); },
+    );
+    return () => { cancelled = true; };
+  }, [browserSupport.detectedBrowser]);
   const browserUnsupportedMessage = useMemo(() => {
+    if (policyBlock) return policyBlock;
     if (browserSupport.supported) return null;
     const missing = browserSupport.missing.join(", ");
     return `This browser is missing features required to run BottleShip: ${missing}. Detected browser: ${browserSupport.detectedBrowser}. Please use an up-to-date Google Chrome or Safari 26+.`;
-  }, [browserSupport]);
+  }, [browserSupport, policyBlock]);
 
   // WebGPU is the whole render backend, but detectBrowserSupport() only checks that the API is
   // *present*. The adapter can still fail to acquire (hardware accel off, GPU blocklisted, VM/RDP)
@@ -458,13 +480,15 @@ export default function App() {
   // (disableSelection) and float the same error card as a modal over it, so users learn up front
   // instead of picking a game and hitting a dead end. (browser-unsupported keeps its own banner.)
   const webgpuBlocked = webgpuProbe !== null && !webgpuProbe.ok;
-  const launchBlocked = !browserSupport.supported || webgpuBlocked;
+  // policyBlock === undefined means the deployment policy has not resolved yet — hold
+  // launching until it has, or a restricted browser gets a game started before we know.
+  const launchBlocked = !browserSupport.supported || webgpuBlocked || policyBlock !== null;
 
   // Auto-load game once worker is ready. Registered games load their wgbUrl; dev mode
   // stays manual UNLESS Add-Game handed us a bundle via ?load=<url> (BYO drop / URL).
   const autoLoadDoneRef = useRef(false);
   useEffect(() => {
-    if (!browserSupport.supported || (webgpuProbe !== null && !webgpuProbe.ok)) return;
+    if (launchBlocked) return;
     if (!selectedGame || workerStatus !== "ready" || autoLoadDoneRef.current) return;
     const params = new URLSearchParams(window.location.search);
     const loadParam = params.get("load");
@@ -712,19 +736,76 @@ export default function App() {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    const updateCanvasCursor = (forceHovered?: boolean) => {
-      const hovered = forceHovered ?? isCanvasHoveredRef.current;
-      if (!hovered) {
-        canvas.style.cursor = "";
-        return;
-      }
-      if (!cursorVisibleRef.current) {
-        canvas.style.cursor = "none";
-        return;
-      }
-      // Guest cursor visible: render whatever shape the guest installed (the
-      // worker forwards system-theme cursors through the same channel).
-      canvas.style.cursor = cursorCssRef.current ?? "default";
+    // The guest pointer has exactly one renderer (see ./guest-cursor). Position comes
+    // from the SAB the GUEST reads, not from inputDevice's copy: touch, harness injection
+    // and guest warps all publish there, and the drawn pointer must sit where the game
+    // believes the pointer is, whoever moved it.
+    const guestCursor = new GuestCursorRenderer({
+      getPosition: () => {
+        // A software D3D device cursor is a sprite the runtime moves on its own; the OS
+        // pointer never followed it, so the worker has to tell us where it is.
+        const sprite = deviceCursorPosRef.current;
+        if (sprite) return sprite;
+        const view = globalInputView;
+        return view ? { x: view[INPUT_INDEX.mouseX]!, y: view[INPUT_INDEX.mouseY]! } : null;
+      },
+      getGeometry: () => {
+        // Self-checking cache: a guest mode switch (800x600 → 640x480) resizes the canvas
+        // between the events that refresh it, and a stale rect silently rescales every
+        // drawn position — the pointer then tracks a screen the guest no longer has.
+        // clientWidth costs nothing unless layout is already dirty, which is exactly when
+        // the cached value is wrong.
+        let rect = canvasRectRef.current;
+        if (!rect
+            || Math.abs(rect.width - canvas.clientWidth) > 0.5
+            || Math.abs(rect.height - canvas.clientHeight) > 0.5) {
+          measureRects();
+          rect = canvasRectRef.current;
+        }
+        if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+        const origin = panelRectRef.current;
+        const space =
+          mouseCoordinateModeRef.current === "guest"
+            ? guestResolutionRef.current
+            : resolutionRef.current;
+        return {
+          left: rect.left,
+          top: rect.top,
+          width: rect.width,
+          height: rect.height,
+          originLeft: origin?.left ?? 0,
+          originTop: origin?.top ?? 0,
+          spaceWidth: space.width,
+          spaceHeight: space.height,
+        };
+      },
+    });
+    guestCursor.attach(cursorCanvasRef.current);
+    ((window as any).__BS__ ??= {}).cursorOverlay = guestCursor.status;
+
+    // Pointer Lock fires no enter/leave and confines the pointer to the canvas by
+    // definition, so it counts as inside — that is a statement about the HOST pointer's
+    // whereabouts, not a branch in the drawing path.
+    // The guest's pointer is drawn over the guest's screen and nowhere else; the letterbox
+    // gets the host's own pointer back. Presence is a HIT TEST, not an enter/leave flag:
+    // pointerleave does not arrive when the mouse crosses the border fast or with a button
+    // held (the canvas keeps pointer capture), and a stale flag leaves our pointer painted
+    // on the picture while the OS one is already out on the black — two cursors at once.
+    const syncCursorPresence = () => {
+      guestCursor.setPointerInside(isPointerOverCanvasRef.current || pointerLockedRef.current);
+    };
+
+    // The ONLY layout read in the pointer path. Everything downstream (mouse mapping,
+    // touch driver, cursor renderer) reads these cached rects, so they must be re-taken
+    // on every event that can move the canvas: window/visualViewport resize, viewport
+    // pan, fullscreen, the canvas ResizeObserver, and a guest resolution change.
+    const measureRects = () => {
+      canvasRectRef.current = canvas.getBoundingClientRect();
+      panelRectRef.current = panelRef.current?.getBoundingClientRect() ?? null;
+    };
+    const captureRects = () => {
+      measureRects();
+      guestCursor.sync();
     };
 
     // 1. Initialize Worker (only once)
@@ -742,22 +823,42 @@ export default function App() {
       // to logs/debug/ while its PNG went to logs/alpha/debug/ reads a sibling's evidence.
       globalWorker.postMessage({ type: "set_session", session: sessionFromLocation(window.location.search) });
 
+      // A self re-exec asked us to reload (see the "reexec" message). Hand the worker the
+      // launcher's command line BEFORE any bundle load — it replaces the manifest's `args`
+      // for exactly this boot. Consumed here so a later manual F5 boots normally again.
+      try {
+        const pendingReExec = sessionStorage.getItem(REEXEC_KEY);
+        if (pendingReExec) {
+          sessionStorage.removeItem(REEXEC_KEY);
+          const { args, url } = JSON.parse(pendingReExec) as { args: string; url: string | null };
+          globalWorker.postMessage({ type: "set_boot_args", args });
+          console.info("[bs] re-exec boot args:", args, url ? `(url ${url})` : "");
+          if (url) reExecBundleUrl = url;
+        }
+      } catch { /* corrupt/no pending re-exec */ }
+
       // Persisted debug flags (e.g. __noHeapSlab to A/B the WASM heap slab). Replayed to
       // the worker on EVERY page load BEFORE any game loads, so a toggle survives F5.
       // Set from the console: dbgFlag('__noHeapSlab', true)  → persists + applies live.
+      // localStorage is origin-wide, so a flag set for one ?bs=<name> tab would otherwise
+      // leak into every parallel agent's tab. Session-scoped flags win over global ones.
+      const session = sessionFromLocation(window.location.search);
+      const flagKeys = session ? ["bs_debug_flags", `bs_debug_flags:${session}`] : ["bs_debug_flags"];
       try {
-        const flags = JSON.parse(localStorage.getItem("bs_debug_flags") || "{}");
-        for (const [key, value] of Object.entries(flags)) {
+        const merged: Record<string, unknown> = {};
+        for (const k of flagKeys) Object.assign(merged, JSON.parse(localStorage.getItem(k) || "{}"));
+        for (const [key, value] of Object.entries(merged)) {
           globalWorker.postMessage({ type: "set_debug_flag", key, value });
         }
-        if (Object.keys(flags).length) console.info("[bs] replayed debug flags:", flags);
+        if (Object.keys(merged).length) console.info("[bs] replayed debug flags:", merged);
       } catch { /* corrupt/no flags */ }
-      (window as any).dbgFlag = (key: string, value: unknown) => {
-        const flags = JSON.parse(localStorage.getItem("bs_debug_flags") || "{}");
+      (window as any).dbgFlag = (key: string, value: unknown, opts?: { scope?: "session" | "global" }) => {
+        const store = opts?.scope === "session" && session ? `bs_debug_flags:${session}` : "bs_debug_flags";
+        const flags = JSON.parse(localStorage.getItem(store) || "{}");
         if (value === undefined || value === null) delete flags[key]; else flags[key] = value;
-        localStorage.setItem("bs_debug_flags", JSON.stringify(flags));
+        localStorage.setItem(store, JSON.stringify(flags));
         globalWorker?.postMessage({ type: "set_debug_flag", key, value });
-        return { [key]: value, note: "persisted; takes effect on next game load" };
+        return { [key]: value, store, note: "persisted; takes effect on next game load" };
       };
 
       // AI-agent harness facade: window.__BS__.harness. Thin page-side
@@ -882,7 +983,13 @@ export default function App() {
       setIsBufferInitialized(true);
     }
     const inputBuffer = globalSab;
-    inputDevice.attach(globalInputView!, () => globalWorker?.postMessage({ type: "input_tick" }));
+    // Redraw on publication, not only on the renderer's own frame: a motion commit is
+    // itself rAF-coalesced and lands after our tick has already run, which would leave
+    // the pointer a whole frame behind the position the guest was just handed.
+    inputDevice.attach(globalInputView!, () => {
+      globalWorker?.postMessage({ type: "input_tick" });
+      guestCursor.sync();
+    });
     assertVirtualPad();
     if (!audioEngine) {
       audioEngine = new AudioEngine();
@@ -923,7 +1030,7 @@ export default function App() {
 
       // Update ref for event calculations (cannot set canvas.width/height anymore)
       resolutionRef.current = { width: renderWidth, height: renderHeight };
-      canvasRectRef.current = canvas.getBoundingClientRect();
+      captureRects();
 
       const useGuestCoords = mouseCoordinateModeRef.current === "guest";
       const target = useGuestCoords
@@ -1019,6 +1126,23 @@ export default function App() {
         audioEngine?.stopAll();
         setLoadingProgress(null);
         setIsLoadingApp(false);
+      }
+      if (event.data?.type === "reexec") {
+        // A guest launcher relaunched its own image (worker: requestSelfReExec). We restart
+        // it the only way that is genuinely a fresh process — reload the page — and hand the
+        // new worker the launcher's command line before it loads the bundle. sessionStorage,
+        // not localStorage: a pending restart belongs to THIS tab and must not leak into a
+        // parallel agent's tab, and it must not survive the tab being closed.
+        try {
+          sessionStorage.setItem(REEXEC_KEY, JSON.stringify({
+            args: String(event.data.args ?? ""),
+            url: typeof event.data.url === "string" ? event.data.url : null,
+          }));
+          window.location.reload();
+        } catch (e) {
+          console.error("[bs] re-exec restart failed:", e);
+        }
+        return;
       }
       if (event.data?.type === "bundle_meta") {
         const name = typeof event.data.name === "string" ? event.data.name.trim() : "";
@@ -1209,32 +1333,20 @@ export default function App() {
       // video_frame and video_end are handled in the worker via WebGPU compositor (smackw32.ts → backend.composite)
       if (event.data?.type === "cursor_visibility") {
         const visible = event.data?.visible !== false;
-        cursorVisibleRef.current = visible;
-        updateCanvasCursor();
+        guestCursor.setVisible(visible);
         relativeIntent.set("cursorHidden", !visible);
         updatePointerLockIntent();
       }
       if (event.data?.type === "cursor_image") {
-        // Guest installed a cursor shape: null pixels = system shape (classic arrow).
-        const px = event.data?.pixels as ArrayBuffer | null;
-        const w = Number(event.data?.width) | 0;
-        const h = Number(event.data?.height) | 0;
-        cursorCssRef.current = null;
-        if (px && w > 0 && h > 0 && px.byteLength >= w * h * 4) {
-          try {
-            const cnv = document.createElement("canvas");
-            cnv.width = w;
-            cnv.height = h;
-            const c2d = cnv.getContext("2d");
-            if (c2d) {
-              c2d.putImageData(new ImageData(new Uint8ClampedArray(px, 0, w * h * 4), w, h), 0, 0);
-              const hx = Math.min(Math.max(Number(event.data?.hotspotX) | 0, 0), w - 1);
-              const hy = Math.min(Math.max(Number(event.data?.hotspotY) | 0, 0), h - 1);
-              cursorCssRef.current = `url("${cnv.toDataURL()}") ${hx} ${hy}, default`;
-            }
-          } catch { /* malformed image — classic arrow fallback */ }
-        }
-        updateCanvasCursor();
+        // Guest installed a cursor shape: null pixels = system shape, which the renderer
+        // covers with its built-in arrow.
+        guestCursor.setShape(
+          (event.data?.pixels as ArrayBuffer | null) ?? null,
+          Number(event.data?.width) | 0,
+          Number(event.data?.height) | 0,
+          Number(event.data?.hotspotX) | 0,
+          Number(event.data?.hotspotY) | 0,
+        );
       }
       if (event.data?.type === "clip_cursor") {
         // Guest ClipCursor(rect) confines the cursor (relative/captured mouse, e.g. Unreal
@@ -1268,13 +1380,17 @@ export default function App() {
         updatePointerLockIntent();
       }
       if (event.data?.type === "set_cursor_pos") {
-        // Guest called SetCursorPos — update virtual cursor so next movement continues from here
-        const x = Number(event.data.x) | 0;
-        const y = Number(event.data.y) | 0;
-        if (pointerLockedRef.current) {
-          inputDevice.setPointerAbsolute(x, y);
-          inputDevice.commit({ immediate: true });
-        }
+        // SetCursorPos moves the GUEST's cursor, so it applies whatever transport the host
+        // happens to be using: Pointer Lock must not be observable by the guest, and gating
+        // the warp on it would make a WinAPI contract depend on a host decision.
+        inputDevice.setPointerAbsolute(Number(event.data.x) | 0, Number(event.data.y) | 0);
+        inputDevice.commit({ immediate: true });
+      }
+      if (event.data?.type === "device_cursor_pos") {
+        const x = event.data.x;
+        deviceCursorPosRef.current = x === null || x === undefined
+          ? null
+          : { x: Number(x) | 0, y: Number(event.data.y) | 0 };
       }
       if (event.data?.type === "show_message_box") {
         const { id, text, caption, uType } = event.data;
@@ -1312,7 +1428,7 @@ export default function App() {
           // the short axis shrinks, the long one stays, and the picture stretches.
           canvas.style.width = "";
           canvas.style.height = "";
-          canvasRectRef.current = canvas.getBoundingClientRect();
+          captureRects();
           if (mouseCoordinateModeRef.current === "guest") {
             worker.postMessage({ type: "resize", width, height });
           } else {
@@ -1324,9 +1440,7 @@ export default function App() {
           // does NOT fire on a position-only shift, so canvasRectRef would keep a stale
           // left/top offset → absolute mouse coords get shifted (e.g. menu at top-left
           // maps to clamped 0,0). Re-capture after layout settles (double rAF = after paint).
-          requestAnimationFrame(() => requestAnimationFrame(() => {
-            if (canvasRef.current) canvasRectRef.current = canvasRef.current.getBoundingClientRect();
-          }));
+          requestAnimationFrame(() => requestAnimationFrame(captureRects));
         }
       }
       if (event.data?.type === "window_title") {
@@ -1500,9 +1614,14 @@ export default function App() {
     const handlePointerEnter = (event?: PointerEvent) => {
       if (event && event.pointerType !== "mouse") return;
       isCanvasHoveredRef.current = true;
-      updateCanvasCursor(true);
       inputDevice.setMouseInside(true, "hw-mouse");
       inputDevice.commit();
+      // Publish the entry position before showing the pointer, or the first frame draws
+      // it at wherever the cursor was when it last left.
+      if (event) writePointer(event);
+      // pointerenter does not bubble to the panel, so hit-test here too: entering the
+      // picture directly from the page chrome must light the pointer up immediately.
+      if (event) updatePointerOverCanvas(event); else syncCursorPresence();
     };
 
     const handlePointerLeave = (event?: PointerEvent) => {
@@ -1512,7 +1631,7 @@ export default function App() {
       if (event && canvas.hasPointerCapture(event.pointerId)) return;
 
       isCanvasHoveredRef.current = false;
-      updateCanvasCursor(false);
+      syncCursorPresence();
       const inputView = globalInputView;
       if (!inputView) return;
 
@@ -1624,6 +1743,34 @@ export default function App() {
     canvas.addEventListener("pointerenter", handlePointerEnter);
     canvas.addEventListener("pointerleave", handlePointerLeave);
     canvas.addEventListener("contextmenu", handleContextMenu);
+
+    const panel = panelRef.current;
+    /** Is this client point on the guest screen? Measured from the LIVE rect: the cache can
+     *  still hold the pre-switch size right after a guest mode change. */
+    const updatePointerOverCanvas = (event: PointerEvent | null) => {
+      let over = false;
+      if (event) {
+        const rect = canvas.getBoundingClientRect();
+        over = rect.width > 0 && rect.height > 0
+          && event.clientX >= rect.left && event.clientX < rect.right
+          && event.clientY >= rect.top && event.clientY < rect.bottom;
+      }
+      if (isPointerOverCanvasRef.current === over) return;
+      isPointerOverCanvasRef.current = over;
+      syncCursorPresence();
+    };
+    // On the PANEL, so a move across the letterbox is seen even though the canvas — which
+    // is what we are hit-testing against — receives nothing out there.
+    const handlePanelMove = (event: PointerEvent) => {
+      if (event.pointerType !== "mouse") return;
+      updatePointerOverCanvas(event);
+    };
+    const handlePanelLeave = (event: PointerEvent) => {
+      if (event.pointerType !== "mouse") return;
+      updatePointerOverCanvas(null);
+    };
+    panel?.addEventListener("pointermove", handlePanelMove);
+    panel?.addEventListener("pointerleave", handlePanelLeave);
     
     const handleWheel = (event: WheelEvent) => {
       const rect = canvasRectRef.current ?? canvas.getBoundingClientRect();
@@ -1682,6 +1829,7 @@ export default function App() {
     // center would make LBUTTONUP jump to (width/2, height/2) mid-click (drag mismatch).
     const handlePointerLockChange = () => {
       pointerLockedRef.current = document.pointerLockElement === canvas;
+      syncCursorPresence();
       if (pointerLockedRef.current) {
         // The device already holds the last absolute position, which is exactly the
         // seed we want; nothing to publish because the position has not changed.
@@ -1793,6 +1941,16 @@ export default function App() {
         setLoadingProgress(null);
       }
     };
+
+    // A self re-exec from a loadApp(url) session (dev / harness / "?game=dev"): the reload
+    // lands on a page that boots no game by itself, so replay the URL now that loadApp
+    // exists. The worker already holds the launcher's command line (set_boot_args above);
+    // a registered `?game=<id>` boot needs nothing here — its normal path picks the args up.
+    if (reExecBundleUrl) {
+      const url = reExecBundleUrl;
+      reExecBundleUrl = null;
+      void (window as any).loadApp(url);
+    }
 
     const applyInputSample = (sample: InputSample) => {
       if (!globalInputView) return;
@@ -2042,6 +2200,8 @@ export default function App() {
       canvas.removeEventListener("pointerup", handlePointerUp);
       canvas.removeEventListener("pointerenter", handlePointerEnter);
       canvas.removeEventListener("pointerleave", handlePointerLeave);
+      panel?.removeEventListener("pointermove", handlePanelMove);
+      panel?.removeEventListener("pointerleave", handlePanelLeave);
       canvas.removeEventListener("contextmenu", handleContextMenu);
       window.removeEventListener("keydown", handleKeyDown, true);
       window.removeEventListener("keyup", handleKeyUp, true);
@@ -2049,6 +2209,7 @@ export default function App() {
       window.removeEventListener("blur", handleBlur);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       document.removeEventListener("pointerlockchange", handlePointerLockChange);
+      guestCursor.dispose();
       // Keep loadApp exposed for buttons
     };
     // Deps are mount-stable only. Pause/load/worker-ready are read via refs
@@ -2486,7 +2647,7 @@ export default function App() {
     );
   }
 
-  if (!browserSupport.supported) {
+  if (!browserSupport.supported || policyBlock) {
     return (
       <div style={{
         minHeight: "100vh",
@@ -2510,30 +2671,47 @@ export default function App() {
           flexDirection: "column",
           gap: "14px",
         }}>
-          <h1 style={{ margin: 0, fontSize: "1.3rem", color: "#ff8f8f" }}>
-            Unsupported browser
-          </h1>
-          <p style={{ margin: 0, color: "#d3c2c2", lineHeight: 1.45 }}>
+          {/* Our own heading would put a second language on a screen whose only sentence
+              the operator wrote for their audience. */}
+          {!policyBlock && (
+            <h1 style={{ margin: 0, fontSize: "1.3rem", color: "#ff8f8f" }}>
+              Unsupported browser
+            </h1>
+          )}
+          <p style={{
+            margin: 0,
+            color: policyBlock ? "#f0e2e2" : "#d3c2c2",
+            fontSize: policyBlock ? "1.05rem" : undefined,
+            lineHeight: 1.45,
+          }}>
             {browserUnsupportedMessage}
           </p>
-          <p style={{ margin: 0, color: "#9f8c8c", fontSize: "0.92rem" }}>
-            Launching games is disabled in this browser. Open the page in an up-to-date Google Chrome or Safari 26+ and try again.
-          </p>
-          <button
-            onClick={() => window.location.assign("/")}
-            style={{
-              marginTop: "8px",
-              alignSelf: "flex-start",
-              border: "1px solid #5f3b3b",
-              backgroundColor: "#241616",
-              color: "#f4d8d8",
-              borderRadius: "8px",
-              padding: "8px 14px",
-              cursor: "pointer",
-            }}
-          >
-            Back to library
-          </button>
+          {/* A policy message is written by the operator for their own audience and already
+              says what to do — anything we add here is a second voice, in our language. */}
+          {!policyBlock && (
+            <p style={{ margin: 0, color: "#9f8c8c", fontSize: "0.92rem" }}>
+              Launching games is disabled in this browser. Open the page in an up-to-date Google Chrome or Safari 26+ and try again.
+            </p>
+          )}
+          {/* Under a policy block the library is the same blocked page — offering it back
+              is a dead end. */}
+          {!policyBlock && (
+            <button
+              onClick={() => window.location.assign("/")}
+              style={{
+                marginTop: "8px",
+                alignSelf: "flex-start",
+                border: "1px solid #5f3b3b",
+                backgroundColor: "#241616",
+                color: "#f4d8d8",
+                borderRadius: "8px",
+                padding: "8px 14px",
+                cursor: "pointer",
+              }}
+            >
+              Back to library
+            </button>
+          )}
         </div>
       </div>
     );
@@ -2646,6 +2824,8 @@ export default function App() {
           className={cx(s, "app__canvas", uiSettings.canvasFiltering === "pixelated" && "app__canvas--pixelated")}
           style={{ aspectRatio: `${guestResolution.width} / ${guestResolution.height}` }}
         />
+        {/* The guest's pointer — the canvas hides the OS one unconditionally. See ./guest-cursor. */}
+        <canvas ref={cursorCanvasRef} className={s["app__cursor"]} aria-hidden />
         {workerStatus === "ready" && showTouchControls && (
           <TouchControlLayer
             ref={touchControlsRef}

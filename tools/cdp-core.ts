@@ -283,7 +283,7 @@ export class CdpSession {
 export async function captureTrace(
     outFile: string,
     seconds: number,
-    opts: { port?: number; categories?: string[] } = {},
+    opts: { port?: number; categories?: string[]; during?: (elapsedMs: number) => Promise<void> } = {},
 ): Promise<{ file: string; events: number; bytes: number }> {
     const port = opts.port ?? DEFAULT_CDP_PORT;
     const version = await fetchJson(port, "/json/version");
@@ -300,7 +300,20 @@ export async function captureTrace(
         traceConfig: { includedCategories: categories, recordMode: "recordAsMuchAsPossible" },
         transferMode: "ReportEvents",
     });
-    await new Promise((r) => setTimeout(r, seconds * 1000));
+    // `during` runs INSIDE the recording window (a third of the way in, so its own sampling
+    // interval finishes comfortably before Tracing.end). This is how the bottleship.hotblocks
+    // mark gets into the trace — blink.user_timing is already recorded, so a mark emitted here
+    // lands in the artifact and analyze-trace can resolve wasm frames to module:rva. Without
+    // it a trace looks complete and analyses shallow.
+    const totalMs = seconds * 1000;
+    const t0 = Date.now();
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    if (opts.during) {
+        await sleep(Math.min(Math.max(500, totalMs / 3), Math.max(0, totalMs - 500)));
+        try { await opts.during(Date.now() - t0); } catch (e) { console.warn(`[captureTrace] during-window hook failed: ${e}`); }
+    }
+    const remaining = totalMs - (Date.now() - t0);
+    if (remaining > 0) await sleep(remaining);
     await session.send("Tracing.end");
     await Promise.race([complete, new Promise((r) => setTimeout(r, 120_000))]);
     session.close();
@@ -319,13 +332,16 @@ export async function connect(opts: { port?: number; urlMatch?: string } = {}): 
 }
 
 /** Evaluate an expression in the PAGE context; returns the deserialized value. */
-export async function pageEval(session: CdpSession, expr: string, opts: { timeoutMs?: number; awaitPromise?: boolean; returnByValue?: boolean } = {}): Promise<any> {
+export async function pageEval(session: CdpSession, expr: string, opts: { timeoutMs?: number; awaitPromise?: boolean; returnByValue?: boolean; userGesture?: boolean } = {}): Promise<any> {
     const timeoutMs = opts.timeoutMs ?? 30_000;
     const r = await Promise.race([
         session.send("Runtime.evaluate", {
             expression: expr,
             awaitPromise: opts.awaitPromise ?? true,
             returnByValue: opts.returnByValue ?? true,
+            // Gesture-gated APIs (requestPointerLock, requestFullscreen, AudioContext.resume)
+            // reject without user activation, which no harness verb can otherwise grant.
+            userGesture: opts.userGesture ?? false,
         }),
         Bun.sleep(timeoutMs).then(() => ({ __timeout: true } as any)),
     ]);
@@ -335,6 +351,32 @@ export async function pageEval(session: CdpSession, expr: string, opts: { timeou
         throw new Error(`page eval exception: ${res.exceptionDetails.text} ${res.exceptionDetails.exception?.description ?? ""}`);
     }
     return res?.result?.value ?? res?.result;
+}
+
+/**
+ * Engage or release Pointer Lock — the transport a guest gets whenever it asks for a
+ * relative mouse (ShowCursor(FALSE), ClipCursor, exclusive DirectInput, a warp burst).
+ * Neither half is reachable from the page: the browser demands user activation AND a
+ * focused document, and a background tab has neither. Everything downstream of the lock
+ * (relative deltas, honored SetCursorPos warps, the host-drawn cursor) is untestable
+ * without it.
+ */
+export async function setPointerLock(session: CdpSession, engage: boolean, opts: { timeoutMs?: number } = {}): Promise<{ locked: boolean; error: string | null }> {
+    if (engage) await session.send("Page.bringToFront", {}).catch(() => { /* already front */ });
+    const expr = `(async () => {
+        const c = document.querySelector('canvas');
+        if (!c) return { locked: false, error: 'no canvas' };
+        let error = null;
+        try {
+            if (${engage}) await c.requestPointerLock(); else document.exitPointerLock();
+        } catch (e) { error = String((e && e.message) || e); }
+        const deadline = Date.now() + 2000;
+        while (!!document.pointerLockElement !== ${engage} && Date.now() < deadline) {
+            await new Promise((r) => setTimeout(r, 32));
+        }
+        return { locked: !!document.pointerLockElement, error };
+    })()`;
+    return await pageEval(session, expr, { userGesture: true, timeoutMs: opts.timeoutMs ?? 15_000 });
 }
 
 /** Evaluate an expression in the WORKER context via the flattened auto-attach dance. */

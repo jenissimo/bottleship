@@ -53,6 +53,13 @@ function aotGameId(): string {
 const WASM_TABLE_SIZE = 900;
 const WASM_TABLE_OFFSET = 1024;
 
+// Dispatch-slab pool geometry — mirrors jit.rs DISPATCH_SLAB_COUNT and the 0x1000
+// cells-per-slab stride. Used by the slabCanary* verbs below.
+const DISPATCH_SLAB_COUNT = 4096;
+const SLAB_CELLS = 0x1000;
+const SLAB_CANARY = 0xa5a5;
+let slabCanaryBand: { lo: number; hi: number; base: number; highWaterAtArm: number } | null = null;
+
 interface DbgConfig {
     enabled: boolean;
     bps: number[];
@@ -464,6 +471,142 @@ export const dbg = {
         console.log(`[dbg] jitSlabAudit ${JSON.stringify(r)}`);
         return r;
     },
+    /**
+     * Dispatch-slab canary, armed ONLY over slabs the JIT provably cannot have used.
+     *
+     * Why this is not the obvious "fill the whole pool and rescan": slabs are handed
+     * out from a LIFO free stack that rust_init fills `FREE[i-1] = i` and pops from the
+     * top, so the FIRST slab ever allocated is 4095 and allocation walks DOWNWARD;
+     * dispatch_meta_clear returns a slab to the top of that stack, so a small live set
+     * recycles the same few high slabs forever. Each reuse legitimately does
+     * `table.fill(0)` and then writes only the page's handful of entries. A whole-pool
+     * canary therefore reports thousands of zeroed cells concentrated in the pool's top
+     * few KB during a perfectly healthy boot — it measures the JIT's own bookkeeping,
+     * not an intruder.
+     *
+     * So we arm only slabs 1..(4095 - highWater - margin): below the allocation floor,
+     * never reachable by dispatch_meta_set. A single changed cell there is an
+     * unambiguous external write into the wasm statics. Verify RED with
+     * `dbg.slabCanaryPoke()` before trusting a green result.
+     */
+    slabCanaryArm(margin = 64, all = false): unknown {
+        const w = wasm();
+        if (!w?.jit_get_dispatch_slabs_ptr) return null;
+        const proc: any = System.getInstance().process;
+        const cpu = proc?.v86?.cpu ?? proc?.v86?.v86?.cpu;
+        const buf = cpu?.wasm_memory?.buffer;
+        if (!buf) { console.warn("[dbg] wasm_memory unreachable (v86 not ready)"); return null; }
+
+        const base = w.jit_get_dispatch_slabs_ptr() >>> 0;
+        const highWater = w.dispatch_slab_high_water() >>> 0;
+        // `all` reproduces the naive whole-pool canary. Only safe straight after
+        // dbg.jitClear(), when no slab is published — otherwise it overwrites live
+        // dispatch entries with a bogus state index.
+        const hi = all ? DISPATCH_SLAB_COUNT - 1 : DISPATCH_SLAB_COUNT - 1 - highWater - margin;
+        if (hi < 1) { console.warn(`[dbg] slabCanary: no safe band (highWater=${highWater})`); return null; }
+
+        const cells = new Uint16Array(buf, base, DISPATCH_SLAB_COUNT * SLAB_CELLS);
+        cells.fill(SLAB_CANARY, SLAB_CELLS, (hi + 1) * SLAB_CELLS); // slabs 1..hi
+        slabCanaryBand = { lo: 1, hi, base, highWaterAtArm: highWater };
+        const r = { armedSlabs: `1..${hi}`, cells: hi * SLAB_CELLS, highWaterAtArm: highWater, base: `0x${base.toString(16)}` };
+        console.log(`[dbg] slabCanaryArm ${JSON.stringify(r)}`);
+        return r;
+    },
+    /** Rescan the armed band. Reports every slab with a non-canary cell, the first few
+     *  exact linear-memory addresses, and what value landed there (0 = a zeroing writer).
+     *  `sawAllocGrowth` warns if the JIT's floor descended into the band since arming,
+     *  which would make hits legitimate rather than external. */
+    slabCanaryCheck(maxReport = 12): unknown {
+        const w = wasm();
+        const band = slabCanaryBand;
+        if (!w?.jit_get_dispatch_slabs_ptr || !band) { console.warn("[dbg] slabCanary not armed"); return null; }
+        const proc: any = System.getInstance().process;
+        const cpu = proc?.v86?.cpu ?? proc?.v86?.v86?.cpu;
+        const buf = cpu?.wasm_memory?.buffer;
+        const base = w.jit_get_dispatch_slabs_ptr() >>> 0;
+        if (!buf) return null;
+        if (base !== band.base) { console.warn(`[dbg] slabCanary: pool moved 0x${band.base.toString(16)}->0x${base.toString(16)} (v86 re-created) — rearm`); return null; }
+
+        const highWater = w.dispatch_slab_high_water() >>> 0;
+        const floor = DISPATCH_SLAB_COUNT - 1 - highWater; // lowest slab the JIT may have used
+        const cells = new Uint16Array(buf, base, DISPATCH_SLAB_COUNT * SLAB_CELLS);
+        const hits: { slab: number; off: number; addr: string; value: number; jitReachable: boolean }[] = [];
+        let damagedCells = 0, damagedSlabs = 0, externalCells = 0;
+        for (let s = band.lo; s <= band.hi; s++) {
+            let slabHit = false;
+            for (let i = 0; i < SLAB_CELLS; i++) {
+                const v = cells[s * SLAB_CELLS + i];
+                if (v === SLAB_CANARY) continue;
+                damagedCells++;
+                slabHit = true;
+                const jitReachable = s >= floor;
+                if (!jitReachable) externalCells++;
+                if (hits.length < maxReport) {
+                    hits.push({ slab: s, off: i, addr: `0x${(base + (s * SLAB_CELLS + i) * 2).toString(16)}`, value: v, jitReachable });
+                }
+            }
+            if (slabHit) damagedSlabs++;
+        }
+        const r = {
+            armed: `1..${band.hi}`, damagedSlabs, damagedCells, externalCells,
+            highWaterAtArm: band.highWaterAtArm, highWaterNow: highWater,
+            sawAllocGrowth: floor <= band.hi,
+            verdict: externalCells > 0 ? "EXTERNAL-WRITE" : damagedCells > 0 ? "jit-reachable-only" : "clean",
+            hits,
+        };
+        console.log(`[dbg] slabCanaryCheck ${JSON.stringify(r)}`);
+        return r;
+    },
+    /** Negative control: stomp one cell in the armed band so slabCanaryCheck MUST go red.
+     *  Run this once per session before believing a clean result. */
+    slabCanaryPoke(slab = 1, off = 7): unknown {
+        const w = wasm();
+        const proc: any = System.getInstance().process;
+        const cpu = proc?.v86?.cpu ?? proc?.v86?.v86?.cpu;
+        const buf = cpu?.wasm_memory?.buffer;
+        if (!w?.jit_get_dispatch_slabs_ptr || !buf) return null;
+        const base = w.jit_get_dispatch_slabs_ptr() >>> 0;
+        new Uint16Array(buf, base, DISPATCH_SLAB_COUNT * SLAB_CELLS)[slab * SLAB_CELLS + off] = 0;
+        console.log(`[dbg] slabCanaryPoke zeroed slab ${slab} off ${off}`);
+        return { slab, off };
+    },
+    /**
+     * Inspect one dispatch slab from JS: how many cells are live, and which virt pages'
+     * DISPATCH_META point at it. Two or more owners means a slab id was handed out twice
+     * (free-stack corruption) and the pages overwrite each other's dispatch tables —
+     * the thing jit_slab_audit's live-vs-published divergence would otherwise only hint at.
+     * Pass no slab to inspect whatever jit_slab_audit flagged last.
+     */
+    slabInspect(slab?: number): unknown {
+        const w = wasm();
+        if (!w?.jit_get_dispatch_slabs_ptr || !w.jit_get_dispatch_meta_ptr) return null;
+        const proc: any = System.getInstance().process;
+        const cpu = proc?.v86?.cpu ?? proc?.v86?.v86?.cpu;
+        const buf = cpu?.wasm_memory?.buffer;
+        if (!buf) return null;
+        if (slab === undefined) {
+            w.jit_slab_audit();
+            slab = w.jit_slab_audit_last(0) >>> 0;
+        }
+        const cells = new Uint16Array(buf, w.jit_get_dispatch_slabs_ptr() >>> 0, DISPATCH_SLAB_COUNT * SLAB_CELLS);
+        let live = 0;
+        const offs: number[] = [];
+        for (let i = 0; i < SLAB_CELLS; i++) {
+            if (cells[slab * SLAB_CELLS + i] !== 0) { live++; if (offs.length < 8) offs.push(i); }
+        }
+        // DISPATCH_META is [u64; 1<<20]; the slab id is the low u16 of each word.
+        const meta = new Uint32Array(buf, w.jit_get_dispatch_meta_ptr() >>> 0, (1 << 20) * 2);
+        const owners: string[] = [];
+        for (let p = 0; p < (1 << 20); p++) {
+            const lo = meta[p * 2];
+            if (lo !== 0 && (lo & 0xffff) === slab) {
+                if (owners.length < 8) owners.push(`page=0x${p.toString(16)} tableIdx=${(lo >>> 16) & 0xffff}`);
+            }
+        }
+        const r = { slab, live, owners: owners.length, ownerList: owners, firstLiveOffsets: offs };
+        console.log(`[dbg] slabInspect ${JSON.stringify(r)}`);
+        return r;
+    },
     /** Linear-memory layout of the JIT statics vs the JS-writable D3D9 arena. */
     jitStaticsMap(): unknown {
         const w = wasm();
@@ -474,6 +617,14 @@ export const dbg = {
         const arena = typeof w.get_d3d9_arena_ptr === "function" ? w.get_d3d9_arena_ptr() >>> 0 : -1;
         const wmap = typeof w.fastmem_write_map_base === "function" ? w.fastmem_write_map_base() >>> 0 : -1;
         const hp = typeof w.get_hypercall_page_ptr === "function" ? w.get_hypercall_page_ptr() >>> 0 : -1;
+        // Guest RAM base inside the SAME linear memory. A JIT fastmem store computes
+        // mem8Base + guestAddr with i32 wrap and no bounds check, so a guest address near
+        // 2^32 lands just BELOW mem8Base — which is why the distance from the slab pool's
+        // end to mem8Base decides whether the guest can reach the pool that way at all.
+        const proc: any = System.getInstance().process;
+        const cpu = proc?.v86?.cpu ?? proc?.v86?.v86?.cpu;
+        const mem8 = cpu?.mem8;
+        const memBase = mem8 ? mem8.byteOffset >>> 0 : -1;
         const r = {
             dispatchSlabs: `0x${slabs.toString(16)}..0x${(slabs + slabsLen).toString(16)}`,
             dispatchMeta: `0x${meta.toString(16)}`,
@@ -481,6 +632,9 @@ export const dbg = {
             arenaMinusSlabsEnd: arena - (slabs + slabsLen),
             fastmemWriteMap: `0x${wmap.toString(16)}`,
             hypercallPage: `0x${hp.toString(16)}`,
+            guestMem: mem8 ? `0x${memBase.toString(16)}..0x${(memBase + mem8.length).toString(16)}` : "n/a",
+            memBaseMinusSlabsEnd: mem8 ? memBase - (slabs + slabsLen) : -1,
+            wasmMemBytes: cpu?.wasm_memory?.buffer?.byteLength ?? -1,
         };
         console.log(`[dbg] jitStaticsMap ${JSON.stringify(r)}`);
         return r;
@@ -1034,7 +1188,7 @@ export const dbg = {
         const honestQuantum = Math.max(0, s.ticks - s.urgentTicks);
         // pinStarvation > 0 means a callback pin (WndProc/Enum*) was overriding preemption long
         // enough to starve queued peers — each one is a freeze the bound turned into a hiccup.
-        const out = { ...s, honestQuantum, fpu, pinStarvationForced: sched?.pinStarvationForced ?? -1,
+        const out = { ...s, honestQuantum, fpu, pinStarvationForced: sched?.pinStarvationForced ?? -1, lastTickExit: sched?.lastTickExit ?? -1,
             urgentPct: pct(s.urgentTicks, s.ticks),
             urgentNoReadyPct: pct(s.urgentNoReady, s.ticks),
             selfReschedulePct: pct(s.selfReschedule, s.selfReschedule + s.realSwitch),
