@@ -103,24 +103,24 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
     dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetTexture', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
         const esp = cpu.reg32[4];
         const device = devices.get(view.getUint32(esp + 4, true));
-        if (device) device.setTexture(view.getUint32(esp + 8, true), view.getUint32(esp + 12, true));
-        return D3D_OK;
+        if (!device) return D3DERR_INVALIDCALL;
+        return device.setTexture(view.getUint32(esp + 8, true), view.getUint32(esp + 12, true));
     }, { trivial: true });
 
     // IDirect3DDevice9_SetStreamSource(thisPtr, StreamNumber, pStreamData, OffsetInBytes, Stride)
     dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetStreamSource', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
         const esp = cpu.reg32[4];
         const device = devices.get(view.getUint32(esp + 4, true));
-        if (device) device.setStreamSource(view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 16, true), view.getUint32(esp + 20, true));
-        return D3D_OK;
+        if (!device) return D3DERR_INVALIDCALL;
+        return device.setStreamSource(view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 16, true), view.getUint32(esp + 20, true));
     }, { trivial: true });
 
     // IDirect3DDevice9_SetIndices(thisPtr, pIndexData)
     dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetIndices', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
         const esp = cpu.reg32[4];
         const device = devices.get(view.getUint32(esp + 4, true));
-        if (device) device.setIndices(view.getUint32(esp + 8, true));
-        return D3D_OK;
+        if (!device) return D3DERR_INVALIDCALL;
+        return device.setIndices(view.getUint32(esp + 8, true));
     }, { trivial: true });
 
     // IDirect3DDevice9_SetVertexShader(thisPtr, pShader) — resolve COM ptr → internal handle.
@@ -355,27 +355,6 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
         (_mem8: Uint8Array, mem32: Uint32Array, ptr: number) => {
             const device = devices.get(mem32[ptr >> 2]);
             if (device) device.setFVF(mem32[(ptr + 4) >> 2]);
-        }, true, 0x1);
-
-    // SetTexture (3 args)
-    dispatcher.registerWriteBufferFunction('d3d9', 'IDirect3DDevice9_SetTexture', 3,
-        (_mem8: Uint8Array, mem32: Uint32Array, ptr: number) => {
-            const device = devices.get(mem32[ptr >> 2]);
-            if (device) device.setTexture(mem32[(ptr + 4) >> 2], mem32[(ptr + 8) >> 2]);
-        }, true, 0x3);
-
-    // SetStreamSource (5 args)
-    dispatcher.registerWriteBufferFunction('d3d9', 'IDirect3DDevice9_SetStreamSource', 5,
-        (_mem8: Uint8Array, mem32: Uint32Array, ptr: number) => {
-            const device = devices.get(mem32[ptr >> 2]);
-            if (device) device.setStreamSource(mem32[(ptr + 4) >> 2], mem32[(ptr + 8) >> 2], mem32[(ptr + 12) >> 2], mem32[(ptr + 16) >> 2]);
-        }, true, 0x3);
-
-    // SetIndices (2 args)
-    dispatcher.registerWriteBufferFunction('d3d9', 'IDirect3DDevice9_SetIndices', 2,
-        (_mem8: Uint8Array, mem32: Uint32Array, ptr: number) => {
-            const device = devices.get(mem32[ptr >> 2]);
-            if (device) device.setIndices(mem32[(ptr + 4) >> 2]);
         }, true, 0x1);
 
     // SetVertexShader (2 args) — resolve COM ptr → internal handle at drain.

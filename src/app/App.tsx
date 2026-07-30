@@ -219,22 +219,6 @@ export default function App() {
     padLabel: null,
     guestActive: false,
   });
-  const handleDroppedFiles = useCallback((fileList: FileList | File[]) => {
-    const files = Array.from(fileList);
-    if (files.length === 0 || !globalWorker) return;
-    ensurePersistentStorageRequested();
-    canvasRef.current?.focus();
-    setIsLoadingApp(true);
-    setErrorMessage(null);
-    setBundleDisplayName(null);
-    setLoadingProgress({ phase: "loading", percent: 0, label: "" });
-    // One file → blob sniff path; several (setup.exe + setup-*.bin) → multi-part install.
-    globalWorker.postMessage(
-      files.length === 1
-        ? { type: "load_bundle", blob: files[0] }
-        : { type: "load_bundle", blobs: files },
-    );
-  }, []);
   const canvasRectRef = useRef<DOMRect | null>(null);
   const cursorVisibleRef = useRef(true);
   // CSS cursor for the guest's installed custom cursor image (SetCursor with a
@@ -265,6 +249,22 @@ export default function App() {
   /** Display name from the loaded WGB manifest (title || name). Used so ?game=dev&load=…
    *  doesn't keep saying "Dev" / "Starting Dev" once the bundle is known. */
   const [bundleDisplayName, setBundleDisplayName] = useState<string | null>(null);
+  const handleDroppedFiles = useCallback((fileList: FileList | File[]) => {
+    const files = Array.from(fileList);
+    if (files.length === 0 || !globalWorker) return;
+    ensurePersistentStorageRequested();
+    canvasRef.current?.focus();
+    setIsLoadingApp(true);
+    setErrorMessage(null);
+    setBundleDisplayName(null);
+    setLoadingProgress({ phase: "loading", percent: 0, label: "" });
+    // One file uses the blob sniff path; several files use multi-part install.
+    globalWorker.postMessage(
+      files.length === 1
+        ? { type: "load_bundle", blob: files[0] }
+        : { type: "load_bundle", blobs: files },
+    );
+  }, []);
   const loadingFadeTimerRef = useRef<number | null>(null);
   const [addGameOpen, setAddGameOpen] = useState(false);
   const [addedGames, setAddedGames] = useState<AddedGame[]>([]);
@@ -476,7 +476,6 @@ export default function App() {
 
     if (selectedGame.id === "dev" && ingest) {
       // BYO installer(s) staged to OPFS _ingest/ by the Add-Game flow — read them back and
-      // feed the worker's blob sniff path (one file → {blob}; multi-part → {blobs}).
       (async () => {
         try {
           const root = await navigator.storage.getDirectory();

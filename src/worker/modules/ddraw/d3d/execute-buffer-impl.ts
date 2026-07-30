@@ -19,6 +19,7 @@ import { ComObjectFactory } from "../../../core/com/base-com-object";
 import { Direct3DExecuteBufferObject } from "../com-objects";
 import { allocateComObject, IID_IDirect3DExecuteBuffer } from "../constants";
 import { createDrawHandler } from "./draw-handler";
+import { readGuidFromMem } from "../../../core/com/typelib/typelib-types";
 
 const D3D_OK = 0;
 const E_POINTER = 0x80004003;
@@ -27,6 +28,7 @@ const E_FAIL = 0x80004005;
 const D3DERR_INVALIDCALL = 0x8876086c;
 const DDERR_ALREADYINITIALIZED = 0x88000005;
 const DDERR_UNSUPPORTED = 0x80004001; // ddraw.h: DDERR_UNSUPPORTED == E_NOTIMPL
+const IID_IUNKNOWN = "00000000-0000-0000-c000-000000000046";
 
 // D3DOPCODE
 const D3DOP_POINT = 1;
@@ -123,9 +125,20 @@ export const createExecuteBufferExports = (
 
     exports["IDirect3DExecuteBuffer_QueryInterface"] = (ctx, mem, args) => {
         const obj = getBuffer(args[0]);
-        if (!obj) return E_NOINTERFACE;
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-        if (args[2]) view.setUint32(args[2], args[0], true);
+        const riid = args[1] >>> 0;
+        const ppvObject = args[2] >>> 0;
+        if (!ppvObject || ppvObject + 4 > mem.length || !riid || riid + 16 > mem.length) return E_POINTER;
+        if (!obj) {
+            view.setUint32(ppvObject, 0, true);
+            return E_NOINTERFACE;
+        }
+        const iid = readGuidFromMem(mem, riid);
+        if (iid !== IID_IUNKNOWN && iid !== IID_IDirect3DExecuteBuffer) {
+            view.setUint32(ppvObject, 0, true);
+            return E_NOINTERFACE;
+        }
+        view.setUint32(ppvObject, args[0] >>> 0, true);
         obj.addRef();
         return D3D_OK;
     };

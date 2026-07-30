@@ -12,7 +12,12 @@ import { surfaceMeta, textureMeta, vertexBufferMeta } from './resource-registry'
 import { stubRegistry } from '../../core/diagnostics/stub-registry';
 import { RawVertexElement } from '../../backends/webgpu/d3d9/shader';
 import type { D3D9StateBlockData } from '../../backends/webgpu/d3d9/d3d9-state-block';
-import { classifyStateBlockCoverage, tryAttachWasmBlockSlot } from '../../backends/webgpu/d3d9/d3d9-state-block';
+import {
+    classifyStateBlockCoverage,
+    disposeStateBlockData,
+    retainStateBlockRefs,
+    tryAttachWasmBlockSlot,
+} from '../../backends/webgpu/d3d9/d3d9-state-block';
 import { d3d9PerfStateBlockCreated } from './d3d9-perf';
 import {
     vertexDeclComObjects,
@@ -53,6 +58,7 @@ export function createStateExports(): Record<string, ThunkImplementation> {
         const coverage = classifyStateBlockCoverage(data.entries);
         data.coverable = coverage.coverable;
         tryAttachWasmBlockSlot(data); // may downgrade coverable on unrepresentable entries
+        retainStateBlockRefs(data);
         d3d9PerfStateBlockCreated(
             data.blockType,
             data.entries.length,
@@ -62,7 +68,10 @@ export function createStateExports(): Record<string, ThunkImplementation> {
             coverage.psConstRanges,
         );
         stateBlocks.set(sbPtr, data);
-        registerComFinalizer(sbPtr, () => stateBlocks.delete(sbPtr));
+        registerComFinalizer(sbPtr, () => {
+            disposeStateBlockData(data);
+            stateBlocks.delete(sbPtr);
+        });
         return sbPtr;
     }
 
@@ -211,14 +220,12 @@ export function createStateExports(): Record<string, ThunkImplementation> {
         }
 
         Logger.verbose(LogCategory.D3D9, `SetStreamSource(Stream=${StreamNumber}, Offset=${OffsetInBytes}, Stride=${Stride})`);
-        device.setStreamSource(StreamNumber, pStreamData, OffsetInBytes, Stride);
-        return D3D_OK;
+        return device.setStreamSource(StreamNumber, pStreamData, OffsetInBytes, Stride);
     };
 
     // GetStreamSource(StreamNumber, ppStreamData, pOffsetInBytes, pStride). ppStreamData is
     // mandatory; the other two out-params are optional. Real D3D9 AddRefs the returned buffer —
-    // a no-op here, since d3d9 COM objects are not reference counted (AddRef/Release above are
-    // constant stubs), exactly like GetRenderTarget/GetBackBuffer in this module.
+    // mirror that so callers can hold the returned COM pointer independently.
     exports['IDirect3DDevice9_GetStreamSource'] = (_ctx, _mem, args) => {
         const device = devices.get(args[0]);
         const ppStreamData = args[2];
@@ -273,8 +280,7 @@ export function createStateExports(): Record<string, ThunkImplementation> {
         }
 
         Logger.verbose(LogCategory.D3D9, `SetIndices(0x${pIndexData.toString(16)})`);
-        device.setIndices(pIndexData);
-        return D3D_OK;
+        return device.setIndices(pIndexData);
     };
 
     exports['IDirect3DDevice9_SetTexture'] = (ctx, mem, args) => {
@@ -289,8 +295,7 @@ export function createStateExports(): Record<string, ThunkImplementation> {
         }
 
         Logger.verbose(LogCategory.D3D9, `SetTexture(Stage=${Stage}, Texture=0x${pTexture.toString(16)})`);
-        device.setTexture(Stage, pTexture);
-        return D3D_OK;
+        return device.setTexture(Stage, pTexture);
     };
 
     exports['IDirect3DDevice9_GetRenderState'] = (_ctx, _mem, args) => {
@@ -786,7 +791,11 @@ export function createStateExports(): Record<string, ThunkImplementation> {
             blockType: 0,
             entries: result.entries,
         });
-        if (!sbPtr || !writeStateBlockOut(ppSB, sbPtr, mem)) return D3DERR_INVALIDCALL;
+        if (!sbPtr) return D3DERR_INVALIDCALL;
+        if (!writeStateBlockOut(ppSB, sbPtr, mem)) {
+            releaseComRef(sbPtr);
+            return D3DERR_INVALIDCALL;
+        }
 
         Logger.verbose(LogCategory.D3D9, `EndStateBlock → 0x${sbPtr.toString(16)} (${result.entries.length} entries)`);
         return D3D_OK;
@@ -800,7 +809,11 @@ export function createStateExports(): Record<string, ThunkImplementation> {
         if (!device) return D3DERR_INVALIDCALL;
 
         const sbPtr = createStateBlockComObject(pDevice, device.createStateBlockData(blockType));
-        if (!sbPtr || !writeStateBlockOut(ppSB, sbPtr, mem)) return D3DERR_INVALIDCALL;
+        if (!sbPtr) return D3DERR_INVALIDCALL;
+        if (!writeStateBlockOut(ppSB, sbPtr, mem)) {
+            releaseComRef(sbPtr);
+            return D3DERR_INVALIDCALL;
+        }
 
         Logger.verbose(LogCategory.D3D9, `CreateStateBlock(type=${blockType}) → 0x${sbPtr.toString(16)}`);
         return D3D_OK;

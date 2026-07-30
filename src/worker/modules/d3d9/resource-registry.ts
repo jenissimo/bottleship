@@ -51,8 +51,8 @@ export const vertexBufferMeta: Map<number, BufferMeta> = new Map();
 export const indexBufferMeta: Map<number, BufferMeta> = new Map();
 /** Per-device bound depth/stencil surface COM pointer (0 = none). */
 export const deviceBoundDepthStencil: Map<number, number> = new Map();
-/** Per-device bound render-target-0 surface COM pointer (0/absent = implicit backbuffer). */
-export const deviceBoundRenderTarget: Map<number, number> = new Map();
+/** Per-device bound render-target surface COM pointers by render-target index. */
+export const deviceBoundRenderTarget: Map<number, Map<number, number>> = new Map();
 /** Per-device cursor bitmap + hotspot accepted by IDirect3DDevice9::SetCursorProperties. */
 export const deviceCursorProperties: Map<number, { hotspotX: number; hotspotY: number; surfacePtr: number }> = new Map();
 
@@ -72,8 +72,11 @@ export function releaseSurfaceMetadata(surfacePtr: number): void {
     for (const [devicePtr, surfPtr] of deviceBoundDepthStencil) {
         if ((surfPtr >>> 0) === pSurf) deviceBoundDepthStencil.delete(devicePtr);
     }
-    for (const [devicePtr, surfPtr] of deviceBoundRenderTarget) {
-        if ((surfPtr >>> 0) === pSurf) deviceBoundRenderTarget.delete(devicePtr);
+    for (const [devicePtr, targets] of deviceBoundRenderTarget) {
+        for (const [index, surfPtr] of targets) {
+            if ((surfPtr >>> 0) === pSurf) targets.delete(index);
+        }
+        if (targets.size === 0) deviceBoundRenderTarget.delete(devicePtr);
     }
     for (const [devicePtr, cursor] of deviceCursorProperties) {
         if ((cursor.surfacePtr >>> 0) === pSurf) deviceCursorProperties.delete(devicePtr);
@@ -81,6 +84,35 @@ export function releaseSurfaceMetadata(surfacePtr: number): void {
     surfaceMeta.delete(pSurf);
     resourceToDevice.delete(pSurf);
     forgetComObject(pSurf);
+}
+
+export function getDeviceRenderTarget(devicePtr: number, index: number): number {
+    return deviceBoundRenderTarget.get(devicePtr >>> 0)?.get(index >>> 0) ?? 0;
+}
+
+export function setDeviceRenderTarget(devicePtr: number, index: number, surfacePtr: number): void {
+    const pDevice = devicePtr >>> 0;
+    const slot = index >>> 0;
+    const pSurf = surfacePtr >>> 0;
+    let targets = deviceBoundRenderTarget.get(pDevice);
+    if (pSurf === 0) {
+        targets?.delete(slot);
+        if (targets && targets.size === 0) deviceBoundRenderTarget.delete(pDevice);
+        return;
+    }
+    if (!targets) {
+        targets = new Map();
+        deviceBoundRenderTarget.set(pDevice, targets);
+    }
+    targets.set(slot, pSurf);
+}
+
+export function getDeviceRenderTargets(devicePtr: number): number[] {
+    return [...(deviceBoundRenderTarget.get(devicePtr >>> 0)?.values() ?? [])];
+}
+
+export function clearDeviceRenderTargets(devicePtr: number): void {
+    deviceBoundRenderTarget.delete(devicePtr >>> 0);
 }
 
 export function clearTextureSubresourceSurfaces(texturePtr: number): void {

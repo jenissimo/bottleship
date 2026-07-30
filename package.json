@@ -22,7 +22,6 @@
     "import-metadata": "bun tools/import-metadata.ts",
     "validate-signatures": "bun tools/validate-signatures.ts",
     "generate-reference-argcounts": "bun tools/generate-reference-argcounts.ts",
-    "seh:ghidra": "bun tools/internal/seh-ghidra-headless.ts",
     "check-file-sizes": "bun tools/check-file-sizes.ts",
     "fetch-reference-headers": "bun tools/fetch-reference-headers.ts",
     "parse-reference-headers": "bun tools/parse-reference-headers.ts",

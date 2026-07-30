@@ -13,6 +13,7 @@ import {
 } from "./d3d9-com-objects";
 import { KeyedStateBlockRecorder } from "../shared/state-block-recorder";
 import { d3d9WasmArena, isWasmBlocksEnabled } from "./d3d9-wasm-arena";
+import { addComRef, releaseComRef } from "../../../modules/d3d9/shared-state";
 
 export const D3DSBT_ALL = 1;
 export const D3DSBT_PIXELSTATE = 2;
@@ -53,6 +54,8 @@ export interface D3D9StateBlockData {
      *  can resolve) of a wasm-slotted block; refreshed/applied on the JS path while the
      *  bulk (renderState/sampler0/shader-constant) set lives in the slot. */
     handleEntries?: StateBlockEntry[];
+    /** COM pointers retained by texture/shader/declaration entries while this block lives. */
+    retainedRefs?: number[];
 }
 
 /**
@@ -145,6 +148,49 @@ export class D3D9StateBlockRecorder extends KeyedStateBlockRecorder<StateBlockEn
     constructor() {
         super(entryKey);
     }
+}
+
+function retainedEntryPtr(entry: StateBlockEntry): number {
+    switch (entry.op) {
+        case "texture":
+            return entry.texPtr >>> 0;
+        case "vertexShader":
+        case "pixelShader":
+        case "vertexDeclaration":
+            return entry.handle >>> 0;
+        default:
+            return 0;
+    }
+}
+
+function activeHandleEntries(data: D3D9StateBlockData): StateBlockEntry[] {
+    return data.wasmSlot !== undefined ? (data.handleEntries ?? []) : data.entries;
+}
+
+export function releaseStateBlockRefs(data: D3D9StateBlockData): void {
+    for (const ptr of data.retainedRefs ?? []) {
+        releaseComRef(ptr);
+    }
+    data.retainedRefs = [];
+}
+
+export function retainStateBlockRefs(data: D3D9StateBlockData): void {
+    releaseStateBlockRefs(data);
+    const retained: number[] = [];
+    for (const entry of activeHandleEntries(data)) {
+        const ptr = retainedEntryPtr(entry);
+        if (ptr !== 0 && addComRef(ptr) !== undefined) retained.push(ptr);
+    }
+    data.retainedRefs = retained;
+}
+
+export function disposeStateBlockData(data: D3D9StateBlockData): void {
+    releaseStateBlockRefs(data);
+    if (data.wasmSlot !== undefined) {
+        d3d9WasmArena.releaseBlockSlot(data.wasmSlot);
+        data.wasmSlot = undefined;
+    }
+    data.handleEntries = undefined;
 }
 
 /**

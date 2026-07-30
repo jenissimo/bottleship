@@ -29,6 +29,11 @@ import {
 
 const ERROR_INVALID_HANDLE = 6;
 const ERROR_INVALID_PARAMETER = 87;
+const DEVICE_NOTIFY_WINDOW_HANDLE = 0x00000000;
+const DEVICE_NOTIFY_SERVICE_HANDLE = 0x00000001;
+const DEVICE_NOTIFY_SUPPORTED_FLAGS = DEVICE_NOTIFY_WINDOW_HANDLE |
+    DEVICE_NOTIFY_SERVICE_HANDLE |
+    DEVICE_NOTIFY_ALL_INTERFACE_CLASSES;
 
 const HID_CLASS_GUID = guidToHex(GUID_DEVINTERFACE_HID);
 
@@ -73,6 +78,10 @@ export function registerDeviceNotification(
     };
     if (!hRecipient) {
         setLastError(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    if ((flags & ~DEVICE_NOTIFY_SUPPORTED_FLAGS) !== 0 || (flags & DEVICE_NOTIFY_SERVICE_HANDLE) !== 0) {
+        setLastError(ERROR_INVALID_PARAMETER);
         return 0;
     }
     const allClasses = (flags & DEVICE_NOTIFY_ALL_INTERFACE_CLASSES) !== 0;

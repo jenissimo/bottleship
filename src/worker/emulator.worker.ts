@@ -1608,11 +1608,24 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
         });
 
         // 3-second timeout — don't block startup on slow connections.
-        // In-flight requests continue in the background even after timeout.
-        await Promise.race([
-            system.fileSystem.prefetchRomFiles(criticalRels, 8, onPrefetchProgress),
-            new Promise<void>(r => setTimeout(r, 3000)),
-        ]);
+        _prefetchController?.abort();
+        const phase1Controller = new AbortController();
+        _prefetchController = phase1Controller;
+        let phase1Timeout: ReturnType<typeof setTimeout> | null = null;
+        try {
+            await Promise.race([
+                system.fileSystem.prefetchRomFiles(criticalRels, 8, onPrefetchProgress, phase1Controller.signal),
+                new Promise<void>(r => {
+                    phase1Timeout = setTimeout(() => {
+                        phase1Controller.abort();
+                        r();
+                    }, 3000);
+                }),
+            ]);
+        } finally {
+            if (phase1Timeout !== null) clearTimeout(phase1Timeout);
+            if (_prefetchController === phase1Controller) _prefetchController = null;
+        }
 
         Logger.log(LogCategory.SYSTEM, `WGB: phase1 done in ${(performance.now() - t1) | 0}ms`);
     }

@@ -14,7 +14,17 @@ import { D3D9Device } from '../../backends/webgpu/d3d9/d3d9-device';
 import { WebGPUBackend } from '../../backends/webgpu/webgpu-backend';
 import { writeDeviceCaps9 } from './caps';
 import { addComRef, getVTables, devices, createComObject, registerComFinalizer, releaseComRef, resourceToDevice, deviceToD3D9 } from './shared-state';
-import { deviceBoundDepthStencil, deviceBoundRenderTarget, deviceCursorProperties, releaseSurfaceMetadata, resolveSurfaceInfo, surfaceMeta } from './resource-registry';
+import {
+    clearDeviceRenderTargets,
+    deviceBoundDepthStencil,
+    deviceCursorProperties,
+    getDeviceRenderTarget,
+    getDeviceRenderTargets,
+    releaseSurfaceMetadata,
+    resolveSurfaceInfo,
+    setDeviceRenderTarget,
+    surfaceMeta,
+} from './resource-registry';
 import { syncHostCursorToGuestState, warpGuestCursorTo } from '../user32/shared-state';
 import { setDeviceCursorImage, showDeviceCursor } from '../../core/device-cursor';
 
@@ -28,6 +38,7 @@ const D3DUSAGE_RENDERTARGET = 0x1;
 const D3DUSAGE_DEPTHSTENCIL = 0x2;
 const D3DPOOL_DEFAULT = 0;
 const D3DFMT_D24S8 = 75;
+const D3D9_MAX_RENDER_TARGETS = 4;
 
 // D3DPRESENT_PARAMETERS field offsets.
 const PP_BACKBUFFER_WIDTH = 0;
@@ -304,12 +315,14 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
             registerComFinalizer(devicePtr, () => {
                 device.releaseComBindings();
                 releaseSurfaceRef(deviceBoundDepthStencil.get(devicePtr) ?? 0);
-                releaseSurfaceRef(deviceBoundRenderTarget.get(devicePtr) ?? 0);
+                for (const surfacePtr of getDeviceRenderTargets(devicePtr)) {
+                    releaseSurfaceRef(surfacePtr);
+                }
                 devices.delete(devicePtr);
                 releaseComRef(pD3D9);
                 deviceToD3D9.delete(devicePtr);
                 deviceBoundDepthStencil.delete(devicePtr);
-                deviceBoundRenderTarget.delete(devicePtr);
+                clearDeviceRenderTargets(devicePtr);
                 deviceCursorProperties.delete(devicePtr);
             });
 
@@ -385,49 +398,70 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
     };
 
     exports['IDirect3DDevice9_SetRenderTarget'] = (_ctx, _mem, args) => {
-        const device = devices.get(args[0]);
+        const devicePtr = args[0] >>> 0;
+        const device = devices.get(devicePtr);
         if (!device) return D3DERR_INVALIDCALL;
+        const renderTargetIndex = args[1] >>> 0;
         const surfacePtr = args[2] >>> 0;
+        if (renderTargetIndex >= D3D9_MAX_RENDER_TARGETS) return D3DERR_INVALIDCALL;
         // Resolve the render-target SURFACE → its parent TEXTURE (GetSurfaceLevel recorded the link
         // in surfaceMeta). A surface with no texture parent (the implicit backbuffer from
         // GetBackBuffer / a NULL restore) → texturePtr 0 = render to the swap-chain.
-        const meta = surfacePtr ? surfaceMeta.get(surfacePtr) : undefined;
-        const texturePtr = surfacePtr ? (meta?.texturePtr ?? 0) : 0;
+        if (surfacePtr === 0) {
+            if (renderTargetIndex === 0) return D3DERR_INVALIDCALL;
+            const previous = getDeviceRenderTarget(devicePtr, renderTargetIndex);
+            setDeviceRenderTarget(devicePtr, renderTargetIndex, 0);
+            if (previous) releaseSurfaceRef(previous);
+            Logger.verbose(LogCategory.D3D9, `SetRenderTarget(index=${renderTargetIndex}, surface=NULL)`);
+            return D3D_OK;
+        }
+
+        const meta = surfaceMeta.get(surfacePtr);
+        if (!meta) return D3DERR_INVALIDCALL;
+        if ((meta.usage & D3DUSAGE_RENDERTARGET) === 0) return D3DERR_INVALIDCALL;
+        if (resourceToDevice.get(surfacePtr) !== device) return D3DERR_INVALIDCALL;
+        const texturePtr = meta.texturePtr ?? 0;
         // A cube-face surface carries its face index (GetCubeMapSurface recorded it); -1 = 2D RT.
         const face = meta?.face ?? -1;
-        device.noteRtResolve(surfacePtr, !!meta, texturePtr);
-        Logger.verbose(LogCategory.D3D9, `SetRenderTarget(index=${args[1]}, surface=0x${surfacePtr.toString(16)} -> tex=0x${texturePtr.toString(16)} face=${face})`);
-        if ((args[1] >>> 0) === 0) {
-            const devicePtr = args[0] >>> 0;
-            const previous = deviceBoundRenderTarget.get(devicePtr) ?? 0;
-            addSurfaceRef(surfacePtr);
-            deviceBoundRenderTarget.set(devicePtr, surfacePtr);
-            if (previous && previous !== surfacePtr) releaseSurfaceRef(previous);
+        device.noteRtResolve(surfacePtr, true, texturePtr);
+        Logger.verbose(LogCategory.D3D9, `SetRenderTarget(index=${renderTargetIndex}, surface=0x${surfacePtr.toString(16)} -> tex=0x${texturePtr.toString(16)} face=${face})`);
+        {
+            const previous = getDeviceRenderTarget(devicePtr, renderTargetIndex);
+            if (previous !== surfacePtr) {
+                addSurfaceRef(surfacePtr);
+                setDeviceRenderTarget(devicePtr, renderTargetIndex, surfacePtr);
+                if (previous) releaseSurfaceRef(previous);
+            }
         }
-        device.setRenderTarget(args[1] >>> 0, texturePtr >>> 0, face);
+        if (renderTargetIndex === 0) {
+            device.setRenderTarget(0, texturePtr >>> 0, face);
+        }
         return D3D_OK;
     };
 
     exports['IDirect3DDevice9_GetRenderTarget'] = (_ctx, mem, args) => {
         const devicePtr = args[0] >>> 0;
         const device = devices.get(devicePtr);
+        const renderTargetIndex = args[1] >>> 0;
         const ppRenderTarget = args[2];
         if (!device || !ppRenderTarget) return D3DERR_INVALIDCALL;
+        if (renderTargetIndex >= D3D9_MAX_RENDER_TARGETS) return D3DERR_INVALIDCALL;
         // Return the surface currently bound as RT0. Games save this and pass it back
         // to SetRenderTarget (a NULL here becomes a NULL-vtable call in the guest).
         // With no explicit RT bound, hand out a stable implicit-backbuffer surface
         // object (meta carries real geometry but no texturePtr → SetRenderTarget
         // still resolves it to the swap-chain).
-        let rt = deviceBoundRenderTarget.get(devicePtr) ?? 0;
-        if (!rt) {
+        let rt = getDeviceRenderTarget(devicePtr, renderTargetIndex);
+        if (!rt && renderTargetIndex === 0) {
             const vtableAddr = getVTables()['IDirect3DSurface9']?.address;
             if (!vtableAddr) return D3DERR_INVALIDCALL;
             rt = createComObject(vtableAddr);
             resourceToDevice.set(rt, device);
             registerImplicitBackbufferMeta(rt);
             registerComFinalizer(rt, () => releaseSurfaceMetadata(rt));
-            deviceBoundRenderTarget.set(devicePtr, rt);
+            setDeviceRenderTarget(devicePtr, 0, rt);
         }
+        if (!rt) return D3DERR_INVALIDCALL;
         addSurfaceRef(rt);
         return Mem.writeUint32(ppRenderTarget, rt) ? D3D_OK : D3DERR_INVALIDCALL;
     };

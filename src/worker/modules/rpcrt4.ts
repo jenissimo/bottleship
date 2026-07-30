@@ -17,6 +17,7 @@ import { Process } from "../core/process";
 import { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 
 const RPC_S_OK = 0;
+const RPC_S_INVALID_ARG = 87;
 const RPC_S_INVALID_STRING_UUID = 1705;
 
 const UUID_STR_LEN = 36; // "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
@@ -46,25 +47,30 @@ export class Rpcrt4 implements IModule {
         };
 
         this.exports["UuidToStringA"] = (_ctx, mem, args) => {
+            const out = args[1] >>> 0;
+            if (out === 0) return RPC_S_INVALID_ARG;
             const str = this.formatUuid(mem, args[0] >>> 0);
             const buf = this.process.memory.alloc(UUID_STR_LEN + 1, "HEAP", "rw");
             for (let i = 0; i < str.length; i++) mem[buf + i] = str.charCodeAt(i);
             mem[buf + str.length] = 0;
-            this.writeU32(mem, args[1] >>> 0, buf);
+            this.writeU32(mem, out, buf);
             return RPC_S_OK;
         };
         this.exports["UuidToStringW"] = (_ctx, mem, args) => {
+            const out = args[1] >>> 0;
+            if (out === 0) return RPC_S_INVALID_ARG;
             const str = this.formatUuid(mem, args[0] >>> 0);
             const buf = this.process.memory.alloc((UUID_STR_LEN + 1) * 2, "HEAP", "rw");
             for (let i = 0; i < str.length; i++) this.writeU16(mem, buf + i * 2, str.charCodeAt(i));
             this.writeU16(mem, buf + str.length * 2, 0);
-            this.writeU32(mem, args[1] >>> 0, buf);
+            this.writeU32(mem, out, buf);
             return RPC_S_OK;
         };
 
         this.exports["UuidFromStringA"] = (_ctx, mem, args) => {
             const strPtr = args[0] >>> 0;
             const out = args[1] >>> 0;
+            if (out === 0) return RPC_S_INVALID_ARG;
             if (strPtr === 0) { mem.fill(0, out, out + 16); return RPC_S_OK; } // NULL → nil UUID
             let s = "";
             for (let i = 0; i < UUID_STR_LEN + 1 && mem[strPtr + i] !== 0; i++) {
@@ -75,6 +81,7 @@ export class Rpcrt4 implements IModule {
         this.exports["UuidFromStringW"] = (_ctx, mem, args) => {
             const strPtr = args[0] >>> 0;
             const out = args[1] >>> 0;
+            if (out === 0) return RPC_S_INVALID_ARG;
             if (strPtr === 0) { mem.fill(0, out, out + 16); return RPC_S_OK; }
             let s = "";
             for (let i = 0; i < UUID_STR_LEN + 1; i++) {
@@ -86,7 +93,7 @@ export class Rpcrt4 implements IModule {
         };
 
         this.exports["UuidCompare"] = (_ctx, mem, args) => {
-            this.writeU32(mem, args[2] >>> 0, RPC_S_OK);
+            this.writeStatus(mem, args[2] >>> 0, RPC_S_OK);
             const a = this.readUuidBytes(mem, args[0] >>> 0);
             const b = this.readUuidBytes(mem, args[1] >>> 0);
             for (let i = 0; i < 16; i++) {
@@ -95,21 +102,21 @@ export class Rpcrt4 implements IModule {
             return 0;
         };
         this.exports["UuidEqual"] = (_ctx, mem, args) => {
-            this.writeU32(mem, args[2] >>> 0, RPC_S_OK);
+            this.writeStatus(mem, args[2] >>> 0, RPC_S_OK);
             const a = this.readUuidBytes(mem, args[0] >>> 0);
             const b = this.readUuidBytes(mem, args[1] >>> 0);
             for (let i = 0; i < 16; i++) if (a[i] !== b[i]) return 0;
             return 1;
         };
         this.exports["UuidIsNil"] = (_ctx, mem, args) => {
-            this.writeU32(mem, args[1] >>> 0, RPC_S_OK);
+            this.writeStatus(mem, args[1] >>> 0, RPC_S_OK);
             const a = this.readUuidBytes(mem, args[0] >>> 0);
             for (let i = 0; i < 16; i++) if (a[i] !== 0) return 0;
             return 1;
         };
         // DCE 1.1 uuid_hash (mod-255 Fletcher fold over the 16 bytes).
         this.exports["UuidHash"] = (_ctx, mem, args) => {
-            this.writeU32(mem, args[1] >>> 0, RPC_S_OK);
+            this.writeStatus(mem, args[1] >>> 0, RPC_S_OK);
             const a = this.readUuidBytes(mem, args[0] >>> 0);
             let c0 = 0, c1 = 0;
             for (let i = 0; i < 16; i++) { c0 = (c0 + a[i]) % 255; c1 = (c1 + c0) % 255; }
@@ -152,6 +159,7 @@ export class Rpcrt4 implements IModule {
     }
 
     private parseUuid(mem: Uint8Array, s: string, out: number): number {
+        if (out === 0) return RPC_S_INVALID_ARG;
         const m = /^([0-9a-fA-F]{8})-([0-9a-fA-F]{4})-([0-9a-fA-F]{4})-([0-9a-fA-F]{4})-([0-9a-fA-F]{12})$/.exec(s.trim());
         if (!m) return RPC_S_INVALID_STRING_UUID;
         const data1 = parseInt(m[1], 16) >>> 0;
@@ -178,6 +186,10 @@ export class Rpcrt4 implements IModule {
         mem[addr + 1] = (value >> 8) & 0xff;
         mem[addr + 2] = (value >> 16) & 0xff;
         mem[addr + 3] = (value >> 24) & 0xff;
+    }
+
+    private writeStatus(mem: Uint8Array, addr: number, value: number): void {
+        if (addr !== 0) this.writeU32(mem, addr, value);
     }
 
     private writeU16(mem: Uint8Array, addr: number, value: number): void {

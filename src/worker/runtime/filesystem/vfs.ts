@@ -58,7 +58,8 @@ export class VirtualFileSystem {
         sizeOf: (value) => value.byteLength,
     });
     private romWhiteouts: Set<string> = new Set();
-    private romLoadPromises: Map<string, Promise<Uint8Array>> = new Map();
+    private romLoadPromises: Map<string, { generation: number; promise: Promise<Uint8Array> }> = new Map();
+    private romGeneration = 0;
     /**
      * Un-evictable pin of small ROM files, consulted first by the sync read path.
      * Sync consumers (GetPrivateProfileString, msvcrt buffered fgetc) can't await,
@@ -103,6 +104,7 @@ export class VirtualFileSystem {
     }
 
     reset(): void {
+        this.romGeneration++;
         this.romArchive = null;
         this.romIndex.clear();
         this.romDirs.clear();
@@ -117,6 +119,7 @@ export class VirtualFileSystem {
     }
 
     mountRom(archive: ZipArchive, romPrefix: string, index: Map<string, ZipEntry>): void {
+        this.romGeneration++;
         this.romArchive = archive;
         this.romPrefix = romPrefix.replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+$/, "");
         
@@ -1360,11 +1363,17 @@ export class VirtualFileSystem {
 
             const pending = this.romLoadPromises.get(rel);
             if (pending) {
-                data = await pending;
+                data = await pending.promise;
             } else {
+                const generation = this.romGeneration;
                 const loadPromise = this.romArchive.readEntry(entry)
-                    .finally(() => this.romLoadPromises.delete(rel));
-                this.romLoadPromises.set(rel, loadPromise);
+                    .finally(() => {
+                        const current = this.romLoadPromises.get(rel);
+                        if (current?.generation === generation && current.promise === loadPromise) {
+                            this.romLoadPromises.delete(rel);
+                        }
+                    });
+                this.romLoadPromises.set(rel, { generation, promise: loadPromise });
                 data = await loadPromise;
             }
 
@@ -1396,22 +1405,33 @@ export class VirtualFileSystem {
      * Prefetch a single ROM entry into romCache with deduplication via romLoadPromises.
      * Skips files > MAX_CACHE_ENTRY_SIZE (served via range reads on demand).
      */
-    private async _prefetchEntry(rel: string, entry: ZipEntry): Promise<void> {
+    private async _prefetchEntry(rel: string, entry: ZipEntry, generation = this.romGeneration, signal?: AbortSignal): Promise<void> {
         const key = rel.toLowerCase();
+        if (signal?.aborted || generation !== this.romGeneration) return;
         if (this.romCache.has(key)) return;
         if (!this.romArchive) return;
 
         const existing = this.romLoadPromises.get(key);
-        if (existing) {
-            await existing;
+        if (existing && existing.generation === generation) {
+            await existing.promise;
             return;
         }
 
         const loadPromise = this.romArchive.readEntry(entry)
-            .then(data => { this.addRomCache(key, data); return data; })
-            .finally(() => this.romLoadPromises.delete(key));
+            .then(data => {
+                if (!signal?.aborted && generation === this.romGeneration) {
+                    this.addRomCache(key, data);
+                }
+                return data;
+            })
+            .finally(() => {
+                const current = this.romLoadPromises.get(key);
+                if (current?.generation === generation && current.promise === loadPromise) {
+                    this.romLoadPromises.delete(key);
+                }
+            });
 
-        this.romLoadPromises.set(key, loadPromise);
+        this.romLoadPromises.set(key, { generation, promise: loadPromise });
         await loadPromise;
     }
 
@@ -1427,20 +1447,23 @@ export class VirtualFileSystem {
         rels: string[],
         concurrency = 8,
         onProgress?: (processed: number, total: number) => void,
+        signal?: AbortSignal,
     ): Promise<number> {
         let prefetched = 0;
         let processed = 0;
         const total = rels.length;
         const queue = [...rels];
+        const generation = this.romGeneration;
         const workers = Array.from({ length: Math.min(concurrency, queue.length || 1) }, async () => {
             while (queue.length > 0) {
+                if (signal?.aborted || generation !== this.romGeneration) break;
                 const rel = queue.shift()!;
                 const key = rel.toLowerCase();
                 const entry = this.romIndex.get(key);
                 if (entry && !entry.isDirectory && entry.uncompressedSize <= this.MAX_CACHE_ENTRY_SIZE && !this.romCache.has(key)) {
                     try {
-                        await this._prefetchEntry(rel, entry);
-                        prefetched++;
+                        await this._prefetchEntry(rel, entry, generation, signal);
+                        if (!signal?.aborted && generation === this.romGeneration && this.romCache.has(key)) prefetched++;
                     } catch (_) { /* best-effort — range request issues are non-fatal */ }
                 }
                 onProgress?.(++processed, total);
@@ -1498,6 +1521,7 @@ export class VirtualFileSystem {
     }
 
     private async _runProgressivePrefetch(signal?: AbortSignal): Promise<void> {
+        const generation = this.romGeneration;
         // Sort by size ascending so small files fill cache quickly
         const entries = Array.from(this.romIndex.entries())
             .filter(([, e]) => !e.isDirectory && e.uncompressedSize <= this.MAX_CACHE_ENTRY_SIZE)
@@ -1506,10 +1530,10 @@ export class VirtualFileSystem {
         Logger.log(LogCategory.SYSTEM, `VFS: starting progressive prefetch of ${entries.length} files`);
 
         for (const [rel, entry] of entries) {
-            if (signal?.aborted) return;
+            if (signal?.aborted || generation !== this.romGeneration) return;
             if (this.romCache.has(rel)) continue;
             try {
-                await this._prefetchEntry(rel, entry);
+                await this._prefetchEntry(rel, entry, generation, signal);
             } catch (_) { /* best-effort */ }
             // Yield event loop so game I/O gets priority
             await new Promise<void>(r => setTimeout(r, 0));
