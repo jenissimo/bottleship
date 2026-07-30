@@ -29,6 +29,7 @@ import {
     d3d9PerfStateBlockApply, d3d9PerfStateBlockCapture,
     d3d9PerfStateBlockWasmApply, d3d9PerfStateBlockWasmCapture,
 } from "../../../modules/d3d9/d3d9-perf";
+import { addComRef, releaseComRef } from "../../../modules/d3d9/shared-state";
 import { isValidAddress } from "../../../core/memory/address-guard";
 import { Mem } from "../../../core/memory/mem-accessor";
 import { sanitizeViewport } from "../ddraw/types";
@@ -62,6 +63,8 @@ import {
     captureStateToEntries,
     refreshCapturedEntries,
     classifyStateBlockCoverage,
+    releaseStateBlockRefs,
+    retainStateBlockRefs,
     type D3D9StateBlockData,
     type StateBlockEntry,
 } from "./d3d9-state-block";
@@ -77,6 +80,8 @@ const D3DPT_LINESTRIP = 3;
 const D3DPT_TRIANGLELIST = 4;
 const D3DPT_TRIANGLESTRIP = 5;
 const D3DPT_TRIANGLEFAN = 6;
+const D3D_OK = 0;
+const D3DERR_INVALIDCALL = 0x8876086c;
 const D3DCULL_NONE = 1;
 const D3DCULL_CW = 2;
 const D3DCULL_CCW = 3;
@@ -236,7 +241,7 @@ export class D3D9Device {
     // Per-face 2D render views into cube RTs, cached by "index:face:level".
     private cubeFaceRenderViews: Map<string, GPUTextureView> = new Map();
     // Depth attachments for RT passes, cached by "WxH" (most RTs share the screen size).
-    private rtDepthCache: Map<string, GPUTextureView> = new Map();
+    private rtDepthCache: Map<string, { texture: GPUTexture; view: GPUTextureView }> = new Map();
     // [diag] dedup'd recent SetRenderTarget resolutions + RT texture creations (harness rtDebug verb).
     private rtResolveLog: string[] = [];
     private rtCreateLog: string[] = [];
@@ -310,18 +315,18 @@ export class D3D9Device {
     /** Depth attachment for an RT pass of the given size (cached; RTs typically share screen size). */
     private getRtDepthView(width: number, height: number): GPUTextureView {
         const key = `${width}x${height}`;
-        let view = this.rtDepthCache.get(key);
-        if (!view) {
+        let entry = this.rtDepthCache.get(key);
+        if (!entry) {
             const dev = this.backend.getDevice()!;
             const tex = dev.createTexture({
                 size: { width, height, depthOrArrayLayers: 1 },
                 format: "depth24plus",
                 usage: GPUTextureUsage.RENDER_ATTACHMENT,
             });
-            view = tex.createView();
-            this.rtDepthCache.set(key, view);
+            entry = { texture: tex, view: tex.createView() };
+            this.rtDepthCache.set(key, entry);
         }
-        return view;
+        return entry.view;
     }
 
     // Temporary lock records for mip levels > 0.
@@ -394,6 +399,7 @@ export class D3D9Device {
 
     private activeVertexShaderComPtr: number = 0;
     private activePixelShaderComPtr: number = 0;
+    private boundIndexPtr: number = 0;
 
     // Fixed-function state commonly touched by older D3D9 games
     private textureStageStates = new Map<number, number>();
@@ -419,6 +425,32 @@ export class D3D9Device {
     private boundTexturePtrs = new Array<number>(8).fill(0);
     private suppressStateBlockRecording = false;
     private viewport = { x: 0, y: 0, width: 800, height: 600, minZ: 0, maxZ: 1 };
+
+    private replaceHeldComRef(current: number, next: number): number {
+        const currentPtr = current >>> 0;
+        const nextPtr = next >>> 0;
+        if (currentPtr === nextPtr) return currentPtr;
+        if (nextPtr !== 0) addComRef(nextPtr);
+        if (currentPtr !== 0) releaseComRef(currentPtr);
+        return nextPtr;
+    }
+
+    releaseComBindings(): void {
+        this.activeVertexShaderComPtr = this.replaceHeldComRef(this.activeVertexShaderComPtr, 0);
+        this.activePixelShaderComPtr = this.replaceHeldComRef(this.activePixelShaderComPtr, 0);
+        this.activeVertexDeclComPtr = this.replaceHeldComRef(this.activeVertexDeclComPtr, 0);
+        this.boundIndexPtr = this.replaceHeldComRef(this.boundIndexPtr, 0);
+        for (let i = 0; i < this.streamBindingPtr.length; i++) {
+            this.streamBindingPtr[i] = this.replaceHeldComRef(this.streamBindingPtr[i]!, 0);
+        }
+        for (let i = 0; i < this.boundTexturePtrs.length; i++) {
+            this.boundTexturePtrs[i] = this.replaceHeldComRef(this.boundTexturePtrs[i]!, 0);
+        }
+        for (const entry of this.rtDepthCache.values()) {
+            entry.texture.destroy();
+        }
+        this.rtDepthCache.clear();
+    }
 
     constructor(backend: WebGPUBackend, memory: Uint8Array) {
         this.backend = backend;
@@ -587,7 +619,7 @@ export class D3D9Device {
             return 0;
         }
         this.activeVertexShader = handle;
-        this.activeVertexShaderComPtr = comPtr;
+        this.activeVertexShaderComPtr = this.replaceHeldComRef(this.activeVertexShaderComPtr, comPtr);
         this.currentPipelineKey = null; // invalidate pipeline cache
         this.currentPipelineId = null;
         Logger.verbose(LogCategory.D3D9, `[D3D9] SetVertexShader(${handle})`);
@@ -614,7 +646,7 @@ export class D3D9Device {
             return 0;
         }
         this.activePixelShader = handle;
-        this.activePixelShaderComPtr = comPtr;
+        this.activePixelShaderComPtr = this.replaceHeldComRef(this.activePixelShaderComPtr, comPtr);
         this.currentPipelineKey = null;
         this.currentPipelineId = null;
         Logger.verbose(LogCategory.D3D9, `[D3D9] SetPixelShader(${handle})`);
@@ -869,7 +901,7 @@ export class D3D9Device {
             this.currentPipelineKey = null;
             this.currentPipelineId = null;
         }
-        this.activeVertexDeclComPtr = comPtr;
+        this.activeVertexDeclComPtr = this.replaceHeldComRef(this.activeVertexDeclComPtr, comPtr);
         return 0;
     }
 
@@ -955,25 +987,25 @@ export class D3D9Device {
 
     setStreamSource(streamNumber: number, vbPtr: number, offset: number, stride: number): number {
         d3d9PerfInc("setStreamSource");
+        if (streamNumber < 0 || streamNumber >= D3D9Device.MAX_STREAMS) return D3DERR_INVALIDCALL;
+        const index = vbPtr === 0 ? null : this.vertexBuffers.getIndex(vbPtr);
+        if (vbPtr !== 0 && index === null) return D3DERR_INVALIDCALL;
         // Record the guest-visible binding for every stream — GetStreamSource must report
         // back exactly what was set even for streams the draw path below ignores.
-        if (streamNumber < D3D9Device.MAX_STREAMS) {
-            this.streamBindingPtr[streamNumber] = vbPtr >>> 0;
-            this.streamBindingOffset[streamNumber] = offset >>> 0;
-            this.streamBindingStride[streamNumber] = stride >>> 0;
-        }
+        this.streamBindingPtr[streamNumber] = this.replaceHeldComRef(this.streamBindingPtr[streamNumber]!, vbPtr);
+        this.streamBindingOffset[streamNumber] = offset >>> 0;
+        this.streamBindingStride[streamNumber] = stride >>> 0;
         // We only support stream 0 for now
-        if (streamNumber !== 0) return 0;
+        if (streamNumber !== 0) return D3D_OK;
 
-        const index = this.vertexBuffers.getIndex(vbPtr);
         if (index === null) {
             if (d3d9WasmArena.isInitialized()) d3d9WasmArena.setStreamSource(0, 0, 0);
             if (!this.stateTracker.clearStreamSource()) d3d9PerfSkip("setStreamSource");
-            return 0;
+            return D3D_OK;
         }
         if (d3d9WasmArena.isInitialized()) d3d9WasmArena.setStreamSource(index, offset, stride);
         if (!this.stateTracker.setStreamSource(index, offset, stride)) d3d9PerfSkip("setStreamSource");
-        return 0;
+        return D3D_OK;
     }
 
     /** Vertex buffer COM ptr / offset / stride last bound to a stream (all zero = unbound).
@@ -1114,20 +1146,19 @@ export class D3D9Device {
 
     setIndices(ibPtr: number): number {
         d3d9PerfInc("setIndices");
+        const index = ibPtr === 0 ? null : this.indexBuffers.getIndex(ibPtr);
+        if (ibPtr !== 0 && index === null) return D3DERR_INVALIDCALL;
+        this.boundIndexPtr = this.replaceHeldComRef(this.boundIndexPtr, ibPtr);
         if (ibPtr === 0) {
             if (d3d9WasmArena.isInitialized()) d3d9WasmArena.setIndices(0, 0);
             if (!this.stateTracker.setIndexSource(null)) d3d9PerfSkip("setIndices");
-            return 0;
+            return D3D_OK;
         }
-        const index = this.indexBuffers.getIndex(ibPtr);
-        if (index === null) {
-            if (d3d9WasmArena.isInitialized()) d3d9WasmArena.setIndices(0, 0);
-            if (!this.stateTracker.setIndexSource(null)) d3d9PerfSkip("setIndices");
-            return 0;
-        }
-        if (d3d9WasmArena.isInitialized()) d3d9WasmArena.setIndices(index, this.indexBuffers.getFormat(index));
-        if (!this.stateTracker.setIndexSource(index)) d3d9PerfSkip("setIndices");
-        return 0;
+        const validIndex = index;
+        if (validIndex === null) return D3DERR_INVALIDCALL;
+        if (d3d9WasmArena.isInitialized()) d3d9WasmArena.setIndices(validIndex, this.indexBuffers.getFormat(validIndex));
+        if (!this.stateTracker.setIndexSource(validIndex)) d3d9PerfSkip("setIndices");
+        return D3D_OK;
     }
 
     setPaletteEntries(paletteNumber: number, pEntries: number, mem: Uint8Array): void {
@@ -1537,29 +1568,32 @@ export class D3D9Device {
 
     setTexture(stage: number, texPtr: number): number {
         d3d9PerfInc("setTexture");
-        if (stage < 0 || stage >= PROG_BIND.MAX_TEX) return 0;
+        if (stage < 0 || stage >= PROG_BIND.MAX_TEX) return D3DERR_INVALIDCALL;
+        const index = texPtr === 0 ? null : this.textures.getIndex(texPtr);
+        if (texPtr !== 0 && index === null) return D3DERR_INVALIDCALL;
         if (this.recordingStateBlock) {
             this.recordStateBlock({ op: "texture", stage, texPtr });
-            return 0;
+            return D3D_OK;
         }
         if (stage < this.boundTexturePtrs.length) {
-            this.boundTexturePtrs[stage] = texPtr;
+            this.boundTexturePtrs[stage] = this.replaceHeldComRef(this.boundTexturePtrs[stage]!, texPtr);
         }
         if (texPtr === 0) {
             if (d3d9WasmArena.isInitialized()) d3d9WasmArena.setTexture(stage, 0);
             if (!this.stateTracker.setTexture(stage, null)) {
                 d3d9PerfSkip("setTexture");
-                return 0;
+                return D3D_OK;
             }
-            return 0;
+            return D3D_OK;
         }
-        const index = this.textures.getIndex(texPtr);
         // `index` is the SAME internal numeric id used everywhere else in this store (not
         // the raw guest COM pointer) — exactly what the arena's textureId expects.
-        if (d3d9WasmArena.isInitialized()) d3d9WasmArena.setTexture(stage, index ?? 0);
-        if (!this.stateTracker.setTexture(stage, index)) {
+        const validIndex = index;
+        if (validIndex === null) return D3DERR_INVALIDCALL;
+        if (d3d9WasmArena.isInitialized()) d3d9WasmArena.setTexture(stage, validIndex);
+        if (!this.stateTracker.setTexture(stage, validIndex)) {
             d3d9PerfSkip("setTexture");
-            return 0;
+            return D3D_OK;
         }
 
         // Update frame snapshot counter
@@ -1567,7 +1601,7 @@ export class D3D9Device {
             this.frameSnapshot.frameCounters.textureBinds++;
         }
 
-        return 0;
+        return D3D_OK;
     }
 
     /**
@@ -4045,6 +4079,7 @@ export class D3D9Device {
 
     captureStateBlockData(data: D3D9StateBlockData): number {
         d3d9PerfStateBlockCapture(data.coverable === true);
+        releaseStateBlockRefs(data);
         if (data.wasmSlot !== undefined) {
             // Bulk values refresh in WASM (memcpy from the live mirror —
             // refresh-only semantics, the recorded set is the slot's masks/ranges);
@@ -4054,6 +4089,7 @@ export class D3D9Device {
             if (data.handleEntries && data.handleEntries.length > 0) {
                 refreshCapturedEntries(this, data.handleEntries);
             }
+            retainStateBlockRefs(data);
             return 0;
         }
         if (data.entries.length > 0) {
@@ -4062,7 +4098,8 @@ export class D3D9Device {
             data.entries = captureStateToEntries(this, data.blockType);
             data.coverable = classifyStateBlockCoverage(data.entries).coverable;
         }
-        return 0;
+        retainStateBlockRefs(data);
+        return D3D_OK;
     }
 
     getBoundTexturePtr(stage: number): number {

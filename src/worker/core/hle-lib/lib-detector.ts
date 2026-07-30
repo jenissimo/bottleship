@@ -550,7 +550,7 @@ export function runDetector(descriptor: LibDescriptor, module: LoadedPEModule): 
         for (const m of extras) {
             if (already.has(m.name)) continue;
             if (!descriptor.functions[m.name]) {
-                Logger.warn(LogCategory.SYSTEM, 
+                Logger.warn(LogCategory.SYSTEM,
                     `[HLE-lib] ${descriptor.id}: resolver produced '${m.name}' but it is not declared in functions{}`,
                 );
                 continue;

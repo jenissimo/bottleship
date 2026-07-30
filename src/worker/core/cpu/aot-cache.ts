@@ -1,5 +1,5 @@
 /**
- * AOT unit cache — stage 1 of the MS-A track (`plan/experiments/ms-aot-design.md` §4–§5).
+ * AOT unit cache — stage 1 of the MS-A track.
  *
  * The point of stage 1 is NOT a better compiler. It is the CONTRACT: can a wasm module that
  * did not come out of the live compile path be published into JitState, entered by the
@@ -252,7 +252,10 @@ export class AotCache {
     }
 
     getUnits(): AotUnit[] { return this.units; }
-    clear(): void { this.units = []; }
+    clear(): void {
+        this.units = [];
+        this.live = [];
+    }
 
     /** SHA-256 of the engine binary. Fetched once — the browser already has it cached, and
      *  this only ever runs on a save/load, never on a hot path. */
@@ -331,6 +334,7 @@ export class AotCache {
     /** Load units persisted by an EARLIER SESSION. Version mismatch is not an error — it is
      *  the design working: the directory for this engine simply does not exist yet. */
     async load(gameId: string): Promise<{ loaded: number; key: string } | { error: string; key?: string }> {
+        this.clear();
         const container = await getContainerDir(gameId, false);
         if (!container) return { error: "no container" };
         const key = await this.versionKey();
@@ -344,7 +348,6 @@ export class AotCache {
                 loaded.push({ entryPage: u.entryPage, tableIndex: u.tableIndex, pages: u.pages, bytes });
             }
             this.units = loaded;
-            this.live = [];
             Logger.log(LogCategory.SYSTEM, `[AOT] loaded ${loaded.length} units from aot/${key}`);
             return { loaded: loaded.length, key };
         } catch {

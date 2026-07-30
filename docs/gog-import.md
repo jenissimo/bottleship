@@ -29,9 +29,6 @@ bun tools/gog-to-wgb.ts setup_game.exe game.wgb
 bun tools/gog-to-wgb.ts --native setup_game.exe game.wgb
 bun tools/gog-to-wgb.ts --native --extract-only setup_game.exe ./out-dir
 
-# Compare native vs innoextract (set fixture path)
-set BOTTLESHIP_INNO_FIXTURE=C:\path\to\setup.exe
-bun tools/internal/test-inno-vs-innoextract.ts
 ```
 
 Per-game emulator settings can be curated in `public/gog-overrides.json` (keyed by GOG product id from `goggame-*.info`).

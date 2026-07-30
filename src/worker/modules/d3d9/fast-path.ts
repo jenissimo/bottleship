@@ -103,24 +103,24 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
     dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetTexture', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
         const esp = cpu.reg32[4];
         const device = devices.get(view.getUint32(esp + 4, true));
-        if (device) device.setTexture(view.getUint32(esp + 8, true), view.getUint32(esp + 12, true));
-        return D3D_OK;
+        if (!device) return D3DERR_INVALIDCALL;
+        return device.setTexture(view.getUint32(esp + 8, true), view.getUint32(esp + 12, true));
     }, { trivial: true });
 
     // IDirect3DDevice9_SetStreamSource(thisPtr, StreamNumber, pStreamData, OffsetInBytes, Stride)
     dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetStreamSource', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
         const esp = cpu.reg32[4];
         const device = devices.get(view.getUint32(esp + 4, true));
-        if (device) device.setStreamSource(view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 16, true), view.getUint32(esp + 20, true));
-        return D3D_OK;
+        if (!device) return D3DERR_INVALIDCALL;
+        return device.setStreamSource(view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 16, true), view.getUint32(esp + 20, true));
     }, { trivial: true });
 
     // IDirect3DDevice9_SetIndices(thisPtr, pIndexData)
     dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetIndices', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
         const esp = cpu.reg32[4];
         const device = devices.get(view.getUint32(esp + 4, true));
-        if (device) device.setIndices(view.getUint32(esp + 8, true));
-        return D3D_OK;
+        if (!device) return D3DERR_INVALIDCALL;
+        return device.setIndices(view.getUint32(esp + 8, true));
     }, { trivial: true });
 
     // IDirect3DDevice9_SetVertexShader(thisPtr, pShader) — resolve COM ptr → internal handle.
@@ -299,17 +299,7 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
         return device.captureStateBlockData(block);
     }, { trivial: true });
 
-    // Resource AddRef/Release — our COM objects are never reference-freed (dummy
-    // refcounts: AddRef→2, Release→1). Hot in the per-frame texture/surface churn
-    // (NFSU: ~94K Texture AddRef + ~94K Release / interval). Trivial constant returns.
-    const addRefFn = () => 2;
-    const releaseFn = () => 1;
-    for (const prefix of ['IDirect3DTexture9', 'IDirect3DCubeTexture9', 'IDirect3DSurface9', 'IDirect3DVertexBuffer9', 'IDirect3DIndexBuffer9']) {
-        dispatcher.registerFastPath('d3d9', `${prefix}_AddRef`, addRefFn, { trivial: true });
-        dispatcher.registerFastPath('d3d9', `${prefix}_Release`, releaseFn, { trivial: true });
-    }
-
-    Logger.log(LogCategory.D3D9, 'Registered FastPath for hot D3D9 state setters, shader constants, draw calls, and resource AddRef/Release');
+    Logger.log(LogCategory.D3D9, 'Registered FastPath for hot D3D9 state setters, shader constants, and draw calls');
 
     // ========================================================================
     // Tier-0 Write-Buffer registrations (the no-trap hot path).
@@ -365,27 +355,6 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
         (_mem8: Uint8Array, mem32: Uint32Array, ptr: number) => {
             const device = devices.get(mem32[ptr >> 2]);
             if (device) device.setFVF(mem32[(ptr + 4) >> 2]);
-        }, true, 0x1);
-
-    // SetTexture (3 args)
-    dispatcher.registerWriteBufferFunction('d3d9', 'IDirect3DDevice9_SetTexture', 3,
-        (_mem8: Uint8Array, mem32: Uint32Array, ptr: number) => {
-            const device = devices.get(mem32[ptr >> 2]);
-            if (device) device.setTexture(mem32[(ptr + 4) >> 2], mem32[(ptr + 8) >> 2]);
-        }, true, 0x3);
-
-    // SetStreamSource (5 args)
-    dispatcher.registerWriteBufferFunction('d3d9', 'IDirect3DDevice9_SetStreamSource', 5,
-        (_mem8: Uint8Array, mem32: Uint32Array, ptr: number) => {
-            const device = devices.get(mem32[ptr >> 2]);
-            if (device) device.setStreamSource(mem32[(ptr + 4) >> 2], mem32[(ptr + 8) >> 2], mem32[(ptr + 12) >> 2], mem32[(ptr + 16) >> 2]);
-        }, true, 0x3);
-
-    // SetIndices (2 args)
-    dispatcher.registerWriteBufferFunction('d3d9', 'IDirect3DDevice9_SetIndices', 2,
-        (_mem8: Uint8Array, mem32: Uint32Array, ptr: number) => {
-            const device = devices.get(mem32[ptr >> 2]);
-            if (device) device.setIndices(mem32[(ptr + 4) >> 2]);
         }, true, 0x1);
 
     // SetVertexShader (2 args) — resolve COM ptr → internal handle at drain.
@@ -577,18 +546,6 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
                 if (device) device.drawPrimitiveUP(
                     mem32[(ptr + 4) >> 2], mem32[(ptr + 8) >> 2], ptr + 20, mem32[(ptr + 12) >> 2]);
             });
-    }
-
-    // ── COM AddRef/Release → zero-crossing constant-return stubs ─────────────
-    // Our COM resources are never reference-freed (dummy refcounts, see the FastPath
-    // block above, which stays as a safety net). Patch the stub itself to
-    // `mov eax, N; ret 4` — no trap, no ring, no JS. Kill-switch: __noComRefStubs.
-    if (typeof dispatcher.registerConstantReturnStub === 'function'
-        && !(globalThis as any).__noComRefStubs) {
-        for (const prefix of ['IDirect3DTexture9', 'IDirect3DCubeTexture9', 'IDirect3DSurface9', 'IDirect3DVertexBuffer9', 'IDirect3DIndexBuffer9']) {
-            dispatcher.registerConstantReturnStub('d3d9', `${prefix}_AddRef`, 2, 4);
-            dispatcher.registerConstantReturnStub('d3d9', `${prefix}_Release`, 1, 4);
-        }
     }
 
     // Shader constants — WBUF with inline capture-at-call (dedicated trampoline).

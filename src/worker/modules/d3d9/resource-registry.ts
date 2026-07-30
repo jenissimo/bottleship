@@ -4,7 +4,7 @@
 
 import { Mem } from '../../core/memory/mem-accessor';
 import { Logger, LogCategory } from '../../core/logger';
-import { devices, getVTables, createComObject, resourceToDevice } from './shared-state';
+import { devices, getVTables, createComObject, forgetComObject, registerComFinalizer, releaseComRef, resourceToDevice } from './shared-state';
 import { D3D9Device } from '../../backends/webgpu/d3d9/d3d9-device';
 import { initReturnPtr, D3DFMT_UNKNOWN, normalizePalettizedTexturePool } from '../../backends/webgpu/shared/dx-com-helpers';
 import { isDxExclusiveFormat } from '../../backends/webgpu/shared/dx-format-support';
@@ -51,8 +51,8 @@ export const vertexBufferMeta: Map<number, BufferMeta> = new Map();
 export const indexBufferMeta: Map<number, BufferMeta> = new Map();
 /** Per-device bound depth/stencil surface COM pointer (0 = none). */
 export const deviceBoundDepthStencil: Map<number, number> = new Map();
-/** Per-device bound render-target-0 surface COM pointer (0/absent = implicit backbuffer). */
-export const deviceBoundRenderTarget: Map<number, number> = new Map();
+/** Per-device bound render-target surface COM pointers by render-target index. */
+export const deviceBoundRenderTarget: Map<number, Map<number, number>> = new Map();
 /** 2D texture COM ptr -> mip level -> stable IDirect3DSurface9 COM ptr. */
 export const textureLevelSurfaces: Map<number, Map<number, number>> = new Map();
 /** Cube texture COM ptr -> `${face}_${level}` -> stable IDirect3DSurface9 COM ptr. */
@@ -64,23 +64,71 @@ const D3DFMT_A8R8G8B8 = 21;
 const D3DRTYPE_SURFACE = 1;
 const D3DMULTISAMPLE_NONE = 0;
 
+export function releaseSurfaceMetadata(surfacePtr: number): void {
+    const pSurf = surfacePtr >>> 0;
+    for (const [devicePtr, surfPtr] of deviceBoundDepthStencil) {
+        if ((surfPtr >>> 0) === pSurf) deviceBoundDepthStencil.delete(devicePtr);
+    }
+    for (const [devicePtr, targets] of deviceBoundRenderTarget) {
+        for (const [index, surfPtr] of targets) {
+            if ((surfPtr >>> 0) === pSurf) targets.delete(index);
+        }
+        if (targets.size === 0) deviceBoundRenderTarget.delete(devicePtr);
+    }
+    surfaceMeta.delete(pSurf);
+    resourceToDevice.delete(pSurf);
+    forgetComObject(pSurf);
+}
+
+export function getDeviceRenderTarget(devicePtr: number, index: number): number {
+    return deviceBoundRenderTarget.get(devicePtr >>> 0)?.get(index >>> 0) ?? 0;
+}
+
+export function setDeviceRenderTarget(devicePtr: number, index: number, surfacePtr: number): void {
+    const pDevice = devicePtr >>> 0;
+    const slot = index >>> 0;
+    const pSurf = surfacePtr >>> 0;
+    let targets = deviceBoundRenderTarget.get(pDevice);
+    if (pSurf === 0) {
+        targets?.delete(slot);
+        if (targets && targets.size === 0) deviceBoundRenderTarget.delete(pDevice);
+        return;
+    }
+    if (!targets) {
+        targets = new Map();
+        deviceBoundRenderTarget.set(pDevice, targets);
+    }
+    targets.set(slot, pSurf);
+}
+
+export function getDeviceRenderTargets(devicePtr: number): number[] {
+    return [...(deviceBoundRenderTarget.get(devicePtr >>> 0)?.values() ?? [])];
+}
+
+export function clearDeviceRenderTargets(devicePtr: number): void {
+    deviceBoundRenderTarget.delete(devicePtr >>> 0);
+}
+
 export function clearTextureSubresourceSurfaces(texturePtr: number): void {
     const pTex = texturePtr >>> 0;
     const levels = textureLevelSurfaces.get(pTex);
     if (levels) {
         for (const surfPtr of levels.values()) {
-            surfaceMeta.delete(surfPtr);
-            resourceToDevice.delete(surfPtr);
+            releaseSurfaceMetadata(surfPtr);
         }
         textureLevelSurfaces.delete(pTex);
     }
     const faces = cubeFaceSurfaces.get(pTex);
     if (faces) {
         for (const surfPtr of faces.values()) {
-            surfaceMeta.delete(surfPtr);
-            resourceToDevice.delete(surfPtr);
+            releaseSurfaceMetadata(surfPtr);
         }
         cubeFaceSurfaces.delete(pTex);
+    }
+    for (const [surfPtr, meta] of surfaceMeta) {
+        if ((meta.texturePtr ?? 0) === pTex) {
+            releaseSurfaceMetadata(surfPtr);
+        }
     }
 }
 
@@ -279,11 +327,15 @@ export function createGuestTexture(
         pool: normalizedPool,
         format: fmt,
     });
+    registerComFinalizer(texPtr, () => {
+        clearTextureSubresourceSurfaces(texPtr);
+        device.releaseTexture(texPtr);
+        textureMeta.delete(texPtr);
+        resourceToDevice.delete(texPtr);
+    });
 
     if (!precreateTextureLevelSurfaces(texPtr, maxLevels)) {
-        clearTextureSubresourceSurfaces(texPtr);
-        resourceToDevice.delete(texPtr);
-        textureMeta.delete(texPtr);
+        releaseComRef(texPtr);
         if (ppTexture) initReturnPtr(ppTexture);
         return D3DERR_INVALIDCALL;
     }

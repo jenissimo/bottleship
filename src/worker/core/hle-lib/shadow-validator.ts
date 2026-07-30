@@ -283,7 +283,7 @@ export class ShadowHookRuntime {
         this.cleanCalls++;
         if (this.cleanCalls >= this.targetCalls && this.state === 'shadowing') {
             this.state = 'active';
-            Logger.log(LogCategory.SYSTEM, 
+            Logger.log(LogCategory.SYSTEM,
                 `[HLE-shadow] ${this.libId}:${this.functionName} VALIDATED — ` +
                 `${this.cleanCalls} clean calls, kernel goes live`);
             this.onValidated?.();
@@ -294,7 +294,7 @@ export class ShadowHookRuntime {
         this.mismatches++;
         this.lastMismatch = `${m.kind}: ${m.detail}`;
         this.state = 'disabled';
-        Logger.error(LogCategory.SYSTEM, 
+        Logger.error(LogCategory.SYSTEM,
             `[HLE-shadow] ${this.libId}:${this.functionName} MISMATCH on call ` +
             `${this.cleanCalls + 1} — ${this.lastMismatch}. Hook permanently disabled; ` +
             `guest code takes over.`);

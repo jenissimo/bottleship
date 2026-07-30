@@ -71,7 +71,7 @@ Legacy Graphics (DirectDraw, D3D3-9). You bridge x86 Windows internals with mode
     map (linear == physical); if paging ever stops being identity, every call site becomes wrong.
   - #PF / MemWriteTrap catch GUEST illegal writes and are diagnostic. They cannot see a JS write —
     there is no host mechanism that can (no MMU, and the one trapping Proxy we had cost ~50x).
-    Do not design as if there were. Rationale and migration: plan/guest-code-coherence.md.
+    Do not design as if there were.
   - guest-code.ts is the SINGLE OWNER of cpu["jit_dirty_cache"] — never call it directly;
     validate-guest-code-writes.ts (gate step 4) enforces that ownership, which is what stops the
     chokepoint eroding back into scattered copies. It checks ownership, not coverage: deciding
