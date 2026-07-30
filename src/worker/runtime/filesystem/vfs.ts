@@ -28,16 +28,34 @@ export interface VfsFileHandle {
     buffer?: Uint8Array;
     /** File offset of buffer[0] */
     bufferOffset?: number;
+    /** Epoch `buffer` was filled under — see VirtualFileSystem.windowEpoch. */
+    bufferEpoch?: number;
     /** In-flight prefetch for next sequential chunk */
     prefetchPromise?: Promise<Uint8Array> | null;
     /** File offset where prefetched chunk starts */
     prefetchOffset?: number;
+    /** Epoch the in-flight prefetch was issued under. */
+    prefetchEpoch?: number;
+    /** Serialises async reads on this handle — see `read()`. */
+    io?: Promise<unknown>;
 }
 
 export interface VfsFindHandle {
     kind: "find";
     entries: VfsEntry[];
     index: number;
+}
+
+// Guest I/O trace, opt-in via __vfsTrace. Records (path,pos,len) for every read the
+// guest makes through any API, so "which path does this file go through" is answerable
+// without guessing which of kernel32/CRT the title happens to use.
+const vfsTraceRecords: string[] = [];
+(globalThis as { getVfsTrace?: () => string[] }).getVfsTrace = () => vfsTraceRecords.slice();
+function vfsTrace(path: string, pos: number, len: number): void {
+    if ((globalThis as { __vfsTrace?: unknown }).__vfsTrace !== true) return;
+    if (vfsTraceRecords.length >= 20000) return;
+    const tid = (globalThis as { __curTid?: () => number }).__curTid?.() ?? -1;
+    vfsTraceRecords.push(`${path}|${pos}|${len}|T${tid}`);
 }
 
 export class VirtualFileSystem {
@@ -82,6 +100,20 @@ export class VirtualFileSystem {
     private static readonly PREFETCH_TRIGGER_REMAINING = 256 * 1024;
     /** Align ROM/OPFS range reads to 4KB pages for steadier I/O behavior */
     private static readonly IO_ALIGN = 4096;
+
+    /**
+     * Bumped whenever a file is truncated, deleted or re-created. Read windows live on
+     * the HANDLES, which the VFS does not own or track — a path-keyed truncate therefore
+     * has no way to reach the window another open cursor is holding, and that window can
+     * cover bytes that no longer exist. Stamping every window with the epoch and
+     * rejecting a stale stamp is the reach, at the cost of one integer compare per read.
+     *
+     * Deliberately global rather than per-path: truncation is rare, the hot path is not,
+     * and a per-path lookup would cost a key normalization on every buffered read.
+     */
+    private windowEpoch = 0;
+    /** Rate limit for the stale-window tripwire (see reportStaleWindow). */
+    private staleWindowReports = 0;
 
     currentDir = "C:\\";
     /** When set, D:\ (the CD-ROM drive) is redirected to this guest path. See manifest emulator.cdPath. */
@@ -309,14 +341,14 @@ export class VirtualFileSystem {
                 return null;
             }
             this.clearRomWhiteout(full);
-            this.overlay.prepareCreateSync(full);
+            this.resetOverlayFileSync(full);
             Logger.verbose(LogCategory.SYSTEM, `VFS: openSync("${path}") -> CREATE_NEW overlay`);
             return { kind: "file" as const, path: full, position: 0, access, source: "overlay" };
         }
 
         if (createDisposition === 2) {
             this.clearRomWhiteout(full);
-            this.overlay.prepareCreateSync(full);
+            this.resetOverlayFileSync(full);
             // Truncation over a ROM file must mask it (empty read, overlay size). See shadowed set.
             if (existsInRom) this.overlay.markShadowed(full);
             Logger.verbose(LogCategory.SYSTEM, `VFS: openSync("${path}") -> CREATE_ALWAYS overlay`);
@@ -326,7 +358,7 @@ export class VirtualFileSystem {
         if (createDisposition === 4) {
             if (!hasOverlay && !existsInRom) {
                 this.clearRomWhiteout(full);
-                this.overlay.prepareCreateSync(full);
+                this.resetOverlayFileSync(full);
             }
             const source = hasOverlay ? "overlay" : (existsInRom ? "rom" : "overlay");
             const resolvedPath = source === "overlay"
@@ -342,13 +374,28 @@ export class VirtualFileSystem {
                 return null;
             }
             this.clearRomWhiteout(full);
-            this.overlay.prepareCreateSync(full);
+            this.resetOverlayFileSync(full);
             if (existsInRom) this.overlay.markShadowed(full);
             Logger.verbose(LogCategory.SYSTEM, `VFS: openSync("${path}") -> TRUNCATE_EXISTING overlay`);
             return { kind: "file" as const, path: full, position: 0, access, source: "overlay" };
         }
 
         return null;
+    }
+
+    /**
+     * The two content-reset chokepoints (create-fresh / truncate-to-zero). Both bump the
+     * window epoch: any read window another open handle holds on this path now describes
+     * a file that no longer exists, and the VFS cannot reach those handles directly.
+     */
+    private resetOverlayFileSync(full: string): void {
+        this.bumpWindowEpoch();
+        this.overlay!.prepareCreateSync(full);
+    }
+
+    private async resetOverlayFile(overlay: OpfsOverlay, full: string): Promise<void> {
+        this.bumpWindowEpoch();
+        await overlay.truncateFile(full);
     }
 
     /** Parent directory must exist before CreateFile (Windows does not mkdir implicitly). */
@@ -509,7 +556,7 @@ export class VirtualFileSystem {
                 }
                 Logger.verbose(LogCategory.SYSTEM, `VFS: open("${path}") CREATE_ALWAYS: calling truncateFile`);
                 this.clearRomWhiteout(full);
-                await overlay.truncateFile(full);
+                await this.resetOverlayFile(overlay, full);
                 if (existsInRom) overlay.markShadowed(full);
                 Logger.verbose(LogCategory.SYSTEM, `VFS: open("${path}") CREATE_ALWAYS: truncateFile completed`);
                 return { kind: "file", path: full, position: 0, access, source: "overlay" };
@@ -548,7 +595,7 @@ export class VirtualFileSystem {
                 if (!existsInOverlay && !existsInRom) {
                     Logger.verbose(LogCategory.SYSTEM, `VFS: open("${path}") OPEN_ALWAYS: file doesn't exist, creating via truncateFile`);
                     this.clearRomWhiteout(full);
-                    await overlay.truncateFile(full);
+                    await this.resetOverlayFile(overlay, full);
                     Logger.verbose(LogCategory.SYSTEM, `VFS: open("${path}") OPEN_ALWAYS: truncateFile completed`);
                 } else {
                     Logger.verbose(LogCategory.SYSTEM, `VFS: open("${path}") OPEN_ALWAYS: file exists, opening without truncate`);
@@ -573,7 +620,7 @@ export class VirtualFileSystem {
                 }
                 Logger.verbose(LogCategory.SYSTEM, `VFS: open("${path}") TRUNCATE_EXISTING: calling truncateFile`);
                 this.clearRomWhiteout(full);
-                await overlay.truncateFile(full);
+                await this.resetOverlayFile(overlay, full);
                 if (existsInRom) overlay.markShadowed(full);
                 Logger.verbose(LogCategory.SYSTEM, `VFS: open("${path}") TRUNCATE_EXISTING: truncateFile completed`);
                 return { kind: "file", path: full, position: 0, access, source: "overlay" };
@@ -585,7 +632,7 @@ export class VirtualFileSystem {
             if (source === "overlay" && overlay && !existsInOverlay) {
                 Logger.verbose(LogCategory.SYSTEM, `VFS: open("${path}") default case: creating file via truncateFile`);
                 this.clearRomWhiteout(full);
-                await overlay.truncateFile(full);
+                await this.resetOverlayFile(overlay, full);
             }
             Logger.verbose(LogCategory.SYSTEM, `VFS: open("${path}") default case: returning handle, source=${source}`);
             const resolvedPath = source === "overlay"
@@ -616,9 +663,8 @@ export class VirtualFileSystem {
                 const end = Math.min(cached.byteLength, offset + length);
                 if (offset >= cached.byteLength) return new Uint8Array();
                 const data = cached.subarray(offset, end);
-                handle.position += data.length;
-                handle.buffer = cached;
-                handle.bufferOffset = 0;
+                this.advanceCursor(handle, data.length);
+                this.installWindow(handle, cached, 0, this.windowEpoch);
                 return data;
             }
 
@@ -627,7 +673,7 @@ export class VirtualFileSystem {
             if (entry && this.romArchive && entry.compression === 0) {
                 const data = this.romArchive.readEntryRangeSync(entry, handle.position, length);
                 if (data) {
-                    handle.position += data.length;
+                    this.advanceCursor(handle, data.length);
                     return data;
                 }
             }
@@ -637,18 +683,30 @@ export class VirtualFileSystem {
         if (handle.source === "overlay" && this.overlay) {
             const merged = this.readOverlayRomUnderlaySync(handle.path, handle.position, length);
             if (merged !== null) {
-                handle.position += merged.length;
+                this.advanceCursor(handle, merged.length);
                 return merged;
             }
             const data = this.overlay.readFileSyncVia(handle.path, handle.position, length);
             if (data !== null) {
-                handle.position += data.length;
+                this.advanceCursor(handle, data.length);
                 return data;
             }
         }
         return null;
     }
 
+    /**
+     * A handle's cursor, window and prefetch are shared mutable state, and the async
+     * path below yields twice while holding a pre-await snapshot of the position. Two
+     * guest threads on ONE handle (a loader on the level assets, an audio thread
+     * streaming music out of the same archive) then double-advance the cursor and every
+     * later read is served from further ahead — silently, at full length.
+     *
+     * NT makes this impossible: a synchronous file object serialises its I/O on the
+     * file-object lock and updates CurrentByteOffset under it. Reproduce that. The SYNC
+     * fast path stays outside the queue — it completes in one JS turn, so it cannot
+     * interleave, and serialising it would cost without buying anything.
+     */
     async read(handle: VfsFileHandle, length: number): Promise<Uint8Array> {
         if (length <= 0) {
             return new Uint8Array();
@@ -661,25 +719,50 @@ export class VirtualFileSystem {
             return sync;
         }
 
+        const prior = handle.io ?? Promise.resolve();
+        const mine = prior.then(() => this.readLocked(handle, length), () => this.readLocked(handle, length));
+        handle.io = mine.catch(() => undefined);
+        return mine;
+    }
+
+    private async readLocked(handle: VfsFileHandle, length: number): Promise<Uint8Array> {
+        // Re-check the window: a read that queued behind another one may now be a hit.
+        const sync = this.readSync(handle, length);
+        if (sync) return sync;
+
         try {
-            const offset = handle.position;
+            let offset = handle.position;
 
             if (handle.prefetchPromise && handle.prefetchOffset !== undefined && offset >= handle.prefetchOffset) {
-                const prefetched = await handle.prefetchPromise;
+                // The bytes come from the promise we had BEFORE the await; its offset must
+                // come from the same instant. Anything that ran during the yield may have
+                // invalidated the window and scheduled a different prefetch — installing
+                // these bytes under that one's offset makes the window lie, and a lying
+                // window is served silently at full length by readFromHandleBuffer.
+                const pending = handle.prefetchPromise;
                 const prefetchOffset = handle.prefetchOffset;
-                handle.prefetchPromise = null;
-                handle.prefetchOffset = undefined;
-                handle.buffer = prefetched;
-                handle.bufferOffset = prefetchOffset;
+                const prefetchEpoch = handle.prefetchEpoch ?? this.windowEpoch;
+                const prefetched = await pending;
+                if (handle.prefetchPromise === pending) {
+                    handle.prefetchPromise = null;
+                    handle.prefetchOffset = undefined;
+                    handle.prefetchEpoch = undefined;
+                    // A truncate during the fetch makes these bytes stale; installWindow
+                    // refuses them and the read falls through to a fresh fetchRange below.
+                    const installed = this.installWindow(handle, prefetched, prefetchOffset, prefetchEpoch);
 
-                const buffered = this.readFromHandleBuffer(handle, length);
-                if (buffered !== null) {
-                    this.maybeSchedulePrefetch(handle);
-                    Logger.verbose(LogCategory.SYSTEM, `VFS: read("${handle.path}") completed from prefetched window, read ${buffered.length} bytes, new position=${handle.position}`);
-                    return buffered;
+                    const buffered = installed ? this.readFromHandleBuffer(handle, length) : null;
+                    if (buffered !== null) {
+                        this.maybeSchedulePrefetch(handle);
+                        Logger.verbose(LogCategory.SYSTEM, `VFS: read("${handle.path}") completed from prefetched window, read ${buffered.length} bytes, new position=${handle.position}`);
+                        return buffered;
+                    }
                 }
             }
 
+            // Re-read the cursor: the prefetch await above is a yield point, and the sync
+            // read path is deliberately not serialised, so it may have moved.
+            offset = handle.position;
             const fileSize = this.getFileSize(handle.path);
             const remaining = Math.max(0, fileSize - offset);
             if (remaining === 0) {
@@ -692,12 +775,12 @@ export class VirtualFileSystem {
             const readSize = isWholeTailRead
                 ? remaining
                 : Math.max(length, VirtualFileSystem.PREFETCH_CHUNK_SIZE);
+            const readEpoch = this.windowEpoch;
             const dataWindow = await this.fetchRange(handle, offset, readSize);
-            handle.buffer = dataWindow;
-            handle.bufferOffset = offset;
+            this.installWindow(handle, dataWindow, offset, readEpoch);
 
             const data = dataWindow.subarray(0, Math.min(length, dataWindow.byteLength));
-            handle.position += data.length;
+            this.advanceCursor(handle, data.length);
             this.maybeSchedulePrefetch(handle);
 
             Logger.verbose(
@@ -715,6 +798,9 @@ export class VirtualFileSystem {
      * Synchronous read-into for fast-path (cached ROM): writes into target, returns bytes read or null if async needed.
      */
     readIntoSync(handle: VfsFileHandle, target: Uint8Array, targetOffset: number, length: number): number | null {
+        // Every file API the guest can use — kernel32 ReadFile and the CRT's fread alike —
+        // funnels through here, so this is the only place that sees ALL of a guest's I/O.
+        vfsTrace(handle.path, handle.position, length);
         // Check handle buffer first (works for both ROM and overlay)
         const buffered = this.readFromHandleBuffer(handle, length);
         if (buffered !== null) {
@@ -732,9 +818,8 @@ export class VirtualFileSystem {
                 if (offset >= cached.byteLength) return 0;
                 const toCopy = end - offset;
                 target.set(cached.subarray(offset, end), targetOffset);
-                handle.position += toCopy;
-                handle.buffer = cached;
-                handle.bufferOffset = 0;
+                this.advanceCursor(handle, toCopy);
+                this.installWindow(handle, cached, 0, this.windowEpoch);
                 return toCopy;
             }
 
@@ -743,7 +828,7 @@ export class VirtualFileSystem {
                 const data = this.romArchive.readEntryRangeSync(entry, handle.position, length);
                 if (data && data.length > 0) {
                     target.set(data, targetOffset);
-                    handle.position += data.length;
+                    this.advanceCursor(handle, data.length);
                     return data.length;
                 }
             }
@@ -755,13 +840,13 @@ export class VirtualFileSystem {
                 handle.path, handle.position, target, targetOffset, length,
             );
             if (merged !== null) {
-                handle.position += merged;
+                this.advanceCursor(handle, merged);
                 return merged;
             }
             const data = this.overlay.readFileSyncVia(handle.path, handle.position, length);
             if (data !== null) {
                 target.set(data, targetOffset);
-                handle.position += data.length;
+                this.advanceCursor(handle, data.length);
                 return data.length;
             }
         }
@@ -804,6 +889,11 @@ export class VirtualFileSystem {
         if (!this.overlay || data.length === 0) {
             return data.length === 0 ? 0 : -1;
         }
+        // Same first move as the async twin: the window predates this write, so leaving
+        // it installed serves pre-write bytes to a read-after-write on this very handle
+        // (fopen "r+b" → fread → fseek → fwrite → fseek → fread). Flipping `source` to
+        // overlay under a still-installed whole-ROM-entry window is the same lie.
+        this.invalidateReadWindow(handle);
         if (handle.source === "rom") {
             handle.source = "overlay";
         }
@@ -812,7 +902,7 @@ export class VirtualFileSystem {
             if (written < 0) return -1;
             // Harness fileWritten event (gated — this is the hot guest-write path).
             if (harnessBus.fileEvents && written > 0) harnessBus.emit("fileWritten", { path: handle.path, offset: handle.position, length: written, sync: true });
-            handle.position += written;
+            this.advanceCursor(handle, written);
             return written;
         } catch (e) {
             Logger.error(LogCategory.SYSTEM, `VFS: writeSync("${handle.path}") failed: ${e}`);
@@ -832,7 +922,7 @@ export class VirtualFileSystem {
             const written = await this.overlay.writeFile(handle.path, handle.position, data);
             const writeTime = performance.now() - writeStart;
             if (harnessBus.fileEvents && written > 0) harnessBus.emit("fileWritten", { path: handle.path, offset: handle.position, length: written, sync: false });
-            handle.position += written;
+            this.advanceCursor(handle, written);
             // Promote source to overlay so subsequent reads from this handle see written data
             if (handle.source === "rom") handle.source = "overlay";
             Logger.verbose(LogCategory.SYSTEM, `VFS: write("${handle.path}") completed: wrote ${written} bytes in ${writeTime.toFixed(2)}ms, new position=${handle.position}`);
@@ -859,6 +949,7 @@ export class VirtualFileSystem {
         const rel = this.relRomPath(full).toLowerCase();
         const romEntry = rel ? this.romIndex.get(rel) : undefined;
         const hasRomFile = !!romEntry && !romEntry.isDirectory && !this.romWhiteouts.has(rel);
+        this.bumpWindowEpoch(); // windows on a deleted (or now whited-out) file describe nothing
         const deletedOverlay = await this.overlay.deleteFile(full);
         if (hasRomFile) {
             this.romWhiteouts.add(rel);
@@ -907,7 +998,7 @@ export class VirtualFileSystem {
         }
         try {
             // Ensure the file doesn't exist or is truncated
-            await this.overlay.truncateFile(filename);
+            await this.resetOverlayFile(this.overlay, filename);
             await this.overlay.writeFile(filename, 0, data);
             Logger.verbose(LogCategory.SYSTEM, `VFS: Stored executable "${filename}" (${data.length} bytes)`);
         } catch (e) {
@@ -921,23 +1012,65 @@ export class VirtualFileSystem {
     async truncateAt(path: string, size: number): Promise<void> {
         if (!this.overlay) throw new Error('VFS overlay not initialized');
         const full = this.resolvePath(path);
+        // Every window taken before now may cover bytes past the new EOF, including
+        // windows on handles this call cannot see. Bump BEFORE the await so a read that
+        // interleaves with the truncate cannot install bytes under the old epoch.
+        this.bumpWindowEpoch();
         await this.overlay.truncateFileAt(full, size);
         // SetEndOfFile sets the authoritative EOF; beyond it Windows reads zero, never ROM.
         // Once a ROM-backed file's end is set here, the overlay masks the ROM underlay.
         if (this.romUncompressedSize(normalizePath(full)) > 0) this.overlay.markShadowed(full);
     }
 
+    /**
+     * A second, INDEPENDENT cursor onto the same open file. Win32 operations that read a
+     * file without being a read on the file object — MapViewOfFile populating a view,
+     * FlushViewOfFile writing one back — must not disturb the guest's file pointer. The
+     * cursor is per-handle state, so those paths take their own handle instead of
+     * save/restoring the guest's around an await (during which the guest can legitimately
+     * seek, and the restore then silently reverts it).
+     */
+    /** The handle's current byte offset (Win32 CurrentByteOffset / C ftell). */
+    tell(handle: VfsFileHandle): number {
+        return handle.position;
+    }
+
+    /**
+     * The ONE cursor advance. Written as an explicit read-then-write because
+     * tools/validate-file-cursor.ts bans `position +=` outright: a compound assignment
+     * is a read-modify-write, and every double-advance bug in this file looked like one
+     * — two paths each crediting the same bytes, silently, at full length.
+     */
+    private advanceCursor(handle: VfsFileHandle, bytes: number): void {
+        handle.position = handle.position + bytes;
+    }
+
+    duplicateHandle(handle: VfsFileHandle, position = 0): VfsFileHandle {
+        return {
+            kind: "file",
+            path: handle.path,
+            position,
+            access: handle.access,
+            source: handle.source,
+        };
+    }
+
     setPosition(handle: VfsFileHandle, offset: number, method: number): number {
+        vfsTrace(handle.path, offset, -1);
         const oldPosition = handle.position;
+        let next = oldPosition;
         if (method === 0) {
-            handle.position = offset;
+            next = offset;
         } else if (method === 1) {
-            handle.position += offset;
+            next = oldPosition + offset;
         } else if (method === 2) {
-            const size = this.getFileSize(handle.path);
-            handle.position = size + offset;
+            next = this.getFileSize(handle.path) + offset;
         }
-        if (handle.position < 0) handle.position = 0;
+        // Win32 would fail the call with ERROR_NEGATIVE_SEEK and leave the pointer
+        // alone; clamping is the pre-existing behaviour and changing it is a contract
+        // change across every seek caller (see the report accompanying this work).
+        if (next < 0) next = 0;
+        handle.position = next;
         if (handle.position !== oldPosition) {
             // Only invalidate if new position is outside the buffered range
             if (handle.buffer && handle.bufferOffset !== undefined) {
@@ -1016,6 +1149,7 @@ export class VirtualFileSystem {
         const toRead = Math.min(length, fileSize - offset);
         const out = new Uint8Array(toRead);
         const copied = this.fillOverlayRomUnderlay(path, offset, out, 0, toRead);
+        if (copied === null) return null; // not serviceable synchronously — caller goes async
         return out.subarray(0, copied);
     }
 
@@ -1034,14 +1168,24 @@ export class VirtualFileSystem {
         return this.fillOverlayRomUnderlay(path, offset, target, targetOffset, toRead);
     }
 
-    /** Copy up to `toRead` bytes from overlay then ROM underlay into `target`. */
+    /**
+     * Copy up to `toRead` bytes from overlay then ROM underlay into `target`. Returns the
+     * byte count, or null when the overlay cannot be served synchronously at all (the
+     * caller must retry on the async path — reporting 0 there would be a false EOF).
+     *
+     * The ROM underlay covers only the region PAST the overlay's EOF. A read that comes
+     * up short INSIDE the overlay's own extent is a short read, not an EOF — filling that
+     * gap from ROM hands back pre-write bytes in the middle of a file the guest already
+     * overwrote. So the fall-through is gated on the cursor actually having reached
+     * overlaySize, and a short overlay read returns short.
+     */
     private fillOverlayRomUnderlay(
         path: string,
         offset: number,
         target: Uint8Array,
         targetOffset: number,
         toRead: number,
-    ): number {
+    ): number | null {
         const full = this.resolvePath(path);
         const overlaySize = this.overlay!.getSize(full) ?? 0;
         let copied = 0;
@@ -1049,13 +1193,13 @@ export class VirtualFileSystem {
         if (offset < overlaySize) {
             const ovLen = Math.min(toRead, overlaySize - offset);
             const ov = this.overlay!.readFileSyncVia(full, offset, ovLen);
-            if (ov && ov.length > 0) {
-                const n = Math.min(ov.length, ovLen);
-                target.set(ov.subarray(0, n), targetOffset);
-                copied += n;
-            }
+            if (ov === null) return null; // cannot be served synchronously — caller falls back
+            const n = Math.min(ov.length, ovLen);
+            if (n > 0) target.set(ov.subarray(0, n), targetOffset);
+            copied += n;
+            if (n < ovLen) return copied;
         }
-        if (copied < toRead) {
+        if (copied < toRead && offset + copied >= overlaySize) {
             const romOff = offset + copied;
             const romLen = toRead - copied;
             const romBuf = new Uint8Array(romLen);
@@ -1087,13 +1231,13 @@ export class VirtualFileSystem {
         if (offset < overlaySize && this.overlay) {
             const ovLen = Math.min(toRead, overlaySize - offset);
             const ov = await this.overlay.readFile(full, offset, ovLen);
-            if (ov.length > 0) {
-                const n = Math.min(ov.length, ovLen);
-                out.set(ov.subarray(0, n), 0);
-                copied += n;
-            }
+            const n = Math.min(ov.length, ovLen);
+            if (n > 0) out.set(ov.subarray(0, n), 0);
+            copied += n;
+            // Short INSIDE the overlay extent — a short read, not an EOF for ROM to patch.
+            if (n < ovLen) return out.subarray(0, copied);
         }
-        if (copied < toRead) {
+        if (copied < toRead && offset + copied >= overlaySize) {
             const rom = await this.readRom(full, offset + copied, toRead - copied);
             out.set(rom.subarray(0, Math.min(rom.length, toRead - copied)), copied);
             copied += Math.min(rom.length, toRead - copied);
@@ -1521,8 +1665,45 @@ export class VirtualFileSystem {
     private invalidateReadWindow(handle: VfsFileHandle): void {
         handle.buffer = undefined;
         handle.bufferOffset = undefined;
+        handle.bufferEpoch = undefined;
         handle.prefetchPromise = null;
         handle.prefetchOffset = undefined;
+        handle.prefetchEpoch = undefined;
+    }
+
+    /** A truncate/delete/re-create invalidates every window taken before this point. */
+    private bumpWindowEpoch(): void {
+        this.windowEpoch = (this.windowEpoch + 1) | 0;
+    }
+
+    /**
+     * Tripwire for the whole "window lies" class: a window that outlived its bytes
+     * would otherwise return plausible-looking stale data at full length, which is
+     * indistinguishable from a correct read at every layer above. Say so out loud.
+     */
+    private reportStaleWindow(handle: VfsFileHandle): void {
+        if (this.staleWindowReports >= 16) return;
+        this.staleWindowReports++;
+        Logger.warn(
+            LogCategory.SYSTEM,
+            `VFS: stale read window discarded for "${handle.path}" ` +
+            `(window epoch=${handle.bufferEpoch}, current=${this.windowEpoch}, ` +
+            `offset=${handle.bufferOffset}, position=${handle.position}) — ` +
+            `the file was truncated/replaced while this handle held a window`,
+        );
+    }
+
+    /**
+     * Publish `data` as the handle's read window. `epoch` is the epoch the bytes were
+     * READ under: a truncate that landed while the read was in flight makes them stale,
+     * so they are dropped rather than installed.
+     */
+    private installWindow(handle: VfsFileHandle, data: Uint8Array, offset: number, epoch: number): boolean {
+        if (epoch !== this.windowEpoch) return false;
+        handle.buffer = data;
+        handle.bufferOffset = offset;
+        handle.bufferEpoch = epoch;
+        return true;
     }
 
     private readFromHandleBuffer(handle: VfsFileHandle, length: number): Uint8Array | null {
@@ -1531,12 +1712,17 @@ export class VirtualFileSystem {
         if (!buffer || bufferOffset === undefined) {
             return null;
         }
+        if (handle.bufferEpoch !== this.windowEpoch) {
+            this.reportStaleWindow(handle);
+            this.invalidateReadWindow(handle);
+            return null;
+        }
         const relPos = handle.position - bufferOffset;
         if (relPos < 0 || relPos + length > buffer.byteLength) {
             return null;
         }
         const out = buffer.subarray(relPos, relPos + length);
-        handle.position += out.length;
+        this.advanceCursor(handle, out.length);
         return out;
     }
 
@@ -1556,6 +1742,7 @@ export class VirtualFileSystem {
         if (nextOffset >= fileSize) return;
 
         handle.prefetchOffset = nextOffset;
+        handle.prefetchEpoch = this.windowEpoch;
         handle.prefetchPromise = this.fetchRange(handle, nextOffset, VirtualFileSystem.PREFETCH_CHUNK_SIZE)
             .catch(() => new Uint8Array(0));
     }
@@ -1592,12 +1779,14 @@ export class VirtualFileSystem {
         return raw.subarray(begin, end);
     }
 
+    // Arithmetic, not bitwise: `&` coerces to int32, so any offset at or past 2 GiB
+    // (reachable inside a single >2 GB ROM entry) would come back negative or wrapped.
     private alignDown(value: number, align: number): number {
-        return value & ~(align - 1);
+        return Math.floor(value / align) * align;
     }
 
     private alignUp(value: number, align: number): number {
-        return (value + (align - 1)) & ~(align - 1);
+        return Math.ceil(value / align) * align;
     }
 }
 
@@ -1920,6 +2109,9 @@ class OpfsOverlay {
             return data.length;
         }
 
+        // Non-sequential write: the buffered run belongs to a different region and must be
+        // committed before this one replaces the buffer. flushWriteBuffer takes it in this
+        // same turn, so the overwrite below cannot race the commit.
         if (cacheEntry.memoryBuffer.length > 0) {
             void this.flushWriteBuffer(cacheEntry).catch((e) => {
                 Logger.error(LogCategory.SYSTEM, `OPFS: writeFileSync("${path}") pre-flush failed: ${e}`);
@@ -2145,7 +2337,7 @@ class OpfsOverlay {
         this.syncHandleLru.push(key);
 
         const buffer = new Uint8Array(length);
-        const bytesRead = handle.read(buffer, { at: offset });
+        const bytesRead = readSyncAccessHandle(handle, buffer, offset);
         return buffer.subarray(0, bytesRead);
     }
 
@@ -2250,7 +2442,7 @@ class OpfsOverlay {
         const syncHandle = await this.ensureSyncHandle(path);
         if (syncHandle) {
             const buffer = new Uint8Array(length);
-            const bytesRead = syncHandle.read(buffer, { at: offset });
+            const bytesRead = readSyncAccessHandle(syncHandle, buffer, offset);
             Logger.verbose(LogCategory.SYSTEM, `OPFS: readFile("${path}") opened sync handle, read ${bytesRead} bytes`);
             return buffer.subarray(0, bytesRead);
         }
@@ -2306,7 +2498,13 @@ class OpfsOverlay {
                 return data.length;
             }
 
-            await this.flushWriteBuffer(cacheEntry);
+            // Take the buffered run and re-anchor BEFORE yielding. flushWriteBuffer has
+            // already emptied memoryBuffer synchronously; anything appended during the
+            // awaits below belongs to a later run and must survive them, so this is the
+            // only point at which the anchor may be moved.
+            const flush = this.flushWriteBuffer(cacheEntry);
+            cacheEntry.bufferOffset = offset + data.length;
+            await flush;
 
             await this.ensureWriter(cacheEntry);
             const buffer = new Uint8Array(data).buffer;
@@ -2318,9 +2516,6 @@ class OpfsOverlay {
 
             cacheEntry.queue = cacheEntry.queue.then(doWrite, doWrite);
             await cacheEntry.queue;
-
-            cacheEntry.bufferOffset = offset + data.length;
-            cacheEntry.memoryBuffer = new Uint8Array(0);
 
             this.scheduleWriterCleanup();
 
@@ -2343,30 +2538,39 @@ class OpfsOverlay {
         entry.replaceExisting = false;
     }
 
+    /**
+     * Commit the entry's buffered run.
+     *
+     * The take-and-swap happens in THIS JS turn, before any await, and a flush already
+     * in flight is CHAINED onto rather than awaited-and-returned. Both matter: callers
+     * (writeFileSync's pre-flush, writeFile, readFile, drainWriters) assume that once
+     * this has been *called* the buffered bytes are spoken for, and then overwrite
+     * memoryBuffer/bufferOffset. An early return that left the buffer in place — which
+     * is exactly what the flushInFlight branch did — dropped that run silently.
+     */
     private async flushWriteBuffer(entry: WriterCacheEntry): Promise<void> {
-        if (entry.flushInFlight) {
-            await entry.flushInFlight;
-            return;
+        const bufferToWrite = entry.memoryBuffer;
+        const offsetToWrite = entry.bufferOffset;
+        if (bufferToWrite.length > 0) {
+            entry.bufferOffset = offsetToWrite + bufferToWrite.length;
+            entry.memoryBuffer = new Uint8Array(0);
+        }
+        if (entry.flushTimer !== null) {
+            clearTimeout(entry.flushTimer);
+            entry.flushTimer = null;
         }
 
+        const prior = entry.flushInFlight;
         const run = (async () => {
-            if (entry.memoryBuffer.length === 0) {
+            if (prior) {
+                try { await prior; } catch { /* the flush that owns it logs it */ }
+            }
+            if (bufferToWrite.length === 0) {
                 if (entry.replaceExisting) {
                     await this.ensureWriter(entry);
                 }
                 return;
             }
-
-            if (entry.flushTimer !== null) {
-                clearTimeout(entry.flushTimer);
-                entry.flushTimer = null;
-            }
-
-            const bufferToWrite = entry.memoryBuffer;
-            const offsetToWrite = entry.bufferOffset;
-
-            entry.bufferOffset += entry.memoryBuffer.length;
-            entry.memoryBuffer = new Uint8Array(0);
 
             await this.ensureWriter(entry);
             const doFlush = async () => {
@@ -2714,6 +2918,26 @@ class OpfsOverlay {
  * set across sessions. Lives OUTSIDE overlay/ so it is never surfaced to the guest via C:\.
  */
 const SHADOW_INDEX_FILE = "overlay-shadow.json";
+
+/**
+ * FileSystemSyncAccessHandle.read() is permitted to return fewer bytes than the buffer
+ * holds without being at EOF. A single un-looped call therefore reports a short read as
+ * an EOF, and every layer above turns that into a truncated file. Loop until filled or
+ * the handle genuinely stops producing (mirrors SyncAccessHandleSource.readRangeSync).
+ */
+function readSyncAccessHandle(
+    handle: { read(buffer: Uint8Array, opts: { at: number }): number },
+    buffer: Uint8Array,
+    at: number,
+): number {
+    let got = 0;
+    while (got < buffer.length) {
+        const n = handle.read(buffer.subarray(got), { at: at + got });
+        if (n <= 0) break;
+        got += n;
+    }
+    return got;
+}
 
 function normalizePath(path: string): string {
     const cleaned = path.replace(/\//g, "\\");

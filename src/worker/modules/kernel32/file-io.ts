@@ -34,6 +34,24 @@ import { ioTraceRing } from '../../core/debug/io-trace-ring';
 import { hypercallDataManager } from '../../core/cpu/hypercall-data';
 
 const readFileFirstLogged = new Set<number>();
+let shortReadLogCount = 0;
+// A handle whose file position is driven from two threads is a race the guest can only
+// win by serialising itself: SetFilePointer and ReadFile are separate calls, and our
+// scheduler preempts between them. Reported once per handle — the pair reads the wrong
+// offset and the caller sees plausible-looking garbage, not an error.
+const readFileLastThread = new Map<number, number>();
+let sharedHandleLogCount = 0;
+function noteReadFileThread(hFile: number, path: string): void {
+    const tid = System.getInstance().scheduler.getCurrentThread()?.id ?? 0;
+    const prev = readFileLastThread.get(hFile);
+    if (prev === undefined) { readFileLastThread.set(hFile, tid); return; }
+    if (prev !== tid && sharedHandleLogCount < 20) {
+        sharedHandleLogCount++;
+        Logger.warn(LogCategory.KERNEL32,
+            `[SHAREDHANDLE] h=0x${hFile.toString(16)} "${path}" read from T${prev} and T${tid}`);
+    }
+    readFileLastThread.set(hFile, tid);
+}
 
 const RW_RASTER_NAMES: Record<number, string> = {
     0x0100: "1555",
@@ -318,17 +336,17 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         const data = Mem.readBytes(base, view.size);
         if (!data) return;
         const vfs = System.getInstance().fileSystem;
-        const vfsHandle = (fileObj as FileHandleWrapper).vfsHandle;
-        const originalPos = vfsHandle.position;
-        vfs.setPosition(vfsHandle, view.offset, 0);
+        // Write-back runs on its OWN cursor. FlushViewOfFile does not move the file
+        // pointer, and a save/restore around these awaits cannot emulate that: the guest
+        // may legitimately seek during the yield, and the restore then reverts its seek.
+        const viewHandle = vfs.duplicateHandle((fileObj as FileHandleWrapper).vfsHandle, view.offset);
         let off = 0;
         while (off < data.length) {
             const chunk = data.subarray(off, Math.min(off + 256 * 1024, data.length));
-            const written = await vfs.write(vfsHandle, chunk);
+            const written = await vfs.write(viewHandle, chunk);
             if (written <= 0) break;
             off += written;
         }
-        vfs.setPosition(vfsHandle, originalPos, 0);
     };
 
     const writeUint16 = (addr: number, value: number): void => {
@@ -1140,9 +1158,10 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             const fileObj = resourceProvider.getFileHandle(mapping.fileHandle);
             if (fileObj && !isConsoleDeviceHandle(fileObj)) {
                 const vfs = System.getInstance().fileSystem;
-                const vfsHandle = (fileObj as FileHandleWrapper).vfsHandle;
-                const originalPos = vfsHandle.position;
-                vfs.setPosition(vfsHandle, offset, 0);
+                // Populating the view runs on its OWN cursor: MapViewOfFile does not touch
+                // the file pointer at all, and save/restore around these awaits would clobber
+                // any seek the guest performs during the yield.
+                const viewHandle = vfs.duplicateHandle((fileObj as FileHandleWrapper).vfsHandle, offset);
 
                 const chunkSize = 256 * 1024;
                 let remaining = size;
@@ -1150,14 +1169,12 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 
                 while (remaining > 0) {
                     const toRead = Math.min(chunkSize, remaining);
-                    const data = await vfs.read(vfsHandle, toRead);
+                    const data = await vfs.read(viewHandle, toRead);
                     if (data.length === 0) break;
                     Mem.writeBytes(dest, data);
                     dest += data.length;
                     remaining -= data.length;
                 }
-
-                vfs.setPosition(vfsHandle, originalPos, 0);
             }
         }
 
@@ -1312,6 +1329,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                     view.setUint32(lpNumberOfBytesRead, bytesReadSync, true);
                 }
                 const vfsHandle = (fileHandle as FileHandleWrapper).vfsHandle;
+                noteReadFileThread(hFile, vfsHandle?.path ?? "?");
                 if (vfsHandle?.path.toLowerCase().endsWith("casa.mmp")) {
                     Logger.log(LogCategory.KERNEL32, 
                         `ReadFile casa.mmp: h=0x${hFile.toString(16)} buf=0x${lpBuffer.toString(16)} ` +
@@ -1343,6 +1361,16 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                     Logger.warn(LogCategory.KERNEL32,
                         `[SHORTREAD] ${vfsHandle.path}: wanted=${nNumberOfBytesToRead} got=${bytesReadSync} ` +
                         `pos=${vfsHandle.position - bytesReadSync}`);
+                }
+                // A short read that the guest does not check leaves its buffer holding whatever
+                // was there before — the header it then parses is stale stack/heap bytes. The
+                // per-extension probes above only cover the titles that already cost us a day,
+                // so keep a generic one: any file, rate-limited.
+                if (vfsHandle && bytesReadSync < nNumberOfBytesToRead && shortReadLogCount < 40) {
+                    shortReadLogCount++;
+                    Logger.warn(LogCategory.KERNEL32,
+                        `[SHORTREAD] ${vfsHandle.path}: wanted=${nNumberOfBytesToRead} got=${bytesReadSync} ` +
+                        `pos=${vfsHandle.position - bytesReadSync} size=${fileHandle.size}`);
                 }
                 if (vfsHandle) {
                     if (LARGE_IO_TRACE_ENABLED) traceLargeRead(

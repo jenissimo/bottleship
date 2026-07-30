@@ -15,11 +15,11 @@
 import type { ZipSource } from "@bottleship/formats/zip";
 import { Logger, LogCategory } from "../../core/logger";
 import {
-    SAB_TOTAL_BYTES, CTL_WORDS, CTL_STATE, CTL_RESP_LEN, CTL_ERRNO,
+    SAB_TOTAL_BYTES, CTL_WORDS, CTL_STATE, CTL_RESP_LEN, CTL_ERRNO, CTL_RESP_SEQ,
     CTL_IO_NET_FETCHES, CTL_IO_PREFETCHES, CTL_IO_CACHE_SERVES, CTL_REQS,
-    META_OFFSET_BYTES, META_REQ_OFF, META_REQ_LEN, META_WORDS,
+    META_OFFSET_BYTES, META_REQ_OFF, META_REQ_LEN, META_REQ_SEQ, META_WORDS,
     DATA_OFFSET_BYTES, DATA_BYTES,
-    ST_IDLE, ST_REQ, ST_DONE, ST_ERR, WAIT_TIMEOUT_MS,
+    ST_IDLE, ST_REQ, ST_ERR, WAIT_TIMEOUT_MS,
 } from "./sab-io-protocol";
 import type { IoWorkerStats } from "./sab-io-protocol";
 
@@ -35,6 +35,8 @@ export class SabIoSource implements ZipSource {
     private _requests = 0;
     private _waits = 0;
     private _timeouts = 0;
+    /** Request tag echoed back in CTL_RESP_SEQ — see sab-io-protocol. */
+    private _seq = 0;
 
     private constructor(worker: Worker, sab: SharedArrayBuffer, size: number) {
         this.worker = worker;
@@ -109,30 +111,41 @@ export class SabIoSource implements ZipSource {
         return this.readRangeSync(start, end);
     }
 
+    /** Monotonic request tag; 0 is reserved as "no response yet". */
+    private nextSeq(): number {
+        this._seq = (this._seq + 1) | 0;
+        if (this._seq === 0) this._seq = 1;
+        return this._seq;
+    }
+
     /** One SAB request/response round-trip. `len` must be ≤ DATA_BYTES. */
     private request(off: number, len: number): Uint8Array {
         this._requests++;
+        const seq = this.nextSeq();
         this.meta[META_REQ_OFF] = off;
         this.meta[META_REQ_LEN] = len;
+        this.meta[META_REQ_SEQ] = seq;
         Atomics.store(this.ctl, CTL_ERRNO, 0);
         Atomics.store(this.ctl, CTL_STATE, ST_REQ);
         this.worker.postMessage({ type: "req" });
 
-        // Park until the I/O worker publishes a terminal state. The value check in
-        // Atomics.wait closes the lost-wakeup race: if the worker already flipped
-        // STATE before we wait, wait returns "not-equal" immediately.
-        while (Atomics.load(this.ctl, CTL_STATE) === ST_REQ) {
+        // Park on the SEQUENCE word, not on STATE: STATE only says "a response exists",
+        // and after an abandoned request that can be someone else's. Re-loading the
+        // observed value before each wait closes the lost-wakeup race — if the worker
+        // published between the load and the wait, Atomics.wait returns "not-equal".
+        for (;;) {
+            const seen = Atomics.load(this.ctl, CTL_RESP_SEQ);
+            if (seen === seq) break;
             this._waits++;
-            const r = Atomics.wait(this.ctl, CTL_STATE, ST_REQ, WAIT_TIMEOUT_MS);
-            if (r === "timed-out" && Atomics.load(this.ctl, CTL_STATE) === ST_REQ) {
+            const r = Atomics.wait(this.ctl, CTL_RESP_SEQ, seen, WAIT_TIMEOUT_MS);
+            if (r === "timed-out" && Atomics.load(this.ctl, CTL_RESP_SEQ) !== seq) {
                 this._timeouts++;
                 Atomics.store(this.ctl, CTL_STATE, ST_IDLE);
-                throw new Error(`SabIoSource: read timed out (off=${off} len=${len})`);
+                throw new Error(`SabIoSource: read timed out (off=${off} len=${len} seq=${seq})`);
             }
         }
 
-        const st = Atomics.load(this.ctl, CTL_STATE);
-        if (st === ST_ERR) {
+        if (Atomics.load(this.ctl, CTL_STATE) === ST_ERR) {
             Atomics.store(this.ctl, CTL_STATE, ST_IDLE);
             throw new Error(`SabIoSource: I/O worker read error (off=${off} len=${len})`);
         }

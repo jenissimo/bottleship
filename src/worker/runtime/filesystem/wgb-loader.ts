@@ -277,7 +277,12 @@ export class WgbLoader {
                 Logger.log(LogCategory.SYSTEM, `WGB: dev cache hit for "${url}" — OPFS sync handle`);
                 return this.fromSource(staged);
             }
-            try {
+            // `__wgbForceCache` skips the streaming source so the same bundle can be
+            // A/B'd against the OPFS-staged one — the two differ in their read/prefetch
+            // machinery, which is exactly what a wrong-offset bug hunt needs to isolate.
+            if ((globalThis as { __wgbForceCache?: unknown }).__wgbForceCache === true) {
+                Logger.log(LogCategory.SYSTEM, `WGB: __wgbForceCache — skipping dev sync-XHR, staging "${url}" to OPFS`);
+            } else try {
                 const sync = await SyncHttpRangeSource.create(url);
                 Logger.log(LogCategory.SYSTEM, `WGB: dev-streaming "${url}" via sync-XHR range (no OPFS copy)`);
                 return await this.fromSource(sync);

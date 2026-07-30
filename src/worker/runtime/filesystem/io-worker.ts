@@ -15,11 +15,11 @@
 import { HttpRangeSource } from "@bottleship/formats/zip";
 import type { ZipSource } from "@bottleship/formats/zip";
 import {
-    CTL_STATE, CTL_RESP_LEN, CTL_ERRNO, CTL_WORDS,
+    CTL_WORDS,
     CTL_IO_NET_FETCHES, CTL_IO_PREFETCHES, CTL_IO_CACHE_SERVES, CTL_REQS,
-    META_OFFSET_BYTES, META_REQ_OFF, META_REQ_LEN, META_WORDS,
+    META_OFFSET_BYTES, META_REQ_OFF, META_REQ_LEN, META_REQ_SEQ, META_WORDS,
     DATA_OFFSET_BYTES, DATA_BYTES,
-    ST_DONE, ST_ERR,
+    publishResponse,
 } from "./sab-io-protocol";
 
 /** Network fetch granularity. A guest readahead run (≤ 8 MiB) is fetched as its
@@ -149,27 +149,28 @@ function publishStats(): void {
     Atomics.store(ctl, CTL_REQS, requests | 0);
 }
 
+/** Sequence of the newest request the guest published. A completion for anything older
+ *  is ABANDONED (the guest timed out on it and moved on) and must not be published: the
+ *  DATA arena is a single slot, so writing it would corrupt the response the guest is
+ *  currently waiting for or copying out. */
+let currentSeq = 0;
+
 async function handleRequest(): Promise<void> {
     const c = ctl!, m = meta!, d = data!;
     const off = m[META_REQ_OFF];
     const len = m[META_REQ_LEN];
+    const seq = m[META_REQ_SEQ];
+    currentSeq = seq;
     requests++;
     try {
         const buf = await serve(off, len);
-        const n = Math.min(buf.byteLength, DATA_BYTES);
-        d.set(buf.subarray(0, n), 0);
-        Atomics.store(c, CTL_RESP_LEN, n);
-        Atomics.store(c, CTL_ERRNO, 0);
         publishStats();
-        Atomics.store(c, CTL_STATE, ST_DONE);
-        Atomics.notify(c, CTL_STATE, 1);
+        if (!publishResponse(c, d, seq, currentSeq, buf)) return; // abandoned request
         // Keep the pipeline full ahead of where the guest just read.
         prefetchAhead(off + len);
     } catch (err) {
-        Atomics.store(c, CTL_ERRNO, 1);
         publishStats();
-        Atomics.store(c, CTL_STATE, ST_ERR);
-        Atomics.notify(c, CTL_STATE, 1);
+        if (!publishResponse(c, d, seq, currentSeq, null)) return;
         (self as unknown as Worker).postMessage({ type: "log", msg: `io-worker read failed off=${off} len=${len}: ${err}` });
     }
 }

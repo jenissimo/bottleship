@@ -166,10 +166,7 @@ export class CachedSource implements ZipSource {
             datas.push(data);
         }
 
-        const out = new Uint8Array(e - s);
-        for (let b = first; b <= last; b++) {
-            this.copyBlockInto(out, s, e, b, datas[b - first]);
-        }
+        const out = this.assemble(datas, first, last, s, e);
         this._syncHits++;
         // Advance the read cursor and top the prefetch pipeline back up — done on
         // resident HITS too, so a sequential scan through already-prefetched blocks
@@ -195,11 +192,7 @@ export class CachedSource implements ZipSource {
             datas.push(await this.ensureBlock(b));
         }
 
-        const out = new Uint8Array(e - s);
-        for (let b = first; b <= last; b++) {
-            this.copyBlockInto(out, s, e, b, datas[b - first]);
-        }
-        return out;
+        return this.assemble(datas, first, last, s, e);
     }
 
     /** Best-effort passthrough so wrapping a closable source (SAH) still cleans up. */
@@ -239,16 +232,34 @@ export class CachedSource implements ZipSource {
         return [blockStart, blockEnd];
     }
 
-    /** Copy the overlap of block `b` (bytes `data`) into `out` which spans [s,e). */
-    private copyBlockInto(out: Uint8Array, s: number, e: number, b: number, data: Uint8Array): void {
+    /** Copy the overlap of block `b` (bytes `data`) into `out` which spans [s,e).
+     *  Returns the FILE OFFSET the copy reached — short of the block's own end when the
+     *  inner read was short, which the caller must propagate as a short result. */
+    private copyBlockInto(out: Uint8Array, s: number, e: number, b: number, data: Uint8Array): number {
         const blockStart = b * this.blockSize;
         const copyStart = Math.max(s, blockStart);
         const copyEnd = Math.min(e, blockStart + data.length);
-        if (copyEnd <= copyStart) return;
+        if (copyEnd <= copyStart) return copyStart;
         out.set(
             data.subarray(copyStart - blockStart, copyEnd - blockStart),
             copyStart - s,
         );
+        return copyEnd;
+    }
+
+    /** Assemble [s,e) from the covering blocks' bytes, STOPPING at the first block that
+     *  came back short. Zero-filling the tail instead (while the caller advances its
+     *  cursor by the full requested length) turns a short read into silent corruption
+     *  that looks exactly like real data. */
+    private assemble(datas: Uint8Array[], first: number, last: number, s: number, e: number): Uint8Array {
+        const out = new Uint8Array(e - s);
+        let reached = s;
+        for (let b = first; b <= last; b++) {
+            reached = this.copyBlockInto(out, s, e, b, datas[b - first]);
+            // Expected end of this block's contribution to the request.
+            if (reached < Math.min(e, (b + 1) * this.blockSize)) break;
+        }
+        return reached >= e ? out : out.subarray(0, Math.max(0, reached - s));
     }
 
     /** Synchronously fault block `b`, reading ahead through consecutive
@@ -383,6 +394,12 @@ export class CachedSource implements ZipSource {
     }
 
     private insert(b: number, data: Uint8Array): void {
+        // Never cache a SHORT block. blockBounds already clamps the legitimate last block
+        // to `size`, so anything below that width is a short inner read — caching it would
+        // make every later hit on this block serve a zero-filled tail from RAM, with no
+        // second chance to notice.
+        const [bs, be] = this.blockBounds(b);
+        if (data.length < be - bs) return;
         if (this.blocks.has(b)) {
             // Raced with another fault-in; keep the existing entry, refresh LRU.
             this.touch(b);

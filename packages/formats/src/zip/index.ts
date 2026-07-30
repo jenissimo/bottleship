@@ -1,5 +1,9 @@
 import { asBlobPart } from "../dom-buffer";
 
+// Synchronous inflate — usable where DecompressionStream is not (guest traps).
+export { adler32, inflateRawSync, inflateZlibSync } from "./inflate";
+export type { InflateOutcome, InflateStatus } from "./inflate";
+
 const EOCD_SIGNATURE = 0x06054b50;
 const CEN_SIGNATURE = 0x02014b50;
 const LOC_SIGNATURE = 0x04034b50;
