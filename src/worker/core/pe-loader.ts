@@ -52,6 +52,20 @@ const DLL_PROCESS_DETACH = 0;
 const DLL_THREAD_ATTACH = 2;
 const DLL_THREAD_DETACH = 3;
 
+/**
+ * DLLs whose implementation IS the emulator. The "registry cannot cover these imports, but
+ * a real file exists in the VFS — load it natively" fallback must never reach them: a real
+ * kernel32/ntdll/user32 expects an NT kernel underneath (syscalls, PEB/TEB internals, a
+ * real GDI driver) and there is none, so satisfying the import from a shipped copy trades
+ * a handful of missing exports for a certain, unexplainable death. A bundle that happens
+ * to ship one of these (installers routinely do) must stay thunked; unknown imports keep
+ * their trap stubs, which fail one call loudly instead of the whole process silently.
+ */
+const HLE_ONLY_DLLS = new Set<string>([
+    'kernel32', 'kernelbase', 'ntdll', 'user32', 'gdi32', 'advapi32',
+    'ddraw', 'd3d8', 'd3d9', 'dsound', 'dinput', 'dinput8', 'opengl32', 'glide2x', 'glide3x',
+]);
+
 export class PELoader {
     private getMemory: () => Uint8Array;
     private thunkGenerator: ThunkGenerator;
@@ -1134,6 +1148,7 @@ export class PELoader {
             // Aliased DLLs keep their trap-stub handling for unknown imports; DLLs the
             // native loader refuses (HLE-only video/d3dx9) stay thunked.
             if (isThunked && !aliasTarget &&
+                !HLE_ONLY_DLLS.has(dllName) &&
                 !(!EMU_NATIVE_VIDEO_DLLS && VIDEO_DLL_NAMES.has(dllName)) &&
                 !isD3dx9VersionedDll(dllName)) {
                 const uncovered = functions.filter(f => {
@@ -1592,29 +1607,59 @@ export class PELoader {
         Logger.log(LogCategory.SYSTEM, `[PE] Stub DLL for ${dllName} written at 0x${stubDll.baseAddress.toString(16)}, size: ${stubDll.stubCode.length}`);
     }
 
+    /**
+     * Walk an ILT/IAT. Bounded, and each entry is validated as an RVA before it is
+     * dereferenced: a PREBOUND table holds resolved ADDRESSES, not name RVAs, so
+     * `base + entry + 2` would point outside the image entirely. An entry that cannot be
+     * a name RVA is recorded as unnamed rather than used to index memory.
+     */
     private parseImportTable(baseAddress: number, tableRVA: number): Array<{ name?: string, ordinal?: number }> {
         const functions: Array<{ name?: string, ordinal?: number }> = [];
         let addr = baseAddress + tableRVA;
+        // No real module imports more than this from one DLL; a runaway loop here means the
+        // table is not a table.
+        const MAX_IMPORTS = 65536;
 
-        while (true) {
+        for (let i = 0; i < MAX_IMPORTS; i++) {
+            if (addr < 0 || addr + 4 > this.memory.length) break;
             const entry = this.view.getUint32(addr, true);
             if (entry === 0) break;
 
             if (entry & 0x80000000) {
                 functions.push({ ordinal: entry & 0xFFFF });
             } else {
-                const nameAddr = baseAddress + entry + 2; // Skip hint
-                functions.push({ name: this.readString(nameAddr) });
+                const nameAddr = baseAddress + entry + 2; // skip the 2-byte hint
+                if (nameAddr >= 0 && nameAddr < this.memory.length) {
+                    functions.push({ name: this.readString(nameAddr, 0x200) });
+                } else {
+                    // Prebound / corrupt entry — no usable name. Recorded so the import
+                    // count still matches the IAT slot count the caller patches.
+                    functions.push({});
+                }
             }
             addr += 4;
         }
         return functions;
     }
 
-    private readString(addr: number): string {
+    /**
+     * Read a NUL-terminated ASCII name out of the mapped image.
+     *
+     * Bounded on purpose. PE import/export names are <= 0xFF bytes by spec, but the
+     * addresses we feed here are derived from IAT/ILT entries, and those are not always
+     * name RVAs: a PREBOUND or packed import table stores resolved addresses instead, so
+     * `base + entry + 2` lands at an arbitrary offset. Unbounded, the walk then scans
+     * until it happens to find a zero byte — megabytes of garbage concatenated into a
+     * string, or an out-of-range index on a Uint8Array (undefined !== 0, so the loop never
+     * terminates). Stop at the cap or at the end of the image view instead.
+     */
+    private readString(addr: number, maxLen = 512): string {
         let str = '';
-        while (this.memory[addr] !== 0) {
-            str += String.fromCharCode(this.memory[addr++]);
+        const limit = Math.min(addr + maxLen, this.memory.length);
+        for (let i = addr; i < limit; i++) {
+            const b = this.memory[i];
+            if (b === 0 || b === undefined) return str;
+            str += String.fromCharCode(b);
         }
         return str;
     }

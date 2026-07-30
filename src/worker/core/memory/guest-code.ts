@@ -87,8 +87,9 @@ export function invalidateGuestCode(address: number, length: number): boolean {
     // tier-2 re-entry threshold, and free-running tiering is what actually breaks it.
     // Before concluding "a call site is missing", confirm with `codeAudit` (which names the
     // page and the writer) and rule out tiering with `dbgCall('jitTier2', 0)` — JIT ON,
-    // invalidation unchanged, promotion off. House of 1000 Doors read as a missing call
-    // site on this flag alone and was neither.
+    // invalidation unchanged, no cache clear, promotion off. Two titles read as a missing
+    // call site on this flag alone and neither was: House of 1000 Doors and Blade of
+    // Darkness both come back on `jitTier2(0)`, and BoD reaches its tutorial level that way.
     if ((globalThis as { __codeInvalidateGlobal?: boolean }).__codeInvalidateGlobal) {
         const exports = preemptionManager.getWasmExports();
         const clear = exports && exports["jit_clear_cache_js"];

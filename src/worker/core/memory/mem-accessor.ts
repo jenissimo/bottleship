@@ -3,6 +3,7 @@ import { reportMemoryFault, MemoryAccessType } from "./memory-fault";
 import { System } from "../system";
 import { borrowGuestMemory } from "./guest-memory";
 import type { RegionEntry } from "./address-space";
+import { jsWriteTrap } from "./js-write-trap";
 
 export interface WatchRange {
     lo: number;
@@ -224,6 +225,7 @@ export class Mem {
     static writeUint32(address: number, value: number): boolean {
         this.logStackWrite(address, 4, value);
         this.checkWatch(address, 4, value);
+        jsWriteTrap.note(address, 4, value);
         const mem = this.ensure(address, 4, "w", "Mem.writeUint32", "write");
         if (!mem) return false;
         mem[address] = value & 0xff;
@@ -236,6 +238,7 @@ export class Mem {
     static writeUint16(address: number, value: number): boolean {
         this.logStackWrite(address, 2, value);
         this.checkWatch(address, 2, value);
+        jsWriteTrap.note(address, 2, value);
         const mem = this.ensure(address, 2, "w", "Mem.writeUint16", "write");
         if (!mem) return false;
         mem[address] = value & 0xff;
@@ -246,6 +249,7 @@ export class Mem {
     static writeUint8(address: number, value: number): boolean {
         this.logStackWrite(address, 1, value);
         this.checkWatch(address, 1, value);
+        jsWriteTrap.note(address, 1, value);
         const mem = this.ensure(address, 1, "w", "Mem.writeUint8", "write");
         if (!mem) return false;
         mem[address] = value & 0xff;
@@ -255,6 +259,7 @@ export class Mem {
     static writeFloat32(address: number, value: number): boolean {
         this.logStackWrite(address, 4, value);
         this.checkWatch(address, 4, value);
+        jsWriteTrap.note(address, 4, value);
         const mem = this.ensure(address, 4, "w", "Mem.writeFloat32", "write");
         if (!mem) return false;
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
@@ -265,6 +270,7 @@ export class Mem {
     static writeFloat64(address: number, value: number): boolean {
         this.logStackWrite(address, 8, value);
         this.checkWatch(address, 8, value);
+        jsWriteTrap.note(address, 8, value);
         const mem = this.ensure(address, 8, "w", "Mem.writeFloat64", "write");
         if (!mem) return false;
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
@@ -275,6 +281,7 @@ export class Mem {
     static writeBytes(address: number, data: Uint8Array): number {
         this.logStackWrite(address, data.length, data);
         this.checkWatch(address, data.length, data);
+        jsWriteTrap.note(address, data.length, data);
         const mem = this.ensure(address, data.length, "w", "Mem.writeBytes", "write");
         if (!mem) return 0;
         mem.set(data, address);
@@ -288,6 +295,7 @@ export class Mem {
         const source = mem.subarray(src, src + length);
         this.logStackWrite(dest, length, source);
         this.checkWatch(dest, length);
+        jsWriteTrap.note(dest, length, source);
         mem.set(source, dest);
         return true;
     }
@@ -309,6 +317,7 @@ export class Mem {
         const source = mem.subarray(src, src + length);
         this.logStackWrite(dest, length, source);
         this.checkWatch(dest, length, source);
+        jsWriteTrap.note(dest, length, source);
         mem.copyWithin(dest, src, src + length);
         return true;
     }

@@ -17,6 +17,9 @@
 import type { HarnessService } from "../service";
 import { HarnessError, HarnessErrorCode } from "../rpc";
 import { memWriteTrap } from "../../core/memory/mem-write-trap";
+import { jsWriteTrap } from "../../core/memory/js-write-trap";
+import { hypercallDataManager } from "../../core/cpu/hypercall-data";
+import { symbolize } from "../serialize";
 
 function toAddr(x: unknown): number {
     if (typeof x === "number") return x >>> 0;
@@ -45,4 +48,56 @@ export function registerMemTrapCommands(svc: HarnessService): void {
     svc.register("memTrapReport", () => memWriteTrap.report());
 
     svc.register("memTrapClear", () => memWriteTrap.disarm());
+
+    /**
+     * trapJsWrites(addr, len?, label?) — the JS-side sibling of trapWrites.
+     * MemWriteTrap only sees GUEST stores (it needs a #PF); a write our own handlers
+     * perform through Mem raises none, so the MMU trap reports zero hits for it and
+     * "nobody wrote here" is indistinguishable from "JS wrote here". This arms a range
+     * check inside Mem instead, so a corrupted block can be attributed to a thunk.
+     *
+     * Read with jsWriteReport(): it returns `inspected` (every write offered while
+     * armed, not just matches) so a run that observed nothing is distinguishable from a
+     * run where the hook never ran, plus `blindSpots` naming the paths it cannot see.
+     */
+    svc.register("trapJsWrites", (args) => {
+        const addr = toAddr(args[0]);
+        const len = args[1] != null ? Math.max(1, Number(args[1]) | 0) : 64;
+        const label = args[2] != null ? String(args[2]) : "";
+        return {
+            ...jsWriteTrap.arm(addr, len, label),
+            wasmStringWritersOff: hypercallDataManager.areWasmStringWritersOff(),
+            note: "Armed inside Mem. Covers JS writes only — WASM hypercall writers and " +
+                "direct mem8[] call sites are blind spots (see blindSpots in jsWriteReport). " +
+                "Call wasmStringWriters(false) first if a null result must mean anything.",
+        };
+    });
+
+    svc.register("jsWriteReport", () => {
+        const r = jsWriteTrap.report();
+        return {
+            ...r,
+            wasmStringWritersOff: hypercallDataManager.areWasmStringWritersOff(),
+            hits: r.hits.map((h) => ({
+                ...h,
+                addrHex: "0x" + (h.addr >>> 0).toString(16),
+                eipSym: symbolize(h.eip),
+            })),
+        };
+    });
+
+    svc.register("jsWriteClear", () => jsWriteTrap.disarm());
+
+    /**
+     * wasmStringWriters(on) — route the WASM string/memory handlers that WRITE guest
+     * memory (memcpy/memset/strcpy/wcscpy/wcscat/wcsncpy) to their JS fallbacks.
+     * Those Rust handlers write through a raw pointer: no #PF and no Mem, so they are
+     * invisible to BOTH traps. Turning them off is what makes them observable, and it
+     * doubles as the A/B that convicts or clears the WASM implementations.
+     * (The heap slab is a separate switch — __noHeapSlab.)
+     */
+    svc.register("wasmStringWriters", (args) => {
+        const on = args[0] === undefined ? true : !!args[0];
+        return hypercallDataManager.setWasmStringWritersEnabled(on);
+    });
 }

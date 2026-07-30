@@ -439,7 +439,7 @@ export function resetHeapSlab(): void {
     return process.memory.getLargeAllocHistory?.(addr >>> 0, radius ?? 0x20000) ?? null;
 };
 
-(globalThis as any).getSlabReport = () => {
+export function slabReport() {
     const live = hypercallDataManager.getSlabStats();
     return {
         current: {
@@ -462,7 +462,9 @@ export function resetHeapSlab(): void {
         totalCap: HEAP_SLAB_TOTAL_MAX,
         nextSlabSizeKB: nextSlabSize / 1024,
     };
-};
+}
+
+(globalThis as any).getSlabReport = slabReport;
 
 /** If ptr is within a slab, return its size class. Used by HeapSize/HeapReAlloc. */
 export function getSlabSizeForPtr(ptr: number): number | undefined {
@@ -2652,9 +2654,51 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 /**
  * Register fast-path implementations for high-frequency heap operations.
  * Keeps heap bookkeeping in JS AddressSpace/MemoryManager, but bypasses full thunk marshalling.
+ *
+ * These run INSTEAD of exports['HeapAlloc'/'HeapFree'], so every slab invariant those
+ * carry has to be honoured here as well or it is silently gone: the fast path is the
+ * tier that actually serves a slab fallthrough.
  */
 export function registerFastPathHeapFunctions(dispatcher: any): void {
     if (!dispatcher || typeof dispatcher.registerFastPath !== 'function') return;
+
+    // A refused allocation is what the guest turns into std::bad_alloc, so it must be
+    // as loud here as in the slow path — the fast path is the tier that actually serves
+    // the call, and a silent 0 leaves the resulting crash with no cause in the log.
+    let refusalLogCount = 0;
+    const reportFastPathAllocFailure = (dwBytes: number, why: string, view: DataView, esp: number): void => {
+        if (refusalLogCount >= 40) return;
+        refusalLogCount++;
+        // [ESP] is the guest return address — the only thing that names WHICH code asked
+        // for the size. The thunk stub's own EIP is the same for every caller.
+        let caller = 0;
+        try { caller = view.getUint32(esp, true) >>> 0; } catch { /* torn stack */ }
+        const process = System.getInstance().process;
+        const registry: any = process?.moduleRegistry;
+        const sym = registry?.resolveAddress?.(caller) ?? "";
+        // The immediate caller is always the CRT allocator, and the frame-pointer walk is
+        // unreliable over FPO code (it invents repeated frames). Scan raw stack words
+        // instead and keep the ones that land in a loaded module — those are the real
+        // return addresses, in order.
+        const chain: string[] = [];
+        try {
+            for (let off = 0; off < 0x200 && chain.length < 14; off += 4) {
+                const w = view.getUint32(esp + off, true) >>> 0;
+                const s = registry?.resolveAddress?.(w);
+                if (s) chain.push(`+0x${off.toString(16)}:${s}`);
+            }
+        } catch { /* torn stack */ }
+        // The size came from an API the guest called just before; the ring names which.
+        let recent = "";
+        try {
+            const d: any = (process as any)?.dispatcher;
+            recent = (d?.getLastWinApiCalls?.(24) ?? []).join(" | ");
+        } catch { /* best-effort */ }
+        Logger.warn(LogCategory.KERNEL32,
+            `HeapAlloc (fast path) refused ${dwBytes} bytes (0x${dwBytes.toString(16)}, ${why}) ` +
+            `caller=0x${caller.toString(16)}${sym ? ` ${sym}` : ""}\n  stack: ${chain.join(" | ")}` +
+            `\n  recent: ${recent}`);
+    };
 
     const heapAllocFastPath: FastPathImplementation = (cpu, mem8, _mem32, view) => {
         const esp = cpu.reg32[4] >>> 0;
@@ -2671,10 +2715,16 @@ export function registerFastPathHeapFunctions(dispatcher: any): void {
             return 0;
         }
 
+        // A sub-4KB alloc reaching JS at all means the inline stub and the WASM hypercall
+        // both fell through, i.e. the arena is full. This is the ONLY signal the arena has
+        // to grow, and it arrives here — not at the slow path below us.
+        if (dwBytes <= HEAP_SMALL_ALLOC_MAX) maybeGrowHeapSlab();
+
         const zeroMemory = (dwFlags & HEAP_ZERO_MEMORY_FLAG) !== 0 || DEBUG_FORCE_ZERO_HEAP_FAST_PATH;
         const memSize = process.getCurrentMemory().length >>> 0;
         if (dwBytes > memSize || dwBytes > HEAP_FAST_PATH_MAX_ALLOC) {
             system.scheduler.setLastError(HEAP_OOM_ERROR);
+            reportFastPathAllocFailure(dwBytes, "size", view, esp);
             return 0;
         }
 
@@ -2685,8 +2735,9 @@ export function registerFastPathHeapFunctions(dispatcher: any): void {
                 mem8.fill(0, address, address + allocBytes);
             }
             return address;
-        } catch {
+        } catch (e) {
             system.scheduler.setLastError(HEAP_OOM_ERROR);
+            reportFastPathAllocFailure(dwBytes, `alloc: ${e}`, view, esp);
             return 0;
         }
     };
@@ -2699,7 +2750,11 @@ export function registerFastPathHeapFunctions(dispatcher: any): void {
         if (esp + 16 > mem8.length) return null;
 
         const lpMem = view.getUint32(esp + 12, true) >>> 0;
+        // A slab-resident pointer is an interior offset, not a root allocation:
+        // process.memory.free would mistarget the enclosing arena. The slow path owns
+        // that case (retired-generation no-op + double-free diagnostics) — defer to it.
         if (lpMem !== 0) {
+            if (isInAnySlab(lpMem)) return null;
             process.memory.free(lpMem);
         }
         return 1;

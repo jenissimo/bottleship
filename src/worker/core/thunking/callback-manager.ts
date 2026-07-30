@@ -112,6 +112,16 @@ const MAX_CALLBACK_NESTING = 8;
 const SUSPENDED_FRAME_RING_SIZE = 64;
 const MAX_PENDING_CALLBACK_SLOTS = 256;
 
+/** A suspended-thunk completion waiting for its owner thread to become current. */
+interface DeferredFrameCompletion {
+    frameId: number;
+    /** Callback whose completeThunk produced the value; for diagnostics only. */
+    functionId: number;
+    finalValue: number;
+    isCdecl: boolean;
+    source: string;
+}
+
 export class CallbackManager {
     private v86: any;
     private thunkGenerator: ThunkGenerator;
@@ -167,6 +177,11 @@ export class CallbackManager {
     private nextFrameId = 1;
     private frameStack = new Int16Array(SUSPENDED_FRAME_RING_SIZE);
     private frameStackDepth = 0;
+    /** Terminal frame completions that arrived while a thread OTHER than the frame's owner
+     *  was current, keyed by owner thread. Drained at that thread's own safe point (see the
+     *  thread-mismatch branch in the callback-return path). At most one per thread: a frame
+     *  completes exactly once, and its owner is parked until it does. */
+    private deferredCompletions = new Map<number, DeferredFrameCompletion>();
     private lastInvokeForensics: CallbackForensicRecord | null = null;
     private lastReturnForensics: CallbackForensicRecord | null = null;
     private lastWinMmForensicLogMs = 0;
@@ -587,12 +602,31 @@ export class CallbackManager {
                 return;
             }
 
-            if ((this.frameThreadId[frameIndex] >>> 0) !== threadId) {
-                Logger.error(LogCategory.CALLBACK,
-                    `Suspended frame thread mismatch: frameId=${frameId} ownerThread=${this.frameThreadId[frameIndex]} currentThread=${threadId}`);
-
-                this.releaseFrame(frameIndex);
-                this.releaseCallbackWithFatal(functionId, stub, 0x3003, functionId >>> 0, threadId);
+            const ownerThreadId = this.frameThreadId[frameIndex] >>> 0;
+            if (ownerThreadId !== threadId) {
+                // Completing a frame WRITES the owner's EIP/ESP/EAX, so it may only run while
+                // the owner is current — doing it now would drop those registers on whatever
+                // thread happens to be running.
+                //
+                // This is reachable by design, not corruption: a thread owning a live frame is
+                // parked WAITING between pump callbacks (scheduler pumpPark), so the scheduler
+                // legitimately runs a sibling, and the JS-driven chain can reach its terminal
+                // step with that sibling current. UE1 front-ends hit it on every EndDialog
+                // teardown — the modal pump's last WM_NCDESTROY lands after a sibling's async
+                // GetMessage resumed. Defer to the owner's own safe point, exactly as a
+                // cross-thread async thunk completion already does.
+                Logger.log(LogCategory.CALLBACK,
+                    `Deferring suspended-thunk completion to owner: frameId=${frameId} ` +
+                    `ownerThread=${ownerThreadId} currentThread=${threadId} value=0x${finalValue.toString(16)}`);
+                this.deferredCompletions.set(ownerThreadId, {
+                    frameId, functionId: functionId >>> 0, finalValue,
+                    isCdecl: !!callback.isCdecl,
+                    source: callback.source ?? '',
+                });
+                // The owner is parked with no other waker — the drain only runs once the
+                // scheduler makes it current, so ready it here or the frame strands forever.
+                System.getInstance().scheduler.wakeThreadForAsyncCompletion(ownerThreadId);
+                this.releaseCallback(functionId, stub);
                 return;
             }
 
@@ -741,6 +775,92 @@ export class CallbackManager {
             if (this.frameActive[slot] === 1 && (this.frameThreadId[slot] >>> 0) === tid) return true;
         }
         return false;
+    }
+
+    /** True when `threadId` has a terminal frame completion waiting for it to become current. */
+    hasDeferredCompletionForThread(threadId: number): boolean {
+        return this.deferredCompletions.has(threadId >>> 0);
+    }
+
+    /** Diagnostics: completions waiting on their owner thread (harness `asyncParked`).
+     *  A non-empty list on a stalled guest means an owner never reached its safe point. */
+    listDeferredCompletions(): Array<{ threadId: number; frameId: number; source: string; value: number }> {
+        return Array.from(this.deferredCompletions.entries()).map(([threadId, d]) => ({
+            threadId, frameId: d.frameId, source: d.source, value: d.finalValue >>> 0,
+        }));
+    }
+
+    /**
+     * Apply a completion that was deferred because its owner thread was not current
+     * (see the thread-mismatch branch of the callback-return path). Must be called only
+     * when `threadId` IS the current thread and its registers are live — the scheduler's
+     * async-restore poll is that point, and it is the same one a cross-thread async thunk
+     * completion resumes at.
+     *
+     * Returns true when a completion was applied (the caller should not also let the
+     * thread keep spinning at the park address).
+     */
+    tryApplyDeferredCompletion(threadId: number, cpu: any): boolean {
+        const tid = threadId >>> 0;
+        const deferred = this.deferredCompletions.get(tid);
+        if (!deferred) return false;
+
+        const frameIndex = this.findFrameIndexById(deferred.frameId);
+        if (frameIndex < 0) {
+            // The frame went away underneath us (process teardown). Drop the completion
+            // rather than restoring registers to a frame that no longer describes anything.
+            this.deferredCompletions.delete(tid);
+            Logger.warn(LogCategory.CALLBACK,
+                `Deferred completion dropped: frame ${deferred.frameId} gone (owner T${tid}, source=${deferred.source})`);
+            return false;
+        }
+        if ((this.frameThreadId[frameIndex] >>> 0) !== tid) return false;
+
+        const mem = this.getMemory();
+        const returnAddr = this.frameReturnAddr[frameIndex] >>> 0;
+        const returnAddrInStack = returnAddr >= 0x80000 && returnAddr < 0x100000;
+        if (returnAddr < 0x1000 || returnAddr >= mem.length ||
+            (returnAddr >= this.stubPoolBase && returnAddr < this.stubPoolEnd) ||
+            returnAddrInStack || this.isInvalidGuestReturnAddress(returnAddr)) {
+            this.deferredCompletions.delete(tid);
+            this.releaseFrame(frameIndex);
+            Logger.error(LogCategory.CALLBACK,
+                `Deferred completion has invalid returnAddr 0x${returnAddr.toString(16)} frameId=${deferred.frameId}`);
+            this.reportFatalFromCallback(0x3002, returnAddr >>> 0, tid);
+            return false;
+        }
+
+        const targetEsp = deferred.isCdecl
+            ? ((this.frameEspEntry[frameIndex] + 4) >>> 0)
+            : (this.frameExpectedPostEsp[frameIndex] >>> 0);
+        if (!(targetEsp >= 0 && targetEsp <= mem.length)) {
+            this.deferredCompletions.delete(tid);
+            this.releaseFrame(frameIndex);
+            Logger.error(LogCategory.CALLBACK,
+                `Deferred completion out of bounds: frameId=${deferred.frameId} targetESP=0x${targetEsp.toString(16)}`);
+            this.reportFatalFromCallback(0x3002, returnAddr >>> 0, tid);
+            return false;
+        }
+
+        cpu.reg32[0] = deferred.finalValue >>> 0;
+        cpu.reg32[4] = targetEsp >>> 0;
+        if (cpu.is_jumping !== undefined) cpu.is_jumping = true;
+        cpu.instruction_pointer[0] = returnAddr >>> 0;
+
+        Logger.log(LogCategory.CALLBACK,
+            `Completed deferred suspended thunk on owner T${tid}: EAX=0x${deferred.finalValue.toString(16)}, ` +
+            `EIP=0x${returnAddr.toString(16)}, ESP=0x${targetEsp.toString(16)} (frameId=${deferred.frameId})`);
+
+        this.deferredCompletions.delete(tid);
+        this.releaseFrame(frameIndex);
+        for (const [cbId, cb] of this.pendingCallbacks.entries()) {
+            if ((cb.frameId ?? 0) === deferred.frameId) {
+                const orphanStub = this.stubsById.get(cbId);
+                if (orphanStub) this.releaseCallback(cbId, orphanStub);
+                else { this.pendingCallbacks.delete(cbId); this.untrackPendingCallback(cbId); }
+            }
+        }
+        return true;
     }
 
     private getTopSuspendedFrameId(): number {

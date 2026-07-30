@@ -187,6 +187,13 @@ const OFF_HC_SLAB_CTL_PTR = 0x1444;
  * Interlocked, GetLastError, SetLastError stay in JS — too frequent,
  * starves onThunkComplete() and breaks thread scheduling.
  */
+/** Hypercall handlers that WRITE guest memory from Rust — the set the diagnostic
+ *  switch can force back to JS so a write trap can observe them. */
+const WASM_WRITE_HANDLERS = new Set<number>([
+    HANDLER_WCSCPY, HANDLER_WCSCAT, HANDLER_WCSNCPY,
+    HANDLER_MEMCPY, HANDLER_MEMSET, HANDLER_STRCPY,
+]);
+
 const HANDLER_MAP: Record<string, number> = {
     'kernel32.gettickcount': HANDLER_GET_TICK_COUNT,
     'kernel32.gettickcount64': HANDLER_GET_TICK_COUNT64,
@@ -428,6 +435,11 @@ export class HypercallDataManager {
     // Registration tracking — Map stores functionId → handlerId for dispatch table rebuild
     // after WASM memory buffer changes (e.g., v86.restart() zeroes HYPERCALL_PAGE statics)
     private registeredEntries = new Map<number, number>();
+    // Diagnostic: while true, the write-capable string/mem handlers are forced to their JS
+    // fallbacks. Must be honoured by BOTH registerFunction and the dispatch-table rebuild,
+    // or a WASM-buffer change would silently re-enable them mid-run and the write trap
+    // would report a clean range it never actually covered.
+    private wasmStringWritersOff = false;
 
     initialize(cpu: any, hpBase: number): void {
         this.cpu = cpu;
@@ -506,7 +518,8 @@ export class HypercallDataManager {
 
         // Dispatch table entries
         for (const [functionId, handlerId] of this.registeredEntries) {
-            this.view.setUint8(this.hpBase + OFF_HC_DISPATCH_TABLE + functionId, handlerId);
+            const suppressed = this.wasmStringWritersOff && WASM_WRITE_HANDLERS.has(handlerId);
+            this.view.setUint8(this.hpBase + OFF_HC_DISPATCH_TABLE + functionId, suppressed ? 0 : handlerId);
         }
 
         // Slab control-block pointer (the slab control fields themselves live in guest RAM,
@@ -900,7 +913,8 @@ export class HypercallDataManager {
         // Write handler_id into dispatch_table[functionId]
         const offset = this.hpBase + OFF_HC_DISPATCH_TABLE + functionId;
         // Use setUint8 since dispatch table entries are single bytes
-        this.view.setUint8(offset, handlerId);
+        const suppressed = this.wasmStringWritersOff && WASM_WRITE_HANDLERS.has(handlerId);
+        this.view.setUint8(offset, suppressed ? 0 : handlerId);
         this.registeredEntries.set(functionId, handlerId);
 
         Logger.verbose(LogCategory.SYSTEM,
@@ -934,6 +948,40 @@ export class HypercallDataManager {
         }
         Logger.log(LogCategory.SYSTEM,
             `[HYPERCALL] Registered raw funcId=${functionId} → handler ${handlerId} (inner-loop HLE)`);
+    }
+
+    /**
+     * Route the WASM string/memory handlers that WRITE guest memory back to their JS
+     * fallbacks (`on = false`), or restore them (`on = true`). Live — no reload needed.
+     *
+     * Diagnostic seam, not a perf knob. A Rust hypercall writes guest memory through a
+     * raw pointer: it raises no #PF (so MemWriteTrap cannot see it) and never touches
+     * `Mem` (so the JS write trap cannot see it either). Forcing these six to JS is what
+     * makes a memory-corruption hunt able to observe them at all, and doubles as the A/B
+     * that convicts or clears the WASM implementations. The heap-slab handlers are NOT in
+     * this set — `__noHeapSlab` owns that switch.
+     */
+    setWasmStringWritersEnabled(on: boolean): { enabled: boolean; affected: number[] } {
+        const writers = WASM_WRITE_HANDLERS;
+        this.wasmStringWritersOff = !on;
+        this.refreshViews();
+        const affected: number[] = [];
+        for (const [functionId, handlerId] of this.registeredEntries) {
+            if (!writers.has(handlerId)) continue;
+            affected.push(functionId);
+            if (this.view) {
+                this.view.setUint8(this.hpBase + OFF_HC_DISPATCH_TABLE + functionId, on ? handlerId : 0);
+            }
+        }
+        Logger.log(LogCategory.SYSTEM,
+            `[HYPERCALL] WASM string/mem WRITERS ${on ? "enabled" : "DISABLED (JS fallback)"} ` +
+            `for ${affected.length} functionIds`);
+        return { enabled: on, affected };
+    }
+
+    /** True while the write-capable string/mem handlers are forced to JS. */
+    areWasmStringWritersOff(): boolean {
+        return this.wasmStringWritersOff;
     }
 
     /** Remove a raw dispatch-table binding (inner-loop hook unpatch). */

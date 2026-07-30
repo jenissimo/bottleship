@@ -253,6 +253,41 @@ describe('ThunkDispatcher.reconcileAsyncRestoreEsp (async-restore ESP invariant)
         expect(r.esp).toBe((parkEsp + 4 + 20) >>> 0);
         expect(r.mismatch).toBe(false);
     });
+
+    // A live ESP that cannot be a RET N from parkEsp belongs to ANOTHER thread: the completion
+    // is applied from a peer's slice (the modal dialog pump dispatches callbacks while its peers
+    // are parked), so the shared register file holds the peer's ESP. Adopting it gave the resumed
+    // thread a foreign stack, whose next park recorded a saved ESP inside the peer's live frame;
+    // the pump's next invokeCallback then overwrote the peer's return address and the peer RET'd
+    // into the bootloader (HP CoS: EIP=0x7c07, "parked-stack write violation").
+    it('ignores a live ESP below parkEsp (another thread stack) and keeps the recorded cleanup', () => {
+        const t3ParkEsp = 0x170ffb0; // T3 parked in its own stack [0x1610000,0x1710000)
+        const t1LiveEsp = 0x10fefc4; // T1's ESP — a different stack entirely
+        const r = ThunkDispatcher.reconcileAsyncRestoreEsp(t3ParkEsp, 16, t1LiveEsp);
+        expect(r.esp).toBe((t3ParkEsp + 4 + 16) >>> 0);
+        expect(r.mismatch).toBe(false);
+    });
+
+    it('ignores a live ESP implausibly far ABOVE parkEsp', () => {
+        const liveEsp = (parkEsp + 0x10000) >>> 0; // no stdcall stub pops 64 KiB
+        const r = ThunkDispatcher.reconcileAsyncRestoreEsp(parkEsp, 12, liveEsp);
+        expect(r.esp).toBe((parkEsp + 4 + 12) >>> 0);
+        expect(r.mismatch).toBe(false);
+    });
+
+    it('ignores a misaligned live ESP (a RET N moves ESP in dword steps)', () => {
+        const liveEsp = (parkEsp + 4 + 9) >>> 0;
+        const r = ThunkDispatcher.reconcileAsyncRestoreEsp(parkEsp, 12, liveEsp);
+        expect(r.esp).toBe((parkEsp + 4 + 12) >>> 0);
+        expect(r.mismatch).toBe(false);
+    });
+
+    it('still trusts a divergent RET N at the top of the plausible range', () => {
+        const liveEsp = (parkEsp + 4 + ThunkDispatcher.MAX_STUB_CLEANUP_BYTES) >>> 0;
+        const r = ThunkDispatcher.reconcileAsyncRestoreEsp(parkEsp, 12, liveEsp);
+        expect(r.esp).toBe(liveEsp);
+        expect(r.mismatch).toBe(true);
+    });
 });
 
 // EBP-sanity tripwire — a guest frame pointer outside the thread stack pointing at non-writable

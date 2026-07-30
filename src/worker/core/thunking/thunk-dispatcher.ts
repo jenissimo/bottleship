@@ -2456,6 +2456,47 @@ export class ThunkDispatcher {
         return this._callbackManager?.hasLiveFrameForThread(threadId) ?? false;
     }
 
+    /** See CallbackManager.listDeferredCompletions — harness `asyncParked` diagnostics. */
+    getDeferredFrameCompletions(): Array<{ threadId: number; frameId: number; source: string; value: number }> {
+        return this._callbackManager?.listDeferredCompletions() ?? [];
+    }
+
+    /**
+     * Apply the current thread's deferred suspended-frame completion, if it has one.
+     * Only ever for the CURRENT thread: the completion writes EIP/ESP/EAX, so it is exactly
+     * as unsafe on a foreign thread as the mismatch it was deferred from.
+     */
+    private drainDeferredFrameCompletion(cpu: any): boolean {
+        const cbMgr = this._callbackManager;
+        // Duck-typed: the dispatcher is constructed with stand-in callback managers in tests
+        // and by callers that predate this hook, and an async restore must never be blocked
+        // by the absence of a purely additive diagnostic-era method.
+        if (typeof cbMgr?.hasDeferredCompletionForThread !== "function"
+            || typeof cbMgr.tryApplyDeferredCompletion !== "function") {
+            return false;
+        }
+        const scheduler = this.ensureScheduler();
+        const currentTid = scheduler.getCurrentThreadId();
+        if (currentTid === null || currentTid === undefined) return false;
+        const tid = currentTid >>> 0;
+        if (!cbMgr.hasDeferredCompletionForThread(tid)) return false;
+
+        // SAFE POINT, same rule as canApplyCurrentThreadRestore: the completion overwrites
+        // EIP/ESP wholesale, so the thread must be parked waiting for exactly this — at the
+        // spin loop, or async-parked. Applying at an arbitrary EIP drops the registers into
+        // live guest code and the thread runs off into garbage.
+        const eip = cpu.instruction_pointer[0] >>> 0;
+        const atSpinLoop = this.spinLoopAddress > 0
+            && eip >= this.spinLoopAddress && eip < this.spinLoopAddress + 4;
+        if (!atSpinLoop && !(scheduler as any).isThreadAsyncParked?.(tid)) return false;
+
+        // The owner was readied when the completion was deferred; bring it fully RUNNING
+        // before its registers are rewritten, mirroring the async-restore resume phase.
+        scheduler.wakeThreadForAsyncCompletion(tid);
+        (scheduler as any).markThreadRunningAfterAsyncWake?.(tid);
+        return cbMgr.tryApplyDeferredCompletion(tid, cpu);
+    }
+
     hasPendingAsyncRestoreForThread(threadId: number | null): boolean {
         if (this.pendingAsyncRestores.length === 0) return false;
         if (threadId === null) return true;
@@ -2502,6 +2543,13 @@ export class ThunkDispatcher {
      *     cross-thread waiter resumes via this same path once the scheduler switches to it.
      */
     tryApplyPendingAsyncRestoreAtSafePoint(cpu: any, source: string = "onPollAsyncRestores"): boolean {
+        // A suspended-frame completion deferred to its owner thread resumes at the SAME
+        // safe point as a cross-thread async thunk: the owner is current and parked, its
+        // registers are live and about to be overwritten wholesale. Drained first (and
+        // independently of pendingAsyncRestores, which may be empty) so a JS-driven pump
+        // whose terminal step landed on a sibling thread is not stranded.
+        if (this.drainDeferredFrameCompletion(cpu)) return true;
+
         if (this.pendingAsyncRestores.length === 0) return false;
 
         const scheduler = this.ensureScheduler();
@@ -2830,7 +2878,15 @@ export class ThunkDispatcher {
      *                               stub RET N); `newEsp` is authoritative — must NOT override.
      *  - otherwise                → v86 ran a RET N that disagrees with our recorded cleanup;
      *                               forcing `newEsp` would misalign ESP → wild EBP. Trust v86.
+     *
+     * "Trust v86" is gated on `liveEsp` being reachable from `parkEsp` by a RET N at all
+     * (see MAX_STUB_CLEANUP_BYTES) — a live ESP belonging to a different thread must never
+     * be adopted as this thread's.
      */
+    /** Largest plausible stdcall stub cleanup (32 args). Beyond this a "divergent RET N" is
+     *  not a RET N — it is some other thread's ESP in the shared register file. */
+    static readonly MAX_STUB_CLEANUP_BYTES = 128;
+
     static reconcileAsyncRestoreEsp(parkEsp: number, cleanupBytes: number, liveEsp: number): { esp: number; mismatch: boolean } {
         const newEsp = (parkEsp + 4 + cleanupBytes) >>> 0;
         const parkEspPlus4 = (parkEsp + 4) >>> 0;
@@ -2843,6 +2899,19 @@ export class ThunkDispatcher {
         // wild EBP → guest SEH → silent ExitProcess(0) (observed on NFSU: LoadLibraryA
         // cleanup=4 and Present cleanup=20, both with liveEsp===parkEsp in the report).
         if (le === (parkEsp >>> 0)) {
+            return { esp: newEsp, mismatch: false };
+        }
+        // A RET N can only raise ESP by 4 (the popped return address) plus N argument bytes,
+        // and only WITHIN THE PARKED THREAD'S OWN STACK. A liveEsp that is not such a value
+        // did not come from this stub at all: the register file is holding ANOTHER thread's
+        // ESP because the completion is being applied from a different thread's slice (the
+        // modal pump dispatches callbacks while its peers sit parked). Adopting it stamps a
+        // foreign stack onto the resumed thread; that thread's next park then records a saved
+        // ESP inside a peer's live frame, the next invokeCallback writes over the peer's
+        // return address, and the peer RETs into the bootloader (EIP=0x7c07). The recorded
+        // cleanup is authoritative whenever the live ESP cannot be a RET N from parkEsp.
+        const delta = le - (parkEsp >>> 0);
+        if (delta < 0 || delta > 4 + ThunkDispatcher.MAX_STUB_CLEANUP_BYTES || (delta % 4) !== 0) {
             return { esp: newEsp, mismatch: false };
         }
         if (le !== newEsp && le !== parkEspPlus4) {
@@ -4231,6 +4300,12 @@ export class ThunkDispatcher {
     /** Most recent wild-EBP note (or null). Surfaced in the crash report. */
     getLastWildEbpNote(): string | null {
         return this.lastWildEbpNote;
+    }
+
+    /** Name of the WinAPI/CRT export most recently dispatched — the thunk in flight
+     *  while JS runs. Read by the JS write trap to attribute a write to a handler. */
+    getCurrentThunkName(): string {
+        return this.lastThunkName ?? "";
     }
 
     /** Most recent async-restore RET N mismatch note (or null). Surfaced in the crash report. */
@@ -6384,7 +6459,28 @@ export class ThunkDispatcher {
         return null;
     }
 
+    /**
+     * Startup-ordering invariant: no guest instruction may execute before HLE module
+     * registration completes. Until it does, EVERY import looks unimplemented and gets
+     * ERROR_NOT_SUPPORTED (50) — a guest that calls the result as a function pointer (a
+     * DllMain resolving GetProcAddress, say) ends up at EIP 0x32 and dies far from the
+     * cause. The load path awaits readiness, so reaching the sentinel while this is false
+     * is a broken gate, not a missing handler: say so instead of returning 50 quietly.
+     */
+    markHleRegistrationComplete(): void {
+        this.hleRegistrationComplete = true;
+    }
+    private hleRegistrationComplete = false;
+
     private _slowPathMissingImplementation(functionId: number, cpu: any, name: string): void {
+        if (!this.hleRegistrationComplete) {
+            Logger.error(LogCategory.THUNK,
+                `[ORDERING] ${name} (id=0x${functionId.toString(16)}) hit the UNIMPLEMENTED path ` +
+                `BEFORE HLE registration completed — the dispatch table is still empty, so this is ` +
+                `an ordering violation, not a missing handler. Every import in this window returns ` +
+                `ERROR_NOT_SUPPORTED and any guest that calls the result crashes with a wild EIP. ` +
+                `The load path must await HLE readiness before the guest runs.`);
+        }
         const stub = this.thunkGenerator.getStubById(functionId);
         const esp = cpu.reg32[4];
         const argCount = stub?.argCount ?? this.argCountsTable[functionId] ?? 0;

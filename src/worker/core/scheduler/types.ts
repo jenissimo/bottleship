@@ -352,7 +352,14 @@ export interface SchedulerConfig {
 
 export const DEFAULT_SCHEDULER_CONFIG: SchedulerConfig = {
     enabled: true,
-    minQuantumMs: 1,
+    // NT's client quantum is ~15.6 ms (two clock ticks). A 1 ms quantum preempts ~15x
+    // more often than the OS these titles were written against, which turns a benign
+    // guest race into a reliable one: a thread that seeks then reads a shared file
+    // handle gets split by a peer far more often than it ever would on Windows.
+    // Measured on Natalie Brooks, 6 level loads per arm: crashed 4/6 at 1 ms vs 0/6
+    // at 16 ms; corrupted archive reads per load 2.8 -> 1.7 mean. Preemption frequency
+    // is part of faithfulness, not just a tuning knob.
+    minQuantumMs: 16,
     debugLogging: false,
     asyncHleWaitEnabled: true,
 };

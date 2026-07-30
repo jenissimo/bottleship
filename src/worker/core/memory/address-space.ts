@@ -52,7 +52,6 @@ interface LayoutBucket {
 }
 
 const FASTMEM_BUMP_ADDRESS_SPACE_PROTECT = 3;
-const FASTMEM_BUMP_ADDRESS_SPACE_RELEASE = 4;
 
 export function bumpFastmemGeneration(source: number): void {
     try {
@@ -151,13 +150,26 @@ export class AddressSpace {
         return newEntry.id;
     }
 
+    /**
+     * Drop a region record. This is JS-side bookkeeping only: it clears no PTE, so
+     * every page in the range stays present and identity-mapped and a fastmem-speculated
+     * load over it stays architecturally correct (it reads freed-but-mapped memory, which
+     * is what real hardware does until the OS decommits). The accessibility change that
+     * CAN invalidate speculation — MEM_DECOMMIT / protect-down — goes through
+     * PageTableManager, which bumps the generation itself.
+     *
+     * So: no bump here. The generation is global — one bump deoptimises the whole
+     * compiled working set (see PageTableManager.noteCommitOnlyMappingChange) — and a
+     * loading game frees non-HEAP blocks many times a second, which is a rate that keeps
+     * the JIT permanently cold.
+     */
     releaseRegion(base: number): boolean {
         const idx = this.regions.findIndex(region => region.base === base && region.owner !== "Layout");
         if (idx >= 0) {
             const released = this.regions[idx];
             this.regions.splice(idx, 1);
-            bumpFastmemGeneration(FASTMEM_BUMP_ADDRESS_SPACE_RELEASE);
             // A released VA is no longer a known writable region — drop bit0.
+            // (Data map, read per store, no generation guard — see codegen gen_safe_write.)
             setWriteMapBase(released.base, released.size, false);
             return true;
         }

@@ -341,6 +341,10 @@ export class Scheduler {
     private pinDeferSinceMs = 0;
     private pinDeferCount = 0;
     public pinStarvationForced = 0;
+    /** Why the last tick boundary did NOT switch. Numeric so the hot path stays a store.
+     *  1=asyncRestore 2=timerThread 3=yieldPending 4=allBlockedOrSpin 5=switched
+     *  6=pinDefer 7=quantumNotExpired 8=nonPreemptible 9=criticalDefer 10=noRunQueue */
+    lastTickExit = 0;
 
     /**
      * Does the callback pin justify skipping THIS switch?
@@ -382,6 +386,15 @@ export class Scheduler {
         this.pinStarvationForced++;
         this.pinDeferSinceMs = 0;
         this.pinDeferCount = 0;
+        // REQUEST the switch, don't merely permit it. The caller's next test is
+        // `switchRequested || quantumExpired`, so returning false alone does nothing on a
+        // tick where the quantum has not expired — and this window has just been reset, so
+        // the pin defers for another full PIN_STARVATION_MAX_MS. A thread holding the pin
+        // continuously (a guest spin-wait inside a callback) then starves READY peers
+        // forever while this counter happily ticks up: the bound fires and nothing moves.
+        // Observed on HP CoS's boot — pinStarvationForced climbing ~28/5s with realSwitch
+        // frozen and window.dll READY the whole time.
+        this.switchRequested = true;
         return false;
     }
 
@@ -726,7 +739,7 @@ export class Scheduler {
         }
 
         // 3a. Dispatch timer thread callback if we ARE the timer thread
-        if (this.tryDispatchTimerThreadCallbacks(cpu)) return;
+        if (this.tryDispatchTimerThreadCallbacks(cpu)) { this.lastTickExit = 2; return; }
 
         // 3b. Dispatch one queued callback if safe
         this.callbackCoord.dispatchOne();
@@ -829,7 +842,7 @@ export class Scheduler {
         }
 
         // 1. Process pending async restores (highest priority — unblocks spin-loop threads)
-        if (this.onPollAsyncRestores?.(cpu, "preemptAtTickBoundary")) return;
+        if (this.onPollAsyncRestores?.(cpu, "preemptAtTickBoundary")) { this.lastTickExit = 1; return; }
 
         // 2. Poll timers
         const now = this.timeService.nowMs();
@@ -848,6 +861,7 @@ export class Scheduler {
         if (this.yieldToHostMs > 0) {
             const ms = this.yieldToHostMs;
             this.yieldToHostMs = 0;
+            this.lastTickExit = 3;
             this.yieldToHost(cpu, ms);
             return;
         }
@@ -907,6 +921,7 @@ export class Scheduler {
                             return;
                         }
                     }
+                    this.lastTickExit = 4;
                     this.yieldToHost(cpu, 1, "spinLoop");
                     return;
                 }
@@ -958,8 +973,21 @@ export class Scheduler {
                 // and cannot run — its peers must be allowed to proceed (see onThunkBoundary).
                 // The deferral is bounded so a frame-long callback cannot starve them (see
                 // pinDefersSwitch).
-                if (this.pinDefersSwitch(current)) return;
+                if (this.pinDefersSwitch(current)) { this.lastTickExit = 6; return; }
                 // Retired-instruction quantum (deterministic), not wall-clock — see quantumExpired().
+                // The quantum is measured in RETIRED GUEST INSTRUCTIONS, and a thread sitting
+                // on the spin loop's `JMP $` advances cpu.instruction_counter by nothing the
+                // scheduler can see — so quantumExpired() is false forever. That is fine for a
+                // properly parked thread (WAITING, skipped entirely), but an ORPHAN left
+                // RUNNING at the park address (async park that lost its restore) then blocks
+                // EVERY switch while peers sit READY: the guest freezes with a non-empty run
+                // queue and `lastTickExit=7` on every tick. It is spinning, not working —
+                // request the switch so peers run. It stays runnable, so a late restore still
+                // resumes it. (HP CoS: froze at the boot splash with window.dll READY.)
+                if (this.spinLoopBase > 0 && (cpu.instruction_pointer[0] >>> 0) === this.spinLoopBase) {
+                    this.switchRequested = true;
+                }
+                if (!(this.switchRequested || this.quantumExpired(current, cpu))) this.lastTickExit = 7;
                 if (this.switchRequested || this.quantumExpired(current, cpu)) {
                     if (this.shouldDeferSwitchForCriticalRuntime(cpu, ThunkBoundaryKind.GUEST_CODE)) {
                         this.switchRequested = true;
@@ -991,6 +1019,7 @@ export class Scheduler {
                         }
                     }
                     this.switchRequested = false;
+                    this.lastTickExit = 5;
                     this.performSwitch(cpu, ThunkBoundaryKind.GUEST_CODE, 0);
                     // 7b. If we just switched TO the timer thread, dispatch its callback immediately
                     this.tryDispatchTimerThreadCallbacks(cpu);
