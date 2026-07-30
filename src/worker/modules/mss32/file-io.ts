@@ -291,7 +291,7 @@ async function fileReadLowLevel(ctx: MSSContext, mem: Uint8Array, fileHandle: nu
 
     try {
         const fileSize = system.fileSystem.getFileSize(vfsHandle.path);
-        const currentPosition = vfsHandle.position || 0;
+        const currentPosition = system.fileSystem.tell(vfsHandle);
         const remainingBytes = fileSize - currentPosition;
 
         if (readSize > remainingBytes) {

@@ -434,7 +434,8 @@ class LibHleManager {
     private runOriginalSync(decl: HookedFunction, handle: PatchHandle, callArgs: number[]): SyncCallResult {
         const env = this.syncEnv();
         if (!env) return { ok: false, reason: 'no-export' };
-        return callGuestFunctionSync(env, handle.trampolineAddress!, callArgs, decl.callingConvention);
+        const effEnv = decl.shadow?.allowGuestImports ? { ...env, abortLo: 0, abortHi: 0 } : env;
+        return callGuestFunctionSync(effEnv, handle.trampolineAddress!, callArgs, decl.callingConvention);
     }
 
     /** Assemble the sync-call environment (lazy sentinel, live wasm export). */

@@ -243,6 +243,17 @@ export interface ShadowSpec {
      * A hook flips this on once the round-trip is proven for its shape.
      */
     validateInGame?: boolean;
+    /**
+     * Let the sync-original run re-enter our import thunks instead of aborting
+     * on them. Required for a library entry point that ALLOCATES (zlib's
+     * `uncompress` mallocs a 32 KiB window through the CRT, whose HeapAlloc IAT
+     * slot is one of our stubs) — without it every validation call aborts with
+     * 'thunk-entry' and the hook disables itself on call one. The cost is that
+     * the guest may OUT-trap while we are already inside an OUT handler: only
+     * safe when the imports involved are SYNCHRONOUS thunks, since an async one
+     * would try to park a thread that the sync-call loop is driving.
+     */
+    allowGuestImports?: boolean;
 }
 
 export type ShadowHookState = 'shadowing' | 'active' | 'disabled';
