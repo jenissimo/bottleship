@@ -7,7 +7,7 @@
 import { System } from '../../core/system';
 import { createVTablesFromDescriptor, VTableInfo } from '../../api/adapters/module-adapter';
 import { d3d9Module } from '../../api/d3d9.api';
-import { D3D9Device } from '../../backends/webgpu/d3d9/d3d9-device';
+import type { D3D9Device } from '../../backends/webgpu/d3d9/d3d9-device';
 import { Logger, LogCategory } from '../../core/logger';
 import { clearResourceRegistry } from './resource-registry';
 import type { D3D9StateBlockData } from '../../backends/webgpu/d3d9/d3d9-state-block';
@@ -18,6 +18,8 @@ import { d3d9WasmArena } from '../../backends/webgpu/d3d9/d3d9-wasm-arena';
 
 // Shared vtables - created once and reused
 let vtables: Record<string, VTableInfo> | null = null;
+const comRefCounts: Map<number, number> = new Map();
+const comFinalizers: Map<number, () => void> = new Map();
 
 // Shared device registry - maps COM object pointer to D3D9Device instance
 export const devices: Map<number, D3D9Device> = new Map();
@@ -48,8 +50,45 @@ export function createComObject(vtableAddress: number): number {
     
     // Write vtable pointer to memory (first field of COM object)
     view.setUint32(objPtr, vtableAddress, true);
+    comRefCounts.set(objPtr, 1);
 
     return objPtr;
+}
+
+export function addComRef(ptr: number): number | undefined {
+    const key = ptr >>> 0;
+    const current = comRefCounts.get(key);
+    if (current === undefined) return undefined;
+    const next = current + 1;
+    comRefCounts.set(key, next);
+    return next;
+}
+
+export function releaseComRef(ptr: number): number | undefined {
+    const key = ptr >>> 0;
+    const current = comRefCounts.get(key);
+    if (current === undefined) return undefined;
+    const next = current - 1;
+    if (next > 0) {
+        comRefCounts.set(key, next);
+        return next;
+    }
+
+    comRefCounts.delete(key);
+    const finalizer = comFinalizers.get(key);
+    comFinalizers.delete(key);
+    finalizer?.();
+    return 0;
+}
+
+export function registerComFinalizer(ptr: number, finalizer: () => void): void {
+    comFinalizers.set(ptr >>> 0, finalizer);
+}
+
+export function forgetComObject(ptr: number): void {
+    const key = ptr >>> 0;
+    comRefCounts.delete(key);
+    comFinalizers.delete(key);
 }
 
 /**
@@ -82,6 +121,8 @@ export function resetD3D9SharedState(): void {
     deviceToD3D9.clear();
     resourceToDevice.clear();
     stateBlocks.clear();
+    comRefCounts.clear();
+    comFinalizers.clear();
     d3d9WasmArena.resetBlockSlots(); // every block ptr just dropped — slot ownership resets with them
     clearD3D9ComObjectRegistries();
     clearResourceRegistry();

@@ -13,8 +13,8 @@ import { gammaService } from '../../core/gamma-service';
 import { D3D9Device } from '../../backends/webgpu/d3d9/d3d9-device';
 import { WebGPUBackend } from '../../backends/webgpu/webgpu-backend';
 import { writeDeviceCaps9 } from './caps';
-import { getVTables, devices, createComObject, resourceToDevice, deviceToD3D9 } from './shared-state';
-import { deviceBoundDepthStencil, deviceBoundRenderTarget, deviceCursorProperties, resolveSurfaceInfo, surfaceMeta } from './resource-registry';
+import { addComRef, getVTables, devices, createComObject, registerComFinalizer, releaseComRef, resourceToDevice, deviceToD3D9 } from './shared-state';
+import { deviceBoundDepthStencil, deviceBoundRenderTarget, deviceCursorProperties, releaseSurfaceMetadata, resolveSurfaceInfo, surfaceMeta } from './resource-registry';
 import { syncHostCursorToGuestState, warpGuestCursorTo } from '../user32/shared-state';
 import { setDeviceCursorImage, showDeviceCursor } from '../../core/device-cursor';
 
@@ -54,6 +54,18 @@ function registerImplicitBackbufferMeta(surfacePtr: number): void {
         width: cfg.width,
         height: cfg.height,
     });
+}
+
+function addSurfaceRef(surfacePtr: number): void {
+    const pSurface = surfacePtr >>> 0;
+    if (!pSurface) return;
+    addComRef(surfaceMeta.get(pSurface)?.texturePtr || pSurface);
+}
+
+function releaseSurfaceRef(surfacePtr: number): void {
+    const pSurface = surfacePtr >>> 0;
+    if (!pSurface) return;
+    releaseComRef(surfaceMeta.get(pSurface)?.texturePtr || pSurface);
 }
 
 /**
@@ -96,6 +108,7 @@ function bindAutoDepthStencil(device: D3D9Device, devicePtr: number, mem: Uint8A
         width: w,
         height: h,
     });
+    registerComFinalizer(surfacePtr, () => releaseSurfaceMetadata(surfacePtr));
     deviceBoundDepthStencil.set(devicePtr, surfacePtr);
     Logger.log(LogCategory.D3D9, `auto depth-stencil ${w}x${h} fmt=${format} -> 0x${surfacePtr.toString(16)} (bound)`);
 }
@@ -287,6 +300,18 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
             // Store device instance mapped to COM object pointer
             devices.set(devicePtr, device);
             deviceToD3D9.set(devicePtr, pD3D9);
+            addComRef(pD3D9);
+            registerComFinalizer(devicePtr, () => {
+                device.releaseComBindings();
+                releaseSurfaceRef(deviceBoundDepthStencil.get(devicePtr) ?? 0);
+                releaseSurfaceRef(deviceBoundRenderTarget.get(devicePtr) ?? 0);
+                devices.delete(devicePtr);
+                releaseComRef(pD3D9);
+                deviceToD3D9.delete(devicePtr);
+                deviceBoundDepthStencil.delete(devicePtr);
+                deviceBoundRenderTarget.delete(devicePtr);
+                deviceCursorProperties.delete(devicePtr);
+            });
 
             // Bind this device as the active owner of the guest-side setter-shadow trampolines and
             // re-sentinel their shadow tables: a fresh device has a fresh JS state-of-record, so a
@@ -372,7 +397,13 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         const face = meta?.face ?? -1;
         device.noteRtResolve(surfacePtr, !!meta, texturePtr);
         Logger.verbose(LogCategory.D3D9, `SetRenderTarget(index=${args[1]}, surface=0x${surfacePtr.toString(16)} -> tex=0x${texturePtr.toString(16)} face=${face})`);
-        if ((args[1] >>> 0) === 0) deviceBoundRenderTarget.set(args[0] >>> 0, surfacePtr);
+        if ((args[1] >>> 0) === 0) {
+            const devicePtr = args[0] >>> 0;
+            const previous = deviceBoundRenderTarget.get(devicePtr) ?? 0;
+            addSurfaceRef(surfacePtr);
+            deviceBoundRenderTarget.set(devicePtr, surfacePtr);
+            if (previous && previous !== surfacePtr) releaseSurfaceRef(previous);
+        }
         device.setRenderTarget(args[1] >>> 0, texturePtr >>> 0, face);
         return D3D_OK;
     };
@@ -394,8 +425,10 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
             rt = createComObject(vtableAddr);
             resourceToDevice.set(rt, device);
             registerImplicitBackbufferMeta(rt);
+            registerComFinalizer(rt, () => releaseSurfaceMetadata(rt));
             deviceBoundRenderTarget.set(devicePtr, rt);
         }
+        addSurfaceRef(rt);
         return Mem.writeUint32(ppRenderTarget, rt) ? D3D_OK : D3DERR_INVALIDCALL;
     };
 
@@ -654,6 +687,7 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
             parentPtr = createComObject(d3d9VtableAddr);
             deviceToD3D9.set(pDevice, parentPtr);
         }
+        addComRef(parentPtr);
 
         return Mem.writeUint32(ppD3D9, parentPtr) ? D3D_OK : D3DERR_INVALIDCALL;
     };
@@ -702,6 +736,7 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         // Register surface with device for method calls
         resourceToDevice.set(surfacePtr, device);
         registerImplicitBackbufferMeta(surfacePtr);
+        registerComFinalizer(surfacePtr, () => releaseSurfaceMetadata(surfacePtr));
 
         if (ppBackBuffer) {
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
@@ -734,7 +769,10 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
             }
         }
 
+        const previous = deviceBoundDepthStencil.get(pDevice) ?? 0;
+        addSurfaceRef(pNewZStencil);
         deviceBoundDepthStencil.set(pDevice, pNewZStencil);
+        if (previous && previous !== pNewZStencil) releaseSurfaceRef(previous);
         Logger.verbose(LogCategory.D3D9, `SetDepthStencilSurface(0x${pNewZStencil.toString(16)})`);
         return D3D_OK;
     };
@@ -750,6 +788,7 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         }
 
         const bound = deviceBoundDepthStencil.get(pDevice) ?? 0;
+        addSurfaceRef(bound);
         if (!Mem.writeUint32(ppZStencilSurface, bound)) {
             return D3DERR_INVALIDCALL;
         }

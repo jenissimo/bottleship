@@ -1512,13 +1512,8 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
     postBundleMeta(bundle.manifest, gameId);
     await system.fileSystem.initOverlay(gameId);
     await system.fileSystem.ensureOverlayIndex();
-    // Read + compile the AOT units NOW, concurrently with the rest of the bundle load. They
-    // cannot be published until the guest image is final (see the pe-loaded hook), but the
-    // expensive half — OPFS reads and megabytes of wasm compilation — needs no guest memory
-    // and has no business sitting on the critical path.
-    const aotPrepared = (globalThis as Record<string, unknown>).__aotAutoLoad
-      ? aotCache.prepare(gameId).catch((e) => ({ error: String(e) }))
-      : null;
+    // Filled after manifest config is applied; AOT versioning depends on CPU flags.
+    let aotPrepared: Promise<{ loaded: number; key: string } | { error: string; key?: string }> | null = null;
     // Install the per-game persist/ephemeral policy (#12): ephemeral writes stay in memory, never OPFS.
     system.fileSystem.setPathPolicy(new PathPolicy({
         ephemeral: bundle.manifest.emulator?.ephemeral,
@@ -1677,6 +1672,11 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
     const emulatorConfig = EmulatorConfig.getInstance();
     emulatorConfig.reset();
     emulatorConfig.applyFromManifest(bundle.manifest);
+    // The AOT cache key includes manifest-controlled CPU flags such as relaxed FPU,
+    // so prepare only after the current bundle config has been applied.
+    aotPrepared = (globalThis as Record<string, unknown>).__aotAutoLoad
+      ? aotCache.prepare(gameId).catch((e) => ({ error: String(e) }))
+      : null;
 
     // Delete crash-sentinel and other stale files from CoW overlay before game starts
     if (emulatorConfig.deleteOnBoot.length > 0) {

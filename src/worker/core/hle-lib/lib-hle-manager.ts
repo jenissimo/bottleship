@@ -151,7 +151,7 @@ class LibHleManager {
                 continue;
             }
 
-            Logger.log(LogCategory.SYSTEM, 
+            Logger.log(LogCategory.SYSTEM,
                 `[HLE-lib] Detected '${desc.id}' in ${module.name} (confidence ${match.confidence}, ` +
                 `${match.functionMatches.length} functions resolved` +
                 (match.missingFunctions.length > 0 ? `, ${match.missingFunctions.length} missing: ${match.missingFunctions.join(', ')}` : '') +
@@ -197,7 +197,7 @@ class LibHleManager {
             const needsTrampoline = decl.shadow?.validateInGame === true;
             if (decl.shadow) {
                 if (needsTrampoline && decl.prologueLen === undefined) {
-                    Logger.error(LogCategory.SYSTEM, 
+                    Logger.error(LogCategory.SYSTEM,
                         `[HLE-lib] ${descriptor.id}:${fm.name} sets validateInGame but no prologueLen — ` +
                         `the original-call path is impossible; skipping hook`);
                     continue;
@@ -212,7 +212,7 @@ class LibHleManager {
                         const h = this.patches.get(descriptor.id)?.get(fm.name);
                         if (decl.hypercallHandlerId !== undefined && h && h.functionId >= 0) {
                             hypercallDataManager.registerRawHandler(h.functionId, decl.hypercallHandlerId);
-                            Logger.log(LogCategory.SYSTEM, 
+                            Logger.log(LogCategory.SYSTEM,
                                 `[HLE-shadow] ${descriptor.id}:${fm.name} promoted to WASM handler ` +
                                 `${decl.hypercallHandlerId} (funcId ${h.functionId})`);
                         }
@@ -231,7 +231,7 @@ class LibHleManager {
                 continue;
             }
             if (decl.entryFilter && decl.prologueLen === undefined) {
-                Logger.error(LogCategory.SYSTEM, 
+                Logger.error(LogCategory.SYSTEM,
                     `[HLE-lib] ${descriptor.id}:${fm.name} declares entryFilter but no prologueLen — ` +
                     `the filter's decline path (trampoline) is impossible; skipping hook`);
                 continue;
@@ -248,7 +248,7 @@ class LibHleManager {
             });
             if (handle) {
                 if (needsTrampoline && handle.trampolineAddress === undefined) {
-                    Logger.error(LogCategory.SYSTEM, 
+                    Logger.error(LogCategory.SYSTEM,
                         `[HLE-lib] ${descriptor.id}:${fm.name}: validateInGame hook patched without ` +
                         `trampoline — unpatching`);
                     this.unpatch(descriptor.id, fm.name);
@@ -271,7 +271,7 @@ class LibHleManager {
                     hypercallDataManager.registerRawHandler(handle.functionId, decl.hypercallHandlerId);
                 }
 
-                Logger.log(LogCategory.SYSTEM, 
+                Logger.log(LogCategory.SYSTEM,
                     `[HLE-lib] Patched ${descriptor.id}:${fm.name} at 0x${fm.address.toString(16)} ` +
                     `→ stub 0x${handle.stubAddress.toString(16)}` +
                     (decl.hypercallHandlerId !== undefined ? ` [WASM handler ${decl.hypercallHandlerId}]` : '') +
@@ -410,7 +410,7 @@ class LibHleManager {
         if (res.reason === 'no-export') {
             if (!this.warnedNoExport) {
                 this.warnedNoExport = true;
-                Logger.error(LogCategory.SYSTEM, 
+                Logger.error(LogCategory.SYSTEM,
                     `[HLE-shadow] run_guest_until export missing (stale v86 wasm?) — ` +
                     `in-game validation impossible; hooks go kernel-live UNVALIDATED ` +
                     `(equivalent to validateInGame:false)`);
@@ -507,7 +507,7 @@ class LibHleManager {
             hypercallDataManager.unregisterRawHandler(handle.functionId);
         }
         libPatches!.delete(functionName);
-        Logger.log(LogCategory.SYSTEM, 
+        Logger.log(LogCategory.SYSTEM,
             `[HLE-lib] Unpatched ${libId}:${functionName} at 0x${handle.targetAddress.toString(16)} ` +
             `— restored ${handle.originalBytes.length} original bytes`,
         );
@@ -577,7 +577,7 @@ class LibHleManager {
             return;
         }
         for (const r of rows) {
-            Logger.log(LogCategory.SYSTEM, 
+            Logger.log(LogCategory.SYSTEM,
                 `[HLE-lib] ${r.lib} @ ${r.module} (confidence=${r.confidence}, patches=${r.patches.length}` +
                 (r.missing.length > 0 ? `, missing=${r.missing.join(',')}` : '') + `)`);
             for (const p of r.patches) {

@@ -29,6 +29,7 @@ import {
     d3d9PerfStateBlockApply, d3d9PerfStateBlockCapture,
     d3d9PerfStateBlockWasmApply, d3d9PerfStateBlockWasmCapture,
 } from "../../../modules/d3d9/d3d9-perf";
+import { addComRef, releaseComRef } from "../../../modules/d3d9/shared-state";
 import { isValidAddress } from "../../../core/memory/address-guard";
 import { Mem } from "../../../core/memory/mem-accessor";
 import { sanitizeViewport } from "../ddraw/types";
@@ -384,6 +385,7 @@ export class D3D9Device {
 
     private activeVertexShaderComPtr: number = 0;
     private activePixelShaderComPtr: number = 0;
+    private boundIndexPtr: number = 0;
 
     // Fixed-function state commonly touched by older D3D9 games
     private textureStageStates = new Map<number, number>();
@@ -409,6 +411,28 @@ export class D3D9Device {
     private boundTexturePtrs = new Array<number>(8).fill(0);
     private suppressStateBlockRecording = false;
     private viewport = { x: 0, y: 0, width: 800, height: 600, minZ: 0, maxZ: 1 };
+
+    private replaceHeldComRef(current: number, next: number): number {
+        const currentPtr = current >>> 0;
+        const nextPtr = next >>> 0;
+        if (currentPtr === nextPtr) return currentPtr;
+        if (nextPtr !== 0) addComRef(nextPtr);
+        if (currentPtr !== 0) releaseComRef(currentPtr);
+        return nextPtr;
+    }
+
+    releaseComBindings(): void {
+        this.activeVertexShaderComPtr = this.replaceHeldComRef(this.activeVertexShaderComPtr, 0);
+        this.activePixelShaderComPtr = this.replaceHeldComRef(this.activePixelShaderComPtr, 0);
+        this.activeVertexDeclComPtr = this.replaceHeldComRef(this.activeVertexDeclComPtr, 0);
+        this.boundIndexPtr = this.replaceHeldComRef(this.boundIndexPtr, 0);
+        for (let i = 0; i < this.streamBindingPtr.length; i++) {
+            this.streamBindingPtr[i] = this.replaceHeldComRef(this.streamBindingPtr[i]!, 0);
+        }
+        for (let i = 0; i < this.boundTexturePtrs.length; i++) {
+            this.boundTexturePtrs[i] = this.replaceHeldComRef(this.boundTexturePtrs[i]!, 0);
+        }
+    }
 
     constructor(backend: WebGPUBackend, memory: Uint8Array) {
         this.backend = backend;
@@ -577,7 +601,7 @@ export class D3D9Device {
             return 0;
         }
         this.activeVertexShader = handle;
-        this.activeVertexShaderComPtr = comPtr;
+        this.activeVertexShaderComPtr = this.replaceHeldComRef(this.activeVertexShaderComPtr, comPtr);
         this.currentPipelineKey = null; // invalidate pipeline cache
         this.currentPipelineId = null;
         Logger.verbose(LogCategory.D3D9, `[D3D9] SetVertexShader(${handle})`);
@@ -604,7 +628,7 @@ export class D3D9Device {
             return 0;
         }
         this.activePixelShader = handle;
-        this.activePixelShaderComPtr = comPtr;
+        this.activePixelShaderComPtr = this.replaceHeldComRef(this.activePixelShaderComPtr, comPtr);
         this.currentPipelineKey = null;
         this.currentPipelineId = null;
         Logger.verbose(LogCategory.D3D9, `[D3D9] SetPixelShader(${handle})`);
@@ -859,7 +883,7 @@ export class D3D9Device {
             this.currentPipelineKey = null;
             this.currentPipelineId = null;
         }
-        this.activeVertexDeclComPtr = comPtr;
+        this.activeVertexDeclComPtr = this.replaceHeldComRef(this.activeVertexDeclComPtr, comPtr);
         return 0;
     }
 
@@ -948,7 +972,7 @@ export class D3D9Device {
         // Record the guest-visible binding for every stream — GetStreamSource must report
         // back exactly what was set even for streams the draw path below ignores.
         if (streamNumber < D3D9Device.MAX_STREAMS) {
-            this.streamBindingPtr[streamNumber] = vbPtr >>> 0;
+            this.streamBindingPtr[streamNumber] = this.replaceHeldComRef(this.streamBindingPtr[streamNumber]!, vbPtr);
             this.streamBindingOffset[streamNumber] = offset >>> 0;
             this.streamBindingStride[streamNumber] = stride >>> 0;
         }
@@ -1104,6 +1128,7 @@ export class D3D9Device {
 
     setIndices(ibPtr: number): number {
         d3d9PerfInc("setIndices");
+        this.boundIndexPtr = this.replaceHeldComRef(this.boundIndexPtr, ibPtr);
         if (ibPtr === 0) {
             if (d3d9WasmArena.isInitialized()) d3d9WasmArena.setIndices(0, 0);
             if (!this.stateTracker.setIndexSource(null)) d3d9PerfSkip("setIndices");
@@ -1533,7 +1558,7 @@ export class D3D9Device {
             return 0;
         }
         if (stage < this.boundTexturePtrs.length) {
-            this.boundTexturePtrs[stage] = texPtr;
+            this.boundTexturePtrs[stage] = this.replaceHeldComRef(this.boundTexturePtrs[stage]!, texPtr);
         }
         if (texPtr === 0) {
             if (d3d9WasmArena.isInitialized()) d3d9WasmArena.setTexture(stage, 0);

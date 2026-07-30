@@ -7,8 +7,8 @@
 import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { Mem } from '../../core/memory/mem-accessor';
-import { devices, getVTables, createComObject, stateBlocks } from './shared-state';
-import { vertexBufferMeta } from './resource-registry';
+import { addComRef, devices, getVTables, createComObject, registerComFinalizer, releaseComRef, stateBlocks } from './shared-state';
+import { surfaceMeta, textureMeta, vertexBufferMeta } from './resource-registry';
 import { stubRegistry } from '../../core/diagnostics/stub-registry';
 import { RawVertexElement } from '../../backends/webgpu/d3d9/shader';
 import type { D3D9StateBlockData } from '../../backends/webgpu/d3d9/d3d9-state-block';
@@ -62,6 +62,7 @@ export function createStateExports(): Record<string, ThunkImplementation> {
             coverage.psConstRanges,
         );
         stateBlocks.set(sbPtr, data);
+        registerComFinalizer(sbPtr, () => stateBlocks.delete(sbPtr));
         return sbPtr;
     }
 
@@ -73,6 +74,26 @@ export function createStateExports(): Record<string, ThunkImplementation> {
     }
 
     const writeStateBlockOut = writeComPtrOut;
+
+    function addD3D9ComRef(prefix: string, ptr: number): number {
+        const pObject = ptr >>> 0;
+        if (!pObject) return 0;
+        if (prefix === 'IDirect3DSurface9') {
+            const parentTexture = surfaceMeta.get(pObject)?.texturePtr ?? 0;
+            if (parentTexture) return addComRef(parentTexture) ?? 1;
+        }
+        return addComRef(pObject) ?? 1;
+    }
+
+    function releaseD3D9ComRef(prefix: string, ptr: number): number {
+        const pObject = ptr >>> 0;
+        if (!pObject) return 0;
+        if (prefix === 'IDirect3DSurface9') {
+            const parentTexture = surfaceMeta.get(pObject)?.texturePtr ?? 0;
+            if (parentTexture) return releaseComRef(parentTexture) ?? 0;
+        }
+        return releaseComRef(pObject) ?? 0;
+    }
 
     function writeVertexElements(pElement: number, elements: RawVertexElement[], mem: Uint8Array): boolean {
         if (!pElement) return false;
@@ -209,6 +230,7 @@ export function createStateExports(): Record<string, ThunkImplementation> {
             return D3DERR_INVALIDCALL;
         }
         if (!Mem.writeUint32(ppStreamData, binding.ptr)) return D3DERR_INVALIDCALL;
+        if (binding.ptr) addComRef(binding.ptr);
         if (args[3] && !Mem.writeUint32(args[3], binding.offset)) return D3DERR_INVALIDCALL;
         if (args[4] && !Mem.writeUint32(args[4], binding.stride)) return D3DERR_INVALIDCALL;
         return D3D_OK;
@@ -487,13 +509,13 @@ export function createStateExports(): Record<string, ThunkImplementation> {
         exports[`${prefix}_AddRef`] = (ctx, mem, args) => {
             const pObject = args[0];
             Logger.verbose(LogCategory.D3D9, `${prefix}::AddRef(0x${pObject.toString(16)})`);
-            return 2; // Dummy ref count
+            return addD3D9ComRef(prefix, pObject);
         };
 
         exports[`${prefix}_Release`] = (ctx, mem, args) => {
             const pObject = args[0];
             Logger.verbose(LogCategory.D3D9, `${prefix}::Release(0x${pObject.toString(16)})`);
-            return 1; // Dummy ref count
+            return releaseD3D9ComRef(prefix, pObject);
         };
     }
 
@@ -523,6 +545,7 @@ export function createStateExports(): Record<string, ThunkImplementation> {
             internalHandle: result.handle,
             bytecode: result.bytecode,
         });
+        registerComFinalizer(shaderPtr, () => vertexShaderComObjects.delete(shaderPtr));
 
         if (ppShader) {
             const dv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
@@ -555,7 +578,9 @@ export function createStateExports(): Record<string, ThunkImplementation> {
 
         if (ppShader) {
             const dv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            dv.setUint32(ppShader, device.getVertexShaderComPtr(), true);
+            const shaderPtr = device.getVertexShaderComPtr();
+            dv.setUint32(ppShader, shaderPtr, true);
+            if (shaderPtr) addComRef(shaderPtr);
         }
         return D3D_OK;
     };
@@ -620,6 +645,7 @@ export function createStateExports(): Record<string, ThunkImplementation> {
             internalHandle: result.handle,
             elements,
         });
+        registerComFinalizer(declPtr, () => vertexDeclComObjects.delete(declPtr));
 
         if (ppDecl) {
             dv.setUint32(ppDecl, declPtr, true);
@@ -647,7 +673,9 @@ export function createStateExports(): Record<string, ThunkImplementation> {
         const device = devices.get(args[0]);
         if (!device) return D3DERR_INVALIDCALL;
         if (args[1]) {
-            writeComPtrOut(args[1], device.getVertexDeclarationComPtr(), mem);
+            const declPtr = device.getVertexDeclarationComPtr();
+            writeComPtrOut(args[1], declPtr, mem);
+            if (declPtr) addComRef(declPtr);
         }
         return D3D_OK;
     };
@@ -678,6 +706,7 @@ export function createStateExports(): Record<string, ThunkImplementation> {
             internalHandle: result.handle,
             bytecode: result.bytecode,
         });
+        registerComFinalizer(shaderPtr, () => pixelShaderComObjects.delete(shaderPtr));
 
         if (ppShader) {
             const dv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
@@ -703,7 +732,9 @@ export function createStateExports(): Record<string, ThunkImplementation> {
         if (!device) return D3DERR_INVALIDCALL;
         if (args[1]) {
             const dv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            dv.setUint32(args[1], device.getPixelShaderComPtr(), true);
+            const shaderPtr = device.getPixelShaderComPtr();
+            dv.setUint32(args[1], shaderPtr, true);
+            if (shaderPtr) addComRef(shaderPtr);
         }
         return D3D_OK;
     };
@@ -782,6 +813,7 @@ export function createStateExports(): Record<string, ThunkImplementation> {
         if (!block || !ppDevice) return D3DERR_INVALIDCALL;
         const dv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         dv.setUint32(ppDevice, block.devicePtr, true);
+        addComRef(block.devicePtr);
         return D3D_OK;
     };
 
@@ -807,6 +839,7 @@ export function createStateExports(): Record<string, ThunkImplementation> {
     exports['IDirect3DVertexDeclaration9_GetDevice'] = (_ctx, mem, args) => {
         const meta = resolveVertexDeclComPtr(args[0]);
         if (!meta || !args[1]) return D3DERR_INVALIDCALL;
+        addComRef(meta.devicePtr);
         return writeComPtrOut(args[1], meta.devicePtr, mem) ? D3D_OK : D3DERR_INVALIDCALL;
     };
 
@@ -826,6 +859,7 @@ export function createStateExports(): Record<string, ThunkImplementation> {
     exports['IDirect3DVertexShader9_GetDevice'] = (_ctx, mem, args) => {
         const meta = resolveVertexShaderComPtr(args[0]);
         if (!meta || !args[1]) return D3DERR_INVALIDCALL;
+        addComRef(meta.devicePtr);
         return writeComPtrOut(args[1], meta.devicePtr, mem) ? D3D_OK : D3DERR_INVALIDCALL;
     };
 
@@ -846,6 +880,7 @@ export function createStateExports(): Record<string, ThunkImplementation> {
     exports['IDirect3DPixelShader9_GetDevice'] = (_ctx, mem, args) => {
         const meta = resolvePixelShaderComPtr(args[0]);
         if (!meta || !args[1]) return D3DERR_INVALIDCALL;
+        addComRef(meta.devicePtr);
         return writeComPtrOut(args[1], meta.devicePtr, mem) ? D3D_OK : D3DERR_INVALIDCALL;
     };
 

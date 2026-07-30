@@ -8,7 +8,7 @@ import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { Mem } from '../../core/memory/mem-accessor';
-import { devices, getVTables, createComObject, resourceToDevice } from './shared-state';
+import { addComRef, devices, getVTables, createComObject, registerComFinalizer, releaseComRef, resourceToDevice } from './shared-state';
 import {
     textureMeta,
     surfaceMeta,
@@ -21,6 +21,7 @@ import {
     precreateTextureLevelSurfaces,
     precreateCubeFaceSurfaces,
     clearTextureSubresourceSurfaces,
+    releaseSurfaceMetadata,
     type SurfaceMeta,
 } from './resource-registry';
 import { getD3DTextureLayout } from '../../backends/webgpu/shared/texture-formats';
@@ -82,6 +83,45 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
     const D3D_OK = 0;
     const D3DERR_INVALIDCALL = 0x8876086c;
 
+    const registerBufferFinalizer = (ptr: number, kind: 'vertex' | 'index'): void => {
+        registerComFinalizer(ptr, () => {
+            const device = resourceToDevice.get(ptr);
+            if (kind === 'vertex') {
+                device?.releaseVertexBuffer(ptr);
+                vertexBufferMeta.delete(ptr);
+            } else {
+                device?.releaseIndexBuffer(ptr);
+                indexBufferMeta.delete(ptr);
+            }
+            resourceToDevice.delete(ptr);
+        });
+    };
+
+    const registerTextureFinalizer = (ptr: number): void => {
+        registerComFinalizer(ptr, () => {
+            const device = resourceToDevice.get(ptr);
+            clearTextureSubresourceSurfaces(ptr);
+            device?.releaseTexture(ptr);
+            textureMeta.delete(ptr);
+            resourceToDevice.delete(ptr);
+        });
+    };
+
+    const registerStandaloneSurfaceFinalizer = (ptr: number): void => {
+        registerComFinalizer(ptr, () => releaseSurfaceMetadata(ptr));
+    };
+
+    const writeResourceDevice = (resourcePtr: number, ppDevice: number): number => {
+        if (!ppDevice) return D3DERR_INVALIDCALL;
+        initReturnPtr(ppDevice);
+        const device = resourceToDevice.get(resourcePtr);
+        if (!device) return D3DERR_INVALIDCALL;
+        const devicePtr = resolveDevicePtr(device);
+        if (!devicePtr) return D3DERR_INVALIDCALL;
+        addComRef(devicePtr);
+        return Mem.writeUint32(ppDevice, devicePtr) ? D3D_OK : D3DERR_INVALIDCALL;
+    };
+
     exports['IDirect3DDevice9_CreateVertexBuffer'] = (ctx, mem, args) => {
         const pDevice = args[0];
         const Length = args[1];
@@ -121,6 +161,7 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
             pool: Pool >>> 0,
             fvf: FVF >>> 0,
         });
+        registerBufferFinalizer(vbPtr, 'vertex');
 
         Mem.writeUint32(ppVertexBuffer, vbPtr);
 
@@ -128,6 +169,10 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
     };
 
     // GetDesc(pDesc) — D3DVERTEXBUFFER_DESC {Format, Type, Usage, Pool, Size, FVF}.
+    exports['IDirect3DVertexBuffer9_GetDevice'] = (_ctx, _mem, args) => {
+        return writeResourceDevice(args[0] >>> 0, args[1] >>> 0);
+    };
+
     exports['IDirect3DVertexBuffer9_GetDesc'] = (_ctx, _mem, args) => {
         const meta = vertexBufferMeta.get(args[0] >>> 0);
         const pDesc = args[1];
@@ -181,6 +226,7 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
             pool: Pool >>> 0,
             format: Format >>> 0,
         });
+        registerBufferFinalizer(ibPtr, 'index');
 
         Mem.writeUint32(ppIndexBuffer, ibPtr);
 
@@ -189,6 +235,10 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
 
     // GetDesc(pDesc) — D3DINDEXBUFFER_DESC {Format, Type, Usage, Pool, Size}: as
     // D3DVERTEXBUFFER_DESC without the trailing FVF.
+    exports['IDirect3DIndexBuffer9_GetDevice'] = (_ctx, _mem, args) => {
+        return writeResourceDevice(args[0] >>> 0, args[1] >>> 0);
+    };
+
     exports['IDirect3DIndexBuffer9_GetDesc'] = (_ctx, _mem, args) => {
         const meta = indexBufferMeta.get(args[0] >>> 0);
         const pDesc = args[1];
@@ -255,11 +305,10 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
             pool: normalizedPool,
             format: Format,
         });
+        registerTextureFinalizer(texPtr);
 
         if (!precreateTextureLevelSurfaces(texPtr, maxLevels)) {
-            clearTextureSubresourceSurfaces(texPtr);
-            resourceToDevice.delete(texPtr);
-            textureMeta.delete(texPtr);
+            releaseComRef(texPtr);
             initReturnPtr(ppTexture);
             return D3DERR_INVALIDCALL;
         }
@@ -320,11 +369,10 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
             format: Format,
             isCube: true,
         });
+        registerTextureFinalizer(cubePtr);
 
         if (!precreateCubeFaceSurfaces(cubePtr, maxLevels)) {
-            clearTextureSubresourceSurfaces(cubePtr);
-            resourceToDevice.delete(cubePtr);
-            textureMeta.delete(cubePtr);
+            releaseComRef(cubePtr);
             initReturnPtr(ppCubeTexture);
             return D3DERR_INVALIDCALL;
         }
@@ -373,6 +421,7 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
             width: w,
             height: h,
         });
+        registerStandaloneSurfaceFinalizer(surfacePtr);
 
         Logger.log(
             LogCategory.D3D9,
@@ -410,6 +459,7 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         if (guestPtr === 0) return D3DERR_INVALIDCALL;
         resourceToDevice.set(texPtr, device);
         textureMeta.set(texPtr, { width, height, levels: 1, usage: 0, pool, format });
+        registerTextureFinalizer(texPtr);
 
         const surfacePtr = createComObject(surfVt);
         resourceToDevice.set(surfacePtr, device);
@@ -630,6 +680,10 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         return D3D_OK;
     };
 
+    exports['IDirect3DTexture9_GetDevice'] = (_ctx, _mem, args) => {
+        return writeResourceDevice(args[0] >>> 0, args[1] >>> 0);
+    };
+
     exports['IDirect3DTexture9_LockRect'] = (ctx, mem, args) => {
         const pTexture = args[0];
         const Level = args[1];
@@ -744,6 +798,7 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         const surfacePtr = ensureTextureLevelSurface(pTexture, level);
         if (!surfacePtr) return D3DERR_INVALIDCALL;
 
+        addComRef(pTexture);
         return Mem.writeUint32(ppSurfaceLevel, surfacePtr) ? D3D_OK : D3DERR_INVALIDCALL;
     };
 
@@ -768,6 +823,7 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         const surfacePtr = ensureCubeFaceSurface(pCube, faceType, level);
         if (!surfacePtr) return D3DERR_INVALIDCALL;
 
+        addComRef(pCube);
         return Mem.writeUint32(ppSurface, surfacePtr) ? D3D_OK : D3DERR_INVALIDCALL;
     };
 
@@ -859,6 +915,7 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         if (!device) return D3DERR_INVALIDCALL;
         const devicePtr = resolveDevicePtr(device);
         if (!devicePtr) return D3DERR_INVALIDCALL;
+        addComRef(devicePtr);
         return Mem.writeUint32(ppDevice, devicePtr) ? D3D_OK : D3DERR_INVALIDCALL;
     };
 
@@ -953,7 +1010,20 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         const devicePtr = resolveDevicePtr(device);
         if (!devicePtr) return D3DERR_INVALIDCALL;
 
+        addComRef(devicePtr);
         return Mem.writeUint32(ppDevice, devicePtr) ? D3D_OK : D3DERR_INVALIDCALL;
+    };
+
+    exports['IDirect3DSurface9_GetContainer'] = (_ctx, _mem, args) => {
+        const pSurface = args[0];
+        const ppContainer = args[2];
+        if (!ppContainer) return D3DERR_INVALIDCALL;
+        initReturnPtr(ppContainer);
+
+        const texturePtr = surfaceMeta.get(pSurface)?.texturePtr ?? 0;
+        if (!texturePtr) return D3DERR_INVALIDCALL;
+        addComRef(texturePtr);
+        return Mem.writeUint32(ppContainer, texturePtr) ? D3D_OK : D3DERR_INVALIDCALL;
     };
 
     exports['IDirect3DSurface9_GetDC'] = (ctx, mem, args) => {

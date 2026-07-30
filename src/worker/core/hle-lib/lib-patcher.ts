@@ -120,7 +120,7 @@ export function validatePrologueBytes(bytes: Uint8Array): string | null {
 export function applyPatch(ctx: PatchContext, req: PatchRequest): PatchHandle | null {
     const mem = ctx.getMemory();
     if (!mem) {
-        Logger.warn(LogCategory.SYSTEM, 
+        Logger.warn(LogCategory.SYSTEM,
             `[HLE-lib] applyPatch: guest memory not yet available, skipping ${req.libId}:${req.functionName}`);
         return null;
     }
@@ -134,7 +134,7 @@ export function applyPatch(ctx: PatchContext, req: PatchRequest): PatchHandle | 
     // requests that violate the invariant. Checked FIRST — nothing is mutated yet.
     const overwriteBytes = req.overwriteBytes ?? (req.prologueLen !== undefined ? 5 : 11);
     if (req.prologueLen !== undefined && overwriteBytes > req.prologueLen) {
-        Logger.error(LogCategory.SYSTEM, 
+        Logger.error(LogCategory.SYSTEM,
             `[HLE-lib] applyPatch: overwriteBytes ${overwriteBytes} > prologueLen ${req.prologueLen} ` +
             `for ${req.libId}:${req.functionName} — the trampoline would re-enter clobbered bytes; refusing`);
         return null;
@@ -156,14 +156,14 @@ export function applyPatch(ctx: PatchContext, req: PatchRequest): PatchHandle | 
         stubAddress = allocated.address;
         stubCode = allocated.code;
     } catch (e) {
-        Logger.error(LogCategory.SYSTEM, 
+        Logger.error(LogCategory.SYSTEM,
             `[HLE-lib] applyPatch: allocateOneStub failed for ${req.libId}:${req.functionName}: ${e}`);
         return null;
     }
 
     // 2. Write stub bytes to guest memory.
     if (stubAddress + stubCode.length > mem.length) {
-        Logger.error(LogCategory.SYSTEM, 
+        Logger.error(LogCategory.SYSTEM,
             `[HLE-lib] applyPatch: stub 0x${stubAddress.toString(16)} overruns memory`);
         return null;
     }
@@ -187,7 +187,7 @@ export function applyPatch(ctx: PatchContext, req: PatchRequest): PatchHandle | 
         const prologue = originalBytes.slice(0, pl);
         const reason = validatePrologueBytes(prologue);
         if (reason) {
-            Logger.error(LogCategory.SYSTEM, 
+            Logger.error(LogCategory.SYSTEM,
                 `[HLE-lib] applyPatch: trampoline refused for ${req.libId}:${req.functionName}: ${reason} ` +
                 `(bytes: ${Array.from(prologue).map(x => x.toString(16).padStart(2, '0')).join(' ')})`);
             return null;
@@ -212,7 +212,7 @@ export function applyPatch(ctx: PatchContext, req: PatchRequest): PatchHandle | 
     let jmpTarget = stubAddress;
     if (req.entryFilter) {
         if (trampolineAddress === undefined) {
-            Logger.error(LogCategory.SYSTEM, 
+            Logger.error(LogCategory.SYSTEM,
                 `[HLE-lib] applyPatch: entryFilter for ${req.libId}:${req.functionName} requires prologueLen ` +
                 `(the trampoline is its decline path); refusing`);
             return null;
@@ -231,7 +231,7 @@ export function applyPatch(ctx: PatchContext, req: PatchRequest): PatchHandle | 
             filterAddr = null;
         }
         if (filterAddr === null || filterAddr <= 0 || filterAddr >= mem.length) {
-            Logger.error(LogCategory.SYSTEM, 
+            Logger.error(LogCategory.SYSTEM,
                 `[HLE-lib] applyPatch: entryFilter refused/invalid for ${req.libId}:${req.functionName} — aborting patch`);
             return null;
         }

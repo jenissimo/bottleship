@@ -10,7 +10,7 @@ import { System } from '../../core/system';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { Mem } from '../../core/memory/mem-accessor';
 import { writeDeviceCaps9 } from './caps';
-import { getVTables } from './shared-state';
+import { createComObject, getVTables } from './shared-state';
 import {
     checkDxDeviceFormat,
     checkDxDeviceMultiSampleType,
@@ -104,39 +104,6 @@ export function createFactoryExports(): Record<string, ThunkImplementation> {
 
     const D3D_OK = 0;
     const D3DERR_INVALIDCALL = 0x8876086c;
-
-    // Shared state for D3D9 module
-    const objects: Map<number, any> = new Map();
-
-    function createObject(type: string, vtableAddress: number): number {
-        const system = System.getInstance();
-        const process = system.process;
-        if (!process) {
-            throw new Error('Process not initialized');
-        }
-
-        // Allocate 4 bytes for COM object (vtable pointer)
-        const objPtr = process.memory.alloc(4);
-        const mem = process.getCurrentMemory();
-        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-        
-        // Write vtable pointer to memory (first field of COM object)
-        view.setUint32(objPtr, vtableAddress, true);
-        
-        // Store object metadata
-        objects.set(objPtr, {
-            type,
-            refCount: 1,
-            vtableAddress
-        });
-
-        Logger.verbose(LogCategory.D3D9, `Created ${type} object at 0x${objPtr.toString(16)} with vtable 0x${vtableAddress.toString(16)}`);
-        return objPtr;
-    }
-
-    function getObject(ptr: number) {
-        return objects.get(ptr);
-    }
 
     exports['IDirect3D9_RegisterSoftwareDevice'] = () => D3D_OK;
 
@@ -257,7 +224,8 @@ export function createFactoryExports(): Record<string, ThunkImplementation> {
             }
 
             // Create COM object in memory
-            const d3dPtr = createObject('IDirect3D9', vtableAddr);
+            const d3dPtr = createComObject(vtableAddr);
+            Logger.verbose(LogCategory.D3D9, `Created IDirect3D9 object at 0x${d3dPtr.toString(16)} with vtable 0x${vtableAddr.toString(16)}`);
             return d3dPtr;
         } catch (error) {
             Logger.error(LogCategory.D3D9, `Direct3DCreate9 failed: ${error}`);
