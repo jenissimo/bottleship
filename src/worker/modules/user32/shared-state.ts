@@ -2,11 +2,7 @@ import { Logger, LogCategory } from "../../core/logger";
 import { System } from "../../core/system";
 import { EmulatorConfig } from "../../core/emulator-config-manager";
 import { getActiveDeviceCursor } from "../../core/device-cursor";
-import { resetHooks } from "./hooks";
-import { resetOwnerDrawScratch } from "./owner-draw";
-import { IDC_ARROW, getSystemCursorHandle, resetSystemCursorHandles } from "./system-cursors";
-import { resetUser32Classes } from "./class";
-import { resetDeviceNotifications } from "./device-notify";
+import { IDC_ARROW, getSystemCursorHandle } from "./system-cursors";
 
 // Window storage
 export interface WindowInfo {
@@ -790,8 +786,6 @@ export function resetUser32SharedState(): void {
     lastWarpTarget = null;
     warpModeActive = false;
     if (warpReleaseTimer) { clearTimeout(warpReleaseTimer); warpReleaseTimer = null; }
-    resetSystemCursorHandles();
-    resetUser32Classes();
     lastLoadStringHint = null;
     capturedHwnd = 0;
     buttonCheckStates.clear();
@@ -800,8 +794,5 @@ export function resetUser32SharedState(): void {
     controlImageHandles.clear();
     clipboardDataByFormat.clear();
     clipboardOpenOwner = null;
-    resetOwnerDrawScratch();
-    resetHooks();
-    resetDeviceNotifications();
     Logger.log(LogCategory.USER32, 'User32 shared state reset');
 }

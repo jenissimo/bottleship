@@ -14,6 +14,11 @@ import { createMessageExports as message, registerFastPathMessageFunctions as re
 import { createSystemExports as system } from './system';
 import { createWindowExports as window } from './window';
 import { resetUser32SharedState } from './shared-state';
+import { resetUser32Classes } from './class';
+import { resetDeviceNotifications } from './device-notify';
+import { resetHooks } from './hooks';
+import { resetOwnerDrawScratch } from './owner-draw';
+import { resetSystemCursorHandles } from './system-cursors';
 
 export class User32 implements IModule {
     name = 'user32';
@@ -39,5 +44,10 @@ export class User32 implements IModule {
 
     reset(): void {
         resetUser32SharedState();
+        resetSystemCursorHandles();
+        resetUser32Classes();
+        resetOwnerDrawScratch();
+        resetHooks();
+        resetDeviceNotifications();
     }
 }
