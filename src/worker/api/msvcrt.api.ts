@@ -371,6 +371,8 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("_umask", 1),
         makeFunc("_stat64i32", 2),
         makeFunc("_fstat64i32", 2),
+        makeFunc("_stat64", 2),
+        makeFunc("_fstat64", 2),
         makeFunc("_findfirst64i32", 2),
         makeFunc("_findnext64i32", 2),
         makeFunc("_findclose", 1),
@@ -384,7 +386,7 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("_controlfp_s", 3),
         makeFunc("memchr", 3),
         makeFunc("strcspn", 2),
-        makeFunc("_gcvt", 3),
+        makeFunc("_gcvt", 4),   // double occupies two stack dwords + ndec + buf
         makeFunc("_ismbblead", 1),
         makeFunc("localtime", 1),
         makeFunc("clearerr", 1),

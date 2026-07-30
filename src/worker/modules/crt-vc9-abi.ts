@@ -215,18 +215,10 @@ export function registerVc9AbiExports(exports: Record<string, ThunkImplementatio
             host.setErrno(2);
             return 0;
         }
-        const result = host.getcwd(buffer, maxLen);
-        if (!buffer || !result) return result;
-        const path = host.readCString(result, maxLen);
-        if (!path.match(/^[A-Za-z]:/)) {
-            const prefixed = `C:\\${path.replace(/^\\+/, "")}`;
-            if (prefixed.length >= maxLen) {
-                host.setErrno(34);
-                return 0;
-            }
-            host.writeCString(buffer, prefixed);
-        }
-        return buffer >>> 0;
+        // Drive qualification and the buffer==NULL allocation size both live in getcwd, so
+        // the two forms cannot diverge (they did while the fix-up lived here: it could only
+        // reach the caller-supplied-buffer form).
+        return host.getcwd(buffer, maxLen);
     };
 
     // C++ exception / type_info — minimal no-op stubs (Stage A)

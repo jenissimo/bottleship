@@ -9,15 +9,28 @@
 import { Process } from "../core/process";
 import { Logger, LogCategory } from "../core/logger";
 
-/** Shared qsort code address — allocated once, reused by both crtdll and msvcrt. */
+/**
+ * Shared qsort code address — allocated once per process generation and reused by
+ * every CRT flavour (crtdll / msvcrt / msvcr90) so all their IAT bindings name the
+ * SAME code.
+ *
+ * Keyed on `process.resetGeneration` because Process.reset() rewinds the THUNK_CODE
+ * bump allocator: a cached pre-reset address is dangling and gets re-handed-out to an
+ * unrelated emitter, so a module that re-publishes it binds the guest's IAT to a
+ * foreign trampoline. Generation-keying makes the first re-registration after a reset
+ * allocate fresh and every later one agree, independent of module iteration order.
+ */
 let sharedQsortCodeAddr = 0;
+let sharedQsortGeneration = -1;
 
 /**
  * Ensure native x86 qsort code is written to THUNK_CODE.
- * Returns the code address (idempotent — second call returns cached address).
+ * Returns the code address (idempotent within one process generation).
  */
 export function ensureNativeQsort(process: Process): number {
-    if (sharedQsortCodeAddr !== 0) return sharedQsortCodeAddr;
+    if (sharedQsortCodeAddr !== 0 && sharedQsortGeneration === process.resetGeneration) {
+        return sharedQsortCodeAddr;
+    }
 
     const QSORT_CODE_SIZE = 176;
     const addr = process.memory.alloc(QSORT_CODE_SIZE, "THUNK_CODE", "rx");
@@ -151,10 +164,6 @@ export function ensureNativeQsort(process: Process): number {
         `Native qsort (insertion sort) written at 0x${addr.toString(16)} (${totalBytes} bytes)`);
 
     sharedQsortCodeAddr = addr;
+    sharedQsortGeneration = process.resetGeneration;
     return addr;
-}
-
-/** Reset shared state (called on system reset). */
-export function resetNativeQsort(): void {
-    sharedQsortCodeAddr = 0;
 }

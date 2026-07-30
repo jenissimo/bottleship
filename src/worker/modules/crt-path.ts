@@ -29,13 +29,32 @@ export interface CrtPathFns {
     getcwd(buffer: number, maxLen: number): number;
 }
 
+/** _MAX_PATH — the block size _fullpath(NULL, …) grants (it ignores maxLength there). */
+const MAX_PATH_BYTES = 260;
+
+/** Ensure a path carries a drive letter — _getcwd/_getdcwd never return a bare path. */
+function qualifyDrive(path: string): string {
+    if (/^[A-Za-z]:/.test(path)) return path;
+    return "C:\\" + path.replace(/^\\+/, "");
+}
+
 export function registerCrtPathExports(exports: Record<string, ThunkImplementation>, host: CrtPathHost): CrtPathFns {
 
     function getcwd(buffer: number, maxLen: number): number {
         const system = System.getInstance();
-        const cwd = (system as any).currentDirectory || "C:\\";
+        // Both _getcwd and _getdcwd return a DRIVE-QUALIFIED absolute path on Windows, so
+        // qualify here — once, before the size is chosen. Doing it in the _getdcwd wrapper
+        // instead only covered the caller-supplied-buffer form, so a cwd without a drive
+        // came back qualified through one form and bare through the other, and the
+        // NULL-buffer form could not have been fixed up anyway (its block is already sized).
+        const cwd = qualifyDrive((system as any).currentDirectory || "C:\\");
         if (!buffer) {
-            const len = cwd.length + 1;
+            // buffer==NULL: the CRT mallocs a block of AT LEAST `maxLen` characters and
+            // hands ownership to the caller — the size is the caller's, not strlen(cwd)'s.
+            // Callers legitimately keep writing into the block up to maxLen (a string class
+            // adopts it with capacity=maxLen and appends in place), so sizing it to the cwd
+            // is a silent heap overrun into whatever we allocated next.
+            const len = Math.max(maxLen >>> 0, cwd.length + 1);
             const ptr = host.malloc(len);
             if (ptr) host.writeCString(ptr, cwd);
             return ptr;
@@ -77,7 +96,16 @@ export function registerCrtPathExports(exports: Record<string, ThunkImplementati
         }
         full = result.join("\\");
 
-        if (!absPath) return full.length + 1;
+        if (!absPath) {
+            // Same ownership contract as getcwd(NULL): malloc the buffer and return it.
+            // _fullpath ignores maxLength in this form and grants _MAX_PATH. Returning a
+            // LENGTH here handed the guest a small integer as a char* — a near-NULL deref
+            // for anyone using the documented form.
+            const len = Math.max(MAX_PATH_BYTES, full.length + 1);
+            const ptr = host.malloc(len);
+            if (ptr) host.writeCString(ptr, full);
+            return ptr;
+        }
         const max = maxLen >>> 0;
         if (full.length >= max) {
             host.setErrno(34);

@@ -24,15 +24,24 @@
 import { Process } from "../core/process";
 import { Logger, LogCategory } from "../core/logger";
 
-/** Shared bsearch code address — allocated once, reused by both crtdll and msvcrt. */
+/**
+ * Shared bsearch code address — allocated once per process generation and reused by
+ * every CRT flavour. Keyed on `process.resetGeneration` for the same reason as
+ * ensureNativeQsort: Process.reset() rewinds the THUNK_CODE bump allocator, so a
+ * cached pre-reset address is dangling and would bind the guest's IAT to whatever
+ * emitter gets that memory next.
+ */
 let sharedBsearchCodeAddr = 0;
+let sharedBsearchGeneration = -1;
 
 /**
  * Ensure native x86 bsearch code is written to THUNK_CODE.
- * Returns the code address (idempotent — second call returns cached address).
+ * Returns the code address (idempotent within one process generation).
  */
 export function ensureNativeCBsearch(process: Process): number {
-    if (sharedBsearchCodeAddr !== 0) return sharedBsearchCodeAddr;
+    if (sharedBsearchCodeAddr !== 0 && sharedBsearchGeneration === process.resetGeneration) {
+        return sharedBsearchCodeAddr;
+    }
 
     const BSEARCH_CODE_SIZE = 128;
     const addr = process.memory.alloc(BSEARCH_CODE_SIZE, "THUNK_CODE", "rx");
@@ -132,10 +141,6 @@ export function ensureNativeCBsearch(process: Process): number {
         `Native bsearch (binary search) written at 0x${addr.toString(16)} (${totalBytes} bytes)`);
 
     sharedBsearchCodeAddr = addr;
+    sharedBsearchGeneration = process.resetGeneration;
     return addr;
-}
-
-/** Reset shared state (called on system reset). */
-export function resetNativeCBsearch(): void {
-    sharedBsearchCodeAddr = 0;
 }

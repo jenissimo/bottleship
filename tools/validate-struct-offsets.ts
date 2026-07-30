@@ -13,6 +13,14 @@ import {
     DEV_BROADCAST_DEVICEINTERFACE_OFFSETS,
     DEV_BROADCAST_HDR_OFFSETS,
 } from '../src/worker/modules/user32/dev-broadcast';
+import {
+    STAT32_OFFSETS,
+    STAT64I32_OFFSETS,
+    STAT64_OFFSETS,
+    FINDDATA32_OFFSETS,
+    FINDDATA64I32_OFFSETS,
+} from '../src/worker/modules/crt-vc9-io';
+import { LOGPEN_OFFSETS, LOGPEN_SIZE } from '../src/worker/modules/gdi32/gdi-objects';
 
 // --- Known Win32 struct sizes (x86, default 8-byte alignment unless noted) ---
 interface StructSpec {
@@ -213,6 +221,46 @@ const STRUCT_SPECS: StructSpec[] = [
         // dbcc_name is char[1]/WCHAR[1] in the header; the real name follows inline
         // and dbcc_size covers it. sizeof() is the padded 32.
         lastField: { name: 'dbcc_name', size: 1 },
+    },
+    // CRT structs: same ABI contract as the Win32 ones — a game reads st_mode/attrib
+    // at a fixed offset, so a drift silently turns every stat into "type unknown".
+    {
+        name: 'struct _stat (_stat32)',
+        expectedSize: 36,
+        offsets: { ...STAT32_OFFSETS },
+        lastField: { name: 'st_ctime', size: 4 },
+    },
+    {
+        name: 'struct _stat64i32',
+        expectedSize: 48,
+        offsets: { ...STAT64I32_OFFSETS },
+        lastField: { name: 'st_ctime', size: 8 },
+    },
+    {
+        name: 'struct __stat64',
+        expectedSize: 56,
+        offsets: { ...STAT64_OFFSETS },
+        lastField: { name: 'st_ctime', size: 8 },
+    },
+    {
+        name: 'struct _finddata_t',
+        expectedSize: 280,
+        offsets: { ...FINDDATA32_OFFSETS },
+        lastField: { name: 'name', size: 260 },
+    },
+    {
+        name: 'struct _finddata64i32_t',
+        expectedSize: 296,
+        offsets: { ...FINDDATA64I32_OFFSETS },
+        lastField: { name: 'name', size: 260 },
+    },
+    // LOGPEN is read by CreatePenIndirect and written by GetObject(OBJ_PEN); a drift in
+    // lopnWidth (a POINT, not a LONG) silently reads the colour as the width.
+    {
+        name: 'LOGPEN',
+        expectedSize: LOGPEN_SIZE,
+        offsets: { ...LOGPEN_OFFSETS },
+        lastField: { name: 'lopnColor', size: 4 },
     },
 ];
 

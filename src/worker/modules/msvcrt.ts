@@ -24,7 +24,7 @@ import { ensureNativeQsort } from "./crt-qsort";
 import { ensureNativeCBsearch } from "./crt-cbsearch";
 import { LARGE_IO_TRACE_ENABLED, traceLargeRead } from "../core/diagnostics/large-io-trace";
 import { registerVc9AbiExports } from "./crt-vc9-abi";
-import { registerVc9IoExports } from "./crt-vc9-io";
+import { registerVc9IoExports, fillStatStruct, STAT32_OFFSETS } from "./crt-vc9-io";
 import { registerVc9SehExports } from "./crt-vc9-seh";
 import { registerVc9SetjmpExports } from "./crt-vc9-setjmp";
 import { registerCrtMathExports } from "./crt-math";
@@ -36,6 +36,21 @@ import { registerCrtPathExports } from "./crt-path";
 import { registerCrtSeh3Exports } from "./crt-seh3";
 import { ensureNativeEHProlog } from "./crt-eh-prolog";
 import { registerRttiExports, demangleTypeInfoName } from "./crt-rtti";
+
+/** Priming value for fgetsLoop — a generator's first next() discards its argument. */
+const EMPTY_BYTES = new Uint8Array(0);
+
+/** State behind one FILE* token (see fileStreams). */
+interface MsvcrtFileStream {
+    fd: number;
+    handle: VfsFileHandle;
+    ungetChar: number;
+    text: boolean;
+    eof: boolean;
+    err: boolean;
+    structPtr?: number;
+    bufPtr?: number;
+}
 
 export class Msvcrt implements IModule {
     name = "msvcrt";
@@ -1705,20 +1720,19 @@ export class Msvcrt implements IModule {
             return -1;
         }
         const vfs = System.getInstance().fileSystem;
-        // Check existence: ROM or overlay
+        // A directory is a legal stat target (st_mode carries _S_IFDIR), and callers
+        // use exactly that to probe for one — see crt-vc9-io STAT32_OFFSETS.
+        if (vfs.directoryExists(path)) {
+            fillStatStruct(structPtr, STAT32_OFFSETS, 36, 0, true, (p, v, n) => this.memset(p, v, n));
+            return 0;
+        }
         const exists = vfs.hasRomFile(path) || vfs.openSync(path, 0x80000000, 3) !== null;
         if (!exists) {
             this.setErrno(2); // ENOENT
             return -1;
         }
-        const size = vfs.getFileSize(path);
-        // Zero out struct _stat (48 bytes covers both 32-bit layouts)
-        this.memset(structPtr, 0, 48);
-        // MSVCRT struct _stat layout: st_dev(2) + st_ino(2) + st_mode(2) at offset 4
-        // Write as uint32 — upper 16 bits (st_nlink) stay 0
-        Mem.writeUint32(structPtr + 4, 0x8000 | 0x0100);
-        // st_size at offset 20 (uint32)
-        Mem.writeUint32(structPtr + 20, size);
+        fillStatStruct(structPtr, STAT32_OFFSETS, 36, vfs.getFileSize(path), false,
+            (p, v, n) => this.memset(p, v, n));
         return 0;
     }
 
@@ -2520,7 +2534,7 @@ export class Msvcrt implements IModule {
     // Simple FILE* simulation: we use the fd number as the FILE* pointer value
     // and store a mapping. Real FILE structs aren't needed since apps only pass
     // the pointer back to us.
-    private fileStreams: Map<number, { fd: number; handle: VfsFileHandle; ungetChar: number; text: boolean; eof: boolean; err: boolean; structPtr?: number; bufPtr?: number }> = new Map();
+    private fileStreams: Map<number, MsvcrtFileStream> = new Map();
     private nextFilePtr = 0x70000000; // pseudo-pointer space for FILE*
     /**
      * When true, fopen hands out a REAL zeroed guest FILE struct instead of the
@@ -2576,7 +2590,9 @@ export class Msvcrt implements IModule {
         const curpOff = Msvcrt.BORLAND_FILE_CURP_OFF;
         const level = Mem.readInt32(filePtr + levelOff) ?? 0;
         if (level > 0) {
-            handle.position -= level;
+            // Through the seek API, not the field: the rewind has to go past the read
+            // window the same way any other seek does.
+            System.getInstance().fileSystem.setPosition(handle, -level, 1 /* FILE_CURRENT */);
             Mem.writeUint32(filePtr + levelOff, 0); // level = 0 → next getc refills
             Mem.writeUint32(filePtr + curpOff, 0);
         }
@@ -2725,7 +2741,44 @@ export class Msvcrt implements IModule {
         })();
     }
 
-    private fgets(bufPtr: number, maxChars: number, filePtr: number): number {
+    /**
+     * fgets' byte loop as a resumable coroutine: it YIELDS to ask for the next byte and
+     * is resumed with what was read (empty = genuine EOF). Two drivers pump the one loop —
+     * a synchronous one, and an async continuation taken over the moment a byte is not
+     * resident — so "not available synchronously" never has to masquerade as EOF, and
+     * neither does the loop have to exist twice.
+     */
+    private *fgetsLoop(
+        stream: MsvcrtFileStream,
+        bufPtr: number,
+        max: number,
+        start: number,
+    ): Generator<void, number, Uint8Array> {
+        let i = start;
+        while (i < max) {
+            const data = yield;
+            if (data.length === 0) { stream.eof = true; break; }
+            let b = data[0];
+            // Text mode: Ctrl-Z (0x1A) is the end-of-file marker.
+            if (stream.text && b === 0x1a) { stream.eof = true; break; }
+            // Text mode: collapse CRLF→LF (and drop a lone trailing \r before EOF).
+            if (stream.text && b === 0x0d) {
+                const peek = yield;
+                if (peek.length === 1) {
+                    if (peek[0] === 0x0a) { b = 0x0a; } // CRLF → emit LF only
+                    else { stream.ungetChar = peek[0]; } // lone \r: keep \r, push back peeked byte
+                } else { stream.eof = true; } // \r at EOF: emit the lone \r verbatim
+            }
+            Mem.writeUint8(bufPtr + i, b);
+            i++;
+            if (b === 0x0a) break; // include newline, stop
+        }
+        if (i === 0) return 0; // EOF/nothing read → NULL
+        Mem.writeUint8(bufPtr + i, 0); // NUL terminate
+        return bufPtr >>> 0;
+    }
+
+    private fgets(bufPtr: number, maxChars: number, filePtr: number): number | Promise<ThunkResult> {
         const stream = this.fileStreams.get(filePtr);
         if (!stream || !bufPtr) return 0;
         const n = maxChars | 0;
@@ -2742,27 +2795,29 @@ export class Msvcrt implements IModule {
             i++;
             if (c === 0x0a) { Mem.writeUint8(bufPtr + i, 0); return bufPtr >>> 0; }
         }
-        while (i < max) {
+
+        const loop = this.fgetsLoop(stream, bufPtr, max, i);
+        // Explicit type: the `while (!step.done)` narrowing must not leak into the
+        // closure below, which resumes the loop to completion.
+        let step: IteratorResult<void, number> = loop.next(EMPTY_BYTES);
+        while (!step.done) {
             const data = vfs.readSync(stream.handle, 1);
-            if (!data || data.length === 0) { stream.eof = true; break; }
-            let b = data[0];
-            // Text mode: Ctrl-Z (0x1A) is the end-of-file marker.
-            if (stream.text && b === 0x1a) { stream.eof = true; break; }
-            // Text mode: collapse CRLF→LF (and drop a lone trailing \r before EOF).
-            if (stream.text && b === 0x0d) {
-                const peek = vfs.readSync(stream.handle, 1);
-                if (peek && peek.length === 1) {
-                    if (peek[0] === 0x0a) { b = 0x0a; } // CRLF → emit LF only
-                    else { stream.ungetChar = peek[0]; } // lone \r: keep \r, push back peeked byte
-                } else { stream.eof = true; } // \r at EOF: emit the lone \r verbatim
+            if (data === null) {
+                // Not resident — finish the SAME loop on the async thunk path.
+                return (async (): Promise<ThunkResult> => {
+                    let s: IteratorResult<void, number> = step;
+                    try {
+                        while (!s.done) s = loop.next(await vfs.read(stream.handle, 1));
+                    } catch {
+                        stream.err = true;
+                        return { value: 0 };
+                    }
+                    return { value: s.value >>> 0 };
+                })();
             }
-            Mem.writeUint8(bufPtr + i, b);
-            i++;
-            if (b === 0x0a) break; // include newline, stop
+            step = loop.next(data);
         }
-        if (i === 0) return 0; // EOF/nothing read → NULL
-        Mem.writeUint8(bufPtr + i, 0); // NUL terminate
-        return bufPtr >>> 0;
+        return step.value;
     }
 
     private ungetc(ch: number, filePtr: number): number {
@@ -3013,7 +3068,21 @@ export class Msvcrt implements IModule {
         }
 
         const data = vfs.readSync(stream.handle, 1);
-        if (!data || data.length === 0) { stream.eof = true; return -1; } // EOF
+        // null is "not resident — await it", NOT end of file. Collapsing the two reports
+        // EOF on the first cold block of a streamed bundle.
+        if (data === null) {
+            return (async (): Promise<ThunkResult> => {
+                try {
+                    const d = await vfs.read(stream.handle, 1);
+                    if (d.length === 0) { stream.eof = true; return { value: 0xffffffff }; }
+                    return { value: d[0] };
+                } catch {
+                    stream.eof = true;
+                    return { value: 0xffffffff };
+                }
+            })();
+        }
+        if (data.length === 0) { stream.eof = true; return -1; } // EOF
         return data[0];
     }
 
