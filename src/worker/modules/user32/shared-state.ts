@@ -470,23 +470,16 @@ function publishCursorConfinementSignal(): void {
     self.postMessage({ type: "clip_cursor", clip: relative });
 }
 
-// Mouse capture state
-export let capturedHwnd: number = 0;
-
 export function setCapture(hwnd: number): number {
-    const prev = capturedHwnd;
-    capturedHwnd = hwnd >>> 0;
-    return prev;
+    return System.getInstance().windowManager.setCapture(hwnd);
 }
 
 export function getCapture(): number {
-    return capturedHwnd;
+    return System.getInstance().windowManager.getCaptureHwnd();
 }
 
 export function releaseCapture(): number {
-    const prev = capturedHwnd;
-    capturedHwnd = 0;
-    return prev;
+    return System.getInstance().windowManager.releaseCapture();
 }
 
 // Clipboard storage
@@ -787,7 +780,6 @@ export function resetUser32SharedState(): void {
     warpModeActive = false;
     if (warpReleaseTimer) { clearTimeout(warpReleaseTimer); warpReleaseTimer = null; }
     lastLoadStringHint = null;
-    capturedHwnd = 0;
     buttonCheckStates.clear();
     listControlStates.clear();
     trackbarStates.clear();

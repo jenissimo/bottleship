@@ -4,7 +4,6 @@ import { System } from '../../core/system';
 import { MessageQueue } from './message-queue';
 import type { Message } from './message-queue';
 import { hypercallDataManager } from '../../core/cpu/hypercall-data';
-import { getCapture, releaseCapture } from '../../modules/user32/shared-state';
 
 // Pseudo-handle returned by GetDesktopWindow() when no top-level window is active.
 // MUST be reserved out of the real window handle space (nextHwnd starts above it):
@@ -83,6 +82,7 @@ export class WindowManager {
     private activeHwnd = 0;     // Active top-level window (GetActiveWindow)
     private focusHwnd = 0;      // Focus window — may be a child (GetFocus)
     private foregroundHwnd = 0; // Foreground top-level window (GetForegroundWindow)
+    private captureHwnd = 0;    // Mouse capture owner (GetCapture / SetCapture)
 
     /**
      * Top-level window Z-order, front (index 0) → back. Children are NOT in this list;
@@ -312,9 +312,9 @@ export class WindowManager {
         const focusInSubtree = this.focusHwnd === hwnd || this.isDescendantOf(this.focusHwnd, hwnd);
 
         // Capture: release if the dying window (or a descendant) holds it (WM_CAPTURECHANGED).
-        const captureHwnd = getCapture();
+        const captureHwnd = this.captureHwnd;
         const captureLost = captureHwnd !== 0 && (captureHwnd === hwnd || this.isDescendantOf(captureHwnd, hwnd));
-        if (captureLost) releaseCapture();
+        if (captureLost) this.captureHwnd = 0;
 
         this.windows.delete(hwnd);
         this.removeFromZOrder(hwnd);
@@ -389,6 +389,22 @@ export class WindowManager {
     /** Foreground top-level window (GetForegroundWindow). */
     getForegroundHwnd(): number {
         return this.foregroundHwnd;
+    }
+
+    setCapture(hwnd: number): number {
+        const previous = this.captureHwnd;
+        this.captureHwnd = hwnd >>> 0;
+        return previous;
+    }
+
+    getCaptureHwnd(): number {
+        return this.captureHwnd;
+    }
+
+    releaseCapture(): number {
+        const previous = this.captureHwnd;
+        this.captureHwnd = 0;
+        return previous;
     }
 
     /**
@@ -748,6 +764,7 @@ export class WindowManager {
         this.activeHwnd = 0;
         this.focusHwnd = 0;
         this.foregroundHwnd = 0;
+        this.captureHwnd = 0;
         this.zOrder = [];
         Logger.log(LogCategory.SYSTEM, 'WindowManager reset');
     }

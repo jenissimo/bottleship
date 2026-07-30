@@ -6,7 +6,7 @@
 import { WindowManager } from '../windowing/window-manager';
 import type { WindowObject } from '../windowing/window-manager';
 import { Logger, LogCategory } from '../../core/logger';
-import { getCapture, getAbsoluteWindowPosition, clampToCursorClip } from '../../modules/user32/shared-state';
+import { getAbsoluteWindowPosition, clampToCursorClip } from '../../modules/user32/shared-state';
 import { getWindowByHandle } from '../../modules/user32/window';
 import { vkToDik } from '../../modules/dinput/dinput-vk-dik';
 import { TimeService } from '../time';
@@ -817,7 +817,7 @@ export class InputManager {
      * 3. Last resort: the keyboard/active target (e.g. before any window is shown).
      */
     private resolveMouseTarget(screenX: number, screenY: number): WindowObject | undefined {
-        const captureHwnd = getCapture();
+        const captureHwnd = this.windowManager.getCaptureHwnd();
         if (captureHwnd) {
             const capWin = this.windowManager.getWindow(captureHwnd);
             if (capWin?.visible) return capWin;

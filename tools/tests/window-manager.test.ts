@@ -14,7 +14,6 @@
 import { describe, expect, test, beforeEach } from "bun:test";
 import { WindowManager } from "../../src/worker/runtime/windowing/window-manager";
 import type { Message } from "../../src/worker/runtime/windowing/message-queue";
-import { setCapture, getCapture, releaseCapture } from "../../src/worker/modules/user32/shared-state";
 
 // Window style bits used by the harness.
 const WS_VISIBLE = 0x10000000;
@@ -80,7 +79,7 @@ function drainAll(wm: WindowManager): Message[] {
 
 describe("WindowManager Z-order", () => {
     let wm: WindowManager;
-    beforeEach(() => { wm = new WindowManager(); releaseCapture(); });
+    beforeEach(() => { wm = new WindowManager(); });
 
     test("new visible top-level windows insert at the top (front of Z-order)", () => {
         const a = mkTopLevel(wm, 0, 0, 100, 100);
@@ -148,7 +147,7 @@ describe("WindowManager Z-order", () => {
 
 describe("WindowManager WindowFromPoint", () => {
     let wm: WindowManager;
-    beforeEach(() => { wm = new WindowManager(); releaseCapture(); });
+    beforeEach(() => { wm = new WindowManager(); });
 
     test("overlap: the frontmost containing top-level wins", () => {
         const back = mkTopLevel(wm, 0, 0, 200, 200);
@@ -199,7 +198,7 @@ describe("WindowManager WindowFromPoint", () => {
 
 describe("WindowManager focus vs active", () => {
     let wm: WindowManager;
-    beforeEach(() => { wm = new WindowManager(); releaseCapture(); });
+    beforeEach(() => { wm = new WindowManager(); });
 
     test("SetFocus on a child sets focus but does NOT change active/foreground", () => {
         const top = mkTopLevel(wm, 0, 0, 300, 300);
@@ -246,14 +245,14 @@ describe("WindowManager focus vs active", () => {
 
 describe("WindowManager capture + destroy", () => {
     let wm: WindowManager;
-    beforeEach(() => { wm = new WindowManager(); releaseCapture(); });
+    beforeEach(() => { wm = new WindowManager(); });
 
     test("destroying the capture window releases capture + posts WM_CAPTURECHANGED", () => {
         const top = mkTopLevel(wm, 0, 0, 200, 200);
-        setCapture(top);
-        expect(getCapture()).toBe(top);
+        wm.setCapture(top);
+        expect(wm.getCaptureHwnd()).toBe(top);
         wm.destroyWindow(top);
-        expect(getCapture()).toBe(0);
+        expect(wm.getCaptureHwnd()).toBe(0);
         // WM_CAPTURECHANGED must have been queued to the losing window.
         const all = drainAll(wm);
         expect(all.some(m => m.hwnd === top && m.message === WM_CAPTURECHANGED)).toBe(true);
@@ -262,9 +261,9 @@ describe("WindowManager capture + destroy", () => {
     test("destroying a window whose CHILD holds capture also releases it", () => {
         const top = mkTopLevel(wm, 0, 0, 200, 200);
         const child = mkChild(wm, top, 0, 0, 50, 50);
-        setCapture(child);
+        wm.setCapture(child);
         wm.destroyWindow(top); // dies with its subtree → capture (held by child) released
-        expect(getCapture()).toBe(0);
+        expect(wm.getCaptureHwnd()).toBe(0);
     });
 
     test("destroying the active top-level activates the next in Z-order with full chain", () => {
