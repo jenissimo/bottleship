@@ -98,7 +98,7 @@ import { registerDirectDraw2Exports } from "./directdraw-v2";
 
 import { windows as sharedWindows } from "../user32/shared-state";
 import type { WindowInfo } from "../user32/shared-state";
-import { repaintDialogOverlayIfVisible, requestGuestDialogPaint } from "../user32/dialog";
+import { repaintDialogOverlayIfVisible, requestGuestDialogPaint } from "../user32/dialog-paint";
 
 type DDEnumCallback = (lpGUID: number, lpDriverDescription: number, lpDriverName: number, lpContext: number) => number;
 

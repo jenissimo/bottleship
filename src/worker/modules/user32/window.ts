@@ -34,9 +34,10 @@ import { ensureAnimateControlClasses, clearAnimateState, onAnimateShowWindow, is
 import { getBuiltinSystemClass } from './system-classes';
 import { invalidateControlColors } from './control-colors';
 import { applyScrollInfo, setScrollPos as setScrollBarPos } from './scroll-state';
-import { repaintDialogOverlayIfVisible, repaintDialogAfterContentChange, isSentinelWndProc, handleSystemControlMessage, isContentChangingMessage, requestGuestDialogPaint } from './dialog';
+import { isSentinelWndProc } from './dialog';
+import { handleSystemControlMessage, isContentChangingMessage } from './dialog-control-messages';
 import { noteDialogOverlayCandidate, eraseDialogOverlay } from './dialog-overlay';
-import { eraseControlOverlayRect, restoreClientRectFromAncestors } from './dialog-paint';
+import { eraseControlOverlayRect, repaintDialogOverlayIfVisible, repaintDialogAfterContentChange, requestGuestDialogPaint, restoreClientRectFromAncestors } from './dialog-paint';
 import { resetControlInteractionState, handleSystemControlClassMouse } from './control-interaction';
 import { isDDrawExclusiveFullscreen } from '../ddraw/gdi-visibility';
 import { paintTraceEnabled, logBeginEndPaint } from './paint-trace';

@@ -167,6 +167,26 @@ export function getWindowByHandle(handle: number): WindowInfo | undefined {
     return windows.get(handle);
 }
 
+export function findChildByControlId(
+    parentHwnd: number,
+    controlId: number,
+    visited: Set<number> = new Set<number>(),
+): WindowInfo | undefined {
+    if (visited.has(parentHwnd)) return undefined;
+    visited.add(parentHwnd);
+
+    const parent = windows.get(parentHwnd);
+    if (!parent) return undefined;
+    for (const childHwnd of parent.children) {
+        const child = windows.get(childHwnd);
+        if (!child) continue;
+        if (child.controlId === controlId) return child;
+        const nested = findChildByControlId(childHwnd, controlId, visited);
+        if (nested) return nested;
+    }
+    return undefined;
+}
+
 /** HWND_TOP / HWND_BOTTOM sentinels for child Z-order (unsigned as guest passes them). */
 const HWND_TOP = 0;
 const HWND_BOTTOM = 1;

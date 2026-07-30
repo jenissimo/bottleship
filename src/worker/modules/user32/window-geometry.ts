@@ -10,7 +10,7 @@ import { System } from '../../core/system';
 import { Mem } from '../../core/memory/mem-accessor';
 import { WindowInfo, windows, getAbsoluteWindowPosition } from './shared-state';
 import { invalidateWindow } from './paint-region';
-import { repaintDialogOverlayIfVisible } from './dialog';
+import { repaintDialogOverlayIfVisible } from './dialog-paint';
 
 /** Callbacks back into window.ts (avoids an import cycle). */
 export interface WindowGeometryHost {

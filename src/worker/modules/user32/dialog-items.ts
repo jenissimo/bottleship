@@ -9,9 +9,9 @@ import { Marshaler } from '../../core/memory/marshaler';
 import { Mem } from '../../core/memory/mem-accessor';
 import { System } from '../../core/system';
 import { encodeAnsi } from '../codepage-utils';
-import { windows, buttonCheckStates } from './shared-state';
-import { findChildByControlId, repaintDialogAfterContentChange, handleSystemControlMessage, isContentChangingMessage } from './dialog';
-import { eraseControlOverlayRect } from './dialog-paint';
+import { windows, buttonCheckStates, findChildByControlId } from './shared-state';
+import { handleSystemControlMessage, isContentChangingMessage } from './dialog-control-messages';
+import { eraseControlOverlayRect, repaintDialogAfterContentChange } from './dialog-paint';
 
 export function registerDialogItemExports(exports: Record<string, ThunkImplementation>): void {
     exports['GetDlgItem'] = (ctx, mem, args) => {

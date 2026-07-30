@@ -12,7 +12,7 @@ import { Mem } from '../../core/memory/mem-accessor';
 import { registerDialogItemExports } from './dialog-items';
 import { registerMessageBoxExports } from './dialog-messagebox';
 import { System } from '../../core/system';
-import { WindowInfo, windows, controlImageHandles, getAbsoluteWindowPosition, assignPendingClientMessage, killWindowTimers, finalizeWindowDestroy, buttonCheckStates } from './shared-state';
+import { WindowInfo, windows, controlImageHandles, getAbsoluteWindowPosition, assignPendingClientMessage, killWindowTimers, finalizeWindowDestroy, buttonCheckStates, findChildByControlId } from './shared-state';
 import { WH_CBT, HCBT_CREATEWND, getHooksOfType } from './hooks';
 import { parseDlgTemplate, dluToPixelX, dluToPixelY, getDialogBaseUnits, logDlgTemplateDump, ParsedDlgTemplate } from './dialog-template';
 import { findResourceInPE } from '../../modules/kernel32/resource';
@@ -22,9 +22,8 @@ import { isGroupBoxSystemControl, hitTestSystemControlAtClient } from './control
 import { handleSystemControlMouseAtScreen, resetControlInteractionState } from './control-interaction';
 import { noteDialogOverlayCandidate, resolveMouseTargetHwnd, eraseDialogOverlay, registerOverlayPaintRepair } from './dialog-overlay';
 import { paintDialogToOverlay, finalizeDialogPaint, repaintDialogOverlayIfVisible, repaintDialogAfterContentChange } from './dialog-paint';
-import { handleSystemControlMessage, applyStaticSetImageAutoSize } from './dialog-control-messages';
+import { handleSystemControlMessage, applyStaticSetImageAutoSize, isContentChangingMessage } from './dialog-control-messages';
 import { getDefWindowProcAddress } from './system-classes';
-import { isEditContentMessage } from './edit-control';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { emitDialogShow } from '../../core/debug/dbg-commands';
 import {
@@ -40,11 +39,6 @@ import {
     reactivateOwnerIfNeeded,
     isCreateInProgress,
 } from './activation-messages';
-
-// Sibling dialog modules re-exported so importers (window.ts, message.ts,
-// dialog-items.ts, destroy-sync.ts, ddraw, comctl32) keep './dialog' paths.
-export { requestGuestDialogPaint, repaintDialogOverlayIfVisible, repaintDialogAfterContentChange } from './dialog-paint';
-export { handleSystemControlMessage, applyStaticSetImageAutoSize } from './dialog-control-messages';
 
 // Track active dialogs for EndDialog result capture
 const activeDialogs = new Map<number, {
@@ -168,67 +162,9 @@ function hasGuestDestroyProc(wi: WindowInfo): boolean {
 /** Win32 COLOR_BTNFACE as COLORREF (0x00BBGGRR). */
 const COLOR_DLGFACE = 0x00C8D0D4;
 
-/**
- * Look up a child control by controlId in the given dialog's children.
- */
-export function findChildByControlId(
-    parentHwnd: number,
-    controlId: number,
-    visited: Set<number> = new Set<number>(),
-): WindowInfo | undefined {
-    if (visited.has(parentHwnd)) return undefined;
-    visited.add(parentHwnd);
-
-    const parent = windows.get(parentHwnd);
-    if (!parent) return undefined;
-    for (const childHwnd of parent.children) {
-        const child = windows.get(childHwnd);
-        if (!child) continue;
-        if (child.controlId === controlId) return child;
-        const nested = findChildByControlId(childHwnd, controlId, visited);
-        if (nested) return nested;
-    }
-    return undefined;
-}
-
 // Auto check/radio state transitions live in control-interaction.ts (shared with
 // DispatchMessage's hit-test path); re-exported here for existing importers.
 export { applyAutoButtonState } from './control-interaction';
-
-/** Check if a message modifies control content and should trigger repaint. */
-export function isContentChangingMessage(msg: number): boolean {
-    const WM_SETTEXT = 0x000C;
-    const CB_ADDSTRING = 0x0143;
-    const CB_DELETESTRING = 0x0144;
-    const CB_INSERTSTRING = 0x014A;
-    const CB_RESETCONTENT = 0x014B;
-    const CB_SETCURSEL = 0x014E;
-    const CB_SHOWDROPDOWN = 0x014F;
-    const LB_ADDSTRING = 0x0180;
-    const LB_INSERTSTRING = 0x0181;
-    const LB_DELETESTRING = 0x0182;
-    const LB_RESETCONTENT = 0x0184;
-    const LB_SETCURSEL = 0x0186;
-    const LB_SELECTSTRING = 0x018C;
-    const LB_SETTOPINDEX = 0x0197;
-    const BM_SETCHECK = 0x00F1;
-    const BM_SETIMAGE = 0x00F7;
-    const STM_SETIMAGE = 0x0172;
-    // Trackbar/progress (WM_USER range) position/range updates — gated to system
-    // controls by the caller, same as handleSystemControlMessage routing.
-    const TBM_SETPOS = 0x0405;
-    const TBM_SETRANGE = 0x0406;
-    const TBM_SETRANGEMAX = 0x0408;
-    return msg === WM_SETTEXT || msg === BM_SETCHECK || msg === STM_SETIMAGE || msg === BM_SETIMAGE
-        || msg === LB_SELECTSTRING
-        || msg === LB_SETTOPINDEX
-        || msg === CB_SHOWDROPDOWN
-        || (msg >= CB_ADDSTRING && msg <= CB_SETCURSEL)
-        || (msg >= LB_ADDSTRING && msg <= LB_SETCURSEL)
-        || (msg >= TBM_SETPOS && msg <= TBM_SETRANGEMAX)
-        || (msg >= 0x0401 && msg <= 0x0406) // PBM_SETRANGE..PBM_SETRANGE32 overlap
-        || isEditContentMessage(msg); // EM_*/WM_CHAR/WM_KEYDOWN on an edit (caller gates class)
-}
 
 function createDialogTemplateFont(parsed: ParsedDlgTemplate | null): number {
     if (!parsed?.fontName || !parsed.fontSize || parsed.fontSize <= 0) return 0;

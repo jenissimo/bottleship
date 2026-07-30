@@ -35,7 +35,7 @@ import { d3d9WasmArena, isWasmPathEnabled, setWasmPathEnabled, setArenaVerifyDra
 import { windows, getAbsoluteWindowPosition, controlImageHandles, WindowInfo } from '../../modules/user32/shared-state';
 import { resolveBitmapRgba } from '../../modules/gdi32/bitmap-resolve';
 import { dialogNeedsPointMouseRouting } from '../../modules/user32/dialog-overlay';
-import { repaintDialogOverlayIfVisible } from '../../modules/user32/dialog';
+import { repaintDialogOverlayIfVisible } from '../../modules/user32/dialog-paint';
 import { isGdiSurfaceHidden } from '../../modules/ddraw/gdi-visibility';
 import { hpFreezeWatchdog } from './hp-freeze-watchdog';
 import { setGuestMemoryStaleGuard, isGuestMemoryStaleGuardEnabled, setGuestMemoryBorrowBypass, isGuestMemoryBorrowBypassed } from '../memory/guest-memory';

@@ -10,7 +10,7 @@ import { Marshaler } from '../../core/memory/marshaler';
 import { System } from '../../core/system';
 import { WindowInfo, windows, buttonCheckStates, getOrCreateListState, getOrCreateTrackbarState, controlImageHandles } from './shared-state';
 import { handleAnimateMessage } from './animate-control';
-import { handleEditMessage } from './edit-control';
+import { handleEditMessage, isEditContentMessage } from './edit-control';
 import { setScrollPos, getScrollPos, setScrollRange, getScrollRange, applyScrollInfo, readScrollInfo } from './scroll-state';
 import { paintSystemControl, clampListTopIndex, listVisibleCount } from './controls';
 import { repaintDialogAfterContentChange, restampOwnedPopupsAbove } from './dialog-paint';
@@ -35,6 +35,40 @@ const BS_AUTORADIOBUTTON = 0x0009;
 const WS_DISABLED = 0x08000000;
 
 const WM_PAINT = 0x000F;
+
+/** Return whether a control message changes visible content. */
+export function isContentChangingMessage(msg: number): boolean {
+    const WM_SETTEXT = 0x000C;
+    const CB_ADDSTRING = 0x0143;
+    const CB_DELETESTRING = 0x0144;
+    const CB_INSERTSTRING = 0x014A;
+    const CB_RESETCONTENT = 0x014B;
+    const CB_SETCURSEL = 0x014E;
+    const CB_SHOWDROPDOWN = 0x014F;
+    const LB_ADDSTRING = 0x0180;
+    const LB_INSERTSTRING = 0x0181;
+    const LB_DELETESTRING = 0x0182;
+    const LB_RESETCONTENT = 0x0184;
+    const LB_SETCURSEL = 0x0186;
+    const LB_SELECTSTRING = 0x018C;
+    const LB_SETTOPINDEX = 0x0197;
+    const BM_SETCHECK = 0x00F1;
+    const BM_SETIMAGE = 0x00F7;
+    const STM_SETIMAGE = 0x0172;
+    const TBM_SETPOS = 0x0405;
+    const TBM_SETRANGE = 0x0406;
+    const TBM_SETRANGEMAX = 0x0408;
+
+    return msg === WM_SETTEXT || msg === BM_SETCHECK || msg === STM_SETIMAGE || msg === BM_SETIMAGE
+        || msg === LB_SELECTSTRING
+        || msg === LB_SETTOPINDEX
+        || msg === CB_SHOWDROPDOWN
+        || (msg >= CB_ADDSTRING && msg <= CB_SETCURSEL)
+        || (msg >= LB_ADDSTRING && msg <= LB_SETCURSEL)
+        || (msg >= TBM_SETPOS && msg <= TBM_SETRANGEMAX)
+        || (msg >= 0x0401 && msg <= 0x0406)
+        || isEditContentMessage(msg);
+}
 
 /**
  * Win32 SS_BITMAP / SS_ICON: a static with an image resizes itself to the image's
