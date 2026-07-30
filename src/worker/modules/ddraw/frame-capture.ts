@@ -18,9 +18,17 @@ import {
     D3DRENDERSTATE_COLORKEYENABLE,
     D3DRENDERSTATE_ZENABLE,
     D3DRENDERSTATE_ZWRITEENABLE,
+    D3DRENDERSTATE_ZFUNC,
     D3DRENDERSTATE_CULLMODE,
     D3DRENDERSTATE_LIGHTING,
     D3DRENDERSTATE_FOGENABLE,
+    D3DRENDERSTATE_FOGCOLOR,
+    D3DRENDERSTATE_FOGTABLEMODE,
+    D3DRENDERSTATE_FOGVERTEXMODE,
+    D3DRENDERSTATE_FOGSTART,
+    D3DRENDERSTATE_FOGEND,
+    D3DRENDERSTATE_FOGDENSITY,
+    D3DRENDERSTATE_SPECULARENABLE,
     D3DRENDERSTATE_TEXTUREADDRESS,
     D3DRENDERSTATE_TEXTUREADDRESSU,
     D3DRENDERSTATE_TEXTUREADDRESSV,
@@ -41,6 +49,13 @@ import {
     D3DTSS_MAXANISOTROPY,
     D3DFVF_XYZRHW,
 } from "./constants";
+
+/** Fog range render states carry float BITS in the DWORD slot. */
+const dwordBitsScratch = new DataView(new ArrayBuffer(4));
+function dwordToFloat(d: number): number {
+    dwordBitsScratch.setUint32(0, d >>> 0, true);
+    return dwordBitsScratch.getFloat32(0, true);
+}
 
 const TOPOLOGY_NAMES: Record<number, string> = {
     1: "POINTLIST", 2: "LINELIST", 3: "LINESTRIP",
@@ -117,18 +132,33 @@ let captureReject: ((e: Error) => void) | null = null;
 let captureFrameId = 0;
 // Backend of the producer recording this frame (set by recordDrawCall/recordRawDraw).
 let captureBackend = "ddraw";
+/** Only this producer's frame boundary may end the capture (undefined = any). */
+let captureWantBackend: string | undefined;
+/** Frame ends skipped because they carried nothing — reported, never silently dropped. */
+let captureSkippedEmpty = 0;
+/** How many empty frame ends to wait through before giving up and reporting one. */
+const MAX_EMPTY_FRAME_ENDS = 8;
 
 export function isCapturing(): boolean {
     return captureActive;
 }
 
-export function startCapture(): Promise<CapturedFrame> {
+/**
+ * Arm a one-frame capture. `backend` restricts which producer's frame boundary ends it:
+ * with two render paths alive (a d3d9 game whose launcher still Flips a DDraw primary) the
+ * first boundary to fire wins, and a frame from the OTHER path resolves with zero draws —
+ * indistinguishable from "nothing drew". An unrestricted capture also waits through empty
+ * boundaries rather than reporting the first one.
+ */
+export function startCapture(backend?: string): Promise<CapturedFrame> {
     // Settle a still-armed prior capture so its caller doesn't hang until its own
     // timeout (two overlapping captureFrame calls, or capture + dbg.frame()).
     if (captureReject) captureReject(new Error("capture superseded by a new startCapture"));
     captureBuffer = [];
     clearBuffer = [];
     captureBackend = "ddraw";
+    captureWantBackend = backend;
+    captureSkippedEmpty = 0;
     captureActive = true;
     return new Promise<CapturedFrame>((resolve, reject) => {
         captureResolve = resolve;
@@ -136,15 +166,31 @@ export function startCapture(): Promise<CapturedFrame> {
     });
 }
 
+/** Schema fields a partial producer leaves at their default. Listed per draw as
+ *  `unmeasured` so a zero here can never be read as a measurement — the whole reason
+ *  a d3d9 capture once looked like "depth test off on all 108 draws". */
+const RAW_DRAW_MEASURABLE = [
+    "primitiveType", "vertexType", "vertexCount", "indexCount", "isRHW",
+    "rtSurfacePtr", "rtWidth", "rtHeight", "rtFormat", "tex0", "tex1",
+    "alphaBlendEnabled", "srcBlend", "dstBlend", "alphaTestEnabled", "alphaFunc", "alphaRef",
+    "colorKeyRenderState", "zEnable", "zWrite", "zFunc", "cullMode", "lightingEnabled", "fogEnabled", "fog",
+    "colorOp", "alphaOp", "colorArg1", "colorArg2", "alphaArg1", "alphaArg2",
+    "legacySamplerState", "stage0SamplerState", "effectiveSamplerState",
+    "derivedColorKeyEnabled", "derivedUseTexture", "derivedPremultiply", "derivedShouldBlend",
+    "firstVertices", "mvp", "viewport",
+] as const;
+
 /**
- * Backend-agnostic draw record. The DDraw/D3D7/D3D8 FFP path uses the
- * rich recordDrawCall above; D3D9's programmable path has no FFP render-state
- * arrays, so its producer supplies a partial (primitive/counts/textures) here and
- * the rest defaults. Keeps ONE CapturedDrawCall schema, tagged by backend.
+ * Backend-agnostic draw record. The DDraw/D3D7/D3D8 FFP path uses the rich recordDrawCall
+ * above; other producers supply what they can measure here and the rest keeps its schema
+ * default — which is why every such default is named in `unmeasured`. Adding a field to a
+ * producer removes it from that list automatically. ONE CapturedDrawCall schema, tagged by
+ * backend.
  */
 export function recordRawDraw(partial: Partial<CapturedDrawCall> & { backend: string }): void {
     if (!captureActive) return;
     captureBackend = partial.backend;
+    const unmeasured = RAW_DRAW_MEASURABLE.filter((k) => (partial as Record<string, unknown>)[k] === undefined);
     const call: CapturedDrawCall = {
         primitiveType: 0, primitiveTypeName: "", vertexType: 0, vertexCount: 0, indexCount: 0, isRHW: false,
         firstVertices: [], rtSurfacePtr: 0, rtWidth: 0, rtHeight: 0, tex0: null, tex1: null,
@@ -158,23 +204,34 @@ export function recordRawDraw(partial: Partial<CapturedDrawCall> & { backend: st
         warnings: [],
         ...partial,
         index: captureBuffer.length, // authoritative index (after spread, so partial can't override)
+        unmeasured: unmeasured.length ? [...unmeasured] : undefined,
     };
     captureBuffer.push(call);
 }
 
-export function onFrameEnd(): void {
+export function onFrameEnd(producer = "ddraw"): void {
     if (!captureActive) return;
+    if (captureWantBackend !== undefined && producer !== captureWantBackend) return;
+    const empty = captureBuffer.length === 0 && clearBuffer.length === 0;
+    if (empty && captureSkippedEmpty < MAX_EMPTY_FRAME_ENDS) {
+        captureSkippedEmpty++;
+        return;
+    }
     captureActive = false;
     const frame: CapturedFrame = {
         frameId: ++captureFrameId,
         timestamp: performance.now(),
         backend: captureBackend, // ddraw | d3d8 | d3d9, set by the producer that recorded
+        producer,
+        skippedEmptyFrameEnds: captureSkippedEmpty,
         drawCalls: captureBuffer,
         clears: clearBuffer,
     };
     captureBuffer = [];
     clearBuffer = [];
     captureBackend = "ddraw";
+    captureWantBackend = undefined;
+    captureSkippedEmpty = 0;
     const resolve = captureResolve;
     captureResolve = null;
     captureReject = null;
@@ -209,6 +266,35 @@ export function recordClear(
         rtSurfacePtr: target.surfacePtr >>> 0,
         rtWidth: target.width,
         rtHeight: target.height,
+        rectCount: rectCount >>> 0,
+    });
+}
+
+/**
+ * Backend-agnostic Clear record for producers with no DirectDrawSurfaceState (D3D9). Same
+ * schema; the point is that a capture never reports `clears: []` for a path that does clear.
+ */
+export function recordClearRaw(
+    flags: number,
+    color: number,
+    depth: number,
+    stencil: number,
+    rt: { surfacePtr: number; width: number; height: number },
+    rectCount = 0
+): void {
+    if (!captureActive) return;
+    clearBuffer.push({
+        index: captureBuffer.length,
+        flags: flags >>> 0,
+        clearsTarget: (flags & D3DCLEAR_TARGET) !== 0,
+        clearsZ: (flags & D3DCLEAR_ZBUFFER) !== 0,
+        clearsStencil: (flags & D3DCLEAR_STENCIL) !== 0,
+        color: color >>> 0,
+        depth,
+        stencil: stencil >>> 0,
+        rtSurfacePtr: rt.surfacePtr >>> 0,
+        rtWidth: rt.width,
+        rtHeight: rt.height,
         rectCount: rectCount >>> 0,
     });
 }
@@ -342,9 +428,20 @@ export function recordDrawCall(p: RecordDrawCallParams): void {
     const colorKeyRenderState = (rs[D3DRENDERSTATE_COLORKEYENABLE] ?? 0) as number;
     const zEnable = (rs[D3DRENDERSTATE_ZENABLE] ?? 0) as number;
     const zWrite = (rs[D3DRENDERSTATE_ZWRITEENABLE] ?? 0) as number;
+    const zFunc = (rs[D3DRENDERSTATE_ZFUNC] ?? 0) as number;
     const cullMode = (rs[D3DRENDERSTATE_CULLMODE] ?? 0) as number;
     const lightingEnabled = (rs[D3DRENDERSTATE_LIGHTING] ?? 0) as number;
     const fogEnabled = (rs[D3DRENDERSTATE_FOGENABLE] ?? 0) as number;
+    const fog = {
+        enable: fogEnabled,
+        tableMode: (rs[D3DRENDERSTATE_FOGTABLEMODE] ?? 0) as number,
+        vertexMode: (rs[D3DRENDERSTATE_FOGVERTEXMODE] ?? 0) as number,
+        colorArgb: ((rs[D3DRENDERSTATE_FOGCOLOR] ?? 0) as number) >>> 0,
+        start: dwordToFloat((rs[D3DRENDERSTATE_FOGSTART] ?? 0) as number),
+        end: dwordToFloat((rs[D3DRENDERSTATE_FOGEND] ?? 0) as number),
+        density: dwordToFloat((rs[D3DRENDERSTATE_FOGDENSITY] ?? 0) as number),
+        specularEnable: (rs[D3DRENDERSTATE_SPECULARENABLE] ?? 0) as number,
+    };
 
     // Texture stage states (stage 0)
     const colorOp = (ts[0 * 32 + D3DTSS_COLOROP] ?? 0) as number;
@@ -452,6 +549,7 @@ export function recordDrawCall(p: RecordDrawCallParams): void {
         rtSurfacePtr: p.rtState.surfacePtr,
         rtWidth: p.rtState.width,
         rtHeight: p.rtState.height,
+        rtFormat: p.rtState.gpuTexture ? ((p.rtState.gpuTexture as GPUTexture).format ?? null) : null,
         tex0,
         tex1,
         alphaBlendEnabled,
@@ -463,9 +561,11 @@ export function recordDrawCall(p: RecordDrawCallParams): void {
         colorKeyRenderState,
         zEnable,
         zWrite,
+        zFunc,
         cullMode,
         lightingEnabled,
         fogEnabled,
+        fog,
         colorOp,
         alphaOp,
         colorArg1,

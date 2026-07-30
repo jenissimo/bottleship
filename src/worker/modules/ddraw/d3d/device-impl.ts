@@ -2,6 +2,7 @@
  * IDirect3DDevice3 and IDirect3DDevice7 implementations
  */
 import { Logger, LogCategory, LogLevel } from "../../../core/logger";
+import { assignStubsOnce } from "../../../core/thunking/stub-merge";
 import { ThunkImplementation } from "../../../core/thunking/thunk-dispatcher";
 import { System } from "../../../core/system";
 import { DDrawContext } from "../context";
@@ -1025,9 +1026,11 @@ export const createDeviceExports = (
             cur = identityMat4();
         }
 
-        // D3D row-vector convention: v' = v * M
-        // MultiplyTransform does: M = M * mul (current matrix multiplied by new matrix)
-        const res = multiplyMatrices(cur, mul);
+        // D3D row-vector convention (v' = v·M): the ARGUMENT is applied to the vertex
+        // first, then the matrix already in the state — M = mul · cur, not cur · mul.
+        // (Mirrors wined3d_stateblock_multiply_transform, and is what a GL wrapper's
+        // glMultMatrix maps to once transposed into D3D's row-vector form.)
+        const res = multiplyMatrices(mul, cur);
 
         obj.setTransform(state, res);
 
@@ -1499,8 +1502,8 @@ export const createDeviceExports = (
         }
 
         // D3D row-vector convention: v' = v * M
-        // MultiplyTransform does: M = M * mul
-        const res = multiplyMatrices(cur, mul);
+        // Argument first, then the stored matrix (see the Device7 note above).
+        const res = multiplyMatrices(mul, cur);
 
         obj.setTransform(state, res);
 
@@ -1829,7 +1832,7 @@ export const createDeviceExports = (
         return D3D_OK;
     };
 
-    Object.assign(exports, createDeviceStubsExports());
+    assignStubsOnce(exports, createDeviceStubsExports(), "d3d device stubs");
 
     exports["IDirect3DDevice3_GetDirect3D"] = (_ctx, mem, args) => {
         const obj = resourceProvider.getComObjectByAddress(args[0]) as Direct3DDevice3Object | null;

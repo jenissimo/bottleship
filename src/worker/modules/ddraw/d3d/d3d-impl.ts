@@ -18,9 +18,19 @@ import {
     allocateComObject,
     COM_OBJECT_SIZE,
     DDPF_ZBUFFER,
+    DDPIXELFORMAT_Z_OFFSETS,
 } from "../constants";
-import { Direct3DDevice3Object, Direct3DDevice7Object, Direct3DVertexBufferObject, Direct3DLightObject, Direct3DMaterial3Object } from "../com-objects";
-import { D3DExports, D3D_OK, D3DERR_INVALIDCALL } from "./types";
+import {
+    Direct3DDevice3Object,
+    Direct3DDevice7Object,
+    Direct3DVertexBufferObject,
+    Direct3DViewport3Object,
+    Direct3DLightObject,
+    Direct3DMaterial3Object,
+} from "../com-objects";
+import { D3DExports, D3D_OK, D3DERR_INVALIDCALL, D3DColorValue } from "./types";
+import { processVertices } from "./process-vertices";
+import { D3DRENDERSTATE_LIGHTING } from "../constants";
 import {
     fillDeviceDesc,
     fillDeviceDesc7,
@@ -38,6 +48,13 @@ import { initReturnPtr } from "../../../backends/webgpu/shared/dx-com-helpers";
 // ddraw.h aliases these onto the standard COM codes, not MAKE_DDHRESULT values.
 const DDERR_INVALIDPARAMS = 0x80070057; // E_INVALIDARG
 const DDERR_UNSUPPORTED = 0x80004001;   // E_NOTIMPL
+
+/** D3DCOLORVALUE (0..1 floats) -> D3DCOLOR (0xAARRGGBB), the FVF colour encoding. */
+const colorValueToArgb = (c?: D3DColorValue): number => {
+    if (!c) return 0xffffffff;
+    const q = (v: number) => Math.max(0, Math.min(255, Math.round(v * 255)));
+    return ((q(c.a) << 24) | (q(c.r) << 16) | (q(c.g) << 8) | q(c.b)) >>> 0;
+};
 
 export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => {
     const exports: D3DExports = {};
@@ -74,12 +91,12 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
 
     exports["IDirect3D_AddRef"] = (ctx, mem, args) => {
         const obj = resourceProvider.getComObjectByAddress(args[0]);
-        return obj ? obj.addRef() : 0;
+        return obj ? obj.addRef(args[0]) : 0;
     };
 
     exports["IDirect3D_Release"] = (ctx, mem, args) => {
         const obj = resourceProvider.getComObjectByAddress(args[0]);
-        return obj ? obj.release() : 0;
+        return obj ? obj.release(args[0]) : 0;
     };
 
     exports["IDirect3D_Initialize"] = () => D3D_OK;
@@ -108,12 +125,12 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
 
     exports["IDirect3D2_AddRef"] = (ctx, mem, args) => {
         const obj = resourceProvider.getComObjectByAddress(args[0]);
-        return obj ? obj.addRef() : 0;
+        return obj ? obj.addRef(args[0]) : 0;
     };
 
     exports["IDirect3D2_Release"] = (ctx, mem, args) => {
         const obj = resourceProvider.getComObjectByAddress(args[0]);
-        return obj ? obj.release() : 0;
+        return obj ? obj.release(args[0]) : 0;
     };
 
     exports["IDirect3D2_EnumDevices"] = (ctx, mem, args) => {
@@ -174,12 +191,12 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
 
     exports["IDirect3D3_AddRef"] = (ctx, mem, args) => {
         const obj = resourceProvider.getComObjectByAddress(args[0]);
-        return obj ? obj.addRef() : 0;
+        return obj ? obj.addRef(args[0]) : 0;
     };
 
     exports["IDirect3D3_Release"] = (ctx, mem, args) => {
         const obj = resourceProvider.getComObjectByAddress(args[0]);
-        return obj ? obj.release() : 0;
+        return obj ? obj.release(args[0]) : 0;
     };
 
     exports["IDirect3D3_CreateViewport"] = (ctx, mem, args) => {
@@ -266,20 +283,21 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
             }
 
             const depth = depths[index];
-            view.setUint32(formatAddr + 12, depth, true); // dwZBufferBitDepth
-            
-            // Offset 24: dwZBitMask, Offset 28: dwStencilBitMask
+            view.setUint32(formatAddr + DDPIXELFORMAT_Z_OFFSETS.zBufferBitDepth, depth, true);
+
+            // dwZBitMask/dwStencilBitMask are union members over dwGBitMask/dwBBitMask —
+            // an app that computes its DDBLT_DEPTHFILL value from dwZBitMask reads them there.
             if (depth === 16) {
-                view.setUint32(formatAddr + 24, 0xFFFF, true);
-                view.setUint32(formatAddr + 28, 0x0000, true);
+                view.setUint32(formatAddr + DDPIXELFORMAT_Z_OFFSETS.zBitMask, 0x0000ffff, true);
+                view.setUint32(formatAddr + DDPIXELFORMAT_Z_OFFSETS.stencilBitMask, 0x00000000, true);
             } else if (depth === 24) {
-                view.setUint32(formatAddr + 24, 0xFFFFFF00, true);
-                view.setUint32(formatAddr + 28, 0x00000000, true);
+                view.setUint32(formatAddr + DDPIXELFORMAT_Z_OFFSETS.zBitMask, 0x00ffffff, true);
+                view.setUint32(formatAddr + DDPIXELFORMAT_Z_OFFSETS.stencilBitMask, 0x00000000, true);
             } else if (depth === 32) {
-                view.setUint32(formatAddr + 24, 0xFFFFFF00, true);
-                view.setUint32(formatAddr + 28, 0x000000FF, true);
+                view.setUint32(formatAddr + DDPIXELFORMAT_Z_OFFSETS.zBitMask, 0xffffffff, true);
+                view.setUint32(formatAddr + DDPIXELFORMAT_Z_OFFSETS.stencilBitMask, 0x00000000, true);
             }
-            
+
             index++;
 
             const { callbackId } = callbackManager.invokeCallback(
@@ -574,6 +592,7 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
         if (!obj) return 0x80004005;
 
         obj.setBufferInfo(dataPtr, dwFVF, dwNumVertices, dwCaps, vertexSize);
+        obj.setInterfaceVersion(3);
 
         const objAddr = allocateComObject(context.process.memory, mem, vtableAddr);
         view.setUint32(lplpVB, objAddr, true);
@@ -616,15 +635,99 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
         if (lpdwSize) {
             view.setUint32(lpdwSize, obj.getNumVertices() * obj.getVertexSize(), true);
         }
+        obj.beginLock();
 
         Logger.verbose(LogCategory.SYSTEM,
             `IDirect3DVertexBuffer_Lock: this=0x${thisPtr.toString(16)} -> data=0x${obj.getDataPtr().toString(16)}`);
         return D3D_OK;
     };
 
-    exports["IDirect3DVertexBuffer_Unlock"] = () => D3D_OK;
+    // Lock/Unlock bracket the guest's own writes into the buffer. The draw path reads the
+    // vertex bytes straight out of guest memory at submit time, so there is no host-side
+    // copy to flush here — what Unlock owes is the lock bookkeeping itself, so that a
+    // double Unlock or an Unlock of a foreign pointer is reported rather than swallowed.
+    exports["IDirect3DVertexBuffer_Unlock"] = (ctx, mem, args) => {
+        const obj = resourceProvider.getComObjectByAddress(args[0]) as Direct3DVertexBufferObject | null;
+        if (!obj) return DDERR_INVALIDPARAMS;
+        obj.endLock();
+        return D3D_OK;
+    };
 
-    exports["IDirect3DVertexBuffer_ProcessVertices"] = () => D3D_OK;
+    /** Current world×view×projection + viewport + lighting inputs for either device version. */
+    const vertexPipelineState = (devAddr: number) => {
+        const dev = resourceProvider.getComObjectByAddress(devAddr) as
+            (Direct3DDevice3Object | Direct3DDevice7Object) | null;
+        if (!dev) return null;
+        const mvp = dev.getCachedMVP();
+        if (!mvp) return null;
+
+        let viewport: { x: number; y: number; width: number; height: number; minZ: number; maxZ: number } | null = null;
+        // IDENTITY_CLIP_SPACE unless a legacy D3DVIEWPORT2 asked for a non-default clipping
+        // volume / depth range. D3DVIEWPORT7 (device-level SetViewport) has neither: its
+        // dvMinZ/dvMaxZ ARE the rasterizer range, so it keeps the identity remap.
+        let clipSpace = { sx: 1, sy: 1, sz: 1, ox: 0, oy: 0, oz: 0 };
+        if (dev instanceof Direct3DDevice7Object) {
+            viewport = dev.getViewportData();
+        } else {
+            const vpAddr = dev.getCurrentViewport();
+            const vpObj = vpAddr ? resourceProvider.getComObjectByAddress(vpAddr) as Direct3DViewport3Object | null : null;
+            if (vpObj) {
+                const v = vpObj.getViewport();
+                clipSpace = vpObj.getClipSpace();
+                // The remap already consumed dvMinZ/dvMaxZ; what remains for the rasterizer is [0,1].
+                viewport = { x: v.x, y: v.y, width: v.width, height: v.height, minZ: 0, maxZ: 1 };
+            }
+        }
+        if (!viewport || viewport.width <= 0 || viewport.height <= 0) {
+            viewport = { x: 0, y: 0, width: context.display.width || 640, height: context.display.height || 480, minZ: 0, maxZ: 1 };
+        }
+
+        const material = dev.getMaterial();
+        return {
+            mvp,
+            viewport,
+            clipSpace,
+            lightingRenderState: dev.getRenderState(D3DRENDERSTATE_LIGHTING) !== 0,
+            hasMaterial: dev.isMaterialSet(),
+            materialDiffuseArgb: colorValueToArgb(material?.diffuse),
+            materialSpecularArgb: colorValueToArgb(material?.specular),
+        };
+    };
+
+    // IDirect3DVertexBuffer::ProcessVertices(this, dwVertexOp, dwDestIndex, dwCount,
+    //                                        lpSrcBuffer, dwSrcIndex, lpD3DDevice, dwFlags)
+    // dwFlags (D3DPV_DONOTCOPYDATA) only asks to skip copying unchanged non-position data;
+    // copying it unconditionally is always a valid superset, so it is not branched on.
+    exports["IDirect3DVertexBuffer_ProcessVertices"] = (ctx, mem, args) => {
+        const dstObj = resourceProvider.getComObjectByAddress(args[0]) as Direct3DVertexBufferObject | null;
+        const srcObj = resourceProvider.getComObjectByAddress(args[4]) as Direct3DVertexBufferObject | null;
+        if (!dstObj || !srcObj) return DDERR_INVALIDPARAMS;
+
+        const state = vertexPipelineState(args[6]);
+        if (!state) {
+            Logger.warn(LogCategory.DDRAW,
+                `IDirect3DVertexBuffer_ProcessVertices: no device state for 0x${args[6].toString(16)}`);
+            return D3DERR_INVALIDCALL;
+        }
+
+        return processVertices(mem, {
+            vertexOp: args[1] >>> 0,
+            destIndex: args[2] >>> 0,
+            srcIndex: args[5] >>> 0,
+            count: args[3] >>> 0,
+            dstAddr: dstObj.getDataPtr(),
+            dstFvf: dstObj.getFVF(),
+            dstStride: dstObj.getVertexSize(),
+            dstNumVertices: dstObj.getNumVertices(),
+            srcAddr: srcObj.getDataPtr(),
+            srcFvf: srcObj.getFVF(),
+            srcStride: srcObj.getVertexSize(),
+            srcNumVertices: srcObj.getNumVertices(),
+            // The DX6 buffer lights off the material; the DX7 one off D3DRENDERSTATE_LIGHTING.
+            legacyV3: dstObj.getInterfaceVersion() === 3,
+            ...state,
+        });
+    };
 
     exports["IDirect3DVertexBuffer_GetVertexBufferDesc"] = (ctx, mem, args) => {
         const thisPtr = args[0];
@@ -683,12 +786,12 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
 
     exports["IDirect3D7_AddRef"] = (ctx, mem, args) => {
         const obj = resourceProvider.getComObjectByAddress(args[0]);
-        return obj ? obj.addRef() : 0;
+        return obj ? obj.addRef(args[0]) : 0;
     };
 
     exports["IDirect3D7_Release"] = (ctx, mem, args) => {
         const obj = resourceProvider.getComObjectByAddress(args[0]);
-        return obj ? obj.release() : 0;
+        return obj ? obj.release(args[0]) : 0;
     };
 
     exports["IDirect3D7_CreateDevice"] = (ctx, mem, args) => {
@@ -751,20 +854,21 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
             }
 
             const depth = depths[index];
-            view.setUint32(formatAddr + 12, depth, true); // dwZBufferBitDepth
-            
-            // Offset 24: dwZBitMask, Offset 28: dwStencilBitMask
+            view.setUint32(formatAddr + DDPIXELFORMAT_Z_OFFSETS.zBufferBitDepth, depth, true);
+
+            // dwZBitMask/dwStencilBitMask are union members over dwGBitMask/dwBBitMask —
+            // an app that computes its DDBLT_DEPTHFILL value from dwZBitMask reads them there.
             if (depth === 16) {
-                view.setUint32(formatAddr + 24, 0xFFFF, true);
-                view.setUint32(formatAddr + 28, 0x0000, true);
+                view.setUint32(formatAddr + DDPIXELFORMAT_Z_OFFSETS.zBitMask, 0x0000ffff, true);
+                view.setUint32(formatAddr + DDPIXELFORMAT_Z_OFFSETS.stencilBitMask, 0x00000000, true);
             } else if (depth === 24) {
-                view.setUint32(formatAddr + 24, 0xFFFFFF00, true);
-                view.setUint32(formatAddr + 28, 0x00000000, true);
+                view.setUint32(formatAddr + DDPIXELFORMAT_Z_OFFSETS.zBitMask, 0x00ffffff, true);
+                view.setUint32(formatAddr + DDPIXELFORMAT_Z_OFFSETS.stencilBitMask, 0x00000000, true);
             } else if (depth === 32) {
-                view.setUint32(formatAddr + 24, 0xFFFFFF00, true);
-                view.setUint32(formatAddr + 28, 0x000000FF, true);
+                view.setUint32(formatAddr + DDPIXELFORMAT_Z_OFFSETS.zBitMask, 0xffffffff, true);
+                view.setUint32(formatAddr + DDPIXELFORMAT_Z_OFFSETS.stencilBitMask, 0x00000000, true);
             }
-            
+
             index++;
 
             const { callbackId } = callbackManager.invokeCallback(
@@ -967,6 +1071,7 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
         if (!obj) return 0x80004005;
 
         obj.setBufferInfo(dataPtr, dwFVF, dwNumVertices, dwCaps, vertexSize);
+        obj.setInterfaceVersion(7);
 
         const objAddr = allocateComObject(context.process.memory, mem, vtableAddr);
         view.setUint32(lplpVB, objAddr, true);

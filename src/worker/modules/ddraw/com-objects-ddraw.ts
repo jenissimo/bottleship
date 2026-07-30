@@ -22,6 +22,12 @@ export class DirectDrawObject extends BaseComObject {
         super(IID_IDirectDraw7, vtableAddress);
     }
 
+    // IDirectDraw/2/4/7 and IDirect3D/2/3/7 are tear-offs of this one driver object, and
+    // DirectDraw gives each its own refcount (see BaseComObject.perInterfaceRefs).
+    protected override get perInterfaceRefs(): boolean {
+        return true;
+    }
+
     protected destroy(): void {
         const resourceProvider = SystemResourceProvider.getInstance();
         const allCom = resourceProvider.getAllComObjects();

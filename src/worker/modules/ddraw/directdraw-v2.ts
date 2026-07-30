@@ -37,12 +37,12 @@ export function registerDirectDraw2Exports(
 
     exports["IDirectDraw2_AddRef"] = (ctx, mem, args) => {
         const obj = context.resourceProvider.getComObjectByAddress(args[0]);
-        return obj ? obj.addRef() : 0;
+        return obj ? obj.addRef(args[0]) : 0;
     };
 
     exports["IDirectDraw2_Release"] = (ctx, mem, args) => {
         const obj = context.resourceProvider.getComObjectByAddress(args[0]);
-        return obj ? obj.release() : 0;
+        return obj ? obj.release(args[0]) : 0;
     };
 
     exports["IDirectDraw2_SetCooperativeLevel"] = (ctx, mem, args) => {

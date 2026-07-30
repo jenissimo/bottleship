@@ -1,6 +1,9 @@
 /**
  * IDirect3DDevice7 and IDirect3DDevice3 stub methods (low priority, not yet implemented).
- * Do NOT add methods that are implemented in device-impl.ts — they would be overwritten.
+ *
+ * A name listed here that device-impl.ts also implements is dead weight — the merge
+ * (assignStubsOnce) keeps the real handler — and `tools/validate-stub-tables.ts` fails
+ * the gate on it, so this stays enforced rather than remembered.
  */
 import type { ThunkImplementation } from "../../../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../../../core/logger";
@@ -39,10 +42,7 @@ export function createDeviceStubsExports(): Record<string, ThunkImplementation> 
 
     const d3dDevice3Stubs = [
         "GetStats",
-        "DeleteViewport",
         "NextViewport",
-        "SetCurrentViewport",
-        "GetCurrentViewport",
         "Begin",
         "BeginIndexed",
         "Vertex",

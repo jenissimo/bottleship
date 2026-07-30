@@ -16,8 +16,12 @@ import {
     DDSCAPS_FLIP,
     DDSCAPS_BACKBUFFER,
     DDSCAPS_3DDEVICE,
+    DDSCAPS_ZBUFFER,
     DDSCAPS_TEXTURE,
     D3DCLEAR_TARGET,
+    D3DCLEAR_ZBUFFER,
+    D3DCLEAR_STENCIL,
+    DDBLT_DEPTHFILL,
     DDCKEY_COLORSPACE,
     DDCKEY_SRCBLT,
     DDCKEY_DESTBLT,
@@ -48,6 +52,7 @@ import { isValidAddress } from "../../core/memory/address-guard";
 import { markGpuSyncedFromCpu } from "./surface-sync";
 import { onFrameEnd as frameCaptureOnFrameEnd } from "./frame-capture";
 import { recordSurfaceOp } from "./surface-op-log";
+import { clearDepthForZSurface, isZBufferSurface } from "./depth-fill";
 import { collectFlipChain, rotateFlipChain, warnOnLockedFlip } from "./flip-chain";
 
 // Module-level rect pool to reduce allocations in hot paths
@@ -603,6 +608,18 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
             const fillSize = DDBLTFX_OFFSETS.fillColor + 4;
             if (lpDDBltFx && isValidAddress(mem, lpDDBltFx, fillSize)) {
                 fillColor = new DataView(mem.buffer, mem.byteOffset, mem.byteLength).getUint32(lpDDBltFx + DDBLTFX_OFFSETS.fillColor, true);
+            }
+
+            // A source-less fill aimed at a z buffer is a DEPTH CLEAR. DDBLT_DEPTHFILL says so
+            // explicitly, but on real hardware the z surface IS the depth memory, so engines of
+            // this era clear it with a plain DDBLT_COLORFILL just as often — the destination's
+            // DDSCAPS_ZBUFFER is what decides, not the flag. Either way, filling the surface's
+            // guest pixels (which nothing reads) would leave the real depth attachment holding
+            // the previous frame's values, and the next frame's geometry z-fails against them.
+            if ((dwFlags & DDBLT_DEPTHFILL) !== 0 || isZBufferSurface(dstState)) {
+                clearDepthForZSurface(context, thisPtr, dstState, dstRect, fillColor);
+                recordSurfaceOp("fill", "depth", dstState, null, dstRect, null);
+                return DD_OK;
             }
 
             // GPU_ONLY surfaces: use GPU-only clear (never Lock/Unlocked)

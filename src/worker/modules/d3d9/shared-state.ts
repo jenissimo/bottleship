@@ -25,6 +25,38 @@ export const devices: Map<number, D3D9Device> = new Map();
 // Parent relationship for IDirect3DDevice9::GetDirect3D
 export const deviceToD3D9: Map<number, number> = new Map();
 
+/**
+ * What the game actually passed to IDirect3D9::CreateDevice, echoed verbatim by
+ * IDirect3DDevice9::GetCreationParameters (keyed by device COM ptr). Engines read
+ * hFocusWindow/BehaviorFlags back out of the device rather than tracking them, so
+ * these must be the caller's own values, not a plausible-looking constant.
+ */
+export const deviceCreationParams: Map<number, {
+    adapter: number;
+    deviceType: number;
+    hFocusWindow: number;
+    behaviorFlags: number;
+}> = new Map();
+
+/**
+ * The device's REAL backbuffer geometry, as given to CreateDevice/Reset (keyed by device
+ * COM ptr). The authority for every geometry answer the runtime owes the app —
+ * GetBackBuffer/GetRenderTarget surface descs and, for a fullscreen device,
+ * GetDisplayMode. The emulator's configured screen resolution is NOT that authority: a
+ * title whose backbuffer differs from it (System Shock 2 mode-sets 800x600 from its own
+ * cam.cfg while the bundle declares 1024x768) is then told the backbuffer is the config
+ * size, lays its fullscreen 2D quad out over that many pixels, and the quad overhangs
+ * the real target — the visible top-left fraction reads as a cropped screen.
+ * `windowed` decides whether GetDisplayMode reports this (fullscreen mode-set) or the
+ * desktop mode (windowed, where the app is a guest of the desktop resolution).
+ */
+export const deviceBackBufferInfo: Map<number, {
+    width: number;
+    height: number;
+    format: number;
+    windowed: boolean;
+}> = new Map();
+
 // Shared resource registry - maps COM object pointer to its parent D3D9Device
 export const resourceToDevice: Map<number, D3D9Device> = new Map();
 
@@ -80,6 +112,8 @@ export function resetD3D9SharedState(): void {
     vtables = null;
     devices.clear();
     deviceToD3D9.clear();
+    deviceCreationParams.clear();
+    deviceBackBufferInfo.clear();
     resourceToDevice.clear();
     stateBlocks.clear();
     d3d9WasmArena.resetBlockSlots(); // every block ptr just dropped — slot ownership resets with them

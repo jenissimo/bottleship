@@ -1,5 +1,6 @@
 import { ThunkImplementation, ThunkResult } from "../../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../../core/logger";
+import { assignStubsOnce } from "../../core/thunking/stub-merge";
 import { System } from "../../core/system";
 import { profiler } from "../../core/profiler";
 import { frameVarianceDiagnostics } from "../../core/frame-variance-diagnostics";
@@ -55,7 +56,8 @@ import { ComObjectFactory } from "../../core/com/base-com-object";
 
 import { convertRGBAToSurface, uploadToGPUTexture, convertSurfaceToRGBA } from "./gpu-texture-utils";
 import { setAuthorityCpu, setAuthorityGpu, markCpuSyncedFromGpu, invalidateCpuSyncedVersion, syncActiveGdiContext, surfaceSyncManager, logSurfaceState, demoteSurfaceToCpu } from "./surface-sync";
-import { recordSurfaceOp } from "./surface-op-log";
+import { recordSurfaceOp, surfaceOpsArmed } from "./surface-op-log";
+import { isZBufferSurface, syncZBufferWriteToDepth } from "./depth-fill";
 import { propagateSurfaceStateToRegistry } from "./d3d/texture-manager";
 import { thunkChecksumManager } from "../../core/memory/thunk-checksum";
 import { leaseRegistry } from "../../core/memory/lease-registry";
@@ -511,13 +513,18 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
             }
 
             // Create new texture interface object
-            // Pass surfaceHandle directly to constructor to avoid initialization race
-            // Constructor will immediately set surfaceHandle and call addRef() on Surface
-            // This ensures object is never in an uninitialized state
+            // Pass surfaceHandle directly to constructor to avoid initialization race,
+            // so the object is never in an uninitialized state.
             const texObj = ComObjectFactory.create(normalizedIid, vtableAddr, obj.handle);
             if (!texObj) {
                 return E_FAIL;
             }
+            // QueryInterface AddRefs what it hands out, and the texture interface shares the
+            // surface's refcount (Direct3DTexture*Object delegates). Without this the app's
+            // own balanced Release of the surface interface destroys the object while it still
+            // holds the texture — the next QI back to IID_IDirectDrawSurface4 then finds
+            // nothing and returns E_NOINTERFACE.
+            obj.addRef();
 
             // Verify that surfaceHandle was set correctly in constructor
             if (texObj instanceof Direct3DTextureObject || texObj instanceof Direct3DTexture2Object) {
@@ -682,7 +689,18 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         const isWriteOnly = (dwFlags & DDLOCK_WRITEONLY) !== 0;
         const isDiscard = (dwFlags & DDLOCK_DISCARDCONTENTS) !== 0;
         const learnedWriteOnly = lockTracker.shouldSkipReadback(thisPtr);
-        const needsReadback = surfaceSyncManager.needsCPUSync(state).needed;
+        // A depth buffer has no colour representation: the GPU side is a depth attachment,
+        // not this surface's (unused) colour texture. Reading that back over the guest's
+        // depth words replaces the app's own clear value with zeros — the app then appears
+        // to clear depth to "near" and every later draw z-fails.
+        const needsReadback = surfaceSyncManager.needsCPUSync(state).needed && !isZBufferSurface(state);
+
+        // DirectDraw has no depth API: a writable Lock on a z surface is how the app clears
+        // depth. Sync the depth attachment from the guest's words HERE, at Lock, because the
+        // fill often lands after Unlock has returned (see syncZBufferWriteToDepth).
+        if (isZBufferSurface(state) && (dwFlags & DDLOCK_READONLY) === 0) {
+            syncZBufferWriteToDepth(context, thisPtr, state, mem);
+        }
 
         // Helper: completes Lock after optional readback
         const completeLock = (didReadback: boolean, readbackTime: number): number => {
@@ -838,7 +856,18 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         const isWriteOnly = (dwFlags & DDLOCK_WRITEONLY) !== 0;
         const isDiscard = (dwFlags & DDLOCK_DISCARDCONTENTS) !== 0;
         const learnedWriteOnly = lockTracker.shouldSkipReadback(thisPtr);
-        const needsReadback = surfaceSyncManager.needsCPUSync(state).needed;
+        // A depth buffer has no colour representation: the GPU side is a depth attachment,
+        // not this surface's (unused) colour texture. Reading that back over the guest's
+        // depth words replaces the app's own clear value with zeros — the app then appears
+        // to clear depth to "near" and every later draw z-fails.
+        const needsReadback = surfaceSyncManager.needsCPUSync(state).needed && !isZBufferSurface(state);
+
+        // DirectDraw has no depth API: a writable Lock on a z surface is how the app clears
+        // depth. Sync the depth attachment from the guest's words HERE, at Lock, because the
+        // fill often lands after Unlock has returned (see syncZBufferWriteToDepth).
+        if (isZBufferSurface(state) && (dwFlags & DDLOCK_READONLY) === 0) {
+            syncZBufferWriteToDepth(context, thisPtr, state, mem);
+        }
 
         // Helper: completes Lock after optional readback
         const completeLock = (didReadback: boolean, readbackTime: number): number => {
@@ -1014,6 +1043,13 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
             profiler.endToken(lockToken);
             return { value: E_FAIL, stackCleanup: 20 };
         }
+        // The op ring must show CPU writes too: "which surface did the guest fill itself"
+        // is the same question as "which rect did a Blt move", and a surface whose pixels
+        // only ever change through Lock is invisible in a Blt-only ring.
+        if (surfaceOpsArmed()) {
+            recordSurfaceOp("lock", `flags:0x${(dwFlags >>> 0).toString(16)}`, obj.getState(), null,
+                lpDestRect && isValidAddress(mem, lpDestRect, 16) ? readRect(mem, lpDestRect) : null, null);
+        }
         if (!lpDDSurfaceDesc) {
             profiler.end("Lock:setup");
             profiler.endToken(lockToken);
@@ -1049,7 +1085,18 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         // This covers BOTH GPU_ONLY and CPU-mode surfaces where D3D rendered after a previous Lock
         // (e.g., EndScene writes to backbuffer GPU texture, then game Locks backbuffer for GDI text).
         const learnedWriteOnly = lockTracker.shouldSkipReadback(thisPtr);
-        const needsReadback = surfaceSyncManager.needsCPUSync(state).needed;
+        // A depth buffer has no colour representation: the GPU side is a depth attachment,
+        // not this surface's (unused) colour texture. Reading that back over the guest's
+        // depth words replaces the app's own clear value with zeros — the app then appears
+        // to clear depth to "near" and every later draw z-fails.
+        const needsReadback = surfaceSyncManager.needsCPUSync(state).needed && !isZBufferSurface(state);
+
+        // DirectDraw has no depth API: a writable Lock on a z surface is how the app clears
+        // depth. Sync the depth attachment from the guest's words HERE, at Lock, because the
+        // fill often lands after Unlock has returned (see syncZBufferWriteToDepth).
+        if (isZBufferSurface(state) && (dwFlags & DDLOCK_READONLY) === 0) {
+            syncZBufferWriteToDepth(context, thisPtr, state, mem);
+        }
 
         // On real hardware, WRITEONLY is advisory — the lock buffer still
         // contains GPU-rendered pixels. In our emulation GPU/CPU memory are separate, so for
@@ -2471,6 +2518,14 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         const attachedState = attachedObj.getState();
         const isZBuffer = (attachedState.caps & DDSCAPS_ZBUFFER) !== 0;
 
+        // A depth buffer is attached TO a render target; DDBLT_DEPTHFILL then clears it
+        // through the z surface. Record the owner so that Blt can find the render target
+        // whose depth attachment the fill actually means.
+        if (isZBuffer) {
+            const owners = attachedState.zOwnerSurfaces ?? (attachedState.zOwnerSurfaces = []);
+            if (!owners.includes(thisPtr >>> 0)) owners.push(thisPtr >>> 0);
+        }
+
         thisObj.setAttachedSurface(lpDDSAttachedSurface);
 
         Logger.verbose(LogCategory.DDRAW,
@@ -2509,7 +2564,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         return DD_OK;
     };
 
-    Object.assign(exports, createSurfaceStubsExports(context));
+    assignStubsOnce(exports, createSurfaceStubsExports(context), "ddraw surface stubs");
     Object.assign(exports, createSurfacePrivateDataExports(context));
 
     // IDirectDrawSurface (v1) stub methods - delegate to v7 where possible

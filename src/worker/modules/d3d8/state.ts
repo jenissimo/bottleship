@@ -8,13 +8,15 @@ import { Logger, LogCategory } from '../../core/logger';
 import { Mem } from '../../core/memory/mem-accessor';
 import { isValidAddress } from '../../core/memory/address-guard';
 import { sanitizeViewport } from '../../backends/webgpu/ddraw/types';
-import { addComRef, createComObject, devices, deviceBoundDepthStencil, deviceCreationParams, deviceRenderTargetOverride, getVTables, releaseComRef, resourceToDevice, surfaceInfo, textureD3DFormat, isComObjectLive } from './shared-state';
+import { addComRef, createComObject, devices, deviceBoundDepthStencil, deviceCreationParams, deviceRenderTargetOverride, deviceWindowed, getVTables, releaseComRef, resourceToDevice, surfaceInfo, textureD3DFormat, isComObjectLive } from './shared-state';
 import { bindAutoDepthStencil, invalidateDevicePresentationSurfaces, resizeFullscreenDeviceWindow } from './device-lifecycle';
 import { isBitmapTexture } from '../ddraw/com-objects';
 import { D3DMaterial7Data, D3DLight7Data } from '../ddraw/d3d/types';
 import { gammaService } from '../../core/gamma-service';
-import { setDeviceCursorImage, showDeviceCursor } from '../../core/device-cursor';
-import { syncHostCursorToGuestState, warpGuestCursorTo } from '../user32/shared-state';
+import {
+    isHardwareDeviceCursor, releaseDeviceCursor, setDeviceCursorImage,
+    setDeviceCursorPosition, showDeviceCursor,
+} from '../../core/device-cursor';
 import { decodeSurfaceFormatToRgba8 } from '../../backends/webgpu/shared/texture-formats';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { D3D8_MAX_STREAMS } from '../../backends/webgpu/d3d8/vsd-constants';
@@ -408,41 +410,50 @@ export function createStateExports(): Record<string, ThunkImplementation> {
         // Snapshot the pixels: real D3D does not addref the surface, so the app is free
         // to release or reuse it the moment this returns.
         const rgba = decodeSurfaceFormatToRgba8(mem, surface.surfacePtr, width, height, surface.pitch, surface.format);
-        setDeviceCursorImage({ width, height, pixels: new Uint8Array(rgba), hotspotX: xHotSpot, hotspotY: yHotSpot });
-        syncHostCursorToGuestState();
-        Logger.log(LogCategory.D3D9, `D3D8 SetCursorProperties(${width}x${height}, hotspot ${xHotSpot},${yHotSpot})`);
+        const windowed = deviceWindowed.get(pDevice) ?? false;
+        setDeviceCursorImage(pDevice,
+            { width, height, pixels: new Uint8Array(rgba), hotspotX: xHotSpot, hotspotY: yHotSpot }, windowed);
+        Logger.log(LogCategory.D3D9,
+            `D3D8 SetCursorProperties(${width}x${height}, hotspot ${xHotSpot},${yHotSpot}) ` +
+            `kind=${isHardwareDeviceCursor(width, height, windowed) ? 'hardware' : 'software'} windowed=${windowed}`);
         return D3D_OK;
     };
 
     // STDMETHOD_(void, ...) — the guest ignores the return value.
     exports['IDirect3DDevice8_SetCursorPosition'] = (_ctx, _mem, args) => {
-        if (!devices.has(args[0] >>> 0)) return 0;
-        warpGuestCursorTo(args[1] | 0, args[2] | 0);
+        const pDevice = args[0] >>> 0;
+        if (!devices.has(pDevice)) return 0;
+        setDeviceCursorPosition(pDevice, args[1] | 0, args[2] | 0);
         return 0;
     };
 
     exports['IDirect3DDevice8_ShowCursor'] = (_ctx, _mem, args) => {
-        if (!devices.has(args[0] >>> 0)) return 0;
-        const prev = showDeviceCursor(!!args[1]);
-        syncHostCursorToGuestState();
-        return prev ? 1 : 0;
+        const pDevice = args[0] >>> 0;
+        if (!devices.has(pDevice)) return 0;
+        return showDeviceCursor(pDevice, !!args[1]) ? 1 : 0;
     };
 
     // Swap chain / reset
     exports['IDirect3DDevice8_CreateAdditionalSwapChain'] = () => D3DERR_INVALIDCALL;
     exports['IDirect3DDevice8_Reset'] = (_ctx, mem, args) => {
+        const devicePtr = args[0] >>> 0;
         const device = devices.get(args[0]);
         if (!device) return D3DERR_INVALIDCALL;
         const hr = device.reset(args[1], mem);
         if (hr !== D3D_OK) return hr;
         invalidateDevicePresentationSurfaces(args[0]);
         bindAutoDepthStencil(args[0], mem, args[1]);
+        // The device cursor does not survive a Reset (wined3d_device_reset drops
+        // cursor_texture) — the app must re-SetCursorProperties.
+        releaseDeviceCursor(devicePtr);
         // Match real D3D8: a Reset into fullscreen re-sizes the device window to the new mode
         // so GetClientRect reports the back-buffer size (see resizeFullscreenDeviceWindow).
         const pp = args[1];
         if (pp) {
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            if (!view.getUint32(pp + 28, true)) {
+            const windowed = view.getUint32(pp + 28, true) !== 0;
+            deviceWindowed.set(devicePtr, windowed);
+            if (!windowed) {
                 resizeFullscreenDeviceWindow(
                     view.getUint32(pp + 24, true) >>> 0,
                     view.getUint32(pp + 0, true) >>> 0,
@@ -985,7 +996,11 @@ export function createStateExports(): Record<string, ThunkImplementation> {
             return refCount ?? 2;
         };
         exports[`${prefix}_Release`] = (_ctx, _mem, args) => {
-            const refCount = releaseComRef(args[0]);
+            const ptr = args[0] >>> 0;
+            const refCount = releaseComRef(ptr);
+            // Final Release of a device: its cursor dies with it (wined3d_device_uninit_3d
+            // drops cursor_texture), so the host must stop being told to draw it.
+            if (refCount === 0 && devices.has(ptr)) releaseDeviceCursor(ptr);
             return refCount ?? 1;
         };
     }

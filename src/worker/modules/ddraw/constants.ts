@@ -95,6 +95,7 @@ export const DDBLT_KEYDEST = 0x00002000;
 export const DDBLT_KEYSRCOVERRIDE = 0x00010000;
 export const DDBLT_KEYDESTOVERRIDE = 0x00004000;
 export const DDBLT_ROP = 0x00020000;
+export const DDBLT_DEPTHFILL = 0x02000000;
 export const DDBLT_WAIT = 0x01000000;
 
 // DDBLTFX structure (ddraw.h) - used for Blt override fields
@@ -316,6 +317,16 @@ export const DDPIXELFORMAT_OFFSETS = {
     gMask: 20,
     bMask: 24,
     aMask: 28,
+};
+
+// DDPIXELFORMAT unions the depth-buffer members onto the RGB ones: dwZBufferBitDepth
+// over dwRGBBitCount, dwStencilBitDepth over dwRBitMask, dwZBitMask over dwGBitMask,
+// dwStencilBitMask over dwBBitMask. Same bytes, different names when DDPF_ZBUFFER is set.
+export const DDPIXELFORMAT_Z_OFFSETS = {
+    zBufferBitDepth: DDPIXELFORMAT_OFFSETS.rgbBitCount,
+    stencilBitDepth: DDPIXELFORMAT_OFFSETS.rMask,
+    zBitMask: DDPIXELFORMAT_OFFSETS.gMask,
+    stencilBitMask: DDPIXELFORMAT_OFFSETS.bMask,
 };
 
 export {

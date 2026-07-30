@@ -123,6 +123,16 @@ export class DDrawPresenter implements RenderActive {
     }
 
     /**
+     * True once a DirectDraw frame has actually reached the canvas. An existing primary
+     * surface only means DirectDraw *could* display something; until a frame is presented
+     * the primary holds nothing, which is what separates a game rendering fullscreen from
+     * an app that took exclusive mode for the display mode and draws with GDI.
+     */
+    hasPresentedFrame(): boolean {
+        return (this.counters.frames ?? 0) > 0;
+    }
+
+    /**
      * PNG of the screen. The canvas is the only source that includes the overlays
      * compositeFrameOverlays() blits on AFTER lastPresented is recorded (video plane,
      * live GDI dialog rects, stats) — capturing lastPresented shows the game layer
@@ -833,8 +843,12 @@ export class DDrawPresenter implements RenderActive {
                 }
             }
 
+            // Keep COPY_SRC: this REPLACES a render target created with it (directdraw.ts
+            // CreateSurface), and the rest of the system may still copy out of the surface
+            // (present-path readback, GetDIBits, dumpSurface). Dropping a usage flag while
+            // swapping the texture silently downgrades the surface.
             const result = createGPUTexture(device, queue, width, height,
-                GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
+                GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
                 "rgba8unorm");
             if (!result) {
                 Logger.error(LogCategory.DDRAW, "Failed to create RGBA texture for PALETTE8");
@@ -949,8 +963,9 @@ export class DDrawPresenter implements RenderActive {
                 }
             }
 
+            // Keep COPY_SRC — see the PALETTE8 path above.
             const result = createGPUTexture(device, queue, width, height,
-                GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+                GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC | GPUTextureUsage.RENDER_ATTACHMENT,
                 "rgba8unorm");
             if (!result) {
                 Logger.error(LogCategory.DDRAW, "Failed to create RGBA texture");

@@ -945,15 +945,20 @@ export class DInput implements IModule {
                 curView.setInt32(lpvData + 4, dy, true);   // lY
                 curView.setInt32(lpvData + 8, inputManager.consumeDInputWheel(), true); // lZ
 
-                // Browser buttons bitmask: 1=L, 2=R, 4=M, 8=X1(back), 16=X2(forward)
-                curMem[lpvData + 12] = (mouse.buttons & 1) ? 0x80 : 0x00;  // Left
-                curMem[lpvData + 13] = (mouse.buttons & 2) ? 0x80 : 0x00;  // Right
-                curMem[lpvData + 14] = (mouse.buttons & 4) ? 0x80 : 0x00;  // Middle
-                curMem[lpvData + 15] = (mouse.buttons & 8) ? 0x80 : 0x00;  // X1
+                // Browser buttons bitmask: 1=L, 2=R, 4=M, 8=X1(back), 16=X2(forward).
+                // Immediate mode reports the LEVEL — but a press the host published and
+                // released between two of these calls never had a level for us to report,
+                // so the latch carries that edge in for exactly one read (input-manager
+                // consumeMouseButtonLatch). A press held across calls is unaffected.
+                const buttons = inputManager.consumeMouseButtonLatch();
+                curMem[lpvData + 12] = (buttons & 1) ? 0x80 : 0x00;  // Left
+                curMem[lpvData + 13] = (buttons & 2) ? 0x80 : 0x00;  // Right
+                curMem[lpvData + 14] = (buttons & 4) ? 0x80 : 0x00;  // Middle
+                curMem[lpvData + 15] = (buttons & 8) ? 0x80 : 0x00;  // X1
 
                 // DIMOUSESTATE2 — 4 extra buttons
                 if (cbData >= DIMOUSESTATE2_SIZE) {
-                    curMem[lpvData + 16] = (mouse.buttons & 16) ? 0x80 : 0x00; // X2
+                    curMem[lpvData + 16] = (buttons & 16) ? 0x80 : 0x00; // X2
                     curMem[lpvData + 17] = 0x00;
                     curMem[lpvData + 18] = 0x00;
                     curMem[lpvData + 19] = 0x00;
@@ -1843,6 +1848,11 @@ export class DInput implements IModule {
         let mouseDy = 0;
         let mouseDz = 0;
         const mouseState = inputManager.getMouseState();
+        // Action-map data is edge-derived from the level, so it loses a press the same way
+        // immediate mode does. Same latch, same one-read consumption.
+        const mouseButtons = device.deviceType === "mouse"
+            ? inputManager.consumeMouseButtonLatch()
+            : mouseState.buttons;
         let prevButtons = device.mousePollPrevButtons;
         if (device.deviceType === "mouse") {
             const accum = inputManager.getDInputAccum();
@@ -1861,11 +1871,11 @@ export class DInput implements IModule {
             device.actionMap,
             dikPressed,
             arrowKeys,
-            { dx: mouseDx, dy: mouseDy, dz: mouseDz, buttons: mouseState.buttons, prevButtons },
+            { dx: mouseDx, dy: mouseDy, dz: mouseDz, buttons: mouseButtons, prevButtons },
             gamepad,
         );
         if (device.deviceType === "mouse") {
-            device.mousePollPrevButtons = mouseState.buttons;
+            device.mousePollPrevButtons = mouseButtons;
         }
 
         const pending = changed.length;

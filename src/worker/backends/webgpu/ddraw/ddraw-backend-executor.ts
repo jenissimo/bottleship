@@ -239,6 +239,29 @@ const PS_ORDER_CW = [0, 1, 3, 0, 3, 2] as const;
 // face, so point sprites stay visible under ANY cull mode (D3D never back-face-culls points).
 const PS_ORDER_CCW = [0, 3, 1, 0, 2, 3] as const;
 
+/** Cap on the blank-check scan; textures above it are sampled with a stride. */
+const BLANK_SCAN_BUDGET = 256 * 1024;
+
+/**
+ * True while a surface's pixel memory is still entirely zero — nothing has written it
+ * since CreateSurface handed out zeroed pages. The direct measurement behind the
+ * "defer an empty texture" decision, which the mediated-write flags can only guess at.
+ */
+function surfacePixelsAreBlank(state: DirectDrawSurfaceState): boolean {
+    const mem = System.getInstance().process?.getCurrentMemory();
+    if (!mem || !state.surfacePtr || state.width <= 0 || state.height <= 0) return true;
+    const bytesPerPixel = Math.max(1, Math.floor(state.format.bpp / 8));
+    const rowBytes = state.width * bytesPerPixel;
+    const pitch = state.pitch && state.pitch >= rowBytes ? state.pitch : rowBytes;
+    const bytes = Math.min(pitch * state.height, mem.length - state.surfacePtr);
+    if (bytes <= 0) return true;
+    const stride = bytes > BLANK_SCAN_BUDGET ? Math.ceil(bytes / BLANK_SCAN_BUDGET) : 1;
+    for (let i = 0; i < bytes; i += stride) {
+        if (mem[state.surfacePtr + i] !== 0) return false;
+    }
+    return true;
+}
+
 /**
  * Main executor class for DirectDraw WebGPU rendering
  */
@@ -772,6 +795,12 @@ export class DDrawWebGPUExecutor {
         return this.pipelineFactory.getCacheSize();
     }
 
+    /** Current DebugFlags — lets a caller see which diagnostic overrides are still armed
+     *  (they are sticky, and a forgotten one silently colours every later observation). */
+    getDebugFlags(): DebugFlags {
+        return { ...this.debugFlags };
+    }
+
     setDebugToggle(toggle: string, enabled: boolean, value?: number): void {
         switch (toggle) {
             case "forceMissingTextureMagenta":
@@ -1174,7 +1203,7 @@ export class DDrawWebGPUExecutor {
             return;
         }
 
-        // Uninitialized SYSMEM/VidMem textures: defer GPU upload until Load/Unlock/Blt writes pixels.
+        // Uninitialized SYSMEM/VidMem textures: defer GPU upload until pixels exist.
         // Early SetTexture bind used to upload CreateSurface zeros and poison sampling (black menu).
         const isTextureCap = (state.caps & DDSCAPS_TEXTURE) !== 0;
         if (
@@ -1184,11 +1213,22 @@ export class DDrawWebGPUExecutor {
             !state.everLocked &&
             state.version === 0
         ) {
-            state.gpuDirty = false;
+            // Those flags only see writes we mediate (Lock/Unlock, Load, Blt). DX6-era code
+            // routinely caches the lpSurface of a SYSTEMMEMORY surface and fills texels through
+            // it with no further Lock, which leaves every flag false on a surface that is full of
+            // art — deferring it for ever, so the scene samples black. Ask the memory instead:
+            // CreateSurface hands out zeroed pages, so "still all zeros" is the real predicate.
+            if (surfacePixelsAreBlank(state)) {
+                state.gpuDirty = false;
+                Logger.verbose(LogCategory.DDRAW,
+                    `syncSurfaceFromMemory: DEFER empty texture 0x${state.surfacePtr.toString(16)} ` +
+                    `${state.width}x${state.height} (no guest writes yet)`);
+                return;
+            }
+            state.surfaceEverWritten = true;
             Logger.verbose(LogCategory.DDRAW,
-                `syncSurfaceFromMemory: DEFER empty texture 0x${state.surfacePtr.toString(16)} ` +
-                `${state.width}x${state.height} (no guest writes yet)`);
-            return;
+                `syncSurfaceFromMemory: texture 0x${state.surfacePtr.toString(16)} ` +
+                `${state.width}x${state.height} holds pixels with no mediated write — uploading`);
         }
 
         const pf = detectPixelFormat(state.format);
@@ -3758,6 +3798,13 @@ export class DDrawWebGPUExecutor {
     ): PrepareDrawResult {
         this.ensureSurfaceGPUResources(target);
 
+        // Pipelines are built HERE, before ensureRenderPass opens the pass they will run in,
+        // so the target's colour format has to be declared here too — declaring it only at
+        // pass-open would cache this draw's pipeline against the previous target's format.
+        this.pipelineFactory.setColorTargetFormat(
+            target.gpuTexture?.format ?? this.resolveSurfaceTextureFormat(target)
+        );
+
         const isTextureTarget = (target.caps & DDSCAPS_TEXTURE) !== 0;
         const isSystemMemory = (target.caps & DDSCAPS_SYSTEMMEMORY) !== 0;
         const shouldSyncTarget = isTextureTarget || isSystemMemory;
@@ -4468,6 +4515,15 @@ export class DDrawWebGPUExecutor {
                     clearValue: clearColor,
                     storeOp: "store",
                 };
+
+            // Pipelines must be built for THIS attachment's colour format, not the swapchain's.
+            // A DirectDraw surface owns its texture and paths that recreate it (presenter
+            // RGB565/PALETTE8 conversion) can hand a bgra8unorm-swapchain build an rgba8unorm
+            // render target; a mismatch makes WebGPU reject the pass and invalidate the whole
+            // command buffer, dropping every draw and every texture upload recorded on it.
+            // Ask the texture, not the config.
+            const attachmentFormat = target.gpuTexture?.format ?? this.resolveSurfaceTextureFormat(target);
+            this.pipelineFactory.setColorTargetFormat(attachmentFormat);
 
             this.currentRenderPass = this.currentEncoder.beginRenderPass({
                 colorAttachments: [colorAttachment],

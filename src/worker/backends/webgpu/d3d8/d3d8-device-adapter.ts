@@ -2074,7 +2074,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             };
             this.frameSnapshot.drawCalls = 0;
             system.services.render.notifyPresent("d3d8");
-            frameCapture.onFrameEnd(); // harness CaptureBus frame boundary (D3D8)
+            frameCapture.onFrameEnd("d3d8"); // harness CaptureBus frame boundary (D3D8)
 
             const now = performance.now();
             if (this.prevPresentTime > 0) {

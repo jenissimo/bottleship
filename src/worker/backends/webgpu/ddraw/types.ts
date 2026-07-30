@@ -188,8 +188,13 @@ export function sanitizeViewport(
     let height = Math.trunc(finiteOr(viewport.height, th));
     let x = Math.trunc(finiteOr(viewport.x, 0));
     let y = Math.trunc(finiteOr(viewport.y, 0));
-    const minZ = finiteOr(viewport.minZ ?? 0, 0);
-    const maxZ = finiteOr(viewport.maxZ ?? 1, 1);
+    // The rasterizer depth range is [0,1] on every D3D generation — a D3DVIEWPORT's
+    // dvMinZ/dvMaxZ scale z INTO that range, they never widen it. WebGPU rejects
+    // anything outside [0,1] with minDepth <= maxDepth, and one rejected setViewport
+    // invalidates the whole command buffer, so an app (or a struct mis-read) offering
+    // e.g. -1..1 would silently drop every draw in the frame.
+    const minZ = Math.min(1, Math.max(0, finiteOr(viewport.minZ ?? 0, 0)));
+    const maxZ = Math.min(1, Math.max(minZ, finiteOr(viewport.maxZ ?? 1, 1)));
 
     const implausible =
         width <= 0 ||

@@ -53,9 +53,6 @@ export const indexBufferMeta: Map<number, BufferMeta> = new Map();
 export const deviceBoundDepthStencil: Map<number, number> = new Map();
 /** Per-device bound render-target-0 surface COM pointer (0/absent = implicit backbuffer). */
 export const deviceBoundRenderTarget: Map<number, number> = new Map();
-/** Per-device cursor bitmap + hotspot accepted by IDirect3DDevice9::SetCursorProperties. */
-export const deviceCursorProperties: Map<number, { hotspotX: number; hotspotY: number; surfacePtr: number }> = new Map();
-
 /** 2D texture COM ptr -> mip level -> stable IDirect3DSurface9 COM ptr. */
 export const textureLevelSurfaces: Map<number, Map<number, number>> = new Map();
 /** Cube texture COM ptr -> `${face}_${level}` -> stable IDirect3DSurface9 COM ptr. */
@@ -184,7 +181,6 @@ export function clearResourceRegistry(): void {
     indexBufferMeta.clear();
     deviceBoundDepthStencil.clear();
     deviceBoundRenderTarget.clear();
-    deviceCursorProperties.clear();
     resetDeviceCursor();
     textureLevelSurfaces.clear();
     cubeFaceSurfaces.clear();

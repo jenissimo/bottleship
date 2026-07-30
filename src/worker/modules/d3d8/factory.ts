@@ -8,7 +8,7 @@ import { System } from '../../core/system';
 import { WebGPUBackend } from '../../backends/webgpu/webgpu-backend';
 import { FFPRenderer } from '../../backends/webgpu/shared';
 import { D3D8DeviceAdapter } from '../../backends/webgpu/d3d8/d3d8-device-adapter';
-import { getVTables, createComObject, devices, deviceCreationParams, resourceToDevice } from './shared-state';
+import { getVTables, createComObject, devices, deviceCreationParams, deviceWindowed, resourceToDevice } from './shared-state';
 import { bindAutoDepthStencil, resizeFullscreenDeviceWindow } from './device-lifecycle';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
 import {
@@ -308,6 +308,9 @@ export function createFactoryExports(): Record<string, ThunkImplementation> {
 
             const devicePtr = createComObject(vtableAddr);
             devices.set(devicePtr, device);
+            // The cursor kind depends on it, and a device that never Resets would otherwise
+            // be read as fullscreen.
+            deviceWindowed.set(devicePtr, !!windowedFlag);
             // Remembered for GetCreationParameters (faithful echo of the game's own flags).
             deviceCreationParams.set(devicePtr, {
                 adapter: Adapter,

@@ -1,5 +1,6 @@
 import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../../core/logger";
+import { assignStubsOnce } from "../../core/thunking/stub-merge";
 import { Marshaler } from "../../core/memory/marshaler";
 import { ComObjectFactory } from "../../core/com/base-com-object";
 import { System } from "../../core/system";
@@ -1216,14 +1217,16 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
 
     exports["IDirectDraw_QueryInterface"] = (ctx, mem, args) => commonQueryInterface(args[0], args[1], args[2], mem);
 
+    // Each DirectDraw generation carries its OWN refcount on the shared driver object,
+    // so AddRef/Release must report the count of the interface they were called through.
     exports["IDirectDraw_AddRef"] = (ctx, mem, args) => {
         const obj = context.resourceProvider.getComObjectByAddress(args[0]);
-        return obj ? obj.addRef() : 0;
+        return obj ? obj.addRef(args[0]) : 0;
     };
 
     exports["IDirectDraw_Release"] = (ctx, mem, args) => {
         const obj = context.resourceProvider.getComObjectByAddress(args[0]);
-        return obj ? obj.release() : 0;
+        return obj ? obj.release(args[0]) : 0;
     };
 
     exports["IDirectDraw_Compact"] = () => DD_OK;
@@ -1314,12 +1317,12 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
 
     exports["IDirectDraw4_AddRef"] = (ctx, mem, args) => {
         const obj = context.resourceProvider.getComObjectByAddress(args[0]);
-        return obj ? obj.addRef() : 0;
+        return obj ? obj.addRef(args[0]) : 0;
     };
 
     exports["IDirectDraw4_Release"] = (ctx, mem, args) => {
         const obj = context.resourceProvider.getComObjectByAddress(args[0]);
-        return obj ? obj.release() : 0;
+        return obj ? obj.release(args[0]) : 0;
     };
 
     exports["IDirectDraw4_SetCooperativeLevel"] = (ctx, mem, args) => {
@@ -1426,12 +1429,12 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
 
     exports["IDirectDraw7_AddRef"] = (ctx, mem, args) => {
         const obj = context.resourceProvider.getComObjectByAddress(args[0]);
-        return obj ? obj.addRef() : 0;
+        return obj ? obj.addRef(args[0]) : 0;
     };
 
     exports["IDirectDraw7_Release"] = (ctx, mem, args) => {
         const obj = context.resourceProvider.getComObjectByAddress(args[0]);
-        return obj ? obj.release() : 0;
+        return obj ? obj.release(args[0]) : 0;
     };
 
     exports["IDirectDraw7_GetCaps"] = (ctx, mem, args) => {
@@ -1672,13 +1675,33 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         if (!lpCallback) return E_POINTER;
 
         const emulatorConfig = EmulatorConfig.getInstance();
-        // Enumerate 16/32bpp first. Some legacy titles stop enumeration early and
-        // then require RenderBitDepth to match at least one collected mode.
+        // Enumerate every resolution at EVERY bit depth we can serve, not just the one the
+        // manifest names. A manifest's bpp is the DESKTOP depth; real DirectDraw reports one
+        // mode per (w,h,depth) combination the hardware supports, and era titles filter the
+        // enumeration by depth: HP CoS's D3DDrv keeps only dwRGBBitCount==16 when it builds
+        // the in-game resolution list, so a 32-bpp-only manifest left that list EMPTY (and
+        // the game unable to change resolution). applySetDisplayMode honours any depth, so
+        // everything advertised here can actually be set.
+        // 16 before 32: some legacy titles stop enumerating early and then require their
+        // RenderBitDepth to match a mode they collected. 8-bpp stays last, and only when the
+        // manifest asked for it — a palettised mode changes what a surface MEANS.
         const supportedModes = emulatorConfig.supportedResolutions;
-        let modes = [
-            ...supportedModes.filter((m) => m.bpp !== 8),
-            ...supportedModes.filter((m) => m.bpp === 8),
-        ];
+        const seen = new Set<string>();
+        const expanded: typeof supportedModes = [];
+        const push = (w: number, h: number, bpp: number, refreshRate: number): void => {
+            const key = `${w}x${h}x${bpp}`;
+            if (seen.has(key)) return;
+            seen.add(key);
+            expanded.push({ width: w, height: h, bpp, refreshRate });
+        };
+        for (const m of supportedModes) {
+            if (m.bpp === 8) continue;
+            for (const bpp of [16, 32]) push(m.width, m.height, bpp, m.refreshRate);
+        }
+        for (const m of supportedModes) {
+            if (m.bpp === 8) push(m.width, m.height, 8, m.refreshRate);
+        }
+        let modes = expanded;
 
         // Faithful: honor the caller's input descriptor filter. If lpDDSurfaceDesc sets
         // DDSD_WIDTH/DDSD_HEIGHT/DDSD_PIXELFORMAT, only matching modes are enumerated
@@ -2339,7 +2362,7 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         return DD_OK;
     };
 
-    Object.assign(exports, createDirectDrawStubsExports(context));
+    assignStubsOnce(exports, createDirectDrawStubsExports(context), "ddraw stubs");
     Object.assign(exports, createDirectDrawPaletteClipperExports(context, commonQueryInterface));
 
     // IDirectDraw (v1) stub methods - delegate to v7 where possible

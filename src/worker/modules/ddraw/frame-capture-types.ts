@@ -36,6 +36,10 @@ export type CapturedDrawCall = {
     rtSurfacePtr: number;
     rtWidth: number;
     rtHeight: number;
+    /** Actual WebGPU format of the attachment this draw renders into. FFP pipelines are
+     *  partitioned by it; a draw whose pipeline was built for another format is rejected
+     *  and takes the whole command buffer with it, so a capture must show it. */
+    rtFormat?: string | null;
     // Texture 0
     tex0: {
         surfacePtr: number;
@@ -73,9 +77,24 @@ export type CapturedDrawCall = {
     colorKeyRenderState: number;
     zEnable: number;
     zWrite: number;
+    /** The compare, without which zEnable says nothing about what gets rejected. */
+    zFunc?: number;
     cullMode: number;
     lightingEnabled: number;
     fogEnabled: number;
+    /** Full fog state. A whole scene resolving to one flat colour is the signature of
+     *  fogFactor==1 everywhere, so the raw modes AND the float-decoded range must be
+     *  visible side by side (the range states are float bits in a DWORD). */
+    fog?: {
+        enable: number;
+        tableMode: number;
+        vertexMode: number;
+        colorArgb: number;
+        start: number;
+        end: number;
+        density: number;
+        specularEnable: number;
+    };
     // Texture stage states (stage 0)
     colorOp: number;
     alphaOp: number;
@@ -120,6 +139,9 @@ export type CapturedDrawCall = {
     derivedShouldBlend: boolean;
     // Diagnostics
     warnings: string[];
+    /** Fields this producer did NOT measure — their values are schema defaults, not readings.
+     *  Absent means every field was measured (the DDraw/D3D7/D3D8 FFP path). */
+    unmeasured?: string[];
     // Draw-time MVP (16 floats as handed to the executor). Lets a capture diff
     // transforms across draws/frames — e.g. a skinned body part rendered with a
     // stale world matrix has an MVP wildly different from its sibling parts.
@@ -151,6 +173,12 @@ export type CapturedFrame = {
     timestamp: number;
     /** Producer backend (single shared draw-call schema across backends). DDraw/D3D7/D3D8 today. */
     backend?: string;
+    /** Which render path's frame boundary ended the capture. Differs from `backend` when the
+     *  frame recorded nothing — that is the tell for "we captured the wrong path's frame". */
+    producer?: string;
+    /** Empty frame boundaries waited through before this one. >0 means another path is also
+     *  presenting; pass a backend to captureFrame to pin the one you mean. */
+    skippedEmptyFrameEnds?: number;
     drawCalls: CapturedDrawCall[];
     clears: CapturedClear[];
 };

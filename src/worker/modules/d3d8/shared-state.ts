@@ -59,6 +59,10 @@ export interface D3D8SurfaceInfo {
 /** Device COM ptr -> cached IDirect3DSurface8 back-buffer wrapper. */
 export const deviceBackBufferSurfaces: Map<number, number> = new Map();
 
+/** Device COM ptr -> D3DPRESENT_PARAMETERS.Windowed, as last declared by CreateDevice/Reset.
+ *  Absent = fullscreen, which is what a device that never declared otherwise runs as. */
+export const deviceWindowed: Map<number, boolean> = new Map();
+
 /** Device COM ptr -> explicit SetRenderTarget color surface (0 = use back buffer). */
 export const deviceRenderTargetOverride: Map<number, number> = new Map();
 
@@ -216,5 +220,6 @@ export function resetD3D8SharedState(): void {
     implicitDepthStencils.clear();
     deviceBackBufferSurfaces.clear();
     deviceRenderTargetOverride.clear();
+    deviceWindowed.clear();
     comRefCounts.clear();
 }

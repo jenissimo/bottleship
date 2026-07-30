@@ -175,6 +175,16 @@ export class PipelineFactory {
     private bindGroupManager: BindGroupManager;
     private debugFlags: DebugFlags;
     private swapChainFormat: GPUTextureFormat;
+    // Colour format of the render target the next pipeline will be used with. A pipeline's
+    // fragment target format must EQUAL the pass attachment's format or WebGPU rejects the
+    // pass ("Attachment state of RenderPipeline is not compatible with RenderPassEncoder")
+    // and invalidates the whole command buffer — silently dropping every draw AND every
+    // texture upload recorded on that encoder. It is NOT always the swapchain format: a
+    // DirectDraw surface owns its texture, and paths that recreate it (the presenter's
+    // RGB565/PALETTE8 conversion needs an rgba8unorm target) legitimately give a
+    // bgra8unorm-swapchain build an rgba8unorm render target. Keyed, not cleared, so a game
+    // alternating targets of different formats does not thrash the cache.
+    private colorFormat: GPUTextureFormat;
     // MSAA sample count (1 = off). Must equal the color + depth attachment sampleCount at
     // draw time. Baked into every pipeline's `multisample.count` and the cache key.
     private sampleCount = 1;
@@ -205,6 +215,20 @@ export class PipelineFactory {
         this.bindGroupManager = bindGroupManager;
         this.debugFlags = debugFlags;
         this.swapChainFormat = swapChainFormat;
+        this.colorFormat = swapChainFormat;
+    }
+
+    /** Declare the colour format of the render target subsequent pipelines will draw into.
+     *  Called when a render pass is opened; see `colorFormat`. */
+    setColorTargetFormat(format: GPUTextureFormat): void {
+        if (format === this.colorFormat) return;
+        this.colorFormat = format;
+        // The last-config fast paths memoise a pipeline for a config that no longer implies
+        // this format; drop them so the next draw re-keys.
+        this.lastGetPipelineConfig = null;
+        this.lastGetPipelinePipeline = null;
+        this.lastMegaBatchConfig = null;
+        this.lastMegaBatchPipeline = null;
     }
 
     /**
@@ -355,7 +379,7 @@ export class PipelineFactory {
 
         // sampleCount prefix keeps MSAA and non-MSAA pipelines distinct without touching the
         // shared PipelineKeyConfig in types.ts (sampleCount is a factory-global, not per-draw).
-        const key = this.sampleCount + "|" + generatePipelineKey(keyConfig);
+        const key = this.sampleCount + "|" + this.colorFormat + "|" + generatePipelineKey(keyConfig);
 
         // Check cache
         let pipeline = this.pipelineCache.get(key);
@@ -518,7 +542,7 @@ export class PipelineFactory {
 
         // Use MegaBatch key generator (excludes alphaTest/alphaFunc - they're dynamic uniforms).
         // sampleCount prefix segregates MSAA pipelines (see getOrCreatePipeline).
-        const key = "mb_" + this.sampleCount + "|" + generateMegaBatchPipelineKey(keyConfig);
+        const key = "mb_" + this.sampleCount + "|" + this.colorFormat + "|" + generateMegaBatchPipelineKey(keyConfig);
 
         // Check cache
         let pipeline = this.megaBatchPipelineCache.get(key);
@@ -702,7 +726,7 @@ export class PipelineFactory {
                 entryPoint: "fs_main",
                 targets: [
                     {
-                        format: this.swapChainFormat,
+                        format: this.colorFormat,
                         blend: blendState,
                     },
                 ],
@@ -895,7 +919,7 @@ export class PipelineFactory {
                 entryPoint: "fs_main",
                 targets: [
                     {
-                        format: this.swapChainFormat, // Use actual swapchain format (bgra8unorm on Windows, rgba8unorm on others)
+                        format: this.colorFormat, // The render target's own format (see colorFormat)
                         blend: blendState,
                     },
                 ],

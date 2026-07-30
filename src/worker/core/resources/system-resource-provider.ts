@@ -75,6 +75,8 @@ export class SystemResourceProvider {
     // Holds RAW slot values (not the generation-tagged handle). FIFO (push/shift) so reuse
     // is spread across all freed slots → a single slot's generation wraps slowly.
     private freeComHandles: number[] = [];
+    /** Freed USER handles, reused FIFO (see registerUserObject). */
+    private freeUserHandles: number[] = [];
 
     // Generation tagging for COM handles. COM is the only recycled handle class, and a guest
     // that caches a D3DTEXTUREHANDLE across a destroy+recreate (UE1 level load) would otherwise
@@ -336,15 +338,27 @@ export class SystemResourceProvider {
     }
 
     /**
-     * Register a user object (windows, etc.)
+     * Register a user object (windows, bitmaps, icons, cursors).
+     *
+     * Handles are RECYCLED. The user range holds 16384 handles; a launcher that rebuilds its
+     * buttons from a compatible bitmap per repaint burns six of them a frame, so a monotonic
+     * allocator runs off the end of the range within a couple of minutes — and the handles it
+     * then hands out fall inside the FILE and GDI ranges, where getResource() dispatches them
+     * to the wrong table. Windows survives that workload because its handle slots come back on
+     * DeleteObject/DestroyIcon, not because its space is unbounded.
      */
     registerUserObject(obj: any): number {
-        const handle = this.nextUserHandle;
-        if (handle >= 0x50000) {
-            Logger.error(LogCategory.RESOURCE, `User handle range exhausted! handle=0x${handle.toString(16)}`);
+        let handle: number;
+        if (this.freeUserHandles.length > 0) {
+            handle = this.freeUserHandles.shift()!; // FIFO — delay reuse of any one slot
+        } else {
+            handle = this.nextUserHandle;
+            if (handle >= 0x50000) {
+                Logger.error(LogCategory.RESOURCE, `User handle range exhausted! handle=0x${handle.toString(16)}`);
+            }
+            this.nextUserHandle += 4;
         }
         this.userObjects.create(handle, obj);
-        this.nextUserHandle += 4;
 
         Logger.log(LogCategory.RESOURCE, `Registered user object handle=0x${handle.toString(16)} type=${obj?.type || '?'}`);
         return handle;
@@ -358,10 +372,14 @@ export class SystemResourceProvider {
     }
 
     /**
-     * Unregister a user object
+     * Unregister a user object and return its slot to the free list.
      */
     unregisterUserObject(handle: number): any {
-        return this.userObjects.release(handle);
+        const obj = this.userObjects.release(handle);
+        if (obj !== null && obj !== undefined) {
+            this.freeUserHandles.push(handle >>> 0);
+        }
+        return obj;
     }
 
     /**
@@ -527,6 +545,7 @@ export class SystemResourceProvider {
         this.nextUserHandle   = 0x40000;
         this.nextFileHandle   = 0x50000;
         this.freeComHandles   = [];
+        this.freeUserHandles  = [];
         this.comSlotGeneration.clear();
     }
 }
@@ -540,12 +559,12 @@ declare module '../resource-table' {
     }
 }
 
-// Add statistics method to ResourceTable
+// Add statistics method to ResourceTable.
+// `count` is the true live-object count. `peak` is a high-water mark across OBSERVATIONS
+// (it can only rise when someone calls this) — it is not a continuously tracked maximum, so
+// never read it as "the most handles this table ever held".
 (ResourceTable.prototype as any).getStatistics = function () {
-    // This is a simplified implementation
-    // In a real implementation, ResourceTable would track these metrics
-    return {
-        count: 0, // Would need to track active items
-        peak: 0   // Would need to track peak usage
-    };
+    const count = this.getAllItems().length;
+    this.__peakObserved = Math.max(this.__peakObserved ?? 0, count);
+    return { count, peak: this.__peakObserved };
 };

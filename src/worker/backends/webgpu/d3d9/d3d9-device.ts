@@ -88,6 +88,16 @@ const D3DRS_ALPHAFUNC = 25;
 const D3DRS_ALPHATESTENABLE = 15;
 const D3DCMP_ALWAYS = 8;
 
+// Depth / blend / raster states the harness frame capture reports (d3d9types.h ordinals).
+const D3DRS_ZENABLE = 7;
+const D3DRS_ZWRITEENABLE = 14;
+const D3DRS_ZFUNC = 23;
+const D3DRS_SRCBLEND = 19;
+const D3DRS_DESTBLEND = 20;
+const D3DRS_ALPHABLENDENABLE = 27;
+const D3DRS_CULLMODE = 22;
+const D3DRS_FOGENABLE = 28;
+
 // D3DTSS_TEXTURETRANSFORMFLAGS: low bits are the coordinate count (D3DTTFF_COUNT1..4);
 // the D3DTTFF_PROJECTED bit requests a projective divide by the last coordinate component
 // in the pixel pipeline (projected spotlights, planar reflections).
@@ -1936,6 +1946,11 @@ export class D3D9Device {
         d3d9PerfInc("clear");
         const clearColor = d3dColorToGpu(color);
         this.commandRecorder.setClear(clearColor, z, flags);
+        if (frameCapture.isCapturing()) {
+            const size = this.getCurrentTargetSize();
+            frameCapture.recordClearRaw(flags, color, z, stencil,
+                { surfacePtr: this.currentRtIndex ?? 0, width: size.w, height: size.h });
+        }
 
         // Update frame snapshot counter
         if (this.frameSnapshot.frameCounters) {
@@ -2026,6 +2041,12 @@ export class D3D9Device {
     private captureDrawIfArmed(primitiveType: number, primitiveCount: number): void {
         if (!frameCapture.isCapturing()) return;
         const stage0 = this.stateTracker.getTexture(0);
+        const rs = (n: number): number => this.stateTracker.getRenderState(n);
+        const rt = this.currentRtIndex;
+        const size = this.getCurrentTargetSize();
+        // Every field here is READ, not defaulted. D3D9 keeps one flat render-state array, so
+        // the depth/blend/alpha/cull/lighting/fog states are as available as on the FFP path;
+        // reporting them as schema zeros made a capture say "depth test off on every draw".
         frameCapture.recordRawDraw({
             backend: "d3d9",
             primitiveType,
@@ -2033,6 +2054,22 @@ export class D3D9Device {
             vertexCount: primitiveCount * 3,
             programmable: (this as any).isProgrammable?.() ?? false,
             derivedUseTexture: stage0 != null,
+            rtSurfacePtr: rt ?? 0,
+            rtWidth: size.w,
+            rtHeight: size.h,
+            zEnable: rs(D3DRS_ZENABLE),
+            zWrite: rs(D3DRS_ZWRITEENABLE),
+            zFunc: rs(D3DRS_ZFUNC),
+            alphaBlendEnabled: rs(D3DRS_ALPHABLENDENABLE),
+            srcBlend: rs(D3DRS_SRCBLEND),
+            dstBlend: rs(D3DRS_DESTBLEND),
+            alphaTestEnabled: rs(D3DRS_ALPHATESTENABLE),
+            alphaFunc: rs(D3DRS_ALPHAFUNC),
+            alphaRef: rs(D3DRS_ALPHAREF),
+            cullMode: rs(D3DRS_CULLMODE),
+            lightingEnabled: rs(D3DRS_LIGHTING),
+            fogEnabled: rs(D3DRS_FOGENABLE),
+            derivedShouldBlend: rs(D3DRS_ALPHABLENDENABLE) !== 0,
             warnings: stage0 != null ? [`tex0 store-index=${stage0}`] : [],
         });
     }
@@ -2811,7 +2848,7 @@ export class D3D9Device {
         this.submitFrame(true);
         this.updateFps();
         System.getInstance().services.render.notifyPresent("d3d9");
-        frameCapture.onFrameEnd(); // harness CaptureBus frame boundary (D3D9)
+        frameCapture.onFrameEnd("d3d9"); // harness CaptureBus frame boundary (D3D9)
 
         // Update frame snapshot for debug panel
         this.frameSnapshot.presents++;

@@ -13,10 +13,12 @@ import { gammaService } from '../../core/gamma-service';
 import { D3D9Device } from '../../backends/webgpu/d3d9/d3d9-device';
 import { WebGPUBackend } from '../../backends/webgpu/webgpu-backend';
 import { writeDeviceCaps9 } from './caps';
-import { getVTables, devices, createComObject, resourceToDevice, deviceToD3D9 } from './shared-state';
-import { deviceBoundDepthStencil, deviceBoundRenderTarget, deviceCursorProperties, resolveSurfaceInfo, surfaceMeta } from './resource-registry';
-import { syncHostCursorToGuestState, warpGuestCursorTo } from '../user32/shared-state';
-import { setDeviceCursorImage, showDeviceCursor } from '../../core/device-cursor';
+import { getVTables, devices, createComObject, resourceToDevice, deviceToD3D9, deviceCreationParams, deviceBackBufferInfo } from './shared-state';
+import { deviceBoundDepthStencil, deviceBoundRenderTarget, resolveSurfaceInfo, surfaceMeta } from './resource-registry';
+import {
+    isHardwareDeviceCursor, releaseDeviceCursor, setDeviceCursorImage,
+    setDeviceCursorPosition, showDeviceCursor,
+} from '../../core/device-cursor';
 
 const D3DFMT_X8R8G8B8 = 22;
 const D3DFMT_R5G6B5 = 23;
@@ -28,10 +30,13 @@ const D3DUSAGE_RENDERTARGET = 0x1;
 const D3DUSAGE_DEPTHSTENCIL = 0x2;
 const D3DPOOL_DEFAULT = 0;
 const D3DFMT_D24S8 = 75;
+const D3DDEVTYPE_HAL = 1;
 
 // D3DPRESENT_PARAMETERS field offsets.
 const PP_BACKBUFFER_WIDTH = 0;
 const PP_BACKBUFFER_HEIGHT = 4;
+const PP_BACKBUFFER_FORMAT = 8;
+const PP_WINDOWED = 32;
 const PP_ENABLE_AUTO_DEPTHSTENCIL = 36;
 const PP_AUTO_DEPTHSTENCIL_FORMAT = 40;
 
@@ -42,18 +47,51 @@ function formatForBpp(bpp: number): number {
 /** Register real backbuffer geometry for a fabricated implicit-backbuffer surface so
  *  GetDesc reports the true mode instead of a fallback. Deliberately NO texturePtr —
  *  SetRenderTarget resolves texturePtr 0 to the swap-chain. */
-function registerImplicitBackbufferMeta(surfacePtr: number): void {
-    const cfg = EmulatorConfig.getInstance().screenResolution;
+function registerImplicitBackbufferMeta(surfacePtr: number, devicePtr: number): void {
+    const bb = resolveBackBufferGeometry(devicePtr);
     surfaceMeta.set(surfacePtr, {
-        format: formatForBpp(cfg.bpp),
+        format: bb.format,
         type: D3DRTYPE_SURFACE,
         usage: D3DUSAGE_RENDERTARGET,
         pool: D3DPOOL_DEFAULT,
         multiSampleType: 0,
         multiSampleQuality: 0,
-        width: cfg.width,
-        height: cfg.height,
+        width: bb.width,
+        height: bb.height,
     });
+}
+
+/**
+ * The device's backbuffer geometry, or the emulator's screen mode when the device never
+ * declared one (BackBufferWidth/Height 0 = "use the focus window's client area", which is
+ * the windowed default in real D3D9). Recorded per-device at CreateDevice/Reset because
+ * the app owns this number, not the bundle manifest.
+ */
+function resolveBackBufferGeometry(devicePtr: number): { width: number; height: number; format: number; windowed: boolean } {
+    const cfg = EmulatorConfig.getInstance().screenResolution;
+    const info = deviceBackBufferInfo.get(devicePtr >>> 0);
+    if (info && info.width > 0 && info.height > 0) return info;
+    return { width: cfg.width, height: cfg.height, format: formatForBpp(cfg.bpp), windowed: !!info?.windowed };
+}
+
+/** Record what CreateDevice/Reset was actually given. Width/height 0 stay 0 so
+ *  resolveBackBufferGeometry falls back rather than inventing an extent. */
+function recordBackBufferInfo(devicePtr: number, pPresentationParameters: number, mem: Uint8Array): void {
+    if (!pPresentationParameters) return;
+    const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+    const width = view.getUint32(pPresentationParameters + PP_BACKBUFFER_WIDTH, true) >>> 0;
+    const height = view.getUint32(pPresentationParameters + PP_BACKBUFFER_HEIGHT, true) >>> 0;
+    const rawFormat = view.getUint32(pPresentationParameters + PP_BACKBUFFER_FORMAT, true) >>> 0;
+    const windowed = (view.getUint32(pPresentationParameters + PP_WINDOWED, true) >>> 0) !== 0;
+    const cfg = EmulatorConfig.getInstance().screenResolution;
+    // D3DFMT_UNKNOWN (0) is legal in windowed mode: the runtime adopts the desktop format.
+    deviceBackBufferInfo.set(devicePtr >>> 0, {
+        width, height,
+        format: rawFormat || formatForBpp(cfg.bpp),
+        windowed,
+    });
+    Logger.log(LogCategory.D3D9,
+        `backbuffer geometry: ${width}x${height} fmt=${rawFormat || formatForBpp(cfg.bpp)} windowed=${windowed}`);
 }
 
 /**
@@ -151,40 +189,39 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         const cfg = EmulatorConfig.getInstance().screenResolution;
         if (meta.width > cfg.width || meta.height > cfg.height) return D3DERR_INVALIDCALL;
 
-        deviceCursorProperties.set(pDevice, { hotspotX: xHotSpot, hotspotY: yHotSpot, surfacePtr: pCursorBitmap });
         // Snapshot the pixels for the host pointer: real D3D does not addref the
         // surface, so the app may release or reuse it as soon as this returns.
         const resolved = resolveSurfaceInfo(pCursorBitmap);
         const pixels = resolved?.device.getTextureLevelPixels(resolved.texturePtr, resolved.level);
-        setDeviceCursorImage(pixels ? {
+        const windowed = resolveBackBufferGeometry(pDevice).windowed;
+        setDeviceCursorImage(pDevice, pixels ? {
             width: meta.width,
             height: meta.height,
             // Format is A8R8G8B8 (validated above) = B,G,R,A bytes little-endian.
             pixels: bgraToRgba(pixels.data, meta.width, meta.height, pixels.pitch),
             hotspotX: xHotSpot,
             hotspotY: yHotSpot,
-        } : null);
-        syncHostCursorToGuestState();
+        } : null, windowed);
         Logger.log(LogCategory.D3D9,
-            `SetCursorProperties(${meta.width}x${meta.height}, hotspot ${xHotSpot},${yHotSpot}) surface=0x${pCursorBitmap.toString(16)}`);
+            `SetCursorProperties(${meta.width}x${meta.height}, hotspot ${xHotSpot},${yHotSpot}) surface=0x${pCursorBitmap.toString(16)} ` +
+            `kind=${isHardwareDeviceCursor(meta.width, meta.height, windowed) ? 'hardware' : 'software'} windowed=${windowed}`);
         return D3D_OK;
     };
 
-    // ShowCursor(bShow) — returns the PREVIOUS visibility. The device cursor is drawn
-    // by the runtime over the frame, so enabling it gives the app a pointer even while
-    // it keeps the Win32 one hidden (core/device-cursor).
+    // ShowCursor(bShow) — returns the PREVIOUS visibility. Enabling the device cursor gives
+    // the app a pointer even while it keeps the Win32 one hidden (core/device-cursor).
     exports['IDirect3DDevice9_ShowCursor'] = (_ctx, _mem, args) => {
-        if (!devices.has(args[0] >>> 0)) return 0;
-        const prev = showDeviceCursor(!!args[1]);
-        syncHostCursorToGuestState();
-        return prev ? 1 : 0;
+        const pDevice = args[0] >>> 0;
+        if (!devices.has(pDevice)) return 0;
+        return showDeviceCursor(pDevice, !!args[1]) ? 1 : 0;
     };
 
     // SetCursorPosition(X, Y, Flags) is STDMETHOD_(void, ...) — the guest ignores the return
-    // value. D3DCURSOR_IMMEDIATE_UPDATE is moot: our warp is always immediate.
+    // value. D3DCURSOR_IMMEDIATE_UPDATE is moot: our update is always immediate.
     exports['IDirect3DDevice9_SetCursorPosition'] = (_ctx, _mem, args) => {
-        if (!devices.has(args[0] >>> 0)) return 0;
-        warpGuestCursorTo(args[1] | 0, args[2] | 0);
+        const pDevice = args[0] >>> 0;
+        if (!devices.has(pDevice)) return 0;
+        setDeviceCursorPosition(pDevice, args[1] | 0, args[2] | 0);
         return 0;
     };
 
@@ -287,6 +324,15 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
             // Store device instance mapped to COM object pointer
             devices.set(devicePtr, device);
             deviceToD3D9.set(devicePtr, pD3D9);
+            deviceCreationParams.set(devicePtr, {
+                adapter: Adapter >>> 0,
+                deviceType: DeviceType >>> 0,
+                hFocusWindow: hFocusWindow >>> 0,
+                behaviorFlags: BehaviorFlags >>> 0,
+            });
+            // The app's own backbuffer geometry, recorded before anything can query it
+            // back out (GetBackBuffer/GetRenderTarget descs, GetDisplayMode).
+            recordBackBufferInfo(devicePtr, pPresentationParameters, mem);
 
             // Bind this device as the active owner of the guest-side setter-shadow trampolines and
             // re-sentinel their shadow tables: a fresh device has a fresh JS state-of-record, so a
@@ -332,8 +378,20 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         // Reset destroys the implicit depth-stencil and re-creates it from the new
         // present parameters (when EnableAutoDepthStencil is still set).
         deviceBoundDepthStencil.delete(pDevice);
+        // The device cursor does not survive a Reset either (wined3d_device_reset drops
+        // cursor_texture) — the app must re-SetCursorProperties. Dropped before the new
+        // present parameters land, so a re-upload sees the new windowed state.
+        releaseDeviceCursor(pDevice);
         const hr = device.reset(pPresentationParameters, mem);
         bindAutoDepthStencil(device, pDevice, mem, pPresentationParameters);
+        // A Reset re-declares the backbuffer (this is how in-game resolution switchers
+        // work), so the recorded geometry must follow it or every later GetDesc /
+        // GetDisplayMode answers for the previous mode. The fabricated implicit
+        // backbuffer/render-target surfaces cached their extents from the OLD geometry —
+        // drop them so the next Get* re-registers against the new one.
+        recordBackBufferInfo(pDevice, pPresentationParameters, mem);
+        const staleRt = deviceBoundRenderTarget.get(pDevice);
+        if (staleRt) surfaceMeta.delete(staleRt);
         return hr;
     };
 
@@ -393,7 +451,7 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
             if (!vtableAddr) return D3DERR_INVALIDCALL;
             rt = createComObject(vtableAddr);
             resourceToDevice.set(rt, device);
-            registerImplicitBackbufferMeta(rt);
+            registerImplicitBackbufferMeta(rt, devicePtr);
             deviceBoundRenderTarget.set(devicePtr, rt);
         }
         return Mem.writeUint32(ppRenderTarget, rt) ? D3D_OK : D3DERR_INVALIDCALL;
@@ -667,12 +725,40 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
             return D3DERR_INVALIDCALL;
         }
 
+        // A FULLSCREEN device mode-set the display to its own backbuffer, so that is the
+        // display mode; a WINDOWED one is a guest of the desktop mode. Answering the
+        // bundle's configured resolution either way tells a mode-setting app the screen is
+        // a size it is not rendering at.
         const cfg = EmulatorConfig.getInstance().screenResolution;
+        const bb = resolveBackBufferGeometry(pDevice);
+        const useDeviceMode = !bb.windowed && bb.width > 0 && bb.height > 0;
         const ok =
-            Mem.writeUint32(pMode + 0, cfg.width >>> 0) &&
-            Mem.writeUint32(pMode + 4, cfg.height >>> 0) &&
+            Mem.writeUint32(pMode + 0, (useDeviceMode ? bb.width : cfg.width) >>> 0) &&
+            Mem.writeUint32(pMode + 4, (useDeviceMode ? bb.height : cfg.height) >>> 0) &&
             Mem.writeUint32(pMode + 8, cfg.refreshRate || 60) &&
-            Mem.writeUint32(pMode + 12, formatForBpp(cfg.bpp));
+            Mem.writeUint32(pMode + 12, useDeviceMode ? bb.format : formatForBpp(cfg.bpp));
+        return ok ? D3D_OK : D3DERR_INVALIDCALL;
+    };
+
+    /**
+     * D3DDEVICE_CREATION_PARAMETERS { UINT AdapterOrdinal; D3DDEVTYPE DeviceType;
+     * HWND hFocusWindow; DWORD BehaviorFlags; } — a verbatim echo of the CreateDevice
+     * arguments. Engines re-read hFocusWindow here to hook/resize their own window and
+     * BehaviorFlags to decide whether to run the FFP through hardware vertex processing,
+     * so a wrong (or absent) answer silently reconfigures the renderer.
+     */
+    exports['IDirect3DDevice9_GetCreationParameters'] = (_ctx, _mem, args) => {
+        const pDevice = args[0];
+        const pParameters = args[1];
+        if (!devices.has(pDevice) || !pParameters) return D3DERR_INVALIDCALL;
+        // Fallback (device created before the map existed): HAL + adapter 0 +
+        // HARDWARE_VERTEXPROCESSING|FPU_PRESERVE (0x42) — a legal combination.
+        const p = deviceCreationParams.get(pDevice);
+        const ok =
+            Mem.writeUint32(pParameters + 0, p?.adapter ?? 0) &&
+            Mem.writeUint32(pParameters + 4, p?.deviceType ?? D3DDEVTYPE_HAL) &&
+            Mem.writeUint32(pParameters + 8, p?.hFocusWindow ?? 0) &&
+            Mem.writeUint32(pParameters + 12, p?.behaviorFlags ?? 0x42);
         return ok ? D3D_OK : D3DERR_INVALIDCALL;
     };
 
@@ -701,7 +787,7 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
 
         // Register surface with device for method calls
         resourceToDevice.set(surfacePtr, device);
-        registerImplicitBackbufferMeta(surfacePtr);
+        registerImplicitBackbufferMeta(surfacePtr, pDevice);
 
         if (ppBackBuffer) {
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);

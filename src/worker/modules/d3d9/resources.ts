@@ -849,18 +849,85 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         return ok ? D3D_OK : D3DERR_INVALIDCALL;
     };
 
-    exports['IDirect3DCubeTexture9_GetDevice'] = (_ctx, _mem, args) => {
-        const pCube = args[0];
+    /**
+     * IDirect3DDevice9::UpdateTexture — the SYSTEMMEM -> VIDEO staging copy. Engines that
+     * never lock a DEFAULT-pool texture (SS2/NewDark loads every world texture into a
+     * SYSTEMMEM twin and pushes it across with this) get an entirely black world without
+     * it: the video-memory texture is created, bound and sampled, but nothing ever writes
+     * its pixels.
+     *
+     * Level matching is by DIMENSION, not by index: the destination may have a shorter
+     * mip chain, in which case the copy starts at the source level whose extents equal
+     * destination level 0. Level 0 is written LAST because that write is what marks the
+     * texture dirty for re-upload.
+     */
+    exports['IDirect3DDevice9_UpdateTexture'] = (_ctx, _mem, args) => {
+        const pDevice = args[0] >>> 0;
+        const pSrc = args[1] >>> 0;
+        const pDst = args[2] >>> 0;
+        const device = devices.get(pDevice);
+        if (!device || !pSrc || !pDst) return D3DERR_INVALIDCALL;
+
+        const src = textureMeta.get(pSrc);
+        const dst = textureMeta.get(pDst);
+        if (!src || !dst) return D3DERR_INVALIDCALL;
+        if (src.format !== dst.format) return D3DERR_INVALIDCALL;
+        // Real D3D9: source must be SYSTEMMEM, destination must not be.
+        if (src.pool !== D3DPOOL_SYSTEMMEM || dst.pool === D3DPOOL_SYSTEMMEM) return D3DERR_INVALIDCALL;
+        if (resourceToDevice.get(pSrc) !== device || resourceToDevice.get(pDst) !== device) {
+            return D3DERR_INVALIDCALL;
+        }
+
+        let srcBase = -1;
+        for (let l = 0; l < src.levels; l++) {
+            if (Math.max(1, src.width >>> l) === dst.width && Math.max(1, src.height >>> l) === dst.height) {
+                srcBase = l;
+                break;
+            }
+        }
+        if (srcBase < 0) return D3DERR_INVALIDCALL;
+
+        const levels = Math.min(dst.levels, src.levels - srcBase);
+        if (levels <= 0) return D3DERR_INVALIDCALL;
+
+        let copied = 0;
+        for (let i = levels - 1; i >= 0; i--) {
+            const px = device.getTextureLevelPixels(pSrc, srcBase + i);
+            if (!px) continue;
+            if (device.setTextureLevelPixels(pDst, i, px.data, px.pitch)) copied++;
+        }
+        if (copied === 0) return D3DERR_INVALIDCALL;
+
+        Logger.verbose(LogCategory.D3D9,
+            `UpdateTexture(0x${pSrc.toString(16)} -> 0x${pDst.toString(16)}): ${copied}/${levels} levels ` +
+            `from src level ${srcBase}`);
+        return D3D_OK;
+    };
+
+    // IDirect3DResource9::GetDevice — identical for every resource type, so one
+    // implementation serves them all. An UNIMPLEMENTED GetDevice is not a benign gap:
+    // the stub returns 0 (== D3D_OK) without touching *ppDevice, so the caller reads its
+    // own uninitialised local as an IDirect3DDevice9* and calls through it. That is how
+    // System Shock 2 died at level load — Texture9::GetDevice fed a garbage vtable into
+    // the very next call and execution left the module entirely.
+    const resourceGetDevice = (_ctx: unknown, _mem: unknown, args: number[]): number => {
+        const pResource = args[0];
         const ppDevice = args[1];
         if (!ppDevice) return D3DERR_INVALIDCALL;
         initReturnPtr(ppDevice);
 
-        const device = resourceToDevice.get(pCube);
+        const device = resourceToDevice.get(pResource);
         if (!device) return D3DERR_INVALIDCALL;
         const devicePtr = resolveDevicePtr(device);
         if (!devicePtr) return D3DERR_INVALIDCALL;
         return Mem.writeUint32(ppDevice, devicePtr) ? D3D_OK : D3DERR_INVALIDCALL;
     };
+
+    exports['IDirect3DCubeTexture9_GetDevice'] = resourceGetDevice;
+    exports['IDirect3DTexture9_GetDevice'] = resourceGetDevice;
+    exports['IDirect3DVolumeTexture9_GetDevice'] = resourceGetDevice;
+    exports['IDirect3DVertexBuffer9_GetDevice'] = resourceGetDevice;
+    exports['IDirect3DIndexBuffer9_GetDevice'] = resourceGetDevice;
 
     exports['IDirect3DCubeTexture9_AddDirtyRect'] = () => D3D_OK;
 

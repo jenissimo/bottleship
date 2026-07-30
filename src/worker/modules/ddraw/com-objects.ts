@@ -120,6 +120,11 @@ export type SurfaceFormat = {
     gMask: number;
     bMask: number;
     aMask: number;
+    /** DDPF_ZBUFFER surfaces only: the raw dwZBitMask / dwStencilBitMask the app declared.
+     *  They alias gMask/bMask in DDPIXELFORMAT, but those go through RGB fallbacks that
+     *  would corrupt a depth value, so the depth interpretation reads these instead. */
+    zBitMask?: number;
+    stencilBitMask?: number;
 };
 
 /** Device-held COM reference swap: AddRef the incoming object, Release the one it
@@ -152,6 +157,10 @@ export interface BaseSurfaceState {
     surfacePtr: number;
     format: SurfaceFormat;
     attachedSurfaceAddr: number;
+    /** DDSCAPS_ZBUFFER surfaces only: guest addresses of the render targets this depth
+     *  buffer was attached to. Our depth attachments are keyed by render target, so a
+     *  DDBLT_DEPTHFILL aimed at the z surface has to be resolved back to them. */
+    zOwnerSurfaces?: number[];
     gpuTexture?: GPUTexture;
     /** Single-mip (level 0) view — used for render attachments, clears, uploads, and sampling
      *  when there is no mip chain. */
@@ -507,6 +516,21 @@ export class DirectDrawSurfaceObject extends BaseComObject {
             executor.invalidateSurfaceCache(this.state);
         }
 
+        // Drop the context's cached primary/back-buffer addresses if they point at THIS object.
+        // The system object pool deliberately recycles same-size COM blocks, so an app that
+        // releases its primary and creates a new DirectDraw gets the block back — and every
+        // reader of the cached address then resolves it to whatever now lives there (a
+        // DirectDrawObject), which is not a surface. Only the whole-DirectDraw cascade cleared
+        // these; a lone Release of the primary did not.
+        const surfaces = ddrawModule?.context?.surfaces;
+        if (surfaces) {
+            const self = (system.resourceProvider as any)?.getAddressForHandle?.(this.handle) >>> 0;
+            if (self) {
+                if ((surfaces.primary >>> 0) === self) surfaces.primary = 0;
+                if ((surfaces.backBuffer >>> 0) === self) surfaces.backBuffer = 0;
+            }
+        }
+
         // Remove from deferred upload batch BEFORE freeing memory.
         // Without this, flushAll() reads from freed/reused surfacePtr → wrong pixel data
         // (wrong pixel data uploaded from freed/reused surfacePtr).
@@ -768,6 +792,8 @@ export class Direct3DDevice3Object extends BaseComObject {
 
     // Lighting system state
     private material: D3DMaterial7Data = createDefaultMaterial();
+    /** SetMaterial was called at least once — the DX6 ProcessVertices D3DVOP_LIGHT gate. */
+    private materialSet: boolean = false;
     private lights: Map<number, D3DLight7Data> = new Map();
     private lightsEnabled: Set<number> = new Set();
 
@@ -788,6 +814,11 @@ export class Direct3DDevice3Object extends BaseComObject {
 
     setMaterial(mat: D3DMaterial7Data): void {
         this.material = mat;
+        this.materialSet = true;
+    }
+
+    isMaterialSet(): boolean {
+        return this.materialSet;
     }
 
     getMaterial(): D3DMaterial7Data {
@@ -1230,10 +1261,34 @@ export class Direct3DViewport3Object extends BaseComObject {
         minZ: 0,
         maxZ: 1,
     };
+    /** D3DVIEWPORT2 clipping volume (dvClipX/Y/Width/Height); D3D's default is the -1..1 cube. */
+    private clipVolume = { x: -1, y: 1, width: 2, height: 2 };
+    /**
+     * Post-projection clip-space scale/bias this viewport contributes (ddraw viewport_activate).
+     * A D3DVIEWPORT's clipping volume / dvScale / dvMinZ..dvMaxZ remap clip space; they never
+     * change the rasterizer's own [0,1] depth range. Identity for a default viewport.
+     */
+    private clipSpace = { sx: 1, sy: 1, sz: 1, ox: 0, oy: 0, oz: 0 };
     private viewport2Address: number = 0; // Address for IDirect3DViewport2 vtable (if mapped)
 
     constructor(vtableAddress: number) {
         super(IID_IDirect3DViewport3, vtableAddress);
+    }
+
+    setClipVolume(x: number, y: number, width: number, height: number): void {
+        this.clipVolume = { x, y, width, height };
+    }
+
+    getClipVolume() {
+        return this.clipVolume;
+    }
+
+    setClipSpace(sx: number, sy: number, sz: number, ox: number, oy: number, oz: number): void {
+        this.clipSpace = { sx, sy, sz, ox, oy, oz };
+    }
+
+    getClipSpace() {
+        return this.clipSpace;
     }
 
     setDevice(addr: number): void {
@@ -1472,6 +1527,8 @@ export class Direct3DDevice7Object extends BaseComObject implements FFPLightingS
 
     // Lighting system state
     private material: D3DMaterial7Data = createDefaultMaterial();
+    /** SetMaterial was called at least once — the DX6 ProcessVertices D3DVOP_LIGHT gate. */
+    private materialSet: boolean = false;
     private lights: Map<number, D3DLight7Data> = new Map();
     private lightsEnabled: Set<number> = new Set();
 
@@ -1726,6 +1783,11 @@ export class Direct3DDevice7Object extends BaseComObject implements FFPLightingS
 
     setMaterial(mat: D3DMaterial7Data): void {
         this.material = mat;
+        this.materialSet = true;
+    }
+
+    isMaterialSet(): boolean {
+        return this.materialSet;
     }
 
     getMaterial(): D3DMaterial7Data {
@@ -2233,6 +2295,9 @@ export class Direct3DVertexBufferObject extends BaseComObject {
     private numVertices: number = 0;
     private caps: number = 0;
     private vertexSize: number = 0;
+    private locked: boolean = false;
+    /** 3 for IDirect3D3::CreateVertexBuffer, 7 for IDirect3D7 — ProcessVertices lights differently. */
+    private interfaceVersion: 3 | 7 = 3;
 
     constructor(vtableAddress: number) {
         super(IID_IDirect3DVertexBuffer, vtableAddress);
@@ -2245,6 +2310,18 @@ export class Direct3DVertexBufferObject extends BaseComObject {
         this.caps = caps;
         this.vertexSize = vertexSize;
     }
+
+    setInterfaceVersion(v: 3 | 7): void { this.interfaceVersion = v; }
+    getInterfaceVersion(): 3 | 7 { return this.interfaceVersion; }
+
+    beginLock(): void { this.locked = true; }
+    /** Returns false for an Unlock with no matching Lock (real ddraw still reports D3D_OK). */
+    endLock(): boolean {
+        const wasLocked = this.locked;
+        this.locked = false;
+        return wasLocked;
+    }
+    isLocked(): boolean { return this.locked; }
 
     getDataPtr(): number { return this.dataPtr; }
     getFVF(): number { return this.fvf; }

@@ -3,6 +3,7 @@ import {
     DDPF_FOURCC,
     DDPF_PALETTEINDEXED8,
     DDPF_RGB,
+    DDPF_ZBUFFER,
     DDSD_CAPS,
     DDSD_HEIGHT,
     DDSD_LPSURFACE,
@@ -119,6 +120,10 @@ export const readPixelFormat = (mem: Uint8Array, address: number): SurfaceFormat
             `R=0x${rMask.toString(16)} G=0x${gMask.toString(16)} B=0x${bMask.toString(16)}`);
     }
 
+    // DDPF_ZBUFFER: dwZBitMask/dwStencilBitMask alias gMask/bMask. Keep the raw values —
+    // the RGB fallbacks below would turn a 0 mask into 0x07e0 and mis-normalise a depth fill.
+    const isZ = (flags & DDPF_ZBUFFER) !== 0;
+
     return {
         flags,
         fourCC: (flags & DDPF_FOURCC) !== 0 ? fourCC : undefined,
@@ -127,6 +132,7 @@ export const readPixelFormat = (mem: Uint8Array, address: number): SurfaceFormat
         gMask: gMask || 0x07e0,
         bMask: bMask || 0x001f,
         aMask,
+        ...(isZ ? { zBitMask: gMask, stencilBitMask: bMask } : {}),
     };
 };
 

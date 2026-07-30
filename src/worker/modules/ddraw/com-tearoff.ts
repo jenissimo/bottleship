@@ -101,7 +101,7 @@ export const resolveDDrawTearOff = (
             `DirectDraw tear-off ${vtableName} -> 0x${addr.toString(16)} (handle=0x${obj.handle.toString(16)})`);
     }
 
-    obj.addRef();
+    obj.addRef(addr);
     new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setUint32(ppvObject, addr, true);
     return DD_OK;
 };
