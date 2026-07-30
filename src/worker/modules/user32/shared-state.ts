@@ -1,9 +1,10 @@
 import { Logger, LogCategory } from "../../core/logger";
 import { System } from "../../core/system";
+import { EmulatorConfig } from "../../core/emulator-config-manager";
 import { getActiveDeviceCursor } from "../../core/device-cursor";
 import { resetHooks } from "./hooks";
 import { resetOwnerDrawScratch } from "./owner-draw";
-import { resetSystemCursorHandles } from "./system-cursors";
+import { IDC_ARROW, getSystemCursorHandle, resetSystemCursorHandles } from "./system-cursors";
 import { resetUser32Classes } from "./class";
 import { resetDeviceNotifications } from "./device-notify";
 
@@ -131,6 +132,9 @@ export function purgeControlState(hwnd: number): void {
 
 export function finalizeWindowDestroy(hwnd: number): void {
     purgeControlState(hwnd);
+    // Handles are pool-reused: a retained client image left behind would be restored under
+    // a DIFFERENT window that later gets this handle.
+    System.getInstance().gdiContext?.dropWindowClientBacking?.(hwnd >>> 0);
     windowDestroyFinalizer?.(hwnd >>> 0);
 }
 
@@ -282,19 +286,192 @@ export function getAbsoluteWindowPosition(win: WindowInfo): { x: number; y: numb
     }
     return { x, y };
 }
+
+/**
+ * Screen-space intersection of the client rects of a window's WS_CHILD ANCESTORS —
+ * the clip Win32 applies to a child window's pixels (a child never draws outside its
+ * parent's client area, and a nested child is clipped by every ancestor in turn).
+ * null when the window has no child ancestor, i.e. it is top-level and unclipped.
+ *
+ * Deliberately excludes the window's OWN rect: our DLU→px conversion is approximate,
+ * so a template-laid-out control can come out a couple of pixels past its own
+ * dialog's edge, and clipping to self would erase content real Windows shows (the
+ * same reason paintDialogBackground fills the rect ∪ children union).
+ */
+export function getAncestorClipRect(
+    win: WindowInfo,
+): { x: number; y: number; w: number; h: number } | null {
+    const WS_CHILD = 0x40000000;
+    let clip: { x: number; y: number; w: number; h: number } | null = null;
+    const visited = new Set<number>([win.handle]);
+    let cur: WindowInfo | undefined = win;
+    while (cur && (cur.style & WS_CHILD) !== 0 && cur.parent && !visited.has(cur.parent)) {
+        visited.add(cur.parent);
+        const parent = windows.get(cur.parent);
+        if (!parent) break;
+        const origin = getAbsoluteWindowPosition(parent);
+        const rect = { x: origin.x, y: origin.y, w: parent.width, h: parent.height };
+        if (!clip) {
+            clip = rect;
+        } else {
+            const x = Math.max(clip.x, rect.x);
+            const y = Math.max(clip.y, rect.y);
+            clip = {
+                x, y,
+                w: Math.min(clip.x + clip.w, rect.x + rect.w) - x,
+                h: Math.min(clip.y + clip.h, rect.y + rect.h) - y,
+            };
+        }
+        cur = parent;
+    }
+    return clip;
+}
+
+/**
+ * Screen rects of the visible child WINDOWS that own their own pixels — child dialogs
+ * and app-class windows, i.e. everything that paints ITSELF rather than being drawn by
+ * us as default control chrome.
+ *
+ * The complement of getAncestorClipRect. A child window's pixels belong to the CHILD on
+ * Windows — a parent's paint cannot reach them, which is what a separate HWND means. Our
+ * overlay is one flat canvas with no such ownership, so a parent flushing its whole
+ * client rect blits straight over a child dialog that legitimately drew there, and
+ * nothing repaints the child afterwards (it is not in the parent's owner-draw chain).
+ *
+ * System controls are deliberately NOT excluded: those we draw ON TOP of the parent's
+ * background, so the background must reach under them — a Static with a transparent
+ * background shows the dialog face through it.
+ */
+export function getChildWindowExclusions(
+    hwnd: number,
+): { x: number; y: number; w: number; h: number }[] {
+    const out: { x: number; y: number; w: number; h: number }[] = [];
+    const visited = new Set<number>([hwnd]);
+    // DESCENDANTS, not just children: a system control owns no pixels of its own (we
+    // draw it), so a paint may reach through one — but the guest-owned windows nested
+    // BELOW it are still theirs. A page dialog hosted in a placeholder Static is a
+    // grandchild of the frame, and a children-only walk lets the frame's flush erase it.
+    const walk = (parentHwnd: number): void => {
+        const parent = windows.get(parentHwnd);
+        if (!parent?.children.length) return;
+        for (const childHwnd of parent.children) {
+            if (visited.has(childHwnd)) continue;
+            visited.add(childHwnd);
+            const child = windows.get(childHwnd);
+            if (!child || !child.visible) continue;
+            if (child.isSystemControl) { walk(childHwnd); continue; }
+            if (child.width <= 0 || child.height <= 0) continue;
+            const origin = getAbsoluteWindowPosition(child);
+            let rect = { x: origin.x, y: origin.y, w: child.width, h: child.height };
+            // Exclude only the pixels the child can ACTUALLY paint: its own paint is clipped
+            // to its ancestors' client areas (getAncestorClipRect), and a page template is
+            // routinely taller than the placeholder hosting it. Holing out the full rect left
+            // the un-paintable remainder showing whatever was under it — the grey dialog face
+            // in a band below the page.
+            const clip = getAncestorClipRect(child);
+            if (clip) {
+                const x0 = Math.max(rect.x, clip.x);
+                const y0 = Math.max(rect.y, clip.y);
+                const x1 = Math.min(rect.x + rect.w, clip.x + clip.w);
+                const y1 = Math.min(rect.y + rect.h, clip.y + clip.h);
+                if (x1 <= x0 || y1 <= y0) continue;
+                rect = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+            }
+            // No descent past a guest-owned window: it owns everything inside its rect.
+            out.push(rect);
+        }
+    };
+    walk(hwnd);
+    return out;
+}
+
+/**
+ * Win32 IsWindowVisible: a window is on screen only if it AND every WS_CHILD ancestor
+ * carry WS_VISIBLE. Hiding a parent does NOT clear the children's bit — Windows just
+ * stops drawing them — so a painter that consults only `win.visible` happily draws the
+ * children of a hidden page. On the flat overlay that resurrects a page that was switched
+ * away, which is why erasing a hidden window's pixels was unsafe without this.
+ */
+export function isEffectivelyVisible(win: WindowInfo | undefined): boolean {
+    const WS_CHILD = 0x40000000;
+    let cur = win;
+    const visited = new Set<number>();
+    while (cur) {
+        if (!cur.visible) return false;
+        if ((cur.style & WS_CHILD) === 0 || cur.parent === undefined) return true;
+        if (visited.has(cur.parent)) return true; // cycle guard
+        visited.add(cur.parent);
+        cur = windows.get(cur.parent);
+    }
+    return true;
+}
+
 export let cursorDisplayCount = 0;
 
-// Cursor confinement state (ClipCursor with a non-NULL rect). Tracks the faithful
-// relative/captured-mouse signal alongside cursorDisplayCount; host engages pointer-lock
-// on (cursor hidden) OR (cursor clipped).
-export let cursorClipped = false;
+/** Screen-space cursor bounds; right/bottom are EXCLUSIVE (Win32 RECT). */
+export interface CursorClipRect {
+    left: number;
+    top: number;
+    right: number;
+    bottom: number;
+}
 
-export function setCursorClipped(clipped: boolean): void {
-    cursorClipped = clipped;
+// Cursor confinement (ClipCursor). null = unconfined. The rect is the whole of the
+// state: the pointer is genuinely clamped to it (see clampToCursorClip), so
+// confinement needs nothing from the host transport.
+let cursorClipRect: CursorClipRect | null = null;
+
+/** Bounds the clip rect itself is confined to (wineserver set_clip_rectangle clamps
+ *  the requested rect to the virtual screen). */
+export function getVirtualScreenRect(): CursorClipRect {
+    const sys = System.getInstance();
+    const cfg = EmulatorConfig.getInstance().screenResolution;
+    return {
+        left: 0,
+        top: 0,
+        right: sys.emulatedDisplayMode?.width || sys.ddrawContext?.display?.width || cfg.width,
+        bottom: sys.emulatedDisplayMode?.height || sys.ddrawContext?.display?.height || cfg.height,
+    };
+}
+
+export function setCursorClipRect(rect: CursorClipRect | null): void {
+    cursorClipRect = rect;
+    publishCursorConfinementSignal();
+}
+
+export function getCursorClipRect(): CursorClipRect | null {
+    return cursorClipRect;
 }
 
 export function isCursorClipped(): boolean {
-    return cursorClipped;
+    return cursorClipRect !== null;
+}
+
+/**
+ * Confine a screen point to the clip rect. Right/bottom are exclusive, so the
+ * pointer bounds to right-1/bottom-1 (NT5 BoundCursor; wineserver
+ * update_desktop_cursor_pos does the same max/min).
+ */
+export function clampToCursorClip(x: number, y: number): { x: number; y: number } {
+    const clip = cursorClipRect;
+    if (!clip) return { x, y };
+    return {
+        x: Math.max(Math.min(x, clip.right - 1), clip.left),
+        y: Math.max(Math.min(y, clip.bottom - 1), clip.top),
+    };
+}
+
+// ClipCursor is confinement, NOT an intent to steer by motion: a windowed game that
+// clips to its own client rect is ordinary and keeps a visible pointer. What marks
+// relative-mouse emulation is confinement with a HIDDEN pointer, so that is what the
+// host is told — the confinement itself we enforce ourselves and it needs no transport.
+let lastPublishedClipSignal = false;
+
+function publishCursorConfinementSignal(): void {
+    const relative = cursorClipRect !== null && !isHostPointerShown();
+    if (relative === lastPublishedClipSignal) return;
+    lastPublishedClipSignal = relative;
+    self.postMessage({ type: "clip_cursor", clip: relative });
 }
 
 // Mouse capture state
@@ -329,6 +506,12 @@ export interface ListControlItem {
 export interface ListControlState {
     items: ListControlItem[];
     selectedIndex: number;  // -1 = no selection
+    /**
+     * Keyboard-focus item (LB_GETCARETINDEX / iSelBase). A single-select
+     * list normally moves this together with selectedIndex, but Win32 keeps
+     * it as distinct state after the selection is cleared.
+     */
+    caretIndex: number;
     /** First visible item (listbox scrolling, LB_SETTOPINDEX). */
     topIndex: number;
     /** Combobox dropdown is open (painted + hit-tested over the dialog). */
@@ -339,7 +522,7 @@ export const listControlStates: Map<number, ListControlState> = new Map();
 export function getOrCreateListState(hwnd: number): ListControlState {
     let state = listControlStates.get(hwnd);
     if (!state) {
-        state = { items: [], selectedIndex: -1, topIndex: 0 };
+        state = { items: [], selectedIndex: -1, caretIndex: 0, topIndex: 0 };
         listControlStates.set(hwnd, state);
     }
     return state;
@@ -378,21 +561,42 @@ export function getCursorDisplayCount(): number {
 // Current cursor handle (SetCursor). A NULL cursor hides the pointer over the
 // window regardless of the ShowCursor display count — SDL2 hides its cursor
 // this way (WIN_ShowCursor → SetCursor(NULL)), never touching ShowCursor.
-let currentCursorHandle = 1;
+// A thread starts with the arrow installed. Held as a sentinel and resolved on
+// first read because the resource provider does not exist at module init; a raw
+// placeholder handle would resolve to no user object, and the host would be asked
+// to show a cursor it has no image for.
+const DEFAULT_CURSOR = -1;
+let currentCursorHandle = DEFAULT_CURSOR;
+
+function resolveCursorHandle(handle: number): number {
+    if (handle === DEFAULT_CURSOR) return getSystemCursorHandle(IDC_ARROW);
+    // A handle whose object is gone (the guest destroyed it, or it outlived a reset of the
+    // user-object table) cannot be what Windows still shows: a destroyed cursor never stays
+    // current. Fall back to the arrow so "visible" always comes with a shape to draw.
+    if (handle !== 0 && !System.getInstance().resourceProvider.getUserObject?.(handle)) {
+        return getSystemCursorHandle(IDC_ARROW);
+    }
+    return handle;
+}
 
 export function setCurrentCursorHandle(hCursor: number): number {
     const prev = currentCursorHandle;
     currentCursorHandle = hCursor >>> 0;
-    return prev;
+    return resolveCursorHandle(prev);
 }
 
 export function getCurrentCursorHandle(): number {
-    return currentCursorHandle;
+    return resolveCursorHandle(currentCursorHandle);
 }
 
 /** Effective host-cursor visibility: display count ≥ 0 AND a non-NULL cursor set. */
 export function isGuestCursorVisible(): boolean {
     return cursorDisplayCount >= 0 && currentCursorHandle !== 0;
+}
+
+/** Whether a pointer is drawn at all — the D3D device cursor outranks the Win32 one. */
+function isHostPointerShown(): boolean {
+    return !!getActiveDeviceCursor() || isGuestCursorVisible();
 }
 
 // Last cursor user object forwarded to the host — identity dedup (handles are
@@ -415,6 +619,9 @@ export function syncHostCursorToGuestState(): void {
     // of the Win32 pointer: an app that enables it hides the Win32 one and still
     // expects a pointer, so while it is on it IS the pointer.
     const deviceCursor = getActiveDeviceCursor();
+    // Whether a pointer is drawn is half of the confinement signal (see
+    // publishCursorConfinementSignal), so re-derive it wherever visibility changes.
+    publishCursorConfinementSignal();
     if (deviceCursor) {
         sys.requestHostCursorVisible(true);
         if (lastForwardedCursorImageObj !== deviceCursor) {
@@ -424,7 +631,7 @@ export function syncHostCursorToGuestState(): void {
         return;
     }
     sys.requestHostCursorVisible(isGuestCursorVisible());
-    const obj = sys.resourceProvider.getUserObject?.(currentCursorHandle);
+    const obj = sys.resourceProvider.getUserObject?.(getCurrentCursorHandle());
     const image = (obj?.type === 'CURSOR'
         && obj.pixels instanceof Uint8Array
         && obj.width > 0 && obj.height > 0
@@ -451,27 +658,47 @@ export function installCursorAndUpdateHostVisibility(hCursor: number): number {
     return prev;
 }
 
-// Cursor-warp capture detection. On real Windows SetCursorPos moves the real
-// pointer; we can honor that only under pointer lock. A steady warp stream is
-// how relative-mouse emulators work (AGS mouse-speed re-centering, UE warpers),
-// so a burst of warps is the faithful "this app needs the pointer captured"
-// signal — one-shot warps (dialog snap-to-default, level-start centering) stay
-// below the threshold.
-const WARP_BURST_COUNT = 3;
-const WARP_BURST_WINDOW_MS = 1500;
-// Long release: re-acquiring pointer lock needs a user gesture, so flapping on
-// short warp pauses would strand the mouse unlocked until the next click.
-const WARP_RELEASE_MS = 10000;
-let warpTimes: number[] = [];
+// RECENTRE detection — the faithful "this app steers by motion" signal. A
+// relative-mouse emulator consumes motion by warping the pointer back to a FIXED
+// target: recentre, let the pointer drift off, recentre again (AGS mouse-speed,
+// UE warpers). The MECHANISM is the signal, not the call rate — an app that
+// mirrors its own pointer position warps just as often and means nothing. So a
+// warp counts only when it (a) displaces the pointer at all, (b) targets the same
+// spot as the previous warp, and (c) had drift away from that spot to consume.
+// One-shot warps (dialog snap-to-default, level-start centring) never chain.
+const RECENTRE_BURST_COUNT = 3;
+const RECENTRE_WINDOW_MS = 1500;
+/** A recentre target is fixed; a few px of slack covers odd/rounded client rects. */
+const RECENTRE_TOLERANCE_PX = 4;
+// A recentring app pauses whenever it is not steering (menu, cutscene, loading) and
+// resumes in the same mode, so the claim outlives a long gap.
+const RECENTRE_RELEASE_MS = 10000;
+let recentreTimes: number[] = [];
+let lastWarpTarget: { x: number; y: number } | null = null;
 let warpModeActive = false;
 let warpReleaseTimer: ReturnType<typeof setTimeout> | null = null;
 
-export function noteCursorWarpForCapture(): void {
+function nearTarget(ax: number, ay: number, bx: number, by: number): boolean {
+    return Math.abs(ax - bx) <= RECENTRE_TOLERANCE_PX && Math.abs(ay - by) <= RECENTRE_TOLERANCE_PX;
+}
+
+function noteCursorRecentre(fromX: number, fromY: number, toX: number, toY: number): void {
+    const prev = lastWarpTarget;
+    lastWarpTarget = { x: toX, y: toY };
+    // A moving target is a pointer FOLLOWER (or an unrelated one-shot), not a recentre —
+    // whatever run was in progress is over.
+    if (!prev || !nearTarget(toX, toY, prev.x, prev.y)) {
+        recentreTimes.length = 0;
+        return;
+    }
+    // Same target, but nothing drifted off it since the last warp: no motion was
+    // consumed, so this is evidence neither way. Engines re-assert the centre several
+    // times per poll; wiping the run on those would keep the count pinned at one.
+    if (nearTarget(fromX, fromY, prev.x, prev.y)) return;
     const now = Date.now();
-    warpTimes.push(now);
-    if (warpTimes.length > 8) warpTimes.shift();
-    if (!warpModeActive
-        && warpTimes.filter((t) => now - t < WARP_BURST_WINDOW_MS).length >= WARP_BURST_COUNT) {
+    recentreTimes.push(now);
+    while (recentreTimes.length > 0 && now - recentreTimes[0] >= RECENTRE_WINDOW_MS) recentreTimes.shift();
+    if (!warpModeActive && recentreTimes.length >= RECENTRE_BURST_COUNT) {
         warpModeActive = true;
         System.getInstance().requestHostCursorWarpMode(true);
     }
@@ -482,20 +709,32 @@ export function noteCursorWarpForCapture(): void {
             warpModeActive = false;
             System.getInstance().requestHostCursorWarpMode(false);
         }
-    }, WARP_RELEASE_MS);
+    }, RECENTRE_RELEASE_MS);
 }
 
 /**
- * Single sink for a guest-driven pointer warp: moves the input-manager pointer, tells the
- * host (virtual cursor under pointer lock) and feeds the warp-burst capture detector.
- * Shared by user32 SetCursorPos and IDirect3DDevice9::SetCursorPosition — both move the
- * one real pointer on Windows (wined3d's cursor-position path calls SetCursorPos for a
- * hardware cursor, which is the cursor kind D3DCAPS9.CursorCaps advertises).
+ * Single sink for a guest-driven pointer warp: moves the pointer (confined, and
+ * generating the mouse move the system generates), tells the host, and feeds the
+ * recentre detector. Shared by user32 SetCursorPos and
+ * IDirect3DDevice9::SetCursorPosition — both move the one real pointer on Windows
+ * (wined3d's cursor-position path calls SetCursorPos for a hardware cursor, which
+ * is the cursor kind D3DCAPS9.CursorCaps advertises).
+ *
+ * A warp onto the pointer's own position still generates its mouse event (that
+ * happens inside moveCursorTo — Windows raises the moved flag without comparing
+ * positions), but it moves no pointer, so it earns no host round-trip and counts as
+ * no evidence. Those are the parts wined3d and NtUserSetCursorPos gate on position:
+ * wined3d_device_set_cursor_position returns before SetCursorPos when x/y already
+ * equal GetCursorPos, and NtUserSetCursorPos drives pSetCursorPos only when
+ * prev != new.
  */
 export function warpGuestCursorTo(x: number, y: number): void {
-    System.getInstance().inputManager.setMousePosition(x, y);
-    self.postMessage({ type: "set_cursor_pos", x, y });
-    noteCursorWarpForCapture();
+    const inputManager = System.getInstance().inputManager;
+    const from = inputManager.getMouseState();
+    if (!inputManager.moveCursorTo(x, y)) return;
+    const to = inputManager.getMouseState();
+    self.postMessage({ type: "set_cursor_pos", x: to.x, y: to.y });
+    noteCursorRecentre(from.x, from.y, to.x, to.y);
 }
 
 export function updateCursorDisplayCount(delta: number): number {
@@ -535,7 +774,7 @@ export function emptyClipboard(): void {
 /** GDI dialogs need a visible host cursor; games may leave ShowCursor count negative after DDraw init. */
 export function ensureHostCursorForDialog(): void {
     if (cursorDisplayCount < 0) cursorDisplayCount = 0;
-    if (currentCursorHandle === 0) currentCursorHandle = 1;
+    if (currentCursorHandle === 0) currentCursorHandle = DEFAULT_CURSOR;
     syncHostCursorToGuestState();
 }
 
@@ -543,10 +782,12 @@ export function resetUser32SharedState(): void {
     windows.clear();
     nextWindowId = 1;
     cursorDisplayCount = 0;
-    cursorClipped = false;
-    currentCursorHandle = 1;
+    cursorClipRect = null;
+    lastPublishedClipSignal = false;
+    currentCursorHandle = DEFAULT_CURSOR;
     lastForwardedCursorImageObj = null;
-    warpTimes = [];
+    recentreTimes = [];
+    lastWarpTarget = null;
     warpModeActive = false;
     if (warpReleaseTimer) { clearTimeout(warpReleaseTimer); warpReleaseTimer = null; }
     resetSystemCursorHandles();

@@ -6,7 +6,7 @@
  * renders with the already-selected state.
  */
 import { Logger, LogCategory } from "../../core/logger";
-import { drawTextPrefixOptions, fillTextWithMnemonic } from "../win32-text";
+import { drawTextPrefixOptions, fillTextWithMnemonic, parseMnemonicText } from "../win32-text";
 import { SystemResourceProvider } from "../../core/resources/system-resource-provider";
 import { Mem } from "../../core/memory/mem-accessor";
 import type { GDIContext } from './context';
@@ -291,82 +291,256 @@ export function textOut(gdi: GDIContext, hdc: number, x: number, y: number, text
     return true;
 }
 
-export function drawText(gdi: GDIContext, hdc: number, text: string, rect?: { left: number; top: number; right: number; bottom: number }, format?: number): boolean {
-    if (!text) return false;
-    const ctx = gdi.contexts.get(hdc);
+// DrawText/DrawTextEx format flags (winuser.h).
+const DT_CENTER = 0x00000001;
+const DT_RIGHT = 0x00000002;
+const DT_VCENTER = 0x00000004;
+const DT_BOTTOM = 0x00000008;
+const DT_WORDBREAK = 0x00000010;
+const DT_SINGLELINE = 0x00000020;
+const DT_EXPANDTABS = 0x00000040;
+const DT_TABSTOP = 0x00000080;
+const DT_NOCLIP = 0x00000100;
+const DT_EXTERNALLEADING = 0x00000200;
+const DT_CALCRECT = 0x00000400;
+const DT_PATH_ELLIPSIS = 0x00004000;
+const DT_END_ELLIPSIS = 0x00008000;
+const DT_WORD_ELLIPSIS = 0x00040000;
+
+export interface DrawTextLayout {
+    /** DrawText's return value: height of the laid-out text in logical units. */
+    height: number;
+    /** Width of the widest line — what DT_CALCRECT reports as right - left. */
+    width: number;
+}
+
+type TextCtx = OffscreenCanvasRenderingContext2D;
+
+/** One laid-out line: display text plus the index of its access-key character (-1 if none). */
+interface LaidOutLine {
+    text: string;
+    underline: number;
+}
+
+/** tmHeight (plus tmExternalLeading under DT_EXTERNALLEADING) of the DC's selected font —
+ *  the per-line advance GDI uses. Same ascent/descent source as GetTextMetrics so a guest
+ *  that sizes its own rects from tmHeight agrees with what we lay out. */
+function lineAdvance(ctx: TextCtx, fontSize: number, externalLeading: boolean): number {
+    let ascent = fontSize * 0.8;
+    let descent = fontSize * 0.2;
+    try {
+        const m = ctx.measureText('ABCgjpqy');
+        if (m.fontBoundingBoxAscent !== undefined) {
+            ascent = m.fontBoundingBoxAscent;
+            descent = m.fontBoundingBoxDescent;
+        }
+    } catch { /* keep the font-size estimate */ }
+    const height = Math.max(1, Math.ceil(ascent + descent));
+    return externalLeading ? height + Math.round(ascent * 0.15) : height;
+}
+
+/** Longest prefix of `s` (from `from`) that fits `maxWidth`, at least one character. */
+function fitPrefix(ctx: TextCtx, s: string, from: number, maxWidth: number): number {
+    let lo = 1;
+    let hi = s.length - from;
+    let fit = 1;
+    while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (ctx.measureText(s.slice(from, from + mid)).width <= maxWidth) {
+            fit = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return fit;
+}
+
+/** Greedy DT_WORDBREAK wrap: break at the last space that fits, and mid-word when a single
+ *  word is wider than the rect (GDI does the same). Segment starts are kept so the access-key
+ *  index can be mapped onto the segment that ends up holding it. */
+function wrapLine(ctx: TextCtx, line: string, maxWidth: number): Array<{ text: string; start: number }> {
+    if (!line || maxWidth <= 0 || ctx.measureText(line).width <= maxWidth) {
+        return [{ text: line, start: 0 }];
+    }
+    const segs: Array<{ text: string; start: number }> = [];
+    let start = 0;
+    while (start < line.length) {
+        let end = start + fitPrefix(ctx, line, start, maxWidth);
+        let next = end;
+        if (end < line.length) {
+            const brk = line.lastIndexOf(' ', end);
+            if (brk > start) {
+                end = brk;
+                next = brk + 1; // GDI swallows the break space
+            }
+        }
+        segs.push({ text: line.slice(start, end), start });
+        start = next > start ? next : start + 1;
+    }
+    return segs;
+}
+
+/** DT_*_ELLIPSIS: shorten an over-wide line to fit, marking the cut with "...". */
+function ellipsize(ctx: TextCtx, line: string, maxWidth: number, path: boolean): string {
+    if (maxWidth <= 0 || ctx.measureText(line).width <= maxWidth) return line;
+    const dots = '...';
+    const dotsWidth = ctx.measureText(dots).width;
+    const budget = maxWidth - dotsWidth;
+    if (budget <= 0) return dots;
+    if (!path) {
+        const keep = fitPrefix(ctx, line, 0, budget);
+        return line.slice(0, keep) + dots;
+    }
+    // DT_PATH_ELLIPSIS keeps the file name: cut from the middle of the path.
+    let head = Math.max(0, fitPrefix(ctx, line, 0, budget / 2));
+    let tail = line.length;
+    while (tail > head && ctx.measureText(line.slice(0, head) + dots + line.slice(tail - 1)).width <= maxWidth) tail--;
+    return line.slice(0, head) + dots + line.slice(tail);
+}
+
+/** Render one laid-out line through fillTextWithMnemonic, which owns the underline
+ *  geometry. The access-key index is re-encoded as a '&' prefix string so there is
+ *  no second copy of that logic. */
+function drawLaidOutLine(
+    ctx: TextCtx,
+    line: LaidOutLine,
+    x: number,
+    y: number,
+    opts: ReturnType<typeof drawTextPrefixOptions>,
+): void {
+    if (line.underline < 0 || !opts.drawUnderline) {
+        fillTextWithMnemonic(ctx, line.text, x, y, { ...opts, processPrefix: false });
+        return;
+    }
+    const esc = (s: string) => s.replace(/&/g, '&&');
+    const encoded = esc(line.text.slice(0, line.underline)) + '&' + esc(line.text.slice(line.underline));
+    fillTextWithMnemonic(ctx, encoded, x, y, opts);
+}
+
+/**
+ * DrawText/DrawTextEx layout + render. Unlike TextOut this owns LINE BREAKING: GDI breaks
+ * on CR/LF, wraps at word boundaries under DT_WORDBREAK, clips to the rectangle unless
+ * DT_NOCLIP, and under DT_CALCRECT measures without drawing. Ignoring DT_WORDBREAK renders
+ * a message as one over-wide line that the rect then clips at BOTH ends when it is centred,
+ * which is how a dialog loses the head and the tail of its own error text.
+ *
+ * Returns null only for an unusable HDC; the layout it returns is what the API must report
+ * (height, and the measured width DT_CALCRECT writes back into the caller's RECT).
+ */
+export function drawText(
+    gdi: GDIContext,
+    hdc: number,
+    text: string,
+    rect?: { left: number; top: number; right: number; bottom: number },
+    format?: number,
+): DrawTextLayout | null {
+    const ctx = gdi.contexts.get(hdc) as TextCtx | undefined;
     const state = gdi.hdcStates.get(hdc);
     if (!ctx || !state) {
         Logger.warn(LogCategory.GDI32, `drawText: Invalid HDC 0x${hdc.toString(16)} or state`);
-        return false;
+        return null;
     }
 
-    // Mark overlay as dirty if we're drawing to it
-    const isOverlay = ctx === gdi.overlayCtx;
-    if (isOverlay) {
-        gdi.setOverlayDirty(true);
-    }
+    const f = format ?? 0;
+    const singleLine = (f & DT_SINGLELINE) !== 0;
+    const calcOnly = (f & DT_CALCRECT) !== 0;
+    const wordBreak = (f & DT_WORDBREAK) !== 0 && !singleLine;
+    const prefixOptions = drawTextPrefixOptions(format);
 
-    // Lazy apply font and text color
+    // Font must be applied before anything is measured.
     if (state.appliedFont !== state.font) {
         ctx.font = state.font;
         state.appliedFont = state.font;
+    }
+
+    // --- Layout -----------------------------------------------------------------
+    let source = text ?? '';
+    if ((f & (DT_EXPANDTABS | DT_TABSTOP)) !== 0) {
+        // DT_TABSTOP puts the tab length in bits 15..8; default is 8 characters.
+        const tabLen = (f & DT_TABSTOP) !== 0 ? (((f >> 8) & 0xff) || 8) : 8;
+        source = source.replace(/\t/g, ' '.repeat(tabLen));
+    }
+    // GDI treats CR/LF as part of the line in DT_SINGLELINE mode; they render as nothing.
+    const rawLines = singleLine ? [source.replace(/[\r\n]/g, '')] : source.split(/\r\n|[\r\n]/);
+
+    const boxWidth = rect ? Math.max(0, rect.right - rect.left) : 0;
+    const advance = lineAdvance(ctx, state.fontSize, (f & DT_EXTERNALLEADING) !== 0);
+    const ellipsis = (f & (DT_END_ELLIPSIS | DT_WORD_ELLIPSIS | DT_PATH_ELLIPSIS)) !== 0;
+
+    const lines: LaidOutLine[] = [];
+    let maxWidth = 0;
+    for (const raw of rawLines) {
+        const parsed = parseMnemonicText(raw, prefixOptions.processPrefix ?? true);
+        const segs = wordBreak && rect
+            ? wrapLine(ctx, parsed.display, boxWidth)
+            : [{ text: parsed.display, start: 0 }];
+        for (const seg of segs) {
+            let display = seg.text;
+            if (ellipsis && rect && segs.length === 1) {
+                display = ellipsize(ctx, display, boxWidth, (f & DT_PATH_ELLIPSIS) !== 0);
+            }
+            const underline = parsed.underlineIndex >= seg.start && parsed.underlineIndex < seg.start + seg.text.length
+                ? parsed.underlineIndex - seg.start
+                : -1;
+            lines.push({ text: display, underline });
+            maxWidth = Math.max(maxWidth, ctx.measureText(display).width);
+        }
+    }
+    const layout: DrawTextLayout = { height: lines.length * advance, width: Math.ceil(maxWidth) };
+
+    // DT_CALCRECT measures only — no pixels, no dirty marking.
+    if (calcOnly) return layout;
+
+    const isOverlay = ctx === gdi.overlayCtx;
+    if (isOverlay) {
+        gdi.setOverlayDirty(true);
     }
     if (state.appliedFillStyle !== state.textColor) {
         ctx.fillStyle = state.textColor;
         state.appliedFillStyle = state.textColor;
     }
 
-    // Only draw background if OPAQUE mode (bkMode=2) and rect provided
-    // TRANSPARENT = 1, OPAQUE = 2
-    if (state.bkMode === 2 && rect) {
-        ctx.fillStyle = state.bkColor;
-        state.appliedFillStyle = state.bkColor;
-        ctx.fillRect(rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top);
-
-        // Restore text color
-        ctx.fillStyle = state.textColor;
-        state.appliedFillStyle = state.textColor;
+    // --- Render -----------------------------------------------------------------
+    // Horizontal origin per line; DT_VCENTER/DT_BOTTOM apply only to a single line
+    // (Win32 ignores them for wrapped text, which always starts at the top).
+    const originX = rect
+        ? ((f & DT_CENTER) !== 0 ? rect.left + boxWidth / 2 : (f & DT_RIGHT) !== 0 ? rect.right : rect.left)
+        : 0;
+    const align: CanvasTextAlign = (f & DT_CENTER) !== 0 ? 'center' : (f & DT_RIGHT) !== 0 ? 'right' : 'left';
+    let originY = rect ? rect.top : 0;
+    if (rect && singleLine) {
+        if ((f & DT_VCENTER) !== 0) originY = rect.top + (rect.bottom - rect.top - advance) / 2;
+        else if ((f & DT_BOTTOM) !== 0) originY = rect.bottom - advance;
     }
 
-    ctx.textBaseline = 'top';
-
-    // DrawText format flags
-    const DT_CENTER = 0x01;
-    const DT_RIGHT = 0x02;
-    const DT_VCENTER = 0x04;
-    const DT_BOTTOM = 0x08;
-    const prefixOptions = drawTextPrefixOptions(format);
-
-    let x = rect ? rect.left : 0;
-    let y = rect ? rect.top : 0;
-
-    // Handle horizontal alignment
-    if (rect && format !== undefined) {
-        if (format & DT_CENTER) {
-            ctx.textAlign = 'center';
-            x = rect.left + (rect.right - rect.left) / 2;
-        } else if (format & DT_RIGHT) {
-            ctx.textAlign = 'right';
-            x = rect.right;
-        } else {
-            ctx.textAlign = 'left';
+    const paint = (target: TextCtx): void => {
+        target.textBaseline = 'top';
+        target.textAlign = align;
+        // Clipped to the rect unless DT_NOCLIP — GDI never spills DrawText outside it.
+        const clipped = !!rect && (f & DT_NOCLIP) === 0;
+        if (clipped) {
+            target.save();
+            target.beginPath();
+            target.rect(rect!.left, rect!.top, boxWidth, Math.max(0, rect!.bottom - rect!.top));
+            target.clip();
         }
-
-        // Handle vertical alignment
-        if (format & DT_VCENTER) {
-            ctx.textBaseline = 'middle';
-            y = rect.top + (rect.bottom - rect.top) / 2;
-        } else if (format & DT_BOTTOM) {
-            ctx.textBaseline = 'bottom';
-            y = rect.bottom;
+        // OPAQUE background covers the whole rect, matching what a control's erase does.
+        if (state.bkMode === 2 && rect) {
+            target.fillStyle = state.bkColor;
+            target.fillRect(rect.left, rect.top, boxWidth, rect.bottom - rect.top);
+            target.fillStyle = state.textColor;
         }
-    }
+        for (let i = 0; i < lines.length; i++) {
+            drawLaidOutLine(target, lines[i], originX, originY + i * advance, prefixOptions);
+        }
+        if (clipped) target.restore();
+        target.textAlign = 'left';
+        target.textBaseline = 'top';
+    };
 
-    fillTextWithMnemonic(ctx, text, x, y, prefixOptions);
-
-    // Reset alignment
-    ctx.textAlign = 'left';
-    ctx.textBaseline = 'top';
+    paint(ctx);
+    if (state.bkMode === 2) state.appliedFillStyle = state.textColor;
 
     // Mark as dirty for ReleaseDC optimization
     gdi.markDirty(hdc);
@@ -377,42 +551,13 @@ export function drawText(gdi: GDIContext, hdc: number, text: string, rect?: { le
     // If this is a memory DC with linked bitmap, update the bitmap canvas
     const linkedBitmap = (ctx.canvas as any).__bitmapCanvas;
     if (linkedBitmap) {
-        const bitmapCtx = linkedBitmap.getContext('2d');
+        const bitmapCtx = linkedBitmap.getContext('2d') as TextCtx | null;
         if (bitmapCtx) {
-            // Apply same settings and draw
-            if (state.appliedFont !== state.font) {
-                bitmapCtx.font = state.font;
-            }
-            if (state.appliedFillStyle !== state.textColor) {
-                bitmapCtx.fillStyle = state.textColor;
-            }
-            bitmapCtx.textBaseline = 'top';
-            bitmapCtx.textAlign = 'left';
-
-            if (rect && format !== undefined) {
-                if (format & DT_CENTER) {
-                    bitmapCtx.textAlign = 'center';
-                } else if (format & DT_RIGHT) {
-                    bitmapCtx.textAlign = 'right';
-                }
-                if (format & DT_VCENTER) {
-                    bitmapCtx.textBaseline = 'middle';
-                } else if (format & DT_BOTTOM) {
-                    bitmapCtx.textBaseline = 'bottom';
-                }
-            }
-
-            if (state.bkMode === 2 && rect) {
-                bitmapCtx.fillStyle = state.bkColor;
-                bitmapCtx.fillRect(rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top);
-                bitmapCtx.fillStyle = state.textColor;
-            }
-
-            fillTextWithMnemonic(bitmapCtx, text, x, y, prefixOptions);
-            bitmapCtx.textAlign = 'left';
-            bitmapCtx.textBaseline = 'top';
+            bitmapCtx.font = state.font;
+            bitmapCtx.fillStyle = state.textColor;
+            paint(bitmapCtx);
         }
     }
 
-    return true;
+    return layout;
 }

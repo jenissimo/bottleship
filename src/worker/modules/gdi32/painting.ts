@@ -9,6 +9,7 @@ import { profiler } from '../../core/profiler';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { SystemResourceProvider } from '../../core/resources/system-resource-provider';
 import { toPlainGuestMemory } from '../../core/memory/guest-memory';
+import { LOGPEN_OFFSETS, LOGPEN_SIZE } from './gdi-objects';
 // Track GetPixel HDC usage for profiling
 const getPixelHdcStats = new Map<number, { count: number; maxX: number; maxY: number }>();
 
@@ -20,6 +21,9 @@ const pixelFormatByHdc = new Map<number, number>();
 export function getLastGetDIBitsBuffer(): { address: number; width: number; height: number } | null {
     return lastGetDIBitsBuffer;
 }
+
+/** Allocation guard for a DIB claimed by guest-supplied header fields (~64 Mpx). */
+const MAX_DIB_PIXELS = 1 << 26;
 
 /** Optional scan-line window for SetDIBitsToDevice / StretchDIBits partial DIB copies. */
 interface DibScanRange {
@@ -154,7 +158,15 @@ function dibToCanvas(
     const absHeight = isTopDown ? -biHeight : biHeight;
     const absWidth = biWidth > 0 ? biWidth : -biWidth;
 
-    if (absWidth <= 0 || absHeight <= 0 || absWidth > 4096 || absHeight > 4096) {
+    // Only reject what cannot be a DIB. A DIB is not bounded by any screen dimension —
+    // a tall single-column strip atlas (button tiles stacked vertically) is perfectly
+    // legal, and the scanline window drawn below is clamped to `scan` and bounds-checked
+    // against guest memory, so the sole remaining hazard is an absurd allocation. That
+    // is what the pixel-count cap covers; a resolution-shaped cap instead silently drops
+    // a legal blit, and the guest sees a black tile it drew nothing into.
+    if (absWidth <= 0 || absHeight <= 0
+        || absWidth > 0xFFFF || absHeight > 0xFFFF
+        || absWidth * absHeight > MAX_DIB_PIXELS) {
         Logger.warn(LogCategory.GDI32, `dibToCanvas: Invalid DIB dimensions ${absWidth}x${absHeight}`);
         return false;
     }
@@ -717,9 +729,17 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         const bottom = args[4] | 0;
 
         Logger.verbose(LogCategory.GDI32, `Rectangle: (${left},${top}) - (${right},${bottom})`);
-        // Rectangle draws border with PEN and fills with BRUSH.
-        // Simplified: Fill with current brush.
-        return System.getInstance().gdiContext.fillRect(hdc, left, top, right, bottom) ? 1 : 0;
+        // Border with the PEN, interior with the BRUSH. GDI's right/bottom are exclusive:
+        // the outline runs along left..right-1 / top..bottom-1 and the brush fills what is
+        // left inside it, so filling the whole rect and then stroking the outline on top
+        // gives the identical footprint for a 1px pen (dibdrv_Rectangle).
+        const gdi = System.getInstance().gdiContext;
+        const filled = gdi.fillRect(hdc, left, top, right, bottom);
+        if (right - left >= 1 && bottom - top >= 1) {
+            const r = right - 1, b = bottom - 1;
+            gdi.strokePolyline(hdc, [left, top, r, top, r, b, left, b], true);
+        }
+        return filled ? 1 : 0;
     };
 
     exports['TextOutA'] = (ctx, mem, args): number => {
@@ -2217,6 +2237,86 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         view.setInt32(lpPoint, pos.x, true);
         view.setInt32(lpPoint + 4, pos.y, true);
         return 1;
+    };
+
+    // HPEN CreatePen(int iStyle, int cWidth, COLORREF color)
+    exports['CreatePen'] = (ctx, mem, args): number => {
+        const style = args[0] | 0;
+        const width = args[1] | 0;
+        const color = args[2] >>> 0;
+        return System.getInstance().gdiContext.createPen(style, width, color) >>> 0;
+    };
+
+    // HPEN CreatePenIndirect(const LOGPEN *plpen)
+    exports['CreatePenIndirect'] = (ctx, mem, args): number => {
+        const plpen = args[0] >>> 0;
+        if (!plpen || plpen + LOGPEN_SIZE > mem.length) return 0;
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        return System.getInstance().gdiContext.createPen(
+            view.getInt32(plpen + LOGPEN_OFFSETS.lopnStyle, true),
+            view.getInt32(plpen + LOGPEN_OFFSETS.lopnWidth_x, true),
+            view.getUint32(plpen + LOGPEN_OFFSETS.lopnColor, true),
+        ) >>> 0;
+    };
+
+    // BOOL LineTo(HDC hdc, int x, int y)
+    exports['LineTo'] = (ctx, mem, args): number => {
+        const hdc = args[0] >>> 0;
+        return System.getInstance().gdiContext.lineTo(hdc, args[1] | 0, args[2] | 0) ? 1 : 0;
+    };
+
+    /** Read cPoints POINTs (2 signed LONGs each) into a flat x,y,... list. */
+    const readPoints = (mem: Uint8Array, apt: number, cPoints: number): number[] | null => {
+        if (!apt || cPoints <= 0 || apt + cPoints * 8 > mem.length) return null;
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const pts = new Array<number>(cPoints * 2);
+        for (let i = 0; i < cPoints; i++) {
+            pts[i * 2] = view.getInt32(apt + i * 8, true);
+            pts[i * 2 + 1] = view.getInt32(apt + i * 8 + 4, true);
+        }
+        return pts;
+    };
+
+    // BOOL Polyline(HDC hdc, const POINT *apt, int cpt) — does NOT use or move the
+    // current position; PolylineTo starts at it and leaves it at the last point.
+    exports['Polyline'] = (ctx, mem, args): number => {
+        const hdc = args[0] >>> 0;
+        const pts = readPoints(mem, args[1] >>> 0, args[2] | 0);
+        if (!pts || pts.length < 4) return 0;
+        return System.getInstance().gdiContext.strokePolyline(hdc, pts) ? 1 : 0;
+    };
+
+    exports['PolylineTo'] = (ctx, mem, args): number => {
+        const hdc = args[0] >>> 0;
+        const gdi = System.getInstance().gdiContext;
+        const pts = readPoints(mem, args[1] >>> 0, args[2] | 0);
+        if (!pts || pts.length < 2) return 0;
+        const from = gdi.getCurrentPosition(hdc);
+        const ok = gdi.strokePolyline(hdc, [from.x, from.y, ...pts]);
+        gdi.setCurrentPosition(hdc, pts[pts.length - 2], pts[pts.length - 1]);
+        return ok ? 1 : 0;
+    };
+
+    // BOOL PolyPolyline(HDC hdc, const POINT *apt, const DWORD *asz, DWORD csz) —
+    // csz independent polylines laid end to end in apt.
+    exports['PolyPolyline'] = (ctx, mem, args): number => {
+        const hdc = args[0] >>> 0;
+        const apt = args[1] >>> 0;
+        const asz = args[2] >>> 0;
+        const csz = args[3] >>> 0;
+        if (!apt || !asz || !csz || asz + csz * 4 > mem.length) return 0;
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const gdi = System.getInstance().gdiContext;
+        let offset = apt;
+        let ok = true;
+        for (let i = 0; i < csz; i++) {
+            const count = view.getUint32(asz + i * 4, true);
+            const pts = readPoints(mem, offset, count);
+            if (!pts) return 0;
+            if (pts.length >= 4) ok = gdi.strokePolyline(hdc, pts) && ok;
+            offset += count * 8;
+        }
+        return ok ? 1 : 0;
     };
 
     registerPaintingDcStateExports(exports);

@@ -28,7 +28,8 @@ import {
     createFont as createFontImpl,
     getFontCss as getFontCssImpl,
 } from './gdi-objects';
-import { textOut as textOutImpl, drawText as drawTextImpl } from './gdi-text';
+import { strokePolyline as strokePolylineImpl, lineTo as lineToImpl } from './gdi-lines';
+import { textOut as textOutImpl, drawText as drawTextImpl, type DrawTextLayout } from './gdi-text';
 import { bitBlt as bitBltImpl, stretchBlt as stretchBltImpl } from './gdi-blit';
 
 export interface GDIObject {
@@ -37,6 +38,11 @@ export interface GDIObject {
     data: any; // Context-dependent data (e.g. CSS color string or font string)
     escapement?: number; // For FONT: rotation angle in tenths of degrees
     fontSize?: number; // For FONT: cached font size to avoid regex parsing
+    // For PEN: LOGPEN fields. `data` stays the CSS colour (SelectObject copies it into
+    // strokeStyle); the rasteriser needs the style/width the colour cannot carry.
+    penStyle?: number;
+    penWidth?: number;
+    penColor?: number;
     // For FONT: raw LOGFONT fields preserved so GetObjectA/W can round-trip them.
     lfHeight?: number;
     lfWidth?: number;
@@ -85,6 +91,9 @@ export class GDIContext {
         dirtyRect: { x1: number, y1: number, x2: number, y2: number } | null; // Bounding box of changed area for partial GPU uploads
         /** When set, this memory DC backs an HWND client area; flush to overlay on EndPaint/ReleaseDC. */
         windowBlit?: { absX: number; absY: number; width: number; height: number };
+        /** HWND this DC was obtained for (GetDC/GetWindowDC/GetDCEx/BeginPaint). Absent on a
+         *  memory/compatible DC, which is exactly the NULL that WindowFromDC must report. */
+        hwnd?: number;
         /** True until guest draws on this DC (CreateCompatibleDC + untouched blit source). */
         pristine?: boolean;
         /** True when this surface DC's canvas was seeded from the surface's CPU pixels at GetDC
@@ -165,15 +174,146 @@ export class GDIContext {
         return this.screenCanvas;
     }
 
+    /**
+     * The overlay plane as compositors must SEE it — the live canvas, except while a
+     * multi-step guest paint sequence is mid-flight, when it is the last complete frame
+     * (see beginOverlayPublish).
+     */
     getOverlayCanvas(): OffscreenCanvas | null {
-        return this.overlayCanvas;
+        return this.overlayPublishHeld() ? this.overlayPublished : this.overlayCanvas;
+    }
+
+    // --- Atomic publication of a guest paint sequence -------------------------------
+    //
+    // A Win32 repaint is a SEQUENCE: erase/background, then each child control on top.
+    // On real hardware the whole sequence lands between two scanouts, so the display
+    // never shows the half of it where the background has covered the controls and they
+    // have not been redrawn yet. Here the sequence is driven by guest callbacks
+    // (WM_DRAWITEM / WM_PAINT per control), so it spans many JS turns and milliseconds of
+    // guest execution, and every compositor — the rAF GDI loop and each presenter — is
+    // free to sample the plane in the middle of it. That is a visible one-frame flash of
+    // controls disappearing, at whatever rate the app repaints.
+    //
+    // So the plane is double-buffered ACROSS a sequence: opening one snapshots the live
+    // plane (which, by induction, is the last COMPLETE state) into a front buffer that
+    // consumers read until the sequence closes. One canvas copy per sequence, not per
+    // frame, and no copy at all when nothing is painting.
+    //
+    // The dirty bookkeeping has to follow the buffer the consumer actually reads, or the
+    // screen starves: repaints arrive back-to-back (hover timers, animated menus), so a
+    // "sequence in flight" is very nearly always true, and reporting the plane clean for
+    // its duration means the compositor never gets a frame to publish. Hence two flags —
+    // `overlayDirty` for the live plane, `overlayFrontDirty` for the front buffer — with
+    // the front inheriting the live flag at each snapshot.
+    //
+    // The DEADLINE is not optional: a guest that never completes a chain (crash, lost
+    // callback) must not be able to freeze the plane, so the hold fails OPEN.
+    private overlayPublished: OffscreenCanvas | null = null;
+    private overlayPublishedCtx: OffscreenCanvasRenderingContext2D | null = null;
+    private overlayPublishDepth = 0;
+    private overlayPublishDeadline = 0;
+    private overlayFrontDirty = false;
+    private overlayPublishCounters = { begins: 0, ends: 0, expiries: 0 };
+    private static readonly OVERLAY_PUBLISH_MAX_MS = 250;
+
+    /**
+     * Fail open. A sequence that never closed must not be able to freeze the plane, so
+     * the hold is abandoned WHOLE — depth included, so the next sequence snapshots
+     * afresh instead of nesting under a corpse; endOverlayPublish() on the lost
+     * sequence then no-ops.
+     */
+    private abandonOverlayPublish(): void {
+        this.overlayPublishCounters.expiries++;
+        Logger.warn(LogCategory.GDI32,
+            `overlay publish barrier expired after ${GDIContext.OVERLAY_PUBLISH_MAX_MS}ms ` +
+            `(depth=${this.overlayPublishDepth}) — a guest paint sequence never completed`);
+        this.overlayPublishDepth = 0;
+        this.overlayPublished = null;
+        this.overlayDirty = this.overlayDirty || this.overlayFrontDirty;
+        this.overlayFrontDirty = false;
+    }
+
+    private overlayPublishHeld(): boolean {
+        if (this.overlayPublishDepth <= 0) return false;
+        if (performance.now() > this.overlayPublishDeadline) {
+            this.abandonOverlayPublish();
+            return false;
+        }
+        // depth>0 with no front buffer (opened before setCanvas) withholds nothing, but
+        // still has to age out through the deadline above or the depth leaks forever.
+        return !!this.overlayPublished;
+    }
+
+    /**
+     * Bracket internals, for diagnostics. Deliberately does NOT evaluate the deadline:
+     * an instrument that expires the thing it measures can never show the deadline
+     * firing, and "is the fail-open alive?" is exactly the question asked here.
+     */
+    overlayPublishStats(): {
+        depth: number; holding: boolean; msToDeadline: number;
+        begins: number; ends: number; expiries: number;
+        frontDirty: boolean; liveDirty: boolean;
+    } {
+        return {
+            depth: this.overlayPublishDepth,
+            holding: this.overlayPublishDepth > 0 && !!this.overlayPublished,
+            msToDeadline: this.overlayPublishDepth > 0
+                ? Math.round(this.overlayPublishDeadline - performance.now()) : 0,
+            ...this.overlayPublishCounters,
+            frontDirty: this.overlayFrontDirty,
+            liveDirty: this.overlayDirty,
+        };
+    }
+
+    /** Open a paint sequence whose intermediate states must not reach the screen. */
+    beginOverlayPublish(): void {
+        // Age out a stale hold BEFORE nesting under it: otherwise one leaked bracket
+        // holds every later sequence hostage to a snapshot nobody will release, and the
+        // deadline — only ever renewed on the 0→1 transition — never comes up again.
+        this.overlayPublishHeld();
+        this.overlayPublishCounters.begins++;
+        if (this.overlayPublishDepth++ > 0) return;
+        this.overlayPublishDeadline = performance.now() + GDIContext.OVERLAY_PUBLISH_MAX_MS;
+        if (!this.overlayCanvas) return;
+        const { width, height } = this.overlayCanvas;
+        if (!this.overlayPublished || this.overlayPublished.width !== width || this.overlayPublished.height !== height) {
+            this.overlayPublished = new OffscreenCanvas(width, height);
+            this.overlayPublishedCtx = this.overlayPublished.getContext('2d', { alpha: true });
+        }
+        if (!this.overlayPublishedCtx) { this.overlayPublished = null; return; }
+        this.overlayPublishedCtx.clearRect(0, 0, width, height);
+        this.overlayPublishedCtx.drawImage(this.overlayCanvas, 0, 0);
+        // The snapshot carries whatever the live plane owed a compositor.
+        this.overlayFrontDirty = this.overlayFrontDirty || this.overlayDirty;
+        this.overlayDirty = false;
+    }
+
+    /** Close it — the sequence's pixels become visible in one step. */
+    endOverlayPublish(): void {
+        if (this.overlayPublishDepth === 0) return;
+        this.overlayPublishCounters.ends++;
+        if (--this.overlayPublishDepth > 0) return;
+        this.overlayPublished = null;
+        // Anything the sequence painted already set overlayDirty on the live plane, which
+        // is what consumers read again from here.
+        this.overlayDirty = this.overlayDirty || this.overlayFrontDirty;
+        this.overlayFrontDirty = false;
+    }
+
+    /** True while a paint sequence is being withheld (diagnostics). */
+    isOverlayPublishHeld(): boolean {
+        return this.overlayPublishHeld();
     }
 
     isOverlayDirty(): boolean {
-        return this.overlayDirty;
+        return this.overlayPublishHeld() ? this.overlayFrontDirty : this.overlayDirty;
     }
 
     clearOverlayDirty(): void {
+        if (this.overlayPublishHeld()) {
+            this.overlayFrontDirty = false;
+            return;
+        }
         if (this.overlayDirty) {
             Logger.verbose(LogCategory.GDI32, `GDIContext.clearOverlayDirty: Clearing overlay dirty flag`);
         }
@@ -243,6 +383,89 @@ export class GDIContext {
                 options?.excludeRepairHwnd ?? 0,
             );
         }
+    }
+
+    /**
+     * The last client image each guest-painted window flushed, kept so a rect of it can be
+     * put BACK later.
+     *
+     * A control we stamp onto the flat overlay destroys whatever the guest had drawn under
+     * it, and nothing can re-derive those pixels: the overlay repair only re-stamps OS
+     * controls, and the guest repaints on its own schedule (measured: it does not come).
+     * Snapshotting the window DC at flush time — before any control is drawn over it — makes
+     * the restore EXACT, where sampling a neighbouring pixel was a guess that reproduced a
+     * flat backdrop and flooded a textured one with the wrong colour.
+     */
+    private windowClientBacking = new Map<number, {
+        canvas: OffscreenCanvas; ctx: OffscreenCanvasRenderingContext2D;
+        x: number; y: number; w: number; h: number;
+    }>();
+
+    private retainWindowClientBacking(
+        hwnd: number, src: OffscreenCanvas, x: number, y: number, w: number, h: number,
+    ): void {
+        if (w <= 0 || h <= 0) return;
+        let entry = this.windowClientBacking.get(hwnd);
+        if (!entry || entry.w !== w || entry.h !== h) {
+            const canvas = new OffscreenCanvas(w, h);
+            const ctx = canvas.getContext("2d") as OffscreenCanvasRenderingContext2D | null;
+            if (!ctx) return;
+            entry = { canvas, ctx, x, y, w, h };
+            this.windowClientBacking.set(hwnd, entry);
+        }
+        entry.x = x;
+        entry.y = y;
+        entry.ctx.clearRect(0, 0, w, h);
+        try {
+            entry.ctx.drawImage(src, 0, 0, w, h, 0, 0, w, h);
+        } catch {
+            this.windowClientBacking.delete(hwnd);
+        }
+    }
+
+    /** Put back a screen-space rect of `hwnd`'s retained client. False if not covered. */
+    restoreWindowClientRect(hwnd: number, x: number, y: number, w: number, h: number): boolean {
+        const entry = this.windowClientBacking.get(hwnd);
+        if (!entry || !this.overlayCtx || w <= 0 || h <= 0) return false;
+        const sx = Math.floor(x - entry.x);
+        const sy = Math.floor(y - entry.y);
+        const sw = Math.ceil(w);
+        const sh = Math.ceil(h);
+        if (sx < 0 || sy < 0 || sx + sw > entry.w || sy + sh > entry.h) return false;
+        this.overlayCtx.clearRect(x, y, sw, sh);
+        try {
+            this.overlayCtx.drawImage(entry.canvas, sx, sy, sw, sh, x, y, sw, sh);
+        } catch {
+            return false;
+        }
+        this.overlayDirty = true;
+        return true;
+    }
+
+    /**
+     * Seed a window memory DC from `ownerHwnd`'s retained client image (the guest's own
+     * backdrop) for the screen rect the DC blits to. False when that image does not cover
+     * the rect, so the caller can fall back to seeding from the overlay.
+     */
+    seedMemoryDCFromClientBacking(hdc: number, ownerHwnd: number): boolean {
+        const state = this.hdcStates.get(hdc);
+        const ctx = this.contexts.get(hdc);
+        const entry = this.windowClientBacking.get(ownerHwnd);
+        if (!state?.windowBlit || !ctx || !entry) return false;
+        const { absX, absY, width, height } = state.windowBlit;
+        const sx = Math.floor(absX - entry.x);
+        const sy = Math.floor(absY - entry.y);
+        if (sx < 0 || sy < 0 || sx + width > entry.w || sy + height > entry.h) return false;
+        try {
+            ctx.drawImage(entry.canvas, sx, sy, width, height, 0, 0, width, height);
+        } catch {
+            return false;
+        }
+        return true;
+    }
+
+    dropWindowClientBacking(hwnd: number): void {
+        this.windowClientBacking.delete(hwnd);
     }
 
     /** Scratch RGBA buffer reused by drawBgraToOverlayRect. */
@@ -594,8 +817,19 @@ export class GDIContext {
         }
     }
 
-    /** Copy a window memory DC to the GDI overlay at its screen position. */
-    flushWindowMemoryDCToOverlay(hdc: number): boolean {
+    /**
+     * Copy a window memory DC to the GDI overlay at its screen position.
+     *
+     * `excludeRects` (screen space) are punched out of the blit: they are the child
+     * WINDOWS whose pixels this window does not own (see getChildWindowExclusions).
+     * The caller supplies them because window parentage lives in user32, not here.
+     */
+    flushWindowMemoryDCToOverlay(
+        hdc: number,
+        excludeRects?: readonly { x: number; y: number; w: number; h: number }[],
+        retainForHwnd?: number,
+        clipRect?: { x: number; y: number; w: number; h: number } | null,
+    ): boolean {
         const state = this.hdcStates.get(hdc);
         const ctx = this.contexts.get(hdc);
         if (!state?.windowBlit || !ctx || !this.overlayCtx) return false;
@@ -615,7 +849,32 @@ export class GDIContext {
         const canvas = ctx.canvas;
         if (!canvas) return false;
 
+        // A WS_CHILD's pixels are confined to its ancestors' client areas — Win32 clips them
+        // there, and a flat overlay must do it explicitly or a child window that extends past
+        // its parent (a page template larger than the placeholder hosting it) paints straight
+        // over the desktop outside the dialog.
+        const clipped = clipRect && clipRect.w > 0 && clipRect.h > 0;
+        // even-odd over [blit rect, ...child rects] leaves the child rects as holes.
+        const holes = excludeRects && excludeRects.length > 0;
+        if (clipped || holes) this.overlayCtx.save();
+        if (clipped) {
+            this.overlayCtx.beginPath();
+            this.overlayCtx.rect(clipRect!.x, clipRect!.y, clipRect!.w, clipRect!.h);
+            this.overlayCtx.clip();
+        }
+        if (holes) {
+            const path = new Path2D();
+            path.rect(absX, absY, width, height);
+            for (const r of excludeRects!) path.rect(r.x, r.y, r.w, r.h);
+            this.overlayCtx.clip(path, 'evenodd');
+        }
         this.overlayCtx.drawImage(canvas, 0, 0, width, height, absX, absY, width, height);
+        if (clipped || holes) this.overlayCtx.restore();
+        // Snapshot from the DC, not the overlay: this is the guest's client alone, before
+        // any control is stamped over it (see windowClientBacking).
+        if (retainForHwnd !== undefined) {
+            this.retainWindowClientBacking(retainForHwnd, canvas, absX, absY, width, height);
+        }
         this.setOverlayDirty(true);
         state.dirty = false;
         state.dirtyRect = null;
@@ -724,6 +983,27 @@ export class GDIContext {
     /** True if this DC is a window/client memory DC seeded from the overlay (attachWindowBlit). */
     hasWindowBlit(hdc: number): boolean {
         return !!this.hdcStates.get(hdc)?.windowBlit;
+    }
+
+    /** Drop the memory DC (and version counter) SelectObject cached for this bitmap. The cache
+     *  is keyed by HBITMAP and never expires on its own, so DeleteObject must retire the entry
+     *  or every deleted bitmap keeps a canvas alive for the life of the process. */
+    purgeBitmapDC(hbitmap: number): void {
+        const hdc = this.bitmapDCCache.get(hbitmap);
+        this.bitmapDCCache.delete(hbitmap);
+        this.bitmapVersions.delete(hbitmap);
+        if (hdc !== undefined && this.contexts.has(hdc)) this.deleteDC(hdc);
+    }
+
+    /** Bind a DC to the window it was obtained for — what WindowFromDC reports back. */
+    setDCWindow(hdc: number, hwnd: number): void {
+        const state = this.hdcStates.get(hdc);
+        if (state) state.hwnd = hwnd >>> 0;
+    }
+
+    /** Owning HWND of a window DC, 0 for a memory/compatible/info DC. */
+    getDCWindow(hdc: number): number {
+        return this.hdcStates.get(hdc)?.hwnd ?? 0;
     }
 
     createCompatibleDC(hdc: number): number {
@@ -1326,8 +1606,17 @@ export class GDIContext {
         return 0;
     }
 
-    createPen(width: number, color: number): number {
-        return createPenImpl(this, width, color);
+    createPen(style: number, width: number, color: number): number {
+        return createPenImpl(this, style, width, color);
+    }
+
+    /** Stroke a flat x,y,... point list with hdc's pen (LineTo/Polyline/Rectangle border). */
+    strokePolyline(hdc: number, pts: readonly number[], closed = false): boolean {
+        return strokePolylineImpl(this, hdc, pts, closed);
+    }
+
+    lineTo(hdc: number, x: number, y: number): boolean {
+        return lineToImpl(this, hdc, x, y);
     }
 
     /** Face name of the font selected into hdc. */
@@ -1478,7 +1767,7 @@ export class GDIContext {
         return textOutImpl(this, hdc, x, y, text);
     }
 
-    drawText(hdc: number, text: string, rect?: { left: number; top: number; right: number; bottom: number }, format?: number): boolean {
+    drawText(hdc: number, text: string, rect?: { left: number; top: number; right: number; bottom: number }, format?: number): DrawTextLayout | null {
         return drawTextImpl(this, hdc, text, rect, format);
     }
 

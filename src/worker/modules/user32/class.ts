@@ -20,6 +20,22 @@ const windowClassesByName: Map<string, number> = new Map();
 let nextClassId = 1;
 
 /**
+ * Classes the APP registered itself (RegisterClass*), as opposed to the OS classes we
+ * materialize (Button/Static/#32770) and the comctl32 classes we implement in JS.
+ *
+ * A window of an app class has no default appearance at all: Windows paints it solely by
+ * running the app's own wndProc, so if we never deliver WM_PAINT to it, it is invisible
+ * forever — no chrome, no fallback. That is the distinction our paint paths need, and it
+ * is not derivable from the class NAME.
+ */
+const appRegisteredClasses = new Set<string>();
+
+/** True if `className` was registered by the guest, not materialized by us. */
+export function isAppRegisteredClass(className: string | undefined): boolean {
+    return !!className && appRegisteredClasses.has(className.toLowerCase());
+}
+
+/**
  * Bundle-switch reset: app classes carry WNDPROC pointers into the old process
  * image, and the builtin materialization cache holds cursor handles / the
  * DefWindowProc thunk address from the old layout — all stale after an
@@ -28,6 +44,7 @@ let nextClassId = 1;
 export function resetUser32Classes(): void {
     windowClasses.clear();
     windowClassesByName.clear();
+    appRegisteredClasses.clear();
     nextClassId = 1;
     builtinClassInfoCache.clear();
     resetDefWindowProcCache();
@@ -41,6 +58,9 @@ function registerClassInternal(className: string, classInfo: any): number {
     const classId = nextClassId++;
     windowClasses.set(classId, classInfo);
     windowClassesByName.set(className.toLowerCase(), classId);
+    // Everything routed here that is not a builtin materialization came from the app's
+    // own RegisterClass* — see appRegisteredClasses.
+    if (classInfo?.appRegistered) appRegisteredClasses.add(className.toLowerCase());
 
     // Also register in system WindowManager
     System.getInstance().windowManager.registerClass({
@@ -118,7 +138,8 @@ export function createClassExports(): Record<string, ThunkImplementation> {
                 hIcon,
                 hCursor,
                 hbrBackground,
-                lpszMenuName
+                lpszMenuName,
+                appRegistered: true,
             };
 
             const classId = registerClassInternal(className, classInfo);
@@ -164,7 +185,8 @@ export function createClassExports(): Record<string, ThunkImplementation> {
                 hIcon,
                 hCursor,
                 hbrBackground,
-                lpszMenuName
+                lpszMenuName,
+                appRegistered: true,
             };
 
             const classId = registerClassInternal(className, classInfo);
@@ -240,7 +262,8 @@ export function createClassExports(): Record<string, ThunkImplementation> {
                 hIcon,
                 hCursor,
                 hbrBackground,
-                lpszMenuName
+                lpszMenuName,
+                appRegistered: true,
             };
 
             const classId = registerClassInternal(className, classInfo);
@@ -316,7 +339,8 @@ export function createClassExports(): Record<string, ThunkImplementation> {
                 hIcon,
                 hCursor,
                 hbrBackground,
-                lpszMenuName
+                lpszMenuName,
+                appRegistered: true,
             };
 
             const classId = registerClassInternal(className, classInfo);

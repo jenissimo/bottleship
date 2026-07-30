@@ -14,12 +14,13 @@ import { getWindowByHandle } from './window';
 import { hypercallDataManager } from '../../core/cpu/hypercall-data';
 import { installHook, uninstallHook, getHooksOfType, getNextHookInChain, hasHooksOfType, pushActiveHook, popActiveHook, currentActiveHook, WH_KEYBOARD, WH_GETMESSAGE, WH_CBT, HC_ACTION, HC_NOREMOVE } from './hooks';
 import { isSentinelWndProc, handleSystemControlMessage, isContentChangingMessage, repaintDialogAfterContentChange } from './dialog';
+import { eraseControlOverlayRect } from './dialog-paint';
 import { handleAnimateMessage } from './animate-control';
 import { windows, buttonCheckStates, registerWindowTimerKiller, finalizeWindowDestroy, getAbsoluteWindowPosition } from './shared-state';
 import { repaintChildControls, isButtonSystemControl, hitTestSystemControlAtClient } from './controls';
 import { handleSystemControlMouseAtScreen, handleSystemControlWheel } from './control-interaction';
 import { encodeAnsi } from '../codepage-utils';
-import { PAINT_TRACE_ENABLED, logPaintMsgDelivered, logPaintPendingBlocked, logPaintTrace } from './paint-trace';
+import { paintTraceEnabled, logPaintMsgDelivered, logPaintPendingBlocked, logPaintTrace } from './paint-trace';
 import { isValidGuestEip } from '../../core/scheduler/scheduler-context';
 
 const WM_TIMER = 0x0113;
@@ -576,7 +577,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         const msg = system.windowManager.peekMessage(true, wMsgFilterMin, wMsgFilterMax, currentThreadId);
         if (msg) {
             const retVal = msg.message === WM_QUIT ? 0 : 1;
-            if (PAINT_TRACE_ENABLED) logPaintMsgDelivered('GetMessageW(sync)', msg.hwnd, msg.message, {
+            if (paintTraceEnabled) logPaintMsgDelivered('GetMessageW(sync)', msg.hwnd, msg.message, {
                 ret: retVal,
                 filterMin: wMsgFilterMin,
                 filterMax: wMsgFilterMax,
@@ -684,7 +685,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
                     `${keyHookPending ? 'WH_KEYBOARD' : 'WH_GETMESSAGE'} hook dispatch`);
             }
             const retVal = waitMsg.message === WM_QUIT ? 0 : 1;
-            if (PAINT_TRACE_ENABLED) logPaintMsgDelivered('GetMessageW(async)', waitMsg.hwnd, waitMsg.message, {
+            if (paintTraceEnabled) logPaintMsgDelivered('GetMessageW(async)', waitMsg.hwnd, waitMsg.message, {
                 ret: retVal,
                 filterMin: wMsgFilterMin,
                 filterMax: wMsgFilterMax,
@@ -778,7 +779,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         }
 
         if (!msg) {
-            if (PAINT_TRACE_ENABLED) logPaintPendingBlocked('PeekMessageW', wMsgFilterMin, wMsgFilterMax, wRemoveMsg !== 0);
+            if (paintTraceEnabled) logPaintPendingBlocked('PeekMessageW', wMsgFilterMin, wMsgFilterMax, wRemoveMsg !== 0);
             // Queue empty — synthesize WM_QUIT if per-thread flag is set
             if (isQuitInFilterRange(wMsgFilterMin, wMsgFilterMax)) {
                 const quitState = system.scheduler.getQuitState(callerThreadId);
@@ -797,7 +798,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         if (msg.message === WM_TIMER) {
             timerDiag.delivered++;
         }
-        if (PAINT_TRACE_ENABLED) logPaintMsgDelivered('PeekMessageW', msg.hwnd, msg.message, {
+        if (paintTraceEnabled) logPaintMsgDelivered('PeekMessageW', msg.hwnd, msg.message, {
             remove: wRemoveMsg,
             filterMin: wMsgFilterMin,
             filterMax: wMsgFilterMax,
@@ -846,7 +847,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
             const time = view.getUint32(lpMsg + 16, true);
 
             Logger.log(LogCategory.USER32, `DispatchMessageW: msg=0x${message.toString(16)} hwnd=0x${hwnd.toString(16)} wParam=0x${wParam.toString(16)} lParam=0x${lParam.toString(16)}`);
-            if (PAINT_TRACE_ENABLED && message === WM_PAINT) {
+            if (paintTraceEnabled && message === WM_PAINT) {
                 logPaintTrace('DispatchMessageW', `enter hwnd=0x${hwnd.toString(16)} thread=${System.getInstance().scheduler.getCurrentThreadId()}`);
             }
             if (message === WM_TIMER) {
@@ -1299,6 +1300,13 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
                 // pump their own messages and SendMessage TBM_SETPOS / LB_ADDSTRING /
                 // WM_SETTEXT etc. at runtime — e.g. TS dialog init from its dlgProc).
                 if (isContentChangingMessage(msg)) {
+                    // Drop the control's OLD pixels first. On a guest-painted parent the
+                    // repaint below can only STAMP the control — it cannot restore what was
+                    // under it — so a changed caption renders on top of the previous one and
+                    // both stay readable (a front-end that reuses one Static across pages
+                    // ends up with two overlaid sentences). Erased AFTER the message applied,
+                    // so the repair this triggers re-stamps the NEW text, not the old.
+                    eraseControlOverlayRect(targetWindow);
                     repaintDialogAfterContentChange(targetWindow.parent ?? hWnd);
                 }
                 return result;
@@ -1313,6 +1321,13 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
                         // Sync tab title for top-level windows (matches SetWindowTextA/W behavior)
                         if (!targetWindow.parent) {
                             System.getInstance().notifyWindowTitle(targetWindow.title, 'WM_SETTEXT');
+                        } else {
+                            // A caption change invalidates the window on Win32. This branch also
+                            // serves SUBCLASSED system controls (UE1 wraps its statics), whose
+                            // pixels we still stamp — so without erasing first, the new caption
+                            // lands on top of the old one and both stay readable.
+                            eraseControlOverlayRect(targetWindow);
+                            repaintDialogAfterContentChange(targetWindow.parent);
                         }
                     }
                     return 1;
@@ -1609,7 +1624,7 @@ export function registerFastPathMessageFunctions(dispatcher: any): void {
         }
 
         if (!msg) {
-            if (PAINT_TRACE_ENABLED) logPaintPendingBlocked('PeekMessageW(fastpath)', wMsgFilterMin, wMsgFilterMax, wRemoveMsg !== 0);
+            if (paintTraceEnabled) logPaintPendingBlocked('PeekMessageW(fastpath)', wMsgFilterMin, wMsgFilterMax, wRemoveMsg !== 0);
             // Queue empty — check per-thread quit flag before returning FALSE
             if (wMsgFilterMin === 0 && wMsgFilterMax === 0 || (WM_QUIT >= wMsgFilterMin && WM_QUIT <= wMsgFilterMax)) {
                 const quitState = system.scheduler.getQuitState(callerThreadId);
@@ -1648,7 +1663,7 @@ export function registerFastPathMessageFunctions(dispatcher: any): void {
             dataView.setInt32(lpMsg + 24, (msg as any).ptY ?? 0, true);  // pt.y
         }
 
-        if (PAINT_TRACE_ENABLED) logPaintMsgDelivered('PeekMessageW(fastpath)', msg.hwnd, msg.message, {
+        if (paintTraceEnabled) logPaintMsgDelivered('PeekMessageW(fastpath)', msg.hwnd, msg.message, {
             remove: wRemoveMsg,
             filterMin: wMsgFilterMin,
             filterMax: wMsgFilterMax,
@@ -1726,7 +1741,7 @@ export function registerFastPathMessageFunctions(dispatcher: any): void {
         }
 
         const retVal = msg.message === WM_QUIT ? 0 : 1;
-        if (PAINT_TRACE_ENABLED) logPaintMsgDelivered('GetMessageW(fastpath)', msg.hwnd, msg.message, {
+        if (paintTraceEnabled) logPaintMsgDelivered('GetMessageW(fastpath)', msg.hwnd, msg.message, {
             ret: retVal,
             filterMin: wMsgFilterMin,
             filterMax: wMsgFilterMax,

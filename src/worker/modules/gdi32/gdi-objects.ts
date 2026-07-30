@@ -33,6 +33,29 @@ export const STOCK_DEFAULT_GUI_FONT = 17;
 export const STOCK_DEFAULT_BITMAP = 9;
 export const DEFAULT_BITMAP_HANDLE = 0x80000000 | STOCK_DEFAULT_BITMAP;
 
+// Pen styles (wingdi.h). PS_SOLID..PS_INSIDEFRAME are the CreatePen range; the
+// PS_USERSTYLE/PS_ALTERNATE styles above it are ExtCreatePen-only. The geometry that
+// consumes them lives in gdi-lines.ts.
+export const PS_SOLID = 0;
+export const PS_DASH = 1;
+export const PS_DOT = 2;
+export const PS_DASHDOT = 3;
+export const PS_DASHDOTDOT = 4;
+export const PS_NULL = 5;
+export const PS_INSIDEFRAME = 6;
+export const PS_STYLE_MASK = 0x0000000F;
+
+// LOGPEN { UINT lopnStyle; POINT lopnWidth; COLORREF lopnColor } — 16 bytes.
+// CreatePenIndirect reads it, GetObject(OBJ_PEN) writes it; checked in
+// tools/validate-struct-offsets.ts.
+export const LOGPEN_OFFSETS = {
+    lopnStyle: 0x00,
+    lopnWidth_x: 0x04,
+    lopnWidth_y: 0x08,
+    lopnColor: 0x0C,
+} as const;
+export const LOGPEN_SIZE = 0x10;
+
 export interface PatternBrushData {
     kind: 'pattern';
     sourceBitmap: number;
@@ -67,11 +90,11 @@ export function getStockObject(objectId: number): GDIObject | null {
         case STOCK_NULL_BRUSH:
             return { handle: objectId, type: 'BRUSH', data: 'transparent' };
         case STOCK_WHITE_PEN:
-            return { handle: objectId, type: 'PEN', data: '#FFFFFF' };
+            return { handle: objectId, type: 'PEN', data: '#FFFFFF', penStyle: PS_SOLID, penWidth: 1, penColor: 0x00FFFFFF };
         case STOCK_BLACK_PEN:
-            return { handle: objectId, type: 'PEN', data: '#000000' };
+            return { handle: objectId, type: 'PEN', data: '#000000', penStyle: PS_SOLID, penWidth: 1, penColor: 0 };
         case STOCK_NULL_PEN:
-            return { handle: objectId, type: 'PEN', data: 'transparent' };
+            return { handle: objectId, type: 'PEN', data: 'transparent', penStyle: PS_NULL, penWidth: 1, penColor: 0 };
         case STOCK_SYSTEM_FONT:
         case STOCK_DEFAULT_GUI_FONT:
         case STOCK_ANSI_VAR_FONT:
@@ -155,11 +178,24 @@ export function getObject(gdi: GDIContext, hgdiobj: number, cbBuffer: number, lp
             return 24; // sizeof(BITMAP)
         } else if (obj.type === 'FONT') {
             return isUnicode ? 92 : 60; // sizeof(LOGFONTW) vs sizeof(LOGFONTA)
+        } else if (obj.type === 'PEN') {
+            return LOGPEN_SIZE;
         }
         return 0;
     }
 
     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+
+    if (obj.type === 'PEN' && cbBuffer >= LOGPEN_SIZE) {
+        // LOGPEN { UINT lopnStyle; POINT lopnWidth; COLORREF lopnColor }. lopnWidth.y is
+        // unused by GDI but must be written — callers round-trip the struct into
+        // CreatePenIndirect.
+        view.setUint32(lpvObject + LOGPEN_OFFSETS.lopnStyle, (obj.penStyle ?? PS_SOLID) >>> 0, true);
+        view.setInt32(lpvObject + LOGPEN_OFFSETS.lopnWidth_x, obj.penWidth ?? 1, true);
+        view.setInt32(lpvObject + LOGPEN_OFFSETS.lopnWidth_y, 0, true);
+        view.setUint32(lpvObject + LOGPEN_OFFSETS.lopnColor, (obj.penColor ?? 0) >>> 0, true);
+        return LOGPEN_SIZE;
+    }
 
     // Palettized (≤8bpp) bitmap loaded with LR_CREATEDIBSECTION: expose a real
     // DIBSECTION so guest sprite loaders can read the 8-bit source + palette
@@ -300,12 +336,26 @@ export function getObject(gdi: GDIContext, hgdiobj: number, cbBuffer: number, lp
 }
 
 export function deleteObject(gdi: GDIContext, hgdiobj: number): boolean {
+    // DeleteObject on a stock object is a successful no-op on Windows. It matters now that
+    // CreatePen(PS_NULL) hands back the stock NULL_PEN: the guest deletes what it created
+    // and must not see a failure.
+    if (isStockObject(hgdiobj)) return true;
+
     const obj = gdi.objects.get(hgdiobj);
 
+    // An HBITMAP lives in the SystemResourceProvider's user table, and the ones minted by
+    // CreateCompatibleBitmap/CreateDIBSection/LoadBitmap have no gdi.objects entry at all —
+    // keying the teardown off gdi.objects alone leaks every one of them (handle slot, pixel
+    // buffer and guest DIB bits) for the life of the process.
+    const provider = System.getInstance().resourceProvider;
+    const bitmapUserObj = (obj?.type === 'BITMAP' ? obj.data : undefined)
+        ?? (obj ? undefined : provider.getUserObject(hgdiobj));
+    const isBitmap = obj?.type === 'BITMAP' || bitmapUserObj?.type === 'BITMAP';
+
     // Clear bitmap-related caches
-    if (obj && obj.type === 'BITMAP') {
+    if (isBitmap) {
         // Check if bitmap is still loading (userObj stored in data field)
-        const userObj = obj.data;
+        const userObj = bitmapUserObj;
         if (userObj && userObj.loading) {
             Logger.warn(LogCategory.GDI32,
                 `deleteObject: Deferred delete for loading HBITMAP 0x${hgdiobj.toString(16)}`);
@@ -315,6 +365,7 @@ export function deleteObject(gdi: GDIContext, hgdiobj: number): boolean {
         // Remove from ImageBitmap caches
         gdi.bitmapImageBitmapCache.delete(hgdiobj);
         gdi.bitmapImageBitmapReady.delete(hgdiobj);
+        gdi.purgeBitmapDC(hgdiobj);
 
         // Free the guest-heap bmBits materialization (GetObject DIBSECTION path)
         if (userObj?.dibBitsPtr) {
@@ -329,8 +380,11 @@ export function deleteObject(gdi: GDIContext, hgdiobj: number): boolean {
             ddraw.invalidateBitmapCache(hgdiobj);
         }
 
-        // Clear from SystemResourceProvider (prevent memory leak)
-        system.resourceProvider.unregisterUserObject(hgdiobj);
+        // Clear from SystemResourceProvider (frees the handle slot for reuse)
+        const removed = system.resourceProvider.unregisterUserObject(hgdiobj);
+        // A provider-only bitmap has no gdi.objects entry, so the delete below would report
+        // failure for a handle we did in fact destroy.
+        if (!obj) return removed !== null && removed !== undefined;
     }
 
     if (obj && obj.type === 'FONT') {
@@ -455,17 +509,32 @@ export function createCompatibleBitmap(gdi: GDIContext, hdc: number, cx: number,
     return handle;
 }
 
-export function createPen(gdi: GDIContext, width: number, color: number): number {
+/**
+ * CreatePen/ExtCreatePen pen object.
+ *
+ * Style handling is gdi32's: a style outside the CreatePen range degrades to PS_SOLID
+ * (gdi32/objects.c CreatePen) and PS_NULL resolves to the stock NULL_PEN rather than a
+ * new object (win32u/pen.c NtGdiCreatePen), so a PS_NULL pen is shareable and compares
+ * equal to GetStockObject(NULL_PEN). Width is |width| and 0 means one device pixel
+ * (get_pen_device_width).
+ */
+export function createPen(gdi: GDIContext, style: number, width: number, color: number): number {
+    const penStyle = (style | 0) & PS_STYLE_MASK;
+    if (penStyle === PS_NULL) return (0x80000000 | STOCK_NULL_PEN) >>> 0;
+
     const cssColor = colorToCss(gdi, color);
     const handle = gdi.nextHgdiobj++;
     gdi.objects.set(handle, {
         handle,
         type: 'PEN',
         data: cssColor,
+        penStyle: penStyle <= PS_INSIDEFRAME ? penStyle : PS_SOLID,
+        penWidth: Math.max(1, Math.abs(width | 0)),
+        penColor: color >>> 0,
     });
     Logger.verbose(
         LogCategory.GDI32,
-        `createPen(width=${width}, color=0x${(color >>> 0).toString(16)}) -> 0x${handle.toString(16)}`,
+        `createPen(style=${penStyle}, width=${width}, color=0x${(color >>> 0).toString(16)}) -> 0x${handle.toString(16)}`,
     );
     return handle;
 }

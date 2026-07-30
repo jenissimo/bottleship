@@ -11,6 +11,7 @@ import { System } from '../../core/system';
 import { encodeAnsi } from '../codepage-utils';
 import { windows, buttonCheckStates } from './shared-state';
 import { findChildByControlId, repaintDialogAfterContentChange, handleSystemControlMessage, isContentChangingMessage } from './dialog';
+import { eraseControlOverlayRect } from './dialog-paint';
 
 export function registerDialogItemExports(exports: Record<string, ThunkImplementation>): void {
     exports['GetDlgItem'] = (ctx, mem, args) => {
@@ -44,6 +45,7 @@ export function registerDialogItemExports(exports: Record<string, ThunkImplement
 
         const child = findChildByControlId(hDlg, nIDDlgItem);
         if (child) {
+            eraseControlOverlayRect(child);
             child.title = text;
             repaintDialogAfterContentChange(hDlg);
         } else {
@@ -63,6 +65,7 @@ export function registerDialogItemExports(exports: Record<string, ThunkImplement
 
         const child = findChildByControlId(hDlg, nIDDlgItem);
         if (child) {
+            eraseControlOverlayRect(child);
             child.title = text;
             repaintDialogAfterContentChange(hDlg);
         }
@@ -249,6 +252,7 @@ export function registerDialogItemExports(exports: Record<string, ThunkImplement
 
         const child = findChildByControlId(hDlg, nIDDlgItem);
         if (child) {
+            eraseControlOverlayRect(child);
             child.title = text;
             repaintDialogAfterContentChange(hDlg);
         }

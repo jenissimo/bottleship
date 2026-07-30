@@ -12,6 +12,40 @@ import { resolveBitmapRgba, resolveIconRgba, resolveDib32RawAlphaRgba } from '..
 import { desktopBackground } from '../../runtime/desktop-background';
 import { asArrayBufferView } from '../../../dom-buffer';
 
+const DT_CALCRECT = 0x00000400;
+const DT_SINGLELINE = 0x00000020;
+
+/**
+ * Shared body of DrawTextA/W and DrawTextEx*: read the RECT, lay the text out, and give
+ * the API its documented return value (the height of the drawn text). DT_CALCRECT writes
+ * the measured extent back into the caller's RECT and draws nothing — a guest that sizes
+ * a control or a dialog from that call gets a garbage layout if the RECT is not updated.
+ */
+function drawTextCommon(hdc: number, text: string, mem: Uint8Array, lpRect: number, format: number): number {
+    let rect: { left: number; top: number; right: number; bottom: number } | undefined;
+    const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+    if (lpRect && lpRect + 16 <= mem.length) {
+        rect = {
+            left: view.getInt32(lpRect, true),
+            top: view.getInt32(lpRect + 4, true),
+            right: view.getInt32(lpRect + 8, true),
+            bottom: view.getInt32(lpRect + 12, true),
+        };
+    }
+
+    const layout = System.getInstance().gdiContext.drawText(hdc, text, rect, format);
+    if (!layout) return 0;
+
+    if (rect && lpRect && (format & DT_CALCRECT) !== 0) {
+        // A wrapped calc keeps the caller's width (it is the wrap limit); an unwrapped one
+        // reports the widest line.
+        const wrapped = (format & 0x10 /* DT_WORDBREAK */) !== 0 && (format & DT_SINGLELINE) === 0;
+        if (!wrapped) view.setInt32(lpRect + 8, rect.left + layout.width, true);
+        view.setInt32(lpRect + 12, rect.top + layout.height, true);
+    }
+    return layout.height;
+}
+
 function drawIconToHdc(
     hdc: number,
     hIcon: number,
@@ -239,20 +273,9 @@ export function registerWindowDrawingExports(exports: Record<string, ThunkImplem
         let text = Marshaler.readString(mem, lpchText);
         if (cchText >= 0) text = text.substring(0, cchText);
 
-        let rect: { left: number; top: number; right: number; bottom: number } | undefined;
-        if (lprc) {
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            rect = {
-                left: view.getInt32(lprc, true),
-                top: view.getInt32(lprc + 4, true),
-                right: view.getInt32(lprc + 8, true),
-                bottom: view.getInt32(lprc + 12, true),
-            };
-        }
-
-        Logger.verbose(LogCategory.USER32, `DrawTextExA(0x${hdc.toString(16)}, "${text}")`);
-        System.getInstance().gdiContext.drawText(hdc, text, rect, format);
-        return rect ? rect.bottom - rect.top : 20;
+        Logger.verbose(LogCategory.USER32,
+            `DrawTextExA(0x${hdc.toString(16)}, fmt=0x${(format >>> 0).toString(16)}, "${text}")`);
+        return drawTextCommon(hdc, text, mem, lprc, format);
     };
 
     exports['TabbedTextOutA'] = (ctx, mem, args) => {
@@ -478,70 +501,31 @@ export function registerWindowDrawingExports(exports: Record<string, ThunkImplem
     exports['DrawTextW'] = (ctx, mem, args) => {
         const hdc = args[0];
         const lpString = args[1];
-        const cchText = args[2];
+        const cchText = args[2] | 0;
         const lpRect = args[3];
         const uFormat = args[4];
 
-        // Read wide string from memory
-        const text = Marshaler.readWideString(mem, lpString);
+        let text = Marshaler.readWideString(mem, lpString);
+        if (cchText >= 0) text = text.substring(0, cchText);
 
-        // Read RECT structure
-        let rect: { left: number; top: number; right: number; bottom: number } | undefined;
-        if (lpRect) {
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            rect = {
-                left: view.getInt32(lpRect, true),
-                top: view.getInt32(lpRect + 4, true),
-                right: view.getInt32(lpRect + 8, true),
-                bottom: view.getInt32(lpRect + 12, true)
-            };
-        }
-
-        // Use GDI context to draw text
-        const success = System.getInstance().gdiContext.drawText(hdc, text, rect, uFormat);
-
-        if (success && lpRect) {
-            // DrawText returns the height of the drawn text
-            // For simplicity, return approximate height based on font
-            const height = rect ? rect.bottom - rect.top : 20; // Approximate
-            return Math.min(height, text.length * 15); // Rough estimate
-        }
-
-        return 0;
+        Logger.verbose(LogCategory.USER32,
+            `DrawTextW(0x${hdc.toString(16)}, fmt=0x${(uFormat >>> 0).toString(16)}, "${text}")`);
+        return drawTextCommon(hdc, text, mem, lpRect, uFormat);
     };
 
     exports['DrawTextA'] = (ctx, mem, args) => {
         const hdc = args[0];
         const lpString = args[1];
-        const cchText = args[2];
+        const cchText = args[2] | 0;
         const lpRect = args[3];
         const uFormat = args[4];
 
-        // Read ANSI string from memory
-        const text = Marshaler.readString(mem, lpString);
+        let text = Marshaler.readString(mem, lpString);
+        if (cchText >= 0) text = text.substring(0, cchText);
 
-        // Read RECT structure
-        let rect: { left: number; top: number; right: number; bottom: number } | undefined;
-        if (lpRect) {
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            rect = {
-                left: view.getInt32(lpRect, true),
-                top: view.getInt32(lpRect + 4, true),
-                right: view.getInt32(lpRect + 8, true),
-                bottom: view.getInt32(lpRect + 12, true)
-            };
-        }
-
-        // Use GDI context to draw text
-        const success = System.getInstance().gdiContext.drawText(hdc, text, rect, uFormat);
-
-        if (success && lpRect) {
-            // DrawText returns the height of the drawn text
-            const height = rect ? rect.bottom - rect.top : 20; // Approximate
-            return Math.min(height, text.length * 15); // Rough estimate
-        }
-
-        return 0;
+        Logger.verbose(LogCategory.USER32,
+            `DrawTextA(0x${hdc.toString(16)}, fmt=0x${(uFormat >>> 0).toString(16)}, "${text}")`);
+        return drawTextCommon(hdc, text, mem, lpRect, uFormat);
     };
 
     exports['FillRect'] = (ctx, mem, args) => {

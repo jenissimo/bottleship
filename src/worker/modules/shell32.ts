@@ -5,7 +5,7 @@
 
 import { IModule } from "../core/module";
 import { Process } from "../core/process";
-import { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
+import { ThunkImplementation, ThunkResult } from "../core/thunking/thunk-dispatcher";
 import { Mem } from "../core/memory/mem-accessor";
 import { System } from "../core/system";
 import { Logger, LogCategory } from "../core/logger";
@@ -91,7 +91,26 @@ export async function applyShellExecFake(commandLine: string, source: string): P
     return false;
 }
 
+/**
+ * Whether a self-launch actually asks for a DIFFERENT command line.
+ *
+ * Re-execing with the arguments we are already running under is a loop with no exit: the
+ * restarted image reaches the same launch and asks again. A launcher only re-execs to
+ * CHANGE something, so an identical command line means we mis-read the call.
+ */
+export function isDifferentCommandLine(requested: string, current: string): boolean {
+    const norm = (s: string): string => s.trim().replace(/\s+/g, " ").toLowerCase();
+    return norm(requested) !== norm(current);
+}
+
 const CSIDL_FLAG_CREATE = 0x8000;
+
+/** ShellExecute* failure codes are 0..31; anything above is an "instance handle" = success. */
+const SE_ERR_MAX = 31;
+const SE_ERR_ACCESSDENIED = 5;
+const SHELL_EXEC_OK = 42;
+const ERROR_ACCESS_DENIED = 5;
+const SEE_MASK_NOCLOSEPROCESS = 0x00000040;
 
 function getSpecialFolderPath(csidl: number): string {
     switch (csidl & 0xff) {
@@ -151,6 +170,22 @@ export class Shell32 implements IModule {
             return String.fromCharCode(...chars);
         };
 
+        /**
+         * ShellExecute* return value. >32 is success; 0..31 are SE_ERR_* codes.
+         *
+         * Success is a claim about EFFECT, not mechanism: we are single-process, so the
+         * only launch shape we can serve is one whose entire observable contract is a
+         * side effect on the filesystem (UE1's `testrendev` child exists purely to leave
+         * Detected.ini behind — the parent never waits on it and never reads an exit
+         * code). Saying "launched" when we produced that artifact is honest; saying it
+         * when we did nothing tells the guest a child ran and lets it proceed on a false
+         * premise, failing arbitrarily far from here.
+         *
+         * The refusal code must not itself assert something false about the image:
+         * SE_ERR_FNF/SE_ERR_BADFORMAT are falsifiable by the guest and route some callers
+         * into a reinstall/repair branch. ACCESSDENIED says only "this environment would
+         * not run it", which is true.
+         */
         const executeShell = async (
             apiName: "ShellExecuteA" | "ShellExecuteW" | "ShellExecuteExA" | "ShellExecuteExW",
             operation: string,
@@ -159,15 +194,61 @@ export class Shell32 implements IModule {
             directory: string,
             nShowCmd: number
         ): Promise<number> => {
-            Logger.warn(
+            const launched = await applyShellExecFake(parameters, "SHELL32");
+
+            // Self re-exec: a launcher relaunching its OWN image with a new command line
+            // (see System.isSelfImage). The child's whole observable contract is "this
+            // program, restarted with these arguments", and that we can reproduce exactly.
+            //
+            // Strictly AFTER shellExecFake: a self-launch whose real purpose is a file side
+            // effect is already served by that rule, and restarting for it would relaunch
+            // the game mid-boot forever (UE1 probes its renderer by running its own image
+            // to drop Detected.ini).
+            const system = System.getInstance();
+            if (!launched && system.isSelfImage(file, directory)
+                && isDifferentCommandLine(parameters, system.executableArgs)
+                && system.requestReExec(parameters)) {
+                system.scheduler.setLastError(0);
+                Logger.log(
+                    LogCategory.SYSTEM,
+                    `[SHELL32] ${apiName}("${operation}", "${file}", "${parameters}") -> re-exec ` +
+                    `(launcher relaunching its own image; restarting with the new command line)`
+                );
+                return SHELL_EXEC_OK;
+            }
+
+            if (!launched) {
+                System.getInstance().scheduler.setLastError(ERROR_ACCESS_DENIED);
+                Logger.warn(
+                    LogCategory.SYSTEM,
+                    `[SHELL32] ${apiName}("${operation}", "${file}", "${parameters}", dir="${directory}", ` +
+                    `show=${nShowCmd}) -> SE_ERR_ACCESSDENIED (no emulated child effect; ` +
+                    `single-process HLE cannot spawn a real child)`
+                );
+                return SE_ERR_ACCESSDENIED;
+            }
+
+            System.getInstance().scheduler.setLastError(0);
+            Logger.log(
                 LogCategory.SYSTEM,
-                `[SHELL32] ${apiName}("${operation}", "${file}", "${parameters}", dir="${directory}", show=${nShowCmd})`
+                `[SHELL32] ${apiName}("${operation}", "${file}", "${parameters}", dir="${directory}", ` +
+                `show=${nShowCmd}) -> ${SHELL_EXEC_OK} (child effect emulated)`
             );
+            return SHELL_EXEC_OK;
+        };
 
-            await applyShellExecFake(parameters, "SHELL32");
+        /** Shared tail for ShellExecuteEx{A,W}: hInstApp + handle policy + BOOL. */
+        const finishShellExecuteEx = (pExecInfo: number, fMask: number, result: number): ThunkResult => {
+            Mem.writeUint32(pExecInfo + 32, result >>> 0); // hInstApp (SE_ERR_* on failure)
 
-            // >32 means success for ShellExecute* return semantics.
-            return 42;
+            // A handle we cannot back must not exist: an unregistered value never signals
+            // a wait, fails GetExitCodeProcess, and corrupts whatever real object later
+            // lands on it via CloseHandle. Leave hProcess NULL and report FALSE instead.
+            if ((fMask & SEE_MASK_NOCLOSEPROCESS) !== 0) {
+                Mem.writeUint32(pExecInfo + 56, 0); // hProcess
+            }
+
+            return { value: result > SE_ERR_MAX ? 1 : 0, stackCleanup: 4 };
         };
 
         // ShellExecuteA(HWND hwnd, LPCSTR lpOperation, LPCSTR lpFile,
@@ -224,14 +305,7 @@ export class Shell32 implements IModule {
             const directory = lpDirectory ? readStrA(mem, lpDirectory) : "";
 
             const result = await executeShell("ShellExecuteExA", operation, file, parameters, directory, nShow);
-            Mem.writeUint32(pExecInfo + 32, result >>> 0); // hInstApp
-
-            const SEE_MASK_NOCLOSEPROCESS = 0x00000040;
-            if ((fMask & SEE_MASK_NOCLOSEPROCESS) !== 0) {
-                Mem.writeUint32(pExecInfo + 56, 0x100); // hProcess
-            }
-
-            return { value: 1, stackCleanup: 4 };
+            return finishShellExecuteEx(pExecInfo, fMask, result);
         };
 
         // BOOL ShellExecuteExW(SHELLEXECUTEINFOW *pExecInfo)
@@ -252,14 +326,7 @@ export class Shell32 implements IModule {
             const directory = lpDirectory ? readStrW(mem, lpDirectory) : "";
 
             const result = await executeShell("ShellExecuteExW", operation, file, parameters, directory, nShow);
-            Mem.writeUint32(pExecInfo + 32, result >>> 0); // hInstApp
-
-            const SEE_MASK_NOCLOSEPROCESS = 0x00000040;
-            if ((fMask & SEE_MASK_NOCLOSEPROCESS) !== 0) {
-                Mem.writeUint32(pExecInfo + 56, 0x100); // hProcess
-            }
-
-            return { value: 1, stackCleanup: 4 };
+            return finishShellExecuteEx(pExecInfo, fMask, result);
         };
         this.exports["Shell_NotifyIconA"] = () => 1; // BOOL TRUE (tray icon ops accepted)
         this.exports["Shell_NotifyIconW"] = () => 1;

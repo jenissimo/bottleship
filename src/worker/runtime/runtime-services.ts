@@ -1,6 +1,7 @@
 import { TimeService } from "./time";
 import { Logger, LogCategory } from "../core/logger";
 import { harnessBus } from "../harness/event-bus";
+import { frameProfiler } from "../core/frame-profiler";
 
 export interface RenderBackend {
     readonly kind: string;
@@ -195,6 +196,10 @@ export class RenderService {
             try { this.firstPresentCb?.(); } catch { /* host bridge must never break the present path */ }
         }
         this.recordFlipCadence();
+        // Frame-time distribution rides the SAME boundary as the cadence ring and the trace
+        // mark below, so the live tail, getFlipCadence and analyze-trace cannot disagree by
+        // construction — only because the world disagreed. Zero-cost while disarmed.
+        frameProfiler.markPresent();
         this.emitFlipTraceMark();
         // Harness frameRendered event — gated so the perf-critical present path
         // stays zero-cost until a script opts in (watchFrames).

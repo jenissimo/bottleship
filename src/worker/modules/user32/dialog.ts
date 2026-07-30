@@ -116,6 +116,17 @@ const WS_GROUP = 0x00020000;
 const WS_EX_CLIENTEDGE = 0x00000200;
 const WS_EX_NOPARENTNOTIFY = 0x00000004;
 
+/**
+ * Wine dialog.c gates the "try to fit it into the desktop" nudge on
+ * `!(style & WS_CHILD)` (DS_CENTER still applies to a child). A WS_CHILD dialog —
+ * a wizard / property page created inside a placeholder control — keeps its template
+ * position verbatim, relative to its parent's client area; clamping it to the screen
+ * would slide the whole page, and every control on it, by the parent's screen offset.
+ */
+function isChildDialogStyle(style: number): boolean {
+    return ((style >>> 0) & WS_CHILD) !== 0;
+}
+
 type DestroyAction = {
     hwnd: number;
     msg: number;
@@ -705,8 +716,8 @@ function runModalDialog(
         dlgX = dluToPixelX(parsed.x, base);
         dlgY = dluToPixelY(parsed.y, base);
         const needsCenter = (dlgStyle & DS_CENTER) !== 0
-            || dlgX + dlgWidth > screen.width
-            || dlgY + dlgHeight > screen.height;
+            || (!isChildDialogStyle(dlgStyle)
+                && (dlgX + dlgWidth > screen.width || dlgY + dlgHeight > screen.height));
         if (needsCenter) {
             dlgX = Math.max(0, Math.floor((screen.width - dlgWidth) / 2));
             dlgY = Math.max(0, Math.floor((screen.height - dlgHeight) / 2));
@@ -1268,8 +1279,8 @@ function createModelessDialog(
         dlgX = dluToPixelX(parsed.x, base);
         dlgY = dluToPixelY(parsed.y, base);
         const needsCenter = (dlgStyle & DS_CENTER_M) !== 0
-            || dlgX + dlgWidth > screenM.width
-            || dlgY + dlgHeight > screenM.height;
+            || (!isChildDialogStyle(dlgStyle)
+                && (dlgX + dlgWidth > screenM.width || dlgY + dlgHeight > screenM.height));
         if (needsCenter) {
             dlgX = Math.max(0, Math.floor((screenM.width - dlgWidth) / 2));
             dlgY = Math.max(0, Math.floor((screenM.height - dlgHeight) / 2));

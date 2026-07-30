@@ -29,7 +29,10 @@ import {
     windows,
     getAbsoluteWindowPosition,
     installCursorAndUpdateHostVisibility,
+    getCurrentCursorHandle,
     warpGuestCursorTo,
+    getCursorClipRect,
+    getVirtualScreenRect,
 } from './shared-state';
 import { getSystemCursorHandle } from './system-cursors';
 import { registerDeviceNotification, unregisterDeviceNotification } from './device-notify';
@@ -119,13 +122,20 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
     };
 
     const getCurrentScreenMode = (): DisplayMode => {
-        const ddraw = System.getInstance().ddrawContext;
+        const system = System.getInstance();
+        // System.requestHostResize is the single publisher of the emulated mode, so it is
+        // right even for a title that never creates a DDraw context; ddrawContext.display
+        // is the same value for DDraw titles and stays as the fallback for anything that
+        // sets it directly.
+        const mode = system.emulatedDisplayMode;
+        const ddraw = system.ddrawContext;
         const cfg = EmulatorConfig.getInstance().screenResolution;
+        const screen = getVirtualScreenRect();
         return {
-            width: ddraw?.display?.width || cfg.width,
-            height: ddraw?.display?.height || cfg.height,
-            bpp: ddraw?.display?.bpp || cfg.bpp || 16,
-            refreshRate: normalizeRefreshRate(ddraw?.display?.refresh || cfg.refreshRate),
+            width: screen.right,
+            height: screen.bottom,
+            bpp: mode?.bpp || ddraw?.display?.bpp || cfg.bpp || 16,
+            refreshRate: normalizeRefreshRate(mode?.refreshRate || ddraw?.display?.refresh || cfg.refreshRate),
         };
     };
 
@@ -2315,7 +2325,18 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         return 1;
     };
     exports['EnumWindows'] = () => 1;
-    exports['WindowFromDC'] = () => 0;
+
+    // Returns the window a DC was obtained FOR (GetDC/GetWindowDC/GetDCEx/BeginPaint), NULL for
+    // a memory/compatible/info DC. Renderers use it to recover the target window from a DC handed
+    // to them: GoldSrc's D3D init does hwnd = WindowFromDC(hdc) and rejects the whole mode with
+    // "not supported by your video card" the moment IsWindow(hwnd) fails, so returning 0 here
+    // reads to the app as "this card cannot do D3D".
+    exports['WindowFromDC'] = (ctx, mem, args) => {
+        const hdc = args[0] >>> 0;
+        const hwnd = System.getInstance().gdiContext.getDCWindow(hdc);
+        // A DC whose window has been destroyed reports NULL, as on Win32.
+        return hwnd && windows.has(hwnd) ? hwnd : 0;
+    };
     exports['DisableProcessWindowsGhosting'] = () => 0;
 
     exports['GetCursorInfo'] = (ctx, mem, args) => {
@@ -2333,19 +2354,23 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
     };
 
     exports['CreateCursor'] = () => 0x100;
-    exports['GetCursor'] = () => 0x100;
+    // The save-and-restore idiom (`old = SetCursor(wait); …; SetCursor(old)`) and the
+    // GetCursor()==NULL visibility test both need the real installed handle.
+    exports['GetCursor'] = () => getCurrentCursorHandle();
     exports['DestroyCursor'] = () => 1;
     exports['DestroyIcon'] = () => 1;
 
+    // The confinement rect an app can save and restore; unconfined reads back as the
+    // whole screen (wineserver seeds desktop cursor.clip with the virtual screen rect).
     exports['GetClipCursor'] = (ctx, mem, args) => {
         const lpRect = args[0] >>> 0;
         if (lpRect && lpRect + 16 <= mem.length) {
-            const mode = getCurrentScreenMode();
+            const rect = getCursorClipRect() ?? getVirtualScreenRect();
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            view.setInt32(lpRect + 0, 0, true);
-            view.setInt32(lpRect + 4, 0, true);
-            view.setInt32(lpRect + 8, mode.width, true);
-            view.setInt32(lpRect + 12, mode.height, true);
+            view.setInt32(lpRect + 0, rect.left, true);
+            view.setInt32(lpRect + 4, rect.top, true);
+            view.setInt32(lpRect + 8, rect.right, true);
+            view.setInt32(lpRect + 12, rect.bottom, true);
         }
         return 1;
     };
@@ -2360,6 +2385,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         const { x, y } = getAbsoluteWindowPosition(win);
         const hdc = gdi.createSizedMemoryDC(win.width, win.height);
         if (!hdc) return 0;
+        gdi.setDCWindow(hdc, hWnd);
         gdi.attachWindowBlit(hdc, x, y, win.width, win.height);
         gdi.seedMemoryDCFromOverlay(hdc);
         Logger.verbose(LogCategory.USER32,

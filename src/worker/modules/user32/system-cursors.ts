@@ -101,7 +101,10 @@ const systemCursorHandles = new Map<number, number>();
 export function getSystemCursorHandle(idcId: number): number {
     const id = SYSTEM_CURSOR_SHAPES.has(idcId) ? idcId : IDC_ARROW;
     const cached = systemCursorHandles.get(id);
-    if (cached) return cached;
+    // Re-register if the cached handle no longer resolves: this cache and the user-object
+    // table are cleared by different resets, and a shared system cursor that stops
+    // resolving would leave the host with a visible pointer and no shape to draw.
+    if (cached && System.getInstance().resourceProvider.getUserObject?.(cached)) return cached;
     const shape = SYSTEM_CURSOR_SHAPES.get(id)!;
     const { width, height, pixels } = rasterizeShape(shape.map);
     const handle = System.getInstance().resourceProvider.registerUserObject({

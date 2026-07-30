@@ -7,8 +7,13 @@ import { System } from '../../core/system';
 import { Marshaler } from '../../core/memory/marshaler';
 import { encodeAnsi } from '../codepage-utils';
 import { addFontResource, removeFontResource } from './font-resource';
+import { PS_STYLE_MASK } from './gdi-objects';
 
 let nextMetafileHandle = 0x50000;
+
+/** ExtCreatePen pen-type bits: cosmetic (0) vs geometric (PS_GEOMETRIC). */
+const PS_TYPE_MASK = 0x000F0000;
+const PS_GEOMETRIC = 0x00010000;
 
 export function registerPaintingMiscExports(exports: Record<string, ThunkImplementation>): void {
     // int EnumFontFamiliesA(HDC hdc, LPCSTR lpszFamily, FONTENUMPROCA lpFontFamProc, LPARAM lParam)
@@ -83,7 +88,14 @@ export function registerPaintingMiscExports(exports: Record<string, ThunkImpleme
             color = view.getUint32(plbrush + 4, true);
         }
 
-        return System.getInstance().gdiContext.createPen(cWidth || 1, color);
+        // A cosmetic ext pen is always one device pixel wide regardless of cWidth
+        // (dibdrv_SelectPen); only PS_GEOMETRIC honours the width.
+        const geometric = (iPenStyle & PS_TYPE_MASK) === PS_GEOMETRIC;
+        return System.getInstance().gdiContext.createPen(
+            iPenStyle & PS_STYLE_MASK,
+            geometric ? (cWidth || 1) : 1,
+            color,
+        );
     };
 
     // HMETAFILE CloseMetaFile(HDC hdc)

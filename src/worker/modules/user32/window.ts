@@ -7,11 +7,12 @@
 import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
+import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { DESKTOP_HWND } from '../../runtime/windowing/window-manager';
 import { getWindowClass, getWindowClassByName } from './class';
 import { Marshaler } from '../../core/memory/marshaler';
 import { Mem } from '../../core/memory/mem-accessor';
-import { WindowInfo, windows, incrementNextWindowId, getCursorDisplayCount, updateCursorDisplayCount, isGuestCursorVisible, syncHostCursorToGuestState, installCursorAndUpdateHostVisibility, getAbsoluteWindowPosition, markGuestCustomPaint, killWindowTimers, registerWindowDestroyFinalizer, reorderChildInParent, setLockWindowUpdate, isWindowUpdateLocked, hasSystemControlChildren } from './shared-state';
+import { WindowInfo, windows, incrementNextWindowId, getCursorDisplayCount, updateCursorDisplayCount, isGuestCursorVisible, syncHostCursorToGuestState, installCursorAndUpdateHostVisibility, getAbsoluteWindowPosition, markGuestCustomPaint, killWindowTimers, registerWindowDestroyFinalizer, reorderChildInParent, setLockWindowUpdate, isWindowUpdateLocked, hasSystemControlChildren, getChildWindowExclusions, isEffectivelyVisible, getAncestorClipRect } from './shared-state';
 import {
     invalidateWindow,
     validateWindow,
@@ -35,9 +36,10 @@ import { invalidateControlColors } from './control-colors';
 import { applyScrollInfo, setScrollPos as setScrollBarPos } from './scroll-state';
 import { repaintDialogOverlayIfVisible, repaintDialogAfterContentChange, isSentinelWndProc, handleSystemControlMessage, isContentChangingMessage, requestGuestDialogPaint } from './dialog';
 import { noteDialogOverlayCandidate, eraseDialogOverlay } from './dialog-overlay';
-import { resetControlInteractionState } from './control-interaction';
+import { eraseControlOverlayRect, restoreClientRectFromAncestors } from './dialog-paint';
+import { resetControlInteractionState, handleSystemControlClassMouse } from './control-interaction';
 import { isDDrawExclusiveFullscreen } from '../ddraw/gdi-visibility';
-import { PAINT_TRACE_ENABLED, logBeginEndPaint } from './paint-trace';
+import { paintTraceEnabled, logBeginEndPaint } from './paint-trace';
 import { repaintChildControls } from './controls';
 import { tryEndPaintOwnerDrawChain, tryRepaintOwnerDrawButton } from './owner-draw';
 import { beginSyncDestroyDelivery } from './destroy-sync';
@@ -275,6 +277,47 @@ function applyWindowPosGeometry(
     const window = windows.get(hWnd);
     if (!window) return null;
 
+    // Some late UE1 launchers use a WS_CHILD dialog as a bitmap-backed page, hosted by
+    // a Static placeholder, but centre that page with GetSystemMetrics(SM_CX/YSCREEN):
+    //
+    //   SetWindowPos(page, HWND_TOP, (screenW-pageW)/2, (screenH-pageH)/2,
+    //                pageW, pageH, SWP_SHOWWINDOW)
+    //
+    // Those are unmistakably SCREEN coordinates even though SetWindowPos normally takes
+    // parent-client coordinates for WS_CHILD. Applying them literally adds the centred
+    // top-level dialog's origin a second time (HP2: 157,17 at 800x600; 269,101 at
+    // 1024x768), shifting and clipping the whole page. Limit the compatibility conversion
+    // to a shown child DIALOG hosted by a system-control placeholder, with a full-page
+    // rect exactly centred on the current screen. Ordinary child SetWindowPos calls retain
+    // strict Win32 parent-relative semantics.
+    const WS_CHILD = 0x40000000;
+    const SWP_NOSIZE = 0x0001;
+    const SWP_NOMOVE = 0x0002;
+    const SWP_SHOWWINDOW = 0x0040;
+    if ((window.style & WS_CHILD) !== 0
+        && window.nativeClassName === '#32770'
+        && window.parent
+        && (uFlags & (SWP_NOMOVE | SWP_NOSIZE)) === 0
+        && (uFlags & SWP_SHOWWINDOW) !== 0) {
+        const parent = windows.get(window.parent);
+        const screen = EmulatorConfig.getInstance().screenResolution;
+        const centeredX = Math.floor((screen.width - cx) / 2);
+        const centeredY = Math.floor((screen.height - cy) / 2);
+        if (parent?.isSystemControl
+            && cx >= parent.width && cy >= parent.height
+            && Math.abs(x - centeredX) <= 1
+            && Math.abs(y - centeredY) <= 1) {
+            const parentOrigin = getAbsoluteWindowPosition(parent);
+            Logger.log(
+                LogCategory.USER32,
+                `SetWindowPos: screen-centered child dialog 0x${hWnd.toString(16)} ` +
+                `(${x},${y}) -> parent-client (${x - parentOrigin.x},${y - parentOrigin.y})`,
+            );
+            x -= parentOrigin.x;
+            y -= parentOrigin.y;
+        }
+    }
+
     const moving = !(uFlags & SWP_NOMOVE_GEO) && (x !== window.x || y !== window.y);
     const resizing = !(uFlags & SWP_NOSIZE_GEO) && cx > 0 && cy > 0
         && (cx !== window.width || cy !== window.height);
@@ -327,6 +370,15 @@ function shouldSuppressWindowOverlay(hWnd: number, window: WindowInfo): boolean 
     return isDDrawExclusiveFullscreen(ddraw);
 }
 
+/** Seed `hdc` from the nearest ancestor that has a retained client image covering it. */
+function restoreSeedFromAncestors(gdi: GDIContext, hdc: number, window: WindowInfo): boolean {
+    for (let anc = window.parent !== undefined ? windows.get(window.parent) : undefined; anc;
+         anc = anc.parent !== undefined ? windows.get(anc.parent) : undefined) {
+        if (gdi.seedMemoryDCFromClientBacking?.(hdc, anc.handle)) return true;
+    }
+    return false;
+}
+
 /** Client-area memory DC; composited to overlay on EndPaint / ReleaseDC. */
 function createWindowClientDC(gdi: GDIContext, hWnd: number): number {
     const window = getWindowByHandle(hWnd);
@@ -336,9 +388,18 @@ function createWindowClientDC(gdi: GDIContext, hWnd: number): number {
     const { x, y } = getAbsoluteWindowPosition(window);
     const hdc = gdi.createSizedMemoryDC(window.width, window.height);
     if (hdc) {
+        gdi.setDCWindow(hdc, hWnd);
         if (!shouldSuppressWindowOverlay(hWnd, window)) {
             gdi.attachWindowBlit(hdc, x, y, window.width, window.height);
-            gdi.seedMemoryDCFromOverlay(hdc);
+            // Seed from the guest's OWN backdrop when we have it, not from the overlay.
+            // The overlay already holds whatever was last stamped in this rect — including
+            // the control's PREVIOUS caption — and a guest that draws transparent text into
+            // the seeded DC then flushes both strings on top of each other. Falling back to
+            // the overlay is still right when no backdrop was ever captured (nothing stale
+            // can be there yet).
+            if (!restoreSeedFromAncestors(gdi, hdc, window)) {
+                gdi.seedMemoryDCFromOverlay(hdc);
+            }
         } else {
             Logger.verbose(LogCategory.USER32,
                 `createWindowClientDC: suppress overlay for exclusive DDraw hwnd=0x${hWnd.toString(16)}`);
@@ -924,6 +985,12 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
 
         const win = windows.get(hWnd);
         if (win?.isSystemControl) {
+            // A system control's wndProc IS this thunk (createDialogChildren), so a guest
+            // that subclasses the control and forwards what it doesn't handle lands here —
+            // which on real Windows is the BUTTON/LISTBOX/COMBOBOX class proc. Run the
+            // class's input behavior (click -> WM_COMMAND(BN_CLICKED), combo drop, …)
+            // before the message-based handling, or the forwarded click dies here.
+            if (handleSystemControlClassMouse(win, Msg, wParam, lParam)) return 0;
             const result = handleSystemControlMessage(win, Msg, wParam, lParam, mem);
             if (isContentChangingMessage(Msg)) {
                 repaintDialogAfterContentChange(win.parent ?? hWnd);
@@ -984,8 +1051,26 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             // Hiding a dialog: erase its pixels from the persistent overlay (while its
             // rect is still known) so it doesn't linger as a ghost. TS hides the
             // campaign dialog (ShowWindow(hWnd,0)) when opening a sub-dialog.
-            if (wasVisible && !window.visible && window.nativeClassName === '#32770') {
-                eraseDialogOverlay(hWnd);
+            //
+            // ANY window, not just #32770: a control's pixels are as persistent on the flat
+            // overlay as a dialog's, so a hidden owner-draw button nothing erases stays on
+            // screen (a page-switching front-end hides "Back" and shows "Quit" over the same
+            // row, leaving both). Safe only because the repair is now ancestor-aware
+            // (isEffectivelyVisible) — it used to walk back into the hidden window's children,
+            // which keep WS_VISIBLE, and repaint the page that was just switched away.
+            if (wasVisible && !window.visible) {
+                // A CHILD control on a guest-painted client gets the surround-restoring
+                // erase: clearing it to transparent would leave a hole showing the desktop
+                // through, because only the guest can redraw the backdrop it sat on. A
+                // top-level dialog still clears — there the game underneath SHOULD show.
+                // Exact restore first — it serves a hidden PAGE as well as a control, and
+                // is the only thing that puts the frame's own backdrop back.
+                // Exact restore first (serves a hidden PAGE as well as a control). Only a
+                // real dialog falls back to the clearing erase — for a CONTROL that clear
+                // makes the repair stamp the grey dialog face over the guest's own backdrop.
+                if (!restoreClientRectFromAncestors(window) && window.nativeClassName === '#32770') {
+                    eraseDialogOverlay(hWnd);
+                }
             }
 
             // Sync WS_VISIBLE style flag
@@ -1365,7 +1450,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             }
         }
 
-        if (PAINT_TRACE_ENABLED) logBeginEndPaint('BeginPaint', hWnd,
+        if (paintTraceEnabled) logBeginEndPaint('BeginPaint', hWnd,
             `lpPaint=0x${lpPaint.toString(16)} hdc=0x${hdc.toString(16)} ` +
             `${window?.width ?? 0}x${window?.height ?? 0}`);
 
@@ -1389,12 +1474,30 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         Logger.verbose(LogCategory.USER32, `EndPaint(0x${hWnd.toString(16)}, 0x${lpPaint.toString(16)})`);
 
         const gdi = System.getInstance().gdiContext;
+        // A repaint is a SEQUENCE: the window background lands first and covers the
+        // controls, then each control is drawn back on top — and the control half runs as
+        // guest callbacks, so it spans frames. Publish the whole thing atomically or a
+        // compositor samples the middle of it (controls momentarily gone).
+        gdi.beginOverlayPublish();
+        try {
         if (lpPaint) {
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
             const hdc = view.getUint32(lpPaint, true);
-            const flushed = gdi.flushWindowMemoryDCToOverlay(hdc);
-            if (PAINT_TRACE_ENABLED) logBeginEndPaint('EndPaint', hWnd,
-                `lpPaint=0x${lpPaint.toString(16)} hdc=0x${hdc.toString(16)} flush=${flushed ? 1 : 0}`);
+            const exclusions = getChildWindowExclusions(hWnd);
+            // A window that is not EFFECTIVELY visible must not reach the screen, however
+            // dutifully it paints: Win32 sends its WM_PAINT to a DC nobody sees. Without this
+            // the guest's splash dialogs kept re-flushing after EndDialog had already erased
+            // them, so the old splash hung behind the launcher menu for the whole session.
+            // The DC itself is still filled and released normally — only the composite stops.
+            const painted = getWindowByHandle(hWnd);
+            const flushed = painted && !isEffectivelyVisible(painted)
+                ? false
+                : gdi.flushWindowMemoryDCToOverlay(
+                    hdc, exclusions, hWnd,
+                    painted ? getAncestorClipRect(painted) : null);
+            if (paintTraceEnabled) logBeginEndPaint('EndPaint', hWnd,
+                `lpPaint=0x${lpPaint.toString(16)} hdc=0x${hdc.toString(16)} flush=${flushed ? 1 : 0} ` +
+                `excl=${exclusions.length}`);
             if (flushed) {
                 markGuestCustomPaint(hWnd);
                 const win = getWindowByHandle(hWnd);
@@ -1419,6 +1522,8 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
                             gdi.releaseDC(childDc);
                         },
                     });
+                    // The chain took its own publish hold; it closes when the last
+                    // control has painted, so the sequence stays atomic past this return.
                     if (ownerDraw) return ownerDraw;
                 } catch (err) {
                     Logger.error(LogCategory.USER32,
@@ -1428,6 +1533,9 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         }
 
         return 1;
+        } finally {
+            gdi.endOverlayPublish();
+        }
     };
 
     exports['CallWindowProcA'] = (ctx, mem, args) => {

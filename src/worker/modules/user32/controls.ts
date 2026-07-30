@@ -7,7 +7,7 @@
  */
 
 import { System } from '../../core/system';
-import { windows, buttonCheckStates, listControlStates, controlImageHandles, getOrCreateTrackbarState, getChildrenInPaintOrder, getAbsoluteWindowPosition } from './shared-state';
+import { windows, isEffectivelyVisible, buttonCheckStates, listControlStates, controlImageHandles, getOrCreateTrackbarState, getChildrenInPaintOrder, getAbsoluteWindowPosition, getAncestorClipRect } from './shared-state';
 import type { GDIContext } from '../gdi32/context';
 import type { WindowInfo } from './shared-state';
 import { resolveBitmapRgba, resolveIconRgba, layoutStaticControlImage, blitStaticControlImage } from '../gdi32/bitmap-resolve';
@@ -102,7 +102,9 @@ export function paintChildControls(parentHwnd: number, hdc: number, gdi: GDICont
     // content messages (LB_ADDSTRING, TBM_SETPOS, …) during WM_INITDIALOG, BEFORE
     // ShowWindow positions it — painting then stamps controls at the stale pre-move
     // origin into the persistent overlay (ghost). ShowWindow repaints once visible.
-    if (!parent.visible) return;
+    // Ancestor-aware: a closed splash dialog keeps its children's WS_VISIBLE bit, and
+    // repainting them re-stamps a splash that EndDialog already erased.
+    if (!isEffectivelyVisible(parent)) return;
 
     const ctx = gdi.getDC(hdc);
     if (!ctx) return;
@@ -112,24 +114,39 @@ export function paintChildControls(parentHwnd: number, hdc: number, gdi: GDICont
     const parentAbsX = getChainX(parent);
     const parentAbsY = getChainY(parent);
 
+    // Win32 clips these controls to every ancestor's client area (see
+    // getAncestorClipRect); the flat overlay has no per-window clip of its own.
+    const clip = getAncestorClipRect(parent);
+    if (clip && (clip.w <= 0 || clip.h <= 0)) return;
+    if (clip) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(clip.x, clip.y, clip.w, clip.h);
+        ctx.clip();
+    }
+
     let painted = false;
     for (const childHandle of getChildrenInPaintOrder(parentHwnd)) {
         const child = windows.get(childHandle);
         if (!child || !child.visible || !child.isSystemControl) continue;
-        // A subclassed control only skips default chrome when its dialog is known to
-        // guest-paint its client (the owner-draw EndPaint chain, owner-draw.ts, actually
-        // dispatches WM_PAINT to it) — mirrors the button rule below (BS_OWNERDRAW gates
-        // on parent.guestCustomPaint, not on subclassing alone). MFC's common
-        // DDX_Control/SubclassDlgItem wraps a control purely for programmatic access
-        // (message routing) without taking over WM_PAINT; treating subclassing alone as
-        // "guest paints it" leaves such controls (ComboBox, CheckBox, …) permanently
-        // blank the moment the dialog re-lays its background after WM_INITDIALOG.
-        if (child.wndProcSubclassed && !isButtonSystemControl(child) && parent.guestCustomPaint) continue;
+        // Skip default chrome only for a control that has DEMONSTRABLY painted itself
+        // (its own EndPaint flushed pixels — child.guestCustomPaint). Subclassing alone is
+        // not that claim: MFC's DDX_Control/SubclassDlgItem and UE1's WControl wrap a
+        // control purely for message routing and leave WM_PAINT to the original class proc,
+        // which IS this chrome. Assuming "subclassed ⇒ guest paints it" left such controls
+        // permanently blank (UE1's video-options resolution ListBox: items inserted, nothing
+        // drawn). Chrome is painted BEFORE the guest-paint chain runs, so a control the guest
+        // really does draw still wins — it simply overwrites what we put down.
+        if (child.guestCustomPaint && !isButtonSystemControl(child) && parent.guestCustomPaint) continue;
 
         painted = paintSystemControl(child, hdc, gdi, parentAbsX, parentAbsY) || painted;
     }
 
-    // Open combobox dropdowns paint LAST (topmost among siblings).
+    if (clip) ctx.restore();
+
+    // Open combobox dropdowns paint LAST (topmost among siblings) and OUTSIDE the
+    // ancestor clip — Win32's drop-down list is its own ComboLBox popup, free to
+    // extend past the parent that owns the closed box.
     for (const childHandle of getChildrenInPaintOrder(parentHwnd)) {
         const child = windows.get(childHandle);
         if (!child || !child.visible || !child.isSystemControl) continue;
@@ -152,12 +169,10 @@ export function paintSystemControl(
     parentAbsX?: number,
     parentAbsY?: number,
 ): boolean {
-    if (!child.visible || !child.isSystemControl) return false;
+    if (!isEffectivelyVisible(child) || !child.isSystemControl) return false;
     const parent = child.parent !== undefined ? windows.get(child.parent) : undefined;
-    // See paintChildControls: only defer to the guest's own painting when its dialog
-    // is known to guest-paint its client (owner-draw EndPaint chain), not merely
-    // because the control was subclassed (common MFC DDX_Control/SubclassDlgItem).
-    if (child.wndProcSubclassed && !isButtonSystemControl(child) && parent?.guestCustomPaint) return false;
+    // See paintChildControls: defer only to a control that has actually painted itself.
+    if (child.guestCustomPaint && !isButtonSystemControl(child) && parent?.guestCustomPaint) return false;
     const ctx = gdi.getDC(hdc);
     if (!ctx) return false;
 
@@ -169,6 +184,19 @@ export function paintSystemControl(
     const h = Math.max(1, child.height);
     const controlClass = normalizeSystemControlClass(child.systemControlClass);
 
+    // A caller that passed parentAbs* is painting a batch and has already clipped to
+    // the ancestor chain (paintChildControls); a standalone repaint must do it itself,
+    // with the SAME rect (the parent's ancestors, not the parent) so a full repaint and
+    // a single-control repaint cannot disagree about what is clipped.
+    const clip = parentAbsX === undefined && parent ? getAncestorClipRect(parent) : null;
+    if (clip) {
+        if (clip.w <= 0 || clip.h <= 0) return false;
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(clip.x, clip.y, clip.w, clip.h);
+        ctx.clip();
+    }
+
     switch (controlClass) {
         case 'button':
             paintButton(ctx, child, absX, absY, w, h);
@@ -178,6 +206,7 @@ export function paintSystemControl(
             break;
         case 'sysanimate32':
         case 'sysanimate32_class':
+            if (clip) ctx.restore();
             return false;
         case 'edit':
             paintEdit(ctx, child, absX, absY, w, h);
@@ -202,6 +231,7 @@ export function paintSystemControl(
             break;
     }
 
+    if (clip) ctx.restore();
     gdi.setOverlayDirty(true);
     return true;
 }

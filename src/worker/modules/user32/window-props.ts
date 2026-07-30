@@ -9,6 +9,7 @@ import { System } from '../../core/system';
 import { Marshaler } from '../../core/memory/marshaler';
 import { Mem } from '../../core/memory/mem-accessor';
 import { windows } from './shared-state';
+import { eraseControlOverlayRect, repaintDialogAfterContentChange } from './dialog-paint';
 import { encodeAnsi } from '../codepage-utils';
 
 export function registerWindowPropExports(exports: Record<string, ThunkImplementation>): void {
@@ -186,8 +187,16 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
         const text = lpString ? Marshaler.readString(mem, lpString) : '';
         const window = windows.get(hWnd);
         if (window) {
+            // Win32 invalidates the window on a caption change and it repaints. Without
+            // that the control keeps its OLD pixels until something else happens to stamp
+            // it, and on a guest-painted parent the new caption then lands ON TOP of the
+            // old one (both strings readable). Erase first so the repair restores the
+            // background, then let the parent re-stamp its controls.
+            const changed = window.title !== text;
+            if (changed) eraseControlOverlayRect(window);
             window.title = text;
             if (!window.parent) System.getInstance().notifyWindowTitle(text, 'SetWindowText');
+            else if (changed) repaintDialogAfterContentChange(window.parent);
         }
         Logger.log(LogCategory.USER32, `SetWindowTextA(0x${hWnd.toString(16)}, "${text}")`);
         return 1; // TRUE
@@ -199,8 +208,16 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
         const text = lpString ? Marshaler.readWideString(mem, lpString) : '';
         const window = windows.get(hWnd);
         if (window) {
+            // Win32 invalidates the window on a caption change and it repaints. Without
+            // that the control keeps its OLD pixels until something else happens to stamp
+            // it, and on a guest-painted parent the new caption then lands ON TOP of the
+            // old one (both strings readable). Erase first so the repair restores the
+            // background, then let the parent re-stamp its controls.
+            const changed = window.title !== text;
+            if (changed) eraseControlOverlayRect(window);
             window.title = text;
             if (!window.parent) System.getInstance().notifyWindowTitle(text, 'SetWindowText');
+            else if (changed) repaintDialogAfterContentChange(window.parent);
         }
         Logger.log(LogCategory.USER32, `SetWindowTextW(0x${hWnd.toString(16)}, "${text}")`);
         return 1; // TRUE

@@ -21,7 +21,7 @@
 
 import { System } from '../../core/system';
 import type { RenderActive } from '../../runtime/runtime-services';
-import { isGdiSurfaceHidden, isDDrawExclusiveFullscreen, shouldSuppress3DGdiOverlay } from '../ddraw/gdi-visibility';
+import { isGdiSurfaceHidden, ddrawOwnsScreen, ddrawShowsContent, shouldSuppress3DGdiOverlay } from '../ddraw/gdi-visibility';
 import {
     windows,
     WindowInfo,
@@ -29,6 +29,7 @@ import {
     listControlStates,
     isWindowUpdateLocked,
     hasSystemControlChildren,
+    isEffectivelyVisible,
 } from './shared-state';
 import { getComboDropdownRect } from './controls';
 import { invokeOverlayRepairRepaint } from './control-interaction';
@@ -51,12 +52,32 @@ export function isFlipScreenOwned(): boolean {
  * beyond DDraw: a dialog shown WHILE the game owns the screen is live UI composited
  * over the frame; one visible from BEFORE (a UE2 loading splash) is occluded by the
  * opaque fullscreen game window on real Windows, so it must not cover our frame.
+ *
+ * The DDraw arm is ddrawOwnsScreen, not the cooperative level alone: exclusive-fullscreen
+ * rights with no primary surface leave the desktop on screen (see gdi-visibility.ts).
  */
 export function isGameScreenOwned(renderActive?: RenderActive | null): boolean {
     const ddrawCtx = getDDrawContext();
-    if (isDDrawExclusiveFullscreen(ddrawCtx)) return true;
+    if (ddrawOwnsScreen(ddrawCtx)) return true;
     const active = renderActive ?? System.getInstance().services.render.getActive();
     return shouldSuppress3DGdiOverlay(active, ddrawCtx);
+}
+
+/**
+ * True while what the game RENDERED is actually on the display — isGameScreenOwned plus,
+ * for the DirectDraw arm, the requirement that a frame was presented. Suppressing the GDI
+ * overlay is only correct when there is a rendered frame underneath it to reveal; an app
+ * that takes exclusive fullscreen and creates a primary but paints its UI with GDI (a
+ * launcher that switches the desktop to its game resolution and hands the primary to the
+ * engine later) has an EMPTY primary, so suppressing the overlay shows a blank screen
+ * instead of its entire UI. A 3D presenter is only "active" once it renders, so its arm
+ * needs no extra test.
+ */
+function isGameContentOnScreen(renderActive?: RenderActive | null): boolean {
+    const ddrawCtx = getDDrawContext();
+    const active = renderActive ?? System.getInstance().services.render.getActive();
+    if (shouldSuppress3DGdiOverlay(active, ddrawCtx)) return true;
+    return ddrawShowsContent(ddrawCtx);
 }
 
 /**
@@ -71,7 +92,9 @@ export function isGameScreenOwned(renderActive?: RenderActive | null): boolean {
  */
 export function isScreenOwnerWindow(hwnd: number): boolean {
     const ddrawCtx = getDDrawContext();
-    if (!hwnd || !isDDrawExclusiveFullscreen(ddrawCtx)) return false;
+    // No primary surface ⇒ nothing of DirectDraw is on screen, so this window's client
+    // area is not "the primary" and its GDI paints are ordinary window output.
+    if (!hwnd || !ddrawOwnsScreen(ddrawCtx)) return false;
     return (ddrawCtx?.cooperative?.hwnd ?? 0) === hwnd;
 }
 
@@ -128,7 +151,15 @@ export function getWindowVisualBounds(hwnd: number): DialogOverlayRect | null {
     if (!root) return null;
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     const visited = new Set<number>();
-    const visit = (h: number): void => {
+    /**
+     * `clip` is the intersection of the client rects of the ancestors BELOW the root —
+     * the Win32 clip a descendant is already painted with (see getAncestorClipRect).
+     * A nested child dialog therefore cannot stretch these bounds past the root, while
+     * the root's OWN controls stay unclipped (clip=null at the first level): those are
+     * the ones our approximate DLU→px can push a few pixels past the root's rect, and
+     * they are genuinely drawn there, so the fill/erase must still cover them.
+     */
+    const visit = (h: number, clip: DialogOverlayRect | null): void => {
         if (visited.has(h)) return;
         visited.add(h);
         const w = windows.get(h);
@@ -144,10 +175,15 @@ export function getWindowVisualBounds(hwnd: number): DialogOverlayRect | null {
         // or a plain empty rect is left oversized until the next unrelated full repaint.
         if (h !== hwnd && (!w.visible || w.pendingDestroy)) return;
         const { x, y } = getAbsoluteWindowPosition(w);
-        minX = Math.min(minX, x);
-        minY = Math.min(minY, y);
-        maxX = Math.max(maxX, x + w.width);
-        maxY = Math.max(maxY, y + w.height);
+        const own: DialogOverlayRect = { x, y, w: w.width, h: w.height };
+        const drawn = clip ? intersectOverlayRects(own, clip) : own;
+        if (drawn.w > 0 && drawn.h > 0) {
+            minX = Math.min(minX, drawn.x);
+            minY = Math.min(minY, drawn.y);
+            maxX = Math.max(maxX, drawn.x + drawn.w);
+            maxY = Math.max(maxY, drawn.y + drawn.h);
+        }
+        // An open drop-down is its own ComboLBox popup — never clipped by the parent.
         if (w.isSystemControl
             && (w.systemControlClass ?? '').toLowerCase() === 'combobox'
             && listControlStates.get(w.handle)?.dropdownOpen) {
@@ -155,11 +191,23 @@ export function getWindowVisualBounds(hwnd: number): DialogOverlayRect | null {
             maxX = Math.max(maxX, r.x + r.w);
             maxY = Math.max(maxY, r.y + r.h);
         }
-        for (const c of w.children) visit(c);
+        const childClip = h === hwnd ? null : (clip ? intersectOverlayRects(own, clip) : own);
+        for (const c of w.children) visit(c, childClip);
     };
-    visit(hwnd);
+    visit(hwnd, null);
     if (!isFinite(minX)) return null;
     return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+}
+
+/** Rect intersection; a non-positive w/h means "empty". */
+function intersectOverlayRects(a: DialogOverlayRect, b: DialogOverlayRect): DialogOverlayRect {
+    const x = Math.max(a.x, b.x);
+    const y = Math.max(a.y, b.y);
+    return {
+        x, y,
+        w: Math.min(a.x + a.w, b.x + b.w) - x,
+        h: Math.min(a.y + a.h, b.y + b.h) - y,
+    };
 }
 
 function overlayRectsOverlap(a: DialogOverlayRect, b: DialogOverlayRect): boolean {
@@ -190,7 +238,9 @@ function getOverlayWindowZRank(hwnd: number): number {
 }
 
 function needsOverlayRepaint(win: WindowInfo): boolean {
-    if (!win.visible || win.pendingDestroy) return false;
+    // Ancestor-aware: a child of a hidden page keeps WS_VISIBLE, and repainting it here
+    // would redraw a page that was switched away (see isEffectivelyVisible).
+    if (!isEffectivelyVisible(win) || win.pendingDestroy) return false;
     if (isWindowUpdateLocked(win.handle)) return false;
     if (win.nativeClassName === '#32770') return true;
     if (win.guestCustomPaint && !win.isSystemControl) return true;
@@ -278,8 +328,9 @@ export type OverlayCompositePlan =
  * present paths. They differ only in the low-level draw primitive (own-encoder blit
  * vs. blitRects into a shared encoder); the DECISION lives here, once.
  *
- *  - Game owns the screen (DDraw exclusive fullscreen OR a hardware-3D renderer
- *    presenting to the canvas — isGameScreenOwned): the fullscreen presentation owns
+ *  - Game content is on the screen (a presented DDraw exclusive-fullscreen frame OR a
+ *    hardware-3D renderer presenting to the canvas — isGameContentOnScreen): the
+ *    fullscreen presentation owns
  *    the display, so the whole overlay is never composited — stale pre-fullscreen GDI
  *    would cover the game. Only the rects of live dialogs survive, and only those the
  *    DirectDraw ownership model says are actually on screen (dialogOverlayComposites);
@@ -293,7 +344,7 @@ export type OverlayCompositePlan =
  * regardless).
  */
 export function getOverlayCompositePlan(renderActive?: RenderActive | null): OverlayCompositePlan {
-    if (isGameScreenOwned(renderActive)) {
+    if (isGameContentOnScreen(renderActive)) {
         const rects = getLiveDialogOverlayRects();
         return rects.length ? { mode: 'rects', rects } : { mode: 'none' };
     }

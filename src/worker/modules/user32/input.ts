@@ -10,7 +10,9 @@ import { Mem } from '../../core/memory/mem-accessor';
 import { Marshaler } from '../../core/memory/marshaler';
 import { System } from '../../core/system';
 import { getWindowByHandle } from './window';
-import { getCapture, setCursorClipped, windows } from './shared-state';
+import {
+    clampToCursorClip, getCapture, getVirtualScreenRect, setCursorClipRect, warpGuestCursorTo, windows,
+} from './shared-state';
 import { GUEST_INPUT_FLAG } from '../../../input/sab-layout';
 
 export function createInputExports(): Record<string, ThunkImplementation> {
@@ -163,17 +165,40 @@ export function createInputExports(): Record<string, ThunkImplementation> {
         return hwnd;
     };
 
+    // BOOL ClipCursor(const RECT *lpRect) — confines the pointer to lpRect (NULL
+    // releases). The rect is clamped to the virtual screen and an inverted one is
+    // rejected, as in wineserver set_clip_rectangle / NtUserClipCursor; a pointer
+    // already outside the new rect is warped into it there and then.
     exports['ClipCursor'] = (ctx, mem, args) => {
-        const lpRect = args[0];
-        // A non-NULL rect confines the cursor (relative/captured mouse, e.g. Unreal
-        // SetMouseCapture); NULL releases the confinement. Mirror ShowCursor's host
-        // notification (see window.ts requestHostCursorVisible) so the host can engage
-        // pointer-lock on the faithful relative-mouse signal. Track in shared-state.
-        const clip = lpRect !== 0;
-        setCursorClipped(clip);
-        self.postMessage({ type: "clip_cursor", clip });
-        Logger.verbose(LogCategory.USER32, `ClipCursor(0x${lpRect.toString(16)}) -> clip=${clip}`);
-        return 1; // TRUE
+        const lpRect = args[0] >>> 0;
+        if (!lpRect) {
+            setCursorClipRect(null);
+            Logger.verbose(LogCategory.USER32, `ClipCursor(NULL)`);
+            return 1;
+        }
+        if (lpRect + 16 > mem.length) return 0;
+        const left = Mem.readInt32(lpRect);
+        const top = Mem.readInt32(lpRect + 4);
+        const right = Mem.readInt32(lpRect + 8);
+        const bottom = Mem.readInt32(lpRect + 12);
+        if (left === null || top === null || right === null || bottom === null) return 0;
+        if (left > right || top > bottom) return 0;
+        const screen = getVirtualScreenRect();
+        const rect = {
+            left: Math.max(left, screen.left),
+            top: Math.max(top, screen.top),
+            right: Math.min(right, screen.right),
+            bottom: Math.min(bottom, screen.bottom),
+        };
+        setCursorClipRect(rect.left > rect.right || rect.top > rect.bottom ? screen : rect);
+        // wineserver set_clip_rectangle warps only when the new rect actually excludes
+        // the pointer — an unchanged confinement is not a mouse event.
+        const pos = System.getInstance().inputManager.getMouseState();
+        const confined = clampToCursorClip(pos.x, pos.y);
+        if (confined.x !== pos.x || confined.y !== pos.y) warpGuestCursorTo(confined.x, confined.y);
+        Logger.verbose(LogCategory.USER32,
+            `ClipCursor(${rect.left},${rect.top},${rect.right},${rect.bottom})`);
+        return 1;
     };
 
     exports['WindowFromPoint'] = (ctx, mem, args) => {

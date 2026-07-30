@@ -379,6 +379,7 @@ export function handleSystemControlMouseAtScreen(
             const idx = state.topIndex + Math.floor((screenY - drop.y - 1) / LIST_ITEM_H);
             if (idx >= 0 && idx < state.items.length && idx !== state.selectedIndex) {
                 state.selectedIndex = idx;
+                state.caretIndex = idx;
                 // WM_GETTEXT/GetDlgItemText reads .title, not the list state — keep them
                 // in sync or a combo that visibly shows the picked item still reads back
                 // empty/stale text to the guest (see dialog.ts CB_SETCURSEL for the
@@ -411,18 +412,41 @@ export function handleSystemControlMouseAtScreen(
 
     const control = hitTestSystemControlAtScreenPoint(hostHwnd, screenX, screenY);
 
-    // --- Pressed pushbutton released outside the control: cancel the press ---
-    if (message === WM_LBUTTONUP && pressedButtonHwnd && control?.handle !== pressedButtonHwnd) {
-        const pressed = windows.get(pressedButtonHwnd);
-        pressedButtonHwnd = 0;
-        if (pressed) {
-            const cur = buttonCheckStates.get(pressed.handle) ?? 0;
-            buttonCheckStates.set(pressed.handle, cur & ~BST_PUSHED);
-            repaintHost(pressed, hostHwnd);
-        }
-    }
+    cancelStalePress(message, control?.handle ?? 0, hostHwnd);
 
     if (!control) return closedComboByClickAway;
+
+    return applyControlClassMouse(control, hostHwnd, message, wParam, screenX, screenY);
+}
+
+/** A pressed pushbutton released anywhere but on itself: cancel the press (Wine
+ *  button.c releases capture without notifying the parent). */
+function cancelStalePress(message: number, hitHwnd: number, hostHwnd: number): void {
+    if (message !== WM_LBUTTONUP || !pressedButtonHwnd || hitHwnd === pressedButtonHwnd) return;
+    const pressed = windows.get(pressedButtonHwnd);
+    pressedButtonHwnd = 0;
+    if (!pressed) return;
+    const cur = buttonCheckStates.get(pressed.handle) ?? 0;
+    buttonCheckStates.set(pressed.handle, cur & ~BST_PUSHED);
+    repaintHost(pressed, hostHwnd);
+}
+
+/**
+ * Our stand-in for a control CLASS's own window procedure (Wine button.c
+ * ButtonWndProc_common, listbox.c, combo.c): the class proc is what turns a
+ * DOWN/UP pair into WM_COMMAND(BN_CLICKED) for the parent, opens a combo's
+ * drop-down, moves a trackbar thumb. Reachable from every place a class proc would
+ * run — the two message pumps' hit-test paths and DefWindowProc (which is where a
+ * SUBCLASSED control forwards a message it did not handle).
+ */
+function applyControlClassMouse(
+    control: WindowInfo,
+    hostHwnd: number,
+    message: number,
+    wParam: number,
+    screenX: number,
+    screenY: number,
+): boolean {
     const controlClass = normalizedControlClass(control);
     const parentHwnd = control.parent ?? hostHwnd;
 
@@ -434,18 +458,9 @@ export function handleSystemControlMouseAtScreen(
         System.getInstance().windowManager.setFocus(control.handle);
     }
 
-    // Subclassing (MFC's DDX_Control/SubclassDlgItem — SetWindowLong(GWL_WNDPROC))
-    // replaces a control's wndproc for MESSAGE ROUTING/programmatic access; it does
-    // NOT reimplement the underlying system control class's default input behavior
-    // (real Windows: an unhandled mouse message falls through to the ORIGINAL
-    // COMCTL32/USER32 class proc via CallWindowProc). We don't emulate that original
-    // proc in x86 — this switch below IS our stand-in for it (click→BN_CLICKED,
-    // listbox/combobox selection, trackbar drag, …) — so it must run for every class
-    // it handles, subclassed or not. Skipping it here for anything but 'button' left
-    // every subclassed ComboBox/ListBox/Trackbar entirely inert (e.g. TLJ's Video
-    // Driver / Color Depth combos never open — MFC's DDX_Control wraps them purely
-    // for programmatic access, not custom input handling).
-
+    // Subclassing (SetWindowLong(GWL_WNDPROC) — MFC DDX_Control, UE1's WControl)
+    // replaces a control's wndproc for message routing; it does NOT reimplement the
+    // class's input behavior, so this switch must run subclassed or not.
     switch (controlClass) {
         case 'button': {
             if (!isButtonSystemControl(control)) return false;
@@ -491,6 +506,7 @@ export function handleSystemControlMouseAtScreen(
                 const idx = state.topIndex + Math.floor((screenY - absY - LIST_INSET) / LIST_ITEM_H);
                 if (idx >= 0 && idx < state.items.length) {
                     state.selectedIndex = idx;
+                    state.caretIndex = idx;
                     Logger.log(LogCategory.USER32,
                         `controlMouse: Listbox id=${control.controlId ?? 0} -> selected ${idx} "${state.items[idx].text}"`);
                     repaintHost(control, hostHwnd);
@@ -545,6 +561,39 @@ export function handleSystemControlMouseAtScreen(
         default:
             return false;
     }
+}
+
+/**
+ * Class-proc entry for a mouse message addressed to a KNOWN system control —
+ * DefWindowProc's half of the contract. A subclassed control's guest wndproc ends
+ * every message it does not consume with CallWindowProc/DefWindowProc to the proc it
+ * replaced (UE1: WControl::CallDefaultProc; MFC: CWnd::DefWindowProc), and on real
+ * Windows that IS the BUTTON/LISTBOX/COMBOBOX class proc, which is what sends
+ * WM_COMMAND(BN_CLICKED) to the parent. Without this the click reaches the guest,
+ * comes straight back to us, and dies.
+ *
+ * Takes the control directly instead of re-running the parent hit-test: the message
+ * was already routed to this window, and re-hit-testing could pick an overlapping
+ * sibling.
+ */
+export function handleSystemControlClassMouse(
+    control: WindowInfo,
+    message: number,
+    wParam: number,
+    lParam: number,
+): boolean {
+    if (!control.isSystemControl) return false;
+    if (message !== WM_MOUSEMOVE && message !== WM_LBUTTONDOWN && message !== WM_LBUTTONUP) return false;
+
+    // lParam holds SIGNED client coords relative to this control (they go negative
+    // while the mouse is captured outside it).
+    const clientX = (lParam << 16) >> 16;
+    const clientY = lParam >> 16;
+    const { x: absX, y: absY } = getAbsoluteWindowPosition(control);
+    const hostHwnd = control.parent ?? control.handle;
+
+    cancelStalePress(message, control.handle, hostHwnd);
+    return applyControlClassMouse(control, hostHwnd, message, wParam, absX + clientX, absY + clientY);
 }
 
 /** Wheel scrolling for the listbox (or open combo dropdown) under the cursor. */

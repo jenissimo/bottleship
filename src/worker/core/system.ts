@@ -260,6 +260,40 @@ export class System {
     public executablePath: string = "C:\\app.exe";  // Full VFS path to the executable
     public executableArgs: string = "";  // Command-line arguments from manifest
 
+    /** Installed by the worker: restart the guest process with a new command line. */
+    public onReExecRequest: ((commandLine: string) => void) | null = null;
+
+    /**
+     * True when `file` (optionally relative to `directory`) names the image THIS process
+     * was started from.
+     *
+     * A process launching its own image is a re-exec, not a child: the launcher hands the
+     * new command line over and exits. Single-process HLE cannot spawn a child, but it CAN
+     * reproduce a re-exec exactly — restart with those arguments. Common in front-end
+     * launchers that pick a map/save/renderer and relaunch (UE1's Game.exe re-running
+     * itself as `Game.exe <map> -SAVESLOT=n`).
+     */
+    public isSelfImage(file: string, directory: string = ""): boolean {
+        const clean = (s: string): string => s.trim().replace(/^"+|"+$/g, "").replace(/\//g, "\\");
+        let target = clean(file);
+        if (!target) return false;
+        const self = clean(this.executablePath);
+        // Bare or relative name: resolve against the stated working directory, else the
+        // image's own directory — the same order CreateProcess/ShellExecute resolve in.
+        if (!/^[a-z]:\\/i.test(target)) {
+            const base = clean(directory) || self.slice(0, self.lastIndexOf("\\") + 1);
+            target = (base.endsWith("\\") ? base : base + "\\") + target.replace(/^\\+/, "");
+        }
+        return target.toLowerCase() === self.toLowerCase();
+    }
+
+    /** Ask the worker to restart this process with `commandLine`. False if unsupported. */
+    public requestReExec(commandLine: string): boolean {
+        if (!this.onReExecRequest) return false;
+        this.onReExecRequest(commandLine);
+        return true;
+    }
+
     /**
      * Implicit TLS entries from PE modules using __declspec(thread).
      * Each entry records the TLS index and template data location so that
@@ -276,6 +310,8 @@ export class System {
     private hostCursorVisibility: ((visible: boolean) => void) | null = null;
     private hostCursorVisibleState: boolean | null = null;
     private hostCursorImage: ((image: HostCursorImage | null) => void) | null = null;
+    private hostCursorPosition: ((pos: { x: number; y: number } | null) => void) | null = null;
+    private hostCursorPositionState: string | null = null;
     private hostCursorWarpMode: ((active: boolean) => void) | null = null;
     private hostCursorWarpModeState = false;
     private hostMouseCapture: ((capture: boolean) => void) | null = null;
@@ -537,11 +573,56 @@ export class System {
         this.hostResize = callback;
     }
 
-    requestHostResize(width: number, height: number): void {
+    /**
+     * The guest wants the host surface to be this size. Every mode-setting path funnels
+     * through here, so this is also where the EMULATED DISPLAY MODE is published.
+     *
+     * There is exactly ONE host canvas and it IS the emulated screen, so its size and the
+     * emulated display mode cannot legitimately disagree — and when they did, everything
+     * that reports the desktop size (GetSystemMetrics(SM_CXSCREEN), EnumDisplaySettings,
+     * where a fullscreen window gets placed, and therefore where a click lands) was reading
+     * a different number from the one on screen. A D3D9 fullscreen device left the mode at
+     * the manifest's, so an 800x600 client sat centred in a 1024x768 desktop and every click
+     * was off by the centring offset. Publishing here makes the two agree by construction.
+     *
+     * `modeSet: false` opts a caller out, for a host resize that is deliberately not a
+     * change of the emulated screen.
+     */
+    requestHostResize(
+        width: number,
+        height: number,
+        opts?: { modeSet?: boolean; bpp?: number; refreshRate?: number },
+    ): void {
+        if (opts?.modeSet !== false && width > 0 && height > 0) {
+            const display = this.ddrawContext?.display;
+            if (display) {
+                display.width = width;
+                display.height = height;
+                if (opts?.bpp) display.bpp = opts.bpp;
+                if (opts?.refreshRate) display.refresh = opts.refreshRate;
+            }
+            const changed = this.emulatedDisplayMode?.width !== width || this.emulatedDisplayMode?.height !== height;
+            this.emulatedDisplayMode = {
+                width, height,
+                bpp: opts?.bpp ?? this.emulatedDisplayMode?.bpp ?? 0,
+                refreshRate: opts?.refreshRate ?? this.emulatedDisplayMode?.refreshRate ?? 0,
+            };
+            if (changed) {
+                Logger.log(LogCategory.SYSTEM,
+                    `[DISPLAY-MODE] ${width}x${height}${opts?.bpp ? `x${opts.bpp}` : ""} published as the emulated display mode`);
+            }
+        }
         if (this.hostResize) {
             this.hostResize(width, height);
         }
     }
+
+    /**
+     * The published emulated display mode, or null before any mode-set. The authoritative
+     * value for anything that must agree on "how big is the screen" — read this rather than
+     * a per-subsystem copy. `ddrawContext.display` is kept in step for the DDraw readers.
+     */
+    public emulatedDisplayMode: { width: number; height: number; bpp: number; refreshRate: number } | null = null;
 
     setHostCursorVisibilityCallback(callback: (visible: boolean) => void): void {
         this.hostCursorVisibility = callback;
@@ -594,6 +675,22 @@ export class System {
         if (this.hostCursorImage) {
             this.hostCursorImage(image);
         }
+    }
+
+    setHostCursorPositionCallback(callback: (pos: { x: number; y: number } | null) => void): void {
+        this.hostCursorPosition = callback;
+    }
+
+    /**
+     * Where the host must draw the pointer when that is NOT the pointer's own position:
+     * a SOFTWARE D3D device cursor is a sprite the runtime composites, and moving it never
+     * moved the OS pointer, so the host cannot infer it. null = the pointer position again.
+     */
+    requestHostCursorPosition(pos: { x: number; y: number } | null): void {
+        const key = pos ? `${pos.x},${pos.y}` : null;
+        if (this.hostCursorPositionState === key) return;
+        this.hostCursorPositionState = key;
+        this.hostCursorPosition?.(pos);
     }
 
     setHostMouseCaptureCallback(callback: (capture: boolean) => void): void {

@@ -167,7 +167,10 @@ export const gdi32Module: ModuleDescriptor = {
         makeFunc("PlgBlt", 11),
         makeFunc("Pie", 9),
         makeFunc("PaintRgn", 2),
-        makeFunc("PolyPolygon", 3),
+        // PolyPolygon/PolyPolyline/PolyDraw take (hdc, apt, counts, nCount) — 4 args.
+        // The stdcall RET N is derived from this count, so an undercount leaves 4 bytes
+        // of the caller's stack behind on every call.
+        makeFunc("PolyPolygon", 4),
         makeFunc("RoundRect", 7),
         makeFunc("GetBitmapBits", 3),
         makeFunc("SetBitmapBits", 3),
@@ -177,9 +180,9 @@ export const gdi32Module: ModuleDescriptor = {
         makeFunc("GdiTransparentBlt", 11),
         makeFunc("GdiGradientFill", 6),
         makeFunc("AngleArc", 6),
-        makeFunc("PolyPolyline", 3),
+        makeFunc("PolyPolyline", 4),
         makeFunc("ArcTo", 9),
-        makeFunc("PolyDraw", 3),
+        makeFunc("PolyDraw", 4),
         makeFunc("ExtTextOutW", 8),
         makeFunc("PolyTextOutA", 3),
         makeFunc("PolyTextOutW", 3),

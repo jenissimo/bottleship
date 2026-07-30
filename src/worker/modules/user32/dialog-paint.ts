@@ -6,11 +6,12 @@
  */
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
-import { WindowInfo, windows, getAbsoluteWindowPosition, ensureHostCursorForDialog, getChildrenInPaintOrder } from './shared-state';
+import { WindowInfo, windows, isEffectivelyVisible, getAbsoluteWindowPosition, getAncestorClipRect, ensureHostCursorForDialog, getChildrenInPaintOrder } from './shared-state';
 import { paintChildControls, repaintChildControls, paintDialogClientMessage, registerOwnedPopupRestamper } from './controls';
 import { registerFullDialogRepainter, registerOverlayRepairRepainter } from './control-interaction';
 import { getWindowVisualBounds } from './dialog-overlay';
 import type { GDIContext } from '../gdi32/context';
+import { paintTraceEnabled, logPaintRequest } from './paint-trace';
 
 /** Win32 COLOR_BTNFACE as COLORREF (0x00BBGGRR). */
 const COLOR_DLGFACE = 0x00C8D0D4;
@@ -75,15 +76,73 @@ function getDialogProcedure(win: WindowInfo): number {
  */
 export function requestGuestDialogPaint(dialogHwnd: number): void {
     const win = windows.get(dialogHwnd);
-    if (!win?.visible) return;
-    if (!shouldUseGuestDialogPaint(win)) return;
-    if (!getDialogProcedure(win)) return;
+    if (!win?.visible) {
+        if (paintTraceEnabled) logPaintRequest(dialogHwnd, false, win ? 'not-visible' : 'no-window');
+        return;
+    }
+    if (!shouldUseGuestDialogPaint(win)) {
+        if (paintTraceEnabled) logPaintRequest(dialogHwnd, false, 'no-guestCustomPaint');
+        return;
+    }
+    if (!getDialogProcedure(win)) {
+        if (paintTraceEnabled) logPaintRequest(dialogHwnd, false, 'no-dlgProc');
+        return;
+    }
+    if (paintTraceEnabled) logPaintRequest(dialogHwnd, true, 'posted');
 
     const system = System.getInstance();
     system.windowManager.postMessage(dialogHwnd, WM_PAINT, 0, 0);
     system.scheduler.wakeMessageWaiters();
     Logger.log(LogCategory.USER32,
         `requestGuestDialogPaint: posted WM_PAINT hwnd=0x${dialogHwnd.toString(16)}`);
+}
+
+/**
+ * Drop a control's pixels before its new content is stamped.
+ *
+ * Only for a control whose parent GUEST-paints its client: there, 'controls' mode stamps
+ * the control straight onto the flat overlay with no way to restore what was under it, so
+ * a changed caption renders on top of the old one and both stay readable. Clearing first
+ * makes the overlay repair (ancestor-aware) restore the background and the control is then
+ * drawn once. A parent we paint ourselves needs none of this — its background is redrawn.
+ */
+/**
+ * Put back the guest's OWN pixels for the rect `win` occupies, from the client image an
+ * ancestor last flushed (captured before any control was stamped over it).
+ *
+ * Walk up: the backdrop under a window belongs to whichever ancestor painted that area — a
+ * page dialog, or the frame behind it. Works for a control's rect and for a whole page being
+ * hidden; the alternative, clearing to transparent, leaves a hole the guest never repaints
+ * (a teal band across the dialog where the previous page was).
+ */
+export function restoreClientRectFromAncestors(win: WindowInfo): boolean {
+    const gdi = System.getInstance().gdiContext;
+    if (!gdi?.restoreWindowClientRect) return false;
+    const origin = getAbsoluteWindowPosition(win);
+    const w = Math.max(1, win.width);
+    const h = Math.max(1, win.height);
+    for (let anc = win.parent !== undefined ? windows.get(win.parent) : undefined; anc;
+         anc = anc.parent !== undefined ? windows.get(anc.parent) : undefined) {
+        if (gdi.restoreWindowClientRect(anc.handle, origin.x, origin.y, w, h)) return true;
+    }
+    return false;
+}
+
+export function eraseControlOverlayRect(child: WindowInfo): boolean {
+    // System controls ONLY — the things WE stamp. A child WINDOW paints itself and can be
+    // page-sized; flooding its whole rect with one sampled colour paints over everything it
+    // covers (observed: hiding a menu page filled the screen area outside the frame grey).
+    // Those go through eraseDialogOverlay's clear + repair instead.
+    if (!child.isSystemControl) return false;
+    const parent = child.parent !== undefined ? windows.get(child.parent) : undefined;
+    if (!parent?.guestCustomPaint) return false;
+    // ONLY erase when the exact pixels can be put back. Clearing as a fallback is worse
+    // than leaving the old ones: the clear triggers the overlay repair, which repaints a
+    // dialog in 'full' mode and stamps the standard grey COLOR_DLGFACE across the guest's
+    // splash — a grey box, plus the caption drawn twice. And there is nothing stale to
+    // remove in that case anyway: no backing exists precisely because the dialog has not
+    // painted its client yet, so its captions are being set for the FIRST time.
+    return restoreClientRectFromAncestors(child);
 }
 
 function paintDialogBackground(win: WindowInfo, hdc: number, gdi: GDIContext): void {
@@ -135,7 +194,20 @@ function paintWindowSubtreeToOverlay(
     const system = System.getInstance();
     const gdi = system.gdiContext;
     const win = windows.get(hwnd);
-    if (!win || !win.visible) return;
+    if (!win || !isEffectivelyVisible(win)) return;
+
+    // Win32 clips a child window's pixels to every ancestor's client area; the overlay
+    // is one flat canvas, so apply that clip ourselves for the whole of this window's
+    // paint (its face, its frame and its controls all go through the same ctx).
+    const clip = getAncestorClipRect(win);
+    const ctx = clip ? gdi.getDC(hdc) : undefined;
+    if (clip && ctx) {
+        if (clip.w <= 0 || clip.h <= 0) return; // fully outside an ancestor
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(clip.x, clip.y, clip.w, clip.h);
+        ctx.clip();
+    }
 
     // Background and controls for dialog/custom windows.
     // System controls are painted by paintChildControls(parent).
@@ -153,6 +225,8 @@ function paintWindowSubtreeToOverlay(
         paintChildControls(win.handle, hdc, gdi);
         paintDialogClientMessage(hdc, gdi, win);
     }
+
+    if (clip && ctx) ctx.restore();
 
     for (const childHwnd of getChildrenInPaintOrder(win.handle)) {
         paintWindowSubtreeToOverlay(childHwnd, hdc, visited, mode);
@@ -232,6 +306,13 @@ export function repaintDialogAfterContentChange(parentHwnd: number): void {
     const win = windows.get(parentHwnd);
     // Guest already drew the dialog client (WM_PAINT flush). Only repaint OS controls.
     if (win?.guestCustomPaint) {
+        // NOTE: 'controls' stamps each control over whatever is already on the flat overlay;
+        // it cannot restore the background UNDER one. A control whose text changed keeps the
+        // old string showing through the new one, and a hidden control keeps its pixels.
+        // Neither requesting a guest WM_PAINT here nor erasing the rect in ShowWindow fixes
+        // it (measured: the first changes nothing, the second resurrects hidden pages via the
+        // overlay repair) — the real fix is ancestor-aware visibility in the painters plus a
+        // retained per-window backing store.
         paintDialogToOverlay(parentHwnd, 'controls');
         return;
     }

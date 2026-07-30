@@ -541,14 +541,20 @@ export function registerWindowGeometryExports(
             return 0;
         }
 
+        // Wine get_windows_offset: the client→screen offset accumulates EVERY ancestor's
+        // client origin, not just the window's own (parent-relative) x/y. Using the raw
+        // x/y drops the offset of every grandparent, so a nested control's own x/y of
+        // (0,0) mapped "to screen" stays (0,0) — and the standard
+        // ClientToScreen/ScreenToClient → SetWindowPos re-positioning idiom then places
+        // the window off by the grandparent chain's origin. GetWindowRect and
+        // MapWindowPoints already walk the chain; these two must agree with them.
+        const origin = getAbsoluteWindowPosition(window);
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-        const cx = inX;
-        const cy = inY;
-        const ox = window.x + cx;
-        const oy = window.y + cy;
+        const ox = origin.x + inX;
+        const oy = origin.y + inY;
         view.setInt32(lpPoint, ox, true);
         view.setInt32(lpPoint + 4, oy, true);
-        Logger.verbose(LogCategory.USER32, `ClientToScreen(0x${hWnd.toString(16)}) (${cx},${cy}) + win(${window.x},${window.y}) -> (${ox},${oy})`);
+        Logger.verbose(LogCategory.USER32, `ClientToScreen(0x${hWnd.toString(16)}) (${inX},${inY}) + origin(${origin.x},${origin.y}) -> (${ox},${oy})`);
         return 1;
     };
 
@@ -566,12 +572,14 @@ export function registerWindowGeometryExports(
         if (!win) {
             return 0;
         }
-        const ox = sx - win.x;
-        const oy = sy - win.y;
+        // Same full-ancestor-chain origin as ClientToScreen (Wine get_windows_offset).
+        const origin = getAbsoluteWindowPosition(win);
+        const ox = sx - origin.x;
+        const oy = sy - origin.y;
         view.setInt32(lpPoint, ox, true);
         view.setInt32(lpPoint + 4, oy, true);
         Logger.verbose(LogCategory.USER32,
-            `ScreenToClient(0x${hWnd.toString(16)}) (${sx},${sy}) - win(${win.x},${win.y}) -> (${ox},${oy})`);
+            `ScreenToClient(0x${hWnd.toString(16)}) (${sx},${sy}) - origin(${origin.x},${origin.y}) -> (${ox},${oy})`);
         return 1;
     };
 

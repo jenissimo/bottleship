@@ -2,6 +2,12 @@ import { V86 } from "v86";
 import { ThunkGenerator } from "./core/thunking/thunk-generator";
 import { Process } from "./core/process";
 import { System } from "./core/system";
+
+// Which guest thread is driving a given VFS read — the shared-cursor question can only
+// be answered where every file API converges, not at one API's fast path.
+(globalThis as unknown as { __curTid?: () => number }).__curTid = () => {
+    try { return System.getInstance().scheduler.getCurrentThread()?.id ?? -1; } catch { return -1; }
+};
 import { APIRegistry } from "./core/api-registry";
 import { memoryWatch } from "./core/memory/memory-watch";
 import { Kernel32 } from "./modules/kernel32";
@@ -237,6 +243,42 @@ const state: WorkerState = {
 };
 
 let placeholderActive = true;
+/**
+ * HLE-readiness gate. STRUCTURAL startup invariant: no guest instruction may execute
+ * before the HLE modules are registered in the dispatcher.
+ *
+ * `system.process` exists from the moment the Process is constructed, but module
+ * registration happens later — and `await backend.initialize(canvas)` sits in between. A
+ * bundle load that landed inside that await window started the guest against an EMPTY
+ * dispatch table, so every import returned ERROR_NOT_SUPPORTED (50); a DllMain that
+ * called the result as a function pointer then jumped to 0x32 and the process died with
+ * a wild EIP nowhere near the cause. Timing-dependent, so it reproduced roughly never
+ * and then killed a user's session once.
+ *
+ * Gating on `system.process` alone cannot express this; a promise the load paths await
+ * can, and the dispatcher asserts the same invariant from the other side
+ * (markHleRegistrationComplete) so a future reordering fails loudly instead of silently.
+ */
+let resolveHleReady: () => void = () => { /* replaced during init */ };
+let hleReady: Promise<void> = new Promise<void>((resolve) => { resolveHleReady = resolve; });
+/** True once HLE registration has completed for the current v86 instance. */
+let hleReadyResolved = false;
+
+/** Called after every dispatcher.registerModule — opens the gate. */
+const markHleReady = (): void => {
+  if (hleReadyResolved) return;
+  hleReadyResolved = true;
+  System.getInstance().process?.dispatcher?.markHleRegistrationComplete?.();
+  resolveHleReady();
+};
+
+/** Re-arm the gate when the emulator is torn down / restarted, so a load that arrives
+ *  during a rebuild waits for the NEW registration rather than the previous one. */
+const resetHleReady = (): void => {
+  hleReadyResolved = false;
+  hleReady = new Promise<void>((resolve) => { resolveHleReady = resolve; });
+};
+
 let pendingPeData: Uint8Array | null = null;
 let pendingBundle: { data?: Uint8Array; url?: string; blob?: Blob } | null = null;
 let heartbeatInterval: number | null = null;
@@ -250,6 +292,10 @@ let _prefetchController: AbortController | null = null;
 let loadBundleChain: Promise<void> = Promise.resolve();
 /** True once a PE has been booted in this worker session (loadApp / load_bundle without page reload). */
 let gameSessionActive = false;
+/** The payload that booted the current game — replayed verbatim by a self re-exec. */
+let lastBundlePayload: { data?: Uint8Array; url?: string; blob?: Blob; blobs?: File[]; preload?: boolean } | null = null;
+/** Command line the next boot must use instead of the manifest's `args` (self re-exec). */
+let pendingReExecArgs: string | null = null;
 let registrySaveTimeout: number | null = null;
 let registrySaveGeneration = 0;
 /** do_tick liveness counter — incremented in the tick_hooks_before guard every v86 do_tick().
@@ -828,6 +874,8 @@ const loadPeData = async (peData: Uint8Array, skipReset: boolean = false) => {
     pendingPeData = peData;
     return;
   }
+  // The Process exists but the dispatch table may still be empty (see hleReady).
+  await hleReady;
 
   // Reset system state before loading new application
   if (!skipReset) {
@@ -1251,6 +1299,8 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
     pendingBundle = payload;
     return;
   }
+  // The Process exists but the dispatch table may still be empty (see hleReady).
+  await hleReady;
 
   bootMark("load-bundle-start");
 
@@ -1770,9 +1820,15 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
     }
     const executablePath = `C:\\${vfsRelPath}`;
 
+    // Re-installed per boot: system.reset() clears it, and a re-exec'd process must still
+    // be able to re-exec again (the front-end can be reached a second time).
+    system.onReExecRequest = requestSelfReExec;
     system.executableName = exeName;
     system.executablePath = executablePath;
-    system.executableArgs = bundle.manifest.args ?? "";
+    // A self re-exec supplies the command line the LAUNCHER chose; it outranks the
+    // manifest's boot args for exactly one boot, then the manifest applies again.
+    system.executableArgs = pendingReExecArgs ?? bundle.manifest.args ?? "";
+    pendingReExecArgs = null;
     const lastSlashIdx = executablePath.lastIndexOf("\\");
     const executableDir = lastSlashIdx > 2 ? executablePath.slice(0, lastSlashIdx + 1) : "C:\\";
     system.fileSystem.setCurrentDirectory(executableDir);
@@ -1835,13 +1891,59 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
 };
 
 const loadBundle = (payload: { data?: Uint8Array; url?: string; blob?: Blob; blobs?: File[]; preload?: boolean }) => {
+  lastBundlePayload = payload;
   loadBundleChain = loadBundleChain
     .then(() => loadBundleImpl(payload))
     .catch(err => Logger.error(LogCategory.SYSTEM, `load_bundle failed: ${err}`));
   return loadBundleChain;
 };
 
+/**
+ * Restart the guest with a new command line — the single-process realization of a
+ * launcher re-execing its own image (System.isSelfImage / requestReExec).
+ *
+ * Replays the payload that booted this game, so the same bundle is remounted and the OPFS
+ * overlay (saves, configs) carries across exactly as it does for a real relaunch.
+ *
+ * Deferred to a MACROTASK, never started inline. The request arrives from inside the
+ * ShellExecute/CreateProcess thunk, and the teardown stops the very v86 instance that is
+ * mid-call: the scheduler then tries to save a main thread whose state is unsaveable and
+ * kills the process (fatal guard 0x4100). A host `load_bundle` message is itself a
+ * macrotask, so this is the same proven entry the normal path uses — by then the thunk has
+ * returned its SE_ERR_/PROCESS_INFORMATION value and the guest is at a clean boundary.
+ */
+const requestSelfReExec = (commandLine: string): void => {
+  if (!lastBundlePayload) {
+    Logger.warn(LogCategory.SYSTEM, `[ReExec] ignored "${commandLine}" — no bundle payload to replay`);
+    return;
+  }
+  if (pendingReExecArgs !== null) return; // already scheduled; a launcher may ask twice
+  pendingReExecArgs = commandLine;
+  const payload = lastBundlePayload;
+
+  // Ask the HOST to restart us by reloading the page. A re-exec has to land in a pristine
+  // process, and an in-worker teardown+reload is not that: the relaunched image boots into
+  // the heavy path (level load, DDraw device, tens of thousands of surfaces) over a worker
+  // that just hosted a full game, and wedges before its first present — while the very same
+  // command line on a cold boot runs. The host replies by reloading, which is the cold boot.
+  if (payload?.url) {
+    Logger.log(LogCategory.SYSTEM, `[ReExec] requesting host page-reload restart, args "${commandLine}"`);
+    self.postMessage({ type: "reexec", args: commandLine, url: payload.url });
+    return;
+  }
+
+  // No URL to replay (a bundle handed over as a Blob by "Load File…") — a page reload could
+  // not find it again, so fall back to the in-worker restart. Deferred to a macrotask: the
+  // request comes from inside the ShellExecute/CreateProcess thunk, and tearing down the v86
+  // that is mid-call makes the scheduler kill an unsaveable main thread (fatal guard 0x4100).
+  Logger.log(LogCategory.SYSTEM,
+    `[ReExec] no replayable URL — in-worker restart with args "${commandLine}"`);
+  setTimeout(() => loadBundle(payload!), 0);
+};
+
 const initV86 = async (canvas: OffscreenCanvas) => {
+  // Arm the HLE gate for THIS emulator instance before anything can await it.
+  resetHleReady();
   // Try to apply RAM configuration from pending bundle if available
   let ramSize = EMU_MEMORY_SIZE;
   if (pendingBundle) {
@@ -2000,6 +2102,9 @@ const initV86 = async (canvas: OffscreenCanvas) => {
         } else {
           self.postMessage({ type: "cursor_image", pixels: null });
         }
+      });
+      system.setHostCursorPositionCallback((pos) => {
+        self.postMessage({ type: "device_cursor_pos", x: pos ? pos.x : null, y: pos ? pos.y : null });
       });
       system.setHostMouseCaptureCallback((capture) => {
         self.postMessage({ type: "mouse_capture", capture });
@@ -2337,6 +2442,9 @@ const initV86 = async (canvas: OffscreenCanvas) => {
 
       bootMark("modules-registered");
 
+      // Every HLE module is now in the dispatch table — the guest may run.
+      markHleReady();
+
       // Initialize WASM hypercall infrastructure (page + managers).
       // NOTE: dispatch is NOT enabled yet (hc_enabled=0) — all thunks still go through JS.
       {
@@ -2672,6 +2780,15 @@ self.onmessage = (event: MessageEvent) => {
     // e.g. __noHeapSlab to A/B the WASM heap slab. Survives page F5 because the host
     // replays it on every worker init. Must arrive before load_bundle (PE-load reads it).
     if (typeof message.key === "string") (globalThis as any)[message.key] = message.value;
+    return;
+  }
+
+  if (message?.type === "set_boot_args") {
+    // The command line a self re-exec chose, replayed by the host after the page reload it
+    // performed on our behalf. Must arrive BEFORE load_bundle — loadBundleImpl consumes it
+    // in place of the manifest's `args` for exactly one boot.
+    pendingReExecArgs = typeof message.args === "string" ? message.args : null;
+    Logger.log(LogCategory.SYSTEM, `[ReExec] boot args from host: "${pendingReExecArgs ?? ""}"`);
     return;
   }
 

@@ -6,7 +6,7 @@
 import { WindowManager } from '../windowing/window-manager';
 import type { WindowObject } from '../windowing/window-manager';
 import { Logger, LogCategory } from '../../core/logger';
-import { getCapture, getAbsoluteWindowPosition } from '../../modules/user32/shared-state';
+import { getCapture, getAbsoluteWindowPosition, clampToCursorClip } from '../../modules/user32/shared-state';
 import { getWindowByHandle } from '../../modules/user32/window';
 import { vkToDik } from '../../modules/dinput/dinput-vk-dik';
 import { TimeService } from '../time';
@@ -237,6 +237,11 @@ const DBLCLK_DIST_PX = 4;
 // Default WM_MOUSEHOVER delay (matches Windows default HOVER_DEFAULT)
 const HOVER_DEFAULT_MS = 400;
 
+/** Mouse-message coordinates are packed into a signed 16-bit lParam field. */
+function clampScreenCoord(v: number): number {
+    return Math.max(0, Math.min(32767, v));
+}
+
 interface TmeHoverEntry {
     fireAt: number;
     delayMs: number;
@@ -257,6 +262,20 @@ export class InputManager {
     private currentMouseX = 0;
     private currentMouseY = 0;
     private currentButtons = 0;
+    /** Last position the host PUBLISHED. The cursor position is a shared cell — the
+     *  host writes real motion, the guest writes SetCursorPos — and the SAB record
+     *  republishes the position slot on any commit, so only a CHANGED publication
+     *  (real motion) takes the position back from the guest. */
+    private lastSabMouseX = 0;
+    private lastSabMouseY = 0;
+    /** Browser-flag mask of buttons whose 0→1 edge poll() has seen but no guest read has.
+     *  The SAB record is a LEVEL with no edge queue, and the host can publish a press and
+     *  its release inside one guest quantum (the harness injectors do it in a single JS
+     *  turn) — so no guest sample ever falls between them and the press is lost, while a
+     *  physical press always spans many device samples. This carries the edge to the first
+     *  guest read; consumeMouseButtonLatch() drains it, one sample wide, so a level-only
+     *  API like DirectInput's immediate mouse state still sees the press exactly once. */
+    private mouseButtonLatch = 0;
     private gamepadConnected = false;
     private gamepadButtons = 0;
     private gamepadAxes: [number, number, number, number] = [0, 0, 0, 0];
@@ -472,9 +491,23 @@ export class InputManager {
         // EVERY seq bump (each mouse move) → endless weapon cycling in DInput games.
         const mouseWheel       = Atomics.exchange(this.inputView, INPUT_INDEX.mouseWheel, 0);
 
-        this.currentMouseX    = mouseX;
-        this.currentMouseY    = mouseY;
+        // Only real motion reclaims the position from a guest SetCursorPos — the record
+        // republishes this slot on every commit (see lastSabMouseX).
+        if (mouseX !== this.lastSabMouseX || mouseY !== this.lastSabMouseY) {
+            this.lastSabMouseX = mouseX;
+            this.lastSabMouseY = mouseY;
+            const confined = clampToCursorClip(mouseX, mouseY);
+            this.currentMouseX = confined.x;
+            this.currentMouseY = confined.y;
+        }
         this.currentButtons   = buttons;
+
+        // Win32 messages carry the SYSTEM cursor position — confined, and reflecting a
+        // guest SetCursorPos — not the raw publication (queue_hardware_message overwrites
+        // msg->x/y with the desktop cursor for exactly this reason). DirectInput's
+        // relative axes stay on the raw slots: a guest warp must not produce a delta.
+        const cursorX = this.currentMouseX;
+        const cursorY = this.currentMouseY;
 
         // DirectInput mouse: accumulate wheel + buffer events.
         // The SAB slot carries browser PIXEL deltaY (~100px per notch, + = scroll down).
@@ -508,6 +541,10 @@ export class InputManager {
         if (!prevLButton && this.keyStates[0x01]) this.keyPressedSinceLastQuery[0x01] = 1;
         if (!prevRButton && this.keyStates[0x02]) this.keyPressedSinceLastQuery[0x02] = 1;
         if (!prevMButton && this.keyStates[0x04]) this.keyPressedSinceLastQuery[0x04] = 1;
+        // Same edges, browser-flag mask, for readers of the raw button state (DirectInput).
+        if (!prevLButton && this.keyStates[0x01]) this.mouseButtonLatch |= 1;
+        if (!prevRButton && this.keyStates[0x02]) this.mouseButtonLatch |= 2;
+        if (!prevMButton && this.keyStates[0x04]) this.mouseButtonLatch |= 4;
 
         // Pass 1: Update keyStates[] from bitfield diff (for DInput/GetAsyncKeyState)
         // This runs BEFORE targetWin check so keyStates are always current
@@ -573,21 +610,7 @@ export class InputManager {
 
         const targetHwnd = targetWin.hwnd;
 
-        // Faithful Win32 mouse routing: capture → WindowFromPoint(cursor).
-        // 1. A window with mouse capture receives every mouse message regardless of the
-        //    cursor position (UE1/UT menus SetCapture during drag).
-        // 2. Otherwise the window under the cursor (Z-order WindowFromPoint, with the
-        //    dialog-overlay router as a fallback, inside getMouseTargetWindow).
-        // 3. Last resort: the keyboard/active target (e.g. before any window is shown).
-        let mouseTargetWin: WindowObject | undefined;
-        const captureHwnd = getCapture();
-        if (captureHwnd) {
-            const capWin = this.windowManager.getWindow(captureHwnd);
-            if (capWin?.visible) mouseTargetWin = capWin;
-        }
-        if (!mouseTargetWin) {
-            mouseTargetWin = this.windowManager.getMouseTargetWindow(mouseX, mouseY) ?? targetWin;
-        }
+        const mouseTargetWin = this.resolveMouseTarget(cursorX, cursorY) ?? targetWin;
         const mouseTargetHwnd = mouseTargetWin.hwnd;
 
         // Only enqueue WM_* when someone is waiting (e.g. GetMessage), or when forceEnqueue (e.g. about to wait)
@@ -612,27 +635,12 @@ export class InputManager {
         }
 
         // Screen coordinates (for MSG.pt)
-        const screenX = mouseX;
-        const screenY = mouseY;
+        const screenX = cursorX;
+        const screenY = cursorY;
 
-        const clampCoord = (v: number) => Math.max(0, Math.min(32767, v));
-
-        // Win32: mouse message lParam uses client coords relative to target hwnd.
-        // HLE coordinate model: client origin == window rect origin. We never render
-        // window decorations (no caption/border pixels exist on the canvas), and
-        // ScreenToClient/ClientToScreen/GetCursorPos all treat client==rect too.
-        // Subtracting clientOffset here put lParam in a DIFFERENT coordinate system
-        // than GetCursorPos — UE1 (HP) reads both and oscillates (mouse tug-of-war,
-        // cursor ~27px off → menu hover/clicks dead). clientOffset stays valid for
-        // SIZE math only (GetClientRect/AdjustWindowRect).
-        // Prefer user32 absolute position (parent chain) over WindowManager.rect so
-        // child dialogs and MoveWindow'd launchers match ScreenToClient/GetCursorPos.
-        const targetInfo = getWindowByHandle(mouseTargetHwnd);
-        const targetAbs = targetInfo
-            ? getAbsoluteWindowPosition(targetInfo)
-            : { x: mouseTargetWin.rect.x, y: mouseTargetWin.rect.y };
-        const clientX = clampCoord(screenX - targetAbs.x);
-        const clientY = clampCoord(screenY - targetAbs.y);
+        const client = this.clientPointFor(mouseTargetWin, screenX, screenY);
+        const clientX = client.x;
+        const clientY = client.y;
 
         // LPARAM for mouse button/move messages (client coords)
         const mouseLParam = ((clientY & 0xFFFF) << 16) | (clientX & 0xFFFF);
@@ -667,33 +675,26 @@ export class InputManager {
         // the move when a snapshot carries both loses the position permanently
         // (lastMouseX/Y advance regardless), so a guest that hover-tests from the last
         // move acts on the previously hovered item.
-        if (mouseX !== this.lastMouseX || mouseY !== this.lastMouseY) {
+        if (cursorX !== this.lastMouseX || cursorY !== this.lastMouseY) {
             if (enqueue) {
-                const wParam = this.buttonsToWParam(buttons);
-                // Windows sends WM_SETCURSOR (hit-test HTCLIENT, trigger message in the
-                // high word) ahead of client-area mouse messages — apps re-assert their
-                // cursor there (SDL2 applies SDL_ShowCursor state ONLY in this handler,
-                // so without it a hidden/blank cursor request is never observed).
-                this.windowManager.postMessage(mouseTargetHwnd, WM_SETCURSOR, mouseTargetHwnd,
-                    (HTCLIENT | (WM_MOUSEMOVE << 16)) >>> 0, screenX, screenY, 0, keyStateSnapshot);
-                this.windowManager.postMessage(mouseTargetHwnd, WM_MOUSEMOVE, wParam, mouseLParam, screenX, screenY, 0, keyStateSnapshot);
+                this.postCursorMove(mouseTargetWin, screenX, screenY, buttons, keyStateSnapshot);
                 Logger.verbose(LogCategory.SYSTEM, `Input: MouseMove (${clientX}, ${clientY})`);
             }
             // Any movement resets the hover timer for all tracked windows
             for (const entry of this.tmeHoverMap.values()) {
                 entry.fireAt = Date.now() + entry.delayMs;
-                entry.x = mouseX;
-                entry.y = mouseY;
+                entry.x = cursorX;
+                entry.y = cursorY;
             }
-            this.lastMouseX = mouseX;
-            this.lastMouseY = mouseY;
+            this.lastMouseX = cursorX;
+            this.lastMouseY = cursorY;
         }
 
         // --- WM_MOUSEHOVER timer check (one-shot per TrackMouseEvent call) ---
         if (this.tmeHoverMap.size > 0) {
             const now = Date.now();
             for (const [hwnd, entry] of this.tmeHoverMap) {
-                if (now >= entry.fireAt && mouseX === entry.x && mouseY === entry.y) {
+                if (now >= entry.fireAt && cursorX === entry.x && cursorY === entry.y) {
                     const hoverWParam = this.buttonsToWParam(buttons);
                     this.windowManager.postMessage(hwnd, WM_MOUSEHOVER, hoverWParam, mouseLParam, screenX, screenY, 0, keyStateSnapshot);
                     Logger.verbose(LogCategory.SYSTEM, `Input: WM_MOUSEHOVER hwnd=0x${hwnd.toString(16)}`);
@@ -747,7 +748,7 @@ export class InputManager {
         // Mouse wheel - also always enqueued (discrete event)
         // NOTE: WM_MOUSEWHEEL lParam uses SCREEN coordinates, not client coords
         if (mouseWheel !== 0) {
-            const lParamWheel = ((clampCoord(screenY) & 0xFFFF) << 16) | (clampCoord(screenX) & 0xFFFF);
+            const lParamWheel = ((clampScreenCoord(screenY) & 0xFFFF) << 16) | (clampScreenCoord(screenX) & 0xFFFF);
             const wheelDelta = Math.round(-mouseWheel * 1.2);
             const wParam = (this.buttonsToWParam(buttons) & 0xFFFF) | ((wheelDelta & 0xFFFF) << 16);
             this.windowManager.postMessage(mouseTargetHwnd, WM_MOUSEWHEEL, wParam, lParamWheel, screenX, screenY, 0, keyStateSnapshot);
@@ -805,6 +806,97 @@ export class InputManager {
         // Update prevKeyBitfield
         this.prevKeyBitfield.set(this.keyBitfieldSnapshot);
 
+    }
+
+    /**
+     * Faithful Win32 mouse routing for a screen point:
+     * 1. A window with mouse capture receives every mouse message regardless of the
+     *    cursor position (UE1/UT menus SetCapture during drag).
+     * 2. Otherwise the window under the cursor (Z-order WindowFromPoint, with the
+     *    dialog-overlay router as a fallback, inside getMouseTargetWindow).
+     * 3. Last resort: the keyboard/active target (e.g. before any window is shown).
+     */
+    private resolveMouseTarget(screenX: number, screenY: number): WindowObject | undefined {
+        const captureHwnd = getCapture();
+        if (captureHwnd) {
+            const capWin = this.windowManager.getWindow(captureHwnd);
+            if (capWin?.visible) return capWin;
+        }
+        return this.windowManager.getMouseTargetWindow(screenX, screenY)
+            ?? this.windowManager.getKeyboardTargetWindow();
+    }
+
+    /**
+     * Win32: mouse message lParam uses client coords relative to the target hwnd.
+     * HLE coordinate model: client origin == window rect origin. We never render
+     * window decorations (no caption/border pixels exist on the canvas), and
+     * ScreenToClient/ClientToScreen/GetCursorPos all treat client==rect too.
+     * Subtracting clientOffset here put lParam in a DIFFERENT coordinate system
+     * than GetCursorPos — UE1 (HP) reads both and oscillates (mouse tug-of-war,
+     * cursor ~27px off → menu hover/clicks dead). clientOffset stays valid for
+     * SIZE math only (GetClientRect/AdjustWindowRect).
+     * Prefer user32 absolute position (parent chain) over WindowManager.rect so
+     * child dialogs and MoveWindow'd launchers match ScreenToClient/GetCursorPos.
+     */
+    private clientPointFor(win: WindowObject, screenX: number, screenY: number): { x: number; y: number } {
+        const info = getWindowByHandle(win.hwnd);
+        const abs = info ? getAbsoluteWindowPosition(info) : { x: win.rect.x, y: win.rect.y };
+        return { x: clampScreenCoord(screenX - abs.x), y: clampScreenCoord(screenY - abs.y) };
+    }
+
+    /**
+     * Windows sends WM_SETCURSOR (hit-test HTCLIENT, trigger message in the high word)
+     * ahead of client-area mouse messages — apps re-assert their cursor there (SDL2
+     * applies SDL_ShowCursor state ONLY in this handler, so without it a hidden/blank
+     * cursor request is never observed).
+     */
+    private postCursorMove(
+        target: WindowObject, screenX: number, screenY: number, buttons: number, keyState: Uint8Array,
+        withSetCursor = true,
+    ): void {
+        const client = this.clientPointFor(target, screenX, screenY);
+        const lParam = ((client.y & 0xFFFF) << 16) | (client.x & 0xFFFF);
+        if (withSetCursor) {
+            this.windowManager.postMessage(target.hwnd, WM_SETCURSOR, target.hwnd,
+                (HTCLIENT | (WM_MOUSEMOVE << 16)) >>> 0, screenX, screenY, 0, keyState);
+        }
+        this.windowManager.postMessage(target.hwnd, WM_MOUSEMOVE, this.buttonsToWParam(buttons),
+            lParam, screenX, screenY, 0, keyState);
+    }
+
+    /**
+     * SetCursorPos semantics: confine the target to the clip rect, take the position
+     * away from the host publication, and generate the mouse event the SYSTEM generates.
+     *
+     * The move is UNCONDITIONAL — NT5 zzzInternalSetCursorPos is BoundCursor +
+     * GreMovePointer + zzzSetFMouseMoved with no comparison against the old position,
+     * and the queue read path (xxxGetNextSysMsg → PostMove) then posts a real
+     * WM_MOUSEMOVE at the current cursor, so a same-position warp still produces one.
+     * Whether the pointer MOVED is a different question, and that is what the return
+     * value answers: false = displaced nothing (the caller must not re-publish the
+     * position to the host, nor read it as evidence of anything).
+     *
+     * It carries NO WM_SETCURSOR: SetCursorPos only raises the moved flag, and the
+     * system derives WM_SETCURSOR later when a mouse message is dispatched. Posting one
+     * here feeds any app that warps from its own WM_SETCURSOR handler — every warp would
+     * queue the discrete message that provokes the next one, and the pump never drains
+     * (WM_MOUSEMOVE coalesces per window, WM_SETCURSOR does not).
+     */
+    moveCursorTo(x: number, y: number): boolean {
+        const confined = clampToCursorClip(x | 0, y | 0);
+        const displaced = confined.x !== this.currentMouseX || confined.y !== this.currentMouseY;
+        this.currentMouseX = confined.x;
+        this.currentMouseY = confined.y;
+        this.lastMouseX = confined.x;
+        this.lastMouseY = confined.y;
+        if (this.shouldEnqueueMessages?.() ?? true) {
+            const target = this.resolveMouseTarget(confined.x, confined.y);
+            if (target) {
+                this.postCursorMove(target, confined.x, confined.y, this.currentButtons,
+                    this.buildPackedKeyState(this.packedKeyStateScratch), false);
+            }
+        }
+        return displaced;
     }
 
     /**
@@ -936,6 +1028,8 @@ export class InputManager {
         this.lastMouseWheel = 0;
         this.currentMouseX = 0;
         this.currentMouseY = 0;
+        this.lastSabMouseX = 0;
+        this.lastSabMouseY = 0;
         this.currentButtons = 0;
         this.dinputWheelAccum = 0;
         this.dinputMouseEvents.length = 0;
@@ -962,6 +1056,7 @@ export class InputManager {
         this.packedKeyStateScratch.fill(0);
         this.hasQueuedKeyState = false;
         this.keyPressedSinceLastQuery.fill(0);
+        this.mouseButtonLatch = 0;
         this.prevKeyBitfield.fill(0);
         this.repeatVk = -1;
         this.repeatNextAt = 0;
@@ -997,6 +1092,19 @@ export class InputManager {
         const was = this.keyPressedSinceLastQuery[vk];
         this.keyPressedSinceLastQuery[vk] = 0;
         return was !== 0;
+    }
+
+    /**
+     * Drain the pressed-since-last-guest-read button mask (browser flags) and return the
+     * button level the guest must observe: the live level OR the latched edges. Callers are
+     * the guest-facing button readers; each call consumes the latch, so a press the host
+     * published and released between two guest reads shows up as down exactly once — the
+     * narrowest press a level API can express, and what a real one-sample press looks like.
+     */
+    consumeMouseButtonLatch(): number {
+        const latched = this.mouseButtonLatch;
+        this.mouseButtonLatch = 0;
+        return this.currentButtons | latched;
     }
 
     private _noteDInputTrail(dev: DInputTrailEntry["dev"], ofs: number, data: number, seq: number): void {
@@ -1249,9 +1357,13 @@ export class InputManager {
         return this.dinputGamepadEvents.length;
     }
 
+    /** Place the pointer without generating a move — for synthetic-input paths that
+     *  post their own messages (mouse_event). Confinement applies wherever the
+     *  pointer is placed, so the clip rect still binds. */
     setMousePosition(x: number, y: number): void {
-        this.currentMouseX = x | 0;
-        this.currentMouseY = y | 0;
+        const confined = clampToCursorClip(x | 0, y | 0);
+        this.currentMouseX = confined.x;
+        this.currentMouseY = confined.y;
     }
 
     /**

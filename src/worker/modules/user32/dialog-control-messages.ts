@@ -12,7 +12,7 @@ import { WindowInfo, windows, buttonCheckStates, getOrCreateListState, getOrCrea
 import { handleAnimateMessage } from './animate-control';
 import { handleEditMessage } from './edit-control';
 import { setScrollPos, getScrollPos, setScrollRange, getScrollRange, applyScrollInfo, readScrollInfo } from './scroll-state';
-import { paintSystemControl, clampListTopIndex } from './controls';
+import { paintSystemControl, clampListTopIndex, listVisibleCount } from './controls';
 import { repaintDialogAfterContentChange, restampOwnedPopupsAbove } from './dialog-paint';
 import { closeOpenComboboxes } from './control-interaction';
 import { getBitmapObjectDimensions, getIconObjectDimensions } from '../gdi32/bitmap-resolve';
@@ -145,8 +145,11 @@ export function handleSystemControlMessage(
     const LB_SETCURSEL      = 0x0186;
     const LB_GETITEMDATA    = 0x0199;
     const LB_SETITEMDATA    = 0x019A;
+    const LB_SETCARETINDEX  = 0x019E;
+    const LB_GETCARETINDEX  = 0x019F;
 
     const CB_ERR = -1 >>> 0; // 0xFFFFFFFF
+    const LB_ERR = CB_ERR;
 
     const controlDlgCode = (): number => {
         const cls = (child.systemControlClass ?? '').toLowerCase();
@@ -270,6 +273,30 @@ export function handleSystemControlMessage(
             clampListTopIndex(state, child.height);
             return 0;
         }
+        case LB_GETCARETINDEX:
+            return getOrCreateListState(child.handle).caretIndex;
+        case LB_SETCARETINDEX: {
+            const state = getOrCreateListState(child.handle);
+            const idx = wParam | 0;
+            const LBS_MULTIPLESEL = 0x0008;
+            const LBS_EXTENDEDSEL = 0x0800;
+            const multiSelect = (child.style & (LBS_MULTIPLESEL | LBS_EXTENDEDSEL)) !== 0;
+
+            // NT5 lb1.c / Wine listbox.c: reject an invalid caret. A
+            // single-select list with a selection rejects this message too;
+            // LB_SETCURSEL has already moved iSelBase/focus_item with it.
+            if (idx < 0 || idx >= state.items.length || (!multiSelect && state.selectedIndex !== -1)) {
+                return LB_ERR;
+            }
+            state.caretIndex = idx;
+            if (!lParam) {
+                const visible = listVisibleCount(child.height);
+                if (idx < state.topIndex) state.topIndex = idx;
+                else if (idx >= state.topIndex + visible) state.topIndex = idx - visible + 1;
+                clampListTopIndex(state, child.height);
+            }
+            return 0; // LB_OKAY
+        }
         case WM_SETTEXT:
             if (lParam) {
                 child.title = readAnsiOrWideString(lParam);
@@ -341,6 +368,7 @@ export function handleSystemControlMessage(
             let index = wParam | 0;
             if (index < 0 || index > state.items.length) index = state.items.length;
             state.items.splice(index, 0, { text, data: 0 });
+            if (state.items.length > 1 && index <= state.caretIndex) state.caretIndex++;
             Logger.log(LogCategory.USER32,
                 `handleSysCtrlMsg ${msg === CB_INSERTSTRING ? 'CB_INSERTSTRING' : 'LB_INSERTSTRING'}: ` +
                 `hwnd=0x${child.handle.toString(16)} id=${child.controlId ?? '?'} index=${index} text="${text}"`);
@@ -354,6 +382,9 @@ export function handleSystemControlMessage(
             state.items.splice(idx, 1);
             if (state.selectedIndex === idx) state.selectedIndex = -1;
             else if (state.selectedIndex > idx) state.selectedIndex--;
+            if (state.items.length === 0) state.caretIndex = 0;
+            else if (state.caretIndex > idx) state.caretIndex--;
+            else if (state.caretIndex >= state.items.length) state.caretIndex = state.items.length - 1;
             return state.items.length;
         }
         case CB_RESETCONTENT:
@@ -361,6 +392,8 @@ export function handleSystemControlMessage(
             const state = getOrCreateListState(child.handle);
             state.items.length = 0;
             state.selectedIndex = -1;
+            state.caretIndex = 0;
+            state.topIndex = 0;
             return 0;
         }
         case CB_GETCOUNT:
@@ -385,6 +418,7 @@ export function handleSystemControlMessage(
                 return CB_ERR;
             }
             state.selectedIndex = idx;
+            state.caretIndex = idx;
             // A combobox's WM_GETTEXT/GetDlgItemText reads child.title, not the list
             // state — without this, a CB_SETCURSEL'd combo shows the right item visually
             // but GetDlgItemText returns "" (e.g. TLJ's Player-Name combo: renders
@@ -472,6 +506,7 @@ export function handleSystemControlMessage(
                 return CB_ERR;
             }
             state.selectedIndex = idx;
+            state.caretIndex = idx;
             if ((child.systemControlClass ?? '').toLowerCase() === 'combobox') {
                 child.title = state.items[idx].text;
             }

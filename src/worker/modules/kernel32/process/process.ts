@@ -16,12 +16,13 @@ import { invalidateGuestCode, invalidateAllGuestCode } from '../../../core/memor
 import { Marshaler } from '../../../core/memory/marshaler';
 import { SystemResourceProvider } from '../../../core/resources/system-resource-provider';
 import { encodeAnsi } from '../../codepage-utils';
-import { applyShellExecFake, hasShellExecFakeMatch } from '../../shell32';
+import { applyShellExecFake, hasShellExecFakeMatch, isDifferentCommandLine } from '../../shell32';
 import { getVirtualProcessManager, VIRTUAL_CURRENT_PROCESS_ID } from './virtual-process-manager';
 import { createActCtxExports } from './actctx';
 import { versionVerifyExports } from './version-verify';
 
 const ERROR_INVALID_HANDLE = 6;
+const ERROR_ACCESS_DENIED = 5;
 const ERROR_INVALID_PARAMETER = 87;
 const ERROR_CALL_NOT_IMPLEMENTED = 120;
 const ERROR_PARTIAL_COPY = 299;
@@ -348,6 +349,28 @@ const readNullableProcessString = (memory: Uint8Array, ptr: number, isWide: bool
     return isWide ? Marshaler.readWideString(memory, ptr) : Marshaler.readString(memory, ptr);
 };
 
+/** argv[0] of a Win32 command line: a quoted run, else up to the first space. */
+const firstCommandLineToken = (commandLine: string): string => {
+    const s = commandLine.trimStart();
+    if (s.startsWith('"')) {
+        const end = s.indexOf('"', 1);
+        return end < 0 ? s.slice(1) : s.slice(1, end);
+    }
+    const sp = s.search(/\s/);
+    return sp < 0 ? s : s.slice(0, sp);
+};
+
+/** Everything after argv[0] — the arguments the re-executed image should receive. */
+const stripFirstCommandLineToken = (commandLine: string): string => {
+    const s = commandLine.trimStart();
+    if (s.startsWith('"')) {
+        const end = s.indexOf('"', 1);
+        return end < 0 ? '' : s.slice(end + 1).trimStart();
+    }
+    const sp = s.search(/\s/);
+    return sp < 0 ? '' : s.slice(sp).trimStart();
+};
+
 const isCurrentProcessHandle = (handle: number): boolean => {
     if ((handle >>> 0) === CURRENT_PROCESS_PSEUDO_HANDLE) {
         return true;
@@ -516,6 +539,27 @@ const createVirtualProcess = (memory: Uint8Array, args: number[], isWide: boolea
     const hasFakeRule = hasShellExecFakeMatch(probeCommand);
     const noOpProbe = !hasFakeRule && isUnrealBrowserProbe(applicationName, commandLine);
     if (!hasFakeRule && !noOpProbe) {
+        // Self re-exec: the launcher pattern (System.isSelfImage), and only once neither a
+        // shellExecFake rule nor the UE1 probe claimed this launch — those self-launches
+        // exist for a file side effect, and restarting for them never terminates.
+        // lpApplicationName may be NULL, in which case the image is argv[0] of the command
+        // line and the arguments are what follows it, the split CreateProcess itself performs.
+        const system = System.getInstance();
+        const argv0 = applicationName || firstCommandLineToken(commandLine || "");
+        const reExecArgs = applicationName
+            ? (commandLine || "")
+            : stripFirstCommandLineToken(commandLine || "");
+        if (argv0 && system.isSelfImage(argv0, currentDirectory || "")
+            && isDifferentCommandLine(reExecArgs, system.executableArgs)
+            && system.requestReExec(reExecArgs)) {
+            Logger.log(LogCategory.SYSTEM,
+                `[KERNEL32] CreateProcess("${argv0}", "${reExecArgs}") -> re-exec ` +
+                `(launcher relaunching its own image; restarting with the new command line)`);
+            return finishVirtualProcess(
+                lpProcessInformation, applicationName, commandLine,
+                currentDirectory, dwCreationFlags, isWide, true,
+            );
+        }
         return failVirtualProcess(lpProcessInformation, applicationName, commandLine, currentDirectory, isWide);
     }
 
@@ -546,6 +590,44 @@ const createVirtualProcess = (memory: Uint8Array, args: number[], isWide: boolea
         isWide,
         noOpProbe
     );
+};
+
+/**
+ * The credentialed CreateProcess* variants. These MUST have real handlers even though
+ * they only ever fail: the UNIMPLEMENTED path leaves ERROR_NOT_SUPPORTED (50) in EAX,
+ * which as a BOOL is TRUE, and leaves lpProcessInformation untouched — so the guest
+ * reads handles out of uninitialised stack and propagates them into Wait/GetExitCode.
+ * Failing loudly with a zeroed PROCESS_INFORMATION is the only honest answer available:
+ * we are single-process, and impersonation/logon is not a thing we model at all.
+ */
+const refuseCredentialedProcess = (
+    mem: Uint8Array,
+    args: number[],
+    apiName: string,
+    argCount: number,
+    appNameIndex: number,
+    commandLineIndex: number,
+    processInfoIndex: number,
+    isWide: boolean
+): ThunkResult => {
+    // argCount is passed explicitly and must match kernel32.api.ts: `args` is the
+    // dispatcher's fixed-size reusable buffer, so args.length is NOT the arity and
+    // deriving RET N from it would corrupt the guest stack.
+    const stackCleanup = argCount * 4;
+    const lpProcessInformation = args[processInfoIndex] >>> 0;
+    writeProcessInformationZeroed(lpProcessInformation);
+
+    const applicationName = readNullableProcessString(mem, args[appNameIndex] >>> 0, isWide);
+    const commandLine = readNullableProcessString(mem, args[commandLineIndex] >>> 0, isWide);
+
+    System.getInstance().scheduler.setLastError(ERROR_CALL_NOT_IMPLEMENTED);
+    Logger.warn(
+        LogCategory.KERNEL32,
+        `${apiName}("${applicationName}", "${commandLine}") -> FAILURE ` +
+        `(ERROR_CALL_NOT_IMPLEMENTED; no impersonation/logon model, and the emulator ` +
+        `cannot spawn real child processes)`
+    );
+    return { value: 0, stackCleanup };
 };
 
 const OSVERSIONINFOA_SIZE = 148;
@@ -787,6 +869,38 @@ export const exports: Record<string, ThunkImplementation> = {
     'CreateProcessW': (ctx, mem, args) => {
         return createVirtualProcess(mem, args, true);
     },
+
+    // UINT WinExec(LPCSTR lpCmdLine, UINT uCmdShow)
+    //
+    // MUST have a real handler even though it only ever fails: WinExec encodes failure as
+    // a return value BELOW 32, so the UNIMPLEMENTED path's ERROR_NOT_SUPPORTED (50) would
+    // read as SUCCESS and the guest would proceed believing it spawned a child.
+    'WinExec': (ctx, mem, args): ThunkResult => {
+        const commandLine = readNullableProcessString(mem, args[0] >>> 0, false);
+        System.getInstance().scheduler.setLastError(ERROR_ACCESS_DENIED);
+        Logger.warn(
+            LogCategory.KERNEL32,
+            `WinExec("${commandLine}", show=${args[1] >>> 0}) -> ERROR_ACCESS_DENIED ` +
+            `(single-process HLE cannot spawn a real child)`
+        );
+        return { value: ERROR_ACCESS_DENIED, stackCleanup: 8 };
+    },
+
+    // CreateProcessAsUser* = CreateProcess* with hToken prepended (11 args).
+    'CreateProcessAsUserA': (ctx, mem, args) =>
+        refuseCredentialedProcess(mem, args, 'CreateProcessAsUserA', 11, 1, 2, 10, false),
+    'CreateProcessAsUserW': (ctx, mem, args) =>
+        refuseCredentialedProcess(mem, args, 'CreateProcessAsUserW', 11, 1, 2, 10, true),
+
+    // (lpUsername, lpDomain, lpPassword, dwLogonFlags, lpApplicationName, lpCommandLine,
+    //  dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation)
+    'CreateProcessWithLogonW': (ctx, mem, args) =>
+        refuseCredentialedProcess(mem, args, 'CreateProcessWithLogonW', 11, 4, 5, 10, true),
+
+    // (hToken, dwLogonFlags, lpApplicationName, lpCommandLine, dwCreationFlags,
+    //  lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation)
+    'CreateProcessWithTokenW': (ctx, mem, args) =>
+        refuseCredentialedProcess(mem, args, 'CreateProcessWithTokenW', 9, 2, 3, 8, true),
 
     'ExitThread': (ctx, mem, args) => {
         const exitCode = args[0] >>> 0;
