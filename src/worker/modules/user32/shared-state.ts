@@ -162,7 +162,10 @@ export function assignPendingClientMessage(win: WindowInfo): void {
 }
 
 export const windows: Map<number, WindowInfo> = new Map();
-export let nextWindowId = 1;
+
+export function getWindowByHandle(handle: number): WindowInfo | undefined {
+    return windows.get(handle);
+}
 
 /** HWND_TOP / HWND_BOTTOM sentinels for child Z-order (unsigned as guest passes them). */
 const HWND_TOP = 0;
@@ -736,10 +739,6 @@ export function updateCursorDisplayCount(delta: number): number {
     return cursorDisplayCount;
 }
 
-export function incrementNextWindowId(): number {
-    return nextWindowId++;
-}
-
 export function isClipboardOpen(): boolean {
     return clipboardOpenOwner !== null;
 }
@@ -769,7 +768,6 @@ export function ensureHostCursorForDialog(): void {
 
 export function resetUser32SharedState(): void {
     windows.clear();
-    nextWindowId = 1;
     cursorDisplayCount = 0;
     cursorClipRect = null;
     lastPublishedClipSignal = false;

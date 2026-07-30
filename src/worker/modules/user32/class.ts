@@ -9,7 +9,7 @@ import { Logger, LogCategory } from '../../core/logger';
 import { Marshaler } from '../../core/memory/marshaler';
 import { Mem } from '../../core/memory/mem-accessor';
 import { System } from '../../core/system';
-import { getWindowByHandle } from './window';
+import { getWindowByHandle } from './shared-state';
 import { encodeAnsi } from '../codepage-utils';
 import { getBuiltinSystemClass, getDefWindowProcAddress, resetDefWindowProcCache } from './system-classes';
 import { getSystemCursorHandle } from './system-cursors';

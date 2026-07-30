@@ -9,9 +9,9 @@ import { Logger, LogCategory } from '../../core/logger';
 import { Mem } from '../../core/memory/mem-accessor';
 import { Marshaler } from '../../core/memory/marshaler';
 import { System } from '../../core/system';
-import { getWindowByHandle } from './window';
 import {
     clampToCursorClip, getCapture, getVirtualScreenRect, setCursorClipRect, warpGuestCursorTo, windows,
+    getWindowByHandle,
 } from './shared-state';
 import { GUEST_INPUT_FLAG } from '../../../input/sab-layout';
 

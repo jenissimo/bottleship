@@ -12,7 +12,7 @@ import { DESKTOP_HWND } from '../../runtime/windowing/window-manager';
 import { getWindowClass, getWindowClassByName } from './class';
 import { Marshaler } from '../../core/memory/marshaler';
 import { Mem } from '../../core/memory/mem-accessor';
-import { WindowInfo, windows, incrementNextWindowId, getCursorDisplayCount, updateCursorDisplayCount, isGuestCursorVisible, syncHostCursorToGuestState, installCursorAndUpdateHostVisibility, getAbsoluteWindowPosition, markGuestCustomPaint, killWindowTimers, registerWindowDestroyFinalizer, reorderChildInParent, setLockWindowUpdate, isWindowUpdateLocked, hasSystemControlChildren, getChildWindowExclusions, isEffectivelyVisible, getAncestorClipRect } from './shared-state';
+import { WindowInfo, windows, getWindowByHandle, getCursorDisplayCount, updateCursorDisplayCount, isGuestCursorVisible, syncHostCursorToGuestState, installCursorAndUpdateHostVisibility, getAbsoluteWindowPosition, markGuestCustomPaint, killWindowTimers, registerWindowDestroyFinalizer, reorderChildInParent, setLockWindowUpdate, isWindowUpdateLocked, hasSystemControlChildren, getChildWindowExclusions, isEffectivelyVisible, getAncestorClipRect } from './shared-state';
 import {
     invalidateWindow,
     validateWindow,
@@ -58,10 +58,6 @@ import {
     isDialogInitInProgress,
     isWindowInitInProgress,
 } from './activation-messages';
-
-export function getWindowByHandle(handle: number): WindowInfo | undefined {
-    return windows.get(handle);
-}
 
 function isDialogLikeWindow(window: WindowInfo): boolean {
     return !!window.guestCustomPaint

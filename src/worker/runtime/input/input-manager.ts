@@ -6,8 +6,7 @@
 import { WindowManager } from '../windowing/window-manager';
 import type { WindowObject } from '../windowing/window-manager';
 import { Logger, LogCategory } from '../../core/logger';
-import { getAbsoluteWindowPosition, clampToCursorClip } from '../../modules/user32/shared-state';
-import { getWindowByHandle } from '../../modules/user32/window';
+import { getAbsoluteWindowPosition, clampToCursorClip, getWindowByHandle } from '../../modules/user32/shared-state';
 import { vkToDik } from '../../modules/dinput/dinput-vk-dik';
 import { TimeService } from '../time';
 import { markJoystickInputLost } from '../../modules/dinput/device-presence';
