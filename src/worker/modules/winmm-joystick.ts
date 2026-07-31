@@ -5,7 +5,8 @@
  * The driver always reports the two standard analog ports (like the Win9x/NT
  * joystick driver does with nothing attached); whether a stick is actually there
  * is answered by the position calls — JOYERR_UNPLUGGED until the host gamepad
- * appears. Axes are reported over the full 0..65535 range declared in JOYCAPS.
+ * appears, and always for port 1, which has no device behind it. Axes are reported
+ * over the full 0..65535 range declared in JOYCAPS.
  *
  * joySetCapture is a real capture: a timer-wheel poll posts MM_JOY*MOVE /
  * MM_JOY*BUTTONDOWN / MM_JOY*BUTTONUP to the captured window, which is the only
@@ -50,9 +51,13 @@ const JOYCAPS_MIN_SIZE = 4;
 const JOYINFO_SIZE = 16;
 const JOYINFOEX_SIZE = 52;
 
-/** wParam button bits carried by MM_JOY* messages (JOY_BUTTON1..4 + their CHG flags). */
+/** wParam button bits carried by MM_JOY* messages (JOY_BUTTON1..4 + their CHG flags).
+ *  JOYINFO.wButtons is the same four bits; JOYINFOEX.dwButtons is the wider set. */
 const JOY_BUTTON_MASK = 0x0F;
 const JOY_BUTTON1CHG = 0x0100;
+/** JOYCAPS.wNumButtons — nothing above it may appear in dwButtons/dwButtonNumber. */
+const JOY_NUM_BUTTONS = 8;
+const JOY_BUTTON_MASK_EX = (1 << JOY_NUM_BUTTONS) - 1;
 
 interface JoyCapture {
     hwnd: number;
@@ -87,15 +92,30 @@ interface JoyPos {
     buttons: number;
 }
 
-function readJoystick(): JoyPos {
+const DISCONNECTED: JoyPos = { connected: false, x: 0, y: 0, z: 0, r: 0, buttons: 0 };
+
+/**
+ * Read a PORT. The host input layer models exactly one pad, so only port 0 has a
+ * device behind it; port 1 must answer JOYERR_UNPLUGGED rather than mirror port 0 —
+ * two identical CONNECTED sticks make a two-player title bind both players to the one
+ * pad and a "highest connected port" scan pick the phantom.
+ *
+ * `guestRead` stamps the usage telemetry the host's control-layout auto-select keys off
+ * ("this title steers with a pad"). Only a call the GUEST made may set it; the
+ * joySetCapture pump is ours and takes the peek path.
+ */
+function readJoystick(joyId: number, guestRead: boolean): JoyPos {
+    if (joyId !== 0) return DISCONNECTED;
     const inputManager = System.getInstance().inputManager;
-    inputManager.noteGuestGamepadRead();
-    const input = inputManager.getGamepadState();
+    if (guestRead) inputManager.noteGuestGamepadRead();
+    const input = guestRead
+        ? inputManager.getGamepadState()
+        : inputManager.peekGamepadStateWithoutUsage();
     const [ax0, ax1, ax2, ax3] = input.axes;
     return {
         connected: input.connected,
         x: toAxis(ax0), y: toAxis(ax1), z: toAxis(ax2), r: toAxis(ax3),
-        buttons: input.buttons >>> 0,
+        buttons: (input.buttons >>> 0) & JOY_BUTTON_MASK_EX,
     };
 }
 
@@ -126,7 +146,7 @@ function pollCapture(joyId: number): void {
     const cap = captures[joyId];
     if (!cap) return;
 
-    const pos = readJoystick();
+    const pos = readJoystick(joyId, false);
     if (!pos.connected) return; // unplugged → the driver goes quiet
 
     const buttons = pos.buttons & JOY_BUTTON_MASK;
@@ -200,7 +220,7 @@ export function registerWinmmJoystickExports(exports: Record<string, ThunkImplem
             put(b + 12, AXIS_MAX);   // wYmax
             put(b + 16, AXIS_MIN);   // wZmin
             put(b + 20, AXIS_MAX);   // wZmax
-            put(b + 24, 8);          // wNumButtons
+            put(b + 24, JOY_NUM_BUTTONS); // wNumButtons
             put(b + 28, PERIOD_MIN); // wPeriodMin
             put(b + 32, PERIOD_MAX); // wPeriodMax
             put(b + 36, AXIS_MIN);   // wRmin
@@ -212,7 +232,7 @@ export function registerWinmmJoystickExports(exports: Record<string, ThunkImplem
             put(b + 60, 0);          // wCaps — no POV/rudder reported
             put(b + 64, 4);          // wMaxAxes
             put(b + 68, 4);          // wNumAxes
-            put(b + 72, 8);          // wMaxButtons
+            put(b + 72, JOY_NUM_BUTTONS); // wMaxButtons
             return MMSYSERR_NOERROR;
         };
         exports["joyGetDevCapsA"] = makeGetDevCaps(false);
@@ -225,7 +245,7 @@ export function registerWinmmJoystickExports(exports: Record<string, ThunkImplem
             if (!pji || pji + JOYINFO_SIZE > mem.length) {
                 return MMSYSERR_INVALPARAM;
             }
-            const pos = readJoystick();
+            const pos = readJoystick(uJoyID, true);
             if (!pos.connected) return JOYERR_UNPLUGGED;
 
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
@@ -249,7 +269,7 @@ export function registerWinmmJoystickExports(exports: Record<string, ThunkImplem
                 return MMSYSERR_INVALPARAM;
             }
 
-            const pos = readJoystick();
+            const pos = readJoystick(uJoyID, true);
             if (!pos.connected) {
                 return JOYERR_UNPLUGGED;
             }
@@ -298,7 +318,7 @@ export function registerWinmmJoystickExports(exports: Record<string, ThunkImplem
             const system = System.getInstance();
             if (!hwnd || !system.windowManager.getWindow(hwnd)) return MMSYSERR_INVALPARAM;
             if (uPeriod < PERIOD_MIN || uPeriod > PERIOD_MAX) return MMSYSERR_INVALPARAM;
-            if (!readJoystick().connected) return JOYERR_UNPLUGGED;
+            if (!readJoystick(uJoyID, false).connected) return JOYERR_UNPLUGGED;
 
             const scheduler = system.scheduler;
             if (!scheduler) return JOYERR_PARMS;

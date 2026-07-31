@@ -54,12 +54,13 @@ export function createRedbookExports(ctx: MSSContext): Record<string, ThunkImple
         return openRedbookHandle(ctx);
     };
 
-    // _AIL_redbook_tracks@4 — Miles counts the leading data track, which has no
-    // ripped file of its own.
+    // _AIL_redbook_tracks@4 — the drive's TOC length. buildToc already models an absent
+    // data track as a non-audio slot, so this is the same count every other surface
+    // reports; assuming a leading data track over-counts a rip whose track 1 IS audio.
     exports["_AIL_redbook_tracks@4"] = (ctxThunk, mem, args) => {
         const hand = args[0];
         const rb = ctx.redbookHandles.get(hand);
-        const count = rb ? virtualCd().audioTracks().length + 1 : 0;
+        const count = rb ? virtualCd().numberOfTracks() : 0;
         Logger.log(LogCategory.SYSTEM, `MSS32: _AIL_redbook_tracks@4: handle=0x${hand.toString(16)} -> ${count} tracks`);
         return count;
     };
@@ -83,22 +84,18 @@ export function createRedbookExports(ctx: MSSContext): Record<string, ThunkImple
             return 0;
         }
 
-        if (tracknum === 1) {
-            writeSpan(0, 0);
-            Logger.log(LogCategory.SYSTEM, `MSS32: _AIL_redbook_track_info@16: track 1 (data) -> 0..0`);
-            return 1;
-        }
-
+        // tracknum indexes the FULL TOC, exactly as virtualCd().track() does. A data
+        // track is an in-range slot with a zero-length span, not a hardcoded track 1.
         const track = virtualCd().track(tracknum);
-        if (track && track.isAudio) {
-            writeSpan(track.startMs, track.startMs + track.lengthMs);
-            Logger.log(LogCategory.SYSTEM,
-                `MSS32: _AIL_redbook_track_info@16: track ${tracknum} -> ${track.startMs}..${track.startMs + track.lengthMs} (${track.file})`);
-            return 1;
+        if (!track) {
+            writeSpan(0, 0);
+            return 0;
         }
-
-        writeSpan(0, 0);
-        return 0;
+        writeSpan(track.startMs, track.startMs + track.lengthMs);
+        Logger.log(LogCategory.SYSTEM,
+            `MSS32: _AIL_redbook_track_info@16: track ${tracknum} -> ` +
+            `${track.startMs}..${track.startMs + track.lengthMs} (${track.isAudio ? track.file : "data"})`);
+        return 1;
     };
 
     // _AIL_redbook_set_volume@8

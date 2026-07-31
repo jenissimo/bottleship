@@ -38,6 +38,7 @@ export function handleAudioBridgeMessage(message: any): boolean {
   if (message?.type === "audio_started") {
     const system = System.getInstance();
     const id = Number(message.id) || 0;
+    if (virtualCd().handleAudioStarted(id)) return true;
     const mss32 = system.process?.getModule("mss32") as MSS32 | undefined;
     if (mss32?.handleAudioStarted) {
       mss32.handleAudioStarted(id);
@@ -53,6 +54,7 @@ export function handleAudioBridgeMessage(message: any): boolean {
     const system = System.getInstance();
     const id = Number(message.id) || 0;
     const error = String(message.error || "Unknown error");
+    if (virtualCd().handleAudioError(id, error)) return true;
     const mss32 = system.process?.getModule("mss32") as MSS32 | undefined;
     if (mss32?.handleAudioError) {
       mss32.handleAudioError(id, error);
@@ -69,6 +71,8 @@ export function handleAudioBridgeMessage(message: any): boolean {
     const mss32 = system.process?.getModule("mss32") as MSS32 | undefined;
     const id = Number(message.id) || 0;
     const frames = Number(message.positionFrames) || 0;
+    // CD segments declare positionRateHz=1000, so their "frames" arrive as milliseconds.
+    if (id && Number.isFinite(frames) && virtualCd().handleAudioPosition(id, frames)) return true;
     if (id && Number.isFinite(frames) && mss32?.handleAudioPosition) {
       mss32.handleAudioPosition(id, frames);
     }

@@ -108,28 +108,62 @@ function findVersionResource(buf: Uint8Array, view: DataView, headers: PeHeaders
     return { off, size };
 }
 
+/** VS_FIXEDFILEINFO.dwSignature. */
+const VS_FFI_SIGNATURE = 0xfeef04bd;
+/** sizeof(VS_FIXEDFILEINFO). */
+const VS_FIXEDFILEINFO_SIZE = 52;
+
+/** Locate the VS_VERSIONINFO root block of a raw PE image. */
+function openVersionResource(image: Uint8Array): { view: DataView; resOff: number; root: VersionBlock } | null {
+    let res: { off: number; size: number } | null;
+    let view: DataView;
+    try {
+        const headers = readPeHeaders(image);
+        if (!headers) return null;
+        view = new DataView(image.buffer, image.byteOffset, image.byteLength);
+        res = findVersionResource(image, view, headers);
+    } catch {
+        return null;
+    }
+    if (!res) return null;
+    const root = readVersionBlock(image, view, res.off, res.off + res.size);
+    return root ? { view, resOff: res.off, root } : null;
+}
+
+export interface PeFileVersion {
+    major: number;
+    minor: number;
+    build: number;
+    revision: number;
+}
+
+/**
+ * VS_FIXEDFILEINFO's dwFileVersionMS/LS — the BINARY version, present whenever the
+ * image has a version resource at all. StringFileInfo is localizable text a build may
+ * omit or write in the comma-separated resource-script form, so anything that keys ABI
+ * decisions off a version needs this as its fallback.
+ */
+export function readPeFixedFileVersion(image: Uint8Array): PeFileVersion | null {
+    const parsed = openVersionResource(image);
+    if (!parsed) return null;
+    const { view, root } = parsed;
+    if (root.valueBytes < VS_FIXEDFILEINFO_SIZE) return null;
+    if (view.getUint32(root.valueOff, true) !== VS_FFI_SIGNATURE) return null;
+    const ms = view.getUint32(root.valueOff + 8, true);
+    const ls = view.getUint32(root.valueOff + 12, true);
+    return { major: ms >>> 16, minor: ms & 0xffff, build: ls >>> 16, revision: ls & 0xffff };
+}
+
 /**
  * Read one StringFileInfo value (e.g. "FileVersion", "ProductVersion") from a raw
  * PE image. Returns null when the image has no version resource or no such key.
  */
 export function readPeVersionString(image: Uint8Array, key: string): string | null {
-    let res: { off: number; size: number } | null;
-    try {
-        const headers = readPeHeaders(image);
-        if (!headers) return null;
-        const probe = new DataView(image.buffer, image.byteOffset, image.byteLength);
-        res = findVersionResource(image, probe, headers);
-    } catch {
-        return null;
-    }
-    if (!res) return null;
+    const parsed = openVersionResource(image);
+    if (!parsed) return null;
+    const { view, resOff: res, root } = parsed;
 
-    const view = new DataView(image.buffer, image.byteOffset, image.byteLength);
-    const end = res.off + res.size;
-    const root = readVersionBlock(image, view, res.off, end);
-    if (!root) return null;
-
-    for (const { block: sfi, off: sfiOff } of versionChildren(image, view, root, res.off)) {
+    for (const { block: sfi, off: sfiOff } of versionChildren(image, view, root, res)) {
         if (sfi.key !== 'StringFileInfo') continue;
         for (const { block: table, off: tableOff } of versionChildren(image, view, sfi, sfiOff)) {
             for (const { block: entry } of versionChildren(image, view, table, tableOff)) {

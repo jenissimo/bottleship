@@ -74,18 +74,27 @@ export const BINK_LAYOUT_V1 = layout('1.x', [
     'width', 'height', 'frames', 'frameNum', 'lastFrameNum', 'frameRate', 'frameRateDiv', ...COMMON_TAIL,
 ]);
 
-/** Used when the shipped DLL carries no readable version (1.x is the long tail of releases). */
+/** Last resort when the shipped DLL carries no readable version at all (1.x is the long
+ *  tail of releases). Picking it is a GUESS — callers must say so out loud. */
 export const BINK_LAYOUT_DEFAULT = BINK_LAYOUT_V1;
 
-/**
- * Pick the layout for a binkw32.dll StringFileInfo FileVersion ("0.5a", "0.8i",
- * "1.0f", "1.5a", "1.9x"). Unparseable input keeps the default.
- */
-export function selectBinkLayout(fileVersion: string | null | undefined): BinkStructLayout {
-    const m = /^\s*(\d+)\.(\d+)/.exec(fileVersion ?? '');
-    if (!m) return BINK_LAYOUT_DEFAULT;
-    const major = Number(m[1]);
-    const minor = Number(m[2]);
+/** `0.5a` / `1.0f`, and the comma-separated form RAD-era resources are written in
+ *  ("0, 8, 0, 0"). A dotted-only pattern silently drops the latter onto the default. */
+const BINK_VERSION_RE = /^\s*(\d+)\s*[.,]\s*(\d+)/;
+
+/** Layout for a major/minor pair, whatever it was read from. */
+export function binkLayoutFor(major: number, minor: number): BinkStructLayout {
     if (major >= 1) return BINK_LAYOUT_V1;
     return minor >= 8 ? BINK_LAYOUT_V08 : BINK_LAYOUT_V05;
+}
+
+/**
+ * Pick the layout for a binkw32.dll FileVersion ("0.5a", "0.8i", "1.0f", "1.5a",
+ * "1.9x", "0, 8, 0, 0"). Returns null when the version is unreadable — the caller
+ * must fall back LOUDLY rather than have a guess look like a resolution.
+ */
+export function selectBinkLayout(fileVersion: string | null | undefined): BinkStructLayout | null {
+    const m = BINK_VERSION_RE.exec(fileVersion ?? '');
+    if (!m) return null;
+    return binkLayoutFor(Number(m[1]), Number(m[2]));
 }

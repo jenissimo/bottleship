@@ -29,6 +29,41 @@ export const CD_FRAMES_PER_SECOND = 75;
  */
 const UNKNOWN_TRACK_LENGTH_MS = 300000;
 
+/** Bytes pulled per turn by readTrackBytes; the loop yields between chunks. JS and the
+ *  guest CPU share the worker thread, so a whole 30-60 MB track in one turn stalls the
+ *  frame loop and the audio pump and then dumps a virtual-time credit burst. */
+const TRACK_READ_CHUNK_BYTES = 4 * 1024 * 1024;
+
+/** Wall-clock budget for the synchronous container probes the initial scan runs.
+ *  ensureDisc() is reachable from any MCI status poll, so the first one must not stall
+ *  for as long as the disc happens to be big; whatever is left unprobed is picked up by
+ *  refineDurations. */
+const SYNC_PROBE_BUDGET_MS = 12;
+
+/** Passes refineDurations may make. A container that stays unprobeable must not turn
+ *  every status poll into another async re-probe. */
+const MAX_REFINE_PASSES = 3;
+
+/** How far past a segment's expected end the drive waits for the host's audio_ended
+ *  before completing on its own clock. A container the browser accepts but cannot
+ *  decode produces neither `ended` nor a play() rejection. */
+const COMPLETION_BACKSTOP_GRACE_MS = 2000;
+
+/** Host/transport position disagreement worth acting on. Below it the reports are
+ *  element-timer noise; above it on the FIRST report the element refused the mid-track
+ *  seek and is playing from somewhere else entirely. */
+const POSITION_SYNC_TOLERANCE_MS = 500;
+
+/** audio_position for a CD segment is reported in milliseconds, not sample frames —
+ *  the host multiplies element.currentTime by the rate the payload declares. */
+const CD_POSITION_RATE_HZ = 1000;
+
+/** Hand the worker thread back to the guest CPU. A microtask is not enough: microtasks
+ *  drain before v86 gets its next slice. */
+function yieldToWorkerTurn(): Promise<void> {
+    return new Promise<void>((resolve) => { setTimeout(resolve, 0); });
+}
+
 /** Directories a ripped disc's tracks conventionally live in (matched case-insensitively). */
 const MUSIC_DIR_NAMES = new Set(["music", "audio", "cdaudio", "tracks"]);
 
@@ -73,6 +108,14 @@ interface CdCandidate {
     rank: number;
 }
 
+interface LoadedCdSegment {
+    track: CdTrack;
+    data: Uint8Array;
+    startOffsetMs: number;
+    endOffsetMs: number;
+    audioId: number;
+}
+
 export class VirtualCdAudio {
     private static instance: VirtualCdAudio | null = null;
 
@@ -80,6 +123,7 @@ export class VirtualCdAudio {
     private trackTable: CdTrack[] = [];
     private scanned = false;
     private refining = false;
+    private refinePasses = 0;
 
     private mode: CdMode = "stopped";
     /** Master CD line level, 0..1 (the aux device's CD volume). */
@@ -100,6 +144,16 @@ export class VirtualCdAudio {
     private pausedPositionMs = 0;
     /** Guards against a stale async track load posting after stop/supersede. */
     private loadGeneration = 0;
+    /** Loaded while paused before a host source existed; posted on Resume. */
+    private pendingSegment: LoadedCdSegment | null = null;
+    /** Whether audio_play_encoded for the current audioId reached the host. */
+    private hostAudioPosted = false;
+    /** Whether the host finished creating and starting the current audio source. */
+    private hostAudioStarted = false;
+    /** Whether a host position report has been reconciled with the current segment. */
+    private segPositionSynced = false;
+    /** Fires when the host owes an audio_ended it never sent — see armCompletionBackstop. */
+    private backstopTimer: ReturnType<typeof setTimeout> | null = null;
 
     private listeners = new Set<CdCompletionListener>();
 
@@ -110,18 +164,30 @@ export class VirtualCdAudio {
 
     // ==================== Table of contents ====================
 
-    /** Scan the bundle for track files once; cheap and idempotent afterwards. */
+    /**
+     * Scan the bundle for track files once; cheap and idempotent afterwards. The scan's
+     * synchronous probes are budgeted (SYNC_PROBE_BUDGET_MS), so a track whose duration
+     * is still unknown is re-probed asynchronously here — the refine pass is what turns
+     * the fallback lengths into real ones, and it must be reachable more than once.
+     */
     ensureDisc(): void {
-        if (this.scanned) return;
-        this.scanned = true;
-        this.scan();
-        if (this.trackTable.length > 0) void this.refineDurations();
+        if (!this.scanned) {
+            this.scanned = true;
+            this.scan();
+        }
+        if (this.needsRefine()) void this.refineDurations();
     }
 
     /** Re-scan on the next query (bundle swap / guest process restart). */
     invalidateDisc(): void {
         this.scanned = false;
         this.trackTable = [];
+        this.refinePasses = 0;
+    }
+
+    private needsRefine(): boolean {
+        if (this.refining || this.refinePasses >= MAX_REFINE_PASSES) return false;
+        return this.trackTable.some((t) => t.isAudio && !t.lengthKnown);
     }
 
     hasMedia(): boolean {
@@ -234,9 +300,12 @@ export class VirtualCdAudio {
 
     pause(): void {
         if (this.mode !== "playing") return;
-        this.pausedPositionMs = this.positionMs();
+        this.pausedPositionMs = this.hostAudioStarted ? this.positionMs() : this.segStartDiscMs;
         this.mode = "paused";
-        self.postMessage({ type: "audio_pause", payload: { id: this.audioId } });
+        this.clearCompletionBackstop();
+        if (this.hostAudioStarted) {
+            self.postMessage({ type: "audio_pause", payload: { id: this.audioId } });
+        }
         Logger.log(LogCategory.SYSTEM, `VirtualCd: paused at ${this.pausedPositionMs | 0}ms`);
     }
 
@@ -244,7 +313,14 @@ export class VirtualCdAudio {
         if (this.mode !== "paused") return;
         this.mode = "playing";
         this.segAnchorMs = performance.now() - (this.pausedPositionMs - this.segStartDiscMs);
-        self.postMessage({ type: "audio_resume", payload: { id: this.audioId } });
+        const pending = this.pendingSegment;
+        if (pending && pending.audioId === this.audioId) {
+            this.pendingSegment = null;
+            this.postLoadedSegment(pending);
+        } else if (this.hostAudioStarted) {
+            self.postMessage({ type: "audio_resume", payload: { id: this.audioId } });
+        }
+        if (this.hostAudioPosted) this.armCompletionBackstop();
         Logger.log(LogCategory.SYSTEM, `VirtualCd: resumed at ${this.pausedPositionMs | 0}ms`);
     }
 
@@ -281,6 +357,55 @@ export class VirtualCdAudio {
             return true;
         }
         this.finishActive("finished");
+        return true;
+    }
+
+    /** Host source-ready notification; applies a pause that arrived during async setup. */
+    handleAudioStarted(id: number): boolean {
+        if (!this.audioId || id !== this.audioId) return false;
+        this.hostAudioStarted = true;
+        if (this.mode === "paused") {
+            self.postMessage({ type: "audio_pause", payload: { id } });
+        } else if (this.mode === "playing") {
+            this.segAnchorMs = performance.now();
+        }
+        return true;
+    }
+
+    /**
+     * Host playback position for the active segment, in disc-relative milliseconds.
+     * The element's clock is the ground truth: a mid-track start offset is best-effort
+     * on the host (the seek may land before a seekable range exists), so the FIRST
+     * report is what tells the drive where playback really began.
+     */
+    handleAudioPosition(id: number, positionMs: number): boolean {
+        if (!this.audioId || id !== this.audioId) return false;
+        if (this.mode !== "playing" || this.segTrack === 0) return true;
+        const track = this.trackTable[this.segTrack - 1];
+        if (!track) return true;
+
+        const discMs = track.startMs + Math.max(0, positionMs);
+        const drift = discMs - this.positionMs();
+        if (!this.segPositionSynced && Math.abs(drift) > POSITION_SYNC_TOLERANCE_MS) {
+            Logger.warn(LogCategory.SYSTEM,
+                `VirtualCd: host started track ${track.number} at ${discMs | 0}ms, not ` +
+                `${this.segStartDiscMs | 0}ms — retiming the transport onto the audio`);
+            this.segStartDiscMs = discMs;
+            this.pausedPositionMs = discMs;
+            this.segAnchorMs = performance.now();
+            this.armCompletionBackstop();
+        } else if (Math.abs(drift) > POSITION_SYNC_TOLERANCE_MS) {
+            this.segAnchorMs = performance.now() - Math.max(0, discMs - this.segStartDiscMs);
+        }
+        this.segPositionSynced = true;
+        return true;
+    }
+
+    /** Host decode/playback failure; ignores ids owned by another audio module. */
+    handleAudioError(id: number, error = "Unknown error"): boolean {
+        if (!this.audioId || id !== this.audioId) return false;
+        Logger.warn(LogCategory.SYSTEM, `VirtualCd: host playback failed for id=${id}: ${error}`);
+        this.finishActive("aborted");
         return true;
     }
 
@@ -322,8 +447,47 @@ export class VirtualCdAudio {
         this.pausedPositionMs = fromDiscMs;
         this.mode = "playing";
         this.audioId = this.nextAudioId++;
+        this.pendingSegment = null;
+        this.hostAudioPosted = false;
+        this.hostAudioStarted = false;
+        this.segPositionSynced = false;
+        this.clearCompletionBackstop();
         void this.loadAndPost(track, fromDiscMs - track.startMs, this.segEndDiscMs - track.startMs,
             this.audioId, ++this.loadGeneration);
+    }
+
+    /**
+     * Complete the request on the transport clock when the host never reports back.
+     * finishActive("finished") is otherwise reachable only from audio_ended, so a track
+     * the browser accepts into a Blob but cannot decode leaves the drive PLAYING forever
+     * and MCI_NOTIFY never fires.
+     */
+    private armCompletionBackstop(): void {
+        this.clearCompletionBackstop();
+        const remaining = Math.max(0, this.segEndDiscMs - this.positionMs());
+        this.backstopTimer = setTimeout(() => {
+            this.backstopTimer = null;
+            this.runCompletionBackstop();
+        }, remaining + COMPLETION_BACKSTOP_GRACE_MS);
+    }
+
+    private clearCompletionBackstop(): void {
+        if (this.backstopTimer === null) return;
+        clearTimeout(this.backstopTimer);
+        this.backstopTimer = null;
+    }
+
+    private runCompletionBackstop(): void {
+        if (this.mode !== "playing" || !this.audioId) return;
+        const left = this.segEndDiscMs - this.positionMs();
+        if (left > 0) {
+            this.armCompletionBackstop();
+            return;
+        }
+        Logger.warn(LogCategory.SYSTEM,
+            `VirtualCd: no audio_ended for id=${this.audioId} (track ${this.segTrack}) — ` +
+            `completing on the transport clock`);
+        this.handleAudioEnded(this.audioId);
     }
 
     private async loadAndPost(
@@ -333,13 +497,31 @@ export class VirtualCdAudio {
         audioId: number,
         generation: number,
     ): Promise<void> {
-        const data = await this.readTrackBytes(track);
+        const data = await this.readTrackBytes(track, generation);
         if (generation !== this.loadGeneration || this.audioId !== audioId) return;
         if (!data || data.length === 0) {
             Logger.warn(LogCategory.SYSTEM, `VirtualCd: no data for track ${track.number} ("${track.file}")`);
             this.finishActive("aborted");
             return;
         }
+
+        const loaded: LoadedCdSegment = {
+            track,
+            data,
+            startOffsetMs,
+            endOffsetMs,
+            audioId,
+        };
+        if (this.mode === "paused") {
+            this.pendingSegment = loaded;
+            return;
+        }
+        this.postLoadedSegment(loaded);
+    }
+
+    private postLoadedSegment(segment: LoadedCdSegment): void {
+        const { track, data, startOffsetMs, endOffsetMs, audioId } = segment;
+        if (this.audioId !== audioId || this.mode !== "playing") return;
 
         // The buffer is ours (allocated in readTrackBytes), so it can be transferred
         // outright unless a short read left it oversized.
@@ -359,19 +541,30 @@ export class VirtualCdAudio {
                 // A CD track is tens of MB decoded; keep it on the host's streaming
                 // path instead of decoding it into a PCM buffer.
                 stream: true,
+                // Report audio_position in ms rather than sample frames — the drive's
+                // whole currency is milliseconds and it has no way to learn the host's
+                // decoded sample rate.
+                positionRateHz: CD_POSITION_RATE_HZ,
             },
         } as any, [payloadData.buffer] as any);
+        this.hostAudioPosted = true;
 
         // Re-anchor on the post so the transport clock starts with the audio, not
         // with the (potentially async) file read.
         this.segAnchorMs = performance.now();
+        this.armCompletionBackstop();
         Logger.log(LogCategory.SYSTEM,
             `VirtualCd: streaming track ${track.number} "${track.file}" ` +
             `(id=${audioId}, ${startOffsetMs | 0}..${endOffsetMs | 0}ms, ${data.length} bytes)`);
     }
 
-    /** Reads one track's bytes on demand — a disc's worth would not fit in memory. */
-    private async readTrackBytes(track: CdTrack): Promise<Uint8Array | null> {
+    /**
+     * Reads one track's bytes on demand — a disc's worth would not fit in memory. The
+     * read is its OWN handle (never a guest file object) and yields the worker thread
+     * between chunks, so a 30-60 MB track does not stall the guest and the audio pump
+     * for the whole transfer.
+     */
+    private async readTrackBytes(track: CdTrack, generation: number): Promise<Uint8Array | null> {
         try {
             const vfs = System.getInstance().fileSystem;
             const size = vfs.getFileSize(track.file);
@@ -383,10 +576,14 @@ export class VirtualCdAudio {
             const out = new Uint8Array(size);
             let filled = 0;
             while (filled < size) {
-                const chunk = vfs.readSync(handle, size - filled) ?? await vfs.read(handle, size - filled);
+                const want = Math.min(TRACK_READ_CHUNK_BYTES, size - filled);
+                const chunk = vfs.readSync(handle, want) ?? await vfs.read(handle, want);
                 if (!chunk || chunk.length === 0) break;
                 out.set(chunk, filled);
                 filled += chunk.length;
+                if (filled >= size) break;
+                await yieldToWorkerTurn();
+                if (generation !== this.loadGeneration) return null;
             }
             return filled === size ? out : out.subarray(0, filled);
         } catch (e) {
@@ -398,13 +595,19 @@ export class VirtualCdAudio {
     private finishActive(reason: CdStopReason): void {
         const token = this.token;
         const hadAudio = this.audioId;
+        const hadHostAudio = this.hostAudioPosted;
         this.token = 0;
         this.audioId = 0;
         this.loadGeneration++;
+        this.pendingSegment = null;
+        this.hostAudioPosted = false;
+        this.hostAudioStarted = false;
+        this.segPositionSynced = false;
+        this.clearCompletionBackstop();
         this.pausedPositionMs = this.positionMs();
         this.segStartDiscMs = this.pausedPositionMs;
         this.mode = this.trackTable.length > 0 ? "stopped" : "notReady";
-        if (hadAudio) {
+        if (hadAudio && hadHostAudio) {
             self.postMessage({ type: "audio_stop", payload: { id: hadAudio } });
         }
         if (!token) return;
@@ -477,9 +680,11 @@ export class VirtualCdAudio {
         const maxTrack = numbers[numbers.length - 1];
         this.trackTable = [];
         let startMs = 0;
+        // Budgeted: this runs inside whatever guest call first asked about the drive.
+        const probeDeadline = performance.now() + SYNC_PROBE_BUDGET_MS;
         for (let n = 1; n <= maxTrack; n++) {
             const hit = candidates.get(n);
-            const probed = hit ? this.probeDuration(hit.file) : 0;
+            const probed = hit && performance.now() < probeDeadline ? this.probeDuration(hit.file) : 0;
             const lengthKnown = probed > 0;
             const lengthMs = hit ? (lengthKnown ? probed : UNKNOWN_TRACK_LENGTH_MS) : 0;
             this.trackTable.push({
@@ -554,12 +759,16 @@ export class VirtualCdAudio {
     /**
      * Second pass for tracks whose bytes were not synchronously reachable (compressed
      * ROM entries, cold overlay files): pull the head/tail windows through the async
-     * VFS path and re-probe. Start times are recomputed only while the transport is
-     * idle so a running position never jumps under the guest.
+     * VFS path and re-probe.
      */
     private async refineDurations(): Promise<void> {
         if (this.refining) return;
         this.refining = true;
+        this.refinePasses++;
+        const active = this.segTrack > 0 ? this.trackTable[this.segTrack - 1] : undefined;
+        const activeStart = active ? active.startMs : 0;
+        const activeEnd = active ? active.startMs + active.lengthMs : 0;
+        const discEnd = this.discLengthMs();
         try {
             let changed = false;
             for (const t of this.trackTable) {
@@ -574,14 +783,35 @@ export class VirtualCdAudio {
                 t.lengthKnown = true;
                 changed = true;
             }
-            if (changed && this.mode !== "playing" && this.mode !== "paused") {
-                this.recomputeStarts();
-                Logger.log(LogCategory.SYSTEM,
-                    `VirtualCd: durations refined — disc length ${this.discLengthMs() | 0}ms`);
-            }
+            if (!changed) return;
+            this.recomputeStarts();
+            if (active) this.retimeActiveSegment(active, activeStart, activeEnd, discEnd);
+            Logger.log(LogCategory.SYSTEM,
+                `VirtualCd: durations refined — disc length ${this.discLengthMs() | 0}ms`);
         } finally {
             this.refining = false;
         }
+    }
+
+    /**
+     * Translate the running transport onto the recomputed timeline. Start times ARE the
+     * disc timeline every adapter's position/seek arithmetic indexes, so they cannot be
+     * left stale while lengths grow — the track ranges would overlap and trackAt() would
+     * resolve a track's own start to its predecessor. Shifting by the active track's own
+     * delta keeps the guest-visible position continuous across the recompute.
+     */
+    private retimeActiveSegment(track: CdTrack, oldStart: number, oldEnd: number, oldDiscEnd: number): void {
+        const delta = track.startMs - oldStart;
+        const newEnd = track.startMs + track.lengthMs;
+        this.segStartDiscMs += delta;
+        this.pausedPositionMs += delta;
+        this.playToMs = this.playToMs >= oldDiscEnd ? this.discLengthMs() : this.playToMs + delta;
+        // A segment that ran to the track's end still does; one with an explicit MCI_TO
+        // keeps its own boundary.
+        this.segEndDiscMs = this.segEndDiscMs >= oldEnd
+            ? Math.min(newEnd, this.playToMs > this.segStartDiscMs ? this.playToMs : newEnd)
+            : this.segEndDiscMs + delta;
+        if (this.mode === "playing") this.armCompletionBackstop();
     }
 
     private recomputeStarts(): void {

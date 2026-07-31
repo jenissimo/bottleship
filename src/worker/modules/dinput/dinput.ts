@@ -295,6 +295,8 @@ class DirectInputDeviceObject extends BaseComObject {
     public actionMapGuid = "";           // guidActionMap string for registry round-trip
     public seq = 0;                      // DIDEVICEOBJECTDATA dwSequence counter
     public mousePollPrevButtons = 0;     // for action-mapped mouse button edges
+    /** Latch epoch this device has already observed — see DInput.readMouseButtons. */
+    public mouseLatchEpoch = -1;
 
     constructor(vtableAddress: number, iid: string = "5944e680-c92e-11cf-bfc7-444553540000") {
         super(iid, vtableAddress); // default: IDirectInputDeviceA IID
@@ -314,6 +316,9 @@ export class DInput implements IModule {
     vtables: Record<string, VTableInfo> = {};
     /** Per-user/device/action-map GUID saved bindings (SetActionMap round-trip). */
     private savedActionMaps = new Map<string, SavedActionBinding[]>();
+    /** Drained-but-undelivered mouse button edge, and the epoch identifying it. */
+    private latchedMouseEdges = 0;
+    private mouseLatchEpoch = 0;
 
     initialize(process: Process): void {
         this.process = process;
@@ -743,6 +748,12 @@ export class DInput implements IModule {
                 && im.getDInputGamepadBufferSize() > 0) {
                 im.baselineDInputGamepad();
             }
+            // Same for the mouse: without a baseline the first buffered read after an
+            // Acquire that followed SetProperty(DIPROP_BUFFERSIZE) reports the absolute
+            // position as a delta.
+            if (device && device.deviceType === "mouse" && im.getDInputMouseBufferSize() > 0) {
+                im.baselineDInputMouse();
+            }
             // Action-mapped device: baseline the buffered edge detector at acquire time so the first
             // GetDeviceData reports only transitions that happen after acquisition (DI semantics).
             if (device && device.isActionMapped) {
@@ -948,9 +959,9 @@ export class DInput implements IModule {
                 // Browser buttons bitmask: 1=L, 2=R, 4=M, 8=X1(back), 16=X2(forward).
                 // Immediate mode reports the LEVEL — but a press the host published and
                 // released between two of these calls never had a level for us to report,
-                // so the latch carries that edge in for exactly one read (input-manager
-                // consumeMouseButtonLatch). A press held across calls is unaffected.
-                const buttons = inputManager.consumeMouseButtonLatch();
+                // so the latch carries that edge in for exactly one read PER DEVICE
+                // (readMouseButtons). A press held across calls is unaffected.
+                const buttons = this.readMouseButtons(device);
                 curMem[lpvData + 12] = (buttons & 1) ? 0x80 : 0x00;  // Left
                 curMem[lpvData + 13] = (buttons & 2) ? 0x80 : 0x00;  // Right
                 curMem[lpvData + 14] = (buttons & 4) ? 0x80 : 0x00;  // Middle
@@ -1849,9 +1860,9 @@ export class DInput implements IModule {
         let mouseDz = 0;
         const mouseState = inputManager.getMouseState();
         // Action-map data is edge-derived from the level, so it loses a press the same way
-        // immediate mode does. Same latch, same one-read consumption.
+        // immediate mode does. Same latch, same per-device one-read consumption.
         const mouseButtons = device.deviceType === "mouse"
-            ? inputManager.consumeMouseButtonLatch()
+            ? this.readMouseButtons(device)
             : mouseState.buttons;
         let prevButtons = device.mousePollPrevButtons;
         if (device.deviceType === "mouse") {
@@ -1913,6 +1924,33 @@ export class DInput implements IModule {
     private getDevice(thisPtr: number): DirectInputDeviceObject | null {
         const obj = SystemResourceProvider.getInstance().getComObjectByAddress(thisPtr);
         return obj instanceof DirectInputDeviceObject ? obj : null;
+    }
+
+    /**
+     * Mouse button LEVEL for one device, carrying a sub-frame press the host published
+     * and released between two guest reads. The latch behind it is per input-manager,
+     * but "seen exactly once" is a per-DEVICE contract: a title reading the mouse in a
+     * UI pass and a camera pass, or running immediate-mode GetDeviceState alongside an
+     * action map, must see the click in each. So the drained edge is held for an epoch
+     * and handed to every device once; the first device to come back for a second read
+     * retires it.
+     */
+    private readMouseButtons(device: DirectInputDeviceObject | null): number {
+        const inputManager = System.getInstance().inputManager;
+        const level = inputManager.getMouseState().buttons >>> 0;
+        const edges = (inputManager.consumeMouseButtonLatch() >>> 0) & ~level;
+        if (edges) {
+            this.latchedMouseEdges = edges;
+            this.mouseLatchEpoch++;
+        }
+        if (!device) return level | edges;
+        if (!this.latchedMouseEdges) return level;
+        if (device.mouseLatchEpoch === this.mouseLatchEpoch) {
+            this.latchedMouseEdges = 0;
+            return level;
+        }
+        device.mouseLatchEpoch = this.mouseLatchEpoch;
+        return level | this.latchedMouseEdges;
     }
 
     private resolveDeviceType(mem: Uint8Array, guidPtr: number): "keyboard" | "mouse" | "joystick" | "gamepad" | "unknown" {

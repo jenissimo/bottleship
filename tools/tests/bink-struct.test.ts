@@ -18,6 +18,7 @@ import {
     BINK_LAYOUT_V08,
     BINK_LAYOUT_V1,
     BINK_LAYOUT_DEFAULT,
+    binkLayoutFor,
     selectBinkLayout,
 } from "../../src/worker/modules/bink-struct";
 
@@ -56,16 +57,35 @@ describe("HBINK layouts match the shipped DLLs", () => {
 
 describe("selectBinkLayout keys off the DLL's FileVersion", () => {
     test("real FileVersion strings", () => {
-        expect(selectBinkLayout("0.5a").id).toBe("0.5x");
-        expect(selectBinkLayout("0.8i").id).toBe("0.8x");
-        expect(selectBinkLayout("1.0f").id).toBe("1.x");
-        expect(selectBinkLayout("1.5a").id).toBe("1.x");
-        expect(selectBinkLayout("1.9x").id).toBe("1.x");
+        expect(selectBinkLayout("0.5a")?.id).toBe("0.5x");
+        expect(selectBinkLayout("0.8i")?.id).toBe("0.8x");
+        expect(selectBinkLayout("1.0f")?.id).toBe("1.x");
+        expect(selectBinkLayout("1.5a")?.id).toBe("1.x");
+        expect(selectBinkLayout("1.9x")?.id).toBe("1.x");
     });
 
-    test("unreadable version keeps the default", () => {
-        expect(selectBinkLayout(null)).toBe(BINK_LAYOUT_DEFAULT);
-        expect(selectBinkLayout("")).toBe(BINK_LAYOUT_DEFAULT);
-        expect(selectBinkLayout("Bink")).toBe(BINK_LAYOUT_DEFAULT);
+    // RAD-era resource scripts write FileVersion as "0, 8, 0, 0". A dotted-only pattern
+    // drops that onto the 1.x default — the exact 8-byte Frames/FrameNum misplacement
+    // this table exists to prevent, and it fails with one log line.
+    test("comma-separated resource-script versions resolve, not fall through", () => {
+        expect(selectBinkLayout("0, 8, 0, 0")?.id).toBe("0.8x");
+        expect(selectBinkLayout("0,5,0,0")?.id).toBe("0.5x");
+        expect(selectBinkLayout("1, 9, 0, 0")?.id).toBe("1.x");
+    });
+
+    // An unresolvable version must not look like a resolution: the caller has to know it
+    // is guessing, so this returns null rather than the default.
+    test("unreadable version resolves to nothing", () => {
+        expect(selectBinkLayout(null)).toBeNull();
+        expect(selectBinkLayout("")).toBeNull();
+        expect(selectBinkLayout("Bink")).toBeNull();
+        expect(BINK_LAYOUT_DEFAULT).toBe(BINK_LAYOUT_V1);
+    });
+
+    test("binkLayoutFor takes the major/minor pair from any source (VS_FIXEDFILEINFO)", () => {
+        expect(binkLayoutFor(0, 5).id).toBe("0.5x");
+        expect(binkLayoutFor(0, 8).id).toBe("0.8x");
+        expect(binkLayoutFor(1, 0).id).toBe("1.x");
+        expect(binkLayoutFor(2, 7).id).toBe("1.x");
     });
 });

@@ -133,3 +133,50 @@ describe("dsound premix ramp", () => {
         expect(buffer.premixMs).toBe(PREMIX_MAX_MS);
     });
 });
+
+/**
+ * The ramp is the MIXER's depth; what the app sees is the write cursor, and that must
+ * never move BACKWARD. A streaming pump computes `avail = (write - lastWrite + size) %
+ * size`, so a retraction reads as a nearly-full buffer and it rewrites the region being
+ * mixed — a loud glitch, with nothing returning an error.
+ */
+describe("dsound reported write cursor", () => {
+    /** 1 s of 44.1 kHz stereo 16-bit. */
+    const BYTES = 44100 * 4;
+    const DEEP = Math.round(44100 * 0.200) * 4;   // lead at the ramp ceiling
+    const SHALLOW = Math.round(44100 * 0.045) * 4; // lead straight after a remix
+
+    type LeadFields = { bytes: number; reportedLeadBytes?: number; lastReportedPlayCursor?: number };
+
+    const monotonic = (b: LeadFields, play: number, lead: number): number =>
+        (DSound.prototype as unknown as {
+            monotonicLeadBytes(b: LeadFields, play: number, lead: number): number;
+        }).monotonicLeadBytes.call({}, b, play, lead);
+
+    test("a remix drops the ramp without retracting the cursor", () => {
+        const buffer: LeadFields = { bytes: BYTES };
+        let play = 0;
+        let write = (play + monotonic(buffer, play, DEEP)) % BYTES;
+
+        // SetVolume/SetPan/SetFrequency on a playing buffer remixes; unfloored, the
+        // reported cursor would jump ~27 KB back toward play in one call.
+        play += 400;
+        expect((((play + SHALLOW) % BYTES) - write + BYTES) % BYTES).toBeGreaterThan(400);
+
+        for (const advance of [400, 4000, 8000, 40000]) {
+            play = (play + advance) % BYTES;
+            const next = (play + monotonic(buffer, play, SHALLOW)) % BYTES;
+            // Forward by at most what play moved, never backward.
+            expect((next - write + BYTES) % BYTES).toBeLessThanOrEqual(advance);
+            write = next;
+        }
+        // Once play has covered the retraction, the lead is back on the ramp's own value.
+        expect(buffer.reportedLeadBytes).toBe(SHALLOW);
+    });
+
+    test("a growing ramp still moves the cursor out immediately", () => {
+        const buffer: LeadFields = { bytes: BYTES };
+        monotonic(buffer, 0, SHALLOW);
+        expect(monotonic(buffer, 100, DEEP)).toBe(DEEP);
+    });
+});

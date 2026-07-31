@@ -232,6 +232,11 @@ type SoundBuffer = {
     premixStepMs?: number;
     /** Host time (performance.now) the ramp last advanced. */
     premixAdvancedAtMs?: number;
+    /** Lead actually REPORTED as the write cursor, floored so the cursor cannot retract
+     *  when the ramp resets — see monotonicLeadBytes. Cleared while not playing. */
+    reportedLeadBytes?: number;
+    /** Play cursor at the last reported-lead update; its advance is the floor's decay. */
+    lastReportedPlayCursor?: number;
     // Ring buffer (SAB)
     sab: SharedArrayBuffer | null;
     registered: boolean;
@@ -1871,6 +1876,10 @@ export class DSound implements IModule {
             if (!(buffer.flags & DSBCAPS_CTRLVOLUME)) return DSERR_CONTROLUNAVAIL;
             const vol = args[1] | 0;
             if (vol > DSBVOLUME_MAX || vol < DSBVOLUME_MIN) return DSERR_INVALIDPARAM;
+            // A set to the value already in effect changes nothing in the mixer and
+            // raises no remix (nt5 dsound early-outs on it). Without that, a title
+            // re-asserting its volume every frame pins the premix ramp at its minimum.
+            const volumeChanged = buffer.volumeDb !== Math.max(-10000, Math.min(0, vol));
             buffer.volumeDb = Math.max(-10000, Math.min(0, vol));
             if (vol <= -10000) {
                 buffer.volume = 0;
@@ -1883,7 +1892,7 @@ export class DSound implements IModule {
             if (buffer.sab) {
                 setCtrl(buffer.sab, CTRL_VOLUME, buffer.volumeDb);
             }
-            this.signalRemix(buffer);
+            if (volumeChanged) this.signalRemix(buffer);
             return DS_OK;
         };
 
@@ -1892,13 +1901,14 @@ export class DSound implements IModule {
             if (!buffer) return DSERR_INVALIDPARAM;
             if (!(buffer.flags & DSBCAPS_CTRLFREQUENCY)) return DSERR_CONTROLUNAVAIL;
             const freq = Math.max(1, args[1] | 0);
+            const freqChanged = buffer.frequency !== freq;
             buffer.frequency = freq;
             buffer.playbackRate = freq / buffer.format.sampleRate;
             // Instant update via Atomics
             if (buffer.sab) {
                 setCtrl(buffer.sab, CTRL_FREQUENCY, freq);
             }
-            this.signalRemix(buffer);
+            if (freqChanged) this.signalRemix(buffer);
             return DS_OK;
         };
 
@@ -2081,12 +2091,14 @@ export class DSound implements IModule {
             const buffer = this.getBuffer(args[0]);
             if (!buffer) return DSERR_INVALIDPARAM;
             if (!(buffer.flags & DSBCAPS_CTRLPAN) || (buffer.flags & DSBCAPS_CTRL3D)) return DSERR_CONTROLUNAVAIL;
-            buffer.pan = Math.max(-10000, Math.min(10000, args[1] | 0));
+            const pan = Math.max(-10000, Math.min(10000, args[1] | 0));
+            const panChanged = buffer.pan !== pan;
+            buffer.pan = pan;
             // Instant update via Atomics
             if (buffer.sab) {
                 setCtrl(buffer.sab, CTRL_PAN, buffer.pan);
             }
-            this.signalRemix(buffer);
+            if (panChanged) this.signalRemix(buffer);
             return DS_OK;
         };
         this.exports["idirectsoundbuffer8_restore"] = (ctx, mem, args) => {
@@ -2514,6 +2526,27 @@ export class DSound implements IModule {
         return Math.min(leadFrames * blockAlign, Math.floor(buffer.bytes / 4));
     }
 
+    /**
+     * The REPORTED write cursor never moves backward. A remix rewinds the mixer's
+     * next-mix position, not the app-visible cursor; a streaming pump sizing its refill
+     * from `(write - lastWrite + size) % size` reads a retraction as a nearly-full buffer
+     * and rewrites the region being mixed. The play cursor only advances, so flooring the
+     * LEAD by how far play moved since the last report is exactly a monotonic write
+     * cursor — and the lead still decays back onto the ramp's own value as play catches up.
+     */
+    private monotonicLeadBytes(buffer: SoundBuffer, playCursor: number, leadBytes: number): number {
+        const prevLead = buffer.reportedLeadBytes;
+        const prevPlay = buffer.lastReportedPlayCursor;
+        let lead = leadBytes;
+        if (prevLead !== undefined && prevPlay !== undefined) {
+            const advanced = (playCursor - prevPlay + buffer.bytes) % buffer.bytes;
+            lead = Math.max(leadBytes, prevLead - advanced);
+        }
+        buffer.reportedLeadBytes = lead;
+        buffer.lastReportedPlayCursor = playCursor;
+        return lead;
+    }
+
     private dsoundStoppedWriteCursor(buffer: SoundBuffer, playCursor: number): number {
         const blockAlign = Math.max(1, buffer.format.blockAlign);
         const marginFrames = Math.max(128, Math.ceil(buffer.format.sampleRate * 0.015));
@@ -2585,10 +2618,12 @@ export class DSound implements IModule {
             // write out-param of GetCurrentPosition is fetched and discarded — so
             // this lead choice is a no-op for that title and exists for correctness
             // toward the clients that DO read it.
-            const leadBytes = this.dsoundLeadBytes(buffer);
+            const leadBytes = this.monotonicLeadBytes(buffer, playCursor, this.dsoundLeadBytes(buffer));
             return { playCursor, writeCursor: (playCursor + leadBytes) % buffer.bytes };
         }
 
+        buffer.reportedLeadBytes = undefined;
+        buffer.lastReportedPlayCursor = undefined;
         const playCursor = (buffer.currentPosition ?? 0) % buffer.bytes;
         return { playCursor, writeCursor: this.dsoundStoppedWriteCursor(buffer, playCursor) };
     }

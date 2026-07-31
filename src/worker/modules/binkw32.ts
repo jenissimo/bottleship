@@ -31,8 +31,8 @@ import { Mem } from "../core/memory/mem-accessor";
 import { overlapsThunkCode } from "../core/memory/address-guard";
 import { Glide2x } from "./glide2x";
 import { VideoFrameViews } from "../video/video-routing-types";
-import { readPeVersionString } from "../core/pe-version";
-import { BinkStructLayout, BINK_LAYOUT_DEFAULT, selectBinkLayout } from "./bink-struct";
+import { readPeVersionString, readPeFixedFileVersion } from "../core/pe-version";
+import { BinkStructLayout, BINK_LAYOUT_DEFAULT, binkLayoutFor, selectBinkLayout } from "./bink-struct";
 
 // Real HBINK structs are 300-500+ bytes depending on SDK version.  Games read
 // internal fields (rect pointers, frame buffer ptrs) at offsets well beyond our
@@ -545,9 +545,23 @@ export class BinkW32 implements IModule {
         }
         const image = await this.readVfsFile(path);
         const version = image ? readPeVersionString(image, "FileVersion") : null;
-        this.layout = selectBinkLayout(version);
+        // StringFileInfo is localizable text a build may omit; VS_FIXEDFILEINFO is the
+        // binary version every versioned image carries.
+        const fixed = image ? readPeFixedFileVersion(image) : null;
+        const resolved = selectBinkLayout(version)
+            ?? (fixed ? binkLayoutFor(fixed.major, fixed.minor) : null);
+        if (!resolved) {
+            Logger.error(LogCategory.SYSTEM,
+                `[BinkW32] ${path}: no readable version (FileVersion="${version ?? ""}", no VS_FIXEDFILEINFO) — ` +
+                `GUESSING HBINK layout ${this.layout.id}. If this DLL is 0.8x, Frames/FrameNum land 8 bytes ` +
+                `off and the guest's "video finished" test never fires.`);
+            return;
+        }
+        this.layout = resolved;
         Logger.log(LogCategory.SYSTEM,
-            `[BinkW32] ${path}: FileVersion="${version ?? "?"}" → HBINK layout ${this.layout.id} ` +
+            `[BinkW32] ${path}: FileVersion="${version ?? "?"}"` +
+            `${fixed ? ` fixed=${fixed.major}.${fixed.minor}.${fixed.build}.${fixed.revision}` : ""}` +
+            ` → HBINK layout ${this.layout.id} ` +
             `(Frames@0x${this.layout.frames.toString(16)} FrameNum@0x${this.layout.frameNum.toString(16)} ` +
             `rects@0x${this.layout.frameRects.toString(16)})`);
     }

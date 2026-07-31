@@ -28,6 +28,7 @@ const MCIERR_INVALID_DEVICE_ID = 257;
 const MCIERR_UNRECOGNIZED_KEYWORD = 259;
 const MCIERR_UNRECOGNIZED_COMMAND = 261;
 const MCIERR_INVALID_DEVICE_NAME = 263;
+const MCIERR_DEVICE_OPEN = 266;
 const MCIERR_MISSING_COMMAND_STRING = 267;
 const MCIERR_MISSING_STRING_ARGUMENT = 269;
 const MCIERR_BAD_INTEGER = 270;
@@ -1243,6 +1244,15 @@ export class WinmmMci {
             if (alias && this.mciAliases.has(alias.toLowerCase())) {
                 return MCIERR_DUPLICATE_ALIAS;
             }
+            // A simple device (cdaudio and friends) is ONE device — there is one drive.
+            // Opening it twice is MCIERR_DEVICE_OPEN, not a second device: the alias
+            // entry would move to the newcomer, so `close cdaudio` would delete the
+            // wrong one and strand the first — its id dead, its drive-side listener
+            // unreleasable. A compound device (a file) may legitimately open more than once.
+            if (!alias && MCI_SIMPLE_DEVICE_TYPES.has(this.normalizeMciText(name))
+                && this.findMciDevice(name)) {
+                return MCIERR_DEVICE_OPEN;
+            }
             const typeIndex = tokens.findIndex((t) => t.toLowerCase() === "type");
             const device = this.createMciDevice(name, alias || undefined);
             device.elementName = name;
@@ -1570,13 +1580,12 @@ export class WinmmMci {
 
             Logger.verbose(LogCategory.SYSTEM, `mciGetDeviceIDA: device="${deviceName}"`);
 
+            // A pure query: mciGetDeviceID returns 0 for a device that is not open. It
+            // must not open one as a side effect — a title using `mciGetDeviceID(...) == 0`
+            // as its "no CD support" test would never take that branch, and the phantom
+            // device it created is never closed.
             const existing = this.findMciDevice(deviceName);
-            if (existing) return existing.id;
-
-            const device = this.createMciDevice(deviceName);
-            device.deviceType = this.inferMciDeviceType(deviceName);
-            if (this.isMciCdAudioDevice(device)) this.openCdAudioDevice(device);
-            return device.id;
+            return existing ? existing.id : 0;
         };
 
         exports["mciSendCommandA"] = (ctx, mem, args) => {
@@ -1612,6 +1621,15 @@ export class WinmmMci {
                     || this.inferMciDeviceType(elementName)
                     || "avivideo";
                 const openName = alias || resolvedType;
+                // Same one-device rule as the string interface: a simple device opened
+                // by type has nothing to distinguish a second instance from the first.
+                const simpleReopen = !elementName && MCI_SIMPLE_DEVICE_TYPES.has(resolvedType);
+                const already = (alias || simpleReopen) ? this.findMciDevice(openName) : null;
+                if (already) {
+                    // Real MCI refuses and hands back the id that is already open.
+                    if (dwParam) view.setUint32(dwParam + 4, already.id, true);
+                    return alias ? MCIERR_DUPLICATE_ALIAS : MCIERR_DEVICE_OPEN;
+                }
                 const device = this.createMciDevice(openName, openName);
                 device.elementName = elementName;
                 device.deviceType = resolvedType;

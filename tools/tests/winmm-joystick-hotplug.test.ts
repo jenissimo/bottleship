@@ -11,6 +11,7 @@ import { describe, expect, test, beforeEach } from "bun:test";
 import { System } from "../../src/worker/core/system";
 import { INPUT_BUFFER_SIZE, INPUT_INDEX, beginInputWrite, endInputWrite } from "../../src/input/sab-layout";
 import { registerWinmmJoystickExports, resetWinmmJoystick } from "../../src/worker/modules/winmm-joystick";
+import { TimeService } from "../../src/worker/runtime/time";
 import type { ThunkImplementation } from "../../src/worker/core/thunking/thunk-dispatcher";
 
 const JOYERR_NOERROR = 0;
@@ -112,6 +113,62 @@ describe("winmm joystick hot-plug", () => {
 
         // A W caller must not have anything written past sizeof(JOYCAPSW).
         expect(mem[PJI + JOYCAPSW_SIZE]).toBe(0);
+    });
+
+    // joyGetNumDevs reports the PORTS the driver supports, but nothing sits behind port 1.
+    // Mirroring port 0 there hands an enumerating game two identical CONNECTED sticks:
+    // a two-player title binds both players to the one pad, and a "use the highest
+    // connected port" scan picks the phantom.
+    test("port 1 reports UNPLUGGED even while port 0 has a pad", () => {
+        setPad(true, 0b0011);
+        expect(call("joyGetNumDevs")).toBe(2);
+        expect(posEx(0)).toBe(JOYERR_NOERROR);
+        expect(posEx(1)).toBe(JOYERR_UNPLUGGED);
+        expect(call("joyGetPos", 0, PJI)).toBe(JOYERR_NOERROR);
+        expect(call("joyGetPos", 1, PJI)).toBe(JOYERR_UNPLUGGED);
+    });
+
+    // JOYCAPS advertises wNumButtons = 8, so nothing above bit 7 may appear in
+    // dwButtons — and dwButtonNumber is a popcount over that set, so an unmasked host
+    // mask makes it exceed the advertised count.
+    test("dwButtons/dwButtonNumber stay within the advertised wNumButtons", () => {
+        setPad(true, 0xFFFF);
+        expect(posEx()).toBe(JOYERR_NOERROR);
+        expect(view.getUint32(PJI + 32, true)).toBe(0xFF);
+        expect(view.getUint32(PJI + 36, true)).toBe(8);
+
+        // JOYINFO.wButtons is only the four JOY_BUTTON1..4 bits, per the struct.
+        expect(call("joyGetPos", 0, PJI)).toBe(JOYERR_NOERROR);
+        expect(view.getUint32(PJI + 12, true)).toBe(0x0F);
+    });
+
+    // guestGamepadSeq is the signal the host's control-layout auto-select uses to decide
+    // "this title steers with a pad". The capture pump is OURS: it must read the stick
+    // without claiming the guest did.
+    test("the capture pump reads the pad without stamping guest-read telemetry", () => {
+        const system = System.getInstance();
+        const wm = system.windowManager;
+        const im = system.inputManager;
+        const v = (im as unknown as { inputView: Int32Array }).inputView;
+        const hwnd = wm.createWindow("T", "joy", 0x90000000, 0, 0, 0, 32, 32, 0, 0, 0, 0);
+        setPad(true);
+
+        const before = Atomics.load(v, INPUT_INDEX.guestGamepadSeq);
+        const period = 50;
+        expect(call("joySetCapture", hwnd, 0, period, 0)).toBe(JOYERR_NOERROR);
+        expect(Atomics.load(v, INPUT_INDEX.guestGamepadSeq)).toBe(before);
+
+        const wheel = system.scheduler!.timerWheel;
+        const now = TimeService.getInstance().nowMs();
+        for (let i = 1; i <= 5; i++) wheel.poll(now + i * period + 1);
+        expect(Atomics.load(v, INPUT_INDEX.guestGamepadSeq)).toBe(before);
+
+        // ...while a read the GUEST made still advances it.
+        expect(posEx()).toBe(JOYERR_NOERROR);
+        expect(Atomics.load(v, INPUT_INDEX.guestGamepadSeq)).toBeGreaterThan(before);
+
+        call("joyReleaseCapture", 0);
+        wm.destroyWindow(hwnd);
     });
 
     test("joySetCapture needs a present stick, and the capture survives an unplug", () => {

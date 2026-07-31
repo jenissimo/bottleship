@@ -25,6 +25,10 @@ export type AudioPlayEncodedPayload = {
   /** Force the streaming path regardless of container — for sources that must not
    *  be decoded into a PCM buffer (a CD track is tens of MB decoded). */
   stream?: boolean;
+  /** Unit for the position reports this source emits: element time is multiplied by
+   *  it. Defaults to the decoded sample rate (frames); 1000 reports milliseconds, for
+   *  callers that never learn the host's sample rate. */
+  positionRateHz?: number;
 };
 
 export type AudioUpdatePayload = {
@@ -61,10 +65,14 @@ type EncodedSource = {
   gainNode: GainNode;
   panNode: StereoPannerNode;
   loopsRemaining: number;
+  /** Multiplier applied to element time for position reports (payload.positionRateHz,
+   *  else the decoded sample rate — i.e. frames). */
   sampleRate?: number;
   positionHandler?: () => void;
   /** Loop/seek origin in seconds (payload.startOffsetMs). */
   startTime: number;
+  /** The startTime seek has been attempted; element time is meaningful from here on. */
+  startApplied?: boolean;
   /** Stop here instead of at the stream's end; null = play to the end. */
   endTime: number | null;
 };
@@ -670,12 +678,14 @@ export class AudioEngine {
     this.stop(payload.id);
 
     const mimeType = payload.mimeType ?? "audio/mpeg";
-    // Ensure we have a regular ArrayBuffer (not SharedArrayBuffer) for Blob
-    // Create a copy with regular ArrayBuffer to satisfy Blob API
-    const regularBuffer = new ArrayBuffer(payload.data.byteLength);
-    const dataCopy = new Uint8Array(regularBuffer);
-    dataCopy.set(payload.data);
-    const blob = new Blob([dataCopy], { type: mimeType });
+    // Blob takes an ArrayBufferView directly and copies once internally. Only a
+    // SharedArrayBuffer-backed view needs a detour — a CD track is tens of MB, and an
+    // extra transient copy per track change lands on the main thread exactly where the
+    // frame loop can least afford the GC spike.
+    const blobSource: BlobPart = payload.data.buffer instanceof SharedArrayBuffer
+      ? new Uint8Array(this.cloneArrayBuffer(payload.data))
+      : (payload.data as unknown as BlobPart);
+    const blob = new Blob([blobSource], { type: mimeType });
     const url = URL.createObjectURL(blob);
     const element = new Audio();
     element.preload = "auto";
@@ -707,6 +717,10 @@ export class AudioEngine {
 
     const reportPosition = () => {
       const source = this.encodedSources.get(payload.id);
+      // Until the start offset has been attempted, element time says nothing about where
+      // playback will actually begin — reporting it would tell the caller "0" for a
+      // mid-track start that is about to succeed.
+      if (source && source.startTime > 0 && !source.startApplied) return;
       const rate = source?.sampleRate ?? this.context?.sampleRate ?? 44100;
       if (this.onPosition && Number.isFinite(element.currentTime)) {
         this.onPosition(payload.id, Math.floor(element.currentTime * rate));
@@ -725,7 +739,7 @@ export class AudioEngine {
       gainNode,
       panNode,
       loopsRemaining,
-      sampleRate: sampleRate ?? undefined,
+      sampleRate: payload.positionRateHz ?? sampleRate ?? undefined,
       positionHandler: reportPosition,
       startTime,
       endTime,
@@ -736,6 +750,21 @@ export class AudioEngine {
     });
     element.addEventListener("timeupdate", reportPosition);
     element.addEventListener("seeking", reportPosition);
+    element.addEventListener("seeked", reportPosition);
+    // A container the browser accepts into a Blob but cannot decode fires `error` and
+    // never `ended`, and element.play() does not reject for it — without these the
+    // caller waits for a completion that can never arrive.
+    element.addEventListener("error", () => {
+      const err = element.error;
+      this.failEncodedSource(payload.id, err ? `media error ${err.code}: ${err.message}` : "media error");
+    });
+    // There is no network behind a blob: URL, so a stall with nothing buffered at all is
+    // the same dead end rather than a recoverable hiccup.
+    element.addEventListener("stalled", () => {
+      if (element.readyState === HTMLMediaElement.HAVE_NOTHING) {
+        this.failEncodedSource(payload.id, "media stalled with no data");
+      }
+    });
 
     if (startTime > 0) {
       const applyStartOffset = () => {
@@ -744,8 +773,13 @@ export class AudioEngine {
         } catch {
           // Seek before the browser has a seekable range — the media is played from 0.
         }
+        // Either way the offset is now settled: unblock position reporting so the caller
+        // learns the offset that was actually ACHIEVED and can retime its own transport.
+        const source = this.encodedSources.get(payload.id);
+        if (source) source.startApplied = true;
+        reportPosition();
       };
-      if (element.readyState >= 1) applyStartOffset();
+      if (element.readyState >= HTMLMediaElement.HAVE_METADATA) applyStartOffset();
       else element.addEventListener("loadedmetadata", applyStartOffset, { once: true });
     }
 
@@ -773,6 +807,14 @@ export class AudioEngine {
     }
   }
 
+  /** Tear down a stream that failed after it started and tell the caller once. */
+  private failEncodedSource(id: number, error: string): void {
+    if (!this.encodedSources.has(id)) return;
+    console.error("BottleShip: Audio stream failed", { id, error });
+    this.cleanupEncodedSource(id);
+    this.onStatusChange?.(id, "error", error);
+  }
+
   private handleEncodedEnded(id: number): void {
     const source = this.encodedSources.get(id);
     if (!source) return;
@@ -795,15 +837,18 @@ export class AudioEngine {
     if (source.positionHandler) {
       source.element.removeEventListener("timeupdate", source.positionHandler);
       source.element.removeEventListener("seeking", source.positionHandler);
+      source.element.removeEventListener("seeked", source.positionHandler);
     }
+    // Drop the map entry before tearing the element down: clearing src can queue an
+    // `error` event, and the membership check is what stops it re-entering here.
+    this.encodedSources.delete(id);
+    this.pausedEncodedSources.delete(id);
     source.element.pause();
     source.element.src = "";
     URL.revokeObjectURL(source.url);
     source.sourceNode.disconnect();
     source.gainNode.disconnect();
     source.panNode.disconnect();
-    this.encodedSources.delete(id);
-    this.pausedEncodedSources.delete(id);
   }
 
   private buildDecodeKey(payload: AudioPlayEncodedPayload): string {
