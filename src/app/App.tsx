@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { cx } from "../ui/cx";
 import s from "./App.module.css";
 import OpfsTool from '../debug/OpfsTool';
+import WgbBrowser from '../debug/WgbBrowser';
 import StorageManagerModal from '../storage/StorageManagerModal';
 import RegistryTool from '../debug/RegistryTool';
 import DebugLogViewer from '../debug/DebugLogViewer';
@@ -12,6 +13,7 @@ import FrameAnalysisPanel from '../debug/FrameAnalysisPanel';
 import { InputStatusOverlay, type InputStatus } from './InputStatusOverlay';
 import { AudioEngine, AudioPlayEncodedPayload, AudioPlayPayload, AudioUpdatePayload } from "../audio/audio-engine";
 import { getLogClient, sendLogToServer, writeDebugFile, writeDebugFileBase64, rotateLogFile, logArtifactPath } from "../utils/log-client";
+import { bundleLogName } from "../utils/bundle-url";
 import { sessionFromLocation } from "../harness/session";
 import { installHarnessFacade } from "../harness/facade";
 import { getCachedGamepadMeta, initGamepadCache, readLiveGamepad, rescanGamepads } from "../gamepad-cache";
@@ -158,6 +160,10 @@ function loadQuality(): QualityConfig {
 // Persistent state outside the component scope to survive re-mounts
 /** sessionStorage key holding a pending self re-exec across the page reload it triggers. */
 const REEXEC_KEY = "bs_pending_reexec";
+/** sessionStorage key holding a bundle the dev browser asked us to open after a reload.
+ *  Separate from REEXEC_KEY on purpose: that one also replaces the manifest's boot args,
+ *  and an empty args string is not the same as "boot this bundle normally". */
+const PENDING_BUNDLE_KEY = "bs_pending_bundle";
 /** Bundle URL a pending re-exec must re-open once window.loadApp exists (dev/harness boots). */
 let reExecBundleUrl: string | null = null;
 let globalWorker: Worker | null = null;
@@ -291,6 +297,7 @@ export default function App() {
   const [addedGames, setAddedGames] = useState<AddedGame[]>([]);
   const [editingKey, setEditingKey] = useState<string | null>(null);
   const [opfsToolOpen, setOpfsToolOpen] = useState(false);
+  const [wgbBrowserOpen, setWgbBrowserOpen] = useState(false);
   const [storageOpen, setStorageOpen] = useState(false);
   /** Chrome-free presentation where the Fullscreen API does not exist (iPhone Safari). */
   const [immersive, setImmersive] = useState(false);
@@ -1935,7 +1942,7 @@ export default function App() {
     (window as any).enableHleAndLoad = async (path: string, logOnly = false, galaxyHleMixer = true) => {
       if (!globalWorker) { console.error("BottleShip: Worker not initialized"); return; }
       console.log(`BottleShip: enableHleAndLoad logOnly=${logOnly} mixer=${galaxyHleMixer} → ${path}`);
-      rotateLogFile((path.split(/[\\/]/).pop()?.replace(/\.wgb$/i, "") || "game") + "-hle");
+      rotateLogFile(bundleLogName(path) + "-hle");
       setIsLoadingApp(true);
       setErrorMessage(null);
       setBundleDisplayName(null);
@@ -1956,7 +1963,7 @@ export default function App() {
     // streaming it on demand (catalog entry `preload`) — see the worker's URL path.
     (window as any).loadApp = async (path: string, opts?: { preload?: boolean }) => {
       console.log(`BottleShip: Loading App from ${path}`);
-      rotateLogFile(path.split(/[\\/]/).pop()?.replace(/\.wgb$/i, "") || "game");
+      rotateLogFile(bundleLogName(path));
       ensurePersistentStorageRequested();
       setIsLoadingApp(true);
       setErrorMessage(null); // Clear any previous errors
@@ -2003,6 +2010,17 @@ export default function App() {
       const url = reExecBundleUrl;
       reExecBundleUrl = null;
       void (window as any).loadApp(url);
+    } else {
+      // The dev bundle browser launches through a reload (see handleLaunchBundle): a fresh
+      // page is the only teardown that is genuinely complete, so back-to-back regression
+      // runs can't inherit the previous game's worker state.
+      try {
+        const pending = sessionStorage.getItem(PENDING_BUNDLE_KEY);
+        if (pending) {
+          sessionStorage.removeItem(PENDING_BUNDLE_KEY);
+          void (window as any).loadApp(pending);
+        }
+      } catch { /* no pending bundle */ }
     }
 
     const applyInputSample = (sample: InputSample) => {
@@ -2558,6 +2576,17 @@ export default function App() {
     return true;
   }, []);
 
+  /** Dev bundle browser: open a bundle through a page reload rather than in place, so a
+   *  regression pass never carries the previous game's state into the next one. */
+  const handleLaunchBundle = useCallback((url: string) => {
+    try {
+      sessionStorage.setItem(PENDING_BUNDLE_KEY, url);
+      window.location.reload();
+    } catch {
+      void (window as any).loadApp?.(url); // sessionStorage unavailable — load in place
+    }
+  }, []);
+
   const handleToggleFpuStrict = useCallback((strict: boolean) => {
     setFpuStrictEnabled(strict);
     globalWorker?.postMessage({ type: "set_fpu_strict", strict });
@@ -2866,6 +2895,7 @@ export default function App() {
           onOpenDebugGpu={() => setDebugGpuOpen(true)}
           onOpenFrameAnalysis={() => setFrameAnalysisOpen(true)}
           onOpenStorage={() => setStorageOpen(true)}
+          onOpenBundles={import.meta.env.DEV ? () => setWgbBrowserOpen(true) : undefined}
           onOpenOpfsTool={() => setOpfsToolOpen(true)}
           onOpenRegistryTool={() => setRegistryToolOpen(true)}
           fpuStrictEnabled={fpuStrictEnabled}
@@ -2999,6 +3029,13 @@ export default function App() {
 
       {settingsDrawer}
       <OpfsTool isOpen={opfsToolOpen} onClose={() => setOpfsToolOpen(false)} />
+      {import.meta.env.DEV && (
+        <WgbBrowser
+          isOpen={wgbBrowserOpen}
+          onClose={() => setWgbBrowserOpen(false)}
+          onLaunch={handleLaunchBundle}
+        />
+      )}
       <StorageManagerModal isOpen={storageOpen} onClose={() => setStorageOpen(false)} />
       <RegistryTool isOpen={registryToolOpen} onClose={() => setRegistryToolOpen(false)} worker={globalWorker} />
       <DebugLogViewer isOpen={logViewerOpen} onClose={() => setLogViewerOpen(false)} worker={globalWorker} />

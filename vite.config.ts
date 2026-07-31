@@ -7,6 +7,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { execSync } from "node:child_process";
 import type { ServerResponse } from "node:http";
+import { isUnc, listWgb, underAnyRoot, wgbListRoots, wgbRoots } from "./tools/wgb-roots";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -90,6 +91,8 @@ function pipeAndCleanup(stream: fs.ReadStream, res: ServerResponse): void {
 
 function serveWgbFromDisk(): Plugin {
   const ROUTE = "/__wgb/";
+  const LIST_ROUTE = "/__wgb/list";
+  const roots = wgbRoots(__dirname);
   return {
     name: "serve-wgb-from-disk",
     apply: "serve",
@@ -99,12 +102,32 @@ function serveWgbFromDisk(): Plugin {
       server.middlewares.use((req, res, next) => {
         if (!req.url || !req.url.startsWith(ROUTE)) return next();
         for (const [k, v] of Object.entries(coopCoepHeaders)) res.setHeader(k, v);
+        // The dev bundle browser (src/debug/WgbBrowser.tsx): what is loadable off disk
+        // WITHOUT registering it in the library catalog. Enumerating the same roots the
+        // delivery route below confines to means the browser cannot offer a bundle that
+        // would then be refused.
+        if (req.url.split("?")[0] === LIST_ROUTE) {
+          const listing = listWgb(wgbListRoots(__dirname));
+          res.statusCode = 200;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify(listing));
+          return;
+        }
         // Caller supplies the absolute disk path via ?path= (URLSearchParams decodes it).
         const qi = req.url.indexOf("?");
         const abs = qi >= 0 ? new URLSearchParams(req.url.slice(qi + 1)).get("path") : null;
         if (!abs) { res.statusCode = 400; res.end("missing ?path=<absolute .wgb path>"); return; }
+        if (isUnc(abs)) { res.statusCode = 403; res.end("UNC paths are refused"); return; }
         const file = path.resolve(abs);
+        if (isUnc(file)) { res.statusCode = 403; res.end("UNC paths are refused"); return; }
         if (!file.toLowerCase().endsWith(".wgb")) { res.statusCode = 403; res.end("only .wgb files"); return; }
+        // Same confinement as the sidecar's /wgb — a fallback route that serves anything
+        // the sidecar would refuse means the confinement only holds when :3001 is up.
+        if (!underAnyRoot(file, roots)) {
+          res.statusCode = 403;
+          res.end("path is outside the configured roots (set BS_WGB_ROOTS)");
+          return;
+        }
         let size: number;
         try {
           const st = fs.statSync(file);

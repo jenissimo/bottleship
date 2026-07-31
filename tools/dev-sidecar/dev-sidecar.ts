@@ -16,8 +16,9 @@
 
 import { appendFile, readdir, unlink, stat, mkdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { normalizeSession, sessionLogDir } from "../../src/harness/session";
+import { isUnc, underAnyRoot, wgbRoots } from "../wgb-roots";
 
 const CONFIG = {
   // BS_SIDECAR_PORT lets a SECOND dev stack (an isolated worktree, a test) run without
@@ -232,29 +233,12 @@ const DEV_ORIGINS = new Set(DEV_PORTS.flatMap((p) =>
  * CORS only decides who may READ the body; the read off disk happens regardless, and a UNC
  * `path` would make Windows authenticate to a remote share (an NTLM handshake a `no-cors`
  * fetch from any visited page can force). So `path` is confined to an explicit root set and
- * UNC is refused outright. Roots: the repo, plus `BS_WGB_ROOTS` (`;`/`,`-separated) for a
- * drop folder living outside it.
+ * UNC is refused outright. The root set is shared with Vite's `/__wgb/` fallback and the
+ * dev browser's listing route (tools/wgb-roots.ts) — two deliverers disagreeing about
+ * what is allowed is the same as no confinement.
  */
 const REPO_ROOT = resolve(import.meta.dir, "..", "..");
-
-/** `public/apps/external-wgb` is the repo's own pointer at the local drop folder — the tree
- *  this checkout is already configured to load bundles from, so it is a root by definition. */
-function dropFolderRoot(): string[] {
-  const link = join(REPO_ROOT, "public", "apps", "external-wgb");
-  try { return [dirname(realpathSync(link))]; } catch { return []; }
-}
-
-const WGB_ROOTS = [
-  REPO_ROOT,
-  ...dropFolderRoot(),
-  ...(process.env.BS_WGB_ROOTS ?? "").split(/[;,]/).map((s) => s.trim()).filter(Boolean).map((s) => resolve(s)),
-];
-
-const isUnc = (p: string) => /^(\\\\|\/\/)/.test(p.trim());
-
-function underAnyRoot(file: string): boolean {
-  return WGB_ROOTS.some((root) => file === root || file.startsWith(root.endsWith(sep) ? root : root + sep));
-}
+const WGB_ROOTS = wgbRoots(REPO_ROOT);
 
 function wgbHeaders(req: Request): Record<string, string> {
   const origin = req.headers.get("origin");
@@ -282,7 +266,7 @@ async function serveWgb(req: Request, url: URL): Promise<Response> {
   if (!file.toLowerCase().endsWith(".wgb")) {
     return new Response("only .wgb files", { status: 403, headers: cors });
   }
-  if (!underAnyRoot(file)) {
+  if (!underAnyRoot(file, WGB_ROOTS)) {
     return new Response("path is outside the configured roots (set BS_WGB_ROOTS)", { status: 403, headers: cors });
   }
 

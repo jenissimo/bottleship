@@ -27,7 +27,7 @@ import { sessionFromLocation } from "./session";
 import type { HarnessStep, HarnessRunResult, HarnessStepResult } from "./types";
 import { isSerializedFn } from "./types";
 import { HarnessChain } from "./dsl";
-import { SIDECAR_PORT } from "../utils/log-client";
+import { diskBundleUrl } from "../utils/bundle-url";
 import { INPUT_INDEX, KEY_BITFIELD_BASE, KEY_BITFIELD_COUNT } from "../input/sab-layout";
 import { relativeIntent } from "../input/relative-intent";
 
@@ -217,19 +217,6 @@ export function installHarnessFacade(worker: Worker, getInputView?: () => Int32A
 
     /* ───────────────────────── browser-only verbs ───────────────────────── */
 
-    /** Dev-sidecar bundle route — see serveWgb in tools/dev-sidecar. Probed once
-     *  per session; null until probed, false when the sidecar is not running. */
-    let wgbSidecar: boolean | null = null;
-
-    async function sidecarAvailable(): Promise<boolean> {
-        if (wgbSidecar !== null) return wgbSidecar;
-        try {
-            const r = await fetch(`http://localhost:${SIDECAR_PORT}/health`, { method: "GET" });
-            wgbSidecar = r.ok;
-        } catch { wgbSidecar = false; }
-        return wgbSidecar;
-    }
-
     async function resolveBundlePath(idOrUrl: string): Promise<string> {
         // A Windows path in a double-quoted JS literal is a trap: "g:\WGB\todo\bod.wgb"
         // is really `g:WGB<TAB>odo<BACKSPACE>od.wgb` — \t and \b are escapes and \W just
@@ -247,22 +234,11 @@ export function installHarnessFacade(worker: Worker, getInputView?: () => Int32A
         if (/^https?:\/\//i.test(idOrUrl)) return idOrUrl;
         // Absolute disk path (Windows "X:\…"/"X:/…" or a POSIX "/…*.wgb") → stream it straight
         // off disk via Range, so the agent/make-wgb can hand a raw path — no symlink, no
-        // hardcoded folder.
-        //
-        // Prefer the dev sidecar over Vite's /__wgb/ route: a bundle read is the hot path of
-        // every boot (8 MB ranges while the guest thread is parked on a 30 s deadline), and
-        // Vite's throughput on that route decays over a long-lived dev server until the
-        // deadline blows ("SabIoSource: read timed out"). Falls back to the Vite route when
-        // the sidecar is not running.
+        // hardcoded folder. Route choice (sidecar over Vite) lives in diskBundleUrl.
         const isWinAbs = /^[a-zA-Z]:[\\/]/.test(idOrUrl);
         const isPosixAbsWgb = idOrUrl.startsWith("/") && !idOrUrl.startsWith("/apps/")
             && !idOrUrl.startsWith("/__wgb/") && idOrUrl.toLowerCase().endsWith(".wgb");
-        if (isWinAbs || isPosixAbsWgb) {
-            const enc = encodeURIComponent(idOrUrl);
-            return (await sidecarAvailable())
-                ? `http://localhost:${SIDECAR_PORT}/wgb?path=${enc}`
-                : `/__wgb/?path=${enc}`;
-        }
+        if (isWinAbs || isPosixAbsWgb) return (await diskBundleUrl(idOrUrl)).url;
         if (idOrUrl.includes("/")) return idOrUrl;                       // already a URL (/apps/…, /__wgb/…)
         // Bare id → a bundled demo served statically from public/apps.
         if (idOrUrl.toLowerCase().endsWith(".wgb")) return `/apps/${idOrUrl}`;

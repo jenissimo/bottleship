@@ -4,6 +4,8 @@ import s from "./DevPanel.module.css";
 
 interface DevPanelProps {
   onLoadFile: (file: File) => boolean;
+  /** Dev-server only (the listing route does not exist in a build) — omitted otherwise. */
+  onOpenBundles?: () => void;
   onOpenSettings: () => void;
   onCaptureFrame: () => void;
   statsOverlayEnabled: boolean;
@@ -41,6 +43,11 @@ export default function DevPanel(props: DevPanelProps) {
         <ActionButton onClick={() => document.getElementById('pe-loader')?.click()}>
           Load File...
         </ActionButton>
+        {props.onOpenBundles && (
+          <ActionButton onClick={props.onOpenBundles} title="Browse .wgb bundles on disk (public/apps, the external-wgb drop folder, BS_WGB_ROOTS)">
+            Bundles...
+          </ActionButton>
+        )}
         <ActionButton variant="secondary" onClick={props.onOpenSettings}>
           Settings
         </ActionButton>
