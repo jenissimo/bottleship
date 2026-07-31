@@ -44,6 +44,10 @@ import {
 import { computeFvfStride } from "../../../backends/webgpu/ddraw/compute/vertex-converter";
 import { EmulatorConfig } from "../../../core/emulator-config-manager";
 import { initReturnPtr } from "../../../backends/webgpu/shared/dx-com-helpers";
+import { isValidAddress } from "../../../core/memory/address-guard";
+
+/** D3DFINDDEVICERESULT: dwSize + GUID + two D3DDEVICEDESCs (252 each). */
+const FIND_DEVICE_RESULT_SIZE = 20 + 252 + 252;
 
 // ddraw.h aliases these onto the standard COM codes, not MAKE_DDHRESULT values.
 const DDERR_INVALIDPARAMS = 0x80070057; // E_INVALIDARG
@@ -72,6 +76,7 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
 
         const obj = resourceProvider.getComObjectByAddress(thisPtr);
         const iidBytes = new Uint8Array(16);
+        if (!riidPtr || !isValidAddress(mem, riidPtr, 16, "r")) return 0x80004003;
         for (let i = 0; i < 16; i++) iidBytes[i] = mem[riidPtr + i];
         const iidStr = bytesToGuid(iidBytes);
 
@@ -145,7 +150,8 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
         // present the Device2 vtable layout to the guest.
         const lpDDS = args[2];
         const lplpD3DDevice = args[3];
-        if (!lplpD3DDevice) return 0x80004003;
+        // initReturnPtr writes through this pointer, so the guard has to precede it.
+        if (!lplpD3DDevice || !isValidAddress(mem, lplpD3DDevice, 4, "rw")) return 0x80004003;
         initReturnPtr(lplpD3DDevice);
 
         const vtableAddr = context.vtables.IDirect3DDevice2?.address;
@@ -204,7 +210,7 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
         const lplpViewport = args[1];
         Logger.log(LogCategory.SYSTEM, `IDirect3D3_CreateViewport called: this=0x${thisPtr.toString(16)}, out=0x${lplpViewport.toString(16)}`);
 
-        if (!lplpViewport) return 0x80004003;
+        if (!lplpViewport || !isValidAddress(mem, lplpViewport, 4, "rw")) return 0x80004003;
         initReturnPtr(lplpViewport);
 
         const vtableAddr = context.vtables.IDirect3DViewport3?.address;
@@ -230,7 +236,8 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
     exports["IDirect3D3_CreateDevice"] = (ctx, mem, args) => {
         const lpDDS = args[2];
         const lplpD3DDevice = args[3];
-        if (!lplpD3DDevice) return 0x80004003;
+        // initReturnPtr writes through this pointer, so the guard has to precede it.
+        if (!lplpD3DDevice || !isValidAddress(mem, lplpD3DDevice, 4, "rw")) return 0x80004003;
         initReturnPtr(lplpD3DDevice);
 
         const vtableAddr = context.vtables.IDirect3DDevice3?.address;
@@ -457,7 +464,7 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
     // IDirect3D3::CreateLight(this, lplpLight, pUnkOuter)
     exports["IDirect3D3_CreateLight"] = (ctx, mem, args) => {
         const lplpLight = args[1];
-        if (!lplpLight) return 0x80004003; // E_POINTER
+        if (!lplpLight || !isValidAddress(mem, lplpLight, 4, "rw")) return 0x80004003; // E_POINTER
         initReturnPtr(lplpLight);
 
         const vtableAddr = context.vtables.IDirect3DLight?.address;
@@ -528,7 +535,9 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
                 `IDirect3D3_FindDevice: flags=0x${searchFlags.toString(16)} bHardware=${bHardware}`);
         }
 
-        // Fill result size
+        // The result carries two D3DDEVICEDESCs after a 20-byte head; validate the whole
+        // thing before the fills below start writing it.
+        if (!isValidAddress(mem, lpD3DFDR, FIND_DEVICE_RESULT_SIZE, "rw")) return 0x80004003;
         const resultSize = view.getUint32(lpD3DFDR, true);
         Logger.log(LogCategory.DDRAW, `IDirect3D3_FindDevice: resultSize=${resultSize}`);
 
@@ -594,6 +603,7 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
         obj.setBufferInfo(dataPtr, dwFVF, dwNumVertices, dwCaps, vertexSize);
         obj.setInterfaceVersion(3);
 
+        if (!isValidAddress(mem, lplpVB, 4, "rw")) return 0x80004003;
         const objAddr = allocateComObject(context.process.memory, mem, vtableAddr);
         view.setUint32(lplpVB, objAddr, true);
         resourceProvider.mapAddressToHandle(objAddr, obj.handle);
@@ -630,6 +640,8 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
         const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DVertexBufferObject | null;
         if (!obj || !lplpData) return 0x80004003;
 
+        if (!lplpData || !isValidAddress(mem, lplpData, 4, "rw")) return 0x80004003;
+        if (lpdwSize && !isValidAddress(mem, lpdwSize, 4, "rw")) return 0x80004003;
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         view.setUint32(lplpData, obj.getDataPtr(), true);
         if (lpdwSize) {
@@ -734,7 +746,7 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
         const lpDesc = args[1];
 
         const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DVertexBufferObject | null;
-        if (!obj || !lpDesc) return 0x80004003;
+        if (!obj || !lpDesc || !isValidAddress(mem, lpDesc, 16, "rw")) return 0x80004003;
 
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         view.setUint32(lpDesc + 0, 16, true);           // dwSize
@@ -798,7 +810,8 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
         const rclsid = args[1];
         const lpDDS = args[2];
         const lplpD3DDevice = args[3];
-        if (!lplpD3DDevice) return 0x80004003;
+        // initReturnPtr writes through this pointer, so the guard has to precede it.
+        if (!lplpD3DDevice || !isValidAddress(mem, lplpD3DDevice, 4, "rw")) return 0x80004003;
         initReturnPtr(lplpD3DDevice);
 
         const vtableAddr = context.vtables.IDirect3DDevice7?.address;
@@ -1073,6 +1086,7 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
         obj.setBufferInfo(dataPtr, dwFVF, dwNumVertices, dwCaps, vertexSize);
         obj.setInterfaceVersion(7);
 
+        if (!isValidAddress(mem, lplpVB, 4, "rw")) return 0x80004003;
         const objAddr = allocateComObject(context.process.memory, mem, vtableAddr);
         view.setUint32(lplpVB, objAddr, true);
         resourceProvider.mapAddressToHandle(objAddr, obj.handle);

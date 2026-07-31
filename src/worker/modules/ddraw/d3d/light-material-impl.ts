@@ -9,6 +9,7 @@ import { Logger, LogCategory } from "../../../core/logger";
 import { DDrawContext } from "../context";
 import { Direct3DLightObject, Direct3DMaterial3Object } from "../com-objects";
 import { bytesToGuid } from "../helpers";
+import { isValidAddress } from "../../../core/memory/address-guard";
 import {
     IID_IDirect3DMaterial,
     IID_IDirect3DMaterial2,
@@ -87,6 +88,7 @@ const LIGHT2_OFF = {
 // D3DMATERIAL structure offsets (76 bytes)
 // ============================================================================
 // dwSize(0), diffuse(4..19), ambient(20..35), specular(36..51), emissive(52..67), power(68), hTexture(72)
+const MAT_SIZE = 76;
 const MAT_OFF = {
     dwSize: 0,
     diffuse: 4,       // D3DCOLORVALUE (16 bytes)
@@ -131,7 +133,9 @@ export const createLightMaterialExports = (context: DDrawContext): D3DExports =>
         const thisPtr = args[0];
         const lpLight = args[1];
 
-        if (!lpLight) return D3DERR_INVALIDCALL;
+        // Borrowed pointer: validate the whole struct once, then read it through a hoisted
+        // view (CLAUDE.md 3.1 — the check belongs at the boundary, not on every field).
+        if (!lpLight || !isValidAddress(mem, lpLight, LIGHT2_SIZE, "r")) return D3DERR_INVALIDCALL;
 
         const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DLightObject | null;
         if (!obj) return 0x80004002;
@@ -175,7 +179,7 @@ export const createLightMaterialExports = (context: DDrawContext): D3DExports =>
         const thisPtr = args[0];
         const lpLight = args[1];
 
-        if (!lpLight) return D3DERR_INVALIDCALL;
+        if (!lpLight || !isValidAddress(mem, lpLight, LIGHT2_SIZE, "rw")) return D3DERR_INVALIDCALL;
 
         const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DLightObject | null;
         if (!obj) return 0x80004002;
@@ -220,7 +224,8 @@ export const createLightMaterialExports = (context: DDrawContext): D3DExports =>
         const ppvObject = args[2];
         const obj = resourceProvider.getComObjectByAddress(thisPtr);
         if (!obj) return E_NOINTERFACE;
-        if (!ppvObject) return E_POINTER;
+        if (!ppvObject || !isValidAddress(mem, ppvObject, 4, "rw")) return E_POINTER;
+        if (!args[1] || !isValidAddress(mem, args[1], 16, "r")) return E_POINTER;
 
         const iidStr = readIid(mem, args[1]);
         const vtableKey = materialVTableByIid[iidStr.replace(/[{}]/g, "").toLowerCase()];
@@ -276,7 +281,7 @@ export const createLightMaterialExports = (context: DDrawContext): D3DExports =>
         const thisPtr = args[0];
         const lpMat = args[1];
 
-        if (!lpMat) return D3DERR_INVALIDCALL;
+        if (!lpMat || !isValidAddress(mem, lpMat, MAT_SIZE, "r")) return D3DERR_INVALIDCALL;
 
         const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DMaterial3Object | null;
         if (!obj) return 0x80004002;
@@ -304,7 +309,7 @@ export const createLightMaterialExports = (context: DDrawContext): D3DExports =>
         const thisPtr = args[0];
         const lpMat = args[1];
 
-        if (!lpMat) return D3DERR_INVALIDCALL;
+        if (!lpMat || !isValidAddress(mem, lpMat, MAT_SIZE, "rw")) return D3DERR_INVALIDCALL;
 
         const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DMaterial3Object | null;
         if (!obj) return 0x80004002;
@@ -312,7 +317,7 @@ export const createLightMaterialExports = (context: DDrawContext): D3DExports =>
         const data = obj.getMaterialData();
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
 
-        view.setUint32(lpMat + MAT_OFF.dwSize, 76, true);
+        view.setUint32(lpMat + MAT_OFF.dwSize, MAT_SIZE, true);
         writeColorValue(view, lpMat + MAT_OFF.diffuse, data.diffuse);
         writeColorValue(view, lpMat + MAT_OFF.ambient, data.ambient);
         writeColorValue(view, lpMat + MAT_OFF.specular, data.specular);
@@ -327,7 +332,7 @@ export const createLightMaterialExports = (context: DDrawContext): D3DExports =>
         const thisPtr = args[0];
         const lpHandle = args[2];
 
-        if (!lpHandle) return D3DERR_INVALIDCALL;
+        if (!lpHandle || !isValidAddress(mem, lpHandle, 4, "rw")) return D3DERR_INVALIDCALL;
 
         const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DMaterial3Object | null;
         if (!obj) return 0x80004002;

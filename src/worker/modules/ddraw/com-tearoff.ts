@@ -14,6 +14,7 @@
  */
 import { BaseComObject } from "../../core/com/base-com-object";
 import { allocateComObject } from "../../core/com/com-memory";
+import { isValidAddress } from "../../core/memory/address-guard";
 import { Logger, LogCategory } from "../../core/logger";
 import { DirectDrawObject } from "./com-objects-ddraw";
 import { DDrawContext } from "./context";
@@ -31,6 +32,7 @@ import {
 
 const DD_OK = 0;
 const E_NOINTERFACE = 0x80004002;
+const E_POINTER = 0x80004003;
 
 /** Normalized IID -> the vtable that interface must be handed out with. */
 const TEAROFF_VTABLE: Record<string, string> = {
@@ -105,6 +107,8 @@ export const resolveDDrawTearOff = (
             `DirectDraw tear-off ${vtableName} -> 0x${addr.toString(16)} (handle=0x${obj.handle.toString(16)})`);
     }
 
+    // Guest out-param: validated before the AddRef, so a bad pointer cannot leak a reference.
+    if (!ppvObject || !isValidAddress(mem, ppvObject, 4, "rw")) return E_POINTER;
     obj.addRef(addr);
     new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setUint32(ppvObject, addr, true);
     return DD_OK;

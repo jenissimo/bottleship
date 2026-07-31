@@ -7,7 +7,7 @@
 
 import { Logger, LogCategory } from "../../core/logger";
 import { System } from "../../core/system";
-import { overlapsThunkCode } from "../../core/memory/address-guard";
+import { isValidAddress, overlapsThunkCode } from "../../core/memory/address-guard";
 import { toPlainGuestMemory } from "../../core/memory/guest-memory";
 import type { DirectDrawSurfaceState } from "./com-objects";
 
@@ -1235,6 +1235,14 @@ function convertGenericRGBAToSurface(
     clearAlphaBit?: boolean
 ): void {
     // NOTE: surfacePtr maps directly to mem[] index — no byteOffset adjustment needed.
+    // A surface's pixels can be a BORROWED pointer (app-supplied lpSurface), so validate the
+    // full extent once here — the per-pixel loop below is the hot path and stays unguarded.
+    const span = Math.max(0, (height - 1)) * pitch + width * Math.max(1, format.bpp >> 3);
+    if (span > 0 && !isValidAddress(mem, surfacePtr, span, "rw")) {
+        Logger.warn(LogCategory.DDRAW,
+            `convertGenericRGBAToSurface: refusing 0x${surfacePtr.toString(16)}+0x${span.toString(16)} (${width}x${height} pitch=${pitch})`);
+        return;
+    }
     const bytesPerPixel = Math.max(1, format.bpp >> 3);
 
     const getMaskInfo = (mask: number) => {

@@ -258,6 +258,10 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
 
         const obj = context.resourceProvider.getComObjectByAddress(thisPtr) as DirectDrawSurfaceObject | null;
 
+        // Both borrowed, and every branch below writes the out-param — validate once here.
+        if (!riidPtr || !isValidAddress(mem, riidPtr, 16, "r")) return E_POINTER;
+        if (!ppvObject || !isValidAddress(mem, ppvObject, 4, "rw")) return E_POINTER;
+
         const iidBytes = new Uint8Array(16);
         for (let i = 0; i < 16; i++) {
             iidBytes[i] = mem[riidPtr + i];
@@ -446,6 +450,10 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         const ppvObject = args[2];
 
         const obj = context.resourceProvider.getComObjectByAddress(thisPtr) as DirectDrawSurfaceObject | null;
+
+        // Both borrowed, and every branch below writes the out-param — validate once here.
+        if (!riidPtr || !isValidAddress(mem, riidPtr, 16, "r")) return E_POINTER;
+        if (!ppvObject || !isValidAddress(mem, ppvObject, 4, "rw")) return E_POINTER;
 
         const iidBytes = new Uint8Array(16);
         for (let i = 0; i < 16; i++) {

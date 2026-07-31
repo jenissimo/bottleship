@@ -18,6 +18,7 @@
  */
 
 import { Logger, LogCategory } from "../../../core/logger";
+import { isValidAddress } from "../../../core/memory/address-guard";
 
 // d3dtypes.h FVF bits, restated locally (same values as ../constants) so this stays a
 // dependency-free pure-math module the conformance test can import on its own.
@@ -151,6 +152,23 @@ export function processVertices(mem: Uint8Array, req: ProcessVerticesRequest): n
     const src = fvfLayout(req.srcFvf);
     const dst = fvfLayout(req.dstFvf);
     if (!src || !dst) return DDERR_INVALIDPARAMS;
+
+    // Validate the WHOLE extent both streams will touch, once, before the loop — count,
+    // stride and index all come from the guest, and the loop below has no per-iteration
+    // guard by design (this is the transform hot path). Checking the first vertex would
+    // let a large count walk out of the buffer; the region map is what says how far each
+    // stream may go.
+    if (req.count > 0) {
+        const srcSpan = req.srcIndex * req.srcStride + req.count * req.srcStride;
+        const dstSpan = req.destIndex * req.dstStride + req.count * req.dstStride;
+        if (!isValidAddress(mem, req.srcAddr, srcSpan, "r")
+            || !isValidAddress(mem, req.dstAddr, dstSpan, "rw")) {
+            Logger.warn(LogCategory.DDRAW,
+                `ProcessVertices: stream out of range — src 0x${req.srcAddr.toString(16)}+0x${srcSpan.toString(16)}, ` +
+                `dst 0x${req.dstAddr.toString(16)}+0x${dstSpan.toString(16)} (count=${req.count})`);
+            return DDERR_INVALIDPARAMS;
+        }
+    }
 
     // LIGHT gate (ddraw/vertexbuffer.c): a DX6 buffer lights when a material is set and the
     // SOURCE carries normals; a DX7 buffer lights when D3DRENDERSTATE_LIGHTING is already on.

@@ -7,6 +7,7 @@ import { ComObjectFactory } from "../../../core/com/base-com-object";
 import { DDrawContext } from "../context";
 import { bytesToGuid } from "../helpers";
 import { isValidAddress } from "../../../core/memory/address-guard";
+import type { RegionPerms } from "../../../core/memory/address-space";
 import { COM_OBJECT_SIZE, IID_IDirect3DViewport3, allocateComObject, E_FAIL, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, DDERR_INVALIDPARAMS } from "../constants";
 import {
     Direct3DViewport3Object,
@@ -16,6 +17,8 @@ import {
     DirectDrawSurfaceObject,
 } from "../com-objects";
 import { D3DExports, D3D_OK, D3DERR_INVALIDCALL } from "./types";
+
+const E_POINTER = 0x80004003;
 
 // Structure sizes for buffer overflow protection
 const D3DVIEWPORT_SIZE = 44; // D3DVIEWPORT v1 structure size
@@ -62,10 +65,24 @@ const CLEAR2_Z_CAST_BUFFER = new ArrayBuffer(4);
 const CLEAR2_Z_CAST_U32 = new Uint32Array(CLEAR2_Z_CAST_BUFFER);
 const CLEAR2_Z_CAST_F32 = new Float32Array(CLEAR2_Z_CAST_BUFFER);
 
-export const validateViewportStruct = (mem: Uint8Array, ptr: number): { ok: boolean; size: number } => {
+/**
+ * Validate a guest D3DVIEWPORT/D3DVIEWPORT2 before reading its self-declared size.
+ *
+ * `perms` is what the CALLER will do with it — every path here writes the struct back
+ * except SetViewport. Bounds alone are not validation: a pointer inside guest RAM can
+ * still address THUNK_CODE or a NOACCESS region, and only the region map knows that.
+ * The dwSize read is guarded separately because the length that bounds the rest of the
+ * struct comes out of the struct itself.
+ */
+export const validateViewportStruct = (
+    mem: Uint8Array,
+    ptr: number,
+    perms: RegionPerms = "rw",
+): { ok: boolean; size: number } => {
     if (!ptr) return { ok: false, size: 0 };
     // Protect low memory (0x0-0xFFFF)
     if (ptr < 0x10000 || ptr + 4 > mem.length) return { ok: false, size: 0 };
+    if (!isValidAddress(mem, ptr, 4, perms)) return { ok: false, size: 0 };
     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
     const size = view.getUint32(ptr, true);
     // Limit size to prevent buffer overflow (max reasonable structure size)
@@ -73,6 +90,7 @@ export const validateViewportStruct = (mem: Uint8Array, ptr: number): { ok: bool
     if (size < 4 || size > maxSize || ptr + size > mem.length) {
         return { ok: false, size };
     }
+    if (!isValidAddress(mem, ptr, size, perms)) return { ok: false, size };
     return { ok: true, size };
 };
 
@@ -167,13 +185,14 @@ export const createViewportExports = (context: DDrawContext): D3DExports => {
     exports["IDirect3DViewport3_GetViewport2"] = (ctx, mem, args) => {
         const thisPtr = args[0];
         const lpData = args[1];
-        if (!lpData) return D3DERR_INVALIDCALL;
+        const guard = validateViewportStruct(mem, lpData);
+        if (!guard.ok) return D3DERR_INVALIDCALL;
 
         const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DViewport3Object | null;
         const vp = normalizeViewport(obj?.getViewport());
 
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-        const size = Math.min(view.getUint32(lpData, true), D3DVIEWPORT2_SIZE); // Buffer overflow protection
+        const size = Math.min(guard.size, D3DVIEWPORT2_SIZE);
         const clip = obj?.getClipVolume() ?? DEFAULT_CLIP_VOLUME;
         if (size >= 8) view.setUint32(lpData + 4, vp.x, true);
         if (size >= 12) view.setUint32(lpData + 8, vp.y, true);
@@ -192,7 +211,7 @@ export const createViewportExports = (context: DDrawContext): D3DExports => {
     exports["IDirect3DViewport3_SetViewport2"] = (ctx, mem, args) => {
         const thisPtr = args[0];
         const lpData = args[1];
-        const { ok, size } = validateViewportStruct(mem, lpData);
+        const { ok, size } = validateViewportStruct(mem, lpData, "r");
         if (!ok) {
             Logger.warn(LogCategory.SYSTEM, `IDirect3DViewport3_SetViewport2: invalid lpData=0x${lpData.toString(16)} size=${size}`);
             return D3DERR_INVALIDCALL;
@@ -228,13 +247,14 @@ export const createViewportExports = (context: DDrawContext): D3DExports => {
     exports["IDirect3DViewport3_GetViewport"] = (ctx, mem, args) => {
         const thisPtr = args[0];
         const lpData = args[1];
-        if (!lpData) return D3DERR_INVALIDCALL;
+        const guard = validateViewportStruct(mem, lpData);
+        if (!guard.ok) return D3DERR_INVALIDCALL;
 
         const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DViewport3Object | null;
         const vp = normalizeViewport(obj?.getViewport());
 
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-        const size = Math.min(view.getUint32(lpData, true), D3DVIEWPORT_SIZE);
+        const size = Math.min(guard.size, D3DVIEWPORT_SIZE);
 
         const scaleX = vp.width / 2.0;
         const scaleY = vp.height / 2.0;
@@ -255,7 +275,7 @@ export const createViewportExports = (context: DDrawContext): D3DExports => {
     exports["IDirect3DViewport3_SetViewport"] = (ctx, mem, args) => {
         const thisPtr = args[0];
         const lpData = args[1];
-        const { ok, size } = validateViewportStruct(mem, lpData);
+        const { ok, size } = validateViewportStruct(mem, lpData, "r");
         if (!ok) {
             Logger.warn(LogCategory.SYSTEM, `IDirect3DViewport3_SetViewport: invalid lpData=0x${lpData.toString(16)} size=${size}`);
             return D3DERR_INVALIDCALL;
@@ -293,11 +313,11 @@ export const createViewportExports = (context: DDrawContext): D3DExports => {
         const lplpDDSurface = args[1];
         const lpValid = args[2];
 
-        if (lplpDDSurface) {
+        if (lplpDDSurface && isValidAddress(mem, lplpDDSurface, 4, "rw")) {
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
             view.setUint32(lplpDDSurface, 0, true);
         }
-        if (lpValid) {
+        if (lpValid && isValidAddress(mem, lpValid, 4, "rw")) {
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
             view.setUint32(lpValid, 0, true);
         }
@@ -497,6 +517,10 @@ export const createViewportExports = (context: DDrawContext): D3DExports => {
 
         const obj = resourceProvider.getComObjectByAddress(thisPtr);
         if (!obj) return 0x80004002;
+        // Both borrowed: the IID is read whole, the out-param written, and every branch
+        // below writes it — so validate once here rather than at each return path.
+        if (!riidPtr || !isValidAddress(mem, riidPtr, 16, "r")) return E_POINTER;
+        if (!ppvObject || !isValidAddress(mem, ppvObject, 4, "rw")) return E_POINTER;
 
         const iidBytes = new Uint8Array(16);
         for (let i = 0; i < 16; i++) {
@@ -568,10 +592,11 @@ export const createViewportExports = (context: DDrawContext): D3DExports => {
 
     exports["IDirect3DViewport2_GetViewport2"] = (ctx, mem, args) => {
         const lpData = args[1];
-        if (!lpData) return D3DERR_INVALIDCALL;
+        const guard = validateViewportStruct(mem, lpData);
+        if (!guard.ok) return D3DERR_INVALIDCALL;
 
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-        const size = Math.min(view.getUint32(lpData, true), D3DVIEWPORT2_SIZE); // Buffer overflow protection
+        const size = Math.min(guard.size, D3DVIEWPORT2_SIZE); // Buffer overflow protection
         const obj = resourceProvider.getComObjectByAddress(args[0]) as any;
         const vp = normalizeViewport(obj?.getViewport?.());
 
@@ -600,7 +625,7 @@ export const createViewportExports = (context: DDrawContext): D3DExports => {
 
     exports["IDirect3DViewport2_SetViewport2"] = (ctx, mem, args) => {
         const lpData = args[1];
-        const { ok, size } = validateViewportStruct(mem, lpData);
+        const { ok, size } = validateViewportStruct(mem, lpData, "r");
         if (!ok) {
             Logger.warn(LogCategory.SYSTEM, `IDirect3DViewport2_SetViewport2: invalid lpData=0x${lpData.toString(16)} size=${size} mem=0x${mem.length.toString(16)}`);
             return D3DERR_INVALIDCALL;
@@ -631,7 +656,8 @@ export const createViewportExports = (context: DDrawContext): D3DExports => {
     // D3DVIEWPORT v1: 44 bytes, float32 at 20–40 (same layout as Viewport3).
     exports["IDirect3DViewport2_GetViewport"] = (ctx, mem, args) => {
         const lpData = args[1];
-        if (!lpData) return D3DERR_INVALIDCALL;
+        const guard = validateViewportStruct(mem, lpData);
+        if (!guard.ok) return D3DERR_INVALIDCALL;
 
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         const size = Math.min(view.getUint32(lpData, true), D3DVIEWPORT_SIZE);
@@ -660,7 +686,7 @@ export const createViewportExports = (context: DDrawContext): D3DExports => {
 
     exports["IDirect3DViewport2_SetViewport"] = (ctx, mem, args) => {
         const lpData = args[1];
-        const { ok, size } = validateViewportStruct(mem, lpData);
+        const { ok, size } = validateViewportStruct(mem, lpData, "r");
         if (!ok) {
             Logger.warn(LogCategory.SYSTEM, `IDirect3DViewport2_SetViewport: invalid lpData=0x${lpData.toString(16)} size=${size}`);
             return D3DERR_INVALIDCALL;

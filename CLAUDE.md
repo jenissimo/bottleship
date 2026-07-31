@@ -101,6 +101,13 @@ Legacy Graphics (DirectDraw, D3D3-9). You bridge x86 Windows internals with mode
   - All HLE modules must use Mem.read*/write* instead of direct mem8[...] access in new/changed code.
   - Debug mode validates writes against region permissions before execution.
   - Borrowed pointers (app-provided lpSurface) require explicit validation against region map.
+    The sanctioned shape is validate-once-at-the-boundary — `isValidAddress(mem, ptr, size, perms)`
+    over the WHOLE extent the handler will touch — and then a hoisted view for the work, because
+    a per-access accessor inside a per-pixel/per-vertex loop fights the zero-alloc rule above.
+    A bounds test (`ptr + size <= mem.length`) is NOT validation: only the region map knows the
+    target is not THUNK_CODE, a red zone or read-only. `tools/validate-guest-pointer-guards.ts`
+    (gate step 8) enforces this for writes in ddraw, so the convention cannot erode silently
+    again — it had, in the whole `ddraw/d3d/` subtree.
 - Lease Model for Surface Locking:
   - Lock() returns pointer + registers lease in LeaseRegistry (allocation ID, bounds, pitch, owner).
   - Unlock() revokes lease; surface destruction auto-revokes all leases.
@@ -339,7 +346,10 @@ Quality Gate (mandatory order):
   5. bun tools/validate-stub-tables.ts
   6. bun tools/validate-file-cursor.ts
   7. bun tools/validate-jit-exports.ts   (checks the BUILT v86 artifact — skips cleanly if absent)
-  8. bun run typecheck
+  8. bun tools/validate-guest-pointer-guards.ts
+  9. bun run typecheck
+
+`bun run gate` runs all of it in order.
 
 A validator that cannot fail is worse than no validator: it converts an unchecked invariant
 into a false assurance. When one of these passes, confirm it CAN fail — feed it the bypass it

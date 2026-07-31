@@ -87,6 +87,8 @@ function fvfForProcessOp(op: number): number {
 const MATRIX_BYTES = 64;
 /** sizeof(D3DEXECUTEDATA): 6 DWORDs + D3DSTATUS (2 DWORDs + D3DRECT). */
 const D3DEXECUTEDATA_SIZE = 48;
+/** sizeof(D3DEXECUTEBUFFERDESC): dwSize, dwFlags, dwCaps, dwBufferSize, lpData. */
+const EXEC_BUFFER_DESC_BYTES = 20;
 
 /** One PROCESSVERTICES record's output inside the accumulated destination buffer. */
 interface VertexBlock {
@@ -160,7 +162,7 @@ export const createExecuteBufferExports = (
     exports["IDirect3DExecuteBuffer_Lock"] = (ctx, mem, args) => {
         const obj = getBuffer(args[0]);
         const lpDesc = args[1];
-        if (!obj || !lpDesc) return D3DERR_INVALIDCALL;
+        if (!obj || !lpDesc || !isValidAddress(mem, lpDesc, EXEC_BUFFER_DESC_BYTES, "rw")) return D3DERR_INVALIDCALL;
 
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         view.setUint32(lpDesc + 8, 1, true);                   // dwCaps = D3DDEBCAPS_SYSTEMMEMORY
@@ -268,6 +270,7 @@ export const createExecuteBufferExports = (
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         for (let i = 0; i < 16; i++) view.setFloat32(addr + i * 4, i % 5 === 0 ? 1 : 0, true);
         matrices.add(addr);
+        if (!lpHandle || !isValidAddress(mem, lpHandle, 4, "rw")) return E_POINTER;
         view.setUint32(lpHandle, addr, true);
         return D3D_OK;
     };
@@ -301,6 +304,8 @@ export const createExecuteBufferExports = (
         const lpDesc = args[1];
         const lplpBuffer = args[2];
         if (!lpDesc || !lplpBuffer) return E_POINTER;
+        if (!isValidAddress(mem, lpDesc, EXEC_BUFFER_DESC_BYTES, "r")
+            || !isValidAddress(mem, lplpBuffer, 4, "rw")) return E_POINTER;
 
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         view.setUint32(lplpBuffer, 0, true);
@@ -646,14 +651,16 @@ export const createExecuteBufferExports = (
     exports["IDirect3DDevice_Pick"] = () => D3D_OK;
     exports["IDirect3DDevice_GetPickRecords"] = (ctx, mem, args) => {
         const lpCount = args[1];
-        if (lpCount) new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setUint32(lpCount, 0, true);
+        if (lpCount && isValidAddress(mem, lpCount, 4, "rw")) {
+            new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setUint32(lpCount, 0, true);
+        }
         return D3D_OK;
     };
 
     // Viewport enumeration on a v1 device: we keep no per-device viewport list.
     exports["IDirect3DDevice_NextViewport"] = (ctx, mem, args) => {
         const lplpAnotherViewport = args[2];
-        if (lplpAnotherViewport) {
+        if (lplpAnotherViewport && isValidAddress(mem, lplpAnotherViewport, 4, "rw")) {
             new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setUint32(lplpAnotherViewport, 0, true);
         }
         return D3D_OK;
