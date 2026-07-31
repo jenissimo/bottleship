@@ -746,7 +746,10 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         Logger.log(LogCategory.SYSTEM, `D3D8 Reset(${width}x${height})`);
 
         this.flushProgrammablePending();
-        System.getInstance().requestHostResize(width, height);
+        // Windowed @ +28 (d3d8): only a fullscreen Reset sets the display mode.
+        System.getInstance().requestHostResize(width, height, {
+            modeSet: view.getUint32(pPresentationParameters + 28, true) === 0,
+        });
         this.renderTarget = createRenderTarget(width, height);
         this.rtOverride = null;
         this.viewport = sanitizeViewport({ x: 0, y: 0, width, height, minZ: 0, maxZ: 1 }, width, height);

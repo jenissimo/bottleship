@@ -4,7 +4,15 @@
 
 import { Mem } from '../../core/memory/mem-accessor';
 import { Logger, LogCategory } from '../../core/logger';
-import { devices, getVTables, createComObject, forgetComObject, registerComFinalizer, releaseComRef, resourceToDevice } from './shared-state';
+import {
+    devices,
+    getVTables,
+    createComObject,
+    forgetComObject,
+    registerDeviceChildFinalizer,
+    releaseComRef,
+    resourceToDevice,
+} from './shared-state';
 import { D3D9Device } from '../../backends/webgpu/d3d9/d3d9-device';
 import { initReturnPtr, D3DFMT_UNKNOWN, normalizePalettizedTexturePool } from '../../backends/webgpu/shared/dx-com-helpers';
 import { isDxExclusiveFormat } from '../../backends/webgpu/shared/dx-format-support';
@@ -53,6 +61,86 @@ export const indexBufferMeta: Map<number, BufferMeta> = new Map();
 export const deviceBoundDepthStencil: Map<number, number> = new Map();
 /** Per-device bound render-target surface COM pointers by render-target index. */
 export const deviceBoundRenderTarget: Map<number, Map<number, number>> = new Map();
+/**
+ * Per-device binding slot ('ds', 'rt0'..'rt3') -> the COM ptr whose reference that
+ * binding actually holds. Recorded at BIND time: a surface reference lands on the
+ * parent texture when there is one, and that link can be gone by the time we
+ * release (a texture teardown clears its subresource metadata), so re-deriving it
+ * at release time decrements the wrong object and leaks the texture's binding ref.
+ */
+const deviceSlotRefs: Map<number, Map<string, number>> = new Map();
+
+export function setDeviceSlotRef(devicePtr: number, slot: string, heldPtr: number): void {
+    const pDevice = devicePtr >>> 0;
+    let slots = deviceSlotRefs.get(pDevice);
+    if (!slots) {
+        slots = new Map();
+        deviceSlotRefs.set(pDevice, slots);
+    }
+    slots.set(slot, heldPtr >>> 0);
+}
+
+/** Hand back (and forget) the reference a slot holds; 0 when it holds none. */
+export function takeDeviceSlotRef(devicePtr: number, slot: string): number {
+    const slots = deviceSlotRefs.get(devicePtr >>> 0);
+    if (!slots) return 0;
+    const held = slots.get(slot) ?? 0;
+    slots.delete(slot);
+    if (slots.size === 0) deviceSlotRefs.delete(devicePtr >>> 0);
+    return held;
+}
+
+/** Hand back (and forget) every reference a device's binding slots hold. */
+export function takeAllDeviceSlotRefs(devicePtr: number): number[] {
+    const slots = deviceSlotRefs.get(devicePtr >>> 0);
+    if (!slots) return [];
+    const held = [...slots.values()];
+    deviceSlotRefs.delete(devicePtr >>> 0);
+    return held;
+}
+
+/**
+ * Device COM ptr -> `${iSwapChain}:${iBackBuffer}` -> the ONE implicit backbuffer
+ * surface object for that slot. Real D3D9 hands out the same object every time, so
+ * `GetRenderTarget(0,&rt) == GetBackBuffer(0,0,&bb)` compares equal and a per-frame
+ * Get/Release loop does not mint a new guest object each frame.
+ */
+const deviceBackBufferSurfaces: Map<number, Map<string, number>> = new Map();
+
+export function getDeviceBackBufferSurface(devicePtr: number, key: string): number {
+    return deviceBackBufferSurfaces.get(devicePtr >>> 0)?.get(key) ?? 0;
+}
+
+export function setDeviceBackBufferSurface(devicePtr: number, key: string, surfacePtr: number): void {
+    const pDevice = devicePtr >>> 0;
+    let cache = deviceBackBufferSurfaces.get(pDevice);
+    if (!cache) {
+        cache = new Map();
+        deviceBackBufferSurfaces.set(pDevice, cache);
+    }
+    cache.set(key, surfacePtr >>> 0);
+}
+
+export function dropDeviceBackBufferSurface(devicePtr: number, surfacePtr: number): void {
+    const pDevice = devicePtr >>> 0;
+    const cache = deviceBackBufferSurfaces.get(pDevice);
+    if (!cache) return;
+    for (const [key, ptr] of cache) {
+        if (ptr === (surfacePtr >>> 0)) cache.delete(key);
+    }
+    if (cache.size === 0) deviceBackBufferSurfaces.delete(pDevice);
+}
+
+/** Hand back (and forget) every implicit backbuffer surface a device owns. */
+export function takeDeviceBackBufferSurfaces(devicePtr: number): number[] {
+    const pDevice = devicePtr >>> 0;
+    const cache = deviceBackBufferSurfaces.get(pDevice);
+    if (!cache) return [];
+    const surfaces = [...cache.values()];
+    deviceBackBufferSurfaces.delete(pDevice);
+    return surfaces;
+}
+
 /** 2D texture COM ptr -> mip level -> stable IDirect3DSurface9 COM ptr. */
 export const textureLevelSurfaces: Map<number, Map<number, number>> = new Map();
 /** Cube texture COM ptr -> `${face}_${level}` -> stable IDirect3DSurface9 COM ptr. */
@@ -99,10 +187,6 @@ export function setDeviceRenderTarget(devicePtr: number, index: number, surfaceP
         deviceBoundRenderTarget.set(pDevice, targets);
     }
     targets.set(slot, pSurf);
-}
-
-export function getDeviceRenderTargets(devicePtr: number): number[] {
-    return [...(deviceBoundRenderTarget.get(devicePtr >>> 0)?.values() ?? [])];
 }
 
 export function clearDeviceRenderTargets(devicePtr: number): void {
@@ -229,6 +313,8 @@ export function clearResourceRegistry(): void {
     indexBufferMeta.clear();
     deviceBoundDepthStencil.clear();
     deviceBoundRenderTarget.clear();
+    deviceSlotRefs.clear();
+    deviceBackBufferSurfaces.clear();
     resetDeviceCursor();
     textureLevelSurfaces.clear();
     cubeFaceSurfaces.clear();
@@ -314,6 +400,7 @@ export function createGuestTexture(
 
     const guestPtr = device.createTexture(texPtr, w, h, levelCount, fmt, usage >>> 0);
     if (guestPtr === 0) {
+        releaseComRef(texPtr);
         if (ppTexture) initReturnPtr(ppTexture);
         return D3DERR_INVALIDCALL;
     }
@@ -327,7 +414,7 @@ export function createGuestTexture(
         pool: normalizedPool,
         format: fmt,
     });
-    registerComFinalizer(texPtr, () => {
+    registerDeviceChildFinalizer(texPtr, devicePtr, () => {
         clearTextureSubresourceSurfaces(texPtr);
         device.releaseTexture(texPtr);
         textureMeta.delete(texPtr);
@@ -341,7 +428,10 @@ export function createGuestTexture(
     }
 
     if (ppTexture) {
-        if (!Mem.writeUint32(ppTexture, texPtr)) return D3DERR_INVALIDCALL;
+        if (!Mem.writeUint32(ppTexture, texPtr)) {
+            releaseComRef(texPtr);
+            return D3DERR_INVALIDCALL;
+        }
     }
 
     return D3D_OK;

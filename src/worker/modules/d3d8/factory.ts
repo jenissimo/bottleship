@@ -284,8 +284,12 @@ export function createFactoryExports(): Record<string, ThunkImplementation> {
             // fold it into the executor's effective sample count so in-engine AA works.
             device.applyPresentMultiSampleType(view.getUint32(pPresParams + 16, true));
 
-            // Resize canvas to match backbuffer (like DDraw SetDisplayMode does)
-            system.requestHostResize(bbWidth, bbHeight);
+            // Resize canvas to match backbuffer (like DDraw SetDisplayMode does). Only a
+            // FULLSCREEN device is a mode-set — a windowed backbuffer lives inside the
+            // desktop and must not become SM_CXSCREEN. (Windowed @ +28 in d3d8.)
+            system.requestHostResize(bbWidth, bbHeight, {
+                modeSet: view.getUint32(pPresParams + 28, true) === 0,
+            });
 
             // FULLSCREEN device: also resize the focus/device window's tracked client rect to
             // the back-buffer size, like real D3D8 does. Apps GetClientRect() the now-fullscreen

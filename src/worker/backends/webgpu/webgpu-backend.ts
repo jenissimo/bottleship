@@ -155,16 +155,19 @@ export class WebGPUBackend implements RenderBackend {
      * (every present path funnels through it) and only while a screenshot consumer has
      * armed it, so a normal run pays nothing.
      */
-    mirrorPresentedFrame(): void {
+    mirrorPresentedFrame(): boolean {
+        // Returns whether a copy actually happened. The caller stamps the mirror's serial from
+        // this: stamping unconditionally makes a stale mirror claim to be the current frame,
+        // and `shot()` then hands back the previous frame labelled as the latest.
         const device = this.device, queue = this.queue, ctx = this.context, format = this.format;
-        if (!device || !queue || !ctx || !format) return;
+        if (!device || !queue || !ctx || !format) return false;
         let tex: GPUTexture;
         try {
             tex = ctx.getCurrentTexture();
         } catch {
-            return; // canvas unconfigured this frame
+            return false; // canvas unconfigured this frame
         }
-        if (!tex.width || !tex.height) return;
+        if (!tex.width || !tex.height) return false;
         if (!this.screenMirror || this.screenMirror.width !== tex.width || this.screenMirror.height !== tex.height) {
             this.screenMirror?.destroy();
             this.screenMirror = device.createTexture({
@@ -179,6 +182,7 @@ export class WebGPUBackend implements RenderBackend {
             { width: tex.width, height: tex.height, depthOrArrayLayers: 1 },
         );
         queue.submit([encoder.finish()]);
+        return true;
     }
 
     /** PNG of the mirrored frame (see mirrorPresentedFrame); null until one was mirrored. */

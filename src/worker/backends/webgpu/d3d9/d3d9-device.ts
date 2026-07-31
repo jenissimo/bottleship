@@ -29,7 +29,7 @@ import {
     d3d9PerfStateBlockApply, d3d9PerfStateBlockCapture,
     d3d9PerfStateBlockWasmApply, d3d9PerfStateBlockWasmCapture,
 } from "../../../modules/d3d9/d3d9-perf";
-import { addComRef, releaseComRef } from "../../../modules/d3d9/shared-state";
+import { addComRef, releaseComRef } from "../../../modules/d3d9/com-refs";
 import { isValidAddress } from "../../../core/memory/address-guard";
 import { Mem } from "../../../core/memory/mem-accessor";
 import { sanitizeViewport } from "../ddraw/types";
@@ -480,9 +480,11 @@ export class D3D9Device {
      * BackBufferWidth/Height of 0 means "use focus-window client area" (windowed)
      * in real D3D9 — only override host/viewport when an explicit size was given.
      */
-    setBackBufferSize(width: number, height: number): void {
+    setBackBufferSize(width: number, height: number, fullscreen = false): void {
         if (width > 0 && height > 0) {
-            System.getInstance().requestHostResize(width, height);
+            // Only a fullscreen device's backbuffer IS the display mode; a windowed one is a
+            // size inside the desktop and must not be published as SM_CXSCREEN.
+            System.getInstance().requestHostResize(width, height, { modeSet: fullscreen });
             this.viewport = { x: 0, y: 0, width, height, minZ: 0, maxZ: 1 };
         }
     }
@@ -989,19 +991,21 @@ export class D3D9Device {
         d3d9PerfInc("setStreamSource");
         if (streamNumber < 0 || streamNumber >= D3D9Device.MAX_STREAMS) return D3DERR_INVALIDCALL;
         const index = vbPtr === 0 ? null : this.vertexBuffers.getIndex(vbPtr);
-        if (vbPtr !== 0 && index === null) return D3DERR_INVALIDCALL;
+        // Unknown pointer: clear the stream with the error (see setTexture) — a stale
+        // vertex buffer would otherwise feed the next draw.
+        const unknown = vbPtr !== 0 && index === null;
         // Record the guest-visible binding for every stream — GetStreamSource must report
         // back exactly what was set even for streams the draw path below ignores.
-        this.streamBindingPtr[streamNumber] = this.replaceHeldComRef(this.streamBindingPtr[streamNumber]!, vbPtr);
-        this.streamBindingOffset[streamNumber] = offset >>> 0;
-        this.streamBindingStride[streamNumber] = stride >>> 0;
+        this.streamBindingPtr[streamNumber] = this.replaceHeldComRef(this.streamBindingPtr[streamNumber]!, unknown ? 0 : vbPtr);
+        this.streamBindingOffset[streamNumber] = unknown ? 0 : offset >>> 0;
+        this.streamBindingStride[streamNumber] = unknown ? 0 : stride >>> 0;
         // We only support stream 0 for now
-        if (streamNumber !== 0) return D3D_OK;
+        if (streamNumber !== 0) return unknown ? D3DERR_INVALIDCALL : D3D_OK;
 
         if (index === null) {
             if (d3d9WasmArena.isInitialized()) d3d9WasmArena.setStreamSource(0, 0, 0);
             if (!this.stateTracker.clearStreamSource()) d3d9PerfSkip("setStreamSource");
-            return D3D_OK;
+            return unknown ? D3DERR_INVALIDCALL : D3D_OK;
         }
         if (d3d9WasmArena.isInitialized()) d3d9WasmArena.setStreamSource(index, offset, stride);
         if (!this.stateTracker.setStreamSource(index, offset, stride)) d3d9PerfSkip("setStreamSource");
@@ -1147,15 +1151,16 @@ export class D3D9Device {
     setIndices(ibPtr: number): number {
         d3d9PerfInc("setIndices");
         const index = ibPtr === 0 ? null : this.indexBuffers.getIndex(ibPtr);
-        if (ibPtr !== 0 && index === null) return D3DERR_INVALIDCALL;
-        this.boundIndexPtr = this.replaceHeldComRef(this.boundIndexPtr, ibPtr);
-        if (ibPtr === 0) {
+        // Unknown pointer: clear the binding with the error (see setTexture) — a stale
+        // index buffer would otherwise index the next draw's vertices.
+        const unknown = ibPtr !== 0 && index === null;
+        this.boundIndexPtr = this.replaceHeldComRef(this.boundIndexPtr, unknown ? 0 : ibPtr);
+        if (index === null) {
             if (d3d9WasmArena.isInitialized()) d3d9WasmArena.setIndices(0, 0);
             if (!this.stateTracker.setIndexSource(null)) d3d9PerfSkip("setIndices");
-            return D3D_OK;
+            return unknown ? D3DERR_INVALIDCALL : D3D_OK;
         }
         const validIndex = index;
-        if (validIndex === null) return D3DERR_INVALIDCALL;
         if (d3d9WasmArena.isInitialized()) d3d9WasmArena.setIndices(validIndex, this.indexBuffers.getFormat(validIndex));
         if (!this.stateTracker.setIndexSource(validIndex)) d3d9PerfSkip("setIndices");
         return D3D_OK;
@@ -1570,21 +1575,24 @@ export class D3D9Device {
         d3d9PerfInc("setTexture");
         if (stage < 0 || stage >= PROG_BIND.MAX_TEX) return D3DERR_INVALIDCALL;
         const index = texPtr === 0 ? null : this.textures.getIndex(texPtr);
-        if (texPtr !== 0 && index === null) return D3DERR_INVALIDCALL;
+        // A pointer this store does not know names a texture that no longer exists (or
+        // never was ours). Report the failure, but UNBIND the stage: leaving the previous
+        // texture live would sample a stale image into every later draw.
+        const unknown = texPtr !== 0 && index === null;
         if (this.recordingStateBlock) {
+            if (unknown) return D3DERR_INVALIDCALL;
             this.recordStateBlock({ op: "texture", stage, texPtr });
             return D3D_OK;
         }
         if (stage < this.boundTexturePtrs.length) {
-            this.boundTexturePtrs[stage] = this.replaceHeldComRef(this.boundTexturePtrs[stage]!, texPtr);
+            this.boundTexturePtrs[stage] = this.replaceHeldComRef(this.boundTexturePtrs[stage]!, unknown ? 0 : texPtr);
         }
-        if (texPtr === 0) {
+        if (index === null) {
             if (d3d9WasmArena.isInitialized()) d3d9WasmArena.setTexture(stage, 0);
             if (!this.stateTracker.setTexture(stage, null)) {
                 d3d9PerfSkip("setTexture");
-                return D3D_OK;
             }
-            return D3D_OK;
+            return unknown ? D3DERR_INVALIDCALL : D3D_OK;
         }
         // `index` is the SAME internal numeric id used everywhere else in this store (not
         // the raw guest COM pointer) — exactly what the arena's textureId expects.
@@ -2030,7 +2038,9 @@ export class D3D9Device {
             `Reset(${width}x${height}, windowed=${windowed}, depth=${enableAutoDepthStencil}, depthFmt=${autoDepthStencilFormat})`,
         );
 
-        System.getInstance().requestHostResize(width, height);
+        // Only a FULLSCREEN device sets the display mode. A windowed device's backbuffer is a
+        // size inside the desktop; publishing it would make SM_CXSCREEN report the window.
+        System.getInstance().requestHostResize(width, height, { modeSet: windowed === 0 });
         this.viewport = { x: 0, y: 0, width, height, minZ: 0, maxZ: 1 };
         this.endScene();
         return 0; // D3D_OK
@@ -4104,6 +4114,10 @@ export class D3D9Device {
 
     getBoundTexturePtr(stage: number): number {
         return this.boundTexturePtrs[stage] ?? 0;
+    }
+
+    getBoundIndexBufferPtr(): number {
+        return this.boundIndexPtr;
     }
 
     getAllRenderStates(): Array<{ state: number; value: number }> {

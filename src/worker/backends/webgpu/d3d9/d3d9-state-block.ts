@@ -13,7 +13,7 @@ import {
 } from "./d3d9-com-objects";
 import { KeyedStateBlockRecorder } from "../shared/state-block-recorder";
 import { d3d9WasmArena, isWasmBlocksEnabled } from "./d3d9-wasm-arena";
-import { addComRef, releaseComRef } from "../../../modules/d3d9/shared-state";
+import { addComRef, releaseComRef } from "../../../modules/d3d9/com-refs";
 
 export const D3DSBT_ALL = 1;
 export const D3DSBT_PIXELSTATE = 2;

@@ -29,6 +29,7 @@
 
 import { Logger, LogCategory } from '../../core/logger';
 import { devices, stateBlocks } from './shared-state';
+import { addD3D9ComRef, releaseD3D9ComRef } from './state';
 import {
     resolveVertexShaderComPtr,
     resolvePixelShaderComPtr,
@@ -299,7 +300,22 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
         return device.captureStateBlockData(block);
     }, { trivial: true });
 
-    Logger.log(LogCategory.D3D9, 'Registered FastPath for hot D3D9 state setters, shader constants, and draw calls');
+    // Resource AddRef/Release — pure JS bookkeeping over the same registry the thunk
+    // handlers use, so the refcount stays exact while skipping the slow-path ladder.
+    // (Per-frame texture/surface churn puts ~100K of each through here per interval;
+    // they can no longer be constant-return stubs now that the counts are real.)
+    for (const prefix of ['IDirect3DTexture9', 'IDirect3DCubeTexture9', 'IDirect3DSurface9', 'IDirect3DVertexBuffer9', 'IDirect3DIndexBuffer9']) {
+        dispatcher.registerFastPath('d3d9', `${prefix}_AddRef`,
+            (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number =>
+                addD3D9ComRef(prefix, view.getUint32(cpu.reg32[4] + 4, true)),
+            { trivial: true });
+        dispatcher.registerFastPath('d3d9', `${prefix}_Release`,
+            (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number =>
+                releaseD3D9ComRef(prefix, view.getUint32(cpu.reg32[4] + 4, true)),
+            { trivial: true });
+    }
+
+    Logger.log(LogCategory.D3D9, 'Registered FastPath for hot D3D9 state setters, shader constants, draw calls, and resource AddRef/Release');
 
     // ========================================================================
     // Tier-0 Write-Buffer registrations (the no-trap hot path).

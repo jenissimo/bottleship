@@ -111,8 +111,11 @@ describe("IDirect3DVertexDeclaration9::GetDeclaration", () => {
             expect(view.getUint8(at + 7)).toBe(e.usageIndex);
         });
 
+        // D3DDECL_END is {0xFF, 0, D3DDECLTYPE_UNUSED, 0, 0, 0}; a caller terminating on the
+        // documented Type == UNUSED test reads past the array if Type says FLOAT1 (0).
         const end = OUT_BUF + STORED_ELEMENTS.length * ELEMENT_SIZE;
-        expect(view.getUint16(end, true)).toBe(0xff); // D3DDECL_END stream sentinel
+        expect(view.getUint16(end, true)).toBe(0xff);
+        expect(view.getUint8(end + 4)).toBe(17);
     });
 
     test("the count is reported even when a buffer is supplied", () => {

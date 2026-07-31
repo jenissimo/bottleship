@@ -21,12 +21,18 @@ import {
 import {
     clearDeviceRenderTargets,
     deviceBoundDepthStencil,
+    dropDeviceBackBufferSurface,
+    getDeviceBackBufferSurface,
     getDeviceRenderTarget,
-    getDeviceRenderTargets,
     releaseSurfaceMetadata,
     resolveSurfaceInfo,
+    setDeviceBackBufferSurface,
     setDeviceRenderTarget,
+    setDeviceSlotRef,
     surfaceMeta,
+    takeAllDeviceSlotRefs,
+    takeDeviceBackBufferSurfaces,
+    takeDeviceSlotRef,
 } from './resource-registry';
 import {
     isHardwareDeviceCursor, releaseDeviceCursor, setDeviceCursorImage,
@@ -45,6 +51,8 @@ const D3DPOOL_DEFAULT = 0;
 const D3DFMT_D24S8 = 75;
 const D3DDEVTYPE_HAL = 1;
 const D3D9_MAX_RENDER_TARGETS = 4;
+const D3DBACKBUFFER_TYPE_MONO = 0;
+const D3DERR_NOTFOUND = 0x88760866;
 
 // D3DPRESENT_PARAMETERS field offsets.
 const PP_BACKBUFFER_WIDTH = 0;
@@ -75,16 +83,44 @@ function registerImplicitBackbufferMeta(surfacePtr: number, devicePtr: number): 
     });
 }
 
-function addSurfaceRef(surfacePtr: number): void {
+/** The object a surface reference actually lands on: a mip level / cube face has no
+ *  refcount of its own, its parent texture holds it. */
+function surfaceRefTarget(surfacePtr: number): number {
     const pSurface = surfacePtr >>> 0;
-    if (!pSurface) return;
-    addComRef(surfaceMeta.get(pSurface)?.texturePtr || pSurface);
+    if (!pSurface) return 0;
+    return (surfaceMeta.get(pSurface)?.texturePtr || pSurface) >>> 0;
 }
 
-function releaseSurfaceRef(surfacePtr: number): void {
-    const pSurface = surfacePtr >>> 0;
-    if (!pSurface) return;
-    releaseComRef(surfaceMeta.get(pSurface)?.texturePtr || pSurface);
+/** Point a device binding slot at a surface. The new reference is taken before the
+ *  slot's old one is dropped (re-binding the same texture must never transiently
+ *  free it), and what was incremented is recorded — see deviceSlotRefs. */
+function rebindSurfaceSlot(devicePtr: number, slot: string, surfacePtr: number): void {
+    const target = surfaceRefTarget(surfacePtr);
+    if (target) addComRef(target);
+    releaseSurfaceSlot(devicePtr, slot);
+    if (target) setDeviceSlotRef(devicePtr, slot, target);
+}
+
+/** Hand a slot a reference it already owns (an implicit surface created for it). */
+function adoptSurfaceSlot(devicePtr: number, slot: string, surfacePtr: number): void {
+    const target = surfaceRefTarget(surfacePtr);
+    releaseSurfaceSlot(devicePtr, slot);
+    if (target) setDeviceSlotRef(devicePtr, slot, target);
+}
+
+function releaseSurfaceSlot(devicePtr: number, slot: string): void {
+    const held = takeDeviceSlotRef(devicePtr, slot);
+    if (held) releaseComRef(held);
+}
+
+function renderTargetSlot(index: number): string {
+    return `rt${index >>> 0}`;
+}
+
+/** Drop every reference this device's bindings and implicit surfaces hold. */
+function releaseDeviceSurfaceRefs(devicePtr: number): void {
+    for (const held of takeAllDeviceSlotRefs(devicePtr)) releaseComRef(held);
+    for (const surfacePtr of takeDeviceBackBufferSurfaces(devicePtr)) releaseComRef(surfacePtr);
 }
 
 /**
@@ -134,6 +170,7 @@ function bindAutoDepthStencil(device: D3D9Device, devicePtr: number, mem: Uint8A
     if (!pPresentationParameters) return;
     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
     const enableAutoDS = view.getUint32(pPresentationParameters + PP_ENABLE_AUTO_DEPTHSTENCIL, true);
+    releaseSurfaceSlot(devicePtr, 'ds');
     if (!enableAutoDS) {
         // No implicit DS — clear any stale binding so Get returns NULL faithfully.
         deviceBoundDepthStencil.delete(devicePtr);
@@ -162,7 +199,37 @@ function bindAutoDepthStencil(device: D3D9Device, devicePtr: number, mem: Uint8A
     });
     registerComFinalizer(surfacePtr, () => releaseSurfaceMetadata(surfacePtr));
     deviceBoundDepthStencil.set(devicePtr, surfacePtr);
+    // The implicit DS is device-owned: its creation reference IS the binding's.
+    adoptSurfaceSlot(devicePtr, 'ds', surfacePtr);
     Logger.log(LogCategory.D3D9, `auto depth-stencil ${w}x${h} fmt=${format} -> 0x${surfacePtr.toString(16)} (bound)`);
+}
+
+/**
+ * The device's implicit backbuffer surface for (iSwapChain, iBackBuffer). Real D3D9
+ * hands out the SAME object on every call — `GetRenderTarget(0,&rt)` and
+ * `GetBackBuffer(0,0,&bb)` compare equal, and a per-frame Get/Release loop must not
+ * mint a fresh guest object each frame. The cache owns one reference, dropped when
+ * the device dies or a Reset re-declares the geometry.
+ */
+function ensureImplicitBackBuffer(devicePtr: number, device: D3D9Device, iSwapChain: number, iBackBuffer: number): number {
+    const key = `${iSwapChain >>> 0}:${iBackBuffer >>> 0}`;
+    const cached = getDeviceBackBufferSurface(devicePtr, key);
+    if (cached) return cached;
+
+    const vtableAddr = getVTables()['IDirect3DSurface9']?.address;
+    if (!vtableAddr) {
+        Logger.error(LogCategory.D3D9, 'IDirect3DSurface9 vtable not found!');
+        return 0;
+    }
+    const surfacePtr = createComObject(vtableAddr);
+    resourceToDevice.set(surfacePtr, device);
+    registerImplicitBackbufferMeta(surfacePtr, devicePtr);
+    registerComFinalizer(surfacePtr, () => {
+        dropDeviceBackBufferSurface(devicePtr, surfacePtr);
+        releaseSurfaceMetadata(surfacePtr);
+    });
+    setDeviceBackBufferSurface(devicePtr, key, surfacePtr);
+    return surfacePtr;
 }
 
 /** A8R8G8B8 texture bytes (B,G,R,A little-endian) → tightly packed RGBA. */
@@ -331,8 +398,10 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
                 const ppView = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
                 const bbWidth = ppView.getUint32(pPresentationParameters + 0, true);
                 const bbHeight = ppView.getUint32(pPresentationParameters + 4, true);
-                Logger.log(LogCategory.D3D9, `CreateDevice backbuffer ${bbWidth}x${bbHeight}`);
-                device.setBackBufferSize(bbWidth, bbHeight);
+                // D3DPRESENT_PARAMETERS.Windowed @ +32 (d3d9); 0 = fullscreen, i.e. a mode-set.
+                const fullscreen = ppView.getUint32(pPresentationParameters + 32, true) === 0;
+                Logger.log(LogCategory.D3D9, `CreateDevice backbuffer ${bbWidth}x${bbHeight} fullscreen=${fullscreen}`);
+                device.setBackBufferSize(bbWidth, bbHeight, fullscreen);
             }
 
             // Get or create vtables
@@ -363,10 +432,7 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
             addComRef(pD3D9);
             registerComFinalizer(devicePtr, () => {
                 device.releaseComBindings();
-                releaseSurfaceRef(deviceBoundDepthStencil.get(devicePtr) ?? 0);
-                for (const surfacePtr of getDeviceRenderTargets(devicePtr)) {
-                    releaseSurfaceRef(surfacePtr);
-                }
+                releaseDeviceSurfaceRefs(devicePtr);
                 devices.delete(devicePtr);
                 releaseComRef(pD3D9);
                 deviceToD3D9.delete(devicePtr);
@@ -418,14 +484,11 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
             return D3DERR_INVALIDCALL;
         }
 
-        // Reset destroys the implicit depth-stencil and re-creates it from the new
+        // Reset destroys the implicit depth-stencil, the implicit backbuffer surfaces and
+        // every render-target binding, then re-creates the depth-stencil from the new
         // present parameters (when EnableAutoDepthStencil is still set).
-        const staleDepthStencil = deviceBoundDepthStencil.get(pDevice) ?? 0;
         deviceBoundDepthStencil.delete(pDevice);
-        if (staleDepthStencil) releaseSurfaceRef(staleDepthStencil);
-        for (const surfacePtr of getDeviceRenderTargets(pDevice)) {
-            releaseSurfaceRef(surfacePtr);
-        }
+        releaseDeviceSurfaceRefs(pDevice);
         clearDeviceRenderTargets(pDevice);
         // The device cursor does not survive a Reset either (wined3d_device_reset drops
         // cursor_texture) — the app must re-SetCursorProperties. Dropped before the new
@@ -476,9 +539,8 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         // GetBackBuffer / a NULL restore) → texturePtr 0 = render to the swap-chain.
         if (surfacePtr === 0) {
             if (renderTargetIndex === 0) return D3DERR_INVALIDCALL;
-            const previous = getDeviceRenderTarget(devicePtr, renderTargetIndex);
             setDeviceRenderTarget(devicePtr, renderTargetIndex, 0);
-            if (previous) releaseSurfaceRef(previous);
+            releaseSurfaceSlot(devicePtr, renderTargetSlot(renderTargetIndex));
             Logger.verbose(LogCategory.D3D9, `SetRenderTarget(index=${renderTargetIndex}, surface=NULL)`);
             return D3D_OK;
         }
@@ -492,13 +554,9 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         const face = meta?.face ?? -1;
         device.noteRtResolve(surfacePtr, true, texturePtr);
         Logger.verbose(LogCategory.D3D9, `SetRenderTarget(index=${renderTargetIndex}, surface=0x${surfacePtr.toString(16)} -> tex=0x${texturePtr.toString(16)} face=${face})`);
-        {
-            const previous = getDeviceRenderTarget(devicePtr, renderTargetIndex);
-            if (previous !== surfacePtr) {
-                addSurfaceRef(surfacePtr);
-                setDeviceRenderTarget(devicePtr, renderTargetIndex, surfacePtr);
-                if (previous) releaseSurfaceRef(previous);
-            }
+        if (getDeviceRenderTarget(devicePtr, renderTargetIndex) !== surfacePtr) {
+            rebindSurfaceSlot(devicePtr, renderTargetSlot(renderTargetIndex), surfacePtr);
+            setDeviceRenderTarget(devicePtr, renderTargetIndex, surfacePtr);
         }
         if (renderTargetIndex === 0) {
             device.setRenderTarget(0, texturePtr >>> 0, face);
@@ -520,18 +578,17 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         // still resolves it to the swap-chain).
         let rt = getDeviceRenderTarget(devicePtr, renderTargetIndex);
         if (!rt && renderTargetIndex === 0) {
-            const vtableAddr = getVTables()['IDirect3DSurface9']?.address;
-            if (!vtableAddr) return D3DERR_INVALIDCALL;
-            rt = createComObject(vtableAddr);
-            resourceToDevice.set(rt, device);
-            registerImplicitBackbufferMeta(rt, devicePtr);
-            registerComFinalizer(rt, () => releaseSurfaceMetadata(rt));
+            rt = ensureImplicitBackBuffer(devicePtr, device, 0, 0);
+            if (!rt) return D3DERR_INVALIDCALL;
+            rebindSurfaceSlot(devicePtr, renderTargetSlot(0), rt);
             setDeviceRenderTarget(devicePtr, 0, rt);
         }
-        if (!rt) return D3DERR_INVALIDCALL;
-        addSurfaceRef(rt);
+        // An index with nothing bound is D3DERR_NOTFOUND, out-param untouched.
+        if (!rt) return D3DERR_NOTFOUND;
+        const target = surfaceRefTarget(rt);
+        addComRef(target);
         if (!Mem.writeUint32(ppRenderTarget, rt)) {
-            releaseSurfaceRef(rt);
+            releaseComRef(target);
             return D3DERR_INVALIDCALL;
         }
         return D3D_OK;
@@ -846,45 +903,30 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         return ok ? D3D_OK : D3DERR_INVALIDCALL;
     };
 
-    exports['IDirect3DDevice9_GetBackBuffer'] = (ctx, mem, args) => {
-        const pDevice = args[0];
-        const iSwapChain = args[1];
-        const iBackBuffer = args[2];
-        const Type = args[3];
+    // GetBackBuffer(iSwapChain, iBackBuffer, Type, ppBackBuffer) — the ONE implicit
+    // backbuffer object for that slot, AddRef'd (see ensureImplicitBackBuffer).
+    exports['IDirect3DDevice9_GetBackBuffer'] = (_ctx, _mem, args) => {
+        const pDevice = args[0] >>> 0;
+        const iSwapChain = args[1] >>> 0;
+        const iBackBuffer = args[2] >>> 0;
+        const type = args[3] >>> 0;
         const ppBackBuffer = args[4];
 
         const device = devices.get(pDevice);
-        if (!device) {
-            Logger.error(LogCategory.D3D9, `GetBackBuffer: invalid device ${pDevice}`);
+        if (!device || !ppBackBuffer) {
+            Logger.error(LogCategory.D3D9, `GetBackBuffer: invalid args device=${pDevice} pp=0x${(ppBackBuffer ?? 0).toString(16)}`);
             return D3DERR_INVALIDCALL;
         }
+        // One implicit swap chain; D3DBACKBUFFER_TYPE_MONO is the only legal type.
+        if (iSwapChain !== 0 || type !== D3DBACKBUFFER_TYPE_MONO) return D3DERR_INVALIDCALL;
 
-        // Create a valid COM object for the back buffer surface
-        const vtables = getVTables();
-        const vtableAddr = vtables['IDirect3DSurface9']?.address;
-        if (!vtableAddr) {
-            Logger.error(LogCategory.D3D9, 'IDirect3DSurface9 vtable not found!');
+        const surfacePtr = ensureImplicitBackBuffer(pDevice, device, iSwapChain, iBackBuffer);
+        if (!surfacePtr) return D3DERR_INVALIDCALL;
+        addComRef(surfacePtr);
+        if (!Mem.writeUint32(ppBackBuffer, surfacePtr)) {
+            releaseComRef(surfacePtr);
             return D3DERR_INVALIDCALL;
         }
-
-        const surfacePtr = createComObject(vtableAddr);
-
-        // Register surface with device for method calls
-        resourceToDevice.set(surfacePtr, device);
-        registerImplicitBackbufferMeta(surfacePtr, pDevice);
-        registerComFinalizer(surfacePtr, () => releaseSurfaceMetadata(surfacePtr));
-
-        if (ppBackBuffer) {
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            view.setUint32(ppBackBuffer, surfacePtr, true);
-            
-            // Verify vtable is written correctly
-            const vtableCheck = view.getUint32(surfacePtr, true);
-            if (vtableCheck !== vtableAddr) {
-                Logger.error(LogCategory.D3D9, `GetBackBuffer: VTable mismatch! Expected 0x${vtableAddr.toString(16)}, got 0x${vtableCheck.toString(16)}`);
-            }
-        }
-
         return D3D_OK;
     };
 
@@ -907,16 +949,15 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
 
         const previous = deviceBoundDepthStencil.get(pDevice) ?? 0;
         if (previous !== pNewZStencil) {
-            addSurfaceRef(pNewZStencil);
+            rebindSurfaceSlot(pDevice, 'ds', pNewZStencil);
             if (pNewZStencil) deviceBoundDepthStencil.set(pDevice, pNewZStencil);
             else deviceBoundDepthStencil.delete(pDevice);
-            if (previous) releaseSurfaceRef(previous);
         }
         Logger.verbose(LogCategory.D3D9, `SetDepthStencilSurface(0x${pNewZStencil.toString(16)})`);
         return D3D_OK;
     };
 
-    exports['IDirect3DDevice9_GetDepthStencilSurface'] = (ctx, mem, args) => {
+    exports['IDirect3DDevice9_GetDepthStencilSurface'] = (_ctx, _mem, args) => {
         const pDevice = args[0];
         const ppZStencilSurface = args[1];
 
@@ -926,10 +967,16 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
             return D3DERR_INVALIDCALL;
         }
 
+        // No depth-stencil bound is D3DERR_NOTFOUND with the out-param UNTOUCHED. Writing
+        // NULL and returning D3D_OK sends `if (SUCCEEDED(hr)) ds->GetDesc(&d);` through a
+        // NULL vtable, which on an identity-mapped address space jumps into garbage.
         const bound = deviceBoundDepthStencil.get(pDevice) ?? 0;
-        addSurfaceRef(bound);
+        if (!bound) return D3DERR_NOTFOUND;
+
+        const target = surfaceRefTarget(bound);
+        addComRef(target);
         if (!Mem.writeUint32(ppZStencilSurface, bound)) {
-            releaseSurfaceRef(bound);
+            releaseComRef(target);
             return D3DERR_INVALIDCALL;
         }
 
