@@ -47,22 +47,38 @@ function emittedNames(src: string): string[] {
     const names: string[] = [];
     const skipUntil: number[] = [];     // brace depths at which an inactive region ends
     let depth = 0;
+    // An `if cfg!(…)` carries its `{` on the same line, but a `#[cfg(…)]` attribute sits on
+    // its OWN line and the block opens on the next one. Binding the region to the depth at
+    // its opening brace covers both; deriving it from the attribute line's depth records -1
+    // for a top-level `#[cfg(test)] mod tests`, a depth no `}` can ever reach — after which
+    // every remaining line of the file is treated as inactive and the check silently stops
+    // checking. `mod tests` conventionally comes last, which is the only reason that was
+    // survivable.
+    let pending = false;
     for (const line of src.split("\n")) {
-        const inactiveHere = skipUntil.length > 0;
-        if (!inactiveHere) {
+        const opensGate = /\bif\s+cfg!\s*\(\s*(?:feature\s*=\s*"profiler"|debug_assertions)\s*\)/.test(line)
+            // `#[cfg(test)]`, `#[cfg(any(test, …))]`, `#[cfg(all(test, …))]`, `#[cfg(debug_assertions)]`
+            || /#\[cfg\([^\]]*\b(?:test|debug_assertions)\b/.test(line);
+        if (opensGate) pending = true;
+
+        if (skipUntil.length === 0 && !pending) {
             const m = CALL_SITE.exec(line);
             if (m) names.push(m[1]);
         }
-        const opensGate = /\bif\s+cfg!\s*\(\s*(?:feature\s*=\s*"profiler"|debug_assertions)\s*\)/.test(line)
-            || /#\[cfg\(test\)\]/.test(line);
-        for (const ch of line.replace(/\/\/.*$/, "")) {
-            if (ch === "{") depth++;
-            else if (ch === "}") {
+
+        const code = line.replace(/\/\/.*$/, "");
+        for (const ch of code) {
+            if (ch === "{") {
+                if (pending) { skipUntil.push(depth); pending = false; }
+                depth++;
+            } else if (ch === "}") {
                 depth--;
                 while (skipUntil.length && depth <= skipUntil[skipUntil.length - 1]) skipUntil.pop();
             }
         }
-        if (opensGate) skipUntil.push(depth - 1);
+        // An attribute on a braceless item (`#[cfg(test)] const X: u32 = 1;`) gates nothing;
+        // leaving `pending` armed would attach it to the next unrelated block.
+        if (pending && !code.includes("{") && /;\s*$/.test(code)) pending = false;
     }
     return names;
 }

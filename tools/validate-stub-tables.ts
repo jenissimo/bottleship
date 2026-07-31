@@ -37,12 +37,20 @@ function* walk(dir: string): Generator<string> {
 
 const rel = (f: string) => relative(ROOT, f).split("/").join(sep);
 
-/** `exports["Interface_Method"] = ` / `exports['…'] = ` — a literal registration. */
-const LITERAL_KEY = /\bexports\[\s*["']([A-Za-z_][A-Za-z0-9_]*)["']\s*\]\s*=/g;
-/** `const someStubs = [ "A", "B", … ]` — the method-name array a stub loop iterates. */
-const STUB_ARRAY = /\bconst\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=]+)?=\s*\[([^\]]*)\]/g;
-/** `for (const method of someStubs)` — binds the loop variable to that array. */
-const STUB_LOOP = /\bfor\s*\(\s*const\s+([A-Za-z_][A-Za-z0-9_]*)\s+of\s+([A-Za-z_][A-Za-z0-9_]*)\s*\)/g;
+/**
+ * The accumulator a registration is written into. NOT just `exports`: a table built as
+ * `table["X"] = …` and merged with `Object.assign(exports, table)` registers exactly the same
+ * key, and a real handler installed through `this.exports` is just as real. Over-matching an
+ * unrelated map is harmless — a collision needs the SAME `Interface_Method` key on both sides.
+ */
+const ACC = String.raw`(?:this\.)?[A-Za-z_$][\w$]*`;
+
+/** `<acc>["Interface_Method"] = ` — a literal registration. */
+const LITERAL_KEY = new RegExp(String.raw`\b${ACC}\[\s*["']([A-Za-z_][A-Za-z0-9_]*)["']\s*\]\s*=`, "g");
+/** `const someNames = [ "A", "B", … ]` — the name array a registration loop iterates. */
+const NAME_ARRAY = /\bconst\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=]+)?=\s*\[([^\]]*)\]/g;
+/** `for (const method of someNames)` — binds the loop variable to that array. */
+const NAME_LOOP = /\bfor\s*\(\s*const\s+([A-Za-z_][A-Za-z0-9_]*)\s+of\s+([A-Za-z_][A-Za-z0-9_]*)\s*\)/g;
 
 /** Body of the block that starts at the first `{` at or after `from`. */
 function blockAfter(text: string, from: number): string {
@@ -63,40 +71,52 @@ const realSites = new Map<string, Site>();
 
 const lineOf = (text: string, index: number) => text.slice(0, index).split(/\r?\n/).length;
 
-for (const file of walk(MODULES)) {
-    const text = readFileSync(file, "utf8");
-    const isStubFile = /-stubs\.ts$/.test(file);
-    const target = isStubFile ? null : realSites;
-
-    for (const m of text.matchAll(LITERAL_KEY)) {
-        const site: Site = { key: m[1]!, file: rel(file), line: lineOf(text, m.index!) };
-        if (isStubFile) stubSites.push(site);
-        else if (!target!.has(site.key)) target!.set(site.key, site);
-    }
-
-    if (!isStubFile) continue;
-
-    // A stub file's templated registrations. Both the array contents and the key prefix are
-    // literals, so `for (const m of arr) exports[`Prefix_${m}`] = …` yields an exactly known
-    // key set — as long as each array is paired with the prefix of ITS OWN loop body.
-    const arrays = new Map<string, { methods: string[]; line: number }>();
-    for (const arr of text.matchAll(STUB_ARRAY)) {
+/**
+ * Templated registrations. Both the array contents and the literal half of the key are
+ * literals, so `for (const m of arr) acc[`Prefix_${m}`] = …` yields an exactly known key set —
+ * as long as each array is paired with ITS OWN loop body. Both halves occur in practice:
+ * the loop variable can supply the METHOD (`IDirect3DDevice7_${method}`) or the INTERFACE
+ * (`${prefix}_QueryInterface`, how d3d9 registers the real COM triple).
+ */
+function templatedKeys(text: string, file: string): Site[] {
+    const out: Site[] = [];
+    const arrays = new Map<string, { names: string[]; line: number }>();
+    for (const arr of text.matchAll(NAME_ARRAY)) {
         arrays.set(arr[1]!, {
-            methods: [...arr[2]!.matchAll(/["']([A-Za-z_][A-Za-z0-9_]*)["']/g)].map((m) => m[1]!),
+            names: [...arr[2]!.matchAll(/["']([A-Za-z_][A-Za-z0-9_]*)["']/g)].map((m) => m[1]!),
             line: lineOf(text, arr.index!),
         });
     }
-    for (const loop of text.matchAll(STUB_LOOP)) {
+    for (const loop of text.matchAll(NAME_LOOP)) {
         const [, loopVar, arrName] = loop;
         const arr = arrays.get(arrName!);
-        if (!arr || arr.methods.length === 0) continue;
+        if (!arr || arr.names.length === 0) continue;
         const body = blockAfter(text, loop.index! + loop[0].length);
-        const keyRe = new RegExp("\\bexports\\[\\s*`([A-Za-z_][A-Za-z0-9_]*_)\\$\\{\\s*" + loopVar + "\\s*\\}`\\s*\\]\\s*=", "g");
-        for (const m of body.matchAll(keyRe)) {
-            for (const method of arr.methods) {
-                stubSites.push({ key: m[1]! + method, file: rel(file), line: arr.line });
-            }
+        const prefixRe = new RegExp(`\\b${ACC}\\[\\s*\`([A-Za-z_][A-Za-z0-9_]*_)\\$\\{\\s*${loopVar}\\s*\\}\`\\s*\\]\\s*=`, "g");
+        const suffixRe = new RegExp(`\\b${ACC}\\[\\s*\`\\$\\{\\s*${loopVar}\\s*\\}(_[A-Za-z_][A-Za-z0-9_]*)\`\\s*\\]\\s*=`, "g");
+        for (const m of body.matchAll(prefixRe)) {
+            for (const name of arr.names) out.push({ key: m[1]! + name, file, line: arr.line });
         }
+        for (const m of body.matchAll(suffixRe)) {
+            for (const name of arr.names) out.push({ key: name + m[1]!, file, line: arr.line });
+        }
+    }
+    return out;
+}
+
+for (const file of walk(MODULES)) {
+    const text = readFileSync(file, "utf8");
+    const isStubFile = /-stubs\.ts$/.test(file);
+    const here = rel(file);
+
+    const sites: Site[] = [...text.matchAll(LITERAL_KEY)].map((m) => ({
+        key: m[1]!, file: here, line: lineOf(text, m.index!),
+    }));
+    sites.push(...templatedKeys(text, here));
+
+    for (const site of sites) {
+        if (isStubFile) stubSites.push(site);
+        else if (!realSites.has(site.key)) realSites.set(site.key, site);
     }
 }
 

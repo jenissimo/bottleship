@@ -8,17 +8,24 @@
  * offset sampled at a different instant. The bytes come back the right LENGTH, so
  * nothing above notices.
  *
- * Two rules, mirroring validate-guest-code-writes.ts's ownership-not-coverage stance:
+ * Three rules, mirroring validate-guest-code-writes.ts's ownership-not-coverage stance:
  *
  *   1. OWNERSHIP — `<something>Handle.position` may only be touched by the layers that
  *      implement the file object: the VFS itself, and the two handle layers that wrap it
  *      for the guest (kernel32's FileHandleWrapper, the CRTs FILE-star/fd tables). Anywhere
  *      else, take your own cursor (`vfs.duplicateHandle`) or use the offset-taking API.
  *
- *   2. NO COMPOUND ASSIGNMENT — `position += n` is banned outright, owners included. A
- *      compound assignment is a read-modify-write; when two paths each do one across a
- *      yield the cursor double-advances and every later read is served from further
- *      ahead. Route advances through a single named mutation so they are greppable.
+ *   2. A PINNED NUMBER OF MUTATION SITES — the hazard is two paths advancing the same
+ *      cursor, and that is a COUNT, not a spelling. `position += n`, `position = position + n`
+ *      and `position = startPos + n` are the same write; a rule phrased against one spelling
+ *      is sidestepped by the next, and the sanctioned advance in vfs.ts already had to be
+ *      written the long way to get past such a rule. So every assignment site is counted and
+ *      compared against the budget below: a new one fails the gate however it is spelled, and
+ *      raising the budget is a deliberate, reviewable edit.
+ *
+ *   3. NO COMPOUND ASSIGNMENT — `position += n` stays banned on top of the budget: a
+ *      read-modify-write across a yield is the shape of every double-advance bug, and
+ *      spelling it out keeps the write greppable.
  *
  * Scope, deliberately: this is a LINE check on receiver SHAPE (an identifier ending in
  * `handle`), not a type check. Proving a given `.position` is a VfsFileHandle needs the
@@ -54,6 +61,21 @@ const OWNERS = new Set([
 const ACCESS = /\b(\w*[Hh]andle)\.position\b/;
 /** The same, being read-modify-written. */
 const COMPOUND = /\b(\w*[Hh]andle)\.position\s*(\+=|-=)/;
+/** The same, being assigned — any spelling, absolute or derived. */
+const MUTATION = /\b(\w*[Hh]andle)\.position\s*(?:\+=|-=|\*=|\/=|\|=|&=|=(?!=))/;
+
+/**
+ * How many cursor writes each owner is allowed. These are the file object's own state
+ * transitions: vfs.ts has the single advance plus the seek, the handle layers have their
+ * rewinds and append-mode syncs. A change here means a NEW way the cursor moves — say why
+ * in the commit, then update the number.
+ */
+const MUTATION_BUDGET = new Map([
+    [join("src", "worker", "runtime", "filesystem", "vfs.ts"), 2],
+    [join("src", "worker", "modules", "kernel32", "file-io.ts"), 2],
+    [join("src", "worker", "modules", "msvcrt.ts"), 5],
+    [join("src", "worker", "modules", "crtdll.ts"), 1],
+]);
 
 function* walk(dir: string): Generator<string> {
     for (const entry of readdirSync(dir)) {
@@ -65,6 +87,7 @@ function* walk(dir: string): Generator<string> {
 
 const foreign: string[] = [];
 const compound: string[] = [];
+const mutations = new Map<string, string[]>();
 
 for (const file of walk(SRC)) {
     const rel = relative(ROOT, file).split("/").join(sep);
@@ -74,12 +97,33 @@ for (const file of walk(SRC)) {
     lines.forEach((line, i) => {
         if (/^\s*(\/\/|\*|\/\*)/.test(line)) return; // comments may name it
         const where = `${rel}:${i + 1}: ${line.trim()}`;
+        if (MUTATION.test(line)) {
+            const list = mutations.get(rel) ?? [];
+            list.push(where);
+            mutations.set(rel, list);
+        }
         if (COMPOUND.test(line)) compound.push(where);
         else if (!isOwner && ACCESS.test(line)) foreign.push(where);
     });
 }
 
-if (foreign.length > 0 || compound.length > 0) {
+// Rule 2: the number of writes, per owner, is pinned.
+const budgeted: string[] = [];
+for (const [rel, allowed] of MUTATION_BUDGET) {
+    const found = mutations.get(rel) ?? [];
+    if (found.length === allowed) continue;
+    budgeted.push(
+        `${rel}: ${found.length} cursor write(s), budget ${allowed}\n` +
+        found.map((f) => `      ${f}`).join("\n"),
+    );
+}
+
+if (foreign.length > 0 || compound.length > 0 || budgeted.length > 0) {
+    if (budgeted.length > 0) {
+        console.error("The number of file-cursor write sites changed.");
+        console.error("(A new advance is a new way the cursor can double-count — see the header here.)\n");
+        for (const v of budgeted) console.error(`  ${v}\n`);
+    }
     if (foreign.length > 0) {
         console.error("A VfsFileHandle's cursor may only be touched by the file-object layers.");
         console.error("(Take your own cursor with vfs.duplicateHandle() — see the header here.)\n");
@@ -92,8 +136,9 @@ if (foreign.length > 0 || compound.length > 0) {
         for (const v of compound) console.error(`  ${v}`);
         console.error("");
     }
-    console.error(`${foreign.length + compound.length} violation(s).`);
+    console.error(`${foreign.length + compound.length + budgeted.length} violation(s).`);
     process.exit(1);
 }
 
-console.log("File-cursor ownership OK — no foreign cursor access, no compound advances.");
+const total = [...MUTATION_BUDGET.values()].reduce((a, b) => a + b, 0);
+console.log(`File-cursor ownership OK — no foreign access, ${total} owned write site(s), all within budget.`);

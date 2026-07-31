@@ -50,9 +50,13 @@ function formatWarning(warning: any): string {
 async function main(): Promise<void> {
     const args = process.argv.slice(2);
     
-    let apiDir = path.join(process.cwd(), 'src/worker/api');
-    let modulesDir = path.join(process.cwd(), 'src/worker/modules');
-    let referenceDir = path.join(process.cwd(), 'tools/reference');
+    // Anchored on this file, not the cwd: from any other directory the defaults resolved to
+    // nothing, validateAllModules returned [] for the missing tree, and the gate printed
+    // "0 errors, 0 warnings" and passed having scanned no module at all.
+    const repoRoot = path.resolve(import.meta.dir, '..');
+    let apiDir = path.join(repoRoot, 'src/worker/api');
+    let modulesDir = path.join(repoRoot, 'src/worker/modules');
+    let referenceDir = path.join(repoRoot, 'tools/reference');
     let moduleName: string | null = null;
     let reference = false;
     let apiOnly = false;
@@ -105,9 +109,25 @@ Examples:
         }
     }
     
+    // An empty scan is indistinguishable from a clean one in the output below, so refuse it
+    // here: a validator that can only report success is not an instrument.
+    const countIn = (dir: string, suffix: string) => {
+        if (!fs.existsSync(dir)) return -1;
+        return fs.readdirSync(dir, { withFileTypes: true })
+            .filter(e => e.isDirectory() || e.name.endsWith(suffix)).length;
+    };
+    const apiCount = countIn(apiDir, '.api.ts');
+    const moduleCount = countIn(modulesDir, '.ts');
+    if (apiCount <= 0 || moduleCount <= 0) {
+        console.error('\x1b[31m✗ validate-signatures scanned nothing.\x1b[0m');
+        console.error(`  API directory:     ${apiDir} (${apiCount < 0 ? 'missing' : apiCount + ' entries'})`);
+        console.error(`  Modules directory: ${modulesDir} (${moduleCount < 0 ? 'missing' : moduleCount + ' entries'})`);
+        process.exit(1);
+    }
+
     // Default: validate all modules with API/Implementation check
     // If --reference is specified, also validate against reference headers
-    
+
     try {
         // 1. API/Implementation validation (always runs unless --reference-only)
         if (!reference || !apiOnly) {

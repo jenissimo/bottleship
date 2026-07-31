@@ -24,8 +24,40 @@ import { join, relative, sep } from "node:path";
 
 const ROOT = join(import.meta.dir, "..");
 const SRC = join(ROOT, "src");
+const JIT_RS = join(ROOT, "vendor", "v86", "src", "rust", "jit.rs");
 const OWNER = join("src", "worker", "core", "memory", "guest-code.ts");
-const PATTERN = /jit_dirty_cache|jit_clear_cache_js/;
+
+/** The only wasm export that clears EVERYTHING; the rest of the family is ranged/per-page. */
+const GLOBAL_CLEAR = "jit_clear_cache_js";
+
+/**
+ * The invalidation family is DERIVED from v86's own `#[no_mangle]` exports rather than listed
+ * here: `jit_dirty_page` is as reachable from JS as `jit_dirty_cache` and is the primitive an
+ * in-place emitter reaches for first, so a hand-written pattern is one v86 rename away from
+ * naming a hole it no longer covers. Anything v86 newly exports as `jit_dirty*`/`jit_clear*`
+ * is in scope the moment the submodule updates.
+ */
+const BASELINE = [GLOBAL_CLEAR, "jit_dirty_cache", "jit_dirty_page"];
+
+function invalidationExports(): string[] {
+    const names = new Set(BASELINE);
+    let rust = "";
+    try {
+        rust = readFileSync(JIT_RS, "utf8");
+    } catch {
+        console.warn(`[validate-guest-code-writes] ${JIT_RS} unreadable (submodule not checked out?) — using the baseline family only.`);
+        return [...names];
+    }
+    for (const m of rust.matchAll(/#\[no_mangle\][\s\S]{0,200}?\bpub\s+fn\s+(jit_(?:dirty|clear)[A-Za-z0-9_]*)/g)) {
+        names.add(m[1]!);
+    }
+    return [...names];
+}
+
+const FAMILY = invalidationExports();
+const PATTERN = new RegExp(`\\b(?:${FAMILY.join("|")})\\b`);
+/** Everything but the global clear: never legitimate outside guest-code.ts. */
+const RANGED = new RegExp(`\\b(?:${FAMILY.filter((n) => n !== GLOBAL_CLEAR).join("|")})\\b`);
 
 /** dbg-commands / preemption-manager own the *global* clear as a deliberate debug/perf knob. */
 const GLOBAL_CLEAR_OWNERS = new Set([
@@ -51,8 +83,8 @@ for (const file of walk(SRC)) {
     lines.forEach((line, i) => {
         if (!PATTERN.test(line)) return;
         if (/^\s*(\/\/|\*|\/\*)/.test(line)) return; // comments may name it
-        // The global clear is a legitimate knob in its owners; the ranged dirty never is.
-        if (GLOBAL_CLEAR_OWNERS.has(rel) && !/jit_dirty_cache/.test(line)) return;
+        // The global clear is a legitimate knob in its owners; a ranged/per-page dirty never is.
+        if (GLOBAL_CLEAR_OWNERS.has(rel) && !RANGED.test(line)) return;
         violations.push(`${rel}:${i + 1}: ${line.trim()}`);
     });
 }
@@ -65,4 +97,4 @@ if (violations.length > 0) {
     process.exit(1);
 }
 
-console.log("Guest-code invalidation ownership OK — no private jit_dirty_cache call sites.");
+console.log(`Guest-code invalidation ownership OK — no private call sites (${FAMILY.length} export(s) watched: ${FAMILY.join(", ")}).`);

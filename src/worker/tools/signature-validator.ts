@@ -372,6 +372,16 @@ export class SignatureValidator {
         let hasStackCleanup = false;
         let hasReturnValue = false;
 
+        /** A `return` belonging to a NESTED function is not this thunk's return value. The walk
+         *  must stop at every function boundary: a handler whose local helper returns
+         *  `{ addr, fvf }` is otherwise reported as a ThunkResult missing `stackCleanup`, and a
+         *  false positive here trains the reader to ignore the one real one. */
+        const isNestedFunction = (n: ts.Node): boolean =>
+            ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n)
+            || ts.isArrowFunction(n) || ts.isMethodDeclaration(n)
+            || ts.isGetAccessor(n) || ts.isSetAccessor(n) || ts.isClassDeclaration(n)
+            || ts.isClassExpression(n);
+
         const checkReturn = (n: ts.Node) => {
             if (ts.isReturnStatement(n) && n.expression) {
                 hasReturnValue = true;
@@ -386,7 +396,10 @@ export class SignatureValidator {
                     }
                 }
             }
-            ts.forEachChild(n, checkReturn);
+            ts.forEachChild(n, (child) => {
+                if (isNestedFunction(child)) return;
+                checkReturn(child);
+            });
         };
 
         // Arrow functions might have an implicit return (no block)
@@ -403,7 +416,12 @@ export class SignatureValidator {
                 }
             }
         } else {
-            ts.forEachChild(node.body, checkReturn);
+            // Guarded entry, same rule as the recursion: a helper declared at the top of the
+            // body is still a nested function, and its returns are not this thunk's.
+            ts.forEachChild(node.body, (child) => {
+                if (isNestedFunction(child)) return;
+                checkReturn(child);
+            });
         }
 
         const { line } = sourceFile.getLineAndCharacterOfPosition(node.getStart());
