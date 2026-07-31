@@ -315,7 +315,12 @@ export interface PeExports {
     ordinals: Map<number, string | null>;
     /** Export name → forwarder string ("NTDLL.RtlAllocateHeap") for forwarded exports. */
     forwarders: Map<string, string>;
+    /** A declared table ran past the image or past the 16-bit ordinal space and was clamped. */
+    truncated?: boolean;
 }
+
+/** Ordinals are 16-bit in the PE format, so a larger table is corrupt, not large. */
+const MAX_EXPORT_ENTRIES = 0x10000;
 
 /** Parse the export directory of an on-disk image (names, ordinals, forwarders). */
 export function parsePeExports(image: Uint8Array, headers?: PeHeaders | null): PeExports {
@@ -343,20 +348,30 @@ export function parsePeExports(image: Uint8Array, headers?: PeHeaders | null): P
     const namesOff = rvaToFileOffset(h, namesRva);
     const nameOrdOff = rvaToFileOffset(h, nameOrdRva);
 
+    // `numFuncs`/`numNames` are unchecked uint32s out of the file, and each drives a loop that
+    // also INSERTS into a Map — so a malformed header buys seconds of CPU and image-sized
+    // memory. Clamp both to what the file can actually hold (and to the ordinal space), the
+    // same shape as the `d > 512` guards on the import walks.
+    const fitting = (off: number | null, stride: number) =>
+        off === null ? 0 : Math.max(0, Math.floor((image.length - off) / stride));
+    const funcCount = Math.min(numFuncs, MAX_EXPORT_ENTRIES, fitting(funcsOff, 4));
+    const nameCount = Math.min(numNames, MAX_EXPORT_ENTRIES, fitting(namesOff, 4), fitting(nameOrdOff, 2));
+    if (funcCount !== numFuncs || nameCount !== numNames) out.truncated = true;
+
     const funcRvaAt = (index: number): number => {
-        if (funcsOff === null || index >= numFuncs) return 0;
+        if (funcsOff === null || index >= funcCount) return 0;
         const o = funcsOff + index * 4;
         return o + 4 <= image.length ? view.getUint32(o, true) : 0;
     };
     const inExportDir = (rva: number): boolean => rva >= dir.rva && rva < dir.rva + dir.size;
 
-    for (let i = 0; i < numFuncs; i++) {
+    for (let i = 0; i < funcCount; i++) {
         const rva = funcRvaAt(i);
         if (rva !== 0) out.ordinals.set(ordinalBase + i, null);
     }
 
     if (namesOff !== null && nameOrdOff !== null) {
-        for (let i = 0; i < numNames; i++) {
+        for (let i = 0; i < nameCount; i++) {
             const strOff = rvaToFileOffset(h, view.getUint32(namesOff + i * 4, true));
             if (strOff === null) continue;
             const name = readCString(image, strOff);

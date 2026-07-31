@@ -193,17 +193,24 @@ async function censusBundle(bundlePath: string, index: ApiCoverageIndex, opts: O
             if (!headers) continue; // a .dll that isn't a PE (data blob with a misleading name)
 
             const packer = detectPacker(headers) ?? undefined;
-            const imports = parsePeImports(image, headers);
+            // One malformed image must not abort the census over the whole tree.
+            let imports;
+            try { imports = parsePeImports(image, headers); }
+            catch (e: any) { opaque.push({ path: entry.name, reason: `bad import table: ${e.message}` }); continue; }
 
             // A shipped DLL's own exports satisfy imports naming it — record before classifying.
             // Recorded even for a DLL we thunk: when our module cannot cover an import of
             // it, the PE loader abandons the HLE module and maps this file instead.
             if (headers.isDll || path.extname(entry.name).toLowerCase() !== '.exe') {
-                const exp = parsePeExports(image, headers);
-                shipped.set(baseNoExt(entry.name), {
-                    names: new Set([...exp.names].map(n => n.toLowerCase())),
-                    ordinals: new Set(exp.ordinals.keys()),
-                });
+                try {
+                    const exp = parsePeExports(image, headers);
+                    shipped.set(baseNoExt(entry.name), {
+                        names: new Set([...exp.names].map(n => n.toLowerCase())),
+                        ordinals: new Set(exp.ordinals.keys()),
+                    });
+                } catch (e: any) {
+                    opaque.push({ path: entry.name, reason: `bad export table: ${e.message}` });
+                }
             }
 
             const slotRvas = new Set<number>();

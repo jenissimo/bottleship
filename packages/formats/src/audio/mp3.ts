@@ -128,9 +128,14 @@ function samplesFromVbrHeader(window: Uint8Array, frame: FrameHeader, windowBase
 
     const flags = u32be(window, xing + 4);
     if ((flags & 0x01) === 0) return null; // no frame count: the header tells us nothing about length
+    // bytes.ts yields 0 for an out-of-range read, so a Xing block near the end of the 8 KB
+    // search window would otherwise report "0 frames" as a FACT and win over the CBR
+    // fallback — 0 ms, which breaks the caller's MCI_STATUS_LENGTH arithmetic outright.
+    if (xing + 12 > window.length) return null;
     let p = xing + 8;
     const frames = u32be(window, p);
     p += 4;
+    if (frames <= 0) return null; // the flag is set but the count is empty: estimate instead
     if (flags & 0x02) p += 4; // byte count
     if (flags & 0x04) p += 100; // seek TOC
     if (flags & 0x08) p += 4; // quality
@@ -159,8 +164,9 @@ function trailerSize(src: RandomAccessSource): number {
 
     const apeFooter = buf.length - size - 32;
     if (apeFooter >= 0 && tagAt(buf, apeFooter, "APETAGEX")) {
+        // APEv2 footer: magic(8) version(8) size(12) ITEM COUNT(16) FLAGS(20) reserved(24).
         const tagBytes = u32le(buf, apeFooter + 12); // footer + items, header excluded
-        const hasHeader = (u32le(buf, apeFooter + 16) & 0x80000000) !== 0;
+        const hasHeader = (u32le(buf, apeFooter + 20) & 0x80000000) !== 0;
         size += tagBytes + (hasHeader ? 32 : 0);
     }
     return Math.min(size, src.size);

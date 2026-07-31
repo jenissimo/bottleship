@@ -414,16 +414,46 @@ describe("probeAudioStream / mp3", () => {
         expect(probeAudioStream(new BufferSource(file))!.durationMs).toBe(Math.round((100 * 417 * 8000) / 128000));
     });
 
-    it("excludes an APEv2 tag from the CBR byte range", () => {
-        const frames: Uint8Array[] = [];
-        for (let i = 0; i < 50; i++) frames.push(mp3Frame(i & 0xff));
-        const apeItems = new Uint8Array(64);
+    // APEv2 footer: magic(8) version(8) size(12) item count(16) FLAGS(20) reserved(24). Both
+    // cases are here because the flags field was being read at +16 — the item count — so
+    // `hasHeader` was always false and the header-present case counted 32 bytes of tag as
+    // audio. A fixture that writes the flags at +16 passes either way.
+    const apeTag = (items: number, flags: number) => {
         const footer = new Uint8Array(32);
         footer.set(ascii("APETAGEX"), 0);
         footer.set(u32leBytes(2000), 8);
-        footer.set(u32leBytes(apeItems.length + 32), 12); // items + footer
-        footer.set(u32leBytes(0), 16); // no header present
-        const file = concat(...frames, apeItems, footer);
+        footer.set(u32leBytes(items + 32), 12); // items + footer
+        footer.set(u32leBytes(3), 16);          // item COUNT, not flags
+        footer.set(u32leBytes(flags), 20);
+        return footer;
+    };
+
+    it("excludes a header-less APEv2 tag from the CBR byte range", () => {
+        const frames: Uint8Array[] = [];
+        for (let i = 0; i < 50; i++) frames.push(mp3Frame(i & 0xff));
+        const apeItems = new Uint8Array(64);
+        const file = concat(...frames, apeItems, apeTag(apeItems.length, 0));
+        expect(probeAudioStream(new BufferSource(file))!.durationMs).toBe(Math.round((50 * 417 * 8000) / 128000));
+    });
+
+    it("excludes the 32-byte APEv2 HEADER too when the flags say there is one", () => {
+        const frames: Uint8Array[] = [];
+        for (let i = 0; i < 50; i++) frames.push(mp3Frame(i & 0xff));
+        const apeHeader = new Uint8Array(32);
+        const apeItems = new Uint8Array(64);
+        const file = concat(...frames, apeHeader, apeItems, apeTag(apeItems.length, 0x80000000));
+        expect(probeAudioStream(new BufferSource(file))!.durationMs).toBe(Math.round((50 * 417 * 8000) / 128000));
+    });
+
+    it("falls back to the CBR estimate when Xing declares zero frames", () => {
+        // The frame-count flag is set and the count is 0: taking that literally reports 0 ms.
+        const frames: Uint8Array[] = [];
+        for (let i = 0; i < 50; i++) frames.push(mp3Frame(i & 0xff));
+        const xing = 4 + 32; // MPEG1 stereo side info
+        frames[0]!.set(ascii("Xing"), xing);
+        frames[0]!.set(u32beBytes(0x0001), xing + 4);
+        frames[0]!.set(u32beBytes(0), xing + 8);
+        const file = concat(...frames);
         expect(probeAudioStream(new BufferSource(file))!.durationMs).toBe(Math.round((50 * 417 * 8000) / 128000));
     });
 
