@@ -16,6 +16,7 @@ import {
     pinUe2PcPackagePath,
     pinUeEngineIni,
     classifyUe1FirstRunFile,
+    isUe1RenderProbeCommandLine,
     dirOfWindowsPath,
     baseOfWindowsPath,
     UE1_RENDER_DEVICE,
@@ -247,6 +248,26 @@ describe("classifyUe1FirstRunFile", () => {
     test("non-ini, non-detected → null", () => {
         expect(classifyUe1FirstRunFile("Core.dll", true)).toBeNull();
         expect(classifyUe1FirstRunFile("save0.usa", true)).toBeNull();
+    });
+});
+
+describe("isUe1RenderProbeCommandLine", () => {
+    test("recognizes the testrendev probe (HP: Philosopher's Stone demo, verbatim)", () => {
+        expect(isUe1RenderProbeCommandLine("testrendev=D3DDrv.D3DRenderDevice log=Detected.log")).toBe(true);
+        expect(isUe1RenderProbeCommandLine("HPDemo.exe testrendev=SoftDrv.SoftwareRenderDevice")).toBe(true);
+        expect(isUe1RenderProbeCommandLine("TESTRENDEV = OpenGLDrv.OpenGLRenderDevice")).toBe(true);
+    });
+
+    test("still recognizes the older -b false browser probe", () => {
+        expect(isUe1RenderProbeCommandLine("UnrealTournament.exe -b false")).toBe(true);
+    });
+
+    test("a real relaunch is NOT a probe — it must stay eligible for self re-exec", () => {
+        expect(isUe1RenderProbeCommandLine("PrivetDr.unr -SAVESLOT=1")).toBe(false);
+        expect(isUe1RenderProbeCommandLine("")).toBe(false);
+        // Substring of a longer token: not the probe switch.
+        expect(isUe1RenderProbeCommandLine("map=notestrendev=x")).toBe(false);
+        expect(isUe1RenderProbeCommandLine("-b true")).toBe(false);
     });
 });
 

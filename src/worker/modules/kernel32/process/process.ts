@@ -17,6 +17,7 @@ import { Marshaler } from '../../../core/memory/marshaler';
 import { SystemResourceProvider } from '../../../core/resources/system-resource-provider';
 import { encodeAnsi } from '../../codepage-utils';
 import { applyShellExecFake, hasShellExecFakeMatch, isDifferentCommandLine } from '../../shell32';
+import { isUe1RenderProbeCommandLine } from '../../../runtime/filesystem/ue1-firstrun';
 import { getVirtualProcessManager, VIRTUAL_CURRENT_PROCESS_ID } from './virtual-process-manager';
 import { createActCtxExports } from './actctx';
 import { versionVerifyExports } from './version-verify';
@@ -444,10 +445,8 @@ const writeVirtualProcessMemory = (pid: number, address: number, data: Uint8Arra
     return data.length;
 };
 
-const isUnrealBrowserProbe = (applicationName: string, commandLine: string): boolean => {
-    const probe = `${applicationName} ${commandLine}`.trim();
-    return /(?:^|\s)-b\s+false(?:\s|$)/i.test(probe);
-};
+const isUnrealBrowserProbe = (applicationName: string, commandLine: string): boolean =>
+    isUe1RenderProbeCommandLine(`${applicationName} ${commandLine}`.trim());
 
 const failVirtualProcess = (
     lpProcessInformation: number,

@@ -12,6 +12,7 @@ import { Logger, LogCategory } from "../core/logger";
 import { EmulatorConfig } from "../core/emulator-config-manager";
 import { invalidateIniCache } from "./kernel32/profile";
 import { readAnsiFromGuest, encodeAnsi } from "./codepage-utils";
+import { isUe1RenderProbeCommandLine } from "../runtime/filesystem/ue1-firstrun";
 import { Marshaler } from "../core/memory/marshaler";
 import {
     countPeIcons,
@@ -196,14 +197,28 @@ export class Shell32 implements IModule {
         ): Promise<number> => {
             const launched = await applyShellExecFake(parameters, "SHELL32");
 
+            // UE1's render-device probe, which a bundle need not carry a shellExecFake rule
+            // for: its Detected.ini/Detected.log is materialized reactively at the file-open
+            // layer, so the child's whole observable effect already happens without us
+            // launching anything. Claiming success here is the same honesty rule as below —
+            // the artifact the parent goes on to read does exist.
+            if (!launched && isUe1RenderProbeCommandLine(parameters)) {
+                System.getInstance().scheduler.setLastError(0);
+                Logger.log(
+                    LogCategory.SYSTEM,
+                    `[SHELL32] ${apiName}("${operation}", "${file}", "${parameters}") -> ${SHELL_EXEC_OK} ` +
+                    `(UE1 render-device probe; Detected.* is materialized on open)`
+                );
+                return SHELL_EXEC_OK;
+            }
+
             // Self re-exec: a launcher relaunching its OWN image with a new command line
             // (see System.isSelfImage). The child's whole observable contract is "this
             // program, restarted with these arguments", and that we can reproduce exactly.
             //
-            // Strictly AFTER shellExecFake: a self-launch whose real purpose is a file side
-            // effect is already served by that rule, and restarting for it would relaunch
-            // the game mid-boot forever (UE1 probes its renderer by running its own image
-            // to drop Detected.ini).
+            // Strictly AFTER shellExecFake and the probe: a self-launch whose real purpose is
+            // a file side effect is already served by those, and restarting for it makes the
+            // probe BE the game — a `testrendev=` run inits the renderer, logs, and exits.
             const system = System.getInstance();
             if (!launched && system.isSelfImage(file, directory)
                 && isDifferentCommandLine(parameters, system.executableArgs)

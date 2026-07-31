@@ -47,6 +47,23 @@ export function detectUe1(exists: (guestPath: string) => boolean): boolean {
 }
 
 /**
+ * UE1's render-device probe (pure): the engine tests a renderer by launching its OWN image
+ * with `testrendev=<class> log=Detected.log` (older builds also use `-b false`). The child's
+ * entire contract is the Detected.ini/Detected.log it leaves behind — the parent neither
+ * waits on it nor reads its exit code — so a no-op virtual child plus the reactive
+ * materialization above IS the observable effect.
+ *
+ * It must never be served as a self re-exec. A re-exec restarts the game WITH the probe's
+ * command line, which makes the probe be the game: a `testrendev=` run initializes the
+ * renderer, writes its log and exits, so the title "starts and immediately quits" with a
+ * clean exit(0) and no fault anywhere to point at.
+ */
+export function isUe1RenderProbeCommandLine(commandLine: string): boolean {
+    return /(?:^|\s)testrendev\s*=/i.test(commandLine)
+        || /(?:^|\s)-b\s+false(?:\s|$)/i.test(commandLine);
+}
+
+/**
  * Reactive-handler classification of a requested filename (pure).
  *  - "detected": basename is Detected.ini / Detected.log — materialize empty,
  *    and the containing dir becomes the UE1 user dir.
