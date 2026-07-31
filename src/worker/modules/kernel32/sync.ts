@@ -1686,8 +1686,32 @@ const syncModule = (() => {
         return 0;
     };
 
+    const reset = (): void => {
+        const wheel = cachedScheduler?.timerWheel;
+        for (const timer of waitableTimers.values()) {
+            if (timer.wheelId !== null) {
+                wheel?.cancel(timer.wheelId);
+                timer.wheelId = null;
+            }
+        }
+        waitableTimers.clear();
+        for (const t of timerQueueTimers.values()) {
+            if (t.wheelId !== null) {
+                wheel?.cancel(t.wheelId);
+                t.wheelId = null;
+            }
+        }
+        timerQueueTimers.clear();
+        timerQueueHandles.clear();
+        registeredWaits.clear();
+        ioCompletionAssociations.clear();
+        nextTimerQueueHandle = 0x00060000;
+        nextTimerQueueTimerHandle = 0x00070000;
+    };
+
     return {
         exports,
+        reset,
         registerFastPathSyncFunctions: (dispatcher: any) => {
             if (dispatcher && typeof dispatcher.registerFastPath === 'function') {
                 dispatcher.registerFastPath('kernel32', 'EnterCriticalSection', fastPathEnterCriticalSection);
@@ -1699,3 +1723,7 @@ const syncModule = (() => {
 
 export const registerFastPathSyncFunctions = syncModule.registerFastPathSyncFunctions;
 export const exports: Record<string, ThunkImplementation> = syncModule.exports;
+
+export function resetSyncState(): void {
+    syncModule.reset();
+}

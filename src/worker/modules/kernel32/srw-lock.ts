@@ -26,6 +26,11 @@ export function resetSrwLock(lockPtr: number): void {
     Mem.writeUint32(lockPtr, 0);
 }
 
+/** Drop every host-side SRWLOCK record on game switch (guest memory is rewound). */
+export function resetAllSrwLocks(): void {
+    locks.clear();
+}
+
 function getOrCreate(lockPtr: number): SrwLockState {
     let st = locks.get(lockPtr);
     if (!st) {

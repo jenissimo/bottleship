@@ -2045,6 +2045,9 @@ export class DInput implements IModule {
 
     reset(): void {
         resetLosableDevices();
+        this.savedActionMaps.clear();
+        this.latchedMouseEdges = 0;
+        this.mouseLatchEpoch = 0;
     }
 
     recreateVTables(): void {

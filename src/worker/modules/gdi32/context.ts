@@ -2064,7 +2064,18 @@ export class GDIContext {
         this.hdcCurrentPos.clear();
         this.stockObjects.clear();
         this.linkedSurfaces.clear();
-        this.colorCache.clear(); // Clear color cache on reset
+        this.colorCache.clear();
+        this.fontCache.clear();
+        this.handleRefs.clear();
+        for (const bm of this.bitmapImageBitmapReady.values()) {
+            try { bm.close(); } catch { /* ImageBitmap may already be closed */ }
+        }
+        this.bitmapImageBitmapReady.clear();
+        this.bitmapImageBitmapCache.clear();
+        this.bitmapDCCache.clear();
+        this.bitmapVersions.clear();
+        this.dcBitmapSyncState.clear();
+        this.windowClientBacking.clear();
         this.nextHdc = 0x20000;
         this.nextHgdiobj = 0x30000;
         this.clearOverlay();

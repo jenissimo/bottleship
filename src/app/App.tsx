@@ -1969,6 +1969,13 @@ export default function App() {
       setErrorMessage(null); // Clear any previous errors
       setExitInfo(null); // Fresh load supersedes a prior exit/crash overlay
       setBundleDisplayName(null);
+      document.title = "BottleShip";
+      // Drop the previous PE's favicon until the next window_icon arrives.
+      const iconLink = document.querySelector<HTMLLinkElement>("link[rel~='icon']");
+      if (iconLink) {
+        if (iconLink.href.startsWith("blob:")) URL.revokeObjectURL(iconLink.href);
+        iconLink.removeAttribute("href");
+      }
       audioEngine?.stopAll(); // Silence stale ring buffers from the previous game
       if (!globalWorker) {
         console.error("BottleShip: Worker not initialized");

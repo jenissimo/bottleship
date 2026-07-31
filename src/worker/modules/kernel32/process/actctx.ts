@@ -78,6 +78,13 @@ let nextActCtxCookie = 1;
 /** Per-thread activation stack top frames: tid -> { cookie, handle }[] */
 const threadActCtxFrames = new Map<number, Array<{ cookie: number; handle: number }>>();
 
+export function resetActCtxState(): void {
+    contextsByHandle.clear();
+    processDefaultActCtx = null;
+    nextActCtxCookie = 1;
+    threadActCtxFrames.clear();
+}
+
 const ASSEMBLY_DLL_MAP: Record<string, string[]> = {
     'microsoft.windows.common-controls': ['comctl32.dll'],
     'microsoft.vc90.crt': ['msvcr90.dll'],

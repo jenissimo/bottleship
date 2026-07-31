@@ -1246,6 +1246,8 @@ const prepareFullGameSwitch = async (): Promise<void> => {
   if (gameSessionActive) {
     Logger.log(LogCategory.SYSTEM, "[GameSwitch] full reset before loading new game");
   }
+  __wasmTrapReported = false;
+  gdiPresentDiagLogged = false;
   _prefetchController?.abort();
   _prefetchController = null;
   WgbCache.releaseMountedSource();

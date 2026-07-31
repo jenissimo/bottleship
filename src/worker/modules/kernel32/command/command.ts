@@ -23,6 +23,13 @@ function ensureCommandLineAllocated(): void {
     cmdLineAddrW = memory.alloc(CMD_LINE_BUF_SIZE_W, "THUNK_DATA", "rw");
 }
 
+/** Drop guest command-line buffers — THUNK_DATA is rewound on Process.reset(). */
+export function resetCommandLineState(): void {
+    cmdLineAddrA = 0;
+    cmdLineAddrW = 0;
+    lastExeName = "";
+}
+
 function initCommandLine(mem: Uint8Array): void {
     const system = System.getInstance();
     const exeName = system.executableName;

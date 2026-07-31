@@ -632,6 +632,11 @@ export class EmulatorConfig {
         this.createDirs = [];
         this.ue1 = false;
         this.ue1UserDir = null;
+        // Manifest-only when present: without this, a CP1251/non-US title leaves its
+        // ACP/OEMCP/LCID for the next Western title that omits those fields.
+        this.ansiCodePage = 1252;
+        this.oemCodePage = 437;
+        this.lcid = 0x0409;
         // hleLibs intentionally NOT reset — it's a dev/debug toggle that the
         // user flips once (hleEnable) and expects to persist across loadApp.
         // A per-game manifest could still opt-in via applyFromManifest later.

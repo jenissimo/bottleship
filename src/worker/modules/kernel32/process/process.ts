@@ -63,6 +63,13 @@ interface ToolhelpSnapshot {
 /** Active snapshots keyed by handle. Cleaned up on access if handle was closed. */
 const toolhelpSnapshots = new Map<number, ToolhelpSnapshot>();
 
+export function resetProcessApiState(): void {
+    currentPriorityClass = NORMAL_PRIORITY_CLASS;
+    threadExecutionState = 0x80000000;
+    toolhelpSnapshots.clear();
+    virtualProcessMemoryByPid.clear();
+}
+
 function getSnapshot(handle: number): ToolhelpSnapshot | null {
     const snap = toolhelpSnapshots.get(handle);
     if (snap) return snap;

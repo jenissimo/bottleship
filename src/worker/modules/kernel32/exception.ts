@@ -45,6 +45,11 @@ const getPointerCookie = (): number => {
     return pointerCookie;
 };
 
+/** New process ⇒ fresh EncodePointer cookie (Process.reset reuses the Process object). */
+export function resetPointerCookie(): void {
+    pointerCookie = 0;
+}
+
 // Well-known NTSTATUS exception codes
 const EXCEPTION_CODE_NAMES: Record<number, string> = {
     0xC0000005: 'ACCESS_VIOLATION',

@@ -676,6 +676,11 @@ export class Msvcrt implements IModule {
         this.handleFds.clear();
         this.fdNext = 3;
         this.crtAllocations.clear();
+        this.appType = 0;
+        this.userMathErrHandler = 0;
+        this.controlFpWord = 0x0009001f;
+        this.currentLocale = "C";
+        this.localeAddr = 0;
         if (this.errnoAddr) {
             Mem.writeUint32(this.errnoAddr, 0);
         }
@@ -714,6 +719,7 @@ export class Msvcrt implements IModule {
         this.adjustFdivAddr = 0;
         this.qsortCodeAddr = 0;
         this.bsearchCodeAddr = 0;
+        this.localeAddr = 0;
 
         this.ensureRuntimeStorage();
         this.registerDataExports();

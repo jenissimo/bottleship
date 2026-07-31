@@ -950,7 +950,12 @@ export class Process {
         if (mem) {
             const totalMemory = Math.min(EMU_MEMORY_SIZE, mem.length);
             // Clear HEAP, THUNK regions, and also LOW_MEM to remove any stale spin loops
-            const clearKinds = new Set<RegionKind>(["LOW_MEM", "HEAP", "THUNK_CODE", "CALLBACK_STUB", "SPIN_LOOP", "THUNK_DATA"]);
+            // SURFACE/ROM too: region buckets are rebuilt empty, but mem8 bytes linger
+            // across an in-worker game switch (stale pixels / residual image bytes).
+            const clearKinds = new Set<RegionKind>([
+                "LOW_MEM", "HEAP", "THUNK_CODE", "CALLBACK_STUB", "SPIN_LOOP", "THUNK_DATA",
+                "SURFACE", "ROM",
+            ]);
             const regions = this.addressSpace.getRegions();
             for (const region of regions) {
                 if (!clearKinds.has(region.kind)) continue;

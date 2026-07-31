@@ -885,4 +885,24 @@ export class Bass implements IModule {
             self.postMessage(msg);
         }
     }
+
+    reset(): void {
+        for (const stream of this.streams.values()) {
+            if (stream.isPlaying) {
+                this.postMessage({ type: "audio_stop", payload: { id: stream.id } });
+            }
+        }
+        for (const sch of this.sampleChannels.values()) {
+            if (sch.isPlaying) {
+                this.postMessage({ type: "audio_stop", payload: { id: sch.audioId } });
+            }
+        }
+        this.streams.clear();
+        this.samples.clear();
+        this.sampleChannels.clear();
+        this.samplePayloadCache.clear();
+        this.nextId = 0xB0000;
+        this.defaultFreq = 44100;
+        this.globalPaused = false;
+    }
 }

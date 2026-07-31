@@ -30,6 +30,7 @@ import { libHleManager } from "./hle-lib/lib-hle-manager";
 import { hookRegistry } from "./hooks";
 import { resetSehDispatchState } from "./seh-dispatch";
 import { namedObjects } from "../modules/kernel32/named-objects";
+import { hypercallDataManager } from "./cpu/hypercall-data";
 
 /**
  * The crash payload posted to the host (`process_exit{crashed:true, fault}`) and
@@ -787,7 +788,14 @@ export class System {
         videoEngine.closeAll();
         libHleManager.resetOnGameSwitch();
         hookRegistry.reset();
+        // Flush deferred destroys (return-to-pool), then wipe the pool — sizes/formats
+        // from game A must not be handed to game B. clear() alone would drop the pending
+        // queue without destroying those textures.
         this.gpuResourceManager?.flushPendingDestruction();
+        this.gpuResourceManager?.clear();
+        hypercallDataManager.resetDispatchTable();
+        // PE-loader TLS templates are guest VAs that die with Process.reset().
+        this.implicitTlsEntries = [];
 
         // Stop and restart v86 if running to fully reset CPU/MMU/JIT state
         if (this.process?.v86) {

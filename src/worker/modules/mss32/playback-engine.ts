@@ -72,6 +72,13 @@ function releaseRingBuffer(id: number): void {
     }
 }
 
+/** Unregister every Miles ring buffer — required on in-worker game switch. */
+export function resetMssRingBuffers(): void {
+    for (const id of [...ringBuffers.keys()]) {
+        releaseRingBuffer(id);
+    }
+}
+
 /** Convert Miles 0-127 volume to DirectSound centibels (-10000..0) */
 function volumeToCentibels(vol127: number): number {
     const linear = vol127 / 127.0;

@@ -1334,4 +1334,16 @@ export class BinkW32 implements IModule {
         this.exports["_BinkGetError@0"]      = (_ctx, _mem, _args) => { console.log(`[BINK] BinkGetError() → null`); return 0; };
         this.exports["_BinkLogoAddress@0"]   = (_ctx, _mem, _args) => 0;
     }
+
+    reset(): void {
+        // Engines already closed by System.reset → videoEngine.closeAll().
+        this.sessions.clear();
+        this.binkBuffers.clear();
+        this.apiCallLog.clear();
+        this.lastSurfaceBpp = 0;
+        this.layout = BINK_LAYOUT_DEFAULT;
+        this.layoutResolved = false;
+        this.nextBufferHandle = 0x7800;
+        this.pendingIoSize = 0;
+    }
 }

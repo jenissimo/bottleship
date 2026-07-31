@@ -221,5 +221,6 @@ export function resetD3D8SharedState(): void {
     deviceBackBufferSurfaces.clear();
     deviceRenderTargetOverride.clear();
     deviceWindowed.clear();
+    deviceCreationParams.clear();
     comRefCounts.clear();
 }

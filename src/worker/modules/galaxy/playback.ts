@@ -83,3 +83,10 @@ export function handleAudioEnded(id: number): void {
         ringBuffers.delete(id);
     }
 }
+
+/** Stop every host ring buffer — required on in-worker game switch. */
+export function resetGalaxyPlayback(): void {
+    for (const id of [...ringBuffers.keys()]) {
+        stopGalaxyAudio(id);
+    }
+}

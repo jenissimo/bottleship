@@ -30,9 +30,11 @@ const CIMMPROJECT_SIZE = 0x10; // 16 bytes
 export class IFC20 implements IModule {
     name = 'ifc20';
     exports: Record<string, ThunkImplementation> = {};
+    private process!: Process;
     private mouseVtableAddr = 0;
 
     initialize(process: Process): void {
+        this.process = process;
         this.setupVtable(process);
         this.registerExports(process);
     }
@@ -175,5 +177,9 @@ export class IFC20 implements IModule {
 
     reset(): void {
         this.mouseVtableAddr = 0;
+    }
+
+    recreateVTables(): void {
+        if (this.process) this.setupVtable(this.process);
     }
 }

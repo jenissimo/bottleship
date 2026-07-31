@@ -18,6 +18,10 @@ type IniData = Map<string, Map<string, string>>;
 // Cache: normalized file path -> parsed data
 const iniCache = new Map<string, IniData>();
 
+export function resetIniCache(): void {
+    iniCache.clear();
+}
+
 /**
  * Invalidate cached INI data for a specific file path.
  * Called when shellExecFake writes a new INI file that was previously cached as empty.

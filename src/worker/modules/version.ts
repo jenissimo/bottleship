@@ -389,5 +389,16 @@ export class Version implements IModule {
             this.exports["GetFileVersionInfoSizeA"]!(ctx, mem, [args[1], args[2]]);
     }
 
-    reset(): void {}
+    reset(): void {
+        this.versionStrBufA = 0;
+        this.versionStrBufW = 0;
+        this.versionTranslationBuf = 0;
+    }
+
+    reregisterExports(process: Process): void {
+        this.process = process;
+        this.versionStrBufA = process.memory.alloc(VERSION_STR_BUF_A_SIZE, "THUNK_DATA", "rw");
+        this.versionStrBufW = process.memory.alloc(VERSION_STR_BUF_W_SIZE, "THUNK_DATA", "rw");
+        this.versionTranslationBuf = process.memory.alloc(VERSION_TRANSLATION_BUF_SIZE, "THUNK_DATA", "rw");
+    }
 }

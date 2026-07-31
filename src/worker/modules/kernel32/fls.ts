@@ -19,10 +19,25 @@ const valuesByThread = new Map<number, Map<number, number>>();
 let nextSlot = 1;
 let flsOwnerProcess: unknown = null;
 
+let flsOwnerResetGeneration = -1;
+
 function ensureProcessLocalFls(): void {
     const process = System.getInstance().process;
-    if (process === flsOwnerProcess) return;
+    // Process.reset() reuses the same Process object — key on resetGeneration too.
+    const gen = process?.resetGeneration ?? 0;
+    if (process === flsOwnerProcess && gen === flsOwnerResetGeneration) return;
     flsOwnerProcess = process;
+    flsOwnerResetGeneration = gen;
+    allocated.clear();
+    valuesByThread.clear();
+    nextSlot = 1;
+    hypercallDataManager.clearFlsSlots();
+}
+
+/** Explicit clear for System.reset → Kernel32.reset (before resetGeneration bumps). */
+export function resetFlsState(): void {
+    flsOwnerProcess = null;
+    flsOwnerResetGeneration = -1;
     allocated.clear();
     valuesByThread.clear();
     nextSlot = 1;

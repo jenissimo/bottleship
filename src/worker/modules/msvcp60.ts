@@ -44,15 +44,82 @@ export class Msvcp60 implements IModule {
 
     private heap!: CppStringHeap;
     private msvcrt!: Msvcrt;
+    private process!: Process;
     private nullstrAddr = 0;
     private nposAddr = 0;
     private refcntAddr = 0;
+    private logicErrorVtableAddr = 0;
 
     setMsvcrt(msvcrt: Msvcrt): void {
         this.msvcrt = msvcrt;
     }
 
+    private ensureRuntimeStorage(process: Process): void {
+        if (this.nullstrAddr === 0) {
+            this.nullstrAddr = process.memory.alloc(1, "THUNK_DATA", "rw");
+            Mem.writeBytes(this.nullstrAddr, new Uint8Array([0]));
+        }
+        if (this.nposAddr === 0) {
+            this.nposAddr = process.memory.alloc(4, "THUNK_DATA", "rw");
+            Mem.writeUint32(this.nposAddr, 0xffffffff);
+        }
+        // Shared "unshared" refcount cell for _Refcnt(_Ptr) — our basic_string never shares a
+        // buffer across instances (every ctor/assign does a real copy), so it always reads 1.
+        if (this.refcntAddr === 0) {
+            this.refcntAddr = process.memory.alloc(2, "THUNK_DATA", "rw");
+            Mem.writeUint16(this.refcntAddr, 1);
+        }
+        if (this.logicErrorVtableAddr === 0) {
+            const tg = process.thunkGenerator;
+            const retStubAddr = process.memory.alloc(1, "THUNK_CODE", "rx");
+            Mem.writeBytes(retStubAddr, new Uint8Array([0xc3]));
+
+            const outOfRangeVtableAddr = process.memory.alloc(16, "THUNK_DATA", "rw");
+            Mem.writeUint32(outOfRangeVtableAddr + 0, 0);
+            Mem.writeUint32(outOfRangeVtableAddr + 4, retStubAddr);
+            Mem.writeUint32(outOfRangeVtableAddr + 8, retStubAddr);
+            Mem.writeUint32(outOfRangeVtableAddr + 12, retStubAddr);
+            tg?.registerDataExport?.(this.name, "??_7out_of_range@std@@6B@", outOfRangeVtableAddr);
+
+            const runtimeErrorVtableAddr = process.memory.alloc(16, "THUNK_DATA", "rw");
+            Mem.writeUint32(runtimeErrorVtableAddr + 0, 0);
+            Mem.writeUint32(runtimeErrorVtableAddr + 4, retStubAddr);
+            Mem.writeUint32(runtimeErrorVtableAddr + 8, retStubAddr);
+            Mem.writeUint32(runtimeErrorVtableAddr + 12, retStubAddr);
+            tg?.registerDataExport?.(this.name, "??_7runtime_error@std@@6B@", runtimeErrorVtableAddr);
+
+            // logic_error's real primary ctor needs a working what():
+            // `mov eax, [ecx+4]; ret` returns the object's stored message pointer.
+            const whatStubAddr = process.memory.alloc(4, "THUNK_CODE", "rx");
+            Mem.writeBytes(whatStubAddr, new Uint8Array([0x8b, 0x41, 0x04, 0xc3]));
+
+            this.logicErrorVtableAddr = process.memory.alloc(16, "THUNK_DATA", "rw");
+            Mem.writeUint32(this.logicErrorVtableAddr + 0, whatStubAddr);
+            Mem.writeUint32(this.logicErrorVtableAddr + 4, whatStubAddr);
+            Mem.writeUint32(this.logicErrorVtableAddr + 8, whatStubAddr);
+            Mem.writeUint32(this.logicErrorVtableAddr + 12, whatStubAddr);
+            tg?.registerDataExport?.(this.name, "??_7logic_error@std@@6B@", this.logicErrorVtableAddr);
+        }
+    }
+
+    private registerDataExports(process: Process): void {
+        const tg = process.thunkGenerator;
+        tg?.registerDataExport?.(this.name, `?npos@${BS}@@2IB`, this.nposAddr);
+        tg?.registerDataExport?.(this.name, `?_C@?1??_Nullstr@${BS}@@CAPBDXZ@4DB`, this.nullstrAddr);
+    }
+
+    reregisterExports(process: Process): void {
+        this.process = process;
+        this.nullstrAddr = 0;
+        this.nposAddr = 0;
+        this.refcntAddr = 0;
+        this.logicErrorVtableAddr = 0;
+        this.ensureRuntimeStorage(process);
+        this.registerDataExports(process);
+    }
+
     initialize(process: Process): void {
+        this.process = process;
         const msvcrt = this.msvcrt;
         this.heap = {
             alloc: (n) => {
@@ -65,50 +132,8 @@ export class Msvcp60 implements IModule {
             },
         };
 
-        this.nullstrAddr = process.memory.alloc(1, "THUNK_DATA", "rw");
-        Mem.writeBytes(this.nullstrAddr, new Uint8Array([0]));
-
-        this.nposAddr = process.memory.alloc(4, "THUNK_DATA", "rw");
-        Mem.writeUint32(this.nposAddr, 0xffffffff);
-
-        // Shared "unshared" refcount cell for _Refcnt(_Ptr) — our basic_string never shares a
-        // buffer across instances (every ctor/assign does a real copy), so it always reads 1.
-        this.refcntAddr = process.memory.alloc(2, "THUNK_DATA", "rw");
-        Mem.writeUint16(this.refcntAddr, 1);
-
-        const tg = process.thunkGenerator;
-        tg?.registerDataExport?.(this.name, `?npos@${BS}@@2IB`, this.nposAddr);
-        tg?.registerDataExport?.(this.name, `?_C@?1??_Nullstr@${BS}@@CAPBDXZ@4DB`, this.nullstrAddr);
-
-        const retStubAddr = process.memory.alloc(1, "THUNK_CODE", "rx");
-        Mem.writeBytes(retStubAddr, new Uint8Array([0xc3]));
-
-        const outOfRangeVtableAddr = process.memory.alloc(16, "THUNK_DATA", "rw");
-        Mem.writeUint32(outOfRangeVtableAddr + 0, 0);
-        Mem.writeUint32(outOfRangeVtableAddr + 4, retStubAddr);
-        Mem.writeUint32(outOfRangeVtableAddr + 8, retStubAddr);
-        Mem.writeUint32(outOfRangeVtableAddr + 12, retStubAddr);
-        tg?.registerDataExport?.(this.name, "??_7out_of_range@std@@6B@", outOfRangeVtableAddr);
-
-        const runtimeErrorVtableAddr = process.memory.alloc(16, "THUNK_DATA", "rw");
-        Mem.writeUint32(runtimeErrorVtableAddr + 0, 0);
-        Mem.writeUint32(runtimeErrorVtableAddr + 4, retStubAddr);
-        Mem.writeUint32(runtimeErrorVtableAddr + 8, retStubAddr);
-        Mem.writeUint32(runtimeErrorVtableAddr + 12, retStubAddr);
-        tg?.registerDataExport?.(this.name, "??_7runtime_error@std@@6B@", runtimeErrorVtableAddr);
-
-        // logic_error's real primary ctor (from a std::string message) is implemented below,
-        // so unlike out_of_range/runtime_error (copy-ctor-only stubs above) its vtable needs a
-        // working what(): `mov eax, [ecx+4]; ret` returns the object's stored message pointer.
-        const whatStubAddr = process.memory.alloc(4, "THUNK_CODE", "rx");
-        Mem.writeBytes(whatStubAddr, new Uint8Array([0x8b, 0x41, 0x04, 0xc3]));
-
-        const logicErrorVtableAddr = process.memory.alloc(16, "THUNK_DATA", "rw");
-        Mem.writeUint32(logicErrorVtableAddr + 0, whatStubAddr);
-        Mem.writeUint32(logicErrorVtableAddr + 4, whatStubAddr);
-        Mem.writeUint32(logicErrorVtableAddr + 8, whatStubAddr);
-        Mem.writeUint32(logicErrorVtableAddr + 12, whatStubAddr);
-        tg?.registerDataExport?.(this.name, "??_7logic_error@std@@6B@", logicErrorVtableAddr);
+        this.ensureRuntimeStorage(process);
+        this.registerDataExports(process);
 
         const nullstr = () => this.nullstrAddr;
         const heap = this.heap;
@@ -284,7 +309,7 @@ export class Msvcp60 implements IModule {
                 for (let i = 0; i <= len; i++) {
                     Mem.writeUint8(msgAddr + i, Mem.readUint8(cstr + i) ?? 0);
                 }
-                Mem.writeUint32(obj + 0, logicErrorVtableAddr);
+                Mem.writeUint32(obj + 0, this.logicErrorVtableAddr);
                 Mem.writeUint32(obj + 4, msgAddr);
                 Mem.writeUint32(obj + 8, 1); // _Dofree
                 return obj;

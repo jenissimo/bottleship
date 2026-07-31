@@ -2049,10 +2049,12 @@ export class WinMM implements IModule {
             }
         }
         // Stop any per-device waveOut completion pollers (wheel entries) so a reset
-        // doesn't leak a poller bound to a stale device.
+        // doesn't leak a poller bound to a stale device, then drop the devices —
+        // handle tables recycle and a stale WaveOutDevice would alias the next open.
         for (const device of this.waveOutDevices.values()) {
             this.stopCompletionPoller(device);
         }
+        this.waveOutDevices.clear();
         this.timers.clear();
         this.pendingTimerCallbacks.length = 0;
         this.pendingTimerHead = 0;
@@ -2070,6 +2072,7 @@ export class WinMM implements IModule {
             if (mmio.guestBuffer) mem?.free(mmio.guestBuffer);
         }
         this.mmioHandles.clear();
+        this.stopPlaySound();
         this.mci?.reset();
         resetWinmmJoystick();
     }

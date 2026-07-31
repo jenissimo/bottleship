@@ -1124,6 +1124,27 @@ export class Ole32 implements IModule {
         Logger.log(LogCategory.COM, `Blowfish: created object at 0x${objAddr.toString(16)}`);
         return objAddr;
     }
+
+    /**
+     * Drop process-scoped COM apartment / object maps before Process.reset() rewinds
+     * THUNK_CODE. Stubs are regenerated in recreateVTables() after the new layout exists.
+     */
+    reset(): void {
+        comInitialized.clear();
+        this.objectAddressMap.clear();
+        this.classRegistrations.clear();
+        this.nextClassRegistration = 0x1000;
+        this.blowfishInstances.clear();
+        this.blowfishVtableAddr = 0;
+        this.messageFilter = 0;
+        this.iunknownStubs = null;
+        this.guidState = 0xa341316c;
+        this.guidCounter = 1;
+    }
+
+    recreateVTables(): void {
+        this.createIUnknownStubs();
+    }
 }
 
 // ---- Blowfish State ----

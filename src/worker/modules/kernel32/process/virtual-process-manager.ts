@@ -478,6 +478,23 @@ class VirtualProcessManager {
         }
         return list;
     }
+
+    /** Drop every virtual child process/thread on game switch. */
+    reset(): void {
+        for (const thread of this.threadsByHandle.values()) {
+            if (thread.autoExitTimerId !== null) {
+                clearTimeout(thread.autoExitTimerId);
+                thread.autoExitTimerId = null;
+            }
+        }
+        this.processesByHandle.clear();
+        this.processesByPid.clear();
+        this.threadsByHandle.clear();
+        this.threadsByTid.clear();
+        this.nextPid = 5000;
+        this.nextTid = 0x100000;
+        this.currentProcessHandle = 0;
+    }
 }
 
 const virtualProcessManager = new VirtualProcessManager();

@@ -855,17 +855,28 @@ export class DDraw implements IModule {
             }
             this.context.nextTextureHandle = this.context.defaults.nextTextureHandleStart;
             
-            // Reset executor state if present (cleanup depth buffers, etc.)
+            // Rebuild the GPU executor — pipeline/depth/texture caches are keyed for one
+            // title's working set and must not survive an in-worker game switch.
             if (this.context.executor) {
-                // Executor cleanup is handled by its own destroy/reset methods if needed
-                // For now, just log - executor state is usually tied to surfaces which are reset above
-                Logger.verbose(LogCategory.DDRAW, 'DDraw.reset: Executor state should be reset via surface cleanup');
+                const backend = this.context.backend;
+                try {
+                    this.context.executor.destroy();
+                } catch (e) {
+                    Logger.warn(LogCategory.DDRAW, `DDraw.reset: executor.destroy failed: ${e}`);
+                }
+                this.context.executor = backend ? new DDrawWebGPUExecutor(backend) : undefined;
             }
             
             // Reset cooperative level
             this.context.cooperative.hwnd = 0;
             this.context.cooperative.flags = 0;
             this.context.cooperative.exclusive = false;
+
+            this.context.deferredUploadManager.clear();
+            this.context.ddraw7ObjectAddr = 0;
+            this.context.gdiSurfaceVisible = true;
+            this.context.suppressPresent = false;
+            delete this.context.gammaRamp;
         }
         
         // Clear texture cache on reset

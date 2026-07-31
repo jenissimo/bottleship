@@ -264,7 +264,7 @@ async function tryUe1FirstRunMaterialize(
     return await materialize(full, new TextEncoder().encode(pinned), 'System\\Default.ini (engine-pinned)');
 }
 
-export const exports: Record<string, ThunkImplementation> = (() => {
+const fileIoModule = (() => {
     const exports: Record<string, ThunkImplementation> = {};
     const SET_FILE_POINTER_LOG_FIRST_N = 8;
     const SET_FILE_POINTER_LOG_SAMPLE_EVERY = 512;
@@ -2273,8 +2273,24 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         return 0;
     };
 
-    return exports;
+    const reset = (): void => {
+        namedFileMappings.clear();
+        fileMappingViews.clear();
+        readFileFirstLogged.clear();
+        readFileLastThread.clear();
+        shortReadLogCount = 0;
+        sharedHandleLogCount = 0;
+        setFilePointerCallCounts.clear();
+    };
+
+    return { exports, reset };
 })();
+
+export const exports: Record<string, ThunkImplementation> = fileIoModule.exports;
+
+export function resetFileIoState(): void {
+    fileIoModule.reset();
+}
 
 /**
  * Register fast-path implementations for high-frequency file I/O.

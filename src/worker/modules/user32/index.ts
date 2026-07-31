@@ -19,6 +19,9 @@ import { resetDeviceNotifications } from './device-notify';
 import { resetHooks } from './hooks';
 import { resetOwnerDrawScratch } from './owner-draw';
 import { resetSystemCursorHandles } from './system-cursors';
+import { resetMenuState } from './menu';
+import { resetScrollState } from './scroll-state';
+import { resetControlInteractionState } from './control-interaction';
 
 export class User32 implements IModule {
     name = 'user32';
@@ -49,5 +52,8 @@ export class User32 implements IModule {
         resetOwnerDrawScratch();
         resetHooks();
         resetDeviceNotifications();
+        resetMenuState();
+        resetScrollState();
+        resetControlInteractionState();
     }
 }

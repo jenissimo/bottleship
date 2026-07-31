@@ -1383,4 +1383,26 @@ export class SmackW32 implements IModule {
             return 0;
         };
     }
+
+    reset(): void {
+        // Engines already closed by System.reset → videoEngine.closeAll(); drop host maps
+        // so reused guest VAs cannot resolve to a previous session.
+        this.sessions.clear();
+        this.smackBuffers.clear();
+        this.loggedUnknownHandles.clear();
+        this.soundDriverSet = false;
+        this.fakeHandle = 0;
+    }
+
+    reregisterExports(process: Process): void {
+        this.process = process;
+        this.fakeHandle = process.memory.alloc(SMACK_STRUCT_SIZE);
+        const mem = this.getMemory();
+        if (mem) {
+            mem.fill(0, this.fakeHandle, this.fakeHandle + SMACK_STRUCT_SIZE);
+            mem[this.fakeHandle + 0] = 0x53; mem[this.fakeHandle + 1] = 0x4D;
+            mem[this.fakeHandle + 2] = 0x4B; mem[this.fakeHandle + 3] = 0x32;
+            this.writeU32(mem, this.fakeHandle + 12, 1);
+        }
+    }
 }

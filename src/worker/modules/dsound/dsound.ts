@@ -2844,6 +2844,15 @@ export class DSound implements IModule {
         this.primaryBufferPtr = 0;
         this.speakerConfig = DEFAULT_SPEAKER_CONFIG;
         this.nextBufferId = DSOUND_AUDIO_ID_BASE;
+        this.listenerState = {
+            posX: 0, posY: 0, posZ: 0,
+            velX: 0, velY: 0, velZ: 0,
+            frontX: 0, frontY: 0, frontZ: 1,
+            topX: 0, topY: 1, topZ: 0,
+            distanceFactor: 1.0, rolloffFactor: 1.0, dopplerFactor: 1.0,
+        };
+        this.deferredListenerState = null;
+        this.flushListenerToSab();
     }
 
     recreateVTables(): void {

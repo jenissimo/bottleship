@@ -7,7 +7,7 @@ import { TimerKind } from "../../core/scheduler/types";
 import { TimeService } from "../../runtime/time";
 import { MSSContext, createMSSContext, SMP_DONE, SMP_PLAYING } from "./context";
 import { finishSamplePlayback, getBytesPerSecond, getPlaybackLengthBytes, setSampleStatus, setStreamStatus, writeSamplePosition, writeStreamPosition, stopHeartbeat } from "./helpers";
-import { updateEmulatorState, playSample, appendDecodedChunk } from "./playback-engine";
+import { updateEmulatorState, playSample, appendDecodedChunk, resetMssRingBuffers } from "./playback-engine";
 import { invokeEOSCallback } from "./callbacks";
 import { convertToFloat } from "./audio-decode";
 import { createCoreExports } from "./core";
@@ -261,6 +261,7 @@ export class MSS32 implements IModule {
         ctx.pendingTimerCallbacks.length = 0;
         ctx.pendingEOSCallbacks.length = 0;
         ctx.insideAilServe = false;
+        resetMssRingBuffers();
         ctx.samples.clear();
         ctx.samplesById.clear();
         ctx.streams.clear();

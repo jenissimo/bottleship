@@ -162,6 +162,10 @@ export function isConsoleDeviceHandle(handle: any): handle is ConsoleDeviceHandl
 
 const consoleModeByHandle = new Map<number, number>();
 
+export function resetConsoleModeState(): void {
+    consoleModeByHandle.clear();
+}
+
 const resolveConsoleOutputBuffer = (hConsoleOutput: number): ConsoleScreenBuffer => {
     const direct = consoleScreenBuffers.resolveOutputHandle(hConsoleOutput);
     if (direct) return direct;

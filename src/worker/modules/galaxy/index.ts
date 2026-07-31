@@ -6,7 +6,7 @@ import type { LoadedPEModule } from '../../core/module-registry';
 import { createGalaxyContext, type GalaxyContext } from './context';
 import { createGalaxyHandlers } from './handlers';
 import { patchGalaxyNativeModule, shouldPatchGalaxyNative } from './native-patch';
-import { handleAudioEnded } from './playback';
+import { handleAudioEnded, resetGalaxyPlayback } from './playback';
 import { probeGalaxyMixerKernels } from './mixer-probe';
 
 export class Galaxy implements IModule {
@@ -22,6 +22,13 @@ export class Galaxy implements IModule {
         this.ctx = createGalaxyContext(process);
         this.exports = createGalaxyHandlers(this.ctx);
         Logger.log(LogCategory.SYSTEM, `[Galaxy] module initialized (${Object.keys(this.exports).length} handlers)`);
+    }
+
+    reset(): void {
+        resetGalaxyPlayback();
+        // Handlers close over the ctx object — mutate in place, do not replace.
+        const process = this.ctx.process;
+        Object.assign(this.ctx, createGalaxyContext(process));
     }
 
     /** Called from pe-loader after native Galaxy.dll is registered. */

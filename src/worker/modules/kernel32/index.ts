@@ -1,29 +1,35 @@
-// Auto-generated index for kernel32 module
-// This file aggregates all atomic implementations
-// Generated from directory scan: src/worker/modules/kernel32
+// Custom index for kernel32 module.
+// Export aggregation matches the generated style, but reset orchestration is
+// hand-maintained: process-scoped state lives across many atomic files and must
+// clear on an in-worker game switch (Process object is reused).
 
 import { IModule } from '../../core/module';
 import { Process } from '../../core/process';
 import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 
-import { exports as atom } from './atom';
-import { exports as command } from './command/command';
+import { exports as atom, resetAtomTable } from './atom';
+import { exports as command, resetCommandLineState } from './command/command';
 import { exports as environment } from './environment';
 import { exports as error } from './error';
-import { exports as exception } from './exception';
-import { exports as file_io } from './file-io';
-import { exports as fls } from './fls';
+import { exports as exception, resetPointerCookie } from './exception';
+import { exports as file_io, resetFileIoState } from './file-io';
+import { exports as fls, resetFlsState } from './fls';
 import { exports as locale } from './locale';
 import { exports as memory } from './memory';
 import { exports as module } from './module/module';
-import { exports as process_ } from './process/process';
-import { exports as profile } from './profile';
-import { exports as resource } from './resource';
-import { exports as sync } from './sync';
+import { exports as process_, resetProcessApiState } from './process/process';
+import { exports as profile, resetIniCache } from './profile';
+import { exports as resource, resetResourceCache } from './resource';
+import { exports as sync, resetSyncState } from './sync';
 import { exports as time } from './time/time';
 import { exports as tls } from './tls';
 import { exports as util } from './util';
 import { exports as vista_runtime } from './vista-runtime';
+import { resetActCtxState } from './process/actctx';
+import { getVirtualProcessManager } from './process/virtual-process-manager';
+import { resetAllSrwLocks } from './srw-lock';
+import { consoleScreenBuffers } from './console-screen-buffer';
+import { resetConsoleModeState } from './file-io-console';
 
 export class Kernel32 implements IModule {
     name = 'kernel32';
@@ -66,5 +72,22 @@ export class Kernel32 implements IModule {
         Object.assign(this.exports, util);
         // vista-runtime functions
         Object.assign(this.exports, vista_runtime);
+    }
+
+    reset(): void {
+        resetAtomTable();
+        resetCommandLineState();
+        resetPointerCookie();
+        resetFileIoState();
+        resetFlsState();
+        resetProcessApiState();
+        resetIniCache();
+        resetResourceCache();
+        resetSyncState();
+        resetActCtxState();
+        getVirtualProcessManager().reset();
+        resetAllSrwLocks();
+        consoleScreenBuffers.reset();
+        resetConsoleModeState();
     }
 }

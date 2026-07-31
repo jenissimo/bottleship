@@ -62,6 +62,11 @@ interface ResourceEntry {
 const resourceCache: Map<number, ResourceEntry> = new Map();
 let nextResourceHandle = 0x80000001;
 
+export function resetResourceCache(): void {
+    resourceCache.clear();
+    nextResourceHandle = 0x80000001;
+}
+
 /**
  * Parse PE resource directory to find a specific resource
  */

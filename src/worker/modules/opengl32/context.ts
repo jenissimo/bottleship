@@ -5,7 +5,7 @@
 
 import { Process } from "../../core/process";
 import { WebGPUBackend } from "../../backends/webgpu/webgpu-backend";
-import { GLCvaState, createCvaState, cvaUnlock } from "./client-arrays";
+import { GLCvaState, createCvaState } from "./client-arrays";
 import { GL_MODELVIEW, GL_LESS, GL_ONE, GL_ZERO, GL_ALWAYS, GL_BACK, GL_CCW, GL_SMOOTH,
          GL_FILL, GL_LINEAR, GL_MODULATE, GL_NEAREST, GL_REPEAT, GL_TEXTURE0,
          GL_EYE_LINEAR } from "./constants";
@@ -665,18 +665,21 @@ export function createOpenGLContext(process: Process): OpenGLContext {
 }
 
 export function resetOpenGLContext(ctx: OpenGLContext): void {
-    ctx.error = 0;
-    ctx.commands.reset();
-    ctx.vertArena.reset();
-    cvaUnlock(ctx);
-    ctx.textures.clear();
-    ctx.displayLists.clear();
-    ctx.compilingList = null;
-    ctx.compilingCommands = [];
-    ctx.replayingList = false;
-    ctx.nextTextureId = 1;
-    ctx.nextListId = 1;
-    ctx.frameSnapshot = { frameId: 0, drawCalls: 0, presents: 0, texUploads: 0, clearCalls: 0, vertexCount: 0 };
-    ctx.frameId = 0;
-    ctx.stringCache.clear();
+    // Exports close over this ctx object — rebuild state in place (keep process/backend/presenter).
+    try {
+        ctx.executor?.destroy();
+    } catch {
+        /* best-effort GPU teardown */
+    }
+    const backend = ctx.backend;
+    const presenter = ctx.presenter;
+    const fresh = createOpenGLContext(ctx.process);
+    for (const key of Object.keys(fresh) as (keyof OpenGLContext)[]) {
+        if (key === "process" || key === "backend" || key === "presenter" || key === "executor") continue;
+        if (typeof fresh[key] === "function") continue;
+        (ctx as any)[key] = (fresh as any)[key];
+    }
+    ctx.backend = backend;
+    ctx.presenter = presenter;
+    ctx.executor = null;
 }
