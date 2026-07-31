@@ -9,6 +9,7 @@
 import { System } from '../../core/system';
 import { Mem } from '../../core/memory/mem-accessor';
 import { WindowInfo, windows, registerControlStatePurger } from './shared-state';
+import { getClipboardText, setClipboardText } from './clipboard-text';
 import { readAnsiOrWideFromGuest, encodeAnsi } from '../codepage-utils';
 
 // ES_* styles
@@ -24,6 +25,7 @@ const WS_DISABLED = 0x08000000;
 // EM_* messages
 const EM_GETSEL = 0x00B0;
 const EM_SETSEL = 0x00B1;
+const EM_UNDO = 0x00C7;
 const EM_SCROLLCARET = 0x00B7;
 const EM_GETMODIFY = 0x00B8;
 const EM_SETMODIFY = 0x00B9;
@@ -47,6 +49,11 @@ const WM_KILLFOCUS = 0x0008;
 const WM_CHAR = 0x0102;
 const WM_KEYDOWN = 0x0100;
 const WM_COMMAND = 0x0111;
+const WM_CUT = 0x0300;
+const WM_COPY = 0x0301;
+const WM_PASTE = 0x0302;
+const WM_CLEAR = 0x0303;
+const WM_UNDO = 0x0304;
 
 // Virtual keys handled in WM_KEYDOWN
 const VK_SHIFT = 0x10;
@@ -73,6 +80,14 @@ interface EditState {
     limit: number;
     modified: boolean;
     passwordChar: number;
+    /** Single-line horizontal scroll, in pixels of text hidden left of the inset. */
+    scrollX: number;
+    /** Single-level undo (Wine edit.c model): the text deleted at undoPos plus the
+     *  number of chars inserted there. Undo re-selects the insertion and puts the
+     *  deletion back, which rebuilds the inverse record — so undo is its own redo. */
+    undoText: string;
+    undoPos: number;
+    undoInsertCount: number;
 }
 
 const editStates = new Map<number, EditState>();
@@ -94,16 +109,22 @@ function getOrCreateEditState(child: WindowInfo): EditState {
             selEnd: 0,
             limit: DEFAULT_LIMIT,
             modified: false,
+            // Sampled once, like the real control's es->password_char / ped->charPasswordChar:
+            // only EM_SETPASSWORDCHAR changes it afterwards, a later style change does not.
             passwordChar: (child.style & ES_PASSWORD) !== 0 ? 0x2A /* '*' */ : 0,
+            scrollX: 0,
+            undoText: '',
+            undoPos: 0,
+            undoInsertCount: 0,
         };
         editStates.set(child.handle, state);
     }
     return state;
 }
 
-/** Caret/selection/password info for the painter (controls.ts). */
+/** Caret/selection/password/scroll info for the painter (controls.ts). */
 export function getEditVisualState(child: WindowInfo): {
-    selStart: number; selEnd: number; focused: boolean; passwordChar: number;
+    selStart: number; selEnd: number; focused: boolean; passwordChar: number; scrollX: number;
 } {
     const state = getOrCreateEditState(child);
     const len = child.title.length;
@@ -112,6 +133,7 @@ export function getEditVisualState(child: WindowInfo): {
         selEnd: Math.min(state.selEnd, len),
         focused: System.getInstance().windowManager.getFocusHwnd() === child.handle,
         passwordChar: state.passwordChar,
+        scrollX: state.scrollX,
     };
 }
 
@@ -121,7 +143,9 @@ const DEFAULT_CONTROL_FONT = "11px 'Liberation Sans', sans-serif";
 let measureCtx: OffscreenCanvasRenderingContext2D | null = null;
 
 function getMeasureCtx(child: WindowInfo): OffscreenCanvasRenderingContext2D | null {
-    if (!measureCtx) {
+    // Text metrics are optional: without a canvas (non-DOM host) hit testing and
+    // scrolling fall back to "no scroll", they never fail the message.
+    if (!measureCtx && typeof OffscreenCanvas !== 'undefined') {
         measureCtx = new OffscreenCanvas(1, 1).getContext('2d');
     }
     if (measureCtx) {
@@ -134,16 +158,24 @@ function getMeasureCtx(child: WindowInfo): OffscreenCanvasRenderingContext2D | n
     return measureCtx;
 }
 
+/** Text inset paintEdit draws at, on both sides of the client rect. */
+export const EDIT_TEXT_INSET = 4;
+
+/** Text as PAINTED: password masking applies to hit testing and scrolling too. */
+function displayText(child: WindowInfo, state: EditState): string {
+    return state.passwordChar
+        ? String.fromCharCode(state.passwordChar).repeat(child.title.length)
+        : child.title;
+}
+
 /** Place the caret at the clicked pixel (x relative to the control); clears selection. */
 export function setEditCaretFromPoint(child: WindowInfo, localX: number): void {
     const state = getOrCreateEditState(child);
-    const text = state.passwordChar
-        ? String.fromCharCode(state.passwordChar).repeat(child.title.length)
-        : child.title;
+    const text = displayText(child, state);
     const ctx = getMeasureCtx(child);
     let pos = text.length;
     if (ctx) {
-        const target = localX - 4; // text inset used by paintEdit
+        const target = localX - EDIT_TEXT_INSET + state.scrollX;
         pos = 0;
         while (pos < text.length) {
             const w = ctx.measureText(text.slice(0, pos + 1)).width;
@@ -154,12 +186,39 @@ export function setEditCaretFromPoint(child: WindowInfo, localX: number): void {
     }
     state.selStart = pos;
     state.selEnd = pos;
+    ensureCaretVisible(child, state);
+}
+
+/**
+ * EM_SCROLLCARET for a single-line edit: scroll horizontally so the caret stays in
+ * the client rect. Without it a caret past the right edge keeps typing into the clip
+ * region and the user sees a frozen box.
+ */
+function ensureCaretVisible(child: WindowInfo, state: EditState): void {
+    if ((child.style & ES_MULTILINE) !== 0) {
+        state.scrollX = 0;
+        return;
+    }
+    const ctx = getMeasureCtx(child);
+    if (!ctx) return;
+    const text = displayText(child, state);
+    const caret = clamp(state.selEnd, 0, text.length);
+    const avail = Math.max(1, child.width - EDIT_TEXT_INSET * 2);
+    const caretX = ctx.measureText(text.slice(0, caret)).width;
+    const totalX = ctx.measureText(text).width;
+
+    if (caretX - state.scrollX > avail) state.scrollX = caretX - avail;
+    else if (caretX < state.scrollX) state.scrollX = caretX;
+    state.scrollX = clamp(state.scrollX, 0, Math.max(0, totalX - avail));
 }
 
 function clamp(v: number, lo: number, hi: number): number {
     return v < lo ? lo : v > hi ? hi : v;
 }
 
+// Win32 SENDS EN_* from inside the control's own processing, so the parent's handler has
+// run by the time SendMessage returns. We POST: entering a guest wndproc means suspending
+// a thunk, which this synchronous LRESULT sink cannot do.
 function postEditNotify(child: WindowInfo, code: number): void {
     if (!child.parent) return;
     const system = System.getInstance();
@@ -186,11 +245,44 @@ function filterInsertable(child: WindowInfo, s: string): string {
     return out;
 }
 
+function emptyUndoBuffer(state: EditState): void {
+    state.undoText = '';
+    state.undoInsertCount = 0;
+}
+
+/** Fold one replacement into the single undo record (Wine EDIT_EM_ReplaceSel). */
+function recordUndo(state: EditState, start: number, deleted: string, inserted: number): void {
+    if (deleted) {
+        if (!state.undoInsertCount && state.undoText && start === state.undoPos) {
+            state.undoText += deleted;               // deletion extends to the right
+        } else if (!state.undoInsertCount && state.undoText && start + deleted.length === state.undoPos) {
+            state.undoText = deleted + state.undoText; // …to the left
+            state.undoPos = start;
+        } else {
+            state.undoText = deleted;
+            state.undoPos = start;
+        }
+        state.undoInsertCount = 0; // any deletion invalidates the insertion record
+    }
+    if (inserted) {
+        if (start === state.undoPos
+            || (state.undoInsertCount && start === state.undoPos + state.undoInsertCount)) {
+            state.undoInsertCount += inserted;
+        } else {
+            state.undoPos = start;
+            state.undoInsertCount = inserted;
+            state.undoText = '';
+        }
+    }
+}
+
 /**
  * Replace the current selection with `insert`, honoring the text limit.
  * Returns true if the text changed.
  */
-function replaceSelection(child: WindowInfo, insert: string, notify: boolean): boolean {
+function replaceSelection(
+    child: WindowInfo, insert: string, notify: boolean, canUndo: boolean = true,
+): boolean {
     const state = getOrCreateEditState(child);
     const text = child.title;
     const start = clamp(Math.min(state.selStart, state.selEnd), 0, text.length);
@@ -204,27 +296,49 @@ function replaceSelection(child: WindowInfo, insert: string, notify: boolean): b
     }
     if (start === end && !filtered.length) return false;
 
+    if (canUndo) recordUndo(state, start, text.slice(start, end), filtered.length);
+    else emptyUndoBuffer(state);
+
     child.title = text.slice(0, start) + filtered + text.slice(end);
     const caret = start + filtered.length;
     state.selStart = caret;
     state.selEnd = caret;
     state.modified = true;
+    ensureCaretVisible(child, state);
     if (notify) notifyTextChanged(child);
     return true;
 }
 
 function deleteRange(child: WindowInfo, from: number, to: number): boolean {
     const state = getOrCreateEditState(child);
-    const text = child.title;
-    const start = clamp(Math.min(from, to), 0, text.length);
-    const end = clamp(Math.max(from, to), 0, text.length);
-    if (start === end) return false;
-    child.title = text.slice(0, start) + text.slice(end);
-    state.selStart = start;
-    state.selEnd = start;
-    state.modified = true;
-    notifyTextChanged(child);
+    state.selStart = clamp(Math.min(from, to), 0, child.title.length);
+    state.selEnd = clamp(Math.max(from, to), 0, child.title.length);
+    return replaceSelection(child, '', true);
+}
+
+/** EM_UNDO / WM_UNDO: put the deleted text back over the inserted range. */
+function undoEdit(child: WindowInfo, state: EditState): boolean {
+    // MSDN/Wine: a read-only single-line edit still answers TRUE.
+    if (isReadOnly(child)) return (child.style & ES_MULTILINE) === 0;
+    const restore = state.undoText;
+    const pos = state.undoPos;
+    setSelection(child, state, pos, pos + state.undoInsertCount);
+    emptyUndoBuffer(state);
+    replaceSelection(child, restore, true);
+    setSelection(child, state, pos, pos + state.undoInsertCount);
     return true;
+}
+
+/** EM_SETSEL: out-of-order endpoints swap and both clamp (NT5 EditSL_ChangeSelection);
+ *  the caret then sits at the end of the selection. */
+function setSelection(child: WindowInfo, state: EditState, start: number, end: number): void {
+    const len = child.title.length;
+    let lo = clamp(start, 0, len);
+    let hi = clamp(end, 0, len);
+    if (lo > hi) { const t = lo; lo = hi; hi = t; }
+    state.selStart = lo;
+    state.selEnd = hi;
+    ensureCaretVisible(child, state);
 }
 
 function isReadOnly(child: WindowInfo): boolean {
@@ -265,19 +379,49 @@ function lineFromCharIndex(child: WindowInfo, charIndex: number): number {
 }
 
 /**
+ * WM_SETTEXT body, taking the text already decoded: SetDlgItemText/SetWindowText are
+ * SendMessage(WM_SETTEXT) on Win32 and must not bypass the style filtering, limit,
+ * caret reset and EN_* notifications by assigning WindowInfo.title.
+ */
+export function setEditControlText(child: WindowInfo, text: string): void {
+    const state = getOrCreateEditState(child);
+    // Case styles apply (Wine EDIT_EM_ReplaceSel); the text LIMIT does not — it bounds
+    // what the USER may type, never what WM_SETTEXT puts in (EM_SETLIMITTEXT docs).
+    let next = applyCaseStyle(child, text);
+    if ((child.style & ES_MULTILINE) === 0) {
+        const brk = next.search(/[\r\n]/);
+        if (brk >= 0) next = next.slice(0, brk);
+    }
+    child.title = next;
+    state.selStart = 0;
+    state.selEnd = 0;
+    state.scrollX = 0;
+    state.modified = false;
+    emptyUndoBuffer(state);
+    // Wine EDIT_WM_SetText: a multiline (or combobox-owned) edit stays silent.
+    if ((child.style & ES_MULTILINE) === 0) notifyTextChanged(child);
+}
+
+/**
  * EM_* / editing-key sink for EDIT system controls. Returns the LRESULT, or
  * null when the message is not edit-specific (generic handling applies).
  */
 export function handleEditMessage(
     child: WindowInfo, msg: number, wParam: number, lParam: number, mem: Uint8Array,
+    /** Text width of the ENTRY POINT the message arrived through, when it is known.
+     *  `"5 A   "` and `L"5A"` are the same bytes, so a probe can never separate
+     *  them — only the A/W entry can. Undefined keeps the heuristic. */
+    textWidth?: 'ansi' | 'wide',
 ): number | null {
     const state = getOrCreateEditState(child);
     const len = () => child.title.length;
 
     switch (msg) {
         case EM_GETSEL: {
-            const start = Math.min(state.selStart, state.selEnd);
-            const end = Math.max(state.selStart, state.selEnd);
+            // Clamp on READ as well: the text can shrink under a stored selection
+            // (WM_SETTEXT from another path, EM_LIMITTEXT truncation).
+            const start = clamp(Math.min(state.selStart, state.selEnd), 0, len());
+            const end = clamp(Math.max(state.selStart, state.selEnd), 0, len());
             if (wParam) Mem.writeUint32(wParam, start);
             if (lParam) Mem.writeUint32(lParam, end);
             return (((end & 0xFFFF) << 16) | (start & 0xFFFF)) >>> 0;
@@ -287,14 +431,14 @@ export function handleEditMessage(
             const end = lParam | 0;
             if (start === -1) {
                 // Deselect; caret stays at current end.
-                state.selStart = state.selEnd;
+                setSelection(child, state, state.selEnd, state.selEnd);
             } else {
-                state.selStart = clamp(start, 0, len());
-                state.selEnd = end === -1 ? len() : clamp(end, 0, len());
+                setSelection(child, state, start, end === -1 ? len() : end);
             }
             return 1;
         }
         case EM_SCROLLCARET:
+            ensureCaretVisible(child, state);
             return 1;
         case EM_GETMODIFY:
             return state.modified ? 1 : 0;
@@ -316,7 +460,7 @@ export function handleEditMessage(
             if (!lParam) return 0;
             const lines = textLines(child);
             const line = wParam | 0;
-            if (line >= lines.length) return 0;
+            if (line < 0 || line >= lines.length) return 0;
             // First WORD of the buffer holds its capacity in chars (Win32 contract).
             const cap = Mem.readUint16(lParam) ?? 0;
             const encoded = encodeAnsi(lines[line]).subarray(0, cap);
@@ -325,8 +469,8 @@ export function handleEditMessage(
         }
         case EM_REPLACESEL: {
             if (isReadOnly(child)) return 0;
-            const insert = lParam ? readAnsiOrWideFromGuest(mem, lParam) : '';
-            replaceSelection(child, insert, true);
+            const insert = lParam ? readAnsiOrWideFromGuest(mem, lParam, textWidth) : '';
+            replaceSelection(child, insert, true, wParam !== 0); // wParam = fCanUndo
             return 1;
         }
         case EM_LIMITTEXT:
@@ -344,11 +488,36 @@ export function handleEditMessage(
         case EM_GETPASSWORDCHAR:
             return state.passwordChar;
         case EM_CANUNDO:
-            return 0;
+            return (state.undoInsertCount || state.undoText.length) ? 1 : 0;
         case EM_EMPTYUNDOBUFFER:
+            emptyUndoBuffer(state);
             return 0;
+        case EM_UNDO:
+        case WM_UNDO:
+            return undoEdit(child, state) ? 1 : 0;
         case EM_GETFIRSTVISIBLELINE:
             return 0;
+
+        case WM_COPY: {
+            const lo = Math.min(state.selStart, state.selEnd);
+            const hi = Math.max(state.selStart, state.selEnd);
+            if (lo === hi) return 0;
+            setClipboardText(mem, child.handle, child.title.slice(lo, hi));
+            return 0;
+        }
+        case WM_CUT:
+            handleEditMessage(child, WM_COPY, 0, 0, mem);
+            handleEditMessage(child, WM_CLEAR, 0, 0, mem);
+            return 0;
+        case WM_CLEAR:
+            if (!isReadOnly(child)) replaceSelection(child, '', true);
+            return 0;
+        case WM_PASTE: {
+            if (isReadOnly(child)) return 0;
+            const text = getClipboardText(mem);
+            if (text !== null) replaceSelection(child, text, true);
+            return 0;
+        }
 
         case WM_SETFOCUS:
             postEditNotify(child, EN_SETFOCUS);
@@ -357,16 +526,9 @@ export function handleEditMessage(
             postEditNotify(child, EN_KILLFOCUS);
             return 0;
 
-        case WM_SETTEXT: {
-            // Text swap resets caret/selection and the modify flag, then notifies.
-            const text = lParam ? readAnsiOrWideFromGuest(mem, lParam) : '';
-            child.title = applyCaseStyle(child, text);
-            state.selStart = 0;
-            state.selEnd = 0;
-            state.modified = false;
-            notifyTextChanged(child);
+        case WM_SETTEXT:
+            setEditControlText(child, lParam ? readAnsiOrWideFromGuest(mem, lParam, textWidth) : '');
             return 1;
-        }
 
         case WM_CHAR: {
             const ch = wParam & 0xFFFF;
@@ -386,7 +548,27 @@ export function handleEditMessage(
                 }
                 return 0;
             }
-            if (ch < 0x20) return 0; // other control chars (tab, ^C...) not handled
+            // TranslateMessage folds Ctrl+key into a control character; the class turns
+            // those back into the clipboard messages (Wine EDIT_WM_Char). A password
+            // edit refuses to hand its content out, so ^C/^X do nothing there.
+            const noPassword = (child.style & ES_PASSWORD) === 0;
+            if (ch === 0x03) { // ^C
+                if (noPassword) handleEditMessage(child, WM_COPY, 0, 0, mem);
+                return 0;
+            }
+            if (ch === 0x16) { // ^V
+                if (!isReadOnly(child)) handleEditMessage(child, WM_PASTE, 0, 0, mem);
+                return 0;
+            }
+            if (ch === 0x18) { // ^X
+                if (noPassword && !isReadOnly(child)) handleEditMessage(child, WM_CUT, 0, 0, mem);
+                return 0;
+            }
+            if (ch === 0x1A) { // ^Z
+                if (!isReadOnly(child)) handleEditMessage(child, WM_UNDO, 0, 0, mem);
+                return 0;
+            }
+            if (ch < 0x20 || ch === 0x7F) return 0;
             if (isReadOnly(child)) return 0;
             replaceSelection(child, String.fromCharCode(ch), true);
             return 0;
@@ -399,6 +581,7 @@ export function handleEditMessage(
                 const p = clamp(pos, 0, len());
                 state.selEnd = p;
                 if (!shiftDown) state.selStart = p;
+                ensureCaretVisible(child, state);
                 return 0;
             };
             switch (wParam & 0xFF) {
@@ -432,9 +615,20 @@ export function handleEditMessage(
     }
 }
 
-/** True for messages this module owns (used by dispatch gating/repaint decisions). */
+/**
+ * Messages that change what an EDIT PAINTS (text, selection, caret, mask) and so
+ * need the parent's control repaint. WM_KEYDOWN is in only because the editing keys
+ * (arrows/Home/End/Delete) move the caret; focus changes are not — the caret blink
+ * is not worth a restore-and-restamp of the whole control set.
+ */
 export function isEditContentMessage(msg: number): boolean {
     return msg === WM_CHAR || msg === WM_KEYDOWN || msg === EM_REPLACESEL
         || msg === EM_SETSEL || msg === EM_SETREADONLY || msg === EM_SETPASSWORDCHAR
-        || msg === WM_SETTEXT || msg === WM_SETFOCUS || msg === WM_KILLFOCUS;
+        || msg === EM_SCROLLCARET || msg === EM_UNDO
+        || msg === WM_CUT || msg === WM_PASTE || msg === WM_CLEAR || msg === WM_UNDO;
+}
+
+/** True when `child` is an EDIT — the only class the messages above belong to. */
+export function isEditControl(child: WindowInfo): boolean {
+    return (child.systemControlClass ?? '').trim().toLowerCase() === 'edit';
 }

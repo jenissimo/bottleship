@@ -10,7 +10,7 @@ import { Marshaler } from '../../core/memory/marshaler';
 import { System } from '../../core/system';
 import { WindowInfo, windows, buttonCheckStates, getOrCreateListState, getOrCreateTrackbarState, controlImageHandles } from './shared-state';
 import { handleAnimateMessage } from './animate-control';
-import { handleEditMessage, isEditContentMessage } from './edit-control';
+import { handleEditMessage, isEditContentMessage, isEditControl, setEditControlText } from './edit-control';
 import { setScrollPos, getScrollPos, setScrollRange, getScrollRange, applyScrollInfo, readScrollInfo } from './scroll-state';
 import { paintSystemControl, clampListTopIndex, listVisibleCount } from './controls';
 import { repaintDialogAfterContentChange, restampOwnedPopupsAbove } from './dialog-paint';
@@ -36,8 +36,10 @@ const WS_DISABLED = 0x08000000;
 
 const WM_PAINT = 0x000F;
 
-/** Return whether a control message changes visible content. */
-export function isContentChangingMessage(msg: number): boolean {
+/** Return whether a control message changes what `child` shows (the caller then
+ *  erases and restamps the control set, so a false positive costs a full repaint of
+ *  the dialog on the message-pump hot path). */
+export function isContentChangingMessage(child: WindowInfo, msg: number): boolean {
     const WM_SETTEXT = 0x000C;
     const CB_ADDSTRING = 0x0143;
     const CB_DELETESTRING = 0x0144;
@@ -67,7 +69,7 @@ export function isContentChangingMessage(msg: number): boolean {
         || (msg >= LB_ADDSTRING && msg <= LB_SETCURSEL)
         || (msg >= TBM_SETPOS && msg <= TBM_SETRANGEMAX)
         || (msg >= 0x0401 && msg <= 0x0406)
-        || isEditContentMessage(msg);
+        || (isEditControl(child) && isEditContentMessage(msg));
 }
 
 /**
@@ -105,22 +107,35 @@ export function applyStaticSetImageAutoSize(child: WindowInfo, imageType: number
 }
 
 /**
+ * WM_SETTEXT with the string already decoded by the caller. SetWindowText and
+ * SetDlgItemText ARE SendMessage(WM_SETTEXT) on Win32, so they must land in the
+ * control class's handler — on an EDIT, assigning the title instead silently drops
+ * EN_UPDATE/EN_CHANGE, the case styles, the caret reset and the modify flag.
+ */
+export function applyControlSetText(win: WindowInfo, text: string): void {
+    if (win.isSystemControl && isEditControl(win)) setEditControlText(win, text);
+    else win.title = text;
+}
+
+/**
  * Handle a message sent to a system control (Button, Static, Edit, etc.).
  * Returns the LRESULT.
  */
 export function handleSystemControlMessage(
     child: WindowInfo, msg: number, wParam: number, lParam: number, mem: Uint8Array,
+    /** Text width of the A/W entry the message came through, when known — see handleEditMessage. */
+    textWidth?: 'ansi' | 'wide',
 ): number {
     const anim = handleAnimateMessage(child.handle, msg, wParam, lParam, mem);
     if (anim !== null) return anim;
 
     // EDIT owns EM_* plus text-editing WM_SETTEXT/WM_CHAR/WM_KEYDOWN semantics.
-    if ((child.systemControlClass ?? '').trim().toLowerCase() === 'edit') {
-        const editResult = handleEditMessage(child, msg, wParam, lParam, mem);
+    if (isEditControl(child)) {
+        const editResult = handleEditMessage(child, msg, wParam, lParam, mem, textWidth);
         if (editResult !== null) return editResult;
     }
 
-    const readAnsiOrWideString = (ptr: number): string => readAnsiOrWideFromGuest(mem, ptr);
+    const readAnsiOrWideString = (ptr: number): string => readAnsiOrWideFromGuest(mem, ptr, textWidth);
 
     const WM_SETTEXT = 0x000C;
     const WM_GETTEXT = 0x000D;
@@ -316,9 +331,9 @@ export function handleSystemControlMessage(
             const LBS_EXTENDEDSEL = 0x0800;
             const multiSelect = (child.style & (LBS_MULTIPLESEL | LBS_EXTENDEDSEL)) !== 0;
 
-            // NT5 lb1.c / Wine listbox.c: reject an invalid caret. A
-            // single-select list with a selection rejects this message too;
-            // LB_SETCURSEL has already moved iSelBase/focus_item with it.
+            // NT5 lb1.c / Wine listbox.c: reject an invalid caret. A single-select list
+            // that ALREADY has a selection rejects this message too — there the caret is
+            // the selection, and LB_SETCURSEL has moved iSelBase with it.
             if (idx < 0 || idx >= state.items.length || (!multiSelect && state.selectedIndex !== -1)) {
                 return LB_ERR;
             }

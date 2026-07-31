@@ -37,6 +37,11 @@ import {
 import { getSystemCursorHandle } from './system-cursors';
 import { registerDeviceNotification, unregisterDeviceNotification } from './device-notify';
 
+// wsprintf's output buffer: reused across calls (hot path, thousands per frame) and
+// sized to the API's own 1024 code-unit budget including the terminator.
+const wsprintfScratch = new Uint8Array(1024 * 2);
+const wsprintfScratchView = new DataView(wsprintfScratch.buffer);
+
 // System color table (COLORREF: 0x00BBGGRR) — mutable via SetSysColors
 const sysColors = new Map<number, number>([
     [0,  0xC0C0C0],  // COLOR_SCROLLBAR
@@ -602,11 +607,15 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         // documented maximum, so an unbounded formatter writes past a correctly-sized buffer.
         // This bounds WRITES only — the format string and %s arguments may live anywhere.
         const WSPRINTF_MAX_UNITS = 1024;
-        const outEnd = Math.min(memEnd, lpOut + (WSPRINTF_MAX_UNITS - 1) * unit);
+        const outEnd = (WSPRINTF_MAX_UNITS - 1) * unit;
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
 
-        // Write cursor into guest memory
-        let out = lpOut;
+        // Formatting builds in this reusable host buffer and lands in the guest through ONE
+        // Mem.writeBytes: the guest-supplied lpOut is then validated against the region map
+        // exactly once instead of per code unit (§3.1 — and this is a per-frame hot path).
+        const scratch = wsprintfScratch;
+        const scratchView = wsprintfScratchView;
+        let out = 0; // byte cursor into `scratch`
 
         // Helper: read one code unit of the format string
         const fmtAt = (p: number): number =>
@@ -615,11 +624,11 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         // Helper: write a single output code unit
         const writeUnit = (c: number): void => {
             if (out + unit > outEnd) return;
-            if (wide) { view.setUint16(out, c & 0xFFFF, true); out += 2; }
-            else mem[out++] = c & 0xFF;
+            if (wide) { scratchView.setUint16(out, c & 0xFFFF, true); out += 2; }
+            else scratch[out++] = c & 0xFF;
         };
 
-        // Helper: write a JS string directly to mem in the output's code-unit width
+        // Helper: write a JS string in the output's code-unit width
         const writeStr = (s: string): void => {
             if (wide) {
                 for (let i = 0; i < s.length; i++) writeUnit(s.charCodeAt(i));
@@ -628,7 +637,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
             const encoded = encodeAnsi(s);
             const writeLen = Math.min(encoded.length, outEnd - out);
             if (writeLen > 0) {
-                mem.set(encoded.subarray(0, writeLen), out);
+                scratch.set(encoded.subarray(0, writeLen), out);
                 out += writeLen;
             }
         };
@@ -647,14 +656,9 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         // Helper: copy a guest string; same-width stays mem-to-mem (no decode round-trip)
         const writeGuestStr = (addr: number, srcWide: boolean, len: number): void => {
             if (srcWide === wide) {
-                if (wide) {
-                    const n = Math.min(len, (outEnd - out) >> 1, (memEnd - addr) >> 1);
-                    for (let j = 0; j < n; j++) view.setUint16(out + j * 2, view.getUint16(addr + j * 2, true), true);
-                    out += n * 2;
-                } else {
-                    const n = Math.min(len, outEnd - out, memEnd - addr);
-                    if (n > 0) { mem.set(mem.subarray(addr, addr + n), out); out += n; }
-                }
+                // Same width on both sides: a byte copy, UTF-16LE included.
+                const n = Math.min(len * unit, outEnd - out, memEnd - addr);
+                if (n > 0) { scratch.set(mem.subarray(addr, addr + n), out); out += n; }
                 return;
             }
             writeStr(srcWide
@@ -778,6 +782,9 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
                 case 0x53: // 'S' — the opposite width of the function's own
                     if (argIndex < args.length) {
                         const isBigS = spec === 0x53;
+                        // Argument width per the WPRINTF_ParseFormat{A,W} tables verbatim
+                        // (wine dlls/user32/wsprintf.c) — note %S consults SHORT|WIDE in the
+                        // ANSI function and LONG|WIDE in the wide one, which is not symmetric.
                         const srcWide = wide
                             ? (isBigS ? (modLong || modWide) : !(modShort && !modWide))
                             : (isBigS ? !(modShort || modWide) : (modLong || modWide));
@@ -833,12 +840,10 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
             }
         }
 
-        // Null terminator — memEnd reserves the slot for it, so this always fits unless the
-        // caller's buffer was already past the end of guest memory.
-        if (out + unit <= mem.length) {
-            if (wide) view.setUint16(out, 0, true); else mem[out] = 0;
-        }
-        const charsWritten = (out - lpOut) / unit;
+        // Null terminator — the scratch buffer reserves the slot for it.
+        if (wide) scratchView.setUint16(out, 0, true); else scratch[out] = 0;
+        Mem.writeBytes(lpOut, scratch.subarray(0, out + unit));
+        const charsWritten = out / unit;
         const truncated = charsWritten >= WSPRINTF_MAX_UNITS - 1;
 
         Logger.verbose(LogCategory.USER32, `wsprintf${wide ? 'W' : 'A'}: ${charsWritten} chars written to 0x${lpOut.toString(16)}`);
@@ -1990,7 +1995,10 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
             const w = ddraw?.display.width ?? width;
             const h = ddraw?.display.height ?? height;
             const b = ddraw?.display.bpp ?? bpp;
-            system.requestHostResize(w, h);
+            // ChangeDisplaySettings is a mode-set by definition, restore included.
+            system.requestHostResize(w, h, {
+                modeSet: true, bpp: b, refreshRate: ddraw?.display.refresh,
+            });
             system.windowManager.postDisplayChange(w, h, b);
             Logger.log(LogCategory.USER32, `${apiName}: applied ${w}x${h}x${b} (restore=${isRestore})`);
         };

@@ -14,6 +14,7 @@
 import { Logger, LogCategory } from '../../core/logger';
 import { Mem } from '../../core/memory/mem-accessor';
 import { System } from '../../core/system';
+import type { MemoryManager } from '../../core/process';
 import {
     DBT_DEVICEARRIVAL,
     DBT_DEVICEREMOVECOMPLETE,
@@ -62,8 +63,18 @@ let nextHandle = 0x00021000;
  * allocated once — a per-event struct would leak on a plug/unplug storm. Freed
  * only at process reset: a posted message may still be sitting in the queue
  * holding the pointer, so unregistering must not pull it out from under it.
+ * The ALLOCATOR is captured with the pointer: reset runs on a bundle switch, by
+ * which time System.process may already be the next one, and freeing a stale
+ * address in a fresh MemoryManager corrupts that allocator instead.
  */
-const payloads = { ansi: 0, wide: 0 };
+interface PayloadSlot {
+    ptr: number;
+    owner: MemoryManager | null;
+}
+const payloads: Record<'ansi' | 'wide', PayloadSlot> = {
+    ansi: { ptr: 0, owner: null },
+    wide: { ptr: 0, owner: null },
+};
 
 /** HDEVNOTIFY RegisterDeviceNotificationA/W. Returns 0 (and sets last error) on failure. */
 export function registerDeviceNotification(
@@ -118,15 +129,16 @@ export function unregisterDeviceNotification(handle: number): boolean {
 /** Guest copy of the payload for `unicode`, allocated on first use. Returns 0 when
  *  there is no process to allocate from. */
 function ensurePayload(unicode: boolean): number {
-    const key = unicode ? 'wide' : 'ansi';
-    if (payloads[key]) return payloads[key];
-    const memory = System.getInstance().process?.memory;
+    const slot = payloads[unicode ? 'wide' : 'ansi'];
+    const memory = System.getInstance().process?.memory ?? null;
+    if (slot.ptr && slot.owner === memory) return slot.ptr;
     if (!memory) return 0;
     const bytes = encodeDevBroadcastDeviceInterface(GAMEPAD_INTERFACE_NAME, unicode);
     const ptr = memory.alloc(bytes.length);
     if (!ptr) return 0;
     Mem.writeBytes(ptr, bytes);
-    payloads[key] = ptr;
+    slot.ptr = ptr;
+    slot.owner = memory;
     return ptr;
 }
 
@@ -183,10 +195,11 @@ export function getDeviceNotifications(): Array<{ handle: number } & DeviceNotif
 
 /** Drop every registration so a fresh process does not inherit the previous one's. */
 export function resetDeviceNotifications(): void {
-    const memory = System.getInstance().process?.memory;
     for (const key of ['ansi', 'wide'] as const) {
-        if (payloads[key]) memory?.free(payloads[key]);
-        payloads[key] = 0;
+        const slot = payloads[key];
+        if (slot.ptr && slot.owner) slot.owner.free(slot.ptr);
+        slot.ptr = 0;
+        slot.owner = null;
     }
     registrations.clear();
     nextHandle = 0x00021000;

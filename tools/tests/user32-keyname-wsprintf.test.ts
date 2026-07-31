@@ -7,11 +7,16 @@
  * code-unit width each %s/%c argument is read at (WPRINTF_ParseFormat{A,W}).
  */
 import { describe, expect, test } from "bun:test";
+import { Mem } from "../../src/worker/core/memory/mem-accessor";
 import { createSystemExports } from "../../src/worker/modules/user32/system";
 
 const exports = createSystemExports();
-const call = (name: string, args: number[]): number =>
-    exports[name]!({} as any, mem, args) as number;
+// Guest writes go through the Mem accessor (region-permission validation), whose
+// binding is process-global — rebind per call so a sibling test file cannot steal it.
+const call = (name: string, args: number[]): number => {
+    Mem.bind(() => mem);
+    return exports[name]!({} as any, mem, args) as number;
+};
 
 const mem = new Uint8Array(0x10000);
 const view = new DataView(mem.buffer);

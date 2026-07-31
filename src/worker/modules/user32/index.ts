@@ -1,6 +1,6 @@
-// Auto-generated index for user32 module
-// This file aggregates all atomic implementations
-// Generated from directory scan: src/worker/modules/user32
+// Custom index for user32 module.
+// Export aggregation is generated-style, but reset orchestration is intentionally
+// hand-maintained because User32 owns state spread across several atomic modules.
 
 import { IModule } from '../../core/module';
 import { Process } from '../../core/process';

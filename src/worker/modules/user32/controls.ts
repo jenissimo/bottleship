@@ -13,7 +13,7 @@ import type { WindowInfo } from './shared-state';
 import { resolveBitmapRgba, resolveIconRgba, layoutStaticControlImage, blitStaticControlImage } from '../gdi32/bitmap-resolve';
 import { Logger, LogCategory } from '../../core/logger';
 import { fillTextWithMnemonic, measureMnemonicText } from '../win32-text';
-import { getEditVisualState } from './edit-control';
+import { getEditVisualState, EDIT_TEXT_INSET } from './edit-control';
 import { getControlColorOverride } from './control-colors';
 
 // Window styles
@@ -521,8 +521,11 @@ function paintCheckableButton(
     // click/content-change) first.
     const colors = getControlColorOverride(child.handle);
     const labelX = indicatorX + indicatorSize + 6;
-    ctx.fillStyle = colors?.brush ?? colors?.bk ?? COLOR_BTNFACE;
-    ctx.fillRect(labelX - 1, y, Math.max(1, x + w - labelX + 1), h);
+    const labelFill = colors ? colors.fill : COLOR_BTNFACE;
+    if (labelFill) {
+        ctx.fillStyle = labelFill;
+        ctx.fillRect(labelX - 1, y, Math.max(1, x + w - labelX + 1), h);
+    }
 
     ctx.font = getWindowFont(child);
     ctx.textAlign = 'left';
@@ -742,9 +745,9 @@ function paintStatic(
     const isTextType = styleType === SS_LEFT || styleType === SS_CENTER || styleType === SS_RIGHT
         || styleType === SS_SIMPLE || styleType === SS_LEFTNOWORDWRAP;
     const colors = getControlColorOverride(child.handle);
-    if (isTextType && (colors?.brush ?? colors?.bk)) {
+    if (isTextType && colors?.fill) {
         // WM_CTLCOLORSTATIC returned a background brush — the static is opaque.
-        ctx.fillStyle = (colors.brush ?? colors.bk)!;
+        ctx.fillStyle = colors.fill;
         ctx.fillRect(x, y, w, h);
     }
 
@@ -817,8 +820,13 @@ function paintEdit(
     const disabled = isControlDisabled(child);
     const colors = getControlColorOverride(child.handle);
 
-    ctx.fillStyle = disabled ? COLOR_BTNFACE : (colors?.brush ?? colors?.bk ?? COLOR_WINDOW);
-    ctx.fillRect(x, y, w, h);
+    // A guest that answered WM_CTLCOLOR* decides the fill outright, including "none"
+    // (hollow brush); only an unanswered query falls back to the class default.
+    const fill = disabled ? COLOR_BTNFACE : (colors ? colors.fill : COLOR_WINDOW);
+    if (fill) {
+        ctx.fillStyle = fill;
+        ctx.fillRect(x, y, w, h);
+    }
     drawSunkenEdge(ctx, x, y, w, h);
 
     const visual = getEditVisualState(child);
@@ -842,11 +850,13 @@ function paintEdit(
         let ty = y + 4;
         for (const line of lines) {
             if (ty + lineHeight > y + h - 2) break;
-            ctx.fillText(line, x + 4, ty);
+            ctx.fillText(line, x + EDIT_TEXT_INSET, ty);
             ty += lineHeight;
         }
     } else {
-        const tx = x + 4;
+        // Text origin walks left by the control's horizontal scroll (EM_SCROLLCARET), so
+        // a single-line edit longer than its box keeps the caret inside the clip rect.
+        const tx = x + EDIT_TEXT_INSET - visual.scrollX;
         const ty = y + h / 2;
         const selLo = Math.min(visual.selStart, visual.selEnd);
         const selHi = Math.max(visual.selStart, visual.selEnd);
@@ -1016,8 +1026,13 @@ function paintListBox(
     const disabled = isControlDisabled(child);
     const colors = getControlColorOverride(child.handle);
 
-    ctx.fillStyle = disabled ? COLOR_BTNFACE : (colors?.brush ?? colors?.bk ?? COLOR_WINDOW);
-    ctx.fillRect(x, y, w, h);
+    // A guest that answered WM_CTLCOLOR* decides the fill outright, including "none"
+    // (hollow brush); only an unanswered query falls back to the class default.
+    const fill = disabled ? COLOR_BTNFACE : (colors ? colors.fill : COLOR_WINDOW);
+    if (fill) {
+        ctx.fillStyle = fill;
+        ctx.fillRect(x, y, w, h);
+    }
     drawSunkenEdge(ctx, x, y, w, h);
 
     const state = listControlStates.get(child.handle);

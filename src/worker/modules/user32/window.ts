@@ -12,7 +12,7 @@ import { DESKTOP_HWND } from '../../runtime/windowing/window-manager';
 import { getWindowClass, getWindowClassByName } from './class';
 import { Marshaler } from '../../core/memory/marshaler';
 import { Mem } from '../../core/memory/mem-accessor';
-import { WindowInfo, windows, getWindowByHandle, getCursorDisplayCount, updateCursorDisplayCount, isGuestCursorVisible, syncHostCursorToGuestState, installCursorAndUpdateHostVisibility, getAbsoluteWindowPosition, markGuestCustomPaint, killWindowTimers, registerWindowDestroyFinalizer, reorderChildInParent, setLockWindowUpdate, isWindowUpdateLocked, hasSystemControlChildren, getChildWindowExclusions, isEffectivelyVisible, getAncestorClipRect } from './shared-state';
+import { WindowInfo, windows, getWindowByHandle, getCursorDisplayCount, updateCursorDisplayCount, isGuestCursorVisible, syncHostCursorToGuestState, installCursorAndUpdateHostVisibility, getAbsoluteWindowPosition, markGuestCustomPaint, killWindowTimers, registerWindowDestroyFinalizer, reorderChildInParent, setLockWindowUpdate, isWindowUpdateLocked, hasSystemControlChildren, getChildWindowExclusions, isEffectivelyVisible, getAncestorClipRect, getVirtualScreenRect } from './shared-state';
 import {
     invalidateWindow,
     validateWindow,
@@ -297,9 +297,12 @@ function applyWindowPosGeometry(
         && (uFlags & (SWP_NOMOVE | SWP_NOSIZE)) === 0
         && (uFlags & SWP_SHOWWINDOW) !== 0) {
         const parent = windows.get(window.parent);
-        const screen = EmulatorConfig.getInstance().screenResolution;
-        const centeredX = Math.floor((screen.width - cx) / 2);
-        const centeredY = Math.floor((screen.height - cy) / 2);
+        // Same screen the game centred with: SM_CX/CYSCREEN report getVirtualScreenRect
+        // (current display mode), which diverges from the configured resolution after
+        // any SetDisplayMode/host resize.
+        const screen = getVirtualScreenRect();
+        const centeredX = Math.floor((screen.right - cx) / 2);
+        const centeredY = Math.floor((screen.bottom - cy) / 2);
         if (parent?.isSystemControl
             && cx >= parent.width && cy >= parent.height
             && Math.abs(x - centeredX) <= 1
@@ -989,7 +992,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             // before the message-based handling, or the forwarded click dies here.
             if (handleSystemControlClassMouse(win, Msg, wParam, lParam)) return 0;
             const result = handleSystemControlMessage(win, Msg, wParam, lParam, mem);
-            if (isContentChangingMessage(Msg)) {
+            if (isContentChangingMessage(win, Msg)) {
                 repaintDialogAfterContentChange(win.parent ?? hWnd);
             }
             return result;
@@ -1056,15 +1059,11 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             // (isEffectivelyVisible) — it used to walk back into the hidden window's children,
             // which keep WS_VISIBLE, and repaint the page that was just switched away.
             if (wasVisible && !window.visible) {
-                // A CHILD control on a guest-painted client gets the surround-restoring
-                // erase: clearing it to transparent would leave a hole showing the desktop
-                // through, because only the guest can redraw the backdrop it sat on. A
-                // top-level dialog still clears — there the game underneath SHOULD show.
-                // Exact restore first — it serves a hidden PAGE as well as a control, and
-                // is the only thing that puts the frame's own backdrop back.
-                // Exact restore first (serves a hidden PAGE as well as a control). Only a
-                // real dialog falls back to the clearing erase — for a CONTROL that clear
-                // makes the repair stamp the grey dialog face over the guest's own backdrop.
+                // Restore the exact backdrop first — it serves a hidden PAGE as well as a
+                // control, and is the only thing that puts the frame's own pixels back.
+                // Only a top-level dialog falls back to the clearing erase; for a CHILD
+                // that clear leaves a hole the guest never repaints, and the repair then
+                // stamps the grey dialog face over the guest's own backdrop.
                 if (!restoreClientRectFromAncestors(window) && window.nativeClassName === '#32770') {
                     eraseDialogOverlay(hWnd);
                 }
@@ -1518,6 +1517,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
                             gdi.flushWindowMemoryDCToOverlay(childDc);
                             gdi.releaseDC(childDc);
                         },
+                        discardChildDC: (childDc) => gdi.releaseDC(childDc),
                     });
                     // The chain took its own publish hold; it closes when the last
                     // control has painted, so the sequence stays atomic past this return.
@@ -1867,6 +1867,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
                         gdi.flushWindowMemoryDCToOverlay(childDc);
                         gdi.releaseDC(childDc);
                     },
+                    discardChildDC: (childDc) => gdi.releaseDC(childDc),
                 }, 'RedrawWindow', stackCleanup);
                 if (repaint) {
                     system.scheduler.wakeMessageWaiters();

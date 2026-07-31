@@ -10,7 +10,7 @@ import { Mem } from '../../core/memory/mem-accessor';
 import { System } from '../../core/system';
 import { encodeAnsi } from '../codepage-utils';
 import { windows, buttonCheckStates, findChildByControlId } from './shared-state';
-import { handleSystemControlMessage, isContentChangingMessage } from './dialog-control-messages';
+import { applyControlSetText, handleSystemControlMessage, isContentChangingMessage } from './dialog-control-messages';
 import { eraseControlOverlayRect, repaintDialogAfterContentChange } from './dialog-paint';
 
 export function registerDialogItemExports(exports: Record<string, ThunkImplementation>): void {
@@ -46,7 +46,7 @@ export function registerDialogItemExports(exports: Record<string, ThunkImplement
         const child = findChildByControlId(hDlg, nIDDlgItem);
         if (child) {
             eraseControlOverlayRect(child);
-            child.title = text;
+            applyControlSetText(child, text);
             repaintDialogAfterContentChange(hDlg);
         } else {
             Logger.warn(LogCategory.USER32, `SetDlgItemTextA: control id=${nIDDlgItem} not found in dialog 0x${hDlg.toString(16)}`);
@@ -66,7 +66,7 @@ export function registerDialogItemExports(exports: Record<string, ThunkImplement
         const child = findChildByControlId(hDlg, nIDDlgItem);
         if (child) {
             eraseControlOverlayRect(child);
-            child.title = text;
+            applyControlSetText(child, text);
             repaintDialogAfterContentChange(hDlg);
         }
 
@@ -253,7 +253,7 @@ export function registerDialogItemExports(exports: Record<string, ThunkImplement
         const child = findChildByControlId(hDlg, nIDDlgItem);
         if (child) {
             eraseControlOverlayRect(child);
-            child.title = text;
+            applyControlSetText(child, text);
             repaintDialogAfterContentChange(hDlg);
         }
         return 1; // TRUE
@@ -272,8 +272,8 @@ export function registerDialogItemExports(exports: Record<string, ThunkImplement
 
         // JS-managed system controls: handle in-process (Wine routes via SendMessage → control WndProc).
         if (child.isSystemControl) {
-            const result = handleSystemControlMessage(child, Msg, wParam, lParam, mem);
-            if (isContentChangingMessage(Msg)) {
+            const result = handleSystemControlMessage(child, Msg, wParam, lParam, mem, 'ansi');
+            if (isContentChangingMessage(child, Msg)) {
                 repaintDialogAfterContentChange(hDlg);
             }
             return result;
@@ -310,9 +310,10 @@ export function registerDialogItemExports(exports: Record<string, ThunkImplement
         const WM_SETTEXT = 0x000C;
         const WM_GETTEXT = 0x000D;
         if (child.isSystemControl) {
-            // Wide SETTEXT/GETTEXT: handleSystemControlMessage already accepts both via readAnsiOrWideString.
-            const result = handleSystemControlMessage(child, Msg, wParam, lParam, mem);
-            if (isContentChangingMessage(Msg)) {
+            // The W entry KNOWS its strings are wide — pass that rather than re-probing bytes
+            // that a 1-char ANSI string is indistinguishable from.
+            const result = handleSystemControlMessage(child, Msg, wParam, lParam, mem, 'wide');
+            if (isContentChangingMessage(child, Msg)) {
                 repaintDialogAfterContentChange(hDlg);
             }
             return result;

@@ -416,6 +416,12 @@ export function handleSystemControlMouseAtScreen(
 
     if (!control) return closedComboByClickAway;
 
+    // A subclassed control's wndproc IS the guest's: DispatchMessage has to reach it
+    // before the class behavior runs, or a subclassed button gets a synthesized
+    // BN_CLICKED and never sees the click. The class proc still runs — the guest's
+    // forward to DefWindowProc lands in handleSystemControlClassMouse.
+    if (control.wndProcSubclassed) return closedComboByClickAway;
+
     return applyControlClassMouse(control, hostHwnd, message, wParam, screenX, screenY);
 }
 

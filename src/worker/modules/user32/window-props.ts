@@ -10,6 +10,7 @@ import { Marshaler } from '../../core/memory/marshaler';
 import { Mem } from '../../core/memory/mem-accessor';
 import { windows } from './shared-state';
 import { eraseControlOverlayRect, repaintDialogAfterContentChange } from './dialog-paint';
+import { applyControlSetText } from './dialog-control-messages';
 import { encodeAnsi } from '../codepage-utils';
 
 export function registerWindowPropExports(exports: Record<string, ThunkImplementation>): void {
@@ -194,7 +195,7 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
             // background, then let the parent re-stamp its controls.
             const changed = window.title !== text;
             if (changed) eraseControlOverlayRect(window);
-            window.title = text;
+            applyControlSetText(window, text);
             if (!window.parent) System.getInstance().notifyWindowTitle(text, 'SetWindowText');
             else if (changed) repaintDialogAfterContentChange(window.parent);
         }
@@ -215,7 +216,7 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
             // background, then let the parent re-stamp its controls.
             const changed = window.title !== text;
             if (changed) eraseControlOverlayRect(window);
-            window.title = text;
+            applyControlSetText(window, text);
             if (!window.parent) System.getInstance().notifyWindowTitle(text, 'SetWindowText');
             else if (changed) repaintDialogAfterContentChange(window.parent);
         }

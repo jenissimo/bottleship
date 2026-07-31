@@ -585,7 +585,10 @@ function resolveCursorHandle(handle: number): number {
     // A handle whose object is gone (the guest destroyed it, or it outlived a reset of the
     // user-object table) cannot be what Windows still shows: a destroyed cursor never stays
     // current. Fall back to the arrow so "visible" always comes with a shape to draw.
-    if (handle !== 0 && !System.getInstance().resourceProvider.getUserObject?.(handle)) {
+    // A provider that cannot answer at all is NOT evidence of destruction — collapsing
+    // every handle to the arrow there would make SetCursor/GetCursor report the wrong one.
+    const provider = System.getInstance().resourceProvider;
+    if (handle !== 0 && provider.getUserObject && !provider.getUserObject(handle)) {
         return getSystemCursorHandle(IDC_ARROW);
     }
     return handle;

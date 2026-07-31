@@ -98,15 +98,6 @@ export function requestGuestDialogPaint(dialogHwnd: number): void {
 }
 
 /**
- * Drop a control's pixels before its new content is stamped.
- *
- * Only for a control whose parent GUEST-paints its client: there, 'controls' mode stamps
- * the control straight onto the flat overlay with no way to restore what was under it, so
- * a changed caption renders on top of the old one and both stay readable. Clearing first
- * makes the overlay repair (ancestor-aware) restore the background and the control is then
- * drawn once. A parent we paint ourselves needs none of this — its background is redrawn.
- */
-/**
  * Put back the guest's OWN pixels for the rect `win` occupies, from the client image an
  * ancestor last flushed (captured before any control was stamped over it).
  *
@@ -128,6 +119,13 @@ export function restoreClientRectFromAncestors(win: WindowInfo): boolean {
     return false;
 }
 
+/**
+ * Drop a control's pixels before its new content is stamped.
+ *
+ * Only for a control whose parent GUEST-paints its client: there the control is stamped
+ * straight onto the flat overlay with no way to restore what was under it, so a changed
+ * caption renders on top of the old one and both stay readable.
+ */
 export function eraseControlOverlayRect(child: WindowInfo): boolean {
     // System controls ONLY — the things WE stamp. A child WINDOW paints itself and can be
     // page-sized; flooding its whole rect with one sampled colour paints over everything it

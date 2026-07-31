@@ -11,14 +11,17 @@
  */
 
 import { System } from '../../core/system';
+import { isStockObject, getStockObject } from '../gdi32/gdi-objects';
 import { WindowInfo, windows, registerControlStatePurger } from './shared-state';
 
 export interface ControlColorOverride {
     /** CSS colors; undefined field = keep classic-theme default. */
     text?: string;
     bk?: string;
-    /** Background brush returned from WM_CTLCOLOR* (fills the control rect). */
-    brush?: string;
+    /** Background the WM_CTLCOLOR* answer fills the control rect with.
+     *  undefined = do NOT fill (the guest answered with a null/hollow brush, which is
+     *  how a caption is drawn over a bitmap dialog background). */
+    fill?: string;
 }
 
 const WM_CTLCOLOREDIT = 0x0133;
@@ -95,12 +98,28 @@ const COLORREF_BLACK = 0x00000000;
 const COLORREF_WHITE = 0x00FFFFFF;
 const COLORREF_BTNFACE = 0x00C8D0D4;
 
+const BKMODE_TRANSPARENT = 1;
+const BKMODE_OPAQUE = 2;
+
 /** Preset the query DC with the class's default text/bk colors before the guest sees it. */
 export function presetCtlColorDC(child: WindowInfo, hdc: number, ctlColorMsg: number): void {
     const gdi = System.getInstance().gdiContext;
     const fieldBk = ctlColorMsg === WM_CTLCOLOREDIT || ctlColorMsg === WM_CTLCOLORLISTBOX;
     gdi.setTextColor(hdc, COLORREF_BLACK);
     gdi.setBkColor(hdc, fieldBk ? COLORREF_WHITE : COLORREF_BTNFACE);
+    // OPAQUE is the Win32 DC default; our memory DCs start TRANSPARENT, and the guest's
+    // own SetBkMode is only readable as a CHANGE from a known starting point.
+    gdi.setBkMode(hdc, BKMODE_OPAQUE);
+}
+
+/** CSS for an HBRUSH, resolving the stock handles gdiContext's object table never
+ *  holds. 'transparent' is the stock NULL/HOLLOW brush; null = unresolvable. */
+function brushCss(returnedBrush: number): string | null {
+    const css = System.getInstance().gdiContext.getBrushCss(returnedBrush);
+    if (css !== null) return css;
+    if (!isStockObject(returnedBrush)) return null;
+    const stock = getStockObject(returnedBrush);
+    return stock?.type === 'BRUSH' && typeof stock.data === 'string' ? stock.data : null;
 }
 
 /**
@@ -120,12 +139,23 @@ export function captureCtlColorResult(
         colorCache.set(child.handle, {});
         return hadOverride;
     }
+    // SetBkMode returns the PREVIOUS mode (Win32) — the only way to read back what the
+    // guest set, gdiContext exposing no getter. Probe and restore.
+    const bkMode = gdi.setBkMode(hdcResult, BKMODE_OPAQUE);
+    gdi.setBkMode(hdcResult, bkMode);
+
+    const css = brushCss(returnedBrush);
+    const bk = gdi.getBkColorCss(hdcResult) ?? undefined;
     const next: ControlColorOverride = {
         text: gdi.getTextColorCss(hdcResult) ?? undefined,
-        bk: gdi.getBkColorCss(hdcResult) ?? undefined,
-        brush: gdi.getBrushCss(returnedBrush) ?? undefined,
+        bk,
+        // A hollow brush is an explicit "leave the background alone". An unresolvable
+        // brush falls back to the DC's bk color, but only while the guest is painting
+        // OPAQUE — under TRANSPARENT that color is not a background it wants filled.
+        fill: css === 'transparent' ? undefined
+            : (css ?? (bkMode === BKMODE_TRANSPARENT ? undefined : bk)),
     };
     const prev = colorCache.get(child.handle)?.override;
     colorCache.set(child.handle, { override: next });
-    return !prev || prev.text !== next.text || prev.bk !== next.bk || prev.brush !== next.brush;
+    return !prev || prev.text !== next.text || prev.bk !== next.bk || prev.fill !== next.fill;
 }

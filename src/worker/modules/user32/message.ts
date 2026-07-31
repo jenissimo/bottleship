@@ -996,7 +996,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
             const window = getWindowByHandle(hwnd);
             if (window?.isSystemControl && !window.wndProcSubclassed) {
                 const result = handleSystemControlMessage(window, message, wParam, lParam, mem);
-                if (isContentChangingMessage(message)) {
+                if (isContentChangingMessage(window, message)) {
                     repaintDialogAfterContentChange(window.parent ?? hwnd);
                 }
                 if (message === WM_NCDESTROY) finalizeWindowDestroy(hwnd);
@@ -1299,7 +1299,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
                 // Repaint content changes done outside the HLE modal pump (games that
                 // pump their own messages and SendMessage TBM_SETPOS / LB_ADDSTRING /
                 // WM_SETTEXT etc. at runtime — e.g. TS dialog init from its dlgProc).
-                if (isContentChangingMessage(msg)) {
+                if (isContentChangingMessage(targetWindow, msg)) {
                     // Drop the control's OLD pixels first. On a guest-painted parent the
                     // repaint below can only STAMP the control — it cannot restore what was
                     // under it — so a changed caption renders on top of the previous one and

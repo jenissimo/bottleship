@@ -990,7 +990,7 @@ function runModalDialog(
                 if (mem8) {
                     handleSystemControlMessage(targetInfo, message, wParam, lParam, mem8);
                     // Repaint after content-changing messages (WM_SETTEXT, LB_ADDSTRING, etc.)
-                    if (isContentChangingMessage(message)) {
+                    if (isContentChangingMessage(targetInfo, message)) {
                         repaintDialogAfterContentChange(targetInfo.parent ?? dialogHwnd);
                     }
                 }

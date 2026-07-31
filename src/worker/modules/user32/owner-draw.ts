@@ -159,6 +159,8 @@ export interface OwnerDrawDeps {
     createChildDC: (childHwnd: number) => number;
     /** Composite the child DC onto the overlay (on top of the background) + release it. */
     flushChildDC: (childDc: number) => void;
+    /** Release a child DC WITHOUT compositing it. */
+    discardChildDC: (childDc: number) => void;
 }
 
 /** One guest-paint task: an owner-draw button (WM_DRAWITEM into a DC we supply), a
@@ -256,7 +258,7 @@ function runGuestPaintChain(
                     frameId,
                 );
                 if (inv.callbackId !== 0) return inv.callbackId;
-                deps.flushChildDC(pendingDc);
+                deps.discardChildDC(pendingDc);
                 pendingDc = 0;
                 pendingCtlColor = null;
                 continue;
@@ -308,15 +310,21 @@ function runGuestPaintChain(
 
     const onTaskComplete = (ret: number): number | null => {
         try {
-            // WM_CTLCOLOR* answer: cache the DC's text/bk colors + returned HBRUSH.
+            // WM_CTLCOLOR* answer: cache the DC's text/bk colors + returned HBRUSH. The
+            // query DC is DISCARDED, never composited — it is seeded from an ancestor's
+            // retained client backing (createWindowClientDC), so flushing it would stamp
+            // that backdrop over the control's current pixels once per query.
             if (pendingCtlColor) {
                 if (captureCtlColorResult(pendingCtlColor, pendingDc, ret >>> 0)) {
                     ctlColorsChanged = true;
                 }
                 pendingCtlColor = null;
+                if (pendingDc) {
+                    deps.discardChildDC(pendingDc);
+                    pendingDc = 0;
+                }
             }
-            // Composite the owner-draw button's DC (no-op for self-painting controls;
-            // a ctlcolor query DC was seeded from the overlay, so this is a visual no-op).
+            // Composite the owner-draw button's DC (no-op for self-painting controls).
             if (pendingDc) {
                 deps.flushChildDC(pendingDc);
                 pendingDc = 0;
