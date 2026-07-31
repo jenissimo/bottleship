@@ -16,8 +16,10 @@
  *
  * Bun script (top-level await, Bun.spawnSync, global fetch/WebSocket).
  */
-import { gzipSync } from "node:zlib";
-import { closeSync, existsSync, openSync, rmSync, statSync } from "node:fs";
+import { createGzip } from "node:zlib";
+import { closeSync, createWriteStream, existsSync, openSync, rmSync, statSync } from "node:fs";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pickSessionTab, sessionFromEnv, sessionOwnsUrl, sessionUrl } from "../src/harness/session";
@@ -29,6 +31,7 @@ export const DEFAULT_DEV_URL = process.env.BS_DEV_URL ?? "http://localhost:5174/
 export const SIDECAR_PORT = Number(process.env.BS_SIDECAR_PORT ?? 3001);
 export const GAME_DEV_FILTER = "game=dev";
 const IS_MAC = process.platform === "darwin";
+const IS_WIN = process.platform === "win32";
 const CHROME_PATH = IS_MAC
     ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
     : "C:/Program Files/Google/Chrome/Application/chrome.exe";
@@ -68,15 +71,24 @@ function acquireLaunchLock(port: number, kind = "cdp", ttlMs = LAUNCH_LOCK_TTL_M
     return acquireLockAt(path, ttlMs);
 }
 
+/**
+ * `null` = someone else holds the lock, and the caller then WAITS for their launch. So only
+ * EEXIST may return null: on a read-only tmpdir or a bad path every attempt failed with
+ * EPERM/ENOENT, the caller waited out the full launch timeout, and nothing had ever started.
+ * Anything that is not contention is rethrown.
+ */
 function acquireLockAt(path: string, ttlMs: number): (() => void) | null {
     for (let attempt = 0; attempt < 2; attempt++) {
         try {
             closeSync(openSync(path, "wx"));
             return () => { try { rmSync(path); } catch { /* already gone */ } };
-        } catch {
+        } catch (e: any) {
+            if (e?.code !== "EEXIST") {
+                throw new Error(`cannot create the launch lock ${path}: ${e?.code ?? e}`);
+            }
             try {
                 if (Date.now() - statSync(path).mtimeMs > ttlMs) { rmSync(path); continue; }
-            } catch { continue; }
+            } catch { continue; }   // the holder released it between our open and our stat
             return null;
         }
     }
@@ -293,7 +305,10 @@ export async function captureTrace(
         "v8", "v8.execute", "devtools.timeline", "blink.user_timing", "toplevel",
     ];
     const events: any[] = [];
-    session.on("Tracing.dataCollected", (p) => { if (p?.value) events.push(...p.value); });
+    // Not `push(...batch)`: the spread passes every element as an ARGUMENT, and Chrome sends
+    // batches well past the engine's argument limit on a busy trace — a RangeError thrown
+    // inside the event callback, losing the recording.
+    session.on("Tracing.dataCollected", (p) => { if (p?.value) for (const e of p.value) events.push(e); });
     const complete = new Promise<void>((resolve) => session.on("Tracing.tracingComplete", () => resolve()));
 
     await session.send("Tracing.start", {
@@ -318,10 +333,20 @@ export async function captureTrace(
     await Promise.race([complete, new Promise((r) => setTimeout(r, 120_000))]);
     session.close();
 
-    const json = JSON.stringify({ traceEvents: events });
-    const gz = gzipSync(Buffer.from(json));
-    await Bun.write(outFile, gz);
-    return { file: outFile, events: events.length, bytes: gz.byteLength };
+    // Serialized one event at a time straight into the gzip stream. A whole-document
+    // JSON.stringify + Buffer.from + gzipSync holds the event array, a multi-hundred-MB string
+    // and the compressed buffer at once — a 30 s trace of a busy worker is enough to run the
+    // process out of heap after the recording succeeded.
+    await pipeline(
+        Readable.from((function* () {
+            yield '{"traceEvents":[';
+            for (let i = 0; i < events.length; i++) yield (i ? "," : "") + JSON.stringify(events[i]);
+            yield "]}";
+        })()),
+        createGzip(),
+        createWriteStream(outFile),
+    );
+    return { file: outFile, events: events.length, bytes: statSync(outFile).size };
 }
 
 /** Connect to the game=dev page target. */
@@ -577,23 +602,51 @@ async function viteTransformOk(timeoutMs = 20_000): Promise<boolean> {
     } catch { return false; }
 }
 
+/** `.vite-temp` untouched for this long is a leftover, not an optimizer mid-run. */
+const VITE_TEMP_STALE_MS = 120_000;
+
 /**
  * Vite pre-bundles deps into `node_modules/.vite-temp` and renames it to `.vite/deps`.
  * When that rename does not happen — which it does under concurrent starts — every dep
- * request 504s forever and no amount of waiting recovers it. The half-state is precisely
- * detectable, so detect and clear it rather than asking a human to notice.
+ * request 504s forever and no amount of waiting recovers it.
+ *
+ * `.vite-temp` present and `.vite/deps` absent is ALSO the normal state of an optimizer that
+ * is simply still running, so that pair alone is not the failure — deleting on it destroys a
+ * healthy cold start. The failure needs a second witness: nothing is listening on the dev
+ * port (so no optimizer can be writing), or the directory has not been touched in minutes.
  */
-function repairViteDepCache(): boolean {
+function repairViteDepCache(listening: boolean): boolean {
     const temp = join(process.cwd(), "node_modules", ".vite-temp");
     const deps = join(process.cwd(), "node_modules", ".vite", "deps");
     if (!existsSync(temp) || existsSync(deps)) return false;
+    if (listening) {
+        let age = 0;
+        try { age = Date.now() - statSync(temp).mtimeMs; } catch { return false; }
+        if (age < VITE_TEMP_STALE_MS) return false;   // an optimizer is still working
+    }
     rmSync(temp, { recursive: true, force: true });
     rmSync(join(process.cwd(), "node_modules", ".vite"), { recursive: true, force: true });
     return true;
 }
 
+/** Detached `bun run dev`, so it outlives this process on every platform. */
+function spawnVite(): void {
+    if (!IS_WIN) {
+        Bun.spawn(["bun", "run", "dev"], {
+            cwd: process.cwd(), stdin: "ignore", stdout: "ignore", stderr: "ignore",
+        }).unref();
+        return;
+    }
+    // A plain Bun.spawn child dies with bun on Windows, hence Start-Process. PowerShell
+    // single-quoted literals escape a quote by doubling it — a repo path containing one
+    // would otherwise terminate the string and change the command.
+    const q = (s: string) => `'${s.replace(/'/g, "''")}'`;
+    Bun.spawnSync(["powershell", "-NoProfile", "-Command",
+        `Start-Process -FilePath 'bun' -ArgumentList 'run','dev' -WorkingDirectory ${q(process.cwd())} -WindowStyle Hidden`]);
+}
+
 function killWedgedVite(): void {
-    if (IS_MAC) { Bun.spawnSync(["pkill", "-f", "vite"]); return; }
+    if (!IS_WIN) { Bun.spawnSync(["pkill", "-f", "vite"]); return; }
     // By PID via the listening socket — matching 'vite' on the command line kills every
     // Vite on the machine, including other agents' and other checkouts'.
     const port = new URL(DEFAULT_DEV_URL).port || "5174";
@@ -627,14 +680,22 @@ export async function ensureVite(): Promise<{ ok: boolean; action: string }> {
 
     try {
         const listening = await (async () => { try { return (await fetch(new URL(DEFAULT_DEV_URL).origin, { signal: AbortSignal.timeout(5_000) })).ok; } catch { return false; } })();
-        const repaired = repairViteDepCache();
-        // Serving static but not transforming = wedged; it will never recover on its own.
-        if (listening || repaired) {
+        // Serving static but not transforming = wedged, and it will never recover on its own —
+        // but the tmpdir lock does not cover a hand-started `bun run dev`, so this process
+        // cannot tell "wedged" from "another agent's, mid-cold-start". Killing it on a guess is
+        // indistinguishable from sabotage in a parallel session, so say what is wrong and let
+        // the owner decide.
+        if (listening && !process.env.BS_VITE_FORCE_RESTART) {
+            console.error(`[ensureVite] :${port} is serving but not transforming, and this process did not start it.`);
+            console.error("  Restart it yourself, or set BS_VITE_FORCE_RESTART=1 to let the harness do it.");
+            return { ok: false, action: "wedged-but-not-ours" };
+        }
+        if (listening) {
             killWedgedVite();
             for (let i = 0; i < 30 && await portInUse(port); i++) await Bun.sleep(1_000);
         }
-        Bun.spawnSync(["powershell", "-NoProfile", "-Command",
-            `Start-Process -FilePath 'bun' -ArgumentList 'run','dev' -WorkingDirectory '${process.cwd()}' -WindowStyle Hidden`]);
+        const repaired = repairViteDepCache(false);
+        spawnVite();
         const deadline = Date.now() + VITE_COLD_START_MS;
         while (Date.now() < deadline) {
             if (await viteTransformOk(10_000)) {

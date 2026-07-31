@@ -16,7 +16,7 @@
 
 import { appendFile, readdir, unlink, stat, mkdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { normalizeSession, sessionLogDir } from "../../src/harness/session";
 
 const CONFIG = {
@@ -24,11 +24,18 @@ const CONFIG = {
   // writing into the first one's logs/. Pair it with VITE_SIDECAR_PORT on the page.
   PORT: Number(process.env.BS_SIDECAR_PORT ?? 3001),
   LOG_DIR: "logs",
-  MAX_SIZE: 50 * 1024 * 1024,  // 50MB per file (increased from 20MB)
-  MAX_FILES: 5,                 // Keep only 5 files (reduced from 20)
-  MAX_AGE_MS: 24 * 60 * 60 * 1000, // 24 hours (reduced from 7 days)
+  MAX_SIZE: 50 * 1024 * 1024,  // 50MB per file
+  MAX_FILES: 5,
+  MAX_AGE_MS: 24 * 60 * 60 * 1000,
   FLUSH_INTERVAL: 1000,
   BUFFER_LIMIT: 100,
+  /** Largest single `write_file`/`write_file_b64` payload (a 4K RGBA surface dump fits). */
+  MAX_WRITE_BYTES: 64 * 1024 * 1024,
+  /** Per-connection write budget, refilled every WRITE_WINDOW_MS. */
+  MAX_WRITES_PER_WINDOW: 120,
+  WRITE_WINDOW_MS: 10_000,
+  /** Distinct `?bs=<name>` archives one process will open. A client picks the name. */
+  MAX_SESSIONS: 32,
 } as const;
 
 const LEVELS = ["SILENT", "ERROR", "WARN", "NORMAL", "VERBOSE"];
@@ -53,6 +60,7 @@ class LogManager {
   private currentPath = "";
   private currentSize = 0;
   private timer: Timer | null = null;
+  private timer2: Timer | null = null;
   private dirReady = false;
   private flushing = false; // Prevent concurrent flushes
   private readonly dir: string;
@@ -66,8 +74,15 @@ class LogManager {
       // A client can rotate (naming the file after its game) before mkdir resolves —
       // don't stomp that name with the default one.
       if (!this.currentPath) this.rotate();
+      // Leading sweep: whatever the previous run left is already over budget.
+      void this.cleanup();
     });
-    setInterval(() => this.cleanup(), 3600000);
+    this.timer2 = setInterval(() => this.cleanup(), 3600000);
+  }
+
+  dispose() {
+    if (this.timer2) { clearInterval(this.timer2); this.timer2 = null; }
+    if (this.timer) { clearTimeout(this.timer); this.timer = null; }
   }
 
   get currentPathPublic(): string {
@@ -123,7 +138,10 @@ class LogManager {
       await appendFile(this.currentPath, data);
       this.currentSize += data.length;
       console.log(`[FS] Wrote ${toWrite.length} lines (${data.length} bytes), total ${this.currentSize} bytes`);
-      if (this.currentSize >= CONFIG.MAX_SIZE) this.rotate();
+      // Prune on every rotation, not only on the hourly timer: at the worker's log rate a
+      // single hour fills the archive with tens of GB before a timer-only sweep ever runs.
+      // Rotating bounds the dir at MAX_FILES x MAX_SIZE.
+      if (this.currentSize >= CONFIG.MAX_SIZE) { this.rotate(); void this.cleanup(); }
     } catch (e) {
       console.error("[FS] Flush failed, restoring buffer:", e);
       // Restore data to beginning of buffer for retry
@@ -154,13 +172,37 @@ class LogManager {
 }
 
 /** One archive per harness session (`?bs=<name>` on the page). "" is the default
- *  single-tab session and keeps writing straight to `logs/`. */
-const loggers = new Map<string, LogManager>([["", new LogManager()]]);
+ *  single-tab session and keeps writing straight to `logs/`. Refcounted by connected
+ *  sockets: the session name is client-supplied, so an unbounded map of timer-owning
+ *  managers is a client-driven leak. The default session is pinned. */
+const loggers = new Map<string, { mgr: LogManager; refs: number }>([
+  ["", { mgr: new LogManager(), refs: 1 }],
+]);
 
 function loggerFor(session: string): LogManager {
-  let m = loggers.get(session);
-  if (!m) { m = new LogManager(session); loggers.set(session, m); }
-  return m;
+  const hit = loggers.get(session);
+  if (hit) return hit.mgr;
+  if (loggers.size >= CONFIG.MAX_SESSIONS) {
+    console.warn(`[WS] session cap reached (${CONFIG.MAX_SESSIONS}) — '${session}' shares the default archive`);
+    return loggers.get("")!.mgr;
+  }
+  const mgr = new LogManager(session);
+  loggers.set(session, { mgr, refs: 0 });
+  return mgr;
+}
+
+function retainSession(session: string) {
+  const hit = loggers.get(session);
+  if (hit) hit.refs++;
+}
+
+async function releaseSession(session: string) {
+  const hit = loggers.get(session);
+  if (!hit || session === "") return;
+  if (--hit.refs > 0) return;
+  loggers.delete(session);
+  await hit.mgr.flush();
+  hit.mgr.dispose();
 }
 
 /**
@@ -178,15 +220,41 @@ function loggerFor(session: string): LogManager {
  * request header, the browser preflights, so OPTIONS must be answered too.
  */
 /**
- * The route hands out whole files by ABSOLUTE path (bundles legitimately live outside the repo,
- * e.g. a WGB drop folder), so the only thing standing between it and "any page you visit can read
- * files off this machine" is the origin. `*` would hand that away — CORS is the access control
- * here, not a formality.
+ * Who may READ a response body cross-origin, and who may open the WebSocket at all. `*` would
+ * hand the first away; see wsOriginAllowed for why the second matters more.
  */
 const DEV_PORTS = [5174, ...(process.env.BS_VITE_PORT ? [Number(process.env.BS_VITE_PORT)] : [])];
 const DEV_ORIGINS = new Set(DEV_PORTS.flatMap((p) =>
   ["http", "https"].flatMap((s) => [`${s}://localhost:${p}`, `${s}://127.0.0.1:${p}`]),
 ));
+
+/**
+ * CORS only decides who may READ the body; the read off disk happens regardless, and a UNC
+ * `path` would make Windows authenticate to a remote share (an NTLM handshake a `no-cors`
+ * fetch from any visited page can force). So `path` is confined to an explicit root set and
+ * UNC is refused outright. Roots: the repo, plus `BS_WGB_ROOTS` (`;`/`,`-separated) for a
+ * drop folder living outside it.
+ */
+const REPO_ROOT = resolve(import.meta.dir, "..", "..");
+
+/** `public/apps/external-wgb` is the repo's own pointer at the local drop folder — the tree
+ *  this checkout is already configured to load bundles from, so it is a root by definition. */
+function dropFolderRoot(): string[] {
+  const link = join(REPO_ROOT, "public", "apps", "external-wgb");
+  try { return [dirname(realpathSync(link))]; } catch { return []; }
+}
+
+const WGB_ROOTS = [
+  REPO_ROOT,
+  ...dropFolderRoot(),
+  ...(process.env.BS_WGB_ROOTS ?? "").split(/[;,]/).map((s) => s.trim()).filter(Boolean).map((s) => resolve(s)),
+];
+
+const isUnc = (p: string) => /^(\\\\|\/\/)/.test(p.trim());
+
+function underAnyRoot(file: string): boolean {
+  return WGB_ROOTS.some((root) => file === root || file.startsWith(root.endsWith(sep) ? root : root + sep));
+}
 
 function wgbHeaders(req: Request): Record<string, string> {
   const origin = req.headers.get("origin");
@@ -208,9 +276,14 @@ async function serveWgb(req: Request, url: URL): Promise<Response> {
 
   const abs = url.searchParams.get("path");
   if (!abs) return new Response("missing ?path=<absolute .wgb path>", { status: 400, headers: cors });
+  if (isUnc(abs)) return new Response("UNC paths are refused", { status: 403, headers: cors });
   const file = resolve(abs);
+  if (isUnc(file)) return new Response("UNC paths are refused", { status: 403, headers: cors });
   if (!file.toLowerCase().endsWith(".wgb")) {
     return new Response("only .wgb files", { status: 403, headers: cors });
+  }
+  if (!underAnyRoot(file)) {
+    return new Response("path is outside the configured roots (set BS_WGB_ROOTS)", { status: 403, headers: cors });
   }
 
   const f = Bun.file(file);
@@ -245,14 +318,42 @@ async function serveWgb(req: Request, url: URL): Promise<Response> {
   return new Response(f, { status: 200, headers });
 }
 
-/** Per-connection state: which session's archive this client's lines belong to.
- *  Set by the `log_session` message the page sends on connect. */
-interface SocketData { session: string }
+/** Per-connection state: which session's archive this client's lines belong to
+ *  (set by the `log_session` message the page sends on connect), plus the write budget. */
+interface SocketData { session: string; writes: number; windowStart: number }
+
+/**
+ * A WebSocket handshake is exempt from the same-origin policy: without this check ANY page
+ * the dev has open can open this socket and drive `write_file`. That writer is jailed to
+ * `logs/` — which is where `tools/harness.ts` writes the `.harness.ts` journals it later
+ * `await import()`s, so an unauthenticated write there is code execution on the dev box.
+ * Browsers always send `Origin` on a WS handshake, so requiring it costs nothing.
+ */
+function wsOriginAllowed(req: Request): boolean {
+  const origin = req.headers.get("origin");
+  return !!origin && DEV_ORIGINS.has(origin);
+}
+
+/** Refill the per-connection budget; false = over the limit for this window. */
+function takeWriteToken(ws: { data: SocketData }): boolean {
+  const now = Date.now();
+  if (now - ws.data.windowStart >= CONFIG.WRITE_WINDOW_MS) {
+    ws.data.windowStart = now;
+    ws.data.writes = 0;
+  }
+  return ++ws.data.writes <= CONFIG.MAX_WRITES_PER_WINDOW;
+}
 
 const server = Bun.serve<SocketData>({
   port: CONFIG.PORT,
+  // Loopback only. The route hands out whole files by absolute path; bound to 0.0.0.0 that
+  // is a read primitive for everything on the LAN, which no CORS header can withhold.
+  hostname: process.env.BS_SIDECAR_HOST ?? "127.0.0.1",
   fetch(req, server) {
-    if (server.upgrade(req, { data: { session: "" } })) return;
+    if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
+      if (!wsOriginAllowed(req)) return new Response("forbidden origin", { status: 403 });
+      if (server.upgrade(req, { data: { session: "", writes: 0, windowStart: Date.now() } })) return;
+    }
     const url = new URL(req.url);
     if (url.pathname === "/wgb") return serveWgb(req, url);
     // CORS/CORP on EVERY response, not just /wgb: the page is cross-origin isolated
@@ -270,14 +371,20 @@ const server = Bun.serve<SocketData>({
     },
     close(ws) {
       console.log("[WS] Client disconnected");
+      void releaseSession(ws.data.session);
     },
     async message(ws, msg) {
       try {
         const data = JSON.parse(String(msg));
         if (data.type === "log_session") {
           // A tab claiming its own archive file (multi-agent parallel bring-up).
-          ws.data.session = normalizeSession(data.session);
-          loggerFor(ws.data.session);
+          const next = normalizeSession(data.session);
+          if (next !== ws.data.session) {
+            await releaseSession(ws.data.session);
+            ws.data.session = next;
+            loggerFor(next);
+            retainSession(next);
+          }
           console.log(`[WS] Client session -> '${ws.data.session || "(default)"}'`);
           return;
         }
@@ -295,6 +402,14 @@ const server = Bun.serve<SocketData>({
             ws.send(JSON.stringify({ type: "write_file_error", error: "invalid_path" }));
             return;
           }
+          if (Buffer.byteLength(data.content, "utf8") > CONFIG.MAX_WRITE_BYTES) {
+            ws.send(JSON.stringify({ type: "write_file_error", error: "too_large" }));
+            return;
+          }
+          if (!takeWriteToken(ws)) {
+            ws.send(JSON.stringify({ type: "write_file_error", error: "rate_limited" }));
+            return;
+          }
           await log.ensureDir();
           await mkdir(dirname(fullPath), { recursive: true });
           await writeFile(fullPath, data.content, "utf8");
@@ -304,6 +419,14 @@ const server = Bun.serve<SocketData>({
           const fullPath = resolveSafeLogPath(data.path);
           if (!fullPath) {
             ws.send(JSON.stringify({ type: "write_file_error", error: "invalid_path" }));
+            return;
+          }
+          if (data.base64.length > CONFIG.MAX_WRITE_BYTES) {
+            ws.send(JSON.stringify({ type: "write_file_error", error: "too_large" }));
+            return;
+          }
+          if (!takeWriteToken(ws)) {
+            ws.send(JSON.stringify({ type: "write_file_error", error: "rate_limited" }));
             return;
           }
           const raw = Buffer.from(data.base64, "base64");
@@ -325,7 +448,7 @@ const server = Bun.serve<SocketData>({
 
 const shutdown = async () => {
   console.log("Shutting down...");
-  await Promise.all([...loggers.values()].map((l) => l.flush()));
+  await Promise.all([...loggers.values()].map((l) => l.mgr.flush()));
   server.stop();
   process.exit(0);
 };
@@ -333,4 +456,5 @@ const shutdown = async () => {
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
-console.log(`Server started on :${CONFIG.PORT}`);
+console.log(`Server started on ${server.hostname}:${CONFIG.PORT}`);
+console.log(`  /wgb roots: ${WGB_ROOTS.join(" | ")}`);

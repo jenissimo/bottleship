@@ -45,6 +45,7 @@ import {
     DEFAULT_DEV_URL,
     setPointerLock,
 } from "./cdp-core";
+import { resolve as resolvePath, sep } from "node:path";
 import { readCanvasGeometry } from "./cdp-geometry";
 import { applyDevice, tap, touchDrag, longPress, twoFingerTap, pinch } from "./cdp-touch";
 import { HarnessChain } from "../src/harness/dsl";
@@ -192,7 +193,10 @@ async function execViaCdp(steps: HarnessStep[]): Promise<HarnessRunResult> {
     }
 
     try {
-        const file = artifact(`logs/harness/run-${++_journalSeq}.harness.ts`);
+        // The PID is part of the name: `_journalSeq` is per-process, so two agents sharing one
+        // BS_TAB (or one agent running two scripts) both wrote run-1 and the second silently
+        // replaced the first's evidence.
+        const file = artifact(`logs/harness/run-${process.pid}-${++_journalSeq}.harness.ts`);
         await Bun.write(file, runResultToJournal(steps, result));
         console.log(`[harness] journal -> ${file} (${result.ok ? "ok" : "FAILED at step " + result.error?.atStep})`);
     } catch { /* logs/ may not exist; non-fatal */ }
@@ -312,8 +316,23 @@ async function cmdStack(samplesArg?: string): Promise<void> {
  *
  * RESTORE BEFORE LOADING THE BUNDLE — a running game holds these files open.
  */
+/**
+ * Join a container-relative path onto the fixture dir, refusing anything that leaves it.
+ * The path comes from the GUEST (a `containerList` entry), so a `..` component would have
+ * `fixture save` write over the checkout.
+ */
+function fixturePath(dir: string, p: string): string {
+    const root = resolvePath(dir);
+    const abs = resolvePath(root, p.replace(/^[\\/]+/, ""));
+    if (abs !== root && !abs.startsWith(root + sep)) {
+        throw new Error(`fixture entry "${p}" resolves outside ${dir}`);
+    }
+    return abs;
+}
+
 async function cmdFixture(mode: string, name: string, args: string[]): Promise<void> {
     if (!name) throw new Error("usage: fixture <save|restore> <name> [--container <id>]");
+    if (/[\\/]/.test(name) || name === "." || name === "..") throw new Error(`bad fixture name "${name}"`);
     const dir = `fixtures/${name}`;
     const flagAt = args.indexOf("--container");
     const flagContainer = flagAt >= 0 ? args[flagAt + 1] : "";
@@ -331,7 +350,7 @@ async function cmdFixture(mode: string, name: string, args: string[]): Promise<v
             const r = await harness().containerRead(container, f.path).run();
             if (!r.ok) throw new Error(`containerRead ${f.path} failed: ${r.error?.message}`);
             const { content } = r.named.containerRead as { content: string };
-            await Bun.write(`${dir}${f.path}`, Buffer.from(content, "base64"));
+            await Bun.write(fixturePath(dir, f.path), Buffer.from(content, "base64"));
             saved.push({ path: f.path, bytes: f.size });
         }
         const prior = await Bun.file(manifestPath).exists() ? JSON.parse(await Bun.file(manifestPath).text()) : {};
@@ -348,7 +367,7 @@ async function cmdFixture(mode: string, name: string, args: string[]): Promise<v
         const container = flagContainer || man.container;
         const done: Array<{ path: string; written: number }> = [];
         for (const p of man.files) {
-            const bytes = new Uint8Array(await Bun.file(`${dir}${p}`).arrayBuffer());
+            const bytes = new Uint8Array(await Bun.file(fixturePath(dir, p)).arrayBuffer());
             const r = await harness().containerWrite(container, p, Buffer.from(bytes).toString("base64")).run();
             if (!r.ok) throw new Error(`containerWrite ${p} failed: ${r.error?.message}`);
             done.push({ path: p, written: (r.named.containerWrite as { written: number }).written });

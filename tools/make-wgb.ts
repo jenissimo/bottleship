@@ -286,8 +286,10 @@ if (emptyDirs.size > 0) {
 }
 
 // Touch controls (host-side data; the worker only forwards it in bundle_meta).
-// A preset id stays a string; a .json path is parsed here so a malformed layout fails
-// at pack time instead of silently degrading to auto-detect on a phone.
+// A preset id stays a string; a .json path is parsed here so unreadable or syntactically
+// invalid JSON fails at pack time instead of silently degrading to auto-detect on a phone.
+// SYNTAX only — the layout's SHAPE is not validated, so a well-formed but wrong object
+// still ships.
 const TOUCH_PRESETS = ['pointer', 'pointer-rmb', 'wasd-look', 'dpad-buttons', 'pad'];
 const touchLayoutArg = get('--touch-layout');
 let touchLayout: string | Record<string, unknown> | undefined;

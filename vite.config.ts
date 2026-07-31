@@ -193,17 +193,13 @@ export default defineConfig({
     ...useSsl ? { https: true } : {},
     hmr: false,
     watch: {
-      // Chokidar registers one fs.watch (one OS handle) PER FILE, and its default
-      // ignores are only .git/node_modules/the cache dir — so it was watching
-      // logs/ (80k+ files, appended continuously by the dev sidecar), agent
-      // worktrees under .claude/, and tmp/. Registering those ~90k watches
-      // saturates the libuv threadpool for minutes after listen: measured 147 s
-      // (node) / 78 s (bun) until the first transform answered, with a single
-      // fs read of main.tsx queued for 71 s — while the whole 798-module graph
-      // transforms in under 1 s once the watcher settles. None of these trees
-      // contain importable modules; ignoring them is pure win.
-      // Forward slashes: picomatch treats backslashes as escapes, so a
-      // path.resolve() result would never match on Windows.
+      // Chokidar registers one fs.watch handle PER FILE and its defaults ignore only
+      // .git/node_modules/the cache dir. These trees hold no importable module and tens of
+      // thousands of files (logs/ is appended continuously by the dev sidecar), and watching
+      // them saturates the libuv threadpool for minutes after listen — the dev server answers
+      // nothing until the watcher settles.
+      // Forward slashes: picomatch treats backslashes as escapes, so a path.resolve() result
+      // would never match on Windows.
       ignored: ["logs", ".claude", "tmp", ".ghidra-home"].map(
         (d) => path.resolve(__dirname, d).replace(/\\/g, "/") + "/**"
       )
@@ -232,33 +228,19 @@ export default defineConfig({
     copyPublicDir: false
   },
   optimizeDeps: {
-    // Pre-bundling is not optional here: @phosphor-icons/react is a 4543-module barrel and
+    // Pre-bundling is not optional here: @phosphor-icons/react is a large barrel and
     // react/react-dom are CJS needing an ESM wrapper, so unbundled a single dev page load
     // would be thousands of requests.
     //
-    // List what we IMPORT, and only that — `include` forces esbuild to bundle a package
-    // whole, so naming an unused one is pure cost. (lucide-react is a dependency with zero
-    // imports in the tree; it belongs out of package.json, not in here.)
+    // This lists every bare import in the BROWSER tree and only that: `include` bundles a
+    // package whole, so naming an unused one is pure cost, while a dep the scanner discovers
+    // mid-session forces a re-optimization whose page reload has to travel over HMR — which is
+    // disabled above. Without that signal the page keeps requesting `?v=<hash>` URLs that no
+    // longer exist and every fresh module hangs while the server still looks alive.
     //
-    // A dep the scanner discovers mid-session triggers a re-optimization, after which Vite
-    // must tell the browser to reload — over the HMR channel, which is disabled below.
-    // Without that signal the page keeps requesting the previous `?v=<hash>` URLs, which no
-    // longer exist: the server looks alive (static and cached modules still answer 200)
-    // while every fresh module hangs.
-    //
-    // No `force`. It discarded a VALID cache on every start, so the optimizer re-ran — and
-    // re-hit the Windows failure where its output is left in `node_modules/.vite-temp` and
-    // never renamed into `.vite/deps`, after which every dep request 504s. Once per
-    // dependency change is survivable; every start was not.
-    // Listing what we import keeps the scanner from discovering a dep mid-session, which
-    // would re-optimize and then need a page reload it cannot request (HMR is off below).
-    // These are every bare import in the browser tree; the typescript/fs/path hits under
-    // src/ belong to tooling no browser entry reaches.
-    //
-    // `noDiscovery: true` was tried here and REVERTED: the measurement that appeared to
-    // show a 12 s cold start turned out to be an old server answering, and while it was
-    // set the worker's `pako` request 504'd. Startup cost is still unexplained — see
-    // docs/development.md.
+    // No `force`: it discards a valid cache on every start, and each re-run can re-hit the
+    // Windows failure where the optimizer's output is left in `node_modules/.vite-temp` and
+    // never renamed into `.vite/deps`, after which every dep request 504s.
     include: ["react", "react-dom", "@phosphor-icons/react", "pako"]
   }
 });
