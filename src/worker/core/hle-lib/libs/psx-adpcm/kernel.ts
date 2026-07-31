@@ -55,11 +55,22 @@ const clamp16 = (v: number): number => (v < -32768 ? -32768 : v > 32767 ? 32767 
 const si16 = (view: ShadowView, addr: number): number => (view.readU16(addr) << 16) >> 16;
 const si32 = (view: ShadowView, addr: number): number => view.readU32(addr) | 0;
 
-/** Where the guest's two `movsx ..., word [edx*4 + disp32]` read their coefficients.
- *  Extracted from the live image at detection time — see descriptor.ts. */
-let coefTable = 0;
-export const setCoefTable = (addr: number): void => { coefTable = addr >>> 0; };
-export const getCoefTable = (): number => coefTable;
+/**
+ * Where the guest's two `movsx ..., word [edx*4 + disp32]` read their coefficients.
+ * Extracted from the live image at detection time — see descriptor.ts.
+ *
+ * Keyed by the DECODER'S OWN ENTRY, not held as a module-level singleton: this codec is
+ * routinely statically linked into more than one module of a process, and each copy has its
+ * own relocated table. One shared slot would leave the first copy decoding through the
+ * second's table.
+ */
+const coefTables = new Map<number, number>();
+export const setCoefTable = (decoderEntry: number, addr: number): void => {
+    coefTables.set(decoderEntry >>> 0, addr >>> 0);
+};
+export const getCoefTable = (decoderEntry: number): number => coefTables.get(decoderEntry >>> 0) ?? 0;
+export const getCoefTables = (): Array<[number, number]> => Array.from(coefTables.entries());
+export const clearCoefTables = (): void => { coefTables.clear(); };
 
 export interface AdpcmSpan { addr: number; len: number }
 
@@ -105,7 +116,7 @@ export function isAliased(spans: { src: AdpcmSpan; dst: AdpcmSpan }, ctx: number
  * struct resolves exactly as it does on the CPU. This is the reference; `decodeFast`
  * is an optimisation of it that only applies when nothing aliases.
  */
-export function decodeExact(view: ShadowView, ctx: number): number {
+export function decodeExact(view: ShadowView, ctx: number, coefTable: number): number {
     let count = si32(view, ctx + ST_COUNT);
     // Both loop bounds live in memory the loop can itself write when the destination
     // aliases the state, so they are capped at the structurally correct counts. Exceeding
@@ -165,7 +176,7 @@ export function decodeExact(view: ShadowView, ctx: number): number {
  * construction — the loop reads only the source and the state fields it tracks, and
  * never reads the destination.
  */
-export function decodeFast(view: ShadowView, ctx: number, blocks: number): number {
+export function decodeFast(view: ShadowView, ctx: number, blocks: number, coefTable: number): number {
     let count = si32(view, ctx + ST_COUNT);
     let src = view.readU32(ctx + ST_SRC);
     let dst = view.readU32(ctx + ST_DST);
@@ -222,19 +233,20 @@ export const adpcmCounters = {
 /** The ShadowSpec kernel: picks the exact path when anything aliases, the hoisted one
  *  otherwise. Throws when the call is outside the modelled envelope — the framework
  *  treats that as "our ABI model is wrong" and hands the function back to the guest. */
-export function adpcmKernel(view: ShadowView, args: number[], memLength: number): number {
+export function adpcmKernel(view: ShadowView, args: number[], memLength: number, decoderEntry: number): number {
     const ctx = args[0] >>> 0;
     const spans = decodeSpans(view, ctx, memLength);
     if (spans === null) {
         throw new Error(`psx-adpcm: state 0x${ctx.toString(16)} outside the modelled envelope`);
     }
+    const coefTable = getCoefTable(decoderEntry);
     adpcmCounters.calls++;
-    if (spans.blocks === 0) { adpcmCounters.emptyCalls++; return decodeExact(view, ctx); }
+    if (spans.blocks === 0) { adpcmCounters.emptyCalls++; return decodeExact(view, ctx, coefTable); }
     adpcmCounters.blocks += spans.blocks;
     adpcmCounters.samples += spans.blocks * SAMPLES_PER_BLOCK;
     if (coefTable === 0) {
-        throw new Error('psx-adpcm: coefficient table address never resolved');
+        throw new Error(`psx-adpcm: no coefficient table for decoder 0x${(decoderEntry >>> 0).toString(16)}`);
     }
-    if (isAliased(spans, ctx)) { adpcmCounters.aliasedCalls++; return decodeExact(view, ctx); }
-    return decodeFast(view, ctx, spans.blocks);
+    if (isAliased(spans, ctx)) { adpcmCounters.aliasedCalls++; return decodeExact(view, ctx, coefTable); }
+    return decodeFast(view, ctx, spans.blocks, coefTable);
 }

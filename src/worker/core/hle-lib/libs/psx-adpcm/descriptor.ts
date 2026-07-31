@@ -4,18 +4,10 @@
  * Harry Potter: Chamber of Secrets; the hook keys on the codec's own bytes, so any
  * image carrying this decoder is covered and none is named.
  *
- * WHAT IT IS WORTH, measured rather than assumed. The loop was picked up as ~37% of
- * retired guest instructions, which did not survive checking: with the decoder's page
- * explicitly instrumented (`guestBlocks({pages:[…]})`) over 30 s windows it is 4.7% of
- * counted guest instructions while ADPCM audio plays and absent otherwise, decoding
- * 83,887 samples/s — real-time 44.1 kHz stereo, not a pathology. Six interleaved A/B
- * boots put the hook 3.3% slower nominally against an 8-14% within-arm spread: no effect
- * either way. The hook is kept because it is byte-exact, self-validating and free when
- * idle, NOT because it was shown to be faster. The 37% figure came from a census that
- * watched an arbitrary quarter of the tier-2 pages and normalised shares within it.
- *
- * It qualifies under §3.8 regardless: a pure-compute leaf with no calls and no state
- * beyond its one argument is exactly the shape that section sanctions.
+ * It qualifies under §3.8: a pure-compute leaf with no calls and no state beyond its one
+ * argument is exactly the shape that section sanctions. It is kept for being byte-exact,
+ * self-validating and free when idle — not for a measured speedup (see
+ * plan/hle-lib-measurements.md).
  *
  * THE FUNCTION (Core.dll static VA 0x1017ab80 .. 0x1017acab, cdecl, one argument,
  * `ret` with no immediate, ZERO calls in the body):
@@ -62,8 +54,9 @@ import type {
 import {
     adpcmCounters,
     adpcmKernel,
+    clearCoefTables,
     decodeSpans,
-    getCoefTable,
+    getCoefTables,
     isAliased,
     PSX_COEF_TABLE_X4,
     setCoefTable,
@@ -150,7 +143,7 @@ function resolveDecoder(view: ResolverModuleView): HookedFunctionMatch[] {
             return [];
         }
     }
-    setCoefTable(lo);
+    setCoefTable(entry, lo);
     Logger.log(LogCategory.SYSTEM,
         `[psx-adpcm] ${view.module.name}: decoder 0x${entry.toString(16)}, `
         + `PSX/VAG filter table 0x${lo.toString(16)} confirmed`);
@@ -192,7 +185,7 @@ const shadow: ShadowSpec = {
         if (spans === null) return [];
         return spansToRanges(ctx, spans.dst);
     },
-    kernel: (view: ShadowView, args: number[]) => adpcmKernel(view, args, memLength()),
+    kernel: (view: ShadowView, args: number[], site) => adpcmKernel(view, args, memLength(), site.targetAddress),
 };
 
 export const psxAdpcmDescriptor: LibDescriptor = {
@@ -225,14 +218,18 @@ export const psxAdpcmDescriptor: LibDescriptor = {
     handlers: {},
     resolveAdditionalFunctions: resolveDecoder,
     onActivated() {
-        // How much audio the title actually asks for, which is the other half of the
-        // profile finding: 37% of guest instructions is only alarming in proportion to
-        // the samples it produces. `aliasedCalls` should stay 0 — a non-zero count
-        // means content exists that the hoisted path must not serve.
+        // How much audio the title actually asks for — the denominator any instruction-share
+        // claim has to be read against. `aliasedCalls` should stay 0: a non-zero count means
+        // content exists that the hoisted path must not serve.
         (globalThis as Record<string, unknown>).__psxAdpcmStats = () => ({
             ...adpcmCounters,
-            coefTable: '0x' + getCoefTable().toString(16),
+            coefTables: getCoefTables().map(([entry, table]) =>
+                `0x${entry.toString(16)}→0x${table.toString(16)}`),
         });
+    },
+    onReset() {
+        clearCoefTables();
+        adpcmCounters.reset();
     },
 };
 

@@ -107,6 +107,23 @@ function findAttrib(entry: VfsEntry): number {
     return entry.kind === "dir" ? A_SUBDIR : (A_NORMAL | A_ARCH);
 }
 
+/**
+ * The one timestamp every file carries: 2020-01-01 UTC, as time_t.
+ *
+ * The VFS keeps no per-file mtime, and leaving the fields at zero dates every file to the
+ * epoch — a guest that compares a cache/save against its source then sees "1970" for both
+ * operands, which is not a comparison anyone wrote code for. A single plausible instant makes
+ * same-age the answer, and it is the SAME instant kernel32's BY_HANDLE_FILE_INFORMATION and
+ * WIN32_FIND_DATA report, so the CRT and Win32 views of a file cannot disagree.
+ */
+const FIXED_TIME_T = 1577836800; // 2020-01-01T00:00:00Z
+
+/** Write a time_t at `offset`; `wide` selects the 64-bit __time64_t layout. */
+function writeTimeT(structPtr: number, offset: number, wide: boolean): void {
+    Mem.writeUint32(structPtr + offset, FIXED_TIME_T);
+    if (wide) Mem.writeUint32(structPtr + offset + 4, 0);
+}
+
 function writeFindName(structPtr: number, offset: number, chars: number, name: string): void {
     const nameBytes = new Uint8Array(chars);
     const nameLen = Math.min(name.length, chars - 1);
@@ -120,6 +137,9 @@ function fillFindData64i32(structPtr: number, entry: VfsEntry, host: Vc9IoHost):
     writeFindName(structPtr, FINDDATA64I32_OFFSETS.name, FINDDATA64I32_NAME_CHARS, entry.name);
     Mem.writeUint32(structPtr + FINDDATA64I32_OFFSETS.size, entry.size >>> 0);
     Mem.writeUint32(structPtr + FINDDATA64I32_OFFSETS.attrib, findAttrib(entry));
+    writeTimeT(structPtr, FINDDATA64I32_OFFSETS.time_create, true);
+    writeTimeT(structPtr, FINDDATA64I32_OFFSETS.time_access, true);
+    writeTimeT(structPtr, FINDDATA64I32_OFFSETS.time_write, true);
 }
 
 function fillFindData32(structPtr: number, entry: VfsEntry, host: Vc9IoHost): void {
@@ -127,6 +147,9 @@ function fillFindData32(structPtr: number, entry: VfsEntry, host: Vc9IoHost): vo
     writeFindName(structPtr, FINDDATA32_OFFSETS.name, FINDDATA32_NAME_CHARS, entry.name);
     Mem.writeUint32(structPtr + FINDDATA32_OFFSETS.size, entry.size >>> 0);
     Mem.writeUint32(structPtr + FINDDATA32_OFFSETS.attrib, findAttrib(entry));
+    writeTimeT(structPtr, FINDDATA32_OFFSETS.time_create, false);
+    writeTimeT(structPtr, FINDDATA32_OFFSETS.time_access, false);
+    writeTimeT(structPtr, FINDDATA32_OFFSETS.time_write, false);
 }
 
 /*
@@ -172,6 +195,11 @@ export function fillStatStruct(
     Mem.writeUint16(structPtr + offsets.st_nlink, 1);
     Mem.writeUint32(structPtr + offsets.st_size, isDir ? 0 : size >>> 0);
     if (offsets.st_size === STAT64_OFFSETS.st_size) Mem.writeUint32(structPtr + offsets.st_size + 4, 0);
+    // 64-bit time_t is what puts st_mtime 8 bytes after st_atime; _stat's is 4.
+    const wideTime = offsets.st_mtime - offsets.st_atime === 8;
+    writeTimeT(structPtr, offsets.st_atime, wideTime);
+    writeTimeT(structPtr, offsets.st_mtime, wideTime);
+    writeTimeT(structPtr, offsets.st_ctime, wideTime);
 }
 
 /** __stat64 (56 bytes) — 64-bit st_size. */

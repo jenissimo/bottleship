@@ -48,6 +48,12 @@ export function registerCrtPathExports(exports: Record<string, ThunkImplementati
         // came back qualified through one form and bare through the other, and the
         // NULL-buffer form could not have been fixed up anyway (its block is already sized).
         const cwd = qualifyDrive((system as any).currentDirectory || "C:\\");
+        // maxLen is a signed int. `>>> 0` turns _getcwd(NULL, -1) into a 4 GiB malloc; the
+        // real CRT validates it and sets EINVAL.
+        if ((maxLen | 0) <= 0) {
+            host.setErrno(22); // EINVAL
+            return 0;
+        }
         if (!buffer) {
             // buffer==NULL: the CRT mallocs a block of AT LEAST `maxLen` characters and
             // hands ownership to the caller — the size is the caller's, not strlen(cwd)'s.

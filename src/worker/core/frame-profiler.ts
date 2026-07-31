@@ -236,15 +236,28 @@ export class FrameProfiler {
         const tail = this.getTail({ budgetMs: opts.budgetMs });
         const budgetMs = opts.budgetMs
             ?? (tail.ok && tail.budget ? tail.budget.ms : this.captureThresholdMs);
-        return {
-            armed: this.enabled,
-            ...this.spikeClasses.report({
-                budgetMs,
-                top: opts.top,
-                categoryNames: FRAME_CATEGORIES,
-                overBudgetFrames: tail.ok && tail.budget ? tail.budget.overFrames : undefined,
-            }),
-        };
+
+        // The coverage verdict compares classifiedFrames (markFrame) against overFrames
+        // (markPresent) — two DIFFERENT boundaries, and ddraw's frameAlreadyMarked can skip
+        // markFrame. While their totals disagree the comparison is between two populations,
+        // so the count is withheld: `unknown` plus the divergence beats "complete" for a
+        // window whose over-budget presents the classifier never saw.
+        const presentFrames = this.getPresentFrameCount();
+        const markFrames = this.getMarkFrameCount();
+        const boundariesAgree = presentFrames === markFrames;
+        const report = this.spikeClasses.report({
+            budgetMs,
+            top: opts.top,
+            categoryNames: FRAME_CATEGORIES,
+            overBudgetFrames: (boundariesAgree && tail.ok && tail.budget) ? tail.budget.overFrames : undefined,
+        });
+        if (!boundariesAgree) {
+            const note = `the classifier counted ${markFrames} markFrame frames while the budget verdict `
+                + `is over ${presentFrames} present frames — different boundaries, so coverage against `
+                + `over-budget presents cannot be established.`;
+            report.coverageNote = report.coverageNote ? `${report.coverageNote} ${note}` : note;
+        }
+        return { armed: this.enabled, ...report };
     }
 
     /**

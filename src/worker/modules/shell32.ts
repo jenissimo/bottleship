@@ -239,16 +239,29 @@ export class Shell32 implements IModule {
 
         /** Shared tail for ShellExecuteEx{A,W}: hInstApp + handle policy + BOOL. */
         const finishShellExecuteEx = (pExecInfo: number, fMask: number, result: number): ThunkResult => {
-            Mem.writeUint32(pExecInfo + 32, result >>> 0); // hInstApp (SE_ERR_* on failure)
-
             // A handle we cannot back must not exist: an unregistered value never signals
             // a wait, fails GetExitCodeProcess, and corrupts whatever real object later
-            // lands on it via CloseHandle. Leave hProcess NULL and report FALSE instead.
-            if ((fMask & SEE_MASK_NOCLOSEPROCESS) !== 0) {
+            // lands on it via CloseHandle. So when the caller ASKED for the process handle,
+            // hProcess stays NULL — and the call must then report FAILURE, because TRUE with
+            // a NULL hProcess sends a guest straight into WaitForSingleObject(NULL) with no
+            // branch for the error it gets back.
+            const wantsProcess = (fMask & SEE_MASK_NOCLOSEPROCESS) !== 0;
+            let outcome = result;
+            if (wantsProcess) {
                 Mem.writeUint32(pExecInfo + 56, 0); // hProcess
+                if (outcome > SE_ERR_MAX) {
+                    outcome = SE_ERR_ACCESSDENIED;
+                    System.getInstance().scheduler.setLastError(ERROR_ACCESS_DENIED);
+                    Logger.warn(
+                        LogCategory.SYSTEM,
+                        `[SHELL32] ShellExecuteEx: SEE_MASK_NOCLOSEPROCESS requested but no process handle ` +
+                        `can be backed — reporting FALSE/SE_ERR_ACCESSDENIED rather than a NULL hProcess`
+                    );
+                }
             }
 
-            return { value: result > SE_ERR_MAX ? 1 : 0, stackCleanup: 4 };
+            Mem.writeUint32(pExecInfo + 32, outcome >>> 0); // hInstApp (SE_ERR_* on failure)
+            return { value: outcome > SE_ERR_MAX ? 1 : 0, stackCleanup: 4 };
         };
 
         // ShellExecuteA(HWND hwnd, LPCSTR lpOperation, LPCSTR lpFile,

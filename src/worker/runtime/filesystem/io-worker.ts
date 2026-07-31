@@ -85,6 +85,14 @@ function getChunk(ci: number, prefetch: boolean): Promise<Uint8Array> {
     if (prefetch) prefetches++; else netFetches++;
     const p = src.readRange(start, end)
         .then((buf) => {
+            // A SHORT Range response must never be memoized: `serve` sizes its output from the
+            // request, so a truncated chunk in the cache serves full length with a zero-filled
+            // tail — silently corrupt, for the rest of the session, with no retry. Reject it
+            // and let the request fail; the next read re-fetches.
+            if (buf.byteLength !== end - start) {
+                throw new Error(
+                    `short range read for chunk ${ci}: got ${buf.byteLength} of ${end - start} bytes at ${start}`);
+            }
             if (!chunks.has(ci)) {
                 chunks.set(ci, buf);
                 lru.push(ci);
@@ -115,13 +123,16 @@ async function serve(off: number, len: number): Promise<Uint8Array> {
     const parts = await Promise.all(need);
 
     const out = new Uint8Array(e - off);
+    let filled = 0;
     for (let c = first; c <= last; c++) {
         const b = parts[c - first];
         const cs = c * CHUNK;
         const copyS = Math.max(off, cs);
         const copyE = Math.min(e, cs + b.byteLength);
-        if (copyE > copyS) out.set(b.subarray(copyS - cs, copyE - cs), copyS - off);
+        if (copyE > copyS) { out.set(b.subarray(copyS - cs, copyE - cs), copyS - off); filled += copyE - copyS; }
     }
+    // Any gap would ship as a zero-filled tail the guest cannot tell from real bytes.
+    if (filled !== out.length) throw new Error(`assembled ${filled} of ${out.length} bytes for [${off}, ${e})`);
     return out;
 }
 

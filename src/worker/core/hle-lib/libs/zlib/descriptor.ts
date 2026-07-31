@@ -6,12 +6,7 @@
  * whole-function replacement. `inflate` itself is deliberately NOT a target —
  * it is the stateful half.
  *
- * WHY THIS EXISTS FIRST AS A DIAGNOSTIC. In shadow mode the validator runs our
- * inflate against SCRATCH copies of the destination, then runs the guest's own
- * `uncompress`, then compares EAX and every declared output byte. That answers,
- * mechanically, whether a correct inflate agrees with the emulated one on the
- * SAME input bytes — the question a guest-side "uncompression failed" cannot
- * answer by itself. Reading a mismatch report:
+ * Reading a shadow mismatch report:
  *   kind 'eax'   — the two disagree on the verdict. Ours 0 / guest negative
  *                  means the bytes were fine and the guest's execution was not.
  *   kind 'bytes' — same verdict, different output. On a shared FAILURE verdict
@@ -38,15 +33,12 @@
  * deflateInit_, which takes a level argument and so cleans 0x10. The resolver
  * refuses to hook when more than one candidate survives.
  *
- * Verified on Natalie Brooks (game.exe, image base 0x400000):
- *   uncompress    0x487000   prologue `SUB ESP,0x38` + `MOV ECX,[ESP+0x48]` = 7 bytes
- *   inflateInit_  0x488550   → inflateInit2_(strm, 15, version, 0x38) @ 0x488450
- *   inflate       0x488570
- *   inflateEnd    0x488400   (Z_STREAM_ERROR when state/zfree are NULL)
- *   ZLIB_VERSION  0x520ebc "1.1.4"      inflate_copyright 0x521b9e
- * Argument order was read off the disassembly, not assumed: after SUB ESP,0x38
- * the loads are [ESP+0x3c]→next_out, [ESP+0x40]→destLen, [ESP+0x44]→next_in,
- * [ESP+0x48]→avail_in, into a 0x38-byte z_stream.
+ * ABI, read off the disassembly rather than assumed: `uncompress` opens with
+ * `SUB ESP,0x38` + `MOV ECX,[ESP+0x48]` (a 7-byte prologue, no frame pointer), and the
+ * argument loads are [ESP+0x3c]→next_out, [ESP+0x40]→destLen, [ESP+0x44]→next_in,
+ * [ESP+0x48]→avail_in, into a 0x38-byte z_stream. `inflateInit_` tail-calls
+ * inflateInit2_(strm, 15, version, 0x38); `inflateEnd` returns Z_STREAM_ERROR when
+ * state/zfree are NULL.
  */
 
 import { inflateZlibSync } from '@bottleship/formats/zip/inflate';

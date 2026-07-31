@@ -266,6 +266,75 @@ export class PELoader {
         return new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
     }
 
+    /** Hard ceiling on a PE's mapped extent — far above any 32-bit game image, far below the
+     *  address space, so a corrupt SizeOfImage cannot reach either end of guest RAM. */
+    private static readonly MAX_IMAGE_SIZE = 512 * 1024 * 1024;
+    /** SizeOfImage is the section extent rounded to SectionAlignment; 1 MiB covers oddities. */
+    private static readonly IMAGE_SIZE_SLACK = 0x100000;
+
+    /**
+     * SizeOfImage as the loader is willing to trust it.
+     *
+     * The field comes straight out of an untrusted file and two operations scale with it
+     * directly: a `memory.fill` that silently CLAMPS to the end of guest RAM (so an absurd
+     * value zeroes the rest of the address space rather than failing) and a page-granular
+     * JIT invalidation that would then walk a million pages. The section table is the
+     * independent witness — the mapped extent cannot be smaller than the last section's end,
+     * and has no legitimate reason to be much larger.
+     */
+    private trustedImageSize(
+        peView: DataView,
+        optHeaderPtr: number,
+        sizeOfOptionalHeader: number,
+        numberOfSections: number,
+        declared: number,
+        label: string,
+    ): number {
+        const alignment = Math.max(peView.getUint32(optHeaderPtr + 32, true) || 0x1000, 0x1000);
+        const align = (v: number): number => Math.ceil(v / alignment) * alignment;
+        let extent = peView.getUint32(optHeaderPtr + 60, true) || 0; // SizeOfHeaders
+        const sectionHeaderPtr = optHeaderPtr + sizeOfOptionalHeader;
+        for (let i = 0; i < numberOfSections; i++) {
+            const ptr = sectionHeaderPtr + i * 40;
+            if (ptr + 40 > peView.byteLength) break;
+            const virtualSize = peView.getUint32(ptr + 8, true);
+            const virtualAddress = peView.getUint32(ptr + 12, true);
+            const rawDataSize = peView.getUint32(ptr + 16, true);
+            extent = Math.max(extent, virtualAddress + (virtualSize || rawDataSize));
+        }
+        const computed = align(Math.max(extent, alignment));
+
+        let trusted = declared > 0 ? declared : computed;
+        if (trusted < computed) trusted = computed;
+        const ceiling = Math.min(PELoader.MAX_IMAGE_SIZE, computed + PELoader.IMAGE_SIZE_SLACK);
+        if (trusted > ceiling) {
+            Logger.warn(LogCategory.SYSTEM,
+                `[PE] ${label}: SizeOfImage 0x${(declared >>> 0).toString(16)} exceeds the section ` +
+                `extent 0x${computed.toString(16)} — using 0x${ceiling.toString(16)}`);
+            trusted = ceiling;
+        }
+        return trusted;
+    }
+
+    /** Zero `[base, base+length)`, clipped to guest RAM. Returns the bytes actually cleared,
+     *  so the caller's JIT invalidation covers exactly what it touched. */
+    private clearImageRegion(base: number, length: number, label: string): number {
+        const mem = this.memory;
+        const start = base >>> 0;
+        if (start >= mem.length) {
+            Logger.error(LogCategory.SYSTEM, `[PE] ${label}: image base 0x${start.toString(16)} is beyond guest RAM`);
+            return 0;
+        }
+        const cleared = Math.min(length, mem.length - start);
+        if (cleared < length) {
+            Logger.warn(LogCategory.SYSTEM,
+                `[PE] ${label}: image at 0x${start.toString(16)} needs 0x${length.toString(16)} bytes but only ` +
+                `0x${cleared.toString(16)} of guest RAM remain — the load will be truncated`);
+        }
+        mem.fill(0, start, start + cleared);
+        return cleared;
+    }
+
     async loadExecutable(peData: Uint8Array): Promise<LoadedModule> {
         const peView = new DataView(peData.buffer, peData.byteOffset, peData.byteLength);
 
@@ -284,7 +353,9 @@ export class PELoader {
         if (magic !== 0x10B) throw new Error('Only 32-bit PE is supported');
 
         const imageBase = peView.getUint32(optHeaderPtr + 28, true);
-        const sizeOfImage = peView.getUint32(optHeaderPtr + 56, true);
+        const sizeOfImage = this.trustedImageSize(
+            peView, optHeaderPtr, sizeOfOptionalHeader, numberOfSections,
+            peView.getUint32(optHeaderPtr + 56, true), 'EXE');
         const entryPointRVA = peView.getUint32(optHeaderPtr + 16, true);
 
         // Use the PE's ImageBase as the load address. On real Windows, EXEs always
@@ -303,15 +374,16 @@ export class PELoader {
 
         // --- Clear image region before loading ---
         // Zero out the image region to prevent stale data from previous loads.
-        const clearedBytes = sizeOfImage + 0x10000; // +64KB buffer
-        this.memory.fill(0, baseAddress, baseAddress + clearedBytes);
+        const clearedBytes = this.clearImageRegion(baseAddress, sizeOfImage + 0x10000, 'EXE'); // +64KB buffer
 
         // --- Copy PE headers to memory ---
         // The headers (DOS header, PE header, optional header, section headers) must be
         // present in memory for FindResource, GetModuleHandle, and other APIs to work.
         // SizeOfHeaders is at offset 60 from optional header start.
         const sizeOfHeaders = peView.getUint32(optHeaderPtr + 60, true);
-        writeGuestCode(this.memory, peData.subarray(0, sizeOfHeaders), baseAddress);
+        if (!writeGuestCode(this.memory, peData.subarray(0, sizeOfHeaders), baseAddress)) {
+            throw new Error(`[PE] header write of ${sizeOfHeaders} bytes at 0x${baseAddress.toString(16)} overruns guest memory`);
+        }
         Logger.log(LogCategory.SYSTEM, `[PE] Copied ${sizeOfHeaders} bytes of headers to 0x${baseAddress.toString(16)}`);
 
         // Load Sections
@@ -455,14 +527,16 @@ export class PELoader {
 
             // 1. Copy raw data from file
             const copySize = hasFileData ? Math.min(rawDataSize, Math.max(0, peData.length - rawDataPtr)) : 0;
-            if (copySize > 0) {
-                writeGuestCode(this.memory, peData.subarray(rawDataPtr, rawDataPtr + copySize), targetAddr);
+            if (copySize > 0
+                && !writeGuestCode(this.memory, peData.subarray(rawDataPtr, rawDataPtr + copySize), targetAddr)) {
+                throw new Error(
+                    `[PE] section ${sectionName}: ${copySize} bytes at 0x${targetAddr.toString(16)} overrun guest memory`);
             }
 
             // 2. Zero-fill the rest of the mapped extent (BSS-like behavior)
             // This is REQUIRED by PE spec - uninitialized global variables depend on this
             const fillStart = targetAddr + copySize;
-            const fillEnd = targetAddr + Math.max(mappedSize, copySize);
+            const fillEnd = Math.min(targetAddr + Math.max(mappedSize, copySize), this.memory.length);
             if (fillEnd > fillStart) {
                 this.memory.fill(0, fillStart, fillEnd);
                 Logger.log(LogCategory.SYSTEM,
@@ -563,7 +637,9 @@ export class PELoader {
                 return null;
             }
 
-            const sizeOfImage = peView.getUint32(optHeaderPtr + 56, true);
+            const sizeOfImage = this.trustedImageSize(
+                peView, optHeaderPtr, sizeOfOptionalHeader, numberOfSections,
+                peView.getUint32(optHeaderPtr + 56, true), dllPath);
             const entryPointRVA = peView.getUint32(optHeaderPtr + 16, true);
 
             // Allocate base address for DLL
@@ -577,18 +653,23 @@ export class PELoader {
             }
 
             // Clear region before loading
-            this.memory.fill(0, baseAddress, baseAddress + sizeOfImage);
+            const clearedBytes = this.clearImageRegion(baseAddress, sizeOfImage, dllPath);
 
             // Copy PE headers to memory (needed for resource access, etc.)
             const sizeOfHeaders = peView.getUint32(optHeaderPtr + 60, true);
-            writeGuestCode(this.memory, peData.subarray(0, sizeOfHeaders), baseAddress);
+            if (!writeGuestCode(this.memory, peData.subarray(0, sizeOfHeaders), baseAddress)) {
+                Logger.error(LogCategory.SYSTEM,
+                    `[PE] ${dllPath}: header write of ${sizeOfHeaders} bytes at 0x${baseAddress.toString(16)} ` +
+                    `overruns guest memory — refusing to load`);
+                return null;
+            }
 
             // Load sections
             const sections = this.loadSections(peData, peView, optHeaderPtr, sizeOfOptionalHeader, numberOfSections, baseAddress);
 
             // Apply base relocations (MUST be done after sections are loaded, before imports)
             this.applyRelocations(peData, baseAddress);
-            invalidateGuestCode(baseAddress, sizeOfImage);
+            invalidateGuestCode(baseAddress, clearedBytes);
 
             // Process TLS directory (implicit __declspec(thread) variables)
             // Must be after sections+relocations so guest memory has correct VAs.
@@ -1370,8 +1451,13 @@ export class PELoader {
                     } catch (e) {
                         // If already reserved, that's fine
                     }
-                    writeGuestCode(this.memory, stubDll.stubCode, stubDll.baseAddress);
-                    Logger.log(LogCategory.SYSTEM, `[PE] Stub DLL for ${dllName} written at 0x${stubDll.baseAddress.toString(16)}, size: ${stubDll.stubCode.length}`);
+                    if (!writeGuestCode(this.memory, stubDll.stubCode, stubDll.baseAddress)) {
+                        Logger.error(LogCategory.SYSTEM,
+                            `[PE] Stub DLL for ${dllName} at 0x${stubDll.baseAddress.toString(16)} overruns guest memory — ` +
+                            `its imports are unbacked and will run into whatever the IAT points at`);
+                    } else {
+                        Logger.log(LogCategory.SYSTEM, `[PE] Stub DLL for ${dllName} written at 0x${stubDll.baseAddress.toString(16)}, size: ${stubDll.stubCode.length}`);
+                    }
                 } else {
                     Logger.verbose(LogCategory.SYSTEM, `[PE] All stubs for ${dllName} reused from existing (no new code written)`);
                 }
@@ -1414,8 +1500,10 @@ export class PELoader {
                     }
 
                     // Write stub code
-                    if (stubDll.stubCode.length > 0) {
-                        writeGuestCode(this.memory, stubDll.stubCode, stubDll.baseAddress);
+                    if (stubDll.stubCode.length > 0
+                        && !writeGuestCode(this.memory, stubDll.stubCode, stubDll.baseAddress)) {
+                        Logger.error(LogCategory.SYSTEM,
+                            `[PE] Safe stubs for ${dllNameRaw} at 0x${stubDll.baseAddress.toString(16)} overrun guest memory`);
                     }
 
                     Logger.log(LogCategory.SYSTEM,
@@ -1602,7 +1690,12 @@ export class PELoader {
         } catch (e) {
             // If already reserved, that's fine
         }
-        writeGuestCode(this.memory, stubDll.stubCode, stubDll.baseAddress);
+        if (!writeGuestCode(this.memory, stubDll.stubCode, stubDll.baseAddress)) {
+            Logger.error(LogCategory.SYSTEM,
+                `[PE] Stub DLL for ${dllName} at 0x${stubDll.baseAddress.toString(16)} overruns guest memory — ` +
+                `its imports are unbacked`);
+            return;
+        }
 
         Logger.log(LogCategory.SYSTEM, `[PE] Stub DLL for ${dllName} written at 0x${stubDll.baseAddress.toString(16)}, size: ${stubDll.stubCode.length}`);
     }

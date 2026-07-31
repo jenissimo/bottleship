@@ -527,6 +527,36 @@ describe("frameProfiler integration", () => {
         expect(held.every((c) => c.reason === "spike")).toBe(true);
     });
 
+    // INVARIANT: the coverage verdict compares classifiedFrames (markFrame) against
+    // overFrames (markPresent). While those two boundaries disagree on their totals the
+    // comparison is between two different populations, so the report must NOT be able to say
+    // "complete" — the whole point of the module is that an instrument cannot report a
+    // plausible verdict about something other than its label.
+    test("coverage is never 'complete' while the two frame boundaries disagree", () => {
+        frameProfiler.configureCapture({ worstN: 4, captureOverMs: 5, classifyOverMs: 5 });
+        // markFrame only: the classifier sees frames the distribution never will.
+        for (let i = 0; i < 6; i++) { spin(8); frameProfiler.markFrame("ddraw"); }
+        for (let i = 0; i < 4; i++) { spin(8); frameProfiler.markPresent(); }
+
+        expect(frameProfiler.getMarkFrameCount()).not.toBe(frameProfiler.getPresentFrameCount());
+        const spikes = frameProfiler.getSpikeClasses({ budgetMs: 5 });
+        expect(spikes.coverage).not.toBe("complete");
+        expect(spikes.coverageNote).toContain("different boundaries");
+        // The divergence is named with both counts, not averaged away.
+        expect(spikes.coverageNote).toContain(String(frameProfiler.getMarkFrameCount()));
+        expect(spikes.coverageNote).toContain(String(frameProfiler.getPresentFrameCount()));
+    });
+
+    test("coverage can still reach 'complete' when the boundaries agree", () => {
+        frameProfiler.configureCapture({ worstN: 4, captureOverMs: 5, classifyOverMs: 5 });
+        // One markFrame and one markPresent per frame: the counts converge (both drop the
+        // first observation, which only starts their clocks).
+        for (let i = 0; i < 8; i++) { spin(8); frameProfiler.markFrame("ddraw"); frameProfiler.markPresent(); }
+        expect(frameProfiler.getMarkFrameCount()).toBe(frameProfiler.getPresentFrameCount());
+        const spikes = frameProfiler.getSpikeClasses({ budgetMs: 5 });
+        expect(spikes.coverage).toBe("complete");
+    });
+
     // INVARIANT: `average` and `sampleCount` describe the same frames or say they do not.
     // getSnapshot averages only the newest slice, and reporting the window size next to it
     // described a 60-frame mean as a 120-frame one.

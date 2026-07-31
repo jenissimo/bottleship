@@ -32,8 +32,11 @@ export interface RenderBackend {
     ): void;
     /** The canvas that IS the screen (the one the host transferred). Source of truth for screenshots. */
     getScreenCanvas?(): OffscreenCanvas | null;
-    /** Copy the frame just submitted to the canvas into a readable mirror (screenshots). */
-    mirrorPresentedFrame?(): void;
+    /** Copy the frame just submitted to the canvas into a readable mirror (screenshots).
+     *  Return false when the copy did NOT happen (unconfigured canvas, 0x0 texture) —
+     *  RenderService only stamps the mirror as current on a real copy. `void` is treated as
+     *  "copied" for backends that predate the return value. */
+    mirrorPresentedFrame?(): void | boolean;
     /** PNG of that mirror; null until a frame has been mirrored. */
     captureMirroredFrame?(): Promise<Blob | null>;
 }
@@ -140,7 +143,23 @@ export class RenderService {
         throw new Error("no frame has been presented to the canvas yet — nothing to screenshot");
     }
 
-    /** Presents since the mirrored frame — 0 means the mirror IS the current screen. */
+    /**
+     * Copy this present into the readable mirror. True only when the copy ACTUALLY happened —
+     * stamping the serial unconditionally is what made `shot()` hand back the previous frame
+     * labelled as the latest, which is the exact failure the mirror exists to eliminate.
+     */
+    private mirrorCurrentFrame(): boolean {
+        const backend = this.backend;
+        if (!backend?.mirrorPresentedFrame) return false;
+        // The backend bails on an unconfigured context or a 0x0 texture; a canvas with no
+        // extent is the same condition seen from here.
+        const canvas = backend.getScreenCanvas?.();
+        if (canvas && (canvas.width <= 0 || canvas.height <= 0)) return false;
+        return backend.mirrorPresentedFrame() !== false;
+    }
+
+    /** Presents since the mirrored frame — 0 means the mirror IS the current screen,
+     *  a positive value means it is that many frames STALE, -1 that nothing was mirrored. */
     screenMirrorAge(): number {
         return this.screenMirrorSerial > 0 ? this.presentSerial - this.screenMirrorSerial : -1;
     }
@@ -189,8 +208,7 @@ export class RenderService {
         this.lastPresenterKind = presenterKind;
         // Screenshot mirror: encoded here because EVERY present path funnels through
         // notifyPresent, so no backend can silently miss it and leave a stale image.
-        this.backend?.mirrorPresentedFrame?.();
-        this.screenMirrorSerial = this.presentSerial;
+        if (this.mirrorCurrentFrame()) this.screenMirrorSerial = this.presentSerial;
         if (!this.firstPresentFired) {
             this.firstPresentFired = true;
             try { this.firstPresentCb?.(); } catch { /* host bridge must never break the present path */ }
@@ -282,6 +300,7 @@ export class RenderService {
     reset(): void {
         this.active = null;
         this.presentSerial = 0;
+        this.screenMirrorSerial = 0; // the previous game's mirror is not this game's screen
         this.lastPresenterKind = null;
         this.resetFlipCadence();
         // Keep backend, it can be reused

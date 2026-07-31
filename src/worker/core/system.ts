@@ -260,8 +260,16 @@ export class System {
     public executablePath: string = "C:\\app.exe";  // Full VFS path to the executable
     public executableArgs: string = "";  // Command-line arguments from manifest
 
-    /** Installed by the worker: restart the guest process with a new command line. */
-    public onReExecRequest: ((commandLine: string) => void) | null = null;
+    /**
+     * Installed by the worker: restart the guest process with a new command line.
+     *
+     * Returns whether the restart was ACCEPTED. The worker refuses when it has no replayable
+     * bundle payload and when a re-exec is already scheduled, and a refusal must reach the
+     * caller: ShellExecute answering "launched" for a child that will never exist makes the
+     * launcher exit and the app simply vanish. `void` is read as acceptance only so a host
+     * that has not been updated keeps working.
+     */
+    public onReExecRequest: ((commandLine: string) => boolean | void) | null = null;
 
     /**
      * True when `file` (optionally relative to `directory`) names the image THIS process
@@ -287,11 +295,14 @@ export class System {
         return target.toLowerCase() === self.toLowerCase();
     }
 
-    /** Ask the worker to restart this process with `commandLine`. False if unsupported. */
+    /** Ask the worker to restart this process with `commandLine`. False if unsupported or refused. */
     public requestReExec(commandLine: string): boolean {
         if (!this.onReExecRequest) return false;
-        this.onReExecRequest(commandLine);
-        return true;
+        const accepted = this.onReExecRequest(commandLine) !== false;
+        if (!accepted) {
+            Logger.warn(LogCategory.SYSTEM, `Re-exec refused by the host for "${commandLine}"`);
+        }
+        return accepted;
     }
 
     /**
@@ -585,15 +596,19 @@ export class System {
      * the manifest's, so an 800x600 client sat centred in a 1024x768 desktop and every click
      * was off by the centring offset. Publishing here makes the two agree by construction.
      *
-     * `modeSet: false` opts a caller out, for a host resize that is deliberately not a
-     * change of the emulated screen.
+     * `modeSet` is OPT-IN and means "this width/height IS the screen": a real
+     * ChangeDisplaySettings / SetDisplayMode / a FULLSCREEN device. It must NOT be passed for
+     * a window size or for a WINDOWED backbuffer — those are sizes INSIDE the desktop, and
+     * publishing one as the mode makes SM_CXSCREEN/SM_CYSCREEN, EnumDisplaySettings and
+     * fullscreen placement report the window as the desktop (and silently rewrites
+     * ddrawContext.display without reallocating a single surface).
      */
     requestHostResize(
         width: number,
         height: number,
         opts?: { modeSet?: boolean; bpp?: number; refreshRate?: number },
     ): void {
-        if (opts?.modeSet !== false && width > 0 && height > 0) {
+        if (opts?.modeSet === true && width > 0 && height > 0) {
             const display = this.ddrawContext?.display;
             if (display) {
                 display.width = width;
@@ -632,11 +647,22 @@ export class System {
         this.hostWindowTitle = callback;
     }
 
+    /** Digits/whitespace stripped — what stays constant while an engine rewrites its FPS. */
+    private lastWindowTitleSkeleton: string | null = null;
+
     /** Single choke point for every top-level title change (CreateWindow, WM_SETTEXT,
-     *  SetWindowText). Logged because a whole class of engines reports fatal asserts
-     *  by rewriting the frame title, and that is otherwise invisible to `watchLog`. */
+     *  SetWindowText). Logged because a whole class of engines reports fatal asserts by
+     *  rewriting the frame title — but a title that only differs in its NUMBERS is an FPS
+     *  counter, and logging that at every frame is a permanent per-frame line in the
+     *  firehose. Those still reach the ring at verbose. */
     notifyWindowTitle(title: string, source = "?"): void {
-        Logger.log(LogCategory.USER32, `[WINDOW-TITLE] via=${source} ${JSON.stringify(title)}`);
+        const skeleton = title.replace(/[\d.,:\s]+/g, "");
+        if (skeleton !== this.lastWindowTitleSkeleton) {
+            this.lastWindowTitleSkeleton = skeleton;
+            Logger.log(LogCategory.USER32, `[WINDOW-TITLE] via=${source} ${JSON.stringify(title)}`);
+        } else {
+            Logger.verbose(LogCategory.USER32, `[WINDOW-TITLE] via=${source} ${JSON.stringify(title)}`);
+        }
         if (this.hostWindowTitle) this.hostWindowTitle(title);
     }
 
@@ -794,6 +820,17 @@ export class System {
                 }
             }
         }
+
+        // Per-GAME host state. An in-worker game switch ("Load File…", no page reload) keeps
+        // this object, so a mode published without a bpp would fall back to the PREVIOUS
+        // title's — a 16-bit game reading 32bpp out of GetDeviceCaps/EnumDisplaySettings.
+        // Same for the cursor states, whose de-dup would swallow the new game's first call.
+        this.emulatedDisplayMode = null;
+        this.hostCursorPositionState = null;
+        this.hostCursorWarpModeState = false;
+        this.hostCursorVisibleState = null;
+        this.hostMouseCaptureState = null;
+        this.lastWindowTitleSkeleton = null;
 
         this.isExiting = false;
         this.isPaused = false;

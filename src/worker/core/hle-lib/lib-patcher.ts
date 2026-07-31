@@ -35,6 +35,14 @@ export interface PatchContext {
 export interface PatchRequest {
     libId: string;
     functionName: string;
+    /**
+     * PE module the patched copy lives in (see PatchHandle.moduleName). Required for any
+     * caller whose (libId, functionName) can occur in more than one module — that is every
+     * hle-lib descriptor. Omit only when the caller's own id is already module-unique
+     * (hook-registry keys on spec.id, galaxy on one module's exports); the patch then keeps
+     * the legacy single-module virtual module id.
+     */
+    moduleName?: string;
     /** Absolute guest address of the target function entry. */
     targetAddress: number;
     /** cdecl = caller cleans stack; stdcall = callee RET N. */
@@ -140,7 +148,11 @@ export function applyPatch(ctx: PatchContext, req: PatchRequest): PatchHandle | 
         return null;
     }
 
-    const virtualModuleId = `${req.libId}-hle`;
+    // Per MODULE, not just per lib: the dispatcher resolves a stub's handler by
+    // (virtualModuleId, functionName), so a lib linked into two modules would have the
+    // second registration replace the first's handler — and for a shadow hook that handler
+    // carries the module's own validation runtime and trampoline.
+    const virtualModuleId = req.moduleName ? `${req.libId}-hle@${req.moduleName}` : `${req.libId}-hle`;
 
     // 1. Allocate the callout stub. ThunkGenerator returns {address, code}.
     let stubAddress = 0;
@@ -167,7 +179,11 @@ export function applyPatch(ctx: PatchContext, req: PatchRequest): PatchHandle | 
             `[HLE-lib] applyPatch: stub 0x${stubAddress.toString(16)} overruns memory`);
         return null;
     }
-    writeGuestCode(mem, stubCode, stubAddress);
+    if (!writeGuestCode(mem, stubCode, stubAddress)) {
+        Logger.error(LogCategory.SYSTEM,
+            `[HLE-lib] applyPatch: stub write at 0x${stubAddress.toString(16)} overran memory`);
+        return null;
+    }
 
     // 3. Register handler under the virtual module id.
     ctx.dispatcher.register(virtualModuleId, req.functionName, req.handler);
@@ -197,7 +213,11 @@ export function applyPatch(ctx: PatchContext, req: PatchRequest): PatchHandle | 
             Logger.error(LogCategory.SYSTEM, `[HLE-lib] applyPatch: trampoline 0x${trampolineAddress.toString(16)} overruns memory`);
             return null;
         }
-        writeGuestCode(mem, prologue, trampolineAddress);
+        if (!writeGuestCode(mem, prologue, trampolineAddress)) {
+            Logger.error(LogCategory.SYSTEM,
+                `[HLE-lib] applyPatch: trampoline write at 0x${trampolineAddress.toString(16)} overran memory`);
+            return null;
+        }
         const back = (req.targetAddress + pl - (trampolineAddress + pl + 5)) | 0;
         mem[trampolineAddress + pl]     = 0xE9;
         mem[trampolineAddress + pl + 1] = back & 0xFF;
@@ -264,6 +284,7 @@ export function applyPatch(ctx: PatchContext, req: PatchRequest): PatchHandle | 
     return {
         libId: req.libId,
         functionName: req.functionName,
+        moduleName: req.moduleName ?? '',
         targetAddress: req.targetAddress,
         stubAddress,
         originalBytes,

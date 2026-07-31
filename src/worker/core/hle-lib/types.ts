@@ -201,6 +201,14 @@ export interface ShadowRange {
     len: number;
 }
 
+/** Which patched copy of a hooked function is executing. */
+export interface ShadowSite {
+    /** PE module carrying this copy. */
+    moduleName: string;
+    /** Absolute guest address of this copy's entry. */
+    targetAddress: number;
+}
+
 export interface ShadowSpec {
     /**
      * Output-relevant guest ranges for the given call (args already decoded).
@@ -214,8 +222,13 @@ export interface ShadowSpec {
      * The exact kernel — mirrors guest operation order/width. Returns the EAX
      * value. All guest-memory access MUST go
      * through `view` — that is what makes validation side-effect-free.
+     *
+     * `site` names WHICH patched copy is running. A kernel that resolved anything out of
+     * the image (a table address, a constant) must key it by the site: the same static
+     * library is routinely linked into two modules of one process, and a module-level
+     * singleton would have the second detection overwrite the first's.
      */
-    kernel(view: ShadowView, args: number[]): number;
+    kernel(view: ShadowView, args: number[], site: ShadowSite): number;
     /**
      * Per-call cheap guard: args in plausible ranges etc. Returning
      * false routes THIS call to the original (not counted, not a mismatch).
@@ -282,7 +295,7 @@ export interface LibDescriptor {
     signatures: Record<string, Signature>;
     /** Functions to hook; name → declaration. */
     functions: Record<string, HookedFunction>;
-    /** Handlers registered with the dispatcher under `id + '-hle'` once detection succeeds. */
+    /** Handlers registered with the dispatcher under `id + '-hle@' + moduleName` once detection succeeds. */
     handlers: Record<string, ThunkImplementation>;
     /**
      * Optional late-resolution hook. Runs AFTER signature detection clears the
@@ -302,6 +315,12 @@ export interface LibDescriptor {
      * the library-specific backend to initialise shadow state maps etc.
      */
     onActivated?(match: LibMatch): void;
+
+    /**
+     * Drop everything the descriptor resolved out of the previous image. Called on a game
+     * switch, when every guest address the descriptor cached stops meaning anything.
+     */
+    onReset?(): void;
 }
 
 /** Context handed to `resolveAdditionalFunctions`. */
@@ -342,6 +361,13 @@ export interface LibMatch {
 export interface PatchHandle {
     libId: string;
     functionName: string;
+    /**
+     * PE module the patched copy lives in. Load-bearing, not cosmetic: the same static
+     * library is routinely linked into BOTH an engine DLL and the exe, and keying patch
+     * bookkeeping without it lets the second copy overwrite the first's original bytes,
+     * target address and trampoline.
+     */
+    moduleName: string;
     /** Absolute address of the patched guest function. */
     targetAddress: number;
     /** Absolute address of our callout stub. */

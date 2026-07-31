@@ -7,6 +7,7 @@
  */
 
 import { EmulatorConfig } from "../emulator-config-manager";
+import { canonicalizeFpuSnapshotForMode } from "../fpu-helper";
 
 const OFF_CYCLE_LIMIT = 0x000;
 
@@ -83,14 +84,48 @@ export class PreemptionManager {
      *  chained modules accumulate re-entries slower and promote late. */
     private tier2Threshold = 300_000;           // config idx 15 (0 = tier-2 OFF)
 
+    /** Walks every PARKED thread's saved x87 snapshot. Registered by the Scheduler
+     *  (which owns the thread table and already depends on this module), same provider
+     *  seam as stack-write-guard's setParkedStackProvider. */
+    private savedFpuStateProvider: ((visit: (snap: Uint8Array) => void) => void) | null = null;
+
+    setSavedFpuStateProvider(provider: ((visit: (snap: Uint8Array) => void) => void) | null): void {
+        this.savedFpuStateProvider = provider;
+    }
+
     /** Set the relaxed-FPU mode authoritatively: stores the desired state (so the NEXT
      *  v86 init boots with it) AND applies it live + clears the JIT cache so FPU-bearing
      *  blocks recompile. on=false → strict F80 (diagnostic A/B). */
     setRelaxedFpu(on: boolean): void {
         this.relaxedFpuEnabled = on;
         const ex = this.wasmExports;
+        // The LIVE wasm flag decides whether the mode actually flips — a manifest
+        // fpuStrict boot leaves wasm strict while relaxedFpuEnabled is true.
+        const wasRelaxed = typeof ex?.get_relaxed_fpu === "function"
+            ? (ex.get_relaxed_fpu() >>> 0) !== 0
+            : on;
         if (ex?.set_relaxed_fpu) ex.set_relaxed_fpu(on ? 1 : 0);
+        // set_relaxed_fpu canonicalizes only the LIVE register file; the parked threads'
+        // saved snapshots are the same shared register file under the OLD tag rules and
+        // would be restored as garbage. Boot (initialize) calls the export directly and
+        // never pays for this — there are no meaningful saved contexts at init.
+        if (wasRelaxed !== on) this.canonicalizeSavedFpuStates(on);
         if (ex?.jit_clear_cache_js) ex.jit_clear_cache_js();
+    }
+
+    /** A thread's context.fpu and lastFpuState routinely alias one buffer — visit each
+     *  distinct snapshot once. */
+    private canonicalizeSavedFpuStates(toRelaxed: boolean): void {
+        const provider = this.savedFpuStateProvider;
+        if (!provider) return;
+        const seen = new Set<Uint8Array>();
+        let converted = 0;
+        provider((snap) => {
+            if (seen.has(snap)) return;
+            seen.add(snap);
+            if (canonicalizeFpuSnapshotForMode(snap, toRelaxed)) converted++;
+        });
+        console.log(`[PERF] relaxed-FPU → ${toRelaxed ? "relaxed" : "strict"}: re-encoded ${converted}/${seen.size} saved x87 snapshots`);
     }
 
     /** Current desired relaxed-FPU state (the single authority). */

@@ -45,6 +45,11 @@ export class SystemResourceProvider {
     // Mapping from emulator memory address to handle
     private addressToHandle: Map<number, number> = new Map();
     private handleToAddress: Map<number, number> = new Map();
+    // The FIRST address a handle was mapped at — the object's own identity. handleToAddress
+    // holds the LAST one, and QueryInterface tear-offs remap the same handle onto a fresh
+    // guest block, so anything that means "this object's own interface pointer" (per-interface
+    // refcounting) must read this instead.
+    private handleToPrimaryAddress: Map<number, number> = new Map();
 
     // OPTIMIZATION: Index for fast lookup of surfaces by surfacePtr
     // Maps surfacePtr -> Set of COM object handles that share this surfacePtr
@@ -75,7 +80,7 @@ export class SystemResourceProvider {
     // Holds RAW slot values (not the generation-tagged handle). FIFO (push/shift) so reuse
     // is spread across all freed slots → a single slot's generation wraps slowly.
     private freeComHandles: number[] = [];
-    /** Freed USER handles, reused FIFO (see registerUserObject). */
+    /** Freed USER handle SLOTS (generation stripped), reused FIFO (see registerUserObject). */
     private freeUserHandles: number[] = [];
 
     // Generation tagging for COM handles. COM is the only recycled handle class, and a guest
@@ -98,6 +103,14 @@ export class SystemResourceProvider {
     /** Raw COM handle slot (generation stripped). Used by ddraw texture-registry slot recycle. */
     static readonly COM_SLOT_MASK = 0x7FFFF;
     private comSlotGeneration: Map<number, number> = new Map(); // raw slot -> current generation
+
+    // Generation tagging for USER handles — same hazard, same answer as COM: the slot comes
+    // back on DeleteObject/DestroyIcon/DestroyWindow, and a guest holding the stale HBITMAP
+    // would otherwise operate on whatever unrelated object took the slot. The generation
+    // lives in bits 0..1 (slots step by 4, so those bits are free), which keeps the tagged
+    // handle inside 0x40000-0x4FFFF and therefore inside getResource's USER range.
+    private static readonly USER_GEN_MASK = 0x3;
+    private userSlotGeneration: Map<number, number> = new Map(); // raw slot -> current generation
 
     static getInstance(): SystemResourceProvider {
         if (!SystemResourceProvider.instance) {
@@ -140,6 +153,7 @@ export class SystemResourceProvider {
         Logger.log(LogCategory.RESOURCE, `mapAddressToHandle: 0x${address.toString(16)} -> handle=0x${handle.toString(16)}`);
         this.addressToHandle.set(address, handle);
         this.handleToAddress.set(handle, address);
+        if (!this.handleToPrimaryAddress.has(handle)) this.handleToPrimaryAddress.set(handle, address);
     }
 
     /**
@@ -175,6 +189,16 @@ export class SystemResourceProvider {
      */
     getAddressForHandle(handle: number): number | null {
         return this.handleToAddress.get(handle) ?? null;
+    }
+
+    /**
+     * The address the object was FIRST published at — its own interface pointer, stable for
+     * the object's whole life. Use this (not getAddressForHandle) wherever "the pointer this
+     * object was created as" is meant: a tear-off remaps the handle and would otherwise
+     * silently become the answer.
+     */
+    getPrimaryAddressForHandle(handle: number): number | null {
+        return this.handleToPrimaryAddress.get(handle) ?? null;
     }
 
     /**
@@ -261,6 +285,7 @@ export class SystemResourceProvider {
                 }
             }
             this.handleToAddress.delete(handle);
+            this.handleToPrimaryAddress.delete(handle);
 
             // OPTIMIZATION: Cleanup surfacePtr index (O(1) using reverse mapping)
             const surfacePtr = this.handleToSurfacePtr.get(handle);
@@ -346,18 +371,25 @@ export class SystemResourceProvider {
      * then hands out fall inside the FILE and GDI ranges, where getResource() dispatches them
      * to the wrong table. Windows survives that workload because its handle slots come back on
      * DeleteObject/DestroyIcon, not because its space is unbounded.
+     *
+     * Recycling ALIASES, so the slot is generation-tagged (see USER_GEN_MASK): a stale
+     * HBITMAP resolves to null instead of silently naming whatever icon/cursor/window took
+     * the slot next.
      */
     registerUserObject(obj: any): number {
-        let handle: number;
+        let slot: number;
         if (this.freeUserHandles.length > 0) {
-            handle = this.freeUserHandles.shift()!; // FIFO — delay reuse of any one slot
+            slot = this.freeUserHandles.shift()!; // FIFO — delay reuse of any one slot
         } else {
-            handle = this.nextUserHandle;
-            if (handle >= 0x50000) {
-                Logger.error(LogCategory.RESOURCE, `User handle range exhausted! handle=0x${handle.toString(16)}`);
+            slot = this.nextUserHandle;
+            if (slot >= 0x50000) {
+                Logger.error(LogCategory.RESOURCE, `User handle range exhausted! handle=0x${slot.toString(16)}`);
             }
             this.nextUserHandle += 4;
         }
+        const gen = (((this.userSlotGeneration.get(slot) ?? -1) + 1) & SystemResourceProvider.USER_GEN_MASK) >>> 0;
+        this.userSlotGeneration.set(slot, gen);
+        const handle = (slot | gen) >>> 0;
         this.userObjects.create(handle, obj);
 
         Logger.log(LogCategory.RESOURCE, `Registered user object handle=0x${handle.toString(16)} type=${obj?.type || '?'}`);
@@ -377,7 +409,9 @@ export class SystemResourceProvider {
     unregisterUserObject(handle: number): any {
         const obj = this.userObjects.release(handle);
         if (obj !== null && obj !== undefined) {
-            this.freeUserHandles.push(handle >>> 0);
+            // Recycle the RAW slot; the generation is bumped on the next reuse, so the
+            // recycled handle differs from this one.
+            this.freeUserHandles.push((handle & ~SystemResourceProvider.USER_GEN_MASK) >>> 0);
         }
         return obj;
     }
@@ -533,6 +567,7 @@ export class SystemResourceProvider {
         // Clear address mappings
         this.addressToHandle.clear();
         this.handleToAddress.clear();
+        this.handleToPrimaryAddress.clear();
 
         // Clear surfacePtr index
         this.surfacePtrIndex.clear();
@@ -547,6 +582,7 @@ export class SystemResourceProvider {
         this.freeComHandles   = [];
         this.freeUserHandles  = [];
         this.comSlotGeneration.clear();
+        this.userSlotGeneration.clear();
     }
 }
 

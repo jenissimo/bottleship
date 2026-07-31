@@ -236,6 +236,13 @@ export function findDirectCallsInText(module: LoadedPEModule, section: PESection
  * From a guest address inside a function body, walk backward until we hit
  * a byte sequence that looks like the start of a function.
  *
+ * ONE backward scan over all recognized prologue shapes, so the NEAREST preceding function
+ * start wins. Preferring the EBP-frame shape across the whole window instead would step over
+ * a frameless callee — zlib's `uncompress` opens `SUB ESP,0x38` with no frame pointer — and
+ * return the PREVIOUS function's entry, which the caller's body-shape window can still
+ * accept. Only the "exactly one candidate" rule stood between that and a hook on the wrong
+ * function.
+ *
  * Returns the absolute address of the prologue start, or -1 on failure.
  */
 export function backtrackToPrologue(module: LoadedPEModule, section: PESection, xrefAddr: number, maxBacktrack: number): number {
@@ -251,34 +258,25 @@ export function backtrackToPrologue(module: LoadedPEModule, section: PESection, 
     for (let i = xrefOff; i >= stop; i--) {
         const b = bytes[i];
         const b1 = bytes[i + 1];
-        const b2 = bytes[i + 2];
-        const b3 = bytes[i + 3];
-        const b4 = bytes[i + 4];
-        if (b === 0x8b && b1 === 0xff && b2 === 0x55 && b3 === 0x8b && b4 === 0xec) {
-            return base + i;
-        }
-        if (b === 0x55 && b1 === 0x8b && b2 === 0xec) {
-            return base + i;
-        }
-    }
-
-    for (let i = xrefOff; i >= stop; i--) {
-        const b = bytes[i];
-        const b1 = bytes[i + 1];
-        if ((b === 0x83 && b1 === 0xec) || (b === 0x81 && b1 === 0xec)) {
-            const prev = i > 0 ? bytes[i - 1] : 0;
-            if (prev === 0xc3 || prev === 0xc2 || prev === 0xcc || prev === 0x90) {
-                return base + i;
-            }
-        }
-    }
-
-    // Fallback for small wrappers that start with preserved-register pushes
-    // instead of an EBP frame, e.g. `push esi; mov esi, [esp+8]`.
-    for (let i = xrefOff; i >= stop; i--) {
-        const b = bytes[i];
-        const b1 = bytes[i + 1];
         const prev = i > 0 ? bytes[i - 1] : 0;
+
+        // EBP frame, with or without the /hotpatch `mov edi,edi` lead-in.
+        if (b === 0x8b && b1 === 0xff && bytes[i + 2] === 0x55 && bytes[i + 3] === 0x8b && bytes[i + 4] === 0xec) {
+            return base + i;
+        }
+        if (b === 0x55 && b1 === 0x8b && bytes[i + 2] === 0xec) {
+            return base + i;
+        }
+
+        // Everything below is only a function start when the previous byte ENDS one
+        // (ret / int3 / alignment nop) — the byte pair alone occurs mid-body.
+        const afterFunctionEnd = prev === 0xc3 || prev === 0xc2 || prev === 0xcc || prev === 0x90;
+        if (!afterFunctionEnd) continue;
+
+        // Frameless: `sub esp, imm8/imm32`.
+        if ((b === 0x83 && b1 === 0xec) || (b === 0x81 && b1 === 0xec)) return base + i;
+
+        // Small wrappers that start with preserved-register pushes, e.g. `push esi; mov esi,[esp+8]`.
         const startsWithPush = b === 0x53 || b === 0x56 || b === 0x57;
         const plausibleNext =
             b1 === 0x8b || // mov
@@ -287,11 +285,7 @@ export function backtrackToPrologue(module: LoadedPEModule, section: PESection, 
             b1 === 0x85 || // test
             b1 === 0x53 || b1 === 0x56 || b1 === 0x57 || // more pushes
             b1 === 0x6a || b1 === 0x68; // push imm8/imm32
-        if (startsWithPush && plausibleNext) {
-            if (prev === 0xc3 || prev === 0xc2 || prev === 0xcc || prev === 0x90) {
-                return base + i;
-            }
-        }
+        if (startsWithPush && plausibleNext) return base + i;
     }
     return -1;
 }

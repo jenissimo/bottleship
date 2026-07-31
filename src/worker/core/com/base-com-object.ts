@@ -37,6 +37,17 @@ export abstract class BaseComObject implements IVTable {
         const resourceProvider = SystemResourceProvider.getInstance();
         this._handle = resourceProvider.registerComObject(this);
         Logger.verbose(LogCategory.COM, `Created COM object ${this.constructor.name} handle=0x${this._handle.toString(16)} iid=${iid}`);
+
+        // A per-interface object whose addRef/release was overridden loses the interface
+        // pointer the guest called through (TypeScript accepts an arity-0 override), and the
+        // symptom is a leak that never reaches destroy(). Say so at birth rather than never.
+        if (this.perInterfaceRefs) {
+            if (this.addRef !== BaseComObject.prototype.addRef || this.release !== BaseComObject.prototype.release) {
+                Logger.error(LogCategory.COM,
+                    `${this.constructor.name} uses per-interface refcounting but overrides addRef/release — ` +
+                    `the override must forward ifacePtr or the object can never reach zero`);
+            }
+        }
     }
 
     /**
@@ -112,8 +123,16 @@ export abstract class BaseComObject implements IVTable {
         return this._ifaceRefs;
     }
 
+    /**
+     * The pointer this object was BORN as. Deliberately not getAddressForHandle: that holds
+     * the last address mapped to the handle, and every QueryInterface tear-off remaps the
+     * handle before AddRef-ing its own pointer — so the birth reference would be credited to
+     * the tear-off's bucket and the original pointer's Release would find no reference,
+     * leaving _liveIfaces permanently above zero (destroy() never runs, surfaces never freed).
+     */
     private primaryInterfaceAddr(): number {
-        return (SystemResourceProvider.getInstance().getAddressForHandle(this._handle) ?? 0) >>> 0;
+        const rp = SystemResourceProvider.getInstance();
+        return ((rp.getPrimaryAddressForHandle(this._handle) ?? rp.getAddressForHandle(this._handle) ?? 0)) >>> 0;
     }
 
     private interfaceKey(ifacePtr: number): number {
@@ -208,13 +227,15 @@ export abstract class BaseComObject implements IVTable {
 
         // Check if this is the requested interface or IUnknown
         if (normalizedRiid === normalizedSelf || normalizedRiid === normalizedIUnknown) {
-            this.addRef();
             const address = SystemResourceProvider.getInstance().getAddressForHandle(this._handle);
             if (address === null) {
                 Logger.error(LogCategory.COM, `${this.constructor.name} QueryInterface ${riid}: object not mapped to guest memory!`);
                 view.setUint32(ppvObject, 0, true);
                 return 0x80004005; // E_FAIL
             }
+            // Reference the pointer we are about to hand out, not "the object" — for a
+            // perInterfaceRefs object those are different buckets.
+            this.addRef(address >>> 0);
             view.setUint32(ppvObject, address >>> 0, true);
             Logger.verbose(LogCategory.COM, `${this.constructor.name} QueryInterface ${riid} -> 0x${address.toString(16)}`);
             return 0; // S_OK
@@ -223,13 +244,13 @@ export abstract class BaseComObject implements IVTable {
         // Check if derived classes support additional interfaces
         const supportedIid = this.queryAdditionalInterfaces(normalizedRiid);
         if (supportedIid) {
-            this.addRef();
             const address = SystemResourceProvider.getInstance().getAddressForHandle(this._handle);
             if (address === null) {
                 Logger.error(LogCategory.COM, `${this.constructor.name} QueryInterface ${riid} (additional): object not mapped to guest memory!`);
                 view.setUint32(ppvObject, 0, true);
                 return 0x80004005; // E_FAIL
             }
+            this.addRef(address >>> 0);
             view.setUint32(ppvObject, address >>> 0, true);
             Logger.verbose(LogCategory.COM, `${this.constructor.name} QueryInterface ${riid} -> 0x${address.toString(16)} (additional)`);
             return 0; // S_OK

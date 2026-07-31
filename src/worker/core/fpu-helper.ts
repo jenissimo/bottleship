@@ -250,6 +250,114 @@ export function fpuRestore(v86: any, snap: Uint8Array): boolean {
     return true;
 }
 
+// ─── Relaxed-FPU mode change: re-encode SAVED x87 state ────────────────────
+//
+// The 16 bytes of an F80 slot mean different numbers depending on a single
+// global flag: under relaxed FPU, `sign_exponent == RELAXED_TAG` (0x7FFE) means
+// `mantissa` holds raw f64 bits; under strict FPU the same bytes are a true
+// 80-bit value (0x7FFE is a legal exponent field — 2^16383, e.g. LDBL_MAX).
+// Toggling the mode canonicalizes only the LIVE register file (wasm
+// set_relaxed_fpu), but every parked thread's x87 state lives in a saved
+// snapshot over the SHARED register file, so those must be re-encoded too or
+// each parked thread resumes reading old-mode bytes under new-mode tag rules.
+// Semantics mirror F80::of_f64_strict / to_f64_strict and the 0x7FFE alias
+// handling in fpu_load_m80 (vendor/v86/src/rust) — do not re-derive rounding.
+
+const U64_MASK = (1n << 64n) - 1n;
+
+function leadingZeros64(v: bigint): number {
+    const hi = Number((v >> 32n) & 0xFFFFFFFFn) >>> 0;
+    return hi !== 0 ? Math.clz32(hi) : 32 + Math.clz32(Number(v & 0xFFFFFFFFn) >>> 0);
+}
+
+/** True 80-bit value → IEEE-754 double bits. Port of F80::to_f64_strict. */
+function f80StrictToF64Bits(mant: bigint, signExp: number): bigint {
+    const sign = BigInt(signExp >>> 15);
+    const exp = signExp & 0x7FFF;
+
+    if (exp === 0 && mant === 0n) return sign << 63n;
+
+    if (exp === 0x7FFF) {
+        if (mant === 0x8000000000000000n) return (sign << 63n) | (0x7FFn << 52n);
+        const payload = (mant & 0x3FFFFFFFFFFFFFFFn) >> 11n;
+        const quiet = (mant >> 62n) & 1n;
+        return (sign << 63n) | (0x7FFn << 52n) | (quiet << 51n) | (payload & 0x7FFFFFFFFFFFFn);
+    }
+
+    // F80 denormal / pseudo-denormal: underflows to zero in f64.
+    if (exp === 0) return sign << 63n;
+
+    const f64Exp = exp - 16383 + 1023;
+    if (f64Exp >= 0x7FF) return (sign << 63n) | (0x7FFn << 52n);
+    if (f64Exp <= 0) {
+        const shift = 1 - f64Exp;
+        if (shift >= 64) return sign << 63n;
+        return (sign << 63n) | (mant >> BigInt(11 + shift));
+    }
+    return (sign << 63n) | (BigInt(f64Exp) << 52n) | ((mant & 0x7FFFFFFFFFFFFFFFn) >> 11n);
+}
+
+/** IEEE-754 double bits → true 80-bit value. Port of F80::of_f64_strict. */
+function f64BitsToF80Strict(src: bigint): { mant: bigint; signExp: number } {
+    const sign = Number((src >> 63n) & 1n);
+    const exp = Number((src >> 52n) & 0x7FFn);
+    const mant = src & 0xFFFFFFFFFFFFFn;
+
+    if (exp === 0 && mant === 0n) return { mant: 0n, signExp: sign << 15 };
+
+    if (exp === 0x7FF) {
+        if (mant === 0n) return { mant: 0x8000000000000000n, signExp: (sign << 15) | 0x7FFF };
+        const quiet = (mant >> 51n) & 1n;
+        const payload = (mant & 0x7FFFFFFFFFFFFn) << 11n;
+        return { mant: 0x8000000000000000n | (quiet << 62n) | payload, signExp: (sign << 15) | 0x7FFF };
+    }
+
+    if (exp === 0) {
+        // Subnormal: normalize so the leading 1 lands on the explicit J-bit. The bias
+        // term is -1023, not 1-1023 — normalizing already consumes the implicit-bit
+        // offset, and biasing as if it were still there doubles the value. Matches
+        // of_f64_strict in vendor/v86/src/rust/softfloat.rs.
+        const shift = leadingZeros64(mant) - 12;
+        const normalized = (mant << BigInt(shift + 1)) & U64_MASK;
+        const f80Exp = (-1023 + 16383 - shift) & 0xFFFF;
+        return { mant: (0x8000000000000000n | ((normalized << 11n) & U64_MASK)) & U64_MASK, signExp: (sign << 15) | f80Exp };
+    }
+
+    return { mant: 0x8000000000000000n | (mant << 11n), signExp: (sign << 15) | ((exp - 1023 + 16383) & 0xFFFF) };
+}
+
+/**
+ * Re-encode a saved x87 snapshot for the relaxed-FPU mode it is about to be
+ * restored under, preserving the NUMBER each slot holds (not its bytes).
+ * `toRelaxed` is the mode being switched TO. Returns true if any slot was
+ * rewritten.
+ */
+export function canonicalizeFpuSnapshotForMode(snap: Uint8Array, toRelaxed: boolean): boolean {
+    if (snap.length < FPU_SNAPSHOT_BYTES) return false;
+    const stackEmpty = snap[129];
+    const dv = new DataView(snap.buffer, snap.byteOffset, snap.byteLength);
+    let changed = false;
+
+    for (let i = 0; i < 8; i++) {
+        if (stackEmpty & (1 << i)) continue; // empty slot holds garbage by definition
+        const base = i * F80_SIZE;
+        if (dv.getUint16(base + 8, true) !== FPU_RELAXED_TAG) continue;
+        const mant = dv.getBigUint64(base, true);
+        if (toRelaxed) {
+            // A genuine 80-bit image whose exponent aliases the tag; relaxed mode would
+            // misread it as f64 bits. Re-express as f64 bits — 2^16383 is out of f64
+            // range and becomes the infinity every op on it would produce (fpu_load_m80).
+            dv.setBigUint64(base, f80StrictToF64Bits(mant, FPU_RELAXED_TAG), true);
+        } else {
+            const { mant: m, signExp } = f64BitsToF80Strict(mant);
+            dv.setBigUint64(base, m, true);
+            dv.setUint16(base + 8, signExp, true);
+        }
+        changed = true;
+    }
+    return changed;
+}
+
 // ─── Full SSE state snapshot (context switches) ────────────────────────────
 //
 // Exactly the same hazard as the x87 block above, for the SSE register file.

@@ -38,7 +38,7 @@ import {
 import { preemptionManager } from '../cpu/preemption-manager';
 import { writeGuestCode } from '../memory/guest-code';
 import { MEM_THUNK_CODE_BASE, MEM_ROM_BASE } from '../cpu/emulator-config';
-import type { HleReportEntry, HookedFunction, LibMatch, PatchHandle, ShadowHookStatus, ShadowSpec } from './types';
+import type { HleReportEntry, HookedFunction, LibMatch, PatchHandle, ShadowHookStatus, ShadowSite, ShadowSpec } from './types';
 
 interface ManagerInit {
     dispatcher: ThunkDispatcher;
@@ -52,11 +52,18 @@ class LibHleManager {
     private init: ManagerInit | null = null;
     /** Recorded matches by libId (module name → LibMatch) for diagnostics. */
     private matches = new Map<string, Map<string, LibMatch>>();
-    /** Patches applied; libId → functionName → PatchHandle. */
-    private patches = new Map<string, Map<string, PatchHandle>>();
-    /** Per-(libId, functionName) hit counters, updated by handlers via countHit. */
+    /**
+     * Patches applied, keyed by (libId, MODULE, functionName). The module component is not
+     * bookkeeping tidiness: one static library routinely appears in two modules of a process
+     * (linked into an engine DLL and into the exe), and without it the second copy's patch
+     * overwrites the first's originalBytes/targetAddress/trampoline — after which unpatch
+     * restores only one of them while the other keeps jumping into a stub whose runtime is
+     * already disabled.
+     */
+    private patches = new Map<string, PatchHandle>();
+    /** Per-(libId, functionName) hit counters — an aggregate across modules (diagnostics only). */
     private hits = new Map<string, Map<string, number>>();
-    /** Shadow state machines, keyed `${libId}:${functionName}`. */
+    /** Shadow state machines, one per PATCH (same key space as `patches`). */
     private shadowRuntimes = new Map<string, ShadowHookRuntime>();
     /** Lazily-allocated return-sentinel for the sync original-call path. */
     private sentinelAddress = 0;
@@ -69,6 +76,35 @@ class LibHleManager {
 
     isInitialized(): boolean {
         return this.init !== null;
+    }
+
+    private static patchKey(libId: string, moduleName: string, functionName: string): string {
+        return `${libId}|${moduleName}|${functionName}`;
+    }
+
+    /**
+     * Find the patch for (libId, functionName). `moduleName` selects one exactly; without it
+     * the lookup only succeeds when a single module carries the function — an ambiguous
+     * request is refused loudly rather than served from an arbitrary module.
+     */
+    private resolvePatch(libId: string, functionName: string, moduleName?: string): PatchHandle | undefined {
+        if (moduleName !== undefined) {
+            return this.patches.get(LibHleManager.patchKey(libId, moduleName, functionName));
+        }
+        let found: PatchHandle | undefined;
+        let count = 0;
+        for (const h of this.patches.values()) {
+            if (h.libId !== libId || h.functionName !== functionName) continue;
+            found = h;
+            count++;
+        }
+        if (count > 1) {
+            Logger.error(LogCategory.SYSTEM,
+                `[HLE-lib] ${libId}:${functionName} is patched in ${count} modules — ` +
+                `this call must name the module`);
+            return undefined;
+        }
+        return found;
     }
 
     /**
@@ -106,8 +142,9 @@ class LibHleManager {
         callArgs: number[],
         convention: 'stdcall' | 'cdecl' = 'stdcall',
         noAbortRange = false,
+        moduleName?: string,
     ): SyncCallResult {
-        const handle = this.patches.get(libId)?.get(functionName);
+        const handle = this.resolvePatch(libId, functionName, moduleName);
         if (!handle || handle.trampolineAddress === undefined) return { ok: false, reason: 'no-export' };
         const env = this.syncEnv();
         if (!env) return { ok: false, reason: 'no-export' };
@@ -182,11 +219,9 @@ class LibHleManager {
             getMemory: this.init.getMemory,
         };
 
-        if (!this.patches.has(descriptor.id)) this.patches.set(descriptor.id, new Map());
-        const libPatches = this.patches.get(descriptor.id)!;
-
         for (const fm of functionMatches) {
             const decl = descriptor.functions[fm.name];
+            const key = LibHleManager.patchKey(descriptor.id, module.name, fm.name);
 
             // Guarded Inner-Loop HLE: shadow-enabled hooks derive their handler
             // from the kernel. The trampoline (prologueLen) is only needed for
@@ -204,12 +239,12 @@ class LibHleManager {
                 }
                 runtime = new ShadowHookRuntime(
                     descriptor.id, fm.name, decl.shadow,
-                    () => { this.unpatch(descriptor.id, fm.name); },
+                    () => { this.unpatch(descriptor.id, fm.name, module.name); },
                     // VALIDATED (shadowing→active): promote to the WASM
                     // hypercall tier — the production home for inner-loop
                     // kernels (JS at kilo-calls/frame is a net regression).
                     () => {
-                        const h = this.patches.get(descriptor.id)?.get(fm.name);
+                        const h = this.patches.get(key);
                         if (decl.hypercallHandlerId !== undefined && h && h.functionId >= 0) {
                             hypercallDataManager.registerRawHandler(h.functionId, decl.hypercallHandlerId);
                             Logger.log(LogCategory.SYSTEM,
@@ -220,11 +255,11 @@ class LibHleManager {
                     // Re-armed (active→shadowing): demote so calls flow through
                     // the JS shadow path again — WASM would serve them silently.
                     () => {
-                        const h = this.patches.get(descriptor.id)?.get(fm.name);
+                        const h = this.patches.get(key);
                         if (h && h.functionId >= 0) hypercallDataManager.unregisterRawHandler(h.functionId);
                     },
                 );
-                handler = this.buildShadowHandler(runtime, decl, descriptor.id, fm.name);
+                handler = this.buildShadowHandler(runtime, decl, descriptor.id, fm.name, module.name, fm.address);
             }
             if (!handler) {
                 Logger.warn(LogCategory.SYSTEM, `[HLE-lib] ${descriptor.id}: no handler for '${fm.name}' — skipping patch`);
@@ -239,6 +274,7 @@ class LibHleManager {
             const handle = applyPatch(patchCtx, {
                 libId: descriptor.id,
                 functionName: fm.name,
+                moduleName: module.name,
                 targetAddress: fm.address,
                 callingConvention: decl.callingConvention,
                 argCount: decl.argCount,
@@ -247,15 +283,15 @@ class LibHleManager {
                 entryFilter: decl.entryFilter,
             });
             if (handle) {
+                this.patches.set(key, handle);
                 if (needsTrampoline && handle.trampolineAddress === undefined) {
                     Logger.error(LogCategory.SYSTEM,
                         `[HLE-lib] ${descriptor.id}:${fm.name}: validateInGame hook patched without ` +
                         `trampoline — unpatching`);
-                    this.unpatch(descriptor.id, fm.name);
+                    this.unpatch(descriptor.id, fm.name, module.name);
                     continue;
                 }
-                libPatches.set(fm.name, handle);
-                if (runtime) this.shadowRuntimes.set(`${descriptor.id}:${fm.name}`, runtime);
+                if (runtime) this.shadowRuntimes.set(key, runtime);
 
                 // Inner-loop WASM tier: bind the stub's functionId → the Rust
                 // handler so the guest OUT is served in WASM; the JS handler
@@ -302,9 +338,12 @@ class LibHleManager {
         decl: HookedFunction,
         libId: string,
         fnName: string,
+        moduleName: string,
+        targetAddress: number,
     ): ThunkImplementation {
         const spec = decl.shadow!;
         const validateInGame = spec.validateInGame === true;
+        const site = { moduleName, targetAddress };
         return (ctx, mem, args): ThunkResult | number => {
             libHleManager.countHit(libId, fnName);
             const liveView = new LiveShadowView(mem);
@@ -320,16 +359,22 @@ class LibHleManager {
             //    beyond the sane envelope, never seen in-game) still computes
             //    the right answer — we only log it. ──
             if (!validateInGame || rt.state === 'active' || rt.state === 'disabled') {
-                if (rt.state === 'disabled') return 0; // patch about to be restored
+                if (rt.state === 'disabled') {
+                    // The patch is already restored; hand the call to the real function
+                    // instead of answering it. Fabricating a return is not survivable for
+                    // an ABI whose contract includes a mutated state struct.
+                    return this.completeViaRestoredOriginal(libId, fnName, moduleName, decl, targetAddress, args);
+                }
                 if (!guardOk) rt.recordGuardFail();
                 try {
-                    return { value: spec.kernel(liveView, args) >>> 0 };
+                    return { value: spec.kernel(liveView, args, site) >>> 0 };
                 } catch (e) {
                     // A live kernel throw on a pure leaf means our ABI model is
-                    // wrong — bail out to the guest permanently.
+                    // wrong — bail out to the guest permanently, and let the guest's own
+                    // code produce this call's result.
                     rt.recordMismatch({ kind: 'kernel-threw', detail: String(e) });
-                    this.unpatch(libId, fnName);
-                    return 0;
+                    this.unpatch(libId, fnName, moduleName);
+                    return this.completeViaRestoredOriginal(libId, fnName, moduleName, decl, targetAddress, args);
                 }
             }
 
@@ -337,7 +382,7 @@ class LibHleManager {
             //    completion synchronously via the trampoline and stays
             //    authoritative; the kernel runs against scratch; outputs are
             //    compared before the guest's own EAX goes back to the caller. ──
-            const handle = this.patches.get(libId)?.get(fnName);
+            const handle = this.resolvePatch(libId, fnName, moduleName);
             if (!handle || handle.trampolineAddress === undefined) {
                 Logger.warn(LogCategory.SYSTEM, `[HLE-shadow] ${libId}:${fnName} called without trampoline — returning 0`);
                 return 0;
@@ -349,7 +394,7 @@ class LibHleManager {
             const callArgs = args.slice(0, decl.argCount);
             if (!guardOk) {
                 rt.recordGuardFail();
-                return this.completeViaOriginalSync(rt, spec, decl, handle, callArgs, liveView, null);
+                return this.completeViaOriginalSync(rt, spec, decl, handle, callArgs, liveView, site, null);
             }
             let ranges;
             let scratchView: ScratchShadowView;
@@ -358,20 +403,20 @@ class LibHleManager {
                 ranges = spec.ranges(callArgs, liveView);
                 if (!rangesAreSane(ranges, mem.length)) {
                     rt.recordGuardFail();
-                    return this.completeViaOriginalSync(rt, spec, decl, handle, callArgs, liveView, null);
+                    return this.completeViaOriginalSync(rt, spec, decl, handle, callArgs, liveView, site, null);
                 }
                 scratchView = new ScratchShadowView(mem, ranges);
-                kernelEax = spec.kernel(scratchView, callArgs) >>> 0;
+                kernelEax = spec.kernel(scratchView, callArgs, site) >>> 0;
                 if (scratchView.outOfContractWrite) {
                     rt.recordMismatch({ kind: 'out-of-contract-write', detail: scratchView.outOfContractWrite });
-                    return this.completeViaOriginalSync(rt, spec, decl, handle, callArgs, liveView, null);
+                    return this.completeViaOriginalSync(rt, spec, decl, handle, callArgs, liveView, site, null);
                 }
             } catch (e) {
                 rt.recordMismatch({ kind: 'kernel-threw', detail: String(e) });
-                return this.completeViaOriginalSync(rt, spec, decl, handle, callArgs, liveView, null);
+                return this.completeViaOriginalSync(rt, spec, decl, handle, callArgs, liveView, site, null);
             }
             const frozenRanges = ranges;
-            return this.completeViaOriginalSync(rt, spec, decl, handle, callArgs, liveView, (guestEax) => {
+            return this.completeViaOriginalSync(rt, spec, decl, handle, callArgs, liveView, site, (guestEax) => {
                 const mismatch = compareShadowOutputs(
                     mem, frozenRanges, scratchView.scratch, kernelEax, guestEax, spec.f32UlpTolerance);
                 if (mismatch) rt.recordMismatch(mismatch);
@@ -399,6 +444,7 @@ class LibHleManager {
         handle: PatchHandle,
         callArgs: number[],
         liveView: LiveShadowView,
+        site: ShadowSite,
         onReturn: ((guestEax: number) => void) | null,
     ): ThunkResult | number {
         const res = this.runOriginalSync(decl, handle, callArgs);
@@ -423,11 +469,51 @@ class LibHleManager {
             });
         }
         try {
-            return { value: spec.kernel(liveView, callArgs) >>> 0 };
+            return { value: spec.kernel(liveView, callArgs, site) >>> 0 };
         } catch (e) {
             Logger.error(LogCategory.SYSTEM, `[HLE-shadow] live-kernel completion threw for ${handle.libId}:${handle.functionName}: ${e}`);
             return 0;
         }
+    }
+
+    /**
+     * Bail-out completion: run the RESTORED original at its OWN entry, synchronously, and
+     * hand back its EAX and its side effects.
+     *
+     * The alternative — returning a fabricated 0 — is what the caller cannot survive: the
+     * hooked functions here are not `int f(...)`, they return a pointer to a state struct the
+     * call was also supposed to advance, so a bare 0 hands the caller NULL and an unchanged
+     * count. Calling the target address (not the trampoline) is deliberate: by the time we
+     * bail the patch bytes are gone, so the entry IS the original.
+     */
+    private completeViaRestoredOriginal(
+        libId: string,
+        fnName: string,
+        moduleName: string,
+        decl: HookedFunction,
+        targetAddress: number,
+        args: number[],
+    ): ThunkResult | number {
+        if (this.resolvePatch(libId, fnName, moduleName)) {
+            Logger.error(LogCategory.SYSTEM,
+                `[HLE-lib] ${libId}:${fnName} (${moduleName}): bail-out with the patch still installed — ` +
+                `re-entering would loop; returning 0`);
+            return 0;
+        }
+        const env = this.syncEnv();
+        if (env) {
+            const effEnv = decl.shadow?.allowGuestImports ? { ...env, abortLo: 0, abortHi: 0 } : env;
+            const res = callGuestFunctionSync(effEnv, targetAddress, args.slice(0, decl.argCount), decl.callingConvention);
+            if (res.ok) return { value: res.eax >>> 0 };
+            Logger.error(LogCategory.SYSTEM,
+                `[HLE-lib] ${libId}:${fnName} (${moduleName}): could not run the restored original ` +
+                `(${res.reason}) — the caller gets 0 and no side effects`);
+            return 0;
+        }
+        Logger.error(LogCategory.SYSTEM,
+            `[HLE-lib] ${libId}:${fnName} (${moduleName}): no sync-call environment for the bail-out — ` +
+            `the caller gets 0 and no side effects`);
+        return 0;
     }
 
     /** Run the hook's ORIGINAL function via its trampoline, synchronously. */
@@ -477,8 +563,9 @@ class LibHleManager {
     rearmShadow(libId?: string, fnName?: string, n?: number): number {
         let count = 0;
         for (const [key, rt] of this.shadowRuntimes) {
-            if (libId && !key.startsWith(`${libId}:`)) continue;
-            if (fnName && !key.endsWith(`:${fnName}`)) continue;
+            const [keyLib, , keyFn] = key.split('|');
+            if (libId && keyLib !== libId) continue;
+            if (fnName && keyFn !== fnName) continue;
             if (rt.rearm(n)) count++;
         }
         return count;
@@ -492,37 +579,39 @@ class LibHleManager {
      * crash the game. Idempotent — a no-op for functions that aren't
      * patched.
      */
-    unpatch(libId: string, functionName: string): boolean {
-        const libPatches = this.patches.get(libId);
-        const handle = libPatches?.get(functionName);
+    unpatch(libId: string, functionName: string, moduleName?: string): boolean {
+        const handle = this.resolvePatch(libId, functionName, moduleName);
         if (!handle) return false;
         const mem = this.init?.getMemory() ?? null;
         if (!mem) {
             Logger.warn(LogCategory.SYSTEM, `[HLE-lib] unpatch: guest memory unavailable for ${libId}:${functionName}`);
             return false;
         }
-        writeGuestCode(mem, handle.originalBytes, handle.targetAddress);
+        if (!writeGuestCode(mem, handle.originalBytes, handle.targetAddress)) {
+            Logger.error(LogCategory.SYSTEM,
+                `[HLE-lib] unpatch: restoring ${libId}:${functionName} at ` +
+                `0x${handle.targetAddress.toString(16)} overran guest memory — patch still live`);
+            return false;
+        }
         // Drop the WASM dispatch binding too, so a bailed-out hook stops being
         // served in WASM (the original guest bytes are back — no stub to reach).
         if (handle.functionId >= 0) {
             hypercallDataManager.unregisterRawHandler(handle.functionId);
         }
-        libPatches!.delete(functionName);
+        this.patches.delete(LibHleManager.patchKey(libId, handle.moduleName, functionName));
         Logger.log(LogCategory.SYSTEM,
-            `[HLE-lib] Unpatched ${libId}:${functionName} at 0x${handle.targetAddress.toString(16)} ` +
-            `— restored ${handle.originalBytes.length} original bytes`,
+            `[HLE-lib] Unpatched ${libId}:${functionName} (${handle.moduleName}) at ` +
+            `0x${handle.targetAddress.toString(16)} — restored ${handle.originalBytes.length} original bytes`,
         );
         return true;
     }
 
-    /** Unpatch every function under a libId. Useful for whole-library bail-out. */
+    /** Unpatch every function under a libId, in every module carrying it. */
     unpatchAll(libId: string): number {
-        const libPatches = this.patches.get(libId);
-        if (!libPatches) return 0;
-        const names = Array.from(libPatches.keys());
+        const targets = Array.from(this.patches.values()).filter(h => h.libId === libId);
         let count = 0;
-        for (const name of names) {
-            if (this.unpatch(libId, name)) count++;
+        for (const h of targets) {
+            if (this.unpatch(libId, h.functionName, h.moduleName)) count++;
         }
         return count;
     }
@@ -542,6 +631,13 @@ class LibHleManager {
         this.shadowRuntimes.clear();
         this.sentinelAddress = 0; // thunk region is rebuilt with the process
         this.warnedNoExport = false;
+        // Descriptors hold per-site state resolved out of the old image (table addresses,
+        // constants) — keyed by guest address, so it must not outlive that address space.
+        for (const desc of libRegistry.getAll()) {
+            try { desc.onReset?.(); } catch (e) {
+                Logger.warn(LogCategory.SYSTEM, `[HLE-lib] ${desc.id}.onReset threw: ${e}`);
+            }
+        }
         // Guest-RAM handler configs died with the process — clear the page
         // pointers so a WASM handler can't read a stale block in fresh memory.
         hypercallDataManager.setEaglTokenConfigPtr(0);
@@ -552,13 +648,14 @@ class LibHleManager {
         const entries: HleReportEntry[] = [];
         for (const [libId, byModule] of this.matches) {
             for (const [moduleName, match] of byModule) {
-                const libPatches = this.patches.get(libId);
                 const libHits = this.hits.get(libId);
-                const patchRows = Array.from(libPatches?.values() ?? []).map(p => ({
-                    name: p.functionName,
-                    addr: '0x' + p.targetAddress.toString(16),
-                    hits: libHits?.get(p.functionName) ?? 0,
-                }));
+                const patchRows = Array.from(this.patches.values())
+                    .filter(p => p.libId === libId && p.moduleName === moduleName)
+                    .map(p => ({
+                        name: p.functionName,
+                        addr: '0x' + p.targetAddress.toString(16),
+                        hits: libHits?.get(p.functionName) ?? 0,
+                    }));
                 entries.push({
                     lib: libId,
                     confidence: match.confidence,

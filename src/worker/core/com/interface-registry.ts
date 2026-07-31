@@ -7,7 +7,7 @@
 
 import { BaseComObject, ComObjectFactory } from './base-com-object';
 import { Logger, LogCategory } from '../logger';
-import { InterfaceDescriptor, ModuleDescriptor } from '../../api/types';
+import { ModuleDescriptor } from '../../api/types';
 
 export interface InterfaceMapping {
     iid: string;
@@ -22,11 +22,6 @@ export class InterfaceRegistry {
     private static instance: InterfaceRegistry;
     private mappings: Map<string, InterfaceMapping> = new Map();
     private classToMappings: Map<string, InterfaceMapping[]> = new Map();
-    /**
-     * Interface NAME -> descriptor. `InterfaceDescriptor.inherits` names a parent interface,
-     * while `mappings` is keyed by IID; the two key spaces must not be mixed.
-     */
-    private descriptorsByName: Map<string, InterfaceDescriptor> = new Map();
 
     static getInstance(): InterfaceRegistry {
         if (!InterfaceRegistry.instance) {
@@ -57,23 +52,18 @@ export class InterfaceRegistry {
     registerFromModuleDescriptor(module: ModuleDescriptor): void {
         if (!module.interfaces) return;
 
-        // Index the whole module before building any chain: a descriptor may name a parent
-        // that appears later in the array.
-        for (const iface of module.interfaces) {
-            this.descriptorsByName.set(iface.name, iface);
-        }
-
+        // `supportedInterfaces` is IUnknown only. QueryInterface never consults this registry
+        // — every object answers from its own IID plus queryAdditionalInterfaces, and ddraw
+        // has its own tear-off table — so deriving an inheritance chain here would decide
+        // nothing while emitting a warning per interface.
         for (const iface of module.interfaces) {
             if (!iface.iid) continue;
-
-            // Build supported interfaces list (inheritance chain)
-            const supportedInterfaces = this.buildSupportedInterfaces(iface);
 
             this.register({
                 iid: iface.iid,
                 className: iface.name,
                 moduleName: module.name,
-                supportedInterfaces
+                supportedInterfaces: [IID_IUNKNOWN],
             });
         }
     }
@@ -136,56 +126,6 @@ export class InterfaceRegistry {
      */
     getRegisteredIIDs(): string[] {
         return Array.from(this.mappings.keys());
-    }
-
-    /**
-     * Build the list of supported interfaces for an interface by walking `inherits` up to IUnknown.
-     *
-     * An ancestor IID is only listed when our table is a prefix-extension of that ancestor's
-     * (same method at every one of its slots, and at least as many slots). Accepting an ancestor
-     * IID means handing our vtable back for it: a shorter or reordered table turns the guest's
-     * call through that IID into a read past the table's end — the vtable is exactly
-     * methods.length * 4 bytes flush against stub code, so the "function pointer" is stub bytes.
-     * An ancestor that fails the check, or that is not declared anywhere, stops the walk.
-     */
-    private buildSupportedInterfaces(iface: InterfaceDescriptor): string[] {
-        const supported = new Set<string>([IID_IUNKNOWN]);
-        const visited = new Set<string>([iface.name]);
-
-        let parentName = iface.inherits;
-        while (parentName && parentName !== "IUnknown" && !visited.has(parentName)) {
-            visited.add(parentName);
-
-            const parent = this.descriptorsByName.get(parentName);
-            if (!parent) {
-                Logger.warn(LogCategory.COM,
-                    `Interface ${iface.name} inherits ${parentName}, which is not declared — inheritance chain stops here`);
-                break;
-            }
-
-            if (!this.isPrefixExtensionOf(parent, iface)) {
-                Logger.warn(LogCategory.COM,
-                    `Interface ${iface.name} (${iface.methods.length} slots) is not a prefix-extension of ${parentName} ` +
-                    `(${parent.methods.length} slots) — ${parentName} left unsupported`);
-                break;
-            }
-
-            if (parent.iid) supported.add(parent.iid);
-            parentName = parent.inherits;
-        }
-
-        return Array.from(supported);
-    }
-
-    /** True when `child`'s leading slots are exactly `ancestor`'s methods, in order. */
-    private isPrefixExtensionOf(ancestor: InterfaceDescriptor, child: InterfaceDescriptor): boolean {
-        if (child.methods.length < ancestor.methods.length) return false;
-
-        for (let i = 0; i < ancestor.methods.length; i++) {
-            if (child.methods[i].name !== ancestor.methods[i].name) return false;
-        }
-
-        return true;
     }
 
     private normalizeIid(iid: string): string {

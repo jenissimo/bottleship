@@ -1799,8 +1799,11 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
     // After writeFiles so a manifest-shipped Default.ini override is the one we pin.
     await applyUe1FirstRunSetup(bundle.manifest.entrypoint);
 
-    const { width, height } = emulatorConfig.screenResolution;
-    System.getInstance().requestHostResize(width, height);
+    // The boot publisher of the emulated display mode: until a game mode-sets, the bundle's
+    // declared resolution IS the desktop, and every SM_CXSCREEN/EnumDisplaySettings reader
+    // needs it. Without modeSet here emulatedDisplayMode stays null for the whole session.
+    const { width, height, bpp } = emulatorConfig.screenResolution;
+    System.getInstance().requestHostResize(width, height, { modeSet: true, bpp });
 
     // Update DDraw context display when module exists (e.g. preloaded)
     const ddraw = system.process?.getModule("ddraw") as { updateDisplayFromConfig?: () => void } | undefined;
@@ -1925,12 +1928,14 @@ const loadBundle = (payload: { data?: Uint8Array; url?: string; blob?: Blob; blo
  * macrotask, so this is the same proven entry the normal path uses — by then the thunk has
  * returned its SE_ERR_/PROCESS_INFORMATION value and the guest is at a clean boundary.
  */
-const requestSelfReExec = (commandLine: string): void => {
+const requestSelfReExec = (commandLine: string): boolean => {
+  // Returns whether the re-exec was ACCEPTED. A launcher that exits believing it started a
+  // child, when nothing was scheduled, is a silent vanish — shell32 reports our verdict.
   if (!lastBundlePayload) {
     Logger.warn(LogCategory.SYSTEM, `[ReExec] ignored "${commandLine}" — no bundle payload to replay`);
-    return;
+    return false;
   }
-  if (pendingReExecArgs !== null) return; // already scheduled; a launcher may ask twice
+  if (pendingReExecArgs !== null) return false; // already scheduled; a launcher may ask twice
   pendingReExecArgs = commandLine;
   const payload = lastBundlePayload;
 
@@ -1942,7 +1947,7 @@ const requestSelfReExec = (commandLine: string): void => {
   if (payload?.url) {
     Logger.log(LogCategory.SYSTEM, `[ReExec] requesting host page-reload restart, args "${commandLine}"`);
     self.postMessage({ type: "reexec", args: commandLine, url: payload.url });
-    return;
+    return true;
   }
 
   // No URL to replay (a bundle handed over as a Blob by "Load File…") — a page reload could
@@ -1952,6 +1957,7 @@ const requestSelfReExec = (commandLine: string): void => {
   Logger.log(LogCategory.SYSTEM,
     `[ReExec] no replayable URL — in-worker restart with args "${commandLine}"`);
   setTimeout(() => loadBundle(payload!), 0);
+  return true;
 };
 
 const initV86 = async (canvas: OffscreenCanvas) => {

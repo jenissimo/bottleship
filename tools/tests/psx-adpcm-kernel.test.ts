@@ -38,6 +38,7 @@ const TBL = 0x1000;   // 16 filter entries, {i16,i16}
 const CTX = 0x2000;
 const SRC = 0x4000;
 const DST = 0x8000;
+const DECODER = 0xc000;  // a decoder entry — coefficient tables are keyed by it
 
 /** Deterministic 32-bit LCG — the same stream for every implementation. */
 function rng(seed: number): () => number {
@@ -131,10 +132,10 @@ function runBoth(count: number, seed: number) {
     for (let i = 0; i < nBytes; i++) { const v = r2() & 0xff; memA[SRC + i] = v; memB[SRC + i] = v; memC[SRC + i] = v; }
     const h1 = ((seed * 31) & 0xffff) - 32768, h2 = ((seed * 17) & 0xffff) - 32768;
     for (const m of [memA, memB, memC]) setState(m, CTX, count, h1, h2, SRC, DST);
-    setCoefTable(TBL);
-    const eaxA = decodeExact(new LiveShadowView(memA), CTX);
+    setCoefTable(DECODER, TBL);
+    const eaxA = decodeExact(new LiveShadowView(memA), CTX, TBL);
     const spans = decodeSpans(new LiveShadowView(memB), CTX, MEM)!;
-    const eaxB = decodeFast(new LiveShadowView(memB), CTX, spans.blocks);
+    const eaxB = decodeFast(new LiveShadowView(memB), CTX, spans.blocks, TBL);
     const ref = reference(memC, CTX);
     return { memA, memB, eaxA, eaxB, ref, blocks: spans.blocks };
 }
@@ -181,8 +182,8 @@ describe('decodeExact vs decodeFast vs an independent reference', () => {
             const mem = mkMem(9);
             setState(mem, CTX, count, 111, -222, SRC, DST);
             const before = mem.slice(0, MEM);
-            setCoefTable(TBL);
-            expect(decodeExact(new LiveShadowView(mem), CTX)).toBe(CTX);
+            setCoefTable(DECODER, TBL);
+            expect(decodeExact(new LiveShadowView(mem), CTX, TBL)).toBe(CTX);
             expect(Array.from(mem)).toEqual(Array.from(before));
         }
     });
@@ -193,8 +194,8 @@ describe('decodeExact vs decodeFast vs an independent reference', () => {
         memA[SRC] = 0xd3; memC[SRC] = 0xd3;      // filter 13, shift 3+8
         setState(memA, CTX, 28, 0, 0, SRC, DST);
         setState(memC, CTX, 28, 0, 0, SRC, DST);
-        setCoefTable(TBL);
-        decodeExact(new LiveShadowView(memA), CTX);
+        setCoefTable(DECODER, TBL);
+        decodeExact(new LiveShadowView(memA), CTX, TBL);
         const ref = reference(memC, CTX);
         const dv = new DataView(memA.buffer);
         for (let i = 0; i < 28; i++) expect(dv.getInt16(DST + i * 2, true)).toBe(ref.samples[i]);
@@ -210,8 +211,8 @@ describe('decodeExact vs decodeFast vs an independent reference', () => {
         mem[SRC] = 0x10;
         for (let i = 1; i < 15; i++) mem[SRC + i] = 0x8f;   // nibbles 8 (=-8) and 15 (=-1)
         setState(mem, CTX, 28, -32768, -32768, SRC, DST);
-        setCoefTable(TBL);
-        decodeExact(new LiveShadowView(mem), CTX);
+        setCoefTable(DECODER, TBL);
+        decodeExact(new LiveShadowView(mem), CTX, TBL);
         const dv = new DataView(mem.buffer);
         const out: number[] = [];
         for (let i = 0; i < 28; i++) out.push(dv.getInt16(DST + i * 2, true));
@@ -245,7 +246,7 @@ describe('aliasing', () => {
         // dst overlapping the state means the decoded samples land on `count` and on the
         // cursors, i.e. the loop's own bounds. Every such call must return or throw one of
         // the two bound errors; a hang would be unrecoverable (no preemption inside JS).
-        setCoefTable(TBL);
+        setCoefTable(DECODER, TBL);
         const outcomes = new Set<string>();
         for (const dstOff of [0, 2, 4, 8, 0xc, -4, -16]) {
             for (const fill of [0x00, 0x1f, 0x7f, 0x88, 0xff]) {
@@ -254,7 +255,7 @@ describe('aliasing', () => {
                     for (let i = 0; i < 15 * 8; i++) mem[SRC + i] = fill;
                     setState(mem, CTX, count, 0, 0, SRC, CTX + dstOff);
                     try {
-                        decodeExact(new LiveShadowView(mem), CTX);
+                        decodeExact(new LiveShadowView(mem), CTX, TBL);
                         outcomes.add('returned');
                     } catch (e) {
                         expect(String(e)).toMatch(/outran its (block|sample count)/);

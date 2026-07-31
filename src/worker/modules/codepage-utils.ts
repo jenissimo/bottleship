@@ -48,29 +48,55 @@ export function writeAnsiToGuest(mem: Uint8Array, addr: number, str: string, max
  * Drop-in replacement for `new TextEncoder().encode(str)` when writing to guest memory.
  */
 /**
- * Read a guest string whose width is unknown (WM_SETTEXT & friends arrive via
- * both A and W entry points): probe the first chars — mostly-zero high bytes
- * means UTF-16. A single probed char proves nothing (an ANSI "5\0" probes
- * identically to L"5"), and a 1-char wide string decodes the same either way —
- * so wide requires at least two probed chars.
+ * Read a guest string whose width is unknown (WM_SETTEXT & friends arrive via both A and W
+ * entry points): mostly-zero high bytes means UTF-16.
+ *
+ * PASS `hint` WHEN YOU KNOW. `"5\0"` and `L"5"` are the same bytes, and `"5\0A\0\0\0"` is
+ * the same bytes as `L"5A"` — no inspection can separate them, so a caller that reached here
+ * from an A or W entry point must say which it was rather than let the heuristic guess.
+ *
+ * Without a hint: the probe never draws a conclusion from bytes PAST the ANSI terminator —
+ * those belong to the heap, not to the string. Two or more non-zero bytes in a row settle it
+ * as ANSI outright (a UTF-16 string of ASCII-range characters puts a zero at ptr+1). That
+ * leaves exactly one ambiguous shape, an ANSI string of length 1, whose first character
+ * decodes the same either way — so wide has to be earned from further characters, and that
+ * evidence is only admissible when the pairs terminate on a real 16-bit NUL inside the window
+ * and every low byte is a plausible text unit. A one-character ANSI string followed by
+ * ordinary heap fails both tests and stays ANSI; heap that happens to spell
+ * `<char> 00 00 00` is the irreducible residual above.
  */
-export function readAnsiOrWideFromGuest(mem: Uint8Array, ptr: number): string {
-    if (!ptr) return '';
+export function readAnsiOrWideFromGuest(mem: Uint8Array, ptr: number, hint?: 'ansi' | 'wide'): string {
+    if (!ptr || ptr < 0 || ptr >= mem.length) return '';
+    if (hint === 'ansi') return readAnsiFromGuest(mem, ptr);
+    if (hint === 'wide') return readWideFromGuest(mem, ptr);
+
     const maxProbeChars = 16;
+    const scanStop = Math.min(ptr + maxProbeChars * 2, mem.length);
+    let ansiEnd = ptr;
+    while (ansiEnd < scanStop && mem[ansiEnd] !== 0) ansiEnd++;
+    if (ansiEnd - ptr !== 1) return readAnsiFromGuest(mem, ptr);
+
     let probed = 0;
     let zeroHighBytes = 0;
+    let terminated = false;
     for (let i = 0; i < maxProbeChars; i++) {
         const loIdx = ptr + i * 2;
         const hiIdx = loIdx + 1;
         if (hiIdx >= mem.length) break;
         const lo = mem[loIdx];
         const hi = mem[hiIdx];
-        if (lo === 0 && hi === 0) break;
+        if (lo === 0 && hi === 0) { terminated = true; break; }
+        if (lo < 0x09) break; // not a plausible text unit — stop believing the wide reading
         probed++;
         if (hi === 0) zeroHighBytes++;
     }
-    const looksWide = probed >= 2 && (zeroHighBytes / probed) >= 0.75;
-    if (!looksWide) return readAnsiFromGuest(mem, ptr);
+    const looksWide = terminated && probed >= 2 && (zeroHighBytes / probed) >= 0.75;
+    return looksWide ? readWideFromGuest(mem, ptr) : readAnsiFromGuest(mem, ptr);
+}
+
+/** Null-terminated UTF-16LE from guest memory. */
+export function readWideFromGuest(mem: Uint8Array, ptr: number): string {
+    if (!ptr || ptr < 0 || ptr >= mem.length) return '';
     let out = '';
     for (let p = ptr; p + 1 < mem.length; p += 2) {
         const code = mem[p] | (mem[p + 1] << 8);

@@ -608,7 +608,9 @@ export class Ole32 implements IModule {
                 return 0;
             }
 
-            return obj.addRef();
+            // thisPtr IS the interface pointer the guest called through — pass it, or a
+            // per-interface object credits the reference to the wrong bucket.
+            return obj.addRef(thisPtr >>> 0);
         };
 
         // COM_IUnknown_Release - universal Release implementation
@@ -623,7 +625,7 @@ export class Ole32 implements IModule {
                 return 0;
             }
 
-            return obj.release();
+            return obj.release(thisPtr >>> 0);
         };
 
         // Register these methods in dispatcher and create thunk stubs
@@ -643,7 +645,14 @@ export class Ole32 implements IModule {
         // Allocate memory for stub code
         const stubAddress = this.process.memory.alloc(stubDll.stubCode.length);
         const currentMemory = this.process.getCurrentMemory();
-        writeGuestCode(currentMemory, stubDll.stubCode, stubAddress);
+        if (!writeGuestCode(currentMemory, stubDll.stubCode, stubAddress)) {
+            // Silently not writing them leaves every IUnknown vtable slot pointing at
+            // whatever bytes happen to live there.
+            Logger.error(LogCategory.COM,
+                `OLE32: IUnknown stub write at 0x${stubAddress.toString(16)} overruns guest memory — ` +
+                `IUnknown vtables would be unbacked; aborting stub registration`);
+            return;
+        }
 
         Logger.verbose(LogCategory.COM, `OLE32: Allocated ${stubDll.stubCode.length} bytes for IUnknown stubs at 0x${stubAddress.toString(16)}`);
 

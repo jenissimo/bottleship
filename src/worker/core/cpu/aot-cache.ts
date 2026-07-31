@@ -85,6 +85,37 @@ function hex(buf: ArrayBuffer): string {
     return s;
 }
 
+/**
+ * Remove everything in `dir` that `keep` does not name. Best-effort: a directory we cannot
+ * enumerate or an entry we cannot remove is logged, never fatal — pruning is housekeeping and
+ * must not be able to fail a save.
+ */
+async function pruneDirectory(
+    dir: FileSystemDirectoryHandle,
+    keep: (name: string) => boolean,
+    label: string,
+): Promise<void> {
+    const entries = (dir as unknown as { keys?: () => AsyncIterableIterator<string> }).keys;
+    if (typeof entries !== "function") return;
+    const doomed: string[] = [];
+    try {
+        for await (const name of entries.call(dir)) {
+            if (!keep(name)) doomed.push(name);
+        }
+    } catch (e) {
+        Logger.warn(LogCategory.SYSTEM, `[AOT] could not enumerate ${label} for pruning: ${e}`);
+        return;
+    }
+    for (const name of doomed) {
+        try {
+            await dir.removeEntry(name, { recursive: true });
+        } catch (e) {
+            Logger.warn(LogCategory.SYSTEM, `[AOT] could not prune ${label}/${name}: ${e}`);
+        }
+    }
+    if (doomed.length) Logger.log(LogCategory.SYSTEM, `[AOT] pruned ${doomed.length} stale entr(ies) from ${label}`);
+}
+
 /** SHA-256 of one guest page. The copy is not defensive tidiness: guest memory is backed by
  *  a SharedArrayBuffer and crypto.subtle refuses shared buffers outright. */
 async function sha256Page(mem: Uint8Array, addr: number): Promise<string> {
@@ -107,8 +138,10 @@ interface AotVersion {
     /** Values of the jit config knobs that BAKE INTO emitted modules (shape, not policy). */
     jitConfig: Record<string, number>;
     /** Relaxed FPU changes x87 semantics to f64 — a unit built under it is invalid for an
-     *  fpuStrict bundle, and the damage is quiet precision loss. */
-    relaxedFpu: boolean;
+     *  fpuStrict bundle, and the damage is quiet precision loss. `"unavailable"` when the
+     *  engine does not expose the flag: that must CHANGE the key rather than default to
+     *  false and make units captured under one FPU mode loadable under the other. */
+    relaxedFpu: boolean | "unavailable";
     fastmem: { guardBase: number; guardSize: number; lowMemEnd: number };
     ramSize: number;
 }
@@ -270,6 +303,23 @@ export class AotCache {
         return this.engineSha;
     }
 
+    /**
+     * The relaxed-FPU flag, or `"unavailable"` when the export is missing. `?.() === true`
+     * silently answers `false` there — the same shape as a genuine fpuStrict build, so units
+     * captured with relaxed FPU on would load into a session that cannot tell, and the damage
+     * (see AotVersion.relaxedFpu) is quiet precision loss. An unreadable flag has to fail the
+     * key instead.
+     */
+    private relaxedFpuFlag(): boolean | "unavailable" {
+        const fn = (globalThis as any).preemption?.isRelaxedFpuEnabled;
+        if (typeof fn !== "function") return "unavailable";
+        try {
+            return fn.call((globalThis as any).preemption) === true;
+        } catch {
+            return "unavailable";
+        }
+    }
+
     async version(): Promise<AotVersion> {
         const w = this.wasm();
         const cpu = this.cpu();
@@ -281,7 +331,7 @@ export class AotCache {
             abi: AOT_ABI,
             engine: await this.engineFingerprint(),
             jitConfig,
-            relaxedFpu: (globalThis as any).preemption?.isRelaxedFpuEnabled?.() === true,
+            relaxedFpu: this.relaxedFpuFlag(),
             fastmem: {
                 guardBase: w?.fastmem_get_guard_base ? w.fastmem_get_guard_base() >>> 0 : -1,
                 guardSize: w?.fastmem_get_guard_size ? w.fastmem_get_guard_size() >>> 0 : -1,
@@ -309,6 +359,15 @@ export class AotCache {
         const key = await this.versionKey();
         const aot = await container.getDirectoryHandle("aot", { create: true });
         const dir = await aot.getDirectoryHandle(key, { create: true });
+
+        // Every engine rebuild or codegen-flag flip mints a NEW versionKey directory, and the
+        // old one is dead the moment it does — nothing will ever match its key again. Drop the
+        // siblings, and the unit files this save did not produce, or the game's OPFS container
+        // accumulates megabytes per rebuild forever.
+        const wanted = new Set(this.units.map(u => `${u.entryPage.toString(16)}.wasm`));
+        wanted.add("index.json");
+        await pruneDirectory(aot, (name) => name === key, "aot");
+        await pruneDirectory(dir, (name) => wanted.has(name), `aot/${key}`);
 
         for (const u of this.units) {
             const h = await dir.getFileHandle(`${u.entryPage.toString(16)}.wasm`, { create: true });

@@ -343,6 +343,13 @@ export function registerCrtSeh3Exports(exports: Record<string, ThunkImplementati
             const x86Result = host.process.dispatcher.setupCxxExceptionX86Dispatch(
                 cpu, mem, ctx.esp >>> 0, 0xe06d7363, 0x1, 3, argsPtr, 8);
             if (x86Result) return x86Result;
+
+            // x86 re-dispatch refused (nesting depth / no stub). Nothing was mutated by the
+            // deferred walk, so re-run it with the defer verdict suppressed: skipping the
+            // unparseable frame still reaches a catch further up, which beats terminating.
+            const retry = dispatchCxxException(mem, cpu, pExceptionObject, pThrowInfo, 8,
+                { allowDeferToX86: false });
+            if (retry && !('deferToX86' in retry)) return retry;
         }
 
         Logger.error(LogCategory.SYSTEM,

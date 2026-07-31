@@ -1818,8 +1818,141 @@ export interface CxxDispatchDefer {
     pThrowInfo: number;
 }
 
+/** How a registration in the FS:[0] chain parses as an MSVC C++ EH frame. */
+interface CxxFrameShape {
+    funcInfoPtr: number;
+    state: number;
+    /** Byte offset of the try-level field inside the registration record. */
+    stateOffset: number;
+    isVC7: boolean;
+    frameEbp: number;
+}
+
+/**
+ * Classify one FS:[0] registration. THE single definition of "is this ours" — the read-only
+ * search pass and the mutating walk both go through it, so the pass that decides to defer
+ * cannot disagree with the pass that would have caught.
+ */
+export function classifyCxxFrame(dv: DataView, mem: Uint8Array, sehHead: number, handlerAddr: number): CxxFrameShape | null {
+    const frameEbp = sehHead + EH_PROLOG_EBP_DELTA;
+
+    // VC5/6: FuncInfo* at [+8], try-level at [+12].
+    const field8 = dv.getUint32(sehHead + 8, true);
+    const field12 = dv.getInt32(sehHead + 12, true);
+    if (field8 >= 0x10000 && field8 + 20 < mem.length && field12 >= -1 && field12 < 256) {
+        let magic = 0;
+        try { magic = dv.getUint32(field8, true); } catch { /* */ }
+        if (isMsvcEhMagic(magic)) {
+            return { funcInfoPtr: field8, state: field12, stateOffset: 12, isVC7: false, frameEbp };
+        }
+    }
+
+    // VC7+: try-level at [+8], FuncInfo* extracted from the handler thunk.
+    const vc7State = dv.getInt32(sehHead + 8, true);
+    if (vc7State >= -1 && vc7State < 256) {
+        const funcInfo = extractFuncInfoFromThunk(mem, handlerAddr);
+        if (funcInfo >= 0x10000 && funcInfo + 20 < mem.length) {
+            let magic = 0;
+            try { magic = dv.getUint32(funcInfo, true); } catch { /* */ }
+            if (isMsvcEhMagic(magic)) {
+                return { funcInfoPtr: funcInfo, state: vc7State, stateOffset: 8, isVC7: true, frameEbp };
+            }
+        }
+    }
+    return null;
+}
+
+/**
+ * Read-only half of tryMatchCatch: would this FuncInfo catch this throw at `trylevel`?
+ * Extracted so the defer decision can be taken BEFORE any frame state is written; the
+ * matching rules must stay identical to tryMatchCatch's, which is why both read the same
+ * TryBlockMap fields in the same order.
+ */
+export function frameCatchesThrow(
+    dv: DataView,
+    mem: Uint8Array,
+    funcInfoPtr: number,
+    trylevel: number,
+    pThrowInfo: number,
+    innerOfCatch?: { tryHighAbove: number; catchHighMax: number },
+): boolean {
+    const nTryBlocks = dv.getUint32(funcInfoPtr + 12, true);
+    const pTryBlockMap = dv.getUint32(funcInfoPtr + 16, true);
+    if (nTryBlocks === 0 || pTryBlockMap < 0x10000) return false;
+
+    for (let i = 0; i < nTryBlocks && i < 32; i++) {
+        const tBase = pTryBlockMap + i * 20;
+        if (tBase + 20 > mem.length) break;
+        const tryLow = dv.getInt32(tBase, true);
+        const tryHigh = dv.getInt32(tBase + 4, true);
+        const nCatches = dv.getInt32(tBase + 12, true);
+        const pHandlerArray = dv.getUint32(tBase + 16, true);
+        if (trylevel < tryLow || trylevel > tryHigh) continue;
+        if (nCatches <= 0 || pHandlerArray < 0x10000) continue;
+        if (innerOfCatch &&
+            !(tryLow > innerOfCatch.tryHighAbove && tryHigh <= innerOfCatch.catchHighMax)) {
+            continue;
+        }
+        for (let j = 0; j < nCatches && j < 16; j++) {
+            const hBase = pHandlerArray + j * 16;
+            if (hBase + 16 > mem.length) break;
+            const pType = dv.getUint32(hBase + 4, true);
+            const catchAddr = dv.getUint32(hBase + 12, true);
+            if (catchAddr < 0x10000 || catchAddr >= mem.length) continue;
+            if (matchesThrowType(dv, mem, pType, pThrowInfo)) return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * SEARCH PHASE, read-only. Windows' RtlDispatchException calls EVERY handler in chain order,
+ * so a registration we cannot parse (typically __except_handler3/4, whose filter may well
+ * claim a C++ throw) must run natively when it stands BEFORE any catch we could serve.
+ *
+ * This runs before the dispatch mutates anything. Deciding later — after the catch-funclet
+ * exit loop has written the try-level, restored PRN_STACK and popped the record + active
+ * exception — would drop the exception object's pmfnUnwind and every catch-body local
+ * destructor, and leave a later bare `throw;` with no active exception to resolve.
+ */
+function chainDefersToX86(
+    dv: DataView,
+    mem: Uint8Array,
+    tebAddr: number,
+    pThrowInfo: number,
+): number | null {
+    // Active catch funclets first: the exit loop consults them ahead of the FS:[0] walk.
+    const records = activeCatchRecords.get(tebAddr) ?? [];
+    for (let r = records.length - 1; r >= 0; r--) {
+        const R = records[r];
+        if (R.pRN + R.stateOffset + 4 > mem.length || R.pRN < 4) continue;
+        const liveState = dv.getInt32(R.pRN + R.stateOffset, true);
+        if (frameCatchesThrow(dv, mem, R.funcInfoPtr, liveState, pThrowInfo,
+            { tryHighAbove: R.tryHigh, catchHighMax: R.catchHigh })) return null;
+        const exitTarget = computeCatchExitTargetState(dv, mem, R.funcInfoPtr, liveState);
+        if (frameCatchesThrow(dv, mem, R.funcInfoPtr, exitTarget, pThrowInfo)) return null;
+    }
+
+    let head = dv.getUint32(tebAddr, true) >>> 0;
+    const visited = new Set<number>();
+    for (let n = 0; n < 64 && head !== 0xFFFFFFFF && head !== 0; n++) {
+        if (visited.has(head) || head + 16 >= mem.length) break;
+        visited.add(head);
+        const handlerAddr = dv.getUint32(head + 4, true);
+        const shape = classifyCxxFrame(dv, mem, head, handlerAddr);
+        if (!shape) return head; // unparseable registration reached first — x86 owns this throw
+        if (frameCatchesThrow(dv, mem, shape.funcInfoPtr, shape.state, pThrowInfo)) return null;
+        head = dv.getUint32(head, true) >>> 0;
+    }
+    return null;
+}
+
 /**
  * Walk the SEH chain and dispatch a C++ exception to the first matching catch block.
+ *
+ * `allowDeferToX86: false` suppresses the defer verdict — for a caller whose x86 re-dispatch
+ * refused (nesting depth, no stub), so the JS walk keeps going past the unparseable frame and
+ * a catch further up is still found rather than the throw going unhandled.
  */
 export function dispatchCxxException(
     mem: Uint8Array,
@@ -1827,6 +1960,7 @@ export function dispatchCxxException(
     pExceptionObject: number,
     pThrowInfo: number,
     thunkCleanupBytes: number,
+    opts?: { allowDeferToX86?: boolean },
 ): ThunkResult | CxxDispatchDefer | null {
     const dv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
     const tebAddr = cpu.segment_offsets[4];
@@ -1904,6 +2038,21 @@ export function dispatchCxxException(
         `ESP=0x${throwEsp.toString(16)} objPtr=0x${pExceptionObject.toString(16)}` +
         (typeName ? ` type="${typeName}"` : '') +
         (thrownStr ? ` thrown="${thrownStr}"` : ''));
+
+    // SEARCH PHASE — decide before anything is written (see chainDefersToX86).
+    if (opts?.allowDeferToX86 !== false) {
+        const deferFrame = chainDefersToX86(dv, mem, tebAddr, pThrowInfo);
+        if (deferFrame !== null) {
+            Logger.warn(LogCategory.SYSTEM,
+                `SEH dispatch: frame 0x${deferFrame.toString(16)} ` +
+                `(handler=0x${(dv.getUint32(deferFrame + 4, true) >>> 0).toString(16)}) is not MSVC C++ EH and ` +
+                `precedes any catch we could serve — deferring dispatch to x86 SEH so its filter runs faithfully`);
+            if (currentThrowRecord && currentThrowRecord.outcome === 'pending') {
+                currentThrowRecord.outcome = 'deferred-x86';
+            }
+            return { deferToX86: true, pExceptionObject, pThrowInfo };
+        }
+    }
 
     let frameCount = 0;
     const skippedFrames: SkippedFrameInfo[] = [];
@@ -2031,94 +2180,45 @@ export function dispatchCxxException(
             `SEH frame #${frameCount}: addr=0x${sehHead.toString(16)} next=0x${(next >>> 0).toString(16)} ` +
             `handler=0x${handlerAddr.toString(16)} [+8]=0x${field8.toString(16)} [+12]=0x${(field12 >>> 0).toString(16)}`);
 
-        // === Try VC5/6 layout first ===
-        if (field8 >= 0x10000 && field8 + 20 < mem.length && field12 >= -1 && field12 < 256) {
-            let magic = 0;
-            try { magic = dv.getUint32(field8, true); } catch { /* */ }
-            if (isMsvcEhMagic(magic)) {
-                Logger.log(LogCategory.SYSTEM,
-                    `  -> VC5/6 layout: FuncInfo=0x${field8.toString(16)} magic=0x${magic.toString(16)} trylevel=${field12} EBP=0x${(sehHead + EH_PROLOG_EBP_DELTA).toString(16)}`);
-                if (isImplausibleFrameEbp(sehHead + EH_PROLOG_EBP_DELTA, mem.length)) {
-                    Logger.error(LogCategory.SYSTEM,
-                        `SEH walk: implausible VC5/6 frame EBP=0x${(sehHead + EH_PROLOG_EBP_DELTA).toString(16)} ` +
-                        `(pRN=0x${sehHead.toString(16)}, handler=0x${handlerAddr.toString(16)}) — stale/garbage record?`);
-                    recordSehDispatchTrace(
-                        `WILD-EBP vc56 pRN=0x${sehHead.toString(16)} ebp=0x${(sehHead + EH_PROLOG_EBP_DELTA).toString(16)} handler=0x${handlerAddr.toString(16)}`);
-                }
-                const result = tryMatchCatch(
-                    dv, mem, field8, field12,
-                    sehHead + EH_PROLOG_EBP_DELTA, sehHead, 12, tebAddr, next,
-                    pExceptionObject, pThrowInfo, cpu, thunkCleanupBytes, false,
-                    skippedFrames, throwEsp, isRethrow, pendingExitActions,
-                );
-                if (result) {
-                    return result;
-                }
-                // No catch match — record as skipped with unwind info
-                const vc56Actions = readUnwindActions(dv, mem, field8, field12);
-                skippedFrames.push({
-                    sehHead, handlerAddr, state: field12, isVC7: false,
-                    funcInfoPtr: field8, frameEbp: sehHead + EH_PROLOG_EBP_DELTA, unwindActions: vc56Actions,
-                });
-                sehHead = next;
-                continue;
-            }
+        const shape = classifyCxxFrame(dv, mem, sehHead, handlerAddr);
+        if (!shape) {
+            // Not a recognizable C++ EH frame — a __try/__except registration
+            // (__except_handler4: shared handler, cookie-XORed scope table). Whether its
+            // filter gets to run was already settled by the search phase; here it can only
+            // be skipped, so an outer catch stays reachable.
+            Logger.log(LogCategory.SYSTEM,
+                `  -> frame handler=0x${handlerAddr.toString(16)} is not MSVC C++ EH — skipping`);
+            sehHead = next;
+            continue;
         }
 
-        // === Try VC7+ layout ===
-        const vc7State = dv.getInt32(sehHead + 8, true);
-        if (vc7State >= -1 && vc7State < 256) {
-            const funcInfoFromThunk = extractFuncInfoFromThunk(mem, handlerAddr);
-            if (funcInfoFromThunk >= 0x10000 && funcInfoFromThunk + 20 < mem.length) {
-                let magic = 0;
-                try { magic = dv.getUint32(funcInfoFromThunk, true); } catch { /* */ }
-                if (isMsvcEhMagic(magic)) {
-                    const frameEbp = sehHead + EH_PROLOG_EBP_DELTA;
-                    Logger.log(LogCategory.SYSTEM,
-                        `  -> VC7+ layout: FuncInfo=0x${funcInfoFromThunk.toString(16)} magic=0x${magic.toString(16)} state=${vc7State} EBP=0x${frameEbp.toString(16)}`);
-                    if (isImplausibleFrameEbp(frameEbp, mem.length)) {
-                        Logger.error(LogCategory.SYSTEM,
-                            `SEH walk: implausible VC7+ frame EBP=0x${frameEbp.toString(16)} ` +
-                            `(pRN=0x${sehHead.toString(16)}, handler=0x${handlerAddr.toString(16)}) — stale/garbage record?`);
-                        recordSehDispatchTrace(
-                            `WILD-EBP vc7 pRN=0x${sehHead.toString(16)} ebp=0x${frameEbp.toString(16)} handler=0x${handlerAddr.toString(16)}`);
-                    }
-                    const result = tryMatchCatch(
-                        dv, mem, funcInfoFromThunk, vc7State,
-                        frameEbp, sehHead, 8, tebAddr, next,
-                        pExceptionObject, pThrowInfo, cpu, thunkCleanupBytes, true,
-                        skippedFrames, throwEsp, isRethrow, pendingExitActions,
-                    );
-                    if (result) {
-                        return result;
-                    }
-                    // No catch match — record as skipped with unwind info
-                    const vc7Actions = readUnwindActions(dv, mem, funcInfoFromThunk, vc7State);
-                    skippedFrames.push({
-                        sehHead, handlerAddr, state: vc7State, isVC7: true,
-                        funcInfoPtr: funcInfoFromThunk, frameEbp, unwindActions: vc7Actions,
-                    });
-                    sehHead = next;
-                    continue;
-                }
-            }
+        Logger.log(LogCategory.SYSTEM,
+            `  -> ${shape.isVC7 ? 'VC7+' : 'VC5/6'} layout: FuncInfo=0x${shape.funcInfoPtr.toString(16)} ` +
+            `state=${shape.state} EBP=0x${shape.frameEbp.toString(16)}`);
+        if (isImplausibleFrameEbp(shape.frameEbp, mem.length)) {
+            Logger.error(LogCategory.SYSTEM,
+                `SEH walk: implausible ${shape.isVC7 ? 'VC7+' : 'VC5/6'} frame EBP=0x${shape.frameEbp.toString(16)} ` +
+                `(pRN=0x${sehHead.toString(16)}, handler=0x${handlerAddr.toString(16)}) — stale/garbage record?`);
+            recordSehDispatchTrace(
+                `WILD-EBP ${shape.isVC7 ? 'vc7' : 'vc56'} pRN=0x${sehHead.toString(16)} ` +
+                `ebp=0x${shape.frameEbp.toString(16)} handler=0x${handlerAddr.toString(16)}`);
         }
-
-        // Not a recognizable C++ EH frame — likely a __try/__except registration
-        // (__except_handler4: shared handler, cookie-XORed scope table). Its filter
-        // may claim this exception (Windows calls every handler in chain order), so
-        // stop guessing and let the guest's own handlers dispatch it natively.
-        if (pendingExitActions.length > 0) {
-            Logger.warn(LogCategory.SYSTEM,
-                `SEH dispatch: dropping ${pendingExitActions.length} queued catch-exit action(s) on x86 defer`);
+        const result = tryMatchCatch(
+            dv, mem, shape.funcInfoPtr, shape.state,
+            shape.frameEbp, sehHead, shape.stateOffset, tebAddr, next,
+            pExceptionObject, pThrowInfo, cpu, thunkCleanupBytes, shape.isVC7,
+            skippedFrames, throwEsp, isRethrow, pendingExitActions,
+        );
+        if (result) {
+            return result;
         }
-        Logger.warn(LogCategory.SYSTEM,
-            `  -> frame handler=0x${handlerAddr.toString(16)} is not MSVC C++ EH — ` +
-            `deferring dispatch to x86 SEH so its filter runs faithfully`);
-        if (currentThrowRecord && currentThrowRecord.outcome === 'pending') {
-            currentThrowRecord.outcome = 'deferred-x86';
-        }
-        return { deferToX86: true, pExceptionObject, pThrowInfo };
+        // No catch match — record as skipped with unwind info
+        skippedFrames.push({
+            sehHead, handlerAddr, state: shape.state, isVC7: shape.isVC7,
+            funcInfoPtr: shape.funcInfoPtr, frameEbp: shape.frameEbp,
+            unwindActions: readUnwindActions(dv, mem, shape.funcInfoPtr, shape.state),
+        });
+        sehHead = next;
     }
 
     // No guest catch found — this throw will fall through to UnhandledExceptionFilter →
