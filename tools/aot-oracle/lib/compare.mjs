@@ -37,6 +37,15 @@ export function compareRegions(ref, cand) {
     const byName = new Map(cand.map((r) => [r.name, r]));
     const regions = [];
     let first = null;
+    // A region only ONE arm produced is a divergence in either direction: iterating `ref`
+    // alone made a candidate-only region invisible, so a unit that wrote a region the
+    // reference never touched compared as identical.
+    const refNames = new Set(ref.map((r) => r.name));
+    for (const c of cand) {
+        if (refNames.has(c.name)) continue;
+        regions.push({ name: c.name, status: "MISSING_IN_REFERENCE" });
+        first ??= { region: c.name, why: "reference produced no such region" };
+    }
     for (const r of ref) {
         const c = byName.get(r.name);
         if (!c) {
@@ -87,9 +96,12 @@ export function compareState(ref, cand) {
     const diffs = [], uncompared = [];
     for (const [k, va] of a) {
         const vb = b.get(k);
-        if (va === undefined && vb === undefined) continue;
+        // A field neither arm modelled is still a field nobody compared. Skipping the pair
+        // when BOTH are null dropped it from `uncompared` too, so a `get_eflags()` that threw
+        // on both arms produced a differential that silently omitted EFLAGS while reporting
+        // "identical" — the one outcome the uncompared channel exists to prevent.
         if (va === null || vb === null || va === undefined || vb === undefined) {
-            if (!(va === null && vb === null)) uncompared.push(k);
+            uncompared.push(k);
             continue;
         }
         if (va !== vb) {

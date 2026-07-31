@@ -84,11 +84,29 @@ export function evaluateGates({ refRuns, candRuns, candClass, reportsNumber, com
         throw new Error("evaluateGates: `comparison` is required — a gate list assembled without "
             + "the comparator's result would report a divergent run as fully gated");
     }
+    // Every gate below is an `.every()`/`.filter()` over the reps. On an empty run they are all
+    // vacuously true and the caller receives a fully green gate list for zero observations —
+    // the same hole the `comparison` check above closes, one level down.
+    if (!Array.isArray(refRuns) || refRuns.length === 0 || !Array.isArray(candRuns) || candRuns.length === 0) {
+        throw new Error(`evaluateGates: needs at least one rep per arm (ref=${refRuns?.length ?? "none"}, `
+            + `cand=${candRuns?.length ?? "none"}) — every gate is a quantifier over the reps and would pass vacuously`);
+    }
     const memOk = comparison.memory_identical === true;
     // `state_compared: false` means the candidate class publishes no host-side state (a raw
     // module). That channel is then reported as UNCOMPARED and gated by state.spilled; it is
     // never silently counted as agreement here.
     const stateOk = comparison.state_compared ? comparison.state_identical === true : true;
+    // `state_compared` is a single boolean over the WHOLE host-side view; the per-field
+    // `uncompared` list it summarises gated nothing, so one field that could not be read on
+    // both arms (a `get_eflags()` that threw) vanished from the differential while the coarse
+    // flag stayed true. Between two v86-hosted arms every field is readable by construction,
+    // so any entry here is a read that failed — not a modelling gap.
+    const skipped = comparison.state_compared && candClass === "unit"
+        ? (comparison.state_uncompared ?? []) : [];
+    add("state.fields_compared", "differential", skipped.length === 0, skipped,
+        "a state field went uncompared between two v86-hosted arms ⇒ that field was neither "
+        + "shown equal nor reported divergent; the differential has a hole in it");
+
     add("output_identical", "differential", memOk && stateOk,
         { memory_identical: comparison.memory_identical,
             state_compared: comparison.state_compared,

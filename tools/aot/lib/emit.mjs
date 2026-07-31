@@ -1704,6 +1704,16 @@ export function compileUnit(job) {
         pageBase: job.pageBase,
         loopCounter: E.loopCounter,
         entries: blocks.map((b) => [b.addr - job.pageBase, b.index]),
+        // Every discovered block is published as a dispatcher entry, and `discoverBlocks`
+        // splits further than the engine's own `marked_as_entry` set — so the unit answers
+        // dispatch at addresses at which the JIT would take a cache miss. Each such block
+        // begins exactly at its published address and the prologue seeds all locals (N24), so
+        // the guest work is unchanged; what differs is the MISS RATE, which is a property of
+        // the candidate arm a ratio must be read against. Reported, not assumed.
+        entriesBeyondEngine: blocks
+            .map((b) => b.addr)
+            .filter((a) => !job.entryAddrs.includes(a))
+            .map((a) => a - job.pageBase),
         blocks: blocks.map((b) => ({
             addr: b.addr, index: b.index, instructions: b.numInstructions, ty: b.ty?.type,
         })),

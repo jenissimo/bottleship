@@ -196,8 +196,9 @@ export function writeDataImage(dv, origin) {
     for (let off = 0; off < 0x28; off++) w8(K5_BITMAP + off, 0);
 
     // ── K6 scratch (the conformance body seeds every slot it reads) ─────────
-    // 0x98 landing slots (stage 2 added imul/mul/bswap/bit-scan/cmov/flag-op/loop results).
-    for (let off = 0; off < 0xA0; off += 4) w32(FRAME6 + off, 0);
+    // Landing slots run to +0xf4 (stage 3's 32-bit shifts/neg/not/movsx/movzx/ALU/push-imm);
+    // FRAME6 + 0x100 is SAVE6, so the region is exactly full.
+    for (let off = 0; off < 0x100; off += 4) w32(FRAME6 + off, 0);
     for (let off = 0; off < 0x20; off += 4) w32(SAVE6 + off, 0);
 
     // ── K7: one input word that ends in a register only, one that ends in memory ──

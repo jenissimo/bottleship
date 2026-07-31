@@ -119,6 +119,12 @@ console.log(JSON.stringify({
         // Empty is the healthy value: a call whose return point is not a published entry
         // dispatches to a miss on return and the JIT then displaces the unit (design §4.2/K5).
         callReturnPointsUnpublished: unit.callReturnPointsUnpublished.map((a) => "0x" + a.toString(16)),
+        // Entries the unit answers that the ENGINE's dispatcher does not publish: block
+        // discovery splits further than v86's `marked_as_entry`, so the candidate arm takes
+        // dispatch hits where the reference would miss. Not a correctness difference (each
+        // block starts at its published address, and the prologue seeds all locals — N24) but
+        // it is a property any ratio must be read against, so it is counted, not assumed.
+        entriesBeyondEngine: unit.entriesBeyondEngine.length,
     },
     module: {
         bytes: unit.bytes.length, bodyBytes: stats.bytes, wasmInstructions: stats.instructions,

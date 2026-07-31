@@ -150,7 +150,17 @@ if (args["shape-check"]) {
 // missing negative control is invisible.
 if (args.prove) {
     const ids = (args.case || Object.keys(CASES).join(",")).split(",").map((s) => s.trim()).filter(Boolean);
+    // `--case ,` filters to nothing and every assertion below quantifies over `ids`: 0/0 rows
+    // is a PROVE_PASS that proved nothing.
+    if (ids.length === 0) usageExit(new Error(`--case selected no case (have: ${Object.keys(CASES).join(", ")})`));
     for (const k of ids) if (!CASES[k]) usageExit(new Error(`unknown case ${k}`));
+    // The default candidate republishes the JIT's own bytes: that proves the ORACLE and says
+    // nothing about a compiler, so it has to be asked for by name rather than fallen into.
+    if (!args.candidate) {
+        usageExit(new Error("--prove needs --candidate. Use `--candidate unit:auto` to prove the ORACLE "
+            + "(the JIT's own bytes republished — the opt-0 identity control), or a template such as "
+            + "`--candidate unit:../aot/units/{case}.json` to prove a PRODUCER."));
+    }
     const outerN = String(Number(args.outer || 2000)), warmupN = String(Number(args.warmup || 2000));
 
     /**
@@ -161,7 +171,7 @@ if (args.prove) {
      * pretty-printed JSON document on stdout, so the whole stream is parsed; taking the last
      * line (which is what the ARM protocol uses) yields a bare "}".
      */
-    const candTemplate = args.candidate || "unit:auto";
+    const candTemplate = args.candidate;
     const candFor = (caseId) => candTemplate.replace(/\{case\}/g, caseId);
     const once = (caseId, faultName) => {
         const shown = ["--check", "--case", caseId, "--candidate", candFor(caseId),
@@ -200,6 +210,12 @@ if (args.prove) {
         }
     }
     const failed = rows.filter((r) => !r.ok);
+    if (rows.length === 0) {
+        process.stderr.write("prove: 0 checks — nothing was proved\n");
+        console.log(JSON.stringify({ verdict: "PROVE_FAIL", candidate: candTemplate, checks: 0,
+            failed: 0, rows, why: "no case produced a check" }, null, 2));
+        process.exit(1);
+    }
     for (const r of rows) {
         process.stderr.write(`${r.ok ? "pass" : "FAIL"}  ${r.case.padEnd(3)} ${r.kind.padEnd(34)} `
             + `${String(r.verdict).padEnd(9)} ${r.first_divergence ?? ""}\n`);
@@ -228,9 +244,19 @@ if (candClass === "raw") {
 }
 
 const cases = (args.case || "k1,k2").split(",").map((s) => s.trim()).filter(Boolean);
+// Zero cases and zero reps are the same bug at two scales: every verdict below is a
+// quantifier over them, so an empty selection reports CORRECT having compared nothing.
+if (cases.length === 0) {
+    process.stderr.write(`--case selected no case (have: ${Object.keys(CASES).join(", ")})\n`);
+    process.exit(2);
+}
 for (const k of cases) if (!CASES[k]) { process.stderr.write(`unknown case ${k}\n`); process.exit(2); }
 const check = !!args.check;
 const reps = Number(args.reps || (check ? 1 : 5));
+if (!Number.isInteger(reps) || reps < 1) {
+    process.stderr.write(`--reps must be a positive integer, got ${args.reps}\n`);
+    process.exit(2);
+}
 // Correctness needs no big N; a number does. The measurement defaults are the spike's,
 // including the warm-up large enough for tier-2 promotion to land OUTSIDE a measured phase.
 const outer = Number(args.outer || (check ? 2000 : 40000));
@@ -294,7 +320,8 @@ for (const caseId of cases) {
         const capture = run("arms/run-v86.mjs", [...refArgs, "--capture", prefix]);
         if (capture.status !== "ok" || !capture.capture?.units) {
             process.stderr.write(`capture run failed for ${caseId}: ${capture.status}\n`);
-            anyArmFailed = true; continue;
+            report.cases[caseId] = { verdict: "ARM_FAILED", why: `capture run failed (${capture.status})`, reps: [] };
+            continue;
         }
         unitManifest = capture.capture.file;
         process.stderr.write(`${caseId}: captured ${capture.capture.units} unit(s) from the JIT -> ${unitManifest}\n`);
@@ -335,6 +362,9 @@ for (const caseId of cases) {
 
     const good = reps_.filter((r) => !r.arm_failed);
     if (!good.length) { report.cases[caseId] = { verdict: "ARM_FAILED", reps: reps_.map(stripBytes) }; continue; }
+    if (good.length < reps_.length) {
+        process.stderr.write(`${caseId}: ${reps_.length - good.length}/${reps_.length} rep(s) failed; verdict is taken from the rest\n`);
+    }
 
     const memDiverged = good.filter((r) => !r.regionCmp.identical);
     const stateDiverged = good.filter((r) => r.stateCmp.available && !r.stateCmp.identical);
@@ -360,6 +390,7 @@ for (const caseId of cases) {
             memory_identical: memDiverged.length === 0,
             state_compared: !stateUncompared,
             state_identical: stateDiverged.length === 0 ? (stateUncompared ? null : true) : false,
+            state_uncompared: [...uncomparedFields],
             first: divergent ? describeFirst(first, firstState) : null,
         },
         requestedFlags: Object.fromEntries([...flagOverrides]), requestedRelaxed: relaxed,
@@ -429,10 +460,21 @@ function stripBytes(r) {
         state_identical: r.stateCmp?.identical ?? null };
 }
 
-report.verdict = anyArmFailed ? "ARM_FAILED"
-    : anyDivergent ? "DIVERGENT"
-    : anyInvalid ? "INVALID"
-    : check ? "CORRECT" : "VALID";
+// The worst PER-CASE verdict wins, with the run-level flags folded in at the same severity.
+// Reading only the flags reported CORRECT for a run whose every rep failed: the flags are set
+// inside the per-rep loop, and the all-reps-failed path takes an early-out that never enters
+// it. A summary that does not consult the results it summarises is not one.
+{
+    const severity = { ARM_FAILED: 3, DIVERGENT: 2, INVALID: 1 };
+    const seen = [
+        ...cases.map((id) => report.cases[id]?.verdict ?? "ARM_FAILED"),
+        ...(anyArmFailed ? ["ARM_FAILED"] : []),
+        ...(anyDivergent ? ["DIVERGENT"] : []),
+        ...(anyInvalid ? ["INVALID"] : []),
+    ];
+    const worst = seen.reduce((a, v) => ((severity[v] ?? 0) > (severity[a] ?? 0) ? v : a), null);
+    report.verdict = severity[worst] ? worst : (check ? "CORRECT" : "VALID");
+}
 report.finished_at = new Date().toISOString();
 
 const outPath = args.out || path.join(workdir, `oracle-${Date.now()}.json`);

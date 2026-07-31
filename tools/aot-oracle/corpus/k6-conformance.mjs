@@ -400,6 +400,167 @@ export function buildK6() {
     a.put("jecxz +6", 0xE3, 0x06);                                      // not taken
     a.put("inc dword [ebp+0x94]", 0xFF, ...modEbpW(0, 0x94));           // executed
 
+    // ──────────────────────────────────────────────────────────────────────
+    // Stage 3 — the 32-bit forms stages 1 and 2 never reach. Stage 1 covers the 8-bit ALU and
+    // 32-bit adc/sbb; stage 2 covers imul/mul/bit-scan/cmov/flags/loops. Everything below was
+    // uncovered, so `--prove` could not fail on it: lowering SAR as a LOGICAL shift (I32SHRU,
+    // the classic sign-extension bug) still verified CORRECT on the old vector, because no
+    // arithmetic right shift of a negative dword was ever executed and observed.
+    //
+    // Every shift/rotate source below is NEGATIVE where sign matters, and each result lands in
+    // its own slot (0x98..0xf8, none of them written twice and none reused from stage 1/2).
+    // ──────────────────────────────────────────────────────────────────────
+    a.put("mov cl, 3", 0xB1, 0x03);
+
+    // ── SAR r/m32 — imm8, CL, register and memory ──────────────────────────
+    a.put("mov eax, 0xf0000001", 0xB8, ...a.u32(0xF0000001));
+    a.put("sar eax, 4", 0xC1, 0xF8, 0x04);
+    a.put("mov [ebp+0x98], eax", 0x89, ...modEbpW(0, 0x98));
+    a.put("mov eax, 0x80000000", 0xB8, ...a.u32(0x80000000));
+    a.put("sar eax, cl", 0xD3, 0xF8);
+    a.put("mov [ebp+0x9c], eax", 0x89, ...modEbpW(0, 0x9C));
+    a.put("mov dword [ebp+0], 0xff000000", 0xC7, ...modEbp(0, 0), ...a.u32(0xFF000000));
+    a.put("sar dword [ebp+0], 3", 0xC1, ...modEbp(7, 0), 0x03);
+    a.put("sar dword [ebp+0], cl", 0xD3, ...modEbp(7, 0));
+    a.put("mov esi, [ebp+0]", 0x8B, ...modEbp(6, 0));
+    a.put("mov [ebp+0xe8], esi", 0x89, ...modEbpW(6, 0xE8));
+
+    // ── SHL / SHR r/m32 — by CL, by imm8, register and memory ──────────────
+    a.put("mov ebx, 0x00012345", 0xBB, ...a.u32(0x00012345));
+    a.put("shl ebx, cl", 0xD3, 0xE3);
+    a.put("mov [ebp+0xa0], ebx", 0x89, ...modEbpW(3, 0xA0));
+    a.put("mov ebx, 0xf0000000", 0xBB, ...a.u32(0xF0000000));
+    a.put("shr ebx, cl", 0xD3, 0xEB);
+    a.put("mov [ebp+0xa4], ebx", 0x89, ...modEbpW(3, 0xA4));
+    a.put("mov edx, 0x0000abcd", 0xBA, ...a.u32(0x0000ABCD));
+    a.put("shl edx, 5", 0xC1, 0xE2, 0x05);
+    a.put("mov [ebp+0xa8], edx", 0x89, ...modEbpW(2, 0xA8));
+    a.put("mov edx, 0x80000000", 0xBA, ...a.u32(0x80000000));
+    a.put("shr edx, 9", 0xC1, 0xEA, 0x09);
+    a.put("mov [ebp+0xac], edx", 0x89, ...modEbpW(2, 0xAC));
+    a.put("mov dword [ebp+0], 0x00ff00ff", 0xC7, ...modEbp(0, 0), ...a.u32(0x00FF00FF));
+    a.put("shl dword [ebp+0], 2", 0xC1, ...modEbp(4, 0), 0x02);
+    a.put("shr dword [ebp+0], cl", 0xD3, ...modEbp(5, 0));
+    a.put("mov esi, [ebp+0]", 0x8B, ...modEbp(6, 0));
+    a.put("mov [ebp+0xec], esi", 0x89, ...modEbpW(6, 0xEC));
+
+    // ── NEG / NOT r/m32, register and memory ───────────────────────────────
+    a.put("mov edi, 5", 0xBF, ...a.u32(5));
+    a.put("neg edi", 0xF7, 0xDF);
+    a.put("mov [ebp+0xb0], edi", 0x89, ...modEbpW(7, 0xB0));
+    a.put("mov edi, 0x0f0f0f0f", 0xBF, ...a.u32(0x0F0F0F0F));
+    a.put("not edi", 0xF7, 0xD7);
+    a.put("mov [ebp+0xb4], edi", 0x89, ...modEbpW(7, 0xB4));
+    a.put("mov dword [ebp+0], 7", 0xC7, ...modEbp(0, 0), ...a.u32(7));
+    a.put("neg dword [ebp+0]", 0xF7, ...modEbp(3, 0));
+    a.put("not dword [ebp+0]", 0xF7, ...modEbp(2, 0));
+    a.put("mov esi, [ebp+0]", 0x8B, ...modEbp(6, 0));
+    a.put("mov [ebp+0xf4], esi", 0x89, ...modEbpW(6, 0xF4));
+
+    // ── MOVSX / MOVZX — both source widths, register and memory ────────────
+    // The 16-bit source is the low half of a dword slot, so no operand-size prefix is needed
+    // (0F BF/B7 take r/m16 with a 32-bit destination).
+    a.put("mov byte [ebp+4], 0x9c", 0xC6, ...modEbp(0, 4), 0x9C);
+    a.put("mov bl, 0x9c", 0xB3, 0x9C);
+    a.put("movsx eax, bl", 0x0F, 0xBE, 0xC3);
+    a.put("mov [ebp+0xb8], eax", 0x89, ...modEbpW(0, 0xB8));
+    a.put("movsx eax, byte [ebp+4]", 0x0F, 0xBE, ...modEbp(0, 4));
+    a.put("mov [ebp+0xbc], eax", 0x89, ...modEbpW(0, 0xBC));
+    a.put("mov ebx, 0xdead8123", 0xBB, ...a.u32(0xDEAD8123));
+    a.put("mov [ebp+8], ebx", 0x89, ...modEbp(3, 8));
+    a.put("movsx eax, bx", 0x0F, 0xBF, 0xC3);
+    a.put("mov [ebp+0xc0], eax", 0x89, ...modEbpW(0, 0xC0));
+    a.put("movsx eax, word [ebp+8]", 0x0F, 0xBF, ...modEbp(0, 8));
+    a.put("mov [ebp+0xc4], eax", 0x89, ...modEbpW(0, 0xC4));
+    a.put("movzx eax, bl", 0x0F, 0xB6, 0xC3);
+    a.put("mov [ebp+0xc8], eax", 0x89, ...modEbpW(0, 0xC8));
+    a.put("movzx eax, word [ebp+8]", 0x0F, 0xB7, ...modEbp(0, 8));
+    a.put("mov [ebp+0xcc], eax", 0x89, ...modEbpW(0, 0xCC));
+
+    // ── 32-bit sub/and/or/add/xor/cmp/test, r/m32 <- r32 (register form) ───
+    a.put("mov eax, 0x0f1e2d3c", 0xB8, ...a.u32(0x0F1E2D3C));
+    a.put("mov ebx, 0x11223344", 0xBB, ...a.u32(0x11223344));
+    a.put("sub eax, ebx", 0x29, 0xD8);
+    a.put("and eax, ebx", 0x21, 0xD8);
+    a.put("or  eax, ebx", 0x09, 0xD8);
+    a.put("xor eax, ebx", 0x31, 0xD8);
+    a.put("add eax, ebx", 0x01, 0xD8);
+    a.put("cmp eax, ebx", 0x39, 0xD8);
+    a.put("test eax, ebx", 0x85, 0xD8);
+    a.put("mov [ebp+0xd0], eax", 0x89, ...modEbpW(0, 0xD0));
+
+    // ── the same, r32 <- r/m32 with a memory source ────────────────────────
+    a.put("mov dword [ebp+0], 0x5a5a5a5a", 0xC7, ...modEbp(0, 0), ...a.u32(0x5A5A5A5A));
+    a.put("sub eax, [ebp+0]", 0x2B, ...modEbp(0, 0));
+    a.put("and eax, [ebp+0]", 0x23, ...modEbp(0, 0));
+    a.put("or  eax, [ebp+0]", 0x0B, ...modEbp(0, 0));
+    a.put("xor eax, [ebp+0]", 0x33, ...modEbp(0, 0));
+    a.put("add eax, [ebp+0]", 0x03, ...modEbp(0, 0));
+    a.put("cmp eax, [ebp+0]", 0x3B, ...modEbp(0, 0));
+    a.put("test [ebp+0], eax", 0x85, ...modEbp(0, 0));
+    a.put("mov [ebp+0xd4], eax", 0x89, ...modEbpW(0, 0xD4));
+
+    // ── acc,imm32 and group 1 imm32 / imm8s, 32-bit ────────────────────────
+    a.put("sub eax, 0x00001111", 0x2D, ...a.u32(0x00001111));
+    a.put("and eax, 0x7fffffff", 0x25, ...a.u32(0x7FFFFFFF));
+    a.put("or  eax, 0x000000f0", 0x0D, ...a.u32(0x000000F0));
+    a.put("xor eax, 0x0f0f0f0f", 0x35, ...a.u32(0x0F0F0F0F));
+    a.put("add eax, 0x00000101", 0x05, ...a.u32(0x00000101));
+    a.put("cmp eax, 0x12345678", 0x3D, ...a.u32(0x12345678));
+    a.put("sub eax, 0x11223344", 0x81, 0xE8, ...a.u32(0x11223344));
+    a.put("and eax, 0x0fffffff", 0x81, 0xE0, ...a.u32(0x0FFFFFFF));
+    a.put("or  eax, 0x00f00000", 0x81, 0xC8, ...a.u32(0x00F00000));
+    a.put("xor eax, 0x0a0a0a0a", 0x81, 0xF0, ...a.u32(0x0A0A0A0A));
+    a.put("sub eax, 0x11", 0x83, 0xE8, 0x11);
+    a.put("and eax, 0x7f", 0x83, 0xE0, 0x7F);
+    a.put("or  eax, 0x0f", 0x83, 0xC8, 0x0F);
+    a.put("xor eax, 0x33", 0x83, 0xF0, 0x33);
+    a.put("mov [ebp+0xd8], eax", 0x89, ...modEbpW(0, 0xD8));
+
+    // ── the 32-bit memory read-modify-write shape ──────────────────────────
+    a.put("mov dword [ebp+0], 0x0000ffff", 0xC7, ...modEbp(0, 0), ...a.u32(0x0000FFFF));
+    a.put("mov ebx, 0x00003333", 0xBB, ...a.u32(0x00003333));
+    a.put("sub [ebp+0], ebx", 0x29, ...modEbp(3, 0));
+    a.put("and [ebp+0], ebx", 0x21, ...modEbp(3, 0));
+    a.put("or  [ebp+0], ebx", 0x09, ...modEbp(3, 0));
+    a.put("xor [ebp+0], ebx", 0x31, ...modEbp(3, 0));
+    a.put("add [ebp+0], ebx", 0x01, ...modEbp(3, 0));
+    a.put("cmp [ebp+0], ebx", 0x39, ...modEbp(3, 0));
+    a.put("sub dword [ebp+0], 0x0111", 0x81, ...modEbp(5, 0), ...a.u32(0x0111));
+    a.put("and dword [ebp+0], 0x0fff", 0x81, ...modEbp(4, 0), ...a.u32(0x0FFF));
+    a.put("or  dword [ebp+0], 0x0f00", 0x81, ...modEbp(1, 0), ...a.u32(0x0F00));
+    a.put("xor dword [ebp+0], 0x00f0", 0x81, ...modEbp(6, 0), ...a.u32(0x00F0));
+    a.put("sub dword [ebp+0], 0x07", 0x83, ...modEbp(5, 0), 0x07);
+    a.put("and dword [ebp+0], 0x7f", 0x83, ...modEbp(4, 0), 0x7F);
+    a.put("or  dword [ebp+0], 0x40", 0x83, ...modEbp(1, 0), 0x40);
+    a.put("xor dword [ebp+0], 0x21", 0x83, ...modEbp(6, 0), 0x21);
+    a.put("mov esi, [ebp+0]", 0x8B, ...modEbp(6, 0));
+    a.put("mov [ebp+0xdc], esi", 0x89, ...modEbpW(6, 0xDC));
+
+    // ── PUSH imm8 / imm32 (the pushed value is popped and landed) ──────────
+    a.put("push 0x7f", 0x6A, 0x7F);
+    a.put("pop eax", 0x58);
+    a.put("mov [ebp+0xe0], eax", 0x89, ...modEbpW(0, 0xE0));
+    a.put("push -3", 0x6A, 0xFD);                       // sign-extended to 0xfffffffd
+    a.put("pop ebx", 0x5B);
+    a.put("push 0x12345678", 0x68, ...a.u32(0x12345678));
+    a.put("pop ecx", 0x59);
+    a.put("add ecx, ebx", 0x01, 0xD9);
+    a.put("mov [ebp+0xe4], ecx", 0x89, ...modEbpW(1, 0xE4));
+
+    // ── 32-bit cmp/test flags, landed through setcc ────────────────────────
+    a.put("mov eax, 5", 0xB8, ...a.u32(5));
+    a.put("mov ebx, 5", 0xBB, ...a.u32(5));
+    a.put("cmp eax, ebx", 0x39, 0xD8);                  // ZF = 1
+    a.put("sete cl", 0x0F, 0x94, 0xC1);
+    a.put("test eax, eax", 0x85, 0xC0);                 // ZF = 0
+    a.put("setne bl", 0x0F, 0x95, 0xC3);
+    a.put("movzx eax, cl", 0x0F, 0xB6, 0xC1);
+    a.put("movzx edx, bl", 0x0F, 0xB6, 0xD3);
+    a.put("shl edx, 8", 0xC1, 0xE2, 0x08);
+    a.put("or eax, edx", 0x09, 0xD0);
+    a.put("mov [ebp+0xf0], eax", 0x89, ...modEbpW(0, 0xF0));
+
     return { bytes: Uint8Array.from(a.b), lines: a.lines };
 }
 

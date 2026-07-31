@@ -181,11 +181,18 @@ oracle's corpus gained:
 
 - **`k5`** — a byte-exact retail kernel (`0x674b94`, the charset-bitmap builder) for the 8-bit
   load / 8-bit shift-by-CL / **byte** read-modify-write / 8-bit self-test shapes;
-- **`k6`** — a **synthetic** conformance vector (`corpus/k6-conformance.mjs`): every form the
-  slice claims, once, **257 instructions in 881 bytes** (135 before stage 2). It is labelled
-  synthetic and carries no retail provenance; `verify-corpus.mjs` guards it by re-deriving it from
-  its generator and re-decoding it with this compiler's own decoder instead of hashing it against
-  the binary.
+- **`k6`** — a **synthetic** conformance vector (`corpus/k6-conformance.mjs`): **385 instructions
+  in 1411 bytes**, in three stages. It is labelled synthetic and carries no retail provenance;
+  `verify-corpus.mjs` guards it by re-deriving it from its generator and re-decoding it with this
+  compiler's own decoder instead of hashing it against the binary.
+
+  It is a vector, not a proof of totality: coverage is what someone wrote down, so "every form
+  the slice claims" is a goal the file is measured against, never a property it asserts. The
+  measurement that matters is whether a lowering bug in a form can make it fail — stage 3 exists
+  because it could not. With stages 1–2 only, forcing `emit.mjs` to lower **SAR as a logical
+  shift** (`I32SHRU`, the classic sign-extension bug) still verified `CORRECT`: no arithmetic
+  right shift of a negative dword was executed and observed anywhere in the corpus. The same
+  mutation is now `DIVERGENT … ref 0xff000000 vs candidate 0xf000000`.
 
   **Stage 2** (added with `imul`/`mul`/`bswap`/`bsf`/`bsr`/`cmovcc`/`clc`-`stc`-`cld`-`std`/the
   `loop` family) is where the vector stops being straight line: four self-loops and two forward
@@ -201,6 +208,12 @@ oracle's corpus gained:
   the perturbation had been overwritten before anything stored it. It runs after those landings for
   that reason. And every stage-2 result goes to a slot written exactly once: a slot a later
   instruction overwrites is not a compared value, the same hole the `FF /2` return address had.
+
+  **Stage 3** is the 32-bit half stages 1 and 2 never reach: `sar`/`shl`/`shr` r/m32 by imm8 and
+  by CL, register and memory; `neg`/`not` r/m32; `movsx`/`movzx` from both source widths;
+  `sub`/`and`/`or`/`add`/`xor`/`cmp`/`test` in every 32-bit operand shape (r/m←r, r←r/m,
+  acc,imm32, group 1 imm32 and imm8s, and the memory read-modify-write); and `push imm8`/`imm32`.
+  Every shift source is negative where sign matters, and each result has its own landing slot.
 
 A scan of all of `.text` (735 candidate self-contained loops) found no retail loop that carries
 those forms together, and none at all on the five hot pages — which is why the synthetic vector

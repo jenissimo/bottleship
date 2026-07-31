@@ -81,7 +81,7 @@ let done = false;
 const codePages = new Set([c.codeAddr >>> 12, L.CODE_BASE >>> 12]);
 if (args.capture) globalThis["__wasmDump"] = { pages: codePages, out: [], keepLatestPerPage: true };
 
-let aot = null;          // what we published, for liveness at the end
+const aotUnits = [];     // EVERY unit we published, for liveness at the end
 let relocApplied = null; // relocation values taken from the manifest, audited at the end
 // The codegen shape READ BACK OUT of the engine, never the shape we asked for: the reported
 // value has to be the measured one, or a knob that silently failed to take would be reported
@@ -240,21 +240,42 @@ function publishUnit(cpu, unit) {
     return { registered: true, idx, fn, pages: unit.pages.map((p) => p.physPage) };
 }
 
-/** Was the published unit still ours at the end, and was it actually entered? */
+/**
+ * Was EVERY published unit still ours at the end, and was each actually entered?
+ *
+ * A manifest may carry several units. Reading the last one only reported the liveness of one
+ * unit while the JIT could have been running the rest — precisely what `aot.registered` exists
+ * to catch, so the gate that guards against "the candidate arm silently ran the JIT" has to
+ * quantify over all of them.
+ */
 function aotLiveness(cpu) {
-    if (!aot) return null;
-    if (!aot.registered) return { registered: false, why: aot.why };
+    if (aotUnits.length === 0) return null;
     const w = cpu.wm.exports;
     const table = cpu.wm.wasm_table;
-    const sameFn = table.get(aot.idx + WASM_TABLE_OFFSET) === aot.fn;
-    const ownsPage = aot.pages.some((p) => (w.jit_aot_page_table_index(p * PAGE_SIZE) >>> 0) === aot.idx);
-    const entries = w.jit_get_module_entry_total ? w.jit_get_module_entry_total(aot.idx) >>> 0 : null;
+    const per = aotUnits.map((u) => {
+        if (!u.registered) return { registered: false, why: u.why };
+        const sameFn = table.get(u.idx + WASM_TABLE_OFFSET) === u.fn;
+        const ownsPage = u.pages.some((p) => (w.jit_aot_page_table_index(p * PAGE_SIZE) >>> 0) === u.idx);
+        const entries = w.jit_get_module_entry_total ? w.jit_get_module_entry_total(u.idx) >>> 0 : null;
+        return {
+            registered: true, idx: u.idx, pages: u.pages.map((p) => "0x" + p.toString(16)),
+            // Function identity, not "the page points at our slot": a freed slot is recycled by
+            // the very next compilation, so a slot check credits the AOT unit with a JIT
+            // module's work (handoff §3).
+            alive: sameFn && ownsPage, sameFn, ownsPage, entries, entered: sameFn && ownsPage && entries > 0,
+        };
+    });
+    const all = (f) => per.every(f);
     return {
-        registered: true, idx: aot.idx, pages: aot.pages.map((p) => "0x" + p.toString(16)),
-        // Function identity, not "the page points at our slot": a freed slot is recycled by
-        // the very next compilation, so a slot check credits the AOT unit with a JIT
-        // module's work (handoff §3).
-        alive: sameFn && ownsPage, sameFn, ownsPage, entries, entered: sameFn && ownsPage && entries > 0,
+        registered: all((u) => u.registered === true),
+        alive: all((u) => u.alive === true),
+        entered: all((u) => u.entered === true),
+        sameFn: all((u) => u.sameFn === true),
+        ownsPage: all((u) => u.ownsPage === true),
+        units: per.length,
+        entries: per.reduce((n, u) => n + (u.entries ?? 0), 0),
+        why: per.filter((u) => !u.registered).map((u) => u.why).join("; ") || undefined,
+        per_unit: per,
     };
 }
 
@@ -415,10 +436,11 @@ emulator.add_listener("emulator-loaded", () => {
         }
         for (const u of manifest.units) {
             const bytes = applyRelocations(fs.readFileSync(path.join(dir, u.file)), u, relocValues);
-            aot = publishUnit(cpu, { ...u, bytes });
-            results.push(aot);
+            const published = publishUnit(cpu, { ...u, bytes });
+            aotUnits.push(published);
+            results.push(published);
         }
-        if (!aot || !aot.registered) {
+        if (!aotUnits.length || !aotUnits.every((u) => u.registered)) {
             // Refusing to publish is always safe (the page keeps the JIT path) but it makes
             // the run meaningless as a CANDIDATE run — say so instead of measuring the JIT
             // twice and calling the second one AOT.

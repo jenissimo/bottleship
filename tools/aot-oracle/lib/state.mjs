@@ -55,13 +55,17 @@ export function readV86State(cpu) {
     for (let i = 0; i < 32; i++) st.push(u32(dv, OFF.fpu_st + i * 4));
     const xmm = [];
     for (let i = 0; i < 32; i++) xmm.push(u32(dv, OFF.reg_xmm32s + i * 4));
-    let eflags = null;
-    try { eflags = cpu.wm.exports.get_eflags() >>> 0; } catch { /* materialization refused */ }
+    // A refused materialization leaves eflags null, which the comparator reports as
+    // UNCOMPARED — never as agreement. The reason travels with it so the report can say
+    // which arm could not read its own flags.
+    let eflags = null, eflagsError = null;
+    try { eflags = cpu.wm.exports.get_eflags() >>> 0; } catch (e) { eflagsError = String(e?.message ?? e); }
     return {
         source: "v86",
         regs,
         eip: u32(dv, OFF.instruction_pointer),
         eflags,
+        eflags_error: eflagsError,
         lazy: {
             flags: u32(dv, OFF.flags),
             flags_changed: u32(dv, OFF.flags_changed),
