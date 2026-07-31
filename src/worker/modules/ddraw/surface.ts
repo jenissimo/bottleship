@@ -13,6 +13,8 @@ import {
     DDERR_NOCLIPPERATTACHED,
     DDSCAPS_BACKBUFFER,
     DDSCAPS_FLIP,
+    DDSCAPS_FRONTBUFFER,
+    DDSCAPS_OVERLAY,
     DDSCAPS_PRIMARYSURFACE,
     DDSCAPS_SYSTEMMEMORY,
     DDSCAPS_VIDEOMEMORY,
@@ -699,7 +701,9 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         // depth. Sync the depth attachment from the guest's words HERE, at Lock, because the
         // fill often lands after Unlock has returned (see syncZBufferWriteToDepth).
         if (isZBufferSurface(state) && (dwFlags & DDLOCK_READONLY) === 0) {
-            syncZBufferWriteToDepth(context, thisPtr, state, mem);
+            const zRect = lpDestRect ? readRect(mem, lpDestRect) : null;
+            syncZBufferWriteToDepth(context, thisPtr, state, mem,
+                zRect ? clipRect(zRect, state.width, state.height) : null);
         }
 
         // Helper: completes Lock after optional readback
@@ -866,7 +870,9 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         // depth. Sync the depth attachment from the guest's words HERE, at Lock, because the
         // fill often lands after Unlock has returned (see syncZBufferWriteToDepth).
         if (isZBufferSurface(state) && (dwFlags & DDLOCK_READONLY) === 0) {
-            syncZBufferWriteToDepth(context, thisPtr, state, mem);
+            const zRect = lpDestRect ? readRect(mem, lpDestRect) : null;
+            syncZBufferWriteToDepth(context, thisPtr, state, mem,
+                zRect ? clipRect(zRect, state.width, state.height) : null);
         }
 
         // Helper: completes Lock after optional readback
@@ -1095,7 +1101,9 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         // depth. Sync the depth attachment from the guest's words HERE, at Lock, because the
         // fill often lands after Unlock has returned (see syncZBufferWriteToDepth).
         if (isZBufferSurface(state) && (dwFlags & DDLOCK_READONLY) === 0) {
-            syncZBufferWriteToDepth(context, thisPtr, state, mem);
+            const zRect = lpDestRect ? readRect(mem, lpDestRect) : null;
+            syncZBufferWriteToDepth(context, thisPtr, state, mem,
+                zRect ? clipRect(zRect, state.width, state.height) : null);
         }
 
         // On real hardware, WRITEONLY is advisory — the lock buffer still
@@ -2515,6 +2523,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
             return E_FAIL;
         }
 
+        const thisState = thisObj.getState();
         const attachedState = attachedObj.getState();
         const isZBuffer = (attachedState.caps & DDSCAPS_ZBUFFER) !== 0;
 
@@ -2528,9 +2537,27 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
 
         thisObj.setAttachedSurface(lpDDSAttachedSurface);
 
+        // Attaching a same-format offscreen surface BUILDS a flip chain: ddraw marks both
+        // surfaces DDSCAPS_FLIP, names the front and the back, and closes the ring — which
+        // is what makes the pair flippable at all (Flip refuses a surface without those).
+        const flippable = (attachedState.caps & (DDSCAPS_ZBUFFER | DDSCAPS_TEXTURE | DDSCAPS_OVERLAY)) === 0
+            && attachedState.width === thisState.width
+            && attachedState.height === thisState.height
+            && attachedState.format.bpp === thisState.format.bpp;
+        if (flippable) {
+            thisState.caps |= DDSCAPS_FLIP;
+            attachedState.caps |= DDSCAPS_FLIP;
+            if ((thisState.caps & (DDSCAPS_FRONTBUFFER | DDSCAPS_BACKBUFFER)) === 0) {
+                thisState.caps |= DDSCAPS_FRONTBUFFER;
+            }
+            attachedState.caps |= (thisState.caps & DDSCAPS_BACKBUFFER)
+                ? DDSCAPS_FRONTBUFFER : DDSCAPS_BACKBUFFER;
+            if (!attachedState.attachedSurfaceAddr) attachedObj.setAttachedSurface(thisPtr);
+        }
+
         Logger.verbose(LogCategory.DDRAW,
             `IDirectDrawSurface7_AddAttachedSurface: this=0x${thisPtr.toString(16)} ` +
-            `attached=0x${lpDDSAttachedSurface.toString(16)} ${isZBuffer ? '[ZBUFFER]' : ''}`
+            `attached=0x${lpDDSAttachedSurface.toString(16)} ${isZBuffer ? '[ZBUFFER]' : ''}${flippable ? '[FLIP]' : ''}`
         );
 
         return DD_OK;

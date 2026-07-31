@@ -17,12 +17,20 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { collectFlipChain, rotateFlipChain } from "../../src/worker/modules/ddraw/flip-chain";
+import {
+    collectFlipChain,
+    findFlipBlockingLease,
+    flipStorageCompatible,
+    rotateFlipChain,
+} from "../../src/worker/modules/ddraw/flip-chain";
 import type { DirectDrawSurfaceState } from "../../src/worker/modules/ddraw/com-objects";
+
+const DDSCAPS_FLIP = 0x00000010;
+const DDSCAPS_ZBUFFER = 0x00020000;
 
 /** Minimal RenderSurface good enough for the rotation: identity fields plus the
  *  storage fields the rotation is supposed to move. */
-function surface(surfacePtr: number, attachedSurfaceAddr: number, caps = 0): DirectDrawSurfaceState {
+function surface(surfacePtr: number, attachedSurfaceAddr: number, caps = DDSCAPS_FLIP): DirectDrawSurfaceState {
     return {
         surfaceType: "render_surface",
         width: 640,
@@ -180,5 +188,72 @@ describe("ddraw flip chain", () => {
         };
 
         expect(collectFlipChain(0xa0, resolve)).toBeNull();
+    });
+
+    test("collectFlipChain refuses a non-flippable attachment", () => {
+        // AddAttachedSurface overwrites the single link slot, so a game that attaches a
+        // z buffer to the buffer it flips through would otherwise put a DEPTH surface on
+        // the chain — and rotation would swap depth storage with colour storage.
+        const front = surface(0xa000, 0xb0);
+        const zbuf = surface(0xb000, 0xa0, DDSCAPS_ZBUFFER);
+        const byAddr: Record<number, DirectDrawSurfaceState> = { 0xa0: front, 0xb0: zbuf };
+        const resolve = (addr: number) => {
+            const st = byAddr[addr];
+            return st ? ({ getState: () => st } as never) : null;
+        };
+
+        expect(collectFlipChain(0xa0, resolve)).toBeNull();
+    });
+
+    test("depth and colour storage are never compatible, whatever the geometry", () => {
+        const colour = surface(0xa000, 0);
+        const depth = surface(0xb000, 0, DDSCAPS_FLIP | DDSCAPS_ZBUFFER);
+        expect(flipStorageCompatible(colour, depth)).toBe(false);
+        expect(flipStorageCompatible(colour, surface(0xc000, 0))).toBe(true);
+    });
+
+    test("the slot's own driving mode does not travel with the image", () => {
+        // `mode`/`everLocked` say how THIS slot is driven — one GetDC on the primary demotes
+        // the primary permanently. Carrying them would move that demotion to the back buffer
+        // on the next Flip, and the two would alternate every frame.
+        const front = surface(0xa000, 0);
+        const back = surface(0xb000, 0);
+        (front as unknown as { mode: string; everLocked: boolean }).mode = "CPU";
+        (front as unknown as { everLocked: boolean }).everLocked = true;
+
+        rotateFlipChain([front, back]);
+
+        expect((front as unknown as { mode: string }).mode).toBe("CPU");
+        expect((front as unknown as { everLocked: boolean }).everLocked).toBe(true);
+        expect((back as unknown as { mode: string }).mode).toBe("GPU_ONLY");
+        expect((back as unknown as { everLocked: boolean }).everLocked).toBe(false);
+    });
+
+    test("rotation reports every storage move with the pointer that left the slot", () => {
+        // The surfacePtr→handle index and the deferred-upload batch are both keyed by the
+        // storage being renamed; without this they describe the other chain member.
+        const front = surface(0xa000, 0);
+        const back = surface(0xb000, 0);
+        const moves: { to: DirectDrawSurfaceState; from: DirectDrawSurfaceState; previousPtr: number }[] = [];
+
+        rotateFlipChain([front, back], 2, (m) => moves.push({ ...m }));
+
+        // `from` identifies the SLOT the image came from — that is the key any index built
+        // before the rotation is stored under — and previousPtr the allocation that left.
+        expect(moves.map((m) => m.previousPtr)).toEqual([0xa000, 0xb000]);
+        expect(moves[0]!.to).toBe(front);
+        expect(moves[0]!.from).toBe(back);
+        expect(moves[1]!.to).toBe(back);
+        expect(moves[1]!.from).toBe(front);
+        expect(front.surfacePtr).toBe(0xb000);
+    });
+
+    test("a live Lock lease names the surface that blocks the flip", () => {
+        const front = surface(0xa000, 0);
+        const back = surface(0xb000, 0);
+        expect(findFlipBlockingLease([front, back])).toBeNull();
+        // A lease id with nothing behind it in the registry must not wedge the frame loop.
+        back.activeLeaseId = 12345;
+        expect(findFlipBlockingLease([front, back])).toBeNull();
     });
 });

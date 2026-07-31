@@ -5,6 +5,7 @@
  * This replaces the monolithic d3d.ts file with a modular structure.
  */
 import { ThunkImplementation } from "../../../core/thunking/thunk-dispatcher";
+import { assignStubsOnce } from "../../../core/thunking/stub-merge";
 import { DDrawContext } from "../context";
 import { Logger, LogCategory } from "../../../core/logger";
 import { Direct3DDevice3Object, Direct3DDevice7Object } from "../com-objects";
@@ -44,7 +45,7 @@ export const createD3DExports = (context: DDrawContext): Record<string, ThunkImp
     };
     // The execute-buffer interpreter replays opcodes onto the handlers above,
     // so it is wired last and takes the merged table.
-    Object.assign(exports, createExecuteBufferExports(context, drawHandler, exports));
+    assignStubsOnce(exports, createExecuteBufferExports(context, drawHandler, exports), "d3d execute buffer");
     return exports;
 };
 

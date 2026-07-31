@@ -85,6 +85,7 @@ import {
 import { createDirectDrawExports } from './directdraw';
 import { createSurfaceExports, registerFastPathSurfaceFunctions } from './surface';
 import { createD3DExports, registerFastPathD3DFunctions } from './d3d/index';
+import { freeExecuteBufferScratch } from './d3d/execute-buffer-impl';
 import { createGPUTexture, convertRGBAToSurface, FormatInfo, readSurfaceStateRGBA } from './gpu-texture-utils';
 import { resolveBitmapRgba, bitmapHasPixelSource } from '../gdi32/bitmap-resolve';
 import { setAuthorityCpu } from './surface-sync';
@@ -830,6 +831,7 @@ export class DDraw implements IModule {
 
         if (this.context) {
             this.flushDeferredSurfacePtrFrees();
+            freeExecuteBufferScratch(this.context.process.memory);
 
             // Reset primary/backbuffer surfaces
             this.context.surfaces.primary = 0;
@@ -892,7 +894,10 @@ export class DDraw implements IModule {
             LogCategory.DDRAW,
             `DDraw: display updated from config -> ${this.context.display.width}x${this.context.display.height} @ ${this.context.display.bpp}bpp ${this.context.display.refresh}Hz`
         );
-        System.getInstance().requestHostResize(this.context.display.width, this.context.display.height);
+        // Boot/manifest baseline — the desktop mode until a game sets its own.
+        System.getInstance().requestHostResize(this.context.display.width, this.context.display.height, {
+            modeSet: true, bpp: this.context.display.bpp, refreshRate: this.context.display.refresh,
+        });
     }
 
     recreateVTables(): void {

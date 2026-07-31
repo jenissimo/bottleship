@@ -285,8 +285,12 @@ export const createDrawHandler = (context: DDrawContext, textureManager: Texture
                             viewportScratch.y = vp.y;
                             viewportScratch.width = vp.width;
                             viewportScratch.height = vp.height;
-                            viewportScratch.minZ = vp.minZ;
-                            viewportScratch.maxZ = vp.maxZ;
+                            // A D3DVIEWPORT's dvMinZ/dvMaxZ remap CLIP space (they reach the
+                            // pipeline through the viewport's clip-space scale/bias); the
+                            // rasterizer's own depth range stays 0..1, as ddraw's
+                            // viewport_activate hardcodes.
+                            viewportScratch.minZ = 0;
+                            viewportScratch.maxZ = 1;
                         }
                     }
                 }

@@ -171,7 +171,10 @@ function normalizeExclusiveCoopWindow(system: System, ddrawCtx: DDrawContext, wi
 
 /** Apply host resize + restore GDI launcher chrome after SetDisplayMode. */
 function applyDisplayModeChange(system: System, ddrawCtx: DDrawContext, width: number, height: number): void {
-    system.requestHostResize(width, height);
+    // SetDisplayMode IS a mode-set — this is the size SM_CXSCREEN must report from now on.
+    system.requestHostResize(width, height, {
+        modeSet: true, bpp: ddrawCtx.display.bpp, refreshRate: ddrawCtx.display.refresh,
+    });
     // In exclusive/fullscreen, normalize the coop window to borderless-fullscreen at the
     // new mode and bring it to top; otherwise just track the size (resizeFullscreenWindow).
     if (ddrawCtx.cooperative.exclusive) {
@@ -252,7 +255,10 @@ export function restoreDisplayModeToDesktop(system: System, ddrawCtx: DDrawConte
     ddrawCtx.display.bpp = ddrawCtx.desktopMode.bpp;
     ddrawCtx.display.refresh = ddrawCtx.desktopMode.refresh;
 
-    system.requestHostResize(ddrawCtx.display.width, ddrawCtx.display.height);
+    // RestoreDisplayMode returns the desktop mode — also a mode-set, back to the original.
+    system.requestHostResize(ddrawCtx.display.width, ddrawCtx.display.height, {
+        modeSet: true, bpp: ddrawCtx.desktopMode.bpp, refreshRate: ddrawCtx.desktopMode.refresh,
+    });
 
     const changed = ddrawCtx.display.width !== prevW
         || ddrawCtx.display.height !== prevH

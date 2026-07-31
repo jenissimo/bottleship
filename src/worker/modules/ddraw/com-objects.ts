@@ -3,6 +3,7 @@ import { BaseComObject } from "../../core/com/base-com-object";
 import { System } from "../../core/system";
 import { SystemResourceProvider } from "../../core/resources/system-resource-provider";
 import { leaseRegistry } from "../../core/memory/lease-registry";
+import { runSurfaceTeardownHooks } from "./surface-teardown";
 import {
     IID_IDirect3D,
     IID_IDirect3D2,
@@ -538,6 +539,8 @@ export class DirectDrawSurfaceObject extends BaseComObject {
         if (deferredMgr) {
             deferredMgr.removeDirty(this.state);
         }
+
+        runSurfaceTeardownHooks(this.state);
 
         // Deferred destruction of GPU resources
         // WebGPU commands are asynchronous - if we destroy texture immediately,
@@ -2042,6 +2045,11 @@ export interface ExecuteData {
     instructionOffset: number;
     instructionLength: number;
     hVertexOffset: number;
+    /** D3DSTATUS the interpreter branches on; D3DOP_SETSTATUS writes it and
+     *  GetExecuteData hands it back to the app. */
+    statusFlags: number;
+    status: number;
+    statusExtent: { left: number; top: number; right: number; bottom: number };
 }
 
 /**
@@ -2055,6 +2063,7 @@ export class Direct3DExecuteBufferObject extends BaseComObject {
     private locked = false;
     private execData: ExecuteData = {
         vertexOffset: 0, vertexCount: 0, instructionOffset: 0, instructionLength: 0, hVertexOffset: 0,
+        statusFlags: 0, status: 0, statusExtent: { left: 0, top: 0, right: 0, bottom: 0 },
     };
 
     constructor(vtableAddress: number) {
@@ -2098,28 +2107,31 @@ export class Direct3DTextureObject extends BaseComObject {
         }
     }
 
-    addRef(): number {
+    // `ifacePtr` must be forwarded, not dropped: the base tracks per-interface references by
+    // the pointer the guest holds, and an arity-0 override silently discards it — which
+    // TypeScript accepts. Delegation goes to the parent surface, so the pointer travels there.
+    addRef(ifacePtr = 0): number {
         if (this.surfaceHandle) {
             const resourceProvider = SystemResourceProvider.getInstance();
             const surfaceObj = resourceProvider.getComObject(this.surfaceHandle);
             if (surfaceObj) {
-                return surfaceObj.addRef();
+                return surfaceObj.addRef(ifacePtr);
             }
         }
         // Fallback: increment our own refcount if surface not found (shouldn't happen)
-        return super.addRef();
+        return super.addRef(ifacePtr);
     }
 
-    release(): number {
+    release(ifacePtr = 0): number {
         if (this.surfaceHandle) {
             const resourceProvider = SystemResourceProvider.getInstance();
             const surfaceObj = resourceProvider.getComObject(this.surfaceHandle);
             if (surfaceObj) {
-                return surfaceObj.release();
+                return surfaceObj.release(ifacePtr);
             }
         }
         // Fallback: decrement our own refcount if surface not found (shouldn't happen)
-        return super.release();
+        return super.release(ifacePtr);
     }
 
     queryInterface(riid: string, ppvObject: number, memory: Uint8Array): number {
@@ -2188,28 +2200,31 @@ export class Direct3DTexture2Object extends BaseComObject {
         }
     }
 
-    addRef(): number {
+    // `ifacePtr` must be forwarded, not dropped: the base tracks per-interface references by
+    // the pointer the guest holds, and an arity-0 override silently discards it — which
+    // TypeScript accepts. Delegation goes to the parent surface, so the pointer travels there.
+    addRef(ifacePtr = 0): number {
         if (this.surfaceHandle) {
             const resourceProvider = SystemResourceProvider.getInstance();
             const surfaceObj = resourceProvider.getComObject(this.surfaceHandle);
             if (surfaceObj) {
-                return surfaceObj.addRef();
+                return surfaceObj.addRef(ifacePtr);
             }
         }
         // Fallback: increment our own refcount if surface not found (shouldn't happen)
-        return super.addRef();
+        return super.addRef(ifacePtr);
     }
 
-    release(): number {
+    release(ifacePtr = 0): number {
         if (this.surfaceHandle) {
             const resourceProvider = SystemResourceProvider.getInstance();
             const surfaceObj = resourceProvider.getComObject(this.surfaceHandle);
             if (surfaceObj) {
-                return surfaceObj.release();
+                return surfaceObj.release(ifacePtr);
             }
         }
         // Fallback: decrement our own refcount if surface not found (shouldn't happen)
-        return super.release();
+        return super.release(ifacePtr);
     }
 
     queryInterface(riid: string, ppvObject: number, memory: Uint8Array): number {

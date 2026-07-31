@@ -1,4 +1,5 @@
 import { DirectDrawSurfaceState, isBitmapTexture, isRenderSurface } from "./com-objects";
+import { registerSurfaceTeardownHook } from "./surface-teardown";
 import { System } from "../../core/system";
 import { Logger, LogCategory, LogLevel } from "../../core/logger";
 import { profiler } from "../../core/profiler";
@@ -280,6 +281,8 @@ function acquireReadbackBuffer(
                 released = true;
                 pooled.buffer.unmap();
                 pooled.busy = false;
+                // Surface torn down while this readback was in flight: we are the last owner.
+                if (readbackBufferPool.get(state) !== pooled) pooled.buffer.destroy();
             },
         };
     }
@@ -314,9 +317,21 @@ function acquireReadbackBuffer(
             released = true;
             buffer.unmap();
             entry.busy = false;
+            if (readbackBufferPool.get(state) !== entry) buffer.destroy();
         },
     };
 }
+
+/** Drop the pooled staging buffer of a surface being torn down; nothing else ever frees
+ *  it, and it is the size of the whole padded surface. */
+function releaseReadbackBufferPool(state: DirectDrawSurfaceState): void {
+    const pooled = readbackBufferPool.get(state);
+    if (!pooled) return;
+    readbackBufferPool.delete(state);
+    // A busy slot is still mapped by an in-flight readback; its own release() destroys it.
+    if (!pooled.busy) pooled.buffer.destroy();
+}
+registerSurfaceTeardownHook(releaseReadbackBufferPool);
 
 /** Last version each surface was actually read back at, for the redundancy assertion.
  *  Separate from `cpuSyncedVersion` on purpose: this one is never cleared by the
@@ -1064,6 +1079,9 @@ export class SurfaceSyncManager {
         // exactly once (in `finally`), which also fixes the double-counting the
         // per-branch profiler.end()s used to produce.
         const syncToken = profiler.startToken("SurfaceSyncManager.syncToCPU");
+        // The pool slot is marked busy at acquire; a rejected mapAsync (or any throw past
+        // it) must still hand it back or every later readback of this surface allocates.
+        let releasePooledReadback: (() => void) | null = null;
         try {
             const system = System.getInstance();
             const process = system?.process;
@@ -1196,6 +1214,7 @@ export class SurfaceSyncManager {
 
             const { buffer: readback, release: releaseReadback } =
                 acquireReadbackBuffer(device, state, bufferSize);
+            releasePooledReadback = releaseReadback;
 
             const encoder = device.createCommandEncoder();
             encoder.copyTextureToBuffer(
@@ -1338,6 +1357,7 @@ export class SurfaceSyncManager {
             Logger.warn(LogCategory.SYSTEM, `syncToCPU: Failed: ${e}`);
             return false;
         } finally {
+            releasePooledReadback?.();
             profiler.endToken(syncToken);
         }
     }

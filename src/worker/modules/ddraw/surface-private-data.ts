@@ -13,7 +13,7 @@
  *         cbSize == sizeof(IUnknown*) and takes a reference on the object.
  *   Get:  absent tag → DDERR_NOTFOUND (nothing written); *pcbSize too small →
  *         *pcbSize = required, DDERR_MOREDATA; NULL pcbSize / NULL buffer with a
- *         large enough size → DDERR_INVALIDPARAMS. The getter does NOT AddRef.
+ *         large enough size → DDERR_INVALIDPARAMS. IUnknown getters AddRef.
  *   Free: absent tag → DDERR_NOTFOUND; releases an IUnknown entry's reference.
  * Surface teardown frees every entry (and its references).
  */
@@ -110,10 +110,14 @@ export function createSurfacePrivateDataExports(context: DDrawContext): Record<s
         if (entry.bytes) {
             mem.set(entry.bytes, lpBuffer);
         } else {
-            // IUnknown entries hand back the raw pointer; the getter takes no reference.
+            // A successful DDSPD_IUNKNOWNPOINTER GetPrivateData hands the caller
+            // an independently owned interface reference.
             view.setUint32(lpBuffer, entry.unknownPtr ?? 0, true);
         }
         view.setUint32(lpcbSize, entry.size, true);
+        if (!entry.bytes && entry.unknownPtr) {
+            context.resourceProvider.getComObjectByAddress(entry.unknownPtr)?.addRef();
+        }
         return DD_OK;
     };
 

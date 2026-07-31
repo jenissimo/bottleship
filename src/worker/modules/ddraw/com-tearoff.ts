@@ -55,7 +55,11 @@ const tearOffCache = (context: DDrawContext, obj: BaseComObject): Map<string, nu
     // The address the object was created at already IS one of these interfaces (whichever
     // vtable it was built with), so seed it: QI for that generation must return the very
     // pointer the app already holds, not a second one.
-    const primary = context.resourceProvider.getAddressForHandle(obj.handle);
+    // The PRIMARY address, not the last-mapped one: every tear-off registered after birth
+    // overwrites `getAddressForHandle`, so seeding from it credits the object's own
+    // interface to whichever tear-off was created most recently.
+    const primary = context.resourceProvider.getPrimaryAddressForHandle?.(obj.handle)
+        ?? context.resourceProvider.getAddressForHandle(obj.handle);
     if (primary) {
         for (const [name, info] of Object.entries(context.vtables)) {
             if (info?.address === obj.vtableAddress) {

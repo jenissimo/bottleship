@@ -21,7 +21,7 @@ import { D3DLight7Data, D3DMaterial7Data, D3DColorValue, D3DVector } from "./typ
 const E_NOINTERFACE = 0x80004002;
 const E_POINTER = 0x80004003;
 const E_FAIL = 0x80004005;
-const DDERR_ALREADYINITIALIZED = 0x88000005;
+const DDERR_ALREADYINITIALIZED = 0x88760005; // MAKE_DDHRESULT(5)
 const DDERR_UNSUPPORTED = 0x80004001; // ddraw.h: DDERR_UNSUPPORTED == E_NOTIMPL
 
 // ============================================================================
@@ -208,6 +208,7 @@ export const createLightMaterialExports = (context: DDrawContext): D3DExports =>
     // Reserve/Unreserve tail (9 slots), v2/v3 are 6. So QI hands back a tear-off over
     // the requested version's table, aliased to the same object — material data and the
     // D3DMATERIALHANDLE must stay shared however the guest reached the material.
+    const materialTearOffs = new WeakMap<object, Map<string, number>>();
     const materialVTableByIid: Record<string, string> = {
         [IID_IDirect3DMaterial.toLowerCase()]: "IDirect3DMaterial",
         [IID_IDirect3DMaterial2.toLowerCase()]: "IDirect3DMaterial2",
@@ -237,16 +238,26 @@ export const createLightMaterialExports = (context: DDrawContext): D3DExports =>
             return D3D_OK;
         }
 
-        const objAddr = allocateComObject(context.process.memory, mem, vtableAddr);
+        // One address per (material, version): QueryInterface is idempotent in COM and a
+        // game may compare the pointers it gets back, so a fresh block per call is wrong.
+        let cache = materialTearOffs.get(obj);
+        if (!cache) {
+            cache = new Map();
+            materialTearOffs.set(obj, cache);
+        }
+        let objAddr = cache.get(vtableKey) ?? 0;
         if (!objAddr) {
-            obj.release();
-            return E_FAIL;
+            objAddr = allocateComObject(context.process.memory, mem, vtableAddr);
+            if (!objAddr) {
+                obj.release();
+                return E_FAIL;
+            }
+            cache.set(vtableKey, objAddr);
+            resourceProvider.mapAddressToHandle(objAddr, obj.handle);
+            Logger.log(LogCategory.COM,
+                `IDirect3DMaterial_QueryInterface -> ${vtableKey} at 0x${objAddr.toString(16)} (handle=0x${obj.handle.toString(16)})`);
         }
         new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setUint32(ppvObject, objAddr, true);
-        resourceProvider.mapAddressToHandle(objAddr, obj.handle);
-
-        Logger.log(LogCategory.COM,
-            `IDirect3DMaterial_QueryInterface -> ${vtableKey} at 0x${objAddr.toString(16)} (handle=0x${obj.handle.toString(16)})`);
         return D3D_OK;
     };
 

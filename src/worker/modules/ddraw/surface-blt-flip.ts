@@ -14,10 +14,16 @@ import {
     E_POINTER,
     DDSCAPS_PRIMARYSURFACE,
     DDSCAPS_FLIP,
+    DDSCAPS_FRONTBUFFER,
+    DDSCAPS_OVERLAY,
     DDSCAPS_BACKBUFFER,
     DDSCAPS_3DDEVICE,
     DDSCAPS_ZBUFFER,
     DDSCAPS_TEXTURE,
+    DDERR_NOTFLIPPABLE,
+    DDERR_SURFACEBUSY,
+    DDBLT_COLORFILL,
+    DDERR_INVALIDPARAMS,
     D3DCLEAR_TARGET,
     D3DCLEAR_ZBUFFER,
     D3DCLEAR_STENCIL,
@@ -52,8 +58,8 @@ import { isValidAddress } from "../../core/memory/address-guard";
 import { markGpuSyncedFromCpu } from "./surface-sync";
 import { onFrameEnd as frameCaptureOnFrameEnd } from "./frame-capture";
 import { recordSurfaceOp } from "./surface-op-log";
-import { clearDepthForZSurface, isZBufferSurface } from "./depth-fill";
-import { collectFlipChain, rotateFlipChain, warnOnLockedFlip } from "./flip-chain";
+import { clearDepthForZSurface, fillZSurfaceMemory, isZBufferSurface } from "./depth-fill";
+import { collectFlipChain, findFlipBlockingLease, flipStorageCompatible, rotateFlipChain } from "./flip-chain";
 
 // Module-level rect pool to reduce allocations in hot paths
 const rectPool = new RectPool(8);
@@ -322,45 +328,77 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
         }
         profiler.end('Flip:gdiSync');
 
+        // Flip renames storage around a chain whose FRONT is `this`. Wine
+        // (ddraw_surface1_Flip) refuses anything else outright — a back buffer, a
+        // non-flippable surface, or an override that is this very surface.
         profiler.start('Flip:resolve');
-        let srcState = state;
-        let dstState = state;
-        let attachedAddr = state.attachedSurfaceAddr;
-
-        if (!attachedAddr && (state.caps & DDSCAPS_PRIMARYSURFACE) && (state.caps & DDSCAPS_FLIP)) {
-            attachedAddr = context.surfaces.backBuffer;
+        const isFront = (state.caps & (DDSCAPS_PRIMARYSURFACE | DDSCAPS_FRONTBUFFER | DDSCAPS_OVERLAY)) !== 0;
+        if (!isFront || (state.caps & DDSCAPS_FLIP) === 0
+            || (lpDDSurfaceTargetOverride && (lpDDSurfaceTargetOverride >>> 0) === (thisPtr >>> 0))) {
+            profiler.end('Flip:resolve');
+            Logger.warn(LogCategory.DDRAW,
+                `IDirectDrawSurface7_Flip: surface 0x${thisPtr.toString(16)} caps=0x${state.caps.toString(16)} ` +
+                `is not the front buffer of a flip chain -> DDERR_NOTFLIPPABLE`);
+            return DDERR_NOTFLIPPABLE;
         }
 
-        if (attachedAddr) {
-            const attached = context.resourceProvider.getComObjectByAddress(attachedAddr) as DirectDrawSurfaceObject | null;
-            if (attached) {
-                const attachedState = attached.getState();
+        const ring = collectFlipChain(thisPtr, (a) =>
+            context.resourceProvider.getComObjectByAddress(a) as DirectDrawSurfaceObject | null);
 
-                if (state.caps & DDSCAPS_PRIMARYSURFACE) {
-                    srcState = attachedState;
-                    dstState = state;
-                } else if (state.caps & DDSCAPS_BACKBUFFER) {
-                    srcState = state;
-                    dstState = attachedState;
-                } else {
-                    srcState = attachedState;
-                    dstState = state;
-                }
-            }
-        } else if (lpDDSurfaceTargetOverride) {
-            const overrideObj = context.resourceProvider.getComObjectByAddress(lpDDSurfaceTargetOverride) as DirectDrawSurfaceObject | null;
-            if (overrideObj) {
-                srcState = overrideObj.getState();
-                dstState = state;
+        // The links do not close into a ring only when the back buffer reached us
+        // through context.surfaces rather than an attachment; pair with it directly.
+        let chain = ring;
+        if (!chain) {
+            const bbAddr = context.surfaces.backBuffer;
+            const bbObj = bbAddr && bbAddr !== thisPtr
+                ? context.resourceProvider.getComObjectByAddress(bbAddr) as DirectDrawSurfaceObject | null
+                : null;
+            const bbState = bbObj?.getState();
+            if (bbState && flipStorageCompatible(state, bbState)) {
+                chain = [{ addr: thisPtr >>> 0, state }, { addr: bbAddr >>> 0, state: bbState }];
             }
         }
+        if (!chain || chain.length < 2) {
+            profiler.end('Flip:resolve');
+            Logger.warn(LogCategory.DDRAW,
+                `IDirectDrawSurface7_Flip: no flip target for surface 0x${thisPtr.toString(16)} -> DDERR_NOTFLIPPABLE`);
+            return DDERR_NOTFLIPPABLE;
+        }
+
+        // Flip(target) renames front and target and leaves the surfaces between them
+        // untouched; without a target the whole ring rotates one position.
+        let rotateSpan = chain.map((e) => e.state);
+        if (lpDDSurfaceTargetOverride) {
+            const idx = chain.findIndex((e) => e.addr === (lpDDSurfaceTargetOverride >>> 0));
+            if (idx <= 0) {
+                profiler.end('Flip:resolve');
+                Logger.warn(LogCategory.DDRAW,
+                    `IDirectDrawSurface7_Flip: override 0x${lpDDSurfaceTargetOverride.toString(16)} is not on ` +
+                    `the flip chain of 0x${thisPtr.toString(16)} -> DDERR_NOTFLIPPABLE`);
+                return DDERR_NOTFLIPPABLE;
+            }
+            rotateSpan = [chain[0].state, chain[idx].state];
+        }
+
+        const busy = findFlipBlockingLease(rotateSpan);
+        if (busy) {
+            profiler.end('Flip:resolve');
+            Logger.warn(LogCategory.DDRAW,
+                `IDirectDrawSurface7_Flip: surface 0x${busy.surfacePtr.toString(16)} still holds a Lock lease ` +
+                `-> DDERR_SURFACEBUSY (the guest must Unlock before flipping)`);
+            return DDERR_SURFACEBUSY;
+        }
+
+        // The image about to reach the screen is the one the successor holds.
+        const srcState = rotateSpan[1];
+        const dstState = state;
         profiler.end('Flip:resolve');
 
         // Diagnostic: log flip resolution
         {
             const s = srcState as any;
             Logger.log(LogCategory.DDRAW,
-                `IDirectDrawSurface7_Flip: attachedAddr=0x${(attachedAddr || 0).toString(16)} src=0x${srcState.surfacePtr.toString(16)} dst=0x${dstState.surfacePtr.toString(16)} srcMode=${s.mode ?? '?'} srcGpuTex=${!!srcState.gpuTexture} dstGpuTex=${!!dstState.gpuTexture} srcGpuDirty=${s.gpuDirty ?? '?'} srcVer=${s.version ?? '?'} srcGpuWriteVer=${s.gpuWrittenVersion ?? '?'}`);
+                `IDirectDrawSurface7_Flip: chain=${chain.length} src=0x${srcState.surfacePtr.toString(16)} dst=0x${dstState.surfacePtr.toString(16)} srcMode=${s.mode ?? '?'} srcGpuTex=${!!srcState.gpuTexture} dstGpuTex=${!!dstState.gpuTexture} srcGpuDirty=${s.gpuDirty ?? '?'} srcVer=${s.version ?? '?'} srcGpuWriteVer=${s.gpuWrittenVersion ?? '?'}`);
         }
 
         // Helper: post-copy Flip tail — deferred uploads, frame pacing, present
@@ -417,36 +455,26 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
         // A pending render pass still targets the pre-rotation texture.
         if (context.executor) context.executor.flush();
 
-        const frontAddr = ((state.caps & DDSCAPS_BACKBUFFER) && attachedAddr) ? attachedAddr : thisPtr;
-        const ring = collectFlipChain(frontAddr, (a) =>
-            context.resourceProvider.getComObjectByAddress(a) as DirectDrawSurfaceObject | null);
+        // Two indexes are keyed by the storage that is about to move and would otherwise
+        // describe the wrong surface afterwards: the surfacePtr→handle map (sibling
+        // propagation reads it) and the deferred-upload batch.
+        const handleOf = new Map<DirectDrawSurfaceState, number>();
+        for (const e of chain) {
+            const obj = context.resourceProvider.getComObjectByAddress(e.addr) as DirectDrawSurfaceObject | null;
+            if (obj) handleOf.set(e.state, obj.handle);
+        }
+        const wasPendingUpload = new Set(
+            rotateSpan.filter((s) => context.deferredUploadManager.isPendingUpload(s)));
 
-        let rotated: DirectDrawSurfaceState[] | null = null;
-        let rotateCount = 0;
-        if (ring && ring.length >= 2) {
-            rotated = ring.map((e) => e.state);
-            rotateCount = rotated.length;
-            // Flip(target) rotates only the span up to that surface (the rest of a longer
-            // chain keeps its contents), matching IDirectDrawSurface7::Flip's override.
-            if (lpDDSurfaceTargetOverride) {
-                const idx = ring.findIndex((e) => e.addr === (lpDDSurfaceTargetOverride >>> 0));
-                if (idx > 0) rotateCount = idx + 1;
+        rotateFlipChain(rotateSpan, rotateSpan.length, (move) => {
+            const handle = handleOf.get(move.to);
+            if (handle !== undefined && move.previousPtr !== move.to.surfacePtr) {
+                context.resourceProvider.unregisterSurfacePtr(handle, move.previousPtr);
+                context.resourceProvider.registerSurfacePtr(handle, move.to.surfacePtr);
             }
-        } else if (srcState.surfacePtr !== dstState.surfacePtr) {
-            // Links do not close into a ring (primary + a back buffer we only know via
-            // context.surfaces): rotate the resolved pair so the exchange still happens.
-            rotated = [dstState, srcState];
-            rotateCount = 2;
-        }
-
-        if (rotated) {
-            warnOnLockedFlip(rotated.slice(0, rotateCount));
-            rotateFlipChain(rotated, rotateCount);
-            recordSurfaceOp("flip", `rotate:${rotateCount}`, dstState, srcState, null, null);
-        } else {
-            Logger.warn(LogCategory.DDRAW, `IDirectDrawSurface7_Flip: no flip target (Src==Dst); nothing to rotate.`);
-            recordSurfaceOp("flip", "noop", dstState, srcState, null, null);
-        }
+            context.deferredUploadManager.setPendingUpload(move.to, wasPendingUpload.has(move.from));
+        });
+        recordSurfaceOp("flip", `rotate:${rotateSpan.length}`, dstState, srcState, null, null);
         profiler.end('Flip:rotate');
 
         return finishFlip();
@@ -604,19 +632,24 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
         if (!dstRect) return DD_OK;
 
         if (!lpSrcSurface) {
-            let fillColor = 0;
+            // A source-less Blt is a fill, and a fill carries its value in DDBLTFX: without
+            // one of the fill flags, or without the struct, DirectDraw has nothing to write.
+            const isFill = (dwFlags & (DDBLT_COLORFILL | DDBLT_DEPTHFILL)) !== 0;
             const fillSize = DDBLTFX_OFFSETS.fillColor + 4;
-            if (lpDDBltFx && isValidAddress(mem, lpDDBltFx, fillSize)) {
-                fillColor = new DataView(mem.buffer, mem.byteOffset, mem.byteLength).getUint32(lpDDBltFx + DDBLTFX_OFFSETS.fillColor, true);
-            }
+            const hasFx = !!lpDDBltFx && isValidAddress(mem, lpDDBltFx, fillSize);
+            if (!isFill || !hasFx) return DDERR_INVALIDPARAMS;
+            const fillColor = new DataView(mem.buffer, mem.byteOffset, mem.byteLength)
+                .getUint32(lpDDBltFx + DDBLTFX_OFFSETS.fillColor, true);
 
             // A source-less fill aimed at a z buffer is a DEPTH CLEAR. DDBLT_DEPTHFILL says so
             // explicitly, but on real hardware the z surface IS the depth memory, so engines of
             // this era clear it with a plain DDBLT_COLORFILL just as often — the destination's
-            // DDSCAPS_ZBUFFER is what decides, not the flag. Either way, filling the surface's
-            // guest pixels (which nothing reads) would leave the real depth attachment holding
-            // the previous frame's values, and the next frame's geometry z-fails against them.
+            // DDSCAPS_ZBUFFER is what decides, not the flag.
             if ((dwFlags & DDBLT_DEPTHFILL) !== 0 || isZBufferSurface(dstState)) {
+                // The guest pixels ARE the depth memory as far as the app is concerned, and a
+                // later Lock reads them back to decide what to clear to, so write them too —
+                // the depth attachment behind them is our cache, not the app's view.
+                fillZSurfaceMemory(dstState, mem, dstRect, fillColor);
                 clearDepthForZSurface(context, thisPtr, dstState, dstRect, fillColor);
                 recordSurfaceOp("fill", "depth", dstState, null, dstRect, null);
                 return DD_OK;

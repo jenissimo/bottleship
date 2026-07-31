@@ -19,7 +19,8 @@ import type { DirectDrawSurfaceState } from "./com-objects";
 import { isRenderSurface } from "./com-objects";
 import type { DirectDrawSurfaceObject } from "./com-objects";
 import type { Rect } from "./helpers";
-import { Logger, LogCategory } from "../../core/logger";
+import { DDSCAPS_FLIP, DDSCAPS_ZBUFFER } from "./constants";
+import { leaseRegistry } from "../../core/memory/lease-registry";
 
 /** Everything that belongs to the PIXELS rather than to the surface identity.
  *  Identity (caps, dimensions, pixel format, attachment links, Lock leases, colour
@@ -40,12 +41,13 @@ interface SurfaceStorage {
     writeGeneration: number;
     needsColorClear?: boolean;
     clearColor?: number;
-    // RenderSurface content/authority state — describes the image, not the slot.
-    mode?: "CPU" | "GPU_ONLY";
+    // RenderSurface content state — describes the image, not the slot. `mode` and
+    // `everLocked` are deliberately absent: they say how this SLOT is driven (a
+    // GetDC on the primary demotes the primary for good), so carrying them would
+    // make the demotion alternate between the buffers on every Flip.
     version?: number;
     gpuDirty?: boolean;
     gpuWrittenVersion?: number;
-    everLocked?: boolean;
     lastUploadVersion?: number;
     dirtyRegion?: Rect;
     rgbaScratch?: Uint8Array;
@@ -71,11 +73,9 @@ function takeStorage(s: DirectDrawSurfaceState): SurfaceStorage {
         clearColor: s.clearColor,
     };
     if (isRenderSurface(s)) {
-        st.mode = s.mode;
         st.version = s.version;
         st.gpuDirty = s.gpuDirty;
         st.gpuWrittenVersion = s.gpuWrittenVersion;
-        st.everLocked = s.everLocked;
         st.lastUploadVersion = s.lastUploadVersion;
         st.dirtyRegion = s.dirtyRegion;
         st.rgbaScratch = s.rgbaScratch;
@@ -101,11 +101,9 @@ function putStorage(s: DirectDrawSurfaceState, st: SurfaceStorage): void {
     s.needsColorClear = st.needsColorClear;
     s.clearColor = st.clearColor;
     if (isRenderSurface(s)) {
-        if (st.mode !== undefined) s.mode = st.mode;
         if (st.version !== undefined) s.version = st.version;
         if (st.gpuDirty !== undefined) s.gpuDirty = st.gpuDirty;
         s.gpuWrittenVersion = st.gpuWrittenVersion;
-        if (st.everLocked !== undefined) s.everLocked = st.everLocked;
         if (st.lastUploadVersion !== undefined) s.lastUploadVersion = st.lastUploadVersion;
         s.dirtyRegion = st.dirtyRegion;
         s.rgbaScratch = st.rgbaScratch;
@@ -115,8 +113,9 @@ function putStorage(s: DirectDrawSurfaceState, st: SurfaceStorage): void {
 }
 
 /** Walk the attachment ring from `startAddr` back to itself, the way DirectDraw finds
- *  a flip target. Returns the surfaces in chain order (front first), or null when the
- *  links do not close into a ring. */
+ *  a flip target: GetAttachedSurface(DDSCAPS_FLIP), so a z buffer or a mip level hanging
+ *  off the same link never enters the chain. Returns the surfaces in chain order (front
+ *  first), or null when the links do not close into a ring. */
 export function collectFlipChain(
     startAddr: number,
     resolve: (addr: number) => DirectDrawSurfaceObject | null
@@ -131,6 +130,8 @@ export function collectFlipChain(
         const obj = resolve(addr);
         if (!obj) return null;
         const state = obj.getState();
+        if ((state.caps & DDSCAPS_FLIP) === 0) return null;
+        if (!flipStorageCompatible(chain[0].state, state)) return null;
         chain.push({ addr, state });
         addr = state.attachedSurfaceAddr >>> 0;
     }
@@ -138,30 +139,64 @@ export function collectFlipChain(
 }
 
 /**
+ * Can these two surfaces exchange storage? Rotation moves the pixel allocation and the
+ * GPU texture, so a pair that disagrees on geometry — or on being depth rather than
+ * colour — would hand each surface a block of the wrong size and kind, and destroy()
+ * would later free it against the wrong owner.
+ */
+export function flipStorageCompatible(a: DirectDrawSurfaceState, b: DirectDrawSurfaceState): boolean {
+    return (a.caps & DDSCAPS_ZBUFFER) === (b.caps & DDSCAPS_ZBUFFER)
+        && a.width === b.width && a.height === b.height
+        && a.format.bpp === b.format.bpp;
+}
+
+/** One storage move performed by a rotation: `to` now holds the image that was `from`'s,
+ *  and gave up the allocation that used to live at `previousPtr`. */
+export interface FlipStorageMove {
+    to: DirectDrawSurfaceState;
+    from: DirectDrawSurfaceState;
+    previousPtr: number;
+}
+
+/**
  * Rotate storage one position towards the front over `chain[0..count-1]`, exactly as
  * DirectDraw does: each surface takes its successor's image and the front's image
  * lands on the last surface of the rotated span. For the usual 2-surface chain that
  * is a straight exchange of front and back.
+ *
+ * `onMove` reports each move so callers can carry the indexes keyed by the OLD storage
+ * (the surfacePtr→handle map, pending-upload membership) across with it.
  */
-export function rotateFlipChain(states: DirectDrawSurfaceState[], count = states.length): void {
+export function rotateFlipChain(
+    states: DirectDrawSurfaceState[],
+    count = states.length,
+    onMove?: (move: FlipStorageMove) => void,
+): void {
     const n = Math.min(count, states.length);
     if (n < 2) return;
+    const previousPtr = states.slice(0, n).map((s) => s.surfacePtr);
     const front = takeStorage(states[0]);
     for (let i = 0; i < n - 1; i++) {
         putStorage(states[i], takeStorage(states[i + 1]));
     }
     putStorage(states[n - 1], front);
+    if (!onMove) return;
+    for (let i = 0; i < n; i++) {
+        onMove({ to: states[i], from: states[(i + 1) % n], previousPtr: previousPtr[i] });
+    }
 }
 
-/** A flip must not rotate memory out from under a live Lock: the guest still holds the
- *  pointer the lease handed it. Real DirectDraw refuses (DDERR_SURFACEBUSY); we log and
- *  let the flip proceed so a leaked lease cannot freeze the frame loop. */
-export function warnOnLockedFlip(states: DirectDrawSurfaceState[]): void {
+/**
+ * The surface whose live Lock lease blocks a flip, or null. Rotating storage out from
+ * under a lease leaves the guest's retained lpSurface addressing another surface's
+ * memory and the lease describing the block the surface no longer owns — real
+ * DirectDraw refuses the flip (DDERR_SURFACEBUSY) rather than allow either.
+ * The registry, not `activeLeaseId`, is the authority: a stale id whose lease was
+ * already revoked must not wedge the frame loop.
+ */
+export function findFlipBlockingLease(states: DirectDrawSurfaceState[]): DirectDrawSurfaceState | null {
     for (const s of states) {
-        if (s.activeLeaseId !== undefined) {
-            Logger.warn(LogCategory.DDRAW,
-                `Flip: surface 0x${s.surfacePtr.toString(16)} still has an active Lock lease; ` +
-                `rotating storage anyway (guest kept a stale lpSurface across Flip)`);
-        }
+        if (s.activeLeaseId !== undefined && leaseRegistry.validateLease(s.activeLeaseId)) return s;
     }
+    return null;
 }

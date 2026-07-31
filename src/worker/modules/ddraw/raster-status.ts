@@ -8,8 +8,9 @@
  * answer is constant — or if the out-parameter is left uninitialised.
  */
 
-/** Vertical blanking as a fraction of the refresh period (~45 of 525 VGA lines). */
-const VBLANK_FRACTION = 2 / (1000 / 60);
+/** Vertical blanking as a fraction of the refresh period: the VGA blanking interval is
+ *  ~45 of 525 total lines, and that ratio holds whatever the refresh rate is. */
+const VBLANK_FRACTION = 45 / 525;
 
 export interface RasterStatus {
     /** 0 <= scanLine < height. */

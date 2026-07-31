@@ -18,7 +18,7 @@ import { setAuthorityCpu, setAuthorityGpu, invalidateCpuSyncedVersion, syncActiv
 import { propagateSurfaceStateToRegistry } from "./texture-manager";
 import { D3DExports, D3D_OK, D3DERR_INVALIDCALL, TextureManager } from "./types";
 
-const DDERR_UNSUPPORTED = 0x8000ffff;
+const DDERR_UNSUPPORTED = 0x80004001; // ddraw.h: DDERR_UNSUPPORTED == E_NOTIMPL
 import { convertRGBAToSurface } from "../gpu-texture-utils";
 import {
     decodeSurfaceFormatToRgba8,

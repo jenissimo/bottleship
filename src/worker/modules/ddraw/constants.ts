@@ -15,6 +15,8 @@ export const DDERR_WASSTILLDRAWING = 0x8876021C;
 export const DDERR_NOCLIPPERATTACHED = 0x88760238;  // MAKE_DDHRESULT(568)
 export const DDERR_NOPALETTEATTACHED = 0x8876023C;  // MAKE_DDHRESULT(572)
 export const DDERR_CANTDUPLICATE = 0x88760247;      // MAKE_DDHRESULT(583)
+export const DDERR_SURFACEBUSY = 0x887601AE;        // MAKE_DDHRESULT(430)
+export const DDERR_NOTFLIPPABLE = 0x88760246;       // MAKE_DDHRESULT(582)
 
 // SetCooperativeLevel flags (DDSCL_* from ddraw.h)
 export const DDSCL_FULLSCREEN     = 0x00000001;
@@ -51,6 +53,8 @@ export const DDSCAPS_PRIMARYSURFACE = 0x00000200;
 export const DDSCAPS_BACKBUFFER = 0x00000004;
 export const DDSCAPS_COMPLEX = 0x00000008;
 export const DDSCAPS_FLIP = 0x00000010;
+export const DDSCAPS_FRONTBUFFER = 0x00000020;
+export const DDSCAPS_OVERLAY = 0x00000080;
 export const DDSCAPS_SYSTEMMEMORY = 0x00000800;
 export const DDSCAPS_VIDEOMEMORY = 0x00004000;
 export const DDSCAPS_LOCALVIDMEM = 0x10000000;
@@ -264,8 +268,9 @@ export const DDSCAPS_COMBINED_3D = DDSCAPS_3DDEVICE | DDSCAPS_TEXTURE | DDSCAPS_
 export const DDDEVICEIDENTIFIER_SIZE = 1064;
 
 // DDDEVICEIDENTIFIER2 structure size and offsets (DX7, IDirectDraw7::GetDeviceIdentifier)
-// 512+512+8+4+4+4+4+16+4 = 1068 bytes
-export const DDDEVICEIDENTIFIER2_SIZE = 1068;
+// Fields sum to 1068, but LARGE_INTEGER liDriverVersion gives the struct 8-byte alignment,
+// so sizeof() rounds to 1072 — and sizeof() is what the guest's own memset/copy uses.
+export const DDDEVICEIDENTIFIER2_SIZE = 1072;
 
 export const DDDEVICEIDENTIFIER2_OFFSETS = {
     szDriver: 0,

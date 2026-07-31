@@ -20,6 +20,8 @@ import {
     DDSURFACEDESC_OFFSETS,
     DDSURFACEDESC_SIZE,
     DDSURFACEDESC2_OFFSETS,
+    IID_IDirect3D,
+    IID_IDirect3D2,
     IID_IDirect3D7,
     IID_IDirect3D3,
     IID_IDirect3DDevice3,
@@ -350,11 +352,18 @@ export const createDeviceExports = (
         return D3D_OK;
     };
 
-    type ParentD3Iface = "IDirect3D7" | "IDirect3D3";
+    type ParentD3Iface = "IDirect3D7" | "IDirect3D3" | "IDirect3D2" | "IDirect3D";
     const PARENT_D3_IID: Record<ParentD3Iface, string> = {
         IDirect3D7: IID_IDirect3D7,
         IDirect3D3: IID_IDirect3D3,
+        IDirect3D2: IID_IDirect3D2,
+        IDirect3D: IID_IDirect3D,
     };
+
+    /** Per device, the parent object handed out for each IDirect3D generation. IDirect3D v1
+     *  and IDirect3D3 are not an inheritance chain (v1 slot 7 is CreateViewport, v3 slot 7 is
+     *  FindDevice), so a device asked for both must return two different objects. */
+    const parentD3ByDevice = new WeakMap<object, Map<ParentD3Iface, number>>();
 
     const writeGetDirect3D = (
         deviceObj: Direct3DDevice7Object | Direct3DDevice3Object | null,
@@ -365,7 +374,16 @@ export const createDeviceExports = (
         if (!lplpDirect3D || !isValidAddress(mem, lplpDirect3D, 4)) return D3DERR_INVALIDCALL;
         initReturnPtr(lplpDirect3D);
 
-        let parentPtr = deviceObj?.getParentD3() ?? 0;
+        let cache: Map<ParentD3Iface, number> | undefined;
+        if (deviceObj) {
+            cache = parentD3ByDevice.get(deviceObj);
+            if (!cache) {
+                cache = new Map();
+                parentD3ByDevice.set(deviceObj, cache);
+            }
+        }
+
+        let parentPtr = cache?.get(iface) ?? 0;
         if (parentPtr) {
             const parentObj = resourceProvider.getComObjectByAddress(parentPtr);
             if (parentObj) parentObj.addRef();
@@ -376,7 +394,9 @@ export const createDeviceExports = (
             if (!parentObj) return D3DERR_INVALIDCALL;
             parentPtr = allocateComObject(context.process.memory, mem, vtableAddr);
             resourceProvider.mapAddressToHandle(parentPtr, parentObj.handle);
-            if (deviceObj) deviceObj.setParentD3(parentPtr);
+            cache?.set(iface, parentPtr);
+            // The device keeps a reference to whichever generation it produced first.
+            if (deviceObj && !deviceObj.getParentD3()) deviceObj.setParentD3(parentPtr);
         }
 
         getDataView(mem).setUint32(lplpDirect3D, parentPtr, true);
@@ -2190,7 +2210,7 @@ export const createDeviceExports = (
     }
 
     const device2OnlyStubs = [
-        "GetStats", "DeleteViewport", "NextViewport", "GetDirect3D",
+        "GetStats", "DeleteViewport", "NextViewport",
         "Begin", "BeginIndexed", "Vertex", "Index", "End",
         "GetLightState", "SetLightState", "SetClipStatus", "GetClipStatus",
     ];
@@ -2212,19 +2232,29 @@ export const createDeviceExports = (
     const device1Methods = [
         "QueryInterface", "AddRef", "Release", "GetCaps",
         "AddViewport", "DeleteViewport", "NextViewport",
-        "BeginScene", "EndScene", "GetDirect3D",
+        "BeginScene", "EndScene",
     ];
     for (const method of device1Methods) {
         const d3key = `IDirect3DDevice3_${method}`;
         if (exports[d3key]) exports[`IDirect3DDevice_${method}`] = exports[d3key];
     }
+    // GetDirect3D is NOT aliasable: a v1 device must hand back an IDirect3D, whose vtable
+    // is a different layout from IDirect3D3's, not merely a shorter prefix of it.
+    exports["IDirect3DDevice_GetDirect3D"] = (_ctx, mem, args) => {
+        const obj = resourceProvider.getComObjectByAddress(args[0]) as Direct3DDevice3Object | null;
+        return writeGetDirect3D(obj, args[1], "IDirect3D", mem);
+    };
+    exports["IDirect3DDevice2_GetDirect3D"] = (_ctx, mem, args) => {
+        const obj = resourceProvider.getComObjectByAddress(args[0]) as Direct3DDevice3Object | null;
+        return writeGetDirect3D(obj, args[1], "IDirect3D2", mem);
+    };
     // v1 and Device2 share the DX5 LPDDSURFACEDESC enumeration callback.
     exports["IDirect3DDevice2_EnumTextureFormats"] = enumTextureFormatsDx5;
     exports["IDirect3DDevice_EnumTextureFormats"] = enumTextureFormatsDx5;
     exports["IDirect3DDevice_SwapTextureHandles"] = () => D3D_OK;
     exports["IDirect3DDevice_GetStats"] = () => D3D_OK;
     // Initialize is a no-op for an already-created device (DDERR_ALREADYINITIALIZED).
-    exports["IDirect3DDevice_Initialize"] = () => 0x88000005;
+    exports["IDirect3DDevice_Initialize"] = () => 0x88760005; // MAKE_DDHRESULT(5)
 
     // Device2 draw calls take a D3DVERTEXTYPE enum (1=VERTEX, 2=LVERTEX, 3=TLVERTEX),
     // not an FVF. The Device3 handler would misread D3DVT_TLVERTEX=3 as FVF XYZ

@@ -109,7 +109,7 @@ describe("IDirectDrawSurface7 private data", () => {
         expect(h.call("SetPrivateData", h.SURFACE_PTR, GUID_A, 0, 4, DDSPD_IUNKNOWNPOINTER)).toBe(DDERR_INVALIDPARAMS);
     });
 
-    test("DDSPD_IUNKNOWNPOINTER needs sizeof(IUnknown*), refs the object, and the getter does not", () => {
+    test("DDSPD_IUNKNOWNPOINTER needs sizeof(IUnknown*) and Set/Get each take a reference", () => {
         const h = makeHarness();
         expect(h.call("SetPrivateData", h.SURFACE_PTR, GUID_A, h.UNKNOWN_PTR, 5, DDSPD_IUNKNOWNPOINTER)).toBe(DDERR_INVALIDPARAMS);
         expect(h.unknown.refs).toBe(1);
@@ -120,6 +120,10 @@ describe("IDirectDrawSurface7 private data", () => {
         h.view.setUint32(OUT_SIZE, 4, true);
         expect(h.call("GetPrivateData", h.SURFACE_PTR, GUID_A, OUT_BUF, OUT_SIZE)).toBe(DD_OK);
         expect(h.view.getUint32(OUT_BUF, true)).toBe(h.UNKNOWN_PTR);
+        expect(h.unknown.refs).toBe(3);
+
+        // The caller owns the reference returned by GetPrivateData.
+        h.unknown.release();
         expect(h.unknown.refs).toBe(2);
 
         expect(h.call("FreePrivateData", h.SURFACE_PTR, GUID_A)).toBe(DD_OK);
