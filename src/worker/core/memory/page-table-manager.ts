@@ -197,7 +197,9 @@ export class PageTableManager {
 
     /**
      * Set Present + RW + User for pages in range, then zero the memory.
-     * Used by VirtualAlloc(MEM_COMMIT) for recommitting decommitted pages.
+     * For a range being allocated fresh — VirtualAlloc(MEM_RESERVE|MEM_COMMIT) and
+     * paging-enable. A commit over pages that may ALREADY be committed must go through
+     * `ensurePagesCommitted`, which leaves present pages (and their protection) alone.
      */
     commitPages(baseAddr: number, sizeBytes: number): void {
         const startPage = (baseAddr >>> 12);
@@ -205,16 +207,33 @@ export class PageTableManager {
         const mem = this.getMemory();
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
 
+        // A page that is already present and NOT writable is being promoted RO → RW here.
+        // That is a protect-class change, not a commit: `setWriteMapBase(.., true)` below
+        // marks the whole span base-writable, and that map is consulted per store with no
+        // generation guard — so a speculated store would start bypassing the slow path on
+        // a page the guest asked to be read-only. Detect it and bump, rather than trusting
+        // every future caller to honour the fresh-range contract above.
+        let protectionRaised = false;
         for (let page = startPage; page < endPage; page++) {
             const physAddr = page * PAGE_SIZE;
             const pteOffset = this._getPteOffset(page);
+            const pte = view.getUint32(pteOffset, true);
+            if ((pte & PTE_PRESENT) !== 0 && (pte & PTE_RW) === 0) protectionRaised = true;
             view.setUint32(pteOffset, physAddr | PTE_DEFAULT, true);
         }
 
         // Flush TLB. Commit only ADDS mappings, so it does not bump the fastmem
         // generation (noteCommitOnlyMappingChange explains why, and what it costs).
         const exports = this.getWasmExports();
-        this.noteCommitOnlyMappingChange();
+        if (protectionRaised) {
+            Logger.warn(LogCategory.SYSTEM,
+                `[PageTableManager] commitPages raised protection on a present read-only page ` +
+                `in 0x${baseAddr.toString(16)}+0x${sizeBytes.toString(16)} — caller should use ` +
+                `ensurePagesCommitted`);
+            this.bumpFastmemGeneration(FASTMEM_BUMP_PAGE_TABLE_PROTECT);
+        } else {
+            this.noteCommitOnlyMappingChange();
+        }
         if (exports?.full_clear_tlb) {
             exports.full_clear_tlb();
         }

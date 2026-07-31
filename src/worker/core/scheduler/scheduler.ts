@@ -80,14 +80,16 @@ const IDLE_PUMP_MAX_MS = 250;
 /** Sole-runnable Sleep(ms): credit+yield only for short pump sleeps; longer → blockThread. */
 const SOLE_RUNNABLE_SLEEP_CREDIT_MAX_MS = 50;
 
-// Fairness budget for the winmm timer thread before its queued callbacks are
-// deferred (vs the general minQuantumMs=1ms). The software audio mixer runs as a
-// timeSetEvent callback on this thread; a 1ms defer chops the mixer's per-tick
-// drain into pieces spread across many scheduler rounds → bursty PCM production →
-// SAB underrun → audible crackle in software audio mixers. A small extra budget
-// lets the mixer finish a tick before yielding, bounding game-thread starvation to
-// a few ms. Only applies to the winmm timer thread; other threads keep minQuantumMs.
-const WINMM_TIMER_QUANTUM_MS = 4;
+// Fairness budget for the winmm timer thread before its queued callbacks are deferred.
+// The software audio mixer runs as a timeSetEvent callback on this thread, and cutting it
+// short chops the per-tick drain across many scheduler rounds → bursty PCM production →
+// SAB underrun → audible crackle. It needs a few ms to finish one tick.
+//
+// DERIVED, never a bare constant: this budget must never fall BELOW the general quantum,
+// or the thread that needs the most headroom becomes the one preempted soonest. That is
+// what a bare 4 silently became when minQuantumMs moved 1 → 16 — the relation the budget
+// exists to express inverted while the number stayed put.
+const WINMM_TIMER_QUANTUM_MS = Math.max(4, DEFAULT_SCHEDULER_CONFIG.minQuantumMs);
 
 interface TimerNoFpuProfile {
     clean: number;
@@ -559,6 +561,18 @@ export class Scheduler {
             }
         }, () => this.currentThreadId ?? -1);
 
+        // Relaxed-FPU is a global tag convention over the SHARED x87 register file, so a
+        // live mode toggle must re-encode every thread's SAVED snapshot too — the wasm
+        // set_relaxed_fpu export reaches only the live registers. Includes the running
+        // thread's cached lastFpuState: a clean dirty-bit save promotes it to ctx.fpu
+        // without re-snapshotting.
+        preemptionManager.setSavedFpuStateProvider((visit) => {
+            for (const t of this.threads.values()) {
+                if (t.context?.fpu) visit(t.context.fpu);
+                if (t.lastFpuState) visit(t.lastFpuState);
+            }
+        });
+
         if (process.memory) {
             this.tebManager.initProcess(() => process.getCurrentMemory(), process.memory);
         }
@@ -707,6 +721,10 @@ export class Scheduler {
      * wall-clock gate — used by the ThunkDispatcher time-poll force-switch. Measuring the gate
      * in retired instructions instead of wall-ms keeps the switch point a function of guest
      * state, not host speed (same rationale as quantumExpired / the Re-Volt mac fix).
+     *
+     * The budget is a FRACTION OF THE QUANTUM, so retuning minQuantumMs retunes every caller
+     * with it — a spin-waiter yields at half the quantum whatever that quantum is, which is
+     * the intended relation. Callers wanting an absolute latency bound must not use this.
      */
     insnQuantumFraction(thread: Thread, fraction: number): boolean {
         const cpu = this.getCpu();
@@ -2197,10 +2215,10 @@ export class Scheduler {
         // Fairness guard: if other threads are runnable and this timer thread has
         // already consumed its budget, do not dispatch another timer callback on this
         // boundary. Let regular switch logic run first, otherwise repeated timer
-        // callbacks can starve the game thread. The budget is WINMM_TIMER_QUANTUM_MS
-        // (> the general minQuantumMs) so the software audio mixer can finish a tick's
-        // drain before yielding — a 1ms defer fragments mixer production into bursts
-        // and underruns the audio SAB (audible crackle).
+        // callbacks can starve the game thread. The budget is WINMM_TIMER_QUANTUM_MS,
+        // which is never below the general quantum, so the software audio mixer can
+        // finish a tick's drain before yielding — deferring mid-drain fragments PCM
+        // production into bursts and underruns the audio SAB (audible crackle).
         if (this.hasOtherRunnableThreads(currentThread.id)) {
             // Instruction-based budget (deterministic, platform-independent) — this gate steers
             // the T3-audio-timer vs game-thread interleaving, so a wall-clock (performance.now)

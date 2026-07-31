@@ -2456,6 +2456,20 @@ export class ThunkDispatcher {
         return this._callbackManager?.hasLiveFrameForThread(threadId) ?? false;
     }
 
+    /**
+     * Is this EIP the parked spin loop, and only that?
+     *
+     * STRICT equality, never a range. The park instruction is `JMP $` (EB FE) at
+     * spinLoopAddress, so a parked thread's EIP is exactly the base — but the bytes
+     * immediately after it are live SEH machinery, not padding: +2 is the `JMP EAX`
+     * gadget catch funclets return through, +4 the hardware-exception dispatch stub
+     * (thunk-memory-manager writes both). A thread sitting there is mid-unwind, not
+     * parked, and every caller of this predicate goes on to overwrite EIP/ESP/EAX.
+     */
+    private isParkedAtSpinLoop(eip: number): boolean {
+        return this.spinLoopAddress > 0 && (eip >>> 0) === (this.spinLoopAddress >>> 0);
+    }
+
     /** See CallbackManager.listDeferredCompletions — harness `asyncParked` diagnostics. */
     getDeferredFrameCompletions(): Array<{ threadId: number; frameId: number; source: string; value: number }> {
         return this._callbackManager?.listDeferredCompletions() ?? [];
@@ -2486,9 +2500,7 @@ export class ThunkDispatcher {
         // spin loop, or async-parked. Applying at an arbitrary EIP drops the registers into
         // live guest code and the thread runs off into garbage.
         const eip = cpu.instruction_pointer[0] >>> 0;
-        const atSpinLoop = this.spinLoopAddress > 0
-            && eip >= this.spinLoopAddress && eip < this.spinLoopAddress + 4;
-        if (!atSpinLoop && !(scheduler as any).isThreadAsyncParked?.(tid)) return false;
+        if (!this.isParkedAtSpinLoop(eip) && !(scheduler as any).isThreadAsyncParked?.(tid)) return false;
 
         // The owner was readied when the completion was deferred; bring it fully RUNNING
         // before its registers are rewritten, mirroring the async-restore resume phase.
@@ -2704,7 +2716,7 @@ export class ThunkDispatcher {
         const eip = cpu.instruction_pointer[0] >>> 0;
 
         // At the spin loop: always safe — the CPU is parked waiting for this very async result.
-        if (this.spinLoopAddress > 0 && eip >= this.spinLoopAddress && eip < this.spinLoopAddress + 4) {
+        if (this.isParkedAtSpinLoop(eip)) {
             return true;
         }
         // Current thread resuming its OWN async-parked syscall: always safe. Its live EIP is residue

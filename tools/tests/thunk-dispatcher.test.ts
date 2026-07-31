@@ -293,6 +293,32 @@ describe('ThunkDispatcher.reconcileAsyncRestoreEsp (async-restore ESP invariant)
 // EBP-sanity tripwire — a guest frame pointer outside the thread stack pointing at non-writable
 // memory is the fingerprint of the Re-Volt mac wedge (EBP=0x2130d16 while the real saved-EBP
 // chain stayed on the stack). Diagnostic-only: it records a note, never throws. Mirrors
+// The park instruction is `JMP $` (EB FE) at spinLoopAddress and nothing else; the bytes after
+// it are live SEH machinery (+2 the `JMP EAX` catch-funclet gadget, +4 the hardware-exception
+// dispatch stub). Every caller of this predicate goes on to overwrite EIP/ESP/EAX, so treating
+// a thread that is mid-unwind as "parked" destroys its continuation.
+describe('ThunkDispatcher.isParkedAtSpinLoop (park vs SEH machinery)', () => {
+    it('accepts only the exact park address', () => {
+        const d = mkDispatcher();
+        bindMemory(d);
+        expect(d.isParkedAtSpinLoop(SPIN_ADDR)).toBe(true);
+    });
+
+    it('rejects the SEH stubs sharing the spin-loop page', () => {
+        const d = mkDispatcher();
+        bindMemory(d);
+        for (const off of [1, 2, 3, 4, 0x200]) {
+            expect(d.isParkedAtSpinLoop(SPIN_ADDR + off)).toBe(false);
+        }
+    });
+
+    it('rejects everything while the spin loop is unallocated', () => {
+        const d = mkDispatcher();
+        d.spinLoopAddress = 0;
+        expect(d.isParkedAtSpinLoop(0)).toBe(false);
+    });
+});
+
 // checkEspSanity (stack bounds + FPO/alt-stack tolerance). No addressSpace is wired in the test,
 // so an out-of-stack EBP is treated as not-writable → flagged.
 describe('ThunkDispatcher.checkEbpSanity (frame-pointer tripwire)', () => {

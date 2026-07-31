@@ -17,8 +17,13 @@ Legacy Graphics (DirectDraw, D3D3-9). You bridge x86 Windows internals with mode
   (File-level CoW lives in the OPFS overlay, not in paging.)
 - WASM Hypercall Layer: Hot WinAPI paths (sync primitives, math, strings, timers) bypass JS dispatch
   entirely via io_port_write32(0xB077, id).
-- Thread Scheduler: Cooperative + preemptive (1ms quantum). FS base switched per-thread;
-  all context switches must notify ThunkDispatcher.
+- Thread Scheduler: Cooperative + preemptive. The quantum is measured in RETIRED GUEST
+  INSTRUCTIONS (minQuantumMs x TARGET_INSN_PER_MS), not wall-clock, so a switch point is a
+  function of guest state rather than host speed. minQuantumMs is 16 — NT's client quantum,
+  not a tuning knob: preempting ~15x more often than the OS these titles were written
+  against turns benign guest races into reliable ones. Anything derived from it (the winmm
+  timer budget, insnQuantumFraction callers) must be DERIVED, not a parallel constant.
+  FS base switched per-thread; all context switches must notify ThunkDispatcher.
 
 3. Engineering Directives
 
@@ -125,7 +130,9 @@ Legacy Graphics (DirectDraw, D3D3-9). You bridge x86 Windows internals with mode
   because Win32 mapping calls do not touch the file pointer and a save/restore across an await
   silently reverts a seek the guest made during the yield. `position +=` is banned outright
   (read-modify-write across a yield = double advance, served silently at full length); advances
-  go through the single named mutation. `tools/validate-file-cursor.ts` (gate step 6) enforces both.
+  go through the single named mutation. `tools/validate-file-cursor.ts` (gate step 6) enforces
+  both — and pins the NUMBER of cursor-mutation sites per owner, in any spelling, because a ban
+  on `+=` alone is a ban on a spelling that the sanctioned advance itself sidesteps.
 
 3.3 Graphics Strategy
 
@@ -273,9 +280,14 @@ facts the harness encodes (and the manual `dbg.*` fallback still needs):
   - Dev: `bun run dev` (:5174 plain HTTP by default — automation needn't clear a self-signed cert;
     `bun run dev:ssl` opts into HTTPS) +
     `bun run dev:sidecar` (:3001 dev sidecar — log archive + file writer + Range delivery of `.wgb`
-    via `GET /wgb?path=`; `dev:logs` is an alias. Start it BEFORE streaming). Kill a stale Vite via PowerShell
+    via `GET /wgb?path=`; `dev:logs` is an alias. Start it BEFORE streaming). The sidecar binds
+    LOOPBACK only and confines `path=` to a root set (repo root + the realpath parent of
+    `public/apps/external-wgb`, so `G:/WGB/**` keeps working); anything else needs `BS_WGB_ROOTS`.
+    Its WebSocket refuses a foreign `Origin` — a browser page must not be able to write files.
+    Kill a stale Vite via PowerShell
     `Get-CimInstance Win32_Process | ? CommandLine -match 'vite'` (git-bash `pkill` won't kill it) — but
-    match the PID, not the pattern, when other agents are working: that filter kills EVERY Vite on the box.
+    match the PID, not the pattern, when other agents are working: that filter kills EVERY Vite on the
+    box. The same applies to the sidecar, and to every kill-by-pattern: match the PID you started.
   - `?game=dev` = the bare emulator exposing `window.loadApp/worker/dbg/__BS__`.
   - PARALLEL bring-up (the queue is mostly WAITING — a bundle load is gigabytes, a boot is minutes):
     `BS_TAB=<name>` binds every harness command to its own `?game=dev&bs=<name>` tab of the SAME Chrome
@@ -326,7 +338,12 @@ Quality Gate (mandatory order):
   4. bun tools/validate-guest-code-writes.ts
   5. bun tools/validate-stub-tables.ts
   6. bun tools/validate-file-cursor.ts
-  7. bun run typecheck
+  7. bun tools/validate-jit-exports.ts   (checks the BUILT v86 artifact — skips cleanly if absent)
+  8. bun run typecheck
+
+A validator that cannot fail is worse than no validator: it converts an unchecked invariant
+into a false assurance. When one of these passes, confirm it CAN fail — feed it the bypass it
+is meant to catch — before trusting a green run.
 
 Tooling:
   - analyze-trace.ts  — Chrome profiler trace → self/total time per thread, WASM breakdown
