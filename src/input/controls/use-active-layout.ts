@@ -14,7 +14,12 @@ import {
 } from "../sab-layout";
 import { relativeIntent } from "../relative-intent";
 import {
-    newPadPollTracker, notePadPoll, padIsSteering, pickPreset, type PadPollTracker,
+    newPadPollTracker,
+    notePadPoll,
+    padIsSteering,
+    pickPreset,
+    shouldLatchAutoPreset,
+    type PadPollTracker,
 } from "../auto-select";
 import {
     isPinned,
@@ -91,6 +96,13 @@ export function useActiveLayout(
     const getInputViewRef = useRef(getInputView);
     useEffect(() => { getInputViewRef.current = getInputView; }, [getInputView]);
 
+    // Orientation is read the same way and for the same reason: a rotation (or any
+    // visualViewport resize that flips the aspect) would otherwise rebuild the interval
+    // and reset the one-shot latch with it — re-running auto-select mid-session and
+    // swapping the whole layout under the player's thumbs.
+    const orientationRef = useRef(orientation);
+    orientationRef.current = orientation;
+
     useEffect(() => {
         if (!enabled || isPinned(gameId)) return;
         // Sticky per game: presets are supersets (wasd-look still taps fine in a menu),
@@ -119,14 +131,15 @@ export function useActiveLayout(
                 readsPad: padIsSteering(padPolls),
                 polledVks: polled,
                 bulkKeyboard: (flags & (GUEST_INPUT_FLAG.bulkKeyboard | GUEST_INPUT_FLAG.dinputKeyboard)) !== 0,
-                orientation,
+                orientation: orientationRef.current,
             });
+            if (!shouldLatchAutoPreset(picked)) return;
             if (fired) return;
             fired = true;
             setPick({ id: gameId, value: { presetId: picked.presetId, mode: picked.mode } });
         }, DEBOUNCE_MS);
         return () => window.clearInterval(timer);
-    }, [enabled, gameId, orientation]);
+    }, [enabled, gameId]);
 
     return useMemo(() => {
         const resolved = resolveActiveLayout<ControlLayout>({

@@ -1,6 +1,8 @@
 // Touch HUD — the only always-reachable shell affordance on a keyboard-less device.
-// Actions only; the touch MODE lives in Settings > Input. Its pointer handlers stop
-// propagation, so the touch driver never sees a HUD tap.
+// Actions only; the touch MODE lives in Settings > Input. `data-touch-reserved` is what
+// keeps a HUD tap out of the guest: the touch driver claims any contact that starts
+// under it. A React handler cannot do that — React delegates to the root container, so
+// the driver's native listener on the panel has already run by then.
 //
 // A 44x44 corner handle rather than an edge swipe: an edge swipe collides with the
 // Android back gesture and the notification shade, and a page cannot win that.

@@ -68,6 +68,14 @@ export const WHEEL_NOTCH_DELTA_PX = 100;
 const MAX_CONTACTS = 10;
 /** A contact untouched this long has lost its lift; well past any real hold. */
 const STALE_CONTACT_MS = 30_000;
+/**
+ * The same, while a button is published down. Tighter because the cost is not a
+ * consumed slot but a button the guest sees held: a lost lift mid-drag latches LMB
+ * for as long as we believe the finger is there. The floor is what a motionless
+ * hold can legitimately last — a still contact emits no events, so its age is all
+ * we have to judge by.
+ */
+const STALE_HELD_CONTACT_MS = 10_000;
 
 export const Phase = {
     /** No contacts, nothing owed. */
@@ -200,9 +208,11 @@ export function step(s: RecognizerState, ev: TouchEvent2, now: number): TouchInt
     return out;
 }
 
-/** Fires the time-based transitions: long press and the owed tap release. */
+/** Fires the time-based transitions: long press, the owed tap release, and the
+ *  reaping of contacts whose lift never arrived. */
 export function tick(s: RecognizerState, now: number): TouchIntent[] {
     const out: TouchIntent[] = [];
+    reapStaleContacts(s, now, out);
     if (s.phase === Phase.pending && now >= s.longPressAt) {
         s.longPressAt = Infinity;
         s.phase = Phase.longPress;
@@ -409,12 +419,15 @@ function updateWheel(s: RecognizerState, out: TouchIntent[]): void {
  * Drop contacts whose lift never arrived. A pointerup/pointercancel CAN be lost (the
  * element goes away mid-gesture, the browser drops capture), and the slot table is
  * fixed-size: without this, MAX_CONTACTS lost lifts leave touch permanently dead with no
- * way back. Reaped through the cancel path so nothing is resolved as a tap.
+ * way back — and a lost lift under a held button latches that button forever. Driven from
+ * tick() as well as touchdown, so recovery does not depend on the player touching again.
+ * Reaped through the cancel path so nothing is resolved as a tap.
  */
 function reapStaleContacts(s: RecognizerState, now: number, out: TouchIntent[]): void {
+    const limit = s.heldButton === NO_BUTTON ? STALE_CONTACT_MS : STALE_HELD_CONTACT_MS;
     for (let i = s.count - 1; i >= 0; i--) {
         const slot = s.order[i]!;
-        if (now - s.seenT[slot]! < STALE_CONTACT_MS) continue;
+        if (now - s.seenT[slot]! < limit) continue;
         onCancel(s, { id: s.id[slot]!, phase: "cancel", x: s.cx[slot]!, y: s.cy[slot]! }, now, out);
     }
 }

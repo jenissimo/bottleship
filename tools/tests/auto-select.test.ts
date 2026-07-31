@@ -8,6 +8,7 @@ import {
     notePadPoll,
     padIsSteering,
     pickPreset,
+    shouldLatchAutoPreset,
     vkBitfield,
     type AutoSelectSignals,
 } from "../../src/input/auto-select";
@@ -92,6 +93,19 @@ describe("pickPreset", () => {
         for (const orientation of ["landscape", "portrait"] as const) {
             expect(pickPreset(signals({ orientation, polledVks: vkBitfield([VK_W]) })).presetId).toBe("wasd-look");
         }
+    });
+});
+
+describe("auto-pick latching", () => {
+    test("an empty boot snapshot keeps the pointer fallback provisional", () => {
+        expect(shouldLatchAutoPreset(pickPreset(signals()))).toBe(false);
+    });
+
+    test("later steering and bulk-keyboard signals become sticky", () => {
+        expect(shouldLatchAutoPreset(pickPreset(signals({ polledVks: vkBitfield([VK_W]) })))).toBe(true);
+        expect(shouldLatchAutoPreset(pickPreset(signals({ bulkKeyboard: true })))).toBe(true);
+        expect(shouldLatchAutoPreset(pickPreset(signals({ readsPad: true })))).toBe(true);
+        expect(shouldLatchAutoPreset(pickPreset(signals({ relativeMouse: true })))).toBe(true);
     });
 });
 

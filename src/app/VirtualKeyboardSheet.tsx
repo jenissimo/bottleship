@@ -1,6 +1,8 @@
-// On-screen keyboard. Position-fixed, and its pointer handlers stop propagation, so
-// it can be mounted anywhere — including inside `.app__panel`, without leaking a
-// contact into the touch driver's listeners.
+// On-screen keyboard. Position-fixed, and marked `data-touch-reserved`, so it can be
+// mounted anywhere — including inside `.app__panel` — without leaking a contact into
+// the guest: the touch driver claims contacts that start under that attribute. Its own
+// pointer handlers run too late to route anything (React delegates to the root
+// container, the driver listens natively on a descendant).
 //
 // It synthesizes VK NUMBERS straight through the input device. It is never the
 // OS soft keyboard and never a synthetic DOM KeyboardEvent, because App.tsx
@@ -130,7 +132,13 @@ const Sheet: React.FC<{ onClose: () => void }> = ({ onClose }) => {
     );
 
     return (
-        <div className={s["osk"]} onPointerDown={(e) => e.stopPropagation()} role="group" aria-label="On-screen keyboard">
+        <div
+            className={s["osk"]}
+            data-touch-reserved=""
+            onPointerDown={(e) => e.stopPropagation()}
+            role="group"
+            aria-label="On-screen keyboard"
+        >
             <div className={s["osk__bar"]}>
                 {ESSENTIALS.map(renderKey)}
                 {MODIFIERS.map((m) => (

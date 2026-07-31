@@ -90,6 +90,15 @@ export function pickPreset(signals: AutoSelectSignals): AutoSelectResult {
 }
 
 /**
+ * The pointer layout is already the resolver's fallback, so an empty boot-time
+ * snapshot must not make the one-shot auto picker sticky. A keyboard hint is a
+ * real observed signal even though it deliberately keeps the pointer preset.
+ */
+export function shouldLatchAutoPreset(result: AutoSelectResult): boolean {
+    return result.presetId !== PRESET_POINTER || result.hintKeyboard === true;
+}
+
+/**
  * A title that merely ENUMERATES a joystick at startup is not a title that steers
  * with one — and with a virtual pad always advertised on a touch device, that
  * boot-time check is something nearly every game does. So "reads a pad" means the

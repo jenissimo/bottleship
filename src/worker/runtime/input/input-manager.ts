@@ -206,6 +206,42 @@ function isToggleKey(vk: number): boolean {
     return vk === VK_CAPITAL || vk === VK_NUMLOCK || vk === VK_SCROLL;
 }
 
+/** [side-agnostic, left, right] for each modifier Windows keeps coherent. */
+const MODIFIER_SIDES: readonly (readonly [number, number, number])[] = [
+    [0x10, 0xA0, 0xA1], // VK_SHIFT / VK_LSHIFT / VK_RSHIFT
+    [0x11, 0xA2, 0xA3], // VK_CONTROL / VK_LCONTROL / VK_RCONTROL
+    [0x12, 0xA4, 0xA5], // VK_MENU / VK_LMENU / VK_RMENU
+];
+
+/** The side VKs, which never carry a window message of their own (see below). */
+const SIDE_MODIFIER_VK = new Set([0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5]);
+
+/**
+ * Make a modifier's side-agnostic VK and its two side VKs agree, the way the Windows
+ * keyboard driver does: it sets both halves, so GetKeyState(VK_SHIFT) answers for
+ * either side and GetKeyState(VK_LSHIFT) answers for a left-hand press. Our producers
+ * each publish only one half — a browser KeyboardEvent carries the agnostic VK
+ * (keyCode 16/17/18), the on-screen keyboard a side one — so the record is reconciled
+ * before anything diffs it. Without this a latched on-screen Shift is invisible to
+ * GetKeyState(VK_SHIFT), which is what shift-tab and shift-select are written against.
+ */
+function isVkSet(bits: Int32Array, vk: number): boolean {
+    return (bits[vk >> 5] & (1 << (vk & 31))) !== 0;
+}
+
+function setVk(bits: Int32Array, vk: number): void {
+    bits[vk >> 5] |= 1 << (vk & 31);
+}
+
+function reconcileModifierSides(bits: Int32Array): void {
+    for (const [both, left, right] of MODIFIER_SIDES) {
+        if (isVkSet(bits, left) || isVkSet(bits, right)) setVk(bits, both);
+        // Agnostic-only: the event carried no side, and the scan code Windows would
+        // have reported for it is the left one.
+        else if (isVkSet(bits, both)) setVk(bits, left);
+    }
+}
+
 // Modifiers never own the typematic schedule (Windows does not auto-repeat them),
 // but holding one must not cancel the repeat of the letter it modifies.
 const MODIFIER_VK = new Set([
@@ -478,6 +514,8 @@ export class InputManager {
         for (let word = 0; word < KEY_BITFIELD_COUNT; word++) {
             this.keyBitfieldSnapshot[word] = this.inputView[KEY_BITFIELD_BASE + word];
         }
+        // Whichever half of a modifier the producer knew about, both are down here.
+        reconcileModifierSides(this.keyBitfieldSnapshot);
 
         if (Atomics.load(this.inputView, INPUT_INDEX.seq) !== seq) return;
         this.lastSeq = seq;
@@ -768,9 +806,14 @@ export class InputManager {
                 for (let bit = 0; bit < 32; bit++) {
                     if (!(changed & (1 << bit))) continue;
                     const vk = word * 32 + bit;
+                    // Win32 posts VK_SHIFT/CONTROL/MENU in wParam and distinguishes the
+                    // side in lParam; the side VK never carries a message of its own, and
+                    // reconcileModifierSides guarantees its partner changed with it.
+                    if (SIDE_MODIFIER_VK.has(vk)) continue;
                     const pressed = (curr & (1 << bit)) !== 0;
-                    const scan = vkToScanCode(vk);
-                    const ext = isExtendedKey(vk) ? 0x01000000 : 0;
+                    const scanVk = this.modifierSideVk(vk, pressed);
+                    const scan = vkToScanCode(scanVk);
+                    const ext = isExtendedKey(scanVk) ? 0x01000000 : 0;
                     const keyLParam = pressed
                         ? (1 | (scan << 16) | ext)                           // WM_KEYDOWN: bit30=0 (was up), bit31=0 (pressed)
                         : ((1 | (scan << 16) | ext | 0xC0000000) >>> 0);    // WM_KEYUP:   bit30=1 (was down), bit31=1 (released)
@@ -805,6 +848,17 @@ export class InputManager {
         // Update prevKeyBitfield
         this.prevKeyBitfield.set(this.keyBitfieldSnapshot);
 
+    }
+
+    /** The VK whose scan code a modifier message reports: whichever side is down in the
+     *  record the edge came from — the previous one, for a release. */
+    private modifierSideVk(vk: number, pressed: boolean): number {
+        for (const [both, left, right] of MODIFIER_SIDES) {
+            if (vk !== both) continue;
+            const bits = pressed ? this.keyBitfieldSnapshot : this.prevKeyBitfield;
+            return isVkSet(bits, right) && !isVkSet(bits, left) ? right : left;
+        }
+        return vk;
     }
 
     /**
@@ -1013,6 +1067,20 @@ export class InputManager {
         if (k === 0x04) return (v[INPUT_INDEX.buttons] & 4) !== 0; // VK_MBUTTON
         const word = k >> 5;
         if (word >= KEY_BITFIELD_COUNT) return false;
+        // This reads the raw record, so it owes the same modifier coherence poll()
+        // applies to its snapshot (see reconcileModifierSides).
+        if ((k >= 0x10 && k <= 0x12) || (k >= 0xA0 && k <= 0xA5)) {
+            const agnostic = v[KEY_BITFIELD_BASE];     // VK 0x00-0x1F
+            const sides    = v[KEY_BITFIELD_BASE + 5]; // VK 0xA0-0xBF
+            for (const [both, left, right] of MODIFIER_SIDES) {
+                const b = (agnostic & (1 << both)) !== 0;
+                const l = (sides & (1 << (left & 31))) !== 0;
+                const r = (sides & (1 << (right & 31))) !== 0;
+                if (k === both) return b || l || r;
+                if (k === left) return l || (b && !r);
+                if (k === right) return r;
+            }
+        }
         return (v[KEY_BITFIELD_BASE + word] & (1 << (k & 31))) !== 0;
     }
 
@@ -1284,6 +1352,15 @@ export class InputManager {
     setDInputMouseBufferSize(size: number): void {
         this.dinputMouseBufferSize = size;
         this.dinputMouseEvents.length = 0;
+        this.baselineDInputMouse();
+    }
+
+    /** Snapshot the current pointer so Acquire/SetProperty does not replay the absolute
+     *  cursor position as the first DIMOFS_X/Y delta — a full-screen view snap. */
+    baselineDInputMouse(): void {
+        this.dinputPrevMouseX = this.lastSabMouseX;
+        this.dinputPrevMouseY = this.lastSabMouseY;
+        this.dinputPrevButtons = this.currentButtons;
     }
 
     /** Get DirectInput mouse buffer size. */
@@ -1510,6 +1587,17 @@ export class InputManager {
             buttons: this.gamepadButtons,
             axes: this.gamepadAxes
         };
+    }
+
+    /**
+     * Same level, for a read the GUEST did not ask for: joySetCapture's own poll timer,
+     * diagnostics, the harness. Callers on this path must NOT stamp
+     * noteGuestGamepadRead() — the control-layout auto-select reads that counter as "the
+     * game is steering with a pad", and a host-side timer would hold it on for a title
+     * that only ever registered a capture window.
+     */
+    peekGamepadStateWithoutUsage(): { connected: boolean; buttons: number; axes: [number, number, number, number] } {
+        return this.getGamepadState();
     }
 
     /**

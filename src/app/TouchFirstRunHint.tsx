@@ -48,6 +48,10 @@ export const TouchFirstRunHint: React.FC<TouchFirstRunHintProps> = ({ active, tr
     return (
         <div
             className={s["hint"]}
+            // The touch driver claims contacts that start under this attribute, so the
+            // tap that dismisses the card is not also a click in the guest. React's
+            // delegated handler below runs after the driver's native one and cannot.
+            data-touch-reserved=""
             role="note"
             onPointerDown={(e) => { e.stopPropagation(); dismiss(); }}
         >

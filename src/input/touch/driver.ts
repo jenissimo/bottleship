@@ -6,6 +6,11 @@
 // that starts on bare canvas both arrive here and are routed by a hit test. A layer
 // root with pointer-events:none is not a hit-test target and would never see the
 // second kind at all.
+//
+// ROUTING IS DECIDED HERE, never in a React handler. These are native listeners on a
+// descendant of the React root container, so they run BEFORE any delegated React
+// handler on the element that was actually touched — an overlay's stopPropagation()
+// arrives after we have already fed the contact to the recognizer.
 
 import { inputDevice } from "../virtual-device";
 import { relativeIntent } from "../relative-intent";
@@ -37,12 +42,24 @@ export interface TouchDriverOptions {
     getSettings: () => TouchSettings;
     /**
      * On-screen controls claim a contact before the translator sees it. Returns true
-     * when the widget layer consumed it.
+     * when the widget layer consumed it. Contacts on a [data-touch-reserved] overlay
+     * never get here — the shell owns those outright.
      */
     hitTest?: (clientX: number, clientY: number, pointerId: number, phase: TouchEvent2["phase"]) => boolean;
 }
 
 const isTouchLike = (type: string): boolean => type === "touch" || type === "pen";
+
+/** Shell affordances (touch HUD, on-screen keyboard, first-run hint) mark the pixels
+ *  they own with this attribute; the same one the control layer avoids placing over. */
+const RESERVED_SELECTOR = "[data-touch-reserved]";
+
+function isReserved(target: EventTarget | null): boolean {
+    // Duck-typed, not `instanceof Element`: the check must survive a contact whose
+    // target came from another realm (an iframe/portal) as readily as a test's stand-in.
+    const el = target as Element | null;
+    return typeof el?.closest === "function" && el.closest(RESERVED_SELECTOR) !== null;
+}
 
 export class TouchDriver {
     private panel: HTMLElement | null = null;
@@ -51,7 +68,10 @@ export class TouchDriver {
     private raf = 0;
     /** Contacts the widget layer owns; the translator must ignore their whole life. */
     private readonly claimed = new Set<number>();
-    private active = 0;
+    /** Contacts the translator is tracking. Touch pointers get IMPLICIT capture, so
+     *  lostpointercapture fires after every normal pointerup — membership, not a
+     *  counter, is what keeps one contact from being ended twice. */
+    private readonly live = new Set<number>();
 
     attach(panel: HTMLElement, opts: TouchDriverOptions): () => void {
         this.detach();
@@ -77,9 +97,24 @@ export class TouchDriver {
         this.opts = null;
         this.stopPump();
         this.claimed.clear();
-        this.active = 0;
+        this.live.clear();
         inputDevice.releaseSource("touch");
         inputDevice.commit({ immediate: true });
+    }
+
+    /**
+     * Focus loss, tab hide, game switch: forget every contact and whatever the
+     * recognizer was holding. Releasing the touch SOURCE alone is not enough — the
+     * recognizer would still believe its button is down, and syncButton only emits
+     * edges, so the press would never be re-published. The caller owns the flush.
+     */
+    reset(): void {
+        this.stopPump();
+        this.claimed.clear();
+        this.live.clear();
+        // Settings latched for the current gesture are still the settings.
+        this.recognizer = createRecognizer(this.recognizer.cfg);
+        inputDevice.releaseSource("touch");
     }
 
     /** Effective mode for the next gesture. */
@@ -96,16 +131,23 @@ export class TouchDriver {
         if (!isTouchLike(event.pointerType)) return;
         const opts = this.opts;
         if (!opts) return;
+        // A shell affordance owns its pixels for the whole life of the contact — and owns
+        // it alone, so the id goes into neither table and every later event for it falls
+        // through both lookups untouched.
+        if (isReserved(event.target)) return;
         if (opts.hitTest?.(event.clientX, event.clientY, event.pointerId, "down")) {
             this.claimed.add(event.pointerId);
             return;
         }
+        // Only the picture is the guest's. A contact starting on a letterbox bar would
+        // otherwise be clamped onto the nearest guest edge and click there on lift.
+        if (!this.onPicture(event)) return;
         const settings = opts.getSettings();
         if (this.modeFor(settings) === null) return;
         // Config is latched between gestures: a mid-drag ShowCursor(FALSE) must not
         // change what the finger already on the glass means.
         if (isIdle(this.recognizer)) this.reconfigure(settings);
-        this.active++;
+        this.live.add(event.pointerId);
         inputDevice.setMouseInside(true, "touch");
         this.feed(event, "down");
         this.startPump();
@@ -117,6 +159,7 @@ export class TouchDriver {
             this.opts?.hitTest?.(event.clientX, event.clientY, event.pointerId, "move");
             return;
         }
+        if (!this.live.has(event.pointerId)) return;
         this.feed(event, "move");
     };
 
@@ -126,7 +169,7 @@ export class TouchDriver {
             this.opts?.hitTest?.(event.clientX, event.clientY, event.pointerId, "up");
             return;
         }
-        this.active = Math.max(0, this.active - 1);
+        if (!this.live.delete(event.pointerId)) return;
         this.feed(event, "up");
     };
 
@@ -136,9 +179,17 @@ export class TouchDriver {
             this.opts?.hitTest?.(event.clientX, event.clientY, event.pointerId, "cancel");
             return;
         }
-        this.active = Math.max(0, this.active - 1);
+        if (!this.live.delete(event.pointerId)) return;
         this.feed(event, "cancel");
     };
+
+    /** Is this contact on the guest picture, as opposed to the letterbox or the panel? */
+    private onPicture(event: PointerEvent): boolean {
+        const rect = this.opts?.getCanvasRect();
+        if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+        return event.clientX >= rect.left && event.clientX < rect.right
+            && event.clientY >= rect.top && event.clientY < rect.bottom;
+    }
 
     private reconfigure(settings: TouchSettings): void {
         const mode = this.modeFor(settings);
@@ -223,9 +274,12 @@ export class TouchDriver {
             this.raf = 0;
             const scale = this.guestPerCss();
             this.emit(tick(this.recognizer, now), scale);
-            if (!isIdle(this.recognizer) || this.active > 0) {
+            // The recognizer is the liveness authority — it also reaps contacts whose
+            // lift never arrived, and those ids must not outlive it here.
+            if (!isIdle(this.recognizer)) {
                 this.raf = requestAnimationFrame(pump);
             } else {
+                this.live.clear();
                 inputDevice.setMouseInside(false, "touch");
                 inputDevice.commit();
             }

@@ -116,6 +116,11 @@ type InputSample = {
   gamepadAxis2: number;
   gamepadAxis3: number;
   mouseWheel: number;
+  /** DirectInput device deltas contributed by this event. Absent in older recordings;
+   *  without them a relative-mouse title (pointer-locked, absolute slots frozen)
+   *  replays as a session where nothing moved. */
+  dinputDX?: number;
+  dinputDY?: number;
 };
 
 function bytesToBase64(bytes: Uint8Array): string {
@@ -167,11 +172,17 @@ let isRecording = false;
 let recordStart = 0;
 let recordedInputs: InputSample[] = [];
 
-/** Capture the published record for playRecording(). No-op unless recording. */
-function recordSample(inputView: Int32Array, keyCode = 0, keyState = 0): void {
+/** Capture the published record for playRecording(). No-op unless recording.
+ *  dinputDX/DY are the deltas this event ADDED to the accumulators, not their running
+ *  total — the slots are monotonic counters the worker never drains. */
+function recordSample(
+    inputView: Int32Array, keyCode = 0, keyState = 0, dinputDX = 0, dinputDY = 0,
+): void {
     if (!isRecording) return;
     recordedInputs.push({
         t: performance.now() - recordStart,
+        dinputDX,
+        dinputDY,
         mouseX: inputView[INPUT_INDEX.mouseX],
         mouseY: inputView[INPUT_INDEX.mouseY],
         buttons: inputView[INPUT_INDEX.buttons],
@@ -534,7 +545,10 @@ export default function App() {
       selectedGame.id === "dev" ? loadParam : selectedGame.wgbUrl,
       { preload: selectedGame.preload === true },
     );
-  }, [browserSupport.supported, selectedGame, workerStatus, webgpuProbe]);
+    // launchBlocked, not its inputs: the deployment policy resolves asynchronously and
+    // may be the LAST of them to arrive. Depending on the others only, the one run that
+    // saw a blocked launch would also be the last, and the game would never start.
+  }, [launchBlocked, selectedGame, workerStatus]);
 
   // Cover the worker/v86 boot phase too: before the worker posts "ready" there is no
   // load_bundle progress yet, so without this the user stares at a bare canvas while
@@ -633,6 +647,19 @@ export default function App() {
       // ignore localStorage errors in restricted contexts
     }
   }, [uiSettings]);
+
+  // `assertVirtualPad` intentionally survives a collapsed touch overlay so games
+  // that enumerate once still see a controller. "Off" is different: it is an
+  // explicit unplug request and must clear that source even when no control layer
+  // is mounted to perform its normal detach cleanup.
+  useEffect(() => {
+    if (uiSettings.touchMode === "off") {
+      inputDevice.releaseSource("touch");
+      inputDevice.commit({ immediate: true });
+      return;
+    }
+    assertVirtualPad();
+  }, [assertVirtualPad, uiSettings.touchMode]);
 
   // Keep the pause ref current for the core-I/O effect's callbacks (audio-resume
   // gating). Isolated so pause/resume toggles this cheap effect instead of
@@ -749,18 +776,7 @@ export default function App() {
         return view ? { x: view[INPUT_INDEX.mouseX]!, y: view[INPUT_INDEX.mouseY]! } : null;
       },
       getGeometry: () => {
-        // Self-checking cache: a guest mode switch (800x600 → 640x480) resizes the canvas
-        // between the events that refresh it, and a stale rect silently rescales every
-        // drawn position — the pointer then tracks a screen the guest no longer has.
-        // clientWidth costs nothing unless layout is already dirty, which is exactly when
-        // the cached value is wrong.
-        let rect = canvasRectRef.current;
-        if (!rect
-            || Math.abs(rect.width - canvas.clientWidth) > 0.5
-            || Math.abs(rect.height - canvas.clientHeight) > 0.5) {
-          measureRects();
-          rect = canvasRectRef.current;
-        }
+        const rect = liveCanvasRect();
         if (!rect || rect.width <= 0 || rect.height <= 0) return null;
         const origin = panelRectRef.current;
         const space =
@@ -802,8 +818,34 @@ export default function App() {
       canvasRectRef.current = canvas.getBoundingClientRect();
       panelRectRef.current = panelRef.current?.getBoundingClientRect() ?? null;
     };
+    // Self-checking cache: a guest mode switch (800x600 → 640x480) resizes the canvas
+    // between the events that refresh the rects, and a stale rect silently rescales every
+    // mapped position — the pointer then tracks a screen the guest no longer has.
+    // clientWidth costs nothing unless layout is already dirty, which is exactly when the
+    // cached value is wrong; getBoundingClientRect would FORCE that flush every time.
+    const liveCanvasRect = (): DOMRect | null => {
+      const rect = canvasRectRef.current;
+      if (!rect
+          || Math.abs(rect.width - canvas.clientWidth) > 0.5
+          || Math.abs(rect.height - canvas.clientHeight) > 0.5) {
+        measureRects();
+        return canvasRectRef.current;
+      }
+      return rect;
+    };
+    // The guest is addressed in this space, and the device clamps every publication
+    // against it. Established here, not on the first pointer event: a guest SetCursorPos
+    // can arrive before the user has touched anything, and 1x1 bounds warp it to (0,0).
+    const syncPointerBounds = () => {
+      const space =
+        mouseCoordinateModeRef.current === "guest"
+          ? guestResolutionRef.current
+          : resolutionRef.current;
+      inputDevice.setPointerBounds(Math.max(1, space.width), Math.max(1, space.height));
+    };
     const captureRects = () => {
       measureRects();
+      syncPointerBounds();
       guestCursor.sync();
     };
 
@@ -1373,6 +1415,7 @@ export default function App() {
         inputDevice.releaseAllSources();
         // No flush until the pad is re-asserted — see handleBlur.
         touchControlsRef.current?.releaseAll(false);
+        touchDriver.reset();
         assertVirtualPad();
         inputDevice.commit({ immediate: true });
         relativeIntent.reset();
@@ -1578,6 +1621,7 @@ export default function App() {
         );
         inputDevice.setButtonsMask(event.buttons, "hw-mouse");
         inputDevice.commit();
+        recordSample(inputView, 0, 0, event.movementX, event.movementY);
         return;
       }
 
@@ -1604,10 +1648,12 @@ export default function App() {
         (event.clientY - rect.top) * scaleY,
       );
       inputDevice.setButtonsMask(event.buttons, "hw-mouse");
-      Atomics.add(inputView, INPUT_INDEX.dinputDX, Math.round(event.movementX * scaleX));
-      Atomics.add(inputView, INPUT_INDEX.dinputDY, Math.round(event.movementY * scaleY));
+      const dinputDX = Math.round(event.movementX * scaleX);
+      const dinputDY = Math.round(event.movementY * scaleY);
+      Atomics.add(inputView, INPUT_INDEX.dinputDX, dinputDX);
+      Atomics.add(inputView, INPUT_INDEX.dinputDY, dinputDY);
       inputDevice.commit();
-      recordSample(inputView);
+      recordSample(inputView, 0, 0, dinputDX, dinputDY);
     };
 
     const handlePointerEnter = (event?: PointerEvent) => {
@@ -1744,13 +1790,12 @@ export default function App() {
     canvas.addEventListener("contextmenu", handleContextMenu);
 
     const panel = panelRef.current;
-    /** Is this client point on the guest screen? Measured from the LIVE rect: the cache can
-     *  still hold the pre-switch size right after a guest mode change. */
+    /** Is this client point on the guest screen? */
     const updatePointerOverCanvas = (event: PointerEvent | null) => {
       let over = false;
       if (event) {
-        const rect = canvas.getBoundingClientRect();
-        over = rect.width > 0 && rect.height > 0
+        const rect = liveCanvasRect();
+        over = !!rect && rect.width > 0 && rect.height > 0
           && event.clientX >= rect.left && event.clientX < rect.right
           && event.clientY >= rect.top && event.clientY < rect.bottom;
       }
@@ -1760,15 +1805,20 @@ export default function App() {
     };
     // On the PANEL, so a move across the letterbox is seen even though the canvas — which
     // is what we are hit-testing against — receives nothing out there.
-    const handlePanelMove = (event: PointerEvent) => {
-      if (event.pointerType !== "mouse") return;
+    // Touch counts too: a contact IS the pointer, and it is the only thing that puts a
+    // pointer on the picture on a device with no mouse — without it the guest's cursor is
+    // never drawn there and the fingertip offset has nothing to offset.
+    const handlePanelPointer = (event: PointerEvent) => {
       updatePointerOverCanvas(event);
     };
     const handlePanelLeave = (event: PointerEvent) => {
+      // Touch leaves on every lift, and the guest's cursor stays where the finger put it;
+      // only a real hovering pointer can be somewhere else.
       if (event.pointerType !== "mouse") return;
       updatePointerOverCanvas(null);
     };
-    panel?.addEventListener("pointermove", handlePanelMove);
+    panel?.addEventListener("pointerdown", handlePanelPointer);
+    panel?.addEventListener("pointermove", handlePanelPointer);
     panel?.addEventListener("pointerleave", handlePanelLeave);
     
     const handleWheel = (event: WheelEvent) => {
@@ -1861,6 +1911,10 @@ export default function App() {
       // frame where the pad is released but not yet re-asserted, which reads as a
       // controller unplug on every tab hide.
       touchControlsRef.current?.releaseAll(false);
+      // The gesture state machine has to forget the contact too — zeroing the source
+      // level while the recognizer still believes its button is down leaves an edge
+      // emitter with nothing to emit, and the drag stays dead until the finger lifts.
+      touchDriver.reset();
       // Losing focus releases what was held; it does not unplug the controller.
       assertVirtualPad();
       inputDevice.commit({ immediate: true });
@@ -1954,6 +2008,11 @@ export default function App() {
     const applyInputSample = (sample: InputSample) => {
       if (!globalInputView) return;
       inputDevice.setPointerAbsolute(sample.mouseX, sample.mouseY);
+      // The absolute position is authoritative on replay, so feed the device deltas
+      // through the RAW channel only — a relative-mouse title reads nothing else.
+      if (sample.dinputDX || sample.dinputDY) {
+        inputDevice.addPointerRelative(0, 0, sample.dinputDX ?? 0, sample.dinputDY ?? 0);
+      }
       inputDevice.setButtonsMask(sample.buttons, "replay");
       if (sample.keyCode) inputDevice.setKey(sample.keyCode, sample.keyState === 1, "replay");
       inputDevice.publishPad({
@@ -2199,7 +2258,8 @@ export default function App() {
       canvas.removeEventListener("pointerup", handlePointerUp);
       canvas.removeEventListener("pointerenter", handlePointerEnter);
       canvas.removeEventListener("pointerleave", handlePointerLeave);
-      panel?.removeEventListener("pointermove", handlePanelMove);
+      panel?.removeEventListener("pointerdown", handlePanelPointer);
+      panel?.removeEventListener("pointermove", handlePanelPointer);
       panel?.removeEventListener("pointerleave", handlePanelLeave);
       canvas.removeEventListener("contextmenu", handleContextMenu);
       window.removeEventListener("keydown", handleKeyDown, true);
@@ -2417,7 +2477,10 @@ export default function App() {
   const handleHostAction = useCallback((action: HostAction) => {
     switch (action) {
       case "fullscreen": toggleFullscreenRef.current(); break;
-      case "pause": setIsPaused((p) => !p); break;
+      // The real toggle: the HUD is the only pause affordance on a keyboard-less
+      // device, and flipping the flag alone leaves the emulator running with audio
+      // that can never resume (isPausedRef then suppresses every resume attempt).
+      case "pause": void togglePause(); break;
       case "keyboard": setOskOpen((v) => !v); break;
       case "toggleControls": setControlsHidden((v) => !v); break;
       case "releaseRelative":
@@ -2427,7 +2490,7 @@ export default function App() {
         break;
       case "editLayout": break;
     }
-  }, []);
+  }, [togglePause]);
 
   const toggleFullscreen = useCallback(async () => {
     const panel = panelRef.current;
