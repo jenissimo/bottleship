@@ -8,9 +8,10 @@
 import { describe, expect, it } from "bun:test";
 import {
     gatherVertices, decodeIndices, sequentialIndices, guestViews,
-    cvaLock, cvaUnlock, createCvaState, VertexSpace,
+    cvaLock, cvaUnlock, createCvaState, VertexSpace, validateClientArrayRange,
 } from "../../src/worker/modules/opengl32/client-arrays";
 import { VERT_FLOATS, mat4Identity, type OpenGLContext } from "../../src/worker/modules/opengl32/context";
+import { createArrayExports } from "../../src/worker/modules/opengl32/arrays";
 
 const GL_BYTE = 0x1400;
 const GL_FLOAT = 0x1406;
@@ -19,6 +20,13 @@ const GL_SHORT = 0x1402;
 const GL_UNSIGNED_BYTE = 0x1401;
 const GL_UNSIGNED_SHORT = 0x1403;
 const GL_UNSIGNED_INT = 0x1405;
+const GL_TRIANGLES = 0x0004;
+const GL_INVALID_ENUM = 0x0500;
+const GL_INVALID_OPERATION = 0x0502;
+const GL_V3F = 0x2A21;
+const GL_C4UB_V3F = 0x2A23;
+const GL_T2F_V3F = 0x2A27;
+const GL_T4F_C4F_N3F_V4F = 0x2A2D;
 
 const GL_VERTEX_ARRAY_SLOT = { size: 3, type: GL_FLOAT, stride: 0, pointer: 0, enabled: false };
 
@@ -38,10 +46,12 @@ function makeCtx(memBytes = 1 << 16) {
         ],
         currentColor: new Float32Array([0.25, 0.5, 0.75, 1]),
         currentNormal: new Float32Array([0, 0, 1]),
+        clientActiveTextureUnit: 0,
         enableFlags: new Set<number>(),
         cva: createCvaState(),
         modelviewStack: stack(ident),
         projectionStack: stack(ident2),
+        error: 0,
     } as unknown as OpenGLContext;
     return { ctx, mem };
 }
@@ -65,17 +75,130 @@ describe("index decode", () => {
         dv.setUint32(0x300, 123456, true); dv.setUint32(0x304, 3, true);
         const v = guestViews(ctx);
 
-        expect(Array.from(decodeIndices(v, 0x100, GL_UNSIGNED_BYTE, 3).subarray(0, 3))).toEqual([7, 2, 9]);
-        expect(Array.from(decodeIndices(v, 0x200, GL_UNSIGNED_SHORT, 2).subarray(0, 2))).toEqual([5, 40000]);
-        expect(Array.from(decodeIndices(v, 0x300, GL_UNSIGNED_INT, 2).subarray(0, 2))).toEqual([123456, 3]);
+        expect(Array.from(decodeIndices(v, 0x100, GL_UNSIGNED_BYTE, 3)!.subarray(0, 3))).toEqual([7, 2, 9]);
+        expect(Array.from(decodeIndices(v, 0x200, GL_UNSIGNED_SHORT, 2)!.subarray(0, 2))).toEqual([5, 40000]);
+        expect(Array.from(decodeIndices(v, 0x300, GL_UNSIGNED_INT, 2)!.subarray(0, 2))).toEqual([123456, 3]);
     });
 
     it("reads a misaligned index pointer through the fallback", () => {
         const { ctx, mem } = makeCtx();
         const dv = new DataView(mem.buffer);
         dv.setUint16(0x201, 4242, true); // odd address: no Uint16Array fast path
-        const idx = decodeIndices(guestViews(ctx), 0x201, GL_UNSIGNED_SHORT, 1);
+        const idx = decodeIndices(guestViews(ctx), 0x201, GL_UNSIGNED_SHORT, 1)!;
         expect(idx[0]).toBe(4242);
+    });
+
+    // Real GL raises GL_INVALID_ENUM and draws nothing. A zero-filled scratch would draw
+    // `count` copies of vertex 0 — invisible garbage that also pins the CVA range to [0,0].
+    it("refuses an index type GL does not define", () => {
+        const { ctx } = makeCtx();
+        expect(decodeIndices(guestViews(ctx), 0x100, GL_FLOAT, 4)).toBeNull();
+    });
+
+    it("raises GL_INVALID_ENUM and draws nothing for a bad glDrawElements type", () => {
+        const { ctx, mem } = makeCtx();
+        setupPositions(ctx, mem, [1, 2, 3]);
+        const api = createArrayExports(ctx);
+        api["glDrawElements"]!({} as any, mem, [GL_TRIANGLES, 3, GL_FLOAT, 0x6000] as any);
+        expect(ctx.error).toBe(GL_INVALID_ENUM);
+    });
+});
+
+describe("draw-range validation", () => {
+    it("accepts a draw whose arrays are fully inside guest memory", () => {
+        const { ctx, mem } = makeCtx();
+        setupPositions(ctx, mem, [1, 2, 3]);
+        sequentialIndices(0, 3);
+        expect(validateClientArrayRange(ctx, 0, 2)).toBe(true);
+    });
+
+    // Unchecked, the typed-array gather reads undefined -> NaN vertices and the DataView
+    // gather throws a RangeError the dispatcher swallows: a silently dropped draw.
+    it("rejects an index that walks the position array past the end of guest memory", () => {
+        const { ctx, mem } = makeCtx(1 << 12);
+        ctx.vertexArray = { size: 3, type: GL_FLOAT, stride: 12, pointer: 0xF00, enabled: true };
+        expect(validateClientArrayRange(ctx, 0, 0)).toBe(true);
+        expect(validateClientArrayRange(ctx, 0, 100000)).toBe(false);
+    });
+
+    it("rejects on any enabled array, not just the position one", () => {
+        const { ctx, mem } = makeCtx(1 << 12);
+        writeF32(mem, 0x100, [1, 0, 0, 2, 0, 0]);
+        ctx.vertexArray = { size: 3, type: GL_FLOAT, stride: 0, pointer: 0x100, enabled: true };
+        ctx.colorArray = { size: 4, type: GL_UNSIGNED_BYTE, stride: 4, pointer: 0xFF0, enabled: true };
+        expect(validateClientArrayRange(ctx, 0, 1)).toBe(true);
+        expect(validateClientArrayRange(ctx, 0, 64)).toBe(false);
+    });
+
+    it("ignores disabled and null-pointer arrays", () => {
+        const { ctx } = makeCtx(1 << 12);
+        ctx.vertexArray = { size: 3, type: GL_FLOAT, stride: 12, pointer: 0xF00, enabled: false };
+        ctx.colorArray = { size: 4, type: GL_FLOAT, stride: 16, pointer: 0, enabled: true };
+        expect(validateClientArrayRange(ctx, 0, 100000)).toBe(true);
+    });
+
+    it("fails the draw loudly instead of emitting NaN geometry", () => {
+        const { ctx, mem } = makeCtx(1 << 12);
+        ctx.vertexArray = { size: 3, type: GL_FLOAT, stride: 12, pointer: 0xF00, enabled: true };
+        const api = createArrayExports(ctx);
+        api["glDrawArrays"]!({} as any, mem, [GL_TRIANGLES, 0, 6000] as any);
+        expect(ctx.error).toBe(GL_INVALID_OPERATION);
+    });
+});
+
+describe("glInterleavedArrays", () => {
+    function interleave(format: number, stride: number, pointer: number) {
+        const { ctx, mem } = makeCtx();
+        const api = createArrayExports(ctx);
+        api["glInterleavedArrays"]!({} as any, mem, [format, stride, pointer] as any);
+        return ctx;
+    }
+
+    it("sets position only for GL_V3F and disables the rest", () => {
+        const ctx = interleave(GL_V3F, 0, 0x1000);
+        expect(ctx.vertexArray).toMatchObject({ enabled: true, size: 3, type: GL_FLOAT, stride: 12, pointer: 0x1000 });
+        expect(ctx.colorArray.enabled).toBe(false);
+        expect(ctx.normalArray.enabled).toBe(false);
+        expect(ctx.texCoordArrays[0].enabled).toBe(false);
+    });
+
+    it("places the packed colour before the position for GL_C4UB_V3F", () => {
+        const ctx = interleave(GL_C4UB_V3F, 0, 0x2000);
+        expect(ctx.colorArray).toMatchObject({ enabled: true, size: 4, type: GL_UNSIGNED_BYTE, stride: 16, pointer: 0x2000 });
+        expect(ctx.vertexArray).toMatchObject({ enabled: true, size: 3, stride: 16, pointer: 0x2004 });
+    });
+
+    it("lays out the widest format at the spec's offsets", () => {
+        const ctx = interleave(GL_T4F_C4F_N3F_V4F, 0, 0x100);
+        expect(ctx.texCoordArrays[0]).toMatchObject({ enabled: true, size: 4, stride: 60, pointer: 0x100 });
+        expect(ctx.colorArray).toMatchObject({ enabled: true, size: 4, type: GL_FLOAT, stride: 60, pointer: 0x110 });
+        expect(ctx.normalArray).toMatchObject({ enabled: true, size: 3, stride: 60, pointer: 0x120 });
+        expect(ctx.vertexArray).toMatchObject({ enabled: true, size: 4, stride: 60, pointer: 0x12c });
+    });
+
+    it("honours an explicit stride over the packed one", () => {
+        const ctx = interleave(GL_T2F_V3F, 64, 0x300);
+        expect(ctx.texCoordArrays[0].stride).toBe(64);
+        expect(ctx.vertexArray.stride).toBe(64);
+        expect(ctx.vertexArray.pointer).toBe(0x308);
+    });
+
+    it("rejects an unknown format without touching the arrays", () => {
+        const ctx = interleave(0x1234, 0, 0x400);
+        expect(ctx.error).toBe(GL_INVALID_ENUM);
+        expect(ctx.vertexArray.enabled).toBe(false);
+    });
+
+    // A gather after it must actually read the packed buffer, not stale state.
+    it("makes the following draw read the interleaved buffer", () => {
+        const { ctx, mem } = makeCtx();
+        writeF32(mem, 0x1000, [0.5, 0.75, 1, 2, 3]); // T2F_V3F: s,t then x,y,z
+        const api = createArrayExports(ctx);
+        api["glInterleavedArrays"]!({} as any, mem, [GL_T2F_V3F, 0, 0x1000] as any);
+        const dst = new Float32Array(VERT_FLOATS);
+        gatherVertices(ctx, sequentialIndices(0, 1), 1, dst, 0, false);
+        expect(vert(dst, 0).slice(0, 4)).toEqual([1, 2, 3, 1]);
+        expect(vert(dst, 0).slice(11, 13)).toEqual([0.5, 0.75]);
     });
 });
 

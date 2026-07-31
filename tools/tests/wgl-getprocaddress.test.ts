@@ -9,9 +9,15 @@
  * entry point NULL" as fatal, so the two lookups disagreeing is a hard stop
  * rather than a degraded-quality path.
  *
+ * The two DO differ on one point, deliberately: GetProcAddress may hand back a stub for
+ * a declared-but-unimplemented export, whereas for wglGetProcAddress NULL is the
+ * documented "this extension is absent" answer — a non-NULL pointer tells the engine the
+ * extension is present, so it calls it and believes the garbage return.
+ *
  * Contract mirrored from the WGL spec / Wine's wglGetProcAddress:
  *   - no current context            -> NULL
  *   - name not provided             -> NULL
+ *   - declared but not implemented  -> NULL
  *   - provided entry point          -> the callable stub address
  */
 
@@ -21,9 +27,18 @@ import { resolveHleExportAddress } from "../../src/worker/core/thunking/export-r
 
 const NAME_PTR = 0x1000;
 
-/** ThunkGenerator stand-in: only the lookups the early-return path uses. */
-function makeDispatcher(stubs: Record<string, number>) {
+/**
+ * ThunkGenerator + dispatcher stand-in: the lookups the early-return path uses, plus the
+ * address -> stub -> registered-handler introspection wglGetProcAddress gates on.
+ * `unimplemented` names resolve to an address whose functionId has no handler.
+ */
+function makeDispatcher(stubs: Record<string, number>, unimplemented: readonly string[] = []) {
     const lookups: string[] = [];
+    const dead = new Set<number>();
+    for (const name of unimplemented) {
+        const addr = stubs[`opengl32:${name}`.toLowerCase()] ?? stubs[name.toLowerCase()];
+        if (addr !== undefined) dead.add(addr >>> 0);
+    }
     return {
         lookups,
         thunkGenerator: {
@@ -32,13 +47,16 @@ function makeDispatcher(stubs: Record<string, number>) {
                 lookups.push(key);
                 return stubs[key.toLowerCase()];
             },
+            getStubByAddress: (addr: number) => ({ functionId: addr >>> 0 }),
         },
+        getImplementationInfo: (functionId: number) =>
+            dead.has(functionId >>> 0) ? null : { arity: 3, argCount: 1 },
     };
 }
 
-function makeHarness(stubs: Record<string, number>) {
+function makeHarness(stubs: Record<string, number>, unimplemented: readonly string[] = []) {
     const mem = new Uint8Array(0x8000);
-    const dispatcher = makeDispatcher(stubs);
+    const dispatcher = makeDispatcher(stubs, unimplemented);
     // ctx.presenter left undefined so wglMakeCurrent stays free of System singletons.
     const ctx: any = {
         process: { getCurrentMemory: () => mem, dispatcher },
@@ -115,6 +133,27 @@ describe("wglGetProcAddress", () => {
         const h = makeHarness({ "opengl32:": 0x21000050 });
         h.makeCurrent();
         expect(h.gpa("")).toBe(0);
+    });
+
+    // The API descriptor carrying a signature only means the name is DECLARED. Handing
+    // its stub out claims the extension exists; the guest then calls it and takes the
+    // untouched-out-param garbage as a real answer.
+    test("returns NULL for a declared entry point with no registered handler", () => {
+        const h = makeHarness(
+            { "opengl32:glsomethingdeclaredonly": 0x21000060 },
+            ["glSomethingDeclaredOnly"],
+        );
+        h.makeCurrent();
+        expect(h.gpa("glSomethingDeclaredOnly")).toBe(0);
+    });
+
+    test("an ARB alias of an unimplemented core function is NULL too", () => {
+        const h = makeHarness(
+            { "opengl32:glmultitexcoord1f": 0x21000070 },
+            ["glMultiTexCoord1f"],
+        );
+        h.makeCurrent();
+        expect(h.gpa("glMultiTexCoord1fARB")).toBe(0);
     });
 });
 

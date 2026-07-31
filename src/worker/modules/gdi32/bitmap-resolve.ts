@@ -179,6 +179,48 @@ export function resolveDibSectionRectRgba(
 }
 
 /**
+ * A DIBSection's pixel surface IS its guest bits — every GDI draw into a DC with one
+ * selected must land there, because apps read the bits back and post-process them, and
+ * because the canvas is re-materialized FROM those bits on the next SelectObject (a
+ * draw that never wrote back is discarded there). Mirrors the canvas rect into 32bpp
+ * bits as B,G,R, preserving the reserved/alpha byte the app owns. No-op for anything
+ * that is not a 32bpp DIBSection.
+ */
+export function writeBackDibSectionRect(
+    hBitmap: number,
+    ctx: OffscreenCanvasRenderingContext2D,
+    x: number, y: number, width: number, height: number,
+): void {
+    if (!hBitmap) return;
+    const obj = unwrapBitmapObj(hBitmap);
+    if (!obj || !obj.bitsPtr || !obj.dibStride || (obj.dibBpp ?? 32) !== 32) return;
+    // Per-pixel write-back below; getCurrentMemory() hands out v86's Proxy, whose
+    // per-element trap V8 cannot JIT. Nothing here re-enters the guest, so the plain
+    // view cannot go stale mid-call.
+    const mem = toPlainGuestMemory(System.getInstance().process?.getCurrentMemory?.());
+    if (!mem) return;
+    const bw = obj.width ?? 0, bh = obj.height ?? 0;
+    const cx = Math.max(0, x | 0), cy = Math.max(0, y | 0);
+    const cw = Math.min(width | 0, bw - cx), ch = Math.min(height | 0, bh - cy);
+    if (cw <= 0 || ch <= 0) return;
+    // Raw writes below — validate the whole section range once (§3.1).
+    if (obj.bitsPtr + obj.dibStride * bh > mem.length) return;
+    let img: ImageData;
+    try { img = ctx.getImageData(cx, cy, cw, ch); } catch { return; }
+    const src = img.data;
+    for (let ry = 0; ry < ch; ry++) {
+        const dibY = obj.dibTopDown ? cy + ry : bh - 1 - (cy + ry);
+        let o = obj.bitsPtr + dibY * obj.dibStride + cx * 4;
+        let si = ry * cw * 4;
+        for (let rx = 0; rx < cw; rx++, o += 4, si += 4) {
+            mem[o] = src[si + 2];
+            mem[o + 1] = src[si + 1];
+            mem[o + 2] = src[si];
+        }
+    }
+}
+
+/**
  * Raw-alpha 32bpp DIBSection read for XP+ alpha-cursor detection: returns the
  * pixels honoring the alpha byte, or null when the bits carry no alpha at all
  * (or the bitmap is not a 32bpp DIBSection).

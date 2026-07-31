@@ -212,6 +212,9 @@ export function textOut(gdi: GDIContext, hdc: number, x: number, y: number, text
 
         // Restore transform manually (doesn't reset font/fillStyle)
         ctx.setTransform(savedTransform);
+        // Rotated glyphs land anywhere in the swept circle, so mirror that whole box.
+        const reach = Math.max(metrics.width, state.fontSize * 1.7) + 4;
+        syncTextRectToDibSection(state, ctx, x - reach, y - reach, reach * 2, reach * 2);
     } else {
         // No rotation - draw normally
         // Only draw background if OPAQUE mode (bkMode=2)

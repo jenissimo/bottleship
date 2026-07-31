@@ -197,6 +197,49 @@ export function getObject(gdi: GDIContext, hgdiobj: number, cbBuffer: number, lp
         return LOGPEN_SIZE;
     }
 
+    // A CreateDIBSection bitmap already HAS its bits in guest memory, so both the
+    // BITMAP and the DIBSECTION view report them directly. Reporting the generic
+    // 32bpp/width*4/NULL-bits shape instead lies about a bitmap whose real stride and
+    // bits pointer we hold, and a guest that walks bmBits then dereferences NULL.
+    if (obj.type === 'BITMAP' && cbBuffer >= 24 && obj.data?.bitsPtr && obj.data?.dibStride) {
+        const width = obj.data.width || 0;
+        const height = obj.data.height || 0;
+        const bitCount = (obj.data.dibBpp as number) || 32;
+        const stride = obj.data.dibStride as number;
+        const bitsPtr = (obj.data.bitsPtr as number) >>> 0;
+        view.setUint32(lpvObject + 0x00, 0, true);           // bmType
+        view.setInt32(lpvObject + 0x04, width, true);        // bmWidth
+        view.setInt32(lpvObject + 0x08, height, true);       // bmHeight
+        view.setUint32(lpvObject + 0x0C, stride, true);      // bmWidthBytes
+        view.setUint16(lpvObject + 0x10, 1, true);           // bmPlanes
+        view.setUint16(lpvObject + 0x12, bitCount, true);    // bmBitsPixel
+        view.setUint32(lpvObject + 0x14, bitsPtr, true);     // bmBits
+        if (cbBuffer < 0x54) {
+            Logger.verbose(LogCategory.GDI32, `getObject BITMAP(DIBSection): ${width}x${height} ${bitCount}bpp stride=${stride} bmBits=0x${bitsPtr.toString(16)}`);
+            return 24;
+        }
+        const palette = obj.data.dibPalette as Uint32Array | undefined;
+        // biHeight sign is the row order the bits are stored in.
+        view.setUint32(lpvObject + 0x18, 40, true);          // dsBmih.biSize
+        view.setInt32(lpvObject + 0x1C, width, true);        // biWidth
+        view.setInt32(lpvObject + 0x20, obj.data.dibTopDown ? -height : height, true);
+        view.setUint16(lpvObject + 0x24, 1, true);           // biPlanes
+        view.setUint16(lpvObject + 0x26, bitCount, true);    // biBitCount
+        view.setUint32(lpvObject + 0x28, 0, true);           // biCompression = BI_RGB
+        view.setUint32(lpvObject + 0x2C, stride * height, true); // biSizeImage
+        view.setInt32(lpvObject + 0x30, 0, true);            // biXPelsPerMeter
+        view.setInt32(lpvObject + 0x34, 0, true);            // biYPelsPerMeter
+        view.setUint32(lpvObject + 0x38, palette ? palette.length : 0, true); // biClrUsed
+        view.setUint32(lpvObject + 0x3C, 0, true);           // biClrImportant
+        view.setUint32(lpvObject + 0x40, 0, true);           // dsBitfields[0]
+        view.setUint32(lpvObject + 0x44, 0, true);           // dsBitfields[1]
+        view.setUint32(lpvObject + 0x48, 0, true);           // dsBitfields[2]
+        view.setUint32(lpvObject + 0x4C, 0, true);           // dshSection
+        view.setUint32(lpvObject + 0x50, 0, true);           // dsOffset
+        Logger.verbose(LogCategory.GDI32, `getObject DIBSECTION(CreateDIBSection): ${width}x${height} ${bitCount}bpp stride=${stride} bmBits=0x${bitsPtr.toString(16)}`);
+        return 0x54;
+    }
+
     // Palettized (≤8bpp) bitmap loaded with LR_CREATEDIBSECTION: expose a real
     // DIBSECTION so guest sprite loaders can read the 8-bit source + palette
     // (biBitCount, bmBits). GetObject(h, sizeof(DIBSECTION)=0x54) triggers this;
@@ -354,6 +397,15 @@ export function deleteObject(gdi: GDIContext, hgdiobj: number): boolean {
 
     // Clear bitmap-related caches
     if (isBitmap) {
+        // Win32 refuses to delete a bitmap that is still selected into a DC and keeps it
+        // alive. Apps routinely delete a back-buffer bitmap before restoring the old one;
+        // destroying it here also deletes the cached DC, losing every later draw into it.
+        if (gdi.isBitmapSelected(hgdiobj)) {
+            Logger.verbose(LogCategory.GDI32,
+                `deleteObject: HBITMAP 0x${hgdiobj.toString(16)} is selected into a DC — refused`);
+            return false;
+        }
+
         // Check if bitmap is still loading (userObj stored in data field)
         const userObj = bitmapUserObj;
         if (userObj && userObj.loading) {

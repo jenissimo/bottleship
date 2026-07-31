@@ -5,7 +5,7 @@ import { SystemResourceProvider } from "../../core/resources/system-resource-pro
 import { System } from "../../core/system";
 import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { gammaService } from "../../core/gamma-service";
-import { resolveBitmapRgba, bitmapPixelsPopulated } from './bitmap-resolve';
+import { resolveBitmapRgba, bitmapPixelsPopulated, writeBackDibSectionRect } from './bitmap-resolve';
 import { asArrayBufferView } from '../../../dom-buffer';
 // Sibling GDI modules take this GDIContext as their `gdi` host and operate on
 // the shared (non-private) state fields.
@@ -50,6 +50,33 @@ export interface GDIObject {
     lfItalic?: number;
     lfQuality?: number;
     faceName?: string;
+}
+
+interface ScreenRect { x: number; y: number; w: number; h: number }
+
+/**
+ * `base` minus the UNION of `holes`, as a set of disjoint rectangles. Canvas has no
+ * path boolean, and an even-odd stack of overlapping holes cancels itself back to
+ * painted; splitting each survivor around each hole cannot.
+ */
+function subtractRects(base: ScreenRect, holes: readonly ScreenRect[]): ScreenRect[] {
+    let out: ScreenRect[] = [base];
+    for (const h of holes) {
+        if (h.w <= 0 || h.h <= 0) continue;
+        const next: ScreenRect[] = [];
+        for (const r of out) {
+            const ix = Math.max(r.x, h.x), iy = Math.max(r.y, h.y);
+            const ir = Math.min(r.x + r.w, h.x + h.w), ib = Math.min(r.y + r.h, h.y + h.h);
+            if (ir <= ix || ib <= iy) { next.push(r); continue; }
+            if (iy > r.y) next.push({ x: r.x, y: r.y, w: r.w, h: iy - r.y });
+            if (ib < r.y + r.h) next.push({ x: r.x, y: ib, w: r.w, h: r.y + r.h - ib });
+            if (ix > r.x) next.push({ x: r.x, y: iy, w: ix - r.x, h: ib - iy });
+            if (ir < r.x + r.w) next.push({ x: ir, y: iy, w: r.x + r.w - ir, h: ib - iy });
+        }
+        out = next;
+        if (out.length === 0) break;
+    }
+    return out;
 }
 
 export interface ClearOverlayRectOptions {
@@ -438,7 +465,8 @@ export class GDIContext {
         } catch {
             return false;
         }
-        this.overlayDirty = true;
+        // setOverlayDirty, not the flag: presenters gate compositing on overlayHasContent.
+        this.setOverlayDirty(true);
         return true;
     }
 
@@ -854,7 +882,6 @@ export class GDIContext {
         // its parent (a page template larger than the placeholder hosting it) paints straight
         // over the desktop outside the dialog.
         const clipped = clipRect && clipRect.w > 0 && clipRect.h > 0;
-        // even-odd over [blit rect, ...child rects] leaves the child rects as holes.
         const holes = excludeRects && excludeRects.length > 0;
         if (clipped || holes) this.overlayCtx.save();
         if (clipped) {
@@ -862,13 +889,22 @@ export class GDIContext {
             this.overlayCtx.rect(clipRect!.x, clipRect!.y, clipRect!.w, clipRect!.h);
             this.overlayCtx.clip();
         }
+        let paint = true;
         if (holes) {
-            const path = new Path2D();
-            path.rect(absX, absY, width, height);
-            for (const r of excludeRects!) path.rect(r.x, r.y, r.w, r.h);
-            this.overlayCtx.clip(path, 'evenodd');
+            // Subtract the UNION of the child rects: stacking them even-odd would turn
+            // the intersection of two OVERLAPPING siblings back into painted area.
+            const keep = subtractRects({ x: absX, y: absY, w: width, h: height }, excludeRects!);
+            if (keep.length === 0) {
+                paint = false;
+            } else {
+                const path = new Path2D();
+                for (const r of keep) path.rect(r.x, r.y, r.w, r.h);
+                this.overlayCtx.clip(path);
+            }
         }
-        this.overlayCtx.drawImage(canvas, 0, 0, width, height, absX, absY, width, height);
+        if (paint) {
+            this.overlayCtx.drawImage(canvas, 0, 0, width, height, absX, absY, width, height);
+        }
         if (clipped || holes) this.overlayCtx.restore();
         // Snapshot from the DC, not the overlay: this is the guest's client alone, before
         // any control is stamped over it (see windowClientBacking).
@@ -983,6 +1019,16 @@ export class GDIContext {
     /** True if this DC is a window/client memory DC seeded from the overlay (attachWindowBlit). */
     hasWindowBlit(hdc: number): boolean {
         return !!this.hdcStates.get(hdc)?.windowBlit;
+    }
+
+    /** True while some DC has this bitmap selected. Win32 FAILS DeleteObject on such a
+     *  bitmap and keeps it alive; the cached bitmap DC itself does not count (its own
+     *  hBitmap stays 0) or nothing would ever be deletable. */
+    isBitmapSelected(hbitmap: number): boolean {
+        for (const state of this.hdcStates.values()) {
+            if (state.hBitmap === hbitmap) return true;
+        }
+        return false;
     }
 
     /** Drop the memory DC (and version counter) SelectObject cached for this bitmap. The cache
@@ -1522,9 +1568,7 @@ export class GDIContext {
                         // observe, no version bump) — re-materialize from live memory
                         // on every select so reads see the current surface.
                         const isDibSection = !!(userObj.bitsPtr && userObj.dibStride);
-                        if (isDibSection) {
-                            this.refreshDibSectionCanvas(hgdiobj);
-                        }
+                        const dibPixels = isDibSection ? this.refreshDibSectionCanvas(hgdiobj) : null;
 
                         // PERFORMANCE OPTIMIZATION: Track bitmap versions to skip redundant drawImage
                         // Only copy bitmap content if the bitmap has changed since last sync
@@ -1536,7 +1580,14 @@ export class GDIContext {
                             syncState.hbitmap !== hgdiobj ||
                             syncState.version !== bitmapVersion;
 
-                        if (needsSync) {
+                        if (dibPixels) {
+                            // The refresh already converted the whole bitmap; going through
+                            // the bitmap canvas again would be a second full-surface copy.
+                            ctx.putImageData(
+                                new (ImageData as any)(dibPixels.data, dibPixels.width, dibPixels.height), 0, 0);
+                            this.invalidateImageDataCache(hdc);
+                            this.dcBitmapSyncState.set(hdc, { hbitmap: hgdiobj, version: bitmapVersion });
+                        } else if (needsSync) {
                             // Copy bitmap content to memory DC
                             ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
                             ctx.drawImage(bitmapCtx.canvas, 0, 0);
@@ -1672,7 +1723,11 @@ export class GDIContext {
         const h = bottom - top;
         Logger.verbose(LogCategory.GDI32, `fillRect: HDC ${hdc} (${left}, ${top}) ${w}x${h} color=${ctx.fillStyle}`);
         ctx.fillRect(left, top, w, h);
-        
+
+        // A DIBSection's guest bits are its pixel surface, so the fill has to land there
+        // too — the next SelectObject re-materializes the canvas from those bits.
+        writeBackDibSectionRect(state.hBitmap, ctx, left, top, w, h);
+
         // Mark as dirty for ReleaseDC optimization
         this.expandDirtyRect(hdc, left, top, w, h);
         this.markDirty(hdc);

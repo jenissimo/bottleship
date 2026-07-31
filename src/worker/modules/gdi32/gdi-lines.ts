@@ -18,6 +18,7 @@
  * round-trip ImageData per segment.
  */
 import { Logger, LogCategory } from "../../core/logger";
+import { writeBackDibSectionRect } from './bitmap-resolve';
 import type { GDIContext } from './context';
 import {
     isStockObject,
@@ -106,14 +107,20 @@ function tracePath(
     ctx.setLineDash(pen.dashes ?? []);
     ctx.beginPath();
     ctx.moveTo(pts[0] + off, pts[1] + off);
+    // Set when the exclusive endpoint consumes the whole final segment: one device pixel
+    // long, so GDI still paints its start pixel and a bare moveTo would paint nothing.
+    let startPixel: { x: number; y: number } | null = null;
     for (let i = 1; i < n; i++) {
         let x = pts[i * 2];
         let y = pts[i * 2 + 1];
         if (!closed && i === n - 1) {
-            const cut = shortenEnd(pts[(i - 1) * 2], pts[(i - 1) * 2 + 1], x, y);
-            // A zero-length final segment paints nothing at all in GDI, and a path that
-            // moves nowhere would still emit a cap here — skip it.
-            if (cut.x === pts[(i - 1) * 2] && cut.y === pts[(i - 1) * 2 + 1]) break;
+            const px = pts[(i - 1) * 2], py = pts[(i - 1) * 2 + 1];
+            const cut = shortenEnd(px, py, x, y);
+            if (cut.x === px && cut.y === py) {
+                // A zero-length final segment paints nothing at all in GDI.
+                if (x !== px || y !== py) startPixel = { x: px, y: py };
+                break;
+            }
             x = cut.x;
             y = cut.y;
         }
@@ -122,6 +129,11 @@ function tracePath(
     if (closed) ctx.closePath();
     ctx.stroke();
     ctx.setLineDash([]);
+    if (startPixel) {
+        const half = pen.width / 2;
+        ctx.fillStyle = pen.css;
+        ctx.fillRect(startPixel.x + off - half, startPixel.y + off - half, pen.width, pen.width);
+    }
 }
 
 /**
@@ -160,6 +172,9 @@ export function strokePolyline(
         if (y < minY) minY = y; else if (y > maxY) maxY = y;
     }
     const pad = pen.width;
+    // A DIBSection's guest bits are its pixel surface — the stroke has to land there too.
+    writeBackDibSectionRect(gdi.hdcStates.get(hdc)?.hBitmap ?? 0, ctx,
+        minX - pad, minY - pad, (maxX - minX) + pad * 2 + 1, (maxY - minY) + pad * 2 + 1);
     gdi.expandDirtyRect(hdc, minX - pad, minY - pad, (maxX - minX) + pad * 2 + 1, (maxY - minY) + pad * 2 + 1);
     gdi.markDirty(hdc);
     gdi.invalidateImageDataCache(hdc);

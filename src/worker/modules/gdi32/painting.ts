@@ -1658,13 +1658,16 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         }
 
         // Real DIBSections have a fixed-size color table (1 << bpp); biClrUsed only
-        // bounds how many entries the caller's BITMAPINFO initializes.
+        // bounds how many entries the caller's BITMAPINFO initializes. The rest are
+        // OPAQUE BLACK, not zero: readers take alpha from bits 24-31, so a zero entry
+        // is a fully transparent pixel where GDI yields black.
         let dibPalette: Uint32Array | undefined;
         if (bpp <= 8) {
-            dibPalette = new Uint32Array(1 << bpp);
-            const numColors = biClrUsed === 0 ? (1 << bpp) : Math.min(biClrUsed, 1 << bpp);
+            const entries = 1 << bpp;
+            const numColors = biClrUsed === 0 ? entries : Math.min(biClrUsed, entries);
             const paletteOffset = pbmi + biSize;
             if (paletteOffset + numColors * 4 <= mem.length) {
+                dibPalette = new Uint32Array(entries).fill(0xff000000);
                 for (let i = 0; i < numColors; i++) {
                     const co = paletteOffset + i * 4;
                     const b = mem[co];

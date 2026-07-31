@@ -5,12 +5,17 @@ import {
 } from "./immediate";
 import {
     guestViews, decodeIndices, sequentialIndices, gatherVertices, ensureGatherScratch,
-    cvaLock, cvaUnlock, VertexSpace,
+    cvaLock, cvaUnlock, VertexSpace, validateClientArrayRange,
+    lastIndexMin, lastIndexMax,
 } from "./client-arrays";
 import {
     GL_VERTEX_ARRAY, GL_NORMAL_ARRAY, GL_COLOR_ARRAY, GL_TEXTURE_COORD_ARRAY,
     GL_TRIANGLES, GL_TRIANGLE_STRIP, GL_TRIANGLE_FAN, GL_POLYGON, GL_QUADS, GL_QUAD_STRIP,
-    GL_INVALID_VALUE,
+    GL_INVALID_VALUE, GL_INVALID_ENUM, GL_INVALID_OPERATION,
+    GL_FLOAT, GL_UNSIGNED_BYTE,
+    GL_V2F, GL_V3F, GL_C4UB_V2F, GL_C4UB_V3F, GL_C3F_V3F, GL_N3F_V3F, GL_C4F_N3F_V3F,
+    GL_T2F_V3F, GL_T4F_V4F, GL_T2F_C4UB_V3F, GL_T2F_C3F_V3F, GL_T2F_N3F_V3F,
+    GL_T2F_C4F_N3F_V3F, GL_T4F_C4F_N3F_V4F,
 } from "./constants";
 
 /**
@@ -28,10 +33,47 @@ function passThroughCount(mode: number, count: number): number {
     }
 }
 
+interface InterleavedFormat {
+    /** Texture-coordinate components, 0 when the format carries none. */
+    st: number;
+    /** Colour components, 0 when the format carries none. */
+    sc: number;
+    colorType: number;
+    hasNormal: boolean;
+    /** Position components (always float). */
+    sv: number;
+    /** Byte offsets of colour / normal / position within one packed vertex. */
+    pc: number; pn: number; pv: number;
+    /** Packed stride, used when the caller passes 0. */
+    stride: number;
+}
+
+/** GL 1.1 table 2.4, with sizeof(GLfloat)=4 and the 4-ubyte colour padded to 4. */
+const INTERLEAVED_FORMATS: Record<number, InterleavedFormat> = {
+    [GL_V2F]:             { st: 0, sc: 0, colorType: GL_FLOAT,         hasNormal: false, sv: 2, pc: 0,  pn: 0,  pv: 0,  stride: 8 },
+    [GL_V3F]:             { st: 0, sc: 0, colorType: GL_FLOAT,         hasNormal: false, sv: 3, pc: 0,  pn: 0,  pv: 0,  stride: 12 },
+    [GL_C4UB_V2F]:        { st: 0, sc: 4, colorType: GL_UNSIGNED_BYTE, hasNormal: false, sv: 2, pc: 0,  pn: 0,  pv: 4,  stride: 12 },
+    [GL_C4UB_V3F]:        { st: 0, sc: 4, colorType: GL_UNSIGNED_BYTE, hasNormal: false, sv: 3, pc: 0,  pn: 0,  pv: 4,  stride: 16 },
+    [GL_C3F_V3F]:         { st: 0, sc: 3, colorType: GL_FLOAT,         hasNormal: false, sv: 3, pc: 0,  pn: 0,  pv: 12, stride: 24 },
+    [GL_N3F_V3F]:         { st: 0, sc: 0, colorType: GL_FLOAT,         hasNormal: true,  sv: 3, pc: 0,  pn: 0,  pv: 12, stride: 24 },
+    [GL_C4F_N3F_V3F]:     { st: 0, sc: 4, colorType: GL_FLOAT,         hasNormal: true,  sv: 3, pc: 0,  pn: 16, pv: 28, stride: 40 },
+    [GL_T2F_V3F]:         { st: 2, sc: 0, colorType: GL_FLOAT,         hasNormal: false, sv: 3, pc: 0,  pn: 0,  pv: 8,  stride: 20 },
+    [GL_T4F_V4F]:         { st: 4, sc: 0, colorType: GL_FLOAT,         hasNormal: false, sv: 4, pc: 0,  pn: 0,  pv: 16, stride: 32 },
+    [GL_T2F_C4UB_V3F]:    { st: 2, sc: 4, colorType: GL_UNSIGNED_BYTE, hasNormal: false, sv: 3, pc: 8,  pn: 0,  pv: 12, stride: 24 },
+    [GL_T2F_C3F_V3F]:     { st: 2, sc: 3, colorType: GL_FLOAT,         hasNormal: false, sv: 3, pc: 8,  pn: 0,  pv: 20, stride: 32 },
+    [GL_T2F_N3F_V3F]:     { st: 2, sc: 0, colorType: GL_FLOAT,         hasNormal: true,  sv: 3, pc: 0,  pn: 8,  pv: 20, stride: 32 },
+    [GL_T2F_C4F_N3F_V3F]: { st: 2, sc: 4, colorType: GL_FLOAT,         hasNormal: true,  sv: 3, pc: 8,  pn: 24, pv: 36, stride: 48 },
+    [GL_T4F_C4F_N3F_V4F]: { st: 4, sc: 4, colorType: GL_FLOAT,         hasNormal: true,  sv: 4, pc: 16, pn: 32, pv: 44, stride: 60 },
+};
+
 /** Gather + emit one client-array draw. `idx` must come from the index scratch so that
  *  the [min,max] recorded by the decode still describes it. */
 function drawClientArrays(ctx: OpenGLContext, mode: number, idx: Uint32Array, count: number): void {
     if (count <= 0) return;
+    if (!validateClientArrayRange(ctx, lastIndexMin(), lastIndexMax())) {
+        ctx.error = GL_INVALID_OPERATION;
+        return;
+    }
 
     const direct = passThroughCount(mode, count);
     if (direct >= 0) {
@@ -115,6 +157,10 @@ export function createArrayExports(ctx: OpenGLContext): Record<string, ThunkImpl
 
     exports['glArrayElement'] = (_c, _m, args): number => {
         const idx = sequentialIndices(args[0] | 0, 1);
+        if (!validateClientArrayRange(ctx, lastIndexMin(), lastIndexMax())) {
+            ctx.error = GL_INVALID_OPERATION;
+            return 0;
+        }
         const base = immediateReserveVertex(ctx);
         // The immediate buffer is transformed at glEnd, so object space is mandatory here.
         gatherVertices(ctx, idx, 1, ctx.immediateFlatBuf, base, false);
@@ -137,6 +183,7 @@ export function createArrayExports(ctx: OpenGLContext): Record<string, ThunkImpl
         const indicesPtr = args[3] >>> 0;
         if (count <= 0 || !indicesPtr) return 0;
         const idx = decodeIndices(guestViews(ctx), indicesPtr, type, count);
+        if (!idx) { ctx.error = GL_INVALID_ENUM; return 0; }
         drawClientArrays(ctx, mode, idx, count);
         return 0;
     };
@@ -157,11 +204,57 @@ export function createArrayExports(ctx: OpenGLContext): Record<string, ThunkImpl
         if (end < start) { ctx.error = GL_INVALID_VALUE; return 0; }
         if (count <= 0 || !indicesPtr) return 0;
         const idx = decodeIndices(guestViews(ctx), indicesPtr, type, count);
+        if (!idx) { ctx.error = GL_INVALID_ENUM; return 0; }
         drawClientArrays(ctx, mode, idx, count);
         return 0;
     };
 
-    exports['glInterleavedArrays'] = (): number => 0;
+    /**
+     * glInterleavedArrays SETS the four client array pointers and their enables from one
+     * packed buffer (GL 1.1 §2.8, table 2.4) — as a no-op it silently leaves whatever the
+     * app configured before, so the next draw renders stale geometry.
+     */
+    exports['glInterleavedArrays'] = (_c, _m, args): number => {
+        const format = args[0] >>> 0;
+        let stride = args[1] | 0;
+        const pointer = args[2] >>> 0;
+
+        const fmt = INTERLEAVED_FORMATS[format];
+        if (!fmt) { ctx.error = GL_INVALID_ENUM; return 0; }
+        if (stride < 0) { ctx.error = GL_INVALID_VALUE; return 0; }
+        if (stride === 0) stride = fmt.stride;
+
+        const tc = ctx.texCoordArrays[ctx.clientActiveTextureUnit];
+        if (tc) {
+            tc.enabled = fmt.st > 0;
+            if (fmt.st > 0) {
+                tc.size = fmt.st; tc.type = GL_FLOAT; tc.stride = stride; tc.pointer = pointer;
+            }
+        }
+
+        ctx.colorArray.enabled = fmt.sc > 0;
+        if (fmt.sc > 0) {
+            ctx.colorArray.size = fmt.sc;
+            ctx.colorArray.type = fmt.colorType;
+            ctx.colorArray.stride = stride;
+            ctx.colorArray.pointer = pointer + fmt.pc;
+        }
+
+        ctx.normalArray.enabled = fmt.hasNormal;
+        if (fmt.hasNormal) {
+            ctx.normalArray.size = 3;
+            ctx.normalArray.type = GL_FLOAT;
+            ctx.normalArray.stride = stride;
+            ctx.normalArray.pointer = pointer + fmt.pn;
+        }
+
+        ctx.vertexArray.enabled = true;
+        ctx.vertexArray.size = fmt.sv;
+        ctx.vertexArray.type = GL_FLOAT;
+        ctx.vertexArray.stride = stride;
+        ctx.vertexArray.pointer = pointer + fmt.pv;
+        return 0;
+    };
     exports['glEdgeFlagPointer'] = (): number => 0;
     exports['glIndexPointer'] = (): number => 0;
 

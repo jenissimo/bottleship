@@ -11,6 +11,26 @@ interface WGLContextBinding {
     hdc: number;
 }
 
+/**
+ * A GL entry point address, but only when a JS handler is actually registered behind it.
+ *
+ * GetProcAddress may legitimately hand back a stub for a declared-but-unimplemented
+ * export; for wglGetProcAddress NULL is the DOCUMENTED "this extension is absent"
+ * answer, and an engine that gets a pointer concludes the extension is present, calls
+ * it, and takes the garbage return as truth. So the two agree on the registry they
+ * consult, and disagree — deliberately — on what an unimplemented name resolves to.
+ */
+function resolveImplementedEntryPoint(dispatcher: any, name: string): number {
+    const addr = resolveHleExportAddress(dispatcher, "opengl32", name) >>> 0;
+    if (!addr) return 0;
+    const stub = dispatcher?.thunkGenerator?.getStubByAddress?.(addr);
+    if (!stub || !dispatcher?.getImplementationInfo?.(stub.functionId)) {
+        Logger.verbose(LogCategory.GDI32, `wglGetProcAddress("${name}") -> 0 (declared, not implemented)`);
+        return 0;
+    }
+    return addr;
+}
+
 export function createWglExports(ctx: OpenGLContext): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
 
@@ -105,7 +125,7 @@ export function createWglExports(ctx: OpenGLContext): Record<string, ThunkImplem
         // entry points are absent from the boot-time stub set, so this is also what
         // creates them on demand.
         const dispatcher = (ctx.process as any)?.dispatcher;
-        const addr = resolveHleExportAddress(dispatcher, "opengl32", name) >>> 0;
+        const addr = resolveImplementedEntryPoint(dispatcher, name);
         if (addr) {
             Logger.verbose(LogCategory.GDI32, `wglGetProcAddress("${name}") -> 0x${addr.toString(16)}`);
             return addr;
@@ -132,7 +152,7 @@ export function createWglExports(ctx: OpenGLContext): Record<string, ThunkImplem
 
         const mapped = aliasMap[name];
         if (mapped && mapped !== name) {
-            const mappedAddr = resolveHleExportAddress(dispatcher, "opengl32", mapped) >>> 0;
+            const mappedAddr = resolveImplementedEntryPoint(dispatcher, mapped);
             if (mappedAddr) {
                 Logger.verbose(LogCategory.GDI32, `wglGetProcAddress("${name}") -> 0x${mappedAddr.toString(16)} (alias: ${mapped})`);
                 return mappedAddr;

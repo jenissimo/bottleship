@@ -15,6 +15,7 @@ import {
     OpenGLContext, GLArrayPointer, VERT_FLOATS, mat4Multiply,
 } from "./context";
 import { toPlainGuestMemory } from "../../core/memory/guest-memory";
+import { Logger, LogCategory } from "../../core/logger";
 import {
     GL_FLOAT, GL_DOUBLE, GL_INT, GL_SHORT, GL_UNSIGNED_BYTE, GL_UNSIGNED_SHORT,
     GL_UNSIGNED_INT, GL_BYTE, GL_TEXTURE_GEN_S, GL_TEXTURE_GEN_T,
@@ -121,6 +122,67 @@ function arrayStride(arr: GLArrayPointer, comps: number): number {
 }
 
 // ---------------------------------------------------------------------------
+// Draw-range validation
+// ---------------------------------------------------------------------------
+
+/**
+ * The gather reads guest memory with an index the GUEST supplied, so the whole span a
+ * draw will touch is validated ONCE here and the inner loops stay unchecked (§3.1).
+ * Out of range the typed-array reads would yield undefined -> NaN vertices and the
+ * DataView reads would throw a RangeError the dispatcher swallows: a silently dropped
+ * draw with EAX never set, instead of a diagnosable fault.
+ */
+function arrayOutOfRange(
+    arr: GLArrayPointer, comps: number, lo: number, hi: number,
+    limit: number, space: { getRegion(a: number): { perms: string } | null } | undefined,
+): boolean {
+    if (comps <= 0) return true;
+    const stride = arrayStride(arr, comps);
+    const start = arr.pointer + lo * stride;
+    const end = arr.pointer + hi * stride + comps * elemSize(arr.type);
+    if (end > limit) return true;
+    if (!space) return false;
+    // A region the map knows to be unreadable is a hard reject; an address it has no
+    // region for is not — plenty of legitimate guest buffers live outside the map.
+    return space.getRegion(start)?.perms === "noaccess"
+        || space.getRegion(end - 1)?.perms === "noaccess";
+}
+
+/**
+ * True when every enabled array covers indices [lo,hi]. Call once per draw, before
+ * gathering; a false answer must fail the draw with GL_INVALID_OPERATION.
+ */
+export function validateClientArrayRange(ctx: OpenGLContext, lo: number, hi: number): boolean {
+    if (hi < lo) return true;
+    if (lo < 0) return false;
+    const limit = toPlainGuestMemory(ctx.process.getCurrentMemory()).length;
+    const space = (ctx.process as unknown as {
+        addressSpace?: { getRegion(a: number): { perms: string } | null };
+    }).addressSpace;
+
+    let bad = "";
+    if (ctx.vertexArray.enabled && ctx.vertexArray.pointer
+        && arrayOutOfRange(ctx.vertexArray, ctx.vertexArray.size, lo, hi, limit, space)) bad = "vertex";
+    else if (ctx.colorArray.enabled && ctx.colorArray.pointer
+        && arrayOutOfRange(ctx.colorArray, ctx.colorArray.size, lo, hi, limit, space)) bad = "color";
+    else if (ctx.normalArray.enabled && ctx.normalArray.pointer
+        && arrayOutOfRange(ctx.normalArray, 3, lo, hi, limit, space)) bad = "normal";
+    else {
+        for (let unit = 0; unit < ctx.texCoordArrays.length; unit++) {
+            const arr = ctx.texCoordArrays[unit];
+            if (arr.enabled && arr.pointer && arrayOutOfRange(arr, arr.size, lo, hi, limit, space)) {
+                bad = `texcoord${unit}`;
+                break;
+            }
+        }
+    }
+    if (!bad) return true;
+    Logger.warn(LogCategory.SYSTEM,
+        `opengl32: ${bad} array out of range for indices [${lo},${hi}] — draw dropped`);
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 // Index decoding
 // ---------------------------------------------------------------------------
 
@@ -141,8 +203,9 @@ function ensureIndexScratch(n: number): Uint32Array {
     return _indexScratch;
 }
 
-/** Decode `count` indices of `type` at guest `ptr`; records the touched [min,max]. */
-export function decodeIndices(v: GuestViews, ptr: number, type: number, count: number): Uint32Array {
+/** Decode `count` indices of `type` at guest `ptr`; records the touched [min,max].
+ *  Null for an index type GL does not define — the caller must raise GL_INVALID_ENUM. */
+export function decodeIndices(v: GuestViews, ptr: number, type: number, count: number): Uint32Array | null {
     const out = ensureIndexScratch(count);
     let lo = 0xFFFFFFFF, hi = 0;
     switch (type) {
@@ -195,10 +258,11 @@ export function decodeIndices(v: GuestViews, ptr: number, type: number, count: n
             break;
         }
         default:
-            // An unrecognised index type draws vertex 0 `count` times, as it always has.
-            out.fill(0, 0, count);
-            lo = 0; hi = 0;
-            break;
+            // GL_INVALID_ENUM, and the draw is skipped entirely: a fan of `count`
+            // vertex-0 copies is invisible garbage that also pins the CVA range to [0,0].
+            _idxMin = 0;
+            _idxMax = 0;
+            return null;
     }
     _idxMin = count > 0 ? lo : 0;
     _idxMax = count > 0 ? hi : 0;

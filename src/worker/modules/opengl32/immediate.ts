@@ -20,7 +20,7 @@ import {
     GL_OBJECT_LINEAR, GL_EYE_LINEAR, GL_SPHERE_MAP, GL_STENCIL_TEST,
 } from "./constants";
 import { Logger, LogCategory } from "../../core/logger";
-import { asArrayBuffer } from "../../../dom-buffer";
+import { guestViews } from "./client-arrays";
 
 const _f32ab = new ArrayBuffer(4);
 const _f32dv = new DataView(_f32ab);
@@ -32,17 +32,10 @@ export function bitsToF32(bits: number): number {
 // Module-level scratch buffers — zero allocations on hot paths
 const _mvpScratch = new Float32Array(16);
 
-// Cached DataView for guest memory — recreate only when buffer changes
-let _cachedDVBuf: ArrayBuffer | null = null;
-let _cachedDV: DataView | null = null;
-
+/** The guest DataView, from the SAME cache the gather path uses — a view keyed on the
+ *  buffer alone reads the wrong base whenever the window's byteOffset moves under it. */
 function getMemDV(ctx: OpenGLContext): DataView {
-    const mem = ctx.process.getCurrentMemory();
-    if (mem.buffer !== _cachedDVBuf) {
-        _cachedDVBuf = asArrayBuffer(mem.buffer);
-        _cachedDV = new DataView(mem.buffer, mem.byteOffset);
-    }
-    return _cachedDV!;
+    return guestViews(ctx).dv;
 }
 
 // Helper to read from guest memory without null-returning Mem API

@@ -8,7 +8,6 @@
 import { Logger, LogCategory } from "../../core/logger";
 import { SystemResourceProvider } from "../../core/resources/system-resource-provider";
 import { System } from "../../core/system";
-import { toPlainGuestMemory } from "../../core/memory/guest-memory";
 import type { DirectDrawSurfaceState } from "../ddraw/com-objects";
 import { isRenderSurface } from "../ddraw/com-objects";
 import { convertRGBAToSurface } from "../ddraw/gpu-texture-utils";
@@ -16,7 +15,7 @@ import { setAuthorityCpu, surfaceHasActiveWriteLease } from "../ddraw/surface-sy
 import { DDSCAPS_SYSTEMMEMORY, DDSCAPS_PRIMARYSURFACE, DDSCAPS_BACKBUFFER } from "../ddraw/constants";
 import { applyRopCode } from './gdi-raster';
 import { DEFAULT_BITMAP_HANDLE, cssToColor } from './gdi-objects';
-import { resolveDibSectionRectRgba } from './bitmap-resolve';
+import { resolveDibSectionRectRgba, writeBackDibSectionRect } from './bitmap-resolve';
 import type { GDIContext } from './context';
 
 /**
@@ -46,9 +45,9 @@ function syncDibSourceDc(
     gdi.invalidateImageDataCache(hdcSrc);
 }
 
-/** DC bkColor CSS → [r,g,b] via the shared parser (COLORREF is 0x00BBGGRR). */
-function bkColorToRgb(css: string | undefined): [number, number, number] {
-    const c = cssToColor(css ?? '#ffffff');
+/** DC color CSS → [r,g,b] via the shared parser (COLORREF is 0x00BBGGRR). */
+function cssToRgb(css: string | undefined, fallback: string): [number, number, number] {
+    const c = cssToColor(css ?? fallback);
     return [c & 0xff, (c >> 8) & 0xff, (c >> 16) & 0xff];
 }
 
@@ -82,45 +81,47 @@ function blitColorToMono(
 }
 
 /**
- * A DIBSection's pixel surface IS its guest bits — GDI draws must land there
- * (apps read the bits back and post-process them, e.g. WA writes cursor alpha
- * over GDI-blitted RGB). Mirrors the dest-canvas rect into 32bpp DIBSection
- * bits as B,G,R, preserving the reserved/alpha byte the app owns.
+ * Real GDI mono→color (nt5src ylateobj.cxx, the icon/mask path): a source 0 bit
+ * (black) becomes the DESTINATION DC's text color and a 1 bit (white) its background
+ * color. Copying the mono canvas through verbatim renders every masked sprite as hard
+ * black/white whatever SetTextColor/SetBkColor said.
  */
+function blitMonoToColor(
+    destCtx: OffscreenCanvasRenderingContext2D,
+    srcCtx: OffscreenCanvasRenderingContext2D,
+    x: number, y: number, width: number, height: number,
+    xSrc: number, ySrc: number,
+    fg: [number, number, number],
+    bg: [number, number, number],
+): boolean {
+    try {
+        const src = srcCtx.getImageData(xSrc, ySrc, width, height);
+        const out = new ImageData(width, height);
+        const s = src.data, d = out.data;
+        for (let i = 0; i < s.length; i += 4) {
+            // The mono canvas stores 0/1 as black/white; anything not black is a 1 bit.
+            const one = s[i] !== 0 || s[i + 1] !== 0 || s[i + 2] !== 0;
+            const c = one ? bg : fg;
+            d[i] = c[0]; d[i + 1] = c[1]; d[i + 2] = c[2];
+            d[i + 3] = 255;
+        }
+        destCtx.putImageData(out, x, y);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/** Mirror a drawn rect of a DC into the DIBSection selected into it (see
+ *  writeBackDibSectionRect); no-op for anything else. */
 function writeBackDib32(
-    gdi: GDIContext,
     destCtx: OffscreenCanvasRenderingContext2D,
     destState: { hBitmap?: number } | undefined,
     x: number, y: number, width: number, height: number,
 ): void {
     const hBmp = destState?.hBitmap;
     if (!hBmp || hBmp === DEFAULT_BITMAP_HANDLE) return;
-    const obj = SystemResourceProvider.getInstance().getUserObject(hBmp);
-    if (!obj || obj.type !== 'BITMAP' || !obj.bitsPtr || obj.dibStride <= 0 || (obj.dibBpp ?? 32) !== 32) return;
-    // Per-pixel write-back below; getCurrentMemory() hands out v86's Proxy, whose
-    // per-element trap V8 cannot JIT. Nothing here re-enters the guest, so the plain
-    // view cannot go stale mid-call.
-    const mem: Uint8Array | undefined = toPlainGuestMemory(System.getInstance().process?.getCurrentMemory?.());
-    if (!mem) return;
-    const bw = obj.width ?? 0, bh = obj.height ?? 0;
-    const cx = Math.max(0, x | 0), cy = Math.max(0, y | 0);
-    const cw = Math.min(width | 0, bw - cx), ch = Math.min(height | 0, bh - cy);
-    if (cw <= 0 || ch <= 0) return;
-    // Raw writes below — validate the whole section range once (§3.1).
-    if (obj.bitsPtr + obj.dibStride * bh > mem.length) return;
-    let img: ImageData;
-    try { img = destCtx.getImageData(cx, cy, cw, ch); } catch { return; }
-    const src = img.data;
-    for (let ry = 0; ry < ch; ry++) {
-        const dibY = obj.dibTopDown ? cy + ry : bh - 1 - (cy + ry);
-        let o = obj.bitsPtr + dibY * obj.dibStride + cx * 4;
-        let si = ry * cw * 4;
-        for (let rx = 0; rx < cw; rx++, o += 4, si += 4) {
-            mem[o] = src[si + 2];
-            mem[o + 1] = src[si + 1];
-            mem[o + 2] = src[si];
-        }
-    }
+    writeBackDibSectionRect(hBmp, destCtx, x, y, width, height);
 }
 
 export function bitBlt(gdi: GDIContext, hdcDest: number, x: number, y: number, width: number, height: number,
@@ -171,7 +172,7 @@ export function bitBlt(gdi: GDIContext, hdcDest: number, x: number, y: number, w
         if (rop === BLACKNESS) {
             destCtx.fillStyle = '#000000';
             destCtx.fillRect(x, y, width, height);
-            writeBackDib32(gdi, destCtx, destState, x, y, width, height);
+            writeBackDib32(destCtx, destState, x, y, width, height);
             gdi.expandDirtyRect(hdcDest, x, y, width, height);
             gdi.markDirty(hdcDest);
             gdi.invalidateImageDataCache(hdcDest);
@@ -179,7 +180,7 @@ export function bitBlt(gdi: GDIContext, hdcDest: number, x: number, y: number, w
         } else if (rop === WHITENESS) {
             destCtx.fillStyle = '#FFFFFF';
             destCtx.fillRect(x, y, width, height);
-            writeBackDib32(gdi, destCtx, destState, x, y, width, height);
+            writeBackDib32(destCtx, destState, x, y, width, height);
             gdi.expandDirtyRect(hdcDest, x, y, width, height);
             gdi.markDirty(hdcDest);
             gdi.invalidateImageDataCache(hdcDest);
@@ -194,6 +195,7 @@ export function bitBlt(gdi: GDIContext, hdcDest: number, x: number, y: number, w
                     data[i + 2] = 255 - data[i + 2];
                 }
                 destCtx.putImageData(imageData, x, y);
+                writeBackDib32(destCtx, destState, x, y, width, height);
                 gdi.expandDirtyRect(hdcDest, x, y, width, height);
                 gdi.markDirty(hdcDest);
                 gdi.invalidateImageDataCache(hdcDest);
@@ -217,13 +219,22 @@ export function bitBlt(gdi: GDIContext, hdcDest: number, x: number, y: number, w
         // Save current composite operation
         const savedCompositeOp = destCtx.globalCompositeOperation;
 
-        // Color→mono: dest has a 1bpp bitmap selected (CreateBitmap planes=1).
+        // Format conversion, both directions: GDI translates through the DC colors
+        // whenever exactly one side is 1bpp (CreateBitmap planes=1).
+        const provider = SystemResourceProvider.getInstance();
+        const destBmp = destState?.hBitmap ? provider.getUserObject(destState.hBitmap) : null;
+        const srcBmp = srcState?.hBitmap ? provider.getUserObject(srcState.hBitmap) : null;
+        const destIsMono = destBmp?.type === 'BITMAP' && destBmp.bmBpp === 1;
+        const srcIsMono = srcBmp?.type === 'BITMAP' && srcBmp.bmBpp === 1;
+
         let monoConverted = false;
-        if (rop === SRCCOPY && destState?.hBitmap) {
-            const destBmp = SystemResourceProvider.getInstance().getUserObject(destState.hBitmap);
-            if (destBmp?.type === 'BITMAP' && destBmp.bmBpp === 1) {
-                monoConverted = blitColorToMono(destCtx, srcCtx, x, y, width, height, xSrc, ySrc, bkColorToRgb(srcState?.bkColor));
-            }
+        if (rop === SRCCOPY && destIsMono && !srcIsMono) {
+            monoConverted = blitColorToMono(destCtx, srcCtx, x, y, width, height, xSrc, ySrc,
+                cssToRgb(srcState?.bkColor, '#ffffff'));
+        } else if (rop === SRCCOPY && srcIsMono && !destIsMono) {
+            monoConverted = blitMonoToColor(destCtx, srcCtx, x, y, width, height, xSrc, ySrc,
+                cssToRgb(destState?.textColor, '#000000'),
+                cssToRgb(destState?.bkColor, '#ffffff'));
         }
 
         if (monoConverted) {
@@ -288,7 +299,7 @@ export function bitBlt(gdi: GDIContext, hdcDest: number, x: number, y: number, w
         // Invalidate image data cache after drawing
         gdi.invalidateImageDataCache(hdcDest);
 
-        writeBackDib32(gdi, destCtx, destState, x, y, width, height);
+        writeBackDib32(destCtx, destState, x, y, width, height);
 
         // If dest is a memory DC with linked bitmap, update the bitmap canvas
         const linkedBitmap = (destCtx.canvas as any).__bitmapCanvas;
@@ -382,6 +393,7 @@ export function stretchBlt(gdi: GDIContext, hdcDest: number, xDest: number, yDes
                 `stretchBlt: WORKAROUND - hdcSrc=0 with SRCCOPY, filling dest with black`);
             destCtx.fillStyle = '#000000';
             destCtx.fillRect(xDest, yDest, wDest, hDest);
+            writeBackDib32(destCtx, gdi.hdcStates.get(hdcDest), xDest, yDest, wDest, hDest);
             gdi.markDirty(hdcDest);
             gdi.invalidateImageDataCache(hdcDest);
             return true; // Pretend success to unblock the game
@@ -397,12 +409,14 @@ export function stretchBlt(gdi: GDIContext, hdcDest: number, xDest: number, yDes
         if (rop === BLACKNESS) {
             destCtx.fillStyle = '#000000';
             destCtx.fillRect(xDest, yDest, wDest, hDest);
+            writeBackDib32(destCtx, gdi.hdcStates.get(hdcDest), xDest, yDest, wDest, hDest);
             gdi.markDirty(hdcDest);
             gdi.invalidateImageDataCache(hdcDest);
             return true;
         } else if (rop === WHITENESS) {
             destCtx.fillStyle = '#FFFFFF';
             destCtx.fillRect(xDest, yDest, wDest, hDest);
+            writeBackDib32(destCtx, gdi.hdcStates.get(hdcDest), xDest, yDest, wDest, hDest);
             gdi.markDirty(hdcDest);
             gdi.invalidateImageDataCache(hdcDest);
             return true;
@@ -418,6 +432,7 @@ export function stretchBlt(gdi: GDIContext, hdcDest: number, xDest: number, yDes
                     // Alpha stays the same
                 }
                 destCtx.putImageData(imageData, xDest, yDest);
+                writeBackDib32(destCtx, gdi.hdcStates.get(hdcDest), xDest, yDest, wDest, hDest);
                 gdi.markDirty(hdcDest);
                 gdi.invalidateImageDataCache(hdcDest);
                 return true;
@@ -694,6 +709,8 @@ export function stretchBlt(gdi: GDIContext, hdcDest: number, xDest: number, yDes
         if (isOverlayDest) {
             gdi.setOverlayDirty(true);
         }
+
+        writeBackDib32(destCtx, gdi.hdcStates.get(hdcDest), xDest, yDest, wDest, hDest);
 
         // Mark as dirty for ReleaseDC optimization
         gdi.expandDirtyRect(hdcDest, xDest, yDest, wDest, hDest);
