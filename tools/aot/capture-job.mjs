@@ -38,9 +38,13 @@ const c = getCase(caseId);
 const warmup = Number(args.warmup || 20000);
 const outPath = path.resolve(args.out || path.join(__dirname, "jobs", `${caseId}.json`));
 
-const JIT_FLAGS = new Map([[5, 1], [9, 1], [10, 1], [11, 1], [12, 1], [13, 1], [18, 1], [19, 0], [21, 0], [15, 300000]]);
-const wasmPath = path.join(REPO, "vendor/v86/build/v86.wasm");
-const libPath = path.join(REPO, "vendor/v86/build/libv86.mjs");
+const JIT_FLAGS = new Map([[5, 1], [10, 0], [11, 1], [12, 1], [13, 1], [19, 0], [21, 0], [15, 300000]]);
+// The integrity gate supplies a disposable engine copy. Capture must use that same binary for
+// both its executable bytes and its identity envelope; falling back to the workspace here would
+// create a job whose measured state and claimed engine disagree.
+const ENGINE_DIR = path.resolve(process.env.V86_ENGINE_DIR || path.join(REPO, "vendor/v86"));
+const wasmPath = path.join(ENGINE_DIR, "build/v86.wasm");
+const libPath = path.join(ENGINE_DIR, "build/libv86.mjs");
 const { V86 } = await import(url.pathToFileURL(libPath).href);
 
 const image = buildImage(c, { warmup, n1: 200, n2: 400 });
@@ -71,6 +75,18 @@ emulator.bus.register("cpu-event-halt", () => {
     }
     const tlb = findTlbDataBase(mem, cpu.mem8.byteOffset, ORACLE_PROBE_PAGES);
     const pageBytes = Buffer.from(cpu.mem8.subarray(pAddr, pAddr + PAGE));
+    const requiredIdentity = ["jit_config_abi_version", "jit_config_supported_mask", "jit_codegen_fingerprint_lo", "jit_codegen_fingerprint_hi"];
+    const jitModuleForPage = (() => {
+        const rec = (globalThis["__wasmDump"]?.out ?? []).find((r) => (r.start >>> 12) === codePage);
+        return rec ? { bytes: rec.len, tableIndex: rec.table_index } : null;
+    })();
+    if (!requiredIdentity.every(name => typeof w[name] === "function")
+        || !Number.isInteger(cpu.memory_size?.[0])
+        || idx === 0xFFFF || idx === 0 || idx >= 900
+        || !jitModuleForPage || !Number.isInteger(jitModuleForPage.tableIndex)
+        || jitModuleForPage.tableIndex !== idx) {
+        throw new Error("capture refused: missing authoritative JIT identity or exact live slot");
+    }
 
     const job = {
         tool: "aot/capture-job", case: caseId, created_at: new Date().toISOString(),
@@ -78,7 +94,16 @@ emulator.bus.register("cpu-event-halt", () => {
             sha256: sha256(fs.readFileSync(wasmPath)),
             // A property of the linked binary, not of this run — see lib/tlb-base.mjs.
             tlbDataBase: tlb.base, tlbProbeSupport: tlb.support,
-            mem8: cpu.mem8.byteOffset, memorySize: w.get_memory_size ? w.get_memory_size() : L.MEM_SIZE,
+            mem8: cpu.mem8.byteOffset, memorySize: cpu.memory_size?.[0] >>> 0,
+        },
+        jit_identity: {
+            aot_abi: 5,
+            engine_sha256: sha256(fs.readFileSync(wasmPath)),
+            ram_size: cpu.memory_size?.[0] >>> 0,
+            abi: w.jit_config_abi_version() >>> 0,
+            supported_mask: w.jit_config_supported_mask() >>> 0,
+            fingerprint_lo: w.jit_codegen_fingerprint_lo() >>> 0,
+            fingerprint_hi: w.jit_codegen_fingerprint_hi() >>> 0,
         },
         jitConfig: Object.fromEntries([...JIT_FLAGS]),
         relaxedFpu: w.get_relaxed_fpu ? w.get_relaxed_fpu() : 1,
@@ -90,10 +115,7 @@ emulator.bus.register("cpu-event-halt", () => {
             // a superset (design G3: every basic-block head).
             entryOffsets: entryOffsets.sort((a, b) => a - b),
         },
-        jitModuleForPage: (() => {
-            const rec = (globalThis["__wasmDump"]?.out ?? []).find((r) => (r.start >>> 12) === codePage);
-            return rec ? { bytes: rec.len, tableIndex: rec.table_index } : null;
-        })(),
+        jitModuleForPage,
     };
     fs.mkdirSync(path.dirname(outPath), { recursive: true });
     fs.writeFileSync(outPath, JSON.stringify(job, null, 2));
@@ -115,7 +137,17 @@ emulator.add_listener("emulator-loaded", () => {
     cpu.reset_memory();
     cpu.load_multiboot(image.buf.buffer);
     const ex = cpu.wm.exports;
-    for (const [i, v] of JIT_FLAGS) ex.set_jit_config(i, v);
+    const supportedMask = typeof ex.jit_config_supported_mask === "function"
+        ? ex.jit_config_supported_mask() >>> 0 : null;
+    for (const [i, v] of JIT_FLAGS) {
+    if (supportedMask !== null && (i >= 32 || !(supportedMask & (1 << i)))) {
+            throw new Error(`JIT config index ${i} is unsupported by mask 0x${supportedMask.toString(16)}`);
+        }
+        const status = ex.set_jit_config(i, v);
+        if (supportedMask !== null && status !== 0) {
+            throw new Error(`set_jit_config(${i}, ${v}) failed with status ${status}`);
+        }
+    }
     ex.set_relaxed_fpu(1);
     if (cpu.jit_clear_cache) cpu.jit_clear_cache();
     globalThis["__wasmDump"] = { pages: new Set([c.codeAddr >>> 12]), out: [], keepLatestPerPage: true };

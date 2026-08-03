@@ -249,8 +249,11 @@ export function registerWindowQueryExports(exports: Record<string, ThunkImplemen
 
     exports['IsWindowEnabled'] = (ctx, mem, args) => {
         const hWnd = args[0];
-        Logger.verbose(LogCategory.USER32, `IsWindowEnabled(0x${hWnd.toString(16)})`);
-        return 1; // TRUE - assume enabled
+        const window = windows.get(hWnd);
+        const enabled = !!window && (window.style & 0x08000000 /* WS_DISABLED */) === 0;
+        Logger.verbose(LogCategory.USER32,
+            `IsWindowEnabled(0x${hWnd.toString(16)}) -> ${enabled ? 1 : 0}`);
+        return enabled ? 1 : 0;
     };
 
     exports['IsWindowUnicode'] = (ctx, mem, args) => {

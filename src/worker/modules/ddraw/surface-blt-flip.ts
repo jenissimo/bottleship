@@ -52,7 +52,13 @@ import {
     getSurfaceFormatLayout,
 } from "../../backends/webgpu/shared/texture-formats";
 import type { DirectDrawSurfaceState } from "./com-objects";
-import { setAuthorityCpu, setAuthorityGpu, surfaceSyncManager, surfaceHasActiveWriteLease } from "./surface-sync";
+import {
+    setAuthorityCpu,
+    setAuthorityGpu,
+    surfaceSyncManager,
+    surfaceHasActiveWriteLease,
+    unionSurfaceDirtyRegion,
+} from "./surface-sync";
 import { propagateSurfaceStateToRegistry } from "./d3d/texture-manager";
 import { isValidAddress } from "../../core/memory/address-guard";
 import { markGpuSyncedFromCpu } from "./surface-sync";
@@ -319,6 +325,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
                         const pitch = sState.pitch || (width * Math.max(1, sState.format.bpp / 8));
                         convertRGBAToSurface(imageData.data, mem, sState.surfacePtr, width, height, pitch, sState.format, { clearAlphaBit: true });
                         setAuthorityCpu(sState);
+                        unionSurfaceDirtyRegion(sState, { left: 0, top: 0, right: width, bottom: height });
                         gdiContext.clearDirty(hdc);
                     }
                 } catch (e) {
@@ -745,6 +752,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
                     }
                 }
                 setAuthorityCpu(dstState);
+                unionSurfaceDirtyRegion(dstState, dstRect);
             }
 
             recordSurfaceOp("fill", "cpu", dstState, null, dstRect, null);
@@ -917,6 +925,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
             }
 
             setAuthorityCpu(dstState);
+            unionSurfaceDirtyRegion(dstState, effDstRect);
             (dstState as { surfaceEverWritten?: boolean }).surfaceEverWritten = true;
             recordSurfaceOp("blt",
                 rop3 !== undefined ? "cpu:rop" : useColorKey ? "cpu:colorkey" : isStretch ? "cpu:stretch" : "cpu",
@@ -1004,6 +1013,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
                     copySurfaceRegion(mem, srcState, dstState, effSrcRect, effDstRect);
                 }
                 setAuthorityCpu(dstState);
+                unionSurfaceDirtyRegion(dstState, effDstRect);
                 (dstState as { surfaceEverWritten?: boolean }).surfaceEverWritten = true;
                 recordSurfaceOp("blt", "cpu:nogpu", dstState, srcState, effDstRect, effSrcRect, colorKey);
             }
@@ -1035,6 +1045,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
                 // Fallback to CPU nearest-neighbor if GPU promotion failed
                 copySurfaceRegion(mem, srcState, dstState, effSrcRect, effDstRect);
                 setAuthorityCpu(dstState);
+                unionSurfaceDirtyRegion(dstState, effDstRect);
                 recordSurfaceOp("blt", "cpu:stretch", dstState, srcState, effDstRect, effSrcRect, colorKey);
             }
             (dstState as { surfaceEverWritten?: boolean }).surfaceEverWritten = true;
@@ -1183,6 +1194,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
                 copySurfaceRegion(mem, srcState, dstState, srcRect, dstRect);
             }
             setAuthorityCpu(dstState);
+            unionSurfaceDirtyRegion(dstState, dstRect);
             (dstState as { surfaceEverWritten?: boolean }).surfaceEverWritten = true;
             recordSurfaceOp("bltfast", useColorKey ? "cpu:colorkey" : "cpu", dstState, srcState, dstRect, srcRect, useColorKey ? srcState.srcColorKey : undefined);
 

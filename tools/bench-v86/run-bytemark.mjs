@@ -85,6 +85,10 @@ const flagPairs = (args.flags || "").split(",").filter(Boolean).map(s => {
     const [i, v] = s.split("=");
     return [Number(i), Number(v)];
 });
+if (flagPairs.some(([i, v]) => i === 9 && v !== 0)) {
+    console.error("nbench boots Linux with non-identity paging; fastmem reads are intentionally unsupported here. Use tools/examples/fastmem-reads-hpcos-ab.harness.ts.");
+    process.exit(2);
+}
 
 // ── lazy 9p mirror ──────────────────────────────────────────────────────────
 const mirrorStats = installLazyMirror({
@@ -162,7 +166,19 @@ function applyEngineConfig() {
     }
     if (flagPairs.length) {
         if (!exports?.set_jit_config) { console.error("--flags requested but set_jit_config export missing (stock engine?)"); process.exit(2); }
-        for (const [i, v] of flagPairs) exports.set_jit_config(i, v);
+        const supportedMask = typeof exports.jit_config_supported_mask === "function"
+            ? exports.jit_config_supported_mask() >>> 0 : null;
+        for (const [i, v] of flagPairs) {
+            if (supportedMask !== null && (i >= 32 || !(supportedMask & (1 << i)))) {
+                console.error(`JIT config index ${i} is unsupported by mask 0x${supportedMask.toString(16)}`);
+                process.exit(2);
+            }
+            const status = exports.set_jit_config(i, v);
+            if (supportedMask !== null && status !== 0) {
+                console.error(`set_jit_config(${i}, ${v}) failed with status ${status}`);
+                process.exit(2);
+            }
+        }
         const readback = flagPairs.map(([i]) => `${i}=${exports.get_jit_config ? exports.get_jit_config(i) : "?"}`).join(",");
         console.error(`[bench] jit flags applied: ${readback}`);
     }
@@ -250,10 +266,46 @@ function onLine(l) {
     }
 }
 
+/**
+ * Whether the feature under test was actually LIVE, sampled before the engine is destroyed.
+ *
+ * A flag readback only proves the flag was set; it does not prove the codegen ever emitted the
+ * shape, so an ablation column can otherwise report a confident percentage for a feature that
+ * never ran. `speculatedLoadsCompiled == 0` under `fastmemReads: 1` means exactly that.
+ *
+ * IDENTITY-MAP CAVEAT: the fastmem read shape loads `mem8 + LINEAR address` with no page
+ * translation, which is sound only where VA == PA. BottleShip guarantees that; a Linux guest
+ * does NOT, and the compile gate only tests protected-mode + PG. So a nonzero count here on a
+ * Linux guest means the run executed an UNSOUND configuration and its scores describe nothing.
+ * Recorded rather than judged — the summary reader needs to see which of the two it was.
+ */
+function sampleEngineCounters() {
+    const e = emulator?.v86?.cpu?.wm?.exports;
+    if (!e) return null;
+    const num = (fn) => (typeof e[fn] === "function" ? e[fn]() >>> 0 : null);
+    return {
+        fastmemReadsFlag: null,
+        fastmemReadsStatus: "retired",
+        speculatedLoadsCompiled: num("fastmem_get_speculated_loads_compiled"),
+        speculatedStoresCompiled: num("fastmem_get_speculated_stores_compiled"),
+        readMapPages: num("fastmem_read_map_count"),
+    };
+}
+
 function finish() {
     clearTimeout(watchdog);
     result.wall_ms = Date.now() - benchStart;
     result.finished_at = new Date().toISOString();
+    result.engine_counters = sampleEngineCounters();
+    if (result.engine_counters) {
+        const c = result.engine_counters;
+        console.error(`[bench] engine counters: fastmemReads=${c.fastmemReadsStatus} `
+            + `speculatedLoads=${c.speculatedLoadsCompiled} readMapPages=${c.readMapPages}`);
+        if (c.fastmemReadsFlag && c.speculatedLoadsCompiled === 0) {
+            console.error("[bench] WARNING: fastmem reads enabled but ZERO speculated loads compiled — "
+                + "this column measures the flag, not the feature.");
+        }
+    }
     emulator.destroy();
 
     const outPath = path.resolve(args.out ||

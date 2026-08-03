@@ -158,12 +158,23 @@ describe("wglGetProcAddress", () => {
 });
 
 describe("resolveHleExportAddress", () => {
-    test("prefers the qualified dll:name key, then the bare name", () => {
+    test("resolves only the qualified dll:name key", () => {
         const qualified = makeDispatcher({ "opengl32:glgetstring": 0x2100aaaa });
         expect(resolveHleExportAddress(qualified, "opengl32", "glGetString")).toBe(0x2100aaaa);
 
         const bare = makeDispatcher({ "glgetstring": 0x2100bbbb });
-        expect(resolveHleExportAddress(bare, "opengl32", "glGetString")).toBe(0x2100bbbb);
+        expect(resolveHleExportAddress(bare, "opengl32", "glGetString")).toBe(0);
+    });
+
+    test("does not leak a same-named export across HLE modules", () => {
+        const dispatcher = makeDispatcher({ "otherdll:mempoolinit": 0x2100cccc, "mempoolinit": 0x2100cccc });
+        expect(resolveHleExportAddress(dispatcher, "bicrt", "MemPoolInit")).toBe(0);
+    });
+
+    test("does not turn cross-module signature metadata into a kernel32 export", () => {
+        const dispatcher = makeDispatcher({});
+        expect(resolveHleExportAddress(dispatcher, "kernel32", "MemPoolInit")).toBe(0);
+        expect(dispatcher.lookups).toEqual(["kernel32:MemPoolInit"]);
     });
 
     test("returns 0 without a dispatcher rather than inventing a pointer", () => {

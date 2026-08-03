@@ -9,6 +9,11 @@ const WINDOWS_FONT_MAP: Readonly<Record<string, string>> = {
     'helvetica':            'Liberation Sans',
     'ms sans serif':        'Liberation Sans',
     'microsoft sans serif': 'Liberation Sans',
+    // NT5 resolves the dialog-manager alias to Microsoft Sans Serif. Keeping the
+    // alias unresolved lets Canvas choose a platform UI font (often Segoe UI),
+    // whose heavier stems and wider metrics do not match classic Win32 dialogs.
+    'ms shell dlg':         'Microsoft Sans Serif',
+    'ms shell dlg 2':       'Microsoft Sans Serif',
     'tahoma':               'Liberation Sans',
     'verdana':              'Liberation Sans',
     'courier new':          'Liberation Mono',

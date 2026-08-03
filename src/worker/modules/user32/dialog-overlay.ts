@@ -225,11 +225,11 @@ function getOverlayWindowZRank(hwnd: number): number {
         if (!win) break;
         if (!win.parent) {
             const zIdx = wm.getZOrder().indexOf(cur);
-            rank += (zIdx >= 0 ? zIdx : 0) * 1_000_000;
+            rank -= (zIdx >= 0 ? zIdx : 0) * 1_000_000;
         } else {
             const parent = windows.get(win.parent);
             const childIdx = parent?.children.indexOf(cur) ?? 0;
-            rank += childIdx * (10_000 ** depth);
+            rank -= childIdx * (10_000 ** depth);
         }
         depth++;
         cur = win.parent ?? 0;
@@ -249,21 +249,72 @@ function needsOverlayRepaint(win: WindowInfo): boolean {
 }
 
 /**
+ * The overlay is flat, so repainting a lower full-screen owner would leak its controls
+ * through transparent areas of an owned popup. Native USER clips that DC against windows
+ * above it. For the common fully-covered case, omitting the lower repaint is equivalent
+ * and avoids destructive overdraw.
+ */
+export function isWindowFullyCoveredByHigherTopLevel(
+    win: WindowInfo,
+    bounds: DialogOverlayRect | null = getWindowVisualBounds(win.handle),
+    excludeHwnd = 0,
+): boolean {
+    if (!bounds) return false;
+    if ((win.style & WS_CHILD) !== 0) return false;
+    const wm = System.getInstance().windowManager;
+    const zOrder = wm.getZOrder();
+    const index = zOrder.indexOf(win.handle);
+    if (index <= 0) return false;
+    for (let i = 0; i < index; i++) {
+        const higherHwnd = zOrder[i];
+        if (higherHwnd === excludeHwnd) continue;
+        const higher = windows.get(higherHwnd);
+        if (!higher || (higher.style & WS_CHILD) !== 0 || !isEffectivelyVisible(higher) || higher.pendingDestroy) continue;
+        const b = getWindowVisualBounds(higherHwnd);
+        if (!b) continue;
+        if (b.x <= bounds.x && b.y <= bounds.y
+            && b.x + b.w >= bounds.x + bounds.w
+            && b.y + b.h >= bounds.y + bounds.h) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
  * Repaint overlay-painted windows intersecting a cleared region (shared canvas).
  */
 function repaintOverlayWindowsOverlappingRect(rect: DialogOverlayRect, excludeHwnd: number): void {
     const candidates: Array<{ hwnd: number; rank: number }> = [];
     for (const win of windows.values()) {
-        if (win.handle === excludeHwnd) continue;
+        if (excludeHwnd) {
+            let cur: WindowInfo | undefined = win;
+            let excluded = false;
+            const visited = new Set<number>();
+            while (cur && !visited.has(cur.handle)) {
+                if (cur.handle === excludeHwnd) { excluded = true; break; }
+                visited.add(cur.handle);
+                cur = cur.parent ? windows.get(cur.parent) : undefined;
+            }
+            if (excluded) continue;
+        }
         if (!needsOverlayRepaint(win)) continue;
         const b = getWindowVisualBounds(win.handle);
         if (!b || !overlayRectsOverlap(rect, b)) continue;
+        if (isWindowFullyCoveredByHigherTopLevel(win, b, excludeHwnd)) continue;
         candidates.push({ hwnd: win.handle, rank: getOverlayWindowZRank(win.handle) });
     }
     candidates.sort((a, b) => a.rank - b.rank);
     for (const c of candidates) {
         invokeOverlayRepairRepaint(c.hwnd);
     }
+}
+
+export function repairOverlayWindowsOverlappingRect(
+    rect: DialogOverlayRect,
+    excludeHwnd: number = 0,
+): void {
+    repaintOverlayWindowsOverlappingRect(rect, excludeHwnd);
 }
 
 /**
@@ -312,7 +363,12 @@ export function eraseDialogOverlay(hwnd: number): void {
     // Explicit parent repaint: launcher menu behind a modal child (e.g. BOD Setup).
     const parentHwnd = win?.parent;
     if (parentHwnd) {
-        invokeOverlayRepairRepaint(parentHwnd);
+        const parent = windows.get(parentHwnd);
+        const parentBounds = parent ? getWindowVisualBounds(parentHwnd) : null;
+        if (parent && parentBounds
+            && !isWindowFullyCoveredByHigherTopLevel(parent, parentBounds, hwnd)) {
+            invokeOverlayRepairRepaint(parentHwnd);
+        }
     }
 }
 

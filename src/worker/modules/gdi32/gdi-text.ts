@@ -12,7 +12,6 @@ import { Mem } from "../../core/memory/mem-accessor";
 import type { GDIContext } from './context';
 
 const NONANTIALIASED_QUALITY = 3;
-const ANTIALIASED_QUALITY = 4;
 
 // SetTextAlign flags (wingdi.h)
 const TA_UPDATECP = 0x01;
@@ -21,13 +20,12 @@ const TA_CENTER = 0x06;
 const TA_BOTTOM = 0x08;
 const TA_BASELINE = 0x18;
 
-/** GDI renders small sizes from embedded bitmap strikes — hard-edged, no gray
- *  fringe — and games colorkey that output. Canvas fillText always antialiases,
- *  so its edge pixels survive the colorkey as grime around every glyph. */
-function wantsAliasedText(state: { fontQuality: number; fontSize: number }): boolean {
-    if (state.fontQuality === NONANTIALIASED_QUALITY) return true;
-    if (state.fontQuality >= ANTIALIASED_QUALITY) return false;
-    return state.fontSize <= 20;
+/** Honor LOGFONT quality: DEFAULT/DRAFT/PROOF do not turn font smoothing off.
+ *  Only NONANTIALIASED_QUALITY explicitly requests a hard-edged 1-bit glyph. */
+function wantsAliasedText(state: { fontQuality: number }): boolean {
+    // DEFAULT/DRAFT/PROOF quality guide font matching; they do not disable the
+    // system font smoother. Only NONANTIALIASED_QUALITY requests a 1-bit glyph.
+    return state.fontQuality === NONANTIALIASED_QUALITY;
 }
 
 let aliasScratch: OffscreenCanvas | null = null;
@@ -43,7 +41,8 @@ function fillTextAliased(
     y: number
 ): void {
     const pad = 2;
-    const w = Math.max(1, Math.ceil(ctx.measureText(text).width) + pad * 2);
+    const textWidth = ctx.measureText(text).width;
+    const w = Math.max(1, Math.ceil(textWidth) + pad * 2);
     const h = Math.max(1, Math.ceil(state.fontSize * 1.7) + pad * 2);
     if (!aliasScratch || aliasScratch.width < w || aliasScratch.height < h) {
         aliasScratch = new OffscreenCanvas(Math.max(w, aliasScratch?.width ?? 0), Math.max(h, aliasScratch?.height ?? 0));
@@ -58,7 +57,14 @@ function fillTextAliased(
     s.fillStyle = '#fff';
     s.fillText(text, pad, pad);
     const mask = s.getImageData(0, 0, w, h).data;
-    const x0 = Math.round(x) - pad, y0 = Math.round(y) - pad;
+    // The mask itself is always rasterized left-aligned, so translate Canvas' current
+    // alignment into the destination's left edge. DrawText sets textAlign to center/right
+    // for DT_CENTER/DT_RIGHT; treating its reference point as a left edge shifted every
+    // aliased caption by half/full its width and clipped it at the control boundary.
+    let left = x;
+    if (ctx.textAlign === 'center') left -= textWidth / 2;
+    else if (ctx.textAlign === 'right' || ctx.textAlign === 'end') left -= textWidth;
+    const x0 = Math.round(left) - pad, y0 = Math.round(y) - pad;
     const img = ctx.getImageData(x0, y0, w, h);
     const t = img.data;
     const cv = state.textColorValue >>> 0; // COLORREF 0x00BBGGRR
@@ -407,18 +413,25 @@ function ellipsize(ctx: TextCtx, line: string, maxWidth: number, path: boolean):
  *  no second copy of that logic. */
 function drawLaidOutLine(
     ctx: TextCtx,
+    state: { fontQuality: number; fontSize: number; textColorValue: number },
     line: LaidOutLine,
     x: number,
     y: number,
     opts: ReturnType<typeof drawTextPrefixOptions>,
 ): void {
-    if (line.underline < 0 || !opts.drawUnderline) {
-        fillTextWithMnemonic(ctx, line.text, x, y, { ...opts, processPrefix: false });
-        return;
+    // DrawText and TextOut share the selected LOGFONT quality: explicitly
+    // non-antialiased fonts use the binary mask, all other qualities use smoothing.
+    if (opts.drawText !== false && line.text) {
+        fillTextGdi(ctx, state, line.text, x, y);
     }
+
+    if (line.underline < 0 || !opts.drawUnderline) return;
+
+    // Reuse the shared mnemonic helper for underline geometry only. The glyphs
+    // were already rasterized above, potentially through the aliased path.
     const esc = (s: string) => s.replace(/&/g, '&&');
     const encoded = esc(line.text.slice(0, line.underline)) + '&' + esc(line.text.slice(line.underline));
-    fillTextWithMnemonic(ctx, encoded, x, y, opts);
+    fillTextWithMnemonic(ctx, encoded, x, y, { ...opts, drawText: false });
 }
 
 /**
@@ -535,7 +548,7 @@ export function drawText(
             target.fillStyle = state.textColor;
         }
         for (let i = 0; i < lines.length; i++) {
-            drawLaidOutLine(target, lines[i], originX, originY + i * advance, prefixOptions);
+            drawLaidOutLine(target, state, lines[i], originX, originY + i * advance, prefixOptions);
         }
         if (clipped) target.restore();
         target.textAlign = 'left';

@@ -19,6 +19,8 @@ import {
     getOrCreateListState,
     getOrCreateTrackbarState,
     getAbsoluteWindowPosition,
+    setCapture,
+    releaseCapture,
 } from './shared-state';
 import {
     repaintChildControls,
@@ -33,10 +35,24 @@ import {
     COMBO_DROP_MAX_VISIBLE,
 } from './controls';
 import { setEditCaretFromPoint } from './edit-control';
+import {
+    getOrCreateListViewState,
+    hitTestListView,
+    selectListViewAtIndex,
+    postListViewClickNotify,
+    clampListViewTopIndex,
+    listViewVisibleCount,
+    LV_SCROLLBAR_W,
+    LV_HEADER_H,
+    listViewHasHeader,
+    MK_CONTROL as LV_MK_CONTROL,
+    MK_SHIFT as LV_MK_SHIFT,
+} from './list-view-control';
 
 const WM_MOUSEMOVE   = 0x0200;
 const WM_LBUTTONDOWN = 0x0201;
 const WM_LBUTTONUP   = 0x0202;
+const WM_LBUTTONDBLCLK = 0x0203;
 const WM_COMMAND     = 0x0111;
 const WM_HSCROLL     = 0x0114;
 const WM_VSCROLL     = 0x0115;
@@ -145,11 +161,29 @@ export function normalizedControlClass(win: WindowInfo | undefined): string {
     return (win?.systemControlClass ?? '').trim().toLowerCase();
 }
 
-function postCommand(parentHwnd: number, notifyCode: number, control: WindowInfo): void {
-    const system = System.getInstance();
+export interface PendingControlNotification {
+    hwnd: number;
+    msg: number;
+    wParam: number;
+    lParam: number;
+}
+
+let pendingControlNotification: PendingControlNotification | null = null;
+
+export function takePendingControlNotification(): PendingControlNotification | null {
+    const notification = pendingControlNotification;
+    pendingControlNotification = null;
+    return notification;
+}
+
+function notifyCommand(parentHwnd: number, notifyCode: number, control: WindowInfo): void {
     const cmdWParam = ((notifyCode << 16) | ((control.controlId ?? 0) & 0xFFFF)) >>> 0;
-    system.windowManager.postMessage(parentHwnd, WM_COMMAND, cmdWParam, control.handle);
-    system.scheduler.wakeMessageWaiters();
+    pendingControlNotification = {
+        hwnd: parentHwnd,
+        msg: WM_COMMAND,
+        wParam: cmdWParam,
+        lParam: control.handle,
+    };
 }
 
 function postScroll(control: WindowInfo, code: number, pos: number): void {
@@ -174,7 +208,7 @@ export function hitTestSystemControlAtScreenPoint(
     const win = windows.get(hostHwnd);
     if (!win || !win.visible || !win.children.length) return undefined;
 
-    for (let i = win.children.length - 1; i >= 0; i--) {
+    for (let i = 0; i < win.children.length; i++) {
         const child = windows.get(win.children[i]);
         if (!child || !child.visible) continue;
 
@@ -198,7 +232,7 @@ function findOpenCombo(hostHwnd: number, visited: Set<number> = new Set<number>(
     const win = windows.get(hostHwnd);
     if (!win) return undefined;
     // Reverse child order = topmost first (matches hit-test / paint z-order).
-    for (let i = win.children.length - 1; i >= 0; i--) {
+    for (let i = 0; i < win.children.length; i++) {
         const child = windows.get(win.children[i]!);
         if (!child) continue;
         if (child.isSystemControl
@@ -263,6 +297,7 @@ let pressedButtonHwnd = 0;
 export function resetControlInteractionState(): void {
     trackbarDragHwnd = 0;
     pressedButtonHwnd = 0;
+    pendingControlNotification = null;
 }
 
 function repaintHost(control: WindowInfo, hostHwnd: number): void {
@@ -385,7 +420,7 @@ export function handleSystemControlMouseAtScreen(
                 // empty/stale text to the guest (see dialog.ts CB_SETCURSEL for the
                 // programmatic-selection half of this fix).
                 openCombo.title = state.items[idx].text;
-                postCommand(openCombo.parent ?? hostHwnd, CBN_SELCHANGE, openCombo);
+                notifyCommand(openCombo.parent ?? hostHwnd, CBN_SELCHANGE, openCombo);
             }
             // Explicitly erase the dropdown's own rect BEFORE the general repaint below.
             // getWindowVisualBounds only extends a dialog's bounds to cover an open combo's
@@ -431,6 +466,11 @@ function cancelStalePress(message: number, hitHwnd: number, hostHwnd: number): v
     if (message !== WM_LBUTTONUP || !pressedButtonHwnd || hitHwnd === pressedButtonHwnd) return;
     const pressed = windows.get(pressedButtonHwnd);
     pressedButtonHwnd = 0;
+    const captured = releaseCapture();
+    if (captured) {
+        System.getInstance().windowManager.postMessage(
+            captured, 0x0215 /* WM_CAPTURECHANGED */, 0, 0);
+    }
     if (!pressed) return;
     const cur = buttonCheckStates.get(pressed.handle) ?? 0;
     buttonCheckStates.set(pressed.handle, cur & ~BST_PUSHED);
@@ -460,6 +500,7 @@ function applyControlClassMouse(
     if (message === WM_LBUTTONDOWN
         && (control.style & WS_DISABLED_CI) === 0
         && (controlClass === 'edit' || controlClass === 'listbox' || controlClass === 'combobox'
+            || controlClass === 'syslistview32'
             || (controlClass === 'button' && isButtonSystemControl(control)))) {
         System.getInstance().windowManager.setFocus(control.handle);
     }
@@ -471,6 +512,11 @@ function applyControlClassMouse(
         case 'button': {
             if (!isButtonSystemControl(control)) return false;
             if (message === WM_LBUTTONDOWN) {
+                const previous = setCapture(control.handle);
+                if (previous && previous !== control.handle) {
+                    System.getInstance().windowManager.postMessage(
+                        previous, 0x0215 /* WM_CAPTURECHANGED */, 0, control.handle);
+                }
                 const currentState = buttonCheckStates.get(control.handle) ?? 0;
                 buttonCheckStates.set(control.handle, currentState | BST_PUSHED);
                 pressedButtonHwnd = control.handle;
@@ -488,13 +534,18 @@ function applyControlClassMouse(
                 // this guard that stray UP fired a phantom BN_CLICKED on it too.
                 if (control.handle !== pressedButtonHwnd) return false;
                 pressedButtonHwnd = 0;
+                const captured = releaseCapture();
+                if (captured) {
+                    System.getInstance().windowManager.postMessage(
+                        captured, 0x0215 /* WM_CAPTURECHANGED */, 0, 0);
+                }
                 const currentState = buttonCheckStates.get(control.handle) ?? 0;
                 buttonCheckStates.set(control.handle, currentState & ~BST_PUSHED);
                 applyAutoButtonState(parentHwnd, control);
                 repaintHost(control, hostHwnd);
                 Logger.log(LogCategory.USER32,
                     `controlMouse: Button click id=${control.controlId ?? 0} "${control.title}" -> WM_COMMAND parent=0x${parentHwnd.toString(16)}`);
-                postCommand(parentHwnd, BN_CLICKED, control);
+                notifyCommand(parentHwnd, BN_CLICKED, control);
                 return true;
             }
             return false;
@@ -516,8 +567,41 @@ function applyControlClassMouse(
                     Logger.log(LogCategory.USER32,
                         `controlMouse: Listbox id=${control.controlId ?? 0} -> selected ${idx} "${state.items[idx].text}"`);
                     repaintHost(control, hostHwnd);
-                    postCommand(parentHwnd, LBN_SELCHANGE, control);
+                    notifyCommand(parentHwnd, LBN_SELCHANGE, control);
                 }
+            }
+            return true;
+        }
+
+        case 'syslistview32': {
+            if (message !== WM_LBUTTONDOWN && message !== WM_LBUTTONDBLCLK && message !== WM_LBUTTONUP) {
+                return false;
+            }
+            if (message === WM_LBUTTONUP) return true;
+            const { x: absX, y: absY } = getAbsoluteWindowPosition(control);
+            if (handleListViewScrollbarClick(control, screenX, screenY)) {
+                repaintHost(control, hostHwnd);
+                return true;
+            }
+            const hit = hitTestListView(control, screenX - absX, screenY - absY);
+            if (hit.iItem >= 0) {
+                const mods = (wParam & (LV_MK_CONTROL | LV_MK_SHIFT)) >>> 0;
+                selectListViewAtIndex(control, hit.iItem, mods);
+                const state = getOrCreateListViewState(control.handle);
+                Logger.log(LogCategory.USER32,
+                    `controlMouse: ListView id=${control.controlId ?? 0} -> item ${hit.iItem}`
+                    + ` selCount=${state.items.filter((it) => it.state & 2).length}`
+                    + ` "${state.items[hit.iItem]?.text ?? ''}"`);
+                repaintHost(control, hostHwnd);
+                postListViewClickNotify(
+                    control,
+                    message === WM_LBUTTONDBLCLK,
+                    hit.iItem,
+                    hit.iSubItem,
+                    screenX - absX,
+                    screenY - absY,
+                    mods,
+                );
             }
             return true;
         }
@@ -589,7 +673,10 @@ export function handleSystemControlClassMouse(
     lParam: number,
 ): boolean {
     if (!control.isSystemControl) return false;
-    if (message !== WM_MOUSEMOVE && message !== WM_LBUTTONDOWN && message !== WM_LBUTTONUP) return false;
+    if (message !== WM_MOUSEMOVE && message !== WM_LBUTTONDOWN && message !== WM_LBUTTONUP
+        && message !== WM_LBUTTONDBLCLK) {
+        return false;
+    }
 
     // lParam holds SIGNED client coords relative to this control (they go negative
     // while the mouse is captured outside it).
@@ -600,6 +687,35 @@ export function handleSystemControlClassMouse(
 
     cancelStalePress(message, control.handle, hostHwnd);
     return applyControlClassMouse(control, hostHwnd, message, wParam, absX + clientX, absY + clientY);
+}
+
+/** ListView vertical scrollbar click. Returns true if the point was in the scrollbar. */
+function handleListViewScrollbarClick(list: WindowInfo, screenX: number, screenY: number): boolean {
+    const state = getOrCreateListViewState(list.handle);
+    const maxVisible = listViewVisibleCount(list);
+    if (state.items.length <= maxVisible) return false;
+
+    const { x: absX, y: absY } = getAbsoluteWindowPosition(list);
+    const headerH = listViewHasHeader(list) ? LV_HEADER_H : 0;
+    const sbX = absX + list.width - 2 - LV_SCROLLBAR_W;
+    if (screenX < sbX || screenX >= absX + list.width - 2) return false;
+
+    const sbY = absY + headerH + 2;
+    const sbH = list.height - headerH - 4;
+    const arrow = Math.min(14, Math.floor(sbH / 2));
+    const maxTop = state.items.length - maxVisible;
+
+    if (screenY < sbY + arrow) {
+        state.topIndex -= 1;
+    } else if (screenY >= sbY + sbH - arrow) {
+        state.topIndex += 1;
+    } else {
+        const trackTop = sbY + arrow;
+        const trackH = Math.max(1, sbH - arrow * 2);
+        state.topIndex = Math.round(((screenY - trackTop) / trackH) * maxTop);
+    }
+    clampListViewTopIndex(list, state);
+    return true;
 }
 
 /** Wheel scrolling for the listbox (or open combo dropdown) under the cursor. */
@@ -624,7 +740,17 @@ export function handleSystemControlWheel(
     }
 
     const control = hitTestSystemControlAtScreenPoint(hostHwnd, screenX, screenY);
-    if (!control || normalizedControlClass(control) !== 'listbox') return false;
+    if (!control) return false;
+    const cls = normalizedControlClass(control);
+    if (cls === 'syslistview32') {
+        const state = getOrCreateListViewState(control.handle);
+        if (state.items.length <= listViewVisibleCount(control)) return true;
+        state.topIndex += lines;
+        clampListViewTopIndex(control, state);
+        repaintHost(control, hostHwnd);
+        return true;
+    }
+    if (cls !== 'listbox') return false;
     const state = getOrCreateListState(control.handle);
     if (state.items.length <= listVisibleCount(control.height)) return true;
     state.topIndex += lines;

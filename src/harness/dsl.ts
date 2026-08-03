@@ -238,11 +238,12 @@ export class HarnessChain {
     // ── breakpoints / exec control ──
     // Breakpoints block until hit — unbounded RPC envelope (the CLI's CDP budget /
     // an explicit clearBreaks bounds them). Pass {continuous:true} to return at once.
-    breakOn(eip: number | string, opts?: { continuous?: boolean; pause?: boolean }): this { return this.pushTimed("breakOn", [eip, opts], 0); }
-    breakOnExport(name: string, opts?: { continuous?: boolean; pause?: boolean }): this { return this.pushTimed("breakOnExport", [name, opts], 0); }
-    breakOnSymbol(name: string, opts?: { continuous?: boolean; pause?: boolean }): this { return this.pushTimed("breakOnSymbol", [name, opts], 0); }
+    breakOn(eip: number | string, opts?: { continuous?: boolean; pause?: boolean; fast?: boolean; when?: { arg: number; ebp?: boolean; eq?: number; ne?: number } }): this { return this.pushTimed("breakOn", [eip, opts], 0); }
+    breakOnExport(name: string, opts?: { continuous?: boolean; pause?: boolean; fast?: boolean; when?: { arg: number; ebp?: boolean; eq?: number; ne?: number } }): this { return this.pushTimed("breakOnExport", [name, opts], 0); }
+    breakOnSymbol(name: string, opts?: { continuous?: boolean; pause?: boolean; fast?: boolean; when?: { arg: number; ebp?: boolean; eq?: number; ne?: number } }): this { return this.pushTimed("breakOnSymbol", [name, opts], 0); }
     /** `argEq` breaks only when a stack argument matches — the way to hit ONE call of a hot API. */
     breakOnApi(pattern: string, opts?: { continuous?: boolean; argEq?: { index: number; value: number } }): this { return this.pushTimed("breakOnApi", [pattern, opts], 0); }
+    clearBreaks(): this { return this.push("clearBreaks", []); }
     watchMem(addr: number | string, opts?: { onWrite?: boolean }): this { return this.push("watchMem", [addr, opts]); }
     pause(): this { return this.push("pause", []); }
     resume(): this { return this.push("resume", []); }
@@ -281,7 +282,6 @@ export class HarnessChain {
     /** Ordered SUBSEQUENCE over the wmTrace ring. Patterns: 'WM_MOUSEMOVE@400,300',
      *  'WM_KEYDOWN vk=0x57', 'WM_KEYDOWN vk=0x57 repeat'. */
     expectMessages(patterns: string[]): this { return this.push("expectMessages", [patterns]); }
-
     /** Execute the chain; returns one accumulated POJO. */
     run(): Promise<HarnessRunResult> {
         return this.exec(this.steps);

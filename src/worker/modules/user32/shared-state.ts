@@ -26,11 +26,12 @@ export interface WindowInfo {
     controlId?: number;           // DLGITEMTEMPLATE.id (for dialog child controls)
     isSystemControl?: boolean;    // true for JS-handled Button/Static/Edit
     systemControlClass?: string;  // 'Button' | 'Static' | 'Edit' | etc.
+    /** Pixels are produced by a dedicated HLE subsystem (for example video frames),
+     *  not by default control chrome or the generic guest WM_PAINT chain. */
+    externalPaintManaged?: boolean;
     lastActivePopupHwnd?: number; // last activated owned popup (for GetLastActivePopup)
     /** Win32 class name (e.g. SysAnimate32) for common-control routing. */
     nativeClassName?: string;
-    /** Client-area message drawn when the template has no Static control (e.g. HL MCI error). */
-    clientMessage?: string;
     /** HFONT currently assigned by WM_SETFONT / dialog-template DS_SETFONT. */
     fontHandle?: number;
     /** Dialog default push button id (DM_GETDEFID / BM_SETSTYLE bookkeeping). */
@@ -61,25 +62,6 @@ export interface WindowInfo {
      *  fullscreen). The presenter composites these windows' rects from the GDI overlay
      *  on top of every flip, and mouse routing prefers them. See dialog-overlay.ts. */
     overlayOnFlipScreen?: boolean;
-}
-
-/** Recent LoadStringA result — consumed when the next dialog is created. */
-export let lastLoadStringHint: { text: string; at: number } | null = null;
-
-export function noteLoadStringForDialog(text: string): void {
-    if (!text) return;
-    lastLoadStringHint = { text, at: performance.now() };
-}
-
-export function consumeLoadStringHint(maxAgeMs = 5000): string | undefined {
-    if (!lastLoadStringHint) return undefined;
-    if (performance.now() - lastLoadStringHint.at > maxAgeMs) {
-        lastLoadStringHint = null;
-        return undefined;
-    }
-    const t = lastLoadStringHint.text;
-    lastLoadStringHint = null;
-    return t;
 }
 
 export function markGuestCustomPaint(hwnd: number): void {
@@ -134,37 +116,28 @@ export function finalizeWindowDestroy(hwnd: number): void {
     windowDestroyFinalizer?.(hwnd >>> 0);
 }
 
-/**
- * Best-effort fallback for dialogs that load their body text via LoadStringA but
- * declare no control to host it (e.g. HL's MCI-error box, which paints the loaded
- * string into the bare client area). We stamp the most recent LoadStringA result
- * onto such a dialog so paintDialogClientMessage can render it.
- *
- * Deliberately narrow to avoid putting stray text into other games' dialogs:
- *   - skip if the dialog already declares a Static/text control (the normal place
- *     for body text) — only truly empty dialogs inherit the hint;
- *   - ANSI only (LoadStringW does not feed the hint) — the targeted path is A;
- *   - time-bounded (consumeLoadStringHint's maxAge) so an unrelated earlier
- *     LoadStringA can't leak into a much-later dialog.
- */
-export function assignPendingClientMessage(win: WindowInfo): void {
-    if (win.clientMessage) return;
-    // If the dialog has a Static child, it has a proper home for body text — don't
-    // grab the hint (prevents cross-game false positives on ordinary dialogs).
-    for (const childHandle of win.children) {
-        const child = windows.get(childHandle);
-        if (child?.isSystemControl && /static/i.test(child.systemControlClass ?? '')) {
-            return;
-        }
-    }
-    const hint = consumeLoadStringHint();
-    if (hint) win.clientMessage = hint;
-}
-
 export const windows: Map<number, WindowInfo> = new Map();
 
 export function getWindowByHandle(handle: number): WindowInfo | undefined {
     return windows.get(handle);
+}
+
+/**
+ * A subclassed STATIC commonly paints transparent text over its parent's pixels.
+ * Its temporary paint DC must therefore start from the parent's retained client,
+ * not from the STATIC's previous completed frame (which already contains the glyphs).
+ */
+export function shouldSeedPaintFromParent(window: WindowInfo): boolean {
+    if (window.parent === undefined) return false;
+    if (window.wndProcSubclassed === true
+        && window.systemControlClass?.toLowerCase() === 'static') return true;
+
+    // A page HWND hosted by an image STATIC starts with the host's pixels. Using
+    // a fresh COLOR_BTNFACE backing here leaks a seam at the ancestor clip and
+    // loses the bitmap when pages are hidden/shown.
+    const parent = windows.get(window.parent);
+    return parent?.systemControlClass?.toLowerCase() === 'static'
+        && controlImageHandles.has(parent.handle);
 }
 
 export function findChildByControlId(
@@ -190,9 +163,35 @@ export function findChildByControlId(
 /** HWND_TOP / HWND_BOTTOM sentinels for child Z-order (unsigned as guest passes them). */
 const HWND_TOP = 0;
 const HWND_BOTTOM = 1;
+const HWND_TOPMOST = -1;
+const HWND_NOTOPMOST = -2;
 
 /**
- * Reorder a child within its parent's children[] (last entry = topmost / front).
+ * NT ValidateWindowPos rejects HWND_TOPMOST/HWND_NOTOPMOST for child windows.
+ * Since validation happens before any WINDOWPOS member is applied, the whole request
+ * (including move, size, and visibility flags) becomes a no-op. SWP_NOZORDER makes
+ * hWndInsertAfter irrelevant, so the request remains valid in that case.
+ */
+export function isWindowPosZOrderRequestValid(window: WindowInfo, insertAfter: number, flags: number): boolean {
+    const SWP_NOZORDER = 0x0004;
+    const WS_CHILD = 0x40000000;
+    if ((flags & SWP_NOZORDER) !== 0) return true;
+
+    const ia = insertAfter | 0;
+    const isChild = (window.style & WS_CHILD) !== 0;
+    if (isChild && (ia === HWND_TOPMOST || ia === HWND_NOTOPMOST)) return false;
+    if (ia === HWND_TOP || ia === HWND_BOTTOM || ia === HWND_TOPMOST || ia === HWND_NOTOPMOST) return true;
+
+    const sibling = windows.get(insertAfter >>> 0);
+    if (!sibling) return false;
+    if (isChild) {
+        return (sibling.style & WS_CHILD) !== 0 && sibling.parent === window.parent;
+    }
+    return (sibling.style & WS_CHILD) === 0;
+}
+
+/**
+ * Reorder a child within its parent's children[] (front to back).
  * Mirrors SetWindowPos Z-order for WS_CHILD windows.
  */
 export function reorderChildInParent(childHwnd: number, insertAfter: number): void {
@@ -207,12 +206,12 @@ export function reorderChildInParent(childHwnd: number, insertAfter: number): vo
     children.splice(idx, 1);
 
     const ia = insertAfter | 0;
-    if (ia === HWND_TOP || ia === -1) {
-        children.push(childHwnd);
+    if (ia === HWND_TOP || ia === HWND_TOPMOST) {
+        children.unshift(childHwnd);
         return;
     }
     if (ia === HWND_BOTTOM || ia === 1) {
-        children.unshift(childHwnd);
+        children.push(childHwnd);
         return;
     }
     const afterIdx = children.indexOf(ia >>> 0);
@@ -263,6 +262,22 @@ export function setLockWindowUpdate(hwnd: number): number {
 
 export function getLockWindowUpdate(): number {
     return lockWindowUpdateHwnd;
+}
+
+/**
+ * win32u NtUserLockWindowUpdate: hwnd=0 unlocks; a non-zero hwnd locks only when
+ * nothing is currently locked (InterlockedCompareExchange against NULL).
+ * @returns TRUE on success, FALSE if a lock is already held.
+ */
+export function tryLockWindowUpdate(hwnd: number): boolean {
+    hwnd = hwnd >>> 0;
+    if (!hwnd) {
+        lockWindowUpdateHwnd = 0;
+        return true;
+    }
+    if (lockWindowUpdateHwnd !== 0) return false;
+    lockWindowUpdateHwnd = hwnd;
+    return true;
 }
 
 /** True if hwnd is the locked window or a descendant of it. */
@@ -402,6 +417,25 @@ export function getChildWindowExclusions(
     };
     walk(hwnd);
     return out;
+}
+
+/** True when a guest-owned child HWND covers the parent's client rect inside `inset`. */
+export function isCoveredByGuestChild(hwnd: number, inset = 0): boolean {
+    const window = windows.get(hwnd);
+    if (!window || window.width <= 0 || window.height <= 0) return false;
+    const origin = getAbsoluteWindowPosition(window);
+    const left = origin.x + inset;
+    const top = origin.y + inset;
+    const right = origin.x + window.width - inset;
+    const bottom = origin.y + window.height - inset;
+    return getChildWindowExclusions(hwnd).some(rect =>
+        rect.x <= left && rect.y <= top
+        && rect.x + rect.w >= right && rect.y + rect.h >= bottom);
+}
+
+/** True when a guest-owned child HWND covers the entire client rectangle. */
+export function isFullyCoveredByGuestChild(hwnd: number): boolean {
+    return isCoveredByGuestChild(hwnd, 0);
 }
 
 /**
@@ -800,7 +834,6 @@ export function resetUser32SharedState(): void {
     lastWarpTarget = null;
     warpModeActive = false;
     if (warpReleaseTimer) { clearTimeout(warpReleaseTimer); warpReleaseTimer = null; }
-    lastLoadStringHint = null;
     buttonCheckStates.clear();
     listControlStates.clear();
     trackbarStates.clear();

@@ -1,12 +1,11 @@
 /**
  * SysAnimate32 common control — AVI playback via VideoEngine (FFmpeg WASM).
- * HL Day One: ACM_OPENA "media\\logo.avi" + ShowWindow / ACM_PLAY on 0x1001a.
+ * Playback starts on ACM_PLAY, or immediately after ACM_OPEN when ACS_AUTOPLAY is set.
  */
 
 import { Logger, LogCategory } from '../../core/logger';
 import { Marshaler } from '../../core/memory/marshaler';
 import { System } from '../../core/system';
-import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { TimeService } from '../../runtime/time';
 import { videoEngine } from '../../../video/video-engine';
 import { registerBuiltinClass } from './class';
@@ -19,6 +18,9 @@ const ACM_PLAY = 0x0400 + 102;
 const ACM_STOP = 0x0400 + 103;
 const ACM_CLOSE = 0x0400 + 104;
 const ACM_ISPLAYING = 0x0400 + 105;
+
+/** Animation control styles (commctrl.h). */
+const ACS_AUTOPLAY = 0x0004;
 
 const ACN_START = 1;
 const ACN_STOP = 2;
@@ -72,8 +74,19 @@ function emptyState(filePath = '', vfsPath = ''): AnimateState {
 export function ensureAnimateControlClasses(): void {
     if (classesRegistered) return;
     classesRegistered = true;
-    registerBuiltinClass('SysAnimate32', { cbWndExtra: 4 });
-    registerBuiltinClass('SysAnimate32_class', { cbWndExtra: 4 });
+    // Common-control HWNDs participate in USER's system-control paint ordering.
+    // In particular, ACS_TRANSPARENT must leave the parent's pixels underneath;
+    // treating the control as a guest-owned child punches an unpainted hole there.
+    registerBuiltinClass('SysAnimate32', {
+        cbWndExtra: 4,
+        controlClass: 'SysAnimate32',
+        externalPaintManaged: true,
+    });
+    registerBuiltinClass('SysAnimate32_class', {
+        cbWndExtra: 4,
+        controlClass: 'SysAnimate32_class',
+        externalPaintManaged: true,
+    });
 }
 
 export function isAnimateControlWindow(win: WindowInfo | undefined): boolean {
@@ -297,13 +310,6 @@ async function startPlayback(hwnd: number, win: WindowInfo): Promise<void> {
     st.playing = true;
 
     try {
-        if (EmulatorConfig.getInstance().skipVideo) {
-            Logger.log(LogCategory.USER32,
-                `SysAnimate32: playback skipped (skipVideo) hwnd=0x${hwnd.toString(16)}`);
-            scheduleStubPlayback(hwnd, win, st.repeats);
-            return;
-        }
-
         const vfsPath = st.vfsPath || resolveMediaVfsPath(st.filePath);
         if (!vfsPath) {
             Logger.warn(LogCategory.USER32,
@@ -379,7 +385,7 @@ async function startPlayback(hwnd: number, win: WindowInfo): Promise<void> {
     }
 }
 
-/** Start decode when HL opens the AVI but never sends ACM_PLAY (common in hl.log). */
+/** Start decode when play is pending and the window is visible. */
 function tryStartPlayback(hwnd: number): void {
     const st = animateStates.get(hwnd);
     const win = windows.get(hwnd);
@@ -395,34 +401,42 @@ function tryStartPlayback(hwnd: number): void {
     void startPlayback(hwnd, win);
 }
 
+function hasAutoPlayStyle(win: WindowInfo | undefined): boolean {
+    return !!win && ((win.style >>> 0) & ACS_AUTOPLAY) !== 0;
+}
+
 function openAnimateFile(hwnd: number, path: string): number {
     if (!path) return 0;
 
     stopPlayback(hwnd, false);
     const vfsPath = resolveMediaVfsPath(path);
     const st = emptyState(path, vfsPath ?? '');
-    st.playPending = true;
+    const win = windows.get(hwnd);
+    // MSDN: ACS_AUTOPLAY begins playing immediately after ACM_OPEN; otherwise ACM_PLAY.
+    if (hasAutoPlayStyle(win)) {
+        st.playPending = true;
+        st.repeats = REPEAT_FOREVER;
+    }
     animateStates.set(hwnd, st);
 
     Logger.log(LogCategory.USER32,
         `SysAnimate32 ACM_OPEN hwnd=0x${hwnd.toString(16)} guest="${path}"` +
-        (vfsPath ? ` vfs="${vfsPath}" size=${System.getInstance().fileSystem.getFileSize(vfsPath)}` : ' (NOT IN BUNDLE)'));
+        (vfsPath ? ` vfs="${vfsPath}" size=${System.getInstance().fileSystem.getFileSize(vfsPath)}` : ' (NOT IN BUNDLE)') +
+        (hasAutoPlayStyle(win) ? ' ACS_AUTOPLAY' : ''));
 
-    const win = windows.get(hwnd);
-    if (win) tryStartPlayback(hwnd);
+    if (win && st.playPending) tryStartPlayback(hwnd);
 
-    // Win32: FALSE if file missing — HL may skip logo but continues to launcher.
+    // Win32: FALSE if file missing.
     return vfsPath ? 1 : 0;
 }
 
-/** Called from ShowWindow when SysAnimate32 becomes visible. */
+/** Called from ShowWindow when SysAnimate32 becomes visible/hidden. */
 export function onAnimateShowWindow(hwnd: number, nCmdShow: number): void {
     const st = animateStates.get(hwnd);
     if (!st?.filePath) return;
 
     if (nCmdShow === 0) {
-        const st = animateStates.get(hwnd);
-        if (st?.startInFlight) {
+        if (st.startInFlight) {
             Logger.log(LogCategory.USER32,
                 `SysAnimate32: ShowWindow(0x${hwnd.toString(16)}, SW_HIDE) during startInFlight — defer cancel`);
             return;
@@ -433,11 +447,10 @@ export function onAnimateShowWindow(hwnd: number, nCmdShow: number): void {
         return;
     }
 
-    st.playPending = true;
-    // HL never sends ACM_PLAY — logo.avi loops on the main menu until SW_HIDE / ACM_STOP.
-    if (st.repeats === 0) st.repeats = REPEAT_FOREVER;
+    // Show alone does not start playback — only resume a pending/open autoplay or ACM_PLAY.
+    if (!st.playPending && !st.playing) return;
     Logger.log(LogCategory.USER32,
-        `SysAnimate32: ShowWindow(0x${hwnd.toString(16)}, ${nCmdShow}) → try playback "${st.filePath}" repeats=${st.repeats >>> 0}`);
+        `SysAnimate32: ShowWindow(0x${hwnd.toString(16)}, ${nCmdShow}) → resume "${st.filePath}" repeats=${st.repeats >>> 0}`);
     tryStartPlayback(hwnd);
 }
 

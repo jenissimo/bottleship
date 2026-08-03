@@ -6,6 +6,7 @@ import { assignStubsOnce } from "../../../core/thunking/stub-merge";
 import { ThunkImplementation } from "../../../core/thunking/thunk-dispatcher";
 import { System } from "../../../core/system";
 import { DDrawContext } from "../context";
+import { resolveDDrawTearOff } from "../com-tearoff";
 import { bytesToGuid } from "../helpers";
 import { isValidAddress } from "../../../core/memory/address-guard";
 import { initReturnPtr } from "../../../backends/webgpu/shared/dx-com-helpers";
@@ -65,7 +66,7 @@ import {
     D3DVector,
 } from "./types";
 import { setDeviceRenderTarget } from "./texture-manager";
-import { setAuthorityGpu, surfaceSyncManager, syncActiveGdiContextBeforeD3D } from "../surface-sync";
+import { surfaceSyncManager, syncActiveGdiContextBeforeD3D } from "../surface-sync";
 import { createDeviceStubsExports } from "./device-impl-stubs";
 import {
     fillDeviceDesc,
@@ -374,6 +375,36 @@ export const createDeviceExports = (
         if (!lplpDirect3D || !isValidAddress(mem, lplpDirect3D, 4)) return D3DERR_INVALIDCALL;
         initReturnPtr(lplpDirect3D);
 
+        // Devices created from an IDirect3D tear-off keep the owning DirectDraw COM
+        // object as their parent. Resolve the requested D3D generation from that live
+        // owner instead of manufacturing a second object. Besides preserving COM
+        // identity, the owner holds the tear-off alive after the caller releases it.
+        //
+        // The old standalone cache stored only a guest address. Once the caller
+        // released that object, the allocator could reuse the address for an unrelated
+        // COM object; a later GetDirect3D then returned (and AddRef'd) that object.
+        const owningParentPtr = deviceObj?.getParentD3() ?? 0;
+        const owningParent = owningParentPtr
+            ? resourceProvider.getComObjectByAddress(owningParentPtr)
+            : null;
+        if (owningParent) {
+            const tearOffResult = resolveDDrawTearOff(
+                context,
+                owningParent,
+                PARENT_D3_IID[iface].toLowerCase(),
+                lplpDirect3D,
+                mem,
+            );
+            if (tearOffResult !== null) return tearOffResult;
+
+            const expectedVtable = context.vtables[iface]?.address;
+            if (expectedVtable && owningParent.vtableAddress === expectedVtable) {
+                owningParent.addRef(owningParentPtr);
+                getDataView(mem).setUint32(lplpDirect3D, owningParentPtr, true);
+                return D3D_OK;
+            }
+        }
+
         let cache: Map<ParentD3Iface, number> | undefined;
         if (deviceObj) {
             cache = parentD3ByDevice.get(deviceObj);
@@ -386,8 +417,17 @@ export const createDeviceExports = (
         let parentPtr = cache?.get(iface) ?? 0;
         if (parentPtr) {
             const parentObj = resourceProvider.getComObjectByAddress(parentPtr);
-            if (parentObj) parentObj.addRef();
-        } else {
+            const expectedVtable = context.vtables[iface]?.address;
+            if (parentObj && parentObj.vtableAddress === expectedVtable) {
+                parentObj.addRef(parentPtr);
+            } else {
+                // Never trust an address-only cache entry after its COM object died:
+                // guest COM allocations are reusable.
+                cache?.delete(iface);
+                parentPtr = 0;
+            }
+        }
+        if (!parentPtr) {
             const vtableAddr = context.vtables[iface]?.address;
             if (!vtableAddr) return D3DERR_INVALIDCALL;
             const parentObj = ComObjectFactory.create(PARENT_D3_IID[iface], vtableAddr);
@@ -719,28 +759,12 @@ export const createDeviceExports = (
     exports["IDirect3DDevice7_EndScene"] = (ctx, mem, args) => {
         const thisPtr = args[0];
         Logger.log(LogCategory.SYSTEM, `IDirect3DDevice7_EndScene: this=0x${thisPtr.toString(16)} - ending frame and resetting ring buffers`);
-        // If the game later calls Lock() on the RT (screenshots/postprocess on CPU), surface-sync must perform GPU->CPU sync so CPU reads current framebuffer.
-
-        // Mark render target as GPU dirty BEFORE endFrame to prevent next BeginScene from overwriting
-        const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DDevice7Object | null;
-        if (obj) {
-            const rtAddr = obj.getRenderTarget() || context.surfaces.backBuffer || context.surfaces.primary;
-            if (rtAddr) {
-                const rtObj = resourceProvider.getComObjectByAddress(rtAddr) as DirectDrawSurfaceObject | null;
-                const state = rtObj?.getState();
-                if (state) {
-                    setAuthorityGpu(state, true);
-                    Logger.log(LogCategory.DDRAW, `IDirect3DDevice7_EndScene: Marked RT 0x${rtAddr.toString(16)} modeStr=gpu`);
-                } else {
-                    Logger.warn(LogCategory.DDRAW, `IDirect3DDevice7_EndScene: RT 0x${rtAddr.toString(16)} has no state!`);
-                }
-            } else {
-                Logger.warn(LogCategory.DDRAW, `IDirect3DDevice7_EndScene: No RT found! getRenderTarget=${obj.getRenderTarget()} backBuffer=${context.surfaces.backBuffer} primary=${context.surfaces.primary}`);
-            }
-        } else {
-            Logger.warn(LogCategory.DDRAW, `IDirect3DDevice7_EndScene: Device object not found for this=0x${thisPtr.toString(16)}`);
-        }
-
+        // Do NOT setAuthorityGpu here. Real GPU writes already mark the RT
+        // (immediate draw / Clear / flushBatch when actualDrawCalls > 0). An
+        // unconditional bump on empty Begin/EndScene forces Lock into a full
+        // GPU→CPU readback of unchanged pixels and double-bumps scenes that drew.
+        // endFrame() flushes pending batches so authority is set before the guest
+        // can Lock after this call returns.
         if (context.executor) {
             context.executor.endFrame();
         }
@@ -1361,22 +1385,7 @@ export const createDeviceExports = (
     exports["IDirect3DDevice3_EndScene"] = (ctx, mem, args) => {
         const thisPtr = args[0];
         Logger.log(LogCategory.SYSTEM, `IDirect3DDevice3_EndScene: this=0x${thisPtr.toString(16)} - ending frame and resetting ring buffers`);
-        // If the game later calls Lock() on the RT (screenshots/postprocess on CPU), surface-sync must perform GPU->CPU sync so CPU reads current framebuffer.
-
-        // Mark render target as GPU dirty BEFORE endFrame to prevent next BeginScene from overwriting
-        const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DDevice3Object | null;
-        if (obj) {
-            const rtAddr = obj.getRenderTarget() || context.surfaces.backBuffer || context.surfaces.primary;
-            if (rtAddr) {
-                const rtObj = resourceProvider.getComObjectByAddress(rtAddr) as DirectDrawSurfaceObject | null;
-                const state = rtObj?.getState();
-                if (state) {
-                    setAuthorityGpu(state, true);
-                    Logger.verbose(LogCategory.DDRAW, `IDirect3DDevice3_EndScene: Marked RT 0x${rtAddr.toString(16)} modeStr=gpu`);
-                }
-            }
-        }
-
+        // Same as Device7: authority belongs to real GPU writes / flushBatch, not EndScene.
         if (context.executor) {
             context.executor.endFrame();
         }

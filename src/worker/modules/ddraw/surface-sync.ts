@@ -21,6 +21,7 @@ import {
     decodeSurfaceFormatToRgba8,
     getSurfaceFormatLayout,
 } from "../../backends/webgpu/shared/texture-formats";
+import { awaitInflightPrefetch } from "./surface-readback-prefetch";
 
 // ============================================================================
 // LEASE VALIDATION (single source of truth for pixel-write safety)
@@ -144,6 +145,30 @@ export const setAuthorityCpu = (state: DirectDrawSurfaceState): void => {
     state.gpuDirty = true; // GPU texture needs re-upload
 };
 
+/** Add a CPU-written rectangle to the region that the next upload must copy. */
+export function unionSurfaceDirtyRegion(
+    state: DirectDrawSurfaceState,
+    rect: { left: number; top: number; right: number; bottom: number }
+): void {
+    if (!isRenderSurface(state)) return;
+
+    const left = Math.max(0, Math.min(state.width, rect.left));
+    const top = Math.max(0, Math.min(state.height, rect.top));
+    const right = Math.max(left, Math.min(state.width, rect.right));
+    const bottom = Math.max(top, Math.min(state.height, rect.bottom));
+    if (right <= left || bottom <= top) return;
+
+    if (!state.dirtyRegion) {
+        state.dirtyRegion = { left, top, right, bottom };
+        return;
+    }
+
+    state.dirtyRegion.left = Math.min(state.dirtyRegion.left, left);
+    state.dirtyRegion.top = Math.min(state.dirtyRegion.top, top);
+    state.dirtyRegion.right = Math.max(state.dirtyRegion.right, right);
+    state.dirtyRegion.bottom = Math.max(state.dirtyRegion.bottom, bottom);
+}
+
 /** CPU-First: Mark that GPU wrote to texture (D3D DrawPrimitive).
  *  Sets gpuWrittenVersion for demotion detection.
  *  IMPORTANT: Only applies to RenderSurface in GPU_ONLY mode.
@@ -206,14 +231,26 @@ export const markGpuSyncedFromCpu = (state: DirectDrawSurfaceState): void => {
  *  cannot serve stale pixels.
  *  BitmapTextureSurface never syncs GPU→CPU.
  */
-export const markCpuSyncedFromGpu = (state: DirectDrawSurfaceState): void => {
+export const markCpuSyncedFromGpu = (
+    state: DirectDrawSurfaceState,
+    expectedVersion?: number,
+): boolean => {
     if (isBitmapTexture(state)) {
         // BitmapTextureSurface is immutable - this should never be called
         Logger.warn(LogCategory.DDRAW, "markCpuSyncedFromGpu called on BitmapTextureSurface - ignoring");
-        return;
+        return false;
     }
 
-    state.cpuSyncedVersion = state.version;
+    // An async copy/map may finish after another GPU write bumped the surface.
+    // The bytes that just landed belong to expectedVersion, never to the newer
+    // version. Leaving the memo unset makes Lock retry instead of serving stale
+    // pixels; this is the correctness gate that makes speculative prefetch safe.
+    const version = expectedVersion ?? state.version;
+    if (state.version !== version) {
+        return false;
+    }
+    state.cpuSyncedVersion = version;
+    return true;
 };
 
 /** Drop the readback memo. Required wherever `version` is assigned rather than
@@ -1062,8 +1099,15 @@ export class SurfaceSyncManager {
         state: DirectDrawSurfaceState,
         device: GPUDevice,
         queue: GPUQueue,
-        textureConverter?: TextureConverter
+        textureConverter?: TextureConverter,
+        opts?: { fromPrefetch?: boolean }
     ): Promise<boolean> {
+        // Prefer a version-matched in-flight prefetch over starting a second trip.
+        // Prefetch itself must not await its own promise (deadlock).
+        if (!opts?.fromPrefetch && await awaitInflightPrefetch(state)) {
+            return true;
+        }
+
         const decision = this.needsCPUSync(state);
         if (!decision.needed) {
             Logger.verbose(
@@ -1118,6 +1162,12 @@ export class SurfaceSyncManager {
             if (this.syncToCPUFromScratch(state, mem)) {
                 return true;
             }
+            if (!isRenderSurface(state)) return false;
+
+            // Capture only after the synchronous scratch path. All GPU bytes copied
+            // below belong to this version even if another writer advances the state
+            // while mapAsync is pending.
+            const readbackVersion = state.version;
 
             // ================================================================
             // GPU COMPUTE FAST PATH: Use compute shader for format conversion
@@ -1161,7 +1211,7 @@ export class SurfaceSyncManager {
 
                     if (inBounds && !overlapsThunkCode(state.surfacePtr, totalWriteSize)) {
                         mem.set(converted.subarray(0, totalWriteSize), state.surfacePtr);
-                        markCpuSyncedFromGpu(state);
+                        const versionStillCurrent = markCpuSyncedFromGpu(state, readbackVersion);
 
                         profiler.increment("SurfaceSyncManager.syncToCPU", "bytes", totalWriteSize);
                         profiler.endToken(gpuConvertToken);
@@ -1187,7 +1237,7 @@ export class SurfaceSyncManager {
                         Logger.log(LogCategory.DDRAW,
                             `syncToCPU GPU COMPUTE PATH completed for 0x${state.surfacePtr.toString(16)} ` +
                             `(${totalWriteSize} bytes, format=${surfacePixelFormat})`);
-                        return true;
+                        return versionStillCurrent;
                     } else {
                         Logger.warn(LogCategory.DDRAW,
                             `syncToCPU: GPU convert succeeded but write blocked (bounds=${inBounds}, thunk=${overlapsThunkCode(state.surfacePtr, totalWriteSize)})`);
@@ -1270,13 +1320,13 @@ export class SurfaceSyncManager {
                 releaseReadback();
 
                 profiler.endToken(copyConvertToken);
-                markCpuSyncedFromGpu(state);
+                const versionStillCurrent = markCpuSyncedFromGpu(state, readbackVersion);
                 profiler.increment("SurfaceSyncManager.syncToCPU", "bytes", unpaddedBytesPerRow * height);
                 Logger.log(
                     LogCategory.DDRAW,
                     `syncToCPU: FAST BGRA copy completed for 0x${state.surfacePtr.toString(16)} ${width}x${height}`
                 );
-                return true;
+                return versionStillCurrent;
             }
 
             // Extract RGBA data (remove padding when needed)
@@ -1325,7 +1375,7 @@ export class SurfaceSyncManager {
                     }
                     state.rgbaScratch.set(rgbaData);
                 }
-                state.rgbaScratchVersion = state.version;
+                state.rgbaScratchVersion = readbackVersion;
             }
 
             const rgbaClamped = rgbaData instanceof Uint8ClampedArray
@@ -1345,14 +1395,14 @@ export class SurfaceSyncManager {
                 releaseReadback();
             }
             profiler.endToken(copyConvertToken);
-            markCpuSyncedFromGpu(state);
+            const versionStillCurrent = markCpuSyncedFromGpu(state, readbackVersion);
 
             profiler.increment("SurfaceSyncManager.syncToCPU", "bytes", rgbaData.byteLength);
             Logger.log(
                 LogCategory.DDRAW,
                 `syncToCPU: completed for 0x${state.surfacePtr.toString(16)} ${width}x${height}`
             );
-            return true;
+            return versionStillCurrent;
         } catch (e) {
             Logger.warn(LogCategory.SYSTEM, `syncToCPU: Failed: ${e}`);
             return false;
@@ -1365,3 +1415,15 @@ export class SurfaceSyncManager {
 
 // Singleton instance
 export const surfaceSyncManager = new SurfaceSyncManager();
+
+/**
+ * A D3D render target must consume any newer CPU writes before the next draw.
+ *
+ * This is intentionally independent of the surface caps. Legacy games can mix
+ * DirectDraw CPU blits with D3D rendering on an ordinary video-memory
+ * backbuffer. Limiting this check to texture/system-memory targets leaves those
+ * CPU writes invisible to the GPU.
+ */
+export function needsRenderTargetUploadBeforeDraw(state: DirectDrawSurfaceState): boolean {
+    return surfaceSyncManager.needsGPUSync(state).needed;
+}

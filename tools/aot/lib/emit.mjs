@@ -8,11 +8,9 @@
 // instruction independently correct rather than correct-in-a-sequence.
 //
 // What this producer does DIFFERENTLY from the live JIT, on purpose (contract §9):
-//   - it emits ONLY the TLB memory shapes (contract N45/N46/N40), never fastmem. That removes
-//     the module prologue's `fastmem_deopt_jit_unit(<baked table index>)` guard — one of the
-//     two sites that bake the wasm table index (contract §9.1 / handoff §2.1(1)) — and it also
-//     removes every baked `mem8` and `fastmem_generation` constant, because a TLB entry already
-//     carries `mem8` folded in. The unit is therefore relocatable into ANY free slot.
+//   - it emits ONLY the TLB memory shapes (contract N45/N46/N40), never fastmem. A read-map
+//     fastmem body bakes the map base and its direct memory access shape; the TLB path keeps
+//     the unit relocatable and avoids that policy-dependent codegen surface.
 //   - it never calls `jit_find_cache_entry_in_page`: an indirect terminator (RET) flushes and
 //     leaves. That removes the second baked-index site. No ret-chaining, no ret-speculation.
 //   ⇒ the body contains no slot number at all, which is contract checklist E1 satisfied by

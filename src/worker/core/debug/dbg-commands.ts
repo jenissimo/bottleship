@@ -294,19 +294,28 @@ export const dbg = {
         console.log("[dbg] JIT cache cleared (JIT state unchanged)");
     },
     /** Generic set_jit_config(index,value) + clear cache, for bisecting JIT knobs.
-     *  index: 0=JIT_DISABLED 1=MAX_PAGES 2=JIT_USE_LOOP_SAFETY 3=MAX_EXTRA_BASIC_BLOCKS
-     *  4=JIT_BLOCK_CHAINING 5=JIT_DEAD_FLAG_ELISION 6=JIT_INDIRECT_REGIONS
-     *  7=JIT_INDIRECT_REGION_MIN_SHARE(%) 8=JIT_INDIRECT_REGION_MAX_PAGES
-     *  9=JIT_FASTMEM_READS 10=JIT_X87_LOCALS 11=JIT_PUSH_RUN_COALESCING
-     *  12=JIT_RET_CHAINING 13=JIT_RET_SPECULATION 14=JIT_RET_SPEC_MAX_INSTR
-     *  15=JIT_TIER2_THRESHOLD 16=JIT_TIER2_RET_SPEC_MAX_INSTR.
-     *  Then reads all knobs back. */
+     *  The current ABI supports 0-3, 5-8, 10-17, 19, and 21-23; retired slots
+     *  4, 9, and 18 are explicitly rejected when the ABI mask is available.
+     *  Then reads the active knobs back. */
     jitcfg(index: number, value: number): void {
         const w = wasm(); if (!w) return;
-        if (w.set_jit_config) w.set_jit_config(index >>> 0, value >>> 0);
+        const requested = index >>> 0;
+        const supportedMask = typeof w.jit_config_supported_mask === "function"
+            ? w.jit_config_supported_mask() >>> 0
+            : null;
+        if (supportedMask !== null && (requested >= 32 || !(supportedMask & (1 << requested)))) {
+            console.warn(`[dbg] JIT config index ${requested} is retired or unsupported by this ABI`);
+            return;
+        }
+        if (!w.set_jit_config) return;
+        const status = w.set_jit_config(requested, value >>> 0);
+        if (supportedMask !== null && status !== 0) {
+            console.error(`[dbg] JIT config index ${requested} was rejected by wasm (status=${status})`);
+            return;
+        }
         if (w.jit_clear_cache_js) w.jit_clear_cache_js();
         const g = (i: number) => (w.get_jit_config ? (w.get_jit_config(i) >>> 0) : -1);
-        console.log(`[dbg] set_jit_config(${index},${value}) + clear. now: DISABLED=${g(0)} MAX_PAGES=${g(1)} LOOP_SAFETY=${g(2)} MAX_EXTRA_BB=${g(3)} BLOCK_CHAINING=${g(4)} DEAD_FLAG_ELISION=${g(5)} INDIRECT_REGIONS=${g(6)} REGION_PAGES=${g(8)} FASTMEM_READS=${g(9)} X87_LOCALS=${g(10)} PUSH_RUN=${g(11)}`);
+        console.log(`[dbg] set_jit_config(${requested},${value}) + clear. now: DISABLED=${g(0)} MAX_PAGES=${g(1)} LOOP_SAFETY=${g(2)} MAX_EXTRA_BB=${g(3)} DEAD_FLAG_ELISION=${g(5)} INDIRECT_REGIONS=${g(6)} REGION_PAGES=${g(8)} X87_LOCALS=${g(10)} PUSH_RUN=${g(11)}`);
     },
     /** Dead-flag elision compile-time census (profiler slots 8/9, always-on — unlike the
      *  dispatch counters these need no dispatchStatsEnable). candidate = instructions that
@@ -333,10 +342,10 @@ export const dbg = {
         const names: Array<[string, number]> = [
             ["jitDisabled", 0], ["maxPages", 1], ["loopSafety", 2], ["maxExtraBasicBlocks", 3],
             ["deadFlagElision", 5], ["indirectRegions", 6], ["regionMinSharePct", 7],
-            ["regionMaxPages", 8], ["fastmemReads", 9], ["x87Locals", 10],
+            ["regionMaxPages", 8], ["x87Locals", 10],
             ["pushRunCoalescing", 11], ["retChaining", 12], ["retSpeculation", 13],
             ["retSpecMaxInstr", 14], ["tier2Threshold", 15], ["tier2RetSpecMaxInstr", 16],
-            ["tier2MaxPages", 17], ["fastmemReadSplit", 18], ["fastmemWrites", 19],
+            ["tier2MaxPages", 17], ["fastmemWrites", 19],
             ["flagLocals", 21], ["branchHints", 22], ["branchHintOffsetFuzz", 23],
         ];
         const out: Record<string, number> = {};
@@ -754,39 +763,9 @@ export const dbg = {
         console.log(`[dbg][jittier] natives=${out.nativesSyntax} entries L=${out.share.liftoff}% T=${out.share.turbofan}% ?=${out.share.unknown}% (n=${totalEntries}) modules L=${modules.liftoff} T=${modules.turbofan} ?=${modules.unknown} empty=${modules.empty} recycled=${recycled} promotions=${churn.promotions} blockedByCap=${churn.blockedByCap}`);
         return out;
     },
-    /** Fastmem read speculation. Default ON; clears JIT cache so blocks recompile. */
-    fastmemReads(on = true): void {
-        const w = wasm(); if (!w?.set_jit_config) return;
-        // Assert the Rust-side red-zone constants mirror the TS memory layout
-        // (single source: emulator-config.ts). A mismatch means the raw-load range
-        // check would let a red-zone read through — refuse to enable speculation.
-        if (on && w.fastmem_get_guard_base && w.fastmem_get_guard_size && w.fastmem_get_low_mem_end) {
-            const gb = w.fastmem_get_guard_base() >>> 0;
-            const gs = w.fastmem_get_guard_size() >>> 0;
-            const lm = w.fastmem_get_low_mem_end() >>> 0;
-            if (gb !== (MEM_GUARD_BASE >>> 0) || gs !== (MEM_GUARD_SIZE >>> 0) || lm !== 0x00100000) {
-                console.error(`[dbg][fastmem] REFUSING enable: guard mismatch wasm(base=0x${gb.toString(16)},size=0x${gs.toString(16)},low=0x${lm.toString(16)}) vs TS(base=0x${(MEM_GUARD_BASE>>>0).toString(16)},size=0x${(MEM_GUARD_SIZE>>>0).toString(16)},low=0x100000)`);
-                return;
-            }
-        }
-        // Route through PreemptionManager so the choice survives a game reload
-        // (default is ON; a kill-switch here must stick). Falls back to a direct set.
-        const pm = (globalThis as any).preemption;
-        if (pm?.setFastmemReads) pm.setFastmemReads(on);
-        else { w.set_jit_config(9, on ? 1 : 0); if (w.jit_clear_cache_js) w.jit_clear_cache_js(); }
-        const g = w.get_jit_config ? (w.get_jit_config(9) >>> 0) : -1;
-        const gen = w.fastmem_get_generation ? (w.fastmem_get_generation() >>> 0) : -1;
-        console.log(`[dbg][fastmem] reads=${g} generation=${gen} (authoritative - survives reload) + cache cleared`);
-    },
-    /** Split-range fastmem read shape (idx 18). Same acceptance set as the legacy
-     *  4-compare shape; OFF = legacy, for in-race A/B. Clears the JIT cache to recompile. */
-    fastmemReadSplit(on = true): void {
-        const w = wasm(); if (!w?.set_jit_config) return;
-        const pm = (globalThis as any).preemption;
-        if (pm?.setFastmemReadSplit) pm.setFastmemReadSplit(on);
-        else { w.set_jit_config(18, on ? 1 : 0); if (w.jit_clear_cache_js) w.jit_clear_cache_js(); }
-        const g = w.get_jit_config ? (w.get_jit_config(18) >>> 0) : -1;
-        console.log(`[dbg][fastmem] readSplit=${g} (authoritative - survives reload) + cache cleared`);
+    /** Retired read-fastmem configuration (ABI slot 9), kept for debugger API compatibility. */
+    fastmemReads(_on = true): void {
+        console.warn("[dbg][fastmem] reads are retired; no configuration change was made");
     },
     /** Fastmem WRITES (idx 19). Default OFF. Rebuilds the write map
      *  (region-intent ∩ PTE present+RW) BEFORE enabling — a wrong bit0 on a decommitted/
@@ -831,6 +810,18 @@ export const dbg = {
         const level = r.danger > 0 ? 'error' : 'log';
         (console as any)[level](`[dbg][fastmem][audit] base0Pages=${r.base0Pages} danger=${r.danger} maxPage=${r.maxPage}${r.danger ? ' ⚠ CORRUPTION-CLASS (blocker)' : ' ✓ clean'}`);
         if (r.danger > 0) console.error(`[dbg][fastmem][audit][JSON] ${JSON.stringify(r.samples)}`);
+        return r;
+    },
+    /** Read-map safety net: `danger` means a raw load could bypass a required
+     * translation/#PF; `missing` is safe but leaves performance on the slow path. */
+    fastmemReadAudit(maxReport = 32): any {
+        const ptm: any = System.getInstance().process?.pageTableManager;
+        if (!ptm?.auditReadMap) { console.warn('[dbg][fastmem] read audit unavailable (process/wasm not ready)'); return null; }
+        const r = ptm.auditReadMap(maxReport);
+        if (!r) { console.warn('[dbg][fastmem] read audit: wasm export missing'); return null; }
+        const level = r.danger > 0 || r.missing > 0 ? 'error' : 'log';
+        (console as any)[level](`[dbg][fastmem][read-audit] readable=${r.readablePages} danger=${r.danger} missing=${r.missing}${r.danger ? ' ⚠ CORRECTNESS BLOCKER' : r.missing ? ' ⚠ map incomplete' : ' ✓ clean'}`);
+        if (r.danger > 0 || r.missing > 0) console.error(`[dbg][fastmem][read-audit][JSON] ${JSON.stringify(r.samples)}`);
         return r;
     },
     /** Lazy-flag tuple in wasm locals (idx 21). Default OFF. Kills per-ALU-op flag stores +
@@ -948,32 +939,14 @@ export const dbg = {
         const g = w.get_jit_config ? (w.get_jit_config(22) >>> 0) : -1;
         console.log(`[dbg][branchhints] mask=${g} (authoritative - survives reload) + cache cleared`);
     },
-    /** Fastmem counters: generation, compiled raw-load sites, lazy deopts, source bump counts. */
+    /** Fastmem counters and the current read/write map population. */
     fastmemStats(): any {
-        const w = wasm(); if (!w?.fastmem_get_generation) return null;
-        const sourceNames = [
-            'tlbFullClear',
-            'tlbClear',
-            'invlpg',
-            'addressProtect',
-            'addressRelease',
-            'ptDecommit',
-            'ptCommit',
-            'ptProtect',
-            'writeWatch',
-            'manual',
-        ];
-        const bumps: Record<string, number> = {};
-        for (let i = 0; i < sourceNames.length; i++) {
-            bumps[sourceNames[i]] = w.fastmem_get_bump_count ? (w.fastmem_get_bump_count(i) >>> 0) : 0;
-        }
+        const w = wasm(); if (!w?.get_jit_config) return null;
         const s = {
-            enabled: w.get_jit_config ? !!(w.get_jit_config(9) >>> 0) : false,
-            generation: w.fastmem_get_generation() >>> 0,
+            enabled: null,
+            readsStatus: "retired",
             speculatedLoadsCompiled: w.fastmem_get_speculated_loads_compiled ? (w.fastmem_get_speculated_loads_compiled() >>> 0) : 0,
-            deoptRecompiles: w.fastmem_get_deopt_recompiles ? (w.fastmem_get_deopt_recompiles() >>> 0) : 0,
-            thrashLatched: w.fastmem_get_thrash_latched ? !!(w.fastmem_get_thrash_latched() >>> 0) : false,
-            bumps,
+            readMapPages: w.fastmem_read_map_count ? (w.fastmem_read_map_count() >>> 0) : 0,
             // Fastmem-write map (bit0 base, bit1 code, bit2 watch; accept = byte==1).
             writesEnabled: w.get_jit_config ? !!(w.get_jit_config(19) >>> 0) : false,
             speculatedStoresCompiled: w.fastmem_get_speculated_stores_compiled ? (w.fastmem_get_speculated_stores_compiled() >>> 0) : 0,

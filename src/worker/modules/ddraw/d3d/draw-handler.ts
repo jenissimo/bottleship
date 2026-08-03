@@ -644,6 +644,9 @@ export const createDrawHandler = (context: DDrawContext, textureManager: Texture
                 texStateObj1: texStateObj1 ?? null,
                 renderStates,
                 texStates,
+                sourceStride: computeFvfStride(vtype),
+                mvp: mvpMatrix ?? null,
+                viewport: viewportScratch,
                 executionDiagnostics: context.executor.getLastDrawDiagnostics(),
             });
         }

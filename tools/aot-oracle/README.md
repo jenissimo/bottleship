@@ -141,17 +141,22 @@ proves end-to-end that the knob changes the produced module bytes.
 
 ### `unit:<manifest.json>` — a contract-shaped AOT module (the real target)
 
-Exports `f(i32)->()`, imports from `"e"`. Published into a real v86 with
-`jit_register_aot_module` + one `jit_aot_flush_tlb()` and entered **through
+Exports `f(i32)->()`, imports from `"e"`. Published into a real v86 through the
+staged Rust AOT transaction (`begin`/page builder/`prepare_finish`/`commit`) plus one
+`jit_aot_flush_tlb()`, and entered **through
 `wasm_table[idx+1024]`** — the production dispatch path, not a direct export call. The
 publication path deliberately mirrors `src/worker/core/cpu/aot-cache.ts`, including both
 constraints bought with failed attempts (handoff §2.1): a unit is only replayable in the slot
 its bytes were compiled for, and registration must **not** stamp the TLB.
 
-Manifest shape (what the compiler must emit; `unit:auto` writes one):
+Manifest shape (what the compiler must emit; `unit:auto` writes one). `jit_identity` is a
+required ABI-5 replay envelope: the loader rejects a missing or mismatched engine SHA, RAM size,
+JIT config ABI/mask/fingerprint, or exact slot before it stages any unit.
 
 ```json
-{ "case": "k1", "jit_flags": {...}, "relaxed_fpu": 1, "engine_sha256": "...",
+{ "case": "k1", "engine_sha256": "...",
+  "jit_identity": { "aot_abi": 5, "engine_sha256": "...", "ram_size": 16777216,
+                    "abi": 1, "supported_mask": 0, "fingerprint_lo": 0, "fingerprint_hi": 0 },
   "units": [{ "entryPage": 257, "tableIndex": 899, "file": "k1-unit.0.wasm",
               "pages": [{ "physPage": 257, "stateFlags": 5,
                           "entries": [[offset, initial_state], ...],

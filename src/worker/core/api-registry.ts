@@ -345,4 +345,20 @@ export class APIRegistry {
         const func = functionName.toLowerCase();
         return mod.functions.some((f) => f.name.toLowerCase() === func);
     }
+
+    /** True when this module, rather than some other descriptor, owns the function signature. */
+    public hasModuleFunctionSignature(dllName: string, functionName: string): boolean {
+        const dll = dllName.toLowerCase().replace(/\.dll$/, "");
+        const func = functionName.toLowerCase();
+        if (this.argCountCache.has(`${dll}:${func}`)) return true;
+
+        const baseName = functionName.replace(/[WA]$/, "").toLowerCase();
+        if (this.argCountCache.has(`${dll}:${baseName}`)) return true;
+
+        if (!/@\d+$/i.test(functionName)) {
+            if (this.baseNameToKeys.get(`${dll}:${func}`)?.length === 1) return true;
+            if (this.baseNameToKeys.get(`${dll}:_${func}`)?.length === 1) return true;
+        }
+        return false;
+    }
 }

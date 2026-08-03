@@ -1955,6 +1955,38 @@ export class Scheduler {
         return WAIT_BLOCKED_NO_SWITCH;
     }
 
+    /**
+     * Park a synchronous HLE call until a short deadline and resume it as if it
+     * returned zero. Unlike sleepWithContext(), this never turns a sole-runnable
+     * wait into an immediate return plus host yield: callers use it to collapse a
+     * hot polling API into one scheduler wait while preserving a synchronous guest
+     * call/return boundary.
+     */
+    parkCurrentThreadUntil(
+        delayMs: number, returnAddr: number, postReturnEsp: number,
+        callerCtx: { ecx: number; edx: number; ebx: number; ebp: number; esi: number; edi: number; eflags: number },
+    ): number {
+        const thread = this.getCurrentThread();
+        if (!thread) return 0;
+
+        if (!isValidGuestEip(returnAddr)) {
+            Logger.error(LogCategory.THREAD,
+                `parkCurrentThreadUntil: invalid returnAddr=0x${returnAddr.toString(16)} T${thread.id}`);
+            return 0;
+        }
+
+        const waitMs = Math.max(1, Number.isFinite(delayMs) ? delayMs : 1);
+        const context = createPostReturnContext(returnAddr, postReturnEsp, callerCtx, 0);
+        this.blockThread(thread, WaitReason.SLEEP, [], false, waitMs, false, 0, context);
+
+        if (this.hasOtherRunnableThreads(thread.id)) {
+            this.requestSwitch();
+        } else {
+            this.requestYieldToHost(this.computeYieldMs(waitMs), "hleDeadline");
+        }
+        return WAIT_BLOCKED_NO_SWITCH;
+    }
+
     waitForMessage(
         returnAddr: number,
         postReturnEsp: number,
@@ -2030,7 +2062,18 @@ export class Scheduler {
         if (decision.ready) { this.syncObjects.consumeWait(decision, thread.id); return decision.result; }
 
         if (alertable && thread.apcQueue.length > 0) return WAIT_IO_COMPLETION;
-        if (timeoutMs === 0) return WAIT_TIMEOUT;
+        if (timeoutMs === 0) {
+            // A zero-timeout wait is only a probe: preserve WAIT_TIMEOUT and never
+            // park the caller.  On Windows the polling thread is still preemptible,
+            // though.  In the emulator a tight loop of WFSO(event, 0) can otherwise
+            // cross thousands of thunk boundaries without retiring enough guest
+            // instructions to expire its quantum, starving the READY thread that is
+            // supposed to SetEvent (TLJ's loader/audio workers are one such pattern).
+            // Requesting the normal thunk-boundary switch restores that fairness; it
+            // does not consume/signals the object or change the observable result.
+            if (this.hasOtherRunnableThreads(thread.id)) this.requestSwitch();
+            return WAIT_TIMEOUT;
+        }
 
         // Debug: Log when a thread blocks on INFINITE wait (helps trace unsignaled events)
         if (timeoutMs === INFINITE) {
@@ -2053,16 +2096,17 @@ export class Scheduler {
 
         const context = createPostReturnContext(returnAddr, postReturnEsp, callerCtx, WAIT_OBJECT_0);
 
+        // Nothing else can run: park on the timer wheel anyway. A finite timeout must be
+        // CONSUMED, not answered — WAIT_TIMEOUT before the deadline is guest-measurable.
+        // Blade of Darkness derives its whole game clock from the RDTSC delta across
+        // WaitForSingleObject(sem, 100) and scales every frame by it. While parked no
+        // thread is READY/RUNNING, so pollTimeouts' idle pump paces virtual time in wall
+        // time and the wheel entry blockThread registers delivers the WAIT_TIMEOUT.
         if (!this.hasOtherRunnableThreads(thread.id)) {
-            const mustPark = timeoutMs === INFINITE || this.hasWaitingThreadsWithPendingTimeouts(thread.id);
-            if (mustPark) {
-                this.blockThread(thread, waitAll ? WaitReason.MULTIPLE_OBJECTS : WaitReason.SINGLE_OBJECT,
-                    resolved, waitAll, timeoutMs === INFINITE ? null : timeoutMs, alertable, 0, context);
-                this.requestYieldToHost(this.computeYieldMs(timeoutMs), "waitObj");
-                return WAIT_BLOCKED_NO_SWITCH;
-            }
-            this.requestYieldToHost(Math.min(timeoutMs, 50), "waitObjTO");
-            return WAIT_TIMEOUT;
+            this.blockThread(thread, waitAll ? WaitReason.MULTIPLE_OBJECTS : WaitReason.SINGLE_OBJECT,
+                resolved, waitAll, timeoutMs === INFINITE ? null : timeoutMs, alertable, 0, context);
+            this.requestYieldToHost(this.computeYieldMs(timeoutMs), "waitObj");
+            return WAIT_BLOCKED_NO_SWITCH;
         }
 
         this.blockThread(thread, waitAll ? WaitReason.MULTIPLE_OBJECTS : WaitReason.SINGLE_OBJECT,
@@ -4021,14 +4065,6 @@ export class Scheduler {
         for (const t of this.threads.values()) {
             if (t.id === excludeId) continue;
             if (t.state === ThreadState.READY || t.state === ThreadState.RUNNING) return true;
-        }
-        return false;
-    }
-
-    private hasWaitingThreadsWithPendingTimeouts(excludeId: number): boolean {
-        for (const t of this.threads.values()) {
-            if (t.id === excludeId || t.state !== ThreadState.WAITING) continue;
-            if (t.waitInfo?.timeoutTimerId) return true;
         }
         return false;
     }

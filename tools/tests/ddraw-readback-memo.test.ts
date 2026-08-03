@@ -121,6 +121,22 @@ describe("ddraw GPU→CPU readback memo", () => {
         expect(surfaceSyncManager.needsCPUSync(s).needed).toBe(true);
     });
 
+    test("an async readback cannot bless a newer GPU version with older pixels", () => {
+        const s = renderSurface();
+        setAuthorityGpu(s);
+        const copiedVersion = s.version;
+
+        // mapAsync is still pending when the next draw advances the surface.
+        setAuthorityGpu(s);
+        expect(markCpuSyncedFromGpu(s, copiedVersion)).toBe(false);
+        expect(s.cpuSyncedVersion).not.toBe(s.version);
+        expect(surfaceSyncManager.needsCPUSync(s).needed).toBe(true);
+
+        // A retry against the current texture is allowed to satisfy the Lock.
+        expect(markCpuSyncedFromGpu(s, s.version)).toBe(true);
+        expect(surfaceSyncManager.needsCPUSync(s).needed).toBe(false);
+    });
+
     test("Flip moves the memo with the storage, not with the surface identity", () => {
         const front = renderSurface(0xa000);
         const back = renderSurface(0xb000);

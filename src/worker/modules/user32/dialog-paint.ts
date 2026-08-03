@@ -6,10 +6,11 @@
  */
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
-import { WindowInfo, windows, isEffectivelyVisible, getAbsoluteWindowPosition, getAncestorClipRect, ensureHostCursorForDialog, getChildrenInPaintOrder } from './shared-state';
-import { paintChildControls, repaintChildControls, paintDialogClientMessage, registerOwnedPopupRestamper } from './controls';
+import { WindowInfo, windows, isEffectivelyVisible, getAbsoluteWindowPosition, getAncestorClipRect, ensureHostCursorForDialog, getChildrenInPaintOrder, hasSystemControlChildren } from './shared-state';
+import { paintChildControls, repaintChildControls, registerOwnedPopupRestamper } from './controls';
 import { registerFullDialogRepainter, registerOverlayRepairRepainter } from './control-interaction';
-import { getWindowVisualBounds } from './dialog-overlay';
+import { getWindowVisualBounds, eraseDialogOverlay, repairOverlayWindowsOverlappingRect } from './dialog-overlay';
+import { invalidateWindow } from './paint-region';
 import type { GDIContext } from '../gdi32/context';
 import { paintTraceEnabled, logPaintRequest } from './paint-trace';
 
@@ -114,9 +115,64 @@ export function restoreClientRectFromAncestors(win: WindowInfo): boolean {
     const h = Math.max(1, win.height);
     for (let anc = win.parent !== undefined ? windows.get(win.parent) : undefined; anc;
          anc = anc.parent !== undefined ? windows.get(anc.parent) : undefined) {
-        if (gdi.restoreWindowClientRect(anc.handle, origin.x, origin.y, w, h)) return true;
+        if (gdi.restoreWindowClientRect(anc.handle, origin.x, origin.y, w, h)) {
+            Logger.verbose(LogCategory.USER32,
+                `restoreClientRectFromAncestors: hwnd=0x${win.handle.toString(16)} from=0x${anc.handle.toString(16)}`);
+            return true;
+        }
     }
+    Logger.verbose(LogCategory.USER32,
+        `restoreClientRectFromAncestors: no backing for hwnd=0x${win.handle.toString(16)}`);
     return false;
+}
+
+/**
+ * After a window is marked hidden, remove its pixels from the flat overlay.
+ *
+ * Win32 invalidates the uncovered parent region; on our shared overlay that means
+ * putting the ancestor's retained client back (exact), or — when no backing exists
+ * yet — invalidating the parent so its next paint owns the hole. Top-level #32770
+ * keeps the clear+repair fallback (a dialog has no parent client to restore from).
+ *
+ * Overlay repair excludes `win`, so this is safe both before a move and after a hide.
+ */
+export function eraseHiddenWindowPixels(win: WindowInfo): void {
+    const bounds = getWindowVisualBounds(win.handle);
+    if (restoreClientRectFromAncestors(win)) {
+        if (bounds) repairOverlayWindowsOverlappingRect(bounds, win.handle);
+        return;
+    }
+
+    if ((win.style & WS_CHILD) === 0) {
+        eraseDialogOverlay(win.handle);
+        return;
+    }
+
+    if ((win.style & WS_CHILD) === 0 || win.parent === undefined) return;
+    // No retained ancestor owns these pixels. Remove the hidden subtree from the
+    // flat overlay now; leaving it in place makes the next transparent sibling
+    // inherit stale buttons/text. eraseDialogOverlay repairs all still-visible
+    // overlapping windows back-to-front and excludes this now-hidden subtree.
+    eraseDialogOverlay(win.handle);
+    const parentHwnd = win.parent;
+    invalidateWindow(parentHwnd, {
+        left: win.x | 0,
+        top: win.y | 0,
+        right: (win.x + Math.max(1, win.width)) | 0,
+        bottom: (win.y + Math.max(1, win.height)) | 0,
+    }, true);
+
+    const parent = windows.get(parentHwnd);
+    if (!parent || !isEffectivelyVisible(parent)) return;
+    if (parent.guestCustomPaint) {
+        requestGuestDialogPaint(parentHwnd);
+    } else {
+        System.getInstance().windowManager.postMessage(parentHwnd, WM_PAINT, 0, 0);
+        if (hasSystemControlChildren(parent)) {
+            repaintDialogAfterContentChange(parentHwnd);
+        }
+    }
+    if (bounds) repairOverlayWindowsOverlappingRect(bounds, win.handle);
 }
 
 /**
@@ -160,6 +216,18 @@ function paintDialogBackground(win: WindowInfo, hdc: number, gdi: GDIContext): v
 /** Non-client dialog frame (WM_NCPAINT approximation for #32770). */
 function paintDialogNcFrame(win: WindowInfo, hdc: number, gdi: GDIContext): void {
     if (win.nativeClassName !== '#32770') return;
+    const WS_BORDER = 0x00800000;
+    const WS_CAPTION = 0x00c00000;
+    const WS_THICKFRAME = 0x00040000;
+    const WS_EX_DLGMODALFRAME = 0x00000001;
+    const WS_EX_WINDOWEDGE = 0x00000100;
+    const WS_EX_CLIENTEDGE = 0x00000200;
+    const edgeExStyle = (win.exStyle ?? 0)
+        & (WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE);
+    const framedStyle = win.style & (WS_BORDER | WS_CAPTION | WS_THICKFRAME);
+    if (!framedStyle && !edgeExStyle) {
+        return;
+    }
     const bounds = getWindowVisualBounds(win.handle)
         ?? (() => { const { x, y } = getAbsoluteWindowPosition(win); return { x, y, w: win.width, h: win.height }; })();
     const ctx = gdi.getDC(hdc);
@@ -169,6 +237,16 @@ function paintDialogNcFrame(win: WindowInfo, hdc: number, gdi: GDIContext): void
     const x1 = bounds.x + bounds.w;
     const y1 = bounds.y + bounds.h;
     ctx.lineWidth = 1;
+
+    // A plain WS_BORDER is the flat COLOR_WINDOWFRAME border. It must not get
+    // the raised highlight used for dialog-modal/window/client edge styles.
+    if ((win.style & (WS_CAPTION | WS_THICKFRAME)) === 0 && !edgeExStyle) {
+        ctx.strokeStyle = '#000000';
+        ctx.strokeRect(x0 + 0.5, y0 + 0.5, bounds.w - 1, bounds.h - 1);
+        gdi.setOverlayDirty(true);
+        return;
+    }
+
     ctx.strokeStyle = '#808080';
     ctx.strokeRect(x0 + 0.5, y0 + 0.5, bounds.w - 1, bounds.h - 1);
     ctx.strokeStyle = '#FFFFFF';
@@ -212,16 +290,33 @@ function paintWindowSubtreeToOverlay(
     if (!win.isSystemControl) {
         // The guest owns the client area when it declares owner-draw buttons or has
         // custom-painted (its WM_PAINT/WM_ERASEBKGND draws the background, e.g. a splash).
-        const guestPaintsClient = !!win.guestCustomPaint;
-        if (mode === 'full' && !guestPaintsClient) {
-            paintDialogBackground(win, hdc, gdi);
-            paintDialogNcFrame(win, hdc, gdi);
+        const parent = win.parent !== undefined ? windows.get(win.parent) : undefined;
+        const parentStaticType = (parent?.style ?? 0) & 0x001f;
+        const hostedByStaticFrame = (win.style & WS_CHILD) !== 0
+            && parent?.isSystemControl
+            && parent.systemControlClass?.toLowerCase() === 'static'
+            && parentStaticType >= 0x0004 && parentStaticType <= 0x0009;
+        const guestPaintsClient = !!win.guestCustomPaint || !!hostedByStaticFrame;
+        const WS_EX_TRANSPARENT = 0x00000020;
+        if (mode === 'full') {
+            if (guestPaintsClient) {
+                // Re-compositing an owned popup must restore the guest's retained client
+                // before its controls. Merely re-stamping controls lets a lower owner's
+                // freshly-painted menu leak through transparent parts of the popup.
+                const origin = getAbsoluteWindowPosition(win);
+                gdi.restoreWindowClientRect?.(
+                    win.handle, origin.x, origin.y,
+                    Math.max(1, win.width), Math.max(1, win.height),
+                );
+            } else if (!((win.exStyle ?? 0) & WS_EX_TRANSPARENT)) {
+                paintDialogBackground(win, hdc, gdi);
+                paintDialogNcFrame(win, hdc, gdi);
+            }
         }
         // OS-owned child controls (statics, edits, non-owner-draw buttons) always paint,
         // exactly like Windows' own control window-procs. Owner-draw buttons early-out
         // inside paintChildControls — the guest paints those via the WM_DRAWITEM chain.
         paintChildControls(win.handle, hdc, gdi);
-        paintDialogClientMessage(hdc, gdi, win);
     }
 
     if (clip && ctx) ctx.restore();
@@ -229,6 +324,7 @@ function paintWindowSubtreeToOverlay(
     for (const childHwnd of getChildrenInPaintOrder(win.handle)) {
         paintWindowSubtreeToOverlay(childHwnd, hdc, visited, mode);
     }
+
 }
 
 export function paintDialogToOverlay(dialogHwnd: number, mode: 'full' | 'controls' = 'full'): void {
@@ -274,6 +370,10 @@ export function repaintDialogOverlayIfVisible(dialogHwnd: number): void {
     const win = windows.get(dialogHwnd);
     if (!win?.visible) return;
     if (shouldUseGuestDialogPaint(win)) {
+        // Exposure is independent of activation. Native USER invalidates an uncovered
+        // window and its normal message pump later delivers WM_PAINT even while another
+        // top-level window is active. Using activation as a paint gate left an owned
+        // launcher page with only its stale retained background after its child closed.
         requestGuestDialogPaint(dialogHwnd);
         return;
     }
@@ -339,4 +439,25 @@ export function finalizeDialogPaint(dialogHwnd: number): void {
     // Tiberian Sun's 7-control "Select Campaign") as custom-painted.
     const mode = win?.guestCustomPaint ? 'controls' : 'full';
     paintDialogToOverlay(dialogHwnd, mode);
+
+    // Creation-time fallback painting is not the final Win32 paint. WM_INITDIALOG
+    // commonly installs bitmaps, subclasses owner-draw controls, and changes text;
+    // USER subsequently validates those results through WM_PAINT/WM_DRAWITEM.
+    // Queue that real paint after init instead of freezing the pre-init fallback.
+    if (win && isEffectivelyVisible(win) && !win.pendingDestroy) {
+        const queueGuestPaint = (): void => {
+            const live = windows.get(dialogHwnd);
+            if (!live || !isEffectivelyVisible(live) || live.pendingDestroy) return;
+            invalidateWindow(dialogHwnd, null, true);
+            System.getInstance().windowManager.postMessage(dialogHwnd, WM_PAINT, 0, 0);
+            System.getInstance().scheduler.wakeMessageWaiters();
+        };
+        // WS_EX_TRANSPARENT is painted after siblings beneath it. Deferring one host
+        // turn preserves that ordering when parent and child finish initialization in
+        // the same callback chain.
+        if ((win.exStyle ?? 0) & 0x00000020) {
+            if (win.parent) requestGuestDialogPaint(win.parent);
+            setTimeout(queueGuestPaint, 0);
+        } else queueGuestPaint();
+    }
 }

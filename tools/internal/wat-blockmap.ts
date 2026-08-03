@@ -20,7 +20,7 @@
  *   regfile      loads/stores @64..95 (reg32 file) — value-forwarding target
  *   cpustate     other global_pointers traffic (segments, state_flags, cr, misc <2048)
  *   memcheck     TLB write-path checks (load offset=TLB_BASE + mask arithmetic) and
- *                fastmem read acceptance range compares (the split-range constants)
+ *                the current read-map load and page-cross guard
  *   guestmem     the actual RAM access: mem8-base adds + load/store with computed addr,
  *                (entry &~0xFFF)^addr translation ops
  *   slowglue     safe_*_slow_jit / get_phys_eip call sites + result tests
@@ -114,7 +114,7 @@ function findIcLocal(ops: Op[]): number {
 function classify(ops: Op[], importName: Map<number, string>, icLocal: number) {
   const isSlowCall = (idx: number) => {
     const n = importName.get(idx) ?? "";
-    return /^(safe_(read|write|read_write)\w*_slow_jit|get_phys_eip_slow_jit|trigger_fault_end_jit|fastmem_deopt_jit_unit)$/.test(n);
+    return /^(safe_(read|write|read_write)\w*_slow_jit|get_phys_eip_slow_jit|trigger_fault_end_jit)$/.test(n);
   };
   const isDispatchCall = (idx: number) => /^jit_find_cache_entry/.test(importName.get(idx) ?? "");
 
@@ -192,7 +192,7 @@ function classify(ops: Op[], importName: Map<number, string>, icLocal: number) {
       continue;
     }
 
-    // 5) fastmem read acceptance constants (split-range compares)
+    // 5) fastmem read-map access and page-cross guard
     if (o.op === "i32.const" && ["1048576", "1073741820", "587202556", "603979776"].includes(o.arg)) {
       const j = ops[i + 1]?.op ?? "";
       if (/^i32\.(ge_u|le_u|lt_u|gt_u)$/.test(j)) { tag(i, "memcheck"); tag(i + 1, "memcheck"); continue; }

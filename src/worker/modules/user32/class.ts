@@ -82,6 +82,10 @@ export function registerBuiltinClass(className: string, classInfo: Partial<{
     cbWndExtra: number;
     hInstance: number;
     hbrBackground: number;
+    /** When set, CreateWindowEx marks the window as a JS system control. */
+    controlClass?: string;
+    /** A dedicated HLE subsystem owns this class's pixels. */
+    externalPaintManaged?: boolean;
 }>): void {
     if (windowClassesByName.has(className.toLowerCase())) return;
     registerClassInternal(className, {
@@ -95,6 +99,8 @@ export function registerBuiltinClass(className: string, classInfo: Partial<{
         hCursor: 0,
         hbrBackground: classInfo.hbrBackground ?? 0,
         lpszMenuName: 0,
+        controlClass: classInfo.controlClass,
+        externalPaintManaged: classInfo.externalPaintManaged,
     });
     Logger.log(LogCategory.USER32, `registerBuiltinClass: "${className}"`);
 }

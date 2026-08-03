@@ -17,7 +17,7 @@ import { HarnessError, HarnessErrorCode } from "../rpc";
 import { getModule, guestMem, serializeSurfaces, sys } from "../serialize";
 import { bytesToBase64, debugDumpPath } from "./screen";
 import { devices as d3d9Devices } from "../../modules/d3d9/shared-state";
-import { startCapture as frameCaptureStart } from "../../modules/ddraw/frame-capture";
+import { cancelCapture as frameCaptureCancel, startCapture as frameCaptureStart } from "../../modules/ddraw/frame-capture";
 import { armSurfaceOps, takeSurfaceOps } from "../../modules/ddraw/surface-op-log";
 import { asArrayBufferView } from "../../../dom-buffer";
 
@@ -239,19 +239,34 @@ export function registerTextureCommands(svc: HarnessService): void {
         return dd.dbgReadSurfacePixels(ptr);
     });
 
-    /** captureFrame(opts) — arm the per-draw CaptureBus for the next frame. Backend-
+    /** captureFrame(opts) — arm the per-draw CaptureBus for the next complete frame. Backend-
      *  agnostic now: DDraw/D3D7 (full FFP), D3D8 (full FFP via the shared executor),
-     *  D3D9 (backend-tagged minimal draws). Resolves at the next present (onFrameEnd). */
+     *  D3D9 (backend-tagged minimal draws). The in-progress frame is discarded at its
+     *  present boundary, then the following frame is recorded through onFrameEnd(). */
     svc.register("captureFrame", async (args, ctx: HarnessCtx) => {
         const opts = (args[0] ?? {}) as { timeoutMs?: number; backend?: string; dumpTargets?: boolean };
         const timeoutMs = opts.timeoutMs ?? 5000;
-        const frame = await Promise.race([
-            frameCaptureStart(opts.backend),
-            new Promise((_res, rej) => {
-                const t = setTimeout(() => rej(new HarnessError(`no frame presented within ${timeoutMs}ms`, HarnessErrorCode.TIMEOUT)), timeoutMs);
-                ctx.signal.addEventListener("abort", () => { clearTimeout(t); rej(ctx.signal.reason ?? new HarnessError("aborted", HarnessErrorCode.CANCELLED)); }, { once: true });
-            }),
-        ]) as { drawCalls: Array<{ rtSurfacePtr: number; rtWidth: number; rtHeight: number; rtFormat?: string | null }> };
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+        let abortReason: Error | undefined;
+        const aborted = new Promise<never>((_res, reject) => {
+            timeout = setTimeout(() => reject(new HarnessError(`no frame presented within ${timeoutMs}ms`, HarnessErrorCode.TIMEOUT)), timeoutMs);
+            ctx.signal.addEventListener("abort", () => {
+                if (timeout) clearTimeout(timeout);
+                abortReason = ctx.signal.reason instanceof Error
+                    ? ctx.signal.reason
+                    : new HarnessError("aborted", HarnessErrorCode.CANCELLED);
+                reject(abortReason);
+            }, { once: true });
+        });
+        let frame: { drawCalls: Array<{ rtSurfacePtr: number; rtWidth: number; rtHeight: number; rtFormat?: string | null }> };
+        try {
+            frame = await Promise.race([frameCaptureStart(opts.backend), aborted]);
+        } catch (e) {
+            frameCaptureCancel(e instanceof Error ? e : abortReason ?? new Error(String(e)));
+            throw e;
+        } finally {
+            if (timeout) clearTimeout(timeout);
+        }
         if (!opts.dumpTargets) return frame;
         // The distinct attachments the frame drew into, in first-use order. A frame split
         // across render targets (render-to-texture, an inset view) is otherwise only visible

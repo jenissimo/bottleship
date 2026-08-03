@@ -2,7 +2,7 @@
  * High-performance message queue using ring buffer
  * - O(1) enqueue/dequeue
  * - Mouse move coalescing
- * - Priority-based retrieval (WM_PAINT last)
+ * - Priority-based retrieval (WM_TIMER last)
  */
 
 import { TimeService } from "../time";
@@ -21,6 +21,7 @@ export interface Message {
 
 const WM_MOUSEMOVE = 0x0200;
 const WM_PAINT = 0x000F;
+const WM_TIMER = 0x0113;
 let coalesceMouseMoveEnabled = true;
 
 const QUEUE_SIZE = 256;
@@ -334,6 +335,9 @@ export class MessageQueue {
     // Separate queues for different priority
     private inputQueue = new RingBuffer(QUEUE_SIZE);  // High priority: mouse, keyboard
     private paintPending: Map<number, PendingMessage> = new Map(); // hwnd -> pending paint
+    // USER synthesizes at most one pending WM_TIMER per (thread, window, id).
+    // Keeping ticks as ordinary posts can permanently starve a modal loop's idle path.
+    private timerPending: Map<string, { hwnd: number; pending: PendingMessage }> = new Map();
 
     // Mouse coalescing - only keep latest per hwnd
     private lastMouseMove: Map<number, PendingMessage> = new Map();
@@ -466,6 +470,22 @@ export class MessageQueue {
             // spins in guest code forever while paint sits in paintPending (HL launcher).
             this.drainWaiters();
             return true;
+        } else if (msg === WM_TIMER) {
+            const key = `${targetThreadId >>> 0}:${hwnd >>> 0}:${wParam >>> 0}`;
+            this.timerPending.set(key, {
+                hwnd: hwnd >>> 0,
+                pending: {
+                    wParam,
+                    lParam,
+                    time,
+                    ptX,
+                    ptY,
+                    targetThreadId,
+                    keyStatePacked: keyStatePacked ? keyStatePacked.slice(0, KEY_STATE_BYTES) : undefined,
+                },
+            });
+            this.drainWaiters();
+            return true;
         } else {
             // Flush any pending mouse move before other input
             const pendingMouse = this.lastMouseMove.get(hwnd);
@@ -525,22 +545,41 @@ export class MessageQueue {
             }
         }
 
-        // 3. Finally WM_PAINT (lowest priority) — same thread filter as mouse
+        // 3. WM_PAINT precedes synthesized timers in USER's retrieval order.
         if (this.paintPending.size > 0 && (noFilter || (WM_PAINT >= msgMin && WM_PAINT <= msgMax))) {
             for (const [hwnd, pending] of this.paintPending) {
+                if (callerThreadId > 0 && pending.targetThreadId > 0
+                    && pending.targetThreadId !== callerThreadId) continue;
+                this.paintPending.delete(hwnd);
+                const msg: Message = {
+                    hwnd, message: WM_PAINT,
+                    wParam: pending.wParam, lParam: pending.lParam,
+                    time: pending.time, ptX: pending.ptX, ptY: pending.ptY,
+                    keyStatePacked: pending.keyStatePacked,
+                };
+                this.trackDequeued(msg);
+                return msg;
+            }
+        }
+
+        // 4. USER synthesizes WM_TIMER only when no higher-priority message is ready.
+        if (this.timerPending.size > 0 && (noFilter || (WM_TIMER >= msgMin && WM_TIMER <= msgMax))) {
+            for (const [key, entry] of this.timerPending) {
+                const pending = entry.pending;
                 if (callerThreadId > 0 && pending.targetThreadId > 0
                     && pending.targetThreadId !== callerThreadId) {
                     continue;
                 }
-                this.paintPending.delete(hwnd);
+                this.timerPending.delete(key);
                 const msg: Message = {
-                    hwnd,
-                    message: WM_PAINT,
+                    hwnd: entry.hwnd,
+                    message: WM_TIMER,
                     wParam: pending.wParam,
                     lParam: pending.lParam,
                     time: pending.time,
                     ptX: pending.ptX,
                     ptY: pending.ptY,
+                    targetThreadId: pending.targetThreadId,
                     keyStatePacked: pending.keyStatePacked,
                 };
                 this.trackDequeued(msg);
@@ -581,17 +620,31 @@ export class MessageQueue {
         if (this.paintPending.size > 0 && (noFilter || (WM_PAINT >= msgMin && WM_PAINT <= msgMax))) {
             for (const [hwnd, pending] of this.paintPending) {
                 if (callerThreadId > 0 && pending.targetThreadId > 0
+                    && pending.targetThreadId !== callerThreadId) continue;
+                return {
+                    hwnd, message: WM_PAINT,
+                    wParam: pending.wParam, lParam: pending.lParam,
+                    time: pending.time, ptX: pending.ptX, ptY: pending.ptY,
+                    keyStatePacked: pending.keyStatePacked,
+                };
+            }
+        }
+        if (this.timerPending.size > 0 && (noFilter || (WM_TIMER >= msgMin && WM_TIMER <= msgMax))) {
+            for (const entry of this.timerPending.values()) {
+                const pending = entry.pending;
+                if (callerThreadId > 0 && pending.targetThreadId > 0
                     && pending.targetThreadId !== callerThreadId) {
                     continue;
                 }
                 return {
-                    hwnd,
-                    message: WM_PAINT,
+                    hwnd: entry.hwnd,
+                    message: WM_TIMER,
                     wParam: pending.wParam,
                     lParam: pending.lParam,
                     time: pending.time,
                     ptX: pending.ptX,
                     ptY: pending.ptY,
+                    targetThreadId: pending.targetThreadId,
                     keyStatePacked: pending.keyStatePacked,
                 };
             }
@@ -604,6 +657,14 @@ export class MessageQueue {
         if (this.inputQueue.hasFiltered(msgMin, msgMax, callerThreadId)) return true;
         if (this.lastMouseMove.size > 0 && (noFilter || (WM_MOUSEMOVE >= msgMin && WM_MOUSEMOVE <= msgMax))) {
             for (const pending of this.lastMouseMove.values()) {
+                if (callerThreadId === 0 || pending.targetThreadId === 0 || pending.targetThreadId === callerThreadId) {
+                    return true;
+                }
+            }
+        }
+        if (this.timerPending.size > 0 && (noFilter || (WM_TIMER >= msgMin && WM_TIMER <= msgMax))) {
+            for (const entry of this.timerPending.values()) {
+                const pending = entry.pending;
                 if (callerThreadId === 0 || pending.targetThreadId === 0 || pending.targetThreadId === callerThreadId) {
                     return true;
                 }
@@ -722,6 +783,9 @@ export class MessageQueue {
     removeWindow(hwnd: number): void {
         this.lastMouseMove.delete(hwnd);
         this.paintPending.delete(hwnd);
+        for (const [key, entry] of this.timerPending) {
+            if (entry.hwnd === (hwnd >>> 0)) this.timerPending.delete(key);
+        }
         // Drain inputQueue entries for this hwnd by dequeuing all and re-enqueuing non-matching
         // This is O(n) but only called on window destruction, not a hot path
         const kept: Message[] = [];
@@ -745,6 +809,7 @@ export class MessageQueue {
             // drain
         }
         this.lastMouseMove.clear();
+        this.timerPending.clear();
         this.paintPending.clear();
         this.waiters = []; // Clear any pending waiters
     }

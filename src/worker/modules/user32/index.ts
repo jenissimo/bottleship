@@ -8,11 +8,11 @@ import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 
 import { createClassExports as class_ } from './class';
 import { createDialogExports as dialog } from './dialog';
-import { createInputExports as input } from './input';
+import { createInputExports as input, registerFastPathInputFunctions } from './input';
 import { createMenuExports as menu } from './menu';
 import { createMessageExports as message, registerFastPathMessageFunctions as registerFastPathmessage } from './message';
 import { createSystemExports as system } from './system';
-import { createWindowExports as window } from './window';
+import { createWindowExports as window, registerFastPathWindowFunctions } from './window';
 import { resetUser32SharedState } from './shared-state';
 import { resetUser32Classes } from './class';
 import { resetDeviceNotifications } from './device-notify';
@@ -34,6 +34,7 @@ export class User32 implements IModule {
         Object.assign(this.exports, dialog());
         // input functions
         Object.assign(this.exports, input());
+        registerFastPathInputFunctions(process.dispatcher);
         // menu functions
         Object.assign(this.exports, menu());
         // message functions
@@ -43,6 +44,7 @@ export class User32 implements IModule {
         Object.assign(this.exports, system());
         // window functions
         Object.assign(this.exports, window());
+        registerFastPathWindowFunctions(process.dispatcher);
     }
 
     reset(): void {

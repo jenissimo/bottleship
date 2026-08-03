@@ -285,6 +285,7 @@ let heartbeatInterval: number | null = null;
 let schedulerInterval: number | null = null;
 let registryFlushInterval: number | null = null;
 let gdiPresentRafId: number | null = null;
+let gdiPresentKickPending = false;
 let gdiPresentDiagLogged = false;
 let isPaused = false;
 let _prefetchController: AbortController | null = null;
@@ -432,6 +433,23 @@ const gdiPresentLoop = () => {
   }
 
   gdiPresentRafId = requestAnimationFrame(gdiPresentLoop);
+};
+
+/**
+ * A busy guest can publish GDI between worker animation frames. Queue a macrotask
+ * kick so a dirty overlay cannot wait indefinitely for a throttled/lost rAF. The
+ * old request is cancelled before the normal recurring loop is restarted.
+ */
+const kickGdiPresentLoop = () => {
+  if (isPaused || gdiPresentKickPending) return;
+  gdiPresentKickPending = true;
+  setTimeout(() => {
+    gdiPresentKickPending = false;
+    if (isPaused) return;
+    if (gdiPresentRafId !== null) cancelAnimationFrame(gdiPresentRafId);
+    gdiPresentRafId = null;
+    gdiPresentLoop();
+  }, 0);
 };
 
 /**
@@ -1855,7 +1873,7 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
     await loadPeData(bundle.entrypointBytes, true);
     bootMark("pe-loaded");
 
-    // AOT units must be published BEFORE the JIT claims their pages — jit_register_aot_module
+    // AOT units must be transaction-committed BEFORE the JIT claims their pages
     // refuses a page the live JIT already owns (rc 2), and that is the whole ordering problem
     // of the track. This is the earliest point where the image is in memory. Registration is
     // gated on the per-page SHA-256, so a page that gets patched after this (hle-lib) simply
@@ -2147,6 +2165,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
           const backend = new WebGPUBackend();
           await backend.initialize(canvas);
           system.services.render.setBackend(backend);
+          system.gdiContext.registerOverlayDirtyNotifier(kickGdiPresentLoop);
           // Tell the host the moment the guest composites its FIRST real frame, so it can
           // tear down the loading screen exactly at the first flip (not at PE-load, which
           // left a black canvas during CRT/DirectX/asset init). One-shot per game load.

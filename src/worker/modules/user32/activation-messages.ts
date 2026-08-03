@@ -282,6 +282,22 @@ export function reactivateOwnerIfNeeded(closedHwnd: number, ownerHwnd = 0): void
     if (!owner || !wm.getWindow(owner)) return;
 
     const active = wm.getActiveHwnd();
+    // An owner cannot take activation while another visible owned popup is still above
+    // it. Nested MFC pages commonly share the application's main window as their nominal
+    // owner; closing the inner page must therefore return to the remaining outer page.
+    const ownedSuccessor = wm.getZOrder().find(candidate => {
+        if (candidate === closedHwnd) return false;
+        const candidateInfo = windows.get(candidate);
+        return candidateInfo?.parent === owner
+            && candidateInfo.visible
+            && !candidateInfo.pendingDestroy
+            && (candidateInfo.style & 0x40000000 /* WS_CHILD */) === 0
+            && (candidateInfo.style & 0x08000000 /* WS_DISABLED */) === 0;
+    }) ?? 0;
+    if (ownedSuccessor && active === owner) {
+        activateTopLevelWindow(ownedSuccessor);
+        return;
+    }
     const ownerWin = windows.get(owner);
     if (ownerWin?.dialogInitInProgress || ownerWin?.createInProgress) {
         // Owner still in WM_INITDIALOG (e.g. intro modal closed via EndDialog) or
@@ -295,7 +311,14 @@ export function reactivateOwnerIfNeeded(closedHwnd: number, ownerHwnd = 0): void
             `(defer wndproc — ${ownerWin.dialogInitInProgress ? 'WM_INITDIALOG' : 'WM_CREATE'} in progress)`);
         return;
     }
-    if (active === closedHwnd || active === 0 || needsActivationDelivery(owner)) {
+    // A pending activation on the owner is not permission to steal activation from
+    // a different window. MFC restores its previously-active nested dialog between
+    // EndDialog and DestroyWindow; the closed dialog's nominal parent may still be
+    // the application's root window. Only deliver the owner's pending activation
+    // when that owner is already active, or choose it when the closed window/NULL
+    // still owns activation.
+    if (active === closedHwnd || active === 0
+        || (active === owner && needsActivationDelivery(owner))) {
         activateTopLevelWindow(owner);
     }
 }

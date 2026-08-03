@@ -25,7 +25,6 @@ import {
     setCapture as setCaptureState,
     releaseCapture as releaseCaptureState,
     getCapture as getCaptureState,
-    noteLoadStringForDialog,
     windows,
     getAbsoluteWindowPosition,
     installCursorAndUpdateHostVisibility,
@@ -36,6 +35,7 @@ import {
 } from './shared-state';
 import { getSystemCursorHandle } from './system-cursors';
 import { registerDeviceNotification, unregisterDeviceNotification } from './device-notify';
+import { invokeWindowMessageSync } from './message';
 
 // wsprintf's output buffer: reused across calls (hot path, thousands per frame) and
 // sized to the API's own 1024 code-unit budget including the terminator.
@@ -523,7 +523,11 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         // Win32: the window losing capture receives WM_CAPTURECHANGED (lParam = hwnd gaining
         // capture, here NULL). Faithful capture transfer — UE1 SetMouseCapture gates on this.
         if (prev) {
-            System.getInstance().windowManager.postMessage(prev, 0x0215 /* WM_CAPTURECHANGED */, 0, 0);
+            const sync = invokeWindowMessageSync(
+                ctx, mem, prev, 0x0215 /* WM_CAPTURECHANGED */, 0, 0,
+                0, 'ReleaseCapture:WM_CAPTURECHANGED', () => 1,
+            );
+            if (sync) return sync;
         }
         Logger.verbose(LogCategory.USER32, `ReleaseCapture() prev=0x${prev.toString(16)}`);
         return { value: 1, stackCleanup: 0 };
@@ -536,7 +540,11 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         // The previously-capturing window (if any, and different) loses capture →
         // WM_CAPTURECHANGED with lParam = the window gaining capture (hWnd).
         if (prev && prev !== (hWnd >>> 0)) {
-            System.getInstance().windowManager.postMessage(prev, 0x0215 /* WM_CAPTURECHANGED */, 0, hWnd >>> 0);
+            const sync = invokeWindowMessageSync(
+                ctx, mem, prev, 0x0215 /* WM_CAPTURECHANGED */, 0, hWnd >>> 0,
+                4, 'SetCapture:WM_CAPTURECHANGED', () => prev,
+            );
+            if (sync) return sync;
         }
         Logger.verbose(LogCategory.USER32, `SetCapture(0x${hWnd.toString(16)}) prev=0x${prev.toString(16)}`);
         return { value: prev, stackCleanup: 4 };
@@ -1602,7 +1610,6 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         mem[lpBuffer + writeLen] = 0;
 
         Logger.log(LogCategory.USER32, `LoadStringA(hInst=0x${hInstance.toString(16)}, uID=${uID}) -> ${writeLen} "${versionString.slice(0, 40)}"`);
-        noteLoadStringForDialog(versionString);
         return { value: writeLen, stackCleanup: 16 };
     };
 

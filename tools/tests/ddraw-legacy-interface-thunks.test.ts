@@ -30,6 +30,7 @@ const OUT = 0x2000;
 const SURFACE_PTR = 0x1000;
 const PALETTE_PTR = 0x1800;
 const DDSCAPS_TEXTURE = 0x00001000;
+const SURFACE_BITS = 0x4000;
 
 function makeContext(overrides: Record<string, unknown> = {}) {
     const surfaceState: any = {
@@ -167,6 +168,44 @@ describe("IDirectDrawSurface (v1/v2/v3) GetCaps takes DDSCAPS, not DDSCAPS2", ()
     test("a NULL or unmapped DDSCAPS is rejected without touching memory", () => {
         const h = harness();
         expect(h.call(h.surf, "IDirectDrawSurface_GetCaps", SURFACE_PTR, 0)).not.toBe(DD_OK);
+    });
+});
+
+describe("legacy writable surface locks", () => {
+    test("v1 Lock permanently demotes a GPU_ONLY render surface so Unlock can upload CPU drawing", () => {
+        const h = harness();
+        Object.assign(h.surfaceState, {
+            surfaceType: "render_surface",
+            caps: 0,
+            width: 8,
+            height: 8,
+            pitch: 32,
+            surfacePtr: SURFACE_BITS,
+            format: {
+                size: 32,
+                flags: 0x40,
+                fourCC: 0,
+                bpp: 32,
+                rMask: 0x00ff0000,
+                gMask: 0x0000ff00,
+                bMask: 0x000000ff,
+                aMask: 0xff000000,
+            },
+            mode: "GPU_ONLY",
+            version: 1,
+            gpuDirty: false,
+            everLocked: false,
+            lastUploadVersion: 1,
+            writeGeneration: 0,
+        });
+        h.view.setUint32(OUT, 108, true);
+
+        expect(h.call(h.surf, "IDirectDrawSurface_Lock", SURFACE_PTR, 0, OUT, 1, 0)).toBe(DD_OK);
+        expect(h.surfaceState.mode).toBe("CPU");
+        expect(h.surfaceState.everLocked).toBe(true);
+
+        // Release the synthetic lease so it cannot leak into later tests.
+        expect(h.call(h.surf, "IDirectDrawSurface_Unlock", SURFACE_PTR, SURFACE_BITS)).toBe(DD_OK);
     });
 });
 

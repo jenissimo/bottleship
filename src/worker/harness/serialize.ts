@@ -178,6 +178,9 @@ export function serializeSurfaces(): unknown {
 
 export function serializeWindows(): unknown {
     const out: unknown[] = [];
+    const wm = sys().windowManager;
+    const activeHwnd = wm.getActiveHwnd();
+    const zOrder = wm.getZOrder();
     for (const [hwnd, w] of windows) {
         const abs = getAbsoluteWindowPosition(w);
         const width = w.width ?? 0, height = w.height ?? 0;
@@ -189,6 +192,8 @@ export function serializeWindows(): unknown {
             x: abs.x, y: abs.y, w: width, h: height,
             cx: abs.x + (width >> 1), cy: abs.y + (height >> 1),
             visible: !!w.visible,
+            active: hwnd === activeHwnd,
+            zIndex: zOrder.indexOf(hwnd),
             parent: w.parent ?? null,
             childCount: w.children?.length ?? 0,
             style: u32(w.style),

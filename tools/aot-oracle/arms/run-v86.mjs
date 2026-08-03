@@ -5,7 +5,7 @@
 //   reference : "what our JIT does today" — the fork booted headless with BottleShip's
 //               production codegen configuration, relaxed FPU, paging on.
 //   unit      : the same thing with a CANDIDATE AOT MODULE published for the case's code
-//               pages before the guest runs (jit_register_aot_module + one jit_aot_flush_tlb,
+//               pages before the guest runs (one staged transaction + one jit_aot_flush_tlb,
 //               entered through wasm_table[idx+1024] — the real dispatch path, not a direct
 //               export call).
 //
@@ -30,6 +30,7 @@ import { findTlbDataBase, ORACLE_PROBE_PAGES } from "../../aot/lib/tlb-base.mjs"
 const __dirname = url.fileURLToPath(new URL(".", import.meta.url));
 const REPO = path.resolve(__dirname, "../../..");
 const WASM_TABLE_OFFSET = 1024;   // vendor/v86/src/const.js
+const WASM_TABLE_SIZE = 900;      // vendor/v86/src/rust/jit.rs and src/const.js
 const PAGE_SIZE = 4096;
 
 const KNOWN = ["case", "outer", "warmup", "timeout", "aot", "capture", "fault", "flags", "relaxed"];
@@ -45,10 +46,10 @@ if (n1 < 1 || warmup < 1) { console.error("--outer/--warmup must be >= 1"); proc
 
 // BottleShip production codegen configuration (preemption-manager.ts defaults). `--flags
 // "10=0,5=0"` overrides individual entries; `--relaxed 0` switches x87 to strict F80. These
-// values are part of the unit's version tuple — a unit compiled under one shape is not valid
-// under another (aot-cache.ts SHAPE_FLAGS).
+// values are applied before capture; Rust exports the authoritative identity of their codegen
+// effect, which is what capture/replay compare.
 const JIT_FLAGS = new Map([
-    [5, 1], [9, 1], [10, 1], [11, 1], [12, 1], [13, 1], [18, 1], [19, 0], [21, 0], [15, 300000],
+    [5, 1], [10, 0], [11, 1], [12, 1], [13, 1], [19, 0], [21, 0], [15, 300000],
 ]);
 let FLAG_OVERRIDES;
 try { FLAG_OVERRIDES = parseFlagOverrides(args.flags); } catch (e) { usageExit(e); }
@@ -56,8 +57,9 @@ for (const [i, v] of FLAG_OVERRIDES) JIT_FLAGS.set(i, v);
 const relaxed = args.relaxed === undefined ? 1 : Number(args.relaxed);
 if (relaxed !== 0 && relaxed !== 1) { console.error(`--relaxed must be 0 or 1, got ${args.relaxed}`); process.exit(2); }
 
-const libv86Path = path.join(REPO, "vendor/v86/build/libv86.mjs");
-const wasmPath = path.join(REPO, "vendor/v86/build/v86.wasm");
+const ENGINE_DIR = path.resolve(process.env.V86_ENGINE_DIR || path.join(REPO, "vendor/v86"));
+const libv86Path = path.join(ENGINE_DIR, "build/libv86.mjs");
+const wasmPath = path.join(ENGINE_DIR, "build/v86.wasm");
 for (const p of [libv86Path, wasmPath]) {
     if (!fs.existsSync(p)) { console.error(`missing ${p} — build the fork first`); process.exit(2); }
 }
@@ -86,7 +88,7 @@ let relocApplied = null; // relocation values taken from the manifest, audited a
 // The codegen shape READ BACK OUT of the engine, never the shape we asked for: the reported
 // value has to be the measured one, or a knob that silently failed to take would be reported
 // as if it had (see applyShape()).
-let effectiveFlags = null, effectiveRelaxed = null;
+let effectiveFlags = null, effectiveRelaxed = null, effectiveJitIdentity = null;
 const timer = setTimeout(() => finish("TIMEOUT"), timeoutMs);
 
 const sha256 = (buf) => crypto.createHash("sha256").update(buf).digest("hex");
@@ -101,6 +103,61 @@ const shaPage = (mem, addr) => sha256(Buffer.from(mem.subarray(addr, addr + PAGE
  * value is read back through `get_jit_config` and a mismatch aborts the arm, because the
  * alternative is a run that measures one shape and is labelled another (design F-d).
  */
+function jitIdentity(ex) {
+    for (const fn of [
+        "jit_config_abi_version", "jit_config_supported_mask",
+        "jit_codegen_fingerprint_lo", "jit_codegen_fingerprint_hi",
+    ]) {
+        if (typeof ex[fn] !== "function") {
+            console.error(`engine lacks ${fn} — cannot verify Rust JIT codegen identity`);
+            process.exit(2);
+        }
+    }
+    const abi = ex.jit_config_abi_version() >>> 0;
+    if (abi !== 1) {
+        console.error(`unsupported JIT config ABI ${abi}; expected 1`);
+        process.exit(2);
+    }
+    return {
+        abi,
+        supported_mask: ex.jit_config_supported_mask() >>> 0,
+        fingerprint_lo: ex.jit_codegen_fingerprint_lo() >>> 0,
+        fingerprint_hi: ex.jit_codegen_fingerprint_hi() >>> 0,
+    };
+}
+
+// This is the replay envelope, not a request-shaped configuration. Every field is measured
+// from the instance that will receive the staged unit, so a manifest cannot cross an engine,
+// RAM, codegen, or AOT-transaction ABI boundary by accident.
+function aotIdentity(cpu) {
+    const ex = cpu.wm.exports;
+    // `memory_size` is the live guest-RAM word maintained by the engine (and is what the JS
+    // allocator/restart paths use). It is authoritative even on builds that deliberately do
+    // not expose a redundant wasm getter.
+    if (!cpu.memory_size || !Number.isInteger(cpu.memory_size[0])) {
+        console.error("engine lacks live memory_size — cannot verify AOT RAM identity");
+        process.exit(2);
+    }
+    return {
+        aot_abi: 5,
+        engine_sha256: sha256(fs.readFileSync(wasmPath)),
+        ram_size: cpu.memory_size[0] >>> 0,
+        ...jitIdentity(ex),
+    };
+}
+
+function manifestMatchesLiveIdentity(manifest, live) {
+    const got = manifest.jit_identity;
+    if (!got || typeof got !== "object") return false;
+    return got.aot_abi === live.aot_abi
+        && got.engine_sha256 === live.engine_sha256
+        && got.ram_size === live.ram_size
+        && got.abi === live.abi
+        && got.supported_mask === live.supported_mask
+        && got.fingerprint_lo === live.fingerprint_lo
+        && got.fingerprint_hi === live.fingerprint_hi;
+}
+
 function applyShape(ex) {
     for (const fn of ["set_jit_config", "get_jit_config", "set_relaxed_fpu", "get_relaxed_fpu"]) {
         if (typeof ex[fn] !== "function") {
@@ -108,9 +165,18 @@ function applyShape(ex) {
             process.exit(2);
         }
     }
+    const before = jitIdentity(ex);
     const eff = {};
     for (const [i, v] of JIT_FLAGS) {
-        ex.set_jit_config(i, v);
+        if (!(before.supported_mask & (1 << i))) {
+            console.error(`JIT config index ${i} is unsupported by mask 0x${before.supported_mask.toString(16)}`);
+            process.exit(2);
+        }
+        const status = ex.set_jit_config(i, v);
+        if (status !== 0) {
+            console.error(`set_jit_config(${i}, ${v}) failed with status ${status}`);
+            process.exit(2);
+        }
         const got = ex.get_jit_config(i) >>> 0;
         if (got !== (v >>> 0)) {
             console.error(`set_jit_config(${i}, ${v}) read back ${got} — the knob did not take `
@@ -127,6 +193,7 @@ function applyShape(ex) {
     }
     effectiveFlags = eff;
     effectiveRelaxed = gotRelaxed;
+    effectiveJitIdentity = jitIdentity(ex);
 }
 
 function jitFacts(cpu) {
@@ -144,7 +211,7 @@ function jitFacts(cpu) {
         out.tier2Pages = ex.jit_get_tier2_page_count ? ex.jit_get_tier2_page_count() : null;
         out.fastmemLoadsCompiled = ex.fastmem_get_speculated_loads_compiled
             ? ex.fastmem_get_speculated_loads_compiled() : null;
-        out.fastmemGeneration = ex.fastmem_get_generation ? ex.fastmem_get_generation() : null;
+        out.fastmemReadMapPages = ex.fastmem_read_map_count ? ex.fastmem_read_map_count() : null;
     } catch (e) { out.error = String(e); }
     return out;
 }
@@ -161,7 +228,7 @@ function regions(cpu) {
  * Publish a candidate unit. Mirrors src/worker/core/cpu/aot-cache.ts replay() — deliberately,
  * because the oracle must exercise the SAME publication path the emulator uses, including the
  * two constraints bought with failed attempts (handoff §2.1): a unit is only replayable in
- * the slot its bytes were compiled for, and registration must not stamp the TLB (one
+ * the slot its bytes were compiled for, and transaction commit must not stamp the TLB (one
  * jit_aot_flush_tlb for the whole batch afterwards).
  */
 /**
@@ -181,63 +248,62 @@ function applyRelocations(bytes, unit, values) {
     return bytes;
 }
 
-function publishUnit(cpu, unit) {
+function publishUnit(cpu, unit, identity) {
     const w = cpu.wm.exports;
     const table = cpu.wm.wasm_table;
     const mem = cpu.mem8;
     const refuse = (why) => ({ registered: false, why });
 
     for (const p of unit.pages) {
+        if (!Number.isInteger(p.physPage) || p.physPage < 0 || p.physPage > 0xFFFFF) return refuse("bad-physical-page");
         const live = shaPage(mem, p.physPage * PAGE_SIZE);
         if (live !== p.sha) return refuse(`content-mismatch page 0x${p.physPage.toString(16)}: live ${live.slice(0, 16)} != unit ${p.sha.slice(0, 16)}`);
     }
-    // A unit whose body bakes a wasm table index is only replayable in that ONE slot: drain the
-    // free list down to it and hand the rest back (aot-cache.reserveTableIndex). A unit that
-    // names no slot (tableIndex null — see plan/aot-module-contract.md §9.1 / E1) has no such
-    // constraint and takes whatever the engine hands out.
-    const spare = [];
-    let idx = -1;
-    const wantAny = unit.tableIndex === null || unit.tableIndex === undefined;
-    for (;;) {
-        const i = w.jit_aot_alloc_table_index() >>> 0;
-        if (i === 0xFFFF) break;
-        if (wantAny || i === unit.tableIndex) { idx = i; break; }
-        spare.push(i);
-    }
-    const giveBack = () => { for (const i of spare) w.jit_aot_free_table_index(i); };
-    if (idx < 0 || (!wantAny && idx !== unit.tableIndex)) { giveBack(); return refuse("slot-unavailable"); }
-
     let fn;
     try {
         const inst = new WebAssembly.Instance(new WebAssembly.Module(unit.bytes), { "e": cpu.jit_imports });
         fn = inst.exports["f"];
-        if (typeof fn !== "function") { w.jit_aot_free_table_index(idx); giveBack(); return refuse("no-export-f"); }
-        table.set(idx + WASM_TABLE_OFFSET, fn);
+        if (typeof fn !== "function") return refuse("no-export-f");
     } catch (e) {
-        w.jit_aot_free_table_index(idx); giveBack();
         return refuse(`instantiate: ${String(e).slice(0, 120)}`);
     }
-    // Check-then-act: half-published units cannot be unwound safely (aot-cache.ts).
+    const required = ["jit_aot_tx_begin", "jit_aot_tx_page_begin", "jit_aot_tx_entry_push",
+        "jit_aot_tx_page_finish", "jit_aot_tx_prepare_finish", "jit_aot_tx_commit", "jit_aot_tx_abort"];
+    if (!required.every((name) => typeof w[name] === "function")) return refuse("transaction-api-unavailable");
+    if (!(unit.tableIndex > 0 && unit.tableIndex < WASM_TABLE_SIZE)) return refuse("bad-table-index");
+    let rc = w.jit_aot_tx_begin(unit.tableIndex, unit.pages.length, identity.fingerprint_lo, identity.fingerprint_hi) >>> 0;
+    if (rc !== 0) return refuse(`tx-begin-${rc}`);
+    const abort = () => (w.jit_aot_tx_abort() >>> 0) === 0;
     for (const p of unit.pages) {
-        if ((w.jit_aot_page_table_index(p.physPage * PAGE_SIZE) >>> 0) !== 0xFFFF) {
-            table.set(idx + WASM_TABLE_OFFSET, null); w.jit_aot_free_table_index(idx); giveBack();
-            return refuse(`page-taken 0x${p.physPage.toString(16)}`);
+        rc = w.jit_aot_tx_page_begin(p.physPage * PAGE_SIZE, p.stateFlags, p.entries.length) >>> 0;
+        if (rc !== 0) break;
+        for (const [off, st] of p.entries) {
+            rc = w.jit_aot_tx_entry_push(off, st) >>> 0;
+            if (rc !== 0) break;
         }
-    }
-    let rc = 0;
-    for (const p of unit.pages) {
-        w.jit_aot_entry_reset();
-        for (const [off, st] of p.entries) w.jit_aot_entry_push(off, st);
-        rc = w.jit_register_aot_module(idx, p.physPage * PAGE_SIZE, p.stateFlags) >>> 0;
+        if (rc !== 0) break;
+        rc = w.jit_aot_tx_page_finish() >>> 0;
         if (rc !== 0) break;
     }
-    giveBack();
+    if (rc === 0) rc = w.jit_aot_tx_prepare_finish() >>> 0;
     if (rc !== 0) {
-        table.set(idx + WASM_TABLE_OFFSET, null); w.jit_aot_free_table_index(idx);
-        return refuse(`register-rc-${rc}`);
+        return abort() ? refuse(`tx-prepare-${rc}`) : refuse(`tx-prepare-${rc}-abort-failed`);
+    }
+    let tableMayHaveBeenWritten = false;
+    try {
+        tableMayHaveBeenWritten = true;
+        table.set(unit.tableIndex + WASM_TABLE_OFFSET, fn);
+        rc = w.jit_aot_tx_commit() >>> 0;
+        if (rc !== 0) throw new Error(`commit-${rc}`);
+    } catch (e) {
+        if (tableMayHaveBeenWritten) {
+            try { table.set(unit.tableIndex + WASM_TABLE_OFFSET, null); }
+            catch { return refuse("table-clear-failed-staged-slot-retained"); }
+        }
+        return abort() ? refuse(`tx-post-set-${String(e).slice(0, 120)}`) : refuse("tx-abort-failed");
     }
     w.jit_aot_flush_tlb();
-    return { registered: true, idx, fn, pages: unit.pages.map((p) => p.physPage) };
+    return { registered: true, idx: unit.tableIndex, fn, pages: unit.pages.map((p) => p.physPage) };
 }
 
 /**
@@ -324,7 +390,6 @@ function captureUnit(cpu) {
                 if (packed === 0xFFFFFFFF) continue;
                 entries.push([packed >>> 16, packed & 0xFFFF]);
             }
-            if (!entries.length) continue;
             pages.push({ physPage: pAddr >>> 12, stateFlags: w.jit_aot_page_state_flags(pAddr) >>> 0,
                 entries, sha: shaPage(mem, pAddr) });
         }
@@ -378,9 +443,10 @@ function finish(status) {
         });
         // The manifest records the shape THAT PRODUCED THESE BYTES (read back from the engine),
         // because that is what makes it valid or invalid to replay them later (AotVersion F1).
+        const identity = aotIdentity(cpu);
         fs.writeFileSync(base + ".json", JSON.stringify({
-            case: c.id, jit_flags: effectiveFlags, relaxed_fpu: effectiveRelaxed,
-            engine_sha256: sha256(fs.readFileSync(wasmPath)), units: index,
+            case: c.id, jit_identity: identity,
+            engine_sha256: identity.engine_sha256, units: index,
         }, null, 2));
         result.capture = { file: base + ".json", units: index.length };
     }
@@ -414,29 +480,24 @@ emulator.add_listener("emulator-loaded", () => {
         // the whole memory contract depend on an unverified constant.
         const relocValues = manifest.relocations ?? {};
         relocApplied = relocValues;
-        if (manifest.engine_sha256) {
-            const liveSha = sha256(fs.readFileSync(wasmPath));
-            if (liveSha !== manifest.engine_sha256) {
-                console.error(`AOT manifest engine sha ${manifest.engine_sha256.slice(0, 16)} != live ${liveSha.slice(0, 16)}`);
-                process.exit(3);
-            }
+        const liveIdentity = aotIdentity(cpu);
+        // Legacy manifests did not carry this envelope. Do not manufacture values for them:
+        // the only safe compatibility mode is refusal, because a missing RAM/AOT ABI check is
+        // not evidence that the old bytes can be staged into this engine.
+        if (manifest.engine_sha256 !== liveIdentity.engine_sha256
+            || !manifestMatchesLiveIdentity(manifest, liveIdentity)) {
+            console.error("AOT manifest ABI-5 identity envelope does not match the live engine");
+            process.exit(3);
         }
-        // AotVersion F1: the shape flags a unit was built under are part of its validity. Only
-        // idx 5 changes THIS producer's output (dead-flag elision), but a silent mismatch on
-        // any of them would mean the arms are not the experiment that was designed.
-        for (const [k, v] of Object.entries(manifest.jit_flags ?? {})) {
-            if (JIT_FLAGS.get(Number(k)) !== v) {
-                console.error(`AOT manifest jit_flags[${k}]=${v} != live ${JIT_FLAGS.get(Number(k))}`);
-                process.exit(3);
-            }
-        }
-        if (manifest.relaxed_fpu !== undefined && manifest.relaxed_fpu !== relaxed) {
-            console.error(`AOT manifest relaxed_fpu=${manifest.relaxed_fpu} != live ${relaxed}`);
+        if (!Array.isArray(manifest.units) || !manifest.units.length
+            || !manifest.units.every((u) => Number.isInteger(u.tableIndex)
+                && u.tableIndex > 0 && u.tableIndex < WASM_TABLE_SIZE)) {
+            console.error("AOT manifest lacks exact valid table slot(s)");
             process.exit(3);
         }
         for (const u of manifest.units) {
             const bytes = applyRelocations(fs.readFileSync(path.join(dir, u.file)), u, relocValues);
-            const published = publishUnit(cpu, { ...u, bytes });
+            const published = publishUnit(cpu, { ...u, bytes }, liveIdentity);
             aotUnits.push(published);
             results.push(published);
         }

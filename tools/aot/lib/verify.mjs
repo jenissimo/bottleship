@@ -533,9 +533,9 @@ export function verifyUnit(bytes, unit, opts) {
     // E1: the body names no wasm table slot at all — there is nothing to pin.
     {
         const suspicious = body.filter((x) => x.op === OP_CALL &&
-            ["fastmem_deopt_jit_unit", "jit_find_cache_entry_in_page"].includes(fnImports[x.imm]?.name));
+            fnImports[x.imm]?.name === "jit_find_cache_entry_in_page");
         check("E1", suspicious.length === 0,
-            "no fastmem_deopt_jit_unit / jit_find_cache_entry_in_page call ⇒ no baked table index");
+            "no jit_find_cache_entry_in_page call ⇒ no baked table index");
     }
     // E2 / N79 / N93: no guest address the unit is compiled from may live in the thunk/callback/
     // spin bucket. The engine excludes that range from every module growth edge of its own

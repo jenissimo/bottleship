@@ -20,6 +20,13 @@ export interface WindowGeometryHost {
         moved: boolean,
         resized: boolean,
     ): void;
+    applyWindowPlacement(
+        ctx: any,
+        mem: Uint8Array,
+        hWnd: number,
+        showCmd: number,
+        normalRect: { left: number; top: number; right: number; bottom: number } | null,
+    ): any;
 }
 
 const WM_PAINT = 0x000F;
@@ -499,26 +506,20 @@ export function registerWindowGeometryExports(
             normalBottom,
         });
 
-        exports['ShowWindow'](ctx, mem, [hWnd, showCmd]);
-
         const applyNormalPosition =
             showCmd === SW_SHOWNORMAL ||
             showCmd === SW_RESTORE ||
             showCmd === SW_SHOW;
 
-        if (applyNormalPosition) {
-            applyOuterRectScreenToWindow(
-                hWnd,
-                window,
-                normalLeft,
-                normalTop,
-                normalRight,
-                normalBottom,
-                true,
-            );
-        }
-
-        return 1;
+        return host.applyWindowPlacement(
+            ctx,
+            mem,
+            hWnd,
+            showCmd,
+            applyNormalPosition
+                ? { left: normalLeft, top: normalTop, right: normalRight, bottom: normalBottom }
+                : null,
+        );
     };
 
     exports['ClientToScreen'] = (ctx, mem, args) => {

@@ -3,7 +3,7 @@
 // v86 enters the image in 32-bit flat protected mode, CPL0, paging OFF, IF=0. The driver
 // then builds a 4KB-page identity map of 0..8MB and turns CR0.PG on, because v86 only
 // compiles the fastmem read fast path when (is_32 && protected_mode && CR0.PG) —
-// jit.rs fastmem_compile_generation(). Without paging we would be measuring the TLB shape,
+// jit.rs fastmem_reads_compile_enabled(). Without paging we would be measuring the TLB shape,
 // which BottleShip does NOT run in production.
 //
 // Promoted from tools/probes/aot-spike/image.mjs. Two differences, both load-bearing for an

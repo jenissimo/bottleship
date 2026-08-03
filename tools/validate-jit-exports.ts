@@ -20,7 +20,7 @@
  *
  * Usual cause of a failure: a `#[no_mangle]` that drifted off the function it decorated.
  */
-const WASM = "vendor/v86/build/v86.wasm";
+const WASM = process.env.V86_WASM_PATH || "vendor/v86/build/v86.wasm";
 const RUST_DIRS = ["vendor/v86/src/rust"];
 
 // The captured name must allow UPPERCASE: dozens of real imports are instruction helpers

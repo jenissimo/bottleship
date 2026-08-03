@@ -34,8 +34,6 @@ export function resolveHleExportAddress(
 
     const byQualifiedName = tg.getExportAddress(`${dllName}:${exportName}`);
     if (byQualifiedName !== undefined) return byQualifiedName >>> 0;
-    const byShortName = tg.getExportAddress(exportName);
-    if (byShortName !== undefined) return byShortName >>> 0;
 
     const system = System.getInstance();
     const apiRegistry = APIRegistry.getInstance();
@@ -43,6 +41,12 @@ export function resolveHleExportAddress(
     const pendingKey = `${dllName}:${exportName}`.toLowerCase();
     const hasPending = !!dispatcher?.pendingRegistrations?.has(pendingKey);
     if (!apiRegistry.hasModule(dllName) && !hasPending) return 0;
+
+    // Signature metadata may fall back across descriptors for ABI recovery, but export
+    // ownership may not: GetProcAddress is scoped by HMODULE.
+    if (!inApi && !hasPending && !apiRegistry.hasModuleFunctionSignature(dllName, exportName)) {
+        return 0;
+    }
 
     const argCount = apiRegistry.getArgCount(dllName, exportName);
     const stackCleanupBytes = apiRegistry.getStackCleanupBytes(dllName, exportName);

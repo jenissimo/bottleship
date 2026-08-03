@@ -154,17 +154,29 @@ export function bitBlt(gdi: GDIContext, hdcDest: number, x: number, y: number, w
     const destState = gdi.hdcStates.get(hdcDest);
     const srcState = gdi.hdcStates.get(hdcSrc);
     if (needsSource) syncDibSourceDc(gdi, hdcSrc, srcCtx, srcState, xSrc, ySrc, width, height);
-    // HL launcher: WM_PAINT BitBlt from fresh CreateCompatibleBitmap (all white, no art).
-    const sourceHasSelectedBitmap = !!srcState?.hBitmap && srcState.hBitmap !== DEFAULT_BITMAP_HANDLE;
+    // Skip only a never-drawn compatible source → window DC (WM_PAINT that BitBlts a
+    // fresh CreateCompatibleBitmap and would whitewash guest art). A pristine flag left
+    // on a DC that already holds real pixels must NOT no-op — menu slide transitions
+    // restore the backdrop with SRCCOPY from an offscreen snapshot into a window DC.
     if (rop === SRCCOPY && srcState?.pristine && destState?.windowBlit) {
-        const wb = destState.windowBlit;
-        if (width >= wb.width && height >= wb.height) {
-            destState.skipOverlayFlush = true;
+        const srcBmp = srcState.hBitmap ?? 0;
+        const noRealBitmap = !srcBmp || srcBmp === DEFAULT_BITMAP_HANDLE;
+        let emptyCompatible = false;
+        if (!noRealBitmap) {
+            const bmpObj = SystemResourceProvider.getInstance().getUserObject(srcBmp) as
+                { compatibleEmpty?: boolean } | undefined;
+            emptyCompatible = !!bmpObj?.compatibleEmpty;
         }
-        Logger.verbose(LogCategory.GDI32,
-            `bitBlt: skip pristine src 0x${hdcSrc.toString(16)} -> window 0x${hdcDest.toString(16)} ` +
-            `(${width}x${height}) selBmp=${sourceHasSelectedBitmap ? 1 : 0}`);
-        return true;
+        if (noRealBitmap || emptyCompatible) {
+            const wb = destState.windowBlit;
+            if (width >= wb.width && height >= wb.height) {
+                destState.skipOverlayFlush = true;
+            }
+            Logger.verbose(LogCategory.GDI32,
+                `bitBlt: skip pristine src 0x${hdcSrc.toString(16)} -> window 0x${hdcDest.toString(16)} ` +
+                `(${width}x${height}) emptyCompat=${emptyCompatible ? 1 : 0}`);
+            return true;
+        }
     }
 
     // Handle source-less ROPs early if no source context

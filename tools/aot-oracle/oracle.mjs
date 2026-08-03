@@ -17,7 +17,7 @@
 //
 // Candidate specs:
 //   unit:<manifest.json>  a contract-shaped AOT module (export f(i32)->(), imports from "e"),
-//                         published into a real v86 with jit_register_aot_module and entered
+//                         published through the staged AOT transaction API and entered
 //                         through wasm_table[idx+1024] — the production dispatch path.
 //   unit:auto             capture the JIT's own module for the case's page in a reference
 //                         run and re-publish THOSE bytes as the unit. This is the opt-0

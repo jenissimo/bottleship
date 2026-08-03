@@ -58,6 +58,13 @@ function mkChild(
     return wm.createWindow("TestChild", "child", style, 0, x, y, w, h, parent, 0, 0, 0);
 }
 
+function mkOwned(wm: WindowManager, owner: number): number {
+    return wm.createWindow(
+        "TestOwned", "owned", WS_POPUP | WS_VISIBLE, 0,
+        0, 0, 100, 100, owner, 0, 0, 0,
+    );
+}
+
 /** Drain the message queue and return all messages targeting `hwnd`. */
 function drainFor(wm: WindowManager, hwnd: number): Message[] {
     const out: Message[] = [];
@@ -135,12 +142,12 @@ describe("WindowManager Z-order", () => {
         expect(wm.getZOrder()).toEqual([t, b, a]);
     });
 
-    test("ShowWindow visibility change reorders (shown → front, hidden → back)", () => {
+    test("visibility alone preserves Z-order", () => {
         const a = mkTopLevel(wm, 0, 0, 100, 100);
         const b = mkTopLevel(wm, 0, 0, 100, 100); // z: [b,a]
-        wm.onWindowVisibilityChanged(b, false); // hide b → back
-        expect(wm.getZOrder()).toEqual([a, b]);
-        wm.onWindowVisibilityChanged(b, true); // show b → front
+        wm.getWindow(b)!.visible = false;
+        expect(wm.getZOrder()).toEqual([b, a]);
+        wm.getWindow(b)!.visible = true;
         expect(wm.getZOrder()).toEqual([b, a]);
     });
 });
@@ -168,6 +175,24 @@ describe("WindowManager WindowFromPoint", () => {
         expect(wm.windowFromPoint(75, 75)).toBe(child);
         // Inside the parent but outside the child → parent.
         expect(wm.windowFromPoint(10, 10)).toBe(top);
+    });
+
+    test("activating an owner keeps its owned top-level window in front", () => {
+        const owner = mkTopLevel(wm, 0, 0, 100, 100);
+        const owned = mkOwned(wm, owner);
+        const unrelated = mkTopLevel(wm, 0, 0, 100, 100);
+
+        wm.setActiveWindow(owner);
+
+        expect(wm.getZOrder()).toEqual([owned, owner, unrelated]);
+        expect(wm.windowFromPoint(50, 50)).toBe(owned);
+    });
+
+    test("new child is inserted at HWND_BOTTOM for hit-testing", () => {
+        const top = mkTopLevel(wm, 0, 0, 300, 300);
+        const front = mkChild(wm, top, 25, 25, 100, 100);
+        mkChild(wm, top, 25, 25, 100, 100);
+        expect(wm.windowFromPoint(50, 50)).toBe(front);
     });
 
     test("nested children: deepest containing child wins", () => {

@@ -7,7 +7,7 @@
  */
 
 import { System } from '../../core/system';
-import { windows, isEffectivelyVisible, buttonCheckStates, listControlStates, controlImageHandles, getOrCreateTrackbarState, getChildrenInPaintOrder, getAbsoluteWindowPosition, getAncestorClipRect } from './shared-state';
+import { windows, isEffectivelyVisible, buttonCheckStates, listControlStates, controlImageHandles, getOrCreateTrackbarState, getChildrenInPaintOrder, getAbsoluteWindowPosition, getAncestorClipRect, isFullyCoveredByGuestChild } from './shared-state';
 import type { GDIContext } from '../gdi32/context';
 import type { WindowInfo } from './shared-state';
 import { resolveBitmapRgba, resolveIconRgba, layoutStaticControlImage, blitStaticControlImage } from '../gdi32/bitmap-resolve';
@@ -15,6 +15,27 @@ import { Logger, LogCategory } from '../../core/logger';
 import { fillTextWithMnemonic, measureMnemonicText } from '../win32-text';
 import { getEditVisualState, EDIT_TEXT_INSET } from './edit-control';
 import { getControlColorOverride } from './control-colors';
+import {
+    getListViewState,
+    clampListViewTopIndex,
+    listViewHasHeader,
+    listViewRowHeight,
+    listViewViewStyle,
+    listViewVisibleCount,
+    LV_HEADER_H,
+    LV_ICON_SIZE,
+    LV_SMALL_ICON_SIZE,
+    LV_ICON_PAD,
+    LV_TEXT_INSET,
+    LV_SCROLLBAR_W,
+    LVIS_SELECTED,
+    LVIS_FOCUSED,
+    LVS_ICON,
+    LVS_REPORT,
+    LVS_SMALLICON,
+    LVS_LIST,
+    LVS_SHOWSELALWAYS,
+} from './list-view-control';
 
 // Window styles
 const WS_DISABLED = 0x08000000;
@@ -137,7 +158,8 @@ export function paintChildControls(parentHwnd: number, hdc: number, gdi: GDICont
         // permanently blank (UE1's video-options resolution ListBox: items inserted, nothing
         // drawn). Chrome is painted BEFORE the guest-paint chain runs, so a control the guest
         // really does draw still wins — it simply overwrites what we put down.
-        if (child.guestCustomPaint && !isButtonSystemControl(child) && parent.guestCustomPaint) continue;
+        if (child.guestCustomPaint && !isButtonSystemControl(child) && parent.guestCustomPaint
+            && !controlImageHandles.has(child.handle)) continue;
 
         painted = paintSystemControl(child, hdc, gdi, parentAbsX, parentAbsY) || painted;
     }
@@ -172,7 +194,8 @@ export function paintSystemControl(
     if (!isEffectivelyVisible(child) || !child.isSystemControl) return false;
     const parent = child.parent !== undefined ? windows.get(child.parent) : undefined;
     // See paintChildControls: defer only to a control that has actually painted itself.
-    if (child.guestCustomPaint && !isButtonSystemControl(child) && parent?.guestCustomPaint) return false;
+    if (child.guestCustomPaint && !isButtonSystemControl(child) && parent?.guestCustomPaint
+        && !controlImageHandles.has(child.handle)) return false;
     const ctx = gdi.getDC(hdc);
     if (!ctx) return false;
 
@@ -216,6 +239,9 @@ export function paintSystemControl(
             break;
         case 'listbox':
             paintListBox(ctx, child, absX, absY, w, h);
+            break;
+        case 'syslistview32':
+            paintListView(ctx, child, absX, absY, w, h);
             break;
         case 'scrollbar':
             paintScrollBar(ctx, child, absX, absY, w, h);
@@ -729,6 +755,22 @@ function paintStatic(
     h: number,
 ): void {
     const styleType = child.style & SS_TYPEMASK;
+    const coveredByGuestChild = styleType >= SS_BLACKRECT && styleType <= SS_WHITEFRAME
+        && isFullyCoveredByGuestChild(child.handle);
+
+    // STM_SETIMAGE can supply bitmap content while the control retains a
+    // non-image SS_TYPE. Render the supplied image instead of re-stamping the
+    // declared class shape (for example an SS_WHITEFRAME) over it.
+    if (controlImageHandles.has(child.handle)
+        && styleType !== SS_ICON && styleType !== SS_BITMAP) {
+        // Restore guest-owned bitmap content during parent/page recomposition.
+        paintStaticBitmap(ctx, child, x, y, w, h);
+        return;
+    }
+
+    // Preserve bitmap content behind a hosted page, but suppress placeholder
+    // RECT/FRAME chrome when the child completely covers the STATIC.
+    if (coveredByGuestChild) return;
 
     if (styleType === SS_ICON) {
         paintStaticIcon(ctx, child, x, y, w, h);
@@ -1073,6 +1115,186 @@ function paintListBox(
     }
 }
 
+function colorRefToCss(color: number, fallback: string): string {
+    if (color === 0xFFFFFFFF || color === 0xFF000000) return fallback; // CLR_NONE / CLR_DEFAULT
+    const r = color & 0xFF;
+    const g = (color >> 8) & 0xFF;
+    const b = (color >> 16) & 0xFF;
+    return `rgb(${r},${g},${b})`;
+}
+
+function paintListView(
+    ctx: OffscreenCanvasRenderingContext2D,
+    child: WindowInfo,
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+): void {
+    const disabled = isControlDisabled(child);
+    const state = getListViewState(child.handle);
+    const bk = colorRefToCss(state?.bkColor ?? 0xFF000000, COLOR_WINDOW);
+    const textColor = colorRefToCss(state?.textColor ?? 0xFF000000, COLOR_WINDOWTEXT);
+    const textBk = colorRefToCss(state?.textBkColor ?? 0xFF000000, bk);
+
+    ctx.fillStyle = disabled ? COLOR_BTNFACE : bk;
+    ctx.fillRect(x, y, w, h);
+    drawSunkenEdge(ctx, x, y, w, h);
+    if (!state) return;
+
+    clampListViewTopIndex(child, state);
+    const view = listViewViewStyle(child.style);
+    const headerH = listViewHasHeader(child) ? LV_HEADER_H : 0;
+    const rowH = listViewRowHeight(child);
+    const inset = 2;
+    const focused = System.getInstance().windowManager.getFocusHwnd() === child.handle;
+    const showSel = focused || (child.style & LVS_SHOWSELALWAYS) !== 0;
+    const maxVisible = listViewVisibleCount(child);
+    const hasScrollbar = state.items.length > maxVisible;
+    const bodyW = w - inset * 2 - (hasScrollbar ? LV_SCROLLBAR_W : 0);
+
+    if (headerH > 0) {
+        ctx.fillStyle = COLOR_BTNFACE;
+        ctx.fillRect(x + inset, y + inset, Math.max(1, bodyW), headerH);
+        ctx.font = getWindowFont(child);
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        let colX = x + inset - state.scrollX;
+        for (const col of state.columns) {
+            const cx = Math.max(0, col.cx);
+            drawRaisedEdge(ctx, colX, y + inset, Math.max(1, cx), headerH);
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(colX + 2, y + inset, Math.max(1, cx - 4), headerH);
+            ctx.clip();
+            ctx.fillStyle = COLOR_BTNTEXT;
+            ctx.fillText(col.text, colX + 4, y + inset + headerH / 2);
+            ctx.restore();
+            colX += cx;
+        }
+    }
+
+    ctx.font = getWindowFont(child);
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+
+    const bodyTop = y + inset + headerH;
+    const bodyH = Math.max(1, h - inset * 2 - headerH);
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(x + inset, bodyTop, Math.max(1, bodyW), bodyH);
+    ctx.clip();
+
+    if (view === LVS_ICON) {
+        const cellW = LV_ICON_SIZE + 40;
+        const cellH = rowH;
+        const cols = Math.max(1, Math.floor(bodyW / cellW));
+        let drawn = 0;
+        for (let i = state.topIndex; i < state.items.length && drawn < maxVisible * cols; i++) {
+            const local = i - state.topIndex;
+            const col = local % cols;
+            const row = Math.floor(local / cols);
+            const ix = x + inset + col * cellW;
+            const iy = bodyTop + row * cellH;
+            paintListViewItemChrome(ctx, state.items[i], ix, iy, cellW, cellH, showSel, disabled, textColor, textBk, true);
+            drawn++;
+        }
+    } else {
+        const iconSize = (view === LVS_SMALLICON || view === LVS_LIST || view === LVS_REPORT)
+            ? LV_SMALL_ICON_SIZE : 0;
+        const visible = Math.min(state.items.length - state.topIndex, maxVisible);
+        for (let i = 0; i < visible; i++) {
+            const idx = state.topIndex + i;
+            const item = state.items[idx];
+            const iy = bodyTop + i * rowH;
+            const selected = showSel && (item.state & LVIS_SELECTED) !== 0;
+            const rowW = view === LVS_REPORT && state.columns.length > 0
+                ? state.columns.reduce((s, c) => s + Math.max(0, c.cx), 0)
+                : bodyW;
+
+            if (selected) {
+                ctx.fillStyle = COLOR_HIGHLIGHT;
+                ctx.fillRect(x + inset - (view === LVS_REPORT ? state.scrollX : 0), iy, Math.max(1, rowW), rowH);
+            } else if (state.textBkColor !== 0xFFFFFFFF) {
+                ctx.fillStyle = textBk;
+                ctx.fillRect(x + inset, iy, Math.max(1, bodyW), rowH);
+            }
+
+            let textX = x + inset + LV_TEXT_INSET - (view === LVS_REPORT ? state.scrollX : 0);
+            if (iconSize > 0 && (state.himlSmall || state.himlNormal || item.iImage >= 0)) {
+                const iconY = iy + Math.max(0, (rowH - iconSize) / 2);
+                ctx.fillStyle = selected ? COLOR_HIGHLIGHTTEXT : '#808080';
+                ctx.fillRect(textX, iconY, iconSize, iconSize);
+                ctx.strokeStyle = selected ? COLOR_HIGHLIGHTTEXT : '#404040';
+                ctx.strokeRect(textX + 0.5, iconY + 0.5, iconSize - 1, iconSize - 1);
+                textX += iconSize + 4;
+            }
+
+            ctx.fillStyle = disabled ? COLOR_GRAYTEXT : (selected ? COLOR_HIGHLIGHTTEXT : textColor);
+            if (view === LVS_REPORT && state.columns.length > 0) {
+                let colX = x + inset - state.scrollX;
+                for (let c = 0; c < state.columns.length; c++) {
+                    const cx = Math.max(0, state.columns[c].cx);
+                    const label = c === 0 ? item.text : (item.subItems[c - 1]?.text ?? '');
+                    const tx = c === 0 ? textX : colX + LV_TEXT_INSET;
+                    ctx.save();
+                    ctx.beginPath();
+                    ctx.rect(colX + 1, iy, Math.max(1, cx - 2), rowH);
+                    ctx.clip();
+                    ctx.fillText(label, tx, iy + rowH / 2);
+                    ctx.restore();
+                    colX += cx;
+                }
+            } else {
+                ctx.fillText(item.text, textX, iy + rowH / 2);
+            }
+
+            if ((item.state & LVIS_FOCUSED) && focused) {
+                ctx.save();
+                ctx.strokeStyle = selected ? COLOR_HIGHLIGHTTEXT : COLOR_WINDOWTEXT;
+                ctx.setLineDash([1, 1]);
+                ctx.strokeRect(x + inset + 1, iy + 1, Math.max(1, bodyW - 2), rowH - 2);
+                ctx.restore();
+            }
+        }
+    }
+
+    ctx.restore();
+
+    if (hasScrollbar) {
+        paintListScrollbar(
+            ctx, x, y + headerH, w, h - headerH,
+            state.topIndex, maxVisible, state.items.length,
+        );
+    }
+}
+
+function paintListViewItemChrome(
+    ctx: OffscreenCanvasRenderingContext2D,
+    item: { text: string; state: number; iImage: number },
+    x: number, y: number, w: number, h: number,
+    showSel: boolean, disabled: boolean, textColor: string, _textBk: string,
+    largeIcon: boolean,
+): void {
+    const selected = showSel && (item.state & LVIS_SELECTED) !== 0;
+    const icon = largeIcon ? LV_ICON_SIZE : LV_SMALL_ICON_SIZE;
+    const ix = x + (w - icon) / 2;
+    const iy = y + LV_ICON_PAD;
+    if (selected) {
+        ctx.fillStyle = COLOR_HIGHLIGHT;
+        ctx.fillRect(ix - 2, iy - 2, icon + 4, icon + 4);
+    }
+    ctx.fillStyle = selected ? COLOR_HIGHLIGHTTEXT : '#808080';
+    ctx.fillRect(ix, iy, icon, icon);
+    ctx.strokeStyle = '#404040';
+    ctx.strokeRect(ix + 0.5, iy + 0.5, icon - 1, icon - 1);
+
+    ctx.fillStyle = disabled ? COLOR_GRAYTEXT : (selected ? COLOR_HIGHLIGHTTEXT : textColor);
+    ctx.textAlign = 'center';
+    ctx.fillText(item.text, x + w / 2, iy + icon + 10);
+    ctx.textAlign = 'left';
+}
+
 /** Classic vertical scrollbar (up/down arrows + proportional thumb) inside a listbox. */
 function paintListScrollbar(
     ctx: OffscreenCanvasRenderingContext2D,
@@ -1299,70 +1521,6 @@ function paintGenericControl(
     ctx.textBaseline = 'top';
 }
 
-/**
- * Paint child controls using a fresh overlay DC.
- * Used for immediate repaints triggered by mouse events (button press/release).
- */
-function wrapDialogText(ctx: OffscreenCanvasRenderingContext2D, text: string, maxWidth: number): string[] {
-    const words = text.split(/\s+/);
-    const lines: string[] = [];
-    let line = '';
-    for (const word of words) {
-        const candidate = line ? `${line} ${word}` : word;
-        if (ctx.measureText(candidate).width <= maxWidth || !line) {
-            line = candidate;
-        } else {
-            lines.push(line);
-            line = word;
-        }
-    }
-    if (line) lines.push(line);
-    return lines.length ? lines : [''];
-}
-
-/** Draw dialog client-area message text (templates with buttons only, no Static). */
-export function paintDialogClientMessage(hdc: number, gdi: GDIContext, win: WindowInfo): void {
-    const text = win.clientMessage;
-    if (!text) return;
-
-    const ctx = gdi.getDC(hdc);
-    if (!ctx) return;
-
-    const absX = getChainX(win);
-    const absY = getChainY(win);
-    const pad = 12;
-    const maxW = Math.max(1, win.width - pad * 2);
-
-    let textBottom = absY + win.height - pad;
-    for (const childHandle of win.children) {
-        const child = windows.get(childHandle);
-        if (!child || !child.visible || !child.isSystemControl) continue;
-        const cls = normalizeSystemControlClass(child.systemControlClass);
-        if (cls === 'button' || cls === 'combobox') {
-            textBottom = Math.min(textBottom, absY + child.y - 8);
-        }
-    }
-
-    ctx.fillStyle = COLOR_WINDOWTEXT;
-    ctx.font = getWindowFont(win);
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'top';
-
-    const lines = wrapDialogText(ctx, text, maxW);
-    const lineH = 14;
-    const totalH = lines.length * lineH;
-    const areaH = Math.max(lineH, textBottom - (absY + pad));
-    let ty = absY + pad + Math.max(0, Math.floor((areaH - totalH) / 2));
-
-    for (const line of lines) {
-        if (ty + lineH > textBottom) break;
-        ctx.fillText(line, absX + win.width / 2, ty);
-        ty += lineH;
-    }
-
-    ctx.textAlign = 'left';
-}
-
 // Owned-popup restamp hook — dialog-paint.ts registers the Z-order restore that
 // re-stamps modal popups floating above this window (cross-module hook avoids a
 // controls.ts <-> dialog-paint.ts import cycle).
@@ -1414,7 +1572,7 @@ function hitTestSystemControlAtScreen(
     const win = windows.get(hwnd);
     if (!win || !win.visible || !win.children.length) return undefined;
 
-    for (let i = win.children.length - 1; i >= 0; i--) {
+    for (let i = 0; i < win.children.length; i++) {
         const child = windows.get(win.children[i]);
         if (!child || !child.visible) continue;
 

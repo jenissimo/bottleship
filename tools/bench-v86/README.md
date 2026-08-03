@@ -22,12 +22,16 @@ After the first run everything is offline.
 
 ```sh
 # single run, all 10 nbench tests
-node tools/bench-v86/run-bytemark.mjs --engine vendor/v86 --label fork --flags "5=1,9=1,10=1,11=1,12=1,13=1,18=1"
+node tools/bench-v86/run-bytemark.mjs --engine vendor/v86 --label shipping \
+  --flags "5=1,10=0,11=1,12=1,13=1,15=300000,17=8,19=0,21=0,22=1" --relaxed 1
 node tools/bench-v86/run-bytemark.mjs --engine tools/bench-v86/engines/stock --label stock
 
-# full matrix (medians of N runs + summary.md)
-node tools/bench-v86/bench-matrix.mjs --runs 3 --configs stock,fork-off,fork-lossless
-node tools/bench-v86/bench-matrix.mjs --runs 1 --configs abl-deadflag,abl-fastmem-r,abl-x87locals,abl-pushrun,abl-retchain,abl-retspec,abl-fastmem-w,abl-flaglocals,abl-tier2
+# inspect the shipping-minus-one contour without launching a benchmark
+node tools/bench-v86/bench-matrix.mjs --list
+
+# full shipping marginal matrix (medians of N runs + summary.md)
+node tools/bench-v86/bench-matrix.mjs --runs 3 \
+  --configs shipping,shipping-minus-deadflag,shipping-minus-pushrun,shipping-minus-retchain,shipping-minus-retspec,shipping-minus-tier2,shipping-minus-tier2-page-cap,shipping-minus-branch-hints,reference-all-off
 ```
 
 ## Methodology (why it's shaped this way)
@@ -43,30 +47,34 @@ node tools/bench-v86/bench-matrix.mjs --runs 1 --configs abl-deadflag,abl-fastme
   skew prints a loud warning — treat those scores as invalid.
 - **Flags are applied at `emulator-started`,** before the kernel compiles anything,
   so the whole run uses one codegen configuration (`set_jit_config`, fork only).
-- **Ablation configs include features that are OFF in BottleShip production**
-  (fastmem writes, flag locals, tier-2). Our "no win" verdicts came from the
-  Windows-game workload; a Linux/nbench workload may value them differently —
-  that's exactly the upstream-relevant question.
-- **Relaxed x87 (`fork-relaxed`) is an accuracy tradeoff** (raw f64 in F80 slots).
-  It is never part of the lossless comparison; it exists as a separate labelled
-  config only.
+- **`shipping` is the only keep/drop baseline.** It explicitly applies the current
+  production values (including `x87Locals=0`, tier-2 threshold `300000`, tier-2
+  page cap `8`, branch-hint group 0, and relaxed FPU on) using only supported JIT
+  indices. Summary percentages are relative to `shipping` whenever it is selected.
+- **Every `shipping-minus-*` arm removes exactly one active shipping JIT feature.**
+  It preserves every other shipping flag and relaxed-FPU policy, so interactions
+  remain in the measurement. These are the marginal numbers used for keep/drop.
+- **`reference-all-off` and legacy `abl-*` arms are diagnostic references, never
+  marginal comparisons.** The latter intentionally add features to all-off and may
+  still be useful for upstream exploration, but cannot answer a shipping keep/drop
+  question.
+- **Strict FPU remains a separately labelled policy reference** (`fork-prod-lossless`),
+  not a lossless-JIT marginal arm.
 
 ## Flag index map (fork `set_jit_config`)
 
 | idx | feature | BottleShip prod |
 |-----|---------|-----------------|
 | 5   | cross-block dead-flag elision | on |
-| 9   | fastmem reads | on |
-| 10  | x87 stack-top locals | on |
+| 10  | x87 stack-top locals | off (pending representative FP evidence) |
 | 11  | push-run coalescing | on |
 | 12  | RET dynamic chaining | on |
 | 13  | RET-target speculation | on |
-| 15  | tier-2 hotness threshold (0 = off) | off |
-| 17  | tier-2 max pages | (8) |
-| 18  | fastmem read split-range | on |
+| 15  | tier-2 hotness threshold (0 = off) | 300000 |
+| 17  | tier-2 max pages | 8 |
 | 19  | fastmem write map | off |
 | 21  | arithmetic-flag locals | off |
-| 22  | wasm branch hints (bitmask of guard sites) | off |
+| 22  | wasm branch hints (bitmask of guard sites) | 1 (group 0) |
 | 23  | branch-hint offset fuzz (verifier probe) | off |
 | 24  | turbo-memory clamp reads (`exp/turbo-memory` only) | off |
 

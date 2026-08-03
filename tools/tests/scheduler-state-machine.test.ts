@@ -24,6 +24,7 @@ import {
     isValidTransition,
     WAIT_OBJECT_0,
     WAIT_BLOCKED_NO_SWITCH,
+    WAIT_TIMEOUT,
     INFINITE,
     type Thread,
     type CpuContext,
@@ -1494,6 +1495,26 @@ describe("scheduler/shouldPumpIdleVirtualTime — wheel-driven wakeups (audio-pu
 });
 
 describe("scheduler/waitForSingleObjectWithContext — blocked with runnable peer", () => {
+    test("zero-timeout probe stays non-blocking but yields fairly to a READY peer", () => {
+        const s = new Scheduler();
+        const t1 = mkBlockableCurrent(s, 1);
+        inject(s, mkThread(2, ThreadState.READY), { runnable: true });
+        const h = s.createEvent(true, false);
+
+        const ret = s.waitForSingleObjectWithContext(
+            h,
+            0,
+            0x401000,
+            0x10ffa00,
+            { ecx: 0, edx: 0, ebx: 0, ebp: 0, esi: 0, edi: 0, eflags: 0x202 },
+        );
+
+        expect(ret).toBe(WAIT_TIMEOUT);
+        expect(t1.state).toBe(ThreadState.RUNNING);
+        expect(t1.waitInfo).toBeNull();
+        expect((s as any).switchRequested).toBe(true);
+    });
+
     test("returns WAIT_BLOCKED_NO_SWITCH when blocking with requestSwitch (not WAIT_OBJECT_0 to sync thunk)", () => {
         const s = new Scheduler();
         const t1 = mkBlockableCurrent(s, 1);
@@ -1512,6 +1533,68 @@ describe("scheduler/waitForSingleObjectWithContext — blocked with runnable pee
         expect(t1.state).toBe(ThreadState.WAITING);
         expect(t1.context!.eip >>> 0).toBe(0x401000);
         expect(t1.context!.esp >>> 0).toBe(0x10ffa00);
+    });
+
+    // A finite timeout is CONSUMED, never answered early — even with nothing else to run.
+    // Guests measure it: Blade of Darkness calibrates its RDTSC game clock from the TSC
+    // delta across WaitForSingleObject(sem, 100), so an early WAIT_TIMEOUT scales every
+    // frame it will ever render.
+    test("sole runnable thread parks for the full timeout instead of returning WAIT_TIMEOUT", () => {
+        const s = new Scheduler();
+        const t1 = mkBlockableCurrent(s, 1);
+        const sem = s.createSemaphore(0, 1);   // count 0 → the wait cannot be satisfied
+
+        const ret = s.waitForSingleObjectWithContext(
+            sem,
+            100,
+            0x401000,
+            0x10ffa00,
+            { ecx: 0, edx: 0, ebx: 0, ebp: 0, esi: 0, edi: 0, eflags: 0x202 },
+        );
+
+        expect(ret).not.toBe(WAIT_TIMEOUT);
+        expect(ret).toBe(WAIT_BLOCKED_NO_SWITCH);
+        expect(t1.state).toBe(ThreadState.WAITING);
+        expect(t1.waitInfo!.timeoutTimerId).toBeGreaterThan(0);
+
+        // The wheel entry carries the WHOLE timeout — that deadline is what the guest measures.
+        const wheel = (s as any).timerWheel as TimerWheel;
+        const now = (s as any).timeService.nowMs();
+        expect(wheel.nextFireIn(now)).toBeGreaterThan(95);
+        expect(wheel.nextFireIn(now)).toBeLessThanOrEqual(100);
+
+        // Parked with nobody READY/RUNNING ⇒ pollTimeouts' idle pump owns the clock and
+        // paces the wait in wall time. Without this the park would freeze virtual time
+        // and the deadline could never come due.
+        expect((s as any).shouldPumpIdleVirtualTime()).toBe(true);
+    });
+});
+
+describe("scheduler/parkCurrentThreadUntil — synchronous HLE deadline", () => {
+    test("always parks a sole runnable thread and prebuilds a zero return context", () => {
+        const s = new Scheduler();
+        const t1 = mkBlockableCurrent(s, 1);
+
+        const ret = s.parkCurrentThreadUntil(
+            25,
+            0x401000,
+            0x10ffa00,
+            { ecx: 1, edx: 2, ebx: 3, ebp: 4, esi: 5, edi: 6, eflags: 0x202 },
+        );
+
+        expect(ret).toBe(WAIT_BLOCKED_NO_SWITCH);
+        expect(t1.state).toBe(ThreadState.WAITING);
+        expect(t1.waitInfo?.reason).toBe(WaitReason.SLEEP);
+        expect(t1.waitInfo?.timeoutTimerId).toBeGreaterThan(0);
+        expect(t1.context?.eip >>> 0).toBe(0x401000);
+        expect(t1.context?.esp >>> 0).toBe(0x10ffa00);
+        expect(t1.context?.eax >>> 0).toBe(0);
+
+        const wheel = (s as any).timerWheel as TimerWheel;
+        const now = (s as any).timeService.nowMs();
+        expect(wheel.nextFireIn(now)).toBeGreaterThan(20);
+        expect(wheel.nextFireIn(now)).toBeLessThanOrEqual(25);
+        expect((s as any).shouldPumpIdleVirtualTime()).toBe(true);
     });
 });
 

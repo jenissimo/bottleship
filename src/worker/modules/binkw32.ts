@@ -17,7 +17,7 @@
 
 import { IModule } from "../core/module";
 import { Process } from "../core/process";
-import { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
+import { ThunkImplementation, ThunkResult, X86Context } from "../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../core/logger";
 import { System } from "../core/system";
 import { EmulatorConfig } from "../core/emulator-config-manager";
@@ -145,7 +145,6 @@ interface BinkSession {
     audioWrapCount:  number;
     audioBaselineMs: number;   // -1 = not set
     frameDecodeCount: number;
-    lastWaitYieldMs: number;   // throttles the cooperative yield in BinkWait
     destPtr: number;
     destPitch: number;
     destHeight: number;
@@ -386,20 +385,24 @@ export class BinkW32 implements IModule {
      * Detects wraps by checking if cursor jumped backward by more than half the buffer.
      */
     /**
-     * Return the "not ready" code from BinkWait while cooperatively yielding the
-     * thread so DDraw present / audio / other threads can run instead of the
-     * guest JIT-grinding its poll loop. The yield is throttled to ≤1×/ms so the
-     * request itself stays cheap. (Mirrors SmackW32.markVideoWaitNotReady — this
-     * is a cooperative requestSwitch, NOT a busy-wait, so it frees the JS thread
-     * rather than stalling DDraw Blt the way an async/spin BinkWait would.)
+     * Replace a hot BinkWait poll loop with one scheduler deadline. The thunk stays
+     * synchronous from the guest's perspective: its post-return context is saved and
+     * EAX=0 (frame ready) is delivered only when the timer wakes the thread.
      */
-    private markVideoWaitNotReady(s: BinkSession): number {
-        const now = performance.now();
-        if (now - s.lastWaitYieldMs >= 1) {
-            s.lastWaitYieldMs = now;
-            System.getInstance().scheduler.requestSwitch();
+    private markVideoWaitNotReady(ctx: X86Context, mem: Uint8Array, waitMs: number): number | ThunkResult {
+        if (ctx.esp < 0 || ctx.esp + 4 > mem.length) {
+            return 1;
         }
-        return 1;
+        const returnAddr = new DataView(mem.buffer, mem.byteOffset, mem.byteLength)
+            .getUint32(ctx.esp, true);
+        const result = System.getInstance().scheduler.parkCurrentThreadUntil(
+            Math.max(1, waitMs),
+            returnAddr,
+            (ctx.esp + 8) >>> 0,
+            { ecx: ctx.ecx, edx: ctx.edx, ebx: ctx.ebx, ebp: ctx.ebp, esi: ctx.esi, edi: ctx.edi, eflags: ctx.eflags },
+        );
+        if (result === 0) return 1;
+        return { value: 0, blockedNoSwitch: true, stackCleanup: 4 };
     }
 
     private _getAudioTimeMs(s: BinkSession): number {
@@ -839,7 +842,6 @@ export class BinkW32 implements IModule {
                     audioCtrl: null, lastPlayCursor: 0,
                     audioWrapCount: 0, audioBaselineMs: -1,
                     frameDecodeCount: 0,
-                    lastWaitYieldMs: 0,
                     destPtr: 0,
                     destPitch: 0,
                     destHeight: 0,
@@ -1160,7 +1162,7 @@ export class BinkW32 implements IModule {
         // FUN_005979d0 (DDraw Unlock→Blt→Lock) only when DAT_00694ce0==1.
         // An async BinkWait would block FUN_0044daa0, preventing the outer loop
         // from ever reaching the DDraw render call.
-        this.exports["_BinkWait@4"] = (_ctx, _mem, args) => {
+        this.exports["_BinkWait@4"] = (ctx, mem, args) => {
             const bink = args[0];
             const s = this.sessions.get(bink);
             if (!s || s.paused || s.eof) return 0;
@@ -1183,7 +1185,9 @@ export class BinkW32 implements IModule {
                 if (audioMs >= 0 && audioMs < targetAudioMs) {
                     const wallElapsed = performance.now() - s.lastFrameMs;
                     if (wallElapsed < msPerFrame * 3) {
-                        return this.markVideoWaitNotReady(s);
+                        const audioRemaining = targetAudioMs - audioMs;
+                        const safetyRemaining = msPerFrame * 3 - wallElapsed;
+                        return this.markVideoWaitNotReady(ctx, mem, Math.min(audioRemaining, safetyRemaining));
                     }
                 }
                 return 0; // ready
@@ -1192,7 +1196,7 @@ export class BinkW32 implements IModule {
             // Fallback: wall-clock pacing (no active audio to sync against).
             const elapsed = performance.now() - s.lastFrameMs;
             if (elapsed < msPerFrame - 2) {
-                return this.markVideoWaitNotReady(s);
+                return this.markVideoWaitNotReady(ctx, mem, msPerFrame - 2 - elapsed);
             }
             return 0; // ready
         };

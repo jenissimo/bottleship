@@ -97,6 +97,8 @@ export interface ThunkResult {
     callbackId?: number;
     terminated?: boolean;
     skipStackCheck?: boolean;
+    /** Callback owns a nested return path; do not auto-save or overwrite its caller stack. */
+    preserveCallbackReturnAddress?: boolean;
     blockedNoSwitch?: boolean;  // Thread is WAITING, redirect EIP to spin loop (no runnable peers)
     deferredWrites?: DeferredWrite[];  // Writes to apply after async completion
     dllInits?: Array<{ baseAddress: number; entryPoint: number; name: string }>;  // DllMains to invoke after async load
@@ -1411,6 +1413,7 @@ export class ThunkDispatcher {
                     Logger.verbose(LogCategory.THUNK,
                         `CB return 0x${functionId.toString(16)}: ESP 0x${preEsp.toString(16)}>0x${postEsp.toString(16)} EIP=0x${postEip.toString(16)}${stackVals}`);
                 }
+
             }
             return;
         }
@@ -1973,7 +1976,8 @@ export class ThunkDispatcher {
 
             // Only save context if not already saved by the thunk itself (via CallbackManager.saveSuspendedThunkContext)
             const hasSavedThunkContext = this._callbackManager?.hasSavedThunkContext?.() ?? false;
-            if (this._callbackManager && !hasSavedThunkContext) {
+            if (this._callbackManager && !hasSavedThunkContext
+                && !suspendedResult.preserveCallbackReturnAddress) {
                 this._callbackManager.saveSuspendedThunkContext(ctx, stackCleanup, name);
                 Logger.verbose(LogCategory.THUNK,
                     `Suspended thunk (auto-saved context via stack): ESP=0x${esp.toString(16)}, EIP=0x${returnAddr.toString(16)}, stackCleanup=${stackCleanup}`);
@@ -1982,7 +1986,9 @@ export class ThunkDispatcher {
             // Park the callback-return stub's RET at the spin loop; otherwise it pops the
             // original game return address and resumes with a stack corrupted by the
             // missing stdcall cleanup. See redirectStackToSpinLoop.
-            this.redirectStackToSpinLoop(espAtEntry);
+            if (!suspendedResult.preserveCallbackReturnAddress) {
+                this.redirectStackToSpinLoop(espAtEntry);
+            }
 
             this.lastThunkNameAfterReturn = ""; // Don't blame this thunk for ESP mismatch after callback
 

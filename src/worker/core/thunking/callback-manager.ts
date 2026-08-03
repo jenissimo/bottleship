@@ -47,6 +47,12 @@ export interface CallbackInvocation {
     ownerThreadId?: number;       // Thread that invoked callback (owner of in-flight return path)
     /** Return EIP was synthesized (e.g. winmm timer thread → spin loop); callerRet check skipped. */
     syntheticReturnEip?: boolean;
+    /** Complete only the currently executing API thunk, preserving any outer callback frame. */
+    directThunkReturn?: {
+        returnAddr: number;
+        postEsp: number;
+        complete?: (callbackReturnValue: number) => number | null;
+    };
 }
 
 export interface CallbackReturnStub {
@@ -99,6 +105,13 @@ export interface InvokeCallbackOptions {
     // For deferred callbacks dispatched at scheduler safe-points:
     // synthesize an explicit return EIP instead of relying on arbitrary stack top.
     forceSyntheticReturnEip?: boolean;
+    // Synchronous guest call made by an API such as CallWindowProc: resume
+    // where that API's RET N would have returned without consuming an outer frame.
+    directThunkReturn?: {
+        returnAddr: number;
+        postEsp: number;
+        complete?: (callbackReturnValue: number) => number | null;
+    };
 }
 
 // Special callback IDs start from 0x80000000 to distinguish from regular thunks
@@ -108,7 +121,7 @@ const CALLBACK_ID_BASE = 0x80000000;
 const CLEANUP_AMOUNTS = [0, 4, 8, 12, 16, 20, 24, 32];
 
 // Maximum callback nesting depth to prevent exhaust of return stub pool
-const MAX_CALLBACK_NESTING = 8;
+const MAX_CALLBACK_NESTING = 32;
 const SUSPENDED_FRAME_RING_SIZE = 64;
 const MAX_PENDING_CALLBACK_SLOTS = 256;
 
@@ -553,7 +566,7 @@ export class CallbackManager {
             }
         }
 
-        if (!callback.completeThunk && !callback.syntheticReturnEip &&
+        if (!callback.completeThunk && !callback.syntheticReturnEip && !callback.directThunkReturn &&
             (callerRetInStubPool || callerRetInStack || callerRetLowAddress || callerRet === 0 ||
                 this.isInvalidGuestReturnAddress(callerRet))) {
             Logger.error(LogCategory.CALLBACK,
@@ -565,6 +578,35 @@ export class CallbackManager {
         }
 
         callback.resolve(returnValue);
+
+        if (callback.directThunkReturn) {
+            const returnAddr = callback.directThunkReturn.returnAddr >>> 0;
+            const postEsp = callback.directThunkReturn.postEsp >>> 0;
+            const completed = callback.directThunkReturn.complete?.(returnValue);
+            if (completed === null) {
+                this.releaseCallback(functionId, stub);
+                return;
+            }
+            const finalValue = completed === undefined ? returnValue : completed;
+            const returnAddrInStack = returnAddr >= 0x80000 && returnAddr < 0x100000;
+            if (returnAddr < 0x1000 || returnAddr >= mem.length || returnAddrInStack
+                || postEsp > mem.length) {
+                Logger.error(LogCategory.CALLBACK,
+                    `Invalid direct thunk return: EIP=0x${returnAddr.toString(16)} ESP=0x${postEsp.toString(16)}`);
+                this.releaseCallbackWithFatal(
+                    functionId, stub, 0x3002, returnAddr,
+                    System.getInstance().scheduler.getCurrentThreadId() >>> 0,
+                );
+                return;
+            }
+
+            cpu.reg32[0] = finalValue >>> 0;
+            cpu.reg32[4] = postEsp;
+            if (cpu.is_jumping !== undefined) cpu.is_jumping = true;
+            cpu.instruction_pointer[0] = returnAddr;
+            this.releaseCallback(functionId, stub);
+            return;
+        }
 
         if (callback.completeThunk) {
             const result = callback.completeThunk(returnValue);
@@ -1301,6 +1343,7 @@ export class CallbackManager {
             espBeforeInvoke,  // Save ESP for stack drift detection
             ownerThreadId: System.getInstance().scheduler.getCurrentThreadId() >>> 0,
             syntheticReturnEip: usedSyntheticReturnEip,
+            directThunkReturn: options?.directThunkReturn,
         };
 
         // Attach thunkContext from stack for callbacks that will complete a suspended thunk
@@ -1320,7 +1363,7 @@ export class CallbackManager {
 
             Logger.verbose(LogCategory.CALLBACK,
                 `Attached suspended frame ${resolvedFrameId} to callback 0x${stub.callbackId.toString(16)} (depth=${this.frameStackDepth})`);
-        } else if (this.frameStackDepth > 0) {
+        } else if (this.frameStackDepth > 0 && !options?.directThunkReturn) {
             Logger.warn(LogCategory.CALLBACK,
                 `Suspended frame stack has depth=${this.frameStackDepth} but callback 0x${stub.callbackId.toString(16)} has no completion handler`);
         }
@@ -1459,6 +1502,18 @@ export class CallbackManager {
 
     hasSavedThunkContext(): boolean {
         return this.frameStackDepth > 0;
+    }
+
+    /**
+     * Return the innermost live suspended thunk frame.
+     *
+     * A Win32 API can be entered from a guest callback whose return address is one of
+     * our callback stubs (for example subclass proc -> DefWindowProc -> SendMessage).
+     * Such an API must extend the callback's existing completion chain rather than try
+     * to suspend the synthetic callback-stub frame as a new guest thunk.
+     */
+    getActiveSuspendedFrameId(): number {
+        return this.getTopSuspendedFrameId();
     }
 
     getStubPoolRange(): { base: number; end: number } {

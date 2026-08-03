@@ -32,8 +32,10 @@ import {
     setAuthorityCpu,
     setAuthorityGpu,
     surfaceSyncManager,
+    needsRenderTargetUploadBeforeDraw,
     logSurfaceState,
 } from "../../../modules/ddraw/surface-sync";
+import { pumpReadbackPrefetch } from "../../../modules/ddraw/surface-readback-prefetch";
 import { isValidAddress } from "../../../modules/ddraw/helpers";
 import * as frameCapture from "../../../modules/ddraw/frame-capture";
 import {
@@ -1315,8 +1317,16 @@ export class DDrawWebGPUExecutor {
             pf === PixelFormat.XRGB8888 ||
             pf === PixelFormat.PALETTE8;
 
+        // Full-surface convertToTexture would stomp GPU pixels outside a WRITEONLY
+        // dirty box (skipped readback leaves stale CPU elsewhere). Partial dirty →
+        // CPU convert + uploadPartialRegion via the syncToGPU path below.
+        const dirty = isRenderSurface(state) ? state.dirtyRegion : undefined;
+        const dirtyIsPartial = !!(dirty &&
+            (dirty.left > 0 || dirty.top > 0 ||
+             dirty.right < state.width || dirty.bottom < state.height));
+
         // Skip GPU path if we have fresh RGBA data in rgbaScratch (use CPU path instead)
-        if (useTextureConverter && state.gpuTexture && !hasFreshRGBA) {
+        if (useTextureConverter && state.gpuTexture && !hasFreshRGBA && !dirtyIsPartial) {
             if (this.currentRenderPass) {
                 this.currentRenderPass.end();
                 this.currentRenderPass = null;
@@ -1381,6 +1391,9 @@ export class DDrawWebGPUExecutor {
                         paletteEntries
                     );
                     markGpuSyncedFromCpu(state);
+                    if (isRenderSurface(state)) {
+                        state.dirtyRegion = undefined;
+                    }
 
                     // Update frame snapshot counters
                     const ddraw = system.process?.getModule("ddraw") as any;
@@ -1551,7 +1564,11 @@ export class DDrawWebGPUExecutor {
                         `pixel1=[${rgbaData[4]},${rgbaData[5]},${rgbaData[6]},${rgbaData[7]}] ` +
                         `targetFmt=${targetFormat}`);
                 }
-                uploadToGPUTexture(queue, texture, rgbaData, width, height, scratch, targetFormat);
+                const region = isRenderSurface(state) ? state.dirtyRegion : undefined;
+                uploadToGPUTexture(queue, texture, rgbaData, width, height, scratch, targetFormat, region);
+                if (isRenderSurface(state)) {
+                    state.dirtyRegion = undefined;
+                }
 
                 // Update frame snapshot counters
                 const system = System.getInstance();
@@ -1568,9 +1585,25 @@ export class DDrawWebGPUExecutor {
     }
 
     async syncSurfaceToMemory(state: DirectDrawSurfaceState): Promise<void> {
-        this.flush();
-        this.ensureSurfaceGPUResources(state);
-        await surfaceSyncManager.syncToCPU(state, this.device, this.queue, this.textureConverter);
+        // A speculative prefetch or direct map may complete after a newer GPU write.
+        // syncToCPU rejects that version at its commit point; retry version races
+        // so a guest Lock never resumes with bytes from the superseded frame.
+        for (let attempt = 1; ; attempt++) {
+            this.flush();
+            this.ensureSurfaceGPUResources(state);
+            const attemptedVersion = isRenderSurface(state) ? state.version : -1;
+            const synced = await surfaceSyncManager.syncToCPU(
+                state, this.device, this.queue, this.textureConverter
+            );
+            if (synced || !surfaceSyncManager.needsCPUSync(state).needed) return;
+            // False can also mean an invalid pointer, active write lease, or a GPU
+            // conversion failure. Only retry the race this loop is designed for.
+            if (!isRenderSurface(state) || state.version === attemptedVersion) return;
+            if (attempt === 3) {
+                Logger.warn(LogCategory.DDRAW,
+                    `syncSurfaceToMemory: surface 0x${state.surfacePtr.toString(16)} changed during 3 readbacks; waiting for a stable version`);
+            }
+        }
     }
 
     syncSurfaceToMemoryFromScratch(state: DirectDrawSurfaceState, mem?: Uint8Array): boolean {
@@ -2608,9 +2641,13 @@ export class DDrawWebGPUExecutor {
 
         const packedStride = computeFvfStride(vertexType);
         const stride = sourceStride && sourceStride > 0 ? Math.max(sourceStride, packedStride) : packedStride;
-        // Disabled for now: D3D8 MinIndex rebasing can regress geometry on some titles.
-        // Keep legacy behavior (no index rebasing) until we have per-game-safe criteria.
-        const requestedIndexBase = 0;
+        // Rebase to the smallest index actually referenced. D3D7 titles commonly pass
+        // the full 32768-vertex scratch capacity while each draw touches a small window
+        // near the tail. Uploading [0..maxIndex] made Half-Life convert 8-13 MiB of
+        // vertices per frame and amplified any out-of-range index into giant polygons.
+        // This is algebraically exact: shift the source pointer by minIndex and subtract
+        // the same value from every index before uploading it.
+        void vertexIndexBase;
 
         // D3D7 DrawIndexedPrimitive ABI uses WORD* indices, so uint16 is the default.
         // Callers that know the real index width (d3d8 with a declared INDEX32 buffer)
@@ -2643,9 +2680,8 @@ export class DDrawWebGPUExecutor {
         // vCount vertices (e.g. 65536) when indices may only reference ~500, causing
         // 100x+ overallocation and ring buffer overflow.
         
+        let minRawIdx = Number.MAX_SAFE_INTEGER;
         let maxRawIdx = 0;
-        let maxRebasedIdx = 0;
-        let rebaseValid = requestedIndexBase > 0 && requestedIndexBase < vCount;
         if (iCount > 0 && isValidAddress(memory, indicesAddr, indexDataSize)) {
             // memory is a Uint8Array view into WASM linear memory with
             // byteOffset ~9.5MB. Must add memory.byteOffset when constructing
@@ -2656,40 +2692,34 @@ export class DDrawWebGPUExecutor {
                 const dv = new DataView(memory.buffer, baseOff, iCount * 4);
                 for (let i = 0; i < iCount; i++) {
                     const rawIdx = dv.getUint32(i * 4, true);
+                    if (rawIdx < minRawIdx) minRawIdx = rawIdx;
                     if (rawIdx > maxRawIdx) maxRawIdx = rawIdx;
-                    if (rebaseValid) {
-                        if (rawIdx < requestedIndexBase || rawIdx >= vCount) {
-                            rebaseValid = false;
-                        } else {
-                            const rebased = rawIdx - requestedIndexBase;
-                            if (rebased > maxRebasedIdx) maxRebasedIdx = rebased;
-                        }
-                    }
                 }
             } else {
                 const dv = new DataView(memory.buffer, baseOff, iCount * 2);
                 for (let i = 0; i < iCount; i++) {
                     const rawIdx = dv.getUint16(i * 2, true);
+                    if (rawIdx < minRawIdx) minRawIdx = rawIdx;
                     if (rawIdx > maxRawIdx) maxRawIdx = rawIdx;
-                    if (rebaseValid) {
-                        if (rawIdx < requestedIndexBase || rawIdx >= vCount) {
-                            rebaseValid = false;
-                        } else {
-                            const rebased = rawIdx - requestedIndexBase;
-                            if (rebased > maxRebasedIdx) maxRebasedIdx = rebased;
-                        }
-                    }
                 }
             }
         }
-        const appliedIndexBase = rebaseValid ? requestedIndexBase : 0;
+        if (iCount > 0 && maxRawIdx >= vCount) {
+            this.renderStats.skipBadRange++;
+            Logger.warn(
+                LogCategory.SYSTEM,
+                `drawIndexedPrimitive: vertex index ${maxRawIdx} is outside vCount=${vCount}`
+            );
+            return;
+        }
+        const appliedIndexBase = iCount > 0 && minRawIdx !== Number.MAX_SAFE_INTEGER ? minRawIdx : 0;
         const sourceVerticesAddr = appliedIndexBase > 0
             ? verticesAddr + appliedIndexBase * stride
             : verticesAddr;
         const availableVertexCount = appliedIndexBase > 0
             ? (vCount - appliedIndexBase)
             : vCount;
-        const effectiveMaxIdx = appliedIndexBase > 0 ? maxRebasedIdx : maxRawIdx;
+        const effectiveMaxIdx = maxRawIdx - appliedIndexBase;
         const effectiveVCount = iCount > 0
             ? Math.min(availableVertexCount, effectiveMaxIdx + 1)
             : availableVertexCount;
@@ -3328,6 +3358,13 @@ export class DDrawWebGPUExecutor {
             Logger.warn(LogCategory.SYSTEM,
                 `Frame vertex ring: ${(usage.bytes / 1024 / 1024).toFixed(1)}MB (${usage.percent.toFixed(0)}%)`);
         }
+        // Overlap GPU→CPU readback with the next scene for surfaces that read-Lock
+        // (R-D). Do not go through syncSurfaceToMemory — that re-flushes.
+        pumpReadbackPrefetch((state) =>
+            surfaceSyncManager.syncToCPU(state, this.device, this.queue, this.textureConverter, {
+                fromPrefetch: true,
+            })
+        );
         this.sampleFrameStats();
         this.ringBufferManager.nextFrame();
         this.depthManager.resetFrameDirtyFlags();
@@ -3805,10 +3842,13 @@ export class DDrawWebGPUExecutor {
             target.gpuTexture?.format ?? this.resolveSurfaceTextureFormat(target)
         );
 
-        const isTextureTarget = (target.caps & DDSCAPS_TEXTURE) !== 0;
-        const isSystemMemory = (target.caps & DDSCAPS_SYSTEMMEMORY) !== 0;
-        const shouldSyncTarget = isTextureTarget || isSystemMemory;
-        const targetNeedsSync = shouldSyncTarget && surfaceSyncManager.needsGPUSync(target).needed;
+        // CPU drawing can target a normal video-memory backbuffer too. In particular,
+        // TLJ restores its previous software-cursor rectangle with a DDraw CPU Blt
+        // *inside* BeginScene, before the first primitive. Restricting this upload to
+        // texture/system-memory targets lets D3D continue from the stale GPU image that
+        // still contains the cursor; the next Lock readback then bakes that cursor into
+        // the saved background and produces permanent trails.
+        const targetNeedsSync = needsRenderTargetUploadBeforeDraw(target);
 
         // Conservative pre-check: flush batch if any stage texture lacks GPU resources
         // or needs sync (evaluated per stage; stage 0 = `texture`).

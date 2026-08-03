@@ -255,28 +255,33 @@ export class MemoryManager {
     }
 
     /**
-     * Allocate a kernel32 heap-slab ARENA top-down from the HEAP bucket (growing down
-     * from `limit`), kept OUT of the guest bump frontier (`next`, growing up).
-     *
-     * Why: the slab arena used to be a normal `alloc()` at the shared bump frontier, so
-     * carving 4 MB+ at tick-500 SHIFTED every subsequent guest allocation's address vs the
-     * no-slab case. Diablo II is sensitive to that — it crashed (garbage pointers / wild
-     * VirtualAlloc) only with the slab on, and was stable under `__noHeapSlab` purely
-     * because no arena was carved. Placing the arena at the top makes the guest's own
-     * allocation addresses BYTE-IDENTICAL to the no-slab layout while the slab keeps
-     * working. Faithful too: a real heap's reserve lives in its own VA, not interleaved
-     * with the app's. Arenas are never freed (geometric, bounded), so no free path here.
+     * Carve from the high end of HEAP (`slabTop` growing down), never touching the
+     * guest bump frontier (`next`). Shared by heap-slab arenas and VirtualAlloc
+     * MEM_TOP_DOWN — both need high VA, segregated from bottom-up HeapAlloc.
      */
-    allocSlabArena(size: number): number {
+    allocFromHigh(size: number, alignment: number = 0x10000): number {
         const bucket = this.bucketState.get('HEAP');
-        if (!bucket) throw new Error('MemoryManager: HEAP bucket unavailable for slab arena');
-        const aligned = this.alignUp(size, 0x10000); // 64KB allocation granularity
+        if (!bucket) throw new Error('MemoryManager: HEAP bucket unavailable for high alloc');
+        const align = Math.max(alignment, 0x10000) >>> 0; // Win32 allocation granularity
+        const aligned = this.alignUp(size, align);
         const top = (bucket.slabTop ?? bucket.limit) >>> 0;
-        const addr = (top - aligned) & ~0xFFFF;       // 64KB-aligned base, growing down
-        if (addr < bucket.next) {
+        const next = bucket.next >>> 0;
+        // Unsigned subtract — if frontiers crossed, treat as OOM (don't wrap).
+        if (top <= next || aligned > (top - next)) {
             throw new Error(
-                `MemoryManager: slab arena OOM (top=0x${top.toString(16)} need 0x${aligned.toString(16)} ` +
-                `would cross guest frontier 0x${bucket.next.toString(16)})`);
+                `MemoryManager: high-end OOM (top=0x${top.toString(16)} next=0x${next.toString(16)} ` +
+                `need 0x${aligned.toString(16)})`);
+        }
+        const addr = ((top - aligned) >>> 0) & ~(align - 1);
+        if (addr < next || ((addr + aligned) >>> 0) > top || (addr + aligned) >>> 0 < addr) {
+            throw new Error(
+                `MemoryManager: high-end align OOM (top=0x${top.toString(16)} next=0x${next.toString(16)} ` +
+                `addr=0x${addr.toString(16)} need 0x${aligned.toString(16)})`);
+        }
+        if (this.allocations.has(addr)) {
+            throw new Error(
+                `MemoryManager: high-end collide at 0x${addr.toString(16)} ` +
+                `(liveSize=0x${(this.allocations.get(addr) ?? 0).toString(16)})`);
         }
         bucket.slabTop = addr;
         this.recordAllocation(addr, aligned);
@@ -284,6 +289,31 @@ export class MemoryManager {
         ensureGuestPagesCommitted(addr, aligned);
         this.logLargeEvent('alloc', addr, aligned);
         return addr;
+    }
+
+    /** DevTools/harness: HEAP bump vs high (MEM_TOP_DOWN/slab) frontier. */
+    getHighHeapReport(): { next: number; slabTop: number; limit: number; freeHigh: number; freeHighMB: number } | null {
+        const bucket = this.bucketState.get('HEAP');
+        if (!bucket) return null;
+        const next = bucket.next >>> 0;
+        const slabTop = (bucket.slabTop ?? bucket.limit) >>> 0;
+        const freeHigh = slabTop > next ? (slabTop - next) >>> 0 : 0;
+        return {
+            next,
+            slabTop,
+            limit: bucket.limit >>> 0,
+            freeHigh,
+            freeHighMB: +(freeHigh / (1024 * 1024)).toFixed(2),
+        };
+    }
+
+    /**
+     * Kernel32 heap-slab ARENA — top-down from HEAP (see allocFromHigh). Kept out of
+     * the guest bump so slab growth does not shift subsequent guest allocation
+     * addresses vs a no-slab layout.
+     */
+    allocSlabArena(size: number): number {
+        return this.allocFromHigh(size, 0x10000);
     }
 
     allocAt(addr: number, size: number, kind?: RegionKind, perms?: RegionPerms): number {
@@ -344,7 +374,13 @@ export class MemoryManager {
 
         if (bucketKind) {
             this.allocBucket.delete(ptr);
-            if (size >= MemoryManager.LARGE_ALLOC_FRESH_THRESHOLD) {
+            const bucket = this.bucketState.get(bucketKind);
+            // MEM_TOP_DOWN / slab frontier: LIFO free at slabTop rejoins the high zone
+            // instead of the bottom-up free lists (keeps high VA available for TOP_DOWN).
+            if (bucket && bucketKind === 'HEAP' && bucket.slabTop !== undefined &&
+                (bucket.slabTop >>> 0) === (ptr >>> 0)) {
+                bucket.slabTop = (ptr + size) >>> 0;
+            } else if (size >= MemoryManager.LARGE_ALLOC_FRESH_THRESHOLD) {
                 // VirtualAlloc-class blocks release into their own list, never the
                 // small-block free list (see allocateLargeFromReleased).
                 this.releaseLargeBlock(bucketKind, ptr, size);

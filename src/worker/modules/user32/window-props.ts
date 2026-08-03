@@ -23,6 +23,7 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
         if (!window) return 0;
 
         const GWL_WNDPROC = -4;
+        const GWL_ID = -12;
         const GWL_STYLE = -16;
         const GWL_EXSTYLE = -20;
         const GWL_USERDATA = -21;
@@ -64,6 +65,10 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
                     window.wndProcSubclassed = true;
                 }
                 break;
+            case GWL_ID:
+                prev = window.controlId ?? 0;
+                window.controlId = dwNewLong >>> 0;
+                break;
             case GWL_STYLE:
                 prev = window.style >>> 0;
                 window.style = dwNewLong >>> 0;
@@ -97,6 +102,7 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
         if (!window) return 0;
 
         const GWL_WNDPROC = -4;
+        const GWL_ID = -12;
         const GWL_STYLE = -16;
         const GWL_EXSTYLE = -20;
         const GWL_USERDATA = -21;
@@ -113,6 +119,8 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
         switch (idx) {
             case GWL_WNDPROC:
                 return window.wndProc >>> 0;
+            case GWL_ID:
+                return (window.controlId ?? 0) >>> 0;
             case GWL_STYLE:
                 return window.style >>> 0;
             case GWL_EXSTYLE:

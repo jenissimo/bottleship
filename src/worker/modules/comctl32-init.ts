@@ -34,13 +34,18 @@ const TOOLTIPS_CLASS = "tooltips_class32";
 /** cbWndExtra hints from comctl32 class registration (approximate v5 values). */
 const DEFAULT_WND_EXTRA = 4;
 
-function registerClass(className: string, cbWndExtra = DEFAULT_WND_EXTRA): void {
-    registerBuiltinClass(className, { cbWndExtra });
+function registerClass(
+    className: string,
+    cbWndExtra = DEFAULT_WND_EXTRA,
+    controlClass?: string,
+): void {
+    registerBuiltinClass(className, { cbWndExtra, controlClass });
 }
 
 function registerListViewClasses(): void {
-    registerClass("SysListView32", 4);
-    registerClass("SysHeader32", 4);
+    // controlClass → CreateWindowEx marks isSystemControl (dialog templates already do).
+    registerClass("SysListView32", 4, "SysListView32");
+    registerClass("SysHeader32", 4, "SysHeader32");
 }
 
 function registerTreeViewClasses(): void {

@@ -51,20 +51,9 @@ interface LayoutBucket {
     allowOverlap?: boolean;
 }
 
-const FASTMEM_BUMP_ADDRESS_SPACE_PROTECT = 3;
-
-export function bumpFastmemGeneration(source: number): void {
-    try {
-        const exports = (globalThis as any).preemption?.getWasmExports?.();
-        exports?.fastmem_bump_generation?.(source >>> 0);
-    } catch {
-        // Optional diagnostic plumbing; AddressSpace must stay usable in isolated tests.
-    }
-}
-
 // ── fastmem write map (bit0 = base-writable) ──────────────────────
-// Mirror of bumpFastmemGeneration: best-effort, never throws (AddressSpace stays usable
-// in isolated tests). Sets/clears bit0 over a byte range. The Rust setter authoritatively
+// Best-effort, never throws (AddressSpace stays usable in isolated tests). Sets/clears
+// bit0 over a byte range. The Rust setter authoritatively
 // clamps SET to the identity-RAM envelope (< ram, above low-mem, outside the guard zone),
 // so an over-wide range is safe; callers still gate SET on writable-RAM kind + perms so
 // non-RAM regions (ROM/THUNK_CODE/CALLBACK_STUB/…) never get marked.
@@ -192,7 +181,6 @@ export class AddressSpace {
         const region = this.regions.find(r => r.base === base && r.size === size);
         if (!region) return false;
         region.perms = perms;
-        bumpFastmemGeneration(FASTMEM_BUMP_ADDRESS_SPACE_PROTECT);
         // Re-derive bit0 from the new perms + kind (RO/NOACCESS ⇒ clear).
         setWriteMapBase(region.base, region.size, isWriteMapFastRegion(region.kind, perms));
         return true;

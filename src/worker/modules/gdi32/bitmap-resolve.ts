@@ -44,6 +44,7 @@ interface BitmapUserObj {
     dibPalette?: Uint32Array;
     isTopDown?: boolean;
     loading?: boolean;
+    compatibleBitmap?: boolean;
     compatibleEmpty?: boolean;
 }
 
@@ -337,7 +338,7 @@ export function resolveBitmapRgba(hBitmap: number, mem?: Uint8Array): ResolvedBi
 
     // DDB (CreateCompatibleBitmap): stored pixels are only a birth snapshot —
     // everything drawn since lives on the rendered canvas, which is the truth.
-    if (obj.compatibleEmpty) {
+    if (obj.compatibleBitmap) {
         const rendered = System.getInstance().gdiContext.getBitmapRenderedPixels(hBitmap);
         if (rendered && rendered.length >= w * h * 4) {
             return { data: rendered.subarray(0, w * h * 4), width: w, height: h };

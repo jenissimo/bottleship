@@ -151,14 +151,14 @@ export class WindowManager {
     /**
      * Walk children of `parentHwnd` (origin originX/originY in screen space), returning
      * the deepest visible+enabled child containing the point, or parentHwnd if none.
-     * Children are tested in reverse creation order (last created = topmost in parent).
+     * Child creation appends at HWND_BOTTOM, so insertion order is front to back.
      */
     private descendToChildAtPoint(parentHwnd: number, originX: number, originY: number, screenX: number, screenY: number): number {
         const children: WindowObject[] = [];
         for (const win of this.windows.values()) {
             if (win.parent === parentHwnd && (win.style & WS_CHILD) !== 0) children.push(win);
         }
-        for (let i = children.length - 1; i >= 0; i--) {
+        for (let i = 0; i < children.length; i++) {
             const child = children[i];
             if (!child.visible || (child.style & WS_DISABLED) !== 0) continue;
             const cx = originX + child.rect.x;
@@ -381,6 +381,25 @@ export class WindowManager {
         return this.activeHwnd;
     }
 
+    /** Resolve a child/control to its top-level ancestor. */
+    getTopLevelAncestor(hwnd: number): number {
+        let top = this.windows.get(hwnd);
+        const seen = new Set<number>();
+        while (top && (top.style & WS_CHILD) !== 0 && top.parent && !seen.has(top.parent)) {
+            seen.add(top.parent);
+            top = this.windows.get(top.parent);
+        }
+        if (!top || (top.style & WS_CHILD) !== 0) return 0;
+        return top.hwnd;
+    }
+
+    /** Clear active/foreground/focus slots when a top-level window is hidden and no successor exists. */
+    clearActiveWindow(hwnd: number): void {
+        if (this.activeHwnd === hwnd) this.activeHwnd = 0;
+        if (this.foregroundHwnd === hwnd) this.foregroundHwnd = 0;
+        if (this.focusHwnd === hwnd || this.isDescendantOf(this.focusHwnd, hwnd)) this.focusHwnd = 0;
+    }
+
     /** Focus window (GetFocus) — may be a child. */
     getFocusHwnd(): number {
         return this.focusHwnd;
@@ -508,14 +527,10 @@ export class WindowManager {
         return this.zOrder.length;
     }
 
-    private insertIntoZOrder(hwnd: number, visible: boolean): void {
+    private insertIntoZOrder(hwnd: number, _visible: boolean): void {
         const i = this.zOrder.indexOf(hwnd);
         if (i >= 0) this.zOrder.splice(i, 1);
-        // A new (or shown) window goes to the top of its group. A hidden window goes to
-        // the back so it does not steal hit-tests, but is still tracked.
-        if (!visible) {
-            this.zOrder.push(hwnd);
-        } else if (this.isTopmost(hwnd)) {
+        if (this.isTopmost(hwnd)) {
             this.zOrder.unshift(hwnd);
         } else {
             this.zOrder.splice(this.normalGroupStart(), 0, hwnd);
@@ -527,15 +542,31 @@ export class WindowManager {
         if (i >= 0) this.zOrder.splice(i, 1);
     }
 
-    /** Move hwnd to the top of its group (topmost stays above normal). */
+    /** Whether candidate is a top-level window owned, directly or transitively, by owner. */
+    private isOwnedBy(candidate: number, owner: number): boolean {
+        const seen = new Set<number>();
+        let current = this.windows.get(candidate);
+        while (current?.parent && !seen.has(current.parent)) {
+            if (current.parent === owner) return true;
+            seen.add(current.parent);
+            current = this.windows.get(current.parent);
+        }
+        return false;
+    }
+
+    /**
+     * Move hwnd to the top of its group (topmost stays above normal). Owned top-level
+     * windows move with their owner and remain in front of it, as required by Win32.
+     */
     private bringToTop(hwnd: number): void {
         if (!this.windows.has(hwnd)) return;
+        const topmost = this.isTopmost(hwnd);
+        const owned = this.zOrder.filter(candidate =>
+            this.isTopmost(candidate) === topmost && this.isOwnedBy(candidate, hwnd));
+        for (const candidate of owned) this.removeFromZOrder(candidate);
         this.removeFromZOrder(hwnd);
-        if (this.isTopmost(hwnd)) {
-            this.zOrder.unshift(hwnd);
-        } else {
-            this.zOrder.splice(this.normalGroupStart(), 0, hwnd);
-        }
+        const insertAt = topmost ? 0 : this.normalGroupStart();
+        this.zOrder.splice(insertAt, 0, ...owned, hwnd);
     }
 
     /** BringWindowToTop — top-level window to the front of its group. */
@@ -617,22 +648,6 @@ export class WindowManager {
         for (const hwnd of this.zOrder) broadcast(hwnd);
         for (const win of this.windows.values()) broadcast(win.hwnd);
         return seen.size;
-    }
-
-    /**
-     * Notify the Z-order of a visibility change (ShowWindow). A shown top-level window
-     * is brought to the top of its group; a hidden one is pushed to the back so it no
-     * longer wins hit-tests. Children are not in the top-level Z-order.
-     */
-    onWindowVisibilityChanged(hwnd: number, visible: boolean): void {
-        const win = this.windows.get(hwnd);
-        if (!win || (win.style & WS_CHILD) !== 0) return;
-        if (visible) {
-            this.bringToTop(hwnd);
-        } else {
-            this.removeFromZOrder(hwnd);
-            this.zOrder.push(hwnd);
-        }
     }
 
     /**

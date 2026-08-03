@@ -4,7 +4,7 @@
  * Atomic implementation for window operations
  */
 
-import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
+import { FastPathImplementation, ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
@@ -12,7 +12,7 @@ import { DESKTOP_HWND } from '../../runtime/windowing/window-manager';
 import { getWindowClass, getWindowClassByName } from './class';
 import { Marshaler } from '../../core/memory/marshaler';
 import { Mem } from '../../core/memory/mem-accessor';
-import { WindowInfo, windows, getWindowByHandle, getCursorDisplayCount, updateCursorDisplayCount, isGuestCursorVisible, syncHostCursorToGuestState, installCursorAndUpdateHostVisibility, getAbsoluteWindowPosition, markGuestCustomPaint, killWindowTimers, registerWindowDestroyFinalizer, reorderChildInParent, setLockWindowUpdate, isWindowUpdateLocked, hasSystemControlChildren, getChildWindowExclusions, isEffectivelyVisible, getAncestorClipRect, getVirtualScreenRect } from './shared-state';
+import { WindowInfo, windows, getWindowByHandle, getCursorDisplayCount, updateCursorDisplayCount, isGuestCursorVisible, syncHostCursorToGuestState, installCursorAndUpdateHostVisibility, getAbsoluteWindowPosition, markGuestCustomPaint, killWindowTimers, registerWindowDestroyFinalizer, reorderChildInParent, isWindowPosZOrderRequestValid, shouldSeedPaintFromParent, tryLockWindowUpdate, isWindowUpdateLocked, hasSystemControlChildren, getChildWindowExclusions, isEffectivelyVisible, getAncestorClipRect } from './shared-state';
 import {
     invalidateWindow,
     validateWindow,
@@ -31,14 +31,14 @@ import { registerWindowQueryExports } from './window-query';
 import { registerWindowPropExports } from './window-props';
 import { GDIContext } from '../gdi32/context';
 import { ensureAnimateControlClasses, clearAnimateState, onAnimateShowWindow, isAnimateControlWindow } from './animate-control';
-import { getBuiltinSystemClass } from './system-classes';
+import { getBuiltinSystemClass, getDefWindowProcAddress } from './system-classes';
 import { invalidateControlColors } from './control-colors';
 import { applyScrollInfo, setScrollPos as setScrollBarPos } from './scroll-state';
 import { isSentinelWndProc } from './dialog';
 import { handleSystemControlMessage, isContentChangingMessage } from './dialog-control-messages';
-import { noteDialogOverlayCandidate, eraseDialogOverlay } from './dialog-overlay';
-import { eraseControlOverlayRect, repaintDialogOverlayIfVisible, repaintDialogAfterContentChange, requestGuestDialogPaint, restoreClientRectFromAncestors } from './dialog-paint';
-import { resetControlInteractionState, handleSystemControlClassMouse } from './control-interaction';
+import { noteDialogOverlayCandidate, eraseDialogOverlay, isWindowFullyCoveredByHigherTopLevel } from './dialog-overlay';
+import { eraseControlOverlayRect, eraseHiddenWindowPixels, repaintDialogOverlayIfVisible, repaintDialogAfterContentChange, requestGuestDialogPaint } from './dialog-paint';
+import { resetControlInteractionState, handleSystemControlClassMouse, takePendingControlNotification } from './control-interaction';
 import { isDDrawExclusiveFullscreen } from '../ddraw/gdi-visibility';
 import { paintTraceEnabled, logBeginEndPaint } from './paint-trace';
 import { repaintChildControls } from './controls';
@@ -86,10 +86,16 @@ function repaintParentDialogIfSystemControlGeometryChanged(
 
 const WM_SIZE_GEO = 0x0005;
 const WM_MOVE_GEO = 0x0003;
-const SIZE_RESTORED_GEO = 0;
 const SWP_NOMOVE_GEO = 0x0002;
 const SWP_NOSIZE_GEO = 0x0001;
-const SWP_NOSENDCHANGING_GEO = 0x0400;
+
+/**
+ * Win32 stores CreateWindowEx's hMenu argument as GWLP_ID for every WS_CHILD
+ * window. Guest custom controls depend on it just as built-in controls do.
+ */
+export function controlIdFromCreateWindow(style: number, hMenu: number): number | undefined {
+    return (style & 0x40000000) !== 0 ? hMenu >>> 0 : undefined;
+}
 
 const makeGeometryLParam = (lo: number, hi: number): number =>
     (((lo & 0xFFFF) | ((hi & 0xFFFF) << 16)) >>> 0);
@@ -124,12 +130,16 @@ const WM_PAINT_GEO = 0x000F;
 
 function finishWindowPosRepaint(hWnd: number): void {
     const win = windows.get(hWnd);
-    if (!win?.visible || win.nativeClassName !== '#32770') return;
+    if (!win || !isEffectivelyVisible(win) || !hasPendingUpdate(hWnd)) return;
     if (win.guestCustomPaint) {
-        repaintChildControls(hWnd);
+        requestGuestDialogPaint(hWnd);
         return;
     }
-    repaintDialogOverlayIfVisible(hWnd);
+    if (win.nativeClassName === '#32770' || win.isSystemControl || hasSystemControlChildren(win)) {
+        repaintDialogOverlayIfVisible(win.isSystemControl && win.parent ? win.parent : hWnd);
+        return;
+    }
+    System.getInstance().windowManager.postMessage(hWnd, WM_PAINT_GEO, 0, 0);
 }
 
 function trySuspendForSyncWindowMessage(
@@ -142,7 +152,14 @@ function trySuspendForSyncWindowMessage(
     stackCleanup: number,
     onComplete: () => number | null,
     existingFrameId?: number,
-): { suspended: true; callbackId: number } | { suspended: false } {
+    existingDirectReturn?: { returnAddr: number; postEsp: number },
+): {
+    suspended: true;
+    callbackId: number;
+    frameId: number;
+    reusedFrame: boolean;
+    directThunkReturn?: { returnAddr: number; postEsp: number };
+} | { suspended: false } {
     const win = windows.get(hWnd);
     // A subclassed system control's wndproc IS the guest's — sync messages must reach it.
     if (!win || (win.isSystemControl && !win.wndProcSubclassed)) return { suspended: false };
@@ -161,14 +178,51 @@ function trySuspendForSyncWindowMessage(
     if (!callbackManager || !mem) return { suspended: false };
 
     let frameId = existingFrameId ?? 0;
+    let reusedFrame = !!existingFrameId;
     if (!frameId) {
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-        const thunkReturnAddr = view.getUint32(ctx.esp, true);
-        frameId = callbackManager.saveSuspendedThunkContext(
-            { ...ctx, returnAddr: thunkReturnAddr },
-            stackCleanup,
-            label,
-        );
+        const thunkReturnAddr = existingDirectReturn?.returnAddr
+            ?? (view.getUint32(ctx.esp, true) >>> 0);
+        const stubRange = callbackManager.getStubPoolRange();
+        if (existingDirectReturn
+            || (thunkReturnAddr >= stubRange.base && thunkReturnAddr < stubRange.end)) {
+            // This API thunk itself was called from a guest callback. Complete only
+            // this nested thunk and return to its callback stub; consuming the outer
+            // suspended frame would abandon the rest of the current WndProc.
+            const directThunkReturn = existingDirectReturn ?? {
+                returnAddr: thunkReturnAddr,
+                postEsp: (ctx.esp + 4 + stackCleanup) >>> 0,
+            };
+            const nested = callbackManager.invokeCallback(
+                wndProc,
+                [hWnd, msg, wParam, lParam],
+                0,
+                undefined,
+                false,
+                `${label}:sync0x${msg.toString(16)}`,
+                undefined,
+                {
+                    directThunkReturn: {
+                        ...directThunkReturn,
+                        complete: onComplete,
+                    },
+                },
+            );
+            if (!nested.callbackId) return { suspended: false };
+            return {
+                suspended: true,
+                callbackId: nested.callbackId,
+                frameId: 0,
+                reusedFrame: true,
+                directThunkReturn,
+            };
+        } else {
+            frameId = callbackManager.saveSuspendedThunkContext(
+                { ...ctx, returnAddr: thunkReturnAddr },
+                stackCleanup,
+                label,
+            );
+        }
         if (!frameId) return { suspended: false };
     }
 
@@ -182,83 +236,7 @@ function trySuspendForSyncWindowMessage(
         frameId,
     );
     if (first.callbackId === 0) return { suspended: false };
-    return { suspended: true, callbackId: first.callbackId };
-}
-
-/**
- * Win32 SetWindowPos delivers WM_SIZE/WM_MOVE synchronously (SendMessage) before returning.
- * dlgProc often resizes child controls or paints the client in WM_PAINT (UE1 splash).
- */
-function trySuspendForSyncGeometryNotify(
-    ctx: any,
-    hWnd: number,
-    moved: boolean,
-    resized: boolean,
-    uFlags: number,
-    label: string,
-    stackCleanup: number,
-): { suspended: true; callbackId: number } | { suspended: false } {
-    if (uFlags & SWP_NOSENDCHANGING_GEO) return { suspended: false };
-    const win = windows.get(hWnd);
-    // A subclassed system control's wndproc IS the guest's — sync messages must reach it.
-    if (!win || (win.isSystemControl && !win.wndProcSubclassed)) return { suspended: false };
-
-    const wndProc = resolveGuestWndProc(win);
-    if (!wndProc || isSentinelWndProc(wndProc)) return { suspended: false };
-
-    let msg = 0;
-    let wParam = 0;
-    let lParam = 0;
-    if (resized) {
-        msg = WM_SIZE_GEO;
-        wParam = SIZE_RESTORED_GEO;
-        lParam = makeGeometryLParam(win.width, win.height);
-    } else if (moved) {
-        msg = WM_MOVE_GEO;
-        lParam = makeGeometryLParam(win.x, win.y);
-    } else {
-        return { suspended: false };
-    }
-
-    const system = System.getInstance();
-    const callbackManager = system.process?.dispatcher?.callbackManager;
-    const mem = system.process?.v86?.mem8 ?? system.process?.v86?.v86?.cpu?.mem8;
-    if (!callbackManager || !mem) return { suspended: false };
-
-    const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-    const thunkReturnAddr = view.getUint32(ctx.esp, true);
-    const frameId = callbackManager.saveSuspendedThunkContext(
-        { ...ctx, returnAddr: thunkReturnAddr },
-        stackCleanup,
-        label,
-    );
-    if (!frameId) return { suspended: false };
-
-    const completeRepaint = (): number | null => {
-        finishWindowPosRepaint(hWnd);
-        return 1;
-    };
-
-    const completeAfterSize = (): number | null => {
-        if (resized && !isWindowInitInProgress(hWnd)) {
-            const paintSync = trySuspendForSyncWindowMessage(
-                ctx, hWnd, WM_PAINT_GEO, 0, 0, label, stackCleanup, completeRepaint, frameId);
-            if (paintSync.suspended) return null;
-        }
-        return completeRepaint();
-    };
-
-    const first = callbackManager.invokeCallback(
-        wndProc,
-        [hWnd, msg, wParam, lParam],
-        0,
-        completeAfterSize,
-        false,
-        `${label}:syncGeo`,
-        frameId,
-    );
-    if (first.callbackId === 0) return { suspended: false };
-    return { suspended: true, callbackId: first.callbackId };
+    return { suspended: true, callbackId: first.callbackId, frameId, reusedFrame };
 }
 
 /** Shared SetWindowPos / DeferWindowPos geometry apply (Win32-faithful). */
@@ -274,52 +252,8 @@ function applyWindowPosGeometry(
     const window = windows.get(hWnd);
     if (!window) return null;
 
-    // Some late UE1 launchers use a WS_CHILD dialog as a bitmap-backed page, hosted by
-    // a Static placeholder, but centre that page with GetSystemMetrics(SM_CX/YSCREEN):
-    //
-    //   SetWindowPos(page, HWND_TOP, (screenW-pageW)/2, (screenH-pageH)/2,
-    //                pageW, pageH, SWP_SHOWWINDOW)
-    //
-    // Those are unmistakably SCREEN coordinates even though SetWindowPos normally takes
-    // parent-client coordinates for WS_CHILD. Applying them literally adds the centred
-    // top-level dialog's origin a second time (HP2: 157,17 at 800x600; 269,101 at
-    // 1024x768), shifting and clipping the whole page. Limit the compatibility conversion
-    // to a shown child DIALOG hosted by a system-control placeholder, with a full-page
-    // rect exactly centred on the current screen. Ordinary child SetWindowPos calls retain
-    // strict Win32 parent-relative semantics.
-    const WS_CHILD = 0x40000000;
-    const SWP_NOSIZE = 0x0001;
-    const SWP_NOMOVE = 0x0002;
-    const SWP_SHOWWINDOW = 0x0040;
-    if ((window.style & WS_CHILD) !== 0
-        && window.nativeClassName === '#32770'
-        && window.parent
-        && (uFlags & (SWP_NOMOVE | SWP_NOSIZE)) === 0
-        && (uFlags & SWP_SHOWWINDOW) !== 0) {
-        const parent = windows.get(window.parent);
-        // Same screen the game centred with: SM_CX/CYSCREEN report getVirtualScreenRect
-        // (current display mode), which diverges from the configured resolution after
-        // any SetDisplayMode/host resize.
-        const screen = getVirtualScreenRect();
-        const centeredX = Math.floor((screen.right - cx) / 2);
-        const centeredY = Math.floor((screen.bottom - cy) / 2);
-        if (parent?.isSystemControl
-            && cx >= parent.width && cy >= parent.height
-            && Math.abs(x - centeredX) <= 1
-            && Math.abs(y - centeredY) <= 1) {
-            const parentOrigin = getAbsoluteWindowPosition(parent);
-            Logger.log(
-                LogCategory.USER32,
-                `SetWindowPos: screen-centered child dialog 0x${hWnd.toString(16)} ` +
-                `(${x},${y}) -> parent-client (${x - parentOrigin.x},${y - parentOrigin.y})`,
-            );
-            x -= parentOrigin.x;
-            y -= parentOrigin.y;
-        }
-    }
-
     const moving = !(uFlags & SWP_NOMOVE_GEO) && (x !== window.x || y !== window.y);
-    const resizing = !(uFlags & SWP_NOSIZE_GEO) && cx > 0 && cy > 0
+    const resizing = !(uFlags & SWP_NOSIZE_GEO)
         && (cx !== window.width || cy !== window.height);
 
     if (window.isSystemControl && resizing) {
@@ -328,14 +262,15 @@ function applyWindowPosGeometry(
             `→ ${cx}x${cy} (was ${window.width}x${window.height})`);
     }
 
-    if ((moving || resizing) && window.visible && window.nativeClassName === '#32770') {
-        eraseDialogOverlay(hWnd);
+    if ((moving || resizing) && !(uFlags & 0x0008 /* SWP_NOREDRAW */)
+        && isEffectivelyVisible(window)) {
+        eraseHiddenWindowPixels(window);
     }
     if (!(uFlags & SWP_NOMOVE_GEO)) {
         window.x = x;
         window.y = y;
     }
-    if (!(uFlags & SWP_NOSIZE_GEO) && cx > 0 && cy > 0) {
+    if (!(uFlags & SWP_NOSIZE_GEO)) {
         window.width = cx;
         window.height = cy;
     }
@@ -346,15 +281,17 @@ function applyWindowPosGeometry(
             wmWin.rect.x = window.x;
             wmWin.rect.y = window.y;
         }
-        if (!(uFlags & SWP_NOSIZE_GEO) && cx > 0 && cy > 0) {
+        if (!(uFlags & SWP_NOSIZE_GEO)) {
             wmWin.rect.w = window.width;
             wmWin.rect.h = window.height;
         }
     }
 
-    repaintParentDialogIfSystemControlGeometryChanged(window, moving, resizing);
+    if (!(uFlags & 0x0008 /* SWP_NOREDRAW */)) {
+        repaintParentDialogIfSystemControlGeometryChanged(window, moving, resizing);
+    }
 
-    if (!options?.skipDialogOverlayRepaint
+    if (!options?.skipDialogOverlayRepaint && !(uFlags & 0x0008 /* SWP_NOREDRAW */)
         && window.visible && window.nativeClassName === '#32770'
         && (moving || resizing)) {
         finishWindowPosRepaint(hWnd);
@@ -391,14 +328,73 @@ function createWindowClientDC(gdi: GDIContext, hWnd: number): number {
         gdi.setDCWindow(hdc, hWnd);
         if (!shouldSuppressWindowOverlay(hWnd, window)) {
             gdi.attachWindowBlit(hdc, x, y, window.width, window.height);
-            // Seed from the guest's OWN backdrop when we have it, not from the overlay.
-            // The overlay already holds whatever was last stamped in this rect — including
-            // the control's PREVIOUS caption — and a guest that draws transparent text into
-            // the seeded DC then flushes both strings on top of each other. Falling back to
-            // the overlay is still right when no backdrop was ever captured (nothing stale
-            // can be there yet).
-            if (!restoreSeedFromAncestors(gdi, hdc, window)) {
+            // Prefer retained client backing over the flat overlay. The overlay already
+            // holds stamped children / prior captions; seeding from it makes the next
+            // GetDC→BitBlt "background snapshot" (menu slide transitions) permanently
+            // accumulate every page that was ever shown. Own backing first, then an
+            // ancestor's, then overlay only when nothing was retained yet.
+            const seeded = shouldSeedPaintFromParent(window)
+                ? (restoreSeedFromAncestors(gdi, hdc, window)
+                    || !!gdi.seedMemoryDCFromClientBacking?.(hdc, window.handle))
+                : (!!gdi.seedMemoryDCFromClientBacking?.(hdc, window.handle)
+                    || restoreSeedFromAncestors(gdi, hdc, window));
+            if (!seeded) {
                 gdi.seedMemoryDCFromOverlay(hdc);
+            }
+
+            // A RECT/FRAME STATIC and the child page it hosts form one retained page
+            // surface. USER clips an oversized page to the host; normalize that clipped
+            // raster edge from adjacent page pixels so a stale placeholder/background
+            // edge cannot survive the next flush on either level.
+            const type = window.style & 0x001f;
+            const parent = window.parent !== undefined ? windows.get(window.parent) : undefined;
+            const parentType = (parent?.style ?? 0) & 0x001f;
+            const isStaticHost = window.isSystemControl
+                && window.systemControlClass?.toLowerCase() === 'static'
+                && type >= 0x0004 && type <= 0x0009 && window.children.length > 0;
+            const isHostedPage = parent?.isSystemControl
+                && parent.systemControlClass?.toLowerCase() === 'static'
+                && parentType >= 0x0004 && parentType <= 0x0009;
+            if ((isStaticHost || isHostedPage) && window.width > 6 && window.height > 6) {
+                const dcCtx = gdi.getDC(hdc);
+                if (dcCtx) {
+                    const edge = 3;
+                    let clipX = 0;
+                    let clipY = 0;
+                    let clipW = window.width;
+                    let clipH = window.height;
+                    if (isHostedPage) {
+                        const clip = getAncestorClipRect(window);
+                        if (clip) {
+                            clipX = Math.max(0, Math.floor(clip.x - x));
+                            clipY = Math.max(0, Math.floor(clip.y - y));
+                            clipW = Math.min(window.width - clipX, Math.ceil(clip.w));
+                            clipH = Math.min(window.height - clipY, Math.ceil(clip.h));
+                        }
+                    }
+                    const snapshot = new OffscreenCanvas(window.width, window.height);
+                    const snapshotCtx = snapshot.getContext('2d');
+                    if (snapshotCtx && clipW > edge * 2 && clipH > edge * 2) {
+                        snapshotCtx.drawImage(dcCtx.canvas, 0, 0);
+                        dcCtx.imageSmoothingEnabled = false;
+                        dcCtx.drawImage(snapshot, clipX + edge, clipY + edge, clipW - edge * 2, 1,
+                            clipX + edge, clipY, clipW - edge * 2, edge);
+                        dcCtx.drawImage(snapshot, clipX + edge, clipY + clipH - edge - 1, clipW - edge * 2, 1,
+                            clipX + edge, clipY + clipH - edge, clipW - edge * 2, edge);
+                        dcCtx.drawImage(snapshot, clipX + edge, clipY + edge, 1, clipH - edge * 2,
+                            clipX, clipY + edge, edge, clipH - edge * 2);
+                        dcCtx.drawImage(snapshot, clipX + clipW - edge - 1, clipY + edge, 1, clipH - edge * 2,
+                            clipX + clipW - edge, clipY + edge, edge, clipH - edge * 2);
+                        dcCtx.drawImage(snapshot, clipX + edge, clipY + edge, 1, 1,
+                            clipX, clipY, edge, edge);
+                        dcCtx.drawImage(snapshot, clipX + clipW - edge - 1, clipY + edge, 1, 1,
+                            clipX + clipW - edge, clipY, edge, edge);
+                        dcCtx.drawImage(snapshot, clipX + edge, clipY + clipH - edge - 1, 1, 1,
+                            clipX, clipY + clipH - edge, edge, edge);
+                        dcCtx.drawImage(snapshot, clipX + clipW - edge - 1, clipY + clipH - edge - 1, 1, 1,
+                            clipX + clipW - edge, clipY + clipH - edge, edge, edge);
+                    }
+                }
             }
         } else {
             Logger.verbose(LogCategory.USER32,
@@ -556,6 +552,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             width: size.width,
             height: size.height,
             hMenu: ((dwStyle & 0x40000000) === 0 && hMenu) ? hMenu : undefined,
+            controlId: controlIdFromCreateWindow(dwStyle, hMenu),
             // Never self-parent: a window whose parent handle equals its own (or the
             // desktop pseudo-handle) is top-level. Self-parenting would form a cycle in
             // the window tree and spin getAbsoluteWindowPosition forever.
@@ -569,12 +566,19 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             nativeClassName: resolvedClassName,
         };
 
-        if (builtinDescr?.controlClass) {
+        // user32 builtins expose controlClass via BuiltinSystemClass; comctl32
+        // classes (SysListView32, …) carry it on the registerBuiltinClass info.
+        const controlClass = builtinDescr?.controlClass ?? classInfo?.controlClass;
+        if (controlClass) {
             windowInfo.isSystemControl = true;
-            windowInfo.systemControlClass = builtinDescr.controlClass;
-            // For a WS_CHILD window the hMenu argument is the control id.
-            if (isChildWindow) windowInfo.controlId = hMenu >>> 0;
+            windowInfo.systemControlClass = controlClass;
+            windowInfo.externalPaintManaged = !!classInfo?.externalPaintManaged;
             windowInfo.fontHandle = windows.get(hWndParent)?.fontHandle;
+            // comctl registerBuiltinClass leaves lpfnWndProc=0; system controls
+            // need DefWindowProc so DispatchMessage / subclass forward works.
+            if (!windowInfo.wndProc) {
+                windowInfo.wndProc = getDefWindowProcAddress();
+            }
         }
 
         windows.set(windowInfo.handle, windowInfo);
@@ -981,16 +985,82 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         const WM_CLOSE = 0x0010;
         const WM_DESTROY = 0x0002;
         const WM_SETCURSOR = 0x0020;
+        const WM_WINDOWPOSCHANGED = 0x0047;
         const HTCLIENT = 1;
 
         const win = windows.get(hWnd);
+        if (win && Msg === WM_WINDOWPOSCHANGED && lParam) {
+            const flags = Mem.readUint32(lParam + 24) ?? 0;
+            const sendMove = (flags & 0x1000 /* SWP_NOCLIENTMOVE */) === 0;
+            const sendSize = (flags & 0x0800 /* SWP_NOCLIENTSIZE */) === 0
+                || (flags & 0x8000 /* SWP_STATECHANGED */) !== 0;
+            if (!sendMove && !sendSize) return 0;
+            let frameId = 0;
+            let directThunkReturn: { returnAddr: number; postEsp: number } | undefined;
+            const completeSize = (): number | null => 0;
+            const sendSizeMessage = (): number | null => {
+                if (!sendSize) return 0;
+                const sizeType = (win.style & 0x20000000) !== 0 ? 1
+                    : ((win.style & 0x01000000) !== 0 ? 2 : 0);
+                const sync = trySuspendForSyncWindowMessage(
+                    ctx, hWnd, WM_SIZE_GEO, sizeType,
+                    makeGeometryLParam(win.width, win.height),
+                    'DefWindowProc:WM_WINDOWPOSCHANGED', 16, completeSize, frameId || undefined,
+                    directThunkReturn,
+                );
+                return sync.suspended ? null : 0;
+            };
+            const sync = trySuspendForSyncWindowMessage(
+                ctx, hWnd,
+                sendMove ? WM_MOVE_GEO : WM_SIZE_GEO,
+                sendMove ? 0 : ((win.style & 0x20000000) !== 0 ? 1 : ((win.style & 0x01000000) !== 0 ? 2 : 0)),
+                sendMove
+                    ? makeGeometryLParam(win.x, win.y)
+                    : makeGeometryLParam(win.width, win.height),
+                'DefWindowProc:WM_WINDOWPOSCHANGED', 16,
+                sendMove ? sendSizeMessage : completeSize,
+            );
+            if (sync.suspended) {
+                frameId = sync.frameId;
+                directThunkReturn = sync.directThunkReturn;
+                return {
+                    value: 0,
+                    suspendedForCallback: true,
+                    callbackId: sync.callbackId,
+                    stackCleanup: 16,
+                    skipStackCheck: true,
+                    preserveCallbackReturnAddress: sync.reusedFrame,
+                };
+            }
+            return 0;
+        }
         if (win?.isSystemControl) {
             // A system control's wndProc IS this thunk (createDialogChildren), so a guest
             // that subclasses the control and forwards what it doesn't handle lands here —
             // which on real Windows is the BUTTON/LISTBOX/COMBOBOX class proc. Run the
             // class's input behavior (click -> WM_COMMAND(BN_CLICKED), combo drop, …)
             // before the message-based handling, or the forwarded click dies here.
-            if (handleSystemControlClassMouse(win, Msg, wParam, lParam)) return 0;
+            if (handleSystemControlClassMouse(win, Msg, wParam, lParam)) {
+                const notification = takePendingControlNotification();
+                if (notification) {
+                    const sync = trySuspendForSyncWindowMessage(
+                        ctx, notification.hwnd, notification.msg,
+                        notification.wParam, notification.lParam,
+                        'DefWindowProc:control-notify', 16, () => 0,
+                    );
+                    if (sync.suspended) {
+                        return {
+                            value: 0,
+                            suspendedForCallback: true,
+                            callbackId: sync.callbackId,
+                            stackCleanup: 16,
+                            skipStackCheck: true,
+                            preserveCallbackReturnAddress: sync.reusedFrame,
+                        };
+                    }
+                }
+                return 0;
+            }
             const result = handleSystemControlMessage(win, Msg, wParam, lParam, mem);
             if (isContentChangingMessage(win, Msg)) {
                 repaintDialogAfterContentChange(win.parent ?? hWnd);
@@ -1037,121 +1107,132 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         exports['DefWindowProcA'](ctx, mem, [args[0], args[2], args[3], args[4]]);
     exports['DefFrameProcW'] = exports['DefFrameProcA'];
 
-    exports['ShowWindow'] = (ctx, mem, args) => {
-        const hWnd = args[0];
-        const nCmdShow = args[1];
+    const showWindowImpl = (
+        ctx: any,
+        hWnd: number,
+        nCmdShow: number,
+        stackCleanup: number,
+        forcedResult?: number,
+        existingFrameId = 0,
+    ): any => {
 
-        Logger.log(LogCategory.USER32, `ShowWindow(0x${hWnd.toString(16)}, ${nCmdShow})`);
+        Logger.verbose(LogCategory.USER32, `ShowWindow(0x${hWnd.toString(16)}, ${nCmdShow})`);
 
         const window = windows.get(hWnd);
-        if (window) {
-            const wasVisible = window.visible;
-            window.visible = nCmdShow !== 0; // SW_HIDE = 0
+        if (!window || nCmdShow < 0 || nCmdShow > 11) return 0;
 
-            // Hiding a dialog: erase its pixels from the persistent overlay (while its
-            // rect is still known) so it doesn't linger as a ghost. TS hides the
-            // campaign dialog (ShowWindow(hWnd,0)) when opening a sub-dialog.
-            //
-            // ANY window, not just #32770: a control's pixels are as persistent on the flat
-            // overlay as a dialog's, so a hidden owner-draw button nothing erases stays on
-            // screen (a page-switching front-end hides "Back" and shows "Quit" over the same
-            // row, leaving both). Safe only because the repair is now ancestor-aware
-            // (isEffectivelyVisible) — it used to walk back into the hidden window's children,
-            // which keep WS_VISIBLE, and repaint the page that was just switched away.
-            if (wasVisible && !window.visible) {
-                // Restore the exact backdrop first — it serves a hidden PAGE as well as a
-                // control, and is the only thing that puts the frame's own pixels back.
-                // Only a top-level dialog falls back to the clearing erase; for a CHILD
-                // that clear leaves a hole the guest never repaints, and the repair then
-                // stamps the grey dialog face over the guest's own backdrop.
-                if (!restoreClientRectFromAncestors(window) && window.nativeClassName === '#32770') {
-                    eraseDialogOverlay(hWnd);
-                }
-            }
+        const WS_VISIBLE = 0x10000000;
+        const WS_CHILD = 0x40000000;
+        const WS_POPUP = 0x80000000;
+        const WS_MINIMIZE = 0x20000000;
+        const WS_MAXIMIZE = 0x01000000;
+        const wasVisible = (window.style & WS_VISIBLE) !== 0;
+        const resultValue = forcedResult ?? (wasVisible ? 1 : 0);
+        const show = nCmdShow !== 0;
+        const visibilityChanged = show !== wasVisible;
+        const isChild = (window.style & WS_CHILD) !== 0;
+        const noActivate = isChild || nCmdShow === 4 || nCmdShow === 6
+            || nCmdShow === 7 || nCmdShow === 8 || nCmdShow === 11;
+        const noZOrder = isChild || nCmdShow === 4 || nCmdShow === 6 || nCmdShow === 7
+            || (!show && System.getInstance().windowManager.getActiveHwnd() !== hWnd);
 
-            // Sync WS_VISIBLE style flag
-            if (window.visible) {
-                window.style |= 0x10000000;  // WS_VISIBLE
-            } else {
-                window.style &= ~0x10000000; // clear WS_VISIBLE
-            }
-
-            // Sync visibility to WindowManager + Z-order (shown window comes to front,
-            // hidden window drops to back so it no longer wins WindowFromPoint hit-tests).
-            const wm = System.getInstance().windowManager;
-            const wmWin = wm.getWindow(hWnd);
-            if (wmWin) {
-                wmWin.visible = window.visible;
-                if (window.visible !== wasVisible) wm.onWindowVisibilityChanged(hWnd, window.visible);
-            }
-
-            // Generic Win32: the system sends WM_SHOWWINDOW when a window is shown or
-            // hidden, with wParam=fShow and lParam=0 (status code 0 = "called via the
-            // ShowWindow function"). Only on an actual show-state change — Windows does
-            // not send it when the visible state is unchanged. HL's menu loads its
-            // background DIB (gfx/shell/splash.bmp) + button strip inside
-            // OnShowWindow(bShow=TRUE, nStatus=0); without this the menu paints its
-            // owner-draw buttons then wipes them with an empty 640x480 backbuffer (black
-            // background). Windows created already-visible get this via
-            // postInitialVisibleWindowMessages; this covers the create-hidden +
-            // ShowWindow(SW_SHOW) path.
-            if (window.visible !== wasVisible) {
-                System.getInstance().windowManager.postMessage(hWnd, 0x18 /* WM_SHOWWINDOW */, window.visible ? 1 : 0, 0);
-            }
-
-            if (window.visible) {
-                // Dialog shown while the DDraw flip chain owns the screen → live
-                // overlay that the presenter must composite over every flip.
-                noteDialogOverlayCandidate(window);
-
-                // Win32: when a dialog becomes visible the system paints it (DefDlgProc
-                // erase + each control class paints itself). Our HLE equivalent is the
-                // overlay chrome paint, which creation only does for visible dialogs —
-                // so a create-hidden + ShowWindow dialog needs it here. Only #32770
-                // (the standard dialog class): non-dialog windows own their pixels via
-                // guest WM_PAINT and must not get a default background.
-                if (!wasVisible && window.nativeClassName === '#32770') {
-                    repaintDialogOverlayIfVisible(hWnd);
-                }
-                // Resize host canvas for normal top-level windows only.
-                // Skip WS_POPUP (dialogs, MCI/message boxes) — they must not shrink the
-                // canvas after DDraw SetDisplayMode (small error dialogs).
-                // Skip WS_CHILD. DDraw SetDisplayMode owns resolution for fullscreen games.
-                const WS_CHILD = 0x40000000;
-                const WS_POPUP = 0x80000000;
-                if (!(window.style & WS_CHILD) && !(window.style & WS_POPUP)) {
-                    const system = System.getInstance();
-                    system.requestHostResize(window.width, window.height);
-                }
-
-                // Activate the window when shown (most SW_* commands activate)
-                // SW_SHOWNOACTIVATE (4) and SW_SHOWNA (8) don't activate
-                if (nCmdShow !== 4 && nCmdShow !== 8) {
-                    const prevActive = System.getInstance().windowManager.getActiveHwnd();
-                    if (prevActive !== hWnd || needsActivationDelivery(hWnd)) {
-                        activateTopLevelWindow(hWnd);
-                    }
-                }
-
-                // Trigger paint for the newly shown window (deferred while WM_CREATE runs).
-                if (!window.createInProgress) {
-                    System.getInstance().windowManager.postMessage(hWnd, WM_PAINT, 0, 0);
-                }
-
-                if (window.guestCustomPaint) {
-                    requestGuestDialogPaint(hWnd);
-                }
-            }
-
-            if (isAnimateControlWindow(window)) {
-                onAnimateShowWindow(hWnd, nCmdShow);
-            }
-
-            return wasVisible ? 1 : 0; // Return previous visibility state
+        if ((nCmdShow === 0 && !wasVisible) || (nCmdShow === 5 && wasVisible)) {
+            return resultValue;
         }
 
-        return 0;
+        const applyShowState = (): number => {
+            const live = windows.get(hWnd);
+            if (!live) return resultValue;
+
+            if (nCmdShow === 2 || nCmdShow === 6 || nCmdShow === 7 || nCmdShow === 11) {
+                live.style = (live.style | WS_MINIMIZE) & ~WS_MAXIMIZE;
+            } else if (nCmdShow === 3) {
+                live.style = (live.style | WS_MAXIMIZE) & ~WS_MINIMIZE;
+            } else if (nCmdShow === 1 || nCmdShow === 4 || nCmdShow === 9 || nCmdShow === 10) {
+                live.style &= ~(WS_MINIMIZE | WS_MAXIMIZE);
+            }
+
+            if (visibilityChanged) {
+                live.visible = show;
+                if (show) live.style |= WS_VISIBLE;
+                else live.style &= ~WS_VISIBLE;
+
+                const wm = System.getInstance().windowManager;
+                const wmWin = wm.getWindow(hWnd);
+                if (wmWin) wmWin.visible = show;
+
+                if (!show) {
+                    eraseHiddenWindowPixels(live);
+                    if (!isChild && wm.getActiveHwnd() === hWnd) {
+                        const successor = wm.getZOrder().find(candidate => {
+                            if (candidate === hWnd) return false;
+                            const next = wm.getWindow(candidate);
+                            // A disabled top-level window cannot become active. This matters
+                            // for nested modal dialogs: MFC disables the main window while the
+                            // intermediate dialog remains enabled, so choosing the disabled
+                            // owner here would route the next click through the window beneath
+                            // the still-visible modal dialog.
+                            return !!next?.visible
+                                && (next.style & WS_CHILD) === 0
+                                && (next.style & 0x08000000 /* WS_DISABLED */) === 0;
+                        }) ?? 0;
+                        if (successor) activateTopLevelWindow(successor);
+                        else wm.clearActiveWindow(hWnd);
+                    }
+                } else if (isEffectivelyVisible(live)) {
+                    if (!noZOrder && !isChild) wm.setWindowZOrder(hWnd, 0 /* HWND_TOP */);
+                    noteDialogOverlayCandidate(live);
+                    invalidateWindow(hWnd, null, true);
+                    if (live.isSystemControl && live.parent) {
+                        repaintDialogAfterContentChange(live.parent);
+                    }
+                    // Showing invalidates the window; WM_PAINT is still dispatched even
+                    // when our flat-overlay fallback supplied an immediate default face.
+                    // The guest may handle it (and owner-draw its controls), replacing the
+                    // fallback exactly as the native paint lifecycle would.
+                    if (!live.createInProgress) {
+                        if (live.guestCustomPaint) requestGuestDialogPaint(hWnd);
+                        else System.getInstance().windowManager.postMessage(hWnd, WM_PAINT, 0, 0);
+                    }
+                }
+            }
+
+            if (show && !noActivate && !isChild) {
+                const wm = System.getInstance().windowManager;
+                if (wm.getActiveHwnd() !== hWnd || needsActivationDelivery(hWnd)) {
+                    activateTopLevelWindow(hWnd);
+                }
+            }
+
+            if (show && !isChild && !(live.style & WS_POPUP)) {
+                System.getInstance().requestHostResize(live.width, live.height);
+            }
+            if (isAnimateControlWindow(live)) onAnimateShowWindow(hWnd, nCmdShow);
+            return resultValue;
+        };
+
+        // USER sends WM_SHOWWINDOW synchronously before SetWindowPos changes WS_VISIBLE.
+        if (visibilityChanged || nCmdShow === 8 /* SW_SHOWNA */) {
+            const sync = trySuspendForSyncWindowMessage(
+                ctx, hWnd, 0x0018 /* WM_SHOWWINDOW */, show ? 1 : 0, 0,
+                'ShowWindow', stackCleanup, applyShowState, existingFrameId || undefined,
+            );
+            if (sync.suspended) {
+                return {
+                    value: resultValue,
+                    suspendedForCallback: true,
+                    callbackId: sync.callbackId,
+                    stackCleanup,
+                    skipStackCheck: true,
+                    preserveCallbackReturnAddress: sync.reusedFrame,
+                };
+            }
+        }
+        return applyShowState();
     };
+
+    exports['ShowWindow'] = (ctx, mem, args) =>
+        showWindowImpl(ctx, args[0] >>> 0, args[1] | 0, 8);
 
     exports['UpdateWindow'] = (ctx, mem, args) => {
         const hWnd = args[0];
@@ -1177,154 +1258,267 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         return 1; // TRUE
     };
 
-    exports['SetWindowPos'] = (ctx, mem, args) => {
-        const hWnd = args[0];
-        const hWndInsertAfter = args[1];
-        const x = args[2] | 0;
-        const y = args[3] | 0;
-        const cx = args[4];
-        const cy = args[5];
-        const uFlags = args[6];
+    const setWindowPosImpl = (
+        ctx: any,
+        mem: Uint8Array,
+        args: number[],
+        stackCleanup: number,
+        existingFrameId = 0,
+        onComplete?: () => number | null,
+        onFrame?: (frameId: number) => void,
+    ): any => {
+        const hWnd = args[0] >>> 0;
+        const hWndInsertAfter = args[1] >>> 0;
+        const x = Math.max(-32768, Math.min(32767, args[2] | 0));
+        const y = Math.max(-32768, Math.min(32767, args[3] | 0));
+        const cx = Math.max(0, Math.min(32767, args[4] | 0));
+        const cy = Math.max(0, Math.min(32767, args[5] | 0));
+        const uFlags = args[6] >>> 0;
 
         Logger.verbose(LogCategory.USER32,
             `SetWindowPos(0x${hWnd.toString(16)}, insertAfter=0x${hWndInsertAfter.toString(16)}, x=${x}, y=${y}, cx=${cx}, cy=${cy}, flags=0x${uFlags.toString(16)})`);
 
-        // Update window position/size if window exists.
         const window = windows.get(hWnd);
-        if (window) {
-            // SWP_HIDEWINDOW/SWP_SHOWWINDOW: SetWindowPos can toggle visibility same as
-            // ShowWindow(SW_HIDE/SW_SHOW). Mirror ShowWindow's hide path exactly (mark
-            // invisible THEN erase — see DestroyWindow for why that order matters: erasing
-            // while still visible=true lets the erase's own parent-repaint walk back into
-            // this window and repaint it right back). Real MFC CDialog::DoModal hides the
-            // dialog this way before DestroyWindow; skipping this left window.visible=true
-            // forever, so later repaints of THIS (should-be-hidden) window kept firing.
-            const SWP_HIDEWINDOW = 0x0080;
-            const SWP_SHOWWINDOW = 0x0040;
-            if ((uFlags & SWP_HIDEWINDOW) !== 0 && window.visible) {
-                window.visible = false;
-                window.style &= ~0x10000000; // clear WS_VISIBLE
-                if (window.nativeClassName === '#32770') {
-                    eraseDialogOverlay(hWnd);
+        if (!window) return 0;
+        // An invalid child Z-order target suppresses only the Z-order portion. USER
+        // still applies move/size/show flags (native launchers commonly pass
+        // HWND_TOPMOST while positioning a child page).
+
+        const SWP_NOSIZE = 0x0001;
+        const SWP_NOMOVE = 0x0002;
+        const SWP_NOZORDER = 0x0004;
+        const SWP_NOREDRAW = 0x0008;
+        const SWP_NOACTIVATE = 0x0010;
+        const SWP_FRAMECHANGED = 0x0020;
+        const SWP_SHOWWINDOW = 0x0040;
+        const SWP_HIDEWINDOW = 0x0080;
+        const SWP_NOSENDCHANGING = 0x0400;
+        const SWP_NOCLIENTSIZE = 0x0800;
+        const SWP_NOCLIENTMOVE = 0x1000;
+        const WS_VISIBLE = 0x10000000;
+        const WS_CHILD = 0x40000000;
+        const process = System.getInstance().process;
+
+        type WindowPosValue = {
+            insertAfter: number; x: number; y: number; cx: number; cy: number; flags: number;
+        };
+
+        const writeWindowPos = (ptr: number, pos: WindowPosValue): void => {
+            Mem.writeUint32(ptr, hWnd);
+            Mem.writeUint32(ptr + 4, pos.insertAfter);
+            Mem.writeUint32(ptr + 8, pos.x >>> 0);
+            Mem.writeUint32(ptr + 12, pos.y >>> 0);
+            Mem.writeUint32(ptr + 16, pos.cx >>> 0);
+            Mem.writeUint32(ptr + 20, pos.cy >>> 0);
+            Mem.writeUint32(ptr + 24, pos.flags >>> 0);
+        };
+        const readWindowPos = (ptr: number): WindowPosValue => ({
+            insertAfter: Mem.readUint32(ptr + 4) ?? hWndInsertAfter,
+            x: Math.max(-32768, Math.min(32767, Mem.readInt32(ptr + 8) ?? x)),
+            y: Math.max(-32768, Math.min(32767, Mem.readInt32(ptr + 12) ?? y)),
+            cx: Math.max(0, Math.min(32767, Mem.readInt32(ptr + 16) ?? cx)),
+            cy: Math.max(0, Math.min(32767, Mem.readInt32(ptr + 20) ?? cy)),
+            flags: Mem.readUint32(ptr + 24) ?? uFlags,
+        });
+
+        const applyWindowPos = (pos: WindowPosValue, ptr: number): boolean => {
+            const live = windows.get(hWnd);
+            if (!live) return false;
+
+            let flags = pos.flags >>> 0;
+            if (!isWindowPosZOrderRequestValid(live, pos.insertAfter, flags)) {
+                // HWND_TOPMOST/NOTOPMOST belong to the desktop Z-order domain. Some
+                // legacy callers nevertheless use that pair for a WS_CHILD page while
+                // supplying desktop coordinates. Downgrade the invalid Z request to
+                // ordinary child Z-order and map the accompanying point into the
+                // parent's client space. This is style/coordinate-domain compatibility,
+                // independent of dialog class, resource ids, or application identity.
+                if ((live.style & WS_CHILD) && !(flags & SWP_NOMOVE)
+                    && (pos.insertAfter === 0xffffffff || pos.insertAfter === 0xfffffffe)
+                    && live.parent) {
+                    const parent = windows.get(live.parent);
+                    if (parent) {
+                        const origin = getAbsoluteWindowPosition(parent);
+                        pos.x -= origin.x;
+                        pos.y -= origin.y;
+                    }
                 }
-                const wmWinHide = System.getInstance().windowManager.getWindow(hWnd);
-                if (wmWinHide) {
-                    wmWinHide.visible = false;
-                    System.getInstance().windowManager.onWindowVisibilityChanged(hWnd, false);
-                }
-            } else if ((uFlags & SWP_SHOWWINDOW) !== 0 && !window.visible) {
-                window.visible = true;
-                window.style |= 0x10000000; // set WS_VISIBLE
-                const wmWinShow = System.getInstance().windowManager.getWindow(hWnd);
-                if (wmWinShow) {
-                    wmWinShow.visible = true;
-                    System.getInstance().windowManager.onWindowVisibilityChanged(hWnd, true);
-                }
-                if (window.nativeClassName === '#32770') {
-                    repaintDialogOverlayIfVisible(hWnd);
-                }
+                flags |= SWP_NOZORDER;
+            }
+            const wasVisible = (live.style & WS_VISIBLE) !== 0;
+            if (wasVisible) flags &= ~SWP_SHOWWINDOW;
+            else {
+                flags &= ~SWP_HIDEWINDOW;
+                if (!(flags & SWP_SHOWWINDOW)) flags |= SWP_NOREDRAW;
+            }
+            if (!(flags & SWP_NOSIZE) && pos.cx === live.width && pos.cy === live.height) flags |= SWP_NOSIZE;
+            if (!(flags & SWP_NOMOVE) && pos.x === live.x && pos.y === live.y) flags |= SWP_NOMOVE;
+
+            const oldRect = { x: live.x, y: live.y, w: live.width, h: live.height };
+            const showing = (flags & SWP_SHOWWINDOW) !== 0;
+            const hiding = !showing && (flags & SWP_HIDEWINDOW) !== 0;
+
+            if (hiding) eraseHiddenWindowPixels(live);
+
+            if (!(flags & SWP_NOZORDER)) {
+                if (live.style & WS_CHILD) reorderChildInParent(hWnd, pos.insertAfter | 0);
+                else System.getInstance().windowManager.setWindowZOrder(hWnd, pos.insertAfter | 0);
             }
 
-            // Z-order: honor hWndInsertAfter unless SWP_NOZORDER (0x0004).
-            const SWP_NOZORDER = 0x0004;
-            if ((uFlags & SWP_NOZORDER) === 0) {
-                const WS_CHILD = 0x40000000;
-                if ((window.style & WS_CHILD) !== 0) {
-                    reorderChildInParent(hWnd, hWndInsertAfter | 0);
-                } else {
-                    System.getInstance().windowManager.setWindowZOrder(hWnd, hWndInsertAfter | 0);
-                }
+            const geom = applyWindowPosGeometry(
+                hWnd, pos.x, pos.y, pos.cx, pos.cy, flags,
+                { skipDialogOverlayRepaint: true },
+            );
+            const moved = !!geom?.moved;
+            const resized = !!geom?.resized;
+            if (showing) {
+                live.visible = true;
+                live.style |= WS_VISIBLE;
+            } else if (hiding) {
+                live.visible = false;
+                live.style &= ~WS_VISIBLE;
             }
-            const geom = applyWindowPosGeometry(hWnd, x, y, cx, cy, uFlags, { skipDialogOverlayRepaint: true });
+            if (!moved) flags |= SWP_NOCLIENTMOVE;
+            if (!resized) flags |= SWP_NOCLIENTSIZE;
+            pos.flags = flags;
+            if (ptr) writeWindowPos(ptr, pos);
+
+            const wmWin = System.getInstance().windowManager.getWindow(hWnd);
+            if (wmWin) wmWin.visible = live.visible;
+
+            if (!(flags & SWP_NOREDRAW) && live.parent && wasVisible
+                && (hiding || moved || resized || !(flags & SWP_NOZORDER))) {
+                invalidateWindow(live.parent, {
+                    left: oldRect.x,
+                    top: oldRect.y,
+                    right: oldRect.x + oldRect.w,
+                    bottom: oldRect.y + oldRect.h,
+                }, true);
+            }
+            if (!(flags & SWP_NOREDRAW) && live.visible
+                && (showing || moved || resized || (flags & SWP_FRAMECHANGED))) {
+                invalidateWindow(hWnd, null, true);
+                noteDialogOverlayCandidate(live);
+            }
+            if (!(flags & SWP_NOACTIVATE) && !(live.style & WS_CHILD) && !hiding) {
+                activateTopLevelWindow(hWnd);
+            }
             Logger.verbose(LogCategory.USER32,
-                `SetWindowPos result: win.x=${window.x} win.y=${window.y} win.w=${window.width} win.h=${window.height}`);
+                `SetWindowPos result: win.x=${live.x} win.y=${live.y} win.w=${live.width} win.h=${live.height} flags=0x${flags.toString(16)}`);
+            return moved || resized || showing || hiding || !(flags & SWP_NOZORDER) || !!(flags & SWP_FRAMECHANGED);
+        };
 
-            if (geom) {
-                const stackCleanup = 7 * 4;
-                const sync = trySuspendForSyncGeometryNotify(
-                    ctx, hWnd, geom.moved, geom.resized, uFlags, 'SetWindowPos', stackCleanup);
-                if (sync.suspended) {
-                    return {
-                        value: 1,
-                        suspendedForCallback: true,
-                        callbackId: sync.callbackId,
-                        stackCleanup,
-                        skipStackCheck: true,
-                    };
-                }
-                finishWindowPosRepaint(hWnd);
-            }
+        const wndProc = resolveGuestWndProc(window);
+        const hasGuestWndProc = !!wndProc && !isSentinelWndProc(wndProc)
+            && (!window.isSystemControl || !!window.wndProcSubclassed);
+        if (!hasGuestWndProc || !process) {
+            const pos = { insertAfter: hWndInsertAfter, x, y, cx, cy, flags: uFlags };
+            const changed = applyWindowPos(pos, 0);
+            if (changed) finishWindowPosRepaint(hWnd);
+            return onComplete ? onComplete() : 1;
         }
 
-        return 1; // TRUE
+        const callbackManager = process.dispatcher?.callbackManager;
+        if (!callbackManager) return 0;
+        const windowPosPtr = process.memory.alloc(28, 'HEAP', 'rw');
+        if (!windowPosPtr) return 0;
+        writeWindowPos(windowPosPtr, { insertAfter: hWndInsertAfter, x, y, cx, cy, flags: uFlags });
+        const thunkReturnAddr = Mem.readUint32(ctx.esp) ?? 0;
+        const saveFrame = (): number => {
+            const frameId = existingFrameId || callbackManager.saveSuspendedThunkContext(
+                { ...ctx, returnAddr: thunkReturnAddr }, stackCleanup, 'SetWindowPos');
+            if (frameId) onFrame?.(frameId);
+            return frameId;
+        };
+
+        if (uFlags & SWP_NOSENDCHANGING) {
+            const changed = applyWindowPos(readWindowPos(windowPosPtr), windowPosPtr);
+            if (!changed) {
+                process.memory.free(windowPosPtr);
+                return onComplete ? onComplete() : 1;
+            }
+            const frameId = saveFrame();
+            if (!frameId) {
+                process.memory.free(windowPosPtr);
+                return 0;
+            }
+            const changedCall = callbackManager.invokeCallback(
+                wndProc, [hWnd, 0x0047 /* WM_WINDOWPOSCHANGED */, 0, windowPosPtr], 0,
+                () => {
+                    process.memory.free(windowPosPtr);
+                    finishWindowPosRepaint(hWnd);
+                    return onComplete ? onComplete() : 1;
+                },
+                false, 'SetWindowPos:WM_WINDOWPOSCHANGED', frameId);
+            if (!changedCall.callbackId) {
+                process.memory.free(windowPosPtr);
+                return 0;
+            }
+            return {
+                value: 1,
+                suspendedForCallback: true,
+                callbackId: changedCall.callbackId,
+                stackCleanup,
+                skipStackCheck: true,
+            };
+        }
+
+        const frameId = saveFrame();
+        if (!frameId) {
+            process.memory.free(windowPosPtr);
+            return 0;
+        }
+
+        const finish = (): number | null => {
+            process.memory.free(windowPosPtr);
+            finishWindowPosRepaint(hWnd);
+            return onComplete ? onComplete() : 1;
+        };
+        const afterChanging = (): number | null => {
+            if (!windows.has(hWnd)) return finish();
+            const changed = applyWindowPos(readWindowPos(windowPosPtr), windowPosPtr);
+            if (!changed) return finish();
+            const changedCall = callbackManager.invokeCallback(
+                wndProc, [hWnd, 0x0047 /* WM_WINDOWPOSCHANGED */, 0, windowPosPtr], 0,
+                () => finish(), false, 'SetWindowPos:WM_WINDOWPOSCHANGED', frameId);
+            return changedCall.callbackId ? null : finish();
+        };
+
+        const first = callbackManager.invokeCallback(
+            wndProc, [hWnd, 0x0046 /* WM_WINDOWPOSCHANGING */, 0, windowPosPtr], 0,
+            afterChanging, false, 'SetWindowPos:WM_WINDOWPOSCHANGING', frameId);
+        if (!first.callbackId) {
+            process.memory.free(windowPosPtr);
+            return 0;
+        }
+        return {
+            value: 1,
+            suspendedForCallback: true,
+            callbackId: first.callbackId,
+            stackCleanup,
+            skipStackCheck: true,
+        };
     };
 
+    exports['SetWindowPos'] = (ctx, mem, args) =>
+        setWindowPosImpl(ctx, mem, args, 7 * 4);
+
     exports['MoveWindow'] = (ctx, mem, args) => {
-        const hWnd = args[0];
-        const X = args[1] | 0;      // signed int
-        const Y = args[2] | 0;      // signed int
-        const nWidth = args[3];
-        const nHeight = args[4];
-        const bRepaint = args[5];
+        const hWnd = args[0] >>> 0;
+        const X = args[1] | 0;
+        const Y = args[2] | 0;
+        const nWidth = args[3] | 0;
+        const nHeight = args[4] | 0;
+        const bRepaint = args[5] !== 0;
 
         Logger.verbose(LogCategory.USER32,
             `MoveWindow(0x${hWnd.toString(16)}, x=${X}, y=${Y}, w=${nWidth}, h=${nHeight}, repaint=${bRepaint})`);
 
-        const window = windows.get(hWnd);
-        if (window) {
-            const oldX = window.x;
-            const oldY = window.y;
-            const oldW = window.width;
-            const oldH = window.height;
-            const moving = X !== oldX || Y !== oldY;
-            const resizing = nWidth > 0 && nHeight > 0 && (nWidth !== oldW || nHeight !== oldH);
-            const moved = moving || resizing;
-
-            // Erase the dialog's OLD overlay rect before moving/resizing so it doesn't
-            // smear its previous position (persistent screen-space overlay canvas).
-            if (moved && window.visible && window.nativeClassName === '#32770') {
-                eraseDialogOverlay(hWnd);
-            }
-            window.x = X;
-            window.y = Y;
-            if (nWidth > 0 && nHeight > 0) {
-                window.width = nWidth;
-                window.height = nHeight;
-            }
-
-            // Sync the new geometry to the WindowManager's WindowObject. The input path
-            // (getInputTargetWindow → InputManager) translates screen→client coords against
-            // WindowObject.rect; without this sync it keeps the window's CREATION rect, so a
-            // repositioned window (e.g. HL's difficulty dialog, created centered then
-            // MoveWindow'd to (0,0,640,480)) gets the wrong client coords → mouse lParam is
-            // offset/clamped → owner-draw hit-tests miss every control. Mirrors ShowWindow's
-            // visibility sync.
-            const wmWin = System.getInstance().windowManager.getWindow(hWnd);
-            if (wmWin) {
-                wmWin.rect.x = X;
-                wmWin.rect.y = Y;
-                if (nWidth > 0 && nHeight > 0) {
-                    wmWin.rect.w = nWidth;
-                    wmWin.rect.h = nHeight;
-                }
-            }
-
-            // If bRepaint is TRUE, invalidate and post WM_PAINT
-            if (bRepaint && window.visible) {
-                invalidateWindow(hWnd, null, true);
-                System.getInstance().windowManager.postMessage(hWnd, WM_PAINT, 0, 0);
-            }
-
-            repaintParentDialogIfSystemControlGeometryChanged(window, moving, resizing);
-
-            // Win32 repaints a moved/resized window; repaint dialog chrome at the
-            // new geometry (the overlay still holds it at the old position).
-            if (window.visible && window.nativeClassName === '#32770') {
-                repaintDialogOverlayIfVisible(hWnd);
-            }
-        }
-
-        return 1; // TRUE
+        const flags = 0x0004 /* SWP_NOZORDER */ | 0x0010 /* SWP_NOACTIVATE */
+            | (bRepaint ? 0 : 0x0008 /* SWP_NOREDRAW */);
+        return setWindowPosImpl(ctx, mem, [
+            hWnd, 0, X, Y, nWidth, nHeight, flags,
+        ], 6 * 4);
     };
 
     exports['ShowCursor'] = (ctx, mem, args) => {
@@ -1339,15 +1533,19 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
     // BOOL OpenIcon(HWND hWnd) — restores a minimized window
     // We never minimize, so just return TRUE (success)
     exports['OpenIcon'] = (ctx, mem, args) => {
-        Logger.verbose(LogCategory.USER32, `OpenIcon(0x${args[0].toString(16)}) -> stub`);
-        return 1;
+        const hWnd = args[0] >>> 0;
+        Logger.verbose(LogCategory.USER32, `OpenIcon(0x${hWnd.toString(16)})`);
+        if (!windows.has(hWnd)) return 0;
+        return showWindowImpl(ctx, hWnd, 9 /* SW_RESTORE */, 4, 1);
     };
 
     // BOOL CloseWindow(HWND hWnd) — minimizes the specified window (does NOT destroy it)
     // We don't support minimizing in emulator, return TRUE
     exports['CloseWindow'] = (ctx, mem, args) => {
-        Logger.verbose(LogCategory.USER32, `CloseWindow(0x${args[0].toString(16)}) -> stub (no-op)`);
-        return 1;
+        const hWnd = args[0] >>> 0;
+        Logger.verbose(LogCategory.USER32, `CloseWindow(0x${hWnd.toString(16)})`);
+        if (!windows.has(hWnd)) return 0;
+        return showWindowImpl(ctx, hWnd, 6 /* SW_MINIMIZE */, 4, 1);
     };
 
     exports['InvalidateRect'] = (ctx, mem, args) => {
@@ -1402,9 +1600,32 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         const hDC = args[1];
         Logger.verbose(LogCategory.USER32, `ReleaseDC(0x${hWnd.toString(16)}, 0x${hDC.toString(16)})`);
         const gdi = System.getInstance().gdiContext;
-        if (gdi.flushWindowMemoryDCToOverlay(hDC)) {
+        const win = getWindowByHandle(hWnd);
+
+        // LockWindowUpdate: drawing without DCX_LOCKWINDOWUPDATE must not reach the
+        // screen (Wine win.c test_LockWindowUpdate — pixels stay at the pre-lock value
+        // after unlock). Drop the dirty flag so a later accidental flush cannot publish them.
+        if (hWnd && isWindowUpdateLocked(hWnd)) {
+            gdi.clearDirty(hDC);
+            gdi.releaseDC(hDC);
+            return 1;
+        }
+
+        // Mirror EndPaint: punch child windows out of the blit, retain the guest's
+        // client for ShowWindow(SW_HIDE) restore, and skip composite when the window
+        // is not effectively visible. GetDC/ReleaseDC is the hot path for MFC owner-draw
+        // menus (BeginPaint is rare); without retain, hide-restore has nothing to put back.
+        const exclusions = hWnd ? getChildWindowExclusions(hWnd) : [];
+        const flushed = win && (!isEffectivelyVisible(win)
+            || isWindowFullyCoveredByHigherTopLevel(win))
+            ? false
+            : gdi.flushWindowMemoryDCToOverlay(
+                hDC,
+                exclusions,
+                hWnd && !win?.isSystemControl ? hWnd : undefined,
+                win ? getAncestorClipRect(win) : null);
+        if (flushed) {
             markGuestCustomPaint(hWnd);
-            const win = getWindowByHandle(hWnd);
             // OS-owned controls (statics/edits) repaint on top of the guest's flush —
             // owner-draw buttons early-out inside repaintChildControls.
             if (win && win.children.length) {
@@ -1486,10 +1707,11 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             // them, so the old splash hung behind the launcher menu for the whole session.
             // The DC itself is still filled and released normally — only the composite stops.
             const painted = getWindowByHandle(hWnd);
-            const flushed = painted && !isEffectivelyVisible(painted)
+            const flushed = painted && (!isEffectivelyVisible(painted)
+                || isWindowFullyCoveredByHigherTopLevel(painted))
                 ? false
                 : gdi.flushWindowMemoryDCToOverlay(
-                    hdc, exclusions, hWnd,
+                    hdc, exclusions, painted?.isSystemControl ? undefined : hWnd,
                     painted ? getAncestorClipRect(painted) : null);
             if (paintTraceEnabled) logBeginEndPaint('EndPaint', hWnd,
                 `lpPaint=0x${lpPaint.toString(16)} hdc=0x${hdc.toString(16)} flush=${flushed ? 1 : 0} ` +
@@ -1508,7 +1730,10 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             // Owner-draw buttons paint on TOP of the now-flushed background. Each child
             // gets its own client DC (positioned + seeded from the overlay); the guest
             // blits its tile in via WM_DRAWITEM, then we composite each onto the overlay.
-            const odWin = getWindowByHandle(hWnd);
+            // A fully occluded window gets an empty native update region. If its parent
+            // blit was suppressed above, its owner-draw children must be suppressed too;
+            // otherwise only the lower window's buttons leak through the popup.
+            const odWin = flushed ? getWindowByHandle(hWnd) : undefined;
             if (odWin) {
                 try {
                     const ownerDraw = tryEndPaintOwnerDrawChain(ctx, mem, hWnd, odWin, {
@@ -1542,7 +1767,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         const wParam = args[3] >>> 0;
         const lParam = args[4] >>> 0;
 
-        Logger.log(LogCategory.USER32,
+        Logger.verboseLazy(LogCategory.USER32, () =>
             `CallWindowProcA(prev=0x${lpPrevWndFunc.toString(16)}, hwnd=0x${hWnd.toString(16)}, msg=0x${Msg.toString(16)})`);
 
         // Sentinel WndProc: system control (Button/Static/Edit etc.) — handle in JS, don't call x86
@@ -1557,21 +1782,42 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         if (!callbackManager || lpPrevWndFunc === 0) return 0;
 
         const stackCleanup = 5 * 4;
-        callbackManager.saveSuspendedThunkContext(ctx, stackCleanup, 'CallWindowProcA');
-
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const returnAddr = view.getUint32(ctx.esp, true) >>> 0;
         const first = callbackManager.invokeCallback(
             lpPrevWndFunc,
             [hWnd, Msg, wParam, lParam],
             0,
-            (wndRet: number): number | null => {
-                if (Msg === WM_SIZE && getWindowByHandle(hWnd)?.guestCustomPaint) {
-                    requestGuestDialogPaint(hWnd);
-                }
-                return wndRet >>> 0;
+            undefined,
+            false,
+            'CallWindowProcA',
+            undefined,
+            {
+                directThunkReturn: {
+                    returnAddr,
+                    postEsp: (ctx.esp + 4 + stackCleanup) >>> 0,
+                    complete: (wndRet: number): number | null => {
+                        if (Msg === WM_SIZE && getWindowByHandle(hWnd)?.guestCustomPaint) {
+                            requestGuestDialogPaint(hWnd);
+                        }
+                        return wndRet >>> 0;
+                    },
+                },
             },
         );
+        if (!first.callbackId) return { value: 0, stackCleanup };
 
-        return { value: 0, suspendedForCallback: true, callbackId: first.callbackId, stackCleanup };
+        // CallWindowProc is a nested guest call, not the end of the outer
+        // DispatchMessage/SendMessage callback.  Return through this thunk's own
+        // continuation so the subclass WndProc resumes with the callee's EAX.
+        return {
+            value: 0,
+            suspendedForCallback: true,
+            callbackId: first.callbackId,
+            stackCleanup,
+            skipStackCheck: true,
+            preserveCallbackReturnAddress: true,
+        };
     };
 
     exports['CallWindowProcW'] = exports['CallWindowProcA'];
@@ -1683,10 +1929,10 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
     };
 
     exports['LockWindowUpdate'] = (ctx, mem, args) => {
-        const hWnd = args[0];
+        const hWnd = args[0] >>> 0;
         Logger.verbose(LogCategory.USER32, `LockWindowUpdate(0x${hWnd.toString(16)})`);
-        setLockWindowUpdate(hWnd);
-        return 1; // TRUE
+        // Unlock does not invent paint — guest Invalidate/RedrawWindow owns that (Wine/NT).
+        return tryLockWindowUpdate(hWnd) ? 1 : 0;
     };
 
     exports['SetScrollPos'] = (ctx, mem, args) => {
@@ -1752,26 +1998,34 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         }
         deferWindowPosBatches.delete(hWinPosInfo);
 
-        const dialogsToRepaint = new Set<number>();
-        for (const entry of batch) {
-            applyWindowPosGeometry(
-                entry.hWnd, entry.x, entry.y, entry.cx, entry.cy, entry.uFlags,
-                { skipDialogOverlayRepaint: true },
-            );
-            const win = windows.get(entry.hWnd);
-            if (win?.visible && win.nativeClassName === '#32770') {
-                dialogsToRepaint.add(entry.hWnd);
+        // EndDeferWindowPos is one synchronous USER transaction, but every member
+        // still receives the normal mutable WM_WINDOWPOSCHANGING -> apply ->
+        // WM_WINDOWPOSCHANGED protocol. Reuse one suspended frame and append each
+        // callback to it; bypassing this path made deferred layouts observably
+        // different from SetWindowPos.
+        let index = 0;
+        let sharedFrameId = 0;
+        let firstSuspension: any = null;
+        const advance = (): number | null => {
+            while (index < batch.length) {
+                const entry = batch[index++]!;
+                const result = setWindowPosImpl(ctx, mem, [
+                    entry.hWnd, entry.hWndInsertAfter, entry.x, entry.y,
+                    entry.cx, entry.cy, entry.uFlags,
+                ], 4, sharedFrameId, advance, frameId => { sharedFrameId = frameId; });
+                if (result && typeof result === 'object' && result.suspendedForCallback) {
+                    if (!firstSuspension) firstSuspension = result;
+                    return null;
+                }
+                if (result === null) return null;
             }
-            if (win?.isSystemControl && win.parent) {
-                dialogsToRepaint.add(win.parent);
-            }
-        }
-        for (const hwnd of dialogsToRepaint) {
-            repaintDialogOverlayIfVisible(hwnd);
-        }
+            Logger.verbose(LogCategory.USER32,
+                `EndDeferWindowPos(0x${hWinPosInfo.toString(16)}) -> TRUE`);
+            return 1;
+        };
 
-        Logger.verbose(LogCategory.USER32, `EndDeferWindowPos(0x${hWinPosInfo.toString(16)}) -> TRUE`);
-        return 1;
+        const immediate = advance();
+        return firstSuspension ?? immediate ?? 1;
     };
 
     exports['ValidateRect'] = (ctx, mem, args) => {
@@ -1825,7 +2079,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         const RDW_ALLCHILDREN = 0x0080;
         const RDW_UPDATENOW = 0x0100;
 
-        Logger.log(LogCategory.USER32,
+        Logger.verbose(LogCategory.USER32,
             `RedrawWindow(0x${hWnd.toString(16)} flags=0x${flags.toString(16)})`);
 
         // HL launcher (FUN_00425310): RedrawWindow(hwnd, NULL, NULL, 0x180) after btns_main.bmp load.
@@ -2037,9 +2291,72 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
 
     registerWindowQueryExports(exports);
     registerWindowPropExports(exports);
-    registerWindowGeometryExports(exports, { repaintParentDialogIfSystemControlGeometryChanged });
+    registerWindowGeometryExports(exports, {
+        repaintParentDialogIfSystemControlGeometryChanged,
+        applyWindowPlacement: (ctx, mem, hWnd, showCmd, normalRect) => {
+            let placementFrameId = 0;
+            const showPlacement = (): number | null => {
+                const shown = showWindowImpl(ctx, hWnd, showCmd, 8, 1, placementFrameId);
+                return shown && typeof shown === 'object' && shown.suspendedForCallback
+                    ? null
+                    : 1;
+            };
+            if (!normalRect) return showWindowImpl(ctx, hWnd, showCmd, 8, 1);
+            const win = windows.get(hWnd);
+            if (!win) return 0;
+            const placementParent = win.parent ? windows.get(win.parent) : undefined;
+            const parentOrigin = placementParent
+                ? getAbsoluteWindowPosition(placementParent)
+                : { x: 0, y: 0 };
+            return setWindowPosImpl(ctx, mem, [
+                hWnd,
+                0,
+                normalRect.left - parentOrigin.x,
+                normalRect.top - parentOrigin.y,
+                Math.max(0, normalRect.right - normalRect.left),
+                Math.max(0, normalRect.bottom - normalRect.top),
+                0x0004 /* SWP_NOZORDER */ | 0x0010 /* SWP_NOACTIVATE */,
+            ], 8, 0, showPlacement, frameId => { placementFrameId = frameId; });
+        },
+    });
     registerWindowDrawingExports(exports);
 
 
     return exports;
+}
+
+/** Hot launcher-loop reads/no-ops that do not need argument marshaling or a boundary per call. */
+export function registerFastPathWindowFunctions(dispatcher: any): void {
+    if (!dispatcher || typeof dispatcher.registerFastPath !== 'function') return;
+
+    const getForeground: FastPathImplementation = () =>
+        System.getInstance().windowManager.getForegroundHwnd();
+
+    const showCursor: FastPathImplementation = (cpu: any, _mem8: Uint8Array, _mem32: Uint32Array, view: DataView) => {
+        const esp = cpu.reg32[4] >>> 0;
+        const beforeVisible = isGuestCursorVisible();
+        const next = updateCursorDisplayCount(view.getUint32(esp + 4, true) !== 0 ? 1 : -1);
+        if (beforeVisible !== isGuestCursorVisible()) syncHostCursorToGuestState();
+        return next;
+    };
+
+    const showWindowNoop: FastPathImplementation = (cpu: any, _mem8: Uint8Array, _mem32: Uint32Array, view: DataView) => {
+        const esp = cpu.reg32[4] >>> 0;
+        const hwnd = view.getUint32(esp + 4, true);
+        const cmd = view.getInt32(esp + 8, true);
+        const win = windows.get(hwnd);
+        if (!win) return null;
+        const visible = (win.style & 0x10000000) !== 0;
+        if (cmd === 0 && !visible) return 0;
+        if (cmd === 5 && visible) return 1;
+        // NT xxxShowWindow returns immediately for SW_SHOWNORMAL/SW_RESTORE when
+        // an already-visible window is neither minimized nor maximized.
+        if ((cmd === 1 || cmd === 9) && visible
+            && (win.style & (0x20000000 | 0x01000000)) === 0) return 1;
+        return null;
+    };
+
+    dispatcher.registerFastPath('user32', 'GetForegroundWindow', getForeground, { trivial: true });
+    dispatcher.registerFastPath('user32', 'ShowCursor', showCursor, { trivial: true });
+    dispatcher.registerFastPath('user32', 'ShowWindow', showWindowNoop, { trivial: true });
 }

@@ -12,14 +12,15 @@ import { Mem } from '../../core/memory/mem-accessor';
 import { registerDialogItemExports } from './dialog-items';
 import { registerMessageBoxExports } from './dialog-messagebox';
 import { System } from '../../core/system';
-import { WindowInfo, windows, controlImageHandles, getAbsoluteWindowPosition, assignPendingClientMessage, killWindowTimers, finalizeWindowDestroy, buttonCheckStates, findChildByControlId } from './shared-state';
+import { WindowInfo, windows, controlImageHandles, getAbsoluteWindowPosition, getVirtualScreenRect, killWindowTimers, finalizeWindowDestroy, buttonCheckStates, findChildByControlId, isEffectivelyVisible } from './shared-state';
+import { validateWindow } from './paint-region';
 import { WH_CBT, HCBT_CREATEWND, getHooksOfType } from './hooks';
 import { parseDlgTemplate, dluToPixelX, dluToPixelY, getDialogBaseUnits, logDlgTemplateDump, ParsedDlgTemplate } from './dialog-template';
 import { findResourceInPE } from '../../modules/kernel32/resource';
 import { loadBitmapFromPeResource, parseResourceNameFromTitle } from '../kernel32/bitmap-extractor';
 import { loadIconFromPeResource } from '../kernel32/icon-extractor';
 import { isGroupBoxSystemControl, hitTestSystemControlAtClient } from './controls';
-import { handleSystemControlMouseAtScreen, resetControlInteractionState } from './control-interaction';
+import { handleSystemControlMouseAtScreen, resetControlInteractionState, takePendingControlNotification } from './control-interaction';
 import { noteDialogOverlayCandidate, resolveMouseTargetHwnd, eraseDialogOverlay, registerOverlayPaintRepair } from './dialog-overlay';
 import { paintDialogToOverlay, finalizeDialogPaint, repaintDialogOverlayIfVisible, repaintDialogAfterContentChange } from './dialog-paint';
 import { handleSystemControlMessage, applyStaticSetImageAutoSize, isContentChangingMessage } from './dialog-control-messages';
@@ -110,6 +111,9 @@ const WS_GROUP = 0x00020000;
 const WS_EX_CLIENTEDGE = 0x00000200;
 const WS_EX_NOPARENTNOTIFY = 0x00000004;
 
+const DS_CENTER = 0x0800;
+const DS_CENTERMOUSE = 0x1000;
+
 /**
  * Wine dialog.c gates the "try to fit it into the desktop" nudge on
  * `!(style & WS_CHILD)` (DS_CENTER still applies to a child). A WS_CHILD dialog —
@@ -119,6 +123,47 @@ const WS_EX_NOPARENTNOTIFY = 0x00000004;
  */
 function isChildDialogStyle(style: number): boolean {
     return ((style >>> 0) & WS_CHILD) !== 0;
+}
+
+/**
+ * Wine/NT dialog placement: DS_CENTER / DS_CENTERMOUSE, else template coords; then
+ * for non-WS_CHILD, clamp into the work area (shift — never invent a re-center on overflow).
+ */
+function placeDialogWindow(
+    style: number,
+    templateX: number,
+    templateY: number,
+    width: number,
+    height: number,
+): { x: number; y: number } {
+    const screen = getVirtualScreenRect();
+    const workLeft = screen.left;
+    const workTop = screen.top;
+    const workRight = screen.right;
+    const workBottom = screen.bottom;
+    const workW = Math.max(1, workRight - workLeft);
+    const workH = Math.max(1, workBottom - workTop);
+
+    let x = templateX;
+    let y = templateY;
+    if ((style & DS_CENTER) !== 0) {
+        x = workLeft + Math.max(0, Math.floor((workW - width) / 2));
+        y = workTop + Math.max(0, Math.floor((workH - height) / 2));
+    } else if ((style & DS_CENTERMOUSE) !== 0) {
+        const mouse = System.getInstance().inputManager.getMouseState();
+        x = (mouse.x | 0) - Math.floor(width / 2);
+        y = (mouse.y | 0) - Math.floor(height / 2);
+    }
+
+    if (!isChildDialogStyle(style)) {
+        // Wine dialog.c: pull back into the desktop work area (SM_CX/CYDLGFRAME ignored —
+        // our virtual screen is the whole guest desktop).
+        if (x + width > workRight) x = workRight - width;
+        if (y + height > workBottom) y = workBottom - height;
+        if (x < workLeft) x = workLeft;
+        if (y < workTop) y = workTop;
+    }
+    return { x, y };
 }
 
 type DestroyAction = {
@@ -300,7 +345,19 @@ function resolveModalOwner(owner: number): number {
 }
 
 /** Wine IsDialogMessage VK_RETURN / DM_GETDEFID path. */
-function postDialogDefaultCommand(hDlg: number): void {
+let pendingDialogCommand: { hwnd: number; wParam: number; lParam: number } | null = null;
+
+function queueDialogCommand(hwnd: number, wParam: number, lParam: number): void {
+    pendingDialogCommand = { hwnd, wParam: wParam >>> 0, lParam: lParam >>> 0 };
+}
+
+function takePendingDialogCommand(): { hwnd: number; wParam: number; lParam: number } | null {
+    const command = pendingDialogCommand;
+    pendingDialogCommand = null;
+    return command;
+}
+
+function queueDialogDefaultCommand(hDlg: number): void {
     const system = System.getInstance();
     const focus = system.windowManager.getFocusHwnd();
     const focusWin = focus ? windows.get(focus) : undefined;
@@ -308,8 +365,7 @@ function postDialogDefaultCommand(hDlg: number): void {
         const className = (focusWin.systemControlClass ?? focusWin.nativeClassName ?? '').toLowerCase();
         if (className === 'button' && (focusWin.style & BS_TYPEMASK) === BS_DEFPUSHBUTTON) {
             const id = focusWin.controlId ?? 0;
-            system.windowManager.postMessage(
-                hDlg, WM_COMMAND, (id & 0xFFFF) | (BN_CLICKED << 16), focus);
+            queueDialogCommand(hDlg, (id & 0xFFFF) | (BN_CLICKED << 16), focus);
             return;
         }
     }
@@ -318,15 +374,13 @@ function postDialogDefaultCommand(hDlg: number): void {
     if (defId) {
         const defChild = findChildByControlId(hDlg, defId);
         if (!defChild || isVisibleEnabledControl(defChild)) {
-            system.windowManager.postMessage(
-                hDlg, WM_COMMAND, (defId & 0xFFFF) | (BN_CLICKED << 16), defChild?.handle ?? 0);
+            queueDialogCommand(hDlg, (defId & 0xFFFF) | (BN_CLICKED << 16), defChild?.handle ?? 0);
             return;
         }
     }
 
     const ok = findChildByControlId(hDlg, IDOK);
-    system.windowManager.postMessage(
-        hDlg, WM_COMMAND, IDOK | (BN_CLICKED << 16), ok?.handle ?? 0);
+    queueDialogCommand(hDlg, IDOK | (BN_CLICKED << 16), ok?.handle ?? 0);
 }
 
 /**
@@ -348,13 +402,12 @@ function handleDialogKeyMessage(hDlg: number, message: number, wParam: number): 
 
     if (wParam === VK_ESCAPE || wParam === VK_CANCEL) {
         const cancel = findChildByControlId(hDlg, IDCANCEL);
-        system.windowManager.postMessage(
-            hDlg, WM_COMMAND, IDCANCEL | (BN_CLICKED << 16), cancel?.handle ?? 0);
+        queueDialogCommand(hDlg, IDCANCEL | (BN_CLICKED << 16), cancel?.handle ?? 0);
         return true;
     }
 
     if (wParam === VK_RETURN) {
-        postDialogDefaultCommand(hDlg);
+        queueDialogDefaultCommand(hDlg);
         return true;
     }
 
@@ -371,8 +424,8 @@ function handleDialogKeyMessage(hDlg: number, message: number, wParam: number): 
                 && (nextWin.style & BS_TYPEMASK) === BS_AUTORADIOBUTTON
                 && (buttonCheckStates.get(next) ?? 0) !== BST_CHECKED) {
                 // Wine: BM_CLICK on autoradio when arrowing into an unchecked one.
-                system.windowManager.postMessage(
-                    hDlg, WM_COMMAND,
+                queueDialogCommand(
+                    hDlg,
                     ((nextWin.controlId ?? 0) & 0xFFFF) | (BN_CLICKED << 16),
                     next);
             }
@@ -381,13 +434,6 @@ function handleDialogKeyMessage(hDlg: number, message: number, wParam: number): 
     }
 
     return false;
-}
-
-/** SS_BITMAP statics are finalized during WM_INITDIALOG; painting before init flickers. */
-function shouldDeferInitialDialogPaint(parsed: ParsedDlgTemplate | null, _dialogInfo: WindowInfo): boolean {
-    if (!parsed) return false;
-    return parsed.controls.some((c) =>
-        c.className.toLowerCase() === 'static' && (c.style & SS_TYPEMASK) === SS_BITMAP);
 }
 
 /**
@@ -539,7 +585,7 @@ function hitTestSystemControlRecursive(
     if (!win || !win.visible || !win.children.length) return undefined;
 
     // Reverse order: last child is treated as topmost.
-    for (let i = win.children.length - 1; i >= 0; i--) {
+    for (let i = 0; i < win.children.length; i++) {
         const child = windows.get(win.children[i]);
         if (!child || !child.visible) continue;
 
@@ -644,21 +690,22 @@ function runModalDialog(
     const dlgHeight = parsed ? dluToPixelY(parsed.cy, base) : 300;
     const dialogFont = createDialogTemplateFont(parsed);
 
-    // Center dialog on screen if DS_CENTER (0x0800) is set, or if it extends beyond screen bounds
-    const DS_CENTER = 0x0800;
     const screen = EmulatorConfig.getInstance().screenResolution;
     let dlgX: number, dlgY: number;
     if (parsed) {
-        dlgX = dluToPixelX(parsed.x, base);
-        dlgY = dluToPixelY(parsed.y, base);
-        const needsCenter = (dlgStyle & DS_CENTER) !== 0
-            || (!isChildDialogStyle(dlgStyle)
-                && (dlgX + dlgWidth > screen.width || dlgY + dlgHeight > screen.height));
-        if (needsCenter) {
-            dlgX = Math.max(0, Math.floor((screen.width - dlgWidth) / 2));
-            dlgY = Math.max(0, Math.floor((screen.height - dlgHeight) / 2));
+        const placed = placeDialogWindow(
+            dlgStyle,
+            dluToPixelX(parsed.x, base),
+            dluToPixelY(parsed.y, base),
+            dlgWidth,
+            dlgHeight,
+        );
+        dlgX = placed.x;
+        dlgY = placed.y;
+        if ((dlgStyle & (DS_CENTER | DS_CENTERMOUSE)) !== 0) {
             Logger.log(LogCategory.USER32,
-                `${label}: Centering dialog (${dlgWidth}x${dlgHeight}) on screen (${screen.width}x${screen.height}) -> pos (${dlgX},${dlgY})`);
+                `${label}: dialog (${dlgWidth}x${dlgHeight}) placed at (${dlgX},${dlgY}) ` +
+                `style=0x${(dlgStyle >>> 0).toString(16)}`);
         }
     } else {
         dlgX = 0;
@@ -741,11 +788,7 @@ function runModalDialog(
         createDialogChildren(system, dialogHwnd, dialogInfo, parsed, hInstance || 0x400000);
     }
 
-    assignPendingClientMessage(dialogInfo);
     noteDialogOverlayCandidate(dialogInfo);
-    if (!shouldDeferInitialDialogPaint(parsed, dialogInfo)) {
-        paintDialogToOverlay(dialogHwnd, 'full');
-    }
 
     Logger.log(LogCategory.USER32,
         `${label}: created modal dialog hwnd=0x${dialogHwnd.toString(16)} ` +
@@ -882,6 +925,35 @@ function runModalDialog(
     // Dequeues one dialog message and dispatches it (or yields for 8 ms if idle).
     // -------------------------------------------------------------------------
     let pumpIterations = 0;
+    let pumpCompleteThunk: (_ret: number) => number | null;
+
+    const dispatchPendingControlNotification = (): boolean => {
+        const control = takePendingControlNotification();
+        const dialog = takePendingDialogCommand();
+        const notification = control ?? (dialog ? {
+            hwnd: dialog.hwnd,
+            msg: WM_COMMAND,
+            wParam: dialog.wParam,
+            lParam: dialog.lParam,
+        } : null);
+        if (!notification) return false;
+        const parent = windows.get(notification.hwnd);
+        const wndProc = notification.hwnd === dialogHwnd
+            ? lpDialogFunc
+            : (parent?.wndProc ?? 0);
+        if (!wndProc || isSentinelWndProc(wndProc)) return false;
+        const result = callbackManager.invokeCallback(
+            wndProc,
+            [notification.hwnd, notification.msg, notification.wParam, notification.lParam],
+            0,
+            pumpCompleteThunk,
+            false,
+            `${label}:control-notify`,
+            frameId,
+        );
+        return result.callbackId !== 0;
+    };
+
     const pumpStep = (): void => {
         pumpIterations++;
         const dialog = activeDialogs.get(dialogHwnd);
@@ -919,8 +991,15 @@ function runModalDialog(
             `isSysCtrl=${!!targetInfo?.isSystemControl} wndProc=0x${(targetInfo?.wndProc ?? 0).toString(16)}`,
         );
 
+        if (message === WM_PAINT && targetInfo && !isEffectivelyVisible(targetInfo)) {
+            validateWindow(hwnd, null);
+            setTimeout(pumpStep, 0);
+            return;
+        }
+
         // --- IsDialogMessage equivalent: Tab / Enter-via-DEFID / Esc / arrows ---
         if (handleDialogKeyMessage(dialogHwnd, message, wParam)) {
+            if (dispatchPendingControlNotification()) return;
             setTimeout(pumpStep, 0);
             return;
         }
@@ -934,6 +1013,7 @@ function runModalDialog(
             const { x: screenX, y: screenY } = clientLParamToScreen(hwnd, lParam);
             const { x: dlgClientX, y: dlgClientY } = screenToDialogClient(dialogHwnd, screenX, screenY);
             if (dispatchSystemControlClick(label, dialogHwnd, message, wParam, screenX, screenY)) {
+                if (dispatchPendingControlNotification()) return;
                 setTimeout(pumpStep, 0);
                 return;
             }
@@ -969,6 +1049,7 @@ function runModalDialog(
         if ((message === WM_LBUTTONDOWN || message === WM_LBUTTONUP) && !targetInfo?.isSystemControl) {
             const { x: screenX, y: screenY } = clientLParamToScreen(hwnd, lParam);
             if (dispatchSystemControlClick(label, dialogHwnd, message, wParam, screenX, screenY)) {
+                if (dispatchPendingControlNotification()) return;
                 setTimeout(pumpStep, 0);
                 return;
             }
@@ -984,6 +1065,7 @@ function runModalDialog(
             if (message === WM_LBUTTONDOWN || message === WM_LBUTTONUP) {
                 const { x: screenX, y: screenY } = clientLParamToScreen(hwnd, lParam);
                 dispatchSystemControlClick(label, dialogHwnd, message, wParam, screenX, screenY);
+                if (dispatchPendingControlNotification()) return;
             } else {
                 // Route other messages to the JS system control handler
                 const mem8 = system.process?.v86?.mem8 ?? system.process?.v86?.v86?.cpu?.mem8;
@@ -1045,7 +1127,7 @@ function runModalDialog(
     // Returns null -> keep frame alive, CPU parks at spin loop, pumpStep reschedules.
     // Returns number -> frame restoration fires, dialog returns to game caller.
     // -------------------------------------------------------------------------
-    const pumpCompleteThunk = (_ret: number): number | null => {
+    pumpCompleteThunk = (_ret: number): number | null => {
         const dialog = activeDialogs.get(dialogHwnd);
         if (!dialog || dialog.closed) {
             return completeClosedDialog(dialog ? 'EndDialog' : 'missing-dialog');
@@ -1128,8 +1210,6 @@ function runModalDialog(
         // window.dbg.waitForEvent('dialogShow') + window.dbg.dlgClick(...).
         emitDialogShow(dialogHwnd);
 
-        const dialogWin = windows.get(dialogHwnd);
-        if (dialogWin) assignPendingClientMessage(dialogWin);
         finalizeDialogPaint(dialogHwnd);
         system.windowManager.postMessage(dialogHwnd, 0x000f /* WM_PAINT */, 0, 0);
 
@@ -1207,20 +1287,17 @@ function createModelessDialog(
     const dlgHeight = parsed ? dluToPixelY(parsed.cy, base) : 300;
     const dialogFont = createDialogTemplateFont(parsed);
 
-    // Center dialog on screen if DS_CENTER (0x0800) is set, or if it extends beyond screen bounds
-    const DS_CENTER_M = 0x0800;
-    const screenM = EmulatorConfig.getInstance().screenResolution;
     let dlgX: number, dlgY: number;
     if (parsed) {
-        dlgX = dluToPixelX(parsed.x, base);
-        dlgY = dluToPixelY(parsed.y, base);
-        const needsCenter = (dlgStyle & DS_CENTER_M) !== 0
-            || (!isChildDialogStyle(dlgStyle)
-                && (dlgX + dlgWidth > screenM.width || dlgY + dlgHeight > screenM.height));
-        if (needsCenter) {
-            dlgX = Math.max(0, Math.floor((screenM.width - dlgWidth) / 2));
-            dlgY = Math.max(0, Math.floor((screenM.height - dlgHeight) / 2));
-        }
+        const placed = placeDialogWindow(
+            dlgStyle,
+            dluToPixelX(parsed.x, base),
+            dluToPixelY(parsed.y, base),
+            dlgWidth,
+            dlgHeight,
+        );
+        dlgX = placed.x;
+        dlgY = placed.y;
     } else {
         dlgX = 0;
         dlgY = 0;
@@ -1246,7 +1323,6 @@ function createModelessDialog(
         dlgX, dlgY, dlgWidth, dlgHeight,
         hWndParent, 0, hInstance, 0
     );
-
     const windowInfo: WindowInfo = {
         handle: hwnd,
         title: dlgTitle,
@@ -1284,13 +1360,7 @@ function createModelessDialog(
     }
     const initFocusHwnd = getInitialDialogFocus(hwnd);
 
-    assignPendingClientMessage(windowInfo);
     noteDialogOverlayCandidate(windowInfo);
-    // Only paint if created visible; a hidden modeless dialog paints when ShowWindow
-    // makes it visible (WM_PAINT is posted there).
-    if (templateVisible && !shouldDeferInitialDialogPaint(parsed, windowInfo)) {
-        paintDialogToOverlay(hwnd, 'full');
-    }
 
     Logger.log(LogCategory.USER32,
         `${label}: created dialog hwnd=0x${hwnd.toString(16)} ${dlgWidth}x${dlgHeight} ` +
@@ -1415,7 +1485,6 @@ function createModelessDialog(
                 activateOwnedDialog(hwnd);
             }
 
-            assignPendingClientMessage(windowInfo);
             finalizeDialogPaint(hwnd);
             return hwnd;
         };
@@ -1709,7 +1778,34 @@ export function createDialogExports(): Record<string, ThunkImplementation> {
 
         // Keyboard navigation / default / cancel — consume (caller must not Dispatch).
         if (handleDialogKeyMessage(hDlg, message, wParam)) {
-            System.getInstance().scheduler.wakeMessageWaiters();
+            const command = takePendingDialogCommand();
+            const wndProc = windows.get(hDlg)?.wndProc ?? 0;
+            const callbackManager = System.getInstance().process?.dispatcher?.callbackManager;
+            if (command && wndProc && !isSentinelWndProc(wndProc) && callbackManager) {
+                const thunkReturnAddr = Mem.readUint32(ctx.esp) ?? 0;
+                const frameId = callbackManager.saveSuspendedThunkContext(
+                    { ...ctx, returnAddr: thunkReturnAddr }, 8, 'IsDialogMessage');
+                if (frameId) {
+                    const invoked = callbackManager.invokeCallback(
+                        wndProc,
+                        [command.hwnd, WM_COMMAND, command.wParam, command.lParam],
+                        0,
+                        () => 1,
+                        false,
+                        'IsDialogMessage:WM_COMMAND',
+                        frameId,
+                    );
+                    if (invoked.callbackId) {
+                        return {
+                            value: 1,
+                            suspendedForCallback: true,
+                            callbackId: invoked.callbackId,
+                            stackCleanup: 8,
+                            skipStackCheck: true,
+                        };
+                    }
+                }
+            }
             return 1;
         }
 
@@ -1854,4 +1950,3 @@ export function createDialogExports(): Record<string, ThunkImplementation> {
 export function isSentinelWndProc(wndProc: number): boolean {
     return (wndProc & 0xFFFF0000) === 0xFFFF0000;
 }
-

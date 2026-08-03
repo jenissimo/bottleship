@@ -27,7 +27,6 @@ export const G = {
     fpu_control_word: 1036, // :65
     fpu_status_word: 1040,  // :66
     fpu_st: 1152,           // :75
-    fastmem_generation: 1280, // :78
 };
 export const reg32Offset = (i) => G.reg32 + i * 4;
 

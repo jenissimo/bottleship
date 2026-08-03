@@ -4,13 +4,13 @@
  * Atomic implementation for input operations
  */
 
-import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
+import { FastPathImplementation, ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { Mem } from '../../core/memory/mem-accessor';
 import { Marshaler } from '../../core/memory/marshaler';
 import { System } from '../../core/system';
 import {
-    clampToCursorClip, getCapture, getVirtualScreenRect, setCursorClipRect, warpGuestCursorTo, windows,
+    clampToCursorClip, getCapture, getCursorClipRect, getVirtualScreenRect, setCursorClipRect, warpGuestCursorTo, windows,
     getWindowByHandle,
 } from './shared-state';
 import { GUEST_INPUT_FLAG } from '../../../input/sab-layout';
@@ -660,4 +660,30 @@ export function createInputExports(): Record<string, ThunkImplementation> {
     };
 
     return exports;
+}
+
+/** Fast no-op path for the identical ClipCursor rect reasserted by launcher idle loops. */
+export function registerFastPathInputFunctions(dispatcher: any): void {
+    if (!dispatcher || typeof dispatcher.registerFastPath !== 'function') return;
+    const clipCursorNoop: FastPathImplementation = (cpu: any, mem8: Uint8Array, _mem32: Uint32Array, view: DataView) => {
+        const esp = cpu.reg32[4] >>> 0;
+        const ptr = view.getUint32(esp + 4, true);
+        const current = getCursorClipRect();
+        if (!ptr) return current === null ? 1 : null;
+        if (ptr + 16 > mem8.length) return 0;
+        const left = view.getInt32(ptr, true);
+        const top = view.getInt32(ptr + 4, true);
+        const right = view.getInt32(ptr + 8, true);
+        const bottom = view.getInt32(ptr + 12, true);
+        if (left > right || top > bottom) return 0;
+        const screen = getVirtualScreenRect();
+        const clipped = {
+            left: Math.max(left, screen.left), top: Math.max(top, screen.top),
+            right: Math.min(right, screen.right), bottom: Math.min(bottom, screen.bottom),
+        };
+        const next = clipped.left > clipped.right || clipped.top > clipped.bottom ? screen : clipped;
+        return current && current.left === next.left && current.top === next.top
+            && current.right === next.right && current.bottom === next.bottom ? 1 : null;
+    };
+    dispatcher.registerFastPath('user32', 'ClipCursor', clipCursorNoop, { trivial: true });
 }

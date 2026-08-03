@@ -32,17 +32,13 @@ export class PreemptionManager {
      *  or globalThis.DISABLE_JIT_DEAD_FLAG_ELISION before first v86 boot. */
     private deadFlagElisionEnabled = true;
 
-    /** Fastmem-wave, default ON. All three re-applied per v86 init.
-     *  Kill-switches: setFastmemReads/setX87Locals/setPushRunCoalescing(false) or the
+    /** Retired read-fastmem is unavailable. All remaining choices are re-applied per v86 init.
+     *  Kill-switches: setX87Locals/setPushRunCoalescing(false) or the
      *  dbg.*(false) verbs (which route through these setters, so the choice survives a
-     *  game reload). fastmem carries the read relaxation + its own thrash auto-latch.
+     *  game reload). The read map preserves #PF semantics per page.
      *  x87-locals is a no-op under strict/PC=24 FPU (codegen self-gates). */
-    private fastmemReadsEnabled = true;         // config idx 9
-    private fastmemReadSplitEnabled = true;     // config idx 18 (split-range read shape)
-    /** idx 10 — measured NEUTRAL on FP-heavy code (nbench FOURIER +0.2 %, LU −0.9 %: both
-     *  inside the noise floor), so it is kept ON for the shapes it was written for rather
-     *  than re-litigated per title. */
-    private x87LocalsEnabled = true;            // config idx 10
+    /** idx 10 — default OFF until representative FP scenes clear the decision gate. */
+    private x87LocalsEnabled = false;           // config idx 10
     private pushRunCoalescingEnabled = true;    // config idx 11
 
     /** Fastmem WRITES behind the per-page writability map (config idx 19).
@@ -131,11 +127,20 @@ export class PreemptionManager {
     /** Current desired relaxed-FPU state (the single authority). */
     isRelaxedFpuEnabled(): boolean { return this.relaxedFpuEnabled; }
 
+    private applyJitConfig(ex: any, index: number, value: number): boolean {
+        if (typeof ex?.set_jit_config !== "function") return false;
+        const status = ex.set_jit_config(index >>> 0, value >>> 0);
+        if (status !== 0) {
+            throw new Error(`set_jit_config(${index}, ${value}) failed with status ${status}`);
+        }
+        return true;
+    }
+
     /** JIT dead-flag elision — authoritative toggle (survives game reload). */
     setDeadFlagElision(on: boolean): void {
         this.deadFlagElisionEnabled = on;
         const ex = this.wasmExports;
-        if (ex?.set_jit_config) ex.set_jit_config(5, on ? 1 : 0);
+        this.applyJitConfig(ex, 5, on ? 1 : 0);
         if (ex?.jit_clear_cache_js) ex.jit_clear_cache_js();
     }
 
@@ -144,32 +149,13 @@ export class PreemptionManager {
     /** Fastmem-wave authoritative toggles (survive game reload). Each stores the
      *  desired state (re-applied on next v86 init) AND applies live + clears the JIT
      *  cache so affected blocks recompile. */
-    setFastmemReads(on: boolean): void {
-        this.fastmemReadsEnabled = on;
-        const ex = this.wasmExports;
-        if (ex?.set_jit_config) ex.set_jit_config(9, on ? 1 : 0);
-        if (ex?.jit_clear_cache_js) ex.jit_clear_cache_js();
-    }
-    isFastmemReadsEnabled(): boolean { return this.fastmemReadsEnabled; }
-
-    /** Split-range fastmem read shape (config idx 18). Same acceptance set as
-     *  the legacy 4-compare shape, decomposed into two early-exit range tests (~25 → ~10
-     *  wasm ops on the hot below-guard read). OFF = legacy shape, for A/B. */
-    setFastmemReadSplit(on: boolean): void {
-        this.fastmemReadSplitEnabled = on;
-        const ex = this.wasmExports;
-        if (ex?.set_jit_config) ex.set_jit_config(18, on ? 1 : 0);
-        if (ex?.jit_clear_cache_js) ex.jit_clear_cache_js();
-    }
-    isFastmemReadSplitEnabled(): boolean { return this.fastmemReadSplitEnabled; }
-
     /** Fastmem writes (config idx 19). Authoritative toggle (survives
      *  game reload). The CALLER (dbg.fastmemWrites) must rebuild the write map before
      *  enabling — this only flips the flag + clears the JIT cache so stores recompile. */
     setFastmemWrites(on: boolean): void {
         this.fastmemWritesEnabled = on;
         const ex = this.wasmExports;
-        if (ex?.set_jit_config) ex.set_jit_config(19, on ? 1 : 0);
+        this.applyJitConfig(ex, 19, on ? 1 : 0);
         if (ex?.jit_clear_cache_js) ex.jit_clear_cache_js();
     }
     isFastmemWritesEnabled(): boolean { return this.fastmemWritesEnabled; }
@@ -179,7 +165,7 @@ export class PreemptionManager {
     setFlagLocals(on: boolean): void {
         this.flagLocalsEnabled = on;
         const ex = this.wasmExports;
-        if (ex?.set_jit_config) ex.set_jit_config(21, on ? 1 : 0);
+        this.applyJitConfig(ex, 21, on ? 1 : 0);
         if (ex?.jit_clear_cache_js) ex.jit_clear_cache_js();
     }
     isFlagLocalsEnabled(): boolean { return this.flagLocalsEnabled; }
@@ -189,7 +175,7 @@ export class PreemptionManager {
     setBranchHints(mask: number): void {
         this.branchHintMask = mask >>> 0;
         const ex = this.wasmExports;
-        if (ex?.set_jit_config) ex.set_jit_config(22, this.branchHintMask);
+        this.applyJitConfig(ex, 22, this.branchHintMask);
         if (ex?.jit_clear_cache_js) ex.jit_clear_cache_js();
     }
     getBranchHintMask(): number { return this.branchHintMask; }
@@ -197,7 +183,7 @@ export class PreemptionManager {
     setX87Locals(on: boolean): void {
         this.x87LocalsEnabled = on;
         const ex = this.wasmExports;
-        if (ex?.set_jit_config) ex.set_jit_config(10, on ? 1 : 0);
+        this.applyJitConfig(ex, 10, on ? 1 : 0);
         if (ex?.jit_clear_cache_js) ex.jit_clear_cache_js();
     }
     isX87LocalsEnabled(): boolean { return this.x87LocalsEnabled; }
@@ -205,7 +191,7 @@ export class PreemptionManager {
     setPushRunCoalescing(on: boolean): void {
         this.pushRunCoalescingEnabled = on;
         const ex = this.wasmExports;
-        if (ex?.set_jit_config) ex.set_jit_config(11, on ? 1 : 0);
+        this.applyJitConfig(ex, 11, on ? 1 : 0);
         if (ex?.jit_clear_cache_js) ex.jit_clear_cache_js();
     }
     isPushRunCoalescingEnabled(): boolean { return this.pushRunCoalescingEnabled; }
@@ -213,7 +199,7 @@ export class PreemptionManager {
     setRetChaining(on: boolean): void {
         this.retChainingEnabled = on;
         const ex = this.wasmExports;
-        if (ex?.set_jit_config) ex.set_jit_config(12, on ? 1 : 0);
+        this.applyJitConfig(ex, 12, on ? 1 : 0);
         if (ex?.jit_clear_cache_js) ex.jit_clear_cache_js();
     }
     isRetChainingEnabled(): boolean { return this.retChainingEnabled; }
@@ -221,7 +207,7 @@ export class PreemptionManager {
     setRetSpeculation(on: boolean): void {
         this.retSpeculationEnabled = on;
         const ex = this.wasmExports;
-        if (ex?.set_jit_config) ex.set_jit_config(13, on ? 1 : 0);
+        this.applyJitConfig(ex, 13, on ? 1 : 0);
         if (ex?.jit_clear_cache_js) ex.jit_clear_cache_js();
     }
     isRetSpeculationEnabled(): boolean { return this.retSpeculationEnabled; }
@@ -231,7 +217,7 @@ export class PreemptionManager {
     setTier2Threshold(threshold: number): void {
         this.tier2Threshold = threshold >>> 0;
         const ex = this.wasmExports;
-        if (ex?.set_jit_config) ex.set_jit_config(15, this.tier2Threshold);
+        this.applyJitConfig(ex, 15, this.tier2Threshold);
     }
     getTier2Threshold(): number { return this.tier2Threshold; }
 
@@ -272,38 +258,36 @@ export class PreemptionManager {
         }
 
         if (this.wasmExports.set_jit_config) {
-            this.wasmExports.set_jit_config(5, this.deadFlagElisionEnabled ? 1 : 0);
+            this.applyJitConfig(this.wasmExports, 5, this.deadFlagElisionEnabled ? 1 : 0);
             console.log(`[PERF] JIT dead-flag elision ${this.deadFlagElisionEnabled ? "enabled" : "DISABLED"}`);
 
-            // Fastmem-wave (idx 9/10/11) — default ON, re-applied per init because v86
+            // Codegen wave (idx 10/11) — re-applied per init because v86
             // resets the wasm flags to their codegen default (OFF) on every game load.
-            this.wasmExports.set_jit_config(9, this.fastmemReadsEnabled ? 1 : 0);
-            this.wasmExports.set_jit_config(10, this.x87LocalsEnabled ? 1 : 0);
-            this.wasmExports.set_jit_config(11, this.pushRunCoalescingEnabled ? 1 : 0);
-            this.wasmExports.set_jit_config(18, this.fastmemReadSplitEnabled ? 1 : 0);
+            this.applyJitConfig(this.wasmExports, 10, this.x87LocalsEnabled ? 1 : 0);
+            this.applyJitConfig(this.wasmExports, 11, this.pushRunCoalescingEnabled ? 1 : 0);
             // Fastmem-writes idx 19 — re-applied per init. Default OFF; when enabled the
             // write map is rebuilt by the enable path (dbg.fastmemWrites), not here (regions
             // may not be registered yet at v86 init). A fresh wasm instance starts with an
             // all-zero map = all-slow = safe, so re-applying the flag alone can't corrupt.
-            this.wasmExports.set_jit_config(19, this.fastmemWritesEnabled ? 1 : 0);
+            this.applyJitConfig(this.wasmExports, 19, this.fastmemWritesEnabled ? 1 : 0);
             // Flag-locals idx 21 — re-applied per init (wasm default OFF). Applied at
             // boot = cold cache, recompile free.
-            this.wasmExports.set_jit_config(21, this.flagLocalsEnabled ? 1 : 0);
+            this.applyJitConfig(this.wasmExports, 21, this.flagLocalsEnabled ? 1 : 0);
             // Branch hints idx 22 — re-applied per init (wasm default OFF). Applied at
             // boot = cold cache, so the implied re-emit is free.
-            this.wasmExports.set_jit_config(22, this.branchHintMask);
-            console.log(`[PERF] fastmem-wave: reads=${this.fastmemReadsEnabled ? "on" : "off"} x87Locals=${this.x87LocalsEnabled ? "on" : "off"} pushRun=${this.pushRunCoalescingEnabled ? "on" : "off"} readSplit=${this.fastmemReadSplitEnabled ? "on" : "off"} writes=${this.fastmemWritesEnabled ? "on" : "off"} flagLocals=${this.flagLocalsEnabled ? "on" : "off"} branchHints=${this.branchHintMask || "off"}`);
+            this.applyJitConfig(this.wasmExports, 22, this.branchHintMask);
+            console.log(`[PERF] fastmem-wave: reads=retired x87Locals=${this.x87LocalsEnabled ? "on" : "off"} pushRun=${this.pushRunCoalescingEnabled ? "on" : "off"} writes=${this.fastmemWritesEnabled ? "on" : "off"} flagLocals=${this.flagLocalsEnabled ? "on" : "off"} branchHints=${this.branchHintMask || "off"}`);
 
             // Dynamic-dispatch wave (idx 12/13) — default ON, re-applied per init (wasm
             // codegen defaults are OFF). Applied at boot = cold cache, so the implied
             // recompile is free (no mid-run cache clear).
-            this.wasmExports.set_jit_config(12, this.retChainingEnabled ? 1 : 0);
-            this.wasmExports.set_jit_config(13, this.retSpeculationEnabled ? 1 : 0);
+            this.applyJitConfig(this.wasmExports, 12, this.retChainingEnabled ? 1 : 0);
+            this.applyJitConfig(this.wasmExports, 13, this.retSpeculationEnabled ? 1 : 0);
             console.log(`[PERF] dynamic dispatch: retChain=${this.retChainingEnabled ? "on" : "off"} retSpec=${this.retSpeculationEnabled ? "on" : "off"}`);
 
             // Hotness tiering (idx 15) — re-applied every init; the TS field is the
             // authority (wasm statics reset per game load).
-            this.wasmExports.set_jit_config(15, this.tier2Threshold);
+            this.applyJitConfig(this.wasmExports, 15, this.tier2Threshold);
             console.log(`[PERF] B3 tiering: threshold=${this.tier2Threshold || "OFF"}`);
         }
 

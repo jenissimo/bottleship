@@ -10,6 +10,7 @@ import {
     handleSystemControlMouseAtScreen,
     handleSystemControlClassMouse,
     resetControlInteractionState,
+    takePendingControlNotification,
 } from "../../src/worker/modules/user32/control-interaction";
 import { windows, type WindowInfo } from "../../src/worker/modules/user32/shared-state";
 
@@ -22,6 +23,7 @@ const DIALOG = 0x1000;
 const BUTTON = 0x1001;
 
 let posted: Array<{ hwnd: number; msg: number; wParam: number }> = [];
+let capture = 0;
 
 function makeWindow(over: Partial<WindowInfo> & { handle: number }): WindowInfo {
     return {
@@ -40,6 +42,7 @@ function makeWindow(over: Partial<WindowInfo> & { handle: number }): WindowInfo 
 
 beforeEach(() => {
     posted = [];
+    capture = 0;
     windows.clear();
     resetControlInteractionState();
     windows.set(DIALOG, makeWindow({ handle: DIALOG, x: 10, y: 10, width: 200, height: 100, children: [BUTTON] }));
@@ -61,6 +64,8 @@ beforeEach(() => {
     saved = { windowManager: system.windowManager, scheduler: system.scheduler, gdiContext: system.gdiContext };
     system.windowManager = {
         setFocus: () => {},
+        setCapture: (hwnd: number) => { const previous = capture; capture = hwnd; return previous; },
+        releaseCapture: () => { const previous = capture; capture = 0; return previous; },
         postMessage: (hwnd: number, msg: number, wParam: number) => { posted.push({ hwnd, msg, wParam }); },
         getWindow: () => undefined,
     };
@@ -82,13 +87,20 @@ afterEach(() => {
 const clickButton = (msg: number): boolean =>
     handleSystemControlMouseAtScreen(DIALOG, msg, 0, 10 + 20 + 5, 10 + 20 + 5);
 
-const clicked = (): boolean =>
-    posted.some((p) => p.msg === WM_COMMAND && p.wParam === (((BN_CLICKED << 16) | 7) >>> 0));
+const clicked = (): boolean => {
+    const notification = takePendingControlNotification();
+    return !!notification
+        && notification.hwnd === DIALOG
+        && notification.msg === WM_COMMAND
+        && notification.wParam === (((BN_CLICKED << 16) | 7) >>> 0);
+};
 
 describe("system-control mouse", () => {
-    test("an ordinary button click is consumed and posts BN_CLICKED", () => {
+    test("an ordinary button captures the mouse and emits BN_CLICKED synchronously", () => {
         expect(clickButton(WM_LBUTTONDOWN)).toBe(true);
+        expect(capture).toBe(BUTTON);
         expect(clickButton(WM_LBUTTONUP)).toBe(true);
+        expect(capture).toBe(0);
         expect(clicked()).toBe(true);
     });
 

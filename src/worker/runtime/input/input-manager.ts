@@ -328,8 +328,10 @@ export class InputManager {
     private dinputMouseEvents: DInputBufferedEvent[] = [];
     private dinputMouseBufferSize = 0; // 0 = buffered mode disabled
     private dinputMouseSeq = 0;
-    private dinputPrevMouseX = 0;
-    private dinputPrevMouseY = 0;
+    /** Last SAB dinputDX/DY seen when buffering — same accum GetDeviceState uses.
+     *  Position-derived Δ dies at canvas edges / under ClipCursor; raw accum does not. */
+    private dinputPrevAccumX = 0;
+    private dinputPrevAccumY = 0;
     private dinputPrevButtons = 0;
 
     private dinputKeyboardEvents: DInputBufferedEvent[] = [];
@@ -555,7 +557,7 @@ export class InputManager {
             this.dinputWheelAccum += Math.round(-mouseWheel * 1.2);
         }
         if (this.dinputMouseBufferSize > 0) {
-            this._bufferDInputMouseEvents(mouseX, mouseY, buttons, mouseWheel);
+            this._bufferDInputMouseEvents(buttons, mouseWheel);
         }
 
         this.gamepadConnected = gamepadConnected;
@@ -745,8 +747,13 @@ export class InputManager {
         // WM_ACTIVATE synthesis here — dialog activation messages are delivered by
         // user32 (activation-messages.ts) when the dialog is created/shown.
         const anyButtonWentDown = (leftDown && !wasLeftDown) || (rightDown && !wasRightDown) || (middleDown && !wasMiddleDown);
-        if (anyButtonWentDown && mouseTargetHwnd !== this.windowManager.getActiveHwnd()) {
-            this.windowManager.setActiveWindow(mouseTargetHwnd);
+        if (anyButtonWentDown) {
+            // Activate the target's top-level ancestor rather than attempting
+            // SetActiveWindow on a WS_CHILD button (a no-op on Win32).
+            const targetTopLevel = this.windowManager.getTopLevelAncestor(mouseTargetHwnd);
+            if (targetTopLevel && targetTopLevel !== this.windowManager.getActiveHwnd()) {
+                this.windowManager.setActiveWindow(targetTopLevel);
+            }
         }
 
         // Button events are ALWAYS enqueued - they must not be lost!
@@ -1101,8 +1108,8 @@ export class InputManager {
         this.dinputWheelAccum = 0;
         this.dinputMouseEvents.length = 0;
         this.dinputMouseSeq = 0;
-        this.dinputPrevMouseX = 0;
-        this.dinputPrevMouseY = 0;
+        this.dinputPrevAccumX = 0;
+        this.dinputPrevAccumY = 0;
         this.dinputPrevButtons = 0;
         this.dinputKeyboardEvents.length = 0;
         this.dinputKeyboardBufferSize = 0;
@@ -1189,8 +1196,8 @@ export class InputManager {
                 bufferSize: this.dinputMouseBufferSize,
                 pending: this.dinputMouseEvents.length,
                 produced: this.dinputMouseSeq,
-                prevX: this.dinputPrevMouseX,
-                prevY: this.dinputPrevMouseY,
+                prevAccumX: this.dinputPrevAccumX,
+                prevAccumY: this.dinputPrevAccumY,
                 prevButtons: this.dinputPrevButtons,
                 wheelAccum: this.dinputWheelAccum,
             },
@@ -1210,7 +1217,7 @@ export class InputManager {
     }
 
     /** Buffer mouse events for DirectInput GetDeviceData. Called from poll(). */
-    private _bufferDInputMouseEvents(mouseX: number, mouseY: number, buttons: number, mouseWheel: number): void {
+    private _bufferDInputMouseEvents(buttons: number, mouseWheel: number): void {
         const ts = performance.now() | 0;
         const maxBuf = this.dinputMouseBufferSize;
         const events = this.dinputMouseEvents;
@@ -1222,11 +1229,16 @@ export class InputManager {
             this._noteDInputTrail("mouse", dwOfs, dwData, seq);
         };
 
-        // Movement deltas
-        const dx = mouseX - this.dinputPrevMouseX;
-        const dy = mouseY - this.dinputPrevMouseY;
+        // Same SAB accum as GetDeviceState — not clamped canvas position. Absolute
+        // mouseX-prev saturates at the edge and kills mouse-look under relative intent
+        // before Pointer Lock engages (and still wrong for buffered exclusive DI).
+        const accum = this.getDInputAccum();
+        const dx = (accum.x - this.dinputPrevAccumX) | 0;
+        const dy = (accum.y - this.dinputPrevAccumY) | 0;
         if (dx !== 0) pushEvent(0, dx);  // DIMOFS_X
         if (dy !== 0) pushEvent(4, dy);  // DIMOFS_Y
+        this.dinputPrevAccumX = accum.x;
+        this.dinputPrevAccumY = accum.y;
 
         // Wheel — WHEEL_DELTA units, sign flipped (browser + = down, DirectInput + = up);
         // must stay in lockstep with the poll() accumulator and WM_MOUSEWHEEL conversions.
@@ -1247,8 +1259,6 @@ export class InputManager {
             }
         }
 
-        this.dinputPrevMouseX = mouseX;
-        this.dinputPrevMouseY = mouseY;
         this.dinputPrevButtons = buttons;
     }
 
@@ -1355,11 +1365,12 @@ export class InputManager {
         this.baselineDInputMouse();
     }
 
-    /** Snapshot the current pointer so Acquire/SetProperty does not replay the absolute
-     *  cursor position as the first DIMOFS_X/Y delta — a full-screen view snap. */
+    /** Snapshot the current accum so Acquire/SetProperty does not replay motion
+     *  that happened before the buffer was armed as the first DIMOFS_X/Y delta. */
     baselineDInputMouse(): void {
-        this.dinputPrevMouseX = this.lastSabMouseX;
-        this.dinputPrevMouseY = this.lastSabMouseY;
+        const accum = this.getDInputAccum();
+        this.dinputPrevAccumX = accum.x;
+        this.dinputPrevAccumY = accum.y;
         this.dinputPrevButtons = this.currentButtons;
     }
 

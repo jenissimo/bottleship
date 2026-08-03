@@ -16,15 +16,20 @@ import { isSentinelWndProc } from './dialog';
 import { handleSystemControlMessage, isContentChangingMessage } from './dialog-control-messages';
 import { eraseControlOverlayRect, repaintDialogAfterContentChange } from './dialog-paint';
 import { handleAnimateMessage } from './animate-control';
-import { windows, buttonCheckStates, registerWindowTimerKiller, finalizeWindowDestroy, getAbsoluteWindowPosition, getWindowByHandle } from './shared-state';
+import { windows, buttonCheckStates, registerWindowTimerKiller, finalizeWindowDestroy, getAbsoluteWindowPosition, getWindowByHandle, isEffectivelyVisible } from './shared-state';
+import { validateWindow } from './paint-region';
 import { repaintChildControls, isButtonSystemControl, hitTestSystemControlAtClient } from './controls';
-import { handleSystemControlMouseAtScreen, handleSystemControlWheel } from './control-interaction';
+import { handleSystemControlMouseAtScreen, handleSystemControlWheel, takePendingControlNotification } from './control-interaction';
 import { encodeAnsi } from '../codepage-utils';
 import { paintTraceEnabled, logPaintMsgDelivered, logPaintPendingBlocked, logPaintTrace } from './paint-trace';
 import { isValidGuestEip } from '../../core/scheduler/scheduler-context';
 
 const WM_TIMER = 0x0113;
 const WM_PAINT = 0x000F;
+const USER_TIMER_MINIMUM = 10;
+
+type TimerMessage = { hwnd: number; message: number; wParam: number; lParam: number };
+let noteFastPathTimerDelivery: ((msg: TimerMessage, removed: boolean) => void) | null = null;
 
 /**
  * Synchronously invoke a window's guest WndProc via the suspended-thunk callback
@@ -39,7 +44,7 @@ const WM_PAINT = 0x000F;
  * @returns a suspended-callback ThunkResult on success, or null when no callback
  *          manager is available (caller falls back to its default return).
  */
-function invokeGuestWndProcSync(
+export function invokeGuestWndProcSync(
     ctx: X86Context,
     mem: Uint8Array,
     wndProc: number,
@@ -57,11 +62,15 @@ function invokeGuestWndProcSync(
 
     const msgView = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
     const thunkReturnAddr = msgView.getUint32(ctx.esp, true);
-    const frameId = callbackManager.saveSuspendedThunkContext(
-        { ...ctx, returnAddr: thunkReturnAddr },
-        stackCleanup,
-        tag,
-    );
+    const stubRange = callbackManager.getStubPoolRange();
+    const reusedFrame = thunkReturnAddr >= stubRange.base && thunkReturnAddr < stubRange.end;
+    const frameId = reusedFrame
+        ? callbackManager.getActiveSuspendedFrameId()
+        : callbackManager.saveSuspendedThunkContext(
+            { ...ctx, returnAddr: thunkReturnAddr },
+            stackCleanup,
+            tag,
+        );
     if (frameId === 0) {
         Logger.error(LogCategory.USER32,
             `${tag}: failed to save suspended context for msg=0x${message.toString(16)} hwnd=0x${hwnd.toString(16)}`);
@@ -89,7 +98,29 @@ function invokeGuestWndProcSync(
         callbackId: first.callbackId,
         stackCleanup,
         skipStackCheck: true,
+        preserveCallbackReturnAddress: reusedFrame,
     };
+}
+
+/** Send a message synchronously when hwnd has a guest-visible WndProc. */
+export function invokeWindowMessageSync(
+    ctx: X86Context,
+    mem: Uint8Array,
+    hwnd: number,
+    message: number,
+    wParam: number,
+    lParam: number,
+    stackCleanup: number,
+    tag: string,
+    onReturn: (wndRet: number) => number | null,
+): ThunkResult | null {
+    const win = windows.get(hwnd);
+    if (!win?.wndProc || isSentinelWndProc(win.wndProc)) return null;
+    if (win.isSystemControl && !win.wndProcSubclassed) return null;
+    return invokeGuestWndProcSync(
+        ctx, mem, win.wndProc, hwnd, message, wParam, lParam,
+        stackCleanup, tag, onReturn,
+    );
 }
 
 export function createMessageExports(): Record<string, ThunkImplementation> {
@@ -107,13 +138,12 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
     let peekCalls = 0;
     let peekHits = 0;
 
-    type TimerSkipReason = 'v86' | 'async' | 'callbackBusy';
-
     interface TimerState {
         wheelTimerId: number;
         hWnd: number;
         timerId: number;
         timerFunc: number;
+        intervalMs: number;
         pendingTicks: number;
     }
 
@@ -168,6 +198,40 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         System.getInstance().scheduler?.timerWheel.cancel(state.wheelTimerId);
     }
 
+    function armTimerState(state: TimerState): void {
+        state.wheelTimerId = System.getInstance().scheduler.timerWheel.add(
+            state.intervalMs,
+            false,
+            TimerKind.USER32_TIMER,
+            () => {
+                const system = System.getInstance();
+                if (system.isExiting || timers.get(timerKey(state.hWnd, state.timerId)) !== state) return;
+                timerDiag.ticks++;
+
+                // USER timers are synthesized messages, not periodic host callbacks.
+                // Once due, Win32 keeps one timer in the expired set and restarts it
+                // only when Get/PeekMessage removes that WM_TIMER (Wine queue.c:
+                // find_expired_timer -> restart_timer). Reposting while the previous
+                // tick is pending can leave an MFC modal loop permanently non-idle.
+                postTimerMessages(system, state, 1);
+                maybeLogTimerDiag();
+            },
+            TimeService.getInstance().nowMs(),
+        );
+    }
+
+    function restartRemovedTimer(msg: { hwnd: number; message: number; wParam: number; lParam: number }): void {
+        if (msg.message !== WM_TIMER) return;
+        const state = timers.get(timerKey(msg.hwnd, msg.wParam));
+        if (!state || state.timerFunc !== (msg.lParam >>> 0)) return;
+        armTimerState(state);
+    }
+
+    noteFastPathTimerDelivery = (msg, removed) => {
+        timerDiag.delivered++;
+        if (removed) restartRemovedTimer(msg);
+    };
+
     // Win32: DestroyWindow destroys all timers owned by that window. Called from
     // window.ts DestroyWindow via the shared-state hook. Without this, a destroyed
     // window's orphaned timer keeps posting WM_TIMER to the dead hwnd (e.g.
@@ -216,19 +280,6 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
 
     function maybeLogTimerDiag(): void {
         return;
-    }
-
-    function registerTimerSkip(state: TimerState, reason: TimerSkipReason): void {
-        if (reason === 'v86') timerDiag.skippedV86++;
-        else if (reason === 'async') timerDiag.skippedAsync++;
-        else timerDiag.skippedCallbackBusy++;
-
-        if (timerDiagConfig.queueSkippedMessageTimers) {
-            state.pendingTicks++;
-            timerDiag.pendingQueued++;
-            return;
-        }
-        timerDiag.pendingDropped++;
     }
 
     function postTimerMessages(system: System, state: TimerState, basePosts: number): void {
@@ -576,13 +627,15 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         const currentThreadId = system.scheduler.getCurrentThreadId();
         const msg = system.windowManager.peekMessage(true, wMsgFilterMin, wMsgFilterMax, currentThreadId);
         if (msg) {
+            restartRemovedTimer(msg);
             const retVal = msg.message === WM_QUIT ? 0 : 1;
             if (paintTraceEnabled) logPaintMsgDelivered('GetMessageW(sync)', msg.hwnd, msg.message, {
                 ret: retVal,
                 filterMin: wMsgFilterMin,
                 filterMax: wMsgFilterMax,
             });
-            Logger.log(LogCategory.USER32, `GetMessageW(sync): msg=0x${msg.message.toString(16)} hwnd=0x${msg.hwnd.toString(16)} -> ${retVal} thread=${currentThreadId}`);
+            Logger.verboseLazy(LogCategory.USER32, () =>
+                `GetMessageW(sync): msg=0x${msg.message.toString(16)} hwnd=0x${msg.hwnd.toString(16)} -> ${retVal} thread=${currentThreadId}`);
             if (isKeyboardHookMessage(msg.message)) {
                 // GetMessage blocking semantics vs discard-to-empty: delivering
                 // WM_NULL would be wrong, but a hook that discards is expected to
@@ -663,6 +716,8 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
                 break;
             }
 
+            restartRemovedTimer(waitMsg);
+
             // Note: Get fresh memory reference after async operation!
             const process = system.process;
             const v86 = process?.v86;
@@ -690,7 +745,8 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
                 filterMin: wMsgFilterMin,
                 filterMax: wMsgFilterMax,
             });
-            Logger.log(LogCategory.USER32, `GetMessageW(async): msg=0x${waitMsg.message.toString(16)} hwnd=0x${waitMsg.hwnd.toString(16)} -> ${retVal} thread=${currentThreadId}`);
+            Logger.verboseLazy(LogCategory.USER32, () =>
+                `GetMessageW(async): msg=0x${waitMsg.message.toString(16)} hwnd=0x${waitMsg.hwnd.toString(16)} -> ${retVal} thread=${currentThreadId}`);
 
             writeMsgToMemory(freshMem, lpMsg, waitMsg);
             return { value: retVal, stackCleanup: 16 };
@@ -779,7 +835,9 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         }
 
         if (!msg) {
-            if (paintTraceEnabled) logPaintPendingBlocked('PeekMessageW', wMsgFilterMin, wMsgFilterMax, wRemoveMsg !== 0);
+            if (paintTraceEnabled && system.windowManager.hasMessages(WM_PAINT, WM_PAINT, callerThreadId)) {
+                logPaintPendingBlocked('PeekMessageW', wMsgFilterMin, wMsgFilterMax, wRemoveMsg !== 0);
+            }
             // Queue empty — synthesize WM_QUIT if per-thread flag is set
             if (isQuitInFilterRange(wMsgFilterMin, wMsgFilterMax)) {
                 const quitState = system.scheduler.getQuitState(callerThreadId);
@@ -797,6 +855,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
 
         if (msg.message === WM_TIMER) {
             timerDiag.delivered++;
+            if (wRemoveMsg !== 0) restartRemovedTimer(msg);
         }
         if (paintTraceEnabled) logPaintMsgDelivered('PeekMessageW', msg.hwnd, msg.message, {
             remove: wRemoveMsg,
@@ -846,12 +905,22 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
             const lParam = view.getUint32(lpMsg + 12, true);
             const time = view.getUint32(lpMsg + 16, true);
 
-            Logger.log(LogCategory.USER32, `DispatchMessageW: msg=0x${message.toString(16)} hwnd=0x${hwnd.toString(16)} wParam=0x${wParam.toString(16)} lParam=0x${lParam.toString(16)}`);
+            Logger.verboseLazy(LogCategory.USER32, () =>
+                `DispatchMessageW: msg=0x${message.toString(16)} hwnd=0x${hwnd.toString(16)} wParam=0x${wParam.toString(16)} lParam=0x${lParam.toString(16)}`);
             if (paintTraceEnabled && message === WM_PAINT) {
                 logPaintTrace('DispatchMessageW', `enter hwnd=0x${hwnd.toString(16)} thread=${System.getInstance().scheduler.getCurrentThreadId()}`);
             }
             if (message === WM_TIMER) {
                 timerDiag.dispatched++;
+            }
+
+            // Posted WM_PAINT is suppressed once the window (or an ancestor) is
+            // hidden. A stale paint queued before a page switch must not resurrect
+            // that page's owner-draw controls on the shared overlay.
+            const paintWindow = message === WM_PAINT ? windows.get(hwnd) : undefined;
+            if (paintWindow && !isEffectivelyVisible(paintWindow)) {
+                validateWindow(hwnd, null);
+                return { value: 0, stackCleanup: 4 };
             }
 
             // WM_TIMER with a callback: call the callback instead of the window procedure.
@@ -930,6 +999,18 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
                     // WM_DRAWITEM and never hit-tests the click itself. So always handle owner-draw
                     // button clicks here, even on a custom-painted launcher.
                     if (handleSystemControlMouseAtScreen(host.handle, message, wParam, screenX, screenY)) {
+                        const notification = takePendingControlNotification();
+                        if (notification) {
+                            const parent = windows.get(notification.hwnd);
+                            if (parent?.wndProc && !isSentinelWndProc(parent.wndProc)) {
+                                const sync = invokeGuestWndProcSync(
+                                    ctx, mem, parent.wndProc, notification.hwnd,
+                                    notification.msg, notification.wParam, notification.lParam,
+                                    4, 'DispatchMessageW:control-notify', () => 0,
+                                );
+                                if (sync) return sync;
+                            }
+                        }
                         return { value: 0, stackCleanup: 4 };
                     }
                 }
@@ -1144,7 +1225,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         const lpTimerFunc = args[3];
 
         const timerId = nIDEvent || nextTimerId++;
-        Logger.log(LogCategory.USER32,
+        Logger.verbose(LogCategory.USER32,
             `SetTimer(hwnd=0x${hWnd.toString(16)}, id=${timerId}, elapse=${uElapse}ms, func=0x${lpTimerFunc.toString(16)}) ` +
             `- ${lpTimerFunc ? 'callback' : 'message'} mode`
         );
@@ -1154,55 +1235,8 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
             hWnd,
             timerId,
             timerFunc: lpTimerFunc >>> 0,
+            intervalMs: Math.max(uElapse, USER_TIMER_MINIMUM),
             pendingTicks: 0,
-        };
-
-        const trigger = () => {
-            const system = System.getInstance();
-            if (system.isExiting) return;
-            timerDiag.ticks++;
-
-            if (lpTimerFunc) {
-                // Callback-mode (lpTimerFunc != 0): invoking the x86 TimerProc mutates CPU
-                // state, so it requires a running CPU and no in-flight async/callback chain.
-                const v86 = system.process?.v86;
-                const isRunning = v86?.is_running?.() ?? false;
-                const callbackManager = system.process?.dispatcher.callbackManager;
-                const canInvoke = isRunning &&
-                                  !system.process?.dispatcher.hasActiveAsyncThunks() &&
-                                  callbackManager?.canAcceptDeferredCallback();
-
-                if (canInvoke) {
-                    // Note: Must use forceSyntheticReturnEip so after the TimerProc returns,
-                    // x86 resumes at the exact EIP it was at when the scheduler timer fired, with ESP preserved.
-                    // void CALLBACK TimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime)
-                    timerDiag.callbackInvoked++;
-                    callbackManager!.invokeCallback(
-                        lpTimerFunc,
-                        [hWnd, WM_TIMER, timerId, TimeService.getInstance().nowMs() | 0],
-                        0,
-                        undefined,
-                        false,
-                        'SetTimer_timerProc',
-                        undefined,
-                        { forceSyntheticReturnEip: true }
-                    );
-                    maybeLogTimerDiag();
-                    return;
-                }
-
-                // Fallback: post WM_TIMER to wake WaitMessage/GetMessage.
-                // This is faithful: callback timers still generate WM_TIMER in Windows.
-                registerTimerSkip(timerState, !isRunning ? 'v86' : (system.process?.dispatcher.hasActiveAsyncThunks() ? 'async' : 'callbackBusy'));
-                postTimerMessages(system, timerState, 1);
-                maybeLogTimerDiag();
-                return;
-            }
-
-            // Message-mode (lpTimerFunc == 0): posting WM_TIMER is pure message-queue
-            // manipulation, valid even when v86 is stopped.
-            postTimerMessages(system, timerState, 1);
-            maybeLogTimerDiag();
         };
 
         // Win32: SetTimer with an existing (hwnd, id) RESETS that timer — cancel the
@@ -1211,14 +1245,8 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         const existing = timers.get(key);
         if (existing) cancelTimerState(existing);
 
-        timerState.wheelTimerId = System.getInstance().scheduler.timerWheel.add(
-            Math.max(uElapse, 1),
-            true,
-            TimerKind.USER32_TIMER,
-            trigger,
-            TimeService.getInstance().nowMs(),
-        );
         timers.set(key, timerState);
+        armTimerState(timerState);
 
         return timerId;
     };
@@ -1624,7 +1652,9 @@ export function registerFastPathMessageFunctions(dispatcher: any): void {
         }
 
         if (!msg) {
-            if (paintTraceEnabled) logPaintPendingBlocked('PeekMessageW(fastpath)', wMsgFilterMin, wMsgFilterMax, wRemoveMsg !== 0);
+            if (paintTraceEnabled && system.windowManager.hasMessages(WM_PAINT, WM_PAINT, callerThreadId)) {
+                logPaintPendingBlocked('PeekMessageW(fastpath)', wMsgFilterMin, wMsgFilterMax, wRemoveMsg !== 0);
+            }
             // Queue empty — check per-thread quit flag before returning FALSE
             if (wMsgFilterMin === 0 && wMsgFilterMax === 0 || (WM_QUIT >= wMsgFilterMin && WM_QUIT <= wMsgFilterMax)) {
                 const quitState = system.scheduler.getQuitState(callerThreadId);
@@ -1650,6 +1680,13 @@ export function registerFastPathMessageFunctions(dispatcher: any): void {
                 system.windowManager.hasMessages(wMsgFilterMin, wMsgFilterMax, callerThreadId),
             );
             return 0;
+        }
+
+        // Match the slow PeekMessage path: USER restarts a synthesized timer when
+        // its WM_TIMER is removed from the queue. Omitting this in the fast path
+        // made hover timers one-shot in tight MFC pumps (Half-Life launcher).
+        if (msg.message === WM_TIMER) {
+            noteFastPathTimerDelivery?.(msg, wRemoveMsg !== 0);
         }
 
         // Write MSG struct (28 bytes) to guest memory
@@ -1727,6 +1764,12 @@ export function registerFastPathMessageFunctions(dispatcher: any): void {
                 }
             }
             return null; // No message → fall through to async slow path
+        }
+
+        // GetMessage always removes the returned message, so an expired USER
+        // timer becomes eligible for its next interval here as on the slow path.
+        if (msg.message === WM_TIMER) {
+            noteFastPathTimerDelivery?.(msg, true);
         }
 
         // Write MSG struct (28 bytes) to guest memory

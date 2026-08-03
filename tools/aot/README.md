@@ -78,6 +78,12 @@ node tools/aot/slice-census.mjs                                 # what the slice
 node tools/aot/module-stats.mjs units/k4.0.wasm jobs/k4.jit.wasm # our module vs the JIT's, same page
 ```
 
+Capture records an ABI-5 identity envelope (engine SHA, RAM size, JIT ABI/mask/fingerprint) and
+the engine's exact publication slot. `aotc.mjs` preserves it into the manifest and the oracle
+refuses any missing or mismatched envelope before a staged replay. To keep this proof independent
+of workspace artifacts, `bun run gate:jit-integrity` performs this capture → compile → named
+manifest proof in a disposable engine/output directory.
+
 ## How the B7 bound is proven rather than asserted
 
 A guard that never fires is indistinguishable from a guard that is wrong. `--loop-bound N` lowers
@@ -110,9 +116,9 @@ Three decisions, each of which removes a hazard the contract names rather than m
 
 | decision | what it buys |
 |---|---|
-| **TLB memory shapes only** (N45/N46/N40), never fastmem | the module prologue's `fastmem_deopt_jit_unit(<baked slot>)` guard disappears — one of the two sites that bake a wasm table index (§9.1 / handoff §2.1(1)) — and with it every baked `mem8` and `fastmem_generation` constant, because a TLB entry already carries `mem8` folded in. Costs the fastmem read fast path. |
+| **TLB memory shapes only** (N45/N46/N40), never fastmem | avoids the read-map fastmem body, whose direct map access is policy-dependent. A TLB entry already carries the translated `mem8` shape. |
 | **indirect terminators leave the unit** — no ret-chaining, no ret-speculation, no `jit_find_cache_entry_in_page` | removes the second baked-index site |
-| ⇒ **the body names no slot at all** | checklist **E1** is satisfied by construction instead of by pinning, so `AotUnit.tableIndex` is `null` and the unit publishes into any free slot. The 899-slot pinning budget (open question **O4**) does not bind this producer. |
+| ⇒ **the body names no slot at all** | checklist **E1** is satisfied by construction; the manifest nevertheless carries the exact engine slot observed at capture, and replay refuses any missing or invalid slot instead of allocating one. |
 
 One value still cannot be known offline: the address of v86's `tlb_data`, a `static mut` the
 linker places and the engine exports no pointer to. It is emitted as a **relocation**
@@ -310,8 +316,8 @@ flag fast paths (we always take v86's unfused `Instruction::Other` arm).
 
 The **imports** column is where the two producers differ structurally rather than by a few percent:
 on k6 the unit declares 26 against the JIT's 29, and the three it does not declare are
-`fastmem_deopt_jit_unit`, `jit_find_cache_entry_in_page` and
-`jit_find_cache_entry_for_dynamic_chaining` — i.e. exactly the two baked-slot consumers plus the
+`jit_find_cache_entry_in_page` and `jit_find_cache_entry_for_dynamic_chaining` — i.e. the
+baked-slot consumer plus the
 chaining helper. That is checklist **E1** visible as a measurement instead of as a claim.
 
 ## Known structural gaps (perf, not correctness)

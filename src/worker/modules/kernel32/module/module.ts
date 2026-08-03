@@ -1315,7 +1315,8 @@ function initModuleFunctions(): void {
         const procKey = isOrdinal ? "" : procName.toLowerCase();
         const isMainExeDebugCrtProbe = hModule === DEFAULT_EXE_BASE && EXE_DEBUG_CRT_PROBE_NAMES.has(procKey);
 
-        // First, try to find in module registry (real DLLs).
+        // A real HMODULE scopes lookup to that PE image. Falling through to the global
+        // thunk table after a miss can return a same-named export from another DLL.
         if (moduleRegistry && hModule !== 0) {
             const peBase = moduleRegistry.resolvePeModuleBase(hModule);
             const mod = moduleRegistry.getByBase(peBase);
@@ -1335,19 +1336,18 @@ function initModuleFunctions(): void {
                     }
                     return finish(address);
                 }
+
+                if (!mod.isExecutable) {
+                    getProcAddressCache.set(cacheKey, 0);
+                    system.process!.lastError = 127;
+                    return finish(0);
+                }
             }
         }
 
         // Thunked APIs (including on-demand stub creation).
         if (system.process?.dispatcher) {
             const dispatcher = system.process.dispatcher as any;
-
-            if (!isMainExeDebugCrtProbe) {
-                const direct = dispatcher.thunkGenerator?.getExportAddress(procName);
-                if (direct !== undefined) {
-                    address = direct >>> 0;
-                }
-            }
 
             if (address === 0 && hModule !== 0) {
                 let dllName = THUNKED_DLL_PSEUDO_BY_BASE.get(hModule) ?? null;

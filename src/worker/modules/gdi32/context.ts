@@ -175,12 +175,18 @@ export class GDIContext {
     private overlayDirty: boolean = false;
     private overlayHasContent: boolean = false; // True if overlay has any content to composite
     private overlayClearRepairFn: ((x: number, y: number, w: number, h: number, excludeHwnd: number) => void) | null = null;
+    private overlayDirtyNotifyFn: (() => void) | null = null;
 
     /** After clearOverlayRect, repaint windows whose overlay pixels were cleared. */
     registerOverlayClearRepair(
         fn: (x: number, y: number, w: number, h: number, excludeHwnd: number) => void,
     ): void {
         this.overlayClearRepairFn = fn;
+    }
+
+    /** Wake the compositor when GDI publishes new screen-visible pixels. */
+    registerOverlayDirtyNotifier(fn: (() => void) | null): void {
+        this.overlayDirtyNotifyFn = fn;
     }
 
     constructor() {
@@ -258,6 +264,7 @@ export class GDIContext {
         this.overlayPublished = null;
         this.overlayDirty = this.overlayDirty || this.overlayFrontDirty;
         this.overlayFrontDirty = false;
+        if (this.overlayDirty) this.overlayDirtyNotifyFn?.();
     }
 
     private overlayPublishHeld(): boolean {
@@ -348,13 +355,15 @@ export class GDIContext {
     }
 
     setOverlayDirty(dirty: boolean): void {
-        if (dirty && !this.overlayDirty) {
+        const becameDirty = dirty && !this.overlayDirty;
+        if (becameDirty) {
             Logger.verbose(LogCategory.GDI32, `GDIContext.setOverlayDirty: Setting overlay dirty flag`);
         }
         this.overlayDirty = dirty;
         // If marking dirty, also mark as having content
         if (dirty) {
             this.overlayHasContent = true;
+            if (becameDirty) this.overlayDirtyNotifyFn?.();
         }
     }
 
@@ -950,6 +959,22 @@ export class GDIContext {
      * the bitmap has no usable backing DC/canvas.
      */
     getBitmapRenderedPixels(hbitmap: number): Uint8ClampedArray | null {
+        // While an HBITMAP is selected into a memory DC, that DC is the live Win32
+        // drawing surface. Some GDI operations update it without mirroring every pixel
+        // into our separate bitmap cache canvas, so prefer the selected surface. The
+        // cache remains the post-deselect/source-only fallback.
+        for (const [hdc, state] of this.hdcStates) {
+            if (state.hBitmap !== hbitmap) continue;
+            const selectedCtx = this.contexts.get(hdc);
+            if (!selectedCtx) continue;
+            const sw = selectedCtx.canvas.width, sh = selectedCtx.canvas.height;
+            if (sw <= 0 || sh <= 0) continue;
+            try {
+                return selectedCtx.getImageData(0, 0, sw, sh).data;
+            } catch {
+                // Try another selected DC or the persistent bitmap canvas below.
+            }
+        }
         const dc = this.createBitmapDC(hbitmap);
         if (dc === null) return null;
         const ctx = this.contexts.get(dc);
@@ -1926,6 +1951,14 @@ export class GDIContext {
             state.pristine = false;
             // Real drawing after a no-op pristine BitBlt must flush to overlay.
             state.skipOverlayFlush = false;
+            // CreateCompatibleBitmap starts compatibleEmpty; once drawn, the canvas is
+            // truth and a later SelectObject must clear pristine (see selectObject BITMAP).
+            const hBmp = state.hBitmap;
+            if (hBmp && hBmp !== GDIContext.DEFAULT_BITMAP_HANDLE) {
+                const obj = SystemResourceProvider.getInstance().getUserObject(hBmp) as
+                    { compatibleEmpty?: boolean } | undefined;
+                if (obj?.compatibleEmpty) obj.compatibleEmpty = false;
+            }
         }
     }
 

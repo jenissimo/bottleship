@@ -32,6 +32,19 @@ const jobPath = path.resolve(args.job);
 const job = JSON.parse(fs.readFileSync(jobPath, "utf8"));
 const outPrefix = path.resolve(args.out || jobPath.replace(/\.json$/, "-unit"));
 const v86WasmPath = path.resolve(args.v86 || path.join(REPO, "vendor/v86/build/v86.wasm"));
+const identity = job.jit_identity;
+if (!identity || identity.aot_abi !== 5 || typeof identity.engine_sha256 !== "string"
+    || !Number.isInteger(identity.ram_size) || !Number.isInteger(identity.abi)
+    || !Number.isInteger(identity.supported_mask) || !Number.isInteger(identity.fingerprint_lo)
+    || !Number.isInteger(identity.fingerprint_hi)) {
+    process.stderr.write("REFUSED: job lacks authoritative AOT ABI-5 JIT identity\n"); process.exit(3);
+}
+if (identity.engine_sha256 !== job.engine?.sha256 || identity.ram_size !== (job.engine?.memorySize >>> 0)) {
+    process.stderr.write("REFUSED: job engine identity is internally inconsistent\n"); process.exit(3);
+}
+if (!fs.existsSync(v86WasmPath) || identity.engine_sha256 !== crypto.createHash("sha256").update(fs.readFileSync(v86WasmPath)).digest("hex")) {
+    process.stderr.write("REFUSED: job identity names a different engine binary\n"); process.exit(3);
+}
 
 const pageBytes = new Uint8Array(Buffer.from(job.page.bytesBase64, "base64"));
 const sha256 = (b) => crypto.createHash("sha256").update(b).digest("hex");
@@ -76,6 +89,12 @@ if (!report.ok) {
     process.exit(5);
 }
 
+const exactTableIndex = job.jitModuleForPage?.tableIndex;
+if (!Number.isInteger(exactTableIndex) || exactTableIndex <= 0 || exactTableIndex >= 900) {
+    process.stderr.write("REFUSED: job lacks a valid exact captured JIT table index\n");
+    process.exit(4);
+}
+
 fs.mkdirSync(path.dirname(outPrefix), { recursive: true });
 const wasmName = `${path.basename(outPrefix)}.0.wasm`;
 fs.writeFileSync(path.join(path.dirname(outPrefix), wasmName), Buffer.from(unit.bytes));
@@ -86,13 +105,13 @@ const manifest = {
     // B7's bound, recorded so a lowered (experiment-only) bound cannot ship unnoticed.
     loop_counter: unit.loopCounter,
     engine_sha256: job.engine.sha256,
+    jit_identity: identity,
     // Values the loader patches in; the body carries a padded LEB placeholder at each site.
     relocations: { tlb_data: job.engine.tlbDataBase },
     units: [{
         entryPage: job.page.physPage,
-        // null = "any free slot": this body names no wasm table index at all (contract E1),
-        // so it is publishable wherever the engine has room.
-        tableIndex: null,
+        // Offline output is bound to the exact slot observed during the authoritative capture.
+        tableIndex: exactTableIndex,
         file: wasmName,
         bytes: unit.bytes.length,
         relocs: unit.relocs.map((r) => ({ kind: r.kind, fileOffset: r.fileOffset, width: r.width })),

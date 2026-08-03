@@ -90,6 +90,8 @@ export const HarnessErrorCode = {
     UNSUPPORTED: "UNSUPPORTED",
     /** The guest process died while the command was waiting — no point waiting out the timeout. */
     CRASHED: "CRASHED",
+    /** An expect* verb looked, and what it found violated the invariant it asserts. */
+    ASSERT_FAILED: "ASSERT_FAILED",
     INTERNAL: "INTERNAL",
 } as const;
 export type HarnessErrorCodeName = (typeof HarnessErrorCode)[keyof typeof HarnessErrorCode];

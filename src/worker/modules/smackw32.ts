@@ -15,7 +15,7 @@
 
 import { IModule } from "../core/module";
 import { Process } from "../core/process";
-import { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
+import { ThunkImplementation, ThunkResult, X86Context } from "../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../core/logger";
 import { System } from "../core/system";
 import { EmulatorConfig } from "../core/emulator-config-manager";
@@ -160,7 +160,6 @@ interface SmackSession {
     /** RGB fingerprint (256×3) to detect real palette changes for HSMACK+0x68. */
     paletteRgb: Uint8Array | null;
     paletteDirty: boolean;
-    lastWaitYieldMs: number;
     explicitDdrawSurface: DirectDrawSurfaceState | null;
     explicitGlideSurfacePtr: number;
 }
@@ -379,13 +378,21 @@ export class SmackW32 implements IModule {
         return this._compositeToPrimary(s, this.getMemory());
     }
 
-    private markVideoWaitNotReady(s: SmackSession): number {
-        const now = performance.now();
-        if (now - s.lastWaitYieldMs >= 1) {
-            s.lastWaitYieldMs = now;
-            System.getInstance().scheduler.requestSwitch();
+    /** Park this synchronous SmackWait call until its next-frame deadline. */
+    private markVideoWaitNotReady(ctx: X86Context, mem: Uint8Array, waitMs: number): number | ThunkResult {
+        if (ctx.esp < 0 || ctx.esp + 4 > mem.length) {
+            return 1;
         }
-        return 1;
+        const returnAddr = new DataView(mem.buffer, mem.byteOffset, mem.byteLength)
+            .getUint32(ctx.esp, true);
+        const result = System.getInstance().scheduler.parkCurrentThreadUntil(
+            Math.max(1, waitMs),
+            returnAddr,
+            (ctx.esp + 8) >>> 0,
+            { ecx: ctx.ecx, edx: ctx.edx, ebx: ctx.ebx, ebp: ctx.ebp, esi: ctx.esi, edi: ctx.edi, eflags: ctx.eflags },
+        );
+        if (result === 0) return 1;
+        return { value: 0, blockedNoSwitch: true, stackCleanup: 4 };
     }
 
     private readCString(mem: Uint8Array, ptr: number, maxLen = 520): string {
@@ -815,7 +822,7 @@ export class SmackW32 implements IModule {
                         audioWrapCount: 0, audioBaselineMs: -1,
                         frameDecodeCount: 0, internalBuf: 0,
                         pendingBufferRect: false, lastDoFrameFlags: 0,
-                        paletteRgb: null, paletteDirty: false, lastWaitYieldMs: 0,
+                        paletteRgb: null, paletteDirty: false,
                         explicitDdrawSurface: null,
                         explicitGlideSurfacePtr: 0,
                     };
@@ -881,7 +888,7 @@ export class SmackW32 implements IModule {
                     audioWrapCount: 0, audioBaselineMs: -1,
                     frameDecodeCount: 0, internalBuf: 0,
                     pendingBufferRect: false, lastDoFrameFlags: 0,
-                    paletteRgb: null, paletteDirty: false, lastWaitYieldMs: 0,
+                    paletteRgb: null, paletteDirty: false,
                     explicitDdrawSurface: null,
                     explicitGlideSurfacePtr: 0,
                 };
@@ -1121,7 +1128,7 @@ export class SmackW32 implements IModule {
         // в”Ђв”Ђ SmackWait(HSMACK) → 0 = ready, non-zero = not ready в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
         // Synchronous polling API. Games call this in tight message/render loops;
         // async sleeping here turns every poll into an expensive parked thunk.
-        this.exports["_SmackWait@4"] = (_ctx, _mem, args) => {
+        this.exports["_SmackWait@4"] = (ctx, mem, args) => {
             const smk = args[0];
             const s = this.sessions.get(smk);
             if (!s || s.eof || s.fps <= 0 || s.lastFrameMs <= 0) return 0;
@@ -1136,8 +1143,9 @@ export class SmackW32 implements IModule {
                     // Safety: don't hold back more than 3x frame time past wall-clock.
                     const wallElapsed = performance.now() - s.lastFrameMs;
                     if (wallElapsed < msPerFrame * 3) {
-                        // Return not-ready synchronously; async sleep here is too expensive.
-                        return this.markVideoWaitNotReady(s);
+                        const audioRemaining = targetAudioMs - audioMs;
+                        const safetyRemaining = msPerFrame * 3 - wallElapsed;
+                        return this.markVideoWaitNotReady(ctx, mem, Math.min(audioRemaining, safetyRemaining));
                     }
                 }
                 return 0; // ready
@@ -1146,8 +1154,7 @@ export class SmackW32 implements IModule {
             // Fallback: wall-clock pacing
             const elapsed = performance.now() - s.lastFrameMs;
             if (elapsed < msPerFrame - 2) {
-                // Return not-ready synchronously; scheduler switch is throttled.
-                return this.markVideoWaitNotReady(s);
+                return this.markVideoWaitNotReady(ctx, mem, msPerFrame - 2 - elapsed);
             }
             return 0; // ready
         };

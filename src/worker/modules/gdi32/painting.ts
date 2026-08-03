@@ -320,6 +320,7 @@ function dibToCanvas(
     // Create ImageData from the selected scan-line window
     const imgData = new ImageData(new Uint8ClampedArray(rgbaData.buffer), absWidth, drawHeight);
 
+
     // If source and dest sizes match and no offset, use putImageData directly
     const srcW = wSrc > 0 ? wSrc : absWidth;
     const srcH = hSrc > 0 ? hSrc : drawHeight;
@@ -1186,7 +1187,7 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         // compatible bitmap then GetDIBits-ing it back, so we must read the canvas here —
         // reading `pixels` returned the init colour (the buttons rendered as solid blocks).
         let sourcePixels: Uint8Array | Uint8ClampedArray;
-        const renderedPixels = (userObj as any).compatibleEmpty
+        const renderedPixels = (userObj as any).compatibleBitmap
             ? System.getInstance().gdiContext.getBitmapRenderedPixels(hbm)
             : null;
         if (renderedPixels) {
@@ -2100,9 +2101,9 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
             loading: false,
             pixels,
             bmBpp: nBitCount,
-            // Without initial bits the contents are undefined at birth (like a
-            // DDB); the drawn canvas is then the truth for reads
-            // (resolveBitmapRgba compatibleEmpty path).
+            // Without initial bits this behaves like a DDB: its rendered canvas is
+            // the source of truth, while compatibleEmpty tracks whether it is pristine.
+            compatibleBitmap: !initialized,
             compatibleEmpty: !initialized,
         });
         Logger.verbose(LogCategory.GDI32, `CreateBitmap(${nWidth}x${nHeight}) -> 0x${handle.toString(16)}`);

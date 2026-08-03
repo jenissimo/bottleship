@@ -603,7 +603,39 @@ export default function App() {
     // Allow-list, not a !== "touch" deny-list: a pen reports "pen" and has neither
     // Pointer Lock nor meaningful movementX/Y, so it belongs on the touch transport.
     if (pointerSourceRef.current !== "mouse") return;
-    Promise.resolve(canvas.requestPointerLock()).catch(() => {});
+    const req = canvas.requestPointerLock as (opts?: { unadjustedMovement?: boolean }) => Promise<void> | void;
+    Promise.resolve(req.call(canvas, { unadjustedMovement: true })).catch(() => {
+      // Options unsupported (older Chromium) — retry bare.
+      Promise.resolve(canvas.requestPointerLock()).catch(() => {});
+    });
+  };
+
+  // Exclusive DI / ShowCursor(hide) often arrives OUTSIDE a user gesture, so the
+  // opportunistic requestPointerLock in updatePointerLockIntent fails silently and
+  // the title keeps absolute edge-clamped mouse until the next canvas click. Arm a
+  // capture-phase window listener so the next trusted activation (fire click, UI
+  // click on the shell) still engages lock — not only pointerdown on the canvas.
+  const pointerLockGestureHandlerRef = useRef<((e: PointerEvent) => void) | null>(null);
+  const armPointerLockGesture = () => {
+    if (pointerLockGestureHandlerRef.current) return;
+    const onActivate = () => {
+      const handler = pointerLockGestureHandlerRef.current;
+      pointerLockGestureHandlerRef.current = null;
+      if (handler) window.removeEventListener("pointerdown", handler, true);
+      const c = canvasRef.current;
+      if (!c || userReleasedLockRef.current || pointerLockedRef.current) return;
+      if (!relativeIntent.get()) return;
+      userReleasedLockRef.current = false;
+      requestPointerLockSafe(c);
+    };
+    pointerLockGestureHandlerRef.current = onActivate;
+    window.addEventListener("pointerdown", onActivate, true);
+  };
+  const disarmPointerLockGesture = () => {
+    const handler = pointerLockGestureHandlerRef.current;
+    if (!handler) return;
+    pointerLockGestureHandlerRef.current = null;
+    window.removeEventListener("pointerdown", handler, true);
   };
 
   // Pointer Lock is the MOUSE transport for relative intent. Engaging always requires a
@@ -617,11 +649,15 @@ export default function App() {
       const c = canvasRef.current;
       if (c && document.hasFocus() && !pointerLockedRef.current && !userReleasedLockRef.current) {
         requestPointerLockSafe(c);
+        armPointerLockGesture();
       }
     } else if (document.pointerLockElement) {
       pointerLockCooldownRef.current = true;
       document.exitPointerLock();
       setTimeout(() => { pointerLockCooldownRef.current = false; }, 32);
+      disarmPointerLockGesture();
+    } else {
+      disarmPointerLockGesture();
     }
   };
 
@@ -1887,6 +1923,7 @@ export default function App() {
       pointerLockedRef.current = document.pointerLockElement === canvas;
       syncCursorPresence();
       if (pointerLockedRef.current) {
+        disarmPointerLockGesture();
         // The device already holds the last absolute position, which is exactly the
         // seed we want; nothing to publish because the position has not changed.
       } else {

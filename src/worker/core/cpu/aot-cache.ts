@@ -26,10 +26,8 @@ import { getContainerDir } from "../../runtime/filesystem/container-store";
 /** v86 places JIT slot i at wasm_table[i + WASM_TABLE_OFFSET] (vendor/v86/src/const.js). */
 const WASM_TABLE_OFFSET = 1024;
 /** Legal JIT slots are 1..WASM_TABLE_SIZE-1 (jit.rs: `(1..=(WASM_TABLE_SIZE - 1))`). The
- *  engine's own registration only rejects >= 0xFFFF, so THIS is the bound that decides
- *  whether a persisted index is a slot at all — checking 0xFFFF instead would let a
- *  corrupted index.json through to the reservation, where the miss reads as "slot-taken"
- *  and hides a malformed cache behind a plausible refusal. */
+ *  transaction API reserves the persisted index exactly, so malformed values are rejected
+ *  before staging rather than being disguised as an ordinary unavailable slot. */
 const WASM_TABLE_SIZE = 900;
 const PAGE_SIZE = 4096;
 
@@ -57,8 +55,7 @@ export interface AotUnit {
      * different slot and that question is asked about a stranger: when some other live
      * module happens to own the slot number baked in here, the helper returns ITS entry
      * block, and this module branches to that block number in its own br_table — running
-     * unrelated guest code. (The other baked use, fastmem_deopt_jit_unit, would free the
-     * wrong module.) So a unit is only replayable in its original slot.
+     * unrelated guest code. So a unit is only replayable in its original slot.
      */
     tableIndex: number;
     /** Compiled ahead of the publish point by prepare(), so the boot hook does not pay
@@ -135,32 +132,22 @@ interface AotVersion {
     abi: number;
     /** SHA-256 of the engine binary — the honest stand-in for "codegen commit". */
     engine: string;
-    /** Values of the jit config knobs that BAKE INTO emitted modules (shape, not policy). */
-    jitConfig: Record<string, number>;
-    /** Relaxed FPU changes x87 semantics to f64 — a unit built under it is invalid for an
-     *  fpuStrict bundle, and the damage is quiet precision loss. `"unavailable"` when the
-     *  engine does not expose the flag: that must CHANGE the key rather than default to
-     *  false and make units captured under one FPU mode loadable under the other. */
-    relaxedFpu: boolean | "unavailable";
-    fastmem: { guardBase: number; guardSize: number; lowMemEnd: number };
+    /** Version and supported-index set of Rust's JIT configuration ABI. */
+    jitConfigAbi: number;
+    jitConfigSupportedMask: number;
+    /** Rust-authoritative 64-bit hash of every input that changes emitted JIT wasm. */
+    jitCodegenFingerprintLo: number;
+    jitCodegenFingerprintHi: number;
     ramSize: number;
 }
 
-/** jit config indices whose VALUE is compiled into module bodies. Policy-only knobs
- *  (tier-2 threshold idx 15/17) are deliberately absent — they change when a module is
- *  built, never what it contains. */
-const SHAPE_FLAGS: Array<[string, number]> = [
-    ["deadFlagElision", 5], ["fastmemReads", 9], ["x87Locals", 10], ["pushRunCoalescing", 11],
-    ["retChaining", 12], ["retSpeculation", 13], ["fastmemReadSplit", 18],
-    ["fastmemWrites", 19], ["flagLocals", 21], ["branchHints", 22],
-];
-
-const AOT_ABI = 2;
+const AOT_ABI = 5;
 
 export class AotCache {
     private units: AotUnit[] = [];
     private live: LiveUnit[] = [];
     private engineSha: string | null = null;
+    private loadedVersion: AotVersion | null = null;
 
     private cpu(): any {
         const sys = (globalThis as any).System?.getInstance?.() ?? null;
@@ -213,8 +200,15 @@ export class AotCache {
         const mem: Uint8Array | undefined = cpu?.mem8;
         if (!w?.jit_aot_page_table_index || !mem) return { units: 0, skipped: out.length };
 
+        // version() reads the mutable wasm identity synchronously before awaiting the immutable
+        // engine hash. Start it before capture, but do not await until every selected page has
+        // been copied: one event-loop turn is the capture boundary.
+        const sourceVersionPromise = this.version();
+
         let skipped = 0;
         const seen = new Set<number>();
+        const captured: Array<{ entryPage: number; bytes: Uint8Array<ArrayBuffer>; tableIndex: number;
+            pages: Array<{ physPage: number; stateFlags: number; entries: Array<[number, number]>; bytes: Uint8Array<ArrayBuffer> }> }> = [];
         // Later captures supersede earlier ones for the same page.
         for (let i = out.length - 1; i >= 0; i--) {
             const rec = out[i];
@@ -228,7 +222,7 @@ export class AotCache {
 
             // Take EVERY page the module covers, not just its entry — see AotUnit.pages.
             const pageCount = w.jit_aot_module_page_count ? w.jit_aot_module_page_count(idx) >>> 0 : 1;
-            const pages: AotPage[] = [];
+            const pages: Array<{ physPage: number; stateFlags: number; entries: Array<[number, number]>; bytes: Uint8Array<ArrayBuffer> }> = [];
             for (let p = 0; p < pageCount; p++) {
                 const pAddr = w.jit_aot_module_page_at ? w.jit_aot_module_page_at(idx, p) >>> 0 : addr;
                 if (pAddr === 0xFFFFFFFF) continue;
@@ -239,12 +233,14 @@ export class AotCache {
                     if (packed === 0xFFFFFFFF) continue;
                     entries.push([packed >>> 16, packed & 0xFFFF]);
                 }
-                if (!entries.length) continue;
+                const pageBytes: Uint8Array<ArrayBuffer> = new Uint8Array(PAGE_SIZE);
+                pageBytes.set(mem.subarray(pAddr, pAddr + PAGE_SIZE));
                 pages.push({
                     physPage: pAddr >>> 12,
                     stateFlags: w.jit_aot_page_state_flags(pAddr) >>> 0,
                     entries,
-                    sha: await sha256Page(mem, pAddr),
+                    // Immutable 4 KiB copy; hashing happens after the whole unit set is captured.
+                    bytes: pageBytes,
                 });
                 seen.add(pAddr >>> 12);
             }
@@ -254,7 +250,33 @@ export class AotCache {
             // WebAssembly.Module rejects a shared backing store at replay time.
             const bytes = new Uint8Array(rec.bytes.length);
             bytes.set(rec.bytes);
-            this.units.push({ entryPage: physPage, bytes, tableIndex: idx, pages });
+            captured.push({ entryPage: physPage, bytes, tableIndex: idx, pages });
+        }
+        let sourceVersion: AotVersion;
+        try {
+            sourceVersion = await sourceVersionPromise;
+            if (this.loadedVersion && !this.sameVersion(this.loadedVersion, sourceVersion)) {
+                this.units = [];
+            }
+            const snapshotUnits: AotUnit[] = [];
+            for (const unit of captured) {
+                snapshotUnits.push({
+                    entryPage: unit.entryPage, bytes: unit.bytes, tableIndex: unit.tableIndex,
+                    pages: await Promise.all(unit.pages.map(async page => ({
+                        physPage: page.physPage, stateFlags: page.stateFlags, entries: page.entries,
+                        sha: await sha256Page(page.bytes, 0),
+                    }))),
+                });
+            }
+            if (!this.sameVersion(sourceVersion, await this.version())) {
+                Logger.warn(LogCategory.SYSTEM, "[AOT] snapshot refused: JIT version identity changed while hashing");
+                return { units: 0, skipped: skipped + captured.length };
+            }
+            this.units.push(...snapshotUnits);
+            this.loadedVersion = sourceVersion;
+        } catch {
+            Logger.warn(LogCategory.SYSTEM, "[AOT] snapshot refused: cannot recheck JIT version identity");
+            return { units: 0, skipped: skipped + captured.length };
         }
         Logger.log(LogCategory.SYSTEM, `[AOT] snapshot: ${this.units.length} units, ${skipped} skipped`);
         return { units: this.units.length, skipped };
@@ -288,6 +310,7 @@ export class AotCache {
     clear(): void {
         this.units = [];
         this.live = [];
+        this.loadedVersion = null;
     }
 
     /** SHA-256 of the engine binary. Fetched once — the browser already has it cached, and
@@ -303,47 +326,46 @@ export class AotCache {
         return this.engineSha;
     }
 
-    /**
-     * The relaxed-FPU flag, or `"unavailable"` when the export is missing. `?.() === true`
-     * silently answers `false` there — the same shape as a genuine fpuStrict build, so units
-     * captured with relaxed FPU on would load into a session that cannot tell, and the damage
-     * (see AotVersion.relaxedFpu) is quiet precision loss. An unreadable flag has to fail the
-     * key instead.
-     */
-    private relaxedFpuFlag(): boolean | "unavailable" {
-        const fn = (globalThis as any).preemption?.isRelaxedFpuEnabled;
-        if (typeof fn !== "function") return "unavailable";
-        try {
-            return fn.call((globalThis as any).preemption) === true;
-        } catch {
-            return "unavailable";
-        }
-    }
-
     async version(): Promise<AotVersion> {
         const w = this.wasm();
         const cpu = this.cpu();
-        const jitConfig: Record<string, number> = {};
-        for (const [name, idx] of SHAPE_FLAGS) {
-            jitConfig[name] = w?.get_jit_config ? w.get_jit_config(idx) >>> 0 : -1;
+        const required = [
+            "jit_config_abi_version",
+            "jit_config_supported_mask",
+            "jit_codegen_fingerprint_lo",
+            "jit_codegen_fingerprint_hi",
+        ];
+        if (!required.every((name) => typeof w?.[name] === "function")) {
+            throw new Error("JIT config ABI exports unavailable; refusing AOT cache identity");
         }
+        // Copy every mutable engine identity input before the first await. snapshot() deliberately
+        // starts this method before it copies pages, then waits on the immutable engine hash after
+        // that copy; reading these exports in the object literal below would instead read them
+        // after the hash yield and could relabel old page bytes with a newer codegen identity.
+        const jitConfigAbi = w.jit_config_abi_version() >>> 0;
+        const jitConfigSupportedMask = w.jit_config_supported_mask() >>> 0;
+        const jitCodegenFingerprintLo = w.jit_codegen_fingerprint_lo() >>> 0;
+        const jitCodegenFingerprintHi = w.jit_codegen_fingerprint_hi() >>> 0;
+        const ramSize = cpu?.memory_size ? cpu.memory_size[0] >>> 0 : -1;
+        const engine = await this.engineFingerprint();
         return {
             abi: AOT_ABI,
-            engine: await this.engineFingerprint(),
-            jitConfig,
-            relaxedFpu: this.relaxedFpuFlag(),
-            fastmem: {
-                guardBase: w?.fastmem_get_guard_base ? w.fastmem_get_guard_base() >>> 0 : -1,
-                guardSize: w?.fastmem_get_guard_size ? w.fastmem_get_guard_size() >>> 0 : -1,
-                lowMemEnd: w?.fastmem_get_low_mem_end ? w.fastmem_get_low_mem_end() >>> 0 : -1,
-            },
-            ramSize: cpu?.memory_size ? cpu.memory_size[0] >>> 0 : -1,
+            engine,
+            jitConfigAbi,
+            jitConfigSupportedMask,
+            jitCodegenFingerprintLo,
+            jitCodegenFingerprintHi,
+            ramSize,
         };
     }
 
-    private async versionKey(): Promise<string> {
-        const json = JSON.stringify(await this.version());
+    private async versionKey(version: AotVersion): Promise<string> {
+        const json = JSON.stringify(version);
         return hex(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(json))).slice(0, 16);
+    }
+
+    private sameVersion(a: AotVersion, b: AotVersion): boolean {
+        return JSON.stringify(a) === JSON.stringify(b);
     }
 
     /**
@@ -356,7 +378,16 @@ export class AotCache {
         if (!this.units.length) return { error: "no units captured" };
         const container = await getContainerDir(gameId, true);
         if (!container) return { error: "no container" };
-        const key = await this.versionKey();
+        // Persist under the identity that bound these captured bytes, never a later mutable
+        // engine identity read after snapshot hashing completed.
+        const version = this.loadedVersion;
+        if (!version) return { error: "snapshot has no capture-time version identity" };
+        try {
+            if (!this.sameVersion(version, await this.version())) {
+                return { error: "capture-time version identity no longer matches live engine" };
+            }
+        } catch { return { error: "cannot recheck live JIT version identity" }; }
+        const key = await this.versionKey(version);
         const aot = await container.getDirectoryHandle("aot", { create: true });
         const dir = await aot.getDirectoryHandle(key, { create: true });
 
@@ -376,7 +407,7 @@ export class AotCache {
             await w.close();
         }
         const index = {
-            version: await this.version(),
+            version,
             units: this.units.map((u) => ({
                 entryPage: u.entryPage, tableIndex: u.tableIndex, pages: u.pages,
                 file: `${u.entryPage.toString(16)}.wasm`, bytes: u.bytes.length,
@@ -396,10 +427,14 @@ export class AotCache {
         this.clear();
         const container = await getContainerDir(gameId, false);
         if (!container) return { error: "no container" };
-        const key = await this.versionKey();
+        const version = await this.version();
+        const key = await this.versionKey(version);
         try {
             const dir = await (await container.getDirectoryHandle("aot")).getDirectoryHandle(key);
             const index = JSON.parse(await (await (await dir.getFileHandle("index.json")).getFile()).text());
+            if (!index.version || !this.sameVersion(index.version, version)) {
+                return { error: "stored version identity mismatch", key };
+            }
             const loaded: AotUnit[] = [];
             for (const u of index.units) {
                 const f = await (await dir.getFileHandle(u.file)).getFile();
@@ -407,6 +442,7 @@ export class AotCache {
                 loaded.push({ entryPage: u.entryPage, tableIndex: u.tableIndex, pages: u.pages, bytes });
             }
             this.units = loaded;
+            this.loadedVersion = index.version;
             Logger.log(LogCategory.SYSTEM, `[AOT] loaded ${loaded.length} units from aot/${key}`);
             return { loaded: loaded.length, key };
         } catch {
@@ -429,23 +465,6 @@ export class AotCache {
             try { u.module = await WebAssembly.compile(u.bytes); } catch { /* replay recompiles */ }
         }));
         return r;
-    }
-
-    /**
-     * Take the ONE slot a unit is valid in (see AotUnit.tableIndex). The engine only offers
-     * "give me any free slot", so drain the free list until the wanted index surfaces; the
-     * drained rest accumulates in `spare` (order in that list carries no meaning) and the
-     * caller hands it back once every unit is placed. Returns -1 when the slot is not free.
-     */
-    private reserveTableIndex(w: any, want: number, spare: number[]): number {
-        const held = spare.indexOf(want);
-        if (held >= 0) { spare.splice(held, 1); return want; }
-        for (;;) {
-            const i = w.jit_aot_alloc_table_index() >>> 0;
-            if (i === 0xFFFF) return -1;
-            if (i === want) return i;
-            spare.push(i);
-        }
     }
 
     /**
@@ -476,6 +495,19 @@ export class AotCache {
      * path — so every failure mode here degrades performance, never correctness.
      */
     async replay(): Promise<{ registered: number; refused: Record<string, number> }> {
+        if (this.loadedVersion) {
+            let liveVersion: AotVersion;
+            try {
+                liveVersion = await this.version();
+            } catch (e) {
+                Logger.warn(LogCategory.SYSTEM, `[AOT] replay refused: cannot read live JIT version identity: ${e}`);
+                return { registered: 0, refused: { "version-unavailable": this.units.length } };
+            }
+            if (!this.sameVersion(this.loadedVersion, liveVersion)) {
+                Logger.warn(LogCategory.SYSTEM, "[AOT] replay refused: live JIT version identity changed after load");
+                return { registered: 0, refused: { "version-mismatch": this.units.length } };
+            }
+        }
         const w = this.wasm();
         const cpu = this.cpu();
         const table = cpu?.wm?.wasm_table;
@@ -483,7 +515,12 @@ export class AotCache {
         const mem: Uint8Array | undefined = cpu?.mem8;
         const refused: Record<string, number> = {};
         const no = (why: string) => { refused[why] = (refused[why] ?? 0) + 1; };
-        if (!w?.jit_register_aot_module || !table || !imports || !mem) {
+        const txExports = [
+            "jit_aot_tx_begin", "jit_aot_tx_page_begin", "jit_aot_tx_entry_push",
+            "jit_aot_tx_page_finish", "jit_aot_tx_prepare_finish", "jit_aot_tx_commit",
+            "jit_aot_tx_abort",
+        ];
+        if (!txExports.every((name) => typeof w?.[name] === "function") || !table || !imports || !mem) {
             return { registered: 0, refused: { "engine-not-ready": this.units.length } };
         }
 
@@ -491,7 +528,7 @@ export class AotCache {
         // byte-for-byte what it was; a module whose other pages changed would be dispatched
         // into for code that no longer matches it. Kept separate from publication because
         // sha256 awaits, and the guest must not run in the middle of the second pass.
-        const candidates: AotUnit[] = [];
+        const candidates: Array<{ unit: AotUnit; fn: unknown }> = [];
         for (const u of this.units) {
             // With no pages the publication loop would publish nothing and still count as a
             // success. snapshot() never produces that; a truncated index.json could.
@@ -499,71 +536,90 @@ export class AotCache {
             if (!(u.tableIndex > 0 && u.tableIndex < WASM_TABLE_SIZE)) { no("no-table-index"); continue; }
             let contentOk = true;
             for (const p of u.pages) {
+                if (!Number.isInteger(p.physPage) || p.physPage < 0 || p.physPage > 0xFFFFF) {
+                    contentOk = false;
+                    break;
+                }
                 if ((await sha256Page(mem, p.physPage * PAGE_SIZE)) !== p.sha) { contentOk = false; break; }
             }
-            if (contentOk) candidates.push(u); else no("content-mismatch");
+            if (!contentOk) { no("content-mismatch"); continue; }
+            try {
+                // This is intentionally before transaction begin: WebAssembly.Module/Instance
+                // construction may fail, but once Rust owns a slot pass 2 contains no await.
+                const inst = new WebAssembly.Instance(u.module ?? new WebAssembly.Module(u.bytes), { "e": imports });
+                const fn = (inst.exports as any)["f"];
+                if (typeof fn !== "function") { no("no-export-f"); continue; }
+                candidates.push({ unit: u, fn });
+            } catch (e) {
+                no(`instantiate:${String(e).slice(0, 40)}`);
+            }
         }
 
-        // PASS 2 — strictly SYNCHRONOUS. Reserving a unit's slot means draining the engine's
-        // free list down to it, and an await in here would let the guest run while that list
-        // is short: the compile path, unlike this one, CLEARS THE JIT CACHE when it finds no
-        // free slot. Descending order means one drain serves every unit.
+        // A content hash can take an arbitrary time. Re-read the persisted identity after that
+        // async pass and immediately before any Rust transaction reserves its exact slot.
+        if (this.loadedVersion) {
+            try {
+                if (!this.sameVersion(this.loadedVersion, await this.version())) {
+                    return { registered: 0, refused: { "version-mismatch-after-validation": candidates.length } };
+                }
+            } catch {
+                return { registered: 0, refused: { "version-unavailable-after-validation": candidates.length } };
+            }
+        }
+
+        // PASS 2 — strictly SYNCHRONOUS. Rust owns an exact slot from tx_begin until commit
+        // or abort; no await may interleave with that ownership. Instances were constructed
+        // in pass 1, so this pass is only stage → table.set → commit.
         let registered = 0;
         this.live = [];
-        const spare: number[] = [];
-        try {
-        for (const u of [...candidates].sort((a, b) => b.tableIndex - a.tableIndex)) {
-            const idx = this.reserveTableIndex(w, u.tableIndex, spare);
-            if (idx !== u.tableIndex) { no("slot-taken"); continue; }
-            let fn: unknown;
-            try {
-                const inst = new WebAssembly.Instance(u.module ?? new WebAssembly.Module(u.bytes), { "e": imports });
-                fn = (inst.exports as any)["f"];
-                if (typeof fn !== "function") { w.jit_aot_free_table_index(idx); no("no-export-f"); continue; }
-                table.set(idx + WASM_TABLE_OFFSET, fn);
-            } catch (e) {
-                w.jit_aot_free_table_index(idx);
-                no(`instantiate:${String(e).slice(0, 40)}`);
+        for (const { unit: u, fn } of candidates) {
+            const fingerprintLo = this.loadedVersion?.jitCodegenFingerprintLo;
+            const fingerprintHi = this.loadedVersion?.jitCodegenFingerprintHi;
+            if (fingerprintLo === undefined || fingerprintHi === undefined) { no("missing-persisted-fingerprint"); continue; }
+            let rc = w.jit_aot_tx_begin(u.tableIndex, u.pages.length, fingerprintLo, fingerprintHi) >>> 0;
+            if (rc !== 0) { no(`tx-begin-${rc}`); continue; }
+            const abort = (): boolean => {
+                const abortRc = w.jit_aot_tx_abort() >>> 0;
+                if (abortRc !== 0) { no(`tx-abort-${abortRc}`); return false; }
+                return true;
+            };
+            for (const p of u.pages) {
+                rc = w.jit_aot_tx_page_begin(p.physPage * PAGE_SIZE, p.stateFlags, p.entries.length) >>> 0;
+                if (rc !== 0) break;
+                for (const [off, st] of p.entries) {
+                    rc = w.jit_aot_tx_entry_push(off, st) >>> 0;
+                    if (rc !== 0) break;
+                }
+                if (rc !== 0) break;
+                rc = w.jit_aot_tx_page_finish() >>> 0;
+                if (rc !== 0) break;
+            }
+            if (rc === 0) rc = w.jit_aot_tx_prepare_finish() >>> 0;
+            if (rc !== 0) {
+                no(`tx-prepare-${rc}`);
+                if (!abort()) break;
                 continue;
             }
 
-            // All pages of the unit point at the SAME table index, exactly as the compile
-            // path publishes them.
-            //
-            // CHECK-THEN-ACT, deliberately: a half-published module cannot be unwound safely
-            // from here — its dispatch metadata may already be live, and rolling back leaves
-            // the guest jumping to a wild EIP. So refuse up front and never start publishing
-            // a unit that cannot be finished.
-            let rc = 0;
-            for (const p of u.pages) {
-                if ((w.jit_aot_page_table_index(p.physPage * PAGE_SIZE) >>> 0) !== 0xFFFF) { rc = 2; break; }
-            }
-            if (rc === 0) {
-                for (const p of u.pages) {
-                    w.jit_aot_entry_reset();
-                    for (const [off, st] of p.entries) w.jit_aot_entry_push(off, st);
-                    rc = w.jit_register_aot_module(idx, p.physPage * PAGE_SIZE, p.stateFlags) >>> 0;
-                    if (rc !== 0) break;   // must not happen: every page was verified free
+            // Rust owns the exact slot now. Do not await: clear JS's table entry before abort
+            // on every post-set exception so a released slot can never dispatch this function.
+            let tableMayHaveBeenWritten = false;
+            try {
+                tableMayHaveBeenWritten = true;
+                table.set(u.tableIndex + WASM_TABLE_OFFSET, fn as any);
+                rc = w.jit_aot_tx_commit() >>> 0;
+                if (rc !== 0) throw new Error(`commit-${rc}`);
+                this.live.push({ unit: u, idx: u.tableIndex, fn });
+                registered++;
+            } catch (e) {
+                if (tableMayHaveBeenWritten) {
+                    try { table.set(u.tableIndex + WASM_TABLE_OFFSET, null); }
+                    catch { no("tx-table-clear-failed"); break; }
                 }
+                no(`tx-post-set:${String(e).slice(0, 40)}`);
+                if (!abort()) break;
             }
-            if (rc !== 0) {
-                table.set(idx + WASM_TABLE_OFFSET, null);
-                w.jit_aot_free_table_index(idx);
-                no(`register-rc-${rc}`);
-                continue;
-            }
-            this.live.push({ unit: u, idx, fn });
-            registered++;
         }
-        } finally {
-            // The drained indices MUST go back even if a malformed unit threw mid-pass: they
-            // are the engine's whole free list, and losing them leaves every later compile
-            // finding no slot and clearing the JIT cache — a permanent thrash.
-            for (const i of spare) w.jit_aot_free_table_index(i);
-        }
-        // One flush for the whole batch: registration only inserts into ctx.pages, so pages
-        // already sitting in the TLB would otherwise never get dispatch meta and the units
-        // would own hot pages without ever being entered — see jit_aot_flush_tlb.
         if (registered > 0 && w.jit_aot_flush_tlb) w.jit_aot_flush_tlb();
         Logger.log(LogCategory.SYSTEM, `[AOT] replay: registered=${registered} refused=${JSON.stringify(refused)}`);
         return { registered, refused };

@@ -49,24 +49,25 @@ export function resetOwnerDrawScratch(): void {
     drawItemScratchPtr = 0;
 }
 
-/** Walk a window up to its top-level (non-child) ancestor. */
-function topLevelOf(win: WindowInfo): WindowInfo {
+/** True when a window belongs to the active window's child/owned subtree. */
+export function isWindowInActiveTree(win: WindowInfo, activeHwnd: number): boolean {
     let cur = win;
     let guard = 0;
-    while (cur.parent !== undefined && guard++ < 32) {
+    while (guard++ < 32) {
+        if (cur.handle === activeHwnd) return true;
+        if (cur.parent === undefined) break;
         const p = windows.get(cur.parent);
         if (!p) break;
         cur = p;
     }
-    return cur;
+    return false;
 }
 
-/** True if the button's top-level dialog is the currently active window. Used to suppress
- *  stale hover-timer repaints from an occluded menu (a modal submenu drawn on top). */
-function isButtonOnActiveTopLevel(button: WindowInfo): boolean {
+/** Suppress stale hover-timer repaints from an occluded menu. */
+function isButtonOnActiveWindowTree(button: WindowInfo): boolean {
     const active = System.getInstance().windowManager.getActiveHwnd();
     if (!active) return true; // no active window tracked — don't over-suppress
-    return topLevelOf(button).handle === active;
+    return isWindowInActiveTree(button, active);
 }
 
 function getDrawItemScratchPtr(process: Process): number {
@@ -112,6 +113,7 @@ export function enumerateGuestPaintedControls(parentHwnd: number): WindowInfo[] 
         const child = windows.get(childHwnd);
         if (!child || !child.visible || !child.wndProc) continue;
         if (isButtonSystemControl(child)) continue;
+        if (child.externalPaintManaged) continue;
         const custom = !child.isSystemControl && isAppRegisteredClass(child.nativeClassName);
         if (!child.wndProcSubclassed && !custom) continue;
         out.push(child);
@@ -161,6 +163,8 @@ export interface OwnerDrawDeps {
     flushChildDC: (childDc: number) => void;
     /** Release a child DC WITHOUT compositing it. */
     discardChildDC: (childDc: number) => void;
+    /** Called after the complete owner-draw sequence has landed on the overlay. */
+    onComplete?: () => void;
 }
 
 /** One guest-paint task: an owner-draw button (WM_DRAWITEM into a DC we supply), a
@@ -268,6 +272,9 @@ function runGuestPaintChain(
                 // The control paints itself: deliver WM_PAINT to its own wndProc. The
                 // guest's BeginPaint returns a client DC seeded from the overlay and its
                 // EndPaint composites the result back — no DC plumbing needed here.
+                // This direct delivery satisfies any coalesced WM_PAINT already waiting
+                // for the control; leaving it queued paints transparent glyphs twice.
+                System.getInstance().windowManager.clearPaintMessage(child.handle);
                 const inv = callbackManager.invokeCallback(
                     child.wndProc,
                     [child.handle, WM_PAINT, 0, 0],
@@ -332,6 +339,7 @@ function runGuestPaintChain(
             if (dispatchNext() !== 0) return null; // suspended for the next task; hold stays
             // Apply freshly-captured guest colors in the same paint sequence.
             if (ctlColorsChanged) repaintChildControls(drawItemTarget.hwnd);
+            deps.onComplete?.();
         } catch (err) {
             Logger.error(LogCategory.USER32, `${thunkName}: guest-paint chain aborted — ${err}`);
         }
@@ -429,8 +437,8 @@ export function tryRepaintOwnerDrawButton(
     if ((button.style & BS_TYPEMASK) !== BS_OWNERDRAW) return null;
     // Guard against ghosts: a hover timer on a now-occluded menu (e.g. after a modal
     // submenu opened on top) must NOT composite its button onto the flat overlay over
-    // the dialog drawn above it. Only repaint buttons whose top-level dialog is active.
-    if (!isButtonOnActiveTopLevel(button)) return null;
+    // the dialog drawn above it. Nested dialogs may themselves be the active HWND.
+    if (!isButtonOnActiveWindowTree(button)) return null;
     const parent = windows.get(button.parent);
     if (!parent?.wndProc) return null;
     return runGuestPaintChain(

@@ -134,6 +134,10 @@ let captureFrameId = 0;
 let captureBackend = "ddraw";
 /** Only this producer's frame boundary may end the capture (undefined = any). */
 let captureWantBackend: string | undefined;
+/** A capture armed between draw calls first sees the tail of the frame already in
+ * progress. Discard that boundary so the returned capture always starts at a real
+ * frame boundary and includes the following frame's Clear/draw sequence. */
+let captureNeedsFrameBoundary = false;
 /** Frame ends skipped because they carried nothing — reported, never silently dropped. */
 let captureSkippedEmpty = 0;
 /** How many empty frame ends to wait through before giving up and reporting one. */
@@ -159,11 +163,30 @@ export function startCapture(backend?: string): Promise<CapturedFrame> {
     captureBackend = "ddraw";
     captureWantBackend = backend;
     captureSkippedEmpty = 0;
+    captureNeedsFrameBoundary = true;
     captureActive = true;
     return new Promise<CapturedFrame>((resolve, reject) => {
         captureResolve = resolve;
         captureReject = reject;
     });
+}
+
+/** Disarm a capture whose consumer timed out or was aborted. Without this the hot
+ * draw path keeps appending diagnostic objects forever, eventually stalling the
+ * renderer that the capture was meant to inspect. */
+export function cancelCapture(reason = new Error("capture cancelled")): void {
+    if (!captureActive && !captureReject) return;
+    captureActive = false;
+    captureBuffer = [];
+    clearBuffer = [];
+    captureBackend = "ddraw";
+    captureWantBackend = undefined;
+    captureSkippedEmpty = 0;
+    captureNeedsFrameBoundary = false;
+    const reject = captureReject;
+    captureResolve = null;
+    captureReject = null;
+    if (reject) reject(reason);
 }
 
 /** Schema fields a partial producer leaves at their default. Listed per draw as
@@ -212,6 +235,13 @@ export function recordRawDraw(partial: Partial<CapturedDrawCall> & { backend: st
 export function onFrameEnd(producer = "ddraw"): void {
     if (!captureActive) return;
     if (captureWantBackend !== undefined && producer !== captureWantBackend) return;
+    if (captureNeedsFrameBoundary) {
+        captureBuffer = [];
+        clearBuffer = [];
+        captureBackend = "ddraw";
+        captureNeedsFrameBoundary = false;
+        return;
+    }
     const empty = captureBuffer.length === 0 && clearBuffer.length === 0;
     if (empty && captureSkippedEmpty < MAX_EMPTY_FRAME_ENDS) {
         captureSkippedEmpty++;
@@ -232,6 +262,7 @@ export function onFrameEnd(producer = "ddraw"): void {
     captureBackend = "ddraw";
     captureWantBackend = undefined;
     captureSkippedEmpty = 0;
+    captureNeedsFrameBoundary = false;
     const resolve = captureResolve;
     captureResolve = null;
     captureReject = null;

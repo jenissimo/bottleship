@@ -90,7 +90,7 @@ type CounterSnapshot = {
     atMs: number;
     presentSerial: number | null;
     sched: Record<string, number> | null;
-    fastmem: { generation: number; deoptRecompiles: number; speculatedLoadsCompiled: number; thrashLatched: boolean; bumps: Record<string, number> } | null;
+    fastmem: { enabled: boolean; speculatedLoadsCompiled: number; readMapPages: number } | null;
     tier2: Record<string, number> | null;
     codeInvalidations: { wired: boolean; ranges: number; bytes: number; deferred: number };
     hypercalls: number;
@@ -106,7 +106,7 @@ function snapshotCounters(render: RenderLike | undefined): CounterSnapshot {
     let tier2: CounterSnapshot["tier2"] = null;
     try {
         const f = dbg.fastmemStats?.() as CounterSnapshot["fastmem"] | null;
-        if (f) fastmem = { generation: f.generation, deoptRecompiles: f.deoptRecompiles, speculatedLoadsCompiled: f.speculatedLoadsCompiled, thrashLatched: f.thrashLatched, bumps: { ...f.bumps } };
+        if (f) fastmem = { enabled: f.enabled, speculatedLoadsCompiled: f.speculatedLoadsCompiled, readMapPages: f.readMapPages };
     } catch { /* wasm debug exports absent in this build */ }
     try {
         tier2 = (dbg.tier2Stats?.() as unknown as Record<string, number> | null) ?? null;
@@ -136,22 +136,13 @@ function counterDelta(base: CounterSnapshot | null, now: CounterSnapshot) {
         return {
             available: false as const,
             note: "no baseline — call frameReport({reset:true}) to arm one; a delta over an unknown window is not a measurement",
-            current: { fastmemGeneration: now.fastmem?.generation ?? null, thrashLatched: now.fastmem?.thrashLatched ?? null },
+            current: { fastmemReadMapPages: now.fastmem?.readMapPages ?? null },
         };
     }
     const notes: string[] = [];
     const sched = diffNumbers(base.sched, now.sched);
     if (sched && sched.realSwitch === 0 && (sched.ticks ?? 0) > 0) {
         notes.push("scheduler made 0 REAL context switches over the window while ticking — the freeze signature (a pinned callback or an empty run queue).");
-    }
-    const bumps = diffNumbers(base.fastmem?.bumps ?? null, now.fastmem?.bumps ?? null);
-    const genDelta = now.fastmem && base.fastmem ? now.fastmem.generation - base.fastmem.generation : null;
-    if (genDelta && genDelta > 0) {
-        const worst = bumps ? Object.entries(bumps).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]) : [];
-        notes.push(
-            `fastmem generation advanced ${genDelta}x (${worst.map(([k, v]) => `${k}:${v}`).join(", ") || "source unknown"}) — `
-            + "each bump throws away ALL compiled code for speculating modules; a per-second bump has cost this project 20x frame time.",
-        );
     }
     // 32-bit wrapping counter: a naive subtraction reads as 0 or negative. One wrap is
     // recoverable, more than one is not distinguishable — say so rather than imply precision.
@@ -162,11 +153,8 @@ function counterDelta(base: CounterSnapshot | null, now: CounterSnapshot) {
         presents: now.presentSerial !== null && base.presentSerial !== null ? now.presentSerial - base.presentSerial : null,
         sched,
         fastmem: {
-            generationDelta: genDelta,
-            bumps: bumps ? Object.fromEntries(Object.entries(bumps).filter(([, v]) => v !== 0)) : null,
-            deoptRecompiles: now.fastmem && base.fastmem ? now.fastmem.deoptRecompiles - base.fastmem.deoptRecompiles : null,
             speculatedLoadsCompiled: now.fastmem && base.fastmem ? now.fastmem.speculatedLoadsCompiled - base.fastmem.speculatedLoadsCompiled : null,
-            thrashLatched: now.fastmem?.thrashLatched ?? null,
+            readMapPages: now.fastmem?.readMapPages ?? null,
         },
         tier2: diffNumbers(base.tier2, now.tier2),
         codeInvalidations: {

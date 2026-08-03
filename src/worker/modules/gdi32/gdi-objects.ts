@@ -95,14 +95,38 @@ export function getStockObject(objectId: number): GDIObject | null {
             return { handle: objectId, type: 'PEN', data: '#000000', penStyle: PS_SOLID, penWidth: 1, penColor: 0 };
         case STOCK_NULL_PEN:
             return { handle: objectId, type: 'PEN', data: 'transparent', penStyle: PS_NULL, penWidth: 1, penColor: 0 };
-        case STOCK_SYSTEM_FONT:
-        case STOCK_DEFAULT_GUI_FONT:
         case STOCK_ANSI_VAR_FONT:
-            return { handle: objectId, type: 'FONT', data: '16px sans-serif' };
+            return {
+                handle: objectId, type: 'FONT',
+                data: '12px "Liberation Sans", sans-serif', fontSize: 12,
+                lfHeight: 12, lfWeight: 400, lfQuality: 0, faceName: 'MS Sans Serif',
+            };
+        case STOCK_SYSTEM_FONT:
+        case STOCK_DEVICE_DEFAULT_FONT:
+            return {
+                handle: objectId, type: 'FONT',
+                data: 'bold 16px "Liberation Sans", sans-serif', fontSize: 16,
+                lfHeight: 16, lfWeight: 700, lfQuality: 0, faceName: 'System',
+            };
+        case STOCK_DEFAULT_GUI_FONT:
+            return {
+                handle: objectId, type: 'FONT',
+                data: '11px "Microsoft Sans Serif", "Liberation Sans", sans-serif', fontSize: 11,
+                lfHeight: -11, lfWeight: 400, lfQuality: 0, faceName: 'MS Shell Dlg',
+            };
         case STOCK_ANSI_FIXED_FONT:
-        case STOCK_SYSTEM_FIXED_FONT:
         case STOCK_OEM_FIXED_FONT:
-            return { handle: objectId, type: 'FONT', data: '16px monospace' };
+            return {
+                handle: objectId, type: 'FONT',
+                data: '12px "Liberation Mono", monospace', fontSize: 12,
+                lfHeight: 12, lfWeight: 400, lfQuality: 0, faceName: 'Courier',
+            };
+        case STOCK_SYSTEM_FIXED_FONT:
+            return {
+                handle: objectId, type: 'FONT',
+                data: 'bold 16px "Liberation Mono", monospace', fontSize: 16,
+                lfHeight: 16, lfWeight: 700, lfQuality: 0, faceName: 'System Fixed Font',
+            };
         case STOCK_DEFAULT_BITMAP:
             return { handle: objectId, type: 'BITMAP', data: { width: 1, height: 1, pixels: null } };
         default:
@@ -549,6 +573,8 @@ export function createCompatibleBitmap(gdi: GDIContext, hdc: number, cx: number,
         height: cy,
         loading: false,
         pixels: pixels,
+        // A DDB's rendered canvas remains authoritative after the first draw.
+        compatibleBitmap: true,
         compatibleEmpty: true,
     };
 

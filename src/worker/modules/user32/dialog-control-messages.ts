@@ -11,6 +11,11 @@ import { System } from '../../core/system';
 import { WindowInfo, windows, buttonCheckStates, getOrCreateListState, getOrCreateTrackbarState, controlImageHandles } from './shared-state';
 import { handleAnimateMessage } from './animate-control';
 import { handleEditMessage, isEditContentMessage, isEditControl, setEditControlText } from './edit-control';
+import {
+    handleListViewMessage,
+    isListViewContentMessage,
+    isListViewControl,
+} from './list-view-control';
 import { setScrollPos, getScrollPos, setScrollRange, getScrollRange, applyScrollInfo, readScrollInfo } from './scroll-state';
 import { paintSystemControl, clampListTopIndex, listVisibleCount } from './controls';
 import { repaintDialogAfterContentChange, restampOwnedPopupsAbove } from './dialog-paint';
@@ -69,7 +74,8 @@ export function isContentChangingMessage(child: WindowInfo, msg: number): boolea
         || (msg >= LB_ADDSTRING && msg <= LB_SETCURSEL)
         || (msg >= TBM_SETPOS && msg <= TBM_SETRANGEMAX)
         || (msg >= 0x0401 && msg <= 0x0406)
-        || (isEditControl(child) && isEditContentMessage(msg));
+        || (isEditControl(child) && isEditContentMessage(msg))
+        || (isListViewControl(child) && isListViewContentMessage(msg));
 }
 
 /**
@@ -133,6 +139,12 @@ export function handleSystemControlMessage(
     if (isEditControl(child)) {
         const editResult = handleEditMessage(child, msg, wParam, lParam, mem, textWidth);
         if (editResult !== null) return editResult;
+    }
+
+    // SysListView32 owns LVM_* (0x1000+); must run before the WM_USER trackbar gate.
+    if (isListViewControl(child)) {
+        const lvResult = handleListViewMessage(child, msg, wParam, lParam, mem);
+        if (lvResult !== null) return lvResult;
     }
 
     const readAnsiOrWideString = (ptr: number): string => readAnsiOrWideFromGuest(mem, ptr, textWidth);

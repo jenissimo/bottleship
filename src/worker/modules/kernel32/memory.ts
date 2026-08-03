@@ -4,11 +4,11 @@
  * Atomic implementation for memory operations
  */
 
-import { FastPathImplementation, ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
+import { FastPathImplementation, ThunkImplementation, type X86Context } from '../../core/thunking/thunk-dispatcher';
 import type { ThunkMemoryRegions } from '../../core/thunking/thunk-memory-manager';
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
-import { bumpFastmemGeneration, type RegionPerms } from '../../core/memory/address-space';
+import { type RegionPerms } from '../../core/memory/address-space';
 import { Mem } from '../../core/memory/mem-accessor';
 import { registerGuestCommitNotifier } from '../../core/memory/guest-page-commit';
 import { profiler } from '../../core/profiler';
@@ -28,7 +28,6 @@ const HEAP_FAST_PATH_MAX_ALLOC = 0x20000000;
 const DEBUG_FORCE_ZERO_HEAP_FAST_PATH = false;
 export const HEAP_SMALL_ALLOC_MAX = 0x1000; // 4KB — the slab fast path covers blocks up to this
 const HEAP_ALLOC_GRANULARITY = 16;   // small allocs rounded up (Win32 heap granularity)
-const FASTMEM_BUMP_ADDRESS_SPACE_PROTECT = 3;
 
 const alignSmallAlloc = (size: number): number =>
     (size + (HEAP_ALLOC_GRANULARITY - 1)) & ~(HEAP_ALLOC_GRANULARITY - 1);
@@ -135,6 +134,25 @@ let slabRanges: Array<{ base: number; end: number }> = [];
 let totalSlabBytes = 0;
 let nextSlabSize = HEAP_SLAB_INITIAL_SIZE;
 let slabGrowLastAttempt = 0; // performance.now() of last grow attempt (throttle)
+
+// VirtualAlloc roots (base -> size). Same MemoryManager bucket as HeapAlloc, but they
+// are NOT heap blocks: HeapSize must return (SIZE_T)-1 and HeapWalk must omit them,
+// or third-party heaps (SmartHeap) treat a VirtualAlloc pool as HeapAlloc memory,
+// HeapFree the pool base, and reuse sub-allocations still held by the CRT (_piob UAF).
+const virtualAllocRegions: Map<number, number> = new Map();
+
+function isVirtualAllocBase(ptr: number): boolean {
+    return virtualAllocRegions.has(ptr >>> 0);
+}
+
+function isInVirtualAllocRegion(ptr: number): boolean {
+    const p = ptr >>> 0;
+    if (virtualAllocRegions.has(p)) return true;
+    for (const [base, size] of virtualAllocRegions) {
+        if (p >= base && p < base + size) return true;
+    }
+    return false;
+}
 
 /** Low-level: allocate one slab of `size` bytes and install it as the active one. */
 function installNewSlab(size: number): boolean {
@@ -282,9 +300,11 @@ function buildHeapWalkSnapshot(view: DataView): HeapBlock[] {
         }
     }
 
-    // 2) Standalone HEAP allocations (newest-first), minus the slab arena roots.
+    // 2) Standalone HEAP allocations (newest-first), minus the slab arena roots
+    //    and VirtualAlloc regions (those are not HeapAlloc blocks — see virtualAllocRegions).
     const standalone = process.memory.snapshotHeapAllocations();
     for (const b of standalone) {
+        if (isVirtualAllocBase(b.addr)) continue;
         if (!isInAnySlab(b.addr)) out.push({ addr: b.addr, size: b.size, busy: true });
     }
     return out;
@@ -296,6 +316,7 @@ export function resetHeapSlab(): void {
     totalSlabBytes = 0;
     nextSlabSize = HEAP_SLAB_INITIAL_SIZE;
     slabGrowLastAttempt = 0;
+    virtualAllocRegions.clear();
     hypercallDataManager.resetHeapSlab();
     createdHeaps.clear();
     nextCreatedHeapHandle = HEAP_CREATE_HANDLE_BASE;
@@ -315,6 +336,11 @@ export function resetHeapSlab(): void {
  * "SURFACE bucket overflow" crashes — compares used/free for HEAP, SURFACE,
  * THUNK_CODE, etc. and counts free-list blocks (nonzero = frees happening).
  */
+(globalThis as any).getHighHeapReport = () => {
+    const process = System.getInstance().process;
+    return process?.memory?.getHighHeapReport?.() ?? null;
+};
+
 (globalThis as any).getMemReport = () => {
     const process = System.getInstance().process;
     if (!process) return null;
@@ -334,6 +360,7 @@ export function resetHeapSlab(): void {
         };
     });
 };
+
 
 /**
  * DevTools diagnostic: audit the 9 per-bin slab free-lists for corruption.
@@ -609,9 +636,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
     // Track reserved pages (address -> size in bytes)
     const reservedPages: Map<number, number> = new Map();
 
-    // Track VirtualAlloc root regions (base -> size), regardless of RESERVE/COMMIT mix.
-    // VirtualFree validation must use this map (exact base for MEM_RELEASE, range containment for MEM_DECOMMIT).
-    const virtualAllocRegions: Map<number, number> = new Map();
+    // virtualAllocRegions is module-scoped (shared with HeapWalk/HeapSize).
 
     // Track decommitted page ranges within reserved regions.
     // Key = page-aligned address, Value = size in bytes.
@@ -1067,11 +1092,19 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             const MEM_COMMIT = 0x1000, MEM_RESERVE = 0x2000, MEM_FREE = 0x10000;
             const MEM_PRIVATE = 0x20000, MEM_IMAGE = 0x01000000;
             const PAGE_EXECUTE_READ_C = 0x20;
-            // Upper bound of usable user address space (matches GetSystemInfo).
-            const MAX_APP_ADDR = 0x7FFF0000;
+            // FREE-coalesce ceiling = backed guest RAM. GetSystemInfo still reports
+            // 0x7FFEFFFF (Win32 userspace), but advertising MEM_FREE for the unbacked
+            // hole [mem.length .. 0x7FFF0000) made SmartHeap MemPoolPreAllocate that
+            // entire remnant (~800MB TOP_DOWN VirtualAlloc) and MessageBox OOM.
+            const memLen = mem.length >>> 0;
+            const MAX_APP_ADDR = memLen;
 
             const pageBase = (lpAddress & ~0xFFF) >>> 0;
+            if (pageBase >= memLen) {
+                return 0;
+            }
 
+            let baseAddress = pageBase;
             let allocationBase = pageBase;
             let regionSize = 0x1000;
             let protect = PAGE_READWRITE;
@@ -1091,7 +1124,8 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             // pages below the SURFACE frontier are backed — the rest fall through to the free-gap
             // coalescing and are skipped in one MEM_FREE step (ROM stays whole-span: PE images
             // there are already coalesced by the MEM_IMAGE branch above).
-            const surfaceFrontier = system.process?.memory?.getBucketFrontier('SURFACE') ?? (MEM_SURFACE_BASE + MEM_SURFACE_SIZE);
+            const surfaceEnd = MEM_SURFACE_BASE + MEM_SURFACE_SIZE;
+            const surfaceFrontier = system.process?.memory?.getBucketFrontier('SURFACE') ?? surfaceEnd;
             const isBackedInterval = (a: number): boolean =>
                 (a >= MEM_HEAP_BASE && a < MEM_THUNK_DATA_BASE + MEM_THUNK_DATA_SIZE) ||
                 (a >= MEM_ROM_BASE && a < MEM_SURFACE_BASE) ||
@@ -1111,6 +1145,18 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 memType = MEM_IMAGE;
                 protect = PAGE_EXECUTE_READ_C;
                 state = MEM_COMMIT;
+            } else if (pageBase >= surfaceFrontier && pageBase < surfaceEnd) {
+                // Virgin SURFACE tail: MEM_RESERVE (bucket reserved for pixels), not MEM_FREE.
+                // Advertising it as FREE let SmartHeap MemPoolPreAllocate hundreds of MB via
+                // MEM_TOP_DOWN VirtualAlloc and collide with the surface bump / OOM.
+                // BaseAddress = frontier (region start), not pageBase — Win32 walkers step
+                // Base+RegionSize; page-granular Base made TOP_DOWN walks crawl 4KB at a time.
+                baseAddress = surfaceFrontier & ~0xFFF;
+                allocationBase = MEM_SURFACE_BASE;
+                regionSize = surfaceEnd - baseAddress;
+                memType = MEM_PRIVATE;
+                protect = PAGE_NOACCESS;
+                state = MEM_RESERVE;
             } else {
                 // 3) Generic memory. A backed page (heap/thunk/rom/surface bucket OR a tracked
                 // VirtualAlloc region) stays page-granular COMMIT — exactly what it was before.
@@ -1119,14 +1165,30 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 // old behaviour) made guest address-space walkers (addr = BaseAddress + RegionSize)
                 // advance 4KB at a time and never see MEM_FREE, scanning the entire 4GB one page at
                 // a time — the BoD VirtualQuery storm (19k+ calls), 2026-06-12.
-                let inVaRegion = false;
+                // Tracked VirtualAlloc regions: Win32 reports AllocationBase = the
+                // original VirtualAlloc base for every page in the reservation.
+                // SmartHeap/Shw32 validates interior pointers against that base; page-
+                // granular AllocationBase made every sub-page look like its own alloc.
+                let vaBase = 0;
+                let vaSize = 0;
                 for (const [base, size] of virtualAllocRegions) {
-                    if (pageBase >= base && pageBase < base + size) { inVaRegion = true; break; }
+                    if (pageBase >= base && pageBase < base + size) {
+                        vaBase = base;
+                        vaSize = size;
+                        break;
+                    }
                 }
 
-                if (isBackedInterval(pageBase) || inVaRegion) {
-                    // Page-granular COMMIT, AllocationBase = the page itself (old semantics —
-                    // SmartHeap tolerated this through the whole boot/launcher/map-load path).
+                if (vaSize !== 0) {
+                    allocationBase = vaBase;
+                    regionSize = vaBase + vaSize - pageBase;
+                    memType = MEM_PRIVATE;
+                    protect = PAGE_READWRITE;
+                    state = MEM_COMMIT;
+                } else if (isBackedInterval(pageBase)) {
+                    // Page-granular COMMIT for the rest of the HEAP/thunk/rom buckets —
+                    // coalescing the whole HEAP into AllocationBase=HEAP_BASE made
+                    // SmartHeap reject every pointer as MEM_BAD_POINTER.
                     allocationBase = pageBase;
                     regionSize = 0x1000;
                     memType = MEM_PRIVATE;
@@ -1139,6 +1201,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                     consider(0x00400000);
                     consider(MEM_HEAP_BASE);
                     consider(MEM_ROM_BASE);
+                    consider(MEM_SURFACE_BASE);
                     for (const [base] of virtualAllocRegions) consider(base);
                     allocationBase = 0;
                     regionSize = Math.max(0x1000, nextBase - pageBase);
@@ -1161,7 +1224,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             }
 
             const reportProtect = (state === MEM_RESERVE || state === MEM_FREE) ? PAGE_NOACCESS : protect;
-            view.setUint32(lpBuffer, pageBase, true);                 // BaseAddress
+            view.setUint32(lpBuffer, baseAddress, true);              // BaseAddress
             view.setUint32(lpBuffer + 4, allocationBase, true);       // AllocationBase
             view.setUint32(lpBuffer + 8, state === MEM_FREE ? 0 : protect, true); // AllocationProtect
             view.setUint32(lpBuffer + 12, regionSize, true);          // RegionSize
@@ -1171,7 +1234,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 
             const stateName = state === MEM_FREE ? 'FREE' : state === MEM_RESERVE ? 'RESERVE' : 'COMMIT';
             Logger.verbose(LogCategory.KERNEL32,
-                `VirtualQuery(0x${lpAddress.toString(16)}) -> base=0x${allocationBase.toString(16)} size=0x${regionSize.toString(16)} state=${stateName} type=0x${memType.toString(16)}`);
+                `VirtualQuery(0x${lpAddress.toString(16)}) -> base=0x${baseAddress.toString(16)} alloc=0x${allocationBase.toString(16)} size=0x${regionSize.toString(16)} state=${stateName} type=0x${memType.toString(16)}`);
 
             return 28; // sizeof(MEMORY_BASIC_INFORMATION)
         }
@@ -1204,12 +1267,18 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             return 0;
         }
 
+        // Cap lpMaximumApplicationAddress to backed guest RAM. Reporting the full
+        // Win32 2GB userspace (0x7FFEFFFF) while VirtualQuery refuses / cannot back
+        // [mem.length..2GB) made SmartHeap (MEM_TOP_DOWN walk / MemPoolPreAllocate)
+        // VirtualAlloc a ~800MB phantom free remnant and MessageBox OOM.
+        const maxAppAddr = mem.length > 0 ? ((mem.length - 1) >>> 0) : 0x7FFEFFFF;
+
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         view.setUint16(lpSystemInfo + 0, 0, true); // wProcessorArchitecture (x86)
         view.setUint16(lpSystemInfo + 2, 0, true); // wReserved
         view.setUint32(lpSystemInfo + 4, 0x1000, true); // dwPageSize
         view.setUint32(lpSystemInfo + 8, 0x00010000, true); // lpMinimumApplicationAddress
-        view.setUint32(lpSystemInfo + 12, 0x7FFEFFFF, true); // lpMaximumApplicationAddress
+        view.setUint32(lpSystemInfo + 12, maxAppAddr, true); // lpMaximumApplicationAddress
         view.setUint32(lpSystemInfo + 16, 1, true); // dwActiveProcessorMask
         view.setUint32(lpSystemInfo + 20, 1, true); // dwNumberOfProcessors
         view.setUint32(lpSystemInfo + 24, 586, true); // dwProcessorType (Pentium)
@@ -1394,13 +1463,22 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         const process = system.process;
         if (process && lpMem) {
             heapWatch('free', ctx, mem, [lpMem]);
+            const p = lpMem >>> 0;
+            // VirtualAlloc roots are not HeapAlloc blocks. Freeing them here would tear
+            // down a SmartHeap/CRT pool while interior owners still hold pointers.
+            if (isInVirtualAllocRegion(p)) {
+                system.scheduler.setLastError(ERROR_INVALID_PARAMETER);
+                Logger.warn(LogCategory.KERNEL32,
+                    `HeapFree(0x${p.toString(16)}): refusing VirtualAlloc region (use VirtualFree)`);
+                return 0;
+            }
             // Retired-slab blocks: the inline stub validates against the *active* slab
             // only, so frees targeting a previous generation fall here. Treat as no-op
             // (the bytes stay "reserved" inside the retired slab until process reset).
             // Must run BEFORE process.memory.free — the pointer is an interior slab
             // offset, not a root allocation, and free would either throw or mistarget
             // the enclosing slab arena.
-            if (isInAnySlab(lpMem >>> 0)) {
+            if (isInAnySlab(p)) {
                 // DIAG: a slab pointer reaching JS HeapFree was rejected by the WASM/inline
                 // fast path. A FREE-marked header (0x534C46xx) means a DOUBLE-FREE — capture
                 // the guest caller to find the load-bearing double-free source.
@@ -1648,10 +1726,9 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                     if (oldSize === undefined) {
                         oldSize = process.memory.getSize(lpMem);
                     }
-                    if (oldSize === undefined) {
-                        const region = process.addressSpace.getRegion(lpMem);
-                        if (region) oldSize = region.size - (lpMem - region.base);
-                    }
+                    // Do NOT fall back to AddressSpace layout-bucket size: the HEAP bucket
+                    // is hundreds of MB and would copy / "relocate" unrelated VirtualAlloc
+                    // pool contents. Unknown size → copy nothing (same as a failed probe).
                     if (oldSize === undefined) {
                         Logger.warn(LogCategory.KERNEL32,
                             `HeapReAlloc DATA LOSS: size unknown for 0x${lpMem.toString(16)}! newSize=${dwBytes} newAddr=0x${newAddress.toString(16)} ${formatCallSite(ctx, mem, 4, [0x38, 0x44], [lpMem])}`);
@@ -1687,9 +1764,12 @@ export const exports: Record<string, ThunkImplementation> = (() => {
     exports['HeapSize'] = (ctx, mem, args) => {
         const hHeap = args[0];
         const dwFlags = args[1];
-        const lpMem = args[2];
+        const lpMem = args[2] >>> 0;
 
         Logger.verbose(LogCategory.KERNEL32, `HeapSize(0x${hHeap.toString(16)}, 0x${dwFlags.toString(16)}, 0x${lpMem.toString(16)})`);
+
+        // VirtualAlloc memory is not a heap block — Win32 returns (SIZE_T)-1.
+        if (!lpMem || isInVirtualAllocRegion(lpMem)) return 0xFFFFFFFF;
 
         // Check WASM slab first (most common for small allocations)
         const slabSize = getSlabSizeForPtr(lpMem);
@@ -1699,14 +1779,12 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         if (process) {
             const size = process.memory.getSize(lpMem);
             if (size !== undefined) return size;
-
-            // Fallback: check address space regions
-            const region = process.addressSpace.getRegion(lpMem);
-            if (region) return region.size;
         }
 
-        // Return a dummy size if not found
-        return 1024; // 1KB
+        // Exact HeapAlloc base only. Layout-bucket / dummy sizes lied to SmartHeap:
+        // a VirtualAlloc pool base looked like a live HeapAlloc block → HeapFree of the
+        // pool while CRT still held interior pointers (_piob).
+        return 0xFFFFFFFF;
     };
 
     // UINT HeapCompact(HANDLE hHeap, DWORD dwFlags)
@@ -1752,6 +1830,12 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         const flAllocationType = args[2];
         const flProtect = args[3];
 
+        const fail = (why: string): 0 => {
+            Logger.warn(LogCategory.KERNEL32,
+                `VirtualAlloc FAIL ${why} (lpAddr=0x${(lpAddress >>> 0).toString(16)}, size=0x${(dwSize >>> 0).toString(16)}, type=0x${(flAllocationType >>> 0).toString(16)}, prot=0x${(flProtect >>> 0).toString(16)})`);
+            return 0;
+        };
+
         Logger.verbose(LogCategory.KERNEL32, `VirtualAlloc(lpAddr=0x${lpAddress.toString(16)}, size=${dwSize}, type=0x${flAllocationType.toString(16)}, prot=0x${flProtect.toString(16)})`);
 
         const MEM_COMMIT = 0x1000;
@@ -1760,8 +1844,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         const ALLOC_GRANULARITY = 0x10000; // 64KB — Windows allocation granularity
 
         if (!(flAllocationType & MEM_COMMIT) && !(flAllocationType & MEM_RESERVE)) {
-            Logger.warn(LogCategory.KERNEL32, 'VirtualAlloc: Invalid allocation type');
-            return 0;
+            return fail('invalid allocation type');
         }
 
         const alignedSize = Math.ceil(dwSize / PAGE_SIZE) * PAGE_SIZE;
@@ -1770,8 +1853,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 
         if (effectiveAddress !== 0 && overlapsThunkRegion(effectiveAddress, alignedSize)) {
             System.getInstance().scheduler.setLastError(ERROR_INVALID_ADDRESS);
-            Logger.warn(LogCategory.KERNEL32, `VirtualAlloc: Address 0x${effectiveAddress.toString(16)} overlaps thunk regions`);
-            return 0;
+            return fail(`address overlaps thunk regions`);
         }
 
         const process = System.getInstance().process;
@@ -1782,6 +1864,8 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 
         const perms = mapProtectToPerms(flProtect);
         let address = effectiveAddress;
+        const MEM_TOP_DOWN = 0x00100000;
+        const ERROR_NOT_ENOUGH_MEMORY = 8;
 
         // MEM_COMMIT-only with specific address: commit pages within an already reserved region.
         // When lpAddress=0, Windows implicitly reserves+commits — fall through to the allocation path.
@@ -1811,8 +1895,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             }
             // Committing without prior reserve is invalid
             System.getInstance().scheduler.setLastError(ERROR_INVALID_ADDRESS);
-            Logger.warn(LogCategory.KERNEL32, `VirtualAlloc: MEM_COMMIT at 0x${effectiveAddress.toString(16)} not within reserved region`);
-            return 0;
+            return fail(`MEM_COMMIT not within reserved region`);
         }
 
         profiler.start("VirtualAlloc:alloc");
@@ -1824,26 +1907,41 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 // If two pools share the same >> 16 index (within same 64KB chunk),
                 // Free() decrements the WRONG pool's Taken counter → premature VirtualFree
                 // → use-after-free of GNames/other critical data.
-                address = process.memory.alloc(alignedSize, 'HEAP', perms, ALLOC_GRANULARITY);
+                //
+                // MEM_TOP_DOWN (SmartHeap/Shw32, FastMM, …): highest available VA — share
+                // the HEAP high frontier with the slab arena so pools stay segregated from
+                // bottom-up HeapAlloc. Ignoring it handed low addresses and SmartHeap's
+                // pool math eventually VirtualAlloc'd a multi-hundred-MB bogus size.
+                if (flAllocationType & MEM_TOP_DOWN) {
+                    address = process.memory.allocFromHigh(alignedSize, ALLOC_GRANULARITY);
+                } else {
+                    address = process.memory.alloc(alignedSize, 'HEAP', perms, ALLOC_GRANULARITY);
+                }
             } else {
                 process.memory.allocAt(address, alignedSize, 'HEAP', perms);
             }
         } catch (error) {
             profiler.end("VirtualAlloc:alloc");
-            System.getInstance().scheduler.setLastError(ERROR_INVALID_ADDRESS);
-            Logger.warn(LogCategory.KERNEL32, `VirtualAlloc: Allocation failed: ${error}`);
-            return 0;
+            System.getInstance().scheduler.setLastError(ERROR_NOT_ENOUGH_MEMORY);
+            const high = process.memory.getHighHeapReport?.();
+            return fail(
+                `Allocation failed: ${error}` +
+                (high ? ` high={next=0x${high.next.toString(16)} slabTop=0x${high.slabTop.toString(16)} freeMB=${high.freeHighMB}}` : ''),
+            );
         }
         profiler.end("VirtualAlloc:alloc");
 
+        // allocFromHigh/alloc may round up to 64KB granularity — track the live block size.
+        const committedSize = process.memory.getSize(address) ?? alignedSize;
+
         if (flAllocationType & MEM_RESERVE) {
-            reservedPages.set(address, alignedSize);
-            Logger.verbose(LogCategory.KERNEL32, `VirtualAlloc: Reserved ${alignedSize} bytes at 0x${address.toString(16)}`);
+            reservedPages.set(address, committedSize);
+            Logger.verbose(LogCategory.KERNEL32, `VirtualAlloc: Reserved ${committedSize} bytes at 0x${address.toString(16)}`);
         }
 
         const trackedSize = virtualAllocRegions.get(address) ?? 0;
-        if (alignedSize > trackedSize) {
-            virtualAllocRegions.set(address, alignedSize);
+        if (committedSize > trackedSize) {
+            virtualAllocRegions.set(address, committedSize);
         }
 
         if (flAllocationType & MEM_COMMIT) {
@@ -2034,8 +2132,6 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             const ptm = process.pageTableManager;
             if (ptm?.isPagingEnabled()) {
                 ptm.setProtection(alignedAddr, alignedSize, flNewProtect);
-            } else {
-                bumpFastmemGeneration(FASTMEM_BUMP_ADDRESS_SPACE_PROTECT);
             }
             // Fake success for sub-region (e.g. page inside PE). App expects TRUE;
             // otherwise CRT aborts via INT 0x29. We already wrote lpflOldProtect.
@@ -2044,9 +2140,8 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             return 1;
         }
 
-        // Also update PTEs if paging is active. addressSpace.protect() already
-        // bumped the fastmem generation for this VirtualProtect, so suppress the
-        // PTE-level bump here — one syscall = one generation bump.
+        // Also update PTEs if paging is active. The read map is updated by the
+        // PTE-level operation itself.
         const ptm = process.pageTableManager;
         if (ptm?.isPagingEnabled()) {
             ptm.setProtection(alignedAddr, alignedSize, flNewProtect, false);
@@ -2652,6 +2747,105 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 })();
 
 /**
+ * DevTools/harness: walk VirtualQuery the way SmartHeap does (addr += RegionSize)
+ * and report GetSystemInfo max + largest FREE/RESERVE. Diagnoses phantom TOP_DOWN
+ * MemPoolPreAllocate sizes (BoD ~807MB OOM).
+ */
+(globalThis as any).getVaMap = () => {
+    const process = System.getInstance().process;
+    if (!process) return null;
+    const mem = process.getCurrentMemory();
+    const memLen = mem.length >>> 0;
+    const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+    const buf = process.memory.alloc(0x1000, 'HEAP');
+    const ctx: X86Context = {
+        eax: 0, ecx: 0, edx: 0, ebx: 0,
+        esp: 0, ebp: 0, esi: 0, edi: 0,
+        eip: 0, eflags: 0,
+    };
+    try {
+        const gsi = exports['GetSystemInfo'];
+        const vq = exports['VirtualQuery'];
+        if (typeof gsi === 'function') gsi(ctx, mem, [buf]);
+        const minApp = view.getUint32(buf + 8, true) >>> 0;
+        const maxApp = view.getUint32(buf + 12, true) >>> 0;
+
+        const MEM_FREE = 0x10000, MEM_RESERVE = 0x2000, MEM_COMMIT = 0x1000;
+        const row = () => {
+            const base = view.getUint32(buf + 0, true) >>> 0;
+            const allocBase = view.getUint32(buf + 4, true) >>> 0;
+            const regionSize = view.getUint32(buf + 12, true) >>> 0;
+            const state = view.getUint32(buf + 16, true) >>> 0;
+            const type = view.getUint32(buf + 24, true) >>> 0;
+            const stateName = state === MEM_FREE ? 'FREE' : state === MEM_RESERVE ? 'RESERVE' : state === MEM_COMMIT ? 'COMMIT' : `0x${state.toString(16)}`;
+            return {
+                base: `0x${base.toString(16)}`,
+                allocBase: `0x${allocBase.toString(16)}`,
+                size: regionSize,
+                sizeHex: `0x${regionSize.toString(16)}`,
+                sizeMB: +(regionSize / 1048576).toFixed(2),
+                state: stateName,
+                type: `0x${type.toString(16)}`,
+            };
+        };
+        const probe = (a: number) => {
+            const rc = typeof vq === 'function' ? (vq(ctx, mem, [a, buf, 28]) as number) : 0;
+            if (!rc) return { addr: `0x${a.toString(16)}`, rc: 0 };
+            return { addr: `0x${a.toString(16)}`, rc, ...row() };
+        };
+        // TOP_DOWN walk (SmartHeap MemPoolPreAllocate style): start at maxApp, step by RegionSize down.
+        const topDown: Array<Record<string, unknown>> = [];
+        let addr = maxApp >>> 0;
+        let steps = 0;
+        while (steps < 4096) {
+            steps++;
+            const rc = typeof vq === 'function' ? (vq(ctx, mem, [addr, buf, 28]) as number) : 0;
+            if (!rc) {
+                topDown.push({ addr: `0x${addr.toString(16)}`, rc: 0 });
+                // Skip into backed RAM if we're still above memLen
+                if (addr >= memLen) {
+                    addr = memLen > 0 ? ((memLen - 1) >>> 0) : 0;
+                    continue;
+                }
+                break;
+            }
+            const r = row();
+            topDown.push({ addr: `0x${addr.toString(16)}`, ...r });
+            const base = parseInt(String(r.base).slice(2), 16) >>> 0;
+            if (base === 0) break;
+            addr = (base - 1) >>> 0;
+            if (addr >= 0x90000000) break; // wrapped
+        }
+        const freeish = topDown
+            .filter((r) => r.state === 'FREE' || r.state === 'RESERVE')
+            .slice()
+            .sort((a, b) => (b.size as number) - (a.size as number));
+        return {
+            memLen,
+            memLenHex: `0x${memLen.toString(16)}`,
+            minApp: `0x${minApp.toString(16)}`,
+            maxApp: `0x${maxApp.toString(16)}`,
+            high: process.memory.getHighHeapReport?.() ?? null,
+            steps,
+            topDownHead: topDown.slice(0, 24),
+            topFreeOrReserve: freeish.slice(0, 16),
+            largestFreeMB: freeish.find((r) => r.state === 'FREE')?.sizeMB ?? 0,
+            largestReserveMB: freeish.find((r) => r.state === 'RESERVE')?.sizeMB ?? 0,
+            probes: {
+                atMemLen: probe(memLen),
+                atMemLenMinusPage: probe(memLen > 0x1000 ? memLen - 0x1000 : 0),
+                at2GB: probe(0x7FFE0000),
+                atSurface: probe(MEM_SURFACE_BASE),
+                atSurfacePlus8M: probe(MEM_SURFACE_BASE + 0x800000),
+                at0x0D904000: probe(0x0D904000),
+            },
+        };
+    } finally {
+        try { process.memory.free(buf); } catch { /* ignore */ }
+    }
+};
+
+/**
  * Register fast-path implementations for high-frequency heap operations.
  * Keeps heap bookkeeping in JS AddressSpace/MemoryManager, but bypasses full thunk marshalling.
  *
@@ -2753,8 +2947,9 @@ export function registerFastPathHeapFunctions(dispatcher: any): void {
         // A slab-resident pointer is an interior offset, not a root allocation:
         // process.memory.free would mistarget the enclosing arena. The slow path owns
         // that case (retired-generation no-op + double-free diagnostics) — defer to it.
+        // VirtualAlloc regions also need the slow path (refuse with ERROR_INVALID_PARAMETER).
         if (lpMem !== 0) {
-            if (isInAnySlab(lpMem)) return null;
+            if (isInAnySlab(lpMem) || isInVirtualAllocRegion(lpMem)) return null;
             process.memory.free(lpMem);
         }
         return 1;
