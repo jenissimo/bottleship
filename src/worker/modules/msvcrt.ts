@@ -85,6 +85,9 @@ export class Msvcrt implements IModule {
     private iobAddr = 0;
     private pioinfoAddr = 0;
     private badioinfoAddr = 0;
+    private lcCodepageAddr = 0;  // int __lc_codepage — the CRT's active ANSI codepage
+    // int _osver/_winmajor/_winminor/_winver — the CRT's cached GetVersion() fields.
+    private osVerVarsAddr = 0;   // 4 consecutive ints in the order above
     private appType = 0;
     private userMathErrHandler = 0;
     private newHandlerPtr = 0;
@@ -378,6 +381,7 @@ export class Msvcrt implements IModule {
             caseUpperTableAddr: () => this.caseUpperTableAddr,
         });
         exports["setlocale"] = (ctx, mem, args) => this.setlocale(args[0] ?? 0, args[1] ?? 0);
+        exports["localeconv"] = () => this.localeconv();
 
         // --- Formatted output ---
         exports["_vsnprintf"] = (ctx, mem, args) => this.vsnprintf(args[0] ?? 0, args[1] ?? 0, args[2] ?? 0, args[3] ?? 0);
@@ -681,6 +685,7 @@ export class Msvcrt implements IModule {
         this.controlFpWord = 0x0009001f;
         this.currentLocale = "C";
         this.localeAddr = 0;
+        this.lconvAddr = 0;
         if (this.errnoAddr) {
             Mem.writeUint32(this.errnoAddr, 0);
         }
@@ -715,11 +720,14 @@ export class Msvcrt implements IModule {
         this.iobAddr = 0;
         this.pioinfoAddr = 0;
         this.badioinfoAddr = 0;
+        this.lcCodepageAddr = 0;
+        this.osVerVarsAddr = 0;
         this.acmdlnVarAddr = 0;
         this.adjustFdivAddr = 0;
         this.qsortCodeAddr = 0;
         this.bsearchCodeAddr = 0;
         this.localeAddr = 0;
+        this.lconvAddr = 0;
 
         this.ensureRuntimeStorage();
         this.registerDataExports();
@@ -733,6 +741,18 @@ export class Msvcrt implements IModule {
         if (this.mbCurMaxAddr === 0) {
             this.mbCurMaxAddr = this.process.memory.alloc(4, "THUNK_DATA", "rw");
             Mem.writeUint32(this.mbCurMaxAddr, 1);
+        }
+        if (this.lcCodepageAddr === 0) {
+            this.lcCodepageAddr = this.process.memory.alloc(4, "THUNK_DATA", "rw");
+            Mem.writeUint32(this.lcCodepageAddr, EmulatorConfig.getInstance().ansiCodePage);
+        }
+        if (this.osVerVarsAddr === 0) {
+            this.osVerVarsAddr = this.process.memory.alloc(16, "THUNK_DATA", "rw");
+            const { major, minor, build } = EmulatorConfig.getInstance().osVersion;
+            Mem.writeUint32(this.osVerVarsAddr, build & 0xffff);          // _osver
+            Mem.writeUint32(this.osVerVarsAddr + 4, major);               // _winmajor
+            Mem.writeUint32(this.osVerVarsAddr + 8, minor);               // _winminor
+            Mem.writeUint32(this.osVerVarsAddr + 12, (major << 8) | minor); // _winver
         }
         if (this.fmodeAddr === 0) {
             this.fmodeAddr = this.process.memory.alloc(4, "THUNK_DATA", "rw");
@@ -906,6 +926,18 @@ export class Msvcrt implements IModule {
         tg.registerDataExport("msvcrt", "__badioinfo", this.badioinfoAddr);
         tg.registerDataExport("msvcrt", "_mbctype", this.mbctypeAddr);
 
+        // Locale/ctype/OS variables the CRT exports as data. A DLL linked against
+        // msvcrt reads them directly (MB_CUR_MAX, isX() via _pctype[c]); resolving one
+        // to a call stub hands back executable bytes as the value, and the import of a
+        // name with no argCount aborts the whole LoadLibrary.
+        tg.registerDataExport("msvcrt", "__mb_cur_max", this.mbCurMaxAddr);
+        tg.registerDataExport("msvcrt", "_pctype", this.pctypeVarAddr);
+        tg.registerDataExport("msvcrt", "__lc_codepage", this.lcCodepageAddr);
+        tg.registerDataExport("msvcrt", "_osver", this.osVerVarsAddr);
+        tg.registerDataExport("msvcrt", "_winmajor", this.osVerVarsAddr + 4);
+        tg.registerDataExport("msvcrt", "_winminor", this.osVerVarsAddr + 8);
+        tg.registerDataExport("msvcrt", "_winver", this.osVerVarsAddr + 12);
+
         if (this.ehPrologAddr === 0) {
             this.ehPrologAddr = ensureNativeEHProlog(this.process);
         }
@@ -984,6 +1016,7 @@ export class Msvcrt implements IModule {
         config.ansiCodePage = resolved;
         const mbCurMax = Msvcrt.DBCS_CODE_PAGES.has(resolved) ? 2 : 1;
         Mem.writeUint32(this.mbCurMaxAddr, mbCurMax);
+        Mem.writeUint32(this.lcCodepageAddr, resolved);
 
         if (this.mbctypeAddr) {
             Mem.writeBytes(this.mbctypeAddr, new Uint8Array(257));
@@ -2473,6 +2506,29 @@ export class Msvcrt implements IModule {
         // and the ANSI codepage's case-folding — rebuild the shared LUTs (stub + JS read them).
         this.buildCaseTables();
         return this.localeAddr >>> 0;
+    }
+
+    /**
+     * struct lconv* localeconv(void) — 10 char* fields then 8 chars (48 bytes).
+     * Only LC_NUMERIC is ever set by setlocale() here, so the struct stays the "C"
+     * locale's: "." for decimal_point, empty strings elsewhere, CHAR_MAX for the
+     * formatting chars ("not available", which is what the C locale specifies).
+     * Callers that parse floats locale-independently read decimal_point and compare.
+     */
+    private lconvAddr = 0;
+    private localeconv(): number {
+        if (this.lconvAddr) return this.lconvAddr >>> 0;
+        const LCONV_SIZE = 48;
+        const empty = this.process.memory.alloc(2, "THUNK_DATA", "rw");
+        this.writeCString(empty, "");
+        const dot = this.process.memory.alloc(2, "THUNK_DATA", "rw");
+        this.writeCString(dot, ".");
+        const addr = this.process.memory.alloc(LCONV_SIZE, "THUNK_DATA", "rw");
+        Mem.writeUint32(addr, dot);
+        for (let off = 4; off < 40; off += 4) Mem.writeUint32(addr + off, empty);
+        for (let off = 40; off < LCONV_SIZE; off++) Mem.writeUint8(addr + off, 0x7f); // CHAR_MAX
+        this.lconvAddr = addr;
+        return addr >>> 0;
     }
 
     // ==================== Formatted output (new) ====================

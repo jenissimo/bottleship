@@ -207,6 +207,7 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("wcstombs", 3),
         makeFunc("wctomb", 2),
         makeFunc("setlocale", 2),
+        makeFunc("localeconv", 0),
 
         // Formatted output
         makeFunc("_vsnprintf", 4),
@@ -243,6 +244,9 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("atan", 2),
         makeFunc("atan2", 4),
         makeFunc("tan", 2),
+        makeFunc("sinh", 2),
+        makeFunc("cosh", 2),
+        makeFunc("tanh", 2),
         makeFunc("fmod", 4),
         makeFunc("fabs", 2),
         makeFunc("log", 2),
@@ -373,6 +377,8 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("_fstat64i32", 2),
         makeFunc("_stat64", 2),
         makeFunc("_fstat64", 2),
+        makeFunc("_stati64", 2),
+        makeFunc("_fstati64", 2),
         makeFunc("_findfirst64i32", 2),
         makeFunc("_findnext64i32", 2),
         makeFunc("_findclose", 1),
@@ -386,6 +392,7 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("_controlfp_s", 3),
         makeFunc("memchr", 3),
         makeFunc("strcspn", 2),
+        makeFunc("strspn", 2),
         makeFunc("_gcvt", 4),   // double occupies two stack dwords + ndec + buf
         makeFunc("_ismbblead", 1),
         makeFunc("localtime", 1),

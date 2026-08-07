@@ -46,6 +46,14 @@ const TIME_CALLBACK_EVENT_PULSE = 0x0020;
 const TIME_CALLBACK_TYPEMASK = 0x0030;
 const TIME_KILL_SYNCHRONOUS = 0x0100;
 const DEBUG_WINMM_TIMER = true;
+// Installable-driver messages (mmsystem.h) answered by DefDriverProc.
+const DRV_LOAD = 0x0001;
+const DRV_ENABLE = 0x0002;
+const DRV_DISABLE = 0x0005;
+const DRV_FREE = 0x0006;
+const DRV_INSTALL = 0x0009;
+const DRV_REMOVE = 0x000a;
+const DRV_SUCCESS = 0x0001;
 const JOYERR_NOERROR = 0;
 const JOYERR_UNPLUGGED = 167;
 
@@ -92,6 +100,7 @@ const MMIOINFO_SIZE       = 72;   // sizeof(MMIOINFO)
 // Windows uses an internal 8KB buffer; a larger window cuts mmioAdvance churn.
 const MMIO_GUEST_BUFSIZE  = 64 * 1024;
 const FCC_DOS = 0x20534f44; // 'DOS ' — fccIOProc for a plain disk file
+const FCC_MEM = 0x204d454d; // 'MEM ' — fccIOProc for a memory file (mmioOpen with a NULL name)
 
 /** The MMIO direct-I/O buffering state an MMIOHandle carries (subset used by the
  *  pure helpers below). Kept structural so it's testable without the WinMM class. */
@@ -102,6 +111,8 @@ export interface MmioBufState {
     guestBufferSize?: number;
     bufFileOffset?: number;
     bufFilled?: number;
+    /** Memory file: guestBuffer aliases the caller's own block (see MMIOHandle). */
+    memoryBase?: number;
 }
 
 /**
@@ -130,14 +141,23 @@ export function mmioWriteInfoStruct(lpmmioinfo: number, hmmio: number, state: Mm
     const base = state.guestBuffer ?? 0;
     const filled = state.bufFilled ?? 0;
     const bufOff = state.bufFileOffset ?? 0;
-    Mem.writeUint32(lpmmioinfo + MMIOINFO_DWFLAGS,    MMIO_READ | MMIO_ALLOCBUF);
-    Mem.writeUint32(lpmmioinfo + MMIOINFO_FCCIOPROC,  FCC_DOS);
+    // A memory file's buffer is the caller's, so neither ALLOCBUF nor the disk IOProc apply.
+    const isMem = !!state.memoryBase;
+    Mem.writeUint32(lpmmioinfo + MMIOINFO_DWFLAGS,    isMem ? MMIO_READ : (MMIO_READ | MMIO_ALLOCBUF));
+    Mem.writeUint32(lpmmioinfo + MMIOINFO_FCCIOPROC,  isMem ? FCC_MEM : FCC_DOS);
     Mem.writeUint32(lpmmioinfo + MMIOINFO_PIOPROC,    0);
     Mem.writeUint32(lpmmioinfo + MMIOINFO_WERRORRET,  0);
     Mem.writeUint32(lpmmioinfo + MMIOINFO_HTASK,      0);
     Mem.writeUint32(lpmmioinfo + MMIOINFO_CCHBUFFER,  state.guestBufferSize ?? 0);
     Mem.writeUint32(lpmmioinfo + MMIOINFO_PCHBUFFER,  base);
-    Mem.writeUint32(lpmmioinfo + MMIOINFO_PCHNEXT,    base);
+    // pchNext is the READ CURSOR, not the buffer start: it must land on the current file
+    // position within the window. Handing back `base` rewinds the caller to offset 0, and
+    // a caller that reads its data through the buffer (rather than through mmioRead) then
+    // consumes the file from the beginning — for a WAV that means decoding the letters
+    // "RIFF" as audio, which is heard as loud, structured, saturating garbage rather than
+    // reported as an error.
+    const cursor = Math.max(0, Math.min((state.position ?? 0) - bufOff, filled));
+    Mem.writeUint32(lpmmioinfo + MMIOINFO_PCHNEXT,    (base + cursor) >>> 0);
     Mem.writeUint32(lpmmioinfo + MMIOINFO_PCHENDREAD, (base + filled) >>> 0);
     Mem.writeUint32(lpmmioinfo + MMIOINFO_PCHENDWRITE,(base + filled) >>> 0);
     Mem.writeUint32(lpmmioinfo + MMIOINFO_LBUFOFFSET, bufOff);
@@ -201,6 +221,9 @@ interface MMIOHandle {
     bufFileOffset?: number;
     /** Valid bytes currently held in guestBuffer (pchEndRead - pchBuffer). */
     bufFilled?: number;
+    /** Set for a MEMORY file (mmioOpen with a NULL name): the caller's own buffer IS the
+     *  file, so guestBuffer aliases it and must never be freed or refilled by us. */
+    memoryBase?: number;
 }
 
 type TimerCallbackMode = "function" | "event_set" | "event_pulse";
@@ -353,6 +376,9 @@ export class WinMM implements IModule {
      */
     private mmioRefillGuestBuffer(mmio: MMIOHandle): number {
         if (!mmio.data) return 0;
+        // A memory file has no window to slide: the caller's whole block is already the file,
+        // and copying it over itself would be both pointless and destructive of guest writes.
+        if (mmio.memoryBase) return Math.max(0, mmio.data.length - mmio.position);
         if (!mmio.guestBuffer) {
             const mem = System.getInstance().process?.memory;
             const cap = MMIO_GUEST_BUFSIZE;
@@ -1688,6 +1714,29 @@ export class WinMM implements IModule {
 
         registerWinmmJoystickExports(this.exports);
 
+        // ==================== Installable drivers ====================
+
+        // DefDriverProc(dwDriverId, hDrv, msg, lParam1, lParam2) — the default handler an
+        // installable driver's DriverProc tail-calls for the messages it doesn't answer.
+        // Every VfW codec DLL loaded in-process (ir50_32, ir41_32, …) resolves it by name,
+        // and a NULL there is called straight through to EIP 0.
+        const defDriverProc = (_ctx: unknown, _mem: unknown, args: number[]): number => {
+            switch (args[2] ?? 0) {
+                case DRV_LOAD:
+                case DRV_ENABLE:
+                case DRV_DISABLE:
+                case DRV_FREE:
+                    return 1;
+                case DRV_INSTALL:
+                case DRV_REMOVE:
+                    return DRV_SUCCESS;
+                default:
+                    return 0;
+            }
+        };
+        this.exports["DefDriverProc"] = defDriverProc;
+        this.exports["DrvDefDriverProc"] = defDriverProc;
+
         // ==================== MCI Functions ====================
 
         // mciGetDeviceIDA / mciSendCommandA / mciSendStringA / mciGetErrorStringA plus the
@@ -1753,10 +1802,38 @@ export class WinMM implements IModule {
                 }
             }
 
-            Logger.verbose(LogCategory.SYSTEM, `mmioOpenA: file="${filename}", flags=0x${dwOpenFlags.toString(16)} (stub)`);
+            Logger.verbose(LogCategory.SYSTEM, `mmioOpenA: file="${filename}", flags=0x${dwOpenFlags.toString(16)}`);
 
+            // MEMORY file: a NULL name means MMIOINFO describes a block of the CALLER's memory
+            // that is to be read as if it were a file. Engines that load a container themselves
+            // and then want mmio's RIFF walker over it (the Dark engine does this for its AVI
+            // cutscenes) open this way — refusing it makes the container look unreadable and the
+            // playback is skipped with no error the game can report.
             if (!filename) {
-                return 0; // NULL handle
+                if (!lpmmioinfo) return 0;
+                const pchBuffer = (Mem.readUint32(lpmmioinfo + MMIOINFO_PCHBUFFER) ?? 0) >>> 0;
+                const cchBuffer = (Mem.readUint32(lpmmioinfo + MMIOINFO_CCHBUFFER) ?? 0) >>> 0;
+                if (!pchBuffer || !cchBuffer || pchBuffer + cchBuffer > mem.length) {
+                    Mem.writeUint32(lpmmioinfo + MMIOINFO_WERRORRET, MMIOERR_CANNOTOPEN);
+                    return 0;
+                }
+                const handle = this.nextMMIOHandle++;
+                // `data` is a VIEW on guest memory, not a copy: the block stays the guest's and
+                // anything it writes there is what the next mmioRead must see.
+                this.mmioHandles.set(handle, {
+                    filename: "", position: 0,
+                    data: mem.subarray(pchBuffer, pchBuffer + cchBuffer),
+                    memoryBase: pchBuffer,
+                    guestBuffer: pchBuffer,
+                    guestBufferSize: cchBuffer,
+                    bufFileOffset: 0,
+                    bufFilled: cchBuffer,
+                });
+                Mem.writeUint32(lpmmioinfo + MMIOINFO_WERRORRET, 0);
+                Mem.writeUint32(lpmmioinfo + MMIOINFO_HMMIO, handle);
+                Logger.verbose(LogCategory.SYSTEM,
+                    `mmioOpenA: MEMORY file at 0x${pchBuffer.toString(16)} size=${cchBuffer} -> handle ${handle}`);
+                return handle;
             }
 
             const handle = this.nextMMIOHandle++;
@@ -1787,12 +1864,13 @@ export class WinMM implements IModule {
             const hmmio = args[0];
             const uFlags = args[1];
 
-            Logger.verbose(LogCategory.SYSTEM, `mmioClose: handle=${hmmio}, flags=0x${uFlags.toString(16)} (stub)`);
+            Logger.verbose(LogCategory.SYSTEM, `mmioClose: handle=${hmmio}, flags=0x${uFlags.toString(16)}`);
 
             const mmio = this.mmioHandles.get(hmmio);
             if (!mmio) return MMIOERR_CANNOTOPEN;
 
-            if (mmio.guestBuffer) {
+            // Only free a window WE allocated — a memory file's buffer belongs to the guest.
+            if (mmio.guestBuffer && !mmio.memoryBase) {
                 System.getInstance().process?.memory?.free(mmio.guestBuffer);
                 mmio.guestBuffer = 0;
             }
@@ -1827,7 +1905,7 @@ export class WinMM implements IModule {
             const lOffset = args[1] | 0; // signed
             const iOrigin = args[2];
 
-            Logger.verbose(LogCategory.SYSTEM, `mmioSeek: handle=${hmmio}, offset=${lOffset}, origin=${iOrigin} (stub)`);
+            Logger.verbose(LogCategory.SYSTEM, `mmioSeek: handle=${hmmio}, offset=${lOffset}, origin=${iOrigin}`);
 
             const mmio = this.mmioHandles.get(hmmio);
             if (!mmio) return -1;
@@ -1958,13 +2036,20 @@ export class WinMM implements IModule {
                 }
 
                 if (matched) {
-                    const dataOffset = isContainer ? pos + 12 : pos + 8;
+                    // MMCKINFO.dwDataOffset is ALWAYS chunkStart+8, including for RIFF and
+                    // LIST — the form type is part of the data, not of the header. Only the
+                    // FILE POSITION skips it. Reporting +12 for a container breaks the
+                    // canonical WAV reader verbatim: it seeks to
+                    // `ckRIFF.dwDataOffset + sizeof(FOURCC)`, which then lands 4 bytes inside
+                    // the first chunk's header and no chunk is ever found again. It also
+                    // pushes a parent-bounded search 4 bytes past EOF.
+                    const dataOffset = pos + 8;
                     view.setUint32(lpck,      ckid,       true);
                     view.setUint32(lpck + 4,  cksize,     true);
                     view.setUint32(lpck + 8,  fccType,    true);
                     view.setUint32(lpck + 12, dataOffset, true);
                     view.setUint32(lpck + 16, 0,          true);
-                    mmio.position = dataOffset;
+                    mmio.position = isContainer ? dataOffset + 4 : dataOffset;
                     Logger.verbose(LogCategory.SYSTEM,
                         `mmioDescend: found ckid=${String.fromCharCode(ckid&0xff,(ckid>>8)&0xff,(ckid>>16)&0xff,(ckid>>24)&0xff)} ` +
                         `cksize=${cksize} fccType=${fccType ? String.fromCharCode(fccType&0xff,(fccType>>8)&0xff,(fccType>>16)&0xff,(fccType>>24)&0xff) : ''} ` +

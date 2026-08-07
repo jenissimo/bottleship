@@ -19,6 +19,8 @@ export const winmmModule: ModuleDescriptor = {
     name: "winmm",
     functions: [
         makeFunc("timeGetTime", 0),
+        makeFunc("DefDriverProc", 5),
+        makeFunc("DrvDefDriverProc", 5),
         makeFunc("timeGetDevCaps", 2),
         makeFunc("timeBeginPeriod", 1),
         makeFunc("timeEndPeriod", 1),

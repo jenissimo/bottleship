@@ -207,11 +207,19 @@ export class PELoader {
     private static readonly CRT_SLAB_MODULES = new Set<string>([
         'msvcrt', 'msvcr70', 'msvcr71', 'msvcr80', 'msvcr90', 'msvcr100', 'msvcr110', 'msvcr120',
     ]);
-    /** cdecl void* malloc(size_t) and its aliases incl. MSVC `operator new(unsigned int)`.
-     *  Plain `malloc` first so the inline stub's slow-path JMP prefers it. */
-    private static readonly CRT_MALLOC_KEYS = ['malloc', '_malloc', '??2@yapaxi@z', '_malloc_dbg'];
-    /** cdecl void free(void*) and its aliases incl. MSVC `operator delete(void*)`. */
-    private static readonly CRT_FREE_KEYS = ['free', '_free', '??3@yaxpax@z', '_free_dbg'];
+    /** Slow-path targets for the inline stubs: names that BOTH resolve to a real JS
+     *  handler and mean cdecl malloc/free. Plain `malloc`/`free` first so the JMP prefers
+     *  them. Nothing outside these lists may be a JMP target — a slow path landing on an
+     *  unimplemented export returns garbage instead of memory. */
+    private static readonly CRT_MALLOC_TRAP_KEYS = ['malloc', '_malloc', '??2@yapaxi@z', '_malloc_dbg'];
+    private static readonly CRT_FREE_TRAP_KEYS = ['free', '_free', '??3@yaxpax@z', '_free_dbg'];
+    /** IAT names redirected to the inline stubs. Supersets of the trap lists with the
+     *  MSVC ARRAY forms `operator new[]` / `operator delete[]`, which the CRT implements
+     *  as forwarders to the scalar ones — same cdecl signature, same allocator. They are
+     *  redirect-only: the slow path still JMPs to a scalar trap, which exists because the
+     *  stubs are not emitted at all unless one of each trap list is imported. */
+    private static readonly CRT_MALLOC_KEYS = [...PELoader.CRT_MALLOC_TRAP_KEYS, '??_u@yapaxi@z'];
+    private static readonly CRT_FREE_KEYS = [...PELoader.CRT_FREE_TRAP_KEYS, '??_v@yaxpax@z'];
 
     /**
      * DLLs whose DllMain(DLL_PROCESS_ATTACH) must be called before the EXE entry point.
@@ -1236,6 +1244,7 @@ export class PELoader {
                     if (f.name) {
                         const cc = this.apiRegistry.getCallingConvention(dllName, f.name);
                         return (!cc || cc === 'stdcall') &&
+                            this.thunkGenerator.getDataExportAddress(dllName, f.name) === undefined &&
                             this.apiRegistry.getArgCount(dllName, f.name) === undefined &&
                             this.apiRegistry.getStackCleanupBytes(dllName, f.name) === undefined &&
                             deriveStackCleanupFromMangledName(f.name) === undefined;
@@ -1286,6 +1295,16 @@ export class PELoader {
                     } else if (f.ordinal !== undefined) {
                         argCount = this.apiRegistry.getArgCountByOrdinal(dllName, f.ordinal);
                         stackCleanupBytes = argCount !== undefined ? argCount * 4 : undefined;
+                    }
+
+                    // A data export has no arg count to know — generateStubDll points the
+                    // IAT straight at the variable. Warning about it names a defect that
+                    // isn't there and hides the ones that are.
+                    if (argCount === undefined && f.name &&
+                        this.thunkGenerator.getDataExportAddress(dllName, f.name) !== undefined) {
+                        knownFunctions.push(f);
+                        stubInfos.push({ name, argCount, stackCleanupBytes, callingConvention });
+                        continue;
                     }
 
                     if (argCount === undefined) {
@@ -1353,9 +1372,9 @@ export class PELoader {
                 // the same WASM slab arena as the kernel32 heap stubs. Generated on the
                 // first CRT module import; reused for later CRT modules' IAT patching.
                 if (PELoader.CRT_SLAB_MODULES.has(dllName) && !this.crtInlineStubs) {
-                    const mallocTrap = PELoader.CRT_MALLOC_KEYS
+                    const mallocTrap = PELoader.CRT_MALLOC_TRAP_KEYS
                         .map(k => stubDll.exportTable.get(k)).find(a => a !== undefined);
-                    const freeTrap = PELoader.CRT_FREE_KEYS
+                    const freeTrap = PELoader.CRT_FREE_TRAP_KEYS
                         .map(k => stubDll.exportTable.get(k)).find(a => a !== undefined);
                     const hpBase = hypercallDataManager.getHpBase();
                     if (mallocTrap && freeTrap && hpBase !== 0) {
@@ -1370,10 +1389,18 @@ export class PELoader {
                                     this.getMemory, slabCtlAddr, lutAddr, mallocTrap, freeTrap);
                                 sys.scheduler?.registerNonPreemptibleRange(
                                     this.crtInlineStubs.regionBase, this.crtInlineStubs.regionEnd);
+                            } else {
+                                Logger.warn(LogCategory.SYSTEM,
+                                    `[PE] Inline CRT slab stubs skipped for ${dllName}: tmm=${!!tmm} ` +
+                                    `lut=${lutAddr ?? 0} slabCtl=${slabCtlAddr ?? 0}`);
                             }
                         } catch (e) {
                             Logger.warn(LogCategory.SYSTEM, `[PE] Inline CRT slab stubs unavailable: ${e}`);
                         }
+                    } else {
+                        Logger.warn(LogCategory.SYSTEM,
+                            `[PE] Inline CRT slab stubs skipped for ${dllName}: mallocTrap=${mallocTrap ?? 0} ` +
+                            `freeTrap=${freeTrap ?? 0} hpBase=${hpBase}`);
                     }
                 }
 
@@ -1401,6 +1428,7 @@ export class PELoader {
                 }
 
                 // Patch IAT with stub addresses
+                const inlinePatched: string[] = [];
                 for (const func of functions) {
                     const funcKey = (func.name || `ord_${func.ordinal}`).toLowerCase();
                     if (unknownFunctions.has(funcKey)) {
@@ -1420,6 +1448,7 @@ export class PELoader {
                         // Set window.__noHeapSlab=true BEFORE loading a game to force it OFF (the JS
                         // process.memory + lookaside path). Global toggle, NOT a per-game branch.
                         const slabOn = !(globalThis as any).__noHeapSlab;
+                        const inlineBefore = stubAddress;
                         if (slabOn && dllName === 'kernel32' && this.heapInlineStubs) {
                             if (funcKey === 'heapalloc') stubAddress = this.heapInlineStubs.heapAllocStub;
                             else if (funcKey === 'heapfree') stubAddress = this.heapInlineStubs.heapFreeStub;
@@ -1432,6 +1461,7 @@ export class PELoader {
                             if (funcKey === 'tolower') stubAddress = this.caseFoldInlineStubs.tolowerStub;
                             else if (funcKey === 'toupper') stubAddress = this.caseFoldInlineStubs.toupperStub;
                         }
+                        if (stubAddress !== inlineBefore) inlinePatched.push(funcKey);
                         if (stubAddress) {
                             this.view.setUint32(iatAddr, stubAddress, true);
                         } else {
@@ -1439,6 +1469,13 @@ export class PELoader {
                         }
                     }
                     iatAddr += 4;
+                }
+                // "Which imports actually became trap-free inline stubs" is otherwise
+                // unanswerable from a log, and a silently-missing redirect looks exactly
+                // like a slow guest.
+                if (inlinePatched.length > 0) {
+                    Logger.log(LogCategory.SYSTEM,
+                        `[PE] Inline stubs patched into ${dllNameRaw} IAT: ${inlinePatched.join(', ')}`);
                 }
 
                 // Load stub code into memory (skip if all stubs were reused)

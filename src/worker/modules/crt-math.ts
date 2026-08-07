@@ -79,6 +79,9 @@ export function registerCrtMathExports(exports: Record<string, ThunkImplementati
     exports["asin"] = (_c, _m, a) => mathUnary(Math.asin, a[0] ?? 0, a[1] ?? 0);
     exports["atan"] = (_c, _m, a) => mathUnary(Math.atan, a[0] ?? 0, a[1] ?? 0);
     exports["tan"] = (_c, _m, a) => mathUnary(Math.tan, a[0] ?? 0, a[1] ?? 0);
+    exports["sinh"] = (_c, _m, a) => mathUnary(Math.sinh, a[0] ?? 0, a[1] ?? 0);
+    exports["cosh"] = (_c, _m, a) => mathUnary(Math.cosh, a[0] ?? 0, a[1] ?? 0);
+    exports["tanh"] = (_c, _m, a) => mathUnary(Math.tanh, a[0] ?? 0, a[1] ?? 0);
     exports["fabs"] = (_c, _m, a) => mathUnary(Math.abs, a[0] ?? 0, a[1] ?? 0);
     exports["log"] = (_c, _m, a) => mathUnary(Math.log, a[0] ?? 0, a[1] ?? 0);
     exports["log10"] = (_c, _m, a) => mathUnary(Math.log10, a[0] ?? 0, a[1] ?? 0);

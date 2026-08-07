@@ -174,6 +174,11 @@ export const STAT64_OFFSETS = {
     st_dev: 0, st_ino: 4, st_mode: 6, st_nlink: 8, st_uid: 10, st_gid: 12,
     st_rdev: 16, st_size: 24, st_atime: 32, st_mtime: 40, st_ctime: 48,
 } as const;
+/** _stati64: 32-bit time_t, 64-bit st_size — the classic msvcrt large-file variant. */
+export const STATI64_OFFSETS = {
+    st_dev: 0, st_ino: 4, st_mode: 6, st_nlink: 8, st_uid: 10, st_gid: 12,
+    st_rdev: 16, st_size: 24, st_atime: 32, st_mtime: 36, st_ctime: 40,
+} as const;
 
 const S_IFDIR = 0x4000;
 const S_IFREG = 0x8000;
@@ -184,7 +189,7 @@ const MODE_DIR = S_IFDIR | 0x1ff;       // 0x41ff — rwxrwxrwx
 /** st_mode/st_nlink/st_size, written at the offsets of the requested variant. */
 export function fillStatStruct(
     structPtr: number,
-    offsets: typeof STAT32_OFFSETS | typeof STAT64I32_OFFSETS | typeof STAT64_OFFSETS,
+    offsets: typeof STAT32_OFFSETS | typeof STAT64I32_OFFSETS | typeof STAT64_OFFSETS | typeof STATI64_OFFSETS,
     totalSize: number,
     size: number,
     isDir: boolean,
@@ -194,7 +199,8 @@ export function fillStatStruct(
     Mem.writeUint16(structPtr + offsets.st_mode, isDir ? MODE_DIR : MODE_FILE);
     Mem.writeUint16(structPtr + offsets.st_nlink, 1);
     Mem.writeUint32(structPtr + offsets.st_size, isDir ? 0 : size >>> 0);
-    if (offsets.st_size === STAT64_OFFSETS.st_size) Mem.writeUint32(structPtr + offsets.st_size + 4, 0);
+    // A 64-bit st_size is what pushes st_atime 8 bytes past it; a 32-bit one leaves 4.
+    if (offsets.st_atime - offsets.st_size === 8) Mem.writeUint32(structPtr + offsets.st_size + 4, 0);
     // 64-bit time_t is what puts st_mtime 8 bytes after st_atime; _stat's is 4.
     const wideTime = offsets.st_mtime - offsets.st_atime === 8;
     writeTimeT(structPtr, offsets.st_atime, wideTime);
@@ -210,6 +216,11 @@ function fillStat64(structPtr: number, size: number, isDir: boolean, host: Vc9Io
 /** _stat64i32 (48 bytes) — the layout `_stat64i32`/`_fstat64i32` actually take. */
 function fillStat64i32(structPtr: number, size: number, isDir: boolean, host: Vc9IoHost): void {
     fillStatStruct(structPtr, STAT64I32_OFFSETS, 48, size, isDir, host.memset.bind(host));
+}
+
+/** struct _stati64 (48 bytes) — 64-bit st_size, 32-bit time_t. */
+function fillStati64(structPtr: number, size: number, isDir: boolean, host: Vc9IoHost): void {
+    fillStatStruct(structPtr, STATI64_OFFSETS, 48, size, isDir, host.memset.bind(host));
 }
 
 /** struct _stat (36 bytes) — 32-bit time_t and st_size. */
@@ -266,6 +277,8 @@ export function registerVc9IoExports(exports: Record<string, ThunkImplementation
     exports["_fstat64i32"] = (_ctx, _mem, args) => statByFd(args[0] ?? 0, args[1] ?? 0, fillStat64i32);
     exports["_fstat64"] = (_ctx, _mem, args) => statByFd(args[0] ?? 0, args[1] ?? 0, fillStat64);
     exports["_fstat"] = (_ctx, _mem, args) => statByFd(args[0] ?? 0, args[1] ?? 0, fillStat32);
+    exports["_stati64"] = (_ctx, _mem, args) => statByPath(args[0] ?? 0, args[1] ?? 0, fillStati64);
+    exports["_fstati64"] = (_ctx, _mem, args) => statByFd(args[0] ?? 0, args[1] ?? 0, fillStati64);
 
     exports["_findfirst64i32"] = (_ctx, _mem, args) => {
         const filespecPtr = args[0] ?? 0;

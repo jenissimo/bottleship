@@ -137,6 +137,19 @@ export function registerVc9AbiExports(exports: Record<string, ThunkImplementatio
         return n;
     };
 
+    exports["strspn"] = (_ctx, _mem, args) => {
+        const s = args[0] ?? 0;
+        const accept = args[1] ?? 0;
+        if (!s || !accept) return 0;
+        const str = host.readCString(s, 0x10000);
+        const accSet = new Set(host.readCString(accept, 256).split(""));
+        let n = 0;
+        for (; n < str.length; n++) {
+            if (!accSet.has(str[n]!)) break;
+        }
+        return n;
+    };
+
     exports["_ismbblead"] = (_ctx, _mem, args) => {
         const c = args[0] ?? 0;
         return c >= 0x80 && c <= 0xff ? 1 : 0;
