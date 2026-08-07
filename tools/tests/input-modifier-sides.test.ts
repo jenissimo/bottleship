@@ -46,6 +46,16 @@ function publishCursor(view: Int32Array, x: number, y: number): void {
     endInputWrite(view);
 }
 
+/** Buffered DirectInput reads the RELATIVE accumulator, not the clamped cursor position —
+ *  an absolute-position delta saturates at the screen edge and kills mouse-look before
+ *  Pointer Lock engages. Publish motion the way the real input path does. */
+function publishMouseMotion(view: Int32Array, dx: number, dy: number): void {
+    beginInputWrite(view);
+    view[INPUT_INDEX.dinputDX] += dx;
+    view[INPUT_INDEX.dinputDY] += dy;
+    endInputWrite(view);
+}
+
 const isDown = (im: InputManager, vk: number): boolean => (im.getKeyState(vk) & 0x8000) !== 0;
 
 describe("a modifier is down under both its names", () => {
@@ -100,13 +110,14 @@ describe("a modifier is down under both its names", () => {
 describe("DirectInput mouse buffering starts from where the cursor already is", () => {
     test("SetProperty(DIPROP_BUFFERSIZE) does not replay the standing position", () => {
         const r = rig();
-        publishCursor(r.view, 400, 300);
+        publishMouseMotion(r.view, 400, 300);   // motion BEFORE the buffer is armed
         r.im.poll();
 
         r.im.setDInputMouseBufferSize(16);
-        publishCursor(r.view, 402, 300);
+        publishMouseMotion(r.view, 2, 0);
         r.im.poll();
 
+        // Only the 2 units that happened after arming — not the 400/300 already accumulated.
         const events = r.im.drainDInputMouseEvents(16);
         expect(events.map((e) => [e.dwOfs, e.dwData])).toEqual([[0, 2]]); // DIMOFS_X += 2
     });

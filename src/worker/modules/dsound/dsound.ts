@@ -1489,7 +1489,16 @@ export class DSound implements IModule {
             }
 
             this.recordLife("create", buffer.id, undefined, `${isPrimary ? "PRIMARY" : `${buffer.bytes}b`} flags=0x${normalizedFlags.toString(16)}`);
-            Logger.log(LogCategory.SYSTEM, `DirectSound: CreateSoundBuffer ${isPrimary ? "PRIMARY" : `${buffer.bytes}b`} flags=0x${normalizedFlags.toString(16)} @0x${bufPtr.toString(16)}`);
+            // Geometry belongs in this line: a buffer whose size, rate or alignment is
+            // wrong is heard as crackle rather than reported as an error.
+            const f = buffer.format;
+            Logger.log(LogCategory.SYSTEM,
+                `DirectSound: CreateSoundBuffer ${isPrimary ? "PRIMARY" : `${buffer.bytes}b`} ` +
+                // Both flag sets: we force LOCSOFTWARE, so printing only ours misreads as
+                // "the caller asked for a software buffer" when it asked for nothing of the kind.
+                `flags=0x${(desc.flags >>> 0).toString(16)}->0x${normalizedFlags.toString(16)} @0x${bufPtr.toString(16)} ` +
+                `pcm=0x${(buffer.ptr >>> 0).toString(16)} ` +
+                `${f.channels}ch ${f.sampleRate}Hz ${f.bitsPerSample}bit align=${f.blockAlign}`);
             return DS_OK;
         };
 
@@ -1519,10 +1528,18 @@ export class DSound implements IModule {
             view.setUint32(capsPtr + 4, dwFlags, true);
             view.setUint32(capsPtr + 8, DSBFREQUENCY_MIN, true);
             view.setUint32(capsPtr + 12, DSBFREQUENCY_MAX, true);
-            view.setUint32(capsPtr + 16, 1, true);
-            view.setUint32(capsPtr + 20, 1, true);
-            view.setUint32(capsPtr + 24, 1, true);
-            view.setUint32(capsPtr + 28, 1, true);
+            view.setUint32(capsPtr + 16, 1, true);   // dwPrimaryBuffers — exactly one primary mix
+
+            // dwMaxHwMixing{All,Static,Streaming} @20/24/28, dwFreeHwMixing* @32/36/40,
+            // dwMaxHw3D* @44/48/52, dwFreeHw3D* @56/60/64 — all zero. We mix natively, but not
+            // as a DSound HAL: CreateSoundBuffer refuses DSBCAPS_LOCHARDWARE, so a non-zero max
+            // over a zero free count advertises a voice that can never be taken and steers a
+            // caller's caps branch straight into the request we have to fail.
+            // The tail (hw memory @68/72/76, unlock transfer rate @80, sw CPU overhead @84,
+            // reserved @88/92) is likewise zero for a software mixer.
+            view.setUint32(capsPtr + 20, 0, true);
+            view.setUint32(capsPtr + 24, 0, true);
+            view.setUint32(capsPtr + 28, 0, true);
             view.setUint32(capsPtr + 32, 0, true);
             view.setUint32(capsPtr + 36, 0, true);
             view.setUint32(capsPtr + 40, 0, true);
@@ -2080,7 +2097,19 @@ export class DSound implements IModule {
             const fmtPtr = args[1];
             if (!buffer || !fmtPtr) return DSERR_INVALIDPARAM;
             const parsed = this.parseWaveFormat(fmtPtr, true);
-            if (parsed.hr !== DS_OK || !parsed.format) return parsed.hr;
+            if (parsed.hr !== DS_OK || !parsed.format) {
+                // Only the SUCCESS path used to log, so a rejected format left no trace at
+                // all — while engines routinely treat a failed primary SetFormat as fatal to
+                // the whole sound system and go permanently, silently mute. Name the format
+                // we refused, or the next reader has a mute game and an empty log.
+                const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+                Logger.warn(LogCategory.SYSTEM,
+                    `IDirectSoundBuffer8::SetFormat REJECTED hr=0x${(parsed.hr >>> 0).toString(16)} — ` +
+                    `tag=${view.getUint16(fmtPtr, true)} ch=${view.getUint16(fmtPtr + 2, true)} ` +
+                    `rate=${view.getUint32(fmtPtr + 4, true)} bits=${view.getUint16(fmtPtr + 14, true)} ` +
+                    `align=${view.getUint16(fmtPtr + 12, true)}`);
+                return parsed.hr;
+            }
             buffer.format = parsed.format;
             buffer.frequency = buffer.format.sampleRate;
             buffer.playbackRate = 1.0;

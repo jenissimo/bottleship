@@ -47,11 +47,16 @@ export class MemoryEventBuffer {
     }
 
     getRecent(n: number): MemoryEvent[] {
+        // Walk back from the WRITE INDEX in both cases. Anchoring an unwrapped ring at 0
+        // walked backwards off the front into the tail the ring has never written, so
+        // getRecent handed out undefined entries — and dump() then threw while reporting a
+        // memory fault, turning a diagnosable fault into an opaque exception exactly when
+        // the ring was still short, i.e. early in a session.
         const result: MemoryEvent[] = [];
-        const start = this.count < RING_BUFFER_SIZE ? 0 : this.writeIndex;
         for (let i = 0; i < Math.min(n, this.count); i++) {
-            const idx = (start - 1 - i + RING_BUFFER_SIZE) % RING_BUFFER_SIZE;
-            result.push(this.events[idx]);
+            const idx = (this.writeIndex - 1 - i + RING_BUFFER_SIZE) % RING_BUFFER_SIZE;
+            const e = this.events[idx];
+            if (e) result.push(e);
         }
         return result.reverse();
     }
