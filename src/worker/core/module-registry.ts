@@ -2,6 +2,7 @@
 // Tracks loaded PE modules (EXE + DLLs) with their exports for GetProcAddress, GetModuleHandle, etc.
 
 import { Logger, LogCategory } from './logger';
+import { MEM_ROM_BASE, MEM_ROM_SIZE } from './cpu/emulator-config';
 
 /**
  * Information about a loaded PE module (EXE or DLL)
@@ -45,14 +46,16 @@ export interface PESection {
 }
 
 /**
- * DLL base address allocation constants
- * ROM region starts at 0x13000000 to avoid conflicts with:
- * - EXE image: 0x00400000
- * - Heap: 0x03000000+
- * - Surfaces: 0x05000000+
- * - Thunks: 0x10000000+
+ * DLL images are rebased into the ROM bucket the layout reserves for PE images
+ * (emulator-config.ts). They must NOT share VA with HEAP: the kernel32 slab arena
+ * carves top-down from HEAP's limit and ZEROES what it takes, so an image mapped
+ * inside HEAP is wiped the moment heap growth reaches it — its vtables read back as
+ * 0 and the next virtual call jumps to NULL, hundreds of frames after the write.
+ * ROM sits above the red zone and no allocator carves from it, so the two frontiers
+ * can never meet.
  */
-const DLL_BASE_START = 0x13000000;
+const DLL_BASE_START = MEM_ROM_BASE;
+const DLL_BASE_LIMIT = MEM_ROM_BASE + MEM_ROM_SIZE;
 const DLL_BASE_ALIGNMENT = 0x10000; // 64KB alignment (Windows standard)
 
 /**
@@ -68,6 +71,8 @@ export class ModuleRegistry {
     private modules = new Map<string, LoadedPEModule>();
     private byBase = new Map<number, LoadedPEModule>();
     private nextDllBase = DLL_BASE_START;
+    /** VA returned by unregister(), first-fit reusable. See allocateBase. */
+    private freeDllRanges: Array<{ base: number; size: number }> = [];
 
     private normalizeModuleLookupKey(name: string): string {
         return name.toLowerCase().replace(/\.(dll|exe)$/i, '');
@@ -103,6 +108,7 @@ export class ModuleRegistry {
 
         this.modules.delete(nameLower);
         this.byBase.delete(mod.baseAddress);
+        this.releaseBase(mod.baseAddress, mod.size);
         return true;
     }
 
@@ -230,13 +236,73 @@ export class ModuleRegistry {
         // Align image size to 64KB boundary
         const alignedSize = (imageSize + DLL_BASE_ALIGNMENT - 1) & ~(DLL_BASE_ALIGNMENT - 1);
 
+        // Reuse VA an unloaded module gave back before taking new ground: the bucket is
+        // bounded now, and a title that cycles LoadLibrary/FreeLibrary on the same DLL —
+        // a real pattern this runtime supports — would otherwise exhaust it in ~100 cycles
+        // and then fail every later load.
+        for (let i = 0; i < this.freeDllRanges.length; i++) {
+            const r = this.freeDllRanges[i];
+            if (r.size < alignedSize) continue;
+            const reused = r.base;
+            if (r.size === alignedSize) this.freeDllRanges.splice(i, 1);
+            else { r.base += alignedSize; r.size -= alignedSize; }
+            Logger.log(LogCategory.SYSTEM,
+                `[ModuleRegistry] Reused base 0x${reused.toString(16)} for DLL (size=0x${imageSize.toString(16)})`);
+            return reused;
+        }
+
         const base = this.nextDllBase;
+        // Running past the bucket would hand out SURFACE VA and corrupt texture pixels
+        // instead of failing — a LoadLibrary failure is the honest outcome.
+        if (base + alignedSize > DLL_BASE_LIMIT) {
+            throw new Error(
+                `ModuleRegistry: module VA exhausted (need 0x${alignedSize.toString(16)} at ` +
+                `0x${base.toString(16)}, limit 0x${DLL_BASE_LIMIT.toString(16)})`);
+        }
         this.nextDllBase += alignedSize;
 
         Logger.log(LogCategory.SYSTEM,
             `[ModuleRegistry] Allocated base 0x${base.toString(16)} for DLL (size=0x${imageSize.toString(16)})`);
 
         return base;
+    }
+
+    /**
+     * Give a module's VA back to the pool, coalescing with neighbours so a load/unload cycle
+     * cannot fragment the bucket into unusable slivers. Rewinding the bump pointer when the
+     * range is the topmost allocation keeps the common case (one DLL loaded and unloaded
+     * repeatedly) exactly as cheap as it was before the bucket had a limit.
+     */
+    private releaseBase(base: number, size: number): void {
+        const aligned = (size + DLL_BASE_ALIGNMENT - 1) & ~(DLL_BASE_ALIGNMENT - 1);
+        if (aligned <= 0 || base < DLL_BASE_START || base + aligned > DLL_BASE_LIMIT) return;
+        if (base + aligned === this.nextDllBase) {
+            this.nextDllBase = base;
+            // Absorb any free range that now sits at the top.
+            let merged = true;
+            while (merged) {
+                merged = false;
+                for (let i = 0; i < this.freeDllRanges.length; i++) {
+                    const r = this.freeDllRanges[i];
+                    if (r.base + r.size === this.nextDllBase) {
+                        this.nextDllBase = r.base;
+                        this.freeDllRanges.splice(i, 1);
+                        merged = true;
+                        break;
+                    }
+                }
+            }
+            return;
+        }
+        this.freeDllRanges.push({ base, size: aligned });
+        this.freeDllRanges.sort((a, b) => a.base - b.base);
+        for (let i = this.freeDllRanges.length - 1; i > 0; i--) {
+            const prev = this.freeDllRanges[i - 1];
+            if (prev.base + prev.size === this.freeDllRanges[i].base) {
+                prev.size += this.freeDllRanges[i].size;
+                this.freeDllRanges.splice(i, 1);
+            }
+        }
     }
 
     /**
@@ -283,6 +349,7 @@ export class ModuleRegistry {
         this.modules.clear();
         this.byBase.clear();
         this.nextDllBase = DLL_BASE_START;
+        this.freeDllRanges = [];
         Logger.log(LogCategory.SYSTEM, '[ModuleRegistry] Reset');
     }
 

@@ -52,7 +52,9 @@ export interface FaultRecord {
     stackDump: number[];
     /** How the fault was resolved once SEH ran (set after the fact by annotateLast). */
     outcome?: string;
-    /** Set when the fault is an indirect CALL that fetched a bad target (see analyzeIndirectCallFault). */
+    /** Set when the fault is an indirect CALL that fetched a bad target (see analyzeIndirectCallFault).
+     *  `slotAddr` is -1 for the register form (`call reg`), where the target came from a
+     *  register rather than a memory slot. */
     badCall?: { callSite: number; slotAddr: number; slotValue: number; operand: string };
 }
 
@@ -182,8 +184,14 @@ export function analyzeIndirectCallFault(
         const modrm = mem[site + 1];
         if (((modrm >> 3) & 7) !== 2) continue; // /2 = CALL near indirect
         const mod = modrm >> 6;
-        if (mod === 3) continue;                 // `call reg` reads no memory
         const rm = modrm & 7;
+        // `call reg` reads no memory, so there is no slot to name — but the call SITE and
+        // which register held the bad target are most of the answer, and reporting nothing
+        // here sends the reader looking for a vtable that was never involved.
+        if (mod === 3) {
+            if (site + 2 !== retAddr) continue;
+            return { callSite: site, slotAddr: -1, slotValue: r[rm], operand: REG_NAMES[rm] };
+        }
         let p = site + 2;
         let base = 0;
         let label = "";

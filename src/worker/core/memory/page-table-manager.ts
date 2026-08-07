@@ -117,7 +117,15 @@ export class PageTableManager {
         // games that legitimately write to low addresses (e.g. Reflexive Arcade).
         // We guard up to page 6 max because the bootloader/GDT/IDT/handlers
         // live at 0x7C00-0x8700+ (pages 7-8) and must remain present.
-        const NULL_GUARD_PAGES = win9x ? 0 : 7;
+        //
+        // `__forceNullGuard` (harness setWorkerFlag, before load_bundle) overrides the Win9x
+        // exemption. Without the guard a jump through a NULL pointer does not fault: it
+        // executes `add [eax],al` across thousands of zero bytes until it reaches the
+        // bootloader, and the crash then reports 0x7c07 with every register and the whole
+        // call site long gone. Forcing it converts that into a fault at the offending
+        // instruction with the caller's frame still on the stack.
+        const forceNullGuard = (globalThis as Record<string, unknown>).__forceNullGuard === true;
+        const NULL_GUARD_PAGES = (win9x && !forceNullGuard) ? 0 : 7;
         const pt0Base = PAGE_TABLES_ADDR; // First page table covers 0x00000000-0x003FFFFF
         for (let i = 0; i < NULL_GUARD_PAGES; i++) {
             view.setUint32(pt0Base + i * 4, 0, true); // Clear Present bit

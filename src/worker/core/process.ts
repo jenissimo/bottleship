@@ -264,19 +264,37 @@ export class MemoryManager {
         if (!bucket) throw new Error('MemoryManager: HEAP bucket unavailable for high alloc');
         const align = Math.max(alignment, 0x10000) >>> 0; // Win32 allocation granularity
         const aligned = this.alignUp(size, align);
-        const top = (bucket.slabTop ?? bucket.limit) >>> 0;
+        let top = (bucket.slabTop ?? bucket.limit) >>> 0;
         const next = bucket.next >>> 0;
-        // Unsigned subtract — if frontiers crossed, treat as OOM (don't wrap).
-        if (top <= next || aligned > (top - next)) {
-            throw new Error(
-                `MemoryManager: high-end OOM (top=0x${top.toString(16)} next=0x${next.toString(16)} ` +
-                `need 0x${aligned.toString(16)})`);
-        }
-        const addr = ((top - aligned) >>> 0) & ~(align - 1);
-        if (addr < next || ((addr + aligned) >>> 0) > top || (addr + aligned) >>> 0 < addr) {
-            throw new Error(
-                `MemoryManager: high-end align OOM (top=0x${top.toString(16)} next=0x${next.toString(16)} ` +
-                `addr=0x${addr.toString(16)} need 0x${aligned.toString(16)})`);
+        let addr = 0;
+        // Same foreign-region skip the bottom-up frontier does, walking DOWN instead.
+        // Without it a carve here is not just misplaced but destructive: the slab arena
+        // zero-fills what it takes, so a PE image in the way is silently erased.
+        for (let guard = 0; ; guard++) {
+            // Unsigned subtract — if frontiers crossed, treat as OOM (don't wrap).
+            if (top <= next || aligned > (top - next)) {
+                throw new Error(
+                    `MemoryManager: high-end OOM (top=0x${top.toString(16)} next=0x${next.toString(16)} ` +
+                    `need 0x${aligned.toString(16)})`);
+            }
+            addr = ((top - aligned) >>> 0) & ~(align - 1);
+            if (addr < next || ((addr + aligned) >>> 0) > top || (addr + aligned) >>> 0 < addr) {
+                throw new Error(
+                    `MemoryManager: high-end align OOM (top=0x${top.toString(16)} next=0x${next.toString(16)} ` +
+                    `addr=0x${addr.toString(16)} need 0x${aligned.toString(16)})`);
+            }
+            const blocker = this.addressSpace.findBlockingRegion(addr, aligned);
+            if (!blocker) break;
+            if (guard >= 32) {
+                throw new Error(
+                    `MemoryManager: high-end blocked by ${blocker.kind} @ 0x${blocker.base.toString(16)} ` +
+                    `(need 0x${aligned.toString(16)}, gave up after ${guard} skips)`);
+            }
+            Logger.warn(LogCategory.SYSTEM,
+                `[MemoryManager] high-end carve at 0x${addr.toString(16)} blocked by ` +
+                `${blocker.kind} @ 0x${blocker.base.toString(16)}..0x${(blocker.base + blocker.size).toString(16)} ` +
+                `(${blocker.owner ?? 'unnamed'}/${blocker.tag ?? '-'}) — skipping below it`);
+            top = blocker.base >>> 0;
         }
         if (this.allocations.has(addr)) {
             throw new Error(

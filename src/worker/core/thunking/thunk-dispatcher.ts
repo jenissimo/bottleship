@@ -5112,13 +5112,19 @@ export class ThunkDispatcher {
             eax: savedEax, ecx: r[1] >>> 0, edx: savedEdx, ebx: r[3] >>> 0,
             esp: r[4] >>> 0, ebp: r[5] >>> 0, esi: r[6] >>> 0, edi: r[7] >>> 0,
         };
-        const cr2Candidates = cr2RegisterCandidates(faultAddr, faultRegs);
+        // CR2 == the faulting EIP means the INSTRUCTION FETCH faulted, not a data access:
+        // no [reg+disp] produced the address, so the register-candidate list would be pure
+        // coincidence — and at CR2 = 0 every zero register "matches", which is exactly the
+        // NULL-call case where the indirect-call analysis below is the whole answer. Keeping
+        // the candidates would have silently suppressed it.
+        const isFetchFault = (faultAddr >>> 0) === (faultingEip >>> 0);
+        const cr2Candidates = isFetchFault ? [] : cr2RegisterCandidates(faultAddr, faultRegs);
         const eipConsistent = this.cachedMem8
             ? isFaultEipConsistent(this.cachedMem8, faultingEip, faultAddr, faultRegs)
             : null;
-        // No register explains CR2 ⇒ likely an instruction-fetch fault from an indirect
-        // CALL whose slot (vtable/IAT) held a bad target. Name the slot.
-        const badCall = (this.cachedMem8 && cr2Candidates.length === 0 && eipConsistent !== true)
+        // A fetch fault, or a data fault no register explains ⇒ likely an indirect CALL whose
+        // target (vtable slot / IAT entry / register) was bad. Name the call site.
+        const badCall = (this.cachedMem8 && (isFetchFault || (cr2Candidates.length === 0 && eipConsistent !== true)))
             ? analyzeIndirectCallFault(this.cachedMem8, faultGameEsp, faultRegs)
             : null;
         faultRecorder.record({
