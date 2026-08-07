@@ -739,6 +739,28 @@ export class ThunkDispatcher {
     }
 
     /**
+     * Park the current thread at the spin loop after JS terminated it from a
+     * guest-callback completion instead of from a thunk return (the CRT exit
+     * chain: the atexit handlers run as callbacks, so the terminating step lands
+     * in handleCallbackReturn, which cannot express `terminated: true`). Same
+     * three moves as that sync-result path: EIP to the spin loop, [ESP]
+     * redirected so a JIT-merged OUT+RET can't pop the dead thread's stack, and
+     * v86 stopped once the process is exiting.
+     */
+    public parkTerminatedThreadAtSpinLoop(): void {
+        const cpu = this.cachedCpu ?? this.v86?.cpu ?? this.v86?.v86?.cpu;
+        if (!cpu) return;
+        this.updateMemoryCache();
+        cpu.instruction_pointer[0] = this.spinLoopAddress;
+        this.redirectStackToSpinLoop(((this.cachedReg32Raw ?? cpu.reg32)[4]) >>> 0);
+        this.lastExpectedEspAfterReturn = 0;
+        this.setBoundaryAndNotify(cpu, ThunkBoundaryKind.SPIN_LOOP, 0);
+        if (System.getInstance().isExiting) {
+            try { this.v86?.stop?.(); } catch { /* already stopped */ }
+        }
+    }
+
+    /**
      * Data-returning guest call-stack reconstruction — the on-demand backbone for
      * the harness `backtrace` verb and for enriching API-break / fault snapshots.
      * Reuses reconstructCallStack (module-labelled, deep scan). `esp` defaults to

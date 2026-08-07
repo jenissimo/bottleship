@@ -171,4 +171,57 @@ export function registerFsCommands(svc: HarnessService): void {
         harnessBus.fileEvents = args[0] === undefined ? true : !!args[0];
         return { fileEvents: harnessBus.fileEvents };
     });
+
+    /** fsTrace(action) — the OPEN side of "the game says it saved and nothing is on
+     *  disk". watchFiles only fires once bytes are written, so a settings write that
+     *  never gets that far (create refused, path resolved elsewhere, or the writing
+     *  code never reached) leaves NO evidence at all; this records every
+     *  openSync/deleteFile/rename attempt with its disposition and whether it
+     *  succeeded. Wraps the live VFS on demand — zero cost when off.
+     *  Actions: "start" | "stop" | "read" (returns + keeps) | "clear". */
+    svc.register("fsTrace", (args) => {
+        const action = String(args[0] ?? "read");
+        const fsx = vfs();
+        const MAX = 4000;
+        type Probe = { entries: unknown[]; originals: Record<string, (...a: any[]) => any> };
+        let probe: Probe | undefined = fsx.__fsTraceProbe;
+
+        if (action === "start") {
+            if (probe) return { ok: true, already: true, entries: probe.entries.length };
+            probe = { entries: [], originals: {} };
+            fsx.__fsTraceProbe = probe;
+            const push = (e: Record<string, unknown>): void => {
+                if (probe!.entries.length >= MAX) probe!.entries.shift();
+                probe!.entries.push({ t: performance.now() | 0, ...e });
+            };
+            const wrap = (name: string, note: (args: any[], result: unknown) => Record<string, unknown>): void => {
+                const original = fsx[name];
+                if (typeof original !== "function") return;
+                probe!.originals[name] = original;
+                fsx[name] = (...a: any[]) => {
+                    const r = original.apply(fsx, a);
+                    // Async verbs (deleteFile) return a promise — record the settled answer.
+                    if (r && typeof r.then === "function") {
+                        return r.then((v: unknown) => { push(note(a, v)); return v; });
+                    }
+                    push(note(a, r));
+                    return r;
+                };
+            };
+            wrap("openSync", (a, r) => ({ op: "openSync", path: String(a[0]), disposition: a[2] >>> 0, ok: !!r, source: (r as any)?.source }));
+            wrap("deleteFile", (a, r) => ({ op: "deleteFile", path: String(a[0]), ok: !!r }));
+            wrap("truncateAt", (a) => ({ op: "truncateAt", path: String(a[0]), size: Number(a[1]) }));
+            wrap("createDirectorySync", (a, r) => ({ op: "mkdir", path: String(a[0]), ok: !!(r as any)?.ok }));
+            return { ok: true, wrapped: Object.keys(probe.originals) };
+        }
+        if (!probe) return { ok: false, tracing: false, entries: [] };
+        if (action === "stop") {
+            for (const [name, fn] of Object.entries(probe.originals)) fsx[name] = fn;
+            const entries = probe.entries;
+            fsx.__fsTraceProbe = undefined;
+            return { ok: true, tracing: false, entries };
+        }
+        if (action === "clear") { probe.entries.length = 0; return { ok: true, entries: [] }; }
+        return { ok: true, tracing: true, entries: probe.entries };
+    });
 }

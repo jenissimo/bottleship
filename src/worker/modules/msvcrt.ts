@@ -96,6 +96,10 @@ export class Msvcrt implements IModule {
     private crtDbgFlag = 0;
     private controlFpWord = 0x0009001f;
     private tempnamCounter = 0;
+    /** atexit/_onexit table, registration order (exit runs it reversed). */
+    private exitHandlers: number[] = [];
+    private exitChainRunning = false;
+    private static readonly MAX_EXIT_HANDLERS = 4096;
     private fdNext = 3;
     private fds: Map<number, VfsFileHandle> = new Map();
     /** CRT fd → Win32 HANDLE (for _get_osfhandle / _open_osfhandle). */
@@ -303,7 +307,8 @@ export class Msvcrt implements IModule {
         exports["_assert"] = (ctx, mem, args) => this.crtAssert(mem, args, false);
         exports["_wassert"] = (ctx, mem, args) => this.crtAssert(mem, args, true);
         exports["_isctype"] = (ctx, mem, args) => this.isctype(args[0] ?? 0, args[1] ?? 0);
-        exports["exit"] = (ctx, mem, args) => this.exitProcess(args[0] ?? 0);
+        exports["exit"] = (ctx, mem, args) => this.exitWithHandlers(args[0] ?? 0);
+        // _exit() is the "skip the atexit table" flavour by contract, not an alias.
         exports["_exit"] = (ctx, mem, args) => this.exitProcess(args[0] ?? 0);
         exports["_execl"] = (ctx, mem, args) => this.execl(args);
         exports["_execv"] = (ctx, mem, args) => this.execv(args[0] ?? 0, args[1] ?? 0);
@@ -581,7 +586,11 @@ export class Msvcrt implements IModule {
             this.vsnwprintf(args[0] ?? 0, args[1] ?? 0, args[2] ?? 0, args[3] ?? 0);
         exports["swprintf"] = (ctx, mem, args) => this.swprintf(args);
 
-        exports["_onexit"]             = (ctx, mem, args) => args[0] ?? 0;
+        exports["_onexit"]             = (ctx, mem, args) => this.registerExitHandler(args[0] ?? 0);
+        // atexit is _onexit with the C return convention (0 = registered).
+        exports["atexit"]              = (ctx, mem, args) => (this.registerExitHandler(args[0] ?? 0) ? 0 : -1);
+        // __dllonexit owns a DLL-scoped table (*pbegin..*pend) drained at DLL detach —
+        // folding it into the process table would run those handlers at the wrong time.
         exports["__dllonexit"]         = (ctx, mem, args) => args[0] ?? 0;
         // VC5/6 SEH surface (_except_handler3/__CxxFrameHandler/_CxxThrowException) — see crt-seh3.ts
         registerCrtSeh3Exports(exports, {
@@ -675,6 +684,8 @@ export class Msvcrt implements IModule {
         this.strerrorBuf = 0;
         this.crtDbgFlag = 0;
         this.tempnamCounter = 0;
+        this.exitHandlers.length = 0;
+        this.exitChainRunning = false;
         this.fds.clear();
         this.fdHandles.clear();
         this.handleFds.clear();
@@ -1189,13 +1200,100 @@ export class Msvcrt implements IModule {
         return 0;
     }
 
+    /**
+     * atexit/_onexit registration. The CRT keeps ONE process-wide table and runs it
+     * LIFO from exit(); returning the pointer without recording it is the shape that
+     * loses every "flush my state on the way out" handler — games persist settings
+     * from here far more often than from their own quit path.
+     */
+    private registerExitHandler(fn: number): number {
+        const target = fn >>> 0;
+        if (!target) return 0;
+        if (this.exitHandlers.length >= Msvcrt.MAX_EXIT_HANDLERS) {
+            Logger.warn(LogCategory.SYSTEM, `_onexit: table full (${Msvcrt.MAX_EXIT_HANDLERS}), dropping 0x${target.toString(16)}`);
+            return 0;
+        }
+        this.exitHandlers.push(target);
+        return target;
+    }
+
+    /** Terminating half of exit(), shared with the atexit chain's terminal step. */
+    private beginProcessExit(exitCode: number): void {
+        const system = System.getInstance();
+        // Same durability barrier ExitProcess raises: whatever the exit path just
+        // wrote is still sitting in the overlay's write buffers.
+        system.fileSystem.flushAll().catch((e) => {
+            Logger.warn(LogCategory.SYSTEM, `msvcrt.exit: flushAll failed: ${e}`);
+        });
+        system.isExiting = true;
+        system.scheduler.exitThread(exitCode);
+    }
+
     private exitProcess(code: number): ThunkResult {
         const exitCode = code >>> 0;
         Logger.log(LogCategory.SYSTEM, `msvcrt.exit(code=0x${exitCode.toString(16)})`);
-        const system = System.getInstance();
-        system.isExiting = true;
-        system.scheduler.exitThread(exitCode);
+        this.beginProcessExit(exitCode);
         return { value: 0, terminated: true };
+    }
+
+    /**
+     * exit(): run the atexit/_onexit table (LIFO, cdecl, no args) as a guest-callback
+     * chain, then terminate — the CRT's own order. _exit()/ExitProcess deliberately
+     * skip the table, so they still go straight to exitProcess.
+     *
+     * The chain is the same mechanism as _initterm's static-ctor chain, but its
+     * terminal step cannot return a value: `exit` is noreturn, so completing the
+     * suspended frame would resume the guest on the byte after `call exit`. It
+     * terminates and parks at the spin loop instead, returning null so the callback
+     * manager leaves the CPU exactly as we left it.
+     */
+    private exitWithHandlers(code: number): ThunkResult {
+        const exitCode = code >>> 0;
+        const skip = (globalThis as { __noExitChain?: unknown }).__noExitChain === true;
+        if (skip || this.exitChainRunning || this.exitHandlers.length === 0) {
+            return this.exitProcess(exitCode);
+        }
+        const cpu = getCPU(this.process.v86);
+        const callbackManager = this.process.dispatcher.callbackManager;
+        if (!cpu || !callbackManager) return this.exitProcess(exitCode);
+
+        const pending = this.exitHandlers.length;
+        this.exitChainRunning = true;
+        Logger.log(LogCategory.SYSTEM, `msvcrt.exit(0x${exitCode.toString(16)}): running ${pending} atexit handler(s)`);
+
+        // cdecl, no args: the thunk stub RETs with 0 cleanup, the caller pops `code`.
+        if (!callbackManager.saveSuspendedThunkContext({ esp: cpu.reg32[4] >>> 0 }, 0, "CrtExitChain")) {
+            this.exitChainRunning = false;
+            return this.exitProcess(exitCode);
+        }
+
+        let ran = 0;
+        const finish = (): null => {
+            Logger.log(LogCategory.SYSTEM, `msvcrt.exit: atexit chain done (${ran} handler(s) ran)`);
+            this.beginProcessExit(exitCode);
+            this.process.dispatcher.parkTerminatedThreadAtSpinLoop();
+            return null;
+        };
+        // Pop rather than iterate a snapshot: a handler may register another one, and
+        // the CRT runs those too. The cap bounds a handler that re-registers itself.
+        const runNext = (): null => {
+            const fn = ran < Msvcrt.MAX_EXIT_HANDLERS ? this.exitHandlers.pop() : undefined;
+            if (!fn) return finish();
+            ran++;
+            try {
+                callbackManager.invokeCallback(fn, [], 0, completeThunk, true, "CrtExitChain");
+                return null;
+            } catch (e) {
+                Logger.warn(LogCategory.SYSTEM, `msvcrt.exit: atexit handler 0x${fn.toString(16)} could not be invoked: ${e}`);
+                return finish();
+            }
+        };
+        const completeThunk = (_ret: number): number | null => runNext();
+
+        // Either a callback now owns EIP/ESP, or finish() already parked the dead
+        // thread; both cases mean "do not RET from this thunk".
+        runNext();
+        return { value: 0, skipStackCheck: true };
     }
 
     private terminateProcess(code: number, reason: string): ThunkResult {

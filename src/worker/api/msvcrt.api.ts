@@ -119,6 +119,7 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("_control87", 2),
         makeFunc("_clearfp", 0),
         makeFunc("_onexit", 1),
+        makeFunc("atexit", 1),
         makeFunc("__dllonexit", 3),
         makeFunc("_except_handler3", 4),
         makeFunc("_XcptFilter", 2),
