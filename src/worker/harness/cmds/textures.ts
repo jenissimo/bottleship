@@ -86,19 +86,51 @@ export function registerTextureCommands(svc: HarnessService): void {
      *  the blit/present paths actually sample), or "auto" (scratch when present). Dumping
      *  both is how you tell "the guest never filled this" from "the guest filled it but we
      *  sample a blank texture" — the second blits a black rectangle at the right place. */
+    /** A D3D9 TextureStore handle, decoded to RGBA — the store DDraw's readSurfaceRGBA
+     *  cannot see. Tried whenever the selector is not a DDraw surface, so one verb serves
+     *  both backends and a d3d9-only title is no longer a dead end. */
+    const dumpD3d9 = async (ptr: number): Promise<{ rgba: Uint8Array; w: number; h: number; format: number } | { err: string } | null> => {
+        let reason: { err: string } | null = null;
+        for (const dev of d3d9Devices.values()) {
+            const r = (dev as any).readTextureRgba?.(ptr);
+            if (!r) continue;
+            if (!("err" in r)) return r;
+            // A render target has no guest copy by construction — go to the GPU for it rather
+            // than reporting the absence of something that is right there.
+            const rt = await (dev as any).readRenderTargetRgba?.(ptr);
+            if (rt && !("err" in rt)) return rt;
+            // Keep WHY it refused. Collapsing the reason into null made every such texture
+            // report "no d3d9 texture with that handle" — a diagnostic that sends the reader
+            // looking for a resource the gallery is already listing.
+            reason = rt ?? r;
+        }
+        return reason;
+    };
+
     const dump = async (args: unknown[]) => {
         const ptr = resolvePtr(args[0]);
         if (!ptr) throw new HarnessError("surface pointer is 0 (no such surface / not initialized)", HarnessErrorCode.NOT_FOUND);
+        const opts = (args[1] ?? {}) as { save?: string; from?: "auto" | "gpu" | "scratch" };
+        const emit = async (rgba: Uint8Array, w: number, h: number, source: string) => {
+            const name = (opts.save ?? `surf_${ptr.toString(16)}_${w}x${h}`).replace(/\.png$/i, "");
+            const base64 = await encodePngBase64(rgba, w, h);
+            (self as unknown as Worker).postMessage({ type: "debug_png_dump", name, base64 });
+            return { saved: debugDumpPath(name), ptr: "0x" + ptr.toString(16), w, h, source };
+        };
+
         const dd = ddraw();
-        if (!dd?.readSurfaceRGBA) throw new HarnessError("ddraw module not loaded (D3D9-only games not yet supported for surface dump)", HarnessErrorCode.UNSUPPORTED);
-        const opts0 = (args[1] ?? {}) as { save?: string; from?: "auto" | "gpu" | "scratch" };
-        const r = await dd.readSurfaceRGBA(ptr, opts0.from ?? "auto");
-        if ("err" in r) throw new HarnessError(`readSurfaceRGBA: ${r.err}`, HarnessErrorCode.INTERNAL);
-        const opts = (args[1] ?? {}) as { save?: string };
-        const name = (opts.save ?? `surf_${ptr.toString(16)}_${r.w}x${r.h}`).replace(/\.png$/i, "");
-        const base64 = await encodePngBase64(r.rgba, r.w, r.h);
-        (self as unknown as Worker).postMessage({ type: "debug_png_dump", name, base64 });
-        return { saved: debugDumpPath(name), ptr: "0x" + ptr.toString(16), w: r.w, h: r.h, source: r.source };
+        if (dd?.readSurfaceRGBA) {
+            const r = await dd.readSurfaceRGBA(ptr, opts.from ?? "auto");
+            if (!("err" in r)) return emit(r.rgba, r.w, r.h, r.source);
+            const d9 = await dumpD3d9(ptr);
+            if (!d9) throw new HarnessError(`readSurfaceRGBA: ${r.err} (and no d3d9 texture with that handle)`, HarnessErrorCode.INTERNAL);
+            if ("err" in d9) throw new HarnessError(`d3d9 texture 0x${ptr.toString(16)}: ${d9.err}`, HarnessErrorCode.UNSUPPORTED);
+            return emit(d9.rgba, d9.w, d9.h, `d3d9-store(fmt ${d9.format})`);
+        }
+        const d9 = await dumpD3d9(ptr);
+        if (!d9) throw new HarnessError("no DDraw surface and no D3D9 texture with that handle", HarnessErrorCode.NOT_FOUND);
+        if ("err" in d9) throw new HarnessError(`d3d9 texture 0x${ptr.toString(16)}: ${d9.err}`, HarnessErrorCode.UNSUPPORTED);
+        return emit(d9.rgba, d9.w, d9.h, `d3d9-store(fmt ${d9.format})`);
     };
     svc.register("dumpSurface", dump);
     svc.register("dumpTexture", dump);

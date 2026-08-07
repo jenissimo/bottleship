@@ -11,13 +11,19 @@ import { frameProfiler } from "../../../core/frame-profiler";
 import { statsOverlay } from "../../../core/stats-overlay";
 import { PROG_BIND } from "./shader";
 import { d3d9WasmArena, ArenaCommandType } from "./d3d9-wasm-arena";
-import { FFP_UNIFORM_BYTES } from "./ffp-lighting";
+import { FFP_UNIFORM_BYTES, FFP_MAX_STAGES } from "./ffp-lighting";
 
 export interface PipelineInfo {
     pipeline: GPURenderPipeline;
     hasTexture: boolean;
     /** Programmable (VS/PS) pipelines bind via per-draw BindProgrammable. */
     programmable: boolean;
+    /** FFP texture blend stages this pipeline's shader declares bindings for. The BIND side
+     *  must supply exactly this many (sampler, texture) pairs — the pipeline owns the number
+     *  because its shader is what the implicit layout is derived from, and a bind group built
+     *  from a differently-counted per-draw snapshot is a WebGPU validation error, not a
+     *  degraded picture. */
+    ffpStageCount: number;
 }
 
 const UNIFORM_ALIGN = 256;
@@ -153,10 +159,10 @@ export class D3D9BackendExecutor {
     /**
      * Register a pipeline and return its ID
      */
-    registerPipeline(pipeline: GPURenderPipeline, hasTexture: boolean, programmable = false): number {
+    registerPipeline(pipeline: GPURenderPipeline, hasTexture: boolean, programmable = false, ffpStageCount = 1): number {
         const id = this.pipelines.length;
         this.pipelines.push(pipeline);
-        this.pipelineInfo.push({ pipeline, hasTexture, programmable });
+        this.pipelineInfo.push({ pipeline, hasTexture, programmable, ffpStageCount });
         return id;
     }
 
@@ -220,8 +226,10 @@ export class D3D9BackendExecutor {
     // pipelines are cached. Read once, like __progCacheN.
     private readonly ffpDynOffsetEnabled = (globalThis as Record<string, unknown>).__ffpDynOffset === true;
     private ffpLayout: { bindGroupLayout: GPUBindGroupLayout; pipelineLayout: GPUPipelineLayout } | null = null;
+    // Flat per-slot stage arrays: slot s occupies [s*FFP_MAX_STAGES, +FFP_MAX_STAGES).
     private ffpCacheSampler: (GPUSampler | null)[] = [];
     private ffpCacheView: (GPUTextureView | null)[] = [];
+    private ffpCacheStages: number[] = [];
     private ffpCacheGroup: GPUBindGroup[] = [];
     private ffpCacheLen = 0;
     private ffpCacheCursor = 0;
@@ -270,14 +278,19 @@ export class D3D9BackendExecutor {
     private getFfpLayout(): { bindGroupLayout: GPUBindGroupLayout; pipelineLayout: GPUPipelineLayout } {
         if (!this.ffpLayout) {
             const device = this.backend.getDevice()!;
-            const bindGroupLayout = device.createBindGroupLayout({
-                entries: [
-                    // Read by both stages (vertex: transform/lighting; fragment: stage-0 ops, fog, clip).
-                    { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform", hasDynamicOffset: true } },
-                    { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
-                    { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
-                ],
-            });
+            const entries: GPUBindGroupLayoutEntry[] = [
+                // Read by both stages (vertex: transform/lighting; fragment: stage ops, fog, clip).
+                { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform", hasDynamicOffset: true } },
+            ];
+            // One (sampler, texture) pair per blend stage. Declared for ALL stages regardless of
+            // how many a given shader uses — a pipeline layout may be a superset of the shader's
+            // bindings, and one shared layout is what lets a single cached bind group serve every
+            // FFP pipeline.
+            for (let s = 0; s < FFP_MAX_STAGES; s++) {
+                entries.push({ binding: 1 + s * 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } });
+                entries.push({ binding: 2 + s * 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } });
+            }
+            const bindGroupLayout = device.createBindGroupLayout({ entries });
             const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] });
             this.ffpLayout = { bindGroupLayout, pipelineLayout };
         }
@@ -297,27 +310,53 @@ export class D3D9BackendExecutor {
      * uniform binding covers the fixed FFP_BIND_SIZE window at offset 0; the per-draw offset
      * is supplied as a dynamic offset by the caller.
      */
-    private acquireFfpBindGroup(sampler: GPUSampler, view: GPUTextureView): GPUBindGroup {
+    private acquireFfpBindGroup(
+        samplers: (GPUSampler | null)[],
+        views: (GPUTextureView | null)[],
+        stageCount: number,
+        validStages: number,
+        fallbackSampler: GPUSampler,
+        fallbackView: GPUTextureView,
+    ): GPUBindGroup {
+        // `validStages` is how far the arrays were actually written this draw; entries past it
+        // are stale (render-frame only clears slot 0). They are non-null, so the `?? fallback`
+        // does NOT catch them — an earlier, deeper draw's sampler/view would be bound, and a
+        // view can outlive its texture. The "auto" branch already honours this; both must.
+        const live = (n: number) => n < validStages;
+        // Compare only the stages this pipeline uses: the rest bind fallbacks, so two draws with
+        // the same used stages share a group whatever stale values sit in the tail.
         for (let s = 0; s < this.ffpCacheLen; s++) {
-            if (this.ffpCacheSampler[s] === sampler && this.ffpCacheView[s] === view) {
+            if (this.ffpCacheStages[s] !== stageCount) continue;
+            const base = s * FFP_MAX_STAGES;
+            let match = true;
+            for (let n = 0; n < stageCount; n++) {
+                if (this.ffpCacheSampler[base + n] !== ((live(n) ? samplers[n] : null) ?? fallbackSampler)
+                    || this.ffpCacheView[base + n] !== ((live(n) ? views[n] : null) ?? fallbackView)) { match = false; break; }
+            }
+            if (match) {
                 this.metrics.bindGroupCacheHits++;
                 return this.ffpCacheGroup[s];
             }
         }
         const device = this.backend.getDevice()!;
-        const bindGroup = device.createBindGroup({
-            layout: this.getFfpLayout().bindGroupLayout,
-            entries: [
-                { binding: 0, resource: { buffer: this.ffpArena!.buffer!, offset: 0, size: FFP_BIND_SIZE } },
-                { binding: 1, resource: sampler },
-                { binding: 2, resource: view },
-            ],
-        });
+        const entries: GPUBindGroupEntry[] = [
+            { binding: 0, resource: { buffer: this.ffpArena!.buffer!, offset: 0, size: FFP_BIND_SIZE } },
+        ];
+        for (let n = 0; n < FFP_MAX_STAGES; n++) {
+            const inRange = n < stageCount && live(n);
+            entries.push({ binding: 1 + n * 2, resource: (inRange ? samplers[n] : null) ?? fallbackSampler });
+            entries.push({ binding: 2 + n * 2, resource: (inRange ? views[n] : null) ?? fallbackView });
+        }
+        const bindGroup = device.createBindGroup({ layout: this.getFfpLayout().bindGroupLayout, entries });
         const slot = this.ffpCacheLen < FFP_CACHE_N
             ? this.ffpCacheLen++
             : (this.ffpCacheCursor = (this.ffpCacheCursor + 1) % FFP_CACHE_N);
-        this.ffpCacheSampler[slot] = sampler;
-        this.ffpCacheView[slot] = view;
+        this.ffpCacheStages[slot] = stageCount;
+        const base = slot * FFP_MAX_STAGES;
+        for (let n = 0; n < stageCount; n++) {
+            this.ffpCacheSampler[base + n] = (live(n) ? samplers[n] : null) ?? fallbackSampler;
+            this.ffpCacheView[base + n] = (live(n) ? views[n] : null) ?? fallbackView;
+        }
         this.ffpCacheGroup[slot] = bindGroup;
         return bindGroup;
     }
@@ -954,9 +993,17 @@ export class D3D9BackendExecutor {
             ];
 
             if (shared || info?.hasTexture) {
-                const texture = textureView ?? this.getFallbackTextureView();
-                entries.push({ binding: 1, resource: this.getSampler() });
-                entries.push({ binding: 2, resource: texture });
+                // One pair per stage the PIPELINE declares. This frame-level bind knows only a
+                // single texture (stage 0's); the stages above it get fallbacks — their ops are
+                // read from the uniform and a stage the guest did not enable is DISABLE anyway.
+                // Under "auto" the count must match the shader exactly, or the whole bind group
+                // is invalid and every draw in the pass is dropped.
+                const stages = shared ? FFP_MAX_STAGES : Math.max(1, info?.ffpStageCount ?? 1);
+                const fallback = this.getFallbackTextureView();
+                for (let n = 0; n < stages; n++) {
+                    entries.push({ binding: 1 + n * 2, resource: this.getSampler() });
+                    entries.push({ binding: 2 + n * 2, resource: (n === 0 ? textureView : null) ?? fallback });
+                }
             }
 
             bindGroup = device.createBindGroup({ layout, entries });
@@ -986,13 +1033,20 @@ export class D3D9BackendExecutor {
         const info = this.pipelineInfo[this.currentPipelineId];
         const offset = this.ffpArena.write(queue, fs.block, fs.blockLen);
 
+        const fallbackSampler = this.getSampler();
+        const fallbackView = this.getFallbackTextureView();
+        // The PIPELINE decides how many stage pairs to bind, not the draw snapshot: the two are
+        // computed from the same state and normally agree, but only the pipeline's number
+        // matches the layout its shader produced. A stage the snapshot did not fill binds the
+        // fallbacks — which the shader ignores anyway, since its op is DISABLE.
+        const stageCount = Math.max(1, Math.min(info?.ffpStageCount ?? 1, FFP_MAX_STAGES));
+
         if (this.ffpDynOffsetEnabled) {
-            // Shared explicit layout ⇒ the group depends only on (sampler, texture); the
-            // per-draw block is reached by the dynamic offset. Textureless variants bind the
-            // fallback view: the layout declares slot 2 even where the shader ignores it.
+            // Shared explicit layout ⇒ the group depends only on the per-stage (sampler,
+            // texture) set; the per-draw block is reached by the dynamic offset. Stages the
+            // shader ignores still bind the fallbacks: the layout declares every slot.
             const bindGroup = this.acquireFfpBindGroup(
-                fs.sampler ?? this.getSampler(),
-                fs.texture ?? this.getFallbackTextureView(),
+                fs.samplers, fs.textures, stageCount, fs.stageCount, fallbackSampler, fallbackView,
             );
             this.setBindGroup0(renderPass, bindGroup, offset, -1, 1);
             return;
@@ -1004,8 +1058,13 @@ export class D3D9BackendExecutor {
             { binding: 0, resource: { buffer: this.ffpArena.buffer!, offset, size: Math.max(16, fs.blockLen * 4) } },
         ];
         if (info?.hasTexture) {
-            entries.push({ binding: 1, resource: fs.sampler ?? this.getSampler() });
-            entries.push({ binding: 2, resource: fs.texture ?? this.getFallbackTextureView() });
+            // Implicit ("auto") layout: exactly the bindings the shader declared, i.e. one pair
+            // per stage it was generated for — supply that many, no more and no fewer.
+            for (let n = 0; n < stageCount; n++) {
+                const inRange = n < fs.stageCount;
+                entries.push({ binding: 1 + n * 2, resource: (inRange ? fs.samplers[n] : null) ?? fallbackSampler });
+                entries.push({ binding: 2 + n * 2, resource: (inRange ? fs.textures[n] : null) ?? fallbackView });
+            }
         }
         const bindGroup = device.createBindGroup({ layout, entries });
         this.setBindGroup0(renderPass, bindGroup);

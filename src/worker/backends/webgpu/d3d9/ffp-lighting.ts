@@ -41,13 +41,22 @@ const OFF_WORLD = TAIL_START;      // mat4x4 — WORLD only (D3DTS_WORLD), for w
 const OFF_CLIP_PLANES = OFF_WORLD + 16; // 308: array<vec4, 6> = 24 floats (raw plane equations)
 const CLIP_PLANE_COUNT = 6;
 // Texture stage 0 ops/args + TEXTUREFACTOR (D3DTSS_* / D3DRS_TEXTUREFACTOR).
-const OFF_STAGE0A = OFF_CLIP_PLANES + CLIP_PLANE_COUNT * 4; // 332: colorOp, colorArg1, colorArg2, alphaOp
-const OFF_STAGE0B = OFF_STAGE0A + 4;                        // 336: alphaArg1, alphaArg2, texOpaqueAlpha, 0
-const OFF_TFACTOR = OFF_STAGE0B + 4;                        // 340: TEXTUREFACTOR rgba
-/** stage0b float index — the per-draw writer sets .z (sampled texture is an
- *  alpha-less D3D format → shader must read alpha as 1.0, like real D3D9). */
-export const FFP_OFF_STAGE0B = OFF_STAGE0B;
-export const FFP_UNIFORM_FLOATS = OFF_TFACTOR + 4; // 344
+const OFF_TFACTOR = OFF_CLIP_PLANES + CLIP_PLANE_COUNT * 4; // 332: TEXTUREFACTOR rgba
+/**
+ * Texture blend stages. D3DCAPS9 advertises MaxTextureBlendStages = 8 (caps.ts ships a real
+ * hardware dump), so the FFP must be able to honor 8 — same reasoning that pinned
+ * MaxActiveLights to FFP_MAX_LIGHTS. Each stage is two vec4:
+ *   a = colorOp, colorArg1, colorArg2, alphaOp
+ *   b = alphaArg1, alphaArg2, texOpaqueAlpha, coordSet
+ * A shader is generated for only as many stages as the draw actually uses (D3D's cascade
+ * stops at the first COLOROP=DISABLE), so the tail of this array is simply never read.
+ */
+export const FFP_MAX_STAGES = 8;
+const STAGE_FLOATS = 8;
+const OFF_STAGES = OFF_TFACTOR + 4;                        // 336
+/** Float index of stage `s`'s first vec4 (a); its second vec4 (b) is +4. */
+export const ffpStageOffset = (stage: number): number => OFF_STAGES + stage * STAGE_FLOATS;
+export const FFP_UNIFORM_FLOATS = OFF_STAGES + FFP_MAX_STAGES * STAGE_FLOATS; // 400
 export const FFP_UNIFORM_BYTES = FFP_UNIFORM_FLOATS * 4; // 1376
 
 const OFF_VIEWPORT = 0;        // vec4: w, h, 0, 0
@@ -132,7 +141,10 @@ export interface FfpUniformParams {
     lights: FfpLightInput[];
     /** Texture stage 0 combiner (D3DTSS_COLOROP/COLORARG1/COLORARG2/ALPHAOP/ALPHAARG1/ALPHAARG2).
      *  The caller resolves the D3D stage-0 defaults. */
-    stage0: { colorOp: number; colorArg1: number; colorArg2: number; alphaOp: number; alphaArg1: number; alphaArg2: number };
+    /** Active texture blend stages, stage 0 first. Only these are written; the shader is
+     *  generated for exactly this many stages, so the rest of the array is never read.
+     *  `coordSet` is the D3DTSS_TEXCOORDINDEX set the stage samples. */
+    stages: Array<{ colorOp: number; colorArg1: number; colorArg2: number; alphaOp: number; alphaArg1: number; alphaArg2: number; coordSet: number }>;
     /** D3DRS_TEXTUREFACTOR, resolved to rgba. */
     tfactor: FfpColor;
 }
@@ -200,15 +212,22 @@ export function packFfpUniforms(out: Float32Array, p: FfpUniformParams): void {
     out.set(p.world.subarray(0, 16), OFF_WORLD);
     out.set(p.clipPlanes.subarray(0, CLIP_PLANE_COUNT * 4), OFF_CLIP_PLANES);
 
-    // Texture stage 0 combiner + TEXTUREFACTOR.
-    const s0 = p.stage0;
-    out[OFF_STAGE0A] = s0.colorOp;
-    out[OFF_STAGE0A + 1] = s0.colorArg1;
-    out[OFF_STAGE0A + 2] = s0.colorArg2;
-    out[OFF_STAGE0A + 3] = s0.alphaOp;
-    out[OFF_STAGE0B] = s0.alphaArg1;
-    out[OFF_STAGE0B + 1] = s0.alphaArg2;
     writeColor(out, OFF_TFACTOR, p.tfactor);
+
+    // Texture blend stages (the .z of each b — the alpha-less-format flag — is set by the
+    // per-draw writer, which is the only place that knows the bound texture's D3D format).
+    const n = Math.min(p.stages.length, FFP_MAX_STAGES);
+    for (let s = 0; s < n; s++) {
+        const st = p.stages[s];
+        const a = ffpStageOffset(s), b = a + 4;
+        out[a] = st.colorOp;
+        out[a + 1] = st.colorArg1;
+        out[a + 2] = st.colorArg2;
+        out[a + 3] = st.alphaOp;
+        out[b] = st.alphaArg1;
+        out[b + 1] = st.alphaArg2;
+        out[b + 3] = st.coordSet;
+    }
 }
 
 const IDENTITY4 = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
@@ -299,6 +318,11 @@ struct FfpLight {
 export const FFP_UNIFORM_STRUCT_WGSL = `
 ${FFP_LIGHT_STRUCT_WGSL}
 
+struct FfpStage {
+    a: vec4<f32>,      // colorOp, colorArg1, colorArg2, alphaOp
+    b: vec4<f32>,      // alphaArg1, alphaArg2, texOpaqueAlpha, coordSet
+}
+
 struct Uniforms {
     viewport: vec4<f32>,
     mvp: mat4x4<f32>,
@@ -315,9 +339,8 @@ struct Uniforms {
     // Tail block (appended after the light array so light offsets never shift):
     world: mat4x4<f32>,                 // WORLD only — FFP clip planes evaluate in world space
     clipPlanes: array<vec4<f32>, ${CLIP_PLANE_COUNT}>, // raw world-space plane equations
-    stage0a: vec4<f32>,    // colorOp, colorArg1, colorArg2, alphaOp
-    stage0b: vec4<f32>,    // alphaArg1, alphaArg2, texOpaqueAlpha, 0
     tfactor: vec4<f32>,    // D3DRS_TEXTUREFACTOR rgba
+    stages: array<FfpStage, ${FFP_MAX_STAGES}>,
 }
 `;
 

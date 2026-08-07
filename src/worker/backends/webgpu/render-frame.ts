@@ -1,4 +1,8 @@
 import { PROG_BIND } from "./d3d9/shader";
+import { FFP_MAX_STAGES } from "./d3d9/ffp-lighting";
+
+/** Stage slots a pooled FfpDrawState carries — the FFP cap (d3d9 advertises 8 blend stages). */
+const FFP_STAGE_SLOTS = FFP_MAX_STAGES;
 
 export const enum RenderCommandType {
     SetPipeline = 1,
@@ -15,9 +19,13 @@ export const enum RenderCommandType {
 export interface FfpDrawState {
     block: Float32Array;
     blockLen: number;
-    texture: GPUTextureView | null;
-    /** Stage-0 sampler built from the guest's D3DSAMP_* state (null = executor default). */
-    sampler: GPUSampler | null;
+    /** Per-texture-stage views + samplers (index = D3D stage). Entries past `stageCount`
+     *  are stale and must not be read; the executor binds fallbacks for them. A null entry
+     *  inside the range means nothing was bound at that stage. */
+    textures: (GPUTextureView | null)[];
+    samplers: (GPUSampler | null)[];
+    /** Texture blend stages this draw's pipeline was generated for (>= 1). */
+    stageCount: number;
 }
 
 export type RenderClear = {
@@ -217,13 +225,21 @@ export class RenderFrame {
     nextFfpState(blockLen: number): number {
         let s = this.ffpStates[this.ffpStateCount];
         if (!s) {
-            s = { block: new Float32Array(Math.max(4, blockLen)), blockLen: 0, texture: null, sampler: null };
+            s = {
+                block: new Float32Array(Math.max(4, blockLen)), blockLen: 0,
+                textures: new Array(FFP_STAGE_SLOTS).fill(null),
+                samplers: new Array(FFP_STAGE_SLOTS).fill(null),
+                stageCount: 1,
+            };
             this.ffpStates[this.ffpStateCount] = s;
         }
         if (s.block.length < blockLen) s.block = new Float32Array(blockLen);
         s.blockLen = blockLen;
-        s.texture = null;
-        s.sampler = null;
+        // Only [0, stageCount) is read, and captureFfpDrawState fills exactly that range —
+        // clearing all eight per draw would be pure hot-path cost for slots nobody looks at.
+        s.stageCount = 1;
+        s.textures[0] = null;
+        s.samplers[0] = null;
         return this.ffpStateCount++;
     }
 

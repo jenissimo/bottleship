@@ -9,7 +9,6 @@ const D3DRS_LIGHTING = 137;
 const D3DRS_CULLMODE = 22;
 const D3DRS_ZENABLE = 7;
 const D3DRS_ZWRITEENABLE = 14;
-const D3DCULL_NONE = 1;
 
 const D3DTS_WORLD = 0x100;
 const D3DTS_VIEW = 2;
@@ -78,11 +77,14 @@ export class D3D9StateTracker {
     /**
      * Seed the non-zero D3D9 default render states the blend/lighting pipelines depend on.
      * The render-state array is zero-filled, but several defaults are non-zero (notably
-     * COLORWRITEENABLE = all channels, and the FFP material-colour sources). None of the
-     * seeded states are part of the FFP pipeline key (cull/z/lighting), so the key is
-     * unaffected; the lighting *enable* default is intentionally left at 0 (games set it
-     * explicitly — same choice as the D3D8 adapter) to avoid darkening titles that draw
-     * pre-coloured FFP geometry without ever touching lighting state.
+     * COLORWRITEENABLE = all channels, the FFP material-colour sources, and the depth states).
+     * The lighting *enable* default is intentionally left at 0 (games set it explicitly — same
+     * choice as the D3D8 adapter) to avoid darkening titles that draw pre-coloured FFP geometry
+     * without ever touching lighting state.
+     *
+     * This runs on Reset() too, which is the case that matters most: after a real D3D9 Reset
+     * every render state returns to its default, and a game that relied on one before the Reset
+     * has no reason to set it again.
      */
     private seedRenderStateDefaults(): void {
         const D3DBLEND_ONE = 2, D3DBLEND_ZERO = 1, D3DBLENDOP_ADD = 1, ALL_CHANNELS = 0xf;
@@ -111,6 +113,20 @@ export class D3D9StateTracker {
         this.renderStates[154] = 0x3F800000; // D3DRS_POINTSIZE     = 1.0f
         this.renderStates[155] = 0x3F800000; // D3DRS_POINTSIZE_MIN = 1.0f
         this.renderStates[166] = 0x46000000; // D3DRS_POINTSIZE_MAX = 8192.0f (advertised MaxPointSize)
+        // Depth. D3DRS_ZENABLE defaults to D3DZB_TRUE when the device has an automatic
+        // depth-stencil buffer, which ours always does (every pipeline carries a depth24plus
+        // attachment). These MUST be seeded rather than inferred at the read site: renderStates
+        // is an Int32Array, so an unset entry reads 0, not undefined, and a `?? 1` fallback can
+        // never fire — a game that relies on the defaults (or on their restoration after a
+        // Reset) then renders its whole world with the z-buffer off.
+        this.renderStates[7] = 1;    // D3DRS_ZENABLE      = D3DZB_TRUE
+        this.renderStates[14] = 1;   // D3DRS_ZWRITEENABLE = TRUE
+        this.renderStates[23] = 4;   // D3DRS_ZFUNC        = D3DCMP_LESSEQUAL
+        // Backface culling is ON by default in D3D9 — the same dead-`??` hole as the depth
+        // states left it at 0 (= NONE), so a game that never sets it drew its interiors
+        // through its walls.
+        this.renderStates[22] = 3;   // D3DRS_CULLMODE     = D3DCULL_CCW
+        this.renderStates[25] = 8;   // D3DRS_ALPHAFUNC    = D3DCMP_ALWAYS
     }
 
     // Render state management
@@ -225,10 +241,12 @@ export class D3D9StateTracker {
             return this.pipelineKey;
         }
 
-        const cullMode = this.renderStates[D3DRS_CULLMODE] ?? D3DCULL_NONE;
-        const lighting = this.renderStates[D3DRS_LIGHTING] ?? 0;
-        const zEnable = this.renderStates[D3DRS_ZENABLE] ?? 1; // Default to true in D3D
-        const zWrite = this.renderStates[D3DRS_ZWRITEENABLE] ?? 1; // Default to true in D3D
+        const cullMode = this.renderStates[D3DRS_CULLMODE];
+        const lighting = this.renderStates[D3DRS_LIGHTING];
+        // Defaults live in seedRenderStateDefaults, not here: renderStates is an Int32Array,
+        // so `?? 1` at a read site is dead code (0 is not nullish) and only looks like a default.
+        const zEnable = this.renderStates[D3DRS_ZENABLE];
+        const zWrite = this.renderStates[D3DRS_ZWRITEENABLE];
         
         const lightingBit = lighting !== 0 ? 1 : 0;
         const zEnableBit = zEnable !== 0 ? 1 : 0;

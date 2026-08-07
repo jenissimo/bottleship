@@ -142,3 +142,43 @@ export function computeBlendKey(getRS: GetRenderState): string {
     return `b${getRS(D3DRS_SRCBLEND)},${getRS(D3DRS_DESTBLEND)},${getRS(D3DRS_BLENDOP)},${sep},`
         + `${getRS(D3DRS_SRCBLENDALPHA)},${getRS(D3DRS_DESTBLENDALPHA)},${getRS(D3DRS_BLENDOPALPHA)},${writeMask}`;
 }
+
+// ── Depth state ───────────────────────────────────────────────────────────
+export const D3DRS_ZENABLE = 7;
+export const D3DRS_ZWRITEENABLE = 14;
+export const D3DRS_ZFUNC = 23;
+
+const D3DCMP_TO_GPU: readonly GPUCompareFunction[] = [
+    "less-equal", // 0 — not a D3DCMPFUNC; treat as the D3D9 default
+    "never", "less", "equal", "less-equal", "greater", "not-equal", "greater-equal", "always",
+];
+
+/**
+ * Build the WebGPU depth-stencil descriptor for the current render state.
+ *
+ * D3DRS_ZFUNC is a first-class part of the state: engines that do their own
+ * visibility (BSP/portal, painter-ordered passes) render most of the world with
+ * D3DCMP_ALWAYS and still write depth for the passes that follow, so pinning the
+ * comparison to LESSEQUAL silently rejects surfaces the game meant to overdraw.
+ *
+ * D3DZB_FALSE turns the z-buffer OFF — no test AND no write, whatever
+ * D3DRS_ZWRITEENABLE says. Vulkan gets that for free ("depth writes are always
+ * disabled when depthTestEnable is VK_FALSE", which is why DXVK can map the two
+ * render states independently); WebGPU does not — depthCompare "always" with
+ * depthWriteEnabled still writes — so the AND has to be explicit here.
+ */
+export function buildDepthStencilState(format: GPUTextureFormat, getRS: GetRenderState): GPUDepthStencilState {
+    const zEnable = getRS(D3DRS_ZENABLE) !== 0; // D3DZB_TRUE(1) and D3DZB_USEW(2) both test
+    const func = getRS(D3DRS_ZFUNC);
+    return {
+        format,
+        depthWriteEnabled: zEnable && getRS(D3DRS_ZWRITEENABLE) !== 0,
+        depthCompare: zEnable ? (D3DCMP_TO_GPU[func] ?? "less-equal") : "always",
+    };
+}
+
+/** Cache-key fragment for the depth portion — folded into the pipeline cache keys. */
+export function computeDepthKey(getRS: GetRenderState): string {
+    if (getRS(D3DRS_ZENABLE) === 0) return "z0";
+    return `z${getRS(D3DRS_ZWRITEENABLE) !== 0 ? 1 : 0}.${getRS(D3DRS_ZFUNC)}`;
+}
