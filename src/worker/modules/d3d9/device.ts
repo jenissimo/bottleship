@@ -61,6 +61,7 @@ const PP_BACKBUFFER_FORMAT = 8;
 const PP_WINDOWED = 32;
 const PP_ENABLE_AUTO_DEPTHSTENCIL = 36;
 const PP_AUTO_DEPTHSTENCIL_FORMAT = 40;
+const PP_PRESENTATION_INTERVAL = 52;
 
 function formatForBpp(bpp: number): number {
     return bpp <= 16 ? D3DFMT_R5G6B5 : D3DFMT_X8R8G8B8;
@@ -402,6 +403,10 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
                 const fullscreen = ppView.getUint32(pPresentationParameters + 32, true) === 0;
                 Logger.log(LogCategory.D3D9, `CreateDevice backbuffer ${bbWidth}x${bbHeight} fullscreen=${fullscreen}`);
                 device.setBackBufferSize(bbWidth, bbHeight, fullscreen);
+                // The swap interval the app asked for. D3DCAPS9.PresentationIntervals
+                // advertises IMMEDIATE|ONE|TWO|THREE|FOUR, so Present has to honor it.
+                device.setPresentationInterval(
+                    ppView.getUint32(pPresentationParameters + PP_PRESENTATION_INTERVAL, true));
             }
 
             // Get or create vtables
@@ -649,13 +654,15 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         return D3D_OK;
     };
 
-    // ColorFill(pSurface, pRect, color). The common use (AGS et al.) is a full
-    // fill of the backbuffer between scenes — expressed as a color-only Clear.
-    // The clear applies at render-pass START, so it is only safe while nothing has
-    // been recorded this frame — otherwise it would reorder before pending draws.
-    // Partial-rect / offscreen-surface fills need a scissored fill pipeline the
-    // D3D9 backend doesn't have yet; dropping the fill beats painting wrong pixels.
-    let colorFillWarned = false;
+    // ColorFill(pSurface, pRect, color). Two shapes, both real:
+    //  - the backbuffer, full rect, nothing recorded yet → a color-only Clear (the clear
+    //    applies at render-pass START, so it is only equivalent while nothing is pending);
+    //  - an OFFSCREEN surface → the backend fills that texture. This is how an engine that
+    //    composes its 2D layer into a render target erases the layer between frames, and
+    //    dropping it makes every frame's UI accumulate on top of the last.
+    // What is still not expressible is a SUB-RECT of a render target (no scissored fill
+    // pipeline); that one is reported, not silently swallowed.
+    let colorFillDropped = 0;
     exports['IDirect3DDevice9_ColorFill'] = (_ctx, _mem, args) => {
         const device = devices.get(args[0]);
         const pSurface = args[1] >>> 0;
@@ -664,17 +671,21 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         if (!device || !pSurface) return D3DERR_INVALIDCALL;
 
         const meta = surfaceMeta.get(pSurface);
-        const isBackbuffer = !meta || !(meta.texturePtr ?? 0);
+        const texturePtr = meta?.texturePtr ?? 0;
+        const isBackbuffer = !texturePtr;
+        let rect: { left: number; top: number; right: number; bottom: number } | null = null;
         let fullRect = !pRect;
         if (pRect) {
-            const left = Mem.readInt32(pRect) ?? 0;
-            const top = Mem.readInt32(pRect + 4) ?? 0;
-            const right = Mem.readInt32(pRect + 8) ?? 0;
-            const bottom = Mem.readInt32(pRect + 12) ?? 0;
+            rect = {
+                left: Mem.readInt32(pRect) ?? 0,
+                top: Mem.readInt32(pRect + 4) ?? 0,
+                right: Mem.readInt32(pRect + 8) ?? 0,
+                bottom: Mem.readInt32(pRect + 12) ?? 0,
+            };
             const bb = EmulatorConfig.getInstance().screenResolution;
             const width = meta?.width ?? bb.width;
             const height = meta?.height ?? bb.height;
-            fullRect = left <= 0 && top <= 0 && right >= width && bottom >= height;
+            fullRect = rect.left <= 0 && rect.top <= 0 && rect.right >= width && rect.bottom >= height;
         }
 
         if (isBackbuffer && fullRect && !device.hasPendingWork()) {
@@ -682,10 +693,17 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
             device.clear(D3DCLEAR_TARGET, color, 1, 0);
             return D3D_OK;
         }
-        if (!colorFillWarned) {
-            colorFillWarned = true;
+        if (!isBackbuffer && device.colorFillSurface(texturePtr, rect, color)) {
+            return D3D_OK;
+        }
+        // Rate-limited by COUNT, not by a once-per-session latch: a latch fires during the
+        // load firehose and then never again, which is how a fill that was being dropped
+        // every single frame stayed invisible.
+        if ((colorFillDropped++ & 0xff) === 0) {
             Logger.warn(LogCategory.D3D9,
-                `ColorFill: unsupported target (surface=0x${pSurface.toString(16)}, backbuffer=${isBackbuffer}, fullRect=${fullRect}, pendingWork=${device.hasPendingWork()}) — fill dropped`);
+                `ColorFill: unsupported target (surface=0x${pSurface.toString(16)}, tex=0x${texturePtr.toString(16)}, ` +
+                `backbuffer=${isBackbuffer}, fullRect=${fullRect}, pendingWork=${device.hasPendingWork()}) — ` +
+                `fill dropped (${colorFillDropped} so far)`);
         }
         return D3D_OK;
     };

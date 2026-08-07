@@ -3,6 +3,7 @@ import { Mem } from "../../core/memory/mem-accessor";
 import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { GlideBackendExecutor } from "../../backends/webgpu/glide/glide-backend-executor";
 import { System } from "../../core/system";
+import { framePacer } from "../../core/frame-pacer";
 import {
     FXFALSE,
     FXTRUE,
@@ -209,7 +210,7 @@ export function createHardwareExports(context: GlideContext): Record<string, Thu
             return 0;
         },
 
-        "_grBufferSwap@4": (_ctx, _mem, args) => {
+        "_grBufferSwap@4": (_ctx, _mem, args): number | Promise<number> => {
             if (!context.winOpen || !context.presenter) {
                 return FXFALSE;
             }
@@ -219,7 +220,11 @@ export function createHardwareExports(context: GlideContext): Record<string, Thu
             const swapInterval = args[0] | 0;
             const ok = context.presenter.presentFrame(swapInterval);
             context.diagnostics.push("swap", `interval=${swapInterval} ok=${ok ? 1 : 0}`);
-            return ok ? FXTRUE : FXFALSE;
+            if (!ok) return FXFALSE;
+            // Glide: 0 swaps without waiting for a vertical retrace, N>0 waits N retraces.
+            // The swap itself runs first so the frame we read is the LFB as the guest left
+            // it at the call — the retrace hold must not straddle other threads' execution.
+            return framePacer.waitForPresentInterval(Math.max(0, swapInterval)).then(() => FXTRUE);
         },
 
         "_grBufferClear@12": (_ctx, _mem, args) => {

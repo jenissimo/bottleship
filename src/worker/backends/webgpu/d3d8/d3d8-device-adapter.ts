@@ -18,7 +18,7 @@ import { TexturePaletteStore } from '../shared/texture-palette-store';
 import { Logger, LogCategory } from '../../../core/logger';
 import * as frameCapture from '../../../modules/ddraw/frame-capture';
 import { System } from '../../../core/system';
-import { framePacer } from '../../../core/frame-pacer';
+import { framePacer, decodeD3DPresentInterval, PRESENT_INTERVAL_ONE } from '../../../core/frame-pacer';
 import { frameProfiler } from '../../../core/frame-profiler';
 import { profiler } from '../../../core/profiler';
 import { statsOverlay } from '../../../core/stats-overlay';
@@ -734,6 +734,17 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         this.renderer.setGuestRequestedMsaa(count);
     }
 
+    /**
+     * D3DPRESENT_PARAMETERS.FullScreen_PresentationInterval, as refreshes to hold each
+     * Present. Same encoding as d3d9's PresentationInterval; windowed mode is required to
+     * pass DEFAULT, which decodes to ONE, so no mode-dependent branch is needed.
+     */
+    private presentInterval = PRESENT_INTERVAL_ONE;
+
+    setPresentationInterval(rawInterval: number): void {
+        this.presentInterval = decodeD3DPresentInterval(rawInterval);
+    }
+
     reset(pPresentationParameters: number, mem: Uint8Array): number {
         if (!pPresentationParameters) return 0x8876086c;
 
@@ -742,8 +753,10 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         const height = Math.max(1, view.getUint32(pPresentationParameters + 4, true) || 600);
         // D3DPRESENT_PARAMETERS.MultiSampleType is at offset +16 (D3D8 has no MultiSampleQuality).
         this.applyPresentMultiSampleType(view.getUint32(pPresentationParameters + 16, true));
+        // FullScreen_PresentationInterval @ +48 — re-declared by every Reset.
+        this.setPresentationInterval(view.getUint32(pPresentationParameters + 48, true));
 
-        Logger.log(LogCategory.SYSTEM, `D3D8 Reset(${width}x${height})`);
+        Logger.log(LogCategory.SYSTEM, `D3D8 Reset(${width}x${height}, interval=${this.presentInterval})`);
 
         this.flushProgrammablePending();
         // Windowed @ +28 (d3d8): only a fullscreen Reset sets the display mode.
@@ -1927,7 +1940,9 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
 
         profiler.start("present");
         const presentStart = frameProfiler.startTimer();
-        await framePacer.waitForFrameSlot({ nonBlocking: true });
+        // Present is an unambiguous frame boundary (unlike DDraw's many-Blts-per-frame
+        // primary), so it paces on the interval the device declared, exactly like d3d9.
+        await framePacer.waitForPresentInterval(this.presentInterval);
         framePacer.reserveFrameSlot();
 
         try {

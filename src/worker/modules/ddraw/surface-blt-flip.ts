@@ -6,12 +6,15 @@ import { Logger, LogCategory } from "../../core/logger";
 import { System } from "../../core/system";
 import { profiler } from "../../core/profiler";
 import { frameProfiler } from "../../core/frame-profiler";
-import { framePacer } from "../../core/frame-pacer";
+import { framePacer, PRESENT_INTERVAL_ONE } from "../../core/frame-pacer";
 import { DDrawContext } from "./context";
 import {
     DD_OK,
     E_FAIL,
     E_POINTER,
+    DDFLIP_INTERVAL2,
+    DDFLIP_INTERVAL3,
+    DDFLIP_INTERVAL4,
     DDSCAPS_PRIMARYSURFACE,
     DDSCAPS_FLIP,
     DDSCAPS_FRONTBUFFER,
@@ -287,6 +290,25 @@ function clampRectsForBlt(
     return { src: resultSrc, dst: resultDst, width: dstW, height: dstH };
 }
 
+/**
+ * Flip's dwFlags → refreshes to hold the flip for. The INTERVALn flags are DirectDraw's
+ * spelling of D3DPRESENT_INTERVAL_TWO/THREE/FOUR and are honored.
+ *
+ * DDFLIP_NOVSYNC is deliberately NOT mapped to IMMEDIATE yet. Its faithful reading is "do
+ * not wait for the retrace", but Flip is the only frame throttle a great many DDraw-era
+ * titles have, and this backend carries most of the library: releasing it lets guest logic
+ * run at the IMMEDIATE backstop (8x refresh) on the same worker thread the guest CPU and the
+ * audio pump share, and a title whose simulation is tied to its frame loop then runs fast.
+ * That is a change to every existing DDraw bundle and wants its own regression pass, not a
+ * ride-along with the d3d paths. `__forcePresentInterval` 0 exercises it meanwhile.
+ */
+function flipPresentInterval(dwFlags: number): number {
+    if (dwFlags & DDFLIP_INTERVAL4) return 4;
+    if (dwFlags & DDFLIP_INTERVAL3) return 3;
+    if (dwFlags & DDFLIP_INTERVAL2) return 2;
+    return PRESENT_INTERVAL_ONE;
+}
+
 export function createSurfaceBltFlipExports(context: DDrawContext): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
 
@@ -296,6 +318,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
     exports["IDirectDrawSurface7_Flip"] = (ctx, mem, args): number | Promise<number> => {
         const thisPtr = args[0];
         const lpDDSurfaceTargetOverride = args[1];
+        const presentInterval = flipPresentInterval(args[2] >>> 0);
         profiler.start('Flip:lookup');
         const obj = context.resourceProvider.getComObjectByAddress(thisPtr) as DirectDrawSurfaceObject | null;
         if (!obj) return E_FAIL;
@@ -433,8 +456,8 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
             // Frame capture: finalize captured draw calls for this frame
             frameCaptureOnFrameEnd();
 
-            // Frame Pacer: wait for display refresh (pauses virtual time, compensates dt)
-            return framePacer.waitForFrameSlot().then(() => {
+            // Frame Pacer: hold for the interval this Flip asked for (default = one refresh).
+            return framePacer.waitForPresentInterval(presentInterval).then(() => {
                 // Mark frame END after pacer wait so frameMs includes real inter-frame interval.
                 frameProfiler.markFrame("ddraw");
 

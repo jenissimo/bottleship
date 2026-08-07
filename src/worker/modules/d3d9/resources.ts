@@ -59,7 +59,7 @@ const E_NOINTERFACE = 0x80004002;
 const IID_IDIRECT3DSWAPCHAIN9 = 'f2504979fcad8a45905e10a10b0b503b';
 
 /** Canonical key for a REFGUID argument (16 raw bytes → hex). */
-function readGuidKey(mem: Uint8Array, addr: number): string | null {
+export function readGuidKey(mem: Uint8Array, addr: number): string | null {
     if (!addr || addr + 16 > mem.length) return null;
     let key = '';
     for (let i = 0; i < 16; i++) key += mem[addr + i]!.toString(16).padStart(2, '0');
@@ -668,21 +668,6 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         if (!device || !srcMeta?.texturePtr || !dstMeta?.texturePtr) return D3DERR_INVALIDCALL;
 
         return device.readTextureIntoGuestTexture(srcMeta.texturePtr, dstMeta.texturePtr);
-    };
-
-    exports['IDirect3DDevice9_CreateQuery'] = (_ctx, _mem, args) => {
-        const pDevice = args[0];
-        const _type = args[1];
-        const ppQuery = args[2];
-
-        const device = devices.get(pDevice);
-        if (!device || !ppQuery) {
-            return D3DERR_INVALIDCALL;
-        }
-
-        // Query objects are not implemented yet. Report as unavailable instead of thunk-missing.
-        Mem.writeUint32(ppQuery, 0);
-        return D3DERR_NOTAVAILABLE;
     };
 
     exports['IDirect3DVertexBuffer9_Lock'] = (ctx, mem, args) => {

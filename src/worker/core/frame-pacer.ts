@@ -12,6 +12,8 @@
  * - Fast path: if rAF already fired (game slower than display), returns immediately.
  * - Non-blocking mode: for Blt-to-primary games that issue many Blts per
  *   visual frame, yields at most once per rAF cycle (12ms cooldown).
+ * - waitForPresentInterval(n) is the PRESENT-side entry point: the swap interval the app
+ *   asked for, expressed as refreshes to hold (see PRESENT_INTERVAL_* below).
  *
  * Enabled by default. Adapts to any display refresh rate (60 Hz, 144 Hz, etc.)
  * with sub-millisecond precision (no setTimeout jitter).
@@ -21,12 +23,50 @@ import { Logger, LogCategory } from "./logger";
 import { frameVarianceDiagnostics } from "./frame-variance-diagnostics";
 import { debugSession } from "./debug/debug-session";
 
+/**
+ * A present's swap interval, in display refreshes to hold it for. Every legacy API
+ * spells the same three requests differently — D3DPRESENT_INTERVAL_*,
+ * DDFLIP_NOVSYNC/DDFLIP_INTERVALn, grBufferSwap's argument — so they all reduce to
+ * this one number: 0 = "don't wait for a retrace", N = "wait N retraces".
+ */
+export const PRESENT_INTERVAL_IMMEDIATE = 0;
+export const PRESENT_INTERVAL_ONE = 1;
+
+/**
+ * D3DPRESENT_INTERVAL_* → refresh count. d3d8caps.h and d3d9types.h use the identical
+ * encoding, so one decoder serves both backends and they cannot drift. DEFAULT (0) means
+ * ONE, as it does on a real runtime; a value we never advertise falls back to ONE rather
+ * than inventing a cadence the app did not ask for.
+ */
+export function decodeD3DPresentInterval(raw: number): number {
+    const v = raw >>> 0;
+    if (v & 0x80000000) return PRESENT_INTERVAL_IMMEDIATE; // D3DPRESENT_INTERVAL_IMMEDIATE
+    switch (v) {
+        case 0x00000002: return 2; // D3DPRESENT_INTERVAL_TWO
+        case 0x00000004: return 3; // D3DPRESENT_INTERVAL_THREE
+        case 0x00000008: return 4; // D3DPRESENT_INTERVAL_FOUR
+        default: return PRESENT_INTERVAL_ONE; // DEFAULT (0) and ONE (1)
+    }
+}
+
+/**
+ * IMMEDIATE work bound: the compositor puts exactly one image on screen per refresh, so
+ * presents past this count inside a single refresh cannot be seen — they only consume the
+ * worker thread the guest CPU runs on. Far above any rate a period title's own logic gates
+ * on, so the bound is not guest-observable; `__noPresentBackstop` removes it entirely.
+ */
+const IMMEDIATE_PRESENTS_PER_REFRESH = 8;
+
 export type FramePacerStats = {
     enabled: boolean;
     frameSlotBusy: boolean;
     totalWaits: number;
     totalWaitTimeMs: number;
     currentWaitStartMs: number;
+    /** Presents released without a retrace wait (interval IMMEDIATE). */
+    immediatePresents: number;
+    /** Extra refreshes held for interval >= TWO (does not count the first). */
+    heldRefreshes: number;
 };
 
 class FramePacerImpl {
@@ -62,6 +102,12 @@ class FramePacerImpl {
     private totalWaitTimeMs = 0;
     private currentWaitStartMs = 0;
     private slotBusy = false;
+    private immediatePresents = 0;
+    private heldRefreshes = 0;
+
+    // IMMEDIATE backstop bookkeeping: presents released inside the current vsync (rafTick).
+    private immediateTick = -1;
+    private immediateCount = 0;
 
     // Adaptive smooth-pacing (opt-in via setPacingMode('smooth')). A sub-refresh guest
     // (~23 FPS on 60 Hz) otherwise lands each frame at an arbitrary phase → held 2 or 3
@@ -208,6 +254,57 @@ class FramePacerImpl {
         frameVarianceDiagnostics.recordIdleTime('raf_wait', wallElapsed);
     }
 
+    /**
+     * Present-side pacing: hold this present for `refreshes` display refreshes.
+     *
+     * 1 (D3DPRESENT_INTERVAL_ONE/DEFAULT, a plain Flip, grBufferSwap(1)) IS the
+     * waitForFrameSlot() path verbatim; >1 holds that many further refreshes on top;
+     * 0 is IMMEDIATE (waitImmediate). `__forcePresentInterval` overrides every caller
+     * globally — the one escape hatch, never a per-title branch.
+     */
+    waitForPresentInterval(refreshes: number): Promise<void> {
+        if (!this.enabled || !this.running) return Promise.resolve();
+        const forced = (globalThis as Record<string, unknown>).__forcePresentInterval;
+        const n = Math.max(0, (typeof forced === 'number' ? forced : refreshes) | 0);
+        if (n === PRESENT_INTERVAL_IMMEDIATE) return this.waitImmediate();
+        // NOT `async`, and interval 1 RETURNS waitForFrameSlot rather than awaiting it.
+        // An async wrapper costs a microtask turn before the wait even begins, and a
+        // present that fits the refresh by a hair (this title clears it by ~0.7ms) then
+        // crosses the deadline and loses a WHOLE refresh — measured as a hard lock to
+        // half rate, with the worker idle half the time. The common path must add nothing.
+        if (n <= PRESENT_INTERVAL_ONE) return this.waitForFrameSlot();
+        return this.holdRefreshes(n);
+    }
+
+    private async holdRefreshes(n: number): Promise<void> {
+        await this.waitForFrameSlot();
+        for (let i = 1; i < n && this.enabled && this.running; i++) {
+            this.heldRefreshes++;
+            await this.awaitRafPermit();
+        }
+    }
+
+    /**
+     * IMMEDIATE: the app asked us not to wait for a retrace, so we don't — an unbounded
+     * rate is the contract. The only intervention is the invisible-work bound
+     * (IMMEDIATE_PRESENTS_PER_REFRESH), which degrades to a single-refresh wait. An
+     * explicitly selected pacing mode wins: 'vsync'/'smooth' exist to force a cadence.
+     */
+    private async waitImmediate(): Promise<void> {
+        this.immediatePresents++;
+        if (this.pacingMode !== 'off') return this.waitForFrameSlot();
+
+        if (this.immediateTick !== this.rafTick) {
+            this.immediateTick = this.rafTick;
+            this.immediateCount = 0;
+        }
+        if (++this.immediateCount <= IMMEDIATE_PRESENTS_PER_REFRESH ||
+            (globalThis as Record<string, unknown>).__noPresentBackstop) {
+            return;
+        }
+        await this.waitForFrameSlot();
+    }
+
     setPacingMode(mode: 'off' | 'vsync' | 'smooth'): void {
         this.pacingMode = mode;
         this.lastSlotReturnMs = 0;
@@ -344,6 +441,8 @@ class FramePacerImpl {
             totalWaits: this.totalWaits,
             totalWaitTimeMs: this.totalWaitTimeMs,
             currentWaitStartMs: this.currentWaitStartMs,
+            immediatePresents: this.immediatePresents,
+            heldRefreshes: this.heldRefreshes,
         };
     }
 
@@ -351,6 +450,8 @@ class FramePacerImpl {
         this.totalWaits = 0;
         this.totalWaitTimeMs = 0;
         this.currentWaitStartMs = 0;
+        this.immediatePresents = 0;
+        this.heldRefreshes = 0;
     }
 
     // --- Internal ---

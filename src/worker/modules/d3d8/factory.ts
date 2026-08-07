@@ -284,6 +284,10 @@ export function createFactoryExports(): Record<string, ThunkImplementation> {
             // fold it into the executor's effective sample count so in-engine AA works.
             device.applyPresentMultiSampleType(view.getUint32(pPresParams + 16, true));
 
+            // The swap interval the app asked for (FullScreen_PresentationInterval @ +48).
+            // D3DCAPS8.PresentationIntervals advertises IMMEDIATE|ONE, so Present must honor it.
+            device.setPresentationInterval(view.getUint32(pPresParams + 48, true));
+
             // Resize canvas to match backbuffer (like DDraw SetDisplayMode does). Only a
             // FULLSCREEN device is a mode-set — a windowed backbuffer lives inside the
             // desktop and must not become SM_CXSCREEN. (Windowed @ +28 in d3d8.)

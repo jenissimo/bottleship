@@ -647,9 +647,13 @@ export const DDCAPS2_PRIMARYGAMMA = 0x00020000;
 export const DDSGR_CALIBRATE = 0x00000001;
 export const DDGAMMARAMP_SIZE = 1536; // 256 * 2 * 3 (red[256], green[256], blue[256] as WORD arrays)
 
-// DDFLIP flags
+// DDFLIP flags. NOVSYNC and INTERVAL2/3/4 are DirectDraw's spelling of a present
+// interval — the same request D3DPRESENT_INTERVAL_* makes (see frame-pacer).
 export const DDFLIP_WAIT = 0x00000001;
 export const DDFLIP_NOVSYNC = 0x00000008;
+export const DDFLIP_INTERVAL2 = 0x02000000;
+export const DDFLIP_INTERVAL3 = 0x04000000;
+export const DDFLIP_INTERVAL4 = 0x08000000;
 
 export const IID_IDirect3D = "3bba0080-2421-11cf-a31a-00aa00b93356";
 export const IID_IDirect3D2 = "6aae1ec1-662a-11d0-889d-00aa00bbb76a";

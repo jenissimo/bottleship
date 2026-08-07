@@ -999,6 +999,40 @@ export const IDirect3DPixelShader9: InterfaceDescriptor = {
     ],
 };
 
+// IDirect3DQuery9 (vtable: QI, AddRef, Release, GetDevice, GetType, GetDataSize, Issue, GetData)
+export const IDirect3DQuery9: InterfaceDescriptor = {
+    name: "IDirect3DQuery9",
+    inherits: "IUnknown",
+    iid: "D9771460-A695-4F26-BBD3-27B840B541CC",
+    methods: [
+        ...IUnknown.methods.map(m => ({ ...m, name: m.name })),
+        {
+            name: "GetDevice",
+            params: [
+                { name: "this", type: "ptr" },
+                { name: "ppDevice", type: "ptr", direction: "out" },
+            ],
+            returnType: "u32",
+            callingConvention: "stdcall",
+        },
+        // GetType returns D3DQUERYTYPE and GetDataSize a DWORD — neither is an HRESULT.
+        makeMethod("GetType", 1),
+        makeMethod("GetDataSize", 1),
+        makeMethod("Issue", 2),
+        {
+            name: "GetData",
+            params: [
+                { name: "this", type: "ptr" },
+                { name: "pData", type: "ptr", direction: "out" },
+                { name: "dwSize", type: "u32" },
+                { name: "dwGetDataFlags", type: "u32" },
+            ],
+            returnType: "u32",
+            callingConvention: "stdcall",
+        },
+    ],
+};
+
 export const IDirect3DShaderValidator9: InterfaceDescriptor = {
     name: "IDirect3DShaderValidator9",
     inherits: "IUnknown",
@@ -1052,6 +1086,7 @@ export const d3d9Module: ModuleDescriptor = {
         IDirect3DVertexDeclaration9,
         IDirect3DVertexShader9,
         IDirect3DPixelShader9,
+        IDirect3DQuery9,
         IDirect3DShaderValidator9,
     ],
     constants: D3D9_CONSTANTS,

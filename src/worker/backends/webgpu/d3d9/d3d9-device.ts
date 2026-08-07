@@ -10,7 +10,7 @@ import { VertexBufferStore, IndexBufferStore, TextureStore } from "./d3d9-resour
 import { DxSamplerCache } from "../shared/dx-sampler";
 import { TexturePaletteStore } from "../shared/texture-palette-store";
 import { decodeD3d9Sampler } from "./d3d9-sampler";
-import { buildColorTargetState, computeBlendKey } from "./d3d9-blend";
+import { buildColorTargetState, computeBlendKey, buildDepthStencilState, computeDepthKey } from "./d3d9-blend";
 import { effectiveMipLevels } from "../shared/mip-utils";
 import {
     canUploadNativeBC,
@@ -34,7 +34,7 @@ import { isValidAddress } from "../../../core/memory/address-guard";
 import { Mem } from "../../../core/memory/mem-accessor";
 import { sanitizeViewport } from "../ddraw/types";
 import { frameProfiler } from "../../../core/frame-profiler";
-import { framePacer } from "../../../core/frame-pacer";
+import { framePacer, decodeD3DPresentInterval, PRESENT_INTERVAL_ONE } from "../../../core/frame-pacer";
 import { statsOverlay } from "../../../core/stats-overlay";
 import {
     compileVertexShader, compilePixelShader, linkProgram, computeCubeMask,
@@ -47,7 +47,8 @@ import {
     FFP_SELECT_COLOR_WGSL,
     emitFfpComputeLighting,
     FFP_UNIFORM_FLOATS,
-    FFP_OFF_STAGE0B,
+    FFP_MAX_STAGES,
+    ffpStageOffset,
     FFP_MAX_LIGHTS,
     packFfpUniforms,
     type FfpLightInput,
@@ -108,6 +109,9 @@ const D3DRS_FOGENABLE = 28;
 // in the pixel pipeline (projected spotlights, planar reflections).
 const D3DTSS_TEXTURETRANSFORMFLAGS = 24;
 const D3DTTFF_PROJECTED = 0x100;
+const D3DTSS_COLOROP = 1;
+const D3DTSS_TEXCOORDINDEX = 25;
+const D3DTOP_DISABLE = 1;
 
 const D3DFVF_XYZ = 0x0002;
 const D3DFVF_XYZRHW = 0x0004;
@@ -389,7 +393,7 @@ export class D3D9Device {
     private lastCaptureIndex = -1;
     private _lrVs = 0; private _lrPs = 0; private _lrDecl = 0; private _lrStride: number | null = null;
     private _lrStateBits = 0; private _lrTopo = ""; private _lrForceCull = false;
-    private _lrBlend = ""; private _lrAlpha = ""; private _lrCube = 0; private _lrProj = 0; private _lrPipelineId = -1;
+    private _lrBlend = ""; private _lrAlpha = ""; private _lrDepth = ""; private _lrCube = 0; private _lrProj = 0; private _lrPipelineId = -1;
 
     // Vertex declaration registry — stores raw D3DVERTEXELEMENT9 data
     private vsDeclRegistry = new Map<number, RawVertexElement[]>();
@@ -408,6 +412,14 @@ export class D3D9Device {
     private projectedFlagsSeen = 0;
     private samplerStates = new Map<number, number>();
     private samplerCache?: DxSamplerCache;
+    /** Per-stage memo of the resolved GPUSampler (hot: one lookup per stage per draw). Its
+     *  complete input set is this stage's D3DSAMP_* block, the live quality override, and the
+     *  GPUDevice — invalidated by writeSamplerState (the sole mutator of samplerStates) and by
+     *  the token/device compares in resolveStageSampler. */
+    private stageSamplers = new Array<GPUSampler | null>(FFP_MAX_STAGES).fill(null);
+    private stageSamplersValid = 0;
+    private stageSamplerQualityToken = -1;
+    private stageSamplerDevice: GPUDevice | null = null;
     private materialData = new Uint8Array(D3DMATERIAL9_SIZE);
     private lights = new Map<number, Uint8Array>();
     private lightEnables = new Map<number, number>();
@@ -1753,13 +1765,23 @@ export class D3D9Device {
             d3d9PerfSkip("setSamplerState");
             return 0;
         }
-        this.samplerStates.set(key, v);
+        this.writeSamplerState(key, sampler, v);
         // Mirror into the guest shadow (slot = (Sampler<<4)|Type, matching the trampoline's fold;
         // only the shadowed range). Covers state-block Apply and any other non-trampoline path.
         if (sampler >= 0 && sampler < 16 && type >= 0 && type < 16) {
             this.syncSetterShadow('IDirect3DDevice9_SetSamplerState', (sampler << 4) | type, v);
         }
         return 0;
+    }
+
+    /** The ONLY mutation of samplerStates: dropping the stage's memoised sampler in the same
+     *  statement is what makes resolveStageSampler's cache unable to go stale. A sampler index
+     *  outside the memoised range (vertex-texture units 257+, or a bogus one) drops the whole
+     *  memo rather than aliasing some stage's bit. */
+    private writeSamplerState(key: number, sampler: number, value: number): void {
+        this.samplerStates.set(key, value);
+        const s = sampler >>> 0;
+        this.stageSamplersValid = s < FFP_MAX_STAGES ? (this.stageSamplersValid & ~(1 << s)) : 0;
     }
 
     getSamplerState(sampler: number, type: number): number {
@@ -1936,6 +1958,41 @@ export class D3D9Device {
             const v = tss(type, dflt);
             return noTex0 && (v & 0xf) === 2 ? (v & ~0xf) >>> 0 : v;
         };
+        // The stages above 0, same rules one stage up. Only as many as activeStageCount() —
+        // which is what the shader was generated for; writing more would be dead bytes on the
+        // hot path. A stage whose texture went away collapses to DISABLE: sampling the
+        // fallback white would otherwise MODULATE the base texture by a blank stage.
+        const stages = [{
+            colorOp: tss(1, 4),      // D3DTSS_COLOROP (default MODULATE)
+            colorArg1: tssArg(2, 2), // COLORARG1 (default TEXTURE)
+            colorArg2: tssArg(3, 1), // COLORARG2 (default CURRENT)
+            alphaOp: tss(4, 2),      // ALPHAOP (default SELECTARG1)
+            alphaArg1: tssArg(5, 2), // ALPHAARG1 (default TEXTURE)
+            alphaArg2: tssArg(6, 1), // ALPHAARG2 (default CURRENT)
+            coordSet: 0,
+        }];
+        const stageCount = this.activeStageCount();
+        for (let s = 1; s < stageCount; s++) {
+            const ts = (type: number, dflt: number) =>
+                this.textureStageStates.has(this.makeStageStateKey(s, type)) ? this.getTextureStageState(s, type) : dflt;
+            const noTex = this.stateTracker.getTexture(s) === null;
+            const tsArg = (type: number, dflt: number) => {
+                const v = ts(type, dflt);
+                return noTex && (v & 0xf) === 2 ? (v & ~0xf) >>> 0 : v;
+            };
+            stages.push({
+                colorOp: noTex ? D3DTOP_DISABLE : ts(1, D3DTOP_DISABLE),
+                colorArg1: tsArg(2, 2),
+                colorArg2: tsArg(3, 1),
+                alphaOp: ts(4, D3DTOP_DISABLE),
+                alphaArg1: tsArg(5, 2),
+                alphaArg2: tsArg(6, 1),
+                // D3DTSS_TEXCOORDINDEX low 16 bits pick the FVF coordinate set (the high bits
+                // are texgen modes the FFP path does not synthesize); the default is the
+                // stage's own index. Only set 1 is separately declared — see emitStage.
+                coordSet: (ts(D3DTSS_TEXCOORDINDEX, s) & 0xffff) === 0 ? 0 : 1,
+            });
+        }
         const params: FfpUniformParams = {
             viewportW: vpW,
             viewportH: vpH,
@@ -1961,14 +2018,7 @@ export class D3D9Device {
             emissiveSrc: this.effectiveColorSource(rs(D3DRS_EMISSIVEMATERIALSOURCE), colorVertex, hasColor, hasSpecular),
             hasNormal,
             lights,
-            stage0: {
-                colorOp: tss(1, 4),      // D3DTSS_COLOROP (default MODULATE)
-                colorArg1: tssArg(2, 2), // COLORARG1 (default TEXTURE)
-                colorArg2: tssArg(3, 1), // COLORARG2 (default CURRENT)
-                alphaOp: tss(4, 2),      // ALPHAOP (default SELECTARG1)
-                alphaArg1: tssArg(5, 2), // ALPHAARG1 (default TEXTURE)
-                alphaArg2: tssArg(6, 1), // ALPHAARG2 (default CURRENT)
-            },
+            stages,
             tfactor: (() => {
                 const tf = rs(60) >>> 0; // D3DRS_TEXTUREFACTOR (tracker seeds the white default)
                 return { r: ((tf >> 16) & 0xff) / 255, g: ((tf >> 8) & 0xff) / 255, b: (tf & 0xff) / 255, a: ((tf >> 24) & 0xff) / 255 };
@@ -1991,7 +2041,7 @@ export class D3D9Device {
         if (frameCapture.isCapturing()) {
             const size = this.getCurrentTargetSize();
             frameCapture.recordClearRaw(flags, color, z, stencil,
-                { surfacePtr: this.currentRtIndex ?? 0, width: size.w, height: size.h });
+                { surfacePtr: this.captureRtId(), width: size.w, height: size.h });
         }
 
         // Update frame snapshot counter
@@ -2032,10 +2082,14 @@ export class D3D9Device {
         const windowed = view.getUint32(pPresentationParameters + 32, true);
         const enableAutoDepthStencil = view.getUint32(pPresentationParameters + 36, true);
         const autoDepthStencilFormat = view.getUint32(pPresentationParameters + 40, true);
+        // Reset re-declares the swap interval (PresentationInterval @ +52) like every other
+        // present parameter — an in-game vsync toggle is exactly this call.
+        this.setPresentationInterval(view.getUint32(pPresentationParameters + 52, true));
 
         Logger.log(
             LogCategory.D3D9,
-            `Reset(${width}x${height}, windowed=${windowed}, depth=${enableAutoDepthStencil}, depthFmt=${autoDepthStencilFormat})`,
+            `Reset(${width}x${height}, windowed=${windowed}, depth=${enableAutoDepthStencil}, ` +
+            `depthFmt=${autoDepthStencilFormat}, interval=${this.presentInterval})`,
         );
 
         // Only a FULLSCREEN device sets the display mode. A windowed device's backbuffer is a
@@ -2081,13 +2135,36 @@ export class D3D9Device {
     /** Harness CaptureBus producer for D3D9. D3D9's programmable path has
      *  no FFP render-state arrays, so it records a backend-tagged minimal draw
      *  (primitive/counts/textured/programmable) into the one schema. Placed before
-     *  the trilist guard so non-trilist draws are still counted. Gated → zero cost. */
-    private captureDrawIfArmed(primitiveType: number, primitiveCount: number): void {
+     *  the trilist guard so non-trilist draws are still counted. Gated → zero cost.
+     *
+     *  `verts` (the draw's stream-0 bytes) is what makes a capture answer "is the
+     *  GEOMETRY wrong" rather than only "which states were set": it fills the
+     *  schema's vertexType/isRHW/firstVertices/mvp/viewport. Without it a d3d9
+     *  capture cannot distinguish a pre-transformed screen-space draw from an
+     *  object-space one — the two need opposite reasoning about every artifact. */
+    /** Capture identity of the CURRENT render target: the RT texture's guest handle, or 0 for
+     *  the backbuffer. `currentRtIndex` cannot be reported directly — index 0 is a perfectly
+     *  ordinary RT (SS2's UI layer is exactly that), so `currentRtIndex ?? 0` collapses it onto
+     *  the backbuffer and a capture then swears every draw went to the screen. */
+    private captureRtId(): number {
+        const idx = this.currentRtIndex;
+        if (idx === null) return 0;
+        return (this.textures.getHandle(idx) >>> 0) || 0;
+    }
+
+    private captureDrawIfArmed(
+        primitiveType: number,
+        primitiveCount: number,
+        verts?: { data: Uint8Array; offset: number; stride: number; count: number },
+    ): void {
         if (!frameCapture.isCapturing()) return;
         const stage0 = this.stateTracker.getTexture(0);
+        const stage1 = this.stateTracker.getTexture(1);
         const rs = (n: number): number => this.stateTracker.getRenderState(n);
         const rt = this.currentRtIndex;
         const size = this.getCurrentTargetSize();
+        const fvf = this.stateTracker.getFVF();
+        const isRhw = (fvf & D3DFVF_POSITION_MASK) === D3DFVF_XYZRHW;
         // Every field here is READ, not defaulted. D3D9 keeps one flat render-state array, so
         // the depth/blend/alpha/cull/lighting/fog states are as available as on the FFP path;
         // reporting them as schema zeros made a capture say "depth test off on every draw".
@@ -2095,10 +2172,15 @@ export class D3D9Device {
             backend: "d3d9",
             primitiveType,
             primitiveTypeName: `D3DPT(${primitiveType})`,
-            vertexCount: primitiveCount * 3,
+            vertexCount: verts ? verts.count : primitiveCount * 3,
             programmable: (this as any).isProgrammable?.() ?? false,
             derivedUseTexture: stage0 != null,
-            rtSurfacePtr: rt ?? 0,
+            vertexType: fvf,
+            isRHW: isRhw,
+            ...(verts ? { firstVertices: this.decodeFirstVertices(verts, fvf), srcStride: verts.stride } : {}),
+            mvp: Array.from(this.stateTracker.getMVP()),
+            viewport: { ...this.viewport },
+            rtSurfacePtr: this.captureRtId(),
             rtWidth: size.w,
             rtHeight: size.h,
             zEnable: rs(D3DRS_ZENABLE),
@@ -2114,8 +2196,60 @@ export class D3D9Device {
             lightingEnabled: rs(D3DRS_LIGHTING),
             fogEnabled: rs(D3DRS_FOGENABLE),
             derivedShouldBlend: rs(D3DRS_ALPHABLENDENABLE) !== 0,
-            warnings: stage0 != null ? [`tex0 store-index=${stage0}`] : [],
+            colorOp: this.getTextureStageState(0, 1),
+            alphaOp: this.getTextureStageState(0, 4),
+            // The bound stages as GUEST HANDLES — the identity dumpTexture/textures() take, so a
+            // capture row leads straight to the pixels. Stage 1 is called out because the FFP
+            // path renders stage 0 only: a draw with a stage-1 texture bound is one whose second
+            // stage we silently drop (lightmap, detail) — invisible in the picture as anything
+            // but "the lighting looks wrong".
+            warnings: [
+                ...(stage0 != null ? [`tex0 handle=0x${this.textures.getHandle(stage0).toString(16)}`] : []),
+                ...(stage1 != null
+                    ? [`stage1 texture bound (handle=0x${this.textures.getHandle(stage1).toString(16)}) — FFP renders stage 0 only`]
+                    : []),
+            ],
         });
+    }
+
+    /** First few stream-0 vertices of a draw, decoded through the FVF layout. Capture-only
+     *  (never on a render path), so it allocates freely. Position is always at offset 0;
+     *  everything after it moves with NORMAL/DIFFUSE/SPECULAR, so the offsets come from the
+     *  one parseFvf() the pipeline and shader also use. */
+    private decodeFirstVertices(
+        verts: { data: Uint8Array; offset: number; stride: number; count: number },
+        fvf: number,
+    ): Array<{ x: number; y: number; z: number; w?: number; u?: number; v?: number; diffuse?: number }> {
+        const out: Array<{ x: number; y: number; z: number; w?: number; u?: number; v?: number; diffuse?: number }> = [];
+        const { data, offset, stride, count } = verts;
+        if (stride <= 0) return out;
+        const layout = parseFvf(fvf);
+        const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+        const n = Math.min(4, count);
+        for (let i = 0; i < n; i++) {
+            const base = offset + i * stride;
+            if (base + stride > data.byteLength) break;
+            // The stream stride can be SMALLER than the FVF's packed size — resolvePipelineId
+            // already takes max(arrayStride, streamStride) for exactly that reason — so an
+            // FVF-derived offset is not guaranteed to sit inside this vertex. DataView throws
+            // on an out-of-range read, and this is capture-gated: an unclamped read would kill
+            // the very draw captureFrame() was armed to explain. Read only what fits.
+            const end = Math.min(base + stride, data.byteLength);
+            const fits = (off: number, size: number) => base + off + size <= end;
+            const v: { x: number; y: number; z: number; w?: number; u?: number; v?: number; diffuse?: number } = {
+                x: view.getFloat32(base, true),
+                y: view.getFloat32(base + 4, true),
+                z: view.getFloat32(base + 8, true),
+            };
+            if (layout.hasRhw && fits(12, 4)) v.w = view.getFloat32(base + 12, true);
+            if (layout.hasColor && fits(layout.colorOff, 4)) v.diffuse = view.getUint32(base + layout.colorOff, true);
+            if (layout.hasTex && fits(layout.texOff, 8)) {
+                v.u = view.getFloat32(base + layout.texOff, true);
+                v.v = view.getFloat32(base + layout.texOff + 4, true);
+            }
+            out.push(v);
+        }
+        return out;
     }
 
     // ── Point sprites (D3DPT_POINTLIST) ───────────────────────────────────
@@ -2288,7 +2422,13 @@ export class D3D9Device {
 
     drawPrimitive(primitiveType: number, startVertex: number, primitiveCount: number): number {
         d3d9PerfInc("drawPrimitive");
-        this.captureDrawIfArmed(primitiveType, primitiveCount);
+        if (frameCapture.isCapturing()) {
+            const ss = this.stateTracker.getStreamSource();
+            const vb = ss ? this.vertexBuffers.getData(ss.index) : null;
+            this.captureDrawIfArmed(primitiveType, primitiveCount, ss && vb
+                ? { data: vb, offset: ss.offset + startVertex * ss.stride, stride: ss.stride, count: primitiveCount * 3 }
+                : undefined);
+        }
         if (primitiveType === D3DPT_POINTLIST) {
             const ss = this.stateTracker.getStreamSource();
             const vb = ss ? this.vertexBuffers.getData(ss.index) : null;
@@ -2347,7 +2487,7 @@ export class D3D9Device {
             if (pipelineId < 0) return 0;
             bindStateIndex = this.captureDrawState();
         } else {
-            pipelineId = this.getPipelineId();
+            pipelineId = this.getPipelineId(streamSource.stride);
             ffpStateIndex = this.captureFfpDrawState();
         }
         this.commandRecorder.recordDraw({
@@ -2456,7 +2596,7 @@ export class D3D9Device {
             if (pipelineId < 0) { this.commandRecorder.registerPooledBuffer(gpuBuffer); return 0; }
             bindStateIndex = this.captureDrawState();
         } else {
-            pipelineId = this.getPipelineIdForTopology(topology, true);
+            pipelineId = this.getPipelineIdForTopology(topology, true, stride);
             ffpStateIndex = this.captureFfpDrawState();
         }
 
@@ -2494,7 +2634,11 @@ export class D3D9Device {
     ): number {
         d3d9PerfInc("drawIndexedPrimitiveUP");
         if (primitiveCount <= 0 || numVertices <= 0 || stride <= 0) return 0;
-        this.captureDrawIfArmed(primitiveType, primitiveCount);
+        if (frameCapture.isCapturing()) {
+            this.captureDrawIfArmed(primitiveType, primitiveCount, {
+                data: this.memory, offset: vertexDataPtr + minVertexIndex * stride, stride, count: numVertices,
+            });
+        }
 
         let idxCount: number;
         let finalVertexCount: number;
@@ -2589,7 +2733,12 @@ export class D3D9Device {
     drawPrimitiveUP(primitiveType: number, primitiveCount: number, vertexDataPtr: number, stride: number): number {
         d3d9PerfInc("drawPrimitiveUP");
         if (primitiveCount <= 0) return 0;
-        this.captureDrawIfArmed(primitiveType, primitiveCount); // harness capture (UP renders non-trilist too)
+        // harness capture (UP renders non-trilist too)
+        if (frameCapture.isCapturing()) {
+            this.captureDrawIfArmed(primitiveType, primitiveCount, {
+                data: this.memory, offset: vertexDataPtr, stride, count: primitiveCount * 3,
+            });
+        }
 
         const fvf = this.stateTracker.getFVF();
         const device = this.backend.getDevice()!;
@@ -2711,7 +2860,7 @@ export class D3D9Device {
             if (pipelineId < 0) { this.commandRecorder.registerPooledBuffer(gpuBuffer); return 0; }
             bindStateIndex = this.captureDrawState();
         } else {
-            pipelineId = this.getPipelineIdForTopology(topology, true);
+            pipelineId = this.getPipelineIdForTopology(topology, true, stride);
             ffpStateIndex = this.captureFfpDrawState();
         }
 
@@ -2758,7 +2907,13 @@ export class D3D9Device {
         primitiveCount: number
     ): number {
         d3d9PerfInc("drawIndexedPrimitive");
-        this.captureDrawIfArmed(primitiveType, primitiveCount);
+        if (frameCapture.isCapturing()) {
+            const ss = this.stateTracker.getStreamSource();
+            const vb = ss ? this.vertexBuffers.getData(ss.index) : null;
+            this.captureDrawIfArmed(primitiveType, primitiveCount, ss && vb
+                ? { data: vb, offset: ss.offset + (baseVertexIndex + minVertexIndex) * ss.stride, stride: ss.stride, count: numVertices }
+                : undefined);
+        }
         if (primitiveType !== D3DPT_TRIANGLELIST) return 0;
         const streamSource = this.stateTracker.getStreamSource();
         if (!streamSource) return 0;
@@ -2827,7 +2982,7 @@ export class D3D9Device {
             if (pipelineId < 0) return 0;
             bindStateIndex = this.captureDrawState();
         } else {
-            pipelineId = this.getPipelineId();
+            pipelineId = this.getPipelineId(streamSource.stride);
             ffpStateIndex = this.captureFfpDrawState();
         }
         this.commandRecorder.recordDrawIndexed({
@@ -2873,12 +3028,23 @@ export class D3D9Device {
 
     private lastActualPresent = 0;
 
+    /**
+     * D3DPRESENT_PARAMETERS.PresentationInterval, as refreshes to hold each Present.
+     * We advertise IMMEDIATE|ONE|TWO|THREE|FOUR in D3DCAPS9.PresentationIntervals, so the
+     * app's choice has to reach the pacer. Re-declared by every CreateDevice/Reset.
+     */
+    private presentInterval = PRESENT_INTERVAL_ONE;
+
+    setPresentationInterval(rawInterval: number): void {
+        this.presentInterval = decodeD3DPresentInterval(rawInterval);
+    }
+
     async present(): Promise<number> {
         d3d9PerfInc("present");
         const presentStart = frameProfiler.startTimer();
 
-        // Frame Pacer: Wait if presenter is busy (pauses virtual time)
-        await framePacer.waitForFrameSlot();
+        // Frame Pacer: hold for the swap interval the device was created with.
+        await framePacer.waitForPresentInterval(this.presentInterval);
         framePacer.reserveFrameSlot();
 
         this.lastActualPresent = performance.now();
@@ -2993,6 +3159,131 @@ export class D3D9Device {
     }
 
     /**
+     * Level-0 pixels of a D3D9 texture as RGBA8 — the diagnostic counterpart to the DDraw
+     * surface dump, which cannot see this store at all. Decoded through the SAME
+     * decodeD3DTextureToRgba8 the upload path uses, so what this returns is what the GPU
+     * copy holds (short of a later guest write we have not uploaded yet).
+     *
+     * A render target has no guest-side pixels — say so rather than return a blank image.
+     */
+    readTextureRgba(handle: number): { rgba: Uint8Array; w: number; h: number; format: number } | { err: string } {
+        const index = this.textures.getIndex(handle);
+        if (index === null) return { err: `no d3d9 texture with handle 0x${(handle >>> 0).toString(16)}` };
+        if (this.textures.isRenderTarget(index)) {
+            return { err: "render-target texture — rendered into, no guest pixels (capture the screen instead)" };
+        }
+        const data = this.textures.getData(index);
+        if (!data) return { err: "texture has no backing store (never locked?)" };
+        const w = this.textures.getWidth(index), h = this.textures.getHeight(index);
+        const format = this.textures.getFormat(index);
+        const rgba = new Uint8Array(w * h * 4);
+        if (isBlockCompressedFormat(format)) return { err: `block-compressed format ${format} — not decoded on the dump path` };
+        decodeD3DTextureToRgba8(data, 0, w, h, format, { pitch: this.textures.getPitch(index), out: rgba });
+        return { rgba, w, h, format };
+    }
+
+    /**
+     * D3D9 ColorFill against an OFFSCREEN surface (an RT texture, or a plain one with a
+     * guest-side store) — the `Clear`-on-the-backbuffer shortcut cannot express it.
+     *
+     * A game that composes its 2D layer into a texture and blits it as one quad erases that
+     * layer with ColorFill, not Clear. Dropping the fill leaves every frame's UI painted on
+     * top of the last, so text and cursors smear along whatever path they took.
+     *
+     * Returns false when the request needs a scissored fill we cannot express (a sub-rect of
+     * a render target); the caller reports that rather than pretending it happened.
+     */
+    colorFillSurface(texturePtr: number, rect: { left: number; top: number; right: number; bottom: number } | null, color: number): boolean {
+        const index = this.textures.getIndex(texturePtr >>> 0);
+        if (index === null) return false;
+        const w = this.textures.getWidth(index), h = this.textures.getHeight(index);
+        if (w <= 0 || h <= 0) return false;
+        const full = !rect || (rect.left <= 0 && rect.top <= 0 && rect.right >= w && rect.bottom >= h);
+
+        const gpuTex = this.textures.getGpuTexture(index);
+        if (this.textures.isRenderTarget(index) || (gpuTex && !this.textures.getData(index))) {
+            if (!full || !gpuTex) return false;
+            const device = this.backend.getDevice();
+            const queue = this.backend.getQueue();
+            if (!device || !queue) return false;
+            // Order matters: everything recorded up to this call must land BEFORE the fill,
+            // exactly as the guest issued it.
+            this.submitFrame(false);
+            const encoder = device.createCommandEncoder();
+            encoder.beginRenderPass({
+                colorAttachments: [{
+                    view: gpuTex.createView(),
+                    clearValue: d3dColorToGpu(color),
+                    loadOp: "clear",
+                    storeOp: "store",
+                }],
+            }).end();
+            queue.submit([encoder.finish()]);
+            return true;
+        }
+
+        // Plain texture: fill its guest-side store and let the ordinary upload path carry it.
+        const data = this.textures.getData(index);
+        if (!data) return false;
+        const format = this.textures.getFormat(index);
+        if (format !== 21 && format !== 22) return false; // [A|X]R8G8B8 — the only packing this writes
+        const pitch = this.textures.getPitch(index);
+        const x0 = Math.max(0, rect?.left ?? 0), y0 = Math.max(0, rect?.top ?? 0);
+        const x1 = Math.min(w, rect?.right ?? w), y1 = Math.min(h, rect?.bottom ?? h);
+        const b = color & 0xff, g = (color >>> 8) & 0xff, r = (color >>> 16) & 0xff, a = (color >>> 24) & 0xff;
+        for (let y = y0; y < y1; y++) {
+            let o = y * pitch + x0 * 4;
+            for (let x = x0; x < x1; x++, o += 4) { data[o] = b; data[o + 1] = g; data[o + 2] = r; data[o + 3] = a; }
+        }
+        this.textures.setDirty(index, true);
+        return true;
+    }
+
+    /**
+     * Level-0 pixels of a RENDER-TARGET texture, read back off the GPU.
+     *
+     * A game that composes its whole 2D layer into an RT and blits it as one quad (SS2's UI)
+     * puts every interesting pixel somewhere `readTextureRgba` cannot reach — it has no guest
+     * copy by construction. Without this the gallery lists the RT and no verb can open it,
+     * which reads as "the texture does not exist".
+     */
+    async readRenderTargetRgba(handle: number): Promise<{ rgba: Uint8Array; w: number; h: number; format: number } | { err: string }> {
+        const index = this.textures.getIndex(handle);
+        if (index === null) return { err: `no d3d9 texture with handle 0x${(handle >>> 0).toString(16)}` };
+        const gpuTex = this.textures.getGpuTexture(index);
+        const device = this.backend.getDevice();
+        const queue = this.backend.getQueue();
+        if (!gpuTex || !device || !queue) return { err: "texture has no GPU copy yet" };
+        const w = this.textures.getWidth(index), h = this.textures.getHeight(index);
+        if (w <= 0 || h <= 0) return { err: `degenerate size ${w}x${h}` };
+        // Flush recorded draws so the readback sees what this frame rendered into it.
+        this.submitFrame(false);
+        const padded = Math.ceil(w * 4 / 256) * 256;
+        const readback = device.createBuffer({
+            size: padded * h,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
+        try {
+            const encoder = device.createCommandEncoder();
+            encoder.copyTextureToBuffer(
+                { texture: gpuTex },
+                { buffer: readback, bytesPerRow: padded },
+                { width: w, height: h, depthOrArrayLayers: 1 },
+            );
+            queue.submit([encoder.finish()]);
+            await readback.mapAsync(GPUMapMode.READ);
+            const mapped = new Uint8Array(readback.getMappedRange());
+            const rgba = new Uint8Array(w * h * 4);
+            for (let y = 0; y < h; y++) rgba.set(mapped.subarray(y * padded, y * padded + w * 4), y * w * 4);
+            return { rgba, w, h, format: this.textures.getFormat(index) };
+        } catch (e) {
+            return { err: `render-target readback failed: ${e}` };
+        } finally {
+            readback.destroy();
+        }
+    }
+
+    /**
      * Compute a 32-bit pipeline cache key that encodes:
      *  - bits  0-14 : vertex decl handle (or low FVF bits when no decl/VS)
      *  - bits 15-15 : reserved
@@ -3042,26 +3333,56 @@ export class D3D9Device {
         return at ? `a${at.func}.${at.ref}` : "a0";
     }
 
-    /** Pipeline cache key = numeric state/decl/VS key + current blend + alpha test. */
-    private blendCacheKey(numericKey: number): string {
-        return `${numericKey}|${computeBlendKey(this.getRS)}|${this.alphaTestKey()}`;
+    /** Pipeline cache key = numeric state/decl/VS key + current blend + alpha test + depth. */
+    private blendCacheKey(numericKey: number, streamStride = 0): string {
+        // The numeric key carries only FVF bits 0-15, so the TEXCOORDSIZE field (bit 16+) and
+        // the stream stride — both of which change the vertex layout — must key the cache too,
+        // or the first pipeline built for an FVF is reused for a differently-strided stream.
+        // Stage count is baked into the shader, so it belongs here for the same reason.
+        const fvfHigh = this.stateTracker.getFVF() >>> 16;
+        // ZFUNC is not in the numeric key (bits 25/26 carry only ZENABLE/ZWRITEENABLE), so it
+        // has to key the cache here or every depth compare collapses onto the first one built.
+        return `${numericKey}|${fvfHigh}|${streamStride}|s${this.activeStageCount()}`
+            + `|${computeBlendKey(this.getRS)}|${this.alphaTestKey()}|${computeDepthKey(this.getRS)}`;
     }
 
-    private getPipelineId(): number {
+    /**
+     * How many texture blend stages this draw uses: 1 + the highest stage the guest enabled.
+     * D3D's cascade STOPS at the first stage whose COLOROP is DISABLE (the default for every
+     * stage above 0), so the scan stops there too — a single-texture draw costs one lookup.
+     * Baked into the FFP shader (and therefore into the pipeline key), which keeps the common
+     * one-stage shader as small as it was before multi-texture existed.
+     */
+    private activeStageCount(): number {
+        let n = 1;
+        for (let s = 1; s < FFP_MAX_STAGES; s++) {
+            const op = this.textureStageStates.get(this.makeStageStateKey(s, D3DTSS_COLOROP));
+            if (op === undefined || op === D3DTOP_DISABLE) break;
+            if (this.stateTracker.getTexture(s) === null) break;
+            n = s + 1;
+        }
+        return n;
+    }
+
+    private getPipelineId(streamStride = 0): number {
         const key = this.buildPipelineKey();
-        const cacheKey = this.blendCacheKey(key);
+        const cacheKey = this.blendCacheKey(key, streamStride);
         if (this.currentPipelineKey !== cacheKey || this.currentPipelineId === null) {
             this.currentPipelineKey = cacheKey;
-            this.currentPipelineId = this.resolvePipelineId(key, "triangle-list", false);
+            this.currentPipelineId = this.resolvePipelineId(key, "triangle-list", false, undefined, streamStride);
         }
         return this.currentPipelineId ?? 0;
     }
 
-    private getPipelineIdForTopology(topology: "triangle-list" | "line-list", forceCullNone: boolean = false): number {
+    private getPipelineIdForTopology(
+        topology: "triangle-list" | "line-list",
+        forceCullNone: boolean = false,
+        streamStride = 0,
+    ): number {
         const topologyOffset = topology === "line-list" ? 0x1000000 : 0;
         const cullOffset = forceCullNone ? 0x2000000 : 0;
         const key = this.buildPipelineKey(topologyOffset, cullOffset);
-        return this.resolvePipelineId(key, topology, forceCullNone);
+        return this.resolvePipelineId(key, topology, forceCullNone, undefined, streamStride);
     }
 
     /**
@@ -3080,10 +3401,13 @@ export class D3D9Device {
         topology: "triangle-list" | "line-list",
         forceCullNone: boolean = false,
         fvfOverride?: number,
+        streamStride = 0,
     ): number {
         // Synthetic-FVF pipelines (point sprites) get their own cache namespace so they never
         // alias the game's decl/FVF pipelines that hash to the same numeric key.
-        const cacheKey = fvfOverride !== undefined ? `ps${fvfOverride}|${this.blendCacheKey(key)}` : this.blendCacheKey(key);
+        const cacheKey = fvfOverride !== undefined
+            ? `ps${fvfOverride}|${this.blendCacheKey(key)}`
+            : this.blendCacheKey(key, streamStride);
         const cachedId = this.pipelineCache.get(cacheKey);
         if (cachedId !== undefined) {
             d3d9PerfBackendInc("pipelineCacheHits");
@@ -3109,6 +3433,11 @@ export class D3D9Device {
         let shaderModule: GPUShaderModule;
         let vertexBufferLayout: GPUVertexBufferLayout;
         let hasTexture: boolean;
+        // Stages this pipeline's shader will declare bindings for. Both fixed-function paths
+        // (FVF and vertex declaration) derive it from the same activeStageCount(); the synthetic
+        // point-sprite FVF stays at one. The executor binds exactly this many pairs, so it MUST
+        // equal what the shader declared (see PipelineInfo.ffpStageCount).
+        let ffpStageCount = 1;
 
         const alphaTest = this.getAlphaTest();
         // D3DRS_LIGHTING bit (24) of the pipeline key selects the lit FFP shader variant.
@@ -3122,22 +3451,30 @@ export class D3D9Device {
             hasTexture = layout.hasTexture;
         } else if (declElements && declElements.length > 0) {
             // FFP + vertex declaration path: build shader and layout from declaration data.
-            const built = buildShaderFromDecl(declElements, alphaTest, lit);
+            ffpStageCount = this.activeStageCount();
+            const built = buildShaderFromDecl(declElements, alphaTest, lit, ffpStageCount);
             shaderModule = gpuDevice.createShaderModule({ code: built.wgsl });
-            const stride = streamSource?.stride ?? built.arrayStride;
+            const stride = streamStride || streamSource?.stride || built.arrayStride;
             vertexBufferLayout = { arrayStride: stride || 16, attributes: built.attributes };
             hasTexture = built.hasTexture;
         } else {
-            // FFP + FVF path.
+            // FFP + FVF path. The STREAM decides the stride (DrawPrimitiveUP's
+            // VertexStreamZeroStride / SetStreamSource's Stride); the FVF only says where the
+            // components sit inside a vertex. They differ whenever the vertex carries data the
+            // FFP layout declares no attribute for — padding, or texcoord sets past the first —
+            // and stepping by the FVF's packed size then reads every vertex after the first
+            // from the middle of its predecessor. Never go BELOW the packed size: a stride that
+            // cannot hold the declared attributes is an invalid draw, not a tighter layout.
             const fvf = this.stateTracker.getFVF();
             const layout = buildVertexLayout(fvf);
-            shaderModule = gpuDevice.createShaderModule({ code: buildShader(fvf, alphaTest, lit) });
-            vertexBufferLayout = { arrayStride: layout.arrayStride, attributes: layout.attributes };
+            ffpStageCount = this.activeStageCount();
+            shaderModule = gpuDevice.createShaderModule({ code: buildShader(fvf, alphaTest, lit, ffpStageCount) });
+            vertexBufferLayout = {
+                arrayStride: Math.max(layout.arrayStride, streamStride || 0),
+                attributes: layout.attributes,
+            };
             hasTexture = layout.hasTexture;
         }
-
-        const zEnable = (key >> 25) & 1;
-        const zWrite = (key >> 26) & 1;
 
         const cullModeD3D = (key >> 16) & 0xff;
         let cullMode: GPUCullMode = "none";
@@ -3165,14 +3502,10 @@ export class D3D9Device {
                 frontFace: "cw",
                 cullMode,
             },
-            depthStencil: {
-                format: "depth24plus",
-                depthWriteEnabled: zWrite !== 0,
-                depthCompare: zEnable !== 0 ? "less-equal" : "always",
-            },
+            depthStencil: buildDepthStencilState("depth24plus", this.getRS),
         });
 
-        const pipelineId = this.backendExecutor.registerPipeline(pipeline, hasTexture);
+        const pipelineId = this.backendExecutor.registerPipeline(pipeline, hasTexture, false, ffpStageCount);
         this.pipelineCache.set(cacheKey, pipelineId);
         return pipelineId;
     }
@@ -3209,6 +3542,7 @@ export class D3D9Device {
         const projKey = this.projectedStageKey();
         const blendKey = computeBlendKey(this.getRS);
         const alphaKey = this.alphaTestKey();
+        const depthKey = computeDepthKey(this.getRS);
 
         // Fast path: identical pipeline identity as the previous draw → return without building the
         // key string or touching the Map (the dominant case within a batch). Shared by both the
@@ -3218,7 +3552,8 @@ export class D3D9Device {
             && this._lrDecl === this.activeVertexDecl && this._lrStride === stride
             && this._lrStateBits === stateBits && this._lrTopo === topology
             && this._lrForceCull === forceCullNone && this._lrBlend === blendKey
-            && this._lrAlpha === alphaKey && this._lrCube === cubeMask && this._lrProj === projKey) {
+            && this._lrAlpha === alphaKey && this._lrDepth === depthKey
+            && this._lrCube === cubeMask && this._lrProj === projKey) {
             d3d9PerfBackendInc("progPipelineCacheHits");
             if (this.frameSnapshot.frameCounters) this.frameSnapshot.frameCounters.cacheHits++;
             return this._lrPipelineId;
@@ -3237,23 +3572,23 @@ export class D3D9Device {
             if (cachedViaArena !== undefined) {
                 d3d9PerfBackendInc("progPipelineCacheHits");
                 if (this.frameSnapshot.frameCounters) this.frameSnapshot.frameCounters.cacheHits++;
-                this._storeLastResolve(stride, stateBits, topology, forceCullNone, blendKey, alphaKey, cubeMask, projKey, cachedViaArena);
+                this._storeLastResolve(stride, stateBits, topology, forceCullNone, blendKey, alphaKey, depthKey, cubeMask, projKey, cachedViaArena);
                 return cachedViaArena;
             }
             d3d9PerfBackendInc("progPipelineCacheMisses");
             if (this.frameSnapshot.frameCounters) this.frameSnapshot.frameCounters.cacheMisses++;
             const built = this.buildProgrammablePipeline(vs, ps, declElements, stride, stateBits, topology, forceCullNone, alphaTest, cubeMask, projKey);
             this.arenaPipelineCache.set(arenaKey, built);
-            this._storeLastResolve(stride, stateBits, topology, forceCullNone, blendKey, alphaKey, cubeMask, projKey, built);
+            this._storeLastResolve(stride, stateBits, topology, forceCullNone, blendKey, alphaKey, depthKey, cubeMask, projKey, built);
             return built;
         }
 
-        const cacheKey = `${this.activeVertexShader}:${this.activePixelShader}:${this.activeVertexDecl}:${stride}:${stateBits}:${topology}:${forceCullNone ? 1 : 0}:${blendKey}:${alphaKey}:cm${cubeMask}:pj${projKey}`;
+        const cacheKey = `${this.activeVertexShader}:${this.activePixelShader}:${this.activeVertexDecl}:${stride}:${stateBits}:${topology}:${forceCullNone ? 1 : 0}:${blendKey}:${alphaKey}:${depthKey}:cm${cubeMask}:pj${projKey}`;
         const cached = this.progPipelineCache.get(cacheKey);
         if (cached !== undefined) {
             d3d9PerfBackendInc("progPipelineCacheHits");
             if (this.frameSnapshot.frameCounters) this.frameSnapshot.frameCounters.cacheHits++;
-            this._storeLastResolve(stride, stateBits, topology, forceCullNone, blendKey, alphaKey, cubeMask, projKey, cached);
+            this._storeLastResolve(stride, stateBits, topology, forceCullNone, blendKey, alphaKey, depthKey, cubeMask, projKey, cached);
             return cached;
         }
         d3d9PerfBackendInc("progPipelineCacheMisses");
@@ -3261,7 +3596,7 @@ export class D3D9Device {
 
         const pipelineId = this.buildProgrammablePipeline(vs, ps, declElements, stride, stateBits, topology, forceCullNone, alphaTest, cubeMask, projKey);
         this.progPipelineCache.set(cacheKey, pipelineId);
-        this._storeLastResolve(stride, stateBits, topology, forceCullNone, blendKey, alphaKey, cubeMask, projKey, pipelineId);
+        this._storeLastResolve(stride, stateBits, topology, forceCullNone, blendKey, alphaKey, depthKey, cubeMask, projKey, pipelineId);
         return pipelineId;
     }
 
@@ -3294,9 +3629,6 @@ export class D3D9Device {
                 if (cullD3D === D3DCULL_CW) cullMode = "front";
                 else if (cullD3D === D3DCULL_CCW) cullMode = "back";
             }
-            const zEnable = (stateBits >> 25) & 1;
-            const zWrite = (stateBits >> 26) & 1;
-
             const pipeline = gpuDevice.createRenderPipeline({
                 layout: pipelineLayout,
                 vertex: {
@@ -3309,11 +3641,7 @@ export class D3D9Device {
                 },
                 fragment: { module, entryPoint: "fs_main", targets: [buildColorTargetState(format, this.getRS)] },
                 primitive: { topology, frontFace: "cw", cullMode },
-                depthStencil: {
-                    format: "depth24plus",
-                    depthWriteEnabled: zWrite !== 0,
-                    depthCompare: zEnable !== 0 ? "less-equal" : "always",
-                },
+                depthStencil: buildDepthStencilState("depth24plus", this.getRS),
             });
             return this.backendExecutor.registerPipeline(pipeline, link.hasTexture, true);
         } catch (e) {
@@ -3325,10 +3653,10 @@ export class D3D9Device {
     /** Remember the just-resolved pipeline identity for the next-draw numeric fast path. VS/PS/decl
      *  come from the current device state (unchanged across the resolve). */
     private _storeLastResolve(stride: number | null, stateBits: number, topo: string, forceCull: boolean,
-        blend: string, alpha: string, cube: number, proj: number, id: number): void {
+        blend: string, alpha: string, depth: string, cube: number, proj: number, id: number): void {
         this._lrVs = this.activeVertexShader; this._lrPs = this.activePixelShader; this._lrDecl = this.activeVertexDecl;
         this._lrStride = stride; this._lrStateBits = stateBits; this._lrTopo = topo; this._lrForceCull = forceCull;
-        this._lrBlend = blend; this._lrAlpha = alpha; this._lrCube = cube; this._lrProj = proj; this._lrPipelineId = id; this._lrValid = true;
+        this._lrBlend = blend; this._lrAlpha = alpha; this._lrDepth = depth; this._lrCube = cube; this._lrProj = proj; this._lrPipelineId = id; this._lrValid = true;
     }
 
     /** Bitmask of stages that currently have a CUBE texture bound. D3D9 ps_1_x / FFP have no
@@ -3368,45 +3696,17 @@ export class D3D9Device {
         const index = frame.nextFfpState(block.length);
         const slot = frame.ffpStates[index];
         slot.block.set(block);
-        slot.texture = this.resolveCurrentTexture();
-        slot.sampler = this.resolveStage0Sampler();
-
-        const ti = this.stateTracker.getTexture(0);
-        if (ti !== null && D3D_ALPHALESS_FORMATS.has(this.textures.getFormat(ti))) {
-            slot.block[FFP_OFF_STAGE0B + 2] = 1;
+        const stageCount = this.activeStageCount();
+        slot.stageCount = stageCount;
+        for (let s = 0; s < stageCount; s++) {
+            slot.textures[s] = this.resolveCurrentTexture(s);
+            slot.samplers[s] = this.resolveStageSampler(s);
+            const ti = this.stateTracker.getTexture(s);
+            if (ti !== null && D3D_ALPHALESS_FORMATS.has(this.textures.getFormat(ti))) {
+                slot.block[ffpStageOffset(s) + 4 + 2] = 1; // stage.b.z — read alpha as 1.0
+            }
         }
         return index;
-    }
-
-    // Per-(addressU, addressV, mag, min) GPUSampler cache for the FFP per-draw path.
-    private ffpSamplerCache = new Map<number, GPUSampler>();
-
-    /** Build the stage-0 sampler from the guest's D3DSAMP_* state (D3D9 defaults:
-     *  WRAP addressing, POINT filtering). */
-    private resolveStage0Sampler(): GPUSampler | null {
-        const dev = this.backend.getDevice();
-        if (!dev) return null;
-        const ss = (type: number, dflt: number) => this.samplerStates.get(this.makeStageStateKey(0, type)) ?? dflt;
-        const au = ss(1, 1);   // D3DSAMP_ADDRESSU (default WRAP)
-        const av = ss(2, 1);   // D3DSAMP_ADDRESSV
-        const mag = ss(5, 1);  // D3DSAMP_MAGFILTER (default POINT)
-        const min = ss(6, 1);  // D3DSAMP_MINFILTER
-        const key = (au & 7) | ((av & 7) << 3) | ((mag & 7) << 6) | ((min & 7) << 9);
-        let s = this.ffpSamplerCache.get(key);
-        if (!s) {
-            const addr = (m: number): GPUAddressMode =>
-                m === 2 ? "mirror-repeat" : (m >= 3 ? "clamp-to-edge" : "repeat");
-            const filt = (f: number): GPUFilterMode => (f >= 2 ? "linear" : "nearest");
-            s = dev.createSampler({
-                addressModeU: addr(au),
-                addressModeV: addr(av),
-                addressModeW: "repeat",
-                magFilter: filt(mag),
-                minFilter: filt(min),
-            });
-            this.ffpSamplerCache.set(key, s);
-        }
-        return s;
     }
 
     /** Snapshot the current VS/PS constants + bound textures for one draw. */
@@ -3485,12 +3785,34 @@ export class D3D9Device {
         return index;
     }
 
-    /** Resolve the faithful GPU sampler for one texture stage from the game's D3DSAMP_* state. */
+    /**
+     * Resolve the faithful GPU sampler for one texture stage from the game's D3DSAMP_* state.
+     * Runs per stage per draw, so the result is memoised per stage; the decode (a closure plus a
+     * spec/descriptor/key-string per call) only reruns when one of the descriptor's three input
+     * groups actually moved — this stage's D3DSAMP_* block, the quality override, or the device.
+     */
     private resolveStageSampler(stage: number): GPUSampler | null {
         const device = this.backend.getDevice();
         if (!device) return null;
-        if (!this.samplerCache) this.samplerCache = new DxSamplerCache(device);
-        return this.samplerCache.acquire(decodeD3d9Sampler((type) => this.getSamplerState(stage, type)));
+        if (!this.samplerCache || device !== this.stageSamplerDevice) {
+            this.samplerCache = new DxSamplerCache(device);
+            this.stageSamplerDevice = device;
+            this.stageSamplersValid = 0;
+        }
+        const token = DxSamplerCache.qualityToken();
+        if (token !== this.stageSamplerQualityToken) {
+            this.stageSamplerQualityToken = token;
+            this.stageSamplersValid = 0;
+        }
+        const bit = (stage >>> 0) < FFP_MAX_STAGES ? (1 << stage) : 0;
+        if (bit !== 0 && (this.stageSamplersValid & bit) !== 0) return this.stageSamplers[stage]!;
+
+        const sampler = this.samplerCache.acquire(decodeD3d9Sampler((type) => this.getSamplerState(stage, type)));
+        if (bit !== 0) {
+            this.stageSamplers[stage] = sampler;
+            this.stageSamplersValid |= bit;
+        }
+        return sampler;
     }
 
     /**
@@ -3676,8 +3998,8 @@ export class D3D9Device {
         return this.currentRtIndex !== null && textureIndex === this.currentRtIndex;
     }
 
-    private resolveCurrentTexture(): GPUTextureView | null {
-        const textureIndex = this.stateTracker.getTexture(0);
+    private resolveCurrentTexture(stage = 0): GPUTextureView | null {
+        const textureIndex = this.stateTracker.getTexture(stage);
         if (textureIndex === null) {
             return null;
         }
@@ -4239,10 +4561,16 @@ function d3dColorToGpu(color: number): GPUColor {
 }
 
 /**
- * Parsed FVF stream-0 layout in D3D byte order (position, normal, diffuse, specular, tex1),
- * with contiguous shader locations. Shared by buildVertexLayout (GPU attributes) and
- * buildShader (WGSL inputs) so the two never drift — important now that NORMAL/SPECULAR
- * shift every following component's offset and location.
+ * Parsed FVF stream-0 layout in D3D byte order (position, normal, psize, diffuse,
+ * specular, texcoord sets), with contiguous shader locations. Shared by
+ * buildVertexLayout (GPU attributes) and buildShader (WGSL inputs) so the two never
+ * drift — important because every optional component shifts what follows it.
+ *
+ * `stride` is the whole vertex, INCLUDING components we declare no attribute for
+ * (blend weights, point size, texcoord sets past the first). Getting that total wrong
+ * is not a missing feature but corrupt geometry: the GPU walks the stream by
+ * arrayStride, so a short stride reads every vertex after the first from the middle of
+ * its predecessor.
  */
 interface FvfLayout {
     hasRhw: boolean;
@@ -4250,37 +4578,82 @@ interface FvfLayout {
     hasColor: boolean;
     hasSpecular: boolean;
     hasTex: boolean;
+    /** Texture coordinate sets present (D3DFVF_TEXCOUNT). Sets 0 and 1 get attributes
+     *  (stages 0 and 1); further sets occupy stride only. */
+    texCount: number;
+    hasTex1: boolean;
     posLoc: number; posOff: number;
     normalLoc: number; normalOff: number;
     colorLoc: number; colorOff: number;
     specularLoc: number; specularOff: number;
     texLoc: number; texOff: number;
+    tex1Loc: number; tex1Off: number;
     stride: number;
+}
+
+const D3DFVF_TEXCOUNT_MASK = 0x0f00;
+const D3DFVF_TEXCOUNT_SHIFT = 8;
+
+/** Bytes the FVF position component occupies (d3d9types.h D3DFVF_POSITION_MASK values).
+ *  XYZBn carries n blend weights after the xyz triple; the last one may be packed as
+ *  UBYTE4/D3DCOLOR instead of a float (D3DFVF_LASTBETA_*), which costs the same 4 bytes. */
+function fvfPositionBytes(fvf: number): number {
+    switch (fvf & 0x000e) {
+        case 0x0002: return (fvf & 0x4000) ? 16 : 12; // XYZ / XYZW
+        case 0x0004: return 16;                        // XYZRHW
+        case 0x0006: return 16;                        // XYZB1
+        case 0x0008: return 20;                        // XYZB2
+        case 0x000a: return 24;                        // XYZB3
+        case 0x000c: return 28;                        // XYZB4
+        case 0x000e: return 32;                        // XYZB5
+        default: return 12;
+    }
+}
+
+/** Floats in texture coordinate set `i` — 2 unless D3DFVF_TEXCOORDSIZE{1,3,4} says otherwise
+ *  (2 bits per set from bit 16; 0=float2, 1=float3, 2=float4, 3=float1). */
+function fvfTexCoordFloats(fvf: number, set: number): number {
+    switch ((fvf >>> (16 + set * 2)) & 3) {
+        case 1: return 3;
+        case 2: return 4;
+        case 3: return 1;
+        default: return 2;
+    }
 }
 
 function parseFvf(fvf: number): FvfLayout {
     const hasRhw = (fvf & D3DFVF_XYZRHW) !== 0;
     // RHW (pre-transformed) vertices carry no normal and skip lighting.
     const hasNormal = !hasRhw && (fvf & D3DFVF_NORMAL) !== 0;
+    const hasPsize = (fvf & D3DFVF_PSIZE) !== 0;
     const hasColor = (fvf & D3DFVF_DIFFUSE) !== 0;
     const hasSpecular = (fvf & D3DFVF_SPECULAR) !== 0;
-    const hasTex = (fvf & D3DFVF_TEX1) !== 0;
+    const texCount = (fvf & D3DFVF_TEXCOUNT_MASK) >>> D3DFVF_TEXCOUNT_SHIFT;
+    // Sets 0 and 1 feed texture stages 0 and 1; sets past those still occupy stride and must
+    // be stepped over even though nothing samples them.
+    const hasTex = texCount > 0 && fvfTexCoordFloats(fvf, 0) >= 2;
+    const hasTex1 = texCount > 1 && fvfTexCoordFloats(fvf, 1) >= 2;
 
     let loc = 0, off = 0;
-    const posLoc = loc++; const posOff = off; off += hasRhw ? 16 : 12;
+    const posLoc = loc++; const posOff = off; off += fvfPositionBytes(fvf);
     let normalLoc = -1, normalOff = 0;
     if (hasNormal) { normalLoc = loc++; normalOff = off; off += 12; }
+    if (hasPsize) off += 4;
     let colorLoc = -1, colorOff = 0;
     if (hasColor) { colorLoc = loc++; colorOff = off; off += 4; }
     let specularLoc = -1, specularOff = 0;
     if (hasSpecular) { specularLoc = loc++; specularOff = off; off += 4; }
-    let texLoc = -1, texOff = 0;
-    if (hasTex) { texLoc = loc++; texOff = off; off += 8; }
+    let texLoc = -1, texOff = 0, tex1Loc = -1, tex1Off = 0;
+    for (let i = 0; i < texCount; i++) {
+        if (i === 0 && hasTex) { texLoc = loc++; texOff = off; }
+        if (i === 1 && hasTex1) { tex1Loc = loc++; tex1Off = off; }
+        off += fvfTexCoordFloats(fvf, i) * 4;
+    }
 
     return {
-        hasRhw, hasNormal, hasColor, hasSpecular, hasTex,
+        hasRhw, hasNormal, hasColor, hasSpecular, hasTex, hasTex1, texCount,
         posLoc, posOff, normalLoc, normalOff, colorLoc, colorOff,
-        specularLoc, specularOff, texLoc, texOff, stride: off,
+        specularLoc, specularOff, texLoc, texOff, tex1Loc, tex1Off, stride: off,
     };
 }
 
@@ -4307,16 +4680,29 @@ function emitFfpShader(d: {
     inputFields: string[];
     hasRhw: boolean;
     hasTex: boolean;
+    /** A second FVF texcoord set is present — a stage can sample its own coordinates. */
+    hasTex1?: boolean;
+    /** Texture blend stages to emit (1..FFP_MAX_STAGES); baked into the pipeline. */
+    stageCount?: number;
     lit: boolean;
     colorExpr: string;
     specularExpr: string;
     normalExpr: string;
     alphaTest: AlphaTest | null;
 }): string {
+    // Pre-transformed (XYZRHW) vertices arrive in screen pixels with rhw = 1/w. Emitting them
+    // with clip w = 1 would rasterize in the right place but interpolate every varying
+    // AFFINELY — UVs shear across large polygons and swim as the camera moves, the classic
+    // no-perspective-correction look. Recover w = 1/rhw and scale the clip coords by it: the
+    // hardware divides back out to the same NDC, and now interpolates perspective-correctly.
+    // Z is clamped to [0,1] first (D3D's rule for pre-transformed vertices) so an out-of-range
+    // depth does not clip the triangle away. Matches the DDraw/D3D7 converter's treatment.
     const posBody = d.hasRhw
-        ? `let ndcX = (input.pos.x / u.viewport.x) * 2.0 - 1.0;
+        ? `let rhw = input.pos.w;
+        let w = select(1.0, 1.0 / rhw, rhw != 0.0);
+        let ndcX = (input.pos.x / u.viewport.x) * 2.0 - 1.0;
         let ndcY = 1.0 - (input.pos.y / u.viewport.y) * 2.0;
-        out.position = vec4<f32>(ndcX, ndcY, clamp(input.pos.z, 0.0, 1.0), 1.0);`
+        out.position = vec4<f32>(ndcX * w, ndcY * w, clamp(input.pos.z, 0.0, 1.0) * w, w);`
         : `out.position = u.mvp * vec4<f32>(input.pos, 1.0);`;
 
     // FFP user clip planes. D3D fixed-function evaluates the plane equations in WORLD space
@@ -4345,6 +4731,57 @@ function emitFfpShader(d: {
         if ((_clipEnable & 32u) != 0u && input.clipB.y < 0.0) { discard; }
     }`;
 
+    // One (sampler, texture) binding pair per emitted stage — pairs 1/2 for stage 0, 3/4 for
+    // stage 1, and so on. The bind-group LAYOUT always declares all FFP_MAX_STAGES pairs (a
+    // pipeline layout may be a superset of what a shader uses), so a 1-stage shader and an
+    // 8-stage one share one cached bind group shape.
+    const stageCount = Math.max(1, Math.min(d.stageCount ?? 1, FFP_MAX_STAGES));
+    const stageBindings = d.hasTex
+        ? Array.from({ length: stageCount }, (_unused, s) =>
+            `@group(0) @binding(${1 + s * 2}) var texSampler${s || ""}: sampler;\n` +
+            `@group(0) @binding(${2 + s * 2}) var tex${s || ""}: texture_2d<f32>;`).join("\n")
+        : "";
+
+    /**
+     * D3D's texture-stage cascade, unrolled: stage 0 combines the sampled texel with the
+     * vertex colour, every stage after it combines its own texel with the previous stage's
+     * result (D3DTA_CURRENT). Ops and args are read from the uniform, so one pipeline serves
+     * any op combination at that stage count; only the NUMBER of stages is baked in. Dropping
+     * the stages past 0 is what renders a lightmapped world full-bright.
+     *
+     * COLOROP=DISABLE ends the cascade in D3D — the CPU side stops counting stages there, so
+     * an emitted stage is one the guest actually enabled; the runtime check stays because ops
+     * change between draws that share a pipeline.
+     */
+    const emitStage = (s: number): string => {
+        const tex = `tex${s || ""}`, smp = `texSampler${s || ""}`;
+        // Which FVF coordinate set this stage samples (D3DTSS_TEXCOORDINDEX). Only set 1 is
+        // separately declared; stages asking for anything else fall back to set 0, which is
+        // also what D3D does when the requested set is absent from the FVF.
+        const uv = d.hasTex1 ? `select(input.uv, input.uv1, u.stages[${s}].b.w > 0.5)` : "input.uv";
+        return `
+    if (u32(u.stages[${s}].a.x) != 1u) {
+        var _t = textureSample(${tex}, ${smp}, ${uv});
+        // Alpha-less D3D formats (X8R8G8B8 & friends, incl. RTs) read alpha as 1.0 on real
+        // hardware; our GPU copies carry a live alpha channel that must be masked.
+        if (u.stages[${s}].b.z > 0.5) { _t = vec4<f32>(_t.rgb, 1.0); }
+        let _cur = ${s === 0 ? "_diff" : "_c"};
+        let _a1 = ffpStageArg(u32(u.stages[${s}].a.y), _t, _cur, _diff, u.tfactor);
+        let _a2 = ffpStageArg(u32(u.stages[${s}].a.z), _t, _cur, _diff, u.tfactor);
+        let _rgb = ffpStageOp(u32(u.stages[${s}].a.x), _a1, _a2, _t * _cur);
+        var _al = _cur.a;
+        if (u32(u.stages[${s}].a.w) != 1u) {
+            let _b1 = ffpStageArg(u32(u.stages[${s}].b.x), _t, _cur, _diff, u.tfactor);
+            let _b2 = ffpStageArg(u32(u.stages[${s}].b.y), _t, _cur, _diff, u.tfactor);
+            _al = ffpStageOp(u32(u.stages[${s}].a.w), _b1, _b2, _t).a;
+        }
+        _c = vec4<f32>(clamp(_rgb.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), clamp(_al, 0.0, 1.0));
+    }`;
+    };
+    const stageBody = d.hasTex
+        ? Array.from({ length: stageCount }, (_unused, s) => emitStage(s)).join("\n")
+        : "";
+
     const colorBody = d.lit
         ? `let vDiffuse = ${d.colorExpr};
         let vSpecular = ${d.specularExpr};
@@ -4369,7 +4806,7 @@ function emitFfpShader(d: {
     return `
 ${FFP_UNIFORM_STRUCT_WGSL}
 @group(0) @binding(0) var<uniform> u: Uniforms;
-${d.hasTex ? "@group(0) @binding(1) var texSampler: sampler;\n@group(0) @binding(2) var tex: texture_2d<f32>;" : ""}
+${stageBindings}
 
 struct VertexInput {
     ${d.inputFields.join(",\n    ")}
@@ -4384,6 +4821,7 @@ struct VertexOutput {
     // for the per-pixel discard in fs_main. Constant 1.0 (no clip) unless clipping is enabled.
     @location(3) clipA: vec4<f32>,
     @location(4) clipB: vec2<f32>,
+    ${d.hasTex1 ? "@location(5) uv1: vec2<f32>," : ""}
 }
 ${FFP_UNPACK_COLOR_WGSL}
 ${d.lit ? FFP_SELECT_COLOR_WGSL + "\n" + emitFfpComputeLighting("u.lights") : ""}
@@ -4394,15 +4832,16 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     ${posBody}
     ${colorBody}
     ${d.hasTex ? "out.uv = input.uv;" : ""}
+    ${d.hasTex1 ? "out.uv1 = input.uv1;" : ""}
     ${clipVsBody}
     return out;
 }
 
-fn ffpStageArg(sel: u32, texC: vec4<f32>, diff: vec4<f32>, tf: vec4<f32>) -> vec4<f32> {
+fn ffpStageArg(sel: u32, texC: vec4<f32>, cur: vec4<f32>, diff: vec4<f32>, tf: vec4<f32>) -> vec4<f32> {
     // D3DTA base selector (modifier bits D3DTA_COMPLEMENT/ALPHAREPLICATE handled below).
     let base = sel & 0xfu;
     var c = diff;                          // 0 = DIFFUSE (also 4 = SPECULAR fallback)
-    if (base == 1u) { c = diff; }          // 1 = CURRENT (stage 0: current == diffuse)
+    if (base == 1u) { c = cur; }           // 1 = CURRENT (stage 0: current == diffuse)
     if (base == 2u) { c = texC; }          // 2 = TEXTURE
     if (base == 3u) { c = tf; }            // 3 = TFACTOR
     if ((sel & 0x10u) != 0u) { c = vec4<f32>(1.0) - c; }         // D3DTA_COMPLEMENT
@@ -4425,27 +4864,9 @@ fn ffpStageOp(op: u32, a1: vec4<f32>, a2: vec4<f32>, fallback: vec4<f32>) -> vec
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     ${clipFsBody}
-    var _texC = ${d.hasTex ? "textureSample(tex, texSampler, input.uv)" : "vec4<f32>(1.0)"};
-    // Alpha-less D3D formats (X8R8G8B8 & friends, incl. RTs) read alpha as 1.0 on
-    // real hardware; our GPU RTs carry a live alpha channel that must be masked.
-    if (u.stage0b.z > 0.5) { _texC = vec4<f32>(_texC.rgb, 1.0); }
     let _diff = input.color;
-    var _c: vec4<f32>;
-    // Texture stage 0 combiner (COLOROP == DISABLE(1) turns texturing off entirely).
-    if (u32(u.stage0a.x) == 1u) {
-        _c = _diff;
-    } else {
-        let _ca1 = ffpStageArg(u32(u.stage0a.y), _texC, _diff, u.tfactor);
-        let _ca2 = ffpStageArg(u32(u.stage0a.z), _texC, _diff, u.tfactor);
-        let _rgb = ffpStageOp(u32(u.stage0a.x), _ca1, _ca2, _texC * _diff);
-        var _a = _diff.a;
-        if (u32(u.stage0a.w) != 1u) {
-            let _aa1 = ffpStageArg(u32(u.stage0b.x), _texC, _diff, u.tfactor);
-            let _aa2 = ffpStageArg(u32(u.stage0b.y), _texC, _diff, u.tfactor);
-            _a = ffpStageOp(u32(u.stage0a.w), _aa1, _aa2, _texC).a;
-        }
-        _c = vec4<f32>(clamp(_rgb.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), clamp(_a, 0.0, 1.0));
-    }
+    var _c: vec4<f32> = _diff;
+${stageBody}
     ${d.lit ? "_c = vec4<f32>(clamp(_c.rgb + input.specular, vec3<f32>(0.0), vec3<f32>(1.0)), _c.a);" : ""}
     ${alphaTestSnippet(d.alphaTest, "_c.a")}
     return _c;
@@ -4453,7 +4874,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 `;
 }
 
-function buildShader(fvf: number, alphaTest: AlphaTest | null = null, litRequested = false): string {
+function buildShader(fvf: number, alphaTest: AlphaTest | null = null, litRequested = false, stageCount = 1): string {
     const f = parseFvf(fvf);
     const lit = litRequested && !f.hasRhw;
 
@@ -4462,11 +4883,14 @@ function buildShader(fvf: number, alphaTest: AlphaTest | null = null, litRequest
     if (f.hasColor) inputFields.push(`@location(${f.colorLoc}) color: u32`);
     if (f.hasSpecular) inputFields.push(`@location(${f.specularLoc}) specColor: u32`);
     if (f.hasTex) inputFields.push(`@location(${f.texLoc}) uv: vec2<f32>`);
+    if (f.hasTex1) inputFields.push(`@location(${f.tex1Loc}) uv1: vec2<f32>`);
 
     return emitFfpShader({
         inputFields,
         hasRhw: f.hasRhw,
         hasTex: f.hasTex,
+        hasTex1: f.hasTex1,
+        stageCount,
         lit,
         colorExpr: f.hasColor ? "unpackColor(input.color)" : "vec4<f32>(1.0, 1.0, 1.0, 1.0)",
         specularExpr: f.hasSpecular ? "unpackColor(input.specColor)" : "vec4<f32>(0.0, 0.0, 0.0, 0.0)",
@@ -4479,6 +4903,7 @@ function buildVertexLayout(fvf: number): {
     arrayStride: number;
     attributes: GPUVertexAttribute[];
     hasTexture: boolean;
+    hasTexture1: boolean;
 } {
     const f = parseFvf(fvf);
     const attributes: GPUVertexAttribute[] = [
@@ -4488,8 +4913,9 @@ function buildVertexLayout(fvf: number): {
     if (f.hasColor) attributes.push({ shaderLocation: f.colorLoc, offset: f.colorOff, format: "uint32" });
     if (f.hasSpecular) attributes.push({ shaderLocation: f.specularLoc, offset: f.specularOff, format: "uint32" });
     if (f.hasTex) attributes.push({ shaderLocation: f.texLoc, offset: f.texOff, format: "float32x2" });
+    if (f.hasTex1) attributes.push({ shaderLocation: f.tex1Loc, offset: f.tex1Off, format: "float32x2" });
 
-    return { arrayStride: f.stride, attributes, hasTexture: f.hasTex };
+    return { arrayStride: f.stride, attributes, hasTexture: f.hasTex, hasTexture1: f.hasTex1 };
 }
 
 // ── D3DVERTEXELEMENT9 helpers ─────────────────────────────────────────────────
@@ -4542,8 +4968,17 @@ const D3DDECLTYPE_D3DCOLOR    = 4;  // stored as BGRA bytes
  * Build a WGSL FFP-style shader + GPU vertex attributes from a D3D9 vertex declaration.
  * This is used when SetVertexDeclaration is active but no vertex shader is set.
  * The generated shader is compatible with the expanded FFP uniform layout (ffp-lighting.ts).
+ *
+ * `stageCount` bakes the texture-blend cascade depth into the shader exactly as the FVF path
+ * does — a declaration is just another way to describe the same fixed-function vertex, so it
+ * must reach the same multi-stage shader or a lightmapped draw renders full-bright.
  */
-function buildShaderFromDecl(elements: RawVertexElement[], alphaTest: AlphaTest | null = null, litRequested = false): {
+function buildShaderFromDecl(
+    elements: RawVertexElement[],
+    alphaTest: AlphaTest | null = null,
+    litRequested = false,
+    stageCount = 1,
+): {
     wgsl: string;
     attributes: GPUVertexAttribute[];
     arrayStride: number;
@@ -4555,6 +4990,8 @@ function buildShaderFromDecl(elements: RawVertexElement[], alphaTest: AlphaTest 
     const posElem = s0.find(e => e.usage === DECLUSAGE_POSITION_FFP || e.usage === DECLUSAGE_POSITIONT_FFP) ?? null;
     const normElem = s0.find(e => e.usage === DECLUSAGE_NORMAL_FFP   && e.usageIndex === 0) ?? null;
     const texElem = s0.find(e => e.usage === DECLUSAGE_TEXCOORD_FFP && e.usageIndex === 0) ?? null;
+    // Coordinate set 1 — the only set beyond 0 a stage can select (see emitStage's coordSet).
+    const tex1Elem = s0.find(e => e.usage === DECLUSAGE_TEXCOORD_FFP && e.usageIndex === 1) ?? null;
     const colElem = s0.find(e => e.usage === DECLUSAGE_COLOR_FFP    && e.usageIndex === 0) ?? null;
     const specElem = s0.find(e => e.usage === DECLUSAGE_COLOR_FFP   && e.usageIndex === 1) ?? null;
 
@@ -4576,15 +5013,19 @@ function buildShaderFromDecl(elements: RawVertexElement[], alphaTest: AlphaTest 
     const hasColor = colElem !== null;
     const hasSpecular = specElem !== null;
     const hasTex   = texElem !== null;
+    // A second set only earns an attribute + varying when something can sample it; a
+    // single-stage draw keeps the shader it has always had even if the decl carries TEXCOORD1.
+    const hasTex1 = hasTex && tex1Elem !== null && stageCount > 1;
     const lit = litRequested && !isRHW;
 
-    // Assign contiguous shader locations in declaration order: pos, [normal], [color], [specular], [uv].
+    // Assign contiguous shader locations in declaration order: pos, [normal], [color], [specular], [uv], [uv1].
     let loc = 0;
     const posLoc = loc++;
     const normLoc = hasNormal ? loc++ : -1;
     const colLoc = hasColor ? loc++ : -1;
     const specLoc = hasSpecular ? loc++ : -1;
     const texLoc = hasTex  ? loc++ : -1;
+    const tex1Loc = hasTex1 ? loc++ : -1;
 
     // Build GPUVertexAttribute list.
     const attributes: GPUVertexAttribute[] = [];
@@ -4608,6 +5049,10 @@ function buildShaderFromDecl(elements: RawVertexElement[], alphaTest: AlphaTest 
         const { gpuFormat } = d3dDeclTypeToGpu(texElem.type);
         attributes.push({ shaderLocation: texLoc, offset: texElem.offset, format: gpuFormat });
     }
+    if (hasTex1 && tex1Elem) {
+        const { gpuFormat } = d3dDeclTypeToGpu(tex1Elem.type);
+        attributes.push({ shaderLocation: tex1Loc, offset: tex1Elem.offset, format: gpuFormat });
+    }
 
     const arrayStride = computeDeclStride(s0.length > 0 ? s0 : elements) || 12;
 
@@ -4619,6 +5064,7 @@ function buildShaderFromDecl(elements: RawVertexElement[], alphaTest: AlphaTest 
     if (hasColor) inputFields.push(`@location(${colLoc}) color: vec4<f32>`);
     if (hasSpecular) inputFields.push(`@location(${specLoc}) specColor: vec4<f32>`);
     if (hasTex)   inputFields.push(`@location(${texLoc}) uv: vec2<f32>`);
+    if (hasTex1)  inputFields.push(`@location(${tex1Loc}) uv1: vec2<f32>`);
 
     const declColorExpr = (elem: typeof colElem, field: string): string => {
         if (!elem) return "vec4<f32>(1.0, 1.0, 1.0, 1.0)";
@@ -4633,6 +5079,8 @@ function buildShaderFromDecl(elements: RawVertexElement[], alphaTest: AlphaTest 
         inputFields,
         hasRhw: isRHW,
         hasTex,
+        hasTex1,
+        stageCount,
         lit,
         colorExpr,
         specularExpr,

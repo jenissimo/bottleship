@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { DxSamplerCache, type SamplerSpec } from "../../src/worker/backends/webgpu/shared/dx-sampler";
+import { EmulatorConfig } from "../../src/worker/core/emulator-config-manager";
 
 // Default (no overrides) quality so the pure mapping is exercised, not the QoL enhancements.
 const Q = { anisotropy: 1, forceTrilinear: false };
@@ -83,5 +84,33 @@ describe("DxSamplerCache.resolveDescriptor — quality overrides", () => {
         expect(d.magFilter).toBe("nearest");
         expect(d.maxAnisotropy).toBe(1);
         expect(d.lodMaxClamp).toBe(0); // still pinned to base — no QoL applied to point art
+    });
+});
+
+// Callers memoise an acquired sampler against their own state; the token is what stops that
+// memo surviving a live quality change (a stale sampler renders with no error anywhere).
+describe("DxSamplerCache.qualityToken", () => {
+    test("moves iff the quality inputs resolveDescriptor reads move", () => {
+        const cfg = EmulatorConfig.getInstance();
+        const restore = { anisotropy: cfg.quality.anisotropy, forceTrilinear: cfg.quality.forceTrilinear };
+        try {
+            cfg.applyQuality({ anisotropy: 1, forceTrilinear: false });
+            const t0 = DxSamplerCache.qualityToken();
+            expect(DxSamplerCache.qualityToken()).toBe(t0);
+
+            cfg.applyQuality({ forceTrilinear: true });
+            expect(DxSamplerCache.qualityToken()).not.toBe(t0);
+
+            cfg.applyQuality({ anisotropy: 8, forceTrilinear: false });
+            expect(DxSamplerCache.qualityToken()).not.toBe(t0);
+
+            // An unrelated quality field must NOT churn the token (that would rebuild every sampler).
+            cfg.applyQuality({ anisotropy: 1, forceTrilinear: false });
+            expect(DxSamplerCache.qualityToken()).toBe(t0);
+            cfg.applyQuality({ brightness: 1.5 });
+            expect(DxSamplerCache.qualityToken()).toBe(t0);
+        } finally {
+            cfg.applyQuality(restore);
+        }
     });
 });

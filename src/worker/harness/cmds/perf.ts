@@ -665,13 +665,27 @@ export function registerPerfCommands(svc: HarnessService): void {
     svc.register("frameReport", (args) => {
         const opts = (args[0] ?? {}) as {
             budgetMs?: number; refreshMs?: number; top?: number; reset?: boolean; maxBuckets?: number;
+            captureOverMs?: number;
         };
         const render = sys().services?.render as RenderLike | undefined;
 
         if (opts.reset) {
             // Arm the classifier at the budget so it sees EVERY over-budget frame, not just
             // the ones past the (30fps-shaped) capture threshold.
+            //
+            // classifyOverMs alone only widens which captured frames get coalesced; a frame
+            // below captureThresholdMs is never captured, so it cannot be classified at any
+            // budget. That is what the coverage note means when it says to "re-arm with
+            // captureOverMs" — without this pass-through the report asks for something the
+            // harness could not do, and a title whose misses are all just over a 16.7ms
+            // budget reports 0 classes while losing seconds per minute.
             if (opts.budgetMs && opts.budgetMs > 0) frameProfiler.configureCapture({ classifyOverMs: opts.budgetMs });
+            if (opts.captureOverMs && opts.captureOverMs > 0) {
+                frameProfiler.configureCapture({
+                    captureOverMs: opts.captureOverMs,
+                    classifyOverMs: opts.budgetMs && opts.budgetMs > 0 ? opts.budgetMs : opts.captureOverMs,
+                });
+            }
             frameProfiler.setEnabled(true);
             frameProfiler.reset();
             profiler.setEnabled(true);

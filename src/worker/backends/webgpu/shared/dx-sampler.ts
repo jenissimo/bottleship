@@ -110,6 +110,16 @@ export class DxSamplerCache {
         return desc;
     }
 
+    /** Comparison token over the LIVE quality inputs resolveDescriptor reads (the only descriptor
+     *  inputs that don't come from the SamplerSpec). A caller memoising an acquired sampler against
+     *  its own state compares this too; it lives here, next to the reads, so a new quality input
+     *  cannot be added without the token covering it. Raw (unclamped) values — over-invalidating
+     *  costs a rebuild, under-invalidating is a silently wrong sampler. */
+    static qualityToken(): number {
+        const q = EmulatorConfig.getInstance().quality;
+        return q.anisotropy * 2 + (q.forceTrilinear ? 1 : 0);
+    }
+
     /** Stable cache key for an effective descriptor. */
     private static keyOf(d: GPUSamplerDescriptor): string {
         const fb = (f: GPUFilterMode | GPUMipmapFilterMode | undefined): number => (f === "linear" ? 1 : 0);
