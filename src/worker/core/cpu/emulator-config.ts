@@ -535,7 +535,7 @@ export const EMU_D3D_DEFAULT_CAPS = {
 export const EMU_NATIVE_VIDEO_DLLS = false;
 
 // Names of video codec DLLs that are intercepted by HLE stubs when EMU_NATIVE_VIDEO_DLLS=false
-export const VIDEO_DLL_NAMES = new Set(['smackw32', 'binkw32']);
+export const VIDEO_DLL_NAMES = new Set(['smackw32', 'binkw32', 'lgvid']);
 
 // Default DDCAPS values — matches real HW (0x85D007C1)
 export const EMU_DDRAW_DEFAULT_CAPS = {

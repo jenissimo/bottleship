@@ -27,6 +27,7 @@ import { DPlayX } from "./modules/dplayx";
 import { MSS32 } from "./modules/mss32";
 import { SmackW32 } from "./modules/smackw32";
 import { BinkW32 } from "./modules/binkw32";
+import { Lgvid } from "./modules/lgvid";
 import { Glide2x } from "./modules/glide2x";
 import { OpenGL32 } from "./modules/opengl32";
 import { Glu32 } from "./modules/glu32";
@@ -2199,6 +2200,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       const mss32 = new MSS32();
       const smackw32 = new SmackW32();
       const binkw32 = new BinkW32();
+      const lgvid = new Lgvid();
       const quartz = new Quartz();
       const a3d = new A3d();
       const avifil32 = new Avifil32();
@@ -2304,6 +2306,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       if (!EMU_NATIVE_VIDEO_DLLS) {
         smackw32.initialize(process);
         binkw32.initialize(process);
+        lgvid.initialize(process);
       }
       quartz.initialize(process);
       a3d.initialize(process);
@@ -2368,6 +2371,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       if (!EMU_NATIVE_VIDEO_DLLS) {
         process.registerModule(smackw32.name, smackw32);
         process.registerModule(binkw32.name, binkw32);
+        process.registerModule(lgvid.name, lgvid);
       }
       process.registerModule(quartz.name, quartz);
       process.registerModule(a3d.name, a3d);
@@ -2433,6 +2437,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       if (!EMU_NATIVE_VIDEO_DLLS) {
         process.dispatcher.registerModule(smackw32.name, smackw32.exports);
         process.dispatcher.registerModule(binkw32.name, binkw32.exports);
+        process.dispatcher.registerModule(lgvid.name, lgvid.exports);
       }
       process.dispatcher.registerModule(quartz.name, quartz.exports);
       process.dispatcher.registerModule(a3d.name, a3d.exports);

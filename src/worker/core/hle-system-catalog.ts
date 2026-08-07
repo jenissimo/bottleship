@@ -46,7 +46,30 @@ export const THUNKED_DLL_PSEUDO_BASE: Record<string, number> = {
     w32skrnl: 0x729c0000,
     riched32: 0x729d0000,
     wtsapi32: 0x729e0000,
+    lgvid: 0x729f0000,
 };
+
+/**
+ * The pseudo-handle IS the module identity: LoadLibrary hands it out and
+ * GetProcAddress maps it back to a name. Two modules sharing one base makes that
+ * map many-to-one, and the loser's every export resolves against the winner —
+ * a live handle whose exports are all NULL, with nothing in the log to say why.
+ * The table is a build-time constant, so a duplicate is a programming error and
+ * is refused at import rather than left to surface as a mute lookup failure.
+ */
+(function assertDistinctPseudoBases(): void {
+    const byBase = new Map<number, string[]>();
+    for (const [name, base] of Object.entries(THUNKED_DLL_PSEUDO_BASE)) {
+        const names = byBase.get(base);
+        if (names) names.push(name); else byBase.set(base, [name]);
+    }
+    const collisions = [...byBase.entries()].filter(([, names]) => names.length > 1);
+    if (collisions.length > 0) {
+        throw new Error(
+            "THUNKED_DLL_PSEUDO_BASE: duplicate pseudo-handle(s) — " +
+            collisions.map(([base, names]) => `0x${base.toString(16)} shared by ${names.join(", ")}`).join("; "));
+    }
+})();
 
 export const HLE_SYSTEM_DLL_NAMES = new Set(Object.keys(THUNKED_DLL_PSEUDO_BASE));
 

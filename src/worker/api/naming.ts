@@ -19,7 +19,8 @@ export const API_SPECIAL_CASES: Record<string, string> = {
     'shell32': 'Shell32',
     'comctl32': 'Comctl32',
     'smackw32': 'SmackW32',
-    'binkw32': 'BinkW32'
+    'binkw32': 'BinkW32',
+    'lgvid': 'Lgvid'
 };
 
 /**

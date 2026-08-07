@@ -1,5 +1,6 @@
 import { ModuleDescriptor, calculateStackCleanup } from "../api/types";
 import { setupapiModule } from "../api/setupapi.api";
+import { lgvidModule } from "../api/lgvid.api";
 import { kernel32VistaSupplement } from "../api/kernel32-vista-supplement";
 import { REFERENCE_ARG_COUNTS } from "../reference-argcounts.generated";
 import { Logger, LogCategory } from "./logger";
@@ -73,6 +74,7 @@ export class APIRegistry {
         // Static imports for modules added after the last Vite glob scan (import.meta.glob
         // is fixed at compile time — new *.api.ts files are invisible until rebuild).
         this.registerModule(setupapiModule);
+        this.registerModule(lgvidModule);
 
         try {
             const apiModules = import.meta.glob('../api/*.api.ts', { eager: true });
