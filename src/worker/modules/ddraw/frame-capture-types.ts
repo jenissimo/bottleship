@@ -82,6 +82,10 @@ export type CapturedDrawCall = {
     cullMode: number;
     lightingEnabled: number;
     fogEnabled: number;
+    /** D3DRS_CLIPPLANEENABLE bitmask. A wrongly-applied FFP user clip plane slices
+     *  geometry along a straight screen line — indistinguishable from missing draws
+     *  unless the capture can say whether any plane was armed. 0 = none. */
+    clipPlaneEnable?: number;
     /** Full fog state. A whole scene resolving to one flat colour is the signature of
      *  fogFactor==1 everywhere, so the raw modes AND the float-decoded range must be
      *  visible side by side (the range states are float bits in a DWORD). */

@@ -56,8 +56,11 @@ const STAGE_FLOATS = 8;
 const OFF_STAGES = OFF_TFACTOR + 4;                        // 336
 /** Float index of stage `s`'s first vec4 (a); its second vec4 (b) is +4. */
 export const ffpStageOffset = (stage: number): number => OFF_STAGES + stage * STAGE_FLOATS;
-export const FFP_UNIFORM_FLOATS = OFF_STAGES + FFP_MAX_STAGES * STAGE_FLOATS; // 400
-export const FFP_UNIFORM_BYTES = FFP_UNIFORM_FLOATS * 4; // 1376
+// Fog: colour + (start, end, density, mode) — see ffp-fog.ts for the mode encoding.
+const OFF_FOG_COLOR = OFF_STAGES + FFP_MAX_STAGES * STAGE_FLOATS; // 400
+const OFF_FOG_PARAMS = OFF_FOG_COLOR + 4;                         // 404
+export const FFP_UNIFORM_FLOATS = OFF_FOG_PARAMS + 4; // 408
+export const FFP_UNIFORM_BYTES = FFP_UNIFORM_FLOATS * 4; // 1632
 
 const OFF_VIEWPORT = 0;        // vec4: w, h, 0, 0
 const OFF_MVP = 4;             // mat4x4
@@ -147,6 +150,13 @@ export interface FfpUniformParams {
     stages: Array<{ colorOp: number; colorArg1: number; colorArg2: number; alphaOp: number; alphaArg1: number; alphaArg2: number; coordSet: number }>;
     /** D3DRS_TEXTUREFACTOR, resolved to rgba. */
     tfactor: FfpColor;
+    /** D3DRS_FOGCOLOR, resolved to rgb (alpha is never fogged). */
+    fogColor: FfpColor;
+    /** FOGSTART / FOGEND / FOGDENSITY as floats, plus the resolveFfpFogMode encoding. */
+    fogStart: number;
+    fogEnd: number;
+    fogDensity: number;
+    fogMode: number;
 }
 
 /** Transform a world-space point by a D3D row-major matrix (row-vector × matrix). */
@@ -213,6 +223,12 @@ export function packFfpUniforms(out: Float32Array, p: FfpUniformParams): void {
     out.set(p.clipPlanes.subarray(0, CLIP_PLANE_COUNT * 4), OFF_CLIP_PLANES);
 
     writeColor(out, OFF_TFACTOR, p.tfactor);
+
+    writeColor(out, OFF_FOG_COLOR, p.fogColor);
+    out[OFF_FOG_PARAMS] = p.fogStart;
+    out[OFF_FOG_PARAMS + 1] = p.fogEnd;
+    out[OFF_FOG_PARAMS + 2] = p.fogDensity;
+    out[OFF_FOG_PARAMS + 3] = p.fogMode;
 
     // Texture blend stages (the .z of each b — the alpha-less-format flag — is set by the
     // per-draw writer, which is the only place that knows the bound texture's D3D format).
@@ -341,6 +357,8 @@ struct Uniforms {
     clipPlanes: array<vec4<f32>, ${CLIP_PLANE_COUNT}>, // raw world-space plane equations
     tfactor: vec4<f32>,    // D3DRS_TEXTUREFACTOR rgba
     stages: array<FfpStage, ${FFP_MAX_STAGES}>,
+    fogColor: vec4<f32>,   // D3DRS_FOGCOLOR rgb
+    fogParams: vec4<f32>,  // start, end, density, mode (ffp-fog.ts encoding)
 }
 `;
 

@@ -3,13 +3,119 @@
  */
 import type { Rect } from "./helpers";
 import type { DirectDrawSurfaceState } from "./com-objects";
+import { isRenderSurface } from "./com-objects";
 import { absToRel } from "./helpers";
 import { isValidAddress } from "../../core/memory/address-guard";
 import { toPlainGuestMemory } from "../../core/memory/guest-memory";
 import { RectPool } from "./rect-pool";
+import { Logger, LogCategory } from "../../core/logger";
+import { convertRGBAToSurface } from "./gpu-texture-utils";
+import {
+    decodeSurfaceFormatToRgba8,
+    getSurfaceFormatLayout,
+    isBlockCompressedFormat,
+} from "../../backends/webgpu/shared/texture-formats";
 
 // Module-level rect pool to reduce allocations in hot paths
 const rectPool = new RectPool(8);
+
+/** A DDPF_FOURCC surface whose fourCC names a block-compressed layout (DXT*, BC4/5). */
+export const isCompressedSurface = (s: DirectDrawSurfaceState): boolean => {
+    const fourCC = s.format.fourCC;
+    return fourCC !== undefined && isBlockCompressedFormat(fourCC);
+};
+
+/**
+ * Blt leg for a block-compressed SOURCE into a linear destination.
+ *
+ * We advertise no compressed formats from EnumTextureFormats, so a game holding DXT data
+ * (the on-disk form) creates its video-memory texture in one of the RGB formats we DO offer
+ * and relies on DirectDraw's documented behaviour: a Blt between different pixel formats
+ * CONVERTS. The linear copy paths address source pixels as `x * bpp/8`, which for 4x4 block
+ * storage reads two block endpoint colours followed by four bytes of block indices — the
+ * indices land in the destination as pixels and the result is periodic noise that still
+ * carries the image's shape, so it reads as a "pitch bug" rather than a missing decode.
+ *
+ * Returns false when it does not apply, so the caller keeps its normal path.
+ */
+export const copyCompressedSurfaceRegion = (
+    mem: Uint8Array,
+    src: DirectDrawSurfaceState,
+    dst: DirectDrawSurfaceState,
+    srcRectInput: Rect,
+    dstRectInput: Rect,
+    colorKey?: { low: number; high: number }
+): boolean => {
+    if (!isCompressedSurface(src) || isCompressedSurface(dst)) return false;
+
+    const srcRect = clipRect(srcRectInput, src.width, src.height);
+    const dstRect = clipRect(dstRectInput, dst.width, dst.height);
+    if (!srcRect || !dstRect) return true; // fully clipped — nothing to copy, but handled
+
+    // The decode is whole-surface, so a game blitting small rects out of a big compressed
+    // atlas every frame would pay for the whole atlas each time. rgbaScratchVersion is the
+    // existing "this cache matches the current pixels" stamp — honour it, and stamp it back
+    // ONLY when no key was applied, because keyed texels carry zeroed alpha that is not the
+    // surface's content and must never be served to another reader as if it were.
+    const key = colorKey ?? src.srcColorKey;
+    const expected = src.width * src.height * 4;
+    const cacheable = isRenderSurface(src);
+    const fresh = cacheable && !key && src.rgbaScratch?.length === expected &&
+        src.rgbaScratchVersion === src.version;
+
+    const layout = getSurfaceFormatLayout(src.format, src.width, src.height);
+    const decoded = fresh ? src.rgbaScratch! : decodeSurfaceFormatToRgba8(
+        mem,
+        src.surfacePtr,
+        src.width,
+        src.height,
+        Math.max(src.pitch, layout.pitch),
+        src.format,
+        src.rgbaScratch,
+        key
+    );
+    if (cacheable && !fresh) {
+        src.rgbaScratch = decoded;
+        src.rgbaScratchVersion = key ? -1 : src.version;
+    }
+
+    const srcW = srcRect.right - srcRect.left;
+    const srcH = srcRect.bottom - srcRect.top;
+    const dstW = dstRect.right - dstRect.left;
+    const dstH = dstRect.bottom - dstRect.top;
+
+    const dstBpp = Math.max(1, dst.format.bpp >> 3);
+    const dstOrigin = dst.surfacePtr + dstRect.top * dst.pitch + dstRect.left * dstBpp;
+
+    // Tightly-packed dstW x dstH RGBA — convertRGBAToSurface writes `width` pixels per row at
+    // `pitch` stride, so the destination sub-rect is just an offset origin. With a colour key
+    // the decode zeroes the alpha of keyed texels and the destination has no alpha to carry
+    // that, so the patch starts as the CURRENT destination content and keyed texels are simply
+    // left alone — which is what a keyed Blt means.
+    const patch = colorKey
+        ? new Uint8ClampedArray(decodeSurfaceFormatToRgba8(
+            mem, dstOrigin, dstW, dstH, dst.pitch, dst.format))
+        : new Uint8ClampedArray(dstW * dstH * 4);
+    const patch32 = new Uint32Array(patch.buffer);
+    const decoded32 = new Uint32Array(decoded.buffer, decoded.byteOffset, src.width * src.height);
+    for (let dy = 0; dy < dstH; dy++) {
+        const sy = srcRect.top + ((dy * srcH / dstH) | 0);
+        const srcRow = sy * src.width + srcRect.left;
+        const dstRow = dy * dstW;
+        for (let dx = 0; dx < dstW; dx++) {
+            const texel = decoded32[srcRow + ((dx * srcW / dstW) | 0)];
+            if (colorKey && (texel >>> 24) === 0) continue;
+            patch32[dstRow + dx] = texel;
+        }
+    }
+
+    convertRGBAToSurface(patch, mem, dstOrigin, dstW, dstH, dst.pitch, dst.format);
+
+    Logger.verbose(LogCategory.DDRAW,
+        `Blt: decompressed 0x${src.format.fourCC!.toString(16)} source 0x${src.surfacePtr.toString(16)} ` +
+        `${srcW}x${srcH} → 0x${dst.surfacePtr.toString(16)} ${dstW}x${dstH} bpp=${dst.format.bpp}`);
+    return true;
+};
 
 export const clipRect = (rect: Rect, width: number, height: number): Rect | null => {
     const left = Math.max(0, rect.left);

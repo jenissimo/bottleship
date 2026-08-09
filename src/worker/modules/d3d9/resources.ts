@@ -685,7 +685,7 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
 
         Logger.verbose(LogCategory.D3D9, `VertexBuffer::Lock(Offset=${OffsetToLock}, Size=${SizeToLock})`);
 
-        const dataPtr = device.lockVertexBuffer(pVertexBuffer, OffsetToLock, SizeToLock);
+        const dataPtr = device.lockVertexBuffer(pVertexBuffer, OffsetToLock, SizeToLock, Flags);
         if (dataPtr === 0) {
             Logger.error(LogCategory.D3D9, `VertexBuffer::Lock failed for 0x${pVertexBuffer.toString(16)}`);
             if (ppbData) Mem.writeUint32(ppbData, 0);
@@ -730,7 +730,7 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
 
         Logger.verbose(LogCategory.D3D9, `IndexBuffer::Lock(Offset=${OffsetToLock}, Size=${SizeToLock})`);
 
-        const dataPtr = device.lockIndexBuffer(pIndexBuffer, OffsetToLock, SizeToLock);
+        const dataPtr = device.lockIndexBuffer(pIndexBuffer, OffsetToLock, SizeToLock, Flags);
         if (dataPtr === 0) {
             Logger.error(LogCategory.D3D9, `IndexBuffer::Lock failed for 0x${pIndexBuffer.toString(16)}`);
             if (ppbData) Mem.writeUint32(ppbData, 0);

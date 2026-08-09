@@ -1487,9 +1487,16 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
             // Z-buffer bit depths
             w32(O.dwZBufferBitDepths, DDBD_16 | DDBD_32);
 
-            // Video memory
+            // Video memory. FREE is the CURRENT remainder, not a constant: real DirectDraw
+            // reports what is left right now, and DX6-era engines budget their texture uploads
+            // from it. Reporting a fixed number means the game never sees VRAM shrink, never
+            // backs off, and keeps creating surfaces until CreateSurface refuses with
+            // DDERR_OUTOFVIDEOMEMORY — which it then does not check, dereferencing the NULL
+            // it was handed. It also made GetCaps and GetAvailableVidMem, which already
+            // computed the remainder, answer the same question differently.
+            const vidMemFree = Math.max(0, defaultCaps.dwVidMemTotal - context.usedVidMem);
             w32(O.dwVidMemTotal, isHEL ? 0 : defaultCaps.dwVidMemTotal);
-            w32(O.dwVidMemFree, isHEL ? 0 : defaultCaps.dwVidMemFree);
+            w32(O.dwVidMemFree, isHEL ? 0 : vidMemFree);
 
             // ddsOldCaps (legacy DDSCAPS at offset 132)
             w32(O.ddsOldCaps, DDSCAPS_COMBINED_3D);

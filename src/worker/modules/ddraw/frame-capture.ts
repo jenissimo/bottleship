@@ -22,6 +22,7 @@ import {
     D3DRENDERSTATE_CULLMODE,
     D3DRENDERSTATE_LIGHTING,
     D3DRENDERSTATE_FOGENABLE,
+    D3DRENDERSTATE_CLIPPLANEENABLE,
     D3DRENDERSTATE_FOGCOLOR,
     D3DRENDERSTATE_FOGTABLEMODE,
     D3DRENDERSTATE_FOGVERTEXMODE,
@@ -197,6 +198,7 @@ const RAW_DRAW_MEASURABLE = [
     "rtSurfacePtr", "rtWidth", "rtHeight", "rtFormat", "tex0", "tex1",
     "alphaBlendEnabled", "srcBlend", "dstBlend", "alphaTestEnabled", "alphaFunc", "alphaRef",
     "colorKeyRenderState", "zEnable", "zWrite", "zFunc", "cullMode", "lightingEnabled", "fogEnabled", "fog",
+    "clipPlaneEnable",
     "colorOp", "alphaOp", "colorArg1", "colorArg2", "alphaArg1", "alphaArg2",
     "legacySamplerState", "stage0SamplerState", "effectiveSamplerState",
     "derivedColorKeyEnabled", "derivedUseTexture", "derivedPremultiply", "derivedShouldBlend",
@@ -218,7 +220,7 @@ export function recordRawDraw(partial: Partial<CapturedDrawCall> & { backend: st
         primitiveType: 0, primitiveTypeName: "", vertexType: 0, vertexCount: 0, indexCount: 0, isRHW: false,
         firstVertices: [], rtSurfacePtr: 0, rtWidth: 0, rtHeight: 0, tex0: null, tex1: null,
         alphaBlendEnabled: 0, srcBlend: 0, dstBlend: 0, alphaTestEnabled: 0, alphaFunc: 0, alphaRef: 0,
-        colorKeyRenderState: 0, zEnable: 0, zWrite: 0, cullMode: 0, lightingEnabled: 0, fogEnabled: 0,
+        colorKeyRenderState: 0, zEnable: 0, zWrite: 0, cullMode: 0, lightingEnabled: 0, fogEnabled: 0, clipPlaneEnable: 0,
         colorOp: 0, alphaOp: 0, colorArg1: 0, colorArg2: 0, alphaArg1: 0, alphaArg2: 0,
         legacySamplerState: { textureAddress: 0, textureAddressU: 0, textureAddressV: 0, textureMag: 0, textureMin: 0, anisotropy: 0 },
         stage0SamplerState: { minFilter: 0, magFilter: 0, mipFilter: 0, addressU: 0, addressV: 0, maxAnisotropy: 0 },
@@ -232,7 +234,18 @@ export function recordRawDraw(partial: Partial<CapturedDrawCall> & { backend: st
     captureBuffer.push(call);
 }
 
+/** Monotonic producer frame-boundary counter, advanced on EVERY onFrameEnd whether or
+ *  not a capture is armed. The draw-scrub bisect numbers its draws against this, so a
+ *  scrub cut and a capture index name the same draw by construction. RenderService's
+ *  present serial is NOT this boundary — the GDI presenter advances it too. */
+let frameBoundarySerial = 0;
+
+export function getFrameBoundarySerial(): number {
+    return frameBoundarySerial;
+}
+
 export function onFrameEnd(producer = "ddraw"): void {
+    frameBoundarySerial++;
     if (!captureActive) return;
     if (captureWantBackend !== undefined && producer !== captureWantBackend) return;
     if (captureNeedsFrameBoundary) {
@@ -463,6 +476,10 @@ export function recordDrawCall(p: RecordDrawCallParams): void {
     const cullMode = (rs[D3DRENDERSTATE_CULLMODE] ?? 0) as number;
     const lightingEnabled = (rs[D3DRENDERSTATE_LIGHTING] ?? 0) as number;
     const fogEnabled = (rs[D3DRENDERSTATE_FOGENABLE] ?? 0) as number;
+    // FFP user clip planes. A wrongly-applied plane slices geometry along a straight
+    // line and looks exactly like missing draws, so the capture has to be able to say
+    // whether any plane was even armed for this draw.
+    const clipPlaneEnable = (rs[D3DRENDERSTATE_CLIPPLANEENABLE] ?? 0) as number;
     const fog = {
         enable: fogEnabled,
         tableMode: (rs[D3DRENDERSTATE_FOGTABLEMODE] ?? 0) as number,
@@ -597,6 +614,7 @@ export function recordDrawCall(p: RecordDrawCallParams): void {
         lightingEnabled,
         fogEnabled,
         fog,
+        clipPlaneEnable,
         colorOp,
         alphaOp,
         colorArg1,

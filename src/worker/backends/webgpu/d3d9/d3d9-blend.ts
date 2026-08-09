@@ -147,6 +147,28 @@ export function computeBlendKey(getRS: GetRenderState): string {
 export const D3DRS_ZENABLE = 7;
 export const D3DRS_ZWRITEENABLE = 14;
 export const D3DRS_ZFUNC = 23;
+// Both are FLOATS bit-cast into the render-state DWORD, and both default to 0.0f.
+export const D3DRS_SLOPESCALEDEPTHBIAS = 175;
+export const D3DRS_DEPTHBIAS = 195;
+
+/**
+ * D3DRS_DEPTHBIAS is a bias in NORMALIZED depth ([0,1] of the buffer's range); WebGPU's
+ * `depthBias` counts the smallest representable depth increment of the attachment format.
+ * For our 24-bit depth attachment that increment is 2^-24, so the conversion is a plain
+ * scale — the same one DXVK applies for UNORM depth formats.
+ */
+const DEPTH_BIAS_UNITS_PER_UNORM24 = 1 << 24;
+
+const _biasBuf = new ArrayBuffer(4);
+const _biasView = new DataView(_biasBuf);
+function rsAsFloat(raw: number): number {
+    _biasView.setUint32(0, raw >>> 0, true);
+    const v = _biasView.getFloat32(0, true);
+    // A DWORD holding a non-float (a game writing an integer into a float render state, or
+    // an uninitialised slot) must not reach createRenderPipeline as NaN/Inf — WebGPU rejects
+    // the pipeline and the draw disappears, which is the exact failure this code exists to fix.
+    return Number.isFinite(v) ? v : 0;
+}
 
 const D3DCMP_TO_GPU: readonly GPUCompareFunction[] = [
     "less-equal", // 0 — not a D3DCMPFUNC; treat as the D3D9 default
@@ -174,11 +196,24 @@ export function buildDepthStencilState(format: GPUTextureFormat, getRS: GetRende
         format,
         depthWriteEnabled: zEnable && getRS(D3DRS_ZWRITEENABLE) !== 0,
         depthCompare: zEnable ? (D3DCMP_TO_GPU[func] ?? "less-equal") : "always",
+        // We advertise D3DPRASTERCAPS_DEPTHBIAS + SLOPESCALEDEPTHBIAS, and a D3D8 title
+        // reaching us through a d3d8to9 wrapper arrives here with its D3DRS_ZBIAS already
+        // translated into these two — ignoring them puts every decal, shadow and road
+        // marking back into a z-fight with the surface it was biased off.
+        // Clamped to i32: the bias is a guest-supplied float, and a wild one scaled by 2^24
+        // overflows the descriptor field — which fails pipeline creation and deletes the draw.
+        depthBias: Math.max(-0x7fffffff, Math.min(0x7fffffff,
+            Math.round(rsAsFloat(getRS(D3DRS_DEPTHBIAS)) * DEPTH_BIAS_UNITS_PER_UNORM24))),
+        depthBiasSlopeScale: rsAsFloat(getRS(D3DRS_SLOPESCALEDEPTHBIAS)),
+        depthBiasClamp: 0,
     };
 }
 
 /** Cache-key fragment for the depth portion — folded into the pipeline cache keys. */
 export function computeDepthKey(getRS: GetRenderState): string {
-    if (getRS(D3DRS_ZENABLE) === 0) return "z0";
-    return `z${getRS(D3DRS_ZWRITEENABLE) !== 0 ? 1 : 0}.${getRS(D3DRS_ZFUNC)}`;
+    // The bias states key the cache whether or not the z-buffer is on: they live in the
+    // pipeline, so a game that biases with ZENABLE off would otherwise reuse an unbiased one.
+    const bias = `${getRS(D3DRS_DEPTHBIAS) >>> 0}.${getRS(D3DRS_SLOPESCALEDEPTHBIAS) >>> 0}`;
+    if (getRS(D3DRS_ZENABLE) === 0) return `z0!${bias}`;
+    return `z${getRS(D3DRS_ZWRITEENABLE) !== 0 ? 1 : 0}.${getRS(D3DRS_ZFUNC)}!${bias}`;
 }

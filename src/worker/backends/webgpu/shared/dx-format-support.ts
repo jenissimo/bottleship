@@ -257,6 +257,12 @@ export function checkDxDeviceFormat(
     const fmt = checkFormat >>> 0;
     if (fmt === D3DFMT_UNKNOWN) return D3DERR_NOTAVAILABLE;
     if (isDxExclusiveFormat(fmt, version)) return D3DERR_NOTAVAILABLE;
+    // D3D9 dropped palettized textures — no D3D9 driver advertises P8/A8P8 here (Wine and
+    // DXVK refuse them too). Saying yes is not harmlessly permissive: a game's "pick the
+    // best format for this card" pass then CHOOSES palettized for everything, and D3D9 has
+    // no palette to resolve it with. D3D8 keeps them; palettized surfaces are a normal
+    // D3D8 path we convert.
+    if (version === 9 && (fmt === D3DFMT_P8 || fmt === D3DFMT_A8P8)) return D3DERR_NOTAVAILABLE;
     if ((usage & D3DUSAGE_RENDERTARGET) && !isDxRenderableFormat(fmt, version)) return D3DERR_NOTAVAILABLE;
     if ((usage & D3DUSAGE_DEPTHSTENCIL) && !isDxDepthStencilFormat(fmt, version)) return D3DERR_NOTAVAILABLE;
     if ((usage & D3DUSAGE_QUERY_VERTEXTEXTURE) !== 0) return D3DERR_NOTAVAILABLE;

@@ -166,7 +166,10 @@ import { createDefaultMaterial } from "../../../modules/ddraw/d3d/types";
 
 const UNIFORM_SLOT_SIZE = DEFAULT_UNIFORM_BUFFER_CONFIG.slotSize;
 
+import { toPlainGuestMemory } from "../../../core/memory/guest-memory";
+import { sanitizeViewportInto, type SanitizedViewport } from "./types";
 import { dwordToFloat } from './dword-float';
+import { resolveFfpFogMode } from '../d3d9/ffp-fog';
 import { maybeClampContainedUv, applySamplerDebugOverrides, updateLastDrawDiagnostics } from './executor-draw-debug';
 import {
     FfpStagesState,
@@ -176,6 +179,17 @@ import {
     MAX_FFP_UV_SETS,
     StageSamplerState,
 } from './ffp-stages';
+
+/**
+ * "Have this surface's PIXELS changed?" — one definition, so the batch-compatibility check and
+ * the early-submit gate can never disagree about what counts as a change. A render surface
+ * carries `version`; a bitmap texture carries `contentVersion`, bumped wherever the guest
+ * rewrites its backing (CopyRects, Unlock, palette re-bake). It is optional, so read it through
+ * `?? 0` — comparing against `undefined` would report a change on every first draw.
+ */
+function surfaceContentVersion(tex: DirectDrawSurfaceState): number {
+    return isRenderSurface(tex) ? tex.version : (tex.contentVersion ?? 0);
+}
 
 function createDefaultStageSamplers(): StageSamplerState[] {
     const samplers: StageSamplerState[] = [];
@@ -414,6 +428,18 @@ export class DDrawWebGPUExecutor {
         disablePointUvBias: false,
     };
 
+    // Per-draw sanitized-viewport scratch. Separate instances because drawPrimitive /
+    // drawIndexedPrimitive hold their result across the call into prepareDraw, which
+    // sanitizes again — one shared struct would let the inner call clobber the outer.
+    private readonly safeVpScratchDraw: SanitizedViewport = { x: 0, y: 0, width: 0, height: 0, minZ: 0, maxZ: 1 };
+    private readonly safeVpScratchIndexed: SanitizedViewport = { x: 0, y: 0, width: 0, height: 0, minZ: 0, maxZ: 1 };
+    private readonly safeVpScratchPrepare: SanitizedViewport = { x: 0, y: 0, width: 0, height: 0, minZ: 0, maxZ: 1 };
+    private readonly safeVpScratchExpand: SanitizedViewport = { x: 0, y: 0, width: 0, height: 0, minZ: 0, maxZ: 1 };
+    private readonly safeVpScratchPass: SanitizedViewport = { x: 0, y: 0, width: 0, height: 0, minZ: 0, maxZ: 1 };
+    /** Stand-in when a draw carries no FFP material. Read-only on this path (its components
+     *  are copied into the uniform slot), so one shared instance replaces a 5-object
+     *  allocation on every unlit draw. */
+    private readonly defaultMaterial = createDefaultMaterial();
     // Reusable prepare-draw result (DOD): mutate in prepareDraw, return same ref; no per-draw heap alloc.
     private readonly prepareResult: PrepareDrawResult = {
         uniformOffset: 0,
@@ -694,15 +720,25 @@ export class DDrawWebGPUExecutor {
         flushes: 0,            // full flush() calls
         nanVerts: 0,           // CPU-converted vertices with non-finite x/y/z/w (guest data bad?)
         nanDraws: 0,           // draws containing at least one such vertex
+        texHashScans: 0,       // content-hash scans run (once per surface per frame)
+        texHashBytes: 0,       // guest bytes read by those scans
+        texHashDirty: 0,       // scans whose hash CHANGED → forced a re-upload
+        texSyncs: 0,           // syncSurfaceFromMemory calls from the stage-texture path
+        earlyTexSubmits: 0,    // mid-frame submits forced by a sampled texture being overwritten
     };
 
     /** Count non-finite positions in CPU-converted vertex data (diagnoses guest-side
      *  vertex corruption — e.g. FPU/softfloat garbage → GPU clips the triangle →
      *  single triangles/surfaces vanish for a frame). */
     private countNanVerts(converted: Uint8Array, vertexCount: number): void {
-        const f32 = new Float32Array(converted.buffer, converted.byteOffset, vertexCount * OUTPUT_VERTEX_U32S);
+        // Diagnostic only — never let it outlive its data: a short/misaligned result would
+        // otherwise throw out of the draw path instead of merely counting nothing.
+        if ((converted.byteOffset & 3) !== 0) return;
+        const avail = Math.min(vertexCount, (converted.length >>> 2) / OUTPUT_VERTEX_U32S | 0);
+        if (avail <= 0) return;
+        const f32 = new Float32Array(converted.buffer, converted.byteOffset, avail * OUTPUT_VERTEX_U32S);
         let bad = 0;
-        for (let i = 0; i < vertexCount; i++) {
+        for (let i = 0; i < avail; i++) {
             const base = i * OUTPUT_VERTEX_U32S;
             // First 4 floats of the output layout are x, y, z, rhw/w.
             if (!Number.isFinite(f32[base]) || !Number.isFinite(f32[base + 1]) ||
@@ -731,6 +767,7 @@ export class DDrawWebGPUExecutor {
     private static readonly FRAME_STATS_CAPACITY = 1024;
 
     sampleFrameStats(): void {
+        this.frameSerial++;
         if (this.opLogArmed > 0) {
             this.opLog("=== FRAME END ===");
             this.opLogArmed--;
@@ -778,6 +815,9 @@ export class DDrawWebGPUExecutor {
         return this.opLogEntries;
     }
 
+    /** Per-draw call sites MUST test `opLogArmed` themselves before calling: the cost of
+     *  this diagnostic is the template string the caller builds, which an early return
+     *  inside here cannot avoid. Same reason drawCostProfiler exposes `enabled` publicly. */
     private opLog(s: string): void {
         if (this.opLogArmed <= 0) return;
         if (this.opLogEntries.length < 4000) this.opLogEntries.push(s);
@@ -799,8 +839,8 @@ export class DDrawWebGPUExecutor {
 
     /** Current DebugFlags — lets a caller see which diagnostic overrides are still armed
      *  (they are sticky, and a forgotten one silently colours every later observation). */
-    getDebugFlags(): DebugFlags {
-        return { ...this.debugFlags };
+    getDebugFlags(): DebugFlags & { scrubLastFrameDraws: number } {
+        return { ...this.debugFlags, scrubLastFrameDraws: this.scrubLastFrameDraws };
     }
 
     setDebugToggle(toggle: string, enabled: boolean, value?: number): void {
@@ -847,8 +887,25 @@ export class DDrawWebGPUExecutor {
             case "disableMegaBatch":
                 this.debugFlags.disableMegaBatch = enabled;
                 break;
+            case "disableMegaBatchAccumulate":
+                this.debugFlags.disableMegaBatchAccumulate = enabled;
+                break;
+            case "disableCpuTextureHash":
+                this.debugFlags.disableCpuTextureHash = enabled;
+                break;
+            case "disableTextureOverwriteSubmit":
+                this.debugFlags.disableTextureOverwriteSubmit = enabled;
+                break;
             case "forceCpuVertexPath":
                 this.debugFlags.forceCpuVertexPath = enabled;
+                break;
+            case "forceDisableZWrite":
+                this.debugFlags.forceDisableZWrite = enabled;
+                break;
+            case "drawScrubMax":
+                // Bisect lever: render only draws 0..value of each frame. Off (-1) when
+                // disabled, so a bare `gpuToggle('drawScrubMax', false)` restores the frame.
+                this.debugFlags.drawScrubMax = enabled ? ((value ?? 0) | 0) : -1;
                 break;
             case "textureConverterDebugMode":
                 // For numeric values, use 'value' parameter if provided, otherwise use 'enabled' as number
@@ -1025,7 +1082,7 @@ export class DDrawWebGPUExecutor {
         this.syncMsaaSampleCount();
 
         const hasRects = rects && rects.length > 0;
-        this.opLog(`CLEAR flags=${flags} rects=${rects?.length ?? 0} passOpen=${!!this.currentRenderPass} pendingBatch=${this.currentBatch ? (this.currentBatch.draws?.length ?? 0) : 0}`);
+        if (this.opLogArmed > 0) this.opLog(`CLEAR flags=${flags} rects=${rects?.length ?? 0} passOpen=${!!this.currentRenderPass} pendingBatch=${this.currentBatch ? (this.currentBatch.draws?.length ?? 0) : 0}`);
         // D3D semantics: Clear is constrained to the current viewport (∩ rects). A
         // partial viewport (e.g. cutscene letterbox bars cleared to black) must NOT
         // take the deferred full-target path — that wipes the whole frame.
@@ -1331,6 +1388,7 @@ export class DDrawWebGPUExecutor {
                 this.currentRenderPass.end();
                 this.currentRenderPass = null;
                 this.currentRenderTarget = null;
+                this.resetBindFastPath();
             }
             // Ensure encoder exists (create if needed)
             if (!this.currentEncoder) {
@@ -2147,6 +2205,7 @@ export class DDrawWebGPUExecutor {
             target, texture, stageTextures: stageTextures ?? null, renderStates, textureStates, memory,
         })) return;
         this.renderStats.drawReq++;
+        if (this.scrubbedOut()) return;
 
         // Point sprites: D3DPT_POINTLIST with a real size (per-vertex PSIZE, or POINTSIZE>1px)
         // or POINTSPRITEENABLE expands each point into a screen-aligned, camera-facing quad so
@@ -2178,7 +2237,7 @@ export class DDrawWebGPUExecutor {
             !this.hasCameraSpaceTexgen(textureStates) &&
             !(renderStates[D3DRENDERSTATE_LIGHTING] | 0) &&
             clipPlaneEnable === 0;
-        const megaBatchAccumulate = !this.debugFlags.disableMegaBatch;
+        const megaBatchAccumulate = !this.debugFlags.disableMegaBatch && !this.debugFlags.disableMegaBatchAccumulate;
         // Vertex-blend draws MUST use the CPU converter (the GPU compute shader has no palette);
         // force the threshold to +∞ so the count-based branch below always picks the CPU path.
         const blendActive = !!vertexBlend && vertexBlend.count >= (vertexBlend.indexed ? 1 : 2);
@@ -2255,7 +2314,7 @@ export class DDrawWebGPUExecutor {
             return;
         }
 
-        const safeViewport = sanitizeViewport(viewport, target.width, target.height);
+        const safeViewport = sanitizeViewportInto(this.safeVpScratchDraw, viewport, target.width, target.height);
 
         // Convert vertices via VertexConverter
         // Use GPU path for large batches (no readback), CPU for small batches or TriangleFan (needs expansion)
@@ -2281,7 +2340,9 @@ export class DDrawWebGPUExecutor {
                 safeViewport.width,
                 safeViewport.height,
                 stride,
-                vertexBlend ?? null
+                vertexBlend ?? null,
+                safeViewport.x,
+                safeViewport.y
             );
 
             // Optimize TriangleFan expansion to avoid subarray allocations in tight loop.
@@ -2318,11 +2379,18 @@ export class DDrawWebGPUExecutor {
             convertedData = expanded;
         } else if (count >= gpuVertexThreshold) {
             this.ensureGpuVertexConversionBudget(count * OUTPUT_VERTEX_BYTES);
-            // GPU path requires ending current render pass
+            // The compute converter cannot run inside a render pass, so the pass has to end
+            // here — and a batch must not outlive the pass it was opened for. Its draws are
+            // still unencoded; leaving them pending puts them in a pass opened LATER, after
+            // work the guest issued after them. Flush first, then close: same draw-order rule
+            // the texture-sync path already follows. The bind fast-path describes bindings
+            // that lived in the closed pass, so it goes too.
+            if (this.currentBatch) this.flushBatch();
             if (this.currentRenderPass) {
                 this.currentRenderPass.end();
                 this.currentRenderPass = null;
                 this.currentRenderTarget = null;
+                this.resetBindFastPath();
             }
             if (!this.currentEncoder) {
                 this.currentEncoder = this.device.createCommandEncoder();
@@ -2337,7 +2405,9 @@ export class DDrawWebGPUExecutor {
                 vertexType,
                 safeViewport.width,
                 safeViewport.height,
-                stride
+                stride,
+                safeViewport.x,
+                safeViewport.y
             );
             if (!gpuConversionResult) {
                 this.renderStats.gpuConvFallback++;
@@ -2352,7 +2422,10 @@ export class DDrawWebGPUExecutor {
                     scratch,
                     safeViewport.width,
                     safeViewport.height,
-                    stride
+                    stride,
+                    null,
+                    safeViewport.x,
+                    safeViewport.y
                 );
             }
         } else {
@@ -2369,7 +2442,9 @@ export class DDrawWebGPUExecutor {
                 safeViewport.width,
                 safeViewport.height,
                 stride,
-                vertexBlend ?? null
+                vertexBlend ?? null,
+                safeViewport.x,
+                safeViewport.y
             );
         }
 
@@ -2394,7 +2469,7 @@ export class DDrawWebGPUExecutor {
             vBuffer = gpuConversionResult.buffer;
             vOffset = gpuConversionResult.offset;
             vSize = gpuConversionResult.size;
-        } else if (convertedData) {
+        } else if (convertedData && convertedData.length > 0) {
             this.countNanVerts(convertedData, drawCount);
             // CPU path: copy from CPU array to ring buffer
             const alloc = this.ringBufferManager.allocateVertexData(convertedData);
@@ -2475,7 +2550,7 @@ export class DDrawWebGPUExecutor {
 
         if (canBatch && this.currentBatch) {
             // Add to existing MegaBatch - each draw has its own drawIndex
-            this.opLog(`BATCH+ v=${useNativeTopology ? count : drawCount} z=${renderStates[D3DRENDERSTATE_ZENABLE]|0} zw=${renderStates[D3DRENDERSTATE_ZWRITEENABLE]|0} zb=${renderStates[D3DRENDERSTATE_ZBIAS]|0} bl=${renderStates[D3DRENDERSTATE_ALPHABLENDENABLE]|0} sb=${renderStates[D3DRENDERSTATE_SRCBLEND]|0} db=${renderStates[D3DRENDERSTATE_DESTBLEND]|0} tex=${!!texture}`);
+            if (this.opLogArmed > 0) this.opLog(`BATCH+ v=${useNativeTopology ? count : drawCount} z=${renderStates[D3DRENDERSTATE_ZENABLE]|0} zw=${renderStates[D3DRENDERSTATE_ZWRITEENABLE]|0} zb=${renderStates[D3DRENDERSTATE_ZBIAS]|0} bl=${renderStates[D3DRENDERSTATE_ALPHABLENDENABLE]|0} sb=${renderStates[D3DRENDERSTATE_SRCBLEND]|0} db=${renderStates[D3DRENDERSTATE_DESTBLEND]|0} tex=${!!texture}`);
             const vertexOffset = vOffset / OUTPUT_VERTEX_BYTES;
             this.currentBatch.draws.push({
                 firstVertex: vertexOffset,
@@ -2498,7 +2573,7 @@ export class DDrawWebGPUExecutor {
 
             if (shouldBatch && megaBatchPipeline) {
                 // Start new MegaBatch - reuse megaBatchPipeline computed above
-                this.opLog(`BATCH-NEW v=${useNativeTopology ? count : drawCount} z=${renderStates[D3DRENDERSTATE_ZENABLE]|0} zw=${renderStates[D3DRENDERSTATE_ZWRITEENABLE]|0} zb=${renderStates[D3DRENDERSTATE_ZBIAS]|0} bl=${renderStates[D3DRENDERSTATE_ALPHABLENDENABLE]|0} sb=${renderStates[D3DRENDERSTATE_SRCBLEND]|0} db=${renderStates[D3DRENDERSTATE_DESTBLEND]|0} tex=${!!texture}`);
+                if (this.opLogArmed > 0) this.opLog(`BATCH-NEW v=${useNativeTopology ? count : drawCount} z=${renderStates[D3DRENDERSTATE_ZENABLE]|0} zw=${renderStates[D3DRENDERSTATE_ZWRITEENABLE]|0} zb=${renderStates[D3DRENDERSTATE_ZBIAS]|0} bl=${renderStates[D3DRENDERSTATE_ALPHABLENDENABLE]|0} sb=${renderStates[D3DRENDERSTATE_SRCBLEND]|0} db=${renderStates[D3DRENDERSTATE_DESTBLEND]|0} tex=${!!texture}`);
                 const vertexOffset = vOffset / OUTPUT_VERTEX_BYTES;
 
                 // Create MegaBatch bind group bound to the WHOLE storage buffer.
@@ -2562,7 +2637,7 @@ export class DDrawWebGPUExecutor {
                 // Pass size to setVertexBuffer to prevent reading beyond vertex data in ring buffer
                 this.currentRenderPass!.setVertexBuffer(0, vBuffer, vOffset, vSize);
                 this.currentRenderPass!.draw(useNativeTopology ? count : drawCount);
-                this.opLog(`DRAW-IMM v=${useNativeTopology ? count : drawCount} lit=${(renderStates[D3DRENDERSTATE_LIGHTING] | 0) !== 0} z=${renderStates[D3DRENDERSTATE_ZENABLE] | 0} zw=${renderStates[D3DRENDERSTATE_ZWRITEENABLE] | 0} vp=${viewport.x||0},${viewport.y||0},${viewport.width},${viewport.height},${viewport.minZ??0},${viewport.maxZ??1}`);
+                if (this.opLogArmed > 0) this.opLog(`DRAW-IMM v=${useNativeTopology ? count : drawCount} lit=${(renderStates[D3DRENDERSTATE_LIGHTING] | 0) !== 0} z=${renderStates[D3DRENDERSTATE_ZENABLE] | 0} zw=${renderStates[D3DRENDERSTATE_ZWRITEENABLE] | 0} vp=${viewport.x||0},${viewport.y||0},${viewport.width},${viewport.height},${viewport.minZ??0},${viewport.maxZ??1}`);
                 setAuthorityGpu(target, true);
 
                 // Update frame snapshot counters
@@ -2616,6 +2691,7 @@ export class DDrawWebGPUExecutor {
         })) return;
         this.renderStats.drawReq++;
         this.renderStats.drawIndexedReq++;
+        if (this.scrubbedOut()) return;
         // Per-stage texture transforms and camera-space texgen live only in the legacy
         // uniform slot (the MegaBatch storage slot has no matrix / World×View fields) —
         // either one vetoes the MegaBatch path. FFP lighting vetoes it too: the MegaBatch
@@ -2633,12 +2709,13 @@ export class DDrawWebGPUExecutor {
             !this.hasCameraSpaceTexgen(textureStates) &&
             !(renderStates[D3DRENDERSTATE_LIGHTING] | 0) &&
             clipPlaneEnable === 0;
-        const megaBatchAccumulate = !this.debugFlags.disableMegaBatch;
+        const megaBatchAccumulate = !this.debugFlags.disableMegaBatch && !this.debugFlags.disableMegaBatchAccumulate;
         // Vertex-blend draws MUST use the CPU converter (the GPU compute shader has no palette);
         // force the threshold to +∞ so the count-based branch below always picks the CPU path.
         const blendActive = !!vertexBlend && vertexBlend.count >= (vertexBlend.indexed ? 1 : 2);
         const gpuVertexThreshold = (this.debugFlags.forceCpuVertexPath || blendActive) ? Number.MAX_SAFE_INTEGER : GPU_VERTEX_THRESHOLD;
 
+        const _tIScan = drawCostProfiler.now();
         const packedStride = computeFvfStride(vertexType);
         const stride = sourceStride && sourceStride > 0 ? Math.max(sourceStride, packedStride) : packedStride;
         // Rebase to the smallest index actually referenced. D3D7 titles commonly pass
@@ -2752,6 +2829,8 @@ export class DDrawWebGPUExecutor {
             this.flush();
         }, storageBytes);
 
+        drawCostProfiler.add(DC.iscan, _tIScan);
+
         // Hint: batchable primitives that will use MegaBatch path → skip legacy uniform allocation
         const isBatchableHint = megaBatchEnabled &&
             iCount <= 8192 && primitiveType !== D3DPT_TRIANGLEFAN && (
@@ -2800,7 +2879,7 @@ export class DDrawWebGPUExecutor {
 
         // Convert vertices - use GPU path for large batches
         // Use effectiveVCount (clamped by max index) to avoid converting unreferenced vertices.
-        const safeViewport = sanitizeViewport(viewport, target.width, target.height);
+        const safeViewport = sanitizeViewportInto(this.safeVpScratchIndexed, viewport, target.width, target.height);
 
         const _tConv = drawCostProfiler.now();
         let convertedData: Uint8Array | null = null;
@@ -2826,7 +2905,9 @@ export class DDrawWebGPUExecutor {
                 vertexType,
                 safeViewport.width,
                 safeViewport.height,
-                stride
+                stride,
+                safeViewport.x,
+                safeViewport.y
             );
             if (!gpuConversionResult) {
                 this.renderStats.gpuConvFallback++;
@@ -2842,7 +2923,9 @@ export class DDrawWebGPUExecutor {
                     safeViewport.width,
                     safeViewport.height,
                     stride,
-                    vertexBlend ?? null
+                    vertexBlend ?? null,
+                    safeViewport.x,
+                    safeViewport.y
                 );
             }
         } else {
@@ -2857,7 +2940,10 @@ export class DDrawWebGPUExecutor {
                 scratch,
                 safeViewport.width,
                 safeViewport.height,
-                stride
+                stride,
+                null,
+                safeViewport.x,
+                safeViewport.y
             );
         }
 
@@ -2881,7 +2967,7 @@ export class DDrawWebGPUExecutor {
             vBuffer = gpuConversionResult.buffer;
             vOffset = gpuConversionResult.offset;
             vSize = gpuConversionResult.size;
-        } else if (convertedData) {
+        } else if (convertedData && convertedData.length > 0) {
             this.countNanVerts(convertedData, effectiveVCount);
             // CPU path: copy from CPU array to ring buffer
             const alloc = this.ringBufferManager.allocateVertexData(convertedData);
@@ -2907,6 +2993,7 @@ export class DDrawWebGPUExecutor {
 
         // Prepare index data
         // Handle indexed TRIANGLEFAN - expand indices to triangle-list
+        const _tSIdx = drawCostProfiler.now();
         let finalIndexCount = iCount;
         let indexFormat: GPUIndexFormat = "uint16";
         if (indexDataSize === iCount * 4) {
@@ -3018,6 +3105,7 @@ export class DDrawWebGPUExecutor {
             return; // Skip draw — index ring buffer full
         }
         const { buffer: iBuffer, offset: iOffset } = indexAlloc;
+        drawCostProfiler.add(DC.s_idx, _tSIdx);
 
         // MegaBatch for indexed draws: same as drawPrimitive — per-draw uniforms in storage buffer,
         // removes uniformOffset constraint, allows batching across different render states.
@@ -3025,6 +3113,7 @@ export class DDrawWebGPUExecutor {
                                      primitiveType === D3DPT_TRIANGLELIST ||
                                      primitiveType === D3DPT_TRIANGLEFAN;
 
+        const _tSPipe = drawCostProfiler.now();
         const megaBatchPipeline = megaBatchEnabled && isBatchablePrimitive
             ? this.pipelineFactory.getOrCreateMegaBatchPipeline(
                 vertexType,
@@ -3035,6 +3124,7 @@ export class DDrawWebGPUExecutor {
                 texture
             )
             : null;
+        drawCostProfiler.add(DC.s_pipe, _tSPipe);
 
         // Normalize viewport once — used in canBatch check and in currentBatch creation below.
         const vpX = viewport.x || 0;
@@ -3069,7 +3159,7 @@ export class DDrawWebGPUExecutor {
 
         if (canBatch && this.currentBatch) {
             // Add to existing MegaBatch — each draw has its own drawIndex
-            this.opLog(`BATCH+ i=${finalIndexCount} v=${effectiveVCount} z=${renderStates[D3DRENDERSTATE_ZENABLE]|0} zw=${renderStates[D3DRENDERSTATE_ZWRITEENABLE]|0} zb=${renderStates[D3DRENDERSTATE_ZBIAS]|0} bl=${renderStates[D3DRENDERSTATE_ALPHABLENDENABLE]|0} sb=${renderStates[D3DRENDERSTATE_SRCBLEND]|0} db=${renderStates[D3DRENDERSTATE_DESTBLEND]|0} tex=${!!texture}`);
+            if (this.opLogArmed > 0) this.opLog(`BATCH+ i=${finalIndexCount} v=${effectiveVCount} z=${renderStates[D3DRENDERSTATE_ZENABLE]|0} zw=${renderStates[D3DRENDERSTATE_ZWRITEENABLE]|0} zb=${renderStates[D3DRENDERSTATE_ZBIAS]|0} bl=${renderStates[D3DRENDERSTATE_ALPHABLENDENABLE]|0} sb=${renderStates[D3DRENDERSTATE_SRCBLEND]|0} db=${renderStates[D3DRENDERSTATE_DESTBLEND]|0} tex=${!!texture}`);
             const vertexOffset = vOffset / OUTPUT_VERTEX_BYTES;
             const indexOffset = iOffset / (indexFormat === "uint32" ? 4 : 2);
             this.currentBatch.draws.push({
@@ -3095,7 +3185,7 @@ export class DDrawWebGPUExecutor {
 
             if (shouldBatch && megaBatchPipeline) {
                 // Start new MegaBatch for indexed draws
-                this.opLog(`BATCH-NEW i=${finalIndexCount} v=${effectiveVCount} z=${renderStates[D3DRENDERSTATE_ZENABLE]|0} zw=${renderStates[D3DRENDERSTATE_ZWRITEENABLE]|0} zb=${renderStates[D3DRENDERSTATE_ZBIAS]|0} bl=${renderStates[D3DRENDERSTATE_ALPHABLENDENABLE]|0} sb=${renderStates[D3DRENDERSTATE_SRCBLEND]|0} db=${renderStates[D3DRENDERSTATE_DESTBLEND]|0} tex=${!!texture}`);
+                if (this.opLogArmed > 0) this.opLog(`BATCH-NEW i=${finalIndexCount} v=${effectiveVCount} z=${renderStates[D3DRENDERSTATE_ZENABLE]|0} zw=${renderStates[D3DRENDERSTATE_ZWRITEENABLE]|0} zb=${renderStates[D3DRENDERSTATE_ZBIAS]|0} bl=${renderStates[D3DRENDERSTATE_ALPHABLENDENABLE]|0} sb=${renderStates[D3DRENDERSTATE_SRCBLEND]|0} db=${renderStates[D3DRENDERSTATE_DESTBLEND]|0} tex=${!!texture}`);
                 const vertexOffset = vOffset / OUTPUT_VERTEX_BYTES;
                 const indexOffset = iOffset / (indexFormat === "uint32" ? 4 : 2);
 
@@ -3165,7 +3255,7 @@ export class DDrawWebGPUExecutor {
                 this.currentRenderPass!.setIndexBuffer(iBuffer, indexFormat, iOffset);
                 // Use finalIndexCount (expanded for triangle fan) instead of original iCount
                 this.currentRenderPass!.drawIndexed(finalIndexCount);
-                this.opLog(`DRAW-IMM-IDX i=${finalIndexCount} v=${effectiveVCount} lit=${(renderStates[D3DRENDERSTATE_LIGHTING] | 0) !== 0} z=${renderStates[D3DRENDERSTATE_ZENABLE] | 0} zw=${renderStates[D3DRENDERSTATE_ZWRITEENABLE] | 0} vp=${viewport.x||0},${viewport.y||0},${viewport.width},${viewport.height},${viewport.minZ??0},${viewport.maxZ??1}`);
+                if (this.opLogArmed > 0) this.opLog(`DRAW-IMM-IDX i=${finalIndexCount} v=${effectiveVCount} lit=${(renderStates[D3DRENDERSTATE_LIGHTING] | 0) !== 0} z=${renderStates[D3DRENDERSTATE_ZENABLE] | 0} zw=${renderStates[D3DRENDERSTATE_ZWRITEENABLE] | 0} vp=${viewport.x||0},${viewport.y||0},${viewport.width},${viewport.height},${viewport.minZ??0},${viewport.maxZ??1}`);
                 setAuthorityGpu(target, true);
 
                 // Update frame snapshot counters
@@ -3192,14 +3282,20 @@ export class DDrawWebGPUExecutor {
      * Only submits if there are actual commands to execute.
      * For better performance, prefer batching commands until endFrame().
      */
-    flush(): void {
+    /**
+     * @param drainDeferredClears Frame-end callers must drain `surfacesNeedingClear` — nothing
+     *   after them will. A MID-frame submit must NOT: the pending clear lives on the surface
+     *   state, so leaving it lets the next ensureRenderPass fold it into `loadOp:"clear"`
+     *   instead of paying a separate clearPipeline pass.
+     */
+    flush(drainDeferredClears = true): void {
         this.renderStats.flushes++;
         this.flushBatch();
         this.ringBufferManager.flushUniforms();
         this.ringBufferManager.flushLights();
         this.ringBufferManager.flushStorageBuffer();
-        
-        if (this.surfacesNeedingClear.size > 0) {
+
+        if (drainDeferredClears && this.surfacesNeedingClear.size > 0) {
             Logger.log(LogCategory.DDRAW,
                 `flush: processing ${this.surfacesNeedingClear.size} deferred clears (no draws consumed them)`);
             // flushBatch() may leave a render pass open via ensureRenderPass().
@@ -3252,6 +3348,7 @@ export class DDrawWebGPUExecutor {
             this.queue.submit([this.currentEncoder.finish()]);
             frameProfiler.endTimer("gpu", submitStart);
             this.currentEncoder = null;
+            this.encoderEpoch++;
             // Flush garbage list after submit to safely destroy unused depth textures
             this.depthManager.flushGarbage();
             this.msaaColorManager.flushGarbage();
@@ -3282,6 +3379,14 @@ export class DDrawWebGPUExecutor {
     }
 
     private frameEndedThisFrame = false;
+    /** Per-frame draw counter feeding the drawScrubMax bisect. See scrubbedOut(). */
+    private frameDrawIndex = 0;
+    /** Present serial the draw counter is currently numbering against (-1 = not yet seen). */
+    private scrubFrameSerial = -1;
+    /** Draws the scrub counted in the last completed frame. The instrument's own
+     *  self-check: a cut of N that leaves the picture whole is meaningless unless this
+     *  says the frame really did contain more than N draws. */
+    private scrubLastFrameDraws = 0;
 
     /**
      * Finalize all pending draws and return the command encoder WITHOUT submitting.
@@ -3330,6 +3435,10 @@ export class DDrawWebGPUExecutor {
 
         const encoder = this.currentEncoder;
         this.currentEncoder = null;
+        // The caller submits this encoder (D3D8 single-submit present). Bump unconditionally:
+        // if it was already null the frame boundary passed anyway, and a missed bump would let
+        // a texture marked in frame N still match the epoch in frame N+1.
+        this.encoderEpoch++;
         this.currentRenderTarget = null;
         this.resetBindFastPath();
         return encoder;
@@ -3348,6 +3457,28 @@ export class DDrawWebGPUExecutor {
         this.frameEndedThisFrame = false;
         // Frame boundary (flush() above submitted + nulled the encoder): apply pending MSAA change.
         this.applyMsaaAtFrameBoundary();
+    }
+
+    /** drawScrubMax bisect: count this draw and report whether it is past the cut.
+     *  Counted BEFORE the cut test so the numbering matches the frame capture's `index`
+     *  (which counts every draw the guest issued, kept or not).
+     *
+     *  The frame boundary is the FRAME CAPTURE's own producer boundary, so a scrub cut and
+     *  a capture index cannot disagree. endFrame() is not it: a title that presents with
+     *  Blt never calls it and the counter runs away, so the scrub freezes the picture.
+     *  Neither is the guest's full-RT Clear (an engine that clears per render target resets
+     *  several times per frame) nor RenderService's present serial (the GDI presenter
+     *  advances it independently, resetting the counter mid-frame). All three failure modes
+     *  read as "the flag does nothing", which is why the counter reports scrubLastFrameDraws. */
+    private scrubbedOut(): boolean {
+        if (this.debugFlags.drawScrubMax < 0) return false;
+        const serial = frameCapture.getFrameBoundarySerial();
+        if (serial !== this.scrubFrameSerial) {
+            this.scrubFrameSerial = serial;
+            this.scrubLastFrameDraws = this.frameDrawIndex;
+            this.frameDrawIndex = 0;
+        }
+        return this.frameDrawIndex++ > this.debugFlags.drawScrubMax;
     }
 
     endFrame(): void {
@@ -3511,7 +3642,8 @@ export class DDrawWebGPUExecutor {
         const subs = state.mipSublevels;
         const levels = state.gpuMipLevels ?? 1;
         if (!subs || subs.length === 0 || !state.gpuTexture || levels <= 1) return false;
-        const mem = System.getInstance()?.process?.getCurrentMemory();
+        // Plain view: decodeSurfaceFormatToRgba8 below reads this per texel.
+        const mem = toPlainGuestMemory(System.getInstance()?.process?.getCurrentMemory());
         if (!mem) return false;
 
         for (let i = 0; i < subs.length && i + 1 < levels; i++) {
@@ -3532,13 +3664,96 @@ export class DDrawWebGPUExecutor {
         return true;
     }
 
+    /** Last observed guest-memory content hash per texture surfacePtr (see prepareStageTexture). */
+    private readonly cpuContentHashes = new Map<number, number>();
+    /** Frame in which each surfacePtr was last hashed, so the scan runs once per frame. */
+    private readonly cpuHashFrame = new Map<number, number>();
+    /** Monotonic frame counter for the hash memo; bumped at each frame boundary. */
+    private frameSerial = 0;
+
+    /** Monotonic id of the command buffer currently being recorded. Bumped on every submit that
+     *  nulls currentEncoder. Draws recorded into epoch N observe every queue.writeTexture issued
+     *  before submit(N) — INCLUDING writes issued after those draws were recorded, because the
+     *  write lands on the queue while the draws are still sitting in an unsubmitted buffer. That
+     *  is the whole copy→draw→copy→draw hazard, and comparing this to a surface's
+     *  sampledEncoderEpoch is how we detect it. */
+    private encoderEpoch = 1;
+
+    /** Samples per surface for the content hash. The scan runs once per surface per frame, so
+     *  its cost is charged to every textured frame — a full sweep of every bound texture cost
+     *  ~45% of the frame rate here. A fixed budget makes it O(1) per surface instead of O(size)
+     *  while staying far denser than any real texel update: a lightmap block rewrite touches
+     *  hundreds of contiguous bytes, so it cannot slip between samples. */
+    private static readonly CONTENT_HASH_SAMPLES = 1024;
+
+    /** FNV-1a over a bounded, evenly spaced sample of the surface's guest bytes. Returns 0 when
+     *  the memory is not addressable (the caller then leaves the freshness flags alone). */
+    private hashSurfaceBytes(tex: RenderSurface): number {
+        // Plain view, not v86's Proxy: every raw `mem[i]` costs a trap + regex assert
+        // (~25-40x), and this is a per-element loop. Borrowed locally — never held across
+        // a yield, so a memory growth cannot detach it under us.
+        const mem = toPlainGuestMemory(System.getInstance()?.process?.getCurrentMemory());
+        if (!mem) return 0;
+        const start = tex.surfacePtr >>> 0;
+        const bytes = Math.max(0, tex.pitch * tex.height);
+        if (!start || bytes <= 0 || start + bytes > mem.length) return 0;
+        // Odd step so the sample positions do not land on one texel component forever.
+        const step = Math.max(1, Math.floor(bytes / DDrawWebGPUExecutor.CONTENT_HASH_SAMPLES)) | 1;
+        let h = 0x811c9dc5;
+        let n = 0;
+        for (let i = start; i < start + bytes; i += step) {
+            h ^= mem[i];
+            h = Math.imul(h, 0x01000193);
+            n++;
+        }
+        this.renderStats.texHashScans++;
+        this.renderStats.texHashBytes += n;
+        return h >>> 0 || 1;
+    }
+
     /** Ensure a stage texture's GPU resources exist and are synced from guest memory. */
+    /**
+     * True when draws already recorded into the CURRENT (unsubmitted) command buffer sampled
+     * this surface, and its pixels have changed since. Both halves matter: after any submit the
+     * epoch advances and this goes false on its own, so no per-submit bookkeeping sweep is
+     * needed, and a re-upload of unchanged content (forceTextureResync, a hash-driven gpuDirty)
+     * does not move contentVersion and so cannot trigger a spurious submit.
+     */
+    private isSampledContentOverwritten(tex: DirectDrawSurfaceState): boolean {
+        return tex.sampledEncoderEpoch === this.encoderEpoch
+            && tex.sampledContentVersion !== surfaceContentVersion(tex);
+    }
+
     private prepareStageTexture(stage: number, tex: DirectDrawSurfaceState): void {
         const justCreated = !tex.gpuTextureView;
         this.ensureSurfaceGPUResources(tex);
         // If GPU texture was just created, force dirty to guarantee initial upload
         if (justCreated && isRenderSurface(tex) && !tex.gpuDirty) {
             tex.gpuDirty = true;
+        }
+        // A game that Locked a texture once may keep the returned lpSurface and rewrite texels
+        // with no further Lock/Unlock/Load — legal, because real D3D6 reads a system-memory
+        // texture's texels at draw time and never needed to be told. Our GPU copy is a cache the
+        // contract does not know about, and every dirty flag stays false, so the first upload
+        // would be the only one for the surface's whole life (Half-Life's lightmaps: permanently
+        // black world faces). Ask the memory instead — hash it at bind and re-upload on change.
+        // Restricted to ever-Locked textures that we believe are already in sync, so the scan
+        // does not run for surfaces whose freshness the flags already describe.
+        // Once per surface per frame: the same texture is bound by many draws, and re-hashing it
+        // for each one costs the scan over and over for an answer that cannot change mid-frame.
+        if (!this.debugFlags.disableCpuTextureHash &&
+            isRenderSurface(tex) && tex.everLocked && (tex.caps & DDSCAPS_TEXTURE) !== 0 &&
+            !tex.gpuDirty && tex.lastUploadVersion === tex.version &&
+            this.cpuHashFrame.get(tex.surfacePtr >>> 0) !== this.frameSerial) {
+            this.cpuHashFrame.set(tex.surfacePtr >>> 0, this.frameSerial);
+            const _tHash = drawCostProfiler.now();
+            const h = this.hashSurfaceBytes(tex);
+            drawCostProfiler.add(DC.p_hash, _tHash);
+            if (h !== 0 && this.cpuContentHashes.get(tex.surfacePtr >>> 0) !== h) {
+                this.cpuContentHashes.set(tex.surfacePtr >>> 0, h);
+                this.renderStats.texHashDirty++;
+                tex.gpuDirty = true;
+            }
         }
         // Force resync: mark texture dirty to force re-upload from guest memory (diagnostic)
         if (this.debugFlags.forceTextureResync) {
@@ -3568,10 +3783,20 @@ export class DDrawWebGPUExecutor {
                         : `bitmap gpuNeedsUpload=${tex.gpuNeedsUpload} `) +
                     `hasView=${!!tex.gpuTextureView}`);
             }
+            this.renderStats.texSyncs++;
+            const _tSync = drawCostProfiler.now();
             this.syncSurfaceFromMemory(tex);
             // Prefer the game's authored mip pixels; fall back to box-gen from level 0.
             if (!this.uploadAuthoredMips(tex)) this.regenerateMipsIfNeeded(tex);
+            drawCostProfiler.add(DC.p_sync, _tSync);
         }
+        // Record which command buffer will hold the draw about to be encoded, and the content
+        // it samples. Marking at PREPARE time (not when flushBatch records the draw) is
+        // deliberately conservative: a prepared draw sits in currentBatch, and the early-submit
+        // path flushes that batch first, so it lands in the epoch it was marked with. Being
+        // conservative can cost an extra submit; it can never miss one.
+        tex.sampledEncoderEpoch = this.encoderEpoch;
+        tex.sampledContentVersion = surfaceContentVersion(tex);
     }
 
     /** Bit-cast a DWORD render state to its float value (POINTSIZE/SCALE are stored as floats). */
@@ -3649,7 +3874,7 @@ export class DDrawWebGPUExecutor {
             return;
         }
 
-        const safeViewport = sanitizeViewport(viewport, target.width, target.height);
+        const safeViewport = sanitizeViewportInto(this.safeVpScratchExpand, viewport, target.width, target.height);
         const vpW = safeViewport.width > 0 ? safeViewport.width : 640;
         const vpH = safeViewport.height > 0 ? safeViewport.height : 480;
 
@@ -3662,7 +3887,7 @@ export class DDrawWebGPUExecutor {
         const baseView = scratch.subarray(0, convSize);
         const expanded = scratch.subarray(convSize, convSize + expSize);
 
-        this.vertexConverter.convertCPU(memory, verticesAddr, count, vertexType, baseView, vpW, vpH, stride);
+        this.vertexConverter.convertCPU(memory, verticesAddr, count, vertexType, baseView, vpW, vpH, stride, null, safeViewport.x, safeViewport.y);
 
         const baseF32 = new Float32Array(baseView.buffer, baseView.byteOffset, convSize / 4);
         const baseU32 = new Uint32Array(baseView.buffer, baseView.byteOffset, convSize / 4);
@@ -3815,7 +4040,7 @@ export class DDrawWebGPUExecutor {
         this.setupPipelineAndBindings(prepareResult);
         this.currentRenderPass!.setVertexBuffer(0, alloc.buffer, alloc.offset, expSize);
         this.currentRenderPass!.draw(outCount);
-        this.opLog(`PSPRITE v=${outCount} pts=${count} sprite=${spriteEnable ? 1 : 0} scale=${scaleEnable ? 1 : 0}`);
+        if (this.opLogArmed > 0) this.opLog(`PSPRITE v=${outCount} pts=${count} sprite=${spriteEnable ? 1 : 0} scale=${scaleEnable ? 1 : 0}`);
         setAuthorityGpu(target, true);
     }
 
@@ -3851,14 +4076,31 @@ export class DDrawWebGPUExecutor {
         const targetNeedsSync = needsRenderTargetUploadBeforeDraw(target);
 
         // Conservative pre-check: flush batch if any stage texture lacks GPU resources
-        // or needs sync (evaluated per stage; stage 0 = `texture`).
+        // or needs sync (evaluated per stage; stage 0 = `texture`). No `break` — the
+        // overwrite gate below has to see EVERY stage, not just the first that needs sync.
         let anyTexMayNeedSync = false;
+        let anySampledTexOverwritten = false;
         for (let s = 0; s < MAX_FFP_SAMPLED_STAGES; s++) {
             const tex = s === 0 ? texture : stageTextures?.[s] ?? null;
-            if (tex && (surfaceSyncManager.needsGPUSync(tex).needed || !tex.gpuTextureView)) {
+            if (!tex) continue;
+            if (surfaceSyncManager.needsGPUSync(tex).needed || !tex.gpuTextureView) {
                 anyTexMayNeedSync = true;
-                break;
             }
+            if (this.isSampledContentOverwritten(tex)) anySampledTexOverwritten = true;
+        }
+        if (targetNeedsSync && this.isSampledContentOverwritten(target)) anySampledTexOverwritten = true;
+
+        // The upload that is about to happen is a queue.writeTexture, and the draws that sampled
+        // the PREVIOUS content are still sitting in an unsubmitted command buffer — so the write
+        // would run ahead of them and they would all sample the new pixels. Submit first, exactly
+        // as ensureClipPlanesUploaded does for its writeBuffer. flush() is reused rather than
+        // open-coded because it also restores the bind fast-path and clears currentRenderTarget,
+        // which is what forces the next pass to re-apply its viewport.
+        if (anySampledTexOverwritten && this.currentEncoder
+            && !this.debugFlags.disableTextureOverwriteSubmit) {
+            this.renderStats.earlyTexSubmits++;
+            if (this.opLogArmed > 0) this.opLog(`SUBMIT-EARLY epoch=${this.encoderEpoch}`);
+            this.flush(false); // mid-frame: deferred clears stay pending for the next pass
         }
 
         // Preserve draw order: if we are about to sync textures, flush any pending batch first.
@@ -3869,16 +4111,19 @@ export class DDrawWebGPUExecutor {
             this.currentRenderPass.end();
             this.currentRenderPass = null;
             this.currentRenderTarget = null;
+            this.resetBindFastPath();
         }
 
         if (targetNeedsSync) {
             this.syncSurfaceFromMemory(target);
         }
 
+        const _tPTex = drawCostProfiler.now();
         for (let s = 0; s < MAX_FFP_SAMPLED_STAGES; s++) {
             const tex = s === 0 ? texture : stageTextures?.[s] ?? null;
             if (tex) this.prepareStageTexture(s, tex);
         }
+        drawCostProfiler.add(DC.p_tex, _tPTex);
 
         if (!target.gpuTextureView) {
             const pr = this.prepareResult;
@@ -4146,22 +4391,8 @@ export class DDrawWebGPUExecutor {
         const fogEnable = renderStates[D3DRENDERSTATE_FOGENABLE] || 0;
         const fogTableMode = renderStates[D3DRENDERSTATE_FOGTABLEMODE] ?? D3DFOG_NONE;
         const fogVertexMode = renderStates[D3DRENDERSTATE_FOGVERTEXMODE] ?? D3DFOG_NONE;
-        // D3D fog mode resolution:
-        // - table (pixel) fog when FOGTABLEMODE != NONE — formula over device depth
-        //   (shader encoding 1..3).
-        // - vertex fog when table fog is NONE and FOGVERTEXMODE != NONE. HERE the
-        //   vertex kind matters: for pre-transformed (RHW) vertices no T&L runs, so
-        //   the app supplies the fog factor in specular alpha (encoded 0.5 → shader
-        //   reads 1-specular.a). For untransformed vertices the T&L pipeline COMPUTES
-        //   per-vertex fog with the FOGVERTEXMODE formula over VIEW-SPACE depth
-        //   (encoded mode+4 → shader uses clip-space w and FOGSTART/END in view
-        //   units). Feeding the specular.a path there reads an alpha the app never
-        //   set (usually 0) and drowns the whole scene in fog color.
-        const fogMode = fogEnable
-            ? (fogTableMode !== D3DFOG_NONE
-                ? fogTableMode
-                : (fogVertexMode !== D3DFOG_NONE ? (isRHW ? 0.5 : fogVertexMode + 4) : D3DFOG_NONE))
-            : D3DFOG_NONE;
+        const fogMode = resolveFfpFogMode(fogEnable, fogTableMode, fogVertexMode, !!isRHW,
+            (vertexType & D3DFVF_SPECULAR) !== 0);
         const specularEnable = renderStates[D3DRENDERSTATE_SPECULARENABLE] ? 1 : 0;
         const fogColorDword = renderStates[D3DRENDERSTATE_FOGCOLOR] ?? 0;
         const fogColorR = ((fogColorDword >> 16) & 0xff) / 255.0;
@@ -4185,15 +4416,9 @@ export class DDrawWebGPUExecutor {
             if (densityRaw !== undefined) fogDensity = dwordToFloat(densityRaw);
         }
 
-        const safeViewport = sanitizeViewport(
-            {
-                ...viewport,
-                minZ: viewport.minZ ?? 0,
-                maxZ: viewport.maxZ ?? 1,
-            },
-            target.width,
-            target.height,
-        );
+        // sanitizeViewportInto already defaults a missing minZ/maxZ to 0/1, so the spread
+        // that used to build those defaults was a second per-draw allocation for nothing.
+        const safeViewport = sanitizeViewportInto(this.safeVpScratchPrepare, viewport, target.width, target.height);
 
         // Determine if blend state requires premultiplied alpha (ONE/INVSRCALPHA)
         // When srcBlend=ONE and dstBlend=INVSRCALPHA, WebGPU expects premultiplied alpha input.
@@ -4259,7 +4484,7 @@ export class DDrawWebGPUExecutor {
         }
         
         
-        const mat = lighting?.material ?? createDefaultMaterial();
+        const mat = lighting?.material ?? this.defaultMaterial;
         const world = lighting?.worldMatrix ?? null;
         // World×View for camera-space texgen (D3DTSS_TCI_CAMERASPACE*); rides the legacy
         // uniform slot only (texgen draws carry a texture matrix → MegaBatch is vetoed).
@@ -4352,6 +4577,7 @@ export class DDrawWebGPUExecutor {
         stages.pack();
 
         // Skip legacy uniform allocation when MegaBatch path will be used (saves the slot write + ring buffer advance)
+        const _tPUni = drawCostProfiler.now();
         const uniformOffset = skipLegacyUniform ? -1 : this.ringBufferManager.allocateUniformSlot(
             safeViewport.width,
             safeViewport.height,
@@ -4454,7 +4680,9 @@ export class DDrawWebGPUExecutor {
             lighting
         );
         const drawIndex = drawUniformsAlloc.index;
+        drawCostProfiler.add(DC.p_uni, _tPUni);
 
+        const _tPPipe = drawCostProfiler.now();
         const pipeline = this.pipelineFactory.getOrCreatePipeline(
             vertexType,
             primitiveType,
@@ -4463,6 +4691,7 @@ export class DDrawWebGPUExecutor {
             renderStates,
             texture
         );
+        drawCostProfiler.add(DC.p_pipe, _tPPipe);
 
         pr.uniformOffset = uniformOffset;
         // Per-draw FFP light set (binding 5) — captured here so each object lights with its own
@@ -4579,7 +4808,7 @@ export class DDrawWebGPUExecutor {
                 const vpDesc = viewport && viewport.width && viewport.height
                     ? (() => { const s = sanitizeViewport(viewport, target.width, target.height); return `${s.x},${s.y},${s.width},${s.height},${s.minZ ?? 0},${s.maxZ ?? 1}`; })()
                     : `full(${target.width}x${target.height})`;
-                this.opLog(`PASS rt=${target.surfacePtr.toString(16)} color=${useClear ? "CLEAR" : "load"} depth=${depthStencilAttachment?.depthLoadOp ?? "none"} cview=#${vid(target.gpuTextureView)} dview=#${vid(depthStencilAttachment?.view)} vp=${vpDesc}`);
+                if (this.opLogArmed > 0) this.opLog(`PASS rt=${target.surfacePtr.toString(16)} color=${useClear ? "CLEAR" : "load"} depth=${depthStencilAttachment?.depthLoadOp ?? "none"} cview=#${vid(target.gpuTextureView)} dview=#${vid(depthStencilAttachment?.view)} vp=${vpDesc}`);
             }
             
             if (useClear) {
@@ -4618,7 +4847,7 @@ export class DDrawWebGPUExecutor {
     private applyPassViewport(target: DirectDrawSurfaceState, viewport?: Viewport): void {
         let vpX = 0, vpY = 0, vpW = target.width, vpH = target.height, vpMinZ = 0, vpMaxZ = 1;
         if (viewport && viewport.width && viewport.height) {
-            const safeVp = sanitizeViewport(viewport, target.width, target.height);
+            const safeVp = sanitizeViewportInto(this.safeVpScratchPass, viewport, target.width, target.height);
             vpX = safeVp.x; vpY = safeVp.y; vpW = safeVp.width; vpH = safeVp.height;
             vpMinZ = safeVp.minZ ?? 0; vpMaxZ = safeVp.maxZ ?? 1;
         }
@@ -4634,7 +4863,7 @@ export class DDrawWebGPUExecutor {
         const scissorW = Math.max(0, Math.min(vpW, target.width - scissorX));
         const scissorH = Math.max(0, Math.min(vpH, target.height - scissorY));
         this.currentRenderPass!.setScissorRect(scissorX, scissorY, scissorW, scissorH);
-        if (cur) this.opLog(`SET-VP(reuse) ${vpX},${vpY},${vpW},${vpH},${vpMinZ},${vpMaxZ}`);
+        if (cur && this.opLogArmed > 0) this.opLog(`SET-VP(reuse) ${vpX},${vpY},${vpW},${vpH},${vpMinZ},${vpMaxZ}`);
         this.appliedPassViewport = { x: vpX, y: vpY, width: vpW, height: vpH, minZ: vpMinZ, maxZ: vpMaxZ };
     }
 
@@ -4667,9 +4896,7 @@ export class DDrawWebGPUExecutor {
         for (let s = 0; s < MAX_FFP_SAMPLED_STAGES; s++) {
             const sampled = (pr.sampledMask & (1 << s)) !== 0;
             const tex = s === 0 ? texture : stageTextures?.[s] ?? null;
-            this.stageVersionsScratch[s] = sampled && tex
-                ? (isRenderSurface(tex) ? tex.version : 0)
-                : -1;
+            this.stageVersionsScratch[s] = sampled && tex ? surfaceContentVersion(tex) : -1;
             const sp = pr.stageSamplers[s];
             this.stageSamplerKeysScratch[s] = sampled
                 ? ((sp.minFilter & 0x3) | ((sp.magFilter & 0x3) << 2) | ((sp.mipFilter & 0x3) << 4) |
@@ -4749,7 +4976,7 @@ export class DDrawWebGPUExecutor {
         // 9002 = skip all draws but run ensureRenderPass(batch.target, batch.viewport).
         const diagMode = this.debugFlags.skipMegaBatchDrawsRender ? this.debugFlags.skipMegaBatchMinIdx : 0;
         if (this.debugFlags.skipMegaBatchDrawsRender && (!diagMode || diagMode === 9001 || diagMode === 9002)) {
-            this.opLog(`FLUSH-BATCH SKIPPED mode=${diagMode} n=${this.currentBatch.draws?.length ?? 0}`);
+            if (this.opLogArmed > 0) this.opLog(`FLUSH-BATCH SKIPPED mode=${diagMode} n=${this.currentBatch.draws?.length ?? 0}`);
             if (diagMode === 9001 && this.currentBatch.useMegaBatch) this.ringBufferManager.flushStorageBuffer();
             if (diagMode === 9002) this.ensureRenderPass(this.currentBatch.target, this.currentBatch.viewport);
             this.currentBatch = null;

@@ -614,10 +614,13 @@ export class SurfaceSyncManager {
         // CPU-First: generation-aware dirty check. surfaceEverWritten is a
         // lifetime hint, not a content generation; only a new version should
         // cause another CPU->GPU upload after the current version was synced.
+        // A completed upload CLEARS gpuDirty (setAuthorityGpu), so a raised flag can only mean
+        // "the CPU wrote after the last upload" — it is not something that can go stale on its
+        // own. Dismissing it whenever version === lastUploadVersion assumed every writer also
+        // bumps version, and several do not (D3D texture Load, some Blt paths): the surface then
+        // keeps whatever reached the GPU on its FIRST upload for the rest of its life, which is
+        // how lightmapped world surfaces ended up permanently black.
         if (state.gpuDirty) {
-            if (state.lastUploadVersion === state.version) {
-                return { needed: false, reason: `dirty flag stale (version ${state.version} already uploaded)` };
-            }
             return { needed: true, reason: `gpuDirty=true (CPU version ${state.version}, uploaded ${state.lastUploadVersion})` };
         }
 

@@ -46,6 +46,7 @@ import {
 
 const D3D_OK = 0;
 const D3DERR_INVALIDCALL = 0x8876086c;
+
 const D3DERR_OUTOFVIDEOMEMORY = 0x8876017c;
 const D3DFMT_X8R8G8B8 = 22;
 const D3DFMT_VERTEXDATA = 100;
@@ -170,6 +171,10 @@ function clampRectToSurface(rect: RectI, width: number, height: number): RectI {
 
 function syncBitmapSurfaceFromGuest(surface: BitmapTextureSurface): void {
     surface.gpuNeedsUpload = true;
+    // The pixels changed — see BitmapTextureSurface.contentVersion. Bump BEFORE any
+    // early return below: a caller that skips the decode still rewrote guest memory,
+    // and a batch that keeps accumulating past that renders with the wrong upload.
+    surface.contentVersion = (surface.contentVersion ?? 0) + 1;
 
     const process = System.getInstance().process;
     if (!process || !surface.surfacePtr) return;

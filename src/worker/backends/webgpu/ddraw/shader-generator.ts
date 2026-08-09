@@ -37,6 +37,7 @@ import {
     FFP_SELECT_COLOR_WGSL,
     emitFfpComputeLighting,
 } from "../d3d9/ffp-lighting";
+import { FFP_FOG_WGSL } from "../d3d9/ffp-fog";
 
 /**
  * Per-sampled-stage GPU bind slots: [sampler, texture] for stages 0..3.
@@ -146,6 +147,8 @@ function generateTextureSample(textureName: string, samplerName: string, uvExpr:
  */
 function generateShaderHelpers(): string {
     return `
+${FFP_FOG_WGSL}
+
 fn selectTexCoord(rawIndex: u32, uv0: vec2f, uv1: vec2f, uv2: vec2f) -> vec2f {
     let index = rawIndex & 0xffffu;
     if (index == 1u) {
@@ -510,40 +513,10 @@ export function generateShaderCode(config: ShaderConfig): string {
                 out.uv3 = genTexCoordSrc(uniforms.stages[3].z, uv, uv1, uv2, tcCamPos, tcCamNormal, tcCamReflect).xy;
                 out.normal = normal;
 
-                // Fog mode encoding (fogParams.w):
-                //   0.5   = pre-transformed vertex fog — app supplied factor in specular.a
-                //   1..3  = table (pixel) fog EXP/EXP2/LINEAR over device depth (z/w)
-                //   5..7  = T&L vertex fog EXP/EXP2/LINEAR over view-space depth (clip w)
-                if (uniforms.fogParams.w > 0.25 && uniforms.fogParams.w < 0.75) {
-                    out.fogFactor = 1.0 - vSpecular.a;
-                } else if (uniforms.fogParams.w >= 1.0) {
-                    var mode = uniforms.fogParams.w;
-                    var depth: f32;
-                    if (mode >= 4.5) {
-                        mode = mode - 4.0;
-                        depth = out.position.w;
-                    } else if (uniforms.isRHW != 0u) {
-                        depth = pos.z;
-                    } else {
-                        depth = clamp(out.position.z / out.position.w, 0.0, 1.0);
-                    }
-                    let start = uniforms.fogParams.x;
-                    let end = uniforms.fogParams.y;
-                    let density = uniforms.fogParams.z;
-                    var fogFactor: f32;
-                    if (mode <= 1.5) {
-                        fogFactor = 1.0 - exp(-density * depth);
-                    } else if (mode <= 2.5) {
-                        let d = density * depth;
-                        fogFactor = 1.0 - exp(-d * d);
-                    } else {
-                        let f = (end - depth) / max(end - start, 0.0001);
-                        fogFactor = 1.0 - clamp(f, 0.0, 1.0);
-                    }
-                    out.fogFactor = clamp(fogFactor, 0.0, 1.0);
-                } else {
-                    out.fogFactor = 0.0;
-                }
+                // Fog: mode encoding + formula live in ffp-fog.ts, shared with the D3D9 FFP.
+                out.fogFactor = ffpFogFactor(uniforms.fogParams.w, uniforms.fogParams.x,
+                    uniforms.fogParams.y, uniforms.fogParams.z,
+                    out.position.z, out.position.w, vSpecular.a);
 
                 // FFP user clip planes. D3D fixed-function evaluates the plane equations in
                 // WORLD space: DXVK's d3d9_fixed_function_vert.vert emitVsClipping() computes
@@ -822,39 +795,9 @@ export function generateMegaBatchShaderCode(config: ShaderConfig): string {
                 out.uv3 = selectTexCoord(draw.stages[3].z, uv, uv1, uv2);
                 out.normal = normal;
 
-                // Fog calculation — mode encoding matches the legacy path:
-                // 0.5 = specular.a (pre-transformed), 1..3 = table fog over device z,
-                // 5..7 = T&L vertex fog over view-space depth (clip w).
-                var fogMode = draw.fogParams.w;
-                if (fogMode > 0.25 && fogMode < 0.75) {
-                    out.fogFactor = 1.0 - vSpecular.a;
-                } else if (fogMode >= 1.0) {
-                    var depth: f32;
-                    if (fogMode >= 4.5) {
-                        fogMode = fogMode - 4.0;
-                        depth = out.position.w;
-                    } else if (draw.misc.y != 0u) {
-                        depth = pos.z;
-                    } else {
-                        depth = clamp(out.position.z / out.position.w, 0.0, 1.0);
-                    }
-                    let start = draw.fogParams.x;
-                    let end = draw.fogParams.y;
-                    let density = draw.fogParams.z;
-                    var fogFactor: f32;
-                    if (fogMode <= 1.5) {
-                        fogFactor = 1.0 - exp(-density * depth);
-                    } else if (fogMode <= 2.5) {
-                        let d = density * depth;
-                        fogFactor = 1.0 - exp(-d * d);
-                    } else {
-                        let f = (end - depth) / max(end - start, 0.0001);
-                        fogFactor = 1.0 - clamp(f, 0.0, 1.0);
-                    }
-                    out.fogFactor = clamp(fogFactor, 0.0, 1.0);
-                } else {
-                    out.fogFactor = 0.0;
-                }
+                out.fogFactor = ffpFogFactor(draw.fogParams.w, draw.fogParams.x,
+                    draw.fogParams.y, draw.fogParams.z,
+                    out.position.z, out.position.w, vSpecular.a);
 
                 return out;
             }`;

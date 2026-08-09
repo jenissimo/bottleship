@@ -41,6 +41,9 @@ import {
     D3DCOLORVALUE_OFFSETS,
     D3DVECTOR_OFFSETS,
     D3D_MAX_LIGHTS,
+    D3DVIEWPORT7_SIZE,
+    D3DVIEWPORT7_OFFSETS,
+    E_INVALIDARG,
     allocateComObject,
 } from "../constants";
 import { ComObjectFactory } from "../../../core/com/base-com-object";
@@ -281,15 +284,29 @@ export const createDeviceExports = (
         const lpViewport = args[1];
         const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DDevice7Object | null;
         if (!obj) return D3D_OK;
-        if (!lpViewport || !isValidAddress(mem, lpViewport, 28)) return D3DERR_INVALIDCALL;
+        // D3DVIEWPORT7 is 24 bytes and has NO leading dwSize — unlike D3DVIEWPORT/D3DVIEWPORT2,
+        // which do (d3dtypes.h). Reading a size field here consumes dwX, shifts every field by
+        // one DWORD and hands back width/height of 0 for the overwhelmingly common x=0 viewport.
+        if (!lpViewport || !isValidAddress(mem, lpViewport, D3DVIEWPORT7_SIZE)) return D3DERR_INVALIDCALL;
         const view = getDataView(mem); // OPTIMIZED: Use cached DataView
-        const dwSize = Math.min(view.getUint32(lpViewport, true), 28);
-        const x = dwSize >= 8 ? view.getUint32(lpViewport + 4, true) : 0;
-        const y = dwSize >= 12 ? view.getUint32(lpViewport + 8, true) : 0;
-        const w = dwSize >= 16 ? view.getUint32(lpViewport + 12, true) : 0;
-        const h = dwSize >= 20 ? view.getUint32(lpViewport + 16, true) : 0;
-        const minZ = dwSize >= 24 ? view.getFloat32(lpViewport + 20, true) : 0;
-        const maxZ = dwSize >= 28 ? view.getFloat32(lpViewport + 24, true) : 1;
+        const x = view.getUint32(lpViewport + D3DVIEWPORT7_OFFSETS.x, true);
+        const y = view.getUint32(lpViewport + D3DVIEWPORT7_OFFSETS.y, true);
+        const w = view.getUint32(lpViewport + D3DVIEWPORT7_OFFSETS.width, true);
+        const h = view.getUint32(lpViewport + D3DVIEWPORT7_OFFSETS.height, true);
+        const minZ = view.getFloat32(lpViewport + D3DVIEWPORT7_OFFSETS.minZ, true);
+        const maxZ = view.getFloat32(lpViewport + D3DVIEWPORT7_OFFSETS.maxZ, true);
+        // The viewport must lie inside the render target; out of range leaves the previous
+        // viewport untouched (d3d_device7_SetViewport's wined3d_bound_range check).
+        const rtAddr = obj.getRenderTarget() || context.surfaces.backBuffer || context.surfaces.primary;
+        const rtState = rtAddr
+            ? (resourceProvider.getComObjectByAddress(rtAddr) as DirectDrawSurfaceObject | null)?.getState()
+            : null;
+        if (rtState && (x > rtState.width || w > rtState.width - x ||
+                        y > rtState.height || h > rtState.height - y)) {
+            Logger.warn(LogCategory.DDRAW,
+                `IDirect3DDevice7_SetViewport: out of range ${x},${y} ${w}x${h} for RT ${rtState.width}x${rtState.height}`);
+            return E_INVALIDARG;
+        }
         obj.setViewportData({ x, y, width: w, height: h, minZ, maxZ });
         Logger.verboseLazy(LogCategory.DDRAW, () => `IDirect3DDevice7_SetViewport: x=${x} y=${y} w=${w} h=${h}`);
         return D3D_OK;
@@ -300,18 +317,24 @@ export const createDeviceExports = (
         const lpViewport = args[1];
         const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DDevice7Object | null;
         if (!obj) return D3DERR_INVALIDCALL;
-        if (!lpViewport || !isValidAddress(mem, lpViewport, 28)) return D3DERR_INVALIDCALL;
+        if (!lpViewport || !isValidAddress(mem, lpViewport, D3DVIEWPORT7_SIZE)) return D3DERR_INVALIDCALL;
         const vp = obj.getViewportData();
-        const x = vp?.x ?? 0, y = vp?.y ?? 0, w = vp?.width ?? 640, h = vp?.height ?? 480;
+        // Unset means the device still carries the viewport it was created with — the full
+        // render target, not a 640x480 guess.
+        const rtAddr = obj.getRenderTarget() || context.surfaces.backBuffer || context.surfaces.primary;
+        const rtState = rtAddr
+            ? (resourceProvider.getComObjectByAddress(rtAddr) as DirectDrawSurfaceObject | null)?.getState()
+            : null;
+        const x = vp?.x ?? 0, y = vp?.y ?? 0;
+        const w = vp?.width ?? rtState?.width ?? 0, h = vp?.height ?? rtState?.height ?? 0;
         const minZ = vp?.minZ ?? 0, maxZ = vp?.maxZ ?? 1;
         const view = getDataView(mem); // OPTIMIZED: Use cached DataView
-        view.setUint32(lpViewport, 28, true);
-        view.setUint32(lpViewport + 4, x, true);
-        view.setUint32(lpViewport + 8, y, true);
-        view.setUint32(lpViewport + 12, w, true);
-        view.setUint32(lpViewport + 16, h, true);
-        view.setFloat32(lpViewport + 20, minZ, true);
-        view.setFloat32(lpViewport + 24, maxZ, true);
+        view.setUint32(lpViewport + D3DVIEWPORT7_OFFSETS.x, x, true);
+        view.setUint32(lpViewport + D3DVIEWPORT7_OFFSETS.y, y, true);
+        view.setUint32(lpViewport + D3DVIEWPORT7_OFFSETS.width, w, true);
+        view.setUint32(lpViewport + D3DVIEWPORT7_OFFSETS.height, h, true);
+        view.setFloat32(lpViewport + D3DVIEWPORT7_OFFSETS.minZ, minZ, true);
+        view.setFloat32(lpViewport + D3DVIEWPORT7_OFFSETS.maxZ, maxZ, true);
         return D3D_OK;
     };
 

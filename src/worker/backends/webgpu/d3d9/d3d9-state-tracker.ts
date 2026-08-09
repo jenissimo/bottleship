@@ -102,7 +102,7 @@ export class D3D9StateTracker {
         // FFP lighting defaults (D3DMCS_*: MATERIAL=0, COLOR1=1, COLOR2=2). These let
         // unset values reflect the real D3D defaults so an explicit MATERIAL (0) is
         // distinguishable from "never set".
-        this.renderStates[134] = 1;  // D3DRS_COLORVERTEX        = TRUE
+        this.renderStates[141] = 1;  // D3DRS_COLORVERTEX        = TRUE
         this.renderStates[142] = 1;  // D3DRS_LOCALVIEWER        = TRUE
         this.renderStates[145] = 1;  // D3DRS_DIFFUSEMATERIALSOURCE  = D3DMCS_COLOR1
         this.renderStates[146] = 2;  // D3DRS_SPECULARMATERIALSOURCE = D3DMCS_COLOR2
@@ -127,6 +127,12 @@ export class D3D9StateTracker {
         // through its walls.
         this.renderStates[22] = 3;   // D3DRS_CULLMODE     = D3DCULL_CCW
         this.renderStates[25] = 8;   // D3DRS_ALPHAFUNC    = D3DCMP_ALWAYS
+        // Fog. FOGSTART/FOGEND/FOGDENSITY are floats bit-cast into the DWORD, and the FFP
+        // reads them raw — an unseeded FOGEND of 0.0f makes linear fog divide by (0 - start)
+        // and saturate the whole scene to the fog colour the moment a game enables fog
+        // without setting the range. FOGCOLOR / the two mode states default to 0 = NONE.
+        this.renderStates[37] = 0x3F800000; // D3DRS_FOGEND     = 1.0f
+        this.renderStates[38] = 0x3F800000; // D3DRS_FOGDENSITY = 1.0f
     }
 
     // Render state management

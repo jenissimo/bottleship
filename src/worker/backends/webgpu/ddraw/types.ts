@@ -16,6 +16,11 @@ export interface DebugFlags {
     forceDisableAlphaBlend: boolean;
     /** Force disable Z test */
     forceDisableZTest: boolean;
+    /** DIAG: keep the depth TEST but let no draw WRITE depth. Splits forceDisableZTest into
+     *  its two halves: geometry that reappears under this one is being rejected by depth a
+     *  DRAW wrote, while geometry still missing is rejected by the clear value or by its own
+     *  z, with no draw to blame. */
+    forceDisableZWrite: boolean;
     /** Force wireframe color mode */
     forceWireColor: boolean;
     /** Force Z = 0.5*w in clip space to isolate NDC/minZ/maxZ/projection issues */
@@ -34,14 +39,31 @@ export interface DebugFlags {
     disableContainedUvClamp: boolean;
     /** Texture converter debug mode: 0=normal, 1=show format (red=32bit, green=16bit, blue=8bit), 2=show read errors */
     textureConverterDebugMode: number;
-    /** Disable MegaBatch accumulation — every draw flushes as its own batch */
+    /** Disable the MegaBatch path entirely — legacy uniform slot AND no accumulation */
     disableMegaBatch: boolean;
+    /** DIAG: keep the MegaBatch shader/storage path but never ACCUMULATE — one draw per
+     *  batch. Splits `disableMegaBatch` into its two halves, so a picture that only comes
+     *  back under this one blames the grouping, and one that needs the full flag blames
+     *  the storage/shader path. */
+    disableMegaBatchAccumulate: boolean;
+    /** DIAG: skip the guest-memory content hash that detects texel writes a game made
+     *  through a cached lpSurface (see prepareStageTexture). Off = hashing on. */
+    disableCpuTextureHash: boolean;
+    /** DIAG: stop submitting mid-frame when a texture already sampled by recorded draws is
+     *  overwritten. On = the copy→draw→copy→draw pattern renders every draw with the LAST
+     *  upload. */
+    disableTextureOverwriteSubmit: boolean;
     /** DIAG: accumulate batches normally but DROP them at flush (render nothing) */
     skipMegaBatchDrawsRender: boolean;
     /** DIAG: with skipMegaBatchDrawsRender, drop only draws with indexCount >= this (0 = all) */
     skipMegaBatchMinIdx: number;
     /** Force the CPU vertex-conversion path for all draws, bypassing the GPU compute converter */
     forceCpuVertexPath: boolean;
+    /** DIAG: render only the first N+1 draws of every frame (-1 = off, render all).
+     *  The frame capture numbers draws in the same order, so bisecting this NAMES the draw
+     *  that first covers a region — the only way to find which draw wrote the depth (or the
+     *  pixels) that hides everything issued after it. */
+    drawScrubMax: number;
 }
 
 /**
@@ -52,6 +74,7 @@ export const DEFAULT_DEBUG_FLAGS: DebugFlags = {
     debugView: "normal",
     forceDisableAlphaBlend: false,
     forceDisableZTest: false,
+    forceDisableZWrite: false,
     forceWireColor: false,
     forceZMidpoint: false,
     forceCullNone: false,
@@ -62,9 +85,13 @@ export const DEFAULT_DEBUG_FLAGS: DebugFlags = {
     disableContainedUvClamp: false,
     textureConverterDebugMode: 0,
     disableMegaBatch: false,
+    disableMegaBatchAccumulate: false,
+    disableCpuTextureHash: false,
+    disableTextureOverwriteSubmit: false,
     skipMegaBatchDrawsRender: false,
     skipMegaBatchMinIdx: 0,
     forceCpuVertexPath: false,
+    drawScrubMax: -1,
 };
 
 /**
@@ -171,15 +198,33 @@ function finiteOr(value: number, fallback: number): number {
     return Number.isFinite(value) ? value : fallback;
 }
 
+export type SanitizedViewport = Viewport & { minZ: number; maxZ: number };
+
 /**
  * Clamp a D3D viewport to render-target bounds and WebGPU limits.
  * Rejects garbage dimensions (null pointer reads, unset fields, float bit patterns).
+ *
+ * Allocating wrapper for cold callers; per-draw paths use sanitizeViewportInto.
  */
 export function sanitizeViewport(
     viewport: Viewport,
     targetWidth: number,
     targetHeight: number,
-): Viewport & { minZ: number; maxZ: number } {
+): SanitizedViewport {
+    return sanitizeViewportInto({ x: 0, y: 0, width: 0, height: 0, minZ: 0, maxZ: 1 }, viewport, targetWidth, targetHeight);
+}
+
+/**
+ * As sanitizeViewport, but writes into a caller-owned struct so a per-draw call site
+ * allocates nothing (CLAUDE.md 3.1 zero-alloc hot paths). Every field of `viewport` is
+ * read before any field of `out` is written, so `out` may alias `viewport`.
+ */
+export function sanitizeViewportInto(
+    out: SanitizedViewport,
+    viewport: Viewport,
+    targetWidth: number,
+    targetHeight: number,
+): SanitizedViewport {
     const tw = Math.max(1, targetWidth | 0);
     const th = Math.max(1, targetHeight | 0);
     const maxDim = WEBGPU_MAX_VIEWPORT_DIM;
@@ -216,7 +261,13 @@ export function sanitizeViewport(
     x = Math.max(0, Math.min(x, Math.max(0, tw - 1)));
     y = Math.max(0, Math.min(y, Math.max(0, th - 1)));
 
-    return { x, y, width, height, minZ, maxZ };
+    out.x = x;
+    out.y = y;
+    out.width = width;
+    out.height = height;
+    out.minZ = minZ;
+    out.maxZ = maxZ;
+    return out;
 }
 
 /**
@@ -274,6 +325,10 @@ export interface PipelineKeyConfig {
     zFunc: number;
     zWrite: number;
     zBias: number; // D3DRENDERSTATE_ZBIAS (0-16) for z-fighting prevention
+    // The draw asked for EQUAL with depth writes off — a coplanar second pass. zFunc is
+    // rewritten to LESSEQUAL for it, so the request is not recoverable from the other
+    // fields, and it selects a depth bias: it must be part of the key.
+    coplanarPass: number;
     alphaBlend: number;
     alphaTest: number;
     srcBlend: number;
@@ -293,10 +348,28 @@ export interface PipelineKeyConfig {
     forceZMidpoint: boolean; // Affects shader: Z remap block
     forceCullNone: boolean;
     forceDisableZTest: boolean;
+    forceDisableZWrite: boolean;
     debugView: "normal" | "uv" | "vertexcolor" | "alpha" | "solid"; // Affects shader: output mode
     flatShading: boolean; // D3DSHADE_FLAT: flat @interpolate on color/specular varyings (affects shader)
     // NOTE: colorOp, alphaOp, lightingEnabled, fogMode, colorOp1, alphaOp1 are NOT in key
     // because they are handled via uniforms in universal shader, not shader code generation
+}
+
+/**
+ * A zeroed key config for use as reusable scratch. The field order matches the interface
+ * so a scratch filled field-by-field keeps the same hidden class as a fresh literal.
+ */
+export function makeEmptyPipelineKeyConfig(): PipelineKeyConfig {
+    return {
+        vertexType: 0, primitiveType: 0, sampledMask: 0, stageCount: 0, pointSampleMask: 0,
+        missingTexture: false, cullMode: 0, zEnable: 0, zFunc: 0, zWrite: 0, zBias: 0,
+        coplanarPass: 0,
+        alphaBlend: 0, alphaTest: 0, srcBlend: 0, dstBlend: 0, alphaFunc: 0, colorKeyEnabled: 0,
+        stencilEnable: 0, stencilFunc: 0, stencilFail: 0, stencilZFail: 0, stencilPass: 0,
+        stencilRef: 0, stencilMask: 0, stencilWriteMask: 0,
+        forceZMidpoint: false, forceCullNone: false, forceDisableZTest: false, forceDisableZWrite: false,
+        debugView: "normal", flatShading: false,
+    };
 }
 
 /**
@@ -315,6 +388,7 @@ export function generatePipelineKey(config: PipelineKeyConfig): string {
         `zf:${config.zFunc}`,
         `zw:${config.zWrite}`,
         `zb:${config.zBias}`,
+        `cop:${config.coplanarPass}`,
         `abl:${config.alphaBlend}`,
         `at:${config.alphaTest}`,
         `sb:${config.srcBlend}`,
@@ -332,6 +406,7 @@ export function generatePipelineKey(config: PipelineKeyConfig): string {
         `fzm:${config.forceZMidpoint ? 1 : 0}`,
         `fcn:${config.forceCullNone ? 1 : 0}`,
         `fzt:${config.forceDisableZTest ? 1 : 0}`,
+        `fzw:${config.forceDisableZWrite ? 1 : 0}`,
         `dv:${config.debugView}`,
         `flat:${config.flatShading ? 1 : 0}`,
     ].join("|");
@@ -355,6 +430,7 @@ export function generateMegaBatchPipelineKey(config: PipelineKeyConfig): string 
         `zf:${config.zFunc}`,
         `zw:${config.zWrite}`,
         `zb:${config.zBias}`,
+        `cop:${config.coplanarPass}`,
         `abl:${config.alphaBlend}`,
         // NOTE: alphaTest (at) and alphaFunc (af) are EXCLUDED - they're dynamic uniforms now
         `sb:${config.srcBlend}`,
@@ -371,6 +447,7 @@ export function generateMegaBatchPipelineKey(config: PipelineKeyConfig): string 
         `fzm:${config.forceZMidpoint ? 1 : 0}`,
         `fcn:${config.forceCullNone ? 1 : 0}`,
         `fzt:${config.forceDisableZTest ? 1 : 0}`,
+        `fzw:${config.forceDisableZWrite ? 1 : 0}`,
         `dv:${config.debugView}`,
         `flat:${config.flatShading ? 1 : 0}`,
     ].join("|");
@@ -392,6 +469,7 @@ export function pipelineKeyConfigsEqual(a: PipelineKeyConfig, b: PipelineKeyConf
         a.zFunc === b.zFunc &&
         a.zWrite === b.zWrite &&
         a.zBias === b.zBias &&
+        a.coplanarPass === b.coplanarPass &&
         a.alphaBlend === b.alphaBlend &&
         a.alphaTest === b.alphaTest &&
         a.srcBlend === b.srcBlend &&
@@ -409,6 +487,7 @@ export function pipelineKeyConfigsEqual(a: PipelineKeyConfig, b: PipelineKeyConf
         a.forceZMidpoint === b.forceZMidpoint &&
         a.forceCullNone === b.forceCullNone &&
         a.forceDisableZTest === b.forceDisableZTest &&
+        a.forceDisableZWrite === b.forceDisableZWrite &&
         a.debugView === b.debugView &&
         a.flatShading === b.flatShading;
 }
@@ -428,6 +507,7 @@ export function megaBatchPipelineKeyConfigsEqual(a: PipelineKeyConfig, b: Pipeli
         a.zFunc === b.zFunc &&
         a.zWrite === b.zWrite &&
         a.zBias === b.zBias &&
+        a.coplanarPass === b.coplanarPass &&
         a.alphaBlend === b.alphaBlend &&
         a.srcBlend === b.srcBlend &&
         a.dstBlend === b.dstBlend &&
@@ -443,6 +523,7 @@ export function megaBatchPipelineKeyConfigsEqual(a: PipelineKeyConfig, b: Pipeli
         a.forceZMidpoint === b.forceZMidpoint &&
         a.forceCullNone === b.forceCullNone &&
         a.forceDisableZTest === b.forceDisableZTest &&
+        a.forceDisableZWrite === b.forceDisableZWrite &&
         a.debugView === b.debugView &&
         a.flatShading === b.flatShading;
 }

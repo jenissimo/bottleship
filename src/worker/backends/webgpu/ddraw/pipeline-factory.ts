@@ -58,7 +58,8 @@ import {
     D3DTFN_POINT,
     D3DTFG_POINT,
 } from "../../../modules/ddraw/constants";
-import { DebugFlags, generatePipelineKey, generateMegaBatchPipelineKey, PipelineKeyConfig, pipelineKeyConfigsEqual, megaBatchPipelineKeyConfigsEqual } from "./types";
+import { DebugFlags, generatePipelineKey, generateMegaBatchPipelineKey, PipelineKeyConfig, makeEmptyPipelineKeyConfig,
+    pipelineKeyConfigsEqual, megaBatchPipelineKeyConfigsEqual } from "./types";
 import { ShaderGenerator, ShaderConfig } from "./shader-generator";
 import { BindGroupManager } from "./bind-group-manager";
 import { DirectDrawSurfaceState } from "../../../modules/ddraw/com-objects";
@@ -193,6 +194,26 @@ export class PipelineFactory {
     private pipelineCache = new Map<string, GPURenderPipeline>();
 
     // Last-config fast path: avoids string allocation + Map lookup on consecutive same-state draws.
+    // Double-buffered key scratch: the fast path RETAINS the previous config by reference,
+    // so a single reusable object would alias `last` and make every comparison trivially
+    // equal — returning the previous pipeline for a changed state. Flipping only on a miss
+    // (the only moment `last` is reassigned) keeps write target and `last` distinct.
+    private readonly getPipelineKeyScratch: [PipelineKeyConfig, PipelineKeyConfig] =
+        [makeEmptyPipelineKeyConfig(), makeEmptyPipelineKeyConfig()];
+    private getPipelineKeyIdx = 0;
+    private readonly megaBatchKeyScratch: [PipelineKeyConfig, PipelineKeyConfig] =
+        [makeEmptyPipelineKeyConfig(), makeEmptyPipelineKeyConfig()];
+    private megaBatchKeyIdx = 0;
+    /** Cached ddraw module for the frame counters — a registry lookup per draw is not free. */
+    private cachedDDrawModule: any = null;
+    private cachedDDrawModuleResolved = false;
+    private ddrawModule(): any {
+        if (!this.cachedDDrawModuleResolved) {
+            this.cachedDDrawModuleResolved = true;
+            this.cachedDDrawModule = System.getInstance().process?.getModule("ddraw");
+        }
+        return this.cachedDDrawModule;
+    }
     private lastGetPipelineConfig: PipelineKeyConfig | null = null;
     private lastGetPipelinePipeline: GPURenderPipeline | null = null;
 
@@ -320,7 +341,15 @@ export class PipelineFactory {
         const effectiveAlphaBlend = alphaBlend ? 1 : 0;
         const effectiveSrcBlend = effectiveAlphaBlend ? (srcBlend || 2) : 0;
         const effectiveDstBlend = effectiveAlphaBlend ? (dstBlend || 1) : 0;
-        const effectiveZFunc = zEnable ? (zFunc || D3DCMP_LESSEQUAL) : 0;
+        // EQUAL + depth-writes-off is a coplanar overlay pass (decal / detail / lightmap). It
+        // relies on both passes interpolating identical depth, which differing triangulation
+        // breaks into a crawling dither. LESSEQUAL asks the same question robustly — nearer
+        // geometry still occludes it. NOTE: a divergence from real D3D (Wine and DXVK map
+        // D3DCMP_EQUAL straight through); confined to depth-write-off passes so anything using
+        // EQUAL while AUTHORING depth keeps exact semantics.
+        const zFuncCoplanar = (zFunc === D3DCMP_EQUAL && !zWrite) ? D3DCMP_LESSEQUAL : zFunc;
+        const coplanarPass = (zEnable && zFunc === D3DCMP_EQUAL && !zWrite) ? 1 : 0;
+        const effectiveZFunc = zEnable ? (zFuncCoplanar || D3DCMP_LESSEQUAL) : 0;
         const effectiveZWrite = zEnable ? (zWrite ? 1 : 0) : 0;
         const keyAlphaBlend = (effectiveAlphaBlend && !this.debugFlags.forceDisableAlphaBlend) ? 1 : 0;
         
@@ -337,42 +366,48 @@ export class PipelineFactory {
         }
         // (No RHW CW<->CCW swap: XYZRHW is culled identically to non-RHW — the old swap
         // inverted culling for pre-transformed geometry. See the cull-mode build below.)
-        const keyConfig: PipelineKeyConfig = {
-            vertexType,
-            primitiveType,
-            sampledMask: stages.sampledMask,
-            stageCount: stages.stageCount,
-            pointSampleMask,
-            missingTexture,
-            cullMode: effectiveCullMode,
-            zEnable,
-            zFunc: effectiveZFunc,
-            zWrite: effectiveZWrite,
-            zBias: zEnable ? zBias : 0, // Only include zBias when depth testing is enabled
-            alphaBlend: keyAlphaBlend,
-            alphaTest,
-            srcBlend: effectiveSrcBlend,
-            dstBlend: effectiveDstBlend,
-            alphaFunc,
-            colorKeyEnabled: colorKeyEnabled > 0 ? 1 : 0,
-            stencilEnable: stencilEnable > 0 ? 1 : 0,
-            stencilFunc: stencilEnable > 0 ? stencilFunc : 0,
-            stencilFail: stencilEnable > 0 ? stencilFail : 0,
-            stencilZFail: stencilEnable > 0 ? stencilZFail : 0,
-            stencilPass: stencilEnable > 0 ? stencilPass : 0,
-            stencilRef,
-            stencilMask,
-            stencilWriteMask,
-            forceZMidpoint: this.debugFlags.forceZMidpoint,
-            forceCullNone: this.debugFlags.forceCullNone,
-            forceDisableZTest: this.debugFlags.forceDisableZTest,
-            debugView: this.debugFlags.debugView,
-            flatShading: renderStates[D3DRENDERSTATE_SHADEMODE] === D3DSHADE_FLAT,
-        };
+        const keyConfig = this.getPipelineKeyScratch[this.getPipelineKeyIdx];
+        keyConfig.vertexType = vertexType;
+        keyConfig.primitiveType = primitiveType;
+        keyConfig.sampledMask = stages.sampledMask;
+        keyConfig.stageCount = stages.stageCount;
+        keyConfig.pointSampleMask = pointSampleMask;
+        keyConfig.missingTexture = missingTexture;
+        keyConfig.cullMode = effectiveCullMode;
+        keyConfig.zEnable = zEnable;
+        keyConfig.zFunc = effectiveZFunc;
+        keyConfig.zWrite = effectiveZWrite;
+        keyConfig.zBias = zEnable ? zBias : 0; // Only include zBias when depth testing is enabled
+        keyConfig.coplanarPass = coplanarPass;
+        keyConfig.alphaBlend = keyAlphaBlend;
+        keyConfig.alphaTest = alphaTest;
+        keyConfig.srcBlend = effectiveSrcBlend;
+        keyConfig.dstBlend = effectiveDstBlend;
+        keyConfig.alphaFunc = alphaFunc;
+        keyConfig.colorKeyEnabled = colorKeyEnabled > 0 ? 1 : 0;
+        keyConfig.stencilEnable = stencilEnable > 0 ? 1 : 0;
+        keyConfig.stencilFunc = stencilEnable > 0 ? stencilFunc : 0;
+        keyConfig.stencilFail = stencilEnable > 0 ? stencilFail : 0;
+        keyConfig.stencilZFail = stencilEnable > 0 ? stencilZFail : 0;
+        keyConfig.stencilPass = stencilEnable > 0 ? stencilPass : 0;
+        keyConfig.stencilRef = stencilRef;
+        keyConfig.stencilMask = stencilMask;
+        keyConfig.stencilWriteMask = stencilWriteMask;
+        keyConfig.forceZMidpoint = this.debugFlags.forceZMidpoint;
+        keyConfig.forceCullNone = this.debugFlags.forceCullNone;
+        keyConfig.forceDisableZTest = this.debugFlags.forceDisableZTest;
+        keyConfig.forceDisableZWrite = this.debugFlags.forceDisableZWrite;
+        keyConfig.debugView = this.debugFlags.debugView;
+        keyConfig.flatShading = renderStates[D3DRENDERSTATE_SHADEMODE] === D3DSHADE_FLAT;
 
         // Fast path: same config as last call → return cached pipeline without string alloc
+        // `keyConfig !== last` is a safety interlock, not an optimisation: should the scratch
+        // ever alias the retained config, every comparison would be trivially equal and this
+        // would hand back the previous pipeline for a changed state. Requiring distinct objects
+        // degrades to the (correct) cache lookup instead of rendering with the wrong pipeline.
         if (this.lastGetPipelineConfig !== null &&
             this.lastGetPipelinePipeline !== null &&
+            keyConfig !== this.lastGetPipelineConfig &&
             pipelineKeyConfigsEqual(keyConfig, this.lastGetPipelineConfig)) {
             return this.lastGetPipelinePipeline;
         }
@@ -384,8 +419,7 @@ export class PipelineFactory {
         // Check cache
         let pipeline = this.pipelineCache.get(key);
 
-        const system = System.getInstance();
-        const ddraw = system.process?.getModule("ddraw") as any;
+        const ddraw = this.ddrawModule();
 
         if (pipeline) {
             if (ddraw?.incrementFrameCounter) {
@@ -393,6 +427,7 @@ export class PipelineFactory {
             }
             this.lastGetPipelineConfig = keyConfig;
             this.lastGetPipelinePipeline = pipeline;
+            this.getPipelineKeyIdx ^= 1;
             return pipeline;
         }
 
@@ -412,9 +447,10 @@ export class PipelineFactory {
             missingTexture,
             d3dCull,
             zEnable,
-            zFunc,
+            effectiveZFunc,
             zWrite,
             zBias,
+            coplanarPass,
             effectiveAlphaBlend, // Use normalized value
             alphaTest,
             srcBlend,
@@ -436,6 +472,7 @@ export class PipelineFactory {
         this.pipelineCache.set(key, pipeline);
         this.lastGetPipelineConfig = keyConfig;
         this.lastGetPipelinePipeline = pipeline;
+        this.getPipelineKeyIdx ^= 1;
         Logger.verbose(LogCategory.SYSTEM, `PipelineFactory: Created new pipeline with key: ${key}`);
         return pipeline;
     }
@@ -483,7 +520,15 @@ export class PipelineFactory {
         const effectiveAlphaBlend = alphaBlend ? 1 : 0;
         const effectiveSrcBlend = effectiveAlphaBlend ? (srcBlend || 2) : 0;
         const effectiveDstBlend = effectiveAlphaBlend ? (dstBlend || 1) : 0;
-        const effectiveZFunc = zEnable ? (zFunc || D3DCMP_LESSEQUAL) : 0;
+        // EQUAL + depth-writes-off is a coplanar overlay pass (decal / detail / lightmap). It
+        // relies on both passes interpolating identical depth, which differing triangulation
+        // breaks into a crawling dither. LESSEQUAL asks the same question robustly — nearer
+        // geometry still occludes it. NOTE: a divergence from real D3D (Wine and DXVK map
+        // D3DCMP_EQUAL straight through); confined to depth-write-off passes so anything using
+        // EQUAL while AUTHORING depth keeps exact semantics.
+        const zFuncCoplanar = (zFunc === D3DCMP_EQUAL && !zWrite) ? D3DCMP_LESSEQUAL : zFunc;
+        const coplanarPass = (zEnable && zFunc === D3DCMP_EQUAL && !zWrite) ? 1 : 0;
+        const effectiveZFunc = zEnable ? (zFuncCoplanar || D3DCMP_LESSEQUAL) : 0;
         const effectiveZWrite = zEnable ? (zWrite ? 1 : 0) : 0;
         const keyAlphaBlend = (effectiveAlphaBlend && !this.debugFlags.forceDisableAlphaBlend) ? 1 : 0;
 
@@ -500,42 +545,45 @@ export class PipelineFactory {
         // inverted culling for pre-transformed geometry. See the cull-mode build below.)
 
         // Generate cache key with "mb_" prefix for MegaBatch
-        const keyConfig: PipelineKeyConfig = {
-            vertexType,
-            primitiveType,
-            sampledMask: stages.sampledMask,
-            stageCount: stages.stageCount,
-            pointSampleMask,
-            missingTexture,
-            cullMode: effectiveCullMode,
-            zEnable,
-            zFunc: effectiveZFunc,
-            zWrite: effectiveZWrite,
-            zBias: zEnable ? zBias : 0,
-            alphaBlend: keyAlphaBlend,
-            alphaTest,
-            srcBlend: effectiveSrcBlend,
-            dstBlend: effectiveDstBlend,
-            alphaFunc,
-            colorKeyEnabled: colorKeyEnabled > 0 ? 1 : 0,
-            stencilEnable: stencilEnable > 0 ? 1 : 0,
-            stencilFunc: stencilEnable > 0 ? stencilFunc : 0,
-            stencilFail: stencilEnable > 0 ? stencilFail : 0,
-            stencilZFail: stencilEnable > 0 ? stencilZFail : 0,
-            stencilPass: stencilEnable > 0 ? stencilPass : 0,
-            stencilRef,
-            stencilMask,
-            stencilWriteMask,
-            forceZMidpoint: this.debugFlags.forceZMidpoint,
-            forceCullNone: this.debugFlags.forceCullNone,
-            forceDisableZTest: this.debugFlags.forceDisableZTest,
-            debugView: this.debugFlags.debugView,
-            flatShading: renderStates[D3DRENDERSTATE_SHADEMODE] === D3DSHADE_FLAT,
-        };
+        const keyConfig = this.megaBatchKeyScratch[this.megaBatchKeyIdx];
+        keyConfig.vertexType = vertexType;
+        keyConfig.primitiveType = primitiveType;
+        keyConfig.sampledMask = stages.sampledMask;
+        keyConfig.stageCount = stages.stageCount;
+        keyConfig.pointSampleMask = pointSampleMask;
+        keyConfig.missingTexture = missingTexture;
+        keyConfig.cullMode = effectiveCullMode;
+        keyConfig.zEnable = zEnable;
+        keyConfig.zFunc = effectiveZFunc;
+        keyConfig.zWrite = effectiveZWrite;
+        keyConfig.zBias = zEnable ? zBias : 0;
+        keyConfig.coplanarPass = coplanarPass;
+        keyConfig.alphaBlend = keyAlphaBlend;
+        keyConfig.alphaTest = alphaTest;
+        keyConfig.srcBlend = effectiveSrcBlend;
+        keyConfig.dstBlend = effectiveDstBlend;
+        keyConfig.alphaFunc = alphaFunc;
+        keyConfig.colorKeyEnabled = colorKeyEnabled > 0 ? 1 : 0;
+        keyConfig.stencilEnable = stencilEnable > 0 ? 1 : 0;
+        keyConfig.stencilFunc = stencilEnable > 0 ? stencilFunc : 0;
+        keyConfig.stencilFail = stencilEnable > 0 ? stencilFail : 0;
+        keyConfig.stencilZFail = stencilEnable > 0 ? stencilZFail : 0;
+        keyConfig.stencilPass = stencilEnable > 0 ? stencilPass : 0;
+        keyConfig.stencilRef = stencilRef;
+        keyConfig.stencilMask = stencilMask;
+        keyConfig.stencilWriteMask = stencilWriteMask;
+        keyConfig.forceZMidpoint = this.debugFlags.forceZMidpoint;
+        keyConfig.forceCullNone = this.debugFlags.forceCullNone;
+        keyConfig.forceDisableZTest = this.debugFlags.forceDisableZTest;
+        keyConfig.forceDisableZWrite = this.debugFlags.forceDisableZWrite;
+        keyConfig.debugView = this.debugFlags.debugView;
+        keyConfig.flatShading = renderStates[D3DRENDERSTATE_SHADEMODE] === D3DSHADE_FLAT;
 
         // Fast path: same config as last call → return cached pipeline without string alloc
+        // Distinct-object interlock — see getOrCreatePipeline.
         if (this.lastMegaBatchConfig !== null &&
             this.lastMegaBatchPipeline !== null &&
+            keyConfig !== this.lastMegaBatchConfig &&
             megaBatchPipelineKeyConfigsEqual(keyConfig, this.lastMegaBatchConfig)) {
             return this.lastMegaBatchPipeline;
         }
@@ -549,6 +597,7 @@ export class PipelineFactory {
         if (pipeline) {
             this.lastMegaBatchConfig = keyConfig;
             this.lastMegaBatchPipeline = pipeline;
+            this.megaBatchKeyIdx ^= 1;
             return pipeline;
         }
 
@@ -564,9 +613,10 @@ export class PipelineFactory {
             missingTexture,
             d3dCull,
             zEnable,
-            zFunc,
+            effectiveZFunc,
             zWrite,
             zBias,
+            coplanarPass,
             effectiveAlphaBlend,
             alphaTest,
             srcBlend,
@@ -588,6 +638,7 @@ export class PipelineFactory {
         this.megaBatchPipelineCache.set(key, pipeline);
         this.lastMegaBatchConfig = keyConfig;
         this.lastMegaBatchPipeline = pipeline;
+        this.megaBatchKeyIdx ^= 1;
         Logger.verbose(LogCategory.SYSTEM, `PipelineFactory: Created MegaBatch pipeline with key: ${key}`);
         return pipeline;
     }
@@ -604,6 +655,7 @@ export class PipelineFactory {
         zFunc: number,
         zWrite: number,
         zBias: number,
+        coplanarPass: number,
         effectiveAlphaBlend: number,
         alphaTest: number,
         srcBlend: number,
@@ -742,13 +794,19 @@ export class PipelineFactory {
             },
             depthStencil: {
                 format: "depth24plus-stencil8",
-                depthWriteEnabled: (zEnable !== 0 && !this.debugFlags.forceDisableZTest) && (zWrite !== 0),
+                depthWriteEnabled: (zEnable !== 0 && !this.debugFlags.forceDisableZTest && !this.debugFlags.forceDisableZWrite) && (zWrite !== 0),
                 depthCompare:
                     (zEnable !== 0 && !this.debugFlags.forceDisableZTest)
                         ? mapDepthCompareFunction(zFunc)
                         : "always",
-                depthBias: (zEnable !== 0 && zBias > 0) ? -zBias * 4 : 0,
-                depthBiasSlopeScale: (zEnable !== 0 && zBias > 0) ? -1.0 : 0,
+                // Coplanar overlay pass (see effectiveZFunc): nudge it toward the camera so it
+                // survives the depth compare. The SLOPE term carries grazing-angle surfaces,
+                // where dz/dx across a pixel dwarfs any constant. Keyed on coplanarPass, never
+                // on writes-off alone — every blended particle and HUD quad is writes-off, and
+                // biasing those would pull them through geometry that occludes them. A
+                // game-supplied ZBIAS still wins.
+                depthBias: (zEnable !== 0 && zBias > 0) ? -zBias * 4 : (coplanarPass !== 0 ? -1 : 0),
+                depthBiasSlopeScale: (zEnable !== 0 && zBias > 0) || coplanarPass !== 0 ? -1.0 : 0,
                 depthBiasClamp: 0,
                 stencilFront: stencilEnable !== 0 ? {
                     compare: mapDepthCompareFunction(stencilFunc),
@@ -780,6 +838,7 @@ export class PipelineFactory {
         zFunc: number,
         zWrite: number,
         zBias: number, // D3DRENDERSTATE_ZBIAS (0-16) for z-fighting prevention
+        coplanarPass: number, // draw asked for EQUAL with depth writes off
         effectiveAlphaBlend: number, // Already normalized (0 or 1)
         alphaTest: number,
         srcBlend: number,
@@ -936,7 +995,7 @@ export class PipelineFactory {
             depthStencil: {
                 format: "depth24plus-stencil8",
                 // Enable depth test/write for both XYZ and XYZRHW when app sets Z (RHW vertices pass depth 0..1 in pos.z)
-                depthWriteEnabled: (zEnable !== 0 && !this.debugFlags.forceDisableZTest) && (zWrite !== 0),
+                depthWriteEnabled: (zEnable !== 0 && !this.debugFlags.forceDisableZTest && !this.debugFlags.forceDisableZWrite) && (zWrite !== 0),
                 depthCompare:
                     (zEnable !== 0 && !this.debugFlags.forceDisableZTest)
                         ? mapDepthCompareFunction(zFunc)
@@ -945,8 +1004,14 @@ export class PipelineFactory {
                 // Negative depthBias pushes geometry toward camera (smaller Z values)
                 // D3D ZBIAS is integer 0-16; we scale it appropriately for 24-bit depth buffer
                 // Each unit of D3D ZBIAS approximately corresponds to 1/65536 of depth range
-                depthBias: (zEnable !== 0 && zBias > 0) ? -zBias * 4 : 0,
-                depthBiasSlopeScale: (zEnable !== 0 && zBias > 0) ? -1.0 : 0,
+                // Coplanar overlay pass (see effectiveZFunc): nudge it toward the camera so it
+                // survives the depth compare. The SLOPE term carries grazing-angle surfaces,
+                // where dz/dx across a pixel dwarfs any constant. Keyed on coplanarPass, never
+                // on writes-off alone — every blended particle and HUD quad is writes-off, and
+                // biasing those would pull them through geometry that occludes them. A
+                // game-supplied ZBIAS still wins.
+                depthBias: (zEnable !== 0 && zBias > 0) ? -zBias * 4 : (coplanarPass !== 0 ? -1 : 0),
+                depthBiasSlopeScale: (zEnable !== 0 && zBias > 0) || coplanarPass !== 0 ? -1.0 : 0,
                 depthBiasClamp: 0,
                 stencilFront: stencilEnable !== 0 ? {
                     compare: mapDepthCompareFunction(stencilFunc),

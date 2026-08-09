@@ -46,7 +46,7 @@ import {
 } from "./constants";
 import { readRect, type Rect } from "./helpers";
 import { absToRel } from "./helpers";
-import { copySurfaceRegion, copySurfaceRegionWithColorKey, copySurfaceRegionWithRop, buildFullRect } from "./surface-helpers";
+import { copySurfaceRegion, copySurfaceRegionWithColorKey, copySurfaceRegionWithRop, copyCompressedSurfaceRegion, buildFullRect } from "./surface-helpers";
 import { RectPool } from "./rect-pool";
 import { DirectDrawSurfaceObject, isBitmapTexture, isRenderSurface } from "./com-objects";
 import { convertRGBAToSurface, createGPUTexture, uploadToGPUTexture } from "./gpu-texture-utils";
@@ -939,7 +939,11 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
                 `IDirectDrawSurface7_Blt: Using CPU DEFAULT PATH (src mode=${srcModeStr} dst mode=${dstModeStr} ` +
                 `useColorKey=${useColorKey} isStretch=${isStretch})`);
 
-            if (rop3 !== undefined) {
+            if (copyCompressedSurfaceRegion(mem, srcState, dstState, effSrcRect, effDstRect,
+                                            useColorKey ? colorKey : undefined)) {
+                // Block-compressed source — decompressed on the way in. A ROP against block
+                // storage is meaningless, so it is deliberately not honoured here.
+            } else if (rop3 !== undefined) {
                 copySurfaceRegionWithRop(mem, srcState, dstState, effSrcRect, effDstRect, rop3);
             } else if (useColorKey && colorKey) {
                 copySurfaceRegionWithColorKey(mem, srcState, dstState, effSrcRect, effDstRect, colorKey);

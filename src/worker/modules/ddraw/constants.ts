@@ -749,6 +749,20 @@ export const D3DLIGHT7_OFFSETS = {
     phi: 100,           // float - spot outer cone angle (radians)
 };
 
+// D3DVIEWPORT7 structure (24 bytes total).
+// Unlike D3DVIEWPORT and D3DVIEWPORT2 it has NO leading dwSize member — it starts at dwX
+// (d3dtypes.h). Reading one as if it did shifts every field by a DWORD and yields a 0x0
+// viewport for the common x=0 case.
+export const D3DVIEWPORT7_SIZE = 24;
+export const D3DVIEWPORT7_OFFSETS = {
+    x: 0,       // dwX (DWORD)
+    y: 4,       // dwY (DWORD)
+    width: 8,   // dwWidth (DWORD)
+    height: 12, // dwHeight (DWORD)
+    minZ: 16,   // dvMinZ (float)
+    maxZ: 20,   // dvMaxZ (float)
+};
+
 // D3D7 supports up to 8 hardware lights (typically)
 export const D3D_MAX_LIGHTS = 8;
 

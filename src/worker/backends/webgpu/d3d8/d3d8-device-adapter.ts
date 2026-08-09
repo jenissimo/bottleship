@@ -15,6 +15,7 @@ import type { RenderActive } from '../../../runtime/runtime-services';
 import { createRenderTarget } from '../shared/surface-factory';
 import { decodeD3DTextureToRgba8, getD3DTextureLayout, D3DFMT_P8, D3DFMT_A8P8 } from '../shared/texture-formats';
 import { TexturePaletteStore } from '../shared/texture-palette-store';
+import { D3DTEXF_NONE, D3DTEXF_POINT } from './d3d8-sampler';
 import { Logger, LogCategory } from '../../../core/logger';
 import * as frameCapture from '../../../modules/ddraw/frame-capture';
 import { System } from '../../../core/system';
@@ -70,9 +71,6 @@ import {
     D3DFILL_SOLID,
     D3DFOG_NONE,
     D3DSHADE_GOURAUD,
-    D3DTFG_POINT,
-    D3DTFN_POINT,
-    D3DTFP_NONE,
     D3DTOP_DISABLE,
     D3DTOP_MODULATE,
     D3DTOP_SELECTARG1,
@@ -127,7 +125,7 @@ import {
     refreshD3D8CapturedEntries,
 } from './d3d8-state-block';
 import { declToSyntheticFvf, DeclStreamCopy } from './decl-to-ffp';
-import type { StreamVertexBinding } from '../d3d9/d3d9-command-recorder';
+import { collectExtraStreamBindings, type StreamVertexBinding } from '../shared/vertex-streams';
 
 // D3D transform types
 const D3DTS_VIEW       = 2;
@@ -525,9 +523,9 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             this.textureStates[offset + D3DTSS_ADDRESSU] = D3DTADDRESS_WRAP;
             this.textureStates[offset + D3DTSS_ADDRESSV] = D3DTADDRESS_WRAP;
             this.textureStates[offset + D3DTSS_TEXCOORDINDEX] = stage;
-            this.textureStates[offset + D3DTSS_MINFILTER] = D3DTFN_POINT;
-            this.textureStates[offset + D3DTSS_MAGFILTER] = D3DTFG_POINT;
-            this.textureStates[offset + D3DTSS_MIPFILTER] = D3DTFP_NONE;
+            this.textureStates[offset + D3DTSS_MINFILTER] = D3DTEXF_POINT;
+            this.textureStates[offset + D3DTSS_MAGFILTER] = D3DTEXF_POINT;
+            this.textureStates[offset + D3DTSS_MIPFILTER] = D3DTEXF_NONE;
             if (stage > 0) {
                 this.textureStates[offset + D3DTSS_COLOROP] = D3DTOP_DISABLE;
                 this.textureStates[offset + D3DTSS_ALPHAOP] = D3DTOP_DISABLE;
@@ -680,6 +678,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             palette: pal,
         });
         bmp.gpuNeedsUpload = true;
+        bmp.contentVersion = (bmp.contentVersion ?? 0) + 1;
     }
 
     // NOTE (perf): setPixelShader/setVertexShader/setFVF must NOT invalidate the programmable
@@ -1304,37 +1303,27 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         vertexCount: number,
         mem: Uint8Array,
     ): StreamVertexBinding[] | null {
-        let maxStream = 0;
-        for (const e of vsObj.decl) if (e.stream > maxStream) maxStream = e.stream;
-        if (maxStream === 0) return [];
-
-        const extras: StreamVertexBinding[] = [];
-        for (let s = 1; s <= maxStream; s++) {
-            if (!vsObj.decl.some(e => e.stream === s)) continue;
+        const { bindings, missing } = collectExtraStreamBindings(vsObj.decl, (s) => {
             const src = this.streamSources[s];
             const vb = this.vbData.get(src.vb);
-            if (!vb) {
-                Logger.warn(LogCategory.SYSTEM, `D3D8 draw: decl references stream ${s} but no VB bound`);
-                return null;
-            }
+            if (!vb) return null;
             const stride = src.stride > 0 ? src.stride : (vsObj.streamStrides[s] ?? 0);
-            if (stride <= 0) {
-                Logger.warn(LogCategory.SYSTEM, `D3D8 draw: stream ${s} has no resolvable stride`);
-                return null;
-            }
-            const offset = firstVertex * stride;
-            if (offset < 0 || offset + vertexCount * stride > vb.size) {
-                Logger.warn(
-                    LogCategory.SYSTEM,
-                    `D3D8 draw: stream ${s} range out of bounds first=${firstVertex} count=${vertexCount} stride=${stride} size=${vb.size}`
-                );
-                return null;
-            }
+            if (stride <= 0) return null;
+            if (firstVertex * stride + vertexCount * stride > vb.size) return null;
             const gpu = this.uploadVb(src.vb, vb.guestPtr, vb.size, mem);
             if (!gpu) return null;
-            extras.push({ slot: s, buffer: gpu, offset, size: vb.size - offset });
+            return { buffer: gpu, offset: 0, size: vb.size, stride };
+        }, firstVertex);
+
+        // D3D8's programmable path indexes streams through a shader-declared register map, so
+        // an unresolvable stream leaves a register with no source at all: abort rather than
+        // feed the shader something arbitrary. (D3D9's FFP path substitutes an empty binding
+        // instead — see D3D9Device.collectFfpExtraStreams.)
+        if (missing.length > 0) {
+            Logger.warn(LogCategory.SYSTEM, `D3D8 draw: decl references unbound/unsized stream(s) ${missing.join(",")}`);
+            return null;
         }
-        return extras;
+        return bindings;
     }
 
     /** Interleave vertices [firstVertex, firstVertex+vertexCount) of every stream the
@@ -1351,7 +1340,10 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         const plan = this.declInterleave!;
         const dstStride = this.syntheticDeclStride;
         const vertexBytes = vertexCount * dstStride;
-        const total = vertexBytes + extraBytes;
+        // The scratch stands in for a guest memory view downstream, and the vertex converter
+        // takes whole-buffer u32/f32 views over it — so its LENGTH must be word-aligned, which
+        // the appended index block (16-bit indices, odd count) otherwise breaks.
+        const total = (vertexBytes + extraBytes + 3) & ~3;
         if (this.declScratch.length < total) {
             this.declScratch = new Uint8Array(Math.max(total, this.declScratch.length * 2, 4096));
         }

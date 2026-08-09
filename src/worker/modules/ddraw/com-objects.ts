@@ -222,6 +222,15 @@ export interface BaseSurfaceState {
      *  mip level, wrapper object) through it, so dropping it silently corrupts
      *  whatever they read back. Freed with the surface. */
     privateData?: Map<string, PrivateDataEntry>;
+
+    /** Executor bookkeeping for the copy→draw→copy→draw hazard: the encoderEpoch of the
+     *  command buffer that last recorded a draw sampling this surface, and the content
+     *  version those draws were recorded against. A guest that rewrites a texture between
+     *  draws would otherwise have every draw in the buffer sample the LAST upload, because
+     *  queue.writeTexture runs ahead of the single submit. See
+     *  DDrawWebGPUExecutor.encoderEpoch / prepareStageTexture. */
+    sampledEncoderEpoch?: number;
+    sampledContentVersion?: number;
 }
 
 /** One SetPrivateData entry: either a byte blob or a (ref-counted) IUnknown pointer. */
@@ -256,6 +265,14 @@ export interface BitmapTextureSurface extends BaseSurfaceState {
 
     /** Simple upload flag - true if GPU texture needs upload from rgbaScratch. */
     gpuNeedsUpload: boolean;
+
+    /** Bumped every time the guest rewrites this texture's pixels (CopyRects, Unlock,
+     *  UpdateTexture). One GPU texture backs all draws that sample this surface, so a
+     *  batch spanning a content change would render every draw with the LAST upload —
+     *  the draw batcher compares this to break the batch, exactly as it does with a
+     *  render surface's `version`. A game using one texture as a scratch tile buffer
+     *  (copy tile → draw quad → copy next tile → draw) depends on it. */
+    contentVersion?: number;
 
     /** D3D8/D3D9 format enum/FourCC used to decode guest texture memory. */
     d3dFormat?: number;

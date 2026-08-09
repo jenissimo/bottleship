@@ -211,8 +211,12 @@ function generateVertexConverterShader(config: VertexFormatConfig): string {
     // rhw = 1/w, so w = 1/rhw (avoid division by zero)
     // NOTE: We must multiply X,Y,Z by w for clip-space (WebGPU does perspective division: clip/w -> NDC)
     // This preserves perspective-correct interpolation for textures/colors.
-    // D3D clamps Z to [0,1] for pre-transformed (XYZRHW) vertices.
-    // Without clamping, out-of-range Z (e.g. 300.0) causes WebGPU to clip the triangle.
+    // Z is passed through, NOT clamped. D3D CLIPS a pre-transformed primitive against the
+    // viewport's z range; it does not pin each vertex into [0,1]. Clamping keeps a polygon
+    // that lies beyond the far plane and pastes it flat at z=1, and it deforms one that
+    // straddles the plane — the far vertices move while the near ones do not — so the face
+    // pokes through whatever should occlude it along a straight polygon edge. Letting the
+    // value through hands the primitive to WebGPU's depth clipping, which is D3D's behaviour.
     let w = select(1.0, 1.0 / rhw, rhw != 0.0);
     // Half-pixel convention shift: legacy D3D (DX7-DX9) puts pixel centers at INTEGER
     // screen coordinates; WebGPU puts them at half-integers. +0.5 maps D3D pixel
@@ -221,12 +225,20 @@ function generateVertexConverterShader(config: VertexFormatConfig): string {
     // "Directly Mapping Texels to Pixels" (e.g. FMV tile quads) otherwise
     // shift by one pixel: boundary pixels flip to the next tile and sample u=0,
     // where WRAP+LINEAR blends in the tile's opposite edge (visible tile seams).
-    let posX_ndc = ((posX + 0.5) / params.viewportWidth) * 2.0 - 1.0;
-    let posY_ndc = 1.0 - ((posY + 0.5) / params.viewportHeight) * 2.0;
+    // Relative to the viewport ORIGIN, not the render target's. A pre-transformed vertex
+    // carries render-target screen coordinates, and D3D maps them into the viewport's NDC by
+    // subtracting the origin before dividing by the extent — the rasterizer's viewport then
+    // maps that NDC back onto the same pixel, so the vertex lands where the app put it and the
+    // viewport acts purely as a clip rect. Dropping the origin offsets every 2D draw by it,
+    // which stays invisible only while the viewport covers the whole target.
+    // (DXVK d3d9_fixed_function_vert.vert: pos * inverseExtent + inverseOffset, with
+    //  inverseOffset = -origin * inverseExtent + (-1, 1).)
+    let posX_ndc = ((posX - params.viewportX + 0.5) / params.viewportWidth) * 2.0 - 1.0;
+    let posY_ndc = 1.0 - ((posY - params.viewportY + 0.5) / params.viewportHeight) * 2.0;
     // Convert NDC to clip-space by multiplying by w (for perspective-correct interpolation)
     let posX_clip = posX_ndc * w;
     let posY_clip = posY_ndc * w;
-    let posZ_clip = clamp(posZ, 0.0, 1.0) * w;
+    let posZ_clip = posZ * w;
     let posW_clip = w;
     `
             : hasXYZW
@@ -255,6 +267,8 @@ struct Params {
     srcStride: u32,
     viewportWidth: f32,
     viewportHeight: f32,
+    viewportX: f32,
+    viewportY: f32,
 }
 
 struct StorageBuf {
@@ -514,7 +528,10 @@ export class VertexConverter {
         }
         this.cachedMemBuffer = memory.buffer;
         this.cachedMemByteOffset = memory.byteOffset;
-        if ((memory.byteOffset & 3) === 0) {
+        // Whole-buffer word views: the byte LENGTH must be word-aligned too. Guest RAM always
+        // is, but a synthesized view (d3d8 interleaved decl scratch) need not be — and a throw
+        // here would take the whole draw down the catch path. Fall back to the DataView reader.
+        if ((memory.byteOffset & 3) === 0 && (memory.buffer.byteLength & 3) === 0) {
             this.cachedMemF32 = new Float32Array(memory.buffer);
             this.cachedMemU32 = new Uint32Array(memory.buffer);
         } else {
@@ -887,7 +904,9 @@ export class VertexConverter {
         fvf: number,
         viewportWidth?: number,
         viewportHeight?: number,
-        sourceStride?: number
+        sourceStride?: number,
+        viewportX?: number,
+        viewportY?: number
     ): GpuVertexConversionResult | null {
         profiler.start("VertexConverter.convertToGpuBuffer");
 
@@ -928,7 +947,7 @@ export class VertexConverter {
             );
 
             const tempParamsBuffer = this.device.createBuffer({
-                size: 16,
+                size: 32,
                 usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
                 mappedAtCreation: true,
             });
@@ -937,6 +956,8 @@ export class VertexConverter {
             paramsView.setUint32(4, srcStride, true);
             paramsView.setFloat32(8, (viewportWidth && viewportWidth > 0 ? viewportWidth : 640), true);
             paramsView.setFloat32(12, (viewportHeight && viewportHeight > 0 ? viewportHeight : 480), true);
+            paramsView.setFloat32(16, viewportX ?? 0, true);
+            paramsView.setFloat32(20, viewportY ?? 0, true);
             tempParamsBuffer.unmap();
 
             const pipeline = this.getOrCreatePipeline(config);
@@ -1008,7 +1029,9 @@ export class VertexConverter {
         fvf: number,
         viewportWidth?: number,
         viewportHeight?: number,
-        sourceStride?: number
+        sourceStride?: number,
+        viewportX?: number,
+        viewportY?: number
     ): Promise<Uint8Array> {
         profiler.start("VertexConverter.convertGPU");
 
@@ -1036,7 +1059,7 @@ export class VertexConverter {
 
             // Use convertToGpuBuffer for the actual conversion
             const encoder = this.device.createCommandEncoder();
-            const result = this.convertToGpuBuffer(encoder, memory, srcAddr, vertexCount, fvf, viewportWidth, viewportHeight, srcStride);
+            const result = this.convertToGpuBuffer(encoder, memory, srcAddr, vertexCount, fvf, viewportWidth, viewportHeight, srcStride, viewportX, viewportY);
             
             if (!result) {
                 profiler.end("VertexConverter.convertGPU");
@@ -1080,7 +1103,9 @@ export class VertexConverter {
         viewportWidth?: number,
         viewportHeight?: number,
         sourceStride?: number,
-        blend?: VertexBlendInput | null
+        blend?: VertexBlendInput | null,
+        viewportX?: number,
+        viewportY?: number
     ): Uint8Array {
         profiler.start("VertexConverter.convertCPU");
 
@@ -1105,6 +1130,8 @@ export class VertexConverter {
             // Viewport for XYZRHW conversion
             const vpW = viewportWidth && viewportWidth > 0 ? viewportWidth : 640;
             const vpH = viewportHeight && viewportHeight > 0 ? viewportHeight : 480;
+            const vpX = viewportX ?? 0;
+            const vpY = viewportY ?? 0;
             const scaleX = 2.0 / vpW;
             const scaleY = 2.0 / vpH;
 
@@ -1169,13 +1196,15 @@ export class VertexConverter {
                         let posW = 1.0;
 
                         if (config.hasXYZRHW) {
+                            // f32 at every step and in the WGSL's operation order — see the
+                            // matching branch below for why bit-equality with the GPU converter
+                            // is load-bearing (D3DCMP_EQUAL second passes).
                             const rhw = memF32[srcIndex + 3];
-                            const w = rhw !== 0 ? 1.0 / rhw : 1.0;
+                            const w = rhw !== 0 ? Math.fround(1.0 / rhw) : 1.0;
                             // +0.5: D3D integer pixel centers -> WebGPU half-integer centers (see WGSL above)
-                            posX = ((posX + 0.5) * scaleX - 1.0) * w;
-                            posY = (1.0 - (posY + 0.5) * scaleY) * w;
-                            const zClamped = posZ < 0 ? 0 : posZ > 1 ? 1 : posZ;
-                            posZ = zClamped * w;
+                            posX = Math.fround(Math.fround(Math.fround(Math.fround(Math.fround(Math.fround(posX - vpX) + 0.5) / vpW) * 2.0) - 1.0) * w);
+                            posY = Math.fround(Math.fround(1.0 - Math.fround(Math.fround(Math.fround(Math.fround(posY - vpY) + 0.5) / vpH) * 2.0)) * w);
+                            posZ = Math.fround(posZ * w);
                             posW = w;
                         } else if (config.hasXYZW) {
                             posW = memF32[srcIndex + 3];
@@ -1244,13 +1273,21 @@ export class VertexConverter {
                 let bnx = 0.0, bny = 0.0, bnz = 0.0;
 
                 if (config.hasXYZRHW) {
+                    // Round after EVERY step, exactly as the WGSL above does. JS arithmetic is
+                    // f64 and would round only once on the store, so the same vertex converted
+                    // here and on the GPU lands on different f32 bits. Depth is then unequal
+                    // between a base pass and a coplanar second pass whose vertex counts put
+                    // them on opposite sides of GPU_VERTEX_THRESHOLD — and D3DCMP_EQUAL, which
+                    // is exactly how a decal/lightmap pass asks "same surface", fails on a
+                    // pixel-dependent subset: a dither grid that crawls as the camera moves.
                     const rhw = srcView.getFloat32(srcBase + 12, true);
-                    const w = rhw !== 0 ? 1.0 / rhw : 1.0;
+                    const w = rhw !== 0 ? Math.fround(1.0 / rhw) : 1.0;
                     // +0.5: D3D integer pixel centers -> WebGPU half-integer centers (see WGSL above)
-                    posX = ((posX + 0.5) * scaleX - 1.0) * w;
-                    posY = (1.0 - (posY + 0.5) * scaleY) * w;
-                    const zClamped = posZ < 0 ? 0 : posZ > 1 ? 1 : posZ;
-                    posZ = zClamped * w;
+                    // Same operation ORDER as the WGSL too — (x+0.5)/vp then *2 then -1 is not
+                    // the same f32 value as (x+0.5)*(2/vp) - 1.
+                    posX = Math.fround(Math.fround(Math.fround(Math.fround(Math.fround(Math.fround(posX - vpX) + 0.5) / vpW) * 2.0) - 1.0) * w);
+                    posY = Math.fround(Math.fround(1.0 - Math.fround(Math.fround(Math.fround(Math.fround(posY - vpY) + 0.5) / vpH) * 2.0)) * w);
+                    posZ = Math.fround(posZ * w);
                     posW = w;
                 } else if (config.hasXYZW) {
                     posW = srcView.getFloat32(srcBase + 12, true);
@@ -1374,12 +1411,14 @@ export class VertexConverter {
         outBuffer?: Uint8Array,
         viewportWidth?: number, 
         viewportHeight?: number,
-        sourceStride?: number
+        sourceStride?: number,
+        viewportX?: number,
+        viewportY?: number
     ): Promise<Uint8Array> {
         if (vertexCount < GPU_VERTEX_THRESHOLD) {
-            return this.convertCPU(memory, srcAddr, vertexCount, fvf, outBuffer, viewportWidth, viewportHeight, sourceStride);
+            return this.convertCPU(memory, srcAddr, vertexCount, fvf, outBuffer, viewportWidth, viewportHeight, sourceStride, null, viewportX, viewportY);
         }
-        return this.convertGPU(memory, srcAddr, vertexCount, fvf, viewportWidth, viewportHeight, sourceStride);
+        return this.convertGPU(memory, srcAddr, vertexCount, fvf, viewportWidth, viewportHeight, sourceStride, viewportX, viewportY);
     }
 
     /**
@@ -1394,9 +1433,11 @@ export class VertexConverter {
         viewportWidth?: number,
         viewportHeight?: number,
         sourceStride?: number,
-        blend?: VertexBlendInput | null
+        blend?: VertexBlendInput | null,
+        viewportX?: number,
+        viewportY?: number
     ): Uint8Array {
-        return this.convertCPU(memory, srcAddr, vertexCount, fvf, outBuffer, viewportWidth, viewportHeight, sourceStride, blend);
+        return this.convertCPU(memory, srcAddr, vertexCount, fvf, outBuffer, viewportWidth, viewportHeight, sourceStride, blend, viewportX, viewportY);
     }
 
     /**

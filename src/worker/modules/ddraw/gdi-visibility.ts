@@ -5,11 +5,11 @@
 import type { DDrawContext } from './context';
 import type { RenderActive } from '../../runtime/runtime-services';
 import { surfaceAt } from './helpers';
+import { windows as sharedWindows } from '../user32/shared-state';
 
-export const DDSCL_NORMAL = 0x00000000;
-export const DDSCL_FULLSCREEN = 0x00000001;
-export const DDSCL_EXCLUSIVE = 0x00000010;
-export const DDSCL_EXCLUSIVE_FULLSCREEN = DDSCL_FULLSCREEN | DDSCL_EXCLUSIVE;
+import { DDSCL_FULLSCREEN, DDSCL_EXCLUSIVE } from './constants';
+
+const DDSCL_EXCLUSIVE_FULLSCREEN = DDSCL_FULLSCREEN | DDSCL_EXCLUSIVE;
 
 export function isDDrawExclusiveFullscreen(ddrawCtx: DDrawContext | null | undefined): boolean {
     if (!ddrawCtx) return false;
@@ -53,7 +53,32 @@ export function ddrawOwnsScreen(ddrawCtx: DDrawContext | null | undefined): bool
  * contract, where GDI and DirectDraw write the same memory and the last writer wins.
  */
 export function ddrawShowsContent(ddrawCtx: DDrawContext | null | undefined): boolean {
-    return ddrawOwnsScreen(ddrawCtx) && !!ddrawCtx?.presenter?.hasPresentedFrame?.();
+    if (!ddrawHasPrimary(ddrawCtx) || !ddrawCtx?.presenter?.hasPresentedFrame?.()) return false;
+    return isDDrawExclusiveFullscreen(ddrawCtx) || ddrawWindowCoversDisplay(ddrawCtx);
+}
+
+/**
+ * The cooperative-level window covers the whole display mode — a borderless-fullscreen app
+ * that took DDSCL_NORMAL.
+ *
+ * Windowed DirectDraw has no layering: the Blt lands in the same primary pixels the window's
+ * WM_ERASEBKGND fill lands in and the last writer wins, so a game repainting a display's
+ * worth of frame every frame is always the last writer, and compositing the GDI overlay over
+ * it shows a one-time black background instead of the frame.
+ *
+ * The test is the WINDOW, not the primary: in DirectDraw the primary surface IS the display
+ * (CreateSurface normalises it to the display mode for every cooperative level), so a primary
+ * size test is true for every app and would suppress GDI for genuinely windowed ones — whose
+ * blits are clipped to their window and which must keep compositing menus, dialogs and the
+ * desktop around them (Wine: ddraw_surface_blt honours the attached clipper's window region).
+ */
+function ddrawWindowCoversDisplay(ddrawCtx: DDrawContext | null | undefined): boolean {
+    const hwnd = ddrawCtx?.cooperative?.hwnd ?? 0;
+    const mode = ddrawCtx?.display;
+    if (!hwnd || !mode?.width || !mode?.height) return false;
+    const win = sharedWindows.get(hwnd);
+    if (!win || !win.visible) return false;
+    return win.width >= mode.width && win.height >= mode.height;
 }
 
 /** GDI desktop surface hidden while the flip chain owns the screen. */

@@ -75,7 +75,13 @@ class UniformArena {
             });
         }
         this.cursor = 0;
+        this.lastOffset = -1;
     }
+
+    /** Offset the most recent write() landed at, -1 before the first write of a frame.
+     *  A caller whose block is byte-identical to the previous one re-points at that block
+     *  instead of uploading a duplicate. */
+    lastOffset = -1;
 
     /** Bump-write the first `floatLen` floats of `data` (zero-alloc), returning the
      *  256-aligned byte offset used as the per-draw dynamic offset. */
@@ -87,6 +93,7 @@ class UniformArena {
             queue.writeBuffer(this.buffer!, offset, data, 0, floatLen);
         }
         this.cursor = alignUp(offset + size, UNIFORM_ALIGN);
+        this.lastOffset = offset;
         return offset;
     }
 }
@@ -570,6 +577,12 @@ export class D3D9BackendExecutor {
                     this.ffpCacheCursor = 0;
                     this.ffpCacheBuffer = this.ffpArena.buffer;
                 }
+                // The "auto" path's reused group binds a buffer RANGE, so it dies with the
+                // frame's arena rewind (begin() resets the cursor, so the same offset now
+                // holds a different block) as well as with a buffer swap. Same for the
+                // identical-block memo: its offset no longer names the bytes it recorded.
+                this.lastAutoGroup = null;
+                this.lastBlockLen = -1;
             }
 
             // Ensure offscreen target (swap-chain path only; RT passes bring their own views).
@@ -1031,7 +1044,18 @@ export class D3D9BackendExecutor {
     ): void {
         if (this.currentPipelineId === null || !this.ffpArena) return;
         const info = this.pipelineInfo[this.currentPipelineId];
-        const offset = this.ffpArena.write(queue, fs.block, fs.blockLen);
+        // Consecutive draws routinely share their entire FFP state (one object split across
+        // several materials keeps the same transform, material, lights and stage ops). Writing
+        // the same 1.6 KB again would cost a queue.writeBuffer AND force a new bind group on the
+        // "auto" path, where the offset is baked into the group. Re-point at the previous block
+        // instead — byte-compared, so a block that differs anywhere still gets its own copy.
+        const sameBlock = this.sameAsLastBlock(fs);
+        const offset = sameBlock
+            ? this.ffpArena.lastOffset
+            : this.ffpArena.write(queue, fs.block, fs.blockLen);
+        // On a hit the remembered copy already IS this block; re-copying it would put the
+        // ~1.6 KB memcpy back on the path whose whole point is to avoid one.
+        if (!sameBlock) this.rememberBlock(fs);
 
         const fallbackSampler = this.getSampler();
         const fallbackView = this.getFallbackTextureView();
@@ -1052,8 +1076,25 @@ export class D3D9BackendExecutor {
             return;
         }
 
-        const pipeline = this.pipelines[this.currentPipelineId];
-        const layout = pipeline.getBindGroupLayout(0);
+        // "auto" layout: the bind group encodes the buffer OFFSET (no hasDynamicOffset), so it
+        // cannot be shared across draws that landed at different arena offsets — which is why
+        // this path built a fresh one per draw and showed up as createBindGroup +
+        // getBindGroupLayout + GC in the profile. Two things make most of that go away without
+        // touching what is bound: the implicit layout is a per-pipeline constant (cache it —
+        // getBindGroupLayout allocates a fresh object on EVERY call), and consecutive draws that
+        // share their whole FFP state share their offset too (see the identical-block reuse
+        // above), so the previous bind group is bindable as-is.
+        if (this.lastAutoGroup !== null
+            && this.lastAutoPipeline === this.currentPipelineId
+            && this.lastAutoOffset === offset
+            && this.lastAutoStages === stageCount
+            && this.autoStageBindingsMatch(fs, stageCount, info?.hasTexture === true, fallbackSampler, fallbackView)) {
+            this.metrics.bindGroupCacheHits++;
+            this.setBindGroup0(renderPass, this.lastAutoGroup);
+            return;
+        }
+
+        const layout = this.getAutoLayout(this.currentPipelineId);
         const entries: GPUBindGroupEntry[] = [
             { binding: 0, resource: { buffer: this.ffpArena.buffer!, offset, size: Math.max(16, fs.blockLen * 4) } },
         ];
@@ -1061,13 +1102,85 @@ export class D3D9BackendExecutor {
             // Implicit ("auto") layout: exactly the bindings the shader declared, i.e. one pair
             // per stage it was generated for — supply that many, no more and no fewer.
             for (let n = 0; n < stageCount; n++) {
-                const inRange = n < fs.stageCount;
-                entries.push({ binding: 1 + n * 2, resource: (inRange ? fs.samplers[n] : null) ?? fallbackSampler });
-                entries.push({ binding: 2 + n * 2, resource: (inRange ? fs.textures[n] : null) ?? fallbackView });
+                const sampler = this.stageSampler(fs, n, fallbackSampler);
+                const view = this.stageView(fs, n, fallbackView);
+                entries.push({ binding: 1 + n * 2, resource: sampler });
+                entries.push({ binding: 2 + n * 2, resource: view });
+                this.lastAutoSamplers[n] = sampler;
+                this.lastAutoTextures[n] = view;
             }
         }
         const bindGroup = device.createBindGroup({ layout, entries });
+        this.lastAutoGroup = bindGroup;
+        this.lastAutoPipeline = this.currentPipelineId;
+        this.lastAutoOffset = offset;
+        this.lastAutoStages = stageCount;
         this.setBindGroup0(renderPass, bindGroup);
+    }
+
+    // Copy of the FFP block the arena last actually uploaded, for the identical-block test.
+    // Grown, never reallocated per draw.
+    private lastBlock = new Float32Array(0);
+    private lastBlockLen = -1;
+
+    /** True when this draw's block is byte-identical to the one already at
+     *  `ffpArena.lastOffset` — i.e. the upload and a new bind group can both be skipped. */
+    private sameAsLastBlock(fs: FfpDrawState): boolean {
+        if (this.ffpArena!.lastOffset < 0 || this.lastBlockLen !== fs.blockLen) return false;
+        const a = this.lastBlock, b = fs.block;
+        for (let i = 0; i < fs.blockLen; i++) if (a[i] !== b[i]) return false;
+        return true;
+    }
+
+    private rememberBlock(fs: FfpDrawState): void {
+        if (this.lastBlock.length < fs.blockLen) this.lastBlock = new Float32Array(fs.blockLen);
+        this.lastBlock.set(fs.block.subarray(0, fs.blockLen));
+        this.lastBlockLen = fs.blockLen;
+    }
+
+    /** WebGPU's implicit bind-group layout for one pipeline. `getBindGroupLayout` mints a new
+     *  JS object per call, so on a per-draw path it is pure allocation — the layout itself is
+     *  immutable for the life of the pipeline. */
+    private autoLayouts: (GPUBindGroupLayout | null)[] = [];
+    private getAutoLayout(pipelineId: number): GPUBindGroupLayout {
+        let l = this.autoLayouts[pipelineId];
+        if (!l) {
+            l = this.pipelines[pipelineId].getBindGroupLayout(0);
+            this.autoLayouts[pipelineId] = l;
+        }
+        return l;
+    }
+
+    // Last bind group built by the "auto" per-draw path, with everything it was built from.
+    // Reused only on an exact match — the offset is part of the group, so it must match too,
+    // and so must EVERY stage's pair: a multi-stage draw (base + lightmap) that keeps stage 0
+    // and swaps stage 1 is otherwise served the previous draw's lightmap, silently.
+    private lastAutoGroup: GPUBindGroup | null = null;
+    private lastAutoPipeline = -1;
+    private lastAutoOffset = -1;
+    private lastAutoTextures: (GPUTextureView | null)[] = [];
+    private lastAutoSamplers: (GPUSampler | null)[] = [];
+    private lastAutoStages = -1;
+
+    private stageSampler(fs: FfpDrawState, n: number, fallback: GPUSampler): GPUSampler {
+        return (n < fs.stageCount ? fs.samplers[n] : null) ?? fallback;
+    }
+
+    private stageView(fs: FfpDrawState, n: number, fallback: GPUTextureView): GPUTextureView {
+        return (n < fs.stageCount ? fs.textures[n] : null) ?? fallback;
+    }
+
+    /** Every stage pair the cached group binds is the pair this draw wants. */
+    private autoStageBindingsMatch(
+        fs: FfpDrawState, stageCount: number, hasTexture: boolean,
+        fallbackSampler: GPUSampler, fallbackView: GPUTextureView,
+    ): boolean {
+        if (!hasTexture) return true;
+        for (let n = 0; n < stageCount; n++) {
+            if (this.lastAutoSamplers[n] !== this.stageSampler(fs, n, fallbackSampler)) return false;
+            if (this.lastAutoTextures[n] !== this.stageView(fs, n, fallbackView)) return false;
+        }
+        return true;
     }
 
     private bindProgrammable(

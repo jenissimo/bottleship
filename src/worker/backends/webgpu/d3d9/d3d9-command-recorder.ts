@@ -6,14 +6,9 @@
  */
 
 import { RenderFrame, RenderFramePool } from "../render-frame";
+import type { StreamVertexBinding } from "../shared/vertex-streams";
 
-/** Extra vertex-stream binding (multi-stream D3D8 declarations): slot = stream number. */
-export interface StreamVertexBinding {
-    slot: number;
-    buffer: GPUBuffer;
-    offset: number;
-    size: number;
-}
+export type { StreamVertexBinding };
 
 export interface DrawCommand {
     pipelineId: number;

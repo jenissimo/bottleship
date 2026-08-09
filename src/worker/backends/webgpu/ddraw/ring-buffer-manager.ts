@@ -64,6 +64,9 @@ export class RingBufferManager {
     private lightsDirtyOffsets: number[] = [];
     private lightsAlignment = 1024;
     private lightsScratch = new Float32Array(FFP_LIGHTSET_FLOATS);
+    private drawUniformsBytes!: Uint8Array;
+    private uniformDataBytes!: Uint8Array;
+    private lightsScratchBytes!: Uint8Array;
     private lightsAdapted: FfpLightInput[] = [];
 
     // Current frame index for ring buffer rotation
@@ -156,6 +159,12 @@ export class RingBufferManager {
             this.drawUniformsData.byteOffset,
             storageConfig.slotSize
         );
+        // Byte views over the scratch buffers, used only as the SOURCE of the staging copy.
+        // The scratch Float32Arrays are allocated once here, so these never need rebuilding —
+        // constructing them per draw/per slot was an allocation on the hot path.
+        this.drawUniformsBytes = new Uint8Array(this.drawUniformsData.buffer, 0, storageConfig.slotSize);
+        this.uniformDataBytes = new Uint8Array(this.uniformData.buffer, 0, this.uniformData.byteLength);
+        this.lightsScratchBytes = new Uint8Array(this.lightsScratch.buffer, 0, FFP_LIGHTSET_BYTES);
 
         this.initializeBuffers();
     }
@@ -309,7 +318,7 @@ export class RingBufferManager {
         packFfpLightSet(this.lightsScratch, this.lightsAdapted, lightingState?.viewMatrix ?? undefined);
 
         const staging = this.lightsStagingBuffers[this.currentFrameIndex];
-        staging.set(new Uint8Array(this.lightsScratch.buffer, 0, FFP_LIGHTSET_BYTES), offset);
+        staging.set(this.lightsScratchBytes, offset);
         this.lightsRingOffsets[this.currentFrameIndex] = offset + this.lightsAlignment;
         return offset;
     }
@@ -607,7 +616,7 @@ export class RingBufferManager {
 
         // Write to CPU staging buffer
         const staging = this.storageStagingBuffers[this.currentFrameIndex];
-        staging.set(new Uint8Array(data.buffer, 0, this.storageSlotSize), offset);
+        staging.set(this.drawUniformsBytes, offset);
 
         this.lastDrawUniformsBits.set(this.drawUniformsBits);
         this.lastDrawUniformIndex = index;
@@ -1066,7 +1075,7 @@ export class RingBufferManager {
         // This eliminates thousands of tiny async GPU calls per frame.
         // The data is flushed to GPU in flushUniforms() which is called during flush().
         const staging = this.uniformStagingBuffers[this.currentFrameIndex];
-        staging.set(new Uint8Array(this.uniformData.buffer, 0, this.uniformData.byteLength), offset);
+        staging.set(this.uniformDataBytes, offset);
         
         // Update cache
         this.lastUniformData.set(this.uniformData);

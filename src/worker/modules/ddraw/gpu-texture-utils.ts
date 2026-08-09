@@ -9,6 +9,7 @@ import { Logger, LogCategory } from "../../core/logger";
 import { System } from "../../core/system";
 import { isValidAddress, overlapsThunkCode } from "../../core/memory/address-guard";
 import { toPlainGuestMemory } from "../../core/memory/guest-memory";
+import { DDPF_FOURCC } from "./constants";
 import type { DirectDrawSurfaceState } from "./com-objects";
 
 // ============================================================================
@@ -152,6 +153,15 @@ export interface FormatInfo {
  */
 export function detectPixelFormat(format: FormatInfo): PixelFormat {
     const { bpp, rMask, gMask, bMask, aMask, flags = 0 } = format;
+
+    // DDPF_FOURCC: the masks and dwRGBBitCount are meaningless by contract, and the guest
+    // leaves them 0 — which readPixelFormat then substitutes with the RGB565 defaults. The
+    // mask tests below would call a DXT1 surface "RGB565", and every consumer gating on this
+    // classifier would read 4x4 blocks as pixels. Only getSurfaceFormatLayout /
+    // decodeSurfaceFormatToRgba8 know the layout, so say UNKNOWN and route callers there.
+    if (flags & DDPF_FOURCC) {
+        return PixelFormat.UNKNOWN;
+    }
 
     if (bpp === 8) {
         // Check for DDPF_PALETTEINDEXED8 (0x20)
