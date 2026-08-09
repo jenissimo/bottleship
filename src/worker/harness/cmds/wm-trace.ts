@@ -11,6 +11,7 @@
 import type { HarnessService } from "../service";
 import { HarnessError, HarnessErrorCode } from "../rpc";
 import { sys } from "../serialize";
+import { setControlNotifyObserver } from "../../modules/user32/control-interaction";
 
 const MAX_ENTRIES = 512;
 
@@ -125,11 +126,26 @@ export function registerWmTraceCommands(svc: HarnessService): void {
                 }
                 original(hwnd, msg, wParam, lParam, ptX, ptY, targetThreadId, keyStatePacked);
             };
+            // Control notifications are delivered synchronously, not posted — tap them
+            // at the source or the ring shows the input and never the outcome.
+            setControlNotifyObserver((n) => {
+                const name = TRACED_MSG[n.msg];
+                if (!name) return;
+                if (created.entries.length >= MAX_ENTRIES) created.entries.shift();
+                created.entries.push({
+                    t: performance.now() | 0,
+                    hwnd: n.hwnd >>> 0, msg: n.msg, name,
+                    wParam: n.wParam | 0, lParam: n.lParam | 0,
+                    x: 0, y: 0,
+                    seq: (sys().inputManager as any)?.lastSeq ?? -1,
+                });
+            });
             return { ok: true, started: true };
         }
         if (action === "stop") {
             if (!p) return { ok: true, already: true, entries: [] };
             w.postMessage = p.original;
+            setControlNotifyObserver(null);
             delete w.__wmTraceProbe;
             // The ring survives the unwrap so a .wmTrace('stop').expectMessages([..])
             // chain still has something to assert against.

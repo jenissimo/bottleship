@@ -255,9 +255,16 @@ export function serializeAudio(): unknown {
 }
 
 export function serializeVideo(): unknown {
-    // VideoEngine doesn't expose "which session is active"; report load state and
-    // let callers drill into a specific handle via the video.info verb.
-    return { loaded: !!videoEngine?.isLoaded?.() };
+    // VideoEngine doesn't expose "which session is active", so the answer to "where
+    // do the decoded frames actually go" lives in VideoRoutingService: the resolved
+    // sink per session, the target hint the codec published, and the overlay plane's
+    // own size. Without it a mis-sized or mis-routed video looks identical to a
+    // decode failure from the outside.
+    const routing: any = sys().videoRouting;
+    return {
+        loaded: !!videoEngine?.isLoaded?.(),
+        routing: routing?.getDebugInfo?.() ?? null,
+    };
 }
 
 /**

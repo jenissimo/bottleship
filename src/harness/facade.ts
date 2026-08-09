@@ -22,6 +22,8 @@ import {
     type HarnessCallOpts,
     type HarnessReply,
     type HarnessEventMsg,
+    HarnessError,
+    HarnessErrorCode,
 } from "../worker/harness/rpc";
 import { sessionFromLocation } from "./session";
 import type { HarnessStep, HarnessRunResult, HarnessStepResult } from "./types";
@@ -33,7 +35,7 @@ import { relativeIntent } from "../input/relative-intent";
 
 /** Verbs handled page-side (browser-only) rather than forwarded to the worker. */
 const BROWSER_ONLY = new Set([
-    "openWgb", "loadPe", "audioGesture", "waitForEvent", "onModal", "inputSab",
+    "openWgb", "loadPe", "audioGesture", "waitForEvent", "onModal", "dismissModal", "inputSab",
     "hostRecord", "hostRecordStop", "hostReplay",
 ]);
 
@@ -62,10 +64,18 @@ export interface HarnessFacade {
     hostRecordStop(): Promise<unknown>;
     /** Re-apply captured samples; deterministic replays from the sample stamps. */
     hostReplay(samples: unknown, opts?: { deterministic?: boolean }): Promise<unknown>;
-    /** Auto-answer matching MessageBox prompts; returns a disposer. */
+    /** Auto-answer matching MessageBox prompts; returns a disposer. Survives the reload
+     *  openWgb() does, and therefore also later runs in the same tab — clear it when a
+     *  script wants the prompts back. */
     onMessageBox(pattern: RegExp | string, reply?: number | string): () => void;
+    /** Drop every armed auto-answer, including ones persisted across reloads. */
+    clearModalAnswers(): void;
     /** Resolver App.tsx consults for a prompt; buttonId to auto-answer, null to defer. */
     autoModalReply(box: { text?: string; caption?: string }): number | null;
+    /** App.tsx publishes a dismisser while its MessageBox modal is mounted (null on close). */
+    setLiveModal(dismiss: ((button: number) => void) | null, box?: { text?: string; caption?: string }): void;
+    /** Answer the modal that is ALREADY on screen. onMessageBox only pre-arms. */
+    dismissModal(button?: number | string, required?: boolean): { dismissed: boolean; text?: string };
     // Generic worker verbs (state, click, breakOn, ...) reachable via the Proxy.
     [cmd: string]: unknown;
 }
@@ -84,6 +94,24 @@ export function installHarnessFacade(worker: Worker, getInputView?: () => Int32A
     // Auto-modal matchers: {pattern, button}. Win32 IDs IDOK=1, IDCANCEL=2, IDYES=6, IDNO=7.
     const BUTTON_IDS: Record<string, number> = { ok: 1, cancel: 2, abort: 3, retry: 4, ignore: 5, yes: 6, no: 7 };
     const modalMatchers: Array<{ test: (m: any) => boolean; button: number }> = [];
+
+    /**
+     * Auto-answers outlive the reload openWgb() does. `.onModal(..).openWgb(..)` is the
+     * order every script writes — arm the answer, then start the game — and a matcher
+     * that only lived in this page instance was gone before the guest ever asked, so the
+     * run hung on a modal the script had already answered for.
+     */
+    const MODAL_STORE_KEY = "__bsHarnessModalMatchers";
+    function persistModalMatchers(specs: Array<{ source: string; button: number }>): void {
+        try { sessionStorage.setItem(MODAL_STORE_KEY, JSON.stringify(specs)); } catch { /* private mode */ }
+    }
+    function readModalSpecs(): Array<{ source: string; button: number }> {
+        try {
+            const raw = sessionStorage.getItem(MODAL_STORE_KEY);
+            return raw ? JSON.parse(raw) : [];
+        } catch { return []; }
+    }
+    const modalSpecs: Array<{ source: string; button: number }> = readModalSpecs();
 
     worker.addEventListener("message", (ev: MessageEvent) => {
         const m = ev.data;
@@ -125,13 +153,71 @@ export function installHarnessFacade(worker: Worker, getInputView?: () => Int32A
         const button = typeof reply === "number" ? reply : (BUTTON_IDS[reply.toLowerCase()] ?? 1);
         const entry = { test: (m: any) => re.test(String(m.text ?? "")) || re.test(String(m.caption ?? "")), button };
         modalMatchers.push(entry);
-        return () => { const i = modalMatchers.indexOf(entry); if (i >= 0) modalMatchers.splice(i, 1); };
+        const spec = { source: re.source, button };
+        modalSpecs.push(spec);
+        persistModalMatchers(modalSpecs);
+        return () => {
+            const i = modalMatchers.indexOf(entry);
+            if (i >= 0) modalMatchers.splice(i, 1);
+            const j = modalSpecs.indexOf(spec);
+            if (j >= 0) modalSpecs.splice(j, 1);
+            persistModalMatchers(modalSpecs);
+        };
+    }
+
+    /**
+     * The modal currently on screen, published by App.tsx while it is mounted.
+     * onMessageBox can only PRE-arm: App.tsx consults the resolver once, before
+     * rendering, so arming after a prompt is up answers nothing and the guest thread
+     * stays parked in MessageBoxA forever. A run that wants the prompt as a pause point
+     * — arm logging, then continue — needs this instead.
+     */
+    let liveModal: { dismiss: (button: number) => void; box: { text?: string; caption?: string } } | null = null;
+
+    function setLiveModal(dismiss: ((button: number) => void) | null, box: { text?: string; caption?: string } = {}): void {
+        liveModal = dismiss ? { dismiss, box } : null;
+    }
+
+    /**
+     * `required: false` opts out for a caller that is only clearing a prompt that MAY be
+     * up; by default a missing modal throws, because a chain step that silently reports
+     * success reads as "the prompt was dismissed" when the prompt never appeared.
+     */
+    function dismissModal(button: number | string = "ok", required = true): { dismissed: boolean; text?: string } {
+        if (!liveModal) {
+            if (required) throw new HarnessError("no modal is on screen to dismiss", HarnessErrorCode.NOT_FOUND);
+            return { dismissed: false };
+        }
+        const id = typeof button === "number" ? button : (BUTTON_IDS[button.toLowerCase()] ?? 1);
+        const text = liveModal.box.text;
+        liveModal.dismiss(id);
+        liveModal = null;
+        return { dismissed: true, text };
+    }
+
+    /** Clear every armed auto-answer, including the ones persisted across reloads. */
+    function clearModalAnswers(): void {
+        modalMatchers.length = 0;
+        modalSpecs.length = 0;
+        persistModalMatchers(modalSpecs);
+    }
+
+    // Rehydrate what an earlier page instance armed (see MODAL_STORE_KEY).
+    for (const spec of modalSpecs.slice()) {
+        const re = new RegExp(spec.source, "i");
+        modalMatchers.push({
+            test: (m: any) => re.test(String(m.text ?? "")) || re.test(String(m.caption ?? "")),
+            button: spec.button,
+        });
     }
 
     /** Resolver consulted by App.tsx: returns the button id for a matching prompt,
      *  or null to let App handle it (render dev modal / non-dev auto-reply). */
     function autoModalReply(box: { text?: string; caption?: string }): number | null {
         const m = modalMatchers.find((mm) => mm.test(box));
+        // Say so: matchers persist across reloads and into later runs in the same tab, so
+        // a silently swallowed prompt would read as "the game never asked".
+        if (m) console.log(`[harness] auto-answered MessageBox "${box.caption ?? ""}" -> ${m.button}`);
         return m ? m.button : null;
     }
 
@@ -413,6 +499,8 @@ export function installHarnessFacade(worker: Worker, getInputView?: () => Int32A
         if (step.cmd === "hostReplay") return hostReplay(step.args[0], step.args[1] as any);
         if (step.cmd === "waitForEvent") return waitForEvent(step.args[0] as string, step.args[1] as any);
         if (step.cmd === "onModal") { onMessageBox((step.args[0] as string) ?? ".*", (step.args[1] as string | number) ?? "ok"); return { armed: true, pattern: step.args[0] ?? ".*" }; }
+        if (step.cmd === "clearModals") { clearModalAnswers(); return { cleared: true }; }
+        if (step.cmd === "dismissModal") return dismissModal((step.args[0] as number | string) ?? "ok", (step.args[1] as boolean) ?? true);
         // Predicate args (waitUntil) are pre-serialized as {__fn} — pass through;
         // the worker reconstructs and evaluates them in its own context.
         return rpc(step.cmd, step.args, step.opts);
@@ -459,7 +547,10 @@ export function installHarnessFacade(worker: Worker, getInputView?: () => Int32A
         hostRecordStop,
         hostReplay,
         onMessageBox,
+        clearModalAnswers,
         autoModalReply,
+        setLiveModal,
+        dismissModal,
     };
 
     // Proxy so any worker command is callable as harness.<cmd>(...args) (like the

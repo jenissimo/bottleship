@@ -9,7 +9,16 @@
 import type { HarnessService } from "../service";
 import { HarnessError, HarnessErrorCode } from "../rpc";
 import { sys } from "../serialize";
-import { windows } from "../../modules/user32/shared-state";
+import {
+    windows,
+    buttonCheckStates,
+    listControlStates,
+    trackbarStates,
+} from "../../modules/user32/shared-state";
+import { getScrollBarState, SB_CTL, SB_HORZ, SB_VERT } from "../../modules/user32/scroll-state";
+import { getListViewState } from "../../modules/user32/list-view-control";
+import { getComboDropdownRect } from "../../modules/user32/controls";
+import { describeEditLayout } from "../../modules/user32/edit-control";
 import { getDeviceNotifications } from "../../modules/user32/device-notify";
 import { describeDlgControl, findDlgControl } from "../dlg";
 import { recorder } from "../recorder";
@@ -106,9 +115,10 @@ export function applyInput(cmd: string, args: unknown[]): any {
             const found = findDlgControl(args[0] as string | number);
             if (!found) throw new HarnessError(`no control matching ${JSON.stringify(args[0])}`, HarnessErrorCode.NOT_FOUND);
             const c = describeDlgControl(found.hwnd, found.win);
-            const ok = im.injectClickAtScreen(c.cx, c.cy);
-            if (!ok) throw new HarnessError("no input buffer connected (SAB not wired)", HarnessErrorCode.UNSUPPORTED);
-            return { ok, ...c };
+            // Press with DURATION, for the reason spelled out on clickAt below — a click by
+            // label is the same gesture as a click by coordinate and must not differ in timing.
+            pressAndRelease(im, c.cx, c.cy, 0, CLICK_HOLD_MS);
+            return { ok: true, ...c };
         }
         case "clickAt": {
             // A click has DURATION. Pressing and releasing inside one JS turn gives the guest
@@ -304,6 +314,64 @@ export function registerInputCommands(svc: HarnessService): void {
     svc.register("dialogs", () => {
         const out = [];
         for (const [hwnd, w] of windows) out.push(describeDlgControl(hwnd, w));
+        return out;
+    });
+
+    /**
+     * controlState(target) — what a JS-managed system control currently HOLDS:
+     * check state, selection, scroll position, thumb position, focus.
+     *
+     * The click half of a UI bug is visible in a screenshot; the state half is not,
+     * and reading pixels to decide whether a listbox moved its selection or a
+     * scrollbar its pos is exactly the kind of inference that mis-models. This is the
+     * readout `.click(x).expect(...)` needs to judge a control generically.
+     */
+    svc.register("controlState", (args) => {
+        const found = findDlgControl(args[0] as string | number);
+        if (!found) throw new HarnessError(`no control matching ${JSON.stringify(args[0])}`, HarnessErrorCode.NOT_FOUND);
+        const { hwnd, win } = found;
+        const cls = (win.systemControlClass ?? "").trim().toLowerCase();
+        const WS_DISABLED = 0x08000000;
+        const out: Record<string, unknown> = {
+            ...describeDlgControl(hwnd, win),
+            enabled: (win.style & WS_DISABLED) === 0,
+            focused: sys().windowManager?.getFocusHwnd?.() === hwnd,
+        };
+        if (buttonCheckStates.has(hwnd)) out.check = buttonCheckStates.get(hwnd);
+        const list = listControlStates.get(hwnd);
+        if (list) {
+            out.sel = list.selectedIndex;
+            out.caret = list.caretIndex;
+            out.topIndex = list.topIndex;
+            out.count = list.items.length;
+            out.selText = list.items[list.selectedIndex]?.text ?? null;
+            if (cls === "combobox") {
+                out.dropdownOpen = !!list.dropdownOpen;
+                // The drop-down is not a window, so `dialogs` cannot show where it is —
+                // and a click aimed at its list or its scroll bar has nothing else to aim by.
+                out.dropRect = getComboDropdownRect(win);
+            }
+        }
+        const lv = getListViewState(hwnd);
+        if (lv) {
+            const LVIS_SELECTED = 2;
+            out.topIndex = lv.topIndex;
+            out.count = lv.items.length;
+            out.focusedItem = lv.focusedItem;
+            out.selected = lv.items
+                .map((it, i) => ((it.state & LVIS_SELECTED) ? i : -1))
+                .filter((i) => i >= 0);
+        }
+        const tb = trackbarStates.get(hwnd);
+        if (tb) out.trackbar = { pos: tb.pos, min: tb.min, max: tb.max };
+        // An edit's laid-out lines and scroll position: the half of "is the text
+        // right?" that pixels cannot answer (a wrapped line count, a scrolled view).
+        if (cls === "edit" || cls === "richedit") out.edit = describeEditLayout(win);
+        if (cls === "scrollbar") out.scroll = getScrollBarState(hwnd, SB_CTL);
+        else {
+            const h = getScrollBarState(hwnd, SB_HORZ), v = getScrollBarState(hwnd, SB_VERT);
+            if (h.max !== h.min || v.max !== v.min) out.scroll = { horz: h, vert: v };
+        }
         return out;
     });
 

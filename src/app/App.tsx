@@ -331,6 +331,23 @@ export default function App() {
   const [statsOverlayEnabled, setStatsOverlayEnabled] = useState(false);
   const [fpuStrictEnabled, setFpuStrictEnabled] = useState(false);
   const [messageBox, setMessageBox] = useState<MessageBoxRequest | null>(null);
+
+  // Publish a dismisser for the prompt that is on screen. The harness's auto-answer is
+  // consulted once, BEFORE render, so a script that wants the prompt as a pause point
+  // (stop here, arm logging, continue) has nothing to answer it with afterwards.
+  useEffect(() => {
+    const harness = (window as any).__BS__?.harness;
+    if (!harness?.setLiveModal) return;
+    if (!messageBox) { harness.setLiveModal(null); return; }
+    harness.setLiveModal(
+      (result: number) => {
+        messageBox.worker.postMessage({ type: "message_box_result", id: messageBox.id, result });
+        setMessageBox(null);
+      },
+      { text: messageBox.text, caption: messageBox.caption },
+    );
+    return () => harness.setLiveModal(null);
+  }, [messageBox]);
   const [isPaused, setIsPaused] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [uiSettings, setUiSettings] = useState<UiSettings>(() => loadUiSettings());
@@ -914,9 +931,10 @@ export default function App() {
         const pendingReExec = sessionStorage.getItem(REEXEC_KEY);
         if (pendingReExec) {
           sessionStorage.removeItem(REEXEC_KEY);
-          const { args, url } = JSON.parse(pendingReExec) as { args: string; url: string | null };
-          globalWorker.postMessage({ type: "set_boot_args", args });
-          console.info("[bs] re-exec boot args:", args, url ? `(url ${url})` : "");
+          const { args, url, image } = JSON.parse(pendingReExec) as
+            { args: string; url: string | null; image?: string | null };
+          globalWorker.postMessage({ type: "set_boot_args", args, image: image ?? null });
+          console.info("[bs] re-exec boot:", image ?? "(manifest entrypoint)", args, url ? `(url ${url})` : "");
           if (url) reExecBundleUrl = url;
         }
       } catch { /* corrupt/no pending re-exec */ }
@@ -1221,6 +1239,9 @@ export default function App() {
           sessionStorage.setItem(REEXEC_KEY, JSON.stringify({
             args: String(event.data.args ?? ""),
             url: typeof event.data.url === "string" ? event.data.url : null,
+            // Set when the launcher started a DIFFERENT image from the same bundle: the
+            // new worker boots that entry point instead of the manifest's.
+            image: typeof event.data.image === "string" ? event.data.image : null,
           }));
           window.location.reload();
         } catch (e) {

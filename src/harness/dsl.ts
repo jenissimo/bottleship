@@ -44,6 +44,9 @@ export class HarnessChain {
     // ── lifecycle / loading (browser-only handled by the facade) ──
     /** Hard-reload ?game=dev before subsequent steps (CDP-side; safe in .run() chains). */
     reload(): this { return this.push("reload", []); }
+    /** Evaluate an expression in the PAGE and return its value (CDP-side). For assertions that
+     *  need the composited canvas itself — `shot` hands back a PNG, not pixels. */
+    evalPage(expr: string, timeoutMs?: number): this { return this.push("evalPage", [expr, timeoutMs]); }
     /** Load a WGB. By default reloads the page first (fresh worker + code); pass `{ reload: false }` to skip. */
     openWgb(idOrUrl: string, opts?: { hle?: boolean; logOnly?: boolean; reload?: boolean }): this {
         const reload = opts?.reload !== false;
@@ -75,8 +78,13 @@ export class HarnessChain {
     // ── waits / determinism ──
     waitForEvent(name: string, opts?: { timeoutMs?: number }): this { return this.push("waitForEvent", [name, opts]); }
     /** onModal(pattern?, reply?) — auto-answer MessageBox prompts (default: any → "ok")
-     *  so unattended runs don't wedge on a modal that parks the guest thread. */
+     *  so unattended runs don't wedge on a modal that parks the guest thread. Armed
+     *  answers survive openWgb()'s reload — and therefore later runs in the same tab. */
     onModal(pattern?: string, reply?: number | string): this { return this.push("onModal", [pattern ?? ".*", reply ?? "ok"]); }
+    /** Disarm every auto-answer, so prompts reach the modal (or the assertion) again. */
+    clearModals(): this { return this.push("clearModals", []); }
+    /** Answer the MessageBox already on screen (onModal only pre-arms). */
+    dismissModal(button: number | string = "ok", required = true): this { return this.push("dismissModal", [button, required]); }
     // These can run >60s; give the RPC envelope a deadline derived from the verb's
     // own (so the default 60s timeout doesn't spuriously abort long bring-up waits).
     waitUntil(predicate: () => boolean, opts?: { timeoutMs?: number; pollMs?: number }): this { return this.pushTimed("waitUntil", [predicate, opts], (opts?.timeoutMs ?? 30_000) + 5_000); }
@@ -216,6 +224,13 @@ export class HarnessChain {
     /** Session-wide per-thunk cost (totalMs / avgUs / msPerFrame / share of the thunk slice).
      *  Use this — not FPS — to A/B one thunk's cost; per-call figures tolerate CPU contention. */
     perfThunks(opts?: { top?: number; filter?: string }): this { return this.push("perfThunks", [opts]); }
+    /** Invoke a `dbg.*` command and return its value as the step result (rstats, fstats, …). */
+    dbgCall(name: string, ...args: unknown[]): this { return this.push("dbgCall", [name, ...args]); }
+    /** Per-draw CPU breakdown inside the ddraw draw path (resolve / prepare / vconvert /
+     *  ringup / submit / tail) — the phase attribution behind a fat DrawPrimitive thunk.
+     *  Off by default and zero-cost while off; measurement itself costs ~0.1-0.2ms/frame.
+     *  Flow: drawCost({enable:true, reset:true}) -> play/tickFrames -> drawCost(). */
+    drawCost(opts?: { enable?: boolean; reset?: boolean }): this { return this.push("drawCost", [opts]); }
     /** Named-bucket sub-phase timings (avg/total/max/count). filter by substring; maxMs = worst single call. */
     profilerStats(opts?: { filter?: string; top?: number; sort?: "max" | "total" | "avg" }): this { return this.push("profilerStats", [opts]); }
     /** Where the GUEST burns CPU: symbolized EIP/page histogram over a sampling window.

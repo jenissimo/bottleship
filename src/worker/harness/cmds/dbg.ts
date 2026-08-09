@@ -17,6 +17,7 @@ import type { HarnessService } from "../service";
 import { dbg } from "../../core/debug/dbg-commands";
 import { System } from "../../core/system";
 import { guestCodeInvalidationStats, takeGuestCodeAuditPages } from "../../core/memory/guest-code";
+import { localeFastPathStats } from "../../modules/kernel32/locale";
 import type { RegionKind } from "../../core/memory/address-space";
 
 /** Decode a generated thunk stub (`B8 <id32> BA 77 B0 00 00 EF C2 <cleanup16>`). */
@@ -108,6 +109,46 @@ export function registerDbgCommands(svc: HarnessService): void {
      * check that BEFORE theorising about the guest.
      */
     svc.register("codeInvalidations", () => guestCodeInvalidationStats());
+
+    /** localeFastPath({reset?}) — MultiByteToWideChar fast-path hit/bail census. A fast path
+     *  that never fires is indistinguishable from an expensive thunk in any profile, so
+     *  `mbtwcSlow` with a `bail` reason (and `lastCodePage`) is what says which one you have.
+     *  Flow: localeFastPath({reset:true}) -> exercise the game -> localeFastPath(). */
+    svc.register("localeFastPath", (args) => {
+        const opts = (args[0] ?? {}) as { reset?: boolean; callers?: boolean };
+        if (opts.callers === true && localeFastPathStats.callerCensus === null) {
+            localeFastPathStats.callerCensus = new Map();
+        } else if (opts.callers === false) {
+            localeFastPathStats.callerCensus = null;
+        }
+        const census = localeFastPathStats.callerCensus;
+        const snapshot = {
+            mbtwcFast: localeFastPathStats.mbtwcFast,
+            mbtwcSlow: localeFastPathStats.mbtwcSlow,
+            mbtwcThunk: localeFastPathStats.mbtwcThunk,
+            mbtwcUnbound: localeFastPathStats.mbtwcThunk - localeFastPathStats.mbtwcSlow,
+            bail: { ...localeFastPathStats.mbtwcBail },
+            lastCodePage: localeFastPathStats.lastCodePage,
+            lcmapFast: localeFastPathStats.lcmapFast,
+            lcmapDeclined: localeFastPathStats.lcmapDeclined,
+            lcmapFlags: [...localeFastPathStats.lcmapFlags.entries()]
+                .sort((a, b) => b[1] - a[1]).slice(0, 8)
+                .map(([f, n]) => ({ flags: `0x${f.toString(16)}`, calls: n })),
+            mbtwcChars: localeFastPathStats.mbtwcChars,
+            mbtwcMaxChars: localeFastPathStats.mbtwcMaxChars,
+            mbtwcTruncated: localeFastPathStats.mbtwcTruncated,
+            mbtwcAvgChars: localeFastPathStats.mbtwcFast > 0
+                ? Math.round(localeFastPathStats.mbtwcChars / localeFastPathStats.mbtwcFast * 10) / 10 : 0,
+            mbtwcLenHist: { "<=8": localeFastPathStats.mbtwcLenHist[0], "<=32": localeFastPathStats.mbtwcLenHist[1],
+                "<=128": localeFastPathStats.mbtwcLenHist[2], "<=512": localeFastPathStats.mbtwcLenHist[3],
+                "<=4096": localeFastPathStats.mbtwcLenHist[4], "more": localeFastPathStats.mbtwcLenHist[5] },
+            topCallers: census === null ? null : [...census.entries()]
+                .sort((a, b) => b[1] - a[1]).slice(0, 12)
+                .map(([ret, n]) => ({ ret: `0x${ret.toString(16)}`, calls: n })),
+        };
+        if (opts.reset) localeFastPathStats.reset();
+        return snapshot;
+    });
 
     /**
      * codeAudit() — find JS writes of guest-executable bytes that skipped the invalidation

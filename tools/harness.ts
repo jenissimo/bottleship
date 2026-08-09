@@ -118,7 +118,7 @@ let _journalSeq = 0;
 
 /** Verbs the CLI executes over CDP itself instead of shipping to the page: the
  *  page can neither reload itself mid-chain nor synthesize trusted touch input. */
-const CDP_STEPS = new Set(["reload", "device", "tap", "touchDrag", "longPress", "twoFingerTap", "pinch", "pointerLock"]);
+const CDP_STEPS = new Set(["reload", "device", "tap", "touchDrag", "longPress", "twoFingerTap", "pinch", "pointerLock", "evalPage"]);
 
 async function runCdpStep(session: CdpSession, step: HarnessStep): Promise<unknown> {
     const a = step.args as (number | string | undefined)[];
@@ -133,6 +133,10 @@ async function runCdpStep(session: CdpSession, step: HarnessStep): Promise<unkno
         case "twoFingerTap": return twoFingerTap(session, n(0), n(1), opt(2));
         case "pinch": return pinch(session, n(0), n(1), n(2), { ms: opt(3) });
         case "pointerLock": return setPointerLock(session, a[0] !== false && a[0] !== 0);
+        // Reading the CANVAS is a page-side act: the worker's own screenshot routes cannot see
+        // what the compositor put on screen, and a PNG round-trip through `shot` throws away
+        // the pixels a numeric assertion needs.
+        case "evalPage": return pageEval(session, String(a[0] ?? ""), { timeoutMs: Number(a[1] ?? 15000) });
     }
     throw new Error(`no CDP handler for step '${step.cmd}'`);
 }
@@ -588,6 +592,9 @@ async function cmdSingle(cmd: string, rest: string[]): Promise<void> {
     const args = rest.map((a) => {
         if (/^0x[0-9a-f]+$/i.test(a)) return parseInt(a, 16);
         if (/^\d+$/.test(a)) return Number(a);
+        // "false" must not arrive as a truthy string: `gpuToggle <flag> false` would
+        // then ENABLE the flag and the picture would silently measure the wrong thing.
+        if (a === "true" || a === "false") return a === "true";
         if (/^[[{]/.test(a)) { try { return JSON.parse(a); } catch { return a; } } // {"continuous":true} etc.
         return a;
     });

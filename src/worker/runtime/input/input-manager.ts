@@ -28,6 +28,8 @@ const HTCLIENT         = 1;
 const WM_MOUSEMOVE     = 0x0200;
 const WM_LBUTTONDOWN   = 0x0201;
 const WM_LBUTTONUP     = 0x0202;
+/** WNDCLASS.style bit that opts a class into WM_*BUTTONDBLCLK. */
+const CS_DBLCLKS = 0x0008;
 const WM_LBUTTONDBLCLK = 0x0203;
 const WM_RBUTTONDOWN   = 0x0204;
 const WM_RBUTTONUP     = 0x0205;
@@ -760,13 +762,13 @@ export class InputManager {
         // Mouse moves can be skipped/coalesced, but clicks are discrete events.
         if (leftDown !== wasLeftDown) {
             let msg = leftDown ? WM_LBUTTONDOWN : WM_LBUTTONUP;
-            if (leftDown) msg = this.checkDblClick(0, clientX, clientY, WM_LBUTTONDOWN, WM_LBUTTONDBLCLK);
+            if (leftDown) msg = this.checkDblClick(0, mouseTargetHwnd, clientX, clientY, WM_LBUTTONDOWN, WM_LBUTTONDBLCLK);
             this.windowManager.postMessage(mouseTargetHwnd, msg, wParamButtons, mouseLParam, screenX, screenY, 0, keyStateSnapshot);
         }
 
         if (rightDown !== wasRightDown) {
             let msg = rightDown ? WM_RBUTTONDOWN : WM_RBUTTONUP;
-            if (rightDown) msg = this.checkDblClick(1, clientX, clientY, WM_RBUTTONDOWN, WM_RBUTTONDBLCLK);
+            if (rightDown) msg = this.checkDblClick(1, mouseTargetHwnd, clientX, clientY, WM_RBUTTONDOWN, WM_RBUTTONDBLCLK);
             this.windowManager.postMessage(mouseTargetHwnd, msg, wParamButtons, mouseLParam, screenX, screenY, 0, keyStateSnapshot);
 
             Logger.verbose(LogCategory.SYSTEM, `Input: ${
@@ -778,7 +780,7 @@ export class InputManager {
 
         if (middleDown !== wasMiddleDown) {
             let msg = middleDown ? WM_MBUTTONDOWN : WM_MBUTTONUP;
-            if (middleDown) msg = this.checkDblClick(2, clientX, clientY, WM_MBUTTONDOWN, WM_MBUTTONDBLCLK);
+            if (middleDown) msg = this.checkDblClick(2, mouseTargetHwnd, clientX, clientY, WM_MBUTTONDOWN, WM_MBUTTONDBLCLK);
             this.windowManager.postMessage(mouseTargetHwnd, msg, wParamButtons, mouseLParam, screenX, screenY, 0, keyStateSnapshot);
             Logger.verbose(LogCategory.SYSTEM, `Input: ${
                 middleDown
@@ -1007,15 +1009,37 @@ export class InputManager {
      */
     private checkDblClick(
         btn: 0 | 1 | 2,
+        hwnd: number,
         x: number,
         y: number,
         downMsg: number,
         dblClkMsg: number,
     ): number {
-        // Disable DBLCLK generation — always send DOWN.
-        // Heroes3 WndProc calls SetCapture on LBUTTONDOWN but NOT on DBLCLK.
-        // Some games' window classes may not have CS_DBLCLKS.
-        this.lastDownTime[btn] = 0;
+        // USER only ever synthesises a double-click for a window whose CLASS asked for
+        // it: without CS_DBLCLKS the second press is another plain WM_*BUTTONDOWN. A
+        // class that skips SetCapture on DBLCLK is therefore telling us it never
+        // registered for the message in the first place.
+        const wndClass = this.windowManager.getWindow(hwnd)?.wndClass;
+        if (!wndClass || (wndClass.style & CS_DBLCLKS) === 0) {
+            this.lastDownTime[btn] = 0;
+            return downMsg;
+        }
+
+        const now = performance.now();
+        const withinTime = this.lastDownTime[btn] !== 0
+            && now - this.lastDownTime[btn] <= DBLCLK_TIME_MS;
+        const withinRect = Math.abs(x - this.lastDownX[btn]) <= DBLCLK_DIST_PX
+            && Math.abs(y - this.lastDownY[btn]) <= DBLCLK_DIST_PX;
+
+        this.lastDownX[btn] = x;
+        this.lastDownY[btn] = y;
+        if (withinTime && withinRect) {
+            // The pair is consumed: a third press starts a new one rather than
+            // producing a second DBLCLK.
+            this.lastDownTime[btn] = 0;
+            return dblClkMsg;
+        }
+        this.lastDownTime[btn] = now;
         return downMsg;
     }
 

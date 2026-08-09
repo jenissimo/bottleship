@@ -427,4 +427,19 @@ export function registerScreenCommands(svc: HarnessService): void {
         if (!active?.getRtDebug) throw new HarnessError("active presenter has no rtDebug (not D3D9)", HarnessErrorCode.UNSUPPORTED);
         return active.getRtDebug();
     });
+
+    /** declCensus({reset?}) — D3D9 vertex declarations the game draws with, the streams each
+     *  spans, and per declaration the FFP semantics we DROP because the fixed-function
+     *  shader/layout is built from stream 0 only. `drawsDropping` vs `drawsTotal` prices it:
+     *  a dropped TEXCOORD/COLOR rasterizes as flat white with no error raised anywhere, so a
+     *  screenshot cannot distinguish it from a game that means to draw white. Rate per frame:
+     *  declCensus({reset:true}) -> tickFrames(N) -> declCensus(). */
+    svc.register("declCensus", (args) => {
+        const opts = (args[0] ?? {}) as { reset?: boolean };
+        const active: any = sys().services?.render?.getActive?.();
+        if (!active?.declCensus) throw new HarnessError("active presenter has no declCensus (not D3D9)", HarnessErrorCode.UNSUPPORTED);
+        const snapshot = active.declCensus();
+        if (opts.reset) active.resetDeclCensus();
+        return snapshot;
+    });
 }

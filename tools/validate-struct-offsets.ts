@@ -149,6 +149,14 @@ const STRUCT_SPECS: StructSpec[] = [
         lastField: { name: "phi", size: 4 },
     },
     {
+        // 24 bytes and NO leading dwSize — unlike D3DVIEWPORT/D3DVIEWPORT2, which have one.
+        // Parsing it as if it did shifts every field by a DWORD.
+        name: "D3DVIEWPORT7",
+        expectedSize: 24,
+        source: { file: "worker/modules/ddraw/constants.ts", table: "D3DVIEWPORT7_OFFSETS" },
+        lastField: { name: "maxZ", size: 4 },
+    },
+    {
         name: "D3DCOLORVALUE",
         expectedSize: 16,
         source: { file: "worker/modules/ddraw/constants.ts", table: "D3DCOLORVALUE_OFFSETS" },

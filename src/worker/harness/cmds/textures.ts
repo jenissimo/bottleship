@@ -17,9 +17,11 @@ import { HarnessError, HarnessErrorCode } from "../rpc";
 import { getModule, guestMem, serializeSurfaces, sys } from "../serialize";
 import { bytesToBase64, debugDumpPath } from "./screen";
 import { devices as d3d9Devices } from "../../modules/d3d9/shared-state";
+import { surfaceInfo as d3d8SurfaceInfo } from "../../modules/d3d8/shared-state";
 import { cancelCapture as frameCaptureCancel, startCapture as frameCaptureStart } from "../../modules/ddraw/frame-capture";
 import { armSurfaceOps, takeSurfaceOps } from "../../modules/ddraw/surface-op-log";
 import { asArrayBufferView } from "../../../dom-buffer";
+import { getSurfaceFormatLayout, getD3DTextureLayout, decodeD3DTextureToRgba8 } from "../../backends/webgpu/shared/texture-formats";
 
 function ddraw(): any {
     return getModule("ddraw");
@@ -61,7 +63,26 @@ export function registerTextureCommands(svc: HarnessService): void {
             const info = (dev as any).getTexturesDebugInfo?.() ?? [];
             for (const t of info) d3d9.push({ ...t, backend: "d3d9", device: ptr >>> 0 });
         }
-        return { ddraw: ddrawSurfaces, d3d9 };
+        // D3D8 surfaces are the ones a CopyRects/Bink question is asked about, and they
+        // were invisible here — a d3d8 title's gallery came back empty, which reads as
+        // "no textures" rather than "this backend is not listed".
+        const d3d8: unknown[] = [];
+        for (const [ptr, info] of d3d8SurfaceInfo) {
+            const s = info.surface;
+            if (!s) continue;
+            d3d8.push({
+                backend: "d3d8",
+                ptr: ptr >>> 0,
+                ptrHex: "0x" + (ptr >>> 0).toString(16),
+                width: s.width, height: s.height,
+                pitch: s.pitch,
+                bpp: s.format?.bpp,
+                d3dFormat: info.d3dFormat,
+                role: info.role ?? null,
+                surfacePtr: "0x" + ((s.surfacePtr ?? 0) >>> 0).toString(16),
+            });
+        }
+        return { ddraw: ddrawSurfaces, d3d9, d3d8 };
     });
 
     /** surfaceOps({arm}) — arm the DDraw composition-op ring for the next `arm` ops;
@@ -107,6 +128,34 @@ export function registerTextureCommands(svc: HarnessService): void {
         return reason;
     };
 
+    /** A D3D8 texture, by either the COM ptr the gallery lists or its pixel surfacePtr.
+     *  Decoded FROM GUEST MEMORY with the surface's palette — the same call the upload
+     *  path makes — NOT from rgbaScratch: that buffer is a cache the palette-bake step
+     *  fills lazily, so a texture the screen clearly shows can read back as flat black.
+     *  Without this a d3d8-only title could see its textures listed but never dump one. */
+    const dumpD3d8 = (ptr: number): { rgba: Uint8Array; w: number; h: number; d3dFormat: number } | null => {
+        for (const [comPtr, info] of d3d8SurfaceInfo) {
+            const s = info.surface as any;
+            if (!s) continue;
+            if ((comPtr >>> 0) !== ptr && ((s.surfacePtr ?? 0) >>> 0) !== ptr) continue;
+            const w = s.width | 0, h = s.height | 0;
+            const src = s.surfacePtr >>> 0;
+            if (!src || w <= 0 || h <= 0) return null;
+            const mem = guestMem();
+            if (!mem) return null;
+            const layout = getD3DTextureLayout(info.d3dFormat, w, h);
+            const pitch = s.pitch || layout.pitch;
+            if (src + pitch * h > mem.length) return null;
+            const rgba = decodeD3DTextureToRgba8(mem, src, w, h, info.d3dFormat, {
+                pitch,
+                surfaceFormat: s.format,
+                palette: s.palette,
+            });
+            return { rgba, w, h, d3dFormat: info.d3dFormat };
+        }
+        return null;
+    };
+
     const dump = async (args: unknown[]) => {
         const ptr = resolvePtr(args[0]);
         if (!ptr) throw new HarnessError("surface pointer is 0 (no such surface / not initialized)", HarnessErrorCode.NOT_FOUND);
@@ -117,6 +166,9 @@ export function registerTextureCommands(svc: HarnessService): void {
             (self as unknown as Worker).postMessage({ type: "debug_png_dump", name, base64 });
             return { saved: debugDumpPath(name), ptr: "0x" + ptr.toString(16), w, h, source };
         };
+
+        const d8 = dumpD3d8(ptr);
+        if (d8) return emit(d8.rgba, d8.w, d8.h, `d3d8-texture(fmt ${d8.d3dFormat})`);
 
         const dd = ddraw();
         if (dd?.readSurfaceRGBA) {
@@ -251,10 +303,22 @@ export function registerTextureCommands(svc: HarnessService): void {
             const f = st.format;
             const dw = [32, f.flags >>> 0, (f.fourCC ?? 0) >>> 0, f.bpp >>> 0,
                         f.rMask >>> 0, f.gMask >>> 0, f.bMask >>> 0, f.aMask >>> 0];
+            // fourCC as its tag, and the pitch the layout REQUIRES beside the one the
+            // surface reports. A DDPF_FOURCC surface carries no masks, so readPixelFormat
+            // fills in the RGB565 defaults and a compressed surface reads as an ordinary
+            // 16-bit one in every other view — this row is where that is visible.
+            const cc = (f.fourCC ?? 0) >>> 0;
+            const layout = getSurfaceFormatLayout(f, st.width, st.height);
             rows.push({
                 ptr: "0x" + (st.surfacePtr >>> 0).toString(16),
                 size: `${st.width}x${st.height}`,
                 caps: "0x" + ((st.caps >>> 0)).toString(16),
+                fourCC: cc
+                    ? String.fromCharCode(cc & 255, (cc >> 8) & 255, (cc >> 16) & 255, (cc >>> 24) & 255)
+                    : null,
+                compressed: layout.compressed,
+                pitch: st.pitch,
+                layoutPitch: layout.pitch,
                 dwords: dw.map((v) => "0x" + v.toString(16)),
                 bytes: dw.map((v) => v.toString(16).padStart(8, "0")
                     .match(/../g)!.reverse().join("")).join(""),
@@ -343,5 +407,26 @@ export function registerTextureCommands(svc: HarnessService): void {
         const value = args[2] as number | undefined;
         exec.setDebugToggle(name, enabled, value);
         return { toggle: name, enabled, value: value ?? null, flags: exec.getDebugFlags?.() ?? null };
+    });
+
+    /** drawScrub(min?, max?) — RenderDoc-style bisect for the D3D9 backend: render only
+     *  draws [min, max] of every frame, numbered exactly as `captureFrame`'s `index`.
+     *
+     *  A capture says what was SUBMITTED; it cannot say what each draw did to the target.
+     *  Cutting the frame at a draw and looking at the screen is what separates "this
+     *  geometry never rasterized" from "a later draw painted over it" — the two produce
+     *  the identical black patch. Call with no argument to read the current cut plus
+     *  `lastFrameDraws`, so a scrub that is silently doing nothing is visible as such.
+     *  drawScrub(0, -1) (or no-arg after setting) leaves it inert; drawScrub(N, N) shows
+     *  ONE draw's contribution over whatever the previous frame left behind. */
+    svc.register("drawScrub", (args) => {
+        const dev: any = sys().services?.render?.getActive?.();
+        if (!dev?.setDrawScrub) throw new HarnessError("active presenter has no draw scrub (not D3D9)", HarnessErrorCode.UNSUPPORTED);
+        if (args.length > 0) {
+            const min = Number(args[0] ?? 0) | 0;
+            const max = args[1] === undefined ? -1 : Number(args[1]) | 0;
+            dev.setDrawScrub(min, max);
+        }
+        return dev.getDrawScrub();
     });
 }

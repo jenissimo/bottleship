@@ -314,7 +314,7 @@ export class WindowManager {
         // Capture: release if the dying window (or a descendant) holds it (WM_CAPTURECHANGED).
         const captureHwnd = this.captureHwnd;
         const captureLost = captureHwnd !== 0 && (captureHwnd === hwnd || this.isDescendantOf(captureHwnd, hwnd));
-        if (captureLost) this.captureHwnd = 0;
+        if (captureLost) this.setCaptureHwnd(0);
 
         this.windows.delete(hwnd);
         this.removeFromZOrder(hwnd);
@@ -410,10 +410,21 @@ export class WindowManager {
         return this.foregroundHwnd;
     }
 
-    setCapture(hwnd: number): number {
+    /**
+     * SINGLE owner of the capture slot. GetCapture is served from HYPERCALL_PAGE
+     * (Tier 1 hypercall), where 0 means "nobody holds capture" rather than
+     * "unpublished" — so every write must republish, or the guest silently reads a
+     * stale owner. Route all mutations through here, never assign captureHwnd directly.
+     */
+    private setCaptureHwnd(hwnd: number): number {
         const previous = this.captureHwnd;
         this.captureHwnd = hwnd >>> 0;
+        hypercallDataManager.updateCaptureHwnd(this.captureHwnd);
         return previous;
+    }
+
+    setCapture(hwnd: number): number {
+        return this.setCaptureHwnd(hwnd);
     }
 
     getCaptureHwnd(): number {
@@ -421,9 +432,7 @@ export class WindowManager {
     }
 
     releaseCapture(): number {
-        const previous = this.captureHwnd;
-        this.captureHwnd = 0;
-        return previous;
+        return this.setCaptureHwnd(0);
     }
 
     /**
@@ -779,7 +788,7 @@ export class WindowManager {
         this.activeHwnd = 0;
         this.focusHwnd = 0;
         this.foregroundHwnd = 0;
-        this.captureHwnd = 0;
+        this.setCaptureHwnd(0);
         this.zOrder = [];
         Logger.log(LogCategory.SYSTEM, 'WindowManager reset');
     }

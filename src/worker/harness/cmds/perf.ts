@@ -82,7 +82,7 @@ const LIVE_BLIND_SPOTS: string[] = [
     "GC pauses: invisible worker-side. Only a trace shows them ('(garbage collector)' JS node in the worker profile).",
     "stack attribution (JS vs wasm vs v86 internals, bad codegen): trace-only — V86_ANNOTATIONS, high cpu::cycle_internal self-time = interpreting, wasm-function[N] = compiled blocks.",
     "which guest code: needs sampling, so it cannot be applied retroactively to a spike that already happened — run guestBlocks() while the behaviour is live.",
-    "per-hypercall-id counts: they do not exist. Only a single wrapping 32-bit total (hypercallDataManager.getCallCount) — no breakdown is fabricated here.",
+    "hypercall COST: the per-id table counts calls served vs fallen back, not time. A cheap handler called a million times and an expensive one called a thousand look the same here — only a trace splits that.",
     "thunk time is summed ACROSS guest threads into the frame it landed in, so a parked audio thread inflates a frame's thunk category (park thunks are excluded from blame, not from the category).",
 ];
 
@@ -94,6 +94,7 @@ type CounterSnapshot = {
     tier2: Record<string, number> | null;
     codeInvalidations: { wired: boolean; ranges: number; bytes: number; deferred: number };
     hypercalls: number;
+    handlers: ReturnType<typeof hypercallDataManager.getHandlerReport>;
 };
 
 let windowBaseline: CounterSnapshot | null = null;
@@ -121,7 +122,27 @@ function snapshotCounters(render: RenderLike | undefined): CounterSnapshot {
         tier2,
         codeInvalidations: guestCodeInvalidationStats(),
         hypercalls: hypercallDataManager.getCallCount(),
+        handlers: hypercallDataManager.getHandlerReport(),
     };
+}
+
+/** Per-handler served/fellBack deltas over the window, busiest first. */
+function diffHandlers(base: CounterSnapshot["handlers"], now: CounterSnapshot["handlers"]) {
+    const byId = new Map(base.map(h => [h.handlerId, h]));
+    const out = now.map(h => {
+        const b = byId.get(h.handlerId);
+        return {
+            handlerId: h.handlerId,
+            names: h.names,
+            served: h.served - (b?.served ?? 0),
+            fellBack: h.fellBack - (b?.fellBack ?? 0),
+            // A saturated counter makes its own delta meaningless — say so rather than
+            // let a clamped subtraction read as "traffic stopped".
+            ...(h.saturated ? { saturated: true as const } : {}),
+        };
+    }).filter(h => h.served !== 0 || h.fellBack !== 0);
+    out.sort((a, b) => (b.served + b.fellBack) - (a.served + a.fellBack));
+    return out;
 }
 
 const diffNumbers = (a: Record<string, number> | null, b: Record<string, number> | null) => {
@@ -164,7 +185,11 @@ function counterDelta(base: CounterSnapshot | null, now: CounterSnapshot) {
         },
         hypercalls: {
             delta: hcDelta,
-            wrapCaveat: "32-bit wrapping total; delta is computed unsigned so ONE wrap is recovered. There are no per-id counters, so 'which hypercall' is not answerable today.",
+            wrapCaveat: "32-bit wrapping total; delta is computed unsigned so ONE wrap is recovered.",
+            // Per-handler_id breakdown — `served` handled in WASM, `fellBack` declined and
+            // cost a JS thunk round-trip. A hot id with a high fellBack ratio is a fast path
+            // that isn't one.
+            byHandler: diffHandlers(base.handlers, now.handlers),
         },
         ...(notes.length ? { notes } : {}),
     };

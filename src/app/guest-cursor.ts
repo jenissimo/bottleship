@@ -62,28 +62,33 @@ interface Shape {
  * IDC_ARROW. The worker resolves the default cursor to a real rasterized user object,
  * so this should never be reached — but a single renderer with a null-shape hole would
  * draw NOTHING where the CSS one silently fell back to the UA arrow, which is strictly
- * worse than what it replaces. 'X' = black, 'O' = white; hotspot (0,0).
+ * worse than what it replaces.
+ *
+ * 'X' = black outline, '.' = white fill, ' ' = transparent — the SAME convention and
+ * the same glyph as user32/system-cursors.ts. It has to be: the two swap in and out
+ * depending on whether a shape reached us, and an inverted copy here turned the pointer
+ * into a black arrow with a white outline whenever it did not.
  */
 const FALLBACK_ARROW = [
-  "O...........",
-  "OO..........",
-  "OXO.........",
-  "OXXO........",
-  "OXXXO.......",
-  "OXXXXO......",
-  "OXXXXXO.....",
-  "OXXXXXXO....",
-  "OXXXXXXXO...",
-  "OXXXXXXXXO..",
-  "OXXXXXXXXXO.",
-  "OXXXXXXOOOOO",
-  "OXXXOXXO....",
-  "OXXO.OXXO...",
-  "OXO..OXXO...",
-  "OO....OXXO..",
-  "O.....OXXO..",
-  ".......OXO..",
-  "........O...",
+  "X           ",
+  "XX          ",
+  "X.X         ",
+  "X..X        ",
+  "X...X       ",
+  "X....X      ",
+  "X.....X     ",
+  "X......X    ",
+  "X.......X   ",
+  "X........X  ",
+  "X.....XXXXX ",
+  "X..X..X     ",
+  "X.X X..X    ",
+  "XX  X..X    ",
+  "X    X..X   ",
+  "     X..X   ",
+  "      X..X  ",
+  "      X..X  ",
+  "       XX   ",
 ];
 
 function shapeFromPixels(
@@ -117,9 +122,9 @@ function buildFallbackArrow(): Shape | null {
     const row = FALLBACK_ARROW[y]!;
     for (let x = 0; x < width; x++) {
       const c = row[x];
-      if (c !== "X" && c !== "O") continue;
+      if (c !== "X" && c !== ".") continue;
       const i = (y * width + x) * 4;
-      const v = c === "O" ? 255 : 0;
+      const v = c === "." ? 255 : 0;
       rgba[i] = v;
       rgba[i + 1] = v;
       rgba[i + 2] = v;
