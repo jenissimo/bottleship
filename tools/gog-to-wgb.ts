@@ -25,11 +25,12 @@ import {
     BufferSource,
     extractInnoToMap,
     parseInnoHeader,
-    parseSliceFile,
+    parseSliceSource,
     MultiSliceReader,
     type SliceData,
 } from "@bottleship/formats/inno";
 import { UnpackDecoder } from "@bottleship/formats/unpack";
+import { FileSource } from "./internal/file-source";
 import { isGogJunk, SKIP_DIRS, detectExeFromPaths } from "@bottleship/repack/gog-filter";
 import { buildZip } from "@bottleship/formats/wgb/zip-build";
 import { OS_PRESETS } from "@bottleship/repack/manifest-synth";
@@ -234,7 +235,7 @@ if (useNative && !extractOnly) {
         for (let i = 0; ; i++) {
             const p = join(dir, sliceName(i));
             if (!existsSync(p)) break;
-            slices.push(parseSliceFile(new Uint8Array(readFileSync(p))));
+            slices.push(parseSliceSource(new FileSource(p)));
         }
         if (slices.length === 0) {
             console.error(`Error: multi-part installer — no slices found next to ${basename(installer)} (expected ${sliceName(0)})`);

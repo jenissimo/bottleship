@@ -115,11 +115,17 @@ export function handleCollision(
 export function filterExtractableFiles(
     files: FileEntry[],
     dataEntries: DataEntry[],
+    /** Per-entry eligibility (e.g. the Check: language guard). Applied BEFORE the collision
+     *  contest, as a real install does: an entry whose Check fails is never installed, so it
+     *  must not be able to win a path against the entry that IS installed — filtering after
+     *  the contest drops the path entirely (the winner is discarded, the loser is gone). */
+    wantEntry?: (file: FileEntry) => boolean,
 ): SelectedFile[] {
     const winners = new Map<string, SelectedFile>();
     const dirCasing = new DirectoryCasingRegistry();
 
     for (const file of files) {
+        if (wantEntry && !wantEntry(file)) continue;
         if (file.location === INVALID_LOCATION) continue;
         if (file.location >= dataEntries.length) continue;
         if (file.externalSize > 0n) continue;

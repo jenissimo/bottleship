@@ -505,14 +505,15 @@ export async function extractInno(
         );
     }
 
-    let selected = filterExtractableFiles(info.files, info.dataEntries);
     // Language-aware filter: drop per-language file variants whose Inno Check excludes the
     // chosen locale, so multi-language installers don't collapse to a last-write-wins (wrong)
     // language. No-op when language is unset or the file has no language Check.
-    if (opts.language) {
-        const lang = opts.language;
-        selected = selected.filter((s) => checkAllowsLanguage(s.file.check, lang));
-    }
+    const lang = opts.language;
+    const selected = filterExtractableFiles(
+        info.files,
+        info.dataEntries,
+        lang ? (file) => checkAllowsLanguage(file.check, lang) : undefined,
+    );
     const { chunks, totalBytes, assemblies } = replanWithHeaderCompression(
         selected,
         info.dataEntries,

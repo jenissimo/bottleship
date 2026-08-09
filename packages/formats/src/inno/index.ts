@@ -29,6 +29,7 @@ export {
     EmbeddedSliceReader,
     MultiSliceReader,
     parseSliceFile,
+    parseSliceSource,
     SLICE_HEADER_SIZE,
     chunkMapKey,
     decompressChunkStream,

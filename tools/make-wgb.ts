@@ -27,7 +27,17 @@
  *   --os     win95|win98|winnt  OS version preset (default: win98)
  *   --reg-hive  HKLM|HKCU      Registry hive for InstallPath key (default: HKLM)
  *   --reg-path  <str>     Registry key path, backslash-separated (default: none)
- *   --reg-install <str>   Value for InstallPath (default: C:\)
+ *   --reg-install <str>   Value data for the install-path key (default: C:\)
+ *   --reg-name <str>      Value NAME for it (default: InstallPath). Titles differ —
+ *                         GTA III reads HKLM\SOFTWARE\Rockstar Games\GTA 3\InstallDir.
+ *   --cd-path <str>       Guest path the CD-ROM drive (D:\) aliases to, for a title that
+ *                         still checks for its disc. Usually "C:\" (the install root).
+ *   --app-dir-dlls <list> Comma/semicolon-separated DLL names whose copy IN THE GAME
+ *                         DIRECTORY must win over our HLE module, as Windows' search
+ *                         order does (app dir before System32). Required for a game that
+ *                         ships a wrapper/proxy DLL — an ASI loader, a Glide or ddraw
+ *                         shim — which otherwise never executes. Example:
+ *                         --app-dir-dlls "ddraw"
  *   --skip-video          Set emulator.skipVideo=true
  *   --codepage <n>       ANSI code page (default: 1252). Use 1251 for Cyrillic
  *   --oem-codepage <n>   OEM code page (default: 437). Use 866 for Cyrillic OEM
@@ -54,91 +64,10 @@
  *       --name "Quake" --exe quake.exe --os winnt --width 800 --height 600 --bpp 32
  */
 
-import { writeFileSync, readdirSync, statSync, readFileSync, existsSync } from 'fs';
-import { join, relative, basename, extname, resolve } from 'path';
+import { readdirSync, statSync, readFileSync, existsSync } from 'fs';
+import { join, basename, extname, resolve } from 'path';
+import { ZipStoreWriter } from './internal/zip-store-writer';
 import { isValidGameId, deriveGameId, KNOWN_GAME_ID_SCHEMES } from '@bottleship/formats/wgb/container-id';
-
-// ---------------------------------------------------------------------------
-// ZIP (Store-only) writer — same algorithm as pack-wgb.ts
-// ---------------------------------------------------------------------------
-
-function crc32(data: Buffer): number {
-    const table = new Uint32Array(256);
-    for (let i = 0; i < 256; i++) {
-        let c = i;
-        for (let j = 0; j < 8; j++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
-        table[i] = c;
-    }
-    let crc = 0xffffffff;
-    for (let i = 0; i < data.length; i++) crc = table[(crc ^ data[i]) & 0xff] ^ (crc >>> 8);
-    return (crc ^ 0xffffffff) >>> 0;
-}
-
-interface ZipEntry { nameBuf: Buffer; data: Buffer; crc: number; offset: number; }
-
-function buildZip(files: Map<string, Buffer>): Buffer {
-    const buffers: Buffer[] = [];
-    const entries: ZipEntry[] = [];
-    let offset = 0;
-
-    for (const [name, data] of files) {
-        const nameBuf = Buffer.from(name, 'utf8');
-        const lfh = Buffer.alloc(30);
-        lfh.writeUint32LE(0x04034b50, 0);
-        lfh.writeUint16LE(20, 4);
-        lfh.writeUint16LE(0, 6);
-        lfh.writeUint16LE(0, 8);   // Store
-        lfh.writeUint16LE(0, 10);
-        lfh.writeUint16LE(0, 12);
-        const crc = crc32(data);
-        lfh.writeUint32LE(crc, 14);
-        lfh.writeUint32LE(data.length, 18);
-        lfh.writeUint32LE(data.length, 22);
-        lfh.writeUint16LE(nameBuf.length, 26);
-        lfh.writeUint16LE(0, 28);
-        entries.push({ nameBuf, data, crc, offset });
-        buffers.push(lfh, nameBuf, data);
-        offset += 30 + nameBuf.length + data.length;
-    }
-
-    const cdOffset = offset;
-    let cdSize = 0;
-    for (const e of entries) {
-        const cdh = Buffer.alloc(46);
-        cdh.writeUint32LE(0x02014b50, 0);
-        cdh.writeUint16LE(20, 4);
-        cdh.writeUint16LE(20, 6);
-        cdh.writeUint16LE(0, 8);
-        cdh.writeUint16LE(0, 10);
-        cdh.writeUint16LE(0, 12);
-        cdh.writeUint16LE(0, 14);
-        cdh.writeUint32LE(e.crc, 16);
-        cdh.writeUint32LE(e.data.length, 20);
-        cdh.writeUint32LE(e.data.length, 24);
-        cdh.writeUint16LE(e.nameBuf.length, 28);
-        cdh.writeUint16LE(0, 30);
-        cdh.writeUint16LE(0, 32);
-        cdh.writeUint16LE(0, 34);
-        cdh.writeUint16LE(0, 36);
-        cdh.writeUint32LE(0, 38);
-        cdh.writeUint32LE(e.offset, 42);
-        buffers.push(cdh, e.nameBuf);
-        cdSize += 46 + e.nameBuf.length;
-    }
-
-    const eocd = Buffer.alloc(22);
-    eocd.writeUint32LE(0x06054b50, 0);
-    eocd.writeUint16LE(0, 4);
-    eocd.writeUint16LE(0, 6);
-    eocd.writeUint16LE(entries.length, 8);
-    eocd.writeUint16LE(entries.length, 10);
-    eocd.writeUint32LE(cdSize, 12);
-    eocd.writeUint32LE(cdOffset, 16);
-    eocd.writeUint16LE(0, 20);
-    buffers.push(eocd);
-
-    return Buffer.concat(buffers);
-}
 
 // ---------------------------------------------------------------------------
 // Argument parsing
@@ -206,7 +135,9 @@ function detectExe(dir: string): string | undefined {
 // no entry for an empty dir, so an installer-created folder like `user\rosters` would
 // vanish silently and the game's fopen("wb") into it would fail (Windows fopen doesn't
 // mkdir parents). We surface these so they can be recreated at boot via createDirs.
-function collectGameFiles(dir: string, prefix: string, out: Map<string, Buffer>, emptyDirs: Set<string>, rel = '') {
+// Only PATHS are collected — a multi-GB bundle must never be assembled in memory; the
+// writer streams each member off disk.
+function collectGameFiles(dir: string, prefix: string, out: Map<string, string>, emptyDirs: Set<string>, rel = '') {
     const entries = readdirSync(dir);
     if (entries.length === 0) {
         if (rel) emptyDirs.add(rel); // deepest empty dir; mkdir -p at boot covers ancestors
@@ -219,7 +150,7 @@ function collectGameFiles(dir: string, prefix: string, out: Map<string, Buffer>,
         if (statSync(full).isDirectory()) {
             collectGameFiles(full, zipName + '/', out, emptyDirs, childRel);
         } else {
-            out.set(zipName, readFileSync(full));
+            out.set(zipName, full);
         }
     }
 }
@@ -271,7 +202,7 @@ if (!gameId) {
 // Scan the game dir up-front: collect rom/ file entries AND auto-detect empty
 // directories the installer left (ZIP drops them). Explicit --create-dirs are
 // merged on top — belt and suspenders for authors who know the paths.
-const romFiles = new Map<string, Buffer>();
+const romFiles = new Map<string, string>();
 const emptyDirs = new Set<string>();
 collectGameFiles(gameDir, 'rom/', romFiles, emptyDirs);
 
@@ -281,6 +212,18 @@ const explicitCreateDirs = (get('--create-dirs') ?? '')
     .filter((d) => d.length > 0);
 
 const createDirs = [...new Set([...explicitCreateDirs, ...emptyDirs])].sort();
+
+// Where the CD-ROM drive (D:\) points. A retail install still expects its disc — GTA III
+// hunts for a DRIVE_CDROM whose AUDIO\HEAD.WAV opens — so a bundle packed from an install
+// must say which guest path stands in for the disc, usually the install root itself.
+const cdPath = get('--cd-path');
+
+// DLLs whose game-directory copy must beat our HLE module (Windows' own search order).
+// Wrapper/proxy DLLs a game ships — ASI loaders, Glide/ddraw shims — never execute without it.
+const appDirDlls = (get('--app-dir-dlls') ?? '')
+    .split(/[,;]/)
+    .map((d) => d.trim())
+    .filter((d) => d.length > 0);
 if (emptyDirs.size > 0) {
     console.log(`  empty dirs: auto-detected ${emptyDirs.size} (added to createDirs): ${[...emptyDirs].sort().join(', ')}`);
 }
@@ -337,6 +280,8 @@ const manifest: Record<string, unknown> = {
         ...(get('--oem-codepage') ? { oemCodepage: parseInt(get('--oem-codepage')!, 10) } : {}),
         ...(get('--lcid') ? { lcid: parseInt(get('--lcid')!, 16) } : {}),
         ...(createDirs.length > 0 ? { createDirs } : {}),
+        ...(appDirDlls.length > 0 ? { appDirDlls } : {}),
+        ...(cdPath ? { cdPath } : {}),
         ...(touch ? { touch } : {}),
     },
 };
@@ -353,7 +298,7 @@ if (regPath) {
         root: regHive,
         path: regPath,          // JS string; JSON.stringify will escape \ → \\
         values: [
-            { name: 'InstallPath', type: 'REG_SZ', data: regInstall },
+            { name: get('--reg-name') ?? 'InstallPath', type: 'REG_SZ', data: regInstall },
         ],
     };
 } else {
@@ -361,19 +306,15 @@ if (regPath) {
     registry = { root: 'HKLM', path: 'Software', values: [] };
 }
 
-// Collect all files
-const files = new Map<string, Buffer>();
+// Stream the archive straight to disk: manifest + registry first (readability in
+// `wgb list`), then the game files scanned above (romFiles holds paths, not bytes).
+const writer = new ZipStoreWriter(output);
+writer.addBuffer('manifest.json', Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'));
+writer.addBuffer('registry.json', Buffer.from(JSON.stringify(registry, null, 2), 'utf8'));
+for (const [zipName, path] of romFiles) writer.addFile(zipName, path);
+const { bytes, entries: entryCount } = writer.finish();
 
-// manifest + registry first (for readability in list-wgb output)
-files.set('manifest.json', Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'));
-files.set('registry.json', Buffer.from(JSON.stringify(registry, null, 2), 'utf8'));
-
-// Game files under rom/ — already scanned above (romFiles), reuse to avoid a second walk.
-for (const [zipName, data] of romFiles) files.set(zipName, data);
-
-const zip = buildZip(files);
-writeFileSync(output, zip);
-console.log(`Created ${output} (${files.size} files, ${(zip.length / 1024 / 1024).toFixed(1)} MB)`);
+console.log(`Created ${output} (${entryCount} files, ${(bytes / 1024 / 1024).toFixed(1)} MB)`);
 console.log(`  name:       ${name}`);
 console.log(`  entrypoint: rom/${exeName}`);
 console.log(`  resolution: ${width}x${height}x${bpp}`);

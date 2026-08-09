@@ -24,16 +24,10 @@
 
 import { openSync, readSync, writeSync, closeSync, fstatSync, renameSync, unlinkSync } from "fs";
 import { inflateRawSync } from "zlib";
-
-// ─── ZIP signatures ──────────────────────────────────────────────────────────
-const LFH_SIG = 0x04034b50;
-const CDH_SIG = 0x02014b50;
-const EOCD_SIG = 0x06054b50;
-const EOCD64_SIG = 0x06064b50;
-const EOCD64_LOC_SIG = 0x07064b50;
-const U32_MAX = 0xffffffff;
-const U16_MAX = 0xffff;
-const COPY_CHUNK = 16 * 1024 * 1024; // 16 MB streamed copy (bounded RAM)
+import {
+    crc32, lfhFor, cdhFor, type OutEntry,
+    LFH_SIG, CDH_SIG, EOCD_SIG, EOCD64_SIG, EOCD64_LOC_SIG, U32_MAX, U16_MAX, COPY_CHUNK,
+} from "./internal/zip-store-writer";
 
 // ─── Ranged file I/O (64-bit safe; never loads the whole file) ───────────────
 
@@ -174,77 +168,6 @@ function streamStoreData(fd: number, e: ZipEntry, sink: (chunk: Buffer) => void)
         at += n;
         remaining -= n;
     }
-}
-
-function crc32(data: Buffer): number {
-    const table = crc32.table ?? (crc32.table = (() => {
-        const t = new Uint32Array(256);
-        for (let i = 0; i < 256; i++) {
-            let c = i;
-            for (let j = 0; j < 8; j++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
-            t[i] = c;
-        }
-        return t;
-    })());
-    let crc = 0xffffffff;
-    for (let i = 0; i < data.length; i++) crc = table[(crc ^ data[i]) & 0xff] ^ (crc >>> 8);
-    return (crc ^ 0xffffffff) >>> 0;
-}
-namespace crc32 { export let table: Uint32Array | undefined; }
-
-// ─── Streaming Store-only writer (ZIP64 when offsets/sizes exceed 32 bits) ───
-
-interface OutEntry { nameBuf: Buffer; size: number; crc: number; offset: number }
-
-function lfhFor(nameBuf: Buffer, size: number, crc: number): Buffer {
-    const needsZip64 = size > U32_MAX;
-    const extra = needsZip64 ? 20 : 0; // ZIP64 extra: header(4) + uncompressed(8) + compressed(8)
-    const lfh = Buffer.alloc(30 + nameBuf.length + extra);
-    lfh.writeUInt32LE(LFH_SIG, 0);
-    lfh.writeUInt16LE(needsZip64 ? 45 : 20, 4); // version needed (4.5 for ZIP64)
-    lfh.writeUInt16LE(0, 8);                      // Store
-    lfh.writeUInt32LE(crc, 14);
-    lfh.writeUInt32LE(needsZip64 ? U32_MAX : size, 18); // compressed
-    lfh.writeUInt32LE(needsZip64 ? U32_MAX : size, 22); // uncompressed
-    lfh.writeUInt16LE(nameBuf.length, 26);
-    lfh.writeUInt16LE(extra, 28);
-    nameBuf.copy(lfh, 30);
-    if (needsZip64) {
-        const e = 30 + nameBuf.length;
-        lfh.writeUInt16LE(0x0001, e);
-        lfh.writeUInt16LE(16, e + 2);
-        lfh.writeBigUInt64LE(BigInt(size), e + 4);
-        lfh.writeBigUInt64LE(BigInt(size), e + 12);
-    }
-    return lfh;
-}
-
-function cdhFor(e: OutEntry): Buffer {
-    const bigSize = e.size > U32_MAX;
-    const bigOff = e.offset > U32_MAX;
-    const zFields = (bigSize ? 16 : 0) + (bigOff ? 8 : 0);
-    const extra = zFields ? 4 + zFields : 0;
-    const cdh = Buffer.alloc(46 + e.nameBuf.length + extra);
-    cdh.writeUInt32LE(CDH_SIG, 0);
-    cdh.writeUInt16LE(bigSize || bigOff ? 45 : 20, 4); // version made by
-    cdh.writeUInt16LE(bigSize || bigOff ? 45 : 20, 6); // version needed
-    cdh.writeUInt16LE(0, 10); // Store
-    cdh.writeUInt32LE(e.crc, 16);
-    cdh.writeUInt32LE(bigSize ? U32_MAX : e.size, 20); // compressed
-    cdh.writeUInt32LE(bigSize ? U32_MAX : e.size, 24); // uncompressed
-    cdh.writeUInt16LE(e.nameBuf.length, 28);
-    cdh.writeUInt16LE(extra, 30);
-    cdh.writeUInt32LE(bigOff ? U32_MAX : e.offset, 42);
-    e.nameBuf.copy(cdh, 46);
-    if (extra) {
-        let p = 46 + e.nameBuf.length;
-        cdh.writeUInt16LE(0x0001, p);
-        cdh.writeUInt16LE(zFields, p + 2);
-        p += 4;
-        if (bigSize) { cdh.writeBigUInt64LE(BigInt(e.size), p); cdh.writeBigUInt64LE(BigInt(e.size), p + 8); p += 16; }
-        if (bigOff) { cdh.writeBigUInt64LE(BigInt(e.offset), p); p += 8; }
-    }
-    return cdh;
 }
 
 /**
