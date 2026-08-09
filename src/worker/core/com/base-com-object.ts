@@ -188,7 +188,7 @@ export abstract class BaseComObject implements IVTable {
         this._refCount = 0;
         const process = System.getInstance().process;
         const cpu = process?.v86?.cpu || (process?.v86?.v86 && process?.v86?.v86.cpu);
-        const mem8 = process?.v86?.mem8 || (process?.v86?.v86 && process?.v86?.v86.cpu.mem8);
+        const mem8 = process?.getCurrentMemory();
         if (cpu && mem8) {
             try {
                 const esp = cpu.reg32?.[4] ?? 0;

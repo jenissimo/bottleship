@@ -316,6 +316,60 @@ export class ThunkGenerator {
     }
 
     /**
+     * Build a stub for a caller-chosen address instead of the THUNK_CODE bump arena, and
+     * register it exactly like any other. Used by the HLE synthetic module images, whose
+     * export bodies must live INSIDE the image so AddressOfFunctions can name them with an
+     * RVA below SizeOfImage. Dispatch keys on the functionId in EAX, not on where the
+     * bytes sit, so such a stub dispatches identically. The caller publishes `code` at
+     * `address` (through writeGuestCode — these bytes are executed).
+     */
+    allocateStubAt(
+        address: number,
+        dllName: string,
+        exportName: string,
+        argCount?: number,
+        callingConvention?: string,
+        stackCleanupBytes?: number
+    ): { address: number; code: Uint8Array } {
+        const functionId = this.nextFunctionId++;
+        const isStdcall = !callingConvention || callingConvention === 'stdcall';
+        const bytesToPop = this.resolveBytesToPop(exportName, isStdcall, argCount, stackCleanupBytes);
+        if (isStdcall && bytesToPop === undefined) {
+            throw new Error(
+                `[ThunkGenerator] allocateStubAt requires argCount or stackCleanupBytes for stdcall: ${dllName}:${exportName}`
+            );
+        }
+        const codeChunks: number[] = [
+            0xB8, functionId & 0xFF, (functionId >> 8) & 0xFF, (functionId >> 16) & 0xFF, (functionId >> 24) & 0xFF,
+            0xBA, 0x77, 0xB0, 0x00, 0x00,
+            0xEF,
+        ];
+        if (isStdcall && bytesToPop && bytesToPop > 0) {
+            codeChunks.push(0xC2, bytesToPop & 0xFF, (bytesToPop >> 8) & 0xFF);
+        } else {
+            codeChunks.push(0xC3);
+        }
+        while (codeChunks.length % 16 !== 0) codeChunks.push(0x90);
+
+        const stub: ThunkStub = {
+            address: address >>> 0,
+            dllName,
+            functionName: exportName,
+            functionId,
+            argCount,
+            stackCleanupBytes: isStdcall ? bytesToPop : 0,
+        };
+        this.stubs.set(functionId, stub);
+        this.addressToStub.set(address >>> 0, stub);
+        this.indexStub(stub);
+        // Deliberately NOT in nameToAddress: that map is generateStubDll's reuse cache, and
+        // feeding it in-image bodies would make a guest IAT point into the image or into
+        // THUNK_CODE depending on whether its DLL loaded before or after materialization.
+        // One inconsistent rule is worse than one uniform divergence.
+        return { address: address >>> 0, code: new Uint8Array(codeChunks) };
+    }
+
+    /**
      * Reserve a raw, 16-byte-granular executable area in THUNK_CODE with no
      * stub/functionId registration. Used by hle-lib for relocated-prologue
      * trampolines (Guarded Inner-Loop HLE): the caller writes the bytes and

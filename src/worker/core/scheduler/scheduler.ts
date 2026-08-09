@@ -17,7 +17,7 @@ import { Process } from '../process';
 import { preemptionManager } from '../cpu/preemption-manager';
 import { MEM_THUNK_CODE_BASE, MEM_ROM_BASE } from '../cpu/emulator-config';
 import { hypercallDataManager } from '../cpu/hypercall-data';
-import { System } from '../system';
+import { System, type ImplicitTlsEntry } from '../system';
 import { SystemResourceProvider } from '../resources/system-resource-provider';
 import { TimeService } from '../../runtime/time';
 import { clearAllActiveExceptions } from '../seh-dispatch';
@@ -3001,6 +3001,55 @@ export class Scheduler {
      * Initialize implicit TLS data for a new thread.
      * Copies TLS template data for each PE module that uses __declspec(thread).
      */
+    /** Give ONE thread its private copy of ONE module's TLS template. */
+    private materializeTlsEntry(
+        threadId: number,
+        thread: Thread,
+        entry: ImplicitTlsEntry,
+        memory: Uint8Array,
+        memManager: { alloc(size: number): number },
+    ): void {
+        const totalSize = entry.templateSize + entry.zeroFillSize;
+        const tlsDataAddr = memManager.alloc(Math.max(totalSize, 16));
+
+        // Copy template data
+        if (entry.templateSize > 0 && entry.templateStart > 0) {
+            memory.copyWithin(tlsDataAddr, entry.templateStart, entry.templateStart + entry.templateSize);
+        }
+        // Zero fill
+        if (entry.zeroFillSize > 0) {
+            memory.fill(0, tlsDataAddr + entry.templateSize, tlsDataAddr + totalSize);
+        }
+
+        // Store in thread's TLS values and sync to guest memory
+        thread.tlsValues.set(entry.tlsIndex, tlsDataAddr >>> 0);
+        this.tebManager.syncTlsSlot(threadId, entry.tlsIndex, tlsDataAddr >>> 0);
+
+        Logger.log(LogCategory.THREAD,
+            `  TLS slot ${entry.tlsIndex} (${entry.moduleName}): data=0x${tlsDataAddr.toString(16)} ` +
+            `(${totalSize} bytes, template@0x${entry.templateStart.toString(16)}) for T${threadId}`);
+    }
+
+    /**
+     * A module with static TLS just loaded — give every ALREADY-RUNNING thread its copy.
+     *
+     * Registering the entry only serves threads created later, and a DLL loaded through
+     * LoadLibrary (every mod/plugin DLL) arrives when the threads that will run its code
+     * already exist. Windows' loader allocates the block for all of them at load time; skip
+     * it and `ThreadLocalStoragePointer[index]` stays NULL, so the module's first
+     * `__declspec(thread)` access — which MSVC also emits for C++ magic statics, i.e. almost
+     * immediately — dereferences a small offset off zero.
+     */
+    initImplicitTlsEntryForExistingThreads(entry: ImplicitTlsEntry): void {
+        const memManager = System.getInstance().process?.memory;
+        const memory = System.getInstance().process?.getCurrentMemory?.();
+        if (!memManager || !memory) return;
+        for (const [threadId, thread] of this.threads) {
+            if (thread.tlsValues.has(entry.tlsIndex)) continue;
+            this.materializeTlsEntry(threadId, thread, entry, memory, memManager);
+        }
+    }
+
     private initImplicitTlsForThread(threadId: number, thread: Thread, memory: Uint8Array): void {
         const system = System.getInstance();
         const entries = system.implicitTlsEntries;
@@ -3022,26 +3071,7 @@ export class Scheduler {
             `TEB=0x${(tebAddr ?? 0).toString(16)}, TLS array=0x${(tlsArrayAddr ?? 0).toString(16)}`);
 
         for (const entry of entries) {
-            const totalSize = entry.templateSize + entry.zeroFillSize;
-            const allocSize = Math.max(totalSize, 16);
-            const tlsDataAddr = memManager.alloc(allocSize);
-
-            // Copy template data
-            if (entry.templateSize > 0 && entry.templateStart > 0) {
-                memory.copyWithin(tlsDataAddr, entry.templateStart, entry.templateStart + entry.templateSize);
-            }
-            // Zero fill
-            if (entry.zeroFillSize > 0) {
-                memory.fill(0, tlsDataAddr + entry.templateSize, tlsDataAddr + totalSize);
-            }
-
-            // Store in thread's TLS values and sync to guest memory
-            thread.tlsValues.set(entry.tlsIndex, tlsDataAddr >>> 0);
-            this.tebManager.syncTlsSlot(threadId, entry.tlsIndex, tlsDataAddr >>> 0);
-
-            Logger.log(LogCategory.THREAD,
-                `  TLS slot ${entry.tlsIndex} (${entry.moduleName}): data=0x${tlsDataAddr.toString(16)} ` +
-                `(${totalSize} bytes, template@0x${entry.templateStart.toString(16)})`);
+            this.materializeTlsEntry(threadId, thread, entry, memory, memManager);
         }
 
         // Verify: read back FS:[0x2C] equivalent (TEB+0x2C) and TLS slot values

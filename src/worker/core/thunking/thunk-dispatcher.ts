@@ -180,6 +180,18 @@ const GUEST_CODE_START = 0x100000;  // After LOW_MEM region
 const THUNK_REGION_START = 0x10000000;
 const THUNK_REGION_END = 0x11000000;
 
+/**
+ * The default window procedures a subclass chain calls through CallWindowProc. Their
+ * stub IS the callback target, so their return address legitimately points into the
+ * callback stub pool — for every other thunk that means a desynced stack.
+ */
+function isDefaultWindowProcThunk(thunkName: string): boolean {
+    return thunkName.includes('DefWindowProc')
+        || thunkName.includes('DefDlgProc')
+        || thunkName.includes('DefMDIChildProc')
+        || thunkName.includes('DefFrameProc');
+}
+
 export class ThunkDispatcher {
     // --- DOD: Flat Arrays for O(1) Access ---
     private dispatchTable: Array<ThunkImplementation | null> = new Array(MAX_THUNK_ID).fill(null);
@@ -1242,7 +1254,7 @@ export class ThunkDispatcher {
                         // Context Switch signaled
                         const thunkName = this.namesTable[functionId] || "unknown";
                         const duration = frameProfiler.endTimer("thunk", thunkStart);
-                        frameProfiler.recordThunk(thunkName, duration * 32, 32);
+                        frameProfiler.recordThunk(thunkName, duration * 32, 32, false, duration);
                         frameProfiler.markThunkEnd();
                         return;
                     }
@@ -1252,7 +1264,7 @@ export class ThunkDispatcher {
                         reg32[0] = res >>> 0;
                         const thunkName = this.namesTable[functionId] || "unknown";
                         const duration = frameProfiler.endTimer("thunk", thunkStart);
-                        frameProfiler.recordThunk(thunkName, duration * 32, 32);
+                        frameProfiler.recordThunk(thunkName, duration * 32, 32, false, duration);
                         frameProfiler.markThunkEnd();
 
                         // Inline ESP tracking
@@ -1601,7 +1613,7 @@ export class ThunkDispatcher {
 
         this.fillStackArgs(espAtEntry, argCount);
 
-        const allowStubPoolRet = thunkName.includes('DefWindowProc');
+        const allowStubPoolRet = isDefaultWindowProcThunk(thunkName);
         if (!this.validateReturnAddrFast(espAtEntry, allowStubPoolRet)) {
             this._slowPathInvalidReturnPreCall(functionId, thunkName, espAtEntry, cpu);
             if (profileThunk) profiler.endAsync(thunkName);
@@ -1675,7 +1687,7 @@ export class ThunkDispatcher {
             if (dur >= HEAVY_THUNK_MS) {
                 frameProfiler.recordThunk(thunkName, dur, 1, memBorrowsBefore === guestMemoryBorrowCount());
             } else if ((this.thunkCount & 0xF) === 0) {
-                frameProfiler.recordThunk(thunkName, dur * 16, 16);
+                frameProfiler.recordThunk(thunkName, dur * 16, 16, false, dur);
             }
             frameProfiler.markThunkEnd();
             this._handleSyncResult(result, functionId, thunkName, cpu, this.reusableContext, argCount, espAtEntry);
@@ -2072,7 +2084,7 @@ export class ThunkDispatcher {
         if (typeof result === 'number') {
             reg32[0] = result >>> 0;
             this.winApiRing.recordReturnValue(result >>> 0); // crash-diagnosis ring
-            const allowStub = name.includes('DefWindowProc');
+            const allowStub = isDefaultWindowProcThunk(name);
             if (!this.validateReturnAddrFast(espAtEntry, allowStub)) {
                 this._slowPathInvalidReturn(id, name, espAtEntry, result, cpu);
                 this.boundaryKind = ThunkBoundaryKind.THUNK_STUB;
@@ -2124,7 +2136,7 @@ export class ThunkDispatcher {
         this.winApiRing.recordReturnValue(thunkRes.value >>> 0); // crash-diagnosis ring
 
         const mem8 = this.cachedMem8;
-        const allowStubSync = name.includes('DefWindowProc');
+        const allowStubSync = isDefaultWindowProcThunk(name);
         // Skip return address validation for SEH/callback thunks � ESP was moved to catch frame
         if (mem8 && !skipStackCheck && !this.validateReturnAddr(mem8, espAtEntry, `Sync thunk ${name}`, allowStubSync)) {
             Logger.error(LogCategory.THUNK,
@@ -2961,6 +2973,10 @@ export class ThunkDispatcher {
     }
 
     private _restoreAsyncContext(info: ActiveAsyncThunk, cpu: any, returnValue: number, cleanupBytes: number, name: string, deferredWrites?: DeferredWrite[]): void {
+        // Crash-diagnosis ring: an async thunk returns long after its entry stopped being the
+        // newest, so recordReturnValue (which writes the newest slot) would pin this result on
+        // an unrelated call. Match by name against the most recent unreturned entry instead.
+        this.winApiRing?.recordAsyncReturnByName(name, returnValue >>> 0);
         // Refresh memory cache after async operations
         this.updateMemoryCache();
 

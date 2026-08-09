@@ -107,6 +107,7 @@ export class AddressSpace {
 
     reset(): void {
         this.regions = [];
+        this.invalidateRegionIndex();
         this.nextRegionId = 1;
         this.layoutBucketMap.clear();
         this.ensureLowMemRegion(0x00100000);
@@ -130,6 +131,7 @@ export class AddressSpace {
         }
 
         this.regions.push(newEntry);
+        this.noteRegionAdded(newEntry);
         if (entry.owner === "Layout") {
             this.layoutBucketMap.set(entry.kind, newEntry);
         }
@@ -157,6 +159,7 @@ export class AddressSpace {
         if (idx >= 0) {
             const released = this.regions[idx];
             this.regions.splice(idx, 1);
+            this.noteRegionRemoved(released);
             // A released VA is no longer a known writable region — drop bit0.
             // (Data map, read per store, no generation guard — see codegen gen_safe_write.)
             setWriteMapBase(released.base, released.size, false);
@@ -295,6 +298,10 @@ export class AddressSpace {
         if (existing) {
             existing.size = size;
             existing.perms = "rw";
+            // A non-bucket region's `size` is baked into the index's prefix-max end, which the
+            // index holds by VALUE (unlike `perms`/bucket sizes, read live through the
+            // reference). Resizing one in place therefore has to drop the index.
+            this.invalidateRegionIndex();
             return;
         }
 
@@ -311,19 +318,133 @@ export class AddressSpace {
 
     validateRange(address: number, size: number, requiredPerms: string = "rw"): boolean {
         if (address < 0 || size < 0) return false;
-        const end = address + size;
 
-        for (const region of this.regions) {
-            if (address >= region.base && end <= region.base + region.size) {
-                if (region.perms === "noaccess") return false;
-                if (requiredPerms.includes("w") && !region.perms.includes("w")) return false;
-                if (requiredPerms.includes("x") && !region.perms.includes("x")) return false;
-                return true;
-            }
+        // Layout buckets are coarse containers that DELIBERATELY overlap the real regions
+        // registered inside them (allowOverlap), so "first containing region wins" answers
+        // with the bucket's blanket perms — a write into a mapped DLL's .data reads as a
+        // write into read-only ROM. The narrowest containing region is the one that actually
+        // describes this address; the bucket is only the fallback when nothing finer exists.
+        const best = this.findNarrowestContaining(address, address + size);
+        if (!best) return false;
+
+        if (best.perms === "noaccess") return false;
+        if (requiredPerms.includes("w") && !best.perms.includes("w")) return false;
+        if (requiredPerms.includes("x") && !best.perms.includes("x")) return false;
+        return true;
+    }
+
+    // ── stabbing index ────────────────────────────────────────────────────────
+    // validateRange is the mandated check on EVERY guest-supplied pointer, so it runs
+    // hundreds of times per frame (two per D3D draw). A linear sweep makes that O(regions),
+    // and `regions` scales with the game's surface count — a loaded Half-Life level
+    // registers ~1900 of them, so the sweep, not the work it guards, became the cost.
+    //
+    // Split so the standard interval prune actually prunes: layout buckets span the whole
+    // address space by design, and a prefix-max over a set containing them never terminates
+    // early. They are few (one per kind) and checked directly; everything else is sorted by
+    // base with a prefix max end, which for the near-disjoint real regions stops after a
+    // couple of steps.
+    //
+    // The index holds REFERENCES, so `perms` (mutated by protect) and a bucket's `size`
+    // (mutated by expandLayoutBucket) are always read live. Only MEMBERSHIP is cached —
+    // which is why noteRegionAdded/noteRegionRemoved/invalidateRegionIndex belong at exactly
+    // the three sites that add or remove a region, and nowhere else. Miss one and the index
+    // answers from a stale membership; tools/tests/address-space-validate-range.test.ts
+    // differences it against the sweep it replaced and fails on each such omission.
+    //
+    // The rebuild is AMORTIZED, not per-mutation: MemoryManager registers and releases
+    // regions in tight alloc/free loops, and an O(n log n) sort on each one would trade a
+    // per-draw cost for a per-allocation one. Recent additions are held in a short unsorted
+    // list and removals as tombstones; both are folded in only once REBUILD_THRESHOLD of
+    // them accumulate, which bounds the linear part of a query as well.
+    private idxBuilt = false;
+    private idxBuckets: RegionEntry[] = [];
+    private idxSorted: RegionEntry[] = [];
+    private idxMaxEnd = new Float64Array(0);
+    /** Registered since the last build — scanned linearly, capped by REBUILD_THRESHOLD. */
+    private idxRecent: RegionEntry[] = [];
+    /** Released since the last build; the sorted array still holds them, so queries skip these. */
+    private idxRemoved: Set<number> = new Set();
+    private static readonly REBUILD_THRESHOLD = 64;
+
+    /** Record a membership change. Cheap; the sort happens only when the deltas pile up. */
+    private noteRegionAdded(entry: RegionEntry): void {
+        if (!this.idxBuilt) return;                 // nothing built yet — nothing to patch
+        this.idxRecent.push(entry);
+        this.maybeRebuildRegionIndex();
+    }
+
+    private noteRegionRemoved(entry: RegionEntry): void {
+        if (!this.idxBuilt) return;
+        const i = this.idxRecent.indexOf(entry);
+        if (i >= 0) this.idxRecent.splice(i, 1);
+        else this.idxRemoved.add(entry.id);
+        this.maybeRebuildRegionIndex();
+    }
+
+    private maybeRebuildRegionIndex(): void {
+        if (this.idxRecent.length + this.idxRemoved.size >= AddressSpace.REBUILD_THRESHOLD) {
+            this.rebuildRegionIndex();
         }
+    }
 
+    private invalidateRegionIndex(): void {
+        this.idxBuilt = false;
+        this.idxRecent.length = 0;
+        this.idxRemoved.clear();
+    }
 
-        return false;
+    private rebuildRegionIndex(): void {
+        const buckets: RegionEntry[] = [];
+        const sorted: RegionEntry[] = [];
+        for (const r of this.regions) (r.owner === "Layout" ? buckets : sorted).push(r);
+        sorted.sort((a, b) => a.base - b.base);
+        const maxEnd = new Float64Array(sorted.length);
+        let m = -Infinity;
+        for (let i = 0; i < sorted.length; i++) {
+            const e = sorted[i].base + sorted[i].size;
+            if (e > m) m = e;
+            maxEnd[i] = m;
+        }
+        this.idxBuckets = buckets;
+        this.idxSorted = sorted;
+        this.idxMaxEnd = maxEnd;
+        this.idxRecent.length = 0;
+        this.idxRemoved.clear();
+        this.idxBuilt = true;
+    }
+
+    /** Narrowest region wholly containing [start, end). Identical result to a full sweep. */
+    private findNarrowestContaining(start: number, end: number): RegionEntry | undefined {
+        if (!this.idxBuilt) this.rebuildRegionIndex();
+        let best: RegionEntry | undefined;
+        const consider = (r: RegionEntry): void => {
+            if (start < r.base || end > r.base + r.size) return;
+            if (!best || r.size < best.size) best = r;
+        };
+        const buckets = this.idxBuckets;
+        for (let i = 0; i < buckets.length; i++) consider(buckets[i]);
+        const recent = this.idxRecent;
+        for (let i = 0; i < recent.length; i++) consider(recent[i]);
+
+        const sorted = this.idxSorted;
+        const maxEnd = this.idxMaxEnd;
+        const removed = this.idxRemoved;
+        const anyRemoved = removed.size > 0;
+        // Last entry with base <= start; everything after it starts too late to contain start.
+        let lo = 0, hi = sorted.length - 1, last = -1;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            if (sorted[mid].base <= start) { last = mid; lo = mid + 1; } else { hi = mid - 1; }
+        }
+        for (let i = last; i >= 0; i--) {
+            // Containment needs base + size >= end; maxEnd is the best any 0..i can offer.
+            if (maxEnd[i] < end) break;
+            const r = sorted[i];
+            if (anyRemoved && removed.has(r.id)) continue;
+            consider(r);
+        }
+        return best;
     }
 
     getLayoutBucket(kind: RegionKind): RegionEntry | null {

@@ -57,6 +57,13 @@ export type ThunkAggregate = {
      *  (see recordThunk's `noBorrow`). High here = a leaf indexing v86's Proxy per element. */
     noBorrowMs: number;
     noBorrowCount: number;
+    /** Of `totalMs`, the part that came from samples at or below the CLOCK's granularity.
+     *  performance.now() is quantised (5 us under cross-origin isolation, coarser without),
+     *  so a sub-microsecond call measures as 0 or one whole quantum — and a sampled thunk
+     *  scales that quantum by its sampling weight. Time that is mostly this is noise wearing
+     *  a number's clothes; getThunkReport marks such rows instead of printing an average
+     *  the clock cannot support. */
+    quantizedMs: number;
 };
 
 export type BadFrameCapture = {
@@ -130,6 +137,32 @@ export class FrameProfiler {
     // Frame-time distribution over the window (histogram + p50/p95/p99 + budget), the tail
     // statistic the 5-slot worst-frame ring and the mean cannot express.
     private readonly distribution = new FrameTimeDistribution();
+
+    /** Smallest non-zero interval performance.now() can express here. Measured, not assumed:
+     *  it is 5 us under cross-origin isolation and coarser without, and every per-call timing
+     *  this class reports is meaningless below it. */
+    get timerResolutionMs(): number {
+        if (this._timerResolutionMs === 0) this._timerResolutionMs = FrameProfiler.measureTimerResolution();
+        return this._timerResolutionMs;
+    }
+    private _timerResolutionMs = 0;
+
+    /** Measured on FIRST READ, not at construction: this class is a module-level singleton
+     *  and the probe busy-spins, so on a coarse-clock host it would block the worker's import
+     *  path. Bounded in wall time as well — a host that never advances the clock must not
+     *  spin forever. */
+    private static measureTimerResolution(): number {
+        let smallest = Infinity;
+        const deadline = performance.now() + 2;
+        for (let i = 0; i < 8; i++) {
+            const a = performance.now();
+            let b = a;
+            while (b === a && b < deadline) b = performance.now();
+            if (b > a && b - a < smallest) smallest = b - a;
+            if (b >= deadline) break;
+        }
+        return Number.isFinite(smallest) ? smallest : 0.005;
+    }
 
     /** Capture threshold. 33.33 (30fps) is the default, NOT a goal: a 60fps-target title
      *  wants ~20, and a budget-relative read wants it aligned with that budget. */
@@ -361,23 +394,30 @@ export class FrameProfiler {
      * per element (~140x the cost of a typed array) — getThunkReport ranks those so the
      * class gets re-found by measurement instead of by another manual audit.
      */
-    recordThunk(name: string, ms: number, countWeight: number = 1, noBorrow: boolean = false): void {
+    recordThunk(name: string, ms: number, countWeight: number = 1, noBorrow: boolean = false,
+                sampleMs: number = ms): void {
         if (!this.enabled || ms < 0) return;
+        // `sampleMs` is the raw measured interval before any sampling scale-up; comparing
+        // THAT (not the scaled total) against the clock's granularity is what says whether
+        // the measurement carried information.
+        const quantized = sampleMs <= this.timerResolutionMs * 1.5;
         let agg = this.currentThunkAggregates.get(name);
         if (!agg) {
-            agg = { count: 0, totalMs: 0, noBorrowMs: 0, noBorrowCount: 0 };
+            agg = { count: 0, totalMs: 0, noBorrowMs: 0, noBorrowCount: 0, quantizedMs: 0 };
             this.currentThunkAggregates.set(name, agg);
         }
         agg.count += countWeight;
         agg.totalMs += ms;
+        if (quantized) agg.quantizedMs += ms;
 
         let sess = this.sessionThunkAggregates.get(name);
         if (!sess) {
-            sess = { count: 0, totalMs: 0, noBorrowMs: 0, noBorrowCount: 0 };
+            sess = { count: 0, totalMs: 0, noBorrowMs: 0, noBorrowCount: 0, quantizedMs: 0 };
             this.sessionThunkAggregates.set(name, sess);
         }
         sess.count += countWeight;
         sess.totalMs += ms;
+        if (quantized) sess.quantizedMs += ms;
         if (noBorrow) {
             agg.noBorrowMs += ms; agg.noBorrowCount += countWeight;
             sess.noBorrowMs += ms; sess.noBorrowCount += countWeight;
@@ -644,13 +684,27 @@ export class FrameProfiler {
                 // Slow AND never borrowed a plain view ⇒ prime suspect for a Proxy-indexed leaf.
                 noBorrowMs: +agg.noBorrowMs.toFixed(2),
                 noBorrowAvgUs: agg.noBorrowCount > 0 ? +((agg.noBorrowMs * 1000) / agg.noBorrowCount).toFixed(1) : 0,
+                // How much of this row's time came from samples the clock could not resolve.
+                // At 100% the totalMs is an artefact of quantisation scaled by the sampling
+                // weight — the call count is real, the time is not.
+                quantizedPct: agg.totalMs > 0 ? +((agg.quantizedMs / agg.totalMs) * 100).toFixed(0) : 0,
+                timeUnreliable: agg.totalMs > 0 && agg.quantizedMs / agg.totalMs > 0.5,
             }))
             .sort((a, b) => b.totalMs - a.totalMs)
             .slice(0, top);
+        const unreliable = rows.filter(r => r.timeUnreliable).map(r => r.name);
         return {
             enabled: this.enabled,
             frames: this.sessionFrames,
             thunkTotalMs: +totalMs.toFixed(2),
+            timerResolutionMs: +this.timerResolutionMs.toFixed(4),
+            // Naming them here, not only per row: a reader scanning for the biggest totalMs
+            // is exactly the reader who will not notice a per-row flag.
+            unreliableRows: unreliable.length > 0 ? unreliable : undefined,
+            note: unreliable.length > 0
+                ? `time for ${unreliable.length} row(s) came from samples at or below the ${(this.timerResolutionMs * 1000).toFixed(0)}us clock granularity `
+                  + `and is quantisation noise scaled by the sampling weight — trust their COUNT, not their ms`
+                : undefined,
             rows,
         };
     }

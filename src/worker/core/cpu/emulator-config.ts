@@ -49,6 +49,17 @@ export const MEM_PAGETABLE_SIZE = 0x00801000;   // PD + 1024 PTs
 export const MEM_ROM_BASE = 0x24000000;         // After GUARD
 export const MEM_ROM_SIZE = 0x08000000;         // 128MB
 
+// HLE MODULE IMAGES: synthetic PE images for the DLLs we thunk (kernel32, ddraw, mss32…).
+// An HMODULE on Windows IS the ImageBase of a mapped PE, and guests act on that: pattern
+// scanners, mod loaders and dbghelp!ImageNtHeader all dereference the handle. Carved from
+// the TOP of ROM so ROM's start — the one number mirrored in Rust as the fastmem guard's
+// end — never moves; ModuleRegistry's real-DLL allocator stops at MEM_HLE_IMAGE_BASE.
+export const MEM_HLE_IMAGE_SIZE = 0x02000000;   // 32MB
+export const MEM_HLE_IMAGE_BASE = MEM_ROM_BASE + MEM_ROM_SIZE - MEM_HLE_IMAGE_SIZE;
+// One slot per module. 256KB is also the size VFS reports for these DLLs, so the stat
+// size and the image's SizeOfImage are the same constant and cannot drift apart.
+export const HLE_IMAGE_SLOT_SIZE = 0x40000;
+
 // SURFACE_PIXELS: DirectDraw surface pixel data — placed LAST so it can expand
 // freely via expandLayoutBucket up to the end of RAM. Texture-heavy hidden-object
 // games (Natalie Brooks) chew through hundreds of MB of 1024x1024 SYSMEM textures.

@@ -22,6 +22,7 @@ import { Ole32 } from "./modules/ole32";
 import { Oleaut32 } from "./modules/oleaut32";
 import { DDraw } from "./modules/ddraw";
 import { getOverlayCompositePlan } from "./modules/user32/dialog-overlay";
+import { flushHeldWindowDCs } from "./modules/user32/window";
 import { DInput } from "./modules/dinput";
 import { DPlayX } from "./modules/dplayx";
 import { MSS32 } from "./modules/mss32";
@@ -67,6 +68,7 @@ import { D3D8 } from "./modules/d3d8";
 import { D3dx9 } from "./modules/d3dx9";
 import { OpenAL, ALUT } from "./modules/openal/openal";
 import { Quartz } from "./modules/quartz";
+import { DMusic } from "./modules/dmusic";
 import { A3d } from "./modules/a3d";
 import { Avifil32 } from "./modules/avifil32";
 import { Rpcrt4 } from "./modules/rpcrt4";
@@ -126,6 +128,7 @@ import { registerFastPathMsvcrtFunctions } from "./modules/msvcrt";
 import { registerFastPathPointerFunctions } from "./modules/kernel32/exception";
 import { registerFastPathProcessFunctions } from "./modules/kernel32/process/process";
 import { prePopulateGetProcAddressCache, registerFastPathModuleFunctions, ensureGetProcAddressDynamicExports } from "./modules/kernel32/module/module";
+import { materializeHleModuleImages } from "./core/hle-module-images";
 import { KERNEL32_VISTA_WARMUP_EXPORTS } from "./api/kernel32-vista-supplement";
 // Load diagnostics commands (exposes frameDiagnostics to console)
 import "./core/diagnostics-commands";
@@ -298,6 +301,9 @@ let gameSessionActive = false;
 let lastBundlePayload: { data?: Uint8Array; url?: string; blob?: Blob; blobs?: File[]; preload?: boolean } | null = null;
 /** Command line the next boot must use instead of the manifest's `args` (self re-exec). */
 let pendingReExecArgs: string | null = null;
+/** VFS path of the image the next boot must run instead of the manifest's `entrypoint`
+ *  (a launcher starting the game — see requestSelfReExec). */
+let pendingReExecImage: string | null = null;
 let registrySaveTimeout: number | null = null;
 let registrySaveGeneration = 0;
 /** do_tick liveness counter — incremented in the tick_hooks_before guard every v86 do_tick().
@@ -361,7 +367,6 @@ const gdiPresentLoop = () => {
   const backend = system.services.render.getBackend();
   if (backend) {
     const videoCanvas = videoOverlay.hasContent() ? videoOverlay.getCanvas() : null;
-    const gdiDirty = gdi.isOverlayDirty();
 
     // This rAF loop is one of several GDI-over-frame compositors (alongside the DDraw
     // presenter's drawFrame/2D/phase-blend paths and the D3D8/D3D9/Glide present paths).
@@ -373,6 +378,14 @@ const gdiPresentLoop = () => {
     // renders its frontend via DDraw sprites, and its full-screen MFC host dialog's gray
     // WM_ERASEBKGND would otherwise be composited over every frame.
     const plan = getOverlayCompositePlan(renderActive);
+
+    // Held window DCs publish here, not on ReleaseDC: a software renderer that keeps its
+    // GetDC for the process lifetime never releases it, and on real GDI its BitBlt is on
+    // screen the moment it is drawn. Coalesced to one blit per composite, and only while
+    // GDI owns the screen — under any other plan that output is not visible on Windows
+    // either, so publishing it would just leak the game's window into the dialog rects.
+    if (plan.mode === 'full') flushHeldWindowDCs();
+    const gdiDirty = gdi.isOverlayDirty();
 
     if (plan.mode !== 'full') {
       // Game owns the screen. Drop stale dirty flags so a later composite (e.g. after
@@ -934,6 +947,8 @@ const loadPeData = async (peData: Uint8Array, skipReset: boolean = false) => {
     // JS implementations to stubs now that they exist.
     // (this also registers matching functions with hypercallDataManager)
     system.process.dispatcher.applyPendingRegistrations();
+    // Before the cache: it keys on the HMODULE, and the HMODULE is the image's base.
+    materializeHleModuleImages(system.process);
     prePopulateGetProcAddressCache(system.process.dispatcher);
     ensureGetProcAddressDynamicExports(system.process.dispatcher, [
       { dll: "d3d9", name: "Direct3DShaderValidatorCreate9" },
@@ -1840,6 +1855,32 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
       );
     }
 
+    // A launcher started another image from this bundle (requestSelfReExec with a VFS
+    // path): that image is the entry point for THIS boot. The VFS root is the bundle's
+    // romRoot, so the archive entry is romRoot + the path minus its drive.
+    if (pendingReExecImage) {
+      // A guest joining cwd + name yields doubled separators when cwd is a bare root
+      // ("C:\" + "\RF.exe"); the archive has no such entry, so normalize before lookup.
+      const rel = pendingReExecImage
+        .replace(/^[a-z]:/i, "").replace(/\\/g, "/").replace(/\/+/g, "/").replace(/^\//, "");
+      const candidate = romRoot ? `${romRoot.replace(/\/+$/, "")}/${rel}` : rel;
+      const found = !!bundle.archive.getEntry(candidate);
+      // Parked where a probe can read it: this decision is made during the load firehose,
+      // and log streaming does not survive the page reload that precedes it.
+      (globalThis as Record<string, unknown>).__bsExecBoot =
+        { image: pendingReExecImage, entry: candidate, romRoot, found };
+      if (found) {
+        Logger.log(LogCategory.SYSTEM,
+          `WGB: exec entrypoint "${bundle.manifest.entrypoint}" -> "${candidate}"`);
+        bundle.manifest.entrypoint = candidate;
+        bundle.entrypointBytes = await readEntrypointBytes(bundle.archive, candidate);
+      } else {
+        Logger.warn(LogCategory.SYSTEM,
+          `WGB: exec image "${pendingReExecImage}" (entry "${candidate}") not in the bundle — booting the manifest entrypoint`);
+      }
+      pendingReExecImage = null;
+    }
+
     // Extract executable name and full VFS path from entrypoint
     // e.g., entrypoint="rom/game/REVOLT.EXE", romRoot="rom" -> VFS path="C:\game\REVOLT.EXE"
     const entrypointPath = bundle.manifest.entrypoint;
@@ -1949,15 +1990,23 @@ const loadBundle = (payload: { data?: Uint8Array; url?: string; blob?: Blob; blo
  * macrotask, so this is the same proven entry the normal path uses — by then the thunk has
  * returned its SE_ERR_/PROCESS_INFORMATION value and the guest is at a clean boundary.
  */
-const requestSelfReExec = (commandLine: string): boolean => {
+const requestSelfReExec = (commandLine: string, imagePath?: string): boolean => {
   // Returns whether the re-exec was ACCEPTED. A launcher that exits believing it started a
   // child, when nothing was scheduled, is a silent vanish — shell32 reports our verdict.
   if (!lastBundlePayload) {
     Logger.warn(LogCategory.SYSTEM, `[ReExec] ignored "${commandLine}" — no bundle payload to replay`);
     return false;
   }
-  if (pendingReExecArgs !== null) return false; // already scheduled; a launcher may ask twice
+  if (pendingReExecArgs !== null || pendingReExecImage !== null) return false; // already scheduled
+  if (imagePath && !/^[a-z]:\\/i.test(imagePath)) {
+    // Refuse rather than restart onto the CURRENT image: a launcher told "your child
+    // started" would exit, and the session would silently reboot into the launcher again.
+    Logger.warn(LogCategory.SYSTEM, `[ReExec] refused "${imagePath}" — not an absolute VFS path`);
+    return false;
+  }
   pendingReExecArgs = commandLine;
+  pendingReExecImage = imagePath ?? null;
+  System.getInstance().isReExecPending = true;
   const payload = lastBundlePayload;
 
   // Ask the HOST to restart us by reloading the page. A re-exec has to land in a pristine
@@ -1966,8 +2015,9 @@ const requestSelfReExec = (commandLine: string): boolean => {
   // that just hosted a full game, and wedges before its first present — while the very same
   // command line on a cold boot runs. The host replies by reloading, which is the cold boot.
   if (payload?.url) {
-    Logger.log(LogCategory.SYSTEM, `[ReExec] requesting host page-reload restart, args "${commandLine}"`);
-    self.postMessage({ type: "reexec", args: commandLine, url: payload.url });
+    Logger.log(LogCategory.SYSTEM,
+      `[ReExec] requesting host page-reload restart, image "${pendingReExecImage ?? "(self)"}" args "${commandLine}"`);
+    self.postMessage({ type: "reexec", args: commandLine, url: payload.url, image: pendingReExecImage });
     return true;
   }
 
@@ -2202,6 +2252,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       const binkw32 = new BinkW32();
       const lgvid = new Lgvid();
       const quartz = new Quartz();
+      const dmusic = new DMusic();
       const a3d = new A3d();
       const avifil32 = new Avifil32();
       const rpcrt4 = new Rpcrt4();
@@ -2309,6 +2360,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
         lgvid.initialize(process);
       }
       quartz.initialize(process);
+      dmusic.initialize(process);
       a3d.initialize(process);
       avifil32.initialize(process);
       rpcrt4.initialize(process);
@@ -2374,6 +2426,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
         process.registerModule(lgvid.name, lgvid);
       }
       process.registerModule(quartz.name, quartz);
+      process.registerModule(dmusic.name, dmusic);
       process.registerModule(a3d.name, a3d);
       process.registerModule(avifil32.name, avifil32);
       process.registerModule(rpcrt4.name, rpcrt4);
@@ -2440,6 +2493,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
         process.dispatcher.registerModule(lgvid.name, lgvid.exports);
       }
       process.dispatcher.registerModule(quartz.name, quartz.exports);
+      process.dispatcher.registerModule(dmusic.name, dmusic.exports);
       process.dispatcher.registerModule(a3d.name, a3d.exports);
       process.dispatcher.registerModule(avifil32.name, avifil32.exports);
       process.dispatcher.registerModule(rpcrt4.name, rpcrt4.exports);
@@ -2515,6 +2569,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       // Apply pending registrations after modules are registered (JS impls) and stubs for external DLLs exist
       // (this also registers matching functions with hypercallDataManager)
       process.dispatcher.applyPendingRegistrations();
+      materializeHleModuleImages(process);
       prePopulateGetProcAddressCache(process.dispatcher);
       ensureGetProcAddressDynamicExports(process.dispatcher, [
         { dll: "d3d9", name: "Direct3DShaderValidatorCreate9" },
@@ -2833,7 +2888,9 @@ self.onmessage = (event: MessageEvent) => {
     // performed on our behalf. Must arrive BEFORE load_bundle — loadBundleImpl consumes it
     // in place of the manifest's `args` for exactly one boot.
     pendingReExecArgs = typeof message.args === "string" ? message.args : null;
-    Logger.log(LogCategory.SYSTEM, `[ReExec] boot args from host: "${pendingReExecArgs ?? ""}"`);
+    pendingReExecImage = typeof message.image === "string" && message.image ? message.image : null;
+    Logger.log(LogCategory.SYSTEM,
+      `[ReExec] boot from host: image "${pendingReExecImage ?? "(manifest)"}" args "${pendingReExecArgs ?? ""}"`);
     return;
   }
 

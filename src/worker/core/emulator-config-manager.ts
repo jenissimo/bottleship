@@ -173,6 +173,25 @@ const decoderCache = new Map<number, CodePageDecoder>();
 const encoderCache = new Map<number, Map<number, number>>();
 
 /**
+ * Code pages whose encoding is multi-byte (DBCS/MBCS/UTF). Everything else getCodePageDecoder
+ * can answer with — the LUT decoders and every CP_TO_ENCODING label, plus the windows-1252
+ * fallback an unknown page lands on — maps one byte to one code unit.
+ *
+ * This is an explicit list because the property CANNOT be probed from a decoder: today an
+ * unlisted page falls back to windows-1252 and decodes byte-at-a-time, and even a real
+ * shift_jis decoder turns a lone lead byte into exactly one U+FFFD. A caller that builds a
+ * 256-entry table must ask here, not measure.
+ */
+const MULTIBYTE_CODEPAGES = new Set([
+    932, 936, 949, 950, 1361, 51932, 51936, 51949, 52936, 54936, 57002, 65000, 65001,
+]);
+
+/** May a 256-entry byte -> UTF-16 table stand in for getCodePageDecoder on this page? */
+export function isSingleByteCodePage(codePage: number): boolean {
+    return !MULTIBYTE_CODEPAGES.has(codePage);
+}
+
+/**
  * Get a decoder for the given Windows code page.
  * Falls back to windows-1252 for unknown code pages.
  * Uses a LUT-backed decoder for DOS code pages the browser doesn't support.
@@ -302,6 +321,13 @@ export class EmulatorConfig {
 
     // Per-game deny-list for LoadLibrary* (case-insensitive; wildcard allowed)
     public disabledDlls: string[] = [];
+
+    // DLL names whose copy in the GAME DIRECTORY wins over our HLE module — Windows'
+    // real search order (the application directory precedes System32 for anything that
+    // is not a KnownDLL). Wrapper/proxy DLLs a game ships next to its exe (ASI loaders,
+    // Glide and ddraw wrappers) only run at all under this. Same rule syntax as
+    // disabledDlls. Opt-in per bundle while the default order is still HLE-first.
+    public appDirDlls: string[] = [];
 
     // Fake ShellExecuteA subprocess results
     public shellExecFake: Array<{
@@ -559,6 +585,17 @@ export class EmulatorConfig {
             );
         }
 
+        // Apply the app-directory-wins list (game-shipped wrapper/proxy DLLs)
+        if (config.appDirDlls && config.appDirDlls.length > 0) {
+            this.appDirDlls = config.appDirDlls
+                .map((rule) => typeof rule === "string" ? rule.trim() : "")
+                .filter((rule) => rule.length > 0);
+            Logger.log(
+                LogCategory.SYSTEM,
+                `EmulatorConfig: appDirDlls loaded (${this.appDirDlls.length}): ${this.appDirDlls.join(", ")}`
+            );
+        }
+
         // Apply shellExecFake rules
         if (config.shellExecFake && config.shellExecFake.length > 0) {
             this.shellExecFake = config.shellExecFake;
@@ -626,6 +663,7 @@ export class EmulatorConfig {
         this.skipVideo = false;
         this.fpuStrict = false;
         this.disabledDlls = [];
+        this.appDirDlls = [];
         this.shellExecFake = [];
         this.deleteOnBoot = [];
         this.writeFiles = [];

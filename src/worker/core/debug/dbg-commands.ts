@@ -2228,13 +2228,16 @@ export const dbg = {
     /** Executor render stats: cumulative counters over every draw-losing path
      *  (ring overflow, bad range, no RT) + batching/pass/flush activity.
      *  Sample twice over an interval to get rates. */
-    rstats(): void {
+    rstats(): Record<string, number> | null {
         try {
             const dd = System.getInstance().process?.getModule?.('ddraw') as any;
             const exec = dd?.context?.executor ?? (globalThis as any).__ddrawExecutor;
             const stats = exec?.getRenderStats?.() ?? null;
             console.log(`[dbg][rstats][JSON] ${JSON.stringify(stats)}`);
-        } catch (e) { console.warn('[dbg] rstats err', e); }
+            // Returned as well as logged so `dbgCall('rstats')` can difference two samples
+            // without parsing the log firehose.
+            return stats ? { ...stats } : null;
+        } catch (e) { console.warn('[dbg] rstats err', e); return null; }
     },
     /** Per-frame renderStats deltas + ring high-water marks for the last n frames
      *  (newest last). One call after a visual glitch answers: did the draw count DROP

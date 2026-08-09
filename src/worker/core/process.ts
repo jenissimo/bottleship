@@ -1,5 +1,6 @@
 
 import { ThunkDispatcher } from './thunking/thunk-dispatcher';
+import { toPlainGuestMemory } from './memory/guest-memory';
 import { PELoader } from './pe-loader';
 import { SystemResourceProvider } from './resources/system-resource-provider';
 import { APIRegistry } from './api-registry';
@@ -959,8 +960,22 @@ export class Process {
         this.setupProtectedMode();
     }
 
+    /**
+     * Guest RAM for HLE consumers, normalized to a PLAIN Uint8Array.
+     *
+     * v86 hands out a Proxy (growth-transparent, but ~25x per element: 162.6ns vs 6.4ns
+     * measured by `dbg.memBench`). Asking every caller to remember `toPlainGuestMemory`
+     * does not scale — of 114 call sites only 4 did, and the misses are invisible in review
+     * and enormous in a profile: a 38 KB/frame scan cost 10.3 ms through the Proxy and
+     * 0.30 ms through a plain view. So the accessor normalizes; nobody downstream has to know.
+     *
+     * Safe because the hazard the Proxy exists for — a stored reference detaching when WASM
+     * memory grows — needs a caller that KEEPS the array across growth, and none does (no
+     * `this.x = getCurrentMemory()` anywhere). Every consumer re-fetches per use, and
+     * toPlainGuestMemory re-wraps on buffer identity, so a grown buffer yields a fresh view.
+     */
     getCurrentMemory(): Uint8Array {
-        return this.getMemory();
+        return toPlainGuestMemory(this.getMemory());
     }
 
     allocateMemory(size: number): number {

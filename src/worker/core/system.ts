@@ -108,6 +108,15 @@ export interface HostCursorImage {
     hotspotY: number;
 }
 
+/** One module's static-TLS (`__declspec(thread)`) template, as the PE TLS directory declares it. */
+export interface ImplicitTlsEntry {
+    tlsIndex: number;
+    templateStart: number;  // guest VA of template data
+    templateSize: number;
+    zeroFillSize: number;
+    moduleName: string;
+}
+
 export class System {
     private static instance: System;
     public process: Process | null = null;
@@ -127,6 +136,9 @@ export class System {
     public scheduler: Scheduler;
     public profiler: Profiler = profiler;
     public isExiting: boolean = false;
+    /** A launcher's re-exec is scheduled: the image is being RESTARTED, so its exit
+     *  must not surface as "the game exited" (see postProcessExitWhenDurable). */
+    public isReExecPending: boolean = false;
     public isCleaningUp: boolean = false;  // Set when game is in cleanup mode
     public isPaused: boolean = false;  // Set when emulator is paused
     private _releaseCount: number = 0;
@@ -270,7 +282,7 @@ export class System {
      * launcher exit and the app simply vanish. `void` is read as acceptance only so a host
      * that has not been updated keeps working.
      */
-    public onReExecRequest: ((commandLine: string) => boolean | void) | null = null;
+    public onReExecRequest: ((commandLine: string, imagePath?: string) => boolean | void) | null = null;
 
     /**
      * True when `file` (optionally relative to `directory`) names the image THIS process
@@ -283,25 +295,44 @@ export class System {
      * itself as `Game.exe <map> -SAVESLOT=n`).
      */
     public isSelfImage(file: string, directory: string = ""): boolean {
+        const target = this.resolveImagePath(file, directory);
+        if (!target) return false;
+        return target.toLowerCase() === this.executablePath.trim().replace(/\//g, "\\").toLowerCase();
+    }
+
+    /**
+     * `file` (optionally relative to `directory`) as a full VFS path, resolved the way
+     * CreateProcess/ShellExecute resolve it: an absolute path as given, otherwise against
+     * the stated working directory, otherwise against the image's own directory.
+     */
+    public resolveImagePath(file: string, directory: string = ""): string {
         const clean = (s: string): string => s.trim().replace(/^"+|"+$/g, "").replace(/\//g, "\\");
         let target = clean(file);
-        if (!target) return false;
-        const self = clean(this.executablePath);
-        // Bare or relative name: resolve against the stated working directory, else the
-        // image's own directory — the same order CreateProcess/ShellExecute resolve in.
+        if (!target) return "";
         if (!/^[a-z]:\\/i.test(target)) {
+            const self = clean(this.executablePath);
             const base = clean(directory) || self.slice(0, self.lastIndexOf("\\") + 1);
             target = (base.endsWith("\\") ? base : base + "\\") + target.replace(/^\\+/, "");
         }
-        return target.toLowerCase() === self.toLowerCase();
+        return target;
     }
 
-    /** Ask the worker to restart this process with `commandLine`. False if unsupported or refused. */
-    public requestReExec(commandLine: string): boolean {
+    /**
+     * Ask the worker to restart with `commandLine`, running `imagePath` instead of the
+     * current image when given. False if unsupported or refused.
+     *
+     * One process hosts one image, so a launcher starting the GAME is served the same way
+     * a launcher relaunching ITSELF is: restart, mounting the same bundle, with the new
+     * image as the entry point. The parent does not survive — which is what a launcher
+     * that exits right after CreateProcess does anyway, and the only single-process
+     * reading of "run this instead" available to us.
+     */
+    public requestReExec(commandLine: string, imagePath?: string): boolean {
         if (!this.onReExecRequest) return false;
-        const accepted = this.onReExecRequest(commandLine) !== false;
+        const accepted = this.onReExecRequest(commandLine, imagePath) !== false;
         if (!accepted) {
-            Logger.warn(LogCategory.SYSTEM, `Re-exec refused by the host for "${commandLine}"`);
+            Logger.warn(LogCategory.SYSTEM,
+                `Re-exec refused by the host for "${imagePath ?? this.executablePath}" "${commandLine}"`);
         }
         return accepted;
     }
@@ -311,13 +342,7 @@ export class System {
      * Each entry records the TLS index and template data location so that
      * new threads (CreateThread) can initialize their own TLS data copies.
      */
-    public implicitTlsEntries: Array<{
-        tlsIndex: number;
-        templateStart: number;  // guest VA of template data
-        templateSize: number;
-        zeroFillSize: number;
-        moduleName: string;
-    }> = [];
+    public implicitTlsEntries: ImplicitTlsEntry[] = [];
     private hostResize: ((width: number, height: number) => void) | null = null;
     private hostCursorVisibility: ((visible: boolean) => void) | null = null;
     private hostCursorVisibleState: boolean | null = null;
@@ -418,6 +443,48 @@ export class System {
         return fault;
     }
 
+    /** Ceiling on the exit-time durability barrier — a stuck OPFS writer must not
+     *  strand the host's exit dialog behind a promise that never settles. */
+    private static readonly EXIT_FLUSH_BUDGET_MS = 3000;
+    private exitNotified = false;
+
+    /**
+     * THE single process-exit notification. `process_exit` is the host's cue that the
+     * tab may be torn down, so it must not be posted while the guest's last writes are
+     * still buffered: the overlay's OPFS commit is DEBOUNCED, and a reload or a close
+     * inside that window drops whatever has not landed. The loss is per written RANGE,
+     * not a truncation, so a settings file saved on the way out comes back with a hole
+     * in it — and a config whose first byte is NUL reads as empty to the app that wrote
+     * it, which is exactly how "the game saved my settings and lost them" happens.
+     *
+     * Idempotent: a process exits once, however many exit paths report it.
+     */
+    postProcessExitWhenDurable(payload: Record<string, unknown>): void {
+        if (this.exitNotified) return;
+        this.exitNotified = true;
+        // A launcher exiting into its own re-exec is a restart, not an exit — but the
+        // page reload that serves it is exactly the teardown that drops buffered
+        // writes, so the barrier still runs; only the host dialog is suppressed.
+        const notifyHost = !this.isReExecPending;
+        let posted = false;
+        const post = (): void => {
+            if (posted || !notifyHost) return;
+            posted = true;
+            try {
+                (self as unknown as { postMessage: (m: unknown) => void })
+                    .postMessage({ type: "process_exit", ...payload });
+            } catch { /* not in a worker context (tests) — ignore */ }
+        };
+        const budget = setTimeout(() => {
+            Logger.warn(LogCategory.SYSTEM,
+                `process exit: flushAll did not drain within ${System.EXIT_FLUSH_BUDGET_MS}ms — notifying host anyway`);
+            post();
+        }, System.EXIT_FLUSH_BUDGET_MS) as unknown as number;
+        this.fileSystem.flushAll()
+            .catch((e) => Logger.warn(LogCategory.SYSTEM, `process exit: flushAll failed: ${e}`))
+            .then(() => { clearTimeout(budget); post(); });
+    }
+
     /**
      * THE single crash funnel. Every fatal guest-side crash class — unhandled AV
      * (#PF), bad return address (thunk stack desync), WASM hard trap (OOB) —
@@ -475,19 +542,13 @@ export class System {
             `lastThunk=${fault.lastThunk || "unknown"}`);
 
         this.isExiting = true;
-        this.fileSystem.flushAll().catch(() => { /* best-effort */ });
         this.scheduler.terminateAllThreads(0xC0000005); // STATUS_ACCESS_VIOLATION
         try { this.process?.v86?.stop?.(); } catch { /* best-effort */ }
 
         // Host UI: full fault record → "The game crashed" dialog + copyable report.
-        try {
-            (self as unknown as { postMessage: (m: unknown) => void }).postMessage({
-                type: "process_exit",
-                exitCode: 0xC0000005,
-                crashed: true,
-                fault,
-            });
-        } catch { /* not in a worker context (tests) */ }
+        // Gated on the durability barrier: a game that crashes after writing its save
+        // deserves the same guarantee as one that exits cleanly.
+        this.postProcessExitWhenDurable({ exitCode: 0xC0000005, crashed: true, fault });
 
         // Harness: one event for every crash class, not just #PF AVs. `fatal`
         // separates this from reportGuestThreadFault, whose process keeps running —
