@@ -445,8 +445,16 @@ export function layoutBitmapDestRect(
     return { x: layout.x, y: layout.y, w: layout.w, h: layout.h, srcW: bmpW, srcH: bmpH };
 }
 
-/** Blit RGBA into a 2D context per Win32 static control rules. */
+/**
+ * Blit RGBA into an HDC per Win32 static control rules.
+ *
+ * The control rect is only half of what confines this image: output through a DC obeys
+ * the DC's clip region too (a BeginPaint DC carries the window's update region), so the
+ * blit is bracketed by it exactly like every other primitive — otherwise a control's
+ * image repaints in full during a partial update and overwrites pixels outside it.
+ */
 export function blitStaticControlImage(
+    hdc: number,
     ctx: OffscreenCanvasRenderingContext2D,
     data: Uint8ClampedArray,
     imageW: number,
@@ -464,6 +472,7 @@ export function blitStaticControlImage(
     if (!frameCtx) return;
     frameCtx.putImageData(new ImageData(asArrayBufferView(data), imageW, imageH), 0, 0);
 
+    const dcClipped = System.getInstance().gdiContext.beginClipOn(hdc, ctx);
     ctx.save();
     ctx.beginPath();
     ctx.rect(clipX, clipY, clipW, clipH);
@@ -476,6 +485,7 @@ export function blitStaticControlImage(
         ctx.drawImage(frame, 0, 0, imageW, imageH, layout.x, layout.y, imageW, imageH);
     }
     ctx.restore();
+    if (dcClipped) ctx.restore();
 }
 
 /** Resolve ICON user object to RGBA (same layout as bitmap). */

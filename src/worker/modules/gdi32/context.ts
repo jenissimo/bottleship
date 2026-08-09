@@ -31,6 +31,25 @@ import {
 import { strokePolyline as strokePolylineImpl, lineTo as lineToImpl } from './gdi-lines';
 import { textOut as textOutImpl, drawText as drawTextImpl, type DrawTextLayout } from './gdi-text';
 import { bitBlt as bitBltImpl, stretchBlt as stretchBltImpl } from './gdi-blit';
+import {
+    type DcClipRegion,
+    type DcClipState,
+    applyClipToContext,
+    clampRectToClip,
+    clipRegionFromRect,
+    clipRegionType,
+    cloneClipRegion,
+    combineClipRegions,
+    excludeClipRegionRect,
+    forEachClipRect,
+    intersectClipRegionRect,
+    makeClipRegion,
+    offsetClipRegion,
+} from './dc-clip';
+// A paint DC's clip IS the window's update region (Win32: BeginPaint hands back a DC
+// clipped to it, and rcPaint is that region's bounding box). The region is USER state,
+// so it is read from there rather than duplicated here.
+import { getWindowUpdateRects } from '../user32/paint-region';
 
 export interface GDIObject {
     handle: number;
@@ -86,6 +105,32 @@ export interface ClearOverlayRectOptions {
     skipRepair?: boolean;
 }
 
+/**
+ * One SaveDC level. Win32 saves the DC's whole attribute set as a unit; this is that set
+ * restricted to what our DC state actually holds — the mapping mode, world transform and
+ * viewport/window origins are not among them because nothing here stores or honours them,
+ * and stacking a value no primitive reads would be a restore that restores nothing.
+ */
+interface SavedDcState {
+    clip: DcClipRegion | null;
+    hBrush: number;
+    hPen: number;
+    hFont: number;
+    hBitmap: number;
+    brushColor: string;
+    textColor: string;
+    textColorValue: number;
+    bkMode: number;
+    bkColor: string;
+    font: string;
+    fontSize: number;
+    fontQuality: number;
+    textEscapement: number;
+    textAlign: number;
+    posX: number;
+    posY: number;
+}
+
 export class GDIContext {
     // Host-shared state: gdi-objects/gdi-text/gdi-blit access non-private
     // fields/methods of this class directly — treat them as module-private to gdi32.
@@ -129,6 +174,12 @@ export class GDIContext {
         surfaceSeeded?: boolean;
         /** Skip next EndPaint flush — WM_PAINT had no real guest pixels (pristine BitBlt). */
         skipOverlayFlush?: boolean;
+        /** BeginPaint DC: EndPaint owns its publish, so it is never auto-published mid-paint. */
+        paintDc?: boolean;
+        /** Clip region; absent means unbounded (see dc-clip.ts). */
+        clip?: DcClipState;
+        /** SaveDC levels, innermost last (see saveDcState). */
+        saved?: SavedDcState[];
     }> = new Map();
 
     /** Current pen position per HDC (MoveToEx / LineTo). */
@@ -838,6 +889,197 @@ export class GDIContext {
         const state = this.hdcStates.get(hdc);
         if (!state) return;
         state.windowBlit = { absX, absY, width, height };
+    }
+
+    /**
+     * Mark a window DC as belonging to a BeginPaint/EndPaint bracket, and give it the
+     * clip such a DC has in Win32: the window's update region. Everything drawn through
+     * the DC — the class-brush erase, the guest's own primitives, the child restamps —
+     * is then confined to the region the guest was told to repaint.
+     */
+    markPaintDC(hdc: number): void {
+        const state = this.hdcStates.get(hdc);
+        if (!state) return;
+        state.paintDc = true;
+        const hwnd = state.hwnd;
+        if (!hwnd) return;
+        const update = getWindowUpdateRects(hwnd);
+        // No update region is our own artifact (a directly posted WM_PAINT); it means
+        // "repaint everything", which is an unbounded clip, not an empty one.
+        if (update.length === 0) return;
+        const quads: number[] = [];
+        for (const r of update) quads.push(r.left, r.top, r.right, r.bottom);
+        this.setClipRegion(hdc, makeClipRegion(quads));
+    }
+
+    // --- Clip region (see dc-clip.ts) -------------------------------------------------
+
+    /** The DC's current clip, or null when unbounded. */
+    getClip(hdc: number): DcClipRegion | null {
+        return this.hdcStates.get(hdc)?.clip?.region ?? null;
+    }
+
+    /** SelectClipRgn: replace the clip wholesale (null restores the unbounded default). */
+    setClipRegion(hdc: number, region: DcClipRegion | null): number {
+        const state = this.hdcStates.get(hdc);
+        if (!state) return 0;
+        const clip = state.clip ?? (state.clip = { region: null });
+        clip.region = region;
+        return clipRegionType(region);
+    }
+
+    intersectClipRect(hdc: number, l: number, t: number, r: number, b: number): number {
+        const state = this.hdcStates.get(hdc);
+        if (!state) return 0;
+        return this.setClipRegion(hdc, intersectClipRegionRect(state.clip?.region ?? null, l, t, r, b));
+    }
+
+    excludeClipRect(hdc: number, l: number, t: number, r: number, b: number): number {
+        const state = this.hdcStates.get(hdc);
+        const canvas = this.contexts.get(hdc)?.canvas;
+        if (!state || !canvas) return 0;
+        return this.setClipRegion(hdc,
+            excludeClipRegionRect(state.clip?.region ?? null, l, t, r, b, canvas.width, canvas.height));
+    }
+
+    /**
+     * ExtSelectClipRgn's non-COPY half: combine the DC's clip with a region.
+     * An absent clip is unbounded, and "unbounded" only has an answer against a
+     * universe — the surface extent, the same one ExcludeClipRect subtracts from.
+     */
+    combineClipWithRegion(hdc: number, region: DcClipRegion, mode: number): number {
+        const state = this.hdcStates.get(hdc);
+        const canvas = this.contexts.get(hdc)?.canvas;
+        if (!state || !canvas) return 0;
+        const current = state.clip?.region
+            ?? clipRegionFromRect(0, 0, canvas.width, canvas.height);
+        return this.setClipRegion(hdc, combineClipRegions(current, region, mode));
+    }
+
+    offsetClipRgn(hdc: number, dx: number, dy: number): number {
+        const region = this.getClip(hdc);
+        if (!region) return clipRegionType(null);
+        return this.setClipRegion(hdc, offsetClipRegion(region, dx, dy));
+    }
+
+    /** SaveDC: push the DC's attribute state, returning the new level. */
+    saveDcState(hdc: number): number {
+        const state = this.hdcStates.get(hdc);
+        if (!state) return 0;
+        const stack = state.saved ?? (state.saved = []);
+        const pos = this.getCurrentPosition(hdc);
+        stack.push({
+            clip: cloneClipRegion(state.clip?.region ?? null),
+            hBrush: state.hBrush, hPen: state.hPen, hFont: state.hFont, hBitmap: state.hBitmap,
+            brushColor: state.brushColor, textColor: state.textColor,
+            textColorValue: state.textColorValue,
+            bkMode: state.bkMode, bkColor: state.bkColor,
+            font: state.font, fontSize: state.fontSize, fontQuality: state.fontQuality,
+            textEscapement: state.textEscapement, textAlign: state.textAlign,
+            posX: pos.x, posY: pos.y,
+        });
+        return stack.length;
+    }
+
+    /**
+     * RestoreDC. `level` follows Win32: positive = absolute, negative = relative, and the
+     * levels above the target are discarded with it.
+     *
+     * The saved objects are RE-SELECTED rather than assigned, because selection has
+     * consequences beyond the handle field — a bitmap re-materializes the DC canvas, a pen
+     * sets strokeStyle — and a restore that only rewrote the field would leave the DC
+     * drawing with the object the guest thought it had put back.
+     */
+    restoreDcState(hdc: number, level: number): boolean {
+        const state = this.hdcStates.get(hdc);
+        const stack = state?.saved;
+        if (!state || !stack || stack.length === 0) return false;
+        const target = level < 0 ? stack.length + level : level - 1;
+        if (target < 0 || target >= stack.length) return false;
+        const saved = stack[target];
+        stack.length = target;
+
+        if (state.clip) state.clip.region = saved.clip;
+        else if (saved.clip) state.clip = { region: saved.clip };
+
+        if (saved.hBitmap && saved.hBitmap !== state.hBitmap) this.selectObject(hdc, saved.hBitmap);
+        if (saved.hBrush && saved.hBrush !== state.hBrush) this.selectObject(hdc, saved.hBrush);
+        if (saved.hPen && saved.hPen !== state.hPen) this.selectObject(hdc, saved.hPen);
+        if (saved.hFont && saved.hFont !== state.hFont) this.selectObject(hdc, saved.hFont);
+
+        state.brushColor = saved.brushColor;
+        state.textColor = saved.textColor;
+        state.textColorValue = saved.textColorValue;
+        state.bkMode = saved.bkMode;
+        state.bkColor = saved.bkColor;
+        state.font = saved.font;
+        state.fontSize = saved.fontSize;
+        state.fontQuality = saved.fontQuality;
+        state.textEscapement = saved.textEscapement;
+        state.textAlign = saved.textAlign;
+        // The canvas still carries the font/fill of the state being discarded; clearing the
+        // "already applied" markers is what makes the next primitive re-apply these.
+        state.appliedFont = '';
+        state.appliedFillStyle = '';
+        this.setCurrentPosition(hdc, saved.posX, saved.posY);
+        return true;
+    }
+
+    /**
+     * Bracket one primitive on one render target with the DC's clip. The pair is what
+     * makes the clip a property of the DC rather than of a call site: every target a
+     * primitive touches (DC canvas, the selected bitmap's canvas) is wrapped in it.
+     * Returns whether a `ctx.restore()` is owed.
+     */
+    beginClipOn(hdc: number, ctx: OffscreenCanvasRenderingContext2D): boolean {
+        const region = this.hdcStates.get(hdc)?.clip?.region;
+        return region ? applyClipToContext(region, ctx) : false;
+    }
+
+    /** Clamp a pixel-copy rect (DIB write-back, dirty tracking) to the clip; null = nothing left. */
+    clipCopyRect(hdc: number, x: number, y: number, w: number, h: number):
+        { x: number; y: number; w: number; h: number } | null {
+        return clampRectToClip(this.hdcStates.get(hdc)?.clip?.region ?? null, x, y, w, h);
+    }
+
+    /** Visit the parts of a rect a putImageData path may write (see forEachClipRect). */
+    forEachClipPart(
+        hdc: number, x: number, y: number, w: number, h: number,
+        fn: (x: number, y: number, w: number, h: number) => void,
+    ): boolean {
+        return forEachClipRect(this.hdcStates.get(hdc)?.clip?.region ?? null, x, y, w, h, fn);
+    }
+
+    /** GetClipBox: the clip's bounding box, or the whole surface when unbounded. */
+    getClipBox(hdc: number): { left: number; top: number; right: number; bottom: number; type: number } {
+        const region = this.getClip(hdc);
+        const canvas = this.contexts.get(hdc)?.canvas;
+        if (!region) {
+            return { left: 0, top: 0, right: canvas?.width ?? 0, bottom: canvas?.height ?? 0, type: clipRegionType(null) };
+        }
+        return { left: region.x1, top: region.y1, right: region.x2, bottom: region.y2, type: clipRegionType(region) };
+    }
+
+    /** Build a region from a device rect (SelectClipRgn's HRGN bounding box). */
+    clipRegionFromRect(l: number, t: number, r: number, b: number): DcClipRegion {
+        return clipRegionFromRect(l, t, r, b);
+    }
+
+    /**
+     * Window DCs holding unpublished guest pixels, i.e. every DC the guest drew on and
+     * has not released. Real GDI has no publish step — output through a window DC is on
+     * screen the moment it is drawn — so a DC held across frames (the classic
+     * GetDC-once + BitBlt-every-frame software renderer) must reach the screen without
+     * waiting for a ReleaseDC that may never come. BeginPaint DCs are excluded: EndPaint
+     * publishes those as one atomic sequence.
+     */
+    heldDirtyWindowDCs(): { hdc: number; hwnd: number }[] {
+        const out: { hdc: number; hwnd: number }[] = [];
+        for (const [hdc, state] of this.hdcStates) {
+            if (!state.windowBlit || !state.dirty || state.paintDc) continue;
+            out.push({ hdc, hwnd: state.hwnd ?? 0 });
+        }
+        return out;
     }
 
     /** Copy existing overlay pixels into a window memory DC before BeginPaint. */
@@ -1747,11 +1989,14 @@ export class GDIContext {
         const w = right - left;
         const h = bottom - top;
         Logger.verbose(LogCategory.GDI32, `fillRect: HDC ${hdc} (${left}, ${top}) ${w}x${h} color=${ctx.fillStyle}`);
+        const clipped = this.beginClipOn(hdc, ctx);
         ctx.fillRect(left, top, w, h);
+        if (clipped) ctx.restore();
 
         // A DIBSection's guest bits are its pixel surface, so the fill has to land there
         // too — the next SelectObject re-materializes the canvas from those bits.
-        writeBackDibSectionRect(state.hBitmap, ctx, left, top, w, h);
+        const back = this.clipCopyRect(hdc, left, top, w, h);
+        if (back) writeBackDibSectionRect(state.hBitmap, ctx, back.x, back.y, back.w, back.h);
 
         // Mark as dirty for ReleaseDC optimization
         this.expandDirtyRect(hdc, left, top, w, h);
@@ -1771,7 +2016,9 @@ export class GDIContext {
                 } else {
                     bitmapCtx.fillStyle = fillStyle as string;
                 }
+                const mirrorClipped = this.beginClipOn(hdc, bitmapCtx);
                 bitmapCtx.fillRect(left, top, w, h);
+                if (mirrorClipped) bitmapCtx.restore();
             }
         }
         

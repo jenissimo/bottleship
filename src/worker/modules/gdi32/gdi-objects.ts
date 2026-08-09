@@ -199,7 +199,8 @@ export function getObject(gdi: GDIContext, hgdiobj: number, cbBuffer: number, lp
     if (!lpvObject || cbBuffer === 0) {
         // Return required size
         if (obj.type === 'BITMAP') {
-            return 24; // sizeof(BITMAP)
+            // A DIB section needs the whole DIBSECTION described, not just its BITMAP head.
+            return (obj.data?.dibBits || (obj.data?.bitsPtr && obj.data?.dibStride)) ? 0x54 : 24;
         } else if (obj.type === 'FONT') {
             return isUnicode ? 92 : 60; // sizeof(LOGFONTW) vs sizeof(LOGFONTA)
         } else if (obj.type === 'PEN') {
@@ -264,14 +265,16 @@ export function getObject(gdi: GDIContext, hgdiobj: number, cbBuffer: number, lp
         return 0x54;
     }
 
-    // Palettized (≤8bpp) bitmap loaded with LR_CREATEDIBSECTION: expose a real
-    // DIBSECTION so guest sprite loaders can read the 8-bit source + palette
-    // (biBitCount, bmBits). GetObject(h, sizeof(DIBSECTION)=0x54) triggers this;
-    // GetObject(h, sizeof(BITMAP)=24) still gets the plain BITMAP below.
-    if (obj.type === 'BITMAP' && cbBuffer >= 0x54 && obj.data?.dibBits && (obj.data.bitCount ?? 32) <= 8) {
+    // Bitmap loaded with LR_CREATEDIBSECTION: expose a real DIBSECTION so guest loaders
+    // read the source's own depth, stride, rows and colour count (biBitCount, biClrUsed,
+    // bmBits). GetObject(h, sizeof(DIBSECTION)=0x54) triggers this; GetObject(h,
+    // sizeof(BITMAP)=24) still gets the plain BITMAP below. Reporting only 24 bytes here
+    // leaves dsBmih as the caller's uninitialized stack, and a palette-building loader
+    // then branches on garbage.
+    if (obj.type === 'BITMAP' && cbBuffer >= 0x54 && obj.data?.dibBits) {
         const width = obj.data.width || 0;
         const height = obj.data.height || 0;
-        const bitCount = obj.data.bitCount as number;
+        const bitCount = (obj.data.bitCount as number) || 32;
         const stride = (obj.data.dibStride as number) || (((width * bitCount + 31) >> 5) << 2);
         const dibBits = obj.data.dibBits as Uint8Array;
         // Materialize the DIB bits into guest memory once (cached on the object).
@@ -325,8 +328,8 @@ export function getObject(gdi: GDIContext, hgdiobj: number, cbBuffer: number, lp
         // the DIB's own depth (not a synthetic 32bpp). Sprite loaders that GetObject a DIB
         // and memcpy bmBits (e.g. WA's FUN_004cf820) get a zero-filled → black sprite if
         // bmBits is NULL. Materialize the palettized rows once (shared with the 0x54 path).
-        if (obj.data?.dibBits && (obj.data.bitCount ?? 32) <= 8) {
-            const bitCount = obj.data.bitCount as number;
+        if (obj.data?.dibBits) {
+            const bitCount = (obj.data.bitCount as number) || 32;
             const stride = (obj.data.dibStride as number) || (((width * bitCount + 31) >> 5) << 2);
             const dibBits = obj.data.dibBits as Uint8Array;
             let bmBitsPtr = obj.data.dibBitsPtr as number | undefined;

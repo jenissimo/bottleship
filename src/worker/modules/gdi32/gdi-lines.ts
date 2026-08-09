@@ -156,13 +156,20 @@ export function strokePolyline(
 
     if (ctx === gdi.overlayCtx) gdi.setOverlayDirty(true);
 
+    const clipped = gdi.beginClipOn(hdc, ctx);
     tracePath(ctx, pts, closed, pen);
+    if (clipped) ctx.restore();
 
-    // Memory DCs mirror into the bitmap's own canvas, same as fillRect/textOut.
+    // Memory DCs mirror into the bitmap's own canvas, same as fillRect/textOut — under
+    // the same DC clip, which is a property of the DC and not of one render target.
     const linkedBitmap = (ctx.canvas as { __bitmapCanvas?: OffscreenCanvas }).__bitmapCanvas;
     if (linkedBitmap) {
-        const bitmapCtx = linkedBitmap.getContext('2d');
-        if (bitmapCtx) tracePath(bitmapCtx as OffscreenCanvasRenderingContext2D, pts, closed, pen);
+        const bitmapCtx = linkedBitmap.getContext('2d') as OffscreenCanvasRenderingContext2D | null;
+        if (bitmapCtx) {
+            const mirrorClipped = gdi.beginClipOn(hdc, bitmapCtx);
+            tracePath(bitmapCtx, pts, closed, pen);
+            if (mirrorClipped) bitmapCtx.restore();
+        }
     }
 
     let minX = pts[0], maxX = pts[0], minY = pts[1], maxY = pts[1];
@@ -173,8 +180,11 @@ export function strokePolyline(
     }
     const pad = pen.width;
     // A DIBSection's guest bits are its pixel surface — the stroke has to land there too.
-    writeBackDibSectionRect(gdi.hdcStates.get(hdc)?.hBitmap ?? 0, ctx,
-        minX - pad, minY - pad, (maxX - minX) + pad * 2 + 1, (maxY - minY) + pad * 2 + 1);
+    const back = gdi.clipCopyRect(hdc, minX - pad, minY - pad,
+        (maxX - minX) + pad * 2 + 1, (maxY - minY) + pad * 2 + 1);
+    if (back) {
+        writeBackDibSectionRect(gdi.hdcStates.get(hdc)?.hBitmap ?? 0, ctx, back.x, back.y, back.w, back.h);
+    }
     gdi.expandDirtyRect(hdc, minX - pad, minY - pad, (maxX - minX) + pad * 2 + 1, (maxY - minY) + pad * 2 + 1);
     gdi.markDirty(hdc);
     gdi.invalidateImageDataCache(hdc);

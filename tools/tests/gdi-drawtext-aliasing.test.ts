@@ -34,6 +34,15 @@ class FakeContext {
         return { data, width: w, height: h } as ImageData;
     }
     putImageData() { this.putImageDataCalls++; }
+    imageSmoothingEnabled = true;
+    drawImageCalls = 0;
+    lastDrawImageDest: { x: number; y: number } | null = null;
+    lastDrawImageSmoothing: boolean | null = null;
+    drawImage(_src: unknown, ..._args: number[]) {
+        this.drawImageCalls++;
+        this.lastDrawImageSmoothing = this.imageSmoothingEnabled;
+        this.lastDrawImageDest = { x: _args[4], y: _args[5] };
+    }
 }
 
 test("DrawText keeps font smoothing for DEFAULT_QUALITY", () => {
@@ -72,6 +81,8 @@ test("DrawText keeps font smoothing for DEFAULT_QUALITY", () => {
             setOverlayDirty() {},
             markDirty() {},
             invalidateImageDataCache() {},
+            // No clip region on this DC: the text path must not save/restore for one.
+            beginClipOn() { return false; },
         };
 
         expect(drawText(gdi as any, 1, "Begin the Journey", {
@@ -110,14 +121,20 @@ test("DrawText thresholds only explicitly NONANTIALIASED_QUALITY fonts", () => {
         const gdi = {
             contexts: new Map([[1, target]]), hdcStates: new Map([[1, state]]),
             overlayCtx: null, setOverlayDirty() {}, markDirty() {}, invalidateImageDataCache() {},
+            beginClipOn() { return false; },
         };
 
         expect(drawText(gdi as any, 1, "Begin the Journey", {
             left: 0, top: 0, right: 200, bottom: 30,
         }, 0x21)).not.toBeNull(); // DT_SINGLELINE | DT_CENTER
         expect(target.directFillTextCalls).toBe(0);
-        expect(target.putImageDataCalls).toBe(1);
-        expect(target.lastGetImageDataX).toBe(47);
+        // The thresholded mask is COMPOSITED (drawImage), not written past the clip
+        // (putImageData), and with filtering off so the hard edges survive a transform.
+        expect(target.putImageDataCalls).toBe(0);
+        expect(target.drawImageCalls).toBe(1);
+        expect(target.lastDrawImageSmoothing).toBe(false);
+        expect(target.imageSmoothingEnabled).toBe(true); // restored
+        expect(target.lastDrawImageDest?.x).toBe(47);
     } finally {
         (globalThis as any).OffscreenCanvas = previous;
     }

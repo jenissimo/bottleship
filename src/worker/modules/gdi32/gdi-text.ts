@@ -56,7 +56,8 @@ function fillTextAliased(
     s.textAlign = 'left';
     s.fillStyle = '#fff';
     s.fillText(text, pad, pad);
-    const mask = s.getImageData(0, 0, w, h).data;
+    const img = s.getImageData(0, 0, w, h);
+    const m = img.data;
     // The mask itself is always rasterized left-aligned, so translate Canvas' current
     // alignment into the destination's left edge. DrawText sets textAlign to center/right
     // for DT_CENTER/DT_RIGHT; treating its reference point as a left edge shifted every
@@ -65,14 +66,23 @@ function fillTextAliased(
     if (ctx.textAlign === 'center') left -= textWidth / 2;
     else if (ctx.textAlign === 'right' || ctx.textAlign === 'end') left -= textWidth;
     const x0 = Math.round(left) - pad, y0 = Math.round(y) - pad;
-    const img = ctx.getImageData(x0, y0, w, h);
-    const t = img.data;
     const cv = state.textColorValue >>> 0; // COLORREF 0x00BBGGRR
     const r = cv & 0xff, g = (cv >> 8) & 0xff, b = (cv >> 16) & 0xff;
-    for (let i = 3; i < mask.length; i += 4) {
-        if (mask[i] >= 128) { t[i - 3] = r; t[i - 2] = g; t[i - 1] = b; t[i] = 255; }
+    // Threshold the mask into opaque text color / fully transparent, in place, then
+    // COMPOSITE it with drawImage. putImageData is the one canvas primitive a clip does
+    // not reach, and this text has to obey the DC's clip like every other primitive;
+    // source-over of an all-or-nothing alpha reproduces the same replace-or-leave result.
+    for (let i = 3; i < m.length; i += 4) {
+        if (m[i] >= 128) { m[i - 3] = r; m[i - 2] = g; m[i - 1] = b; m[i] = 255; }
+        else { m[i] = 0; }
     }
-    ctx.putImageData(img, x0, y0);
+    s.putImageData(img, 0, 0);
+    // drawImage filters, and under an escapement transform that would re-introduce the
+    // soft edges NONANTIALIASED_QUALITY just asked us to threshold away.
+    const smoothing = ctx.imageSmoothingEnabled;
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(aliasScratch!, 0, 0, w, h, x0, y0, w, h);
+    ctx.imageSmoothingEnabled = smoothing;
 }
 
 /** After drawing on a DC with a selected DIBSection, mirror the drawn rect into the
@@ -191,6 +201,11 @@ export function textOut(gdi: GDIContext, hdc: number, x: number, y: number, text
     // Convert to radians: angle_rad = (escapement / 10) * (π / 180)
     const hasRotation = state.textEscapement !== 0;
 
+    // The clip belongs to the DC, so it wraps the glyphs on every target. It is applied
+    // after the lazy font/fillStyle sync above so the matching restore hands the context
+    // back with exactly the attributes state.applied* claims are on it.
+    const clipped = gdi.beginClipOn(hdc, ctx);
+
     if (hasRotation) {
         // Save transform instead of using save/restore to avoid resetting font/fillStyle
         const savedTransform = ctx.getTransform();
@@ -218,9 +233,11 @@ export function textOut(gdi: GDIContext, hdc: number, x: number, y: number, text
 
         // Restore transform manually (doesn't reset font/fillStyle)
         ctx.setTransform(savedTransform);
+        if (clipped) ctx.restore();
         // Rotated glyphs land anywhere in the swept circle, so mirror that whole box.
         const reach = Math.max(metrics.width, state.fontSize * 1.7) + 4;
-        syncTextRectToDibSection(state, ctx, x - reach, y - reach, reach * 2, reach * 2);
+        const back = gdi.clipCopyRect(hdc, x - reach, y - reach, reach * 2, reach * 2);
+        if (back) syncTextRectToDibSection(state, ctx, back.x, back.y, back.w, back.h);
     } else {
         // No rotation - draw normally
         // Only draw background if OPAQUE mode (bkMode=2)
@@ -237,7 +254,9 @@ export function textOut(gdi: GDIContext, hdc: number, x: number, y: number, text
         }
 
         fillTextGdi(ctx, state, text, x, y);
-        syncTextRectToDibSection(state, ctx, x - 2, y - 2, metrics.width + 4, state.fontSize * 1.7 + 4);
+        if (clipped) ctx.restore();
+        const back = gdi.clipCopyRect(hdc, x - 2, y - 2, metrics.width + 4, state.fontSize * 1.7 + 4);
+        if (back) syncTextRectToDibSection(state, ctx, back.x, back.y, back.w, back.h);
     }
 
     // Mark as dirty for ReleaseDC optimization
@@ -271,6 +290,8 @@ export function textOut(gdi: GDIContext, hdc: number, x: number, y: number, text
             }
             bitmapCtx.textBaseline = 'top';
             bitmapCtx.textAlign = 'left';
+            // Same DC, same clip: the mirror is a second render target, not a second DC.
+            const mirrorClipped = gdi.beginClipOn(hdc, bitmapCtx);
 
             if (hasRotation) {
                 bitmapCtx.save();
@@ -294,6 +315,7 @@ export function textOut(gdi: GDIContext, hdc: number, x: number, y: number, text
                 }
                 fillTextGdi(bitmapCtx, state, text, x, y);
             }
+            if (mirrorClipped) bitmapCtx.restore();
         }
     }
 
@@ -533,6 +555,9 @@ export function drawText(
     const paint = (target: TextCtx): void => {
         target.textBaseline = 'top';
         target.textAlign = align;
+        // The DC's own clip region bounds the format rect, and applies to every target
+        // this paints on (DC canvas and the selected bitmap's canvas alike).
+        const dcClipped = gdi.beginClipOn(hdc, target as OffscreenCanvasRenderingContext2D);
         // Clipped to the rect unless DT_NOCLIP — GDI never spills DrawText outside it.
         const clipped = !!rect && (f & DT_NOCLIP) === 0;
         if (clipped) {
@@ -551,6 +576,7 @@ export function drawText(
             drawLaidOutLine(target, state, lines[i], originX, originY + i * advance, prefixOptions);
         }
         if (clipped) target.restore();
+        if (dcClipped) (target as OffscreenCanvasRenderingContext2D).restore();
         target.textAlign = 'left';
         target.textBaseline = 'top';
     };

@@ -10,12 +10,12 @@ import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { SystemResourceProvider } from '../../core/resources/system-resource-provider';
 import { toPlainGuestMemory } from '../../core/memory/guest-memory';
 import { LOGPEN_OFFSETS, LOGPEN_SIZE } from './gdi-objects';
+import { writeBackDibSectionRect } from './bitmap-resolve';
 // Track GetPixel HDC usage for profiling
 const getPixelHdcStats = new Map<number, { count: number; maxX: number; maxY: number }>();
 
 // Store last GetDIBits output buffer address for texture loading workaround
 let lastGetDIBitsBuffer: { address: number; width: number; height: number } | null = null;
-let dibSectionSyncDiagCount = 0;
 const pixelFormatByHdc = new Map<number, number>();
 
 export function getLastGetDIBitsBuffer(): { address: number; width: number; height: number } | null {
@@ -324,14 +324,32 @@ function dibToCanvas(
     // If source and dest sizes match and no offset, use putImageData directly
     const srcW = wSrc > 0 ? wSrc : absWidth;
     const srcH = hSrc > 0 ? hSrc : drawHeight;
-    if (srcW === wDest && srcH === hDest && xSrc === 0 && (ySrc === 0 || ySrc === uStartScan)) {
-        dcCtx.putImageData(imgData, xDest, yDest, 0, 0, wDest, hDest);
+    // A zero destination extent means "use the source extent" and a negative one is a
+    // mirrored blit — both are legal output, so the clip is applied to the extent that
+    // actually lands on the canvas rather than to the raw argument.
+    const outW = wDest !== 0 ? wDest : absWidth;
+    const outH = hDest !== 0 ? hDest : drawHeight;
+    const dstX = outW < 0 ? xDest + outW : xDest;
+    const dstY = outH < 0 ? yDest + outH : yDest;
+    const dstW = Math.abs(outW), dstH = Math.abs(outH);
+    // Clipping is DC state and applies to a DIB blit like any other output. putImageData
+    // ignores the canvas clip, so the 1:1 path writes one rect of the clip REGION at a
+    // time (via putImageData's own dirty-rect arguments) while the stretched path draws
+    // through the clip.
+    const clipRect = gdi.clipCopyRect(hdc, dstX, dstY, dstW, dstH);
+    if (!clipRect) return true;
+    if (srcW === outW && srcH === outH && xSrc === 0 && (ySrc === 0 || ySrc === uStartScan)) {
+        gdi.forEachClipPart(hdc, dstX, dstY, dstW, dstH, (px, py, pw, ph) => {
+            dcCtx.putImageData(imgData, xDest, yDest, px - xDest, py - yDest, pw, ph);
+        });
     } else {
         // Need stretching: draw via temporary canvas
         const tmpCanvas = new OffscreenCanvas(absWidth, drawHeight);
         const tmpCtx = tmpCanvas.getContext('2d')!;
         tmpCtx.putImageData(imgData, 0, 0);
-        dcCtx.drawImage(tmpCanvas, xSrc, 0, srcW, drawHeight, xDest, yDest, wDest, hDest);
+        const clipped = gdi.beginClipOn(hdc, dcCtx);
+        dcCtx.drawImage(tmpCanvas, xSrc, 0, srcW, drawHeight, xDest, yDest, outW, outH);
+        if (clipped) dcCtx.restore();
     }
 
     // Keep the DC's selected-bitmap backing canvas in sync, mirroring the writeback
@@ -345,10 +363,10 @@ function dibToCanvas(
     if (linkedBitmapCanvas) {
         const bmCtx = linkedBitmapCanvas.getContext('2d') as OffscreenCanvasRenderingContext2D | null;
         if (bmCtx) {
-            const cw = wDest > 0 ? wDest : absWidth;
-            const ch = hDest > 0 ? hDest : drawHeight;
+            // Copied out of the (already clipped) DC canvas, so the clip governs it too.
             try {
-                bmCtx.drawImage(dcCtx.canvas, xDest, yDest, cw, ch, xDest, yDest, cw, ch);
+                bmCtx.drawImage(dcCtx.canvas, clipRect.x, clipRect.y, clipRect.w, clipRect.h,
+                    clipRect.x, clipRect.y, clipRect.w, clipRect.h);
             } catch { /* ignore writeback failures */ }
         }
     }
@@ -364,90 +382,16 @@ function dibToCanvas(
     Logger.verbose(LogCategory.GDI32,
         `dibToCanvas: Drew ${absWidth}x${drawHeight}@${uStartScan}/${absHeight} ${biBitCount}bpp DIB to DC 0x${hdc.toString(16)} at (${xDest},${yDest})`);
 
-    // If this HDC has a DIBSection selected, keep ppvBits memory in sync.
-    // Some engines upload textures directly from CreateDIBSection bits instead of blitting the HDC.
+    // A DIBSection selected into this DC has its guest bits as its pixel surface, so the
+    // blit has to land there too (engines upload textures straight from ppvBits). The
+    // source of truth is the DC canvas we just drew: it alone carries the destination
+    // offset, the stretch and the clip, all three of which a copy straight out of the
+    // decoded source buffer would lose — writing the whole bitmap from (0,0) and blanking
+    // whatever the blit did not cover.
     const linkedBitmap = ((dcCtx.canvas as any).__linkedBitmap as number | undefined) ||
         ((state as any)?.hBitmap as number | undefined);
     if (linkedBitmap && linkedBitmap !== 0x80000009) {
-        const userObj = SystemResourceProvider.getInstance().getUserObject(linkedBitmap) as any;
-        const bitsPtr = userObj?.bitsPtr as number | undefined;
-        const dibBpp = userObj?.dibBpp as number | undefined;
-        const dibStride = userObj?.dibStride as number | undefined;
-        const dibTopDown = !!userObj?.dibTopDown;
-        const w = userObj?.width as number | undefined;
-        const h = userObj?.height as number | undefined;
-
-        if (bitsPtr && dibBpp === 32 && dibStride && w && h && w > 0 && h > 0) {
-            // Sync from decoded RGBA buffer directly (faster and avoids canvas readback path).
-            const srcW = absWidth;
-            const srcH = drawHeight;
-            const copyW = Math.min(w, srcW);
-            const copyH = Math.min(h, srcH);
-            // Fast path: matching dimensions, stride=w*4, 4-byte aligned
-            const canFast32 = dibStride === w * 4 && copyW === w && copyW === srcW &&
-                (bitsPtr & 3) === 0;
-            if (canFast32) {
-                const dst32 = new Uint32Array(mem.buffer, mem.byteOffset + bitsPtr, w * h);
-                const src32 = new Uint32Array(rgbaData.buffer, 0, srcW * srcH);
-                for (let y = 0; y < copyH; y++) {
-                    const srcRowBase = y * srcW;
-                    const dstY = dibTopDown ? y : (h - 1 - y);
-                    const dstRowBase = dstY * w;
-                    for (let x = 0; x < copyW; x++) {
-                        const p = src32[srcRowBase + x];
-                        // RGBA → BGRA: swap R and B
-                        dst32[dstRowBase + x] = ((p & 0xFF) << 16) | (p & 0xFF00FF00) | ((p >> 16) & 0xFF);
-                    }
-                }
-                // Zero-fill remaining rows if h > copyH
-                for (let y = copyH; y < h; y++) {
-                    const dstY = dibTopDown ? y : (h - 1 - y);
-                    const dstRowBase = dstY * w;
-                    for (let x = 0; x < w; x++) dst32[dstRowBase + x] = 0xFF000000;
-                }
-            } else {
-                for (let y = 0; y < h; y++) {
-                    const srcY = y < copyH ? y : -1;
-                    const dstY = dibTopDown ? y : (h - 1 - y);
-                    let dstOff = bitsPtr + dstY * dibStride;
-                    for (let x = 0; x < w; x++) {
-                        if (srcY >= 0 && x < copyW) {
-                            const srcOff = (srcY * srcW + x) * 4;
-                            // RGBA -> BGRA
-                            mem[dstOff] = rgbaData[srcOff + 2];
-                            mem[dstOff + 1] = rgbaData[srcOff + 1];
-                            mem[dstOff + 2] = rgbaData[srcOff];
-                            mem[dstOff + 3] = rgbaData[srcOff + 3];
-                        } else {
-                            mem[dstOff] = 0;
-                            mem[dstOff + 1] = 0;
-                            mem[dstOff + 2] = 0;
-                            mem[dstOff + 3] = 255;
-                        }
-                        dstOff += 4;
-                    }
-                }
-            }
-            if (dibSectionSyncDiagCount < 3) {
-                const b = mem[bitsPtr];
-                const gch = mem[bitsPtr + 1];
-                const r = mem[bitsPtr + 2];
-                const a = mem[bitsPtr + 3];
-                const cX = Math.max(0, (w >> 1) - 1);
-                const cY = Math.max(0, (h >> 1) - 1);
-                const cOff = bitsPtr + (dibTopDown ? cY : (h - 1 - cY)) * dibStride + cX * 4;
-                const cb = mem[cOff];
-                const cg = mem[cOff + 1];
-                const cr = mem[cOff + 2];
-                const ca = mem[cOff + 3];
-                Logger.log(
-                    LogCategory.GDI32,
-                    `dibToCanvas: DIBSection sync hbm=0x${linkedBitmap.toString(16)} bits=0x${bitsPtr.toString(16)} ` +
-                    `sampleBGRA=[${b},${gch},${r},${a}] center=[${cb},${cg},${cr},${ca}] copy=${copyW}x${copyH}`
-                );
-                dibSectionSyncDiagCount++;
-            }
-        }
+        writeBackDibSectionRect(linkedBitmap, dcCtx, clipRect.x, clipRect.y, clipRect.w, clipRect.h);
     }
 
     return true;
@@ -1435,6 +1379,52 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
     let nextPaletteHandle = 0x50000001;
     const dcPalette = new Map<number, number>(); // hdc -> hPal
 
+    /** The 20 static system colours, R,G,B triples: indices 0-9 then 246-255. */
+    const STATIC_SYSTEM_COLORS = [
+        0x000000, 0x800000, 0x008000, 0x808000, 0x000080,
+        0x800080, 0x008080, 0xc0c0c0, 0xc0dcc0, 0xa6caf0,
+        0xfffbf0, 0xa0a0a4, 0x808080, 0xff0000, 0x00ff00,
+        0xffff00, 0x0000ff, 0xff00ff, 0x00ffff, 0xffffff,
+    ];
+
+    /**
+     * The default 8bpp colour table — the halftone palette every DIB and
+     * CreateHalftonePalette is measured against: a 4x8x8 blue/green/red cube with the
+     * 20 static system colours stamped over indices 0-9 and 246-255.
+     */
+    let cachedHalftoneEntries: Uint8Array | null = null;
+    function defaultColorTable8(): Uint8Array {
+        if (cachedHalftoneEntries) return cachedHalftoneEntries;
+        const entries = new Uint8Array(256 * 4); // PALETTEENTRY[256]: R,G,B,flags
+        for (let i = 0; i < 256; i++) {
+            entries[i * 4] = (i & 7) * 0x20;             // peRed
+            entries[i * 4 + 1] = ((i >> 3) & 7) * 0x20;  // peGreen
+            entries[i * 4 + 2] = (i >> 6) * 0x40;        // peBlue
+        }
+        for (let n = 0; n < STATIC_SYSTEM_COLORS.length; n++) {
+            const i = n < 10 ? n : 246 + (n - 10);
+            const rgb = STATIC_SYSTEM_COLORS[n];
+            entries[i * 4] = (rgb >> 16) & 0xff;
+            entries[i * 4 + 1] = (rgb >> 8) & 0xff;
+            entries[i * 4 + 2] = rgb & 0xff;
+        }
+        cachedHalftoneEntries = entries;
+        return entries;
+    }
+
+    // CreateHalftonePalette - the standard 256-colour halftone palette. Apps that load a
+    // >256-colour DIB take this branch instead of building a palette from the colour
+    // table, and then Select/RealizePalette it before every blit; a failed create is an
+    // HPALETTE of 0 that poisons the whole draw path.
+    exports['CreateHalftonePalette'] = (ctx, mem, args): number => {
+        const hdc = args[0] >>> 0;
+        const handle = nextPaletteHandle++;
+        paletteStore.set(handle, new Uint8Array(defaultColorTable8()));
+        Logger.verbose(LogCategory.GDI32,
+            `CreateHalftonePalette(hdc=0x${hdc.toString(16)}) -> 0x${handle.toString(16)}`);
+        return handle;
+    };
+
     // CreatePalette - creates a logical palette
     exports['CreatePalette'] = (ctx, mem, args): number => {
         const plpal = args[0]; // pointer to LOGPALETTE
@@ -2188,19 +2178,21 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         return hdc;
     };
 
+    // SaveDC/RestoreDC push and pop real DC levels: the clip region, the selected objects
+    // and the attributes that go with them (see GDIContext.saveDcState).
     exports['SaveDC'] = (ctx, mem, args): number => {
         const hdc = args[0];
-        Logger.verbose(LogCategory.GDI32, `SaveDC(hdc=0x${hdc.toString(16)})`);
-        // Stub: return saved state ID
-        return 1;
+        const level = System.getInstance().gdiContext.saveDcState(hdc);
+        Logger.verbose(LogCategory.GDI32, `SaveDC(hdc=0x${hdc.toString(16)}) -> ${level}`);
+        return level;
     };
 
     exports['RestoreDC'] = (ctx, mem, args): number => {
         const hdc = args[0];
-        const nSavedDC = args[1] | 0; // signed
-        Logger.verbose(LogCategory.GDI32, `RestoreDC(hdc=0x${hdc.toString(16)}, savedDC=${nSavedDC})`);
-        // Stub: return success
-        return 1;
+        const nSavedDC = args[1] | 0; // signed: negative is relative to the current level
+        const ok = System.getInstance().gdiContext.restoreDcState(hdc, nSavedDC);
+        Logger.verbose(LogCategory.GDI32, `RestoreDC(hdc=0x${hdc.toString(16)}, savedDC=${nSavedDC}) -> ${ok}`);
+        return ok ? 1 : 0;
     };
 
     exports['GetCurrentObject'] = (ctx, mem, args): number => {
