@@ -44,7 +44,11 @@ const OFF_HC_TEB_BASE = 0x028;
 const OFF_HC_INSN_AT_TIME_UPDATE = 0x02C;
 const OFF_HC_MIPS_ESTIMATE = 0x030;
 const OFF_HC_CURRENT_THREAD_ID = 0x034;
-const OFF_HC_FALLBACK_COUNTS = 0x0C0; // 68 bytes: per-handler fallback counters (must match hypercall.rs)
+// Per-handler_id accounting written by try_dispatch (must match hypercall.rs).
+// 256 slots each, u32, saturating — see getHandlerReport().
+const OFF_HC_HANDLER_CALLS = 0x2000;
+const OFF_HC_HANDLER_FALLBACKS = 0x2400;
+const HC_HANDLER_SLOTS = 256;
 const OFF_HC_CURSOR_X = 0x080;
 const OFF_HC_CURSOR_Y = 0x084;
 const OFF_HC_WINDOW_X = 0x088;
@@ -56,6 +60,11 @@ const OFF_HC_HAS_RUNNABLE_PEERS = 0x09C;  // 1 when other threads are READY/RUNN
 const OFF_HC_SLEEP_STARVATION_COUNTER = 0x0A0;
 const OFF_HC_SLEEP_STARVATION_LIMIT = 0x0A4;
 const OFF_HC_RAND_SEED = 0x0B0;
+// Mouse-capture owner (GetCapture). 0 is a LEGITIMATE answer, not an "unpublished"
+// sentinel, so the WASM handler cannot fall through on it — the page must therefore be
+// authoritative at all times: published at init, on every capture mutation, and on
+// buffer-change resync (rewriteState).
+const OFF_HC_CAPTURE_HWND = 0x0B4;
 const OFF_HC_DISPATCH_TABLE = 0x100;
 const OFF_HC_FLS_ALLOCATED = 0x1100; // 129 bytes, one allocation flag per FLS slot (slot 0 unused)
 const OFF_HC_FLS_VALUES = 0x1184;    // 129 * u32 slot values
@@ -147,6 +156,7 @@ const HANDLER_IS_BAD_READ_PTR = 78;
 const HANDLER_IS_BAD_WRITE_PTR = 79;
 const HANDLER_RELEASE_MUTEX = 80;
 const HANDLER_WAIT_FOR_SINGLE_OBJECT = 81;
+const HANDLER_GET_CAPTURE = 82;
 
 /**
  * Inner-loop HLE handler-id band (128..=255) — engine compute kernels, kept
@@ -212,6 +222,11 @@ const HANDLER_MAP: Record<string, number> = {
     // the correct per-HWND conversion (pt - win.x/win.y). Keep it on the JS path.
     // 'user32.screentoclient': HANDLER_SCREEN_TO_CLIENT,
     'user32.getcursorpos': HANDLER_GET_CURSOR_POS,
+    // GetCapture — pure page read of the capture owner (WindowManager publishes it on
+    // every mutation). No args, no scheduler state; onTickHook compensates the skipped
+    // onThunkComplete exactly as it does for GetLastError/GetCurrentThreadId. Games poll
+    // this per frame from their input loop.
+    'user32.getcapture': HANDLER_GET_CAPTURE,
     'user32.peekmessagea': HANDLER_PEEK_MESSAGE,
     'user32.peekmessagew': HANDLER_PEEK_MESSAGE,
     'kernel32.sleep': HANDLER_SLEEP,
@@ -418,6 +433,10 @@ export class HypercallDataManager {
     private readonly flsAllocatedShadow = new Uint8Array(HC_FLS_SLOT_COUNT);
     private readonly flsValuesByThread = new Map<number, Uint32Array>();
     private flsCurrentTid = 0;
+    // Last capture owner published to the page. Needed because the page is a Rust static
+    // that v86.restart() zeroes: without a shadow, a buffer change would silently drop a
+    // held capture to 0 and the WASM handler would keep answering 0 forever.
+    private captureHwndShadow = 0;
 
     private flsValuesFor(tid: number): Uint32Array {
         let v = this.flsValuesByThread.get(tid);
@@ -461,6 +480,8 @@ export class HypercallDataManager {
 
         // Initialize rand seed to 1 (matches MSVCRT default)
         this.view.setUint32(this.hpBase + OFF_HC_RAND_SEED, 1, true);
+
+        this.view.setUint32(this.hpBase + OFF_HC_CAPTURE_HWND, this.captureHwndShadow, true);
 
         this.writeFlsSharedState();
         this.writeEventMirrorState();
@@ -538,6 +559,9 @@ export class HypercallDataManager {
         if (this.eaglTokenCfgAddr !== 0) {
             this.view.setUint32(this.hpBase + OFF_HC_EAGL_TOKEN_CFG_PTR, this.eaglTokenCfgAddr, true);
         }
+
+        // Capture owner — JS-owned, WASM never writes it, so the shadow is authoritative.
+        this.view.setUint32(this.hpBase + OFF_HC_CAPTURE_HWND, this.captureHwndShadow, true);
 
         this.writeFlsSharedState();
         this.writeEventMirrorState(true); // preserve WASM-set signal bits across buffer-change resync
@@ -1370,6 +1394,22 @@ export class HypercallDataManager {
     }
 
     /**
+     * Publish the mouse-capture owner (GetCapture) into the shared page.
+     *
+     * Event-driven, NOT per tick: capture changes on SetCapture/ReleaseCapture/window
+     * destroy, while games poll GetCapture every frame. Must be called from the single
+     * owner of the capture slot (WindowManager) so no path can leave the page stale —
+     * a stale value here is not a slow answer, it is a WRONG one the guest cannot detect.
+     */
+    updateCaptureHwnd(hwnd: number): void {
+        this.captureHwndShadow = hwnd >>> 0;
+        if (!this.initialized) return;
+        this.refreshViews();
+        if (!this.view || this.hpBase === 0) return;
+        this.view.setUint32(this.hpBase + OFF_HC_CAPTURE_HWND, this.captureHwndShadow, true);
+    }
+
+    /**
      * Update main window offset in shared page.
      * Called when window position changes.
      */
@@ -1492,24 +1532,61 @@ export class HypercallDataManager {
     }
 
     /**
-     * Read per-handler fallback counters from HYPERCALL_PAGE.
-     * Returns a Map from handler ID to fallback count (only non-zero entries).
-     * A fallback means the WASM handler returned false → JS handled the call.
+     * Per-handler_id accounting from HYPERCALL_PAGE — the answer to "which hypercall",
+     * which the single wrapping hc_call_count cannot give.
+     *
+     * `served` = calls the WASM handler completed; `fellBack` = calls it declined
+     * (returned false), which then cost a full JS thunk round-trip. A fast path with a
+     * high fallback ratio is not a fast path — that ratio is the number worth reading.
+     * Counters saturate rather than wrap, so `saturated: true` is reported explicitly
+     * instead of a lapped value passing for a small one.
+     *
+     * Cumulative since page init (and reset by v86.restart(), which zeroes the static) —
+     * take two readings and subtract for a windowed measurement.
      */
-    getFallbackReport(): Map<number, number> {
-        const result = new Map<number, number>();
-        if (!this.initialized || !this.view) return result;
+    getHandlerReport(): Array<{
+        handlerId: number;
+        names: string[];
+        served: number;
+        fellBack: number;
+        saturated: boolean;
+    }> {
+        const result: Array<{
+            handlerId: number; names: string[]; served: number; fellBack: number; saturated: boolean;
+        }> = [];
+        if (!this.initialized) return result;
         this.refreshViews();
-        if (!this.view) return result;
+        if (!this.view || this.hpBase === 0) return result;
 
-        for (let i = 0; i < 68; i++) {
-            const count = this.view.getUint8(this.hpBase + OFF_HC_FALLBACK_COUNTS + i);
-            if (count > 0) {
-                result.set(i, count);
-            }
+        for (let id = 0; id < HC_HANDLER_SLOTS; id++) {
+            const served = this.view.getUint32(this.hpBase + OFF_HC_HANDLER_CALLS + id * 4, true);
+            const fellBack = this.view.getUint32(this.hpBase + OFF_HC_HANDLER_FALLBACKS + id * 4, true);
+            if (served === 0 && fellBack === 0) continue;
+            result.push({
+                handlerId: id,
+                names: namesForHandlerId(id),
+                served,
+                fellBack,
+                saturated: served === 0xFFFFFFFF || fellBack === 0xFFFFFFFF,
+            });
         }
+        result.sort((a, b) => (b.served + b.fellBack) - (a.served + a.fellBack));
         return result;
     }
+}
+
+/** handler_id → the WinAPI/CRT names bound to it (several names share one handler). */
+let handlerIdNames: Map<number, string[]> | null = null;
+function namesForHandlerId(id: number): string[] {
+    if (handlerIdNames === null) {
+        handlerIdNames = new Map();
+        for (const [key, handlerId] of Object.entries(HANDLER_MAP)) {
+            const list = handlerIdNames.get(handlerId);
+            if (list) list.push(key);
+            else handlerIdNames.set(handlerId, [key]);
+        }
+    }
+    return handlerIdNames.get(id) ?? [];
 }
 
 export const hypercallDataManager = new HypercallDataManager();
