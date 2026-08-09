@@ -1,6 +1,7 @@
 import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../../core/logger";
 import { MemoryGuard } from "../../core/memory/mem-guard";
+import { isValidAddress } from "../../core/memory/address-guard";
 import { MSSContext, SMP_DONE, SMP_FREE, SMP_PLAYING, SMP_STOPPED } from "./context";
 import { MSSSample } from "./types";
 import {
@@ -296,8 +297,21 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
         const handle = args[0];
         const sampleObj = ctx.samples.get(handle);
         if (!sampleObj) {
-            Logger.log(LogCategory.SYSTEM, `MSS32: _AIL_sample_status@4: handle=0x${handle.toString(16)} → 0 (not found)`);
-            return 0;
+            // A released (or never-allocated) slot is still a real HSAMPLE in the driver's
+            // sample array, and its status word lives at +0x08 — release_sample_handle stamps
+            // SMP_FREE there. 0 is NOT a Miles status, and answering it strands the documented
+            // teardown loop `end_sample; release_sample_handle; while (status != SMP_FREE);`
+            // (ZenGin's zCSndSys_MSS does exactly this) in an unbreakable spin.
+            const slotStatus = isValidAddress(mem, handle + 0x08, 4)
+                ? makeView(mem).getUint32(handle + 0x08, true)
+                : 0;
+            const status = (slotStatus === SMP_FREE || slotStatus === SMP_DONE
+                || slotStatus === SMP_PLAYING || slotStatus === SMP_STOPPED)
+                ? slotStatus
+                : SMP_FREE;
+            Logger.log(LogCategory.SYSTEM,
+                `MSS32: _AIL_sample_status@4: handle=0x${handle.toString(16)} → ${status} (slot, no JS sample)`);
+            return status;
         }
         const status = sampleObj.isStopped ? SMP_STOPPED : (sampleObj.isPlaying || sampleObj.pendingStart) ? SMP_PLAYING : SMP_DONE;
         Logger.log(LogCategory.SYSTEM, `MSS32: _AIL_sample_status@4: handle=0x${handle.toString(16)} → ${status} (${status === SMP_DONE ? 'DONE' : status === SMP_PLAYING ? 'PLAYING' : 'STOPPED'})`);

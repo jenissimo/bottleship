@@ -80,6 +80,10 @@ export const mss32Module: ModuleDescriptor = {
         
         // Digital driver
         makeFunc("_AIL_open_digital_driver@4", 1),       // @4 = 1 arg
+        // MSS 3.x spells it (frequency, bits, channels, flags). The decorated name carries
+        // the byte count, so both versions coexist — but WITHOUT this entry the @16 import
+        // falls back to the @4 row and returns with RET 4, drifting the caller's stack.
+        makeFunc("_AIL_open_digital_driver@16", 4),
         
         // Wave output
         makeFunc("_AIL_waveOutOpen@16", 4),              // @16 = 4 args
@@ -130,6 +134,19 @@ export const mss32Module: ModuleDescriptor = {
         makeFunc("_AIL_redbook_position@4", 1),
         // 3D provider enumeration
         makeFunc("_AIL_enumerate_3D_providers@12", 3),
+        makeFunc("_AIL_enumerate_filters@12", 3),
+        makeFunc("_AIL_open_filter@8", 2),
+        makeFunc("_AIL_set_filter_sample_preference@12", 3),
+        makeFunc("_AIL_set_sample_processor@12", 3),
+        makeFunc("_AIL_sample_ms_position@12", 3),
+        makeFunc("_AIL_digital_CPU_percent@4", 1),
+        makeFunc("_AIL_set_sample_loop_block@12", 3),
+        makeFunc("_AIL_set_3D_sample_loop_block@12", 3),
+        makeFunc("_AIL_set_3D_sample_obstruction@8", 2),
+        makeFunc("_AIL_set_3D_sample_occlusion@8", 2),
+        makeFunc("_AIL_set_3D_sample_preference@12", 3),
+        makeFunc("_AIL_3D_sample_cone@16", 4),
+        makeFunc("_AIL_3D_provider_attribute@12", 3),
         // 3D audio provider stubs
         makeFunc("_AIL_open_3D_provider@4", 1),
         makeFunc("_AIL_close_3D_provider@4", 1),
@@ -176,6 +193,7 @@ export const mss32Module: ModuleDescriptor = {
         makeFunc("_AIL_digital_handle_reacquire@4", 1),
         // Raw sample data
         makeFunc("_AIL_set_sample_address@8", 2),
+        makeFunc("_AIL_set_sample_address@12", 3),      // (S, start, len)
         // CPU features
         makeFunc("_AIL_MMX_available@0", 0),
         // Timer API (Miles 4.x often uses these)
@@ -233,6 +251,11 @@ export const mss32Module: ModuleDescriptor = {
 
         // Auto-generated from reference signatures
         makeFunc("AIL_allocate_sample_handle", 1),
+        // RIB (Miles' Resource Interchange Broker) — every provider the engine loads
+        // (.m3d/.flt/.asi decoders and 3D drivers) imports these two from mss32 to publish
+        // its own entry points, so one missing name fails the whole provider's load.
+        makeFunc("RIB_register_interface", 4),   // provider, interface_name, entry_count, entries
+        makeFunc("RIB_unregister_interface", 4),
         makeFunc("AIL_close_digital_driver", 1),
         makeFunc("AIL_close_stream", 1),
         makeFunc("AIL_delay", 1),

@@ -10,6 +10,9 @@ import { ensureListener3D } from "./spatial";
 
 /** Fake 3D provider handle — games null-check but never dereference internals */
 const FAKE_3D_PROVIDER_HANDLE = 0xDEAD3D01;
+/** 3D voices we advertise. Miles' own software providers report 32; engines size their
+ *  voice pools from this and treat a small number as "provider not worth keeping". */
+const MAX_3D_SAMPLES = 32;
 
 export function createCoreExports(ctx: MSSContext): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
@@ -242,6 +245,50 @@ export function createCoreExports(ctx: MSSContext): Record<string, ThunkImplemen
         return 0;
     };
 
+    // _AIL_enumerate_filters@12
+    // S32 AIL_enumerate_filters(HPROENUM *next, HPROVIDER *dest, C8 **name)
+    // We ship no DSP filter providers, so enumeration is empty. Returning 0 is what ends
+    // the caller's loop; a non-zero "success" that leaves *name untouched sends it into
+    // strlen(NULL) (Gothic's zMusic filter scan, zSound_MSS.cpp).
+    exports["_AIL_enumerate_filters@12"] = (ctxThunk, mem, args) => {
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        for (const ptr of [args[1], args[2]]) {
+            if (ptr && MemoryGuard.isValidRange(mem, ptr, 4)) view.setUint32(ptr, 0, true);
+        }
+        Logger.verbose(LogCategory.SYSTEM, `MSS32: _AIL_enumerate_filters@12 -> 0 (no filter providers)`);
+        return 0;
+    };
+
+    // HPROVIDER AIL_open_filter(...) — nothing to open once enumeration is empty.
+    exports["_AIL_open_filter@8"] = () => 0;
+    exports["_AIL_set_filter_sample_preference@12"] = () => 0;
+    exports["_AIL_set_sample_processor@12"] = () => 0;
+
+    // void AIL_sample_ms_position(HSAMPLE, S32 *total_ms, S32 *current_ms)
+    // Both are OUT parameters the caller reads unconditionally.
+    exports["_AIL_sample_ms_position@12"] = (ctxThunk, mem, args) => {
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        if (args[1] && MemoryGuard.isValidRange(mem, args[1], 4)) view.setUint32(args[1], 0, true);
+        if (args[2] && MemoryGuard.isValidRange(mem, args[2], 4)) view.setUint32(args[2], 0, true);
+        return 0;
+    };
+
+    // S32 AIL_digital_CPU_percent(HDIGDRIVER) — a mixer we do not run costs nothing.
+    exports["_AIL_digital_CPU_percent@4"] = () => 0;
+
+    exports["_AIL_set_sample_loop_block@12"] = () => 0;
+    exports["_AIL_set_3D_sample_loop_block@12"] = () => 0;
+    exports["_AIL_set_3D_sample_obstruction@8"] = () => 0;
+    exports["_AIL_set_3D_sample_occlusion@8"] = () => 0;
+    exports["_AIL_set_3D_sample_preference@12"] = () => 0;
+    exports["_AIL_3D_sample_cone@16"] = (ctxThunk, mem, args) => {
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        for (const ptr of [args[1], args[2], args[3]]) {
+            if (ptr && MemoryGuard.isValidRange(mem, ptr, 4)) view.setUint32(ptr, 0, true);
+        }
+        return 0;
+    };
+
     // _AIL_set_redist_directory@4
     exports["_AIL_set_redist_directory@4"] = (ctxThunk, mem, args) => {
         const dirPtr = args[0];
@@ -323,9 +370,28 @@ export function createCoreExports(ctx: MSSContext): Record<string, ThunkImplemen
         return 0;
     };
 
-    // _AIL_3D_provider_attribute@12(prov, name, value) → 0
+    // M3DRESULT AIL_3D_provider_attribute(HPROVIDER lib, C8 *name, void *val)
+    // `val` is an OUT parameter. Answering M3D_NOERR without writing it is how a caller
+    // reads "0 supported samples" and discards a provider it just opened: ZenGin's
+    // zCSndSys_MSS does exactly that, then AIL_waveOutClose + AIL_shutdown, leaving its
+    // global sound system NULL — and the crash lands much later, in the Bink intro.
+    // Unknown attributes must FAIL so the caller keeps its own default.
     exports["_AIL_3D_provider_attribute@12"] = (ctxThunk, mem, args) => {
-        return 0;
+        const name = args[1] ? Marshaler.readString(mem, args[1]) : "";
+        const out = args[2] >>> 0;
+        const write = (v: number): number => {
+            if (out && MemoryGuard.isValidRange(mem, out, 4)) {
+                new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setUint32(out, v >>> 0, true);
+            }
+            Logger.log(LogCategory.SYSTEM, `MSS32: _AIL_3D_provider_attribute@12("${name}") -> ${v}`);
+            return 0; // M3D_NOERR
+        };
+        // Voice budget: the worklet mixer has no fixed ceiling, so report the count Miles'
+        // software providers advertise rather than a number that reads as "unusable".
+        if (/max.*sample/i.test(name)) return write(MAX_3D_SAMPLES);
+        if (/max.*(room|environment)/i.test(name)) return write(0);
+        Logger.verbose(LogCategory.SYSTEM, `MSS32: _AIL_3D_provider_attribute@12("${name}") -> M3D_NOT_FOUND`);
+        return 2; // M3D_NOT_FOUND — leave the caller's default in place
     };
 
     // _AIL_open_3D_listener@4(prov) → listener handle (creates the global listener SAB)

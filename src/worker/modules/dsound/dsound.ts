@@ -2852,7 +2852,7 @@ export class DSound implements IModule {
     }
 
     private getMemory(): Uint8Array {
-        return this.process.v86.mem8 || (this.process.v86.v86 && this.process.v86.v86.cpu.mem8);
+        return this.process.getCurrentMemory();
     }
 
     reset(): void {

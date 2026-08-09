@@ -8,7 +8,7 @@ import { MSSSample, MSSStream } from "./types";
 // ==================== Memory helpers ====================
 
 export function getMemory(ctx: MSSContext): Uint8Array {
-    return ctx.process.v86.mem8 || (ctx.process.v86.v86 && ctx.process.v86.v86.cpu.mem8);
+    return ctx.process.getCurrentMemory();
 }
 
 export function makeView(mem: Uint8Array): DataView {

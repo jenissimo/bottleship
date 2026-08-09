@@ -30,8 +30,12 @@ import {
     TIME_FORMAT_MEDIA_TIME,
     S_OK,
     E_NOINTERFACE,
+    EC_COMPLETE,
     FilterState,
 } from "./constants";
+
+/** One entry of the graph's event queue (IMediaEvent::GetEvent out-params). */
+export type MediaEvent = { code: number; param1: number; param2: number };
 
 export class FilterGraphObject extends BaseComObject {
     private static nextAudioId = 0x51000000;
@@ -80,6 +84,14 @@ export class FilterGraphObject extends BaseComObject {
     videoOwnerHwnd: number = 0;
     /** Set once EC_COMPLETE has been posted; reset by RenderFile for graph reuse. */
     completionNotified = false;
+
+    // DirectShow event queue. GetEvent POPS — an event is delivered exactly once and the
+    // queue then runs dry (E_ABORT), which is how a drain loop terminates. Re-answering a
+    // sticky "graph is completed" state instead spins such a loop forever (GTA III's intro
+    // handler drains until GetEvent fails).
+    private eventQueue: MediaEvent[] = [];
+    /** Guards EC_COMPLETE against being queued twice for one RenderFile. */
+    private completionEventRaised = false;
 
     // Playback timer — TimerWheel id, 0 = none scheduled (TimerWheel ids start at 1).
     private playbackTimer: number = 0;
@@ -238,6 +250,8 @@ export class FilterGraphObject extends BaseComObject {
         this.audioPrerollTime = 0;
         this.seekTimeFormat = TIME_FORMAT_MEDIA_TIME;
         this.completionNotified = false;
+        this.completionEventRaised = false;
+        this.eventQueue.length = 0;
         this.videoOwnerHwnd = 0;
         this.state = FilterState.STOPPED;
     }
@@ -370,9 +384,7 @@ export class FilterGraphObject extends BaseComObject {
         this.audioHostActive = false;
         this.audioPlaying = false;
         this.audioStartMs = 0;
-        this.state = FilterState.COMPLETED;
-        this.resolveWaiters();
-        this.postCompletionNotify();
+        this.markCompleted();
         Logger.log(LogCategory.COM, `[Quartz] audio ended id=${id}`);
     }
 
@@ -382,9 +394,7 @@ export class FilterGraphObject extends BaseComObject {
         this.audioHostActive = false;
         this.audioPlaying = false;
         this.audioStartMs = 0;
-        this.state = FilterState.COMPLETED;
-        this.resolveWaiters();
-        this.postCompletionNotify();
+        this.markCompleted();
     }
 
     handleAudioPosition(id: number, positionFrames: number): void {
@@ -422,6 +432,26 @@ export class FilterGraphObject extends BaseComObject {
     }
 
     /**
+     * The graph reached end-of-stream. Idempotent: EC_COMPLETE is queued once per
+     * RenderFile, so a drain loop sees it exactly once and then hits an empty queue.
+     */
+    markCompleted(): void {
+        const wasCompleted = this.state === FilterState.COMPLETED;
+        this.state = FilterState.COMPLETED;
+        if (!wasCompleted) this.resolveWaiters();
+        if (!this.completionEventRaised) {
+            this.completionEventRaised = true;
+            this.eventQueue.push({ code: EC_COMPLETE, param1: 0, param2: 0 });
+        }
+        this.postCompletionNotify();
+    }
+
+    /** IMediaEvent::GetEvent — pop the oldest queued event, or null when the queue is dry. */
+    dequeueEvent(): MediaEvent | null {
+        return this.eventQueue.shift() ?? null;
+    }
+
+    /**
      * Post the EC_COMPLETE notification to the window registered via SetNotifyWindow.
      * Followed by a WM_NULL: game loops commonly check their "video done" flag only
      * after GetMessage returns, and the flag is set while dispatching the notify —
@@ -453,8 +483,8 @@ export class FilterGraphObject extends BaseComObject {
         if (this.state === FilterState.RUNNING) return;
         if (this.state === FilterState.COMPLETED) {
             // Already done (e.g. skipVideo completed RenderFile instantly) — Run() on a
-            // completed graph must still surface EC_COMPLETE to the notify window.
-            this.postCompletionNotify();
+            // completed graph must still surface EC_COMPLETE to both event channels.
+            this.markCompleted();
             return;
         }
         this.state = FilterState.RUNNING;
@@ -462,9 +492,7 @@ export class FilterGraphObject extends BaseComObject {
 
         if (this.engineHandle <= 0) {
             // No valid video — mark completed immediately
-            this.state = FilterState.COMPLETED;
-            this.resolveWaiters();
-            this.postCompletionNotify();
+            this.markCompleted();
             return;
         }
 
@@ -577,9 +605,7 @@ export class FilterGraphObject extends BaseComObject {
 
     private startAudioPlayback(): void {
         if (!this.audioBytes || !this.audioId) {
-            this.state = FilterState.COMPLETED;
-            this.resolveWaiters();
-            this.postCompletionNotify();
+            this.markCompleted();
             return;
         }
 
@@ -742,9 +768,7 @@ export class FilterGraphObject extends BaseComObject {
     }
 
     private finishVideoPlayback(): void {
-        this.state = FilterState.COMPLETED;
-        this.resolveWaiters();
-        this.postCompletionNotify();
+        this.markCompleted();
         this.closeVideoRouting();
         (self as any).postMessage({ type: "video_end" });
         if (this.playbackTimer !== 0) {

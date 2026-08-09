@@ -45,6 +45,7 @@ import {
     E_NOINTERFACE,
     E_NOTIMPL,
     E_FAIL,
+    E_ABORT,
     EC_COMPLETE,
     FilterState,
 } from "./constants";
@@ -390,12 +391,12 @@ export class Quartz implements IModule {
             if (filePath && EmulatorConfig.getInstance().skipVideo && !this.isAudioPath(filePath)) {
                 Logger.log(LogCategory.COM, `[Quartz] RenderFile: skipVideo=true, completing "${filePath}"`);
                 fg.engineHandle = 0;
-                fg.state = FilterState.COMPLETED;
+                fg.markCompleted();
                 return S_OK;
             }
 
             if (!filePath) {
-                fg.state = FilterState.COMPLETED;
+                fg.markCompleted();
                 return S_OK;
             }
 
@@ -410,7 +411,7 @@ export class Quartz implements IModule {
             const fileBytes = await this.readVfsFile(vfsPath);
             if (!fileBytes) {
                 Logger.warn(LogCategory.COM, `[Quartz] RenderFile: could not read "${vfsPath}" — skipping video`);
-                fg.state = FilterState.COMPLETED;
+                fg.markCompleted();
                 return S_OK;
             }
 
@@ -441,7 +442,7 @@ export class Quartz implements IModule {
             } catch (e) {
                 // Video format not supported (e.g., AVI) — gracefully skip
                 Logger.warn(LogCategory.COM, `[Quartz] RenderFile: video engine failed for "${vfsPath}": ${e} — skipping`);
-                fg.state = FilterState.COMPLETED;
+                fg.markCompleted();
             }
 
             return S_OK;
@@ -707,19 +708,20 @@ export class Quartz implements IModule {
         // GetEventHandle
         this.exports["IMediaEvent_GetEventHandle"] = (_ctx, _mem, _args) => E_NOTIMPL;
 
-        // GetEvent
+        // GetEvent — pops one queued event. An empty queue is E_ABORT (the documented
+        // "timeout expired, no event"), NOT a failure to be retried: drain loops spin on
+        // success and only break when the queue runs dry.
         this.exports["IMediaEvent_GetEvent"] = (_ctx, mem, args) => {
             const fg = this.getFilterGraph(mem, args[0]);
             if (!fg) return E_FAIL;
             // args[1] = lEventCode, args[2] = lParam1, args[3] = lParam2, args[4] = msTimeout
+            const ev = fg.dequeueEvent();
+            if (!ev) return E_ABORT;
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            if (fg.state === FilterState.COMPLETED) {
-                if (args[1]) view.setUint32(args[1], EC_COMPLETE, true);
-                if (args[2]) view.setUint32(args[2], 0, true);
-                if (args[3]) view.setUint32(args[3], 0, true);
-                return S_OK;
-            }
-            return E_FAIL; // No event available
+            if (args[1]) view.setInt32(args[1], ev.code, true);
+            if (args[2]) view.setInt32(args[2], ev.param1, true);
+            if (args[3]) view.setInt32(args[3], ev.param2, true);
+            return S_OK;
         };
 
         // WaitForCompletion — async thunk
@@ -738,6 +740,10 @@ export class Quartz implements IModule {
                 const timeout = (msTimeout === -1 || msTimeout === 0xFFFFFFFF) ? 0 : msTimeout;
                 await fg.waitForCompletion(timeout);
             }
+
+            // WaitForCompletion consumes the completion event — a later GetEvent drain
+            // must not see it a second time.
+            while (fg.dequeueEvent()) { /* drain */ }
 
             // Write event code
             if (pEvCode) {
