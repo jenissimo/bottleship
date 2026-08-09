@@ -347,7 +347,9 @@ Quality Gate (mandatory order):
   6. bun tools/validate-file-cursor.ts
   7. bun tools/validate-jit-exports.ts   (checks the BUILT v86 artifact — skips cleanly if absent)
   8. bun tools/validate-guest-pointer-guards.ts
-  9. bun run typecheck
+  9. bun tools/validate-guest-memory-borrow.ts   (raw guest-memory Proxy access confined to its owners)
+ 10. bun tools/validate-hypercall-abi.ts         (Rust/TS hypercall page offsets + handler ids agree)
+ 11. bun run typecheck
 
 `bun run gate` runs all of it in order.
 
