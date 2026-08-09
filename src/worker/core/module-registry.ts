@@ -2,7 +2,7 @@
 // Tracks loaded PE modules (EXE + DLLs) with their exports for GetProcAddress, GetModuleHandle, etc.
 
 import { Logger, LogCategory } from './logger';
-import { MEM_ROM_BASE, MEM_ROM_SIZE } from './cpu/emulator-config';
+import { MEM_ROM_BASE, MEM_ROM_SIZE, MEM_HLE_IMAGE_BASE } from './cpu/emulator-config';
 
 /**
  * Information about a loaded PE module (EXE or DLL)
@@ -55,7 +55,10 @@ export interface PESection {
  * can never meet.
  */
 const DLL_BASE_START = MEM_ROM_BASE;
-const DLL_BASE_LIMIT = MEM_ROM_BASE + MEM_ROM_SIZE;
+// The top of ROM is the HLE synthetic-image arena (emulator-config). Real DLLs stop
+// short of it: a slot there is pinned per module for the life of the process, so it must
+// never enter this allocator's bump range or its FreeLibrary free-list.
+const DLL_BASE_LIMIT = MEM_HLE_IMAGE_BASE;
 const DLL_BASE_ALIGNMENT = 0x10000; // 64KB alignment (Windows standard)
 
 /**
@@ -85,9 +88,14 @@ export class ModuleRegistry {
         const nameLower = this.normalizeModuleLookupKey(mod.name);
 
         // Check for duplicate registration
-        if (this.modules.has(nameLower)) {
+        const previous = this.modules.get(nameLower);
+        if (previous) {
             Logger.warn(LogCategory.SYSTEM,
                 `[ModuleRegistry] Module "${mod.name}" already registered, replacing`);
+            // The replaced module keeps its byBase entry otherwise, so getByBase(oldBase)
+            // keeps answering with a module no name resolves to any more — a live handle
+            // pointing at an image the registry no longer believes is loaded.
+            if (previous.baseAddress !== mod.baseAddress) this.byBase.delete(previous.baseAddress);
         }
 
         this.modules.set(nameLower, mod);

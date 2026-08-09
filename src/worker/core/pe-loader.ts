@@ -14,6 +14,9 @@ import { libHleManager } from './hle-lib/lib-hle-manager';
 import { hookRegistry } from './hooks';
 import { Galaxy } from '../modules/galaxy';
 import { normalizeDllBaseName, resolveThunkedDllAlias } from './dll-aliases';
+import { findDllRule, normalizeDllPathToken } from './dll-rules';
+import { isUnderSystemDirectory } from './hle-system-catalog';
+import { EmulatorConfig } from './emulator-config-manager';
 import { installCw3220Stdio } from '../modules/cw3220/cw3220-stdio';
 import { writeHeapSlabStubs } from '../modules/kernel32/heap-slab-stubs';
 import { writeCrtSlabStubs, writeCaseFoldStubs } from '../modules/crt-slab-stubs';
@@ -657,6 +660,10 @@ export class PELoader {
             const system = System.getInstance();
             const addressSpace = system.process?.addressSpace;
             if (addressSpace) {
+                // FreeLibrary hands the VA back to the registry's pool but leaves the image
+                // mapped, so a reload of the same DLL is handed the identical base with the
+                // previous region record still registered — drop it, exactly as the EXE path does.
+                addressSpace.releaseRegion(baseAddress);
                 addressSpace.mapRegion(baseAddress, sizeOfImage, "rwx", "ROM", "PELoader", "dll");
             }
 
@@ -909,14 +916,18 @@ export class PELoader {
         // Write TLS index to AddressOfIndex in guest memory
         memView.setUint32(addressOfIndex, tlsIndex, true);
 
-        // Register entry for thread initialization (ensureMainThread / createThread will use it)
-        system.implicitTlsEntries.push({
+        // Register the entry so threads created LATER get their copy...
+        const entry = {
             tlsIndex,
             templateStart: startOfRawData,
             templateSize,
             zeroFillSize: sizeOfZeroFill,
             moduleName,
-        });
+        };
+        system.implicitTlsEntries.push(entry);
+        // ...and give the threads that already exist theirs now, as Windows' loader does.
+        // A LoadLibrary'd module (any mod/plugin DLL) always arrives after its threads.
+        scheduler.initImplicitTlsEntryForExistingThreads(entry);
 
         Logger.log(LogCategory.SYSTEM,
             `[PE] TLS: "${moduleName}" index=${tlsIndex} template=0x${startOfRawData.toString(16)} (${totalTlsSize} bytes) ` +
@@ -1228,6 +1239,21 @@ export class PELoader {
             // Video DLLs are excluded when native loading is enabled — they fall through to VFS.
             let isThunked = this.apiRegistry.hasModule(dllName) &&
                 !(EMU_NATIVE_VIDEO_DLLS && VIDEO_DLL_NAMES.has(dllName));
+
+            // manifest.appDirDlls: the game ships its own copy of this DLL next to the exe,
+            // and Windows' search order binds to THAT — it is a wrapper/proxy (ASI loader,
+            // Glide or ddraw shim) whose whole purpose is to run first. Checked before the
+            // coverage rule below and outside its exclusions, because the DLLs games wrap
+            // are exactly the video ones that rule skips. A rule with no file on disk stays
+            // thunked: metadata must not be able to turn an import into an unbound one.
+            if (isThunked && findDllRule(EmulatorConfig.getInstance().appDirDlls, dllNameRaw) !== null) {
+                const appDirPath = this.findDllPath(dllName);
+                if (appDirPath && !isUnderSystemDirectory(normalizeDllPathToken(appDirPath))) {
+                    Logger.log(LogCategory.SYSTEM,
+                        `[PE] "${dllNameRaw}" -> the game's own ${appDirPath} (manifest.appDirDlls), not the HLE module`);
+                    isThunked = false;
+                }
+            }
 
             // A thunked module must cover every requested import — stdcall stubs need
             // argCount or stackCleanupBytes, and generateStubDll throws otherwise.

@@ -10,7 +10,9 @@ import { EMU_NATIVE_VIDEO_DLLS } from '../../../core/cpu/emulator-config';
 import { EmulatorConfig, VER_PLATFORM_WIN32_WINDOWS } from '../../../core/emulator-config-manager';
 import { encodeAnsi } from '../../codepage-utils';
 import { resolveThunkedDllAlias } from '../../../core/dll-aliases';
-import { THUNKED_DLL_PSEUDO_BASE } from '../../../core/hle-system-catalog';
+import { FORCE_NATIVE_PACKAGE_LOAD, isUnderSystemDirectory } from '../../../core/hle-system-catalog';
+import { findDllRule } from '../../../core/dll-rules';
+import { hleImageBase, hleModuleNameByBase } from '../../../core/hle-module-images';
 import { getProcAddressRegistry, type GetProcResolution } from '../../../core/diagnostics/get-proc-address-registry';
 import { SILENT_STUBS } from '../../../core/diagnostics/api-census';
 import { resolveHleExportAddress } from '../../../core/thunking/export-resolver';
@@ -23,18 +25,8 @@ function getMainExeHandle(): number {
     return System.getInstance().process?.moduleRegistry?.getMainExecutableBase() ?? DEFAULT_EXE_BASE;
 }
 
-// THUNKED_DLL_PSEUDO_BASE lives in hle-system-catalog.ts (shared with VFS virtual presence).
-// UE1 native packages (e.g. Galaxy.dll) self-register their UClass via IMPLEMENT_CLASS in
-// C++ static-init when the DLL actually loads. They MUST load for real: returning a thunked
-// API pseudo-base makes LoadLibrary skip the real load (PRIORITY 3), so the class is never
-// registered and UE1 aborts with "Failed to find object 'Class Galaxy.GalaxyAudioSubsystem'".
-// The galaxy HLE is designed to PATCH the real DLL after load (native-patch.ts), never to
-// replace it — so galaxy's APIRegistry presence must not hijack LoadLibrary/GetModuleHandle.
-const FORCE_NATIVE_PACKAGE_LOAD = new Set<string>(['galaxy']);
-
-const THUNKED_DLL_PSEUDO_BY_BASE = new Map<number, string>(
-    Object.entries(THUNKED_DLL_PSEUDO_BASE).map(([name, base]) => [base >>> 0, name])
-);
+// The HLE module images (their bases ARE the HMODULEs) live in hle-module-images.ts;
+// FORCE_NATIVE_PACKAGE_LOAD and the VFS presence rules in hle-system-catalog.ts.
 
 const loadLibraryHandleCache = new Map<string, number>();
 const handleToPathCache = new Map<number, string>();
@@ -174,7 +166,7 @@ function getThunkedModuleName(value: string): string {
 }
 
 function getThunkedDllBase(dllName: string): number | undefined {
-    return THUNKED_DLL_PSEUDO_BASE[getThunkedModuleName(dllName)];
+    return hleImageBase(getThunkedModuleName(dllName));
 }
 
 function getDllBaseName(value: string): string {
@@ -260,16 +252,9 @@ function resolveModuleFilename(hModule: number): { path: string; found: boolean 
         }
     }
 
-    const thunked = THUNKED_DLL_PSEUDO_BY_BASE.get(h);
-    if (thunked) {
-        const path = formatSystemDllPath(thunked);
-        handleToPathCache.set(h, path);
-        return { path, found: true };
-    }
-
-    const generated = getHashToDllNameMap().get(h);
-    if (generated) {
-        const path = formatSystemDllPath(generated);
+    const hleName = hleModuleNameByBase(h);
+    if (hleName) {
+        const path = formatSystemDllPath(hleName);
         handleToPathCache.set(h, path);
         return { path, found: true };
     }
@@ -333,8 +318,8 @@ export function ensureGetProcAddressDynamicExports(
     ensureProcessLocalCaches();
     for (const entry of exports) {
         const dllLower = entry.dll.toLowerCase();
-        let base: number | undefined = THUNKED_DLL_PSEUDO_BASE[dllLower];
-        if (base === undefined) base = computeGeneratedPseudoBase(dllLower);
+        const base = hleImageBase(dllLower);
+        if (base === undefined) continue;
         const cacheKey = buildGetProcCacheKey(base, entry.name, false, 0);
         if (getProcAddressCache.has(cacheKey)) continue;
 
@@ -349,27 +334,6 @@ export function ensureGetProcAddressDynamicExports(
     }
 }
 
-/** Lazily-built cache: hash → module name for APIRegistry modules not in THUNKED_DLL_PSEUDO_BASE */
-let hashToDllNameCache: Map<number, string> | null = null;
-
-function computeGeneratedPseudoBase(moduleName: string): number {
-    let hash = 0x70000000;
-    for (let i = 0; i < moduleName.length; i++) {
-        hash = ((hash << 5) - hash + moduleName.charCodeAt(i)) >>> 0;
-    }
-    return (hash & 0x0FFFFFFF) | 0x70000000;
-}
-
-function getHashToDllNameMap(): Map<number, string> {
-    if (hashToDllNameCache) return hashToDllNameCache;
-    hashToDllNameCache = new Map();
-    const apiRegistry = APIRegistry.getInstance();
-    for (const modName of apiRegistry.getModuleNames()) {
-        hashToDllNameCache.set(computeGeneratedPseudoBase(modName), modName);
-    }
-    return hashToDllNameCache;
-}
-
 function normalizeDllPathToken(value: string): string {
     return value.trim().replace(/^"+|"+$/g, "").replace(/\//g, "\\");
 }
@@ -378,63 +342,45 @@ function stripDllExtension(value: string): string {
     return value.replace(/\.dll$/i, "");
 }
 
-function wildcardToRegExp(pattern: string): RegExp {
-    const escaped = pattern.replace(/[-/\\^$+?.()|[\]{}]/g, "\\$&");
-    return new RegExp(`^${escaped.replace(/\*/g, ".*").replace(/\?/g, ".")}$`, "i");
+function findDisabledDllRule(dllName: string): string | null {
+    return findDllRule(EmulatorConfig.getInstance().disabledDlls, dllName);
 }
 
-function findDisabledDllRule(dllName: string): string | null {
-    if (!dllName) return null;
-    const rules = EmulatorConfig.getInstance().disabledDlls;
-    if (!rules || rules.length === 0) return null;
+/**
+ * Does the game directory's copy of this DLL outrank our HLE module (manifest.appDirDlls)?
+ *
+ * An EXPLICIT system-directory path never does: that is how a proxy reaches the library it
+ * wraps ("C:\WINDOWS\SYSTEM32\ddraw.dll" from an ASI loader's own DllMain). Without this
+ * carve-out the proxy resolves to itself and recurses.
+ */
+function prefersAppDirDll(requestedName: string): boolean {
+    if (!requestedName) return false;
+    if (isUnderSystemDirectory(normalizeDllPathToken(requestedName))) return false;
+    return findDllRule(EmulatorConfig.getInstance().appDirDlls, requestedName) !== null;
+}
 
-    const full = normalizeDllPathToken(dllName).toLowerCase();
-    const fullNoDot = full.replace(/^[.\\]+/, "");
-    const fullNoDrive = fullNoDot.replace(/^[a-z]:\\/, "");
-    const base = full.split("\\").pop() ?? full;
-    const baseNoExt = stripDllExtension(base);
-    const candidates = Array.from(new Set([full, fullNoDot, fullNoDrive, base, baseNoExt]));
+/**
+ * The mirror of prefersAppDirDll: an EXPLICIT system-directory request for a name that has
+ * an app-dir rule. Such a request must bypass both the handle cache and the loaded-module
+ * registry (which key on the bare name and would hand the proxy back its own base) and land
+ * on the HLE module.
+ */
+function requestsSystemCopyOfAppDirDll(requestedName: string): boolean {
+    if (!requestedName) return false;
+    if (!isUnderSystemDirectory(normalizeDllPathToken(requestedName))) return false;
+    return findDllRule(EmulatorConfig.getInstance().appDirDlls, requestedName) !== null;
+}
 
-    for (const rawRule of rules) {
-        const ruleToken = normalizeDllPathToken(rawRule);
-        if (!ruleToken) continue;
-
-        const rule = ruleToken.toLowerCase();
-        const ruleNoDot = rule.replace(/^[.\\]+/, "");
-        const ruleNoDrive = ruleNoDot.replace(/^[a-z]:\\/, "");
-        const ruleBase = rule.split("\\").pop() ?? rule;
-        const ruleBaseNoExt = stripDllExtension(ruleBase);
-        const hasWildcard = /[*?]/.test(rule) || /[*?]/.test(ruleBase);
-
-        if (hasWildcard) {
-            const wildcardPatterns = Array.from(new Set([rule, ruleNoDot, ruleNoDrive, ruleBase, ruleBaseNoExt]));
-            for (const pattern of wildcardPatterns) {
-                if (!pattern) continue;
-                const rx = wildcardToRegExp(pattern);
-                if (candidates.some((candidate) => rx.test(candidate))) {
-                    return rawRule;
-                }
-            }
-            continue;
-        }
-
-        if (
-            candidates.includes(rule) ||
-            candidates.includes(ruleNoDot) ||
-            candidates.includes(ruleNoDrive) ||
-            candidates.includes(ruleBase) ||
-            candidates.includes(ruleBaseNoExt)
-        ) {
-            return rawRule;
-        }
-
-        // Path-like explicit rules should also match suffix of full path.
-        if (rule.includes("\\") && (full.endsWith(rule) || fullNoDot.endsWith(ruleNoDot) || fullNoDrive.endsWith(ruleNoDrive))) {
-            return rawRule;
-        }
-    }
-
-    return null;
+/**
+ * Does a real game-directory PE actually exist to take the HLE module's place? A rule alone
+ * is not enough — without the file we would skip the HLE and then fail the load outright,
+ * turning a metadata typo into a missing import. The VFS also advertises virtual HLE system
+ * files, so a hit under the system directory is our own presence, not the game's copy.
+ */
+function appDirDllShadowsHle(dllName: string): boolean {
+    if (!prefersAppDirDll(dllName)) return false;
+    const path = System.getInstance().process?.loader?.findDllPath(dllName);
+    return !!path && !isUnderSystemDirectory(normalizeDllPathToken(path));
 }
 
 function formatLoadLibraryCaller(ctx: { eip?: number } | null | undefined): string {
@@ -516,17 +462,6 @@ function initModuleFunctions(): void {
             return { value: pseudoBase, stackCleanup: 4 };
         }
 
-        // Also check APIRegistry for any thunked module we might have missed in the pseudo-base list
-        const apiRegistry = APIRegistry.getInstance();
-        if (apiRegistry.hasModule(thunkedName) && !FORCE_NATIVE_PACKAGE_LOAD.has(thunkedName)) {
-            const blocked = tryBlockThunkedDllLoad(name, thunkedName, 4, "GetModuleHandleA");
-            if (blocked) {
-                return blocked;
-            }
-            const hash = computeGeneratedPseudoBase(thunkedName);
-            Logger.log(LogCategory.KERNEL32, `GetModuleHandleA("${name}") -> 0x${hash.toString(16)} (thunked DLL, generated)`);
-            return { value: hash, stackCleanup: 4 };
-        }
 
         Logger.log(LogCategory.KERNEL32, `GetModuleHandleA("${name}") -> 0 (not found)`);
         system.process!.lastError = 126; // ERROR_MOD_NOT_FOUND
@@ -575,17 +510,6 @@ function initModuleFunctions(): void {
             return { value: pseudoBase, stackCleanup: 4 };
         }
 
-        // Also check APIRegistry for any thunked module we might have missed
-        const apiRegistry = APIRegistry.getInstance();
-        if (apiRegistry.hasModule(thunkedName) && !FORCE_NATIVE_PACKAGE_LOAD.has(thunkedName)) {
-            const blocked = tryBlockThunkedDllLoad(name, thunkedName, 4, "GetModuleHandleW");
-            if (blocked) {
-                return blocked;
-            }
-            const hash = computeGeneratedPseudoBase(thunkedName);
-            Logger.verbose(LogCategory.KERNEL32, `GetModuleHandleW("${name}") -> 0x${hash.toString(16)} (thunked DLL, generated)`);
-            return { value: hash, stackCleanup: 4 };
-        }
 
         Logger.verbose(LogCategory.KERNEL32, `GetModuleHandleW("${name}") -> 0 (not found)`);
         system.process!.lastError = 126; // ERROR_MOD_NOT_FOUND
@@ -832,7 +756,7 @@ function initModuleFunctions(): void {
         const loader = system.process?.loader;
 
         // PRIORITY 1: Check if already loaded (real DLL from VFS)
-        if (moduleRegistry) {
+        if (moduleRegistry && !requestsSystemCopyOfAppDirDll(dllName)) {
             const existing = moduleRegistry.getByName(dllName);
             if (existing) {
                 Logger.log(LogCategory.KERNEL32, `LoadLibraryExW("${dllName}") -> 0x${existing.baseAddress.toString(16)} (already loaded)`);
@@ -840,9 +764,9 @@ function initModuleFunctions(): void {
             }
         }
 
-        // PRIORITY 2: Check if it's a thunked DLL
+        // PRIORITY 2: Check if it's a thunked DLL (unless the game ships its own — appDirDlls)
         const thunkedName = getThunkedModuleName(dllName);
-        const thunkedBase = getThunkedDllBase(dllName);
+        const thunkedBase = appDirDllShadowsHle(dllName) ? undefined : getThunkedDllBase(dllName);
         if (thunkedBase !== undefined) {
             const blocked = tryBlockThunkedDllLoad(dllName, thunkedName, 12, "LoadLibraryExW");
             if (blocked) {
@@ -853,18 +777,6 @@ function initModuleFunctions(): void {
             return { value: thunkedBase, stackCleanup: 12 };
         }
 
-        // Also check APIRegistry for any thunked module not in the explicit list
-        const apiRegistry = APIRegistry.getInstance();
-        if (apiRegistry.hasModule(thunkedName) && !FORCE_NATIVE_PACKAGE_LOAD.has(thunkedName)) {
-            const blocked = tryBlockThunkedDllLoad(dllName, thunkedName, 12, "LoadLibraryExW");
-            if (blocked) {
-                return blocked;
-            }
-            const hash = computeGeneratedPseudoBase(thunkedName);
-            rememberLoadLibraryHandle(dllName, hash);
-            Logger.log(LogCategory.KERNEL32, `LoadLibraryExW("${dllName}") -> 0x${hash.toString(16)} (thunked DLL, generated)`);
-            return { value: hash, stackCleanup: 12 };
-        }
 
         // PRIORITY 3: Try to load real DLL from VFS
         if (loader) {
@@ -909,7 +821,7 @@ function initModuleFunctions(): void {
         const loader = system.process?.loader;
 
         // PRIORITY 1: Check if already loaded (real DLL from VFS)
-        if (moduleRegistry) {
+        if (moduleRegistry && !requestsSystemCopyOfAppDirDll(dllName)) {
             const existing = moduleRegistry.getByName(dllName);
             if (existing) {
                 Logger.log(LogCategory.KERNEL32, `LoadLibraryExA("${dllName}") -> 0x${existing.baseAddress.toString(16)} (already loaded)`);
@@ -917,9 +829,9 @@ function initModuleFunctions(): void {
             }
         }
 
-        // PRIORITY 2: Check if it's a thunked DLL
+        // PRIORITY 2: Check if it's a thunked DLL (unless the game ships its own — appDirDlls)
         const thunkedName = getThunkedModuleName(dllName);
-        const thunkedBase = getThunkedDllBase(dllName);
+        const thunkedBase = appDirDllShadowsHle(dllName) ? undefined : getThunkedDllBase(dllName);
         if (thunkedBase !== undefined) {
             const blocked = tryBlockThunkedDllLoad(dllName, thunkedName, 12, "LoadLibraryExA");
             if (blocked) {
@@ -930,18 +842,6 @@ function initModuleFunctions(): void {
             return { value: thunkedBase, stackCleanup: 12 };
         }
 
-        // Also check APIRegistry for any thunked module not in the explicit list
-        const apiRegistry = APIRegistry.getInstance();
-        if (apiRegistry.hasModule(thunkedName) && !FORCE_NATIVE_PACKAGE_LOAD.has(thunkedName)) {
-            const blocked = tryBlockThunkedDllLoad(dllName, thunkedName, 12, "LoadLibraryExA");
-            if (blocked) {
-                return blocked;
-            }
-            const hash = computeGeneratedPseudoBase(thunkedName);
-            rememberLoadLibraryHandle(dllName, hash);
-            Logger.log(LogCategory.KERNEL32, `LoadLibraryExA("${dllName}") -> 0x${hash.toString(16)} (thunked DLL, generated)`);
-            return { value: hash, stackCleanup: 12 };
-        }
 
         // PRIORITY 3: Try to load real DLL from VFS
         if (loader) {
@@ -979,7 +879,8 @@ function initModuleFunctions(): void {
 
         ensureProcessLocalCaches();
         pinUntrackedModules();
-        const cached = getCachedLoadLibraryHandle(dllName);
+        const wantsSystemCopy = requestsSystemCopyOfAppDirDll(dllName);
+        const cached = wantsSystemCopy ? undefined : getCachedLoadLibraryHandle(dllName);
         if (cached !== undefined) {
             return { value: cached, stackCleanup: 4 };
         }
@@ -989,7 +890,7 @@ function initModuleFunctions(): void {
         const loader = system.process?.loader;
 
         // PRIORITY 1: already loaded native DLL
-        if (moduleRegistry) {
+        if (moduleRegistry && !wantsSystemCopy) {
             const existing = moduleRegistry.getByName(dllName);
             if (existing) {
                 rememberLoadLibraryHandle(dllName, existing.baseAddress);
@@ -997,9 +898,9 @@ function initModuleFunctions(): void {
             }
         }
 
-        // PRIORITY 2: thunked DLL
+        // PRIORITY 2: thunked DLL (unless the game ships its own — appDirDlls)
         const thunkedName = getThunkedModuleName(dllName);
-        const thunkedBase = getThunkedDllBase(dllName);
+        const thunkedBase = appDirDllShadowsHle(dllName) ? undefined : getThunkedDllBase(dllName);
         if (thunkedBase !== undefined) {
             const blocked = tryBlockThunkedDllLoad(dllName, thunkedName, 4, "LoadLibraryW");
             if (blocked) return blocked;
@@ -1007,15 +908,6 @@ function initModuleFunctions(): void {
             return { value: thunkedBase, stackCleanup: 4 };
         }
 
-        // Also check APIRegistry for generated thunked module pseudo-bases.
-        const apiRegistry = APIRegistry.getInstance();
-        if (apiRegistry.hasModule(thunkedName) && !FORCE_NATIVE_PACKAGE_LOAD.has(thunkedName)) {
-            const blocked = tryBlockThunkedDllLoad(dllName, thunkedName, 4, "LoadLibraryW");
-            if (blocked) return blocked;
-            const hash = computeGeneratedPseudoBase(thunkedName);
-            rememberLoadLibraryHandle(dllName, hash);
-            return { value: hash, stackCleanup: 4 };
-        }
 
         // PRIORITY 3: load native DLL from VFS
         if (loader) {
@@ -1051,7 +943,8 @@ function initModuleFunctions(): void {
 
         ensureProcessLocalCaches();
         pinUntrackedModules();
-        const cached = getCachedLoadLibraryHandle(dllName);
+        const wantsSystemCopy = requestsSystemCopyOfAppDirDll(dllName);
+        const cached = wantsSystemCopy ? undefined : getCachedLoadLibraryHandle(dllName);
         if (cached !== undefined) {
             return { value: cached, stackCleanup: 4 };
         }
@@ -1074,7 +967,7 @@ function initModuleFunctions(): void {
         const isBinkCaller = callerNameLower.includes('bink');
 
         // PRIORITY 1: already loaded native DLL
-        if (moduleRegistry) {
+        if (moduleRegistry && !wantsSystemCopy) {
             const existing = moduleRegistry.getByName(dllName);
             if (existing) {
                 rememberLoadLibraryHandle(dllName, existing.baseAddress);
@@ -1082,8 +975,8 @@ function initModuleFunctions(): void {
             }
         }
 
-        // PRIORITY 2: thunked DLL
-        const thunkedBase = getThunkedDllBase(dllName);
+        // PRIORITY 2: thunked DLL (unless the game ships its own — appDirDlls)
+        const thunkedBase = appDirDllShadowsHle(dllName) ? undefined : getThunkedDllBase(dllName);
         if (thunkedBase !== undefined) {
             const blocked = tryBlockThunkedDllLoad(dllName, thunkedName, 4, "LoadLibraryA", callerInfo);
             if (blocked) return blocked;
@@ -1099,15 +992,6 @@ function initModuleFunctions(): void {
             return { value: thunkedBase, stackCleanup: 4 };
         }
 
-        // Also check APIRegistry for generated thunked module pseudo-bases.
-        const apiRegistry = APIRegistry.getInstance();
-        if (apiRegistry.hasModule(thunkedName) && !FORCE_NATIVE_PACKAGE_LOAD.has(thunkedName)) {
-            const blocked = tryBlockThunkedDllLoad(dllName, thunkedName, 4, "LoadLibraryA", callerInfo);
-            if (blocked) return blocked;
-            const hash = computeGeneratedPseudoBase(thunkedName);
-            rememberLoadLibraryHandle(dllName, hash);
-            return { value: hash, stackCleanup: 4 };
-        }
 
         // PRIORITY 3: load native DLL from VFS
         if (loader) {
@@ -1304,7 +1188,7 @@ function initModuleFunctions(): void {
             return finish(cached);
         }
         // Retry previously-missed thunked exports — stubs may appear after warmup / HMR.
-        if (cached === 0 && (THUNKED_DLL_PSEUDO_BY_BASE.has(hModule) || getHashToDllNameMap().has(hModule))) {
+        if (cached === 0 && hleModuleNameByBase(hModule) !== undefined) {
             getProcAddressCache.delete(cacheKey);
         } else if (cached === 0) {
             system.process!.lastError = 127;
@@ -1350,10 +1234,7 @@ function initModuleFunctions(): void {
             const dispatcher = system.process.dispatcher as any;
 
             if (address === 0 && hModule !== 0) {
-                let dllName = THUNKED_DLL_PSEUDO_BY_BASE.get(hModule) ?? null;
-                if (!dllName) {
-                    dllName = getHashToDllNameMap().get(hModule) ?? null;
-                }
+                const dllName = hleModuleNameByBase(hModule) ?? null;
 
                 if (dllName) {
                     const dataAddr = dispatcher.thunkGenerator?.getDataExportAddress(dllName, procName);
@@ -1414,8 +1295,8 @@ export function prePopulateGetProcAddressCache(dispatcher: any): void {
     let count = 0;
     for (const stub of stubs) {
         const dllLower = stub.dllName.toLowerCase();
-        let base: number | undefined = THUNKED_DLL_PSEUDO_BASE[dllLower];
-        if (base === undefined) base = computeGeneratedPseudoBase(dllLower);
+        const base = hleImageBase(dllLower);
+        if (base === undefined) continue;
         const key = buildGetProcCacheKey(base, stub.functionName, false, 0);
         if (!getProcAddressCache.has(key)) {
             getProcAddressCache.set(key, stub.address >>> 0);
@@ -1439,7 +1320,16 @@ export function registerFastPathModuleFunctions(dispatcher: any): void {
         const lpName = view.getUint32(esp + 4, true) >>> 0;
         if (lpName === 0) return getMainExeHandle();
         const name = Marshaler.readString(mem8, lpName);
-        const base = getThunkedDllBase(name.toLowerCase().replace(/\.dll$/, ''));
+        const thunkedName = getThunkedModuleName(name);
+        // Answer ONLY where the slow path would answer the same. It consults the loaded-module
+        // registry FIRST, so a game shipping its own ddraw/d3d8 (manifest.appDirDlls) must not
+        // get the HLE image's base here — two handles for one name means it patches the wrong
+        // image. Same for manifest.disabledDlls: a module we must not provide.
+        const registry = System.getInstance().process?.moduleRegistry;
+        if (registry?.getByName(name)) return null;
+        if (appDirDllShadowsHle(name) || requestsSystemCopyOfAppDirDll(name)) return null;
+        if (findDisabledDllRule(name) || findDisabledDllRule(thunkedName)) return null;
+        const base = hleImageBase(thunkedName);
         if (base !== undefined) return base;
         return null; // Fall through to slow path for real DLLs, exe name, etc.
     };
