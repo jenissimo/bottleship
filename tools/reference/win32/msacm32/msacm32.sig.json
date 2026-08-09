@@ -1,0 +1,258 @@
+{
+  "source": "msacm.h — documented Win32 ACM entry points; stdcall arities from their published signatures",
+  "module": "msacm32",
+  "functions": [
+    {
+      "name": "_acmGetVersion@0",
+      "argCount": 0,
+      "signature": "DWORD acmGetVersion()",
+      "returnType": "DWORD"
+    },
+    {
+      "name": "_acmMetrics@12",
+      "argCount": 3,
+      "signature": "MMRESULT acmMetrics(_In_, _In_, _Inout_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmDriverEnum@12",
+      "argCount": 3,
+      "signature": "MMRESULT acmDriverEnum(_In_, _In_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmDriverDetailsA@12",
+      "argCount": 3,
+      "signature": "MMRESULT acmDriverDetailsA(_In_, _Inout_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmDriverDetailsW@12",
+      "argCount": 3,
+      "signature": "MMRESULT acmDriverDetailsW(_In_, _Inout_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmDriverOpen@12",
+      "argCount": 3,
+      "signature": "MMRESULT acmDriverOpen(_Out_, _In_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmDriverClose@8",
+      "argCount": 2,
+      "signature": "MMRESULT acmDriverClose(_In_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmDriverPriority@12",
+      "argCount": 3,
+      "signature": "MMRESULT acmDriverPriority(_In_, _In_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmDriverMessage@16",
+      "argCount": 4,
+      "signature": "LRESULT acmDriverMessage(_In_, _In_, _In_, _In_)",
+      "returnType": "LRESULT"
+    },
+    {
+      "name": "_acmDriverID@12",
+      "argCount": 3,
+      "signature": "MMRESULT acmDriverID(_In_, _Out_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmDriverAddA@20",
+      "argCount": 5,
+      "signature": "MMRESULT acmDriverAddA(_Out_, _In_, _In_, _In_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmDriverAddW@20",
+      "argCount": 5,
+      "signature": "MMRESULT acmDriverAddW(_Out_, _In_, _In_, _In_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmDriverRemove@8",
+      "argCount": 2,
+      "signature": "MMRESULT acmDriverRemove(_In_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmFormatChooseA@4",
+      "argCount": 1,
+      "signature": "MMRESULT acmFormatChooseA(_Inout_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmFormatChooseW@4",
+      "argCount": 1,
+      "signature": "MMRESULT acmFormatChooseW(_Inout_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmFormatDetailsA@16",
+      "argCount": 4,
+      "signature": "MMRESULT acmFormatDetailsA(_In_, _Inout_, _In_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmFormatDetailsW@16",
+      "argCount": 4,
+      "signature": "MMRESULT acmFormatDetailsW(_In_, _Inout_, _In_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmFormatEnumA@20",
+      "argCount": 5,
+      "signature": "MMRESULT acmFormatEnumA(_In_, _Inout_, _In_, _In_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmFormatEnumW@20",
+      "argCount": 5,
+      "signature": "MMRESULT acmFormatEnumW(_In_, _Inout_, _In_, _In_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmFormatSuggest@20",
+      "argCount": 5,
+      "signature": "MMRESULT acmFormatSuggest(_In_, _In_, _Inout_, _In_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmFormatTagDetailsA@12",
+      "argCount": 3,
+      "signature": "MMRESULT acmFormatTagDetailsA(_In_, _Inout_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmFormatTagDetailsW@12",
+      "argCount": 3,
+      "signature": "MMRESULT acmFormatTagDetailsW(_In_, _Inout_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmFormatTagEnumA@16",
+      "argCount": 4,
+      "signature": "MMRESULT acmFormatTagEnumA(_In_, _Inout_, _In_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmFormatTagEnumW@16",
+      "argCount": 4,
+      "signature": "MMRESULT acmFormatTagEnumW(_In_, _Inout_, _In_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmFilterChooseA@4",
+      "argCount": 1,
+      "signature": "MMRESULT acmFilterChooseA(_Inout_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmFilterChooseW@4",
+      "argCount": 1,
+      "signature": "MMRESULT acmFilterChooseW(_Inout_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmFilterDetailsA@16",
+      "argCount": 4,
+      "signature": "MMRESULT acmFilterDetailsA(_In_, _Inout_, _In_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmFilterDetailsW@16",
+      "argCount": 4,
+      "signature": "MMRESULT acmFilterDetailsW(_In_, _Inout_, _In_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmFilterEnumA@20",
+      "argCount": 5,
+      "signature": "MMRESULT acmFilterEnumA(_In_, _Inout_, _In_, _In_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmFilterEnumW@20",
+      "argCount": 5,
+      "signature": "MMRESULT acmFilterEnumW(_In_, _Inout_, _In_, _In_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmFilterTagDetailsA@12",
+      "argCount": 3,
+      "signature": "MMRESULT acmFilterTagDetailsA(_In_, _Inout_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmFilterTagDetailsW@12",
+      "argCount": 3,
+      "signature": "MMRESULT acmFilterTagDetailsW(_In_, _Inout_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmFilterTagEnumA@16",
+      "argCount": 4,
+      "signature": "MMRESULT acmFilterTagEnumA(_In_, _Inout_, _In_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmFilterTagEnumW@16",
+      "argCount": 4,
+      "signature": "MMRESULT acmFilterTagEnumW(_In_, _Inout_, _In_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmStreamOpen@32",
+      "argCount": 8,
+      "signature": "MMRESULT acmStreamOpen(_Out_, _In_, _In_, _In_, _In_, _In_, _In_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmStreamClose@8",
+      "argCount": 2,
+      "signature": "MMRESULT acmStreamClose(_In_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmStreamSize@16",
+      "argCount": 4,
+      "signature": "MMRESULT acmStreamSize(_In_, _In_, _Out_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmStreamReset@8",
+      "argCount": 2,
+      "signature": "MMRESULT acmStreamReset(_In_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmStreamMessage@16",
+      "argCount": 4,
+      "signature": "MMRESULT acmStreamMessage(_In_, _In_, _In_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmStreamConvert@12",
+      "argCount": 3,
+      "signature": "MMRESULT acmStreamConvert(_In_, _Inout_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmStreamPrepareHeader@12",
+      "argCount": 3,
+      "signature": "MMRESULT acmStreamPrepareHeader(_In_, _Inout_, _In_)",
+      "returnType": "MMRESULT"
+    },
+    {
+      "name": "_acmStreamUnprepareHeader@12",
+      "argCount": 3,
+      "signature": "MMRESULT acmStreamUnprepareHeader(_In_, _Inout_, _In_)",
+      "returnType": "MMRESULT"
+    }
+  ]
+}
