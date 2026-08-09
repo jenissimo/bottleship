@@ -5,7 +5,7 @@
  * DialogBoxParam uses callback chaining (same pattern as CreateWindowEx) to invoke dlgProc.
  */
 
-import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
+import { ThunkImplementation, ThunkResult } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { Marshaler } from '../../core/memory/marshaler';
 import { Mem } from '../../core/memory/mem-accessor';
@@ -19,12 +19,13 @@ import { parseDlgTemplate, dluToPixelX, dluToPixelY, getDialogBaseUnits, logDlgT
 import { findResourceInPE } from '../../modules/kernel32/resource';
 import { loadBitmapFromPeResource, parseResourceNameFromTitle } from '../kernel32/bitmap-extractor';
 import { loadIconFromPeResource } from '../kernel32/icon-extractor';
-import { isGroupBoxSystemControl, hitTestSystemControlAtClient } from './controls';
+import { isGroupBoxSystemControl, hitTestSystemControlAtClient, applyComboBoxClosedHeight } from './controls';
 import { handleSystemControlMouseAtScreen, resetControlInteractionState, takePendingControlNotification } from './control-interaction';
 import { noteDialogOverlayCandidate, resolveMouseTargetHwnd, eraseDialogOverlay, registerOverlayPaintRepair } from './dialog-overlay';
 import { paintDialogToOverlay, finalizeDialogPaint, repaintDialogOverlayIfVisible, repaintDialogAfterContentChange } from './dialog-paint';
 import { handleSystemControlMessage, applyStaticSetImageAutoSize, isContentChangingMessage } from './dialog-control-messages';
 import { getDefWindowProcAddress } from './system-classes';
+import { runDefaultWindowPaint } from './window';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { emitDialogShow } from '../../core/debug/dbg-commands';
 import {
@@ -40,6 +41,7 @@ import {
     reactivateOwnerIfNeeded,
     isCreateInProgress,
 } from './activation-messages';
+import { getSystemColorRef, COLOR_BTNFACE_INDEX } from './system';
 
 // Track active dialogs for EndDialog result capture
 const activeDialogs = new Map<number, {
@@ -204,8 +206,8 @@ function hasGuestDestroyProc(wi: WindowInfo): boolean {
         && (!wi.isSystemControl || !!wi.wndProcSubclassed);
 }
 
-/** Win32 COLOR_BTNFACE as COLORREF (0x00BBGGRR). */
-const COLOR_DLGFACE = 0x00C8D0D4;
+/** Dialog face as COLORREF (0x00BBGGRR), from the live system palette. */
+const dlgFaceColorRef = (): number => getSystemColorRef(COLOR_BTNFACE_INDEX);
 
 // Auto check/radio state transitions live in control-interaction.ts (shared with
 // DispatchMessage's hit-test path); re-exported here for existing importers.
@@ -455,13 +457,7 @@ export function createDialogChildren(
         const childX = dluToPixelX(ctrl.x, base);
         const childY = dluToPixelY(ctrl.y, base);
         const childW = dluToPixelX(ctrl.cx, base);
-        let childH = dluToPixelY(ctrl.cy, base);
-        // Win32: a combobox template's cy includes the open drop-down list; the
-        // closed control is sized by the system. Clamp to the classic closed height
-        // so the sunken box doesn't cover the controls below it.
-        if (ctrl.className.toLowerCase() === 'combobox') {
-            childH = Math.min(childH, 21);
-        }
+        const childH = dluToPixelY(ctrl.cy, base);
 
         const childHwnd = system.windowManager.createWindow(
             ctrl.className,
@@ -494,6 +490,9 @@ export function createDialogChildren(
         };
 
         windows.set(childHwnd, childInfo);
+        // A combobox template's cy covers the dropped list; USER sizes the window to
+        // the closed box (see applyComboBoxClosedHeight) — same rule as CreateWindow.
+        applyComboBoxClosedHeight(childInfo);
         dialogInfo.children.push(childHwnd);
         if (ctrl.className.toLowerCase() === 'button'
             && (childStyle & BS_TYPEMASK) === BS_DEFPUSHBUTTON) {
@@ -1837,15 +1836,14 @@ export function createDialogExports(): Record<string, ThunkImplementation> {
         return getNextDialogGroupItem(hDlg, hCtl, bPrevious);
     };
 
-    const defDlgProc = (ctx: any, mem: Uint8Array, args: number[]): number => {
+    const defDlgProc = (ctx: any, mem: Uint8Array, args: number[]): number | ThunkResult => {
         const hDlg = args[0];
         const Msg = args[1];
         const wParam = args[2];
         const lParam = args[3];
 
         if (Msg === WM_PAINT) {
-            Logger.log(LogCategory.USER32,
-                `DefDlgProc(0x${hDlg.toString(16)}, WM_PAINT) — guest should have painted in dlgProc`);
+            Logger.log(LogCategory.USER32, `DefDlgProc(0x${hDlg.toString(16)}, WM_PAINT)`);
         } else {
             Logger.verbose(LogCategory.USER32,
                 `DefDlgProc(0x${hDlg.toString(16)}, 0x${Msg.toString(16)}, 0x${wParam.toString(16)}, 0x${lParam.toString(16)})`);
@@ -1857,8 +1855,14 @@ export function createDialogExports(): Record<string, ThunkImplementation> {
         const DM_GETDEFID = 0x0400;
         const DM_SETDEFID = 0x0401;
         if (Msg === WM_PAINT) {
+            // Real DefDlgProc bottoms out in DefWindowProc: BeginPaint (which sends
+            // WM_ERASEBKGND back to the dialog's own proc) then EndPaint. Only when the
+            // guest has no proc left to answer that do we fall back to drawing the
+            // dialog's chrome ourselves.
+            const paint = runDefaultWindowPaint(ctx, mem, hDlg, 'DefDlgProc', 16);
+            if (paint) return paint;
             const win = windows.get(hDlg);
-            if (win) paintDialogToOverlay(hDlg, win.guestCustomPaint ? 'controls' : 'full');
+            if (win && !win.guestCustomPaint) paintDialogToOverlay(hDlg, 'full');
             return 0;
         }
         if (Msg === WM_NEXTDLGCTL) {
@@ -1919,12 +1923,11 @@ export function createDialogExports(): Record<string, ThunkImplementation> {
             return id ? ((0x534b << 16) | (id & 0xFFFF)) >>> 0 : 0;
         }
         if (Msg === WM_ERASEBKGND && wParam) {
-            // Fill dialog background with standard button-face color (#D4D0C8)
-            // Windows COLORREF is 0x00BBGGRR, so #D4D0C8 = RGB(212,208,200) → 0x00C8D0D4
+            // Fill the dialog background with the system button face.
             const win = windows.get(hDlg);
             if (win) {
                 const gdi = System.getInstance().gdiContext;
-                const hBrush = gdi.createSolidBrush(0x00C8D0D4);
+                const hBrush = gdi.createSolidBrush(dlgFaceColorRef());
                 const prevBrush = gdi.selectObject(wParam, hBrush);
                 gdi.fillRect(wParam, 0, 0, win.width, win.height);
                 gdi.selectObject(wParam, prevBrush);

@@ -33,6 +33,7 @@ import {
     getCursorClipRect,
     getVirtualScreenRect,
 } from './shared-state';
+import * as Classic from './classic-theme';
 import { getSystemCursorHandle } from './system-cursors';
 import { registerDeviceNotification, unregisterDeviceNotification } from './device-notify';
 import { invokeWindowMessageSync } from './message';
@@ -42,18 +43,67 @@ import { invokeWindowMessageSync } from './message';
 const wsprintfScratch = new Uint8Array(1024 * 2);
 const wsprintfScratchView = new DataView(wsprintfScratch.buffer);
 
-// System color table (COLORREF: 0x00BBGGRR) — mutable via SetSysColors
+/** '#RRGGBB' → COLORREF 0x00BBGGRR, so one palette can serve both painters and the API. */
+function cssToColorRef(css: string): number {
+    const v = parseInt(css.slice(1), 16);
+    return (((v & 0xFF) << 16) | (v & 0xFF00) | ((v >> 16) & 0xFF)) >>> 0;
+}
+
+// System color table (COLORREF: 0x00BBGGRR) — mutable via SetSysColors. The entries the
+// JS control painters also use come FROM classic-theme, so GetSysColor(COLOR_BTNFACE) and
+// a painted button face cannot drift apart: a window erased with the class brush would
+// otherwise sit a shade off every control on it.
 const sysColors = new Map<number, number>([
-    [0,  0xC0C0C0],  // COLOR_SCROLLBAR
-    [1,  0xC0DCC0],  // COLOR_BACKGROUND / COLOR_DESKTOP
-    [5,  0xFFFFFF],  // COLOR_WINDOW
-    [8,  0x000000],  // COLOR_WINDOWTEXT
-    [15, 0xC0C0C0],  // COLOR_BTNFACE
-    [16, 0x808080],  // COLOR_BTNSHADOW
-    [17, 0xFFFFFF],  // COLOR_GRAYTEXT (disabled text)
-    [18, 0x000080],  // COLOR_HIGHLIGHT
-    [19, 0xFFFFFF],  // COLOR_HIGHLIGHTTEXT
+    [0,  cssToColorRef(Classic.COLOR_BTNFACE)],      // COLOR_SCROLLBAR
+    [1,  0xC0DCC0],                                  // COLOR_BACKGROUND / COLOR_DESKTOP
+    [2,  cssToColorRef(Classic.COLOR_ACTIVECAPTION)],// COLOR_ACTIVECAPTION
+    [3,  cssToColorRef(Classic.COLOR_INACTIVECAPTION)], // COLOR_INACTIVECAPTION
+    [4,  cssToColorRef(Classic.COLOR_BTNFACE)],      // COLOR_MENU
+    [5,  cssToColorRef(Classic.COLOR_WINDOW)],       // COLOR_WINDOW
+    [6,  0x000000],                                  // COLOR_WINDOWFRAME
+    [7,  cssToColorRef(Classic.COLOR_WINDOWTEXT)],   // COLOR_MENUTEXT
+    [8,  cssToColorRef(Classic.COLOR_WINDOWTEXT)],   // COLOR_WINDOWTEXT
+    [9,  cssToColorRef(Classic.COLOR_BTNHILIGHT)],   // COLOR_CAPTIONTEXT
+    [10, cssToColorRef(Classic.COLOR_BTNFACE)],      // COLOR_ACTIVEBORDER
+    [11, cssToColorRef(Classic.COLOR_BTNFACE)],      // COLOR_INACTIVEBORDER
+    [12, 0x808080],                                  // COLOR_APPWORKSPACE
+    [13, cssToColorRef(Classic.COLOR_HIGHLIGHT)],    // COLOR_HIGHLIGHT
+    [14, cssToColorRef(Classic.COLOR_HIGHLIGHTTEXT)],// COLOR_HIGHLIGHTTEXT
+    [15, cssToColorRef(Classic.COLOR_BTNFACE)],      // COLOR_BTNFACE / COLOR_3DFACE
+    [16, cssToColorRef(Classic.COLOR_BTNSHADOW)],    // COLOR_BTNSHADOW
+    [17, cssToColorRef(Classic.COLOR_GRAYTEXT)],     // COLOR_GRAYTEXT (disabled text)
+    [18, cssToColorRef(Classic.COLOR_BTNTEXT)],      // COLOR_BTNTEXT
+    [19, cssToColorRef(Classic.COLOR_BTNFACE)],      // COLOR_INACTIVECAPTIONTEXT
+    [20, cssToColorRef(Classic.COLOR_BTNHILIGHT)],   // COLOR_BTNHIGHLIGHT / COLOR_3DHILIGHT
+    [21, cssToColorRef(Classic.COLOR_BTNDKSHADOW)],  // COLOR_3DDKSHADOW
+    [22, cssToColorRef(Classic.COLOR_BTNINNERHI)],   // COLOR_3DLIGHT
+    [23, cssToColorRef(Classic.COLOR_WINDOWTEXT)],   // COLOR_INFOTEXT
+    [24, 0xE1FFFF],                                  // COLOR_INFOBK
 ]);
+
+/** COLOR_BTNFACE / COLOR_3DFACE — the index every "standard grey" caller must ask for
+ *  rather than inlining a COLORREF, so the dialog face cannot drift from the controls. */
+export const COLOR_BTNFACE_INDEX = 15;
+
+/** Live system color for COLOR_*; unknown indices answer white as GetSysColor does. */
+export function getSystemColorRef(nIndex: number): number {
+    return sysColors.get(nIndex) ?? 0x00FFFFFF;
+}
+
+// GetSysColorBrush hands out a REAL brush the object table can resolve: an opaque cookie
+// reaches every painter (WM_CTLCOLOR*, class hbrBackground, FillRect) as "unresolvable"
+// and silently degrades to no fill. Cached per index, as Win32's are process-wide and
+// must not be deleted; re-created when a reset drops the object.
+const sysColorBrushes = new Map<number, number>();
+
+export function getSystemColorBrush(nIndex: number): number {
+    const gdi = System.getInstance().gdiContext;
+    const cached = sysColorBrushes.get(nIndex);
+    if (cached && gdi.getBrushCss(cached) !== null) return cached;
+    const brush = gdi.createSolidBrush(getSystemColorRef(nIndex));
+    if (brush) sysColorBrushes.set(nIndex, brush);
+    return brush;
+}
 
 export function createSystemExports(): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
@@ -1279,17 +1329,15 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
                     resourceData.palette = header.palette;
                     Logger.verbose(LogCategory.USER32, `${apiName} BMP: Saved ${header.palette.length}-color palette for 8-bit BMP`);
                 }
-                // Preserve the raw palettized DIB rows so GetObject can expose a real
-                // DIBSECTION (biBitCount==8, bmBits→8-bit data). Sprite loaders that pass
-                // LR_CREATEDIBSECTION and require an 8-bit source (e.g. WA's frontend
-                // FUN_00426290: GetObjectA(h,0x54) then reads dsBmih.biBitCount==8) need this;
-                // the 32bpp `pixels` above is for GPU upload, not for guest bmBits reads.
-                if (header.bitsPerPixel <= 8) {
-                    resourceData.bitCount = header.bitsPerPixel;
-                    resourceData.dibStride = header.rowSize;
-                    resourceData.dibTopDown = header.isTopDown;
-                    resourceData.dibBits = data.slice(header.offset, header.offset + header.rowSize * header.height);
-                }
+                // Preserve the raw DIB rows so GetObject can expose a real DIBSECTION
+                // (the file's own biBitCount, bmBits→its own rows). Sprite loaders that
+                // pass LR_CREATEDIBSECTION read that, not the 32bpp `pixels` above, which
+                // is the GPU-upload form. Depth-independent: a 24bpp caller reads
+                // biBitCount/biClrUsed to decide how to build its palette.
+                resourceData.bitCount = header.bitsPerPixel;
+                resourceData.dibStride = header.rowSize;
+                resourceData.dibTopDown = header.isTopDown;
+                resourceData.dibBits = data.slice(header.offset, header.offset + header.rowSize * header.height);
                 resourceData.loading = false;
                 Logger.verbose(LogCategory.USER32, `${apiName} BMP: Successfully loaded "${normalizedFilename}" ${header.width}x${header.height} -> handle=0x${handle.toString(16)}`);
 
@@ -1766,15 +1814,16 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
 
     exports['GetSysColor'] = (ctx, mem, args) => {
         const nIndex = args[0];
-        const color = sysColors.get(nIndex) ?? 0xFFFFFF; // default white
+        const color = getSystemColorRef(nIndex);
         Logger.verbose(LogCategory.USER32, `GetSysColor(${nIndex}) -> 0x${color.toString(16)}`);
         return color;
     };
 
     exports['GetSysColorBrush'] = (ctx, mem, args) => {
         const nIndex = args[0];
-        Logger.verbose(LogCategory.USER32, `GetSysColorBrush(${nIndex})`);
-        return 0x1000 + nIndex; // Return a dummy brush handle
+        const brush = getSystemColorBrush(nIndex);
+        Logger.verbose(LogCategory.USER32, `GetSysColorBrush(${nIndex}) -> 0x${brush.toString(16)}`);
+        return brush;
     };
 
     // BOOL SetSysColors(int cElements, const INT *lpaElements, const COLORREF *lpaRgbValues)
@@ -1798,6 +1847,8 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
             const index = view.getInt32(lpaElements  + i * 4, true);
             const color = view.getUint32(lpaRgbValues + i * 4, true) & 0x00FFFFFF;
             sysColors.set(index, color);
+            // Next GetSysColorBrush re-creates it at the new color.
+            sysColorBrushes.delete(index);
             Logger.verbose(LogCategory.USER32,
                 `SetSysColors: index=${index} color=0x${color.toString(16).padStart(6, '0')}`);
         }

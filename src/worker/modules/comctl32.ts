@@ -746,10 +746,14 @@ export class Comctl32 implements IModule {
                         const dlgWidth  = dluToPixelX(parsed.cx, base);
                         const dlgHeight = dluToPixelY(parsed.cy, base);
 
-                        // Create a real dialog window
+                        // A page is created HIDDEN — Win32 shows only the active one, and
+                        // not before PSN_SETACTIVE. Forcing WS_VISIBLE put every page of
+                        // every tab on the flat overlay at once and left the pump
+                        // delivering WM_PAINT to all of them and their controls.
+                        const pageStyle = (parsed.style & ~0x10000000) >>> 0;
                         dialogHwnd = system.windowManager.createWindow(
                             '#32770', parsed.title || '',
-                            parsed.style | 0x10000000 /* WS_VISIBLE */, parsed.exStyle,
+                            pageStyle, parsed.exStyle,
                             dluToPixelX(parsed.x, base), dluToPixelY(parsed.y, base),
                             dlgWidth, dlgHeight,
                             0, 0, hInstance || 0x400000, 0
@@ -758,14 +762,14 @@ export class Comctl32 implements IModule {
                         const dialogInfo: WindowInfo = {
                             handle: dialogHwnd,
                             title: parsed.title || '',
-                            style: parsed.style | 0x10000000,
+                            style: pageStyle,
                             exStyle: parsed.exStyle,
                             x: dluToPixelX(parsed.x, base),
                             y: dluToPixelY(parsed.y, base),
                             width: dlgWidth,
                             height: dlgHeight,
                             children: [],
-                            visible: true,
+                            visible: false,
                             wndProc: pfnDlgProc,
                             userData: 0,
                             cbWndExtra: 40,
@@ -833,15 +837,18 @@ export class Comctl32 implements IModule {
                 Logger.log(LogCategory.SYSTEM,
                     `PropertySheetA: restored registry snapshot after callbacks`);
 
-                // Clean up dialog windows
+                // Clean up dialog windows. Dropping them from the user32 map alone leaves
+                // the WindowManager holding live windows: it keeps routing WM_PAINT to
+                // every page and control the sheet ever built, long after the sheet is
+                // gone, and each one costs the guest a pump turn.
                 for (const page of pages) {
                     const info = windows.get(page.dialogHwnd);
-                    if (info) {
-                        for (const childHwnd of info.children) {
-                            windows.delete(childHwnd);
-                        }
-                        windows.delete(page.dialogHwnd);
+                    for (const childHwnd of info?.children ?? []) {
+                        windows.delete(childHwnd);
+                        system.windowManager.destroyWindow(childHwnd);
                     }
+                    windows.delete(page.dialogHwnd);
+                    system.windowManager.destroyWindow(page.dialogHwnd);
                 }
 
                 // Free temporary pointer-block (handle-array path only)

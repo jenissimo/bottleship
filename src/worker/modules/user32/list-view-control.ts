@@ -8,6 +8,8 @@ import { Marshaler } from '../../core/memory/marshaler';
 import { System } from '../../core/system';
 import { encodeAnsi } from '../codepage-utils';
 import { WindowInfo, registerControlStatePurger } from './shared-state';
+import { SB_WIDTH } from './scrollbar-paint';
+import { controlClientInset } from './controls';
 
 // ---- Messages (LVM_FIRST = 0x1000) ----
 const LVM_FIRST = 0x1000;
@@ -139,6 +141,7 @@ const LVN_ITEMCHANGED = (LVN_FIRST - 1) >>> 0;
 const LVN_INSERTITEM = (LVN_FIRST - 2) >>> 0;
 const LVN_DELETEITEM = (LVN_FIRST - 3) >>> 0;
 const LVN_DELETEALLITEMS = (LVN_FIRST - 4) >>> 0;
+const LVN_COLUMNCLICK = (LVN_FIRST - 8) >>> 0;
 const LVN_KEYDOWN = (LVN_FIRST - 55) >>> 0;
 
 const VK_UP = 0x26;
@@ -152,14 +155,18 @@ const VK_RETURN = 0x0D;
 const MK_CONTROL = 0x0008;
 const MK_SHIFT = 0x0004;
 
-/** Report-view row height / header — classic comctl metrics. */
-export const LV_ROW_H = 16;
+/**
+ * Report-view row height / header — classic comctl metrics. A report row is one
+ * text cell plus a pixel (tmHeight 13 + 1 for the classic UI font), measured off a
+ * native capture: rows land on a 14 px pitch, so a 120 px list shows 7 of them.
+ */
+export const LV_ROW_H = 14;
 export const LV_HEADER_H = 18;
 export const LV_ICON_SIZE = 32;
 export const LV_SMALL_ICON_SIZE = 16;
 export const LV_ICON_PAD = 4;
 export const LV_TEXT_INSET = 4;
-export const LV_SCROLLBAR_W = 14;
+export const LV_SCROLLBAR_W = SB_WIDTH;
 
 export interface ListViewSubItem {
     text: string;
@@ -719,6 +726,29 @@ export interface ListViewHitResult {
 }
 
 /** Client-space hit test (x/y relative to the control). */
+/**
+ * Column under a client x in the HEADER. hitTestListView answers LVHT_NOWHERE there
+ * (the header is not the item area), but a header click is still a click on a
+ * column — this is the same left-to-right walk over cx, minus the row lookup.
+ */
+export function listViewColumnAtClientX(child: WindowInfo, clientX: number): number {
+    const state = getOrCreateListViewState(child.handle);
+    // The same origin the header painter starts at, so the hit test cannot sit a
+    // pixel off a column drawn behind a client edge or border.
+    let x = controlClientInset(child) - state.scrollX;
+    for (let c = 0; c < state.columns.length; c++) {
+        const cx = Math.max(0, state.columns[c].cx);
+        if (clientX >= x && clientX < x + cx) return c;
+        x += cx;
+    }
+    return -1;
+}
+
+/** LVN_COLUMNCLICK — what comctl32 sends when the user clicks a report header. */
+export function postListViewColumnClick(child: WindowInfo, iSubItem: number): void {
+    postNmListView(child, LVN_COLUMNCLICK, -1, iSubItem, 0, 0, 0, 0);
+}
+
 export function hitTestListView(
     child: WindowInfo,
     clientX: number,
@@ -1363,6 +1393,7 @@ export {
     LVN_ITEMCHANGED,
     LVN_ITEMCHANGING,
     LVN_KEYDOWN,
+    LVN_COLUMNCLICK,
     WM_NOTIFY,
     MK_CONTROL,
     MK_SHIFT,

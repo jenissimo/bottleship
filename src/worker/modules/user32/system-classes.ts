@@ -57,44 +57,63 @@ export function getBuiltinSystemClass(className: string): BuiltinSystemClass | u
  * When the thunk fires, the DefWindowProcA handler runs in JS.
  */
 let cachedDefWindowProcAddr = 0;
+let cachedDefDlgProcAddr = 0;
 
 /** The thunk layout is rebuilt on bundle switch — the cached stub address dies with it. */
 export function resetDefWindowProcCache(): void {
     cachedDefWindowProcAddr = 0;
+    cachedDefDlgProcAddr = 0;
 }
 
-export function getDefWindowProcAddress(): number {
-    if (cachedDefWindowProcAddr) return cachedDefWindowProcAddr;
+/** Resolve (or allocate) the x86 thunk stub for a user32 export used as a wndProc. */
+function resolveWndProcStub(exportName: string): number {
     const system = System.getInstance();
     const dispatcher = system.process?.dispatcher as any;
     const tg = dispatcher?.thunkGenerator;
-    if (tg) {
-        // Prefer the stub generated during PE import processing.
-        let addr = tg.getExportAddress('user32:defwindowproca') ?? tg.getExportAddress('defwindowproca');
-        if (!addr) {
-            // App didn't import DefWindowProcA — allocate a stub on demand
-            // (stdcall, 4 args: hWnd, Msg, wParam, lParam).
-            try {
-                const { address, code } = tg.allocateOneStub('user32', 'DefWindowProcA', 4, 'stdcall');
-                const memArray = system.process?.getCurrentMemory();
-                if (memArray && address + code.length <= memArray.length) {
-                    writeGuestCode(memArray, code, address);
-                    dispatcher.applyPendingRegistrations?.();
-                    addr = address;
-                    Logger.log(LogCategory.USER32,
-                        `Allocated DefWindowProcA stub on demand at 0x${address.toString(16)}`);
-                }
-            } catch (e) {
-                Logger.warn(LogCategory.USER32, `Failed to allocate DefWindowProcA stub: ${e}`);
+    if (!tg) {
+        Logger.warn(LogCategory.USER32, `Could not resolve ${exportName} thunk address`);
+        return 0;
+    }
+    const key = exportName.toLowerCase();
+    // Prefer the stub generated during PE import processing.
+    let addr = tg.getExportAddress(`user32:${key}`) ?? tg.getExportAddress(key);
+    if (!addr) {
+        // App didn't import it — allocate a stub on demand
+        // (stdcall, 4 args: hWnd, Msg, wParam, lParam).
+        try {
+            const { address, code } = tg.allocateOneStub('user32', exportName, 4, 'stdcall');
+            const memArray = system.process?.getCurrentMemory();
+            if (memArray && address + code.length <= memArray.length) {
+                writeGuestCode(memArray, code, address);
+                dispatcher.applyPendingRegistrations?.();
+                addr = address;
+                Logger.log(LogCategory.USER32,
+                    `Allocated ${exportName} stub on demand at 0x${address.toString(16)}`);
             }
-        }
-        if (addr) {
-            cachedDefWindowProcAddr = addr;
-            Logger.log(LogCategory.USER32,
-                `Resolved DefWindowProcA thunk address: 0x${addr.toString(16)}`);
-            return addr;
+        } catch (e) {
+            Logger.warn(LogCategory.USER32, `Failed to allocate ${exportName} stub: ${e}`);
         }
     }
-    Logger.warn(LogCategory.USER32, 'Could not resolve DefWindowProcA thunk address');
-    return 0;
+    if (!addr) {
+        Logger.warn(LogCategory.USER32, `Could not resolve ${exportName} thunk address`);
+        return 0;
+    }
+    Logger.log(LogCategory.USER32, `Resolved ${exportName} thunk address: 0x${addr.toString(16)}`);
+    return addr;
+}
+
+export function getDefWindowProcAddress(): number {
+    if (!cachedDefWindowProcAddr) cachedDefWindowProcAddr = resolveWndProcStub('DefWindowProcA');
+    return cachedDefWindowProcAddr;
+}
+
+/**
+ * The window procedure a `#32770` reports through GWL_WNDPROC. Win32 gives a dialog
+ * USER's DefDlgProc and keeps the app's DlgProc in DWLP_DLGPROC; a subclasser stores
+ * whatever GWL_WNDPROC returned and calls it for every message it does not handle, so
+ * this address has to land in real default processing.
+ */
+export function getDefDlgProcAddress(): number {
+    if (!cachedDefDlgProcAddr) cachedDefDlgProcAddr = resolveWndProcStub('DefDlgProcA');
+    return cachedDefDlgProcAddr;
 }

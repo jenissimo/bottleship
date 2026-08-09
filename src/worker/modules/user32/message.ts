@@ -14,12 +14,18 @@ import { hypercallDataManager } from '../../core/cpu/hypercall-data';
 import { installHook, uninstallHook, getHooksOfType, getNextHookInChain, hasHooksOfType, pushActiveHook, popActiveHook, currentActiveHook, WH_KEYBOARD, WH_GETMESSAGE, WH_CBT, HC_ACTION, HC_NOREMOVE } from './hooks';
 import { isSentinelWndProc } from './dialog';
 import { handleSystemControlMessage, isContentChangingMessage } from './dialog-control-messages';
+import { tryRichEditStreamMessage } from './rich-edit-stream';
 import { eraseControlOverlayRect, repaintDialogAfterContentChange } from './dialog-paint';
 import { handleAnimateMessage } from './animate-control';
 import { windows, buttonCheckStates, registerWindowTimerKiller, finalizeWindowDestroy, getAbsoluteWindowPosition, getWindowByHandle, isEffectivelyVisible } from './shared-state';
 import { validateWindow } from './paint-region';
 import { repaintChildControls, isButtonSystemControl, hitTestSystemControlAtClient } from './controls';
-import { handleSystemControlMouseAtScreen, handleSystemControlWheel, takePendingControlNotification } from './control-interaction';
+import {
+    handleSystemControlMouseAtScreen,
+    handleSystemControlWheel,
+    handleSystemControlKey,
+    takePendingControlNotification,
+} from './control-interaction';
 import { encodeAnsi } from '../codepage-utils';
 import { paintTraceEnabled, logPaintMsgDelivered, logPaintPendingBlocked, logPaintTrace } from './paint-trace';
 import { isValidGuestEip } from '../../core/scheduler/scheduler-context';
@@ -1016,6 +1022,33 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
                 }
             }
 
+            // Keyboard for a JS-managed system control. DispatchMessage delivers the key
+            // to the FOCUS window, and for a control we manage that window's wndProc is
+            // our sentinel — so the class's own keyboard behaviour (listbox arrows,
+            // scrollbar SB_LINE*, Space on a button) has to run here, exactly as the
+            // mouse does above. Subclassed controls are skipped: their guest wndProc
+            // sees the key first and reaches the class proc through DefWindowProc.
+            const WM_KEYDOWN_MSG = 0x0100, WM_KEYUP_MSG = 0x0101;
+            if (message === WM_KEYDOWN_MSG || message === WM_KEYUP_MSG) {
+                const target = getWindowByHandle(hwnd);
+                if (target?.isSystemControl && !target.wndProcSubclassed
+                    && handleSystemControlKey(target, message, wParam & 0xFF)) {
+                    const notification = takePendingControlNotification();
+                    if (notification) {
+                        const parent = windows.get(notification.hwnd);
+                        if (parent?.wndProc && !isSentinelWndProc(parent.wndProc)) {
+                            const sync = invokeGuestWndProcSync(
+                                ctx, mem, parent.wndProc, notification.hwnd,
+                                notification.msg, notification.wParam, notification.lParam,
+                                4, 'DispatchMessageW:control-key-notify', () => 0,
+                            );
+                            if (sync) return sync;
+                        }
+                    }
+                    return { value: 0, stackCleanup: 4 };
+                }
+            }
+
             // WM_MOUSEWHEEL over a listbox / open combo dropdown scrolls it.
             // NOTE: wheel lParam is in SCREEN coordinates already (Win32 contract).
             if (message === WM_MOUSEWHEEL) {
@@ -1323,6 +1356,15 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
             // SendMessageToDescendants) reach the guest. Mirrors the `!wndProcSubclassed`
             // guard the DispatchMessage/postMessage path uses.
             if (targetWindow.isSystemControl && !targetWindow.wndProcSubclassed) {
+                // EM_STREAMIN/OUT call back into the guest, so they need this thunk's
+                // return frame — the generic sink below has no way to suspend. Gated on
+                // allowGuestDispatch for the same reason the WndProc re-entry below is:
+                // the SendMessageTimeout wrapper cannot thread a suspended result back.
+                const stream = allowGuestDispatch
+                    ? tryRichEditStreamMessage(ctx, mem, targetWindow, msg, wParam, lParam, 16, 'SendMessage')
+                    : null;
+                if (stream) return stream;
+
                 const result = handleSystemControlMessage(targetWindow, msg, wParam, lParam, mem);
                 // Repaint content changes done outside the HLE modal pump (games that
                 // pump their own messages and SendMessage TBM_SETPOS / LB_ADDSTRING /

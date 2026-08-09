@@ -21,6 +21,7 @@ import { windows, buttonCheckStates, type WindowInfo } from './shared-state';
 import { paintTraceEnabled, logOwnerDrawChain } from './paint-trace';
 import { isButtonSystemControl, repaintChildControls } from './controls';
 import { isAppRegisteredClass } from './class';
+import { invalidateWindow } from './paint-region';
 import {
     enumerateCtlColorChildren,
     ctlColorMessageFor,
@@ -105,18 +106,21 @@ export function enumerateOwnerDrawChildren(parentHwnd: number): WindowInfo[] {
  * Buttons are excluded — owner-draw buttons take the WM_DRAWITEM path above, and
  * non-owner-draw buttons paint as default chrome.
  */
+export function isGuestPaintedControl(child: WindowInfo | undefined): boolean {
+    if (!child || !child.visible || !child.wndProc) return false;
+    if (isButtonSystemControl(child)) return false;
+    if (child.externalPaintManaged) return false;
+    const custom = !child.isSystemControl && isAppRegisteredClass(child.nativeClassName);
+    return !!child.wndProcSubclassed || custom;
+}
+
 export function enumerateGuestPaintedControls(parentHwnd: number): WindowInfo[] {
     const parent = windows.get(parentHwnd);
     if (!parent) return [];
     const out: WindowInfo[] = [];
     for (const childHwnd of parent.children) {
         const child = windows.get(childHwnd);
-        if (!child || !child.visible || !child.wndProc) continue;
-        if (isButtonSystemControl(child)) continue;
-        if (child.externalPaintManaged) continue;
-        const custom = !child.isSystemControl && isAppRegisteredClass(child.nativeClassName);
-        if (!child.wndProcSubclassed && !custom) continue;
-        out.push(child);
+        if (isGuestPaintedControl(child)) out.push(child!);
     }
     return out;
 }
@@ -181,6 +185,13 @@ interface DrawItemTarget {
     wndProc: number;
 }
 
+/** Resume point for a thunk that was itself invoked from a callback stub (CallWindowProc
+ *  reaching DefDlgProc): it returns through its own RET N, not an outer suspended frame. */
+export interface DirectThunkReturn {
+    returnAddr: number;
+    postEsp: number;
+}
+
 /**
  * Shared runner: serialize a list of guest-paint tasks one at a time, suspending the
  * calling thunk until the whole chain finishes (the thunk then returns TRUE/1).
@@ -199,6 +210,8 @@ function runGuestPaintChain(
     deps: OwnerDrawDeps,
     thunkName: string,
     stackCleanup: number,
+    existingFrameId?: number,
+    directReturn?: DirectThunkReturn,
 ): ThunkResult | null {
     if (tasks.length === 0) return null;
 
@@ -207,14 +220,31 @@ function runGuestPaintChain(
     const callbackManager = process?.dispatcher?.callbackManager;
     if (!callbackManager || !process) return null;
 
-    const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-    const thunkReturnAddr = view.getUint32(ctx.esp, true);
-    const frameId = callbackManager.saveSuspendedThunkContext(
-        { ...ctx, returnAddr: thunkReturnAddr },
-        stackCleanup,
-        thunkName,
-    );
-    if (frameId === 0) return null;
+    // Three ways to get back here after a task's guest callback:
+    //  • directReturn — the calling thunk was itself invoked from a callback stub, so it
+    //    resumes through its own RET N rather than consuming an outer suspended frame;
+    //  • existingFrameId — an earlier step of the same paint (the default WM_PAINT sends
+    //    WM_ERASEBKGND first) already saved a frame, and ctx.esp now belongs to it;
+    //  • otherwise save one from this thunk's own stack.
+    let frameId = existingFrameId ?? 0;
+    if (!frameId && !directReturn) {
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const thunkReturnAddr = view.getUint32(ctx.esp, true);
+        frameId = callbackManager.saveSuspendedThunkContext(
+            { ...ctx, returnAddr: thunkReturnAddr },
+            stackCleanup,
+            thunkName,
+        );
+    }
+    if (frameId === 0 && !directReturn) return null;
+
+    const invokeTask = (target: number, cbArgs: number[], label: string): { callbackId: number } =>
+        directReturn
+            ? callbackManager.invokeCallback(
+                target, cbArgs, 0, undefined, false, label, undefined,
+                { directThunkReturn: { ...directReturn, complete: onTaskComplete } })
+            : callbackManager.invokeCallback(
+                target, cbArgs, 0, onTaskComplete, false, label, frameId);
 
     const scratchPtr = getDrawItemScratchPtr(process);
     let taskIndex = 0;
@@ -252,14 +282,10 @@ function runGuestPaintChain(
                 presetCtlColorDC(child, queryDc, msg);
                 pendingDc = queryDc;
                 pendingCtlColor = child;
-                const inv = callbackManager.invokeCallback(
+                const inv = invokeTask(
                     drawItemTarget.wndProc,
                     [drawItemTarget.hwnd, msg, queryDc, child.handle],
-                    0,
-                    onTaskComplete,
-                    false,
                     `${thunkName}-WM_CTLCOLOR`,
-                    frameId,
                 );
                 if (inv.callbackId !== 0) return inv.callbackId;
                 deps.discardChildDC(pendingDc);
@@ -274,15 +300,17 @@ function runGuestPaintChain(
                 // EndPaint composites the result back — no DC plumbing needed here.
                 // This direct delivery satisfies any coalesced WM_PAINT already waiting
                 // for the control; leaving it queued paints transparent glyphs twice.
+                // The parent just repainted the ground under this control, so its whole
+                // client is invalid AND needs erasing — the same state Win32 leaves after
+                // a parent's erase runs under a non-WS_CLIPCHILDREN child. Without the
+                // invalidate the paint arrives with fErase FALSE and the control draws
+                // over its own previous output (glyphs thicken with every repaint).
+                invalidateWindow(child.handle, null, true);
                 System.getInstance().windowManager.clearPaintMessage(child.handle);
-                const inv = callbackManager.invokeCallback(
+                const inv = invokeTask(
                     child.wndProc,
                     [child.handle, WM_PAINT, 0, 0],
-                    0,
-                    onTaskComplete,
-                    false,
                     `${thunkName}-WM_PAINT`,
-                    frameId,
                 );
                 if (inv.callbackId !== 0) return inv.callbackId;
                 continue;
@@ -298,14 +326,10 @@ function runGuestPaintChain(
             pendingDc = childDc;
             writeDrawItemStruct(mem, scratchPtr, child, childDc);
             const ctlId = (child.controlId ?? 0) & 0xFFFF;
-            const inv = callbackManager.invokeCallback(
+            const inv = invokeTask(
                 drawItemTarget.wndProc,
                 [drawItemTarget.hwnd, WM_DRAWITEM, ctlId, scratchPtr],
-                0,
-                onTaskComplete,
-                false,
                 `${thunkName}-WM_DRAWITEM`,
-                frameId,
             );
             if (inv.callbackId !== 0) return inv.callbackId;
             // Dispatch failed: flush whatever (empty) DC and try the next task.
@@ -387,6 +411,9 @@ export function tryEndPaintOwnerDrawChain(
     hWnd: number,
     window: WindowInfo,
     deps: OwnerDrawDeps,
+    stackCleanup = 8, // EndPaint(hWnd, lpPaint) — 2 stdcall args
+    existingFrameId?: number,
+    directReturn?: DirectThunkReturn,
 ): ThunkResult | null {
     if (!window.wndProc) {
         if (paintTraceEnabled) logOwnerDrawChain(hWnd, { ctlcolor: 0, drawitem: 0, paint: 0 }, 'no-wndProc');
@@ -400,11 +427,10 @@ export function tryEndPaintOwnerDrawChain(
         ...drawItem.map((child): PaintTask => ({ kind: 'drawitem', child })),
         ...guestPainted.map((child): PaintTask => ({ kind: 'paint', child })),
     ];
-    const stackCleanup = 8; // EndPaint(hWnd, lpPaint) — 2 stdcall args
     const result = runGuestPaintChain(
         ctx, mem, tasks,
         { hwnd: hWnd, wndProc: window.wndProc },
-        deps, 'EndPaint', stackCleanup,
+        deps, 'EndPaint', stackCleanup, existingFrameId, directReturn,
     );
     if (paintTraceEnabled) {
         logOwnerDrawChain(

@@ -12,9 +12,64 @@ import type { GDIContext } from '../gdi32/context';
 import type { WindowInfo } from './shared-state';
 import { resolveBitmapRgba, resolveIconRgba, layoutStaticControlImage, blitStaticControlImage } from '../gdi32/bitmap-resolve';
 import { Logger, LogCategory } from '../../core/logger';
-import { fillTextWithMnemonic, measureMnemonicText } from '../win32-text';
-import { getEditVisualState, EDIT_TEXT_INSET } from './edit-control';
+import {
+    fillTextWithMnemonic,
+    fillDisabledTextWithMnemonic,
+    measureMnemonicText,
+    gdiTextMetrics,
+    topTextBaseline,
+    vcenterTextBaseline,
+} from '../win32-text';
+import {
+    getEditVisualState,
+    editLines,
+    editVisibleLineCount,
+    EDIT_TEXT_INSET,
+    editLineHeight,
+    editHorizontalScrollRange,
+} from './edit-control';
+import {
+    getRichEditVisualState,
+    layoutRichEdit,
+    richEditContentRuns,
+    richEditRunFont,
+    setRichEditScrollTop,
+    noteRichEditLayout,
+    RICH_EDIT_INSET,
+} from './rich-edit-control';
 import { getControlColorOverride } from './control-colors';
+import { resolveBrushHandle } from './window-drawing';
+import {
+    COLOR_BTNFACE,
+    COLOR_BTNHILIGHT,
+    COLOR_BTNINNERHI,
+    COLOR_BTNDKSHADOW,
+    COLOR_BTNSHADOW,
+    COLOR_WINDOW,
+    COLOR_WINDOWFRAME,
+    COLOR_WINDOWTEXT,
+    COLOR_BTNTEXT,
+    COLOR_GRAYTEXT,
+    COLOR_HIGHLIGHT,
+    COLOR_HIGHLIGHTTEXT,
+    drawRaisedEdge,
+    drawSunkenEdge,
+    drawEtchedEdge,
+    drawCheckBoxIndicator,
+    drawRadioIndicator,
+    CHECKBOX_SIZE,
+    RADIO_SIZE,
+} from './classic-theme';
+import {
+    SB_WIDTH,
+    listBarRect,
+    bottomBarRect,
+    drawArrowButton,
+    listScrollRange,
+    paintScrollBarRect,
+    scrollFeedbackFor,
+} from './scrollbar-paint';
+import { getScrollBarState, SB_CTL, SB_HORZ, SB_VERT } from './scroll-state';
 import {
     getListViewState,
     clampListViewTopIndex,
@@ -36,6 +91,8 @@ import {
     LVS_LIST,
     LVS_SHOWSELALWAYS,
 } from './list-view-control';
+import { restampOwnedPopups } from './paint-hooks';
+
 
 // Window styles
 const WS_DISABLED = 0x08000000;
@@ -85,18 +142,7 @@ const SS_REALSIZEIMAGE = 0x0800;
 // SBS_* styles
 const SBS_VERT = 0x0001;
 
-// Windows classic theme colors
-const COLOR_BTNFACE = '#D4D0C8';
-const COLOR_BTNHILIGHT = '#FFFFFF';
-const COLOR_BTNINNERHI = '#DFDFDF';
-const COLOR_BTNSHADOW = '#808080';
-const COLOR_BTNDKSHADOW = '#404040';
-const COLOR_WINDOW = '#FFFFFF';
-const COLOR_WINDOWTEXT = '#000000';
-const COLOR_BTNTEXT = '#000000';
-const COLOR_GRAYTEXT = '#808080';
-const COLOR_HIGHLIGHT = '#0A246A';
-const COLOR_HIGHLIGHTTEXT = '#FFFFFF';
+// Windows classic theme colors and 3D edges live in classic-theme.ts (imported above).
 
 // Font used for control labels
 const CONTROL_FONT = "11px 'Liberation Sans', sans-serif";
@@ -222,10 +268,10 @@ export function paintSystemControl(
 
     switch (controlClass) {
         case 'button':
-            paintButton(ctx, child, absX, absY, w, h);
+            paintButton(hdc, ctx, child, absX, absY, w, h);
             break;
         case 'static':
-            paintStatic(ctx, child, absX, absY, w, h);
+            paintStatic(hdc, ctx, child, absX, absY, w, h);
             break;
         case 'sysanimate32':
         case 'sysanimate32_class':
@@ -233,6 +279,9 @@ export function paintSystemControl(
             return false;
         case 'edit':
             paintEdit(ctx, child, absX, absY, w, h);
+            break;
+        case 'richedit':
+            paintRichEdit(ctx, child, absX, absY, w, h);
             break;
         case 'combobox':
             paintComboBox(ctx, child, absX, absY, w, h);
@@ -316,52 +365,6 @@ function isControlDisabled(child: WindowInfo): boolean {
     return (child.style & WS_DISABLED) !== 0;
 }
 
-function drawRaisedEdge(
-    ctx: OffscreenCanvasRenderingContext2D,
-    x: number,
-    y: number,
-    w: number,
-    h: number,
-): void {
-    // Outer highlight
-    ctx.fillStyle = COLOR_BTNHILIGHT;
-    ctx.fillRect(x, y, w, 1);
-    ctx.fillRect(x, y, 1, h);
-    // Inner highlight
-    ctx.fillStyle = COLOR_BTNINNERHI;
-    ctx.fillRect(x + 1, y + 1, Math.max(1, w - 2), 1);
-    ctx.fillRect(x + 1, y + 1, 1, Math.max(1, h - 2));
-    // Inner shadow
-    ctx.fillStyle = COLOR_BTNSHADOW;
-    ctx.fillRect(x + 1, y + h - 2, Math.max(1, w - 2), 1);
-    ctx.fillRect(x + w - 2, y + 1, 1, Math.max(1, h - 2));
-    // Outer dark shadow
-    ctx.fillStyle = COLOR_BTNDKSHADOW;
-    ctx.fillRect(x, y + h - 1, w, 1);
-    ctx.fillRect(x + w - 1, y, 1, h);
-}
-
-function drawSunkenEdge(
-    ctx: OffscreenCanvasRenderingContext2D,
-    x: number,
-    y: number,
-    w: number,
-    h: number,
-): void {
-    // Outer shadow
-    ctx.fillStyle = COLOR_BTNSHADOW;
-    ctx.fillRect(x, y, w, 1);
-    ctx.fillRect(x, y, 1, h);
-    // Inner dark shadow
-    ctx.fillStyle = COLOR_BTNDKSHADOW;
-    ctx.fillRect(x + 1, y + 1, Math.max(1, w - 2), 1);
-    ctx.fillRect(x + 1, y + 1, 1, Math.max(1, h - 2));
-    // Outer highlight
-    ctx.fillStyle = COLOR_BTNHILIGHT;
-    ctx.fillRect(x, y + h - 1, w, 1);
-    ctx.fillRect(x + w - 1, y, 1, h);
-}
-
 function paintPushButton(
     ctx: OffscreenCanvasRenderingContext2D,
     child: WindowInfo,
@@ -397,16 +400,14 @@ function paintPushButton(
     const ty = pushed ? 1 : 0;
     ctx.font = getWindowFont(child);
     ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
+    ctx.textBaseline = 'alphabetic';
+    const labelY = vcenterTextBaseline(ctx, y, h) + ty;
 
     if (disabled) {
-        ctx.fillStyle = COLOR_BTNHILIGHT;
-        fillTextWithMnemonic(ctx, label, x + w / 2 + tx + 1, y + h / 2 + ty + 1);
-        ctx.fillStyle = COLOR_GRAYTEXT;
-        fillTextWithMnemonic(ctx, label, x + w / 2 + tx, y + h / 2 + ty);
+        fillDisabledTextWithMnemonic(ctx, label, x + w / 2 + tx, labelY, COLOR_BTNHILIGHT, COLOR_GRAYTEXT);
     } else {
         ctx.fillStyle = COLOR_BTNTEXT;
-        fillTextWithMnemonic(ctx, label, x + w / 2 + tx, y + h / 2 + ty);
+        fillTextWithMnemonic(ctx, label, x + w / 2 + tx, labelY);
     }
 
     ctx.textAlign = 'left';
@@ -424,48 +425,25 @@ function paintGroupBox(
     const label = child.title || '';
 
     ctx.font = getWindowFont(child);
-    ctx.textBaseline = 'top';
+    const tm = gdiTextMetrics(ctx);
     const textWidth = label ? Math.ceil(measureMnemonicText(ctx, label)) : 0;
-    const textInset = 8;
-    const textPad = label ? 6 : 0;
-    const lineY = y + 7;
-    const textStart = x + textInset;
-    const textEnd = textStart + textWidth + textPad;
+    // Win32 drops the etched frame by half a text cell so the label straddles it,
+    // then erases the label's own run of the line (GB_Paint: rcFrame.top +=
+    // tmHeight/2, label rect inflated -7 and filled with the parent's brush).
+    const frameTop = y + Math.floor(tm.height / 2);
+    const textStart = x + 8;
 
-    ctx.fillStyle = COLOR_BTNSHADOW;
-    if (label) {
-        ctx.fillRect(x, lineY, Math.max(0, textStart - x - 2), 1);
-        ctx.fillRect(textEnd, lineY, Math.max(0, x + w - textEnd), 1);
-    } else {
-        ctx.fillRect(x, lineY, w, 1);
-    }
-    ctx.fillRect(x, lineY, 1, Math.max(1, h - 7));
-    ctx.fillRect(x + w - 1, lineY, 1, Math.max(1, h - 7));
-    ctx.fillRect(x, y + h - 1, w, 1);
+    drawEtchedEdge(ctx, x, frameTop, w, Math.max(2, h - (frameTop - y)));
 
     if (label) {
         ctx.fillStyle = COLOR_BTNFACE;
-        ctx.fillRect(textStart - 2, y, textWidth + textPad, 12);
+        ctx.fillRect(textStart - 1, y, textWidth + 2, tm.height);
         ctx.fillStyle = isControlDisabled(child) ? COLOR_GRAYTEXT : COLOR_WINDOWTEXT;
         ctx.textAlign = 'left';
-        fillTextWithMnemonic(ctx, label, textStart, y);
+        ctx.textBaseline = 'alphabetic';
+        fillTextWithMnemonic(ctx, label, textStart, topTextBaseline(ctx, y));
+        ctx.textBaseline = 'top';
     }
-}
-
-function drawCheckMark(
-    ctx: OffscreenCanvasRenderingContext2D,
-    x: number,
-    y: number,
-    size: number,
-): void {
-    ctx.strokeStyle = COLOR_WINDOWTEXT;
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(x + Math.max(2, Math.floor(size * 0.2)), y + Math.floor(size * 0.55));
-    ctx.lineTo(x + Math.floor(size * 0.45), y + size - 3);
-    ctx.lineTo(x + size - 2, y + 2);
-    ctx.stroke();
-    ctx.lineWidth = 1;
 }
 
 function paintCheckableButton(
@@ -485,52 +463,20 @@ function paintCheckableButton(
     const radio = buttonType === BS_RADIOBUTTON || buttonType === BS_AUTORADIOBUTTON;
     const disabled = isControlDisabled(child);
 
-    const indicatorSize = Math.max(9, Math.min(13, h - 4));
-    const indicatorX = x + 2;
-    const indicatorY = y + Math.max(1, Math.floor((h - indicatorSize) / 2));
+    // The indicator is a fixed 13x13 CELL flush with the control's left edge and
+    // centred in its height (Wine button.c CB_Paint: checkBoxWidth = 13, rbox
+    // centred by delta/2); the 12x12 radio glyph is then centred inside that cell.
+    // Sizing it from the control height instead made a 16px-high check box 12px
+    // and a radio 13px, neither of which Windows ever draws.
+    const cellX = x;
+    const cellY = y + Math.max(0, Math.floor((h - CHECKBOX_SIZE) / 2));
+    const indicator = { checked, indeterminate, disabled, pushed };
 
     if (radio) {
-        ctx.fillStyle = COLOR_WINDOW;
-        ctx.beginPath();
-        ctx.arc(
-            indicatorX + indicatorSize / 2,
-            indicatorY + indicatorSize / 2,
-            indicatorSize / 2,
-            0,
-            Math.PI * 2,
-        );
-        ctx.fill();
-        ctx.strokeStyle = COLOR_BTNSHADOW;
-        ctx.lineWidth = 1;
-        ctx.stroke();
-
-        if (checked) {
-            ctx.fillStyle = disabled ? COLOR_GRAYTEXT : COLOR_WINDOWTEXT;
-            ctx.beginPath();
-            ctx.arc(
-                indicatorX + indicatorSize / 2,
-                indicatorY + indicatorSize / 2,
-                Math.max(2, indicatorSize / 4),
-                0,
-                Math.PI * 2,
-            );
-            ctx.fill();
-        }
+        const inset = (CHECKBOX_SIZE - RADIO_SIZE) >> 1;
+        drawRadioIndicator(ctx, cellX + inset, cellY + inset, indicator);
     } else {
-        ctx.fillStyle = COLOR_WINDOW;
-        ctx.fillRect(indicatorX, indicatorY, indicatorSize, indicatorSize);
-        if (pushed) {
-            drawSunkenEdge(ctx, indicatorX, indicatorY, indicatorSize, indicatorSize);
-        } else {
-            drawRaisedEdge(ctx, indicatorX, indicatorY, indicatorSize, indicatorSize);
-        }
-
-        if (indeterminate) {
-            ctx.fillStyle = disabled ? COLOR_GRAYTEXT : COLOR_BTNSHADOW;
-            ctx.fillRect(indicatorX + 3, indicatorY + 3, Math.max(2, indicatorSize - 6), Math.max(2, indicatorSize - 6));
-        } else if (checked) {
-            drawCheckMark(ctx, indicatorX, indicatorY, indicatorSize);
-        }
+        drawCheckBoxIndicator(ctx, cellX, cellY, indicator);
     }
 
     const label = child.title || '';
@@ -546,8 +492,8 @@ function paintCheckableButton(
     // control most visibly affected (checkboxes repaint far more often, on every
     // click/content-change) first.
     const colors = getControlColorOverride(child.handle);
-    const labelX = indicatorX + indicatorSize + 6;
-    const labelFill = colors ? colors.fill : COLOR_BTNFACE;
+    const labelX = cellX + CHECKBOX_SIZE + 4;
+    const labelFill = (colors ? colors.fill : COLOR_BTNFACE) ?? parentGroundCss(child) ?? undefined;
     if (labelFill) {
         ctx.fillStyle = labelFill;
         ctx.fillRect(labelX - 1, y, Math.max(1, x + w - labelX + 1), h);
@@ -555,13 +501,19 @@ function paintCheckableButton(
 
     ctx.font = getWindowFont(child);
     ctx.textAlign = 'left';
-    ctx.textBaseline = 'middle';
-    ctx.fillStyle = disabled ? COLOR_GRAYTEXT : (colors?.text ?? COLOR_WINDOWTEXT);
-    fillTextWithMnemonic(ctx, label, labelX, y + h / 2);
+    ctx.textBaseline = 'alphabetic';
+    const labelY = vcenterTextBaseline(ctx, y, h);
+    if (disabled) {
+        fillDisabledTextWithMnemonic(ctx, label, labelX, labelY, COLOR_BTNHILIGHT, COLOR_GRAYTEXT);
+    } else {
+        ctx.fillStyle = colors?.text ?? COLOR_WINDOWTEXT;
+        fillTextWithMnemonic(ctx, label, labelX, labelY);
+    }
     ctx.textBaseline = 'top';
 }
 
 function paintButton(
+    hdc: number,
     ctx: OffscreenCanvasRenderingContext2D,
     child: WindowInfo,
     x: number,
@@ -574,7 +526,7 @@ function paintButton(
     const pushed = (state & BST_PUSHED) !== 0;
 
     if ((child.style & BS_BITMAP) !== 0) {
-        paintStaticBitmap(ctx, child, x, y, w, h);
+        paintStaticBitmap(hdc, ctx, child, x, y, w, h);
         const disabled = isControlDisabled(child);
         const pushed = (buttonCheckStates.get(child.handle) ?? 0) & BST_PUSHED;
         if (disabled || pushed) {
@@ -620,7 +572,7 @@ function drawStaticShape(
 ): void {
     switch (styleType) {
         case SS_BLACKRECT:
-            ctx.fillStyle = '#000000';
+            ctx.fillStyle = COLOR_WINDOWTEXT;
             ctx.fillRect(x, y, w, h);
             return;
         case SS_GRAYRECT:
@@ -632,7 +584,7 @@ function drawStaticShape(
             ctx.fillRect(x, y, w, h);
             return;
         case SS_BLACKFRAME:
-            ctx.strokeStyle = '#000000';
+            ctx.strokeStyle = COLOR_WINDOWTEXT;
             ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
             return;
         case SS_GRAYFRAME:
@@ -660,10 +612,7 @@ function drawStaticShape(
             return;
         }
         case SS_ETCHEDFRAME:
-            ctx.strokeStyle = COLOR_BTNSHADOW;
-            ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
-            ctx.strokeStyle = COLOR_BTNHILIGHT;
-            ctx.strokeRect(x + 1.5, y + 1.5, Math.max(1, w - 3), Math.max(1, h - 3));
+            drawEtchedEdge(ctx, x, y, w, h);
             return;
     }
 }
@@ -696,6 +645,7 @@ function wrapStaticLine(
 }
 
 function paintStaticBitmap(
+    hdc: number,
     ctx: OffscreenCanvasRenderingContext2D,
     child: WindowInfo,
     x: number,
@@ -717,13 +667,14 @@ function paintStaticBitmap(
     const { data, width: bmpW, height: bmpH } = resolved;
     const layout = layoutStaticControlImage(x, y, w, h, bmpW, bmpH, child.style, SS_CENTERIMAGE);
     try {
-        blitStaticControlImage(ctx, data, bmpW, bmpH, x, y, w, h, layout);
+        blitStaticControlImage(hdc, ctx, data, bmpW, bmpH, x, y, w, h, layout);
     } catch (e) {
         Logger.warn(LogCategory.USER32, `paintStaticBitmap: failed to draw bitmap: ${e}`);
     }
 }
 
 function paintStaticIcon(
+    hdc: number,
     ctx: OffscreenCanvasRenderingContext2D,
     child: WindowInfo,
     x: number,
@@ -740,13 +691,40 @@ function paintStaticIcon(
     const { data, width: iconW, height: iconH } = resolved;
     const layout = layoutStaticControlImage(x, y, w, h, iconW, iconH, child.style, SS_CENTERIMAGE);
     try {
-        blitStaticControlImage(ctx, data, iconW, iconH, x, y, w, h, layout);
+        blitStaticControlImage(hdc, ctx, data, iconW, iconH, x, y, w, h, layout);
     } catch (e) {
         Logger.warn(LogCategory.USER32, `paintStaticIcon: failed: ${e}`);
     }
 }
 
+/**
+ * The ground a control with no background of its own sits on.
+ *
+ * A guest that answers WM_CTLCOLOR* with a hollow brush means "show the parent's
+ * background" — on Windows that is whatever the parent's WM_ERASEBKGND just painted,
+ * so the control never sees its own previous pixels. Our overlay keeps no per-control
+ * backing store, so without restoring that ground each repaint stamps another copy of
+ * the text over the last one and the label thickens. Only the transparent labels do
+ * it; their opaque neighbours erase and stay crisp.
+ *
+ * null when the parent has no class brush — a guest that paints its own client owns
+ * those pixels, and erasing them would be worse than the doubling.
+ *
+ * Deliberate divergence: Win32's DefWindowProc answers WM_CTLCOLORSTATIC with the
+ * BTNFACE brush, not the parent's class brush.
+ */
+function parentGroundCss(child: WindowInfo): string | null {
+    if (child.parent === undefined) return null;
+    const system = System.getInstance();
+    const parent = system.windowManager.getWindow(child.parent);
+    const brush = resolveBrushHandle((parent?.wndClass?.hbrBackground ?? 0) >>> 0);
+    if (!brush) return null;
+    return system.gdiContext.getBrushCss(brush);
+}
+
+
 function paintStatic(
+    hdc: number,
     ctx: OffscreenCanvasRenderingContext2D,
     child: WindowInfo,
     x: number,
@@ -764,7 +742,7 @@ function paintStatic(
     if (controlImageHandles.has(child.handle)
         && styleType !== SS_ICON && styleType !== SS_BITMAP) {
         // Restore guest-owned bitmap content during parent/page recomposition.
-        paintStaticBitmap(ctx, child, x, y, w, h);
+        paintStaticBitmap(hdc, ctx, child, x, y, w, h);
         return;
     }
 
@@ -773,12 +751,12 @@ function paintStatic(
     if (coveredByGuestChild) return;
 
     if (styleType === SS_ICON) {
-        paintStaticIcon(ctx, child, x, y, w, h);
+        paintStaticIcon(hdc, ctx, child, x, y, w, h);
         return;
     }
 
     if (styleType === SS_BITMAP) {
-        paintStaticBitmap(ctx, child, x, y, w, h);
+        paintStaticBitmap(hdc, ctx, child, x, y, w, h);
         return;
     }
 
@@ -787,6 +765,13 @@ function paintStatic(
     const isTextType = styleType === SS_LEFT || styleType === SS_CENTER || styleType === SS_RIGHT
         || styleType === SS_SIMPLE || styleType === SS_LEFTNOWORDWRAP;
     const colors = getControlColorOverride(child.handle);
+    if (isTextType && !colors?.fill) {
+        const ground = parentGroundCss(child);
+        if (ground) {
+            ctx.fillStyle = ground;
+            ctx.fillRect(x, y, w, h);
+        }
+    }
     if (isTextType && colors?.fill) {
         // WM_CTLCOLORSTATIC returned a background brush — the static is opaque.
         ctx.fillStyle = colors.fill;
@@ -797,12 +782,14 @@ function paintStatic(
     if (!text) return;
 
     const processPrefix = (child.style & SS_NOPREFIX) === 0;
-    const lineHeight = 14;
     const disabled = isControlDisabled(child);
 
     ctx.font = getWindowFont(child);
+    // DrawText advances one tmHeight per line; a static is TOP-aligned in its
+    // client (only SS_CENTERIMAGE centres), so the first cell starts at y.
+    const lineHeight = gdiTextMetrics(ctx).height;
     ctx.fillStyle = disabled ? COLOR_GRAYTEXT : (colors?.text ?? COLOR_WINDOWTEXT);
-    ctx.textBaseline = 'top';
+    ctx.textBaseline = 'alphabetic';
 
     // SS_LEFT/SS_CENTER/SS_RIGHT word-wrap to the control width (real Win32); only
     // SS_LEFTNOWORDWRAP and SS_SIMPLE render single-line. Without wrapping, a long
@@ -811,18 +798,18 @@ function paintStatic(
     const wordWraps = styleType === SS_LEFT || styleType === SS_CENTER || styleType === SS_RIGHT;
     let lines = text.split(/\r\n|\n|\r/g);
     if (wordWraps) {
-        const maxW = Math.max(1, w - 4);
+        const maxW = Math.max(1, w);
         lines = lines.flatMap((l) => wrapStaticLine(ctx, l, maxW, processPrefix));
     }
 
-    let textY = y + 2;
+    let textY = y;
     if ((child.style & SS_CENTERIMAGE) !== 0) {
         const contentHeight = lines.length * lineHeight;
         textY = y + Math.max(0, Math.floor((h - contentHeight) / 2));
     }
 
     for (let i = 0; i < lines.length; i++) {
-        const lineY = textY + i * lineHeight;
+        const lineY = topTextBaseline(ctx, textY + i * lineHeight);
         // Only reject SUBSEQUENT lines that overflow — a single-line static must
         // always draw its text. DLU→px conversion routinely yields a control height
         // (e.g. 15px) a couple pixels short of lineHeight+padding (16px); rejecting
@@ -830,20 +817,20 @@ function paintStatic(
         // label whose template height came out tight) render as fully blank chrome
         // with visible+correct state and no drawing error — a "control is missing"
         // symptom, not a clipping one. Real Windows just draws the line.
-        if (i > 0 && lineY + lineHeight > y + h) break;
+        if (i > 0 && textY + (i + 1) * lineHeight > y + h) break;
 
+        // DrawText over the whole client, no inset — a static's text starts on the
+        // control's own left edge, which is how a label lines up with the control
+        // below it in a dialog template.
         if (styleType === SS_CENTER) {
             ctx.textAlign = 'center';
             fillTextWithMnemonic(ctx, lines[i], x + w / 2, lineY, processPrefix);
         } else if (styleType === SS_RIGHT) {
             ctx.textAlign = 'right';
-            fillTextWithMnemonic(ctx, lines[i], x + w - 2, lineY, processPrefix);
-        } else if (styleType === SS_LEFT || styleType === SS_LEFTNOWORDWRAP || styleType === SS_SIMPLE) {
-            ctx.textAlign = 'left';
-            fillTextWithMnemonic(ctx, lines[i], x + 2, lineY, processPrefix);
+            fillTextWithMnemonic(ctx, lines[i], x + w, lineY, processPrefix);
         } else {
             ctx.textAlign = 'left';
-            fillTextWithMnemonic(ctx, lines[i], x + 2, lineY, processPrefix);
+            fillTextWithMnemonic(ctx, lines[i], x, lineY, processPrefix);
         }
     }
 
@@ -859,6 +846,9 @@ function paintEdit(
     w: number,
     h: number,
 ): void {
+    const ES_MULTILINE = 0x0004;
+    const WS_HSCROLL = 0x00100000;
+    const WS_VSCROLL = 0x00200000;
     const disabled = isControlDisabled(child);
     const colors = getControlColorOverride(child.handle);
 
@@ -869,7 +859,16 @@ function paintEdit(
         ctx.fillStyle = fill;
         ctx.fillRect(x, y, w, h);
     }
-    drawSunkenEdge(ctx, x, y, w, h);
+    drawControlFieldFrame(ctx, child, x, y, w, h);
+
+    const multiline = (child.style & ES_MULTILINE) !== 0;
+    // Win32 shows a multiline edit's bars whenever the style asks for them, live or
+    // disabled — unlike a listbox, which hides one it does not need. They sit INSIDE
+    // the client, so the text area shrinks by exactly their extent.
+    const vBar = multiline && (child.style & WS_VSCROLL) !== 0;
+    const hBar = multiline && (child.style & WS_HSCROLL) !== 0;
+    const bodyW = w - (vBar ? LIST_SCROLLBAR_W : 0);
+    const bodyH = h - (hBar ? LIST_SCROLLBAR_W : 0);
 
     const visual = getEditVisualState(child);
     const textColor = disabled ? COLOR_GRAYTEXT : (colors?.text ?? COLOR_WINDOWTEXT);
@@ -879,27 +878,39 @@ function paintEdit(
 
     ctx.font = getWindowFont(child);
     ctx.textAlign = 'left';
-    ctx.textBaseline = 'middle';
+    ctx.textBaseline = 'alphabetic';
     ctx.save();
     ctx.beginPath();
-    ctx.rect(x + 2, y + 2, Math.max(1, w - 4), Math.max(1, h - 4));
+    ctx.rect(x + 2, y + 2, Math.max(1, bodyW - 4), Math.max(1, bodyH - 4));
     ctx.clip();
-    const ES_MULTILINE = 0x0004;
-    if ((child.style & ES_MULTILINE) !== 0) {
-        ctx.textBaseline = 'top';
-        const lineHeight = 14;
-        const lines = text.split(/\r\n|\n|\r/g);
-        let ty = y + 4;
-        for (const line of lines) {
-            if (ty + lineHeight > y + h - 2) break;
-            ctx.fillText(line, x + EDIT_TEXT_INSET, ty);
-            ty += lineHeight;
+    if (multiline) {
+        ctx.fillStyle = textColor;
+        // Lines come from the control itself, so what is painted and what
+        // EM_GETLINECOUNT/EM_LINESCROLL count are the same laid-out lines.
+        const lines = editLines(child);
+        const lineH = editLineHeight(child);
+        const mask = visual.passwordChar ? String.fromCharCode(visual.passwordChar) : '';
+        let ty = y + EDIT_TEXT_INSET;
+        // Text origin walks left by the horizontal scroll, exactly as the single-line
+        // branch does; a wrapping edit keeps that offset at 0 and is unaffected.
+        const tx = x + EDIT_TEXT_INSET - visual.scrollX;
+        for (let i = visual.scrollTop; i < lines.length; i++) {
+            if (ty >= y + bodyH - 2) break;
+            const line = mask ? mask.repeat(lines[i].text.length) : lines[i].text;
+            ctx.fillText(line, tx, topTextBaseline(ctx, ty));
+            const caretInLine = visual.selEnd - lines[i].start;
+            if (visual.focused && !disabled && caretInLine >= 0 && caretInLine <= line.length
+                && (i === lines.length - 1 || visual.selEnd < lines[i + 1].start)) {
+                const caretX = tx + ctx.measureText(line.slice(0, caretInLine)).width;
+                ctx.fillRect(Math.round(caretX), ty, 1, lineH - 1);
+            }
+            ty += lineH;
         }
     } else {
         // Text origin walks left by the control's horizontal scroll (EM_SCROLLCARET), so
         // a single-line edit longer than its box keeps the caret inside the clip rect.
         const tx = x + EDIT_TEXT_INSET - visual.scrollX;
-        const ty = y + h / 2;
+        const ty = vcenterTextBaseline(ctx, y, h);
         const selLo = Math.min(visual.selStart, visual.selEnd);
         const selHi = Math.max(visual.selStart, visual.selEnd);
 
@@ -928,34 +939,300 @@ function paintEdit(
     }
     ctx.restore();
     ctx.textBaseline = 'top';
+
+    if (vBar || hBar) {
+        const lines = editLines(child);
+        const page = editVisibleLineCount(child);
+        const inset = controlClientInset(child);
+        // Win32 keeps the bar visible but DISABLED (grey arrows, no thumb) while the
+        // text fits — SIF_DISABLENOSCROLL, which is how the edit updates its scroll info.
+        const canScroll = lines.length > page;
+        if (vBar) {
+            const bar = listBarRect(x, y, w, bodyH, inset);
+            paintScrollBarRect(ctx, bar.x, bar.y, bar.w, bar.h, {
+                vertical: true,
+                ...listScrollRange(visual.scrollTop, page, lines.length),
+                upEnabled: canScroll,
+                downEnabled: canScroll,
+                pressed: scrollFeedbackFor(child.handle, SB_VERT).pressed,
+            });
+        }
+        if (hBar) {
+            // The range is measured in PIXELS of text — the unit the edit's own x offset
+            // and the bar's binding both use, so the thumb lands where a drag puts it.
+            const range = editHorizontalScrollRange(child);
+            // Win32 greys the arrows when the whole range fits the page.
+            const canScrollX = range.max - range.min >= range.page;
+            const bar = bottomBarRect(x, y, bodyW, h, inset);
+            paintScrollBarRect(ctx, bar.x, bar.y, bar.w, bar.h, {
+                vertical: false,
+                ...range,
+                upEnabled: canScrollX,
+                downEnabled: canScrollX,
+                pressed: scrollFeedbackFor(child.handle, SB_HORZ).pressed,
+            });
+        }
+    }
+}
+
+function rgbToCss(rgb: number): string {
+    return `rgb(${(rgb >> 16) & 0xFF},${(rgb >> 8) & 0xFF},${rgb & 0xFF})`;
+}
+
+/**
+ * Rich Edit: word-wrapped styled text over the same sunken field EDIT draws.
+ * Content comes from the RTF run list (EM_STREAMIN) or, with none streamed, from
+ * child.title under the control's default character format.
+ */
+function paintRichEdit(
+    ctx: OffscreenCanvasRenderingContext2D,
+    child: WindowInfo,
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+): void {
+    const WS_VSCROLL = 0x00200000;
+    const disabled = isControlDisabled(child);
+    const colors = getControlColorOverride(child.handle);
+    const visual = getRichEditVisualState(child);
+
+    // A guest WM_CTLCOLOR* answer wins outright, then EM_SETBKGNDCOLOR, then the
+    // window colour. Rich Edit's background is its OWN back colour, not the brush
+    // DefWindowProc hands a plain EDIT: ES_READONLY/WS_DISABLED bar text entry, they
+    // do not repaint the field grey the way they do on the EDIT class.
+    const fill = colors
+        ? colors.fill
+        : visual.bkColor !== null
+            ? rgbToCss(visual.bkColor)
+            : COLOR_WINDOW;
+    if (fill) {
+        ctx.fillStyle = fill;
+        ctx.fillRect(x, y, w, h);
+    }
+    drawControlFieldFrame(ctx, child, x, y, w, h);
+
+    const runs = richEditContentRuns(child);
+    if (runs.length === 0) return;
+
+    const hasScrollbar = (child.style & WS_VSCROLL) !== 0;
+    const textW = Math.max(1, w - RICH_EDIT_INSET * 2 - (hasScrollbar ? LIST_SCROLLBAR_W : 0));
+    const textH = Math.max(1, h - RICH_EDIT_INSET * 2);
+    const lines = layoutRichEdit(ctx, runs, textW);
+
+    // Clamp the scroll here rather than at the message: how many lines exist is a
+    // function of the control's width, which only the painter knows.
+    let visibleLines = 0;
+    let used = 0;
+    for (let i = 0; i < lines.length && used + lines[i].height <= textH; i++) {
+        used += lines[i].height;
+        visibleLines++;
+    }
+    visibleLines = Math.max(1, visibleLines);
+    const maxTop = Math.max(0, lines.length - visibleLines);
+    const top = Math.min(visual.scrollTop, maxTop);
+    if (top !== visual.scrollTop) setRichEditScrollTop(child, top);
+    // Publish the wrapped layout: the bar's thumb and its hit test cannot re-derive
+    // it without redoing the wrap.
+    noteRichEditLayout(child, lines.length, visibleLines);
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(x + 2, y + 2, Math.max(1, w - 4), Math.max(1, h - 4));
+    ctx.clip();
+    ctx.textAlign = 'left';
+    // Every run on a line shares the line's baseline, so a bold or larger run sits on
+    // the same feet as its neighbours instead of hanging from a common top edge.
+    ctx.textBaseline = 'alphabetic';
+
+    const defaultColor = disabled ? COLOR_GRAYTEXT : (colors?.text ?? COLOR_WINDOWTEXT);
+    let ty = y + RICH_EDIT_INSET;
+    for (let i = top; i < lines.length; i++) {
+        const line = lines[i];
+        // A line whose TOP is inside the client is painted and CLIPPED, exactly as
+        // Windows does — dropping it whole showed one line fewer than the control has
+        // room for.
+        if (ty >= y + h - RICH_EDIT_INSET) break;
+        let tx = x + RICH_EDIT_INSET;
+        const baseline = ty + line.baseline;
+        for (const seg of line.segments) {
+            ctx.font = richEditRunFont(seg.run);
+            ctx.fillStyle = disabled || seg.run.color === null
+                ? defaultColor
+                : rgbToCss(seg.run.color);
+            ctx.fillText(seg.text, tx, baseline);
+            const segW = ctx.measureText(seg.text).width;
+            if (seg.run.underline) {
+                ctx.fillRect(tx, baseline + 2, Math.max(1, Math.round(segW)), 1);
+            }
+            tx += segW;
+        }
+        ty += line.height;
+    }
+    ctx.restore();
+
+    if (hasScrollbar) {
+        paintListScrollbar(ctx, child.handle, x, y, w, h, top, visibleLines, lines.length,
+            controlClientInset(child));
+    }
 }
 
 // Dropdown arrow button width (Windows classic = 16px)
 const COMBO_ARROW_W = 16;
-/** Listbox / dropdown item height (matches CONTROL_FONT metrics). */
-export const LIST_ITEM_H = 14;
-/** Listbox border inset before the first item. */
+/** Listbox / dropdown item height — Windows uses one text cell (tmHeight) per row. */
+export const LIST_ITEM_H = 13;
+/** Field chrome when a control names no border style: the class's own sunken edge. */
 export const LIST_INSET = 2;
-/** Vertical scrollbar width inside an overflowing listbox / dropdown. */
-export const LIST_SCROLLBAR_W = 14;
+
+const WS_BORDER_STYLE = 0x00800000;
+const WS_EX_CLIENTEDGE_STYLE = 0x00000200;
+
+/**
+ * Pixels between a field control's window rect and its client.
+ *
+ * SM_CXEDGE (the WS_EX_CLIENTEDGE 3D edge, 2) and SM_CXBORDER (the WS_BORDER frame,
+ * 1) are SEPARATE adjustments and both apply — a dialog listbox carrying both, which
+ * is what an RC template normally emits, starts its first item three pixels in, not
+ * two. Measured against a native capture of the control zoo.
+ */
+export function controlClientInset(child: WindowInfo): number {
+    const edge = ((child.exStyle ?? 0) & WS_EX_CLIENTEDGE_STYLE) !== 0 ? 2 : 0;
+    const border = (child.style & WS_BORDER_STYLE) !== 0 ? 1 : 0;
+    return edge + border || LIST_INSET;
+}
+
+/**
+ * The chrome those styles PAINT — which is not the same as the space they reserve.
+ *
+ * The 3D look of a classic field is the sunken edge itself (highlight / face /
+ * shadow / dark shadow); the pixel WS_BORDER additionally reserves is left as plain
+ * client background, which is the familiar gap between a listbox's frame and its
+ * first item. Only a control with WS_BORDER and NO client edge draws a flat
+ * COLOR_WINDOWFRAME line, because then there is no bevel to carry the border.
+ */
+function drawControlFieldFrame(
+    ctx: OffscreenCanvasRenderingContext2D,
+    child: WindowInfo,
+    x: number, y: number, w: number, h: number,
+): void {
+    const edge = ((child.exStyle ?? 0) & WS_EX_CLIENTEDGE_STYLE) !== 0;
+    const border = (child.style & WS_BORDER_STYLE) !== 0;
+    if (border && !edge) {
+        ctx.fillStyle = COLOR_WINDOWFRAME;
+        ctx.fillRect(x, y, w, 1);
+        ctx.fillRect(x, y + h - 1, w, 1);
+        ctx.fillRect(x, y, 1, h);
+        ctx.fillRect(x + w - 1, y, 1, h);
+        return;
+    }
+    drawSunkenEdge(ctx, x, y, w, h);
+}
+/** Vertical scrollbar width inside an overflowing listbox / dropdown (SM_CXVSCROLL). */
+export const LIST_SCROLLBAR_W = SB_WIDTH;
 /** Max items shown in an open combobox dropdown. */
 export const COMBO_DROP_MAX_VISIBLE = 8;
+/** The dropped list is framed by a single line, not by a control's sunken edge. */
+export const COMBO_DROP_INSET = 1;
 
-/** Number of fully visible items in a listbox of height h. */
-export function listVisibleCount(h: number): number {
-    return Math.max(1, Math.floor((h - LIST_INSET * 2) / LIST_ITEM_H));
+/** Rows an open dropdown shows for `itemCount` items — one definition for the
+ *  painter, its scrollbar and the hit test. */
+export function comboDropVisibleCount(itemCount: number): number {
+    return Math.max(1, Math.min(COMBO_DROP_MAX_VISIBLE, itemCount));
+}
+
+/**
+ * Top row of a list that has just dropped: the selection becomes the first row,
+ * clamped so a short list cannot open scrolled past its own end. Shared by the
+ * click that opens the list and by CB_SHOWDROPDOWN, which must not differ.
+ */
+export function comboDropTopIndex(itemCount: number, selectedIndex: number): number {
+    const maxTop = Math.max(0, itemCount - comboDropVisibleCount(itemCount));
+    return Math.max(0, Math.min(selectedIndex < 0 ? 0 : selectedIndex, maxTop));
+}
+/** Sunken frame + padding around a combobox's selection field (top + bottom). */
+const COMBO_FRAME_H = 6;
+
+/** Pixel size of a control's font, used for text-derived control metrics. */
+function fontPixelSize(win: WindowInfo): number {
+    const match = /(\d+(?:\.\d+)?)px/.exec(getWindowFont(win));
+    const px = match ? parseFloat(match[1]) : 0;
+    return px > 0 ? px : 11;
+}
+
+/**
+ * Height of a combobox's selection field / list row — CB_SETITEMHEIGHT when the app
+ * set one, otherwise text height + the 2px Windows adds around an item.
+ */
+export function comboBoxItemHeight(child: WindowInfo): number {
+    const set = listControlStates.get(child.handle)?.itemHeight;
+    if (set !== undefined && set > 0) return set;
+    return Math.round(fontPixelSize(child)) + 4;
+}
+
+/**
+ * CLOSED height of a non-CBS_SIMPLE combobox. The height an app passes to
+ * CreateWindow (or a dialog template's cy) covers the closed box PLUS the dropped
+ * list; the list is a separate ComboLBox popup, so USER sizes the window itself to
+ * the selection field plus its frame and re-applies that on every size change
+ * (Wine combo.c COMBO_Size / CBGetTextAreaHeight). Without it the app's "room for
+ * the list" number becomes a floor-to-ceiling sunken box over the controls below.
+ */
+export function comboBoxClosedHeight(child: WindowInfo): number {
+    return comboBoxItemHeight(child) + COMBO_FRAME_H;
+}
+
+/** CBS_SIMPLE keeps its list attached below the edit field, so its height is the app's. */
+export function comboBoxHasFixedHeight(child: WindowInfo): boolean {
+    const CBS_SIMPLE = 0x0001;
+    return (child.style & 0x0003) !== CBS_SIMPLE;
+}
+
+/**
+ * Apply the closed height to a combobox window. Returns true if it changed —
+ * callers repaint on that. Every path that sizes a control funnels here so the
+ * window rect the guest observes (GetWindowRect/MoveWindow) and the rect we paint
+ * cannot disagree.
+ */
+export function applyComboBoxClosedHeight(child: WindowInfo): boolean {
+    if (normalizeSystemControlClass(child.systemControlClass) !== 'combobox') return false;
+    if (!comboBoxHasFixedHeight(child)) return false;
+    const closed = comboBoxClosedHeight(child);
+    if (child.height <= closed) return false;
+    child.height = closed;
+    const wmWin = System.getInstance().windowManager.getWindow(child.handle);
+    if (wmWin) wmWin.rect.h = closed;
+    return true;
+}
+
+/** Fully visible items in a list `h` tall whose chrome is `inset` px thick. */
+export function listVisibleCount(h: number, inset: number = LIST_INSET): number {
+    return Math.max(1, Math.floor((h - inset * 2) / LIST_ITEM_H));
+}
+
+/** The same for a control, whose chrome its styles decide. */
+export function listVisibleCountOf(child: WindowInfo): number {
+    return listVisibleCount(child.height, controlClientInset(child));
 }
 
 /** Listbox needs a scrollbar when items overflow the client height. */
 export function listNeedsScrollbar(child: WindowInfo): boolean {
     const state = listControlStates.get(child.handle);
-    return !!state && state.items.length > listVisibleCount(child.height);
+    return !!state && state.items.length > listVisibleCountOf(child);
 }
 
 /** Clamp topIndex so the visible window stays within the item list. */
-export function clampListTopIndex(state: { items: unknown[]; topIndex: number }, h: number): void {
-    const maxTop = Math.max(0, state.items.length - listVisibleCount(h));
+export function clampListTopIndex(
+    state: { items: unknown[]; topIndex: number }, h: number, inset: number = LIST_INSET,
+): void {
+    const maxTop = Math.max(0, state.items.length - listVisibleCount(h, inset));
     state.topIndex = Math.max(0, Math.min(state.topIndex | 0, maxTop));
+}
+
+/** The same for a control. */
+export function clampListTopIndexOf(
+    state: { items: unknown[]; topIndex: number }, child: WindowInfo,
+): void {
+    clampListTopIndex(state, child.height, controlClientInset(child));
 }
 
 /** Screen-space rect of an open combobox dropdown list (below the closed box). */
@@ -974,7 +1251,14 @@ function paintComboBox(
     w: number,
     h: number,
 ): void {
-    const textW = Math.max(1, w - COMBO_ARROW_W);
+    // CBS_SIMPLE has no drop-down button at all: its list is a permanently attached
+    // sibling below the edit field, so the app's height covers BOTH. Painting the
+    // whole rect as one field turns it into a floor-to-ceiling white box with the
+    // selection floating in the middle of it.
+    const simple = !comboBoxHasFixedHeight(child);
+    const fieldH = simple ? Math.min(h, comboBoxClosedHeight(child)) : h;
+    const arrowW = simple ? 0 : COMBO_ARROW_W;
+    const textW = Math.max(1, w - arrowW);
     const disabled = isControlDisabled(child);
 
     // Backgrounds first (white text field, gray button field), THEN one continuous
@@ -982,10 +1266,12 @@ function paintComboBox(
     // single recessed field with the arrow button inset near its right edge, not two
     // separately-bordered boxes side by side.
     ctx.fillStyle = disabled ? COLOR_BTNFACE : COLOR_WINDOW;
-    ctx.fillRect(x, y, textW, h);
-    ctx.fillStyle = COLOR_BTNFACE;
-    ctx.fillRect(x + textW, y, COMBO_ARROW_W, h);
-    drawSunkenEdge(ctx, x, y, w, h);
+    ctx.fillRect(x, y, textW, fieldH);
+    if (arrowW > 0) {
+        ctx.fillStyle = COLOR_BTNFACE;
+        ctx.fillRect(x + textW, y, arrowW, fieldH);
+    }
+    drawSunkenEdge(ctx, x, y, w, fieldH);
 
     const state = listControlStates.get(child.handle);
     if (state && state.selectedIndex >= 0 && state.selectedIndex < state.items.length) {
@@ -993,37 +1279,67 @@ function paintComboBox(
         ctx.fillStyle = disabled ? COLOR_GRAYTEXT : COLOR_WINDOWTEXT;
         ctx.font = getWindowFont(child);
         ctx.textAlign = 'left';
-        ctx.textBaseline = 'middle';
+        ctx.textBaseline = 'alphabetic';
         ctx.save();
         ctx.beginPath();
-        ctx.rect(x + 3, y + 2, Math.max(1, textW - 5), Math.max(1, h - 4));
+        ctx.rect(x + 3, y + 2, Math.max(1, textW - 5), Math.max(1, fieldH - 4));
         ctx.clip();
-        ctx.fillText(text, x + 4, y + h / 2);
+        ctx.fillText(text, x + 3, vcenterTextBaseline(ctx, y, fieldH));
         ctx.restore();
         ctx.textBaseline = 'top';
     }
 
-    // Arrow button: a small raised (sunken while the dropdown is open) bevel filling
-    // the button area, clearing only the outer sunken frame's own border pixels (2px
-    // shadow on top/left, 1px highlight on bottom/right) — no left-side inset, or a
-    // flat unstyled gray gap is left between the text field and the button's bevel.
-    const ax = x + textW;
-    const bx = ax, by = y + 2, bw = Math.max(1, COMBO_ARROW_W - 1), bh = Math.max(1, h - 3);
-    if (state?.dropdownOpen) {
-        drawSunkenEdge(ctx, bx, by, bw, bh);
-    } else {
-        drawRaisedEdge(ctx, bx, by, bw, bh);
+    if (arrowW > 0) {
+        // Arrow button: a small raised (sunken while the dropdown is open) bevel filling
+        // the button area, clearing only the outer sunken frame's own border pixels (2px
+        // shadow on top/left, 1px highlight on bottom/right) — no left-side inset, or a
+        // flat unstyled gray gap is left between the text field and the button's bevel.
+        const bx = x + textW, by = y + 2, bw = Math.max(1, arrowW - 1), bh = Math.max(1, fieldH - 3);
+        drawArrowButton(ctx, bx, by, bw, bh, 'down', !disabled, !!state?.dropdownOpen);
     }
 
-    const arrowCx = bx + bw / 2;
-    const arrowCy = by + bh / 2;
-    ctx.fillStyle = disabled ? COLOR_GRAYTEXT : COLOR_BTNTEXT;
+    // CBS_SIMPLE's list is a permanently attached sibling below the field, not a
+    // popup — the height the app passed covers both, so the field must not swallow it.
+    if (!simple || !state) return;
+    const listY = y + fieldH + 2;
+    const listH = h - (fieldH + 2);
+    if (listH <= 0) return;
+
+    ctx.fillStyle = disabled ? COLOR_BTNFACE : COLOR_WINDOW;
+    ctx.fillRect(x, listY, w, listH);
+    drawSunkenEdge(ctx, x, listY, w, listH);
+
+    clampListTopIndex(state, listH);
+    const maxVisible = listVisibleCount(listH);
+    const hasBar = state.items.length > maxVisible;
+    const itemW = w - LIST_INSET * 2 - (hasBar ? LIST_SCROLLBAR_W : 0);
+
+    ctx.font = getWindowFont(child);
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.save();
     ctx.beginPath();
-    ctx.moveTo(arrowCx - 3, arrowCy - 1);
-    ctx.lineTo(arrowCx + 3, arrowCy - 1);
-    ctx.lineTo(arrowCx, arrowCy + 2);
-    ctx.closePath();
-    ctx.fill();
+    ctx.rect(x + LIST_INSET, listY + LIST_INSET, Math.max(1, itemW), Math.max(1, listH - LIST_INSET * 2));
+    ctx.clip();
+    const visible = Math.min(state.items.length - state.topIndex, maxVisible);
+    for (let i = 0; i < visible; i++) {
+        const idx = state.topIndex + i;
+        const iy = listY + LIST_INSET + i * LIST_ITEM_H;
+        if (!disabled && idx === state.selectedIndex) {
+            ctx.fillStyle = COLOR_HIGHLIGHT;
+            ctx.fillRect(x + LIST_INSET, iy, Math.max(1, itemW), LIST_ITEM_H);
+            ctx.fillStyle = COLOR_HIGHLIGHTTEXT;
+        } else {
+            ctx.fillStyle = disabled ? COLOR_GRAYTEXT : COLOR_WINDOWTEXT;
+        }
+        ctx.fillText(state.items[idx].text, x + 4, vcenterTextBaseline(ctx, iy, LIST_ITEM_H));
+    }
+    ctx.restore();
+    ctx.textBaseline = 'top';
+
+    if (hasBar) {
+        paintListScrollbar(ctx, child.handle, x, listY, w, listH, state.topIndex, maxVisible, state.items.length);
+    }
 }
 
 /** Painted after all siblings so the open list overlaps controls below the combo. */
@@ -1039,21 +1355,34 @@ function paintComboDropdown(ctx: OffscreenCanvasRenderingContext2D, child: Windo
 
     ctx.font = getWindowFont(child);
     ctx.textAlign = 'left';
-    ctx.textBaseline = 'top';
+    ctx.textBaseline = 'alphabetic';
 
-    clampListTopIndex(state, rect.h);
-    const visible = Math.min(state.items.length - state.topIndex, COMBO_DROP_MAX_VISIBLE);
+    // The dropped list's frame is a single line, so its bar sits one pixel in — with
+    // the listbox's 2px inset it left a white gap between the bar and the frame.
+    clampListTopIndex(state, rect.h, COMBO_DROP_INSET);
+    const maxVisible = comboDropVisibleCount(state.items.length);
+    const hasScrollbar = state.items.length > maxVisible;
+    const itemW = rect.w - COMBO_DROP_INSET * 2 - (hasScrollbar ? LIST_SCROLLBAR_W : 0);
+    const visible = Math.min(state.items.length - state.topIndex, maxVisible);
     for (let i = 0; i < visible; i++) {
         const idx = state.topIndex + i;
         const iy = rect.y + 1 + i * LIST_ITEM_H;
         if (idx === state.selectedIndex) {
-            ctx.fillStyle = '#000080';
-            ctx.fillRect(rect.x + 1, iy, rect.w - 2, LIST_ITEM_H);
+            ctx.fillStyle = COLOR_HIGHLIGHT;
+            ctx.fillRect(rect.x + 1, iy, Math.max(1, itemW), LIST_ITEM_H);
             ctx.fillStyle = COLOR_BTNHILIGHT;
         } else {
             ctx.fillStyle = COLOR_WINDOWTEXT;
         }
-        ctx.fillText(state.items[idx].text, rect.x + 3, iy + 1);
+        ctx.fillText(state.items[idx].text, rect.x + 3, vcenterTextBaseline(ctx, iy, LIST_ITEM_H));
+    }
+    ctx.textBaseline = 'top';
+
+    if (hasScrollbar) {
+        paintListScrollbar(
+            ctx, child.handle, rect.x, rect.y, rect.w, rect.h,
+            state.topIndex, maxVisible, state.items.length, COMBO_DROP_INSET,
+        );
     }
 }
 
@@ -1075,43 +1404,45 @@ function paintListBox(
         ctx.fillStyle = fill;
         ctx.fillRect(x, y, w, h);
     }
-    drawSunkenEdge(ctx, x, y, w, h);
+    drawControlFieldFrame(ctx, child, x, y, w, h);
 
     const state = listControlStates.get(child.handle);
     if (!state) return;
 
-    clampListTopIndex(state, h);
-    const maxVisible = listVisibleCount(h);
+    const inset = controlClientInset(child);
+    clampListTopIndexOf(state, child);
+    const maxVisible = listVisibleCountOf(child);
     const hasScrollbar = state.items.length > maxVisible;
-    const itemW = w - LIST_INSET * 2 - (hasScrollbar ? LIST_SCROLLBAR_W : 0);
+    const itemW = w - inset * 2 - (hasScrollbar ? LIST_SCROLLBAR_W : 0);
 
     ctx.font = getWindowFont(child);
     ctx.textAlign = 'left';
-    ctx.textBaseline = 'top';
+    ctx.textBaseline = 'alphabetic';
 
     ctx.save();
     ctx.beginPath();
-    ctx.rect(x + LIST_INSET, y + LIST_INSET, Math.max(1, itemW), Math.max(1, h - LIST_INSET * 2));
+    ctx.rect(x + inset, y + inset, Math.max(1, itemW), Math.max(1, h - inset * 2));
     ctx.clip();
 
     const visible = Math.min(state.items.length - state.topIndex, maxVisible);
     for (let i = 0; i < visible; i++) {
         const idx = state.topIndex + i;
-        const iy = y + LIST_INSET + i * LIST_ITEM_H;
+        const iy = y + inset + i * LIST_ITEM_H;
         if (!disabled && idx === state.selectedIndex) {
-            ctx.fillStyle = '#000080';
-            ctx.fillRect(x + LIST_INSET, iy, Math.max(1, itemW), LIST_ITEM_H);
+            ctx.fillStyle = COLOR_HIGHLIGHT;
+            ctx.fillRect(x + inset, iy, Math.max(1, itemW), LIST_ITEM_H);
             ctx.fillStyle = COLOR_BTNHILIGHT;
         } else {
             ctx.fillStyle = disabled ? COLOR_GRAYTEXT : (colors?.text ?? COLOR_WINDOWTEXT);
         }
-        ctx.fillText(state.items[idx].text, x + 4, iy + 1);
+        ctx.fillText(state.items[idx].text, x + inset + 2, vcenterTextBaseline(ctx, iy, LIST_ITEM_H));
     }
 
     ctx.restore();
+    ctx.textBaseline = 'top';
 
     if (hasScrollbar) {
-        paintListScrollbar(ctx, x, y, w, h, state.topIndex, maxVisible, state.items.length);
+        paintListScrollbar(ctx, child.handle, x, y, w, h, state.topIndex, maxVisible, state.items.length, inset);
     }
 }
 
@@ -1139,14 +1470,14 @@ function paintListView(
 
     ctx.fillStyle = disabled ? COLOR_BTNFACE : bk;
     ctx.fillRect(x, y, w, h);
-    drawSunkenEdge(ctx, x, y, w, h);
+    drawControlFieldFrame(ctx, child, x, y, w, h);
     if (!state) return;
 
     clampListViewTopIndex(child, state);
     const view = listViewViewStyle(child.style);
     const headerH = listViewHasHeader(child) ? LV_HEADER_H : 0;
     const rowH = listViewRowHeight(child);
-    const inset = 2;
+    const inset = controlClientInset(child);
     const focused = System.getInstance().windowManager.getFocusHwnd() === child.handle;
     const showSel = focused || (child.style & LVS_SHOWSELALWAYS) !== 0;
     const maxVisible = listViewVisibleCount(child);
@@ -1154,11 +1485,14 @@ function paintListView(
     const bodyW = w - inset * 2 - (hasScrollbar ? LV_SCROLLBAR_W : 0);
 
     if (headerH > 0) {
+        // The header spans the whole client width: the vertical scrollbar starts BELOW
+        // it, so stopping at bodyW left the corner above the bar unpainted.
+        const headerW = Math.max(1, w - inset * 2);
         ctx.fillStyle = COLOR_BTNFACE;
-        ctx.fillRect(x + inset, y + inset, Math.max(1, bodyW), headerH);
+        ctx.fillRect(x + inset, y + inset, headerW, headerH);
         ctx.font = getWindowFont(child);
         ctx.textAlign = 'left';
-        ctx.textBaseline = 'middle';
+        ctx.textBaseline = 'alphabetic';
         let colX = x + inset - state.scrollX;
         for (const col of state.columns) {
             const cx = Math.max(0, col.cx);
@@ -1168,15 +1502,22 @@ function paintListView(
             ctx.rect(colX + 2, y + inset, Math.max(1, cx - 4), headerH);
             ctx.clip();
             ctx.fillStyle = COLOR_BTNTEXT;
-            ctx.fillText(col.text, colX + 4, y + inset + headerH / 2);
+            ctx.fillText(col.text, colX + 4, vcenterTextBaseline(ctx, y + inset, headerH));
             ctx.restore();
             colX += cx;
+        }
+        // Columns narrower than the client leave a gap: the header bar runs the full
+        // width as one empty, unlabelled section — never a hole showing the list's
+        // own background.
+        const headerEnd = x + inset + headerW;
+        if (colX < headerEnd) {
+            drawRaisedEdge(ctx, colX, y + inset, headerEnd - colX, headerH);
         }
     }
 
     ctx.font = getWindowFont(child);
     ctx.textAlign = 'left';
-    ctx.textBaseline = 'middle';
+    ctx.textBaseline = 'alphabetic';
 
     const bodyTop = y + inset + headerH;
     const bodyH = Math.max(1, h - inset * 2 - headerH);
@@ -1223,9 +1564,9 @@ function paintListView(
             let textX = x + inset + LV_TEXT_INSET - (view === LVS_REPORT ? state.scrollX : 0);
             if (iconSize > 0 && (state.himlSmall || state.himlNormal || item.iImage >= 0)) {
                 const iconY = iy + Math.max(0, (rowH - iconSize) / 2);
-                ctx.fillStyle = selected ? COLOR_HIGHLIGHTTEXT : '#808080';
+                ctx.fillStyle = selected ? COLOR_HIGHLIGHTTEXT : COLOR_BTNSHADOW;
                 ctx.fillRect(textX, iconY, iconSize, iconSize);
-                ctx.strokeStyle = selected ? COLOR_HIGHLIGHTTEXT : '#404040';
+                ctx.strokeStyle = selected ? COLOR_HIGHLIGHTTEXT : COLOR_BTNDKSHADOW;
                 ctx.strokeRect(textX + 0.5, iconY + 0.5, iconSize - 1, iconSize - 1);
                 textX += iconSize + 4;
             }
@@ -1241,12 +1582,12 @@ function paintListView(
                     ctx.beginPath();
                     ctx.rect(colX + 1, iy, Math.max(1, cx - 2), rowH);
                     ctx.clip();
-                    ctx.fillText(label, tx, iy + rowH / 2);
+                    ctx.fillText(label, tx, vcenterTextBaseline(ctx, iy, rowH));
                     ctx.restore();
                     colX += cx;
                 }
             } else {
-                ctx.fillText(item.text, textX, iy + rowH / 2);
+                ctx.fillText(item.text, textX, vcenterTextBaseline(ctx, iy, rowH));
             }
 
             if ((item.state & LVIS_FOCUSED) && focused) {
@@ -1260,11 +1601,12 @@ function paintListView(
     }
 
     ctx.restore();
+    ctx.textBaseline = 'top';
 
     if (hasScrollbar) {
         paintListScrollbar(
-            ctx, x, y + headerH, w, h - headerH,
-            state.topIndex, maxVisible, state.items.length,
+            ctx, child.handle, x, y + headerH, w, h - headerH,
+            state.topIndex, maxVisible, state.items.length, inset,
         );
     }
 }
@@ -1284,64 +1626,31 @@ function paintListViewItemChrome(
         ctx.fillStyle = COLOR_HIGHLIGHT;
         ctx.fillRect(ix - 2, iy - 2, icon + 4, icon + 4);
     }
-    ctx.fillStyle = selected ? COLOR_HIGHLIGHTTEXT : '#808080';
+    ctx.fillStyle = selected ? COLOR_HIGHLIGHTTEXT : COLOR_BTNSHADOW;
     ctx.fillRect(ix, iy, icon, icon);
-    ctx.strokeStyle = '#404040';
+    ctx.strokeStyle = COLOR_BTNDKSHADOW;
     ctx.strokeRect(ix + 0.5, iy + 0.5, icon - 1, icon - 1);
 
     ctx.fillStyle = disabled ? COLOR_GRAYTEXT : (selected ? COLOR_HIGHLIGHTTEXT : textColor);
     ctx.textAlign = 'center';
-    ctx.fillText(item.text, x + w / 2, iy + icon + 10);
+    ctx.fillText(item.text, x + w / 2, topTextBaseline(ctx, iy + icon + 8));
     ctx.textAlign = 'left';
 }
 
-/** Classic vertical scrollbar (up/down arrows + proportional thumb) inside a listbox. */
+/** Vertical scrollbar inside a listbox/listview/rich edit client, at its right edge. */
 function paintListScrollbar(
     ctx: OffscreenCanvasRenderingContext2D,
+    hwnd: number,
     x: number, y: number, w: number, h: number,
     topIndex: number, visibleCount: number, itemCount: number,
+    inset: number = LIST_INSET,
 ): void {
-    const sbX = x + w - LIST_INSET - LIST_SCROLLBAR_W;
-    const sbY = y + LIST_INSET;
-    const sbH = h - LIST_INSET * 2;
-    const arrow = Math.min(14, Math.floor(sbH / 2));
-
-    ctx.fillStyle = '#E8E8E8';
-    ctx.fillRect(sbX, sbY, LIST_SCROLLBAR_W, sbH);
-
-    // Arrow buttons
-    ctx.fillStyle = COLOR_BTNFACE;
-    ctx.fillRect(sbX, sbY, LIST_SCROLLBAR_W, arrow);
-    drawRaisedEdge(ctx, sbX, sbY, LIST_SCROLLBAR_W, arrow);
-    ctx.fillRect(sbX, sbY + sbH - arrow, LIST_SCROLLBAR_W, arrow);
-    drawRaisedEdge(ctx, sbX, sbY + sbH - arrow, LIST_SCROLLBAR_W, arrow);
-
-    const cx = sbX + LIST_SCROLLBAR_W / 2;
-    ctx.fillStyle = COLOR_BTNTEXT;
-    ctx.beginPath();
-    ctx.moveTo(cx, sbY + 4);
-    ctx.lineTo(cx - 3, sbY + arrow - 5);
-    ctx.lineTo(cx + 3, sbY + arrow - 5);
-    ctx.closePath();
-    ctx.fill();
-    ctx.beginPath();
-    ctx.moveTo(cx, sbY + sbH - 4);
-    ctx.lineTo(cx - 3, sbY + sbH - arrow + 5);
-    ctx.lineTo(cx + 3, sbY + sbH - arrow + 5);
-    ctx.closePath();
-    ctx.fill();
-
-    // Proportional thumb
-    const trackTop = sbY + arrow;
-    const trackH = Math.max(0, sbH - arrow * 2);
-    if (trackH > 6 && itemCount > visibleCount) {
-        const thumbH = Math.max(8, Math.floor(trackH * visibleCount / itemCount));
-        const maxTop = itemCount - visibleCount;
-        const thumbY = trackTop + Math.floor((trackH - thumbH) * Math.min(1, topIndex / maxTop));
-        ctx.fillStyle = COLOR_BTNFACE;
-        ctx.fillRect(sbX + 1, thumbY, LIST_SCROLLBAR_W - 2, thumbH);
-        drawRaisedEdge(ctx, sbX + 1, thumbY, LIST_SCROLLBAR_W - 2, thumbH);
-    }
+    const bar = listBarRect(x, y, w, h, inset);
+    paintScrollBarRect(ctx, bar.x, bar.y, bar.w, bar.h, {
+        vertical: true,
+        ...listScrollRange(topIndex, visibleCount, itemCount),
+        pressed: scrollFeedbackFor(hwnd, SB_VERT).pressed,
+    });
 }
 
 /** Trackbar (msctls_trackbar32): channel + thumb + tick marks, horizontal or vertical. */
@@ -1359,43 +1668,83 @@ function paintTrackbar(
     const TBS_VERT = 0x0002;
     const vertical = (child.style & TBS_VERT) !== 0 || h > w * 2;
 
+    // comctl32 geometry (trackbar.c TRACKBAR_CalcChannel/CalcThumb) from uThumbLen:
+    // the channel is 4px thick, inset uThumbLen/4 + 3 from both ends and offset
+    // uThumbLen/2 - 1 from the near edge; the thumb is (uThumbLen/2)|1 across, sits
+    // 2px in, and is a POINTER, not a rectangle — the tick side tapers to a point.
+    const thumbLen = 23;
+    const thumbBreadth = (thumbLen >> 1) | 1;
+    const offsetEdge = (thumbLen >> 2) + 3;
+    const channelOff = (thumbLen >> 1) - 1;
+    const point = thumbBreadth >> 1;
+    const body = thumbLen - 1 - point;
+    const span = Math.max(1, (vertical ? h : w) - offsetEdge * 2);
+    const travel = Math.max(0, span - thumbBreadth);
+    const near = (vertical ? y : x) + offsetEdge;
+    const pos = near + Math.round(travel * frac);
+
     if (vertical) {
-        const cx = x + Math.floor(w / 2);
-        const margin = 8;
-        const trackH = Math.max(1, h - margin * 2);
+        const cx = x + channelOff;
         ctx.fillStyle = COLOR_WINDOW;
-        ctx.fillRect(cx - 2, y + margin, 4, trackH);
-        drawSunkenEdge(ctx, cx - 2, y + margin, 4, trackH);
-
-        const thumbH = 10;
-        const thumbW = Math.max(8, Math.min(20, w - 4));
-        const ty = y + margin + Math.floor((trackH - thumbH) * frac);
-        ctx.fillStyle = COLOR_BTNFACE;
-        ctx.fillRect(cx - thumbW / 2, ty, thumbW, thumbH);
-        drawRaisedEdge(ctx, Math.floor(cx - thumbW / 2), ty, thumbW, thumbH);
+        ctx.fillRect(cx, y + offsetEdge, 4, span);
+        drawSunkenEdge(ctx, cx, y + offsetEdge, 4, span);
+        drawTrackbarThumb(ctx, x + 2, pos, body, thumbBreadth, point, false);
     } else {
-        const cy = y + Math.floor(h / 2);
-        const margin = 8;
-        const trackW = Math.max(1, w - margin * 2);
+        const cy = y + channelOff;
         ctx.fillStyle = COLOR_WINDOW;
-        ctx.fillRect(x + margin, cy - 2, trackW, 4);
-        drawSunkenEdge(ctx, x + margin, cy - 2, trackW, 4);
+        ctx.fillRect(x + offsetEdge, cy, span, 4);
+        drawSunkenEdge(ctx, x + offsetEdge, cy, span, 4);
 
-        // Tick marks below the channel
         if (state.ticFreq > 0 && range / state.ticFreq <= 50) {
             ctx.fillStyle = COLOR_BTNSHADOW;
             for (let v = state.min; v <= state.max; v += state.ticFreq) {
-                const tx = x + margin + Math.floor(trackW * (v - state.min) / range);
-                ctx.fillRect(tx, cy + 6, 1, 3);
+                const tx = near + Math.round(travel * (v - state.min) / range) + (thumbBreadth >> 1);
+                ctx.fillRect(tx, y + 2 + thumbLen, 1, 3);
             }
         }
 
-        const thumbW = 10;
-        const thumbH = Math.max(12, Math.min(20, h - 4));
-        const tx = x + margin + Math.floor((trackW - thumbW) * frac);
-        ctx.fillStyle = COLOR_BTNFACE;
-        ctx.fillRect(tx, cy - Math.floor(thumbH / 2), thumbW, thumbH);
-        drawRaisedEdge(ctx, tx, cy - Math.floor(thumbH / 2), thumbW, thumbH);
+        drawTrackbarThumb(ctx, pos, y + 2, body, thumbBreadth, point, true);
+    }
+}
+
+/**
+ * The pointer thumb: a raised body with no bottom edge, then `point` rows that
+ * step both bevels inward one pixel at a time until they meet at the tip.
+ */
+function drawTrackbarThumb(
+    ctx: OffscreenCanvasRenderingContext2D,
+    x: number,
+    y: number,
+    body: number,
+    breadth: number,
+    point: number,
+    horizontal: boolean,
+): void {
+    const put = (a: number, b: number, len: number, color: string) => {
+        ctx.fillStyle = color;
+        if (horizontal) ctx.fillRect(x + a, y + b, len, 1);
+        else ctx.fillRect(x + b, y + a, 1, len);
+    };
+
+    put(0, 0, breadth, COLOR_BTNFACE);
+    for (let i = 1; i < body; i++) put(0, i, breadth, COLOR_BTNFACE);
+    put(0, 0, breadth - 1, COLOR_BTNHILIGHT);
+    for (let i = 1; i < body; i++) put(0, i, 1, COLOR_BTNHILIGHT);
+    put(1, 1, breadth - 2, COLOR_BTNINNERHI);
+    for (let i = 2; i < body; i++) put(1, i, 1, COLOR_BTNINNERHI);
+    for (let i = 1; i < body; i++) put(breadth - 2, i, 1, COLOR_BTNSHADOW);
+    for (let i = 0; i < body; i++) put(breadth - 1, i, 1, COLOR_BTNDKSHADOW);
+
+    for (let k = 0; k < point; k++) {
+        const lo = k + 1;
+        const hi = breadth - 2 - k;
+        if (lo > hi) break;
+        const row = body + k;
+        put(lo, row, hi - lo + 1, COLOR_BTNFACE);
+        put(lo, row, 1, COLOR_BTNHILIGHT);
+        if (lo + 1 < hi) put(lo + 1, row, 1, COLOR_BTNINNERHI);
+        if (hi - 1 > lo) put(hi - 1, row, 1, COLOR_BTNSHADOW);
+        put(hi, row, 1, COLOR_BTNDKSHADOW);
     }
 }
 
@@ -1416,10 +1765,23 @@ function paintProgressBar(
     ctx.fillRect(x, y, w, h);
     drawSunkenEdge(ctx, x, y, w, h);
 
+    const barH = Math.max(1, h - 4);
     const fillW = Math.floor((w - 4) * frac);
-    if (fillW > 0) {
-        ctx.fillStyle = '#000080';
-        ctx.fillRect(x + 2, y + 2, fillW, Math.max(1, h - 4));
+    if (fillW <= 0) return;
+
+    ctx.fillStyle = COLOR_HIGHLIGHT;
+    const PBS_SMOOTH = 0x01;
+    if ((child.style & PBS_SMOOTH) !== 0) {
+        ctx.fillRect(x + 2, y + 2, fillW, barH);
+        return;
+    }
+
+    // Classic (non-PBS_SMOOTH) comctl32 draws the fill as discrete LEDs sized from the
+    // bar height, not one solid rectangle; a partial trailing chunk is never drawn.
+    const chunkW = Math.max(2, Math.floor((barH * 2) / 3));
+    const pitch = chunkW + 2;
+    for (let cx = 0; cx + chunkW <= fillW; cx += pitch) {
+        ctx.fillRect(x + 2 + cx, y + 2, chunkW, barH);
     }
 }
 
@@ -1431,64 +1793,25 @@ function paintScrollBar(
     w: number,
     h: number,
 ): void {
+    // SBS_VERT decides orientation; a bar with neither style set is horizontal, so the
+    // aspect ratio only breaks the tie for controls created without an explicit style.
     const vertical = ((child.style & SBS_VERT) !== 0) || h > w;
-    const arrow = Math.max(12, Math.min(16, vertical ? w : h));
+    const sb = getScrollBarState(child.handle, SB_CTL);
+    const feedback = scrollFeedbackFor(child.handle, SB_CTL);
 
-    ctx.fillStyle = COLOR_BTNFACE;
-    ctx.fillRect(x, y, w, h);
-    drawSunkenEdge(ctx, x, y, w, h);
-
-    if (vertical) {
-        const trackTop = y + arrow;
-        const trackBottom = y + h - arrow;
-        const thumbH = Math.max(10, Math.floor((trackBottom - trackTop) * 0.35));
-        const thumbY = trackTop + Math.max(0, Math.floor((trackBottom - trackTop - thumbH) / 2));
-
-        drawRaisedEdge(ctx, x + 1, y + 1, w - 2, arrow - 1);
-        drawRaisedEdge(ctx, x + 1, y + h - arrow, w - 2, arrow - 1);
-        drawRaisedEdge(ctx, x + 2, thumbY, Math.max(4, w - 4), thumbH);
-
-        const cx = x + w / 2;
-        ctx.fillStyle = COLOR_BTNTEXT;
-        ctx.beginPath();
-        ctx.moveTo(cx, y + 4);
-        ctx.lineTo(cx - 4, y + arrow - 4);
-        ctx.lineTo(cx + 4, y + arrow - 4);
-        ctx.closePath();
-        ctx.fill();
-
-        ctx.beginPath();
-        ctx.moveTo(cx, y + h - 4);
-        ctx.lineTo(cx - 4, y + h - arrow + 4);
-        ctx.lineTo(cx + 4, y + h - arrow + 4);
-        ctx.closePath();
-        ctx.fill();
-    } else {
-        const trackLeft = x + arrow;
-        const trackRight = x + w - arrow;
-        const thumbW = Math.max(10, Math.floor((trackRight - trackLeft) * 0.35));
-        const thumbX = trackLeft + Math.max(0, Math.floor((trackRight - trackLeft - thumbW) / 2));
-
-        drawRaisedEdge(ctx, x + 1, y + 1, arrow - 1, h - 2);
-        drawRaisedEdge(ctx, x + w - arrow, y + 1, arrow - 1, h - 2);
-        drawRaisedEdge(ctx, thumbX, y + 2, thumbW, Math.max(4, h - 4));
-
-        const cy = y + h / 2;
-        ctx.fillStyle = COLOR_BTNTEXT;
-        ctx.beginPath();
-        ctx.moveTo(x + 4, cy);
-        ctx.lineTo(x + arrow - 4, cy - 4);
-        ctx.lineTo(x + arrow - 4, cy + 4);
-        ctx.closePath();
-        ctx.fill();
-
-        ctx.beginPath();
-        ctx.moveTo(x + w - 4, cy);
-        ctx.lineTo(x + w - arrow + 4, cy - 4);
-        ctx.lineTo(x + w - arrow + 4, cy + 4);
-        ctx.closePath();
-        ctx.fill();
-    }
+    paintScrollBarRect(ctx, x, y, w, h, {
+        vertical,
+        min: sb.min,
+        max: sb.max,
+        page: sb.page,
+        // While the thumb is dragged the bar follows the cursor, not the committed
+        // position: the owner only moves that when it answers WM_VSCROLL, and some
+        // never do until the drag ends.
+        pos: feedback.trackPos ?? sb.pos,
+        upEnabled: sb.enabled && sb.upEnabled,
+        downEnabled: sb.enabled && sb.downEnabled,
+        pressed: feedback.pressed,
+    });
 }
 
 function paintGenericControl(
@@ -1511,22 +1834,14 @@ function paintGenericControl(
     ctx.fillStyle = isControlDisabled(child) ? COLOR_GRAYTEXT : COLOR_WINDOWTEXT;
     ctx.font = getWindowFont(child);
     ctx.textAlign = 'left';
-    ctx.textBaseline = 'middle';
+    ctx.textBaseline = 'alphabetic';
     ctx.save();
     ctx.beginPath();
     ctx.rect(x + 2, y + 2, Math.max(1, w - 4), Math.max(1, h - 4));
     ctx.clip();
-    fillTextWithMnemonic(ctx, text, x + 4, y + h / 2);
+    fillTextWithMnemonic(ctx, text, x + 4, vcenterTextBaseline(ctx, y, h));
     ctx.restore();
     ctx.textBaseline = 'top';
-}
-
-// Owned-popup restamp hook — dialog-paint.ts registers the Z-order restore that
-// re-stamps modal popups floating above this window (cross-module hook avoids a
-// controls.ts <-> dialog-paint.ts import cycle).
-let ownedPopupRestamper: ((hwnd: number) => void) | null = null;
-export function registerOwnedPopupRestamper(fn: (hwnd: number) => void): void {
-    ownedPopupRestamper = fn;
 }
 
 export function repaintChildControls(parentHwnd: number): void {
@@ -1538,7 +1853,7 @@ export function repaintChildControls(parentHwnd: number): void {
     gdi.releaseDC(hdc);
     // A controls-only repaint of a lower window would overpaint a modal it owns;
     // the flat overlay has no Z-clip, so re-stamp any owned popup back on top.
-    ownedPopupRestamper?.(parentHwnd);
+    restampOwnedPopups(parentHwnd);
 }
 
 /** Hit-test system controls under a parent using parent-client coordinates. */

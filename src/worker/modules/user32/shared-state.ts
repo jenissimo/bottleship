@@ -62,6 +62,10 @@ export interface WindowInfo {
      *  fullscreen). The presenter composites these windows' rects from the GDI overlay
      *  on top of every flip, and mouse routing prefers them. See dialog-overlay.ts. */
     overlayOnFlipScreen?: boolean;
+    /** Screen rect the last full overlay paint of this window covered. The flat overlay
+     *  has no per-window layer, so a paint that covers LESS than the previous one leaves
+     *  the difference behind for good; this is what the next paint erases. */
+    lastOverlayFillBounds?: { x: number; y: number; w: number; h: number };
 }
 
 export function markGuestCustomPaint(hwnd: number): void {
@@ -307,9 +311,12 @@ export function getAbsoluteWindowPosition(win: WindowInfo): { x: number; y: numb
     // Cycle guard: the window tree is a DAG in real Win32, so any cycle (a parent handle that
     // resolves back into the chain — see the desktop-handle collision fixed in window-manager.ts)
     // is our bug; without the guard it spins the worker forever (GetWindowRect → here → ∞).
-    const visited = new Set<number>([win.handle]);
+    // Built lazily: a top-level window never enters the loop, and GetWindowRect calls this
+    // per frame, so the common case must not allocate.
+    let visited: Set<number> | null = null;
     let cur: WindowInfo | undefined = win;
     while (cur && (cur.style & WS_CHILD) !== 0 && cur.parent) {
+        if (visited === null) visited = new Set<number>([win.handle]);
         if (visited.has(cur.parent)) break;
         visited.add(cur.parent);
         const parent = windows.get(cur.parent);
@@ -362,24 +369,44 @@ export function getAncestorClipRect(
 }
 
 /**
- * Screen rects of the visible child WINDOWS that own their own pixels — child dialogs
- * and app-class windows, i.e. everything that paints ITSELF rather than being drawn by
- * us as default control chrome.
+ * Screen rects of the visible descendant WINDOWS that must be punched out of `hwnd`'s
+ * blit to the flat overlay. TWO different concerns share this one list; they are gated
+ * separately below because only the first is GDI's:
  *
- * The complement of getAncestorClipRect. A child window's pixels belong to the CHILD on
- * Windows — a parent's paint cannot reach them, which is what a separate HWND means. Our
- * overlay is one flat canvas with no such ownership, so a parent flushing its whole
- * client rect blits straight over a child dialog that legitimately drew there, and
- * nothing repaints the child afterwards (it is not in the parent's owner-draw chain).
+ *  1. GDI CLIPPING. Win32 removes the children's rectangles from a window's DC only when
+ *     the window has WS_CLIPCHILDREN. WITHOUT that style the parent legitimately paints
+ *     the ground under its children and the children repaint on top afterwards — which is
+ *     how a child whose class brush is NULL (or whose WM_ERASEBKGND paints nothing) shows
+ *     the PARENT's face rather than whatever was on screen before.
  *
- * System controls are deliberately NOT excluded: those we draw ON TOP of the parent's
- * background, so the background must reach under them — a Static with a transparent
- * background shows the dialog face through it.
+ *  2. OVERLAY COMPOSITE ORDERING. Our overlay is one flat canvas with no per-window pixel
+ *     ownership, so the parent's blit physically destroys a child's pixels. That is
+ *     recoverable only for children someone repaints right after the blit; for the rest
+ *     (a hosted child dialog, a video surface) the pixels are simply gone and nothing
+ *     brings them back. Those stay excluded whatever the parent's style says — this is
+ *     OUR limitation, not GDI's clip.
+ *
+ * `opts.repaintedAfterFlush` is how a caller declares which DIRECT children it restamps
+ * once its blit has landed (the EndPaint guest-paint chain); with no predicate every
+ * child is excluded, which is the right answer for a caller that restamps nothing and
+ * for the pure coverage query below.
+ *
+ * System controls are deliberately NOT excluded under either concern: those we draw ON
+ * TOP of the parent's background, so the background must reach under them — a Static
+ * with a transparent background shows the dialog face through it.
  */
+export interface ChildExclusionOptions {
+    /** Direct children the caller repaints on top immediately after its blit lands. */
+    repaintedAfterFlush?: (child: WindowInfo) => boolean;
+}
+
 export function getChildWindowExclusions(
     hwnd: number,
+    opts?: ChildExclusionOptions,
 ): { x: number; y: number; w: number; h: number }[] {
+    const WS_CLIPCHILDREN = 0x02000000;
     const out: { x: number; y: number; w: number; h: number }[] = [];
+    const gdiClipsChildren = ((windows.get(hwnd)?.style ?? 0) & WS_CLIPCHILDREN) !== 0;
     const visited = new Set<number>([hwnd]);
     // DESCENDANTS, not just children: a system control owns no pixels of its own (we
     // draw it), so a paint may reach through one — but the guest-owned windows nested
@@ -395,6 +422,16 @@ export function getChildWindowExclusions(
             if (!child || !child.visible) continue;
             if (child.isSystemControl) { walk(childHwnd); continue; }
             if (child.width <= 0 || child.height <= 0) continue;
+            // Concern 1 + 2 together: drop the hole only when GDI would not have clipped
+            // this child out AND the caller restamps it. Restricted to DIRECT children
+            // because that is the reach of the restamp chain, and refused when the child
+            // hosts guest-owned windows of its OWN — repainting the child does not bring
+            // those back, so the blit would still destroy pixels for good.
+            if (!gdiClipsChildren && parentHwnd === hwnd
+                && opts?.repaintedAfterFlush?.(child)
+                && getChildWindowExclusions(childHwnd).length === 0) {
+                continue;
+            }
             const origin = getAbsoluteWindowPosition(child);
             let rect = { x: origin.x, y: origin.y, w: child.width, h: child.height };
             // Exclude only the pixels the child can ACTUALLY paint: its own paint is clipped
@@ -562,6 +599,8 @@ export interface ListControlState {
     topIndex: number;
     /** Combobox dropdown is open (painted + hit-tested over the dialog). */
     dropdownOpen?: boolean;
+    /** CB_SETITEMHEIGHT / LB_SETITEMHEIGHT override; unset = font-derived. */
+    itemHeight?: number;
 }
 export const listControlStates: Map<number, ListControlState> = new Map();
 

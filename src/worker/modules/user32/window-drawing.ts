@@ -10,10 +10,14 @@ import { loadBitmapFromPeResource } from '../kernel32/bitmap-extractor';
 import { loadIconFromPeResource } from '../kernel32/icon-extractor';
 import { resolveBitmapRgba, resolveIconRgba, resolveDib32RawAlphaRgba } from '../gdi32/bitmap-resolve';
 import { desktopBackground } from '../../runtime/desktop-background';
+import { getSystemColorBrush } from './system';
 import { asArrayBufferView } from '../../../dom-buffer';
 
 const DT_CALCRECT = 0x00000400;
 const DT_SINGLELINE = 0x00000020;
+
+/** Highest COLOR_* index; bounds the sys-color-plus-one pseudo-brush encoding. */
+const COLOR_ENDCOLORS = 24;
 
 /**
  * Shared body of DrawTextA/W and DrawTextEx*: read the RECT, lay the text out, and give
@@ -154,48 +158,41 @@ function composeIconFromBitmaps(
     return null;
 }
 
+/**
+ * A brush value that may be the COLOR_* + 1 pseudo-brush Win32 accepts wherever a
+ * background brush is stored (WNDCLASS.hbrBackground, FillRect) → a real HBRUSH.
+ * Small integers can only be the encoding: no GDI handle we hand out lives there.
+ */
+export function resolveBrushHandle(hbr: number): number {
+    if (hbr === 0) return 0;
+    if (hbr > 0 && hbr <= COLOR_ENDCOLORS + 1) return getSystemColorBrush((hbr - 1) | 0);
+    return hbr;
+}
+
+/**
+ * DefWindowProc's WM_ERASEBKGND: fill `rect` (the update region's bounds) of the window's
+ * client with the class background brush. Returns false when the class has no brush —
+ * Win32 then leaves the pixels alone and DefWindowProc answers 0, which is how a window
+ * that paints its own background (games, custom-drawn frames) avoids a flash.
+ */
+export function eraseWindowBackgroundWithClassBrush(
+    hdc: number,
+    hbrBackground: number,
+    rect: { left: number; top: number; right: number; bottom: number },
+): boolean {
+    const brush = resolveBrushHandle(hbrBackground >>> 0);
+    if (!brush) return false;
+    const gdi = System.getInstance().gdiContext;
+    if (!gdi.getDC(hdc)) return false;
+    const previous = gdi.selectObject(hdc, brush);
+    const filled = gdi.fillRect(hdc, rect.left, rect.top, rect.right, rect.bottom);
+    if (previous) gdi.selectObject(hdc, previous);
+    return filled;
+}
+
 export function registerWindowDrawingExports(exports: Record<string, ThunkImplementation>): void {
     let desktopBrush = 0;
     let desktopBrushColorRef = 0;
-
-    // COLOR_* → COLORREF (0x00BBGGRR), aligned with user32/system.ts defaults.
-    const systemColors: Record<number, number> = {
-        0: 0x00C0C0C0,  // COLOR_SCROLLBAR
-        1: 0x00C0DCC0,  // COLOR_BACKGROUND
-        5: 0x00000080,  // COLOR_WINDOW
-        15: 0x00C0C0C0, // COLOR_BTNFACE
-        16: 0x00808080, // COLOR_BTNSHADOW
-    };
-    const systemBrushCache = new Map<number, number>();
-
-    function getSysColor(colorIndex: number): number {
-        return systemColors[colorIndex] ?? 0x00FFFFFF;
-    }
-
-    function resolveBrushHandle(hbr: number): number {
-        if (hbr === 0) return 0;
-
-        // Win32 FillRect accepts COLOR_* + 1 pseudo-brush values.
-        let colorIndex: number | null = null;
-        if (hbr > 0 && hbr <= 0x1F) {
-            colorIndex = (hbr - 1) | 0;
-        } else if (hbr >= 0x1000 && hbr <= 0x101F) {
-            // Compatibility with our current GetSysColorBrush stub handles.
-            colorIndex = (hbr - 0x1000) | 0;
-        }
-
-        if (colorIndex === null) return hbr;
-
-        const cached = systemBrushCache.get(colorIndex);
-        if (cached) return cached;
-
-        const brush = System.getInstance().gdiContext.createSolidBrush(getSysColor(colorIndex));
-        if (brush) {
-            systemBrushCache.set(colorIndex, brush);
-            return brush;
-        }
-        return hbr;
-    }
 
     exports['EqualRect'] = (ctx, mem, args) => {
         const lprc1 = args[0];

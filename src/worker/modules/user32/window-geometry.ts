@@ -8,9 +8,12 @@ import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { Mem } from '../../core/memory/mem-accessor';
-import { WindowInfo, windows, getAbsoluteWindowPosition } from './shared-state';
+import { isValidAddress } from '../../core/memory/address-guard';
+import { WindowInfo, windows, getAbsoluteWindowPosition, getVirtualScreenRect } from './shared-state';
+import { DESKTOP_HWND } from '../../runtime/windowing/window-manager';
 import { invalidateWindow } from './paint-region';
 import { repaintDialogOverlayIfVisible } from './dialog-paint';
+import { applyComboBoxClosedHeight } from './controls';
 
 /** Callbacks back into window.ts (avoids an import cycle). */
 export interface WindowGeometryHost {
@@ -67,6 +70,51 @@ function writeRect(address: number, left: number, top: number, right: number, bo
         writeInt32(address + 8, right) &&
         writeInt32(address + 12, bottom)
     );
+}
+
+/**
+ * Hoisted guest view, rebuilt only when the backing buffer identity changes.
+ *
+ * The rect queries below are per-frame calls (a game re-reads its window/client
+ * rect every frame), so both a `new DataView` per call and the byte-at-a-time
+ * `Mem.write*` path are the wrong shape: guest memory is v86's Proxy, where a
+ * per-byte store is an order of magnitude more expensive than a view write.
+ * §3.1's sanctioned form applies — validate the WHOLE extent once at the
+ * boundary (isValidAddress), then do the work through a hoisted view.
+ */
+let cachedGuestView: DataView | null = null;
+let cachedGuestBuffer: ArrayBufferLike | null = null;
+let cachedGuestOffset = -1;
+let cachedGuestLength = -1;
+
+function guestView(mem: Uint8Array): DataView {
+    if (
+        cachedGuestView === null ||
+        cachedGuestBuffer !== mem.buffer ||
+        cachedGuestOffset !== mem.byteOffset ||
+        cachedGuestLength !== mem.byteLength
+    ) {
+        cachedGuestView = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        cachedGuestBuffer = mem.buffer;
+        cachedGuestOffset = mem.byteOffset;
+        cachedGuestLength = mem.byteLength;
+    }
+    return cachedGuestView;
+}
+
+/** Validate a guest RECT out-param and write it through the hoisted view. */
+function writeRectChecked(
+    mem: Uint8Array,
+    address: number,
+    left: number, top: number, right: number, bottom: number,
+): boolean {
+    if (!isValidAddress(mem, address, 16, 'rw')) return false;
+    const view = guestView(mem);
+    view.setInt32(address, left, true);
+    view.setInt32(address + 4, top, true);
+    view.setInt32(address + 8, right, true);
+    view.setInt32(address + 12, bottom, true);
+    return true;
 }
 
 function adjustWindowRectCore(mem: Uint8Array, lpRect: number, dwStyle: number, bMenu: number, dwExStyle: number): number {
@@ -263,6 +311,10 @@ export function registerWindowGeometryExports(
         }
         window.width = clientW;
         window.height = clientH;
+        // The combobox class proc answers a size change by shrinking back to its closed
+        // height, so a MoveWindow that budgets room for the dropped list must not leave
+        // a full-height sunken box behind (see applyComboBoxClosedHeight).
+        applyComboBoxClosedHeight(window);
 
         const wmWin = System.getInstance().windowManager.getWindow(hWnd);
         if (wmWin) {
@@ -285,22 +337,31 @@ export function registerWindowGeometryExports(
         }
     }
 
+    /**
+     * The desktop window is a real window on Windows and is how a great many programs read
+     * the screen size (GetDesktopWindow → GetWindowRect). It has no entry in `windows`, so
+     * without this both rect calls returned FALSE and left the caller's RECT untouched —
+     * i.e. stack garbage read as a resolution ("Cannot find 6016347x4x32 video mode").
+     * Both rects are the virtual screen: the desktop's client area has no non-client frame.
+     */
+    function writeDesktopRect(mem: Uint8Array, lpRect: number, screenCoords: boolean): number {
+        const screen = getVirtualScreenRect();
+        const ok = screenCoords
+            ? writeRectChecked(mem, lpRect, screen.left, screen.top, screen.right, screen.bottom)
+            : writeRectChecked(mem, lpRect, 0, 0, screen.right - screen.left, screen.bottom - screen.top);
+        return ok ? 1 : 0;
+    }
+
     exports['GetClientRect'] = (ctx, mem, args) => {
         const hWnd = args[0];
         const lpRect = args[1];
 
-        Logger.verbose(LogCategory.USER32, `GetClientRect(0x${hWnd.toString(16)}, 0x${lpRect.toString(16)})`);
-
         if (lpRect) {
+            if (hWnd === DESKTOP_HWND) return writeDesktopRect(mem, lpRect, false);
             const window = windows.get(hWnd);
-            if (window) {
-                const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-                view.setInt32(lpRect, 0, true);      // left
-                view.setInt32(lpRect + 4, 0, true);  // top
-                view.setInt32(lpRect + 8, window.width, true);  // right
-                view.setInt32(lpRect + 12, window.height, true); // bottom
-                Logger.verbose(LogCategory.USER32, `GetClientRect(0x${hWnd.toString(16)}) -> (0, 0, ${window.width}, ${window.height})`);
-
+            if (window && writeRectChecked(mem, lpRect, 0, 0, window.width, window.height)) {
+                Logger.verboseLazy(LogCategory.USER32, () =>
+                    `GetClientRect(0x${hWnd.toString(16)}) -> (0, 0, ${window.width}, ${window.height})`);
                 return 1; // TRUE
             }
         }
@@ -312,10 +373,8 @@ export function registerWindowGeometryExports(
         const hWnd = args[0];
         const lpRect = args[1];
 
-        Logger.verbose(LogCategory.USER32, `GetWindowRect(0x${hWnd.toString(16)}, 0x${lpRect.toString(16)})`);
-
         if (lpRect) {
-
+            if (hWnd === DESKTOP_HWND) return writeDesktopRect(mem, lpRect, true);
             const window = windows.get(hWnd);
             if (window) {
                 // GetWindowRect returns SCREEN coordinates (Win32 contract). For a child
@@ -324,13 +383,13 @@ export function registerWindowGeometryExports(
                 // common GetWindowRect → ScreenToClient → MoveWindow re-centering idiom
                 // subtract the parent offset twice, shifting child controls off-position.
                 const { x: absX, y: absY } = getAbsoluteWindowPosition(window);
-                const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-                view.setInt32(lpRect, absX, true);                    // left
-                view.setInt32(lpRect + 4, absY, true);                // top
-                view.setInt32(lpRect + 8, absX + window.width, true);  // right
-                view.setInt32(lpRect + 12, absY + window.height, true); // bottom
-
-                return 1; // TRUE
+                if (writeRectChecked(mem, lpRect,
+                    absX, absY, absX + window.width, absY + window.height)) {
+                    Logger.verboseLazy(LogCategory.USER32, () =>
+                        `GetWindowRect(0x${hWnd.toString(16)}) -> ` +
+                        `(${absX}, ${absY}, ${absX + window.width}, ${absY + window.height})`);
+                    return 1; // TRUE
+                }
             }
         }
 

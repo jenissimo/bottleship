@@ -11,15 +11,21 @@ import { Mem } from '../../core/memory/mem-accessor';
 import { WindowInfo, windows, registerControlStatePurger } from './shared-state';
 import { getClipboardText, setClipboardText } from './clipboard-text';
 import { readAnsiOrWideFromGuest, encodeAnsi } from '../codepage-utils';
+import { SB_WIDTH } from './scrollbar-paint';
+import { textCellHeight } from '../win32-text';
 
 // ES_* styles
 const ES_MULTILINE = 0x0004;
 const ES_UPPERCASE = 0x0008;
 const ES_LOWERCASE = 0x0010;
 const ES_PASSWORD = 0x0020;
+const ES_AUTOVSCROLL = 0x0040;
+const ES_AUTOHSCROLL = 0x0080;
 const ES_READONLY = 0x0800;
 const ES_WANTRETURN = 0x1000;
 const ES_NUMBER = 0x2000;
+const WS_HSCROLL = 0x00100000;
+const WS_VSCROLL = 0x00200000;
 const WS_DISABLED = 0x08000000;
 
 // EM_* messages
@@ -41,6 +47,7 @@ const EM_GETFIRSTVISIBLELINE = 0x00CE;
 const EM_SETREADONLY = 0x00CF;
 const EM_SETPASSWORDCHAR = 0x00CC;
 const EM_GETPASSWORDCHAR = 0x00D2;
+const EM_LINESCROLL = 0x00B6;
 const EM_GETLIMITTEXT = 0x00D5;
 
 const WM_SETTEXT = 0x000C;
@@ -61,6 +68,10 @@ const VK_END = 0x23;
 const VK_HOME = 0x24;
 const VK_LEFT = 0x25;
 const VK_RIGHT = 0x27;
+const VK_PRIOR = 0x21;
+const VK_NEXT = 0x22;
+const VK_UP = 0x26;
+const VK_DOWN = 0x28;
 const VK_DELETE = 0x2E;
 
 // EN_* notification codes
@@ -80,8 +91,14 @@ interface EditState {
     limit: number;
     modified: boolean;
     passwordChar: number;
-    /** Single-line horizontal scroll, in pixels of text hidden left of the inset. */
+    /** Horizontal scroll, in pixels of text hidden left of the inset. Always 0 on a
+     *  wrapping multiline edit, which has nothing to the left or right of its box. */
     scrollX: number;
+    /** Multiline: first visible LAID-OUT line (EM_LINESCROLL / EM_GETFIRSTVISIBLELINE). */
+    scrollTop: number;
+    /** Memo of the last line layout; the key covers every input it depends on. */
+    lineCacheKey: string;
+    lineCache: EditLine[];
     /** Single-level undo (Wine edit.c model): the text deleted at undoPos plus the
      *  number of chars inserted there. Undo re-selects the insertion and puts the
      *  deletion back, which rebuilds the inverse record — so undo is its own redo. */
@@ -113,6 +130,9 @@ function getOrCreateEditState(child: WindowInfo): EditState {
             // only EM_SETPASSWORDCHAR changes it afterwards, a later style change does not.
             passwordChar: (child.style & ES_PASSWORD) !== 0 ? 0x2A /* '*' */ : 0,
             scrollX: 0,
+            scrollTop: 0,
+            lineCacheKey: '',
+            lineCache: [],
             undoText: '',
             undoPos: 0,
             undoInsertCount: 0,
@@ -125,6 +145,7 @@ function getOrCreateEditState(child: WindowInfo): EditState {
 /** Caret/selection/password/scroll info for the painter (controls.ts). */
 export function getEditVisualState(child: WindowInfo): {
     selStart: number; selEnd: number; focused: boolean; passwordChar: number; scrollX: number;
+    scrollTop: number;
 } {
     const state = getOrCreateEditState(child);
     const len = child.title.length;
@@ -133,7 +154,12 @@ export function getEditVisualState(child: WindowInfo): {
         selEnd: Math.min(state.selEnd, len),
         focused: System.getInstance().windowManager.getFocusHwnd() === child.handle,
         passwordChar: state.passwordChar,
-        scrollX: state.scrollX,
+        // Clamped on read for the same reason scrollTop is: the text can shrink under
+        // a scroll position set while it was longer.
+        scrollX: clampScrollX(child, state.scrollX),
+        // Clamped on read: the text (and so the line count) can shrink under a
+        // scroll position the guest set earlier.
+        scrollTop: (child.style & ES_MULTILINE) !== 0 ? clampScrollTop(child, state.scrollTop) : 0,
     };
 }
 
@@ -168,9 +194,241 @@ function displayText(child: WindowInfo, state: EditState): string {
         : child.title;
 }
 
-/** Place the caret at the clicked pixel (x relative to the control); clears selection. */
-export function setEditCaretFromPoint(child: WindowInfo, localX: number): void {
+// ---------------------------------------------------------------------------
+// Multiline layout
+//
+// A multiline EDIT's "line" is the LAID-OUT line, not the paragraph: with word
+// wrap on, EM_GETLINECOUNT/EM_LINEINDEX/EM_LINELENGTH/EM_GETLINE and the scroll
+// position all count wrapped lines. That is why layout lives here and not in the
+// painter — the messages and the pixels have to agree, or a guest that scrolls by
+// EM_LINESCROLL moves the text by a different amount than it asked for.
+// ---------------------------------------------------------------------------
+
+/**
+ * Height of one laid-out line: the font's TEXT CELL (tmHeight), which is what GDI
+ * advances a line by and what the painter stamps. A constant here counted a line
+ * taller than the painter drew, so an edit reported one visible line fewer than it
+ * showed — and paged by that wrong number.
+ */
+export function editLineHeight(child: WindowInfo): number {
+    const ctx = getMeasureCtx(child);
+    return ctx ? textCellHeight(ctx) : EDIT_LINE_HEIGHT_FALLBACK;
+}
+
+/** Classic UI font cell, for a host with no canvas to measure on. */
+const EDIT_LINE_HEIGHT_FALLBACK = 13;
+
+export interface EditLine {
+    text: string;
+    /** Char offset of the line's first character in child.title. */
+    start: number;
+}
+
+/** Win32 wraps a multiline edit unless the app asked for horizontal scrolling. */
+function editWraps(child: WindowInfo): boolean {
+    return (child.style & ES_MULTILINE) !== 0
+        && (child.style & (ES_AUTOHSCROLL | WS_HSCROLL)) === 0;
+}
+
+/** Width the text is laid out in: client minus the insets and the vertical bar. */
+export function editTextWidth(child: WindowInfo): number {
+    const bar = (child.style & WS_VSCROLL) !== 0 ? SB_WIDTH : 0;
+    return Math.max(1, child.width - EDIT_TEXT_INSET * 2 - bar);
+}
+
+/** Lines that fit in the client area — the vertical page size (SCROLLINFO.nPage). */
+export function editVisibleLineCount(child: WindowInfo): number {
+    const bar = (child.style & WS_HSCROLL) !== 0 ? SB_WIDTH : 0;
+    const avail = child.height - EDIT_TEXT_INSET * 2 - bar;
+    return Math.max(1, Math.floor(avail / editLineHeight(child)));
+}
+
+/** Greedy word wrap of one paragraph, breaking inside a word too long to fit. */
+function wrapParagraph(
+    s: string, base: number, maxWidth: number, ctx: OffscreenCanvasRenderingContext2D,
+): EditLine[] {
+    const out: EditLine[] = [];
+    let start = 0;
+    while (start < s.length) {
+        let breakAt = -1; // after the last whitespace run seen on this line
+        let i = start;
+        for (; i < s.length; i++) {
+            if (ctx.measureText(s.slice(start, i + 1)).width > maxWidth) break;
+            if (s[i] === ' ' || s[i] === '\t') breakAt = i + 1;
+        }
+        if (i >= s.length) break; // the rest fits
+        // Break after the last space that still fits; a single over-wide word breaks
+        // mid-word, as the real control does rather than clipping it away.
+        const end = breakAt > start ? breakAt : Math.max(start + 1, i);
+        out.push({ text: s.slice(start, end), start: base + start });
+        start = end;
+    }
+    out.push({ text: s.slice(start), start: base + start });
+    return out;
+}
+
+/** Paragraphs of `text`, split on any of the three separators a guest may have used. */
+function splitParagraphs(text: string): EditLine[] {
+    const out: EditLine[] = [];
+    const re = /\r\n|\n|\r/g;
+    let pos = 0;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) {
+        out.push({ text: text.slice(pos, m.index), start: pos });
+        pos = m.index + m[0].length;
+    }
+    out.push({ text: text.slice(pos), start: pos });
+    return out;
+}
+
+/** The control's laid-out lines. Single-line edits have exactly one. */
+export function editLines(child: WindowInfo): EditLine[] {
+    if ((child.style & ES_MULTILINE) === 0) return [{ text: child.title, start: 0 }];
     const state = getOrCreateEditState(child);
+    const maxWidth = editTextWidth(child);
+    const ctx = editWraps(child) ? getMeasureCtx(child) : null;
+    const key = `${maxWidth}|${ctx?.font ?? ''}|${child.title}`;
+    if (state.lineCacheKey === key) return state.lineCache;
+
+    let lines = splitParagraphs(child.title);
+    if (ctx) {
+        lines = lines.flatMap((p) => (p.text ? wrapParagraph(p.text, p.start, maxWidth, ctx) : [p]));
+    }
+    state.lineCacheKey = key;
+    state.lineCache = lines;
+    return lines;
+}
+
+/** Pixel x of `pos` within its own line — the column a vertical caret move keeps. */
+function caretXInLine(child: WindowInfo, line: EditLine, pos: number): number {
+    const ctx = getMeasureCtx(child);
+    if (!ctx) return 0;
+    return ctx.measureText(line.text.slice(0, Math.max(0, pos - line.start))).width;
+}
+
+/** Char position in `line` nearest to pixel x (the inverse of caretXInLine). */
+function posAtLineX(child: WindowInfo, line: EditLine, targetX: number): number {
+    const ctx = getMeasureCtx(child);
+    const text = line.text;
+    if (!ctx) return line.start + text.length;
+    let i = 0;
+    for (; i < text.length; i++) {
+        const w = ctx.measureText(text.slice(0, i + 1)).width;
+        const wPrev = ctx.measureText(text.slice(0, i)).width;
+        if (targetX < (wPrev + w) / 2) break;
+    }
+    return line.start + i;
+}
+
+/** First visible line, clamped: Win32 lets the LAST line scroll to the top. */
+function clampScrollTop(child: WindowInfo, top: number): number {
+    return clamp(top | 0, 0, Math.max(0, editLines(child).length - 1));
+}
+
+export function setEditScrollTop(child: WindowInfo, line: number): void {
+    getOrCreateEditState(child).scrollTop = clampScrollTop(child, line);
+}
+
+/**
+ * Width of the widest laid-out line, in pixels — the horizontal scroll range's max,
+ * measured in the same unit as scrollX. 0 without a canvas to measure on, which
+ * reads as "nothing to scroll".
+ */
+export function editMaxTextWidth(child: WindowInfo): number {
+    const ctx = getMeasureCtx(child);
+    if (!ctx) return 0;
+    let widest = 0;
+    for (const line of editLines(child)) {
+        widest = Math.max(widest, ctx.measureText(line.text).width);
+    }
+    return widest;
+}
+
+/** One arrow-click of horizontal travel: tmAveCharWidth, as the real control uses. */
+export function editHorizontalLineStep(child: WindowInfo): number {
+    const ctx = getMeasureCtx(child);
+    return Math.max(1, Math.round(ctx ? ctx.measureText('0').width : 7));
+}
+
+/** Pixels of text the client shows at once — the horizontal page size (nPage). */
+export function editHorizontalPage(child: WindowInfo): number {
+    return editTextWidth(child);
+}
+
+/** A wrapping edit has no horizontal range; everything else clamps to what overflows. */
+function clampScrollX(child: WindowInfo, px: number): number {
+    // A single-line edit's offset is owned by ensureCaretVisible, which measures the
+    // DISPLAYED text (a password field's mask is not its title).
+    if ((child.style & ES_MULTILINE) === 0) return Math.max(0, px);
+    if (editWraps(child)) return 0;
+    const overflow = Math.max(0, editMaxTextWidth(child) - editHorizontalPage(child));
+    return clamp(Math.round(px), 0, overflow);
+}
+
+/** WM_HSCROLL / the horizontal bar's thumb, in pixels of text. */
+export function setEditScrollX(child: WindowInfo, px: number): void {
+    getOrCreateEditState(child).scrollX = clampScrollX(child, px);
+}
+
+/**
+ * SCROLLINFO for the horizontal bar, in pixels of text. One definition for the
+ * painter and the hit test, so the thumb cannot land where a drag does not.
+ */
+export function editHorizontalScrollRange(child: WindowInfo): {
+    min: number; max: number; page: number; pos: number;
+} {
+    const page = editHorizontalPage(child);
+    const width = editMaxTextWidth(child);
+    const state = getOrCreateEditState(child);
+    return {
+        min: 0,
+        // Win32's nMax is inclusive, and a thumb fills the bar when nMax - nMin < nPage.
+        max: Math.max(0, Math.ceil(width) - 1),
+        page,
+        pos: clampScrollX(child, state.scrollX),
+    };
+}
+
+/**
+ * What the control's text layout currently IS — the readout the harness needs to
+ * judge an edit without inferring it from pixels (a wrapped line count and a scroll
+ * position are exactly what a screenshot cannot tell apart from a paint bug).
+ */
+export function describeEditLayout(child: WindowInfo): Record<string, unknown> {
+    const state = getOrCreateEditState(child);
+    const lines = editLines(child);
+    const multiline = (child.style & ES_MULTILINE) !== 0;
+    return {
+        lineCount: lines.length,
+        visibleLines: multiline ? editVisibleLineCount(child) : 1,
+        firstVisibleLine: multiline ? clampScrollTop(child, state.scrollTop) : 0,
+        wraps: editWraps(child),
+        textWidth: editTextWidth(child),
+        selStart: state.selStart,
+        selEnd: state.selEnd,
+        lines: lines.map((l) => l.text),
+    };
+}
+
+/**
+ * Place the caret at the clicked pixel (relative to the control); clears selection.
+ * `localY` picks the line on a multiline edit; without it the click lands on the
+ * first visible line, which is all a single-line edit ever has.
+ */
+export function setEditCaretFromPoint(child: WindowInfo, localX: number, localY?: number): void {
+    const state = getOrCreateEditState(child);
+    if ((child.style & ES_MULTILINE) !== 0) {
+        const lines = editLines(child);
+        const row = localY === undefined
+            ? 0
+            : Math.floor((localY - EDIT_TEXT_INSET) / editLineHeight(child));
+        const line = lines[clamp(clampScrollTop(child, state.scrollTop) + row, 0, lines.length - 1)];
+        const pos = posAtLineX(child, line, localX - EDIT_TEXT_INSET + clampScrollX(child, state.scrollX));
+        state.selStart = pos;
+        state.selEnd = pos;
+        ensureCaretVisible(child, state);
+        return;
+    }
     const text = displayText(child, state);
     const ctx = getMeasureCtx(child);
     let pos = text.length;
@@ -190,13 +448,21 @@ export function setEditCaretFromPoint(child: WindowInfo, localX: number): void {
 }
 
 /**
- * EM_SCROLLCARET for a single-line edit: scroll horizontally so the caret stays in
- * the client rect. Without it a caret past the right edge keeps typing into the clip
- * region and the user sees a frozen box.
+ * EM_SCROLLCARET: scroll the view so the caret stays in the client rect. Without it a
+ * caret past an edge keeps typing outside the clip region and the user sees a frozen
+ * box. Each axis is gated on its own AUTO*SCROLL style, as the real control is.
  */
 function ensureCaretVisible(child: WindowInfo, state: EditState): void {
     if ((child.style & ES_MULTILINE) !== 0) {
-        state.scrollX = 0;
+        ensureCaretVisibleHorizontallyMultiline(child, state);
+        // Only ES_AUTOVSCROLL scrolls the view to follow the caret; without it the
+        // control keeps its view and the caret simply walks out of sight.
+        if ((child.style & ES_AUTOVSCROLL) === 0) return;
+        const caretLine = lineFromCharIndex(child, clamp(state.selEnd, 0, child.title.length));
+        const page = editVisibleLineCount(child);
+        if (caretLine < state.scrollTop) state.scrollTop = caretLine;
+        else if (caretLine >= state.scrollTop + page) state.scrollTop = caretLine - page + 1;
+        state.scrollTop = clampScrollTop(child, state.scrollTop);
         return;
     }
     const ctx = getMeasureCtx(child);
@@ -212,6 +478,37 @@ function ensureCaretVisible(child: WindowInfo, state: EditState): void {
     state.scrollX = clamp(state.scrollX, 0, Math.max(0, totalX - avail));
 }
 
+/** The multiline half of ensureCaretVisible: a wrapping edit never scrolls sideways. */
+function ensureCaretVisibleHorizontallyMultiline(child: WindowInfo, state: EditState): void {
+    if (editWraps(child)) {
+        state.scrollX = 0;
+        return;
+    }
+    if ((child.style & ES_AUTOHSCROLL) === 0) {
+        state.scrollX = clampScrollX(child, state.scrollX);
+        return;
+    }
+    const caret = clamp(state.selEnd, 0, child.title.length);
+    const line = editLines(child)[lineFromCharIndex(child, caret)];
+    if (!line) return;
+    const caretX = caretXInLine(child, line, caret);
+    const avail = editHorizontalPage(child);
+    if (caretX - state.scrollX > avail) state.scrollX = caretX - avail;
+    else if (caretX < state.scrollX) state.scrollX = caretX;
+    state.scrollX = clampScrollX(child, state.scrollX);
+}
+
+/** Chars scrolled off the left of a single-line edit — its EM_GETFIRSTVISIBLELINE. */
+function firstVisibleChar(child: WindowInfo, state: EditState): number {
+    if (state.scrollX <= 0) return 0;
+    const ctx = getMeasureCtx(child);
+    if (!ctx) return 0;
+    const text = displayText(child, state);
+    let i = 0;
+    while (i < text.length && ctx.measureText(text.slice(0, i + 1)).width <= state.scrollX) i++;
+    return i;
+}
+
 function clamp(v: number, lo: number, hi: number): number {
     return v < lo ? lo : v > hi ? hi : v;
 }
@@ -219,8 +516,16 @@ function clamp(v: number, lo: number, hi: number): number {
 // Win32 SENDS EN_* from inside the control's own processing, so the parent's handler has
 // run by the time SendMessage returns. We POST: entering a guest wndproc means suspending
 // a thunk, which this synchronous LRESULT sink cannot do.
+/** Set by rich-edit-control: Rich Edit gates EN_* on its event mask, EDIT does not.
+ *  Registered rather than imported so this module stays free of the rich-edit import. */
+let editNotifyFilter: ((child: WindowInfo, code: number) => boolean) | null = null;
+export function registerEditNotifyFilter(fn: (child: WindowInfo, code: number) => boolean): void {
+    editNotifyFilter = fn;
+}
+
 function postEditNotify(child: WindowInfo, code: number): void {
     if (!child.parent) return;
+    if (editNotifyFilter && !editNotifyFilter(child, code)) return;
     const system = System.getInstance();
     const wParam = ((code << 16) | ((child.controlId ?? 0) & 0xFFFF)) >>> 0;
     system.windowManager.postMessage(child.parent, WM_COMMAND, wParam, child.handle);
@@ -345,35 +650,16 @@ function isReadOnly(child: WindowInfo): boolean {
     return (child.style & (ES_READONLY | WS_DISABLED)) !== 0;
 }
 
-function textLines(child: WindowInfo): string[] {
-    return (child.style & ES_MULTILINE) !== 0
-        ? child.title.split(/\r\n|\n|\r/g)
-        : [child.title];
-}
-
-/** Per-line char offsets into child.title, honoring the ACTUAL separator widths
- *  (guest-set text may use lone \n or \r, not just \r\n). */
-function lineStartOffsets(child: WindowInfo): number[] {
-    if ((child.style & ES_MULTILINE) === 0) return [0];
-    const offsets = [0];
-    const re = /\r\n|\n|\r/g;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(child.title)) !== null) {
-        offsets.push(m.index + m[0].length);
-    }
-    return offsets;
-}
-
 function lineStartIndex(child: WindowInfo, line: number): number {
-    const offsets = lineStartOffsets(child);
-    if (line >= offsets.length) return -1;
-    return offsets[line];
+    const lines = editLines(child);
+    if (line < 0 || line >= lines.length) return -1;
+    return lines[line].start;
 }
 
 function lineFromCharIndex(child: WindowInfo, charIndex: number): number {
-    const offsets = lineStartOffsets(child);
-    for (let i = offsets.length - 1; i >= 0; i--) {
-        if (charIndex >= offsets[i]) return i;
+    const lines = editLines(child);
+    for (let i = lines.length - 1; i >= 0; i--) {
+        if (charIndex >= lines[i].start) return i;
     }
     return 0;
 }
@@ -396,6 +682,7 @@ export function setEditControlText(child: WindowInfo, text: string): void {
     state.selStart = 0;
     state.selEnd = 0;
     state.scrollX = 0;
+    state.scrollTop = 0;
     state.modified = false;
     emptyUndoBuffer(state);
     // Wine EDIT_WM_SetText: a multiline (or combobox-owned) edit stays silent.
@@ -446,24 +733,24 @@ export function handleEditMessage(
             state.modified = !!wParam;
             return 0;
         case EM_GETLINECOUNT:
-            return Math.max(1, textLines(child).length);
+            return Math.max(1, editLines(child).length);
         case EM_LINEINDEX: {
             const line = (wParam | 0) === -1 ? lineFromCharIndex(child, state.selEnd) : (wParam | 0);
             return lineStartIndex(child, line);
         }
         case EM_LINELENGTH: {
             const charIndex = (wParam | 0) === -1 ? state.selEnd : (wParam | 0);
-            const lines = textLines(child);
-            return lines[lineFromCharIndex(child, clamp(charIndex, 0, len()))]?.length ?? 0;
+            const lines = editLines(child);
+            return lines[lineFromCharIndex(child, clamp(charIndex, 0, len()))]?.text.length ?? 0;
         }
         case EM_GETLINE: {
             if (!lParam) return 0;
-            const lines = textLines(child);
+            const lines = editLines(child);
             const line = wParam | 0;
             if (line < 0 || line >= lines.length) return 0;
             // First WORD of the buffer holds its capacity in chars (Win32 contract).
             const cap = Mem.readUint16(lParam) ?? 0;
-            const encoded = encodeAnsi(lines[line]).subarray(0, cap);
+            const encoded = encodeAnsi(lines[line].text).subarray(0, cap);
             if (encoded.length > 0) Mem.writeBytes(lParam, encoded);
             return encoded.length;
         }
@@ -495,8 +782,22 @@ export function handleEditMessage(
         case EM_UNDO:
         case WM_UNDO:
             return undoEdit(child, state) ? 1 : 0;
+        case EM_LINESCROLL: {
+            // Single-line edits scroll horizontally only, and answer FALSE.
+            if ((child.style & ES_MULTILINE) === 0) return 0;
+            state.scrollTop = clampScrollTop(child, state.scrollTop + (lParam | 0));
+            // wParam is CHARACTERS horizontally, measured in average char widths.
+            if (wParam | 0) {
+                state.scrollX = clampScrollX(
+                    child, state.scrollX + (wParam | 0) * editHorizontalLineStep(child));
+            }
+            return 1;
+        }
         case EM_GETFIRSTVISIBLELINE:
-            return 0;
+            // Multiline answers in lines; a single-line edit answers in CHARACTERS
+            // scrolled off the left (Wine EDIT_EM_GetFirstVisibleLine).
+            if ((child.style & ES_MULTILINE) !== 0) return clampScrollTop(child, state.scrollTop);
+            return firstVisibleChar(child, state);
 
         case WM_COPY: {
             const lo = Math.min(state.selStart, state.selEnd);
@@ -593,10 +894,38 @@ export function handleEditMessage(
                     return moveCaret((state.selStart !== state.selEnd && !shiftDown)
                         ? Math.max(state.selStart, state.selEnd)
                         : state.selEnd + 1);
+                case VK_UP:
+                case VK_DOWN:
+                case VK_PRIOR:
+                case VK_NEXT: {
+                    // Vertical caret movement is a MULTILINE affair; on a single-line
+                    // edit these keys belong to the dialog, which is what null means.
+                    if ((child.style & ES_MULTILINE) === 0) return null;
+                    const lines = editLines(child);
+                    const key = wParam & 0xFF;
+                    const page = editVisibleLineCount(child);
+                    const delta = key === VK_UP ? -1 : key === VK_DOWN ? 1
+                        : key === VK_PRIOR ? -page : page;
+                    const from = lineFromCharIndex(child, clamp(state.selEnd, 0, len()));
+                    const to = clamp(from + delta, 0, lines.length - 1);
+                    const x = caretXInLine(child, lines[from], clamp(state.selEnd, 0, len()));
+                    return moveCaret(posAtLineX(child, lines[to], x));
+                }
                 case VK_HOME:
+                    // Multiline Home/End work on the CURRENT line, as the real control does.
+                    if ((child.style & ES_MULTILINE) !== 0) {
+                        const lines = editLines(child);
+                        return moveCaret(lines[lineFromCharIndex(child, clamp(state.selEnd, 0, len()))].start);
+                    }
                     return moveCaret(0);
-                case VK_END:
+                case VK_END: {
+                    if ((child.style & ES_MULTILINE) !== 0) {
+                        const lines = editLines(child);
+                        const line = lines[lineFromCharIndex(child, clamp(state.selEnd, 0, len()))];
+                        return moveCaret(line.start + line.text.length);
+                    }
                     return moveCaret(len());
+                }
                 case VK_DELETE:
                     if (isReadOnly(child)) return 0;
                     if (state.selStart !== state.selEnd) {
@@ -624,7 +953,7 @@ export function handleEditMessage(
 export function isEditContentMessage(msg: number): boolean {
     return msg === WM_CHAR || msg === WM_KEYDOWN || msg === EM_REPLACESEL
         || msg === EM_SETSEL || msg === EM_SETREADONLY || msg === EM_SETPASSWORDCHAR
-        || msg === EM_SCROLLCARET || msg === EM_UNDO
+        || msg === EM_SCROLLCARET || msg === EM_UNDO || msg === EM_LINESCROLL
         || msg === WM_CUT || msg === WM_PASTE || msg === WM_CLEAR || msg === WM_UNDO;
 }
 

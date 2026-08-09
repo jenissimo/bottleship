@@ -99,4 +99,19 @@ export function registerCrtStringExports(exports: Record<string, ThunkImplementa
         }
         return 0;
     };
+
+    // int _memicmp(const void*, const void*, size_t) — memcmp over ASCII-folded bytes.
+    // The fold is ASCII-only in the "C" locale, which is what the CRT does too.
+    exports["_memicmp"] = (_c, _m, a) => {
+        const aPtr = a[0] ?? 0, bPtr = a[1] ?? 0, n = (a[2] ?? 0) >>> 0;
+        if (!aPtr || !bPtr || n === 0) return 0;
+        const fold = (c: number) => (c >= 0x41 && c <= 0x5a ? c + 0x20 : c);
+        for (let i = 0; i < n; i++) {
+            const av = fold(Mem.readUint8(aPtr + i) ?? 0);
+            const bv = fold(Mem.readUint8(bPtr + i) ?? 0);
+            if (av !== bv) return (av - bv) | 0;
+        }
+        return 0;
+    };
+    exports["_memicmp_l"] = exports["_memicmp"];
 }

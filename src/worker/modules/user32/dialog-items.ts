@@ -3,7 +3,7 @@
  * SendDlgItemMessage, …). Find a dialog's child control by id and read/write its
  * state.
  */
-import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
+import { ThunkImplementation, ThunkResult } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { Marshaler } from '../../core/memory/marshaler';
 import { Mem } from '../../core/memory/mem-accessor';
@@ -12,6 +12,7 @@ import { encodeAnsi } from '../codepage-utils';
 import { windows, buttonCheckStates, findChildByControlId } from './shared-state';
 import { applyControlSetText, handleSystemControlMessage, isContentChangingMessage } from './dialog-control-messages';
 import { eraseControlOverlayRect, repaintDialogAfterContentChange } from './dialog-paint';
+import { tryRichEditStreamMessage } from './rich-edit-stream';
 
 export function registerDialogItemExports(exports: Record<string, ThunkImplementation>): void {
     exports['GetDlgItem'] = (ctx, mem, args) => {
@@ -259,7 +260,7 @@ export function registerDialogItemExports(exports: Record<string, ThunkImplement
         return 1; // TRUE
     };
 
-    const sendDlgItemMessage = (ctx: any, mem: Uint8Array, args: number[]): number => {
+    const sendDlgItemMessage = (ctx: any, mem: Uint8Array, args: number[]): number | ThunkResult => {
         const hDlg = args[0];
         const nIDDlgItem = args[1];
         const Msg = args[2];
@@ -272,6 +273,9 @@ export function registerDialogItemExports(exports: Record<string, ThunkImplement
 
         // JS-managed system controls: handle in-process (Wine routes via SendMessage → control WndProc).
         if (child.isSystemControl) {
+            const stream = tryRichEditStreamMessage(
+                ctx, mem, child, Msg, wParam, lParam, 20, 'SendDlgItemMessageA');
+            if (stream) return stream;
             const result = handleSystemControlMessage(child, Msg, wParam, lParam, mem, 'ansi');
             if (isContentChangingMessage(child, Msg)) {
                 repaintDialogAfterContentChange(hDlg);
@@ -310,6 +314,9 @@ export function registerDialogItemExports(exports: Record<string, ThunkImplement
         const WM_SETTEXT = 0x000C;
         const WM_GETTEXT = 0x000D;
         if (child.isSystemControl) {
+            const stream = tryRichEditStreamMessage(
+                ctx, mem, child, Msg, wParam, lParam, 20, 'SendDlgItemMessageW');
+            if (stream) return stream;
             // The W entry KNOWS its strings are wide — pass that rather than re-probing bytes
             // that a 1-char ANSI string is indistinguishable from.
             const result = handleSystemControlMessage(child, Msg, wParam, lParam, mem, 'wide');

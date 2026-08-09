@@ -159,9 +159,11 @@ export function createInputExports(): Record<string, ThunkImplementation> {
         return vk !== undefined ? vk : -1;
     };
 
+    // JS fallback for the Tier 1 hypercall (HANDLER_GET_CAPTURE) — a pure read of
+    // the capture owner, which WindowManager mirrors into HYPERCALL_PAGE.
     exports['GetCapture'] = (ctx, mem, args) => {
         const hwnd = getCapture();
-        Logger.verbose(LogCategory.USER32, `GetCapture() -> 0x${hwnd.toString(16)}`);
+        Logger.verboseLazy(LogCategory.USER32, () => `GetCapture() -> 0x${hwnd.toString(16)}`);
         return hwnd;
     };
 

@@ -82,6 +82,7 @@ export function registerBuiltinClass(className: string, classInfo: Partial<{
     cbWndExtra: number;
     hInstance: number;
     hbrBackground: number;
+    hCursor: number;
     /** When set, CreateWindowEx marks the window as a JS system control. */
     controlClass?: string;
     /** A dedicated HLE subsystem owns this class's pixels. */
@@ -96,7 +97,7 @@ export function registerBuiltinClass(className: string, classInfo: Partial<{
         cbWndExtra: classInfo.cbWndExtra ?? 0,
         hInstance: classInfo.hInstance ?? 0,
         hIcon: 0,
-        hCursor: 0,
+        hCursor: classInfo.hCursor ?? 0,
         hbrBackground: classInfo.hbrBackground ?? 0,
         lpszMenuName: 0,
         controlClass: classInfo.controlClass,
@@ -856,6 +857,18 @@ function getBuiltinClassInfo(nameLower: string): any | undefined {
         isBuiltinSystemClass: true,
     };
     builtinClassInfoCache.set(nameLower, info);
+    // Mirror it into the WindowManager as well. Materializing it only here left
+    // createWindow to fall back on its "unknown class" stub, which registers style 0 —
+    // so every class-style behaviour of a system control (CS_DBLCLKS, CS_VREDRAW,
+    // CS_PARENTDC, CS_SAVEBITS) silently evaporated, and a listbox never produced a
+    // double-click.
+    System.getInstance().windowManager.registerClass({
+        name: descr.name,
+        wndProc: info.lpfnWndProc,
+        hInstance: 0,
+        style: descr.style,
+        hbrBackground: 0,
+    });
     return info;
 }
 

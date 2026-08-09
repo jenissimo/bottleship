@@ -13,6 +13,7 @@
 import { System } from '../../core/system';
 import { isStockObject, getStockObject } from '../gdi32/gdi-objects';
 import { WindowInfo, windows, registerControlStatePurger } from './shared-state';
+import { getSystemColorRef, COLOR_BTNFACE_INDEX } from './system';
 
 export interface ControlColorOverride {
     /** CSS colors; undefined field = keep classic-theme default. */
@@ -96,7 +97,9 @@ export function enumerateCtlColorChildren(parentHwnd: number): WindowInfo[] {
 // system-color state real user32 hands to the app (it may change only part of it).
 const COLORREF_BLACK = 0x00000000;
 const COLORREF_WHITE = 0x00FFFFFF;
-const COLORREF_BTNFACE = 0x00C8D0D4;
+/** WM_CTLCOLOR* bk colour: the same face the control is painted with, or opaque
+ *  guest text lands on a rectangle of the wrong grey. */
+const btnFaceColorRef = (): number => getSystemColorRef(COLOR_BTNFACE_INDEX);
 
 const BKMODE_TRANSPARENT = 1;
 const BKMODE_OPAQUE = 2;
@@ -106,7 +109,7 @@ export function presetCtlColorDC(child: WindowInfo, hdc: number, ctlColorMsg: nu
     const gdi = System.getInstance().gdiContext;
     const fieldBk = ctlColorMsg === WM_CTLCOLOREDIT || ctlColorMsg === WM_CTLCOLORLISTBOX;
     gdi.setTextColor(hdc, COLORREF_BLACK);
-    gdi.setBkColor(hdc, fieldBk ? COLORREF_WHITE : COLORREF_BTNFACE);
+    gdi.setBkColor(hdc, fieldBk ? COLORREF_WHITE : btnFaceColorRef());
     // OPAQUE is the Win32 DC default; our memory DCs start TRANSPARENT, and the guest's
     // own SetBkMode is only readable as a CHANGE from a known starting point.
     gdi.setBkMode(hdc, BKMODE_OPAQUE);

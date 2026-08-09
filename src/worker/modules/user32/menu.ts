@@ -10,6 +10,7 @@ import { Marshaler } from '../../core/memory/marshaler';
 import { windows } from './shared-state';
 import { findResourceInPE } from '../kernel32/resource';
 import { encodeAnsi } from '../codepage-utils';
+import { System } from '../../core/system';
 
 // Resource types
 const RT_MENU = 4;
@@ -19,6 +20,7 @@ const MF_STRING = 0x0000;
 const MF_POPUP = 0x0010;
 const MF_END = 0x0080;
 const MF_SEPARATOR = 0x0800;
+const ERROR_MENU_ITEM_NOT_FOUND = 1447;
 const MF_CHECKED = 0x0008;
 const MF_ENABLED = 0x0000;
 const MF_GRAYED = 0x0001;
@@ -435,11 +437,16 @@ export function createMenuExports(): Record<string, ThunkImplementation> {
         if (!menu) return 0;
 
         const idx = findItemIndex(menu, uPosition, uFlags);
-        if (idx >= 0) {
-            menu.items.splice(idx, 1);
-        }
         Logger.verbose(LogCategory.USER32,
-            `DeleteMenu(0x${hMenu.toString(16)}, ${uPosition}, 0x${uFlags.toString(16)})`);
+            `DeleteMenu(0x${hMenu.toString(16)}, ${uPosition}, 0x${uFlags.toString(16)}) -> ${idx >= 0}`);
+        // FALSE when the item is not there. Stripping a system menu is idiomatically
+        // written `while (DeleteMenu(h, 0, MF_BYPOSITION));` — an unconditional TRUE turns that
+        // into an infinite loop with no fault and no log to say why.
+        if (idx < 0) {
+            System.getInstance().scheduler.setLastError(ERROR_MENU_ITEM_NOT_FOUND);
+            return 0;
+        }
+        menu.items.splice(idx, 1);
         return 1;
     };
 
@@ -452,11 +459,16 @@ export function createMenuExports(): Record<string, ThunkImplementation> {
         if (!menu) return 0;
 
         const idx = findItemIndex(menu, uPosition, uFlags);
-        if (idx >= 0) {
-            menu.items.splice(idx, 1);
-        }
         Logger.verbose(LogCategory.USER32,
-            `RemoveMenu(0x${hMenu.toString(16)}, ${uPosition}, 0x${uFlags.toString(16)})`);
+            `RemoveMenu(0x${hMenu.toString(16)}, ${uPosition}, 0x${uFlags.toString(16)}) -> ${idx >= 0}`);
+        // FALSE when the item is not there. Stripping a system menu is idiomatically
+        // written `while (RemoveMenu(h, 0, MF_BYPOSITION));` — an unconditional TRUE turns that
+        // into an infinite loop with no fault and no log to say why.
+        if (idx < 0) {
+            System.getInstance().scheduler.setLastError(ERROR_MENU_ITEM_NOT_FOUND);
+            return 0;
+        }
+        menu.items.splice(idx, 1);
         return 1;
     };
 

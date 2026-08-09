@@ -10,19 +10,24 @@ import { Process } from "../core/process";
 import { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../core/logger";
 import { registerBuiltinClass } from "./user32/class";
+import { getSystemCursorHandle, IDC_IBEAM } from "./user32/system-cursors";
 
 const S_FALSE = 1;
 const E_NOTIMPL = 0x80004001;
 const CLASS_E_CLASSNOTAVAILABLE = 0x80040111;
 
 function registerRichEditClasses(): void {
+    // controlClass is what makes CreateWindowEx mark the window a JS system control,
+    // so the EM_* protocol and the default chrome come from rich-edit-control.ts —
+    // without it these windows have no behavior and no appearance at all.
+    const common = { controlClass: "RichEdit", hCursor: getSystemCursorHandle(IDC_IBEAM) };
     // Rich Edit 1.0 (RICHED32.DLL)
-    registerBuiltinClass("RICHEDIT", { cbWndExtra: 4 });
+    registerBuiltinClass("RICHEDIT", { cbWndExtra: 4, ...common });
     // Rich Edit 2.0+ class names (normally riched20.dll; games expect them after RICHED32 load)
-    registerBuiltinClass("RichEdit20A", { cbWndExtra: 256 });
-    registerBuiltinClass("RichEdit20W", { cbWndExtra: 256 });
+    registerBuiltinClass("RichEdit20A", { cbWndExtra: 256, ...common });
+    registerBuiltinClass("RichEdit20W", { cbWndExtra: 256, ...common });
     // Legacy alias seen in some resources
-    registerBuiltinClass("RichEdit", { cbWndExtra: 256 });
+    registerBuiltinClass("RichEdit", { cbWndExtra: 256, ...common });
 }
 
 export class Riched32 implements IModule {

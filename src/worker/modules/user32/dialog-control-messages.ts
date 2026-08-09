@@ -12,12 +12,25 @@ import { WindowInfo, windows, buttonCheckStates, getOrCreateListState, getOrCrea
 import { handleAnimateMessage } from './animate-control';
 import { handleEditMessage, isEditContentMessage, isEditControl, setEditControlText } from './edit-control';
 import {
+    handleRichEditMessage,
+    isRichEditContentMessage,
+    isRichEditControl,
+    setRichEditContent,
+} from './rich-edit-control';
+import {
     handleListViewMessage,
     isListViewContentMessage,
     isListViewControl,
 } from './list-view-control';
 import { setScrollPos, getScrollPos, setScrollRange, getScrollRange, applyScrollInfo, readScrollInfo } from './scroll-state';
-import { paintSystemControl, clampListTopIndex, listVisibleCount } from './controls';
+import {
+    paintSystemControl,
+    clampListTopIndexOf,
+    listVisibleCountOf,
+    applyComboBoxClosedHeight,
+    comboDropTopIndex,
+    comboBoxItemHeight,
+} from './controls';
 import { repaintDialogAfterContentChange, restampOwnedPopupsAbove } from './dialog-paint';
 import { closeOpenComboboxes } from './control-interaction';
 import { getBitmapObjectDimensions, getIconObjectDimensions } from '../gdi32/bitmap-resolve';
@@ -75,6 +88,7 @@ export function isContentChangingMessage(child: WindowInfo, msg: number): boolea
         || (msg >= TBM_SETPOS && msg <= TBM_SETRANGEMAX)
         || (msg >= 0x0401 && msg <= 0x0406)
         || (isEditControl(child) && isEditContentMessage(msg))
+        || (isRichEditControl(child) && (isEditContentMessage(msg) || isRichEditContentMessage(msg)))
         || (isListViewControl(child) && isListViewContentMessage(msg));
 }
 
@@ -119,7 +133,11 @@ export function applyStaticSetImageAutoSize(child: WindowInfo, imageType: number
  * EN_UPDATE/EN_CHANGE, the case styles, the caret reset and the modify flag.
  */
 export function applyControlSetText(win: WindowInfo, text: string): void {
-    if (win.isSystemControl && isEditControl(win)) setEditControlText(win, text);
+    if (!win.isSystemControl) { win.title = text; return; }
+    // Plain text replaces a Rich Edit's streamed runs — setRichEditContent drops them
+    // and then goes through the same EDIT path.
+    if (isRichEditControl(win)) setRichEditContent(win, text, []);
+    else if (isEditControl(win)) setEditControlText(win, text);
     else win.title = text;
 }
 
@@ -134,6 +152,12 @@ export function handleSystemControlMessage(
 ): number {
     const anim = handleAnimateMessage(child.handle, msg, wParam, lParam, mem);
     if (anim !== null) return anim;
+
+    // Rich Edit is a superset of EDIT and falls through to it internally.
+    if (isRichEditControl(child)) {
+        const richResult = handleRichEditMessage(child, msg, wParam, lParam, mem, textWidth);
+        if (richResult !== null) return richResult;
+    }
 
     // EDIT owns EM_* plus text-editing WM_SETTEXT/WM_CHAR/WM_KEYDOWN semantics.
     if (isEditControl(child)) {
@@ -153,6 +177,7 @@ export function handleSystemControlMessage(
     const WM_GETTEXT = 0x000D;
     const WM_GETTEXTLENGTH = 0x000E;
     const WM_ENABLE = 0x000A;
+    const WM_SIZE = 0x0005;
     const WM_SHOWWINDOW = 0x0018;
     const WM_SETFONT = 0x0030;
     const WM_GETFONT = 0x0031;
@@ -191,6 +216,8 @@ export function handleSystemControlMessage(
         const CB_SHOWDROPDOWN   = 0x014F;
         const CB_GETITEMDATA    = 0x0150;
     const CB_SETITEMDATA    = 0x0151;
+    const CB_SETITEMHEIGHT  = 0x0153;
+    const CB_GETITEMHEIGHT  = 0x0154;
     const CB_FINDSTRINGEXACT = 0x0158;
 
     // Listbox messages
@@ -230,7 +257,7 @@ export function handleSystemControlMessage(
                     return DLGC_BUTTON;
             }
         }
-        if (cls === 'edit') return DLGC_WANTCHARS | DLGC_WANTARROWS | DLGC_HASSETSEL;
+        if (cls === 'edit' || cls === 'richedit') return DLGC_WANTCHARS | DLGC_WANTARROWS | DLGC_HASSETSEL;
         if (cls === 'static') return DLGC_STATIC;
         return 0;
     };
@@ -273,9 +300,21 @@ export function handleSystemControlMessage(
     switch (msg) {
         case WM_GETDLGCODE:
             return controlDlgCode();
-        case WM_SETFONT:
+        case WM_SETFONT: {
             child.fontHandle = wParam >>> 0;
-            if (lParam && child.parent) repaintDialogAfterContentChange(child.parent);
+            // The selection field is text-sized, so a font change re-sizes the window
+            // (Wine combo.c COMBO_Font → CBCalcPlacement + SetWindowPos).
+            const resized = applyComboBoxClosedHeight(child);
+            if ((lParam || resized) && child.parent) repaintDialogAfterContentChange(child.parent);
+            return 0;
+        }
+        case WM_SIZE:
+            // A combobox answers every size change by shrinking itself back to the
+            // closed height — that is where the app's "height includes the list"
+            // argument is discarded (Wine combo.c COMBO_Size).
+            if (applyComboBoxClosedHeight(child) && child.parent) {
+                repaintDialogAfterContentChange(child.parent);
+            }
             return 0;
         case WM_GETFONT: {
             const parent = child.parent !== undefined ? windows.get(child.parent) : undefined;
@@ -287,6 +326,9 @@ export function handleSystemControlMessage(
                 const wmWin = System.getInstance().windowManager.getWindow(child.handle);
                 if (wmWin) wmWin.visible = child.visible;
             }
+            // The show is a SetWindowPos, so a combobox sizes itself here too — a control
+            // created hidden gets no WM_SIZE until then.
+            applyComboBoxClosedHeight(child);
             if (child.parent) repaintDialogAfterContentChange(child.parent);
             return 0;
         case WM_PRINTCLIENT:
@@ -331,7 +373,7 @@ export function handleSystemControlMessage(
         case LB_SETTOPINDEX: {
             const state = getOrCreateListState(child.handle);
             state.topIndex = wParam | 0;
-            clampListTopIndex(state, child.height);
+            clampListTopIndexOf(state, child);
             return 0;
         }
         case LB_GETCARETINDEX:
@@ -351,10 +393,10 @@ export function handleSystemControlMessage(
             }
             state.caretIndex = idx;
             if (!lParam) {
-                const visible = listVisibleCount(child.height);
+                const visible = listVisibleCountOf(child);
                 if (idx < state.topIndex) state.topIndex = idx;
                 else if (idx >= state.topIndex + visible) state.topIndex = idx - visible + 1;
-                clampListTopIndex(state, child.height);
+                clampListTopIndexOf(state, child);
             }
             return 0; // LB_OKAY
         }
@@ -411,6 +453,19 @@ export function handleSystemControlMessage(
             return controlImageHandles.get(child.handle) ?? 0;
 
         // --- Combobox messages ---
+        case CB_SETITEMHEIGHT: {
+            // wParam -1 addresses the selection field, any other index the list rows;
+            // we keep one height for both, as the classic non-owner-draw combo does.
+            const h = lParam & 0xFFFF;
+            if (h <= 0) return CB_ERR;
+            getOrCreateListState(child.handle).itemHeight = h;
+            if (applyComboBoxClosedHeight(child) && child.parent) {
+                repaintDialogAfterContentChange(child.parent);
+            }
+            return 0;
+        }
+        case CB_GETITEMHEIGHT:
+            return comboBoxItemHeight(child);
         case CB_ADDSTRING:
         case LB_ADDSTRING: {
             const state = getOrCreateListState(child.handle);
@@ -500,10 +555,7 @@ export function handleSystemControlMessage(
                 const host = child.parent ?? child.handle;
                 closeOpenComboboxes(host, child.handle);
                 state.dropdownOpen = true;
-                const visibleCount = Math.max(1, Math.min(8, state.items.length));
-                const sel = state.selectedIndex < 0 ? 0 : state.selectedIndex;
-                const maxTop = Math.max(0, state.items.length - visibleCount);
-                state.topIndex = Math.max(0, Math.min(sel - visibleCount + 1, maxTop));
+                state.topIndex = comboDropTopIndex(state.items.length, state.selectedIndex);
             } else if (state.dropdownOpen) {
                 state.dropdownOpen = false;
             }

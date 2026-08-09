@@ -4,7 +4,7 @@
  * Atomic implementation for window operations
  */
 
-import { FastPathImplementation, ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
+import { FastPathImplementation, ThunkImplementation, ThunkResult } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
@@ -23,9 +23,10 @@ import {
     removeWindowUpdate,
     readClientRectFromMem,
     writeClientRectToMem,
+    type ClientRect,
 } from './paint-region';
 import { WH_CBT, HCBT_CREATEWND, getHooksOfType } from './hooks';
-import { registerWindowDrawingExports } from './window-drawing';
+import { registerWindowDrawingExports, eraseWindowBackgroundWithClassBrush } from './window-drawing';
 import { registerWindowGeometryExports, removeWindowPlacement } from './window-geometry';
 import { registerWindowQueryExports } from './window-query';
 import { registerWindowPropExports } from './window-props';
@@ -33,16 +34,30 @@ import { GDIContext } from '../gdi32/context';
 import { ensureAnimateControlClasses, clearAnimateState, onAnimateShowWindow, isAnimateControlWindow } from './animate-control';
 import { getBuiltinSystemClass, getDefWindowProcAddress } from './system-classes';
 import { invalidateControlColors } from './control-colors';
-import { applyScrollInfo, setScrollPos as setScrollBarPos } from './scroll-state';
+import {
+    applyScrollInfo,
+    readScrollInfo,
+    getScrollRange,
+    getScrollPos,
+    enableScrollBar,
+    showScrollBar,
+    setScrollRange,
+    setScrollPos as setScrollBarPos,
+} from './scroll-state';
 import { isSentinelWndProc } from './dialog';
 import { handleSystemControlMessage, isContentChangingMessage } from './dialog-control-messages';
 import { noteDialogOverlayCandidate, eraseDialogOverlay, isWindowFullyCoveredByHigherTopLevel } from './dialog-overlay';
 import { eraseControlOverlayRect, eraseHiddenWindowPixels, repaintDialogOverlayIfVisible, repaintDialogAfterContentChange, requestGuestDialogPaint } from './dialog-paint';
-import { resetControlInteractionState, handleSystemControlClassMouse, takePendingControlNotification } from './control-interaction';
+import {
+    resetControlInteractionState,
+    handleSystemControlClassMouse,
+    handleSystemControlKey,
+    takePendingControlNotification,
+} from './control-interaction';
 import { isDDrawExclusiveFullscreen } from '../ddraw/gdi-visibility';
 import { paintTraceEnabled, logBeginEndPaint } from './paint-trace';
 import { repaintChildControls } from './controls';
-import { tryEndPaintOwnerDrawChain, tryRepaintOwnerDrawButton } from './owner-draw';
+import { tryEndPaintOwnerDrawChain, tryRepaintOwnerDrawButton, isGuestPaintedControl } from './owner-draw';
 import { beginSyncDestroyDelivery } from './destroy-sync';
 import {
     postInitialActivationMessages,
@@ -316,6 +331,57 @@ function restoreSeedFromAncestors(gdi: GDIContext, hdc: number, window: WindowIn
     return false;
 }
 
+/**
+ * Publish a window DC's guest pixels to the overlay: punch child windows out of the
+ * blit, retain the guest's client for ShowWindow(SW_HIDE) restore, and skip the
+ * composite when the window is not effectively visible. Shared by ReleaseDC and the
+ * held-DC flush so both apply one policy (EndPaint has its own, publish-bracketed copy).
+ */
+function publishWindowDC(hWnd: number, hDC: number): boolean {
+    const gdi = System.getInstance().gdiContext;
+    const win = getWindowByHandle(hWnd);
+    // No repaintedAfterFlush here: this path restamps only the OS-owned controls, so a
+    // guest-owned child's pixels would be destroyed with nothing to bring them back —
+    // every child stays punched out regardless of WS_CLIPCHILDREN.
+    const exclusions = hWnd ? getChildWindowExclusions(hWnd) : [];
+    const flushed = win && (!isEffectivelyVisible(win)
+        || isWindowFullyCoveredByHigherTopLevel(win))
+        ? false
+        : gdi.flushWindowMemoryDCToOverlay(
+            hDC,
+            exclusions,
+            hWnd && !win?.isSystemControl ? hWnd : undefined,
+            win ? getAncestorClipRect(win) : null);
+    if (flushed) {
+        markGuestCustomPaint(hWnd);
+        // OS-owned controls (statics/edits) repaint on top of the guest's flush —
+        // owner-draw buttons early-out inside repaintChildControls.
+        if (win && win.children.length) {
+            repaintChildControls(hWnd);
+        }
+    }
+    return flushed;
+}
+
+/**
+ * Publish every window DC the guest has drawn on and still holds. Real GDI writes
+ * through a window DC straight to the screen; ours buffers into the DC's canvas and
+ * publishes on release, so a renderer that does GetDC once and BitBlts every frame
+ * (the standard Win32 software-renderer shape) would never reach the screen at all.
+ * Called once per composite so a frame's worth of GDI calls coalesces into one blit.
+ */
+export function flushHeldWindowDCs(): void {
+    const gdi = System.getInstance().gdiContext;
+    const held = gdi.heldDirtyWindowDCs();
+    for (const { hdc, hwnd } of held) {
+        if (hwnd && isWindowUpdateLocked(hwnd)) {
+            gdi.clearDirty(hdc);
+            continue;
+        }
+        publishWindowDC(hwnd, hdc);
+    }
+}
+
 /** Client-area memory DC; composited to overlay on EndPaint / ReleaseDC. */
 function createWindowClientDC(gdi: GDIContext, hWnd: number): number {
     const window = getWindowByHandle(hWnd);
@@ -404,6 +470,201 @@ function createWindowClientDC(gdi: GDIContext, hWnd: number): number {
     return hdc;
 }
 
+const WM_ERASEBKGND_PAINT = 0x0014;
+
+/**
+ * The area USER is erasing for a window, published while its WM_ERASEBKGND is in flight.
+ * Win32 hands the erase a DC clipped to the update region; the class-brush fill must
+ * respect that or an InvalidateRect of one control's rect repaints the whole client.
+ */
+const pendingEraseRects = new Map<number, ClientRect>();
+
+function windowClientRect(window: WindowInfo): ClientRect {
+    return { left: 0, top: 0, right: window.width, bottom: window.height };
+}
+
+/** WNDCLASS.hbrBackground, still in its raw (possibly COLOR_* + 1) form. */
+function getClassBackgroundBrush(window: WindowInfo): number {
+    const classInfo = window.classId !== undefined
+        ? getWindowClass(window.classId)
+        : (window.nativeClassName ? getWindowClassByName(window.nativeClassName) : undefined);
+    return (classInfo?.hbrBackground ?? 0) >>> 0;
+}
+
+/**
+ * DefWindowProc's WM_ERASEBKGND. Returns nonzero when the class brush painted, which is
+ * what BeginPaint's fErase contract and every guest that forwards the message expect.
+ */
+function eraseWindowBackground(hWnd: number, hdc: number): number {
+    const window = getWindowByHandle(hWnd);
+    if (!window || !hdc) return 0;
+    const rect = pendingEraseRects.get(hWnd) ?? windowClientRect(window);
+    return eraseWindowBackgroundWithClassBrush(hdc, getClassBackgroundBrush(window), rect) ? 1 : 0;
+}
+
+/**
+ * Erase for a paint that is starting. The guest sees WM_ERASEBKGND when it has a wndproc —
+ * it may answer itself, or forward to DefWindowProc and land back in eraseWindowBackground.
+ * With no guest proc, USER's default is all there is, so it runs inline instead of the
+ * erase silently not happening. Returns whether the caller must still send the message.
+ */
+function beginWindowErase(hWnd: number, window: WindowInfo, hdc: number, bounds: ClientRect | null): boolean {
+    pendingEraseRects.set(hWnd, bounds ?? windowClientRect(window));
+    if (resolveGuestWndProc(window)) return true;
+    eraseWindowBackground(hWnd, hdc);
+    pendingEraseRects.delete(hWnd);
+    return false;
+}
+
+/** EndPaint's composite step: put the painted client DC on the overlay, then restamp the
+ *  OS-owned controls that sit on top of it. Returns whether the blit actually landed. */
+function flushPaintDCToOverlay(hWnd: number, hdc: number): boolean {
+    const gdi = System.getInstance().gdiContext;
+    // This is the ONE composite path that restamps guest-painted children afterwards
+    // (tryEndPaintOwnerDrawChain, below), so it is the one that may let a parent without
+    // WS_CLIPCHILDREN paint the ground under them the way GDI does. The chain needs the
+    // window's own wndProc to run; without one nothing would repaint and the holes stay.
+    const painted = getWindowByHandle(hWnd);
+    const exclusions = getChildWindowExclusions(hWnd, painted?.wndProc
+        ? { repaintedAfterFlush: isGuestPaintedControl }
+        : undefined);
+    // A window that is not EFFECTIVELY visible must not reach the screen, however
+    // dutifully it paints: Win32 sends its WM_PAINT to a DC nobody sees. Without this
+    // the guest's splash dialogs kept re-flushing after EndDialog had already erased
+    // them, so the old splash hung behind the launcher menu for the whole session.
+    // The DC itself is still filled and released normally — only the composite stops.
+    const flushed = painted && (!isEffectivelyVisible(painted)
+        || isWindowFullyCoveredByHigherTopLevel(painted))
+        ? false
+        : gdi.flushWindowMemoryDCToOverlay(
+            hdc, exclusions, painted?.isSystemControl ? undefined : hWnd,
+            painted ? getAncestorClipRect(painted) : null);
+    if (flushed) {
+        markGuestCustomPaint(hWnd);
+        // OS-owned controls (statics/edits) paint on top of the guest's flushed
+        // background; owner-draw buttons early-out and are drawn by the chain below.
+        const win = getWindowByHandle(hWnd);
+        if (win && win.children.length) repaintChildControls(hWnd);
+    }
+    return !!flushed;
+}
+
+/**
+ * DefWindowProc/DefDlgProc's WM_PAINT. Win32's default is literally `BeginPaint(&ps);
+ * EndPaint(&ps);` — which is where WM_ERASEBKGND gets sent and, here, where the
+ * owner-draw chain runs. A window proc that hands an unhandled WM_PAINT down its
+ * subclass chain (MFC's `CWnd::Default()`) depends on landing here; a launcher whose
+ * whole art is an OnEraseBkgnd blit plus CBitmapButtons draws nothing without it.
+ *
+ * Returns a suspended-thunk result while guest paint callbacks are in flight, or null
+ * when the sequence finished inline (the caller then returns 0 as DefWindowProc does).
+ */
+export function runDefaultWindowPaint(
+    ctx: any,
+    mem: Uint8Array,
+    hWnd: number,
+    label: string,
+    stackCleanup: number,
+): ThunkResult | null {
+    const window = getWindowByHandle(hWnd);
+    if (!window || window.isSystemControl) return null;
+    // Win32 does not re-enter WM_PAINT while WM_CREATE / WM_INITDIALOG is running.
+    if (isWindowInitInProgress(hWnd)) return null;
+
+    const system = System.getInstance();
+    const callbackManager = system.process?.dispatcher?.callbackManager;
+    if (!callbackManager) return null;
+    const gdi = system.gdiContext;
+    const hdc = createWindowClientDC(gdi, hWnd);
+    if (!hdc) return null;
+    gdi.markPaintDC(hdc);
+    const updateBounds = getWindowUpdateBounds(hWnd);
+    // No update region at all is not a Win32 state — there WM_PAINT is derived FROM the
+    // region, so the message could not exist. Ours can (repaint requests that post it
+    // directly), and it means a full-client repaint: erase, or a guest that draws text
+    // every paint stacks glyphs on the ones the last paint left (visibly bolder).
+    const fErase = consumeNeedsErase(hWnd) || updateBounds === null;
+    clearWindowUpdate(hWnd);
+
+    // Reached through CallWindowProc from a subclass chain, this thunk IS the callback —
+    // its return address is a callback stub, so every guest step below has to resume
+    // through this thunk's own RET N instead of consuming the outer frame.
+    const thunkReturnAddr =
+        new DataView(mem.buffer, mem.byteOffset, mem.byteLength).getUint32(ctx.esp, true) >>> 0;
+    const stubRange = callbackManager.getStubPoolRange();
+    const directReturn = thunkReturnAddr >= stubRange.base && thunkReturnAddr < stubRange.end
+        ? { returnAddr: thunkReturnAddr, postEsp: (ctx.esp + 4 + stackCleanup) >>> 0 }
+        : undefined;
+    if (paintTraceEnabled) logBeginEndPaint('BeginPaint', hWnd,
+        `via=${label} hdc=0x${hdc.toString(16)} fErase=${fErase ? 1 : 0}`);
+
+    // Background + controls are one frame; each control is a guest callback, so without
+    // the hold a compositor samples the middle of the sequence.
+    gdi.beginOverlayPublish();
+    let holdReleased = false;
+    const releaseHold = (): void => {
+        if (holdReleased) return;
+        holdReleased = true;
+        gdi.endOverlayPublish();
+    };
+
+    /** The EndPaint half: composite, then let the guest draw the controls it owns. */
+    const endPaint = (frameId?: number): ThunkResult | null => {
+        pendingEraseRects.delete(hWnd);
+        try {
+            const flushed = flushPaintDCToOverlay(hWnd, hdc);
+            gdi.releaseDC(hdc);
+            if (paintTraceEnabled) logBeginEndPaint('EndPaint', hWnd,
+                `via=${label} hdc=0x${hdc.toString(16)} flush=${flushed ? 1 : 0}`);
+            const odWin = flushed ? getWindowByHandle(hWnd) : undefined;
+            if (odWin) {
+                const chain = tryEndPaintOwnerDrawChain(ctx, mem, hWnd, odWin, {
+                    createChildDC: (childHwnd) => createWindowClientDC(gdi, childHwnd),
+                    flushChildDC: (childDc) => {
+                        gdi.flushWindowMemoryDCToOverlay(childDc);
+                        gdi.releaseDC(childDc);
+                    },
+                    discardChildDC: (childDc) => gdi.releaseDC(childDc),
+                    onComplete: releaseHold,
+                }, stackCleanup, frameId, directReturn);
+                // The chain took its own hold and releases ours via onComplete.
+                if (chain) return chain;
+            }
+        } catch (err) {
+            Logger.error(LogCategory.USER32, `${label}: default paint failed — ${err}`);
+        }
+        releaseHold();
+        return null;
+    };
+
+    if (fErase && beginWindowErase(hWnd, window, hdc, updateBounds)) {
+        // The frame the erase suspension saved; the owner-draw chain reuses it rather
+        // than saving a second one from an ESP that no longer belongs to this thunk.
+        // It stays 0 on the nested (directThunkReturn) path, where the live frame is an
+        // outer callback's and the chain must not touch it.
+        let eraseFrameId = 0;
+        const sync = trySuspendForSyncWindowMessage(
+            ctx, hWnd, WM_ERASEBKGND_PAINT, hdc, 0, `${label}:erase`, stackCleanup,
+            // The erase answered; finish the paint. Returning null keeps this thunk
+            // suspended for the owner-draw chain the EndPaint half just started.
+            () => (endPaint(eraseFrameId || undefined) ? null : 0),
+            undefined, directReturn,
+        );
+        if (sync.suspended) {
+            eraseFrameId = sync.frameId;
+            return {
+                value: 0,
+                suspendedForCallback: true,
+                callbackId: sync.callbackId,
+                stackCleanup,
+                skipStackCheck: true,
+                preserveCallbackReturnAddress: sync.reusedFrame,
+            };
+        }
+    }
+    return endPaint();
+}
+
 export function createWindowExports(): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
 
@@ -446,6 +707,11 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
                 makeLParam(windowInfo.width, windowInfo.height)
             );
         }
+        // A window born visible is entirely invalid AND needs erasing — the update region
+        // is what carries that to BeginPaint. Posting WM_PAINT alone delivers a paint whose
+        // fErase is FALSE, so the class brush never runs and the client keeps whatever the
+        // screen held (on a DirectDraw primary, the raw surface).
+        invalidateWindow(windowInfo.handle, null, true);
         system.windowManager.postMessage(windowInfo.handle, WM_PAINT, 0, 0);
     };
 
@@ -587,7 +853,12 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         if (hWndParent) {
             const parent = windows.get(hWndParent);
             if (parent) {
-                parent.children.push(windowInfo.handle);
+                // children[] is front-to-back (index 0 = topmost, see reorderChildInParent),
+                // and CreateWindowEx puts a new window at the TOP of its siblings' Z-order.
+                // Appending inverted that for every CreateWindow-made control: the OLDEST
+                // sibling hit-tested first and, once controls started filling their own
+                // background, painted last — a static's fill wiping its neighbour's text.
+                parent.children.unshift(windowInfo.handle);
                 // A visible plain window gaining its first system control while the
                 // game owns the screen becomes an overlay candidate (controls are
                 // usually created AFTER the parent was shown).
@@ -1040,7 +1311,11 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             // which on real Windows is the BUTTON/LISTBOX/COMBOBOX class proc. Run the
             // class's input behavior (click -> WM_COMMAND(BN_CLICKED), combo drop, …)
             // before the message-based handling, or the forwarded click dies here.
-            if (handleSystemControlClassMouse(win, Msg, wParam, lParam)) {
+            const WM_KEYDOWN_CTL = 0x0100, WM_KEYUP_CTL = 0x0101;
+            const classHandled = (Msg === WM_KEYDOWN_CTL || Msg === WM_KEYUP_CTL)
+                ? handleSystemControlKey(win, Msg, wParam & 0xFF)
+                : handleSystemControlClassMouse(win, Msg, wParam, lParam);
+            if (classHandled) {
                 const notification = takePendingControlNotification();
                 if (notification) {
                     const sync = trySuspendForSyncWindowMessage(
@@ -1066,6 +1341,18 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
                 repaintDialogAfterContentChange(win.parent ?? hWnd);
             }
             return result;
+        }
+
+        if (Msg === WM_PAINT_GEO) {
+            const paint = runDefaultWindowPaint(ctx, mem, hWnd, 'DefWindowProc', 16);
+            return paint ?? 0;
+        }
+
+        if (Msg === WM_ERASEBKGND_PAINT) {
+            // The class brush is the ONLY thing that paints a plain registered class's
+            // client: a window whose whole UI is child controls shows whatever was on the
+            // screen between them (here, the DirectDraw primary) until this fills it.
+            return eraseWindowBackground(hWnd, wParam >>> 0);
         }
 
         if (Msg === WM_CLOSE) {
@@ -1524,8 +1811,13 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
     exports['ShowCursor'] = (ctx, mem, args) => {
         const bShow = args[0] !== 0;
         const prevCount = getCursorDisplayCount();
+        const wasVisible = isGuestCursorVisible();
         const nextCount = updateCursorDisplayCount(bShow ? 1 : -1);
-        syncHostCursorToGuestState();
+        // ShowCursor is a COUNTER; visibility is only its sign. Apps drive it in loops
+        // (`while (ShowCursor(FALSE) >= 0);` is the idiomatic force-hide), so most calls
+        // move the count without changing what the host should show — and the host sync
+        // costs a cursor-resource lookup each time. Sync on the transition only.
+        if (isGuestCursorVisible() !== wasVisible) syncHostCursorToGuestState();
         Logger.verbose(LogCategory.USER32, `ShowCursor(${bShow ? 1 : 0}) -> ${nextCount} (prev=${prevCount}), visible=${isGuestCursorVisible()}`);
         return nextCount;
     };
@@ -1600,7 +1892,6 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         const hDC = args[1];
         Logger.verbose(LogCategory.USER32, `ReleaseDC(0x${hWnd.toString(16)}, 0x${hDC.toString(16)})`);
         const gdi = System.getInstance().gdiContext;
-        const win = getWindowByHandle(hWnd);
 
         // LockWindowUpdate: drawing without DCX_LOCKWINDOWUPDATE must not reach the
         // screen (Wine win.c test_LockWindowUpdate — pixels stay at the pre-lock value
@@ -1611,27 +1902,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             return 1;
         }
 
-        // Mirror EndPaint: punch child windows out of the blit, retain the guest's
-        // client for ShowWindow(SW_HIDE) restore, and skip composite when the window
-        // is not effectively visible. GetDC/ReleaseDC is the hot path for MFC owner-draw
-        // menus (BeginPaint is rare); without retain, hide-restore has nothing to put back.
-        const exclusions = hWnd ? getChildWindowExclusions(hWnd) : [];
-        const flushed = win && (!isEffectivelyVisible(win)
-            || isWindowFullyCoveredByHigherTopLevel(win))
-            ? false
-            : gdi.flushWindowMemoryDCToOverlay(
-                hDC,
-                exclusions,
-                hWnd && !win?.isSystemControl ? hWnd : undefined,
-                win ? getAncestorClipRect(win) : null);
-        if (flushed) {
-            markGuestCustomPaint(hWnd);
-            // OS-owned controls (statics/edits) repaint on top of the guest's flush —
-            // owner-draw buttons early-out inside repaintChildControls.
-            if (win && win.children.length) {
-                repaintChildControls(hWnd);
-            }
-        }
+        publishWindowDC(hWnd, hDC);
         gdi.releaseDC(hDC);
         return 1;
     };
@@ -1645,11 +1916,15 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         const gdi = System.getInstance().gdiContext;
         const window = getWindowByHandle(hWnd);
         const hdc = createWindowClientDC(gdi, hWnd);
+        gdi.markPaintDC(hdc);
 
+        // See runDefaultWindowPaint: a paint with no update region is our own artifact and
+        // means "repaint everything", which in Win32 always comes with an erase.
+        const pending = getWindowUpdateBounds(hWnd);
         const updateBounds = window
-            ? (getWindowUpdateBounds(hWnd) ?? { left: 0, top: 0, right: window.width, bottom: window.height })
+            ? (pending ?? { left: 0, top: 0, right: window.width, bottom: window.height })
             : null;
-        const fErase = consumeNeedsErase(hWnd);
+        const fErase = consumeNeedsErase(hWnd) || pending === null;
         clearWindowUpdate(hWnd);
 
         if (updateBounds && hdc) {
@@ -1669,7 +1944,10 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
 
         if (paintTraceEnabled) logBeginEndPaint('BeginPaint', hWnd,
             `lpPaint=0x${lpPaint.toString(16)} hdc=0x${hdc.toString(16)} ` +
-            `${window?.width ?? 0}x${window?.height ?? 0}`);
+            `${window?.width ?? 0}x${window?.height ?? 0} fErase=${fErase ? 1 : 0} ` +
+            `upd=${updateBounds
+                ? `${updateBounds.left},${updateBounds.top},${updateBounds.right},${updateBounds.bottom}`
+                : 'none'}`);
 
         if (lpPaint && window && updateBounds) {
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
@@ -1680,6 +1958,33 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             view.setInt32(lpPaint + 16, updateBounds.right, true);
             view.setInt32(lpPaint + 20, updateBounds.bottom, true);
         }
+
+        // USER — not the caller — erases: BeginPaint sends WM_ERASEBKGND when the update
+        // region was invalidated with bErase, and reports fErase=FALSE afterwards. An app
+        // whose background lives in OnEraseBkgnd never draws it otherwise, and MFC's
+        // CPaintDC does not erase on its own.
+        if (fErase && hdc && window && !window.isSystemControl
+            && beginWindowErase(hWnd, window, hdc, updateBounds)) {
+            const sync = trySuspendForSyncWindowMessage(
+                ctx, hWnd, WM_ERASEBKGND_PAINT, hdc, 0, 'BeginPaint:erase', 8,
+                () => { pendingEraseRects.delete(hWnd); return hdc; },
+            );
+            if (sync.suspended) {
+                if (lpPaint) {
+                    new DataView(mem.buffer, mem.byteOffset, mem.byteLength)
+                        .setUint32(lpPaint + 4, 0, true); // fErase: USER already erased
+                }
+                return {
+                    value: hdc,
+                    suspendedForCallback: true,
+                    callbackId: sync.callbackId,
+                    stackCleanup: 8,
+                    skipStackCheck: true,
+                    preserveCallbackReturnAddress: sync.reusedFrame,
+                };
+            }
+        }
+        pendingEraseRects.delete(hWnd);
 
         return hdc;
     };
@@ -1700,31 +2005,9 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         if (lpPaint) {
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
             const hdc = view.getUint32(lpPaint, true);
-            const exclusions = getChildWindowExclusions(hWnd);
-            // A window that is not EFFECTIVELY visible must not reach the screen, however
-            // dutifully it paints: Win32 sends its WM_PAINT to a DC nobody sees. Without this
-            // the guest's splash dialogs kept re-flushing after EndDialog had already erased
-            // them, so the old splash hung behind the launcher menu for the whole session.
-            // The DC itself is still filled and released normally — only the composite stops.
-            const painted = getWindowByHandle(hWnd);
-            const flushed = painted && (!isEffectivelyVisible(painted)
-                || isWindowFullyCoveredByHigherTopLevel(painted))
-                ? false
-                : gdi.flushWindowMemoryDCToOverlay(
-                    hdc, exclusions, painted?.isSystemControl ? undefined : hWnd,
-                    painted ? getAncestorClipRect(painted) : null);
+            const flushed = flushPaintDCToOverlay(hWnd, hdc);
             if (paintTraceEnabled) logBeginEndPaint('EndPaint', hWnd,
-                `lpPaint=0x${lpPaint.toString(16)} hdc=0x${hdc.toString(16)} flush=${flushed ? 1 : 0} ` +
-                `excl=${exclusions.length}`);
-            if (flushed) {
-                markGuestCustomPaint(hWnd);
-                const win = getWindowByHandle(hWnd);
-                // OS-owned controls (statics/edits) paint on top of the guest's flushed
-                // background; owner-draw buttons early-out and are drawn by the chain below.
-                if (win && win.children.length) {
-                    repaintChildControls(hWnd);
-                }
-            }
+                `lpPaint=0x${lpPaint.toString(16)} hdc=0x${hdc.toString(16)} flush=${flushed ? 1 : 0}`);
             gdi.releaseDC(hdc);
 
             // Owner-draw buttons paint on TOP of the now-flushed background. Each child
@@ -1942,6 +2225,36 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         const bRedraw = args[3];
         Logger.verbose(LogCategory.USER32, `SetScrollPos(0x${hWnd.toString(16)}, ${nBar}, ${nPos}, ${bRedraw})`);
         return setScrollBarPos(hWnd, nBar, nPos);
+    };
+
+    exports['GetScrollPos'] = (ctx, mem, args) => getScrollPos(args[0] >>> 0, args[1] | 0);
+
+    exports['SetScrollRange'] = (ctx, mem, args) => {
+        const hWnd = args[0] >>> 0;
+        setScrollRange(hWnd, args[1] | 0, args[2] | 0, args[3] | 0);
+        if (args[4]) invalidateWindow(hWnd, null, false);
+        return 1;
+    };
+
+    exports['GetScrollRange'] = (ctx, mem, args) =>
+        getScrollRange(mem, args[0] >>> 0, args[1] | 0, args[2] >>> 0, args[3] >>> 0) ? 1 : 0;
+
+    // BOOL GetScrollInfo(HWND hwnd, int nBar, LPSCROLLINFO lpsi)
+    exports['GetScrollInfo'] = (ctx, mem, args) =>
+        readScrollInfo(mem, args[0] >>> 0, args[1] | 0, args[2] >>> 0) ? 1 : 0;
+
+    exports['EnableScrollBar'] = (ctx, mem, args) => {
+        const hWnd = args[0] >>> 0;
+        const changed = enableScrollBar(hWnd, args[1] | 0, args[2] >>> 0);
+        if (changed) invalidateWindow(hWnd, null, false);
+        return changed ? 1 : 0;
+    };
+
+    exports['ShowScrollBar'] = (ctx, mem, args) => {
+        const hWnd = args[0] >>> 0;
+        showScrollBar(hWnd, args[1] | 0, !!args[2]);
+        invalidateWindow(hWnd, null, false);
+        return 1;
     };
 
     // int SetScrollInfo(HWND hwnd, int nBar, LPCSCROLLINFO lpsi, BOOL redraw)

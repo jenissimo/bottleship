@@ -7,15 +7,17 @@
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { WindowInfo, windows, isEffectivelyVisible, getAbsoluteWindowPosition, getAncestorClipRect, ensureHostCursorForDialog, getChildrenInPaintOrder, hasSystemControlChildren } from './shared-state';
-import { paintChildControls, repaintChildControls, registerOwnedPopupRestamper } from './controls';
+import { paintChildControls, repaintChildControls } from './controls';
+import { registerOwnedPopupRestamper } from './paint-hooks';
 import { registerFullDialogRepainter, registerOverlayRepairRepainter } from './control-interaction';
 import { getWindowVisualBounds, eraseDialogOverlay, repairOverlayWindowsOverlappingRect } from './dialog-overlay';
-import { invalidateWindow } from './paint-region';
+import { invalidateWindow, hasPendingUpdate, type ClientRect } from './paint-region';
 import type { GDIContext } from '../gdi32/context';
 import { paintTraceEnabled, logPaintRequest } from './paint-trace';
+import { getSystemColorRef, COLOR_BTNFACE_INDEX } from './system';
 
-/** Win32 COLOR_BTNFACE as COLORREF (0x00BBGGRR). */
-const COLOR_DLGFACE = 0x00C8D0D4;
+/** Dialog face as COLORREF (0x00BBGGRR), from the live system palette. */
+const dlgFaceColorRef = (): number => getSystemColorRef(COLOR_BTNFACE_INDEX);
 
 const WM_PAINT = 0x000F;
 const WS_CHILD = 0x40000000;
@@ -74,8 +76,15 @@ function getDialogProcedure(win: WindowInfo): number {
 /**
  * Queue WM_PAINT for a dialog whose client was actually painted by the guest.
  * Guest must dispatch via PeekMessage/GetMessage → DispatchMessage.
+ *
+ * The INVALIDATE is half the request, not a detail: a bare WM_PAINT reaches BeginPaint
+ * with an empty update region and fErase=FALSE, so the guest repaints over pixels USER
+ * never erased. Every caller here is an exposure (a popup closed, a window was hidden,
+ * the canvas was wiped), which is exactly the case Win32 invalidates WITH erase — and on
+ * our flat overlay the exposed pixels are transparent, so skipping the erase publishes
+ * the bare DirectDraw surface through the hole.
  */
-export function requestGuestDialogPaint(dialogHwnd: number): void {
+export function requestGuestDialogPaint(dialogHwnd: number, rect: ClientRect | null = null): void {
     const win = windows.get(dialogHwnd);
     if (!win?.visible) {
         if (paintTraceEnabled) logPaintRequest(dialogHwnd, false, win ? 'not-visible' : 'no-window');
@@ -92,6 +101,11 @@ export function requestGuestDialogPaint(dialogHwnd: number): void {
     if (paintTraceEnabled) logPaintRequest(dialogHwnd, true, 'posted');
 
     const system = System.getInstance();
+    // Only SUPPLY an update region, never overwrite one: a caller that already invalidated
+    // (InvalidateRect with a rect and bErase=FALSE is the whole point of the API) has said
+    // exactly what to repaint, and widening that to the full client with an erase would
+    // make every partial repaint a full one.
+    if (!hasPendingUpdate(dialogHwnd)) invalidateWindow(dialogHwnd, rect, true);
     system.windowManager.postMessage(dialogHwnd, WM_PAINT, 0, 0);
     system.scheduler.wakeMessageWaiters();
     Logger.log(LogCategory.USER32,
@@ -199,6 +213,33 @@ export function eraseControlOverlayRect(child: WindowInfo): boolean {
     return restoreClientRectFromAncestors(child);
 }
 
+/**
+ * A dialog's fill covers its rect UNION its children's (see paintDialogBackground), so it
+ * SHRINKS whenever the guest moves template-positioned controls back inside the client —
+ * which every launcher does in WM_INITDIALOG, between two of our repaints. On a flat
+ * overlay the vacated ring is nobody's pixels afterwards and survives the whole session
+ * as a gray halo around the dialog. Clear it before the smaller fill lands; the clear's
+ * repair hook redraws whatever else overlapped it, and this window is excluded because
+ * it is about to repaint itself.
+ */
+function dropVacatedOverlayFill(hwnd: number): void {
+    const win = windows.get(hwnd);
+    if (!win) return;
+    const previous = win.lastOverlayFillBounds;
+    const next = getWindowVisualBounds(hwnd);
+    if (!next) return;
+    win.lastOverlayFillBounds = next;
+    if (!previous) return;
+    const contained = previous.x >= next.x && previous.y >= next.y
+        && previous.x + previous.w <= next.x + next.w
+        && previous.y + previous.h <= next.y + next.h;
+    if (contained) return;
+    System.getInstance().gdiContext.clearOverlayRect?.(
+        previous.x - 2, previous.y - 2, previous.w + 4, previous.h + 4,
+        { excludeRepairHwnd: hwnd },
+    );
+}
+
 function paintDialogBackground(win: WindowInfo, hdc: number, gdi: GDIContext): void {
     // Fill the dialog's full VISUAL bounds (rect ∪ child rects), not just its own
     // rect: a game can size the dialog window smaller than its template-laid-out
@@ -206,7 +247,7 @@ function paintDialogBackground(win: WindowInfo, hdc: number, gdi: GDIContext): v
     // the overflowing children sitting on black instead of the gray dialog face.
     const bounds = getWindowVisualBounds(win.handle)
         ?? (() => { const { x, y } = getAbsoluteWindowPosition(win); return { x, y, w: win.width, h: win.height }; })();
-    const hBrush = gdi.createSolidBrush(COLOR_DLGFACE);
+    const hBrush = gdi.createSolidBrush(dlgFaceColorRef());
     const prevBrush = gdi.selectObject(hdc, hBrush);
     gdi.fillRect(hdc, bounds.x, bounds.y, bounds.x + bounds.w, bounds.y + bounds.h);
     gdi.selectObject(hdc, prevBrush);
@@ -330,6 +371,7 @@ function paintWindowSubtreeToOverlay(
 export function paintDialogToOverlay(dialogHwnd: number, mode: 'full' | 'controls' = 'full'): void {
     const system = System.getInstance();
     const gdi = system.gdiContext;
+    if (mode === 'full') dropVacatedOverlayFill(dialogHwnd);
     const hdc = gdi.createOverlayDC();
     if (!hdc) return;
 

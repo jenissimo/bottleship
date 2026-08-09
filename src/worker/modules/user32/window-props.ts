@@ -8,10 +8,26 @@ import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { Marshaler } from '../../core/memory/marshaler';
 import { Mem } from '../../core/memory/mem-accessor';
-import { windows } from './shared-state';
+import { windows, type WindowInfo } from './shared-state';
 import { eraseControlOverlayRect, repaintDialogAfterContentChange } from './dialog-paint';
 import { applyControlSetText } from './dialog-control-messages';
 import { encodeAnsi } from '../codepage-utils';
+import { getDefDlgProcAddress } from './system-classes';
+
+/**
+ * What GWL_WNDPROC reports. For an un-subclassed `#32770` that is DefDlgProc, not the
+ * app's DlgProc: Win32 keeps the DlgProc in DWLP_DLGPROC and lets DefDlgProc call it.
+ * Our dispatch calls the DlgProc directly, but a subclasser (MFC's AfxWndProc, ATL, a
+ * raw SetWindowLong) stores this value and calls it for everything it does not handle —
+ * handing back the DlgProc makes that chain a no-op, because a DlgProc answers FALSE
+ * and does no default processing (no BeginPaint, hence no WM_ERASEBKGND/WM_DRAWITEM).
+ */
+function reportedWndProc(window: WindowInfo): number {
+    const wndProc = window.wndProc >>> 0;
+    if (window.nativeClassName !== '#32770' || !wndProc) return wndProc;
+    if (wndProc !== ((window.extraBytes?.[1] ?? 0) >>> 0)) return wndProc; // already subclassed
+    return getDefDlgProcAddress() || wndProc;
+}
 
 export function registerWindowPropExports(exports: Record<string, ThunkImplementation>): void {
     exports['SetWindowLongA'] = (ctx, mem, args) => {
@@ -56,7 +72,7 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
 
         switch (idx) {
             case GWL_WNDPROC:
-                prev = window.wndProc >>> 0;
+                prev = reportedWndProc(window);
                 window.wndProc = dwNewLong >>> 0;
                 // A system control given a guest wndProc is subclassed (e.g. MFC custom
                 // CStatic/CButton that paints itself). It now owns its own painting —
@@ -118,7 +134,7 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
 
         switch (idx) {
             case GWL_WNDPROC:
-                return window.wndProc >>> 0;
+                return reportedWndProc(window);
             case GWL_ID:
                 return (window.controlId ?? 0) >>> 0;
             case GWL_STYLE:

@@ -56,7 +56,10 @@ function registerTreeViewClasses(): void {
 function registerBarClasses(): void {
     registerClass("ToolbarWindow32", 4);
     registerClass("msctls_statusbar32", 4);
-    registerClass("msctls_trackbar32", 4);
+    // controlClass is what makes CreateWindowEx mark the window isSystemControl —
+    // without it the class exists but its window is an inert plain child: no painter,
+    // and TBM_*/PBM_* never reach the control message sink.
+    registerClass("msctls_trackbar32", 4, "msctls_trackbar32");
     registerClass(TOOLTIPS_CLASS, 4);
 }
 
@@ -70,7 +73,7 @@ function registerUpDownClass(): void {
 }
 
 function registerProgressClass(): void {
-    registerClass("msctls_progress32", 4);
+    registerClass("msctls_progress32", 4, "msctls_progress32");
 }
 
 function registerHotKeyClass(): void {
