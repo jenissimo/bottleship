@@ -33,6 +33,7 @@
  *    must match the values written into AVISTREAMINFOA (+20/+24).
  */
 
+import { toPlainGuestMemory } from "../core/memory/guest-memory";
 import { IModule } from "../core/module";
 import { Process } from "../core/process";
 import { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
@@ -120,7 +121,7 @@ export class Avifil32 implements IModule {
 
     private getMemory(): Uint8Array {
         const v86 = this.process.v86;
-        return v86["mem8"] || (v86["v86"] && v86["v86"]["cpu"]["mem8"]);
+        return toPlainGuestMemory(v86["mem8"] || (v86["v86"] && v86["v86"]["cpu"]["mem8"]));
     }
 
     private normalizeVfsPath(filePath: string): string {

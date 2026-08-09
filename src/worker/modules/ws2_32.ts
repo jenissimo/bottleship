@@ -22,11 +22,14 @@ import {
     makeSelect,
     makeFdIsSet,
     WSAENOTSOCK,
+    WSAENOTCONN,
+    WSAEWOULDBLOCK,
 } from "./wsa-stub-shared";
 
 const WSA_INVALID_EVENT = 0xffffffff;
 const WSANOTINITIALISED = 10093;
 const WSAEINVAL = 10022;
+const WSAEOPNOTSUPP = 10045;
 const WSA_WAIT_TIMEOUT = 258;
 const WSA_WAIT_FAILED = 0xffffffff;
 
@@ -269,6 +272,69 @@ export class Ws2_32 implements IModule {
             view.setUint32(lpNetworkEvents, 0, true);
             view.setUint32(lpNetworkEvents + 4, 0, true);
             return 0;
+        };
+
+        // Winsock 2 scatter/gather over the same socket table as send/recv. The
+        // non-overlapped form is the whole contract we can honor; an OVERLAPPED request or
+        // completion routine is refused outright, because the alternative is a caller
+        // waiting forever on a completion nothing will ever post. Declared-but-unhandled
+        // is not an option here: that path returns 50, which is neither 0 nor SOCKET_ERROR.
+        const wsaBufTotal = (lpBuffers: number, count: number): number => {
+            let total = 0;
+            for (let i = 0; i < count; i++) total += (Mem.readUint32(lpBuffers + i * 8) ?? 0) >>> 0;
+            return total;
+        };
+        const wsaSend = (args: number[], overlappedIdx: number): number => {
+            if (!requireStarted()) return SOCKET_ERROR;
+            const s = args[0] | 0;
+            if (args[overlappedIdx] || args[overlappedIdx + 1]) {
+                setError(WSAEOPNOTSUPP);
+                return SOCKET_ERROR;
+            }
+            if (args[3]) Mem.writeUint32(args[3] >>> 0, 0);
+            if (!this.socketTable.isValid(s)) {
+                setError(WSAENOTSOCK);
+                return SOCKET_ERROR;
+            }
+            if (!args[1] || !args[2]) {
+                setError(WSAEFAULT);
+                return SOCKET_ERROR;
+            }
+            const sent = this.socketTable.send(s, wsaBufTotal(args[1] >>> 0, args[2] >>> 0));
+            if (sent === SOCKET_ERROR) {
+                setError(WSAENOTCONN);
+                return SOCKET_ERROR;
+            }
+            if (args[3]) Mem.writeUint32(args[3] >>> 0, sent >>> 0);
+            setError(0);
+            return 0;
+        };
+        const wsaRecv = (args: number[], overlappedIdx: number): number => {
+            if (!requireStarted()) return SOCKET_ERROR;
+            const s = args[0] | 0;
+            if (args[overlappedIdx] || args[overlappedIdx + 1]) {
+                setError(WSAEOPNOTSUPP);
+                return SOCKET_ERROR;
+            }
+            if (args[3]) Mem.writeUint32(args[3] >>> 0, 0);
+            if (args[4]) Mem.writeUint32(args[4] >>> 0, 0);
+            if (!this.socketTable.isValid(s)) {
+                setError(WSAENOTSOCK);
+                return SOCKET_ERROR;
+            }
+            // The table never has data pending, so a recv is always "would block".
+            setError(this.socketTable.recv(s) === SOCKET_ERROR ? WSAEWOULDBLOCK : 0);
+            return SOCKET_ERROR;
+        };
+        this.exports["WSASend"] = (_ctx, _mem, args) => wsaSend(args, 5);
+        this.exports["WSASendTo"] = (_ctx, _mem, args) => wsaSend(args, 7);
+        this.exports["WSARecv"] = (_ctx, _mem, args) => wsaRecv(args, 5);
+        this.exports["WSARecvFrom"] = (_ctx, _mem, args) => wsaRecv(args, 7);
+        this.exports["WSAGetOverlappedResult"] = (_ctx, _mem, args) => {
+            if (args[2]) Mem.writeUint32(args[2] >>> 0, 0);
+            if (args[4]) Mem.writeUint32(args[4] >>> 0, 0);
+            setError(WSAEOPNOTSUPP);
+            return 0;   // FALSE — no overlapped request was ever accepted
         };
 
         this.exports["inet_pton"] = () => 0;

@@ -1,66 +1,161 @@
 import { IModule } from "../core/module";
 import { Process } from "../core/process";
 import { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
-import { Marshaler } from "../core/memory/marshaler";
+import { Mem } from "../core/memory/mem-accessor";
+import { System } from "../core/system";
+import { LoadedPEModule } from "../core/module-registry";
 import { Logger, LogCategory } from "../core/logger";
 import { encodeAnsi } from "./codepage-utils";
+import { getVirtualProcessManager, VIRTUAL_CURRENT_PROCESS_ID } from "./kernel32/process/virtual-process-manager";
+
+/**
+ * PSAPI — process/module enumeration over the real ModuleRegistry.
+ *
+ * Every answer here has to agree with what kernel32's toolhelp snapshot and
+ * GetModuleFileName report: crash reporters (Gothic's SHW32) walk BOTH and treat a
+ * disagreement as a corrupted process image.
+ */
+
+/** Modules a psapi walk may see: the EXE plus every real DLL mapped from the VFS. */
+function enumerableModules(): LoadedPEModule[] {
+    const registry = System.getInstance().process?.moduleRegistry;
+    if (!registry) return [];
+    const mods = registry.getAllModules().filter(m => m.isExecutable || m.isRealDll);
+    // EnumProcessModules documents the EXE as the first entry; callers use [0] as
+    // "the process image" without re-checking.
+    mods.sort((a, b) => (b.isExecutable ? 1 : 0) - (a.isExecutable ? 1 : 0));
+    return mods;
+}
+
+/**
+ * A handle that names no registered image has no MODULEINFO, and every caller here
+ * fails rather than substitute one: reporting the EXE for an unknown HMODULE hands
+ * back a base/size pair for a different module, which a pattern scanner then walks.
+ * resolvePeModuleBase already maps NULL and the 0x400000 placeholder to the EXE.
+ */
+function moduleFor(hModule: number): LoadedPEModule | undefined {
+    const registry = System.getInstance().process?.moduleRegistry;
+    if (!registry) return undefined;
+    return registry.getByBase(registry.resolvePeModuleBase(hModule >>> 0));
+}
+
+function baseNameOf(mod: LoadedPEModule): string {
+    return mod.path ? (mod.path.split("\\").pop() ?? mod.name) : mod.name;
+}
+
+/** Shared A/W tail of GetModuleBaseName / GetModuleFileNameEx: copy, truncate, count. */
+function writeAnsi(text: string, ptr: number, nSize: number): number {
+    if (!ptr || nSize === 0) return 0;
+    const bytes = encodeAnsi(text);
+    const copied = Math.min(bytes.length, nSize - 1);
+    if (Mem.writeBytes(ptr, bytes.subarray(0, copied)) !== copied) return 0;
+    if (!Mem.writeUint8(ptr + copied, 0)) return 0;
+    return copied;
+}
+
+function writeWide(text: string, ptr: number, nSize: number): number {
+    if (!ptr || nSize === 0) return 0;
+    const copied = Math.min(text.length, nSize - 1);
+    for (let i = 0; i < copied; i++) {
+        if (!Mem.writeUint16(ptr + i * 2, text.charCodeAt(i))) return 0;
+    }
+    if (!Mem.writeUint16(ptr + copied * 2, 0)) return 0;
+    return copied;
+}
 
 export class Psapi implements IModule {
     name = "psapi";
     exports: Record<string, ThunkImplementation> = {};
 
     initialize(process: Process): void {
-        // BOOL GetModuleInformation(HANDLE hProcess, HMODULE hModule, LPMODULEINFO lpmodinfo, DWORD cb)
-        // MODULEINFO = { LPVOID lpBaseOfDll; DWORD SizeOfImage; LPVOID EntryPoint; } (12 bytes)
-        this.exports["GetModuleInformation"] = (ctx, mem, args) => {
-            const hModule = args[1];
-            const lpmodinfo = args[2];
-            const cb = args[3];
+        // BOOL EnumProcesses(DWORD* lpidProcess, DWORD cb, DWORD* lpcbNeeded)
+        this.exports["EnumProcesses"] = (ctx, mem, args) => {
+            const lpidProcess = args[0] >>> 0;
+            const cb = args[1] >>> 0;
+            const lpcbNeeded = args[2] >>> 0;
 
-            if (!lpmodinfo || cb < 12) {
-                return { value: 0, stackCleanup: 16 }; // FALSE
+            const pids = [VIRTUAL_CURRENT_PROCESS_ID >>> 0];
+            for (const entry of getVirtualProcessManager().listProcessSnapshotEntries()) {
+                if (!pids.includes(entry.pid)) pids.push(entry.pid);
             }
 
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            view.setUint32(lpmodinfo, hModule >>> 0, true);     // lpBaseOfDll
-            view.setUint32(lpmodinfo + 4, 0x10000, true);       // SizeOfImage (64K placeholder)
-            view.setUint32(lpmodinfo + 8, hModule >>> 0, true); // EntryPoint
-            return { value: 1, stackCleanup: 16 }; // TRUE
+            // cb is a BYTE count; a caller that sized the buffer too small gets the
+            // truncated list and a "needed" of what FIT (documented psapi quirk — the
+            // caller detects truncation by needed === cb, not by a larger value).
+            const fits = Math.min(pids.length, Math.floor(cb / 4));
+            for (let i = 0; i < fits; i++) {
+                if (!Mem.writeUint32(lpidProcess + i * 4, pids[i])) return 0;
+            }
+            if (lpcbNeeded && !Mem.writeUint32(lpcbNeeded, fits * 4)) return 0;
+            return 1;
+        };
+
+        // BOOL EnumProcessModules(HANDLE hProcess, HMODULE* lphModule, DWORD cb, LPDWORD lpcbNeeded)
+        const enumModules = (lphModule: number, cb: number, lpcbNeeded: number): number => {
+            const mods = enumerableModules();
+            const fits = Math.min(mods.length, Math.floor(cb / 4));
+            for (let i = 0; i < fits; i++) {
+                if (!Mem.writeUint32(lphModule + i * 4, mods[i].baseAddress >>> 0)) return 0;
+            }
+            // Unlike EnumProcesses, lpcbNeeded here IS the full requirement, so a caller
+            // can grow the buffer and retry.
+            if (lpcbNeeded && !Mem.writeUint32(lpcbNeeded, mods.length * 4)) return 0;
+            return 1;
+        };
+
+        this.exports["EnumProcessModules"] = (ctx, mem, args) =>
+            enumModules(args[1] >>> 0, args[2] >>> 0, args[3] >>> 0);
+
+        // BOOL EnumProcessModulesEx(HANDLE, HMODULE*, DWORD, LPDWORD, DWORD dwFilterFlag)
+        // We are 32-bit only, so LIST_MODULES_32BIT/64BIT/ALL all select the same set.
+        this.exports["EnumProcessModulesEx"] = (ctx, mem, args) =>
+            enumModules(args[1] >>> 0, args[2] >>> 0, args[3] >>> 0);
+
+        // DWORD GetModuleBaseNameA(HANDLE hProcess, HMODULE hModule, LPSTR lpBaseName, DWORD nSize)
+        this.exports["GetModuleBaseNameA"] = (ctx, mem, args) => {
+            const mod = moduleFor(args[1] >>> 0);
+            if (!mod) return 0;
+            return writeAnsi(baseNameOf(mod), args[2] >>> 0, args[3] >>> 0);
+        };
+
+        this.exports["GetModuleBaseNameW"] = (ctx, mem, args) => {
+            const mod = moduleFor(args[1] >>> 0);
+            if (!mod) return 0;
+            return writeWide(baseNameOf(mod), args[2] >>> 0, args[3] >>> 0);
         };
 
         // DWORD GetModuleFileNameExA(HANDLE hProcess, HMODULE hModule, LPSTR lpFilename, DWORD nSize)
         this.exports["GetModuleFileNameExA"] = (ctx, mem, args) => {
-            const lpFilename = args[2];
-            const nSize = args[3];
-
-            const name = "C:\\program.exe";
-            if (!lpFilename || nSize === 0) {
-                return { value: 0, stackCleanup: 16 };
-            }
-
-            const bytes = encodeAnsi(name + "\0");
-            const toWrite = Math.min(bytes.length, nSize);
-            mem.set(bytes.slice(0, toWrite), lpFilename);
-            if (toWrite === nSize) mem[lpFilename + nSize - 1] = 0; // ensure null-term
-            return { value: Math.min(name.length, nSize - 1), stackCleanup: 16 };
+            const mod = moduleFor(args[1] >>> 0);
+            if (!mod) return 0;
+            return writeAnsi(mod.path || `C:\\${baseNameOf(mod)}`, args[2] >>> 0, args[3] >>> 0);
         };
 
         this.exports["GetModuleFileNameExW"] = (ctx, mem, args) => {
-            const lpFilename = args[2];
-            const nSize = args[3];
+            const mod = moduleFor(args[1] >>> 0);
+            if (!mod) return 0;
+            return writeWide(mod.path || `C:\\${baseNameOf(mod)}`, args[2] >>> 0, args[3] >>> 0);
+        };
 
-            const name = "C:\\program.exe";
-            if (!lpFilename || nSize === 0) {
-                return { value: 0, stackCleanup: 16 };
-            }
+        // BOOL GetModuleInformation(HANDLE hProcess, HMODULE hModule, LPMODULEINFO lpmodinfo, DWORD cb)
+        // MODULEINFO = { LPVOID lpBaseOfDll; DWORD SizeOfImage; LPVOID EntryPoint; }
+        this.exports["GetModuleInformation"] = (ctx, mem, args) => {
+            const lpmodinfo = args[2] >>> 0;
+            const cb = args[3] >>> 0;
+            if (!lpmodinfo || cb < 12) return 0;
 
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            const toWrite = Math.min(name.length, nSize - 1);
-            for (let i = 0; i < toWrite; i++) {
-                view.setUint16(lpFilename + i * 2, name.charCodeAt(i), true);
-            }
-            view.setUint16(lpFilename + toWrite * 2, 0, true);
-            return { value: toWrite, stackCleanup: 16 };
+            const mod = moduleFor(args[1] >>> 0);
+            if (!mod) return 0;
+            // SizeOfImage bounds the range a symbol resolver accepts as "inside this
+            // module"; a placeholder here silently drops every address past it.
+            const ok = Mem.writeUint32(lpmodinfo, mod.baseAddress >>> 0)
+                && Mem.writeUint32(lpmodinfo + 4, mod.size >>> 0)
+                && Mem.writeUint32(lpmodinfo + 8, (mod.baseAddress + mod.entryPoint) >>> 0);
+            if (!ok) return 0;
+            Logger.verbose(LogCategory.KERNEL32,
+                `GetModuleInformation(0x${(args[1] >>> 0).toString(16)}) -> "${mod.name}" ` +
+                `base=0x${mod.baseAddress.toString(16)} size=0x${mod.size.toString(16)}`);
+            return 1;
         };
     }
 }

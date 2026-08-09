@@ -162,6 +162,8 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("_open", 2),
         makeFunc("_sopen", 4),
         makeFunc("_close", 1),
+        makeFunc("_chsize", 2),
+        makeFunc("_chsize_s", 3),   // fd + __int64 size (two stack dwords)
         makeFunc("_read", 3),
         makeFunc("_write", 3),
         makeFunc("_lseek", 3),
@@ -194,6 +196,7 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("_strupr", 1),
         makeFunc("strtok", 2),
         makeFunc("memcmp", 3),
+        makeFunc("_memicmp", 3),
 
         // Conversion functions
         makeFunc("strtol", 3),
@@ -267,6 +270,8 @@ export const msvcrtModule: ModuleDescriptor = {
 
         // High-level file I/O (FILE* based)
         makeFunc("fopen", 2),
+        makeFunc("_fsopen", 3),
+        makeFunc("_wfsopen", 3),
         makeFunc("_wfopen", 2),
         makeFunc("wfopen", 2),
         makeFunc("fclose", 1),
@@ -408,6 +413,11 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("_EH_prolog", 0),
         makeFunc("_mbctype", 0),
         makeFunc("_setmbcp", 1),
+        makeFunc("_getmbcp", 0),
+        makeFunc("_mbsicmp", 2),
+        makeFunc("_mbsnbcpy", 3),
+        makeFunc("_mbctolower", 1),
+        makeFunc("_mbctoupper", 1),
         makeFunc("_mbsnbicmp", 3),
         makeFunc("_mbsdec", 2),
         makeFunc("_ismbcspace", 1),

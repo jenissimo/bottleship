@@ -174,6 +174,18 @@ export class Oleaut32 implements IModule {
         };
         this.exports["VariantCopy"] = this.exports["ord_10"];
 
+        // HRESULT VariantCopyInd(VARIANTARG* pvargDest, const VARIANTARG* pvargSrc)
+        // Same as VariantCopy except a VT_BYREF source is dereferenced first, so the
+        // destination owns a value rather than a pointer into the caller's storage.
+        this.exports["ord_11"] = (ctx, mem, args) => {
+            const pvargDest = args[0] >>> 0;
+            const pvargSrc = args[1] >>> 0;
+            if (!pvargDest || !pvargSrc) return E_INVALIDARG;
+            if (pvargDest + 16 > mem.length || pvargSrc + 16 > mem.length) return E_INVALIDARG;
+            return this.variantCopyInd(mem, pvargDest, pvargSrc);
+        };
+        this.exports["VariantCopyInd"] = this.exports["ord_11"];
+
         const variantChangeType = (ctx: unknown, mem: Uint8Array, args: number[]) => {
             const pvargDest = args[0] >>> 0;
             const pvargSrc = args[1] >>> 0;
@@ -324,6 +336,41 @@ export class Oleaut32 implements IModule {
         }
         mem.set(mem.subarray(src + 2, src + 16), dest + 2);
         return S_OK;
+    }
+
+    /** VariantCopy after resolving one level of VT_BYREF indirection on the source. */
+    private variantCopyInd(mem: Uint8Array, dest: number, src: number): number {
+        const srcVt = this.readVariantType(mem, src);
+        if (!(srcVt & VT_BYREF)) return this.variantCopy(mem, dest, src);
+
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const vt = srcVt & VT_TYPEMASK;
+        const ref = view.getUint32(src + 8, true) >>> 0;
+        if (!ref) return E_INVALIDARG;
+
+        this.variantClear(mem, dest);
+        view.setUint16(dest, vt, true);
+        switch (vt) {
+            case VT_I2: view.setInt16(dest + 8, view.getInt16(ref, true), true); return S_OK;
+            case VT_I4:
+            case VT_UI4: view.setUint32(dest + 8, view.getUint32(ref, true), true); return S_OK;
+            case VT_R4: view.setFloat32(dest + 8, view.getFloat32(ref, true), true); return S_OK;
+            case VT_R8: view.setFloat64(dest + 8, view.getFloat64(ref, true), true); return S_OK;
+            case VT_BOOL: view.setInt16(dest + 8, view.getInt16(ref, true), true); return S_OK;
+            case VT_BSTR:
+                // A BYREF BSTR points at the BSTR variable, not at the characters.
+                view.setUint32(dest + 8, this.copyBstr(mem, view.getUint32(ref, true) >>> 0), true);
+                return S_OK;
+            case VT_EMPTY:
+            case VT_NULL: return S_OK;
+            default:
+                // VT_VARIANT|VT_BYREF and the interface types need a second indirection or
+                // an AddRef we cannot fake; failing is safer than handing back a pointer
+                // the caller will free as a value.
+                view.setUint16(dest, VT_EMPTY, true);
+                Logger.warn(LogCategory.SYSTEM, `VariantCopyInd: unsupported byref type vt=0x${vt.toString(16)}`);
+                return E_INVALIDARG;
+        }
     }
 
     private variantChangeType(mem: Uint8Array, dest: number, src: number, vtNew: number): number {

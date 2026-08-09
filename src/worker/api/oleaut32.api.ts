@@ -40,6 +40,8 @@ export const oleaut32Module: ModuleDescriptor = {
         makeFunc("VariantClear", 1),
         makeFunc("ord_10", 2, { ordinal: 10 }),   // VariantCopy(VARIANT*, VARIANT*)
         makeFunc("VariantCopy", 2),
+        makeFunc("ord_11", 2, { ordinal: 11 }),   // VariantCopyInd(VARIANT*, VARIANT*)
+        makeFunc("VariantCopyInd", 2),
         makeFunc("ord_12", 4, { ordinal: 12 }),   // VariantChangeType
         makeFunc("VariantChangeType", 4),
         makeFunc("ord_13", 6, { ordinal: 13 }),   // VariantChangeTypeEx

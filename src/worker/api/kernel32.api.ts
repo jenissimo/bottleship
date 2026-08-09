@@ -270,6 +270,7 @@ export const kernel32Module: ModuleDescriptor = {
         makeFunc("WaitForDebugEvent", 2),
         makeFunc("GetConsoleMode", 2),
         makeFunc("SetConsoleMode", 2),
+        makeFunc("GetConsoleWindow", 0),
         // Console text/screen-buffer APIs (HL's engine/sw.dll import these for its dev console).
         makeFunc("GetConsoleScreenBufferInfo", 2),
         makeFunc("SetConsoleTextAttribute", 2),

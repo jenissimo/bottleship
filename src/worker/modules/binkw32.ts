@@ -210,7 +210,7 @@ export class BinkW32 implements IModule {
     }
 
     private getMemory(): Uint8Array {
-        return this.process.v86.mem8 || (this.process.v86.v86 && this.process.v86.v86.cpu.mem8);
+        return this.process.getCurrentMemory();
     }
 
     private writeU32(mem: Uint8Array, addr: number, value: number): void {
@@ -637,9 +637,22 @@ export class BinkW32 implements IModule {
             return 0;
         };
 
-        // BinkSetVolume — no-op
+        // BinkSetVolume — no-op. Two ABI generations ship under this name: pre-1.9
+        // BinkSetVolume(HBINK, S32 volume) and 1.9+ BinkSetVolume(HBINK, U32 trackid,
+        // S32 volume). Both must be DECLARED: with only one, the registry's
+        // single-variant base-name fallback sizes the other from it, and the stub's
+        // RET N then differs from what the caller pushed. A 4-byte ESP drift moves every
+        // local in the caller's frame, so the fault lands far away with nothing pointing
+        // back here (Gothic's Bink intro: a stack-local zFILE read as a NULL vtable).
         this.exports["_BinkSetVolume@12"] = (_ctx, _mem, args) => {
             console.log(`[BINK] BinkSetVolume(bink=0x${args[0].toString(16)}, track=${args[1]}, vol=${args[2]})`);
+            return 0;
+        };
+        // Same handler shape as @12: the `@8` decoration is stale, the caller passes
+        // (handle, trackid, volume) — see the descriptor note in binkw32.api.ts.
+        this.exports["_BinkSetVolume@8"] = (_ctx, _mem, args) => {
+            Logger.verbose(LogCategory.SYSTEM,
+                `[BINK] BinkSetVolume(bink=0x${args[0].toString(16)}, track=${args[1]}, vol=${args[2]})`);
             return 0;
         };
 

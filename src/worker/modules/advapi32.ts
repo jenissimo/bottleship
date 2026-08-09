@@ -18,7 +18,16 @@ const HKEY_CURRENT_CONFIG = 0x80000005;
 const HKEY_DYN_DATA = 0x80000006;
 const ERROR_INVALID_HANDLE = 6;
 const ERROR_INVALID_PARAMETER = 87;
+const ERROR_ACCESS_DENIED = 5;
+const ERROR_INSUFFICIENT_BUFFER = 122;
+const ERROR_SERVICE_DISABLED = 1058;
+const ERROR_SERVICE_NOT_ACTIVE = 1062;
+const SERVICE_STATUS_SIZE = 28;
+const SERVICE_KERNEL_DRIVER = 1;
+const SERVICE_STOPPED = 1;
+const SERVICE_NO_CHANGE = 0xffffffff;
 const ERROR_UNKNOWN_REVISION = 1305;
+const ERROR_NO_TOKEN = 1008;
 const SECURITY_DESCRIPTOR_REVISION = 1;
 const SECURITY_DESCRIPTOR_MIN_LENGTH = 20;
 const SE_DACL_PRESENT = 0x0004;
@@ -1403,6 +1412,195 @@ export class Advapi32 implements IModule {
             return { value: 1, stackCleanup: 4 };
         };
 
+        // Service control/query. Nothing here can run a kernel driver, so every verb that
+        // would need one FAILS — a declared-but-unimplemented export returns
+        // ERROR_NOT_SUPPORTED (50) in EAX, which a BOOL-returning caller reads as TRUE
+        // over an untouched SERVICE_STATUS.
+        const serviceObject = (handle: number): any | null => {
+            const obj = process.resourceProvider.getKernelObject(handle >>> 0);
+            return obj && obj.kind === "service" ? obj : null;
+        };
+        /** SERVICE_STATUS (28 bytes): stopped, and stopped is the truth. */
+        const writeStoppedStatus = (mem: Uint8Array, ptr: number, svc: any): boolean => {
+            if (!ptr || !isValidAddress(mem, ptr, SERVICE_STATUS_SIZE, "rw")) return false;
+            const buf = new Uint8Array(SERVICE_STATUS_SIZE);
+            new DataView(buf.buffer).setUint32(0, svc.serviceType ?? SERVICE_KERNEL_DRIVER, true);
+            new DataView(buf.buffer).setUint32(4, SERVICE_STOPPED, true);
+            return Mem.writeBytes(ptr, buf) > 0;
+        };
+
+        this.exports["StartServiceA"] = (ctx, mem, args) => {
+            const svc = serviceObject(args[0]);
+            if (!svc) {
+                system.scheduler.setLastError(ERROR_INVALID_HANDLE);
+                return { value: 0, stackCleanup: 12 };
+            }
+            Logger.log(LogCategory.SYSTEM, `StartServiceA("${svc.name}") -> ERROR_SERVICE_DISABLED (no kernel-mode services)`);
+            system.scheduler.setLastError(ERROR_SERVICE_DISABLED);
+            return { value: 0, stackCleanup: 12 };
+        };
+
+        this.exports["ControlService"] = (ctx, mem, args) => {
+            const svc = serviceObject(args[0]);
+            if (!svc) {
+                system.scheduler.setLastError(ERROR_INVALID_HANDLE);
+                return { value: 0, stackCleanup: 12 };
+            }
+            writeStoppedStatus(mem, args[2] >>> 0, svc);
+            system.scheduler.setLastError(ERROR_SERVICE_NOT_ACTIVE);
+            return { value: 0, stackCleanup: 12 };
+        };
+
+        this.exports["QueryServiceStatus"] = (ctx, mem, args) => {
+            const svc = serviceObject(args[0]);
+            if (!svc) {
+                system.scheduler.setLastError(ERROR_INVALID_HANDLE);
+                return { value: 0, stackCleanup: 8 };
+            }
+            if (!writeStoppedStatus(mem, args[1] >>> 0, svc)) {
+                system.scheduler.setLastError(ERROR_INVALID_PARAMETER);
+                return { value: 0, stackCleanup: 8 };
+            }
+            system.scheduler.setLastError(0);
+            return { value: 1, stackCleanup: 8 };
+        };
+
+        this.exports["DeleteService"] = (ctx, mem, args) => {
+            const svc = serviceObject(args[0]);
+            if (!svc) {
+                system.scheduler.setLastError(ERROR_INVALID_HANDLE);
+                return { value: 0, stackCleanup: 4 };
+            }
+            svc.deleted = true;
+            system.scheduler.setLastError(0);
+            return { value: 1, stackCleanup: 4 };
+        };
+
+        // QUERY_SERVICE_CONFIGA: a 36-byte header whose five string pointers must point
+        // INTO the caller's own buffer, so the whole thing is sized first and the caller
+        // gets ERROR_INSUFFICIENT_BUFFER plus the byte count when its buffer is short.
+        this.exports["QueryServiceConfigA"] = (ctx, mem, args) => {
+            const lpServiceConfig = args[1] >>> 0;
+            const cbBufSize = args[2] >>> 0;
+            const pcbBytesNeeded = args[3] >>> 0;
+            const svc = serviceObject(args[0]);
+            if (!svc) {
+                system.scheduler.setLastError(ERROR_INVALID_HANDLE);
+                return { value: 0, stackCleanup: 16 };
+            }
+            const header = 36;
+            const placed: { off: number; bytes: Uint8Array }[] = [];
+            let cursor = header;
+            const place = (s: string, trailingNuls = 1): number => {
+                const bytes = encodeAnsi(s ?? "");
+                const off = cursor;
+                placed.push({ off, bytes });
+                cursor += bytes.length + trailingNuls;
+                return off;
+            };
+            const binOff = place(svc.binaryPath ?? "");
+            const grpOff = place(svc.loadOrderGroup ?? "");
+            const depOff = place(svc.dependencies ?? "", 2);   // REG_MULTI_SZ: double-NUL
+            const usrOff = place(svc.startName ?? "");
+            const dspOff = place(svc.displayName ?? svc.name ?? "");
+            const needed = cursor;
+            if (pcbBytesNeeded) Mem.writeUint32(pcbBytesNeeded, needed);
+            if (!lpServiceConfig || cbBufSize < needed
+                || !isValidAddress(mem, lpServiceConfig, needed, "rw")) {
+                system.scheduler.setLastError(cbBufSize < needed ? ERROR_INSUFFICIENT_BUFFER : ERROR_INVALID_PARAMETER);
+                return { value: 0, stackCleanup: 16 };
+            }
+            const buf = new Uint8Array(needed);
+            const view = new DataView(buf.buffer);
+            view.setUint32(0, svc.serviceType ?? SERVICE_KERNEL_DRIVER, true);
+            view.setUint32(4, svc.startType ?? 3, true);       // SERVICE_DEMAND_START
+            view.setUint32(8, svc.errorControl ?? 0, true);
+            view.setUint32(12, (lpServiceConfig + binOff) >>> 0, true);
+            view.setUint32(16, (lpServiceConfig + grpOff) >>> 0, true);
+            view.setUint32(20, 0, true);                        // dwTagId
+            view.setUint32(24, (lpServiceConfig + depOff) >>> 0, true);
+            view.setUint32(28, (lpServiceConfig + usrOff) >>> 0, true);
+            view.setUint32(32, (lpServiceConfig + dspOff) >>> 0, true);
+            for (const s of placed) buf.set(s.bytes, s.off);
+            Mem.writeBytes(lpServiceConfig, buf);
+            system.scheduler.setLastError(0);
+            return { value: 1, stackCleanup: 16 };
+        };
+
+        this.exports["ChangeServiceConfigA"] = (ctx, mem, args) => {
+            const svc = serviceObject(args[0]);
+            if (!svc) {
+                system.scheduler.setLastError(ERROR_INVALID_HANDLE);
+                return { value: 0, stackCleanup: 44 };
+            }
+            const noChange = (v: number) => (v >>> 0) === SERVICE_NO_CHANGE;
+            if (!noChange(args[1])) svc.serviceType = args[1] >>> 0;
+            if (!noChange(args[2])) svc.startType = args[2] >>> 0;
+            if (!noChange(args[3])) svc.errorControl = args[3] >>> 0;
+            if (args[4]) svc.binaryPath = Marshaler.readString(mem, args[4] >>> 0);
+            if (args[5]) svc.loadOrderGroup = Marshaler.readString(mem, args[5] >>> 0);
+            if (args[7]) svc.dependencies = Marshaler.readString(mem, args[7] >>> 0);
+            if (args[8]) svc.startName = Marshaler.readString(mem, args[8] >>> 0);
+            if (args[10]) svc.displayName = Marshaler.readString(mem, args[10] >>> 0);
+            if (args[6]) Mem.writeUint32(args[6] >>> 0, 0);   // lpdwTagId
+            system.scheduler.setLastError(0);
+            return { value: 1, stackCleanup: 44 };
+        };
+
+        // No security descriptors exist behind these services; a locked-down box answers
+        // the same way, and it is a branch callers handle.
+        this.exports["QueryServiceObjectSecurity"] = (ctx, mem, args) => {
+            if (args[4]) Mem.writeUint32(args[4] >>> 0, 0);   // pcbBytesNeeded
+            system.scheduler.setLastError(ERROR_ACCESS_DENIED);
+            return { value: 0, stackCleanup: 20 };
+        };
+        this.exports["SetServiceObjectSecurity"] = () => {
+            system.scheduler.setLastError(ERROR_ACCESS_DENIED);
+            return { value: 0, stackCleanup: 12 };
+        };
+
+        // The SCM database is single-threaded here, so the lock always succeeds; its
+        // handle has to be non-NULL or the caller treats the call as failed.
+        this.exports["LockServiceDatabase"] = (ctx, mem, args) => {
+            const scm = process.resourceProvider.getKernelObject(args[0] >>> 0);
+            if (!scm || scm.kind !== "scm") {
+                system.scheduler.setLastError(ERROR_INVALID_HANDLE);
+                return { value: 0, stackCleanup: 4 };
+            }
+            const handle = process.resourceProvider.registerKernelObject({ kind: "sc_lock" });
+            system.scheduler.setLastError(0);
+            return { value: handle >>> 0, stackCleanup: 4 };
+        };
+        this.exports["UnlockServiceDatabase"] = (ctx, mem, args) => {
+            const lock = process.resourceProvider.getKernelObject(args[0] >>> 0);
+            if (!lock || lock.kind !== "sc_lock") {
+                system.scheduler.setLastError(ERROR_INVALID_HANDLE);
+                return { value: 0, stackCleanup: 4 };
+            }
+            process.resourceProvider.unregisterKernelObject(args[0] >>> 0);
+            system.scheduler.setLastError(0);
+            return { value: 1, stackCleanup: 4 };
+        };
+
+        // BOOLEAN SystemFunction036(PVOID pbBuffer, ULONG ulLen) — RtlGenRandom. Callers
+        // seed an RNG from it and never check the return, so it must actually write.
+        this.exports["SystemFunction036"] = (ctx, mem, args) => {
+            const pbBuffer = args[0] >>> 0;
+            const ulLen = args[1] >>> 0;
+            if (!pbBuffer || ulLen === 0 || !isValidAddress(mem, pbBuffer, ulLen, "rw")) {
+                system.scheduler.setLastError(ERROR_INVALID_PARAMETER);
+                return { value: 0, stackCleanup: 8 };
+            }
+            const random = new Uint8Array(ulLen);
+            // getRandomValues refuses more than 65536 bytes per call.
+            for (let off = 0; off < ulLen; off += 0x10000) {
+                crypto.getRandomValues(random.subarray(off, Math.min(off + 0x10000, ulLen)));
+            }
+            mem.set(random, pbBuffer);
+            system.scheduler.setLastError(0);
+            return { value: 1, stackCleanup: 8 };
+        };
+
         this.exports["StartServiceCtrlDispatcherA"] = (ctx, mem, args) => {
             const lpServiceStartTable = args[0] >>> 0;
             Logger.verbose(LogCategory.SYSTEM, `StartServiceCtrlDispatcherA(table=0x${lpServiceStartTable.toString(16)})`);
@@ -1659,6 +1857,19 @@ export class Advapi32 implements IModule {
                 view.setUint32(pTokenHandle, 0x1ACC, true); // dummy token handle
             }
             return { value: 1, stackCleanup: 12 }; // TRUE
+        };
+
+        // OpenThreadToken - open the access token of a thread
+        // BOOL OpenThreadToken(HANDLE ThreadHandle, DWORD DesiredAccess, BOOL OpenAsSelf, PHANDLE TokenHandle)
+        // A thread only has a token while impersonating; ours never does, so the faithful
+        // answer is failure with ERROR_NO_TOKEN — the branch callers take to fall back to
+        // OpenProcessToken. Handing out the process token instead makes an impersonation
+        // check silently succeed.
+        this.exports["OpenThreadToken"] = (ctx, mem, args) => {
+            const pTokenHandle = args[3] >>> 0;
+            if (pTokenHandle) Mem.writeUint32(pTokenHandle, 0);
+            system.scheduler.setLastError(ERROR_NO_TOKEN);
+            return { value: 0, stackCleanup: 16 }; // FALSE
         };
 
         // GetTokenInformation - retrieve information about an access token

@@ -125,6 +125,30 @@ function getSpecialFolderPath(csidl: number): string {
     }
 }
 
+/**
+ * KNOWNFOLDERID (a GUID) → the CSIDL that names the same folder, so both shell-folder APIs
+ * answer from one table. Only the folders a game or a mod loader actually asks for; anything
+ * else must fail rather than be silently aliased to C:\.
+ */
+const KNOWN_FOLDER_CSIDL: Record<string, number> = {
+    "fdd39ad0-238f-46af-adb4-6c85480369c7": 0x05, // Documents      → CSIDL_PERSONAL
+    "3eb685db-65f9-4cf6-a03a-e3ef65729f3d": 0x1a, // RoamingAppData → CSIDL_APPDATA
+    "f1b32785-6fba-4fcf-9d55-7b8e7f157091": 0x1c, // LocalAppData   → CSIDL_LOCAL_APPDATA
+    "f38bf404-1d43-42f2-9305-67de0b28fc23": 0x24, // Windows        → CSIDL_WINDOWS
+    "1ac14e77-02e7-4e5d-b744-2eb1ae5198b7": 0x25, // System         → CSIDL_SYSTEM
+    "905e63b6-c1bf-494e-b29c-65b732d3d21a": 0x26, // ProgramFiles   → CSIDL_PROGRAM_FILES
+};
+
+/** GUID bytes (little-endian Data1/2/3 + big-endian Data4) → canonical lowercase string. */
+function csidlForKnownFolderId(guid: Uint8Array | null): number | undefined {
+    if (!guid || guid.length < 16) return undefined;
+    const hex = (n: number): string => guid[n].toString(16).padStart(2, "0");
+    const key =
+        `${hex(3)}${hex(2)}${hex(1)}${hex(0)}-${hex(5)}${hex(4)}-${hex(7)}${hex(6)}-` +
+        `${hex(8)}${hex(9)}-${hex(10)}${hex(11)}${hex(12)}${hex(13)}${hex(14)}${hex(15)}`;
+    return KNOWN_FOLDER_CSIDL[key];
+}
+
 function ensureSpecialFolderPath(path: string): void {
     if (/^[A-Za-z]:\\?$/.test(path.trim())) return;
 
@@ -567,6 +591,41 @@ export class Shell32 implements IModule {
                 }
                 view.setUint16(pszPath + path.length * 2, 0, true);
             }
+            return 0; // S_OK
+        };
+
+        // HRESULT SHGetKnownFolderPath(REFKNOWNFOLDERID rfid, DWORD dwFlags, HANDLE hToken,
+        //                              PWSTR *ppszPath)
+        // The Vista+ replacement for SHGetFolderPath, and the one modern loaders reach for
+        // (Ultimate ASI Loader). Unlike its predecessor it OUT-ALLOCATES: the caller passes a
+        // PWSTR* and frees the result with CoTaskMemFree. A stub returning S_OK without
+        // writing *ppszPath is worse than failing — the caller dereferences whatever was in
+        // that variable. On any path we cannot map, fail and NULL the out-param.
+        this.exports["SHGetKnownFolderPath"] = (ctx, mem, args) => {
+            const rfid = args[0] >>> 0;
+            const ppszPath = args[3] >>> 0;
+            const E_FAIL = 0x80004005;
+            const E_INVALIDARG = 0x80070057;
+
+            if (!ppszPath) return E_INVALIDARG;
+            Mem.writeUint32(ppszPath, 0);
+            if (!rfid) return E_INVALIDARG;
+
+            const csidl = csidlForKnownFolderId(Mem.readBytes(rfid, 16));
+            if (csidl === undefined) return E_FAIL;
+
+            const path = getSpecialFolderPath(csidl);
+            ensureSpecialFolderPath(path);
+
+            // CoTaskMemAlloc semantics: the caller owns the buffer (CoTaskMemFree is a no-op
+            // for us, matching ole32's own allocator).
+            const bytes = (path.length + 1) * 2;
+            const buf = System.getInstance().process?.memory?.alloc(bytes);
+            if (!buf) return E_FAIL;
+            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            for (let i = 0; i < path.length; i++) view.setUint16(buf + i * 2, path.charCodeAt(i), true);
+            view.setUint16(buf + path.length * 2, 0, true);
+            Mem.writeUint32(ppszPath, buf >>> 0);
             return 0; // S_OK
         };
 

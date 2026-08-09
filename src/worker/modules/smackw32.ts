@@ -184,7 +184,7 @@ export class SmackW32 implements IModule {
     private loggedUnknownHandles: Set<number> = new Set();
 
     private getMemory(): Uint8Array {
-        return this.process.v86.mem8 || (this.process.v86.v86 && this.process.v86.v86.cpu.mem8);
+        return this.process.getCurrentMemory();
     }
 
     private writeU32(mem: Uint8Array, addr: number, value: number): void {

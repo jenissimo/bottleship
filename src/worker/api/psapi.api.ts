@@ -21,5 +21,10 @@ export const psapiModule: ModuleDescriptor = {
         makeFunc("GetModuleInformation", 4),
         makeFunc("GetModuleFileNameExA", 4),
         makeFunc("GetModuleFileNameExW", 4),
+        makeFunc("GetModuleBaseNameA", 4),
+        makeFunc("GetModuleBaseNameW", 4),
+        makeFunc("EnumProcesses", 3),
+        makeFunc("EnumProcessModules", 4),
+        makeFunc("EnumProcessModulesEx", 5),
     ],
 };

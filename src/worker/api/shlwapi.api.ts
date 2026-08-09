@@ -44,6 +44,8 @@ export const shlwapiModule: ModuleDescriptor = {
         makeFunc("PathRelativePathToW", 5),
         makeFunc("PathRemoveExtensionA", 1),
         makeFunc("PathRemoveExtensionW", 1),
+        makeFunc("PathRenameExtensionA", 2), // pszPath, pszExt
+        makeFunc("PathRenameExtensionW", 2),
         makeFunc("UrlUnescapeA", 4),
         makeFunc("UrlUnescapeW", 4),
     ],

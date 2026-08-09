@@ -142,5 +142,12 @@ export const ws2_32Module: ModuleDescriptor = {
         makeFunc("WSAWaitForMultipleEvents", 5),
         makeFunc("WSAEventSelect", 3),
         makeFunc("WSAEnumNetworkEvents", 3),
+        // Overlapped I/O — the Winsock 2 scatter/gather calls. Anything built against a
+        // modern SDK links these instead of send/recv (Ultimate ASI Loader does).
+        makeFunc("WSAGetOverlappedResult", 5), // s, lpOverlapped, lpcbTransfer, fWait, lpdwFlags
+        makeFunc("WSASend", 7),     // s, buffers, count, lpNumberOfBytesSent, flags, overlapped, completion
+        makeFunc("WSASendTo", 9),   // ... + lpTo, iTolen
+        makeFunc("WSARecv", 7),     // s, buffers, count, lpNumberOfBytesRecvd, lpFlags, overlapped, completion
+        makeFunc("WSARecvFrom", 9), // ... + lpFrom, lpFromlen
     ],
 };

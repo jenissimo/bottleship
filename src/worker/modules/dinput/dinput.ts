@@ -30,6 +30,7 @@ const DIERR_INVALIDPARAM = 0x80070057;
 const DIERR_OUTOFMEMORY = 0x8007000E;
 const DIERR_NOTACQUIRED = 0x8007000C; // ERROR_INVALID_ACCESS (0x0C) — was wrongly 0x1E
 const DIERR_INPUTLOST = 0x8007001E;   // ERROR_READ_FAULT (0x1E)
+const DIERR_DEVICENOTREG = 0x80040154; // REGDB_E_CLASSNOTREG
 
 // DI8 action-mapping constants (dinput.h) — keyboard semantics / defaults live in dinput-action-maps.ts
 const DIDFT_BUTTON = 0x0000000c;
@@ -339,6 +340,7 @@ export class DInput implements IModule {
 
         // Register COM object factories
         ComObjectFactory.register("89521360-AA8A-11CF-BFC7-444553540000", DirectInputObject); // IDirectInputA
+        ComObjectFactory.register("9a4cb684-236d-11d3-8e9d-00c04f6844ae", DirectInputObject); // IDirectInput7A
         ComObjectFactory.register(IID_IDIRECTINPUT8A, DirectInputObject); // IDirectInput8A
         ComObjectFactory.register(IID_IDIRECTINPUT8W, DirectInputObject); // IDirectInput8W
         ComObjectFactory.register("5944e680-c92e-11cf-bfc7-444553540000", DirectInputDeviceObject); // IDirectInputDeviceA
@@ -356,6 +358,7 @@ export class DInput implements IModule {
 
             if (!ppDI) return DIERR_INVALIDPARAM;
 
+            // DirectInputCreateA names no IID — it is defined to return IDirectInputA.
             const vtableAddr = this.vtables.IDirectInputA.address;
             const obj = ComObjectFactory.create("89521360-AA8A-11CF-BFC7-444553540000", vtableAddr);
             if (!obj) return DIERR_OUTOFMEMORY;
@@ -377,12 +380,24 @@ export class DInput implements IModule {
             const dwVersion = args[1];
             const ppvOut = args[3];
 
-            Logger.log(LogCategory.SYSTEM, `DirectInputCreateEx called: hinst=0x${hinst.toString(16)}, dwVersion=${dwVersion}, ppvOut=0x${ppvOut.toString(16)}`);
+            const riidBytes = args[2] ? this.readGuidBytes(mem, args[2]) : null;
+            const riidStr = riidBytes
+                ? Array.from(riidBytes).map(b => b.toString(16).padStart(2, "0")).join("")
+                : "(null)";
+            Logger.log(LogCategory.SYSTEM, `DirectInputCreateEx called: hinst=0x${hinst.toString(16)}, dwVersion=0x${dwVersion.toString(16)}, riid=${riidStr}, ppvOut=0x${ppvOut.toString(16)}`);
 
             if (!ppvOut) return DIERR_INVALIDPARAM;
 
-            const vtableAddr = this.vtables.IDirectInputA.address;
-            const obj = ComObjectFactory.create("89521360-AA8A-11CF-BFC7-444553540000", vtableAddr);
+            // Honour the requested interface. IID_IDirectInput2A/7A carry FindDevice and
+            // CreateDeviceEx past the end of the IDirectInputA vtable, and a guest that
+            // calls one on the short vtable reads adjacent stub bytes as a function
+            // pointer (EIP=0xb077ba00) — the same defect the IDirectInput8A note below
+            // describes, one interface generation earlier. Gothic asks for
+            // IID_IDirectInput7A and calls CreateDeviceEx at index 9 immediately.
+            const { iid, vtableName } = this.resolveDirectInputCreateExInterface(mem, args[2]);
+            const vtableAddr = this.vtables[vtableName]?.address;
+            if (!vtableAddr) return DIERR_OUTOFMEMORY;
+            const obj = ComObjectFactory.create(iid, vtableAddr);
             if (!obj) return DIERR_OUTOFMEMORY;
 
             const objAddr = allocateComObject(this.process.memory, mem, vtableAddr);
@@ -392,7 +407,8 @@ export class DInput implements IModule {
 
             resourceProvider.mapAddressToHandle(objAddr, obj.handle);
 
-            Logger.log(LogCategory.SYSTEM, `DirectInputCreateEx -> 0x${objAddr.toString(16)} (handle=0x${obj.handle.toString(16)})`);
+            Logger.log(LogCategory.SYSTEM,
+                `DirectInputCreateEx -> 0x${objAddr.toString(16)} (${vtableName}, handle=0x${obj.handle.toString(16)})`);
             return DI_OK;
         };
 
@@ -1405,6 +1421,29 @@ export class DInput implements IModule {
         // methods so the vtable has the correct length. Calling EnumDevicesBySemantics
         // (index 9 / offset 0x24) on the shorter DX7 vtable read past its end → wild
         // indirect call to 0xb077ba00 (adjacent callback stub bytes) → NFSU freeze/OOB.
+        // IDirectInput7A: the DX7 interface DirectInputCreateEx is asked for. Same five
+        // DX7 methods, plus the two the shorter IDirectInputA vtable lacks.
+        this.exports["IDirectInput7A_QueryInterface"] = this.exports["IDirectInputA_QueryInterface"];
+        this.exports["IDirectInput7A_AddRef"] = this.exports["IDirectInputA_AddRef"];
+        this.exports["IDirectInput7A_Release"] = this.exports["IDirectInputA_Release"];
+        this.exports["IDirectInput7A_CreateDevice"] = this.exports["IDirectInputA_CreateDevice"];
+        this.exports["IDirectInput7A_EnumDevices"] = this.exports["IDirectInputA_EnumDevices"];
+        this.exports["IDirectInput7A_GetDeviceStatus"] = this.exports["IDirectInputA_GetDeviceStatus"];
+        this.exports["IDirectInput7A_RunControlPanel"] = this.exports["IDirectInputA_RunControlPanel"];
+        this.exports["IDirectInput7A_Initialize"] = this.exports["IDirectInputA_Initialize"];
+        // FindDevice(rguidClass, ptszName, pguidInstance) — we keep no name->instance
+        // registry, and DI_OK leaves the caller handing its uninitialised stack GUID to
+        // CreateDevice. Report the device as unregistered and NULL the out-GUID.
+        this.exports["IDirectInput7A_FindDevice"] = (_ctx, _mem, args) => {
+            if (args[3]) Mem.writeBytes(args[3] >>> 0, new Uint8Array(16));
+            return DIERR_DEVICENOTREG;
+        };
+        // CreateDeviceEx(rguid, riid, ppvObj, punkOuter) differs from CreateDevice only by
+        // the extra IID; every device interface we hand out is the same object, so the call
+        // forwards with the out-pointer moved into CreateDevice's slot.
+        this.exports["IDirectInput7A_CreateDeviceEx"] = (ctx, mem, args) =>
+            this.exports["IDirectInputA_CreateDevice"]!(ctx, mem, [args[0], args[1], args[3], args[4]]);
+
         this.exports["IDirectInput8A_QueryInterface"] = this.exports["IDirectInputA_QueryInterface"];
         this.exports["IDirectInput8A_AddRef"] = this.exports["IDirectInputA_AddRef"];
         this.exports["IDirectInput8A_Release"] = this.exports["IDirectInputA_Release"];
@@ -1416,7 +1455,7 @@ export class DInput implements IModule {
         this.exports["IDirectInput8A_GetDeviceStatus"] = this.exports["IDirectInputA_GetDeviceStatus"];
         this.exports["IDirectInput8A_RunControlPanel"] = this.exports["IDirectInputA_RunControlPanel"];
         this.exports["IDirectInput8A_Initialize"] = this.exports["IDirectInputA_Initialize"];
-        this.exports["IDirectInput8A_FindDevice"] = () => DI_OK;
+        this.exports["IDirectInput8A_FindDevice"] = this.exports["IDirectInput7A_FindDevice"];
         // CreateDevice on IDirectInput8 must hand back an IDirectInputDevice8A (the full vtable
         // with Build/SetActionMap), not the DX7 Device2A — a DI8 game may action-map a device it
         // created directly. The DX7 IDirectInputA_CreateDevice path keeps returning Device2A.
@@ -1562,6 +1601,23 @@ export class DInput implements IModule {
         const objAddr = allocateComObject(this.process.memory, mem, vtableAddr);
         SystemResourceProvider.getInstance().mapAddressToHandle(objAddr, obj.handle);
         return objAddr;
+    }
+
+    /** DirectInputCreateEx riid -> the vtable that actually has the methods it will call. */
+    private resolveDirectInputCreateExInterface(
+        mem: Uint8Array,
+        riidPtr: number,
+    ): { iid: string; vtableName: "IDirectInputA" | "IDirectInput7A" } {
+        const DI7A = { iid: "9a4cb684-236d-11d3-8e9d-00c04f6844ae", vtableName: "IDirectInput7A" as const };
+        if (!riidPtr) return DI7A;
+        const b = this.readGuidBytes(mem, riidPtr);
+        // Data1 little-endian: IID_IDirectInputA = 0x89521360, IID_IDirectInput2A = 0x5944e662.
+        const data1 = (b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24)) >>> 0;
+        if (data1 === 0x89521360) {
+            return { iid: "89521360-AA8A-11CF-BFC7-444553540000", vtableName: "IDirectInputA" };
+        }
+        // IDirectInput2A is a strict prefix of IDirectInput7A, so the longer vtable serves both.
+        return DI7A;
     }
 
     private resolveDirectInput8Interface(
@@ -1917,7 +1973,7 @@ export class DInput implements IModule {
     }
 
     private getMemory(): Uint8Array {
-        return this.process.v86.mem8 || (this.process.v86.v86 && this.process.v86.v86.cpu.mem8);
+        return this.process.getCurrentMemory();
     }
 
 

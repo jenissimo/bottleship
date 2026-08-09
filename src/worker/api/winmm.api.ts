@@ -117,6 +117,12 @@ export const winmmModule: ModuleDescriptor = {
         makeFunc("midiInGetID", 2),
         makeFunc("midiInGetNumDevs", 0),
         makeFunc("midiInGetDevCapsA", 3),
+        makeFunc("midiOutGetDevCapsA", 3),   // uDeviceID, lpCaps, cbCaps
+        // MIDI stream API — the Miles RSX/synth drivers (Mssrsx.m3d) link these.
+        makeFunc("midiStreamOpen", 6),       // lphms, puDeviceID, cMidi, dwCallback, dwInstance, fdwOpen
+        makeFunc("midiStreamOut", 3),        // hms, pmh, cbmh
+        makeFunc("midiStreamPosition", 3),   // hms, lpmmt, cbmmt
+        makeFunc("midiStreamProperty", 3),   // hms, lppropdata, dwProperty
         makeFunc("midiInMessage", 4),
         makeFunc("midiInOpen", 5),
         makeFunc("midiInReset", 1),
@@ -131,6 +137,9 @@ export const winmmModule: ModuleDescriptor = {
         makeFunc("midiOutReset", 1),
         makeFunc("midiOutSetVolume", 2),
         makeFunc("midiOutShortMsg", 2),
+        makeFunc("midiOutLongMsg", 3),
+        makeFunc("midiOutPrepareHeader", 3),
+        makeFunc("midiOutUnprepareHeader", 3),
         makeFunc("midiStreamClose", 1),
         makeFunc("midiStreamPause", 1),
         makeFunc("midiStreamRestart", 1),

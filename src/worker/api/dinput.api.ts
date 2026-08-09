@@ -53,12 +53,32 @@ export const IDirectInputA: InterfaceDescriptor = {
     inherits: "IUnknown",
     iid: "89521360-AA8A-11CF-BFC7-444553540000",
     methods: [
-        ...IUnknown.methods.map(m => ({ ...m, name: m.name })),
+        ...IUnknown.methods,
         makeMethod("CreateDevice", 4),
         makeMethod("EnumDevices", 5),
         makeMethod("GetDeviceStatus", 2),
         makeMethod("RunControlPanel", 3),
         makeMethod("Initialize", 3),
+    ],
+};
+
+// IDirectInput7A — what a DX7 title asks DirectInputCreateEx for. Extends IDirectInputA
+// with FindDevice (IDirectInput2, index 8) and CreateDeviceEx (IDirectInput7, index 9).
+// Handing back the shorter IDirectInputA vtable for this IID is the same defect the
+// IDirectInput8A comment below describes, one interface generation earlier.
+export const IDirectInput7A: InterfaceDescriptor = {
+    name: "IDirectInput7A",
+    inherits: "IUnknown",
+    iid: "9a4cb684-236d-11d3-8e9d-00c04f6844ae",
+    methods: [
+        ...IUnknown.methods,
+        makeMethod("CreateDevice", 4),
+        makeMethod("EnumDevices", 5),
+        makeMethod("GetDeviceStatus", 2),
+        makeMethod("RunControlPanel", 3),
+        makeMethod("Initialize", 3),
+        makeMethod("FindDevice", 4),
+        makeMethod("CreateDeviceEx", 5),
     ],
 };
 
@@ -72,7 +92,7 @@ export const IDirectInput8A: InterfaceDescriptor = {
     inherits: "IUnknown",
     iid: "bf798030-483a-4da2-aa99-5d64ed369700",
     methods: [
-        ...IUnknown.methods.map(m => ({ ...m, name: m.name })),
+        ...IUnknown.methods,
         makeMethod("CreateDevice", 4),
         makeMethod("EnumDevices", 5),
         makeMethod("GetDeviceStatus", 2),
@@ -99,7 +119,7 @@ export const IDirectInputDeviceA: InterfaceDescriptor = {
     inherits: "IUnknown",
     iid: "5944e680-c92e-11cf-bfc7-444553540000",
     methods: [
-        ...IUnknown.methods.map(m => ({ ...m, name: m.name })),
+        ...IUnknown.methods,
         makeMethod("GetCapabilities", 2),
         makeMethod("EnumObjects", 4),
         makeMethod("GetProperty", 3),
@@ -213,6 +233,7 @@ export const dinputModule: ModuleDescriptor = {
     ],
     interfaces: [
         IDirectInputA,
+        IDirectInput7A,
         IDirectInput8A,
         IDirectInput8W,
         IDirectInputDeviceA,

@@ -333,6 +333,8 @@ export class Msvcrt implements IModule {
         exports["_open"] = (ctx, mem, args) => this.open(args[0] ?? 0, args[1] ?? 0);
         exports["_sopen"] = (ctx, mem, args) => this.sopen(args[0] ?? 0, args[1] ?? 0, args[2] ?? 0, args[3] ?? 0);
         exports["_close"] = (ctx, mem, args) => this.close(args[0] ?? 0);
+        exports["_chsize"] = (ctx, mem, args) => this.chsize(args[0] ?? 0, args[1] ?? 0);
+        exports["_chsize_s"] = (ctx, mem, args) => this.chsizeS(args[0] ?? 0, args[1] ?? 0, args[2] ?? 0);
         exports["_read"] = (ctx, mem, args) => this.read(ctx, mem, args[0] ?? 0, args[1] ?? 0, args[2] ?? 0);
         exports["_write"] = (ctx, mem, args) => this.write(args[0] ?? 0, args[1] ?? 0, args[2] ?? 0);
         exports["_lseek"] = (ctx, mem, args) => this.lseek(args[0] ?? 0, args[1] ?? 0, args[2] ?? 0);
@@ -373,6 +375,7 @@ export class Msvcrt implements IModule {
             compareCString: (a, b, ci, n) => this.compareCString(a, b, ci, n),
             ischartype: (ch, mask) => this.ischartype(ch, mask),
             setMbcp: (cp) => this.setMbcp(cp),
+            getMbcp: () => this.getMbcp(),
         });
 
         // --- Conversion functions — see crt-conv.ts ---
@@ -489,6 +492,10 @@ export class Msvcrt implements IModule {
 
         // --- High-level file I/O (FILE* based) ---
         exports["fopen"] = (ctx, mem, args) => this.fopen(args[0] ?? 0, args[1] ?? 0);
+        // FILE* _fsopen(path, mode, shflag) — fopen plus a share mode. Our VFS has no
+        // mandatory locking, so every share mode resolves to the same open.
+        exports["_fsopen"] = (ctx, mem, args) => this.fopen(args[0] ?? 0, args[1] ?? 0);
+        exports["_wfsopen"] = (ctx, mem, args) => this.wfopen(args[0] ?? 0, args[1] ?? 0);
         exports["_wfopen"] = (ctx, mem, args) => this.wfopen(args[0] ?? 0, args[1] ?? 0);
         exports["wfopen"] = exports["_wfopen"];
         exports["fclose"] = (ctx, mem, args) => this.fclose(args[0] ?? 0);
@@ -1040,6 +1047,12 @@ export class Msvcrt implements IModule {
         return 0;
     }
 
+    /** int _getmbcp(void) — the active multibyte code page, or 0 when the locale is SBCS. */
+    private getMbcp(): number {
+        const cp = EmulatorConfig.getInstance().ansiCodePage;
+        return Msvcrt.DBCS_CODE_PAGES.has(cp) ? cp : 0;
+    }
+
     private strerrorMessage(errnoVal: number): string {
         switch (errnoVal) {
             case 1: return "Operation not permitted";
@@ -1220,13 +1233,19 @@ export class Msvcrt implements IModule {
     /** Terminating half of exit(), shared with the atexit chain's terminal step. */
     private beginProcessExit(exitCode: number): void {
         const system = System.getInstance();
-        // Same durability barrier ExitProcess raises: whatever the exit path just
-        // wrote is still sitting in the overlay's write buffers.
-        system.fileSystem.flushAll().catch((e) => {
-            Logger.warn(LogCategory.SYSTEM, `msvcrt.exit: flushAll failed: ${e}`);
-        });
         system.isExiting = true;
         system.scheduler.exitThread(exitCode);
+        // C exit() ends the PROCESS, so the host gets the same notification ExitProcess
+        // sends — behind the same durability barrier. This is the path the atexit chain
+        // ends on, i.e. exactly where a game's settings write has just happened and is
+        // still sitting in the overlay's buffers.
+        let exitFault: unknown;
+        try {
+            exitFault = system.buildProcessExitReport(exitCode);
+        } catch (e) {
+            Logger.warn(LogCategory.SYSTEM, `msvcrt.exit: exit report failed: ${e}`);
+        }
+        system.postProcessExitWhenDurable({ exitCode: exitCode >>> 0, fault: exitFault });
     }
 
     private exitProcess(code: number): ThunkResult {
@@ -1789,6 +1808,38 @@ export class Msvcrt implements IModule {
             return -1;
         }
         return written;
+    }
+
+    /** int _chsize(int fd, long size) — set the file's length, growing with zeros. */
+    private chsize(fd: number, size: number): number | Promise<ThunkResult> {
+        return this.chsizeImpl(fd, size | 0, false);
+    }
+
+    /**
+     * errno_t _chsize_s(int fd, __int64 size) — the secure variant differs twice: the size is
+     * 64-bit (two stack dwords) and the errno IS the return value, 0 on success.
+     */
+    private chsizeS(fd: number, lo: number, hi: number): number | Promise<ThunkResult> {
+        return this.chsizeImpl(fd, (hi | 0) * 0x1_0000_0000 + (lo >>> 0), true);
+    }
+
+    private chsizeImpl(fd: number, length: number, errnoIsResult: boolean): number | Promise<ThunkResult> {
+        const fail = (errno: number): number => {
+            this.setErrno(errno);
+            return errnoIsResult ? errno : -1;
+        };
+        const handle = this.fds.get(fd);
+        if (!handle) return fail(9); // EBADF
+        if (length < 0) return fail(22); // EINVAL
+        const vfs = System.getInstance().fileSystem;
+        return (async (): Promise<ThunkResult> => {
+            try {
+                await vfs.truncateAt(handle.path, length);
+                return { value: 0 };
+            } catch {
+                return { value: fail(13) }; // EACCES
+            }
+        })();
     }
 
     private lseek(fd: number, offset: number, origin: number): number {

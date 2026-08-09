@@ -54,6 +54,22 @@ export const advapi32Module: ModuleDescriptor = {
         makeFunc("CreateServiceA", 13),
         makeFunc("OpenServiceA", 3),
         makeFunc("CloseServiceHandle", 1),
+        // Service control/query set — copy-protection drivers (SafeDisc's drvmgt.dll)
+        // install and poke a kernel service through these, and one missing name fails
+        // the whole DLL's load.
+        makeFunc("StartServiceA", 3),                  // hService, dwNumServiceArgs, lpServiceArgVectors
+        makeFunc("ControlService", 3),                 // hService, dwControl, lpServiceStatus
+        makeFunc("DeleteService", 1),
+        makeFunc("QueryServiceStatus", 2),             // hService, lpServiceStatus
+        makeFunc("QueryServiceConfigA", 4),            // hService, lpServiceConfig, cbBufSize, pcbBytesNeeded
+        makeFunc("ChangeServiceConfigA", 11),          // hService, type, start, error, path, group, tagId, deps, user, pw, display
+        makeFunc("QueryServiceObjectSecurity", 5),     // hService, si, lpSecurityDescriptor, cbBufSize, pcbBytesNeeded
+        makeFunc("SetServiceObjectSecurity", 3),       // hService, si, lpSecurityDescriptor
+        makeFunc("LockServiceDatabase", 1),
+        makeFunc("UnlockServiceDatabase", 1),
+        // RtlGenRandom, exported only under this name — the CRT and mod code use it as
+        // the system entropy source.
+        makeFunc("SystemFunction036", 2),    // pbBuffer, ulLen
         makeFunc("StartServiceCtrlDispatcherA", 1),
         makeFunc("RegisterServiceCtrlHandlerA", 2),
         makeFunc("SetServiceStatus", 2),
@@ -66,6 +82,7 @@ export const advapi32Module: ModuleDescriptor = {
         makeFunc("AddAccessAllowedAce", 4),
         makeFunc("AddAccessDeniedAce", 4),
         makeFunc("OpenProcessToken", 3),
+        makeFunc("OpenThreadToken", 4),
         makeFunc("GetTokenInformation", 5),
         makeFunc("RegEnumKeyA", 4),
         makeFunc("RegQueryValueA", 4),

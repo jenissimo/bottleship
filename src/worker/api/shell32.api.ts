@@ -41,6 +41,7 @@ export const shell32Module: ModuleDescriptor = {
         makeFunc("SHAppBarMessage", 2), // dwMessage, pData
         makeFunc("SHGetFolderPathA", 5), // hwnd, csidl, hToken, dwFlags, pszPath
         makeFunc("SHGetFolderPathW", 5),
+        makeFunc("SHGetKnownFolderPath", 4), // rfid, dwFlags, hToken, ppszPath
         makeFunc("CommandLineToArgvW", 2), // lpCmdLine, pNumArgs
         makeFunc("DragAcceptFiles", 2), // hWnd, fAccept
         makeFunc("IsUserAnAdmin", 0),

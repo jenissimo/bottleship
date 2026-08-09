@@ -23,13 +23,20 @@ export const dbghelpModule: ModuleDescriptor = {
         makeFunc("SymSetOptions", 1),
         makeFunc("SymGetOptions", 0),
         makeFunc("SymGetModuleBase", 2),
-        makeFunc("SymGetModuleBase64", 2),
+        // A DWORD64 argument occupies two stack dwords on x86 stdcall — the *64 variants
+        // and SymFromAddr take one, so their RET N is one dword wider than the 32-bit form.
+        makeFunc("SymGetModuleBase64", 3),
         makeFunc("SymLoadModule", 6),
         makeFunc("SymFunctionTableAccess", 2),
-        makeFunc("SymFunctionTableAccess64", 2),
+        makeFunc("SymFunctionTableAccess64", 3),
         makeFunc("SymGetLineFromAddr", 4),
         makeFunc("SymGetSymFromAddr", 4),
         makeFunc("StackWalk", 9),
         makeFunc("StackWalk64", 9),
+        makeFunc("UnDecorateSymbolName", 4),
+        makeFunc("ImageNtHeader", 1),
+        makeFunc("SymFromAddr", 5), // hProcess, Address (DWORD64), Displacement, Symbol
+        // hProcess, ProcessId, hFile, DumpType, ExceptionParam, UserStreamParam, CallbackParam
+        makeFunc("MiniDumpWriteDump", 7),
     ],
 };
