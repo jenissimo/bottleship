@@ -8,6 +8,7 @@ import { FastPathImplementation, ThunkImplementation, type X86Context } from '..
 import type { ThunkMemoryRegions } from '../../core/thunking/thunk-memory-manager';
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
+import type { PESection } from '../../core/module-registry';
 import { type RegionPerms } from '../../core/memory/address-space';
 import { Mem } from '../../core/memory/mem-accessor';
 import { registerGuestCommitNotifier } from '../../core/memory/guest-page-commit';
@@ -1078,6 +1079,58 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         return perms as RegionPerms;
     };
 
+    // IMAGE_SCN_MEM_{EXECUTE,READ,WRITE}
+    const SCN_EXECUTE = 0x20000000, SCN_READ = 0x40000000, SCN_WRITE = 0x80000000;
+
+    function sectionProtect(characteristics: number): number {
+        const x = (characteristics & SCN_EXECUTE) !== 0;
+        const w = (characteristics & SCN_WRITE) !== 0;
+        const r = (characteristics & SCN_READ) !== 0;
+        if (x) return w ? PAGE_EXECUTE_READWRITE : PAGE_EXECUTE_READ;
+        if (w) return PAGE_READWRITE;
+        return r ? PAGE_READONLY : PAGE_NOACCESS;
+    }
+
+    /**
+     * The [start, end) run of same-protection pages inside a loaded image that contains
+     * `pageBase`, and that protection — Windows' MEMORY_BASIC_INFORMATION granularity for
+     * MEM_IMAGE. Adjacent sections with equal protection coalesce, as they do on Windows.
+     * The PE headers (before the first section) are read-only. An image whose sections we
+     * did not record falls back to the whole span as PAGE_EXECUTE_READ.
+     */
+    function imageProtectionRun(mod: { baseAddress: number; size: number; sections?: PESection[] },
+                                pageBase: number): { end: number; protect: number } {
+        const imageEnd = mod.baseAddress + mod.size;
+        const sections = mod.sections;
+        if (!sections?.length) return { end: imageEnd, protect: PAGE_EXECUTE_READ };
+
+        // Section bounds in ascending address order, page-aligned as the loader mapped them.
+        const spans = sections
+            .map((s) => ({
+                start: (mod.baseAddress + s.virtualAddress) & ~0xFFF,
+                end: (mod.baseAddress + s.virtualAddress + Math.max(s.virtualSize, s.rawSize) + 0xFFF) & ~0xFFF,
+                protect: sectionProtect(s.characteristics),
+            }))
+            .sort((a, b) => a.start - b.start);
+
+        const first = spans[0]!;
+        if (pageBase < first.start) return { end: first.start, protect: PAGE_READONLY }; // PE headers
+
+        let i = spans.findIndex((s) => pageBase >= s.start && pageBase < s.end);
+        if (i < 0) {
+            // A gap between sections (or past the last one): report to the next section start.
+            const next = spans.find((s) => s.start > pageBase);
+            return { end: next ? next.start : imageEnd, protect: PAGE_NOACCESS };
+        }
+        const protect = spans[i]!.protect;
+        let end = spans[i]!.end;
+        while (i + 1 < spans.length && spans[i + 1]!.start === end && spans[i + 1]!.protect === protect) {
+            i++;
+            end = spans[i]!.end;
+        }
+        return { end: Math.min(end, imageEnd) || imageEnd, protect };
+    }
+
     exports['VirtualQuery'] = (ctx, mem, args) => {
         const lpAddress = args[0] >>> 0;
         const lpBuffer = args[1];
@@ -1131,14 +1184,21 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 (a >= MEM_ROM_BASE && a < MEM_SURFACE_BASE) ||
                 (a >= MEM_SURFACE_BASE && a < surfaceFrontier);
 
-            // 1) PE module image — report the whole image as one MEM_IMAGE region.
+            // 1) PE module image. AllocationBase is the image base, but the REGION is the run
+            //    of pages sharing one protection — for an image that means per-SECTION, which
+            //    is what Windows reports. Handing back the whole image as one PAGE_EXECUTE_READ
+            //    span is not a harmless simplification: the query-protect-patch-restore dance
+            //    every exe patcher performs (ASI loaders, SilentPatch, packers) then restores
+            //    RX over .data and .bss too, and the game's next global write takes an access
+            //    violation far from the patcher.
             const mod = moduleRegistry?.getModuleContainingAddress(lpAddress) ?? null;
             if (mod) {
                 allocationBase = mod.baseAddress;
-                regionSize = mod.size - (pageBase - mod.baseAddress);
-                protect = PAGE_EXECUTE_READ_C;
                 memType = MEM_IMAGE;
                 state = MEM_COMMIT;
+                const run = imageProtectionRun(mod, pageBase);
+                protect = run.protect;
+                regionSize = run.end - pageBase;
             } else if (lpAddress >= 0x00400000 && lpAddress < 0x00500000) {
                 // 2) Main EXE range (kept for parity with the old classifier).
                 allocationBase = 0x00400000;

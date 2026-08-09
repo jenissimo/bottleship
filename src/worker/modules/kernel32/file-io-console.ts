@@ -211,6 +211,15 @@ export function registerFileIoConsoleExports(exports: Record<string, ThunkImplem
         return 1; // TRUE
     };
 
+    // HWND GetConsoleWindow(void)
+    // Our console is log-backed and owns no window, so there is no HWND to hand out.
+    // NULL is the documented answer for a process with no console window, and callers
+    // (crash reporters hiding/raising the console) all test for it.
+    exports['GetConsoleWindow'] = () => {
+        Logger.verbose(LogCategory.KERNEL32, 'GetConsoleWindow() -> NULL (log-backed console has no window)');
+        return 0;
+    };
+
     exports['GetConsoleMode'] = (ctx, mem, args) => {
         const hConsoleHandle = args[0];
         const lpMode = args[1];

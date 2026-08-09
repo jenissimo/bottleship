@@ -12,6 +12,7 @@ import { System } from '../../../core/system';
 import { Mem } from '../../../core/memory/mem-accessor';
 import { Marshaler } from '../../../core/memory/marshaler';
 import { APIRegistry } from '../../../core/api-registry';
+import { hleImageBase } from '../../../core/hle-module-images';
 import { resolveThunkedDllAlias } from '../../../core/dll-aliases';
 import { findResourceInPE, getFirstResourceId } from '../resource';
 
@@ -105,14 +106,6 @@ const ASSEMBLY_DLL_MAP: Record<string, string[]> = {
 function isIntResource(ptr: number): boolean {
     const p = ptr >>> 0;
     return p > 0 && p <= 0xffff;
-}
-
-function computeGeneratedPseudoBase(moduleName: string): number {
-    let hash = 0x70000000;
-    for (let i = 0; i < moduleName.length; i++) {
-        hash = ((hash << 5) - hash + moduleName.charCodeAt(i)) >>> 0;
-    }
-    return (hash & 0x0fffffff) | 0x70000000;
 }
 
 function buildAssemblyKey(asm: ParsedAssembly): string {
@@ -353,10 +346,11 @@ async function ensureDllLoaded(dllPathOrName: string): Promise<number> {
         if (existing) return existing.baseAddress;
     }
 
-    const apiRegistry = APIRegistry.getInstance();
-    if (apiRegistry.hasModule(thunkedName)) {
-        return computeGeneratedPseudoBase(thunkedName);
-    }
+    // Must be the same handle GetModuleHandle/LoadLibrary hand out — a second, privately
+    // derived base means two HMODULEs for one module, and GetProcAddress resolves against
+    // whichever one the caller happens to hold.
+    const hleBase = hleImageBase(thunkedName);
+    if (hleBase !== undefined) return hleBase;
 
     if (loader) {
         try {

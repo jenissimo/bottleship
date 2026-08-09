@@ -2074,7 +2074,15 @@ class OpfsOverlay {
                 staleWriter.flushTimer = null;
             }
             if (staleWriter.writer) {
-                void staleWriter.writer.close().catch(() => { });
+                // close() is async and holds OPFS's exclusive lock until it settles, so
+                // it is registered as a pending commit rather than dropped: the next
+                // writer for this path awaits it instead of failing to open (ensureWriter).
+                const closing = staleWriter.writer.close().catch((e) => {
+                    Logger.warn(LogCategory.SYSTEM, `OPFS: closing stale writer for "${path}" failed: ${e}`);
+                });
+                this.pendingFlushes.set(key, closing);
+                const done = () => { if (this.pendingFlushes.get(key) === closing) this.pendingFlushes.delete(key); };
+                closing.then(done, done);
             }
         }
         this.entries.set(key, { size: 0, kind: "file", path: normalizePath(path) });
@@ -2553,13 +2561,56 @@ class OpfsOverlay {
         }
     }
 
+    /**
+     * Open the entry's WritableFileStream.
+     *
+     * OPFS gives `createWritable` an EXCLUSIVE lock, so it throws
+     * NoModificationAllowedError while any other writable or sync access handle on the
+     * same file is still open — including one of ours whose close() has not settled
+     * (prepareCreateSync/cleanupWriters retire entries without awaiting the close).
+     * A commit that gives up there loses the guest's bytes, so wait the conflict out
+     * once: settle whatever commit we already have in flight for this path and retry.
+     */
     private async ensureWriter(entry: WriterCacheEntry): Promise<void> {
         if (entry.writer) return;
         this.closeSyncHandle(entry.path);
-        const handle = await this.getFileHandle(entry.path, true);
         const keepExistingData = !entry.replaceExisting;
-        entry.writer = await handle.createWritable({ keepExistingData });
+        const open = async (): Promise<FileSystemWritableFileStream> => {
+            const handle = await this.getFileHandle(entry.path, true);
+            return handle.createWritable({ keepExistingData });
+        };
+        try {
+            entry.writer = await open();
+        } catch (e) {
+            if ((e as { name?: string })?.name !== "NoModificationAllowedError") throw e;
+            const pending = this.pendingFlushes.get(toKey(entry.path));
+            if (pending) { try { await pending; } catch { /* its owner logs it */ } }
+            this.closeSyncHandle(entry.path);
+            Logger.warn(LogCategory.SYSTEM,
+                `OPFS: ensureWriter("${entry.path}") lock conflict — retrying after in-flight commit`);
+            entry.writer = await open();
+        }
         entry.replaceExisting = false;
+    }
+
+    /**
+     * Last-resort commit for a buffered run whose WritableFileStream cannot be opened:
+     * a sync access handle takes the same lock through a different door. Only usable
+     * once the entry is out of writerCache (ensureSyncHandle refuses otherwise), which
+     * is exactly the drain/cleanup case. Returns false if it could not commit.
+     */
+    private async commitBufferViaSyncHandle(path: string, offset: number, buf: Uint8Array): Promise<boolean> {
+        const sh = await this.ensureSyncHandle(path, true);
+        if (!sh) return false;
+        try {
+            sh.write(buf, { at: offset });
+            sh.flush();
+            return true;
+        } catch (e) {
+            Logger.error(LogCategory.SYSTEM,
+                `OPFS: sync-handle fallback for "${path}" (offset=${offset}, ${buf.length} bytes) failed: ${e}`);
+            return false;
+        }
     }
 
     /**
@@ -2596,7 +2647,19 @@ class OpfsOverlay {
                 return;
             }
 
-            await this.ensureWriter(entry);
+            try {
+                await this.ensureWriter(entry);
+            } catch (e) {
+                // The buffer has already been taken out of the entry, so giving up here
+                // DROPS guest bytes. Try the other door before losing them, and if that
+                // fails too, say so at error level — this is data loss, not a hiccup.
+                Logger.warn(LogCategory.SYSTEM,
+                    `OPFS: writer unavailable for "${entry.path}" (offset=${offsetToWrite}, ${bufferToWrite.length} bytes): ${e}`);
+                if (await this.commitBufferViaSyncHandle(entry.path, offsetToWrite, bufferToWrite)) return;
+                Logger.error(LogCategory.SYSTEM,
+                    `OPFS: LOST ${bufferToWrite.length} buffered bytes at offset ${offsetToWrite} of "${entry.path}" — no writable and no sync handle`);
+                throw e;
+            }
             const doFlush = async () => {
                 await entry.writer!.seek(offsetToWrite);
                 await entry.writer!.write(asArrayBuffer(bufferToWrite.buffer));
@@ -2716,14 +2779,21 @@ class OpfsOverlay {
      * the next run (the "create -> not found -> crash, relaunch, repeat" symptom).
      */
     async flushAll(): Promise<void> {
+        // Settle in-flight CloseHandle commits FIRST: flushFile holds a sync access
+        // handle, and OPFS refuses a WritableFileStream on a file one is open on — so
+        // draining first makes the drain fail on exactly the files a commit just touched.
+        await this.settlePendingFlushes();
         await this.drainWriters();
-        // Await any CloseHandle-driven commits (flushFile via sync access handle) still in flight.
-        const pending = Array.from(this.pendingFlushes.values());
-        for (const p of pending) {
-            try { await p; } catch { /* commit error already logged in flushFile */ }
-        }
+        // ...and again for anything the drain kicked off.
+        await this.settlePendingFlushes();
         // Persist CoW tombstones so a relaunch re-opens the truncated state, not stale ROM.
         await this.saveShadowIndex();
+    }
+
+    private async settlePendingFlushes(): Promise<void> {
+        for (const p of Array.from(this.pendingFlushes.values())) {
+            try { await p; } catch { /* commit error already logged in flushFile */ }
+        }
     }
 
     /** Flush each cached writer's buffer and CLOSE it so its bytes commit to OPFS. */
@@ -2744,7 +2814,9 @@ class OpfsOverlay {
                 await entry.queue;
                 await entry.writer?.close();
             } catch (e) {
-                Logger.warn(LogCategory.SYSTEM, `OPFS: drainWriters error for "${key}": ${e}`);
+                // Loud: the teardown barrier failing means the guest's last writes to
+                // this file did not reach OPFS (see flushWriteBuffer's fallback).
+                Logger.error(LogCategory.SYSTEM, `OPFS: drainWriters FAILED for "${key}" — writes may be lost: ${e}`);
             }
         }
     }

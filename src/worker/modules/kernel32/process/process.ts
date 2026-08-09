@@ -290,11 +290,6 @@ const shutdownProcess = (exitCode: number): ThunkResult => {
         Logger.warn(LogCategory.KERNEL32, `ShutdownProcess: deferred surfacePtr flush failed: ${e}`);
     }
 
-    // Flush all pending VFS writes to OPFS before stopping
-    system.fileSystem.flushAll().catch(e => {
-        Logger.warn(LogCategory.KERNEL32, `ShutdownProcess: flushAll failed: ${e}`);
-    });
-
     system.isExiting = true;
 
     // Snapshot diagnostics while guest state is still live (backtrace, stubs,
@@ -315,14 +310,9 @@ const shutdownProcess = (exitCode: number): ThunkResult => {
     system.scheduler.terminateAllThreads(exitCode);
 
     // Notify the host so the UI can present a clean "game exited" state instead
-    // of a stale, frozen canvas (the game's window is gone, nothing repaints it).
-    try {
-        (self as unknown as { postMessage: (m: unknown) => void }).postMessage({
-            type: "process_exit",
-            exitCode: exitCode >>> 0,
-            fault: exitFault,
-        });
-    } catch { /* not in a worker context (tests) — ignore */ }
+    // of a stale, frozen canvas (the game's window is gone, nothing repaints it) —
+    // once the exit path's own writes are durable (postProcessExitWhenDurable).
+    system.postProcessExitWhenDurable({ exitCode: exitCode >>> 0, fault: exitFault });
 
     return { value: 0, terminated: true };
 };
@@ -455,6 +445,22 @@ const writeVirtualProcessMemory = (pid: number, address: number, data: Uint8Arra
 const isUnrealBrowserProbe = (applicationName: string, commandLine: string): boolean =>
     isUe1RenderProbeCommandLine(`${applicationName} ${commandLine}`.trim());
 
+/**
+ * True when `path` names an executable that ships in the mounted bundle — the only kind
+ * of child we can honour, because running it means remounting this bundle on that entry
+ * point. An .exe the guest merely *names* (notepad, a system tool, an installer that was
+ * never packed) is not there, and must keep failing rather than restarting the session
+ * onto a file that does not exist.
+ */
+const isBundledImage = (path: string): boolean => {
+    if (!/\.(exe|com)$/i.test(path)) return false;
+    try {
+        return System.getInstance().fileSystem.fileExists(path);
+    } catch {
+        return false;
+    }
+};
+
 const failVirtualProcess = (
     lpProcessInformation: number,
     applicationName: string,
@@ -561,6 +567,20 @@ const createVirtualProcess = (memory: Uint8Array, args: number[], isWide: boolea
             Logger.log(LogCategory.SYSTEM,
                 `[KERNEL32] CreateProcess("${argv0}", "${reExecArgs}") -> re-exec ` +
                 `(launcher relaunching its own image; restarting with the new command line)`);
+            return finishVirtualProcess(
+                lpProcessInformation, applicationName, commandLine,
+                currentDirectory, dwCreationFlags, isWide, true,
+            );
+        }
+        // A launcher starting the GAME: a different image, but one that ships in the same
+        // bundle. One process hosts one image here, so run it the same way a self re-exec
+        // runs: restart on that entry point. The launcher exits right after either way.
+        const imagePath = argv0 ? system.resolveImagePath(argv0, currentDirectory || "") : "";
+        if (imagePath && isBundledImage(imagePath)
+            && system.requestReExec(reExecArgs, imagePath)) {
+            Logger.log(LogCategory.SYSTEM,
+                `[KERNEL32] CreateProcess("${imagePath}", "${reExecArgs}") -> exec ` +
+                `(launcher starting another image from the bundle; restarting on it)`);
             return finishVirtualProcess(
                 lpProcessInformation, applicationName, commandLine,
                 currentDirectory, dwCreationFlags, isWide, true,

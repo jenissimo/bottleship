@@ -5,7 +5,8 @@
  * Parses INI files from VFS with caching
  */
 
-import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
+import { ThunkImplementation, ThunkResult } from '../../core/thunking/thunk-dispatcher';
+import type { VfsFileHandle } from '../../runtime/filesystem/vfs';
 import { Logger, LogCategory } from '../../core/logger';
 import { Marshaler } from '../../core/memory/marshaler';
 import { Mem } from '../../core/memory/mem-accessor';
@@ -92,10 +93,16 @@ function parseIniContent(content: string): IniData {
     return data;
 }
 
+interface IniLookup {
+    ini: IniData | null;
+    /** Set when the file is present but its bytes need an async read to finish. */
+    pending?: { handle: VfsFileHandle; fileSize: number; cacheKey: string };
+}
+
 /**
  * Read and parse an INI file from VFS, with caching
  */
-function getIniData(fileName: string): IniData | null {
+function lookupIniData(fileName: string): IniLookup {
     const system = System.getInstance();
     const vfs = system.fileSystem;
 
@@ -103,7 +110,7 @@ function getIniData(fileName: string): IniData | null {
     const cacheKey = resolved.toLowerCase();
 
     const cached = iniCache.get(cacheKey);
-    if (cached) return cached;
+    if (cached) return { ini: cached };
 
     // Try to open and read the file synchronously
     const handle = vfs.openSync(fileName, 0x80000000 /* GENERIC_READ */, 3 /* OPEN_EXISTING */);
@@ -111,35 +118,72 @@ function getIniData(fileName: string): IniData | null {
         // Genuinely absent — negative-cache to avoid repeated index lookups.
         Logger.verbose(LogCategory.KERNEL32, `INI: file not found: "${fileName}"`);
         iniCache.set(cacheKey, new Map());
-        return null;
+        return { ini: null };
     }
 
     const fileSize = vfs.getFileSize(handle.path);
     if (fileSize <= 0) {
         // Genuinely empty file — negative-cache is correct.
         iniCache.set(cacheKey, new Map());
-        return null;
+        return { ini: null };
     }
 
     const data = vfs.readSync(handle, fileSize);
     if (!data || data.length < fileSize) {
-        // File exists with size>0 but the sync read came up short — a transient
-        // miss (non-resident ROM blocks), NOT an empty file. Don't negative-cache:
-        // that would poison this INI as empty for the whole run. Returning null
-        // lets a later call retry once the bytes are resident (config files are
-        // pinned at boot, so this should not recur).
-        Logger.verbose(LogCategory.KERNEL32, `INI: transient sync-read miss (not caching): "${fileName}" (got ${data?.length ?? 0}/${fileSize})`);
-        return null;
+        // File exists with size>0 but the sync read came up short: the blocks are not
+        // resident yet. NOT an empty file, so don't negative-cache — and don't answer
+        // either. The caller finishes the read asynchronously (see withIniData).
+        Logger.verbose(LogCategory.KERNEL32, `INI: sync-read miss, deferring to async: "${fileName}" (got ${data?.length ?? 0}/${fileSize})`);
+        return { ini: null, pending: { handle, fileSize, cacheKey } };
     }
 
-    // Decode as ASCII/Latin-1
-    const text = new TextDecoder('latin1').decode(data);
-    const parsed = parseIniContent(text);
+    return { ini: cacheParsedIni(cacheKey, fileName, data) };
+}
 
+function cacheParsedIni(cacheKey: string, fileName: string, data: Uint8Array): IniData {
+    const parsed = parseIniContent(new TextDecoder('latin1').decode(data));
     Logger.log(LogCategory.KERNEL32, `INI: parsed "${fileName}" -> ${parsed.size} sections`);
     iniCache.set(cacheKey, parsed);
-
     return parsed;
+}
+
+/**
+ * Answer an INI query, finishing the file read asynchronously when its bytes are not yet
+ * resident. Windows always reads the file, so handing back the caller's default on a
+ * transient miss is a wrong answer that is indistinguishable from "key absent" at the
+ * call site — a launcher reads its config once at startup and renders empty forever.
+ * The resident case stays fully synchronous.
+ */
+function withIniData(
+    fileName: string,
+    stackCleanup: number,
+    produce: (ini: IniData | null) => number,
+): number | Promise<ThunkResult> {
+    const lookup = lookupIniData(fileName);
+    if (!lookup.pending) return produce(lookup.ini);
+
+    const { handle, fileSize, cacheKey } = lookup.pending;
+    return (async (): Promise<ThunkResult> => {
+        let ini: IniData | null = null;
+        try {
+            // The sync attempt already advanced `handle`'s cursor by whatever it got, and that
+            // cursor is the file OBJECT's state (CLAUDE.md §3.2). Re-read from a PRIVATE cursor
+            // at offset 0 instead — reusing the handle reads from the wrong offset, comes up
+            // short, and hands the caller the default we exist to avoid.
+            const vfs = System.getInstance().fileSystem;
+            const data = await vfs.read(vfs.duplicateHandle(handle, 0), fileSize);
+            ini = data && data.length >= fileSize
+                ? cacheParsedIni(cacheKey, fileName, data)
+                : null;
+            if (!ini) {
+                Logger.warn(LogCategory.KERNEL32,
+                    `INI: async read still short for "${fileName}" (${data?.length ?? 0}/${fileSize})`);
+            }
+        } catch (e) {
+            Logger.warn(LogCategory.KERNEL32, `INI: async read failed for "${fileName}": ${e}`);
+        }
+        return { value: produce(ini), stackCleanup };
+    })();
 }
 
 /**
@@ -281,35 +325,30 @@ export const exports: Record<string, ThunkImplementation> = {
             return 0;
         }
 
-        // Special case: lpAppName == NULL -> enumerate sections
-        if (!lpAppName) {
-            const ini = getIniData(fileName);
-            if (!ini) return writeStringToBuffer(mem, lpReturnedString, '', nSize);
-            return enumerateSections(mem, lpReturnedString, nSize, ini);
-        }
+        return withIniData(fileName, 24, (ini) => {
+            // lpAppName == NULL -> enumerate sections
+            if (!lpAppName) {
+                if (!ini) return writeStringToBuffer(mem, lpReturnedString, '', nSize);
+                return enumerateSections(mem, lpReturnedString, nSize, ini);
+            }
 
-        // Special case: lpKeyName == NULL -> enumerate keys in section
-        if (!lpKeyName) {
-            const ini = getIniData(fileName);
-            if (!ini) return writeStringToBuffer(mem, lpReturnedString, '', nSize);
-            const sectionData = ini.get(appName.toLowerCase());
-            if (!sectionData) return writeStringToBuffer(mem, lpReturnedString, '', nSize);
-            return enumerateKeys(mem, lpReturnedString, nSize, sectionData);
-        }
+            // lpKeyName == NULL -> enumerate keys in section
+            if (!lpKeyName) {
+                if (!ini) return writeStringToBuffer(mem, lpReturnedString, '', nSize);
+                const sectionData = ini.get(appName.toLowerCase());
+                if (!sectionData) return writeStringToBuffer(mem, lpReturnedString, '', nSize);
+                return enumerateKeys(mem, lpReturnedString, nSize, sectionData);
+            }
 
-        // Normal case: read specific key
-        const ini = getIniData(fileName);
-        const value = ini ? getIniValue(ini, appName, keyName) : undefined;
-        const result = value !== undefined ? value : defaultValue;
-
-        if (value !== undefined) {
-            Logger.verboseLazy(
-                LogCategory.KERNEL32,
-                () => `GetPrivateProfileStringA: [${appName}]${keyName} = "${value}" (from file)`
-            );
-        }
-
-        return writeStringToBuffer(mem, lpReturnedString, result, nSize);
+            const value = ini ? getIniValue(ini, appName, keyName) : undefined;
+            if (value !== undefined) {
+                Logger.verboseLazy(
+                    LogCategory.KERNEL32,
+                    () => `GetPrivateProfileStringA: [${appName}]${keyName} = "${value}" (from file)`
+                );
+            }
+            return writeStringToBuffer(mem, lpReturnedString, value !== undefined ? value : defaultValue, nSize);
+        });
     },
 
     'GetPrivateProfileIntA': (ctx, mem, args) => {
@@ -327,21 +366,20 @@ export const exports: Record<string, ThunkImplementation> = {
             () => `GetPrivateProfileIntA(section="${appName}", key="${keyName}", default=${nDefault}, file="${fileName}")`
         );
 
-        const ini = getIniData(fileName);
-        const value = ini ? getIniValue(ini, appName, keyName) : undefined;
-
-        if (value !== undefined) {
-            const parsed = parseInt(value, 10);
-            if (!isNaN(parsed)) {
-                Logger.verboseLazy(
-                    LogCategory.KERNEL32,
-                    () => `GetPrivateProfileIntA: [${appName}]${keyName} = ${parsed} (from file)`
-                );
-                return parsed;
+        return withIniData(fileName, 16, (ini) => {
+            const value = ini ? getIniValue(ini, appName, keyName) : undefined;
+            if (value !== undefined) {
+                const parsed = parseInt(value, 10);
+                if (!isNaN(parsed)) {
+                    Logger.verboseLazy(
+                        LogCategory.KERNEL32,
+                        () => `GetPrivateProfileIntA: [${appName}]${keyName} = ${parsed} (from file)`
+                    );
+                    return parsed;
+                }
             }
-        }
-
-        return nDefault;
+            return nDefault;
+        });
     },
 
     'GetPrivateProfileIntW': (ctx, mem, args) => {
@@ -359,21 +397,20 @@ export const exports: Record<string, ThunkImplementation> = {
             () => `GetPrivateProfileIntW(section="${appName}", key="${keyName}", default=${nDefault}, file="${fileName}")`
         );
 
-        const ini = getIniData(fileName);
-        const value = ini ? getIniValue(ini, appName, keyName) : undefined;
-
-        if (value !== undefined) {
-            const parsed = parseInt(value, 10);
-            if (!isNaN(parsed)) {
-                Logger.verboseLazy(
-                    LogCategory.KERNEL32,
-                    () => `GetPrivateProfileIntW: [${appName}]${keyName} = ${parsed} (from file)`
-                );
-                return parsed;
+        return withIniData(fileName, 16, (ini) => {
+            const value = ini ? getIniValue(ini, appName, keyName) : undefined;
+            if (value !== undefined) {
+                const parsed = parseInt(value, 10);
+                if (!isNaN(parsed)) {
+                    Logger.verboseLazy(
+                        LogCategory.KERNEL32,
+                        () => `GetPrivateProfileIntW: [${appName}]${keyName} = ${parsed} (from file)`
+                    );
+                    return parsed;
+                }
             }
-        }
-
-        return nDefault;
+            return nDefault;
+        });
     },
 
     'WritePrivateProfileStringA': (ctx, mem, args) => {
@@ -458,35 +495,28 @@ export const exports: Record<string, ThunkImplementation> = {
             return 0;
         }
 
-        // Special case: lpAppName == NULL -> enumerate sections
-        if (!lpAppName) {
-            const ini = getIniData(fileName);
-            if (!ini) return writeWideStringToBuffer(lpReturnedString, '', nSize);
-            return enumerateSectionsWide(lpReturnedString, nSize, ini);
-        }
+        return withIniData(fileName, 24, (ini) => {
+            if (!lpAppName) {
+                if (!ini) return writeWideStringToBuffer(lpReturnedString, '', nSize);
+                return enumerateSectionsWide(lpReturnedString, nSize, ini);
+            }
 
-        // Special case: lpKeyName == NULL -> enumerate keys in section
-        if (!lpKeyName) {
-            const ini = getIniData(fileName);
-            if (!ini) return writeWideStringToBuffer(lpReturnedString, '', nSize);
-            const sectionData = ini.get(appName.toLowerCase());
-            if (!sectionData) return writeWideStringToBuffer(lpReturnedString, '', nSize);
-            return enumerateKeysWide(lpReturnedString, nSize, sectionData);
-        }
+            if (!lpKeyName) {
+                if (!ini) return writeWideStringToBuffer(lpReturnedString, '', nSize);
+                const sectionData = ini.get(appName.toLowerCase());
+                if (!sectionData) return writeWideStringToBuffer(lpReturnedString, '', nSize);
+                return enumerateKeysWide(lpReturnedString, nSize, sectionData);
+            }
 
-        // Normal case: read specific key
-        const ini = getIniData(fileName);
-        const value = ini ? getIniValue(ini, appName, keyName) : undefined;
-        const result = value !== undefined ? value : defaultValue;
-
-        if (value !== undefined) {
-            Logger.verboseLazy(
-                LogCategory.KERNEL32,
-                () => `GetPrivateProfileStringW: [${appName}]${keyName} = "${value}" (from file)`
-            );
-        }
-
-        return writeWideStringToBuffer(lpReturnedString, result, nSize);
+            const value = ini ? getIniValue(ini, appName, keyName) : undefined;
+            if (value !== undefined) {
+                Logger.verboseLazy(
+                    LogCategory.KERNEL32,
+                    () => `GetPrivateProfileStringW: [${appName}]${keyName} = "${value}" (from file)`
+                );
+            }
+            return writeWideStringToBuffer(lpReturnedString, value !== undefined ? value : defaultValue, nSize);
+        });
     },
 
     'GetProfileStringA': (ctx, mem, args) => {

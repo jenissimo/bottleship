@@ -177,6 +177,14 @@ export interface WgbManifest {
          * Supports names, paths and wildcard patterns ("opengl3z", "opengl3z.dll", "drivers/opengl3/*").
          */
         disabledDlls?: string[];
+        /**
+         * DLL names whose copy in the game directory must win over our HLE module, as
+         * Windows' search order does (application directory before System32). Needed by
+         * games that ship a wrapper/proxy DLL next to the exe — ASI loaders, Glide and
+         * ddraw wrappers — which never execute while the HLE answers first.
+         * Same rule syntax as disabledDlls ("ddraw", "ddraw.dll", wildcards).
+         */
+        appDirDlls?: string[];
         /** Glob patterns for files to eagerly prefetch during startup (e.g. ["*.dll", "data/sprites.vga"]) */
         prefetch?: string[];
         /** Fake ShellExecuteA subprocess results: when parameters match `match`, create `createFiles` in VFS */

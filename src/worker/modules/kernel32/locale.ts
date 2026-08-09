@@ -5,9 +5,10 @@ import { ThunkImplementation, ThunkResult } from '../../core/thunking/thunk-disp
 import { Logger, LogCategory } from '../../core/logger';
 import { Marshaler } from '../../core/memory/marshaler';
 import { System } from '../../core/system';
-import { EmulatorConfig, getCodePageDecoder, encodeAnsiString } from '../../core/emulator-config-manager';
+import { EmulatorConfig, getCodePageDecoder, encodeAnsiString, isSingleByteCodePage } from '../../core/emulator-config-manager';
 import { encodeAnsi } from '../codepage-utils';
 import { asBufferSource } from '../../../dom-buffer';
+import { borrowGuestMemory } from '../../core/memory/guest-memory';
 
 // US English locale data lookup (shared between GetLocaleInfoA and GetLocaleInfoW)
 const US_LOCALE_DATA: Record<number, string> = {
@@ -413,6 +414,9 @@ export const exports: Record<string, ThunkImplementation> = {
     },
 
     'MultiByteToWideChar': (ctx, mem, args) => {
+        // Counted HERE, not only at the fast path's bail sites: a call that never reaches the
+        // fast-path table at all (an unbound stub) would otherwise be invisible to both.
+        localeFastPathStats.mbtwcThunk++;
         const CodePage = args[0];
         const dwFlags = args[1];
         const lpMultiByteStr = args[2];
@@ -1352,22 +1356,136 @@ const _ctype1LUT: Uint16Array = (() => {
     return t;
 })();
 
-// CP1252 → Unicode LUT for 256 codepoints (chars 0x80-0x9F have special mappings)
-const _cp1252ToUnicode: Uint16Array = (() => {
-    const t = new Uint16Array(256);
-    for (let i = 0; i < 256; i++) t[i] = i; // identity for 0x00-0x7F and 0xA0-0xFF
-    // CP1252 special range 0x80-0x9F
-    const specials: Record<number, number> = {
-        0x80: 0x20AC, 0x82: 0x201A, 0x83: 0x0192, 0x84: 0x201E, 0x85: 0x2026,
-        0x86: 0x2020, 0x87: 0x2021, 0x88: 0x02C6, 0x89: 0x2030, 0x8A: 0x0160,
-        0x8B: 0x2039, 0x8C: 0x0152, 0x8E: 0x017D, 0x91: 0x2018, 0x92: 0x2019,
-        0x93: 0x201C, 0x94: 0x201D, 0x95: 0x2022, 0x96: 0x2013, 0x97: 0x2014,
-        0x98: 0x02DC, 0x99: 0x2122, 0x9A: 0x0161, 0x9B: 0x203A, 0x9C: 0x0153,
-        0x9E: 0x017E, 0x9F: 0x0178,
-    };
-    for (const [b, u] of Object.entries(specials)) t[Number(b)] = u as number;
-    return t;
-})();
+/**
+ * byte → UTF-16 table for a single-byte code page, cached per page.
+ *
+ * The fast path needs a table, not a decoder: a TextDecoder call per conversion allocates
+ * a JS string (two, with the terminator concat) and that is the whole cost of the slow
+ * path. Built from the decoder itself so a page's mapping has ONE definition. Null for any
+ * multi-byte page (UTF-8, DBCS), which isSingleByteCodePage decides — a probe cannot, since
+ * a decoder answers a lone lead byte with one U+FFFD.
+ */
+const _cpLutCache = new Map<number, Uint16Array | null>();
+
+function codePageToUnicodeLut(codePage: number): Uint16Array | null {
+    const cached = _cpLutCache.get(codePage);
+    if (cached !== undefined) return cached;
+    let lut: Uint16Array | null = null;
+    if (isSingleByteCodePage(codePage)) {
+        try {
+            // Constructing the decoder can throw on a label the host does not know; a fast
+            // path must never be the thing that raises, so an unbuildable table is simply
+            // "no fast path for this page".
+            const decoder = getCodePageDecoder(codePage);
+            const one = new Uint8Array(1);
+            lut = new Uint16Array(256);
+            for (let b = 0; b < 256; b++) {
+                one[0] = b;
+                const ch = decoder.decode(one);
+                if (ch.length !== 1) { lut = null; break; }
+                lut[b] = ch.charCodeAt(0);
+            }
+        } catch {
+            lut = null;
+        }
+    }
+    _cpLutCache.set(codePage, lut);
+    return lut;
+}
+
+/**
+ * UTF-16 → byte table for a single-byte code page (0xffff = not representable on this page,
+ * which is the caller's signal to take the slow path and its default-char rules). Derived
+ * by inverting the same forward table, so the two cannot drift apart.
+ */
+const _cpRevLutCache = new Map<number, Uint16Array | null>();
+
+function codePageToByteLut(codePage: number): Uint16Array | null {
+    const cached = _cpRevLutCache.get(codePage);
+    if (cached !== undefined) return cached;
+    const forward = codePageToUnicodeLut(codePage);
+    let rev: Uint16Array | null = null;
+    if (forward) {
+        rev = new Uint16Array(65536).fill(0xffff);
+        // Ascending, so the LOWEST byte wins when a page maps two bytes to one code point —
+        // matching the canonical encoding Windows picks.
+        for (let b = 255; b >= 0; b--) rev[forward[b]!] = b;
+    }
+    _cpRevLutCache.set(codePage, rev);
+    return rev;
+}
+
+
+/**
+ * Simple 1:1 case-mapping tables for the BMP, derived from the same JS case mapping the
+ * thunk uses so the two cannot disagree. A code point whose mapping is not one character
+ * (Turkish dotted I, ligatures, ...) is left as 0xffff: the fast path declines the WHOLE
+ * call there, because a length change is precisely what a table cannot express.
+ */
+const _caseLut: (Uint16Array | null)[] = [null, null];
+
+function caseMapLut(upper: boolean): Uint16Array {
+    const idx = upper ? 1 : 0;
+    let lut = _caseLut[idx];
+    if (lut) return lut;
+    lut = new Uint16Array(65536);
+    for (let c = 0; c < 65536; c++) {
+        const ch = String.fromCharCode(c);
+        const m = upper ? ch.toUpperCase() : ch.toLowerCase();
+        lut[c] = m.length === 1 ? m.charCodeAt(0) : 0xffff;
+    }
+    // Surrogates map to themselves through String.prototype case mapping; keeping them
+    // verbatim matches what the thunk's whole-string mapping does for an unpaired half.
+    _caseLut[idx] = lut;
+    return lut;
+}
+
+/** Why the MultiByteToWideChar fast path handed a call back to the full thunk. A thunk
+ *  whose fast path silently never fires looks exactly like one that is inherently slow;
+ *  these counters tell the two apart. Read via the `localeFastPath` harness verb. */
+export const localeFastPathStats = {
+    mbtwcFast: 0,
+    mbtwcSlow: 0,
+    /** Characters converted, and the length distribution. Cost per call is proportional to
+     *  length, so "many short strings" (a per-call overhead problem, fixable only by moving
+     *  the boundary) and "few long strings" (a loop problem, fixable by moving the loop into
+     *  WASM) need opposite work — and a profiler's per-call average cannot tell them apart. */
+    mbtwcChars: 0,
+    mbtwcMaxChars: 0,
+    /** Conversions whose destination could not hold the result. Win32 fails these with
+     *  ERROR_INSUFFICIENT_BUFFER; a silently truncated string is a different program. */
+    mbtwcTruncated: 0,
+    /** Buckets: <=8, <=32, <=128, <=512, <=4096, more. */
+    mbtwcLenHist: new Uint32Array(6),
+    /** Return addresses seen at the fast path, counted. Armed on demand: a Map write per
+     *  call is not something a hot path carries for free. */
+    callerCensus: null as Map<number, number> | null,
+    /** Full-thunk entries. mbtwcThunk - mbtwcSlow = calls that never reached the fast path. */
+    mbtwcThunk: 0,
+    /** Bail counts by reason. */
+    mbtwcBail: { multiByteCodePage: 0, badRange: 0, negativeLength: 0 } as Record<string, number>,
+    lastCodePage: 0,
+    lcmapFast: 0,
+    lcmapDeclined: 0,
+    /** Flag words seen at LCMapStringW, counted — the fast path covers only plain
+     *  lower/upper, and guessing which combination the CRT actually passes is how a fast
+     *  path ends up never firing while looking implemented. */
+    lcmapFlags: new Map<number, number>(),
+    reset(): void {
+        this.mbtwcFast = 0;
+        this.mbtwcSlow = 0;
+        this.mbtwcThunk = 0;
+        this.mbtwcChars = 0;
+        this.mbtwcMaxChars = 0;
+        this.mbtwcTruncated = 0;
+        this.mbtwcLenHist.fill(0);
+        this.lcmapFast = 0;
+        this.lcmapDeclined = 0;
+        this.lcmapFlags.clear();
+        this.callerCensus?.clear();
+        for (const k of Object.keys(this.mbtwcBail)) this.mbtwcBail[k] = 0;
+    },
+};
 
 // Pre-built UTF-16LE byte buffers for GetLocaleInfoW (keyed by cleanType)
 // Built lazily on first call to registerFastPathLocaleFunctions so EmulatorConfig is ready.
@@ -1411,10 +1529,15 @@ export function registerFastPathLocaleFunctions(dispatcher: any): void {
     // GetLocaleInfoW — 850K calls/session (CRT reads ANSI CP, decimal sep, etc.)
     // Stack (stdcall @16): [esp+4]=locale [esp+8]=lcType [esp+12]=lpLCData [esp+16]=cchData
     // -------------------------------------------------------------------------
-    dispatcher.registerFastPath('kernel32', 'GetLocaleInfoW', (cpu: any, mem8: Uint8Array): number | null => {
+    dispatcher.registerFastPath('kernel32', 'GetLocaleInfoW', (cpu: any, rawMem8: Uint8Array, _m32: Uint32Array, dv: DataView): number | null => {
+        // Leaf hot loop: index a PLAIN view, never v86's Proxy. The dispatcher must keep the
+        // Proxy (it is how WASM growth is detected — see updateMemoryCache), so the unwrap
+        // belongs here, once per call. Per-BYTE through the Proxy is ~13x slower, and these
+        // paths walk tens of millions of bytes over a load.
+        const mem8 = borrowGuestMemory(rawMem8);
         const esp = (cpu.reg32[4]) >>> 0;
         if (esp + 20 > mem8.length) return null;
-        const view = new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
+        const view = dv ?? new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
 
         const lcType   = view.getUint32(esp + 8, true);
         const lpLCData = view.getUint32(esp + 12, true);
@@ -1456,10 +1579,15 @@ export function registerFastPathLocaleFunctions(dispatcher: any): void {
     // GetLocaleInfoA — same as W but writes ANSI bytes
     // Stack (stdcall @16): [esp+4]=locale [esp+8]=lcType [esp+12]=lpLCData [esp+16]=cchData
     // -------------------------------------------------------------------------
-    dispatcher.registerFastPath('kernel32', 'GetLocaleInfoA', (cpu: any, mem8: Uint8Array): number | null => {
+    dispatcher.registerFastPath('kernel32', 'GetLocaleInfoA', (cpu: any, rawMem8: Uint8Array, _m32: Uint32Array, dv: DataView): number | null => {
+        // Leaf hot loop: index a PLAIN view, never v86's Proxy. The dispatcher must keep the
+        // Proxy (it is how WASM growth is detected — see updateMemoryCache), so the unwrap
+        // belongs here, once per call. Per-BYTE through the Proxy is ~13x slower, and these
+        // paths walk tens of millions of bytes over a load.
+        const mem8 = borrowGuestMemory(rawMem8);
         const esp = (cpu.reg32[4]) >>> 0;
         if (esp + 20 > mem8.length) return null;
-        const view = new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
+        const view = dv ?? new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
 
         const lcType   = view.getUint32(esp + 8, true);
         const lpLCData = view.getUint32(esp + 12, true);
@@ -1503,10 +1631,15 @@ export function registerFastPathLocaleFunctions(dispatcher: any): void {
     // Stack (stdcall @12): [esp+4]=dwInfoType [esp+8]=lpSrcStr [esp+12]=cchSrc [esp+16]=lpCharType
     // Note: 4 args = stdcall @16
     // -------------------------------------------------------------------------
-    dispatcher.registerFastPath('kernel32', 'GetStringTypeW', (cpu: any, mem8: Uint8Array): number | null => {
+    dispatcher.registerFastPath('kernel32', 'GetStringTypeW', (cpu: any, rawMem8: Uint8Array, _m32: Uint32Array, dv: DataView): number | null => {
+        // Leaf hot loop: index a PLAIN view, never v86's Proxy. The dispatcher must keep the
+        // Proxy (it is how WASM growth is detected — see updateMemoryCache), so the unwrap
+        // belongs here, once per call. Per-BYTE through the Proxy is ~13x slower, and these
+        // paths walk tens of millions of bytes over a load.
+        const mem8 = borrowGuestMemory(rawMem8);
         const esp = (cpu.reg32[4]) >>> 0;
         if (esp + 20 > mem8.length) return null;
-        const view = new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
+        const view = dv ?? new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
 
         const dwInfoType = view.getUint32(esp + 4, true);
         const lpSrcStr   = view.getUint32(esp + 8, true);
@@ -1536,15 +1669,72 @@ export function registerFastPathLocaleFunctions(dispatcher: any): void {
         return 1; // TRUE
     }, { trivial: true });
 
+
+    // -------------------------------------------------------------------------
+    // LCMapStringW — the middle of the CRT's __crtLCMapStringA sandwich (A->W, map, W->A).
+    // Only plain LCMAP_LOWERCASE / LCMAP_UPPERCASE, only where every character maps 1:1;
+    // sort keys, normalisation and anything else go to the thunk.
+    // -------------------------------------------------------------------------
+    dispatcher.registerFastPath('kernel32', 'LCMapStringW', (cpu: any, rawMem8: Uint8Array, _m32: Uint32Array, dv: DataView): number | null => {
+        const mem8 = borrowGuestMemory(rawMem8);
+        const esp = (cpu.reg32[4]) >>> 0;
+        if (esp + 28 > mem8.length) return null;
+        const view = dv ?? new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
+
+        const dwMapFlags = view.getUint32(esp + 8, true);
+        const lpSrcStr = view.getUint32(esp + 12, true);
+        const cchSrc = view.getInt32(esp + 16, true);
+        const lpDestStr = view.getUint32(esp + 20, true);
+        const cchDest = view.getInt32(esp + 24, true);
+
+        if (!lpSrcStr) return 0;
+        localeFastPathStats.lcmapFlags.set(dwMapFlags, (localeFastPathStats.lcmapFlags.get(dwMapFlags) ?? 0) + 1);
+        const LCMAP_LOWERCASE = 0x100, LCMAP_UPPERCASE = 0x200;
+        if (dwMapFlags !== LCMAP_LOWERCASE && dwMapFlags !== LCMAP_UPPERCASE) { localeFastPathStats.lcmapDeclined++; return null; }
+        if (cchSrc < -1 || cchDest < 0) return null;
+
+        let srcLen: number;
+        if (cchSrc === -1) {
+            srcLen = 0;
+            while (lpSrcStr + srcLen * 2 + 1 < mem8.length && view.getUint16(lpSrcStr + srcLen * 2, true) !== 0) srcLen++;
+        } else {
+            srcLen = Math.min(cchSrc, ((mem8.length - lpSrcStr) / 2) | 0);
+        }
+        if (lpSrcStr + srcLen * 2 > mem8.length) return null;
+
+        const lut = caseMapLut(dwMapFlags === LCMAP_UPPERCASE);
+        // Verify before writing: one non-1:1 character and the thunk owns the call.
+        for (let i = 0; i < srcLen; i++) {
+            if (lut[view.getUint16(lpSrcStr + i * 2, true)] === 0xffff) return null;
+        }
+
+        // Mirrors the thunk exactly, including writeWideString reserving a terminator slot.
+        if (cchDest === 0) return srcLen + (cchSrc === -1 ? 1 : 0);
+        if (lpDestStr <= 0 || lpDestStr >= mem8.length) return 0;
+        const toWrite = Math.min(srcLen, cchDest - 1);
+        if (toWrite < 0 || lpDestStr + (toWrite + 1) * 2 > mem8.length) return null;
+        for (let i = 0; i < toWrite; i++) {
+            view.setUint16(lpDestStr + i * 2, lut[view.getUint16(lpSrcStr + i * 2, true)]!, true);
+        }
+        view.setUint16(lpDestStr + toWrite * 2, 0, true);
+        localeFastPathStats.lcmapFast++;
+        return toWrite + 1;
+    }, { trivial: true });
+
     // -------------------------------------------------------------------------
     // MultiByteToWideChar — 226K calls/session
     // Stack (stdcall @24): [+4]=CodePage [+8]=dwFlags [+12]=lpMB [+16]=cbMB [+20]=lpWC [+24]=cchWC
     // Fast path covers CP_ACP/CP_OEMCP/1252 with cbMB=-1 (null-terminated) or positive length.
     // -------------------------------------------------------------------------
-    dispatcher.registerFastPath('kernel32', 'MultiByteToWideChar', (cpu: any, mem8: Uint8Array): number | null => {
+    dispatcher.registerFastPath('kernel32', 'MultiByteToWideChar', (cpu: any, rawMem8: Uint8Array, _m32: Uint32Array, dv: DataView): number | null => {
+        // Leaf hot loop: index a PLAIN view, never v86's Proxy. The dispatcher must keep the
+        // Proxy (it is how WASM growth is detected — see updateMemoryCache), so the unwrap
+        // belongs here, once per call. Per-BYTE through the Proxy is ~13x slower, and these
+        // paths walk tens of millions of bytes over a load.
+        const mem8 = borrowGuestMemory(rawMem8);
         const esp = (cpu.reg32[4]) >>> 0;
         if (esp + 28 > mem8.length) return null;
-        const view = new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
+        const view = dv ?? new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
 
         const codePage  = view.getUint32(esp + 4, true);
         // dwFlags at esp+8 — we don't act on them in fast path
@@ -1555,12 +1745,20 @@ export function registerFastPathLocaleFunctions(dispatcher: any): void {
 
         if (!lpMB) return 0;
 
-        // Only fast-path CP_ACP(0), CP_OEMCP(1), CP_UTF8(65001 — ASCII subset only), or 1252
+        // Any single-byte code page is a 256-entry table (built once from that page's own
+        // decoder); UTF-8 keeps its ASCII-subset path below. Naming individual pages here
+        // is what left every non-Western title on the allocating slow path.
         const config = EmulatorConfig.getInstance();
         const effectiveCp = codePage === 0 ? config.ansiCodePage
                           : codePage === 1 ? config.oemCodePage
                           : codePage;
-        if (effectiveCp !== 1252 && effectiveCp !== 437 && effectiveCp !== 65001) return null;
+        localeFastPathStats.lastCodePage = effectiveCp;
+        const cpLut = effectiveCp === 65001 ? null : codePageToUnicodeLut(effectiveCp);
+        if (!cpLut && effectiveCp !== 65001) {
+            localeFastPathStats.mbtwcBail.multiByteCodePage++;
+            localeFastPathStats.mbtwcSlow++;
+            return null;
+        }
 
         // Determine byte count
         let byteLen: number;
@@ -1570,30 +1768,42 @@ export function registerFastPathLocaleFunctions(dispatcher: any): void {
             while (lpMB + byteLen < mem8.length && mem8[lpMB + byteLen] !== 0) byteLen++;
             byteLen++; // include null
         } else {
-            if (cbMB < 0) return null;
+            if (cbMB < 0) { localeFastPathStats.mbtwcBail.negativeLength++; localeFastPathStats.mbtwcSlow++; return null; }
             byteLen = Math.min(cbMB, mem8.length - lpMB);
         }
 
         const outLen = byteLen; // for single-byte CPs, 1 byte → 1 wchar
-        if (cchWC === 0) return outLen;
+        if (cchWC === 0) { localeFastPathStats.mbtwcFast++; return outLen; }
         if (!lpWC) return 0;
 
+        if (outLen > cchWC) { localeFastPathStats.mbtwcTruncated++; }
         const toWrite = Math.min(outLen, cchWC);
-        if (lpWC + toWrite * 2 > mem8.length) return null;
+        if (lpWC + toWrite * 2 > mem8.length) {
+            localeFastPathStats.mbtwcBail.badRange++; localeFastPathStats.mbtwcSlow++; return null;
+        }
 
-        if (effectiveCp === 65001) {
-            // UTF-8: only fast-path pure ASCII subset
+        if (cpLut) {
             for (let i = 0; i < toWrite; i++) {
-                const b = mem8[lpMB + i];
-                if (b >= 0x80) return null; // non-ASCII, fall to slow path
-                view.setUint16(lpWC + i * 2, b, true);
+                view.setUint16(lpWC + i * 2, cpLut[mem8[lpMB + i]!]!, true);
             }
         } else {
-            // CP1252 / CP437: use LUT
-            const lut = _cp1252ToUnicode;
+            // UTF-8: only fast-path pure ASCII subset
             for (let i = 0; i < toWrite; i++) {
-                view.setUint16(lpWC + i * 2, lut[mem8[lpMB + i]], true);
+                const b = mem8[lpMB + i]!;
+                if (b >= 0x80) { localeFastPathStats.mbtwcSlow++; return null; } // non-ASCII, fall to slow path
+                view.setUint16(lpWC + i * 2, b, true);
             }
+        }
+        localeFastPathStats.mbtwcFast++;
+        localeFastPathStats.mbtwcChars += toWrite;
+        if (toWrite > localeFastPathStats.mbtwcMaxChars) localeFastPathStats.mbtwcMaxChars = toWrite;
+        localeFastPathStats.mbtwcLenHist[
+            toWrite <= 8 ? 0 : toWrite <= 32 ? 1 : toWrite <= 128 ? 2 : toWrite <= 512 ? 3 : toWrite <= 4096 ? 4 : 5
+        ]!++;
+        const census = localeFastPathStats.callerCensus;
+        if (census !== null) {
+            const ret = view.getUint32(esp, true);
+            census.set(ret, (census.get(ret) ?? 0) + 1);
         }
         return toWrite;
     }, { trivial: true });
@@ -1604,11 +1814,59 @@ export function registerFastPathLocaleFunctions(dispatcher: any): void {
     //                       [+28]=lpDefaultChar [+32]=lpUsedDefaultChar
     // Fast path: ASCII-only strings (all codepoints < 0x80), CP1252/OEMCP/ACP.
     // -------------------------------------------------------------------------
-    dispatcher.registerFastPath('kernel32', 'WideCharToMultiByte', (_cpu: any, _mem8: Uint8Array): number | null => {
-        // Temporarily disable this fast path while bisecting the UT99 Render.dll
-        // regression. The slow path is the source of truth for null-termination
-        // and code page semantics, and the failure signature points at the
-        // WCTMB -> LoadLibraryA chain.
-        return null;
+    dispatcher.registerFastPath('kernel32', 'WideCharToMultiByte', (cpu: any, rawMem8: Uint8Array, _m32: Uint32Array, dv: DataView): number | null => {
+        // The slow path stays the source of truth for null-termination and code-page
+        // semantics: this handles ONLY the plainly-representable case and hands back
+        // anything else — a default char, a flag, or a code point the page cannot encode —
+        // so it can never be the one that decides a subtle case.
+        const mem8 = borrowGuestMemory(rawMem8);
+        const esp = (cpu.reg32[4]) >>> 0;
+        if (esp + 36 > mem8.length) return null;
+        const view = dv ?? new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
+
+        const codePage = view.getUint32(esp + 4, true);
+        const dwFlags = view.getUint32(esp + 8, true);
+        const lpWC = view.getUint32(esp + 12, true);
+        const cchWC = view.getInt32(esp + 16, true);
+        const lpMB = view.getUint32(esp + 20, true);
+        const cbMB = view.getInt32(esp + 24, true);
+        const lpDefaultChar = view.getUint32(esp + 28, true);
+        const lpUsedDefaultChar = view.getUint32(esp + 32, true);
+
+        if (!lpWC) return 0;
+        if (dwFlags !== 0 || lpDefaultChar !== 0 || lpUsedDefaultChar !== 0) return null;
+        if (cbMB < 0 || (cchWC < 0 && cchWC !== -1)) return null;
+
+        const config = EmulatorConfig.getInstance();
+        const effectiveCp = codePage === 0 ? config.ansiCodePage
+                          : codePage === 1 ? config.oemCodePage
+                          : codePage;
+        const rev = codePageToByteLut(effectiveCp);
+        if (!rev) return null;
+
+        // Source length in wchars, including the terminator when the guest passed -1.
+        let count: number;
+        if (cchWC === -1) {
+            count = 0;
+            while (lpWC + count * 2 + 1 < mem8.length && view.getUint16(lpWC + count * 2, true) !== 0) count++;
+            count++; // the terminator is part of the conversion
+        } else {
+            count = cchWC;
+        }
+        if (lpWC + count * 2 > mem8.length) return null;
+
+        // Every code point must be representable, or the default-char rules apply and this
+        // is not our case. Checked before writing anything.
+        for (let i = 0; i < count; i++) {
+            if (rev[view.getUint16(lpWC + i * 2, true)] === 0xffff) return null;
+        }
+        if (cbMB === 0) return count;   // size query: single-byte page ⇒ one byte per wchar
+
+        const toWrite = Math.min(count, cbMB);
+        if (!lpMB || lpMB + toWrite > mem8.length) return null;
+        for (let i = 0; i < toWrite; i++) {
+            mem8[lpMB + i] = rev[view.getUint16(lpWC + i * 2, true)]!;
+        }
+        return toWrite;
     }, { trivial: true });
 }
