@@ -166,7 +166,6 @@ export class DDraw implements IModule {
     exports: Record<string, ThunkImplementation> = {};
     vtables: Record<string, VTableInfo> = {};
     private process!: Process;
-    private memory!: Uint8Array;
     private context!: DDrawContext;
     private bitmapToSurfaceCache: Map<number, number> = new Map(); // HBITMAP -> Surface address
     private thrashAutoPresenterUnregister: (() => void) | null = null;
@@ -566,7 +565,6 @@ export class DDraw implements IModule {
 
     initialize(process: Process): void {
         this.process = process;
-        this.memory = this.getMemory();
 
         const interfaceRegistry = InterfaceRegistry.getInstance();
         interfaceRegistry.registerFromModuleDescriptor(ddrawModule);
@@ -583,7 +581,6 @@ export class DDraw implements IModule {
         
         this.context = {
             process: this.process,
-            memory: this.memory,
             vtables: this.vtables,
             resourceProvider,
             presenter: new DDrawPresenter(this.process),
@@ -913,8 +910,7 @@ export class DDraw implements IModule {
 
     recreateVTables(): void {
         if (this.process) {
-            this.memory = this.getMemory();
-            this.vtables = createVTablesFromDescriptor(this.process, ddrawModule); if (this.context) { this.context.vtables = this.vtables; this.context.memory = this.memory; }
+            this.vtables = createVTablesFromDescriptor(this.process, ddrawModule); if (this.context) { this.context.vtables = this.vtables; }
             Logger.verbose(LogCategory.SYSTEM, 'DirectDraw: Recreated vtables after reset');
 
             for (const [name, info] of Object.entries(this.vtables)) {

@@ -865,6 +865,14 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
                     surfacePtr: mipSurfacePtr,
                     surfacePtrAllocated: true,
                     attachedSurfaceAddr: 0,
+                    // DirectDraw made this level, not the app: it is not reference-counted as
+                    // an attachment and it cannot be detached.
+                    implicitChainMember: true,
+                    attachRefOwner: 0,
+                    // Own attachment/z-owner lists — the spread copies the ROOT's array by
+                    // reference, and a shared list would detach the root's members with this one.
+                    attachedSurfaceAddrs: undefined,
+                    zOwnerSurfaces: undefined,
                     mode: surfaceState.mode,
                     version: 0,
                     // Do not mark gpuDirty until guest writes — pre-Load bind must not upload zeros.
@@ -955,6 +963,14 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
                     surfacePtr: backbufferSurfacePtr,
                     surfacePtrAllocated: true,
                     attachedSurfaceAddr: 0,
+                    // A back buffer DirectDraw created for DDSD_BACKBUFFERCOUNT belongs to the
+                    // chain, not to the app: no attachment reference, and it dies with the root.
+                    implicitChainMember: true,
+                    attachRefOwner: 0,
+                    // Own attachment/z-owner lists — the spread copies the PRIMARY's array by
+                    // reference, and from the second back buffer on that array is non-empty.
+                    attachedSurfaceAddrs: undefined,
+                    zOwnerSurfaces: undefined,
                     // Backbuffer should inherit mode from primary for consistency
                     // If primary is GPU_ONLY, backbuffer should also be GPU_ONLY to avoid CPU↔GPU sync
                     mode: surfaceState.mode,  // Inherit from primary (GPU_ONLY or CPU)

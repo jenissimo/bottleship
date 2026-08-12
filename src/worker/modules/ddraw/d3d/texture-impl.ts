@@ -4,7 +4,7 @@
 import { Logger, LogCategory, LogLevel } from "../../../core/logger";
 import { System } from "../../../core/system";
 import { DDrawContext } from "../context";
-import { bytesToGuid } from "../helpers";
+import { bytesToGuid, surfaceAt } from "../helpers";
 import { isValidAddress } from "../../../core/memory/address-guard";
 import {
     DirectDrawSurfaceObject,
@@ -246,8 +246,8 @@ export const createTextureExports = (
 
             // 3. Handle Mipmaps: Recursively copy attached surfaces if they exist
             if (srcState.attachedSurfaceAddr && dstState.attachedSurfaceAddr) {
-                const srcAttached = resourceProvider.getComObjectByAddress(srcState.attachedSurfaceAddr) as DirectDrawSurfaceObject | null;
-                const dstAttached = resourceProvider.getComObjectByAddress(dstState.attachedSurfaceAddr) as DirectDrawSurfaceObject | null;
+                const srcAttached = surfaceAt(resourceProvider, srcState.attachedSurfaceAddr);
+                const dstAttached = surfaceAt(resourceProvider, dstState.attachedSurfaceAddr);
 
                 if (srcAttached && dstAttached) {
                     return copyTexture2Data(srcAttached, dstAttached, mem, _threadId, `${tag}[MIP]`);

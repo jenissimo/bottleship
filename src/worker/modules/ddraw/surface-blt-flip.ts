@@ -44,7 +44,7 @@ import {
     DDGFS_ISFLIPDONE,
     DDGFS_CANFLIP,
 } from "./constants";
-import { readRect, type Rect } from "./helpers";
+import { readRect, surfaceAt, type Rect } from "./helpers";
 import { absToRel } from "./helpers";
 import { copySurfaceRegion, copySurfaceRegionWithColorKey, copySurfaceRegionWithRop, copyCompressedSurfaceRegion, buildFullRect } from "./surface-helpers";
 import { RectPool } from "./rect-pool";
@@ -320,7 +320,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
         const lpDDSurfaceTargetOverride = args[1];
         const presentInterval = flipPresentInterval(args[2] >>> 0);
         profiler.start('Flip:lookup');
-        const obj = context.resourceProvider.getComObjectByAddress(thisPtr) as DirectDrawSurfaceObject | null;
+        const obj = surfaceAt(context.resourceProvider, thisPtr);
         if (!obj) return E_FAIL;
         const state = obj.getState();
 
@@ -336,7 +336,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
         for (const sPtr of surfacesToSync) {
             const hdc = gdiContext.getHDCBySurface(sPtr);
             if (hdc && gdiContext.isDirty(hdc)) {
-                const sObj = context.resourceProvider.getComObjectByAddress(sPtr) as DirectDrawSurfaceObject | null;
+                const sObj = surfaceAt(context.resourceProvider, sPtr);
                 if (!sObj) continue;
                 Logger.log(LogCategory.DDRAW, `IDirectDrawSurface7_Flip: Force syncing active GDI HDC 0x${hdc.toString(16)} on surface 0x${sPtr.toString(16)}`);
                 try {
@@ -373,7 +373,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
         }
 
         const ring = collectFlipChain(thisPtr, (a) =>
-            context.resourceProvider.getComObjectByAddress(a) as DirectDrawSurfaceObject | null);
+            surfaceAt(context.resourceProvider, a));
 
         // The links do not close into a ring only when the back buffer reached us
         // through context.surfaces rather than an attachment; pair with it directly.
@@ -381,7 +381,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
         if (!chain) {
             const bbAddr = context.surfaces.backBuffer;
             const bbObj = bbAddr && bbAddr !== thisPtr
-                ? context.resourceProvider.getComObjectByAddress(bbAddr) as DirectDrawSurfaceObject | null
+                ? surfaceAt(context.resourceProvider, bbAddr)
                 : null;
             const bbState = bbObj?.getState();
             if (bbState && flipStorageCompatible(state, bbState)) {
@@ -490,7 +490,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
         // propagation reads it) and the deferred-upload batch.
         const handleOf = new Map<DirectDrawSurfaceState, number>();
         for (const e of chain) {
-            const obj = context.resourceProvider.getComObjectByAddress(e.addr) as DirectDrawSurfaceObject | null;
+            const obj = surfaceAt(context.resourceProvider, e.addr);
             if (obj) handleOf.set(e.state, obj.handle);
         }
         const wasPendingUpload = new Set(
@@ -535,7 +535,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
         const dwFlags = args[1];
         const lpColorKey = args[2];
 
-        const obj = context.resourceProvider.getComObjectByAddress(thisPtr) as DirectDrawSurfaceObject | null;
+        const obj = surfaceAt(context.resourceProvider, thisPtr);
         if (!obj) return E_FAIL;
 
         const state = obj.getState();
@@ -608,7 +608,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
         const dwFlags = args[1];
         const lpColorKey = args[2];
 
-        const obj = context.resourceProvider.getComObjectByAddress(thisPtr) as DirectDrawSurfaceObject | null;
+        const obj = surfaceAt(context.resourceProvider, thisPtr);
         if (!obj) return E_FAIL;
         if (!lpColorKey || !isValidAddress(mem, lpColorKey, 8)) return E_POINTER;
 
@@ -646,12 +646,12 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
         const dwFlags = args[4];
         const lpDDBltFx = args[5];
 
-        const dstObj = context.resourceProvider.getComObjectByAddress(thisPtr) as DirectDrawSurfaceObject | null;
+        const dstObj = surfaceAt(context.resourceProvider, thisPtr);
         if (!dstObj) return E_FAIL;
         const dstState = dstObj.getState();
 
         if ((dstState.caps & DDSCAPS_TEXTURE) !== 0) {
-            const srcObj = lpSrcSurface ? context.resourceProvider.getComObjectByAddress(lpSrcSurface) as DirectDrawSurfaceObject | null : null;
+            const srcObj = lpSrcSurface ? surfaceAt(context.resourceProvider, lpSrcSurface) : null;
             Logger.log(LogCategory.DDRAW, 
                 `Blt to TEXTURE: dst=0x${thisPtr.toString(16)} src=0x${(lpSrcSurface || 0).toString(16)} ` +
                 `flags=0x${dwFlags.toString(16)} dstSize=${dstState.width}x${dstState.height} ` +
@@ -782,7 +782,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
             return DD_OK;
         }
 
-        const srcObj = context.resourceProvider.getComObjectByAddress(lpSrcSurface) as DirectDrawSurfaceObject | null;
+        const srcObj = surfaceAt(context.resourceProvider, lpSrcSurface);
         if (!srcObj) return E_FAIL;
 
         const srcState = srcObj.getState();
@@ -1175,11 +1175,11 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
         const lpSrcRect = args[4];
         const dwTrans = args[5] >>> 0;
 
-        const dstObj = context.resourceProvider.getComObjectByAddress(thisPtr) as DirectDrawSurfaceObject | null;
+        const dstObj = surfaceAt(context.resourceProvider, thisPtr);
         if (!dstObj) return E_FAIL;
         const dstState = dstObj.getState();
 
-        const srcObj = context.resourceProvider.getComObjectByAddress(lpSrcSurface) as DirectDrawSurfaceObject | null;
+        const srcObj = surfaceAt(context.resourceProvider, lpSrcSurface);
         if (!srcObj) return E_FAIL;
 
         const srcState = srcObj.getState();

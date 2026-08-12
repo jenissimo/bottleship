@@ -157,7 +157,24 @@ export interface BaseSurfaceState {
     caps4?: number;            // DDSCAPS2.dwCaps4 / dwVolumeDepth (union)
     surfacePtr: number;
     format: SurfaceFormat;
+    /** The FLIP-CHAIN link: the successor in the attachment ring a Flip rotates around.
+     *  DirectDraw keeps a LIST of attachments, so this is only the chain member; a depth
+     *  buffer or mip level attached to the same surface goes in `attachedSurfaceAddrs`
+     *  and must never overwrite this, or Flip loses its target. */
     attachedSurfaceAddr: number;
+    /** Every surface attached to this one (the flip link included), in attach order —
+     *  what GetAttachedSurface/EnumAttachedSurfaces enumerate. */
+    attachedSurfaceAddrs?: number[];
+    /** Created BY DirectDraw as part of a complex surface (flip-chain back buffer, mip
+     *  sublevel) rather than handed to AddAttachedSurface by the app. DirectDraw owns these:
+     *  they carry no attachment reference, they die with the root, and DeleteAttachedSurface
+     *  refuses them with DDERR_CANNOTDETACHSURFACE. */
+    implicitChainMember?: boolean;
+    /** The surface this one is attached to and holds ONE reference for — the reference
+     *  AddAttachedSurface takes, dropped by DeleteAttachedSurface or by the owner's
+     *  destruction. DirectDraw keeps exactly one such slot per surface, so an already-attached
+     *  surface never takes a second reference. 0/undefined = holds none. */
+    attachRefOwner?: number;
     /** DDSCAPS_ZBUFFER surfaces only: guest addresses of the render targets this depth
      *  buffer was attached to. Our depth attachments are keyed by render target, so a
      *  DDBLT_DEPTHFILL aimed at the z surface has to be resolved back to them. */
@@ -432,9 +449,39 @@ export class DirectDrawSurfaceObject extends BaseComObject {
     }
 
     /**
+     * Drop the reference AddAttachedSurface took on every surface EXPLICITLY attached to
+     * this one. DirectDraw detaches before it destroys the root, and detaching is what
+     * releases the attachment (Wine ddraw_surface_cleanup → ddraw_surface_delete_attached_surface).
+     * Without this the reference is a leak, and a leaked reference on a primary or a
+     * flip-chain member keeps a dead screen resolvable long after the app dropped it.
+     */
+    private releaseAttachRefs(): void {
+        const attached = this.state.attachedSurfaceAddrs;
+        if (!attached || attached.length === 0) return;
+        const resourceProvider = SystemResourceProvider.getInstance();
+        const myAddr = (resourceProvider.getAddressForHandle(this.handle) ?? 0) >>> 0;
+        if (!myAddr) return;
+
+        for (const addr of [...attached]) {
+            const resolved = resourceProvider.getComObjectByAddress(addr);
+            if (!(resolved instanceof DirectDrawSurfaceObject)) continue;
+            const state = resolved.getState();
+            if (((state.attachRefOwner ?? 0) >>> 0) !== myAddr) continue;
+            // Clear the slot BEFORE releasing: the surface may go away inside release().
+            state.attachRefOwner = 0;
+            resolved.release();
+        }
+    }
+
+    /**
      * Releasing the primary of a flipping chain also releases attached chain members
      * (MSDN IDirectDrawSurface::Release). Without this, backbuffers stay at refCount=1
      * until IDirectDraw cascade forceRelease - wrong teardown order for ref_soft/Q2 VID_restart.
+     *
+     * IMPLICIT members only. A chain the app built itself with AddAttachedSurface holds the
+     * app's own reference plus the attachment reference; the root's destruction drops the
+     * attachment reference (releaseAttachRefs) and nothing else — releasing the app's
+     * reference for it would destroy a surface the app still owns.
      */
     private releaseFlipChainAttached(): void {
         const caps = this.state.caps >>> 0;
@@ -451,16 +498,19 @@ export class DirectDrawSurfaceObject extends BaseComObject {
 
         while (currentAddr && currentAddr !== myAddr && !visited.has(currentAddr)) {
             visited.add(currentAddr);
-            const attached = resourceProvider.getComObjectByAddress(currentAddr) as DirectDrawSurfaceObject | null;
-            if (!attached) break;
+            const resolved = resourceProvider.getComObjectByAddress(currentAddr);
+            // A released chain member's COM slot can already hold a device/texture.
+            if (!(resolved instanceof DirectDrawSurfaceObject)) break;
+            const attached = resolved;
             const nextAddr = attached.getState().attachedSurfaceAddr >>> 0;
-            attached.release();
+            if (attached.getState().implicitChainMember) attached.release();
             currentAddr = nextAddr;
         }
     }
 
     release(): number {
         if (this.refCount === 1) {
+            this.releaseAttachRefs();
             this.releaseFlipChainAttached();
         }
 
@@ -705,13 +755,38 @@ export class DirectDrawSurfaceObject extends BaseComObject {
         return null;
     }
 
+    /** Set the FLIP-CHAIN link. Use addAttachment() for attachments in general. */
     setAttachedSurface(addr: number): void {
         const oldAddr = this.state.attachedSurfaceAddr;
         this.state.attachedSurfaceAddr = addr;
-        Logger.verbose(LogCategory.DDRAW, 
+        this.addAttachment(addr);
+        Logger.verbose(LogCategory.DDRAW,
             `DirectDrawSurfaceObject.setAttachedSurface: handle=0x${this.handle.toString(16)} ` +
             `old=0x${oldAddr.toString(16)} new=0x${addr.toString(16)}`
         );
+    }
+
+    /** Record `addr` in the attachment list without touching the flip-chain link. */
+    addAttachment(addr: number): void {
+        const a = addr >>> 0;
+        if (!a) return;
+        const list = this.state.attachedSurfaceAddrs ?? (this.state.attachedSurfaceAddrs = []);
+        if (!list.includes(a)) list.push(a);
+    }
+
+    /** Drop `addr` from the attachment list, and from the flip link if it was the link. */
+    removeAttachment(addr: number): void {
+        const a = addr >>> 0;
+        const list = this.state.attachedSurfaceAddrs;
+        if (list) {
+            const i = list.indexOf(a);
+            if (i >= 0) list.splice(i, 1);
+        }
+        if ((this.state.attachedSurfaceAddr >>> 0) === a) {
+            // Promote whatever else is attached; a chain of one is not a chain, and Flip
+            // rejects it the same way DirectDraw does.
+            this.state.attachedSurfaceAddr = list?.[0] ?? 0;
+        }
     }
 }
 

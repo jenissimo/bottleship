@@ -19,7 +19,6 @@ export function createSurfaceStubsExports(context: DDrawContext): Record<string,
     const stubMethods = [
         "AddOverlayDirtyRect",
         "BltBatch",
-        "DeleteAttachedSurface",
         "EnumOverlayZOrders",
         "GetOverlayPosition",
         "Initialize",

@@ -38,7 +38,6 @@ export type TextureHandleEntry = {
 
 export type DDrawContext = {
     process: Process;
-    memory: Uint8Array;
     vtables: Record<string, VTableInfo>;
     resourceProvider: SystemResourceProvider;
     presenter: DDrawPresenter;

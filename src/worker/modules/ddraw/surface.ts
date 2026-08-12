@@ -47,8 +47,9 @@ import {
     IID_IDirect3DRampDevice,
     IID_IDirect3DMMXDevice,
     D3DRENDERSTATE_COLORKEYENABLE,
+    DDERR_CANNOTDETACHSURFACE, DDERR_SURFACENOTATTACHED, DDERR_INVALIDOBJECT,
 } from "./constants";
-import { bytesToGuid, readRect, Rect, absToRel, readU16Abs, readU32Abs } from "./helpers";
+import { bytesToGuid, readRect, Rect, absToRel, readU16Abs, readU32Abs, surfaceAt } from "./helpers";
 import { writeSurfaceDescV1 } from "./structs";
 import { DirectDrawSurfaceObject, DirectDrawSurfaceState, Direct3DTextureObject, Direct3DTexture2Object, DirectDrawGammaControlObject, DirectDrawClipperObject, Direct3DDevice3Object, isBitmapTexture, isRenderSurface } from "./com-objects";
 import { writePixelFormat, writeSurfaceDesc } from "./structs";
@@ -254,17 +255,22 @@ function resolveGetAttachedSurfaceTarget(
     const obj = lookup(thisPtr);
     if (!obj) return 0;
 
-    let currentAddr = obj.getState().attachedSurfaceAddr;
-    const visited = new Set<number>();
-    while (currentAddr && !visited.has(currentAddr)) {
+    // Every surface attached to `this` is a candidate — a depth buffer and the flip
+    // successor hang off the same surface — and only then do we follow the chain on.
+    const visited = new Set<number>([thisPtr >>> 0]);
+    const queue: number[] = [...(obj.getState().attachedSurfaceAddrs ?? []),
+                             obj.getState().attachedSurfaceAddr];
+    while (queue.length) {
+        const currentAddr = queue.shift()! >>> 0;
+        if (!currentAddr || visited.has(currentAddr)) continue;
         visited.add(currentAddr);
         const attachedObj = lookup(currentAddr);
-        if (!attachedObj) break;
-        const attachedCaps = attachedObj.getState().caps >>> 0;
-        if (attachedCapsMatch(attachedCaps, requestedCaps)) {
+        if (!attachedObj) continue;
+        const attachedState = attachedObj.getState();
+        if (attachedCapsMatch(attachedState.caps >>> 0, requestedCaps)) {
             return currentAddr;
         }
-        currentAddr = attachedObj.getState().attachedSurfaceAddr;
+        queue.push(...(attachedState.attachedSurfaceAddrs ?? []), attachedState.attachedSurfaceAddr);
     }
 
     if (requestedCaps & DDSCAPS_BACKBUFFER) {
@@ -1911,12 +1917,17 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         const lpContext = args[1];
         const lpCallback = args[2];
 
-        const obj = context.resourceProvider.getComObjectByAddress(thisPtr) as DirectDrawSurfaceObject | null;
+        const obj = surfaceAt(context.resourceProvider, thisPtr);
         const state = obj?.getState();
 
         // Collect attached surface addresses
         const attached: number[] = [];
-        if (state?.attachedSurfaceAddr) attached.push(state.attachedSurfaceAddr);
+        for (const a of state?.attachedSurfaceAddrs ?? []) {
+            if (a && !attached.includes(a)) attached.push(a);
+        }
+        if (state?.attachedSurfaceAddr && !attached.includes(state.attachedSurfaceAddr)) {
+            attached.push(state.attachedSurfaceAddr);
+        }
         if (state && (state.caps & DDSCAPS_PRIMARYSURFACE) && context.surfaces.backBuffer &&
                 !attached.includes(context.surfaces.backBuffer)) {
             attached.push(context.surfaces.backBuffer);
@@ -1948,7 +1959,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
             }
 
             const surfaceAddr = attached[index];
-            const attachedObj = context.resourceProvider.getComObjectByAddress(surfaceAddr) as DirectDrawSurfaceObject | null;
+            const attachedObj = surfaceAt(context.resourceProvider, surfaceAddr);
             const attachedState = attachedObj?.getState();
             index++;
 
@@ -2084,7 +2095,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         const state = obj.getState();
         const targetAddr = resolveGetAttachedSurfaceTarget(
             context,
-            (addr) => context.resourceProvider.getComObjectByAddress(addr) as DirectDrawSurfaceObject | null,
+            (addr) => surfaceAt(context.resourceProvider, addr),
             thisPtr,
             requestedCaps,
         );
@@ -2611,7 +2622,27 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
             if (!owners.includes(thisPtr >>> 0)) owners.push(thisPtr >>> 0);
         }
 
-        thisObj.setAttachedSurface(lpDDSAttachedSurface);
+        thisObj.addAttachment(lpDDSAttachedSurface);
+
+        // DirectDraw takes ONE reference on an explicitly attached surface and holds it until
+        // the attachment is deleted or the surface it hangs off is destroyed — which is what
+        // lets an app create a z buffer, attach it, Release its own pointer and keep rendering.
+        // (Wine surface.c ddraw_surface7/4/3/2/1_AddAttachedSurface: attached_iface = attachment,
+        // AddRef; the matching Release is in ddraw_surface_delete_attached_surface.) There is one
+        // such slot per surface, so a surface already holding an attachment reference does not
+        // take a second; implicit chain members are DirectDraw's own and are never counted.
+        // Kill switch for A/B'ing surface lifetime: setWorkerFlag('__noAttachAddRef', true).
+        let attachRef = "none";
+        if (!(globalThis as { __noAttachAddRef?: boolean }).__noAttachAddRef
+            && !attachedState.implicitChainMember
+            && !attachedState.attachRefOwner) {
+            attachedState.attachRefOwner = thisPtr >>> 0;
+            attachRef = `taken(ref=${attachedObj.addRef()})`;
+        } else if (attachedState.implicitChainMember) {
+            attachRef = "implicit";
+        } else if (attachedState.attachRefOwner) {
+            attachRef = `held-by-0x${(attachedState.attachRefOwner >>> 0).toString(16)}`;
+        }
 
         // Attaching a same-format offscreen surface BUILDS a flip chain: ddraw marks both
         // surfaces DDSCAPS_FLIP, names the front and the back, and closes the ring — which
@@ -2628,12 +2659,17 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
             }
             attachedState.caps |= (thisState.caps & DDSCAPS_BACKBUFFER)
                 ? DDSCAPS_FRONTBUFFER : DDSCAPS_BACKBUFFER;
+            thisObj.setAttachedSurface(lpDDSAttachedSurface);
             if (!attachedState.attachedSurfaceAddr) attachedObj.setAttachedSurface(thisPtr);
         }
 
-        Logger.verbose(LogCategory.DDRAW,
+        // Attachments are a handful of calls per title and they decide surface LIFETIME,
+        // so this is worth a normal-level line: without it "the attach reference was taken"
+        // is invisible until a freed COM block is dispatched through, hours away.
+        Logger.log(LogCategory.DDRAW,
             `IDirectDrawSurface7_AddAttachedSurface: this=0x${thisPtr.toString(16)} ` +
-            `attached=0x${lpDDSAttachedSurface.toString(16)} ${isZBuffer ? '[ZBUFFER]' : ''}${flippable ? '[FLIP]' : ''}`
+            `attached=0x${lpDDSAttachedSurface.toString(16)} ${isZBuffer ? '[ZBUFFER]' : ''}${flippable ? '[FLIP]' : ''} ` +
+            `attachRef=${attachRef}`
         );
 
         return DD_OK;
@@ -2654,6 +2690,56 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         }
         // In emu we never lose surfaces; always return DD_OK (not lost)
         return DD_OK;
+    };
+
+    // DeleteAttachedSurface(dwFlags, lpDDSAttachedSurface). A NULL surface detaches
+    // everything that was attached explicitly; DirectDraw refuses to detach an
+    // implicitly-created chain member (DDERR_CANNOTDETACHSURFACE), so those are skipped.
+    // Detaching releases the reference AddAttachedSurface took.
+    exports["IDirectDrawSurface7_DeleteAttachedSurface"] = (ctx, mem, args) => {
+        const thisPtr = args[0];
+        const lpDDSAttachedSurface = args[2];
+        const thisObj = surfaceAt(context.resourceProvider, thisPtr);
+        if (!thisObj) return DDERR_INVALIDOBJECT;
+        const state = thisObj.getState();
+        const targets = lpDDSAttachedSurface
+            ? [lpDDSAttachedSurface >>> 0]
+            : [...(state.attachedSurfaceAddrs ?? [])];
+        let detached = false;
+        for (const addr of targets) {
+            // A surface that is not on the list was never attached to this one, and
+            // DirectDraw says so rather than silently succeeding.
+            if (!(state.attachedSurfaceAddrs ?? []).includes(addr >>> 0)) continue;
+            const attachedObj = surfaceAt(context.resourceProvider, addr);
+            if (!attachedObj) {
+                // Already gone — drop the dangling link rather than keep it. It WAS
+                // attached, so the detach itself succeeded.
+                thisObj.removeAttachment(addr);
+                detached = true;
+                continue;
+            }
+            const attachedState = attachedObj.getState();
+            if (attachedState.implicitChainMember) {
+                // A member DirectDraw created as part of a complex surface belongs to
+                // DirectDraw and dies with the root, so it cannot be detached at all.
+                if (lpDDSAttachedSurface) return DDERR_CANNOTDETACHSURFACE;
+                continue;
+            }
+            const zOwners = attachedState.zOwnerSurfaces;
+            if (zOwners) {
+                const i = zOwners.indexOf(thisPtr >>> 0);
+                if (i >= 0) zOwners.splice(i, 1);
+            }
+            thisObj.removeAttachment(addr);
+            detached = true;
+            // Detaching drops the reference the attach took. Clear the slot first: the
+            // surface may be destroyed inside release().
+            if (((attachedState.attachRefOwner ?? 0) >>> 0) === (thisPtr >>> 0)) {
+                attachedState.attachRefOwner = 0;
+                attachedObj.release();
+            }
+        }
+        return (detached || !lpDDSAttachedSurface) ? DD_OK : DDERR_SURFACENOTATTACHED;
     };
 
     // Restore: restore surface after loss. No-op in emu since we never lose.
@@ -2795,7 +2881,7 @@ export function registerFastPathSurfaceFunctions(dispatcher: any, context: DDraw
 
         const targetAddr = resolveGetAttachedSurfaceTarget(
             context,
-            (addr) => resourceProvider.getComObjectByAddressFast(addr) as DirectDrawSurfaceObject | null,
+            (addr) => { const o = resourceProvider.getComObjectByAddressFast(addr); return o instanceof DirectDrawSurfaceObject ? o : null; },
             thisPtr,
             requestedCaps,
         );

@@ -31,7 +31,12 @@ export function registerSurfaceV1Exports(
     exports["IDirectDrawSurface_BltFast"] = (ctx, mem, args) => {
         return exports["IDirectDrawSurface7_BltFast"]?.(ctx, mem, args) ?? DD_OK;
     };
-    exports["IDirectDrawSurface_DeleteAttachedSurface"] = () => DD_OK;
+    // Same parameters as v7, and it must run the real thing: the v1 interface is how
+    // pre-DX7 titles both build and dismantle a flip chain, and answering DD_OK without
+    // detaching leaks the reference AddAttachedSurface took.
+    exports["IDirectDrawSurface_DeleteAttachedSurface"] = (ctx, mem, args) => {
+        return exports["IDirectDrawSurface7_DeleteAttachedSurface"]?.(ctx, mem, args) ?? DD_OK;
+    };
     exports["IDirectDrawSurface_EnumAttachedSurfaces"] = (ctx, mem, args) => {
         return enumAttachedSurfacesImpl(ctx, mem, args, false);
     };
