@@ -22,6 +22,7 @@ don't reach for a binary.
 | GOG `setup_*.exe` / Inno Setup | Inno headers (LZMA1/2) | end-to-end: `bun tools/gog-to-wgb.ts`; inspect: `bun tools/inno-inspect.ts` |
 | `.iso` / `.bin`+`.cue` | ISO9660 / disc image | `bun tools/iso-to-wgb.ts`; `bun tools/bin2iso.ts` |
 | `.arc` | FreeArc (srep+LZMA) repacks | `packages/formats/src/freearc/` |
+| `.rar` | store-only RAR5 wrapper around an installer (typical game drop), incl. `.partN.rar` sets | `bun tools/rar-extract.ts <a.rar> <out> [--list]` — refuses compressed/solid/encrypted/RAR4 |
 | `.zip` / `.wgb` | store+deflate ZIP (also the `.wgb` container) | `bun tools/wgb.ts` |
 
 Cores live in `packages/formats/src/<fmt>/`; the native codec backend (LZMA1/2/srep) is
