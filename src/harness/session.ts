@@ -78,20 +78,18 @@ export interface TabLike { type: string; url: string }
  * Pick the tab a session drives.
  *
  * Named: only a tab carrying its own token — never a sibling's.
- * Default: prefer an UNMARKED tab so a named sibling is never hijacked, then (unless
- * `strict`) fall back to the first match, which is exactly today's behaviour when no
- * session is in play. `strict` is for "find or CREATE": rather open our own tab than
- * borrow one that belongs to somebody.
+ * Default (BS_TAB unset): an UNMARKED tab, and NOTHING else — never a named sibling's, not
+ * even as a last resort. A marked tab belongs to some agent, and one dropped `BS_TAB=` prefix
+ * would otherwise load a bundle into their live guest. No match returns undefined so the
+ * caller fails loudly with the tab list, which names the mistake.
  */
 export function pickSessionTab<T extends TabLike>(
     list: readonly T[],
     name: string,
-    opts: { type: string; urlMatch: string; strict?: boolean },
+    opts: { type: string; urlMatch: string },
 ): T | undefined {
     const cands = list.filter((t) => t.type === opts.type && t.url.includes(opts.urlMatch));
-    const own = cands.find((t) => sessionOwnsUrl(t.url, name));
-    if (own || name || opts.strict) return own;
-    return cands[0];
+    return cands.find((t) => sessionOwnsUrl(t.url, name));
 }
 
 /** logs-relative path re-rooted into the session subtree: `debug/x.png` → `alpha/debug/x.png`. */

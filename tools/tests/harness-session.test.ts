@@ -101,10 +101,11 @@ describe("tab selection", () => {
         expect(pickSessionTab(list, "", PICK)?.url).toBe(DEV);
     });
 
-    it("default falls back to any dev tab when attaching, but never adopts one when creating", () => {
+    it("default never adopts a named sibling's tab, even as the only candidate", () => {
+        // The whole point of sessions: one dropped BS_TAB= prefix must NOT load a bundle
+        // into another agent's live guest. No unmarked tab ⇒ no tab, and the caller says so.
         const list = [tab(`${DEV}&bs=alpha`)];
-        expect(pickSessionTab(list, "", PICK)?.url).toBe(`${DEV}&bs=alpha`);
-        expect(pickSessionTab(list, "", { ...PICK, strict: true })).toBeUndefined();
+        expect(pickSessionTab(list, "", PICK)).toBeUndefined();
     });
 
     it("ignores non-page targets and non-dev pages", () => {

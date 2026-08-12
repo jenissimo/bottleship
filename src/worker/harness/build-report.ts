@@ -12,6 +12,8 @@ import { getCxxExceptionRing, getSehDispatchTrace } from "../core/seh-dispatch";
 import { getStackGuardViolations } from "../core/memory/stack-write-guard";
 import { hypercallDataManager } from "../core/cpu/hypercall-data";
 import { loadDiagnostics } from "../core/diagnostics/load-diagnostics";
+import { getGpuErrorReport, type GpuErrorReport } from "../core/gpu-error-log";
+import { pendingMessageBoxes } from "../runtime/dialog-bridge";
 
 const hx = (v: number) => "0x" + (v >>> 0).toString(16);
 
@@ -33,6 +35,19 @@ export interface HarnessReport {
     backtrace: Array<{ i: number; ret: string; sym: string | null; isThunk: boolean }>;
     lastThunks: string[];
     stubs: Array<{ api: string; id: string; count: number; firstCaller: string; firstCallerSym: string | null }>;
+    /**
+     * A non-zero `gpuTotal` is never normal: WebGPU reports validation asynchronously and
+     * never throws for it, so the guest runs on believing it drew — the symptom is missing
+     * geometry or a frozen picture, not an exception. (`total` also counts guarded
+     * non-GPU callback throws.) Carried here because the log ring cannot hold the first one.
+     */
+    gpuErrors: GpuErrorReport;
+    /**
+     * Message boxes the guest is blocked on. The host draws them as DOM, so no canvas
+     * capture can show one: without this, a guest waiting on an error box is indistinguishable
+     * from a freeze, and the text naming the actual problem is invisible.
+     */
+    pendingModals: Array<{ id: number; text: string; caption: string; uType: number; waitingMs: number }>;
     silentStubs: Array<{ api: string; count: number; arity: number; lastCaller: string; lastCallerSym: string | null }>;
     getProcMisses: Array<{
         module: string; proc: string; count: number;
@@ -152,6 +167,8 @@ export function buildHarnessReport(esp?: number): HarnessReport {
             isThunk: f.isThunk,
         })),
         lastThunks: bt?.recent ?? [],
+        gpuErrors: getGpuErrorReport(),
+        pendingModals: pendingMessageBoxes(),
         stubs: stubRegistry.list().map((s) => ({
             api: s.key,
             id: hx(s.functionId),

@@ -149,6 +149,15 @@ export function serializeSurfaces(): unknown {
             ptrHex: "0x" + (st.surfacePtr >>> 0).toString(16),
             comAddrHex: comAddr ? "0x" + comAddr.toString(16) : null,
             attachedSurfaceAddrHex: st.attachedSurfaceAddr ? "0x" + u32(st.attachedSurfaceAddr).toString(16) : null,
+            // The whole attachment picture, so surface LIFETIME is inspectable: who is
+            // attached to whom, which members DirectDraw owns (implicit, never counted),
+            // which surface holds the one reference AddAttachedSurface takes, and the
+            // resulting refcount. "The attach ref leaked" is otherwise invisible until a
+            // freed COM block is dispatched through.
+            attachedSurfaceAddrs: st.attachedSurfaceAddrs?.map((a: number) => "0x" + u32(a).toString(16)) ?? null,
+            implicitChainMember: st.implicitChainMember ?? false,
+            attachRefOwnerHex: st.attachRefOwner ? "0x" + u32(st.attachRefOwner).toString(16) : null,
+            refCount: typeof o?.refCount === "number" ? o.refCount : null,
             zOwnerSurfaces: st.zOwnerSurfaces?.map((a: number) => "0x" + u32(a).toString(16)) ?? null,
             width: st.width,
             height: st.height,

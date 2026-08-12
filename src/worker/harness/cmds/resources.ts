@@ -11,6 +11,7 @@
 
 import type { HarnessService } from "../service";
 import { SystemResourceProvider, ResourceType } from "../../core/resources/system-resource-provider";
+import { comDoubleFreeCount, comLifecycleLog, comPoolStats, comReuseStats, poisonComObject } from "../../core/com/com-memory";
 
 /** End of each typed handle range (system-resource-provider layout). */
 const RANGE_END: Record<string, number> = {
@@ -56,5 +57,37 @@ export function registerResourceCommands(svc: HarnessService): void {
             };
         }
         return out;
+    });
+
+    /** comLifetime(addr?) — COM block free/recycle history with the guest call site of
+     *  each half, per-module free-list depths, and any block reuse that crossed modules
+     *  (structurally impossible unless the `__comSharedPool` control is on). Pass an
+     *  object address to see only that block's history — the two halves of a UAF. */
+    svc.register("comLifetime", (args) => {
+        const addr = args[0] === undefined ? undefined : Number(args[0]) >>> 0;
+        return {
+            pools: comPoolStats(),
+            crossOwnerReuse: comReuseStats(),
+            doubleFreesRefused: comDoubleFreeCount(),
+            log: comLifecycleLog(addr).map((e) => ({
+                seq: e.seq,
+                op: e.op,
+                obj: "0x" + e.objAddr.toString(16),
+                iface: e.iface,
+                owner: e.owner,
+                into: e.intoIface ? `${e.intoOwner}:${e.intoIface}` : undefined,
+                t: (e.t / 1000).toFixed(3) + "s",
+                by: e.by,
+            })),
+        };
+    });
+
+    /** comPoison(addr) — FAULT INJECTION: poison a LIVE COM object's vptr as if it had
+     *  just been released. The next guest dispatch through it must hit the released-COM
+     *  trap; that is what makes the trap a checkable instrument rather than a claim. */
+    svc.register("comPoison", (args) => {
+        const addr = Number(args[0]) >>> 0;
+        if (!addr) throw new Error("comPoison: need a COM object address");
+        return { addr: "0x" + addr.toString(16), owner: poisonComObject(addr, true) };
     });
 }

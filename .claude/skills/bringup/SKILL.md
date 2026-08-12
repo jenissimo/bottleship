@@ -107,6 +107,14 @@ CLI invocation reconnects without it.
   are refused (CLAUDE.md §3.5).
 - Read the streamed log; `events(n)` shows recent harness events; on a WASM trap a
   `fault` event carries the fault-grade snapshot.
+- The ring holds a fixed number of ENTRIES, so on a ddraw/d3d title the per-frame spam
+  overwrites init-time evidence in ~20s and it is gone before a late crash fires. Quiet the
+  firehose category first — `logLevel("DDRAW","WARN")` (`logLevel()` resets) — rather than
+  just enlarging the ring, which only postpones losing the same lines.
+- A guest blocked on a **MessageBox** looks exactly like a freeze: the host draws it as DOM,
+  so no canvas capture shows it and the one string naming the problem is invisible.
+  `report().pendingModals` lists them (text, caption, how long it has waited);
+  `dismissModal()` / `onModal()` answer them.
 
 ## 5. Hypothesis from DATA, not reasoning
 

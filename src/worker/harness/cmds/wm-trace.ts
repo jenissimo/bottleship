@@ -21,6 +21,14 @@ const MAX_ENTRIES = 512;
  *  can see whether the class proc turned it into WM_COMMAND(BN_CLICKED) — and for
  *  whom. */
 const TRACED_MSG: Record<number, string> = {
+    // Activation/focus. "Which of these did the game's WndProc ever see" is a question
+    // that has to be answered from the wire, not from reading the activation code —
+    // a game can run a whole session without one and nothing logs their absence.
+    0x0006: "WM_ACTIVATE",
+    0x0007: "WM_SETFOCUS",
+    0x0008: "WM_KILLFOCUS",
+    0x001C: "WM_ACTIVATEAPP",
+    0x0086: "WM_NCACTIVATE",
     0x0020: "WM_SETCURSOR",
     0x004E: "WM_NOTIFY",
     0x0111: "WM_COMMAND",

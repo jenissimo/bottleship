@@ -182,15 +182,15 @@ export async function listSessionTabs(opts: { port?: number } = {}): Promise<Cdp
 
 /** Find the target this session drives (default page/game=dev).
  *  Multi-agent isolation: with `BS_TAB=<name>` set, only a tab carrying the matching
- *  `?bs=<name>` token matches, so two agents never steal each other's. With BS_TAB unset
- *  an UNMARKED tab wins (a named sibling's tab is not hijacked), falling back to the first
- *  game=dev tab — which is the unchanged behaviour when no session is in play. */
-export async function findTab(urlMatch = GAME_DEV_FILTER, opts: { type?: string; port?: number; strict?: boolean } = {}): Promise<CdpTarget> {
+ *  `?bs=<name>` token matches. With BS_TAB unset only an UNMARKED tab matches — never a
+ *  named sibling's, not even as a last resort: one dropped prefix would otherwise load a
+ *  bundle into another agent's live guest. No match throws, and the message lists the tabs. */
+export async function findTab(urlMatch = GAME_DEV_FILTER, opts: { type?: string; port?: number } = {}): Promise<CdpTarget> {
     const port = opts.port ?? DEFAULT_CDP_PORT;
     const type = opts.type ?? "page";
     const session = cdpSession();
     const list: CdpTarget[] = await fetchJson(port, "/json/list");
-    const hit = pickSessionTab(list, session, { type, urlMatch, strict: opts.strict });
+    const hit = pickSessionTab(list, session, { type, urlMatch });
     if (!hit) {
         const avail = list.map((t) => `${t.type}:${t.url.slice(-60)}`).join("\n  ");
         throw new Error(`no ${type} tab matching '${urlMatch}'${session ? ` + BS_TAB '${session}'` : ""}. Open tabs:\n  ${avail}`);
@@ -217,11 +217,11 @@ export async function closeStaleTabs(urlMatch = GAME_DEV_FILTER, opts: { port?: 
 }
 
 /** Find this session's game=dev tab, or open one at `url` (PUT then GET fallback).
- *  Creation is strict: rather open our own tab than adopt one another session owns. */
+ *  Rather open our own tab than adopt one another session owns. */
 export async function findOrCreateTab(url = DEFAULT_DEV_URL, opts: { port?: number } = {}): Promise<CdpTarget> {
     const port = opts.port ?? DEFAULT_CDP_PORT;
     try {
-        return await findTab(GAME_DEV_FILTER, { port, strict: true });
+        return await findTab(GAME_DEV_FILTER, { port });
     } catch { /* create below */ }
     const target = sessionUrl(url, cdpSession());
     const newUrl = `http://localhost:${port}/json/new?${encodeURIComponent(target)}`;

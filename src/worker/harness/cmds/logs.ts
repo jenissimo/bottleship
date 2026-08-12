@@ -67,6 +67,33 @@ export function registerLogCommands(svc: HarnessService): void {
         return { size };
     });
 
+    /** logLevel(category, level) — per-category verbosity, or reset with no args.
+     *  The ring holds a fixed number of ENTRIES, so a per-frame firehose category
+     *  overwrites init-time evidence long before a late crash fires. Lowering that
+     *  category keeps it out of the ring (and off the console); streaming and the log
+     *  hub still see it, so the durable archive loses nothing.
+     *  Level: SILENT|ERROR|WARN|NORMAL|VERBOSE (or a number). */
+    svc.register("logLevel", (args) => {
+        if (args.length === 0) {
+            Logger.resetCategoryLevels();
+            return { reset: true };
+        }
+        const catName = String(args[0] ?? "").toUpperCase();
+        const category = (LogCategory as any)[catName];
+        if (category === undefined) {
+            throw new HarnessError(`logLevel: unknown category '${args[0]}'`, HarnessErrorCode.BAD_ARGS);
+        }
+        const raw = args[1];
+        // A numeric enum has reverse mappings, so LogLevel["0"] is the STRING "SILENT" —
+        // accepting it would set a level nothing compares correctly against.
+        const level = typeof raw === "number" ? raw : (LogLevel as any)[String(raw ?? "").toUpperCase()];
+        if (typeof level !== "number" || !(level in LogLevel)) {
+            throw new HarnessError(`logLevel: unknown level '${raw}'`, HarnessErrorCode.BAD_ARGS);
+        }
+        Logger.setCategoryLevel(category, level);
+        return { category: catName, level };
+    });
+
     svc.register("logs", (args) => {
         const count = typeof args[0] === "number" ? (args[0] as number) : 200;
         const filter = typeof args[1] === "string" ? (args[1] as string).toLowerCase() : null;

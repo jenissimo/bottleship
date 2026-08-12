@@ -1812,6 +1812,24 @@ export const dbg = {
             return snap;
         } catch (e) { console.warn('[dbg] d3d9Perf err', e); return null; }
     },
+    /** Arm the indexed-fetch audit for N frames (default 60) and/or read its report.
+     *  Per indexed draw it compares the bytes the GPU will fetch (final ring-buffer
+     *  contents after all of the frame's uploads) against the guest's buffer bytes at
+     *  record time — a mismatch names the draw whose vertices/indices the upload/ring
+     *  layer served stale. d3d9FetchAudit() reads without re-arming. */
+    d3d9FetchAudit(frames = 0): unknown {
+        try {
+            const out: unknown[] = [];
+            for (const dev of devices.values()) {
+                const d = dev as unknown as { armFetchAudit?: (n: number) => void; getFetchAuditReport?: () => unknown };
+                if (frames > 0) d.armFetchAudit?.(frames);
+                out.push(d.getFetchAuditReport?.() ?? null);
+            }
+            const result = out.length === 1 ? out[0] : out;
+            console.log(`[dbg][d3d9FetchAudit][JSON] ${JSON.stringify(result)}`);
+            return result;
+        } catch (e) { console.warn('[dbg] d3d9FetchAudit err', e); return null; }
+    },
     /** Enumerate created D3D9 vertex/pixel shaders across all devices with a compact
      *  disassembly. Per pixel shader it reports projectedTex/biasedTex counts (texldp/texldb
      *  usage) so we can confirm whether a title relies on projected texture sampling

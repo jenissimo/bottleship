@@ -220,6 +220,26 @@ export function registerDbgCommands(svc: HarnessService): void {
         return { pagesScanned: pages.length, coveredPages: covered.size, uncoveredChanges: changed.length, changed: changed.slice(0, 64) };
     });
 
+    /** evalWorker(code) — evaluate a JS function body IN the worker, return its result.
+     *  Bindings: dbg (debug command table), System, d3d9Devices (live D3D9Device map),
+     *  state (a persistent scratch object shared across evalWorker calls — park originals
+     *  there when monkey-patching so a later call can restore them). Complements the
+     *  reload workflow: a diagnostic hook can be installed INTO A RUNNING GAME (TS
+     *  `private` is compile-time only, so instance fields/methods are reachable), where
+     *  a worker reload costs a full multi-GB reboot. Diagnostics only — shipping
+     *  behavior still lands in source + reload. */
+    const evalState: Record<string, unknown> = {};
+    svc.register("evalWorker", async (args) => {
+        const code = String(args[0] ?? "");
+        if (!code) throw new Error("evalWorker: empty code");
+        const d3d9Devices = (await import("../../modules/d3d9/shared-state")).devices;
+        const fn = new Function(
+            "dbg", "System", "d3d9Devices", "state",
+            `"use strict"; return (async () => { ${code} })();`,
+        );
+        return (await fn(dbg, System, d3d9Devices, evalState)) ?? null;
+    });
+
     /** dbgCall(name, ...args) — invoke dbg[name](...args), return its result. */
     svc.register("dbgCall", (args) => {
         const [name, ...rest] = args as [string, ...unknown[]];

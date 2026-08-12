@@ -477,6 +477,19 @@ class LoggerImpl {
         this.verbose(LogCategory.THUNK, msg);
     }
 
+    /**
+     * Does this entry earn a RING slot? Only an EXPLICITLY configured category filters
+     * (setCategoryLevel / harness `logLevel`), so the ring's default contents never
+     * depend on console verbosity. ERROR is never dropped. This is the ring only —
+     * taps and streaming still see the entry, because the durable archive must not
+     * lose what the ring is being asked to make room for.
+     */
+    private keepInRing(category: LogCategory, level: LogLevel): boolean {
+        if (level <= LogLevel.ERROR) return true;
+        const configured = this.categoryLevels.get(category);
+        return configured === undefined || configured >= level;
+    }
+
     private addToBuffer(category: LogCategory, level: LogLevel, message: string): LogEntry {
         const entry: LogEntry = {
             timestamp: TimeService.getInstance().nowMs(),
@@ -485,14 +498,16 @@ class LoggerImpl {
             message,
         };
 
-        if (this.buffer.length < this.bufferSize) {
-            this.buffer.push(entry);
-        } else {
-            this.buffer[this.writeIndex] = entry;
-        }
+        if (this.keepInRing(category, level)) {
+            if (this.buffer.length < this.bufferSize) {
+                this.buffer.push(entry);
+            } else {
+                this.buffer[this.writeIndex] = entry;
+            }
 
-        this.writeIndex = (this.writeIndex + 1) % this.bufferSize;
-        this.entryCount++;
+            this.writeIndex = (this.writeIndex + 1) % this.bufferSize;
+            this.entryCount++;
+        }
 
         // Per-entry taps (harness log hub). Guarded so there's zero cost when none.
         if (this.taps.length) {
