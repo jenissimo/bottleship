@@ -98,6 +98,13 @@ Legacy Graphics (DirectDraw, D3D3-9). You bridge x86 Windows internals with mode
     `dbgCall('jitTier2', 0)` — JIT on, invalidation unchanged, promotion off. House of 1000 Doors
     read as a missing site on this flag alone and was neither.
 - Safe Memory Accessors:
+  - A PLAIN guest view is per-TURN. `process.getCurrentMemory()` normalizes v86's Proxy into a
+    plain Uint8Array, which DETACHES the instant WASM memory grows — `.subarray()` then throws
+    and plain indexing silently reads nothing, both far from the store. Never keep one in a
+    field, hand it to a constructor, or pass it to a `create*` factory; re-derive per use. v86's
+    raw Proxy is the growth-transparent one, which is why a thunk's `mem` parameter may be held.
+    `tools/validate-guest-memory-views.ts` (gate step 10) enforces all three shapes — the
+    accessor's own comment asserted this invariant while two modules were violating it.
   - All HLE modules must use Mem.read*/write* instead of direct mem8[...] access in new/changed code.
   - Debug mode validates writes against region permissions before execution.
   - Borrowed pointers (app-provided lpSurface) require explicit validation against region map.
@@ -348,8 +355,9 @@ Quality Gate (mandatory order):
   7. bun tools/validate-jit-exports.ts   (checks the BUILT v86 artifact — skips cleanly if absent)
   8. bun tools/validate-guest-pointer-guards.ts
   9. bun tools/validate-guest-memory-borrow.ts   (raw guest-memory Proxy access confined to its owners)
- 10. bun tools/validate-hypercall-abi.ts         (Rust/TS hypercall page offsets + handler ids agree)
- 11. bun run typecheck
+ 10. bun tools/validate-guest-memory-views.ts    (no PLAIN guest view stored past the turn that derived it)
+ 11. bun tools/validate-hypercall-abi.ts         (Rust/TS hypercall page offsets + handler ids agree)
+ 12. bun run typecheck
 
 `bun run gate` runs all of it in order.
 
@@ -416,6 +424,10 @@ Archive / installer formats — USE OUR OWN READERS, never `apt install` a third
     - inno/         — Inno Setup headers (LZMA1/2 via the Rust WASM backend). CLI: `tools/inno-inspect.ts`;
                       end-to-end GOG installer → bundle: `tools/gog-to-wgb.ts`.
     - freearc/      — FreeArc (`.arc`, srep+LZMA) used by some repacks.
+    - rar/          — RAR5 layout + STORED data (the store-only `.rar` a game drop wraps an
+                      installer in), incl. multi-volume `.partN.rar`. CLI:
+                      `tools/rar-extract.ts <a.rar> <out> [--list]`. RAR's own compression,
+                      solid groups, encryption and RAR 1.5–4.x are REFUSED by name.
     - iso/          — ISO9660 + BIN/CUE disc images. CLI: `tools/iso-to-wgb.ts`; `tools/bin2iso.ts`.
     - unpack/       — shared native codec backend (LZMA1/LZMA2/srep) built from the Rust crate
                       `tools/build-unpack-streaming` → `public/unpack-streaming.wasm`, plus the

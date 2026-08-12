@@ -278,7 +278,6 @@ export class DSound implements IModule {
     exports: Record<string, ThunkImplementation> = {};
 
     private process!: Process;
-    private memory!: Uint8Array;
     private objects: Map<number, DSoundObject> = new Map();
     private vtables: Record<string, VTableInfo> = {};
     private nextBufferId = DSOUND_AUDIO_ID_BASE;
@@ -338,7 +337,6 @@ export class DSound implements IModule {
 
     initialize(process: Process): void {
         this.process = process;
-        this.memory = this.getMemory();
         this.vtables = createVTablesFromDescriptor(this.process, dsoundModule);
 
         // Log vtable addresses for debugging
@@ -2886,7 +2884,6 @@ export class DSound implements IModule {
 
     recreateVTables(): void {
         if (this.process) {
-            this.memory = this.getMemory();
             this.vtables = createVTablesFromDescriptor(this.process, dsoundModule);
             Logger.verbose(LogCategory.SYSTEM, `DirectSound: Recreated vtables after reset`);
 

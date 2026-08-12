@@ -969,10 +969,10 @@ export class Process {
      * and enormous in a profile: a 38 KB/frame scan cost 10.3 ms through the Proxy and
      * 0.30 ms through a plain view. So the accessor normalizes; nobody downstream has to know.
      *
-     * Safe because the hazard the Proxy exists for — a stored reference detaching when WASM
-     * memory grows — needs a caller that KEEPS the array across growth, and none does (no
-     * `this.x = getCurrentMemory()` anywhere). Every consumer re-fetches per use, and
-     * toPlainGuestMemory re-wraps on buffer identity, so a grown buffer yields a fresh view.
+     * The hazard the Proxy exists for — a stored reference detaching when WASM memory grows —
+     * is therefore the CALLER's to avoid: re-fetch per use and never keep the result past the
+     * turn (toPlainGuestMemory re-wraps on buffer identity, so each fetch yields a live view).
+     * Enforced by tools/validate-guest-memory-views.ts — as a comment alone this did not hold.
      */
     getCurrentMemory(): Uint8Array {
         return toPlainGuestMemory(this.getMemory());
