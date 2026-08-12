@@ -18,7 +18,8 @@ const E_NOTIMPL = 0x80004001;
 const E_POINTER = 0x80004003;
 const E_INVALIDARG = 0x80070057;
 const DPERR_BUFFERTOOSMALL = 0x8877001e;
-const DPERR_NOTLOBBIED = 0x88770023;
+// MAKE_DPHRESULT(code) = 0x8877_0000 | code, with `code` the DECIMAL value from dplay.h.
+const DPERR_NOTLOBBIED = 0x8877042e; // MAKE_DPHRESULT(1070)
 const DPERR_NOMESSAGES = 0x887700BE;
 const DPERR_INVALIDOBJECT = 0x88770082;
 const DPERR_UNINITIALIZED = 0x88770140;
@@ -132,7 +133,6 @@ export class DPlayX implements IModule {
     name = "dplayx";
     exports: Record<string, ThunkImplementation> = {};
     private process!: Process;
-    private memory!: Uint8Array;
     private vtables: Record<string, VTableInfo> = {};
     private messageQueue: DPlayMessage[] = [];
     private localPlayerId: number = 0;
@@ -161,7 +161,6 @@ export class DPlayX implements IModule {
 
     initialize(process: Process): void {
         this.process = process;
-        this.memory = this.getMemory();
 
         const interfaceRegistry = InterfaceRegistry.getInstance();
         interfaceRegistry.registerFromModuleDescriptor(dplayxModule);
@@ -576,23 +575,17 @@ export class DPlayX implements IModule {
         this.exports["IDirectPlayLobby3A_ConnectEx"] = connectExImpl("IDirectPlayLobby3A");
         this.exports["IDirectPlayLobbyCompatA_ConnectEx"] = connectExImpl("IDirectPlayLobbyCompatA");
 
-        // GetConnectionSettings: return DPERR_NOTLOBBIED for non-lobby-launched games.
-        // Games launched directly (not via IDirectPlayLobby::RunApplication) are not
-        // lobby-aware. HoMM3's FUN_00498b70 checks for DPERR_BUFFERTOOSMALL to detect
-        // lobby launch — returning BUFFERTOOSMALL pushes the game into the network
-        // connection path → "Error connecting to host computer". Keep NOTLOBBIED.
-        // Campaign narration (Path B) does NOT check sess_connected — the issue is elsewhere.
+        // GetConnectionSettings(dwAppID, lpData, lpdwDataSize): the connection settings a
+        // lobby handed the app at launch. We never lobby-launch anything (RunApplication is
+        // not implemented), so every process we host is a direct launch and DPERR_NOTLOBBIED
+        // is the whole answer — no size is written, exactly as dplayx does when there is no
+        // lobby session to describe. Games gate their lobby path on THIS code (Re-Volt
+        // compares the HRESULT against DPERR_NOTLOBBIED literally), so its numeric value is
+        // load-bearing; anything else sends them into the size-query/connect path.
         const getConnectionSettingsImpl = (iface: string): ThunkImplementation => (ctx, mem, args) => {
             const dwAppID = args[1] >>> 0;
-            const lpdwDataSize = args[3] >>> 0;
-            // Zero out *lpdwDataSize so games that blindly read it after an error
-            // (e.g. Re-Volt) don't LocalAlloc with garbage → OOM crash.
-            if (lpdwDataSize) {
-                const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-                view.setUint32(lpdwDataSize, 0, true);
-            }
             Logger.log(LogCategory.SYSTEM,
-                `${iface}_GetConnectionSettings: appID=${dwAppID} → DPERR_NOTLOBBIED (not lobby-launched)`);
+                `${iface}_GetConnectionSettings: appID=${dwAppID} → DPERR_NOTLOBBIED (0x${DPERR_NOTLOBBIED.toString(16)}, not lobby-launched)`);
             return DPERR_NOTLOBBIED;
         };
 
@@ -736,6 +729,11 @@ export class DPlayX implements IModule {
                 if (method === "SetConnectionSettings") {
                     return DP_OK;
                 }
+                // Waiting for settings that a lobby would have supplied: same answer as
+                // GetConnectionSettings, and it must ANSWER rather than block forever.
+                if (method === "WaitForConnectionSettings") {
+                    return DPERR_NOTLOBBIED;
+                }
 
                 return E_NOTIMPL;
             };
@@ -747,6 +745,9 @@ export class DPlayX implements IModule {
 
                 if (method === "SetConnectionSettings") {
                     return DP_OK;
+                }
+                if (method === "WaitForConnectionSettings") {
+                    return DPERR_NOTLOBBIED;
                 }
 
                 return E_NOTIMPL;
@@ -1342,7 +1343,6 @@ export class DPlayX implements IModule {
 
     recreateVTables(): void {
         if (this.process) {
-            this.memory = this.getMemory();
             this.vtables = createVTablesFromDescriptor(this.process, dplayxModule);
             Logger.verbose(LogCategory.SYSTEM, "DirectPlay: Recreated vtables after reset");
 
