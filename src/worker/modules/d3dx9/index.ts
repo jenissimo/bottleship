@@ -11,6 +11,8 @@ import { createMathExports } from './math';
 import { createSurfaceExports } from './surfaces';
 import { createTextureExports } from './textures';
 import { createEffectExports, resetEffectState } from './effects';
+import { createBufferExports, resetD3DXBuffers } from './buffer';
+import { createShaderExports, resetShaderAsmState } from './shaders';
 
 const D3D_OK = 0;
 const D3DERR_INVALIDCALL = 0x8876086c;
@@ -42,6 +44,8 @@ export class D3dx9 implements IModule {
         Object.assign(this.exports, createSurfaceExports());
         Object.assign(this.exports, createTextureExports());
         Object.assign(this.exports, createEffectExports(process));
+        Object.assign(this.exports, createBufferExports(process));
+        Object.assign(this.exports, createShaderExports(process));
 
         this.exports['D3DXTessellateNPatches'] = () => D3DERR_INVALIDCALL;
         this.exports['D3DXSavePRTCompBufferToFileW'] = () => D3DERR_INVALIDCALL;
@@ -67,5 +71,7 @@ export class D3dx9 implements IModule {
     reset(): void {
         warnedStubs.clear();
         resetEffectState();
+        resetD3DXBuffers();
+        resetShaderAsmState();
     }
 }

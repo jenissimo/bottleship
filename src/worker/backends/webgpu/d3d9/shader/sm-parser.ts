@@ -29,17 +29,27 @@ export interface SmDest {
     writeMask: number;      // bit0=x … bit3=w
     shift: number;          // signed result shift: +1=_x2 … -3=_d8
     saturate: boolean;      // _sat
+    partialPrecision: boolean;  // _pp
+    centroid: boolean;          // _centroid
 }
 
 export interface SmSource {
     reg: SmRegister;
     swizzle: number;        // 8 bits, 2 per component
     modifier: number;       // SrcMod
+    /**
+     * SM2+ relative addressing carries the index register in a SECOND token
+     * (SM1.x implies a0.x and has none). Kept so a disassembler can name the
+     * actual register/component instead of assuming a0.
+     */
+    relReg?: SmRegister;
+    relSwizzle?: number;
 }
 
 export interface SmInstruction {
     opcode: Op;
     coissue: boolean;       // "+" co-issued (ps_1_x .rgb/.a pairing)
+    predicated: boolean;    // (p0) predicate prefix
     specificData: number;   // bits 16-23 (comparison / texld mode)
     dst: SmDest | null;
     src: SmSource[];
@@ -50,6 +60,8 @@ export interface SmDcl {
     usageIndex: number;
     textureType: number;
     reg: SmRegister;
+    /** The declared register's write mask — a partial dcl (`dcl_texcoord1 v3.xy`) is legal. */
+    writeMask: number;
 }
 
 export interface SmDef {
@@ -58,6 +70,17 @@ export interface SmDef {
     rawInt: Int32Array;     // 4 ints (for defi/defb)
     kind: "f" | "i" | "b";
 }
+
+/**
+ * The program in SOURCE ORDER. `declarations`/`definitions`/`instructions` are
+ * the code generators' view (grouped, order irrelevant); a disassembler needs
+ * the original interleaving, so the walk records it here as it goes.
+ */
+export type SmStreamItem =
+    | { kind: "instruction"; instruction: SmInstruction }
+    | { kind: "dcl"; dcl: SmDcl }
+    | { kind: "def"; def: SmDef }
+    | { kind: "phase" };
 
 export interface SmProgram {
     isPixelShader: boolean;
@@ -75,6 +98,12 @@ export interface SmProgram {
     inputRegs: Set<number>;
     /** True if any constant source uses relative (a0) addressing. */
     usesRelativeConst: boolean;
+    /** Everything above, in bytecode order. */
+    stream: SmStreamItem[];
+    /** DWORDs consumed, including the version token and the trailing END. */
+    tokenCount: number;
+    /** False if the stream ran out before an END token — i.e. truncated input. */
+    terminated: boolean;
 }
 
 /** Output rows (= consecutive const regs read) for matrix-multiply macro ops. */
@@ -108,6 +137,8 @@ function decodeDst(token: number): SmDest {
         writeMask: (token >>> 16) & 0xF,
         shift,
         saturate: (token & (1 << 20)) !== 0,
+        partialPrecision: (token & (1 << 21)) !== 0,
+        centroid: (token & (1 << 22)) !== 0,
     };
 }
 
@@ -140,6 +171,8 @@ export function parseShader(tokens: Uint32Array): SmProgram {
     const instructions: SmInstruction[] = [];
     const declarations: SmDcl[] = [];
     const definitions: SmDef[] = [];
+    const stream: SmStreamItem[] = [];
+    let terminated = false;
     let maxTemp = -1;
     let maxConst = -1;
     let usesRelativeConst = false;
@@ -164,7 +197,7 @@ export function parseShader(tokens: Uint32Array): SmProgram {
         const instrToken = tokens[i] >>> 0;
         const opcode = (instrToken & 0xFFFF) as Op;
 
-        if (opcode === Op.END || instrToken === 0x0000FFFF) break;
+        if (opcode === Op.END || instrToken === 0x0000FFFF) { i += 1; terminated = true; break; }
 
         if (opcode === Op.COMMENT) {
             const len = (instrToken >>> 16) & 0x7FFF;
@@ -174,6 +207,7 @@ export function parseShader(tokens: Uint32Array): SmProgram {
         if (opcode === Op.PHASE) {
             // ps_1_4 phase separator — no operands, no emitted code.
             i += 1;
+            stream.push({ kind: "phase" });
             continue;
         }
 
@@ -197,12 +231,15 @@ export function parseShader(tokens: Uint32Array): SmProgram {
             const dclToken = tokens[i++] >>> 0;
             const regToken = tokens[i++] >>> 0;
             const reg = makeRegister(regToken);
-            declarations.push({
+            const decl: SmDcl = {
                 usage: dclToken & 0xF,
                 usageIndex: (dclToken >>> 16) & 0xF,
                 textureType: (dclToken >>> 27) & 0xF,
                 reg,
-            });
+                writeMask: (regToken >>> 16) & 0xF,
+            };
+            declarations.push(decl);
+            stream.push({ kind: "dcl", dcl: decl });
             if (reg.type === RegType.SAMPLER) samplersUsed.add(reg.num);
             trackReg(reg);
             continue;
@@ -215,24 +252,27 @@ export function parseShader(tokens: Uint32Array): SmProgram {
             const valueCount = opcode === Op.DEFB ? 1 : 4;
             const raw = new Uint32Array(4);
             for (let v = 0; v < valueCount; v++) raw[v] = tokens[i++] >>> 0;
-            definitions.push({
+            const definition: SmDef = {
                 reg,
                 values: new Float32Array(raw.buffer.slice(0)),
                 rawInt: new Int32Array(raw.buffer.slice(0)),
                 kind: opcode === Op.DEF ? "f" : opcode === Op.DEFI ? "i" : "b",
-            });
+            };
+            definitions.push(definition);
+            stream.push({ kind: "def", def: definition });
             if (reg.type === RegType.CONST && reg.num > maxConst) maxConst = reg.num;
             continue;
         }
 
-        // Generic instruction: optional dst + N source operands
+        // Generic instruction: optional dst + source operands. `length` is a DWORD
+        // count, not a source count — an SM2+ relative source spends two of them —
+        // so the operand walk is bounded by the end of the operand block.
+        const operandEnd = i + length;
         const hasDst = !NO_DST.has(opcode);
         let dst: SmDest | null = null;
-        let consumed = 0;
 
         if (hasDst) {
             dst = decodeDst(tokens[i++] >>> 0);
-            consumed += 1;
             trackReg(dst.reg);
             if (dst.reg.type === RegType.SAMPLER) samplersUsed.add(dst.reg.num);
             // ps_1_1-1_3 implicit sampler = texture-coord register number for tex.
@@ -243,13 +283,16 @@ export function parseShader(tokens: Uint32Array): SmProgram {
             }
         }
 
-        const srcCount = Math.max(0, length - consumed);
         const src: SmSource[] = [];
-        for (let s = 0; s < srcCount; s++) {
+        while (i < operandEnd) {
             const srcToken = tokens[i++] >>> 0;
             const operand = decodeSrc(srcToken);
             // SM2+ relative addressing consumes an extra token (the rel register).
-            if (major >= 2 && operand.reg.relative) i++;
+            if (major >= 2 && operand.reg.relative) {
+                const relToken = tokens[i++] >>> 0;
+                operand.relReg = makeRegister(relToken);
+                operand.relSwizzle = (relToken >>> 16) & 0xFF;
+            }
             trackReg(operand.reg);
             if (operand.reg.type === RegType.SAMPLER) samplersUsed.add(operand.reg.num);
             src.push(operand);
@@ -269,13 +312,16 @@ export function parseShader(tokens: Uint32Array): SmProgram {
             if (top > maxConst) maxConst = top;
         }
 
-        instructions.push({
+        const instruction: SmInstruction = {
             opcode,
             coissue: (instrToken & 0x40000000) !== 0,
+            predicated: (instrToken & 0x10000000) !== 0,
             specificData: (instrToken >>> 16) & 0xFF,
             dst,
             src,
-        });
+        };
+        instructions.push(instruction);
+        stream.push({ kind: "instruction", instruction });
     }
 
     return {
@@ -290,5 +336,8 @@ export function parseShader(tokens: Uint32Array): SmProgram {
         samplersUsed,
         inputRegs,
         usesRelativeConst,
+        stream,
+        tokenCount: i,
+        terminated,
     };
 }

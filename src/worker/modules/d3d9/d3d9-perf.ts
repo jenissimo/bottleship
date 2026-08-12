@@ -10,6 +10,12 @@ export interface D3D9PerfSnapshot {
     stateTracker: Record<string, number>;
     /** Draws the device dropped, keyed by reason. Empty is the healthy state. */
     droppedDraws: Record<string, number>;
+    /** FFP state a draw needed and the shader does not implement. Empty is the healthy state. */
+    ffpUnimplemented: Record<string, number>;
+    /** Full D3DTSS_COLOROP/ALPHAOP distribution — the context ffpUnimplemented needs. */
+    ffpOps: Record<string, number>;
+    /** Has SetMaterial ever been called? If not, the default material is what lit every draw. */
+    materialEverSet: boolean;
     wbuf: { hits: number; outTrapHits: number; coalescedSkips: number; registered: number } | null;
     /** Guest-side setter-shadow skip counters per shadowed setter (filled by dbg.d3d9Perf). */
     setterShadow?: Record<string, number> | null;
@@ -55,6 +61,15 @@ export interface D3D9BufferPerf {
     indexedVertexRangeOOB: number;
     /** Worst overshoot in bytes, for sizing the miss. */
     indexedVertexRangeOOBMaxBytes: number;
+    /**
+     * Indexed draws whose INDEX range runs past the bound index buffer — a separate counter
+     * from the vertex one because the failure mode is the opposite: WebGPU does raise this,
+     * and the rejection invalidates the whole frame's command buffer rather than one draw.
+     * Must be 0.
+     */
+    indexRangeOOB: number;
+    /** Worst overshoot in bytes, for sizing the miss. */
+    indexRangeOOBMaxBytes: number;
 }
 
 export interface D3D9StateBlockPerf {
@@ -184,6 +199,51 @@ const skip: Record<SkipKey, number> = {
 /** reason -> count; keys are free-form so a new early-out needs no schema edit. */
 const droppedDraws: Record<string, number> = {};
 
+/**
+ * FFP state a draw ASKED for that the D3D9 fixed-function shader does not implement.
+ * `stubs()` names an unimplemented ENTRY POINT; this names unimplemented fixed-function
+ * STATE, which is invisible by comparison — the draw records, nothing is dropped and no
+ * WebGPU error fires, so only the counter distinguishes it from a correctly-drawn frame.
+ */
+const ffpUnimplemented: Record<string, number> = {};
+
+export function d3d9PerfFfpUnimplemented(feature: string): void {
+    ffpUnimplemented[feature] = (ffpUnimplemented[feature] ?? 0) + 1;
+}
+
+/**
+ * D3DTSS_COLOROP/ALPHAOP histogram over EVERY draw, not just the ops we cannot do: an
+ * "unimplemented" count of zero only means something next to the distribution it was read
+ * from, which is what shows whether the title uses solely implemented ops or the census is
+ * reading the wrong state.
+ *
+ * Counted into fixed arrays (op is a D3DTEXTUREOP, 0..31) because this runs per stage per
+ * draw; the names exist only in the snapshot.
+ */
+const FFP_OP_SLOTS = 32;
+const ffpColorOps = new Int32Array(FFP_OP_SLOTS);
+const ffpAlphaOps = new Int32Array(FFP_OP_SLOTS);
+
+export function d3d9PerfFfpOp(kind: "color" | "alpha", op: number): void {
+    if (op < 0 || op >= FFP_OP_SLOTS) return;
+    const bins = kind === "color" ? ffpColorOps : ffpAlphaOps;
+    bins[op]++;
+}
+
+function ffpOpsSnapshot(): Record<string, number> {
+    const out: Record<string, number> = {};
+    for (let op = 0; op < FFP_OP_SLOTS; op++) {
+        if (ffpColorOps[op]) out[`color${op}`] = ffpColorOps[op]!;
+        if (ffpAlphaOps[op]) out[`alpha${op}`] = ffpAlphaOps[op]!;
+    }
+    return out;
+}
+
+/** Whether the guest has ever called SetMaterial. False means every lit draw so far used the
+ *  device's initial material, which makes its value load-bearing rather than incidental. */
+let materialEverSet = false;
+export function d3d9PerfMaterialSet(): void { materialEverSet = true; }
+
 const backend: Record<BackendKey, number> = {
     pipelineCacheHits: 0,
     pipelineCacheMisses: 0,
@@ -295,12 +355,21 @@ const buffers: D3D9BufferPerf = {
     maxUploadsPerBufferPerFrame: 0,
     indexedVertexRangeOOB: 0,
     indexedVertexRangeOOBMaxBytes: 0,
+    indexRangeOOB: 0,
+    indexRangeOOBMaxBytes: 0,
 };
 
 export function d3d9PerfVertexRangeOOB(overshootBytes: number): void {
     buffers.indexedVertexRangeOOB++;
     if (overshootBytes > buffers.indexedVertexRangeOOBMaxBytes) {
         buffers.indexedVertexRangeOOBMaxBytes = overshootBytes;
+    }
+}
+
+export function d3d9PerfIndexRangeOOB(overshootBytes: number): void {
+    buffers.indexRangeOOB++;
+    if (overshootBytes > buffers.indexRangeOOBMaxBytes) {
+        buffers.indexRangeOOBMaxBytes = overshootBytes;
     }
 }
 
@@ -337,6 +406,10 @@ export function resetD3D9Perf(): void {
     for (const k of BACKEND_KEYS) backend[k] = 0;
     for (const k in stateBlock) (stateBlock as Record<string, number>)[k] = 0;
     for (const k in droppedDraws) delete droppedDraws[k];
+    for (const k in ffpUnimplemented) delete ffpUnimplemented[k];
+    ffpColorOps.fill(0);
+    ffpAlphaOps.fill(0);
+    materialEverSet = false;
     for (const k in buffers) (buffers as unknown as Record<string, number>)[k] = 0;
     stateBlockByType = {};
     stateBlockOps = {};
@@ -355,6 +428,9 @@ export function getD3D9PerfSnapshot(): D3D9PerfSnapshot {
         backend: pickRecord(backend, BACKEND_KEYS),
         stateTracker: {},
         droppedDraws: { ...droppedDraws },
+        ffpUnimplemented: { ...ffpUnimplemented },
+        ffpOps: ffpOpsSnapshot(),
+        materialEverSet,
         wbuf: null,
         stateBlocks: {
             ...stateBlock,

@@ -494,6 +494,9 @@ export function generateShaderCode(config: ShaderConfig): string {
                         ecPos, ecNormal,
                         uniforms.matDiffuse, uniforms.matAmbient, uniforms.matSpecular, uniforms.matEmissive,
                         uniforms.matPower, uniforms.specularEnable != 0u, uniforms.localViewer != 0u, uniforms.hasNormal != 0u,
+                        // The ddraw uniform block carries no D3DRENDERSTATE_NORMALIZENORMALS,
+                        // so this path cannot observe the state and always normalizes.
+                        true,
                         f32(uniforms.matDiffuseSrc), f32(uniforms.matAmbientSrc),
                         f32(uniforms.matSpecularSrc), f32(uniforms.matEmissiveSrc),
                         uniforms.ambientColor.rgb, i32(ffpLightSet.count.x),

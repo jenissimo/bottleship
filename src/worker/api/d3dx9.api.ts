@@ -54,5 +54,11 @@ export const d3dx9Module: ModuleDescriptor = {
         makeFunc("D3DXCreateFontIndirectA", 4),
         makeFunc("D3DXCreateFontIndirectW", 4),
         makeFunc("D3DXCreateSprite", 2),
+        // D3D8→D3D9 wrappers resolve the assemble/disassemble pair by GetProcAddress and
+        // translate every D3D8 shader through it (disassemble → patch text → assemble);
+        // both hand back the ID3DXBuffer that D3DXCreateBuffer also produces.
+        makeFunc("D3DXAssembleShader", 7),
+        makeFunc("D3DXDisassembleShader", 4),
+        makeFunc("D3DXCreateBuffer", 2),
     ],
 };

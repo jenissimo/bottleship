@@ -11,6 +11,7 @@ import type { DirectDrawSurfaceState, RenderSurface, BitmapTextureSurface } from
 import { surfaceSyncManager } from '../../../modules/ddraw/surface-sync';
 import type { Viewport } from '../ddraw/types';
 import { sanitizeViewport } from '../ddraw/types';
+import { recordGpuError } from '../../../core/gpu-error-log';
 import type { RenderActive } from '../../../runtime/runtime-services';
 import { createRenderTarget } from '../shared/surface-factory';
 import { decodeD3DTextureToRgba8, getD3DTextureLayout, D3DFMT_P8, D3DFMT_A8P8 } from '../shared/texture-formats';
@@ -221,7 +222,6 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
 
     constructor(
         readonly renderer: DDrawWebGPUExecutor,
-        private memory: Uint8Array,
         width: number,
         height: number,
         backend?: WebGPUBackend,
@@ -278,12 +278,10 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         return this.stageTexturesScratch;
     }
 
+    /** Guest RAM, re-derived per use — a stored view detaches on WASM growth and the
+     *  adapter outlives any number of growths. */
     private getMemoryView(): Uint8Array {
-        const latest = System.getInstance().process?.getCurrentMemory();
-        if (latest) {
-            this.memory = latest;
-        }
-        return this.memory;
+        return System.getInstance().process!.getCurrentMemory();
     }
 
     setStreamSource(streamNumber: number, vbPtr: number, stride: number): void {
@@ -484,8 +482,12 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         this.renderStates[D3DRENDERSTATE_FOGEND] = 0x3F800000;
         this.renderStates[D3DRENDERSTATE_FOGDENSITY] = 0x3F800000;
         this.renderStates[D3DRENDERSTATE_COLORKEYENABLE] = 0;
-        // Keep the default aligned with the D3D7 backend until the lighting path
-        // reaches feature parity. Explicit SetRenderState(LIGHTING, TRUE) still works.
+        // KNOWN DEVIATION, shared with the D3D7 backend: D3D8's documented default is TRUE,
+        // exactly as in D3D9 — and the D3D9 state tracker does seed TRUE. Seeding FALSE here
+        // keeps the two legacy backends' lighting behaviour identical until this path reaches
+        // parity, at the cost of a title routed through a d3d8→d3d9 wrapper being lit while
+        // the same title on native d3d8 is not. Explicit SetRenderState(LIGHTING, TRUE) works
+        // either way. Close this by flipping it to 1, not by reverting the D3D9 tracker.
         this.renderStates[D3DRENDERSTATE_LIGHTING] = 0;
         this.renderStates[D3DRENDERSTATE_AMBIENT] = 0;
         this.renderStates[D3DRENDERSTATE_SPECULARENABLE] = 0;
@@ -2057,10 +2059,14 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             if (useErrorScopes) {
                 const frameNum = this.presentCount;
                 device.popErrorScope().then(err => {
-                    if (err) Logger.error(LogCategory.SYSTEM, `[D3D8 PRESENT] Validation error frame=${frameNum}: ${err.message}`);
+                    if (!err) return;
+                    recordGpuError("scope", "d3d8Present.validation", err.message);
+                    Logger.error(LogCategory.SYSTEM, `[D3D8 PRESENT] Validation error frame=${frameNum}: ${err.message}`);
                 });
                 device.popErrorScope().then(err => {
-                    if (err) Logger.error(LogCategory.SYSTEM, `[D3D8 PRESENT] OOM error frame=${frameNum}: ${err.message}`);
+                    if (!err) return;
+                    recordGpuError("scope", "d3d8Present.oom", err.message);
+                    Logger.error(LogCategory.SYSTEM, `[D3D8 PRESENT] OOM error frame=${frameNum}: ${err.message}`);
                 });
             }
 

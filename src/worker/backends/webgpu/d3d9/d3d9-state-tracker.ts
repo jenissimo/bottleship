@@ -13,6 +13,10 @@ const D3DRS_ZWRITEENABLE = 14;
 const D3DTS_WORLD = 0x100;
 const D3DTS_VIEW = 2;
 const D3DTS_PROJECTION = 3;
+// D3DTS_TEXTURE0..7 — the fixed-function per-stage texture matrix (D3DTSS_TEXTURETRANSFORMFLAGS
+// says how many of its output components a stage consumes).
+const D3DTS_TEXTURE0 = 16;
+export const FFP_TEXTURE_TRANSFORM_COUNT = 8;
 
 export interface StreamSource {
     index: number;
@@ -36,6 +40,8 @@ export class D3D9StateTracker {
     private worldMatrix: Float32Array;
     private viewMatrix: Float32Array;
     private projMatrix: Float32Array;
+    /** D3DTS_TEXTURE0..7, one 4×4 each in a single flat array (stage N at N*16). */
+    private texMatrices = new Float32Array(FFP_TEXTURE_TRANSFORM_COUNT * 16);
 
     // FVF and stream bindings
     private fvf: number = 0;
@@ -71,16 +77,25 @@ export class D3D9StateTracker {
         this.worldMatrix = identityMatrix();
         this.viewMatrix = identityMatrix();
         this.projMatrix = identityMatrix();
+        this.resetTexMatrices();
         this.seedRenderStateDefaults();
+    }
+
+    private resetTexMatrices(): void {
+        this.texMatrices.fill(0);
+        for (let s = 0; s < FFP_TEXTURE_TRANSFORM_COUNT; s++) {
+            const b = s * 16;
+            this.texMatrices[b] = 1;
+            this.texMatrices[b + 5] = 1;
+            this.texMatrices[b + 10] = 1;
+            this.texMatrices[b + 15] = 1;
+        }
     }
 
     /**
      * Seed the non-zero D3D9 default render states the blend/lighting pipelines depend on.
      * The render-state array is zero-filled, but several defaults are non-zero (notably
      * COLORWRITEENABLE = all channels, the FFP material-colour sources, and the depth states).
-     * The lighting *enable* default is intentionally left at 0 (games set it explicitly — same
-     * choice as the D3D8 adapter) to avoid darkening titles that draw pre-coloured FFP geometry
-     * without ever touching lighting state.
      *
      * This runs on Reset() too, which is the case that matters most: after a real D3D9 Reset
      * every render state returns to its default, and a game that relied on one before the Reset
@@ -102,6 +117,12 @@ export class D3D9StateTracker {
         // FFP lighting defaults (D3DMCS_*: MATERIAL=0, COLOR1=1, COLOR2=2). These let
         // unset values reflect the real D3D defaults so an explicit MATERIAL (0) is
         // distinguishable from "never set".
+        // D3DRS_LIGHTING defaults to TRUE, and the material defaults to all-zero, so an app that
+        // never touches either draws black — that is real D3D9, not a gap. Seeding FALSE instead
+        // would make every app that relies on the default (or on Reset restoring it) render
+        // full-bright unlit, and no app can detect the difference to work around it.
+        // The D3D8 adapter deliberately seeds FALSE instead; see the note at its own seed.
+        this.renderStates[137] = 1;  // D3DRS_LIGHTING           = TRUE
         this.renderStates[141] = 1;  // D3DRS_COLORVERTEX        = TRUE
         this.renderStates[142] = 1;  // D3DRS_LOCALVIEWER        = TRUE
         this.renderStates[145] = 1;  // D3DRS_DIFFUSEMATERIALSOURCE  = D3DMCS_COLOR1
@@ -153,20 +174,24 @@ export class D3D9StateTracker {
     // Transform management
     setTransform(type: number, matrix: Float32Array): boolean {
         let target: Float32Array;
+        let base = 0;
         if (type === D3DTS_WORLD) {
             target = this.worldMatrix;
         } else if (type === D3DTS_VIEW) {
             target = this.viewMatrix;
         } else if (type === D3DTS_PROJECTION) {
             target = this.projMatrix;
+        } else if (type >= D3DTS_TEXTURE0 && type < D3DTS_TEXTURE0 + FFP_TEXTURE_TRANSFORM_COUNT) {
+            target = this.texMatrices;
+            base = (type - D3DTS_TEXTURE0) * 16;
         } else {
             return false;
         }
         for (let i = 0; i < 16; i++) {
-            if (target[i] !== matrix[i]) break;
+            if (target[base + i] !== matrix[i]) break;
             if (i === 15) return false;
         }
-        for (let i = 0; i < 16; i++) target[i] = matrix[i]!;
+        for (let i = 0; i < 16; i++) target[base + i] = matrix[i]!;
         this.dirtyFlags.transforms = true;
         this.metrics.transformUpdates++;
         return true;
@@ -175,6 +200,14 @@ export class D3D9StateTracker {
     getWorldMatrix(): Float32Array { return this.worldMatrix; }
     getViewMatrix(): Float32Array { return this.viewMatrix; }
     getProjectionMatrix(): Float32Array { return this.projMatrix; }
+    /** All 8 texture matrices, flat (stage N at N*16). The FFP uniform copies the whole run. */
+    getTextureMatrices(): Float32Array { return this.texMatrices; }
+    /** One texture matrix as a 16-float view, or null for a non-D3DTS_TEXTURE* state. */
+    getTextureMatrix(type: number): Float32Array | null {
+        if (type < D3DTS_TEXTURE0 || type >= D3DTS_TEXTURE0 + FFP_TEXTURE_TRANSFORM_COUNT) return null;
+        const base = (type - D3DTS_TEXTURE0) * 16;
+        return this.texMatrices.subarray(base, base + 16);
+    }
 
     getMVP(): Float32Array {
         return multiplyMatrices(
@@ -301,6 +334,7 @@ export class D3D9StateTracker {
         this.worldMatrix = identityMatrix();
         this.viewMatrix = identityMatrix();
         this.projMatrix = identityMatrix();
+        this.resetTexMatrices();
         this.fvf = 0;
         this.streamSource = null;
         this.indexSource = null;

@@ -278,7 +278,7 @@ export function createFactoryExports(): Record<string, ThunkImplementation> {
             }
 
             // Create D3D8 device adapter
-            const device = new D3D8DeviceAdapter(renderer, process.getCurrentMemory(), bbWidth, bbHeight, backend);
+            const device = new D3D8DeviceAdapter(renderer, bbWidth, bbHeight, backend);
 
             // Honor the requested back-buffer MSAA (D3DPRESENT_PARAMETERS.MultiSampleType @ +16):
             // fold it into the executor's effective sample count so in-engine AA works.

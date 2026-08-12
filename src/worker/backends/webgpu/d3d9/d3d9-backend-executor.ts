@@ -7,6 +7,8 @@
 
 import { WebGPUBackend } from "../webgpu-backend";
 import { RenderFrame, RenderCommandType, ProgrammableDrawState, FfpDrawState } from "../render-frame";
+import { Logger, LogCategory } from "../../../core/logger";
+import { recordGpuError } from "../../../core/gpu-error-log";
 import { frameProfiler } from "../../../core/frame-profiler";
 import { statsOverlay } from "../../../core/stats-overlay";
 import { PROG_BIND } from "./shader";
@@ -116,6 +118,8 @@ export class D3D9BackendExecutor {
     private backend: WebGPUBackend;
     private pipelines: GPURenderPipeline[] = [];
     private pipelineInfo: PipelineInfo[] = [];
+    /** Throws caught in executeFrame; drives the log throttle there. */
+    private executeFrameThrows = 0;
 
     // Optimization caches
     private currentPipelineId: number | null = null;
@@ -754,6 +758,19 @@ export class D3D9BackendExecutor {
             const submitStart = frameProfiler.startTimer();
             queue.submit([encoder.finish()]);
             frameProfiler.endTimer("gpu", submitStart);
+        } catch (e) {
+            // A synchronous throw here (e.g. a misaligned writeBuffer) discards the ENTIRE
+            // frame, and every upload queued after it is lost permanently — the producers
+            // already cleared their dirty flags. Never quiet, but never a firehose either:
+            // the condition usually persists, so log the first of each run and then thin out.
+            // recordGpuError keeps the full census regardless of the log throttle.
+            recordGpuError("throw", "d3d9Executor.executeFrame", String(e));
+            this.executeFrameThrows = (this.executeFrameThrows + 1) >>> 0;
+            if (this.executeFrameThrows % 200 === 1) {
+                Logger.error(LogCategory.D3D9,
+                    `executeFrame aborted mid-flush — frame discarded, queued uploads lost `
+                    + `(${this.executeFrameThrows} so far): ${e}`);
+            }
         } finally {
             frame.releaseTemporaryBuffers();
         }

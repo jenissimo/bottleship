@@ -389,7 +389,7 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
             }
 
             // Create D3D9Device instance
-            const device = new D3D9Device(backend, process.getCurrentMemory());
+            const device = new D3D9Device(backend);
 
             // Establish backbuffer size from present params (single source of truth
             // for resolution: host canvas + viewport + XYZRHW NDC divisor must agree).

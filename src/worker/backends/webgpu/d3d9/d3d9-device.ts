@@ -2,7 +2,7 @@
 import { WebGPUBackend } from "../webgpu-backend";
 import { RenderFramePool } from "../render-frame";
 import { LruCache } from "../../../core/collections/lru-cache";
-import { D3D9StateTracker } from "./d3d9-state-tracker";
+import { D3D9StateTracker, FFP_TEXTURE_TRANSFORM_COUNT } from "./d3d9-state-tracker";
 import { D3D9CommandRecorder } from "./d3d9-command-recorder";
 import { DynamicVbPool } from "./dynamic-vb-pool";
 import { D3D9BackendExecutor, UniformData } from "./d3d9-backend-executor";
@@ -28,7 +28,8 @@ import {
     d3d9PerfInc, d3d9PerfSkip, d3d9PerfBackendInc, d3d9DropDraw,
     d3d9PerfStateBlockApply, d3d9PerfStateBlockCapture,
     d3d9PerfStateBlockWasmApply, d3d9PerfStateBlockWasmCapture,
-    d3d9PerfBufferLock, d3d9PerfBufferUpload, d3d9PerfVertexRangeOOB,
+    d3d9PerfBufferLock, d3d9PerfBufferUpload, d3d9PerfVertexRangeOOB, d3d9PerfIndexRangeOOB,
+    d3d9PerfFfpUnimplemented, d3d9PerfFfpOp, d3d9PerfMaterialSet,
 } from "../../../modules/d3d9/d3d9-perf";
 import { addComRef, releaseComRef } from "../../../modules/d3d9/com-refs";
 import { isValidAddress } from "../../../core/memory/address-guard";
@@ -46,20 +47,25 @@ import { Op, opName } from "./shader/sm-enums";
 import {
     FFP_UNIFORM_STRUCT_WGSL,
     FFP_SELECT_COLOR_WGSL,
+    FFP_TEXGEN_WGSL,
     emitFfpComputeLighting,
     FFP_UNIFORM_FLOATS,
     FFP_MAX_STAGES,
     ffpStageOffset,
     FFP_MAX_LIGHTS,
     packFfpUniforms,
+    type FfpColor,
     type FfpLightInput,
     type FfpMaterial,
     type FfpUniformParams,
+    D3DLIGHT_POINT,
+    D3DLIGHT_DIRECTIONAL,
     D3DMCS_MATERIAL,
     D3DMCS_COLOR1,
     D3DMCS_COLOR2,
 } from "./ffp-lighting";
 import { FFP_FOG_WGSL, resolveFfpFogMode } from "./ffp-fog";
+import { FFP_IMPLEMENTED_OPS, emitFfpCombinerWgsl } from "./ffp-combiner";
 import {
     D3D9StateBlockRecorder,
     applyStateBlockEntries,
@@ -129,8 +135,56 @@ const D3DRS_FOGVERTEXMODE = 140;
 const D3DTSS_TEXTURETRANSFORMFLAGS = 24;
 const D3DTTFF_PROJECTED = 0x100;
 const D3DTSS_COLOROP = 1;
-const D3DTSS_TEXCOORDINDEX = 25;
+const D3DTSS_ALPHAOP = 4;
+// The third operand (D3DTOP_MULTIPLYADD / D3DTOP_LERP) and the stage's destination register.
+const D3DTSS_COLORARG0 = 26;
+const D3DTSS_ALPHAARG0 = 27;
+const D3DTSS_RESULTARG = 28;
+
+/**
+ * One texture stage with D3D's defaults already applied (resolveFfpStages). The shader, the
+ * gap census and the frame capture all read THIS, never the raw state map: an unset COLOROP
+ * is MODULATE, not 0, and a census reading the raw 0 would report the default as a gap.
+ */
+type FfpResolvedStage = FfpUniformParams["stages"][number];
+
+/**
+ * D3DTA_CONSTANT (base 6) selects the stage's own D3DTSS_CONSTANT colour, which the stage
+ * uniform does not carry — the combiner reads white for it. We advertise
+ * D3DPMISCCAPS_PERSTAGECONSTANT (the caps blob is a real hardware dump), so a guest may
+ * legitimately ask for it; count the ask instead of letting the substitution be silent.
+ * ARG0 only counts when the op reads it (MULTIPLYADD / LERP), so the number stays a count of
+ * arguments that actually reach a pixel.
+ */
+function censusStageConstantArg(st: FfpResolvedStage): void {
+    const isConst = (v: number): boolean => (v & 0xf) === 6;
+    const readsArg0 = (op: number): boolean => op === 25 || op === 26;
+    if (isConst(st.colorArg1) || isConst(st.colorArg2) || isConst(st.alphaArg1) || isConst(st.alphaArg2)
+        || (readsArg0(st.colorOp) && isConst(st.colorArg0))
+        || (readsArg0(st.alphaOp) && isConst(st.alphaArg0))) {
+        d3d9PerfFfpUnimplemented("stageArgConstant");
+    }
+}
+
+/**
+ * `setWorkerFlag('__ffpUnhandledOpMagenta', true)` makes the stage combiner's fallback paint
+ * magenta instead of guessing. The census says WHICH op a frame needs; this says WHICH PIXELS
+ * depend on it, which is the half a counter cannot answer — a surface that is absent and one
+ * that is merely mis-combined look identical until the guess is made visible. Read at shader
+ * emit time, so set it before the title loads.
+ */
+function unhandledOpMagenta(): boolean {
+    return !!(globalThis as unknown as Record<string, unknown>).__ffpUnhandledOpMagenta;
+}
+// Must agree with the other copies in the tree (ddraw/d3d/sampler-constants.ts,
+// modules/d3d8/state.ts) — a wrong value reads a slot nothing writes, so every stage
+// silently resolves to UV set 0 with no texgen flag visible.
+const D3DTSS_TEXCOORDINDEX = 11;
 const D3DTOP_DISABLE = 1;
+// Fixed-function skinning. The D3D9 FFP shader implements neither, so a draw that asks for
+// them is counted (censusFfpGaps) rather than silently transformed by the wrong matrix.
+const D3DRS_VERTEXBLEND = 151;
+const D3DRS_INDEXEDVERTEXBLENDENABLE = 167;
 // D3DLOCK_DISCARD — the guest is refilling the whole buffer; D3D gives it fresh memory
 // rather than overwriting bytes already-issued draws read (see uploadBufferVersion).
 const D3DLOCK_DISCARD = 0x00002000;
@@ -159,6 +213,7 @@ const D3DRS_LIGHTING = 137;
 const D3DRS_AMBIENT = 139;
 const D3DRS_COLORVERTEX = 141;
 const D3DRS_LOCALVIEWER = 142;
+const D3DRS_NORMALIZENORMALS = 143;
 const D3DRS_DIFFUSEMATERIALSOURCE = 145;
 const D3DRS_SPECULARMATERIALSOURCE = 146;
 const D3DRS_AMBIENTMATERIALSOURCE = 147;
@@ -170,6 +225,7 @@ const D3DRS_CLIPPLANEENABLE = 152;
 const D3DTS_WORLD = 0x100;
 const D3DTS_VIEW = 2;
 const D3DTS_PROJECTION = 3;
+const D3DTS_TEXTURE0 = 16;
 const D3DMATERIAL9_SIZE = 68;
 const D3DLIGHT9_SIZE = 104;
 
@@ -187,7 +243,16 @@ export class D3D9Device {
     private prevPresentTime: number = 0;
 
     private backend: WebGPUBackend;
-    private memory: Uint8Array;
+
+    /**
+     * Guest RAM, re-derived per use. A view stored across a WASM memory growth is
+     * DETACHED, and every later subarray()/set() on it throws — the device outlives
+     * any number of growths, so it may never hold one. This is the invariant
+     * process.getCurrentMemory() documents for all of its callers.
+     */
+    private get memory(): Uint8Array {
+        return System.getInstance().process!.getCurrentMemory();
+    }
 
     private stateTracker = new D3D9StateTracker();
     private commandRecorder = new D3D9CommandRecorder(new RenderFramePool(2));
@@ -493,9 +558,8 @@ export class D3D9Device {
         this.rtDepthCache.clear();
     }
 
-    constructor(backend: WebGPUBackend, memory: Uint8Array) {
+    constructor(backend: WebGPUBackend) {
         this.backend = backend;
-        this.memory = memory;
 
         this.backendExecutor = new D3D9BackendExecutor(backend);
         this.pipelineCache = new LruCache<string, number>({
@@ -1219,13 +1283,24 @@ export class D3D9Device {
     private vertexRangeOobLogs = 0;
     private bufferFrameSerial = -1;
 
-    /** Reset the per-frame version bookkeeping when the producer frame boundary moves. Every
-     *  buffer restarts at ring slot 0, which is safe because the previous frame's draws have
-     *  been submitted by then. */
+    /**
+     * Reset the per-frame version bookkeeping when the producer frame boundary moves. Every
+     * buffer restarts at ring slot 0, which is safe for GPU ordering because the previous
+     * frame's draws have been submitted — but the buffer's current bytes live in the slot that
+     * frame ENDED on, and an upload only happens while `store.isDirty`. So rewinding the slot
+     * must also re-dirty the buffer, or slot 0 binds a stale version (or zeros, if it was never
+     * written) and WebGPU reports nothing.
+     */
     private syncBufferFrame(): void {
         const serial = frameCapture.getFrameBoundarySerial();
         if (serial === this.bufferFrameSerial) return;
         this.bufferFrameSerial = serial;
+        for (const [index, slot] of this.vbSlotThisFrame) {
+            if (slot > 0) this.vertexBuffers.setDirty(index, true);
+        }
+        for (const [index, slot] of this.ibSlotThisFrame) {
+            if (slot > 0) this.indexBuffers.setDirty(index, true);
+        }
         this.vbSlotThisFrame.clear();
         this.ibSlotThisFrame.clear();
         this.vbUploadedThisFrame.clear();
@@ -1286,6 +1361,10 @@ export class D3D9Device {
         const discarded = isVb ? this.discardedVb : this.discardedIb;
         const usage = (isVb ? GPUBufferUsage.VERTEX : GPUBufferUsage.INDEX) | GPUBufferUsage.COPY_DST;
         const size = store.getSize(index);
+        // GPU-side ring buffers are padded to a 4-byte multiple to admit the padded
+        // writeBuffer the flush performs (see RenderFrame.queueUpload) — a write past the
+        // end is a validation error that invalidates the whole frame's command buffer.
+        const gpuSize = (size + 3) & ~3;
 
         // The ring OWNS the buffer identity: slot 0 is the buffer the store was created with,
         // and every frame restarts at slot 0. Driving it from store.getGpuBuffer() instead would
@@ -1303,7 +1382,7 @@ export class D3D9Device {
         }
         if (!ring) {
             const storeBuf = store.getGpuBuffer(index);
-            const base = storeBuf && storeBuf.size >= size ? storeBuf : device.createBuffer({ size, usage });
+            const base = storeBuf && storeBuf.size >= gpuSize ? storeBuf : device.createBuffer({ size: gpuSize, usage });
             ring = [base];
             (isVb ? this.vbVersions : this.ibVersions).set(index, ring);
             slots.set(index, 0);
@@ -1318,7 +1397,7 @@ export class D3D9Device {
             const renamed = overwrote && discarded.has(index);
             if (renamed) {
                 slot += 1;
-                while (ring.length <= slot) ring.push(device.createBuffer({ size, usage }));
+                while (ring.length <= slot) ring.push(device.createBuffer({ size: gpuSize, usage }));
                 slots.set(index, slot);
             }
             const counts = isVb ? this.vbUploadCountThisFrame : this.ibUploadCountThisFrame;
@@ -1329,6 +1408,7 @@ export class D3D9Device {
             const target = ring[slot]!;
             store.setGpuBuffer(index, target);
             this.commandRecorder.queueUpload(target, data);
+            if (this.fetchAuditFramesLeft > 0) this.fetchAuditShadow.set(target, data.slice());
             store.setDirty(index, false);
             uploaded.add(index);
             if (this.frameSnapshot.frameCounters) {
@@ -1340,6 +1420,136 @@ export class D3D9Device {
         const current = ring[slot]!;
         store.setGpuBuffer(index, current);
         return current;
+    }
+
+    // ── Indexed-fetch audit (dbg.d3d9FetchAudit) ────────────────────────────────────────
+    // Per indexed draw, verifies that the bytes the GPU will fetch at pass execution (the
+    // bound ring buffer's final uploaded contents for this frame) equal the bytes the guest's
+    // buffers held when the draw was recorded. Splits "the upload/ring layer served other
+    // bytes" from "fetch parameters or shading are wrong" without a GPU readback: shadows are
+    // keyed by GPUBuffer identity and updated at queueUpload time, so the last upload wins —
+    // exactly the contents queue.writeBuffer leaves for the render pass.
+    private fetchAuditFramesLeft = 0;
+    private fetchAuditShadow = new Map<GPUBuffer, Uint8Array>();
+    private fetchAuditRecords: Array<{
+        draw: number; fvf: number; stride: number; vbOffset: number;
+        baseVertex: number; startIndex: number; indexCount: number; is16: boolean;
+        vbIndex: number; ibIndex: number; vbSlot: number; ibSlot: number;
+        vbAssumed: boolean; ibAssumed: boolean;
+        vbRef: GPUBuffer; ibRef: GPUBuffer;
+        expIdxHash: number; expVtxHash: number; expMaxIndex: number;
+    }> = [];
+    private fetchAuditReport = {
+        frames: 0, draws: 0, ok: 0, okAssumed: 0,
+        ibMismatch: 0, vbMismatch: 0, bothMismatch: 0, gatherOOB: 0,
+        samples: [] as Array<Record<string, unknown>>,
+    };
+
+    armFetchAudit(frames: number): void {
+        this.fetchAuditFramesLeft = frames;
+        this.fetchAuditRecords.length = 0;
+        this.fetchAuditShadow.clear();
+        this.fetchAuditReport = {
+            frames: 0, draws: 0, ok: 0, okAssumed: 0,
+            ibMismatch: 0, vbMismatch: 0, bothMismatch: 0, gatherOOB: 0, samples: [],
+        };
+    }
+
+    getFetchAuditReport(): unknown {
+        return { active: this.fetchAuditFramesLeft > 0, ...this.fetchAuditReport };
+    }
+
+    private static fnv1a(bytes: Uint8Array, off: number, len: number, h = 0x811c9dc5): number {
+        for (let i = off, e = off + len; i < e; i++) h = Math.imul(h ^ bytes[i]!, 0x01000193);
+        return h >>> 0;
+    }
+
+    /** Hash the index list and the vertex bytes those indices fetch (mirrors the GPU's
+     *  vbOffset + (baseVertex+idx)*stride reads). Returns null when the gather runs past
+     *  either buffer — the robust-access case the GPU silently zero-fills. */
+    private static hashIndexedFetch(
+        ib: Uint8Array, vb: Uint8Array,
+        startIndex: number, indexCount: number, is16: boolean,
+        vbOffset: number, baseVertex: number, stride: number,
+    ): { idxHash: number; vtxHash: number; maxIndex: number } | null {
+        const idxBytes = is16 ? 2 : 4;
+        const idxOff = startIndex * idxBytes;
+        if (idxOff + indexCount * idxBytes > ib.byteLength) return null;
+        const dv = new DataView(ib.buffer, ib.byteOffset, ib.byteLength);
+        let idxHash = 0x811c9dc5;
+        let vtxHash = 0x811c9dc5;
+        let maxIndex = 0;
+        for (let i = 0; i < indexCount; i++) {
+            const idx = is16 ? dv.getUint16(idxOff + i * 2, true) : dv.getUint32(idxOff + i * 4, true);
+            idxHash = Math.imul(idxHash ^ idx, 0x01000193);
+            idxHash = Math.imul(idxHash ^ (idx >>> 16), 0x01000193);
+            if (idx > maxIndex) maxIndex = idx;
+            const vOff = vbOffset + (baseVertex + idx) * stride;
+            if (vOff < 0 || vOff + stride > vb.byteLength) return null;
+            vtxHash = D3D9Device.fnv1a(vb, vOff, stride, vtxHash);
+        }
+        return { idxHash: idxHash >>> 0, vtxHash: vtxHash >>> 0, maxIndex };
+    }
+
+    /** Record-time half of the audit: expected hashes from the guest's CURRENT buffer bytes.
+     *  A buffer the audit has never seen uploaded is seeded from those same bytes and marked
+     *  `assumed` — its GPU copy predates the audit, so equality there is presumed, not proven. */
+    private fetchAuditRecord(
+        vbIndex: number, ibIndex: number, vbData: Uint8Array, ibData: Uint8Array,
+        vbRef: GPUBuffer, ibRef: GPUBuffer,
+        vbOffset: number, stride: number, baseVertex: number, startIndex: number,
+        indexCount: number, is16: boolean,
+    ): void {
+        let vbAssumed = false, ibAssumed = false;
+        if (!this.fetchAuditShadow.has(vbRef)) { this.fetchAuditShadow.set(vbRef, vbData.slice()); vbAssumed = true; }
+        if (!this.fetchAuditShadow.has(ibRef)) { this.fetchAuditShadow.set(ibRef, ibData.slice()); ibAssumed = true; }
+        const exp = D3D9Device.hashIndexedFetch(ibData, vbData, startIndex, indexCount, is16, vbOffset, baseVertex, stride);
+        if (!exp) { this.fetchAuditReport.gatherOOB++; return; }
+        this.fetchAuditRecords.push({
+            draw: this.drawCount, fvf: this.stateTracker.getFVF(), stride, vbOffset,
+            baseVertex, startIndex, indexCount, is16, vbIndex, ibIndex,
+            vbSlot: this.vbSlotThisFrame.get(vbIndex) ?? 0, ibSlot: this.ibSlotThisFrame.get(ibIndex) ?? 0,
+            vbAssumed, ibAssumed, vbRef, ibRef,
+            expIdxHash: exp.idxHash, expVtxHash: exp.vtxHash, expMaxIndex: exp.maxIndex,
+        });
+    }
+
+    /** Present-time half: replay every recorded fetch against the shadows (= the bytes the
+     *  render pass will actually see) and tally agreement. */
+    private fetchAuditOnPresent(): void {
+        if (this.fetchAuditFramesLeft <= 0) return;
+        const rep = this.fetchAuditReport;
+        rep.frames++;
+        for (const r of this.fetchAuditRecords) {
+            rep.draws++;
+            const vbShadow = this.fetchAuditShadow.get(r.vbRef)!;
+            const ibShadow = this.fetchAuditShadow.get(r.ibRef)!;
+            const act = D3D9Device.hashIndexedFetch(
+                ibShadow, vbShadow, r.startIndex, r.indexCount, r.is16, r.vbOffset, r.baseVertex, r.stride);
+            const idxOk = act !== null && act.idxHash === r.expIdxHash;
+            const vtxOk = act !== null && act.vtxHash === r.expVtxHash;
+            if (idxOk && vtxOk) {
+                if (r.vbAssumed || r.ibAssumed) rep.okAssumed++; else rep.ok++;
+                continue;
+            }
+            if (!idxOk && !vtxOk) rep.bothMismatch++;
+            else if (!idxOk) rep.ibMismatch++;
+            else rep.vbMismatch++;
+            if (rep.samples.length < 24) {
+                rep.samples.push({
+                    frame: rep.frames, draw: r.draw, fvf: `0x${r.fvf.toString(16)}`, stride: r.stride,
+                    vbIndex: r.vbIndex, ibIndex: r.ibIndex, vbSlot: r.vbSlot, ibSlot: r.ibSlot,
+                    vbOffset: r.vbOffset, baseVertex: r.baseVertex, startIndex: r.startIndex,
+                    indexCount: r.indexCount, is16: r.is16,
+                    idxOk, vtxOk, gatherOOB: act === null,
+                    expMaxIndex: r.expMaxIndex, actMaxIndex: act?.maxIndex ?? -1,
+                    vbAssumed: r.vbAssumed, ibAssumed: r.ibAssumed,
+                    vbShadowSize: vbShadow.byteLength, ibShadowSize: ibShadow.byteLength,
+                });
+            }
+        }
+        this.fetchAuditRecords.length = 0;
+        if (--this.fetchAuditFramesLeft <= 0) this.fetchAuditShadow.clear();
     }
 
     lockVertexBuffer(vbPtr: number, offset: number, size: number, flags = 0): number {
@@ -1970,7 +2180,11 @@ export class D3D9Device {
     setTransform(state: number, matrix: Float32Array): number {
         d3d9PerfInc("setTransform");
         if (this.recordingStateBlock) {
-            if (state === D3DTS_WORLD || state === D3DTS_VIEW || state === D3DTS_PROJECTION) {
+            // D3DTS_TEXTURE0..7 belong in a state block for the same reason the other three do:
+            // the FFP texture transform is captured/applied state, and a block that restores the
+            // stage's TEXTURETRANSFORMFLAGS but not its matrix restores half a transform.
+            if (state === D3DTS_WORLD || state === D3DTS_VIEW || state === D3DTS_PROJECTION
+                || (state >= D3DTS_TEXTURE0 && state < D3DTS_TEXTURE0 + FFP_TEXTURE_TRANSFORM_COUNT)) {
                 this.recordStateBlock({ op: "transform", state, matrix: new Float32Array(matrix) });
             }
             return 0;
@@ -1986,7 +2200,7 @@ export class D3D9Device {
         if (state === D3DTS_WORLD) return this.stateTracker.getWorldMatrix();
         if (state === D3DTS_VIEW) return this.stateTracker.getViewMatrix();
         if (state === D3DTS_PROJECTION) return this.stateTracker.getProjectionMatrix();
-        return null;
+        return this.stateTracker.getTextureMatrix(state);
     }
 
     private makeStageStateKey(stage: number, type: number): number {
@@ -2070,6 +2284,7 @@ export class D3D9Device {
         const size = Math.min(D3DMATERIAL9_SIZE, data.length);
         this.materialData.fill(0);
         this.materialData.set(data.subarray(0, size), 0);
+        d3d9PerfMaterialSet();
         return 0;
     }
 
@@ -2127,6 +2342,19 @@ export class D3D9Device {
     private ffpUniformBlock = new Float32Array(FFP_UNIFORM_FLOATS);
     // Reused scratch: the 6 raw user clip-plane equations packed as 6 × vec4 (index N at N*4).
     private ffpClipPlanesScratch = new Float32Array(6 * 4);
+    // Reused scratch: inverse-transpose of worldView's 3×3, widened to 4×4 (see buildNormalMatrix).
+    private ffpNormalMatrix = new Float32Array(16);
+    // Reused scratch for the enabled-light gather: `ffpLightPool` holds parsed records that
+    // parseLightInto overwrites, `ffpLights` is the (sub)list handed to packFfpUniforms and
+    // `ffpEnabledIdx` the sorted enabled indices. buildFfpUniformBlock runs per submit, so the
+    // gather must not allocate once these have grown to their steady-state size.
+    private ffpLightPool: FfpLightInput[] = [];
+    private ffpLights: FfpLightInput[] = [];
+    private ffpEnabledIdx: number[] = [];
+    // Same pool/list split for the resolved texture stages: `ffpStagePool` holds records
+    // resolveFfpStages overwrites, `ffpStages` is the list its callers read.
+    private ffpStagePool: FfpResolvedStage[] = [];
+    private ffpStages: FfpResolvedStage[] = [];
 
     /** Parse the stored D3DMATERIAL9 bytes into float colours + power. */
     private parseMaterial(): FfpMaterial {
@@ -2141,22 +2369,107 @@ export class D3D9Device {
         };
     }
 
-    /** Parse one stored D3DLIGHT9 record into a lighting input. */
-    private parseLight(data: Uint8Array): FfpLightInput {
+    /** Overwrite `out` with one stored D3DLIGHT9 record. */
+    private parseLightInto(data: Uint8Array, out: FfpLightInput): void {
         const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-        const color = (o: number) => ({
-            r: dv.getFloat32(o, true), g: dv.getFloat32(o + 4, true),
-            b: dv.getFloat32(o + 8, true), a: dv.getFloat32(o + 12, true),
-        });
+        const color = (o: number, c: FfpColor) => {
+            c.r = dv.getFloat32(o, true); c.g = dv.getFloat32(o + 4, true);
+            c.b = dv.getFloat32(o + 8, true); c.a = dv.getFloat32(o + 12, true);
+        };
+        out.type = dv.getUint32(0, true);
+        color(4, out.diffuse); color(20, out.specular); color(36, out.ambient);
+        out.position[0] = dv.getFloat32(52, true);
+        out.position[1] = dv.getFloat32(56, true);
+        out.position[2] = dv.getFloat32(60, true);
+        out.direction[0] = dv.getFloat32(64, true);
+        out.direction[1] = dv.getFloat32(68, true);
+        out.direction[2] = dv.getFloat32(72, true);
+        out.range = dv.getFloat32(76, true);
+        out.falloff = dv.getFloat32(80, true);
+        out.att0 = dv.getFloat32(84, true);
+        out.att1 = dv.getFloat32(88, true);
+        out.att2 = dv.getFloat32(92, true);
+        out.theta = dv.getFloat32(96, true);
+        out.phi = dv.getFloat32(100, true);
+    }
+
+    /** A reusable, zero-filled FfpLightInput record for the light-gather pool. */
+    private static emptyLight(): FfpLightInput {
+        const c = (): FfpColor => ({ r: 0, g: 0, b: 0, a: 0 });
         return {
-            type: dv.getUint32(0, true),
-            diffuse: color(4), specular: color(20), ambient: color(36),
-            position: [dv.getFloat32(52, true), dv.getFloat32(56, true), dv.getFloat32(60, true)],
-            direction: [dv.getFloat32(64, true), dv.getFloat32(68, true), dv.getFloat32(72, true)],
-            range: dv.getFloat32(76, true),
-            falloff: dv.getFloat32(80, true),
-            att0: dv.getFloat32(84, true), att1: dv.getFloat32(88, true), att2: dv.getFloat32(92, true),
-            theta: dv.getFloat32(96, true), phi: dv.getFloat32(100, true),
+            type: 0, diffuse: c(), specular: c(), ambient: c(),
+            position: [0, 0, 0], direction: [0, 0, 0],
+            range: 0, falloff: 0, att0: 0, att1: 0, att2: 0, theta: 0, phi: 0,
+        };
+    }
+
+    /**
+     * Write the inverse-transpose of `wv`'s upper-left 3×3 into `this.ffpNormalMatrix`, widened
+     * to a 4×4 (D3D row-major, translation dropped — normals carry w = 0). This is the matrix
+     * FFP normals are transformed by; worldView itself is only correct for rigid transforms.
+     * A singular 3×3 has no inverse-transpose, so fall back to the raw 3×3 rather than emit the
+     * infinities the closed-form division would produce.
+     */
+    private buildNormalMatrix(wv: Float32Array): Float32Array {
+        const n = this.ffpNormalMatrix;
+        const a00 = wv[0], a01 = wv[1], a02 = wv[2];
+        const a10 = wv[4], a11 = wv[5], a12 = wv[6];
+        const a20 = wv[8], a21 = wv[9], a22 = wv[10];
+        // Cofactor matrix / det == transpose(inverse(A)) in the same row-major convention.
+        const c00 = a11 * a22 - a12 * a21;
+        const c01 = a12 * a20 - a10 * a22;
+        const c02 = a10 * a21 - a11 * a20;
+        const det = a00 * c00 + a01 * c01 + a02 * c02;
+        n.fill(0);
+        n[15] = 1;
+        if (det === 0 || !Number.isFinite(det)) {
+            n[0] = a00; n[1] = a01; n[2] = a02;
+            n[4] = a10; n[5] = a11; n[6] = a12;
+            n[8] = a20; n[9] = a21; n[10] = a22;
+            return n;
+        }
+        const inv = 1 / det;
+        n[0] = c00 * inv;
+        n[1] = c01 * inv;
+        n[2] = c02 * inv;
+        n[4] = (a02 * a21 - a01 * a22) * inv;
+        n[5] = (a00 * a22 - a02 * a20) * inv;
+        n[6] = (a01 * a20 - a00 * a21) * inv;
+        n[8] = (a01 * a12 - a02 * a11) * inv;
+        n[9] = (a02 * a10 - a00 * a12) * inv;
+        n[10] = (a00 * a11 - a01 * a10) * inv;
+        return n;
+    }
+
+    /**
+     * Which colour/normal components the current vertex format actually carries.
+     *
+     * ONE definition, because the shader and the frame capture must not be able to disagree:
+     * the declaration scan applies the same two rules buildShaderFromDecl does — usage +
+     * usageIndex, and the caller's `streamAllow` filter. Without the filter a colour living in
+     * a stream the pipeline does not declare would resolve to COLOR1 here while the shader has
+     * no colour attribute for it, and the material colour would silently drop out.
+     */
+    private resolveFfpVertexColors(
+        streamAllow: ReadonlySet<number> | null = null,
+    ): { hasColor: boolean; hasSpecular: boolean; hasNormal: boolean } {
+        const decl = this.activeVertexDecl > 0 ? this.vsDeclRegistry.get(this.activeVertexDecl) : null;
+        if (decl && decl.length > 0) {
+            // Predicate rather than a filtered copy — this runs per draw.
+            const has = (usage: number, index: number): boolean => decl.some(e =>
+                e.usage === usage && e.usageIndex === index
+                && (streamAllow === null || streamAllow.has(e.stream)));
+            return {
+                hasColor: has(DECLUSAGE_COLOR_FFP, 0),
+                hasSpecular: has(DECLUSAGE_COLOR_FFP, 1),
+                hasNormal: has(DECLUSAGE_NORMAL_FFP, 0),
+            };
+        }
+        const fvf = this.stateTracker.getFVF();
+        return {
+            hasColor: (fvf & D3DFVF_DIFFUSE) !== 0,
+            hasSpecular: (fvf & D3DFVF_SPECULAR) !== 0,
+            hasNormal: (fvf & D3DFVF_NORMAL) !== 0,
         };
     }
 
@@ -2173,43 +2486,111 @@ export class D3D9Device {
     }
 
     /**
+     * The active texture stages with D3D's defaults applied, into the reused pool.
+     *
+     * The SINGLE resolver: the shader uniform, the gap census and the frame capture all read
+     * its output, so none of them can disagree about what an unset state means. `has()` rather
+     * than a `?? 0` read, because an explicitly-set 0 (COLOROP=DISABLE) is not "unset".
+     * D3DTSS_TEXCOORDINDEX / D3DTSS_TEXTURETRANSFORMFLAGS stay RAW — the TCI_* generator in the
+     * high bits and the D3DTTFF count/PROJECTED bits are decoded in the shader, so no CPU-side
+     * pre-resolution can drop a mode. TEXCOORDINDEX defaults to the stage's own index.
+     */
+    private resolveFfpStages(stageCount: number): FfpResolvedStage[] {
+        const stages = this.ffpStages;
+        stages.length = 0;
+        // Hoisted out of the loop: this runs per draw, and closures allocated per stage would
+        // undo what the pooled stage records buy.
+        const ts = (s: number, type: number, dflt: number): number =>
+            this.textureStageStates.has(this.makeStageStateKey(s, type))
+                ? this.getTextureStageState(s, type) : dflt;
+        // With no texture bound, a D3DTA_TEXTURE selector resolves to D3DTA_DIFFUSE (MSDN
+        // D3DTSS_COLORARG1: the default argument when no texture is set); modifiers kept.
+        const tsArg = (s: number, noTex: boolean, type: number, dflt: number): number => {
+            const v = ts(s, type, dflt);
+            return noTex && (v & 0xf) === 2 ? (v & ~0xf) >>> 0 : v;
+        };
+        for (let s = 0; s < Math.max(1, stageCount); s++) {
+            const noTex = this.stateTracker.getTexture(s) === null;
+            // Stage 0 defaults to MODULATE/SELECTARG1; every stage above it defaults to
+            // DISABLE, and collapses to DISABLE outright once its texture goes away —
+            // sampling the fallback white would MODULATE the base texture by a blank stage.
+            const first = s === 0;
+            const st = this.ffpStagePool[s] ??= D3D9Device.emptyStage();
+            st.colorOp = first
+                ? ts(s, D3DTSS_COLOROP, 4)
+                : (noTex ? D3DTOP_DISABLE : ts(s, D3DTSS_COLOROP, D3DTOP_DISABLE));
+            st.colorArg1 = tsArg(s, noTex, 2, 2);
+            st.colorArg2 = tsArg(s, noTex, 3, 1);
+            st.alphaOp = ts(s, D3DTSS_ALPHAOP, first ? 2 : D3DTOP_DISABLE);
+            st.alphaArg1 = tsArg(s, noTex, 5, 2);
+            st.alphaArg2 = tsArg(s, noTex, 6, 1);
+            // ARG0 is the third operand of MULTIPLYADD/LERP; every other op ignores it.
+            st.colorArg0 = tsArg(s, noTex, D3DTSS_COLORARG0, 1);
+            st.alphaArg0 = tsArg(s, noTex, D3DTSS_ALPHAARG0, 1);
+            st.resultArg = ts(s, D3DTSS_RESULTARG, 1); // default D3DTA_CURRENT
+            st.texCoordIndex = ts(s, D3DTSS_TEXCOORDINDEX, s);
+            st.texTransformFlags = ts(s, D3DTSS_TEXTURETRANSFORMFLAGS, 0);
+            stages.push(st);
+        }
+        return stages;
+    }
+
+    /** A reusable, zero-filled stage record for the resolved-stage pool. */
+    private static emptyStage(): FfpResolvedStage {
+        return {
+            colorOp: 0, colorArg1: 0, colorArg2: 0, colorArg0: 0,
+            alphaOp: 0, alphaArg1: 0, alphaArg2: 0, alphaArg0: 0,
+            resultArg: 0, texCoordIndex: 0, texTransformFlags: 0,
+        };
+    }
+
+    /**
      * Build the per-frame FFP uniform block (viewport + MVP + worldView + full lighting state)
      * into the reused scratch and return it. Mirrors how the FFP path already snapshots a single
      * transform per frame — the lighting state (material/lights/render-states) is read at submit.
      */
-    private buildFfpUniformBlock(vpW: number, vpH: number): Float32Array {
+    private buildFfpUniformBlock(
+        vpW: number,
+        vpH: number,
+        stages: FfpResolvedStage[] = this.resolveFfpStages(this.activeStageCount()),
+        /** The stream restriction the pipeline was built with — see resolveFfpVertexColors. */
+        streamAllow: ReadonlySet<number> | null = null,
+    ): Float32Array {
         const rs = (s: number) => this.stateTracker.getRenderState(s);
 
-        // Resolve the FVF / declaration colour components present, so colour sources resolve right.
         const fvf = this.stateTracker.getFVF();
         const decl = this.activeVertexDecl > 0 ? this.vsDeclRegistry.get(this.activeVertexDecl) : null;
-        let hasColor: boolean, hasSpecular: boolean;
-        if (decl && decl.length > 0) {
-            hasColor = decl.some(e => e.stream === 0 && e.usage === DECLUSAGE_COLOR_FFP && e.usageIndex === 0);
-            hasSpecular = decl.some(e => e.stream === 0 && e.usage === DECLUSAGE_COLOR_FFP && e.usageIndex === 1);
-        } else {
-            hasColor = (fvf & D3DFVF_DIFFUSE) !== 0;
-            hasSpecular = (fvf & D3DFVF_SPECULAR) !== 0;
-        }
-        const hasNormal = decl && decl.length > 0
-            ? decl.some(e => e.stream === 0 && e.usage === DECLUSAGE_NORMAL_FFP && e.usageIndex === 0)
-            : (fvf & D3DFVF_NORMAL) !== 0;
+        const { hasColor, hasSpecular, hasNormal: hasNormalDecl } = this.resolveFfpVertexColors(streamAllow);
         // Pre-transformed position — decides which fog the FFP runs (see resolveFfpFogMode).
         // Same POSITIONT-or-POSITION+FLOAT4 rule buildShaderFromDecl uses.
         const isRHW = decl && decl.length > 0
             ? decl.some(e => e.usage === DECLUSAGE_POSITIONT_FFP
                 || (e.usage === DECLUSAGE_POSITION_FFP && e.type === 3))
             : (fvf & D3DFVF_POSITION_MASK) === D3DFVF_XYZRHW;
+        // A pre-transformed vertex is never lit, so it never has a usable normal either —
+        // the shader builders drop the normal attribute for XYZRHW.
+        const hasNormal = hasNormalDecl && !isRHW;
 
         const colorVertex = rs(D3DRS_COLORVERTEX) !== 0;
 
         // Gather enabled lights in ascending index order (D3D iterates by light index).
-        const lights: FfpLightInput[] = [];
-        const enabled = [...this.lightEnables.entries()].filter(([, v]) => v !== 0).map(([i]) => i).sort((a, b) => a - b);
+        const enabled = this.ffpEnabledIdx;
+        enabled.length = 0;
+        for (const [idx, on] of this.lightEnables) {
+            if (on !== 0) enabled.push(idx);
+        }
+        enabled.sort((a, b) => a - b);
+        const lights = this.ffpLights;
+        lights.length = 0;
         for (const idx of enabled) {
             const raw = this.lights.get(idx);
             if (!raw) continue;
-            lights.push(this.parseLight(raw));
+            const slot = this.ffpLightPool[lights.length] ??= D3D9Device.emptyLight();
+            this.parseLightInto(raw, slot);
+            // D3D lets an app set and enable a light with a bogus type; it just never
+            // contributes. Dropping it here keeps the shader's type dispatch total.
+            if (slot.type < D3DLIGHT_POINT || slot.type > D3DLIGHT_DIRECTIONAL) continue;
+            lights.push(slot);
             if (lights.length >= FFP_MAX_LIGHTS) break;
         }
 
@@ -2226,56 +2607,14 @@ export class D3D9Device {
         }
 
         const ambientVal = rs(D3DRS_AMBIENT) >>> 0;
-        // has() form so an explicitly-set 0 (e.g. COLOROP=DISABLE) is honored.
-        const tss = (type: number, dflt: number) =>
-            this.textureStageStates.has(this.makeStageStateKey(0, type)) ? this.getTextureStageState(0, type) : dflt;
-        // With no texture bound at stage 0, a D3DTA_TEXTURE selector resolves to D3DTA_DIFFUSE
-        // (MSDN D3DTSS_COLORARG1: the default argument when no texture is set); modifier bits kept.
-        const noTex0 = this.stateTracker.getTexture(0) === null;
-        const tssArg = (type: number, dflt: number) => {
-            const v = tss(type, dflt);
-            return noTex0 && (v & 0xf) === 2 ? (v & ~0xf) >>> 0 : v;
-        };
-        // The stages above 0, same rules one stage up. Only as many as activeStageCount() —
-        // which is what the shader was generated for; writing more would be dead bytes on the
-        // hot path. A stage whose texture went away collapses to DISABLE: sampling the
-        // fallback white would otherwise MODULATE the base texture by a blank stage.
-        const stages = [{
-            colorOp: tss(1, 4),      // D3DTSS_COLOROP (default MODULATE)
-            colorArg1: tssArg(2, 2), // COLORARG1 (default TEXTURE)
-            colorArg2: tssArg(3, 1), // COLORARG2 (default CURRENT)
-            alphaOp: tss(4, 2),      // ALPHAOP (default SELECTARG1)
-            alphaArg1: tssArg(5, 2), // ALPHAARG1 (default TEXTURE)
-            alphaArg2: tssArg(6, 1), // ALPHAARG2 (default CURRENT)
-            coordSet: 0,
-        }];
-        const stageCount = this.activeStageCount();
-        for (let s = 1; s < stageCount; s++) {
-            const ts = (type: number, dflt: number) =>
-                this.textureStageStates.has(this.makeStageStateKey(s, type)) ? this.getTextureStageState(s, type) : dflt;
-            const noTex = this.stateTracker.getTexture(s) === null;
-            const tsArg = (type: number, dflt: number) => {
-                const v = ts(type, dflt);
-                return noTex && (v & 0xf) === 2 ? (v & ~0xf) >>> 0 : v;
-            };
-            stages.push({
-                colorOp: noTex ? D3DTOP_DISABLE : ts(1, D3DTOP_DISABLE),
-                colorArg1: tsArg(2, 2),
-                colorArg2: tsArg(3, 1),
-                alphaOp: ts(4, D3DTOP_DISABLE),
-                alphaArg1: tsArg(5, 2),
-                alphaArg2: tsArg(6, 1),
-                // D3DTSS_TEXCOORDINDEX low 16 bits pick the FVF coordinate set (the high bits
-                // are texgen modes the FFP path does not synthesize); the default is the
-                // stage's own index. Only set 1 is separately declared — see emitStage.
-                coordSet: (ts(D3DTSS_TEXCOORDINDEX, s) & 0xffff) === 0 ? 0 : 1,
-            });
-        }
+        // One worldView for both the uniform and the normal matrix — multiplyMatrices allocates.
+        const worldView = this.stateTracker.getWorldView();
         const params: FfpUniformParams = {
             viewportW: vpW,
             viewportH: vpH,
             mvp: this.stateTracker.getMVP(),
-            worldView: this.stateTracker.getWorldView(),
+            worldView,
+            normalMatrix: this.buildNormalMatrix(worldView),
             view: this.stateTracker.getViewMatrix(),
             world: this.stateTracker.getWorldMatrix(),
             clipPlanes: this.ffpClipPlanesScratch,
@@ -2295,8 +2634,10 @@ export class D3D9Device {
             specularSrc: this.effectiveColorSource(rs(D3DRS_SPECULARMATERIALSOURCE), colorVertex, hasColor, hasSpecular),
             emissiveSrc: this.effectiveColorSource(rs(D3DRS_EMISSIVEMATERIALSOURCE), colorVertex, hasColor, hasSpecular),
             hasNormal,
+            normalizeNormals: rs(D3DRS_NORMALIZENORMALS) !== 0,
             lights,
             stages,
+            texMatrices: this.stateTracker.getTextureMatrices(),
             tfactor: (() => {
                 const tf = rs(60) >>> 0; // D3DRS_TEXTUREFACTOR (tracker seeds the white default)
                 return { r: ((tf >> 16) & 0xff) / 255, g: ((tf >> 8) & 0xff) / 255, b: (tf & 0xff) / 255, a: ((tf >> 24) & 0xff) / 255 };
@@ -2477,10 +2818,85 @@ export class D3D9Device {
         return i < this.scrubMin || i > this.scrubMax;
     }
 
+    /**
+     * Per-stage combiner arguments + the texture each stage samples, for `captureFrame`.
+     *
+     * Reports the RESOLVED stages (resolveFfpStages), so a row shows the op the shader ran
+     * rather than the 0 an unset state reads as. `alphalessFormat` is the flag the shader uses
+     * to read a format's alpha as 1.0: whether a texture's alpha is real or substituted decides
+     * an alpha-blended draw's visibility.
+     */
+    private captureStageArgs(): Array<Record<string, number | string | boolean | null>> {
+        const out: Array<Record<string, number | string | boolean | null>> = [];
+        const stages = this.resolveFfpStages(this.activeStageCount());
+        for (let s = 0; s < stages.length; s++) {
+            const st = stages[s]!;
+            const ti = this.stateTracker.getTexture(s);
+            const fmt = ti !== null ? this.textures.getFormat(ti) : null;
+            out.push({
+                stage: s,
+                colorOp: st.colorOp,
+                colorArg1: st.colorArg1,
+                colorArg2: st.colorArg2,
+                colorArg0: st.colorArg0,
+                alphaOp: st.alphaOp,
+                alphaArg1: st.alphaArg1,
+                alphaArg2: st.alphaArg2,
+                alphaArg0: st.alphaArg0,
+                texCoordIndex: st.texCoordIndex,
+                texTransformFlags: st.texTransformFlags,
+                texture: ti !== null ? `0x${this.textures.getHandle(ti).toString(16)}` : null,
+                d3dFormat: fmt,
+                alphalessFormat: fmt !== null ? D3D_ALPHALESS_FORMATS.has(fmt) : null,
+            });
+        }
+        return out;
+    }
+
+    /**
+     * The inputs FFP lighting actually computes from, for `captureFrame`.
+     *
+     * Geometry whose vertex format carries no COLOR1/COLOR2 has no other source of colour:
+     * every channel comes from the material, the lights and the ambient. A black surface there
+     * is arithmetic, not a render bug, and telling the two apart needs the operands.
+     */
+    private captureLighting(streamAllow: ReadonlySet<number> | null = null): Record<string, unknown> {
+        const rs = (n: number): number => this.stateTracker.getRenderState(n);
+        const m = this.parseMaterial();
+        const c = (x: FfpColor): number[] => [x.r, x.g, x.b, x.a].map((v) => Math.round(v * 1000) / 1000);
+        const { hasColor, hasSpecular } = this.resolveFfpVertexColors(streamAllow);
+        const colorVertex = rs(D3DRS_COLORVERTEX) !== 0;
+        // Enabled AND actually supplied: LightEnable on an index the app never SetLight'd
+        // contributes nothing, so counting the enable bits alone would overstate the light rig.
+        let enabled = 0;
+        for (const [idx, on] of this.lightEnables) if (on !== 0 && this.lights.has(idx)) enabled++;
+        return {
+            enabled: rs(D3DRS_LIGHTING) !== 0,
+            specularEnable: rs(D3DRS_SPECULARENABLE),
+            enabledLights: enabled,
+            globalAmbientArgb: rs(D3DRS_AMBIENT) >>> 0,
+            matDiffuse: c(m.diffuse),
+            matAmbient: c(m.ambient),
+            matSpecular: c(m.specular),
+            matEmissive: c(m.emissive),
+            power: m.power,
+            // Resolved sources, not the raw render states: a source naming a vertex colour the
+            // FVF does not carry silently becomes MATERIAL, and that substitution is the whole
+            // question for a mesh with no vertex colours.
+            diffuseSrc: this.effectiveColorSource(rs(D3DRS_DIFFUSEMATERIALSOURCE), colorVertex, hasColor, hasSpecular),
+            specularSrc: this.effectiveColorSource(rs(D3DRS_SPECULARMATERIALSOURCE), colorVertex, hasColor, hasSpecular),
+            hasVertexColor: hasColor,
+            hasVertexSpecular: hasSpecular,
+        };
+    }
+
     private captureDrawIfArmed(
         primitiveType: number,
         primitiveCount: number,
         verts?: { data: Uint8Array; offset: number; stride: number; count: number },
+        /** The stream restriction this draw's pipeline will be built with, when the caller
+         *  already knows it — so the reported colour sources match the shader's. */
+        streamAllow: ReadonlySet<number> | null = null,
     ): void {
         if (!frameCapture.isCapturing()) return;
         const stage0 = this.stateTracker.getTexture(0);
@@ -2533,6 +2949,19 @@ export class D3D9Device {
             derivedShouldBlend: rs(D3DRS_ALPHABLENDENABLE) !== 0,
             colorOp: this.getTextureStageState(0, 1),
             alphaOp: this.getTextureStageState(0, 4),
+            colorArg1: this.getTextureStageState(0, 2),
+            colorArg2: this.getTextureStageState(0, 3),
+            alphaArg1: this.getTextureStageState(0, 5),
+            alphaArg2: this.getTextureStageState(0, 6),
+            // Two states that delete a draw's pixels with nothing else to show for it: a zero
+            // write mask, and an enabled user clip plane.
+            colorWriteEnable: rs(168),
+            clipPlaneEnable: rs(D3DRS_CLIPPLANEENABLE),
+            // The stage combiner's ARGUMENTS. An op alone does not say where a channel's value
+            // came from: SELECTARG1 is the texture on one draw and the vertex colour on the
+            // next, and "the alpha reaching the blender" is exactly that distinction.
+            stages: this.captureStageArgs(),
+            lighting: this.captureLighting(streamAllow),
             // The bound stages as GUEST HANDLES — the identity dumpTexture/textures() take, so a
             // capture row leads straight to the pixels. Stage 1 is called out because the FFP
             // path renders stage 0 only: a draw with a stage-1 texture bound is one whose second
@@ -3042,11 +3471,13 @@ export class D3D9Device {
             const size = vertexCount * stride;
             if (base < 0 || base + maxIndex * stride + stride > data.byteLength) return null;
             // Pooled scratch, refilled per stream: queue.writeBuffer copies at call time, so
-            // one buffer can serve every stream of every draw.
-            const bytes = this.ensureExtraStreamScratch(size);
+            // one buffer can serve every stream of every draw. Write length padded to 4 —
+            // writeBuffer throws on any other size.
+            const paddedSize = (size + 3) & ~3;
+            const bytes = this.ensureExtraStreamScratch(paddedSize);
             gatherVertices(bytes, data, base, order, vertexCount, stride);
-            const buffer = this.vbPool.acquire(Math.max(16, size));
-            device.queue.writeBuffer(buffer, 0, bytes, 0, size);
+            const buffer = this.vbPool.acquire(Math.max(16, paddedSize));
+            device.queue.writeBuffer(buffer, 0, bytes, 0, paddedSize);
             this.commandRecorder.registerPooledBuffer(buffer);
             out.push({ slot: stream, buffer, offset: 0, size });
         }
@@ -3092,7 +3523,7 @@ export class D3D9Device {
             const slots = new Set<number>([0]);
             for (const s of extraStreams ?? []) slots.add(s.slot);
             pipelineId = this.getPipelineIdForTopology(topology, true, stride, slots);
-            ffpStateIndex = this.captureFfpDrawState();
+            ffpStateIndex = this.captureFfpDrawState(slots);
         }
 
         this.commandRecorder.recordDraw({
@@ -3133,7 +3564,7 @@ export class D3D9Device {
         if (frameCapture.isCapturing()) {
             this.captureDrawIfArmed(primitiveType, primitiveCount, {
                 data: this.memory, offset: vertexDataPtr + minVertexIndex * stride, stride, count: numVertices,
-            });
+            }, UP_STREAM_SLOTS);
         }
         if (this.scrubbedOut()) return 0;
 
@@ -3234,7 +3665,7 @@ export class D3D9Device {
         if (frameCapture.isCapturing()) {
             this.captureDrawIfArmed(primitiveType, primitiveCount, {
                 data: this.memory, offset: vertexDataPtr, stride, count: primitiveCount * 3,
-            });
+            }, UP_STREAM_SLOTS);
         }
         if (this.scrubbedOut()) return 0;
 
@@ -3361,7 +3792,7 @@ export class D3D9Device {
             // A *UP draw supplies its vertices inline; D3D9 reads no bound stream for it, so
             // the pipeline declares stream 0 alone even when the declaration spans more.
             pipelineId = this.getPipelineIdForTopology(topology, true, stride, UP_STREAM_SLOTS);
-            ffpStateIndex = this.captureFfpDrawState();
+            ffpStateIndex = this.captureFfpDrawState(UP_STREAM_SLOTS);
         }
 
         this.commandRecorder.recordDraw({
@@ -3438,8 +3869,17 @@ export class D3D9Device {
         // an indexed draw — robust access silently substitutes zeros — so check it here or the
         // miss shows up only as geometry that never appears. See D3D9BufferPerf.
         const vbBytes = this.vertexBuffers.getSize(vbIndex);
+        const idxBytes = this.indexBuffers.getFormat(ibIndex) === D3DFMT_INDEX16 ? 2 : 4;
+        const ibNeed = (startIndex + primitiveCount * 3) * idxBytes;
+        const ibBytes = this.indexBuffers.getSize(ibIndex);
         const firstVertex = baseVertexIndex + minVertexIndex;
         const need = streamSource.offset + (firstVertex + numVertices) * streamSource.stride;
+        if (ibNeed > ibBytes) {
+            // An over-long index range is the one case WebGPU does raise — and the rejection
+            // invalidates the whole command buffer, not just this draw, so drop it here.
+            d3d9PerfIndexRangeOOB(ibNeed - ibBytes);
+            return d3d9DropDraw("drawIndexed:indexRangeOOB");
+        }
         if (firstVertex < 0 || need > vbBytes) {
             d3d9PerfVertexRangeOOB(Math.max(0, need - vbBytes));
             this.vertexRangeOobLogs = (this.vertexRangeOobLogs + 1) >>> 0;
@@ -3472,6 +3912,13 @@ export class D3D9Device {
             pipelineId = this.getPipelineId(streamSource.stride);
             ffpStateIndex = this.captureFfpDrawState();
             extraStreams = this.collectFfpExtraStreams();
+        }
+        if (this.fetchAuditFramesLeft > 0) {
+            this.fetchAuditRecord(
+                vbIndex, ibIndex, vbData, ibData, vbBuffer, ibBuffer,
+                streamSource.offset, streamSource.stride, baseVertexIndex, startIndex,
+                primitiveCount * 3, this.indexBuffers.getFormat(ibIndex) === D3DFMT_INDEX16,
+            );
         }
         this.commandRecorder.recordDrawIndexed({
             pipelineId,
@@ -3537,6 +3984,7 @@ export class D3D9Device {
         framePacer.reserveFrameSlot();
 
         this.lastActualPresent = performance.now();
+        this.fetchAuditOnPresent();
         // Defensive: if the guest left an RT bound at Present, flush its work to that RT, then
         // return authority to the backbuffer so the present actually copies the scene to the canvas.
         if (this.currentRtIndex !== null) {
@@ -3868,7 +4316,7 @@ export class D3D9Device {
             const size = this.vertexBuffers.getSize(index);
             let gpu = this.vertexBuffers.getGpuBuffer(index);
             if (!gpu) {
-                gpu = device.createBuffer({ size, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+                gpu = device.createBuffer({ size: (size + 3) & ~3, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
                 this.vertexBuffers.setGpuBuffer(index, gpu);
             }
             if (this.vertexBuffers.isDirty(index)) {
@@ -3898,9 +4346,29 @@ export class D3D9Device {
         const fvfHigh = this.stateTracker.getFVF() >>> 16;
         // ZFUNC is not in the numeric key (bits 25/26 carry only ZENABLE/ZWRITEENABLE), so it
         // has to key the cache here or every depth compare collapses onto the first one built.
-        return `${numericKey}|${fvfHigh}|${streamStride}|s${this.activeStageCount()}`
+        const stages = this.activeStageCount();
+        // Appended only when texgen is on, so it multiplies pipelines for the draws that use
+        // it and leaves every other key the shape it already had.
+        const texGen = this.texGenActive(stages) ? "|tg" : "";
+        return `${numericKey}|${fvfHigh}|${streamStride}|s${stages}${texGen}`
             + `|${computeBlendKey(this.getRS)}|${this.alphaTestKey()}|${computeDepthKey(this.getRS)}`
             + this.extraStreamKey(streamAllow);
+    }
+
+    /**
+     * True when some active stage generates its own texture coordinates (D3DTSS_TCI_* in the
+     * high bits of D3DTSS_TEXCOORDINDEX).
+     *
+     * The generator itself is a uniform, so it never rebuilds a pipeline — but a vertex that
+     * carries no texcoord at all makes it structural: the shader would declare no samplers and
+     * the stage would drop out, leaving an env-mapped mesh with no UV set untextured. Hence
+     * the pipeline cache key carries it (blendCacheKey).
+     */
+    private texGenActive(stageCount: number): boolean {
+        for (let s = 0; s < stageCount; s++) {
+            if ((this.getTextureStageState(s, D3DTSS_TEXCOORDINDEX) & 0xffff0000) !== 0) return true;
+        }
+        return false;
     }
 
     /**
@@ -3908,7 +4376,7 @@ export class D3D9Device {
      * D3D's cascade STOPS at the first stage whose COLOROP is DISABLE (the default for every
      * stage above 0), so the scan stops there too — a single-texture draw costs one lookup.
      * Baked into the FFP shader (and therefore into the pipeline key), which keeps the common
-     * one-stage shader as small as it was before multi-texture existed.
+     * one-stage shader small.
      */
     private activeStageCount(): number {
         let n = 1;
@@ -4014,7 +4482,8 @@ export class D3D9Device {
             // stream 0's stride (its bytes are repacked) and carries no other stream.
             ffpStageCount = this.activeStageCount();
             const strides = this.declStreamStrides(streamStride || streamSource?.stride || 0);
-            const built = buildShaderFromDecl(declElements, alphaTest, lit, ffpStageCount, strides, streamAllow);
+            const built = buildShaderFromDecl(declElements, alphaTest, lit, ffpStageCount, strides, streamAllow,
+                this.texGenActive(ffpStageCount));
             shaderModule = gpuDevice.createShaderModule({ code: built.wgsl });
             vertexBuffers = built.buffers;
             hasTexture = built.hasTexture;
@@ -4029,12 +4498,15 @@ export class D3D9Device {
             const fvf = this.stateTracker.getFVF();
             const layout = buildVertexLayout(fvf);
             ffpStageCount = this.activeStageCount();
-            shaderModule = gpuDevice.createShaderModule({ code: buildShader(fvf, alphaTest, lit, ffpStageCount) });
+            const texGen = this.texGenActive(ffpStageCount);
+            shaderModule = gpuDevice.createShaderModule({
+                code: buildShader(fvf, alphaTest, lit, ffpStageCount, texGen),
+            });
             vertexBuffers = [{
                 arrayStride: Math.max(layout.arrayStride, streamStride || 0),
                 attributes: layout.attributes,
             }];
-            hasTexture = layout.hasTexture;
+            hasTexture = layout.hasTexture || texGen;
         }
 
         const cullModeD3D = (key >> 16) & 0xff;
@@ -4247,18 +4719,55 @@ export class D3D9Device {
         return key;
     }
 
+    /**
+     * Count the fixed-function state this draw needs and `emitFfpShader` ignores.
+     *
+     * Ignoring it is silent by construction: the draw records, nothing is dropped, WebGPU is
+     * happy, and only one class of object goes missing or lands untextured. Naming the feature
+     * is what turns "some surfaces are gone" into a work item. Reads the RESOLVED stages, so a
+     * state left at its D3D default is not counted as a gap.
+     */
+    private censusFfpGaps(stages: readonly FfpResolvedStage[]): void {
+        const rs = (s: number): number => this.stateTracker.getRenderState(s);
+        if (rs(D3DRS_VERTEXBLEND) !== 0) d3d9PerfFfpUnimplemented("vertexBlend");
+        if (rs(D3DRS_INDEXEDVERTEXBLENDENABLE) !== 0) d3d9PerfFfpUnimplemented("indexedVertexBlend");
+        for (const st of stages) {
+            censusStageConstantArg(st);
+            // The stage combiner implements a SUBSET of D3DTEXTUREOP and silently substitutes a
+            // fallback expression for the rest — in the alpha channel that fallback is the raw
+            // texel alpha, which then decides the alpha test. So an unimplemented op does not
+            // tint a surface, it deletes it. Histogram every op, not just the missing ones:
+            // "nothing missing" is only trustworthy next to the distribution it was read from.
+            d3d9PerfFfpOp("color", st.colorOp);
+            d3d9PerfFfpOp("alpha", st.alphaOp);
+            if (!FFP_IMPLEMENTED_OPS.has(st.colorOp)) d3d9PerfFfpUnimplemented(`colorOp${st.colorOp}`);
+            if (!FFP_IMPLEMENTED_OPS.has(st.alphaOp)) d3d9PerfFfpUnimplemented(`alphaOp${st.alphaOp}`);
+            const tci = st.texCoordIndex;
+            // Generators 0..4 are implemented; anything above is outside the documented
+            // D3DTSS_TCI_* enum and would fall through to passthrough unnoticed.
+            if (((tci >>> 16) & 0xffff) > 4) d3d9PerfFfpUnimplemented("texCoordGen");
+            // Only UV sets 0 and 1 reach the shader as attributes; a higher set samples set 0.
+            if ((tci & 0xffff) > 1) d3d9PerfFfpUnimplemented("texCoordSet");
+        }
+    }
+
     /** Snapshot the full FFP uniform block + stage-0 texture for one draw. The
      *  guest mutates transforms/stage-ops/TFACTOR/texture between draws, so
      *  FFP draws can't share the frame-level uniform buffer. */
-    private captureFfpDrawState(): number {
+
+    private captureFfpDrawState(streamAllow: ReadonlySet<number> | null = null): number {
         this.declDrawCounts.set(this.activeVertexDecl, (this.declDrawCounts.get(this.activeVertexDecl) ?? 0) + 1);
         const { w, h } = this.getCurrentTargetSize();
-        const block = this.buildFfpUniformBlock(w, h);
+        // Resolved once and shared: the uniform the shader reads and the census that reports
+        // what it could not honor must be looking at the same stages.
+        const stageCount = this.activeStageCount();
+        const stages = this.resolveFfpStages(stageCount);
+        const block = this.buildFfpUniformBlock(w, h, stages, streamAllow);
         const frame = this.commandRecorder.getCurrentFrame();
         const index = frame.nextFfpState(block.length);
         const slot = frame.ffpStates[index];
         slot.block.set(block);
-        const stageCount = this.activeStageCount();
+        this.censusFfpGaps(stages);
         slot.stageCount = stageCount;
         for (let s = 0; s < stageCount; s++) {
             slot.textures[s] = this.resolveCurrentTexture(s);
@@ -4780,11 +5289,14 @@ export class D3D9Device {
      * Ensure conversion buffer is large enough and return a view of the required size
      */
     private ensureConversionBuffer(size: number): Uint8Array {
-        if (!this.vertexConversionBuffer || this.vertexConversionBufferSize < size) {
-            this.vertexConversionBuffer = new Uint8Array(size);
-            this.vertexConversionBufferSize = size;
+        // Padded to a 4-byte multiple because callers hand the returned view straight to
+        // queue.writeBuffer, which throws on any other length (see RenderFrame.queueUpload).
+        const padded = (size + 3) & ~3;
+        if (!this.vertexConversionBuffer || this.vertexConversionBufferSize < padded) {
+            this.vertexConversionBuffer = new Uint8Array(padded);
+            this.vertexConversionBufferSize = padded;
         }
-        return this.vertexConversionBuffer.subarray(0, size);
+        return this.vertexConversionBuffer.subarray(0, padded);
     }
 
     private ensureIndexScratch(count: number): Uint32Array {
@@ -5043,6 +5555,13 @@ export class D3D9Device {
                 out.push({ state, matrix });
             }
         }
+        // D3DTS_TEXTURE0..7 are vertex state too: a D3DSBT_VERTEXSTATE block that restored the
+        // stage's TEXTURETRANSFORMFLAGS but not its matrix would restore half a transform.
+        for (let s = 0; s < FFP_TEXTURE_TRANSFORM_COUNT; s++) {
+            const state = D3DTS_TEXTURE0 + s;
+            const matrix = this.getTransform(state);
+            if (matrix) out.push({ state, matrix });
+        }
         return out;
     }
 
@@ -5244,6 +5763,10 @@ function emitFfpShader(d: {
     hasTex: boolean;
     /** A second FVF texcoord set is present — a stage can sample its own coordinates. */
     hasTex1?: boolean;
+    /** Some active stage generates its own coordinates (D3DTSS_TCI_*). Only load-bearing when
+     *  the vertex carries NO texcoord: whether the shader declares samplers at all is then a
+     *  structural choice a uniform cannot make, so it is part of the pipeline cache key. */
+    texGen?: boolean;
     /** Texture blend stages to emit (1..FFP_MAX_STAGES); baked into the pipeline. */
     stageCount?: number;
     lit: boolean;
@@ -5298,7 +5821,10 @@ function emitFfpShader(d: {
     // pipeline layout may be a superset of what a shader uses), so a 1-stage shader and an
     // 8-stage one share one cached bind group shape.
     const stageCount = Math.max(1, Math.min(d.stageCount ?? 1, FFP_MAX_STAGES));
-    const stageBindings = d.hasTex
+    // A stage samples whenever the pipeline was built to: either the vertex carries texture
+    // coordinates, or a stage generates its own (D3DTSS_TCI_*) and needs no attribute at all.
+    const samples = d.hasTex || d.texGen;
+    const stageBindings = samples
         ? Array.from({ length: stageCount }, (_unused, s) =>
             `@group(0) @binding(${1 + s * 2}) var texSampler${s || ""}: sampler;\n` +
             `@group(0) @binding(${2 + s * 2}) var tex${s || ""}: texture_2d<f32>;`).join("\n")
@@ -5317,53 +5843,102 @@ function emitFfpShader(d: {
      */
     const emitStage = (s: number): string => {
         const tex = `tex${s || ""}`, smp = `texSampler${s || ""}`;
-        // Which FVF coordinate set this stage samples (D3DTSS_TEXCOORDINDEX). Only set 1 is
-        // separately declared; stages asking for anything else fall back to set 0, which is
-        // also what D3D does when the requested set is absent from the FVF.
-        const uv = d.hasTex1 ? `select(input.uv, input.uv1, u.stages[${s}].b.w > 0.5)` : "input.uv";
+        // Every stage carries its own final coordinate (source select + texture matrix already
+        // applied in the vertex stage), so nothing here needs to know about UV sets or texgen.
+        const arg = (sel: string) => `ffpStageArg(${sel}, _t, _cur, _diff, _spec, _tmp, u.tfactor)`;
         return `
     if (u32(u.stages[${s}].a.x) != 1u) {
-        var _t = textureSample(${tex}, ${smp}, ${uv});
+        var _t = textureSample(${tex}, ${smp}, input.tc${s});
         // Alpha-less D3D formats (X8R8G8B8 & friends, incl. RTs) read alpha as 1.0 on real
         // hardware; our GPU copies carry a live alpha channel that must be masked.
         if (u.stages[${s}].b.z > 0.5) { _t = vec4<f32>(_t.rgb, 1.0); }
-        let _cur = ${s === 0 ? "_diff" : "_c"};
-        let _a1 = ffpStageArg(u32(u.stages[${s}].a.y), _t, _cur, _diff, u.tfactor);
-        let _a2 = ffpStageArg(u32(u.stages[${s}].a.z), _t, _cur, _diff, u.tfactor);
-        let _rgb = ffpStageOp(u32(u.stages[${s}].a.x), _a1, _a2, _t * _cur);
-        var _al = _cur.a;
+        let _cur = _c;
+        // COLORARG0 | ALPHAARG0<<8 | resultIsTemp<<16 (see FfpStage in ffp-lighting.ts).
+        let _x = u32(u.stages[${s}].b.w);
+        let _toTemp = (_x >> 16u) != 0u;
+        // D3DTSS_RESULTARG: the stage reads CURRENT/TEMP as its arguments either way, but
+        // writes only the selected register — and an unwritten channel keeps ITS old value,
+        // not CURRENT's.
+        let _dst = select(_c, _tmp, _toTemp);
+        let _a0 = ${arg("_x & 0xffu")};
+        let _a1 = ${arg(`u32(u.stages[${s}].a.y)`)};
+        let _a2 = ${arg(`u32(u.stages[${s}].a.z)`)};
+        let _rgb = ffpStageOp(u32(u.stages[${s}].a.x), _a0, _a1, _a2, _t, _cur, _diff, u.tfactor, _dst);
+        var _al = _dst.a;
         if (u32(u.stages[${s}].a.w) != 1u) {
-            let _b1 = ffpStageArg(u32(u.stages[${s}].b.x), _t, _cur, _diff, u.tfactor);
-            let _b2 = ffpStageArg(u32(u.stages[${s}].b.y), _t, _cur, _diff, u.tfactor);
-            _al = ffpStageOp(u32(u.stages[${s}].a.w), _b1, _b2, _t).a;
+            let _b0 = ${arg("(_x >> 8u) & 0xffu")};
+            let _b1 = ${arg(`u32(u.stages[${s}].b.x)`)};
+            let _b2 = ${arg(`u32(u.stages[${s}].b.y)`)};
+            _al = ffpStageOp(u32(u.stages[${s}].a.w), _b0, _b1, _b2, _t, _cur, _diff, u.tfactor, _dst).a;
         }
-        _c = vec4<f32>(clamp(_rgb.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), clamp(_al, 0.0, 1.0));
+        let _out = vec4<f32>(clamp(_rgb.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), clamp(_al, 0.0, 1.0));
+        if (_toTemp) { _tmp = _out; } else { _c = _out; }
     }`;
     };
-    const stageBody = d.hasTex
-        ? Array.from({ length: stageCount }, (_unused, s) => emitStage(s)).join("\n")
+    // TEMP starts at (0,0,0,0) and SPECULAR is vertex colour 1 — both are D3DTA registers the
+    // stage cascade may read, so they exist for the whole cascade, not per stage.
+    const stageBody = samples
+        ? `    let _spec = input.specular;
+    var _tmp: vec4<f32> = vec4<f32>(0.0);\n`
+            + Array.from({ length: stageCount }, (_unused, s) => emitStage(s)).join("\n")
+        : "";
+
+    /**
+     * View-space position + normal, shared by FFP lighting and the D3DTSS_TCI_* generators.
+     * Normals go through the inverse-transpose of worldView, not worldView itself: under a
+     * non-uniform world scale the two differ and only the former keeps a normal perpendicular
+     * to its surface. NORMALIZENORMALS is applied here so the generated reflection vectors see
+     * the same normal the lighting does (ffpComputeLighting re-normalizing a unit vector is a
+     * no-op, so the flag still travels with it).
+     *
+     * A pre-transformed (XYZRHW) vertex has no world/view transform and no normal — texgen from
+     * it reads the raw position, and D3D applies no texture matrix to it either.
+     */
+    const eyeSpaceBody = !(d.lit || samples)
+        ? ""
+        : d.hasRhw
+        ? `let _ecPos = input.pos.xyz;
+        let _ecNormal = vec3<f32>(0.0);`
+        : `let _ecPos = (u.worldView * vec4<f32>(input.pos, 1.0)).xyz;
+        var _ecNormal = (u.normalMatrix * vec4<f32>(${d.normalExpr}, 0.0)).xyz;
+        if (u.ctrl2.w > 0.5 && any(_ecNormal != vec3<f32>(0.0))) { _ecNormal = normalize(_ecNormal); }`;
+
+    // Per-stage texture coordinates: source select (vertex UV set or a TCI_* generator) plus
+    // the stage's D3DTS_TEXTURE matrix, both driven by uniforms — texgen turning on or off
+    // never rebuilds the pipeline. XYZRHW skips the matrix, matching D3D.
+    const uvSrc = `let _uv0 = ${d.hasTex ? "input.uv" : "vec2<f32>(0.0)"};
+    let _uv1 = ${d.hasTex1 ? "input.uv1" : "_uv0"};`;
+    const texCoordBody = samples
+        ? uvSrc + "\n" + Array.from({ length: stageCount }, (_unused, s) => {
+            const src = `ffpTexCoordSrc(u32(u.texGen[${s}].x), _uv0, _uv1, _ecPos, _ecNormal)`;
+            return d.hasRhw
+                ? `    out.tc${s} = (${src}).xy;`
+                : `    out.tc${s} = ffpTexTransform(${src}, u.texMatrices[${s}], u32(u.texGen[${s}].y));`;
+        }).join("\n")
         : "";
 
     const colorBody = d.lit
         ? `let vDiffuse = ${d.colorExpr};
         let vSpecular = ${d.specularExpr};
         if (u.ctrl0.y > 0.5) {
-            let ecPos = (u.worldView * vec4<f32>(input.pos, 1.0)).xyz;
-            let ecNormal = (u.worldView * vec4<f32>(${d.normalExpr}, 0.0)).xyz;
             let lit = ffpComputeLighting(
-                ecPos, ecNormal,
+                _ecPos, _ecNormal,
                 u.matDiffuse, u.matAmbient, u.matSpecular, u.matEmissive,
                 u.ctrl0.x, u.ctrl0.z > 0.5, u.ctrl0.w > 0.5, u.ctrl2.y > 0.5,
+                u.ctrl2.w > 0.5,
                 u.ctrl1.x, u.ctrl1.y, u.ctrl1.z, u.ctrl1.w,
                 u.globalAmbient.xyz, i32(u.ctrl2.x),
                 vDiffuse, vSpecular);
             out.color = lit[0];
-            out.specular = lit[1].xyz;
+            // Alpha rides through unlit: FFP lighting replaces specular RGB only, and D3DTA_SPECULAR
+            // (plus vertex fog) reads the app's own specular alpha.
+            out.specular = vec4<f32>(lit[1].xyz, vSpecular.a);
         } else {
             out.color = vDiffuse;
-            out.specular = vec3<f32>(0.0);
+            out.specular = vec4<f32>(0.0, 0.0, 0.0, vSpecular.a);
         }`
-        : `out.color = ${d.colorExpr};`;
+        : `out.color = ${d.colorExpr};
+        out.specular = ${d.specularExpr};`;
 
     return `
 ${FFP_UNIFORM_STRUCT_WGSL}
@@ -5377,28 +5952,34 @@ struct VertexInput {
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec4<f32>,
-    ${d.hasTex ? "@location(1) uv: vec2<f32>," : ""}
-    ${d.lit ? "@location(2) specular: vec3<f32>," : ""}
+    // D3D fixed-function fog factor (0 = unfogged). Computed per vertex for every draw —
+    // the mode lives in a uniform, so fog turning on or off never rebuilds the pipeline.
+    @location(1) fog: f32,
+    // Vertex colour 1. Present whether or not the draw is lit: the stage cascade can select it
+    // as D3DTA_SPECULAR, which has nothing to do with D3DRS_LIGHTING.
+    @location(2) specular: vec4<f32>,
     // FFP user clip-plane signed distances (planes 0..3 in clipA, 4..5 in clipB), interpolated
     // for the per-pixel discard in fs_main. Constant 1.0 (no clip) unless clipping is enabled.
     @location(3) clipA: vec4<f32>,
     @location(4) clipB: vec2<f32>,
-    ${d.hasTex1 ? "@location(5) uv1: vec2<f32>," : ""}
-    // D3D fixed-function fog factor (0 = unfogged). Computed per vertex for every draw —
-    // the mode lives in a uniform, so fog turning on or off never rebuilds the pipeline.
-    @location(6) fog: f32,
+    // One FINAL texture coordinate per emitted blend stage (location 5 + stage), not one per
+    // vertex UV set: after texgen and the texture matrix, two stages reading the same set can
+    // still need different coordinates. Locations stay under the 16-variable inter-stage limit
+    // because the count is FFP_MAX_STAGES at most.
+${Array.from({ length: samples ? stageCount : 0 }, (_unused, s) => `    @location(${5 + s}) tc${s}: vec2<f32>,`).join("\n")}
 }
 ${FFP_UNPACK_COLOR_WGSL}
 ${FFP_FOG_WGSL}
+${samples ? FFP_TEXGEN_WGSL : ""}
 ${d.lit ? FFP_SELECT_COLOR_WGSL + "\n" + emitFfpComputeLighting("u.lights") : ""}
 
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
     var out: VertexOutput;
     ${posBody}
+    ${eyeSpaceBody}
     ${colorBody}
-    ${d.hasTex ? "out.uv = input.uv;" : ""}
-    ${d.hasTex1 ? "out.uv1 = input.uv1;" : ""}
+${texCoordBody}
     ${clipVsBody}
     // Pre-transformed vertex fog reads the factor the app wrote into specular alpha, which
     // FFP lighting leaves alone (it replaces the specular RGB only) — so take it from the
@@ -5408,29 +5989,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     return out;
 }
 
-fn ffpStageArg(sel: u32, texC: vec4<f32>, cur: vec4<f32>, diff: vec4<f32>, tf: vec4<f32>) -> vec4<f32> {
-    // D3DTA base selector (modifier bits D3DTA_COMPLEMENT/ALPHAREPLICATE handled below).
-    let base = sel & 0xfu;
-    var c = diff;                          // 0 = DIFFUSE (also 4 = SPECULAR fallback)
-    if (base == 1u) { c = cur; }           // 1 = CURRENT (stage 0: current == diffuse)
-    if (base == 2u) { c = texC; }          // 2 = TEXTURE
-    if (base == 3u) { c = tf; }            // 3 = TFACTOR
-    if ((sel & 0x10u) != 0u) { c = vec4<f32>(1.0) - c; }         // D3DTA_COMPLEMENT
-    if ((sel & 0x20u) != 0u) { c = vec4<f32>(c.a, c.a, c.a, c.a); } // D3DTA_ALPHAREPLICATE
-    return c;
-}
-
-fn ffpStageOp(op: u32, a1: vec4<f32>, a2: vec4<f32>, fallback: vec4<f32>) -> vec4<f32> {
-    if (op == 2u) { return a1; }                        // SELECTARG1
-    if (op == 3u) { return a2; }                        // SELECTARG2
-    if (op == 4u) { return a1 * a2; }                   // MODULATE
-    if (op == 5u) { return a1 * a2 * 2.0; }             // MODULATE2X
-    if (op == 6u) { return a1 * a2 * 4.0; }             // MODULATE4X
-    if (op == 7u) { return a1 + a2; }                   // ADD
-    if (op == 8u) { return a1 + a2 - vec4<f32>(0.5); }  // ADDSIGNED
-    if (op == 13u) { return a1 * a1.a + a2 * (1.0 - a1.a); } // BLENDTEXTUREALPHA (a1=tex)
-    return fallback;
-}
+${emitFfpCombinerWgsl(unhandledOpMagenta() ? "vec4<f32>(1.0, 0.0, 1.0, 1.0)" : "dst")}
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
@@ -5438,7 +5997,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let _diff = input.color;
     var _c: vec4<f32> = _diff;
 ${stageBody}
-    ${d.lit ? "_c = vec4<f32>(clamp(_c.rgb + input.specular, vec3<f32>(0.0), vec3<f32>(1.0)), _c.a);" : ""}
+    ${d.lit ? "_c = vec4<f32>(clamp(_c.rgb + input.specular.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), _c.a);" : ""}
     ${alphaTestSnippet(d.alphaTest, "_c.a")}
     if (u.fogParams.w > 0.0) { _c = vec4<f32>(mix(_c.rgb, u.fogColor.rgb, input.fog), _c.a); }
     return _c;
@@ -5446,7 +6005,8 @@ ${stageBody}
 `;
 }
 
-function buildShader(fvf: number, alphaTest: AlphaTest | null = null, litRequested = false, stageCount = 1): string {
+function buildShader(fvf: number, alphaTest: AlphaTest | null = null, litRequested = false, stageCount = 1,
+                     texGen = false): string {
     const f = parseFvf(fvf);
     const lit = litRequested && !f.hasRhw;
 
@@ -5462,6 +6022,7 @@ function buildShader(fvf: number, alphaTest: AlphaTest | null = null, litRequest
         hasRhw: f.hasRhw,
         hasTex: f.hasTex,
         hasTex1: f.hasTex1,
+        texGen,
         stageCount,
         lit,
         colorExpr: f.hasColor ? "unpackColor(input.color)" : "vec4<f32>(1.0, 1.0, 1.0, 1.0)",
@@ -5612,6 +6173,8 @@ function buildShaderFromDecl(
      *  vertices into one buffer passes {0}: the pipeline must declare exactly the buffers
      *  the draw binds, or WebGPU rejects it. */
     streamAllow: ReadonlySet<number> | null = null,
+    /** Some active stage generates its own texture coordinates — see emitFfpShader.texGen. */
+    texGen = false,
 ): {
     wgsl: string;
     /** One layout per stream slot, indexed by stream number; null for slots the
@@ -5715,6 +6278,7 @@ function buildShaderFromDecl(
         hasRhw: isRHW,
         hasTex,
         hasTex1,
+        texGen,
         stageCount,
         lit,
         colorExpr,
@@ -5723,5 +6287,5 @@ function buildShaderFromDecl(
         alphaTest,
     });
 
-    return { wgsl, buffers, hasTexture: hasTex };
+    return { wgsl, buffers, hasTexture: hasTex || texGen };
 }
