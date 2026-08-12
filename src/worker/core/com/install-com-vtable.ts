@@ -2,7 +2,7 @@ import { Process } from "../process";
 import { ThunkImplementation } from "../thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../logger";
 import { Mem } from "../memory/mem-accessor";
-import { verifyComVtableSlot } from "./com-memory";
+import { verifyComVtableSlot, registerComVtableOwner } from "./com-memory";
 import { writeGuestCode } from "../memory/guest-code";
 
 export interface ComVtableMethod {
@@ -84,6 +84,7 @@ export function installComVtable(process: Process, options: InstallComVtableOpti
     }
 
     process.dispatcher.applyPendingRegistrations();
+    registerComVtableOwner(vtableAddr, moduleName, logLabel);
 
     const releaseAddr = stubDll.exportTable.get(
         methods.find((m) => m.name.toLowerCase().includes("release") && !m.name.toLowerCase().includes("tlibattr") && !m.name.toLowerCase().includes("typeattr"))?.name.toLowerCase()

@@ -3,6 +3,8 @@ import { generateModuleVTables } from "../codegen";
 import { Process } from "../../core/process";
 import { Logger, LogCategory } from "../../core/logger";
 import { writeGuestCode } from "../../core/memory/guest-code";
+import { registerComVtableOwner } from "../../core/com/com-memory";
+import { ensureReleasedComTrap } from "../../core/com/released-com-trap";
 
 export type VTableInfo = {
     address: number;
@@ -81,8 +83,14 @@ export function createVTablesFromDescriptor(
         const firstMethodAddr = updatedExportTable.get(firstMethodName);
         Logger.verbose(LogCategory.COM, `Created vtable ${vtableSpec.name} at 0x${vtableAddr.toString(16)}, first method (${firstMethodName}) at 0x${firstMethodAddr?.toString(16) || 'unknown'}`);
 
+        // A COM block is only ever recycled within its owning module (com-memory.ts),
+        // and the released-object trap names the interface — both keyed off the vtable.
+        registerComVtableOwner(vtableAddr, module.name, vtableSpec.name);
+
         vtables[vtableSpec.name] = { address: vtableAddr, size: vtableSpec.methods.length };
     }
+
+    ensureReleasedComTrap(process);
 
     // Apply any pending registrations now that stubs are created
     // NOTE: This is called BEFORE exports are registered in dispatcher (emulator.worker.ts:556)

@@ -22,7 +22,7 @@ import { dmusicModule } from "../api/dmusic.api";
 import { InterfaceRegistry } from "../core/com/interface-registry";
 import { BaseComObject, ComObjectFactory } from "../core/com/base-com-object";
 import { SystemResourceProvider } from "../core/resources/system-resource-provider";
-import { allocateComObject, freeComObject } from "../core/com/com-memory";
+import { allocateComObject } from "../core/com/com-memory";
 
 const S_OK = 0;
 const S_FALSE = 1;
@@ -70,20 +70,17 @@ function bytesToGuid(b: Uint8Array): string {
  * are strict extensions, so every slot the older interface knows about lines up.
  */
 abstract class DMusicObject extends BaseComObject {
-    /** The guest block `emit` handed out; the object owns it until its last Release. */
+    /** The guest block `emit` handed out; `emit` also maps it to this handle, which makes
+     *  SystemResourceProvider.unregisterComObject the single owner of its free. */
     guestAddress = 0;
     protected abstract legacyIid(): string;
     protected queryAdditionalInterfaces(riid: string): string | null {
         return riid === this.legacyIid() ? riid : null;
     }
     protected destroy(): void {
-        if (this.guestAddress && comMemory) freeComObject(comMemory, this.guestAddress);
         this.guestAddress = 0;
     }
 }
-
-/** The system-object pool `emit` allocates from, so destroy() can give the block back. */
-let comMemory: { freeSystemBlock(addr: number, size: number): void } | null = null;
 
 class DirectMusicLoaderObject extends DMusicObject {
     constructor(vtableAddress: number) { super(IID_IDirectMusicLoader8, vtableAddress); }
@@ -141,7 +138,6 @@ export class DMusic implements IModule {
 
     initialize(process: Process): void {
         this.process = process;
-        comMemory = process.memory;
 
         InterfaceRegistry.getInstance().registerFromModuleDescriptor(dmusicModule);
         this.vtables = createVTablesFromDescriptor(this.process, dmusicModule);
