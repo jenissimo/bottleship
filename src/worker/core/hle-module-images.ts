@@ -32,6 +32,16 @@ let exportsByName = new Map<string, Map<string, number>>();
 let ordinalsByName = new Map<string, Map<number, number>>();
 let owner: unknown = null;
 let ownerGeneration = -1;
+/**
+ * The modules this process actually LOADED, as opposed to the ones that merely have a
+ * slot. Materialization is eager over every HLE'd DLL, so the arena holds images no real
+ * process would contain — a 2001 game gets an MSVCR90.DLL image it never linked. Code
+ * that answers a module WALK (VirtualQuery over the address space, then ask each base for
+ * its name) must consult this, or it invents loaded modules: SmartHeap's shw32.dll walks
+ * exactly like that, concludes the app links a foreign MSVC runtime, and refuses to start.
+ * Populated by the name -> base handouts, which is what "the process asked for it" means.
+ */
+let loadedNames = new Set<string>();
 
 /** Canonical module key: what LoadLibrary("DDRAW.DLL") and the slot table agree on. */
 export function canonicalHleModuleName(dllName: string): string {
@@ -46,6 +56,33 @@ export function canonicalHleModuleName(dllName: string): string {
 export function hleImageBase(dllName: string): number | undefined {
     const slot = slotByName.get(canonicalHleModuleName(dllName));
     return slot === undefined ? undefined : hleImageBaseForSlot(slot);
+}
+
+/**
+ * Slots are keyed by the name they were planned under, which for an aliased flavour
+ * (msvcr90 -> msvcrt) is NOT the canonical name — msvcr90 owns a slot of its own. Both
+ * spellings must therefore be tracked, or marking "msvcrt" loaded would silently vouch
+ * for every CRT flavour's image.
+ */
+function slotKeys(dllName: string): string[] {
+    const raw = normalizeDllBaseName(dllName);
+    const canonical = canonicalHleModuleName(dllName);
+    return raw === canonical ? [canonical] : [raw, canonical];
+}
+
+/**
+ * Record an HLE'd DLL as loaded: its imports were bound into a PE image, or the guest
+ * asked for its handle by name. Deliberately NOT inside hleImageBase — our own warmup
+ * loops resolve every known module's base, and marking there would vouch for all of them.
+ */
+export function markHleModuleLoaded(dllName: string): void {
+    for (const key of slotKeys(dllName)) if (slotByName.has(key)) loadedNames.add(key);
+}
+
+/** Has this process loaded the module, or does it only have an image? See loadedNames. */
+export function isHleModuleLoaded(dllName: string): boolean {
+    const raw = normalizeDllBaseName(dllName);
+    return loadedNames.has(slotByName.has(raw) ? raw : canonicalHleModuleName(dllName));
 }
 
 /** Reverse of hleImageBase, for logging and handle->name resolution. */
@@ -95,6 +132,7 @@ export function materializeHleModuleImages(process: any): void {
     slotByName = new Map();
     exportsByName = new Map();
     ordinalsByName = new Map();
+    loadedNames = new Set();
 
     // Pinned names first, then everything else the APIRegistry knows, sorted so the
     // assignment does not depend on descriptor load order.

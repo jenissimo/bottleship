@@ -12,7 +12,7 @@ import { encodeAnsi } from '../../codepage-utils';
 import { resolveThunkedDllAlias } from '../../../core/dll-aliases';
 import { FORCE_NATIVE_PACKAGE_LOAD, isUnderSystemDirectory } from '../../../core/hle-system-catalog';
 import { findDllRule } from '../../../core/dll-rules';
-import { hleImageBase, hleModuleNameByBase } from '../../../core/hle-module-images';
+import { hleImageBase, hleModuleNameByBase, isHleModuleLoaded, markHleModuleLoaded } from '../../../core/hle-module-images';
 import { getProcAddressRegistry, type GetProcResolution } from '../../../core/diagnostics/get-proc-address-registry';
 import { SILENT_STUBS } from '../../../core/diagnostics/api-census';
 import { resolveHleExportAddress } from '../../../core/thunking/export-resolver';
@@ -141,22 +141,34 @@ const EXE_GETPROC_FORWARD_MAP: Record<string, Array<{ dll: string; name: string 
     "_memsetpatching@4": [{ dll: "mss32", name: "_MemSetPatching@4" }],
 };
 
-const EXE_DEBUG_CRT_PROBE_NAMES = new Set([
-    "_malloc_dbg",
-    "_calloc_dbg",
-    "_realloc_dbg",
-    "_free_dbg",
-    "_strdup_dbg",
-    "_msize_dbg",
-    "_crtdbgreport",
-    "_crtdbgreportw",
-    "_crtsetdbgflag",
-    "_crtcheckmemory",
-    "_crtisvalidheappointer",
-    "_crtdumpmemoryleaks",
-    "_assert",
-    "_wassert",
+/**
+ * Exports that live ONLY in the debug CRT (msvcrtd.dll / msvcr##d.dll). One msvcrt HLE
+ * implementation serves every CRT flavour, so without this a GetProcAddress probe finds
+ * them on a RELEASE CRT module and the caller concludes the process links a debug runtime
+ * — SmartHeap (shw32.dll) walks the loaded modules doing exactly that probe and refuses to
+ * start. IAT binding is untouched: a binary that really links the debug CRT imports these
+ * by name and still gets the handler. _assert/_wassert are deliberately absent — the
+ * release CRT exports both.
+ */
+const DEBUG_CRT_ONLY_EXPORTS = new Set([
+    "_malloc_dbg", "_calloc_dbg", "_realloc_dbg", "_free_dbg", "_expand_dbg",
+    "_strdup_dbg", "_wcsdup_dbg", "_msize_dbg", "_recalloc_dbg", "_aligned_malloc_dbg",
+    "_crtdbgreport", "_crtdbgreportw", "_crtsetdbgflag", "_crtcheckmemory",
+    "_crtisvalidheappointer", "_crtisvalidpointer", "_crtismemoryblock",
+    "_crtdumpmemoryleaks", "_crtsetreportmode", "_crtsetreportfile", "_crtsetreporthook",
+    "_crtsetreporthook2", "_crtsetallochook", "_crtsetdumpclient",
+    "_crtmemcheckpoint", "_crtmemdifference", "_crtmemdumpstatistics",
+    "_crtmemdumpallobjectssince", "_crtdopostterminate", "_crtdbgbreak",
 ]);
+
+/** Release CRT flavours — the ones that must NOT answer a DEBUG_CRT_ONLY_EXPORTS probe. */
+const RELEASE_CRT_MODULE_RE = /^(crtdll|msvcrt|msvcr\d+|msvcp\d+)$/;
+
+/**
+ * The same probe aimed at the EXE's own base. An exe never exports these, so the two
+ * the release CRT does export (_assert/_wassert) belong here as well.
+ */
+const EXE_DEBUG_CRT_PROBE_NAMES = new Set([...DEBUG_CRT_ONLY_EXPORTS, "_assert", "_wassert"]);
 
 /**
  * Get pseudo-base address for a thunked DLL
@@ -166,7 +178,11 @@ function getThunkedModuleName(value: string): string {
 }
 
 function getThunkedDllBase(dllName: string): number | undefined {
-    return hleImageBase(getThunkedModuleName(dllName));
+    const thunkedName = getThunkedModuleName(dllName);
+    const base = hleImageBase(thunkedName);
+    // Asking for a module by name IS loading it, as far as the loader list is concerned.
+    if (base !== undefined) markHleModuleLoaded(thunkedName);
+    return base;
 }
 
 function getDllBaseName(value: string): string {
@@ -252,8 +268,11 @@ function resolveModuleFilename(hModule: number): { path: string; found: boolean 
         }
     }
 
+    // Only for a module the process actually loaded. The image arena is materialized for
+    // every HLE'd DLL, so naming any base that lands in it turns a memory walk into a
+    // loader-list enumeration and reports modules the app never linked.
     const hleName = hleModuleNameByBase(h);
-    if (hleName) {
+    if (hleName && isHleModuleLoaded(hleName)) {
         const path = formatSystemDllPath(hleName);
         handleToPathCache.set(h, path);
         return { path, found: true };
@@ -1236,7 +1255,11 @@ function initModuleFunctions(): void {
             if (address === 0 && hModule !== 0) {
                 const dllName = hleModuleNameByBase(hModule) ?? null;
 
-                if (dllName) {
+                const debugCrtProbeOnRelease = dllName !== null
+                    && DEBUG_CRT_ONLY_EXPORTS.has(procKey)
+                    && RELEASE_CRT_MODULE_RE.test(dllName);
+
+                if (dllName && !debugCrtProbeOnRelease) {
                     const dataAddr = dispatcher.thunkGenerator?.getDataExportAddress(dllName, procName);
                     if (dataAddr !== undefined) {
                         address = dataAddr >>> 0;
@@ -1330,7 +1353,10 @@ export function registerFastPathModuleFunctions(dispatcher: any): void {
         if (appDirDllShadowsHle(name) || requestsSystemCopyOfAppDirDll(name)) return null;
         if (findDisabledDllRule(name) || findDisabledDllRule(thunkedName)) return null;
         const base = hleImageBase(thunkedName);
-        if (base !== undefined) return base;
+        if (base !== undefined) {
+            markHleModuleLoaded(thunkedName);
+            return base;
+        }
         return null; // Fall through to slow path for real DLLs, exe name, etc.
     };
 

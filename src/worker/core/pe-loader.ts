@@ -2,6 +2,7 @@
 // Portably parses Win32 PE files and loads them into emulator memory
 
 import { ThunkGenerator } from './thunking/thunk-generator';
+import { markHleModuleLoaded } from './hle-module-images';
 import { deriveStackCleanupFromMangledName } from './thunking/msvc-mangling';
 import { APIRegistry } from './api-registry';
 import { System } from './system';
@@ -1347,6 +1348,9 @@ export class PELoader {
                     stubInfos.push({ name, argCount, stackCleanupBytes, callingConvention });
                 }
 
+                // Binding a DLL's imports is the process LOADING it — the line between the modules
+                // it really has and the rest of the eagerly materialized image arena.
+                markHleModuleLoaded(dllName);
                 const stubDll = this.thunkGenerator.generateStubDll(dllName, stubInfos);
 
                 // One-time inline x86 stub generation for kernel32!HeapAlloc/HeapFree.
@@ -1551,6 +1555,9 @@ export class PELoader {
                         return { name, argCount: 0, stackCleanupBytes: 0, callingConvention: 'stdcall' };
                     });
 
+                    // Binding a DLL's imports is the process LOADING it — the line between the
+                    // modules it really has and the rest of the eagerly materialized image arena.
+                    markHleModuleLoaded(dllName);
                     const stubDll = this.thunkGenerator.generateStubDll(dllName, stubInfos);
 
                     // Patch IAT with stub addresses
@@ -1730,6 +1737,9 @@ export class PELoader {
             return { name, argCount, stackCleanupBytes, callingConvention };
         });
 
+        // Binding a DLL's imports is the process LOADING it — the line between the modules
+        // it really has and the rest of the eagerly materialized image arena.
+        markHleModuleLoaded(dllName);
         const stubDll = this.thunkGenerator.generateStubDll(dllName, stubInfos);
 
         // Patch IAT
