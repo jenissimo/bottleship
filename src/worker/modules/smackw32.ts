@@ -38,9 +38,9 @@ const SMACK_STRUCT_SIZE = 0x500;
 const SMACKBUF_STRUCT_SIZE = 0x450;
 const SMACK_FROM_HANDLE = 0x1000;
 
-/** SmackDoFrame return flags (RAD Smacker SDK). */
-const SMACKFRM_NEWPAL = 0x01;
-const SMACKFRM_NEWPIX = 0x04;
+/** HSMACK fields the caller polls between frames (offsets from the shipped smackw32.dll). */
+const SMACK_NEW_PALETTE = 0x68;   // set by the frame-prepare step, cleared when the frame has no palette
+const SMACK_PALETTE = 0x6c;       // 256 x RGB triples
 
 /**
  * Detect destination bpp from pitch vs video width.
@@ -155,8 +155,8 @@ interface SmackSession {
     internalBuf: number;  // guest address of internal pixel buffer (allocated when SmackToBuffer buf=0)
     /** SmackToBufferRect: one full-frame dirty rect pending after DoFrame. */
     pendingBufferRect: boolean;
-    /** Last-frame SmackDoFrame change flags for SmackToBufferRect arg. */
-    lastDoFrameFlags: number;
+    /** Current frame is already decoded by the prepare step; DoFrame must not decode again. */
+    prepared: boolean;
     /** RGB fingerprint (256×3) to detect real palette changes for HSMACK+0x68. */
     paletteRgb: Uint8Array | null;
     paletteDirty: boolean;
@@ -256,11 +256,6 @@ export class SmackW32 implements IModule {
             if (buf.pixelBuf === pixelBuf) return buf;
         }
         return null;
-    }
-
-    /** Storm SmackBuffer path: DoFrame returns 0 and rects come from SmackToBufferRect. */
-    private usesSmackBufferRectPath(s: SmackSession): boolean {
-        return this.findBufferForSmack(s.guestPtr) !== null;
     }
 
     private resolveHsmackFromRectHandle(handle: number): number {
@@ -429,10 +424,9 @@ export class SmackW32 implements IModule {
      * The decoder palette is 256 × 4 bytes BGRA; we write RGB (matching real smackw32.dll).
      */
     private _writePaletteToStruct(mem: Uint8Array, smk: number, bgraPalette: Uint8Array): void {
-        const PALETTE_OFFSET = 0x6c;
         for (let i = 0; i < 256; i++) {
             const si = i * 4; // BGRA
-            const di = smk + PALETTE_OFFSET + i * 3;
+            const di = smk + SMACK_PALETTE + i * 3;
             mem[di] = bgraPalette[si + 2]; // R ← from BGRA[2]
             mem[di + 1] = bgraPalette[si + 1]; // G ← from BGRA[1]
             mem[di + 2] = bgraPalette[si];     // B ← from BGRA[0]
@@ -497,6 +491,45 @@ export class SmackW32 implements IModule {
             }
         }
         return null;
+    }
+
+    /**
+     * Publish the current frame's palette into the HSMACK struct: RGB triples at
+     * +0x6c and the NewPalette flag at +0x68 (1 only when the palette actually
+     * differs from the one the caller last consumed, matching the real library's
+     * "palette record belongs to a frame we haven't handed over yet" test).
+     */
+    private publishPalette(s: SmackSession): void {
+        const mem = this.getMemory();
+        const palette = this._getValidPalette(s);
+        if (!palette) {
+            this.writeU32(mem, s.guestPtr + SMACK_NEW_PALETTE, 0);
+            return;
+        }
+        this._writePaletteToStruct(mem, s.guestPtr, palette);
+        this.writeU32(mem, s.guestPtr + SMACK_NEW_PALETTE, this.notePaletteChange(s, palette) ? 1 : 0);
+    }
+
+    /**
+     * Decode the current frame and publish its palette — the real library's
+     * frame-prepare step, which runs in SmackOpen, SmackNextFrame and SmackGoto,
+     * NOT in SmackDoFrame. Callers read NewPalette *before* the DoFrame that draws
+     * the frame: Storm's SVidPlayContinue builds its 64K palette-blend table in that
+     * window and the blitter it generates dereferences the table on the very next
+     * blit, so a palette published only at DoFrame arrives one frame too late and
+     * the first blit runs through a NULL table.
+     */
+    private prepareFrame(s: SmackSession): boolean {
+        const startMs = performance.now();
+        const decoded = videoEngine.doFrame(s.engineHandle);
+        const elapsed = performance.now() - startMs;
+        // Credit heavy decode time back to the game clock (no x86 ran during it).
+        if (elapsed > 1) {
+            TimeService.getInstance().advanceVirtualTime(elapsed);
+        }
+        if (!decoded) return false;
+        this.publishPalette(s);
+        return true;
     }
 
     /**
@@ -821,13 +854,16 @@ export class SmackW32 implements IModule {
                         audioCtrl: null, lastPlayCursor: 0,
                         audioWrapCount: 0, audioBaselineMs: -1,
                         frameDecodeCount: 0, internalBuf: 0,
-                        pendingBufferRect: false, lastDoFrameFlags: 0,
+                        pendingBufferRect: false, prepared: false,
                         paletteRgb: null, paletteDirty: false,
                         explicitDdrawSurface: null,
                         explicitGlideSurfacePtr: 0,
                     };
                     this.writeSmackHeader(this.getMemory(), guestPtr, s);
                     this.sessions.set(guestPtr, s);
+                    // Real SmackOpen prepares frame 0 before returning, so its palette
+                    // and NewPalette are live on the caller's very first poll.
+                    s.prepared = this.prepareFrame(s);
 
                     // Store audio SAB for volume/pan control via SmackVolumePan
                     if (info.hasAudio) {
@@ -887,13 +923,14 @@ export class SmackW32 implements IModule {
                     audioCtrl: null, lastPlayCursor: 0,
                     audioWrapCount: 0, audioBaselineMs: -1,
                     frameDecodeCount: 0, internalBuf: 0,
-                    pendingBufferRect: false, lastDoFrameFlags: 0,
+                    pendingBufferRect: false, prepared: false,
                     paletteRgb: null, paletteDirty: false,
                     explicitDdrawSurface: null,
                     explicitGlideSurfacePtr: 0,
                 };
                 this.writeSmackHeader(this.getMemory(), guestPtr, s);
                 this.sessions.set(guestPtr, s);
+                s.prepared = this.prepareFrame(s);
 
                 // Store audio SAB for volume/pan control via SmackVolumePan
                 if (info.hasAudio) {
@@ -964,14 +1001,10 @@ export class SmackW32 implements IModule {
             if (s) {
                 if (s.eof) return 0;
 
-                const startMs = performance.now();
-                const ok = videoEngine.doFrame(s.engineHandle);
-                const decodeElapsed = performance.now() - startMs;
-
-                // Restore "stolen" virtual time spent in heavy decoding back to the game clock
-                if (decodeElapsed > 1) {
-                    TimeService.getInstance().advanceVirtualTime(decodeElapsed);
-                }
+                // The frame is normally already decoded by the prepare step (open / next /
+                // goto); decode here only for a caller that drives DoFrame on its own.
+                const ok = s.prepared || this.prepareFrame(s);
+                s.prepared = false;
 
                 s.lastFrameMs = performance.now();
                 s.frameDecodeCount++;
@@ -994,7 +1027,7 @@ export class SmackW32 implements IModule {
                     videoEngine.gotoFrame(s.engineHandle, 0);
                     s.audioBaselineMs = -1;    // re-baseline audio pacing for the new pass
                     s.frameDecodeCount = 1;    // about to (re)decode frame 0
-                    decoded = videoEngine.doFrame(s.engineHandle);
+                    decoded = this.prepareFrame(s);
                     if (decoded) {
                         const m = this.getMemory();
                         this.writeU32(m, smk + 20, 0);
@@ -1014,23 +1047,8 @@ export class SmackW32 implements IModule {
                     return 0;
                 }
 
-                // Update palette in HSMACK struct after each frame
-                const validPalette = this._getValidPalette(s);
-                let doFrameFlags = SMACKFRM_NEWPIX;
-                if (validPalette) {
-                    const m2 = this.getMemory();
-                    this._writePaletteToStruct(m2, smk, validPalette);
-                    if (this.notePaletteChange(s, validPalette)) {
-                        doFrameFlags |= SMACKFRM_NEWPAL;
-                        this.writeU32(m2, smk + 0x68, 1);
-                    } else {
-                        this.writeU32(m2, smk + 0x68, 0);
-                    }
-                } else {
-                    this.writeU32(this.getMemory(), smk + 0x68, 0);
-                }
-
-                s.lastDoFrameFlags = doFrameFlags;
+                // The palette was published by the prepare step; the caller has already
+                // read NewPalette for this frame, so do not disturb it here.
 
                 // Copy decoded pixels to guest memory if SmackToBuffer set a destination
                 if (s.destBuf !== 0) {
@@ -1058,11 +1076,11 @@ export class SmackW32 implements IModule {
                     explicitGlideSink: null,
                 });
 
-                // Storm SmackBuffer path: DoFrame==0 triggers FUN_6ffde580 → SmackToBufferRect loop.
-                if (this.usesSmackBufferRectPath(s)) {
-                    return 0;
-                }
-                return doFrameFlags;
+                // Real SmackDoFrame returns a frame-SKIP flag, not change flags: non-zero
+                // means the library dropped this frame to keep up, and callers suppress
+                // their blit for it. We never drop, so the answer is always 0. Change
+                // notifications reach the caller through HSMACK+0x68 / SmackToBufferRect.
+                return 0;
             } else {
                 // Unknown handle (game-allocated struct or fakeHandle from a previous session).
                 // Patch Frames=1 at +12 so game's loop (FrameNum < Frames-1) doesn't wrap to 0xFFFFFFFF.
@@ -1113,6 +1131,9 @@ export class SmackW32 implements IModule {
                     this.writeU32(m, smk + 884, info.currentFrame); // real SDK FrameNum offset
                     Logger.verbose(LogCategory.SYSTEM, `SmackW32: NextFrame → ${info.currentFrame}/${s.frameCount}`);
                 }
+                // Prepare the frame we just advanced to, so its palette (and NewPalette)
+                // are readable before the DoFrame that draws it.
+                s.prepared = this.prepareFrame(s);
             } else {
                 // fakeHandle or unknown: increment FrameNum at +20 so game's loop exits
                 const m = this.getMemory();
@@ -1277,16 +1298,18 @@ export class SmackW32 implements IModule {
             return 0;
         };
 
-        // в”Ђв”Ђ SmackToBufferRect(handle, SmackDoFrameReturn) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
-        // Real API: SmackToBufferRect(hSmackOrBuf, changeFlags).
-        // Storm loops while return != 0, reading dirty rects from HSMACK+0x380..+0x38c.
+        // в”Ђв”Ђ SmackToBufferRect(HSMACK, SmackSurface) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+        // A dirty-rect ITERATOR, not a status call: it renders one changed rectangle
+        // into the SmackToBuffer destination, leaves that rect at HSMACK+0x380..+0x38c
+        // (x, y, w, h) and returns 1; 0 means the frame's rect list is exhausted, which
+        // is what ends the caller's `while (SmackToBufferRect(...))` loop.
         this.exports["_SmackToBufferRect@8"] = (_ctx, _mem, args) => {
             const handle = args[0];
             const hSmack = this.resolveHsmackFromRectHandle(handle);
             const s = hSmack ? this.sessions.get(hSmack) : undefined;
             if (!s || !s.pendingBufferRect) return 0;
             s.pendingBufferRect = false;
-            return s.lastDoFrameFlags || SMACKFRM_NEWPIX;
+            return 1;
         };
 
         // в”Ђв”Ђ SmackGoto(HSMACK, frame) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
@@ -1297,6 +1320,7 @@ export class SmackW32 implements IModule {
             if (s) {
                 videoEngine.gotoFrame(s.engineHandle, frame);
                 s.eof = false; // seeking resets EOF state
+                s.prepared = this.prepareFrame(s);
             }
             const m = this.getMemory();
             if (m) {
