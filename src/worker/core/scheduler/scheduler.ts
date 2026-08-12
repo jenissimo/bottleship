@@ -40,6 +40,7 @@ import { SyncObjectManager } from './sync-objects';
 import { WaitEngine } from './wait-engine';
 import { CallbackCoordinator } from './callback-coord';
 import { TARGET_INSN_PER_MS } from './timing';
+import { setFsBase } from './fs-base';
 import { framePacer } from '../frame-pacer';
 import { frameVarianceDiagnostics } from '../frame-variance-diagnostics';
 import {
@@ -1585,8 +1586,8 @@ export class Scheduler {
         }
 
         // Update FS segment for new thread's TEB
-        if (next.tebAddress > 0 && cpu.segment_offsets) {
-            cpu.segment_offsets[4] = next.tebAddress;
+        if (next.tebAddress > 0) {
+            setFsBase(cpu, next.tebAddress);
         }
 
         // Sync thread data to WASM hypercall page
@@ -4321,8 +4322,8 @@ export class Scheduler {
         let tebAddress = 0;
         if (this.process.memory && stackTop > 0) {
             tebAddress = this.tebManager.allocateTeb(threadId, stackBase, stackTop, this.process.memory);
-            if (tebAddress > 0 && cpu.segment_offsets) {
-                cpu.segment_offsets[4] = tebAddress;
+            if (tebAddress > 0) {
+                setFsBase(cpu, tebAddress);
             }
         }
 

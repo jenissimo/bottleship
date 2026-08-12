@@ -11,7 +11,7 @@ export function createBootloader(
     dllInits: DllInitEntry[] = []
 ): { code: Uint8Array; loadAddress: number; startAddress: number } {
     const loadAddress = 0x7c00;
-    const gdtAddress = 0x7e00;
+    const gdtAddress = GDT_ADDRESS;
     // IDT immediately after GDT (32 bytes for 4 entries)
     const idtAddress = gdtAddress + 32; // 0x7E20
     const idtSize = 256 * 8; // 2048 bytes
@@ -449,17 +449,28 @@ function createGDTBytes(): Uint8Array {
     view.setUint32(16, 0x0000ffff, true);
     view.setUint32(20, 0x00cf9200, true);
 
-    // Entry 3 (0x18): FS segment - Data 32-bit, Base=0 (updated per-thread via segment_offsets), Limit=4GB
+    // Entry 3 (0x18): FS segment - Data 32-bit, Limit=4GB. Base starts at 0 and is
+    // reprogrammed per-thread by setFsBase() (scheduler/fs-base.ts), which patches THIS
+    // descriptor as well as cpu.segment_offsets[4]. The descriptor is what the CPU
+    // re-reads whenever guest code reloads the FS selector (`pop fs`, an ordinary Borland/
+    // Delphi RTL epilogue idiom) — a base of 0 there silently sends every later fs:[…]
+    // to linear 0. Limit stays 4GB rather than the one TEB page: narrowing it would be
+    // closer to real Windows but would #GP code that uses large fs: offsets.
     view.setUint32(24, 0x0000ffff, true);
     view.setUint32(28, 0x00cf9200, true);
 
     return gdt;
 }
 
+/** Guest linear address of the GDT the bootloader lgdt's. */
+export const GDT_ADDRESS = 0x7e00;
+/** Entry 3 (selector 0x18) — the FS descriptor. Base fields live at +2/+3, +4 and +7. */
+export const GDT_FS_DESCRIPTOR_ADDRESS = GDT_ADDRESS + 3 * 8; // 0x7e18
+
 export function createGDT(): {
     gdt: Uint8Array;
     gdtAddress: number;
     gdtSize: number;
 } {
-    return { gdt: createGDTBytes(), gdtAddress: 0x7e00, gdtSize: 32 };
+    return { gdt: createGDTBytes(), gdtAddress: GDT_ADDRESS, gdtSize: 32 };
 }

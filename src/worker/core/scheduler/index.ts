@@ -14,3 +14,4 @@ export { WaitEngine } from './wait-engine';
 export { TimerWheel, type TimerEntry } from './timer-wheel';
 export { CallbackCoordinator, type QueuedCallback } from './callback-coord';
 export { Scheduler } from './scheduler';
+export { setFsBase, readFsDescriptorBase } from './fs-base';
