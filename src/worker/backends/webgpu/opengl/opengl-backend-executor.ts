@@ -126,6 +126,11 @@ export class OpenGLBackendExecutor {
     private depthView: GPUTextureView | null = null;
     private offscreenSize: { width: number; height: number } | null = null;
     private offscreenInitialized = false;
+    /** Depth/stencil survives SwapBuffers exactly as GL's is: only glClear resets it.
+     *  Quake-lineage engines run gl_ztrick — alternate frames swap the depth range and
+     *  the compare function INSTEAD of clearing, so a per-frame clear drops every
+     *  fragment of the GEQUAL frame. */
+    private depthStencilInitialized = false;
     /** Last frame's default-framebuffer resolution (the GL drawable). */
     private presentSourceW = 0;
     private presentSourceH = 0;
@@ -158,6 +163,11 @@ export class OpenGLBackendExecutor {
     private readonly uniformScratchBuffer = new ArrayBuffer(UNIFORM_BLOCK_SIZE);
     private readonly uniformScratchF32 = new Float32Array(this.uniformScratchBuffer);
     private readonly uniformScratchU32 = new Uint32Array(this.uniformScratchBuffer);
+
+    /** Current draw's glDepthRange, as WebGPU takes it (see readDepthRange). */
+    private depthRangeMin = 0;
+    private depthRangeMax = 1;
+    private depthRangeReversed = false;
 
     private readonly samplerIds = new WeakMap<GPUSampler, number>();
     private readonly textureViewIds = new WeakMap<GPUTextureView, number>();
@@ -222,8 +232,7 @@ export class OpenGLBackendExecutor {
         const encoder = device.createCommandEncoder();
         let renderPass: GPURenderPassEncoder | null = null;
         let colorHasContent = this.offscreenInitialized;
-        // Do not preserve depth/stencil across presents by default.
-        let depthStencilHasContent = false;
+        let depthStencilHasContent = this.depthStencilInitialized;
         let drawsIssued = 0;
 
         const endPass = (): void => {
@@ -358,7 +367,7 @@ export class OpenGLBackendExecutor {
                     const vpH = cmdVpH > 0 ? cmdVpH : renderH;
                     const vpX = I[i + CI_VP_X];
                     const vpY = renderH - I[i + CI_VP_Y] - vpH;
-                    pass.setViewport(vpX, vpY, vpW, vpH, F[f + CF_DEPTH_RANGE_NEAR], F[f + CF_DEPTH_RANGE_FAR]);
+                    pass.setViewport(vpX, vpY, vpW, vpH, this.depthRangeMin, this.depthRangeMax);
 
                     pass.setPipeline(pipeline);
                     if (stencilTest) {
@@ -422,9 +431,11 @@ export class OpenGLBackendExecutor {
                 false,
             );
             colorHasContent = true;
+            depthStencilHasContent = true;
         }
 
         this.offscreenInitialized = colorHasContent;
+        this.depthStencilInitialized = depthStencilHasContent;
 
         const targetView = context.getCurrentTexture().createView();
         this.blitOffscreenToCanvas(targetView, encoder, screenW, screenH);
@@ -616,6 +627,7 @@ export class OpenGLBackendExecutor {
 
         this.offscreenSize = { width, height };
         this.offscreenInitialized = false;
+        this.depthStencilInitialized = false;
     }
 
     private pruneTextureCache(textures: Map<number, GLTextureObject>): void {
@@ -1151,6 +1163,12 @@ export class OpenGLBackendExecutor {
         this.uniformScratchF32[18] = this.clamp01(F[f + CF_FOG_B]);
         this.uniformScratchF32[19] = this.clamp01(F[f + CF_FOG_A]);
 
+        // 80..84 — reversed glDepthRange (see readDepthRange): the sorted pair goes to
+        // setViewport, the mirroring happens here. writeUniforms runs before the
+        // setViewport that consumes the same read.
+        this.readDepthRange(F, f);
+        this.uniformScratchU32[20] = this.depthRangeReversed ? 1 : 0;
+
         queue.writeBuffer(this.uniformBuffer!, offset, this.uniformScratchBuffer, 0, UNIFORM_BLOCK_SIZE);
     }
 
@@ -1183,6 +1201,27 @@ export class OpenGLBackendExecutor {
 
         pass.setScissorRect(x, y, w, h);
         return true;
+    }
+
+    /**
+     * glDepthRange(near, far) as WebGPU can express it.
+     *
+     * GL clamps both to [0,1] and explicitly ALLOWS near > far (a reversed mapping);
+     * WebGPU's setViewport rejects minDepth > maxDepth and invalidates the whole command
+     * buffer, so the frame is dropped and the canvas shows an unwritten swap image. Hand
+     * setViewport the sorted pair and tell the vertex shader to mirror its normalized depth
+     * (t → 1-t), which reproduces GL's z_window bit for bit.
+     *
+     * Results land in depthRangeMin/Max/Reversed — a per-draw call, so no object per draw.
+     */
+    private readDepthRange(F: Float32Array, f: number): void {
+        const rawNear = F[f + CF_DEPTH_RANGE_NEAR];
+        const rawFar = F[f + CF_DEPTH_RANGE_FAR];
+        const near = this.clamp01(Number.isFinite(rawNear) ? rawNear : 0);
+        const far = this.clamp01(Number.isFinite(rawFar) ? rawFar : 1);
+        this.depthRangeReversed = near > far;
+        this.depthRangeMin = this.depthRangeReversed ? far : near;
+        this.depthRangeMax = this.depthRangeReversed ? near : far;
     }
 
     private encodeClearPass(
@@ -1354,6 +1393,7 @@ struct Uniforms {
     fogEnd: f32,            // 56..60
     _pad1: f32,             // 60..64
     fogColor: vec4f,        // 64..80
+    depthFlip: u32,         // 80..84
 };
 
 struct VertexIn {
@@ -1420,8 +1460,11 @@ fn computeFogFactor(mode: u32, density: f32, start: f32, end: f32, coord: f32) -
 fn vs_main(input: VertexIn) -> VertexOut {
     var out: VertexOut;
     // Pass clip-space coordinates — GPU handles perspective divide, clipping,
-    // and viewport transform. Remap Z from OpenGL [-w,w] to WebGPU [0,w].
-    out.position = vec4f(input.pos.x, input.pos.y, input.pos.z * 0.5 + input.pos.w * 0.5, input.pos.w);
+    // and viewport transform. Remap Z from OpenGL [-w,w] to WebGPU [0,w]; depthFlip
+    // mirrors it for a reversed glDepthRange, whose sorted pair the viewport carries.
+    let zHalf = input.pos.z * 0.5 + input.pos.w * 0.5;
+    let zOut = select(zHalf, input.pos.w - zHalf, uniforms.depthFlip != 0u);
+    out.position = vec4f(input.pos.x, input.pos.y, zOut, input.pos.w);
     out.color = input.color;
     out.uv0 = input.uv0;
     out.uv1 = input.uv1;
