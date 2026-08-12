@@ -44,6 +44,13 @@ export interface FaultRecord {
      * hint, not ground truth, when this is false.
      */
     eipTrusted?: boolean;
+    /**
+     * True when the #PF interrupt frame could NOT be read, so `eip` and `errorCode` are
+     * placeholder zeros rather than measurements. Without this the record is a confident
+     * lie — "EIP 0x0, faultAddr 0x0" reads as a NULL-call wild jump and sends the reader
+     * hunting a bug that isn't there. A fault report must be able to say "I don't know".
+     */
+    frameUnread?: boolean;
     /** Tail of the WinAPI call ring leading up to the fault (newest last). */
     recentCalls: string[];
     /** Guest ESP at the fault (above the #PF interrupt frame). */

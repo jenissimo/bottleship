@@ -3235,7 +3235,7 @@ export class ThunkDispatcher {
         // [0–4]  B8 ID ID ID ID  — MOV EAX, funcId  (keep)
         // [5]    E9               — JMP rel32         (was BA port high)
         // [6–9]  rel32            — trampolineAddr - (stubAddr + 10)
-        // [10–15] 90 90 90 90 90 90 — NOP padding
+        // [10–15] left as-is        — the original OUT + RET N (see below)
         let mem8 = this.cachedMem8;
         if (!mem8 || mem8.byteLength === 0) {
             this.updateMemoryCache();
@@ -3253,12 +3253,12 @@ export class ThunkDispatcher {
         mem8[stubAddr + 7]  = (rel32 >> 8)  & 0xFF;
         mem8[stubAddr + 8]  = (rel32 >> 16) & 0xFF;
         mem8[stubAddr + 9]  = (rel32 >> 24) & 0xFF;
-        mem8[stubAddr + 10] = 0x90;
-        mem8[stubAddr + 11] = 0x90;
-        mem8[stubAddr + 12] = 0x90;
-        mem8[stubAddr + 13] = 0x90;
-        mem8[stubAddr + 14] = 0x90;
-        mem8[stubAddr + 15] = 0x90;
+        // Bytes 10..15 (the original OUT + RET N) are left ALONE: unreachable through the
+        // JMP, but they are the exact sequence a guest PARKED IN THIS STUB'S OUT resumes
+        // into, and registration can happen during that very trap (a lazily bound export
+        // patches on its first call). NOPing the tail drops that guest through the arena
+        // into the NEXT stub's RET N — a different stack cleanup, so the caller's frame is
+        // silently skewed and its own return pops an argument instead of an address.
 
         // Drop the cached OUT-trap block so the new JMP bytes are re-compiled.
         const jitDirtied = invalidateGuestCode(stubAddr, 16);
@@ -3559,12 +3559,12 @@ export class ThunkDispatcher {
         mem8[stubAddr + 7]  = (rel32 >> 8)  & 0xFF;
         mem8[stubAddr + 8]  = (rel32 >> 16) & 0xFF;
         mem8[stubAddr + 9]  = (rel32 >> 24) & 0xFF;
-        mem8[stubAddr + 10] = 0x90;
-        mem8[stubAddr + 11] = 0x90;
-        mem8[stubAddr + 12] = 0x90;
-        mem8[stubAddr + 13] = 0x90;
-        mem8[stubAddr + 14] = 0x90;
-        mem8[stubAddr + 15] = 0x90;
+        // Bytes 10..15 (the original OUT + RET N) are left ALONE: unreachable through the
+        // JMP, but they are the exact sequence a guest PARKED IN THIS STUB'S OUT resumes
+        // into, and registration can happen during that very trap (a lazily bound export
+        // patches on its first call). NOPing the tail drops that guest through the arena
+        // into the NEXT stub's RET N — a different stack cleanup, so the caller's frame is
+        // silently skewed and its own return pops an argument instead of an address.
 
         invalidateGuestCode(stubAddr, 16);
 
@@ -3633,12 +3633,12 @@ export class ThunkDispatcher {
         mem8[stubAddr + 7]  = (rel32 >> 8)  & 0xFF;
         mem8[stubAddr + 8]  = (rel32 >> 16) & 0xFF;
         mem8[stubAddr + 9]  = (rel32 >> 24) & 0xFF;
-        mem8[stubAddr + 10] = 0x90;
-        mem8[stubAddr + 11] = 0x90;
-        mem8[stubAddr + 12] = 0x90;
-        mem8[stubAddr + 13] = 0x90;
-        mem8[stubAddr + 14] = 0x90;
-        mem8[stubAddr + 15] = 0x90;
+        // Bytes 10..15 (the original OUT + RET N) are left ALONE: unreachable through the
+        // JMP, but they are the exact sequence a guest PARKED IN THIS STUB'S OUT resumes
+        // into, and registration can happen during that very trap (a lazily bound export
+        // patches on its first call). NOPing the tail drops that guest through the arena
+        // into the NEXT stub's RET N — a different stack cleanup, so the caller's frame is
+        // silently skewed and its own return pops an argument instead of an address.
 
         invalidateGuestCode(stubAddr, 16);
 
@@ -3668,7 +3668,7 @@ export class ThunkDispatcher {
         mem8[stubAddr + 7] = (rel32 >> 8) & 0xFF;
         mem8[stubAddr + 8] = (rel32 >> 16) & 0xFF;
         mem8[stubAddr + 9] = (rel32 >> 24) & 0xFF;
-        for (let i = 10; i < 16; i++) mem8[stubAddr + i] = 0x90;
+        // Tail (OUT + RET N) deliberately preserved — see registerWriteBufferFunction.
         invalidateGuestCode(stubAddr, 16);
         return stub.functionId;
     }
@@ -5086,12 +5086,20 @@ export class ThunkDispatcher {
         const esp = cpu.reg32[4] >>> 0;
         const view = this.cachedDataView;
 
-        // Stack offsets (+8 from saved EAX/EDX)
+        // Stack offsets (+8 from saved EAX/EDX). When the frame is unreadable these stay 0,
+        // which is indistinguishable from a real fault at EIP 0 addressing 0 — the exact
+        // shape of a NULL indirect call. Carry the distinction (frameUnread) instead of
+        // letting the report state a measurement it never made.
         let errorCode = 0;
         let faultingEip = 0;
+        let frameRead = false;
         if (this.cachedMem8 && this.isDataViewValid() && esp + 16 <= this.memLength) {
             errorCode = view!.getUint32(esp + 8, true) >>> 0;
             faultingEip = view!.getUint32(esp + 12, true) >>> 0;
+            frameRead = true;
+        } else {
+            Logger.error(LogCategory.SYSTEM,
+                `#PF: interrupt frame unreadable at ESP=0x${esp.toString(16)} — faulting EIP and error code are UNKNOWN, not 0`);
         }
 
         // Diagnostic write-trap (harness): if this fault is an armed page-write
@@ -5175,7 +5183,8 @@ export class ThunkDispatcher {
             kind: "unhandled",
             regs: faultRegs,
             cr2Candidates,
-            eipTrusted: eipConsistent ?? undefined,
+            eipTrusted: frameRead ? (eipConsistent ?? undefined) : false,
+            frameUnread: frameRead ? undefined : true,
             badCall: badCall ?? undefined,
             recentCalls: this.winApiRing?.getCrashTraceLines?.(48) ?? [],
             gameEsp: faultGameEsp,

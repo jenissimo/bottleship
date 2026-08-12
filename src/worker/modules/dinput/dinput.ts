@@ -313,7 +313,6 @@ export class DInput implements IModule {
     name = "dinput";
     exports: Record<string, ThunkImplementation> = {};
     private process!: Process;
-    private memory!: Uint8Array;
     vtables: Record<string, VTableInfo> = {};
     /** Per-user/device/action-map GUID saved bindings (SetActionMap round-trip). */
     private savedActionMaps = new Map<string, SavedActionBinding[]>();
@@ -323,7 +322,6 @@ export class DInput implements IModule {
 
     initialize(process: Process): void {
         this.process = process;
-        this.memory = this.getMemory();
         const resourceProvider = SystemResourceProvider.getInstance();
 
         // Register interfaces in InterfaceRegistry
@@ -555,11 +553,20 @@ export class DInput implements IModule {
 
             // Save thunk context BEFORE starting enumeration
             const callbackManager = this.process.dispatcher.callbackManager;
-            if (callbackManager) {
-                // EnumDevices is stdcall with 5 parameters including `this`.
-                // The suspended frame must match the thunk's final RET 20,
-                // otherwise callback completion restores ESP to the wrong address.
-                callbackManager.saveSuspendedThunkContext(ctx, 20, "IDirectInputA_EnumDevices");
+            if (!callbackManager) {
+                Logger.warn(LogCategory.SYSTEM, 'IDirectInputA_EnumDevices: CallbackManager not available');
+                return DI_OK;
+            }
+            // EnumDevices is stdcall with 5 parameters including `this`.
+            // The suspended frame must match the thunk's final RET 20,
+            // otherwise callback completion restores ESP to the wrong address.
+            const frameId = callbackManager.saveSuspendedThunkContext(ctx, 20, "IDirectInputA_EnumDevices");
+            if (frameId === 0) {
+                // The frame could not be saved (bad ESP / return address). Claiming
+                // suspension now would bind the chain to whatever OUTER frame happens to
+                // be on top of the stack; enumerate nothing instead.
+                Logger.warn(LogCategory.SYSTEM, 'IDirectInputA_EnumDevices: could not save suspended frame');
+                return DI_OK;
             }
 
             let firstCallbackId: number | null = null;
@@ -629,14 +636,7 @@ export class DInput implements IModule {
                 // Leave as zeros
 
                 // Invoke callback: BOOL CALLBACK EnumDevicesCallback(LPCDIDEVICEINSTANCEA lpddi, LPVOID pvRef)
-                const callbackMgr = this.process.dispatcher.callbackManager;
-                if (!callbackMgr) {
-                    Logger.warn(LogCategory.SYSTEM, 'IDirectInputA_EnumDevices: CallbackManager not available');
-                    for (const addr of allocatedMemory) {
-                        this.process.memory.free(addr);
-                    }
-                    return;
-                }
+                const callbackMgr = callbackManager;
 
                 const { callbackId } = callbackMgr.invokeCallback(
                     lpCallback,
@@ -670,7 +670,10 @@ export class DInput implements IModule {
 
                         // Continue enumeration
                         return null;
-                    }
+                    },
+                    false,
+                    "IDirectInputA_EnumDevices",
+                    frameId,
                 );
 
                 if (firstCallbackId === null) {
@@ -700,15 +703,29 @@ export class DInput implements IModule {
                 }
             };
 
-            // Start enumeration
-            processNextDevice();
+            // Start enumeration. If it dispatches nothing — invokeCallback refused or threw —
+            // the saved frame has PINNED this thread and no callback will ever return to
+            // release it, so claiming suspension here freezes the guest silently. Give the
+            // frame back and answer synchronously instead.
+            try {
+                processNextDevice();
+            } catch (e) {
+                Logger.error(LogCategory.SYSTEM,
+                    `IDirectInputA_EnumDevices: callback dispatch failed: ${(e as Error)?.message ?? e}`);
+            }
+            if (!firstCallbackId) {
+                callbackManager.abandonSuspendedFrame(frameId);
+                for (const addr of allocatedMemory) this.process.memory.free(addr);
+                allocatedMemory.length = 0;
+                return DI_OK;
+            }
 
             // Return suspended - thunk completes when enumeration finishes
             // EnumDevices has 5 params (this, dwDevType, lpCallback, pvRef, dwFlags) = 20 bytes
             return {
                 value: 0,
                 suspendedForCallback: true,
-                callbackId: firstCallbackId || 0,
+                callbackId: firstCallbackId,
                 stackCleanup: 20
             };
         };
@@ -1215,7 +1232,11 @@ export class DInput implements IModule {
             const callbackMgr = this.process.dispatcher.callbackManager;
             if (!callbackMgr) return DI_OK;
             // 4 stdcall args (this, cb, pvRef, flags) = RET 16
-            callbackMgr.saveSuspendedThunkContext(ctx, 16, "IDirectInputDeviceA_EnumObjects");
+            const frameId = callbackMgr.saveSuspendedThunkContext(ctx, 16, "IDirectInputDeviceA_EnumObjects");
+            if (frameId === 0) {
+                Logger.warn(LogCategory.SYSTEM, 'IDirectInputDeviceA_EnumObjects: could not save suspended frame');
+                return DI_OK;
+            }
 
             let currentIdx = 0;
             let firstCallbackId: number | null = null;
@@ -1242,7 +1263,10 @@ export class DInput implements IModule {
                         if (idx >= 0) allocated.splice(idx, 1);
                         if (ret === 0 || currentIdx >= objects.length) { freeAll(); return DI_OK; }
                         return null; // continue enumeration
-                    }
+                    },
+                    false,
+                    "IDirectInputDeviceA_EnumObjects",
+                    frameId,
                 );
                 if (firstCallbackId === null) firstCallbackId = callbackId;
                 const invocation = callbackMgr.getPendingCallback(callbackId);
@@ -1258,8 +1282,20 @@ export class DInput implements IModule {
                 }
             };
 
-            processNext();
-            return { value: 0, suspendedForCallback: true, callbackId: firstCallbackId || 0, stackCleanup: 16 };
+            // A saved frame pins this thread; if nothing was dispatched, give it back and
+            // answer synchronously rather than wait forever on a callback that never ran.
+            try {
+                processNext();
+            } catch (e) {
+                Logger.error(LogCategory.SYSTEM,
+                    `IDirectInputDeviceA_EnumObjects: callback dispatch failed: ${(e as Error)?.message ?? e}`);
+            }
+            if (!firstCallbackId) {
+                callbackMgr.abandonSuspendedFrame(frameId);
+                freeAll();
+                return DI_OK;
+            }
+            return { value: 0, suspendedForCallback: true, callbackId: firstCallbackId, stackCleanup: 16 };
         };
 
         // GetObjectInfo(this, pdidoi, dwObj, dwHow) — fill the object descriptor for one
@@ -1670,7 +1706,11 @@ export class DInput implements IModule {
             const callbackMgr = this.process.dispatcher.callbackManager;
             if (!callbackMgr) return DI_OK;
             // EnumDevicesBySemantics is stdcall with 6 params → RET 24.
-            callbackMgr.saveSuspendedThunkContext(ctx, 0x18, "IDirectInput8A_EnumDevicesBySemantics");
+            const frameId = callbackMgr.saveSuspendedThunkContext(ctx, 0x18, "IDirectInput8A_EnumDevicesBySemantics");
+            if (frameId === 0) {
+                Logger.warn(LogCategory.SYSTEM, 'IDirectInput8A_EnumDevicesBySemantics: could not save suspended frame');
+                return DI_OK;
+            }
 
             let firstCallbackId: number | null = null;
 
@@ -1714,7 +1754,10 @@ export class DInput implements IModule {
                         // FALSE stops enumeration; otherwise continue until devices exhausted.
                         if (cbRet === 0 || currentIdx >= devices.length) { freeAll(); return DI_OK; }
                         return null;
-                    }
+                    },
+                    false,
+                    "IDirectInput8A_EnumDevicesBySemantics",
+                    frameId,
                 );
 
                 if (firstCallbackId === null) firstCallbackId = callbackId;
@@ -1728,8 +1771,21 @@ export class DInput implements IModule {
                 }
             };
 
-            processNextDevice();
-            return { value: 0, suspendedForCallback: true, callbackId: firstCallbackId || 0, stackCleanup: 0x18 };
+            // createDevice8Object can fail before the first invoke, and invokeCallback can
+            // refuse or throw. Either way the saved frame has pinned this thread, so hand it
+            // back and complete synchronously instead of announcing a suspension nobody ends.
+            try {
+                processNextDevice();
+            } catch (e) {
+                Logger.error(LogCategory.SYSTEM,
+                    `IDirectInput8A_EnumDevicesBySemantics: callback dispatch failed: ${(e as Error)?.message ?? e}`);
+            }
+            if (!firstCallbackId) {
+                callbackMgr.abandonSuspendedFrame(frameId);
+                freeAll();
+                return DI_OK;
+            }
+            return { value: 0, suspendedForCallback: true, callbackId: firstCallbackId, stackCleanup: 0x18 };
         };
     }
 
@@ -2109,7 +2165,6 @@ export class DInput implements IModule {
     recreateVTables(): void {
         // Recreate vtables after memory reset
         if (this.process) {
-            this.memory = this.getMemory();
             this.vtables = createVTablesFromDescriptor(this.process, dinputModule);
             Logger.verbose(LogCategory.SYSTEM, `DirectInput: Recreated vtables after reset`);
 

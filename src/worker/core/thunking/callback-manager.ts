@@ -478,7 +478,7 @@ export class CallbackManager {
         let callerRet = view.getUint32(esp + 4, true) >>> 0;
         let callerRetInStubPool = callerRet >= this.stubPoolBase && callerRet < this.stubPoolEnd;
         let callerRetLowAddress = callerRet < 0x100000;
-        let callerRetInStack = callerRet >= 0x80000 && callerRet < 0x100000;
+        let callerRetInStack = this.isGuestStackAddress(callerRet);
         let driftStdcall: number | null = null;
         let driftCdecl: number | null = null;
 
@@ -588,11 +588,12 @@ export class CallbackManager {
                 return;
             }
             const finalValue = completed === undefined ? returnValue : completed;
-            const returnAddrInStack = returnAddr >= 0x80000 && returnAddr < 0x100000;
+            const returnAddrInStack = this.isGuestStackAddress(returnAddr);
             if (returnAddr < 0x1000 || returnAddr >= mem.length || returnAddrInStack
                 || postEsp > mem.length) {
                 Logger.error(LogCategory.CALLBACK,
-                    `Invalid direct thunk return: EIP=0x${returnAddr.toString(16)} ESP=0x${postEsp.toString(16)}`);
+                    `Invalid direct thunk return: EIP=0x${returnAddr.toString(16)} ESP=0x${postEsp.toString(16)}` +
+                    (returnAddrInStack ? ' — target is INSIDE the guest stack (skewed RET N / stack-executed return)' : ''));
                 this.releaseCallbackWithFatal(
                     functionId, stub, 0x3002, returnAddr,
                     System.getInstance().scheduler.getCurrentThreadId() >>> 0,
@@ -673,12 +674,13 @@ export class CallbackManager {
             }
 
             const returnAddr = this.frameReturnAddr[frameIndex] >>> 0;
-            const returnAddrInStack = returnAddr >= 0x80000 && returnAddr < 0x100000;
+            const returnAddrInStack = this.isGuestStackAddress(returnAddr);
             if (returnAddr < 0x1000 || returnAddr >= mem.length ||
                 (returnAddr >= this.stubPoolBase && returnAddr < this.stubPoolEnd) ||
                 returnAddrInStack || this.isInvalidGuestReturnAddress(returnAddr)) {
                 Logger.error(LogCategory.CALLBACK,
-                    `Invalid frame returnAddr: 0x${returnAddr.toString(16)} frameId=${frameId}`);
+                    `Invalid frame returnAddr: 0x${returnAddr.toString(16)} frameId=${frameId}` +
+                    (returnAddrInStack ? ' — INSIDE the guest stack (skewed RET N / stack-executed return)' : ''));
     
                 this.releaseCallbackWithFatal(functionId, stub, 0x3002, returnAddr >>> 0, threadId);
                 return;
@@ -860,14 +862,15 @@ export class CallbackManager {
 
         const mem = this.getMemory();
         const returnAddr = this.frameReturnAddr[frameIndex] >>> 0;
-        const returnAddrInStack = returnAddr >= 0x80000 && returnAddr < 0x100000;
+        const returnAddrInStack = this.isGuestStackAddress(returnAddr);
         if (returnAddr < 0x1000 || returnAddr >= mem.length ||
             (returnAddr >= this.stubPoolBase && returnAddr < this.stubPoolEnd) ||
             returnAddrInStack || this.isInvalidGuestReturnAddress(returnAddr)) {
             this.deferredCompletions.delete(tid);
             this.releaseFrame(frameIndex);
             Logger.error(LogCategory.CALLBACK,
-                `Deferred completion has invalid returnAddr 0x${returnAddr.toString(16)} frameId=${deferred.frameId}`);
+                `Deferred completion has invalid returnAddr 0x${returnAddr.toString(16)} frameId=${deferred.frameId}` +
+                (returnAddrInStack ? ' — INSIDE the guest stack (skewed RET N / stack-executed return)' : ''));
             this.reportFatalFromCallback(0x3002, returnAddr >>> 0, tid);
             return false;
         }
@@ -1190,7 +1193,7 @@ export class CallbackManager {
             return { callbackId: 0 };
         }
 
-        if (callbackAddress >= 0x80000 && callbackAddress < 0x100000) {
+        if (this.isGuestStackAddress(callbackAddress)) {
             const msg = `Attempted to invoke callback at STACK address 0x${callbackAddress.toString(16)}!`;
             Logger.error(LogCategory.SYSTEM, msg);
             throw new CallbackError(msg, callbackAddress, ERROR_INVALID_PARAMETER);
@@ -1505,6 +1508,42 @@ export class CallbackManager {
     }
 
     /**
+     * Abandon a suspended-thunk frame whose callback chain never started, so the thunk can
+     * complete synchronously instead.
+     *
+     * saveSuspendedThunkContext PINS the calling thread (a real Win32 enumeration is
+     * synchronous, so the callback chain must not be preempted). A caller that saves the
+     * frame and then fails to dispatch even one callback — invokeCallback refused
+     * (nesting limit, frame not found) or threw (null target, stack bounds, slot
+     * exhaustion), or the enumeration bailed before its first invoke — would otherwise
+     * leave the thread pinned for good AND return "suspended" to a dispatcher that then
+     * waits for a callback nobody will ever issue: a silent freeze with no fault.
+     * Releasing the frame here unpins the owner and drops any callbacks already bound to
+     * it; the caller must then return a normal HRESULT, not `suspendedForCallback`.
+     *
+     * Returns true when a live frame was found and released.
+     */
+    abandonSuspendedFrame(frameId: number): boolean {
+        const target = frameId >>> 0;
+        const frameIndex = this.findFrameIndexById(target);
+        if (frameIndex < 0) return false;
+
+        const source = this.frameSource[frameIndex] || 'unknown';   // releaseFrame clears it
+        for (const [cbId, cb] of this.pendingCallbacks.entries()) {
+            if ((cb.frameId ?? 0) !== target) continue;
+            const stub = this.stubsById.get(cbId);
+            if (stub) this.releaseCallback(cbId, stub);
+            else { this.pendingCallbacks.delete(cbId); this.untrackPendingCallback(cbId); }
+        }
+        this.releaseFrame(frameIndex);
+
+        Logger.warn(LogCategory.CALLBACK,
+            `Abandoned suspended frame ${target} (${source}): ` +
+            `no callback was dispatched — thunk completes synchronously`);
+        return true;
+    }
+
+    /**
      * Return the innermost live suspended thunk frame.
      *
      * A Win32 API can be entered from a guest callback whose return address is one of
@@ -1557,5 +1596,32 @@ export class CallbackManager {
         if (a === 0 || a < 0x1000) return true;
         if (a >= MEM_THUNK_CODE_BASE && a < MEM_THUNK_CODE_BASE + MEM_THUNK_CODE_SIZE) return true;
         return false;
+    }
+
+    /**
+     * True when `addr` lands inside the RUNNING thread's guest stack.
+     *
+     * An address we are about to set EIP to came out of a stack slot; if it points back
+     * into that same stack it is data the guest overwrote, not code, and jumping there
+     * executes the stack. That is the signature of a skewed RET N (a stub-cleanup
+     * mismatch, a stdcall/cdecl mix-up) and it must be a NAMED fatal, not a silent jump.
+     *
+     * The bounds come from the scheduler because thread stacks are carved out of HEAP:
+     * there is no RegionKind to ask, and a fixed address window cannot answer it at all.
+     * Only the current thread is checked — it owns the live frame, and a per-return scan
+     * of every thread would put an allocation and a loop on a path that runs once per
+     * callback. A base of 0 means the main stack was never registered: report nothing
+     * rather than swallow the address space whole.
+     */
+    private isGuestStackAddress(addr: number): boolean {
+        try {
+            const scheduler = System.getInstance().scheduler;
+            const bounds = scheduler.getThreadStackBounds(scheduler.getCurrentThreadId() >>> 0);
+            if (!bounds || bounds.base < 0x1000) return false;
+            const a = addr >>> 0;
+            return a >= bounds.base && a < bounds.top;
+        } catch {
+            return false;   // scheduler not up yet (early boot) — nothing to compare against
+        }
     }
 }
