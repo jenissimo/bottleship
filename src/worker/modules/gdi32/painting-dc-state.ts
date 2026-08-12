@@ -7,6 +7,7 @@ import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { isValidAddress } from '../../core/memory/address-guard';
+import { registerDcTeardown } from './context';
 import {
     clipIntersectsRect,
     clipRegionFromRect,
@@ -43,16 +44,209 @@ const ERROR_REGION = 0;
 
 /** RECT is 16 bytes; a guest pointer is validated over that whole extent before use. */
 const RECT_SIZE = 16;
+/** POINT / SIZE are 8 bytes (two LONGs). */
+const POINT_SIZE = 8;
+
+// ---------------------------------------------------------------------------
+// Per-DC coordinate mapping
+// ---------------------------------------------------------------------------
+// The window→viewport mapping a DC carries: map mode, the two origins, the two
+// extents, and the graphics mode. DPtoLP/LPtoDP exist FOR this state — with none
+// kept they can only answer "identity", which is a wrong answer the caller cannot
+// detect (a dialog that measures a font through DPtoLP under a non-MM_TEXT mode
+// gets a nonsense point size back and asks for a nonsense font).
+//
+// Only the coordinate queries consume it: our primitives draw in device space, so
+// nothing here silently rescales existing output.
+
+const MM_TEXT = 1;
+const MM_LOMETRIC = 2;
+const MM_HIMETRIC = 3;
+const MM_LOENGLISH = 4;
+const MM_HIENGLISH = 5;
+const MM_TWIPS = 6;
+const MM_ISOTROPIC = 7;
+const MM_ANISOTROPIC = 8;
+
+const GM_COMPATIBLE = 1;
+const GM_ADVANCED = 2;
+
+/** Device pixels per inch and screen size in millimetres — GetDeviceCaps' answers. */
+const DC_LOGPIXELS = 96;
+const MM_PER_INCH_X10 = 254;
+
+export interface DcMapping {
+    mapMode: number;
+    graphicsMode: number;
+    wndOrgX: number; wndOrgY: number;
+    vportOrgX: number; vportOrgY: number;
+    wndExtX: number; wndExtY: number;
+    vportExtX: number; vportExtY: number;
+}
+
+const _dcMapping = new Map<number, DcMapping>();
+
+/** Win32's DC defaults: MM_TEXT, GM_COMPATIBLE, both origins at 0, unit extents. */
+export function defaultDcMapping(): DcMapping {
+    return {
+        mapMode: MM_TEXT, graphicsMode: GM_COMPATIBLE,
+        wndOrgX: 0, wndOrgY: 0, vportOrgX: 0, vportOrgY: 0,
+        wndExtX: 1, wndExtY: 1, vportExtX: 1, vportExtY: 1,
+    };
+}
+
+/** Mutable mapping for a DC, created on first WRITE. */
+function mappingFor(hdc: number): DcMapping {
+    let m = _dcMapping.get(hdc);
+    if (!m) {
+        m = defaultDcMapping();
+        _dcMapping.set(hdc, m);
+    }
+    return m;
+}
+
+/**
+ * Read-only mapping. Queries take this instead of mappingFor: an HDC the guest passes to
+ * GetMapMode/DPtoLP need not be one of ours, and inserting on read would grow the map by
+ * one entry per bogus handle with no teardown to ever remove it.
+ */
+const READONLY_DEFAULT_MAPPING: Readonly<DcMapping> = Object.freeze(defaultDcMapping());
+function readMapping(hdc: number): Readonly<DcMapping> {
+    return _dcMapping.get(hdc) ?? READONLY_DEFAULT_MAPPING;
+}
+
+/** Screen extent in device pixels — the "virtual resolution" Wine's set_map_mode reads. */
+function screenRes(): { cx: number; cy: number } {
+    const canvas = System.getInstance().gdiContext.getOverlayCanvas?.();
+    return { cx: Math.max(1, canvas?.width ?? 640), cy: Math.max(1, canvas?.height ?? 480) };
+}
+
+const muldiv = (a: number, b: number, c: number): number => Math.round((a * b) / c);
+
+/**
+ * Apply a map mode's fixed window/viewport extents (Wine win32u/mapping.c:113-178).
+ * The metric modes derive theirs from the display's size and resolution; only
+ * MM_ISOTROPIC / MM_ANISOTROPIC leave the app's own Set*ExtEx values in place.
+ * Returns false for a mode outside the enum, exactly as set_map_mode does.
+ */
+export function applyMapMode(m: DcMapping, mode: number, res = screenRes()): boolean {
+    if (mode === m.mapMode && (mode === MM_ISOTROPIC || mode === MM_ANISOTROPIC)) return true;
+    // Physical size in tenths of a millimetre, from resolution and dots-per-inch.
+    const sizeX = muldiv(res.cx, MM_PER_INCH_X10, DC_LOGPIXELS);
+    const sizeY = muldiv(res.cy, MM_PER_INCH_X10, DC_LOGPIXELS);
+    switch (mode) {
+        case MM_TEXT:
+            m.wndExtX = 1; m.wndExtY = 1; m.vportExtX = 1; m.vportExtY = 1;
+            break;
+        case MM_LOMETRIC:
+        case MM_ISOTROPIC:
+            m.wndExtX = sizeX * 10; m.wndExtY = sizeY * 10;
+            m.vportExtX = res.cx; m.vportExtY = -res.cy;
+            break;
+        case MM_HIMETRIC:
+            m.wndExtX = sizeX * 100; m.wndExtY = sizeY * 100;
+            m.vportExtX = res.cx; m.vportExtY = -res.cy;
+            break;
+        case MM_LOENGLISH:
+            m.wndExtX = muldiv(1000, sizeX, 254); m.wndExtY = muldiv(1000, sizeY, 254);
+            m.vportExtX = res.cx; m.vportExtY = -res.cy;
+            break;
+        case MM_HIENGLISH:
+            m.wndExtX = muldiv(10000, sizeX, 254); m.wndExtY = muldiv(10000, sizeY, 254);
+            m.vportExtX = res.cx; m.vportExtY = -res.cy;
+            break;
+        case MM_TWIPS:
+            m.wndExtX = muldiv(14400, sizeX, 254); m.wndExtY = muldiv(14400, sizeY, 254);
+            m.vportExtX = res.cx; m.vportExtY = -res.cy;
+            break;
+        case MM_ANISOTROPIC:
+            break;
+        default:
+            return false;
+    }
+    m.mapMode = mode;
+    return true;
+}
+
+/** Logical → device (Wine's construct_window_to_viewport, win32u/dc.c:417). */
+export function lpToDp(m: DcMapping, x: number, y: number): { x: number; y: number } {
+    const scaleX = m.vportExtX / m.wndExtX;
+    const scaleY = m.vportExtY / m.wndExtY;
+    return {
+        x: Math.round(x * scaleX + (m.vportOrgX - scaleX * m.wndOrgX)),
+        y: Math.round(y * scaleY + (m.vportOrgY - scaleY * m.wndOrgY)),
+    };
+}
+
+/** Device → logical: the inverse transform. Null when it has no inverse (zero extent). */
+export function dpToLp(m: DcMapping, x: number, y: number): { x: number; y: number } | null {
+    const scaleX = m.vportExtX / m.wndExtX;
+    const scaleY = m.vportExtY / m.wndExtY;
+    if (!scaleX || !scaleY || !Number.isFinite(scaleX) || !Number.isFinite(scaleY)) return null;
+    return {
+        x: Math.round((x - (m.vportOrgX - scaleX * m.wndOrgX)) / scaleX),
+        y: Math.round((y - (m.vportOrgY - scaleY * m.wndOrgY)) / scaleY),
+    };
+}
+
+/** Transform `count` POINTs in place. False (and no writes) on a bad guest pointer. */
+function transformPoints(
+    mem: Uint8Array, lppt: number, count: number,
+    map: (x: number, y: number) => { x: number; y: number } | null,
+): boolean {
+    if (count <= 0) return count === 0;
+    if (!lppt || !isValidAddress(mem, lppt, POINT_SIZE * count, "rw")) return false;
+    const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+    for (let i = 0; i < count; i++) {
+        const at = lppt + i * POINT_SIZE;
+        const out = map(view.getInt32(at, true), view.getInt32(at + 4, true));
+        if (!out) return false;
+        view.setInt32(at, out.x, true);
+        view.setInt32(at + 4, out.y, true);
+    }
+    return true;
+}
+
+/** Store a POINT/SIZE out-param, when the caller asked for one. */
+function writePair(mem: Uint8Array, ptr: number, a: number, b: number): void {
+    if (!ptr || !isValidAddress(mem, ptr, POINT_SIZE, "rw")) return;
+    const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+    view.setInt32(ptr, a, true);
+    view.setInt32(ptr + 4, b, true);
+}
+
+// DeleteDC/ReleaseDC drop the mapping with the DC — BeginPaint makes one per paint.
+registerDcTeardown((hdc) => { _dcMapping.delete(hdc); });
 
 export function registerPaintingDcStateExports(exports: Record<string, ThunkImplementation>): void {
     // Coordinate transformations and mapping
     exports['SetMapMode'] = (ctx, mem, args): number => {
         const hdc = args[0];
-        const iMode = args[1];
+        const iMode = args[1] | 0;
+        const m = mappingFor(hdc);
+        const prev = m.mapMode;
         Logger.verbose(LogCategory.GDI32, `SetMapMode(hdc=0x${hdc.toString(16)}, mode=${iMode})`);
-        // Stub: return old mode (MM_TEXT = 1)
-        return 1;
+        return applyMapMode(m, iMode) ? prev : 0;
     };
+
+    exports['GetMapMode'] = (ctx, mem, args): number => readMapping(args[0]).mapMode;
+
+    // int SetGraphicsMode(HDC, int) — GM_COMPATIBLE / GM_ADVANCED. Returns the PREVIOUS
+    // mode, 0 for a mode outside the enum (Wine win32u/dc.c:892-907, :970). GM_ADVANCED
+    // only unlocks the world transform; it does not reset one already set.
+    exports['SetGraphicsMode'] = (ctx, mem, args): number => {
+        const hdc = args[0];
+        const mode = args[1] | 0;
+        const m = mappingFor(hdc);
+        const prev = m.graphicsMode;
+        Logger.verbose(LogCategory.GDI32, `SetGraphicsMode(hdc=0x${hdc.toString(16)}, ${mode}) -> ${prev}`);
+        if (mode === prev) return prev;
+        if (mode < GM_COMPATIBLE || mode > GM_ADVANCED) return 0;
+        m.graphicsMode = mode;
+        return prev;
+    };
+
+    exports['GetGraphicsMode'] = (ctx, mem, args): number => readMapping(args[0]).graphicsMode;
 
     // BOOL ModifyWorldTransform(HDC hdc, const XFORM *lpXform, DWORD iMode)
     // MWT_IDENTITY=1, MWT_LEFTMULTIPLY=2, MWT_RIGHTMULTIPLY=3
@@ -63,60 +257,99 @@ export function registerPaintingDcStateExports(exports: Record<string, ThunkImpl
         return 1; // success
     };
 
+    // The origin/extent setters all follow the same Win32 shape: hand back the PREVIOUS
+    // value through the out-param, then install the new one (Wine gdi32/dc.c:1205-1217).
     exports['SetViewportOrgEx'] = (ctx, mem, args): number => {
         const hdc = args[0];
         const x = args[1] | 0;
         const y = args[2] | 0;
-        const lppt = args[3];
+        const m = mappingFor(hdc);
         Logger.verbose(LogCategory.GDI32, `SetViewportOrgEx(hdc=0x${hdc.toString(16)}, ${x}, ${y})`);
-        if (lppt) {
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            view.setInt32(lppt, 0, true);     // old x
-            view.setInt32(lppt + 4, 0, true); // old y
-        }
-        return 1; // success
+        writePair(mem, args[3], m.vportOrgX, m.vportOrgY);
+        m.vportOrgX = x; m.vportOrgY = y;
+        return 1;
+    };
+
+    // BOOL SetWindowOrgEx(HDC, int X, int Y, LPPOINT) — the LOGICAL point that maps to
+    // the viewport origin. Half of what DPtoLP subtracts; unimplemented, every logical
+    // coordinate a shifted-origin DC produced was off by the shift.
+    exports['SetWindowOrgEx'] = (ctx, mem, args): number => {
+        const hdc = args[0];
+        const x = args[1] | 0;
+        const y = args[2] | 0;
+        const m = mappingFor(hdc);
+        Logger.verbose(LogCategory.GDI32, `SetWindowOrgEx(hdc=0x${hdc.toString(16)}, ${x}, ${y})`);
+        writePair(mem, args[3], m.wndOrgX, m.wndOrgY);
+        m.wndOrgX = x; m.wndOrgY = y;
+        return 1;
     };
 
     exports['SetViewportExtEx'] = (ctx, mem, args): number => {
         const hdc = args[0];
         const x = args[1] | 0;
         const y = args[2] | 0;
-        const lpsz = args[3];
+        const m = mappingFor(hdc);
         Logger.verbose(LogCategory.GDI32, `SetViewportExtEx(hdc=0x${hdc.toString(16)}, ${x}, ${y})`);
-        if (lpsz) {
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            view.setInt32(lpsz, 640, true);     // old cx
-            view.setInt32(lpsz + 4, 480, true); // old cy
+        writePair(mem, args[3], m.vportExtX, m.vportExtY);
+        // Only the two scalable modes accept app extents; the metric modes own theirs and
+        // the call is a documented no-op that still SUCCEEDS (Wine NtGdiSetViewportExtEx
+        // jumps to `done` and returns TRUE). A zero extent is the one real failure.
+        if (!x || !y) return 0;
+        if (m.mapMode === MM_ISOTROPIC || m.mapMode === MM_ANISOTROPIC) {
+            m.vportExtX = x; m.vportExtY = y;
         }
-        return 1; // success
+        return 1;
     };
 
     exports['SetWindowExtEx'] = (ctx, mem, args): number => {
         const hdc = args[0];
         const x = args[1] | 0;
         const y = args[2] | 0;
-        const lpsz = args[3];
+        const m = mappingFor(hdc);
         Logger.verbose(LogCategory.GDI32, `SetWindowExtEx(hdc=0x${hdc.toString(16)}, ${x}, ${y})`);
-        if (lpsz) {
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            view.setInt32(lpsz, 640, true);     // old cx
-            view.setInt32(lpsz + 4, 480, true); // old cy
+        writePair(mem, args[3], m.wndExtX, m.wndExtY);
+        // Same shape as SetViewportExtEx: a fixed map mode ignores the request and still
+        // succeeds; only a zero extent fails.
+        if (!x || !y) return 0;
+        if (m.mapMode === MM_ISOTROPIC || m.mapMode === MM_ANISOTROPIC) {
+            m.wndExtX = x; m.wndExtY = y;
         }
-        return 1; // success
+        return 1;
+    };
+
+    exports['GetViewportOrgEx'] = (ctx, mem, args): number => {
+        const m = readMapping(args[0]);
+        writePair(mem, args[1], m.vportOrgX, m.vportOrgY);
+        return 1;
+    };
+
+    exports['GetWindowOrgEx'] = (ctx, mem, args): number => {
+        const m = readMapping(args[0]);
+        writePair(mem, args[1], m.wndOrgX, m.wndOrgY);
+        return 1;
+    };
+
+    exports['GetViewportExtEx'] = (ctx, mem, args): number => {
+        const m = readMapping(args[0]);
+        writePair(mem, args[1], m.vportExtX, m.vportExtY);
+        return 1;
+    };
+
+    exports['GetWindowExtEx'] = (ctx, mem, args): number => {
+        const m = readMapping(args[0]);
+        writePair(mem, args[1], m.wndExtX, m.wndExtY);
+        return 1;
     };
 
     exports['OffsetViewportOrgEx'] = (ctx, mem, args): number => {
         const hdc = args[0];
         const x = args[1] | 0;
         const y = args[2] | 0;
-        const lppt = args[3];
+        const m = mappingFor(hdc);
         Logger.verbose(LogCategory.GDI32, `OffsetViewportOrgEx(hdc=0x${hdc.toString(16)}, ${x}, ${y})`);
-        if (lppt) {
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            view.setInt32(lppt, 0, true);     // old x
-            view.setInt32(lppt + 4, 0, true); // old y
-        }
-        return 1; // success
+        writePair(mem, args[3], m.vportOrgX, m.vportOrgY);
+        m.vportOrgX += x; m.vportOrgY += y;
+        return 1;
     };
 
     exports['ScaleViewportExtEx'] = (ctx, mem, args): number => {
@@ -151,13 +384,23 @@ export function registerPaintingDcStateExports(exports: Record<string, ThunkImpl
         return 1; // success
     };
 
+    // DPtoLP / LPtoDP are the coordinate mapping's whole reason to exist: device pixels
+    // ↔ the logical space the window/viewport origins and extents define (Wine
+    // win32u/mapping.c:185-203 and :219-248). Under the default MM_TEXT with unit
+    // extents and both origins at 0 both are the identity — which is why answering
+    // "identity" unconditionally looked right until a DC actually had a mapping.
     exports['DPtoLP'] = (ctx, mem, args): number => {
         const hdc = args[0];
-        const lppt = args[1];
-        const c = args[2];
-        Logger.verbose(LogCategory.GDI32, `DPtoLP(hdc=0x${hdc.toString(16)}, count=${c})`);
-        // Stub: identity transformation (no change to points)
-        return 1; // success
+        const m = readMapping(hdc);
+        Logger.verbose(LogCategory.GDI32, `DPtoLP(hdc=0x${hdc.toString(16)}, count=${args[2] | 0})`);
+        return transformPoints(mem, args[1], args[2] | 0, (x, y) => dpToLp(m, x, y)) ? 1 : 0;
+    };
+
+    exports['LPtoDP'] = (ctx, mem, args): number => {
+        const hdc = args[0];
+        const m = readMapping(hdc);
+        Logger.verbose(LogCategory.GDI32, `LPtoDP(hdc=0x${hdc.toString(16)}, count=${args[2] | 0})`);
+        return transformPoints(mem, args[1], args[2] | 0, (x, y) => lpToDp(m, x, y)) ? 1 : 0;
     };
 
     // Clipping and visibility — all of these read or write the one clip region the DC
@@ -350,13 +593,10 @@ export function registerPaintingDcStateExports(exports: Record<string, ThunkImpl
         const hdc = args[0];
         const x = args[1] | 0;
         const y = args[2] | 0;
-        const lppt = args[3];
+        const m = mappingFor(hdc);
         Logger.verbose(LogCategory.GDI32, `OffsetWindowOrgEx(hdc=0x${hdc.toString(16)}, ${x}, ${y})`);
-        if (lppt) {
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            view.setInt32(lppt, 0, true);
-            view.setInt32(lppt + 4, 0, true);
-        }
+        writePair(mem, args[3], m.wndOrgX, m.wndOrgY);
+        m.wndOrgX += x; m.wndOrgY += y;
         return 1;
     };
 

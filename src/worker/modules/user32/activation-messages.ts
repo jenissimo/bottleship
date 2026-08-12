@@ -10,6 +10,7 @@ export const WM_ACTIVATE = 0x0006;
 export const WM_SETFOCUS = 0x0007;
 export const WM_KILLFOCUS = 0x0008;
 export const WM_ACTIVATEAPP = 0x001c;
+export const WM_NCACTIVATE = 0x0086;
 
 export const WA_INACTIVE = 0;
 export const WA_ACTIVE = 1;
@@ -32,34 +33,65 @@ export function resolveActivationWndProc(hwnd: number, fallback = 0): number {
     return resolveWndProc(hwnd) || fallback;
 }
 
+/**
+ * WM_ACTIVATEAPP is an APPLICATION-level notification: Win32 sends it only when
+ * activation crosses to a window of a different thread (Wine input.c:2059,
+ * `if (old_thread != new_thread)`). We emulate ONE guest process whose UI is one
+ * thread, so the only real crossing is the app gaining or losing the foreground
+ * altogether — moving between the game's own windows must NOT announce it, or every
+ * dialog tells the game it went to the background and it pauses / releases DirectDraw.
+ * (activateOwnedDialog existed purely to dodge that; this is the same rule, generic.)
+ */
+function crossesApplicationBoundary(newHwnd: number, prevHwnd: number): boolean {
+    return !newHwnd || !prevHwnd;
+}
+
 /** First activation on a hwnd that is already active but never received WM_ACTIVATE. */
 export function buildInitialActivationSteps(hwnd: number, wndProc: number): ActivationStep[] {
     if (!hwnd || !wndProc) return [];
     return [
         { hwnd, wndProc, msg: WM_ACTIVATEAPP, wParam: 1, lParam: 0 },
+        { hwnd, wndProc, msg: WM_NCACTIVATE, wParam: 1, lParam: 0 },
         { hwnd, wndProc, msg: WM_ACTIVATE, wParam: WA_ACTIVE, lParam: 0 },
         { hwnd, wndProc, msg: WM_SETFOCUS, wParam: 0, lParam: 0 },
     ];
 }
 
-/** Ordered activation/deactivation steps for synchronous delivery via invokeCallback. */
+/**
+ * Ordered activation/deactivation steps for synchronous delivery via invokeCallback.
+ *
+ * The order is Win32's, not ours (Wine input.c:2029-2100): the OUTGOING window is told
+ * first (WM_NCACTIVATE(FALSE) then WM_ACTIVATE(WA_INACTIVE)), the app-level notification
+ * follows, then the incoming window's WM_NCACTIVATE(TRUE)/WM_ACTIVATE(WA_ACTIVE), and
+ * focus moves LAST — so WM_KILLFOCUS arrives after the new window is already active,
+ * which is what a handler that queries GetActiveWindow from it expects.
+ */
 export function buildActivationSteps(
     newHwnd: number,
     newWndProc: number,
     prevHwnd: number,
 ): ActivationStep[] {
     const steps: ActivationStep[] = [];
-    if (prevHwnd && prevHwnd !== newHwnd) {
-        const prevProc = resolveWndProc(prevHwnd);
-        if (prevProc) {
+    const prevProc = prevHwnd && prevHwnd !== newHwnd ? resolveWndProc(prevHwnd) : 0;
+    const appBoundary = crossesApplicationBoundary(newHwnd, prevHwnd);
+    if (prevProc) {
+        steps.push({ hwnd: prevHwnd, wndProc: prevProc, msg: WM_NCACTIVATE, wParam: 0, lParam: newHwnd >>> 0 });
+        steps.push({ hwnd: prevHwnd, wndProc: prevProc, msg: WM_ACTIVATE, wParam: WA_INACTIVE, lParam: newHwnd >>> 0 });
+        if (appBoundary) {
             steps.push({ hwnd: prevHwnd, wndProc: prevProc, msg: WM_ACTIVATEAPP, wParam: 0, lParam: 0 });
-            steps.push({ hwnd: prevHwnd, wndProc: prevProc, msg: WM_ACTIVATE, wParam: WA_INACTIVE, lParam: newHwnd >>> 0 });
-            steps.push({ hwnd: prevHwnd, wndProc: prevProc, msg: WM_KILLFOCUS, wParam: newHwnd >>> 0, lParam: 0 });
         }
     }
     if (newHwnd && newWndProc) {
-        steps.push({ hwnd: newHwnd, wndProc: newWndProc, msg: WM_ACTIVATEAPP, wParam: 1, lParam: 0 });
+        if (appBoundary) {
+            steps.push({ hwnd: newHwnd, wndProc: newWndProc, msg: WM_ACTIVATEAPP, wParam: 1, lParam: 0 });
+        }
+        steps.push({ hwnd: newHwnd, wndProc: newWndProc, msg: WM_NCACTIVATE, wParam: 1, lParam: prevHwnd >>> 0 });
         steps.push({ hwnd: newHwnd, wndProc: newWndProc, msg: WM_ACTIVATE, wParam: WA_ACTIVE, lParam: prevHwnd >>> 0 });
+    }
+    if (prevProc) {
+        steps.push({ hwnd: prevHwnd, wndProc: prevProc, msg: WM_KILLFOCUS, wParam: newHwnd >>> 0, lParam: 0 });
+    }
+    if (newHwnd && newWndProc) {
         steps.push({ hwnd: newHwnd, wndProc: newWndProc, msg: WM_SETFOCUS, wParam: prevHwnd >>> 0, lParam: 0 });
     }
     return steps;
@@ -113,15 +145,22 @@ export function isWindowInitInProgress(hwnd: number): boolean {
  */
 export function postActivationTransition(newHwnd: number, prevHwnd: number): void {
     const wm = System.getInstance().windowManager;
-    if (prevHwnd && prevHwnd !== newHwnd) {
-        wm.postMessage(prevHwnd, WM_ACTIVATEAPP, 0, 0);
+    const deactivating = prevHwnd && prevHwnd !== newHwnd;
+    const appBoundary = crossesApplicationBoundary(newHwnd, prevHwnd);
+    if (deactivating) {
+        wm.postMessage(prevHwnd, WM_NCACTIVATE, 0, newHwnd >>> 0);
         wm.postMessage(prevHwnd, WM_ACTIVATE, WA_INACTIVE, newHwnd >>> 0);
-        wm.postMessage(prevHwnd, WM_KILLFOCUS, newHwnd >>> 0, 0);
+        if (appBoundary) wm.postMessage(prevHwnd, WM_ACTIVATEAPP, 0, 0);
         markPendingActivation(prevHwnd);
     }
     if (newHwnd) {
-        wm.postMessage(newHwnd, WM_ACTIVATEAPP, 1, 0);
+        if (appBoundary) wm.postMessage(newHwnd, WM_ACTIVATEAPP, 1, 0);
+        wm.postMessage(newHwnd, WM_NCACTIVATE, 1, prevHwnd >>> 0);
         wm.postMessage(newHwnd, WM_ACTIVATE, WA_ACTIVE, prevHwnd >>> 0);
+    }
+    // Focus moves after activation has settled (Wine input.c:2094).
+    if (deactivating) wm.postMessage(prevHwnd, WM_KILLFOCUS, newHwnd >>> 0, 0);
+    if (newHwnd) {
         wm.postMessage(newHwnd, WM_SETFOCUS, prevHwnd >>> 0, 0);
         // Queued counts as delivered for the needsActivationDelivery gate. Without this,
         // a guest that calls SetForegroundWindow/SetFocus from its WM_ACTIVATE handler
@@ -136,6 +175,7 @@ export function postInitialActivationMessages(hwnd: number): void {
     if (!hwnd) return;
     const wm = System.getInstance().windowManager;
     wm.postMessage(hwnd, WM_ACTIVATEAPP, 1, 0);
+    wm.postMessage(hwnd, WM_NCACTIVATE, 1, 0);
     wm.postMessage(hwnd, WM_ACTIVATE, WA_ACTIVE, 0);
     wm.postMessage(hwnd, WM_SETFOCUS, 0, 0);
     markActivationDelivered(hwnd); // queued counts as delivered (see postActivationTransition)
@@ -177,37 +217,34 @@ export function setForegroundWithFocus(topLevel: number, focusHwnd: number): num
     const focus = focusHwnd || topLevel;
     const focusProc = resolveWndProc(focus);
 
+    // A child that takes the focus gets WM_SETFOCUS only — WM_ACTIVATE belongs to the
+    // top-level window (Wine set_focus_window, input.c:1975).
+    const focusChild = (): void => {
+        if (!focusProc) return;
+        wm.postMessage(focus, WM_SETFOCUS, prevActive >>> 0, 0);
+        markActivationDelivered(focus); // queued counts as delivered
+    };
+
     if (topLevel === prevActive) {
         if (!needsActivationDelivery(focus)) return prevActive;
-        if (focus === topLevel) {
-            postInitialActivationMessages(topLevel);
-        } else if (focusProc) {
-            wm.postMessage(focus, WM_ACTIVATE, WA_ACTIVE, prevActive >>> 0);
-            wm.postMessage(focus, WM_SETFOCUS, prevActive >>> 0, 0);
-            markActivationDelivered(focus); // queued counts as delivered
-        }
+        if (focus === topLevel) postInitialActivationMessages(topLevel);
+        else focusChild();
         return prevActive;
     }
 
     wm.setActiveWindow(topLevel);
     postActivationTransition(topLevel, prevActive);
-    if (focus !== topLevel && focusProc) {
-        wm.postMessage(focus, WM_ACTIVATE, WA_ACTIVE, prevActive >>> 0);
-        wm.postMessage(focus, WM_SETFOCUS, prevActive >>> 0, 0);
-        markActivationDelivered(focus); // queued counts as delivered
-    }
+    if (focus !== topLevel) focusChild();
     Logger.verbose(LogCategory.USER32,
         `setForegroundWithFocus: top=0x${topLevel.toString(16)} focus=0x${focus.toString(16)} prev=0x${prevActive.toString(16)}`);
     return prevActive;
 }
 
 /**
- * Activate an owned (in-process) dialog: WM_ACTIVATE/focus transition WITHOUT
- * WM_ACTIVATEAPP. Windows only sends WM_ACTIVATEAPP when activation crosses
- * processes; for a game's own dialog over its fullscreen window, sending
- * WM_ACTIVATEAPP(0) to the main window would make the game believe it lost
- * the foreground (pause/minimize handlers fire). Used for dialogs created
- * visible over a DDraw flip chain (e.g. Tiberian Sun "Select Campaign").
+ * Activate an owned (in-process) dialog — e.g. one created visible over a DDraw flip
+ * chain (Tiberian Sun's "Select Campaign"). Nothing special remains here: an intra-app
+ * activation change never carries WM_ACTIVATEAPP (see crossesApplicationBoundary), so
+ * this is the ordinary transition.
  */
 export function activateOwnedDialog(hwnd: number): number {
     const wm = System.getInstance().windowManager;
@@ -219,6 +256,7 @@ export function activateOwnedDialog(hwnd: number): number {
 
     if (hwnd === prevActive) {
         if (needsActivationDelivery(hwnd)) {
+            wm.postMessage(hwnd, WM_NCACTIVATE, 1, 0);
             wm.postMessage(hwnd, WM_ACTIVATE, WA_ACTIVE, 0);
             wm.postMessage(hwnd, WM_SETFOCUS, 0, 0);
             markActivationDelivered(hwnd);
@@ -227,15 +265,9 @@ export function activateOwnedDialog(hwnd: number): number {
     }
 
     wm.setActiveWindow(hwnd);
-    if (prevActive) {
-        wm.postMessage(prevActive, WM_ACTIVATE, WA_INACTIVE, hwnd >>> 0);
-        wm.postMessage(prevActive, WM_KILLFOCUS, hwnd >>> 0, 0);
-    }
-    wm.postMessage(hwnd, WM_ACTIVATE, WA_ACTIVE, prevActive >>> 0);
-    wm.postMessage(hwnd, WM_SETFOCUS, prevActive >>> 0, 0);
-    markActivationDelivered(hwnd);
+    postActivationTransition(hwnd, prevActive);
     Logger.verbose(LogCategory.USER32,
-        `activateOwnedDialog: 0x${prevActive.toString(16)} -> 0x${hwnd.toString(16)} (no WM_ACTIVATEAPP)`);
+        `activateOwnedDialog: 0x${prevActive.toString(16)} -> 0x${hwnd.toString(16)}`);
     return prevActive;
 }
 

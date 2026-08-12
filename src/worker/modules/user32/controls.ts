@@ -436,9 +436,17 @@ function paintGroupBox(
     drawEtchedEdge(ctx, x, frameTop, w, Math.max(2, h - (frameTop - y)));
 
     if (label) {
-        ctx.fillStyle = COLOR_BTNFACE;
-        ctx.fillRect(textStart - 1, y, textWidth + 2, tm.height);
-        ctx.fillStyle = isControlDisabled(child) ? COLOR_GRAYTEXT : COLOR_WINDOWTEXT;
+        // GB_Paint erases the label's own run of the etched line with the brush the
+        // parent returned from WM_CTLCOLORSTATIC, not a hardcoded face (Wine
+        // button.c:1011) — a hardcoded grey box is visible on any coloured dialog.
+        const labelGround = controlEraseCss(child);
+        if (labelGround) {
+            ctx.fillStyle = labelGround;
+            ctx.fillRect(textStart - 1, y, textWidth + 2, tm.height);
+        }
+        const colors = getControlColorOverride(child.handle);
+        ctx.fillStyle = isControlDisabled(child) ? COLOR_GRAYTEXT
+            : (colors?.text ?? COLOR_WINDOWTEXT);
         ctx.textAlign = 'left';
         ctx.textBaseline = 'alphabetic';
         fillTextWithMnemonic(ctx, label, textStart, topTextBaseline(ctx, y));
@@ -455,6 +463,12 @@ function paintCheckableButton(
     h: number,
     buttonType: number,
 ): void {
+    // CB_Paint fills the WHOLE client with the WM_CTLCOLORSTATIC brush before it draws
+    // the box or the label (Wine button.c:867, ODA_DRAWENTIRE) — the indicator lands on
+    // top of it. Erasing only the label run leaves the previous caption's anti-aliased
+    // edges to compound darker on every repaint.
+    eraseControlBackground(ctx, child, x, y, w, h);
+
     const state = buttonCheckStates.get(child.handle) ?? BST_UNCHECKED;
     const pushed = (state & BST_PUSHED) !== 0;
     const logicalState = state & ~BST_PUSHED;
@@ -482,22 +496,8 @@ function paintCheckableButton(
     const label = child.title || '';
     if (!label) return;
 
-    // Overwrite the label area with an opaque background before drawing text. The
-    // overlay is a persistent canvas repainted many times over a control's life
-    // (WM_INITDIALOG, every content/click repaint); fillText's anti-aliased edge
-    // pixels are only partially opaque, so redrawing the same text on top of itself
-    // without first clearing compounds those edges darker each pass — a checkbox
-    // repainted a dozen times ends up looking artificially bold / faintly
-    // double-struck. Static/group-box text has the same exposure; fixing the
-    // control most visibly affected (checkboxes repaint far more often, on every
-    // click/content-change) first.
     const colors = getControlColorOverride(child.handle);
     const labelX = cellX + CHECKBOX_SIZE + 4;
-    const labelFill = (colors ? colors.fill : COLOR_BTNFACE) ?? parentGroundCss(child) ?? undefined;
-    if (labelFill) {
-        ctx.fillStyle = labelFill;
-        ctx.fillRect(labelX - 1, y, Math.max(1, x + w - labelX + 1), h);
-    }
 
     ctx.font = getWindowFont(child);
     ctx.textAlign = 'left';
@@ -722,6 +722,46 @@ function parentGroundCss(child: WindowInfo): string | null {
     return system.gdiContext.getBrushCss(brush);
 }
 
+/**
+ * What a control's own window proc erases its client with, before it draws anything.
+ *
+ * Every OS control that draws on the parent's background asks the parent for a brush
+ * first and FillRects its whole client with the answer — Wine comctl32/trackbar.c:965
+ * (trackbar), user32/static.c:664 (static), user32/button.c:867 (check box / radio),
+ * :1011 (group box label). Drawing straight onto the flat overlay without erasing leaves
+ * a moved thumb's predecessor behind and compounds re-stamped anti-aliased text into bold.
+ *
+ * A hollow/NULL answer and no answer at all lead to the same place: the parent's own
+ * background, which is what its WM_ERASEBKGND put down — its class brush, or the
+ * COLOR_BTNFACE face paintDialogBackground fills for a dialog whose client WE paint
+ * (the brush Win32's DefWindowProc hands back for an unanswered WM_CTLCOLORSTATIC).
+ *
+ * null = the parent GUEST-paints its client and supplied no brush, so those pixels are
+ * its art and the caller must leave them alone. paintWindowSubtreeToOverlay restores
+ * the guest's retained client for that case; inventing a fill here would erase it.
+ */
+function controlEraseCss(child: WindowInfo): string | null {
+    const answered = getControlColorOverride(child.handle);
+    if (answered?.fill) return answered.fill;
+    const ground = parentGroundCss(child);
+    if (ground) return ground;
+    const parent = child.parent !== undefined ? windows.get(child.parent) : undefined;
+    return parent && !parent.guestCustomPaint ? COLOR_BTNFACE : null;
+}
+
+/** Erase a control's client the way its class proc does. False = nothing to erase with. */
+function eraseControlBackground(
+    ctx: OffscreenCanvasRenderingContext2D,
+    child: WindowInfo,
+    x: number, y: number, w: number, h: number,
+): boolean {
+    const css = controlEraseCss(child);
+    if (!css) return false;
+    ctx.fillStyle = css;
+    ctx.fillRect(x, y, w, h);
+    return true;
+}
+
 
 function paintStatic(
     hdc: number,
@@ -765,18 +805,10 @@ function paintStatic(
     const isTextType = styleType === SS_LEFT || styleType === SS_CENTER || styleType === SS_RIGHT
         || styleType === SS_SIMPLE || styleType === SS_LEFTNOWORDWRAP;
     const colors = getControlColorOverride(child.handle);
-    if (isTextType && !colors?.fill) {
-        const ground = parentGroundCss(child);
-        if (ground) {
-            ctx.fillStyle = ground;
-            ctx.fillRect(x, y, w, h);
-        }
-    }
-    if (isTextType && colors?.fill) {
-        // WM_CTLCOLORSTATIC returned a background brush — the static is opaque.
-        ctx.fillStyle = colors.fill;
-        ctx.fillRect(x, y, w, h);
-    }
+    // STATIC_PaintTextfn FillRects the client with the WM_CTLCOLORSTATIC brush before
+    // the text (Wine static.c:664); the shapes above are the SS_*RECT/FRAME classes,
+    // which paint their own opaque ground.
+    if (isTextType) eraseControlBackground(ctx, child, x, y, w, h);
 
     const text = child.title || '';
     if (!text) return;
@@ -1662,6 +1694,10 @@ function paintTrackbar(
     w: number,
     h: number,
 ): void {
+    // TRACKBAR_Refresh erases the whole client with the parent's brush before drawing
+    // (Wine trackbar.c:965); without it every thumb position ever painted stays.
+    eraseControlBackground(ctx, child, x, y, w, h);
+
     const state = getOrCreateTrackbarState(child.handle);
     const range = Math.max(1, state.max - state.min);
     const frac = Math.max(0, Math.min(1, (state.pos - state.min) / range));

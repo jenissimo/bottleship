@@ -79,7 +79,10 @@ export function isContentChangingMessage(child: WindowInfo, msg: number): boolea
     const TBM_SETRANGE = 0x0406;
     const TBM_SETRANGEMAX = 0x0408;
 
+    const TBM_SETTICFREQ = 0x0414;
+
     return msg === WM_SETTEXT || msg === BM_SETCHECK || msg === STM_SETIMAGE || msg === BM_SETIMAGE
+        || msg === TBM_SETTICFREQ
         || msg === LB_SELECTSTRING
         || msg === LB_SETTOPINDEX
         || msg === CB_SHOWDROPDOWN

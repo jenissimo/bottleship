@@ -131,6 +131,16 @@ interface SavedDcState {
     posY: number;
 }
 
+/**
+ * Per-HDC state a sibling module owns (the coordinate mapping) has to die with the DC,
+ * and the DC dies here. A hook keeps that module's map out of this class without
+ * leaking an entry per BeginPaint.
+ */
+const dcTeardownHooks: ((hdc: number) => void)[] = [];
+export function registerDcTeardown(fn: (hdc: number) => void): void {
+    dcTeardownHooks.push(fn);
+}
+
 export class GDIContext {
     // Host-shared state: gdi-objects/gdi-text/gdi-blit access non-private
     // fields/methods of this class directly — treat them as module-private to gdi32.
@@ -837,6 +847,7 @@ export class GDIContext {
 
     releaseDC(hdc: number): boolean {
         this.hdcStates.delete(hdc);
+        dcTeardownHooks.forEach((fn) => fn(hdc));
         return this.contexts.delete(hdc);
     }
 
@@ -1577,6 +1588,7 @@ export class GDIContext {
             this.hdcStates.delete(hdc);
             this.hdcCurrentPos.delete(hdc);
             this.contexts.delete(hdc);
+            dcTeardownHooks.forEach((fn) => fn(hdc));
             // OPTIMIZATION: Clean up bitmap sync state when DC is deleted
             this.dcBitmapSyncState.delete(hdc);
             Logger.verboseLazy(LogCategory.GDI32, () => `deleteDC(0x${hdc.toString(16)}) -> TRUE`);

@@ -558,6 +558,11 @@ function flushPaintDCToOverlay(hWnd: number, hdc: number): boolean {
  *
  * Returns a suspended-thunk result while guest paint callbacks are in flight, or null
  * when the sequence finished inline (the caller then returns 0 as DefWindowProc does).
+ *
+ * `onUnpainted` is the chrome the caller draws itself when the window's own paint
+ * reached the overlay with nothing. It has to be a callback because the erase is a
+ * guest callback: on that path this function returns a SUSPENDED thunk and the paint
+ * finishes later, so anything the caller does after the call has already missed it.
  */
 export function runDefaultWindowPaint(
     ctx: any,
@@ -565,6 +570,7 @@ export function runDefaultWindowPaint(
     hWnd: number,
     label: string,
     stackCleanup: number,
+    onUnpainted?: () => void,
 ): ThunkResult | null {
     const window = getWindowByHandle(hWnd);
     if (!window || window.isSystemControl) return null;
@@ -616,6 +622,13 @@ export function runDefaultWindowPaint(
             gdi.releaseDC(hdc);
             if (paintTraceEnabled) logBeginEndPaint('EndPaint', hWnd,
                 `via=${label} hdc=0x${hdc.toString(16)} flush=${flushed ? 1 : 0}`);
+            // Nothing of the window's OWN client reached the overlay — its proc answered
+            // WM_ERASEBKGND without drawing (the classic no-flicker TRUE), or painted
+            // nothing. In Win32 that costs the window its background and NOTHING else:
+            // its child controls are separate windows that receive their own WM_PAINT and
+            // paint themselves regardless. On a flat overlay only the parent's composite
+            // carries them, so without this a dialog like that is wholly invisible.
+            if (!flushed) onUnpainted?.();
             const odWin = flushed ? getWindowByHandle(hWnd) : undefined;
             if (odWin) {
                 const chain = tryEndPaintOwnerDrawChain(ctx, mem, hWnd, odWin, {
@@ -692,10 +705,20 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         if (!windowInfo.visible) return;
         const system = System.getInstance();
 
-        // First visible top-level window: deliver WM_ACTIVATEAPP + WM_ACTIVATE so
-        // guest OnActivate handlers run (StarCraft render loop, HL splash.bmp load, etc.).
-        if (!windowInfo.parent && system.windowManager.getActiveHwnd() === windowInfo.handle) {
-            postInitialActivationMessages(windowInfo.handle);
+        // A top-level window created VISIBLE becomes the active window — Win32 activates
+        // it as part of showing it — and hears the activation chain. Announcing only to a
+        // window that is ALREADY active would silently skip a main window born after a
+        // splash/launcher one. WS_EX_NOACTIVATE is the documented opt-out.
+        const WS_EX_NOACTIVATE = 0x08000000;
+        const WS_CHILD_STYLE = 0x40000000;
+        const activatable = (windowInfo.style & WS_CHILD_STYLE) === 0
+            && ((windowInfo.exStyle ?? 0) & WS_EX_NOACTIVATE) === 0;
+        if (activatable) {
+            if (system.windowManager.getActiveHwnd() === windowInfo.handle) {
+                postInitialActivationMessages(windowInfo.handle);
+            } else {
+                activateTopLevelWindow(windowInfo.handle);
+            }
         }
 
         if (!windowInfo.createSyncVisibleDelivered) {
@@ -1256,6 +1279,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         const WM_CLOSE = 0x0010;
         const WM_DESTROY = 0x0002;
         const WM_SETCURSOR = 0x0020;
+        const WM_NCACTIVATE_MSG = 0x0086;
         const WM_WINDOWPOSCHANGED = 0x0047;
         const HTCLIENT = 1;
 
@@ -1366,6 +1390,12 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             // DefWindowProc does NOT call PostQuitMessage — that's the app's responsibility.
             // Only return 0 to indicate "processed".
             return 0;
+        }
+
+        if (Msg === WM_NCACTIVATE_MSG) {
+            // Repaint the caption in the active/inactive colours and answer TRUE
+            // (Wine defwnd.c:2452). FALSE would mean "refuse the activation change".
+            return 1;
         }
 
         if (Msg === WM_SETCURSOR) {
@@ -1920,11 +1950,18 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
 
         // See runDefaultWindowPaint: a paint with no update region is our own artifact and
         // means "repaint everything", which in Win32 always comes with an erase.
+        //
+        // But that synthesized erase must be ONE-SHOT, the way the real flag is. Win32 cannot
+        // recurse here because BeginPaint consumes the erase bit; we re-derive ours from a
+        // condition the erase does not change, so a WndProc that reaches BeginPaint again from
+        // inside its own WM_ERASEBKGND would erase forever, leaking a window DC per pass. An
+        // erase still in flight for this window (pendingEraseRects) is that recursion and
+        // nothing else: the entry is set when the message goes out, dropped when it completes.
         const pending = getWindowUpdateBounds(hWnd);
         const updateBounds = window
             ? (pending ?? { left: 0, top: 0, right: window.width, bottom: window.height })
             : null;
-        const fErase = consumeNeedsErase(hWnd) || pending === null;
+        const fErase = consumeNeedsErase(hWnd) || (pending === null && !pendingEraseRects.has(hWnd));
         clearWindowUpdate(hWnd);
 
         if (updateBounds && hdc) {
@@ -2175,8 +2212,15 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         const hWnd = args[0];
         Logger.log(LogCategory.USER32, `SetFocus(0x${hWnd.toString(16)})`);
         // Faithful Win32: SetFocus sets the focus window (a CHILD is allowed) and sends
-        // WM_KILLFOCUS/WM_SETFOCUS — it does NOT change the active/foreground window.
+        // WM_KILLFOCUS/WM_SETFOCUS. It does not choose a different top-level window —
+        // but it DOES activate the one it focuses into when that is not already the
+        // active window (Wine input.c:2189, "activate hwndTop if needed"), which is how
+        // a game that only ever calls SetFocus on its main window is told it is active.
         const wm = System.getInstance().windowManager;
+        if (hWnd) {
+            const { topLevel } = resolveForegroundTargets(hWnd);
+            if (topLevel && topLevel !== wm.getActiveHwnd()) activateTopLevelWindow(topLevel);
+        }
         const prevFocus = wm.setFocus(hWnd);
         recordLastActivePopup(hWnd);
         return prevFocus;

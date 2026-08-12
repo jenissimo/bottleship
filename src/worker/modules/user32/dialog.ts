@@ -1859,10 +1859,19 @@ export function createDialogExports(): Record<string, ThunkImplementation> {
             // WM_ERASEBKGND back to the dialog's own proc) then EndPaint. Only when the
             // guest has no proc left to answer that do we fall back to drawing the
             // dialog's chrome ourselves.
-            const paint = runDefaultWindowPaint(ctx, mem, hDlg, 'DefDlgProc', 16);
+            // Once only: runDefaultWindowPaint calls this itself when the window's own
+            // paint reached the overlay with nothing, and returns null on the paths that
+            // never got that far — so both callers have to be able to ask for it.
+            let chromeDrawn = false;
+            const paintDialogChrome = (): void => {
+                if (chromeDrawn) return;
+                chromeDrawn = true;
+                const w = windows.get(hDlg);
+                if (w && !w.guestCustomPaint) paintDialogToOverlay(hDlg, 'full');
+            };
+            const paint = runDefaultWindowPaint(ctx, mem, hDlg, 'DefDlgProc', 16, paintDialogChrome);
             if (paint) return paint;
-            const win = windows.get(hDlg);
-            if (win && !win.guestCustomPaint) paintDialogToOverlay(hDlg, 'full');
+            paintDialogChrome();
             return 0;
         }
         if (Msg === WM_NEXTDLGCTL) {

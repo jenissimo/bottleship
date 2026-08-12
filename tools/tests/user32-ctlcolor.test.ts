@@ -8,6 +8,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { System } from "../../src/worker/core/system";
 import {
     captureCtlColorResult,
+    ctlColorMessageFor,
     getControlColorOverride,
     invalidateControlColors,
     presetCtlColorDC,
@@ -93,6 +94,33 @@ describe("WM_CTLCOLORSTATIC capture", () => {
         System.getInstance().gdiContext.setBkMode(HDC, TRANSPARENT);
         captureCtlColorResult(transparent, HDC, 0x9999);
         expect(getControlColorOverride(transparent.handle)?.fill).toBeUndefined();
+    });
+
+    // Asking with the wrong message loses the answer: an app that makes its check-box
+    // labels transparent over a bitmap dialog handles WM_CTLCOLORSTATIC only.
+    test("which WM_CTLCOLOR* each control class is asked with", () => {
+        const control = (cls: string, style = 0): WindowInfo =>
+            ({ ...staticControl(), systemControlClass: cls, style });
+        const WM_CTLCOLOREDIT = 0x0133, WM_CTLCOLORLISTBOX = 0x0134;
+        const WM_CTLCOLORBTN = 0x0135, WM_CTLCOLORSCROLLBAR = 0x0137;
+        const BS_CHECKBOX = 0x0002, BS_AUTORADIOBUTTON = 0x0009, BS_GROUPBOX = 0x0007;
+        const BS_PUSHBUTTON = 0x0000, BS_OWNERDRAW = 0x000b;
+
+        expect(ctlColorMessageFor(control("Static"))).toBe(WM_CTLCOLORSTATIC);
+        expect(ctlColorMessageFor(control("Edit"))).toBe(WM_CTLCOLOREDIT);
+        expect(ctlColorMessageFor(control("Edit", 0x0800 /* ES_READONLY */))).toBe(WM_CTLCOLORSTATIC);
+        expect(ctlColorMessageFor(control("ListBox"))).toBe(WM_CTLCOLORLISTBOX);
+        expect(ctlColorMessageFor(control("ScrollBar"))).toBe(WM_CTLCOLORSCROLLBAR);
+        // Static-like button types ask as statics (Wine button.c:847, :987)…
+        expect(ctlColorMessageFor(control("Button", BS_CHECKBOX))).toBe(WM_CTLCOLORSTATIC);
+        expect(ctlColorMessageFor(control("Button", BS_AUTORADIOBUTTON))).toBe(WM_CTLCOLORSTATIC);
+        expect(ctlColorMessageFor(control("Button", BS_GROUPBOX))).toBe(WM_CTLCOLORSTATIC);
+        // …the push/owner-draw family as buttons (button.c:221, :1039).
+        expect(ctlColorMessageFor(control("Button", BS_PUSHBUTTON))).toBe(WM_CTLCOLORBTN);
+        expect(ctlColorMessageFor(control("Button", BS_OWNERDRAW))).toBe(WM_CTLCOLORBTN);
+        // The trackbar erases with the parent's brush too (Wine trackbar.c:965).
+        expect(ctlColorMessageFor(control("msctls_trackbar32"))).toBe(WM_CTLCOLORSTATIC);
+        expect(ctlColorMessageFor(control("msctls_progress32"))).toBeNull();
     });
 
     test("LRESULT 0 (guest did not handle it) records no override at all", () => {

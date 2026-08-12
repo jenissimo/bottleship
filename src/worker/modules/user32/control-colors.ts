@@ -59,6 +59,24 @@ export function invalidateControlColors(hwnd: number): void {
     colorCache.delete(hwnd);
 }
 
+const BS_TYPEMASK = 0x0000000f;
+/** BS_CHECKBOX/AUTOCHECKBOX/RADIOBUTTON/3STATE/AUTO3STATE, BS_GROUPBOX, BS_AUTORADIOBUTTON. */
+const STATIC_LIKE_BUTTON_TYPES = new Set([0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x09]);
+
+/**
+ * A button's face is fixed (DrawFrameControl), so only the button types that draw a
+ * label straight onto the parent's background ask for a background at all — and those
+ * ask as STATICS, not as buttons: Wine button.c:847 (check boxes / radios) and :987
+ * (group box, "GroupBox acts like static control"). Only the push/owner-draw family
+ * sends WM_CTLCOLORBTN (button.c:221, :1039). Asking with the wrong message loses the
+ * answer entirely — an app that gives its check-box labels a transparent background
+ * over a bitmap dialog handles WM_CTLCOLORSTATIC and ignores WM_CTLCOLORBTN.
+ */
+function buttonCtlColorMessage(child: WindowInfo): number {
+    return STATIC_LIKE_BUTTON_TYPES.has(child.style & BS_TYPEMASK)
+        ? WM_CTLCOLORSTATIC : WM_CTLCOLORBTN;
+}
+
 /** WM_CTLCOLOR* message for a control class (null = class has no color query). */
 export function ctlColorMessageFor(child: WindowInfo): number | null {
     switch ((child.systemControlClass ?? '').trim().toLowerCase()) {
@@ -69,11 +87,15 @@ export function ctlColorMessageFor(child: WindowInfo): number | null {
             return (child.style & (ES_READONLY | WS_DISABLED)) !== 0
                 ? WM_CTLCOLORSTATIC : WM_CTLCOLOREDIT;
         case 'button':
-            return WM_CTLCOLORBTN;
+            return buttonCtlColorMessage(child);
         case 'listbox':
             return WM_CTLCOLORLISTBOX;
         case 'scrollbar':
             return WM_CTLCOLORSCROLLBAR;
+        case 'msctls_trackbar32':
+            // comctl32's trackbar erases its client with the parent's brush before
+            // drawing channel/thumb/ticks (Wine trackbar.c:965) — a static query.
+            return WM_CTLCOLORSTATIC;
         default:
             return null;
     }

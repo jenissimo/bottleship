@@ -120,8 +120,8 @@ const VK_TO_SCAN: Record<number, number> = {
     0x64: 0x4B, // VK_NUMPAD4
     0x65: 0x4C, // VK_NUMPAD5
     0x66: 0x4D, // VK_NUMPAD6
-    0x67: 0x48, // VK_NUMPAD7
-    0x68: 0x49, // VK_NUMPAD8
+    0x67: 0x47, // VK_NUMPAD7 (same physical key as Home)
+    0x68: 0x48, // VK_NUMPAD8 (same physical key as Up)
     0x69: 0x49, // VK_NUMPAD9 (same physical key as PgUp; numpad distinguished by NO extended bit)
     0x6A: 0x37, // VK_MULTIPLY
     0x6B: 0x4E, // VK_ADD
@@ -190,7 +190,7 @@ const LETTER_SCAN: readonly number[] = [
 ];
 
 /** Map VK code to OEM hardware scan code */
-function vkToScanCode(vk: number): number {
+export function vkToScanCode(vk: number): number {
     // Letters A-Z (physical layout, not alphabetical)
     if (vk >= 0x41 && vk <= 0x5A) return LETTER_SCAN[vk - 0x41];
     // Digits 0-9: '1'→0x02 .. '9'→0x0A, '0'→0x0B
@@ -200,7 +200,7 @@ function vkToScanCode(vk: number): number {
 }
 
 /** Check if VK code is an extended key (bit 24 in lParam) */
-function isExtendedKey(vk: number): boolean {
+export function isExtendedKey(vk: number): boolean {
     return EXTENDED_VK.has(vk);
 }
 

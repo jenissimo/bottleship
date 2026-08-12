@@ -339,20 +339,23 @@ function paintWindowSubtreeToOverlay(
             && parentStaticType >= 0x0004 && parentStaticType <= 0x0009;
         const guestPaintsClient = !!win.guestCustomPaint || !!hostedByStaticFrame;
         const WS_EX_TRANSPARENT = 0x00000020;
-        if (mode === 'full') {
-            if (guestPaintsClient) {
-                // Re-compositing an owned popup must restore the guest's retained client
-                // before its controls. Merely re-stamping controls lets a lower owner's
-                // freshly-painted menu leak through transparent parts of the popup.
-                const origin = getAbsoluteWindowPosition(win);
-                gdi.restoreWindowClientRect?.(
-                    win.handle, origin.x, origin.y,
-                    Math.max(1, win.width), Math.max(1, win.height),
-                );
-            } else if (!((win.exStyle ?? 0) & WS_EX_TRANSPARENT)) {
-                paintDialogBackground(win, hdc, gdi);
-                paintDialogNcFrame(win, hdc, gdi);
-            }
+        if (guestPaintsClient) {
+            // Restore the guest's retained client before its controls — in BOTH modes.
+            // 'full' needs it so a lower owner's freshly-painted menu cannot leak through
+            // transparent parts of an owned popup. 'controls' needs it because stamping a
+            // control over whatever is already on the flat overlay cannot restore the
+            // background UNDER it: changed text lands on the old string (glyphs stack and
+            // read as bold) and a moved trackbar thumb leaves its predecessor behind. The
+            // retained client IS that background, exactly, and restoring is a no-op when
+            // no backing exists yet.
+            const origin = getAbsoluteWindowPosition(win);
+            gdi.restoreWindowClientRect?.(
+                win.handle, origin.x, origin.y,
+                Math.max(1, win.width), Math.max(1, win.height),
+            );
+        } else if (mode === 'full' && !((win.exStyle ?? 0) & WS_EX_TRANSPARENT)) {
+            paintDialogBackground(win, hdc, gdi);
+            paintDialogNcFrame(win, hdc, gdi);
         }
         // OS-owned child controls (statics, edits, non-owner-draw buttons) always paint,
         // exactly like Windows' own control window-procs. Owner-draw buttons early-out
@@ -446,13 +449,11 @@ export function repaintDialogAfterContentChange(parentHwnd: number): void {
     const win = windows.get(parentHwnd);
     // Guest already drew the dialog client (WM_PAINT flush). Only repaint OS controls.
     if (win?.guestCustomPaint) {
-        // NOTE: 'controls' stamps each control over whatever is already on the flat overlay;
-        // it cannot restore the background UNDER one. A control whose text changed keeps the
-        // old string showing through the new one, and a hidden control keeps its pixels.
-        // Neither requesting a guest WM_PAINT here nor erasing the rect in ShowWindow fixes
-        // it (measured: the first changes nothing, the second resurrects hidden pages via the
-        // overlay repair) — the real fix is ancestor-aware visibility in the painters plus a
-        // retained per-window backing store.
+        // 'controls' stamps each control over the flat overlay; the background UNDER one
+        // comes from the guest's retained client, which paintWindowSubtreeToOverlay now
+        // restores first (see there). Without a retained backing it degrades to the old
+        // stamp-over-stale behaviour rather than clearing — only the guest may redraw its
+        // own client, so inventing a fill there would erase its art.
         paintDialogToOverlay(parentHwnd, 'controls');
         return;
     }
