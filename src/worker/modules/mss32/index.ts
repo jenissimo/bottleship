@@ -30,8 +30,7 @@ export class MSS32 implements IModule {
     private ctx!: MSSContext;
 
     initialize(process: Process): void {
-        const memory = process.getCurrentMemory();
-        this.ctx = createMSSContext(process, memory);
+        this.ctx = createMSSContext(process);
 
         // Start the heartbeat loop to sync emulator memory with playback state (50Hz / 20ms):
         // EOS detection (samples reaching SMP_DONE) + position writeback. Driven by the scheduler

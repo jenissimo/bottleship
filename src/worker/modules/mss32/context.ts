@@ -6,10 +6,11 @@ export const SMP_FREE = 1;
 export const SMP_DONE = 2;
 export const SMP_PLAYING = 4;
 export const SMP_STOPPED = 8;
+/** Released while still audible — the mixer still owns the voice (AIL_active_sample_count counts it). */
+export const SMP_PLAYINGBUTRELEASED = 16;
 
 export interface MSSContext {
     process: Process;
-    memory: Uint8Array;
 
     samples: Map<number, MSSSample>;
     samplesById: Map<number, MSSSample>;
@@ -82,10 +83,9 @@ export interface MSSContext {
     wavFormatByDataPtr: Map<number, number>;
 }
 
-export function createMSSContext(process: Process, memory: Uint8Array): MSSContext {
+export function createMSSContext(process: Process): MSSContext {
     return {
         process,
-        memory,
 
         samples: new Map(),
         samplesById: new Map(),

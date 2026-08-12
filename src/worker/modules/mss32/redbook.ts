@@ -72,7 +72,7 @@ export function createRedbookExports(ctx: MSSContext): Record<string, ThunkImple
         const startmsecPtr = args[2];
         const endmsecPtr = args[3];
         const rb = ctx.redbookHandles.get(hand);
-        const view = new DataView(ctx.memory.buffer, ctx.memory.byteOffset, ctx.memory.byteLength);
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
 
         const writeSpan = (start: number, end: number): void => {
             if (startmsecPtr) view.setUint32(startmsecPtr, start >>> 0, true);

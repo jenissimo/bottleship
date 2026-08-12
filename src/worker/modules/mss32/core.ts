@@ -3,7 +3,7 @@ import { Logger, LogCategory } from "../../core/logger";
 import { Marshaler } from "../../core/memory/marshaler";
 import { MemoryGuard } from "../../core/memory/mem-guard";
 import { MSSContext, SMP_PLAYING } from "./context";
-import { ensureDriverHandle, stopHeartbeat, freeDriverResources } from "./helpers";
+import { ensureDriverHandle, stopHeartbeat, freeDriverResources, getBytesPerSecond, getPlaybackLengthBytes } from "./helpers";
 import { updateEmulatorState, stopRingBuffer } from "./playback-engine";
 import { processPendingTimerCallbacks, processPendingEOSCallbacks } from "./callbacks";
 import { ensureListener3D } from "./spatial";
@@ -265,11 +265,20 @@ export function createCoreExports(ctx: MSSContext): Record<string, ThunkImplemen
     exports["_AIL_set_sample_processor@12"] = () => 0;
 
     // void AIL_sample_ms_position(HSAMPLE, S32 *total_ms, S32 *current_ms)
-    // Both are OUT parameters the caller reads unconditionally.
+    // Both are OUT parameters the caller reads unconditionally. Real mss32 divides the
+    // sample's data length and its current byte offset by the sample's bytes-per-second —
+    // i.e. this is the millisecond view of AIL_sample_position, and answering a constant 0
+    // tells a game that every sound is zero-length and never advances.
     exports["_AIL_sample_ms_position@12"] = (ctxThunk, mem, args) => {
+        const sample = ctx.samples.get(args[0]);
+        const bytesPerSec = sample ? getBytesPerSecond(sample) : 0;
+        const totalMs = sample && bytesPerSec > 0
+            ? Math.round(getPlaybackLengthBytes(sample) * 1000 / bytesPerSec) : 0;
+        const currentMs = sample && bytesPerSec > 0
+            ? Math.round(Math.max(0, sample.position) * 1000 / bytesPerSec) : 0;
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-        if (args[1] && MemoryGuard.isValidRange(mem, args[1], 4)) view.setUint32(args[1], 0, true);
-        if (args[2] && MemoryGuard.isValidRange(mem, args[2], 4)) view.setUint32(args[2], 0, true);
+        if (args[1] && MemoryGuard.isValidRange(mem, args[1], 4)) view.setUint32(args[1], totalMs >>> 0, true);
+        if (args[2] && MemoryGuard.isValidRange(mem, args[2], 4)) view.setUint32(args[2], currentMs >>> 0, true);
         return 0;
     };
 
@@ -290,11 +299,17 @@ export function createCoreExports(ctx: MSSContext): Record<string, ThunkImplemen
     };
 
     // _AIL_set_redist_directory@4
+    //
+    // Declared void in MSS, so EAX is whatever the shipped DLL's last operation left — for a
+    // function whose whole body copies the path into its redist buffer, a non-NULL pointer.
+    // Callers do read it: Blade of Darkness treats a zero here as "MSS failed", skips 3D
+    // provider enumeration entirely, and then indexes its (never allocated) provider table.
+    // Synthesising 0 for a void API is our invention, and it is the one value that breaks them.
     exports["_AIL_set_redist_directory@4"] = (ctxThunk, mem, args) => {
         const dirPtr = args[0];
-        const dir = dirPtr ? Marshaler.readString(ctx.memory, dirPtr) : "(null)";
+        const dir = dirPtr ? Marshaler.readString(mem, dirPtr) : "(null)";
         Logger.log(LogCategory.SYSTEM, `MSS32: _AIL_set_redist_directory@4 called: dir="${dir}"`);
-        return 0;
+        return dirPtr || 1;
     };
 
     // _AIL_MMX_available@0
@@ -392,6 +407,22 @@ export function createCoreExports(ctx: MSSContext): Record<string, ThunkImplemen
         if (/max.*(room|environment)/i.test(name)) return write(0);
         Logger.verbose(LogCategory.SYSTEM, `MSS32: _AIL_3D_provider_attribute@12("${name}") -> M3D_NOT_FOUND`);
         return 2; // M3D_NOT_FOUND — leave the caller's default in place
+    };
+
+    // M3DRESULT AIL_3D_sample_attribute(H3DSAMPLE S, C8 *name, S32 *val)
+    // The per-voice twin of AIL_3D_provider_attribute. Real mss32 stamps *val = -1 up front
+    // and only overwrites it when the provider that owns the voice publishes that named
+    // attribute; ours publishes none, so -1 plus a failure code is the honest pair — a
+    // success code over an untouched-looking -1 would read as a real attribute value.
+    exports["_AIL_3D_sample_attribute@12"] = (ctxThunk, mem, args) => {
+        const name = args[1] ? Marshaler.readString(mem, args[1]) : "";
+        const out = args[2] >>> 0;
+        if (out && MemoryGuard.isValidRange(mem, out, 4)) {
+            new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setInt32(out, -1, true);
+        }
+        Logger.log(LogCategory.SYSTEM,
+            `MSS32: _AIL_3D_sample_attribute@12(0x${args[0].toString(16)}, "${name}") -> M3D_NOT_FOUND (*val=-1)`);
+        return 2; // M3D_NOT_FOUND
     };
 
     // _AIL_open_3D_listener@4(prov) → listener handle (creates the global listener SAB)

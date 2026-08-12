@@ -2,16 +2,16 @@ import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../../core/logger";
 import { MemoryGuard } from "../../core/memory/mem-guard";
 import { isValidAddress } from "../../core/memory/address-guard";
-import { MSSContext, SMP_DONE, SMP_FREE, SMP_PLAYING, SMP_STOPPED } from "./context";
+import { MSSContext, SMP_DONE, SMP_FREE, SMP_PLAYING, SMP_PLAYINGBUTRELEASED, SMP_STOPPED } from "./context";
 import { MSSSample } from "./types";
 import {
     ensureDriverHandle, getBytesPerSecond, getMemory, makeView,
     setSampleStatus, updateSampleMemory, refreshSampleLenDone,
     readFilenameArg, isEncodedFormat, MSS_SAMPLE_STRUCT_SIZE,
-    computeSampleVolumes,
+    computeSampleVolumes, getPlaybackLengthBytes, writeSamplePosition,
 } from "./helpers";
 import { decodeAudioFile } from "./audio-decode";
-import { playSample, updateSamplePlayback, stopRingBuffer, resumeRingBuffer, applySample3D } from "./playback-engine";
+import { playSample, updateSamplePlayback, stopRingBuffer, resumeRingBuffer, seekRingBuffer, applySample3D } from "./playback-engine";
 import { System } from "../../core/system";
 import { i32ToFloat } from "../../../audio/audio-ring-buffer";
 import { ensureListener3D, writeListener3D } from "./spatial";
@@ -550,6 +550,90 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
         return sample ? sample.position : 0;
     };
 
+    // S32 AIL_sample_granularity(HSAMPLE S) — the quantum AIL_sample_position and
+    // AIL_set_sample_position work in. Real mss32 maps the sample's DIG_F_* format to its
+    // frame size (mono8=1, mono16/stereo8=2, stereo16=4), returns the ADPCM block size for
+    // an ADPCM sample, and 1 when an ASI decoder owns the data. A WAV's blockAlign is
+    // exactly the first two of those; host-decoded MP3/OGG is our ASI-equivalent.
+    const sampleGranularity = (s: MSSSample): number => {
+        if (isEncodedFormat(s.fileFormat)) return 1;
+        return Math.max(1, s.blockAlign
+            || Math.max(1, s.channels) * Math.max(1, s.bitsPerSample >> 3));
+    };
+
+    exports["_AIL_sample_granularity@4"] = (ctxThunk, mem, args) => {
+        const s = ctx.samples.get(args[0]);
+        // Callers divide by this; real mss32 only ever answers 0 for a NULL handle.
+        if (!args[0]) return 0;
+        return s ? sampleGranularity(s) : 1;
+    };
+
+    // void AIL_set_sample_position(HSAMPLE S, S32 offset) — offset in bytes into the sample
+    // data. Real mss32 rounds to the nearest multiple of AIL_sample_granularity before
+    // storing, so a mid-frame seek cannot desync the mixer's frame stride.
+    exports["_AIL_set_sample_position@8"] = (ctxThunk, mem, args) => {
+        const s = ctx.samples.get(args[0]);
+        if (!s) return 0;
+        const gran = sampleGranularity(s);
+        const total = getPlaybackLengthBytes(s);
+        let pos = Math.max(0, args[1] | 0);
+        pos = Math.floor((pos + (gran >> 1)) / gran) * gran;
+        if (total > 0) pos = Math.min(pos, total);
+
+        s.position = pos;
+        writeSamplePosition(ctx, s, pos);
+        // The heartbeat derives position from startTime, so re-anchor it or the next tick
+        // reverts the seek.
+        const bytesPerSec = getBytesPerSecond(s) * (s.playbackRate || 1.0);
+        if (bytesPerSec > 0) s.startTime = performance.now() - (pos / bytesPerSec) * 1000.0;
+        s.lastAudioPositionTime = undefined;
+        s.lastAudioPositionBytes = undefined;
+        s.lastRingCursorBytes = undefined;
+        s.lastRingCursorTime = undefined;
+
+        if (!seekRingBuffer(s, pos) && s.isPlaying) {
+            // Host-decoded voices (MP3/OGG via audio_play_encoded) expose no seek; the
+            // reported position moves, the audible one does not.
+            Logger.warn(LogCategory.SYSTEM,
+                `MSS32: _AIL_set_sample_position@8: id=${s.id} seek to ${pos} not applied (no ring buffer)`);
+        }
+        Logger.log(LogCategory.SYSTEM,
+            `MSS32: _AIL_set_sample_position@8: handle=0x${args[0].toString(16)} → ${pos} (gran=${gran})`);
+        return 0;
+    };
+
+    // void AIL_set_sample_ms_position(HSAMPLE S, S32 milliseconds) — real mss32 converts
+    // with the sample's bytes-per-second and hands the byte offset to
+    // AIL_set_sample_position, which is where the granularity rounding happens.
+    exports["_AIL_set_sample_ms_position@8"] = (ctxThunk, mem, args) => {
+        const s = ctx.samples.get(args[0]);
+        if (!s) return 0;
+        const ms = args[1] | 0;
+        const bytes = Math.max(0, Math.round(getBytesPerSecond(s) * ms / 1000));
+        return exports["_AIL_set_sample_position@8"]!(ctxThunk, mem, [args[0], bytes]);
+    };
+
+    // S32 AIL_active_sample_count(HDIGDRIVER dig) — real mss32 walks the driver's sample
+    // array and counts slots whose status is SMP_PLAYING or SMP_PLAYINGBUTRELEASED, so a
+    // voice the game released while still audible keeps counting. Same array, same rule.
+    exports["_AIL_active_sample_count@4"] = (ctxThunk, mem, args) => {
+        let count = 0;
+        if (ctx.driverSampleArray) {
+            const view = makeView(mem);
+            for (let i = 0; i < ctx.driverMaxSamples; i++) {
+                const slot = ctx.driverSampleArray + i * MSS_SAMPLE_STRUCT_SIZE;
+                if (!isValidAddress(mem, slot + 0x08, 4)) break;
+                const status = view.getUint32(slot + 0x08, true);
+                if (status === SMP_PLAYING || status === SMP_PLAYINGBUTRELEASED) count++;
+            }
+        } else {
+            for (const s of ctx.samples.values()) {
+                if (s.isPlaying || s.pendingStart) count++;
+            }
+        }
+        return count;
+    };
+
     // _AIL_set_sample_user_data@12
     exports["_AIL_set_sample_user_data@12"] = (ctxThunk, mem, args) => {
         const sample = args[0];
@@ -636,6 +720,21 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
 
     exports["_AIL_3D_sample_loop_count@4"] = (ctxThunk, mem, args) =>
         exports["_AIL_sample_loop_count@4"]!(ctxThunk, mem, args);
+
+    // U32 AIL_3D_sample_length(H3DSAMPLE S) / AIL_(set_)3D_sample_offset — byte length and
+    // play cursor of the 3D voice's data. In real mss32 these dispatch straight into the
+    // provider (.m3d) that owns the voice; ours are the same voices as the 2D pool, so they
+    // answer from the same data.
+    exports["_AIL_3D_sample_length@4"] = (ctxThunk, mem, args) => {
+        const s = ctx.samples.get(args[0]);
+        return s ? getPlaybackLengthBytes(s) >>> 0 : 0;
+    };
+
+    exports["_AIL_3D_sample_offset@4"] = (ctxThunk, mem, args) =>
+        exports["_AIL_sample_position@4"]!(ctxThunk, mem, args);
+
+    exports["_AIL_set_3D_sample_offset@8"] = (ctxThunk, mem, args) =>
+        exports["_AIL_set_sample_position@8"]!(ctxThunk, mem, args);
 
     // Reverb/occlusion strength — no DSP for it yet; accept and ignore.
     exports["_AIL_set_3D_sample_effects_level@8"] = () => 0;

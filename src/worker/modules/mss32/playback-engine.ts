@@ -291,6 +291,24 @@ export function stopRingBuffer(id: number): boolean {
     return true;
 }
 
+/**
+ * Seek a PCM voice to a guest byte offset. The SAB holds Float32 frames, so the guest
+ * offset is converted through the sample's own block align; the worklet applies
+ * CTRL_PLAY_CURSOR on the next block once CTRL_RESET_POSITION is raised.
+ * Returns false when the voice has no ring buffer (host-decoded formats).
+ */
+export function seekRingBuffer(sample: MSSSample, positionBytes: number): boolean {
+    const entry = ringBuffers.get(sample.id);
+    if (!entry) return false;
+    const guestAlign = Math.max(1, sample.blockAlign
+        || Math.max(1, sample.channels) * Math.max(1, sample.bitsPerSample >> 3));
+    const frame = Math.max(0, Math.floor(positionBytes / guestAlign));
+    const sabAlign = Math.max(1, getCtrl(entry.sab, CTRL_BLOCK_ALIGN));
+    setCtrl(entry.sab, CTRL_PLAY_CURSOR, frame * sabAlign);
+    setCtrl(entry.sab, CTRL_RESERVED, 1); // CTRL_RESET_POSITION
+    return true;
+}
+
 /** Resume playback via ring buffer Atomics. Returns true if handled. */
 export function resumeRingBuffer(id: number): boolean {
     const entry = ringBuffers.get(id);
