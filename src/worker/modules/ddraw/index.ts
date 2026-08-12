@@ -3,6 +3,7 @@ import { IModule } from '../../core/module';
 import { Process } from '../../core/process';
 import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
+import { recordGpuError } from '../../core/gpu-error-log';
 import { createVTablesFromDescriptor, VTableInfo } from '../../api/adapters/module-adapter';
 import { ddrawModule } from '../../api/ddraw.api';
 import { InterfaceRegistry } from '../../core/com/interface-registry';
@@ -507,7 +508,11 @@ export class DDraw implements IModule {
         );
         queue.submit([enc.finish()]);
         const verr = await device.popErrorScope();
-        if (verr) { buf.destroy(); return { err: `validation: ${verr.message}` }; }
+        if (verr) {
+            recordGpuError("scope", "ddrawSurfaceProbe", verr.message);
+            buf.destroy();
+            return { err: `validation: ${verr.message}` };
+        }
         await buf.mapAsync(GPUMapMode.READ);
         const data = new Uint8Array(buf.getMappedRange());
         let min = 255, max = 0, nonBlack = 0;

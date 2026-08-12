@@ -1,5 +1,6 @@
 import { RenderBackend } from "../../runtime/runtime-services";
 import { Logger, LogCategory } from "../../core/logger";
+import { recordGpuError } from "../../core/gpu-error-log";
 import { EmulatorConfig } from "../../core/emulator-config-manager";
 import { PostFxChain } from "./postfx/post-fx-chain";
 import { desktopBackground } from "../../runtime/desktop-background";
@@ -74,12 +75,16 @@ export class WebGPUBackend implements RenderBackend {
 
         // Monitor device loss — after this fires, all GPU ops are no-ops (black screen)
         this.device.lost.then((info) => {
+            recordGpuError("deviceLost", "device", `reason=${info.reason} ${info.message}`);
             Logger.error(LogCategory.SYSTEM,
                 `[WEBGPU] Device LOST! reason=${info.reason} message="${info.message}"`);
         });
 
-        // DIAGNOSTIC: Catch WebGPU validation errors that silently drop draw calls
+        // Async validation errors never throw, so this is the only thing standing between a
+        // silently dropped draw call and nobody knowing. Counted as well as logged: the log
+        // ring is far too short to still hold it by the time a picture looks wrong.
         this.device.onuncapturederror = (event: GPUUncapturedErrorEvent) => {
+            recordGpuError("uncaptured", "device", event.error.message);
             Logger.error(LogCategory.DDRAW,
                 `[WEBGPU] Uncaptured error: ${event.error.message}`);
         };

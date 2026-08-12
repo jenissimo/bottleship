@@ -59,6 +59,20 @@ export class VideoRoutingService {
         return this.overlay;
     }
 
+    /**
+     * Is the overlay plane showing a movie that is still PLAYING? Structural, not timed:
+     * true while the session that owns the overlay is open and still routed to it. A
+     * wall-clock window would blank a paused movie or one whose decode stalled, and the
+     * overlay's own content flag cannot tell playing from finished on its own.
+     */
+    isOverlayPlaybackLive(): boolean {
+        if (!this.overlay.hasContent()) return false;
+        const owner = this.overlay.getOwnerSessionKey();
+        if (!owner) return false;
+        const session = this.sessions.get(owner);
+        return !!session && (session.sinkLockedToOverlay || session.sink === "VIDEO_OVERLAY");
+    }
+
     reset(): void {
         for (const session of this.sessions.values()) {
             if (session.sinkLockedToOverlay) {
@@ -87,7 +101,7 @@ export class VideoRoutingService {
             return;
         }
 
-        const initialSerial = this.render.getPresentSerial();
+        const initialSerial = this.render.getGuestPresentSerial();
         const state: VideoSessionState = {
             sessionKey,
             codec: options.codec,
@@ -177,7 +191,10 @@ export class VideoRoutingService {
             return "DROP";
         }
 
-        const currentSerial = this.render.getPresentSerial();
+        // GUEST presents only. Our own video compositor also calls notifyPresent (the screen
+        // really is being updated), and counting that here would make the app look like it is
+        // presenting the movie itself — unlocking and clearing the overlay we just drew.
+        const currentSerial = this.render.getGuestPresentSerial();
         const appPresented = currentSerial > session.presentSerialAtDecode;
         if (appPresented) {
             session.lastObservedPresentSerial = currentSerial;
@@ -198,7 +215,7 @@ export class VideoRoutingService {
                 // Fall through to normal sink resolution below
             } else {
                 const lockedSink = this.tryOverlaySink(session, "locked");
-                session.presentSerialAtDecode = this.render.getPresentSerial();
+                session.presentSerialAtDecode = this.render.getGuestPresentSerial();
                 return lockedSink;
             }
         }
@@ -210,7 +227,7 @@ export class VideoRoutingService {
         // not bare D3D8 Present while video still lives in a CPU buffer (Morrowind Bink).
         if (appPresented && this.shouldTrustAppPresent(session)) {
             this.updateSink(session, preferredObservedSink, "app_present_observed");
-            session.presentSerialAtDecode = this.render.getPresentSerial();
+            session.presentSerialAtDecode = this.render.getGuestPresentSerial();
             return session.sink;
         }
 
@@ -220,7 +237,7 @@ export class VideoRoutingService {
             const noPresentDeltaMs = performance.now() - session.lastObservedPresentAtMs;
             if (session.consecutiveMisses < FALLBACK_AFTER_CONSECUTIVE_MISSES && noPresentDeltaMs <= noPresentBudgetMs) {
                 this.updateSink(session, preferredObservedSink, `await_present miss=${session.consecutiveMisses}`);
-                session.presentSerialAtDecode = this.render.getPresentSerial();
+                session.presentSerialAtDecode = this.render.getGuestPresentSerial();
                 return session.sink;
             }
         } else {
@@ -239,14 +256,14 @@ export class VideoRoutingService {
                     session.sinkLockedToOverlay = true;
                     this.pushEvent(session.sessionKey, "fallback_on", "video_overlay_lock");
                 }
-                session.presentSerialAtDecode = this.render.getPresentSerial();
+                session.presentSerialAtDecode = this.render.getGuestPresentSerial();
                 return session.sink;
             }
         }
 
         this.warnThrottled(session, "drop", `[VideoRouting] sink=DROP session=${session.sessionKey} presenter=${this.render.getLastPresenterKind() ?? "none"}`);
         this.updateSink(session, "DROP", "no_sink");
-        session.presentSerialAtDecode = this.render.getPresentSerial();
+        session.presentSerialAtDecode = this.render.getGuestPresentSerial();
         return "DROP";
     }
 
@@ -269,7 +286,7 @@ export class VideoRoutingService {
         ring: VideoRoutingEvent[];
         overlay: ReturnType<VideoOverlayService["getDebugInfo"]>;
     } {
-        const presentSerial = this.render.getPresentSerial();
+        const presentSerial = this.render.getGuestPresentSerial();
         const sessions = Array.from(this.sessions.values()).map((s) => ({
             sessionKey: s.sessionKey,
             codec: s.codec,

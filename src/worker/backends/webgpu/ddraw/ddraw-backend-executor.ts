@@ -12,6 +12,7 @@ import { Logger, LogCategory, LogLevel } from "../../../core/logger";
 import { profiler } from "../../../core/profiler";
 import { System } from "../../../core/system";
 import { frameProfiler } from "../../../core/frame-profiler";
+import { recordGpuError } from "../../../core/gpu-error-log";
 import { drawCostProfiler, DC } from "./draw-cost-profiler";
 import {
     createGPUTexture,
@@ -3345,7 +3346,15 @@ export class DDrawWebGPUExecutor {
         }
         if (this.currentEncoder) {
             const submitStart = frameProfiler.startTimer();
-            this.queue.submit([this.currentEncoder.finish()]);
+            try {
+                this.queue.submit([this.currentEncoder.finish()]);
+            } catch (e) {
+                // The teardown below must run even on a throw. A finish()/submit() that throws
+                // leaves the encoder already finished, so keeping it would hand every later
+                // frame an unusable encoder — one bad frame becomes every frame after it.
+                recordGpuError("throw", "ddrawExecutor.flush", String(e));
+                Logger.error(LogCategory.DDRAW, `[WEBGPU] flush() submit failed — frame discarded: ${e}`);
+            }
             frameProfiler.endTimer("gpu", submitStart);
             this.currentEncoder = null;
             this.encoderEpoch++;

@@ -1555,8 +1555,6 @@ export class PELoader {
                         return { name, argCount: 0, stackCleanupBytes: 0, callingConvention: 'stdcall' };
                     });
 
-                    // Binding a DLL's imports is the process LOADING it — the line between the
-                    // modules it really has and the rest of the eagerly materialized image arena.
                     markHleModuleLoaded(dllName);
                     const stubDll = this.thunkGenerator.generateStubDll(dllName, stubInfos);
 
@@ -1737,8 +1735,6 @@ export class PELoader {
             return { name, argCount, stackCleanupBytes, callingConvention };
         });
 
-        // Binding a DLL's imports is the process LOADING it — the line between the modules
-        // it really has and the rest of the eagerly materialized image arena.
         markHleModuleLoaded(dllName);
         const stubDll = this.thunkGenerator.generateStubDll(dllName, stubInfos);
 

@@ -22,6 +22,7 @@
 import { Logger, LogCategory } from "./logger";
 import { frameVarianceDiagnostics } from "./frame-variance-diagnostics";
 import { debugSession } from "./debug/debug-session";
+import { recordGpuError } from "./gpu-error-log";
 
 /**
  * A present's swap interval, in display refreshes to hold it for. Every legacy API
@@ -507,9 +508,17 @@ class FramePacerImpl {
             this.permitAvailable = true;
         }
 
-        // Fire per-frame callbacks (e.g. THRASH auto-presenter)
+        // Fire per-frame callbacks (e.g. THRASH auto-presenter). Guarded individually:
+        // scheduleNext() below is the ONLY thing that re-arms rAF, so a throw escaping here
+        // stops the pacer for the rest of the session with `running` still true — a freeze
+        // that reads as a guest hang and leaves no trace of what threw.
         for (const cb of this.frameCallbacks) {
-            cb();
+            try {
+                cb();
+            } catch (e) {
+                recordGpuError("callback", "framePacer.frameCallback", String(e));
+                Logger.error(LogCategory.SYSTEM, `[FRAME-PACER] frame callback threw: ${e}`);
+            }
         }
 
         // Poll debug session memory watches (~60Hz, zero-cost when disabled)

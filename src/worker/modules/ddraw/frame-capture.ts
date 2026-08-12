@@ -198,7 +198,7 @@ const RAW_DRAW_MEASURABLE = [
     "rtSurfacePtr", "rtWidth", "rtHeight", "rtFormat", "tex0", "tex1",
     "alphaBlendEnabled", "srcBlend", "dstBlend", "alphaTestEnabled", "alphaFunc", "alphaRef",
     "colorKeyRenderState", "zEnable", "zWrite", "zFunc", "cullMode", "lightingEnabled", "fogEnabled", "fog",
-    "clipPlaneEnable",
+    "clipPlaneEnable", "colorWriteEnable", "stages", "lighting",
     "colorOp", "alphaOp", "colorArg1", "colorArg2", "alphaArg1", "alphaArg2",
     "legacySamplerState", "stage0SamplerState", "effectiveSamplerState",
     "derivedColorKeyEnabled", "derivedUseTexture", "derivedPremultiply", "derivedShouldBlend",

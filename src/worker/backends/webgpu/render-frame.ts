@@ -255,7 +255,13 @@ export class RenderFrame {
         this.uploadBuffers.push(buffer);
         // IMPORTANT: Make a copy! The source data may be a view into a shared
         // conversion buffer that gets overwritten by subsequent DrawPrimitiveUP calls.
-        this.uploadData.push(new Uint8Array(data));
+        // The copy is padded to a 4-byte multiple: GPUQueue.writeBuffer THROWS an
+        // OperationError on any other size (a 16-bit index buffer with an odd index
+        // count is 2 mod 4), and one throw at flush time abandons every upload queued
+        // after it — permanently, since their dirty flags were already cleared.
+        const padded = new Uint8Array((data.byteLength + 3) & ~3);
+        padded.set(data);
+        this.uploadData.push(padded);
     }
 
     registerTemporaryBuffer(buffer: GPUBuffer): void {

@@ -101,6 +101,7 @@ import { buildStagedBundle, inspectBundle, finalizeBundle, readStagedEntry, type
 import { TimeService } from "./runtime/time";
 import { resolveMessageBox } from "./runtime/dialog-bridge";
 import { Logger, LogLevel, LogCategory } from "./core/logger";
+import { recordGpuError, resetGpuErrors } from "./core/gpu-error-log";
 import { createStreamingWasmLoader } from "./core/wasm-loader";
 import { WebGPUBackend } from "./backends/webgpu/webgpu-backend";
 import { profiler } from "./core/profiler";
@@ -349,12 +350,7 @@ function installRegistryAutosave(gameId: string): void {
 /**
  * GDI presentation loop - composites overlay to screen when dirty
  */
-const gdiPresentLoop = () => {
-  if (isPaused) {
-    gdiPresentRafId = null;
-    return;
-  }
-
+const gdiPresentOnce = () => {
   const system = System.getInstance();
   const gdi = system.gdiContext;
   const videoOverlay = system.videoRouting.getOverlayService();
@@ -397,11 +393,22 @@ const gdiPresentLoop = () => {
       if (gdiDirty) gdi.clearOverlayDirty();
       if (videoOverlay.isDirty()) videoOverlay.consumeDirty();
       (renderActive as { repaintLastFrame?(): void } | null)?.repaintLastFrame?.();
+
+      // The video plane is NOT GDI window output, so the overlay plan does not govern it.
+      // A fullscreen movie is on screen on real Windows whether or not a 3D device exists,
+      // and while it plays the guest sits in its playback loop presenting nothing — so the
+      // paths that normally composite it never run. Re-composited every frame, not only when
+      // dirty: repaintLastFrame above would otherwise flip the screen back to the last game
+      // frame on the animation frames a 15 fps movie does not update.
+      if (videoCanvas && system.videoRouting.isOverlayPlaybackLive()) {
+        backend.composite(videoCanvas, false);
+        system.services.render.notifyPresent("video");
+      }
+
       if (plan.mode === 'rects' && backend.compositeRects) {
         const overlayCanvas = gdi.getOverlayCanvas();
         if (overlayCanvas) backend.compositeRects(overlayCanvas, plan.rects);
       }
-      gdiPresentRafId = requestAnimationFrame(gdiPresentLoop);
       return;
     }
 
@@ -444,6 +451,26 @@ const gdiPresentLoop = () => {
         system.services.render.notifyPresent("gdi");
       }
     }
+  }
+
+};
+
+/**
+ * The rAF chain. The re-arm below is the only thing keeping this loop alive, so a throw
+ * escaping gdiPresentOnce would freeze the screen for the rest of the session. A skipped
+ * frame is recoverable; a dead loop is not.
+ */
+const gdiPresentLoop = () => {
+  if (isPaused) {
+    gdiPresentRafId = null;
+    return;
+  }
+
+  try {
+    gdiPresentOnce();
+  } catch (e) {
+    recordGpuError("throw", "gdiPresentLoop", String(e));
+    Logger.error(LogCategory.SYSTEM, `[GDI-PRESENT] present loop threw — frame skipped: ${e}`);
   }
 
   gdiPresentRafId = requestAnimationFrame(gdiPresentLoop);
@@ -1339,6 +1366,9 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
   await hleReady;
 
   bootMark("load-bundle-start");
+  // Scope the GPU-error census to this run, so report().gpuErrors answers "this game",
+  // not "everything since the worker started".
+  resetGpuErrors();
 
   await prepareFullGameSwitch();
 

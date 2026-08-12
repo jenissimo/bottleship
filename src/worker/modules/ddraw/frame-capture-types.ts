@@ -86,6 +86,18 @@ export type CapturedDrawCall = {
      *  geometry along a straight screen line — indistinguishable from missing draws
      *  unless the capture can say whether any plane was armed. 0 = none. */
     clipPlaneEnable?: number;
+    /** D3DRS_COLORWRITEENABLE mask. Zero means the draw wrote depth only — no pixels, no
+     *  warning, and indistinguishable from a draw that never happened. */
+    colorWriteEnable?: number;
+    /** Per-stage combiner arguments plus the texture each stage samples. The op alone cannot
+     *  say where a channel's value came from, and for an alpha-blended draw that is precisely
+     *  what decides whether it is visible. `alphalessFormat` says whether the sampled alpha is
+     *  the texture's own or the 1.0 we substitute for formats that carry none. */
+    stages?: Array<Record<string, number | string | boolean | null>>;
+    /** The operands FFP lighting computes from — material, light count, ambient, and the
+     *  RESOLVED colour sources. For a mesh whose FVF carries no vertex colour these are the
+     *  only source of its colour, so "black" is decidable here and nowhere else. */
+    lighting?: Record<string, unknown>;
     /** Full fog state. A whole scene resolving to one flat colour is the signature of
      *  fogFactor==1 everywhere, so the raw modes AND the float-decoded range must be
      *  visible side by side (the range states are float bits in a DWORD). */

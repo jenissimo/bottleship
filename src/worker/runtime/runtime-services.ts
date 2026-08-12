@@ -69,12 +69,19 @@ export interface RenderActive {
     repaintLastFrame?(): void;
 }
 
-export type PresenterKind = "ddraw" | "glide" | "d3d8" | "d3d9" | "gdi" | "opengl";
+/** `video` is OURS: the compositor that puts a fallback video-overlay frame on the
+ *  screen when the guest is inside a playback loop and presenting nothing. Everything
+ *  else is a present the GUEST asked for. */
+export type PresenterKind = "ddraw" | "glide" | "d3d8" | "d3d9" | "gdi" | "opengl" | "video";
 
 export class RenderService {
     private backend: RenderBackend | null = null;
     private active: RenderActive | null = null;
     private presentSerial = 0;
+    /** Presents the GUEST drove. Video routing decides "is the app presenting this movie
+     *  itself?" from a rising serial, so our own video composite must not advance it —
+     *  otherwise we answer our own question and clear the overlay we just drew. */
+    private guestPresentSerial = 0;
     private lastPresenterKind: PresenterKind | null = null;
     private static readonly FLIP_TRACE_MARK = "bottleship.flip";
 
@@ -205,6 +212,7 @@ export class RenderService {
 
     notifyPresent(presenterKind: PresenterKind): void {
         this.presentSerial += 1;
+        if (presenterKind !== "video") this.guestPresentSerial += 1;
         this.lastPresenterKind = presenterKind;
         // Screenshot mirror: encoded here because EVERY present path funnels through
         // notifyPresent, so no backend can silently miss it and leave a stale image.
@@ -293,6 +301,11 @@ export class RenderService {
         return this.presentSerial;
     }
 
+    /** Presents excluding our own video compositor — see `guestPresentSerial`. */
+    getGuestPresentSerial(): number {
+        return this.guestPresentSerial;
+    }
+
     getLastPresenterKind(): PresenterKind | null {
         return this.lastPresenterKind;
     }
@@ -300,6 +313,7 @@ export class RenderService {
     reset(): void {
         this.active = null;
         this.presentSerial = 0;
+        this.guestPresentSerial = 0;
         this.screenMirrorSerial = 0; // the previous game's mirror is not this game's screen
         this.lastPresenterKind = null;
         this.resetFlipCadence();

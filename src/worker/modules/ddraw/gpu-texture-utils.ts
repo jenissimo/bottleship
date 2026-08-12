@@ -6,6 +6,7 @@
  */
 
 import { Logger, LogCategory } from "../../core/logger";
+import { recordGpuError } from "../../core/gpu-error-log";
 import { System } from "../../core/system";
 import { isValidAddress, overlapsThunkCode } from "../../core/memory/address-guard";
 import { toPlainGuestMemory } from "../../core/memory/guest-memory";
@@ -1468,7 +1469,11 @@ export async function readSurfaceStateRGBA(
     enc.copyTextureToBuffer({ texture: state.gpuTexture }, { buffer: buf, bytesPerRow }, { width: w, height: h, depthOrArrayLayers: 1 });
     queue.submit([enc.finish()]);
     const verr = await device.popErrorScope();
-    if (verr) { buf.destroy(); return { err: `validation: ${verr.message}` }; }
+    if (verr) {
+        recordGpuError("scope", "ddrawTextureReadback", verr.message);
+        buf.destroy();
+        return { err: `validation: ${verr.message}` };
+    }
     await buf.mapAsync(GPUMapMode.READ);
     const padded = new Uint8Array(buf.getMappedRange());
     const rgba = new Uint8Array(w * h * 4);

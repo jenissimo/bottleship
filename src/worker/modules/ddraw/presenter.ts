@@ -3,6 +3,7 @@ import { FrameDebugSnapshot } from "./index";
 import { Process } from "../../core/process";
 import { System } from "../../core/system";
 import { profiler } from "../../core/profiler";
+import { recordGpuError } from "../../core/gpu-error-log";
 import { DirectDrawSurfaceState, isRenderSurface } from "./com-objects";
 import { WebGPUBackend } from "../../backends/webgpu/webgpu-backend";
 import { FrameInterpolator } from "../../backends/webgpu/frame-interpolator";
@@ -486,10 +487,14 @@ export class DDrawPresenter implements RenderActive {
                     if (useErrorScopes) {
                         const frameNum = this.counters.frames;
                         device.popErrorScope().then(err => {
-                            if (err) Logger.error(LogCategory.DDRAW, `[PRESENT] Validation error frame=${frameNum}: ${err.message}`);
+                            if (!err) return;
+                            recordGpuError("scope", "ddrawPresent.validation", err.message);
+                            Logger.error(LogCategory.DDRAW, `[PRESENT] Validation error frame=${frameNum}: ${err.message}`);
                         });
                         device.popErrorScope().then(err => {
-                            if (err) Logger.error(LogCategory.DDRAW, `[PRESENT] OOM error frame=${frameNum}: ${err.message}`);
+                            if (!err) return;
+                            recordGpuError("scope", "ddrawPresent.oom", err.message);
+                            Logger.error(LogCategory.DDRAW, `[PRESENT] OOM error frame=${frameNum}: ${err.message}`);
                         });
                     }
 
