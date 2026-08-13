@@ -12,6 +12,8 @@ import { surfaceSyncManager } from '../../../modules/ddraw/surface-sync';
 import type { Viewport } from '../ddraw/types';
 import { sanitizeViewport } from '../ddraw/types';
 import { recordGpuError } from '../../../core/gpu-error-log';
+import { registerGpuDeviceObserver } from '../../../core/gpu/gpu-device-lifecycle';
+import { registerDDrawSurfaceSource } from '../../../modules/ddraw/surface-device-loss';
 import type { RenderActive } from '../../../runtime/runtime-services';
 import { createRenderTarget } from '../shared/surface-factory';
 import { decodeD3DTextureToRgba8, getD3DTextureLayout, D3DFMT_P8, D3DFMT_A8P8 } from '../shared/texture-formats';
@@ -232,6 +234,26 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         if (backend) {
             this.programmable = new D3D8ProgrammableRenderer(backend);
         }
+        // The two buffer maps are the only device-derived state this adapter owns directly;
+        // both are refilled from guest memory by uploadVb/uploadIb on the next draw.
+        registerGpuDeviceObserver("d3d8-adapter", {
+            onDeviceLost: () => {
+                this.vbGpuBuffers.clear();
+                this.ibGpuBuffers.clear();
+                this.programmable?.onDeviceLost();
+            },
+        });
+        // A D3D8 texture's surface state is NOT a ddraw COM object, so the COM walk never sees
+        // it — this device's own texture map and its render target are the only route to them.
+        registerDDrawSurfaceSource(`d3d8-device-${D3D8DeviceAdapter.nextSourceId++}`, () => this.ownedSurfaces());
+    }
+
+    private static nextSourceId = 0;
+
+    private *ownedSurfaces(): Iterable<{ state: DirectDrawSurfaceState }> {
+        yield { state: this.renderTarget };
+        if (this.rtOverride) yield { state: this.rtOverride };
+        for (const surf of this.texSurfaces.values()) yield { state: surf };
     }
 
     /** Surface all draws/clears target right now (SetRenderTarget override or back buffer). */

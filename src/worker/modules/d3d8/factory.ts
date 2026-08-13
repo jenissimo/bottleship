@@ -25,6 +25,7 @@ import {
     DEFAULT_VENDOR_ID,
     writeAdapterIdentifier8,
 } from '../../backends/webgpu/shared/dx-adapter-identifier';
+import { registerLossTrackedDevice } from '../../core/gpu/gpu-device-loss-contract';
 
 const D3D_OK = 0;
 const D3DERR_INVALIDCALL = 0x8876086c;
@@ -316,6 +317,7 @@ export function createFactoryExports(): Record<string, ThunkImplementation> {
 
             const devicePtr = createComObject(vtableAddr);
             devices.set(devicePtr, device);
+            registerLossTrackedDevice(devicePtr);
             // The cursor kind depends on it, and a device that never Resets would otherwise
             // be read as fullscreen.
             deviceWindowed.set(devicePtr, !!windowedFlag);

@@ -248,6 +248,11 @@ export interface BaseSurfaceState {
      *  DDrawWebGPUExecutor.encoderEpoch / prepareStageTexture. */
     sampledEncoderEpoch?: number;
     sampledContentVersion?: number;
+
+    /** Set when a device loss took the surface's ONLY copy (a GPU_ONLY render target); cleared
+     *  by Restore()/RestoreAllSurfaces(). Lives here rather than in an address-keyed table
+     *  because COM blocks are recycled — see gpu-device-loss-contract.ts. */
+    surfaceLost?: boolean;
 }
 
 /** One SetPrivateData entry: either a byte blob or a (ref-counted) IUnknown pointer. */

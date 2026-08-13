@@ -11,6 +11,7 @@
 import { OpenGLFrameInput } from "./opengl-types";
 import { OpenGLPipelineConfig, pipelineConfigKey } from "./opengl-pipeline-factory";
 import { EmulatorConfig } from "../../../core/emulator-config-manager";
+import { registerGpuDeviceObserver } from "../../../core/gpu/gpu-device-lifecycle";
 import {
     GLCommandStream, GLDrawCommandType, GLTextureObject, VERT_FLOATS,
     CMD_I32, CMD_F32, CI_TYPE,
@@ -175,6 +176,33 @@ export class OpenGLBackendExecutor {
 
     constructor(backend: WebGPUBackend) {
         this.backend = backend;
+        // All of this is rebuilt lazily by ensureStaticResources/ensureTargets/resolveTexture
+        // from the GL object state, which lives on the CPU side and outlives the device.
+        registerGpuDeviceObserver("opengl-executor", {
+            onDeviceLost: () => {
+                this.offscreenTexture = null;
+                this.offscreenView = null;
+                this.depthTexture = null;
+                this.depthView = null;
+                this.targetFormat = null;
+                this.shaderModule = null;
+                this.bindGroupLayout = null;
+                this.pipelineLayout = null;
+                this.pipelineCache.clear();
+                this.textureCache.clear();
+                this.samplerCache.clear();
+                this.bindGroupCache.clear();
+                this.whiteTexture = null;
+                this.whiteTextureView = null;
+                this.defaultSampler = null;
+                this.vertexBuffer = null;
+                this.vertexBufferSize = 0;
+                this.vertexUploadCursor = 0;
+                this.uniformBuffer = null;
+                this.uniformCapacity = 0;
+                this.uniformCursor = 0;
+            },
+        });
     }
 
     /** Default-framebuffer size: the presentation surface a WGL context owns. */

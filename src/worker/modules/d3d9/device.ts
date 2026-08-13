@@ -12,6 +12,12 @@ import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { gammaService } from '../../core/gamma-service';
 import { D3D9Device } from '../../backends/webgpu/d3d9/d3d9-device';
 import { WebGPUBackend } from '../../backends/webgpu/webgpu-backend';
+import {
+    acknowledgeDeviceReset,
+    deviceCooperativeLevel,
+    forgetLossTrackedDevice,
+    registerLossTrackedDevice,
+} from '../../core/gpu/gpu-device-loss-contract';
 import { writeDeviceCaps9 } from './caps';
 import {
     addComRef, getVTables, devices, createComObject, registerComFinalizer,
@@ -254,6 +260,8 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
 
     const D3D_OK = 0;
     const D3DERR_INVALIDCALL = 0x8876086c;
+    const D3DERR_DEVICELOST = 0x88760868;
+    const D3DERR_DEVICENOTRESET = 0x88760869;
 
     // Gamma — SetGammaRamp(iSwapChain, Flags, pRamp); GetGammaRamp(iSwapChain, pRamp).
     // Routed to the shared RAMDAC LUT sink so the D3D9 brightness slider actually works.
@@ -346,7 +354,16 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
 
     exports['IDirect3DDevice9_TestCooperativeLevel'] = (_ctx, _mem, args) => {
         const pDevice = args[0];
-        return devices.has(pDevice) ? D3D_OK : D3DERR_INVALIDCALL;
+        if (!devices.has(pDevice)) return D3DERR_INVALIDCALL;
+        // The documented recovery sequence, driven by the real WebGPU device state:
+        // DEVICELOST while there is nothing to reset onto, DEVICENOTRESET once there is.
+        // Answering an error before the backend could recreate a device would be worse than
+        // the old unconditional D3D_OK — the app would spin in a Reset that cannot succeed.
+        switch (deviceCooperativeLevel(pDevice)) {
+            case "lost": return D3DERR_DEVICELOST;
+            case "notreset": return D3DERR_DEVICENOTRESET;
+            default: return D3D_OK;
+        }
     };
 
     exports['IDirect3DDevice9_GetAvailableTextureMem'] = (_ctx, _mem, args) => {
@@ -424,6 +441,7 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
             
             // Store device instance mapped to COM object pointer
             devices.set(devicePtr, device);
+            registerLossTrackedDevice(devicePtr);
             deviceToD3D9.set(devicePtr, pD3D9);
             deviceCreationParams.set(devicePtr, {
                 adapter: Adapter >>> 0,
@@ -439,6 +457,7 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
                 device.releaseComBindings();
                 releaseDeviceSurfaceRefs(devicePtr);
                 devices.delete(devicePtr);
+                forgetLossTrackedDevice(devicePtr);
                 releaseComRef(pD3D9);
                 deviceToD3D9.delete(devicePtr);
                 deviceBoundDepthStencil.delete(devicePtr);
@@ -487,6 +506,14 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         if (!device) {
             Logger.error(LogCategory.D3D9, `Reset: invalid device ${pDevice}`);
             return D3DERR_INVALIDCALL;
+        }
+
+        // A Reset while the backend still has no device cannot succeed. Real D3D9 answers
+        // D3DERR_DEVICELOST here, which is what keeps a correct app in its poll loop instead
+        // of proceeding as if the reset had worked.
+        if (!acknowledgeDeviceReset(pDevice)) {
+            Logger.warn(LogCategory.D3D9, `Reset refused — no GPU device yet (still recovering)`);
+            return D3DERR_DEVICELOST;
         }
 
         // Reset destroys the implicit depth-stencil, the implicit backbuffer surfaces and

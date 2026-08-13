@@ -94,6 +94,14 @@ far too much log output to grep. So the harness gives you structured views inste
   guest pages and diffs two captures — per-section sizes, declared locals, first differing
   offset. It is the decisive test for any codegen flag: if the bytes don't change, the flag is
   dead on that workload, and no timing measurement can say otherwise.
+- **GPU device loss.** A lost WebGPU device never throws — every later call is a validated
+  no-op — so the picture stops changing while every counter keeps incrementing.
+  **`gpuDeviceState()`** reports the device's status and generation alongside the answers the
+  guest would get right now (`testCooperativeLevel` per d3d8/d3d9 device, `ddrawLostSurfaces`),
+  and `report().gpuDevice` carries the same. **`gpuLoseDevice()`** destroys the live device on
+  purpose — the same path a real loss takes — and returns `before` / `during` / `after`
+  snapshots; `during` is sampled from inside the invalidation fan-out, which is the only
+  instant at which "did we tell the guest?" is answerable.
 
 ## Checked-in scripts & the regression batch
 

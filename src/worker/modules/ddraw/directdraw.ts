@@ -24,6 +24,7 @@ import {
     DDBD_32,
     DDCAPS_OFFSETS,
     DDCAPS_SIZE_V7,
+    DDERR_SURFACELOST,
     DDSCAPS_COMBINED_3D,
     CKCAPS_COMBINED,
     DDFXCAPS_COMBINED,
@@ -91,6 +92,8 @@ import { computePitch, normalizeSurfaceDesc, readSurfaceDesc, readSurfaceDescV1,
 import { rasterStatusAt } from "./raster-status";
 import { DirectDrawSurfaceObject, DirectDrawSurfaceState, DirectDrawPaletteObject } from "./com-objects";
 import { createGPUTexture, convertRGBAToSurface } from "./gpu-texture-utils";
+import { gpuDeviceUsable } from "../../core/gpu/gpu-device-lifecycle";
+import { restoreAllLostSurfaces } from "./surface-device-loss";
 import { setAuthorityCpu, setAuthorityGpu, syncActiveGdiContext } from "./surface-sync";
 import { createDirectDrawStubsExports } from "./directdraw-stubs";
 import { createDirectDrawPaletteClipperExports } from "./directdraw-palette-clipper";
@@ -2242,8 +2245,32 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         return DD_OK;
     };
 
-    // TestCooperativeLevel: apps check before Present/CreateSurface. In emu we always report success.
+    /**
+     * TestCooperativeLevel reports EXCLUSIVE-MODE ownership, not surface loss — that is
+     * DirectDraw's split, and it is why a lost device shows up through IsLost/Restore instead
+     * of here. Nothing else on this machine can take exclusive mode from us, so DD_OK is the
+     * faithful answer even while surfaces are lost.
+     */
     exports["IDirectDraw7_TestCooperativeLevel"] = (ctx, mem, args) => {
+        return DD_OK;
+    };
+
+    /**
+     * RestoreAllSurfaces: restore every lost surface owned by this DirectDraw object. Same
+     * contract as IDirectDrawSurface7::Restore applied wholesale — the surfaces come back
+     * valid with undefined (cleared) contents, and the call fails while there is still no
+     * device to restore onto.
+     */
+    exports["IDirectDraw7_RestoreAllSurfaces"] = (ctx, mem, args) => {
+        if (!gpuDeviceUsable()) {
+            Logger.warn(LogCategory.DDRAW, `RestoreAllSurfaces refused — no GPU device yet (still recovering)`);
+            return DDERR_SURFACELOST;
+        }
+        const restored = restoreAllLostSurfaces();
+        if (restored > 0) {
+            Logger.log(LogCategory.DDRAW,
+                `RestoreAllSurfaces: ${restored} surface(s) revalidated (contents undefined, per DirectDraw)`);
+        }
         return DD_OK;
     };
 

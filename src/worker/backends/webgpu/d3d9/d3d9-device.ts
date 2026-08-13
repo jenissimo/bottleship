@@ -2,6 +2,10 @@
 import { WebGPUBackend } from "../webgpu-backend";
 import { RenderFramePool } from "../render-frame";
 import { LruCache } from "../../../core/collections/lru-cache";
+import { registerGpuDeviceObserver } from "../../../core/gpu/gpu-device-lifecycle";
+// Side-effect import: the surface-side device-loss observer. A pure-d3d9 title never loads the
+// ddraw executor, but its render targets and the texture-handle registry are the same objects.
+import "../../../modules/ddraw/surface-device-loss";
 import { D3D9StateTracker, FFP_TEXTURE_TRANSFORM_COUNT } from "./d3d9-state-tracker";
 import { D3D9CommandRecorder } from "./d3d9-command-recorder";
 import { DynamicVbPool } from "./dynamic-vb-pool";
@@ -569,6 +573,40 @@ export class D3D9Device {
 
         // Register as active renderer
         System.getInstance().services.render.setActive(this);
+
+        registerGpuDeviceObserver("d3d9-device", { onDeviceLost: () => this.onDeviceLost() });
+    }
+
+    /**
+     * Device loss. Everything below is either a dead handle or an INDEX into one — the
+     * pipeline caches map a state key to a slot in the executor's `pipelines` array, which
+     * the executor is emptying in the same fan-out, so they have to be cleared together or a
+     * live key would resolve to a slot that no longer exists.
+     *
+     * The textures/vertex/index stores keep a CPU shadow of every resource, so dropping their
+     * GPU side and re-raising `dirty` restores them on next use with no guest involvement.
+     * Render-target textures are the exception and are reported, not restored (see
+     * TextureStore.dropGpuResources).
+     */
+    private onDeviceLost(): void {
+        this.backendExecutor.dropDeviceResources();
+        this.pipelineCache.clear();
+        this.currentPipelineKey = null;
+        this.currentPipelineId = null;
+        this.progPipelineCache.clear();
+        this.arenaPipelineCache.clear();
+        this.cubeFaceRenderViews.clear();
+        this.rtDepthCache.clear();
+        this.vbVersions.clear();
+        this.ibVersions.clear();
+        this.fetchAuditShadow.clear();
+        this.vbPool = null;
+        const tex = this.textures.dropGpuResources();
+        const vb = this.vertexBuffers.dropGpuResources();
+        const ib = this.indexBuffers.dropGpuResources();
+        Logger.warn(LogCategory.D3D9,
+            `[GPU-LOST] d3d9 resources invalidated — textures=${tex.dropped} (${tex.contentLost} render targets whose contents are gone), ` +
+            `vertexBuffers=${vb}, indexBuffers=${ib}; all restore from their CPU shadow on next use`);
     }
 
     getDrawCount(): number {
@@ -2664,6 +2702,7 @@ export class D3D9Device {
     }
 
     clear(flags: number, color: number, z: number, stencil: number): number {
+        if (this.gpuGone) return 0;
         d3d9PerfInc("clear");
         const clearColor = d3dColorToGpu(color);
         this.commandRecorder.setClear(clearColor, z, flags);
@@ -2800,6 +2839,17 @@ export class D3D9Device {
 
     getDrawScrub(): { min: number; max: number; lastFrameDraws: number } {
         return { min: this.scrubMin, max: this.scrubMax, lastFrameDraws: this.scrubLastFrameDraws };
+    }
+
+    /**
+     * No GPU device (lost, recreation in flight). Every draw/clear/present path dereferences
+     * `backend.getDevice()!`, so without this a lost device turns each of them into a TypeError
+     * thrown out of a guest thunk. The work is dropped instead: the frame is gone either way,
+     * and the caches it would have populated must not be rebuilt onto a device that is about to
+     * be replaced.
+     */
+    private get gpuGone(): boolean {
+        return this.backend.getDevice() === null;
     }
 
     /** Count this draw and report whether the scrub cuts it. Counted BEFORE the test so the
@@ -3190,6 +3240,7 @@ export class D3D9Device {
     }
 
     drawPrimitive(primitiveType: number, startVertex: number, primitiveCount: number): number {
+        if (this.gpuGone) return d3d9DropDraw("drawPrimitive:deviceLost");
         d3d9PerfInc("drawPrimitive");
         if (frameCapture.isCapturing()) {
             const ss = this.stateTracker.getStreamSource();
@@ -3559,6 +3610,7 @@ export class D3D9Device {
         vertexDataPtr: number,
         stride: number,
     ): number {
+        if (this.gpuGone) return d3d9DropDraw("drawIndexedPrimitiveUP:deviceLost");
         d3d9PerfInc("drawIndexedPrimitiveUP");
         if (primitiveCount <= 0 || numVertices <= 0 || stride <= 0) return 0;
         if (frameCapture.isCapturing()) {
@@ -3659,6 +3711,7 @@ export class D3D9Device {
     }
 
     drawPrimitiveUP(primitiveType: number, primitiveCount: number, vertexDataPtr: number, stride: number): number {
+        if (this.gpuGone) return d3d9DropDraw("drawPrimitiveUP:deviceLost");
         d3d9PerfInc("drawPrimitiveUP");
         if (primitiveCount <= 0) return 0;
         // harness capture (UP renders non-trilist too)
@@ -3837,6 +3890,7 @@ export class D3D9Device {
         startIndex: number,
         primitiveCount: number
     ): number {
+        if (this.gpuGone) return d3d9DropDraw("drawIndexedPrimitive:deviceLost");
         d3d9PerfInc("drawIndexedPrimitive");
         if (frameCapture.isCapturing()) {
             const ss = this.stateTracker.getStreamSource();
@@ -3977,6 +4031,10 @@ export class D3D9Device {
 
     async present(): Promise<number> {
         d3d9PerfInc("present");
+        // Nothing to present onto. Returning D3D_OK is the faithful answer for a Present on a
+        // lost device: real D3D9 answers D3DERR_DEVICELOST there, and TestCooperativeLevel
+        // (which the app polls for exactly this) already says so — see the loss contract.
+        if (this.gpuGone) return 0x88760868;
         const presentStart = frameProfiler.startTimer();
 
         // Frame Pacer: hold for the swap interval the device was created with.

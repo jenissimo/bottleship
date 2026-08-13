@@ -27,6 +27,7 @@ import { markGpuSyncedFromCpu, surfaceSyncManager } from "./surface-sync";
 import { EmulatorConfig } from "../../core/emulator-config-manager";
 import { onFrameEnd as frameCaptureOnFrameEnd } from "./frame-capture";
 import { statsOverlay } from "../../core/stats-overlay";
+import { registerGpuDeviceObserver } from "../../core/gpu/gpu-device-lifecycle";
 
 export class DDrawPresenter implements RenderActive {
     private process: Process;
@@ -57,6 +58,16 @@ export class DDrawPresenter implements RenderActive {
 
     constructor(process: Process) {
         this.process = process;
+        // `lastPresented` is a view onto a texture the dead device owned; keeping it would let
+        // repaintLastFrame / captureFrame present a handle that can never render again.
+        registerGpuDeviceObserver("ddraw-presenter", {
+            onDeviceLost: () => {
+                this.lastPresented = null;
+                this.interpolator = null;
+                this.lastBlendWidth = 0;
+                this.lastBlendHeight = 0;
+            },
+        });
     }
 
     /**

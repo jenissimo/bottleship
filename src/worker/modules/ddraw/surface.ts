@@ -5,12 +5,15 @@ import { System } from "../../core/system";
 import { profiler } from "../../core/profiler";
 import { frameVarianceDiagnostics } from "../../core/frame-variance-diagnostics";
 import { DDrawContext } from "./context";
+import { gpuDeviceUsable } from "../../core/gpu/gpu-device-lifecycle";
+import { isSurfaceLost, markSurfaceRestored } from "../../core/gpu/gpu-device-loss-contract";
 import { registerSurfaceV1Exports } from "./surface-v1";
 import {
     DD_OK,
     DDERR_NOTFOUND,
     DDERR_INVALIDPARAMS,
     DDERR_NOCLIPPERATTACHED,
+    DDERR_SURFACELOST,
     DDSCAPS_BACKBUFFER,
     DDSCAPS_FLIP,
     DDSCAPS_FRONTBUFFER,
@@ -2675,7 +2678,9 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         return DD_OK;
     };
 
-    // IsLost: report surface lost state (e.g. after Alt+Tab). We never lose surfaces in emu.
+    // IsLost: DD_OK = usable, DDERR_SURFACELOST = the video memory behind it is gone.
+    // Only a surface with no CPU copy can be lost here — see surface-device-loss.ts for why
+    // guest-memory-backed surfaces are system-memory surfaces and DirectDraw never loses those.
     exports["IDirectDrawSurface7_IsLost"] = (ctx, mem, args) => {
         const thisPtr = args[0];
         const obj = context.resourceProvider.getComObjectByAddress(thisPtr) as DirectDrawSurfaceObject | null;
@@ -2688,8 +2693,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
             );
             return DD_OK; // Graceful degradation - pretend surface is fine
         }
-        // In emu we never lose surfaces; always return DD_OK (not lost)
-        return DD_OK;
+        return isSurfaceLost(obj.getState()) ? DDERR_SURFACELOST : DD_OK;
     };
 
     // DeleteAttachedSurface(dwFlags, lpDDSAttachedSurface). A NULL surface detaches
@@ -2742,7 +2746,11 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         return (detached || !lpDDSAttachedSurface) ? DD_OK : DDERR_SURFACENOTATTACHED;
     };
 
-    // Restore: restore surface after loss. No-op in emu since we never lose.
+    // Restore: re-validate a lost surface. Its GPU texture was already dropped at loss, so the
+    // reallocation is the next draw's lazy create — which is also why the contents come back
+    // CLEARED. DirectDraw documents exactly that: after Restore the contents are undefined and
+    // the app must redraw. Refused while there is still no device, so an app that restores in a
+    // loop is told the truth rather than handed a surface that cannot be drawn into.
     exports["IDirectDrawSurface7_Restore"] = (ctx, mem, args) => {
         const thisPtr = args[0];
         const obj = context.resourceProvider.getComObjectByAddress(thisPtr) as DirectDrawSurfaceObject | null;
@@ -2750,6 +2758,11 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
             Logger.warn(LogCategory.DDRAW, `IDirectDrawSurface7_Restore: invalid this=0x${thisPtr.toString(16)}`);
             return DDERR_INVALIDPARAMS;
         }
+        const state = obj.getState();
+        if (!isSurfaceLost(state)) return DD_OK;
+        if (!gpuDeviceUsable()) return DDERR_SURFACELOST;
+        markSurfaceRestored(state);
+        Logger.log(LogCategory.DDRAW, `Restore: surface 0x${thisPtr.toString(16)} revalidated (contents undefined, per DirectDraw)`);
         return DD_OK;
     };
 

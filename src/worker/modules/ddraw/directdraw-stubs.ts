@@ -15,7 +15,6 @@ export function createDirectDrawStubsExports(context: DDrawContext): Record<stri
         "Compact",
         "RestoreDisplayMode",
         "GetSurfaceFromDC",
-        "RestoreAllSurfaces",
         "StartModeTest",
         "EvaluateMode",
     ];

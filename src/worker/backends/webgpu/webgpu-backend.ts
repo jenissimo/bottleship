@@ -1,9 +1,15 @@
 import { RenderBackend } from "../../runtime/runtime-services";
 import { Logger, LogCategory } from "../../core/logger";
 import { recordGpuError } from "../../core/gpu-error-log";
+import { gpuDeviceLifecycle } from "../../core/gpu/gpu-device-lifecycle";
 import { EmulatorConfig } from "../../core/emulator-config-manager";
 import { PostFxChain } from "./postfx/post-fx-chain";
 import { desktopBackground } from "../../runtime/desktop-background";
+
+/** Backoff between requestDevice attempts while recovering, in ms. The list also fixes how
+ *  many attempts there are: a GPU that has not come back by ~4s is gone, and retrying past
+ *  that only keeps the guest polling a device that will never arrive. */
+const RECREATE_BACKOFF_MS = [0, 100, 250, 500, 1000, 2000];
 
 export class WebGPUBackend implements RenderBackend {
     readonly kind = "webgpu";
@@ -51,11 +57,30 @@ export class WebGPUBackend implements RenderBackend {
     private postFx: PostFxChain | null = null;
 
 
+    /** Set while a replacement device is being requested — the retry is single-flight. */
+    private recreating: Promise<boolean> | null = null;
+    /** Set while a harness-forced destroy is in flight, so the loss can be labelled as ours. */
+    private forcingLoss = false;
+
     async initialize(canvas: OffscreenCanvas): Promise<void> {
         if (!("gpu" in navigator)) {
             throw new Error("WebGPU unavailable: navigator.gpu is absent — this browser/worker does not expose the WebGPU API.");
         }
+        const device = await this.requestDevice();
+        this.adoptDevice(device);
 
+        this.context = canvas.getContext("webgpu") as GPUCanvasContext | null;
+        if (!this.context) {
+            throw new Error("WebGPU unavailable: OffscreenCanvas.getContext('webgpu') returned null despite a valid device.");
+        }
+
+        this.format = navigator.gpu.getPreferredCanvasFormat();
+        this.configureContext();
+        this.createDeviceResources();
+    }
+
+    /** requestAdapter + requestDevice. Throws with the reason a caller can act on. */
+    private async requestDevice(): Promise<GPUDevice> {
         const adapter = await navigator.gpu.requestAdapter();
         if (!adapter) {
             throw new Error("WebGPU unavailable: requestAdapter() returned no adapter — no usable GPU (hardware acceleration disabled, GPU blocklisted, or VM/Remote Desktop with no GPU).");
@@ -69,32 +94,31 @@ export class WebGPUBackend implements RenderBackend {
         if (adapter.features.has("texture-compression-bc")) {
             requiredFeatures.push("texture-compression-bc");
         }
-        this.device = await adapter.requestDevice({ requiredFeatures });
-        this.bcSupported = this.device.features.has("texture-compression-bc");
-        this.queue = this.device.queue;
+        return await adapter.requestDevice({ requiredFeatures });
+    }
 
-        // Monitor device loss — after this fires, all GPU ops are no-ops (black screen)
-        this.device.lost.then((info) => {
-            recordGpuError("deviceLost", "device", `reason=${info.reason} ${info.message}`);
-            Logger.error(LogCategory.SYSTEM,
-                `[WEBGPU] Device LOST! reason=${info.reason} message="${info.message}"`);
-        });
+    /** Take ownership of a device: capabilities, queue, and the two error channels. */
+    private adoptDevice(device: GPUDevice): void {
+        this.device = device;
+        this.bcSupported = device.features.has("texture-compression-bc");
+        this.queue = device.queue;
+
+        // `lost` resolves once per device and never rejects. Bind the device it belongs to so
+        // a late resolution from a PREVIOUS device cannot tear down the current one.
+        void device.lost.then((info) => this.handleDeviceLost(device, info));
 
         // Async validation errors never throw, so this is the only thing standing between a
         // silently dropped draw call and nobody knowing. Counted as well as logged: the log
         // ring is far too short to still hold it by the time a picture looks wrong.
-        this.device.onuncapturederror = (event: GPUUncapturedErrorEvent) => {
+        device.onuncapturederror = (event: GPUUncapturedErrorEvent) => {
             recordGpuError("uncaptured", "device", event.error.message);
             Logger.error(LogCategory.DDRAW,
                 `[WEBGPU] Uncaptured error: ${event.error.message}`);
         };
+    }
 
-        this.context = canvas.getContext("webgpu") as GPUCanvasContext | null;
-        if (!this.context) {
-            throw new Error("WebGPU unavailable: OffscreenCanvas.getContext('webgpu') returned null despite a valid device.");
-        }
-
-        this.format = navigator.gpu.getPreferredCanvasFormat();
+    private configureContext(): void {
+        if (!this.context || !this.device || !this.format) return;
         this.context.configure({
             device: this.device,
             format: this.format,
@@ -104,9 +128,128 @@ export class WebGPUBackend implements RenderBackend {
             // reliably readable (see mirrorPresentedFrame).
             usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC,
         });
+    }
 
+    /** The backend's own eagerly-built resources. Everything else here is lazy. */
+    private createDeviceResources(): void {
+        if (!this.device || !this.format) return;
         this.postFx = new PostFxChain(this.device, () => EmulatorConfig.getInstance().quality);
         this.postFx.setFormat(this.format);
+    }
+
+    /**
+     * Every handle this class holds is derived from the device, so on loss they are all
+     * dead references. Nulled rather than destroyed — destroy() on a lost device's resource
+     * is meaningless, and the getters below recreate lazily from these nulls.
+     */
+    private dropDeviceResources(): void {
+        this.device = null;
+        this.queue = null;
+        this.screenMirror = null;
+        this.overlayPipeline = null;
+        this.overlayPipelineOpaque = null;
+        this.overlayPipelineFormat = null;
+        this.overlayTexture = null;
+        this.overlayTextureView = null;
+        this.overlaySampler = null;
+        this.overlayNearestSampler = null;
+        this.overlayVertexBuffer = null;
+        this.overlayBindGroup = null;
+        this.rectVertexBuffer = null;
+        this.rectsVertexBuffer = null;
+        this.rectsVertexBufferCapacity = 0;
+        this.statsTexture = null;
+        this.statsTextureView = null;
+        this.statsBindGroup = null;
+        this.statsVertexBuffer = null;
+        this.bindGroupCache = new WeakMap();
+        this.nearestBindGroupCache = new WeakMap();
+        this.rgb565Pipeline = null;
+        this.rgb565BindGroupCache = new WeakMap();
+        this.postFx = null;
+    }
+
+    /**
+     * The device died. Drop everything derived from it, tell every other cache to do the
+     * same, then go get another one.
+     *
+     * Ordering matters: the invalidation fan-out runs SYNCHRONOUSLY here, before any await,
+     * so no stale handle can be used by a frame that starts while we are asking for the
+     * replacement.
+     */
+    private handleDeviceLost(device: GPUDevice, info: GPUDeviceLostInfo): void {
+        if (device !== this.device) return;           // a previous device, already replaced
+        const forced = this.forcingLoss;
+        this.forcingLoss = false;
+
+        recordGpuError("deviceLost", "device", `reason=${info.reason} ${info.message}`);
+        Logger.error(LogCategory.SYSTEM,
+            `[WEBGPU] Device LOST! reason=${info.reason} forced=${forced} message="${info.message}"`);
+
+        this.dropDeviceResources();
+        gpuDeviceLifecycle.notifyLost(forced ? "forced" : info.reason, info.message);
+        void this.recreateDevice();
+    }
+
+    /**
+     * Ask for a replacement device and republish it. Single-flight: a second loss while a
+     * recreation is in flight joins the one already running rather than racing it.
+     */
+    private recreateDevice(): Promise<boolean> {
+        if (this.recreating) return this.recreating;
+        this.recreating = (async () => {
+            for (let attempt = 0; attempt < RECREATE_BACKOFF_MS.length; attempt++) {
+                const wait = RECREATE_BACKOFF_MS[attempt]!;
+                if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+                try {
+                    const device = await this.requestDevice();
+                    this.adoptDevice(device);
+                    // The canvas configuration belongs to the OLD device; a swap chain is not
+                    // transferable, so it has to be configured again before getCurrentTexture.
+                    this.configureContext();
+                    this.createDeviceResources();
+                    gpuDeviceLifecycle.notifyRecreated(device);
+                    return true;
+                } catch (err) {
+                    gpuDeviceLifecycle.countFailedAttempt();
+                    Logger.warn(LogCategory.SYSTEM,
+                        `[WEBGPU] device recreation attempt ${attempt + 1}/${RECREATE_BACKOFF_MS.length} failed: ${err instanceof Error ? err.message : String(err)}`);
+                }
+            }
+            gpuDeviceLifecycle.notifyUnavailable(
+                `requestDevice failed ${RECREATE_BACKOFF_MS.length}x — the adapter is gone`);
+            return false;
+        })().finally(() => { this.recreating = null; });
+        return this.recreating;
+    }
+
+    /**
+     * Lose the device on purpose (harness `gpuLoseDevice`). destroy() resolves `lost` with
+     * reason "destroyed" and everything downstream is the code path a real loss takes; the flag
+     * only lets the census label the loss as ours instead of the driver's.
+     */
+    async forceDeviceLoss(): Promise<boolean> {
+        const device = this.device;
+        if (!device) return false;
+        this.forcingLoss = true;
+        device.destroy();
+        // `lost` resolves a task later, so the caller has to wait for it or it observes the
+        // state from BEFORE the loss and reads a successful destroy as "nothing happened".
+        // handleDeviceLost is registered on this same promise first, so it has already run
+        // (synchronously, through the invalidation fan-out) when this await resumes.
+        await device.lost;
+        return await this.whenDeviceReady();
+    }
+
+    /** True while a device exists. Every GPU path's one question. */
+    isDeviceUsable(): boolean {
+        return this.device !== null && gpuDeviceLifecycle.isUsable();
+    }
+
+    /** Resolves once the in-flight recreation settles; true when a device is live. */
+    async whenDeviceReady(): Promise<boolean> {
+        if (this.recreating) return await this.recreating;
+        return this.device !== null;
     }
 
     /**

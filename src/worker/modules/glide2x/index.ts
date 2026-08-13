@@ -2,6 +2,7 @@ import { IModule } from "../../core/module";
 import { Process } from "../../core/process";
 import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { WebGPUBackend } from "../../backends/webgpu/webgpu-backend";
+import { registerGpuDeviceObserver } from "../../core/gpu/gpu-device-lifecycle";
 import { createGlideContext, GlideContext, GlideDebugInfo, GlideFrameSnapshot, resetGlideContextRuntime } from "./context";
 import { cloneFrameSnapshot, buildGlideDebugInfo } from "./diagnostics";
 import { createHardwareExports } from "./hardware";
@@ -26,11 +27,22 @@ export class Glide2x implements IModule {
         Object.assign(this.exports, createTextureExports(this.context));
         Object.assign(this.exports, createLfbExports(this.context));
         Object.assign(this.exports, createDrawExports(this.context));
+
+        // Device loss invalidates exactly what a backend swap does: the executor and every
+        // uploaded TMU texture. The texture records keep the guest `dataPtr` they were
+        // decoded from, so clearing `uploadedAt` makes grTexSource re-download them.
+        registerGpuDeviceObserver("glide2x", { onDeviceLost: () => this.invalidateGpuState() });
     }
 
     setBackend(backend: WebGPUBackend): void {
         if (!this.context) return;
         this.context.backend = backend;
+        this.invalidateGpuState();
+        // Re-created lazily on grSstWinOpen
+    }
+
+    private invalidateGpuState(): void {
+        if (!this.context) return;
         this.context.executor?.destroy();
         this.context.executor = null;
         for (const tmu of this.context.tmus) {
@@ -38,7 +50,6 @@ export class Glide2x implements IModule {
                 tex.uploadedAt = 0;
             }
         }
-        // Re-created lazily on grSstWinOpen
     }
 
     getFrameSnapshot(): GlideFrameSnapshot {

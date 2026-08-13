@@ -11,6 +11,7 @@ import { Logger, LogCategory } from '../../core/logger';
 import { allocateComObject as allocateGuardedComObject } from '../../core/com/com-memory';
 import { resetDeviceCursor } from '../../core/device-cursor';
 import type { BitmapTextureSurface, DirectDrawSurfaceState } from '../../modules/ddraw/com-objects';
+import { registerDDrawSurfaceSource } from '../../modules/ddraw/surface-device-loss';
 
 let vtables: Record<string, VTableInfo> | null = null;
 
@@ -76,6 +77,12 @@ export function resolveLockSurface(info: D3D8SurfaceInfo, device: D3D8DeviceAdap
 
 /** Surface COM ptr -> surface info */
 export const surfaceInfo: Map<number, D3D8SurfaceInfo> = new Map();
+
+// Device loss: these surface states are reachable from nowhere else (a D3D8 surface is not a
+// ddraw COM object), so they need their own source or they keep a dead GPU texture.
+registerDDrawSurfaceSource("d3d8-surfaces", function* () {
+    for (const [comAddr, info] of surfaceInfo) yield { state: info.surface, comAddr };
+});
 
 /** Texture COM ptr -> original D3DFMT (for GetDesc on texture-owned surfaces) */
 export const textureD3DFormat: Map<number, number> = new Map();

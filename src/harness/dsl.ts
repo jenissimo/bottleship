@@ -203,6 +203,14 @@ export class HarnessChain {
     glTextures(): this { return this.push("glTextures", []); }
     glDumpTexture(id: number): this { return this.push("glDumpTexture", [id]); }
 
+    // ── GPU device loss ──
+    /** Destroy the live GPUDevice on purpose — the same path a real `deviceLost` takes.
+     *  Waits for recovery and returns before/during/after state (`during` is sampled inside
+     *  the invalidation fan-out, the one instant the guest is told the device is lost). */
+    gpuLoseDevice(): this { return this.pushTimed("gpuLoseDevice", [], 30_000); }
+    /** Device status/generation plus what TestCooperativeLevel and IsLost would answer now. */
+    gpuDeviceState(): this { return this.push("gpuDeviceState", []); }
+
     // ── perf (frame profiler / worst-frames, POJO equivalent of the System Profiler) ──
     /** Arm (default) / disarm + optionally reset the worker frame profiler. */
     perfProfile(opts?: { enable?: boolean; reset?: boolean }): this { return this.push("perfProfile", [opts]); }

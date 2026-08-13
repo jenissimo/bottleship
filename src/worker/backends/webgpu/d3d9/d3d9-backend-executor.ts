@@ -168,6 +168,57 @@ export class D3D9BackendExecutor {
     }
 
     /**
+     * Every handle here is device-derived and rebuilt lazily from CPU-side state (pipelines
+     * from their descriptors, bind groups from the views they cache, the ring/uniform buffers
+     * on first use), so recovery is exactly "forget all of it". `pipelines` is INDEX-addressed
+     * by the pipeline cache in D3D9Device — dropping the array without dropping that cache
+     * would leave live ids pointing past the end, so the two are cleared together (see
+     * D3D9Device.onDeviceLost).
+     */
+    dropDeviceResources(): void {
+        this.pipelines = [];
+        this.pipelineInfo = [];
+        this.currentPipelineId = null;
+        this.bindGroupCache.clear();
+        this.uniformBuffer = null;
+        this.uniformBufferSize = 0;
+        this.vsUniformBuffer = null;
+        this.sampler = null;
+        this.offscreenTexture = null;
+        this.offscreenView = null;
+        this.depthTexture = null;
+        this.depthView = null;
+        this.presentedTexture = null;
+        this.hasPresented = false;
+        this.fallbackTexture = null;
+        this.fallbackTextureView = null;
+        this.fallbackCubeTexture = null;
+        this.fallbackCubeView = null;
+        this.progLayouts.clear();
+        this.progCacheSampler = [];
+        this.progCacheViews = new Array(this.progCacheN * PROG_BIND.MAX_TEX).fill(null);
+        this.progCacheGroup = [];
+        this.progCacheCubeMask = [];
+        this.progCacheHash = [];
+        this.progCacheIndex.clear();
+        this.progCacheLen = 0;
+        this.progCacheCursor = 0;
+        this.progCacheVsBuffer = null;
+        this.progCachePsBuffer = null;
+        this.ffpLayout = null;
+        this.ffpCacheSampler = [];
+        this.ffpCacheView = [];
+        this.ffpCacheStages = [];
+        this.ffpCacheGroup = [];
+        this.ffpCacheLen = 0;
+        this.ffpCacheCursor = 0;
+        this.ffpCacheBuffer = null;
+        this.lastBoundBindGroup = null;
+        this.lastAutoGroup = null;
+        this.autoLayouts = [];
+    }
+
+    /**
      * Register a pipeline and return its ID
      */
     registerPipeline(pipeline: GPURenderPipeline, hasTexture: boolean, programmable = false, ffpStageCount = 1): number {
@@ -524,8 +575,14 @@ export class D3D9BackendExecutor {
             depthStencil?: GPURenderPassDepthStencilAttachment;
         } | null,
     ): void {
-        const device = this.backend.getDevice()!;
-        const queue = this.backend.getQueue()!;
+        const device = this.backend.getDevice();
+        const queue = this.backend.getQueue();
+        // No device: every handle this frame would reference is dead and `submit` is a
+        // validated no-op. Discard the frame rather than build it against nothing.
+        if (!device || !queue) {
+            frame.releaseTemporaryBuffers();
+            return;
+        }
 
         // Reset state tracking for the new frame/renderPass
         this.currentPipelineId = null;

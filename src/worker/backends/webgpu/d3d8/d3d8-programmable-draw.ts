@@ -42,6 +42,15 @@ export class D3D8ProgrammableRenderer {
         this.backendExecutor = new D3D9BackendExecutor(backend);
     }
 
+    /** Device loss — driven by the adapter that owns this renderer, not registered separately,
+     *  so the two invalidate in one step and can never disagree about which device they are on. */
+    onDeviceLost(): void {
+        this.backendExecutor.dropDeviceResources();
+        // Pipeline ids index the executor's (now empty) pipeline array.
+        this.progPipelineCache.clear();
+        this.samplerCache = undefined;
+    }
+
     hasPendingWork(): boolean {
         return this.commandRecorder.hasWork();
     }

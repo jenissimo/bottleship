@@ -13,6 +13,7 @@ import { bindAutoDepthStencil, invalidateDevicePresentationSurfaces, resizeFulls
 import { isBitmapTexture } from '../ddraw/com-objects';
 import { D3DMaterial7Data, D3DLight7Data } from '../ddraw/d3d/types';
 import { gammaService } from '../../core/gamma-service';
+import { acknowledgeDeviceReset } from '../../core/gpu/gpu-device-loss-contract';
 import {
     isHardwareDeviceCursor, releaseDeviceCursor, setDeviceCursorImage,
     setDeviceCursorPosition, showDeviceCursor,
@@ -24,6 +25,7 @@ import { D3D8_MAX_STREAMS } from '../../backends/webgpu/d3d8/vsd-constants';
 const D3D_OK = 0;
 const D3DFMT_A8R8G8B8 = 21;
 const D3DERR_INVALIDCALL = 0x8876086c;
+const D3DERR_DEVICELOST = 0x88760868;
 const E_NOTIMPL = 0x80004001;
 
 // Render state name lookup for diagnostics
@@ -439,6 +441,9 @@ export function createStateExports(): Record<string, ThunkImplementation> {
         const devicePtr = args[0] >>> 0;
         const device = devices.get(args[0]);
         if (!device) return D3DERR_INVALIDCALL;
+        // No GPU device yet: a Reset cannot succeed, and real D3D8 says so rather than
+        // pretending — that answer is what keeps the app's poll loop honest.
+        if (!acknowledgeDeviceReset(devicePtr)) return D3DERR_DEVICELOST;
         const hr = device.reset(args[1], mem);
         if (hr !== D3D_OK) return hr;
         invalidateDevicePresentationSurfaces(args[0]);

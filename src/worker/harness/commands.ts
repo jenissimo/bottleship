@@ -33,6 +33,7 @@ import { registerDbgCommands } from "./cmds/dbg";
 import { registerCodegenCommands } from "./cmds/codegen";
 import { registerResourceCommands } from "./cmds/resources";
 import { registerHeapCommands } from "./cmds/heap";
+import { registerGpuCommands } from "./cmds/gpu";
 
 let installed = false;
 
@@ -48,6 +49,7 @@ export function installHarnessCommands(): void {
     registerBreakpointCommands(harnessService);
     registerTextureCommands(harnessService);
     registerGlCommands(harnessService);
+    registerGpuCommands(harnessService);
     registerFsCommands(harnessService);
     registerFixtureCommands(harnessService);
     registerRegistryCommands(harnessService);

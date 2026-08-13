@@ -13,6 +13,7 @@ import { profiler } from "../../../core/profiler";
 import { System } from "../../../core/system";
 import { frameProfiler } from "../../../core/frame-profiler";
 import { recordGpuError } from "../../../core/gpu-error-log";
+import { registerGpuDeviceObserver } from "../../../core/gpu/gpu-device-lifecycle";
 import { drawCostProfiler, DC } from "./draw-cost-profiler";
 import {
     createGPUTexture,
@@ -37,6 +38,9 @@ import {
     logSurfaceState,
 } from "../../../modules/ddraw/surface-sync";
 import { pumpReadbackPrefetch } from "../../../modules/ddraw/surface-readback-prefetch";
+// Side-effect import: registers the surface-side device-loss observer. Loaded here because
+// every ddraw AND d3d8 path goes through this executor, so no consumer can miss it.
+import "../../../modules/ddraw/surface-device-loss";
 import { isValidAddress } from "../../../modules/ddraw/helpers";
 import * as frameCapture from "../../../modules/ddraw/frame-capture";
 import {
@@ -283,23 +287,23 @@ function surfacePixelsAreBlank(state: DirectDrawSurfaceState): boolean {
  * Main executor class for DirectDraw WebGPU rendering
  */
 export class DDrawWebGPUExecutor {
-    private device: GPUDevice;
-    private queue: GPUQueue;
-    private swapChainFormat: GPUTextureFormat;
+    private device!: GPUDevice;
+    private queue!: GPUQueue;
+    private swapChainFormat!: GPUTextureFormat;
 
     // Modular components
     /** @internal — exposed for D3D8 single-submit present path */
-    ringBufferManager: RingBufferManager;
-    private bindGroupManager: BindGroupManager;
-    private depthManager: DepthManager;
-    private shaderGenerator: ShaderGenerator;
-    private pipelineFactory: PipelineFactory;
-    private clearPipeline: ClearPipeline;
+    ringBufferManager!: RingBufferManager;
+    private bindGroupManager!: BindGroupManager;
+    private depthManager!: DepthManager;
+    private shaderGenerator!: ShaderGenerator;
+    private pipelineFactory!: PipelineFactory;
+    private clearPipeline!: ClearPipeline;
     // Per-surface multisample COLOR texture manager (quality.msaa override). No-op when msaa===1.
-    private msaaColorManager: MsaaColorManager;
-    private colorKeyBlitPipeline: ColorKeyBlitPipeline;
-    private vertexConverter: VertexConverter;
-    private textureConverter: TextureConverter;
+    private msaaColorManager!: MsaaColorManager;
+    private colorKeyBlitPipeline!: ColorKeyBlitPipeline;
+    private vertexConverter!: VertexConverter;
+    private textureConverter!: TextureConverter;
 
     // Debug flags
     private debugFlags: DebugFlags = { ...DEFAULT_DEBUG_FLAGS };
@@ -469,17 +473,32 @@ export class DDrawWebGPUExecutor {
     private readonly clipPlanesPacked = new Float32Array(6 * 4);
     private readonly clipPlanesUploaded = new Float32Array(6 * 4);
 
+    /** No device: every entry point below bails instead of dispatching onto dead handles. */
+    private deviceLost = false;
+
     constructor(private backend: WebGPUBackend) {
-        this.device = backend.getDevice()!;
-        this.queue = backend.getQueue()!;
+        this.buildDeviceResources(backend.getDevice()!, backend.getQueue()!);
+        // Debug handle: pure-D3D8 games have no ddraw module context to hang the
+        // executor off, so dbg rstats/fstats fall back to this.
+        (globalThis as unknown as Record<string, unknown>).__ddrawExecutor = this;
+
+        // Every sub-manager below is built FROM the device, so a lost device makes all of
+        // them dead references at once — they are rebuilt as a set, never patched.
+        registerGpuDeviceObserver("ddraw-executor", {
+            onDeviceLost: () => this.onDeviceLost(),
+            onDeviceRecreated: (device) => this.onDeviceRecreated(device),
+        });
+    }
+
+    /** Everything this executor owns that is derived from the device, in one place. */
+    private buildDeviceResources(device: GPUDevice, queue: GPUQueue): void {
+        this.device = device;
+        this.queue = queue;
         // Persistent, zero-initialized clip-plane buffer (matches clipPlanesUploaded = 0).
         this.clipPlanesBuffer = this.device.createBuffer({
             size: FFP_CLIP_PLANES_BYTES,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
-        // Debug handle: pure-D3D8 games have no ddraw module context to hang the
-        // executor off, so dbg rstats/fstats fall back to this.
-        (globalThis as unknown as Record<string, unknown>).__ddrawExecutor = this;
 
         // Initialize modular components
         this.ringBufferManager = new RingBufferManager(this.device, this.queue);
@@ -489,7 +508,7 @@ export class DDrawWebGPUExecutor {
             enableDebugCopy: false,
         });
         this.shaderGenerator = new ShaderGenerator(this.device);
-        this.swapChainFormat = backend.getFormat() || "rgba8unorm"; // Fallback to rgba8unorm if format not available
+        this.swapChainFormat = this.backend.getFormat() || "rgba8unorm"; // Fallback to rgba8unorm if format not available
         this.pipelineFactory = new PipelineFactory(
             this.device,
             this.shaderGenerator,
@@ -512,6 +531,41 @@ export class DDrawWebGPUExecutor {
 
         // Initialize scratch buffer
         this.initScratchBuffer();
+    }
+
+    /**
+     * Device gone. Drop the in-flight frame WITHOUT touching the GPU (the encoder belongs to
+     * the dead device), then forget every cached handle. `deviceLost` gates the entry points
+     * until a replacement arrives — the sub-manager fields stay pointing at dead objects
+     * because they are non-nullable and are replaced wholesale on recreation.
+     */
+    private onDeviceLost(): void {
+        this.deviceLost = true;
+        this.currentEncoder = null;
+        this.currentRenderPass = null;
+        this.currentBatch = null;
+        this.encoderEpoch++;
+        this.lastBindGroup = null;
+        this.lastPipeline = null;
+        this.dummyTexture = null;
+        this.dummyTextureView = null;
+        this.mipGenerator = null;
+        this.sampleViewCache = new WeakMap();
+        this.lastAppliedMsaa = -1;
+    }
+
+    private onDeviceRecreated(device: GPUDevice): void {
+        this.buildDeviceResources(device, device.queue);
+        // A draw issued during the lost window may have parked an encoder built on the dead
+        // device; using it against the new device's resources is a validation error that
+        // costs the whole frame. Drop the in-flight frame a second time, on this edge too.
+        this.currentEncoder = null;
+        this.currentRenderPass = null;
+        this.currentBatch = null;
+        this.encoderEpoch++;
+        this.lastBindGroup = null;
+        this.lastPipeline = null;
+        this.deviceLost = false;
     }
 
     private resolveSurfaceTextureFormat(
@@ -3290,6 +3344,9 @@ export class DDrawWebGPUExecutor {
      *   instead of paying a separate clearPipeline pass.
      */
     flush(drainDeferredClears = true): void {
+        // No device: submitting is a silent no-op anyway, and the recorded commands would be
+        // built from handles that are already dead. Skip the whole frame instead.
+        if (this.deviceLost) return;
         this.renderStats.flushes++;
         this.flushBatch();
         this.ringBufferManager.flushUniforms();

@@ -16,6 +16,7 @@ import {
     resolvePalette,
 } from "./gpu-texture-utils";
 import { overlapsThunkCode } from "../../core/memory/address-guard";
+import { gpuDeviceUsable } from "../../core/gpu/gpu-device-lifecycle";
 import type { TextureConverter } from "../../backends/webgpu/ddraw/compute/texture-converter";
 import {
     decodeSurfaceFormatToRgba8,
@@ -1105,6 +1106,11 @@ export class SurfaceSyncManager {
         textureConverter?: TextureConverter,
         opts?: { fromPrefetch?: boolean }
     ): Promise<boolean> {
+        // A GPU→CPU readback on a lost device submits into nothing and then awaits a mapAsync
+        // that will never be satisfied by real work — the shape that turns one device loss
+        // into a stalled frame loop. There is nothing on the GPU to read back anyway.
+        if (!gpuDeviceUsable()) return false;
+
         // Prefer a version-matched in-flight prefetch over starting a second trip.
         // Prefetch itself must not await its own promise (deadlock).
         if (!opts?.fromPrefetch && await awaitInflightPrefetch(state)) {

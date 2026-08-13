@@ -19,6 +19,8 @@ export const D3D9_CONSTANTS = {
     D3DERR_INVALIDCALL: 0x8876086c,
     D3DERR_NOTFOUND: 0x8876086c,
     D3DERR_DEVICELOST: 0x88760868,
+    /** MAKE_D3DHRESULT(2153) — a device exists again; release D3DPOOL_DEFAULT and Reset(). */
+    D3DERR_DEVICENOTRESET: 0x88760869,
 
     // Primitive types
     D3DPT_POINTLIST: 1,

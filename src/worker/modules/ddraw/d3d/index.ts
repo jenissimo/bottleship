@@ -9,6 +9,7 @@ import { assignStubsOnce } from "../../../core/thunking/stub-merge";
 import { DDrawContext } from "../context";
 import { Logger, LogCategory } from "../../../core/logger";
 import { Direct3DDevice3Object, Direct3DDevice7Object } from "../com-objects";
+import { lostSurfaceCount } from "../../../core/gpu/gpu-device-loss-contract";
 
 import { createTextureManager } from "./texture-manager";
 import { createDrawHandler } from "./draw-handler";
@@ -267,10 +268,14 @@ export function registerFastPathD3DFunctions(dispatcher: any, context: DDrawCont
     }, { trivial: true });
 
     // ============================================================================
-    // IDirectDrawSurface4/7_IsLost — 10K calls/48 frames, trivial no-op in emu.
-    // Surfaces never become "lost" in our environment; always return DD_OK.
+    // IDirectDrawSurface4/7_IsLost — 10K calls/48 frames. Almost always DD_OK, and the
+    // fast path answers that without a thunk. It must NOT answer it unconditionally: after
+    // a device loss some surfaces really are lost, and this tier cannot resolve `this`
+    // cheaply — so it defers to the JS handler (return null) for as long as ANY surface is
+    // lost, which is a handful of frames per loss and never in a normal run.
     // ============================================================================
-    const isLostFn = (_cpu: any, _mem: Uint8Array, _mem32: Uint32Array, _view: DataView): number => DD_OK;
+    const isLostFn = (_cpu: any, _mem: Uint8Array, _mem32: Uint32Array, _view: DataView): number | null =>
+        lostSurfaceCount() === 0 ? DD_OK : null;
     dispatcher.registerFastPath('ddraw', 'IDirectDrawSurface4_IsLost', isLostFn, { trivial: true });
     dispatcher.registerFastPath('ddraw', 'IDirectDrawSurface7_IsLost', isLostFn, { trivial: true });
 

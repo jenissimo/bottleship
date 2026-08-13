@@ -120,6 +120,21 @@ export class VertexBufferStore {
     setGpuBuffer(index: number, buffer: GPUBuffer): void { this.gpuBuffers[index] = buffer; }
     setDirty(index: number, dirty: boolean): void { this.dirtyFlags[index] = dirty ? 1 : 0; }
 
+    /**
+     * Device loss: the GPU copies are dead handles, the `data` shadow is not. Forgetting the
+     * buffers and re-raising `dirty` is the whole restore — the upload path re-creates and
+     * re-fills each buffer from the shadow the next time it is drawn with.
+     * Returns how many live entries were dropped.
+     */
+    dropGpuResources(): number {
+        let n = 0;
+        for (let i = 0; i < this.count; i++) {
+            if (this.gpuBuffers[i]) { this.gpuBuffers[i] = null; n++; }
+            this.dirtyFlags[i] = 1;
+        }
+        return n;
+    }
+
     // Lock operations — returns guest pointer for the locked region
     lock(index: number, offset: number, size: number): number {
         const guestBase = this.guestPtrs[index];
@@ -351,6 +366,16 @@ export class IndexBufferStore {
 
     setGpuBuffer(index: number, buffer: GPUBuffer): void { this.gpuBuffers[index] = buffer; }
     setDirty(index: number, dirty: boolean): void { this.dirtyFlags[index] = dirty ? 1 : 0; }
+
+    /** Device loss — see VertexBufferStore.dropGpuResources. */
+    dropGpuResources(): number {
+        let n = 0;
+        for (let i = 0; i < this.count; i++) {
+            if (this.gpuBuffers[i]) { this.gpuBuffers[i] = null; n++; }
+            this.dirtyFlags[i] = 1;
+        }
+        return n;
+    }
 
     lock(index: number, offset: number, size: number): number {
         const guestBase = this.guestPtrs[index];
@@ -614,6 +639,27 @@ export class TextureStore {
         this.views[index] = view;
     }
     setDirty(index: number, dirty: boolean): void { this.dirtyFlags[index] = dirty ? 1 : 0; }
+
+    /**
+     * Device loss. A sampled texture keeps its `data` shadow and is restored by re-raising
+     * `dirty`; a RENDER TARGET has no shadow, because its only copy was the lost texture.
+     * That is the same thing real hardware does to a D3DPOOL_DEFAULT render target — the
+     * contents are gone and the app redraws them — so it is left un-dirtied rather than
+     * re-uploaded from a buffer that holds nothing.
+     * Returns `{dropped, contentLost}` so the loss report can say what did NOT come back.
+     */
+    dropGpuResources(): { dropped: number; contentLost: number } {
+        let dropped = 0, contentLost = 0;
+        for (let i = 0; i < this.count; i++) {
+            if (this.gpuTextures[i]) { dropped++; }
+            this.gpuTextures[i] = null;
+            this.views[i] = null;
+            if (this.rtFlags[i]) contentLost++;
+            else this.dirtyFlags[i] = 1;
+        }
+        return { dropped, contentLost };
+    }
+
     markRenderTarget(index: number): void { this.rtFlags[index] = 1; }
     isRenderTarget(index: number): boolean { return this.rtFlags[index] !== 0; }
     markCube(index: number): void { this.cubeFlags[index] = 1; }

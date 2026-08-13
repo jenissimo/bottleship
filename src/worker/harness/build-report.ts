@@ -13,6 +13,7 @@ import { getStackGuardViolations } from "../core/memory/stack-write-guard";
 import { hypercallDataManager } from "../core/cpu/hypercall-data";
 import { loadDiagnostics } from "../core/diagnostics/load-diagnostics";
 import { getGpuErrorReport, type GpuErrorReport } from "../core/gpu-error-log";
+import { gpuDeviceLifecycle, type GpuDeviceLifecycleReport } from "../core/gpu/gpu-device-lifecycle";
 import { pendingMessageBoxes } from "../runtime/dialog-bridge";
 
 const hx = (v: number) => "0x" + (v >>> 0).toString(16);
@@ -42,6 +43,12 @@ export interface HarnessReport {
      * non-GPU callback throws.) Carried here because the log ring cannot hold the first one.
      */
     gpuErrors: GpuErrorReport;
+    /**
+     * The GPU device's own lifecycle: `status:"lost"` means every draw since is a no-op and
+     * the picture on screen is stale — a diagnosis no pixel or counter can express, and the
+     * one that separates "the guest stopped drawing" from "the GPU stopped listening".
+     */
+    gpuDevice: GpuDeviceLifecycleReport;
     /**
      * Message boxes the guest is blocked on. The host draws them as DOM, so no canvas
      * capture can show one: without this, a guest waiting on an error box is indistinguishable
@@ -168,6 +175,7 @@ export function buildHarnessReport(esp?: number): HarnessReport {
         })),
         lastThunks: bt?.recent ?? [],
         gpuErrors: getGpuErrorReport(),
+        gpuDevice: gpuDeviceLifecycle.report(),
         pendingModals: pendingMessageBoxes(),
         stubs: stubRegistry.list().map((s) => ({
             api: s.key,
