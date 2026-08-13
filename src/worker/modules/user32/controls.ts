@@ -7,8 +7,9 @@
  */
 
 import { System } from '../../core/system';
-import { windows, isEffectivelyVisible, buttonCheckStates, listControlStates, controlImageHandles, getOrCreateTrackbarState, getChildrenInPaintOrder, getAbsoluteWindowPosition, getAncestorClipRect, isFullyCoveredByGuestChild } from './shared-state';
+import { windows, isEffectivelyVisible, buttonCheckStates, listControlStates, controlImageHandles, getOrCreateTrackbarState, getChildrenInPaintOrder, getAbsoluteWindowPosition, getAncestorClipRect, getHigherZSiblingRects, isFullyCoveredByGuestChild } from './shared-state';
 import type { GDIContext } from '../gdi32/context';
+import { subtractRects } from '../gdi32/context';
 import type { WindowInfo } from './shared-state';
 import { resolveBitmapRgba, resolveIconRgba, layoutStaticControlImage, blitStaticControlImage } from '../gdi32/bitmap-resolve';
 import { Logger, LogCategory } from '../../core/logger';
@@ -91,6 +92,13 @@ import {
     LVS_LIST,
     LVS_SHOWSELALWAYS,
 } from './list-view-control';
+import {
+    ensureTabLayout,
+    tabItemRect,
+    tabRowsHeight,
+    SELECTED_TAB_OFFSET as SELECTED_TAB_OFFSET_PX,
+    TCS_BOTTOM as TCS_BOTTOM_STYLE,
+} from './tab-control';
 import { restampOwnedPopups } from './paint-hooks';
 import { paintTraceEnabled, logChromeStamp } from './paint-trace';
 
@@ -278,12 +286,32 @@ export function paintSystemControl(
     // with the SAME rect (the parent's ancestors, not the parent) so a full repaint and
     // a single-control repaint cannot disagree about what is clipped.
     const clip = parentAbsX === undefined && parent ? getAncestorClipRect(parent) : null;
-    if (clip) {
-        if (clip.w <= 0 || clip.h <= 0) return false;
+    // WS_CLIPSIBLINGS: a guest-owned window in front of this control owns those
+    // pixels, and on a flat overlay only an explicit hole keeps this stamp out of
+    // them (a property page lives INSIDE its tab control's rect).
+    // A/B switch: restores the greedy stamp, i.e. reproduces the erased child window
+    // on demand. A check nobody has seen fail is indistinguishable from one that cannot.
+    const siblingHoles = (globalThis as { __noSiblingClip?: boolean }).__noSiblingClip
+        ? [] : getHigherZSiblingRects(child);
+    const clipped = !!clip || siblingHoles.length > 0;
+    if (clipped) {
+        if (clip && (clip.w <= 0 || clip.h <= 0)) return false;
         ctx.save();
-        ctx.beginPath();
-        ctx.rect(clip.x, clip.y, clip.w, clip.h);
-        ctx.clip();
+        if (clip) {
+            ctx.beginPath();
+            ctx.rect(clip.x, clip.y, clip.w, clip.h);
+            ctx.clip();
+        }
+        if (siblingHoles.length > 0) {
+            const keep = subtractRects({ x: absX, y: absY, w, h }, siblingHoles);
+            if (keep.length === 0) {
+                ctx.restore();
+                return false;
+            }
+            const path = new Path2D();
+            for (const r of keep) path.rect(r.x, r.y, r.w, r.h);
+            ctx.clip(path);
+        }
     }
 
     switch (controlClass) {
@@ -295,7 +323,7 @@ export function paintSystemControl(
             break;
         case 'sysanimate32':
         case 'sysanimate32_class':
-            if (clip) ctx.restore();
+            if (clipped) ctx.restore();
             return false;
         case 'edit':
             paintEdit(ctx, child, absX, absY, w, h);
@@ -312,6 +340,9 @@ export function paintSystemControl(
         case 'syslistview32':
             paintListView(ctx, child, absX, absY, w, h);
             break;
+        case 'systabcontrol32':
+            paintTabControl(ctx, child, absX, absY, w, h);
+            break;
         case 'scrollbar':
             paintScrollBar(ctx, child, absX, absY, w, h);
             break;
@@ -326,7 +357,7 @@ export function paintSystemControl(
             break;
     }
 
-    if (clip) ctx.restore();
+    if (clipped) ctx.restore();
     if (paintTraceEnabled) logChromeStamp(child.handle, `${controlClass} ${w}x${h}`);
     gdi.setOverlayDirty(true);
     return true;
@@ -1869,6 +1900,83 @@ function paintScrollBar(
         downEnabled: sb.enabled && sb.downEnabled,
         pressed: feedback.pressed,
     });
+}
+
+/**
+ * SysTabControl32 — the tab row plus the raised pane the pages sit in.
+ *
+ * The selected tab is drawn one pixel taller and two wider than its stored rect
+ * and overlaps the pane's top edge, which is what makes it read as "in front"
+ * in the classic theme; tabItemRect() therefore returns the UNSELECTED geometry
+ * for everyone (hit test included), exactly as comctl32 stores it.
+ */
+function paintTabControl(
+    ctx: OffscreenCanvasRenderingContext2D,
+    child: WindowInfo,
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+): void {
+    const state = ensureTabLayout(child);
+    const bottomTabs = (child.style & TCS_BOTTOM_STYLE) !== 0;
+    const rows = tabRowsHeight(child, state);
+    const disabled = isControlDisabled(child);
+
+    ctx.fillStyle = COLOR_BTNFACE;
+    ctx.fillRect(x, y, w, h);
+
+    // The display area's raised pane.
+    const paneTop = bottomTabs ? y : y + rows;
+    const paneH = Math.max(2, h - rows);
+    drawRaisedEdge(ctx, x, paneTop, w, paneH);
+
+    ctx.font = getWindowFont(child);
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+
+    for (let i = 0; i < state.items.length; i++) {
+        const r = tabItemRect(child, i);
+        if (!r) continue;
+        const selected = i === state.curSel;
+        const tx = x + r.left - (selected ? SELECTED_TAB_OFFSET_PX : 0);
+        const tw = Math.max(1, (r.right - r.left) + (selected ? SELECTED_TAB_OFFSET_PX * 2 : 0));
+        const ty = y + r.top - (selected && !bottomTabs ? SELECTED_TAB_OFFSET_PX : 0);
+        const th = Math.max(1, (r.bottom - r.top) + (selected ? SELECTED_TAB_OFFSET_PX : 0));
+        if (tx + tw <= x || tx >= x + w) continue;
+
+        ctx.fillStyle = COLOR_BTNFACE;
+        ctx.fillRect(tx, ty, tw, th);
+
+        // Classic tab: highlight on the two edges facing the pane's outside,
+        // shadow on the far side; the edge shared with the pane stays open.
+        ctx.fillStyle = COLOR_BTNHILIGHT;
+        ctx.fillRect(tx, ty, 1, th);
+        if (!bottomTabs) ctx.fillRect(tx, ty, tw - 1, 1);
+        ctx.fillStyle = COLOR_BTNSHADOW;
+        ctx.fillRect(tx + tw - 1, ty, 1, th);
+        if (bottomTabs) ctx.fillRect(tx, ty + th - 1, tw, 1);
+
+        const label = state.items[i].text;
+        if (label) {
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(tx + 2, ty, Math.max(1, tw - 4), th);
+            ctx.clip();
+            const textW = measureMnemonicText(ctx, label);
+            const textX = tx + Math.max(2, Math.floor((tw - textW) / 2));
+            const baseline = vcenterTextBaseline(ctx, ty, th);
+            if (disabled) {
+                fillDisabledTextWithMnemonic(ctx, label, textX, baseline, COLOR_BTNHILIGHT, COLOR_GRAYTEXT);
+            } else {
+                ctx.fillStyle = COLOR_BTNTEXT;
+                fillTextWithMnemonic(ctx, label, textX, baseline);
+            }
+            ctx.restore();
+        }
+    }
+
+    ctx.textBaseline = 'top';
 }
 
 function paintGenericControl(

@@ -79,6 +79,7 @@ import {
     MK_CONTROL as LV_MK_CONTROL,
     MK_SHIFT as LV_MK_SHIFT,
 } from './list-view-control';
+import { hitTestTab, selectTabFromUser, handleTabKey } from './tab-control';
 
 const WM_MOUSEMOVE   = 0x0200;
 const WM_LBUTTONDOWN = 0x0201;
@@ -1044,7 +1045,8 @@ function applyControlClassMouse(
     // a bar that never takes focus can never answer the keyboard.
     if (message === WM_LBUTTONDOWN
         && (controlClass === 'edit' || controlClass === 'listbox' || controlClass === 'combobox'
-            || controlClass === 'syslistview32' || controlClass === 'scrollbar'
+            || controlClass === 'syslistview32' || controlClass === 'systabcontrol32'
+            || controlClass === 'scrollbar'
             || (controlClass === 'button' && isButtonSystemControl(control)))) {
         System.getInstance().windowManager.setFocus(control.handle);
     }
@@ -1171,6 +1173,20 @@ function applyControlClassMouse(
                     screenY - absY,
                     mods,
                 );
+            }
+            return true;
+        }
+
+        case 'systabcontrol32': {
+            if (message !== WM_LBUTTONDOWN && message !== WM_LBUTTONDBLCLK
+                && message !== WM_LBUTTONUP) {
+                return false;
+            }
+            if (message === WM_LBUTTONUP) return true;
+            const { x: absX, y: absY } = getAbsoluteWindowPosition(control);
+            const hit = hitTestTab(control, screenX - absX, screenY - absY);
+            if (hit >= 0 && selectTabFromUser(control, hit)) {
+                repaintHost(control, hostHwnd);
             }
             return true;
         }
@@ -1321,6 +1337,14 @@ export function handleSystemControlKey(
 
     if (cls === 'syslistview32') {
         if (handleListViewKey(control, vKey, 0)) {
+            repaintHost(control, hostHwnd);
+            return true;
+        }
+        return false;
+    }
+
+    if (cls === 'systabcontrol32') {
+        if (handleTabKey(control, vKey)) {
             repaintHost(control, hostHwnd);
             return true;
         }

@@ -467,6 +467,36 @@ export function getChildWindowExclusions(
     return out;
 }
 
+/**
+ * Screen rects of the siblings ABOVE `child` in Z-order that own their own pixels.
+ *
+ * This is WS_CLIPSIBLINGS on a flat overlay. A system control's chrome covers its
+ * whole client, and Win32 clips that paint against the siblings in front of it —
+ * a property page sits INSIDE its tab control's rect and is a sibling above it, so
+ * without this the tab's next repaint erases the page and nothing asks for it back.
+ * children[0] is topmost, so "above" is every sibling before this one.
+ */
+export function getHigherZSiblingRects(
+    child: WindowInfo,
+): { x: number; y: number; w: number; h: number }[] {
+    if (child.parent === undefined) return [];
+    const parent = windows.get(child.parent);
+    if (!parent) return [];
+    const idx = parent.children.indexOf(child.handle);
+    if (idx <= 0) return [];
+    const out: { x: number; y: number; w: number; h: number }[] = [];
+    for (let i = 0; i < idx; i++) {
+        const sibling = windows.get(parent.children[i]!);
+        // Only a guest-owned window owns pixels a control must not overwrite; another
+        // system control is chrome we draw ourselves, in this same pass.
+        if (!sibling || sibling.isSystemControl || !isEffectivelyVisible(sibling)) continue;
+        if (sibling.width <= 0 || sibling.height <= 0) continue;
+        const origin = getAbsoluteWindowPosition(sibling);
+        out.push({ x: origin.x, y: origin.y, w: sibling.width, h: sibling.height });
+    }
+    return out;
+}
+
 /** True when a guest-owned child HWND covers the parent's client rect inside `inset`. */
 export function isCoveredByGuestChild(hwnd: number, inset = 0): boolean {
     const window = windows.get(hwnd);

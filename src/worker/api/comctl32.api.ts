@@ -172,6 +172,10 @@ export const comctl32Module: ModuleDescriptor = {
 
         // Property Sheet
         makeFunc("PropertySheetA", 1),
+        makeFunc("PropertySheetW", 1),
+        // The sheet frame's DLGPROC. Not a real comctl32 export — it exists so the
+        // thunk generator hands out a code address for DWLP_DLGPROC (see propsheet.ts).
+        makeFunc("PropertySheetDlgProc", 4),
         makeFunc("CreatePropertySheetPageA", 1),
         makeFunc("CreatePropertySheetPageW", 1),
         makeFunc("DestroyPropertySheetPage", 1),

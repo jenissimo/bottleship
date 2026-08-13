@@ -10,10 +10,6 @@ import { Mem } from "../core/memory/mem-accessor";
 import { Marshaler } from "../core/memory/marshaler";
 import { Logger, LogCategory } from "../core/logger";
 import { System } from "../core/system";
-import { WindowInfo, windows } from "./user32/shared-state";
-import { parseDlgTemplate, dluToPixelX, dluToPixelY, getDialogBaseUnits } from "./user32/dialog-template";
-import { createDialogChildren } from "./user32/dialog";
-import { findResourceInPE } from "./kernel32/resource";
 import { ensureAnimateControlClasses } from "./user32/animate-control";
 import { registerFlatSbExports, resetFlatSbState } from "./comctl32-flatsb";
 import {
@@ -21,6 +17,7 @@ import {
     initCommonControls,
     initCommonControlsEx,
 } from "./comctl32-init";
+import { propertySheet, propSheetDlgProc, resetPropSheetState } from "./comctl32-propsheet";
 
 type ImageListState = {
     count: number;
@@ -593,292 +590,21 @@ export class Comctl32 implements IModule {
             return 1; // TRUE
         };
 
-        /**
-         * PropertySheetA — HLE implementation.
-         *
-         * Reads PROPSHEETHEADER, resolves each page's DLGTEMPLATE resource,
-         * creates real dialog windows with child controls, then invokes
-         * WM_INITDIALOG on each page's dlgProc. This ensures GetDlgItem
-         * returns valid handles and SendMessage works on child controls.
-         *
-         * After all pages complete, we re-seed critical registry values
-         * (display dimensions, BPP) that the callbacks may have zeroed out
-         * (because our dialog controls return default/empty selections).
-         */
-        this.exports["PropertySheetA"] = (ctx, mem, args): number | ThunkResult => {
-            const lpPropSheetHeader = args[0] >>> 0;
-            if (!lpPropSheetHeader) {
-                Logger.warn(LogCategory.SYSTEM, "PropertySheetA: NULL header");
-                return 1;
-            }
+        // PropertySheetA/W — the real sheet lives in comctl32/propsheet.ts.
+        // `resolveHandle` closes over this module's HPROPSHEETPAGE table so the
+        // sheet never needs to know how a handle maps to a guest struct.
+        const resolveHandle = (hPage: number): number =>
+            this.propPageHandles.get(hPage >>> 0) ?? 0;
 
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        this.exports["PropertySheetA"] = (ctx, mem, args) =>
+            propertySheet(ctx, mem, args, false, resolveHandle);
+        this.exports["PropertySheetW"] = (ctx, mem, args) =>
+            propertySheet(ctx, mem, args, true, resolveHandle);
 
-            // --- Read PROPSHEETHEADERA ---
-            const dwFlags  = view.getUint32(lpPropSheetHeader + 0x04, true) >>> 0;
-            const nPages   = view.getUint32(lpPropSheetHeader + 0x18, true) >>> 0;
-            const ppsp     = view.getUint32(lpPropSheetHeader + 0x20, true) >>> 0;
-
-            const PSH_PROPSHEETPAGE = 0x0008;
-            const hasPropSheetPage = (dwFlags & PSH_PROPSHEETPAGE) !== 0;
-
-            Logger.log(LogCategory.SYSTEM,
-                `PropertySheetA: flags=0x${dwFlags.toString(16)}, nPages=${nPages}, ` +
-                `ppsp=0x${ppsp.toString(16)}, PSH_PROPSHEETPAGE=${hasPropSheetPage}`);
-
-            if (nPages === 0 || !ppsp) {
-                Logger.warn(LogCategory.SYSTEM, "PropertySheetA: no pages, returning IDOK");
-                return 1;
-            }
-
-            // When PSH_PROPSHEETPAGE is clear, ppsp is an array of HPROPSHEETPAGE handles
-            // (created by CreatePropertySheetPageA). Resolve each handle to its struct pointer.
-            let resolvedPpsp = ppsp;
-            let resolvedStride = 0; // will be computed from first struct below
-            const isHandleArray = !hasPropSheetPage;
-
-            if (isHandleArray) {
-                // Build an inline block of pointers-to-structs so the loop below works uniformly.
-                // We store the resolved guest pointers in a temporary u32 array in guest heap.
-                const system2 = System.getInstance();
-                const process2 = system2.process;
-                if (!process2) {
-                    Logger.warn(LogCategory.SYSTEM, "PropertySheetA: no process for handle resolution");
-                    return 1;
-                }
-                const ptrBlock = process2.memory.alloc(nPages * 4);
-                const ptrView = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-                for (let i = 0; i < nPages; i++) {
-                    const hPage = ptrView.getUint32(ppsp + i * 4, true) >>> 0;
-                    const guestCopy = this.propPageHandles.get(hPage) ?? 0;
-                    if (!guestCopy) {
-                        Logger.warn(LogCategory.SYSTEM,
-                            `PropertySheetA: handle[${i}]=0x${hPage.toString(16)} not found in propPageHandles`);
-                    }
-                    ptrView.setUint32(ptrBlock + i * 4, guestCopy, true);
-                }
-                // Rewrite resolvedPpsp to point at the newly built block;
-                // we need a stride of 4 (pointer) to index it.
-                // Override pageStride below by using resolvedStride=4 sentinel.
-                resolvedPpsp = ptrBlock;
-                resolvedStride = 4;
-            }
-
-            const system = System.getInstance();
-            // If we built a temporary pointer-block for the handle-array path, remember it for cleanup.
-            const ptrBlockToFree = isHandleArray ? resolvedPpsp : 0;
-
-            // --- Collect page info and create dialog windows ---
-            const PSP_DLGINDIRECT = 0x0001;
-
-            type PageInfo = {
-                dlgProc: number;
-                lParam: number;
-                pageIndex: number;
-                dialogHwnd: number;
-            };
-            const pages: PageInfo[] = [];
-
-            const firstPageSize = view.getUint32(resolvedPpsp, true) >>> 0;
-            // For the handle-array path resolvedStride is already 4 (pointer indirection).
-            // For the inline-pages path compute stride from the first struct's dwSize.
-            const pageStride = resolvedStride > 0 ? resolvedStride
-                : (firstPageSize >= 0x28 ? firstPageSize : 0x28);
-
-            for (let i = 0; i < nPages; i++) {
-                // In the inline-pages path each entry IS the struct.
-                // In the handle-array path each entry is a 4-byte guest pointer to the struct.
-                let pagePtr: number;
-                if (isHandleArray) {
-                    pagePtr = view.getUint32(resolvedPpsp + i * 4, true) >>> 0;
-                    if (!pagePtr) {
-                        Logger.warn(LogCategory.SYSTEM, `PropertySheetA: handle[${i}] resolved to NULL, skipping`);
-                        continue;
-                    }
-                } else {
-                    pagePtr = resolvedPpsp + i * pageStride;
-                }
-                const pageFlags  = view.getUint32(pagePtr + 0x04, true) >>> 0;
-                const hInstance  = view.getUint32(pagePtr + 0x08, true) >>> 0;
-                const pszTmpl   = view.getUint32(pagePtr + 0x0C, true) >>> 0;
-                const pfnDlgProc = view.getUint32(pagePtr + 0x18, true) >>> 0;
-                const lParam     = view.getUint32(pagePtr + 0x1C, true) >>> 0;
-
-                Logger.log(LogCategory.SYSTEM,
-                    `  Page[${i}]: dlgProc=0x${pfnDlgProc.toString(16)}, lParam=0x${lParam.toString(16)}, ` +
-                    `hInstance=0x${hInstance.toString(16)}, pszTemplate=0x${pszTmpl.toString(16)}, ` +
-                    `flags=0x${pageFlags.toString(16)}`);
-
-                if (!pfnDlgProc) continue;
-
-                // Resolve dialog template
-                let templatePtr = 0;
-                if (pageFlags & PSP_DLGINDIRECT) {
-                    // pszTemplate IS the DLGTEMPLATE pointer
-                    templatePtr = pszTmpl;
-                } else if (pszTmpl) {
-                    // pszTemplate is a resource identifier (MAKEINTRESOURCE or string)
-                    const moduleBase = hInstance || 0x00400000;
-                    const resourceName: number | string = pszTmpl < 0x10000
-                        ? pszTmpl
-                        : Marshaler.readString(mem, pszTmpl);
-                    const entry = findResourceInPE(mem, moduleBase, 5 /* RT_DIALOG */, resourceName);
-                    if (entry) {
-                        templatePtr = entry.moduleBase + entry.dataRVA;
-                        Logger.log(LogCategory.SYSTEM,
-                            `  Page[${i}]: resolved RT_DIALOG resource → 0x${templatePtr.toString(16)}`);
-                    } else {
-                        Logger.warn(LogCategory.SYSTEM,
-                            `  Page[${i}]: RT_DIALOG resource not found for ${typeof resourceName === 'number' ? '#' + resourceName : resourceName}`);
-                    }
-                }
-
-                // Parse template and create dialog window with child controls
-                let dialogHwnd = 0xF500 + i; // fallback fake handle
-                if (templatePtr) {
-                    try {
-                        const parsed = parseDlgTemplate(mem, templatePtr);
-                        const base = getDialogBaseUnits(parsed);
-                        Logger.log(LogCategory.SYSTEM,
-                            `  Page[${i}]: parsed template "${parsed.title}" ${parsed.cx}x${parsed.cy} DLU, ` +
-                            `${parsed.controls.length} controls`);
-
-                        const dlgWidth  = dluToPixelX(parsed.cx, base);
-                        const dlgHeight = dluToPixelY(parsed.cy, base);
-
-                        // A page is created HIDDEN — Win32 shows only the active one, and
-                        // not before PSN_SETACTIVE. Forcing WS_VISIBLE put every page of
-                        // every tab on the flat overlay at once and left the pump
-                        // delivering WM_PAINT to all of them and their controls.
-                        const pageStyle = (parsed.style & ~0x10000000) >>> 0;
-                        dialogHwnd = system.windowManager.createWindow(
-                            '#32770', parsed.title || '',
-                            pageStyle, parsed.exStyle,
-                            dluToPixelX(parsed.x, base), dluToPixelY(parsed.y, base),
-                            dlgWidth, dlgHeight,
-                            0, 0, hInstance || 0x400000, 0
-                        );
-
-                        const dialogInfo: WindowInfo = {
-                            handle: dialogHwnd,
-                            title: parsed.title || '',
-                            style: pageStyle,
-                            exStyle: parsed.exStyle,
-                            x: dluToPixelX(parsed.x, base),
-                            y: dluToPixelY(parsed.y, base),
-                            width: dlgWidth,
-                            height: dlgHeight,
-                            children: [],
-                            visible: false,
-                            wndProc: pfnDlgProc,
-                            userData: 0,
-                            cbWndExtra: 40,
-                            extraBytes: new Uint32Array(10),
-                        };
-                        windows.set(dialogHwnd, dialogInfo);
-
-                        // Create child controls from template
-                        if (parsed.controls.length > 0) {
-                            createDialogChildren(system, dialogHwnd, dialogInfo, parsed, hInstance || 0x400000);
-                        }
-
-                        Logger.log(LogCategory.SYSTEM,
-                            `  Page[${i}]: created dialog hwnd=0x${dialogHwnd.toString(16)} ` +
-                            `with ${dialogInfo.children.length} children`);
-                    } catch (e) {
-                        Logger.warn(LogCategory.SYSTEM,
-                            `  Page[${i}]: failed to parse DLGTEMPLATE at 0x${templatePtr.toString(16)}: ${e}`);
-                    }
-                }
-
-                pages.push({ dlgProc: pfnDlgProc, lParam, pageIndex: i, dialogHwnd });
-            }
-
-            if (pages.length === 0) {
-                Logger.warn(LogCategory.SYSTEM, "PropertySheetA: no valid dlgProcs, returning IDOK");
-                return 1;
-            }
-
-            const callbackManager = system.process?.dispatcher?.callbackManager;
-            if (!callbackManager) {
-                Logger.warn(LogCategory.SYSTEM, "PropertySheetA: no callback manager, returning IDOK");
-                return 1;
-            }
-
-            // Snapshot entire registry state BEFORE callbacks (to restore after)
-            // Callbacks interact with dialog controls → may write zeroed settings back
-            const registry = system.registry;
-            const registrySnapshot = registry.serialize();
-
-            const STACK_CLEANUP = 4;
-            callbackManager.saveSuspendedThunkContext(ctx, STACK_CLEANUP);
-
-            const WM_INITDIALOG = 0x0110;
-            let pageIndex = 0;
-
-            const completeThunk = (_ret: number): number | null => {
-                pageIndex++;
-                if (pageIndex < pages.length) {
-                    const next = pages[pageIndex];
-                    Logger.log(LogCategory.SYSTEM,
-                        `PropertySheetA: page[${next.pageIndex}] WM_INITDIALOG → 0x${next.dlgProc.toString(16)} ` +
-                        `hwnd=0x${next.dialogHwnd.toString(16)}`);
-                    callbackManager.invokeCallback(
-                        next.dlgProc,
-                        [next.dialogHwnd, WM_INITDIALOG, 0, next.lParam],
-                        0,
-                        completeThunk,
-                    );
-                    return null;
-                }
-
-                // All pages done — restore registry values that callbacks zeroed out
-                registry.restore(registrySnapshot);
-                Logger.log(LogCategory.SYSTEM,
-                    `PropertySheetA: restored registry snapshot after callbacks`);
-
-                // Clean up dialog windows. Dropping them from the user32 map alone leaves
-                // the WindowManager holding live windows: it keeps routing WM_PAINT to
-                // every page and control the sheet ever built, long after the sheet is
-                // gone, and each one costs the guest a pump turn.
-                for (const page of pages) {
-                    const info = windows.get(page.dialogHwnd);
-                    for (const childHwnd of info?.children ?? []) {
-                        windows.delete(childHwnd);
-                        system.windowManager.destroyWindow(childHwnd);
-                    }
-                    windows.delete(page.dialogHwnd);
-                    system.windowManager.destroyWindow(page.dialogHwnd);
-                }
-
-                // Free temporary pointer-block (handle-array path only)
-                if (ptrBlockToFree) {
-                    system.process?.memory.free(ptrBlockToFree);
-                }
-
-                Logger.log(LogCategory.SYSTEM,
-                    `PropertySheetA: all ${pages.length} pages initialized, returning IDOK`);
-                return 1;
-            };
-
-            const first = pages[0];
-            Logger.log(LogCategory.SYSTEM,
-                `PropertySheetA: page[${first.pageIndex}] WM_INITDIALOG → 0x${first.dlgProc.toString(16)} ` +
-                `hwnd=0x${first.dialogHwnd.toString(16)}`);
-            const { callbackId } = callbackManager.invokeCallback(
-                first.dlgProc,
-                [first.dialogHwnd, WM_INITDIALOG, 0, first.lParam],
-                0,
-                completeThunk,
-            );
-
-            return {
-                value: 1,
-                suspendedForCallback: true,
-                callbackId,
-                stackCleanup: STACK_CLEANUP,
-            };
-        };
+        // The sheet frame's DLGPROC needs a guest-visible code address; registering
+        // it as an export is what gives the thunk generator a stub to hand out.
+        // Nothing imports this name — DWLP_DLGPROC is the only way to observe it.
+        this.exports["PropertySheetDlgProc"] = propSheetDlgProc;
 
         this.exports["ImageList_GetIconSize"] = (_ctx, _mem, args) => {
             const handle = args[0] >>> 0;
@@ -900,6 +626,7 @@ export class Comctl32 implements IModule {
         this.imageLists.clear();
         this.nextPropPageHandle = 0x8000;
         this.propPageHandles.clear();
+        resetPropSheetState();
         resetFlatSbState();
     }
 }

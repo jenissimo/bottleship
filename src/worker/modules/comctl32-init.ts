@@ -64,7 +64,9 @@ function registerBarClasses(): void {
 }
 
 function registerTabClasses(): void {
-    registerClass("SysTabControl32", 4);
+    // controlClass is what makes the window a JS system control — without it the
+    // class name resolves but nothing paints, hit-tests or answers TCM_*.
+    registerClass("SysTabControl32", 4, "SysTabControl32");
     registerClass(TOOLTIPS_CLASS, 4);
 }
 

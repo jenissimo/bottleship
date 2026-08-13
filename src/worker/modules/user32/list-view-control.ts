@@ -10,6 +10,7 @@ import { encodeAnsi } from '../codepage-utils';
 import { WindowInfo, registerControlStatePurger } from './shared-state';
 import { SB_WIDTH } from './scrollbar-paint';
 import { controlClientInset } from './controls';
+import { postNotify, resetNotifyScratch } from './control-notify';
 
 // ---- Messages (LVM_FIRST = 0x1000) ----
 const LVM_FIRST = 0x1000;
@@ -260,8 +261,7 @@ export function getListViewState(hwnd: number): ListViewState | undefined {
 /** Clear module state (unit tests). */
 export function resetListViewStatesForTests(): void {
     listViewStates.clear();
-    notifyScratchBase = 0;
-    notifyScratchIndex = 0;
+    resetNotifyScratch();
 }
 
 export function isListViewContentMessage(msg: number): boolean {
@@ -464,53 +464,11 @@ function setItemImage(item: ListViewItem, subItem: number, iImage: number): void
 }
 
 // ---- WM_NOTIFY (posted; scratch valid until the parent's wndproc consumes it) ----
-// Same constraint as edit EN_*: a sync LRESULT sink cannot suspend into a guest
-// wndproc, so we post. A small ring of THUNK_DATA NMLISTVIEW buffers keeps the
-// struct alive across the pump hop without reuse races on nested notifies.
+// See control-notify.ts for why these are posted rather than sent.
 
 const NMLISTVIEW_SIZE = 44;
 const NMITEMACTIVATE_SIZE = 48;
 const NMLVKEYDOWN_SIZE = 20;
-const NOTIFY_SLOT_SIZE = 64;
-const NOTIFY_RING = 8;
-
-let notifyScratchBase = 0;
-let notifyScratchIndex = 0;
-
-function allocNotifySlot(): number {
-    const process = System.getInstance().process;
-    if (!process) return 0;
-    if (!notifyScratchBase) {
-        notifyScratchBase = process.memory.alloc(NOTIFY_SLOT_SIZE * NOTIFY_RING, 'THUNK_DATA', 'rw');
-    }
-    if (!notifyScratchBase) return 0;
-    const slot = notifyScratchBase + (notifyScratchIndex % NOTIFY_RING) * NOTIFY_SLOT_SIZE;
-    notifyScratchIndex++;
-    return slot;
-}
-
-function writeNmHdr(mem: Uint8Array, ptr: number, hwndFrom: number, idFrom: number, code: number): void {
-    const v = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-    v.setUint32(ptr, hwndFrom >>> 0, true);
-    v.setUint32(ptr + 4, idFrom >>> 0, true);
-    v.setUint32(ptr + 8, code >>> 0, true);
-}
-
-function postNotify(child: WindowInfo, code: number, fill: (ptr: number, mem: Uint8Array) => void): void {
-    const parent = child.parent;
-    if (!parent) return;
-    const process = System.getInstance().process;
-    const mem = process?.getCurrentMemory?.();
-    if (!mem) return;
-    const ptr = allocNotifySlot();
-    if (!ptr) return;
-    for (let i = 0; i < NOTIFY_SLOT_SIZE; i++) mem[ptr + i] = 0;
-    writeNmHdr(mem, ptr, child.handle, (child.controlId ?? 0) >>> 0, code);
-    fill(ptr, mem);
-    const system = System.getInstance();
-    system.windowManager.postMessage(parent, WM_NOTIFY, (child.controlId ?? 0) >>> 0, ptr);
-    system.scheduler.wakeMessageWaiters();
-}
 
 function postNmListView(
     child: WindowInfo,

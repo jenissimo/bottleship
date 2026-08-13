@@ -22,6 +22,11 @@ import {
     isListViewContentMessage,
     isListViewControl,
 } from './list-view-control';
+import {
+    handleTabMessage,
+    isTabContentMessage,
+    isTabControl,
+} from './tab-control';
 import { setScrollPos, getScrollPos, setScrollRange, getScrollRange, applyScrollInfo, readScrollInfo } from './scroll-state';
 import {
     paintSystemControl,
@@ -92,7 +97,8 @@ export function isContentChangingMessage(child: WindowInfo, msg: number): boolea
         || (msg >= 0x0401 && msg <= 0x0406)
         || (isEditControl(child) && isEditContentMessage(msg))
         || (isRichEditControl(child) && (isEditContentMessage(msg) || isRichEditContentMessage(msg)))
-        || (isListViewControl(child) && isListViewContentMessage(msg));
+        || (isListViewControl(child) && isListViewContentMessage(msg))
+        || (isTabControl(child) && isTabContentMessage(msg));
 }
 
 /**
@@ -172,6 +178,12 @@ export function handleSystemControlMessage(
     if (isListViewControl(child)) {
         const lvResult = handleListViewMessage(child, msg, wParam, lParam, mem);
         if (lvResult !== null) return lvResult;
+    }
+
+    // SysTabControl32 owns TCM_* (0x1300+); same gate reasoning as the listview.
+    if (isTabControl(child)) {
+        const tabResult = handleTabMessage(child, msg, wParam, lParam, mem);
+        if (tabResult !== null) return tabResult;
     }
 
     const readAnsiOrWideString = (ptr: number): string => readAnsiOrWideFromGuest(mem, ptr, textWidth);

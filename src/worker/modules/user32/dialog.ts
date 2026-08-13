@@ -385,6 +385,18 @@ function queueDialogDefaultCommand(hDlg: number): void {
     queueDialogCommand(hDlg, IDOK | (BN_CLICKED << 16), ok?.handle ?? 0);
 }
 
+const DLGC_WANTARROWS = 0x0001;
+
+/** WM_GETDLGCODE & DLGC_WANTARROWS for a JS-managed control. */
+function wantsArrowKeys(hwnd: number): boolean {
+    const win = windows.get(hwnd);
+    if (!win?.isSystemControl || win.wndProcSubclassed) return false;
+    const mem = System.getInstance().process?.getCurrentMemory?.();
+    if (!mem) return false;
+    const code = handleSystemControlMessage(win, 0x0087 /* WM_GETDLGCODE */, 0, 0, mem);
+    return (code & DLGC_WANTARROWS) !== 0;
+}
+
 /**
  * Shared keyboard handling for the modal pump and IsDialogMessage
  * (Tab / arrows / Enter-via-DEFID / Esc). Returns true if consumed.
@@ -416,6 +428,14 @@ function handleDialogKeyMessage(hDlg: number, message: number, wParam: number): 
     if (wParam === VK_LEFT || wParam === VK_UP || wParam === VK_RIGHT || wParam === VK_DOWN) {
         const previous = wParam === VK_LEFT || wParam === VK_UP;
         const focus = system.windowManager.getFocusHwnd();
+        // IsDialogMessage asks the focused control first: a control that answers
+        // WM_GETDLGCODE with DLGC_WANTARROWS owns the arrow keys, and the dialog
+        // manager must not steal them for group navigation (tab control, listbox,
+        // listview, edit).
+        if (focus && focus !== hDlg && isDescendantOfDialog(focus, hDlg)
+            && wantsArrowKeys(focus)) {
+            return false;
+        }
         const cur = (focus && isDescendantOfDialog(focus, hDlg)) ? focus : 0;
         const next = getNextDialogGroupItem(hDlg, cur, previous);
         if (next) {
@@ -664,6 +684,8 @@ function runModalDialog(
     ctx: any, mem: Uint8Array, hInstance: number, hWndParent: number,
     lpDialogFunc: number, dwInitParam: number, label: string,
     lpTemplate: number = 0,
+    /** stdcall bytes the CALLING thunk pops; DialogBoxParam's five args by default. */
+    callerStackCleanup: number = 5 * 4,
 ): any {
     if (!lpDialogFunc) {
         Logger.warn(LogCategory.USER32, `${label}: No dlgProc, returning IDOK`);
@@ -829,7 +851,7 @@ function runModalDialog(
     // Every x86 callback below is anchored to frame_esp via the frame mechanism,
     // so [frame_esp] = spinLoopAddress (written by _handleAsyncResult) is always
     // the callerRet the return-stub sees.
-    const stackCleanup = 5 * 4;
+    const stackCleanup = callerStackCleanup;
     const frameId = callbackManager.saveSuspendedThunkContext(ctx, stackCleanup, label);
     if (!frameId) {
         Logger.error(LogCategory.USER32, `${label}: failed to save suspended thunk context`);
@@ -1270,6 +1292,8 @@ function createModelessDialog(
     ctx: any, hInstance: number, title: string, hWndParent: number,
     lpDialogFunc: number, dwInitParam: number, label: string,
     lpTemplate: number = 0,
+    /** stdcall bytes the CALLING thunk pops; CreateDialogParam*'s five args by default. */
+    callerStackCleanup: number = 5 * 4,
 ): any {
     const system = System.getInstance();
     const mem = system.process?.v86?.mem8 ?? system.process?.v86?.v86?.cpu?.mem8;
@@ -1400,7 +1424,7 @@ function createModelessDialog(
             Logger.log(LogCategory.USER32, `${label}: firing ${totalCbtHooks} CBT hook(s) before WM_INITDIALOG`);
         }
 
-        const stackCleanup = 5 * 4; // CreateDialogParam* has 5 stdcall args
+        const stackCleanup = callerStackCleanup;
         callbackManager.saveSuspendedThunkContext(ctx, stackCleanup);
 
         // Phase: CBT -> WM_INITDIALOG -> activation (top-level) -> finalize.
@@ -1665,45 +1689,7 @@ export function createDialogExports(): Record<string, ThunkImplementation> {
     /**
      * EndDialog - Destroys a modal dialog box, returns control to owner
      */
-    exports['EndDialog'] = (_ctx, _mem, args) => {
-        const hDlg = args[0];
-        const nResult = args[1];
-
-        Logger.log(LogCategory.USER32, `EndDialog(0x${hDlg.toString(16)}, result=${nResult})`);
-
-        // Mark dialog as closed with result
-        const dialog = activeDialogs.get(hDlg);
-        if (dialog) {
-            dialog.result = nResult;
-            dialog.closed = true;
-            // Wine/NT: re-enable owner immediately in EndDialog.
-            if (dialog.disabledOwner) {
-                setWindowEnabled(dialog.disabledOwner, true);
-                dialog.disabledOwner = undefined;
-            }
-        }
-
-        const dialogInfo = windows.get(hDlg);
-        if (dialogInfo) {
-            resetControlInteractionState();
-            const ownerHwnd = dialogInfo.parent ?? 0;
-            if (ownerHwnd) {
-                markPendingActivation(ownerHwnd);
-            }
-
-            // NT EndDialog: SWP_HIDEWINDOW before the modal loop tears down.
-            dialogInfo.visible = false;
-            const wmWin = System.getInstance().windowManager.getWindow(hDlg);
-            if (wmWin) wmWin.visible = false;
-            eraseDialogOverlay(hDlg);
-
-            // Do not destroy HWND yet. Win32 lets the current DLGPROC keep
-            // using its controls after EndDialog; teardown starts after it returns.
-            Logger.log(LogCategory.USER32,
-                `EndDialog: modal teardown deferred for 0x${hDlg.toString(16)}`);
-        }
-        return 1; // TRUE
-    };
+    exports['EndDialog'] = (_ctx, _mem, args) => endModalDialog(args[0], args[1]);
 
     /**
      * GetDlgItem - Retrieves a handle to a control in the dialog box
@@ -2072,6 +2058,97 @@ export function createDialogExports(): Record<string, ThunkImplementation> {
  * Legacy check Р В Р’В Р В РІР‚В Р В Р’В Р Р†Р вЂљРЎв„ўР В Р вЂ Р В РІР‚С™Р РЋРЎС™ system controls now use DefWindowProcA thunk addresses instead.
  * Kept for safety: any wndProc in 0xFFFF0000-0xFFFFFFFF is definitely not valid x86 code.
  */
+/**
+ * EndDialog's whole effect, callable from HLE code that owns a modal dialog of
+ * its own (comctl32's property sheet). One definition so the sheet's OK/Cancel
+ * and the guest's EndDialog cannot diverge.
+ */
+export function endModalDialog(hDlg: number, nResult: number): number {
+    Logger.log(LogCategory.USER32, `EndDialog(0x${hDlg.toString(16)}, result=${nResult})`);
+
+    const dialog = activeDialogs.get(hDlg);
+    if (dialog) {
+        dialog.result = nResult;
+        dialog.closed = true;
+        // Wine/NT: re-enable owner immediately in EndDialog.
+        if (dialog.disabledOwner) {
+            setWindowEnabled(dialog.disabledOwner, true);
+            dialog.disabledOwner = undefined;
+        }
+    }
+
+    const dialogInfo = windows.get(hDlg);
+    if (dialogInfo) {
+        resetControlInteractionState();
+        const ownerHwnd = dialogInfo.parent ?? 0;
+        if (ownerHwnd) {
+            markPendingActivation(ownerHwnd);
+        }
+
+        // NT EndDialog: SWP_HIDEWINDOW before the modal loop tears down.
+        dialogInfo.visible = false;
+        const wmWin = System.getInstance().windowManager.getWindow(hDlg);
+        if (wmWin) wmWin.visible = false;
+        eraseDialogOverlay(hDlg);
+
+        // Do not destroy HWND yet. Win32 lets the current DLGPROC keep
+        // using its controls after EndDialog; teardown starts after it returns.
+        Logger.log(LogCategory.USER32,
+            `EndDialog: modal teardown deferred for 0x${hDlg.toString(16)}`);
+    }
+    return 1; // TRUE
+}
+
+/** True while `hDlg` is a modal dialog this manager is pumping. */
+export function isModalDialogActive(hDlg: number): boolean {
+    const dialog = activeDialogs.get(hDlg);
+    return !!dialog && !dialog.closed;
+}
+
+/**
+ * Create a MODELESS dialog straight from a DLGTEMPLATE, for an HLE module that
+ * builds its own frame. Returns the HWND to the calling thunk once WM_INITDIALOG
+ * and the activation chain have run — the app's own message loop drives it from
+ * there (comctl32's PSH_MODELESS sheet, which is how MFC always creates one).
+ */
+export function createModelessDialogFromTemplate(
+    ctx: any,
+    hInstance: number,
+    hWndParent: number,
+    lpDialogFunc: number,
+    dwInitParam: number,
+    label: string,
+    lpTemplate: number,
+    callerStackCleanup: number,
+): any {
+    return createModelessDialog(
+        ctx, hInstance, '', hWndParent, lpDialogFunc, dwInitParam,
+        label, lpTemplate, callerStackCleanup,
+    );
+}
+
+/**
+ * Run a modal dialog straight from a DLGTEMPLATE in guest memory, for an HLE
+ * module that builds its own frame (comctl32's PropertySheet). Same engine as
+ * DialogBoxIndirectParam — there is deliberately no second modal pump.
+ */
+export function runModalDialogFromTemplate(
+    ctx: any,
+    mem: Uint8Array,
+    hInstance: number,
+    hWndParent: number,
+    lpDialogFunc: number,
+    dwInitParam: number,
+    label: string,
+    lpTemplate: number,
+    callerStackCleanup: number,
+): any {
+    return runModalDialog(
+        ctx, mem, hInstance, hWndParent, lpDialogFunc, dwInitParam,
+        label, lpTemplate, callerStackCleanup,
+    );
+}
+
 export function isSentinelWndProc(wndProc: number): boolean {
     return (wndProc & 0xFFFF0000) === 0xFFFF0000;
 }

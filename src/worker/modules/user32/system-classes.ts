@@ -65,8 +65,15 @@ export function resetDefWindowProcCache(): void {
     cachedDefDlgProcAddr = 0;
 }
 
-/** Resolve (or allocate) the x86 thunk stub for a user32 export used as a wndProc. */
-function resolveWndProcStub(exportName: string): number {
+/**
+ * Resolve (or allocate) the x86 thunk stub for an export used as a wndProc.
+ *
+ * A window procedure must be a real code address: the guest can read it back
+ * through GWL_WNDPROC, CALL it, or subclass around it. Any HLE module that owns
+ * a window class or a dialog procedure of its own (comctl32's property sheet)
+ * gets its address from here rather than inventing a handle.
+ */
+export function resolveModuleWndProcStub(moduleName: string, exportName: string): number {
     const system = System.getInstance();
     const dispatcher = system.process?.dispatcher as any;
     const tg = dispatcher?.thunkGenerator;
@@ -76,12 +83,12 @@ function resolveWndProcStub(exportName: string): number {
     }
     const key = exportName.toLowerCase();
     // Prefer the stub generated during PE import processing.
-    let addr = tg.getExportAddress(`user32:${key}`) ?? tg.getExportAddress(key);
+    let addr = tg.getExportAddress(`${moduleName}:${key}`) ?? tg.getExportAddress(key);
     if (!addr) {
         // App didn't import it — allocate a stub on demand
         // (stdcall, 4 args: hWnd, Msg, wParam, lParam).
         try {
-            const { address, code } = tg.allocateOneStub('user32', exportName, 4, 'stdcall');
+            const { address, code } = tg.allocateOneStub(moduleName, exportName, 4, 'stdcall');
             const memArray = system.process?.getCurrentMemory();
             if (memArray && address + code.length <= memArray.length) {
                 writeGuestCode(memArray, code, address);
@@ -98,8 +105,15 @@ function resolveWndProcStub(exportName: string): number {
         Logger.warn(LogCategory.USER32, `Could not resolve ${exportName} thunk address`);
         return 0;
     }
+    // The dispatcher's return-address check must let this stub be entered from the
+    // callback stub pool: as a wndproc it IS a callback target.
+    (System.getInstance().process?.dispatcher as any)?.markWndProcStub?.(addr);
     Logger.log(LogCategory.USER32, `Resolved ${exportName} thunk address: 0x${addr.toString(16)}`);
     return addr;
+}
+
+function resolveWndProcStub(exportName: string): number {
+    return resolveModuleWndProcStub('user32', exportName);
 }
 
 export function getDefWindowProcAddress(): number {

@@ -184,6 +184,11 @@ const THUNK_REGION_END = 0x11000000;
  * The default window procedures a subclass chain calls through CallWindowProc. Their
  * stub IS the callback target, so their return address legitimately points into the
  * callback stub pool — for every other thunk that means a desynced stack.
+ *
+ * This is the fallback for a stub that came straight out of PE import processing and
+ * was never handed out as a window procedure by us; `markWndProcStub` is the primary
+ * record, and any HLE module that owns a window class or a dialog procedure of its
+ * own (comctl32's property sheet) registers through that.
  */
 function isDefaultWindowProcThunk(thunkName: string): boolean {
     return thunkName.includes('DefWindowProc')
@@ -198,6 +203,13 @@ export class ThunkDispatcher {
     private fastPathTable: Array<FastPathImplementation | null> = new Array(MAX_THUNK_ID).fill(null);
     /** Per-thunk fast-path hit counts — the census for the tier apiCensus cannot see. */
     private fastPathCounts = new Uint32Array(MAX_THUNK_ID);
+    /**
+     * Thunks whose stub is used AS a window procedure. Such a stub is a callback
+     * target, so [ESP] on entry is a callback return stub — the one shape the
+     * return-address check must not reject. Registered, not name-matched, so a new
+     * HLE window class cannot be forgotten (see markWndProcStub).
+     */
+    private wndProcThunkFlags = new Uint8Array(MAX_THUNK_ID);
 
     // Metadata tables (SoA - Struct of Arrays) to avoid object lookups in hot path
     private argCountsTable: Int8Array = new Int8Array(MAX_THUNK_ID).fill(-1);
@@ -1621,7 +1633,8 @@ export class ThunkDispatcher {
 
         this.fillStackArgs(espAtEntry, argCount);
 
-        const allowStubPoolRet = isDefaultWindowProcThunk(thunkName);
+        const allowStubPoolRet = this.wndProcThunkFlags[functionId] !== 0
+            || isDefaultWindowProcThunk(thunkName);
         if (!this.validateReturnAddrFast(espAtEntry, allowStubPoolRet)) {
             this._slowPathInvalidReturnPreCall(functionId, thunkName, espAtEntry, cpu);
             if (profileThunk) profiler.endAsync(thunkName);
@@ -1801,6 +1814,18 @@ export class ThunkDispatcher {
      * OPTIMIZED: Validate return address with minimal checks.
      * Memory validity is checked once per thunk, handles detached buffers.
      */
+    /**
+     * Declare that the stub at `stubAddress` is used as a window/dialog procedure,
+     * so it may be entered from the callback stub pool. Idempotent.
+     */
+    markWndProcStub(stubAddress: number): boolean {
+        const stub = this.thunkGenerator?.getStubByAddress?.(stubAddress >>> 0);
+        const id = stub?.functionId ?? -1;
+        if (id < 0 || id >= MAX_THUNK_ID) return false;
+        this.wndProcThunkFlags[id] = 1;
+        return true;
+    }
+
     private validateReturnAddrFast(esp: number, allowStubPoolRet = false): boolean {
         // Minimal bounds check. NOTE: ESP need NOT be 4-byte aligned. x86 permits
         // an unaligned stack pointer, and real compilers genuinely produce one:
@@ -2092,7 +2117,7 @@ export class ThunkDispatcher {
         if (typeof result === 'number') {
             reg32[0] = result >>> 0;
             this.winApiRing.recordReturnValue(result >>> 0); // crash-diagnosis ring
-            const allowStub = isDefaultWindowProcThunk(name);
+            const allowStub = this.wndProcThunkFlags[id] !== 0 || isDefaultWindowProcThunk(name);
             if (!this.validateReturnAddrFast(espAtEntry, allowStub)) {
                 this._slowPathInvalidReturn(id, name, espAtEntry, result, cpu);
                 this.boundaryKind = ThunkBoundaryKind.THUNK_STUB;
@@ -2144,7 +2169,7 @@ export class ThunkDispatcher {
         this.winApiRing.recordReturnValue(thunkRes.value >>> 0); // crash-diagnosis ring
 
         const mem8 = this.cachedMem8;
-        const allowStubSync = isDefaultWindowProcThunk(name);
+        const allowStubSync = this.wndProcThunkFlags[id] !== 0 || isDefaultWindowProcThunk(name);
         // Skip return address validation for SEH/callback thunks � ESP was moved to catch frame
         if (mem8 && !skipStackCheck && !this.validateReturnAddr(mem8, espAtEntry, `Sync thunk ${name}`, allowStubSync)) {
             Logger.error(LogCategory.THUNK,

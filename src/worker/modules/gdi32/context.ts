@@ -78,7 +78,7 @@ interface ScreenRect { x: number; y: number; w: number; h: number }
  * path boolean, and an even-odd stack of overlapping holes cancels itself back to
  * painted; splitting each survivor around each hole cannot.
  */
-function subtractRects(base: ScreenRect, holes: readonly ScreenRect[]): ScreenRect[] {
+export function subtractRects(base: ScreenRect, holes: readonly ScreenRect[]): ScreenRect[] {
     let out: ScreenRect[] = [base];
     for (const h of holes) {
         if (h.w <= 0 || h.h <= 0) continue;
