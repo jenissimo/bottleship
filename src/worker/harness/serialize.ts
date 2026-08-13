@@ -125,7 +125,13 @@ export function serializeThreads(): unknown {
             });
         }
     }
-    return { currentThreadId, runQueue, count: threads.length, threads };
+    // Suspend-vs-wait census: WAITING+suspendCount>0 is a legal, transient shape and a
+    // point-sampled thread list cannot show whether it ever happened. These cumulative
+    // counters can — `suspendOnWaiting: 0` means the suspend/wait interaction never arose.
+    return {
+        currentThreadId, runQueue, count: threads.length, threads,
+        suspendWait: sched.suspendWaitStats ? { ...sched.suspendWaitStats } : null,
+    };
 }
 
 /** Enumerate all surface-like COM objects backend-agnostically (DDraw/D3D7/D3D8). */

@@ -1183,7 +1183,8 @@ export const exports: Record<string, ThunkImplementation> = {
             ? virtualPrev
             : system.scheduler.suspendThread(hThread);
         Logger.log(LogCategory.KERNEL32,
-            `SuspendThread(hThread=0x${hThread.toString(16)}) -> ${prevCount === 0xFFFFFFFF ? 'INVALID_HANDLE' : prevCount}`);
+            `SuspendThread(hThread=0x${hThread.toString(16)}) -> ` +
+            (prevCount === 0xFFFFFFFF ? `FAILED (lastError=${system.scheduler.getLastError()})` : String(prevCount)));
         return { value: prevCount, stackCleanup: 4 };
     },
 

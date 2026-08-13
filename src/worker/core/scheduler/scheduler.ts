@@ -262,6 +262,17 @@ export class Scheduler {
      *    round-trip produced no switch. Recoverable waste.
      *  - realSwitch: performSwitch switched to a different thread (legitimate). noRunnable: nothing. */
     public roundTripStats = { ticks: 0, urgentTicks: 0, urgentNoReady: 0, selfReschedule: 0, realSwitch: 0, noRunnable: 0 };
+    /** Suspend-vs-wait interaction census. Every counter sits on a COLD branch (a suspend that
+     *  targets a waiter, a wake that lands on a suspended thread) — never on the ~1.4M/s
+     *  Suspend/Resume spin itself — so it costs nothing and makes an otherwise invisible,
+     *  non-deterministic class observable: `suspendOnWaiting` is the only input the
+     *  orthogonality rules change, so a zero there means a title cannot be affected by them.
+     *  Surfaced in the harness `threads` state (report(), state(["threads"])). */
+    public suspendWaitStats = {
+        suspendOnWaiting: 0, suspendOnAsyncPark: 0, suspendRefused: 0,
+        wakeWhileSuspended: 0, skippedSuspendedWaiter: 0,
+        reevalOnResume: 0, reevalSatisfied: 0,
+    };
     /** Per-thread wall-clock attribution: ms of worker time spent while each thread was
      *  the CURRENT thread (guest execution + its thunks' JS time). Accumulated on every
      *  performSwitch entry — the single switch primitive — so it covers all switch paths.
@@ -2786,13 +2797,43 @@ export class Scheduler {
 
         const prev = thread.suspendCount;
         if (thread.suspendCount > 0) thread.suspendCount--;
+        if (thread.suspendCount > 0) return prev;
 
-        if (thread.suspendCount === 0 && thread.state === ThreadState.SUSPENDED) {
+        if (thread.state === ThreadState.SUSPENDED) {
+            // SUSPENDED means "nothing left to wait for" — either it never waited, or its
+            // wait was satisfied while suspended and wakeThread parked the result in EAX.
             this.setThreadState(thread, ThreadState.READY);
             if (!this.runQueue.includes(thread.id)) this.runQueue.push(thread.id);
+        } else if (thread.state === ThreadState.WAITING && prev > 0) {
+            // `prev > 0`: only a call that actually RELEASED the last suspend re-evaluates.
+            // A stray Resume on a thread that was never suspended must stay free (engines that
+            // spin Suspend/Resume issue millions of them).
+            this.reevaluateWaitAfterResume(thread);
         }
 
         return prev;
+    }
+
+    /**
+     * Last resume of a thread whose wait is still outstanding. While suspended it was skipped
+     * by wakeWaitingThreadsForHandle, so a signal may have arrived and been taken by nobody;
+     * re-evaluate now — NT re-enters the wait when the suspend APC returns, which re-reads the
+     * object state. A wait with no object predicate (SLEEP/MESSAGE/ASYNC_THUNK) is left alone:
+     * its own waker (timer wheel / message post / async-restore FIFO) still owns it, and those
+     * wakes are delivered while suspended rather than skipped.
+     */
+    private reevaluateWaitAfterResume(thread: Thread): void {
+        const info = thread.waitInfo;
+        if (!info || info.handles.length === 0) return;
+        if (info.reason === WaitReason.SLEEP || info.reason === WaitReason.MESSAGE) return;
+
+        this.suspendWaitStats.reevalOnResume++;
+        const decision = this.syncObjects.checkWait(
+            info.handles, info.waitAll, thread.id, (tid) => this.threads.get(tid) ?? null);
+        if (!decision.ready) return;
+        this.suspendWaitStats.reevalSatisfied++;
+        this.syncObjects.consumeWait(decision, thread.id);
+        this.wakeThread(thread, decision.result);
     }
 
     /** Win32 SuspendThread: previous suspend count, or 0xFFFFFFFF on failure (last error set
@@ -2806,6 +2847,7 @@ export class Scheduler {
 
         const prev = thread.suspendCount;
         if (prev >= MAXIMUM_SUSPEND_COUNT) {
+            this.suspendWaitStats.suspendRefused++;
             this.setLastError(ERROR_SIGNAL_REFUSED);
             return 0xFFFFFFFF;
         }
@@ -2815,12 +2857,22 @@ export class Scheduler {
             this.setThreadState(thread, ThreadState.SUSPENDED);
             const idx = this.runQueue.indexOf(thread.id);
             if (idx >= 0) this.runQueue.splice(idx, 1);
-        }
-        // WAITING → SUSPENDED is valid: thread stays suspended, when wait completes
-        // it will check suspendCount before going READY
-        else if (thread.state === ThreadState.WAITING) {
+        } else if (thread.state === ThreadState.WAITING &&
+                   thread.waitInfo?.reason === WaitReason.ASYNC_THUNK) {
+            this.suspendWaitStats.suspendOnAsyncPark++;
+            // An async park is not a guest wait — it is resumed by the dispatcher's
+            // pendingAsyncRestores FIFO, which retries until the thread is runnable and so
+            // cannot lose a completion. Keep the historical flip; the FIFO's own guards
+            // (isThreadAsyncParked, canApplyCurrentThreadRestore) are written against it.
             this.setThreadState(thread, ThreadState.SUSPENDED);
+        } else if (thread.state === ThreadState.WAITING) {
+            this.suspendWaitStats.suspendOnWaiting++;
         }
+        // A real wait stays WAITING, with its waitInfo, its timeout timer and its WaitEngine
+        // registration intact: suspension is a SEPARATE condition from the wait (NT carries it
+        // on the suspend APC, and the object still satisfies the wait underneath). suspendCount
+        // alone keeps the thread off the CPU — wakeThread parks a satisfied wait in SUSPENDED,
+        // and resumeThread re-evaluates one that is still outstanding.
 
         return prev;
     }
@@ -2838,8 +2890,12 @@ export class Scheduler {
     suspendThreadFast(handle: number): number | null {
         const thread = this.getThreadByHandle(this.resolveHandle(handle));
         if (!thread || thread.state === ThreadState.TERMINATED) return null;
-        // At the cap the call FAILS and must set a last error — that is the slow path's job.
-        if (thread.suspendCount >= MAXIMUM_SUSPEND_COUNT) return null;
+        // A refusal at MAXIMUM_SUSPEND_COUNT is answered HERE, not deferred: suspendThread
+        // sets the last error itself and setLastError syncs the hypercall page GetLastError
+        // is served from, so nothing about the failure needs the slow path. Deferring it put
+        // an engine that spins Suspend/Resume — which is exactly the engine that saturates the
+        // count — permanently into the slow-dispatch swarm this fast path exists to avoid,
+        // at ~1.4M calls/s (Discworld Noir, with a NORMAL log line each).
         // Self-suspend (the Tin3 handshake: thread suspends ITSELF to yield to the driver
         // thread) is handled here too: suspendThread() flips the current thread RUNNING→
         // SUSPENDED, and the FastPath's NON-deferred thunk boundary then runs performSwitch,
@@ -3988,6 +4044,18 @@ export class Scheduler {
         // Set return value
         thread.context.eax = result >>> 0;
 
+        // A suspended thread's wait is satisfied exactly like anyone else's — it just does not
+        // get to run yet. Park it in SUSPENDED with the result already in EAX; the last
+        // ResumeThread releases it to READY. Nothing became runnable, so no switch is requested.
+        if (thread.suspendCount > 0) {
+            this.suspendWaitStats.wakeWhileSuspended++;
+            this.transitionTo(thread, ThreadState.SUSPENDED, null, thread.context);
+            Logger.verbose(LogCategory.THREAD,
+                `wakeThread: T${thread.id} ${reason !== undefined ? WAIT_REASON_NAMES[reason] : '?'} satisfied while suspended ` +
+                `(count=${thread.suspendCount}) -> SUSPENDED, result=0x${result.toString(16)}`);
+            return;
+        }
+
         this.transitionTo(thread, ThreadState.READY, null, thread.context);
 
         Logger.verbose(LogCategory.THREAD,
@@ -4010,6 +4078,11 @@ export class Scheduler {
             const thread = this.threads.get(threadId);
             if (!thread || thread.state !== ThreadState.WAITING || !thread.waitInfo) continue;
             if (thread.waitInfo.reason === WaitReason.SLEEP) continue;
+            // A suspended waiter cannot act on the signal, and these decisions CONSUME it
+            // (auto-reset event, semaphore count, mutex, CS lock semaphore). NT unlinks a
+            // suspended thread's wait block for exactly that reason, so the signal reaches a
+            // waiter that can use it; the last ResumeThread re-evaluates instead.
+            if (thread.suspendCount > 0) { this.suspendWaitStats.skippedSuspendedWaiter++; continue; }
 
             const decision = this.syncObjects.checkWait(
                 thread.waitInfo.handles, thread.waitInfo.waitAll, thread.id,
@@ -4085,6 +4158,13 @@ export class Scheduler {
         thread.state = newState;
     }
 
+    /** Runnable ⇔ READY *and* not suspended. suspendCount is the authority on whether a
+     *  thread may execute — state alone is not, now that a suspended thread can sit in
+     *  WAITING with a live wait (see suspendThread). */
+    private isRunnable(t: Thread | undefined): t is Thread {
+        return !!t && t.state === ThreadState.READY && t.suspendCount === 0;
+    }
+
     private pickNextRunnable(excludeId?: number): Thread | null {
         if (this.runQueue.length === 0) return null;
 
@@ -4093,7 +4173,7 @@ export class Scheduler {
         for (const id of this.bootstrapUntilFirstWait) {
             if (id !== excludeId) {
                 const t = this.threads.get(id);
-                if (t && t.state === ThreadState.READY) return t;
+                if (this.isRunnable(t)) return t;
             }
         }
 
@@ -4102,14 +4182,14 @@ export class Scheduler {
             const id = this.runQueue[i];
             if (id !== excludeId) {
                 const t = this.threads.get(id);
-                if (t && t.state === ThreadState.READY) return t;
+                if (this.isRunnable(t)) return t;
             }
         }
 
         // No different thread — return any ready thread
         for (let i = 0; i < this.runQueue.length; i++) {
             const t = this.threads.get(this.runQueue[i]);
-            if (t && t.state === ThreadState.READY) return t;
+            if (this.isRunnable(t)) return t;
         }
 
         return null;

@@ -360,11 +360,17 @@ describe("scheduler/suspendThread", () => {
         expect((s as any).runQueue).not.toContain(1);
     });
 
-    test("WAITING -> SUSPENDED (deferred resume checks suspendCount later)", () => {
+    // Suspension is ORTHOGONAL to waiting (NT carries it on the suspend APC, so the wait
+    // object still satisfies the wait underneath). A real wait therefore stays WAITING —
+    // see the "suspend ⟂ wait" block below for the behaviour that depends on it.
+    test("WAITING stays WAITING — suspendCount alone takes it off the CPU", () => {
         const s = new Scheduler();
         const t = inject(s, mkThread(1, ThreadState.WAITING));
+        t.waitInfo = { reason: WaitReason.SINGLE_OBJECT, handles: [0x1234], waitAll: false, timeoutTimerId: 0, alertable: false, csAddress: 0 } as any;
         s.suspendThread(t.handle);
-        expect(t.state).toBe(ThreadState.SUSPENDED);
+        expect(t.state).toBe(ThreadState.WAITING);
+        expect(t.suspendCount).toBe(1);
+        expect(t.waitInfo).not.toBeNull();
     });
 
     test("nested suspend increments count, stays SUSPENDED", () => {
@@ -397,14 +403,21 @@ describe("scheduler/suspendThread", () => {
         expect(t.lastError).toBe(ERROR_SIGNAL_REFUSED);
     });
 
-    // The fast path must defer at the cap: it cannot set a last error itself.
-    test("suspendThreadFast defers to the slow path at the cap", () => {
+    // The fast path answers the refusal ITSELF (suspendThread sets the last error, and
+    // setLastError syncs the page GetLastError reads). Deferring it sent the engine that
+    // saturates the count — the very engine this fast path exists for — through the
+    // slow-dispatch swarm on every one of its ~1.4M calls/s.
+    test("suspendThreadFast answers the cap refusal without deferring", () => {
         const s = new Scheduler();
         const t = inject(s, mkThread(1, ThreadState.RUNNING), { current: true });
         t.suspendCount = MAXIMUM_SUSPEND_COUNT - 1;
         expect(s.suspendThreadFast(t.handle)).toBe(MAXIMUM_SUSPEND_COUNT - 1);
-        expect(s.suspendThreadFast(t.handle)).toBeNull();
+
+        const refused = s.suspendThreadFast(t.handle);
+        expect(refused).not.toBeNull();                 // NOT deferred to the slow path
+        expect(refused! >>> 0).toBe(0xFFFFFFFF);
         expect(t.suspendCount).toBe(MAXIMUM_SUSPEND_COUNT);
+        expect(t.lastError).toBe(ERROR_SIGNAL_REFUSED); // the failure is fully reported here
     });
 });
 
@@ -425,6 +438,219 @@ describe("scheduler/resumeThread", () => {
         expect(s.resumeThread(t.handle)).toBe(2);
         expect(t.suspendCount).toBe(1);
         expect(t.state).toBe(ThreadState.SUSPENDED);
+    });
+});
+
+// ─── 5b. suspend ⟂ wait ────────────────────────────────────────────────────────
+// Suspension is a SEPARATE condition from the wait. NT models it as the builtin
+// suspend APC: the APC breaks the wait, blocks on the thread's suspend semaphore
+// (thredsup.c KiSuspendThread), and on resume the wait is RE-ENTERED with the
+// original due time (wait.c, the STATUS_KERNEL_APC arm + KiComputeWaitInterval).
+// Observably: the object still satisfies the wait, the timeout deadline keeps
+// running, and suspendCount — not the state — is what keeps the thread off the CPU.
+//
+// Our shape: the thread stays WAITING while suspended (so every waker still finds
+// it); a SATISFIED wait parks in SUSPENDED with the result already in EAX; a
+// consuming signal skips a suspended waiter (NT unlinks its wait block) and the
+// last ResumeThread re-evaluates instead.
+
+/** Park a thread on `h` from READY (so several can wait on one handle in one test). */
+function blockOn(s: Scheduler, t: Thread, handles: number[], timeoutMs: number | null = null, eip = 0x402000): Thread {
+    const ctx = { eip, esp: 0x290000, eax: 0 } as CpuContext;
+    (s as any).blockThread(t, WaitReason.SINGLE_OBJECT, handles, false, timeoutMs, false, 0, ctx);
+    return t;
+}
+
+describe("scheduler/suspend ⟂ wait", () => {
+    test("a signal that arrives while suspended is delivered on resume", () => {
+        const s = new Scheduler();
+        const t = mkBlockableCurrent(s, 1);
+        const h = s.createEvent(false, false);        // auto-reset, unsignaled
+        blockOn(s, t, [h]);
+        expect(t.state).toBe(ThreadState.WAITING);
+
+        s.suspendThread(t.handle);
+        s.setEvent(h);
+
+        // Skipped by the wake scan — it cannot act on the signal — so it is neither
+        // readied nor holding the event: still parked, still registered.
+        expect(t.state).toBe(ThreadState.WAITING);
+        expect((s as any).runQueue).not.toContain(1);
+        expect((s as any).waitEngine.getHandleWaiters(h)).toContain(1);
+
+        // The last resume re-evaluates the wait: the latched signal is consumed now.
+        expect(s.resumeThread(t.handle)).toBe(1);
+        expect(t.state).toBe(ThreadState.READY);
+        expect(t.context!.eax >>> 0).toBe(WAIT_OBJECT_0);
+        expect((s as any).runQueue).toContain(1);
+        expect((s as any).waitEngine.getHandleWaiters(h)).not.toContain(1);
+    });
+
+    test("resume of a still-unsatisfied wait returns to WAITING, not READY", () => {
+        const s = new Scheduler();
+        const t = mkBlockableCurrent(s, 1);
+        const h = s.createEvent(false, false);        // never signaled
+        blockOn(s, t, [h]);
+
+        s.suspendThread(t.handle);
+        expect(s.resumeThread(t.handle)).toBe(1);
+
+        expect(t.state).toBe(ThreadState.WAITING);    // NOT a return from a wait that never completed
+        expect(t.suspendCount).toBe(0);
+        expect(t.waitInfo!.handles).toEqual([h]);
+        expect((s as any).runQueue).not.toContain(1);
+        expect((s as any).waitEngine.getHandleWaiters(h)).toContain(1);
+        expect(t.context!.eax >>> 0).toBe(0);         // no result was invented
+    });
+
+    test("a wait satisfied while suspended parks in SUSPENDED, off the run queue, until resumed", () => {
+        const s = new Scheduler();
+        const t = mkBlockableCurrent(s, 1);
+        const ctx = { eip: 0x402000, esp: 0x290000, eax: 0 } as CpuContext;
+        // A MESSAGE wait consumes nothing on wake, so it is delivered to a suspended
+        // waiter rather than skipped — the guest re-polls its queue when it runs again.
+        (s as any).blockThread(t, WaitReason.MESSAGE, [], false, null, false, 0, ctx);
+
+        s.suspendThread(t.handle);
+        s.wakeMessageWaiters();
+
+        expect(t.state).toBe(ThreadState.SUSPENDED);  // wait complete, suspend still holds it
+        expect(t.waitInfo).toBeNull();
+        expect(t.context!.eax >>> 0).toBe(1);         // WaitMessage TRUE, banked
+        expect((s as any).runQueue).not.toContain(1);
+        expect((s as any).pickNextRunnable()).toBeNull();
+
+        s.resumeThread(t.handle);
+        expect(t.state).toBe(ThreadState.READY);
+        expect((s as any).runQueue).toContain(1);
+        expect(t.context!.eax >>> 0).toBe(1);         // the result survived the suspension
+    });
+
+    test("a timed wait suspended mid-flight still times out on schedule", () => {
+        const s = new Scheduler();
+        const t = mkBlockableCurrent(s, 1);
+        const h = s.createEvent(false, false);
+        blockOn(s, t, [h], 50);
+        expect(t.waitInfo!.timeoutTimerId).toBeGreaterThan(0);
+
+        s.suspendThread(t.handle);
+        const now = (s as any).timeService.nowMs();
+        expect(s.timerWheel.poll(now + 60)).toBe(1);  // the deadline is absolute, not "while running"
+
+        expect(t.state).toBe(ThreadState.SUSPENDED);
+        expect(t.waitInfo).toBeNull();
+        expect(t.context!.eax >>> 0).toBe(WAIT_TIMEOUT);
+
+        s.resumeThread(t.handle);
+        expect(t.state).toBe(ThreadState.READY);
+        expect(t.context!.eax >>> 0).toBe(WAIT_TIMEOUT);
+    });
+
+    test("nested suspends: the wait is delivered only when the LAST one drains", () => {
+        const s = new Scheduler();
+        const t = mkBlockableCurrent(s, 1);
+        const h = s.createEvent(false, false);
+        blockOn(s, t, [h]);
+
+        s.suspendThread(t.handle);
+        s.suspendThread(t.handle);
+        expect(t.suspendCount).toBe(2);
+        s.setEvent(h);
+
+        expect(s.resumeThread(t.handle)).toBe(2);
+        expect(t.suspendCount).toBe(1);
+        expect(t.state).toBe(ThreadState.WAITING);    // still suspended → no re-evaluation
+        expect((s as any).runQueue).not.toContain(1);
+
+        expect(s.resumeThread(t.handle)).toBe(1);
+        expect(t.state).toBe(ThreadState.READY);
+        expect(t.context!.eax >>> 0).toBe(WAIT_OBJECT_0);
+    });
+
+    test("a consuming signal goes to the runnable waiter, never to the suspended one", () => {
+        // NT unlinks a suspended thread's wait block, so an auto-reset event cannot be
+        // swallowed by a thread that will not run. Guards the skip in
+        // wakeWaitingThreadsForHandle against being dropped when the state stops saying it.
+        const s = new Scheduler();
+        const t1 = inject(s, mkThread(1, ThreadState.READY), { runnable: true });
+        const t2 = inject(s, mkThread(2, ThreadState.READY), { runnable: true });
+        const h = s.createEvent(false, false);        // auto-reset: exactly one winner
+        blockOn(s, t1, [h]);
+        blockOn(s, t2, [h], null, 0x403000);
+
+        s.suspendThread(t1.handle);                   // T1 is first in the waiter set
+        s.setEvent(h);
+
+        expect(t2.state).toBe(ThreadState.READY);
+        expect(t2.context!.eax >>> 0).toBe(WAIT_OBJECT_0);
+        expect(t1.state).toBe(ThreadState.WAITING);   // still parked, holding nothing
+        expect(t1.context!.eax >>> 0).toBe(0);
+    });
+
+    test("a READY thread with suspendCount > 0 is never picked to run", () => {
+        const s = new Scheduler();
+        const t = inject(s, mkThread(1, ThreadState.READY), { runnable: true });
+        t.suspendCount = 1;
+        expect((s as any).pickNextRunnable()).toBeNull();
+        t.suspendCount = 0;
+        expect((s as any).pickNextRunnable()).toBe(t);
+    });
+
+    // The census is what makes this class observable in a live guest (no title in the sweep
+    // suspends a waiter on its own). An instrument that always reads 0 is worse than none, so
+    // pin that each counter actually moves on the event it names.
+    test("suspendWaitStats counts each interaction it names", () => {
+        const s = new Scheduler();
+        const t = mkBlockableCurrent(s, 1);
+        const h = s.createEvent(false, false);
+        blockOn(s, t, [h]);
+
+        s.suspendThread(t.handle);
+        expect(s.suspendWaitStats.suspendOnWaiting).toBe(1);
+
+        s.setEvent(h);
+        expect(s.suspendWaitStats.skippedSuspendedWaiter).toBe(1);
+
+        s.resumeThread(t.handle);
+        expect(s.suspendWaitStats.reevalOnResume).toBe(1);
+        expect(s.suspendWaitStats.reevalSatisfied).toBe(1);
+
+        // A MESSAGE wake is delivered to a suspended waiter rather than skipped.
+        const t2 = inject(s, mkThread(2, ThreadState.READY), { runnable: true });
+        (s as any).blockThread(t2, WaitReason.MESSAGE, [], false, null, false, 0,
+            { eip: 0x403000, esp: 0x291000, eax: 0 } as CpuContext);
+        s.suspendThread(t2.handle);
+        s.wakeMessageWaiters();
+        expect(s.suspendWaitStats.wakeWhileSuspended).toBe(1);
+
+        t2.suspendCount = MAXIMUM_SUSPEND_COUNT;
+        s.suspendThread(t2.handle);
+        expect(s.suspendWaitStats.suspendRefused).toBe(1);
+
+        const t3 = inject(s, mkThread(3, ThreadState.WAITING));
+        t3.waitInfo = { reason: WaitReason.ASYNC_THUNK, handles: [], waitAll: false, timeoutTimerId: 0, alertable: false, csAddress: 0 } as any;
+        s.suspendThread(t3.handle);
+        expect(s.suspendWaitStats.suspendOnAsyncPark).toBe(1);
+        expect(s.suspendWaitStats.suspendOnWaiting).toBe(2); // t1 + t2, NOT the async park
+    });
+
+    // The async park is deliberately NOT orthogonal: it is not a guest wait, it is resumed by
+    // the dispatcher's pendingAsyncRestores FIFO, which RETRIES until the thread is runnable
+    // and so cannot lose a completion. Its guards are written against the state flip.
+    test("an async park is unchanged: WAITING -> SUSPENDED, and the completion is retried", () => {
+        const s = new Scheduler();
+        const t = inject(s, mkThread(1, ThreadState.WAITING));
+        t.waitInfo = { reason: WaitReason.ASYNC_THUNK, handles: [], waitAll: false, timeoutTimerId: 0, alertable: false, csAddress: 0 } as any;
+        t.context = { eip: 0x402000, esp: 0x290000, eax: 0 } as CpuContext;
+
+        s.suspendThread(t.handle);
+        expect(t.state).toBe(ThreadState.SUSPENDED);
+        expect(s.isThreadAsyncParked(1)).toBe(false);
+        expect(s.wakeThreadForAsyncCompletion(1)).toBe(false);  // stays queued in the FIFO
+
+        s.resumeThread(t.handle);
+        expect(t.state).toBe(ThreadState.READY);
+        expect(s.wakeThreadForAsyncCompletion(1)).toBe(true);   // now the FIFO drains it
     });
 });
 
