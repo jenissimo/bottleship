@@ -94,13 +94,31 @@ function toAddr(x: number | string): number {
     return (s.startsWith("0x") || s.startsWith("0X") ? parseInt(s.slice(2), 16) : parseInt(s, 16)) >>> 0;
 }
 
+/**
+ * Re-seat the whole dbg config on the wasm side. dbg_clear() is the ONLY way to zero
+ * DBG_STEP_COUNTER, and that counter is what silences a breakpoint: past DBG_MAX_DUMPS
+ * lines, dbg_on_instruction stops emitting the "<BP>" line the JS side listens for, so a
+ * bp armed after an earlier trace fires into a void. Arming therefore resets the counter
+ * and re-applies everything.
+ */
+function reseatDbgConfig(): void {
+    const w = wasm();
+    if (!w) return;
+    w.dbg_clear();
+    w.dbg_set_max_dumps(cfg.maxDumps >>> 0);
+    w.dbg_set_step_on_bp(cfg.stepOnBp >>> 0);
+    if (cfg.indirect) w.dbg_set_indirect(1);
+    for (const bp of cfg.bps) w.dbg_add_bp(bp >>> 0);
+    for (const a of cfg.watches) w.dbg_add_watch(a >>> 0);
+}
+
 function addBreakpoint(addr: number): boolean {
     const a = addr >>> 0;
     if (!cfg.bps.includes(a)) {
         cfg.bps.push(a);
     }
-    const w = wasm();
-    w?.dbg_add_bp(a);
+    if (cfg.maxDumps < 1_000_000) cfg.maxDumps = 1_000_000;
+    reseatDbgConfig();
     return true;
 }
 
@@ -139,11 +157,12 @@ export const dbg = {
         cfg.enabled = true;
         if (!cfg.bps.includes(a)) cfg.bps.push(a);
         const w = wasm(); if (!w) return false;
-        w.dbg_set_max_dumps((cfg.maxDumps || 1_000_000) >>> 0);
-        w.dbg_add_bp(a);
+        if (cfg.maxDumps < 1_000_000) cfg.maxDumps = 1_000_000;
+        reseatDbgConfig();                                   // also zeroes the dump counter
         if (w.jit_clear_cache_js) w.jit_clear_cache_js();   // drop any pre-compiled copy of the bp page
         w.dbg_enable(1);                                     // enable the <BP> dump (does NOT touch JIT)
-        console.log(`[dbg] bpFast 0x${a.toString(16)} — JIT stays ON; only the bp page is interpreted (page-gate).`);
+        console.log(`[dbg] bpFast 0x${a.toString(16)} — JIT stays ON; only the bp page is interpreted (page-gate). ` +
+            `Fires only if this address is a v86 BLOCK ENTRY (see the header note).`);
         return true;
     },
     /** Disable dumping (JIT stays off until reload). */

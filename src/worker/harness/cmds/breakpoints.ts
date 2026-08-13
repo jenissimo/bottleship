@@ -9,6 +9,13 @@
  * require JIT OFF — breakOn auto-calls dbg.enable() and warns that perf
  * collapses while armed. API breakpoints do NOT need JIT off → prefer them for
  * bring-up. Addresses inside the async-park spin loop are refused.
+ *
+ * SECOND hard constraint, and the one that produces silent zeroes: an EIP breakpoint
+ * only fires when the address is a v86 BLOCK ENTRY (the wasm hook runs once per block,
+ * and blocks end at call/ret/out/far or page-crossing flow, not at jmp/jcc). A bp on a
+ * mid-function instruction never fires however often the code runs — with JIT off just
+ * the same as with `fast:true`. Arm the function ENTRY (breakOnExport/breakOnSymbol do
+ * this by construction) and use trapWrites for "who writes this address".
  */
 
 import type { HarnessService, HarnessCtx } from "../service";
@@ -51,6 +58,9 @@ function armEip(addr: number, ctx: HarnessCtx, opts: { continuous?: boolean; pau
         dbg.bp(addr);        // arm the wasm interpreter breakpoint (persists across reloads via cfg)
         warning = "JIT is OFF while this breakpoint is armed — emulator perf collapses. clearBreaks() to restore.";
     }
+    warning += " BLOCK ENTRIES ONLY: this fires only if the address is where v86 starts a block " +
+        "(function entry / after a call or ret). A mid-function instruction NEVER fires even while the " +
+        "code runs — 0 hits is not evidence it did not execute. For 'who writes X', use trapWrites.";
     return new Promise((resolve) => {
         const id = eipBreaks.arm(addr, {
             runId: ctx.runId,
@@ -269,7 +279,16 @@ export function registerBreakpointCommands(svc: HarnessService): void {
     });
 
     /** breaks() — list all armed breakpoints. */
-    svc.register("breaks", () => ({ api: apiBreaks.list(), eip: eipBreaks.list(), symbolMaps: symbolMap.loaded() }));
+    svc.register("breaks", () => {
+        const eip = eipBreaks.list();
+        return {
+            api: apiBreaks.list(),
+            eip: eip.map((e) => (e.hits === 0
+                ? { ...e, note: "0 hits — an EIP bp only fires at a v86 BLOCK ENTRY, so this may mean 'not a block entry', not 'never executed'" }
+                : e)),
+            symbolMaps: symbolMap.loaded(),
+        };
+    });
 
     /** clearBreaks() — disarm everything (and restore JIT via dbg.clear()). */
     svc.register("clearBreaks", () => {

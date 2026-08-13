@@ -7,8 +7,16 @@
  * the fault-grade snapshot, emit breakHit, and (by default) stop the v86 loop so
  * the state stays inspectable.
  *
- * Reliability: this fires on EVERY interpreter pass through the armed eip (the
- * wasm logs each time), so it's reliable as long as JIT is OFF (dbg.enable()).
+ * BLOCK ENTRIES ONLY — the limit that makes a silent breakpoint possible.
+ * dbg_on_instruction runs once per cycle_internal, i.e. once per v86 BLOCK, not per
+ * instruction, and v86 ends a block at call/ret/out/int/far or page-crossing control
+ * flow — a plain jmp/jcc does NOT end one. An address that is not a block entry NEVER
+ * fires, with JIT off exactly as with `fast:true` (measured: a bp on a stub's first
+ * instruction fired 5/5 calls, one byte later 0/5 in both modes). So a breakpoint on a
+ * store or any mid-function instruction — the "known writer" shape — reports nothing
+ * while the code runs. Arm the enclosing function's ENTRY, or use trapWrites for a
+ * data question. `hits: 0` here is never evidence that the code did not execute.
+ *
  * It is NOT instruction-precise pausing — execution may advance a few
  * instructions between the log and our v86.stop(); breakHit reports the eip the
  * wasm logged.

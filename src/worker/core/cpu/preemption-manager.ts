@@ -351,6 +351,22 @@ export class PreemptionManager {
         this.setCycleLimit(0);
     }
 
+    /**
+     * Cap the NEXT slice at `insns` retired instructions (block-granular, so at least
+     * one block always runs). Distinct from requestImmediateExit(), whose limit of 0
+     * retires nothing: this is for a caller that needs bounded forward progress and
+     * then control back — MemWriteTrap closing a write-trap window before more stores
+     * can slip through it. `do_many_cycles_native` reads the limit ONCE per slice, so
+     * this only binds a slice that has not started yet: call it from a tick hook, not
+     * from inside a thunk. One JS round trip per `insns` — diagnostic use only.
+     * A limit already at 0 (async-park urgent exit) is left alone.
+     */
+    requestBoundedSlice(insns: number): void {
+        if (!this.initialized) return;
+        if (this.getCycleLimit() === 0) return;
+        this.setCycleLimit(Math.max(1, insns | 0));
+    }
+
     /** Read back the live cycle-limit slot (diagnostic). -1 if unavailable. A RUNNING
      *  thread observed with cycle_limit===0 means a per-tick prepareForExecution restore
      *  was missed after an async-park requestImmediateExit → v86 retires 0 instructions

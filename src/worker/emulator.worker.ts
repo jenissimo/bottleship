@@ -10,6 +10,7 @@ import { System } from "./core/system";
 };
 import { APIRegistry } from "./core/api-registry";
 import { memoryWatch } from "./core/memory/memory-watch";
+import { memWriteTrap } from "./core/memory/mem-write-trap";
 import { Kernel32 } from "./modules/kernel32";
 import { User32 } from "./modules/user32";
 import { GDI32 } from "./modules/gdi32";
@@ -2706,6 +2707,10 @@ const initV86 = async (canvas: OffscreenCanvas) => {
           const urgentExit = !!curThread && curThread.state === ThreadState.WAITING;
           system.scheduler.noteRoundTripTick(urgentExit);
           preemptionManager.prepareForExecution(cpu, urgentExit);
+          // AFTER the budget is set: an armed write trap narrows this slice to one
+          // block while it waits for a faulting store to retire, and re-protects the
+          // page the moment it has. No-op (one boolean) when nothing is armed.
+          memWriteTrap.onTickBoundary(cpu);
           hypercallDataManager.updateTimeData();
           // Robust unified-clock activation. The one-shot enable() gates in loadPeData
           // (~651) and the v86-init block (~1389) race with stub registration and v86
