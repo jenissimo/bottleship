@@ -603,6 +603,15 @@ function hitTestSystemControlRecursive(
 
 const WM_PAINT = 0x000F;
 
+/** DefDlgProc epilogue messages (Wine defdlg.c) — see answersWithDlgProcResult. */
+const WM_CTLCOLOR16 = 0x0019;
+const WM_VKEYTOITEM = 0x002E;
+const WM_CHARTOITEM = 0x002F;
+const WM_QUERYDRAGICON = 0x0037;
+const WM_COMPAREITEM = 0x0039;
+const WM_CTLCOLORMSGBOX = 0x0132;
+const WM_CTLCOLORSTATIC = 0x0138;
+
 function clientLParamToScreen(hwnd: number, lParam: number): { x: number; y: number } {
     const clientX = lParam & 0xFFFF;
     const clientY = (lParam >>> 16) & 0xFFFF;
@@ -1836,7 +1845,11 @@ export function createDialogExports(): Record<string, ThunkImplementation> {
         return getNextDialogGroupItem(hDlg, hCtl, bPrevious);
     };
 
-    const defDlgProc = (ctx: any, mem: Uint8Array, args: number[]): number | ThunkResult => {
+    /**
+     * The half of DefDlgProc that runs when the dialog procedure declined the message —
+     * Wine's DEFDLG_Proc plus the DefWindowProc fallback it ends in.
+     */
+    const defDlgDefaultProcessing = (ctx: any, mem: Uint8Array, args: number[]): number | ThunkResult => {
         const hDlg = args[0];
         const Msg = args[1];
         const wParam = args[2];
@@ -1946,6 +1959,106 @@ export function createDialogExports(): Record<string, ThunkImplementation> {
         }
 
         return 0; // Default processing
+    };
+
+    /**
+     * Messages whose answer is the dialog procedure's own BOOL rather than DWLP_MSGRESULT
+     * (Wine defdlg.c, USER_DefDlgProc epilogue).
+     */
+    const answersWithDlgProcResult = (Msg: number): boolean =>
+        (Msg >= WM_CTLCOLORMSGBOX && Msg <= WM_CTLCOLORSTATIC)
+        || Msg === WM_CTLCOLOR16 || Msg === WM_COMPAREITEM || Msg === WM_VKEYTOITEM
+        || Msg === WM_CHARTOITEM || Msg === WM_QUERYDRAGICON || Msg === WM_INITDIALOG;
+
+    /** Messages the dialog manager must NOT default-process when the DlgProc declines. */
+    const NO_DEFAULT_PROCESSING = new Set(
+        [WM_INITDIALOG, WM_VKEYTOITEM, WM_COMPAREITEM, WM_CHARTOITEM]);
+
+    /** hwnd:msg:wParam:lParam of a DlgProc call in flight — a DlgProc that itself calls
+     *  DefDlgProc would otherwise recurse until the callback pool is exhausted. */
+    const dlgProcInFlight = new Set<string>();
+
+    /**
+     * DefDlgProc — the window procedure of the `#32770` class, and the ONLY route to a
+     * subclassed dialog's DlgProc. Win32 keeps the app's procedure in DWLP_DLGPROC and
+     * calls it from here; when it answers FALSE, the dialog manager's own default
+     * processing runs (Wine defdlg.c USER_DefDlgProcA). A subclasser (MFC's AfxWndProc,
+     * a skinning library, a raw SetWindowLong) saves the address GWL_WNDPROC reported and
+     * CallWindowProc's it for everything it does not consume — so without this call the
+     * app's DlgProc never sees WM_COMMAND at all, and a dialog whose Cancel/OK handler
+     * lives there can never be dismissed.
+     */
+    const defDlgProc = (ctx: any, mem: Uint8Array, args: number[]): number | ThunkResult => {
+        const hDlg = args[0] >>> 0;
+        const Msg = args[1] >>> 0;
+        const wParam = args[2] >>> 0;
+        const lParam = args[3] >>> 0;
+
+        const win = windows.get(hDlg);
+        const dlgProc = (win?.extraBytes?.[1] ?? 0) >>> 0;
+        // NT clears DWLP_MSGRESULT before the dialog procedure runs; the epilogue reads
+        // back whatever the procedure stored there.
+        if (win?.extraBytes) win.extraBytes[0] = 0;
+
+        const finish = (dlgResult: number): number | ThunkResult => {
+            if (!dlgResult && windows.has(hDlg)) {
+                if (!NO_DEFAULT_PROCESSING.has(Msg)) return defDlgDefaultProcessing(ctx, mem, args);
+            }
+            if (answersWithDlgProcResult(Msg)) return dlgResult >>> 0;
+            return (windows.get(hDlg)?.extraBytes?.[0] ?? 0) >>> 0;
+        };
+
+        // WM_PAINT's default processing is itself a multi-step guest sequence (erase +
+        // owner-draw chain) that has to own THIS thunk's return path, so it cannot run
+        // from another callback's completion — the dialog then composites empty. The
+        // dialog procedure still receives WM_PAINT through normal dispatch; only the
+        // DefDlgProc → DWLP_DLGPROC hop for it is ours to skip.
+        if (Msg === WM_PAINT) return defDlgDefaultProcessing(ctx, mem, args);
+
+        // Our dispatch calls a dialog's DlgProc directly while it is still the window
+        // proc, so only the subclassed case — where DWLP_DLGPROC is the sole remaining
+        // route to it — is called from here; otherwise every message would arrive twice.
+        const callbackManager = System.getInstance().process?.dispatcher?.callbackManager;
+        const key = `${hDlg}:${Msg}:${wParam}:${lParam}`;
+        if (dlgProc && dlgProc !== ((win?.wndProc ?? 0) >>> 0)
+            && !isSentinelWndProc(dlgProc) && callbackManager && !dlgProcInFlight.has(key)) {
+            const stackCleanup = 16;
+            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            const returnAddr = view.getUint32(ctx.esp, true) >>> 0;
+            dlgProcInFlight.add(key);
+            const invoked = callbackManager.invokeCallback(
+                dlgProc, [hDlg, Msg, wParam, lParam], 0, undefined, false, 'DefDlgProc:DlgProc',
+                undefined,
+                {
+                    // A nested guest call, like CallWindowProc: resume where this thunk's
+                    // own RET N would have, without consuming an outer callback frame.
+                    directThunkReturn: {
+                        returnAddr,
+                        postEsp: (ctx.esp + 4 + stackCleanup) >>> 0,
+                        complete: (ret: number): number | null => {
+                            dlgProcInFlight.delete(key);
+                            const out = finish(ret >>> 0);
+                            // Default processing that suspended for guest callbacks of
+                            // its own owns the resume from here.
+                            return typeof out === 'number' ? out >>> 0 : null;
+                        },
+                    },
+                },
+            );
+            if (invoked.callbackId) {
+                return {
+                    value: 0,
+                    suspendedForCallback: true,
+                    callbackId: invoked.callbackId,
+                    stackCleanup,
+                    skipStackCheck: true,
+                    preserveCallbackReturnAddress: true,
+                };
+            }
+            dlgProcInFlight.delete(key);
+        }
+
+        return finish(0);
     };
 
     exports['DefDlgProcA'] = defDlgProc;
