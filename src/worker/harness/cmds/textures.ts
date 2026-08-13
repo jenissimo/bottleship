@@ -237,6 +237,78 @@ export function registerTextureCommands(svc: HarnessService): void {
         return { ptr: "0x" + ptr.toString(16), w: width, h: height, bpp, distinct: hist.size, top };
     });
 
+    /** surfaceRows(sel) — per-row mean luminance of a surface's GUEST pixels, plus the
+     *  even-vs-odd row split.
+     *
+     *  "Every other scanline is darker" is the one artefact class a screenshot cannot
+     *  settle: at any zoom it is indistinguishable from a dithered gradient, a video
+     *  field order, or the viewer's own scaling. This measures it. `combRatio` near 1
+     *  means the rows agree; a real comb sits far from 1 and `combRuns` confirms the
+     *  alternation is strict rather than a few dark bands. `pitchPixelsExact` is checked
+     *  alongside because an odd byte pitch byte-shifts every other row on its own, which
+     *  produces a comb with no bug anywhere in the blitter. */
+    svc.register("surfaceRows", (args) => {
+        const ptr = resolvePtr(args[0] ?? "primary");
+        if (!ptr) throw new HarnessError("surface pointer is 0", HarnessErrorCode.NOT_FOUND);
+        const surf = (serializeSurfaces() as any[]).find((s) => (s.ptr >>> 0) === ptr);
+        if (!surf) throw new HarnessError(`no surface at 0x${ptr.toString(16)}`, HarnessErrorCode.NOT_FOUND);
+        const memory = guestMem();
+        if (!memory) throw new HarnessError("guest memory unavailable (no process loaded?)", HarnessErrorCode.NO_PROCESS);
+        const { width, height, pitch, bpp } = surf;
+        const bytesPer = Math.max(1, bpp >> 3);
+        const view = new DataView(memory.buffer, memory.byteOffset, memory.byteLength);
+        // Channel split by bpp; 8bpp is paletted, so the raw index is the only honest number.
+        const lum = (v: number): number => {
+            if (bytesPer === 4) return (((v >>> 16) & 0xFF) * 299 + ((v >>> 8) & 0xFF) * 587 + (v & 0xFF) * 114) / 1000;
+            if (bytesPer === 2) {
+                const r = ((v >>> 11) & 0x1F) * 255 / 31, g = ((v >>> 5) & 0x3F) * 255 / 63, b = (v & 0x1F) * 255 / 31;
+                return (r * 299 + g * 587 + b * 114) / 1000;
+            }
+            return v & 0xFF;
+        };
+        const rows: number[] = [];
+        for (let y = 0; y < height; y++) {
+            let off = ptr + y * pitch;
+            if (off < 0 || off + width * bytesPer > memory.length) break;
+            let sum = 0;
+            for (let x = 0; x < width; x++, off += bytesPer) {
+                sum += lum(bytesPer === 4 ? view.getUint32(off, true)
+                    : bytesPer === 3 ? (memory[off] | (memory[off + 1] << 8) | (memory[off + 2] << 16))
+                    : bytesPer === 2 ? view.getUint16(off, true)
+                    : memory[off]);
+            }
+            rows.push(sum / width);
+        }
+        const mean = (xs: number[]) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0);
+        const even = mean(rows.filter((_, i) => i % 2 === 0));
+        const odd = mean(rows.filter((_, i) => i % 2 === 1));
+        // How much of the surface actually alternates, so a few dark bands cannot pass as a comb.
+        let combRuns = 0;
+        for (let i = 2; i < rows.length; i++) {
+            const a = rows[i - 2]! - rows[i - 1]!, b = rows[i - 1]! - rows[i]!;
+            if (a !== 0 && b !== 0 && Math.sign(a) !== Math.sign(b)) combRuns++;
+        }
+        // A field that is ENTIRELY zero is the strongest possible comb, and it is exactly
+        // the case a plain even/odd ratio cannot express — report it as its own verdict
+        // rather than letting a division by zero read as "no comb".
+        const zeroRows = (parity: number) =>
+            rows.filter((r, i) => i % 2 === parity && r === 0).length;
+        const evenCount = Math.ceil(rows.length / 2), oddCount = Math.floor(rows.length / 2);
+        const oddAllZero = oddCount > 0 && zeroRows(1) === oddCount && even > 0;
+        const evenAllZero = evenCount > 0 && zeroRows(0) === evenCount && odd > 0;
+        return {
+            ptr: "0x" + ptr.toString(16), w: width, h: height, bpp, pitch,
+            pitchPixelsExact: pitch % bytesPer === 0,
+            evenMean: +even.toFixed(2), oddMean: +odd.toFixed(2),
+            combRatio: odd === 0 ? null : +(even / odd).toFixed(4),
+            /** One whole field is blank — half the picture was never written at all. */
+            fieldBlank: oddAllZero ? "odd" : evenAllZero ? "even" : null,
+            evenZeroRows: zeroRows(0), oddZeroRows: zeroRows(1), evenRows: evenCount, oddRows: oddCount,
+            combRuns, alternatingPct: rows.length > 2 ? +((combRuns / (rows.length - 2)) * 100).toFixed(1) : 0,
+            rows: rows.map((r) => +r.toFixed(1)),
+        };
+    });
+
     /** surfaceScan({caps?, onlyEmpty?}) — one line per DDraw surface saying whether its
      *  GUEST PIXEL MEMORY holds anything, next to the state that should reflect it
      *  (version / gpuDirty / everLocked). Answers "the game created and bound N textures

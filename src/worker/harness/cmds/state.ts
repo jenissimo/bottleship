@@ -379,17 +379,69 @@ export function registerStateCommands(svc: HarnessService): void {
      * source. `suspect` marks likely SILENT stubs (handler ignores its args / curated).
      * Pass true to get only the suspect-stub subset (== report().silentStubs).
      */
+    /**
+     * apiCensus(sel?, {reset?}) — every API the guest actually called, across BOTH dispatch
+     * tiers.
+     *
+     * The JS-dispatch census alone is a trap: every d3d8/d3d9/ddraw draw and render-state
+     * setter is served by the fast path, so asking this for a rendering question and reading
+     * a zero says "the guest issued no draw calls" when it issued thousands. `fastPathCount`
+     * is that tier, reported beside `count` rather than summed into it (a fast path that
+     * defers by returning null is counted on both). `tiersNotCovered` names what is still
+     * invisible, so a zero here can never again be read as "never called".
+     *
+     * Counts are cumulative since load; pass `{reset:true}` to zero both tiers, or diff two
+     * snapshots for a windowed answer. `module` filters by the `"<module>:"` prefix.
+     *
+     * Returns `{calls, tiersNotCovered}` — an OBJECT, not the bare array it used to be,
+     * because a non-index property on an array does not survive JSON serialization and the
+     * caveat would have arrived as `undefined` at every caller.
+     */
     svc.register("apiCensus", (args) => {
         const onlySuspect = args[0] === true || args[0] === "suspect";
+        const moduleFilter = typeof args[0] === "string" && args[0] !== "suspect" ? args[0].toLowerCase() : null;
+        const opts = (args[1] ?? (typeof args[0] === "object" ? args[0] : {})) as { reset?: boolean };
+        const dispatcher = proc()?.dispatcher as {
+            getFastPathCensus?: () => Array<{ name: string; count: number }>;
+            resetFastPathCensus?: () => void;
+        } | undefined;
+
+        if (opts?.reset) {
+            apiCensus.clear();
+            dispatcher?.resetFastPathCensus?.();
+            return { reset: true };
+        }
+
+        const fast = new Map((dispatcher?.getFastPathCensus?.() ?? []).map((r) => [r.name, r.count]));
         const rows = onlySuspect ? apiCensus.suspectStubs() : apiCensus.list();
-        return rows.map((s) => ({
+        const out = rows.map((s) => ({
             api: s.name,
             count: s.count,
+            fastPathCount: fast.get(s.name) ?? 0,
             arity: s.arity,
             suspect: s.suspectStub,
             lastCaller: "0x" + s.lastCaller.toString(16),
             lastCallerSym: symbolize(s.lastCaller),
         }));
+        // Anything served ONLY by the fast path has no JS-dispatch row at all, and those are
+        // exactly the calls this verb used to lose.
+        if (!onlySuspect) {
+            const seen = new Set(rows.map((r) => r.name));
+            for (const [name, count] of fast) {
+                if (!seen.has(name)) {
+                    out.push({
+                        api: name, count: 0, fastPathCount: count, arity: -1, suspect: false,
+                        lastCaller: "0x0", lastCallerSym: null,
+                    });
+                }
+            }
+        }
+        const calls = moduleFilter ? out.filter((r) => r.api.toLowerCase().startsWith(`${moduleFilter}:`)) : out;
+        return {
+            calls,
+            total: calls.length,
+            tiersNotCovered: ["wasm hypercall (io_port_write32 0xB077): time, sync, string/memory, FPU/math"],
+        };
     });
 
     /** silentStubs() — shorthand for apiCensus(true): only the called methods flagged

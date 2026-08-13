@@ -196,6 +196,8 @@ export class ThunkDispatcher {
     // --- DOD: Flat Arrays for O(1) Access ---
     private dispatchTable: Array<ThunkImplementation | null> = new Array(MAX_THUNK_ID).fill(null);
     private fastPathTable: Array<FastPathImplementation | null> = new Array(MAX_THUNK_ID).fill(null);
+    /** Per-thunk fast-path hit counts — the census for the tier apiCensus cannot see. */
+    private fastPathCounts = new Uint32Array(MAX_THUNK_ID);
 
     // Metadata tables (SoA - Struct of Arrays) to avoid object lookups in hot path
     private argCountsTable: Int8Array = new Int8Array(MAX_THUNK_ID).fill(-1);
@@ -1230,6 +1232,12 @@ export class ThunkDispatcher {
         if (functionId > 0 && functionId < MAX_THUNK_ID) {
             const fastImpl = this.fastPathTable[functionId];
             if (fastImpl) {
+                // Census for THIS tier. apiCensus.record() only runs on the JS-dispatch path
+                // below, so without this the busiest and most diagnostic calls a game makes —
+                // every d3d8/d3d9/ddraw draw and render-state setter is fast-pathed — read as
+                // "never called". One array store keeps it off the Map that the fast path
+                // exists to avoid; names are resolved from namesTable at read time.
+                this.fastPathCounts[functionId]++;
                 // Ensure memory cache is valid
                 if (!this.cachedMem8 || this.cachedMem8.byteLength === 0) this.updateMemoryCache();
                 const cpu = this.cachedCpu;
@@ -3777,6 +3785,27 @@ export class ThunkDispatcher {
         for (const [name, impl] of Object.entries(exports)) {
             this.register(moduleName, name, impl);
         }
+    }
+
+    /**
+     * Fast-path call census: what the guest called on the tier `apiCensus` is blind to.
+     *
+     * The count is hits at the fast-path ENTRY, so it includes the calls a fast path
+     * DEFERRED by returning null — those are also counted again by apiCensus when the slow
+     * path serves them. The two tiers are therefore reported side by side rather than summed:
+     * a number that is sometimes a sum and sometimes not is worse than two honest numbers.
+     */
+    getFastPathCensus(): Array<{ name: string; count: number }> {
+        const out: Array<{ name: string; count: number }> = [];
+        for (let id = 0; id < this.fastPathCounts.length; id++) {
+            const count = this.fastPathCounts[id]!;
+            if (count) out.push({ name: this.namesTable[id] || `thunk#${id}`, count });
+        }
+        return out.sort((a, b) => b.count - a.count);
+    }
+
+    resetFastPathCensus(): void {
+        this.fastPathCounts.fill(0);
     }
 
     /**
