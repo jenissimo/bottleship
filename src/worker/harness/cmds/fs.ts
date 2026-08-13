@@ -140,14 +140,27 @@ export function registerFsCommands(svc: HarnessService): void {
 
     /** fsStat(path) — existence + size + rom/overlay origin. getFileSize returns 0
      *  (not -1) for a missing file, so existence is probed with a read-only
-     *  openSync (null = absent) — a real 0-byte file still reports exists:true. */
+     *  openSync (null = absent) — a real 0-byte file still reports exists:true.
+     *
+     *  `listed` re-asks the same question the way FindFirstFile does — through the
+     *  parent's directory ENUMERATION rather than an exact stat. The two must agree;
+     *  when they don't, a game that gates its real open on FindFirstFile cannot read
+     *  back a file that every other probe says is there, and `exists:true` alone reads
+     *  as "the file is fine" while the guest is being told it does not exist. */
     svc.register("fsStat", (args) => {
         const path = String(args[0] ?? "");
         const fsx = vfs();
         const isDir = fsx.directoryExists(path);
         const handle = isDir ? null : fsx.openSync(path, GENERIC_READ, OPEN_EXISTING);
         const exists = !!handle || isDir;
-        return { path, exists, isDir, size: handle ? fsx.getFileSize(path) : null, source: handle?.source ?? null, inRom: fsx.hasRomFile?.(path) ?? null };
+        const full = String(fsx.resolvePath(path) ?? path);
+        const cut = full.lastIndexOf("\\");
+        const parent = cut > 0 ? full.slice(0, cut) : full.slice(0, cut + 1);
+        const leaf = full.slice(cut + 1).toLowerCase();
+        const listed = leaf
+            ? (fsx.listDirectory(parent) ?? []).some((e: any) => String(e.name).toLowerCase() === leaf)
+            : null;
+        return { path, exists, listed, isDir, size: handle ? fsx.getFileSize(path) : null, source: handle?.source ?? null, inRom: fsx.hasRomFile?.(path) ?? null };
     });
 
     /** fsDelete(path) — remove a file from the CoW overlay (reproduces a first-run
@@ -157,6 +170,23 @@ export function registerFsCommands(svc: HarnessService): void {
         if (!path) throw new HarnessError("fsDelete needs a path", HarnessErrorCode.BAD_ARGS);
         const deleted = await vfs().deleteFile(path);
         return { path, deleted };
+    });
+
+    /**
+     * fsRevert(path) — drop the user's copy-on-write copy and go back to the SHIPPED bundle
+     * file.
+     *
+     * `fsDelete` is a guest DeleteFile: on a ROM-shadowed path it leaves a whiteout, so the
+     * file ends up GONE, not shipped. That is correct, and it is also the wrong verb for
+     * resetting a fixture — a game's own written config shadowing the bundle's is exactly the
+     * case, and using fsDelete for it silently boots the game with no config at all (it cost a
+     * session: SS2 with no `CAM.CFG` never leaves the menu and says nothing). The result
+     * distinguishes "nothing to revert" from "reverted".
+     */
+    svc.register("fsRevert", async (args) => {
+        const path = String(args[0] ?? "");
+        if (!path) throw new HarnessError("fsRevert needs a path", HarnessErrorCode.BAD_ARGS);
+        return { path, ...(await vfs().revertToRom(path)) };
     });
 
     /** fsFlush() — durable flush (closes OPFS writers). The record/replay teardown barrier. */

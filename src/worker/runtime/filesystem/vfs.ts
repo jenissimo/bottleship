@@ -962,6 +962,59 @@ export class VirtualFileSystem {
     }
 
     /**
+     * Drop the user's copy-on-write copy of `path` and go back to the shipped ROM file.
+     *
+     * NOT the same as deleteFile, and the difference is load-bearing: a guest DeleteFile on a
+     * ROM-shadowed file must leave a whiteout, or the shipped file would reappear and the
+     * delete would be a lie. That is correct and stays. But "undo my override" is a different
+     * operation with no spelling until now, and reaching for deleteFile to perform it leaves
+     * the file GONE rather than shipped — which is silent, because the caller asked for a
+     * delete and got one. Every fixture reset (a game's own written config shadowing the
+     * bundle's) needs this, not that.
+     *
+     * Returns what actually happened, so a caller cannot mistake "nothing to revert" for
+     * "reverted".
+     */
+    async revertToRom(path: string, timeoutMs = 4000): Promise<{ reverted: boolean; hadOverlay: boolean; hadWhiteout: boolean; romExists: boolean; blocked?: string }> {
+        const full = normalizePath(this.resolvePath(path));
+        const rel = this.relRomPath(full).toLowerCase();
+        const romEntry = rel ? this.romIndex.get(rel) : undefined;
+        const romExists = !!romEntry && !romEntry.isDirectory;
+        const hadWhiteout = rel !== "" && this.romWhiteouts.has(rel);
+        this.bumpWindowEpoch();
+        // Settle the commit that may still be writing this file before removing it — a game
+        // whose config is mid-flush is exactly when a fixture reset gets asked for, and racing
+        // the commit leaves the delete waiting on a lock it cannot get.
+        // OPFS hands `createWritable` an EXCLUSIVE lock, so settling the in-flight commit for a
+        // file the RUNNING guest still holds — and then removing it — can wait indefinitely.
+        // Answering "blocked" beats never answering: a verb that hangs takes the whole harness
+        // chain with it and looks like a dead worker. The timeout covers BOTH steps, because the
+        // settle is the one that actually stalls.
+        let blocked: string | null = null;
+        const overlay = this.overlay;
+        const removal = overlay
+            ? (async () => {
+                await overlay.settlePendingFlush(full);
+                return await overlay.deleteFile(full);
+            })().catch((e: unknown) => {
+                // The running guest still has the file open, so OPFS refuses removeEntry.
+                blocked = String((e as { name?: string })?.name ?? e);
+                return false;
+            })
+            : Promise.resolve(false);
+        const hadOverlay = await Promise.race([
+            removal,
+            new Promise<boolean>((resolve) => setTimeout(() => { blocked = "timeout"; resolve(false); }, timeoutMs)),
+        ]);
+        if (hadWhiteout && !blocked) this.romWhiteouts.delete(rel);
+        return {
+            reverted: !blocked && romExists && (hadOverlay || hadWhiteout),
+            hadOverlay, hadWhiteout, romExists,
+            ...(blocked ? { blocked } : {}),
+        };
+    }
+
+    /**
      * Faithful RemoveDirectory: the directory must exist, be empty (across ROM
      * and overlay), and be overlay-backed (there is no whiteout for ROM
      * directories — removing one would need per-dir whiteout plumbing).
@@ -2189,20 +2242,27 @@ class OpfsOverlay {
 
     listDirectory(path: string): VfsEntry[] {
         const normalizedPrefix = normalizePath(path);
-        const prefix = toKey(normalizedPrefix);
-        const prefixParts = normalizedPrefix.split("\\");
+        // The drive root normalizes to "C:\" — a trailing separator no other path has, so
+        // both the prefix test and the depth test have to be built from segments rather
+        // than from the raw string (`"C:\" + "\"` matches nothing, and split() yields a
+        // phantom empty segment that makes every root child look too shallow). Getting
+        // this wrong hides every guest-created file in the root from FindFirstFile while
+        // statEntry still finds it.
+        const prefixKey = toKey(normalizedPrefix);
+        const prefix = prefixKey.endsWith("\\") ? prefixKey.slice(0, -1) : prefixKey;
+        const prefixDepth = normalizedPrefix.split("\\").filter(Boolean).length;
         const out: VfsEntry[] = [];
         const seen = new Set<string>();
 
         for (const [key, entry] of this.entries.entries()) {
             if (!(key.startsWith(`${prefix}\\`))) continue;
-            const entryParts = entry.path.split("\\");
-            if (entryParts.length <= prefixParts.length) continue;
-            const name = entryParts[prefixParts.length];
+            const entryParts = entry.path.split("\\").filter(Boolean);
+            if (entryParts.length <= prefixDepth) continue;
+            const name = entryParts[prefixDepth];
             const nameKey = name?.toLowerCase();
             if (!name || !nameKey || seen.has(nameKey)) continue;
             seen.add(nameKey);
-            const isDir = entryParts.length > prefixParts.length + 1 || entry.kind === "dir";
+            const isDir = entryParts.length > prefixDepth + 1 || entry.kind === "dir";
             out.push({
                 path: normalizePath(`${normalizedPrefix}\\${name}`),
                 name,
@@ -2819,6 +2879,14 @@ class OpfsOverlay {
                 Logger.error(LogCategory.SYSTEM, `OPFS: drainWriters FAILED for "${key}" — writes may be lost: ${e}`);
             }
         }
+    }
+
+    /** Wait out an in-flight commit for one path (the read path does the same at
+     *  `pendingFlushes.get(key)`). A caller that is about to remove the file must not race the
+     *  commit that is still writing it. */
+    async settlePendingFlush(path: string): Promise<void> {
+        const inFlight = this.pendingFlushes.get(toKey(path));
+        if (inFlight) { try { await inFlight; } catch { /* commit error already logged */ } }
     }
 
     async deleteFile(path: string): Promise<boolean> {
