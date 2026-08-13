@@ -48,12 +48,12 @@ const LAYOUT = `
         return { x: a.x - fa.x, y: a.y - fa.y, w: w.width, h: w.height }; };
     const walk = (w, out) => { for (const h of w.children ?? []) {
         const c = ss.windows.get(h); if (!c) continue;
-        out.push({ t: c.title ?? '', cls: c.nativeClassName ?? c.systemControlClass ?? '',
+        out.push({ hwnd: c.handle, t: c.title ?? '', cls: c.nativeClassName ?? c.systemControlClass ?? '',
                    id: c.controlId ?? 0, vis: !!c.visible, ...rel(c) });
         walk(c, out); } return out; };
     return {
         frame: { x: fa.x, y: fa.y, w: fr.width, h: fr.height, title: fr.title },
-        tab: { ...rel(tab), th: st.tabHeight, sel: st.curSel, rows: st.rowCount,
+        tab: { hwnd: tab.handle, ...rel(tab), th: st.tabHeight, sel: st.curSel, rows: st.rowCount,
                items: st.items.map(i => i.text),
                rects: st.items.map((_, i) => tc.tabItemRect(tab, i)) },
         controls: walk(fr, []),
@@ -235,7 +235,48 @@ if (ch[0].hash !== ch[2].hash) {
         + `(${ch[0].hash} -> ${ch[2].hash}): the uncover repaint did not restore what the popup covered`);
 }
 
-// ---- (5) a page's FIRST show must not wait on the deferred-chrome deadline --------
+// ---- (5) the click must be ADDRESSED to the control it lands on ------------------
+// A page sits INSIDE the tab control's rect and above it in Z-order, which only the
+// sibling list records. Hit-testing siblings by creation order instead puts the tab in
+// front, and every click on a page control is delivered to the tab: the container
+// hit-test still finds the right control, so buttons and combos keep working and the
+// misrouting is invisible — until a control the guest SUBCLASSED (MFC's DDX_Control)
+// needs the message in its own wndProc and never gets one. Assert the address, not the
+// effect, because the effect is what hides it.
+const armed: any = await harness()
+    .wmTrace("start").wmTrace("clear")
+    .clickAt(drop.x, drop.y)
+    .sleep(1500)
+    .wmTrace("read")
+    .wmTrace("stop")
+    .call("evalWorker", [`
+        const ss = await import('/src/worker/modules/user32/shared-state.ts');
+        return { dropdownOpen: !!ss.listControlStates.get(${cb.hwnd})?.dropdownOpen };
+    `])
+    .run();
+const wmRead = armed.steps.filter((s: any) => s.cmd === "wmTrace")[2]?.result;
+const downs = (wmRead?.entries ?? []).filter((e: any) => e.name === "WM_LBUTTONDOWN");
+const state = armed.steps.find((s: any) => s.cmd === "evalWorker")?.result;
+console.log(`  click on combo 0x${cb.hwnd.toString(16)}: WM_LBUTTONDOWN -> `
+    + `${downs.map((e: any) => `0x${(e.hwnd >>> 0).toString(16)}`).join(",") || "(none)"}`
+    + `  dropdownOpen=${state?.dropdownOpen}`);
+if (!downs.length) fail("no WM_LBUTTONDOWN was posted at all — the click did not reach the guest");
+if (!state?.dropdownOpen) {
+    fail("the combobox did not drop — the click missed, so the addressing check below "
+        + "would pass on a click that landed nowhere");
+}
+const wrong = downs.filter((e: any) => (e.hwnd >>> 0) !== cb.hwnd);
+if (wrong.length) {
+    fail(`WM_LBUTTONDOWN was addressed to 0x${(wrong[0].hwnd >>> 0).toString(16)}`
+        + `${(wrong[0].hwnd >>> 0) === L.tab.hwnd ? " (the SysTabControl32 behind the page)" : ""}`
+        + `, not to the combobox 0x${cb.hwnd.toString(16)} under the cursor. WindowFromPoint is `
+        + "hit-testing siblings in creation order instead of Z-order, so a subclassed control "
+        + "here would never see a mouse message.");
+}
+// Close it again so the sections below start from the state they expect.
+await harness().clickAt(drop.x, drop.y).sleep(1000).run();
+
+// ---- (6) a page's FIRST show must not wait on the deferred-chrome deadline --------
 // Win32 shows a page by making it visible and letting the sheet's modal loop pump the
 // WM_PAINT; ours IS that loop, so nothing pumps the page's queue and the posted message
 // never arrives — the page then appeared only when DEFAULT_CHROME_DEADLINE_MS expired,
@@ -277,4 +318,5 @@ if (!posted.length) {
 console.log(`  ok  A/B: without UpdateWindow the same show waits for the deadline (${posted[0]!.slice(0, 90)})`);
 
 console.log("OK — layout matches comctl32's numbers; A->B->A and uncover restore byte-identically, "
-    + "and a page's first show does not wait on the chrome deadline");
+    + "a click on a page control is addressed to that control, and a page's first show does "
+    + "not wait on the chrome deadline");

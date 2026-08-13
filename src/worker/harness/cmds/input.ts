@@ -18,6 +18,7 @@ import {
 import { getScrollBarState, SB_CTL, SB_HORZ, SB_VERT } from "../../modules/user32/scroll-state";
 import { getListViewState } from "../../modules/user32/list-view-control";
 import { getComboDropdownRect } from "../../modules/user32/controls";
+import { hitTestSystemControlAtScreenPoint } from "../../modules/user32/control-interaction";
 import { describeEditLayout } from "../../modules/user32/edit-control";
 import { getDeviceNotifications } from "../../modules/user32/device-notify";
 import { describeDlgControl, findDlgControl } from "../dlg";
@@ -411,6 +412,39 @@ export function registerInputCommands(svc: HarnessService): void {
             if (h.max !== h.min || v.max !== v.min) out.scroll = { horz: h, vert: v };
         }
         return out;
+    });
+
+    /**
+     * hitTest(x, y) — the two answers a click depends on, side by side.
+     *
+     * `windowFromPoint` is the window a mouse message is ADDRESSED to; `control` is what
+     * the container hit-test then finds under the same point and runs the class behaviour
+     * for. They are normally the same window, and when they are not the click still
+     * "works" for every control WE drive — while a control the guest SUBCLASSED never
+     * receives a message at all, because the guest's proc is only reached through the
+     * address. That asymmetry is invisible in pixels and in `dialogs`.
+     */
+    svc.register("hitTest", (args) => {
+        const x = Number(args[0]) | 0, y = Number(args[1]) | 0;
+        const wm = sys().windowManager as any;
+        const at = wm?.windowFromPoint?.(x, y) >>> 0;
+        const addressed = at ? windows.get(at) : undefined;
+        // The class behaviour is hit-tested over a CONTAINER's subtree (message.ts
+        // resolves a leaf control up to its parent), so mirror that resolution here.
+        const host = (addressed && addressed.children.length === 0 && addressed.isSystemControl
+            && addressed.parent) ? addressed.parent : at;
+        const control = host ? hitTestSystemControlAtScreenPoint(host, x, y) : undefined;
+        return {
+            at: [x, y],
+            windowFromPoint: at,
+            addressed: addressed ? describeDlgControl(at, addressed) : null,
+            host,
+            control: control ? describeDlgControl(control.handle, control) : null,
+            /** A subclassed control only ever sees the mouse through the address. */
+            subclassed: !!control?.wndProcSubclassed,
+            agrees: !!control && control.handle === at,
+            capture: sys().windowManager?.getCaptureHwnd?.() ?? 0,
+        };
     });
 
     /** findControl(target) — resolve a control selector to its described row, or null. */

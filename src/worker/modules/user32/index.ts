@@ -4,6 +4,7 @@
 
 import { IModule } from '../../core/module';
 import { Process } from '../../core/process';
+import { System } from '../../core/system';
 import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 
 import { createClassExports as class_ } from './class';
@@ -13,7 +14,7 @@ import { createMenuExports as menu } from './menu';
 import { createMessageExports as message, registerFastPathMessageFunctions as registerFastPathmessage } from './message';
 import { createSystemExports as system } from './system';
 import { createWindowExports as window, registerFastPathWindowFunctions } from './window';
-import { resetUser32SharedState } from './shared-state';
+import { getChildZOrder, resetUser32SharedState } from './shared-state';
 import { resetUser32Classes } from './class';
 import { resetDeviceNotifications } from './device-notify';
 import { resetHooks } from './hooks';
@@ -28,6 +29,8 @@ export class User32 implements IModule {
     exports: Record<string, ThunkImplementation> = {};
 
     initialize(process: Process): void {
+        // WindowFromPoint hit-tests siblings in Z-order, and user32 owns that list.
+        System.getInstance().windowManager.registerChildZOrderProvider(getChildZOrder);
         // class functions
         Object.assign(this.exports, class_());
         // dialog functions

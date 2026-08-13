@@ -57,6 +57,7 @@ import {
 import { isDDrawExclusiveFullscreen } from '../ddraw/gdi-visibility';
 import { paintTraceEnabled, logBeginEndPaint } from './paint-trace';
 import { repaintChildControls } from './controls';
+import { restampOwnedPopups } from './paint-hooks';
 import {
     tryEndPaintOwnerDrawChain,
     tryRepaintOwnerDrawButton,
@@ -679,7 +680,14 @@ export function runDefaultWindowPaint(
                         gdi.releaseDC(childDc);
                     },
                     discardChildDC: (childDc) => gdi.releaseDC(childDc),
-                    onComplete: releaseHold,
+                    onComplete: () => {
+                        // The chain draws through GUEST callbacks, so its tiles land after
+                        // the flush that already re-stamped the popups above this window.
+                        // The overlay is flat, so those tiles sit on top of a modal they
+                        // must never touch — restamp again, inside the publish hold.
+                        restampOwnedPopups(hWnd);
+                        releaseHold();
+                    },
                 }, stackCleanup, frameId, directReturn);
                 // The chain took its own hold and releases ours via onComplete.
                 if (chain) return chain;

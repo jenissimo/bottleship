@@ -94,6 +94,7 @@ const WM_VSCROLL     = 0x0115;
 const WM_KEYDOWN     = 0x0100;
 
 const MK_LBUTTON = 0x0001;
+const WS_CHILD_CI = 0x40000000;
 const WS_DISABLED_CI = 0x08000000;
 const WS_VSCROLL_CI = 0x00200000;
 const WS_HSCROLL_CI = 0x00100000;
@@ -1486,7 +1487,10 @@ export function handleSystemControlWheel(
 function rootDialogOf(control: WindowInfo): number | undefined {
     let cur: WindowInfo | undefined = control;
     const visited = new Set<number>();
-    while (cur?.parent && !visited.has(cur.handle)) {
+    // Climb only while the window is a CHILD. A popup's `parent` field holds its OWNER —
+    // a separate top-level window that owns none of these pixels — so climbing through it
+    // would repaint the owner's whole client, restamping it over the popup above.
+    while (cur && (cur.style & WS_CHILD_CI) !== 0 && cur.parent && !visited.has(cur.handle)) {
         visited.add(cur.handle);
         cur = windows.get(cur.parent);
     }

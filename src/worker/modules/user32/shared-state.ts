@@ -321,6 +321,18 @@ export function getChildrenInPaintOrder(parentHwnd: number): number[] {
     return [...parent.children];
 }
 
+/**
+ * The LIVE sibling Z-order list — the same array reorderChildInParent mutates, handed
+ * out uncopied because the WindowManager hit-test walks it at every level on every
+ * pointer poll. Read-only for callers; anything that needs to keep it copies.
+ *
+ * `undefined` means user32 has no record of this window at all, which is a different
+ * answer from "it has no children" and must not silently hide a subtree.
+ */
+export function getChildZOrder(parentHwnd: number): number[] | undefined {
+    return windows.get(parentHwnd)?.children;
+}
+
 /** LockWindowUpdate: suppress overlay repaint while a subtree is locked. */
 let lockWindowUpdateHwnd = 0;
 

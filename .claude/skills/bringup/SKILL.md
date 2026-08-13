@@ -102,6 +102,11 @@ CLI invocation reconnects without it.
 - A Win32 FRONT-END presents nothing — its dialogs run before the render device does. Gate on
   `waitForControl("New Game")`, never `tickFrames`, or you wait on presents that never come and
   it reads exactly like a hang.
+- DEAD control (the click does nothing) → `hitTest(x,y)` before anything else. It prints the
+  window a mouse message is ADDRESSED to next to the control the container hit-test finds, and
+  `agrees:false` is a routing bug the pixels cannot show: every control we drive ourselves keeps
+  working off the container hit-test, while one the guest SUBCLASSED needs the address and gets
+  nothing. `wmTrace` then confirms it on the wire (the `hwnd` on WM_LBUTTONDOWN).
 - BLANK control / unpainted dialog → `paintTrace("start")` … `paintTrace("read")`. The chain has
   many links (posted → pump filter → dispatched → BeginPaint/EndPaint+flush → owner-draw chain
   with its task counts → per-flush child-window exclusions) and the pixels look identical

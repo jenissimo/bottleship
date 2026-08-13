@@ -86,9 +86,9 @@ export class WindowManager {
 
     /**
      * Top-level window Z-order, front (index 0) → back. Children are NOT in this list;
-     * they z-order within their parent by creation order (children[] insertion). The
-     * topmost group (WS_EX_TOPMOST) is kept ahead of the normal group inside this same
-     * list: the first non-topmost entry marks the boundary.
+     * a child's Z-order is its position in its parent's sibling list (see
+     * childZOrderProvider). The topmost group (WS_EX_TOPMOST) is kept ahead of the normal
+     * group inside this same list: the first non-topmost entry marks the boundary.
      */
     private zOrder: number[] = [];
 
@@ -96,10 +96,24 @@ export class WindowManager {
      *  to prefer live native dialogs over a DDraw flip chain). Returns hwnd or 0. */
     private mouseTargetResolver: ((screenX: number, screenY: number) => number) | null = null;
 
+    /**
+     * The parent → children sibling list, front to back. Win32 has ONE sibling order
+     * serving Z-order, paint order, hit-test order and the dialog manager's walks, and
+     * user32 owns it (WindowInfo.children, mutated by SetWindowPos). Deriving a second
+     * one here from creation order makes every child Z-order change invisible to the
+     * MOUSE while paint and the dialog walks honour it — a control raised over a sibling
+     * is drawn on top and clicked through.
+     */
+    private childZOrderProvider: ((parentHwnd: number) => number[] | undefined) | null = null;
+
     constructor() { }
 
     registerMouseTargetResolver(resolver: (screenX: number, screenY: number) => number): void {
         this.mouseTargetResolver = resolver;
+    }
+
+    registerChildZOrderProvider(provider: (parentHwnd: number) => number[] | undefined): void {
+        this.childZOrderProvider = provider;
     }
 
     /**
@@ -149,15 +163,32 @@ export class WindowManager {
     }
 
     /**
-     * Walk children of `parentHwnd` (origin originX/originY in screen space), returning
-     * the deepest visible+enabled child containing the point, or parentHwnd if none.
-     * Child creation appends at HWND_BOTTOM, so insertion order is front to back.
+     * The parent's children front to back — the registered sibling list when user32 knows
+     * this window, else this map's own creation order (a bare WindowManager has no
+     * reorders, so the two agree until SetWindowPos moves a child).
      */
-    private descendToChildAtPoint(parentHwnd: number, originX: number, originY: number, screenX: number, screenY: number): number {
+    private childrenFrontToBack(parentHwnd: number): WindowObject[] {
         const children: WindowObject[] = [];
+        const order = this.childZOrderProvider?.(parentHwnd);
+        if (order) {
+            for (let i = 0; i < order.length; i++) {
+                const win = this.windows.get(order[i]);
+                if (win && (win.style & WS_CHILD) !== 0) children.push(win);
+            }
+            return children;
+        }
         for (const win of this.windows.values()) {
             if (win.parent === parentHwnd && (win.style & WS_CHILD) !== 0) children.push(win);
         }
+        return children;
+    }
+
+    /**
+     * Walk children of `parentHwnd` (origin originX/originY in screen space), returning
+     * the deepest visible+enabled child containing the point, or parentHwnd if none.
+     */
+    private descendToChildAtPoint(parentHwnd: number, originX: number, originY: number, screenX: number, screenY: number): number {
+        const children = this.childrenFrontToBack(parentHwnd);
         for (let i = 0; i < children.length; i++) {
             const child = children[i];
             if (!child.visible || (child.style & WS_DISABLED) !== 0) continue;

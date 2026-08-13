@@ -219,6 +219,29 @@ describe("WindowManager WindowFromPoint", () => {
         mkChild(wm, top, 50, 50, 100, 100, { disabled: true });
         expect(wm.windowFromPoint(75, 75)).toBe(top);
     });
+
+    // The sibling list lives in user32 and SetWindowPos reorders it there; a child raised
+    // over an earlier-created sibling (comctl32 puts a property-sheet PAGE over the tab
+    // control that way) must win the hit test, or it is painted on top and clicked through.
+    test("registered sibling Z-order beats creation order", () => {
+        const top = mkTopLevel(wm, 0, 0, 300, 300);
+        const first = mkChild(wm, top, 25, 25, 100, 100);
+        const raised = mkChild(wm, top, 25, 25, 100, 100);
+        expect(wm.windowFromPoint(50, 50)).toBe(first); // creation order, no provider
+
+        const order = new Map<number, number[]>([[top, [raised, first]]]);
+        wm.registerChildZOrderProvider((parent) => order.get(parent) ?? (parent === first || parent === raised ? [] : undefined));
+        expect(wm.windowFromPoint(50, 50)).toBe(raised);
+    });
+
+    // "user32 does not know this window" must not read as "it has no children": a subtree
+    // the provider cannot describe still has to be hit-testable.
+    test("a parent the provider does not know falls back to creation order", () => {
+        const top = mkTopLevel(wm, 0, 0, 300, 300);
+        const child = mkChild(wm, top, 50, 50, 100, 100);
+        wm.registerChildZOrderProvider(() => undefined);
+        expect(wm.windowFromPoint(75, 75)).toBe(child);
+    });
 });
 
 describe("WindowManager focus vs active", () => {
