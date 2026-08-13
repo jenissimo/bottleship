@@ -1,7 +1,7 @@
 /**
  * cdp-touch.ts — device emulation + synthetic touch for the harness.
  *
- * Touch is a HOST input device (docs/mobile-touch-plan.md): the guest never sees a
+ * Touch is a HOST input device (plan/mobile-touch-plan.md): the guest never sees a
  * contact, only the cursor/delta/button the recognizer derives from one. So the
  * regression surface for every touch feature is exactly this — put real
  * `Input.dispatchTouchEvent` contacts on the canvas at GUEST coordinates and assert

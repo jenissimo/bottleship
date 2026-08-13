@@ -1,5 +1,5 @@
 /**
- * Template touch/mobile script — the P3 acceptance shape from docs/mobile-touch-plan.md.
+ * Template touch/mobile script — the P3 acceptance shape from plan/mobile-touch-plan.md.
  *
  * Prereqs: `bun tools/harness.ts up`. Then:
  *   WGB=/apps/<bundle>.wgb bun tools/harness.ts run tools/harness/regression/touch.harness.ts
