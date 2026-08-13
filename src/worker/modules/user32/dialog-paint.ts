@@ -6,14 +6,14 @@
  */
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
-import { WindowInfo, windows, isEffectivelyVisible, getAbsoluteWindowPosition, getAncestorClipRect, ensureHostCursorForDialog, getChildrenInPaintOrder, hasSystemControlChildren } from './shared-state';
-import { paintChildControls, repaintChildControls } from './controls';
+import { WindowInfo, windows, isEffectivelyVisible, getAbsoluteWindowPosition, getAncestorClipRect, ensureHostCursorForDialog, getChildrenInPaintOrder, hasSystemControlChildren, listControlStates } from './shared-state';
+import { paintChildControls, repaintChildControls, paintsOsControlChrome, getComboDropdownRect } from './controls';
 import { registerOwnedPopupRestamper } from './paint-hooks';
 import { registerFullDialogRepainter, registerOverlayRepairRepainter } from './control-interaction';
 import { getWindowVisualBounds, eraseDialogOverlay, repairOverlayWindowsOverlappingRect } from './dialog-overlay';
 import { invalidateWindow, hasPendingUpdate, type ClientRect } from './paint-region';
 import type { GDIContext } from '../gdi32/context';
-import { paintTraceEnabled, logPaintRequest } from './paint-trace';
+import { paintTraceEnabled, logPaintRequest, logOverlayMutation, logChromeStamp } from './paint-trace';
 import { getSystemColorRef, COLOR_BTNFACE_INDEX } from './system';
 
 /** Dialog face as COLORREF (0x00BBGGRR), from the live system palette. */
@@ -110,6 +110,75 @@ export function requestGuestDialogPaint(dialogHwnd: number, rect: ClientRect | n
     system.scheduler.wakeMessageWaiters();
     Logger.log(LogCategory.USER32,
         `requestGuestDialogPaint: posted WM_PAINT hwnd=0x${dialogHwnd.toString(16)}`);
+}
+
+/**
+ * USER's default chrome — the COLOR_BTNFACE face plus the OS-drawn look of every control
+ * — is the ELSE branch of a window's paint cycle: DefDlgProc answers WM_PAINT with
+ * BeginPaint/EndPaint (runDefaultWindowPaint) and draws it only when the window's own
+ * paint reached the overlay with nothing. Publishing it OUTSIDE that cycle, as a prologue,
+ * shows default chrome for however long the guest's WM_PAINT takes to be pumped, and the
+ * guest's art then replaces it — grey on every dialog/menu state change.
+ *
+ * So the two eager stampers below hold off while this is true: a dialog with a wndProc
+ * that has never completed a paint cycle. `guestCustomPaint === false` cannot decide it —
+ * the latch is set BY a paint, so before the first one it reads "never" for a window that
+ * simply has not been asked yet. After that first cycle nothing changes: the latch is
+ * authoritative and every repaint behaves exactly as before.
+ */
+function firstPaintCyclePending(win: WindowInfo): boolean {
+    // A/B switch: restores the eager stamp, i.e. reproduces the flash on demand. The
+    // regression for this is an ORDERING check, and an ordering check nobody has seen
+    // fail is indistinguishable from one that cannot.
+    if ((globalThis as { __noDeferDialogChrome?: boolean }).__noDeferDialogChrome) return false;
+    return !win.paintCycleRan && !win.guestCustomPaint && !!getDialogProcedure(win);
+}
+
+/**
+ * The paint we deferred to has to actually arrive. It comes off the message queue, so a
+ * guest that stops pumping (or never starts) would leave the window unpainted forever —
+ * and unlike the chrome we skipped, nothing else would ever draw it. If the update region
+ * is still unconsumed after this long, USER's default paint runs anyway; the trace records
+ * it, so a title that lives on this fallback is visible rather than silently late.
+ */
+const DEFAULT_CHROME_DEADLINE_MS = 250;
+const chromeDeadlines = new Map<number, ReturnType<typeof setTimeout>>();
+
+function stampDefaultChromeIfPaintNeverCame(hwnd: number): void {
+    chromeDeadlines.delete(hwnd);
+    const win = windows.get(hwnd);
+    // A net that declines has to say so: "it never fired" and "it fired and found the
+    // paint had landed" are the same silence otherwise, and only the second is healthy.
+    const reason = !win ? 'gone'
+        : win.pendingDestroy ? 'destroying'
+        : !isEffectivelyVisible(win) ? 'not-visible'
+        : win.guestCustomPaint ? 'guest-painted'
+        : win.paintCycleRan ? 'paint-cycle-ran'
+        : null;
+    if (paintTraceEnabled) {
+        logOverlayMutation('defaultChromeDeadline', hwnd,
+            reason ? `declined: ${reason}` : `fired: no paint cycle in ${DEFAULT_CHROME_DEADLINE_MS}ms`);
+    }
+    if (reason) return;
+    paintDialogToOverlay(hwnd, 'full');
+}
+
+/**
+ * Ask the window for the paint whose default branch draws the chrome. Win32's own
+ * UpdateWindow/InvalidateRect do exactly this — mark invalid, let WM_PAINT reach the
+ * window procedure — and DefDlgProc is where the class background and the controls
+ * come from.
+ */
+function requestDefaultDialogPaint(win: WindowInfo): void {
+    const system = System.getInstance();
+    if (!hasPendingUpdate(win.handle)) invalidateWindow(win.handle, null, true);
+    system.windowManager.postMessage(win.handle, WM_PAINT, 0, 0);
+    system.scheduler.wakeMessageWaiters();
+    if (paintTraceEnabled) logPaintRequest(win.handle, true, 'default-paint (chrome deferred to its else-branch)');
+    if (!chromeDeadlines.has(win.handle)) {
+        chromeDeadlines.set(win.handle,
+            setTimeout(() => stampDefaultChromeIfPaintNeverCame(win.handle), DEFAULT_CHROME_DEADLINE_MS));
+    }
 }
 
 /**
@@ -252,6 +321,7 @@ function paintDialogBackground(win: WindowInfo, hdc: number, gdi: GDIContext): v
     gdi.fillRect(hdc, bounds.x, bounds.y, bounds.x + bounds.w, bounds.y + bounds.h);
     gdi.selectObject(hdc, prevBrush);
     gdi.deleteObject(hBrush);
+    if (paintTraceEnabled) logChromeStamp(win.handle, `dlgface ${bounds.w}x${bounds.h}`);
 }
 
 /** Non-client dialog frame (WM_NCPAINT approximation for #32770). */
@@ -297,6 +367,34 @@ function paintDialogNcFrame(win: WindowInfo, hdc: number, gdi: GDIContext): void
     ctx.lineTo(x1 - 0.5, y0 + 0.5);
     ctx.stroke();
     gdi.setOverlayDirty(true);
+}
+
+/**
+ * Put the guest's retained client back under the OS-drawn controls a 'controls' repaint
+ * is about to stamp — and nowhere else. An open drop-down is included: it paints outside
+ * its combobox's rect, so its old pixels are not covered by the box's own restore.
+ */
+function restoreClientUnderStampedControls(win: WindowInfo, gdi: GDIContext): void {
+    if (!gdi.restoreWindowClientRect) return;
+    let n = 0;
+    for (const childHwnd of win.children) {
+        const child = windows.get(childHwnd);
+        if (!child || !paintsOsControlChrome(win, child)) continue;
+        n++;
+        const origin = getAbsoluteWindowPosition(child);
+        gdi.restoreWindowClientRect(
+            win.handle, origin.x, origin.y,
+            Math.max(1, child.width), Math.max(1, child.height),
+        );
+        if (listControlStates.get(child.handle)?.dropdownOpen) {
+            const r = getComboDropdownRect(child);
+            gdi.restoreWindowClientRect(win.handle, r.x, r.y, r.w, r.h);
+        }
+    }
+    if (paintTraceEnabled) {
+        logOverlayMutation('restoreClient', win.handle,
+            `under ${n}/${win.children.length} stamped control(s)`);
+    }
 }
 
 function paintWindowSubtreeToOverlay(
@@ -348,11 +446,23 @@ function paintWindowSubtreeToOverlay(
             // read as bold) and a moved trackbar thumb leaves its predecessor behind. The
             // retained client IS that background, exactly, and restoring is a no-op when
             // no backing exists yet.
+            //
+            // 'controls' restores ONLY under the controls it is about to stamp. The
+            // retained client holds the guest's WM_PAINT output and nothing else, so a
+            // whole-client restore also deletes the pixels only the guest can produce —
+            // its owner-draw buttons' WM_DRAWITEM tiles — and this path has no way to ask
+            // for them back (Win32 repaints the invalidated CONTROL, never its parent's
+            // client). That is the launcher whose art survives and whose labels vanish.
             const origin = getAbsoluteWindowPosition(win);
-            gdi.restoreWindowClientRect?.(
-                win.handle, origin.x, origin.y,
-                Math.max(1, win.width), Math.max(1, win.height),
-            );
+            if (mode === 'full') {
+                if (paintTraceEnabled) logOverlayMutation('restoreClient', win.handle, 'whole-client');
+                gdi.restoreWindowClientRect?.(
+                    win.handle, origin.x, origin.y,
+                    Math.max(1, win.width), Math.max(1, win.height),
+                );
+            } else {
+                restoreClientUnderStampedControls(win, gdi);
+            }
         } else if (mode === 'full' && !((win.exStyle ?? 0) & WS_EX_TRANSPARENT)) {
             paintDialogBackground(win, hdc, gdi);
             paintDialogNcFrame(win, hdc, gdi);
@@ -374,6 +484,7 @@ function paintWindowSubtreeToOverlay(
 export function paintDialogToOverlay(dialogHwnd: number, mode: 'full' | 'controls' = 'full'): void {
     const system = System.getInstance();
     const gdi = system.gdiContext;
+    if (paintTraceEnabled) logOverlayMutation('paintDialogToOverlay', dialogHwnd, mode);
     if (mode === 'full') dropVacatedOverlayFill(dialogHwnd);
     const hdc = gdi.createOverlayDC();
     if (!hdc) return;
@@ -420,6 +531,10 @@ export function repaintDialogOverlayIfVisible(dialogHwnd: number): void {
         // top-level window is active. Using activation as a paint gate left an owned
         // launcher page with only its stale retained background after its child closed.
         requestGuestDialogPaint(dialogHwnd);
+        return;
+    }
+    if (firstPaintCyclePending(win)) {
+        requestDefaultDialogPaint(win);
         return;
     }
     paintDialogToOverlay(dialogHwnd, 'full');
@@ -481,7 +596,13 @@ export function finalizeDialogPaint(dialogHwnd: number): void {
     // The previous child-count<=4 heuristic mislabeled larger standard dialogs (e.g.
     // Tiberian Sun's 7-control "Select Campaign") as custom-painted.
     const mode = win?.guestCustomPaint ? 'controls' : 'full';
-    paintDialogToOverlay(dialogHwnd, mode);
+    // 'full' here is the same default chrome DefDlgProc draws; the WM_PAINT queued below
+    // is what asks for it. Stamping it first only makes it visible until the guest answers.
+    if (mode === 'controls' || !win || !firstPaintCyclePending(win)) {
+        paintDialogToOverlay(dialogHwnd, mode);
+    } else {
+        requestDefaultDialogPaint(win);
+    }
 
     // Creation-time fallback painting is not the final Win32 paint. WM_INITDIALOG
     // commonly installs bitmaps, subclasses owner-draw controls, and changes text;

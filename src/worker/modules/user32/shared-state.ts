@@ -41,6 +41,11 @@ export interface WindowInfo {
     dialogBaseUnitY?: number;
     /** Guest WM_PAINT / GetDC drew client pixels; preserve that client area on repaint. */
     guestCustomPaint?: boolean;
+    /** A paint cycle has COMPLETED for this window at least once (its own BeginPaint /
+     *  EndPaint, or DefWindowProc's default paint). Until then `guestCustomPaint === false`
+     *  means "not yet", not "never" — the guest has had no WM_PAINT to answer — so USER's
+     *  default chrome must not be published ahead of it. */
+    paintCycleRan?: boolean;
     /** A system control whose wndProc the guest replaced via SetWindowLong(GWL_WNDPROC)
      *  — i.e. it paints itself (MFC subclassing). We deliver WM_PAINT to it instead of
      *  drawing default chrome, exactly like Windows runs the control's own window proc. */
@@ -71,6 +76,12 @@ export interface WindowInfo {
 export function markGuestCustomPaint(hwnd: number): void {
     const win = windows.get(hwnd);
     if (win) win.guestCustomPaint = true;
+}
+
+/** A BeginPaint/EndPaint pair (the guest's own, or DefWindowProc's) finished for `hwnd`. */
+export function markWindowPaintCycleRan(hwnd: number): void {
+    const win = windows.get(hwnd);
+    if (win) win.paintCycleRan = true;
 }
 
 // Win32: destroying a window destroys all timers it owns. The timer map lives in

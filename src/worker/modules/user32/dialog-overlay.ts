@@ -33,6 +33,7 @@ import {
 } from './shared-state';
 import { getComboDropdownRect } from './controls';
 import { invokeOverlayRepairRepaint } from './control-interaction';
+import { paintTraceEnabled, logOverlayMutation } from './paint-trace';
 
 const WS_CHILD = 0x40000000;
 
@@ -356,6 +357,10 @@ export function eraseDialogOverlay(hwnd: number): void {
     };
     // excludeRepairHwnd: erase runs while the window is still visible — repair must
     // not repaint it (that was the "clearing doesn't happen" regression).
+    if (paintTraceEnabled) {
+        logOverlayMutation('eraseDialogOverlay', hwnd,
+            `${eraseRect.x},${eraseRect.y} ${eraseRect.w}x${eraseRect.h}`);
+    }
     gdi.clearOverlayRect(eraseRect.x, eraseRect.y, eraseRect.w, eraseRect.h, {
         excludeRepairHwnd: hwnd,
     });

@@ -92,6 +92,7 @@ import {
     LVS_SHOWSELALWAYS,
 } from './list-view-control';
 import { restampOwnedPopups } from './paint-hooks';
+import { paintTraceEnabled, logChromeStamp } from './paint-trace';
 
 
 // Window styles
@@ -155,6 +156,36 @@ function getWindowFont(win: WindowInfo): string {
 }
 
 /**
+ * True when paintChildControls puts OS-drawn chrome on the overlay for this child.
+ * Its complement is the set of controls whose pixels ONLY the guest can produce, which
+ * is why this is one definition with two callers: a repaint that restores the parent's
+ * retained client before stamping must restore under THESE and nowhere else, or it
+ * erases guest output it cannot re-derive.
+ *
+ * Defer to a control that has DEMONSTRABLY painted itself (its own EndPaint flushed
+ * pixels — child.guestCustomPaint). Subclassing alone is not that claim: MFC's
+ * DDX_Control/SubclassDlgItem and UE1's WControl wrap a control purely for message
+ * routing and leave WM_PAINT to the original class proc, which IS this chrome. Assuming
+ * "subclassed ⇒ guest paints it" left such controls permanently blank (UE1's
+ * video-options resolution ListBox: items inserted, nothing drawn). Chrome is painted
+ * BEFORE the guest-paint chain runs, so a control the guest really does draw still wins —
+ * it simply overwrites what we put down.
+ *
+ * Owner-draw buttons under a guest-painting parent are the other half: Windows answers
+ * those with WM_DRAWITEM to the parent, so paintButton draws nothing for them and only
+ * the guest's chain can.
+ */
+export function paintsOsControlChrome(parent: WindowInfo, child: WindowInfo): boolean {
+    if (!child.visible || !child.isSystemControl) return false;
+    if (child.guestCustomPaint && !isButtonSystemControl(child) && parent.guestCustomPaint
+        && !controlImageHandles.has(child.handle)) return false;
+    if (isButtonSystemControl(child)
+        && (child.style & BS_TYPEMASK) === BS_OWNERDRAW
+        && parent.guestCustomPaint) return false;
+    return true;
+}
+
+/**
  * Paint all visible system child controls of the given parent window.
  * hdc must be a valid HDC pointing at the overlay canvas (as returned by BeginPaint).
  *
@@ -195,18 +226,7 @@ export function paintChildControls(parentHwnd: number, hdc: number, gdi: GDICont
     let painted = false;
     for (const childHandle of getChildrenInPaintOrder(parentHwnd)) {
         const child = windows.get(childHandle);
-        if (!child || !child.visible || !child.isSystemControl) continue;
-        // Skip default chrome only for a control that has DEMONSTRABLY painted itself
-        // (its own EndPaint flushed pixels — child.guestCustomPaint). Subclassing alone is
-        // not that claim: MFC's DDX_Control/SubclassDlgItem and UE1's WControl wrap a
-        // control purely for message routing and leave WM_PAINT to the original class proc,
-        // which IS this chrome. Assuming "subclassed ⇒ guest paints it" left such controls
-        // permanently blank (UE1's video-options resolution ListBox: items inserted, nothing
-        // drawn). Chrome is painted BEFORE the guest-paint chain runs, so a control the guest
-        // really does draw still wins — it simply overwrites what we put down.
-        if (child.guestCustomPaint && !isButtonSystemControl(child) && parent.guestCustomPaint
-            && !controlImageHandles.has(child.handle)) continue;
-
+        if (!child || !paintsOsControlChrome(parent, child)) continue;
         painted = paintSystemControl(child, hdc, gdi, parentAbsX, parentAbsY) || painted;
     }
 
@@ -307,6 +327,7 @@ export function paintSystemControl(
     }
 
     if (clip) ctx.restore();
+    if (paintTraceEnabled) logChromeStamp(child.handle, `${controlClass} ${w}x${h}`);
     gdi.setOverlayDirty(true);
     return true;
 }

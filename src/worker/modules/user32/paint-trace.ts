@@ -138,3 +138,29 @@ export function logOwnerDrawChain(
 export function logPaintRequest(hWnd: number, posted: boolean, reason: string): void {
     push(posted ? "post" : "skip", hWnd, reason);
 }
+
+/**
+ * OS-drawn chrome we publish ourselves — the COLOR_BTNFACE dialog face, a control's
+ * default 3-D look. This is DefWindowProc's paint, so what matters is WHEN it lands
+ * relative to the guest's own: chrome published BEFORE a guest paint that is going to
+ * overwrite it is visible for the whole gap, which is the grey-flash shape. `overlay`
+ * names the path that drove a repaint; this names the pixels it actually put down.
+ */
+export function logChromeStamp(hwnd: number, what: string): void {
+    push("chrome", hwnd, what);
+}
+
+/**
+ * A JS-side mutation of the overlay plane — a repaint we drove ourselves, a clear, a
+ * restore of a window's retained client. These bypass WM_PAINT entirely, so without
+ * them the trace can answer "the guest never repainted" while the pixels change under
+ * it, which is the shape of every "it painted, then something ate it" bug. The caller
+ * is what identifies the path; the stack walk is diagnostic-only (armed trace).
+ */
+export function logOverlayMutation(op: string, hwnd: number, detail: string): void {
+    const frames = (new Error().stack ?? "").split("\n").slice(2, 5)
+        .map((s) => s.trim().replace(/^at\s+/, "").replace(/\s*\(.*/, ""))
+        .filter((s) => s && s !== "logOverlayMutation")
+        .join("<");
+    push("overlay", hwnd, `${op} ${detail}${frames ? ` via ${frames}` : ""}`);
+}

@@ -12,7 +12,7 @@ import { DESKTOP_HWND } from '../../runtime/windowing/window-manager';
 import { getWindowClass, getWindowClassByName } from './class';
 import { Marshaler } from '../../core/memory/marshaler';
 import { Mem } from '../../core/memory/mem-accessor';
-import { WindowInfo, windows, getWindowByHandle, getCursorDisplayCount, updateCursorDisplayCount, isGuestCursorVisible, syncHostCursorToGuestState, installCursorAndUpdateHostVisibility, getAbsoluteWindowPosition, markGuestCustomPaint, killWindowTimers, registerWindowDestroyFinalizer, reorderChildInParent, isWindowPosZOrderRequestValid, shouldSeedPaintFromParent, tryLockWindowUpdate, isWindowUpdateLocked, hasSystemControlChildren, getChildWindowExclusions, isEffectivelyVisible, getAncestorClipRect } from './shared-state';
+import { WindowInfo, windows, getWindowByHandle, getCursorDisplayCount, updateCursorDisplayCount, isGuestCursorVisible, syncHostCursorToGuestState, installCursorAndUpdateHostVisibility, getAbsoluteWindowPosition, markGuestCustomPaint, markWindowPaintCycleRan, killWindowTimers, registerWindowDestroyFinalizer, reorderChildInParent, isWindowPosZOrderRequestValid, shouldSeedPaintFromParent, tryLockWindowUpdate, isWindowUpdateLocked, hasSystemControlChildren, getChildWindowExclusions, isEffectivelyVisible, getAncestorClipRect } from './shared-state';
 import {
     invalidateWindow,
     validateWindow,
@@ -620,6 +620,7 @@ export function runDefaultWindowPaint(
         try {
             const flushed = flushPaintDCToOverlay(hWnd, hdc);
             gdi.releaseDC(hdc);
+            markWindowPaintCycleRan(hWnd);
             if (paintTraceEnabled) logBeginEndPaint('EndPaint', hWnd,
                 `via=${label} hdc=0x${hdc.toString(16)} flush=${flushed ? 1 : 0}`);
             // Nothing of the window's OWN client reached the overlay — its proc answered
@@ -2043,6 +2044,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
             const hdc = view.getUint32(lpPaint, true);
             const flushed = flushPaintDCToOverlay(hWnd, hdc);
+            markWindowPaintCycleRan(hWnd);
             if (paintTraceEnabled) logBeginEndPaint('EndPaint', hWnd,
                 `lpPaint=0x${lpPaint.toString(16)} hdc=0x${hdc.toString(16)} flush=${flushed ? 1 : 0}`);
             gdi.releaseDC(hdc);
