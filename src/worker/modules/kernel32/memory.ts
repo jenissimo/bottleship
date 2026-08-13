@@ -1191,8 +1191,24 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             //    every exe patcher performs (ASI loaders, SilentPatch, packers) then restores
             //    RX over .data and .bss too, and the game's next global write takes an access
             //    violation far from the patcher.
-            const mod = moduleRegistry?.getModuleContainingAddress(lpAddress) ?? null;
-            if (mod) {
+            const stack = system.scheduler?.findStackReservation(pageBase) ?? null;
+            const mod = stack ? null : (moduleRegistry?.getModuleContainingAddress(lpAddress) ?? null);
+            if (stack) {
+                // 0) Thread stack. Windows describes a stack by its RESERVATION, and every
+                //    stack-bounds helper reads it that way: bottom = AllocationBase, top from
+                //    TEB StackBase. Answering page-granular (AllocationBase = the queried page,
+                //    RegionSize = 0x1000) hands them inverted or 4KB-wide bounds. We commit the
+                //    whole stack up front, so the committed run IS the reservation — no guard
+                //    page, no reserved tail to describe. This precedes the generic
+                //    backed-interval branch, whose page-granular answer stays load-bearing for
+                //    SmartHeap-style pointer validation of HEAP pointers.
+                baseAddress = stack.base;
+                allocationBase = stack.base;
+                regionSize = stack.top - stack.base;
+                memType = MEM_PRIVATE;
+                protect = PAGE_READWRITE;
+                state = MEM_COMMIT;
+            } else if (mod) {
                 allocationBase = mod.baseAddress;
                 memType = MEM_IMAGE;
                 state = MEM_COMMIT;
@@ -2805,6 +2821,45 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 
     return exports;
 })();
+
+/**
+ * What the GUEST is told about one address — the real VirtualQuery, decoded.
+ *
+ * getVaMap below answers a fixed set of probes, which is the wrong shape when the
+ * question is about ONE address: a thread stack, a borrowed lpSurface, the pointer a
+ * heap manager just rejected. Reading region state off our own AddressSpace instead
+ * answers a different question than the guest asked, and the two have disagreed before.
+ * Backs the `vaQuery` harness verb.
+ */
+export function queryVirtualMemory(addr: number): Record<string, unknown> | null {
+    const process = System.getInstance().process;
+    const vq = exports['VirtualQuery'];
+    if (!process || typeof vq !== 'function') return null;
+    const mem = process.getCurrentMemory();
+    const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+    const buf = process.memory.alloc(0x1000, 'HEAP');
+    const ctx: X86Context = {
+        eax: 0, ecx: 0, edx: 0, ebx: 0, esp: 0, ebp: 0, esi: 0, edi: 0, eip: 0, eflags: 0,
+    };
+    try {
+        const rc = vq(ctx, mem, [addr >>> 0, buf, 28]) as number;
+        if (!rc) return { addr: `0x${(addr >>> 0).toString(16)}`, rc: 0 };
+        const state = view.getUint32(buf + 16, true) >>> 0;
+        return {
+            addr: `0x${(addr >>> 0).toString(16)}`,
+            rc,
+            baseAddress: `0x${(view.getUint32(buf + 0, true) >>> 0).toString(16)}`,
+            allocationBase: `0x${(view.getUint32(buf + 4, true) >>> 0).toString(16)}`,
+            allocationProtect: `0x${(view.getUint32(buf + 8, true) >>> 0).toString(16)}`,
+            regionSize: view.getUint32(buf + 12, true) >>> 0,
+            state: state === 0x10000 ? 'FREE' : state === 0x2000 ? 'RESERVE' : state === 0x1000 ? 'COMMIT' : `0x${state.toString(16)}`,
+            protect: `0x${(view.getUint32(buf + 20, true) >>> 0).toString(16)}`,
+            type: `0x${(view.getUint32(buf + 24, true) >>> 0).toString(16)}`,
+        };
+    } finally {
+        try { process.memory.free(buf); } catch { /* ignore */ }
+    }
+}
 
 /**
  * DevTools/harness: walk VirtualQuery the way SmartHeap does (addr += RegionSize)
