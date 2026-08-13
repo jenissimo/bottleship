@@ -12,9 +12,9 @@
  * fsRead alone CANNOT test this: it serves the overlay's in-memory copy and always looks
  * complete. Only a read after a real teardown proves durability.
  *
- *   WGB=G:/WGB/running/quake2.wgb bun tools/harness.ts run tools/examples/quake2-settings-persist.harness.ts
+ *   WGB=G:/WGB/running/quake2.wgb bun tools/harness.ts run tools/harness/regression/quake2-settings-persist.harness.ts
  */
-import { harness } from "../harness";
+import { harness } from "../../harness";
 
 const WGB = process.env.WGB ?? "/apps/external-wgb/quake2.wgb";
 const VK = { ESC: 0x1b, DOWN: 0x28, LEFT: 0x25, RIGHT: 0x27, RETURN: 0x0d, Y: 0x59 };

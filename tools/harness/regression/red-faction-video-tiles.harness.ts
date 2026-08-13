@@ -8,13 +8,13 @@
  * sample the LAST tile. This asserts the screen against the frame the guest actually decoded,
  * which is the only check that can tell "assembled" from "six stretched copies".
  *
- *   WGB=g:/WGB/todo/red-faction.wgb bun tools/harness.ts run tools/examples/red-faction-video-tiles.harness.ts
+ *   WGB=g:/WGB/todo/red-faction.wgb bun tools/harness.ts run tools/harness/regression/red-faction-video-tiles.harness.ts
  *
  * Requires the launcher's video-card gate to be satisfied first: run
- * tools/examples/red-faction-launcher.harness.ts, pick a card in Setup, then Play.
+ * tools/harness/regression/red-faction-launcher.harness.ts, pick a card in Setup, then Play.
  */
 
-import { harness } from "../harness";
+import { harness } from "../../harness";
 
 const TILES = [
     { sx: 0, sy: 0, w: 256, h: 256 },

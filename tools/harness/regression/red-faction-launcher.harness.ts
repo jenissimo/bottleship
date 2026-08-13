@@ -7,10 +7,10 @@
  * DefDlgProc → BeginPaint/EndPaint. Hand a subclasser the app's DlgProc instead of
  * DefDlgProc and the window stays blank grey with no error anywhere.
  *
- *   WGB=g:/WGB/todo/red-faction.wgb bun tools/harness.ts run tools/examples/red-faction-launcher.harness.ts
+ *   WGB=g:/WGB/todo/red-faction.wgb bun tools/harness.ts run tools/harness/regression/red-faction-launcher.harness.ts
  */
 
-import { harness } from "../harness";
+import { harness } from "../../harness";
 
 const result: any = await harness()
     // First run shows a "you will now be taken to Setup" MessageBoxEx; the guest is

@@ -86,7 +86,7 @@ const flagPairs = (args.flags || "").split(",").filter(Boolean).map(s => {
     return [Number(i), Number(v)];
 });
 if (flagPairs.some(([i, v]) => i === 9 && v !== 0)) {
-    console.error("nbench boots Linux with non-identity paging; fastmem reads are intentionally unsupported here. Use tools/examples/fastmem-reads-hpcos-ab.harness.ts.");
+    console.error("nbench boots Linux with non-identity paging; fastmem reads are intentionally unsupported here. Use tools/harness/perf/fastmem-reads-hpcos-ab.harness.ts.");
     process.exit(2);
 }
 

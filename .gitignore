@@ -86,7 +86,7 @@ tools/reference/**/*.h
 # Perf/investigation plan docs — local scratch, not shipped
 /plan/
 
-# Throwaway bring-up/debug probe scripts — local scratch; durable scenarios live in tools/examples/
+# Throwaway bring-up/debug probe scripts — local scratch; durable scenarios live in tools/harness/
 /tools/probes/
 
 # bench-v86 local caches

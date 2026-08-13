@@ -4,13 +4,13 @@
  *
  * Prereqs: `bun tools/harness.ts up` (launches/attaches Chrome with the autoplay
  * flag, opens ?game=dev, arms log streaming). Then:
- *   bun tools/harness.ts run tools/examples/bringup.harness.ts
+ *   bun tools/harness.ts run tools/harness/templates/bringup.harness.ts
  *
  * Every verb is sugar over harness_rpc; `.run()` ships the whole chain to the
  * page in one CDP eval and returns one POJO (also written to logs/harness/).
  */
 
-import { harness } from "../harness";
+import { harness } from "../../harness";
 
 const result = await harness()
     .streamLogs(["SYSTEM", "DDRAW", "USER32"])     // observe the worker log stream

@@ -47,6 +47,7 @@ import {
     setPointerLock,
 } from "./cdp-core";
 import { resolve as resolvePath, sep } from "node:path";
+import { readdirSync } from "node:fs";
 import { readCanvasGeometry } from "./cdp-geometry";
 import { applyDevice, tap, touchDrag, longPress, twoFingerTap, pinch } from "./cdp-touch";
 import { HarnessChain } from "../src/harness/dsl";
@@ -589,6 +590,104 @@ async function cmdTrace(secondsArg?: string, out?: string): Promise<void> {
     console.log(`  analyze: bun tools/analyze-trace.ts ${file} --thread worker --top 40`);
 }
 
+const REGRESSION_DIR = resolvePath(import.meta.dir, "harness", "regression");
+
+function globToRegExp(glob: string): RegExp {
+    const escaped = glob.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
+    return new RegExp(`^${escaped}$`, "i");
+}
+
+/** Stream a child's output live to our own stdout/stderr while also accumulating it,
+ *  so a multi-minute scenario shows progress AND leaves a tail line for the summary. */
+async function pipeAndCapture(stream: ReadableStream<Uint8Array> | null, sink: { write(s: string): unknown }): Promise<string> {
+    if (!stream) return "";
+    const decoder = new TextDecoder();
+    let acc = "";
+    for await (const chunk of stream) {
+        const text = decoder.decode(chunk as Uint8Array, { stream: true });
+        sink.write(text);
+        acc += text;
+    }
+    return acc;
+}
+
+/** regress [--only <glob>] — run every checked-in scenario in tools/harness/regression/
+ *  against the shared tab, one game at a time (a tab drives exactly one guest, so this
+ *  cannot fan out the way `parallel` bring-up does). Each scenario is its own
+ *  `harness run` subprocess: a script's thrown Error or explicit `process.exitCode`
+ *  then can't leak state (globals, the shared `_session`, a lingering CDP breakpoint)
+ *  into the next one. Bundle paths are each scenario's OWN concern — its `WGB` env var
+ *  / built-in default (drop-folder or a raw disk path) — this command holds none of
+ *  its own, so it runs unmodified regardless of where the caller's bundles live. */
+async function cmdRegress(rest: string[]): Promise<void> {
+    const onlyIdx = rest.indexOf("--only");
+    const onlyRaw = onlyIdx >= 0 ? rest[onlyIdx + 1] : rest.find((a) => a.startsWith("--only="))?.slice("--only=".length);
+    const onlyRe = onlyRaw ? globToRegExp(onlyRaw) : null;
+
+    const files = readdirSync(REGRESSION_DIR)
+        .filter((f) => f.endsWith(".harness.ts"))
+        .filter((f) => !onlyRe || onlyRe.test(f.replace(/\.harness\.ts$/, "")))
+        .sort();
+    if (!files.length) {
+        console.log(onlyRe ? `[regress] no scenario matches --only ${onlyRaw}` : "[regress] tools/harness/regression/ is empty");
+        return;
+    }
+    console.log(`[regress] ${files.length} scenario(s): ${files.map((f) => f.replace(/\.harness\.ts$/, "")).join(", ")}`);
+
+    const repoRoot = resolvePath(import.meta.dir, "..");
+    const rows: { name: string; ok: boolean; verdict: string; shot: string; ms: number }[] = [];
+
+    for (const file of files) {
+        const name = file.replace(/\.harness\.ts$/, "");
+        console.log(`\n[regress] === ${name} ===`);
+        const t0 = Date.now();
+        const proc = Bun.spawn(["bun", "tools/harness.ts", "run", `tools/harness/regression/${file}`], {
+            cwd: repoRoot,
+            env: process.env,
+            stdout: "pipe",
+            stderr: "pipe",
+        });
+        const [outText, errText, exitCode] = await Promise.all([
+            pipeAndCapture(proc.stdout, process.stdout),
+            pipeAndCapture(proc.stderr, process.stderr),
+            proc.exited,
+        ]);
+        const ms = Date.now() - t0;
+        const ok = exitCode === 0;
+        const tail = (t: string) => t.trim().split("\n").filter(Boolean).pop() ?? "";
+        // A scenario fails two ways: a thrown Error (message lands on stderr via the
+        // CLI's own top-level catch) or an explicit process.exitCode with no throw
+        // (blackwell-legacy's style, reason already printed on stdout) — surface
+        // whichever the script actually gave, never invent a generic message.
+        const verdict = ok ? (tail(outText) || "OK") : (tail(errText) || tail(outText) || `exit ${exitCode}`);
+
+        let shot = "(capture failed)";
+        try {
+            const session = await ensureSession();
+            const b64 = await screenshot(session);
+            const shotPath = artifact(`logs/regress/${name}.png`);
+            await Bun.write(shotPath, Buffer.from(b64, "base64"));
+            shot = shotPath;
+        } catch (e) {
+            shot = `(capture failed: ${(e as Error).message})`;
+        }
+        rows.push({ name, ok, verdict, shot, ms });
+    }
+
+    console.log("\n[regress] ── summary ──────────────────────────────────────────────");
+    const nameW = Math.max(8, ...rows.map((r) => r.name.length));
+    for (const r of rows) {
+        console.log(`  ${r.ok ? "PASS" : "FAIL"}  ${r.name.padEnd(nameW)}  ${(r.ms / 1000).toFixed(1).padStart(6)}s  ${r.shot}`);
+        if (!r.ok || r.verdict !== "OK") console.log(`        ${r.verdict}`);
+    }
+    const failed = rows.filter((r) => !r.ok);
+    console.log(`\n[regress] ${rows.length - failed.length}/${rows.length} passed`);
+    if (failed.length) {
+        console.log(`[regress] FAILED: ${failed.map((r) => r.name).join(", ")}`);
+        process.exitCode = 1;
+    }
+}
+
 /** reload — hard-reload the page (replaces cdp-reload; HMR is off, so reload to pick up worker edits). */
 async function cmdReload(): Promise<void> {
     const session = await ensureSession();
@@ -627,8 +726,9 @@ async function main(): Promise<void> {
         case "gridShot": case "gridshot": await cmdGridShot(rest[0], rest[1]); break;
         case "trace": await cmdTrace(rest[0], rest[1]); break;
         case "reload": await cmdReload(); break;
+        case "regress": await cmdRegress(rest); break;
         case undefined:
-            console.log("usage: bun tools/harness.ts <up|run <script>|repl|health|eval <expr>|worker-eval <expr>|fixture <save|restore> <name> [--container <id>]|shot [out.png] [--verify]|gridShot [out.png] [step]|trace <sec> [out.json.gz]|reload|device <profile>|tap <x> <y>|<any-harness-command> [args...]>");
+            console.log("usage: bun tools/harness.ts <up|run <script>|repl|health|eval <expr>|worker-eval <expr>|fixture <save|restore> <name> [--container <id>]|shot [out.png] [--verify]|gridShot [out.png] [step]|trace <sec> [out.json.gz]|reload|regress [--only <glob>]|device <profile>|tap <x> <y>|<any-harness-command> [args...]>");
             process.exit(0);
             break;
         // Any other token is dispatched as a harness RPC command (report, stubs, backtrace,
@@ -640,5 +740,8 @@ async function main(): Promise<void> {
 
 // Only run the CLI when invoked directly (not when imported by a .harness.ts script).
 if (import.meta.main) {
-    main().then(() => process.exit(0)).catch((e) => { console.error(e); process.exit(1); });
+    // process.exitCode (set by e.g. blackwell-legacy.harness.ts's non-throwing
+    // verdict, or cmdRegress on a failed scenario) must survive to the real exit —
+    // a hardcoded exit(0) here silently discards it.
+    main().then(() => process.exit(process.exitCode ?? 0)).catch((e) => { console.error(e); process.exit(1); });
 }

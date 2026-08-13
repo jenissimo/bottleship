@@ -19,7 +19,7 @@
  *
  * The PNGs are for eyeballing colour and geometry — the two bugs bring-up actually hit.
  */
-import { harness } from "../harness";
+import { harness } from "../../harness";
 
 const WGB = process.env.WGB ?? "g:/WGB/running/system-shock-ii.wgb";
 

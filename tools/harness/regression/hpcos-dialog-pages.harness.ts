@@ -1,5 +1,5 @@
 /** Ground-truth regression for Win32 child-dialog page switching in HP CoS. */
-import { harness } from "../harness";
+import { harness } from "../../harness";
 
 const WGB = process.env.WGB ?? "g:/WGB/running/harry-potter-cos.wgb";
 

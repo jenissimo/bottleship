@@ -9,9 +9,9 @@
  * Drives it into the windowed DIB path deterministically via baseq2/autoexec.cfg
  * (the bundle ships no config.cfg, so cvar defaults otherwise pick DirectDraw).
  *
- *   WGB=G:/WGB/running/quake2.wgb bun tools/harness.ts run tools/examples/quake2-gdi-window.harness.ts
+ *   WGB=G:/WGB/running/quake2.wgb bun tools/harness.ts run tools/harness/regression/quake2-gdi-window.harness.ts
  */
-import { harness } from "../harness";
+import { harness } from "../../harness";
 
 const WGB = process.env.WGB ?? "/apps/external-wgb/quake2.wgb";
 

@@ -13,10 +13,10 @@
  * Five COLD attempts, because the guest also has an intermittent SEH-driven self-kill
  * around this click (~2 of 5 before the gdi32 mapping-mode gap was closed).
  *
- *   WGB=g:/WGB/prod-library/tiberian-sun.wgb bun tools/harness.ts run tools/examples/tiberian-sun-dialog.harness.ts
+ *   WGB=g:/WGB/prod-library/tiberian-sun.wgb bun tools/harness.ts run tools/harness/regression/tiberian-sun-dialog.harness.ts
  */
 
-import { harness } from "../harness";
+import { harness } from "../../harness";
 
 const ATTEMPTS = 5;
 const chain = harness().call("logLevel", "DDRAW", "WARN");

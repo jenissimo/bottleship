@@ -6,9 +6,9 @@
  * BottleShip's identity map, so a raw `mem8 + linear` read is unsound there.
  *
  * Usage: WGB=g:/WGB/running/harry-potter-cos.wgb OUT=fastmem-hpcos-ab.json
- *        bun tools/harness.ts run tools/examples/fastmem-reads-hpcos-ab.harness.ts
+ *        bun tools/harness.ts run tools/harness/perf/fastmem-reads-hpcos-ab.harness.ts
  */
-import { harness } from "../harness";
+import { harness } from "../../harness";
 
 const WGB = process.env.WGB ?? "g:/WGB/running/harry-potter-cos.wgb";
 const OUT = process.env.OUT ?? "fastmem-hpcos-ab.json";

@@ -2,7 +2,7 @@
  * Template touch/mobile script — the P3 acceptance shape from docs/mobile-touch-plan.md.
  *
  * Prereqs: `bun tools/harness.ts up`. Then:
- *   WGB=/apps/<bundle>.wgb bun tools/harness.ts run tools/examples/touch.harness.ts
+ *   WGB=/apps/<bundle>.wgb bun tools/harness.ts run tools/harness/regression/touch.harness.ts
  *
  * `device` + the gesture verbs execute CLI-side over CDP (Emulation.* /
  * Input.dispatchTouchEvent) and splice back into the same ordered result as the
@@ -12,7 +12,7 @@
  * All coordinates are GUEST pixels (same space as clickAt / gridShot labels).
  */
 
-import { harness } from "../harness";
+import { harness } from "../../harness";
 
 const result = await harness()
     .device("phone-landscape")                       // 844x390 dpr3, maxTouchPoints 5

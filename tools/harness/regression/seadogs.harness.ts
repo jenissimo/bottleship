@@ -2,11 +2,11 @@
  * Sea Dogs bring-up: boot to the main menu, open Options, snapshot the screen.
  *
  * Pass the bundle location via env (absolute path is streamed off disk):
- *   WGB=<path-to>\seadogs.wgb bun tools/harness.ts run tools/examples/seadogs.harness.ts
+ *   WGB=<path-to>\seadogs.wgb bun tools/harness.ts run tools/harness/regression/seadogs.harness.ts
  * Falls back to the /apps/external-wgb drop-folder convention.
  */
 
-import { harness } from "../harness";
+import { harness } from "../../harness";
 
 const wgb = process.env.WGB ?? "/apps/external-wgb/seadogs.wgb";
 

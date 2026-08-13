@@ -126,8 +126,11 @@ canvas-vs-selected-bitmap distinction and multi-DC composites are easy to mis-mo
 ## 6. Fix → re-run → keep tools, drop probes
 
 Every `.run()` writes a re-runnable `logs/harness/run-N.harness.ts` (journal). Turn
-the winning chain into a checked-in `*.harness.ts` regression script. **Remove
-one-off probes**; keep only reusable harness verbs.
+the winning chain into a checked-in `*.harness.ts` regression script under
+`tools/harness/regression/` **only if it self-judges** (throws/sets exitCode with
+a stated reason, not "look at the screenshot") **and** isn't tied to one closed bug
+(see `tools/harness/README.md`). **Remove one-off probes**; keep only reusable
+harness verbs.
 
 ## Hard rules (don't relearn these)
 
@@ -148,5 +151,7 @@ one-off probes**; keep only reusable harness verbs.
 The **skill** = workflow/checklist; the **harness** (`src/worker/harness/`,
 `src/harness/`, `tools/harness.ts`) = capability/verbs; **CLAUDE.md** = invariants.
 
-Bundled examples: `tools/examples/bringup.harness.ts` (template),
-`tools/examples/diagnose-eip.harness.ts` (API-breakpoint + waitUntil).
+Templates: `tools/harness/templates/bringup.harness.ts` (bring-up starting point),
+`tools/harness/templates/diagnose-eip.harness.ts` (API-breakpoint + waitUntil). Checked-in
+per-game regression scenarios live in `tools/harness/regression/` (run the whole batch with
+`bun tools/harness.ts regress`); see `tools/harness/README.md` for what earns a spot there.

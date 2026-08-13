@@ -82,6 +82,22 @@ far too much log output to grep. So the harness gives you structured views inste
   offset. It is the decisive test for any codegen flag: if the bytes don't change, the flag is
   dead on that workload, and no timing measurement can say otherwise.
 
+## Checked-in scripts & the regression batch
+
+Durable `*.harness.ts` scripts live under `tools/harness/`: `templates/` (copy-and-adapt
+starting points), `regression/` (self-judging per-game scenarios), `perf/` (production A/B
+instruments). `tools/harness/README.md` has the admission rule for what earns a spot in
+`regression/` versus staying a throwaway probe in the gitignored `tools/probes/`. Run the
+whole regression set with:
+
+```bash
+bun tools/harness.ts regress                   # every scenario, sequentially
+bun tools/harness.ts regress --only "quake2*"  # glob against the scenario name
+```
+
+which prints a scenario → verdict → screenshot table; a failure always has a picture next
+to it even if the scenario itself never calls `.shot()`.
+
 ## Reverse-engineering the guest
 
 For understanding the guest binary itself, a warm RE service (Ghidra headless behind an HTTP

@@ -30,7 +30,10 @@ Public dev/build tooling. Game-specific RE/debug one-offs live in
   deleted `logs/`), which is the case where a log buffer either stays bounded or eats the machine.
 - **re/** — warm RE service (Ghidra headless behind an HTTP daemon): decompile / resolve / exportSymbolMap.
 - **pe-disas.py** — lightweight PE disassembler/xref helper (capstone + pefile), Ghidra-down fallback.
-- **examples/** — harness script template (`bringup.harness.ts`) and a worked diagnostic example (`diagnose-eip.harness.ts`).
+- **harness/** — checked-in harness scripts: `templates/` (copy-and-adapt starting points), `regression/`
+  (self-judging per-game scenarios, run in a batch via `bun tools/harness.ts regress`), `perf/` (production
+  A/B instruments). See `tools/harness/README.md` for the admission rule. One-off probes belong in the
+  gitignored `tools/probes/` and die with the investigation, not here.
 
 ## Quality gate & codegen
 

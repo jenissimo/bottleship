@@ -2,7 +2,7 @@
  * Natalie Brooks: Secrets of Treasure House — boot + new-game regression script.
  *
  *   WGB=g:/WGB/running/NatalieBrooksSTH-nofpu.wgb \
- *   bun tools/harness.ts run tools/examples/natalie-brooks.harness.ts
+ *   bun tools/harness.ts run tools/harness/regression/natalie-brooks.harness.ts
  *
  * Doubles as the phase stopwatch for load-time work: it ticks SMALL frame batches
  * and prints the cost of each, so a loading phase (a few fps) separates itself from
@@ -14,7 +14,7 @@
  * UI's own sampling tick and is dropped.
  */
 
-import { harness } from "../harness";
+import { harness } from "../../harness";
 
 const WGB = process.env.WGB ?? "g:/WGB/running/NatalieBrooksSTH-nofpu.wgb";
 const BATCH = 30;

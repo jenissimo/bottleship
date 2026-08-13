@@ -16,7 +16,7 @@
  * validation errors (bind group vs shader layout), so the run asserts the screen is not
  * black and leaves a PNG to eyeball.
  */
-import { harness } from "../harness";
+import { harness } from "../../harness";
 
 const WGB = process.env.WGB ?? "g:/WGB/running/system-shock-ii.wgb";
 

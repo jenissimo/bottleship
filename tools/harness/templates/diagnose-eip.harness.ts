@@ -5,10 +5,10 @@
  * Demonstrates API breakpoints (no JIT-off — preferred for bring-up), a
  * worker-evaluated waitUntil predicate over guest memory, and a fault-grade
  * state snapshot. Run after `bun tools/harness.ts up`:
- *   bun tools/harness.ts run tools/examples/diagnose-eip.harness.ts
+ *   bun tools/harness.ts run tools/harness/templates/diagnose-eip.harness.ts
  */
 
-import { harness } from "../harness";
+import { harness } from "../../harness";
 
 const result = await harness()
     .openWgb("some-d3d-game")
