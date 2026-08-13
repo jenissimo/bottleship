@@ -184,6 +184,22 @@ export class HarnessChain {
     /** PNG of the SCREEN (canvas, overlays composited). `source:'layer'` asks for the
      *  presenter's pre-composite game layer instead — labelled `composited:false`. */
     shot(opts?: { save?: string; source?: "screen" | "layer" }): this { return this.push("shot", [opts]); }
+    /** Our screen vs a NATIVE Windows capture, per pixel, over named regions. The reference
+     *  is palette-remapped first (the demos are the classic CODE path but not the classic
+     *  colour scheme); unmapped reference pixels are counted, not silently skipped. Reports
+     *  a diff count and bounding box per region — WHERE, not just whether. */
+    compareReference(opts: {
+        url: string;
+        at: { x: number; y: number };
+        palette: [string, string][];
+        regions?: { name: string; x: number; y: number; w: number; h: number }[];
+        ignore?: { x: number; y: number; w: number; h: number }[];
+        save?: string;
+    }): this { return this.push("compareReference", [opts]); }
+    /** Stable digest of a screen rect — the A -> B -> A identity check needs no reference. */
+    screenRegionHash(rect: { x: number; y: number; w: number; h: number }): this {
+        return this.push("screenRegionHash", [rect]);
+    }
     /** One-frame per-draw capture. `backend` ("ddraw"|"d3d8"|"d3d9") pins WHICH render path's
      *  frame boundary ends it — without it, a title where two paths present returns the other
      *  path's empty frame and that reads exactly like "no draws happened". `dumpTargets` adds

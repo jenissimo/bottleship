@@ -13,6 +13,7 @@ import { Logger, LogCategory } from '../../core/logger';
 import { Marshaler } from '../../core/memory/marshaler';
 import { System } from '../../core/system';
 import { encodeAnsi } from '../codepage-utils';
+import { gdiTextMetrics } from '../win32-text';
 import { WindowInfo, registerControlStatePurger, windows } from './shared-state';
 import { postNotify } from './control-notify';
 
@@ -247,7 +248,10 @@ function makeMetrics(font: string): TabTextMetrics {
     return {
         textWidth: (t) => ctx.measureText(t).width,
         avgCharWidth: avg,
-        fontHeight: fontPixelHeight(font),
+        // comctl32 sizes the row from tmHeight, which is ascent+descent — NOT the
+        // font's point/px size. Taking the px size instead makes every tab row two
+        // pixels short, so the same helper the control painters use answers here.
+        fontHeight: gdiTextMetrics(ctx).height,
     };
 }
 
@@ -330,7 +334,13 @@ export function ensureTabLayout(win: WindowInfo, state: TabControlState = getOrC
 
 export interface TabRect { left: number; top: number; right: number; bottom: number }
 
-/** Client-relative pixel rect of one tab (unselected geometry). */
+/**
+ * Client-relative pixel rect of one tab (unselected geometry).
+ *
+ * The row is inset by SELECTED_TAB_OFFSET on both axes: comctl32 leaves that gap
+ * so the SELECTED tab, which is this rect inflated by the same offset, still fits
+ * inside the client (TAB_InternalGetItemRect's OffsetRect + the row's top bias).
+ */
 export function tabItemRect(win: WindowInfo, index: number): TabRect | null {
     const state = ensureTabLayout(win);
     const item = state.items[index];
@@ -339,13 +349,15 @@ export function tabItemRect(win: WindowInfo, index: number): TabRect | null {
     const buttons = (style & TCS_BUTTONS) !== 0;
     const rowSpan = state.tabHeight + (buttons ? BUTTON_SPACINGY : 0);
     const height = Math.max(1, win.height);
+    const left = item.left + SELECTED_TAB_OFFSET;
+    const right = item.right + SELECTED_TAB_OFFSET;
 
     if ((style & TCS_BOTTOM) !== 0) {
         const bottom = height - item.row * rowSpan - (buttons ? 0 : SELECTED_TAB_OFFSET);
-        return { left: item.left, top: bottom - state.tabHeight, right: item.right, bottom };
+        return { left, top: bottom - state.tabHeight, right, bottom };
     }
     const top = item.row * rowSpan + (buttons ? 0 : SELECTED_TAB_OFFSET);
-    return { left: item.left, top, right: item.right, bottom: top + state.tabHeight };
+    return { left, top, right, bottom: top + state.tabHeight };
 }
 
 /** Total pixel height the tab rows occupy, including button spacing. */

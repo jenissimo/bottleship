@@ -97,6 +97,7 @@ import {
     tabItemRect,
     tabRowsHeight,
     SELECTED_TAB_OFFSET as SELECTED_TAB_OFFSET_PX,
+    CONTROL_BORDER_SIZE,
     TCS_BOTTOM as TCS_BOTTOM_STYLE,
 } from './tab-control';
 import { restampOwnedPopups } from './paint-hooks';
@@ -479,11 +480,16 @@ function paintGroupBox(
     ctx.font = getWindowFont(child);
     const tm = gdiTextMetrics(ctx);
     const textWidth = label ? Math.ceil(measureMnemonicText(ctx, label)) : 0;
-    // Win32 drops the etched frame by half a text cell so the label straddles it,
-    // then erases the label's own run of the line (GB_Paint: rcFrame.top +=
-    // tmHeight/2, label rect inflated -7 and filled with the parent's brush).
-    const frameTop = y + Math.floor(tm.height / 2);
+    // GB_Paint's three numbers, and they only read right together (Wine button.c:996
+    // + BUTTON_CalcLabelRect): the etched frame drops by tmHeight/2 - 1, the label
+    // rect starts at the client inflated by (-7, +1) and is then nudged one more
+    // pixel right and down by the DT_LEFT|DT_TOP alignment — so the text lands at
+    // (x+8, y+2) and the gap burned in the top line runs from x+7. Taking the frame
+    // one pixel low and the label two pixels high instead leaves the label floating
+    // clear of its own gap, with the frame closing under it.
+    const frameTop = y + Math.floor(tm.height / 2) - 1;
     const textStart = x + 8;
+    const labelTop = y + 2;
 
     drawEtchedEdge(ctx, x, frameTop, w, Math.max(2, h - (frameTop - y)));
 
@@ -494,14 +500,14 @@ function paintGroupBox(
         const labelGround = controlEraseCss(child);
         if (labelGround) {
             ctx.fillStyle = labelGround;
-            ctx.fillRect(textStart - 1, y, textWidth + 2, tm.height);
+            ctx.fillRect(textStart - 1, labelTop, textWidth + 2, tm.height + 1);
         }
         const colors = getControlColorOverride(child.handle);
         ctx.fillStyle = isControlDisabled(child) ? COLOR_GRAYTEXT
             : (colors?.text ?? COLOR_WINDOWTEXT);
         ctx.textAlign = 'left';
         ctx.textBaseline = 'alphabetic';
-        fillTextWithMnemonic(ctx, label, textStart, topTextBaseline(ctx, y));
+        fillTextWithMnemonic(ctx, label, textStart, topTextBaseline(ctx, labelTop));
         ctx.textBaseline = 'top';
     }
 }
@@ -1903,12 +1909,87 @@ function paintScrollBar(
 }
 
 /**
+ * DrawEdge(EDGE_RAISED, BF_SOFT | LEFT|TOP|RIGHT) — the three sides of a tab that
+ * face away from the pane. The side facing the pane is deliberately absent: that
+ * open edge is what merges the selected tab into the page.
+ */
+function drawTabEdge(
+    ctx: OffscreenCanvasRenderingContext2D,
+    x: number, y: number, w: number, h: number, bottomTabs: boolean,
+): void {
+    ctx.fillStyle = COLOR_BTNHILIGHT;
+    ctx.fillRect(x, y, 1, h);
+    ctx.fillStyle = COLOR_BTNDKSHADOW;
+    ctx.fillRect(x + w - 1, y, 1, h);
+    if (bottomTabs) {
+        ctx.fillRect(x, y + h - 1, w, 1);
+        ctx.fillStyle = COLOR_BTNINNERHI;
+        ctx.fillRect(x + 1, y, 1, Math.max(1, h - 1));
+        ctx.fillStyle = COLOR_BTNSHADOW;
+        ctx.fillRect(x + w - 2, y, 1, Math.max(1, h - 1));
+        ctx.fillRect(x + 1, y + h - 2, Math.max(1, w - 2), 1);
+        return;
+    }
+    ctx.fillStyle = COLOR_BTNHILIGHT;
+    ctx.fillRect(x, y, w, 1);
+    ctx.fillStyle = COLOR_BTNINNERHI;
+    ctx.fillRect(x + 1, y + 1, Math.max(1, w - 2), 1);
+    ctx.fillRect(x + 1, y + 1, 1, Math.max(1, h - 1));
+    ctx.fillStyle = COLOR_BTNSHADOW;
+    ctx.fillRect(x + w - 2, y + 1, 1, Math.max(1, h - 1));
+}
+
+/**
+ * comctl32's DoCorners: each corner on the outer side is erased to a 2x3 block of
+ * face and redrawn as a 2px diagonal, which is what clips a classic tab's corners
+ * instead of leaving it a plain rectangle.
+ */
+function drawTabCorners(
+    ctx: OffscreenCanvasRenderingContext2D,
+    x: number, y: number, w: number, h: number, bottomTabs: boolean,
+): void {
+    const rx = x + w - 2;
+    if (bottomTabs) {
+        const by = y + h - 3;
+        ctx.fillStyle = COLOR_BTNFACE;
+        ctx.fillRect(rx, by, 2, 3);
+        ctx.fillRect(x, by, 2, 3);
+        ctx.fillStyle = COLOR_BTNSHADOW;
+        ctx.fillRect(rx, by, 1, 1);
+        ctx.fillStyle = COLOR_BTNDKSHADOW;
+        ctx.fillRect(rx + 1, by, 1, 1);
+        ctx.fillRect(rx, by + 1, 1, 1);
+        ctx.fillStyle = COLOR_BTNHILIGHT;
+        ctx.fillRect(x, by, 1, 1);
+        ctx.fillRect(x + 1, by + 1, 1, 1);
+        ctx.fillStyle = COLOR_BTNINNERHI;
+        ctx.fillRect(x + 1, by, 1, 1);
+        return;
+    }
+    ctx.fillStyle = COLOR_BTNFACE;
+    ctx.fillRect(rx, y, 2, 3);
+    ctx.fillRect(x, y, 2, 3);
+    ctx.fillStyle = COLOR_BTNDKSHADOW;
+    ctx.fillRect(rx, y + 1, 1, 1);
+    ctx.fillRect(rx + 1, y + 2, 1, 1);
+    ctx.fillStyle = COLOR_BTNSHADOW;
+    ctx.fillRect(rx, y + 2, 1, 1);
+    ctx.fillStyle = COLOR_BTNHILIGHT;
+    ctx.fillRect(x + 1, y + 1, 1, 1);
+    ctx.fillRect(x, y + 2, 1, 1);
+    ctx.fillStyle = COLOR_BTNINNERHI;
+    ctx.fillRect(x + 1, y + 2, 1, 1);
+}
+
+/**
  * SysTabControl32 — the tab row plus the raised pane the pages sit in.
  *
- * The selected tab is drawn one pixel taller and two wider than its stored rect
- * and overlaps the pane's top edge, which is what makes it read as "in front"
- * in the classic theme; tabItemRect() therefore returns the UNSELECTED geometry
- * for everyone (hit test included), exactly as comctl32 stores it.
+ * Draw order is comctl32's and load-bearing: pane, then the unselected tabs, then
+ * the selected one LAST. The selected tab's rect is the stored one inflated by
+ * SELECTED_TAB_OFFSET on every side, so its face erases the pane's top border
+ * across its own width — that open edge is the entire "this page is in front"
+ * cue, and it only survives if nothing paints over it afterwards. tabItemRect()
+ * keeps returning the UNSELECTED geometry (hit test included), as comctl32 stores it.
  */
 function paintTabControl(
     ctx: OffscreenCanvasRenderingContext2D,
@@ -1922,61 +2003,94 @@ function paintTabControl(
     const bottomTabs = (child.style & TCS_BOTTOM_STYLE) !== 0;
     const rows = tabRowsHeight(child, state);
     const disabled = isControlDisabled(child);
+    const E = SELECTED_TAB_OFFSET_PX;
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(x, y, w, h);
+    ctx.clip();
 
     ctx.fillStyle = COLOR_BTNFACE;
     ctx.fillRect(x, y, w, h);
 
-    // The display area's raised pane.
-    const paneTop = bottomTabs ? y : y + rows;
-    const paneH = Math.max(2, h - rows);
+    // The pane's border sits one edge past the tab rows — the same allowance
+    // TCM_ADJUSTRECT reserves, so the page starts exactly where the border ends.
+    const paneTop = bottomTabs ? y : y + rows + CONTROL_BORDER_SIZE;
+    const paneH = Math.max(2 * CONTROL_BORDER_SIZE, h - rows - CONTROL_BORDER_SIZE);
     drawRaisedEdge(ctx, x, paneTop, w, paneH);
 
     ctx.font = getWindowFont(child);
     ctx.textAlign = 'left';
     ctx.textBaseline = 'alphabetic';
 
-    for (let i = 0; i < state.items.length; i++) {
+    const paintItem = (i: number): void => {
         const r = tabItemRect(child, i);
-        if (!r) continue;
+        if (!r) return;
         const selected = i === state.curSel;
-        const tx = x + r.left - (selected ? SELECTED_TAB_OFFSET_PX : 0);
-        const tw = Math.max(1, (r.right - r.left) + (selected ? SELECTED_TAB_OFFSET_PX * 2 : 0));
-        const ty = y + r.top - (selected && !bottomTabs ? SELECTED_TAB_OFFSET_PX : 0);
-        const th = Math.max(1, (r.bottom - r.top) + (selected ? SELECTED_TAB_OFFSET_PX : 0));
-        if (tx + tw <= x || tx >= x + w) continue;
+        const tx = x + r.left - (selected ? E : 0);
+        const ty = y + r.top - (selected ? E : 0);
+        const tw = Math.max(1, (r.right - r.left) + (selected ? E * 2 : 0));
+        const th = Math.max(1, (r.bottom - r.top) + (selected ? E * 2 : 0));
+        if (tx + tw <= x || tx >= x + w) return;
 
         ctx.fillStyle = COLOR_BTNFACE;
         ctx.fillRect(tx, ty, tw, th);
 
-        // Classic tab: highlight on the two edges facing the pane's outside,
-        // shadow on the far side; the edge shared with the pane stays open.
-        ctx.fillStyle = COLOR_BTNHILIGHT;
-        ctx.fillRect(tx, ty, 1, th);
-        if (!bottomTabs) ctx.fillRect(tx, ty, tw - 1, 1);
-        ctx.fillStyle = COLOR_BTNSHADOW;
-        ctx.fillRect(tx + tw - 1, ty, 1, th);
-        if (bottomTabs) ctx.fillRect(tx, ty + th - 1, tw, 1);
+        // The selected tab's bevel stops one pixel short of its face so the face
+        // alone reaches into the pane; the edge it would have drawn there belongs
+        // to the pane's own border, which continues only where the tab meets the
+        // control's side.
+        const ey = selected && bottomTabs ? ty + 1 : ty;
+        const eh = selected ? th - 1 : th;
+        drawTabEdge(ctx, tx, ey, tw, eh, bottomTabs);
+        drawTabCorners(ctx, tx, ey, tw, eh, bottomTabs);
+        if (selected) {
+            const sy = bottomTabs ? ty : ty + th - 1;
+            if (tx + tw >= x + w) {
+                ctx.fillStyle = COLOR_BTNSHADOW;
+                ctx.fillRect(tx + tw - 2, sy, 1, 1);
+                ctx.fillStyle = COLOR_BTNDKSHADOW;
+                ctx.fillRect(tx + tw - 1, sy, 1, 1);
+            } else if (tx <= x) {
+                ctx.fillStyle = COLOR_BTNHILIGHT;
+                ctx.fillRect(tx, sy, 1, 1);
+                ctx.fillStyle = COLOR_BTNINNERHI;
+                ctx.fillRect(tx + 1, sy, 1, 1);
+            }
+        }
 
         const label = state.items[i].text;
-        if (label) {
-            ctx.save();
-            ctx.beginPath();
-            ctx.rect(tx + 2, ty, Math.max(1, tw - 4), th);
-            ctx.clip();
-            const textW = measureMnemonicText(ctx, label);
-            const textX = tx + Math.max(2, Math.floor((tw - textW) / 2));
-            const baseline = vcenterTextBaseline(ctx, ty, th);
-            if (disabled) {
-                fillDisabledTextWithMnemonic(ctx, label, textX, baseline, COLOR_BTNHILIGHT, COLOR_GRAYTEXT);
-            } else {
-                ctx.fillStyle = COLOR_BTNTEXT;
-                fillTextWithMnemonic(ctx, label, textX, baseline);
-            }
-            ctx.restore();
+        if (!label) return;
+        // TAB_DrawItemInterior's label rect: the selected tab centres its text on
+        // the same point its unselected rect would, so selecting a tab moves the
+        // frame around the label rather than the label itself.
+        const lx = selected ? tx : tx + E;
+        const ly = selected || !bottomTabs ? ty : ty + E;
+        const lw = Math.max(1, selected ? tw : tw - E * 2);
+        const lh = Math.max(1, selected ? th : th - E);
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(lx, ly, lw, lh);
+        ctx.clip();
+        const textW = measureMnemonicText(ctx, label);
+        const textX = lx + Math.max(0, Math.floor((lw - textW) / 2));
+        const baseline = vcenterTextBaseline(ctx, ly, lh);
+        if (disabled) {
+            fillDisabledTextWithMnemonic(ctx, label, textX, baseline, COLOR_BTNHILIGHT, COLOR_GRAYTEXT);
+        } else {
+            ctx.fillStyle = COLOR_BTNTEXT;
+            fillTextWithMnemonic(ctx, label, textX, baseline);
         }
+        ctx.restore();
+    };
+
+    for (let i = 0; i < state.items.length; i++) {
+        if (i !== state.curSel) paintItem(i);
     }
+    if (state.curSel >= 0 && state.curSel < state.items.length) paintItem(state.curSel);
 
     ctx.textBaseline = 'top';
+    ctx.restore();
 }
 
 function paintGenericControl(

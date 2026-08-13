@@ -27,6 +27,7 @@ import {
     TCS_BOTTOM,
     DISPLAY_AREA_PADDING,
     CONTROL_BORDER_SIZE,
+    SELECTED_TAB_OFFSET,
 } from "../../src/worker/modules/user32/tab-control";
 import { isContentChangingMessage } from "../../src/worker/modules/user32/dialog-control-messages";
 import type { WindowInfo } from "../../src/worker/modules/user32/shared-state";
@@ -241,7 +242,10 @@ describe("SysTabControl32 layout", () => {
         const r0 = tabItemRect(win, 0)!;
         const r1 = tabItemRect(win, 1)!;
         const r2 = tabItemRect(win, 2)!;
-        expect(r0.left).toBe(0);
+        // The row is inset by SELECTED_TAB_OFFSET so the selected tab, which is
+        // inflated by the same amount, still fits inside the client.
+        expect(r0.left).toBe(SELECTED_TAB_OFFSET);
+        expect(r0.top).toBe(SELECTED_TAB_OFFSET);
         expect(r1.left).toBe(r0.right);
         expect(r2.left).toBe(r1.right);
         expect(r0.right).toBeGreaterThan(r0.left);
@@ -339,7 +343,8 @@ describe("SysTabControl32 layout", () => {
         const wide = tabWin();
         insert(wide, 0, "A");
         send(wide, TCM_SETMINTABWIDTH, 0, 120);
-        expect(tabItemRect(wide, 0)!.right).toBe(120);
+        const wr = tabItemRect(wide, 0)!;
+        expect(wr.right - wr.left).toBe(120);
 
         const fixed = tabWin(0x0400 /* TCS_FIXEDWIDTH */);
         insert(fixed, 0, "A");

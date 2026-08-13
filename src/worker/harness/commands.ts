@@ -34,6 +34,7 @@ import { registerCodegenCommands } from "./cmds/codegen";
 import { registerResourceCommands } from "./cmds/resources";
 import { registerHeapCommands } from "./cmds/heap";
 import { registerGpuCommands } from "./cmds/gpu";
+import { registerReferenceCommands } from "./cmds/reference";
 
 let installed = false;
 
@@ -65,6 +66,7 @@ export function installHarnessCommands(): void {
     registerCodegenCommands(harnessService);
     registerResourceCommands(harnessService);
     registerHeapCommands(harnessService);
+    registerReferenceCommands(harnessService);
 }
 
 // Install on import so a bare `import './harness/commands'` is sufficient.
