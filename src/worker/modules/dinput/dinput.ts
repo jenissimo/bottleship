@@ -971,6 +971,7 @@ export class DInput implements IModule {
                     // This avoids the edge-clamping bug of (mouse.x - lastMouseX) where
                     // mouse.x saturates at [0, width-1] in pointer-lock mode.
                     const accum = inputManager.getDInputAccum();
+                    inputManager.noteGuestRelativeMouseRead();
                     if (device.mouseInitialized) {
                         dx = (accum.x - device.lastDInputAccumX) | 0;
                         dy = (accum.y - device.lastDInputAccumY) | 0;
@@ -1979,6 +1980,7 @@ export class DInput implements IModule {
         let prevButtons = device.mousePollPrevButtons;
         if (device.deviceType === "mouse") {
             const accum = inputManager.getDInputAccum();
+            inputManager.noteGuestRelativeMouseRead();
             if (device.mouseInitialized) {
                 mouseDx = (accum.x - device.lastDInputAccumX) | 0;
                 mouseDy = (accum.y - device.lastDInputAccumY) | 0;

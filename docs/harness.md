@@ -59,6 +59,19 @@ harness()
 Verbs cover loading bundles, waiting for events, synthetic input (clicks, keys), advancing
 frames, and asserting on rendered surfaces and engine state.
 
+### Two mouse coordinate systems
+
+`click`/`clickAt`/`move` address the **absolute** pointer — right for Win32 controls and for
+in-engine menus that consume `WM_MOUSEMOVE`/`WM_LBUTTON*` (GTA III, Tiberian Sun, HL Uplink).
+
+A title that steers by **motion** (exclusive DirectInput: Quake 3-lineage menus, mouse-look)
+owns the cursor it hit-tests against and draws it itself. No absolute coordinate we publish
+says where that cursor is, so an absolute click there lands wherever the *guest's* cursor
+happens to be. Use `moveRelative(dx, dy)` to steer it and `clickHere()` to press without
+disturbing it, and read the cursor's position back off a `shot` — it is the guest's, not ours.
+Every pointer verb's result (and `state(['dinput'])`) carries `relativeMouse` when the guest is
+in that mode, so you never have to guess which world you are in.
+
 ## Seeing what happened
 
 The canvas is an `OffscreenCanvas` the main thread can't read directly, and the guest generates

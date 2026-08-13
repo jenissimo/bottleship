@@ -335,6 +335,9 @@ export class InputManager {
     private dinputPrevAccumX = 0;
     private dinputPrevAccumY = 0;
     private dinputPrevButtons = 0;
+    /** Guest reads of the DirectInput RELATIVE mouse axes (immediate + action-map).
+     *  Buffered mode is covered by dinputMouseBufferSize; see relativeMousePosture(). */
+    private guestRelativeMouseReads = 0;
 
     private dinputKeyboardEvents: DInputBufferedEvent[] = [];
     private dinputKeyboardBufferSize = 0;
@@ -1236,6 +1239,7 @@ export class InputManager {
                 produced: this.dinputGamepadSeq,
             },
             cursor: { x: this.currentMouseX, y: this.currentMouseY, buttons: this.currentButtons },
+            relativeMouse: this.relativeMousePosture(),
             trail: this.dinputTrail.slice(),
         };
     }
@@ -1379,6 +1383,28 @@ export class InputManager {
         return {
             x: this.inputView[INPUT_INDEX.dinputDX],
             y: this.inputView[INPUT_INDEX.dinputDY],
+        };
+    }
+
+    /** A guest read of the relative axes (dinput GetDeviceState / action-map poll).
+     *  Stamped by the GUEST paths only — our own buffering calls getDInputAccum too. */
+    noteGuestRelativeMouseRead(): void {
+        this.guestRelativeMouseReads++;
+    }
+
+    /**
+     * Is this title steering by MOTION rather than position? Observed, not declared:
+     * a buffered DI mouse queue, or guest reads of the relative axes. Such a guest
+     * hit-tests against a cursor IT owns, whose position no absolute screen coordinate
+     * we publish can describe — so an absolute click aims at nothing in particular.
+     * The harness pointer verbs report this so that failure mode cannot pass silently.
+     */
+    relativeMousePosture(): { relative: boolean; bufferSize: number; produced: number; stateReads: number } {
+        return {
+            relative: this.dinputMouseBufferSize > 0 || this.guestRelativeMouseReads > 0,
+            bufferSize: this.dinputMouseBufferSize,
+            produced: this.dinputMouseSeq,
+            stateReads: this.guestRelativeMouseReads,
         };
     }
 
@@ -1546,6 +1572,33 @@ export class InputManager {
         endInputWrite(view);
         this.poll(true);
         return true;
+    }
+
+    /**
+     * Feed RELATIVE pointer motion, leaving the absolute pointer where it is — the
+     * worker-side twin of the host's Pointer Lock branch (App.tsx addPointerRelative),
+     * which likewise publishes movement with no position. A guest steering by motion
+     * (DirectInput axes) sees this; one reading position does not. That split is the
+     * whole point: an absolute injector cannot express a delta larger than the screen,
+     * and a guest whose own cursor is already at the edge needs exactly that.
+     */
+    injectPointerDelta(dx: number, dy: number): boolean {
+        const view = this.inputView;
+        if (!view) return false;
+        beginInputWrite(view);
+        if (dx) Atomics.add(view, INPUT_INDEX.dinputDX, dx | 0);
+        if (dy) Atomics.add(view, INPUT_INDEX.dinputDY, dy | 0);
+        endInputWrite(view);
+        this.poll(true);
+        return true;
+    }
+
+    /** The pointer slots as the SAB holds them — the frame injected deltas are measured
+     *  against. getMouseState() reports the CLAMPED cursor, which is a different fact. */
+    getPublishedPointer(): { x: number; y: number } {
+        const view = this.inputView;
+        if (!view) return { x: this.currentMouseX, y: this.currentMouseY };
+        return { x: view[INPUT_INDEX.mouseX], y: view[INPUT_INDEX.mouseY] };
     }
 
     /** Press/release a mouse button (0=left,1=right,2=middle) at a screen point. */

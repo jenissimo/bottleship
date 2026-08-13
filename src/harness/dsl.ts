@@ -113,6 +113,21 @@ export class HarnessChain {
     keyHold(vk: number | string, holdMs = 350): this { return this.push("keyHold", [vk, holdMs]); }
     type(text: string): this { return this.push("type", [text]); }
     move(x: number, y: number): this { return this.push("move", [x, y]); }
+    /**
+     * Relative pointer motion, leaving the ABSOLUTE pointer where it is — the worker-side
+     * twin of the host's Pointer Lock delta path, and the only way to steer a guest that
+     * owns its own cursor (Quake3/DirectInput menus, mouse-look). `move`/`clickAt` say
+     * nothing about where such a cursor sits, so a click there is a silent no-op; check
+     * `relativeMouse` in any pointer verb's result to know you are in that world. Read the
+     * cursor back off a `shot` — its position is the guest's, not ours.
+     */
+    moveRelative(dx: number, dy: number): this { return this.push("moveRelative", [dx, dy]); }
+    /** Press WITHOUT moving, at the pointer's published position — the click half of
+     *  driving a relative cursor (clickAt would inject a delta and move it off the item). */
+    clickHere(holdMs = 200, button = 0): this { return this.push("clickHere", [holdMs, button]); }
+    /** Sniff what the GUEST reads from the input layer: DInput drains, wheel consumption,
+     *  button transitions, pressed-VK changes. Answers WHICH mechanism a title samples. */
+    inputTrace(action: "start" | "stop" | "read" | "clear" = "read"): this { return this.push("inputTrace", [action]); }
     drag(x0: number, y0: number, x1: number, y1: number, button?: number): this { return this.push("drag", [x0, y0, x1, y1, button]); }
     wheel(x: number, y: number, delta: number): this { return this.push("wheel", [x, y, delta]); }
     /** Plug (true) or unplug (false) the gamepad: drives the SAB presence slot through the

@@ -84,7 +84,9 @@ function input() {
 
 /** Input commands that mutate guest state — recorded by the present-serial
  *  recorder and replayable. (dialogs/findControl are read-only queries, excluded.) */
-export const RECORDABLE_INPUT = new Set(["click", "clickAt", "move", "drag", "wheel", "key", "type", "padPlug"]);
+export const RECORDABLE_INPUT = new Set([
+    "click", "clickAt", "move", "moveRelative", "drag", "wheel", "key", "type", "padPlug",
+]);
 
 /**
  * Apply one input command — the single implementation shared by the registered
@@ -96,6 +98,24 @@ const CLICK_HOLD_MS = 80;
 
 /** Pending releases per button, so back-to-back clicks cannot leave a button stuck down. */
 const pendingRelease = new Map<number, ReturnType<typeof setTimeout>>();
+
+/**
+ * The relative-mouse posture stamped onto every pointer verb's result. A title that
+ * steers by MOTION owns the cursor it hit-tests against, and no absolute screen
+ * coordinate we publish describes where that cursor sits — so `clickAt` there is a
+ * plausible-looking no-op. This stamp is what makes that visible; `moveRelative` is
+ * the verb that actually addresses such a cursor.
+ *
+ * There is deliberately no "aim at (x,y)" verb: aiming a cursor whose position only
+ * the guest knows would have to assume it clamps to the viewport, and Alice (Q3
+ * lineage) does NOT — it keeps stepping an off-screen position and draws it clamped,
+ * so a "pin to the corner then step" aim silently lands nowhere. Step relatively and
+ * read the cursor back off a `shot` instead.
+ */
+function pointerPosture(im: any): Record<string, unknown> | undefined {
+    const p = im.relativeMousePosture?.();
+    return p?.relative ? { relativeMouse: p } : undefined;
+}
 
 function pressAndRelease(im: any, x: number, y: number, button: number, holdMs: number): void {
     const armed = pendingRelease.get(button);
@@ -118,7 +138,7 @@ export function applyInput(cmd: string, args: unknown[]): any {
             // Press with DURATION, for the reason spelled out on clickAt below — a click by
             // label is the same gesture as a click by coordinate and must not differ in timing.
             pressAndRelease(im, c.cx, c.cy, 0, CLICK_HOLD_MS);
-            return { ok: true, ...c };
+            return { ok: true, ...c, ...pointerPosture(im) };
         }
         case "clickAt": {
             // A click has DURATION. Pressing and releasing inside one JS turn gives the guest
@@ -129,7 +149,7 @@ export function applyInput(cmd: string, args: unknown[]): any {
             // hardware. So release on a timer, like clickHold, just with a short human default.
             const x = Number(args[0]) | 0, y = Number(args[1]) | 0;
             pressAndRelease(im, x, y, 0, CLICK_HOLD_MS);
-            return { ok: true, x, y, holdMs: CLICK_HOLD_MS };
+            return { ok: true, x, y, holdMs: CLICK_HOLD_MS, ...pointerPosture(im) };
         }
         case "clickHold": {
             // Press and HOLD the button for `holdMs` of wall-clock, then release on a
@@ -141,11 +161,16 @@ export function applyInput(cmd: string, args: unknown[]): any {
             const holdMs = Number(args[2] ?? 200) | 0;
             const button = Number(args[3] ?? 0) | 0;
             pressAndRelease(im, x, y, button, holdMs);
-            return { ok: true, x, y, holdMs, button };
+            return { ok: true, x, y, holdMs, button, ...pointerPosture(im) };
         }
         case "move": {
             const x = Number(args[0]) | 0, y = Number(args[1]) | 0;
-            return { ok: im.injectMoveAtScreen(x, y), x, y };
+            return { ok: im.injectMoveAtScreen(x, y), x, y, ...pointerPosture(im) };
+        }
+        case "moveRelative": {
+            // Raw relative motion — mouse-look, and the primitive aimCursor is built from.
+            const dx = Number(args[0]) | 0, dy = Number(args[1]) | 0;
+            return { ok: im.injectPointerDelta(dx, dy), dx, dy, ...pointerPosture(im) };
         }
         case "drag": {
             const [x0, y0, x1, y1, button] = args.map((a, i) => (i < 4 ? Number(a) | 0 : Number(a ?? 0) | 0));
@@ -207,6 +232,19 @@ export function registerInputCommands(svc: HarnessService): void {
     // clickHold(x, y, holdMs?, button?) — press, hold across wall-clock, release.
     // Not recordable (timer-based release); for driving low-fps state-polling menus.
     svc.register("clickHold", (args) => applyInput("clickHold", args));
+
+    // clickHere(holdMs?, button?) — press WITHOUT moving, at the pointer's own published
+    // position. The click half of driving a relative cursor: once moveRelative has put the
+    // guest's cursor on the item, any coordinate we could pass to clickAt/clickHold injects
+    // one more delta and drags it back off before the press lands.
+    svc.register("clickHere", (args) => {
+        const im = input();
+        const holdMs = Number(args[0] ?? 200) | 0;
+        const button = Number(args[1] ?? 0) | 0;
+        const at = im.getPublishedPointer();
+        pressAndRelease(im, at.x, at.y, button, holdMs);
+        return { ok: true, at, holdMs, button, ...pointerPosture(im) };
+    });
 
     // keyHold(vk, holdMs?) — keyboard twin of clickHold: press, hold across real
     // frames, release on a timer. A synchronous key tap (down+up in one tick) is
