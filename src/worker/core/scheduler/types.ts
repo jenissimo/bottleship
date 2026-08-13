@@ -16,6 +16,16 @@ export const enum ThreadState {
     TERMINATED = 5,
 }
 
+/** Win32 `MAXIMUM_SUSPEND_COUNT`. A SuspendThread that would push the count past this
+ *  fails with `(DWORD)-1` / ERROR_SIGNAL_REFUSED instead of counting on — engines that use
+ *  Suspend/Resume as a spin-sync primitive can otherwise accumulate an unbounded count that
+ *  no number of Resumes can drain, and a count real Windows never produces is a state the
+ *  guest was never written against. */
+export const MAXIMUM_SUSPEND_COUNT = 127;
+
+/** RtlNtStatusToDosError(STATUS_SUSPEND_COUNT_EXCEEDED). */
+export const ERROR_SIGNAL_REFUSED = 156;
+
 export const THREAD_STATE_NAMES: Record<ThreadState, string> = {
     [ThreadState.CREATED]: 'CREATED',
     [ThreadState.READY]: 'READY',

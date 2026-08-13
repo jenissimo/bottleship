@@ -37,7 +37,9 @@ import {
     createPostReturnContext,
 } from "../../src/worker/core/scheduler/scheduler-context";
 import { TARGET_INSN_PER_MS } from "../../src/worker/core/scheduler/timing";
-import { DEFAULT_SCHEDULER_CONFIG } from "../../src/worker/core/scheduler/types";
+import {
+    DEFAULT_SCHEDULER_CONFIG, MAXIMUM_SUSPEND_COUNT, ERROR_SIGNAL_REFUSED,
+} from "../../src/worker/core/scheduler/types";
 import { hypercallDataManager } from "../../src/worker/core/cpu/hypercall-data";
 import { hasFpuSimdDirtyFlag } from "../../src/worker/core/fpu-helper";
 
@@ -379,6 +381,30 @@ describe("scheduler/suspendThread", () => {
         const t = inject(s, mkThread(1, ThreadState.TERMINATED));
         expect(s.suspendThread(t.handle) >>> 0).toBe(0xFFFFFFFF);
         expect(t.state).toBe(ThreadState.TERMINATED);
+    });
+
+    // Engines that use Suspend/Resume as a spin-sync primitive out-suspend their own
+    // resumes; Win32 refuses past MAXIMUM_SUSPEND_COUNT instead of counting on forever.
+    test("refuses past MAXIMUM_SUSPEND_COUNT: -1, count pinned, ERROR_SIGNAL_REFUSED", () => {
+        const s = new Scheduler();
+        const t = inject(s, mkThread(1, ThreadState.RUNNING), { current: true });
+        t.suspendCount = MAXIMUM_SUSPEND_COUNT - 1;
+        expect(s.suspendThread(t.handle)).toBe(MAXIMUM_SUSPEND_COUNT - 1); // last one allowed
+        expect(t.suspendCount).toBe(MAXIMUM_SUSPEND_COUNT);
+
+        expect(s.suspendThread(t.handle) >>> 0).toBe(0xFFFFFFFF);
+        expect(t.suspendCount).toBe(MAXIMUM_SUSPEND_COUNT); // NOT 128
+        expect(t.lastError).toBe(ERROR_SIGNAL_REFUSED);
+    });
+
+    // The fast path must defer at the cap: it cannot set a last error itself.
+    test("suspendThreadFast defers to the slow path at the cap", () => {
+        const s = new Scheduler();
+        const t = inject(s, mkThread(1, ThreadState.RUNNING), { current: true });
+        t.suspendCount = MAXIMUM_SUSPEND_COUNT - 1;
+        expect(s.suspendThreadFast(t.handle)).toBe(MAXIMUM_SUSPEND_COUNT - 1);
+        expect(s.suspendThreadFast(t.handle)).toBeNull();
+        expect(t.suspendCount).toBe(MAXIMUM_SUSPEND_COUNT);
     });
 });
 

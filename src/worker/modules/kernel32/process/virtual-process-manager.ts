@@ -1,6 +1,8 @@
 import { Logger, LogCategory } from '../../../core/logger';
 import { System } from '../../../core/system';
 import { SystemResourceProvider } from '../../../core/resources/system-resource-provider';
+import { MAXIMUM_SUSPEND_COUNT, ERROR_SIGNAL_REFUSED } from '../../../core/scheduler/types';
+import { ERROR_INVALID_HANDLE } from '../../../core/thunking/thunk-errors';
 
 const STILL_ACTIVE = 259;
 const CREATE_SUSPENDED = 0x00000004;
@@ -400,9 +402,16 @@ class VirtualProcessManager {
         this.pruneStaleHandles();
         const thread = this.threadsByHandle.get(handle >>> 0);
         if (!thread) return null;
-        if (thread.terminated) return 0xFFFFFFFF;
+        if (thread.terminated) {
+            System.getInstance().scheduler.setLastError(ERROR_INVALID_HANDLE);
+            return 0xFFFFFFFF;
+        }
 
         const prev = thread.suspendCount >>> 0;
+        if (prev >= MAXIMUM_SUSPEND_COUNT) {
+            System.getInstance().scheduler.setLastError(ERROR_SIGNAL_REFUSED);
+            return 0xFFFFFFFF;
+        }
         thread.suspendCount++;
         if (thread.autoExitTimerId !== null) {
             clearTimeout(thread.autoExitTimerId);

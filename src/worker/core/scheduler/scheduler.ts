@@ -22,6 +22,7 @@ import { SystemResourceProvider } from '../resources/system-resource-provider';
 import { TimeService } from '../../runtime/time';
 import { clearAllActiveExceptions } from '../seh-dispatch';
 import { Mem } from '../memory/mem-accessor';
+import { ERROR_INVALID_HANDLE } from '../thunking/thunk-errors';
 import { setParkedStackProvider, guardStackWrite } from '../memory/stack-write-guard';
 import { TebManager } from '../teb-manager';
 import {
@@ -53,6 +54,7 @@ import {
     SchedulerConfig, DEFAULT_SCHEDULER_CONFIG,
     WAIT_OBJECT_0, WAIT_IO_COMPLETION, WAIT_TIMEOUT, WAIT_FAILED,
     WAIT_BLOCKED_NO_SWITCH, INFINITE, CREATE_SUSPENDED,
+    MAXIMUM_SUSPEND_COUNT, ERROR_SIGNAL_REFUSED,
 } from './types';
 import {
     isValidGuestEip,
@@ -2793,11 +2795,20 @@ export class Scheduler {
         return prev;
     }
 
+    /** Win32 SuspendThread: previous suspend count, or 0xFFFFFFFF on failure (last error set
+     *  here, since the caller cannot tell an invalid handle from a refused signal). */
     suspendThread(handle: number): number {
         const thread = this.getThreadByHandle(this.resolveHandle(handle));
-        if (!thread || thread.state === ThreadState.TERMINATED) return 0xFFFFFFFF;
+        if (!thread || thread.state === ThreadState.TERMINATED) {
+            this.setLastError(ERROR_INVALID_HANDLE);
+            return 0xFFFFFFFF;
+        }
 
         const prev = thread.suspendCount;
+        if (prev >= MAXIMUM_SUSPEND_COUNT) {
+            this.setLastError(ERROR_SIGNAL_REFUSED);
+            return 0xFFFFFFFF;
+        }
         thread.suspendCount++;
 
         if (thread.state === ThreadState.READY || thread.state === ThreadState.RUNNING) {
@@ -2827,6 +2838,8 @@ export class Scheduler {
     suspendThreadFast(handle: number): number | null {
         const thread = this.getThreadByHandle(this.resolveHandle(handle));
         if (!thread || thread.state === ThreadState.TERMINATED) return null;
+        // At the cap the call FAILS and must set a last error — that is the slow path's job.
+        if (thread.suspendCount >= MAXIMUM_SUSPEND_COUNT) return null;
         // Self-suspend (the Tin3 handshake: thread suspends ITSELF to yield to the driver
         // thread) is handled here too: suspendThread() flips the current thread RUNNING→
         // SUSPENDED, and the FastPath's NON-deferred thunk boundary then runs performSwitch,
@@ -3677,6 +3690,21 @@ export class Scheduler {
         const t = this.threads.get(threadId);
         if (!t || !(t.stackTop > t.stackBase)) return null;
         return { base: t.stackBase >>> 0, top: t.stackTop >>> 0 };
+    }
+
+    /** The thread-stack reservation containing `addr`, or null. VirtualQuery needs this:
+     *  Win32 reports a stack as ONE region whose AllocationBase is the reservation base,
+     *  and stack-bounds helpers (Delphi's, a scanning GC's, a guard-page grower's) derive
+     *  their bounds from exactly those two fields. Called from a query storm, so it stays a
+     *  plain scan over the (small) thread map. */
+    findStackReservation(addr: number): { base: number; top: number } | null {
+        const a = addr >>> 0;
+        for (const t of this.threads.values()) {
+            const base = t.stackBase >>> 0;
+            const top = t.stackTop >>> 0;
+            if (top > base && a >= base && a < top) return { base, top };
+        }
+        return null;
     }
 
     getDetailedThreadInfo(): string {

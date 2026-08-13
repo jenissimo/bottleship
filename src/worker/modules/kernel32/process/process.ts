@@ -1176,12 +1176,12 @@ export const exports: Record<string, ThunkImplementation> = {
         const system = System.getInstance();
         const manager = getVirtualProcessManager();
         const virtualPrev = manager.suspendThread(hThread);
+        // Both suspend paths set their own last error on failure — INVALID_HANDLE for an
+        // unknown/terminated thread, SIGNAL_REFUSED at MAXIMUM_SUSPEND_COUNT — so the two
+        // cannot be told apart from the 0xFFFFFFFF return alone. Do not overwrite it here.
         const prevCount = virtualPrev !== null
             ? virtualPrev
             : system.scheduler.suspendThread(hThread);
-        if (prevCount === 0xFFFFFFFF) {
-            system.scheduler.setLastError(ERROR_INVALID_HANDLE);
-        }
         Logger.log(LogCategory.KERNEL32,
             `SuspendThread(hThread=0x${hThread.toString(16)}) -> ${prevCount === 0xFFFFFFFF ? 'INVALID_HANDLE' : prevCount}`);
         return { value: prevCount, stackCleanup: 4 };
