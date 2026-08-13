@@ -207,6 +207,9 @@ export function serializeWindows(): unknown {
             childCount: w.children?.length ?? 0,
             style: u32(w.style),
             customPaint: !!w.guestCustomPaint,
+            // Which proc will see a message: a subclassed control's guest proc runs first
+            // and reaches the class behaviour only through CallWindowProc.
+            subclassed: !!w.wndProcSubclassed,
         });
     }
     return out;

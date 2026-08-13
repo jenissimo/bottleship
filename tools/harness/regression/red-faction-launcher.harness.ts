@@ -14,6 +14,11 @@
  * eight tiles and nothing can ask for them again. That reads as a launcher whose art
  * survives and whose labels vanish, and no log line says so; only the pixels do.
  *
+ * The same click's OTHER half: leaving the tile alone is not enough — the invalidate has
+ * to reach the guest as WM_DRAWITEM, or the tile is frozen at the last full paint. The
+ * pixels cannot tell "unchanged" from "stale", so that link is asserted on the trace.
+ * Confirm it can fail with `setWorkerFlag('__noOwnerDrawPaintRequest', true)`.
+ *
  *   WGB=g:/WGB/running/red-faction.wgb bun tools/harness.ts run tools/harness/regression/red-faction-launcher.harness.ts
  */
 
@@ -91,7 +96,59 @@ if (screen?.canvasWidth && b0.cw !== screen.canvasWidth) {
 
 // Click Setup: our PropertySheetA is a no-op sheet, so the launcher is on screen again
 // within a second and nothing else has changed — anything the tiles lost is ours.
-await harness().click("Setup").sleep(4000).run();
+const clickRun: any = await harness()
+    .call("paintTrace", ["start"])
+    .click("Setup")
+    .sleep(4000)
+    .call("paintTrace", ["read"])
+    .state(["windows"])
+    .run();
+
+// ---- the invalidate must ASK for the tile back -------------------------------------
+// The CBitmapButton answers the click with Invalidate(). On Windows that ends in the
+// BUTTON proc's WM_PAINT → WM_DRAWITEM to the parent (Wine dlls/user32/button.c
+// OB_Paint) — the only thing that can produce an owner-draw tile's pixels. Leaving the
+// tile ALONE is only half of it; a repaint nobody runs is a tile frozen at whatever the
+// last full paint drew (no pressed, hover or disabled state ever lands), and the pixel
+// check below cannot tell an unchanged tile from a stale one.
+const clickTrace: string[] =
+    clickRun.steps?.filter((s: any) => s.cmd === "paintTrace").pop()?.result?.lines ?? [];
+const btnHwnds = new Set(buttons.map((b) => `0x${(b.hwnd >>> 0).toString(16)}`));
+const hwndOf = (l: string) => l.match(/hwnd=(0x[0-9a-f]+)/)?.[1] ?? "";
+const asked = clickTrace.filter((l) => / (post|skip) .*owner-draw button/.test(l));
+const drawn = clickTrace.filter((l) => /chain .*drawitem=1 .*-> \S+ dispatched/.test(l));
+const drawnButtons = new Set(drawn.map(hwndOf).filter((h) => btnHwnds.has(h)));
+console.log(`  invalidate→paint: ${asked.length} request(s), ${drawnButtons.size} tile(s) redrawn`);
+for (const l of [...asked, ...drawn]) console.log("    " + l);
+if (drawnButtons.size === 0) {
+    throw new Error("the click never reached the guest as WM_DRAWITEM for any launcher button "
+        + `(${asked.length} paint request(s) on an owner-draw button, `
+        + `${drawn.length} chain(s) in total) — either InvalidateRect no longer asks for the `
+        + "tile back, or the launcher stopped invalidating and this check is watching nothing");
+}
+console.log("OK — the invalidate reached the guest as WM_DRAWITEM");
+
+// ---- and the tiles must still be there ---------------------------------------------
+// Setup opens a property sheet ON TOP of the launcher. Sampling the tiles under it reads
+// the sheet, not the launcher — so close it first, and say which it was if it will not go
+// rather than reporting its grey as a wiped tile.
+// A dialog, not a control: it has children of its own and is owned by the launcher (or
+// by nothing) — a page inside the sheet goes away with it.
+const covers = (w: any) => w.visible && w.hwnd !== dlg?.hwnd && w.childCount > 0
+    && (w.parent == null || w.parent === dlg?.hwnd)
+    && rects.some((r) => w.x < r.x + r.w && w.x + w.w > r.x && w.y < r.y + r.h && w.y + w.h > r.y);
+const sheet = (clickRun.steps?.filter((s: any) => s.cmd === "state").pop()?.result?.windows ?? [])
+    .find(covers);
+if (sheet) {
+    console.log(`  a ${sheet.cls} "${sheet.title}" covers the tiles — closing it`);
+    const closed: any = await harness().key("Escape").sleep(2500).state(["windows"]).run();
+    const still = (closed.steps?.filter((s: any) => s.cmd === "state").pop()?.result?.windows ?? [])
+        .find((w: any) => w.hwnd === sheet.hwnd && w.visible);
+    if (still) {
+        throw new Error(`"${sheet.title}" (${sheet.cls}) still covers the launcher after Escape — `
+            + "the tiles under it cannot be sampled");
+    }
+}
 
 const after: any = await harness().evalPage(rectStdDev(rects)).run();
 const a0 = after.steps?.[0]?.result;

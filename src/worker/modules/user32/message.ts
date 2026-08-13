@@ -20,6 +20,8 @@ import { handleAnimateMessage } from './animate-control';
 import { windows, buttonCheckStates, registerWindowTimerKiller, finalizeWindowDestroy, getAbsoluteWindowPosition, getWindowByHandle, isEffectivelyVisible } from './shared-state';
 import { validateWindow } from './paint-region';
 import { repaintChildControls, isButtonSystemControl, hitTestSystemControlAtClient } from './controls';
+import { isOwnerDrawButton } from './owner-draw';
+import { runOwnerDrawButtonPaint } from './window';
 import {
     handleSystemControlMouseAtScreen,
     handleSystemControlWheel,
@@ -1108,6 +1110,23 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
             const WM_NCDESTROY = 0x0082;
 
             const window = getWindowByHandle(hwnd);
+            // The BUTTON class proc's WM_PAINT: a BS_OWNERDRAW button is drawn by ONE
+            // WM_DRAWITEM to its parent (Wine button.c OB_Paint), which is a guest
+            // callback — so this is where an InvalidateRect/UpdateWindow on such a button
+            // finally reaches the guest. A subclassed one gets the message first and
+            // arrives here only through CallWindowProc (window.ts).
+            if (message === WM_PAINT && window?.isSystemControl && !window.wndProcSubclassed
+                && isOwnerDrawButton(window)) {
+                try {
+                    const repaint = runOwnerDrawButtonPaint(
+                        ctx, mem, window, 'DispatchMessage', 4);
+                    if (repaint) return repaint;
+                } catch (err) {
+                    Logger.error(LogCategory.USER32,
+                        `DispatchMessage owner-draw paint failed hwnd=0x${hwnd.toString(16)}: ${err}`);
+                }
+                return { value: 0, stackCleanup: 4 };
+            }
             if (window?.isSystemControl && !window.wndProcSubclassed) {
                 const result = handleSystemControlMessage(window, message, wParam, lParam, mem);
                 if (isContentChangingMessage(window, message)) {

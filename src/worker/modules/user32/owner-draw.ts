@@ -18,10 +18,10 @@ import { System } from '../../core/system';
 import type { Process } from '../../core/process';
 import type { ThunkResult } from '../../core/thunking/thunk-dispatcher';
 import { windows, buttonCheckStates, type WindowInfo } from './shared-state';
-import { paintTraceEnabled, logOwnerDrawChain } from './paint-trace';
+import { paintTraceEnabled, logOwnerDrawChain, logPaintRequest } from './paint-trace';
 import { isButtonSystemControl, repaintChildControls } from './controls';
 import { isAppRegisteredClass } from './class';
-import { invalidateWindow } from './paint-region';
+import { invalidateWindow, clearWindowUpdate } from './paint-region';
 import {
     enumerateCtlColorChildren,
     ctlColorMessageFor,
@@ -78,6 +78,12 @@ function getDrawItemScratchPtr(process: Process): number {
     return drawItemScratchPtr;
 }
 
+/** A BS_OWNERDRAW button: the one control class whose pixels come from the PARENT's
+ *  WM_DRAWITEM, so nothing we draw ourselves can produce them. */
+export function isOwnerDrawButton(win: WindowInfo | undefined): boolean {
+    return !!win && isButtonSystemControl(win) && (win.style & BS_TYPEMASK) === BS_OWNERDRAW;
+}
+
 export function enumerateOwnerDrawChildren(parentHwnd: number): WindowInfo[] {
     const parent = windows.get(parentHwnd);
     if (!parent) return [];
@@ -85,11 +91,38 @@ export function enumerateOwnerDrawChildren(parentHwnd: number): WindowInfo[] {
     for (const childHwnd of parent.children) {
         const child = windows.get(childHwnd);
         if (!child || !child.visible) continue;
-        if (!isButtonSystemControl(child)) continue;
-        if ((child.style & BS_TYPEMASK) !== BS_OWNERDRAW) continue;
+        if (!isOwnerDrawButton(child)) continue;
         out.push(child);
     }
     return out;
+}
+
+/**
+ * The queued half of Wine's `OB_Paint`: ask USER for the button's WM_PAINT instead of
+ * running the WM_DRAWITEM here. Reaching the guest needs a callback, which a hot
+ * synchronous API (InvalidateRect) cannot return, so the invalidation is delivered the
+ * way USER delivers one — mark the client invalid, post WM_PAINT (coalesced to one per
+ * hwnd, lowest priority) and let the pump hand it to the button's class proc.
+ */
+export function requestOwnerDrawButtonPaint(button: WindowInfo | undefined): boolean {
+    if (!isOwnerDrawButton(button)) return false;
+    // A/B lever: with this set an invalidate marks the button and asks for nothing, which
+    // is what the tile-repaint regressions must fail on.
+    if ((globalThis as Record<string, unknown>)['__noOwnerDrawPaintRequest']) {
+        if (paintTraceEnabled) {
+            logPaintRequest(button!.handle, false, 'owner-draw button: __noOwnerDrawPaintRequest');
+        }
+        return false;
+    }
+    if (!button!.visible) {
+        if (paintTraceEnabled) logPaintRequest(button!.handle, false, 'owner-draw button hidden');
+        return false;
+    }
+    const system = System.getInstance();
+    system.windowManager.postMessage(button!.handle, WM_PAINT, 0, 0);
+    system.scheduler.wakeMessageWaiters();
+    if (paintTraceEnabled) logPaintRequest(button!.handle, true, 'owner-draw button invalidated');
+    return true;
 }
 
 /**
@@ -443,12 +476,13 @@ export function tryEndPaintOwnerDrawChain(
 }
 
 /**
- * Re-render ONE owner-draw button on demand (e.g. when its own RedrawWindow fires from a
- * hover-glow timer). Sends a single WM_DRAWITEM to the button's PARENT wndProc, into a
- * client DC seeded from the overlay (so the background shows through), then composites it
- * on top — exactly one iteration of the EndPaint chain. The guest computes any hover-glow
- * blend itself from the button object's own timing state. Returns a suspended-thunk result
- * (the calling thunk returns TRUE once the repaint finishes), or null to finalize normally.
+ * Wine's `OB_Paint` (dlls/user32/button.c): the BUTTON class answers a BS_OWNERDRAW
+ * repaint by sending ONE WM_DRAWITEM to the button's PARENT — here into a client DC
+ * seeded from the overlay (so the background shows through), composited on top when the
+ * guest returns. Exactly one iteration of the EndPaint chain. Reached from the class
+ * proc's WM_PAINT and from RedrawWindow's paint-now branch; the guest computes any
+ * hover/pressed blend itself. Returns a suspended-thunk result (the calling thunk returns
+ * TRUE once the repaint finishes), or null to finalize normally.
  */
 export function tryRepaintOwnerDrawButton(
     ctx: { esp: number },
@@ -457,20 +491,37 @@ export function tryRepaintOwnerDrawButton(
     deps: OwnerDrawDeps,
     thunkName: string,
     stackCleanup: number,
+    directReturn?: DirectThunkReturn,
 ): ThunkResult | null {
-    if (!button.visible || button.parent === undefined) return null;
-    if (!isButtonSystemControl(button)) return null;
-    if ((button.style & BS_TYPEMASK) !== BS_OWNERDRAW) return null;
     // Guard against ghosts: a hover timer on a now-occluded menu (e.g. after a modal
     // submenu opened on top) must NOT composite its button onto the flat overlay over
     // the dialog drawn above it. Nested dialogs may themselves be the active HWND.
-    if (!isButtonOnActiveWindowTree(button)) return null;
-    const parent = windows.get(button.parent);
-    if (!parent?.wndProc) return null;
-    return runGuestPaintChain(
+    const parent = button.parent !== undefined ? windows.get(button.parent) : undefined;
+    const bail = !isOwnerDrawButton(button) ? 'not-owner-draw'
+        : !button.visible ? 'hidden'
+        : !isButtonOnActiveWindowTree(button) ? 'occluded'
+        : !parent?.wndProc ? 'no-parent-wndProc'
+        : null;
+    if (bail) {
+        if (paintTraceEnabled) {
+            logOwnerDrawChain(button.handle, { ctlcolor: 0, drawitem: 1, paint: 0 },
+                `${thunkName} ${bail}`);
+        }
+        return null;
+    }
+    const chain = runGuestPaintChain(
         ctx, mem,
         [{ kind: 'drawitem', child: button }],
-        { hwnd: parent.handle, wndProc: parent.wndProc },
-        deps, thunkName, stackCleanup,
+        { hwnd: parent!.handle, wndProc: parent!.wndProc },
+        deps, thunkName, stackCleanup, undefined, directReturn,
     );
+    // BeginPaint's half of the contract: the paint that just went out validates the
+    // client, or the button stays "still invalid" for GetUpdateRect and every later
+    // UpdateWindow re-posts a paint nobody asked for.
+    if (chain) clearWindowUpdate(button.handle);
+    if (paintTraceEnabled) {
+        logOwnerDrawChain(button.handle, { ctlcolor: 0, drawitem: 1, paint: 0 },
+            `${thunkName} ${chain ? 'dispatched' : 'not-dispatched'}`);
+    }
+    return chain;
 }

@@ -4,7 +4,7 @@
  * Atomic implementation for window operations
  */
 
-import { FastPathImplementation, ThunkImplementation, ThunkResult } from '../../core/thunking/thunk-dispatcher';
+import { FastPathImplementation, ThunkImplementation, ThunkResult, X86Context } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
@@ -57,7 +57,15 @@ import {
 import { isDDrawExclusiveFullscreen } from '../ddraw/gdi-visibility';
 import { paintTraceEnabled, logBeginEndPaint } from './paint-trace';
 import { repaintChildControls } from './controls';
-import { tryEndPaintOwnerDrawChain, tryRepaintOwnerDrawButton, isGuestPaintedControl } from './owner-draw';
+import {
+    tryEndPaintOwnerDrawChain,
+    tryRepaintOwnerDrawButton,
+    requestOwnerDrawButtonPaint,
+    isOwnerDrawButton,
+    isGuestPaintedControl,
+    type OwnerDrawDeps,
+    type DirectThunkReturn,
+} from './owner-draw';
 import { beginSyncDestroyDelivery } from './destroy-sync';
 import {
     postInitialActivationMessages,
@@ -547,6 +555,38 @@ function flushPaintDCToOverlay(hWnd: number, hdc: number): boolean {
         if (win && win.children.length) repaintChildControls(hWnd);
     }
     return !!flushed;
+}
+
+/** Per-child DC plumbing for a single owner-draw button repaint (OB_Paint). */
+function ownerDrawButtonDeps(): OwnerDrawDeps {
+    const gdi = System.getInstance().gdiContext;
+    return {
+        createChildDC: (childHwnd) => createWindowClientDC(gdi, childHwnd),
+        flushChildDC: (childDc) => {
+            gdi.flushWindowMemoryDCToOverlay(childDc);
+            gdi.releaseDC(childDc);
+        },
+        discardChildDC: (childDc) => gdi.releaseDC(childDc),
+    };
+}
+
+/**
+ * The BUTTON class proc's repaint of ONE BS_OWNERDRAW button — Wine button.c's
+ * `OB_Paint`, which every WM_PAINT for such a button ends in. The DC plumbing lives
+ * here (only this module can make a window client DC), so the class proc has ONE
+ * spelling wherever it is reached from: the pump's WM_PAINT delivery, a subclass
+ * forwarding through CallWindowProc, and RedrawWindow's paint-now branch.
+ */
+export function runOwnerDrawButtonPaint(
+    ctx: X86Context,
+    mem: Uint8Array,
+    button: WindowInfo,
+    thunkName: string,
+    stackCleanup: number,
+    directReturn?: DirectThunkReturn,
+): ThunkResult | null {
+    return tryRepaintOwnerDrawButton(
+        ctx, mem, button, ownerDrawButtonDeps(), thunkName, stackCleanup, directReturn);
 }
 
 /**
@@ -1888,6 +1928,12 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         const win = windows.get(hWnd);
         if (win?.isSystemControl && win.parent) {
             invalidateControlColors(hWnd); // next EndPaint chain re-queries WM_CTLCOLOR*
+            // An owner-draw button's pixels exist only as the parent's WM_DRAWITEM, so the
+            // chrome restamp below draws nothing for it — Win32 gets them back by handing
+            // the button a WM_PAINT (button.c: WM_PAINT -> OB_Paint -> WM_DRAWITEM). Ask for
+            // that paint instead of running it: this is a hot, synchronous API and the
+            // WM_DRAWITEM is a guest callback.
+            requestOwnerDrawButtonPaint(win);
             repaintDialogAfterContentChange(win.parent);
         } else if (win && isDialogLikeWindow(win)) {
             repaintDialogOverlayIfVisible(hWnd);
@@ -2092,20 +2138,38 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         Logger.verboseLazy(LogCategory.USER32, () =>
             `CallWindowProcA(prev=0x${lpPrevWndFunc.toString(16)}, hwnd=0x${hWnd.toString(16)}, msg=0x${Msg.toString(16)})`);
 
-        // Sentinel WndProc: system control (Button/Static/Edit etc.) — handle in JS, don't call x86
+        const stackCleanup = 5 * 4;
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const returnAddr = view.getUint32(ctx.esp, true) >>> 0;
+
+        // Sentinel WndProc: system control (Button/Static/Edit etc.) — the CLASS proc,
+        // handled in JS. A subclass that leaves WM_PAINT to it (MFC's CWnd::Default →
+        // m_pfnSuper) is asking for exactly Wine button.c's WM_PAINT → OB_Paint, which
+        // is the only thing that can draw an owner-draw tile.
         if ((lpPrevWndFunc & 0xFFFF0000) === 0xFFFF0000) {
+            const subclassed = windows.get(hWnd);
+            if (Msg === WM_PAINT && isOwnerDrawButton(subclassed)) {
+                try {
+                    // This thunk IS a guest callback (the subclass proc called it), so it
+                    // resumes through its own RET N, not an outer suspended frame.
+                    const repaint = runOwnerDrawButtonPaint(
+                        ctx, mem, subclassed!, 'CallWindowProc', stackCleanup,
+                        { returnAddr, postEsp: (ctx.esp + 4 + stackCleanup) >>> 0 });
+                    if (repaint) return repaint;
+                } catch (err) {
+                    Logger.error(LogCategory.USER32,
+                        `CallWindowProc owner-draw paint failed hwnd=0x${hWnd.toString(16)}: ${err}`);
+                }
+            }
             Logger.verbose(LogCategory.USER32,
                 `CallWindowProcA: sentinel WndProc 0x${lpPrevWndFunc.toString(16)}, returning 0`);
-            return { value: 0, stackCleanup: 5 * 4 };
+            return { value: 0, stackCleanup };
         }
 
         const system = System.getInstance();
         const callbackManager = system.process?.dispatcher?.callbackManager;
         if (!callbackManager || lpPrevWndFunc === 0) return 0;
 
-        const stackCleanup = 5 * 4;
-        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-        const returnAddr = view.getUint32(ctx.esp, true) >>> 0;
         const first = callbackManager.invokeCallback(
             lpPrevWndFunc,
             [hWnd, Msg, wParam, lParam],
@@ -2466,22 +2530,11 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         // so posting WM_PAINT to the button (the default path below) would not redraw the
         // tile. Re-run just this button's WM_DRAWITEM into a seeded child DC instead. The
         // guest computes any glow blend from the button object's own timing state.
-        const BS_TYPEMASK = 0x000F;
-        const BS_OWNERDRAW = 0x000B;
-        const isOwnerDrawButton = !!win && !!win.isSystemControl
-            && (win.style & BS_TYPEMASK) === BS_OWNERDRAW;
-        if (isOwnerDrawButton && (flags & RDW_INVALIDATE) !== 0) {
+        if (isOwnerDrawButton(win) && (flags & RDW_INVALIDATE) !== 0) {
             try {
-                const gdi = system.gdiContext;
                 const stackCleanup = 4 * 4; // RedrawWindow(hWnd, lpRect, hrgn, flags)
-                const repaint = tryRepaintOwnerDrawButton(ctx, mem, win!, {
-                    createChildDC: (childHwnd) => createWindowClientDC(gdi, childHwnd),
-                    flushChildDC: (childDc) => {
-                        gdi.flushWindowMemoryDCToOverlay(childDc);
-                        gdi.releaseDC(childDc);
-                    },
-                    discardChildDC: (childDc) => gdi.releaseDC(childDc),
-                }, 'RedrawWindow', stackCleanup);
+                const repaint = runOwnerDrawButtonPaint(
+                    ctx, mem, win!, 'RedrawWindow', stackCleanup);
                 if (repaint) {
                     system.scheduler.wakeMessageWaiters();
                     return repaint;
