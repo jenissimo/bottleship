@@ -47,6 +47,11 @@ interface AnimateState {
     height: number;
     playbackTimer?: ReturnType<typeof setTimeout>;
     stubTimer?: ReturnType<typeof setTimeout>;
+    /** Why playback last stopped, and at which frame — see stopPlayback. */
+    stopReason?: string;
+    stoppedAtFrame?: number;
+    /** Playback was torn down by a hide and must restart when the control is shown again. */
+    resumeOnShow?: boolean;
 }
 
 const animateStates = new Map<number, AnimateState>();
@@ -107,10 +112,15 @@ function cancelTimers(st: AnimateState | undefined): void {
     }
 }
 
-function stopPlayback(hwnd: number, notifyStop: boolean): void {
+/** `reason` is recorded on the state and surfaced by formatAnimateDiagnosticSnapshot.
+ *  An animation that stopped is indistinguishable from one that never started once the
+ *  engine handle is closed, and that ambiguity is the whole diagnostic difficulty here. */
+function stopPlayback(hwnd: number, notifyStop: boolean, reason = 'unspecified'): void {
     const st = animateStates.get(hwnd);
     if (!st) return;
 
+    st.stopReason = reason;
+    st.stoppedAtFrame = st.frameIndex;
     cancelTimers(st);
     st.playing = false;
     st.playPending = false;
@@ -218,11 +228,18 @@ export function formatAnimateDiagnosticSnapshot(): string {
     const parts: string[] = [];
     for (const [hwnd, st] of animateStates) {
         const win = windows.get(hwnd);
+        // vfs= and autoplay= are the two that decide whether playback should have started at
+        // all: a control that is open, visible and idle is either a file we failed to resolve
+        // or an ACM_OPEN we did not treat as autoplay, and the rest of the line cannot tell
+        // those apart. frame= separates "never started" from "played and ended".
         parts.push(
             `0x${hwnd.toString(16)} vis=${win?.visible ? 1 : 0} ` +
-            `file="${st.filePath}" pending=${st.playPending ? 1 : 0} ` +
+            `file="${st.filePath}" vfs="${st.vfsPath}" autoplay=${hasAutoPlayStyle(win) ? 1 : 0} ` +
+            `pending=${st.playPending ? 1 : 0} ` +
             `playing=${st.playing ? 1 : 0} inFlight=${st.startInFlight ? 1 : 0} ` +
-            `engine=${st.engineHandle} notified=${st.notifiedStart ? 1 : 0}`,
+            `engine=${st.engineHandle} frame=${st.frameIndex} loops=${st.loopsDone} ` +
+            `notified=${st.notifiedStart ? 1 : 0} resumeOnShow=${st.resumeOnShow ? 1 : 0} ` +
+            `stop="${st.stopReason ?? '-'}"@${st.stoppedAtFrame ?? -1}`,
         );
     }
     return `animate=[${parts.join('; ')}]`;
@@ -241,7 +258,7 @@ function scheduleStubPlayback(hwnd: number, win: WindowInfo, repeats: number): v
     st.stubTimer = setTimeout(() => {
         const cur = animateStates.get(hwnd);
         if (!cur?.playing) return;
-        stopPlayback(hwnd, true);
+        stopPlayback(hwnd, true, 'stub-timer-elapsed');
     }, durationMs);
 }
 
@@ -284,7 +301,7 @@ function decodeOneFrame(hwnd: number): void {
             return;
         }
         Logger.log(LogCategory.USER32, `SysAnimate32: playback EOF hwnd=0x${hwnd.toString(16)}`);
-        stopPlayback(hwnd, true);
+        stopPlayback(hwnd, true, 'decode-returned-false');
         return;
     }
 
@@ -406,9 +423,24 @@ function hasAutoPlayStyle(win: WindowInfo | undefined): boolean {
 }
 
 function openAnimateFile(hwnd: number, path: string): number {
-    if (!path) return 0;
+    // MSDN: ACM_OPEN with a NULL name CLOSES the currently open AVI — it is how
+    // Animate_Close() is spelled, and the HL launcher uses it on every state change.
+    // Treating it as a no-op leaves the control believing it still has an animation, which
+    // matters now that a hide/show cycle can resume one: without this the guest closes the
+    // clip and we bring it back on the next show.
+    if (!path) {
+        stopPlayback(hwnd, false, 'ACM_OPEN-close');
+        const st = animateStates.get(hwnd);
+        if (st) {
+            st.resumeOnShow = false;
+            st.filePath = '';
+            st.vfsPath = '';
+        }
+        Logger.log(LogCategory.USER32, `SysAnimate32 ACM_OPEN(NULL) hwnd=0x${hwnd.toString(16)} — close`);
+        return 1;
+    }
 
-    stopPlayback(hwnd, false);
+    stopPlayback(hwnd, false, 'ACM_OPEN-reopen');
     const vfsPath = resolveMediaVfsPath(path);
     const st = emptyState(path, vfsPath ?? '');
     const win = windows.get(hwnd);
@@ -441,13 +473,27 @@ export function onAnimateShowWindow(hwnd: number, nCmdShow: number): void {
                 `SysAnimate32: ShowWindow(0x${hwnd.toString(16)}, SW_HIDE) during startInFlight — defer cancel`);
             return;
         }
+        // Hiding stops the timer but must NOT lose the loaded animation: Win32 keeps the AVI
+        // open from ACM_OPEN until ACM_CLOSE or destroy, and a control that is hidden and shown
+        // again resumes. We tear the decoder down here to save CPU while invisible, so the
+        // intent to play has to survive that teardown or the animation is gone for good after
+        // the first hide — which is exactly what a launcher that lays out its window mid-play
+        // produces (HL Day One: one frame, then hidden, then shown again, then nothing).
+        st.resumeOnShow = st.playing || st.playPending;
+        const repeats = st.repeats;
         Logger.log(LogCategory.USER32,
-            `SysAnimate32: ShowWindow(0x${hwnd.toString(16)}, SW_HIDE) — stop`);
-        stopPlayback(hwnd, false);
+            `SysAnimate32: ShowWindow(0x${hwnd.toString(16)}, SW_HIDE) — stop (resumeOnShow=${st.resumeOnShow ? 1 : 0})`);
+        stopPlayback(hwnd, false, 'SW_HIDE');
+        st.repeats = repeats;
         return;
     }
 
-    // Show alone does not start playback — only resume a pending/open autoplay or ACM_PLAY.
+    // Show alone does not start playback — only resume a pending/open autoplay or ACM_PLAY,
+    // or one we suspended on a previous hide.
+    if (st.resumeOnShow) {
+        st.resumeOnShow = false;
+        st.playPending = true;
+    }
     if (!st.playPending && !st.playing) return;
     Logger.log(LogCategory.USER32,
         `SysAnimate32: ShowWindow(0x${hwnd.toString(16)}, ${nCmdShow}) → resume "${st.filePath}" repeats=${st.repeats >>> 0}`);
@@ -494,12 +540,12 @@ export function handleAnimateMessage(
         }
         case ACM_STOP: {
             Logger.log(LogCategory.USER32, `SysAnimate32 ACM_STOP hwnd=0x${hwnd.toString(16)}`);
-            stopPlayback(hwnd, false);
+            stopPlayback(hwnd, false, 'ACM_STOP');
             return 1;
         }
         case ACM_CLOSE: {
             Logger.log(LogCategory.USER32, `SysAnimate32 ACM_CLOSE hwnd=0x${hwnd.toString(16)}`);
-            stopPlayback(hwnd, false);
+            stopPlayback(hwnd, false, 'ACM_CLOSE');
             animateStates.delete(hwnd);
             return 1;
         }
@@ -512,6 +558,6 @@ export function handleAnimateMessage(
 }
 
 export function clearAnimateState(hwnd: number): void {
-    stopPlayback(hwnd, false);
+    stopPlayback(hwnd, false, 'clearAnimateState');
     animateStates.delete(hwnd);
 }
