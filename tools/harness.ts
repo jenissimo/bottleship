@@ -30,6 +30,7 @@
 import {
     launchOrAttachChrome,
     ensureVite,
+    ensureSidecar,
     reloadDevPage,
     findOrCreateTab,
     listSessionTabs,
@@ -216,6 +217,10 @@ export function harness(): HarnessChain {
 
 async function cmdUp(): Promise<void> {
     console.log("[harness up] probing services…");
+    // Before the page exists: the loader probes :3001 ONCE per page and caches it, so a tab
+    // opened while the sidecar is down streams every bundle through Vite for its whole life.
+    const s = await ensureSidecar();
+    console.log(`[harness up] sidecar: ${s.action}${s.ok ? "" : " — NOT SERVING"}`);
     // Before Chrome: a wedged Vite makes every guest look broken, and several agents each
     // starting their own Vite is what wedges it. ensureVite locks, repairs and waits.
     const v = await ensureVite();
@@ -229,6 +234,11 @@ async function cmdUp(): Promise<void> {
     console.log("[harness up] services:", JSON.stringify(h));
     if (h.vite && !h.viteTransform) {
         console.warn("[harness up] WARNING: Vite answers the root but will not transform modules — the page will load and render nothing. Restart the dev server (wait for :5174 to be released first); do not debug the guest until this is green.");
+    }
+    if (h.logArchive) {
+        console.warn(`[harness up] WARNING: the log archive is degraded — ${h.logArchive.droppedLines} lines dropped, ` +
+            `${h.logArchive.writeErrors} failed appends${h.logArchive.lastError ? ` (${h.logArchive.lastError})` : ""}. ` +
+            "logsSince/streamLogs will have holes; check disk space and logs/dev-sidecar.err.log.");
     }
     let ping = await pageEval(session, "window.__BS__.harness.ping()", { timeoutMs: 8000 }).catch((e) => ({ error: String(e) }));
     // A tab opened while Vite was wedged holds a dead page forever: the module graph never

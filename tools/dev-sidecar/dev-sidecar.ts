@@ -9,9 +9,11 @@
  *    `logs/debug/` (a page cannot write to the repo). The client prefixes its session dir.
  *  - **bundle delivery** — `GET /wgb?path=…` with Range, deliberately NOT via the Vite dev
  *    server (see serveWgb below).
- *  - **liveness** — `/health`, one of the three services `harness up` probes.
+ *  - **liveness** — `/health`, one of the three services `harness up` probes, and `/stats`,
+ *    which reports what the archive is actually doing (buffered, written, DROPPED).
  *
  * `bun run dev:sidecar` (`dev:logs` is kept as an alias so existing docs and scripts still work).
+ * Load-test it with `tools/dev-sidecar/sidecar-loadtest.ts`.
  */
 
 import { appendFile, readdir, unlink, stat, mkdir, writeFile } from "node:fs/promises";
@@ -30,6 +32,17 @@ const CONFIG = {
   MAX_AGE_MS: 24 * 60 * 60 * 1000,
   FLUSH_INTERVAL: 1000,
   BUFFER_LIMIT: 100,
+  /** Hard ceiling on log text held in memory per session, in UTF-16 code units.
+   *  Reached only when the writer cannot keep up; past it the OLDEST lines are dropped
+   *  and counted (see enforceCap). Unbounded is not an option: a stalled writer under
+   *  the worker's firehose grows this by ~10x the ingest rate in committed bytes. */
+  MAX_BUFFER_CHARS: 8 * 1024 * 1024,
+  /** Drop down to this fraction of the cap, so a stalled writer does not shift() per line. */
+  DRAIN_TO: 0.75,
+  /** Retry backoff after a failed append, and how often a persistent failure is reported. */
+  RETRY_BASE_MS: 250,
+  RETRY_MAX_MS: 10_000,
+  REPORT_INTERVAL_MS: 10_000,
   /** Largest single `write_file`/`write_file_b64` payload (a 4K RGBA surface dump fits). */
   MAX_WRITE_BYTES: 64 * 1024 * 1024,
   /** Per-connection write budget, refilled every WRITE_WINDOW_MS. */
@@ -40,6 +53,12 @@ const CONFIG = {
 } as const;
 
 const LEVELS = ["SILENT", "ERROR", "WARN", "NORMAL", "VERBOSE"];
+
+/** Per-flush/per-batch chatter is not a daemon's steady state: nothing reads this process's
+ *  stdout, and one line per 100 archived lines is its own second firehose. BS_SIDECAR_VERBOSE=1
+ *  brings it back for a hand-run sidecar. Anything ABNORMAL is reported regardless. */
+const VERBOSE = process.env.BS_SIDECAR_VERBOSE === "1";
+const vlog = VERBOSE ? console.log : () => {};
 
 function resolveSafeLogPath(requestedPath: string): string | null {
   const parts = requestedPath
@@ -56,19 +75,62 @@ function resolveSafeLogPath(requestedPath: string): string | null {
   return fullPath;
 }
 
+export interface ArchiveStats {
+  session: string;
+  path: string;
+  bufferedChars: number;
+  bufferedChunks: number;
+  bytesWritten: number;
+  droppedLines: number;
+  droppedChars: number;
+  writeErrors: number;
+  lastError: string | null;
+  /** Milliseconds since the last SUCCESSFUL append, or null if nothing has been written. */
+  msSinceWrite: number | null;
+}
+
+/**
+ * The durable log archive for one harness session.
+ *
+ * The in-memory buffer is BOUNDED (CONFIG.MAX_BUFFER_CHARS). A log archive whose writer
+ * stalls — a full disk, a deleted logs/, an antivirus lock — must not convert the guest's
+ * firehose into committed memory: measured, an unbounded buffer took this process from
+ * 200 MB to 1.6 GB in 20 s at 8 MB/s and then killed it. Over the cap the OLDEST lines are
+ * dropped, COUNTED, and announced — both on stdout and as an `[ARCHIVE GAP]` line written
+ * into the archive itself, so a reader of the file can never mistake a gap for silence.
+ */
 class LogManager {
+  /** Pending log text. Elements are single lines, or one re-joined chunk after a failed
+   *  append; both are just strings to concatenate, and `bufferedChars` tracks the total. */
   private buffer: string[] = [];
+  private bufferedChars = 0;
   private currentPath = "";
   private currentSize = 0;
+  private bytesWritten = 0;
   private timer: Timer | null = null;
   private timer2: Timer | null = null;
   private dirReady = false;
-  private flushing = false; // Prevent concurrent flushes
+  /** The write in flight. Callers of flush() share it, so `await flush()` is honest —
+   *  shutdown used to return before the write it was waiting for had even started. */
+  private inflight: Promise<void> | null = null;
+  /** Pending gap, cleared once it has been stated in the archive file. */
+  private droppedLines = 0;
+  private droppedChars = 0;
+  private droppedSince = 0;
+  /** Lifetime totals — what /stats reports, so a gap stays visible after it was written out. */
+  private droppedLinesTotal = 0;
+  private droppedCharsTotal = 0;
+  private writeErrors = 0;
+  private lastError: string | null = null;
+  private lastReportAt = 0;
+  private lastWriteAt = 0;
+  private readonly session: string;
   private readonly dir: string;
 
   /** `session` scopes the archive to its own directory: parallel guests would otherwise
    *  interleave into one file, and a firehose that mixes two games is worse than none. */
   constructor(session = "") {
+    this.session = session;
     this.dir = sessionLogDir(CONFIG.LOG_DIR, session);
     this.ensureDir().then(() => {
       this.dirReady = true;
@@ -110,46 +172,151 @@ class LogManager {
     console.log(`[FS] New game session -> ${this.currentPath}`);
   }
 
+  /** The scheduling invariant: while anything is buffered, either a write is in flight or a
+   *  timer is armed to start one. The old code armed the timer only on the small-buffer
+   *  branch, so a flush skipped because one was already running left the rest unscheduled. */
+  private schedule(delayMs = CONFIG.FLUSH_INTERVAL) {
+    if (this.timer || this.inflight || !this.buffer.length) return;
+    this.timer = setTimeout(() => { this.timer = null; void this.flush(); }, delayMs);
+  }
+
   add(entry: any) {
     const { timestamp = Date.now(), category = "ANY", level = 2, message = "" } = entry;
     const line = `[${(timestamp / 1000).toFixed(3)}s] [${LEVELS[level] || level}] [${category}] ${message}\n`;
 
     this.buffer.push(line);
+    this.bufferedChars += line.length;
+    this.enforceCap();
 
-    if (this.buffer.length >= CONFIG.BUFFER_LIMIT) {
-      this.flush();
-    } else if (!this.timer) {
-      this.timer = setTimeout(() => this.flush(), CONFIG.FLUSH_INTERVAL);
-    }
+    if (this.buffer.length >= CONFIG.BUFFER_LIMIT) void this.flush();
+    else this.schedule();
   }
 
-  async flush() {
+  /**
+   * Keep the buffer under the cap by dropping the OLDEST text — the newest window is the
+   * one worth having when the writer comes back. Every dropped line is counted so the gap
+   * can be stated exactly; nothing here loses data quietly.
+   */
+  private enforceCap() {
+    if (this.bufferedChars <= CONFIG.MAX_BUFFER_CHARS) return;
+    const target = CONFIG.MAX_BUFFER_CHARS * CONFIG.DRAIN_TO;
+    if (!this.droppedSince) this.droppedSince = Date.now();
+    while (this.bufferedChars > target && this.buffer.length) {
+      const gone = this.buffer.shift()!;
+      this.bufferedChars -= gone.length;
+      this.droppedChars += gone.length;
+      this.droppedCharsTotal += gone.length;
+      // One chunk can hold many lines (a re-queued failed append); count them for real.
+      for (let i = gone.indexOf("\n"); i >= 0; i = gone.indexOf("\n", i + 1)) {
+        this.droppedLines++;
+        this.droppedLinesTotal++;
+      }
+    }
+    this.report(`buffer over ${(CONFIG.MAX_BUFFER_CHARS / 1e6).toFixed(0)}MB — dropping oldest lines`);
+  }
+
+  /** Loud, but not once per failed flush: a stalled writer under the firehose would itself
+   *  become a firehose. One line per REPORT_INTERVAL_MS, carrying the running totals. */
+  private report(what: string) {
+    const now = Date.now();
+    if (now - this.lastReportAt < CONFIG.REPORT_INTERVAL_MS) return;
+    this.lastReportAt = now;
+    console.error(
+      `[FS] ARCHIVE DEGRADED (${this.session || "default"}): ${what}; ` +
+      `buffered=${(this.bufferedChars / 1e6).toFixed(1)}MB dropped=${this.droppedLinesTotal} lines ` +
+      `writeErrors=${this.writeErrors}${this.lastError ? ` last=${this.lastError}` : ""}`,
+    );
+  }
+
+  /** The gap marker that goes INTO the archive, so the file states its own losses. Pending
+   *  until an append actually succeeds — a gap that was never written down is not recorded. */
+  private gapNotice(): string {
+    if (!this.droppedLines && !this.droppedChars) return "";
+    return `[ARCHIVE GAP] ${this.droppedLines} lines (${this.droppedChars} chars) dropped ` +
+      `since ${new Date(this.droppedSince).toISOString()} — the archive writer could not keep up\n`;
+  }
+
+  private backoff(): number {
+    return Math.min(CONFIG.RETRY_MAX_MS, CONFIG.RETRY_BASE_MS * 2 ** Math.min(this.writeErrors, 6));
+  }
+
+  /** Drain what is buffered. Concurrent callers share the write in flight. */
+  flush(): Promise<void> {
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
-    if (!this.buffer.length || !this.dirReady) return;
+    if (this.inflight) return this.inflight;
+    if (!this.buffer.length) return Promise.resolve();
+    if (!this.dirReady) { this.schedule(); return Promise.resolve(); }
+    const run = this.writeOnce();
+    this.inflight = run;
+    return run;
+  }
 
-    // Prevent concurrent flushes - this was causing duplicate writes!
-    if (this.flushing) return;
-    this.flushing = true;
-
-    // Take data from buffer atomically BEFORE any async operation
-    const toWrite = this.buffer.splice(0, this.buffer.length);
-    const data = toWrite.join("");
+  private async writeOnce(): Promise<void> {
+    // Take the data out before any await: another turn's add() must not see it twice.
+    const chunk = this.buffer.splice(0, this.buffer.length);
+    const body = chunk.join("");
+    const data = this.gapNotice() + body;
+    this.bufferedChars -= body.length;
+    let failed = false;
 
     try {
       await appendFile(this.currentPath, data);
+      this.droppedLines = this.droppedChars = this.droppedSince = 0;  // the gap is now on record
       this.currentSize += data.length;
-      console.log(`[FS] Wrote ${toWrite.length} lines (${data.length} bytes), total ${this.currentSize} bytes`);
+      this.bytesWritten += data.length;
+      this.lastWriteAt = Date.now();
+      if (this.writeErrors) {
+        console.log(`[FS] archive writer recovered (${this.session || "default"}) after ${this.writeErrors} failed appends`);
+        this.writeErrors = 0;
+        this.lastError = null;
+      }
+      vlog(`[FS] Wrote ${chunk.length} chunks (${data.length} bytes), total ${this.currentSize} bytes`);
       // Prune on every rotation, not only on the hourly timer: at the worker's log rate a
       // single hour fills the archive with tens of GB before a timer-only sweep ever runs.
       // Rotating bounds the dir at MAX_FILES x MAX_SIZE.
       if (this.currentSize >= CONFIG.MAX_SIZE) { this.rotate(); void this.cleanup(); }
     } catch (e) {
-      console.error("[FS] Flush failed, restoring buffer:", e);
-      // Restore data to beginning of buffer for retry
-      this.buffer.unshift(...toWrite);
+      failed = true;
+      this.writeErrors++;
+      this.lastError = String((e as { message?: string })?.message ?? e).slice(0, 200);
+      // ONE element, never a spread: `unshift(...toWrite)` is a RangeError once the backlog
+      // passes the argument-count limit, and that exception killed the whole archive.
+      // Re-queue the BODY only; the gap notice is regenerated when a write finally lands.
+      this.buffer.unshift(body);
+      this.bufferedChars += body.length;
+      this.enforceCap();
+      this.report(`append failed: ${this.lastError}`);
     } finally {
-      this.flushing = false;
+      // Re-arm here and only here for the post-write case: immediately if the writer is
+      // healthy and more arrived meanwhile, on a backoff while it is failing.
+      this.inflight = null;
+      this.schedule(failed ? this.backoff() : 0);
     }
+  }
+
+  /** Best-effort drain for shutdown: retry until empty or out of time. */
+  async drain(maxMs = 3000): Promise<void> {
+    const deadline = Date.now() + maxMs;
+    while (this.buffer.length && Date.now() < deadline) {
+      const before = this.bufferedChars;
+      await this.flush();
+      if (this.bufferedChars >= before) await Bun.sleep(100);  // writer is failing
+    }
+  }
+
+  stats(): ArchiveStats {
+    return {
+      session: this.session,
+      path: this.currentPath,
+      bufferedChars: this.bufferedChars,
+      bufferedChunks: this.buffer.length,
+      bytesWritten: this.bytesWritten,
+      droppedLines: this.droppedLinesTotal,
+      droppedChars: this.droppedCharsTotal,
+      writeErrors: this.writeErrors,
+      lastError: this.lastError,
+      msSinceWrite: this.lastWriteAt ? Date.now() - this.lastWriteAt : null,
+    };
   }
 
   async cleanup() {
@@ -202,8 +369,20 @@ async function releaseSession(session: string) {
   if (!hit || session === "") return;
   if (--hit.refs > 0) return;
   loggers.delete(session);
-  await hit.mgr.flush();
+  await hit.mgr.drain(2000);
   hit.mgr.dispose();
+}
+
+/**
+ * What the archive is actually doing — the instrument that makes a stalled writer visible
+ * instead of merely slow. `harness up` folds it into its service report, and
+ * tools/dev-sidecar/sidecar-loadtest.ts reads it to judge a run.
+ */
+function archiveStats() {
+  return {
+    rss: process.memoryUsage.rss(),
+    sessions: [...loggers.values()].map((l) => l.mgr.stats()),
+  };
 }
 
 /**
@@ -340,6 +519,11 @@ const server = Bun.serve<SocketData>({
     }
     const url = new URL(req.url);
     if (url.pathname === "/wgb") return serveWgb(req, url);
+    if (url.pathname.endsWith("/stats")) {
+      return new Response(JSON.stringify(archiveStats()), {
+        headers: { ...wgbHeaders(req), "Content-Type": "application/json" },
+      });
+    }
     // CORS/CORP on EVERY response, not just /wgb: the page is cross-origin isolated
     // (COOP/COEP, for SharedArrayBuffer), and under COEP a cross-origin response without
     // Cross-Origin-Resource-Policy is blocked outright. Without this the /health probe the
@@ -351,10 +535,10 @@ const server = Bun.serve<SocketData>({
   },
   websocket: {
     open(ws) {
-      console.log("[WS] Client connected");
+      vlog("[WS] Client connected");
     },
     close(ws) {
-      console.log("[WS] Client disconnected");
+      vlog("[WS] Client disconnected");
       void releaseSession(ws.data.session);
     },
     async message(ws, msg) {
@@ -376,7 +560,7 @@ const server = Bun.serve<SocketData>({
         if (data.type === "log_entry") {
           log.add(data.entry);
         } else if (data.type === "log_batch" && Array.isArray(data.entries)) {
-          console.log(`[WS] Received batch: ${data.entries.length} entries`);
+          vlog(`[WS] Received batch: ${data.entries.length} entries`);
           for (const entry of data.entries) {
             log.add(entry);
           }
@@ -397,7 +581,7 @@ const server = Bun.serve<SocketData>({
           await log.ensureDir();
           await mkdir(dirname(fullPath), { recursive: true });
           await writeFile(fullPath, data.content, "utf8");
-          console.log(`[FS] Wrote debug file: ${fullPath} (${data.content.length} bytes)`);
+          vlog(`[FS] Wrote debug file: ${fullPath} (${data.content.length} bytes)`);
           ws.send(JSON.stringify({ type: "write_file_ok", path: fullPath }));
         } else if (data.type === "write_file_b64" && typeof data.path === "string" && typeof data.base64 === "string") {
           const fullPath = resolveSafeLogPath(data.path);
@@ -417,7 +601,7 @@ const server = Bun.serve<SocketData>({
           await log.ensureDir();
           await mkdir(dirname(fullPath), { recursive: true });
           await writeFile(fullPath, raw);
-          console.log(`[FS] Wrote debug binary file: ${fullPath} (${raw.byteLength} bytes)`);
+          vlog(`[FS] Wrote debug binary file: ${fullPath} (${raw.byteLength} bytes)`);
           ws.send(JSON.stringify({ type: "write_file_ok", path: fullPath }));
         } else if (data.type === "log_rotate") {
           await log.rotateForGame(typeof data.game === "string" && data.game ? data.game : undefined);
@@ -432,13 +616,19 @@ const server = Bun.serve<SocketData>({
 
 const shutdown = async () => {
   console.log("Shutting down...");
-  await Promise.all([...loggers.values()].map((l) => l.mgr.flush()));
+  await Promise.all([...loggers.values()].map((l) => l.mgr.drain(3000)));
   server.stop();
   process.exit(0);
 };
 
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
+
+// A daemon nobody watches must not die of a stray rejection: losing the archive mid-session
+// costs an hour of re-running a game. Say it loudly and stay up.
+process.on("unhandledRejection", (reason) => {
+  console.error("[sidecar] unhandled rejection (staying up):", reason);
+});
 
 console.log(`Server started on ${server.hostname}:${CONFIG.PORT}`);
 console.log(`  /wgb roots: ${WGB_ROOTS.join(" | ")}`);

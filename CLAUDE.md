@@ -330,7 +330,12 @@ facts the harness encodes (and the manual `dbg.*` fallback still needs):
     `breakOnApi('kernel32:ExitProcess')` (its snapshot carries `backtrace`+`lastThunks`) or `report()`.
   - Logs (megabytes/sec): don't grep the firehose — `logStats` (template-dedup summary), `watchLog(/re/)`
     (signal→event), `markLog`/`logsSince` (windows); the fault snapshot carries the log-ring tail. The
-    dev sidecar (:3001) is the durable archive tier, managed by `harness up`. It also serves
+    dev sidecar (:3001) is the durable archive tier, started by `harness up` (detached, stdout to
+    `logs/dev-sidecar.out.log` — never an inherited pipe nobody drains). Its in-memory buffer is
+    BOUNDED: when the writer cannot write (full disk, deleted `logs/`) it drops the oldest lines,
+    counts them, prints one degraded line per 10s, and writes an `[ARCHIVE GAP]` marker into the
+    archive when it recovers — `GET /stats` reports buffered/written/dropped/lastError per session
+    and `harness up` warns on it. A log window with no gap marker really is complete. It also serves
     bundles by Range (`/wgb?path=`) — deliberately NOT through Vite, whose dev server degrades on
     that route over a session and blows the io-worker's 30 s deadline (`SabIoSource: read timed out`).
   - RE the guest: the warm RE service (`tools/re/`, §14) — `re decompile/resolve/exportSymbolMap`

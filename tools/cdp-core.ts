@@ -17,7 +17,7 @@
  * Bun script (top-level await, Bun.spawnSync, global fetch/WebSocket).
  */
 import { createGzip } from "node:zlib";
-import { closeSync, createWriteStream, existsSync, openSync, rmSync, statSync } from "node:fs";
+import { closeSync, createWriteStream, existsSync, mkdirSync, openSync, rmSync, statSync } from "node:fs";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { tmpdir } from "node:os";
@@ -545,6 +545,9 @@ export interface HealthReport {
     logServer: boolean;
     chrome: boolean;
     devTab: boolean;
+    /** The sidecar answering /health says nothing about whether it can WRITE. Present only
+     *  when the archive is degraded — a session losing log lines must not read as green. */
+    logArchive?: { droppedLines: number; writeErrors: number; bufferedMB: number; lastError: string | null };
 }
 
 /** Hard-reload the ?game=dev tab (cache bypass) and poll until harness + loadApp are ready. */
@@ -709,6 +712,62 @@ export async function ensureVite(): Promise<{ ok: boolean; action: string }> {
     }
 }
 
+/**
+ * Make sure the dev sidecar is serving, starting a DETACHED one if not.
+ *
+ * It must be up before the page loads: `src/utils/bundle-url.ts` probes :3001 once per page
+ * and caches the answer, so a tab opened while the sidecar is down streams every bundle for
+ * its whole life through Vite's fallback route — the slow path the sidecar exists to avoid.
+ *
+ * Its stdout goes to a FILE, never to an inherited pipe with nobody draining it: a detached
+ * daemon writing into a pipe no one reads is a stall waiting to happen, and the file is also
+ * where a degraded-archive report can be read after the fact.
+ */
+export async function ensureSidecar(): Promise<{ ok: boolean; action: string }> {
+    const healthy = async (timeoutMs: number) => {
+        try {
+            const r = await fetch(`http://localhost:${SIDECAR_PORT}/health`, { signal: AbortSignal.timeout(timeoutMs) });
+            return (await r.text()).trim() === "OK";
+        } catch { return false; }
+    };
+    if (await healthy(2_000)) return { ok: true, action: "already-serving" };
+
+    const release = acquireLaunchLock(SIDECAR_PORT, "sidecar", 20_000);
+    if (!release) {
+        for (let i = 0; i < 20; i++) {
+            if (await healthy(1_000)) return { ok: true, action: "waited-for-other-starter" };
+            await Bun.sleep(500);
+        }
+        return { ok: false, action: "timed-out-waiting-for-other-starter" };
+    }
+    try {
+        if (await healthy(1_000)) return { ok: true, action: "already-serving" };
+        const script = join(process.cwd(), "tools", "dev-sidecar", "dev-sidecar.ts");
+        const logDir = join(process.cwd(), "logs");
+        mkdirSync(logDir, { recursive: true });
+        const out = join(logDir, "dev-sidecar.out.log");
+        const err = join(logDir, "dev-sidecar.err.log");
+        if (IS_WIN) {
+            const q = (s: string) => `'${s.replace(/'/g, "''")}'`;
+            Bun.spawnSync(["powershell", "-NoProfile", "-Command",
+                `Start-Process -FilePath 'bun' -ArgumentList 'run',${q(script)} -WorkingDirectory ${q(process.cwd())} ` +
+                `-WindowStyle Hidden -RedirectStandardOutput ${q(out)} -RedirectStandardError ${q(err)}`]);
+        } else {
+            Bun.spawn(["bun", "run", script], {
+                cwd: process.cwd(), stdin: "ignore",
+                stdout: openSync(out, "a"), stderr: openSync(err, "a"),
+            }).unref();
+        }
+        for (let i = 0; i < 40; i++) {
+            if (await healthy(1_000)) return { ok: true, action: "started" };
+            await Bun.sleep(250);
+        }
+        return { ok: false, action: `started-but-not-answering (see ${err})` };
+    } finally {
+        release();
+    }
+}
+
 async function portInUse(port: number): Promise<boolean> {
     try { await fetch(`http://localhost:${port}/`, { signal: AbortSignal.timeout(2_000) }); return true; } catch { return false; }
 }
@@ -730,6 +789,7 @@ export async function health(opts: { port?: number } = {}): Promise<HealthReport
     const logServer = await (async () => {
         try { return (await (await fetch(`http://localhost:${SIDECAR_PORT}/health`)).text()).trim() === "OK"; } catch { return false; }
     })();
+    const logArchive = logServer ? await sidecarArchiveHealth() : undefined;
     let chrome = false, devTab = false;
     try {
         await fetchJson(port, "/json/version");
@@ -737,5 +797,28 @@ export async function health(opts: { port?: number } = {}): Promise<HealthReport
         await findTab(GAME_DEV_FILTER, { port });
         devTab = true;
     } catch { /* */ }
-    return { vite, viteTransform, logServer, chrome, devTab };
+    return { vite, viteTransform, logServer, chrome, devTab, ...(logArchive ? { logArchive } : {}) };
+}
+
+interface SidecarStats {
+    sessions: Array<{ bufferedChars: number; droppedLines: number; writeErrors: number; lastError: string | null }>;
+}
+
+/** Summed over sessions; undefined when the archive is healthy, so `health()` stays terse. */
+async function sidecarArchiveHealth(): Promise<HealthReport["logArchive"]> {
+    try {
+        const s = await (await fetch(`http://localhost:${SIDECAR_PORT}/stats`,
+            { signal: AbortSignal.timeout(3_000) })).json() as SidecarStats;
+        const sum = (pick: (x: SidecarStats["sessions"][number]) => number) =>
+            s.sessions.reduce((a, x) => a + pick(x), 0);
+        const droppedLines = sum((x) => x.droppedLines);
+        const writeErrors = sum((x) => x.writeErrors);
+        if (!droppedLines && !writeErrors) return undefined;
+        return {
+            droppedLines,
+            writeErrors,
+            bufferedMB: Math.round(sum((x) => x.bufferedChars) / 1e5) / 10,
+            lastError: s.sessions.find((x) => x.lastError)?.lastError ?? null,
+        };
+    } catch { return undefined; }   // an older sidecar has no /stats
 }

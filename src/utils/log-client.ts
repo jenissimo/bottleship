@@ -55,6 +55,11 @@ class LogClient {
   // Buffering and batching
   private buffer: LogEntry[] = [];
   private batchTimer: number | null = null;
+  /** Entries the cap threw away while disconnected or backlogged. Announced into the stream
+   *  itself on the next successful send — a gap the archive never hears about is a hole no
+   *  reader of the log can see. */
+  private droppedEntries = 0;
+  private droppedSince = 0;
   
   // Backpressure callback (optional)
   private backpressureCallback: ((isHeavy: boolean) => void) | null = null;
@@ -174,8 +179,10 @@ class LogClient {
     // Add to buffer
     this.buffer.push(entry);
 
-    // Trim buffer if too large (keep newest entries)
+    // Trim buffer if too large (keep newest entries), counting what goes.
     if (this.buffer.length > CONFIG.MAX_BUFFER_SIZE) {
+      if (!this.droppedSince) this.droppedSince = Date.now();
+      this.droppedEntries += this.buffer.length - CONFIG.MAX_BUFFER_SIZE;
       this.buffer = this.buffer.slice(-CONFIG.MAX_BUFFER_SIZE);
     }
 
@@ -192,6 +199,21 @@ class LogClient {
     }
   }
 
+  /** The gap marker, as a log entry, so a dropped window is visible in the archive file. */
+  private takeGapEntry(): LogEntry | null {
+    if (!this.droppedEntries) return null;
+    const entry: LogEntry = {
+      timestamp: Date.now(),
+      category: "LOGCLIENT",
+      level: 1,
+      message: `[CLIENT GAP] ${this.droppedEntries} entries dropped since ` +
+        `${new Date(this.droppedSince).toISOString()} — the log socket could not keep up`,
+    };
+    this.droppedEntries = 0;
+    this.droppedSince = 0;
+    return entry;
+  }
+
   /**
    * Flush buffered logs to server
    */
@@ -202,6 +224,8 @@ class LogClient {
 
     // Take a batch from the buffer
     const batch = this.buffer.splice(0, CONFIG.BATCH_SIZE);
+    const gap = this.takeGapEntry();
+    if (gap) batch.unshift(gap);
 
     try {
       // Send as batch message
