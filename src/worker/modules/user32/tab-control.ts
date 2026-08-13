@@ -391,6 +391,40 @@ export function adjustTabRect(win: WindowInfo, larger: boolean, rc: TabRect): Ta
     return out;
 }
 
+/**
+ * TAB_InvalidateTabArea: the client rect a selection or focus change damages.
+ *
+ * It is the tab ROWS only — bounded by the display area on the side the pane is on,
+ * and, while there is a single row, by the last tab plus the selected tab's inflation
+ * on the other axis. The pane and everything a sibling drew inside it are NOT in it,
+ * which is why a tab click in Win32 leaves a property page's content untouched:
+ * comctl32 never asks for those pixels back, so nothing repaints over them.
+ */
+export function tabInvalidateRect(win: WindowInfo): TabRect | null {
+    const state = ensureTabLayout(win);
+    if (state.items.length === 0 || state.rowCount < 1) return null;
+    const style = win.style >>> 0;
+    const client: TabRect = { left: 0, top: 0, right: Math.max(1, win.width), bottom: Math.max(1, win.height) };
+    const display = adjustTabRect(win, false, { ...client });
+    const lastTab = tabItemRect(win, state.items.length - 1);
+    const singleRow = state.rowCount === 1 && lastTab !== null;
+    const out = { ...client };
+    const vertical = (style & TCS_VERTICAL) !== 0;
+    const bottom = (style & TCS_BOTTOM) !== 0;
+
+    if (vertical) {
+        if (bottom) out.left = display.right; else out.right = display.left;
+        if (singleRow) out.bottom = lastTab!.bottom + 2 * SELECTED_TAB_OFFSET;
+    } else {
+        if (bottom) out.top = display.bottom; else out.bottom = display.top;
+        if (singleRow) out.right = lastTab!.right + 2 * SELECTED_TAB_OFFSET;
+    }
+    out.right = Math.min(out.right, client.right);
+    out.bottom = Math.min(out.bottom, client.bottom);
+    if (out.right <= out.left || out.bottom <= out.top) return null;
+    return out;
+}
+
 /** Index of the tab under a control-client point, or -1. */
 export function hitTestTab(win: WindowInfo, clientX: number, clientY: number): number {
     const state = ensureTabLayout(win);

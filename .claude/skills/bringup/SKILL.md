@@ -84,7 +84,13 @@ CLI invocation reconnects without it.
 - `bun tools/harness.ts shot [file] --verify` — the browser's own capture of the canvas,
   plus a cross-check of every worker-side route against it (with the screen's own churn as
   the noise floor). Run it when a screenshot and the tab seem to disagree.
+- `screenPixels({x,y,w,h,legend})` — a rect as one string per row, colours quantised to
+  `legend`; anything outside it reads `?` and is tallied, so a chrome-geometry assertion
+  (is the etched line present HERE and absent THERE) cannot pass on pixels it did not
+  recognise.
 - `screenMark()` … `screenChangeSince({allow})` — WHICH pixels a transition touched.
+  Mark from a REPAIRED screen: a mark taken over an already-damaged one reports "nothing
+  changed" and the scope assertion then passes on the very bug it exists to catch.
   `outside.changed` answers "what repainted that had no business repainting" (an
   over-wide invalidate, a stamp with nothing erased under it); each `allow` rect's own
   count is the positive control, so a run where the click missed fails instead of

@@ -279,4 +279,54 @@ export function registerReferenceCommands(svc: HarnessService): void {
         }
         return { rect: { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }, hash, mean: +(sum / n).toFixed(2) };
     });
+
+    /**
+     * screenPixels() — a screen rect as a legend + one string per row.
+     *
+     * A hash says "different", a diff says "changed"; a geometry assertion over
+     * chrome asks WHICH colour is at a pixel — is the etched line present here and
+     * absent there. Colours are quantised to a caller-supplied legend so a row reads
+     * as a picture, and every colour outside it becomes '?' with its own tally, so a
+     * region that "matches" only because nothing was recognised cannot pass silently.
+     */
+    svc.register("screenPixels", async (args) => {
+        const a = (args[0] ?? {}) as {
+            x: number; y: number; w: number; h: number;
+            legend?: Record<string, string>;
+        };
+        const render: any = sys().services?.render;
+        const blob: Blob | null = await render?.captureScreen?.();
+        if (!blob) throw new HarnessError("cannot see the screen", HarnessErrorCode.UNSUPPORTED);
+        const px = await bitmapPixels(await createImageBitmap(blob));
+        const x0 = Math.max(0, a.x | 0), y0 = Math.max(0, a.y | 0);
+        const x1 = Math.min(px.width, x0 + (a.w | 0)), y1 = Math.min(px.height, y0 + (a.h | 0));
+        if (x1 <= x0 || y1 <= y0) {
+            throw new HarnessError(`region ${JSON.stringify(a)} is outside the ${px.width}x${px.height} screen`,
+                HarnessErrorCode.BAD_ARGS);
+        }
+        const legend = new Map<number, string>();
+        for (const [ch, hex] of Object.entries(a.legend ?? {})) legend.set(parseHex(hex), ch);
+
+        const rows: string[] = [];
+        const unknown = new Map<number, number>();
+        for (let y = y0; y < y1; y++) {
+            let row = "";
+            for (let x = x0; x < x1; x++) {
+                const i = (y * px.width + x) * 4;
+                const rgb = (px.data[i] << 16 | px.data[i + 1] << 8 | px.data[i + 2]) >>> 0;
+                const ch = legend.get(rgb);
+                if (ch) { row += ch; continue; }
+                row += "?";
+                unknown.set(rgb, (unknown.get(rgb) ?? 0) + 1);
+            }
+            rows.push(row);
+        }
+        const other = [...unknown.entries()].sort((p, q) => q[1] - p[1]).slice(0, 8)
+            .map(([rgb, n]) => ({ color: toHex(rgb), count: n }));
+        return {
+            rect: { x: x0, y: y0, w: x1 - x0, h: y1 - y0 },
+            rows, legend: a.legend ?? {},
+            unmatched: { pixels: [...unknown.values()].reduce((s, n) => s + n, 0), top: other },
+        };
+    });
 }

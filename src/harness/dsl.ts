@@ -200,6 +200,13 @@ export class HarnessChain {
     screenRegionHash(rect: { x: number; y: number; w: number; h: number }): this {
         return this.push("screenRegionHash", [rect]);
     }
+    /** A screen rect as one string per row, colours quantised to `legend`. Everything
+     *  outside the legend reads '?' and is tallied, so a chrome-geometry assertion
+     *  cannot pass on a region it failed to recognise. */
+    screenPixels(opts: {
+        x: number; y: number; w: number; h: number;
+        legend?: Record<string, string>;
+    }): this { return this.push("screenPixels", [opts]); }
     /** Snapshot the screen for a later screenChangeSince() per-pixel compare. */
     screenMark(): this { return this.push("screenMark", []); }
     /** WHICH pixels changed since screenMark(). `allow` names the rects that were

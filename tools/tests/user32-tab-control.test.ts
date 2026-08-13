@@ -12,6 +12,7 @@ import {
     ensureTabLayout,
     tabItemRect,
     tabRowsHeight,
+    tabInvalidateRect,
     adjustTabRect,
     hitTestTab,
     handleTabKey,
@@ -287,6 +288,35 @@ describe("SysTabControl32 layout", () => {
         expect(back.top).toBe(0);
         expect(back.right).toBe(win.width);
         expect(back.bottom).toBe(win.height);
+    });
+
+    // TAB_InvalidateTabArea (Wine comctl32/tab.c:2537). The pane is deliberately outside
+    // it: a selection change must not ask for the pixels a sibling drew in the display
+    // area, or a property page is erased by a click that never invalidated it.
+    test("a selection change damages only the tab rows", () => {
+        const win = tabWin();
+        for (const t of ["Video", "Audio", "Speed"]) insert(win, 99, t);
+        const display = adjustTabRect(win, false, { left: 0, top: 0, right: win.width, bottom: win.height });
+        const inval = tabInvalidateRect(win)!;
+        expect(inval.left).toBe(0);
+        expect(inval.top).toBe(0);
+        expect(inval.bottom).toBe(display.top);
+        // One row: bounded on the right by the last tab plus the selected tab's inflation.
+        expect(inval.right).toBe(tabItemRect(win, 2)!.right + 2 * SELECTED_TAB_OFFSET);
+        expect(inval.right).toBeLessThan(win.width);
+    });
+
+    test("TCS_BOTTOM damages the rows at the bottom", () => {
+        const win = tabWin(TCS_BOTTOM);
+        insert(win, 0, "Video");
+        const display = adjustTabRect(win, false, { left: 0, top: 0, right: win.width, bottom: win.height });
+        const inval = tabInvalidateRect(win)!;
+        expect(inval.top).toBe(display.bottom);
+        expect(inval.bottom).toBe(win.height);
+    });
+
+    test("no tabs, nothing to damage", () => {
+        expect(tabInvalidateRect(tabWin())).toBeNull();
     });
 
     test("TCS_BOTTOM takes the rows off the bottom instead of the top", () => {

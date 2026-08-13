@@ -182,6 +182,32 @@ function requestDefaultDialogPaint(win: WindowInfo): void {
 }
 
 /**
+ * UpdateWindow's tail: run DefDlgProc's own paint NOW, because the window's WM_PAINT has
+ * just been delivered by hand rather than left to a pump.
+ *
+ * Win32's UpdateWindow sends WM_PAINT immediately when the update region is non-empty, and
+ * a window whose procedure draws nothing still gets USER's default chrome from DefDlgProc.
+ * Behind an HLE modal — a property sheet runs its own loop, so nothing pumps a page's queue
+ * — the posted WM_PAINT never arrives at all and only the deadline below would ever paint
+ * the page, at its full cost. The caller must have SENT the WM_PAINT first; this is the
+ * else-branch, not a substitute for it.
+ */
+export function completeDefaultDialogPaint(dialogHwnd: number): void {
+    const timer = chromeDeadlines.get(dialogHwnd);
+    if (timer !== undefined) {
+        clearTimeout(timer);
+        chromeDeadlines.delete(dialogHwnd);
+    }
+    const win = windows.get(dialogHwnd);
+    if (!win || win.pendingDestroy || !isEffectivelyVisible(win)) return;
+    if (win.paintCycleRan || win.guestCustomPaint) return;
+    if (paintTraceEnabled) {
+        logOverlayMutation('updateWindow', dialogHwnd, 'default paint: the procedure drew nothing');
+    }
+    paintDialogToOverlay(dialogHwnd, 'full');
+}
+
+/**
  * Put back the guest's OWN pixels for the rect `win` occupies, from the client image an
  * ancestor last flushed (captured before any control was stamped over it).
  *

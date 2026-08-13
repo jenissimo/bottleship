@@ -194,15 +194,39 @@ export function paintsOsControlChrome(parent: WindowInfo, child: WindowInfo): bo
     return true;
 }
 
+/** Screen rect a control's repaint is confined to. */
+export interface ControlDamage { x: number; y: number; w: number; h: number }
+
 /**
- * The controls a repaint is allowed to touch. Undefined = every child, which is what
- * an exposure (a wiped canvas, an uncovered window) needs; a set is the Win32 scope of
- * a state change — BM_SETCHECK invalidates the buttons whose check state moved and
- * nothing else, so a click on a radio may not re-stamp its neighbours.
+ * The controls a repaint is allowed to touch, and how much of each. Undefined = every
+ * child in full, which is what an exposure (a wiped canvas, an uncovered window) needs;
+ * a map is the Win32 scope of a state change — BM_SETCHECK invalidates the buttons whose
+ * check state moved and nothing else, so a click on a radio may not re-stamp its
+ * neighbours.
+ *
+ * The value is that control's UPDATE RECT, and null means its whole window. A class proc
+ * invalidates a RECT, not always the whole client — comctl32's TAB_InvalidateTabArea
+ * damages the tab rows alone — and on a flat overlay the difference is destructive
+ * rather than cosmetic: the pixels outside the update rect belong to whoever drew them.
  */
-export type ControlPaintScope = ReadonlySet<number> | undefined;
+export type ControlPaintScope = ReadonlyMap<number, ControlDamage | null> | undefined;
 
 const inScope = (only: ControlPaintScope, hwnd: number): boolean => !only || only.has(hwnd);
+
+/** A/B switch: ignores every update rect, i.e. restores the whole-window stamp that
+ *  erases whatever a sibling drew inside a tab control's pane. */
+const damageOf = (only: ControlPaintScope, hwnd: number): ControlDamage | null =>
+    (globalThis as { __noControlDamageClip?: boolean }).__noControlDamageClip
+        ? null : (only?.get(hwnd) ?? null);
+
+/** Intersection, or null when the two do not meet. */
+function clipToDamage(rect: ControlDamage, damage: ControlDamage | null): ControlDamage | null {
+    if (!damage) return rect;
+    const x0 = Math.max(rect.x, damage.x), y0 = Math.max(rect.y, damage.y);
+    const x1 = Math.min(rect.x + rect.w, damage.x + damage.w);
+    const y1 = Math.min(rect.y + rect.h, damage.y + damage.h);
+    return x1 > x0 && y1 > y0 ? { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } : null;
+}
 
 /**
  * Screen rects a control's stamp must NOT enter: the guest-owned siblings in front of
@@ -242,7 +266,9 @@ export function restoreClientUnderStampedControls(
         if (!child || !inScope(only, childHwnd) || !paintsOsControlChrome(parent, child)) continue;
         n++;
         const origin = getAbsoluteWindowPosition(child);
-        const rect = { x: origin.x, y: origin.y, w: Math.max(1, child.width), h: Math.max(1, child.height) };
+        const full = { x: origin.x, y: origin.y, w: Math.max(1, child.width), h: Math.max(1, child.height) };
+        const rect = clipToDamage(full, damageOf(only, childHwnd));
+        if (!rect) continue;
         for (const r of subtractRects(rect, stampSiblingHoles(child))) {
             gdi.restoreWindowClientRect(parent.handle, r.x, r.y, r.w, r.h);
         }
@@ -304,7 +330,8 @@ export function paintChildControls(
     for (const childHandle of getChildrenInPaintOrder(parentHwnd)) {
         const child = windows.get(childHandle);
         if (!child || !inScope(only, childHandle) || !paintsOsControlChrome(parent, child)) continue;
-        painted = paintSystemControl(child, hdc, gdi, parentAbsX, parentAbsY) || painted;
+        painted = paintSystemControl(child, hdc, gdi, parentAbsX, parentAbsY,
+            damageOf(only, childHandle)) || painted;
     }
 
     if (clip) ctx.restore();
@@ -333,6 +360,7 @@ export function paintSystemControl(
     gdi: GDIContext,
     parentAbsX?: number,
     parentAbsY?: number,
+    damage?: ControlDamage | null,
 ): boolean {
     if (!isEffectivelyVisible(child) || !child.isSystemControl) return false;
     const parent = child.parent !== undefined ? windows.get(child.parent) : undefined;
@@ -359,13 +387,21 @@ export function paintSystemControl(
     // pixels, and on a flat overlay only an explicit hole keeps this stamp out of
     // them (a property page lives INSIDE its tab control's rect).
     const siblingHoles = stampSiblingHoles(child);
-    const clipped = !!clip || siblingHoles.length > 0;
+    const clipped = !!clip || !!damage || siblingHoles.length > 0;
     if (clipped) {
         if (clip && (clip.w <= 0 || clip.h <= 0)) return false;
         ctx.save();
         if (clip) {
             ctx.beginPath();
             ctx.rect(clip.x, clip.y, clip.w, clip.h);
+            ctx.clip();
+        }
+        // The update rect: everything the class proc draws is clipped to it, exactly as
+        // BeginPaint clips to the update region.
+        if (damage) {
+            if (damage.w <= 0 || damage.h <= 0) { ctx.restore(); return false; }
+            ctx.beginPath();
+            ctx.rect(damage.x, damage.y, damage.w, damage.h);
             ctx.clip();
         }
         if (siblingHoles.length > 0) {
@@ -556,16 +592,37 @@ function paintGroupBox(
     const textStart = x + 8;
     const labelTop = y + 2;
 
-    drawEtchedEdge(ctx, x, frameTop, w, Math.max(2, h - (frameTop - y)));
+    // GB_Paint's gap: the label's own band, FillRect'ed out of the finished frame with
+    // the brush the parent returned (Wine button.c:1011) — and a parent that ignores
+    // WM_CTLCOLORSTATIC still returns one, since its DefWindowProc answers COLOR_3DFACE.
+    // controlEraseCss has no such fallback (a guest-painted client is not ours to fill),
+    // so the frame is ALSO kept out of the band: same pixels, no brush needed. Clipped to
+    // the client, or a caption wider than its box would open the frame past the corner.
+    const gapLeft = Math.max(x, textStart - 1);
+    const gap = label ? {
+        x: gapLeft, y: labelTop, h: tm.height + 1,
+        w: Math.max(0, Math.min(x + w - 1, textStart + textWidth + 1) - gapLeft),
+    } : null;
+    // A/B switch: leaves the gap to the brush erase alone, i.e. reproduces the line
+    // struck through the caption on a parent that answers no WM_CTLCOLORSTATIC.
+    const clipGap = gap && gap.w > 0
+        && !(globalThis as { __noGroupBoxLabelGap?: boolean }).__noGroupBoxLabelGap;
+
+    const frame = { x, y: frameTop, w, h: Math.max(2, h - (frameTop - y)) };
+    ctx.save();
+    if (clipGap) {
+        const keep = new Path2D();
+        for (const r of subtractRects(frame, [gap!])) keep.rect(r.x, r.y, r.w, r.h);
+        ctx.clip(keep);
+    }
+    drawEtchedEdge(ctx, frame.x, frame.y, frame.w, frame.h);
+    ctx.restore();
 
     if (label) {
-        // GB_Paint erases the label's own run of the etched line with the brush the
-        // parent returned from WM_CTLCOLORSTATIC, not a hardcoded face (Wine
-        // button.c:1011) — a hardcoded grey box is visible on any coloured dialog.
         const labelGround = controlEraseCss(child);
-        if (labelGround) {
+        if (labelGround && gap!.w > 0) {
             ctx.fillStyle = labelGround;
-            ctx.fillRect(textStart - 1, labelTop, textWidth + 2, tm.height + 1);
+            ctx.fillRect(gap!.x, gap!.y, gap!.w, gap!.h);
         }
         const colors = getControlColorOverride(child.handle);
         ctx.fillStyle = isControlDisabled(child) ? COLOR_GRAYTEXT

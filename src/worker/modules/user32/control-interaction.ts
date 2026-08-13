@@ -23,6 +23,7 @@ import {
     setCapture,
     releaseCapture,
 } from './shared-state';
+import type { ControlDamage } from './controls';
 import {
     repaintChildControls,
     isButtonSystemControl,
@@ -80,7 +81,7 @@ import {
     MK_CONTROL as LV_MK_CONTROL,
     MK_SHIFT as LV_MK_SHIFT,
 } from './list-view-control';
-import { hitTestTab, selectTabFromUser, handleTabKey } from './tab-control';
+import { hitTestTab, selectTabFromUser, handleTabKey, tabInvalidateRect } from './tab-control';
 
 const WM_MOUSEMOVE   = 0x0200;
 const WM_LBUTTONDOWN = 0x0201;
@@ -403,8 +404,17 @@ export function resetControlInteractionState(): void {
  * client there is none, so an untouched neighbour is redrawn on top of its own
  * predecessor. `alsoChanged` carries the other windows this action really did change
  * (the auto-radio siblings BM_SETCHECK cleared).
+ *
+ * `damage` is the control's own update rect in SCREEN coordinates, for a class proc that
+ * invalidates less than its whole client (TAB_InvalidateTabArea). Omitted = the whole
+ * window, which is what BM_SETCHECK and friends invalidate.
  */
-function repaintHost(control: WindowInfo, hostHwnd: number, alsoChanged?: readonly number[]): void {
+function repaintHost(
+    control: WindowInfo,
+    hostHwnd: number,
+    alsoChanged?: readonly number[],
+    damage?: ControlDamage | null,
+): void {
     // A control inside a dialog composited over a DDraw flip chain needs the FULL
     // dialog repainted (gray face + all controls) — the overlay canvas can be wiped
     // between frames and a controls-only paint would lose the background. The full
@@ -419,9 +429,17 @@ function repaintHost(control: WindowInfo, hostHwnd: number, alsoChanged?: readon
         visited.add(cur.handle);
         cur = cur.parent ? windows.get(cur.parent) : undefined;
     }
-    const only = new Set<number>([control.handle]);
-    if (alsoChanged) for (const h of alsoChanged) only.add(h);
+    const only = new Map<number, ControlDamage | null>([[control.handle, damage ?? null]]);
+    if (alsoChanged) for (const h of alsoChanged) if (!only.has(h)) only.set(h, null);
     repaintChildControls(control.parent ?? hostHwnd, only);
+}
+
+/** A tab control's update rect (TAB_InvalidateTabArea), in screen coordinates. */
+function tabDamage(control: WindowInfo): ControlDamage | null {
+    const r = tabInvalidateRect(control);
+    if (!r) return null;
+    const { x, y } = getAbsoluteWindowPosition(control);
+    return { x: x + r.left, y: y + r.top, w: r.right - r.left, h: r.bottom - r.top };
 }
 
 function trackbarPosFromPoint(tb: WindowInfo, screenX: number, screenY: number): number {
@@ -1205,7 +1223,7 @@ function applyControlClassMouse(
             const { x: absX, y: absY } = getAbsoluteWindowPosition(control);
             const hit = hitTestTab(control, screenX - absX, screenY - absY);
             if (hit >= 0 && selectTabFromUser(control, hit)) {
-                repaintHost(control, hostHwnd);
+                repaintHost(control, hostHwnd, undefined, tabDamage(control));
             }
             return true;
         }
@@ -1363,7 +1381,7 @@ export function handleSystemControlKey(
 
     if (cls === 'systabcontrol32') {
         if (handleTabKey(control, vKey)) {
-            repaintHost(control, hostHwnd);
+            repaintHost(control, hostHwnd, undefined, tabDamage(control));
             return true;
         }
         return false;

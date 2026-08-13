@@ -39,7 +39,7 @@ import {
     isSentinelWndProc, runModalDialogFromTemplate,
 } from './user32/dialog';
 import {
-    repaintDialogAfterContentChange, repaintDialogOverlayIfVisible,
+    repaintDialogAfterContentChange, repaintDialogOverlayIfVisible, completeDefaultDialogPaint,
 } from './user32/dialog-paint';
 import { WH_CBT, HCBT_CREATEWND, getHooksOfType } from './user32/hooks';
 import { handleSystemControlMessage } from './user32/dialog-control-messages';
@@ -48,6 +48,7 @@ import { resolveModuleWndProcStub } from './user32/system-classes';
 
 // ---- Win32 constants ----
 const WM_DESTROY = 0x0002;
+const WM_PAINT = 0x000f;
 const WM_CLOSE = 0x0010;
 const WM_SETFONT = 0x0030;
 const WM_INITDIALOG = 0x0110;
@@ -1072,6 +1073,14 @@ function* setCurSel(sheet: SheetInfo, index: number, skipDir: number): Generator
     // frame's own repaint only covers the frame's direct children, so the page
     // subtree needs its own paint cycle or the pane stays empty grey.
     repaintDialogOverlayIfVisible(page.hwndPage);
+    // …and then UpdateWindow. Real comctl32 leaves the WM_PAINT to the sheet's modal
+    // loop, which pumps it at once; ours IS that loop, so nothing would deliver it and
+    // the page would appear only when the deferred-chrome deadline expired.
+    // A/B switch: drops back to the posted WM_PAINT nobody pumps.
+    if (!(globalThis as { __noPropSheetUpdateWindow?: boolean }).__noPropSheetUpdateWindow) {
+        yield msgTo(page.hwndPage, WM_PAINT, 0, 0, 'PropSheet:page WM_PAINT');
+        completeDefaultDialogPaint(page.hwndPage);
+    }
     return true;
 }
 

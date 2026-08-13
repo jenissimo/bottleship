@@ -235,4 +235,46 @@ if (ch[0].hash !== ch[2].hash) {
         + `(${ch[0].hash} -> ${ch[2].hash}): the uncover repaint did not restore what the popup covered`);
 }
 
-console.log("OK — layout matches comctl32's numbers; A->B->A and uncover restore byte-identically");
+// ---- (5) a page's FIRST show must not wait on the deferred-chrome deadline --------
+// Win32 shows a page by making it visible and letting the sheet's modal loop pump the
+// WM_PAINT; ours IS that loop, so nothing pumps the page's queue and the posted message
+// never arrives — the page then appeared only when DEFAULT_CHROME_DEADLINE_MS expired,
+// which is a quarter-second of visible wait per page. showPage now sends it (UpdateWindow).
+// The deadline logs whether it fired, so this is read rather than timed: a wall-clock
+// bound would be this box's speed, while "the net had to catch it" is the defect itself.
+const firstShow = async (tabIndex: number): Promise<string[]> => {
+    const t: any = await harness()
+        .paintTrace("clear").paintTrace("start")
+        .clickAt(tabCentre(tabIndex).x, tabCentre(tabIndex).y)
+        .sleep(1500)
+        .paintTrace("read")
+        .run();
+    const pt = [...t.steps].reverse().find((s: any) => s.cmd === "paintTrace")?.result;
+    return (pt.lines as string[]).filter((l) => l.includes("defaultChromeDeadline fired"));
+};
+
+await harness().call("setWorkerFlag", "__noPropSheetUpdateWindow", null).run();
+await harness().openWgb(process.env.WGB ?? "/apps/propsheet_zoo.wgb")
+    .waitForControl("OK", { timeoutMs: 180000 }).sleep(4000).run();
+const sent = await firstShow(2);
+if (sent.length) {
+    fail(`showing a page for the first time still fell through to the deferred-chrome `
+        + `deadline (${sent.join(" / ")}) — its WM_PAINT was posted to a queue nobody pumps, `
+        + "so the page appears a quarter of a second after the click");
+}
+console.log("  ok  first page show: painted without the chrome deadline");
+
+// The A/B is the positive control: without the send, the net has to catch it.
+await harness().call("setWorkerFlag", "__noPropSheetUpdateWindow", true).run();
+await harness().openWgb(process.env.WGB ?? "/apps/propsheet_zoo.wgb")
+    .waitForControl("OK", { timeoutMs: 180000 }).sleep(4000).run();
+const posted = await firstShow(2);
+await harness().call("setWorkerFlag", "__noPropSheetUpdateWindow", null).run();
+if (!posted.length) {
+    fail("__noPropSheetUpdateWindow drops back to the posted WM_PAINT and the deadline STILL "
+        + "did not fire — the check above cannot fail, so its pass means nothing");
+}
+console.log(`  ok  A/B: without UpdateWindow the same show waits for the deadline (${posted[0]!.slice(0, 90)})`);
+
+console.log("OK — layout matches comctl32's numbers; A->B->A and uncover restore byte-identically, "
+    + "and a page's first show does not wait on the chrome deadline");
