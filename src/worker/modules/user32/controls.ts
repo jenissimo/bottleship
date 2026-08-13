@@ -101,7 +101,7 @@ import {
     TCS_BOTTOM as TCS_BOTTOM_STYLE,
 } from './tab-control';
 import { restampOwnedPopups } from './paint-hooks';
-import { paintTraceEnabled, logChromeStamp } from './paint-trace';
+import { paintTraceEnabled, logChromeStamp, logOverlayMutation } from './paint-trace';
 
 
 // Window styles
@@ -195,6 +195,69 @@ export function paintsOsControlChrome(parent: WindowInfo, child: WindowInfo): bo
 }
 
 /**
+ * The controls a repaint is allowed to touch. Undefined = every child, which is what
+ * an exposure (a wiped canvas, an uncovered window) needs; a set is the Win32 scope of
+ * a state change — BM_SETCHECK invalidates the buttons whose check state moved and
+ * nothing else, so a click on a radio may not re-stamp its neighbours.
+ */
+export type ControlPaintScope = ReadonlySet<number> | undefined;
+
+const inScope = (only: ControlPaintScope, hwnd: number): boolean => !only || only.has(hwnd);
+
+/**
+ * Screen rects a control's stamp must NOT enter: the guest-owned siblings in front of
+ * it. Shared with the restore below so "restore under exactly what you are about to
+ * stamp" stays literally true, A/B flag included.
+ */
+function stampSiblingHoles(child: WindowInfo): { x: number; y: number; w: number; h: number }[] {
+    // A/B switch: restores the greedy stamp, i.e. reproduces the erased child window
+    // on demand. A check nobody has seen fail is indistinguishable from one that cannot.
+    return (globalThis as { __noSiblingClip?: boolean }).__noSiblingClip
+        ? [] : getHigherZSiblingRects(child);
+}
+
+/**
+ * Put the guest's retained client back under the OS-drawn controls a repaint is about
+ * to stamp — and nowhere else.
+ *
+ * A stamp onto the flat overlay cannot erase its own predecessor when the parent
+ * guest-paints its client: the control's class proc would FillRect with the parent's
+ * brush first, and there is no brush to ask for (controlEraseCss returns null), so
+ * changed text lands on the old string and a moved thumb leaves its predecessor
+ * behind. The retained client IS that background, exactly. No backing yet ⇒ a no-op,
+ * which is also why this is safe to call for a parent that paints nothing of its own.
+ *
+ * An open drop-down is included: it paints outside its combobox's rect, so its old
+ * pixels are not covered by the box's own restore.
+ */
+export function restoreClientUnderStampedControls(
+    parent: WindowInfo,
+    gdi: GDIContext,
+    only?: ControlPaintScope,
+): void {
+    if (!gdi.restoreWindowClientRect) return;
+    let n = 0;
+    for (const childHwnd of parent.children) {
+        const child = windows.get(childHwnd);
+        if (!child || !inScope(only, childHwnd) || !paintsOsControlChrome(parent, child)) continue;
+        n++;
+        const origin = getAbsoluteWindowPosition(child);
+        const rect = { x: origin.x, y: origin.y, w: Math.max(1, child.width), h: Math.max(1, child.height) };
+        for (const r of subtractRects(rect, stampSiblingHoles(child))) {
+            gdi.restoreWindowClientRect(parent.handle, r.x, r.y, r.w, r.h);
+        }
+        if (listControlStates.get(child.handle)?.dropdownOpen) {
+            const d = getComboDropdownRect(child);
+            gdi.restoreWindowClientRect(parent.handle, d.x, d.y, d.w, d.h);
+        }
+    }
+    if (paintTraceEnabled) {
+        logOverlayMutation('restoreClient', parent.handle,
+            `under ${n}/${parent.children.length} stamped control(s)`);
+    }
+}
+
+/**
  * Paint all visible system child controls of the given parent window.
  * hdc must be a valid HDC pointing at the overlay canvas (as returned by BeginPaint).
  *
@@ -202,7 +265,12 @@ export function paintsOsControlChrome(parent: WindowInfo, child: WindowInfo): bo
  * which runs BEFORE the game's WM_PAINT. This function must NOT re-fill the background
  * because that would overwrite text the game drew in WM_PAINT.
  */
-export function paintChildControls(parentHwnd: number, hdc: number, gdi: GDIContext): void {
+export function paintChildControls(
+    parentHwnd: number,
+    hdc: number,
+    gdi: GDIContext,
+    only?: ControlPaintScope,
+): void {
     const parent = windows.get(parentHwnd);
     if (!parent || !parent.children.length) return;
     // Never paint the controls of a hidden window. A dialog created hidden gets its
@@ -235,7 +303,7 @@ export function paintChildControls(parentHwnd: number, hdc: number, gdi: GDICont
     let painted = false;
     for (const childHandle of getChildrenInPaintOrder(parentHwnd)) {
         const child = windows.get(childHandle);
-        if (!child || !paintsOsControlChrome(parent, child)) continue;
+        if (!child || !inScope(only, childHandle) || !paintsOsControlChrome(parent, child)) continue;
         painted = paintSystemControl(child, hdc, gdi, parentAbsX, parentAbsY) || painted;
     }
 
@@ -246,7 +314,7 @@ export function paintChildControls(parentHwnd: number, hdc: number, gdi: GDICont
     // extend past the parent that owns the closed box.
     for (const childHandle of getChildrenInPaintOrder(parentHwnd)) {
         const child = windows.get(childHandle);
-        if (!child || !child.visible || !child.isSystemControl) continue;
+        if (!child || !inScope(only, childHandle) || !child.visible || !child.isSystemControl) continue;
         if (normalizeSystemControlClass(child.systemControlClass) !== 'combobox') continue;
         if (!listControlStates.get(child.handle)?.dropdownOpen) continue;
         paintComboDropdown(ctx, child);
@@ -290,10 +358,7 @@ export function paintSystemControl(
     // WS_CLIPSIBLINGS: a guest-owned window in front of this control owns those
     // pixels, and on a flat overlay only an explicit hole keeps this stamp out of
     // them (a property page lives INSIDE its tab control's rect).
-    // A/B switch: restores the greedy stamp, i.e. reproduces the erased child window
-    // on demand. A check nobody has seen fail is indistinguishable from one that cannot.
-    const siblingHoles = (globalThis as { __noSiblingClip?: boolean }).__noSiblingClip
-        ? [] : getHigherZSiblingRects(child);
+    const siblingHoles = stampSiblingHoles(child);
     const clipped = !!clip || siblingHoles.length > 0;
     if (clipped) {
         if (clip && (clip.w <= 0 || clip.h <= 0)) return false;
@@ -2123,12 +2188,32 @@ function paintGenericControl(
     ctx.textBaseline = 'top';
 }
 
-export function repaintChildControls(parentHwnd: number): void {
+/**
+ * Re-stamp a parent's OS-drawn control chrome, optionally only the controls in `only`.
+ *
+ * Erase and stamp are one operation, decided here: every re-stamp first puts back the
+ * parent's retained client under exactly the controls it is about to draw, because
+ * nothing else on this path can supply the background a control's class proc would
+ * have erased with.
+ */
+export function repaintChildControls(parentHwnd: number, only?: ControlPaintScope): void {
     const gdi = System.getInstance().gdiContext;
+    const parent = windows.get(parentHwnd);
+    if (!parent) return;
     const hdc = gdi.createOverlayDC();
     if (!hdc) return;
 
-    paintChildControls(parentHwnd, hdc, gdi);
+    // A/B switch: re-stamp every child with nothing put back underneath — the shape
+    // that compounded a page's labels on each radio click. A check nobody has seen
+    // fail is indistinguishable from one that cannot.
+    const legacy = !!(globalThis as { __noScopedControlRepaint?: boolean }).__noScopedControlRepaint;
+    const scope = legacy ? undefined : only;
+    if (paintTraceEnabled) {
+        logOverlayMutation('repaintChildControls', parentHwnd,
+            scope ? `scoped to ${scope.size} control(s)` : 'all children');
+    }
+    if (!legacy) restoreClientUnderStampedControls(parent, gdi, scope);
+    paintChildControls(parentHwnd, hdc, gdi, scope);
     gdi.releaseDC(hdc);
     // A controls-only repaint of a lower window would overpaint a modal it owns;
     // the flat overlay has no Z-clip, so re-stamp any owned popup back on top.

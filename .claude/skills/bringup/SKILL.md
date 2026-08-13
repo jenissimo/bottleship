@@ -84,6 +84,11 @@ CLI invocation reconnects without it.
 - `bun tools/harness.ts shot [file] --verify` — the browser's own capture of the canvas,
   plus a cross-check of every worker-side route against it (with the screen's own churn as
   the noise floor). Run it when a screenshot and the tab seem to disagree.
+- `screenMark()` … `screenChangeSince({allow})` — WHICH pixels a transition touched.
+  `outside.changed` answers "what repainted that had no business repainting" (an
+  over-wide invalidate, a stamp with nothing erased under it); each `allow` rect's own
+  count is the positive control, so a run where the click missed fails instead of
+  passing. Both sides are ours, so it is exact — no reference image, nothing to tune.
 - `textures()` + `dumpSurface(ptr|'primary')` — gallery + per-surface PNG to `logs/debug/`.
 - `surfacePixels(sel)` / `expectSurfaceNonBlack(sel)` — cheap liveness from a subsampled readback.
 - Dump PNGs preserve ALPHA: an area that looks WHITE in a viewer but BLACK on the canvas is

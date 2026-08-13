@@ -177,19 +177,33 @@ function getAutoradioGroupSiblings(parentHwnd: number, button: WindowInfo): Wind
         isButtonSystemControl(s) && getButtonType(s) === BS_AUTORADIOBUTTON);
 }
 
-/** BM auto-state transitions for checkbox / 3-state / radio buttons on click. */
-export function applyAutoButtonState(parentHwnd: number, button: WindowInfo): void {
-    if (!isButtonSystemControl(button)) return;
+/** One BM_SETCHECK, recording the button only when the state really moved. */
+function setCheckState(button: WindowInfo, next: number, changed: number[]): void {
+    const previous = buttonCheckStates.get(button.handle) ?? BST_UNCHECKED;
+    // Keep BST_PUSHED: the caller owns it, and a click's UP clears it separately.
+    const merged = (previous & BST_PUSHED) | next;
+    if (merged === previous) return;
+    buttonCheckStates.set(button.handle, merged);
+    changed.push(button.handle);
+}
+
+/**
+ * BM auto-state transitions for checkbox / 3-state / radio buttons on click.
+ *
+ * Returns the buttons whose check state actually MOVED — Wine button.c's
+ * BUTTON_SetCheck invalidates only on a real change, and the auto-radio group walk is
+ * a BM_SETCHECK to each sibling, so this set is exactly what Win32 repaints.
+ */
+export function applyAutoButtonState(parentHwnd: number, button: WindowInfo): number[] {
+    const changed: number[] = [];
+    if (!isButtonSystemControl(button)) return changed;
 
     const buttonType = getButtonType(button);
     const currentState = (buttonCheckStates.get(button.handle) ?? BST_UNCHECKED) & ~BST_PUSHED;
 
     if (buttonType === BS_AUTOCHECKBOX) {
-        buttonCheckStates.set(
-            button.handle,
-            currentState === BST_CHECKED ? BST_UNCHECKED : BST_CHECKED,
-        );
-        return;
+        setCheckState(button, currentState === BST_CHECKED ? BST_UNCHECKED : BST_CHECKED, changed);
+        return changed;
     }
 
     if (buttonType === BS_AUTO3STATE) {
@@ -198,18 +212,16 @@ export function applyAutoButtonState(parentHwnd: number, button: WindowInfo): vo
             : currentState === BST_CHECKED
                 ? BST_INDETERMINATE
                 : BST_UNCHECKED;
-        buttonCheckStates.set(button.handle, nextState);
-        return;
+        setCheckState(button, nextState, changed);
+        return changed;
     }
 
     if (buttonType === BS_AUTORADIOBUTTON) {
         for (const sibling of getAutoradioGroupSiblings(parentHwnd, button)) {
-            buttonCheckStates.set(
-                sibling.handle,
-                sibling.handle === button.handle ? BST_CHECKED : BST_UNCHECKED,
-            );
+            setCheckState(sibling, sibling.handle === button.handle ? BST_CHECKED : BST_UNCHECKED, changed);
         }
     }
+    return changed;
 }
 
 export function normalizedControlClass(win: WindowInfo | undefined): string {
@@ -386,7 +398,18 @@ export function resetControlInteractionState(): void {
     pendingControlNotification = null;
 }
 
-function repaintHost(control: WindowInfo, hostHwnd: number): void {
+/**
+ * Repaint after a control's own class proc changed how it looks.
+ *
+ * A class proc invalidates ITS window, never its siblings: BM_SETCHECK repaints the
+ * buttons whose check state moved, a listbox repaints itself, a trackbar repaints
+ * itself. Re-stamping every child of the parent is both wrong and destructive — on a
+ * flat overlay each stamp needs a background to erase with, and under a guest-painted
+ * client there is none, so an untouched neighbour is redrawn on top of its own
+ * predecessor. `alsoChanged` carries the other windows this action really did change
+ * (the auto-radio siblings BM_SETCHECK cleared).
+ */
+function repaintHost(control: WindowInfo, hostHwnd: number, alsoChanged?: readonly number[]): void {
     // A control inside a dialog composited over a DDraw flip chain needs the FULL
     // dialog repainted (gray face + all controls) — the overlay canvas can be wiped
     // between frames and a controls-only paint would lose the background. The full
@@ -401,7 +424,9 @@ function repaintHost(control: WindowInfo, hostHwnd: number): void {
         visited.add(cur.handle);
         cur = cur.parent ? windows.get(cur.parent) : undefined;
     }
-    repaintChildControls(control.parent ?? hostHwnd);
+    const only = new Set<number>([control.handle]);
+    if (alsoChanged) for (const h of alsoChanged) only.add(h);
+    repaintChildControls(control.parent ?? hostHwnd, only);
 }
 
 function trackbarPosFromPoint(tb: WindowInfo, screenX: number, screenY: number): number {
@@ -1090,8 +1115,7 @@ function applyControlClassMouse(
                 }
                 const currentState = buttonCheckStates.get(control.handle) ?? 0;
                 buttonCheckStates.set(control.handle, currentState & ~BST_PUSHED);
-                applyAutoButtonState(parentHwnd, control);
-                repaintHost(control, hostHwnd);
+                repaintHost(control, hostHwnd, applyAutoButtonState(parentHwnd, control));
                 Logger.log(LogCategory.USER32,
                     `controlMouse: Button click id=${control.controlId ?? 0} "${control.title}" -> WM_COMMAND parent=0x${parentHwnd.toString(16)}`);
                 notifyCommand(parentHwnd, BN_CLICKED, control);
@@ -1298,8 +1322,7 @@ export function handleSystemControlKey(
             return true;
         }
         buttonCheckStates.set(control.handle, state & ~BST_PUSHED);
-        applyAutoButtonState(parentHwnd, control);
-        repaintHost(control, hostHwnd);
+        repaintHost(control, hostHwnd, applyAutoButtonState(parentHwnd, control));
         notifyCommand(parentHwnd, BN_CLICKED, control);
         return true;
     }

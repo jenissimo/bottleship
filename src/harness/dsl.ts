@@ -200,6 +200,15 @@ export class HarnessChain {
     screenRegionHash(rect: { x: number; y: number; w: number; h: number }): this {
         return this.push("screenRegionHash", [rect]);
     }
+    /** Snapshot the screen for a later screenChangeSince() per-pixel compare. */
+    screenMark(): this { return this.push("screenMark", []); }
+    /** WHICH pixels changed since screenMark(). `allow` names the rects that were
+     *  SUPPOSED to repaint: `outside.changed` is the scope finding, and each allow
+     *  rect's own count is the positive control that the transition happened at all. */
+    screenChangeSince(opts?: {
+        allow?: { name?: string; x: number; y: number; w: number; h: number }[];
+        within?: { x: number; y: number; w: number; h: number };
+    }): this { return this.push("screenChangeSince", [opts]); }
     /** One-frame per-draw capture. `backend` ("ddraw"|"d3d8"|"d3d9") pins WHICH render path's
      *  frame boundary ends it — without it, a title where two paths present returns the other
      *  path's empty frame and that reads exactly like "no draws happened". `dumpTargets` adds

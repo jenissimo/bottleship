@@ -16,7 +16,11 @@
  *     the pixels — mouse hit-test, page activation and repaint in one.
  *  4. The PSN_* protocol really ran: the trace names each notification and the
  *     page's verdict, because none of it is visible any other way.
- *  5. Cancel asks PSN_QUERYCANCEL, resets every CREATED page, and the sheet goes.
+ *  5. Clicking a radio repaints THAT radio pair and nothing else. Win32's BM_SETCHECK
+ *     invalidates the buttons whose check state moved; re-stamping the page's other
+ *     controls is visible because this page guest-paints its client, so a re-stamp has
+ *     no background to erase with and every label lands on its own predecessor.
+ *  6. Cancel asks PSN_QUERYCANCEL, resets every CREATED page, and the sheet goes.
  *
  *   WGB=g:/WGB/running/red-faction.wgb bun tools/harness.ts run tools/harness/regression/red-faction-propsheet.harness.ts
  */
@@ -156,7 +160,100 @@ if (!has("PSN_KILLACTIVE")) {
 const setActives = trace.filter((t) => t.includes("PSN_SETACTIVE")).length;
 if (setActives < 2) fail(`only ${setActives} PSN_SETACTIVE for two activated pages`);
 
-// ---- (5) Cancel: PSN_QUERYCANCEL, PSN_RESET to every created page, sheet closes ---
+// ---- (5) a radio click repaints the radio pair and NOTHING else -------------------
+// Both sides are ours, so this is pixel-exact: mark the screen, click, and every
+// changed pixel outside the two buttons is a control we had no business redrawing.
+// The per-button counts are the positive control — a run where the click missed
+// reports zero everywhere and would otherwise "pass".
+const CONTROLS = `
+    const ss = await import('/src/worker/modules/user32/shared-state.ts');
+    const out = [];
+    for (const w of ss.windows.values()) {
+        if (!w.isSystemControl || !ss.isEffectivelyVisible(w)) continue;
+        const a = ss.getAbsoluteWindowPosition(w);
+        const p = ss.windows.get(w.parent);
+        out.push({ h: w.handle, t: w.title ?? '', cls: (w.systemControlClass ?? '').toLowerCase(),
+                   chk: (ss.buttonCheckStates.get(w.handle) ?? 0) & ~4,
+                   pGuest: !!p?.guestCustomPaint, x: a.x, y: a.y, w: w.width, hh: w.height });
+    }
+    return out;
+`;
+const back: any = await harness()
+    .clickAt(Math.floor(s0.rects[0].x + s0.rects[0].w / 2), Math.floor(s0.rects[0].y + s0.rects[0].h / 2))
+    .sleep(4000)
+    .call("evalWorker", [CONTROLS])
+    .run();
+const vBefore: any[] = back.steps.find((s: any) => s.cmd === "evalWorker")?.result ?? [];
+const bits = vBefore.filter((c) => c.cls === "button" && /\b(16|32)\s*bit\b/i.test(c.t));
+if (bits.length < 2) {
+    fail(`the Video page shows ${bits.length} of the "16 Bit"/"32 Bit" radio pair `
+        + "— the framebuffer group is not there to click");
+}
+const radio = bits.find((c) => !c.chk) ?? bits[0];
+if (!radio.pGuest) {
+    console.log(`  note: the page does not guest-paint its client, so an over-wide repaint `
+        + "would be idempotent here and this check is weaker than it looks");
+}
+
+const clicked: any = await harness()
+    .screenMark()
+    .clickAt(radio.x + 8, radio.y + Math.floor(radio.hh / 2))
+    .sleep(2000)
+    .call("evalWorker", [CONTROLS])
+    .run();
+const vAfter: any[] = clicked.steps.find((s: any) => s.cmd === "evalWorker")?.result ?? [];
+const moved = vAfter.filter((c) => {
+    const b = vBefore.find((k: any) => k.h === c.h);
+    return b && b.chk !== c.chk;
+});
+console.log(`clicked "${radio.t}"; check state moved on: ${moved.map((c: any) => `"${c.t}"`).join(", ") || "(none)"}`);
+if (!moved.some((c: any) => c.h === radio.h)) {
+    fail(`clicking "${radio.t}" did not check it — the click never reached the button, `
+        + "so the repaint-scope assertion below would pass on a dead dialog");
+}
+
+const allowHandles = new Set<number>([radio.h, ...moved.map((c: any) => c.h)]);
+const allow = vAfter.filter((c) => allowHandles.has(c.h))
+    .map((c) => ({ name: c.t || `0x${c.h.toString(16)}`, x: c.x - 1, y: c.y - 1, w: c.w + 2, h: c.hh + 2 }));
+const scope: any = (await harness().screenChangeSince({ allow }).run()).steps?.[0]?.result;
+console.log(`  pixels changed: ${scope.changed} total, `
+    + `${scope.allow.map((a: any) => `${a.name}=${a.changed}`).join(" ")}, outside=${scope.outside.changed}`);
+if (scope.note) fail(scope.note + " — the click rendered nothing at all");
+for (const a of scope.allow) {
+    if (a.changed === 0) fail(`"${a.name}" changed its check state but not one pixel of it repainted`);
+}
+if (scope.outside.changed > 0) {
+    fail(`${scope.outside.changed} pixel(s) changed OUTSIDE the ${allow.length} button(s) whose `
+        + `state moved, over ${JSON.stringify(scope.outside.bbox)} `
+        + `(e.g. ${JSON.stringify(scope.outside.samples[0])}). BM_SETCHECK invalidates those `
+        + "buttons only; anything else on this page was re-stamped over pixels it could not erase");
+}
+
+// The same click with the pre-fix behaviour armed: it MUST dirty the rest of the page,
+// or the zero above is a property of this dialog rather than of the repaint scope.
+const other = bits.find((c: any) => c.h !== radio.h)!;
+const ab: any = await harness()
+    .call("setWorkerFlag", "__noScopedControlRepaint", true)
+    .screenMark()
+    .clickAt(other.x + 8, other.y + Math.floor(other.hh / 2))
+    .sleep(2000)
+    .screenChangeSince({ allow })
+    // The flag is persisted per session, so clear it in the same chain: leaving it
+    // armed would silently change every later run in this tab.
+    .call("setWorkerFlag", "__noScopedControlRepaint", null)
+    .run();
+const abScope = ab.steps.find((s: any) => s.cmd === "screenChangeSince")?.result;
+console.log(`  A/B (__noScopedControlRepaint): outside=${abScope?.outside.changed}`);
+if (!abScope || abScope.outside.changed === 0) {
+    fail("with __noScopedControlRepaint armed the whole-page re-stamp changed nothing outside "
+        + "the radios either — this dialog cannot show the defect, so the assertion above is vacuous");
+}
+
+// ---- (6) Cancel: PSN_QUERYCANCEL, PSN_RESET to every created page, sheet closes ---
+// Re-read the notification trace here: the page switches above added their own, and
+// slicing from a stale length would credit them to Cancel.
+const preCancel: any = await harness().call("evalWorker", [SHEET_STATE]).run();
+const beforeCancel: string[] = preCancel.steps?.[0]?.result?.trace ?? trace;
 const cancelled: any = await harness()
     .click("Cancel")
     .sleep(5000)
@@ -165,7 +262,7 @@ const cancelled: any = await harness()
     .run();
 const s2 = cancelled.steps?.find((s: any) => s.cmd === "evalWorker")?.result;
 const trace2: string[] = s2?.trace ?? [];
-const fresh = trace2.slice(trace.length);
+const fresh = trace2.slice(beforeCancel.length);
 console.log(`cancel notifications (${fresh.length}):`);
 for (const t of fresh) console.log("  " + t);
 if (!fresh.some((t) => t.includes("PSN_QUERYCANCEL"))) {

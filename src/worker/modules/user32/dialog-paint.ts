@@ -6,8 +6,8 @@
  */
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
-import { WindowInfo, windows, isEffectivelyVisible, getAbsoluteWindowPosition, getAncestorClipRect, ensureHostCursorForDialog, getChildrenInPaintOrder, hasSystemControlChildren, listControlStates } from './shared-state';
-import { paintChildControls, repaintChildControls, paintsOsControlChrome, getComboDropdownRect } from './controls';
+import { WindowInfo, windows, isEffectivelyVisible, getAbsoluteWindowPosition, getAncestorClipRect, ensureHostCursorForDialog, getChildrenInPaintOrder, hasSystemControlChildren } from './shared-state';
+import { paintChildControls, repaintChildControls, restoreClientUnderStampedControls } from './controls';
 import { registerOwnedPopupRestamper } from './paint-hooks';
 import { registerFullDialogRepainter, registerOverlayRepairRepainter } from './control-interaction';
 import { getWindowVisualBounds, eraseDialogOverlay, repairOverlayWindowsOverlappingRect } from './dialog-overlay';
@@ -367,34 +367,6 @@ function paintDialogNcFrame(win: WindowInfo, hdc: number, gdi: GDIContext): void
     ctx.lineTo(x1 - 0.5, y0 + 0.5);
     ctx.stroke();
     gdi.setOverlayDirty(true);
-}
-
-/**
- * Put the guest's retained client back under the OS-drawn controls a 'controls' repaint
- * is about to stamp — and nowhere else. An open drop-down is included: it paints outside
- * its combobox's rect, so its old pixels are not covered by the box's own restore.
- */
-function restoreClientUnderStampedControls(win: WindowInfo, gdi: GDIContext): void {
-    if (!gdi.restoreWindowClientRect) return;
-    let n = 0;
-    for (const childHwnd of win.children) {
-        const child = windows.get(childHwnd);
-        if (!child || !paintsOsControlChrome(win, child)) continue;
-        n++;
-        const origin = getAbsoluteWindowPosition(child);
-        gdi.restoreWindowClientRect(
-            win.handle, origin.x, origin.y,
-            Math.max(1, child.width), Math.max(1, child.height),
-        );
-        if (listControlStates.get(child.handle)?.dropdownOpen) {
-            const r = getComboDropdownRect(child);
-            gdi.restoreWindowClientRect(win.handle, r.x, r.y, r.w, r.h);
-        }
-    }
-    if (paintTraceEnabled) {
-        logOverlayMutation('restoreClient', win.handle,
-            `under ${n}/${win.children.length} stamped control(s)`);
-    }
 }
 
 function paintWindowSubtreeToOverlay(

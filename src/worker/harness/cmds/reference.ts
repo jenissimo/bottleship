@@ -157,6 +157,96 @@ export function registerReferenceCommands(svc: HarnessService): void {
     });
 
     /**
+     * screenMark() / screenChangeSince() — WHICH pixels a transition touched.
+     *
+     * A hash answers "did this rect change"; the question a repaint-scope bug asks is
+     * "what changed that had no business changing", and that needs the two frames
+     * compared per pixel with the expected rects named. `allow` is the region the
+     * caller asked to be repainted; every changed pixel outside it is the finding, and
+     * the count INSIDE it is the positive control — without it, a run where nothing
+     * rendered at all reports a perfect zero and passes.
+     */
+    let mark: ImageData | null = null;
+
+    svc.register("screenMark", async () => {
+        const render: any = sys().services?.render;
+        const blob: Blob | null = await render?.captureScreen?.();
+        if (!blob) throw new HarnessError("cannot see the screen", HarnessErrorCode.UNSUPPORTED);
+        const px = await bitmapPixels(await createImageBitmap(blob));
+        mark = px;
+        return { marked: true, screen: { w: px.width, h: px.height } };
+    });
+
+    svc.register("screenChangeSince", async (args) => {
+        const a = (args[0] ?? {}) as {
+            allow?: { name?: string; x: number; y: number; w: number; h: number }[];
+            within?: { x: number; y: number; w: number; h: number };
+        };
+        if (!mark) {
+            throw new HarnessError("screenChangeSince needs a screenMark() first",
+                HarnessErrorCode.BAD_ARGS);
+        }
+        const render: any = sys().services?.render;
+        const blob: Blob | null = await render?.captureScreen?.();
+        if (!blob) throw new HarnessError("cannot see the screen", HarnessErrorCode.UNSUPPORTED);
+        const now = await bitmapPixels(await createImageBitmap(blob));
+        const was = mark;
+        if (now.width !== was.width || now.height !== was.height) {
+            throw new HarnessError(
+                `screen resized between mark and compare (${was.width}x${was.height} -> `
+                + `${now.width}x${now.height}) — nothing can be compared`, HarnessErrorCode.UNSUPPORTED);
+        }
+
+        const allow = (a.allow ?? []).map((r, i) => ({ name: r.name ?? `allow${i}`, ...r, changed: 0 }));
+        const scan = a.within ?? { x: 0, y: 0, w: now.width, h: now.height };
+        const x0 = Math.max(0, scan.x | 0), y0 = Math.max(0, scan.y | 0);
+        const x1 = Math.min(now.width, x0 + (scan.w | 0)), y1 = Math.min(now.height, y0 + (scan.h | 0));
+
+        let changed = 0, outside = 0, compared = 0;
+        let ox0 = Infinity, oy0 = Infinity, ox1 = -Infinity, oy1 = -Infinity;
+        const samples: { x: number; y: number; before: string; after: string }[] = [];
+        for (let y = y0; y < y1; y++) {
+            for (let x = x0; x < x1; x++) {
+                compared++;
+                const i = (y * now.width + x) * 4;
+                if (now.data[i] === was.data[i] && now.data[i + 1] === was.data[i + 1]
+                    && now.data[i + 2] === was.data[i + 2]) continue;
+                changed++;
+                let inAllow = false;
+                for (const r of allow) {
+                    if (x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h) { r.changed++; inAllow = true; }
+                }
+                if (inAllow) continue;
+                outside++;
+                if (x < ox0) ox0 = x;
+                if (y < oy0) oy0 = y;
+                if (x > ox1) ox1 = x;
+                if (y > oy1) oy1 = y;
+                if (samples.length < 8) {
+                    samples.push({
+                        x, y,
+                        before: toHex((was.data[i] << 16 | was.data[i + 1] << 8 | was.data[i + 2]) >>> 0),
+                        after: toHex((now.data[i] << 16 | now.data[i + 1] << 8 | now.data[i + 2]) >>> 0),
+                    });
+                }
+            }
+        }
+        return {
+            screen: { w: now.width, h: now.height }, scanned: { x: x0, y: y0, w: x1 - x0, h: y1 - y0 },
+            compared, changed,
+            allow: allow.map((r) => ({ name: r.name, rect: { x: r.x, y: r.y, w: r.w, h: r.h }, changed: r.changed })),
+            outside: {
+                changed: outside,
+                bbox: outside ? { x: ox0, y: oy0, w: ox1 - ox0 + 1, h: oy1 - oy0 + 1 } : null,
+                samples,
+            },
+            note: changed === 0
+                ? "NOTHING on the screen changed — a scope assertion over this is vacuous"
+                : null,
+        };
+    });
+
+    /**
      * screenRegionHash() — a stable digest of a screen rect, for A -> B -> A
      * identity checks that need no reference image at all: capture, drive a
      * transition, capture again, and an unequal hash means we stamped or erased
