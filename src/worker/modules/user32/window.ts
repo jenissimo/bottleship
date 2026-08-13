@@ -917,12 +917,15 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         if (hWndParent) {
             const parent = windows.get(hWndParent);
             if (parent) {
-                // children[] is front-to-back (index 0 = topmost, see reorderChildInParent),
-                // and CreateWindowEx puts a new window at the TOP of its siblings' Z-order.
-                // Appending inverted that for every CreateWindow-made control: the OLDEST
-                // sibling hit-tested first and, once controls started filling their own
-                // background, painted last — a static's fill wiping its neighbour's text.
-                parent.children.unshift(windowInfo.handle);
+                // children[] is the Z-order sibling list (index 0 = topmost; see
+                // WindowInfo.children). NT xxxCreateWindowEx positions a CHILD at the
+                // BOTTOM of it (createw.c: "Defaultly position child windows at bottom
+                // of their list", overriding even the CBT hook's hwndInsertAfter), so
+                // children come out in CREATION order — which is what makes template
+                // order the tab/WS_GROUP order. An owned popup is not really a sibling
+                // of the owner's children at all (Win32 keeps it in the desktop's list,
+                // above its owner); appending is what puts it above them here.
+                parent.children.push(windowInfo.handle);
                 // A visible plain window gaining its first system control while the
                 // game owns the screen becomes an overlay candidate (controls are
                 // usually created AFTER the parent was shown).

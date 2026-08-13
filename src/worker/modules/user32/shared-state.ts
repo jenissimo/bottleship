@@ -16,6 +16,19 @@ export interface WindowInfo {
     width: number;
     height: number;
     parent?: number;
+    /**
+     * THE Z-ORDER sibling list, front-to-back: children[0] is topmost (GW_CHILD), +1 is
+     * GW_HWNDNEXT. It is the ONLY ordering — Win32 has the sibling list serve as Z-order,
+     * paint order (getChildrenInPaintOrder), hit-test order AND the order the dialog
+     * manager walks for tab stops and WS_GROUP ranges.
+     *
+     * So a new CHILD is APPENDED, whoever creates it: NT puts a child at the bottom of its
+     * parent's list (createw.c, overriding even the CBT hook's hwndInsertAfter), pinned by
+     * Wine's test_children_zorder — creation order == list order, which is what makes a
+     * template's control order the tab/group order. Inserting a child at the front instead
+     * reverses the group/tab walks for that one creator's windows while leaving every other
+     * creator's correct. SetWindowPos Z-order changes go through reorderChildInParent.
+     */
     children: number[];
     visible: boolean;
     wndProc: number;
@@ -251,7 +264,40 @@ export function getChildZOrderSibling(hwnd: number, direction: 'next' | 'prev'):
     return idx > 0 ? parent.children[idx - 1] : 0;
 }
 
-/** Children in paint order: back → front (topmost painted last). */
+/**
+ * The WS_GROUP range around hCtl in its parent's sibling list, in Z-order.
+ *
+ * A group starts at the nearest sibling carrying WS_GROUP at or before hCtl and ends
+ * just before the next one. Both consumers of that range — GetNextDlgGroupItem and
+ * BS_AUTORADIOBUTTON exclusion — must compute it identically (Wine's
+ * BUTTON_CheckAutoRadioButton IS a GetNextDlgGroupItem walk), so it lives here, once.
+ * Boundaries count every sibling including hidden/disabled ones; a caller applies its
+ * own membership filter to what comes back.
+ */
+export function getGroupSiblingRange(parentHwnd: number, hCtl: number): WindowInfo[] {
+    const parent = windows.get(parentHwnd);
+    if (!parent) return [];
+    const siblings = parent.children
+        .map((h) => windows.get(h))
+        .filter((c): c is WindowInfo => !!c);
+    const startIdx = siblings.findIndex((c) => c.handle === hCtl);
+    if (startIdx < 0) return [];
+
+    const WS_GROUP = 0x00020000;
+    let groupStart = 0;
+    for (let i = 0; i <= startIdx; i++) {
+        if ((siblings[i]!.style & WS_GROUP) !== 0) groupStart = i;
+    }
+    let groupEnd = siblings.length;
+    for (let i = startIdx + 1; i < siblings.length; i++) {
+        if ((siblings[i]!.style & WS_GROUP) !== 0) {
+            groupEnd = i;
+            break;
+        }
+    }
+    return siblings.slice(groupStart, groupEnd);
+}
+
 /** True when any direct child is a JS-driven system control. */
 export function hasSystemControlChildren(win: WindowInfo): boolean {
     for (const h of win.children) {
@@ -260,10 +306,19 @@ export function hasSystemControlChildren(win: WindowInfo): boolean {
     return false;
 }
 
+/**
+ * Children in the order Windows paints them: the sibling list from the head, i.e.
+ * TOPMOST FIRST — Wine's server walks parent->children from the front to pick the next
+ * window to send WM_PAINT to (find_child_to_repaint). Siblings do not clip each other
+ * unless they carry WS_CLIPSIBLINGS, so where two overlap the one painted LAST (the
+ * bottom-most, and for controls that means the last created) keeps the pixels. That is
+ * not a painter's-algorithm order and must not be "corrected" into one: overlapping
+ * labels in control_zoo resolve the way native Windows resolves them only in this order.
+ */
 export function getChildrenInPaintOrder(parentHwnd: number): number[] {
     const parent = windows.get(parentHwnd);
     if (!parent) return [];
-    return [...parent.children].reverse();
+    return [...parent.children];
 }
 
 /** LockWindowUpdate: suppress overlay repaint while a subtree is locked. */

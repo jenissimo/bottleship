@@ -12,7 +12,7 @@ import { Mem } from '../../core/memory/mem-accessor';
 import { registerDialogItemExports } from './dialog-items';
 import { registerMessageBoxExports } from './dialog-messagebox';
 import { System } from '../../core/system';
-import { WindowInfo, windows, controlImageHandles, getAbsoluteWindowPosition, getVirtualScreenRect, killWindowTimers, finalizeWindowDestroy, buttonCheckStates, findChildByControlId, isEffectivelyVisible } from './shared-state';
+import { WindowInfo, windows, controlImageHandles, getAbsoluteWindowPosition, getGroupSiblingRange, getVirtualScreenRect, killWindowTimers, finalizeWindowDestroy, buttonCheckStates, findChildByControlId, isEffectivelyVisible } from './shared-state';
 import { validateWindow } from './paint-region';
 import { WH_CBT, HCBT_CREATEWND, getHooksOfType } from './hooks';
 import { parseDlgTemplate, dluToPixelX, dluToPixelY, getDialogBaseUnits, logDlgTemplateDump, ParsedDlgTemplate } from './dialog-template';
@@ -20,7 +20,7 @@ import { findResourceInPE } from '../../modules/kernel32/resource';
 import { loadBitmapFromPeResource, parseResourceNameFromTitle } from '../kernel32/bitmap-extractor';
 import { loadIconFromPeResource } from '../kernel32/icon-extractor';
 import { isGroupBoxSystemControl, hitTestSystemControlAtClient, applyComboBoxClosedHeight } from './controls';
-import { handleSystemControlMouseAtScreen, resetControlInteractionState, takePendingControlNotification } from './control-interaction';
+import { clickAutoButton, handleSystemControlMouseAtScreen, resetControlInteractionState, takePendingControlNotification } from './control-interaction';
 import { noteDialogOverlayCandidate, resolveMouseTargetHwnd, eraseDialogOverlay, registerOverlayPaintRepair } from './dialog-overlay';
 import { paintDialogToOverlay, finalizeDialogPaint, repaintDialogOverlayIfVisible, repaintDialogAfterContentChange } from './dialog-paint';
 import { handleSystemControlMessage, applyStaticSetImageAutoSize, isContentChangingMessage } from './dialog-control-messages';
@@ -109,7 +109,6 @@ const WS_DISABLED = 0x08000000;
 const WS_BORDER = 0x00800000;
 const WS_POPUP = 0x80000000;
 const WS_TABSTOP = 0x00010000;
-const WS_GROUP = 0x00020000;
 const WS_EX_CLIENTEDGE = 0x00000200;
 const WS_EX_NOPARENTNOTIFY = 0x00000004;
 
@@ -260,38 +259,22 @@ function getNextDialogControl(hDlg: number, hCtl: number, previous: boolean, req
 function getNextDialogGroupItem(hDlg: number, hCtl: number, previous: boolean): number {
     const parent = windows.get(hDlg);
     if (!parent) return 0;
-
-    const siblings = parent.children
-        .map((h) => windows.get(h))
-        .filter((c): c is WindowInfo => !!c);
-
-    if (siblings.length === 0) return 0;
+    if (parent.children.length === 0) return 0;
     if (hCtl === hDlg) hCtl = 0;
     // Wine: previous of NULL fails
     if (!hCtl && previous) return 0;
 
     if (!hCtl) {
-        const first = siblings.find((c) => isVisibleEnabledControl(c) && !isGroupBoxSystemControl(c));
-        return first?.handle ?? 0;
-    }
-
-    const startIdx = siblings.findIndex((c) => c.handle === hCtl);
-    if (startIdx < 0) return 0;
-
-    // Group starts at the nearest WS_GROUP at or before startIdx (or 0).
-    let groupStart = 0;
-    for (let i = 0; i <= startIdx; i++) {
-        if ((siblings[i]!.style & WS_GROUP) !== 0) groupStart = i;
-    }
-    let groupEnd = siblings.length;
-    for (let i = startIdx + 1; i < siblings.length; i++) {
-        if ((siblings[i]!.style & WS_GROUP) !== 0) {
-            groupEnd = i;
-            break;
+        // GW_CHILD is children[0]: the topmost sibling, which for a dialog is the first
+        // control the template declared.
+        for (const h of parent.children) {
+            const c = windows.get(h);
+            if (c && isVisibleEnabledControl(c) && !isGroupBoxSystemControl(c)) return c.handle;
         }
+        return 0;
     }
 
-    const group = siblings.slice(groupStart, groupEnd)
+    const group = getGroupSiblingRange(hDlg, hCtl)
         .filter((c) => isVisibleEnabledControl(c) && !isGroupBoxSystemControl(c));
     if (group.length === 0) return 0;
 
@@ -445,7 +428,10 @@ function handleDialogKeyMessage(hDlg: number, message: number, wParam: number): 
                 && (nextWin.systemControlClass ?? '').toLowerCase() === 'button'
                 && (nextWin.style & BS_TYPEMASK) === BS_AUTORADIOBUTTON
                 && (buttonCheckStates.get(next) ?? 0) !== BST_CHECKED) {
-                // Wine: BM_CLICK on autoradio when arrowing into an unchecked one.
+                // Wine: BM_CLICK on autoradio when arrowing into an unchecked one —
+                // the button checks itself and clears its group, THEN the parent hears
+                // BN_CLICKED.
+                clickAutoButton(nextWin);
                 queueDialogCommand(
                     hDlg,
                     ((nextWin.controlId ?? 0) & 0xFFFF) | (BN_CLICKED << 16),

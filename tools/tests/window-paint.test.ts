@@ -22,6 +22,7 @@ import {
     isFullyCoveredByGuestChild,
     getChildZOrderSibling,
     getChildrenInPaintOrder,
+    getGroupSiblingRange,
     setLockWindowUpdate,
     tryLockWindowUpdate,
     getLockWindowUpdate,
@@ -131,8 +132,12 @@ describe('child Z-order helpers', () => {
         windows.set(C, { ...mkWin(C), parent: PARENT });
     });
 
-    test('paint order is back to front', () => {
-        expect(getChildrenInPaintOrder(PARENT)).toEqual([C, B, A]);
+    // Windows sends WM_PAINT down the sibling list from the head (Wine server
+    // find_child_to_repaint), so the TOPMOST child paints first and the bottom-most
+    // last — which is what decides an overlap between siblings that do not carry
+    // WS_CLIPSIBLINGS.
+    test('paint order is the sibling list, topmost first', () => {
+        expect(getChildrenInPaintOrder(PARENT)).toEqual([A, B, C]);
     });
 
     test('SetWindowPos Z-order reorder', () => {
@@ -159,13 +164,58 @@ describe('child Z-order helpers', () => {
     test('HWND_TOP moves child to front', () => {
         reorderChildInParent(A, 0);
         expect(windows.get(PARENT)!.children[0]).toBe(A);
-        expect(getChildrenInPaintOrder(PARENT).at(-1)).toBe(A);
+        expect(getChildrenInPaintOrder(PARENT)[0]).toBe(A);
     });
 
     test('HWND_BOTTOM moves child to back', () => {
         reorderChildInParent(A, 1);
         expect(windows.get(PARENT)!.children.at(-1)).toBe(A);
-        expect(getChildrenInPaintOrder(PARENT)[0]).toBe(A);
+        expect(getChildrenInPaintOrder(PARENT).at(-1)).toBe(A);
+    });
+});
+
+describe('WS_GROUP ranges over the sibling list', () => {
+    const PARENT = 0x11000;
+    const WS_GROUP = 0x00020000;
+    // Creation order, which is also the sibling order: a label, group A (three items),
+    // group B (two items) — control_zoo's radio row.
+    const [LABEL, A1, A2, A3, B1, B2] = [0x11001, 0x11002, 0x11003, 0x11004, 0x11005, 0x11006];
+    const group = (h: number) => getGroupSiblingRange(PARENT, h).map((w) => w.handle);
+
+    beforeEach(() => {
+        windows.clear();
+        const kids = [LABEL, A1, A2, A3, B1, B2];
+        windows.set(PARENT, { ...mkWin(PARENT), children: [...kids] });
+        for (const h of kids) {
+            windows.set(h, {
+                ...mkWin(h), parent: PARENT,
+                style: (h === A1 || h === B1) ? WS_GROUP : 0,
+            });
+        }
+    });
+
+    test('a group runs from its WS_GROUP opener to the next one', () => {
+        expect(group(A1)).toEqual([A1, A2, A3]);
+        expect(group(A3)).toEqual([A1, A2, A3]);
+    });
+
+    test('the last group runs to the end of the list', () => {
+        expect(group(B2)).toEqual([B1, B2]);
+    });
+
+    test('controls before the first WS_GROUP form their own range', () => {
+        expect(group(LABEL)).toEqual([LABEL]);
+    });
+
+    test('an unknown control has no range', () => {
+        expect(group(0xdead)).toEqual([]);
+    });
+
+    // The bug this exists for: with the list reversed, A3's range picks up B1 (the
+    // WS_GROUP that now precedes it) and loses A1.
+    test('a reversed sibling list is what a wrong range looks like', () => {
+        windows.get(PARENT)!.children.reverse();
+        expect(group(A3)).toEqual([B1, A3, A2]);
     });
 });
 

@@ -19,6 +19,7 @@ import {
     getOrCreateListState,
     getOrCreateTrackbarState,
     getAbsoluteWindowPosition,
+    getGroupSiblingRange,
     setCapture,
     releaseCapture,
 } from './shared-state';
@@ -138,7 +139,6 @@ const BS_RADIOBUTTON = 0x0004;
 const BS_3STATE = 0x0005;
 const BS_AUTO3STATE = 0x0006;
 const BS_AUTORADIOBUTTON = 0x0009;
-const WS_GROUP = 0x00020000;
 const BST_UNCHECKED = 0;
 const BST_CHECKED = 1;
 const BST_INDETERMINATE = 2;
@@ -149,32 +149,14 @@ function getButtonType(button: WindowInfo): number {
 
 /**
  * Wine/NT: BS_AUTORADIOBUTTON mutual exclusion is scoped to the WS_GROUP range
- * containing the clicked button (not every radio under the dialog).
+ * containing the clicked button (not every radio under the dialog) — Wine's
+ * BUTTON_CheckAutoRadioButton walks it with GetNextDlgGroupItem, so the range comes
+ * from the same place the dialog manager's walk gets it.
  */
 function getAutoradioGroupSiblings(parentHwnd: number, button: WindowInfo): WindowInfo[] {
-    const parent = windows.get(parentHwnd);
-    if (!parent) return [button];
-
-    const siblings = parent.children
-        .map((h) => windows.get(h))
-        .filter((c): c is WindowInfo => !!c);
-    const startIdx = siblings.findIndex((c) => c.handle === button.handle);
-    if (startIdx < 0) return [button];
-
-    let groupStart = 0;
-    for (let i = 0; i <= startIdx; i++) {
-        if ((siblings[i]!.style & WS_GROUP) !== 0) groupStart = i;
-    }
-    let groupEnd = siblings.length;
-    for (let i = startIdx + 1; i < siblings.length; i++) {
-        if ((siblings[i]!.style & WS_GROUP) !== 0) {
-            groupEnd = i;
-            break;
-        }
-    }
-
-    return siblings.slice(groupStart, groupEnd).filter((s) =>
-        isButtonSystemControl(s) && getButtonType(s) === BS_AUTORADIOBUTTON);
+    const group = getGroupSiblingRange(parentHwnd, button.handle)
+        .filter((s) => isButtonSystemControl(s) && getButtonType(s) === BS_AUTORADIOBUTTON);
+    return group.length ? group : [button];
 }
 
 /** One BM_SETCHECK, recording the button only when the state really moved. */
@@ -221,6 +203,19 @@ export function applyAutoButtonState(parentHwnd: number, button: WindowInfo): nu
             setCheckState(sibling, sibling.handle === button.handle ? BST_CHECKED : BST_UNCHECKED, changed);
         }
     }
+    return changed;
+}
+
+/**
+ * BM_CLICK's own half: the auto state transition plus the repaint of whatever moved.
+ * Wine's dialog manager arrows into an unchecked auto-radio by SENDING BM_CLICK to the
+ * control, so the button's state changes before the parent ever sees BN_CLICKED — the
+ * notification alone leaves the group unchanged. Returns the buttons that moved.
+ */
+export function clickAutoButton(button: WindowInfo): number[] {
+    const parentHwnd = button.parent ?? 0;
+    const changed = applyAutoButtonState(parentHwnd, button);
+    if (changed.length) repaintHost(button, parentHwnd, changed);
     return changed;
 }
 
