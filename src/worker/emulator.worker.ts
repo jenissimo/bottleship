@@ -103,6 +103,7 @@ import { TimeService } from "./runtime/time";
 import { resolveMessageBox } from "./runtime/dialog-bridge";
 import { Logger, LogLevel, LogCategory } from "./core/logger";
 import { recordGpuError, resetGpuErrors } from "./core/gpu-error-log";
+import { resetDeviceLossContract } from "./core/gpu/gpu-device-loss-contract";
 import { createStreamingWasmLoader } from "./core/wasm-loader";
 import { WebGPUBackend } from "./backends/webgpu/webgpu-backend";
 import { profiler } from "./core/profiler";
@@ -1370,6 +1371,8 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
   // Scope the GPU-error census to this run, so report().gpuErrors answers "this game",
   // not "everything since the worker started".
   resetGpuErrors();
+  // A previous run's lost devices/surfaces are not this run's state.
+  resetDeviceLossContract();
 
   await prepareFullGameSwitch();
 
