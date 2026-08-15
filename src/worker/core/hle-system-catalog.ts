@@ -65,6 +65,7 @@ export const HLE_IMAGE_SLOT: Record<string, number> = {
     riched32: 32,
     wtsapi32: 33,
     lgvid: 34,
+    msacm32: 35,
 };
 
 /** Slots past the pinned block, handed to APIRegistry-only modules in sorted order. */
