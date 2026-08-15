@@ -1897,7 +1897,15 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
       // ("C:\" + "\RF.exe"); the archive has no such entry, so normalize before lookup.
       const rel = pendingReExecImage
         .replace(/^[a-z]:/i, "").replace(/\\/g, "/").replace(/\/+/g, "/").replace(/^\//, "");
-      const candidate = romRoot ? `${romRoot.replace(/\/+$/, "")}/${rel}` : rel;
+      let candidate = romRoot ? `${romRoot.replace(/\/+$/, "")}/${rel}` : rel;
+      // Win32 paths are case-insensitive and a launcher spells its target however it
+      // likes ("war3demo.exe" for an archive entry named "War3Demo.exe"); the archive
+      // index is a case-SENSITIVE map, so match the entry the guest means.
+      if (!bundle.archive.getEntry(candidate)) {
+        const lower = candidate.toLowerCase();
+        const match = bundle.archive.listEntries().find((e) => e.name.toLowerCase() === lower);
+        if (match) candidate = match.name;
+      }
       const found = !!bundle.archive.getEntry(candidate);
       // Parked where a probe can read it: this decision is made during the load firehose,
       // and log streaming does not survive the page reload that precedes it.

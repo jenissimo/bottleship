@@ -30,6 +30,18 @@ export function resetCommandLineState(): void {
     lastExeName = "";
 }
 
+/**
+ * The command line the guest sees: "argv0 args", with argv[0] QUOTED when it contains a
+ * space, as every real producer of a command line does. Unquoted, argv[0] ends at the
+ * first space — and an app that strips its own argv[0] to build a child's command line
+ * then keeps the tail as an argument forever — a launcher whose own name has a space
+ * re-execs itself in a loop, with the command line growing on every restart.
+ */
+export function buildGuestCommandLine(exeName: string, args: string): string {
+    const argv0 = /\s/.test(exeName) ? `"${exeName}"` : exeName;
+    return args ? `${argv0} ${args}` : argv0;
+}
+
 function initCommandLine(mem: Uint8Array): void {
     const system = System.getInstance();
     const exeName = system.executableName;
@@ -41,10 +53,7 @@ function initCommandLine(mem: Uint8Array): void {
     ensureCommandLineAllocated();
     if (!cmdLineAddrA || !cmdLineAddrW) return;
 
-    // ANSI version: "exeName args" (Windows GetCommandLineA returns full command line)
-    const cmdLineA = system.executableArgs
-        ? `${exeName} ${system.executableArgs}`
-        : exeName;
+    const cmdLineA = buildGuestCommandLine(exeName, system.executableArgs);
     const cmdLineABytes = encodeAnsi(cmdLineA);
     const cmdLineACopy = Math.min(cmdLineABytes.length, CMD_LINE_BUF_SIZE - 1);
     mem.set(cmdLineABytes.subarray(0, cmdLineACopy), cmdLineAddrA);

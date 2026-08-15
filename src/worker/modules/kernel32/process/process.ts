@@ -348,7 +348,7 @@ const readNullableProcessString = (memory: Uint8Array, ptr: number, isWide: bool
 };
 
 /** argv[0] of a Win32 command line: a quoted run, else up to the first space. */
-const firstCommandLineToken = (commandLine: string): string => {
+export const firstCommandLineToken = (commandLine: string): string => {
     const s = commandLine.trimStart();
     if (s.startsWith('"')) {
         const end = s.indexOf('"', 1);
@@ -359,7 +359,7 @@ const firstCommandLineToken = (commandLine: string): string => {
 };
 
 /** Everything after argv[0] — the arguments the re-executed image should receive. */
-const stripFirstCommandLineToken = (commandLine: string): string => {
+export const stripFirstCommandLineToken = (commandLine: string): string => {
     const s = commandLine.trimStart();
     if (s.startsWith('"')) {
         const end = s.indexOf('"', 1);
