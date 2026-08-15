@@ -10,6 +10,7 @@ import { allocateComObject } from "../core/com/com-memory";
 import { installComVtable, ComVtableMethod } from "../core/com/install-com-vtable";
 import { tryInprocCoCreateInstance, startInprocFromFactory } from "../core/com/inproc-com";
 import { Mem } from "../core/memory/mem-accessor";
+import { readGuidFromMem } from "../core/com/typelib/typelib-types";
 import { writeGuestCode } from "../core/memory/guest-code";
 import { MEM_THUNK_CODE_BASE, MEM_THUNK_CODE_SIZE } from "../core/cpu/emulator-config";
 
@@ -21,6 +22,11 @@ const S_FALSE = 0x00000001;
 const E_POINTER = 0x80004003;
 const E_INVALIDARG = 0x80070057;
 const CO_E_NOTLOADED = 0x800401f0;
+const E_NOINTERFACE = 0x80004002;
+
+// The only two interfaces the task allocator answers for (readGuidFromMem spelling).
+const IID_IUNKNOWN = "00000000-0000-0000-c000-000000000046";
+const IID_IMALLOC = "00000002-0000-0000-c000-000000000046";
 
 // BLOWFISH.DLL IBlockCipher::Submit_Key — stdcall, max 56-byte key (Ghidra @ 0x11002011)
 const BF_MAX_KEY_LEN = 0x38;
@@ -37,6 +43,8 @@ export class Ole32 implements IModule {
     private guidCounter = 1;
     private blowfishInstances: Map<number, BlowfishState> = new Map(); // objAddr -> state
     private blowfishVtableAddr = 0;
+    private mallocObjAddr = 0;                          // the process-wide IMalloc singleton
+    private taskMemSizes = new Map<number, number>();   // task-allocator block sizes (GetSize/DidAlloc/Realloc)
     private classRegistrations = new Map<number, { clsid: string; punk: number; flags: number }>();
     private nextClassRegistration = 0x1000;
     private messageFilter = 0;
@@ -269,11 +277,20 @@ export class Ole32 implements IModule {
         };
 
         // LPVOID CoTaskMemAlloc(SIZE_T cb)
-        this.exports["CoTaskMemAlloc"] = (ctx, mem, args) => {
-            const cb = args[0] >>> 0;
-            if (cb === 0) return 0;
-            const ptr = System.getInstance().process?.memory?.alloc(cb);
-            return ptr ? (ptr >>> 0) : 0;
+        this.exports["CoTaskMemAlloc"] = (ctx, mem, args) => this.taskMemAlloc(args[0] >>> 0);
+
+        // HRESULT CoGetMalloc(DWORD dwMemContext, LPMALLOC *ppMalloc)
+        // The task allocator IS the one behind CoTaskMemAlloc, so a caller that
+        // takes this interface and one that calls the flat API share memory.
+        this.exports["CoGetMalloc"] = (ctx, mem, args) => {
+            const dwMemContext = args[0] >>> 0;
+            const ppMalloc = args[1] >>> 0;
+            if (!ppMalloc) return E_INVALIDARG;
+            if (dwMemContext !== 1 /* MEMCTX_TASK */) return E_INVALIDARG;
+            const obj = this.ensureTaskMalloc(mem);
+            if (!obj) return 0x8007000e; // E_OUTOFMEMORY
+            Mem.writeUint32(ppMalloc, obj);
+            return S_OK;
         };
 
         // void CoTaskMemFree(LPVOID pv)
@@ -566,6 +583,102 @@ export class Ole32 implements IModule {
             Logger.verbose(LogCategory.COM, `PropVariantClear(0x${pvar.toString(16)}) vt=0x${vt.toString(16)}`);
             return S_OK;
         };
+    }
+
+    /** The task allocator behind both CoTaskMemAlloc and IMalloc::Alloc. */
+    private taskMemAlloc(cb: number): number {
+        if (cb === 0) return 0;
+        const ptr = System.getInstance().process?.memory?.alloc(cb);
+        if (!ptr) return 0;
+        this.taskMemSizes.set(ptr >>> 0, cb);
+        return ptr >>> 0;
+    }
+
+    /**
+     * The process-wide IMalloc (CoGetMalloc / SHGetMalloc). One singleton, as on
+     * Windows: callers compare the pointer, and DidAlloc must be able to answer
+     * for anything this allocator handed out.
+     */
+    private ensureTaskMalloc(mem: Uint8Array): number {
+        if (this.mallocObjAddr) return this.mallocObjAddr;
+
+        const handlers: Record<string, ThunkImplementation> = {
+            Malloc_QueryInterface: (ctx, mem, args) => {
+                const riid = args[1] >>> 0;
+                const ppv = args[2] >>> 0;
+                if (!ppv) return E_POINTER;
+                // IUnknown and IMalloc are the only interfaces this object has, and both
+                // are answered by the same pointer. Answering S_OK for anything else hands
+                // back an IMalloc vtable under another interface's name — the caller then
+                // calls slot N of an interface this object does not implement.
+                const iid = riid ? readGuidFromMem(mem, riid) : "";
+                if (iid !== IID_IUNKNOWN && iid !== IID_IMALLOC) {
+                    Mem.writeUint32(ppv, 0);
+                    return E_NOINTERFACE;
+                }
+                Mem.writeUint32(ppv, this.mallocObjAddr);
+                return S_OK;
+            },
+            // A process-lifetime singleton: refcounting it would let a guest's
+            // last Release free the allocator every other caller still holds.
+            Malloc_AddRef: () => 1,
+            Malloc_Release: () => 1,
+            Malloc_Alloc: (ctx, mem, args) => this.taskMemAlloc(args[1] >>> 0),
+            Malloc_Realloc: (ctx, mem, args) => {
+                const pv = args[1] >>> 0;
+                const cb = args[2] >>> 0;
+                if (!pv) return this.taskMemAlloc(cb);
+                if (cb === 0) return 0; // Realloc(pv, 0) frees and returns NULL
+                const oldSize = this.taskMemSizes.get(pv);
+                if (oldSize !== undefined && oldSize >= cb) return pv;
+                const next = this.taskMemAlloc(cb);
+                if (!next) return 0;
+                // An UNTRACKED block (handed out by another path, e.g. a PIDL) has no known
+                // size: copy the full new size rather than nothing. Realloc must preserve
+                // the old contents; bytes past the old end are indeterminate either way,
+                // whereas copying zero bytes silently empties the caller's data.
+                const bytes = Mem.readBytes(pv, oldSize === undefined ? cb : Math.min(oldSize, cb));
+                if (bytes) Mem.writeBytes(next, bytes);
+                return next;
+            },
+            // Free is a no-op for the same reason CoTaskMemFree is: the allocator
+            // does not track individual small blocks for reuse.
+            Malloc_Free: () => 0,
+            Malloc_GetSize: (ctx, mem, args) => {
+                const pv = args[1] >>> 0;
+                const size = this.taskMemSizes.get(pv);
+                return size === undefined ? 0xffffffff : size; // (SIZE_T)-1 == unknown
+            },
+            Malloc_DidAlloc: (ctx, mem, args) => {
+                const pv = args[1] >>> 0;
+                if (!pv) return 0xffffffff; // -1 == cannot tell
+                return this.taskMemSizes.has(pv) ? 1 : 0;
+            },
+            Malloc_HeapMinimize: () => 0,
+        };
+
+        const methods: ComVtableMethod[] = [
+            { name: "Malloc_QueryInterface", argCount: 3, stackCleanupBytes: 12 },
+            { name: "Malloc_AddRef", argCount: 1, stackCleanupBytes: 4 },
+            { name: "Malloc_Release", argCount: 1, stackCleanupBytes: 4 },
+            { name: "Malloc_Alloc", argCount: 2, stackCleanupBytes: 8 },
+            { name: "Malloc_Realloc", argCount: 3, stackCleanupBytes: 12 },
+            { name: "Malloc_Free", argCount: 2, stackCleanupBytes: 8 },
+            { name: "Malloc_GetSize", argCount: 2, stackCleanupBytes: 8 },
+            { name: "Malloc_DidAlloc", argCount: 2, stackCleanupBytes: 8 },
+            { name: "Malloc_HeapMinimize", argCount: 1, stackCleanupBytes: 4 },
+        ];
+
+        const installed = installComVtable(this.process, {
+            moduleName: "ole32_imalloc",
+            methods,
+            handlers,
+            logLabel: "IMalloc",
+        });
+        if (!installed) return 0;
+
+        this.mallocObjAddr = allocateComObject(this.process.memory, mem, installed.vtableAddr);
+        return this.mallocObjAddr;
     }
 
     /**
@@ -1166,6 +1279,11 @@ export class Ole32 implements IModule {
         this.nextClassRegistration = 0x1000;
         this.blowfishInstances.clear();
         this.blowfishVtableAddr = 0;
+        // The IMalloc singleton lives in THUNK_CODE/heap that reset rewinds; keeping its
+        // address would hand the next process a vtable pointer into rewound memory, and
+        // the block sizes would answer GetSize/DidAlloc for a dead address space.
+        this.mallocObjAddr = 0;
+        this.taskMemSizes.clear();
         this.messageFilter = 0;
         this.iunknownStubs = null;
         this.guidState = 0xa341316c;

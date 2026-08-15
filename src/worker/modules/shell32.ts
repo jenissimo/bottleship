@@ -522,6 +522,21 @@ export class Shell32 implements IModule {
             return 1; // TRUE
         };
 
+        // HRESULT SHGetMalloc(LPMALLOC *ppMalloc) — documented as CoGetMalloc with
+        // MEMCTX_TASK, so it must hand back the SAME allocator: the shell frees
+        // with it what ole32 allocated (PIDLs), and two allocators would corrupt.
+        this.exports["SHGetMalloc"] = (ctx, mem, args) => {
+            const ppMalloc = args[0] >>> 0;
+            if (!ppMalloc) return 0x80004003; // E_POINTER
+            const ole32 = process.getModule("ole32");
+            const coGetMalloc = ole32?.exports?.["CoGetMalloc"];
+            if (!coGetMalloc) {
+                Mem.writeUint32(ppMalloc, 0);
+                return 0x80004005; // E_FAIL
+            }
+            return coGetMalloc(ctx, mem, [1 /* MEMCTX_TASK */, ppMalloc]) as ThunkResult;
+        };
+
         // SHGetSpecialFolderPathA - get path for special folder
         this.exports["SHGetSpecialFolderPathA"] = (ctx, mem, args) => {
             const hwnd = args[0] >>> 0;

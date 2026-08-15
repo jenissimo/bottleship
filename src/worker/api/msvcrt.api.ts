@@ -159,6 +159,7 @@ export const msvcrtModule: ModuleDescriptor = {
         makeThiscall("??1type_info@@UAE@XZ", 0),
         makeThiscall("??8type_info@@QBEHABV0@@Z", 4),
         makeThiscall("?name@type_info@@QBEPBDXZ", 0),
+        makeThiscall("?raw_name@type_info@@QBEPBDXZ", 0),
         makeFunc("_open", 2),
         makeFunc("_sopen", 4),
         makeFunc("_close", 1),
@@ -291,6 +292,7 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("fgetc", 1),
         makeFunc("getc", 1),
         makeFunc("fputc", 2),
+        makeFunc("putc", 2),
         makeFunc("ungetc", 2),
         makeFunc("strerror", 1),
 
@@ -394,6 +396,7 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("vfprintf", 3),
         makeFunc("fscanf", 16),
         makeFunc("setbuf", 2),
+        makeFunc("setvbuf", 4),
         makeFunc("_CIatan", 0),
         makeFunc("_controlfp_s", 3),
         makeFunc("memchr", 3),
@@ -402,6 +405,7 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("_gcvt", 4),   // double occupies two stack dwords + ndec + buf
         makeFunc("_ismbblead", 1),
         makeFunc("localtime", 1),
+        makeFunc("ctime", 1),
         makeFunc("clearerr", 1),
         makeFunc("_clearerr", 1),
         makeFunc("_open_osfhandle", 2),

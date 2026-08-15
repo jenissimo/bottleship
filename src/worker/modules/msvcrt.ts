@@ -24,11 +24,11 @@ import { ensureNativeQsort } from "./crt-qsort";
 import { ensureNativeCBsearch } from "./crt-cbsearch";
 import { LARGE_IO_TRACE_ENABLED, traceLargeRead } from "../core/diagnostics/large-io-trace";
 import { registerVc9AbiExports } from "./crt-vc9-abi";
-import { registerVc9IoExports, fillStatStruct, STAT32_OFFSETS } from "./crt-vc9-io";
+import { registerVc9IoExports, resetVc9TimeStatics, fillStatStruct, STAT32_OFFSETS } from "./crt-vc9-io";
 import { registerVc9SehExports } from "./crt-vc9-seh";
 import { registerVc9SetjmpExports } from "./crt-vc9-setjmp";
 import { registerCrtMathExports } from "./crt-math";
-import { registerCrtTimeExports } from "./crt-time";
+import { registerCrtTimeExports, resetCrtTimeStatics } from "./crt-time";
 import { registerCrtStringExports } from "./crt-string";
 import { registerCrtMbExports } from "./crt-mb";
 import { registerCrtConvExports } from "./crt-conv";
@@ -173,6 +173,7 @@ export class Msvcrt implements IModule {
     private acmdlnVarAddr = 0;   // 4-byte pointer-to-string: *acmdlnVarAddr → acmdlnAddr (string data)
     private adjustFdivAddr = 0;  // 4-byte int variable (value 0 = no FDIV bug)
     private encodedNullAddr = 0; // VC9 _encoded_null DATA export (encoded NULL pointer cookie)
+    private hugeValAddr = 0;     // _HUGE DATA export (8-byte double, DBL_MAX)
     private qsortCodeAddr = 0;
     private bsearchCodeAddr = 0;
     private readonly crtAllocations = new Map<number, number>();
@@ -516,6 +517,7 @@ export class Msvcrt implements IModule {
         exports["fgetc"] = (ctx, mem, args) => this.fgetc(args[0] ?? 0);
         exports["getc"] = exports["fgetc"];
         exports["fputc"] = (ctx, mem, args) => this.fputc(args[0] ?? 0, args[1] ?? 0);
+        exports["putc"] = exports["fputc"];
         exports["ungetc"] = (ctx, mem, args) => this.ungetc(args[0] ?? 0, args[1] ?? 0);
         exports["strerror"] = (ctx, mem, args) => this.strerror(args[0] ?? 0);
 
@@ -624,6 +626,13 @@ export class Msvcrt implements IModule {
             dv.setUint32(self + 4, ptr, true);
             return ptr;
         };
+        // raw_name() is the DECORATED name at +8, returned as-is — name()'s
+        // undecorated cache at +4 is a different string and must not be reused.
+        exports["?raw_name@type_info@@QBEPBDXZ"] = (ctx, mem, _args) => {
+            const self = ctx.ecx >>> 0;
+            if (!self || self + 12 > mem.length) return 0;
+            return (self + 8) >>> 0;
+        };
         exports["??8type_info@@QBEHABV0@@Z"] = (ctx, _mem, args) => {
             const lhs = ctx.ecx >>> 0;
             const rhs = args[0] ?? 0;
@@ -717,6 +726,9 @@ export class Msvcrt implements IModule {
 
     reregisterExports(_process: Process): void {
         // Zero addresses so ensureRuntimeStorage re-allocates after reset freed the memory
+        // — including the CRT's static time scratch, which lives in other modules.
+        resetCrtTimeStatics();
+        resetVc9TimeStatics();
         this.errnoAddr = 0;
         this.pctypeVarAddr = 0;
         this.pctypeTableAddr = 0;
@@ -742,6 +754,7 @@ export class Msvcrt implements IModule {
         this.osVerVarsAddr = 0;
         this.acmdlnVarAddr = 0;
         this.adjustFdivAddr = 0;
+        this.hugeValAddr = 0;
         this.qsortCodeAddr = 0;
         this.bsearchCodeAddr = 0;
         this.localeAddr = 0;
@@ -934,6 +947,18 @@ export class Msvcrt implements IModule {
             Mem.writeUint32(this.adjustFdivAddr, 0);
         }
         tg.registerDataExport("msvcrt", "_adjust_fdiv", this.adjustFdivAddr);
+
+        // _HUGE: the double the CRT exports as data (math.h: #define HUGE_VAL _HUGE) —
+        // math code compares results against it (overflow test) and reads it, never calls
+        // it. MSVC's value is +infinity, NOT DBL_MAX: our own math handlers return JS
+        // Infinity on overflow, so DBL_MAX here makes `result == HUGE_VAL` — the standard
+        // overflow test — silently false forever.
+        if (this.hugeValAddr === 0) {
+            this.hugeValAddr = this.process.memory.alloc(8, "THUNK_DATA", "rw");
+            Mem.writeUint32(this.hugeValAddr, 0x00000000);      // +INF = 0x7FF00000_00000000
+            Mem.writeUint32(this.hugeValAddr + 4, 0x7ff00000);
+        }
+        tg.registerDataExport("msvcrt", "_HUGE", this.hugeValAddr);
 
         // _environ aliases: exported CRT environment pointer.
         tg.registerDataExport("msvcrt", "_environ", this.environVarAddr);

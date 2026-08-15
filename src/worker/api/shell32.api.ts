@@ -36,6 +36,7 @@ export const shell32Module: ModuleDescriptor = {
         makeFunc("SHGetSpecialFolderLocation", 3), // hwnd, csidl, ppidl
         makeFunc("SHGetPathFromIDListA", 2), // pidl, pszPath
         makeFunc("SHGetPathFromIDListW", 2), // pidl, pszPath
+        makeFunc("SHGetMalloc", 1),
         makeFunc("SHGetSpecialFolderPathA", 4), // hwnd, pszPath, csidl, fCreate
         makeFunc("SHGetSpecialFolderPathW", 4), // hwnd, pszPath, csidl, fCreate
         makeFunc("SHAppBarMessage", 2), // dwMessage, pData

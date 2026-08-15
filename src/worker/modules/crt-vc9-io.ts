@@ -8,6 +8,7 @@ import type { VfsEntry, VfsFileHandle } from "../runtime/filesystem/vfs";
 import type { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 import { getCPU } from "../core/thunking/thunk-utils";
 import { ArrayVaListReader, scanCLazy } from "./crt-format";
+import { formatAsctime } from "./crt-time";
 
 export interface Vc9IoHost {
     process: { v86: unknown };
@@ -228,7 +229,19 @@ function fillStat32(structPtr: number, size: number, isDir: boolean, host: Vc9Io
     fillStatStruct(structPtr, STAT32_OFFSETS, 36, size, isDir, host.memset.bind(host));
 }
 
+/**
+ * asctime's string scratch and _localtime64's struct tm are SEPARATE statics, as
+ * in the real CRT: asctime(localtime(t)) is a legal call, and one shared buffer
+ * has the formatted text land on top of the tm being read.
+ */
 let asctimeBuf = 0;
+let localtime64Buf = 0;
+
+/** Both live in memory Process.reset() rewinds — forget them with it (see crt-time). */
+export function resetVc9TimeStatics(): void {
+    asctimeBuf = 0;
+    localtime64Buf = 0;
+}
 
 export function registerVc9IoExports(exports: Record<string, ThunkImplementation>, host: Vc9IoHost): void {
     /** Path stat shared by every by-name variant: a directory is a legal stat target. */
@@ -420,10 +433,10 @@ export function registerVc9IoExports(exports: Record<string, ThunkImplementation
         const hi = Mem.readUint32(timePtr + 4) ?? 0;
         const secs = lo + hi * 0x100000000;
         const date = new Date(secs * 1000);
-        if (!asctimeBuf) {
-            asctimeBuf = host.malloc(36);
+        if (!localtime64Buf) {
+            localtime64Buf = host.malloc(36);
         }
-        const buf = asctimeBuf;
+        const buf = localtime64Buf;
         Mem.writeUint32(buf + 0, date.getSeconds());
         Mem.writeUint32(buf + 4, date.getMinutes());
         Mem.writeUint32(buf + 8, date.getHours());
@@ -447,8 +460,8 @@ export function registerVc9IoExports(exports: Record<string, ThunkImplementation
         const min = Mem.readUint32(tmPtr + 4) ?? 0;
         const sec = Mem.readUint32(tmPtr + 0) ?? 0;
         const year = (Mem.readUint32(tmPtr + 20) ?? 0) + 1900;
-        const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-        const text = `${months[mon] ?? "???"} ${String(mday).padStart(2, " ")} ${String(hour).padStart(2, "0")}:${String(min).padStart(2, "0")}:${String(sec).padStart(2, "0")} ${year}\n`;
+        const wday = Mem.readUint32(tmPtr + 24) ?? 0;
+        const text = formatAsctime(wday, mon, mday, hour, min, sec, year);
         if (!asctimeBuf) asctimeBuf = host.malloc(32);
         host.writeCString(asctimeBuf, text);
         return asctimeBuf >>> 0;

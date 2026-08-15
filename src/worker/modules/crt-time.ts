@@ -4,8 +4,8 @@
  *
  * Coupling to Msvcrt is only via CrtTimeHost: v86 handle (difftime returns via
  * the FPU), process allocator (gmtime's static struct-tm scratch), and the
- * string/word writers. The gmtime scratch buffer lives in this register call's
- * closure (one per registration). These CRT entry points are wall-clock
+ * string/word writers. The scratch buffers are module statics, reset with the
+ * process (resetCrtTimeStatics). These CRT entry points are wall-clock
  * (Date.now()/new Date()).
  */
 
@@ -22,10 +22,47 @@ export interface CrtTimeHost {
     writeWString(ptr: number, value: string, maxChars?: number): void;
 }
 
-export function registerCrtTimeExports(exports: Record<string, ThunkImplementation>, host: CrtTimeHost): void {
-    // Lazily-allocated struct tm scratch returned by gmtime (per-registration).
-    let gmtimeBuf = 0;
+const WDAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
+/**
+ * asctime's fixed 26-character form: "Www Mmm dd hh:mm:ss yyyy\n\0". The
+ * weekday is part of it — callers that parse the result by COLUMN read garbage
+ * without it, and ctime is specified as asctime(localtime(t)).
+ */
+export function formatAsctime(
+    wday: number,
+    mon: number,
+    mday: number,
+    hour: number,
+    min: number,
+    sec: number,
+    year: number,
+): string {
+    const hh = String(hour).padStart(2, "0");
+    const mm = String(min).padStart(2, "0");
+    const ss = String(sec).padStart(2, "0");
+    return `${WDAY_NAMES[wday] ?? "???"} ${MONTH_NAMES[mon] ?? "???"} ${String(mday).padStart(2, " ")} ${hh}:${mm}:${ss} ${year}\n`;
+}
+
+/**
+ * The CRT's static scratch buffers (the struct tm gmtime/localtime return, the string
+ * ctime returns). They live in guest memory that Process.reset() rewinds, so they must
+ * be forgotten with it — a kept address would have the next process's ctime write into
+ * whatever now owns those bytes. Cleared via resetCrtTimeStatics from msvcrt's
+ * reregisterExports, since registration itself does not run again.
+ */
+let gmtimeBuf = 0;
+let localtimeBuf = 0;
+let ctimeBuf = 0;
+
+export function resetCrtTimeStatics(): void {
+    gmtimeBuf = 0;
+    localtimeBuf = 0;
+    ctimeBuf = 0;
+}
+
+export function registerCrtTimeExports(exports: Record<string, ThunkImplementation>, host: CrtTimeHost): void {
     exports["time"] = (_c, _m, a) => {
         const ptr = a[0] ?? 0;
         const seconds = Math.floor(Date.now() / 1000) >>> 0;
@@ -67,9 +104,6 @@ export function registerCrtTimeExports(exports: Record<string, ThunkImplementati
         return 0;
     };
 
-    // Lazily-allocated struct tm scratch returned by localtime (per-registration).
-    let localtimeBuf = 0;
-
     exports["localtime"] = (_c, _m, a) => {
         const timePtr = a[0] ?? 0;
         if (!timePtr) return 0;
@@ -91,6 +125,23 @@ export function registerCrtTimeExports(exports: Record<string, ThunkImplementati
         Mem.writeUint32(buf + 28, yday);
         Mem.writeUint32(buf + 32, 0);
         return buf >>> 0;
+    };
+
+    // ctime's scratch is NOT the localtime struct-tm buffer: ctime is
+    // asctime(localtime(t)), so one shared buffer would have the text overwrite the
+    // tm it was formatted from.
+    exports["ctime"] = (_c, _m, a) => {
+        const timePtr = a[0] ?? 0;
+        if (!timePtr) return 0;
+        const seconds = Mem.readUint32(timePtr) ?? 0;
+        const date = new Date(seconds * 1000);
+        if (Number.isNaN(date.getTime())) return 0;
+        if (!ctimeBuf) ctimeBuf = host.process.memory.alloc(32, "THUNK_DATA", "rw");
+        host.writeCString(
+            ctimeBuf,
+            formatAsctime(date.getDay(), date.getMonth(), date.getDate(), date.getHours(), date.getMinutes(), date.getSeconds(), date.getFullYear()),
+        );
+        return ctimeBuf >>> 0;
     };
 
     exports["gmtime"] = (_c, _m, a) => {
