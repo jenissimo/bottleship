@@ -24,6 +24,8 @@
 
 let _lastBuffer: ArrayBufferLike | null = null;
 let _lastPlain: Uint8Array | null = null;
+/** The exact object `_lastPlain` was derived from — see the fast path in toPlainGuestMemory. */
+let _lastRaw: Uint8Array | null = null;
 
 /** Bumped on every borrow. The dispatcher samples it around each thunk to tell a slow
  *  thunk that DID ask for a fast view from one that indexed the Proxy per element —
@@ -47,7 +49,7 @@ let _bypass = false;
  */
 export function setGuestMemoryBorrowBypass(enabled: boolean): void {
     _bypass = enabled;
-    if (enabled) { _lastBuffer = null; _lastPlain = null; }
+    if (enabled) { _lastBuffer = null; _lastPlain = null; _lastRaw = null; }
 }
 
 export function isGuestMemoryBorrowBypassed(): boolean {
@@ -58,6 +60,14 @@ export function toPlainGuestMemory<T extends Uint8Array | null | undefined>(raw:
     _borrows++;
     if (_bypass) return raw;
     if (!raw) return raw;
+    // FAST PATH — no proxy trap. Both property reads below are `get` traps (and
+    // `.constructor` allocates a fresh `Uint8Array.bind(view)` per call), which on the
+    // busiest guest-memory entry point in the worker is the cost this module exists to
+    // remove. Identity alone proves nothing — the proxy outlives growth — so the freshness
+    // test is `_lastPlain.byteLength`, read trap-free off the PLAIN view: growth detaches
+    // the old (non-shared) ArrayBuffer, so "still attached" is the buffer-identity test the
+    // slow path performs.
+    if (raw === _lastRaw && _lastPlain !== null && _lastPlain.byteLength !== 0) return _lastPlain as T;
     // Already a canonical Uint8Array (non-proxy / post-fix steady state) — nothing to do.
     if (raw.constructor === Uint8Array) return raw;
     const buffer = raw.buffer; // proxy get → the CURRENT (possibly just-grown) ArrayBuffer
@@ -69,6 +79,9 @@ export function toPlainGuestMemory<T extends Uint8Array | null | undefined>(raw:
     const plain = new Uint8Array(buffer, raw.byteOffset, raw.length);
     _lastBuffer = buffer;
     _lastPlain = plain;
+    // Armed only where the view is derived: the fast path above then answers for exactly
+    // the object whose offset/length `plain` was built from.
+    _lastRaw = raw;
     return plain as T;
 }
 

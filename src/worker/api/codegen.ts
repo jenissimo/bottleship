@@ -20,6 +20,7 @@ import { System } from "../core/system";
 import { Logger, LogCategory } from "../core/logger";
 import { EmulatorConfig, getCodePageDecoder } from "../core/emulator-config-manager";
 import { asBufferSource } from "../../dom-buffer";
+import { toPlainGuestMemory } from "../core/memory/guest-memory";
 
 export interface StubSpec {
     name: string;
@@ -386,8 +387,12 @@ function generateParamMarshaler(param: ParameterDescriptor, argIndex: number): s
  */
 export function readString(mem: Uint8Array, ptr: number): string {
     if (ptr === 0) return "";
+    // A thunk's `mem` is v86's Proxy; scanning it per byte (and re-reading `.length`
+    // through the trap each iteration) is the slow arm this normalizer exists for.
+    mem = toPlainGuestMemory(mem);
+    const len = mem.length;
     let end = ptr;
-    while (mem[end] !== 0 && end < mem.length) end++;
+    while (mem[end] !== 0 && end < len) end++;
     return getCodePageDecoder(EmulatorConfig.getInstance().ansiCodePage)
         .decode(asBufferSource(mem.subarray(ptr, end)));
 }
@@ -397,9 +402,11 @@ export function readString(mem: Uint8Array, ptr: number): string {
  */
 export function readWideString(mem: Uint8Array, ptr: number): string {
     if (ptr === 0) return "";
+    mem = toPlainGuestMemory(mem);
     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+    const stop = mem.length - 1;
     let end = ptr;
-    while (end < mem.length - 1 && view.getUint16(end, true) !== 0) {
+    while (end < stop && view.getUint16(end, true) !== 0) {
         end += 2;
     }
     return new TextDecoder("utf-16le").decode(mem.subarray(ptr, end));
