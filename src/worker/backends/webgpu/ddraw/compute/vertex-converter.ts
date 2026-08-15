@@ -25,6 +25,7 @@ import {
     D3DFVF_XYZB4,
     D3DFVF_XYZB5,
 } from "../../../../modules/ddraw/constants";
+import { D3D_PIXEL_CENTER_OFFSET_PX } from "../../pixel-center";
 
 // Track warned FVF values to avoid log spam
 const warnedFVFs = new Set<number>();
@@ -221,7 +222,9 @@ function generateVertexConverterShader(config: VertexFormatConfig): string {
     // Half-pixel convention shift: legacy D3D (DX7-DX9) puts pixel centers at INTEGER
     // screen coordinates; WebGPU puts them at half-integers. +0.5 maps D3D pixel
     // centers onto WebGPU pixel centers so rasterization coverage and interpolated
-    // UVs reproduce D3D exactly. Games that pre-offset quads by -0.5 per MS's
+    // UVs reproduce D3D exactly. The same shift for TRANSFORMED geometry is folded into
+    // the MVP by webgpu/pixel-center.ts — read it for why the two are the same delta.
+    // Games that pre-offset quads by -0.5 per MS's
     // "Directly Mapping Texels to Pixels" (e.g. FMV tile quads) otherwise
     // shift by one pixel: boundary pixels flip to the next tile and sample u=0,
     // where WRAP+LINEAR blends in the tile's opposite edge (visible tile seams).
@@ -233,8 +236,8 @@ function generateVertexConverterShader(config: VertexFormatConfig): string {
     // which stays invisible only while the viewport covers the whole target.
     // (DXVK d3d9_fixed_function_vert.vert: pos * inverseExtent + inverseOffset, with
     //  inverseOffset = -origin * inverseExtent + (-1, 1).)
-    let posX_ndc = ((posX - params.viewportX + 0.5) / params.viewportWidth) * 2.0 - 1.0;
-    let posY_ndc = 1.0 - ((posY - params.viewportY + 0.5) / params.viewportHeight) * 2.0;
+    let posX_ndc = ((posX - params.viewportX + ${D3D_PIXEL_CENTER_OFFSET_PX}) / params.viewportWidth) * 2.0 - 1.0;
+    let posY_ndc = 1.0 - ((posY - params.viewportY + ${D3D_PIXEL_CENTER_OFFSET_PX}) / params.viewportHeight) * 2.0;
     // Convert NDC to clip-space by multiplying by w (for perspective-correct interpolation)
     let posX_clip = posX_ndc * w;
     let posY_clip = posY_ndc * w;
@@ -1202,8 +1205,8 @@ export class VertexConverter {
                             const rhw = memF32[srcIndex + 3];
                             const w = rhw !== 0 ? Math.fround(1.0 / rhw) : 1.0;
                             // +0.5: D3D integer pixel centers -> WebGPU half-integer centers (see WGSL above)
-                            posX = Math.fround(Math.fround(Math.fround(Math.fround(Math.fround(Math.fround(posX - vpX) + 0.5) / vpW) * 2.0) - 1.0) * w);
-                            posY = Math.fround(Math.fround(1.0 - Math.fround(Math.fround(Math.fround(Math.fround(posY - vpY) + 0.5) / vpH) * 2.0)) * w);
+                            posX = Math.fround(Math.fround(Math.fround(Math.fround(Math.fround(Math.fround(posX - vpX) + D3D_PIXEL_CENTER_OFFSET_PX) / vpW) * 2.0) - 1.0) * w);
+                            posY = Math.fround(Math.fround(1.0 - Math.fround(Math.fround(Math.fround(Math.fround(posY - vpY) + D3D_PIXEL_CENTER_OFFSET_PX) / vpH) * 2.0)) * w);
                             posZ = Math.fround(posZ * w);
                             posW = w;
                         } else if (config.hasXYZW) {
@@ -1285,8 +1288,8 @@ export class VertexConverter {
                     // +0.5: D3D integer pixel centers -> WebGPU half-integer centers (see WGSL above)
                     // Same operation ORDER as the WGSL too — (x+0.5)/vp then *2 then -1 is not
                     // the same f32 value as (x+0.5)*(2/vp) - 1.
-                    posX = Math.fround(Math.fround(Math.fround(Math.fround(Math.fround(Math.fround(posX - vpX) + 0.5) / vpW) * 2.0) - 1.0) * w);
-                    posY = Math.fround(Math.fround(1.0 - Math.fround(Math.fround(Math.fround(Math.fround(posY - vpY) + 0.5) / vpH) * 2.0)) * w);
+                    posX = Math.fround(Math.fround(Math.fround(Math.fround(Math.fround(Math.fround(posX - vpX) + D3D_PIXEL_CENTER_OFFSET_PX) / vpW) * 2.0) - 1.0) * w);
+                    posY = Math.fround(Math.fround(1.0 - Math.fround(Math.fround(Math.fround(Math.fround(posY - vpY) + D3D_PIXEL_CENTER_OFFSET_PX) / vpH) * 2.0)) * w);
                     posZ = Math.fround(posZ * w);
                     posW = w;
                 } else if (config.hasXYZW) {

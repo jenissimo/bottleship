@@ -17,6 +17,8 @@
  * use for the MVP. Up to FFP_MAX_LIGHTS enabled lights contribute.
  */
 
+import { pixelCenterOffsetPx, writeMvpWithPixelCenter } from "../pixel-center";
+
 // D3DLIGHTTYPE
 export const D3DLIGHT_POINT = 1;
 export const D3DLIGHT_SPOT = 2;
@@ -95,7 +97,7 @@ export const ffpTexGenOffset = (stage: number): number => OFF_TEXGEN + stage * T
 export const ffpTexMatrixOffset = (stage: number): number => OFF_TEX_MATRICES + stage * 16;
 export const FFP_UNIFORM_BYTES = FFP_UNIFORM_FLOATS * 4;
 
-const OFF_VIEWPORT = 0;        // vec4: w, h, 0, 0
+const OFF_VIEWPORT = 0;        // vec4: w, h, pixelCentreOffsetPx, 0
 const OFF_MVP = 4;             // mat4x4
 const OFF_WORLDVIEW = 20;      // mat4x4
 const OFF_MAT_DIFFUSE = 36;    // vec4
@@ -238,7 +240,11 @@ export function packFfpUniforms(out: Float32Array, p: FfpUniformParams): void {
 
     out[OFF_VIEWPORT] = p.viewportW;
     out[OFF_VIEWPORT + 1] = p.viewportH;
-    out.set(p.mvp.subarray(0, 16), OFF_MVP);
+    // viewport.z carries the pixel-centre offset in PIXELS for the pre-transformed branch
+    // of the FFP vertex shader; the transformed branch gets the same shift folded into the
+    // matrix below. Both come from webgpu/pixel-center.ts — see it for the equivalence.
+    out[OFF_VIEWPORT + 2] = pixelCenterOffsetPx();
+    writeMvpWithPixelCenter(out, OFF_MVP, p.mvp, p.viewportW, p.viewportH);
     out.set(p.worldView.subarray(0, 16), OFF_WORLDVIEW);
 
     const m = p.material;
@@ -401,6 +407,7 @@ struct FfpStage {
 }
 
 struct Uniforms {
+    // x,y = viewport width/height; z = pixel-centre offset in pixels (see pixel-center.ts).
     viewport: vec4<f32>,
     mvp: mat4x4<f32>,
     worldView: mat4x4<f32>,

@@ -6,6 +6,7 @@
  */
 
 import { WebGPUBackend } from "../webgpu-backend";
+import { pixelCenterOffsetPx } from '../pixel-center';
 import { DirectDrawSurfaceState, DirectDrawSurfaceObject, RenderSurface, isBitmapTexture, isRenderSurface } from "../../../modules/ddraw/com-objects";
 import { MEM_SURFACE_BASE, MEM_SURFACE_SIZE } from "../../../core/cpu/emulator-config";
 import { Logger, LogCategory, LogLevel } from "../../../core/logger";
@@ -4006,6 +4007,14 @@ export class DDrawWebGPUExecutor {
                 cy = M[1] * bx + M[5] * by + M[9] * bz + M[13];
                 cz = M[2] * bx + M[6] * by + M[10] * bz + M[14];
                 cw = M[3] * bx + M[7] * by + M[11] * bz + M[15];
+                // "Exactly as the render VS does" includes the pixel-centre shift the VS
+                // receives folded into its matrix (backends/webgpu/pixel-center.ts). Without
+                // it, expanded point sprites sit half a pixel off every other primitive.
+                const px = pixelCenterOffsetPx();
+                if (px > 0) {
+                    if (vpW > 0) cx += cw * (2 * px) / vpW;
+                    if (vpH > 0) cy -= cw * (2 * px) / vpH;
+                }
                 if (WV) {
                     const ex = WV[0] * bx + WV[4] * by + WV[8] * bz + WV[12];
                     const ey = WV[1] * bx + WV[5] * by + WV[9] * bz + WV[13];

@@ -131,7 +131,15 @@ describe("FFP uniform block ↔ WGSL struct", () => {
     test("packFfpUniforms writes every member where the WGSL struct declares it", () => {
         const p = probeParams();
         const out = new Float32Array(FFP_UNIFORM_FLOATS);
-        packFfpUniforms(out, p);
+        // This test is about WHERE each member lands, not what the transform does to it.
+        // The pixel-centre convention (backends/webgpu/pixel-center.ts) shifts mvp's x/y by
+        // design, so switch it off here to keep the probe values readable as placements.
+        (globalThis as Record<string, unknown>).__d3dNoPixelCentre = true;
+        try {
+            packFfpUniforms(out, p);
+        } finally {
+            delete (globalThis as Record<string, unknown>).__d3dNoPixelCentre;
+        }
 
         const at = (name: string, i = 0) => out[off.get(name)! + i];
         expect(at("viewport")).toBe(640);

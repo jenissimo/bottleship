@@ -5840,11 +5840,14 @@ function emitFfpShader(d: {
     // hardware divides back out to the same NDC, and now interpolates perspective-correctly.
     // Z is clamped to [0,1] first (D3D's rule for pre-transformed vertices) so an out-of-range
     // depth does not clip the triangle away. Matches the DDraw/D3D7 converter's treatment.
+    // u.viewport.z is the pixel-centre offset in pixels (webgpu/pixel-center.ts): the same
+    // half-pixel the transformed branch gets folded into u.mvp, so the two branches place the
+    // same screen-space point identically. 0 until the convention is switched on.
     const posBody = d.hasRhw
         ? `let rhw = input.pos.w;
         let w = select(1.0, 1.0 / rhw, rhw != 0.0);
-        let ndcX = (input.pos.x / u.viewport.x) * 2.0 - 1.0;
-        let ndcY = 1.0 - (input.pos.y / u.viewport.y) * 2.0;
+        let ndcX = ((input.pos.x + u.viewport.z) / u.viewport.x) * 2.0 - 1.0;
+        let ndcY = 1.0 - ((input.pos.y + u.viewport.z) / u.viewport.y) * 2.0;
         out.position = vec4<f32>(ndcX * w, ndcY * w, clamp(input.pos.z, 0.0, 1.0) * w, w);`
         : `out.position = u.mvp * vec4<f32>(input.pos, 1.0);`;
 

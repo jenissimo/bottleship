@@ -19,6 +19,7 @@ import {
 import { FFPLightingState } from "../../../modules/ddraw/d3d/ffp-lighting";
 import { packFfpLightSet, FFP_LIGHTSET_FLOATS, FFP_LIGHTSET_BYTES, FfpLightInput } from "../d3d9/ffp-lighting";
 import { FfpStagesState, MAX_FFP_TEX_MATRICES } from "./ffp-stages";
+import { writeMvpWithPixelCenter } from "../pixel-center";
 
 /**
  * Manages GPU ring buffers for vertex, index, and uniform data.
@@ -471,11 +472,11 @@ export class RingBufferManager {
         // Clear the buffer
         data.fill(0);
 
-        // mvp @0 (floats 0..15)
+        // mvp @0 (floats 0..15), carrying the pixel-centre shift for this viewport
+        // (webgpu/pixel-center.ts owns the convention and the equivalence with the
+        // pre-transformed path).
         if (mvpMatrix && mvpMatrix.length >= 16) {
-            for (let i = 0; i < 16; i++) {
-                data[i] = mvpMatrix[i];
-            }
+            writeMvpWithPixelCenter(data, 0, mvpMatrix, viewportWidth, viewportHeight);
         } else {
             // Identity matrix
             data[0] = 1; data[5] = 1; data[10] = 1; data[15] = 1;
@@ -944,12 +945,12 @@ export class RingBufferManager {
         this.uniformData[22] = textureFactorB;
         this.uniformData[23] = textureFactorA;
 
-        // mvp @96 (floats 24..39)
+        // mvp @96 (floats 24..39), carrying the pixel-centre shift for this viewport
+        // (webgpu/pixel-center.ts owns the convention and the equivalence with the
+        // pre-transformed path).
         const mvpOffset = 24;
         if (mvpMatrix && mvpMatrix.length >= 16) {
-            for (let i = 0; i < 16; i++) {
-                this.uniformData[mvpOffset + i] = mvpMatrix[i];
-            }
+            writeMvpWithPixelCenter(this.uniformData, mvpOffset, mvpMatrix, viewportWidth, viewportHeight);
         } else {
             // Use identity matrix (normal for XYZRHW/pre-transformed vertices)
             // Only log warning for XYZ vertices (isRHW === 0) that actually need MVP
