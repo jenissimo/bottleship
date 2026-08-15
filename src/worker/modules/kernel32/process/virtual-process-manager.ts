@@ -380,6 +380,16 @@ class VirtualProcessManager {
         return true;
     }
 
+    /**
+     * Owning pid of a thread handle. A launcher that created a child SUSPENDED holds only
+     * hThread until it resumes it, so the process behind that handle has to be reachable
+     * from the handle alone.
+     */
+    getProcessIdByThreadHandle(handle: number): number | null {
+        this.pruneStaleHandles();
+        return this.threadsByHandle.get(handle >>> 0)?.processPid ?? null;
+    }
+
     resumeThread(handle: number): number | null {
         this.pruneStaleHandles();
         const thread = this.threadsByHandle.get(handle >>> 0);

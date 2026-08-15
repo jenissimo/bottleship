@@ -139,7 +139,14 @@ async function launchChrome(port: number, profile: string, autoplay: boolean): P
         `--user-data-dir=${profile}`,
         "--no-first-run",
         "--no-default-browser-check",
-        "--disable-features=Translate",
+        // CalculateNativeWinOcclusion: Windows stops producing frames for a window another
+        // window fully covers — which is EVERY agent-driven run, since the terminal sits on
+        // top. `document.visibilityState` stays "visible" throughout, so nothing in the page
+        // can tell; the guest simply stops advancing the moment it waits on a frame slot,
+        // and every measurement taken across that window is of a stopped emulator.
+        // (One --disable-features flag only: a second occurrence replaces the first.)
+        "--disable-features=Translate,CalculateNativeWinOcclusion",
+        "--disable-backgrounding-occluded-windows",
         // Touch feature detection ('ontouchstart' in window, maxTouchPoints > 0) at
         // page load — before any Emulation override — so startup-time capability
         // checks see a touch device in automation.

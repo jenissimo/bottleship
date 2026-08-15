@@ -4053,7 +4053,10 @@ export class ThunkDispatcher {
         retAddr: number
     ): void {
         const i = this.shadowStackRingIdx;
-        this.ssTs[i] = performance.now();
+        // A SEQUENCE, not a clock read: this ring is written on every thunk entry (millions
+        // per second on an engine that spins WinAPI calls), and performance.now() per entry
+        // costs more than the six stores around it. Ordering is all the dump needs.
+        this.ssTs[i] = ++this.shadowStackSeq;
         this.ssThreadId[i] = threadId >>> 0;
         this.ssThunkId[i] = thunkId >>> 0;
         this.ssEspEntry[i] = espEntry >>> 0;
@@ -4062,6 +4065,8 @@ export class ThunkDispatcher {
         this.shadowStackRingIdx = (i + 1) % ThunkDispatcher.SHADOW_STACK_RING_SIZE;
         if (this.shadowStackRingCount < ThunkDispatcher.SHADOW_STACK_RING_SIZE) this.shadowStackRingCount++;
     }
+
+    private shadowStackSeq = 0;
 
     private dumpShadowStackGuard(reason: string): void {
         const len = this.shadowStackRingCount;
@@ -4073,7 +4078,7 @@ export class ThunkDispatcher {
         for (let i = 0; i < len; i++) {
             const e = (start + i) % SIZE;
             lines.push(
-                `  [${i}] t=${this.ssTs[e].toFixed(1)} T${this.ssThreadId[e]} thunk=0x${this.ssThunkId[e].toString(16)} ` +
+                `  [${i}] #${this.ssTs[e]} T${this.ssThreadId[e]} thunk=0x${this.ssThunkId[e].toString(16)} ` +
                 `espEntry=0x${this.ssEspEntry[e].toString(16)} expectedPost=0x${this.ssExpectedPost[e].toString(16)} ` +
                 `ret=0x${this.ssRetAddr[e].toString(16)}`
             );
@@ -5169,6 +5174,7 @@ export class ThunkDispatcher {
                 return;
             }
         }
+
 
         if (!this._sehFaultDispatchGuard(esp, faultingEip, faultAddr, view)) return;
         const isWrite = !!(errorCode & 0x02);

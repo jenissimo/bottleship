@@ -1,7 +1,7 @@
 import { V86 } from "v86";
 import { ThunkGenerator } from "./core/thunking/thunk-generator";
 import { Process } from "./core/process";
-import { System } from "./core/system";
+import { System, type GuestImagePatch } from "./core/system";
 
 // Which guest thread is driving a given VFS read — the shared-cursor question can only
 // be answered where every file API converges, not at one API's fast path.
@@ -48,6 +48,7 @@ import { Winspool } from "./modules/winspool";
 import { Dwmapi } from "./modules/dwmapi";
 import { Riched32 } from "./modules/riched32";
 import { Wtsapi32 } from "./modules/wtsapi32";
+import { Msacm32 } from "./modules/msacm32";
 import { Imm32 } from "./modules/imm32";
 import { Msimg32 } from "./modules/msimg32";
 import { Uxtheme } from "./modules/uxtheme";
@@ -307,6 +308,8 @@ let pendingReExecArgs: string | null = null;
 /** VFS path of the image the next boot must run instead of the manifest's `entrypoint`
  *  (a launcher starting the game — see requestSelfReExec). */
 let pendingReExecImage: string | null = null;
+/** Bytes a launcher wrote into the child it created suspended, replayed after the PE loads. */
+let pendingReExecPatches: GuestImagePatch[] | null = null;
 let registrySaveTimeout: number | null = null;
 let registrySaveGeneration = 0;
 /** do_tick liveness counter — incremented in the tick_hooks_before guard every v86 do_tick().
@@ -955,6 +958,37 @@ const loadPeData = async (peData: Uint8Array, skipReset: boolean = false) => {
 
     // Update PEB ImageBaseAddress now that we know the actual EXE base
     system.scheduler?.tebManager.updatePebImageBase(module.baseAddress);
+
+    // Replay what the launcher wrote into this image while it was a suspended child. For
+    // the encrypt-on-disk launchers those bytes ARE the decrypted code, so this has to run
+    // after the image is mapped and before the first guest instruction. Addresses came from
+    // the launcher's view of the child at its preferred base; anything outside the image we
+    // actually mapped would be a relocation we cannot reproduce, so it is refused, loudly.
+    if (pendingReExecPatches?.length) {
+      const mem8 = system.process.getCurrentMemory();
+      const imageEnd = (module.baseAddress + module.size) >>> 0;
+      let applied = 0;
+      let skipped = 0;
+      for (const patch of pendingReExecPatches) {
+        const addr = patch.address >>> 0;
+        const binary = atob(patch.data);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i) & 0xff;
+        if (addr < module.baseAddress || addr + bytes.length > imageEnd) {
+          Logger.error(LogCategory.SYSTEM,
+            `[ReExec] patch 0x${addr.toString(16)}+${bytes.length} falls outside the mapped image ` +
+            `[0x${module.baseAddress.toString(16)}..0x${imageEnd.toString(16)}) — NOT applied`);
+          skipped++;
+          continue;
+        }
+        writeGuestCode(mem8, bytes, addr);
+        applied += bytes.length;
+      }
+      Logger.warn(LogCategory.SYSTEM,
+        `[ReExec] replayed launcher writes into the child image: ${applied} byte(s) in ` +
+        `${pendingReExecPatches.length - skipped} run(s)${skipped ? `, ${skipped} refused` : ""}`);
+      pendingReExecPatches = null;
+    }
 
     // Extract app icon from PE resources and send to host page for favicon
     try {
@@ -2032,7 +2066,7 @@ const loadBundle = (payload: { data?: Uint8Array; url?: string; blob?: Blob; blo
  * macrotask, so this is the same proven entry the normal path uses — by then the thunk has
  * returned its SE_ERR_/PROCESS_INFORMATION value and the guest is at a clean boundary.
  */
-const requestSelfReExec = (commandLine: string, imagePath?: string): boolean => {
+const requestSelfReExec = (commandLine: string, imagePath?: string, imagePatches?: GuestImagePatch[]): boolean => {
   // Returns whether the re-exec was ACCEPTED. A launcher that exits believing it started a
   // child, when nothing was scheduled, is a silent vanish — shell32 reports our verdict.
   if (!lastBundlePayload) {
@@ -2048,6 +2082,7 @@ const requestSelfReExec = (commandLine: string, imagePath?: string): boolean => 
   }
   pendingReExecArgs = commandLine;
   pendingReExecImage = imagePath ?? null;
+  pendingReExecPatches = imagePatches?.length ? imagePatches : null;
   System.getInstance().isReExecPending = true;
   const payload = lastBundlePayload;
 
@@ -2059,7 +2094,10 @@ const requestSelfReExec = (commandLine: string, imagePath?: string): boolean => 
   if (payload?.url) {
     Logger.log(LogCategory.SYSTEM,
       `[ReExec] requesting host page-reload restart, image "${pendingReExecImage ?? "(self)"}" args "${commandLine}"`);
-    self.postMessage({ type: "reexec", args: commandLine, url: payload.url, image: pendingReExecImage });
+    self.postMessage({
+      type: "reexec", args: commandLine, url: payload.url, image: pendingReExecImage,
+      patches: pendingReExecPatches,
+    });
     return true;
   }
 
@@ -2317,6 +2355,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       const dwmapi = new Dwmapi();
       const riched32 = new Riched32();
       const wtsapi32 = new Wtsapi32();
+      const msacm32 = new Msacm32();
       const imm32 = new Imm32();
       const msimg32 = new Msimg32();
       const uxtheme = new Uxtheme();
@@ -2355,6 +2394,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
           dwmapi.name,
           riched32.name,
           wtsapi32.name,
+          msacm32.name,
           imm32.name,
           msimg32.name,
           uxtheme.name,
@@ -2427,6 +2467,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       dwmapi.initialize(process);
       riched32.initialize(process);
       wtsapi32.initialize(process);
+      msacm32.initialize(process);
       imm32.initialize(process);
       msimg32.initialize(process);
       uxtheme.initialize(process);
@@ -2491,6 +2532,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.registerModule(dwmapi.name, dwmapi);
       process.registerModule(riched32.name, riched32);
       process.registerModule(wtsapi32.name, wtsapi32);
+      process.registerModule(msacm32.name, msacm32);
       process.registerModule(imm32.name, imm32);
       process.registerModule(msimg32.name, msimg32);
       process.registerModule(uxtheme.name, uxtheme);
@@ -2559,6 +2601,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.dispatcher.registerModule(dwmapi.name, dwmapi.exports);
       process.dispatcher.registerModule(riched32.name, riched32.exports);
       process.dispatcher.registerModule(wtsapi32.name, wtsapi32.exports);
+      process.dispatcher.registerModule(msacm32.name, msacm32.exports);
       process.dispatcher.registerModule(imm32.name, imm32.exports);
       process.dispatcher.registerModule(msimg32.name, msimg32.exports);
       process.dispatcher.registerModule(uxtheme.name, uxtheme.exports);
@@ -2935,6 +2978,9 @@ self.onmessage = (event: MessageEvent) => {
     // in place of the manifest's `args` for exactly one boot.
     pendingReExecArgs = typeof message.args === "string" ? message.args : null;
     pendingReExecImage = typeof message.image === "string" && message.image ? message.image : null;
+    pendingReExecPatches = Array.isArray(message.patches) && message.patches.length
+      ? (message.patches as GuestImagePatch[])
+      : null;
     Logger.log(LogCategory.SYSTEM,
       `[ReExec] boot from host: image "${pendingReExecImage ?? "(manifest)"}" args "${pendingReExecArgs ?? ""}"`);
     return;

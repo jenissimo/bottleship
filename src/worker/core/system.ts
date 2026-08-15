@@ -108,6 +108,16 @@ export interface HostCursorImage {
     hotspotY: number;
 }
 
+/**
+ * A run of bytes a launcher wrote into a child it had created SUSPENDED, to be replayed
+ * into the image once the restart has mapped it. `data` is base64 because this crosses the
+ * page reload through sessionStorage.
+ */
+export interface GuestImagePatch {
+    address: number;
+    data: string;
+}
+
 /** One module's static-TLS (`__declspec(thread)`) template, as the PE TLS directory declares it. */
 export interface ImplicitTlsEntry {
     tlsIndex: number;
@@ -282,7 +292,7 @@ export class System {
      * launcher exit and the app simply vanish. `void` is read as acceptance only so a host
      * that has not been updated keeps working.
      */
-    public onReExecRequest: ((commandLine: string, imagePath?: string) => boolean | void) | null = null;
+    public onReExecRequest: ((commandLine: string, imagePath?: string, imagePatches?: GuestImagePatch[]) => boolean | void) | null = null;
 
     /**
      * True when `file` (optionally relative to `directory`) names the image THIS process
@@ -326,10 +336,14 @@ export class System {
      * image as the entry point. The parent does not survive — which is what a launcher
      * that exits right after CreateProcess does anyway, and the only single-process
      * reading of "run this instead" available to us.
+     *
+     * `imagePatches` carry what the launcher wrote into the child while it was suspended —
+     * for the encrypt-on-disk launchers that is the decrypted code itself, so the restart
+     * has to replay it or the new process runs ciphertext.
      */
-    public requestReExec(commandLine: string, imagePath?: string): boolean {
+    public requestReExec(commandLine: string, imagePath?: string, imagePatches?: GuestImagePatch[]): boolean {
         if (!this.onReExecRequest) return false;
-        const accepted = this.onReExecRequest(commandLine, imagePath) !== false;
+        const accepted = this.onReExecRequest(commandLine, imagePath, imagePatches) !== false;
         if (!accepted) {
             Logger.warn(LogCategory.SYSTEM,
                 `Re-exec refused by the host for "${imagePath ?? this.executablePath}" "${commandLine}"`);
@@ -855,6 +869,7 @@ export class System {
         this.gpuResourceManager?.flushPendingDestruction();
         this.gpuResourceManager?.clear();
         hypercallDataManager.resetDispatchTable();
+        hypercallDataManager.resetThreadSuspendTable();
         // PE-loader TLS templates are guest VAs that die with Process.reset().
         this.implicitTlsEntries = [];
 

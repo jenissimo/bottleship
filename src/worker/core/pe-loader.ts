@@ -680,8 +680,10 @@ export class PELoader {
                 peView.getUint32(optHeaderPtr + 56, true), dllPath);
             const entryPointRVA = peView.getUint32(optHeaderPtr + 16, true);
 
-            // Allocate base address for DLL
-            const baseAddress = this.moduleRegistry.allocateBase(sizeOfImage);
+            // Pick the load address the way Windows does: the DLL's own ImageBase when
+            // that VA is free, the rebase bucket only on conflict.
+            const baseAddress = this.chooseDllBase(
+                peView.getUint32(optHeaderPtr + 28, true), sizeOfImage, dllPath);
 
             // Register address space region
             const system = System.getInstance();
@@ -804,6 +806,32 @@ export class PELoader {
         } finally {
             this.loadingDlls.delete(dllNameLower);
         }
+    }
+
+    /**
+     * Load address for a DLL: its own ImageBase when that VA is free, the rebase bucket
+     * otherwise — the Windows rule. Honouring it is a correctness requirement, not a
+     * preference: a .reloc table that does not cover every absolute operand still loads
+     * (and still relocates most of the image), so the gap only shows up as a call through
+     * a stale pointer far from the loader. Hitman's system.dll has no relocation for the
+     * `call [__imp__GetCurrentThreadId]` in its CRT and calls through 0 anywhere else.
+     */
+    private chooseDllBase(preferredBase: number, sizeOfImage: number, dllPath: string): number {
+        const registry = this.moduleRegistry!;
+        const system = System.getInstance();
+        const memory = system.process?.memory;
+        const addressSpace = system.process?.addressSpace;
+        if (memory && addressSpace && preferredBase) {
+            // A mapping an unloaded image left behind must not block its own reload.
+            if (!registry.getByBase(preferredBase)) addressSpace.releaseRegion(preferredBase);
+            if (memory.canPlaceImageAt(preferredBase, sizeOfImage)) {
+                Logger.log(LogCategory.SYSTEM,
+                    `[PE] ${dllPath}: mapped at its preferred base 0x${preferredBase.toString(16)} ` +
+                    `(size=0x${sizeOfImage.toString(16)}, no relocation)`);
+                return preferredBase;
+            }
+        }
+        return registry.allocateBase(sizeOfImage);
     }
 
     /**

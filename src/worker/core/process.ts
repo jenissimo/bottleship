@@ -7,7 +7,7 @@ import { APIRegistry } from './api-registry';
 import { ThunkMemoryManager } from './thunking/thunk-memory-manager';
 import { AddressSpace, RegionKind, RegionPerms } from './memory/address-space';
 import { Mem } from './memory/mem-accessor';
-import { EMU_MEMORY_SIZE, MAX_ALLOC_BYTES } from './cpu/emulator-config';
+import { EMU_MEMORY_SIZE, MAX_ALLOC_BYTES, MEM_LOWMEM_SIZE, MEM_HEAP_BASE } from './cpu/emulator-config';
 import { Logger, LogCategory } from './logger';
 import { ModuleRegistry } from './module-registry';
 import { memoryEventBuffer, MemoryEventType } from './memory/memory-event-buffer';
@@ -34,6 +34,9 @@ interface BucketState {
 }
 
 const BUCKET_KINDS: RegionKind[] = ['HEAP', 'SURFACE', 'THUNK_CODE', 'THUNK_DATA'];
+
+/** Win32 VA allocation granularity — the alignment every image base is stated in. */
+const DLL_IMAGE_GRANULARITY = 0x10000;
 
 /**
  * Drop v86's compiled blocks for a freshly handed-out executable range.
@@ -187,6 +190,37 @@ export class MemoryManager {
             const limit = region.base + region.size;
             this.bucketState.set(kind, { base, limit, next: base, slabTop: limit, everMax: base });
         }
+    }
+
+    /**
+     * May a PE image be mapped at its PREFERRED ImageBase? Windows maps a DLL there
+     * whenever the VA is free and relocates only on conflict, and an image whose .reloc
+     * table does not cover every absolute operand is correct ONLY there — so this is a
+     * correctness question, not a placement preference.
+     *
+     * The layout's fixed buckets belong to us, which leaves two windows able to host a
+     * foreign image: the EXE window below HEAP, and HEAP's UNTOUCHED middle — above the
+     * bump high-water mark and below the slab frontier. There the region both frontiers
+     * already skip (allocateInBucket / allocFromHigh) keeps the hole for good; anywhere
+     * below everMax the guest may already hold live pointers into the range.
+     */
+    canPlaceImageAt(base: number, size: number): boolean {
+        const start = base >>> 0;
+        const span = this.alignUp(size, DLL_IMAGE_GRANULARITY);
+        const end = start + span;
+        if (size <= 0 || start === 0 || (start % DLL_IMAGE_GRANULARITY) !== 0) return false;
+        if (end <= start || end > this.addressSpace.getMemorySize()) return false;
+        if (this.addressSpace.findBlockingRegion(start, span)) return false;
+
+        // EXE window — everything between low memory and the heap.
+        if (start >= MEM_LOWMEM_SIZE && end <= MEM_HEAP_BASE) return true;
+
+        const heap = this.bucketState.get('HEAP');
+        if (!heap) return false;
+        if (start < heap.base || end > heap.limit) return false;
+        const floor = this.alignUp(heap.everMax + DLL_IMAGE_GRANULARITY, DLL_IMAGE_GRANULARITY);
+        const ceiling = heap.slabTop ?? heap.limit;
+        return start >= floor && end <= ceiling;
     }
 
     alloc(size: number, kind?: RegionKind, perms?: RegionPerms, alignment?: number): number {

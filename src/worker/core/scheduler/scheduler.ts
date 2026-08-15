@@ -107,6 +107,17 @@ interface TimerFpuBorrow {
     previousOwnerThreadId: number;
 }
 
+/** One context switch, as the forensic ring stores it before anyone asks to read it. */
+interface SwitchTraceRecord {
+    seq: number;
+    eip: number;
+    esp: number;
+    threadId: number;
+    state: number;
+    kind: ThunkBoundaryKind;
+    cleanup: number;
+}
+
 export class Scheduler {
     private process: Process | null = null;
     public config: SchedulerConfig;
@@ -528,7 +539,15 @@ export class Scheduler {
     private sehDeferredSwitchCount = 0;
     private sehDeniedRestoreCount = 0;
     private sehUnbalancedExitCount = 0;
-    private readonly asyncRestoreTrace: string[] = [];
+    /** Forensic ring for the async park/restore path. Entries are either a formatted line
+     *  (the rare, interesting events) or a compact record the hot context-switch path pushes
+     *  WITHOUT formatting: performSwitch runs tens of thousands of times a second on an engine
+     *  that hands the CPU back and forth (Discworld Noir: ~37k/s), and building five template
+     *  strings plus a performance.now() per switch cost more than the switch. Formatted on read
+     *  (getAsyncRestoreTrace / the dumps), which is where a human is the only consumer. */
+    private readonly asyncRestoreTrace: Array<string | SwitchTraceRecord> = [];
+    /** Ordering stamp for the compact records — a clock read per switch is what this avoids. */
+    private asyncTraceSeq = 0;
 
     constructor(config: Partial<SchedulerConfig> = {}) {
         this.config = { ...DEFAULT_SCHEDULER_CONFIG, ...config };
@@ -989,7 +1008,11 @@ export class Scheduler {
             // async restore) is re-queued but still currentThreadId; with no peer, wakeThread skips
             // requestSwitch() and it's never promoted → frozen at the spin loop with is_running()
             // stuck true (HoMM3-demo Sleep boot freeze). Async-restore wakes are handled at step 1.
-            if (current.state === ThreadState.WAITING || current.state === ThreadState.READY) {
+            // SUSPENDED: same reasoning — a suspended thread must not be on the CPU at all, and
+            // whatever suspended it (a self-suspend, or a peer that suspended it between
+            // boundaries) has no other way to take it off.
+            if (current.state === ThreadState.WAITING || current.state === ThreadState.READY ||
+                current.state === ThreadState.SUSPENDED) {
                 this.switchRequested = false;
                 this.performSwitch(cpu, ThunkBoundaryKind.GUEST_CODE, 0);
                 this.tryDispatchTimerThreadCallbacks(cpu);
@@ -1486,7 +1509,7 @@ export class Scheduler {
     private performSwitch(cpu: V86Cpu, kind: ThunkBoundaryKind, cleanup: number): boolean {
         this.accumThreadCpu();
         let current = this.getCurrentThread();
-        this.traceAsyncRestore("performSwitch", cpu, `boundary=${boundaryKindName(kind)},cleanup=${cleanup}`);
+        this.recordSwitchTrace(cpu, kind, cleanup);
 
         // Save current thread context if RUNNING
         if (current && current.state === ThreadState.RUNNING) {
@@ -1715,6 +1738,7 @@ export class Scheduler {
         };
 
         this.threads.set(threadId, thread);
+        this.publishSuspendCount(thread);
         if (!isSuspended) this.runQueue.push(threadId);
 
         // Initialize implicit TLS data for the new thread.
@@ -1808,6 +1832,9 @@ export class Scheduler {
         }
 
         const safeExitCode = exitCode >>> 0;
+        // A terminated thread leaves the shared table: its handle can be handed to a new
+        // thread, and the WASM handler must not answer for the dead one.
+        hypercallDataManager.forgetThreadSuspendCount(thread.handle >>> 0);
         this.setThreadState(thread, ThreadState.TERMINATED);
         thread.exitCode = safeExitCode;
         thread.waitInfo = null;
@@ -2797,6 +2824,7 @@ export class Scheduler {
 
         const prev = thread.suspendCount;
         if (thread.suspendCount > 0) thread.suspendCount--;
+        if (prev !== thread.suspendCount) this.publishSuspendCount(thread);
         if (thread.suspendCount > 0) return prev;
 
         if (thread.state === ThreadState.SUSPENDED) {
@@ -2804,6 +2832,14 @@ export class Scheduler {
             // wait was satisfied while suspended and wakeThread parked the result in EAX.
             this.setThreadState(thread, ThreadState.READY);
             if (!this.runQueue.includes(thread.id)) this.runQueue.push(thread.id);
+            // The same event wakeThread reports, and it asks for a switch for the same reason:
+            // the resumed thread is what the resumer just made runnable, and on real hardware it
+            // would already be running on another core. Only the transition asks — a resume of
+            // an ALREADY runnable thread is a no-op, and engines that call one per main-loop
+            // iteration (Discworld Noir, ~11k/frame) would otherwise switch on every one.
+            if (this.currentThreadId !== null && this.currentThreadId !== thread.id) {
+                this.requestSwitch();
+            }
         } else if (thread.state === ThreadState.WAITING && prev > 0) {
             // `prev > 0`: only a call that actually RELEASED the last suspend re-evaluates.
             // A stray Resume on a thread that was never suspended must stay free (engines that
@@ -2836,6 +2872,19 @@ export class Scheduler {
         this.wakeThread(thread, decision.result);
     }
 
+    /**
+     * Mirror one thread's suspend count into the hypercall page.
+     *
+     * The WASM ResumeThread handler answers the no-op case (target not suspended) from this
+     * table, so it must be republished on EVERY count change — a stale 0 would let a real
+     * resume be answered as a no-op and the thread would never wake. Everything the handler
+     * cannot answer falls through to this class, which stays the only owner of the state
+     * machine.
+     */
+    private publishSuspendCount(thread: Thread): void {
+        hypercallDataManager.setThreadSuspendCount(thread.handle >>> 0, thread.suspendCount);
+    }
+
     /** Win32 SuspendThread: previous suspend count, or 0xFFFFFFFF on failure (last error set
      *  here, since the caller cannot tell an invalid handle from a refused signal). */
     suspendThread(handle: number): number {
@@ -2852,11 +2901,21 @@ export class Scheduler {
             return 0xFFFFFFFF;
         }
         thread.suspendCount++;
+        this.publishSuspendCount(thread);
 
         if (thread.state === ThreadState.READY || thread.state === ThreadState.RUNNING) {
             this.setThreadState(thread, ThreadState.SUSPENDED);
             const idx = this.runQueue.indexOf(thread.id);
             if (idx >= 0) this.runQueue.splice(idx, 1);
+            // Suspending YOURSELF yields the CPU at that instruction — NT parks the thread on
+            // its suspend semaphore inside the call and never returns until someone resumes it.
+            // Marking the state without asking for a switch leaves the thread running to the
+            // next quantum, and an engine that self-suspends as a handshake (Tin3/Discworld
+            // Noir: the worker yields to the driver thread this way) spends that whole quantum
+            // calling SuspendThread again — ~450k calls/s, the count ratchets to
+            // MAXIMUM_SUSPEND_COUNT, and from then on EVERY call is refused while the loop
+            // still spins. Measured: half the worker's time in a refused suspend, 3–15 FPS.
+            if (thread.id === this.currentThreadId) this.switchRequested = true;
         } else if (thread.state === ThreadState.WAITING &&
                    thread.waitInfo?.reason === WaitReason.ASYNC_THUNK) {
             this.suspendWaitStats.suspendOnAsyncPark++;
@@ -3768,19 +3827,45 @@ export class Scheduler {
             this.threads, this.currentThreadId, this.runQueue, this.process?.getCurrentMemory());
     }
 
+    /** The hot half of traceAsyncRestore: same ring, no strings and no clock read. */
+    private recordSwitchTrace(cpu: V86Cpu | null, kind: ThunkBoundaryKind, cleanup: number): void {
+        const current = this.getCurrentThread();
+        this.pushTrace({
+            seq: ++this.asyncTraceSeq,
+            eip: cpu ? cpu.instruction_pointer[0] >>> 0 : 0,
+            esp: cpu ? cpu.reg32[4] >>> 0 : 0,
+            threadId: current?.id ?? 0,
+            state: current?.state ?? -1,
+            kind,
+            cleanup,
+        });
+    }
+
+    private pushTrace(entry: string | SwitchTraceRecord): void {
+        this.asyncRestoreTrace.push(entry);
+        if (this.asyncRestoreTrace.length > 128) this.asyncRestoreTrace.splice(0, 64);
+    }
+
+    /** Compact record -> the line it always used to be. */
+    private formatTraceEntry(e: string | SwitchTraceRecord): string {
+        if (typeof e === 'string') return e;
+        return `#${e.seq} source=performSwitch liveEip=${hx(e.eip)},liveEsp=${hx(e.esp)} ` +
+            `T${e.threadId}:${THREAD_STATE_NAMES[e.state as ThreadState] ?? '?'} ` +
+            `boundary=${boundaryKindName(e.kind)},cleanup=${e.cleanup}`;
+    }
+
     traceAsyncRestore(source: string, cpu?: V86Cpu | null, detail: string = ''): void {
         const current = this.getCurrentThread();
         const live = cpu
             ? `liveEip=${hx(cpu.instruction_pointer[0])},liveEsp=${hx(cpu.reg32[4])}`
             : 'live=?';
         const entry = `t=${Math.round(performance.now())} source=${source} ${live} ${formatThreadSnapshot(current)} ${detail}`.trim();
-        this.asyncRestoreTrace.push(entry);
-        if (this.asyncRestoreTrace.length > 128) this.asyncRestoreTrace.splice(0, 64);
+        this.pushTrace(entry);
         Logger.verbose(LogCategory.THREAD, `[ASYNC-SCHED] ${entry}`);
     }
 
     getAsyncRestoreTrace(): string[] {
-        return this.asyncRestoreTrace.slice();
+        return this.asyncRestoreTrace.map((e) => this.formatTraceEntry(e));
     }
 
     private dumpSchedulerAsyncState(source: string, cpu: V86Cpu | null, kind?: ThunkBoundaryKind, detail: string = '', level: 'warn' | 'error' = 'error'): void {
@@ -3791,7 +3876,7 @@ export class Scheduler {
         const message =
             `[ASYNC-SCHED-DUMP] source=${source},boundary=${boundaryKindName(kind)},${live},` +
             `${formatThreadSnapshot(current)},detail=${detail},pending=${formatPendingAsyncRestoreQueue(this.process?.dispatcher)},` +
-            `threads=${this.getDetailedThreadInfo()},traceTail=${this.asyncRestoreTrace.slice(-8).join(' || ')}`;
+            `threads=${this.getDetailedThreadInfo()},traceTail=${this.asyncRestoreTrace.slice(-8).map((e) => this.formatTraceEntry(e)).join(' || ')}`;
         if (level === 'warn') Logger.warn(LogCategory.THREAD, message);
         else Logger.error(LogCategory.THREAD, message);
     }

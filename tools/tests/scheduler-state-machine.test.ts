@@ -352,6 +352,30 @@ describe("scheduler/suspendThread", () => {
         expect(t.suspendCount).toBe(1);
     });
 
+    // A thread that suspends ITSELF has yielded the CPU at that instruction (NT parks it on
+    // its suspend semaphore inside the call). Marking the state without asking for a switch
+    // let Discworld Noir's worker keep running past its own SuspendThread and call it again
+    // for the rest of the quantum — ~450k/s until the count saturated at 127 and every call
+    // was refused for the rest of the session.
+    test("suspending the CURRENT thread requests a switch away from it", () => {
+        const s = new Scheduler();
+        const t = inject(s, mkThread(1, ThreadState.RUNNING), { current: true });
+        (s as any).switchRequested = false;
+        s.suspendThread(t.handle);
+        expect(t.state).toBe(ThreadState.SUSPENDED);
+        expect((s as any).switchRequested).toBe(true);
+    });
+
+    test("suspending ANOTHER thread does not request a switch", () => {
+        const s = new Scheduler();
+        inject(s, mkThread(1, ThreadState.RUNNING), { current: true });
+        const other = inject(s, mkThread(2, ThreadState.READY), { runnable: true });
+        (s as any).switchRequested = false;
+        s.suspendThread(other.handle);
+        expect(other.state).toBe(ThreadState.SUSPENDED);
+        expect((s as any).switchRequested).toBe(false);
+    });
+
     test("READY -> SUSPENDED removes it from the run queue", () => {
         const s = new Scheduler();
         const t = inject(s, mkThread(1, ThreadState.READY), { runnable: true });
@@ -460,6 +484,32 @@ function blockOn(s: Scheduler, t: Thread, handles: number[], timeoutMs: number |
     (s as any).blockThread(t, WaitReason.SINGLE_OBJECT, handles, false, timeoutMs, false, 0, ctx);
     return t;
 }
+
+// Resuming a thread readies it, and the resumer is normally waiting on what it released —
+// the same reason wakeThread asks for a switch. Only the SUSPENDED->READY transition asks:
+// an engine that calls ResumeThread once per main-loop iteration (Discworld Noir, ~11k per
+// frame) would otherwise force a context switch on every one.
+describe("scheduler/resumeThread — switch policy", () => {
+    test("the transition out of SUSPENDED requests a switch", () => {
+        const s = new Scheduler();
+        inject(s, mkThread(1, ThreadState.RUNNING), { current: true });
+        const t = inject(s, mkThread(2, ThreadState.RUNNING));
+        s.suspendThread(t.handle);
+        (s as any).switchRequested = false;
+        s.resumeThread(t.handle);
+        expect(t.state).toBe(ThreadState.READY);
+        expect((s as any).switchRequested).toBe(true);
+    });
+
+    test("a resume of an already-runnable thread does not", () => {
+        const s = new Scheduler();
+        inject(s, mkThread(1, ThreadState.RUNNING), { current: true });
+        const t = inject(s, mkThread(2, ThreadState.READY), { runnable: true });
+        (s as any).switchRequested = false;
+        s.resumeThread(t.handle);
+        expect((s as any).switchRequested).toBe(false);
+    });
+});
 
 describe("scheduler/suspend ⟂ wait", () => {
     test("a signal that arrives while suspended is delivered on resume", () => {

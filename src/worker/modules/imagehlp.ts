@@ -46,8 +46,51 @@ export class ImageHlp implements IModule {
     name = "imagehlp";
     exports: Record<string, ThunkImplementation> = {};
 
+    /** Flat file mappings handed out by MapAndLoad, so UnMapAndLoad can give them back. */
+    private readonly fileMappings = new Map<number, number>();
+
     initialize(process: Process): void {
         const system = System.getInstance();
+
+        /**
+         * Resolve an image name the way MapAndLoad does — as given, then against DllPath,
+         * then the app directory — and map the file's bytes flat into guest memory.
+         */
+        const mapImageFile = (imageName: string, dllPath: string): { address: number; size: number; path: string } | null => {
+            if (!imageName) return null;
+            const vfs = system.fileSystem;
+            const leaf = basename(imageName);
+            const candidates = [imageName];
+            for (const dir of dllPath.split(";")) {
+                const trimmed = dir.trim();
+                if (trimmed && leaf) candidates.push(`${trimmed.replace(/[\\/]+$/, "")}\\${leaf}`);
+            }
+
+            for (const candidate of candidates) {
+                const handle = vfs.openSync(candidate, 0x80000000, 3);
+                if (!handle) continue;
+                const size = vfs.getFileSize(handle.path);
+                if (size <= 0) continue;
+                const bytes = vfs.readSync(handle, size);
+                if (!bytes || bytes.byteLength === 0) continue;
+
+                const address = process.memory.alloc(bytes.byteLength);
+                if (!address) return null;
+                if (!Mem.writeBytes(address, bytes)) {
+                    process.memory.free(address);
+                    return null;
+                }
+                this.fileMappings.set(address, bytes.byteLength);
+                return { address, size: bytes.byteLength, path: candidate };
+            }
+            return null;
+        };
+
+        const unmapImageFile = (address: number): boolean => {
+            if (!this.fileMappings.delete(address >>> 0)) return false;
+            process.memory.free(address >>> 0);
+            return true;
+        };
 
         const writeLoadedImage = (
             loadedImagePtr: number,
@@ -97,71 +140,51 @@ export class ImageHlp implements IModule {
 
             const imageName = imageNamePtr ? Marshaler.readString(mem, imageNamePtr) : "";
             const dllPath = dllPathPtr ? Marshaler.readString(mem, dllPathPtr) : "";
-            const lookupCandidates = new Set<string>();
-            const imageBasename = basename(imageName);
 
-            if (imageName) lookupCandidates.add(imageName);
-            if (imageBasename) lookupCandidates.add(imageBasename);
-            if (imageBasename) lookupCandidates.add(stripImageExtension(imageBasename));
-            if (system.executableName) {
-                lookupCandidates.add(system.executableName);
-                lookupCandidates.add(stripImageExtension(system.executableName));
-            }
-
-            let mod = undefined as ReturnType<typeof process.moduleRegistry.getByName>;
-            let resolvedName = "";
-            for (const candidate of lookupCandidates) {
-                const maybe = process.moduleRegistry.getByName(candidate);
-                if (maybe) {
-                    mod = maybe;
-                    resolvedName = candidate;
-                    break;
-                }
-            }
-
-            if (!mod) {
+            // MapAndLoad maps the FILE, flat, exactly as it sits on disk — MappedAddress is
+            // file offset 0, so a caller converts an offset to a VA itself with the section
+            // table (PointerToRawData / VirtualAddress). It is NOT the loaded image, and it
+            // has nothing to do with which modules this process happens to have loaded: the
+            // whole point is inspecting an executable the process did NOT load.
+            const mapped = mapImageFile(imageName, dllPath);
+            if (!mapped) {
                 Logger.warn(
                     LogCategory.SYSTEM,
-                    `MapAndLoad(image="${imageName}", dllPath="${dllPath}", dotDll=${dotDll}, readOnly=${readOnly}) -> module not found`
+                    `MapAndLoad(image="${imageName}", dllPath="${dllPath}", dotDll=${dotDll}, readOnly=${readOnly}) -> file not found`
                 );
                 system.scheduler.setLastError(ERROR_MOD_NOT_FOUND);
                 return { value: FALSE, stackCleanup: 20 };
             }
 
-            let mappedAddress = mod?.baseAddress ?? 0;
+            const mappedAddress = mapped.address;
+            const eLfanew = Mem.readUint32(mappedAddress + 0x3c);
+            const mz = Mem.readUint16(mappedAddress);
             let fileHeader = 0;
             let numberOfSections = 0;
             let sectionsPtr = 0;
             let characteristics = 0;
-            let sizeOfImage = mod?.size ?? 0;
-            let fDosImage = 0;
-
-            if (mappedAddress !== 0) {
-                const mz = Mem.readUint16(mappedAddress);
-                const eLfanew = Mem.readUint32(mappedAddress + 0x3c);
-                if (mz === 0x5a4d && eLfanew !== null) {
-                    const ntHeaders = (mappedAddress + eLfanew) >>> 0;
-                    const peSig = Mem.readUint32(ntHeaders);
-                    if (peSig === 0x00004550) {
-                        fileHeader = ntHeaders;
-                        numberOfSections = Mem.readUint16(ntHeaders + 6) ?? 0;
-                        const optionalHeaderSize = Mem.readUint16(ntHeaders + 20) ?? 0;
-                        characteristics = Mem.readUint16(ntHeaders + 22) ?? 0;
-                        sectionsPtr = (ntHeaders + 24 + optionalHeaderSize) >>> 0;
-                        const parsedSizeOfImage = Mem.readUint32(ntHeaders + 24 + 56);
-                        if (parsedSizeOfImage !== null && parsedSizeOfImage > 0) {
-                            sizeOfImage = parsedSizeOfImage >>> 0;
-                        }
-                        fDosImage = 1;
+            let sizeOfImage = mapped.size;
+            if (mz === 0x5a4d && eLfanew !== null) {
+                const ntHeaders = (mappedAddress + eLfanew) >>> 0;
+                if (Mem.readUint32(ntHeaders) === 0x00004550) {
+                    fileHeader = ntHeaders;
+                    numberOfSections = Mem.readUint16(ntHeaders + 6) ?? 0;
+                    const optionalHeaderSize = Mem.readUint16(ntHeaders + 20) ?? 0;
+                    characteristics = Mem.readUint16(ntHeaders + 22) ?? 0;
+                    sectionsPtr = (ntHeaders + 24 + optionalHeaderSize) >>> 0;
+                    const parsedSizeOfImage = Mem.readUint32(ntHeaders + 24 + 56);
+                    if (parsedSizeOfImage !== null && parsedSizeOfImage > 0) {
+                        sizeOfImage = parsedSizeOfImage >>> 0;
                     }
                 }
             }
+            const fDosImage = fileHeader ? 1 : 0;
 
-            if (!mappedAddress || !fileHeader) {
+            if (!fileHeader) {
+                unmapImageFile(mappedAddress);
                 Logger.warn(
                     LogCategory.SYSTEM,
-                    `MapAndLoad(image="${imageName}", resolved="${resolvedName || imageBasename}") -> invalid PE mapping ` +
-                    `(mapped=0x${mappedAddress.toString(16)}, fileHeader=0x${fileHeader.toString(16)})`
+                    `MapAndLoad(image="${imageName}", resolved="${mapped.path}") -> not a PE file`
                 );
                 system.scheduler.setLastError(ERROR_BAD_EXE_FORMAT);
                 return { value: FALSE, stackCleanup: 20 };
@@ -205,6 +228,9 @@ export class ImageHlp implements IModule {
                 system.scheduler.setLastError(ERROR_INVALID_PARAMETER);
                 return { value: FALSE, stackCleanup: 4 };
             }
+
+            const mappedAddress = Mem.readUint32(loadedImagePtr + LOADED_IMAGE_OFFSETS.mappedAddress) ?? 0;
+            if (mappedAddress) unmapImageFile(mappedAddress);
 
             if (!Mem.writeUint32(loadedImagePtr + LOADED_IMAGE_OFFSETS.hFile, 0)) {
                 system.scheduler.setLastError(ERROR_INVALID_PARAMETER);

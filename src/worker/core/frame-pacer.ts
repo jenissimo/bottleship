@@ -58,6 +58,13 @@ export function decodeD3DPresentInterval(raw: number): number {
  */
 const IMMEDIATE_PRESENTS_PER_REFRESH = 8;
 
+/**
+ * How long a frame-slot wait may hold when no rAF arrives. Far above any real refresh
+ * interval (so a foreground tab never reaches it and pacing is unchanged), far below the
+ * point where a stalled guest reads as a hang. See parkForPermit.
+ */
+const STALL_RELEASE_MS = 250;
+
 export type FramePacerStats = {
     enabled: boolean;
     frameSlotBusy: boolean;
@@ -68,14 +75,25 @@ export type FramePacerStats = {
     immediatePresents: number;
     /** Extra refreshes held for interval >= TWO (does not count the first). */
     heldRefreshes: number;
+    /** Permits the watchdog released because no frame arrived (hidden tab, occluded
+     *  window, stalled compositor). Nonzero means the display stopped, not the guest. */
+    stalledReleases: number;
 };
 
 class FramePacerImpl {
     private enabled = true;  // Enabled by default
     private running = false;
 
-    // Single-waiter queue: at most one Flip/Present awaits the next rAF permit.
-    private waiter: (() => void) | null = null;
+    /** Everyone parked on the next frame permit. A Blt-to-primary and the present it
+     *  triggers can be in flight together, so this is a QUEUE, not a slot: a second
+     *  waiter must neither strand the first (a permanent stall) nor release it early
+     *  (pacing silently off — the guest then free-runs at hundreds of "FPS" with the
+     *  spikes of an unpaced present loop). */
+    private waiters: Array<() => void> = [];
+    /** Watchdog for the parked waiters — see parkForPermit. */
+    private waiterWatchdog: ReturnType<typeof setTimeout> | null = null;
+    /** Permits released by the watchdog because no frame arrived (reported in stats). */
+    private stalledReleases = 0;
 
     // Per-frame callbacks: fired once per rAF, synchronized with display refresh.
     // Used by THRASH auto-presenter and other subsystems that need frame-boundary events.
@@ -138,11 +156,8 @@ class FramePacerImpl {
     /** Stop the rAF loop (e.g. on emulator teardown). */
     stop(): void {
         this.running = false;
-        // Release any blocked waiter so it doesn't hang forever
-        if (this.waiter) {
-            this.waiter();
-            this.waiter = null;
-        }
+        // Release anyone blocked so they don't hang forever
+        this.releaseWaiters();
     }
 
     setEnabled(enabled: boolean): void {
@@ -150,13 +165,8 @@ class FramePacerImpl {
         if (enabled && !this.running) {
             this.start();
         }
-        if (!enabled) {
-            // Release any blocked waiter
-            if (this.waiter) {
-                this.waiter();
-                this.waiter = null;
-            }
-        }
+        // Release anyone blocked — nothing will grant a permit once disabled.
+        if (!enabled) this.releaseWaiters();
     }
 
     isEnabled(): boolean {
@@ -242,9 +252,7 @@ class FramePacerImpl {
         this.totalWaits++;
 
         // Wait for the next rAF permit
-        await new Promise<void>(resolve => {
-            this.waiter = resolve;
-        });
+        await this.parkForPermit();
 
         const wallElapsed = performance.now() - wallBefore;
         this.totalWaitTimeMs += wallElapsed;
@@ -332,7 +340,7 @@ class FramePacerImpl {
         this.slotBusy = true;
         const wallBefore = performance.now();
         this.currentWaitStartMs = wallBefore;
-        await new Promise<void>(resolve => { this.waiter = resolve; });
+        await this.parkForPermit();
         const wallElapsed = performance.now() - wallBefore;
         this.totalWaitTimeMs += wallElapsed;
         this.slotBusy = false;
@@ -343,7 +351,49 @@ class FramePacerImpl {
     /** Await exactly one rAF permit (fast-path the pre-queued one). */
     private awaitRafPermit(): Promise<void> {
         if (this.permitAvailable) { this.permitAvailable = false; return Promise.resolve(); }
-        return new Promise<void>(resolve => { this.waiter = resolve; });
+        return this.parkForPermit();
+    }
+
+    /**
+     * Park until the next frame — but never longer than STALL_RELEASE_MS.
+     *
+     * The permit comes from requestAnimationFrame, and rAF is DELIVERY-CONDITIONAL: a hidden
+     * tab, a window another window covers (Chrome's native occlusion), a compositor that
+     * stops for any other reason — and callbacks simply stop arriving, with
+     * `document.visibilityState` still reporting "visible". A pacer that only ever wakes on
+     * rAF then holds its waiter forever, and because a Blt/Flip to the primary is an ASYNC
+     * THUNK, the guest thread that issued it stays parked with it: the emulator does not slow
+     * down, it stops, and only starts again when someone looks at the tab. Pacing to a display
+     * that is not producing frames is meaningless anyway — releasing is the honest answer.
+     *
+     * Everyone parked here is waiting for the SAME thing — the next frame — so a frame
+     * releases all of them, and a late arrival joins the queue instead of displacing whoever
+     * is already in it.
+     */
+    private parkForPermit(): Promise<void> {
+        return new Promise<void>((resolve) => {
+            this.waiters.push(resolve);
+            if (this.waiterWatchdog === null) {
+                this.waiterWatchdog = setTimeout(() => {
+                    this.waiterWatchdog = null;
+                    if (!this.waiters.length) return;
+                    this.stalledReleases++;
+                    this.releaseWaiters();
+                }, STALL_RELEASE_MS);
+            }
+        });
+    }
+
+    /** Hand the permit to everyone parked (from rAF, the watchdog, or teardown). */
+    private releaseWaiters(): void {
+        if (this.waiterWatchdog !== null) {
+            clearTimeout(this.waiterWatchdog);
+            this.waiterWatchdog = null;
+        }
+        if (!this.waiters.length) return;
+        const pending = this.waiters;
+        this.waiters = [];
+        for (const resolve of pending) resolve();
     }
 
     /**
@@ -444,6 +494,7 @@ class FramePacerImpl {
             currentWaitStartMs: this.currentWaitStartMs,
             immediatePresents: this.immediatePresents,
             heldRefreshes: this.heldRefreshes,
+            stalledReleases: this.stalledReleases,
         };
     }
 
@@ -453,6 +504,7 @@ class FramePacerImpl {
         this.currentWaitStartMs = 0;
         this.immediatePresents = 0;
         this.heldRefreshes = 0;
+        this.stalledReleases = 0;
     }
 
     // --- Internal ---
@@ -490,18 +542,14 @@ class FramePacerImpl {
         this.lastRafTime = now;
 
         // Grant the permit: release the waiting Flip/Present
-        if (this.waiter) {
-            const resolve = this.waiter;
-            this.waiter = null;
-
+        if (this.waiters.length) {
             // Record the actual wait time for diagnostics
             if (frameVarianceDiagnostics.isEnabled() && this.currentWaitStartMs > 0) {
                 const waitMs = now - this.currentWaitStartMs;
                 frameVarianceDiagnostics.recordRafWait(waitMs, now);
                 frameVarianceDiagnostics.recordEvent('frame_pacer_wait', undefined, waitMs);
             }
-
-            resolve();
+            this.releaseWaiters();
         } else {
             // No one waiting — queue one permit for next waitForFrameSlot().
             // Only one permit queued at a time (no accumulation).

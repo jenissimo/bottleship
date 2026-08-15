@@ -3,7 +3,7 @@
 
 import { ThunkImplementation, ThunkResult } from '../../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../../core/logger';
-import { System } from '../../../core/system';
+import { System, type GuestImagePatch } from '../../../core/system';
 import {
     EmulatorConfig,
     VER_PLATFORM_WIN32_NT,
@@ -40,6 +40,15 @@ const ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000;
 const HIGH_PRIORITY_CLASS = 0x00000080;
 const REALTIME_PRIORITY_CLASS = 0x00000100;
 const INVALID_HANDLE_VALUE = 0xFFFFFFFF;
+const GENERIC_READ = 0x80000000;
+const OPEN_EXISTING = 3;
+const IMAGE_DOS_SIGNATURE = 0x5a4d;   // 'MZ'
+const IMAGE_NT_SIGNATURE = 0x00004550; // 'PE\0\0'
+const IMAGE_FILE_MACHINE_I386 = 0x014c;
+const IMAGE_FILE_DLL = 0x2000;
+// e_lfanew is a 32-bit offset, but a real image keeps its NT headers inside the first
+// page; a sniff that reads further would pay a second range read to reject junk.
+const PE_SNIFF_BYTES = 0x1000;
 
 let currentPriorityClass = NORMAL_PRIORITY_CLASS;
 
@@ -407,10 +416,81 @@ const getVirtualMemoryMapForPid = (pid: number): Map<number, number> => {
     return map;
 };
 
+/**
+ * A suspended child's mapped image, so ReadProcessMemory answers out of the CHILD's file
+ * rather than out of the parent's own address space.
+ *
+ * Reading the parent is not a degraded answer, it is a wrong one: a launcher that reads
+ * its child's PE headers to find the entry point gets its OWN header back, decrypts at an
+ * address that means nothing in the child, and writes the result there. Everything
+ * downstream then looks plausible and is off by a whole image.
+ */
+interface ChildImageMap {
+    file: Uint8Array;
+    imageBase: number;
+    /** RVA -> file offset for the section containing it, or -1 when it maps to no raw bytes. */
+    sections: Array<{ va: number; vsize: number; raw: number; rawSize: number }>;
+}
+const childImageByPid = new Map<number, ChildImageMap | null>();
+
+const loadChildImage = (path: string): ChildImageMap | null => {
+    const vfs = System.getInstance().fileSystem;
+    const handle = vfs.openSync(path, GENERIC_READ, OPEN_EXISTING);
+    if (!handle) return null;
+    const file = vfs.readSync(handle, vfs.getFileSize(handle.path));
+    if (!file || file.byteLength < 0x40) return null;
+
+    const view = new DataView(file.buffer, file.byteOffset, file.byteLength);
+    if (view.getUint16(0, true) !== IMAGE_DOS_SIGNATURE) return null;
+    const pe = view.getUint32(0x3c, true);
+    if (pe + 24 > file.byteLength || view.getUint32(pe, true) !== IMAGE_NT_SIGNATURE) return null;
+    const sectionCount = view.getUint16(pe + 6, true);
+    const optSize = view.getUint16(pe + 20, true);
+    const imageBase = view.getUint32(pe + 24 + 28, true);
+    const table = pe + 24 + optSize;
+
+    const sections: ChildImageMap["sections"] = [];
+    for (let i = 0; i < sectionCount; i++) {
+        const s = table + i * 40;
+        if (s + 40 > file.byteLength) break;
+        sections.push({
+            va: view.getUint32(s + 12, true),
+            vsize: view.getUint32(s + 8, true),
+            raw: view.getUint32(s + 20, true),
+            rawSize: view.getUint32(s + 16, true),
+        });
+    }
+    return { file, imageBase, sections };
+};
+
+const childImageForPid = (pid: number): ChildImageMap | null => {
+    const cached = childImageByPid.get(pid >>> 0);
+    if (cached !== undefined) return cached;
+    const pending = pendingSuspendedChildExec.get(pid >>> 0);
+    const image = pending ? loadChildImage(pending.imagePath) : null;
+    childImageByPid.set(pid >>> 0, image);
+    return image;
+};
+
+/** File offset backing a linear address in the child image, or -1 (headers, BSS, unmapped). */
+const childFileOffset = (image: ChildImageMap, address: number): number => {
+    const rva = (address >>> 0) - image.imageBase;
+    if (rva < 0) return -1;
+    for (const s of image.sections) {
+        if (rva >= s.va && rva < s.va + s.vsize) {
+            const off = s.raw + (rva - s.va);
+            return rva - s.va < s.rawSize && off < image.file.byteLength ? off : -1;
+        }
+    }
+    // Below the first section: the PE headers, which map 1:1 from offset 0.
+    return rva < (image.sections[0]?.va ?? 0) && rva < image.file.byteLength ? rva : -1;
+};
+
 const readVirtualProcessMemory = (pid: number, address: number, size: number): Uint8Array | null => {
     const base = address >>> 0;
     const store = virtualProcessMemoryByPid.get(pid >>> 0);
-    const fallback = Mem.readBytes(base, size);
+    const image = childImageForPid(pid);
+    const fallback = image ? null : Mem.readBytes(base, size);
     const out = new Uint8Array(size);
 
     for (let i = 0; i < size; i++) {
@@ -418,6 +498,14 @@ const readVirtualProcessMemory = (pid: number, address: number, size: number): U
         const written = store?.get(key);
         if (written !== undefined) {
             out[i] = written & 0xFF;
+            continue;
+        }
+
+        if (image) {
+            const off = childFileOffset(image, key);
+            // A section's uninitialised tail (VirtualSize past SizeOfRawData) is zero in a
+            // mapped image, which is exactly what a miss yields here.
+            out[i] = off >= 0 ? image.file[off]! : 0;
             continue;
         }
 
@@ -433,6 +521,36 @@ const readVirtualProcessMemory = (pid: number, address: number, size: number): U
     return out;
 };
 
+/**
+ * Everything written into a child's address space, coalesced into contiguous runs. The
+ * per-byte map is what WriteProcessMemory records; a restart needs the runs.
+ */
+const collectVirtualProcessWrites = (pid: number): GuestImagePatch[] => {
+    const store = virtualProcessMemoryByPid.get(pid >>> 0);
+    if (!store || store.size === 0) return [];
+
+    const addresses = [...store.keys()].sort((a, b) => a - b);
+    const patches: GuestImagePatch[] = [];
+    let runStart = addresses[0]!;
+    let bytes: number[] = [];
+    const flush = (): void => {
+        if (!bytes.length) return;
+        let binary = "";
+        for (const b of bytes) binary += String.fromCharCode(b);
+        patches.push({ address: runStart, data: btoa(binary) });
+        bytes = [];
+    };
+    for (const addr of addresses) {
+        if (bytes.length && addr !== runStart + bytes.length) {
+            flush();
+            runStart = addr;
+        }
+        bytes.push(store.get(addr)! & 0xff);
+    }
+    flush();
+    return patches;
+};
+
 const writeVirtualProcessMemory = (pid: number, address: number, data: Uint8Array): number => {
     const base = address >>> 0;
     const store = getVirtualMemoryMapForPid(pid >>> 0);
@@ -446,16 +564,43 @@ const isUnrealBrowserProbe = (applicationName: string, commandLine: string): boo
     isUe1RenderProbeCommandLine(`${applicationName} ${commandLine}`.trim());
 
 /**
+ * True when the file's own bytes are an i386 PE executable image. CreateProcess maps the
+ * file as a section and never consults the extension, so a wrapper that ships the real
+ * game under a private suffix (Reflexive's `.RWG`) is launchable exactly like an `.exe` —
+ * an extension test refuses it and the wrapper then exits having started nothing.
+ * A DLL is excluded: it is a PE, but not something CreateProcess will run.
+ */
+const hasPeExecutableHeader = (path: string): boolean => {
+    const vfs = System.getInstance().fileSystem;
+    const handle = vfs.openSync(path, GENERIC_READ, OPEN_EXISTING);
+    if (!handle) return false;
+    const head = vfs.readSync(handle, PE_SNIFF_BYTES);
+    if (!head || head.byteLength < 0x40) return false;
+
+    const view = new DataView(head.buffer, head.byteOffset, head.byteLength);
+    if (view.getUint16(0, true) !== IMAGE_DOS_SIGNATURE) return false;
+    const peOffset = view.getUint32(0x3c, true);
+    if (peOffset + 24 > head.byteLength) return false;
+    if (view.getUint32(peOffset, true) !== IMAGE_NT_SIGNATURE) return false;
+    if (view.getUint16(peOffset + 4, true) !== IMAGE_FILE_MACHINE_I386) return false;
+    return (view.getUint16(peOffset + 22, true) & IMAGE_FILE_DLL) === 0;
+};
+
+/**
  * True when `path` names an executable that ships in the mounted bundle — the only kind
  * of child we can honour, because running it means remounting this bundle on that entry
  * point. An .exe the guest merely *names* (notepad, a system tool, an installer that was
  * never packed) is not there, and must keep failing rather than restarting the session
  * onto a file that does not exist.
+ *
+ * The header decides; the extension is only the answer for a bundled file whose first
+ * bytes are not readable without going async (a compressed entry not yet cached), where
+ * refusing a plainly-named `.exe` would be a regression.
  */
 const isBundledImage = (path: string): boolean => {
-    if (!/\.(exe|com)$/i.test(path)) return false;
     try {
-        return System.getInstance().fileSystem.fileExists(path);
+        if (!System.getInstance().fileSystem.fileExists(path)) return false;
+        return hasPeExecutableHeader(path) || /\.(exe|com)$/i.test(path);
     } catch {
         return false;
     }
@@ -478,6 +623,19 @@ const failVirtualProcess = (
     return { value: 0, stackCleanup: 40 };
 };
 
+const CREATE_SUSPENDED = 0x00000004;
+
+/**
+ * Children created SUSPENDED on an image we could actually run, keyed by pid, until the
+ * launcher resumes them.
+ *
+ * CREATE_SUSPENDED means "map it but do not start it yet" — the caller intends to modify
+ * the child before its first instruction, which for this family of launchers is the whole
+ * point: the on-disk image is encrypted and the parent WriteProcessMemory's the decrypted
+ * code over it. Running such an image at CreateProcess time executes ciphertext.
+ */
+const pendingSuspendedChildExec = new Map<number, { imagePath: string; commandLine: string }>();
+
 const finishVirtualProcess = (
     lpProcessInformation: number,
     applicationName: string,
@@ -485,7 +643,8 @@ const finishVirtualProcess = (
     currentDirectory: string,
     dwCreationFlags: number,
     isWide: boolean,
-    noOpProbe: boolean
+    noOpProbe: boolean,
+    deferredExec?: { imagePath: string; commandLine: string }
 ): ThunkResult => {
     const manager = getVirtualProcessManager();
     const proc = manager.createProcess({
@@ -508,12 +667,15 @@ const finishVirtualProcess = (
         return { value: 0, stackCleanup: 40 };
     }
 
+    if (deferredExec) pendingSuspendedChildExec.set(proc.processId, deferredExec);
+
     Logger.log(
         LogCategory.KERNEL32,
         `CreateProcess${isWide ? 'W' : 'A'}("${applicationName}", "${commandLine}", cwd="${currentDirectory}", ` +
         `flags=0x${dwCreationFlags.toString(16)}) -> pid=${proc.processId} tid=${proc.threadId} ` +
         `hProcess=0x${proc.processHandle.toString(16)} hThread=0x${proc.threadHandle.toString(16)}` +
-        `${noOpProbe ? ' no-op-probe=1 sync=1' : ''}`
+        `${noOpProbe ? ' no-op-probe=1 sync=1' : ''}` +
+        `${deferredExec ? ` suspended-exec="${deferredExec.imagePath}"` : ''}`
     );
 
     System.getInstance().scheduler.setLastError(0);
@@ -576,6 +738,15 @@ const createVirtualProcess = (memory: Uint8Array, args: number[], isWide: boolea
         // bundle. One process hosts one image here, so run it the same way a self re-exec
         // runs: restart on that entry point. The launcher exits right after either way.
         const imagePath = argv0 ? system.resolveImagePath(argv0, currentDirectory || "") : "";
+        const deferExec = (dwCreationFlags & CREATE_SUSPENDED) !== 0
+            || !!(globalThis as { __noSuspendedChildExec?: boolean }).__noSuspendedChildExec;
+        if (imagePath && isBundledImage(imagePath) && deferExec) {
+            return finishVirtualProcess(
+                lpProcessInformation, applicationName, commandLine,
+                currentDirectory, dwCreationFlags, isWide, true,
+                { imagePath, commandLine: reExecArgs },
+            );
+        }
         if (imagePath && isBundledImage(imagePath)
             && system.requestReExec(reExecArgs, imagePath)) {
             Logger.log(LogCategory.SYSTEM,
@@ -796,7 +967,30 @@ export const exports: Record<string, ThunkImplementation> = {
         const hThread = args[0];
         const system = System.getInstance();
         const manager = getVirtualProcessManager();
+        // Resolve the owner BEFORE resuming: resumeThread can retire the record.
+        const childPid = manager.getProcessIdByThreadHandle(hThread);
         const virtualPrev = manager.resumeThread(hThread);
+
+        // The launcher has finished preparing the child (see pendingSuspendedChildExec):
+        // this is the point real Windows starts running it, and therefore ours too.
+        if (childPid !== null && virtualPrev === 1) {
+            const deferred = (globalThis as { __noSuspendedChildExec?: boolean }).__noSuspendedChildExec
+                ? undefined
+                : pendingSuspendedChildExec.get(childPid);
+            if (deferred) {
+                const patches = collectVirtualProcessWrites(childPid);
+                pendingSuspendedChildExec.delete(childPid);
+                childImageByPid.delete(childPid);
+                if (system.requestReExec(deferred.commandLine, deferred.imagePath, patches)) {
+                    const patchedBytes = patches.reduce((n, p) => n + ((p.data.length / 4) | 0) * 3, 0);
+                    Logger.log(LogCategory.SYSTEM,
+                        `[KERNEL32] ResumeThread(pid=${childPid}) -> exec "${deferred.imagePath}" ` +
+                        `(launcher resumed the child it created suspended; ` +
+                        `${patches.length} patch run(s), ~${patchedBytes} bytes)`);
+                    return { value: virtualPrev, stackCleanup: 4 };
+                }
+            }
+        }
         const prevSuspendCount = virtualPrev !== null
             ? virtualPrev
             : system.scheduler.resumeThread(hThread);

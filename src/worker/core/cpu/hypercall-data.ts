@@ -48,6 +48,9 @@ const OFF_HC_CURRENT_THREAD_ID = 0x034;
 // 256 slots each, u32, saturating — see getHandlerReport().
 const OFF_HC_HANDLER_CALLS = 0x2000;
 const OFF_HC_HANDLER_FALLBACKS = 0x2400;
+/** 32 slots of (thread handle, suspend count) — see publishThreadSuspendCounts. */
+const OFF_HC_THREAD_SUSPEND = 0x2800;
+const HC_THREAD_SUSPEND_SLOTS = 32;
 const HC_HANDLER_SLOTS = 256;
 const OFF_HC_CURSOR_X = 0x080;
 const OFF_HC_CURSOR_Y = 0x084;
@@ -157,6 +160,7 @@ const HANDLER_IS_BAD_WRITE_PTR = 79;
 const HANDLER_RELEASE_MUTEX = 80;
 const HANDLER_WAIT_FOR_SINGLE_OBJECT = 81;
 const HANDLER_GET_CAPTURE = 82;
+const HANDLER_RESUME_THREAD = 83;
 
 /**
  * Inner-loop HLE handler-id band (128..=255) — engine compute kernels, kept
@@ -233,6 +237,11 @@ const HANDLER_MAP: Record<string, number> = {
     'kernel32.setevent': HANDLER_SET_EVENT,
     'kernel32.releasemutex': HANDLER_RELEASE_MUTEX,
     'kernel32.waitforsingleobject': HANDLER_WAIT_FOR_SINGLE_OBJECT,
+    // ResumeThread — the WASM handler answers ONLY a resume of a thread that is not suspended
+    // (returns 0, changes nothing); everything else falls through to the scheduler. Engines
+    // that kick a worker once per main-loop iteration make this one of the hottest thunks
+    // there is (Discworld Noir: ~270k calls/s, virtually all of them no-ops).
+    'kernel32.resumethread': HANDLER_RESUME_THREAD,
     // GetCurrentThreadId — pure read of the page's current-thread-id (republished on every
     // context switch). Read-only, no scheduler state touched; onTickHook compensates the
     // skipped onThunkComplete the same as GetLastError. Hot via the CRT's _getptd().
@@ -459,6 +468,8 @@ export class HypercallDataManager {
     // or a WASM-buffer change would silently re-enable them mid-run and the write trap
     // would report a clean range it never actually covered.
     private wasmStringWritersOff = false;
+    /** thread handle -> slot index in the shared suspend table (packed from the front). */
+    private readonly threadSuspendSlots = new Map<number, number>();
 
     initialize(cpu: any, hpBase: number): void {
         this.cpu = cpu;
@@ -1454,6 +1465,69 @@ export class HypercallDataManager {
         this.refreshViews();
         if (!this.view) return;
         this.view.setUint32(this.hpBase + OFF_HC_SLEEP_STARVATION_LIMIT, limit >>> 0, true);
+    }
+
+    /**
+     * Publish one thread's suspend count for the WASM ResumeThread handler.
+     *
+     * The handler answers only "this thread is NOT suspended, so the resume is a no-op", so the
+     * table must never claim 0 for a thread that IS suspended — every count change publishes,
+     * and a terminated thread is removed (its handle can come back on a new thread). A handle
+     * that is absent, or a full table, simply means the JS scheduler answers as it always did.
+     */
+    setThreadSuspendCount(handle: number, suspendCount: number): void {
+        if (!this.initialized || !this.view) return;
+        const h = handle >>> 0;
+        if (h === 0) return;
+        let slot = this.threadSuspendSlots.get(h);
+        if (slot === undefined) {
+            if (this.threadSuspendSlots.size >= HC_THREAD_SUSPEND_SLOTS) return;
+            slot = this.threadSuspendSlots.size;
+            this.threadSuspendSlots.set(h, slot);
+        }
+        this.refreshViews();
+        if (!this.view) return;
+        const base = this.hpBase + OFF_HC_THREAD_SUSPEND + slot * 8;
+        this.view.setUint32(base, h, true);
+        this.view.setUint32(base + 4, suspendCount >>> 0, true);
+    }
+
+    /** Drop a thread from the table (termination). Slots stay packed from the front: the
+     *  handler stops scanning at the first empty one. */
+    forgetThreadSuspendCount(handle: number): void {
+        if (!this.initialized || !this.view) return;
+        const h = handle >>> 0;
+        const slot = this.threadSuspendSlots.get(h);
+        if (slot === undefined) return;
+        this.threadSuspendSlots.delete(h);
+        this.refreshViews();
+        if (!this.view) return;
+        const lastSlot = this.threadSuspendSlots.size; // index of the now-surplus tail entry
+        if (slot !== lastSlot) {
+            // Move the tail entry into the hole so the scan never sees a gap.
+            const from = this.hpBase + OFF_HC_THREAD_SUSPEND + lastSlot * 8;
+            const to = this.hpBase + OFF_HC_THREAD_SUSPEND + slot * 8;
+            const movedHandle = this.view.getUint32(from, true);
+            this.view.setUint32(to, movedHandle, true);
+            this.view.setUint32(to + 4, this.view.getUint32(from + 4, true), true);
+            if (movedHandle !== 0) this.threadSuspendSlots.set(movedHandle >>> 0, slot);
+        }
+        const tail = this.hpBase + OFF_HC_THREAD_SUSPEND + lastSlot * 8;
+        this.view.setUint32(tail, 0, true);
+        this.view.setUint32(tail + 4, 0, true);
+    }
+
+    /** Process reset — the next run's threads are not this one's. */
+    resetThreadSuspendTable(): void {
+        this.threadSuspendSlots.clear();
+        if (!this.initialized) return;
+        this.refreshViews();
+        if (!this.view) return;
+        for (let i = 0; i < HC_THREAD_SUSPEND_SLOTS; i++) {
+            const off = this.hpBase + OFF_HC_THREAD_SUSPEND + i * 8;
+            this.view.setUint32(off, 0, true);
+            this.view.setUint32(off + 4, 0, true);
+        }
     }
 
     /**
