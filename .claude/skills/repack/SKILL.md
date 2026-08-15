@@ -24,6 +24,13 @@ don't reach for a binary.
 | `.arc` | FreeArc (srep+LZMA) repacks | `packages/formats/src/freearc/` |
 | `.rar` | store-only RAR5 wrapper around an installer (typical game drop), incl. `.partN.rar` sets | `bun tools/rar-extract.ts <a.rar> <out> [--list]` — refuses compressed/solid/encrypted/RAR4 |
 | `.zip` / `.wgb` | store+deflate ZIP (also the `.wgb` container) | `bun tools/wgb.ts` |
+| Blizzard `setup.exe` / `.mpq` | MoPaQ archive appended to a self-extracting stub | `bun tools/mpq-extract.ts <installer.exe> <out> [--list]` |
+
+A Blizzard installer payload carries no `(listfile)` — MPQ stores hashes, not names — so
+`--list` comes up empty and extraction has to go by block index. The names live in the
+installer's own script inside the archive (`SetupDat\*.ins`, the `FileBlock` lists): dump the
+blocks, read the script, then map MPQ paths to install paths. Files whose block is encrypted
+still decrypt: the key is recovered from the sector table.
 
 Cores live in `packages/formats/src/<fmt>/`; the native codec backend (LZMA1/2/srep) is
 `public/unpack-streaming.wasm` (Rust crate `tools/build-unpack-streaming`). See CLAUDE.md

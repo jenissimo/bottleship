@@ -434,6 +434,12 @@ Archive / installer formats — USE OUR OWN READERS, never `apt install` a third
                       `tools/rar-extract.ts <a.rar> <out> [--list]`. RAR's own compression,
                       solid groups, encryption and RAR 1.5–4.x are REFUSED by name.
     - iso/          — ISO9660 + BIN/CUE disc images. CLI: `tools/iso-to-wgb.ts`; `tools/bin2iso.ts`.
+    - mpq/          — MoPaQ (`MPQ\x1A`, v0/v1), incl. one APPENDED to a Blizzard self-extracting
+                      installer, and MPQs nested inside it. Storm crypt + PKWARE DCL implode
+                      (`explode.ts`) + zlib. CLI: `tools/mpq-extract.ts <a.mpq|installer.exe> <out>
+                      [--list]`. An installer payload has NO `(listfile)`: names come from the
+                      install script inside it, and `readBlockByIndex` recovers a block's key from
+                      its own sector table when there is no name to hash.
     - unpack/       — shared native codec backend (LZMA1/LZMA2/srep) built from the Rust crate
                       `tools/build-unpack-streaming` → `public/unpack-streaming.wasm`, plus the
                       dependency-free primitives (RandomAccessSource, Crc32/Md5/Sha1) every reader uses.
