@@ -931,9 +931,9 @@ export default function App() {
         const pendingReExec = sessionStorage.getItem(REEXEC_KEY);
         if (pendingReExec) {
           sessionStorage.removeItem(REEXEC_KEY);
-          const { args, url, image } = JSON.parse(pendingReExec) as
-            { args: string; url: string | null; image?: string | null };
-          globalWorker.postMessage({ type: "set_boot_args", args, image: image ?? null });
+          const { args, url, image, patches } = JSON.parse(pendingReExec) as
+            { args: string; url: string | null; image?: string | null; patches?: unknown[] | null };
+          globalWorker.postMessage({ type: "set_boot_args", args, image: image ?? null, patches: patches ?? null });
           console.info("[bs] re-exec boot:", image ?? "(manifest entrypoint)", args, url ? `(url ${url})` : "");
           if (url) reExecBundleUrl = url;
         }
@@ -1242,6 +1242,10 @@ export default function App() {
             // Set when the launcher started a DIFFERENT image from the same bundle: the
             // new worker boots that entry point instead of the manifest's.
             image: typeof event.data.image === "string" ? event.data.image : null,
+            // What the launcher wrote into the child while it was suspended (decrypted
+            // code, for the encrypt-on-disk launchers). Without it the restart runs the
+            // untouched, still-encrypted image.
+            patches: Array.isArray(event.data.patches) ? event.data.patches : null,
           }));
           window.location.reload();
         } catch (e) {

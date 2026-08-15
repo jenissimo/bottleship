@@ -101,41 +101,15 @@ import { registerDirectDraw2Exports } from "./directdraw-v2";
 
 import { windows as sharedWindows } from "../user32/shared-state";
 import type { WindowInfo } from "../user32/shared-state";
+import { resizeFullscreenWindowToMode } from "../../runtime/windowing/fullscreen-window";
 import { repaintDialogOverlayIfVisible, requestGuestDialogPaint } from "../user32/dialog-paint";
 
 type DDEnumCallback = (lpGUID: number, lpDriverDescription: number, lpDriverName: number, lpContext: number) => number;
 
 function resizeFullscreenWindow(system: System, width: number, height: number): void {
-    const ddraw = system.ddrawContext;
-    if (!ddraw) return;
-
-    const hwnd = ddraw.cooperative.hwnd;
+    const hwnd = system.ddrawContext?.cooperative.hwnd;
     if (!hwnd) return;
-
-    // Update WindowManager's WindowObject
-    const wm = system.windowManager;
-    const winObj = wm.getWindow(hwnd);
-    if (winObj) {
-        winObj.rect.w = width;
-        winObj.rect.h = height;
-        winObj.rect.x = 0;
-        winObj.rect.y = 0;
-        Logger.log(LogCategory.DDRAW,
-            `resizeFullscreenWindow: hwnd=0x${hwnd.toString(16)} -> ${width}x${height}`);
-    }
-
-    // Update shared-state WindowInfo (used by GetClientRect, etc.)
-    const sharedWin = sharedWindows.get(hwnd);
-    if (sharedWin) {
-        sharedWin.width = width;
-        sharedWin.height = height;
-        sharedWin.x = 0;
-        sharedWin.y = 0;
-    }
-
-    // Post WM_SIZE so the game can update its viewport/projection (mirrors real Windows behavior)
-    system.windowManager.postMessage(hwnd, 0x0005 /* WM_SIZE */, 0 /* SIZE_RESTORED */,
-        ((width & 0xFFFF) | ((height & 0xFFFF) << 16)) >>> 0);
+    resizeFullscreenWindowToMode(hwnd, width, height, "DDraw");
 }
 
 /**

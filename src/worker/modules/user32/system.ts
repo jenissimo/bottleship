@@ -1089,6 +1089,12 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         return exports['MapVirtualKeyA']!(ctx, mem, args) as number;
     };
 
+    // The *Ex forms take the layout explicitly; we model one layout, so the mapping is
+    // the same one. The extra HKL argument only changes the arity, and getting THAT wrong
+    // is a corrupted guest stack rather than a wrong key code.
+    exports['MapVirtualKeyExA'] = (ctx, mem, args) => exports['MapVirtualKeyA']!(ctx, mem, args) as number;
+    exports['MapVirtualKeyExW'] = (ctx, mem, args) => exports['MapVirtualKeyA']!(ctx, mem, args) as number;
+
     // int ToAscii(UINT uVirtKey, UINT uScanCode, const BYTE *lpKeyState, LPWORD lpChar, UINT uFlags)
     exports['ToAscii'] = (ctx, mem, args) => {
         const uVirtKey = args[0];
@@ -1147,6 +1153,10 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         return 1; // one character produced
     };
 
+    // The *Ex forms differ only in taking the layout explicitly instead of the calling
+    // thread's. We model one layout, so the translation itself is the same one.
+    exports['ToAsciiEx'] = (ctx, mem, args) => exports['ToAscii']!(ctx, mem, args) as number;
+
     // ToUnicode is semantically similar to ToAscii for basic Latin keyboard paths.
     // Reuse ToAscii conversion and write one UTF-16 code unit at pwszBuff.
     exports['ToUnicode'] = (ctx, mem, args) => {
@@ -1164,6 +1174,8 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
             args[5] >>> 0,
         ]) as number;
     };
+
+    exports['ToUnicodeEx'] = (ctx, mem, args) => exports['ToUnicode']!(ctx, mem, args) as number;
 
     // Decode a WM_KEYDOWN-style lParam into a Set 1 / US-layout key name.
     // Bit 24 = extended, bit 25 = "don't care about left vs. right" (nt5 xlate.c _GetKeyNameText):

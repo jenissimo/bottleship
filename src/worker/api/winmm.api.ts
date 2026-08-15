@@ -123,6 +123,9 @@ export const winmmModule: ModuleDescriptor = {
         makeFunc("midiStreamOut", 3),        // hms, pmh, cbmh
         makeFunc("midiStreamPosition", 3),   // hms, lpmmt, cbmmt
         makeFunc("midiStreamProperty", 3),   // hms, lppropdata, dwProperty
+        makeFunc("midiInAddBuffer", 3),      // hmi, pmh, cbmh
+        makeFunc("midiInPrepareHeader", 3),  // hmi, pmh, cbmh
+        makeFunc("midiInUnprepareHeader", 3),// hmi, pmh, cbmh
         makeFunc("midiInMessage", 4),
         makeFunc("midiInOpen", 5),
         makeFunc("midiInReset", 1),

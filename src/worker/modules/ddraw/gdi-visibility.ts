@@ -5,6 +5,7 @@
 import type { DDrawContext } from './context';
 import type { RenderActive } from '../../runtime/runtime-services';
 import { surfaceAt } from './helpers';
+import { DirectDrawClipperObject } from './com-objects';
 import { windows as sharedWindows } from '../user32/shared-state';
 
 import { DDSCL_FULLSCREEN, DDSCL_EXCLUSIVE } from './constants';
@@ -73,12 +74,33 @@ export function ddrawShowsContent(ddrawCtx: DDrawContext | null | undefined): bo
  * desktop around them (Wine: ddraw_surface_blt honours the attached clipper's window region).
  */
 function ddrawWindowCoversDisplay(ddrawCtx: DDrawContext | null | undefined): boolean {
-    const hwnd = ddrawCtx?.cooperative?.hwnd ?? 0;
+    const hwnd = ddrawTargetWindow(ddrawCtx);
     const mode = ddrawCtx?.display;
     if (!hwnd || !mode?.width || !mode?.height) return false;
     const win = sharedWindows.get(hwnd);
     if (!win || !win.visible) return false;
     return win.width >= mode.width && win.height >= mode.height;
+}
+
+/**
+ * The window a windowed primary blit lands in.
+ *
+ * `SetCooperativeLevel(NULL, DDSCL_NORMAL)` is legal — the hwnd argument is only required
+ * for DDSCL_EXCLUSIVE — and an app that passes NULL names its window the other way DirectDraw
+ * offers: an IDirectDrawClipper with SetHWnd attached to the primary, which is what the blit
+ * is clipped against in the first place (Wine: ddraw_surface_blt honours the attached
+ * clipper's window region). So the clipper answers first and the cooperative window is the
+ * fallback; for the usual app that sets both they are the same window.
+ */
+function ddrawTargetWindow(ddrawCtx: DDrawContext | null | undefined): number {
+    const coop = ddrawCtx?.cooperative?.hwnd ?? 0;
+    const provider = ddrawCtx?.resourceProvider;
+    const primary = provider ? surfaceAt(provider, ddrawCtx?.surfaces?.primary ?? 0) : null;
+    const clipperHandle = primary?.getState().clipperHandle;
+    if (clipperHandle === undefined || !provider) return coop;
+    const clipper = provider.getComObject(clipperHandle);
+    if (!(clipper instanceof DirectDrawClipperObject)) return coop;
+    return clipper.getHwnd() || coop;
 }
 
 /** GDI desktop surface hidden while the flip chain owns the screen. */

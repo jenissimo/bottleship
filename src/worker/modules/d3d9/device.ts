@@ -12,6 +12,7 @@ import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { gammaService } from '../../core/gamma-service';
 import { D3D9Device } from '../../backends/webgpu/d3d9/d3d9-device';
 import { WebGPUBackend } from '../../backends/webgpu/webgpu-backend';
+import { resizeFullscreenWindowToMode } from '../../runtime/windowing/fullscreen-window';
 import {
     acknowledgeDeviceReset,
     deviceCooperativeLevel,
@@ -420,6 +421,14 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
                 const fullscreen = ppView.getUint32(pPresentationParameters + 32, true) === 0;
                 Logger.log(LogCategory.D3D9, `CreateDevice backbuffer ${bbWidth}x${bbHeight} fullscreen=${fullscreen}`);
                 device.setBackBufferSize(bbWidth, bbHeight, fullscreen);
+                // A FULLSCREEN device also puts its window INTO that mode, and engines size
+                // themselves from the window they get back (hDeviceWindow @ +28, else the
+                // focus window).
+                if (fullscreen) {
+                    resizeFullscreenWindowToMode(
+                        (ppView.getUint32(pPresentationParameters + 28, true) || hFocusWindow) >>> 0,
+                        bbWidth, bbHeight, "D3D9 CreateDevice");
+                }
                 // The swap interval the app asked for. D3DCAPS9.PresentationIntervals
                 // advertises IMMEDIATE|ONE|TWO|THREE|FOUR, so Present has to honor it.
                 device.setPresentationInterval(
@@ -527,6 +536,21 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         // present parameters land, so a re-upload sees the new windowed state.
         releaseDeviceCursor(pDevice);
         const hr = device.reset(pPresentationParameters, mem);
+        // An in-game resolution switch IS a Reset, and a fullscreen one re-sizes the window
+        // to the new mode just as CreateDevice did — an engine that re-creates its render
+        // targets from GetClientRect otherwise builds them for the mode it just left.
+        if (pPresentationParameters) {
+            const ppView = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            if (ppView.getUint32(pPresentationParameters + 32, true) === 0) {
+                const hwnd = (ppView.getUint32(pPresentationParameters + 28, true)
+                    || deviceCreationParams.get(pDevice)?.hFocusWindow || 0) >>> 0;
+                resizeFullscreenWindowToMode(
+                    hwnd,
+                    ppView.getUint32(pPresentationParameters + 0, true),
+                    ppView.getUint32(pPresentationParameters + 4, true),
+                    "D3D9 Reset");
+            }
+        }
         bindAutoDepthStencil(device, pDevice, mem, pPresentationParameters);
         // A Reset re-declares the backbuffer (this is how in-game resolution switchers
         // work), so the recorded geometry must follow it or every later GetDesc /
