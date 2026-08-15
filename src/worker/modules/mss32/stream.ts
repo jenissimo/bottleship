@@ -11,11 +11,18 @@ import {
 } from "./helpers";
 import { playStream, updateStreamPlayback, stopRingBuffer, resumeRingBuffer } from "./playback-engine";
 import { decodeStreamFile } from "./audio-decode";
+import { GuestCallChain, hasAppFileCallbacks, readWholeFileViaApp, runGuestCallChain } from "./app-file-io";
 
 export function createStreamExports(ctx: MSSContext): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
 
     // _AIL_open_stream@12
+    //
+    // With the app's file callbacks installed, Miles opens the stream THROUGH THEM
+    // (the name is an archive entry, not a file). That is guest code, so the caller
+    // is parked on a suspended-thunk chain until the data has landed and the handle
+    // can be returned — same shape as a Win32 enumeration, and a cold read inside
+    // the app's reader simply parks and resumes like any other guest I/O.
     exports["_AIL_open_stream@12"] = (ctxThunk, mem, args) => {
         const dig = args[0];
         const filenamePtr = args[1];
@@ -66,6 +73,22 @@ export function createStreamExports(ctx: MSSContext): Record<string, ThunkImplem
         ctx.streams.set(handle, stream);
         ctx.streamsById.set(streamId, stream);
 
+        if (filenameStr && hasAppFileCallbacks(ctx)) {
+            const chain = (function* (): GuestCallChain {
+                const data = yield* readWholeFileViaApp(ctx, filenamePtr, filenameStr);
+                if (!data) {
+                    discardStream(ctx, stream);
+                    return 0;
+                }
+                stream.fileData = data;
+                decodeStreamFile(ctx, stream);
+                Logger.log(LogCategory.SYSTEM,
+                    `MSS32: _AIL_open_stream@12 -> 0x${handle.toString(16)} (streamId=${streamId}, ${data.length} bytes via app callbacks)`);
+                return handle;
+            })();
+            return runGuestCallChain(ctx, ctxThunk, 12, "mss32:AIL_open_stream", chain);
+        }
+
         if (filenameStr) {
             loadStreamFile(ctx, stream).catch(err => {
                 Logger.error(LogCategory.SYSTEM, `MSS32: Failed to load stream file "${filenameStr}": ${err}`);
@@ -112,23 +135,7 @@ export function createStreamExports(ctx: MSSContext): Record<string, ThunkImplem
             Logger.warn(LogCategory.SYSTEM, `MSS32: _AIL_start_stream@4: Invalid stream handle`);
             return 0;
         }
-
-        stream.startTime = performance.now();
-
-        if (!stream.decodedData) {
-            if (stream.fileData && isEncodedFormat(stream.fileFormat)) {
-                playStream(ctx, stream);
-                Logger.log(LogCategory.SYSTEM, `MSS32: _AIL_start_stream@4: Started ${stream.fileFormat} stream`);
-                return 0;
-            }
-            Logger.warn(LogCategory.SYSTEM, `MSS32: _AIL_start_stream@4: No data yet, deferring start`);
-            stream.pendingStart = true;
-            setStreamStatus(ctx, stream, SMP_PLAYING);
-            return 0;
-        }
-
-        playStream(ctx, stream);
-        Logger.log(LogCategory.SYSTEM, `MSS32: _AIL_start_stream@4: Started stream playback`);
+        startStream(ctx, stream, "_AIL_start_stream@4");
         return 0;
     };
 
@@ -139,14 +146,7 @@ export function createStreamExports(ctx: MSSContext): Record<string, ThunkImplem
 
         const stream = ctx.streams.get(streamHandle);
         if (!stream) return 0;
-
-        if (stream.isPlaying && !stream.isPaused) {
-            if (!stopRingBuffer(stream.id)) {
-                self.postMessage({ type: "audio_pause", payload: { id: stream.id } });
-            }
-            stream.isPaused = true;
-            Logger.log(LogCategory.SYSTEM, `MSS32: Stream paused (id=${stream.id})`);
-        }
+        pauseStream(ctx, stream);
         return 0;
     };
 
@@ -159,18 +159,10 @@ export function createStreamExports(ctx: MSSContext): Record<string, ThunkImplem
         const stream = ctx.streams.get(streamHandle);
         if (!stream) return 0;
 
-        if (pause && stream.isPlaying && !stream.isPaused) {
-            if (!stopRingBuffer(stream.id)) {
-                self.postMessage({ type: "audio_pause", payload: { id: stream.id } });
-            }
-            stream.isPaused = true;
-            Logger.log(LogCategory.SYSTEM, `MSS32: Stream paused (id=${stream.id})`);
-        } else if (!pause && stream.isPaused) {
-            if (!resumeRingBuffer(stream.id)) {
-                self.postMessage({ type: "audio_resume", payload: { id: stream.id } });
-            }
-            stream.isPaused = false;
-            Logger.log(LogCategory.SYSTEM, `MSS32: Stream resumed (id=${stream.id})`);
+        if (pause) {
+            pauseStream(ctx, stream);
+        } else {
+            unpauseStream(ctx, stream);
         }
         return 0;
     };
@@ -182,14 +174,7 @@ export function createStreamExports(ctx: MSSContext): Record<string, ThunkImplem
 
         const stream = ctx.streams.get(streamHandle);
         if (!stream) return 0;
-
-        if (stream.isPaused) {
-            if (!resumeRingBuffer(stream.id)) {
-                self.postMessage({ type: "audio_resume", payload: { id: stream.id } });
-            }
-            stream.isPaused = false;
-            Logger.log(LogCategory.SYSTEM, `MSS32: Stream resumed (id=${stream.id})`);
-        }
+        unpauseStream(ctx, stream);
         return 0;
     };
 
@@ -327,6 +312,53 @@ export function createStreamExports(ctx: MSSContext): Record<string, ThunkImplem
         return 0;
     };
 
+    // _AIL_stream_playback_rate@4(stream) -> current rate in Hz. The getter pairs
+    // with the setter above; an app that reads it back to compute a pitch ratio
+    // divides by whatever we answer.
+    exports["_AIL_stream_playback_rate@4"] = (ctxThunk, mem, args) => {
+        const stream = ctx.streams.get(args[0]);
+        if (!stream) return 0;
+        return (stream.playbackRateHz ?? stream.sampleRate ?? 0) >>> 0;
+    };
+
+    // _AIL_set_stream_user_data@12(stream, index, value) — opaque per-stream slots.
+    // Miles hands them back to the app's own callbacks; storing them is the whole
+    // contract, and a stream callback that reads a slot we dropped gets a null
+    // "this" pointer.
+    exports["_AIL_set_stream_user_data@12"] = (ctxThunk, mem, args) => {
+        const streamHandle = args[0];
+        const index = args[1] | 0;
+        const value = args[2] >>> 0;
+        if (!ctx.streams.has(streamHandle) || index < 0) return 0;
+        let slots = ctx.streamUserData.get(streamHandle);
+        if (!slots) ctx.streamUserData.set(streamHandle, (slots = []));
+        slots[index] = value;
+        return 0;
+    };
+
+    // _AIL_stream_user_data@8(stream, index) -> value
+    exports["_AIL_stream_user_data@8"] = (ctxThunk, mem, args) => {
+        const slots = ctx.streamUserData.get(args[0]);
+        const index = args[1] | 0;
+        return (slots?.[index] ?? 0) >>> 0;
+    };
+
+    // _AIL_register_stream_callback@8(stream, callback) -> previous callback.
+    // The app's data pump: Miles calls it when the stream needs more data. Ours
+    // reads the whole file at open, so there is no refill to ask for — recorded
+    // against a future incremental stream engine.
+    exports["_AIL_register_stream_callback@8"] = (ctxThunk, mem, args) => {
+        const streamHandle = args[0];
+        const callback = args[1] >>> 0;
+        if (!ctx.streams.has(streamHandle)) return 0;
+        const previous = ctx.streamCallbacks.get(streamHandle) ?? 0;
+        if (callback) ctx.streamCallbacks.set(streamHandle, callback);
+        else ctx.streamCallbacks.delete(streamHandle);
+        Logger.log(LogCategory.SYSTEM,
+            `MSS32: _AIL_register_stream_callback@8 stream=0x${streamHandle.toString(16)} cb=0x${callback.toString(16)}`);
+        return previous;
+    };
+
     // _AIL_stream_info@8
     exports["_AIL_stream_info@8"] = (ctxThunk, mem, args) => {
         const streamHandle = args[0];
@@ -373,6 +405,66 @@ export function createStreamExports(ctx: MSSContext): Record<string, ThunkImplem
 }
 
 // ==================== Private helpers ====================
+
+/** Begin playback from the current position (AIL_start_stream, and the first
+ *  AIL_pause_stream(S,0) on a stream that has never run). */
+function startStream(ctx: MSSContext, stream: MSSStream, who: string): void {
+    stream.startTime = performance.now();
+    stream.isPaused = false;
+
+    if (!stream.decodedData) {
+        if (stream.fileData && isEncodedFormat(stream.fileFormat)) {
+            playStream(ctx, stream);
+            Logger.log(LogCategory.SYSTEM, `MSS32: ${who}: Started ${stream.fileFormat} stream`);
+            return;
+        }
+        Logger.warn(LogCategory.SYSTEM, `MSS32: ${who}: No data yet, deferring start`);
+        stream.pendingStart = true;
+        setStreamStatus(ctx, stream, SMP_PLAYING);
+        return;
+    }
+
+    playStream(ctx, stream);
+    Logger.log(LogCategory.SYSTEM, `MSS32: ${who}: Started stream playback`);
+}
+
+function pauseStream(ctx: MSSContext, stream: MSSStream): void {
+    if (!stream.isPlaying || stream.isPaused) return;
+    if (!stopRingBuffer(stream.id)) {
+        self.postMessage({ type: "audio_pause", payload: { id: stream.id } });
+    }
+    stream.isPaused = true;
+    Logger.log(LogCategory.SYSTEM, `MSS32: Stream paused (id=${stream.id})`);
+}
+
+/** AIL_pause_stream(S,0) / AIL_resume_stream. A stream is PAUSED from the moment
+ *  it is opened, so un-pausing one that never ran is how Miles starts it — an app
+ *  that never calls AIL_start_stream is using the documented path, not a shortcut. */
+function unpauseStream(ctx: MSSContext, stream: MSSStream): void {
+    if (!stream.isPlaying && !stream.pendingStart) {
+        startStream(ctx, stream, "_AIL_pause_stream@8(resume)");
+        return;
+    }
+    if (!stream.isPaused) return;
+    if (!resumeRingBuffer(stream.id)) {
+        self.postMessage({ type: "audio_resume", payload: { id: stream.id } });
+    }
+    stream.isPaused = false;
+    Logger.log(LogCategory.SYSTEM, `MSS32: Stream resumed (id=${stream.id})`);
+}
+
+/** Tear a half-built stream back down: AIL_open_stream answers 0, so the app must
+ *  never be able to reach the handle we already allocated. */
+function discardStream(ctx: MSSContext, stream: MSSStream): void {
+    Logger.error(LogCategory.SYSTEM,
+        `MSS32: _AIL_open_stream@12: "${stream.filename}" could not be read through the app's file callbacks — returning failure`);
+    if (stream.streamDummyBuffer) ctx.process.memory.free(stream.streamDummyBuffer);
+    ctx.process.memory.free(stream.handle);
+    ctx.streamsById.delete(stream.id);
+    ctx.streams.delete(stream.handle);
+    ctx.streamCallbacks.delete(stream.handle);
+    ctx.streamUserData.delete(stream.handle);
+}
 
 async function loadStreamFile(ctx: MSSContext, stream: MSSStream): Promise<void> {
     if (!stream.filename) {

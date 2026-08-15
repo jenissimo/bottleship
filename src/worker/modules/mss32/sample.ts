@@ -634,6 +634,20 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
         return count;
     };
 
+    // _AIL_register_EOS_callback@8(sample, EOS) -> previous callback.
+    // The callback lives in the GUEST's sample struct at +0x4C, which is where
+    // invokeEOSCallback reads it from — an app may set it either way, so the API
+    // has to write the same slot rather than keep a private copy.
+    exports["_AIL_register_EOS_callback@8"] = (ctxThunk, mem, args) => {
+        const sample = args[0] >>> 0;
+        const callback = args[1] >>> 0;
+        if (!MemoryGuard.isValidRange(mem, sample + 0x4C, 4)) return 0;
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const previous = view.getUint32(sample + 0x4C, true);
+        view.setUint32(sample + 0x4C, callback, true);
+        return previous === 0xFFFFFFFF ? 0 : previous;
+    };
+
     // _AIL_set_sample_user_data@12
     exports["_AIL_set_sample_user_data@12"] = (ctxThunk, mem, args) => {
         const sample = args[0];

@@ -81,6 +81,24 @@ export interface MSSContext {
     serveDepth: number;
     /** WAV format tag keyed by guest data-chunk pointer (set by AIL_WAV_info for ADPCM decode). */
     wavFormatByDataPtr: Map<number, number>;
+    /**
+     * The app's own file I/O for Miles (AIL_set_file_callbacks). A title whose
+     * assets live inside an archive — Warcraft III's war3.mpq — installs these so
+     * Miles reads through ITS reader instead of the file system — our own VFS
+     * cannot serve those names at all, because they are not files.
+     */
+    fileCallbacks: { open: number; close: number; seek: number; read: number } | null;
+    /** The app's allocator for Miles (AIL_mem_use_malloc/free). */
+    memCallbacks: { malloc: number; free: number };
+    /** Per-stream user data slots (AIL_set_stream_user_data), keyed by stream handle. */
+    streamUserData: Map<number, number[]>;
+    /** Per-stream data-pump callback (AIL_register_stream_callback), keyed by stream handle. */
+    streamCallbacks: Map<number, number>;
+    /** Per-sequence user data slots and callback (the MIDI twins of the stream pair). */
+    sequenceUserData: Map<number, number[]>;
+    sequenceCallbacks: Map<number, number>;
+    /** 3D distance factor (AIL_set_3D_distance_factor), metres per world unit. */
+    distanceFactor3D: number;
 }
 
 export function createMSSContext(process: Process): MSSContext {
@@ -155,5 +173,12 @@ export function createMSSContext(process: Process): MSSContext {
         insideAilServe: false,
         serveDepth: 0,
         wavFormatByDataPtr: new Map(),
+        fileCallbacks: null,
+        memCallbacks: { malloc: 0, free: 0 },
+        streamUserData: new Map(),
+        streamCallbacks: new Map(),
+        sequenceUserData: new Map(),
+        sequenceCallbacks: new Map(),
+        distanceFactor3D: 1.0,
     };
 }

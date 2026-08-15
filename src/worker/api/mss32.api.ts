@@ -193,6 +193,8 @@ export const mss32Module: ModuleDescriptor = {
         makeFunc("_AIL_3D_speaker_type@4", 1),
         makeFunc("_AIL_set_3D_speaker_type@8", 2),
         makeFunc("_AIL_set_3D_provider_preference@12", 3),
+        makeFunc("_AIL_set_3D_distance_factor@8", 2),
+        makeFunc("_AIL_DLS_open@28", 7),
         makeFunc("_AIL_quick_handles@12", 3),
         // Redist directory
         makeFunc("_AIL_set_redist_directory@4", 1),

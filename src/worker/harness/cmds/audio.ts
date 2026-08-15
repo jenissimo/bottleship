@@ -12,6 +12,7 @@
 
 import type { HarnessService } from "../service";
 import { sys, getModule, symbolize } from "../serialize";
+import { getHostAudioStats, resetHostAudioStats } from "../../worker-handlers/audio-bridge";
 
 interface PumpSnapshot {
     tMs: number;
@@ -134,7 +135,13 @@ export function registerAudioCommands(svc: HarnessService): void {
      *
      *  ctrl is the raw SAB control block decoded — the format fields the worklet
      *  actually reads, not the worker's private SoundBuffer.format copy. The two
-     *  disagreeing IS the failure mode this verb exists to catch. */
+     *  disagreeing IS the failure mode this verb exists to catch.
+     *
+     *  `host` is the FOURTH place a sound can be: an encoded stream (MP3/OGG) plays on
+     *  a host media element the worklet never mixes, so peakMilli stays 0 while the
+     *  music is perfectly audible. Rising `positions`/`lastFrames` for an id is the only
+     *  worker-side proof that such a stream is really decoding; `error` names a container
+     *  the browser refused. */
     svc.register("audioSignal", async (args) => {
         const opts = (args[0] ?? {}) as { reset?: boolean };
         const ds: any = getModule("dsound");
@@ -152,6 +159,9 @@ export function registerAudioCommands(svc: HarnessService): void {
                 underrunMid: Atomics.load(s, 8), starvedBlocks: Atomics.load(s, 9),
             };
             if (opts.reset) Atomics.store(s, 15, 1);
+        }
+        if (opts.reset) {
+            resetHostAudioStats();
         }
 
         const CTRL_BLOCK_BYTES = 128;
@@ -200,6 +210,6 @@ export function registerAudioCommands(svc: HarnessService): void {
             });
         }
 
-        return { worklet, buffers };
+        return { worklet, host: getHostAudioStats(), buffers };
     });
 }

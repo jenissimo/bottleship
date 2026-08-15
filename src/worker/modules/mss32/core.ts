@@ -467,6 +467,27 @@ export function createCoreExports(ctx: MSSContext): Record<string, ThunkImplemen
         return 0;
     };
 
+    // _AIL_set_3D_distance_factor@8(provider, factor) — metres per world unit.
+    // The float rides the stack as raw bits; reinterpret rather than truncate, or a
+    // factor of 1.0 reads as 1065353216.
+    exports["_AIL_set_3D_distance_factor@8"] = (ctxThunk, mem, args) => {
+        const bits = new Uint32Array(1);
+        bits[0] = args[1] >>> 0;
+        const factor = new Float32Array(bits.buffer)[0];
+        if (Number.isFinite(factor) && factor > 0) ctx.distanceFactor3D = factor;
+        Logger.verbose(LogCategory.SYSTEM, `MSS32: _AIL_set_3D_distance_factor@8 factor=${ctx.distanceFactor3D}`);
+        return 0;
+    };
+
+    // _AIL_DLS_open@28(mdi, dig, filename, flags, rate, bits, channels) -> HDLSDEVICE
+    // We have no DLS/wavetable synth. NULL is the documented failure and the honest
+    // answer: a handle we cannot service would have the app load an instrument set
+    // into it and then wonder why every note is silent.
+    exports["_AIL_DLS_open@28"] = (ctxThunk, mem, args) => {
+        Logger.warn(LogCategory.SYSTEM, "MSS32: _AIL_DLS_open@28 — no DLS synth, returning NULL");
+        return 0;
+    };
+
     // _AIL_set_3D_provider_preference@12(prov, name, value)
     exports["_AIL_set_3D_provider_preference@12"] = (ctxThunk, mem, args) => {
         return 0;

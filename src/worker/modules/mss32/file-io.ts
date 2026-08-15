@@ -1,10 +1,13 @@
-import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
+import { ThunkImplementation, ThunkResult } from "../../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../../core/logger";
 import { MemoryGuard } from "../../core/memory/mem-guard";
 import { System } from "../../core/system";
 import { VfsFileHandle } from "../../runtime/filesystem/vfs";
 import { MSSContext } from "./context";
 import { detectAilFileTypeFromMemory, readFilenameArg, readStackArg, resolveVfsHandle } from "./helpers";
+import {
+    GuestCallChain, fileSizeViaApp, hasAppFileCallbacks, readWholeFileViaApp, runGuestCallChain,
+} from "./app-file-io";
 
 const FILE_READ_WITH_SIZE = 0xFFFFFFFF;
 
@@ -13,7 +16,7 @@ export function createFileIOExports(ctx: MSSContext): Record<string, ThunkImplem
     const system = System.getInstance();
 
     // _AIL_file_read@8
-    const fileReadCompat: ThunkImplementation = async (ctxThunk, mem, args) => {
+    const fileReadCompat: ThunkImplementation = (ctxThunk, mem, args): ThunkResult | Promise<ThunkResult> => {
         const arg0 = args[0];
         const arg1 = args[1];
         const vfsHandle = resolveVfsHandle(ctx, arg0);
@@ -21,21 +24,27 @@ export function createFileIOExports(ctx: MSSContext): Record<string, ThunkImplem
 
         if (filename) {
             Logger.log(LogCategory.SYSTEM, `MSS32: _AIL_file_read@8 called: filename="${filename}" (ptr=0x${arg0.toString(16)}), dest=0x${arg1.toString(16)}`);
-            const value = await readFileByName(ctx, filename, arg1, mem);
-            return { value, stackCleanup: 8 };
+            if (hasAppFileCallbacks(ctx)) {
+                const chain = (function* (): GuestCallChain {
+                    const data = yield* readWholeFileViaApp(ctx, arg0, filename);
+                    return deliverFileData(ctx, data, arg1, filename);
+                })();
+                const r = runGuestCallChain(ctx, ctxThunk, 8, "mss32:AIL_file_read", chain);
+                return typeof r === "number" ? { value: r, stackCleanup: 8 } : r;
+            }
+            return readFileByName(ctx, filename, arg1, mem).then(value => ({ value, stackCleanup: 8 }));
         }
 
         const fileHandle = arg0;
         const buffer = arg1;
         const bytes = readStackArg(mem, ctxThunk.esp, 2) ?? args[2] ?? 0;
         Logger.log(LogCategory.SYSTEM, `MSS32: _AIL_file_read@8 called: fileHandle=0x${fileHandle.toString(16)}, buffer=0x${buffer.toString(16)}, bytes=${bytes}`);
-        const value = await fileReadLowLevel(ctx, mem, fileHandle, buffer, bytes);
-        return { value, stackCleanup: 8 };
+        return fileReadLowLevel(ctx, mem, fileHandle, buffer, bytes).then(value => ({ value, stackCleanup: 8 }));
     };
     exports["_AIL_file_read@8"] = fileReadCompat;
 
     // _AIL_file_read@12
-    const fileRead12: ThunkImplementation = async (ctxThunk, mem, args) => {
+    const fileRead12: ThunkImplementation = (ctxThunk, mem, args) => {
         const arg0 = args[0];
         const arg1 = args[1];
         const arg2 = args[2];
@@ -49,7 +58,15 @@ export function createFileIOExports(ctx: MSSContext): Record<string, ThunkImplem
             );
             const requestedBytes = (arg2 >>> 0);
             const useRequestedBytes = arg1 !== 0 && arg1 !== FILE_READ_WITH_SIZE && requestedBytes > 0;
-            return readFileByName(ctx, filename, arg1, mem, useRequestedBytes ? requestedBytes : 0);
+            const maxBytes = useRequestedBytes ? requestedBytes : 0;
+            if (hasAppFileCallbacks(ctx)) {
+                const chain = (function* (): GuestCallChain {
+                    const data = yield* readWholeFileViaApp(ctx, arg0, filename, maxBytes);
+                    return deliverFileData(ctx, data, arg1, filename);
+                })();
+                return runGuestCallChain(ctx, ctxThunk, 12, "mss32:AIL_file_read", chain);
+            }
+            return readFileByName(ctx, filename, arg1, mem, maxBytes);
         }
 
         const fileHandle = arg0;
@@ -82,6 +99,10 @@ export function createFileIOExports(ctx: MSSContext): Record<string, ThunkImplem
 
         if (filename) {
             Logger.log(LogCategory.SYSTEM, `MSS32: _AIL_file_size@4 called: filename="${filename}" (ptr=0x${arg0.toString(16)})`);
+            if (hasAppFileCallbacks(ctx)) {
+                return runGuestCallChain(
+                    ctx, ctxThunk, 4, "mss32:AIL_file_size", fileSizeViaApp(ctx, arg0, filename));
+            }
             try {
                 const fileSize = system.fileSystem.getFileSize(filename);
                 Logger.verbose(LogCategory.SYSTEM, `MSS32: _AIL_file_size@4: "${filename}" size = ${fileSize} bytes`);
@@ -105,6 +126,35 @@ export function createFileIOExports(ctx: MSSContext): Record<string, ThunkImplem
             Logger.warn(LogCategory.SYSTEM, `MSS32: _AIL_file_size@4: Error getting file size for handle 0x${arg0.toString(16)}: ${e}`);
             return 0;
         }
+    };
+
+    // _AIL_set_file_callbacks@16(open, close, seek, read)
+    //
+    // The app takes over Miles' file I/O. A title that keeps its audio inside an
+    // archive installs these because the names it will ask for are NOT files, so
+    // from here on every AIL_file_* path must go through them and not the VFS.
+    exports["_AIL_set_file_callbacks@16"] = (ctxThunk, mem, args) => {
+        const [open, close, seek, read] = [args[0] >>> 0, args[1] >>> 0, args[2] >>> 0, args[3] >>> 0];
+        ctx.fileCallbacks = (open || close || seek || read) ? { open, close, seek, read } : null;
+        Logger.log(
+            LogCategory.SYSTEM,
+            `MSS32: _AIL_set_file_callbacks@16 open=0x${open.toString(16)} close=0x${close.toString(16)} ` +
+            `seek=0x${seek.toString(16)} read=0x${read.toString(16)}`
+        );
+        return 0;
+    };
+
+    // _AIL_mem_use_malloc@4(fn) / _AIL_mem_use_free@4(fn)
+    // The app's allocator for Miles' internal buffers. Ours are host-side, so there
+    // is nothing to route through it; remember the pointers so a later read-back
+    // (or a stream engine that must allocate in guest memory) has them.
+    exports["_AIL_mem_use_malloc@4"] = (ctxThunk, mem, args) => {
+        ctx.memCallbacks.malloc = args[0] >>> 0;
+        return 0;
+    };
+    exports["_AIL_mem_use_free@4"] = (ctxThunk, mem, args) => {
+        ctx.memCallbacks.free = args[0] >>> 0;
+        return 0;
     };
 
     // _AIL_mem_alloc_lock@4
@@ -132,6 +182,40 @@ export function createFileIOExports(ctx: MSSContext): Record<string, ThunkImplem
 }
 
 // ==================== Private helpers ====================
+
+/**
+ * AIL_file_read's destination contract, applied to bytes we already hold:
+ * NULL = Miles allocates and returns the block, 0xFFFFFFFF = same but with the
+ * size in the first DWORD, otherwise the caller's own buffer.
+ */
+function deliverFileData(ctx: MSSContext, data: Uint8Array | null, destBuffer: number, filename: string): number {
+    if (!data || data.length === 0) return 0;
+
+    const mem = ctx.process.getCurrentMemory();
+    let targetBuffer = destBuffer;
+    const writeOffset = destBuffer === FILE_READ_WITH_SIZE ? 4 : 0;
+
+    if (destBuffer === 0 || destBuffer === FILE_READ_WITH_SIZE) {
+        const allocated = ctx.process.memory.alloc(data.length + writeOffset);
+        if (!allocated) {
+            Logger.error(LogCategory.SYSTEM, `MSS32: AIL_file_read: no memory for ${data.length} bytes of "${filename}"`);
+            return 0;
+        }
+        ctx.memAllocatedByMss.add(allocated);
+        targetBuffer = allocated;
+    }
+
+    if (!MemoryGuard.isValidRange(mem, targetBuffer + writeOffset, data.length)) {
+        Logger.error(LogCategory.SYSTEM,
+            `MSS32: AIL_file_read: buffer 0x${targetBuffer.toString(16)} + ${data.length} exceeds memory bounds`);
+        return 0;
+    }
+    if (destBuffer === FILE_READ_WITH_SIZE) {
+        new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setUint32(targetBuffer, data.length, true);
+    }
+    MemoryGuard.writeBytes(mem, targetBuffer + writeOffset, data, "MSS32:AIL_file_read");
+    return targetBuffer;
+}
 
 async function readFileByName(
     ctx: MSSContext,
