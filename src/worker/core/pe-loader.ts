@@ -21,6 +21,7 @@ import { EmulatorConfig } from './emulator-config-manager';
 import { installCw3220Stdio } from '../modules/cw3220/cw3220-stdio';
 import { writeHeapSlabStubs } from '../modules/kernel32/heap-slab-stubs';
 import { writeCrtSlabStubs, writeCaseFoldStubs } from '../modules/crt-slab-stubs';
+import { writeCrtMathStubs, type CrtMathStubs, type CrtMathStubName } from '../modules/crt-math-stubs';
 import { loadDiagnostics } from './diagnostics/load-diagnostics';
 import { writeGuestCode, invalidateGuestCode } from './memory/guest-code';
 
@@ -206,6 +207,13 @@ export class PELoader {
     private crtInlineStubs: { mallocStub: number; freeStub: number; regionBase: number; regionEnd: number } | null = null;
     private caseFoldInlineStubs: { tolowerStub: number; toupperStub: number; regionBase: number; regionEnd: number } | null = null;
 
+    /**
+     * Cached addresses of the native x86 micro-thunks for the pure-compute CRT math
+     * imports. Generated on the first CRT-module import; reused for later CRT modules'
+     * IAT patching. See crt-math-stubs writeCrtMathStubs.
+     */
+    private mathInlineStubs: CrtMathStubs | null = null;
+
     /** Dynamically-linked C runtime modules that export the cdecl malloc/free pair
      *  and the MSVC operator new/delete aliases — all share one slab fast path. */
     private static readonly CRT_SLAB_MODULES = new Set<string>([
@@ -224,6 +232,23 @@ export class PELoader {
      *  stubs are not emitted at all unless one of each trap list is imported. */
     private static readonly CRT_MALLOC_KEYS = [...PELoader.CRT_MALLOC_TRAP_KEYS, '??_u@yapaxi@z'];
     private static readonly CRT_FREE_KEYS = [...PELoader.CRT_FREE_TRAP_KEYS, '??_v@yaxpax@z'];
+
+    /** C runtime modules whose math exports the micro-thunks may replace. Supersets
+     *  CRT_SLAB_MODULES with crtdll, which exports the same cdecl _ftol. */
+    private static readonly CRT_MATH_MODULES = new Set<string>([...PELoader.CRT_SLAB_MODULES, 'crtdll']);
+    /** EXPLICIT allowlist: imports whose entire contract is a pure computation on their
+     *  arguments, so a block of real x86 in guest memory IS the implementation and the
+     *  OUT trap buys nothing. Additive — the JS/hypercall handlers stay registered and
+     *  remain the path for GetProcAddress, for every other CRT module, and for the flag-off
+     *  A/B. Nothing with state, errno, locale or an out-pointer belongs here. */
+    private static readonly CRT_MATH_KEYS: Record<string, CrtMathStubName> = {
+        'floor': 'floorStub',
+        'ceil': 'ceilStub',
+        'fabs': 'fabsStub',
+        'sqrt': 'sqrtStub',
+        '_ftol': 'ftolStub',
+        '__ftol': 'ftolStub',
+    };
 
     /**
      * DLLs whose DllMain(DLL_PROCESS_ATTACH) must be called before the EXE entry point.
@@ -253,6 +278,7 @@ export class PELoader {
         this.heapInlineStubs = null;
         this.crtInlineStubs = null;
         this.caseFoldInlineStubs = null;
+        this.mathInlineStubs = null;
     }
 
     /**
@@ -1457,6 +1483,32 @@ export class PELoader {
                     }
                 }
 
+                // One-time native x86 micro-thunks for the pure-compute CRT math imports.
+                // DEFAULT-ON; set window.__noCrtMathStubs=true BEFORE loading a game to force
+                // the OUT-trap/hypercall path back on for an A/B. Global toggle, not a per-game
+                // branch; binding happens here at load, so a later toggle affects later loads.
+                if (PELoader.CRT_MATH_MODULES.has(dllName) && !this.mathInlineStubs
+                    && !(globalThis as { __noCrtMathStubs?: boolean }).__noCrtMathStubs) {
+                    try {
+                        const sys = System.getInstance();
+                        const tmm = sys.process?.thunkMemoryManager;
+                        if (tmm) {
+                            this.mathInlineStubs = writeCrtMathStubs(tmm.stubAllocator, this.getMemory);
+                            // floor/ceil/_ftol run with a modified x87 rounding control between
+                            // two FLDCWs; a tick preempt in that window would hand another thread
+                            // our rounding mode (fpuRestore writes the control word without
+                            // re-deriving the softfloat mode).
+                            sys.scheduler?.registerNonPreemptibleRange(
+                                this.mathInlineStubs.regionBase, this.mathInlineStubs.regionEnd);
+                        } else {
+                            Logger.warn(LogCategory.SYSTEM,
+                                `[PE] CRT math micro-thunks skipped for ${dllName}: no thunkMemoryManager`);
+                        }
+                    } catch (e) {
+                        Logger.warn(LogCategory.SYSTEM, `[PE] CRT math micro-thunks unavailable: ${e}`);
+                    }
+                }
+
                 // Patch IAT with stub addresses
                 const inlinePatched: string[] = [];
                 for (const func of functions) {
@@ -1490,6 +1542,11 @@ export class PELoader {
                         if (this.caseFoldInlineStubs && PELoader.CRT_SLAB_MODULES.has(dllName)) {
                             if (funcKey === 'tolower') stubAddress = this.caseFoldInlineStubs.tolowerStub;
                             else if (funcKey === 'toupper') stubAddress = this.caseFoldInlineStubs.toupperStub;
+                        }
+                        // Pure-compute math: real x86 in guest memory, no trap at all.
+                        if (this.mathInlineStubs && PELoader.CRT_MATH_MODULES.has(dllName)) {
+                            const field = PELoader.CRT_MATH_KEYS[funcKey];
+                            if (field) stubAddress = this.mathInlineStubs[field];
                         }
                         if (stubAddress !== inlineBefore) inlinePatched.push(funcKey);
                         if (stubAddress) {
