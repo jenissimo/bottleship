@@ -88,6 +88,53 @@ function writeRequiredUint32(ptr: number, value: number): boolean {
     return ptr !== 0 && Mem.writeUint32(ptr, value);
 }
 
+/**
+ * Read a guest D3DLIGHT8 (104 bytes). Shared with the FastPath registration so the
+ * struct layout has ONE definition — a divergence here would only ever surface as a
+ * wrongly-lit scene.
+ */
+export function readD3DLight8(view: DataView, pLight: number): D3DLight7Data {
+    const light: D3DLight7Data = {
+        type: view.getUint32(pLight + 0, true),
+        diffuse: {
+            r: view.getFloat32(pLight + 4, true),
+            g: view.getFloat32(pLight + 8, true),
+            b: view.getFloat32(pLight + 12, true),
+            a: view.getFloat32(pLight + 16, true),
+        },
+        specular: {
+            r: view.getFloat32(pLight + 20, true),
+            g: view.getFloat32(pLight + 24, true),
+            b: view.getFloat32(pLight + 28, true),
+            a: view.getFloat32(pLight + 32, true),
+        },
+        ambient: {
+            r: view.getFloat32(pLight + 36, true),
+            g: view.getFloat32(pLight + 40, true),
+            b: view.getFloat32(pLight + 44, true),
+            a: view.getFloat32(pLight + 48, true),
+        },
+        position: {
+            x: view.getFloat32(pLight + 52, true),
+            y: view.getFloat32(pLight + 56, true),
+            z: view.getFloat32(pLight + 60, true),
+        },
+        direction: {
+            x: view.getFloat32(pLight + 64, true),
+            y: view.getFloat32(pLight + 68, true),
+            z: view.getFloat32(pLight + 72, true),
+        },
+        range: view.getFloat32(pLight + 76, true),
+        falloff: view.getFloat32(pLight + 80, true),
+        attenuation0: view.getFloat32(pLight + 84, true),
+        attenuation1: view.getFloat32(pLight + 88, true),
+        attenuation2: view.getFloat32(pLight + 92, true),
+        theta: view.getFloat32(pLight + 96, true),
+        phi: view.getFloat32(pLight + 100, true),
+    };
+    return light;
+}
+
 export function createStateExports(): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
 
@@ -581,44 +628,7 @@ export function createStateExports(): Record<string, ThunkImplementation> {
         if (!device) return D3DERR_INVALIDCALL;
         const index = args[1], pLight = args[2];
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-        const light: D3DLight7Data = {
-            type: view.getUint32(pLight + 0, true),
-            diffuse: {
-                r: view.getFloat32(pLight + 4, true),
-                g: view.getFloat32(pLight + 8, true),
-                b: view.getFloat32(pLight + 12, true),
-                a: view.getFloat32(pLight + 16, true),
-            },
-            specular: {
-                r: view.getFloat32(pLight + 20, true),
-                g: view.getFloat32(pLight + 24, true),
-                b: view.getFloat32(pLight + 28, true),
-                a: view.getFloat32(pLight + 32, true),
-            },
-            ambient: {
-                r: view.getFloat32(pLight + 36, true),
-                g: view.getFloat32(pLight + 40, true),
-                b: view.getFloat32(pLight + 44, true),
-                a: view.getFloat32(pLight + 48, true),
-            },
-            position: {
-                x: view.getFloat32(pLight + 52, true),
-                y: view.getFloat32(pLight + 56, true),
-                z: view.getFloat32(pLight + 60, true),
-            },
-            direction: {
-                x: view.getFloat32(pLight + 64, true),
-                y: view.getFloat32(pLight + 68, true),
-                z: view.getFloat32(pLight + 72, true),
-            },
-            range: view.getFloat32(pLight + 76, true),
-            falloff: view.getFloat32(pLight + 80, true),
-            attenuation0: view.getFloat32(pLight + 84, true),
-            attenuation1: view.getFloat32(pLight + 88, true),
-            attenuation2: view.getFloat32(pLight + 92, true),
-            theta: view.getFloat32(pLight + 96, true),
-            phi: view.getFloat32(pLight + 100, true),
-        };
+        const light = readD3DLight8(view, pLight);
         if (device.recordingStateBlock) {
             device.recordStateBlock({ op: 'light', index, light });
             return D3D_OK;
