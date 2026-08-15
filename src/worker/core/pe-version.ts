@@ -130,6 +130,25 @@ function openVersionResource(image: Uint8Array): { view: DataView; resOff: numbe
     return root ? { view, resOff: res.off, root } : null;
 }
 
+/**
+ * The RT_VERSION resource exactly as it sits in the image — the bytes GetFileVersionInfoW
+ * is defined to hand back. Returned as a copy so the caller may keep it past the life of
+ * the image buffer.
+ */
+export function readPeVersionResourceBytes(image: Uint8Array): Uint8Array | null {
+    let res: { off: number; size: number } | null;
+    try {
+        const headers = readPeHeaders(image);
+        if (!headers) return null;
+        const view = new DataView(image.buffer, image.byteOffset, image.byteLength);
+        res = findVersionResource(image, view, headers);
+    } catch {
+        return null;
+    }
+    if (!res || res.size < 6) return null;
+    return image.slice(res.off, res.off + res.size);
+}
+
 export interface PeFileVersion {
     major: number;
     minor: number;
