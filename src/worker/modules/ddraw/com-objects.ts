@@ -356,6 +356,8 @@ export interface RenderSurface extends BaseSurfaceState {
     gpuWrittenVersion?: number;
     /** True if surface was ever Lock()'d (permanent CPU mode). */
     everLocked: boolean;
+    /** The last Lock was D3DLOCK_READONLY — Unlock must not claim CPU authority for it. */
+    lastLockReadOnly?: boolean;
     /** Version of last CPU→GPU upload (for debugging). */
     lastUploadVersion: number;
     /** Bounding box of dirty region (for partial upload optimization - Phase 2). */

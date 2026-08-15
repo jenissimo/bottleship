@@ -64,9 +64,10 @@ const D3DMULTISAMPLE_NONE = 0;
 const isSupportedD3D8MultiSample = (t: number): boolean =>
     t === D3DMULTISAMPLE_NONE || t === 2 || t === 4;
 const D3DLOCK_DISCARD = 0x00002000;
+const D3DLOCK_READONLY = 0x00000010;
 const D3DUSAGE_RENDERTARGET = 0x00000001;
 
-function validateLockRange(totalSize: number, offset: number, requestedSize: number): number | null {
+export function validateLockRange(totalSize: number, offset: number, requestedSize: number): number | null {
     if (offset < 0 || offset > totalSize) return null;
     const lockSize = requestedSize === 0 ? (totalSize - offset) : requestedSize;
     if (lockSize < 0 || lockSize > totalSize - offset) return null;
@@ -267,6 +268,13 @@ function lockRenderSurfaceRect(
     d3dFormat: number,
 ): number | Promise<number> {
     const isDiscard = (flags & D3DLOCK_DISCARD) !== 0;
+    // Tracks the lock Unlock will answer for. `undefined` means "no lock is outstanding",
+    // so an Unlock that never had a Lock (or one whose Lock failed before this point)
+    // takes the write path — the conservative one. A second, WRITABLE lock of the same
+    // surface (D3D8 permits it for disjoint rects) latches false and keeps it: a read-only
+    // Unlock arriving after a write lock must never suppress the write's CPU-dirty mark.
+    if ((flags & D3DLOCK_READONLY) !== 0) surface.lastLockReadOnly ??= true;
+    else surface.lastLockReadOnly = false;
     if (!ensureRenderSurfaceGuestMemory(surface)) return D3DERR_INVALIDCALL;
 
     const finish = (): number => {
@@ -839,6 +847,16 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         if (isBitmapTexture(surface)) {
             syncBitmapSurfaceFromGuest(surface);
         } else if (isRenderSurface(surface)) {
+            const wasReadOnly = surface.lastLockReadOnly === true;
+            surface.lastLockReadOnly = undefined;   // no lock outstanding
+            if (wasReadOnly) {
+                // A READ-ONLY lock modifies nothing, so claiming CPU authority here would
+                // upload the CPU copy over the GPU's own render target next frame. The
+                // readback memo stays valid because every writer bumps `version`
+                // (surface-sync setAuthorityGpu), so the next lock still re-reads.
+                surface.everLocked = true;
+                return D3D_OK;
+            }
             surface.version++;
             surface.gpuDirty = true;
             surface.mode = 'CPU';
