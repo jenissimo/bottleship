@@ -219,7 +219,11 @@ export function createFactoryExports(): Record<string, ThunkImplementation> {
         if (!pMode) return D3DERR_INVALIDCALL;
 
         const modes = getD3D8Modes();
-        const mode = modes[modeIdx] ?? modes[modes.length - 1];
+        // Out of range MUST fail: an app is entitled to enumerate until D3D8 refuses
+        // rather than call GetAdapterModeCount first, and answering D3D_OK with the
+        // last mode forever is an infinite loop it can never leave. Matches d3d9's.
+        const mode = modes[modeIdx];
+        if (!mode) return D3DERR_INVALIDCALL;
 
         const ok =
             Mem.writeUint32(pMode + 0, mode.width) &&
