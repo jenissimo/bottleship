@@ -126,6 +126,7 @@ export const kernel32Module: ModuleDescriptor = {
         makeFunc("CreateEventW", 4),
         makeFunc("CreateIoCompletionPort", 4),
         makeFunc("GetQueuedCompletionStatus", 5),
+        makeFunc("PostQueuedCompletionStatus", 4),
         makeFunc("SetEvent", 1),
         makeFunc("ResetEvent", 1),
         makeFunc("PulseEvent", 1),

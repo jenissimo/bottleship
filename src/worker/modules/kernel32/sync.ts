@@ -21,6 +21,144 @@ import {
 } from './srw-lock';
 import { namedObjects } from './named-objects';
 
+/**
+ * fileHandle -> the completion port it was associated with. Module scope, not the
+ * factory's: the I/O paths that COMPLETE a request live in file-io.ts and have to
+ * reach the same table.
+ */
+const ioCompletionAssociations: Map<number, { portHandle: number; key: number }> = new Map();
+
+/**
+ * Queue an I/O completion packet for a finished overlapped operation, exactly as
+ * the OS does when the handle is associated with a completion port. Signalling
+ * the OVERLAPPED's hEvent is NOT a substitute: a worker pool blocked in
+ * GetQueuedCompletionStatus never learns its read finished, and waits forever
+ * (an asset loader that runs its reads through such a pool sees nothing complete).
+ *
+ * Returns whether a packet was queued — false when the handle belongs to no port,
+ * which is the common, non-error case.
+ */
+export function postFileIoCompletion(fileHandle: number, bytesTransferred: number, lpOverlapped: number): boolean {
+    const assoc = ioCompletionAssociations.get(fileHandle >>> 0);
+    if (!assoc) return false;
+    const port = System.getInstance().resourceProvider.getKernelObject(assoc.portHandle) as
+        { kind?: string; queue?: Array<{ bytesTransferred: number; completionKey: number; overlapped: number }> } | undefined;
+    if (!port || port.kind !== 'iocp' || !Array.isArray(port.queue)) return false;
+    queueCompletionPacket(assoc.portHandle, {
+        bytesTransferred: bytesTransferred >>> 0,
+        completionKey: assoc.key >>> 0,
+        overlapped: lpOverlapped >>> 0,
+    });
+    return true;
+}
+
+export interface IoCompletionPacket {
+    bytesTransferred: number;
+    completionKey: number;
+    overlapped: number;
+}
+
+/**
+ * What a parked GetQueuedCompletionStatus wakes with: a packet, `null` for the
+ * timeout, or ABANDONED when the port was closed under it — which must NOT read as
+ * a timeout, or a pool that retries on timeout spins on a handle that is gone.
+ */
+export const IO_COMPLETION_ABANDONED = 'abandoned';
+export type IoCompletionWake = IoCompletionPacket | null | typeof IO_COMPLETION_ABANDONED;
+
+/** Threads parked in GetQueuedCompletionStatus, per port, in arrival order. */
+const ioCompletionWaiters = new Map<number, Array<(wake: IoCompletionWake) => void>>();
+
+function getPortQueue(portHandle: number): IoCompletionPacket[] | null {
+    const port = System.getInstance().resourceProvider.getKernelObject(portHandle >>> 0) as
+        { kind?: string; queue?: IoCompletionPacket[] } | undefined;
+    if (!port || port.kind !== 'iocp' || !Array.isArray(port.queue)) return null;
+    return port.queue;
+}
+
+/** Post a packet and hand it straight to a thread already waiting for one. */
+export function queueCompletionPacket(portHandle: number, packet: IoCompletionPacket): void {
+    const waiters = ioCompletionWaiters.get(portHandle >>> 0);
+    const waiter = waiters?.shift();
+    if (waiter) {
+        waiter(packet);
+        return;
+    }
+    getPortQueue(portHandle)?.push(packet);
+}
+
+/**
+ * Park until a packet arrives, or the timeout expires (null). Real
+ * GetQueuedCompletionStatus BLOCKS; answering an INFINITE wait with an immediate
+ * WAIT_TIMEOUT turns an idle I/O worker pool into a spin at full speed, which
+ * starves the very thread that would post the work.
+ */
+export function waitForCompletionPacket(portHandle: number, timeoutMs: number): Promise<IoCompletionWake> {
+    return new Promise((resolve) => {
+        const key = portHandle >>> 0;
+        let settled = false;
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        const finish = (wake: IoCompletionWake) => {
+            if (settled) return;
+            settled = true;
+            if (timer !== null) clearTimeout(timer);
+            const list = ioCompletionWaiters.get(key);
+            const at = list?.indexOf(finish) ?? -1;
+            if (list && at >= 0) list.splice(at, 1);
+            if (list && list.length === 0) ioCompletionWaiters.delete(key);
+            resolve(wake);
+        };
+        let list = ioCompletionWaiters.get(key);
+        if (!list) ioCompletionWaiters.set(key, (list = []));
+        list.push(finish);
+        if (timeoutMs !== 0xffffffff) {  // 0xFFFFFFFF = INFINITE
+            timer = setTimeout(() => finish(null), timeoutMs);
+            return;
+        }
+        // An INFINITE wait is legitimate, but a packet we forget to post turns it into a
+        // silent hang with every thread parked. Say so once, so the next one names itself.
+        timer = setTimeout(() => {
+            if (settled) return;
+            timer = null;  // the wait continues; only the warning was one-shot
+            Logger.warn(LogCategory.KERNEL32,
+                `GetQueuedCompletionStatus: a thread has waited 10s on port 0x${key.toString(16)} — ` +
+                `if the guest is stuck, an I/O completion is not being posted for some operation`);
+        }, 10_000);
+    });
+}
+
+/**
+ * Wake everyone parked on a port that is being closed. Windows fails their
+ * GetQueuedCompletionStatus (ERROR_ABANDONED_WAIT_0); leaving them parked instead
+ * strands the threads on a handle no packet can ever reach again.
+ */
+export function abandonIoCompletionWaiters(portHandle: number): void {
+    const key = portHandle >>> 0;
+    const list = ioCompletionWaiters.get(key);
+    if (list) {
+        for (const waiter of list.slice()) waiter(IO_COMPLETION_ABANDONED);
+        ioCompletionWaiters.delete(key);
+    }
+    // A handle bound to this port must not keep naming it: handle values are recycled,
+    // and a later file would post its completions into a dead port.
+    for (const [fileHandle, assoc] of ioCompletionAssociations) {
+        if (assoc.portHandle === key) ioCompletionAssociations.delete(fileHandle);
+    }
+}
+
+/** Forget a closed file handle's port binding, so a recycled value cannot inherit it. */
+export function dissociateIoCompletionHandle(fileHandle: number): void {
+    ioCompletionAssociations.delete(fileHandle >>> 0);
+}
+
+/** Release every parked waiter — a process reset must not leave threads parked. */
+export function resetIoCompletionWaiters(): void {
+    for (const list of ioCompletionWaiters.values()) {
+        for (const waiter of list.slice()) waiter(IO_COMPLETION_ABANDONED);
+    }
+    ioCompletionWaiters.clear();
+}
+
 const syncModule = (() => {
     const exports: Record<string, ThunkImplementation> = {};
     const waitableTimers: Map<number, { wheelId: number | null; periodMs: number }> = new Map();
@@ -29,7 +167,6 @@ const syncModule = (() => {
     const registeredWaits = new Set<number>();
     let nextTimerQueueHandle = 0x00060000;
     let nextTimerQueueTimerHandle = 0x00070000;
-    const ioCompletionAssociations: Map<number, number> = new Map();
     let cachedSystem = System.getInstance();
     let cachedScheduler = cachedSystem.scheduler;
     let lastWaitLog = 0;
@@ -739,15 +876,43 @@ const syncModule = (() => {
             }
         }
 
-        // Associate file handle with completion key (best-effort; async I/O completion posting is not modeled yet).
+        // Bind the handle to the port: overlapped ReadFile/WriteFile completions post here
+        // (postFileIoCompletion), and CloseHandle drops the binding again.
         if (fileHandle !== 0 && fileHandle !== 0xFFFFFFFF) {
-            ioCompletionAssociations.set(fileHandle, completionKey);
+            ioCompletionAssociations.set(fileHandle, { portHandle: portHandle >>> 0, key: completionKey });
         }
 
         return portHandle >>> 0;
     };
 
-    exports['GetQueuedCompletionStatus'] = (ctx, mem, args) => {
+    exports['PostQueuedCompletionStatus'] = (ctx, mem, args) => {
+        const completionPortHandle = args[0] >>> 0;
+        const dwNumberOfBytesTransferred = args[1] >>> 0;
+        const dwCompletionKey = args[2] >>> 0;
+        const lpOverlapped = args[3] >>> 0;
+
+        const resourceProvider = System.getInstance().resourceProvider;
+        const scheduler = System.getInstance().scheduler;
+        const port = resourceProvider.getKernelObject(completionPortHandle) as any;
+
+        if (!port || port.kind !== 'iocp' || !Array.isArray(port.queue)) {
+            scheduler.setLastError(6); // ERROR_INVALID_HANDLE
+            return 0;
+        }
+
+        // The packet is delivered VERBATIM — the three values are opaque to the
+        // OS, which is what makes this the standard way to wake a worker pool
+        // with a private shutdown key rather than a real I/O completion.
+        queueCompletionPacket(completionPortHandle, {
+            bytesTransferred: dwNumberOfBytesTransferred,
+            completionKey: dwCompletionKey,
+            overlapped: lpOverlapped,
+        });
+        scheduler.setLastError(0);
+        return 1;
+    };
+
+    exports['GetQueuedCompletionStatus'] = (ctx, mem, args): number | Promise<number> => {
         const completionPortHandle = args[0] >>> 0;
         const lpNumberOfBytesTransferred = args[1] >>> 0;
         const lpCompletionKey = args[2] >>> 0;
@@ -763,26 +928,28 @@ const syncModule = (() => {
             return 0;
         }
 
-        const packet = Array.isArray(port.queue) && port.queue.length > 0 ? port.queue.shift() : null;
-        if (packet) {
-            if (lpNumberOfBytesTransferred) Mem.writeUint32(lpNumberOfBytesTransferred, packet.bytesTransferred >>> 0);
-            if (lpCompletionKey) Mem.writeUint32(lpCompletionKey, packet.completionKey >>> 0);
-            if (lpOverlapped) Mem.writeUint32(lpOverlapped, packet.overlapped >>> 0);
-            scheduler.setLastError(0);
-            return 1;
-        }
+        const deliver = (wake: IoCompletionWake): number => {
+            const sched = System.getInstance().scheduler;
+            const packet = wake === IO_COMPLETION_ABANDONED ? null : wake;
+            if (lpNumberOfBytesTransferred) Mem.writeUint32(lpNumberOfBytesTransferred, packet ? packet.bytesTransferred >>> 0 : 0);
+            if (lpCompletionKey) Mem.writeUint32(lpCompletionKey, packet ? packet.completionKey >>> 0 : 0);
+            if (lpOverlapped) Mem.writeUint32(lpOverlapped, packet ? packet.overlapped >>> 0 : 0);
+            // A closed port is not a timeout: ERROR_ABANDONED_WAIT_0 is the only answer
+            // that tells a retry-on-timeout pool to stop.
+            sched.setLastError(packet ? 0 : (wake === IO_COMPLETION_ABANDONED ? 735 : WAIT_TIMEOUT));
+            return packet ? 1 : 0;
+        };
 
-        if (lpNumberOfBytesTransferred) Mem.writeUint32(lpNumberOfBytesTransferred, 0);
-        if (lpCompletionKey) Mem.writeUint32(lpCompletionKey, 0);
-        if (lpOverlapped) Mem.writeUint32(lpOverlapped, 0);
+        const queued = Array.isArray(port.queue) && port.queue.length > 0 ? port.queue.shift() : null;
+        if (queued) return deliver(queued);
+        if (dwMilliseconds === 0) return deliver(null);
 
-        // Non-blocking fallback for now: report timeout when queue is empty.
-        scheduler.setLastError(WAIT_TIMEOUT);
-        Logger.verbose(
-            LogCategory.KERNEL32,
-            `GetQueuedCompletionStatus(port=0x${completionPortHandle.toString(16)}, timeout=${dwMilliseconds}) -> WAIT_TIMEOUT`
-        );
-        return 0;
+        // Empty queue and the caller is willing to wait: PARK. Answering an INFINITE
+        // wait with an immediate timeout makes an idle worker pool spin, and the
+        // packet it waits for is posted by a thread that then never gets to run.
+        // Only the WAITING branch is a promise: a packet already queued must stay a
+        // plain sync return, or every dequeue pays the async park/resume round trip.
+        return waitForCompletionPacket(completionPortHandle, dwMilliseconds).then(deliver);
     };
 
     exports['SetEvent'] = (ctx, mem, args) => {
@@ -1705,6 +1872,7 @@ const syncModule = (() => {
         timerQueueHandles.clear();
         registeredWaits.clear();
         ioCompletionAssociations.clear();
+        resetIoCompletionWaiters();
         nextTimerQueueHandle = 0x00060000;
         nextTimerQueueTimerHandle = 0x00070000;
     };

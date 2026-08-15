@@ -32,6 +32,7 @@ import { namedObjects } from './named-objects';
 import { LARGE_IO_TRACE_ENABLED, traceLargeRead } from '../../core/diagnostics/large-io-trace';
 import { ioTraceRing } from '../../core/debug/io-trace-ring';
 import { hypercallDataManager } from '../../core/cpu/hypercall-data';
+import { postFileIoCompletion, abandonIoCompletionWaiters, dissociateIoCompletionHandle } from './sync';
 
 const readFileFirstLogged = new Set<number>();
 let shortReadLogCount = 0;
@@ -297,6 +298,7 @@ const fileIoModule = (() => {
     const ERROR_NO_MORE_FILES = 18;
     const ERROR_SEEK = 25;
     const ERROR_NOACCESS = 998;
+    const ERROR_IO_DEVICE = 1117;
     const INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF;
 
     const FILE_ATTRIBUTE_DIRECTORY = 0x10;
@@ -1285,6 +1287,9 @@ const fileIoModule = (() => {
             if (overlappedHEvent) {
                 System.getInstance().scheduler.setEvent(overlappedHEvent);
             }
+            // A handle bound to a completion port also gets a packet: that, not the
+            // event, is what an I/O worker pool is waiting on.
+            postFileIoCompletion(hFile, bytesRead, lpOverlapped);
         };
 
         const cleanup = () => {
@@ -1465,6 +1470,11 @@ const fileIoModule = (() => {
                 return { value: 1, stackCleanup: 20 };
             } catch (e) {
                 cleanup();
+                // A FALSE with a STALE last error is a wrong answer the caller cannot
+                // detect: a leftover ERROR_IO_PENDING reads as "overlapped, wait for it"
+                // and the guest waits for a completion this failure will never post.
+                Logger.error(LogCategory.KERNEL32, `ReadFile async failed: h=0x${hFile.toString(16)} ${e}`);
+                System.getInstance().scheduler.setLastError(ERROR_IO_DEVICE);
                 return { value: 0, stackCleanup: 20 };
             }
         })();
@@ -1476,7 +1486,26 @@ const fileIoModule = (() => {
         const lpBuffer = args[1];
         const nNumberOfBytesToWrite = args[2];
         const lpNumberOfBytesWritten = args[3];
-        const lpOverlapped = args[4]; // unused
+        const lpOverlapped = args[4];
+
+        /**
+         * Complete an overlapped write the way the OS does: the OVERLAPPED's status
+         * fields, then its event, then a packet on the completion port the handle is
+         * bound to. Leaving this out is invisible while GetQueuedCompletionStatus
+         * merely polls, and a deadlock once it properly blocks: a save hangs with the
+         * whole thread pool parked on a packet that never comes.
+         */
+        const completeOverlappedWrite = (bytesWritten: number): void => {
+            if (!lpOverlapped) return;
+            const freshMem = Mem.getView();
+            if (!freshMem || lpOverlapped + 20 > freshMem.length) return;
+            const ovView = new DataView(freshMem.buffer, freshMem.byteOffset, freshMem.byteLength);
+            ovView.setUint32(lpOverlapped, 0, true);                 // Internal = STATUS_SUCCESS
+            ovView.setUint32(lpOverlapped + 4, bytesWritten, true);  // InternalHigh = bytes transferred
+            const hEvent = ovView.getUint32(lpOverlapped + 16, true) >>> 0;
+            if (hEvent) System.getInstance().scheduler.setEvent(hEvent);
+            postFileIoCompletion(hFile, bytesWritten, lpOverlapped);
+        };
 
         // Handle standard file handles (stdin/stdout/stderr) - synchronous
         if (hFile === 1 || hFile === 2) {
@@ -1572,6 +1601,7 @@ const fileIoModule = (() => {
                 const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
                 view.setUint32(capturedLpNumberOfBytesWritten, syncWritten, true);
             }
+            completeOverlappedWrite(syncWritten);
             return 1; // TRUE — stdcall cleanup applied from the registered WriteFile signature
         }
 
@@ -1592,6 +1622,7 @@ const fileIoModule = (() => {
 
                 // Use deferred writes - they're applied in _restoreAsyncContext BEFORE simulating RET
                 // This ensures writes happen when ESP is still at original position
+                completeOverlappedWrite(bytesWritten);
                 if (capturedLpNumberOfBytesWritten) {
                     return {
                         value: 1,
@@ -1607,6 +1638,8 @@ const fileIoModule = (() => {
                 return { value: 1, stackCleanup: 20 };
             } catch (error) {
                 Logger.error(LogCategory.KERNEL32, `WriteFile failed: ${error}`);
+                // Same reason as ReadFile's catch: never return FALSE on a stale error.
+                System.getInstance().scheduler.setLastError(ERROR_IO_DEVICE);
                 return { value: 0, stackCleanup: 20 }; // FALSE
             }
         })();
@@ -1940,6 +1973,9 @@ const fileIoModule = (() => {
 
         Logger.verbose(LogCategory.KERNEL32, `CloseHandle(0x${hObject.toString(16)})`);
         readFileFirstLogged.delete(hObject);
+        // Handle values are recycled: a completion-port binding must die with the handle
+        // that owns it, or the next file to get this value posts into someone else's port.
+        dissociateIoCompletionHandle(hObject);
 
         const resourceProvider = System.getInstance().resourceProvider;
         const resource = resourceProvider.getResource(hObject);
@@ -1996,6 +2032,11 @@ const fileIoModule = (() => {
                         break;
                     }
                     const kernelObj = resourceProvider.getKernelObject(hObject);
+                    if (kernelObj?.kind === 'iocp') {
+                        // Threads parked in GetQueuedCompletionStatus on this port would
+                        // otherwise wait for a packet the closed port can never deliver.
+                        abandonIoCompletionWaiters(hObject);
+                    }
                     if (kernelObj?.kind === 'event') {
                         hypercallDataManager.unregisterEventMirror(hObject);
                     } else if (kernelObj?.kind === 'mutex') {
