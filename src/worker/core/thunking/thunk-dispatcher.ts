@@ -26,7 +26,7 @@ import { thunkChecksumManager } from '../memory/thunk-checksum';
 import { invalidateGuestCode } from '../memory/guest-code';
 import { hypercallDataManager } from '../cpu/hypercall-data';
 import { preemptionManager } from '../cpu/preemption-manager';
-import { PF_HALT_TARGET } from '../bootloader';
+import { PF_HALT_TARGET, TRAP_MARKER_VECTOR } from '../bootloader';
 import { faultRecorder, cr2RegisterCandidates, isFaultEipConsistent, analyzeIndirectCallFault } from '../memory/fault-recorder';
 import { stubRegistry } from '../diagnostics/stub-registry';
 import { apiCensus } from '../diagnostics/api-census';
@@ -170,6 +170,19 @@ const HEAVY_THUNK_MS = 0.5;
 const MAX_THUNK_ID = 65536; // Adjust based on your max expected ID
 const DEFAULT_ARGS_COUNT = 16;
 const SPIN_LOOP_ADDR_DEFAULT = 0x01F80000;
+
+/** NT status each recoverable CPU vector is delivered to the guest's SEH as. */
+const EXCEPTION_CODE_FOR_VECTOR: Record<number, number> = {
+    0x03: 0x80000003,   // #BP  → EXCEPTION_BREAKPOINT
+    0x04: 0xC0000095,   // #OF  → EXCEPTION_INT_OVERFLOW
+    0x06: 0xC000001D,   // #UD  → EXCEPTION_ILLEGAL_INSTRUCTION
+    0x0D: 0xC0000005,   // #GP  → EXCEPTION_ACCESS_VIOLATION (user-mode #GP)
+};
+const VECTOR_NAME: Record<number, string> = { 0x03: '#BP', 0x04: '#OF', 0x06: '#UD', 0x0D: '#GP' };
+const VECTOR_DESCRIPTION: Record<number, string> = {
+    0x03: 'breakpoint', 0x04: 'integer overflow',
+    0x06: 'illegal instruction', 0x0D: 'general protection',
+};
 
 // Memory region constants for validation (fail-fast diagnostics)
 const BOOTLOADER_START = 0x7c00;
@@ -406,6 +419,8 @@ export class ThunkDispatcher {
      *  current when the dispatch unwinds. */
     private sehRuntimePinnedThreadId = 0;
     private unhandledExceptionFilterAddr = 0;
+    /** One report per process for a runaway ESP — the CPU re-faults on it without end. */
+    private unreadableFaultFrameReported = false;
     private callbackStubPoolBase = 0;
     private callbackStubPoolEnd = 0;
     private thunkGeneratorBase = 0;
@@ -4135,6 +4150,11 @@ export class ThunkDispatcher {
         return old;
     }
 
+    /** The app's registered top-level filter, 0 if none. */
+    getUnhandledExceptionFilter(): number {
+        return this.unhandledExceptionFilterAddr;
+    }
+
     private _registerSehTransientRanges(): void {
         const sched = this.ensureScheduler();
         if (this.sehDispatchStubAddress) {
@@ -4646,6 +4666,14 @@ export class ThunkDispatcher {
             return;
         }
 
+        // Deliberate traps (INT 3 / INTO) share the #UD frame shape and the same
+        // SEH → UnhandledExceptionFilter → terminate hierarchy, under their own NT status.
+        const trapVector = TRAP_MARKER_VECTOR[marker];
+        if (trapVector !== undefined) {
+            this._handleRecoverableCpuException(trapVector, cpu);
+            return;
+        }
+
         // DllMain result reporter (from bootloader hook)
         if (marker === 0x000a) {
             const result = cpu.reg32[1] >>> 0; // ECX holds the result
@@ -4749,11 +4777,26 @@ export class ThunkDispatcher {
             cpu.reg32[0] = view.getUint32(ctxBase + 0xB0, true); // EAX
             cpu.reg32[5] = view.getUint32(ctxBase + 0xB4, true); // EBP
             const ctxEip = view.getUint32(ctxBase + 0xB8, true); // EIP from CONTEXT
+            const ctxEsp = view.getUint32(ctxBase + 0xC4, true) >>> 0; // ESP from CONTEXT
 
+            // ESP is part of the context, not an exception to it. Dispatch runs on a
+            // scratch stack 0x200 below the fault, so resuming on the dispatcher's own ESP
+            // hands the resumed code somebody else's stack: the first POP/RET in it reads
+            // garbage and the frame pointer it restores is garbage too, which detonates
+            // far away as a wild jump with ESP walked down to 0. The stub's tail is
+            // OUT;RET with nothing in between, so pointing ESP at a slot holding ctxEip
+            // makes that RET land on exactly the pre-fault (EIP, ESP) pair — NtContinue's
+            // contract. The slot is at ctxEsp-4, i.e. the dead zone below the resumed ESP.
+            const retSlot = (ctxEsp - 4) >>> 0;
+            const canRestoreEsp = ctxEsp >= 4 && retSlot + 4 <= this.memLength;
             Logger.warn(LogCategory.SYSTEM,
-                `SEH dispatch: handler returned ContinueExecution, retrying EIP=0x${ctxEip.toString(16)}`);
-            // Write restored EIP at [ESP] so RET pops it → retries the instruction
-            if (esp + 4 <= this.memLength) {
+                `SEH dispatch: handler returned ContinueExecution, retrying EIP=0x${ctxEip.toString(16)} ` +
+                `ESP=0x${ctxEsp.toString(16)}${canRestoreEsp ? '' : ' (UNRESTORABLE — resuming on the dispatch stack)'}`);
+            if (canRestoreEsp) {
+                guardStackWrite(retSlot, 4, 'thunk:sehContinueExec', ctxEip);
+                view.setUint32(retSlot, ctxEip, true);
+                cpu.reg32[4] = retSlot | 0;
+            } else if (esp + 4 <= this.memLength) {
                 guardStackWrite(esp, 4, 'thunk:sehContinueExec', ctxEip);
                 view.setUint32(esp, ctxEip, true);
             }
@@ -5001,32 +5044,71 @@ export class ThunkDispatcher {
     }
 
     /**
-     * Handle recoverable #UD (vector 6) / #GP (vector 13) from guest code.
+     * Handle a recoverable CPU exception from guest code: #BP (3), #OF (4), #UD (6),
+     * #GP (13). All four arrive through the same frame shape.
      *
-     * Frame during the OUT (the #UD handler pushes a dummy error code so both
-     * vectors share the #PF frame shape):
+     * Frame during the OUT (only #GP pushes a real error code; the others push a
+     * dummy one so every vector shares the #PF frame shape):
      *   [ESP+0]  = saved EDX
      *   [ESP+4]  = saved EAX
-     *   [ESP+8]  = error code (real for #GP, 0 for #UD)
+     *   [ESP+8]  = error code (real for #GP, 0 otherwise)
      *   [ESP+12] = faulting EIP (IRET return target)
      *   [ESP+16] = CS
      *   [ESP+20] = EFLAGS
      *
      * Outcome hierarchy (Windows-faithful order): SEH chain dispatch with the
-     * vector's NT status (#UD → STATUS_ILLEGAL_INSTRUCTION, #GP → the
+     * vector's NT status (EXCEPTION_CODE_FOR_VECTOR — note #GP carries the
      * STATUS_ACCESS_VIOLATION/0xFFFFFFFF form Windows reports for user-mode #GP),
      * then UnhandledExceptionFilter, then termination: the whole process when the
      * MAIN thread faulted (IRET → halt stub → scheduler halt watch → crash funnel),
      * or just the faulting WORKER thread (terminate + IRET → spin loop + immediate
      * reschedule) so the rest of the VM keeps running instead of freezing at CLI;HLT.
      */
+    /**
+     * The one fault we cannot describe: ESP is outside guest memory, so the interrupt frame —
+     * the only place the faulting EIP exists — is gone with it. The CPU then re-faults on the
+     * same push forever, and the useful signal (which stack ran out, and how far past its end)
+     * used to be buried under thousands of identical lines with `report().faults` still empty.
+     * Say it once, record it, and stop: nothing here is recoverable, so repeating is noise.
+     */
+    private _reportUnreadableFaultFrame(vecName: string, vector: number, esp: number, cpu: any): void {
+        if (this.unreadableFaultFrameReported) return;
+        this.unreadableFaultFrameReported = true;
+
+        const scheduler = this.ensureScheduler();
+        const thread = scheduler?.getCurrentThread?.() ?? null;
+        const stackLo = thread?.stackBase ?? 0;
+        const stackHi = thread?.stackTop ?? 0;
+        const r = cpu.reg32;
+        Logger.error(LogCategory.SYSTEM,
+            `${vecName}: fault frame unreadable — ESP=0x${esp.toString(16)} is outside guest memory ` +
+            `(0..0x${this.memLength.toString(16)}). The stack pointer ran away, so the faulting EIP is ` +
+            `unrecoverable; the exception before this one is the lead. ` +
+            `T${thread?.id ?? '?'} registered stack=[0x${(stackLo >>> 0).toString(16)},0x${(stackHi >>> 0).toString(16)}) ` +
+            `EBP=0x${(r[5] >>> 0).toString(16)} ESI=0x${(r[6] >>> 0).toString(16)} EDI=0x${(r[7] >>> 0).toString(16)} ` +
+            `last_thunk=${this.lastThunkName || 'unknown'} — further ${vecName} reports suppressed`);
+
+        faultRecorder.record({
+            ts: performance.now(),
+            eip: 0,
+            faultAddr: esp >>> 0,
+            errorCode: EXCEPTION_CODE_FOR_VECTOR[vector] ?? 0xC0000005,
+            threadId: thread?.id ?? null,
+            lastThunk: this.lastThunkName || 'unknown',
+            kind: "unhandled",
+            regs: { ecx: r[1] >>> 0, ebx: r[3] >>> 0, esp: r[4] >>> 0, ebp: r[5] >>> 0, esi: r[6] >>> 0, edi: r[7] >>> 0 },
+            recentCalls: this.winApiRing?.getCrashTraceLines?.(48) ?? [],
+            gameEsp: esp >>> 0,
+            stackDump: [],
+        });
+    }
+
     private _handleRecoverableCpuException(vector: number, cpu: any): void {
         const esp = cpu.reg32[4] >>> 0;
         const view = this.cachedDataView;
-        const vecName = vector === 0x06 ? '#UD' : '#GP';
+        const vecName = VECTOR_NAME[vector] ?? `vector ${vector}`;
         if (!this.cachedMem8 || !this.isDataViewValid() || !view || esp + 24 > this.memLength) {
-            Logger.error(LogCategory.SYSTEM,
-                `${vecName}: fault frame unreadable at ESP=0x${esp.toString(16)} — cannot recover`);
+            this._reportUnreadableFaultFrame(vecName, vector, esp, cpu);
             return;
         }
 
@@ -5035,9 +5117,13 @@ export class ThunkDispatcher {
         const errorCode = view.getUint32(esp + 8, true) >>> 0;
         const faultingEip = view.getUint32(esp + 12, true) >>> 0;
 
-        const isUd = vector === 0x06;
-        const exceptionCode = isUd ? 0xC000001D : 0xC0000005;
-        const faultAddr = isUd ? faultingEip : 0xFFFFFFFF;
+        // #GP is the odd one out: Windows reports user-mode #GP as an access violation at
+        // an unknown address, so its ExceptionAddress is the 0xFFFFFFFF form rather than
+        // the faulting EIP. A trap pushes the address of the NEXT instruction, and KiTrap03
+        // backs that up by the one INT 3 byte so the record names the trap itself.
+        const isGp = vector === 0x0d;
+        const exceptionCode = EXCEPTION_CODE_FOR_VECTOR[vector] ?? 0xC0000005;
+        const faultAddr = isGp ? 0xFFFFFFFF : (vector === 0x03 ? (faultingEip - 1) >>> 0 : faultingEip);
 
         // Live EAX/EDX hold the OUT scratch; the handler tail POPs the real values
         // back from the frame, so restoring them here only fixes the forensics below.
@@ -5055,7 +5141,7 @@ export class ThunkDispatcher {
 
         // Full forensic dump. The dumper expects ESP at the error-code slot for
         // error-code vectors and at the EIP slot otherwise — see espOverride.
-        dumpExceptionContext(this, vector, cpu, isUd ? esp + 12 : esp + 8);
+        dumpExceptionContext(this, vector, cpu, isGp ? esp + 8 : esp + 12);
 
         const sys = System.getInstance();
         if (sys.isExiting) {
@@ -5114,7 +5200,7 @@ export class ThunkDispatcher {
             `${vecName}: unhandled on worker T${currentThread.id} — terminating thread ` +
             `with 0x${exceptionCode.toString(16)}, VM continues (fault EIP=0x${faultingEip.toString(16)})`);
         sys.reportGuestThreadFault({
-            reason: `Unhandled ${vecName} (${isUd ? 'illegal instruction' : 'general protection'}) on worker thread — thread terminated`,
+            reason: `Unhandled ${vecName} (${VECTOR_DESCRIPTION[vector] ?? 'cpu exception'}) on worker thread — thread terminated`,
             eip: faultingEip,
             threadId: currentThread.id,
             exceptionCode,

@@ -2,6 +2,22 @@
 
 import { DllInitEntry } from './pe-loader';
 
+/**
+ * Marker ids for the deliberately-raised trap vectors. The low 16 bits of a 0xDEADxxxx id
+ * are what the dispatcher switches on, and there 0x0003/0x0004 are already the bootloader's
+ * own progress markers — so these carry a 0x01xx prefix rather than the bare vector number.
+ */
+export const TRAP_MARKER = {
+    bp: 0xdead0103,   // vector 3, INT 3
+    of: 0xdead0104,   // vector 4, INTO
+} as const;
+
+/** Vector each trap marker came from, for the dispatcher's NT-status mapping. */
+export const TRAP_MARKER_VECTOR: Record<number, number> = {
+    [TRAP_MARKER.bp & 0xffff]: 3,
+    [TRAP_MARKER.of & 0xffff]: 4,
+};
+
 // Creates a 16-bit real mode bootloader that switches to 32-bit protected mode
 // and jumps to the PE entry point.
 // dllInits: DLLs whose DllMain(DLL_PROCESS_ATTACH) must be called before entry.
@@ -198,6 +214,13 @@ export function createBootloader(
     const hInt2eOff = hPfOff + handlerSize;
     const hInt80Off = hInt2eOff + handlerSize;
     const hDeOff = hInt80Off + handlerSize; // #DE (Division Error) - recoverable
+    // Trap vectors a guest raises DELIBERATELY: INT 3 is how anti-debug code probes for a
+    // debugger, INTO how compiled overflow checks report. Both must reach the guest's SEH
+    // as EXCEPTION_BREAKPOINT / EXCEPTION_INT_OVERFLOW; the generic halt handler would
+    // stop the machine on code that runs fine on Windows. Appended AFTER the existing
+    // handlers so PF_HALT_TARGET's slot arithmetic below stays valid.
+    const hBpOff = hDeOff + handlerSize;    // #BP (INT 3) - recoverable
+    const hOfOff = hBpOff + handlerSize;    // #OF (INTO)  - recoverable
 
     const totalSize = 512 + 32 + idtSize + 1024;
     const finalBuffer = new Uint8Array(totalSize);
@@ -233,6 +256,9 @@ export function createBootloader(
         createRecoverableHandlerBytes(0xdead0000),
         hDeOff
     ); // #DE - recoverable via IRET
+    // A trap pushes no error code, so both share the #UD frame shape (dummy pushed).
+    finalBuffer.set(createRecoverableFaultHandler(TRAP_MARKER.bp, true), hBpOff);
+    finalBuffer.set(createRecoverableFaultHandler(TRAP_MARKER.of, true), hOfOff);
 
     // Create and write IDT
     const idtBytes = createIDTBytes({
@@ -243,6 +269,8 @@ export function createBootloader(
         int2e: loadAddress + hInt2eOff,
         int80: loadAddress + hInt80Off,
         de: loadAddress + hDeOff,
+        bp: loadAddress + hBpOff,
+        of: loadAddress + hOfOff,
     });
     finalBuffer.set(idtBytes, 512 + 32);
 
@@ -418,6 +446,8 @@ function createIDTBytes(addrs: {
     int2e: number;
     int80: number;
     de: number;
+    bp: number;
+    of: number;
 }): Uint8Array {
     const idt = new Uint8Array(256 * 8);
     const view = new DataView(idt.buffer);
@@ -427,6 +457,8 @@ function createIDTBytes(addrs: {
     }
 
     setIDTEntry(view, 0, addrs.de);     // #DE - Division Error (recoverable)
+    setIDTEntry(view, 3, addrs.bp);     // #BP - INT 3 (recoverable)
+    setIDTEntry(view, 4, addrs.of);     // #OF - INTO (recoverable)
     setIDTEntry(view, 6, addrs.ud);
     setIDTEntry(view, 13, addrs.gp);
     setIDTEntry(view, 14, addrs.pf);

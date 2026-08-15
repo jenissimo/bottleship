@@ -35,6 +35,11 @@ function dumpGuestDwords(mem: Uint8Array, ptr: number, words: number = 8): strin
     return `ptr=0x${ptr.toString(16)} ${parts.join(' ')}`;
 }
 
+/** Exception-filter dispositions, and the stdcall arg size both filters share. */
+const EXCEPTION_CONTINUE_SEARCH = 0;
+const EXCEPTION_EXECUTE_HANDLER = 1;
+const UEF_STACK_CLEANUP = 4;
+
 // EncodePointer/DecodePointer cookie — module-scope so fast path can access it.
 // Must NOT be zero! See comment in exceptionExports below.
 let pointerCookie = 0;
@@ -240,9 +245,44 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             // Best-effort diagnostics
         }
 
-        // EXCEPTION_CONTINUE_SEARCH = 0
-        // We don't handle exceptions, so continue search
-        return 0;
+        // Windows hands the exception to the filter the app registered with
+        // SetUnhandledExceptionFilter and returns whatever that filter decides. Skipping
+        // that call is not a missing diagnostic but a wrong answer: an app whose filter
+        // would have said "continue execution" — the shape anti-debug probes take, where a
+        // deliberate INT 3 is expected to come back through here — instead sees its own
+        // exception go unhandled and dies.
+        const dispatcher = System.getInstance().process?.dispatcher;
+        const filter = dispatcher?.getUnhandledExceptionFilter() ?? 0;
+        const callbackManager = dispatcher?.callbackManager;
+        if (filter && callbackManager) {
+            const frameId = callbackManager.saveSuspendedThunkContext(ctx, UEF_STACK_CLEANUP, 'UnhandledExceptionFilter');
+            if (frameId) {
+                const { callbackId } = callbackManager.invokeCallback(
+                    filter,
+                    [ExceptionInfo],
+                    UEF_STACK_CLEANUP,
+                    // A filter that declines still ends the process on Windows: UEF puts up
+                    // the fatal-error dialog and reports EXCEPTION_EXECUTE_HANDLER so the
+                    // CRT's __except runs its exit path.
+                    (ret: number) => (ret === EXCEPTION_CONTINUE_SEARCH ? EXCEPTION_EXECUTE_HANDLER : ret),
+                    false,
+                    'UnhandledExceptionFilter',
+                    frameId,
+                );
+                if (callbackId) {
+                    return {
+                        value: 0,
+                        suspendedForCallback: true,
+                        callbackId,
+                        stackCleanup: UEF_STACK_CLEANUP,
+                    };
+                }
+            }
+            Logger.error(LogCategory.KERNEL32,
+                `UnhandledExceptionFilter: could not invoke the app filter at 0x${filter.toString(16)}`);
+        }
+
+        return EXCEPTION_EXECUTE_HANDLER;
     };
 
     exports['RaiseException'] = (ctx, mem, args) => {
