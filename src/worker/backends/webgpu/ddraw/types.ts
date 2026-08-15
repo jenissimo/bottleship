@@ -34,7 +34,6 @@ export interface DebugFlags {
     /** Force POINT sampling on all draws without changing UV coordinates */
     forcePointFilter: boolean;
     /** Disable the POINT-filter UV bias without changing sampler state */
-    disablePointUvBias: boolean;
     /** Disable the contained-UV WRAP->CLAMP seam suppression (XYZRHW draws with UVs in [0,1]) */
     disableContainedUvClamp: boolean;
     /** Texture converter debug mode: 0=normal, 1=show format (red=32bit, green=16bit, blue=8bit), 2=show read errors */
@@ -81,7 +80,6 @@ export const DEFAULT_DEBUG_FLAGS: DebugFlags = {
     forceDisableAlphaTest: false,
     forceTextureResync: false,
     forcePointFilter: false,
-    disablePointUvBias: false,
     disableContainedUvClamp: false,
     textureConverterDebugMode: 0,
     disableMegaBatch: false,
@@ -173,9 +171,7 @@ export interface DrawExecutionDiagnostics {
     addressU: number;
     addressV: number;
     maxAnisotropy: number;
-    pointUvBiasApplied: boolean;
     forcePointFilter: boolean;
-    disablePointUvBias: boolean;
 }
 
 /**
@@ -318,7 +314,6 @@ export interface PipelineKeyConfig {
     primitiveType: number;
     sampledMask: number; // Bit N = stage N samples a texture (affects shader: bindings)
     stageCount: number; // Cascade stage blocks emitted (1 + highest enabled stage)
-    pointSampleMask: number; // Bit N = stage N uses legacy POINT texel selection in shader
     missingTexture: boolean; // Affects shader: fallback texture handling
     cullMode: number;
     zEnable: number;
@@ -361,7 +356,7 @@ export interface PipelineKeyConfig {
  */
 export function makeEmptyPipelineKeyConfig(): PipelineKeyConfig {
     return {
-        vertexType: 0, primitiveType: 0, sampledMask: 0, stageCount: 0, pointSampleMask: 0,
+        vertexType: 0, primitiveType: 0, sampledMask: 0, stageCount: 0,
         missingTexture: false, cullMode: 0, zEnable: 0, zFunc: 0, zWrite: 0, zBias: 0,
         coplanarPass: 0,
         alphaBlend: 0, alphaTest: 0, srcBlend: 0, dstBlend: 0, alphaFunc: 0, colorKeyEnabled: 0,
@@ -381,7 +376,6 @@ export function generatePipelineKey(config: PipelineKeyConfig): string {
         `pt:${config.primitiveType}`,
         `sm:${config.sampledMask}`,
         `sc:${config.stageCount}`,
-        `psm:${config.pointSampleMask}`,
         `miss:${config.missingTexture ? 1 : 0}`,
         `cull:${config.cullMode}`,
         `z:${config.zEnable}`,
@@ -423,7 +417,6 @@ export function generateMegaBatchPipelineKey(config: PipelineKeyConfig): string 
         `pt:${config.primitiveType}`,
         `sm:${config.sampledMask}`,
         `sc:${config.stageCount}`,
-        `psm:${config.pointSampleMask}`,
         `miss:${config.missingTexture ? 1 : 0}`,
         `cull:${config.cullMode}`,
         `z:${config.zEnable}`,
@@ -462,7 +455,6 @@ export function pipelineKeyConfigsEqual(a: PipelineKeyConfig, b: PipelineKeyConf
         a.primitiveType === b.primitiveType &&
         a.sampledMask === b.sampledMask &&
         a.stageCount === b.stageCount &&
-        a.pointSampleMask === b.pointSampleMask &&
         a.missingTexture === b.missingTexture &&
         a.cullMode === b.cullMode &&
         a.zEnable === b.zEnable &&
@@ -500,7 +492,6 @@ export function megaBatchPipelineKeyConfigsEqual(a: PipelineKeyConfig, b: Pipeli
         a.primitiveType === b.primitiveType &&
         a.sampledMask === b.sampledMask &&
         a.stageCount === b.stageCount &&
-        a.pointSampleMask === b.pointSampleMask &&
         a.missingTexture === b.missingTexture &&
         a.cullMode === b.cullMode &&
         a.zEnable === b.zEnable &&

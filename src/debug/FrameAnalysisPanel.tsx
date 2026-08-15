@@ -50,9 +50,7 @@ type CapturedDrawCall = {
         minFilter: number; magFilter: number; mipFilter: number;
         addressU: number; addressV: number; maxAnisotropy: number;
     } | null;
-    pointUvBiasApplied: boolean | null;
     forcePointFilter: boolean;
-    disablePointUvBias: boolean;
     derivedColorKeyEnabled: boolean;
     derivedUseTexture: boolean;
     derivedPremultiply: boolean;
@@ -492,12 +490,8 @@ function ExpandedDrawCall({ dc, texPreview, bit15Stats, onCheckBit15 }: {
                                 ? `${FILTER_NAMES[dc.effectiveSamplerState.minFilter] ?? dc.effectiveSamplerState.minFilter}/${FILTER_NAMES[dc.effectiveSamplerState.magFilter] ?? dc.effectiveSamplerState.magFilter}/${MIPFILTER_NAMES[dc.effectiveSamplerState.mipFilter] ?? dc.effectiveSamplerState.mipFilter} ${ADDRESS_NAMES[dc.effectiveSamplerState.addressU] ?? dc.effectiveSamplerState.addressU}/${ADDRESS_NAMES[dc.effectiveSamplerState.addressV] ?? dc.effectiveSamplerState.addressV}`
                                 : "not prepared"}
                         </span>
-                        <span style={{ color: "#888" }}>POINT UV bias</span>
-                        <span>
-                            {dc.pointUvBiasApplied === null ? "not prepared" : dc.pointUvBiasApplied ? "APPLIED" : "not applied"}
-                            {dc.forcePointFilter ? " (forcePointFilter)" : ""}
-                            {dc.disablePointUvBias ? " (disabled)" : ""}
-                        </span>
+                        <span style={{ color: "#888" }}>forcePointFilter</span>
+                        <span>{dc.forcePointFilter ? "YES" : "no"}</span>
                     </div>
                 </div>
 

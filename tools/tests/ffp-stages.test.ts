@@ -190,7 +190,7 @@ describe("FfpStagesState.resolve", () => {
 });
 
 describe("shader generation (stage-generic WGSL)", () => {
-    const baseConfig: Omit<ShaderConfig, "sampledMask" | "stageCount" | "pointSampleMask"> = {
+    const baseConfig: Omit<ShaderConfig, "sampledMask" | "stageCount"> = {
         alphaTestEnabled: false,
         alphaFunc: 8,
         shouldEnableBlending: false,
@@ -201,7 +201,7 @@ describe("shader generation (stage-generic WGSL)", () => {
     };
 
     test("legacy shader: bindings and stage blocks follow the masks", () => {
-        const code = generateShaderCode({ ...baseConfig, sampledMask: 0b1011, stageCount: 4, pointSampleMask: 0 });
+        const code = generateShaderCode({ ...baseConfig, sampledMask: 0b1011, stageCount: 4 });
         for (const s of [0, 1, 3]) {
             expect(code).toContain(`var tex${s}Sampler`);
             expect(code).toContain(`var tex${s}: texture_2d<f32>`);
@@ -214,13 +214,13 @@ describe("shader generation (stage-generic WGSL)", () => {
     });
 
     test("legacy shader: untextured stage 0 falls back to diffuse", () => {
-        const code = generateShaderCode({ ...baseConfig, sampledMask: 0, stageCount: 1, pointSampleMask: 0 });
+        const code = generateShaderCode({ ...baseConfig, sampledMask: 0, stageCount: 1 });
         expect(code).toContain("var tex0Color = diffuse");
         expect(code).not.toContain("textureSample(tex0");
     });
 
     test("megabatch shader mirrors the stage cascade against the storage slot", () => {
-        const code = generateMegaBatchShaderCode({ ...baseConfig, sampledMask: 0b11, stageCount: 2, pointSampleMask: 0, useMegaBatch: true });
+        const code = generateMegaBatchShaderCode({ ...baseConfig, sampledMask: 0b11, stageCount: 2, useMegaBatch: true });
         expect(code).toContain("var<storage, read> draws");
         expect(code).toContain("draw.stages[0]");
         expect(code).toContain("draw.stages[1]");

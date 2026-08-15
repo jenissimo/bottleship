@@ -145,9 +145,7 @@ export type CapturedDrawCall = {
         addressV: number;
         maxAnisotropy: number;
     } | null;
-    pointUvBiasApplied: boolean | null;
     forcePointFilter: boolean;
-    disablePointUvBias: boolean;
     // Derived state (what the executor actually uses)
     derivedColorKeyEnabled: boolean;
     derivedUseTexture: boolean;

@@ -224,7 +224,7 @@ export function recordRawDraw(partial: Partial<CapturedDrawCall> & { backend: st
         colorOp: 0, alphaOp: 0, colorArg1: 0, colorArg2: 0, alphaArg1: 0, alphaArg2: 0,
         legacySamplerState: { textureAddress: 0, textureAddressU: 0, textureAddressV: 0, textureMag: 0, textureMin: 0, anisotropy: 0 },
         stage0SamplerState: { minFilter: 0, magFilter: 0, mipFilter: 0, addressU: 0, addressV: 0, maxAnisotropy: 0 },
-        effectiveSamplerState: null, pointUvBiasApplied: null, forcePointFilter: false, disablePointUvBias: false,
+        effectiveSamplerState: null, forcePointFilter: false,
         derivedColorKeyEnabled: false, derivedUseTexture: false, derivedPremultiply: false, derivedShouldBlend: false,
         warnings: [],
         ...partial,
@@ -374,9 +374,7 @@ export type RecordDrawCallParams = {
         addressU: number;
         addressV: number;
         maxAnisotropy: number;
-        pointUvBiasApplied: boolean;
         forcePointFilter: boolean;
-        disablePointUvBias: boolean;
     } | null;
 };
 
@@ -624,9 +622,7 @@ export function recordDrawCall(p: RecordDrawCallParams): void {
         legacySamplerState,
         stage0SamplerState,
         effectiveSamplerState,
-        pointUvBiasApplied: p.executionDiagnostics?.pointUvBiasApplied ?? null,
         forcePointFilter: p.executionDiagnostics?.forcePointFilter ?? false,
-        disablePointUvBias: p.executionDiagnostics?.disablePointUvBias ?? false,
         derivedColorKeyEnabled,
         derivedUseTexture,
         derivedPremultiply,

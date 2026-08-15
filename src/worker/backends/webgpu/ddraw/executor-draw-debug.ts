@@ -75,7 +75,5 @@ export function updateLastDrawDiagnostics(self: any, pr: PrepareDrawResult): voi
         d.addressU = s0.addressU;
         d.addressV = s0.addressV;
         d.maxAnisotropy = s0.maxAnisotropy;
-        d.pointUvBiasApplied = false;
         d.forcePointFilter = self.debugFlags.forcePointFilter;
-        d.disablePointUvBias = self.debugFlags.disablePointUvBias;
     }

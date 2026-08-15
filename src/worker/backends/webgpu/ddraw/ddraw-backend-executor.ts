@@ -429,9 +429,7 @@ export class DDrawWebGPUExecutor {
         addressU: D3DTADDRESS_WRAP,
         addressV: D3DTADDRESS_WRAP,
         maxAnisotropy: 1,
-        pointUvBiasApplied: false,
         forcePointFilter: false,
-        disablePointUvBias: false,
     };
 
     // Per-draw sanitized-viewport scratch. Separate instances because drawPrimitive /
@@ -927,9 +925,6 @@ export class DDrawWebGPUExecutor {
                 break;
             case "forcePointFilter":
                 this.debugFlags.forcePointFilter = enabled;
-                break;
-            case "disablePointUvBias":
-                this.debugFlags.disablePointUvBias = enabled;
                 break;
             case "disableContainedUvClamp":
                 this.debugFlags.disableContainedUvClamp = enabled;
@@ -2504,14 +2499,6 @@ export class DDrawWebGPUExecutor {
             );
         }
 
-        // D3D7 POINT sampling often places UVs exactly on texel boundaries.
-        // The shader applies a tiny sampler-space nudge for this case; do not mutate
-        // vertex UVs here or atlas/tile boundaries shift and expose neighboring texels.
-        if (texture && !this.debugFlags.disablePointUvBias &&
-            prepareResult.stageSamplers[0].minFilter === D3DTFN_POINT &&
-            prepareResult.stageSamplers[0].magFilter === D3DTFG_POINT) {
-            this.lastDrawDiagnostics.pointUvBiasApplied = true;
-        }
         drawCostProfiler.add(DC.vconvert, _tConv);
 
         // Allocate vertex data in ring buffer
@@ -3003,13 +2990,6 @@ export class DDrawWebGPUExecutor {
             );
         }
 
-        // Same POINT texel-boundary fix as drawPrimitive; implemented in shader so
-        // indexed vertex data stays identical across adjacent tiles/planes.
-        if (texture && !this.debugFlags.disablePointUvBias &&
-            prepareResult.stageSamplers[0].minFilter === D3DTFN_POINT &&
-            prepareResult.stageSamplers[0].magFilter === D3DTFG_POINT) {
-            this.lastDrawDiagnostics.pointUvBiasApplied = true;
-        }
         drawCostProfiler.add(DC.vconvert, _tConv);
 
         // Allocate vertex data in ring buffer

@@ -77,8 +77,15 @@ export class ModuleRegistry {
     /** VA returned by unregister(), first-fit reusable. See allocateBase. */
     private freeDllRanges: Array<{ base: number; size: number }> = [];
 
+    /** A module is identified by the FILE it maps, so the key is the basename — a load
+     *  through a full path and a later import of the bare name are the same module.
+     *  Keying on the caller's spelling instead loads a second copy of the image, and the
+     *  two copies then have separate statics: Hitman's gsc.dll registered its script host
+     *  in "c:\gsc" while hitmandlc.dlc called getHostInterface() on "gsc" and got NULL. */
     private normalizeModuleLookupKey(name: string): string {
-        return name.toLowerCase().replace(/\.(dll|exe)$/i, '');
+        const lower = name.toLowerCase();
+        const cut = Math.max(lower.lastIndexOf('/'), lower.lastIndexOf('\\'));
+        return (cut >= 0 ? lower.slice(cut + 1) : lower).replace(/\.(dll|exe)$/i, '');
     }
 
     /**
@@ -133,17 +140,9 @@ export class ModuleRegistry {
         const acceptable = (m: LoadedPEModule | undefined): LoadedPEModule | undefined =>
             (m && !(wantsDll && m.isExecutable)) ? m : undefined;
 
-        const existing = acceptable(this.modules.get(this.normalizeModuleLookupKey(nameLower)));
-        if (existing) return existing;
-
-        // Also try basename only — DLLs loaded via import table are registered
-        // by short name ("engine"), but LoadLibraryA passes full path ("c:\system\engine")
-        const lastSlash = Math.max(nameLower.lastIndexOf('/'), nameLower.lastIndexOf('\\'));
-        if (lastSlash >= 0) {
-            const basename = this.normalizeModuleLookupKey(nameLower.substring(lastSlash + 1));
-            return acceptable(this.modules.get(basename));
-        }
-        return undefined;
+        // The key is already the basename, so a full-path request ("c:\system\engine.dll")
+        // and an import-table one ("engine.dll") land on the same entry.
+        return acceptable(this.modules.get(this.normalizeModuleLookupKey(nameLower)));
     }
 
     /**

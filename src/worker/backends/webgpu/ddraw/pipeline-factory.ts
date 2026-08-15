@@ -131,42 +131,6 @@ function mapStencilOperation(d3dStencilOp: number): GPUStencilOperation {
     }
 }
 
-function shouldUseLegacyPointSample(
-    useTexture: boolean,
-    minFilter: number,
-    magFilter: number,
-    forcePointFilter: boolean,
-    disablePointUvBias: boolean
-): boolean {
-    if (!useTexture || disablePointUvBias) return false;
-
-    const effectiveMin = forcePointFilter ? D3DTFN_POINT : (minFilter || D3DTFN_POINT);
-    const effectiveMag = forcePointFilter ? D3DTFG_POINT : (magFilter || D3DTFG_POINT);
-    return effectiveMin === D3DTFN_POINT && effectiveMag === D3DTFG_POINT;
-}
-
-/** Bit N = sampled stage N uses the legacy POINT texel-selection bias in the shader. */
-function computePointSampleMask(
-    stages: FfpStagesState,
-    colorKeyActive: boolean,
-    debugFlags: DebugFlags
-): number {
-    let mask = 0;
-    for (let s = 0; s < MAX_FFP_SAMPLED_STAGES; s++) {
-        const sampled = (stages.sampledMask & (1 << s)) !== 0;
-        if (shouldUseLegacyPointSample(
-            sampled,
-            stages.minFilter[s],
-            stages.magFilter[s],
-            debugFlags.forcePointFilter || (s === 0 && colorKeyActive),
-            debugFlags.disablePointUvBias
-        )) {
-            mask |= 1 << s;
-        }
-    }
-    return mask;
-}
-
 /**
  * Factory for creating and caching render pipelines
  */
@@ -326,7 +290,6 @@ export class PipelineFactory {
         const alphaFunc = renderStates[D3DRENDERSTATE_ALPHAFUNC];
         const colorKeyEnabled = renderStates[D3DRENDERSTATE_COLORKEYENABLE] || 0;
         const colorKeyActive = useTexture && !!texture?.srcColorKey && colorKeyEnabled !== 0;
-        const pointSampleMask = computePointSampleMask(stages, colorKeyActive, this.debugFlags);
 
         // Read stencil states
         const stencilEnable = renderStates[D3DRENDERSTATE_STENCILENABLE] || 0;
@@ -371,7 +334,6 @@ export class PipelineFactory {
         keyConfig.primitiveType = primitiveType;
         keyConfig.sampledMask = stages.sampledMask;
         keyConfig.stageCount = stages.stageCount;
-        keyConfig.pointSampleMask = pointSampleMask;
         keyConfig.missingTexture = missingTexture;
         keyConfig.cullMode = effectiveCullMode;
         keyConfig.zEnable = zEnable;
@@ -443,7 +405,6 @@ export class PipelineFactory {
             primitiveType,
             stages.sampledMask,
             stages.stageCount,
-            pointSampleMask,
             missingTexture,
             d3dCull,
             zEnable,
@@ -507,7 +468,6 @@ export class PipelineFactory {
         const alphaFunc = renderStates[D3DRENDERSTATE_ALPHAFUNC];
         const colorKeyEnabled = renderStates[D3DRENDERSTATE_COLORKEYENABLE] || 0;
         const colorKeyActive = useTexture && !!texture?.srcColorKey && colorKeyEnabled !== 0;
-        const pointSampleMask = computePointSampleMask(stages, colorKeyActive, this.debugFlags);
         const stencilEnable = renderStates[D3DRENDERSTATE_STENCILENABLE] || 0;
         const stencilFunc = renderStates[D3DRENDERSTATE_STENCILFUNC] || D3DCMP_ALWAYS;
         const stencilFail = renderStates[D3DRENDERSTATE_STENCILFAIL] || D3DSTENCILOP_KEEP;
@@ -550,7 +510,6 @@ export class PipelineFactory {
         keyConfig.primitiveType = primitiveType;
         keyConfig.sampledMask = stages.sampledMask;
         keyConfig.stageCount = stages.stageCount;
-        keyConfig.pointSampleMask = pointSampleMask;
         keyConfig.missingTexture = missingTexture;
         keyConfig.cullMode = effectiveCullMode;
         keyConfig.zEnable = zEnable;
@@ -609,7 +568,6 @@ export class PipelineFactory {
             primitiveType,
             stages.sampledMask,
             stages.stageCount,
-            pointSampleMask,
             missingTexture,
             d3dCull,
             zEnable,
@@ -648,7 +606,6 @@ export class PipelineFactory {
         primitiveType: number,
         sampledMask: number,
         stageCount: number,
-        pointSampleMask: number,
         missingTexture: boolean,
         d3dCull: number,
         zEnable: number,
@@ -718,7 +675,6 @@ export class PipelineFactory {
         const shaderConfig: ShaderConfig = {
             sampledMask,
             stageCount,
-            pointSampleMask,
             flatShading,
             alphaTestEnabled: this.debugFlags.forceDisableAlphaTest ? false : alphaTest !== 0,
             alphaFunc,
@@ -831,7 +787,6 @@ export class PipelineFactory {
         primitiveType: number,
         sampledMask: number,
         stageCount: number,
-        pointSampleMask: number,
         missingTexture: boolean,
         d3dCull: number,
         zEnable: number,
@@ -912,7 +867,6 @@ export class PipelineFactory {
         const shaderConfig: ShaderConfig = {
             sampledMask,
             stageCount,
-            pointSampleMask,
             flatShading,
             alphaTestEnabled: this.debugFlags.forceDisableAlphaTest ? false : alphaTest !== 0,
             alphaFunc,

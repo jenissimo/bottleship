@@ -5,7 +5,7 @@
  * The FFP texture cascade is stage-count-generic: per-stage ops/args/TCI/transform-flags
  * travel in a packed `stages: array<vec4u, MAX_FFP_STAGES>` block (see ffp-stages.ts for
  * the packing), and the fragment cascade is loop-emitted per compiled variant from
- * (stageCount, sampledMask, pointSampleMask).
+ * (stageCount, sampledMask).
  */
 
 import {
@@ -59,8 +59,6 @@ export interface ShaderConfig {
     sampledMask: number;
     /** Number of cascade stage blocks to emit (1 + highest enabled stage). */
     stageCount: number;
-    /** Bit N set = stage N uses POINT sampling and gets the tiny forward texel bias. */
-    pointSampleMask: number;
     /** D3DRENDERSTATE_SHADEMODE == D3DSHADE_FLAT: flat-shade the diffuse (COLOR0) and specular
      *  (COLOR1) varyings — the provoking (first) vertex's color is used for the whole primitive,
      *  matching real D3D. Games (e.g. Airfix Dogfighter's menu) set only the provoking vertex's
@@ -134,12 +132,12 @@ function generateZBlock(forceZMidpoint: boolean): string {
                     out.position.z = z_ndc2 * out.position.w;`;
 }
 
-function generateTextureSample(textureName: string, samplerName: string, uvExpr: string, pointSample: boolean): string {
-    if (!pointSample) {
-        return `textureSample(${textureName}, ${samplerName}, ${uvExpr})`;
-    }
-
-    return `textureSample(${textureName}, ${samplerName}, ${uvExpr} + vec2f(0.000244140625) / max(vec2f(textureDimensions(${textureName}, 0)), vec2f(1.0)))`;
+/** D3DTEXF_POINT is a plain nearest fetch — no coordinate nudge. Real D3D (and Wine
+ *  and DXVK, which map D3DTEXF_POINT straight to VK_FILTER_NEAREST) bias nothing, and
+ *  a nudge shifts a glyph-atlas cell into its neighbour: Hitman's HUD strings came out
+ *  as fragments of the wrong letters. */
+function generateTextureSample(textureName: string, samplerName: string, uvExpr: string): string {
+    return `textureSample(${textureName}, ${samplerName}, ${uvExpr})`;
 }
 
 /**
@@ -271,15 +269,15 @@ function generateStageBindings(sampledMask: number): string {
  * Emit one FFP cascade stage block for the fragment shader.
  *
  * Ops/args are dynamic (read from the packed stages block), so the only compile-time
- * variation is whether the stage samples its texture (binding exists) and the POINT
- * bias. Stage 0 keeps its historical texColor fallback: with no texture bound the
- * "texture" input is the diffuse color (D3DTA_TEXTURE args were already remapped to
- * DIFFUSE by the resolver, so this only affects the colorkey path and texAlpha).
+ * variation is whether the stage samples its texture (binding exists). Stage 0 keeps its
+ * historical texColor fallback: with no texture bound the "texture" input is the diffuse
+ * color (D3DTA_TEXTURE args were already remapped to DIFFUSE by the resolver, so this
+ * only affects the colorkey path and texAlpha).
  */
-function emitStageBlock(s: number, prefix: string, sampled: boolean, pointSample: boolean): string {
+function emitStageBlock(s: number, prefix: string, sampled: boolean): string {
     const uvExpr = s === 0 ? "in.uv" : `in.uv${s}`;
     const texColorExpr = sampled
-        ? generateTextureSample(`tex${s}`, `tex${s}Sampler`, uvExpr, pointSample)
+        ? generateTextureSample(`tex${s}`, `tex${s}Sampler`, uvExpr)
         : (s === 0 ? "diffuse" : "vec4f(0.0, 0.0, 0.0, 1.0)");
     return `
                 // ---- FFP stage ${s} ----
@@ -309,8 +307,7 @@ function emitStageCascade(config: ShaderConfig, prefix: string): string {
     const count = Math.max(1, Math.min(MAX_FFP_STAGES, config.stageCount));
     for (let s = 0; s < count; s++) {
         const sampled = (config.sampledMask & (1 << s)) !== 0 && s < MAX_FFP_SAMPLED_STAGES;
-        const point = (config.pointSampleMask & (1 << s)) !== 0;
-        out += emitStageBlock(s, prefix, sampled, point);
+        out += emitStageBlock(s, prefix, sampled);
     }
     return out;
 }

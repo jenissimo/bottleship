@@ -835,21 +835,6 @@ export default function DebugGPUPanel({ isOpen, onClose, worker }: DebugGPUPanel
                                 if (worker) {
                                     worker.postMessage({
                                         type: "gpu_debug_toggle",
-                                        toggle: "disablePointUvBias",
-                                        enabled: e.target.checked,
-                                    });
-                                }
-                            }}
-                        />
-                        <span>Disable POINT UV Bias</span>
-                    </label>
-                    <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
-                        <input
-                            type="checkbox"
-                            onChange={(e) => {
-                                if (worker) {
-                                    worker.postMessage({
-                                        type: "gpu_debug_toggle",
                                         toggle: "forceDisableZTest",
                                         enabled: e.target.checked,
                                     });

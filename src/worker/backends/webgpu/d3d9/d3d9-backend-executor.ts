@@ -1038,6 +1038,8 @@ export class D3D9BackendExecutor {
                 queue.writeBuffer(this.uniformBuffer, 0, block);
             } else {
                 // Defensive fallback: viewport (vec2) + pad (vec2) + mat4x4 MVP only.
+                // No pixel-centre offset here (uniformData[2] stays 0, MVP goes in raw) —
+                // this path has no packFfpUniforms behind it, so it is legacy-convention.
                 if (!this.uniformBuffer) {
                     this.uniformBuffer = device.createBuffer({
                         size: 80,

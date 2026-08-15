@@ -2434,7 +2434,7 @@ export const dbg = {
                 `blend=${d.alphaBlendEnabled ? `${d.srcBlend}/${d.dstBlend}` : 'off'} atest=${d.alphaTestEnabled ? `${d.alphaFunc}@${d.alphaRef}` : 'off'} ` +
                 `z=${d.zEnable}/${d.zWrite} cull=${d.cullMode} light=${d.lightingEnabled} cop=${d.colorOp} aop=${d.alphaOp} ` +
                 `sampler=${d.effectiveSamplerState ? `${d.effectiveSamplerState.minFilter}/${d.effectiveSamplerState.magFilter}/${d.effectiveSamplerState.mipFilter}@${d.effectiveSamplerState.addressU}/${d.effectiveSamplerState.addressV}` : 'n/a'} ` +
-                `uvbias=${d.pointUvBiasApplied === null ? 'n/a' : d.pointUvBiasApplied ? 'Y' : 'N'}${d.warnings?.length ? ` WARN[${d.warnings.join('; ')}]` : ''}`);
+                `${d.warnings?.length ? `WARN[${d.warnings.join('; ')}]` : ''}`);
             console.log(`[dbg][frame] frame#${frame.frameId} draws=${frame.drawCalls?.length ?? 0} clears=${frame.clears?.length ?? 0}\n  CLEARS:\n    ${clears.join('\n    ') || '(none)'}\n  DRAWS:\n    ${draws.join('\n    ') || '(none)'}`);
             console.log(`[dbg][frame][JSON] ${JSON.stringify(frame)}`);
         }).catch((e: any) => {
