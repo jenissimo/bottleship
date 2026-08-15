@@ -334,8 +334,12 @@ export function installHarnessFacade(worker: Worker, getInputView?: () => Int32A
     async function openWgb(idOrUrl: string, opts?: { hle?: boolean; logOnly?: boolean; reload?: boolean }): Promise<unknown> {
         const path = await resolveBundlePath(idOrUrl);
         const w = window as any;
+        // The worker reports a failed load as {type:"error"}, never as a "done" phase, so
+        // waiting only for "done" turns every load failure into a 120s stall that still
+        // reports ok — the run then fails later, somewhere unrelated, with the real reason
+        // only in the log. Watch for both and let the error be the answer.
         const loadDone = waitForWorkerMessage(
-            (m) => m?.type === "loading_progress" && m.phase === "done",
+            (m) => (m?.type === "loading_progress" && m.phase === "done") || m?.type === "error",
             120_000,
         );
         if (opts?.hle && typeof w.enableHleAndLoad === "function") {
@@ -346,7 +350,9 @@ export function installHarnessFacade(worker: Worker, getInputView?: () => Int32A
             throw new Error("window.loadApp not available (open ?game=dev)");
         }
         const done = await loadDone;
-        return { path, loaded: !!done, progress: done ?? null };
+        if (done?.type === "error") throw new Error(`openWgb("${path}"): ${done.message}`);
+        if (!done) throw new Error(`openWgb("${path}"): no load completion within 120s`);
+        return { path, loaded: true, progress: done };
     }
 
     /**

@@ -1527,6 +1527,17 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
       // (Content-Range 0-EOF → the EOCD tail read lands on the file START).
       const loadFromRam = async () => {
         if (!downloadedBuffer) downloadedBuffer = await downloadToRam();
+        // Last resort, so this is where a URL that never served a bundle finally has to
+        // say so. A dev server answers a missing .wgb with 200 + its index page, and every
+        // layer downstream then reports the same useless "EOCD not found" — name the URL
+        // and what actually came back instead.
+        if (sniffBlobHead(downloadedBuffer) !== "wgb") {
+          const preview = new TextDecoder("utf-8", { fatal: false })
+            .decode(downloadedBuffer.subarray(0, 80)).replace(/\s+/g, " ").trim();
+          throw new Error(
+            `${url} did not return a WGB bundle — got ${downloadedBuffer.byteLength} bytes ` +
+            `starting with "${preview}". Check the bundle path.`);
+        }
         Logger.warn(LogCategory.SYSTEM, `WGB: loading from the in-RAM download (${(downloadedBuffer.byteLength / 1048576).toFixed(1)} MB) — OPFS cache unusable`);
         return WgbLoader.fromBuffer(downloadedBuffer);
       };

@@ -16,11 +16,61 @@ const LRU_META_FILE = "_cache-lru.json";
  *  never fills the origin to the brim (saves/overlay writes must keep working). */
 const STAGE_QUOTA_MARGIN = 256 * 1024 * 1024;
 
+/** 8 hex chars of FNV-1a — enough to separate bundles, short enough to keep a key readable. */
+function shortHash(s: string): string {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h = Math.imul(h, 0x01000193);
+    }
+    return (h >>> 0).toString(16).padStart(8, "0");
+}
+
+/**
+ * OPFS filename for a bundle URL.
+ *
+ * The last path segment alone is NOT an identity when the query string is where the
+ * bundle is actually named: the dev sidecar serves every bundle from `/wgb?path=...`, so
+ * a bare-basename key files all of them under "wgb" and the second game launched reads
+ * the first one's bytes. A query therefore folds into the key as a hash. The classic
+ * `/apps/<name>.wgb[?v=2]` shape keeps its plain filename so an existing cache entry —
+ * and the dedupe against the same file dropped from disk — still match.
+ */
 function urlToCacheKey(url: string): string {
-    // "/apps/re-volt.wgb?v=2" → "re-volt.wgb"
-    const path = url.split("?")[0];
+    const [path, query] = url.split("?");
     const parts = path.split("/");
-    return parts[parts.length - 1] || "game.wgb";
+    const base = parts[parts.length - 1] || "game.wgb";
+    if (base.toLowerCase().endsWith(".wgb")) return base;
+    const named = query ? `${base}-${shortHash(query)}` : base;
+    return named.toLowerCase().endsWith(".wgb") ? named : `${named}.wgb`;
+}
+
+/** Bytes scanned from the tail for the EOCD record: 22-byte record + max 64K comment. */
+const EOCD_SCAN_BYTES = 22 + 0xffff;
+const EOCD_SIGNATURE = 0x06054b50;
+
+/**
+ * Does this file actually end in a ZIP end-of-central-directory record?
+ *
+ * The only checks the cache used to make were "non-empty" and "matches Content-Length",
+ * and neither can tell a bundle from what a server hands back when something goes wrong:
+ * an HTML error page is a perfectly well-formed 1.6 KB response, and once written under
+ * the bundle's key it is served from cache forever, failing the loader with "EOCD not
+ * found" on every later launch with no way for the user to know why. Reading the tail is
+ * one seek and answers the question the loader is about to ask anyway — so a poisoned
+ * entry is caught on write AND healed on read, including entries already on disk.
+ */
+function hasZipEocd(sah: SyncAccessHandleLike, size: number): boolean {
+    if (size < 22) return false;
+    const scan = Math.min(size, EOCD_SCAN_BYTES);
+    const buf = new Uint8Array(scan);
+    const got = sah.read(buf, { at: size - scan });
+    if (got < 22) return false;
+    const view = new DataView(buf.buffer, buf.byteOffset, got);
+    for (let i = got - 22; i >= 0; i--) {
+        if (view.getUint32(i, true) === EOCD_SIGNATURE) return true;
+    }
+    return false;
 }
 
 /**
@@ -325,32 +375,49 @@ export class WgbCache {
         const dir = await this.getCacheDir();
         if (!dir) return null;
         const key = urlToCacheKey(url);
+        const partKey = `${key}.part`;
 
         // SAH and any prior reader on this file are mutually exclusive (one SAH per file).
         this.releaseMountedSource();
 
-        const fileHandle = await dir.getFileHandle(key, { create: true });
-        const createSah = (fileHandle as unknown as { createSyncAccessHandle?: () => Promise<SyncAccessHandleLike> }).createSyncAccessHandle;
-        if (typeof createSah !== "function") {
-            Logger.warn(LogCategory.SYSTEM, `WgbCache: createSyncAccessHandle unavailable — cannot stream "${key}"`);
+        // Stage under ".part" and promote only once the bytes check out, exactly as
+        // stageInBackground does. Writing the live key directly means a torn stream — a
+        // reload, a dropped connection, a quota wall mid-download — leaves a partial file
+        // at the name every later launch reads, and the game never starts again.
+        try { await dir.removeEntry(partKey); } catch { /* none */ }
+        const fileHandle = await dir.getFileHandle(partKey, { create: true });
+        const handleOps = fileHandle as unknown as {
+            createSyncAccessHandle?: () => Promise<SyncAccessHandleLike>;
+            move?: (name: string) => Promise<void>;
+        };
+        if (typeof handleOps.createSyncAccessHandle !== "function" || typeof handleOps.move !== "function") {
+            try { await dir.removeEntry(partKey); } catch { /* best-effort */ }
+            Logger.warn(LogCategory.SYSTEM, `WgbCache: createSyncAccessHandle/move unavailable — cannot stream "${key}"`);
             return null;
         }
 
         Logger.log(LogCategory.SYSTEM, `WgbCache: streaming "${key}" to OPFS (no RAM copy)`);
         const resp = await fetch(url);
-        if (!resp.ok) throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
+        if (!resp.ok) {
+            try { await dir.removeEntry(partKey); } catch { /* best-effort */ }
+            throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
+        }
         const contentLength = Number(resp.headers.get("content-length") ?? "0");
         const body = resp.body;
         if (!body) {
+            try { await dir.removeEntry(partKey); } catch { /* best-effort */ }
             Logger.warn(LogCategory.SYSTEM, `WgbCache: no streaming body for "${key}" — cannot stream`);
             return null;
         }
         if (contentLength > 0 && !(await this.ensureSpaceFor(contentLength, key))) {
+            try { await dir.removeEntry(partKey); } catch { /* best-effort */ }
             Logger.warn(LogCategory.SYSTEM, `WgbCache: quota too tight to stream "${key}" to OPFS`);
             return null;
         }
 
-        const sah = await createSah.call(fileHandle);
+        const sah = await handleOps.createSyncAccessHandle();
+        let size = 0;
+        let complete = false;
         try {
             sah.truncate(0);
             let pos = 0;
@@ -368,26 +435,26 @@ export class WgbCache {
                 onProgress(pos, contentLength);
             }
             sah.flush();
-        } catch (e) {
+            size = sah.getSize();
+            // Content-Length catches a truncated transfer; the EOCD scan catches a
+            // complete transfer of something that is not a bundle (an HTML error page
+            // arrives intact and would otherwise be cached under the bundle's name).
+            complete = (contentLength <= 0 || size === contentLength) && hasZipEocd(sah, size);
+        } finally {
             try { sah.close(); } catch { /* best-effort */ }
-            throw e;
         }
 
-        const size = sah.getSize();
-        // Reject a truncated stream (smaller than the minimum EOCD record) — trusting it
-        // makes the loader fail with "EOCD not found" and poisons every later launch.
-        if (size < 22) {
-            try { sah.close(); } catch { /* best-effort */ }
-            try { await dir.removeEntry(key); } catch { /* best-effort */ }
-            Logger.warn(LogCategory.SYSTEM, `WgbCache: streamed "${key}" too small (${size} bytes < EOCD) — discarding`);
+        if (!complete) {
+            try { await dir.removeEntry(partKey); } catch { /* best-effort */ }
+            Logger.warn(LogCategory.SYSTEM,
+                `WgbCache: streamed "${key}" is not a usable bundle (${size}/${contentLength} bytes) — discarded, not cached`);
             return null;
         }
-        const source = new SyncAccessHandleSource(sah, size);
-        this.currentSource = source;
-        this.currentSourceKey = key;
-        this.queueTouch(key);
+
+        try { await dir.removeEntry(key); } catch { /* no prior entry */ }
+        await handleOps.move(key);
         Logger.log(LogCategory.SYSTEM, `WgbCache: streamed "${key}" to OPFS (${(size / 1024 / 1024).toFixed(1)} MB, off-disk, no RAM copy)`);
-        return source;
+        return this.openSyncSourceByKey(key);
     }
 
     /**
@@ -423,6 +490,7 @@ export class WgbCache {
 
         const sah = await movable.createSyncAccessHandle();
         let size = 0;
+        let isZip = false;
         try {
             sah.truncate(0);
             const reader = resp.body.getReader();
@@ -440,13 +508,15 @@ export class WgbCache {
             }
             sah.flush();
             size = sah.getSize();
+            isZip = hasZipEocd(sah, size);
         } finally {
             try { sah.close(); } catch { /* best-effort */ }
         }
 
-        if (size < 22 || (contentLength > 0 && size !== contentLength)) {
+        if (!isZip || (contentLength > 0 && size !== contentLength)) {
             try { await dir.removeEntry(partKey); } catch { /* best-effort */ }
-            Logger.warn(LogCategory.SYSTEM, `WgbCache: background stage of "${key}" incomplete (${size}/${contentLength}) — discarded`);
+            Logger.warn(LogCategory.SYSTEM,
+                `WgbCache: background stage of "${key}" is not a usable bundle (${size}/${contentLength}) — discarded`);
             return false;
         }
         await movable.move(key);
@@ -469,7 +539,41 @@ export class WgbCache {
      * cached or sync-access handles are unavailable (caller falls back to BufferSource).
      */
     static async openSyncSourceForUrl(url: string): Promise<SyncAccessHandleSource | null> {
-        return this.openSyncSourceByKey(urlToCacheKey(url));
+        const key = urlToCacheKey(url);
+        if (!(await this.cacheMatchesServer(url, key))) return null;
+        return this.openSyncSourceByKey(key);
+    }
+
+    /**
+     * Is the cached copy still the file this URL serves?
+     *
+     * A cache keyed by name has no way to notice the bundle behind that name changed, so a
+     * rebuilt bundle keeps launching as the old one — silently, which is worse than failing.
+     * One HEAD settles it. Every uncertain answer (no server, no Content-Length, a method
+     * the server dislikes) keeps the cache: this must never turn an offline launch, or a
+     * blob/relative URL that was never fetched over HTTP, into a failure.
+     */
+    private static async cacheMatchesServer(url: string, key: string): Promise<boolean> {
+        const dir = await this.getCacheDir();
+        if (!dir) return true;
+        let cachedSize: number;
+        try {
+            cachedSize = (await (await dir.getFileHandle(key)).getFile()).size;
+        } catch {
+            return true; // not cached — nothing to invalidate
+        }
+        try {
+            const resp = await fetch(url, { method: "HEAD" });
+            if (!resp.ok) return true;
+            const len = Number(resp.headers.get("content-length") ?? "0");
+            if (!(len > 0) || len === cachedSize) return true;
+            await dir.removeEntry(key);
+            Logger.log(LogCategory.SYSTEM,
+                `WgbCache: "${key}" changed on the server (${cachedSize} → ${len} bytes) — re-downloading`);
+            return false;
+        } catch {
+            return true; // offline / non-HTTP URL — the cached copy is what we have
+        }
     }
 
     private static async openSyncSourceByKey(key: string): Promise<SyncAccessHandleSource | null> {
@@ -483,14 +587,16 @@ export class WgbCache {
             if (typeof createSah !== "function") return null;
             const sah = await createSah.call(fileHandle);
             const size = sah.getSize();
-            // Reject a truncated/empty cache entry (a smaller-than-EOCD file cannot be a
-            // valid ZIP — e.g. an interrupted download leaves a 0-byte placeholder).
-            // Trusting it makes the loader skip the re-download and fail with "EOCD not
-            // found", poisoning every subsequent launch. Drop the poison entry instead.
-            if (size < 22) {
+            // Reject anything that is not a ZIP. A truncated download, or a server's HTML
+            // error page written under the bundle's key, both survive a size test and then
+            // make the loader fail with "EOCD not found" on this and every later launch.
+            // Dropping the entry here is what re-downloads it and heals a cache poisoned
+            // before this check existed.
+            if (!hasZipEocd(sah, size)) {
                 try { sah.close(); } catch { /* best-effort */ }
                 try { await dir.removeEntry(key); } catch { /* best-effort */ }
-                Logger.warn(LogCategory.SYSTEM, `WgbCache: discarded corrupt cache entry "${key}" (${size} bytes < EOCD) — will re-download`);
+                Logger.warn(LogCategory.SYSTEM,
+                    `WgbCache: discarded cache entry "${key}" (${size} bytes, no ZIP end-of-central-directory) — will re-download`);
                 return null;
             }
             const source = new SyncAccessHandleSource(sah, size);
@@ -582,7 +688,20 @@ export class WgbCache {
                 Logger.log(LogCategory.SYSTEM, `WgbCache: blob "${key}" reuse on-disk copy (${(blob.size / 1024 / 1024).toFixed(1)} MB, sync)`);
             }
 
-            const source = new SyncAccessHandleSource(sah, sah.getSize());
+            // The reuse branch trusts a size match, which an entry written by an older
+            // build (or a half-finished copy of the same length) can satisfy without being
+            // a bundle. Confirm before handing it to the loader; a failure here drops the
+            // entry so the next attempt re-stages instead of failing identically forever.
+            const size = sah.getSize();
+            if (!hasZipEocd(sah, size)) {
+                try { sah.close(); } catch { /* best-effort */ }
+                try { await dir.removeEntry(key); } catch { /* best-effort */ }
+                Logger.warn(LogCategory.SYSTEM,
+                    `WgbCache: staged blob "${key}" (${size} bytes) has no ZIP end-of-central-directory — falling back to async blob`);
+                return null;
+            }
+
+            const source = new SyncAccessHandleSource(sah, size);
             this.currentSource = source;
             this.currentSourceKey = key;
             this.queueTouch(key);
@@ -615,6 +734,9 @@ export class WgbCache {
             return null; // no overrides file / unreadable
         }
     }
+
+    /** Cache identity + poison rejection, exposed for tools/tests/wgb-cache-key.test.ts. */
+    static readonly __testing = { urlToCacheKey, hasZipEocd };
 
     /** Removes a cached entry (e.g., for cache invalidation). */
     static async evict(url: string): Promise<void> {
