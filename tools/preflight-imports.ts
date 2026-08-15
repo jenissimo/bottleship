@@ -48,6 +48,46 @@ interface ArityTables {
     descriptorDlls: Set<string>;
 }
 
+/**
+ * Local helpers that BUILD a FunctionDescriptor, found by their return annotation:
+ * `const gl = (...): FunctionDescriptor => ({...})`. Every .api.ts declares its own,
+ * so the set is per-file. The inner `(?!=>|const)` keeps the scan inside one
+ * signature — without it a `ParameterDescriptor` helper would bind to the next
+ * FunctionDescriptor helper's annotation.
+ */
+const DESCRIPTOR_HELPER = /\bconst\s+([A-Za-z_$][\w$]*)\s*=\s*\((?:(?!=>|\bconst\b)[\s\S])*?\)\s*:\s*FunctionDescriptor\s*=>/g;
+
+/**
+ * Every export name a descriptor declares, whichever helper spells it. Grepping one
+ * helper by name (`makeFunc`) misses the rest — a `makeThiscall`/`makeCdecl`/`gl`
+ * entry is just as bindable, and reporting it unbindable sends you implementing an
+ * API that already exists.
+ *
+ * Recognised helpers are WHITELISTED, not "any call with a string first argument":
+ * the parameter helpers (`u("dwFlags")`, `p("lpName")`, …) share that shape, and
+ * folding a parameter name into the export set is how this tool would silently stop
+ * reporting a genuinely missing export. Failing to recognise a helper only
+ * over-reports, which is visible; the reverse is not.
+ *
+ * File-wide, not `functions:`-sliced: descriptors build that array from spreads
+ * of tables declared above it (comctl32's `...imageListFuncs`), so a slice loses
+ * exactly the entries a module keeps in named groups.
+ *
+ * `makeMethod` is excluded — those are COM vtable slots, not DLL exports, and
+ * folding them in would let a missing export read as bindable.
+ */
+function exportNames(text: string): string[] {
+    const helpers = new Set<string>(["makeFunc"]);
+    for (const m of text.matchAll(DESCRIPTOR_HELPER)) helpers.add(m[1]);
+    helpers.delete("makeMethod");
+
+    const names: string[] = [];
+    for (const m of text.matchAll(/\b([A-Za-z_$][\w$]*)\(\s*"([^"]+)"/g)) {
+        if (helpers.has(m[1])) names.push(m[2]);
+    }
+    return names;
+}
+
 /** Names the thunk generator can size, per HLE module. */
 function loadKnownNames(): ArityTables {
     const known = new Map<string, Set<string>>();
@@ -74,7 +114,7 @@ function loadKnownNames(): ArityTables {
             /ModuleDescriptor\s*=\s*\{[^}]*?name:\s*"([^"]+)"/.exec(text)?.[1];
         const mod = declared ?? basename(file).replace(/\.api\.ts$/, "");
         descriptorDlls.add(mod.toLowerCase());
-        for (const m of text.matchAll(/makeFunc\(\s*"([^"]+)"/g)) add(mod, m[1]);
+        for (const name of exportNames(text)) add(mod, name);
     }
 
     // Data exports have no arity to know — the loader points the IAT straight at the
@@ -206,8 +246,9 @@ function* peFilesFromDir(dir: string): Generator<[string, Uint8Array]> {
 function main(): void {
     const args = process.argv.slice(2);
     const dllAt = args.indexOf("--dll");
-    // --dll takes a value, so its operand is not the target.
-    const target = args.find((a, i) => !a.startsWith("--") && i !== dllAt + 1);
+    // --dll takes a value, so its operand is not the target. Absent, indexOf is -1 and
+    // the exclusion would land on index 0 — the sole positional in the documented form.
+    const target = args.find((a, i) => !a.startsWith("--") && (dllAt < 0 || i !== dllAt + 1));
     if (!target) {
         console.error("usage: bun tools/preflight-imports.ts <bundle.wgb | directory> [--json] [--dll <name>]");
         process.exit(2);

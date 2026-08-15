@@ -28,6 +28,10 @@
  *   --reg-hive  HKLM|HKCU      Registry hive for InstallPath key (default: HKLM)
  *   --reg-path  <str>     Registry key path, backslash-separated (default: none)
  *   --reg-install <str>   Value data for the install-path key (default: C:\)
+ *   --reg-value <n=v>     Extra REG_SZ value under --reg-path, repeatable:
+ *                         --reg-value "War3CD=D:\\" --reg-value "Program=C:\game.exe".
+ *                         One InstallPath is not enough for an installer that wrote several.
+ *                         Requires --reg-path; a duplicate value name is an error.
  *   --reg-name <str>      Value NAME for it (default: InstallPath). Titles differ —
  *                         GTA III reads HKLM\SOFTWARE\Rockstar Games\GTA 3\InstallDir.
  *   --cd-path <str>       Guest path the CD-ROM drive (D:\) aliases to, for a title that
@@ -89,6 +93,12 @@ function parseArgs(argv: string[]) {
         return i !== -1 ? args[i + 1] : undefined;
     };
     const has = (flag: string) => args.includes(flag);
+    /** Every occurrence of a repeatable flag, in order. */
+    const getAll = (flag: string) => {
+        const out: string[] = [];
+        for (let i = 0; i < args.length; i++) if (args[i] === flag && args[i + 1] !== undefined) out.push(args[i + 1]);
+        return out;
+    };
 
     if (has('--help')) {
         // Print the block comment at the top of this file
@@ -98,7 +108,7 @@ function parseArgs(argv: string[]) {
         process.exit(0);
     }
 
-    return { gameDir, output, get, has };
+    return { gameDir, output, get, getAll, has };
 }
 
 // ---------------------------------------------------------------------------
@@ -159,7 +169,7 @@ function collectGameFiles(dir: string, prefix: string, out: Map<string, string>,
 // Main
 // ---------------------------------------------------------------------------
 
-const { gameDir, output, get, has } = parseArgs(process.argv);
+const { gameDir, output, get, getAll, has } = parseArgs(process.argv);
 
 if (!existsSync(gameDir)) {
     console.error(`Error: game directory not found: ${gameDir}`);
@@ -292,16 +302,45 @@ const regPath    = get('--reg-path');
 const regHive    = get('--reg-hive') ?? 'HKLM';
 const regInstall = get('--reg-install') ?? 'C:\\';
 
+// Additional REG_SZ values under the same key. One install-path value is not enough for a
+// title whose installer wrote several (Warcraft III reads Program AND War3CD alongside
+// InstallPath, and answers a missing War3CD with a "please insert the disc" modal).
+const extraRegValues = getAll('--reg-value').map((pair) => {
+    const eq = pair.indexOf('=');
+    if (eq <= 0) {
+        console.error(`Error: --reg-value expects NAME=DATA, got "${pair}"`);
+        process.exit(1);
+    }
+    return { name: pair.slice(0, eq), type: 'REG_SZ', data: pair.slice(eq + 1) };
+});
+
 let registry: unknown;
 if (regPath) {
+    const values = [
+        { name: get('--reg-name') ?? 'InstallPath', type: 'REG_SZ', data: regInstall },
+        ...extraRegValues,
+    ];
+    // Two values under one name means one of them silently never applies, and the game
+    // reads whichever the loader happens to keep — say so at pack time instead.
+    const seen = new Set<string>();
+    for (const v of values) {
+        const key = v.name.toLowerCase();
+        if (seen.has(key)) {
+            console.error(`Error: registry value "${v.name}" given twice under ${regHive}\\${regPath}`);
+            process.exit(1);
+        }
+        seen.add(key);
+    }
     registry = {
         root: regHive,
         path: regPath,          // JS string; JSON.stringify will escape \ → \\
-        values: [
-            { name: get('--reg-name') ?? 'InstallPath', type: 'REG_SZ', data: regInstall },
-        ],
+        values,
     };
 } else {
+    if (extraRegValues.length > 0) {
+        console.error('Error: --reg-value needs --reg-path — there is no key to write it under.');
+        process.exit(1);
+    }
     // Minimal placeholder so the loader doesn't error on missing registry.json
     registry = { root: 'HKLM', path: 'Software', values: [] };
 }
@@ -319,7 +358,10 @@ console.log(`  name:       ${name}`);
 console.log(`  entrypoint: rom/${exeName}`);
 console.log(`  resolution: ${width}x${height}x${bpp}`);
 console.log(`  os:         ${osKey} (${osVer.major}.${osVer.minor}.${osVer.build})`);
-if (regPath) console.log(`  registry:   ${regHive}\\${regPath}`);
+if (regPath) {
+    console.log(`  registry:   ${regHive}\\${regPath}`);
+    for (const v of extraRegValues) console.log(`              ${v.name} = ${v.data}`);
+}
 
 // Ready-to-open dev URL: the dev server (serveWgbFromDisk) streams this file straight
 // off disk via Range — no symlink, no copy into public/. `?game=dev&load=` auto-loads it.
