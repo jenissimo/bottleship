@@ -164,6 +164,9 @@ const REEXEC_KEY = "bs_pending_reexec";
  *  Separate from REEXEC_KEY on purpose: that one also replaces the manifest's boot args,
  *  and an empty args string is not the same as "boot this bundle normally". */
 const PENDING_BUNDLE_KEY = "bs_pending_bundle";
+/** Chrome refuses requestPointerLock for ~1.25 s after a user-initiated exit; retries
+ *  inside that window are silently rejected, so gate them rather than burn the gesture. */
+const POINTER_LOCK_EXIT_COOLDOWN_MS = 1300;
 /** Bundle URL a pending re-exec must re-open once window.loadApp exists (dev/harness boots). */
 let reExecBundleUrl: string | null = null;
 let globalWorker: Worker | null = null;
@@ -630,19 +633,27 @@ export default function App() {
   // Exclusive DI / ShowCursor(hide) often arrives OUTSIDE a user gesture, so the
   // opportunistic requestPointerLock in updatePointerLockIntent fails silently and
   // the title keeps absolute edge-clamped mouse until the next canvas click. Arm a
-  // capture-phase window listener so the next trusted activation (fire click, UI
-  // click on the shell) still engages lock — not only pointerdown on the canvas.
+  // capture-phase window listener so the next trusted activation anywhere on the game
+  // stage (fire click, a click on a touch/status overlay) still engages lock — not only
+  // a pointerdown the canvas itself receives.
   const pointerLockGestureHandlerRef = useRef<((e: PointerEvent) => void) | null>(null);
   const armPointerLockGesture = () => {
     if (pointerLockGestureHandlerRef.current) return;
-    const onActivate = () => {
-      const handler = pointerLockGestureHandlerRef.current;
-      pointerLockGestureHandlerRef.current = null;
-      if (handler) window.removeEventListener("pointerdown", handler, true);
+    // Stays armed until the lock actually engages. Disarming on the first activation
+    // assumed the request succeeds, and it often does not — the browser rejects a
+    // re-acquire for over a second after a user-initiated exit (ESC), which is exactly
+    // when this is armed. One rejected attempt would otherwise retire the gesture and
+    // leave a title steering by motion with an absolute cursor for the rest of the run.
+    const onActivate = (e: PointerEvent) => {
       const c = canvasRef.current;
       if (!c || userReleasedLockRef.current || pointerLockedRef.current) return;
       if (!relativeIntent.get()) return;
-      userReleasedLockRef.current = false;
+      // Scoped to the game stage (canvas + its overlays). Since this stays armed until
+      // the lock engages, an unscoped handler would grab the pointer on every click on
+      // the host shell's own buttons and menus and make them unusable mid-game.
+      const target = e.target as Node | null;
+      const stage = panelRef.current;
+      if (!target || !(target === c || stage?.contains(target))) return;
       requestPointerLockSafe(c);
     };
     pointerLockGestureHandlerRef.current = onActivate;
@@ -857,6 +868,17 @@ export default function App() {
     });
     guestCursor.attach(cursorCanvasRef.current);
     ((window as any).__BS__ ??= {}).cursorOverlay = guestCursor.status;
+    // Why the pointer is (not) locked, in one read. The decision spans three layers —
+    // the guest's claim, this store, and the browser's gesture rules — and a screenshot
+    // shows none of them: a title steering by motion with no lock looks exactly like one
+    // whose camera is broken.
+    ((window as any).__BS__ ??= {}).relativeMouse = () => ({
+      intent: relativeIntent.get(),
+      reasons: relativeIntent.reasons(),
+      locked: !!document.pointerLockElement,
+      userReleased: userReleasedLockRef.current,
+      focus: document.hasFocus(),
+    });
 
     // Pointer Lock fires no enter/leave and confines the pointer to the canvas by
     // definition, so it counts as inside — that is a statement about the HOST pointer's
@@ -1780,7 +1802,7 @@ export default function App() {
           userReleasedLockRef.current = true;
           pointerLockCooldownRef.current = true;
           document.exitPointerLock();
-          setTimeout(() => { pointerLockCooldownRef.current = false; }, 32);
+          setTimeout(() => { pointerLockCooldownRef.current = false; }, POINTER_LOCK_EXIT_COOLDOWN_MS);
           event.preventDefault();
           event.stopPropagation();
           return;
@@ -1822,6 +1844,10 @@ export default function App() {
       // A deliberate click on the canvas is the re-engage gesture: clear the Right-Ctrl
       // host-release suppression so lock can be re-acquired.
       userReleasedLockRef.current = false;
+      // Arm before requesting: this click may land inside the browser's post-exit refusal
+      // window (Right Ctrl / ESC release), where the request is silently rejected. Armed,
+      // the next gesture retries instead of the click being lost.
+      armPointerLockGesture();
       // If cursor is hidden by guest, request pointer lock (user click = valid gesture)
       if (relativeIntent.get() && !pointerLockedRef.current) {
         requestPointerLockSafe(canvas);
@@ -1958,9 +1984,14 @@ export default function App() {
         // re-requests on the next click (the reliable gesture); we also opportunistically
         // attempt on the next pointermove via writePointer.
         if (relativeIntent.get() && !userReleasedLockRef.current) {
-          // ESC force-exit briefly rejects re-acquire; cooldown gates the click/move retries.
+          // A browser-initiated exit rejects re-acquire for over a second, so the retry
+          // cannot be a one-shot: arm the gesture listener as well, so the next trusted
+          // pointerdown ANYWHERE re-engages rather than only a click that happens to land
+          // on the canvas. ESC is a menu key in most of these titles, so this path runs
+          // every time the player opens and closes the menu.
           pointerLockCooldownRef.current = true;
-          setTimeout(() => { pointerLockCooldownRef.current = false; }, 32);
+          setTimeout(() => { pointerLockCooldownRef.current = false; }, POINTER_LOCK_EXIT_COOLDOWN_MS);
+          armPointerLockGesture();
         }
       }
     };
@@ -2355,6 +2386,9 @@ export default function App() {
       window.removeEventListener("blur", handleBlur);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       document.removeEventListener("pointerlockchange", handlePointerLockChange);
+      // The armed capture-phase listener outlives this effect otherwise, and would keep
+      // requesting lock against a stale canvasRef after unmount/remount.
+      disarmPointerLockGesture();
       guestCursor.dispose();
       // Keep loadApp exposed for buttons
     };
