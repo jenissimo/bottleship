@@ -178,6 +178,13 @@ export function createMenuExports(): Record<string, ThunkImplementation> {
         return handle;
     };
 
+    // BOOL IsMenu(HMENU hMenu)
+    // Menu handles are represented by entries in the USER32 menu table; this includes
+    // normal menus, popup menus, resource menus, and lazily-created system menus.
+    exports['IsMenu'] = (_ctx, _mem, args) => {
+        return menus.has(args[0] >>> 0) ? 1 : 0;
+    };
+
     exports['DestroyMenu'] = (ctx, mem, args) => {
         const hMenu = args[0] >>> 0;
         Logger.verbose(LogCategory.USER32, `DestroyMenu(0x${hMenu.toString(16)})`);

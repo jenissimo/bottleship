@@ -644,6 +644,16 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         return lpStr;
     };
 
+    // BOOL IsCharLowerA(CHAR ch)
+    // The ANSI entry point classifies the byte using the system ANSI code page. A
+    // character is lower case only when it has a distinct upper-case form and is
+    // already its lower-case form; digits, punctuation, and uncased letters are false.
+    exports['IsCharLowerA'] = (_ctx, _mem, args) => {
+        const cp = EmulatorConfig.getInstance().ansiCodePage;
+        const ch = getCodePageDecoder(cp).decode(new Uint8Array([args[0] & 0xFF]));
+        return ch === ch.toLowerCase() && ch !== ch.toUpperCase() ? 1 : 0;
+    };
+
     // LPWSTR CharUpperW(LPWSTR lpsz)
     // If lpsz <= 0xFFFF it is a single wide character passed as atom; return uppercased code point.
     // Otherwise it is a pointer to a null-terminated UTF-16LE string; upper-case in-place.

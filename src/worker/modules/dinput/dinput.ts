@@ -23,12 +23,11 @@ import {
 import { DIK_TO_VK, vkToDik } from "./dinput-vk-dik";
 import { resetLosableDevices, trackLosableDevice, untrackLosableDevice } from "./device-presence";
 import { GUEST_INPUT_FLAG } from "../../../input/sab-layout";
+import { DInputNotifyRegistry, DI_OK, DIERR_INVALIDPARAM } from "./dinput-notify";
 
 // DirectInput error codes (HRESULT = MAKE_HRESULT(ERROR, FACILITY_WIN32, win32err))
-const DI_OK = 0x00000000;
-const DIERR_INVALIDPARAM = 0x80070057;
 const DIERR_OUTOFMEMORY = 0x8007000E;
-const DIERR_NOTACQUIRED = 0x8007000C; // ERROR_INVALID_ACCESS (0x0C) — was wrongly 0x1E
+const DIERR_NOTACQUIRED = 0x8007000C; // ERROR_INVALID_ACCESS (0x0C)
 const DIERR_INPUTLOST = 0x8007001E;   // ERROR_READ_FAULT (0x1E)
 const DIERR_DEVICENOTREG = 0x80040154; // REGDB_E_CLASSNOTREG
 
@@ -245,10 +244,36 @@ const IDirectInputA_StubMethods = ["GetDeviceStatus", "RunControlPanel", "Initia
 // EnumObjects/GetObjectInfo are NOT here — they have real implementations below;
 // a DI_OK stub that leaves the caller's out-struct untouched is the bug class that
 // broke Max Payne (GetProperty granularity → 0 divisor → NaN wheel tracker).
-const IDirectInputDeviceA_StubMethods = ["SetEventNotification", "RunControlPanel", "Initialize"];
+const IDirectInputDeviceA_StubMethods = ["RunControlPanel", "Initialize"];
 
 // Stub methods for IDirectInputDevice2A (additional methods that just return DI_OK)
 const IDirectInputDevice2A_StubMethods = ["CreateEffect", "EnumEffects", "GetEffectInfo", "GetForceFeedbackState", "SendForceFeedbackCommand", "EnumCreatedEffectObjects", "Escape", "SendDeviceData"];
+
+/** Devices with an armed SetEventNotification handle. */
+const notifyRegistry = new DInputNotifyRegistry({
+    setEvent: (handle) => System.getInstance().scheduler.setEvent(handle),
+});
+
+/** Every live device object, for the harness `dinputState` readout. */
+const liveDInputDevices = new Set<DirectInputDeviceObject>();
+
+/**
+ * What DirectInput currently believes about each device. Cooperative level and acquisition
+ * are what decide whether the host grabs the pointer at all, and neither is visible in a
+ * screenshot: a game reading a NONEXCLUSIVE mouse looks exactly like one whose capture
+ * broke. The log line that carries it scrolls out of the ring within seconds of boot.
+ */
+export function describeDInputDevices(): Array<Record<string, unknown>> {
+    return [...liveDInputDevices].map(d => ({
+        deviceType: d.deviceType,
+        dataFormat: d.dataFormat,
+        acquired: d.acquired,
+        exclusive: d.exclusive,
+        inputLost: d.inputLost,
+        notifyEvent: d.notifyEvent ? `0x${d.notifyEvent.toString(16)}` : 0,
+        isActionMapped: d.isActionMapped,
+    }));
+}
 
 /**
  * DirectInput COM object implementation
@@ -289,6 +314,9 @@ class DirectInputDeviceObject extends BaseComObject {
     public lastDInputAccumX = 0;  // last-seen value of the SAB running accumulator
     public lastDInputAccumY = 0;
     public mouseInitialized = false;
+    /** Event handle SetEventNotification armed, or 0. Signalled whenever this device's
+     *  buffer gains data — the app's input thread waits on it instead of polling. */
+    public notifyEvent = 0;
 
     // DI8 action-mapping state (set by SetActionMap, consumed by the buffered GetDeviceData path).
     public isActionMapped = false;
@@ -301,10 +329,13 @@ class DirectInputDeviceObject extends BaseComObject {
 
     constructor(vtableAddress: number, iid: string = "5944e680-c92e-11cf-bfc7-444553540000") {
         super(iid, vtableAddress); // default: IDirectInputDeviceA IID
+        liveDInputDevices.add(this);
     }
 
     protected destroy(): void {
         untrackLosableDevice(this);
+        liveDInputDevices.delete(this);
+        notifyRegistry.forget(this);
         Logger.verbose(LogCategory.COM, "DirectInputDeviceObject destroyed");
     }
 }
@@ -812,6 +843,17 @@ export class DInput implements IModule {
             return DI_OK;
         };
 
+        // HRESULT SetEventNotification(HANDLE hEvent) — see dinput-notify.ts for the contract.
+        this.exports["IDirectInputDeviceA_SetEventNotification"] = (ctx, mem, args) => {
+            const device = this.getDevice(args[0]);
+            const hEvent = args[1] >>> 0;
+            const hr = notifyRegistry.setEventNotification(device, hEvent);
+            if (hr === DI_OK && hEvent) this.armDInputNotifier();
+            Logger.verbose(LogCategory.SYSTEM,
+                `SetEventNotification: this=0x${args[0].toString(16)} hEvent=0x${hEvent.toString(16)} hr=0x${hr.toString(16)}`);
+            return hr;
+        };
+
         this.exports["IDirectInputDeviceA_Unacquire"] = (ctx, mem, args) => {
             const device = this.getDevice(args[0]);
             if (device) device.acquired = false;
@@ -1074,6 +1116,9 @@ export class DInput implements IModule {
         };
         this.exports["IDirectInputDeviceA_Release"] = (ctx, mem, args) => {
             const obj = resourceProvider.getComObjectByAddress(args[0]);
+            // Release only drops the notification when the refcount actually reaches zero;
+            // destroy() does that. A non-final release (a QueryInterface'd Device2/Device8
+            // reference going away) must leave the armed handle intact.
             return obj ? obj.release() : 0;
         };
 
@@ -2035,6 +2080,18 @@ export class DInput implements IModule {
     }
 
 
+    /** Registered on the first armed handle: the input manager fires this whenever a poll
+     *  produced buffered device data, and every armed device gets its event signalled.
+     *  Waiters are edge-triggered, so signalling an event no one waits on is harmless —
+     *  the app resets it itself. */
+    private dinputDataListener: (() => void) | null = null;
+
+    private armDInputNotifier(): void {
+        if (this.dinputDataListener) return;
+        this.dinputDataListener = () => notifyRegistry.signal();
+        System.getInstance().inputManager.addDInputDataListener(this.dinputDataListener);
+    }
+
     private getDevice(thisPtr: number): DirectInputDeviceObject | null {
         const obj = SystemResourceProvider.getInstance().getComObjectByAddress(thisPtr);
         return obj instanceof DirectInputDeviceObject ? obj : null;
@@ -2159,6 +2216,15 @@ export class DInput implements IModule {
 
     reset(): void {
         resetLosableDevices();
+        // The device objects of the old process are gone and their event handles will be
+        // recycled, so anything still tracked would signal an unrelated object / be
+        // reported by the harness readout as a live device of the new process.
+        notifyRegistry.reset();
+        liveDInputDevices.clear();
+        if (this.dinputDataListener) {
+            System.getInstance().inputManager.removeDInputDataListener(this.dinputDataListener);
+            this.dinputDataListener = null;
+        }
         this.savedActionMaps.clear();
         this.latchedMouseEdges = 0;
         this.mouseLatchEpoch = 0;

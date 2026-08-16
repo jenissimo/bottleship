@@ -1244,17 +1244,32 @@ export class InputManager {
         };
     }
 
+    /**
+     * Listeners fired once per poll that produced buffered device data (mouse, keyboard
+     * or gamepad). DirectInput's SetEventNotification promises the app an event it can
+     * WAIT on — an app whose input thread blocks until it is signalled never polls, so
+     * nothing else can drive it. The listener is not told WHICH device kind produced the
+     * data: the event is edge-triggered and the waiter re-reads its own buffer, so waking
+     * on another device's data costs one spurious pass, never a missed wakeup.
+     */
+    private dinputDataListeners = new Set<() => void>();
+
+    addDInputDataListener(listener: () => void): void { this.dinputDataListeners.add(listener); }
+    removeDInputDataListener(listener: () => void): void { this.dinputDataListeners.delete(listener); }
+
     /** Buffer mouse events for DirectInput GetDeviceData. Called from poll(). */
     private _bufferDInputMouseEvents(buttons: number, mouseWheel: number): void {
         const ts = performance.now() | 0;
         const maxBuf = this.dinputMouseBufferSize;
         const events = this.dinputMouseEvents;
+        let produced = false;
 
         const pushEvent = (dwOfs: number, dwData: number): void => {
             if (events.length >= maxBuf) events.shift(); // overflow: drop oldest
             const seq = ++this.dinputMouseSeq;
             events.push({ dwOfs, dwData, dwTimeStamp: ts, dwSequence: seq });
             this._noteDInputTrail("mouse", dwOfs, dwData, seq);
+            produced = true;
         };
 
         // Same SAB accum as GetDeviceState — not clamped canvas position. Absolute
@@ -1288,6 +1303,11 @@ export class InputManager {
         }
 
         this.dinputPrevButtons = buttons;
+        if (produced) this._notifyDInputData();
+    }
+
+    private _notifyDInputData(): void {
+        for (const listener of this.dinputDataListeners) listener();
     }
 
     /** Buffer keyboard DIK press/release edges for DirectInput GetDeviceData. */
@@ -1295,12 +1315,14 @@ export class InputManager {
         const ts = performance.now() | 0;
         const maxBuf = this.dinputKeyboardBufferSize;
         const events = this.dinputKeyboardEvents;
+        let produced = false;
 
         const pushEvent = (dwOfs: number, dwData: number): void => {
             if (events.length >= maxBuf) events.shift();
             const seq = ++this.dinputKeyboardSeq;
             events.push({ dwOfs, dwData, dwTimeStamp: ts, dwSequence: seq });
             this._noteDInputTrail("keyboard", dwOfs, dwData, seq);
+            produced = true;
         };
 
         for (let vk = 0; vk < 256; vk++) {
@@ -1312,6 +1334,7 @@ export class InputManager {
             if (dik === null) continue;
             pushEvent(dik, now);
         }
+        if (produced) this._notifyDInputData();
     }
 
     /** Buffer gamepad axis/button changes for DirectInput GetDeviceData. */
@@ -1322,12 +1345,14 @@ export class InputManager {
         const maxBuf = this.dinputGamepadBufferSize;
         const events = this.dinputGamepadEvents;
         const buttonsMask = connected ? buttons : 0;
+        let produced = false;
 
         const pushEvent = (dwOfs: number, dwData: number): void => {
             if (events.length >= maxBuf) events.shift();
             const seq = ++this.dinputGamepadSeq;
             events.push({ dwOfs, dwData, dwTimeStamp: ts, dwSequence: seq });
             this._noteDInputTrail("gamepad", dwOfs, dwData, seq);
+            produced = true;
         };
 
         const axisOfs = [DIJOFS_X, DIJOFS_Y, DIJOFS_RX, DIJOFS_RY] as const;
@@ -1348,6 +1373,7 @@ export class InputManager {
 
         this.dinputGamepadPrevButtons = buttonsMask;
         this.dinputGamepadPrevAxes = [axes[0], axes[1], axes[2], axes[3]];
+        if (produced) this._notifyDInputData();
     }
 
     getKeyboardStateVk(target?: Uint8Array): Uint8Array {
