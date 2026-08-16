@@ -39,6 +39,9 @@ function dcl(usage: number, usageIndex: number, num: number): number[] {
     // the separate vertex declaration, not the shader bytecode.
     return [instr(Op.DCL), (usage | (usageIndex << 16)) >>> 0, regBits(RegType.INPUT, num)];
 }
+function dclReg(usage: number, usageIndex: number, type: number, num: number): number[] {
+    return [instr(Op.DCL), (usage | (usageIndex << 16)) >>> 0, regBits(type, num)];
+}
 function def(num: number, x: number, y: number, z: number, w: number): number[] {
     const f = new Float32Array([x, y, z, w]);
     const u = new Uint32Array(f.buffer);
@@ -201,6 +204,49 @@ describe("vs codegen", () => {
         expect(res.vsConstantCount).toBe(5);
     });
 
+    test("uses the FFP texture-stage cascade for programmable VS + NULL PS", () => {
+        const vs = compileVertexShader(buildVs());
+        const res = linkProgram({
+            vs, ps: null, declElements: decl, streamStride: 20, ffpStageCount: 2,
+            projectedStages: 1 << 1,
+        });
+        // A hybrid draw declares both textures and their independently configured samplers;
+        // stage 1 combines CURRENT with its own texel rather than falling back to white.
+        expect(res.hasTexture).toBe(true);
+        expect(res.wgsl).toContain("var<uniform> psc: PsUniforms");
+        expect(res.wgsl).toContain("var ffpSamp0: sampler");
+        expect(res.wgsl).toContain("var ffpSamp1: sampler");
+        expect(res.wgsl).toContain("textureSample(tex0, ffpSamp0");
+        expect(res.wgsl).toContain("textureSample(tex1, ffpSamp1");
+        expect(res.wgsl).toContain("psc.stages[0].a.x");
+        expect(res.wgsl).toContain("psc.stages[1].a.x");
+        expect(res.wgsl).toContain("psc.tfactor");
+        // A programmable VS does not let D3DTSS_TEXCOORDINDEX remap its oT# outputs.
+        // This synthetic shader writes no oT1, so stage 1 gets the defined zero fallback
+        // rather than incorrectly reusing oT0.
+        expect(res.wgsl).toContain("vec4<f32>(0.0, 0.0, 0.0, 1.0).xy / max(abs(vec4<f32>(0.0, 0.0, 0.0, 1.0).w)");
+        expect(res.wgsl).toContain("psc.c[0].x > 2.5");
+        expect(res.wgsl).toContain("psc.c[0].x > 1.5");
+        expect(res.wgsl).toContain("psc.c[0].x > 0.5");
+    });
+
+    test("hybrid fragment ignores D3DTSS_TEXCOORDINDEX with a programmable VS", () => {
+        // The vertex shader declares no pixel shader to consume t2, so the linker must retain
+        // it specifically for the VS + fixed-function-pixel path.
+        const base = buildVs();
+        const vs = compileVertexShader(new Uint32Array([
+            ...base.subarray(0, base.length - 1),
+            instr(Op.MOV), dst(RegType.TEXCRDOUT, 2), src(RegType.INPUT, 1),
+            END,
+        ]));
+        const res = linkProgram({ vs, ps: null, declElements: decl, streamStride: 20 });
+        expect(res.wgsl).toContain("@location(4) tex2: vec4<f32>");
+        // Stage 0 consumes oT0 directly. oT2 must remain linked for stage 2, but a
+        // captured TCI value may not redirect stage 0 to it.
+        expect(res.wgsl).toContain("textureSample(tex0, ffpSamp0, in.tex0.xy)");
+        expect(res.wgsl).not.toContain("textureSample(tex0, ffpSamp0, in.tex2.xy)");
+    });
+
     test("builds vertex attributes from the declaration", () => {
         const vs = compileVertexShader(buildVs());
         const res = linkProgram({ vs, ps: null, declElements: decl, streamStride: 20 });
@@ -209,6 +255,32 @@ describe("vs codegen", () => {
             { shaderLocation: 1, offset: 12, format: "float32x2" },
         ]);
         expect(res.arrayStride).toBe(20);
+    });
+
+    test("links VS3/PS3 generic registers by declared semantics", () => {
+        const i3 = (op: number, operands: number) => (op | (operands << 24)) >>> 0;
+        const vs = compileVertexShader(new Uint32Array([
+            version(false, 3, 0),
+            ...dclReg(0 /* POSITION */, 0, RegType.INPUT, 0),
+            ...dclReg(5 /* TEXCOORD */, 0, RegType.INPUT, 1),
+            ...dclReg(0 /* POSITION */, 0, RegType.OUTPUT, 0),
+            ...dclReg(5 /* TEXCOORD */, 2, RegType.OUTPUT, 3),
+            i3(Op.MOV, 2), dst(RegType.OUTPUT, 0), src(RegType.INPUT, 0),
+            i3(Op.MOV, 2), dst(RegType.OUTPUT, 3), src(RegType.INPUT, 1),
+            END,
+        ]));
+        const ps = compilePixelShader(new Uint32Array([
+            version(true, 3, 0),
+            ...dclReg(5 /* TEXCOORD */, 2, RegType.INPUT, 5),
+            i3(Op.MOV, 2), dst(RegType.COLOROUT, 0), src(RegType.INPUT, 5),
+            END,
+        ]));
+        const res = linkProgram({ vs, ps, declElements: decl, streamStride: 20 });
+        expect(res.wgsl).toContain("oPos.x =");
+        expect(res.wgsl).toContain("oT2.x =");
+        expect(res.wgsl).toContain("out.tex2 = oT2;");
+        expect(res.wgsl).toContain("in.tex2");
+        expect(res.wgsl).not.toContain("in.col5");
     });
 });
 
@@ -228,6 +300,26 @@ describe("ps codegen", () => {
         expect(res.wgsl).toContain("return r0;");
         // The iterated texcoord t0 is seeded from the interpolant.
         expect(res.wgsl).toContain("var t0: vec4<f32> = in.tex0;");
+    });
+
+    test("packs b# constants and emits structured if/else flow", () => {
+        const i2 = (op: number, operands: number) => (op | (operands << 24)) >>> 0;
+        const psTokens = new Uint32Array([
+            version(true, 2, 0),
+            i2(Op.IF, 1), src(RegType.CONSTBOOL, 0),
+            i2(Op.MOV, 2), dst(RegType.COLOROUT, 0), src(RegType.CONST, 0),
+            i2(Op.ELSE, 0),
+            i2(Op.MOV, 2), dst(RegType.COLOROUT, 0), src(RegType.CONST, 1),
+            i2(Op.ENDIF, 0),
+            END,
+        ]);
+        const vs = compileVertexShader(buildVs());
+        const ps = compilePixelShader(psTokens);
+        const res = linkProgram({ vs, ps, declElements: decl, streamStride: 20 });
+        expect(ps.prog.maxBool).toBe(0);
+        expect(res.psConstantCount).toBe(225);
+        expect(res.wgsl).toContain("if ((psc.c[224]).x != 0.0) {");
+        expect(res.wgsl).toContain("} else {");
     });
 
     test("tex into a texture register does not collide with a store temp", () => {
@@ -252,6 +344,55 @@ describe("ps codegen", () => {
         const ps = compilePixelShader(psTokens);
         const res = linkProgram({ vs, ps, declElements: decl, streamStride: 20 });
         expect(res.wgsl).toContain("var tex1: texture_2d<f32>");
+        assertAllSampledTexturesDeclared(res.wgsl);
+    });
+
+    test("texbeml lowers the destination-stage bump matrix and luminance state", () => {
+        const psTokens = new Uint32Array([
+            version(true, 1, 1),
+            instr(Op.TEX), dst(RegType.TEXTURE, 0),
+            instr(Op.TEXBEML), dst(RegType.TEXTURE, 1), src(RegType.TEXTURE, 0),
+            instr(Op.MOV), dst(RegType.TEMP, 0), src(RegType.TEXTURE, 1),
+            END,
+        ]);
+        const vs = compileVertexShader(buildVs());
+        const ps = compilePixelShader(psTokens);
+        const res = linkProgram({ vs, ps, declElements: decl, streamStride: 20 });
+        expect(ps.analysis.usesLegacyBumpEnv).toBe(true);
+        // [M00,M01,M10,M11] → u uses x/z and v uses y/w; TEXBEML scales the
+        // fetched texel by src.b * LScale + LOffset (not by the sampled texel).
+        expect(res.wgsl).toContain("struct LegacyBumpStage");
+        expect(res.wgsl).toContain("psc.bump[1].mat.x");
+        expect(res.wgsl).toContain("psc.bump[1].mat.z");
+        expect(res.wgsl).toContain("psc.bump[1].mat.y");
+        expect(res.wgsl).toContain("psc.bump[1].mat.w");
+        expect(res.wgsl).toContain("_bemDuDv1 = (t0).xy * 2.0 - vec2<f32>(1.0)");
+        expect(res.wgsl).toContain(".z * psc.bump[1].lum.x + psc.bump[1].lum.y");
+        expect(res.wgsl).toContain("in.tex1");
+        assertAllSampledTexturesDeclared(res.wgsl);
+    });
+
+    test("texm3x3pad to texm3x3vspec preserves matrix rows and per-stage eye ray", () => {
+        const psTokens = new Uint32Array([
+            version(true, 1, 1),
+            instr(Op.TEX), dst(RegType.TEXTURE, 0),
+            instr(Op.TEXM3x3PAD), dst(RegType.TEXTURE, 1), src(RegType.TEXTURE, 0),
+            instr(Op.TEXM3x3PAD), dst(RegType.TEXTURE, 2), src(RegType.TEXTURE, 0),
+            instr(Op.TEXM3x3VSPEC), dst(RegType.TEXTURE, 3), src(RegType.TEXTURE, 0),
+            instr(Op.MOV), dst(RegType.TEMP, 0), src(RegType.TEXTURE, 3),
+            END,
+        ]);
+        const vs = compileVertexShader(buildVs());
+        const ps = compilePixelShader(psTokens);
+        const res = linkProgram({ vs, ps, declElements: decl, streamStride: 20, cubeMask: 1 << 3 });
+        // PAD stages are matrix rows, not texture samples; only the final stage is sampled.
+        expect(res.wgsl).toContain("_m3x3r0_t0 = dot((in.tex1).xyz");
+        expect(res.wgsl).toContain("_m3x3r1_t0 = dot((in.tex2).xyz");
+        expect(res.wgsl).toContain("vec3<f32>((in.tex1).w, (in.tex2).w, (in.tex3).w)");
+        expect(res.wgsl).toContain("2.0 * (dot(_m3N");
+        expect(res.wgsl).toContain("textureSample(tex3, samp, _m3R");
+        expect(res.wgsl).not.toContain("textureSample(tex1, samp");
+        expect(res.wgsl).not.toContain("textureSample(tex2, samp");
         assertAllSampledTexturesDeclared(res.wgsl);
     });
 

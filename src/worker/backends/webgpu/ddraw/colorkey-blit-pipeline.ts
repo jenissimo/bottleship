@@ -36,6 +36,8 @@ export interface ColorKeyBlitConfig {
     colorKeyHigh: { r: number; g: number; b: number; a: number };
     /** Enable colorkey discard (default true) */
     enableColorKey?: boolean;
+    /** Texture filtering used while scaling. DirectDraw defaults to point sampling. */
+    filter?: GPUFilterMode;
 }
 
 /**
@@ -61,7 +63,8 @@ export class ColorKeyBlitPipeline {
     private shaderModule: GPUShaderModule | null = null;
     private bindGroupLayout: GPUBindGroupLayout | null = null;
     private pipelineLayout: GPUPipelineLayout | null = null;
-    private sampler: GPUSampler | null = null;
+    private pointSampler: GPUSampler | null = null;
+    private linearSampler: GPUSampler | null = null;
     private uniformBuffer: GPUBuffer | null = null;
     private vertexBuffer: GPUBuffer | null = null;
 
@@ -106,9 +109,15 @@ export class ColorKeyBlitPipeline {
         });
 
         // Create nearest-neighbor sampler (pixel-perfect blit without interpolation)
-        this.sampler = this.device.createSampler({
+        this.pointSampler = this.device.createSampler({
             magFilter: "nearest",
             minFilter: "nearest",
+            addressModeU: "clamp-to-edge",
+            addressModeV: "clamp-to-edge",
+        });
+        this.linearSampler = this.device.createSampler({
+            magFilter: "linear",
+            minFilter: "linear",
             addressModeU: "clamp-to-edge",
             addressModeV: "clamp-to-edge",
         });
@@ -186,7 +195,8 @@ export class ColorKeyBlitPipeline {
      * @param config Blit configuration
      */
     blit(encoder: GPUCommandEncoder, config: ColorKeyBlitConfig): void {
-        if (!this.uniformBuffer || !this.vertexBuffer || !this.sampler || !this.bindGroupLayout) {
+        if (!this.uniformBuffer || !this.vertexBuffer || !this.pointSampler ||
+            !this.linearSampler || !this.bindGroupLayout) {
             Logger.warn(LogCategory.DDRAW, `ColorKeyBlitPipeline: Not initialized`);
             return;
         }
@@ -220,7 +230,7 @@ export class ColorKeyBlitPipeline {
             entries: [
                 { binding: 0, resource: { buffer: this.uniformBuffer } },
                 { binding: 1, resource: config.srcView },
-                { binding: 2, resource: this.sampler },
+                { binding: 2, resource: config.filter === "linear" ? this.linearSampler : this.pointSampler },
             ],
         });
 
@@ -278,7 +288,8 @@ export class ColorKeyBlitPipeline {
             this.vertexBuffer.destroy();
             this.vertexBuffer = null;
         }
-        this.sampler = null;
+        this.pointSampler = null;
+        this.linearSampler = null;
         this.shaderModule = null;
         this.bindGroupLayout = null;
         this.pipelineLayout = null;

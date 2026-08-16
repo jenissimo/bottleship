@@ -1319,12 +1319,14 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
     }
 
     /** Gather + upload the GPU bindings for streams ≥ 1 referenced by the active decl.
-     *  Offsets follow stream 0's convention: firstVertex × per-stream stride. Returns
-     *  [] for single-stream decls, null when a referenced stream is unbound/out of bounds. */
+     *  Offsets follow stream 0's convention: firstVertex × per-stream stride, and the size
+     *  runs from that offset — the same origin the executor's vertex-range guard compares
+     *  against, which is why a stream too SHORT for the draw is not rejected here: the guard
+     *  owns that rule for every backend and substitutes zeros the way hardware does. Returns
+     *  [] for single-stream decls, null when a referenced stream is unbound/unsized. */
     private collectExtraStreamBindings(
         vsObj: D3D8VsObject,
         firstVertex: number,
-        vertexCount: number,
         mem: Uint8Array,
     ): StreamVertexBinding[] | null {
         const { bindings, missing } = collectExtraStreamBindings(vsObj.decl, (s) => {
@@ -1333,7 +1335,6 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             if (!vb) return null;
             const stride = src.stride > 0 ? src.stride : (vsObj.streamStrides[s] ?? 0);
             if (stride <= 0) return null;
-            if (firstVertex * stride + vertexCount * stride > vb.size) return null;
             const gpu = this.uploadVb(src.vb, vb.guestPtr, vb.size, mem);
             if (!gpu) return null;
             return { buffer: gpu, offset: 0, size: vb.size, stride };
@@ -1341,8 +1342,8 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
 
         // D3D8's programmable path indexes streams through a shader-declared register map, so
         // an unresolvable stream leaves a register with no source at all: abort rather than
-        // feed the shader something arbitrary. (D3D9's FFP path substitutes an empty binding
-        // instead — see D3D9Device.collectFfpExtraStreams.)
+        // feed the shader something arbitrary. (D3D9 substitutes an empty binding instead —
+        // see D3D9Device.resolveDrawStreams.)
         if (missing.length > 0) {
             Logger.warn(LogCategory.SYSTEM, `D3D8 draw: decl references unbound/unsized stream(s) ${missing.join(",")}`);
             return null;
@@ -1576,7 +1577,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             const gpuBuffer = this.uploadVb(this.streamSources[0].vb, vb.guestPtr, vb.size, mem);
             if (!gpuBuffer) return 0x8876086c;
             const extraStreams = this.collectExtraStreamBindings(
-                this.shaders.getActiveVs()!, startVertex, vertexCount, mem,
+                this.shaders.getActiveVs()!, startVertex, mem,
             );
             if (extraStreams === null) return 0x8876086c;
             const topology = primitiveType === 2 || primitiveType === 3 ? "line-list" : "triangle-list";
@@ -1661,7 +1662,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             });
             device.queue.writeBuffer(gpuBuffer, 0, mem.buffer, mem.byteOffset + dataPtr, byteSize);
             const extraStreams = this.collectExtraStreamBindings(
-                this.shaders.getActiveVs()!, 0, vertexCount, mem,
+                this.shaders.getActiveVs()!, 0, mem,
             );
             if (extraStreams === null) { gpuBuffer.destroy(); return 0x8876086c; }
             const topology = primitiveType === 2 || primitiveType === 3 ? "line-list" : "triangle-list";
@@ -1764,7 +1765,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             const ibGpu = this.uploadIb(this.indexIB, ib.guestPtr, ib.size, mem);
             if (!vbGpu || !ibGpu) return 0x8876086c;
             const extraStreams = this.collectExtraStreamBindings(
-                this.shaders.getActiveVs()!, this.baseVertexIndex, vertexRangeCount, mem,
+                this.shaders.getActiveVs()!, this.baseVertexIndex, mem,
             );
             if (extraStreams === null) return 0x8876086c;
             const topology = primitiveType === 2 || primitiveType === 3 ? "line-list" : "triangle-list";
@@ -1879,7 +1880,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             });
             device.queue.writeBuffer(ibGpu, 0, mem.buffer, mem.byteOffset + indexPtr, indexBytes);
             const extraStreams = this.collectExtraStreamBindings(
-                this.shaders.getActiveVs()!, 0, vertexRangeCount, mem,
+                this.shaders.getActiveVs()!, 0, mem,
             );
             if (extraStreams === null) { vbGpu.destroy(); ibGpu.destroy(); return 0x8876086c; }
             const topology = primitiveType === 2 || primitiveType === 3 ? "line-list" : "triangle-list";

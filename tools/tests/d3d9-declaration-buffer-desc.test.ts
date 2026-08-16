@@ -15,7 +15,7 @@
  * very registry they populate.
  */
 
-import { beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Mem } from "../../src/worker/core/memory/mem-accessor";
 import { createStateExports } from "../../src/worker/modules/d3d9/state";
 import { createResourcesExports } from "../../src/worker/modules/d3d9/resources";
@@ -74,7 +74,15 @@ beforeEach(() => {
     });
     vertexBufferMeta.clear();
     indexBufferMeta.clear();
-    devices.set(DEVICE_PTR, {} as any);
+    // `devices` is module-level and shared with every other test file in the run. The stand-in
+    // needs whatever resetD3D9SharedState() calls on a registered device, or the NEXT file's
+    // reset throws on this one's leftovers.
+    devices.clear();
+    devices.set(DEVICE_PTR, { resetSubsystemPerf() { /* stand-in device */ } } as any);
+});
+
+afterEach(() => {
+    devices.clear();
 });
 
 describe("IDirect3DVertexDeclaration9::GetDeclaration", () => {

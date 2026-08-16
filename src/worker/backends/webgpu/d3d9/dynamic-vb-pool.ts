@@ -43,7 +43,8 @@ export class DynamicVbPool {
         this.device = device;
     }
 
-    /** Get a buffer with capacity >= size (VERTEX | COPY_DST). */
+    /** Get a buffer with capacity >= size (VERTEX | COPY_DST | COPY_SRC — the executor's
+     *  robustness padding copies out of whatever a draw binds). */
     acquire(size: number): GPUBuffer {
         this.acquires++;
         const cap = bucketFor(size);
@@ -54,7 +55,7 @@ export class DynamicVbPool {
         this.creates++;
         return this.device.createBuffer({
             size: cap,
-            usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+            usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
         });
     }
 

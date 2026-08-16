@@ -788,7 +788,11 @@ export function createStateExports(): Record<string, ThunkImplementation> {
     exports['IDirect3DDevice9_GetPixelShaderConstantF'] = () => D3D_OK;
     exports['IDirect3DDevice9_SetPixelShaderConstantI'] = () => D3D_OK;
     exports['IDirect3DDevice9_GetPixelShaderConstantI'] = () => D3D_OK;
-    exports['IDirect3DDevice9_SetPixelShaderConstantB'] = () => D3D_OK;
+    exports['IDirect3DDevice9_SetPixelShaderConstantB'] = (_ctx, mem, args) => {
+        const device = devices.get(args[0]);
+        if (!device) return D3DERR_INVALIDCALL;
+        return device.setPixelShaderConstantB(args[1], args[2], args[3], mem);
+    };
     exports['IDirect3DDevice9_GetPixelShaderConstantB'] = () => D3D_OK;
 
     // D3DX effect framework probes whether current VS/PS/state can render in N passes.

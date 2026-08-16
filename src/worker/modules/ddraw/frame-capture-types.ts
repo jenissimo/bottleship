@@ -8,6 +8,12 @@ export type CapturedDrawCall = {
     backend?: string;
     /** D3D9 programmable draws set this (no FFP render-state arrays available). */
     programmable?: boolean;
+    /** D3D9 shader handles and VS outputs at draw time. A null PS with a custom VS is
+     *  the legal hybrid VS+fixed-function-pixel path, not an untextured shader. */
+    vertexShader?: number;
+    pixelShader?: number;
+    vsWritesColor?: boolean[];
+    vsWritesTexcoord?: number[];
     // Geometry
     primitiveType: number;
     primitiveTypeName: string;

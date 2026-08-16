@@ -93,6 +93,8 @@ export interface SmProgram {
     maxTemp: number;
     /** Highest float-constant register index referenced (-1 if none). */
     maxConst: number;
+    /** Highest boolean-constant register index referenced (-1 if none). */
+    maxBool: number;
     /** Texture/sampler stages referenced (PS) or input regs (VS). */
     samplersUsed: Set<number>;
     inputRegs: Set<number>;
@@ -175,6 +177,7 @@ export function parseShader(tokens: Uint32Array): SmProgram {
     let terminated = false;
     let maxTemp = -1;
     let maxConst = -1;
+    let maxBool = -1;
     let usesRelativeConst = false;
     const samplersUsed = new Set<number>();
     const inputRegs = new Set<number>();
@@ -185,6 +188,7 @@ export function parseShader(tokens: Uint32Array): SmProgram {
             if (reg.num > maxConst) maxConst = reg.num;
             if (reg.relative) usesRelativeConst = true;
         }
+        if (reg.type === RegType.CONSTBOOL && reg.num > maxBool) maxBool = reg.num;
         if (reg.type === RegType.INPUT) inputRegs.add(reg.num);
     };
 
@@ -261,6 +265,7 @@ export function parseShader(tokens: Uint32Array): SmProgram {
             definitions.push(definition);
             stream.push({ kind: "def", def: definition });
             if (reg.type === RegType.CONST && reg.num > maxConst) maxConst = reg.num;
+            if (reg.type === RegType.CONSTBOOL && reg.num > maxBool) maxBool = reg.num;
             continue;
         }
 
@@ -333,6 +338,7 @@ export function parseShader(tokens: Uint32Array): SmProgram {
         definitions,
         maxTemp,
         maxConst,
+        maxBool,
         samplersUsed,
         inputRegs,
         usesRelativeConst,

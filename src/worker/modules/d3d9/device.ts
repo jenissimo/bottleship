@@ -11,6 +11,11 @@ import { Mem } from '../../core/memory/mem-accessor';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { gammaService } from '../../core/gamma-service';
 import { D3D9Device } from '../../backends/webgpu/d3d9/d3d9-device';
+import {
+    PP_BACKBUFFER_WIDTH, PP_BACKBUFFER_HEIGHT, PP_BACKBUFFER_FORMAT,
+    PP_WINDOWED, PP_ENABLE_AUTO_DEPTHSTENCIL,
+    PP_AUTO_DEPTHSTENCIL_FORMAT, PP_PRESENTATION_INTERVAL, readD3d9SwapEffect,
+} from './presentation-params';
 import { WebGPUBackend } from '../../backends/webgpu/webgpu-backend';
 import { resizeFullscreenWindowToMode } from '../../runtime/windowing/fullscreen-window';
 import {
@@ -60,15 +65,6 @@ const D3DDEVTYPE_HAL = 1;
 const D3D9_MAX_RENDER_TARGETS = 4;
 const D3DBACKBUFFER_TYPE_MONO = 0;
 const D3DERR_NOTFOUND = 0x88760866;
-
-// D3DPRESENT_PARAMETERS field offsets.
-const PP_BACKBUFFER_WIDTH = 0;
-const PP_BACKBUFFER_HEIGHT = 4;
-const PP_BACKBUFFER_FORMAT = 8;
-const PP_WINDOWED = 32;
-const PP_ENABLE_AUTO_DEPTHSTENCIL = 36;
-const PP_AUTO_DEPTHSTENCIL_FORMAT = 40;
-const PP_PRESENTATION_INTERVAL = 52;
 
 function formatForBpp(bpp: number): number {
     return bpp <= 16 ? D3DFMT_R5G6B5 : D3DFMT_X8R8G8B8;
@@ -433,6 +429,7 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
                 // advertises IMMEDIATE|ONE|TWO|THREE|FOUR, so Present has to honor it.
                 device.setPresentationInterval(
                     ppView.getUint32(pPresentationParameters + PP_PRESENTATION_INTERVAL, true));
+                device.setSwapEffect(readD3d9SwapEffect(ppView, pPresentationParameters));
             }
 
             // Get or create vtables
@@ -703,6 +700,62 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         // Clear expects ARGB color as single number
         device.clear(Flags, Color, Z, Stencil);
         return D3D_OK;
+    };
+
+    // StretchRect(pSourceSurface, pSourceRect, pDestSurface, pDestRect, Filter).
+    // The usual shape is an offscreen render target moved into the backbuffer, so a
+    // success-only stub silently drops the whole world layer and leaves just the HUD.
+    let stretchRectFailures = 0;
+    exports['IDirect3DDevice9_StretchRect'] = (_ctx, _mem, args) => {
+        const device = devices.get(args[0]);
+        const pSrcSurface = args[1] >>> 0;
+        const pSrcRect = args[2] >>> 0;
+        const pDstSurface = args[3] >>> 0;
+        const pDstRect = args[4] >>> 0;
+        const filter = args[5] >>> 0;
+        if (!device || !pSrcSurface || !pDstSurface || filter > 2) return D3DERR_INVALIDCALL;
+
+        const srcMeta = surfaceMeta.get(pSrcSurface);
+        const dstMeta = surfaceMeta.get(pDstSurface);
+        if (!srcMeta || !dstMeta) return D3DERR_INVALIDCALL;
+        if (resourceToDevice.get(pSrcSurface) !== device || resourceToDevice.get(pDstSurface) !== device) {
+            return D3DERR_INVALIDCALL;
+        }
+        if ((srcMeta.usage & D3DUSAGE_DEPTHSTENCIL) !== 0 ||
+            (dstMeta.usage & D3DUSAGE_RENDERTARGET) === 0) {
+            return D3DERR_INVALIDCALL;
+        }
+
+        const readRect = (ptr: number, width: number, height: number) => {
+            const rect = ptr ? {
+                left: Mem.readInt32(ptr) ?? 0,
+                top: Mem.readInt32(ptr + 4) ?? 0,
+                right: Mem.readInt32(ptr + 8) ?? 0,
+                bottom: Mem.readInt32(ptr + 12) ?? 0,
+            } : { left: 0, top: 0, right: width, bottom: height };
+            if (rect.left < 0 || rect.top < 0 || rect.right > width || rect.bottom > height ||
+                rect.right <= rect.left || rect.bottom <= rect.top) return null;
+            return rect;
+        };
+        const srcRect = readRect(pSrcRect, srcMeta.width, srcMeta.height);
+        const dstRect = readRect(pDstRect, dstMeta.width, dstMeta.height);
+        if (!srcRect || !dstRect) return D3DERR_INVALIDCALL;
+
+        const endpoint = (meta: typeof srcMeta) => meta.texturePtr ? {
+            texturePtr: meta.texturePtr,
+            face: meta.face ?? -1,
+            width: meta.width,
+            height: meta.height,
+        } : null;
+        if (device.stretchRect(endpoint(srcMeta), endpoint(dstMeta), srcRect, dstRect, filter === 2)) {
+            return D3D_OK;
+        }
+        if ((stretchRectFailures++ & 0xff) === 0) {
+            Logger.warn(LogCategory.D3D9,
+                `StretchRect failed src=0x${pSrcSurface.toString(16)}(tex=0x${(srcMeta.texturePtr ?? 0).toString(16)}) ` +
+                `dst=0x${pDstSurface.toString(16)}(tex=0x${(dstMeta.texturePtr ?? 0).toString(16)}) filter=${filter}`);
+        }
+        return D3DERR_INVALIDCALL;
     };
 
     // ColorFill(pSurface, pRect, color). Two shapes, both real:

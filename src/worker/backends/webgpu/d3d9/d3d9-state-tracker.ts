@@ -5,6 +5,8 @@
  * and enable cleaner state management.
  */
 
+import type { StreamBindingTable } from "../shared/vertex-streams";
+
 const D3DRS_LIGHTING = 137;
 const D3DRS_CULLMODE = 22;
 const D3DRS_ZENABLE = 7;
@@ -18,10 +20,11 @@ const D3DTS_PROJECTION = 3;
 const D3DTS_TEXTURE0 = 16;
 export const FFP_TEXTURE_TRANSFORM_COUNT = 8;
 
+/** A read-only view of one slot of the stream binding table. */
 export interface StreamSource {
-    index: number;
-    offset: number;
-    stride: number;
+    readonly index: number;
+    readonly offset: number;
+    readonly stride: number;
 }
 
 export interface DirtyFlags {
@@ -45,8 +48,10 @@ export class D3D9StateTracker {
 
     // FVF and stream bindings
     private fvf: number = 0;
-    private streamSource: StreamSource | null = null;
     private indexSource: number | null = null;
+    /** Read-through view onto slot 0 of the binding table (see getStreamSource) — one object,
+     *  reused, so the per-draw reads that use it allocate nothing. */
+    private readonly stream0View: StreamSource;
 
     // Texture stages
     private textureStages: (number | null)[] = new Array(8).fill(null);
@@ -73,7 +78,14 @@ export class D3D9StateTracker {
         transformUpdates: 0,
     };
 
-    constructor() {
+    /** `streams` is the device's binding table — the tracker READS it, never writes it. */
+    constructor(private readonly streams: StreamBindingTable) {
+        const table = streams;
+        this.stream0View = {
+            get index(): number { return table.bufferIndex[0]!; },
+            get offset(): number { return table.offsetBytes[0]!; },
+            get stride(): number { return table.strideBytes[0]!; },
+        };
         this.worldMatrix = identityMatrix();
         this.viewMatrix = identityMatrix();
         this.projMatrix = identityMatrix();
@@ -232,22 +244,19 @@ export class D3D9StateTracker {
 
     getFVF(): number { return this.fvf; }
 
-    // Stream source management
-    setStreamSource(index: number, offset: number, stride: number): boolean {
-        const cur = this.streamSource;
-        if (cur && cur.index === index && cur.offset === offset && cur.stride === stride) return false;
-        this.streamSource = { index, offset, stride };
-        this.dirtyFlags.streams = true;
-        return true;
+    /**
+     * Slot 0 of the binding table, or null when nothing is bound there. A VIEW, not a copy:
+     * SetStreamSource writes the table and the table alone, so slot 0 cannot drift from the
+     * slots the multi-stream paths read. The object is reused — treat it as valid only for
+     * the duration of the call that asked for it.
+     */
+    getStreamSource(): StreamSource | null {
+        return this.streams.bufferIndex[0]! >= 0 ? this.stream0View : null;
     }
 
-    getStreamSource(): StreamSource | null { return this.streamSource; }
-
-    clearStreamSource(): boolean {
-        if (this.streamSource === null) return false;
-        this.streamSource = null;
+    /** SetStreamSource/SetIndices changed a binding — the table itself is the state. */
+    markStreamsDirty(): void {
         this.dirtyFlags.streams = true;
-        return true;
     }
 
     // Index source management
@@ -336,7 +345,6 @@ export class D3D9StateTracker {
         this.projMatrix = identityMatrix();
         this.resetTexMatrices();
         this.fvf = 0;
-        this.streamSource = null;
         this.indexSource = null;
         this.textureStages.fill(null);
         this.pipelineKey = null;

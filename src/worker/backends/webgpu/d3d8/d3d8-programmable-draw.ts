@@ -187,7 +187,10 @@ export class D3D8ProgrammableRenderer {
                     depthCompare: zEnable !== 0 ? "less-equal" : "always",
                 },
             });
-            pipelineId = this.backendExecutor.registerPipeline(pipeline, link.hasTexture, true);
+            // Per-slot strides from the SAME layouts the pipeline was built with: the executor's
+            // vertex-range guard sizes a non-indexed draw by them, and an empty array disables it.
+            pipelineId = this.backendExecutor.registerPipeline(pipeline, link.hasTexture, true, 1,
+                link.vertexBuffers.map(b => b?.arrayStride ?? 0));
         } catch (e) {
             Logger.error(LogCategory.SYSTEM, `[D3D8] programmable pipeline build failed: ${e}`);
             pipelineId = -1;

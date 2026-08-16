@@ -8,7 +8,7 @@
  */
 
 import { SmProgram, SmRegister } from "./sm-parser";
-import { RegType, RASTOUT_POS, RASTOUT_FOG, opName } from "./sm-enums";
+import { RegType, RASTOUT_POS, RASTOUT_FOG, Usage, opName } from "./sm-enums";
 import {
     ShaderCtx, srcExpr, emitAlu, emitStore, colField, texField,
 } from "./sm-wgsl";
@@ -24,6 +24,8 @@ export interface VsAnalysis {
     maxTemp: number;
     /** def c# values keyed by register number. */
     defConsts: Map<number, Float32Array>;
+    /** VS3 generic o# register → declared output semantic. */
+    outputBindings: Map<number, { kind: "position" | "color" | "texcoord" | "fog" | "drop"; index: number }>;
 }
 
 export function analyzeVs(prog: SmProgram): VsAnalysis {
@@ -32,10 +34,30 @@ export function analyzeVs(prog: SmProgram): VsAnalysis {
     let writesFog = false;
     let needsA0 = prog.usesRelativeConst;
 
+    const outputBindings = new Map<number, { kind: "position" | "color" | "texcoord" | "fog" | "drop"; index: number }>();
+    if (prog.major >= 3) {
+        for (const dcl of prog.declarations) {
+            if (dcl.reg.type !== RegType.OUTPUT) continue;
+            let kind: "position" | "color" | "texcoord" | "fog" | "drop" = "drop";
+            if (dcl.usage === Usage.POSITION || dcl.usage === Usage.POSITIONT) kind = "position";
+            else if (dcl.usage === Usage.COLOR) kind = "color";
+            else if (dcl.usage === Usage.TEXCOORD) kind = "texcoord";
+            else if (dcl.usage === Usage.FOG) kind = "fog";
+            outputBindings.set(dcl.reg.num, { kind, index: dcl.usageIndex });
+        }
+    }
+
     for (const ins of prog.instructions) {
         const d = ins.dst;
         if (!d) continue;
         if (d.reg.type === RegType.ADDR) needsA0 = true;
+        if (prog.major >= 3 && d.reg.type === RegType.OUTPUT) {
+            const binding = outputBindings.get(d.reg.num);
+            if (binding?.kind === "color" && binding.index <= 1) writesColor[binding.index] = true;
+            else if (binding?.kind === "texcoord") writesTexcoord.add(binding.index);
+            else if (binding?.kind === "fog") writesFog = true;
+            continue;
+        }
         if (d.reg.type === RegType.ATTROUT) writesColor[d.reg.num === 1 ? 1 : 0] = true;
         if (d.reg.type === RegType.TEXCRDOUT) writesTexcoord.add(d.reg.num);
         if (d.reg.type === RegType.RASTOUT && d.reg.num === RASTOUT_FOG) writesFog = true;
@@ -64,6 +86,7 @@ export function analyzeVs(prog: SmProgram): VsAnalysis {
         needsA0,
         maxTemp: prog.maxTemp,
         defConsts,
+        outputBindings,
     };
 }
 
@@ -103,7 +126,16 @@ export function emitVsMain(prog: SmProgram, a: VsAnalysis, opts: VsEmitOptions):
                     if (reg.num === RASTOUT_FOG) return "oFog";
                     return null; // oPts — dropped
                 case RegType.ATTROUT: return reg.num === 1 ? "oD1" : "oD0";
-                case RegType.TEXCRDOUT: return `oT${reg.num}`;
+                case RegType.TEXCRDOUT: {
+                    if (prog.major < 3) return `oT${reg.num}`;
+                    const binding = a.outputBindings.get(reg.num);
+                    if (!binding) return null;
+                    if (binding.kind === "position") return "oPos";
+                    if (binding.kind === "color") return binding.index === 1 ? "oD1" : "oD0";
+                    if (binding.kind === "texcoord") return `oT${binding.index}`;
+                    if (binding.kind === "fog") return "oFog";
+                    return null;
+                }
                 default: return null;
             }
         },

@@ -61,6 +61,9 @@ export interface D3D9BufferPerf {
     indexedVertexRangeOOB: number;
     /** Worst overshoot in bytes, for sizing the miss. */
     indexedVertexRangeOOBMaxBytes: number;
+    /** The most recent refused draw, spelled out. A count alone cannot say WHETHER the
+     *  binding is too small or the stride is wrong, and those need opposite fixes. */
+    lastVertexRangeReject: string;
     /**
      * Indexed draws whose INDEX range runs past the bound index buffer — a separate counter
      * from the vertex one because the failure mode is the opposite: WebGPU does raise this,
@@ -355,15 +358,17 @@ const buffers: D3D9BufferPerf = {
     maxUploadsPerBufferPerFrame: 0,
     indexedVertexRangeOOB: 0,
     indexedVertexRangeOOBMaxBytes: 0,
+    lastVertexRangeReject: "",
     indexRangeOOB: 0,
     indexRangeOOBMaxBytes: 0,
 };
 
-export function d3d9PerfVertexRangeOOB(overshootBytes: number): void {
+export function d3d9PerfVertexRangeOOB(overshootBytes: number, detail = ""): void {
     buffers.indexedVertexRangeOOB++;
     if (overshootBytes > buffers.indexedVertexRangeOOBMaxBytes) {
         buffers.indexedVertexRangeOOBMaxBytes = overshootBytes;
     }
+    if (detail) buffers.lastVertexRangeReject = detail;
 }
 
 export function d3d9PerfIndexRangeOOB(overshootBytes: number): void {

@@ -9,11 +9,14 @@ import { WebGPUBackend } from "../webgpu-backend";
 import { RenderFrame, RenderCommandType, ProgrammableDrawState, FfpDrawState } from "../render-frame";
 import { Logger, LogCategory } from "../../../core/logger";
 import { recordGpuError } from "../../../core/gpu-error-log";
+import { d3d9PerfVertexRangeOOB } from "../../../modules/d3d9/d3d9-perf";
 import { frameProfiler } from "../../../core/frame-profiler";
 import { statsOverlay } from "../../../core/stats-overlay";
 import { PROG_BIND } from "./shader";
+import { padRegion, vertexRangeEndBytes, zeroStreamBuffer } from "../shared/vertex-streams";
 import { d3d9WasmArena, ArenaCommandType } from "./d3d9-wasm-arena";
 import { FFP_UNIFORM_BYTES, FFP_MAX_STAGES } from "./ffp-lighting";
+import { ColorKeyBlitPipeline } from "../ddraw/colorkey-blit-pipeline";
 
 export interface PipelineInfo {
     pipeline: GPURenderPipeline;
@@ -26,7 +29,21 @@ export interface PipelineInfo {
      *  from a differently-counted per-draw snapshot is a WebGPU validation error, not a
      *  degraded picture. */
     ffpStageCount: number;
+    /** arrayStride of every vertex-buffer slot this pipeline declares (index = slot, 0 = no
+     *  layout there). The encoder sizes each draw against these — see planVertexRangePadding. */
+    strides: number[];
+    /** End offset of the furthest attribute in each slot's layout — the second half of
+     *  WebGPU's non-indexed draw rule, which sizes the LAST vertex by its final attribute and
+     *  not by a whole stride. Empty (or 0 for a slot) falls back to the stride. */
+    attrEnds: number[];
 }
+
+/** Vertex-buffer slots the encoder tracks; D3D9 advertises 16 streams. */
+const MAX_VB_SLOTS = 16;
+
+/** Ceiling on one frame's robustness padding. A pathological frame asks for zeros, not for a
+ *  buffer the size of its own geometry. */
+const PAD_BUFFER_BUDGET = 32 * 1024 * 1024;
 
 const UNIFORM_ALIGN = 256;
 function alignUp(n: number, a: number): number { return Math.ceil(n / a) * a; }
@@ -38,7 +55,10 @@ function alignUp(n: number, a: number): number { return Math.ceil(n / a) * a; }
 // single cached bind group serve every draw of a material — only the dynamic
 // offset varies per draw (see bindProgrammable / acquireProgBindGroup).
 const VS_BIND_SIZE = 256 * 4 * 4; // 4096 bytes
-const PS_BIND_SIZE = 224 * 4 * 4; // 3584 bytes
+// 224 float vec4 registers followed by 16 packed boolean vec4 registers. Legacy
+// ps_1_x TEXBEM/TEXBEML appends two vec4 texture-stage-state records for each
+// of the eight stages, so reserve the full 256-vec4 WebGPU binding window.
+const PS_BIND_SIZE = 256 * 4 * 4; // 4096 bytes
 // Material-keyed programmable bind-group cache slots (default; __progCacheN overrides).
 // Sized to hold a full track/level material working set: slots grow on demand
 // (progCacheLen), so small sets scan short regardless of the cap; an undersized cap
@@ -143,6 +163,8 @@ export class D3D9BackendExecutor {
     // the canvas never flashes the black intermediate at the RAF rate. See NFSU cube-reflection flicker.
     private presentedTexture: GPUTexture | null = null;
     private hasPresented = false;
+    /** Shared textured-quad copier used by D3D9 StretchRect. */
+    private stretchRectPipeline: ColorKeyBlitPipeline | null = null;
 
     // Fallback texture for when no texture is bound
     private fallbackTexture: GPUTexture | null = null;
@@ -190,6 +212,14 @@ export class D3D9BackendExecutor {
         this.depthView = null;
         this.presentedTexture = null;
         this.hasPresented = false;
+        // Holds buffers created on the lost device — rebuilt lazily on the next StretchRect.
+        this.stretchRectPipeline?.destroy();
+        this.stretchRectPipeline = null;
+        this.paddedVb = null;
+        this.paddedVbSize = 0;
+        this.padCount = 0;
+        this.padCursor = 0;
+        this.boundVbBuffer.fill(null);
         this.fallbackTexture = null;
         this.fallbackTextureView = null;
         this.fallbackCubeTexture = null;
@@ -197,6 +227,7 @@ export class D3D9BackendExecutor {
         this.progLayouts.clear();
         this.progCacheSampler = [];
         this.progCacheViews = new Array(this.progCacheN * PROG_BIND.MAX_TEX).fill(null);
+        this.progCacheStageSamplers = new Array(this.progCacheN * PROG_BIND.MAX_TEX).fill(null);
         this.progCacheGroup = [];
         this.progCacheCubeMask = [];
         this.progCacheHash = [];
@@ -221,11 +252,236 @@ export class D3D9BackendExecutor {
     /**
      * Register a pipeline and return its ID
      */
-    registerPipeline(pipeline: GPURenderPipeline, hasTexture: boolean, programmable = false, ffpStageCount = 1): number {
+    registerPipeline(
+        pipeline: GPURenderPipeline,
+        hasTexture: boolean,
+        programmable = false,
+        ffpStageCount = 1,
+        strides: number[] = [],
+        attrEnds: number[] = [],
+    ): number {
         const id = this.pipelines.length;
         this.pipelines.push(pipeline);
-        this.pipelineInfo.push({ pipeline, hasTexture, programmable, ffpStageCount });
+        this.pipelineInfo.push({ pipeline, hasTexture, programmable, ffpStageCount, strides, attrEnds });
         return id;
+    }
+
+    /**
+     * The bindings each slot carries, as the last SetVertexBuffer left them. The padding path
+     * puts the guest's own binding back after a substituted draw, so all three numbers are
+     * kept, not just the size.
+     */
+    private boundVbSize = new Float64Array(MAX_VB_SLOTS);
+    private boundVbOffset = new Float64Array(MAX_VB_SLOTS);
+    private boundVbBuffer: (GPUBuffer | null)[] = new Array(MAX_VB_SLOTS).fill(null);
+
+    // ── Robustness padding for a slot a draw outruns ──────────────────────
+    //
+    // WebGPU sizes a NON-indexed draw exactly as
+    //   (firstVertex + vertexCount - 1) * arrayStride + <end of the slot's last attribute>
+    // and refuses an overrun — and the refusal invalidates the WHOLE command buffer, so one
+    // short slot costs every other draw in the frame. Hardware does not refuse: Vulkan/D3D9
+    // robust buffer access hands the shader zeros for what lies PAST the end and rasterizes
+    // everything before it normally. Zeroing the whole slot instead (which is all a bare
+    // substitution can do) blanks the vertices that WERE in range too, and a sprite whose
+    // colours and UVs all read zero is a very different picture from one missing its tail.
+    //
+    // Reproducing hardware needs the real bytes copied into a longer buffer with a zeroed
+    // tail, and a copy is legal only OUTSIDE a render pass while the draw is encoded inside
+    // one. So the frame's commands are walked once before the pass opens: the walk replays the
+    // binding state the encode loop will see, applies the rule above, and stages the copies on
+    // the frame's own encoder. Encoding then only swaps the padded binding in for that one
+    // draw and swaps the guest's binding back after it.
+    private padCmd = new Int32Array(32);
+    private padSlot = new Int32Array(32);
+    private padSrcRef = new Int32Array(32);
+    private padSrcOffset = new Float64Array(32);
+    private padCopyBytes = new Float64Array(32);
+    /** Offset into the padded buffer, or -1 for an entry that could not be copied and falls
+     *  back to the zero-filled stand-in for the whole slot. */
+    private padDstOffset = new Float64Array(32);
+    private padSize = new Float64Array(32);
+    private padCount = 0;
+    private padCursor = 0;
+    private paddedVb: GPUBuffer | null = null;
+    private paddedVbSize = 0;
+    // The plan walk's own copy of the binding state (it runs before any of it is encoded).
+    private planVbSize = new Float64Array(MAX_VB_SLOTS);
+    private planVbOffset = new Float64Array(MAX_VB_SLOTS);
+    private planVbRef = new Int32Array(MAX_VB_SLOTS);
+
+    /** Draws whose vertex range overran a bound slot and were padded (or zeroed) for it. */
+    vertexRangeRejects = 0;
+
+    private growPadPlan(): void {
+        if (this.padCount < this.padCmd.length) return;
+        const n = this.padCmd.length * 2;
+        const growI = (a: Int32Array) => { const b = new Int32Array(n); b.set(a); return b; };
+        const growF = (a: Float64Array) => { const b = new Float64Array(n); b.set(a); return b; };
+        this.padCmd = growI(this.padCmd);
+        this.padSlot = growI(this.padSlot);
+        this.padSrcRef = growI(this.padSrcRef);
+        this.padSrcOffset = growF(this.padSrcOffset);
+        this.padCopyBytes = growF(this.padCopyBytes);
+        this.padDstOffset = growF(this.padDstOffset);
+        this.padSize = growF(this.padSize);
+    }
+
+    /**
+     * Walk the frame's commands, size every non-indexed draw by WebGPU's rule, and stage the
+     * copies that make a short slot behave like hardware robustness. Runs on the frame's
+     * encoder BEFORE its render pass opens — the only place a buffer copy is legal.
+     */
+    private planVertexRangePadding(frame: RenderFrame, device: GPUDevice, encoder: GPUCommandEncoder): void {
+        this.padCount = 0;
+        this.padCursor = 0;
+        this.planVbSize.fill(0);
+        this.planVbOffset.fill(0);
+        this.planVbRef.fill(-1);
+        let pipelineId = -1;
+        let padBytes = 0;
+
+        for (let i = 0; i < frame.commandTypes.length; i++) {
+            const type = frame.commandTypes[i];
+            if (type === RenderCommandType.SetPipeline) {
+                pipelineId = frame.commandA[i];
+                continue;
+            }
+            if (type === RenderCommandType.SetVertexBuffer) {
+                const slot = frame.commandD[i] | 0;
+                if (slot < MAX_VB_SLOTS) {
+                    this.planVbRef[slot] = frame.commandA[i];
+                    this.planVbOffset[slot] = frame.commandB[i];
+                    this.planVbSize[slot] = frame.commandC[i];
+                }
+                continue;
+            }
+            // Indexed draws are deliberately absent: WebGPU cannot bound an index-driven
+            // vertex range and validates nothing, so there is no rejection to pre-empt.
+            if (type !== RenderCommandType.Draw) continue;
+            const info = pipelineId >= 0 ? this.pipelineInfo[pipelineId] : undefined;
+            const strides = info?.strides;
+            if (!strides) continue;
+            const vertexCount = frame.commandA[i];
+            const firstVertex = frame.commandB[i];
+            const slots = Math.min(strides.length, MAX_VB_SLOTS);
+            for (let slot = 0; slot < slots; slot++) {
+                const stride = strides[slot]!;
+                if (stride <= 0) continue;
+                const need = vertexRangeEndBytes(firstVertex, vertexCount, stride,
+                    info!.attrEnds[slot] ?? 0);
+                const have = this.planVbSize[slot]!;
+                if (need <= have) continue;
+
+                this.vertexRangeRejects++;
+                // Both the detail string and the warn are sampled: this runs per rejected slot of
+                // every draw, and the sink keeps the last non-empty detail either way.
+                const sample = this.vertexRangeRejects % 500 === 1;
+                d3d9PerfVertexRangeOOB(need - have, !sample ? "" :
+                    `slot=${slot} first=${firstVertex} count=${vertexCount} stride=${stride} `
+                    + `need=${need} bound=${have} guestStride=${frame.commandC[i]} `
+                    + `pipeline=${pipelineId} programmable=${info!.programmable} `
+                    + `pipelineStrides=[${strides.join(",")}]`);
+                if (sample) {
+                    Logger.warn(LogCategory.D3D9,
+                        `[D3D9] slot ${slot} short for this draw: needs ${need}B (first=${firstVertex} `
+                        + `count=${vertexCount} stride=${stride}), ${have}B bound — padding with zeros`);
+                }
+                padBytes = this.addPadEntry(frame, i, slot, need, have, padBytes);
+            }
+        }
+
+        if (this.padCount === 0) return;
+        this.ensurePaddedBuffer(device, padBytes);
+        for (let k = 0; k < this.padCount; k++) {
+            const dst = this.padDstOffset[k]!;
+            if (dst < 0) continue;
+            const copyBytes = this.padCopyBytes[k]!;
+            if (copyBytes > 0) {
+                encoder.copyBufferToBuffer(frame.bufferRefs[this.padSrcRef[k]!], this.padSrcOffset[k]!,
+                    this.paddedVb!, dst, copyBytes);
+            }
+            // The region is reused across draws and frames, so the tail must be zeroed, not
+            // merely left alone.
+            const tail = this.padSize[k]! - copyBytes;
+            if (tail > 0) encoder.clearBuffer(this.paddedVb!, dst + copyBytes, tail);
+        }
+    }
+
+    /** Record one short slot, as a padded copy where the source allows one. Returns the new
+     *  padded-buffer high-water mark. */
+    private addPadEntry(
+        frame: RenderFrame, cmdIndex: number, slot: number, need: number, have: number, padBytes: number,
+    ): number {
+        const ref = this.planVbRef[slot]!;
+        const src = ref >= 0 ? frame.bufferRefs[ref] : undefined;
+        const srcOffset = this.planVbOffset[slot]!;
+        // Only a COPY_SRC buffer can be read at all, and copyBufferToBuffer's source offset is
+        // a 4-byte multiple. Anything else falls back to the whole-slot zero binding.
+        const readable = src && (src.usage & GPUBufferUsage.COPY_SRC) !== 0 && (srcOffset & 3) === 0
+            ? Math.min(have, src.size - srcOffset)
+            : 0;
+        const { size, copyBytes } = padRegion(need, readable);
+        const canCopy = copyBytes > 0 && padBytes + size <= PAD_BUFFER_BUDGET;
+
+        this.growPadPlan();
+        const k = this.padCount++;
+        this.padCmd[k] = cmdIndex;
+        this.padSlot[k] = slot;
+        this.padSrcRef[k] = ref;
+        this.padSrcOffset[k] = srcOffset;
+        this.padCopyBytes[k] = copyBytes;
+        this.padSize[k] = size;
+        if (!canCopy) {
+            this.padDstOffset[k] = -1;
+            return padBytes;
+        }
+        this.padDstOffset[k] = padBytes;
+        return padBytes + size;
+    }
+
+    /** Grow-on-demand home for the padded copies. Never destroys the old buffer: command
+     *  buffers already submitted still reference it. */
+    private ensurePaddedBuffer(device: GPUDevice, bytes: number): void {
+        if (bytes <= 0 || (this.paddedVb && this.paddedVbSize >= bytes)) return;
+        const size = Math.max(bytes, this.paddedVbSize * 2, 256 * 1024);
+        this.paddedVb = device.createBuffer({
+            label: "d3d9-vertex-pad",
+            size,
+            usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+        });
+        this.paddedVbSize = size;
+    }
+
+    /** Bind the padded (or zero) stand-in for every slot this draw outran. Returns the plan
+     *  index the draw's entries start at, for the restore afterwards. */
+    private applyVertexPadding(
+        renderPass: GPURenderPassEncoder, cmdIndex: number, device: GPUDevice,
+    ): number {
+        while (this.padCursor < this.padCount && this.padCmd[this.padCursor]! < cmdIndex) this.padCursor++;
+        const start = this.padCursor;
+        while (this.padCursor < this.padCount && this.padCmd[this.padCursor] === cmdIndex) {
+            const k = this.padCursor++;
+            const slot = this.padSlot[k]!;
+            const size = this.padSize[k]!;
+            const dst = this.padDstOffset[k]!;
+            if (dst >= 0 && this.paddedVb) {
+                renderPass.setVertexBuffer(slot, this.paddedVb, dst, size);
+            } else {
+                const zeros = zeroStreamBuffer(device, size);
+                renderPass.setVertexBuffer(slot, zeros, 0, Math.min(zeros.size, size));
+            }
+        }
+        return start;
+    }
+
+    /** Put the guest's own bindings back, so the next draw sees the state it recorded. */
+    private restoreVertexPadding(renderPass: GPURenderPassEncoder, start: number): void {
+        for (let k = start; k < this.padCursor; k++) {
+            const slot = this.padSlot[k]!;
+            const buffer = this.boundVbBuffer[slot];
+            if (buffer) renderPass.setVertexBuffer(slot, buffer, this.boundVbOffset[slot], this.boundVbSize[slot]);
+        }
     }
 
     // ── Programmable (VS/PS) path ─────────────────────────────────────────
@@ -246,6 +502,7 @@ export class D3D9BackendExecutor {
     // load_bundle) so capacity A/Bs need a reload, not a rebuild. Read once per executor.
     private readonly progCacheN = ((globalThis as Record<string, unknown>).__progCacheN as number >>> 0) || PROG_CACHE_N;
     private progCacheSampler: (GPUSampler | null)[] = [];
+    private progCacheStageSamplers: (GPUSampler | null)[] = new Array(this.progCacheN * PROG_BIND.MAX_TEX).fill(null);
     private progCacheViews: (GPUTextureView | null)[] = new Array(this.progCacheN * PROG_BIND.MAX_TEX).fill(null);
     private progCacheGroup: GPUBindGroup[] = [];
     // Per-slot cube mask: a bind group built for one layout (cube mask) is incompatible with a
@@ -320,6 +577,11 @@ export class D3D9BackendExecutor {
                     visibility: GPUShaderStage.FRAGMENT,
                     texture: { sampleType: "float", viewDimension: ((cubeMask >> n) & 1) ? "cube" : "2d" },
                 });
+            }
+            // Used by programmable-VS + fixed-function-pixel (hybrid) shaders. Keeping these
+            // in the shared layout makes their per-stage filter/address state bindable per draw.
+            for (let n = 0; n < PROG_BIND.MAX_TEX; n++) {
+                entries.push({ binding: PROG_BIND.HYBRID_SAMPLER_BASE + n, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } });
             }
             const bindGroupLayout = device.createBindGroupLayout({ entries });
             const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] });
@@ -574,6 +836,8 @@ export class D3D9BackendExecutor {
             /** When set, used directly (shared FFP depth with stencil load/clear semantics). */
             depthStencil?: GPURenderPassDepthStencilAttachment;
         } | null,
+        /** DISCARD swap chains expose undefined backbuffer contents after Present. */
+        discardBackbufferAfterPresent = false,
     ): void {
         const device = this.backend.getDevice();
         const queue = this.backend.getQueue();
@@ -588,6 +852,10 @@ export class D3D9BackendExecutor {
         this.currentPipelineId = null;
         this.resetProgConstOffsetCache();
         this.resetRenderPassBindCache();
+        // A fresh pass inherits no vertex bindings; every recorded draw sets its own first.
+        this.boundVbSize.fill(0);
+        this.boundVbOffset.fill(0);
+        this.boundVbBuffer.fill(null);
 
         try {
             // Upload queued data
@@ -652,6 +920,10 @@ export class D3D9BackendExecutor {
             // Create command encoder
             const encoder = device.createCommandEncoder();
 
+            // Robustness padding is staged here, before the pass opens — a buffer copy inside
+            // a render pass is not legal (see planVertexRangePadding).
+            this.planVertexRangePadding(frame, device, encoder);
+
             const clearTarget = (frame.clear.flags & 1) !== 0; // D3DCLEAR_TARGET
             const clearZ = (frame.clear.flags & 2) !== 0; // D3DCLEAR_ZBUFFER
 
@@ -711,7 +983,13 @@ export class D3D9BackendExecutor {
                         const vbOffset = frame.commandB[i];
                         const vbSize = frame.commandC[i];
                         // commandD = vertex-buffer slot (D3D stream number); 0 for single-stream.
-                        renderPass.setVertexBuffer(frame.commandD[i] | 0, frame.bufferRefs[vbIndex], vbOffset, vbSize);
+                        const slot = frame.commandD[i] | 0;
+                        renderPass.setVertexBuffer(slot, frame.bufferRefs[vbIndex], vbOffset, vbSize);
+                        if (slot < MAX_VB_SLOTS) {
+                            this.boundVbBuffer[slot] = frame.bufferRefs[vbIndex];
+                            this.boundVbOffset[slot] = vbOffset;
+                            this.boundVbSize[slot] = vbSize;
+                        }
                         break;
                     }
 
@@ -726,8 +1004,11 @@ export class D3D9BackendExecutor {
                     case RenderCommandType.Draw: {
                         const vertexCount = frame.commandA[i];
                         const startVertex = frame.commandB[i];
+                        if (this.currentPipelineId === null) break;
+                        const padStart = this.applyVertexPadding(renderPass, i, device);
                         renderPass.draw(vertexCount, 1, startVertex, 0);
                         this.metrics.drawCalls++;
+                        if (this.padCursor > padStart) this.restoreVertexPadding(renderPass, padStart);
                         break;
                     }
 
@@ -809,6 +1090,20 @@ export class D3D9BackendExecutor {
                         }
                     );
                     this.hasPresented = true;
+                }
+
+                // The single offscreen texture otherwise has COPY semantics. DISCARD
+                // must not feed the previous presented image into the next frame.
+                if (discardBackbufferAfterPresent) {
+                    const discardPass = encoder.beginRenderPass({
+                        colorAttachments: [{
+                            view: this.offscreenView!,
+                            clearValue: { r: 0, g: 0, b: 0, a: 0 },
+                            loadOp: "clear",
+                            storeOp: "store",
+                        }],
+                    });
+                    discardPass.end();
                 }
             }
 
@@ -929,6 +1224,60 @@ export class D3D9BackendExecutor {
         return { width: canvas.width, height: canvas.height };
     }
 
+    /**
+     * D3D9 StretchRect GPU blit. A missing endpoint denotes the implicit backbuffer;
+     * explicit endpoints are render-target/plain-surface texture views supplied by
+     * D3D9Device. The shader path intentionally handles both scaling and format
+     * conversion, which copyTextureToTexture cannot do.
+     */
+    stretchRect(
+        src: { view: GPUTextureView; width: number; height: number } | null,
+        dst: { view: GPUTextureView; width: number; height: number } | null,
+        srcRect: { left: number; top: number; right: number; bottom: number },
+        dstRect: { left: number; top: number; right: number; bottom: number },
+        linear: boolean,
+    ): boolean {
+        const device = this.backend.getDevice();
+        const queue = this.backend.getQueue();
+        const format = this.backend.getFormat();
+        if (!device || !queue || !format) return false;
+
+        this.ensureOffscreenTarget();
+        const source = src ?? {
+            view: this.offscreenView!,
+            width: this.offscreenSize!.width,
+            height: this.offscreenSize!.height,
+        };
+        const destination = dst ?? {
+            view: this.offscreenView!,
+            width: this.offscreenSize!.width,
+            height: this.offscreenSize!.height,
+        };
+
+        if (!this.stretchRectPipeline) {
+            this.stretchRectPipeline = new ColorKeyBlitPipeline(device, queue);
+        }
+        const zero = { r: 0, g: 0, b: 0, a: 0 };
+        const encoder = device.createCommandEncoder();
+        this.stretchRectPipeline.blit(encoder, {
+            srcView: source.view,
+            srcWidth: source.width,
+            srcHeight: source.height,
+            dstView: destination.view,
+            dstFormat: format,
+            dstWidth: destination.width,
+            dstHeight: destination.height,
+            srcRect,
+            dstRect,
+            colorKeyLow: zero,
+            colorKeyHigh: zero,
+            enableColorKey: false,
+            filter: linear ? "linear" : "nearest",
+        });
+        queue.submit([encoder.finish()]);
+        return true;
+    }
+
     private ensureOffscreenTarget(): void {
         const device = this.backend.getDevice()!;
         const format = this.backend.getFormat()!;
@@ -951,7 +1300,8 @@ export class D3D9BackendExecutor {
         this.offscreenTexture = device.createTexture({
             size: { width: size.width, height: size.height, depthOrArrayLayers: 1 },
             format,
-            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING |
+                   GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST,
         });
         this.offscreenView = this.offscreenTexture.createView();
 
@@ -1271,7 +1621,7 @@ export class D3D9BackendExecutor {
         const psOff = this.writeProgrammableConstants(this.psArena!, queue, ds.psConst, ds.psLen, ds.psVersion, false);
 
         const sampler = ds.sampler ?? this.getSampler();
-        const bindGroup = this.acquireProgBindGroup(sampler, ds.textures, ds.cubeMask);
+        const bindGroup = this.acquireProgBindGroup(sampler, ds.textures, ds.samplers, ds.cubeMask);
 
         this.setBindGroup0(renderPass, bindGroup, vsOff, psOff);
     }
@@ -1410,7 +1760,7 @@ export class D3D9BackendExecutor {
         return id;
     }
 
-    private progKeyHash(sampler: GPUSampler, textures: (GPUTextureView | null)[], cubeMask: number): number {
+    private progKeyHash(sampler: GPUSampler, textures: (GPUTextureView | null)[], samplers: (GPUSampler | null)[], cubeMask: number): number {
         // FNV-1a over the identity ids. Collisions are fine — the bucket is verified by
         // identity below, so the hash only has to be cheap and well-spread.
         let h = 0x811c9dc5;
@@ -1418,13 +1768,14 @@ export class D3D9BackendExecutor {
         h = Math.imul(h ^ cubeMask, 0x01000193);
         for (let n = 0; n < PROG_BIND.MAX_TEX; n++) {
             h = Math.imul(h ^ this.gpuId(textures[n] ?? null), 0x01000193);
+            h = Math.imul(h ^ this.gpuId(samplers[n] ?? null), 0x01000193);
         }
         return h >>> 0;
     }
 
-    private acquireProgBindGroup(sampler: GPUSampler, textures: (GPUTextureView | null)[], cubeMask: number = 0): GPUBindGroup {
+    private acquireProgBindGroup(sampler: GPUSampler, textures: (GPUTextureView | null)[], samplers: (GPUSampler | null)[], cubeMask: number = 0): GPUBindGroup {
         const MAX = PROG_BIND.MAX_TEX;
-        const hash = this.progKeyHash(sampler, textures, cubeMask);
+        const hash = this.progKeyHash(sampler, textures, samplers, cubeMask);
         const bucket = this.progCacheIndex.get(hash);
         if (bucket !== undefined) {
             for (let i = 0; i < bucket.length; i++) {
@@ -1433,7 +1784,8 @@ export class D3D9BackendExecutor {
                 const base = s * MAX;
                 let match = true;
                 for (let n = 0; n < MAX; n++) {
-                    if (this.progCacheViews[base + n] !== (textures[n] ?? null)) { match = false; break; }
+                    if (this.progCacheViews[base + n] !== (textures[n] ?? null)
+                        || this.progCacheStageSamplers[base + n] !== (samplers[n] ?? null)) { match = false; break; }
                 }
                 if (match) { this.metrics.bindGroupCacheHits++; return this.progCacheGroup[s]; }
             }
@@ -1455,6 +1807,9 @@ export class D3D9BackendExecutor {
             const fallback = ((cubeMask >> n) & 1) ? fallbackCube : fallback2d;
             entries.push({ binding: PROG_BIND.TEX_BASE + n, resource: textures[n] ?? fallback });
         }
+        for (let n = 0; n < MAX; n++) {
+            entries.push({ binding: PROG_BIND.HYBRID_SAMPLER_BASE + n, resource: samplers[n] ?? sampler });
+        }
         const bindGroup = device.createBindGroup({ layout: bindGroupLayout, entries });
 
         const slot = this.progCacheLen < this.progCacheN
@@ -1469,7 +1824,10 @@ export class D3D9BackendExecutor {
         this.progCacheSampler[slot] = sampler;
         this.progCacheCubeMask[slot] = cubeMask;
         const base = slot * MAX;
-        for (let n = 0; n < MAX; n++) this.progCacheViews[base + n] = textures[n] ?? null;
+        for (let n = 0; n < MAX; n++) {
+            this.progCacheViews[base + n] = textures[n] ?? null;
+            this.progCacheStageSamplers[base + n] = samplers[n] ?? null;
+        }
         this.progCacheGroup[slot] = bindGroup;
         return bindGroup;
     }

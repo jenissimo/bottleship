@@ -16,6 +16,7 @@ import { analyzeVs, emitVsMain, VsAnalysis } from "./vs-codegen";
 import { analyzePs, emitPsMain, PsAnalysis } from "./ps-codegen";
 import { colField, texField, AlphaTest, alphaTestSnippet } from "./sm-wgsl";
 import { TexType } from "./sm-enums";
+import { emitFfpCombinerWgsl } from "../ffp-combiner";
 
 export { parseShader } from "./sm-parser";
 
@@ -26,7 +27,12 @@ export const PROG_BIND = {
     SAMPLER: 2,
     TEX_BASE: 3,
     MAX_TEX: 8,
+    /** Extra per-stage samplers used by the VS + fixed-function pixel hybrid path.
+     *  Kept after the texture window so existing programmable shader bindings stay stable. */
+    HYBRID_SAMPLER_BASE: 11,
 } as const;
+
+const FFP_MAX_STAGES = 8;
 
 /**
  * Raw D3DVERTEXELEMENT9 data as read from guest memory (shared with the
@@ -116,6 +122,9 @@ export interface LinkOptions {
      *  the ps_1_1-1_3 / fixed-function projective texture divide (projected spotlights, planar
      *  reflections). SM2+ shaders project in-shader (texldp) and ignore this. */
     projectedStages?: number;
+    /** With a programmable VS but no PS, D3D still runs the fixed-function texture-stage
+     *  cascade. This is the number of enabled stages, baked into the generated fragment entry. */
+    ffpStageCount?: number;
 }
 
 export function linkProgram(opts: LinkOptions): LinkResult {
@@ -149,12 +158,14 @@ export function linkProgram(opts: LinkOptions): LinkResult {
 
     // ── Fragment sampler set ───────────────────────────────────────────────
     let fragSamplers: number[];
+    const hybridStageCount = ps ? 0 : Math.max(1, Math.min(opts.ffpStageCount ?? 1, FFP_MAX_STAGES));
     if (ps) {
         fragSamplers = [...psA!.samplers].filter(n => n < PROG_BIND.MAX_TEX).sort((a, b) => a - b);
-    } else if (vsA.writesTexcoord.size > 0) {
-        fragSamplers = [Math.min(...vsA.writesTexcoord)];
     } else {
-        fragSamplers = [];
+        // Hybrid pixel processing samples each active fixed-function stage, irrespective of
+        // which coordinates the VS happened to write. Missing coordinates are handled by the
+        // fragment generator's t0 fallback, just as the declaration/FVF FFP path does.
+        fragSamplers = Array.from({ length: hybridStageCount }, (_unused, stage) => stage);
     }
     const hasTexture = fragSamplers.length > 0;
 
@@ -166,7 +177,22 @@ export function linkProgram(opts: LinkOptions): LinkResult {
 
     lines.push(`struct VsUniforms { c: array<vec4<f32>, ${Math.max(1, vsConstantCount)}>, }`);
     lines.push(`@group(0) @binding(${PROG_BIND.VS_UNIFORM}) var<uniform> vsc: VsUniforms;`);
-    lines.push(`struct PsUniforms { c: array<vec4<f32>, ${Math.max(1, psConstantCount)}>, }`);
+    if (ps) {
+        if (psA!.usesLegacyBumpEnv) {
+            // TEXBEM/TEXBEML source their matrix/luminance from D3DTSS state,
+            // separate from c#. Two vec4 values per stage keep the WGSL layout
+            // naturally 16-byte aligned and fit after the largest PS constant bank.
+            lines.push(`struct LegacyBumpStage { mat: vec4<f32>, lum: vec4<f32>, }`);
+            lines.push(`struct PsUniforms { c: array<vec4<f32>, ${Math.max(1, psConstantCount)}>, bump: array<LegacyBumpStage, ${FFP_MAX_STAGES}>, }`);
+        } else {
+            lines.push(`struct PsUniforms { c: array<vec4<f32>, ${Math.max(1, psConstantCount)}>, }`);
+        }
+    } else {
+        // `c` deliberately remains a vec4 so the hybrid layout keeps the regular PS uniform
+        // binding shape. The device packs tfactor + eight FfpStage records immediately after it.
+        lines.push(`struct FfpStage { a: vec4<f32>, b: vec4<f32>, }`);
+        lines.push(`struct PsUniforms { c: array<vec4<f32>, 1>, tfactor: vec4<f32>, stages: array<FfpStage, ${FFP_MAX_STAGES}>, }`);
+    }
     lines.push(`@group(0) @binding(${PROG_BIND.PS_UNIFORM}) var<uniform> psc: PsUniforms;`);
     // Per-stage cube-sampler mask: a cube sampler declares texture_cube<f32> + samples with a
     // 3-component direction (ps-codegen). The bind-group layout's viewDimension must match. The
@@ -177,6 +203,11 @@ export function linkProgram(opts: LinkOptions): LinkResult {
         for (const n of fragSamplers) {
             const kind = (cubeMask >> n) & 1 ? "texture_cube<f32>" : "texture_2d<f32>";
             lines.push(`@group(0) @binding(${PROG_BIND.TEX_BASE + n}) var tex${n}: ${kind};`);
+        }
+        if (!ps) {
+            for (const n of fragSamplers) {
+                lines.push(`@group(0) @binding(${PROG_BIND.HYBRID_SAMPLER_BASE + n}) var ffpSamp${n}: sampler;`);
+            }
         }
     }
     lines.push("");
@@ -205,10 +236,10 @@ export function linkProgram(opts: LinkOptions): LinkResult {
     if (ps) {
         lines.push(emitPsMain(ps.prog, psA!, alphaTest, cubeMask, projectedStages));
     } else {
-        const dftStage = hasTexture ? fragSamplers[0] : null;
-        const dftCube = dftStage !== null && ((cubeMask >> dftStage) & 1) !== 0;
-        const dftProjected = dftStage !== null && ((projectedStages >> dftStage) & 1) !== 0;
-        lines.push(emitDefaultFragment(interpColors[0], dftStage, alphaTest, dftCube, dftProjected));
+        lines.push(emitHybridFixedFunctionFragment(
+            interpColors[0], interpColors[1], interpTexcoords, hybridStageCount, alphaTest,
+            cubeMask, projectedStages,
+        ));
     }
 
     return {
@@ -242,6 +273,89 @@ function emitDefaultFragment(hasColor: boolean, sampleStage: number | null, alph
         return `@fragment\nfn fs_main(in: Interp) -> @location(0) vec4<f32> {\n    return ${ret};\n}`;
     }
     return `@fragment\nfn fs_main(in: Interp) -> @location(0) vec4<f32> {\n    let _c = ${ret};\n    ${atest}\n    return _c;\n}`;
+}
+
+/**
+ * A NULL pixel shader leaves texture combiners fixed-function, but a bound
+ * vertex shader remains programmable: stage N samples the VS's oTN directly.
+ * D3DTSS_TEXCOORDINDEX is a fixed-function *vertex* state and is ignored here.
+ */
+export function hybridTexcoordSetForStage(stage: number, writtenTexcoords: readonly number[]): number | null {
+    return writtenTexcoords.includes(stage) ? stage : null;
+}
+
+/** D3D9 hybrid path: programmable vertex shader + NULL pixel shader. The pixel side is not a
+ * white/default sample; it is the normal fixed-function texture-stage cascade — the very same
+ * combiner the FFP shader emits (ffp-combiner.ts), over stage records the device packs into the
+ * otherwise-unused PS uniform binding in `packFfpUniforms`' layout. */
+function emitHybridFixedFunctionFragment(
+    hasColor: boolean, hasSpecular: boolean, texcoords: number[], stageCount: number,
+    alphaTest: AlphaTest | null, cubeMask: number, projectedStages: number,
+): string {
+    const color = hasColor ? `in.${colField(0)}` : "vec4<f32>(1.0)";
+    const specular = hasSpecular ? `in.${colField(1)}` : "vec4<f32>(0.0)";
+    const arg = (sel: string): string => `ffpStageArg(${sel}, _t, _cur, _diff, _spec, _tmp, psc.tfactor)`;
+    const stage = (s: number): string => {
+        // D3DTSS_TEXCOORDINDEX configures the fixed-function VERTEX pipeline. It does not
+        // remap a programmable VS's oT# outputs: fixed-function pixel stage N consumes oTN.
+        const coordSet = hybridTexcoordSetForStage(s, texcoords);
+        const raw = coordSet === null
+            ? "vec4<f32>(0.0, 0.0, 0.0, 1.0)"
+            : `in.${texField(coordSet)}`;
+        const cube = ((cubeMask >> s) & 1) !== 0;
+        const projected = ((projectedStages >> s) & 1) !== 0;
+        const coord = cube
+            ? `${raw}.xyz`
+            : projected
+                ? `(${raw}.xy / max(abs(${raw}.w), 1e-8))`
+                : `${raw}.xy`;
+        return `
+    if (u32(psc.stages[${s}].a.x) != 1u) {
+        var _t = textureSample(tex${s}, ffpSamp${s}, ${coord});
+        // Alpha-less D3D formats read alpha as 1.0 on real hardware; our GPU copies carry a
+        // live alpha channel that must be masked.
+        if (psc.stages[${s}].b.z > 0.5) { _t = vec4<f32>(_t.rgb, 1.0); }
+        let _cur = _c;
+        // COLORARG0 | ALPHAARG0<<8 | resultIsTemp<<16 (see FfpStage in ffp-lighting.ts).
+        let _x = u32(psc.stages[${s}].b.w);
+        let _toTemp = (_x >> 16u) != 0u;
+        // D3DTSS_RESULTARG: the stage reads CURRENT/TEMP as arguments either way, but writes
+        // only the selected register — and an unwritten channel keeps ITS old value.
+        let _dst = select(_c, _tmp, _toTemp);
+        let _a0 = ${arg("_x & 0xffu")};
+        let _a1 = ${arg(`u32(psc.stages[${s}].a.y)`)};
+        let _a2 = ${arg(`u32(psc.stages[${s}].a.z)`)};
+        let _rgb = ffpStageOp(u32(psc.stages[${s}].a.x), _a0, _a1, _a2, _t, _cur, _diff, psc.tfactor, _dst);
+        var _al = _dst.a;
+        if (u32(psc.stages[${s}].a.w) != 1u) {
+            let _b0 = ${arg("(_x >> 8u) & 0xffu")};
+            let _b1 = ${arg(`u32(psc.stages[${s}].b.x)`)};
+            let _b2 = ${arg(`u32(psc.stages[${s}].b.y)`)};
+            _al = ffpStageOp(u32(psc.stages[${s}].a.w), _b0, _b1, _b2, _t, _cur, _diff, psc.tfactor, _dst).a;
+        }
+        let _out = vec4<f32>(clamp(_rgb.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), clamp(_al, 0.0, 1.0));
+        if (_toTemp) { _tmp = _out; } else { _c = _out; }
+    }`;
+    };
+    return `
+${emitFfpCombinerWgsl("dst")}
+@fragment
+fn fs_main(in: Interp) -> @location(0) vec4<f32> {
+    let _diff = ${color};
+    let _spec = ${specular};
+    // c0.x is a harness-only diagnostic selector: 1=texture0, 2=vertex colour, 3=white.
+    // It is dynamic uniform state, so it deliberately does not affect pipeline caching.
+    if (psc.c[0].x > 0.5) {
+        if (psc.c[0].x > 2.5) { return vec4<f32>(1.0); }
+        if (psc.c[0].x > 1.5) { return ${hasColor ? "_diff" : "vec4<f32>(1.0, 0.0, 1.0, 1.0)"}; }
+        return textureSample(tex0, ffpSamp0, ${texcoords.includes(0) ? `in.${texField(0)}.xy` : "vec2<f32>(0.0)"});
+    }
+    // TEMP starts at (0,0,0,0) — it is a D3DTA register the whole cascade shares, not per stage.
+    var _tmp: vec4<f32> = vec4<f32>(0.0);
+    var _c: vec4<f32> = _diff;${Array.from({ length: stageCount }, (_unused, s) => stage(s)).join("")}
+    ${alphaTestSnippet(alphaTest, "_c.a")}
+    return _c;
+}`;
 }
 
 // ── Vertex declaration → WGSL input + attributes ──────────────────────────────
@@ -323,6 +437,16 @@ function buildVertexInputs(
             info = declTypeInfo(spec.elem.type);
             offset = spec.elem.offset;
             stream = multiStream ? spec.elem.stream : 0;
+            // An element that does not fit the BOUND vertex has no attribute to read from:
+            // the stride is what SetStreamSource said, and raising it to fit would step every
+            // vertex past its successor. Reading zeros is what the hardware does there, and it
+            // has to be decided HERE — a WGSL @location the vertex state cannot supply makes
+            // the pipeline invalid, which costs the whole frame's command buffer, not one draw.
+            const bound = (multiStream ? streamStrides![stream] : streamStride) ?? 0;
+            if (bound > 0 && offset + info.size > bound) {
+                inputExprs.set(spec.reg, info.expand(`${info.wgslType}()`));
+                continue;
+            }
         } else {
             // No matching declaration element — tight-pack as float4.
             info = declTypeInfo(3);

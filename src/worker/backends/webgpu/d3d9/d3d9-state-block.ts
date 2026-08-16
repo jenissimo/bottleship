@@ -12,6 +12,7 @@ import {
     resolvePixelShaderComPtr,
 } from "./d3d9-com-objects";
 import { KeyedStateBlockRecorder } from "../shared/state-block-recorder";
+import { MAX_VERTEX_STREAMS } from "../shared/vertex-streams";
 import { d3d9WasmArena, isWasmBlocksEnabled } from "./d3d9-wasm-arena";
 import { addComRef, releaseComRef } from "../../../modules/d3d9/com-refs";
 
@@ -34,7 +35,58 @@ export type StateBlockEntry =
     | { op: "pixelShader"; handle: number }
     | { op: "vertexDeclaration"; handle: number }
     | { op: "vertexShaderConstantF"; start: number; data: Float32Array }
-    | { op: "pixelShaderConstantF"; start: number; data: Float32Array };
+    | { op: "pixelShaderConstantF"; start: number; data: Float32Array }
+    | { op: "pixelShaderConstantB"; start: number; data: Int32Array }
+    | { op: "streamSource"; stream: number; vbPtr: number; offset: number; stride: number }
+    | { op: "indices"; ibPtr: number };
+
+/**
+ * Which blocks own the vertex-stream BINDINGS (SetStreamSource) and the index buffer.
+ *
+ * D3DSBT_ALL only. "Saving All Device States with a StateBlock (D3D9)" lists, on top of vertex
+ * and pixel state: "For each vertex stream: a pointer to the vertex buffer, each argument from
+ * IDirect3DDevice9::SetStreamSource, and the divider (if any) from SetStreamSourceFreq" and "A
+ * pointer to the index buffer".
+ *
+ * D3DSBT_VERTEXSTATE deliberately does NOT: its list ("Saving Vertex States With a StateBlock")
+ * is the vertex render/sampler/texture states, NPatch mode, lights + enables, the vertex shader
+ * and its constants, the SetStreamSourceFreq DIVIDERS, and the vertex declaration — the divider
+ * is vertex state, the binding it divides is not. Capturing bindings into a vertex-state block
+ * would be as wrong as omitting them from an ALL block: Apply would then overwrite the buffers
+ * the app bound after the capture and expected to survive.
+ *
+ * (The dividers themselves are not captured because SetStreamSourceFreq is not implemented;
+ * capturing state we cannot set would restore nothing.)
+ */
+export function stateBlockCapturesStreamBindings(blockType: number): boolean {
+    return blockType === D3DSBT_ALL;
+}
+
+/**
+ * The device surface the stream/index capture and replay needs. D3D9Device satisfies it; naming
+ * it keeps this logic testable without a GPU and documents that stream state is read through the
+ * device's accessor over the single StreamBindingTable, never a second copy.
+ */
+export interface StreamStateDevice {
+    getStreamBinding(streamNumber: number): { ptr: number; offset: number; stride: number } | null;
+    setStreamSource(streamNumber: number, vbPtr: number, offset: number, stride: number): number;
+    getBoundIndexBufferPtr(): number;
+    setIndices(ibPtr: number): number;
+}
+
+/**
+ * Append one entry per stream slot — INCLUDING the slots nothing is bound to. A slot left out
+ * is a slot Apply cannot unbind, so a buffer bound after the capture would survive it and feed
+ * the next draw geometry from another object.
+ */
+export function captureStreamBindingEntries(device: StreamStateDevice, entries: StateBlockEntry[]): void {
+    for (let stream = 0; stream < MAX_VERTEX_STREAMS; stream++) {
+        const b = device.getStreamBinding(stream);
+        if (!b) break;
+        entries.push({ op: "streamSource", stream, vbPtr: b.ptr >>> 0, offset: b.offset >>> 0, stride: b.stride >>> 0 });
+    }
+    entries.push({ op: "indices", ibPtr: device.getBoundIndexBufferPtr() >>> 0 });
+}
 
 export interface D3D9StateBlockData {
     devicePtr: number;
@@ -44,7 +96,7 @@ export interface D3D9StateBlockData {
      * True when every entry is representable in the WASM arena mirror (see
      * classifyStateBlockCoverage). Computed once at End/CreateStateBlock; blocks with
      * beyond-mirror ops (transforms, TSS, materials, lights, clip planes, stage>0
-     * samplers) stay on the JS apply/capture path.
+     * samplers, stream/index bindings) stay on the JS apply/capture path.
      */
     coverable?: boolean;
     /** Arena block-slot index when this block lives in the d3d9-webgpu WASM arena
@@ -141,6 +193,12 @@ function entryKey(entry: StateBlockEntry): string {
             return `vsc:${entry.start}:${entry.data.length}`;
         case "pixelShaderConstantF":
             return `psc:${entry.start}:${entry.data.length}`;
+        case "pixelShaderConstantB":
+            return `pscb:${entry.start}:${entry.data.length}`;
+        case "streamSource":
+            return `stream:${entry.stream}`;
+        case "indices":
+            return "ib";
     }
 }
 
@@ -158,6 +216,10 @@ function retainedEntryPtr(entry: StateBlockEntry): number {
         case "pixelShader":
         case "vertexDeclaration":
             return entry.handle >>> 0;
+        case "streamSource":
+            return entry.vbPtr >>> 0;
+        case "indices":
+            return entry.ibPtr >>> 0;
         default:
             return 0;
     }
@@ -276,6 +338,32 @@ export function tryAttachWasmBlockSlot(data: D3D9StateBlockData): void {
     data.handleEntries = handleEntries;
 }
 
+export type StreamStateEntry = Extract<StateBlockEntry, { op: "streamSource" } | { op: "indices" }>;
+
+/** Replay one captured binding. vbPtr/ibPtr 0 is the captured "nothing bound" and must be
+ *  replayed as such — the setters treat it as an unbind, not as "leave alone". */
+export function applyStreamStateEntry(device: StreamStateDevice, entry: StreamStateEntry): void {
+    if (entry.op === "streamSource") {
+        device.setStreamSource(entry.stream, entry.vbPtr, entry.offset, entry.stride);
+    } else {
+        device.setIndices(entry.ibPtr);
+    }
+}
+
+/** Re-read one captured binding from the live device. Refreshed IN PLACE: Capture runs per
+ *  frame over every slot, and a replacement entry object per slot is churn with no reason. */
+export function refreshStreamStateEntry(device: StreamStateDevice, entry: StreamStateEntry): void {
+    if (entry.op === "streamSource") {
+        const b = device.getStreamBinding(entry.stream);
+        if (!b) return;
+        entry.vbPtr = b.ptr >>> 0;
+        entry.offset = b.offset >>> 0;
+        entry.stride = b.stride >>> 0;
+    } else {
+        entry.ibPtr = device.getBoundIndexBufferPtr() >>> 0;
+    }
+}
+
 export function applyStateBlockEntries(device: D3D9Device, entries: StateBlockEntry[], mem: Uint8Array): void {
     for (const entry of entries) {
         switch (entry.op) {
@@ -329,6 +417,13 @@ export function applyStateBlockEntries(device: D3D9Device, entries: StateBlockEn
                 break;
             case "pixelShaderConstantF":
                 device.setPixelShaderConstantFFromArray(entry.start, entry.data, mem);
+                break;
+            case "pixelShaderConstantB":
+                device.setPixelShaderConstantBFromArray(entry.start, entry.data);
+                break;
+            case "streamSource":
+            case "indices":
+                applyStreamStateEntry(device, entry);
                 break;
         }
     }
@@ -409,6 +504,15 @@ export function refreshCapturedEntries(device: D3D9Device, entries: StateBlockEn
                 entries[i] = { op: "pixelShaderConstantF", start: entry.start, data };
                 break;
             }
+            case "pixelShaderConstantB": {
+                const data = device.getPixelShaderConstantsB(entry.start, entry.data.length);
+                entries[i] = { op: "pixelShaderConstantB", start: entry.start, data };
+                break;
+            }
+            case "streamSource":
+            case "indices":
+                refreshStreamStateEntry(device, entry);
+                break;
         }
     }
 }
@@ -472,6 +576,10 @@ export function captureStateToEntries(device: D3D9Device, blockType: number): St
         if (vsConsts.length > 0) {
             entries.push({ op: "vertexShaderConstantF", start: 0, data: vsConsts });
         }
+    }
+
+    if (stateBlockCapturesStreamBindings(blockType)) {
+        captureStreamBindingEntries(device, entries);
     }
 
     return entries;

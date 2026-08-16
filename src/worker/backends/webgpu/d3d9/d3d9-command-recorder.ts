@@ -6,30 +6,58 @@
  */
 
 import { RenderFrame, RenderFramePool } from "../render-frame";
-import type { StreamVertexBinding } from "../shared/vertex-streams";
+import type { StreamBindingPlan, StreamVertexBinding } from "../shared/vertex-streams";
 
 export type { StreamVertexBinding };
 
-export interface DrawCommand {
-    pipelineId: number;
+/**
+ * Where a draw's vertex bindings come from. The two shapes are deliberately exclusive:
+ *
+ *  - `streams` — a plan covering EVERY slot the pipeline declares, slot 0 included, resolved
+ *    once from the stream binding table (the D3D9 backend).
+ *  - `gpuBuffer` + `extraStreams` — slot 0 passed separately from the rest, with the draw's
+ *    base vertex already folded into the extra offsets (the D3D8 backend's convention).
+ *
+ * Mixing them is what let slot 0 and slots 1+ be computed by different rules, so the type
+ * refuses the mixture rather than documenting against it.
+ */
+export interface PlannedVertexBindings {
+    /** Every vertex slot this draw binds, slot 0 included. */
+    streams: StreamBindingPlan;
+}
+
+export interface Slot0VertexBindings {
     gpuBuffer: GPUBuffer;
     bufferOffset: number;
     bufferSize: number;
+    /** Streams beyond 0 — bound with setVertexBuffer(slot, …) before the draw. */
+    extraStreams?: StreamVertexBinding[];
+}
+
+interface DrawCommandBase {
+    pipelineId: number;
     vertexCount: number;
     startVertex: number;
     /** Programmable (VS/PS) per-draw state index, or undefined for FFP. */
     bindStateIndex?: number;
     /** FFP per-draw state index (uniform block + stage-0 texture), or undefined. */
     ffpStateIndex?: number;
+    /** The guest's own stream-0 stride (diagnostic — see RenderFrame.pushDraw). */
+    guestStride?: number;
+}
+
+export type DrawCommand = DrawCommandBase & (PlannedVertexBindings | Slot0VertexBindings);
+
+export interface IndexedSlot0VertexBindings {
+    vbGpuBuffer: GPUBuffer;
+    vbOffset: number;
+    vbSize: number;
     /** Streams beyond 0 — bound with setVertexBuffer(slot, …) before the draw. */
     extraStreams?: StreamVertexBinding[];
 }
 
-export interface DrawIndexedCommand {
+interface DrawIndexedCommandBase {
     pipelineId: number;
-    vbGpuBuffer: GPUBuffer;
-    vbOffset: number;
-    vbSize: number;
     ibGpuBuffer: GPUBuffer;
     ibFormat: "uint16" | "uint32";
     indexCount: number;
@@ -37,9 +65,10 @@ export interface DrawIndexedCommand {
     baseVertex: number;
     bindStateIndex?: number;
     ffpStateIndex?: number;
-    /** Streams beyond 0 — bound with setVertexBuffer(slot, …) before the draw. */
-    extraStreams?: StreamVertexBinding[];
 }
+
+export type DrawIndexedCommand =
+    DrawIndexedCommandBase & (PlannedVertexBindings | IndexedSlot0VertexBindings);
 
 export class D3D9CommandRecorder {
     private frame: RenderFrame;
@@ -86,14 +115,27 @@ export class D3D9CommandRecorder {
         if (cmd.ffpStateIndex !== undefined) {
             this.frame.pushBindFfp(cmd.ffpStateIndex);
         }
+        this.bindVertexBuffers(cmd);
+        this.frame.pushDraw(cmd.vertexCount, cmd.startVertex, cmd.guestStride ?? 0);
+        this.drawCount++;
+    }
+
+    /** Bind every vertex slot the draw declares, whichever shape it supplied them in. */
+    private bindVertexBuffers(cmd: PlannedVertexBindings | Slot0VertexBindings): void {
+        if ("streams" in cmd) {
+            const plan = cmd.streams;
+            for (let i = 0; i < plan.count; i++) {
+                const b = plan.at(i);
+                this.frame.pushSetVertexBuffer(b.buffer, b.offset, b.size, b.slot);
+            }
+            return;
+        }
         this.frame.pushSetVertexBuffer(cmd.gpuBuffer, cmd.bufferOffset, cmd.bufferSize);
         if (cmd.extraStreams) {
             for (const s of cmd.extraStreams) {
                 this.frame.pushSetVertexBuffer(s.buffer, s.offset, s.size, s.slot);
             }
         }
-        this.frame.pushDraw(cmd.vertexCount, cmd.startVertex);
-        this.drawCount++;
     }
 
     /**
@@ -113,10 +155,13 @@ export class D3D9CommandRecorder {
         if (cmd.ffpStateIndex !== undefined) {
             this.frame.pushBindFfp(cmd.ffpStateIndex);
         }
-        this.frame.pushSetVertexBuffer(cmd.vbGpuBuffer, cmd.vbOffset, cmd.vbSize);
-        if (cmd.extraStreams) {
-            for (const s of cmd.extraStreams) {
-                this.frame.pushSetVertexBuffer(s.buffer, s.offset, s.size, s.slot);
+        if ("streams" in cmd) this.bindVertexBuffers(cmd);
+        else {
+            this.frame.pushSetVertexBuffer(cmd.vbGpuBuffer, cmd.vbOffset, cmd.vbSize);
+            if (cmd.extraStreams) {
+                for (const s of cmd.extraStreams) {
+                    this.frame.pushSetVertexBuffer(s.buffer, s.offset, s.size, s.slot);
+                }
             }
         }
         this.frame.pushSetIndexBuffer(cmd.ibGpuBuffer, cmd.ibFormat);

@@ -32,15 +32,16 @@ import {
     d3d9PerfInc, d3d9PerfSkip, d3d9PerfBackendInc, d3d9DropDraw,
     d3d9PerfStateBlockApply, d3d9PerfStateBlockCapture,
     d3d9PerfStateBlockWasmApply, d3d9PerfStateBlockWasmCapture,
-    d3d9PerfBufferLock, d3d9PerfBufferUpload, d3d9PerfVertexRangeOOB, d3d9PerfIndexRangeOOB,
+    d3d9PerfBufferLock, d3d9PerfBufferUpload, d3d9PerfIndexRangeOOB,
     d3d9PerfFfpUnimplemented, d3d9PerfFfpOp, d3d9PerfMaterialSet,
 } from "../../../modules/d3d9/d3d9-perf";
 import { addComRef, releaseComRef } from "../../../modules/d3d9/com-refs";
 import { isValidAddress } from "../../../core/memory/address-guard";
 import { Mem } from "../../../core/memory/mem-accessor";
-import { sanitizeViewport } from "../ddraw/types";
+import { fullTargetViewport, sanitizeViewport } from "../ddraw/types";
 import { frameProfiler } from "../../../core/frame-profiler";
 import { framePacer, decodeD3DPresentInterval, PRESENT_INTERVAL_ONE } from "../../../core/frame-pacer";
+import { D3DSWAPEFFECT_DISCARD, d3d9SwapEffectDiscardsBackBuffer, readD3d9SwapEffect } from "../../../modules/d3d9/presentation-params";
 import { statsOverlay } from "../../../core/stats-overlay";
 import {
     compileVertexShader, compilePixelShader, linkProgram, computeCubeMask,
@@ -83,12 +84,18 @@ import {
 } from "./d3d9-state-block";
 import { d3d9WasmArena, isWasmPathEnabled, isArenaVerifyDrainEnabled } from "./d3d9-wasm-arena";
 import {
-    collectExtraStreamBindings, declStreamsUsed, maxDeclStream, zeroStreamBuffer,
-    type StreamVertexBinding,
+    MAX_VERTEX_BUFFER_SLOTS, MAX_VERTEX_STREAMS, StreamBindingPlan, StreamBindingTable,
+    bindingSize, declStreamMask, layoutAttributeEnds, layoutStrides, slotArrayStride, slotMaskExceedsLimit,
+    slotsInMask, zeroStreamBuffer,
 } from "../shared/vertex-streams";
+import {
+    parseFvf, planFvf,
+    D3DFVF_XYZ, D3DFVF_XYZRHW, D3DFVF_POSITION_MASK, D3DFVF_NORMAL, D3DFVF_PSIZE, D3DFVF_DIFFUSE,
+    D3DFVF_SPECULAR, D3DFVF_TEX1,
+} from "./shader/fvf-layout";
 
-/** A *UP draw binds only the inline vertex data. */
-const UP_STREAM_SLOTS: ReadonlySet<number> = new Set([0]);
+/** A *UP draw binds only the inline vertex data — slot 0 and nothing else. */
+const UP_STREAM_SLOTS = 1;
 /** Size of the stand-in binding for a stream the declaration wants and the guest never bound. */
 const ZERO_STREAM_MIN_BYTES = 64 * 1024;
 
@@ -108,6 +115,9 @@ const D3DCULL_NONE = 1;
 const D3DCULL_CW = 2;
 const D3DCULL_CCW = 3;
 const D3DFMT_INDEX16 = 101;
+const PS_FLOAT_REGISTER_COUNT = 224;
+const PS_BOOL_REGISTER_COUNT = 16;
+const PS_BOOL_UNIFORM_BASE = PS_FLOAT_REGISTER_COUNT;
 
 // Alpha-test render states + D3DCMPFUNC ALWAYS (the no-op compare).
 const D3DRS_ALPHAREF = 24;
@@ -189,18 +199,27 @@ const D3DTOP_DISABLE = 1;
 // them is counted (censusFfpGaps) rather than silently transformed by the wrong matrix.
 const D3DRS_VERTEXBLEND = 151;
 const D3DRS_INDEXEDVERTEXBLENDENABLE = 167;
+
+// ps_1_x TEXBEM/TEXBEML take these from the *destination* texture stage.
+// Values are FLOAT-as-DWORD, not integer enum values.
+const D3DTSS_BUMPENVMAT00 = 7;
+const D3DTSS_BUMPENVMAT01 = 8;
+const D3DTSS_BUMPENVMAT10 = 9;
+const D3DTSS_BUMPENVMAT11 = 10;
+const D3DTSS_BUMPENVLSCALE = 22;
+const D3DTSS_BUMPENVLOFFSET = 23;
+
+const dwordFloatScratch = new ArrayBuffer(4);
+const dwordFloatBits = new Uint32Array(dwordFloatScratch);
+const dwordFloatValue = new Float32Array(dwordFloatScratch);
+function dwordAsFloat(value: number): number {
+    dwordFloatBits[0] = value >>> 0;
+    return dwordFloatValue[0]!;
+}
 // D3DLOCK_DISCARD — the guest is refilling the whole buffer; D3D gives it fresh memory
 // rather than overwriting bytes already-issued draws read (see uploadBufferVersion).
 const D3DLOCK_DISCARD = 0x00002000;
 
-const D3DFVF_XYZ = 0x0002;
-const D3DFVF_XYZRHW = 0x0004;
-const D3DFVF_POSITION_MASK = 0x000e;
-const D3DFVF_NORMAL = 0x0010;
-const D3DFVF_PSIZE = 0x0020;
-const D3DFVF_DIFFUSE = 0x0040;
-const D3DFVF_SPECULAR = 0x0080;
-const D3DFVF_TEX1 = 0x0100;
 // Point-sprite render states (float-as-DWORD except the two BOOLs). Canonical d3d9types.h ordinals.
 const D3DRS_POINTSIZE = 154;
 const D3DRS_POINTSIZE_MIN = 155;
@@ -258,7 +277,11 @@ export class D3D9Device {
         return System.getInstance().process!.getCurrentMemory();
     }
 
-    private stateTracker = new D3D9StateTracker();
+    /** THE per-slot stream state (see StreamBindingTable). Written only by setStreamSource. */
+    private readonly streams = new StreamBindingTable();
+    /** Reused per-draw binding plan — every slot a draw binds, slot 0 included. */
+    private readonly streamPlan = new StreamBindingPlan();
+    private stateTracker = new D3D9StateTracker(this.streams);
     private commandRecorder = new D3D9CommandRecorder(new RenderFramePool(2));
     private backendExecutor: D3D9BackendExecutor;
 
@@ -377,11 +400,21 @@ export class D3D9Device {
             }
         }
         if (newTarget !== null) this.rtNonBackThisFrame++;
-        if (newTarget === this.currentRtIndex && newFace === this.currentRtFace) return 0;
+        if (newTarget === this.currentRtIndex && newFace === this.currentRtFace) {
+            // D3D9 resets the viewport even when the caller rebinds the current target.
+            const { w, h } = this.getCurrentTargetSize();
+            this.viewport = fullTargetViewport(w, h);
+            return 0;
+        }
         // Flush everything drawn for the current target/face before switching.
         this.submitFrame(false);
         this.currentRtIndex = newTarget;
         this.currentRtFace = newFace;
+        // Per D3D9 SetRenderTarget, the new target starts with a full-target viewport.
+        // In particular, returning from a 512x512 bloom RT must not leave a 512x480
+        // viewport on a 1024x768 swap-chain backbuffer.
+        const { w, h } = this.getCurrentTargetSize();
+        this.viewport = fullTargetViewport(w, h);
         return 0;
     }
 
@@ -443,13 +476,7 @@ export class D3D9Device {
     private dipUpIndexRangeWarned = false;
 
     /** D3DCAPS9.MaxStreams from the caps blob we report (caps.ts, offset 188). */
-    static readonly MAX_STREAMS = 16;
-    private streamBindingPtr = new Uint32Array(D3D9Device.MAX_STREAMS);
-    private streamBindingOffset = new Uint32Array(D3D9Device.MAX_STREAMS);
-    private streamBindingStride = new Uint32Array(D3D9Device.MAX_STREAMS);
-    /** Vertex-buffer registry index per stream (null = nothing bound). The guest-visible
-     *  ptr/offset/stride above answer GetStreamSource; this is what a draw binds. */
-    private streamBindingIndex: (number | null)[] = new Array(D3D9Device.MAX_STREAMS).fill(null);
+    static readonly MAX_STREAMS = MAX_VERTEX_STREAMS;
     /** Reuse pool for DrawPrimitiveUP vertex buffers (lazily created — needs the device). */
     private vbPool: DynamicVbPool | null = null;
 
@@ -467,7 +494,10 @@ export class D3D9Device {
     private psShaderRegistry = new Map<number, CompiledPs>();
     private psNextHandle = 1;
     private activePixelShader: number = 0;
-    private psConstants = new Float32Array(224 * 4);   // c0-c223 (ps_3_0 ceiling)
+    /** Harness-only hybrid fragment output diagnostic: 0 normal, 1 tex0, 2 colour, 3 white. */
+    private hybridDebugOutput = 0;
+    // c0-c223 followed by b0-b15 expanded to vec4(0|1) for WGSL uniform alignment.
+    private psConstants = new Float32Array((PS_FLOAT_REGISTER_COUNT + PS_BOOL_REGISTER_COUNT) * 4);
     private psConstantBits = new Uint32Array(this.psConstants.buffer);
     private psConstantsVersion = 0;
 
@@ -487,7 +517,9 @@ export class D3D9Device {
     private lastCaptureIndex = -1;
     private _lrVs = 0; private _lrPs = 0; private _lrDecl = 0; private _lrStride: number | null = null;
     private _lrStateBits = 0; private _lrTopo = ""; private _lrForceCull = false;
-    private _lrBlend = ""; private _lrAlpha = ""; private _lrDepth = ""; private _lrCube = 0; private _lrProj = 0; private _lrPipelineId = -1;
+    private _lrBlend = ""; private _lrAlpha = ""; private _lrDepth = ""; private _lrCube = 0; private _lrProj = 0; private _lrHybridStages = 0; private _lrPipelineId = -1;
+    /** Identity of the vertex input: which slots the layout has and each one's stride. */
+    private _lrStreamHash = 0;
 
     // Vertex declaration registry — stores raw D3DVERTEXELEMENT9 data
     private vsDeclRegistry = new Map<number, RawVertexElement[]>();
@@ -549,9 +581,9 @@ export class D3D9Device {
         this.activePixelShaderComPtr = this.replaceHeldComRef(this.activePixelShaderComPtr, 0);
         this.activeVertexDeclComPtr = this.replaceHeldComRef(this.activeVertexDeclComPtr, 0);
         this.boundIndexPtr = this.replaceHeldComRef(this.boundIndexPtr, 0);
-        for (let i = 0; i < this.streamBindingPtr.length; i++) {
-            this.streamBindingPtr[i] = this.replaceHeldComRef(this.streamBindingPtr[i]!, 0);
-            this.streamBindingIndex[i] = null;
+        for (let i = 0; i < MAX_VERTEX_STREAMS; i++) {
+            this.replaceHeldComRef(this.streams.ptr[i]!, 0);
+            this.streams.clear(i);
         }
         for (let i = 0; i < this.boundTexturePtrs.length; i++) {
             this.boundTexturePtrs[i] = this.replaceHeldComRef(this.boundTexturePtrs[i]!, 0);
@@ -947,7 +979,7 @@ export class D3D9Device {
     setPixelShaderConstantF(startRegister: number, pConstantData: number, vector4fCount: number, mem: Uint8Array): number {
         d3d9PerfInc("setPixelShaderConstantF");
         const baseIdx = startRegister * 4;
-        const max = this.psConstants.length;
+        const max = PS_FLOAT_REGISTER_COUNT * 4;
         const n = vector4fCount * 4;
         if (this.recordingStateBlock) {
             const data = this.readGuestConstantsForRecording(pConstantData, Math.min(n, max - baseIdx), mem);
@@ -964,6 +996,51 @@ export class D3D9Device {
             if (count > 0) d3d9WasmArena.setPixelShaderConstantF(baseIdx, this.psConstants.subarray(baseIdx, baseIdx + count));
         }
         return 0;
+    }
+
+    setPixelShaderConstantB(startRegister: number, pConstantData: number, boolCount: number, mem: Uint8Array): number {
+        if (startRegister < 0 || boolCount < 0 || startRegister + boolCount > PS_BOOL_REGISTER_COUNT ||
+            !pConstantData || !isValidAddress(mem, pConstantData, boolCount * 4, "r")) return D3DERR_INVALIDCALL;
+        const read = (i: number): number => ((Mem.readUint32(pConstantData + i * 4) ?? 0) !== 0 ? 1 : 0);
+        if (this.recordingStateBlock) {
+            const data = new Int32Array(boolCount);
+            for (let i = 0; i < boolCount; i++) data[i] = read(i);
+            this.recordStateBlock({ op: "pixelShaderConstantB", start: startRegister, data });
+            return D3D_OK;
+        }
+        for (let i = 0; i < boolCount; i++) this.storePixelShaderConstantB(startRegister + i, read(i));
+        return D3D_OK;
+    }
+
+    /** Replay one recorded BOOL register (state-block Apply). */
+    setPixelShaderConstantBFromArray(startRegister: number, data: Int32Array): number {
+        if (startRegister < 0 || startRegister + data.length > PS_BOOL_REGISTER_COUNT) return D3DERR_INVALIDCALL;
+        for (let i = 0; i < data.length; i++) this.storePixelShaderConstantB(startRegister + i, data[i] ? 1 : 0);
+        return D3D_OK;
+    }
+
+    /** Current values of `count` BOOL registers from `startRegister` (state-block Capture). */
+    getPixelShaderConstantsB(startRegister: number, count: number): Int32Array {
+        const out = new Int32Array(Math.max(0, count));
+        for (let i = 0; i < out.length; i++) {
+            const reg = startRegister + i;
+            if (reg < 0 || reg >= PS_BOOL_REGISTER_COUNT) continue;
+            out[i] = this.psConstants[(PS_BOOL_UNIFORM_BASE + reg) * 4] ? 1 : 0;
+        }
+        return out;
+    }
+
+    /** A b# register occupies a whole vec4 in the PS uniform bank — all four lanes carry it. */
+    private storePixelShaderConstantB(register: number, value: number): void {
+        const base = (PS_BOOL_UNIFORM_BASE + register) * 4;
+        let changed = false;
+        for (let lane = 0; lane < 4; lane++) {
+            if (this.psConstants[base + lane] !== value) {
+                this.psConstants[base + lane] = value;
+                changed = true;
+            }
+        }
+        if (changed) this.psConstantsVersion++;
     }
 
     setVertexShaderConstantFFromArray(startRegister: number, data: Float32Array, _mem: Uint8Array): number {
@@ -1013,7 +1090,9 @@ export class D3D9Device {
             this.recordStateBlock({ op: "pixelShaderConstantF", start: startRegister, data: new Float32Array(data) });
             return 0;
         }
-        if (this.copyShaderConstantsFromArray(this.psConstants, startRegister, data)) {
+        // State-block float constants must not spill into the packed b# bank.
+        const floatBank = this.psConstants.subarray(0, PS_FLOAT_REGISTER_COUNT * 4);
+        if (this.copyShaderConstantsFromArray(floatBank, startRegister, data)) {
             this.psConstantsVersion++;
         }
         if (d3d9WasmArena.isInitialized()) {
@@ -1066,7 +1145,7 @@ export class D3D9Device {
     declCensus(): unknown {
         const decls: { handle: number; draws: number; drops: unknown[]; [k: string]: unknown }[] = [];
         for (const [handle, elements] of this.vsDeclRegistry) {
-            const streams = declStreamsUsed(elements);
+            const streams = slotsInMask(declStreamMask(elements));
             // What the FFP vertex path will NOT turn into an attribute. Every stream is bound
             // now, so a stream number is no longer a drop by itself — only a semantic the
             // shader builder has no input for is. Keep this in step with buildShaderFromDecl:
@@ -1087,8 +1166,8 @@ export class D3D9Device {
                 .filter(e => indexed(e) && e.usageIndex === 1)
                 .map(describe);
             // Streams the declaration reads that nothing is bound to — they draw against a
-            // zero-filled stand-in (collectFfpExtraStreams), which reads as black/untextured.
-            const unbound = streams.filter(s => s !== 0 && this.streamBindingIndex[s] === null);
+            // zero-filled stand-in (resolveDrawStreams), which reads as black/untextured.
+            const unbound = streams.filter(s => !this.streams.isBound(s));
             decls.push({
                 handle,
                 draws: this.declDrawCounts.get(handle) ?? 0,
@@ -1143,7 +1222,10 @@ export class D3D9Device {
      *  glance whether a title uses texldp (projected spotlight/reflection). Consumed by
      *  dbg.d3d9DumpShaders(); kept here so the registries stay private. */
     dumpShaders(): {
-        vs: Array<{ handle: number; version: string; instrs: number; active: boolean }>;
+        vs: Array<{
+            handle: number; version: string; instrs: number; active: boolean;
+            writesColor: boolean[]; writesTexcoord: number[]; disasm: string[];
+        }>;
         ps: Array<{
             handle: number; version: string; instrs: number; samplers: number[];
             projectedTex: number; biasedTex: number; active: boolean; disasm: string[];
@@ -1158,6 +1240,11 @@ export class D3D9Device {
             version: `vs_${c.prog.major}_${c.prog.minor}`,
             instrs: c.prog.instructions.length,
             active: handle === this.activeVertexShader,
+            writesColor: [...c.analysis.writesColor],
+            writesTexcoord: [...c.analysis.writesTexcoord].sort((a, b) => a - b),
+            // Keep the numeric opcode in the diagnostic. It makes the census useful even
+            // when an optimized build strips/const-folds an enum-name lookup.
+            disasm: c.prog.instructions.map(ins => `${opName(ins.opcode)}(${ins.opcode})`),
         }));
         const ps = [...this.psShaderRegistry.entries()].map(([handle, c]) => {
             let projectedTex = 0, biasedTex = 0;
@@ -1205,28 +1292,35 @@ export class D3D9Device {
         // Unknown pointer: clear the stream with the error (see setTexture) — a stale
         // vertex buffer would otherwise feed the next draw.
         const unknown = vbPtr !== 0 && index === null;
-        // Record the guest-visible binding for every stream — GetStreamSource must report
-        // back exactly what was set even for streams the draw path below ignores.
-        this.streamBindingPtr[streamNumber] = this.replaceHeldComRef(this.streamBindingPtr[streamNumber]!, unknown ? 0 : vbPtr);
-        this.streamBindingOffset[streamNumber] = unknown ? 0 : offset >>> 0;
-        this.streamBindingStride[streamNumber] = unknown ? 0 : stride >>> 0;
-        this.streamBindingIndex[streamNumber] = unknown ? null : index;
-        // Streams beyond 0 feed the draw through collectFfpExtraStreams; their strides shape
-        // the per-stream vertex layout, so a change there invalidates the cached pipeline.
-        if (streamNumber !== 0) {
+        if (this.recordingStateBlock) {
+            if (unknown) return D3DERR_INVALIDCALL;
+            this.recordStateBlock({
+                op: "streamSource", stream: streamNumber,
+                vbPtr, offset: offset >>> 0, stride: stride >>> 0,
+            });
+            return D3D_OK;
+        }
+        // ONE writer, every slot: GetStreamSource, the pipeline's per-slot strides and the
+        // draw's bindings all read this table, so slot 0 cannot drift from slots 1+.
+        const held = this.replaceHeldComRef(this.streams.ptr[streamNumber]!, unknown ? 0 : vbPtr);
+        const changed = this.streams.set(
+            streamNumber, held, unknown || index === null ? -1 : index,
+            unknown ? 0 : offset >>> 0, unknown ? 0 : stride >>> 0,
+        );
+        if (!changed) d3d9PerfSkip("setStreamSource");
+        else this.stateTracker.markStreamsDirty();
+        // Every slot's stride shapes the per-slot vertex layout, so a change to any of them
+        // invalidates the cached pipeline.
+        if (changed) {
             this.currentPipelineKey = null;
             this.currentPipelineId = null;
-            return unknown ? D3DERR_INVALIDCALL : D3D_OK;
         }
-
-        if (index === null) {
-            if (d3d9WasmArena.isInitialized()) d3d9WasmArena.setStreamSource(0, 0, 0);
-            if (!this.stateTracker.clearStreamSource()) d3d9PerfSkip("setStreamSource");
-            return unknown ? D3DERR_INVALIDCALL : D3D_OK;
+        if (streamNumber === 0 && d3d9WasmArena.isInitialized()) {
+            const bound = this.streams.bufferIndex[0]!;
+            d3d9WasmArena.setStreamSource(
+                bound < 0 ? 0 : bound, this.streams.offsetBytes[0]!, this.streams.strideBytes[0]!);
         }
-        if (d3d9WasmArena.isInitialized()) d3d9WasmArena.setStreamSource(index, offset, stride);
-        if (!this.stateTracker.setStreamSource(index, offset, stride)) d3d9PerfSkip("setStreamSource");
-        return D3D_OK;
+        return unknown ? D3DERR_INVALIDCALL : D3D_OK;
     }
 
     /** Vertex buffer COM ptr / offset / stride last bound to a stream (all zero = unbound).
@@ -1234,9 +1328,9 @@ export class D3D9Device {
     getStreamBinding(streamNumber: number): { ptr: number; offset: number; stride: number } | null {
         if (streamNumber >= D3D9Device.MAX_STREAMS) return null;
         return {
-            ptr: this.streamBindingPtr[streamNumber]!,
-            offset: this.streamBindingOffset[streamNumber]!,
-            stride: this.streamBindingStride[streamNumber]!,
+            ptr: this.streams.ptr[streamNumber]!,
+            offset: this.streams.offsetBytes[streamNumber]!,
+            stride: this.streams.strideBytes[streamNumber]!,
         };
     }
 
@@ -1318,7 +1412,6 @@ export class D3D9Device {
     /** Flags of the most recent Lock per buffer — diagnostic only (see D3D9BufferPerf). */
     private vbLastLockFlags = new Map<number, number>();
     private ibLastLockFlags = new Map<number, number>();
-    private vertexRangeOobLogs = 0;
     private bufferFrameSerial = -1;
 
     /**
@@ -1397,7 +1490,10 @@ export class D3D9Device {
         const slots = isVb ? this.vbSlotThisFrame : this.ibSlotThisFrame;
         const uploaded = isVb ? this.vbUploadedThisFrame : this.ibUploadedThisFrame;
         const discarded = isVb ? this.discardedVb : this.discardedIb;
-        const usage = (isVb ? GPUBufferUsage.VERTEX : GPUBufferUsage.INDEX) | GPUBufferUsage.COPY_DST;
+        // COPY_SRC: a slot a draw outruns is padded by COPYING its real bytes into a longer
+        // buffer with a zeroed tail (executor robustness padding), which needs to read this one.
+        const usage = (isVb ? GPUBufferUsage.VERTEX : GPUBufferUsage.INDEX)
+            | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
         const size = store.getSize(index);
         // GPU-side ring buffers are padded to a 4-byte multiple to admit the padded
         // writeBuffer the flush performs (see RenderFrame.queueUpload) — a write past the
@@ -1680,6 +1776,11 @@ export class D3D9Device {
         // Unknown pointer: clear the binding with the error (see setTexture) — a stale
         // index buffer would otherwise index the next draw's vertices.
         const unknown = ibPtr !== 0 && index === null;
+        if (this.recordingStateBlock) {
+            if (unknown) return D3DERR_INVALIDCALL;
+            this.recordStateBlock({ op: "indices", ibPtr });
+            return D3D_OK;
+        }
         this.boundIndexPtr = this.replaceHeldComRef(this.boundIndexPtr, unknown ? 0 : ibPtr);
         if (index === null) {
             if (d3d9WasmArena.isInitialized()) d3d9WasmArena.setIndices(0, 0);
@@ -2484,19 +2585,18 @@ export class D3D9Device {
      *
      * ONE definition, because the shader and the frame capture must not be able to disagree:
      * the declaration scan applies the same two rules buildShaderFromDecl does — usage +
-     * usageIndex, and the caller's `streamAllow` filter. Without the filter a colour living in
-     * a stream the pipeline does not declare would resolve to COLOR1 here while the shader has
-     * no colour attribute for it, and the material colour would silently drop out.
+     * usageIndex, and the caller's slot mask. Without the mask a colour living in a slot the
+     * pipeline does not declare would resolve to COLOR1 here while the shader has no colour
+     * attribute for it, and the material colour would silently drop out.
      */
     private resolveFfpVertexColors(
-        streamAllow: ReadonlySet<number> | null = null,
+        slotMask: number = this.activeSlotMask(),
     ): { hasColor: boolean; hasSpecular: boolean; hasNormal: boolean } {
         const decl = this.activeVertexDecl > 0 ? this.vsDeclRegistry.get(this.activeVertexDecl) : null;
         if (decl && decl.length > 0) {
             // Predicate rather than a filtered copy — this runs per draw.
             const has = (usage: number, index: number): boolean => decl.some(e =>
-                e.usage === usage && e.usageIndex === index
-                && (streamAllow === null || streamAllow.has(e.stream)));
+                e.usage === usage && e.usageIndex === index && ((slotMask >>> e.stream) & 1) !== 0);
             return {
                 hasColor: has(DECLUSAGE_COLOR_FFP, 0),
                 hasSpecular: has(DECLUSAGE_COLOR_FFP, 1),
@@ -2591,14 +2691,14 @@ export class D3D9Device {
         vpW: number,
         vpH: number,
         stages: FfpResolvedStage[] = this.resolveFfpStages(this.activeStageCount()),
-        /** The stream restriction the pipeline was built with — see resolveFfpVertexColors. */
-        streamAllow: ReadonlySet<number> | null = null,
+        /** The slot mask the pipeline was built with — see resolveFfpVertexColors. */
+        slotMask: number = this.activeSlotMask(),
     ): Float32Array {
         const rs = (s: number) => this.stateTracker.getRenderState(s);
 
         const fvf = this.stateTracker.getFVF();
         const decl = this.activeVertexDecl > 0 ? this.vsDeclRegistry.get(this.activeVertexDecl) : null;
-        const { hasColor, hasSpecular, hasNormal: hasNormalDecl } = this.resolveFfpVertexColors(streamAllow);
+        const { hasColor, hasSpecular, hasNormal: hasNormalDecl } = this.resolveFfpVertexColors(slotMask);
         // Pre-transformed position — decides which fog the FFP runs (see resolveFfpFogMode).
         // Same POSITIONT-or-POSITION+FLOAT4 rule buildShaderFromDecl uses.
         const isRHW = decl && decl.length > 0
@@ -2753,6 +2853,7 @@ export class D3D9Device {
         // Reset re-declares the swap interval (PresentationInterval @ +52) like every other
         // present parameter — an in-game vsync toggle is exactly this call.
         this.setPresentationInterval(view.getUint32(pPresentationParameters + 52, true));
+        this.setSwapEffect(readD3d9SwapEffect(view, pPresentationParameters));
 
         Logger.log(
             LogCategory.D3D9,
@@ -2771,8 +2872,7 @@ export class D3D9Device {
     setViewport(pViewport: number, mem: Uint8Array): number {
         if (!pViewport || !isValidAddress(mem, pViewport, 24)) return 0x8876086c;
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-        const targetW = this.viewport.width || 800;
-        const targetH = this.viewport.height || 600;
+        const { w: targetW, h: targetH } = this.getCurrentTargetSize();
         this.viewport = sanitizeViewport({
             x: view.getUint32(pViewport + 0, true),
             y: view.getUint32(pViewport + 4, true),
@@ -2910,11 +3010,11 @@ export class D3D9Device {
      * every channel comes from the material, the lights and the ambient. A black surface there
      * is arithmetic, not a render bug, and telling the two apart needs the operands.
      */
-    private captureLighting(streamAllow: ReadonlySet<number> | null = null): Record<string, unknown> {
+    private captureLighting(slotMask: number = this.activeSlotMask()): Record<string, unknown> {
         const rs = (n: number): number => this.stateTracker.getRenderState(n);
         const m = this.parseMaterial();
         const c = (x: FfpColor): number[] => [x.r, x.g, x.b, x.a].map((v) => Math.round(v * 1000) / 1000);
-        const { hasColor, hasSpecular } = this.resolveFfpVertexColors(streamAllow);
+        const { hasColor, hasSpecular } = this.resolveFfpVertexColors(slotMask);
         const colorVertex = rs(D3DRS_COLORVERTEX) !== 0;
         // Enabled AND actually supplied: LightEnable on an index the app never SetLight'd
         // contributes nothing, so counting the enable bits alone would overstate the light rig.
@@ -2944,9 +3044,9 @@ export class D3D9Device {
         primitiveType: number,
         primitiveCount: number,
         verts?: { data: Uint8Array; offset: number; stride: number; count: number },
-        /** The stream restriction this draw's pipeline will be built with, when the caller
-         *  already knows it — so the reported colour sources match the shader's. */
-        streamAllow: ReadonlySet<number> | null = null,
+        /** The slot mask this draw's pipeline will be built with, when the caller already
+         *  knows it — so the reported colour sources match the shader's. */
+        slotMask: number = this.activeSlotMask(),
     ): void {
         if (!frameCapture.isCapturing()) return;
         const stage0 = this.stateTracker.getTexture(0);
@@ -2956,6 +3056,7 @@ export class D3D9Device {
         const size = this.getCurrentTargetSize();
         const fvf = this.stateTracker.getFVF();
         const isRhw = (fvf & D3DFVF_POSITION_MASK) === D3DFVF_XYZRHW;
+        const activeVs = this.getActiveVsShader();
         // Every field here is READ, not defaulted. D3D9 keeps one flat render-state array, so
         // the depth/blend/alpha/cull/lighting/fog states are as available as on the FFP path;
         // reporting them as schema zeros made a capture say "depth test off on every draw".
@@ -2965,6 +3066,10 @@ export class D3D9Device {
             primitiveTypeName: `D3DPT(${primitiveType})`,
             vertexCount: verts ? verts.count : primitiveCount * 3,
             programmable: (this as any).isProgrammable?.() ?? false,
+            vertexShader: this.activeVertexShader,
+            pixelShader: this.activePixelShader,
+            vsWritesColor: activeVs ? [...activeVs.analysis.writesColor] : [],
+            vsWritesTexcoord: activeVs ? [...activeVs.analysis.writesTexcoord].sort((a, b) => a - b) : [],
             derivedUseTexture: stage0 != null,
             vertexType: fvf,
             isRHW: isRhw,
@@ -3011,7 +3116,7 @@ export class D3D9Device {
             // came from: SELECTARG1 is the texture on one draw and the vertex colour on the
             // next, and "the alpha reaching the blender" is exactly that distinction.
             stages: this.captureStageArgs(),
-            lighting: this.captureLighting(streamAllow),
+            lighting: this.captureLighting(slotMask),
             // The bound stages as GUEST HANDLES — the identity dumpTexture/textures() take, so a
             // capture row leads straight to the pixels. Stage 1 is called out because the FFP
             // path renders stage 0 only: a draw with a stage-1 texture bound is one whose second
@@ -3020,8 +3125,13 @@ export class D3D9Device {
             warnings: [
                 ...(stage0 != null ? [`tex0 handle=0x${this.textures.getHandle(stage0).toString(16)}`] : []),
                 ...(stage1 != null
-                    ? [`stage1 texture bound (handle=0x${this.textures.getHandle(stage1).toString(16)}) — FFP renders stage 0 only`]
+                    ? [`tex1 handle=0x${this.textures.getHandle(stage1).toString(16)}`]
                     : []),
+                `tss0 cop=${this.getTextureStageState(0, D3DTSS_COLOROP)} c1=${this.getTextureStageState(0, 2)} c2=${this.getTextureStageState(0, 3)} ` +
+                    `aop=${this.getTextureStageState(0, 4)} a1=${this.getTextureStageState(0, 5)} a2=${this.getTextureStageState(0, 6)} tci=${this.getTextureStageState(0, D3DTSS_TEXCOORDINDEX)}`,
+                `tss1 cop=${this.getTextureStageState(1, D3DTSS_COLOROP)} c1=${this.getTextureStageState(1, 2)} c2=${this.getTextureStageState(1, 3)} ` +
+                    `aop=${this.getTextureStageState(1, 4)} a1=${this.getTextureStageState(1, 5)} a2=${this.getTextureStageState(1, 6)} tci=${this.getTextureStageState(1, D3DTSS_TEXCOORDINDEX)}`,
+                `colorWrite=0x${rs(168).toString(16)}`,
             ],
         });
     }
@@ -3048,9 +3158,9 @@ export class D3D9Device {
         for (let i = 0; i < n; i++) {
             const base = offset + i * stride;
             if (base + stride > data.byteLength) break;
-            // The stream stride can be SMALLER than the FVF's packed size — resolvePipelineId
-            // already takes max(arrayStride, streamStride) for exactly that reason — so an
-            // FVF-derived offset is not guaranteed to sit inside this vertex. DataView throws
+            // The stream stride can be SMALLER than the FVF's packed size (planFvf drops the
+            // components that fall outside it), so an FVF-derived offset is not guaranteed to
+            // sit inside this vertex. DataView throws
             // on an out-of-range read, and this is capture-gated: an unclamped read would kill
             // the very draw captureFrame() was armed to explain. Read only what fits.
             const end = Math.min(base + stride, data.byteLength);
@@ -3227,9 +3337,17 @@ export class D3D9Device {
         device.queue.writeBuffer(gpuBuffer, 0, view);
 
         const pipelineId = this.getPointSpritePipelineId(outFvf);
-        const ffpStateIndex = this.captureFfpDrawState();
+        if (pipelineId < 0) {
+            this.vbPool.release(gpuBuffer);
+            d3d9DropDraw("pointSprite:noPipeline");
+            return false;
+        }
+        // The synthetic FVF pipeline declares slot 0 alone, so the expansion binds slot 0 alone.
+        const ffpStateIndex = this.captureFfpDrawState(UP_STREAM_SLOTS);
+        this.streamPlan.reset();
+        this.streamPlan.add(0, gpuBuffer, 0, outBytes);
         this.commandRecorder.recordDraw({
-            pipelineId, gpuBuffer, bufferOffset: 0, bufferSize: outBytes,
+            pipelineId, streams: this.streamPlan,
             vertexCount: outVerts, startVertex: 0,
             ffpStateIndex,
         });
@@ -3269,8 +3387,9 @@ export class D3D9Device {
         const vbData = this.vertexBuffers.getData(vbIndex);
         if (!vbData) return d3d9DropDraw("drawPrimitive:noVertexData");
 
+        const vertexCount = primitiveCount * 3;
         const device = this.backend.getDevice()!;
-        const gpuBuffer = this.uploadBufferVersion(vbIndex, vbData, "vb", device);
+        const slotMask = this.activeSlotMask();
 
         // WASM arena. ONLY reachable for
         // D3DPT_TRIANGLELIST (the early-return above), so topology=0/forceCullNone=false,
@@ -3279,32 +3398,31 @@ export class D3D9Device {
         // can skip the legacy string-key path entirely (see resolveProgrammablePipeline).
         let arenaKey: number | undefined;
         if (d3d9WasmArena.isInitialized()) {
-            arenaKey = d3d9WasmArena.recordDraw(0, primitiveCount * 3, startVertex, streamSource.stride, false);
+            arenaKey = d3d9WasmArena.recordDraw(0, vertexCount, startVertex, streamSource.stride, false);
         }
 
         let pipelineId: number;
         let bindStateIndex: number | undefined;
         let ffpStateIndex: number | undefined;
-        let extraStreams: StreamVertexBinding[] | undefined;
         if (this.isProgrammable()) {
-            pipelineId = this.resolveProgrammablePipeline("triangle-list", false, undefined, arenaKey);
+            pipelineId = this.resolveProgrammablePipeline("triangle-list", false, undefined, arenaKey, slotMask);
             if (pipelineId < 0) return d3d9DropDraw("drawIndexed:noPipeline");
             bindStateIndex = this.captureDrawState();
         } else {
-            pipelineId = this.getPipelineId(streamSource.stride);
-            ffpStateIndex = this.captureFfpDrawState();
-            extraStreams = this.collectFfpExtraStreams();
+            pipelineId = this.getPipelineId(slotMask);
+            if (pipelineId < 0) return d3d9DropDraw("drawPrimitive:noPipeline");
+            ffpStateIndex = this.captureFfpDrawState(slotMask);
         }
+        // Slot 0 is resolved by the same code as every other slot — including its binding
+        // size, which runs to the END of the buffer (the GPU applies startVertex itself).
         this.commandRecorder.recordDraw({
             pipelineId,
-            gpuBuffer,
-            bufferOffset: streamSource.offset,
-            bufferSize: this.vertexBuffers.getSize(vbIndex) - streamSource.offset,
-            vertexCount: primitiveCount * 3,
+            streams: this.resolveDrawStreams(slotMask, device),
+            vertexCount,
             startVertex,
+            guestStride: streamSource.stride,
             bindStateIndex,
             ffpStateIndex,
-            extraStreams,
         });
         this.drawCount += 1;
 
@@ -3415,9 +3533,11 @@ export class D3D9Device {
         const finalData = this.ensureConversionBuffer(finalVertexCount * stride);
         gatherVertices(finalData, srcData, 0, order, finalVertexCount, stride);
 
-        const extraStreams = this.expandExtraStreamsByOrder(order, finalVertexCount, startVertex);
-        if (extraStreams === null) return d3d9DropDraw("strip:extraStreamUnreadable");
-        return this.recordConvertedDraw(finalData, finalVertexCount, stride, topology, extraStreams);
+        const slotMask = this.activeSlotMask();
+        if (!this.expandStreamsByOrder(slotMask, order, finalVertexCount, startVertex)) {
+            return d3d9DropDraw("strip:extraStreamUnreadable");
+        }
+        return this.recordConvertedDraw(finalData, finalVertexCount, stride, topology, slotMask);
     }
 
     /**
@@ -3475,9 +3595,11 @@ export class D3D9Device {
         const finalData = this.ensureConversionBuffer(finalVertexCount * stride);
         gatherVertices(finalData, vb, base, order, finalVertexCount, stride);
 
-        const extraStreams = this.expandExtraStreamsByOrder(order, finalVertexCount, baseVertexIndex);
-        if (extraStreams === null) return d3d9DropDraw("indexedStrip:extraStreamUnreadable");
-        return this.recordConvertedDraw(finalData, finalVertexCount, stride, shape.topology, extraStreams);
+        const slotMask = this.activeSlotMask();
+        if (!this.expandStreamsByOrder(slotMask, order, finalVertexCount, baseVertexIndex)) {
+            return d3d9DropDraw("indexedStrip:extraStreamUnreadable");
+        }
+        return this.recordConvertedDraw(finalData, finalVertexCount, stride, shape.topology, slotMask);
     }
 
     /** Scratch for the strip/fan rewind permutation (grown, never per-draw allocated). */
@@ -3488,39 +3610,44 @@ export class D3D9Device {
     }
 
     /**
-     * Rewind the streams beyond 0 with the same vertex permutation a CPU-converted draw
-     * applied to stream 0, into pooled buffers. Returns undefined when the declaration is
-     * single-stream (the overwhelmingly common case, no work done), or null when a stream
-     * cannot be read — the caller then drops the draw rather than binding vertices that do
-     * not correspond to the ones stream 0 supplies.
+     * Rewind the slots beyond 0 with the same vertex permutation a CPU-converted draw applied
+     * to slot 0, into pooled buffers, and put them in the draw plan (slot 0 is added by
+     * recordConvertedDraw once its own pooled buffer exists).
+     *
+     * The rewind IS the fetch — the resulting draw runs from vertex 0 — so the source offset
+     * here legitimately folds in startVertex/baseVertex. That is the one place it may be
+     * folded: nothing downstream steps these buffers again.
+     *
+     * False when a slot cannot be read: the caller drops the draw rather than binding vertices
+     * that do not correspond to the ones slot 0 supplies.
      */
-    private expandExtraStreamsByOrder(
+    private expandStreamsByOrder(
+        slotMask: number,
         order: Uint32Array,
         vertexCount: number,
         startVertex: number,
-    ): StreamVertexBinding[] | undefined | null {
-        const decl = this.activeVertexDecl > 0 ? this.vsDeclRegistry.get(this.activeVertexDecl) : null;
-        if (!decl || maxDeclStream(decl) === 0) return undefined;
+    ): boolean {
+        this.streamPlan.reset();
+        if ((slotMask & ~1) === 0) return true;
         const device = this.backend.getDevice();
-        if (!device) return null;
+        if (!device) return false;
         if (!this.vbPool) this.vbPool = new DynamicVbPool(device);
 
         let maxIndex = 0;
         for (let v = 0; v < vertexCount; v++) if (order[v]! > maxIndex) maxIndex = order[v]!;
 
-        const out: StreamVertexBinding[] = [];
-        for (const stream of declStreamsUsed(decl)) {
-            if (stream === 0) continue;
-            const index = this.streamBindingIndex[stream];
-            const stride = this.streamBindingStride[stream]!;
-            const data = index !== null ? this.vertexBuffers.getData(index) : null;
+        for (let slot = 1; slot < MAX_VERTEX_STREAMS; slot++) {
+            if (((slotMask >>> slot) & 1) === 0) continue;
+            const index = this.streams.bufferIndex[slot]!;
+            const stride = this.streams.strideBytes[slot]!;
+            const data = index >= 0 ? this.vertexBuffers.getData(index) : null;
             if (!data || stride <= 0) {
-                Logger.warn(LogCategory.D3D9, `converted draw: stream ${stream} unbound/unsized — dropping draw`);
-                return null;
+                Logger.warn(LogCategory.D3D9, `converted draw: stream ${slot} unbound/unsized — dropping draw`);
+                return false;
             }
-            const base = this.streamBindingOffset[stream]! + startVertex * stride;
+            const base = this.streams.offsetBytes[slot]! + startVertex * stride;
             const size = vertexCount * stride;
-            if (base < 0 || base + maxIndex * stride + stride > data.byteLength) return null;
+            if (base < 0 || base + maxIndex * stride + stride > data.byteLength) return false;
             // Pooled scratch, refilled per stream: queue.writeBuffer copies at call time, so
             // one buffer can serve every stream of every draw. Write length padded to 4 —
             // writeBuffer throws on any other size.
@@ -3530,9 +3657,9 @@ export class D3D9Device {
             const buffer = this.vbPool.acquire(Math.max(16, paddedSize));
             device.queue.writeBuffer(buffer, 0, bytes, 0, paddedSize);
             this.commandRecorder.registerPooledBuffer(buffer);
-            out.push({ slot: stream, buffer, offset: 0, size });
+            this.streamPlan.add(slot, buffer, 0, size);
         }
-        return out;
+        return true;
     }
 
     /** Scratch for the extra-stream rewind, pooled like ensureConversionBuffer. */
@@ -3553,7 +3680,9 @@ export class D3D9Device {
         finalVertexCount: number,
         stride: number,
         topology: "triangle-list" | "line-list",
-        extraStreams?: StreamVertexBinding[],
+        /** The slots the plan already holds (slots 1+ rewound by expandStreamsByOrder); slot 0
+         *  is this call's repacked buffer. 1 = slot 0 alone. */
+        slotMask = 1,
     ): number {
         const device = this.backend.getDevice();
         if (!device) return 0;
@@ -3562,31 +3691,30 @@ export class D3D9Device {
         if (!this.vbPool) this.vbPool = new DynamicVbPool(device);
         const gpuBuffer = this.vbPool.acquire(bufferSize);
         device.queue.writeBuffer(gpuBuffer, 0, finalData);
+        // Slot 0's stride is this draw's own repacked one, so it is the single legitimate
+        // stride override — every other slot still steps by what SetStreamSource bound.
+        this.streamPlan.add(0, gpuBuffer, 0, finalData.byteLength);
 
         let pipelineId: number;
         let bindStateIndex: number | undefined;
         let ffpStateIndex: number | undefined;
         if (this.isProgrammable()) {
-            pipelineId = this.resolveProgrammablePipeline(topology, true, stride, undefined);
+            pipelineId = this.resolveProgrammablePipeline(topology, true, stride, undefined, slotMask);
             if (pipelineId < 0) { this.commandRecorder.registerPooledBuffer(gpuBuffer); return d3d9DropDraw("converted:noPipeline"); }
             bindStateIndex = this.captureDrawState();
         } else {
-            const slots = new Set<number>([0]);
-            for (const s of extraStreams ?? []) slots.add(s.slot);
-            pipelineId = this.getPipelineIdForTopology(topology, true, stride, slots);
-            ffpStateIndex = this.captureFfpDrawState(slots);
+            pipelineId = this.getPipelineIdForTopology(topology, true, stride, slotMask);
+            if (pipelineId < 0) { this.commandRecorder.registerPooledBuffer(gpuBuffer); return d3d9DropDraw("converted:noPipeline"); }
+            ffpStateIndex = this.captureFfpDrawState(slotMask);
         }
 
         this.commandRecorder.recordDraw({
             pipelineId,
-            gpuBuffer,
-            bufferOffset: 0,
-            bufferSize: finalData.byteLength,
+            streams: this.streamPlan,
             vertexCount: finalVertexCount,
             startVertex: 0,
             bindStateIndex,
             ffpStateIndex,
-            extraStreams: extraStreams && extraStreams.length > 0 ? extraStreams : undefined,
         });
         this.commandRecorder.registerPooledBuffer(gpuBuffer);
         this.drawCount += 1;
@@ -3707,7 +3835,9 @@ export class D3D9Device {
             numVerts: finalVertexCount,
             timestamp: performance.now(),
         };
-        return this.recordConvertedDraw(finalData, finalVertexCount, stride, topology);
+        // No bound streams take part: a *UP draw supplies its vertices inline.
+        this.streamPlan.reset();
+        return this.recordConvertedDraw(finalData, finalVertexCount, stride, topology, UP_STREAM_SLOTS);
     }
 
     drawPrimitiveUP(primitiveType: number, primitiveCount: number, vertexDataPtr: number, stride: number): number {
@@ -3837,22 +3967,24 @@ export class D3D9Device {
         let pipelineId: number;
         let bindStateIndex: number | undefined;
         let ffpStateIndex: number | undefined;
+        // A *UP draw supplies its vertices inline; D3D9 reads no bound stream for it, so the
+        // pipeline declares slot 0 alone even when the declaration spans more — and the draw
+        // binds exactly that slot.
         if (this.isProgrammable()) {
-            pipelineId = this.resolveProgrammablePipeline(topology, true, stride, arenaKey);
+            pipelineId = this.resolveProgrammablePipeline(topology, true, stride, arenaKey, UP_STREAM_SLOTS);
             if (pipelineId < 0) { this.commandRecorder.registerPooledBuffer(gpuBuffer); return 0; }
             bindStateIndex = this.captureDrawState();
         } else {
-            // A *UP draw supplies its vertices inline; D3D9 reads no bound stream for it, so
-            // the pipeline declares stream 0 alone even when the declaration spans more.
             pipelineId = this.getPipelineIdForTopology(topology, true, stride, UP_STREAM_SLOTS);
+            if (pipelineId < 0) { this.commandRecorder.registerPooledBuffer(gpuBuffer); return d3d9DropDraw("up:noPipeline"); }
             ffpStateIndex = this.captureFfpDrawState(UP_STREAM_SLOTS);
         }
 
+        this.streamPlan.reset();
+        this.streamPlan.add(0, gpuBuffer, 0, finalData.byteLength);
         this.commandRecorder.recordDraw({
             pipelineId,
-            gpuBuffer,
-            bufferOffset: 0,
-            bufferSize: finalData.byteLength,
+            streams: this.streamPlan,
             vertexCount: finalVertexCount,
             startVertex: 0,
             bindStateIndex,
@@ -3915,35 +4047,27 @@ export class D3D9Device {
         if (!vbData || !ibData) return d3d9DropDraw("drawIndexed:noBufferData");
 
         const device = this.backend.getDevice()!;
-        const vbBuffer = this.uploadBufferVersion(vbIndex, vbData, "vb", device);
+        const slotMask = this.activeSlotMask();
         const ibBuffer = this.uploadBufferVersion(ibIndex, ibData, "ib", device);
 
         // D3D9 promises every index of this draw lies in [minVertexIndex, +numVertices), so
         // the bytes the GPU will fetch are known up front. WebGPU cannot check that itself for
         // an indexed draw — robust access silently substitutes zeros — so check it here or the
         // miss shows up only as geometry that never appears. See D3D9BufferPerf.
-        const vbBytes = this.vertexBuffers.getSize(vbIndex);
         const idxBytes = this.indexBuffers.getFormat(ibIndex) === D3DFMT_INDEX16 ? 2 : 4;
         const ibNeed = (startIndex + primitiveCount * 3) * idxBytes;
         const ibBytes = this.indexBuffers.getSize(ibIndex);
-        const firstVertex = baseVertexIndex + minVertexIndex;
-        const need = streamSource.offset + (firstVertex + numVertices) * streamSource.stride;
         if (ibNeed > ibBytes) {
             // An over-long index range is the one case WebGPU does raise — and the rejection
             // invalidates the whole command buffer, not just this draw, so drop it here.
             d3d9PerfIndexRangeOOB(ibNeed - ibBytes);
             return d3d9DropDraw("drawIndexed:indexRangeOOB");
         }
-        if (firstVertex < 0 || need > vbBytes) {
-            d3d9PerfVertexRangeOOB(Math.max(0, need - vbBytes));
-            this.vertexRangeOobLogs = (this.vertexRangeOobLogs + 1) >>> 0;
-            if (this.vertexRangeOobLogs % 200 === 1) {
-                Logger.warn(LogCategory.D3D9,
-                    `drawIndexedPrimitive vertex range outside VB: off=${streamSource.offset} ` +
-                    `base=${baseVertexIndex} min=${minVertexIndex} num=${numVertices} ` +
-                    `stride=${streamSource.stride} need=${need} vbSize=${vbBytes}`);
-            }
-        }
+        // No vertex-range check here: WebGPU validates a vertex range only for a NON-indexed
+        // draw (the encoder enforces that one, where the pipeline's real stride is known).
+        // An indexed draw gets robust access instead — an out-of-range fetch reads zero,
+        // exactly what D3D9 hardware does with an undersized buffer — so dropping it would
+        // delete geometry the hardware rasterizes.
 
         // WASM arena — computed BEFORE pipeline resolution so a real-bypass hit
         // (dbg.d3dWasmPath(true)) can skip the legacy string-key path entirely (see
@@ -3957,28 +4081,28 @@ export class D3D9Device {
         let pipelineId: number;
         let bindStateIndex: number | undefined;
         let ffpStateIndex: number | undefined;
-        let extraStreams: StreamVertexBinding[] | undefined;
         if (this.isProgrammable()) {
-            pipelineId = this.resolveProgrammablePipeline("triangle-list", false, undefined, arenaKey);
+            pipelineId = this.resolveProgrammablePipeline("triangle-list", false, undefined, arenaKey, slotMask);
             if (pipelineId < 0) return 0;
             bindStateIndex = this.captureDrawState();
         } else {
-            pipelineId = this.getPipelineId(streamSource.stride);
-            ffpStateIndex = this.captureFfpDrawState();
-            extraStreams = this.collectFfpExtraStreams();
+            pipelineId = this.getPipelineId(slotMask);
+            if (pipelineId < 0) return d3d9DropDraw("drawIndexed:noPipeline");
+            ffpStateIndex = this.captureFfpDrawState(slotMask);
         }
-        if (this.fetchAuditFramesLeft > 0) {
+        // Slot 0 comes out of the same resolver as every other slot (its upload included).
+        const plan = this.resolveDrawStreams(slotMask, device);
+        const slot0 = plan.find(0);
+        if (this.fetchAuditFramesLeft > 0 && slot0) {
             this.fetchAuditRecord(
-                vbIndex, ibIndex, vbData, ibData, vbBuffer, ibBuffer,
+                vbIndex, ibIndex, vbData, ibData, slot0.buffer, ibBuffer,
                 streamSource.offset, streamSource.stride, baseVertexIndex, startIndex,
                 primitiveCount * 3, this.indexBuffers.getFormat(ibIndex) === D3DFMT_INDEX16,
             );
         }
         this.commandRecorder.recordDrawIndexed({
             pipelineId,
-            vbGpuBuffer: vbBuffer,
-            vbOffset: streamSource.offset,
-            vbSize: this.vertexBuffers.getSize(vbIndex) - streamSource.offset,
+            streams: plan,
             ibGpuBuffer: ibBuffer,
             ibFormat: this.indexBuffers.getFormat(ibIndex) === D3DFMT_INDEX16 ? "uint16" : "uint32",
             indexCount: primitiveCount * 3,
@@ -3986,7 +4110,6 @@ export class D3D9Device {
             baseVertex: baseVertexIndex,
             bindStateIndex,
             ffpStateIndex,
-            extraStreams,
         });
         this.drawCount += 1;
 
@@ -4024,9 +4147,15 @@ export class D3D9Device {
      * app's choice has to reach the pacer. Re-declared by every CreateDevice/Reset.
      */
     private presentInterval = PRESENT_INTERVAL_ONE;
+    /** D3DPRESENT_PARAMETERS.SwapEffect, re-declared by CreateDevice/Reset. */
+    private swapEffect = D3DSWAPEFFECT_DISCARD;
 
     setPresentationInterval(rawInterval: number): void {
         this.presentInterval = decodeD3DPresentInterval(rawInterval);
+    }
+
+    setSwapEffect(rawSwapEffect: number): void {
+        this.swapEffect = rawSwapEffect >>> 0;
     }
 
     async present(): Promise<number> {
@@ -4172,9 +4301,47 @@ export class D3D9Device {
         const w = this.textures.getWidth(index), h = this.textures.getHeight(index);
         const format = this.textures.getFormat(index);
         const rgba = new Uint8Array(w * h * 4);
-        if (isBlockCompressedFormat(format)) return { err: `block-compressed format ${format} — not decoded on the dump path` };
+        // The shared decoder handles DXT/BC blocks as well as plain pixels. Keeping BC
+        // textures on the GPU-readback fallback is misleading: copyTextureToBuffer returns
+        // compressed blocks, while that fallback interprets them as RGBA rows.
         decodeD3DTextureToRgba8(data, 0, w, h, format, { pitch: this.textures.getPitch(index), out: rgba });
         return { rgba, w, h, format };
+    }
+
+    /**
+     * Copy/scale a surface on the GPU (IDirect3DDevice9::StretchRect). `null` is the
+     * implicit backbuffer; explicit surfaces resolve to their parent texture in the
+     * module layer. Pending draws are flushed first so the copy observes strict D3D
+     * command ordering.
+     */
+    stretchRect(
+        src: { texturePtr: number; face: number; width: number; height: number } | null,
+        dst: { texturePtr: number; face: number; width: number; height: number } | null,
+        srcRect: { left: number; top: number; right: number; bottom: number },
+        dstRect: { left: number; top: number; right: number; bottom: number },
+        linear: boolean,
+    ): boolean {
+        // Sampling and attaching the same subresource in one render pass is invalid in
+        // WebGPU and invalid for StretchRect on D3D9 as well.
+        if (!src && !dst) return false;
+        if (src && dst && src.texturePtr === dst.texturePtr && src.face === dst.face) return false;
+
+        this.submitFrame(false);
+        const resolve = (surface: NonNullable<typeof src>):
+            { view: GPUTextureView; width: number; height: number } | null => {
+            const index = this.textures.getIndex(surface.texturePtr);
+            if (index === null) return null;
+            this.ensureTexture(index);
+            const view = this.textures.isCubeMap(index)
+                ? this.getCubeFaceRenderView(index, surface.face, 0)
+                : this.textures.getView(index);
+            return view ? { view, width: surface.width, height: surface.height } : null;
+        };
+
+        const source = src ? resolve(src) : null;
+        const destination = dst ? resolve(dst) : null;
+        if ((src && !source) || (dst && !destination)) return false;
+        return this.backendExecutor.stretchRect(source, destination, srcRect, dstRect, linear);
     }
 
     /**
@@ -4328,75 +4495,117 @@ export class D3D9Device {
         return at ? `a${at.func}.${at.ref}` : "a0";
     }
 
-    /** Pipeline cache key = numeric state/decl/VS key + current blend + alpha test + depth. */
-    /** Bound stride per stream, with stream 0 overridable by a CPU-converted draw's own
-     *  stride. Feeds both the vertex layout and the pipeline cache key. */
-    private declStreamStrides(stream0Override = 0): number[] {
-        const strides = new Array<number>(D3D9Device.MAX_STREAMS);
-        for (let s = 0; s < D3D9Device.MAX_STREAMS; s++) strides[s] = this.streamBindingStride[s]!;
-        if (stream0Override > 0) strides[0] = stream0Override;
-        return strides;
+    // ── Vertex input: one table, one resolver, one identity ───────────────────────────────
+    // Everything below reads `this.streams` (the binding table) and a slot MASK — the set of
+    // slots the active declaration references, or {0} for an FVF / *UP draw that supplies its
+    // own vertices. Slot 0 is resolved by exactly the same code as slots 1+; the only thing a
+    // caller may override is slot 0's STRIDE, and only when it repacked the vertices itself.
+
+    /** Slot mask per declaration handle. A declaration is immutable once created, so this is
+     *  computed once instead of re-scanning the elements on every draw. */
+    private declSlotMasks = new Map<number, number>();
+
+    /** The slots this draw's pipeline declares: the active declaration's, or slot 0 alone. */
+    private activeSlotMask(): number {
+        const handle = this.activeVertexDecl;
+        if (handle <= 0) return 1;
+        const cached = this.declSlotMasks.get(handle);
+        if (cached !== undefined) return cached;
+        const decl = this.vsDeclRegistry.get(handle);
+        const mask = decl && decl.length > 0 ? declStreamMask(decl) : 1;
+        this.declSlotMasks.set(handle, mask);
+        return mask;
     }
 
-    /** The active declaration's streams beyond 0, as a cache-key fragment: the vertex layout
-     *  has one entry per stream, so two draws that differ only in a stream-1 stride need
-     *  different pipelines. Empty for a single-stream declaration. */
-    private extraStreamKey(streamAllow: ReadonlySet<number> | null): string {
-        const decl = this.activeVertexDecl > 0 ? this.vsDeclRegistry.get(this.activeVertexDecl) : null;
-        if (!decl) return "";
-        let key = "";
-        for (const stream of declStreamsUsed(decl)) {
-            if (stream === 0 || (streamAllow && !streamAllow.has(stream))) continue;
-            key += `|x${stream}:${this.streamBindingStride[stream]}`;
-        }
-        return streamAllow ? `|only${[...streamAllow].join(",")}${key}` : key;
+    /** The stride a slot steps by: the bound stride, unless the caller repacked slot 0. */
+    /** Vertex-buffer slots this device can actually bind. D3D9 advertises 16 streams; WebGPU
+     *  binds `maxVertexBuffers` (8 by default) and refuses a pipeline declaring more. */
+    private maxVertexBufferSlots(): number {
+        const limit = this.backend.getDevice()?.limits?.maxVertexBuffers ?? 0;
+        return limit > 0 ? limit : MAX_VERTEX_BUFFER_SLOTS;
+    }
+
+    private slotStride(slot: number, stride0Override: number): number {
+        return slot === 0 && stride0Override > 0 ? stride0Override : this.streams.strideBytes[slot]!;
+    }
+
+    /** Reused stride-per-slot scratch for the shader/layout builders (consumed synchronously). */
+    private strideScratch = new Array<number>(MAX_VERTEX_STREAMS).fill(0);
+
+    private slotStrides(stride0Override: number): number[] {
+        for (let s = 0; s < MAX_VERTEX_STREAMS; s++) this.strideScratch[s] = this.slotStride(s, stride0Override);
+        return this.strideScratch;
     }
 
     /**
-     * GPU bindings for the streams beyond 0 that the active declaration references.
-     *
-     * A stream the guest left unbound gets a zero-filled buffer rather than cancelling the
-     * draw: real D3D9 binds an empty buffer there and still rasterizes (DXVK
-     * D3D9DeviceEx::BindVertexBuffer with a null buffer), and WebGPU rejects a draw whose
-     * pipeline declares a layout for a slot with nothing bound.
+     * Pipeline identity for the vertex input: which slots the layout has and what each steps
+     * by. ONE key over every used slot including 0 — a stride that only reaches the key for
+     * slot 0 is how a multi-stream draw reuses a pipeline built for a different layout.
      */
-    private collectFfpExtraStreams(): StreamVertexBinding[] | undefined {
-        const decl = this.activeVertexDecl > 0 ? this.vsDeclRegistry.get(this.activeVertexDecl) : null;
-        if (!decl || maxDeclStream(decl) === 0) return undefined;
-        const device = this.backend.getDevice();
-        if (!device) return undefined;
-
-        const { bindings, missing } = collectExtraStreamBindings(decl, (s) => {
-            const index = this.streamBindingIndex[s];
-            if (index === null) return null;
-            const data = this.vertexBuffers.getData(index);
-            if (!data) return null;
-            const size = this.vertexBuffers.getSize(index);
-            let gpu = this.vertexBuffers.getGpuBuffer(index);
-            if (!gpu) {
-                gpu = device.createBuffer({ size: (size + 3) & ~3, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
-                this.vertexBuffers.setGpuBuffer(index, gpu);
-            }
-            if (this.vertexBuffers.isDirty(index)) {
-                this.commandRecorder.queueUpload(gpu, data);
-                this.vertexBuffers.setDirty(index, false);
-                if (this.frameSnapshot.frameCounters) {
-                    this.frameSnapshot.frameCounters.uploads++;
-                    this.frameSnapshot.frameCounters.vertexBytes += data.byteLength;
-                }
-            }
-            const stride = this.streamBindingStride[s]!;
-            if (stride <= 0) return null;
-            return { buffer: gpu, offset: this.streamBindingOffset[s]!, size, stride };
-        });
-
-        for (const s of missing) {
-            bindings.push({ slot: s, buffer: zeroStreamBuffer(device, ZERO_STREAM_MIN_BYTES), offset: 0, size: ZERO_STREAM_MIN_BYTES });
+    private streamKey(slotMask: number, stride0Override: number): string {
+        let key = "";
+        for (let s = 0; s < MAX_VERTEX_STREAMS; s++) {
+            if (((slotMask >>> s) & 1) === 0) continue;
+            key += `|v${s}:${this.slotStride(s, stride0Override)}`;
         }
-        return bindings.length > 0 ? bindings : undefined;
+        return key;
     }
 
-    private blendCacheKey(numericKey: number, streamStride = 0, streamAllow: ReadonlySet<number> | null = null): string {
+    /** Zero-alloc twin of streamKey — guards the hot last-resolve fast path. */
+    private streamHash(slotMask: number, stride0Override: number): number {
+        let h = slotMask | 0;
+        for (let s = 0; s < MAX_VERTEX_STREAMS; s++) {
+            if (((slotMask >>> s) & 1) === 0) continue;
+            h = (Math.imul(h, 31) + this.slotStride(s, stride0Override)) | 0;
+        }
+        return h;
+    }
+
+    /**
+     * The GPU buffer backing a slot's bound vertex buffer, uploaded and version-renamed.
+     * Every slot goes through uploadBufferVersion — DISCARD renaming is a per-buffer property,
+     * not a stream-0 privilege. Null when the slot has nothing usable bound.
+     */
+    private slotGpuBuffer(slot: number, device: GPUDevice): GPUBuffer | null {
+        const index = this.streams.bufferIndex[slot]!;
+        if (index < 0 || this.streams.strideBytes[slot]! <= 0) return null;
+        const data = this.vertexBuffers.getData(index);
+        if (!data) return null;
+        return this.uploadBufferVersion(index, data, "vb", device);
+    }
+
+    /**
+     * Resolve the bindings for every slot this draw's pipeline declares, slot 0 included, into
+     * the reused plan.
+     *
+     * A binding runs [OffsetInBytes, end of buffer): the draw's firstVertex/baseVertex is
+     * applied by the GPU to every slot uniformly, so folding it in here would double-count it.
+     * A slot the guest left unbound gets the zero-filled stand-in rather than cancelling the
+     * draw — real D3D9 binds an empty buffer there and still rasterizes (DXVK
+     * D3D9DeviceEx::BindVertexBuffer with a null buffer), and WebGPU has no null binding at
+     * all, so a slot the pipeline declares MUST have something in it.
+     *
+     * Draws that build their own vertex buffer (*UP, the CPU rewinds) fill the plan directly
+     * instead — those bytes never came from a bound stream.
+     */
+    private resolveDrawStreams(slotMask: number, device: GPUDevice): StreamBindingPlan {
+        const plan = this.streamPlan;
+        plan.reset();
+        for (let slot = 0; slot < MAX_VERTEX_STREAMS; slot++) {
+            if (((slotMask >>> slot) & 1) === 0) continue;
+            const gpu = this.slotGpuBuffer(slot, device);
+            const offset = this.streams.offsetBytes[slot]!;
+            const size = gpu ? bindingSize(this.vertexBuffers.getSize(this.streams.bufferIndex[slot]!), offset) : 0;
+            if (!gpu || size <= 0) {
+                plan.add(slot, zeroStreamBuffer(device, ZERO_STREAM_MIN_BYTES), 0, ZERO_STREAM_MIN_BYTES);
+                continue;
+            }
+            plan.add(slot, gpu, offset, size);
+        }
+        return plan;
+    }
+
+    private blendCacheKey(numericKey: number, stride0Override = 0, slotMask = this.activeSlotMask()): string {
         // The numeric key carries only FVF bits 0-15, so the TEXCOORDSIZE field (bit 16+) and
         // the stream stride — both of which change the vertex layout — must key the cache too,
         // or the first pipeline built for an FVF is reused for a differently-strided stream.
@@ -4408,9 +4617,9 @@ export class D3D9Device {
         // Appended only when texgen is on, so it multiplies pipelines for the draws that use
         // it and leaves every other key the shape it already had.
         const texGen = this.texGenActive(stages) ? "|tg" : "";
-        return `${numericKey}|${fvfHigh}|${streamStride}|s${stages}${texGen}`
+        return `${numericKey}|${fvfHigh}|s${stages}${texGen}`
             + `|${computeBlendKey(this.getRS)}|${this.alphaTestKey()}|${computeDepthKey(this.getRS)}`
-            + this.extraStreamKey(streamAllow);
+            + this.streamKey(slotMask, stride0Override);
     }
 
     /**
@@ -4447,26 +4656,26 @@ export class D3D9Device {
         return n;
     }
 
-    private getPipelineId(streamStride = 0): number {
+    private getPipelineId(slotMask: number): number {
         const key = this.buildPipelineKey();
-        const cacheKey = this.blendCacheKey(key, streamStride);
+        const cacheKey = this.blendCacheKey(key, 0, slotMask);
         if (this.currentPipelineKey !== cacheKey || this.currentPipelineId === null) {
             this.currentPipelineKey = cacheKey;
-            this.currentPipelineId = this.resolvePipelineId(key, "triangle-list", false, undefined, streamStride);
+            this.currentPipelineId = this.resolvePipelineId(key, "triangle-list", false, undefined, 0, slotMask);
         }
         return this.currentPipelineId ?? 0;
     }
 
     private getPipelineIdForTopology(
         topology: "triangle-list" | "line-list",
-        forceCullNone: boolean = false,
-        streamStride = 0,
-        streamAllow: ReadonlySet<number> | null = null,
+        forceCullNone: boolean,
+        stride0Override: number,
+        slotMask: number,
     ): number {
         const topologyOffset = topology === "line-list" ? 0x1000000 : 0;
         const cullOffset = forceCullNone ? 0x2000000 : 0;
         const key = this.buildPipelineKey(topologyOffset, cullOffset);
-        return this.resolvePipelineId(key, topology, forceCullNone, undefined, streamStride, streamAllow);
+        return this.resolvePipelineId(key, topology, forceCullNone, undefined, stride0Override, slotMask);
     }
 
     /**
@@ -4485,14 +4694,14 @@ export class D3D9Device {
         topology: "triangle-list" | "line-list",
         forceCullNone: boolean = false,
         fvfOverride?: number,
-        streamStride = 0,
-        streamAllow: ReadonlySet<number> | null = null,
+        stride0Override = 0,
+        slotMask = this.activeSlotMask(),
     ): number {
         // Synthetic-FVF pipelines (point sprites) get their own cache namespace so they never
         // alias the game's decl/FVF pipelines that hash to the same numeric key.
         const cacheKey = fvfOverride !== undefined
-            ? `ps${fvfOverride}|${this.blendCacheKey(key)}`
-            : this.blendCacheKey(key, streamStride, streamAllow);
+            ? `ps${fvfOverride}|${this.blendCacheKey(key, 0, 1)}`
+            : this.blendCacheKey(key, stride0Override, slotMask);
         const cachedId = this.pipelineCache.get(cacheKey);
         if (cachedId !== undefined) {
             d3d9PerfBackendInc("pipelineCacheHits");
@@ -4513,7 +4722,6 @@ export class D3D9Device {
         const declElements = this.activeVertexDecl > 0
             ? (this.vsDeclRegistry.get(this.activeVertexDecl) ?? null)
             : null;
-        const streamSource = this.stateTracker.getStreamSource();
 
         let shaderModule: GPUShaderModule;
         let vertexBuffers: (GPUVertexBufferLayout | null)[];
@@ -4535,35 +4743,36 @@ export class D3D9Device {
             vertexBuffers = [{ arrayStride: layout.arrayStride, attributes: layout.attributes }];
             hasTexture = layout.hasTexture;
         } else if (declElements && declElements.length > 0) {
+            if (slotMaskExceedsLimit(slotMask, this.maxVertexBufferSlots())) {
+                d3d9DropDraw("pipeline:streamSlotOverLimit");
+                return -1;
+            }
             // FFP + vertex declaration path: build shader and layout from declaration data.
-            // One layout per stream the declaration spans — a CPU-converted draw overrides
-            // stream 0's stride (its bytes are repacked) and carries no other stream.
+            // One layout per slot the mask names — the same mask the draw's bindings come
+            // from, so the pipeline can never declare a slot the draw leaves unbound. Only a
+            // CPU-converted draw overrides slot 0's stride (its bytes are repacked).
             ffpStageCount = this.activeStageCount();
-            const strides = this.declStreamStrides(streamStride || streamSource?.stride || 0);
-            const built = buildShaderFromDecl(declElements, alphaTest, lit, ffpStageCount, strides, streamAllow,
+            const strides = this.slotStrides(stride0Override);
+            const built = buildShaderFromDecl(declElements, alphaTest, lit, ffpStageCount, strides, slotMask,
                 this.texGenActive(ffpStageCount));
             shaderModule = gpuDevice.createShaderModule({ code: built.wgsl });
             vertexBuffers = built.buffers;
             hasTexture = built.hasTexture;
         } else {
-            // FFP + FVF path. The STREAM decides the stride (DrawPrimitiveUP's
-            // VertexStreamZeroStride / SetStreamSource's Stride); the FVF only says where the
-            // components sit inside a vertex. They differ whenever the vertex carries data the
-            // FFP layout declares no attribute for — padding, or texcoord sets past the first —
-            // and stepping by the FVF's packed size then reads every vertex after the first
-            // from the middle of its predecessor. Never go BELOW the packed size: a stride that
-            // cannot hold the declared attributes is an invalid draw, not a tighter layout.
+            // FFP + FVF path. The BOUND stride wins (DrawPrimitiveUP's VertexStreamZeroStride /
+            // SetStreamSource's Stride): that is what D3D9 steps the stream by, while the FVF
+            // only says where components sit inside a vertex — raising it to the FVF's packed
+            // size reads every vertex after the first out of its successor. planFvf drops the
+            // components that no longer fit, so shader and layout stay in step.
             const fvf = this.stateTracker.getFVF();
-            const layout = buildVertexLayout(fvf);
+            const boundStride = this.slotStride(0, stride0Override);
+            const layout = buildVertexLayout(fvf, boundStride);
             ffpStageCount = this.activeStageCount();
             const texGen = this.texGenActive(ffpStageCount);
             shaderModule = gpuDevice.createShaderModule({
-                code: buildShader(fvf, alphaTest, lit, ffpStageCount, texGen),
+                code: buildShader(fvf, alphaTest, lit, ffpStageCount, texGen, boundStride),
             });
-            vertexBuffers = [{
-                arrayStride: Math.max(layout.arrayStride, streamStride || 0),
-                attributes: layout.attributes,
-            }];
+            vertexBuffers = [{ arrayStride: layout.arrayStride, attributes: layout.attributes }];
             hasTexture = layout.hasTexture || texGen;
         }
 
@@ -4574,29 +4783,40 @@ export class D3D9Device {
             else if (cullModeD3D === D3DCULL_CCW) cullMode = "back";
         }
 
-        const pipeline = gpuDevice.createRenderPipeline({
-            // Shared explicit layout when the FFP dynamic-offset shape is on (one cached bind
-            // group serves every FFP draw); WebGPU's implicit per-pipeline layout otherwise.
-            layout: this.backendExecutor.getFfpPipelineLayout(),
-            vertex: {
-                module: shaderModule,
-                entryPoint: "vs_main",
-                buffers: vertexBuffers,
-            },
-            fragment: {
-                module: shaderModule,
-                entryPoint: "fs_main",
-                targets: [buildColorTargetState(format, this.getRS)],
-            },
-            primitive: {
-                topology,
-                frontFace: "cw",
-                cullMode,
-            },
-            depthStencil: buildDepthStencilState("depth24plus", this.getRS),
-        });
+        // A throw here (an unsupported format, a layout the shader disagrees with) must cost
+        // this draw alone — uncaught it unwinds through the recorder and the whole frame dies.
+        let pipeline: GPURenderPipeline;
+        try {
+            pipeline = gpuDevice.createRenderPipeline({
+                // Shared explicit layout when the FFP dynamic-offset shape is on (one cached bind
+                // group serves every FFP draw); WebGPU's implicit per-pipeline layout otherwise.
+                layout: this.backendExecutor.getFfpPipelineLayout(),
+                vertex: {
+                    module: shaderModule,
+                    entryPoint: "vs_main",
+                    buffers: vertexBuffers,
+                },
+                fragment: {
+                    module: shaderModule,
+                    entryPoint: "fs_main",
+                    targets: [buildColorTargetState(format, this.getRS)],
+                },
+                primitive: {
+                    topology,
+                    frontFace: "cw",
+                    cullMode,
+                },
+                depthStencil: buildDepthStencilState("depth24plus", this.getRS),
+            });
+        } catch (e) {
+            Logger.error(LogCategory.D3D9, `[D3D9] fixed-function pipeline build failed: ${e}`);
+            return -1;
+        }
 
-        const pipelineId = this.backendExecutor.registerPipeline(pipeline, hasTexture, false, ffpStageCount);
+        // Strides AND per-slot attribute extents from the SAME layouts this pipeline was built
+        // with — the executor sizes every non-indexed draw against both (planVertexRangePadding).
+        const pipelineId = this.backendExecutor.registerPipeline(pipeline, hasTexture, false, ffpStageCount,
+            layoutStrides(vertexBuffers), layoutAttributeEnds(vertexBuffers));
         this.pipelineCache.set(cacheKey, pipelineId);
         return pipelineId;
     }
@@ -4613,16 +4833,27 @@ export class D3D9Device {
         forceCullNone: boolean,
         strideOverride?: number,
         arenaKey?: number,
+        slotMask: number = this.activeSlotMask(),
     ): number {
         const vs = this.getActiveVsShader();
         if (!vs) return -1;
         const ps = this.getActivePsShader();
+        const hybridStages = ps ? 0 : this.activeStageCount();
         const declElements = this.activeVertexDecl > 0
             ? (this.vsDeclRegistry.get(this.activeVertexDecl) ?? null)
             : null;
         const streamSource = this.stateTracker.getStreamSource();
         const stride = strideOverride ?? streamSource?.stride ?? null;
         const stateBits = this.stateTracker.computePipelineKey() & 0x7FF0000;
+        // The layout has one entry per slot the draw will bind, so EVERY one of their strides
+        // is part of the pipeline identity — not just slot 0's. One hash over the used slots.
+        const multiSlot = !!declElements && declElements.length > 0 && (slotMask & ~1) !== 0;
+        if (multiSlot && slotMaskExceedsLimit(slotMask, this.maxVertexBufferSlots())) {
+            d3d9DropDraw("pipeline:streamSlotOverLimit");
+            return -1;
+        }
+        const streamStrides = multiSlot ? this.slotStrides(stride ?? 0) : null;
+        const streamHash = this.streamHash(slotMask, stride ?? 0);
 
         const alphaTest = this.getAlphaTest();
         // Effective cube mask (dcl_cube ∪ bound cube textures) — part of the pipeline identity since
@@ -4644,7 +4875,8 @@ export class D3D9Device {
             && this._lrStateBits === stateBits && this._lrTopo === topology
             && this._lrForceCull === forceCullNone && this._lrBlend === blendKey
             && this._lrAlpha === alphaKey && this._lrDepth === depthKey
-            && this._lrCube === cubeMask && this._lrProj === projKey) {
+            && this._lrCube === cubeMask && this._lrProj === projKey && this._lrHybridStages === hybridStages
+            && this._lrStreamHash === streamHash) {
             d3d9PerfBackendInc("progPipelineCacheHits");
             if (this.frameSnapshot.frameCounters) this.frameSnapshot.frameCounters.cacheHits++;
             return this._lrPipelineId;
@@ -4658,36 +4890,40 @@ export class D3D9Device {
         // with the legacy key space via dual-run cross-checking
         // BEFORE this fast path is ever taken; falls through to the legacy path below whenever
         // bypass is off, the arena declined this draw, or the arena isn't initialized.
-        if (arenaKey !== undefined && arenaKey >= 0 && isWasmPathEnabled()) {
+        // The arena key currently does not encode FFP texture-stage state, so hybrid draws use
+        // the ordinary cache whose identity includes `hybridStages`.
+        // The arena key encodes stream 0's stride alone, so it cannot distinguish two
+        // multi-stream layouts; those resolve through the string-keyed cache below.
+        if (ps && arenaKey !== undefined && arenaKey >= 0 && !multiSlot && isWasmPathEnabled()) {
             const cachedViaArena = this.arenaPipelineCache.get(arenaKey);
             if (cachedViaArena !== undefined) {
                 d3d9PerfBackendInc("progPipelineCacheHits");
                 if (this.frameSnapshot.frameCounters) this.frameSnapshot.frameCounters.cacheHits++;
-                this._storeLastResolve(stride, stateBits, topology, forceCullNone, blendKey, alphaKey, depthKey, cubeMask, projKey, cachedViaArena);
+                this._storeLastResolve(stride, stateBits, topology, forceCullNone, blendKey, alphaKey, depthKey, cubeMask, projKey, hybridStages, streamHash, cachedViaArena);
                 return cachedViaArena;
             }
             d3d9PerfBackendInc("progPipelineCacheMisses");
             if (this.frameSnapshot.frameCounters) this.frameSnapshot.frameCounters.cacheMisses++;
-            const built = this.buildProgrammablePipeline(vs, ps, declElements, stride, stateBits, topology, forceCullNone, alphaTest, cubeMask, projKey);
+            const built = this.buildProgrammablePipeline(vs, ps, declElements, stride, stateBits, topology, forceCullNone, alphaTest, cubeMask, projKey, hybridStages, null);
             this.arenaPipelineCache.set(arenaKey, built);
-            this._storeLastResolve(stride, stateBits, topology, forceCullNone, blendKey, alphaKey, depthKey, cubeMask, projKey, built);
+            this._storeLastResolve(stride, stateBits, topology, forceCullNone, blendKey, alphaKey, depthKey, cubeMask, projKey, hybridStages, streamHash, built);
             return built;
         }
 
-        const cacheKey = `${this.activeVertexShader}:${this.activePixelShader}:${this.activeVertexDecl}:${stride}:${stateBits}:${topology}:${forceCullNone ? 1 : 0}:${blendKey}:${alphaKey}:${depthKey}:cm${cubeMask}:pj${projKey}`;
+        const cacheKey = `${this.activeVertexShader}:${this.activePixelShader}:${this.activeVertexDecl}:${stateBits}:${topology}:${forceCullNone ? 1 : 0}:${blendKey}:${alphaKey}:${depthKey}:cm${cubeMask}:pj${projKey}:hs${hybridStages}${this.streamKey(slotMask, stride ?? 0)}`;
         const cached = this.progPipelineCache.get(cacheKey);
         if (cached !== undefined) {
             d3d9PerfBackendInc("progPipelineCacheHits");
             if (this.frameSnapshot.frameCounters) this.frameSnapshot.frameCounters.cacheHits++;
-            this._storeLastResolve(stride, stateBits, topology, forceCullNone, blendKey, alphaKey, depthKey, cubeMask, projKey, cached);
+            this._storeLastResolve(stride, stateBits, topology, forceCullNone, blendKey, alphaKey, depthKey, cubeMask, projKey, hybridStages, streamHash, cached);
             return cached;
         }
         d3d9PerfBackendInc("progPipelineCacheMisses");
         if (this.frameSnapshot.frameCounters) this.frameSnapshot.frameCounters.cacheMisses++;
 
-        const pipelineId = this.buildProgrammablePipeline(vs, ps, declElements, stride, stateBits, topology, forceCullNone, alphaTest, cubeMask, projKey);
+        const pipelineId = this.buildProgrammablePipeline(vs, ps, declElements, stride, stateBits, topology, forceCullNone, alphaTest, cubeMask, projKey, hybridStages, streamStrides);
         this.progPipelineCache.set(cacheKey, pipelineId);
-        this._storeLastResolve(stride, stateBits, topology, forceCullNone, blendKey, alphaKey, depthKey, cubeMask, projKey, pipelineId);
+        this._storeLastResolve(stride, stateBits, topology, forceCullNone, blendKey, alphaKey, depthKey, cubeMask, projKey, hybridStages, streamHash, pipelineId);
         return pipelineId;
     }
 
@@ -4704,9 +4940,11 @@ export class D3D9Device {
         alphaTest: ReturnType<D3D9Device["getAlphaTest"]>,
         cubeMask: number,
         projectedStages: number,
+        hybridStages: number,
+        streamStrides: number[] | null,
     ): number {
         try {
-            const link = linkProgram({ vs, ps, declElements, streamStride: stride, alphaTest, cubeMask, projectedStages });
+            const link = linkProgram({ vs, ps, declElements, streamStride: stride, streamStrides, alphaTest, cubeMask, projectedStages, ffpStageCount: hybridStages || undefined });
             const gpuDevice = this.backend.getDevice()!;
             const format = this.backend.getFormat()!;
             const module = gpuDevice.createShaderModule({ code: link.wgsl });
@@ -4720,21 +4958,30 @@ export class D3D9Device {
                 if (cullD3D === D3DCULL_CW) cullMode = "front";
                 else if (cullD3D === D3DCULL_CCW) cullMode = "back";
             }
+            // One layout per stream the declaration spans. A declaration addresses its elements
+            // as (stream, offset) and each stream steps by ITS OWN stride, so folding them into
+            // a single slot-0 layout reads every non-zero stream's attributes out of stream 0 —
+            // and sizes the draw against the wrong stride, which WebGPU rejects (invalidating
+            // the whole frame's command buffer, not just the draw).
+            const buffers: (GPUVertexBufferLayout | null)[] = streamStrides
+                ? link.vertexBuffers
+                : [{
+                    arrayStride: (stride && stride > 0) ? stride : link.arrayStride,
+                    attributes: link.vertexAttributes,
+                }];
             const pipeline = gpuDevice.createRenderPipeline({
                 layout: pipelineLayout,
                 vertex: {
                     module,
                     entryPoint: "vs_main",
-                    buffers: [{
-                        arrayStride: (stride && stride > 0) ? stride : link.arrayStride,
-                        attributes: link.vertexAttributes,
-                    }],
+                    buffers,
                 },
                 fragment: { module, entryPoint: "fs_main", targets: [buildColorTargetState(format, this.getRS)] },
                 primitive: { topology, frontFace: "cw", cullMode },
                 depthStencil: buildDepthStencilState("depth24plus", this.getRS),
             });
-            return this.backendExecutor.registerPipeline(pipeline, link.hasTexture, true);
+            return this.backendExecutor.registerPipeline(pipeline, link.hasTexture, true,
+                1, layoutStrides(buffers), layoutAttributeEnds(buffers));
         } catch (e) {
             Logger.error(LogCategory.D3D9, `[D3D9] programmable pipeline build failed: ${e}`);
             return -1;
@@ -4744,10 +4991,11 @@ export class D3D9Device {
     /** Remember the just-resolved pipeline identity for the next-draw numeric fast path. VS/PS/decl
      *  come from the current device state (unchanged across the resolve). */
     private _storeLastResolve(stride: number | null, stateBits: number, topo: string, forceCull: boolean,
-        blend: string, alpha: string, depth: string, cube: number, proj: number, id: number): void {
+        blend: string, alpha: string, depth: string, cube: number, proj: number, hybridStages: number,
+        streamHash: number, id: number): void {
         this._lrVs = this.activeVertexShader; this._lrPs = this.activePixelShader; this._lrDecl = this.activeVertexDecl;
         this._lrStride = stride; this._lrStateBits = stateBits; this._lrTopo = topo; this._lrForceCull = forceCull;
-        this._lrBlend = blend; this._lrAlpha = alpha; this._lrDepth = depth; this._lrCube = cube; this._lrProj = proj; this._lrPipelineId = id; this._lrValid = true;
+        this._lrBlend = blend; this._lrAlpha = alpha; this._lrDepth = depth; this._lrCube = cube; this._lrProj = proj; this._lrHybridStages = hybridStages; this._lrStreamHash = streamHash; this._lrPipelineId = id; this._lrValid = true;
     }
 
     /** Bitmask of stages that currently have a CUBE texture bound. D3D9 ps_1_x / FFP have no
@@ -4813,14 +5061,14 @@ export class D3D9Device {
      *  guest mutates transforms/stage-ops/TFACTOR/texture between draws, so
      *  FFP draws can't share the frame-level uniform buffer. */
 
-    private captureFfpDrawState(streamAllow: ReadonlySet<number> | null = null): number {
+    private captureFfpDrawState(slotMask: number = this.activeSlotMask()): number {
         this.declDrawCounts.set(this.activeVertexDecl, (this.declDrawCounts.get(this.activeVertexDecl) ?? 0) + 1);
         const { w, h } = this.getCurrentTargetSize();
         // Resolved once and shared: the uniform the shader reads and the census that reports
         // what it could not honor must be looking at the same stages.
         const stageCount = this.activeStageCount();
         const stages = this.resolveFfpStages(stageCount);
-        const block = this.buildFfpUniformBlock(w, h, stages, streamAllow);
+        const block = this.buildFfpUniformBlock(w, h, stages, slotMask);
         const frame = this.commandRecorder.getCurrentFrame();
         const index = frame.nextFfpState(block.length);
         const slot = frame.ffpStates[index];
@@ -4843,7 +5091,22 @@ export class D3D9Device {
         const vs = this.getActiveVsShader();
         const ps = this.getActivePsShader();
         const vsLen = Math.min(vs ? vs.analysis.constantCount : 0, 256) * 4;
-        const psLen = Math.min(ps ? ps.analysis.constantCount : 0, 224) * 4;
+        // ps_3_0 exposes two distinct banks: c0-c223 and b0-b15.  The WGSL
+        // recompiler packs b# immediately after the float bank, so a shader that
+        // references b# needs that tail included in every per-draw snapshot.
+        // Keeping the old 224-register ceiling here silently uploaded zeros for
+        // every dynamic branch even though SetPixelShaderConstantB had stored the
+        // values in psConstants.
+        // Hybrid VS + NULL-PS draws repurpose the PS uniform binding for one unused c-register,
+        // TEXTUREFACTOR, and eight FfpStage {a,b} records: 4 + 4 + 8*8 floats.
+        const psLen = ps
+            ? (ps.analysis.usesLegacyBumpEnv
+                // The WGSL struct has at least c[0], followed by two vec4 bump records for
+                // every texture stage. Keep the appended state in the same per-draw snapshot
+                // as c# so changing D3DTSS values cannot reuse stale bind data.
+                ? (Math.max(1, Math.min(ps.analysis.constantCount, PS_FLOAT_REGISTER_COUNT + PS_BOOL_REGISTER_COUNT)) + FFP_MAX_STAGES * 2) * 4
+                : Math.min(ps.analysis.constantCount, PS_FLOAT_REGISTER_COUNT + PS_BOOL_REGISTER_COUNT) * 4)
+            : 72;
 
         // Zero-alloc capture: snapshot constants + bound views into a pooled, reused
         // draw-state slot (see RenderFrame.nextDrawState) instead of fresh Float32Arrays /
@@ -4854,7 +5117,47 @@ export class D3D9Device {
         const state = frame.nextDrawState(vsLen, psLen);
 
         state.vsVersion = this.copyConstantPrefixWithKey(this.vsConstantBits, state.vsBits, vsLen);
-        state.psVersion = this.copyConstantPrefixWithKey(this.psConstantBits, state.psBits, psLen);
+        if (ps) {
+            if (ps.analysis.usesLegacyBumpEnv) {
+                const cVecs = Math.max(1, Math.min(ps.analysis.constantCount, PS_FLOAT_REGISTER_COUNT + PS_BOOL_REGISTER_COUNT));
+                const cFloats = cVecs * 4;
+                state.psConst.fill(0, 0, psLen);
+                if (ps.analysis.constantCount > 0) {
+                    state.psConst.set(this.psConstants.subarray(0, Math.min(ps.analysis.constantCount, PS_FLOAT_REGISTER_COUNT + PS_BOOL_REGISTER_COUNT) * 4));
+                }
+                // LegacyBumpStage { mat: vec4(M00,M01,M10,M11), lum: vec4(scale,offset,0,0) }
+                // follows c#. See TEXBEM/TEXBEML's D3D9 formula and ps-codegen.ts.
+                for (let stage = 0; stage < FFP_MAX_STAGES; stage++) {
+                    const at = cFloats + stage * 8;
+                    state.psConst[at + 0] = dwordAsFloat(this.getTextureStageState(stage, D3DTSS_BUMPENVMAT00));
+                    state.psConst[at + 1] = dwordAsFloat(this.getTextureStageState(stage, D3DTSS_BUMPENVMAT01));
+                    state.psConst[at + 2] = dwordAsFloat(this.getTextureStageState(stage, D3DTSS_BUMPENVMAT10));
+                    state.psConst[at + 3] = dwordAsFloat(this.getTextureStageState(stage, D3DTSS_BUMPENVMAT11));
+                    state.psConst[at + 4] = dwordAsFloat(this.getTextureStageState(stage, D3DTSS_BUMPENVLSCALE));
+                    state.psConst[at + 5] = dwordAsFloat(this.getTextureStageState(stage, D3DTSS_BUMPENVLOFFSET));
+                }
+                state.psVersion = this.copyConstantPrefixWithKey(state.psBits, state.psBits, psLen);
+            } else {
+                state.psVersion = this.copyConstantPrefixWithKey(this.psConstantBits, state.psBits, psLen);
+            }
+        } else {
+            const { w, h } = this.getCurrentTargetSize();
+            const ffp = this.buildFfpUniformBlock(w, h);
+            const stageCount = this.activeStageCount();
+            for (let stage = 0; stage < stageCount; stage++) {
+                const ti = this.stateTracker.getTexture(stage);
+                if (ti !== null && D3D_ALPHALESS_FORMATS.has(this.textures.getFormat(ti))) {
+                    ffp[ffpStageOffset(stage) + 4 + 2] = 1;
+                }
+            }
+            state.psConst.fill(0, 0, psLen);
+            state.psConst[0] = this.hybridDebugOutput;
+            // c[0] occupies [0..3]; tfactor follows at [4..7]. The FFP packer's stage tail
+            // is already exactly two vec4s per stage, so preserve it bit-for-bit.
+            state.psConst.set(ffp.subarray(ffpStageOffset(0) - 4, ffpStageOffset(0)), 4);
+            state.psConst.set(ffp.subarray(ffpStageOffset(0), ffpStageOffset(0) + FFP_MAX_STAGES * 8), 8);
+            state.psVersion = this.copyConstantPrefixWithKey(state.psBits, state.psBits, psLen);
+        }
 
         // Cube-sampler mask for this PS — must match the pipeline's layout (resolveProgrammablePipeline
         // built it with link.cubeMask, derived identically) so the bind group stays compatible.
@@ -4886,6 +5189,10 @@ export class D3D9Device {
         // The programmable layout has a single shared sampler binding → resolve stage 0's sampler
         // from the game's D3DSAMP_* state via the shared DxSamplerCache (was a hardcoded linear).
         state.sampler = this.resolveStageSampler(0);
+        const samplerStages = ps ? 1 : this.activeStageCount();
+        for (let stage = 0; stage < PROG_BIND.MAX_TEX; stage++) {
+            state.samplers[stage] = stage < samplerStages ? this.resolveStageSampler(stage) : null;
+        }
 
         // Identical-consecutive-state elision: consecutive draws that
         // captured an IDENTICAL state collapse to one slot → the recorder skips the redundant
@@ -4901,7 +5208,7 @@ export class D3D9Device {
                 && prev.cubeMask === state.cubeMask && prev.sampler === state.sampler) {
                 let texEqual = true;
                 for (let i = 0; i < PROG_BIND.MAX_TEX; i++) {
-                    if (prev.textures[i] !== state.textures[i]) { texEqual = false; break; }
+                    if (prev.textures[i] !== state.textures[i] || prev.samplers[i] !== state.samplers[i]) { texEqual = false; break; }
                 }
                 if (texEqual) {
                     frame.rollbackDrawState();
@@ -4912,6 +5219,12 @@ export class D3D9Device {
         }
         this.lastCaptureIndex = index;
         return index;
+    }
+
+    /** Live diagnostic control; c0 is otherwise unused by a NULL pixel shader. */
+    setHybridDebugOutput(mode: number): number {
+        this.hybridDebugOutput = Math.max(0, Math.min(3, mode | 0));
+        return this.hybridDebugOutput;
     }
 
     /**
@@ -5063,7 +5376,7 @@ export class D3D9Device {
             videoOverlayCanvas,
             gdiOverlayCanvas,
             gdiOverlayRects,
-        }, target);
+        }, target, present && !target && d3d9SwapEffectDiscardsBackBuffer(this.swapEffect));
 
         // Return DrawPrimitiveUP vertex buffers to the reuse pool. execute() has already
         // issued queue.submit, so by WebGPU queue ordering the next frame's writeBuffer
@@ -5699,102 +6012,6 @@ function d3dColorToGpu(color: number): GPUColor {
     };
 }
 
-/**
- * Parsed FVF stream-0 layout in D3D byte order (position, normal, psize, diffuse,
- * specular, texcoord sets), with contiguous shader locations. Shared by
- * buildVertexLayout (GPU attributes) and buildShader (WGSL inputs) so the two never
- * drift — important because every optional component shifts what follows it.
- *
- * `stride` is the whole vertex, INCLUDING components we declare no attribute for
- * (blend weights, point size, texcoord sets past the first). Getting that total wrong
- * is not a missing feature but corrupt geometry: the GPU walks the stream by
- * arrayStride, so a short stride reads every vertex after the first from the middle of
- * its predecessor.
- */
-interface FvfLayout {
-    hasRhw: boolean;
-    hasNormal: boolean;
-    hasColor: boolean;
-    hasSpecular: boolean;
-    hasTex: boolean;
-    /** Texture coordinate sets present (D3DFVF_TEXCOUNT). Sets 0 and 1 get attributes
-     *  (stages 0 and 1); further sets occupy stride only. */
-    texCount: number;
-    hasTex1: boolean;
-    posLoc: number; posOff: number;
-    normalLoc: number; normalOff: number;
-    colorLoc: number; colorOff: number;
-    specularLoc: number; specularOff: number;
-    texLoc: number; texOff: number;
-    tex1Loc: number; tex1Off: number;
-    stride: number;
-}
-
-const D3DFVF_TEXCOUNT_MASK = 0x0f00;
-const D3DFVF_TEXCOUNT_SHIFT = 8;
-
-/** Bytes the FVF position component occupies (d3d9types.h D3DFVF_POSITION_MASK values).
- *  XYZBn carries n blend weights after the xyz triple; the last one may be packed as
- *  UBYTE4/D3DCOLOR instead of a float (D3DFVF_LASTBETA_*), which costs the same 4 bytes. */
-function fvfPositionBytes(fvf: number): number {
-    switch (fvf & 0x000e) {
-        case 0x0002: return (fvf & 0x4000) ? 16 : 12; // XYZ / XYZW
-        case 0x0004: return 16;                        // XYZRHW
-        case 0x0006: return 16;                        // XYZB1
-        case 0x0008: return 20;                        // XYZB2
-        case 0x000a: return 24;                        // XYZB3
-        case 0x000c: return 28;                        // XYZB4
-        case 0x000e: return 32;                        // XYZB5
-        default: return 12;
-    }
-}
-
-/** Floats in texture coordinate set `i` — 2 unless D3DFVF_TEXCOORDSIZE{1,3,4} says otherwise
- *  (2 bits per set from bit 16; 0=float2, 1=float3, 2=float4, 3=float1). */
-function fvfTexCoordFloats(fvf: number, set: number): number {
-    switch ((fvf >>> (16 + set * 2)) & 3) {
-        case 1: return 3;
-        case 2: return 4;
-        case 3: return 1;
-        default: return 2;
-    }
-}
-
-function parseFvf(fvf: number): FvfLayout {
-    const hasRhw = (fvf & D3DFVF_XYZRHW) !== 0;
-    // RHW (pre-transformed) vertices carry no normal and skip lighting.
-    const hasNormal = !hasRhw && (fvf & D3DFVF_NORMAL) !== 0;
-    const hasPsize = (fvf & D3DFVF_PSIZE) !== 0;
-    const hasColor = (fvf & D3DFVF_DIFFUSE) !== 0;
-    const hasSpecular = (fvf & D3DFVF_SPECULAR) !== 0;
-    const texCount = (fvf & D3DFVF_TEXCOUNT_MASK) >>> D3DFVF_TEXCOUNT_SHIFT;
-    // Sets 0 and 1 feed texture stages 0 and 1; sets past those still occupy stride and must
-    // be stepped over even though nothing samples them.
-    const hasTex = texCount > 0 && fvfTexCoordFloats(fvf, 0) >= 2;
-    const hasTex1 = texCount > 1 && fvfTexCoordFloats(fvf, 1) >= 2;
-
-    let loc = 0, off = 0;
-    const posLoc = loc++; const posOff = off; off += fvfPositionBytes(fvf);
-    let normalLoc = -1, normalOff = 0;
-    if (hasNormal) { normalLoc = loc++; normalOff = off; off += 12; }
-    if (hasPsize) off += 4;
-    let colorLoc = -1, colorOff = 0;
-    if (hasColor) { colorLoc = loc++; colorOff = off; off += 4; }
-    let specularLoc = -1, specularOff = 0;
-    if (hasSpecular) { specularLoc = loc++; specularOff = off; off += 4; }
-    let texLoc = -1, texOff = 0, tex1Loc = -1, tex1Off = 0;
-    for (let i = 0; i < texCount; i++) {
-        if (i === 0 && hasTex) { texLoc = loc++; texOff = off; }
-        if (i === 1 && hasTex1) { tex1Loc = loc++; tex1Off = off; }
-        off += fvfTexCoordFloats(fvf, i) * 4;
-    }
-
-    return {
-        hasRhw, hasNormal, hasColor, hasSpecular, hasTex, hasTex1, texCount,
-        posLoc, posOff, normalLoc, normalOff, colorLoc, colorOff,
-        specularLoc, specularOff, texLoc, texOff, tex1Loc, tex1Off, stride: off,
-    };
-}
 
 const FFP_UNPACK_COLOR_WGSL = `
 fn unpackColor(color: u32) -> vec4<f32> {
@@ -6066,9 +6283,11 @@ ${stageBody}
 `;
 }
 
+/** `boundStride` is SetStreamSource's Stride (0 = none bound); it decides which components fit
+ *  the vertex and must be the same value buildVertexLayout is given — see planFvf. */
 function buildShader(fvf: number, alphaTest: AlphaTest | null = null, litRequested = false, stageCount = 1,
-                     texGen = false): string {
-    const f = parseFvf(fvf);
+                     texGen = false, boundStride = 0): string {
+    const f = planFvf(fvf, boundStride);
     const lit = litRequested && !f.hasRhw;
 
     const inputFields: string[] = [`@location(${f.posLoc}) pos: ${f.hasRhw ? "vec4<f32>" : "vec3<f32>"}`];
@@ -6093,23 +6312,17 @@ function buildShader(fvf: number, alphaTest: AlphaTest | null = null, litRequest
     });
 }
 
-function buildVertexLayout(fvf: number): {
+function buildVertexLayout(fvf: number, boundStride = 0): {
     arrayStride: number;
     attributes: GPUVertexAttribute[];
     hasTexture: boolean;
     hasTexture1: boolean;
 } {
-    const f = parseFvf(fvf);
-    const attributes: GPUVertexAttribute[] = [
-        { shaderLocation: f.posLoc, offset: f.posOff, format: f.hasRhw ? "float32x4" : "float32x3" },
-    ];
-    if (f.hasNormal) attributes.push({ shaderLocation: f.normalLoc, offset: f.normalOff, format: "float32x3" });
-    if (f.hasColor) attributes.push({ shaderLocation: f.colorLoc, offset: f.colorOff, format: "uint32" });
-    if (f.hasSpecular) attributes.push({ shaderLocation: f.specularLoc, offset: f.specularOff, format: "uint32" });
-    if (f.hasTex) attributes.push({ shaderLocation: f.texLoc, offset: f.texOff, format: "float32x2" });
-    if (f.hasTex1) attributes.push({ shaderLocation: f.tex1Loc, offset: f.tex1Off, format: "float32x2" });
-
-    return { arrayStride: f.stride, attributes, hasTexture: f.hasTex, hasTexture1: f.hasTex1 };
+    const f = planFvf(fvf, boundStride);
+    return {
+        arrayStride: f.arrayStride, attributes: f.attributes,
+        hasTexture: f.hasTex, hasTexture1: f.hasTex1,
+    };
 }
 
 // ── D3DVERTEXELEMENT9 helpers ─────────────────────────────────────────────────
@@ -6227,13 +6440,13 @@ function buildShaderFromDecl(
     alphaTest: AlphaTest | null = null,
     litRequested = false,
     stageCount = 1,
-    /** Bound stride per stream; a stream the guest bound with stride 0 falls back to the
+    /** Bound stride per slot; a slot the guest bound with stride 0 falls back to the
      *  packed size its own elements imply. */
     streamStrides: readonly number[] = [],
-    /** Restrict the declaration to these streams. A CPU-converted draw that repacks its
-     *  vertices into one buffer passes {0}: the pipeline must declare exactly the buffers
-     *  the draw binds, or WebGPU rejects it. */
-    streamAllow: ReadonlySet<number> | null = null,
+    /** The slots this pipeline may declare, as a bitmask. A CPU-converted draw that repacks
+     *  its vertices into one buffer passes 1 (slot 0 alone): the pipeline must declare exactly
+     *  the buffers the draw binds, or WebGPU rejects it. */
+    slotMask = 0xffff,
     /** Some active stage generates its own texture coordinates — see emitFfpShader.texGen. */
     texGen = false,
 ): {
@@ -6243,7 +6456,35 @@ function buildShaderFromDecl(
     buffers: (GPUVertexBufferLayout | null)[];
     hasTexture: boolean;
 } {
-    const all = streamAllow ? elements.filter(e => streamAllow.has(e.stream)) : elements;
+    const declared = elements.filter(e => ((slotMask >>> e.stream) & 1) !== 0);
+
+    // The stride the guest BOUND is what D3D9 steps a stream by — the declaration only says
+    // where components sit inside a vertex. It may legitimately exceed the packed size (data
+    // this declaration names no attribute for), so the packed size is the fallback for an
+    // UNBOUND stream, never a floor: stepping by a packed size that overshoots reads every
+    // vertex after the first out of its successor and runs the draw past the buffer's end.
+    const strideFor = (stream: number): number =>
+        slotArrayStride(streamStrides[stream] ?? 0, computeDeclStride(declared, stream));
+    // An element that does not fit the bound vertex is dropped HERE, before anything is
+    // emitted, so the shader never declares an input the vertex state cannot supply — a
+    // pipeline whose WGSL and layout disagree is rejected outright and takes the frame with
+    // it. Position is exempt: without it there is no draw to salvage, so that stream keeps
+    // the packed stride instead.
+    const posStream = declared.find(
+        e => e.usage === DECLUSAGE_POSITION_FFP || e.usage === DECLUSAGE_POSITIONT_FFP)?.stream ?? 0;
+    const posFits = declared.every(e => e.stream !== posStream
+        || (e.usage !== DECLUSAGE_POSITION_FFP && e.usage !== DECLUSAGE_POSITIONT_FFP)
+        || e.offset + d3dDeclTypeToGpu(e.type).byteSize <= strideFor(e.stream));
+    const streamStride = (stream: number): number => (!posFits && stream === posStream)
+        ? Math.max(strideFor(stream), computeDeclStride(declared, stream))
+        : strideFor(stream);
+    const all = declared.filter(
+        e => e.offset + d3dDeclTypeToGpu(e.type).byteSize <= streamStride(e.stream));
+    if (all.length !== declared.length) {
+        Logger.warn(LogCategory.D3D9,
+            `[D3D9] declaration: ${declared.length - all.length} element(s) fall outside the bound `
+            + `stride and were dropped (streams ${[...new Set(declared.map(e => e.stream))].join(",")})`);
+    }
 
     // Find the key semantic elements we care about. A declaration addresses these by
     // (stream, offset) and each stream is bound separately, so the search spans every
@@ -6306,13 +6547,10 @@ function buildShaderFromDecl(
 
     const buffers: (GPUVertexBufferLayout | null)[] = [];
     for (const [stream, attrs] of [...perStream].sort((a, b) => a[0] - b[0])) {
-        // The bound stride wins: a vertex may carry data this declaration names no attribute
-        // for, and stepping by the packed size would then read each vertex after the first
-        // out of the middle of its predecessor. Never go below the packed size.
-        const packed = computeDeclStride(all, stream);
-        const bound = streamStrides[stream] ?? 0;
+        // Same stride the elements were filtered against, so the layout and the emitted
+        // WGSL cannot disagree about which attributes exist.
         while (buffers.length < stream) buffers.push(null);
-        buffers.push({ arrayStride: Math.max(bound, packed) || 12, attributes: attrs });
+        buffers.push({ arrayStride: streamStride(stream) || 12, attributes: attrs });
     }
 
     // Build input struct fields. D3DCOLOR is delivered as unorm8x4 (BGRA) → vec4; the

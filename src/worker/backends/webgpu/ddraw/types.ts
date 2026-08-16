@@ -211,6 +211,15 @@ export function sanitizeViewport(
 }
 
 /**
+ * The D3D9 SetRenderTarget contract resets the viewport to cover the newly
+ * selected target.  Keep that rule next to the target-bound sanitizer so D3D
+ * backends do not accidentally inherit a viewport from a differently sized RT.
+ */
+export function fullTargetViewport(targetWidth: number, targetHeight: number): SanitizedViewport {
+    return sanitizeViewport({ x: 0, y: 0, width: targetWidth, height: targetHeight, minZ: 0, maxZ: 1 }, targetWidth, targetHeight);
+}
+
+/**
  * As sanitizeViewport, but writes into a caller-owned struct so a per-draw call site
  * allocates nothing (CLAUDE.md 3.1 zero-alloc hot paths). Every field of `viewport` is
  * read before any field of `out` is written, so `out` may alias `viewport`.
@@ -836,4 +845,3 @@ export interface DrawUniformsAllocation {
 
 // Import for MegaBatch interface (circular dependency prevention)
 import type { DirectDrawSurfaceState } from "../../../modules/ddraw/com-objects";
-

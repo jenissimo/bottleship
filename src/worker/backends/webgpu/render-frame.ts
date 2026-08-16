@@ -59,6 +59,8 @@ export interface ProgrammableDrawState {
     /** Resolved GPU sampler for the shared programmable sampler binding.
      *  null → executor falls back to its default. */
     sampler: GPUSampler | null;
+    /** Per-stage samplers for the programmable-VS / fixed-function-pixel hybrid path. */
+    samplers: (GPUSampler | null)[];
     /** Bitmask of cube-sampler stages for this draw (matches the pipeline's bind-group layout). */
     cubeMask: number;
 }
@@ -135,11 +137,14 @@ export class RenderFrame {
         this.commandD.push(slot);
     }
 
-    pushDraw(vertexCount: number, startVertex: number): void {
+    /** commandC carries the guest's SetStreamSource stride for slot 0 — diagnostic only, but
+     *  it is the one number the encoder cannot recover, and a refused draw needs BOTH it and
+     *  the pipeline's arrayStride to say which of the two is wrong. */
+    pushDraw(vertexCount: number, startVertex: number, guestStride = 0): void {
         this.commandTypes.push(RenderCommandType.Draw);
         this.commandA.push(vertexCount);
         this.commandB.push(startVertex);
-        this.commandC.push(0);
+        this.commandC.push(guestStride);
         this.commandD.push(0);
     }
 
@@ -185,6 +190,7 @@ export class RenderFrame {
                 psVersion: undefined,
                 textures: new Array(PROG_BIND.MAX_TEX).fill(null),
                 sampler: null,
+                samplers: new Array(PROG_BIND.MAX_TEX).fill(null),
                 cubeMask: 0,
             };
             this.drawStates[this.drawStateCount] = s;

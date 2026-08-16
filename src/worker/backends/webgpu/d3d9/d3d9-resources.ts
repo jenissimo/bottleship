@@ -168,7 +168,9 @@ export class VertexBufferStore {
                 if (!this.gpuBuffers[i]) {
                     this.gpuBuffers[i] = device.createBuffer({
                         size: this.sizes[i],
-                        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+                        // COPY_SRC: the executor's robustness padding copies out of a slot a
+                        // draw outruns (d3d9-backend-executor planVertexRangePadding).
+                        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
                     });
                 }
                 queue.writeBuffer(this.gpuBuffers[i]!, 0, this.data[i]!);
