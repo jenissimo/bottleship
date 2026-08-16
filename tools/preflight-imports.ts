@@ -28,8 +28,10 @@
 
 import { readdirSync, readFileSync, statSync } from "fs";
 import { join, resolve, basename, extname } from "path";
+import { pathToFileURL } from "url";
 import { spawnSync } from "child_process";
 import { parsePeImports, isPeImage } from "../packages/formats/src/pe";
+import { resolveThunkedDllAlias } from "../src/worker/core/dll-aliases";
 
 const REPO = resolve(import.meta.dir, "..");
 
@@ -89,7 +91,7 @@ function exportNames(text: string): string[] {
 }
 
 /** Names the thunk generator can size, per HLE module. */
-function loadKnownNames(): ArityTables {
+async function loadKnownNames(): Promise<ArityTables> {
     const known = new Map<string, Set<string>>();
     const descriptorDlls = new Set<string>();
     const add = (mod: string, name: string) => {
@@ -102,19 +104,48 @@ function loadKnownNames(): ArityTables {
     const apiDir = join(REPO, "src", "worker", "api");
     for (const file of walk(apiDir)) {
         if (!file.endsWith(".api.ts")) continue;
-        const text = readFileSync(file, "utf8");
-        // The MODULE descriptor's own `name:` is authoritative — the filename drifts from it
-        // (kernel32-vista-supplement.ts, msvcp60.api.ts → "msvcp60"). Anchor on the
-        // `: ModuleDescriptor = {` declaration: a bare `name:\s*"..."` search finds whichever
-        // literal comes first in the file, and a module that declares an ordinal table above
-        // its descriptor (ws2_32's `{ name: "ord_1", ... }`) then gets filed under "ord_1" —
-        // so every one of its imports is treated as "no HLE module" and silently reported
-        // bindable. This tool exists to fail loudly; keep it anchored.
-        const declared =
-            /ModuleDescriptor\s*=\s*\{[^}]*?name:\s*"([^"]+)"/.exec(text)?.[1];
-        const mod = declared ?? basename(file).replace(/\.api\.ts$/, "");
-        descriptorDlls.add(mod.toLowerCase());
-        for (const name of exportNames(text)) add(mod, name);
+        // Import the descriptor itself instead of approximating TypeScript with regexes.
+        // This covers direct object literals (d3d9), generated/spread ordinal tables
+        // (ws2_32/wsock32), and filename/name drift with the exact runtime values.
+        try {
+            const namespace = await import(pathToFileURL(file).href);
+            for (const value of Object.values(namespace)) {
+                const descriptor = value as { name?: unknown; functions?: unknown };
+                if (typeof descriptor?.name !== "string" || !Array.isArray(descriptor.functions)) continue;
+                const mod = descriptor.name.toLowerCase();
+                descriptorDlls.add(mod);
+                for (const fn of descriptor.functions as Array<{ name?: unknown; ordinal?: unknown }>) {
+                    if (typeof fn.name === "string") add(mod, fn.name);
+                    if (typeof fn.ordinal === "number") add(mod, `ord_${fn.ordinal}`);
+                }
+            }
+        } catch (error) {
+            // A few descriptors import runtime constants whose modules are not safe to
+            // evaluate under Bun outside Vite. Retain a conservative static fallback —
+            // announced, because it sees less than the import does and its blind spots
+            // surface later as false "unbindable" rows for exactly this module.
+            console.error(`[preflight] WARN: could not import ${basename(file)}, falling back to static scan`
+                + ` — ${error instanceof Error ? error.message : String(error)}`);
+            const text = readFileSync(file, "utf8");
+            // Anchor on the `: ModuleDescriptor = {` declaration: a bare `name:\s*"..."`
+            // search finds whichever literal comes first, and a module that declares an
+            // ordinal table above its descriptor (ws2_32's `{ name: "ord_1", ... }`) then
+            // gets filed under "ord_1" — every import of it would read as bindable.
+            const declared = /ModuleDescriptor\s*=\s*\{[^}]*?name:\s*"([^"]+)"/.exec(text)?.[1]
+                ?? basename(file).replace(/\.api\.ts$/, "");
+            descriptorDlls.add(declared.toLowerCase());
+            for (const name of exportNames(text)) add(declared, name);
+            for (const m of text.matchAll(/\{\s*name:\s*"([^"]+)"\s*,\s*ordinal:\s*\d+\s*,\s*argCount:\s*\d+\s*\}/g)) {
+                add(declared, m[1]);
+            }
+            // The import table exposes an import-by-ordinal as `ord_N`, which the descriptor
+            // path adds from `fn.ordinal`. Without the same here, every ordinal import of a
+            // module that degraded to this scan reads as unbindable — a false positive
+            // affecting only the module that silently lost its descriptor. A numeric
+            // `ordinal:` literal appears nowhere in a .api.ts but a descriptor entry (the
+            // helpers spell it `ordinal: overrides.ordinal`), so a file-wide scrape is exact.
+            for (const m of text.matchAll(/\bordinal:\s*(\d+)/g)) add(declared, `ord_${m[1]}`);
+        }
     }
 
     // Data exports have no arity to know — the loader points the IAT straight at the
@@ -218,15 +249,20 @@ function* walk(dir: string): Generator<string> {
 // game whose plugins are the very things that break.
 const PE_EXTENSIONS = new Set([".exe", ".dll", ".asi", ".ax", ".ocx", ".cpl", ".drv", ".acm", ".flt", ".mix", ".m3d"]);
 
-/** (name, bytes) for every PE in a .wgb, read through our own container tool. */
-function* peFilesFromWgb(archive: string): Generator<[string, Uint8Array]> {
+function listWgbEntries(archive: string): string[] {
     const list = spawnSync("bun", [join(REPO, "tools", "wgb.ts"), "list", archive], {
         encoding: "utf8",
         maxBuffer: 1 << 28,
     });
     if (list.status !== 0) throw new Error(`wgb list failed: ${list.stderr}`);
-    for (const line of list.stdout.split("\n")) {
-        const entry = line.trim().split(/\s+/).slice(1).join(" ");
+    return list.stdout.split("\n")
+        .map(line => line.trim().split(/\s+/).slice(1).join(" "))
+        .filter(Boolean);
+}
+
+/** (name, bytes) for every PE in a .wgb, read through our own container tool. */
+function* peFilesFromWgb(archive: string, entries = listWgbEntries(archive)): Generator<[string, Uint8Array]> {
+    for (const entry of entries) {
         if (!PE_EXTENSIONS.has(extname(entry).toLowerCase())) continue;
         const cat = spawnSync("bun", [join(REPO, "tools", "wgb.ts"), "cat", archive, entry], {
             maxBuffer: 1 << 29,
@@ -243,26 +279,57 @@ function* peFilesFromDir(dir: string): Generator<[string, Uint8Array]> {
     }
 }
 
-function main(): void {
+async function main(): Promise<void> {
     const args = process.argv.slice(2);
-    const dllAt = args.indexOf("--dll");
-    // --dll takes a value, so its operand is not the target. Absent, indexOf is -1 and
-    // the exclusion would land on index 0 — the sole positional in the documented form.
-    const target = args.find((a, i) => !a.startsWith("--") && (dllAt < 0 || i !== dllAt + 1));
+    const positional: string[] = [];
+    let onlyDll: string | undefined;
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i]!;
+        if (arg === "--json") continue;
+        if (arg === "--dll") {
+            const value = args[++i];
+            if (!value || value.startsWith("--")) {
+                console.error("--dll requires a module name");
+                process.exit(2);
+            }
+            onlyDll = value.toLowerCase();
+            continue;
+        }
+        if (arg.startsWith("--")) {
+            console.error(`unknown option: ${arg}`);
+            process.exit(2);
+        }
+        positional.push(arg);
+    }
+    const target = positional[0];
     if (!target) {
         console.error("usage: bun tools/preflight-imports.ts <bundle.wgb | directory> [--json] [--dll <name>]");
         process.exit(2);
     }
+    if (positional.length > 1) {
+        console.error(`unexpected positional argument: ${positional[1]}`);
+        process.exit(2);
+    }
     const asJson = args.includes("--json");
-    const dllFilter = args[args.indexOf("--dll") + 1];
-    const onlyDll = args.includes("--dll") ? dllFilter?.toLowerCase() : undefined;
 
-    const tables = loadKnownNames();
+    const tables = await loadKnownNames();
     const findings = new Map<string, Finding>();
     let scanned = 0;
 
     const isArchive = statSync(target).isFile();
-    const source = isArchive ? peFilesFromWgb(resolve(target)) : peFilesFromDir(resolve(target));
+    const resolvedTarget = resolve(target);
+    const archiveEntries = isArchive ? listWgbEntries(resolvedTarget) : undefined;
+    const source = isArchive
+        ? peFilesFromWgb(resolvedTarget, archiveEntries)
+        : peFilesFromDir(resolvedTarget);
+    // An imported DLL with no HLE descriptor is safe to skip only when the bundle
+    // actually carries that guest DLL. Otherwise the runtime must synthesize stubs
+    // for its imports, and still needs exact stdcall arities (e.g. oledlg in Painkiller).
+    const guestDlls = new Set((isArchive
+        ? archiveEntries!
+        : [...walk(resolvedTarget)])
+        .filter(file => extname(file).toLowerCase() === ".dll")
+        .map(file => basename(file, extname(file)).toLowerCase()));
 
     for (const [name, bytes] of source) {
         if (!isPeImage(bytes)) continue;
@@ -274,19 +341,24 @@ function main(): void {
         }
         scanned++;
         for (const dll of imports.dlls) {
-            const mod = dll.dll.toLowerCase().replace(/\.dll$/, "");
-            if (onlyDll && mod !== onlyDll) continue;
-            // No HLE module for this DLL — it loads as real guest code from the VFS.
-            if (!tables.byDll.has(mod)) continue;
+            const importedMod = dll.dll.toLowerCase().replace(/\.dll$/, "");
+            const mod = resolveThunkedDllAlias(importedMod);
+            if (onlyDll && importedMod !== onlyDll && mod !== onlyDll) continue;
+            const hasDescriptor = tables.byDll.has(mod);
+            if (!hasDescriptor && guestDlls.has(importedMod)) continue;
             for (const entry of dll.entries) {
-                if (!entry.name) continue;
-                const mismatch = wrongArityVariant(tables, mod, entry.name);
-                if (!mismatch && isBindable(tables, mod, entry.name)) continue;
-                const key = `${mod}!${entry.name}`;
+                // The runtime exposes import-by-ordinal entries as `ord_N`; skipping
+                // them makes preflight claim a bundle is clean, then the real loader
+                // dies on the first unknown ordinal (Painkiller: oleaut32 ordinal 150).
+                const func = entry.name ?? (entry.ordinal === undefined ? undefined : `ord_${entry.ordinal}`);
+                if (!func) continue;
+                const mismatch = hasDescriptor ? wrongArityVariant(tables, mod, func) : null;
+                if (!mismatch && hasDescriptor && isBindable(tables, mod, func)) continue;
+                const key = `${importedMod}!${func}`;
                 let f = findings.get(key);
                 if (!f) {
                     findings.set(key, (f = {
-                        dll: mod, func: entry.name, importers: new Set(),
+                        dll: importedMod, func, importers: new Set(),
                         wrongArity: mismatch ?? undefined,
                     }));
                 }
@@ -334,4 +406,7 @@ function main(): void {
     process.exit(rows.length === 0 ? 0 : 1);
 }
 
-main();
+main().catch((error) => {
+    console.error(error);
+    process.exit(2);
+});
