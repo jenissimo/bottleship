@@ -11,6 +11,7 @@
 
 import { harnessService } from "./service";
 import { registerStateCommands } from "./cmds/state";
+import { registerDInputCommands } from "./cmds/dinput";
 import { registerInputCommands } from "./cmds/input";
 import { registerTimeCommands } from "./cmds/time";
 import { registerLogCommands } from "./cmds/logs";
@@ -43,6 +44,7 @@ export function installHarnessCommands(): void {
     if (installed) return;
     installed = true;
     registerStateCommands(harnessService);
+    registerDInputCommands(harnessService);
     registerInputCommands(harnessService);
     registerTimeCommands(harnessService);
     registerLogCommands(harnessService);

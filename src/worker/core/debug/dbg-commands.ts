@@ -1861,7 +1861,7 @@ export const dbg = {
                 const dump = (dev as { dumpShaders?: () => unknown }).dumpShaders?.();
                 if (!dump) continue;
                 const d = dump as {
-                    vs: Array<Record<string, unknown>>;
+                    vs: Array<{ disasm: string[] } & Record<string, unknown>>;
                     ps: Array<{ disasm: string[] } & Record<string, unknown>>;
                     projectedStageKey: number;
                     projectedStages: number[];
@@ -1872,12 +1872,16 @@ export const dbg = {
                     const { disasm, ...rest } = p;
                     return full ? { ...rest, disasm } : rest;
                 });
+                const vsSummary = d.vs.map(v => {
+                    const { disasm, ...rest } = v;
+                    return full ? { ...rest, disasm } : rest;
+                });
                 console.log(`[dbg][d3d9DumpShaders][JSON] ${JSON.stringify({
                     device: devIdx++, vsCount: d.vs.length, psCount: d.ps.length,
                     projectedShaders: d.ps.filter(p => (p.projectedTex as number) > 0).length,
                     projectedStageKey: d.projectedStageKey, projectedStages: d.projectedStages,
                     projectedSetCount: d.projectedSetCount, projectedFlagsSeen: d.projectedFlagsSeen,
-                    vs: d.vs, ps: psSummary,
+                    vs: vsSummary, ps: psSummary,
                 })}`);
             }
         } catch (e) { console.warn('[dbg] d3d9DumpShaders err', e); }

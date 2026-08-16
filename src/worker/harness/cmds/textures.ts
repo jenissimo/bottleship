@@ -55,6 +55,13 @@ export async function encodePngBase64(rgba: Uint8Array, w: number, h: number): P
 }
 
 export function registerTextureCommands(svc: HarnessService): void {
+    /** hybridDebugOutput(mode): 0 normal, 1 texture0, 2 VS colour (magenta when absent), 3 white. */
+    svc.register("hybridDebugOutput", (args) => {
+        const mode = Number(args[0] ?? 0);
+        const out: number[] = [];
+        for (const dev of d3d9Devices.values()) out.push((dev as any).setHybridDebugOutput?.(mode) ?? -1);
+        return out;
+    });
     /** textures() — gallery across backends. */
     svc.register("textures", () => {
         const ddrawSurfaces = (serializeSurfaces() as any[]).map((s) => ({ ...s, backend: "ddraw" }));
