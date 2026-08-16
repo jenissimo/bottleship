@@ -1,6 +1,7 @@
 import { ModuleDescriptor, calculateStackCleanup } from "../api/types";
 import { setupapiModule } from "../api/setupapi.api";
 import { lgvidModule } from "../api/lgvid.api";
+import { oledlgModule } from "../api/oledlg.api";
 import { kernel32VistaSupplement } from "../api/kernel32-vista-supplement";
 import { REFERENCE_ARG_COUNTS } from "../reference-argcounts.generated";
 import { Logger, LogCategory } from "./logger";
@@ -75,6 +76,7 @@ export class APIRegistry {
         // is fixed at compile time — new *.api.ts files are invisible until rebuild).
         this.registerModule(setupapiModule);
         this.registerModule(lgvidModule);
+        this.registerModule(oledlgModule);
 
         try {
             const apiModules = import.meta.glob('../api/*.api.ts', { eager: true });
@@ -315,6 +317,12 @@ export class APIRegistry {
         }
 
         return undefined;
+    }
+
+    /** Resolve an imported ordinal to its canonical exported name, if declared. */
+    public getFunctionNameByOrdinal(dllName: string, ordinal: number): string | undefined {
+        const dll = dllName.toLowerCase().replace(/\.dll$/, "");
+        return this.modules.get(dll)?.functions.find(f => f.ordinal === ordinal)?.name;
     }
 
     /**

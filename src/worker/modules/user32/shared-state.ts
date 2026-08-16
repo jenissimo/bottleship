@@ -136,8 +136,17 @@ export function purgeControlState(hwnd: number): void {
     for (const purge of extraControlStatePurgers) purge(h);
 }
 
+/** Modules holding per-HWND state of their own (ole32 drag-drop, ...). Same cross-module
+ *  hook pattern as the purgers above — handles are pool-reused, so a registration left
+ *  behind would be inherited by whatever window later gets this handle. */
+const windowDestroyObservers: Array<(hwnd: number) => void> = [];
+export function registerWindowDestroyObserver(fn: (hwnd: number) => void): void {
+    windowDestroyObservers.push(fn);
+}
+
 export function finalizeWindowDestroy(hwnd: number): void {
     purgeControlState(hwnd);
+    for (const observe of windowDestroyObservers) observe(hwnd >>> 0);
     // Handles are pool-reused: a retained client image left behind would be restored under
     // a DIFFERENT window that later gets this handle.
     System.getInstance().gdiContext?.dropWindowClientBacking?.(hwnd >>> 0);

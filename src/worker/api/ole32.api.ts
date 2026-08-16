@@ -33,6 +33,17 @@ export const ole32Module: ModuleDescriptor = {
         // OLE initialization
         makeFunc("OleInitialize", 1),
         makeFunc("OleUninitialize", 0),
+        makeFunc("RegisterDragDrop", 2, {
+            params: [
+                { name: "hwnd", type: "handle", direction: "in" },
+                { name: "pDropTarget", type: "ptr", direction: "in" },
+            ],
+            description: "Register an IDropTarget for an OLE drag-and-drop window",
+        }),
+        makeFunc("RevokeDragDrop", 1, {
+            params: [{ name: "hwnd", type: "handle", direction: "in" }],
+            description: "Revoke a window's OLE drag-and-drop target registration",
+        }),
         // Class registration
         makeFunc("CoRegisterClassObject", 5),
         makeFunc("CoRevokeClassObject", 1),

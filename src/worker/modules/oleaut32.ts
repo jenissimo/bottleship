@@ -4,6 +4,7 @@ import { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../core/logger";
 import { System } from "../core/system";
 import { Mem } from "../core/memory/mem-accessor";
+import { isValidAddress } from "../core/memory/address-guard";
 import { TypeLibRuntime } from "../core/com/typelib/typelib-objects";
 import { createSafeArrayExports } from "./oleaut32-safearray";
 import { createVariantOpExports } from "./oleaut32-variant-ops";
@@ -146,6 +147,33 @@ export class Oleaut32 implements IModule {
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
             return view.getUint32(bstr - 4, true) / 2;
         };
+
+        // BSTR SysAllocStringByteLen(LPCSTR psz, UINT len) — OLEAUT32 ordinal 150.
+        // Unlike SysAllocStringLen, len is a byte count and the source may be binary
+        // (including embedded NULs). A null psz deliberately leaves the payload untouched.
+        const sysAllocStringByteLen: ThunkImplementation = (_ctx, mem, args) => {
+            const psz = args[0] >>> 0;
+            const len = args[1] >>> 0;
+            // DWORD BSTR byte prefix + mandatory OLECHAR terminator must not overflow.
+            if (len >= 0xfffffff9) return 0;
+
+            const block = alloc(4 + len + 2);
+            if (!block) return 0;
+
+            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            view.setUint32(block, len, true);
+            if (psz) {
+                if (!isValidAddress(mem, psz, len, "r")) {
+                    System.getInstance().process?.memory?.free(block);
+                    return 0;
+                }
+                mem.copyWithin(block + 4, psz, psz + len);
+            }
+            view.setUint16(block + 4 + len, 0, true);
+            return block + 4;
+        };
+        this.exports["ord_150"] = sysAllocStringByteLen;
+        this.exports["SysAllocStringByteLen"] = sysAllocStringByteLen;
 
         // ---- VARIANT functions ----
 

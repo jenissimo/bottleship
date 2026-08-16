@@ -32,6 +32,7 @@ export const oleaut32Module: ModuleDescriptor = {
         makeFunc("SysFreeString", 1),
         makeFunc("ord_7", 1, { ordinal: 7 }),     // SysStringLen(BSTR) -> UINT
         makeFunc("SysStringLen", 1),
+        makeFunc("ord_150", 2, { ordinal: 150 }), // SysAllocStringByteLen(LPCSTR, UINT) -> BSTR
 
         // VARIANT functions (ordinal + named alias)
         makeFunc("ord_8", 1, { ordinal: 8 }),     // VariantInit(VARIANT*)
@@ -116,7 +117,7 @@ export const oleaut32Module: ModuleDescriptor = {
         makeFunc("ord_202", 1, { ordinal: 202 }), // CreateErrorInfo
         makeFunc("CreateErrorInfo", 1),
 
-        // SysStringByteLen
+        // BSTR byte-length functions
         makeFunc("SysStringByteLen", 1),
         makeFunc("SysAllocStringByteLen", 2),
 

@@ -72,6 +72,18 @@ const HLE_ONLY_DLLS = new Set<string>([
 ]);
 
 export class PELoader {
+    /**
+     * The name an import binds under: its declared name, else the canonical export name
+     * our descriptors publish for that ordinal, else the `ord_N` placeholder. Every lookup
+     * AND every log line must agree on it — a stub registered under one spelling and
+     * searched for under another silently binds nothing.
+     */
+    private resolveImportName(dllName: string, f: { name?: string; ordinal?: number }): string {
+        if (f.name) return f.name;
+        if (f.ordinal === undefined) return "";
+        return this.apiRegistry.getFunctionNameByOrdinal(dllName, f.ordinal) ?? `ord_${f.ordinal}`;
+    }
+
     private getMemory: () => Uint8Array;
     private thunkGenerator: ThunkGenerator;
     private apiRegistry: APIRegistry;
@@ -1334,7 +1346,7 @@ export class PELoader {
                         this.apiRegistry.getArgCountByOrdinal(dllName, f.ordinal) === undefined;
                 });
                 if (uncovered.length > 0 && this.findDllPath(dllName) !== null) {
-                    const names = uncovered.slice(0, 5).map(f => f.name || `ord_${f.ordinal}`).join(', ');
+                    const names = uncovered.slice(0, 5).map(f => this.resolveImportName(dllName, f)).join(', ');
                     Logger.warn(LogCategory.SYSTEM,
                         `[PE] Thunked module "${dllName}" cannot cover ${uncovered.length}/${functions.length} ` +
                         `imports of ${dllNameRaw} (${names}${uncovered.length > 5 ? ', …' : ''}); ` +
@@ -1344,7 +1356,7 @@ export class PELoader {
             }
 
             // Log ALL DLLs and their functions
-            const importedNames = functions.map(f => f.name || `ord_${f.ordinal}`);
+            const importedNames = functions.map(f => this.resolveImportName(dllName, f));
             const thunkedStatus = isThunked ? "THUNKED" : "NOT THUNKED";
             Logger.log(LogCategory.SYSTEM, `[PE] DLL: ${dllNameRaw} (${thunkedStatus}) - ${functions.length} functions`);
 
@@ -1364,7 +1376,7 @@ export class PELoader {
 
                 const stubInfos: { name: string, argCount?: number, stackCleanupBytes?: number, callingConvention?: string }[] = [];
                 for (const f of functions) {
-                    const name = f.name || `ord_${f.ordinal}`;
+                    const name = this.resolveImportName(dllName, f);
                     let argCount: number | undefined;
                     let stackCleanupBytes: number | undefined;
                     let callingConvention: string | undefined;
@@ -1540,12 +1552,12 @@ export class PELoader {
                 // Patch IAT with stub addresses
                 const inlinePatched: string[] = [];
                 for (const func of functions) {
-                    const funcKey = (func.name || `ord_${func.ordinal}`).toLowerCase();
+                    const funcKey = this.resolveImportName(dllName, func).toLowerCase();
                     if (unknownFunctions.has(funcKey)) {
                         // Unknown function from aliased DLL — use trap stub
                         this.thunkGenerator.writeTrapStub(this.memory);
                         this.view.setUint32(iatAddr, this.thunkGenerator.getTrapStubAddress(), true);
-                        Logger.warn(LogCategory.SYSTEM, `[PE] Trap stub for unknown ${dllName}:${func.name || `ord_${func.ordinal}`} (from alias ${dllNameRaw})`);
+                        Logger.warn(LogCategory.SYSTEM, `[PE] Trap stub for unknown ${dllName}:${this.resolveImportName(dllName, func)} (from alias ${dllNameRaw})`);
                     } else {
                         // Heap slab fast path: override IAT with inline x86 stub when available.
                         // Inline stub's fallback JMPs to the original OUT-trap stub. HEAP_ZERO
@@ -1580,7 +1592,7 @@ export class PELoader {
                         if (stubAddress) {
                             this.view.setUint32(iatAddr, stubAddress, true);
                         } else {
-                            Logger.warn(LogCategory.SYSTEM, `[PE] Failed to generate stub for ${dllName}:${func.name || `ord_${func.ordinal}`}`);
+                            Logger.warn(LogCategory.SYSTEM, `[PE] Failed to generate stub for ${dllName}:${this.resolveImportName(dllName, func)}`);
                         }
                     }
                     iatAddr += 4;
@@ -1790,7 +1802,7 @@ export class PELoader {
     ): void {
         // Generate stubs with arg counts and calling conventions (if known)
         const stubInfos = functions.map(f => {
-            const name = f.name || `ord_${f.ordinal}`;
+            const name = this.resolveImportName(dllName, f);
             let argCount: number | undefined;
             let callingConvention: string | undefined;
 
@@ -1826,11 +1838,11 @@ export class PELoader {
         // Patch IAT
         let addr = iatAddr;
         for (const func of functions) {
-            const stubAddress = stubDll.exportTable.get((func.name || `ord_${func.ordinal}`).toLowerCase());
+            const stubAddress = stubDll.exportTable.get(this.resolveImportName(dllName, func).toLowerCase());
             if (stubAddress) {
                 this.view.setUint32(addr, stubAddress, true);
             } else {
-                Logger.warn(LogCategory.SYSTEM, `[PE] Failed to generate stub for ${dllName}:${func.name || `ord_${func.ordinal}`}`);
+                Logger.warn(LogCategory.SYSTEM, `[PE] Failed to generate stub for ${dllName}:${this.resolveImportName(dllName, func)}`);
             }
             addr += 4;
         }

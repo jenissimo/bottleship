@@ -13,6 +13,8 @@ import { Mem } from "../core/memory/mem-accessor";
 import { readGuidFromMem } from "../core/com/typelib/typelib-types";
 import { writeGuestCode } from "../core/memory/guest-code";
 import { MEM_THUNK_CODE_BASE, MEM_THUNK_CODE_SIZE } from "../core/cpu/emulator-config";
+import { windows, registerWindowDestroyObserver } from "./user32/shared-state";
+import { DragDropRegistry } from "./ole32-dragdrop";
 
 // COM error codes
 const REGDB_E_CLASSNOTREG = 0x80040154;
@@ -33,6 +35,9 @@ const BF_MAX_KEY_LEN = 0x38;
 
 // Thread-local storage for COM initialization state
 const comInitialized = new Map<number, boolean>(); // Thread ID -> initialized
+// Drag-and-drop is an OLE service, not merely a COM service.  In particular,
+// RegisterDragDrop must reject a CoInitialize-only apartment.
+const oleInitialized = new Set<number>();
 
 export class Ole32 implements IModule {
     name = "ole32";
@@ -48,6 +53,15 @@ export class Ole32 implements IModule {
     private classRegistrations = new Map<number, { clsid: string; punk: number; flags: number }>();
     private nextClassRegistration = 0x1000;
     private messageFilter = 0;
+    private dragDropRegistrations = new DragDropRegistry({
+        isOleInitialized: () => oleInitialized.has(System.getInstance().scheduler.getCurrentThreadId()),
+        isWindowValid: (hwnd) => {
+            const window = windows.get(hwnd >>> 0);
+            return !!window && !window.pendingDestroy;
+        },
+        addRef: (dropTarget) => this.addRefGuestUnknown(dropTarget),
+        release: (dropTarget) => this.releaseGuestUnknown(dropTarget),
+    });
 
     // Map: object address in memory -> BaseComObject instance
     // This allows IUnknown methods to find the object by its memory address
@@ -57,6 +71,8 @@ export class Ole32 implements IModule {
         this.process = process;
         const system = System.getInstance();
         const interfaceRegistry = InterfaceRegistry.getInstance();
+
+        registerWindowDestroyObserver(hwnd => this.dragDropRegistrations.windowDestroyed(hwnd));
 
         // Register standard DirectX interfaces
         registerStandardDirectXInterfaces();
@@ -316,6 +332,7 @@ export class Ole32 implements IModule {
             Logger.log(LogCategory.COM, `OleInitialize called`);
             const threadId = System.getInstance().scheduler.getCurrentThreadId();
             comInitialized.set(threadId, true);
+            oleInitialized.add(threadId);
             return S_OK;
         };
 
@@ -324,7 +341,26 @@ export class Ole32 implements IModule {
             Logger.log(LogCategory.COM, `OleUninitialize called`);
             const threadId = System.getInstance().scheduler.getCurrentThreadId();
             comInitialized.delete(threadId);
+            oleInitialized.delete(threadId);
             return 0;
+        };
+
+        // HRESULT RegisterDragDrop(HWND hwnd, LPDROPTARGET pDropTarget)
+        this.exports["RegisterDragDrop"] = (ctx, mem, args) => {
+            const hwnd = args[0] >>> 0;
+            const dropTarget = args[1] >>> 0;
+            const result = this.dragDropRegistrations.register(hwnd, dropTarget);
+            Logger.verbose(LogCategory.COM,
+                `RegisterDragDrop(hwnd=0x${hwnd.toString(16)}, pDropTarget=0x${dropTarget.toString(16)}) -> 0x${result.toString(16)}`);
+            return result;
+        };
+
+        // HRESULT RevokeDragDrop(HWND hwnd)
+        this.exports["RevokeDragDrop"] = (ctx, mem, args) => {
+            const hwnd = args[0] >>> 0;
+            const result = this.dragDropRegistrations.revoke(hwnd);
+            Logger.verbose(LogCategory.COM, `RevokeDragDrop(hwnd=0x${hwnd.toString(16)}) -> 0x${result.toString(16)}`);
+            return result;
         };
 
         // HRESULT CoRegisterMessageFilter(LPMESSAGEFILTER lpMessageFilter, LPMESSAGEFILTER *lplpMessageFilter)
@@ -1058,11 +1094,11 @@ export class Ole32 implements IModule {
         return 0;
     }
 
-    /** Best-effort AddRef for a guest IUnknown* passed to CoRegisterClassObject. */
+    /** Best-effort AddRef for an HLE-managed guest IUnknown*. */
     private addRefGuestUnknown(punk: number): void {
         const obj = SystemResourceProvider.getInstance().getComObjectByAddress(punk);
         if (obj) {
-            obj.addRef();
+            obj.addRef(punk);
             return;
         }
         const mem = this.process.getCurrentMemory();
@@ -1072,17 +1108,17 @@ export class Ole32 implements IModule {
         if (vtable + 8 > mem.length) return;
         const addRefAddr = view.getUint32(vtable + 4, true) >>> 0;
         if (addRefAddr < 0x10000) return;
-        Logger.verbose(LogCategory.COM, `CoRegisterClassObject: guest AddRef skipped for punk=0x${punk.toString(16)} (stub at 0x${addRefAddr.toString(16)})`);
+        Logger.verbose(LogCategory.COM, `OLE32: guest AddRef skipped for punk=0x${punk.toString(16)} (stub at 0x${addRefAddr.toString(16)})`);
     }
 
     /** Best-effort Release paired with addRefGuestUnknown. */
     private releaseGuestUnknown(punk: number): void {
         const obj = SystemResourceProvider.getInstance().getComObjectByAddress(punk);
         if (obj) {
-            obj.release();
+            obj.release(punk);
             return;
         }
-        Logger.verbose(LogCategory.COM, `CoRevokeClassObject: guest Release skipped for punk=0x${punk.toString(16)}`);
+        Logger.verbose(LogCategory.COM, `OLE32: guest Release skipped for punk=0x${punk.toString(16)}`);
     }
 
     private readWide(mem: Uint8Array, addr: number): string {
@@ -1274,6 +1310,8 @@ export class Ole32 implements IModule {
      */
     reset(): void {
         comInitialized.clear();
+        oleInitialized.clear();
+        this.dragDropRegistrations.reset();
         this.objectAddressMap.clear();
         this.classRegistrations.clear();
         this.nextClassRegistration = 0x1000;
