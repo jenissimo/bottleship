@@ -91,6 +91,8 @@ export interface MSSStream {
     bitsPerSample: number;
     formatTag: number;
     blockAlign: number;
+    /** `stream_mem` supplied to AIL_open_stream; reported by AIL_stream_info. */
+    streamMemory: number;
     volume: number; // 0-127
     pan: number; // 0-127 (64=center)
     playbackRate: number;

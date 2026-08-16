@@ -98,6 +98,8 @@ export const mss32Module: ModuleDescriptor = {
         makeFunc("_AIL_get_preference@4", 1),
         makeFunc("_AIL_close_stream@4", 1),
         makeFunc("_AIL_open_stream@12", 3),
+        // MSS 6.x: void AIL_stream_info(HSTREAM, S32*, S32*, S32*, S32*).
+        makeFunc("_AIL_stream_info@20", 5),
         makeFunc("_AIL_stream_info@8", 2),
         makeFunc("_AIL_set_stream_loop_count@8", 2),
         makeFunc("_AIL_stream_position@4", 1),
@@ -264,8 +266,14 @@ export const mss32Module: ModuleDescriptor = {
         // RIB (Miles' Resource Interchange Broker) — every provider the engine loads
         // (.m3d/.flt/.asi decoders and 3D drivers) imports these two from mss32 to publish
         // its own entry points, so one missing name fails the whole provider's load.
+        makeFunc("RIB_alloc_provider_handle", 1), // HPROVIDER (U32 module)
+        makeFunc("_RIB_alloc_provider_handle@4", 1),
+        makeFunc("RIB_free_provider_handle", 1),
+        makeFunc("_RIB_free_provider_handle@4", 1),
         makeFunc("RIB_register_interface", 4),   // provider, interface_name, entry_count, entries
+        makeFunc("_RIB_register_interface@16", 4),
         makeFunc("RIB_unregister_interface", 4),
+        makeFunc("_RIB_unregister_interface@16", 4),
         makeFunc("AIL_close_digital_driver", 1),
         makeFunc("AIL_close_stream", 1),
         makeFunc("AIL_delay", 1),
@@ -336,7 +344,9 @@ export const mss32Module: ModuleDescriptor = {
         makeFunc("AIL_startup", 0),
         makeFunc("AIL_stop_sample", 1),
         makeFunc("AIL_stop_timer", 1),
-        makeFunc("AIL_stream_info", 2),
+        // MSS 5/6 ABI: (HSTREAM, S32 *datarate, S32 *sndtype, S32 *length, S32 *memory).
+        // The 2-arg @8 export is a separate legacy entry point, not this one.
+        makeFunc("AIL_stream_info", 5),
         makeFunc("AIL_stream_position", 1),
         makeFunc("AIL_stream_position_ms", 1),
         makeFunc("AIL_stream_status", 1),

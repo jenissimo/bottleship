@@ -1,6 +1,8 @@
 import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../../core/logger";
 import { Marshaler } from "../../core/memory/marshaler";
+import { Mem } from "../../core/memory/mem-accessor";
+import { isValidAddress } from "../../core/memory/address-guard";
 import { MSSContext, SMP_DONE, SMP_PLAYING } from "./context";
 import { MSSStream } from "./types";
 import { System } from "../../core/system";
@@ -59,6 +61,7 @@ export function createStreamExports(ctx: MSSContext): Record<string, ThunkImplem
             bitsPerSample: 16,
             formatTag: 1,
             blockAlign: 4,
+            streamMemory: memoryImage >>> 0,
             volume: 127,
             pan: 64,
             playbackRate: 1.0,
@@ -377,6 +380,44 @@ export function createStreamExports(ctx: MSSContext): Record<string, ThunkImplem
             default: return 0;
         }
     };
+
+    // AIL_stream_info(stream, datarate, sndtype, length, memory)
+    // MSS 5/6 declares this as `void __stdcall`; all results are optional S32 out
+    // parameters. Do not fold it into the unrelated legacy @8 export: that one takes
+    // two arguments, so sharing an implementation emits the wrong RET N for one of them.
+    const streamInfo5: ThunkImplementation = (ctxThunk, mem, args) => {
+        const streamHandle = args[0] >>> 0;
+        const stream = ctx.streams.get(streamHandle);
+        if (!stream) return 0;
+
+        const writeOptionalS32 = (pointer: number, value: number, field: string) => {
+            if (pointer === 0) return;
+            if (!isValidAddress(mem, pointer, 4, "rw")) {
+                Logger.warn(LogCategory.SYSTEM, `MSS32: AIL_stream_info ${field} out-pointer 0x${pointer.toString(16)} is not writable guest memory`);
+                return;
+            }
+            Mem.writeUint32(pointer, value >>> 0);
+        };
+
+        // `sndtype` is the DIG_F_* output-format bitfield (the MSS change log
+        // calls it the "flags return parameter").  This is deliberately derived
+        // from the decoded stream format, rather than exposing the WAV format tag.
+        const sndtype = (stream.bitsPerSample >= 16 ? 0x1 : 0) |
+            (stream.channels >= 2 ? 0x2 : 0);
+        const length = stream.pcmBytes ?? stream.fileData?.length ?? 0;
+
+        writeOptionalS32(args[1] >>> 0, Math.floor(getBytesPerSecond(stream)), "datarate");
+        writeOptionalS32(args[2] >>> 0, sndtype, "sndtype");
+        writeOptionalS32(args[3] >>> 0, length, "length");
+        writeOptionalS32(args[4] >>> 0, stream.streamMemory, "memory");
+        Logger.verbose(LogCategory.SYSTEM, `MSS32: AIL_stream_info stream=0x${streamHandle.toString(16)} rate=${getBytesPerSecond(stream)} type=0x${sndtype.toString(16)} length=${length} memory=${stream.streamMemory}`);
+        return 0;
+    };
+    exports["_AIL_stream_info@20"] = streamInfo5;
+    // Registered on the exact name too: the stub lookup falls back to a normalized key
+    // (leading `_` and `@N` stripped), under which the undecorated import would otherwise
+    // resolve to whichever `AIL_stream_info` variant registered last.
+    exports["AIL_stream_info"] = streamInfo5;
 
     // _AIL_service_stream@8
     exports["_AIL_service_stream@8"] = (ctxThunk, mem, args) => {

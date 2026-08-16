@@ -2,6 +2,12 @@ import { Process } from "../../core/process";
 import { VfsFileHandle } from "../../runtime/filesystem/vfs";
 import { MSSSample, MSSStream, MSSWaveOut, RedbookHandle, MSSTimer, MSSSequence, MSSListener3D } from "./types";
 
+/** A provider registered through Miles' Resource Interface Broker (RIB). */
+export interface MSSRibProvider {
+    module: number;
+    interfaces: Map<string, { entryCount: number; entries: number[] }>;
+}
+
 export const SMP_FREE = 1;
 export const SMP_DONE = 2;
 export const SMP_PLAYING = 4;
@@ -21,6 +27,8 @@ export interface MSSContext {
     redbookHandles: Map<number, RedbookHandle>;
     timers: Map<number, MSSTimer>;
     sequences: Map<number, MSSSequence>;
+    /** Opaque HPROVIDERs allocated for .m3d/.flt/.asi RIB_Main entry points. */
+    ribProviders: Map<number, MSSRibProvider>;
 
     nextSampleId: number;
     nextStreamId: number;
@@ -114,6 +122,7 @@ export function createMSSContext(process: Process): MSSContext {
         redbookHandles: new Map(),
         timers: new Map(),
         sequences: new Map(),
+        ribProviders: new Map(),
 
         nextSampleId: 1,
         nextStreamId: 0x00010001,

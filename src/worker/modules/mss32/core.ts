@@ -2,6 +2,7 @@ import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../../core/logger";
 import { Marshaler } from "../../core/memory/marshaler";
 import { MemoryGuard } from "../../core/memory/mem-guard";
+import { isValidAddress } from "../../core/memory/address-guard";
 import { MSSContext, SMP_PLAYING } from "./context";
 import { ensureDriverHandle, stopHeartbeat, freeDriverResources, getBytesPerSecond, getPlaybackLengthBytes } from "./helpers";
 import { updateEmulatorState, stopRingBuffer } from "./playback-engine";
@@ -60,6 +61,10 @@ export function createCoreExports(ctx: MSSContext): Record<string, ThunkImplemen
         ctx.samples.clear();
         ctx.samplesById.clear();
         ctx.waveOuts.clear();
+        for (const provider of ctx.ribProviders.keys()) {
+            ctx.process.memory.free(provider);
+        }
+        ctx.ribProviders.clear();
         return 0;
     };
 
@@ -525,7 +530,96 @@ export function createCoreExports(ctx: MSSContext): Record<string, ThunkImplemen
 
     // ==================== RIB / Processor Chain Stubs ====================
     // Real MSS32 uses RIB (Resource Interface Broker) to enumerate and bind
-    // mixer providers. We have no providers — return 0/NULL for everything.
+    // mixer providers.  External .m3d/.flt/.asi modules call these while their
+    // RIB_Main registers its callable interface, so retain that state instead of
+    // pretending registration succeeded and then losing the provider.
+
+    const RIB_NOERR = 0;
+    const RIB_NOT_FOUND = 2;
+    const RIB_INTERFACE_ENTRY_SIZE = 16;
+
+    const readRibEntries = (mem: Uint8Array, listPtr: number, entryCount: number): number[] | null => {
+        if (entryCount < 0 || entryCount > 4096 || !listPtr ||
+            !isValidAddress(mem, listPtr, entryCount * RIB_INTERFACE_ENTRY_SIZE, "r")) {
+            return null;
+        }
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const entries: number[] = [];
+        for (let i = 0; i < entryCount; i++) {
+            // RIB_INTERFACE_ENTRY = type, entry_name, token, subtype.  Token is
+            // retained because it is the provider's function/attribute identity.
+            entries.push(view.getUint32(listPtr + i * RIB_INTERFACE_ENTRY_SIZE + 8, true));
+        }
+        return entries;
+    };
+
+    const allocProviderHandle: ThunkImplementation = (ctxThunk, mem, args) => {
+        const module = args[0] >>> 0;
+        try {
+            // HPROVIDER is opaque in the SDK.  Back it with a guest allocation so
+            // a provider can safely retain/pass it, and preserve its HMODULE for
+            // its eventual RIB interface registrations.
+            const handle = ctx.process.memory.alloc(4) >>> 0;
+            if (!handle) return 0;
+            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            MemoryGuard.writeUint32(mem, view, handle, module, "MSS32:RIB_alloc_provider_handle:module");
+            ctx.ribProviders.set(handle, { module, interfaces: new Map() });
+            Logger.verbose(LogCategory.SYSTEM, `MSS32: RIB_alloc_provider_handle(module=0x${module.toString(16)}) -> 0x${handle.toString(16)}`);
+            return handle;
+        } catch (error) {
+            Logger.warn(LogCategory.SYSTEM, `MSS32: RIB_alloc_provider_handle failed: ${error}`);
+            return 0;
+        }
+    };
+
+    const freeProviderHandle: ThunkImplementation = (ctxThunk, mem, args) => {
+        const handle = args[0] >>> 0;
+        if (!ctx.ribProviders.delete(handle)) return 0;
+        ctx.process.memory.free(handle);
+        return 0;
+    };
+
+    const registerInterface: ThunkImplementation = (ctxThunk, mem, args) => {
+        const provider = ctx.ribProviders.get(args[0] >>> 0);
+        const interfaceNamePtr = args[1] >>> 0;
+        const entryCount = args[2] | 0;
+        const entries = readRibEntries(mem, args[3] >>> 0, entryCount);
+        if (!provider || !interfaceNamePtr || !entries) return RIB_NOT_FOUND;
+
+        const interfaceName = Marshaler.readString(mem, interfaceNamePtr);
+        if (!interfaceName) return RIB_NOT_FOUND;
+        provider.interfaces.set(interfaceName, { entryCount, entries });
+        Logger.verbose(LogCategory.SYSTEM, `MSS32: RIB_register_interface provider=0x${(args[0] >>> 0).toString(16)} interface=${interfaceName} entries=${entryCount}`);
+        return RIB_NOERR;
+    };
+
+    const unregisterInterface: ThunkImplementation = (ctxThunk, mem, args) => {
+        const provider = ctx.ribProviders.get(args[0] >>> 0);
+        if (!provider) return RIB_NOT_FOUND;
+        const interfaceNamePtr = args[1] >>> 0;
+        const entryCount = args[2] | 0;
+        if (!interfaceNamePtr && entryCount === 0 && (args[3] >>> 0) === 0) {
+            provider.interfaces.clear();
+            return RIB_NOERR;
+        }
+        const entries = readRibEntries(mem, args[3] >>> 0, entryCount);
+        if (!interfaceNamePtr || !entries) return RIB_NOT_FOUND;
+        const interfaceName = Marshaler.readString(mem, interfaceNamePtr);
+        const registered = provider.interfaces.get(interfaceName);
+        if (!registered || registered.entryCount !== entryCount ||
+            registered.entries.some((token, i) => token !== entries[i])) return RIB_NOT_FOUND;
+        provider.interfaces.delete(interfaceName);
+        return RIB_NOERR;
+    };
+
+    exports["RIB_alloc_provider_handle"] = allocProviderHandle;
+    exports["_RIB_alloc_provider_handle@4"] = allocProviderHandle;
+    exports["RIB_free_provider_handle"] = freeProviderHandle;
+    exports["_RIB_free_provider_handle@4"] = freeProviderHandle;
+    exports["RIB_register_interface"] = registerInterface;
+    exports["_RIB_register_interface@16"] = registerInterface;
+    exports["RIB_unregister_interface"] = unregisterInterface;
+    exports["_RIB_unregister_interface@16"] = unregisterInterface;
 
     // _RIB_enumerate_providers@12(type, outPROV, outNAME) → 0 = no more providers
     exports["_RIB_enumerate_providers@12"] = (ctxThunk, mem, args) => {
