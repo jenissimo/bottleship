@@ -21,6 +21,7 @@ import { DSound } from "./modules/dsound";
 import { WinMM } from "./modules/winmm";
 import { Ole32 } from "./modules/ole32";
 import { Oleaut32 } from "./modules/oleaut32";
+import { Oledlg } from "./modules/oledlg";
 import { DDraw } from "./modules/ddraw";
 import { getOverlayCompositePlan } from "./modules/user32/dialog-overlay";
 import { flushHeldWindowDCs } from "./modules/user32/window";
@@ -2335,6 +2336,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       const winmm = new WinMM();
       const ole32 = new Ole32();
       const oleaut32 = new Oleaut32();
+      const oledlg = new Oledlg();
       const ddraw = new DDraw();
       const dinput = new DInput();
       const dplayx = new DPlayX();
@@ -2389,49 +2391,6 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       const alut = new ALUT();
       const wininet = new Wininet();
 
-      // Prewarm stub DLLs ONLY for thunked modules that lack a JS implementation
-      (() => {
-        const api = APIRegistry.getInstance();
-        const tg = process.thunkGenerator as any;
-        const mem = System.getInstance().process?.memory;
-        const memBytes = process.v86.mem8 || (process.v86.v86 && process.v86.v86.cpu.mem8);
-        if (!tg?.generateStubDll || !mem || !memBytes) return;
-
-        // Modules that already have JS implementations (registered below) should NOT be stubbed here
-        const implemented = new Set([
-          kernel32.name, ntdll.name, user32.name, gdi32.name, d3d9.name, d3dx9.name, advapi32.name,
-          dsound.name, winmm.name, ole32.name, ddraw.name, dinput.name,
-          dplayx.name, mss32.name, wsock32.name, shell32.name, shlwapi.name, comdlg32.name, comctl32.name,
-          dwmapi.name,
-          riched32.name,
-          wtsapi32.name,
-          msacm32.name,
-          imm32.name,
-          msimg32.name,
-          uxtheme.name,
-          wintrust.name,
-          crypt32.name,
-          ws2_32.name,
-          psapi.name,
-          imagehlp.name,
-          iphlpapi.name,
-          tapi32.name,
-          setupapi.name,
-          netapi32.name,
-          glu32.name,
-          "gdiplus",
-          "bass",
-          "galaxy",
-        ].map(n => n.toLowerCase()));
-
-        // TODO: Re-enable stub DLL prewarming when moduleRegistry is restored
-        // for (const mod of api.getModules()) {
-        //   const dllName = mod.name.toLowerCase();
-        //   if (implemented.has(dllName)) continue;
-        //   ...
-        // }
-      })();
-
       kernel32.initialize(process);
       ntdll.initialize(process);
       user32.initialize(process);
@@ -2443,6 +2402,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       winmm.initialize(process);
       ole32.initialize(process);
       oleaut32.initialize(process);
+      oledlg.initialize(process);
       ddraw.initialize(process);
       dinput.initialize(process);
       dplayx.initialize(process);
@@ -2510,6 +2470,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.registerModule(winmm.name, winmm);
       process.registerModule(ole32.name, ole32);
       process.registerModule(oleaut32.name, oleaut32);
+      process.registerModule(oledlg.name, oledlg);
       process.registerModule(ddraw.name, ddraw);
       process.registerModule(dinput.name, dinput);
       process.registerModule(dplayx.name, dplayx);
@@ -2578,6 +2539,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.dispatcher.registerModule(dsound.name, dsound.exports);
       process.dispatcher.registerModule(winmm.name, winmm.exports);
       process.dispatcher.registerModule(ole32.name, ole32.exports);
+      process.dispatcher.registerModule(oledlg.name, oledlg.exports);
       process.dispatcher.registerModule(ddraw.name, ddraw.exports);
       process.dispatcher.registerModule(dinput.name, dinput.exports);
       process.dispatcher.registerModule(dplayx.name, dplayx.exports);
