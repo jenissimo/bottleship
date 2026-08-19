@@ -1,7 +1,7 @@
 // Module management functions for kernel32
 // GetModuleHandle*, LoadLibrary*, GetProcAddress, FreeLibrary, GetModuleFileName*
 
-import { ThunkImplementation } from '../../../core/thunking/thunk-dispatcher';
+import { ThunkImplementation, ThunkResult } from '../../../core/thunking/thunk-dispatcher';
 import { System } from '../../../core/system';
 import { Marshaler } from '../../../core/memory/marshaler';
 import { Logger, LogCategory, LogLevel } from '../../../core/logger';
@@ -759,7 +759,17 @@ function initModuleFunctions(): void {
         return { value: (toWrite / 2) - 1, stackCleanup: 12 };
     };
 
-    exports['LoadLibraryExW'] = async (ctx, mem, args) => {
+    /**
+     * The LoadLibrary family is SYNCHRONOUS except for the one leg that reads a PE off the
+     * VFS. That distinction matters because the dispatcher classifies a thunk as async purely
+     * by `result instanceof Promise` (thunk-dispatcher), and an `async` handler always returns
+     * one: declaring these `async` parked and unparked the guest thread under the §3.5 async
+     * protocol on EVERY call, including a handle-cache hit and a probe for a DLL that does not
+     * exist. Titles poll for absent DLLs (SDL2 re-probes hid.dll once per frame looking for
+     * gamepad hotplug), so that was a park per frame for an answer the loader already had.
+     * peekLoadDll() reports whether I/O is actually needed; only that branch returns a Promise.
+     */
+    exports['LoadLibraryExW'] = (ctx, mem, args) => {
         const lpLibFileName = args[0];
         const hFile = args[1]; // Reserved, must be NULL
         const dwFlags = args[2];
@@ -797,34 +807,52 @@ function initModuleFunctions(): void {
         }
 
 
+        const loaded = (module: { baseAddress: number }): ThunkResult => {
+            const dllInits = loader!.getPendingDllInits();
+            if (dllInits.length > 0) {
+                Logger.log(LogCategory.KERNEL32,
+                    `LoadLibraryExW("${dllName}") -> 0x${module.baseAddress.toString(16)} (loaded from VFS, ${dllInits.length} DllMain pending)`);
+                return { value: module.baseAddress, stackCleanup: 12, dllInits };
+            }
+            Logger.log(LogCategory.KERNEL32,
+                `LoadLibraryExW("${dllName}") -> 0x${module.baseAddress.toString(16)} (loaded from VFS)`);
+            return { value: module.baseAddress, stackCleanup: 12 };
+        };
+        const notFound = (): ThunkResult => {
+            Logger.log(LogCategory.KERNEL32, `LoadLibraryExW("${dllName}"): NOT FOUND`);
+            system.process!.lastError = 126; // ERROR_MOD_NOT_FOUND
+            return { value: 0, stackCleanup: 12 };
+        };
+
         // PRIORITY 3: Try to load real DLL from VFS
         if (loader) {
-            Logger.log(LogCategory.KERNEL32, `LoadLibraryExW("${dllName}"): trying to load from VFS...`);
-            try {
-                const module = await loader.loadDll(dllName, true);
-                if (module) {
-                    const dllInits = loader.getPendingDllInits();
-                    if (dllInits.length > 0) {
-                        Logger.log(LogCategory.KERNEL32,
-                            `LoadLibraryExW("${dllName}") -> 0x${module.baseAddress.toString(16)} (loaded from VFS, ${dllInits.length} DllMain pending)`);
-                        return { value: module.baseAddress, stackCleanup: 12, dllInits };
+            const peek = loader.peekLoadDll(dllName);
+            if (peek.kind === "existing") {
+                const res = loaded(peek.module);
+                // A pending DllMain chain is only walked on the async-restore path, which
+                // needs the CPU parked at the spin loop. Hand this back as a Promise so the
+                // inits still run — the sync path would silently drop them.
+                return res.dllInits ? Promise.resolve(res) : res;
+            }
+            if (peek.kind === "io") {
+                Logger.log(LogCategory.KERNEL32, `LoadLibraryExW("${dllName}"): trying to load from VFS...`);
+                return (async () => {
+                    try {
+                        const module = await loader.loadDll(dllName, true);
+                        if (module) return loaded(module);
+                    } catch (e) {
+                        Logger.warn(LogCategory.KERNEL32,
+                            `LoadLibraryExW("${dllName}"): VFS load failed: ${e}`);
                     }
-                    Logger.log(LogCategory.KERNEL32,
-                        `LoadLibraryExW("${dllName}") -> 0x${module.baseAddress.toString(16)} (loaded from VFS)`);
-                    return { value: module.baseAddress, stackCleanup: 12 };
-                }
-            } catch (e) {
-                Logger.warn(LogCategory.KERNEL32,
-                    `LoadLibraryExW("${dllName}"): VFS load failed: ${e}`);
+                    return notFound();
+                })();
             }
         }
 
-        Logger.log(LogCategory.KERNEL32, `LoadLibraryExW("${dllName}"): NOT FOUND`);
-        system.process!.lastError = 126; // ERROR_MOD_NOT_FOUND
-        return { value: 0, stackCleanup: 12 };
+        return notFound();
     };
 
-    exports['LoadLibraryExA'] = async (ctx, mem, args) => {
+    exports['LoadLibraryExA'] = (ctx, mem, args) => {
         const lpLibFileName = args[0];
         const hFile = args[1];
         const dwFlags = args[2];
@@ -862,34 +890,52 @@ function initModuleFunctions(): void {
         }
 
 
+        const loaded = (module: { baseAddress: number }): ThunkResult => {
+            const dllInits = loader!.getPendingDllInits();
+            if (dllInits.length > 0) {
+                Logger.log(LogCategory.KERNEL32,
+                    `LoadLibraryExA("${dllName}") -> 0x${module.baseAddress.toString(16)} (loaded from VFS, ${dllInits.length} DllMain pending)`);
+                return { value: module.baseAddress, stackCleanup: 12, dllInits };
+            }
+            Logger.log(LogCategory.KERNEL32,
+                `LoadLibraryExA("${dllName}") -> 0x${module.baseAddress.toString(16)} (loaded from VFS)`);
+            return { value: module.baseAddress, stackCleanup: 12 };
+        };
+        const notFound = (): ThunkResult => {
+            Logger.log(LogCategory.KERNEL32, `LoadLibraryExA("${dllName}"): NOT FOUND`);
+            system.process!.lastError = 126;
+            return { value: 0, stackCleanup: 12 };
+        };
+
         // PRIORITY 3: Try to load real DLL from VFS
         if (loader) {
-            Logger.log(LogCategory.KERNEL32, `LoadLibraryExA("${dllName}"): trying to load from VFS...`);
-            try {
-                const module = await loader.loadDll(dllName, true);
-                if (module) {
-                    const dllInits = loader.getPendingDllInits();
-                    if (dllInits.length > 0) {
-                        Logger.log(LogCategory.KERNEL32,
-                            `LoadLibraryExA("${dllName}") -> 0x${module.baseAddress.toString(16)} (loaded from VFS, ${dllInits.length} DllMain pending)`);
-                        return { value: module.baseAddress, stackCleanup: 12, dllInits };
+            const peek = loader.peekLoadDll(dllName);
+            if (peek.kind === "existing") {
+                const res = loaded(peek.module);
+                // A pending DllMain chain is only walked on the async-restore path, which
+                // needs the CPU parked at the spin loop. Hand this back as a Promise so the
+                // inits still run — the sync path would silently drop them.
+                return res.dllInits ? Promise.resolve(res) : res;
+            }
+            if (peek.kind === "io") {
+                Logger.log(LogCategory.KERNEL32, `LoadLibraryExA("${dllName}"): trying to load from VFS...`);
+                return (async () => {
+                    try {
+                        const module = await loader.loadDll(dllName, true);
+                        if (module) return loaded(module);
+                    } catch (e) {
+                        Logger.warn(LogCategory.KERNEL32,
+                            `LoadLibraryExA("${dllName}"): VFS load failed: ${e}`);
                     }
-                    Logger.log(LogCategory.KERNEL32,
-                        `LoadLibraryExA("${dllName}") -> 0x${module.baseAddress.toString(16)} (loaded from VFS)`);
-                    return { value: module.baseAddress, stackCleanup: 12 };
-                }
-            } catch (e) {
-                Logger.warn(LogCategory.KERNEL32,
-                    `LoadLibraryExA("${dllName}"): VFS load failed: ${e}`);
+                    return notFound();
+                })();
             }
         }
 
-        Logger.log(LogCategory.KERNEL32, `LoadLibraryExA("${dllName}"): NOT FOUND`);
-        system.process!.lastError = 126;
-        return { value: 0, stackCleanup: 12 };
+        return notFound();
     };
 
-    exports['LoadLibraryW'] = async (_ctx, mem, args) => {
+    exports['LoadLibraryW'] = (_ctx, mem, args) => {
         const lpLibFileName = args[0];
         const dllName = canonicalizeLibraryRequest(
             lpLibFileName ? Marshaler.readStringW(mem, lpLibFileName) : ""
@@ -928,31 +974,49 @@ function initModuleFunctions(): void {
         }
 
 
+        const loaded = (module: { baseAddress: number }): ThunkResult => {
+            rememberLoadLibraryHandle(dllName, module.baseAddress);
+            const dllInits = loader!.getPendingDllInits();
+            if (dllInits.length > 0) {
+                return { value: module.baseAddress, stackCleanup: 4, dllInits };
+            }
+            return { value: module.baseAddress, stackCleanup: 4 };
+        };
+        const notFound = (): ThunkResult => {
+            if (verbose) {
+                Logger.verbose(LogCategory.KERNEL32, `LoadLibraryW("${dllName}") -> NOT FOUND`);
+            }
+            system.process!.lastError = 126; // ERROR_MOD_NOT_FOUND
+            return { value: 0, stackCleanup: 4 };
+        };
+
         // PRIORITY 3: load native DLL from VFS
         if (loader) {
-            try {
-                const module = await loader.loadDll(dllName, true);
-                if (module) {
-                    rememberLoadLibraryHandle(dllName, module.baseAddress);
-                    const dllInits = loader.getPendingDllInits();
-                    if (dllInits.length > 0) {
-                        return { value: module.baseAddress, stackCleanup: 4, dllInits };
+            const peek = loader.peekLoadDll(dllName);
+            if (peek.kind === "existing") {
+                const res = loaded(peek.module);
+                // A pending DllMain chain is only walked on the async-restore path, which
+                // needs the CPU parked at the spin loop. Hand this back as a Promise so the
+                // inits still run — the sync path would silently drop them.
+                return res.dllInits ? Promise.resolve(res) : res;
+            }
+            if (peek.kind === "io") {
+                return (async () => {
+                    try {
+                        const module = await loader.loadDll(dllName, true);
+                        if (module) return loaded(module);
+                    } catch (e) {
+                        Logger.warn(LogCategory.KERNEL32, `LoadLibraryW("${dllName}") failed: ${e}`);
                     }
-                    return { value: module.baseAddress, stackCleanup: 4 };
-                }
-            } catch (e) {
-                Logger.warn(LogCategory.KERNEL32, `LoadLibraryW("${dllName}") failed: ${e}`);
+                    return notFound();
+                })();
             }
         }
 
-        if (verbose) {
-            Logger.verbose(LogCategory.KERNEL32, `LoadLibraryW("${dllName}") -> NOT FOUND`);
-        }
-        system.process!.lastError = 126; // ERROR_MOD_NOT_FOUND
-        return { value: 0, stackCleanup: 4 };
+        return notFound();
     };
 
-    exports['LoadLibraryA'] = async (ctx, mem, args) => {
+    exports['LoadLibraryA'] = (ctx, mem, args) => {
         const lpLibFileName = args[0];
         const dllName = canonicalizeLibraryRequest(
             lpLibFileName ? Marshaler.readString(mem, lpLibFileName) : ""
@@ -1012,33 +1076,51 @@ function initModuleFunctions(): void {
         }
 
 
+        const loaded = (module: { baseAddress: number }): ThunkResult => {
+            rememberLoadLibraryHandle(dllName, module.baseAddress);
+            Logger.verbose(
+                LogCategory.KERNEL32,
+                `LoadLibraryA("${dllName}") -> 0x${module.baseAddress.toString(16)} (native)${callerInfo}`
+            );
+            const dllInits = loader!.getPendingDllInits();
+            if (dllInits.length > 0) {
+                return { value: module.baseAddress, stackCleanup: 4, dllInits };
+            }
+            return { value: module.baseAddress, stackCleanup: 4 };
+        };
+        const notFound = (): ThunkResult => {
+            system.process!.lastError = 126; // ERROR_MOD_NOT_FOUND
+            Logger.log(
+                LogCategory.KERNEL32,
+                `LoadLibraryA("${dllName}") -> NOT FOUND (err=126)${callerInfo}`
+            );
+            return { value: 0, stackCleanup: 4 };
+        };
+
         // PRIORITY 3: load native DLL from VFS
         if (loader) {
-            try {
-                const module = await loader.loadDll(dllName, true);
-                if (module) {
-                    rememberLoadLibraryHandle(dllName, module.baseAddress);
-                    Logger.verbose(
-                        LogCategory.KERNEL32,
-                        `LoadLibraryA("${dllName}") -> 0x${module.baseAddress.toString(16)} (native)${callerInfo}`
-                    );
-                    const dllInits = loader.getPendingDllInits();
-                    if (dllInits.length > 0) {
-                        return { value: module.baseAddress, stackCleanup: 4, dllInits };
+            const peek = loader.peekLoadDll(dllName);
+            if (peek.kind === "existing") {
+                const res = loaded(peek.module);
+                // A pending DllMain chain is only walked on the async-restore path, which
+                // needs the CPU parked at the spin loop. Hand this back as a Promise so the
+                // inits still run — the sync path would silently drop them.
+                return res.dllInits ? Promise.resolve(res) : res;
+            }
+            if (peek.kind === "io") {
+                return (async () => {
+                    try {
+                        const module = await loader.loadDll(dllName, true);
+                        if (module) return loaded(module);
+                    } catch (e) {
+                        Logger.warn(LogCategory.KERNEL32, `LoadLibraryA("${dllName}") failed: ${e}${callerInfo}`);
                     }
-                    return { value: module.baseAddress, stackCleanup: 4 };
-                }
-            } catch (e) {
-                Logger.warn(LogCategory.KERNEL32, `LoadLibraryA("${dllName}") failed: ${e}${callerInfo}`);
+                    return notFound();
+                })();
             }
         }
 
-        system.process!.lastError = 126; // ERROR_MOD_NOT_FOUND
-        Logger.log(
-            LogCategory.KERNEL32,
-            `LoadLibraryA("${dllName}") -> NOT FOUND (err=126)${callerInfo}`
-        );
-        return { value: 0, stackCleanup: 4 };
+        return notFound();
     };
 
     exports['FreeLibrary'] = (ctx, mem, args) => {

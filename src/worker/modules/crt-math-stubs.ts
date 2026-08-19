@@ -48,11 +48,9 @@ const REGION_SIZE = 256;
  * slots are the callee's to modify) for the double-arg stubs, and 16 bytes of
  * fresh stack for _ftol, which has no argument area.
  *
- * The caller MUST register [regionBase, regionEnd) as a scheduler non-preemptible
- * range: a preempt between the two FLDCWs would leave the softfloat rounding mode
- * set for another thread (fpuRestore writes fpu_control_word straight into WASM
- * memory and never calls set_control_word, so a context switch does not re-derive
- * it).
+ * The FLDCW window is preempt-safe: the control word is per-thread state — saved and
+ * restored with the rest of the x87 snapshot (fpu-helper.ts) — and softfloat reads RC/PC
+ * from it live, so a thread switch inside a stub hands nobody our rounding mode.
  */
 export function writeCrtMathStubs(
     allocator: StubAllocator,

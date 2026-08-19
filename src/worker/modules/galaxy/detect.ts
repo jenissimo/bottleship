@@ -2,6 +2,7 @@ import type { LoadedPEModule } from '../../core/module-registry';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { Logger, LogCategory } from '../../core/logger';
 import { Mem } from '../../core/memory/mem-accessor';
+import { resolveExportBodyRva } from '../../core/hle-lib/lib-patcher';
 import { HP344_PROFILE } from './profiles/hp-344';
 import { UT348_PROFILE } from './profiles/ut-348';
 import type { GalaxyProfile } from './profiles/types';
@@ -42,20 +43,7 @@ export function detectGalaxyIntegration(module: LoadedPEModule): GalaxyIntegrati
     return 'UNKNOWN';
 }
 
-/** Follow up to 4 rel32 jmp thunks at export entry. */
-export function resolveExportBodyRva(module: LoadedPEModule, exportRva: number): number {
-    const imageEnd = module.baseAddress + module.size;
-    let rva = exportRva;
-    for (let hop = 0; hop < 4; hop++) {
-        const addr = module.baseAddress + rva;
-        const b0 = Mem.readUint8(addr) ?? 0;
-        if (b0 !== 0xe9) break;
-        const rel = Mem.readInt32(addr + 1) ?? 0;
-        rva = (rva + 5 + rel) >>> 0;
-        if (rva === 0 || module.baseAddress + rva >= imageEnd) break;
-    }
-    return rva;
-}
+export { resolveExportBodyRva };
 
 export function verifyBannerNeedle(module: LoadedPEModule, needle: string): boolean {
     if (!needle) return false;

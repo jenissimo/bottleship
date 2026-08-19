@@ -13,7 +13,7 @@ import { EMU_NATIVE_VIDEO_DLLS, VIDEO_DLL_NAMES } from './cpu/emulator-config';
 import { hypercallDataManager } from './cpu/hypercall-data';
 import { libHleManager } from './hle-lib/lib-hle-manager';
 import { hookRegistry } from './hooks';
-import { Galaxy } from '../modules/galaxy';
+import { runNativeModulePatchers } from '../modules/native-patchers';
 import { normalizeDllBaseName, resolveThunkedDllAlias } from './dll-aliases';
 import { findDllRule, normalizeDllPathToken } from './dll-rules';
 import { isUnderSystemDirectory } from './hle-system-catalog';
@@ -597,26 +597,31 @@ export class PELoader {
     }
 
     /**
-     * Load a real DLL from VFS
-     * Returns the module or null if DLL not found in VFS
+     * Everything loadDll decides BEFORE its first await, as a value.
+     *
+     * Split out so a caller can learn the outcome synchronously: LoadLibrary* must not
+     * park the guest thread (§3.5) for a probe whose answer is "no such DLL" or "already
+     * loaded", and only the "path" case actually reads a file. Keeping the decision in one
+     * place is what stops the sync predicate and the loader drifting apart.
      */
-    async loadDll(dllName: string, invokeDllMain: boolean = true): Promise<LoadedPEModule | null> {
-        if (!this.vfs || !this.moduleRegistry) {
-            return null;
-        }
+    private resolveLoadTarget(dllName: string):
+        | { kind: "none" }
+        | { kind: "existing"; module: LoadedPEModule }
+        | { kind: "path"; path: string; nameLower: string } {
+        if (!this.vfs || !this.moduleRegistry) return { kind: "none" };
 
         const dllNameLower = dllName.toLowerCase().replace(/\.dll$/, '');
 
         // Skip native load of video DLLs when HLE stubs are active
         if (!EMU_NATIVE_VIDEO_DLLS && VIDEO_DLL_NAMES.has(dllNameLower)) {
             Logger.log(LogCategory.SYSTEM, `[PE] Skipping native load of "${dllName}" — HLE stubs active`);
-            return null; // IAT will be resolved to HLE thunk stubs
+            return { kind: "none" }; // IAT will be resolved to HLE thunk stubs
         }
 
         // D3DX9 versioned redist DLLs (d3dx9_24 … d3dx9_43) — always HLE via canonical d3dx9 module.
         if (isD3dx9VersionedDll(dllNameLower)) {
             Logger.log(LogCategory.SYSTEM, `[PE] Skipping native load of "${dllName}" — d3dx9 HLE active`);
-            return null;
+            return { kind: "none" };
         }
 
         // Check if already loaded. Pass the ORIGINAL name (with .dll) so getByName's
@@ -624,20 +629,41 @@ export class PELoader {
         const existing = this.moduleRegistry.getByName(dllName);
         if (existing) {
             Logger.log(LogCategory.SYSTEM, `[PE] DLL "${dllName}" already loaded at 0x${existing.baseAddress.toString(16)}`);
-            return existing;
+            return { kind: "existing", module: existing };
         }
 
         // Check for circular dependency
         if (this.loadingDlls.has(dllNameLower)) {
             Logger.warn(LogCategory.SYSTEM, `[PE] Circular dependency detected for "${dllName}", skipping`);
-            return null;
+            return { kind: "none" };
         }
 
         // Find DLL in VFS
         const dllPath = this.findDllPath(dllNameLower);
-        if (!dllPath) {
-            return null;
-        }
+        if (!dllPath) return { kind: "none" };
+        return { kind: "path", path: dllPath, nameLower: dllNameLower };
+    }
+
+    /**
+     * loadDll's verdict as far as it can be reached without I/O: nothing to load, an
+     * already-loaded module, or "io" — a file must actually be read. Only the last case
+     * has to park the guest thread, so LoadLibrary* asks this first.
+     */
+    peekLoadDll(dllName: string):
+        | { kind: "none" }
+        | { kind: "existing"; module: LoadedPEModule }
+        | { kind: "io" } {
+        const target = this.resolveLoadTarget(dllName);
+        return target.kind === "path" ? { kind: "io" } : target;
+    }
+
+    /** Load a real DLL from VFS. Returns the module, or null if it is not there. */
+    async loadDll(dllName: string, invokeDllMain: boolean = true): Promise<LoadedPEModule | null> {
+        const target = this.resolveLoadTarget(dllName);
+        if (target.kind === "none") return null;
+        if (target.kind === "existing") return target.module;
+        if (!this.vfs || !this.moduleRegistry) return null;
+        const { path: dllPath, nameLower: dllNameLower } = target;
 
         Logger.log(LogCategory.SYSTEM, `[PE] Loading real DLL: ${dllName} from VFS path: ${dllPath}`);
 
@@ -773,14 +799,13 @@ export class PELoader {
                 await this.processImports(baseAddress, importDirRVA);
             }
 
-            // Galaxy HLE after imports: patch function bodies, not packed 5-byte export thunks.
-            try {
+            // Real-DLL export patchers (HLE replacements for a library the game ships), AFTER
+            // imports: they patch function BODIES rather than the packed 5-byte export thunks,
+            // and their handlers run as ordinary thunks, which needs the IAT bound. Each entry
+            // is isolated by the registry, so one library's patcher cannot fail the DLL load.
+            {
                 const system = System.getInstance();
-                if (system.process) {
-                    Galaxy.onNativeModuleLoaded(system.process, module);
-                }
-            } catch (e) {
-                Logger.warn(LogCategory.SYSTEM, `[Galaxy] onNativeModuleLoaded threw on DLL ${dllName}: ${e}`);
+                if (system.process) runNativeModulePatchers(system.process, module);
             }
 
             Logger.warn(LogCategory.SYSTEM,
@@ -1155,27 +1180,11 @@ export class PELoader {
                 : `${normalizedInput}.dll`;
             const candidatePath = this.vfs.resolvePath(candidateInput);
 
-            const existsInRom = this.vfs.hasRomFile(candidatePath);
-            if (existsInRom) {
+            const found = this.statDllFile(candidatePath);
+            if (found) {
                 Logger.log(LogCategory.SYSTEM,
-                    `[PE] findDllPath("${dllName}"): found at absolute path ${candidatePath}`);
-                return candidatePath;
-            }
-
-            try {
-                const dir = candidatePath.substring(0, candidatePath.lastIndexOf('\\') + 1);
-                const fileName = candidatePath.substring(dir.length);
-                const entries = this.vfs.listDirectory(dir);
-                for (const entry of entries) {
-                    if (entry.kind === 'file' && entry.name.toLowerCase() === fileName.toLowerCase()) {
-                        const foundPath = `${dir}${entry.name}`;
-                        Logger.log(LogCategory.SYSTEM,
-                            `[PE] findDllPath("${dllName}"): found via absolute directory listing at ${foundPath}`);
-                        return foundPath;
-                    }
-                }
-            } catch {
-                // ignore listing failures
+                    `[PE] findDllPath("${dllName}"): found at absolute path ${found}`);
+                return found;
             }
 
             Logger.verbose(LogCategory.SYSTEM,
@@ -1221,56 +1230,30 @@ export class PELoader {
         Logger.verbose(LogCategory.SYSTEM, `[PE] findDllPath("${dllName}"): searching in ${searchPaths.join(', ')}`);
 
         for (const path of searchPaths) {
-            if (this.vfs.hasRomFile(path)) {
-                Logger.log(LogCategory.SYSTEM, `[PE] findDllPath("${dllName}"): found at ${path}`);
-                return path;
-            }
-        }
-
-        // Try case-insensitive search in application directory listing
-        if (appDir !== 'C:\\') {
-            try {
-                const appDirEntries = this.vfs.listDirectory(appDir);
-                for (const entry of appDirEntries) {
-                    if (entry.kind === 'file' && entry.name.toLowerCase() === dllFileName) {
-                        const foundPath = `${appDir}${entry.name}`;
-                        Logger.log(LogCategory.SYSTEM, `[PE] findDllPath("${dllName}"): found via listing at ${foundPath}`);
-                        return foundPath;
-                    }
-                }
-            } catch {
-                // Directory listing may fail for non-existent directories
-            }
-        }
-
-        // Try case-insensitive search in current directory listing
-        if (currentDir.toLowerCase() !== appDir.toLowerCase() && currentDir !== 'C:\\') {
-            try {
-                const currentDirEntries = this.vfs.listDirectory(currentDir);
-                for (const entry of currentDirEntries) {
-                    if (entry.kind === 'file' && entry.name.toLowerCase() === dllFileName) {
-                        const foundPath = `${currentDir}${entry.name}`;
-                        Logger.log(LogCategory.SYSTEM, `[PE] findDllPath("${dllName}"): found via current-directory listing at ${foundPath}`);
-                        return foundPath;
-                    }
-                }
-            } catch {
-                // Directory listing may fail for non-existent directories
-            }
-        }
-
-        // Try case-insensitive search in root directory listing
-        const rootEntries = this.vfs.listDirectory('C:\\');
-        for (const entry of rootEntries) {
-            if (entry.kind === 'file' && entry.name.toLowerCase() === dllFileName) {
-                const foundPath = `C:\\${entry.name}`;
-                Logger.log(LogCategory.SYSTEM, `[PE] findDllPath("${dllName}"): found via root listing at ${foundPath}`);
-                return foundPath;
+            const found = this.statDllFile(path);
+            if (found) {
+                Logger.log(LogCategory.SYSTEM, `[PE] findDllPath("${dllName}"): found at ${found}`);
+                return found;
             }
         }
 
         Logger.verbose(LogCategory.SYSTEM, `[PE] findDllPath("${dllName}"): NOT FOUND`);
         return null;
+    }
+
+    /**
+     * One search-path probe: the stored file's real path (original case), or null.
+     *
+     * statEntry is an O(1) index lookup that also sees the OPFS overlay leg, so it
+     * subsumes both hasRomFile and the case-insensitive directory listings this used
+     * to fall back on — a runtime-created DLL is now found, and a MISS no longer costs
+     * a full scan of the ROM index. That scan ran up to three times per failed probe
+     * (app dir, current dir, and C:\ unconditionally), and a title that polls for an
+     * absent DLL every frame (SDL2 re-probing hid.dll) paid it every frame.
+     */
+    private statDllFile(path: string): string | null {
+        const entry = this.vfs?.statEntry(path);
+        return entry?.kind === 'file' ? entry.path : null;
     }
 
     private async processImports(baseAddress: number, importDirRVA: number): Promise<void> {
@@ -1534,12 +1517,6 @@ export class PELoader {
                         const tmm = sys.process?.thunkMemoryManager;
                         if (tmm) {
                             this.mathInlineStubs = writeCrtMathStubs(tmm.stubAllocator, this.getMemory);
-                            // floor/ceil/_ftol run with a modified x87 rounding control between
-                            // two FLDCWs; a tick preempt in that window would hand another thread
-                            // our rounding mode (fpuRestore writes the control word without
-                            // re-deriving the softfloat mode).
-                            sys.scheduler?.registerNonPreemptibleRange(
-                                this.mathInlineStubs.regionBase, this.mathInlineStubs.regionEnd);
                         } else {
                             Logger.warn(LogCategory.SYSTEM,
                                 `[PE] CRT math micro-thunks skipped for ${dllName}: no thunkMemoryManager`);

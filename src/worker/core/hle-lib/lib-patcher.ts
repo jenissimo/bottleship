@@ -72,6 +72,26 @@ export interface PatchRequest {
 }
 
 /**
+ * Follow up to 4 rel32 jmp thunks from an export entry to the real body. An incrementally
+ * linked DLL exports 5-byte `E9` thunks packed back to back — patching one clobbers its
+ * neighbours, so every caller patches the body the thunks jump to.
+ */
+export function resolveExportBodyRva(module: LoadedPEModule, exportRva: number): number {
+    const imageEnd = module.baseAddress + module.size;
+    let rva = exportRva;
+    for (let hop = 0; hop < 4; hop++) {
+        const addr = module.baseAddress + rva;
+        if ((Mem.readUint8(addr) ?? 0) !== 0xe9) break;
+        // Keep the last RVA that was inside the image: callers patch/read at what this
+        // returns, so accepting a hop that lands outside would aim them at another image.
+        const next = (rva + 5 + (Mem.readInt32(addr + 1) ?? 0)) >>> 0;
+        if (next === 0 || module.baseAddress + next >= imageEnd) break;
+        rva = next;
+    }
+    return rva;
+}
+
+/**
  * Conservative position-independence check for relocated prologue bytes.
  * Decodes ONLY a whitelisted subset of instructions that occur in real
  * MSVC/EA function prologues — anything else (including every EIP-relative
