@@ -1,4 +1,8 @@
-export const EMU_MEMORY_SIZE = 1024 * 1024 * 1024; // 1 GB (increased from 512 MB for large allocations)
+// Guest RAM. The fixed region layout below spans the first GB; everything past it is
+// HEAP_HIGH (see MEM_HEAP_HIGH_BASE), which is what lets a 32-bit title with a real
+// 400MB+ working set live inside a 512MB HEAP bucket. WASM memory is committed, not
+// resident, so the surplus costs commit charge and not RSS until the guest touches it.
+export const EMU_MEMORY_SIZE = 1536 * 1024 * 1024; // 1.5 GB
 export const EMU_VGA_MEMORY_SIZE = 8 * 1024 * 1024;
 // Largest single allocation the guest heap will accept. Purely a corrupted/garbage-size
 // guard — the real ceiling is the bucket's free space (an oversize request fails there →
@@ -66,6 +70,14 @@ export const HLE_IMAGE_SLOT_SIZE = 0x40000;
 // Default 320MB; layout clamps to actual RAM size (EMU_MEMORY_SIZE) at init.
 export const MEM_SURFACE_BASE = 0x2C000000;   // After ROM
 export const MEM_SURFACE_SIZE = 0x14000000;   // 320MB default — ends at 0x40000000 (= 1GB)
+
+// HEAP_HIGH: the HEAP bucket's overflow, everything above the 1GB layout up to end-of-RAM.
+// The fixed layout above ends exactly at 0x40000000, so a bundle that asks for more RAM than
+// that gets the surplus as heap and NOTHING BELOW MOVES — MEM_GUARD_BASE in particular, which
+// is mirrored in Rust as FASTMEM_GUARD_BASE and cannot change without rebuilding v86.
+// A 32-bit title on real Windows has a 2GB user space; 512MB of HEAP is our limit, not its.
+// The region exists whenever RAM exceeds the layout — which the default 1.5GB does.
+export const MEM_HEAP_HIGH_BASE = 0x40000000;
 
 // Threading and scheduling configuration
 // REDUCED: 1ms interval for highest resolution (clamped by browser to ~4ms)

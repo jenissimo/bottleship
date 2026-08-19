@@ -117,6 +117,12 @@ const HEAP_SLAB_INITIAL_SIZE = 4 * 1024 * 1024;    // 4 MB
 const HEAP_SLAB_MAX_SIZE     = 64 * 1024 * 1024;   // 64 MB per slab
 const HEAP_SLAB_TOTAL_MAX    = 256 * 1024 * 1024;  // 256 MB total across all generations
 const HEAP_SLAB_GROW_HEADROOM = 256 * 1024;        // grow when < 256 KB remaining in active slab
+// The arena and the guest's own large allocations share ONE bucket, and the arena grows
+// DOWN from the top while the bump frontier grows UP — so an absolute total cap is not a
+// bound on what the guest is left with. This is the share of the HEAP bucket the arena may
+// never take: cross it and a 400 MB-working-set title dies of std::bad_alloc while a
+// quarter of its heap is arena that only ever serves sub-4KB blocks.
+const HEAP_SLAB_BUMP_RESERVE_FRACTION = 0.25;
 const SLAB_BIN_SIZES = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
 const SLAB_MAGIC = 0x534C4100; // BUSY slab block ('SLA'); low nibble = bin
 
@@ -156,6 +162,26 @@ function isInVirtualAllocRegion(ptr: number): boolean {
 }
 
 /** Low-level: allocate one slab of `size` bytes and install it as the active one. */
+/**
+ * How much of the HEAP bucket the arena may still take, given the reserve the guest's own
+ * bump allocations must keep. Negative/zero means the arena is already at or past its share.
+ */
+function slabGrowBudget(): number | null {
+    const stats = System.getInstance().process?.memory?.getBucketStats?.();
+    const heap = stats?.find((b) => b.kind === "HEAP");
+    if (!heap) return null;
+    // HEAP_HIGH is the arena's preferred home (see allocSlabArena) and it competes with
+    // nothing there, so its headroom is spendable in full. Only the LOW heap needs the
+    // reserve, because there the arena's growth is taken straight out of the guest's.
+    const high = stats?.find((b) => b.kind === "HEAP_HIGH");
+    if (high && high.free > 0) return high.free;
+    const reserve = (heap.limit - heap.base) * HEAP_SLAB_BUMP_RESERVE_FRACTION;
+    // `free` is slab-aware (slabTop - next), i.e. exactly the gap the two frontiers share.
+    return heap.free - reserve;
+}
+
+let slabBudgetRefusalLogged = false;
+
 function installNewSlab(size: number): boolean {
     const process = System.getInstance().process;
     if (!process) return false;
@@ -164,6 +190,28 @@ function installNewSlab(size: number): boolean {
             `Heap slab grow refused: would exceed total cap ${HEAP_SLAB_TOTAL_MAX / 1024 / 1024}MB ` +
             `(current=${totalSlabBytes / 1024 / 1024}MB, requested=+${size / 1024 / 1024}MB)`);
         return false;
+    }
+    const budget = slabGrowBudget();
+    if (budget !== null && size > budget) {
+        // Shrink to what the reserve allows rather than refuse outright — a smaller arena
+        // still serves the inline stub; no arena drops every small alloc to the JS thunk.
+        let fitted = size;
+        while (fitted > HEAP_SLAB_INITIAL_SIZE && fitted > budget) fitted = Math.floor(fitted / 2);
+        if (fitted > budget) {
+            if (!slabBudgetRefusalLogged) {
+                slabBudgetRefusalLogged = true;
+                Logger.warn(LogCategory.KERNEL32,
+                    `Heap slab grow refused: the guest's bump reserve is exhausted ` +
+                    `(arena=${(totalSlabBytes / 1048576).toFixed(1)}MB, budget=${(budget / 1048576).toFixed(1)}MB, ` +
+                    `wanted=${(size / 1048576).toFixed(1)}MB). Sub-4KB allocations now fall back to the ` +
+                    `JS HeapAlloc thunk — SLOW but alive; the alternative is std::bad_alloc in the guest.`);
+            }
+            return false;
+        }
+        Logger.log(LogCategory.KERNEL32,
+            `Heap slab grow clamped ${(size / 1048576).toFixed(1)}MB -> ${(fitted / 1048576).toFixed(1)}MB ` +
+            `by the guest's bump reserve`);
+        size = fitted;
     }
     let addr: number;
     try {
@@ -1963,7 +2011,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             }
             // Fallback: region may already be mapped by a prior RESERVE|COMMIT (reservedPages can be out of sync).
             const region = process.addressSpace.getRegion(effectiveAddress);
-            if (region && region.kind === 'HEAP' && effectiveAddress + alignedSize <= region.base + region.size) {
+            if (region && (region.kind === 'HEAP' || region.kind === 'HEAP_HIGH') && effectiveAddress + alignedSize <= region.base + region.size) {
                 commitPreservingCommitted(effectiveAddress, alignedSize);
                 clearDecommittedRange(effectiveAddress, alignedSize);
                 Logger.verbose(LogCategory.KERNEL32, `VirtualAlloc -> 0x${effectiveAddress.toString(16)} (COMMIT in HEAP, size=${alignedSize})`);

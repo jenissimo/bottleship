@@ -89,4 +89,39 @@ export function registerHeapCommands(svc: HarnessService): void {
             activeFreePct: b.current.freePct,
         };
     });
+
+    /** heapBuckets() — per-REGION allocator occupancy (HEAP, THUNK_*, SURFACE, ROM).
+     *  heapSlab() only sees the small-alloc arena; an "HEAP exhausted at slab boundary"
+     *  bad_alloc is about the BUCKET around it — the bump frontier growing up and the
+     *  slab arena growing down until they meet. Sampling this over a load says whether a
+     *  title genuinely needs more than the bucket holds or is failing to reuse what it
+     *  frees: `liveMB` flat while `bumpMB` climbs is a reuse failure, both climbing
+     *  together is real demand. */
+    svc.register("heapBuckets", () => {
+        const process = sys().process;
+        const stats = (process?.memory as any)?.getBucketStats?.() as any[] | undefined;
+        if (!stats) throw new HarnessError("no process", HarnessErrorCode.NO_PROCESS);
+        const mb = (n: number) => Math.round((n / 1048576) * 100) / 100;
+        return {
+            metrics: process!.memory.getMetrics(),
+            buckets: stats.map((b) => ({
+                kind: b.kind,
+                range: `0x${b.base.toString(16)}..0x${b.limit.toString(16)}`,
+                capMB: mb(b.limit - b.base),
+                bumpMB: mb(b.used),
+                liveMB: mb(b.liveUsed),
+                freeListMB: mb(b.freeBytes),
+                freeBlocks: b.freeBlocks,
+                // Bump headroom, already discounting a slab arena growing down from the top.
+                headroomMB: mb(b.free),
+                slabArenaMB: mb(b.limit - b.slabTop),
+            })),
+            // The biggest live blocks, largest first — "who is holding 380 MB" is the
+            // question a bucket total always raises and never answers.
+            topBlocks: ((process!.memory as any).snapshotHeapAllocations?.() ?? [])
+                .sort((a: any, z: any) => z.size - a.size)
+                .slice(0, 12)
+                .map((a: any) => ({ addr: `0x${(a.addr >>> 0).toString(16)}`, MB: mb(a.size) })),
+        };
+    });
 }

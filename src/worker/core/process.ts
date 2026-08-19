@@ -7,8 +7,9 @@ import { APIRegistry } from './api-registry';
 import { ThunkMemoryManager } from './thunking/thunk-memory-manager';
 import { AddressSpace, RegionKind, RegionPerms } from './memory/address-space';
 import { Mem } from './memory/mem-accessor';
-import { EMU_MEMORY_SIZE, MAX_ALLOC_BYTES, MEM_LOWMEM_SIZE, MEM_HEAP_BASE } from './cpu/emulator-config';
+import { MAX_ALLOC_BYTES, MEM_LOWMEM_SIZE, MEM_HEAP_BASE } from './cpu/emulator-config';
 import { Logger, LogCategory } from './logger';
+import { GUEST_COMPUTER_NAME } from './guest-identity';
 import { ModuleRegistry } from './module-registry';
 import { memoryEventBuffer, MemoryEventType } from './memory/memory-event-buffer';
 import { ensureGuestPagesCommitted } from './memory/guest-page-commit';
@@ -33,7 +34,13 @@ interface BucketState {
                       // anything below it that a bump re-hands-out was previously written.
 }
 
-const BUCKET_KINDS: RegionKind[] = ['HEAP', 'SURFACE', 'THUNK_CODE', 'THUNK_DATA'];
+const BUCKET_KINDS: RegionKind[] = ['HEAP', 'HEAP_HIGH', 'SURFACE', 'THUNK_CODE', 'THUNK_DATA'];
+
+/** Both halves of the guest heap. HEAP sub-allocations are covered by the layout bucket and
+ *  are never registered individually (see alloc), so every membership test has to name both. */
+function isHeapBucket(kind: RegionKind | undefined): boolean {
+    return kind === 'HEAP' || kind === 'HEAP_HIGH';
+}
 
 /** Win32 VA allocation granularity — the alignment every image base is stated in. */
 const DLL_IMAGE_GRANULARITY = 0x10000;
@@ -242,7 +249,34 @@ export class MemoryManager {
             throw new Error(`MemoryManager: bucket ${bucketKind} is not available`);
         }
 
-        const addr = this.allocateInBucket(bucket, aligned, minAlign, bucketKind);
+        // A full HEAP spills into HEAP_HIGH when the bundle asked for RAM past the fixed
+        // layout. Only after the low bucket genuinely refuses: keeping allocations low and
+        // contiguous is what makes the bump frontier and the slab arena meet predictably,
+        // and a title that fits in 512MB must behave exactly as it did.
+        let usedBucketKind = bucketKind;
+        let addr = this.allocateInBucket(bucket, aligned, minAlign, bucketKind);
+        if (addr === 0 && bucketKind === 'HEAP') {
+            const high = this.bucketState.get('HEAP_HIGH');
+            if (high) {
+                addr = this.allocateInBucket(high, aligned, minAlign, 'HEAP_HIGH');
+                if (addr !== 0) usedBucketKind = 'HEAP_HIGH';
+            }
+        }
+        if (addr === 0) {
+            // Genuinely out of guest heap — the one case that IS exceptional, so the
+            // message (and its stack) is built once here rather than per allocation.
+            // Both halves are named: after a spill the low bucket's numbers alone say nothing
+            // about how full the one that actually refused was.
+            const describe = (kind: RegionKind, b: BucketState | undefined): string =>
+                b ? `${kind} 0x${b.base.toString(16)}..0x${b.limit.toString(16)} ` +
+                    `next=0x${b.next.toString(16)} slabTop=0x${(b.slabTop ?? b.limit).toString(16)}`
+                  : `${kind} (absent)`;
+            const high = bucketKind === 'HEAP' ? this.bucketState.get('HEAP_HIGH') : undefined;
+            throw new Error(
+                `MemoryManager: ${bucketKind} exhausted (requested 0x${aligned.toString(16)}; ` +
+                `${describe(bucketKind, bucket)}` +
+                `${bucketKind === 'HEAP' ? `; ${describe('HEAP_HIGH', high)}` : ''})`);
+        }
 
         // [DIAG/SAFETY] Double-hand-out detector: the allocator must never return an
         // address that is still recorded live. A real heap never hands out a busy block;
@@ -261,7 +295,7 @@ export class MemoryManager {
         // Individual HEAP sub-allocations (HeapAlloc etc.) are already covered by the
         // HEAP layout bucket — registering each one bloats regions[] to 200K+ entries,
         // making findBlockingRegion and releaseRegion O(n) and killing performance.
-        if (finalKind !== 'HEAP') {
+        if (!isHeapBucket(usedBucketKind)) {
             this.addressSpace.registerRegion({
                 base: addr,
                 size: aligned,
@@ -273,10 +307,10 @@ export class MemoryManager {
         }
 
         this.recordAllocation(addr, aligned);
-        this.allocBucket.set(addr, bucketKind);
+        this.allocBucket.set(addr, usedBucketKind);
         this.logLargeEvent('alloc', addr, aligned);
 
-        if (bucketKind === 'HEAP' || bucketKind === 'SURFACE') {
+        if (isHeapBucket(usedBucketKind) || usedBucketKind === 'SURFACE') {
             ensureGuestPagesCommitted(addr, aligned);
         }
 
@@ -294,9 +328,9 @@ export class MemoryManager {
      * guest bump frontier (`next`). Shared by heap-slab arenas and VirtualAlloc
      * MEM_TOP_DOWN — both need high VA, segregated from bottom-up HeapAlloc.
      */
-    allocFromHigh(size: number, alignment: number = 0x10000): number {
-        const bucket = this.bucketState.get('HEAP');
-        if (!bucket) throw new Error('MemoryManager: HEAP bucket unavailable for high alloc');
+    allocFromHigh(size: number, alignment: number = 0x10000, bucketKind: RegionKind = 'HEAP'): number {
+        const bucket = this.bucketState.get(bucketKind);
+        if (!bucket) throw new Error(`MemoryManager: ${bucketKind} bucket unavailable for high alloc`);
         const align = Math.max(alignment, 0x10000) >>> 0; // Win32 allocation granularity
         const aligned = this.alignUp(size, align);
         let top = (bucket.slabTop ?? bucket.limit) >>> 0;
@@ -338,7 +372,7 @@ export class MemoryManager {
         }
         bucket.slabTop = addr;
         this.recordAllocation(addr, aligned);
-        this.allocBucket.set(addr, 'HEAP');
+        this.allocBucket.set(addr, bucketKind);
         ensureGuestPagesCommitted(addr, aligned);
         this.logLargeEvent('alloc', addr, aligned);
         return addr;
@@ -361,11 +395,19 @@ export class MemoryManager {
     }
 
     /**
-     * Kernel32 heap-slab ARENA — top-down from HEAP (see allocFromHigh). Kept out of
-     * the guest bump so slab growth does not shift subsequent guest allocation
-     * addresses vs a no-slab layout.
+     * Kernel32's small-alloc slab ARENA — top-down (see allocFromHigh), so arena growth does
+     * not shift the guest's own allocation addresses. Carved from HEAP_HIGH when that region
+     * exists: sharing one bucket with the guest means every megabyte the arena takes is a
+     * megabyte the guest loses, and a refused grow drops every sub-4KB allocation to the JS
+     * HeapAlloc thunk — alive, but very slow. Falls back to the low HEAP when there is no
+     * high region (default RAM).
      */
     allocSlabArena(size: number): number {
+        if (this.bucketState.has('HEAP_HIGH')) {
+            try {
+                return this.allocFromHigh(size, 0x10000, 'HEAP_HIGH');
+            } catch { /* high region full — the low heap is still a valid home */ }
+        }
         return this.allocFromHigh(size, 0x10000);
     }
 
@@ -418,7 +460,7 @@ export class MemoryManager {
         // HEAP allocs are not registered in addressSpace.regions (skipped in alloc),
         // so skip releaseRegion for them to avoid O(n) scan of a non-existent entry.
         const bucketKind = this.allocBucket.get(ptr);
-        if (bucketKind !== 'HEAP') {
+        if (!isHeapBucket(bucketKind)) {
             this.addressSpace.releaseRegion(ptr);
         }
         this.currentBytes -= size;
@@ -430,7 +472,7 @@ export class MemoryManager {
             const bucket = this.bucketState.get(bucketKind);
             // MEM_TOP_DOWN / slab frontier: LIFO free at slabTop rejoins the high zone
             // instead of the bottom-up free lists (keeps high VA available for TOP_DOWN).
-            if (bucket && bucketKind === 'HEAP' && bucket.slabTop !== undefined &&
+            if (bucket && isHeapBucket(bucketKind) && bucket.slabTop !== undefined &&
                 (bucket.slabTop >>> 0) === (ptr >>> 0)) {
                 bucket.slabTop = (ptr + size) >>> 0;
             } else if (size >= MemoryManager.LARGE_ALLOC_FRESH_THRESHOLD) {
@@ -583,7 +625,7 @@ export class MemoryManager {
     snapshotHeapAllocations(): Array<{ addr: number; size: number }> {
         const out: Array<{ addr: number; size: number }> = [];
         for (const [addr, size] of this.allocations) {
-            if (this.allocBucket.get(addr) === 'HEAP') {
+            if (isHeapBucket(this.allocBucket.get(addr))) {
                 out.push({ addr, size });
             }
         }
@@ -601,13 +643,23 @@ export class MemoryManager {
      *              allocs live past large allocs that were freed but can't be
      *              retreated into the bump.
      */
-    getBucketStats(): Array<{ kind: string; base: number; limit: number; next: number; used: number; liveUsed: number; free: number; freeBlocks: number; freeBytes: number }> {
-        const rows: Array<{ kind: string; base: number; limit: number; next: number; used: number; liveUsed: number; free: number; freeBlocks: number; freeBytes: number }> = [];
+    /**
+     * Per-bucket occupancy. `free` is what a BUMP allocation can actually still take:
+     * HEAP's slab arena grows DOWN from `limit`, so limit-next overstates the headroom by
+     * the whole arena — and an exhaustion reported next to a large `free` reads as an
+     * allocator bug instead of the collision it is.
+     */
+    getBucketStats(): Array<{ kind: string; base: number; limit: number; next: number; slabTop: number; used: number; liveUsed: number; free: number; freeBlocks: number; freeBytes: number }> {
+        const rows: Array<{ kind: string; base: number; limit: number; next: number; slabTop: number; used: number; liveUsed: number; free: number; freeBlocks: number; freeBytes: number }> = [];
         for (const [kind, state] of this.bucketState.entries()) {
-            const total = state.limit - state.base;
             const used = state.next - state.base;
+            const ceiling = state.slabTop ?? state.limit;
             const list = this.freeBlocks.get(kind);
+            // Both free pools: a large block goes to largeFreeBlocks, not freeBlocks, and
+            // counting only the small one reports a reuse failure (bump and live climbing
+            // together) as genuine demand — the exact reading heapBuckets exists to make.
             let freeBytes = 0;
+            for (const b of this.largeFreeBlocks.get(kind) ?? []) freeBytes += b.size;
             if (list) {
                 for (let i = 0; i < list.length; i++) freeBytes += list[i].size;
             }
@@ -616,9 +668,10 @@ export class MemoryManager {
                 base: state.base,
                 limit: state.limit,
                 next: state.next,
+                slabTop: ceiling,
                 used,
                 liveUsed: used - freeBytes,
-                free: total - used,
+                free: Math.max(0, ceiling - state.next),
                 freeBlocks: list?.length ?? 0,
                 freeBytes,
             });
@@ -754,6 +807,15 @@ export class MemoryManager {
         return alignedAddr;
     }
 
+    /**
+     * Carve `size` out of `bucket`, or return 0 when it cannot be served.
+     *
+     * A SENTINEL, not an exception: exhaustion is a NORMAL, per-allocation outcome once a
+     * bucket fills (the HEAP→HEAP_HIGH spill hits it on every call), and building an Error with a
+     * captured stack per allocation costs more than the allocation itself. Both exits below
+     * are reached only AFTER the free list, the released-large list and bucket expansion have
+     * all been tried, so 0 really does mean "nothing in this bucket can serve it".
+     */
     private allocateInBucket(bucket: BucketState, size: number, alignment: number = 8, bucketKind?: RegionKind): number {
         // Try free list first: find a block that fits (best-fit), then SPLIT the
         // remainder back into the list so oversized freed blocks aren't consumed whole.
@@ -809,9 +871,7 @@ export class MemoryManager {
         const guestCeiling = bucket.slabTop ?? bucket.limit;
         if (bucket.slabTop !== undefined && bucket.slabTop < bucket.limit &&
             alignedStart + size > guestCeiling) {
-            throw new Error(
-                `MemoryManager: HEAP exhausted at slab boundary (need 0x${size.toString(16)} ` +
-                `at 0x${alignedStart.toString(16)}, slabTop=0x${bucket.slabTop.toString(16)})`);
+            return 0;
         }
         if (alignedStart + size > bucket.limit) {
             const bucketKind = this.getBucketKindByState(bucket);
@@ -829,13 +889,8 @@ export class MemoryManager {
                 // Last resort before OOM: any fitting hole (ignoring the size-class
                 // gate) beats a spurious overflow. Try the small free list any-fit,
                 // then released VirtualAlloc-class ranges.
-                const fallback = this.carveFromFreeList(bucketKind, size, alignment, Infinity)
+                return this.carveFromFreeList(bucketKind, size, alignment, Infinity)
                     || this.allocateLargeFromReleased(bucketKind, size, alignment);
-                if (fallback !== 0) return fallback;
-                throw new Error(
-                    `MemoryManager: bucket overflow (requested 0x${size.toString(16)} ` +
-                    `in 0x${bucket.base.toString(16)}..0x${bucket.limit.toString(16)})`
-                );
             }
 
             bucket.limit = bucket.base + expandedSize;
@@ -955,7 +1010,7 @@ export class Process {
         this.environment.set("TEMP", "C:\\TEMP");
         this.environment.set("TMP", "C:\\TEMP");
         this.environment.set("USERNAME", "BottleShip");
-        this.environment.set("COMPUTERNAME", "BS-EMULATOR");
+        this.environment.set("COMPUTERNAME", GUEST_COMPUTER_NAME);
 
         // Initialize callback manager for x86 callback invocation (WndProc, etc.)
         // Pass thunk memory manager to dispatcher so it can use dynamic addresses
@@ -1035,8 +1090,10 @@ export class Process {
     }
 
     private initializeMemoryLayout(): void {
-        const limit = Math.min(EMU_MEMORY_SIZE, this.getMemory().length);
-        this.addressSpace.initializeLayout(limit);
+        // The layout spans the RAM v86 was actually created with — EMU_MEMORY_SIZE is the
+        // DEFAULT for that, not a ceiling on it. Clamping to it would leave RAM past the
+        // default addressable by the guest but owned by no bucket.
+        this.addressSpace.initializeLayout(this.getMemory().length);
         Mem.sync();
     }
 
@@ -1051,12 +1108,12 @@ export class Process {
         // --- Zero out memory regions ---
         const mem = this.getMemory();
         if (mem) {
-            const totalMemory = Math.min(EMU_MEMORY_SIZE, mem.length);
+            const totalMemory = mem.length;
             // Clear HEAP, THUNK regions, and also LOW_MEM to remove any stale spin loops
             // SURFACE/ROM too: region buckets are rebuilt empty, but mem8 bytes linger
             // across an in-worker game switch (stale pixels / residual image bytes).
             const clearKinds = new Set<RegionKind>([
-                "LOW_MEM", "HEAP", "THUNK_CODE", "CALLBACK_STUB", "SPIN_LOOP", "THUNK_DATA",
+                "LOW_MEM", "HEAP", "HEAP_HIGH", "THUNK_CODE", "CALLBACK_STUB", "SPIN_LOOP", "THUNK_DATA",
                 "SURFACE", "ROM",
             ]);
             const regions = this.addressSpace.getRegions();
@@ -1114,7 +1171,7 @@ export class Process {
         this.environment.set("TEMP", "C:\\TEMP");
         this.environment.set("TMP", "C:\\TEMP");
         this.environment.set("USERNAME", "BottleShip");
-        this.environment.set("COMPUTERNAME", "BS-EMULATOR");
+        this.environment.set("COMPUTERNAME", GUEST_COMPUTER_NAME);
 
         this.lastError = 0;
 

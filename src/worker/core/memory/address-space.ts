@@ -3,6 +3,7 @@ import {
     MEM_HEAP_BASE,
     MEM_HEAP_SIZE,
     MEM_SURFACE_BASE,
+    MEM_HEAP_HIGH_BASE,
     MEM_SURFACE_SIZE,
     MEM_THUNK_CODE_BASE,
     MEM_THUNK_CODE_SIZE,
@@ -17,6 +18,7 @@ import {
 export type RegionKind =
     | "LOW_MEM"
     | "HEAP"
+    | "HEAP_HIGH"
     | "SURFACE"
     | "THUNK_CODE"
     | "THUNK_DATA"
@@ -59,6 +61,7 @@ interface LayoutBucket {
 // non-RAM regions (ROM/THUNK_CODE/CALLBACK_STUB/…) never get marked.
 const WRITE_MAP_FAST_KINDS: ReadonlySet<RegionKind> = new Set<RegionKind>([
     "HEAP",
+    "HEAP_HIGH",
     "SURFACE",
     "THUNK_DATA",
 ]);
@@ -284,6 +287,20 @@ export class AddressSpace {
             allowOverlap: true,
         });
 
+        // HEAP_HIGH: heap overflow above the fixed 1GB layout, present only when the
+        // bundle asked for more RAM than the layout spans. See MEM_HEAP_HIGH_BASE.
+        if (linearSize > MEM_HEAP_HIGH_BASE) {
+            layoutBuckets.push({
+                base: MEM_HEAP_HIGH_BASE,
+                size: linearSize - MEM_HEAP_HIGH_BASE,
+                perms: "rw",
+                kind: "HEAP_HIGH",
+                owner: "Layout",
+                tag: "heap-high",
+                allowOverlap: true,
+            });
+        }
+
         for (const bucket of layoutBuckets) {
             if (bucket.size > 0) {
                 this.registerRegion(bucket);
@@ -474,6 +491,23 @@ export class AddressSpace {
         if (newEnd > maxMemorySize) {
             Logger.warn(LogCategory.SYSTEM,
                 `expandLayoutBucket: expansion exceeds total memory (0x${newEnd.toString(16)} > 0x${maxMemorySize.toString(16)})`);
+            return 0;
+        }
+
+        // A layout bucket may not grow into the layout bucket above it. Every layout bucket
+        // carries allowOverlap (its sub-allocations are not registered individually), so the
+        // conflict filter below is blind to them — and SURFACE, the one bucket whose whole
+        // design is to grow upward, now has HEAP_HIGH immediately above it.
+        let ceiling = maxMemorySize;
+        for (const other of this.layoutBucketMap.values()) {
+            if (other.id !== bucket.id && other.base >= currentEnd && other.base < ceiling) {
+                ceiling = other.base;
+            }
+        }
+        if (newEnd > ceiling) {
+            Logger.warn(LogCategory.SYSTEM,
+                `expandLayoutBucket: ${kind} expansion blocked by the layout bucket at ` +
+                `0x${ceiling.toString(16)} (wanted 0x${newEnd.toString(16)})`);
             return 0;
         }
 
