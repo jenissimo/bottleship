@@ -8,7 +8,15 @@
 import {
     getD3DTextureLayout,
 } from "../shared/texture-formats";
+import { noteGuestBufferWrite, writeDirtyRange } from "../buffer-upload";
 
+/**
+ * `[dirtyStart, dirtyEnd)` accumulates the union of the locked ranges since the last upload
+ * (empty = clean) so an upload costs the lock's size rather than the buffer's — see
+ * buffer-upload.ts. `setDirty(i, true)` means the WHOLE buffer, which is what every caller
+ * that forces a re-upload (device loss, ring rewind, creation) actually means, so those paths
+ * keep working unchanged and cannot silently degrade into a partial upload.
+ */
 
 // Vertex Buffer Store - SoA layout
 export class VertexBufferStore {
@@ -27,6 +35,8 @@ export class VertexBufferStore {
     private lockedOffsets: Uint32Array;
     private guestPtrs: Int32Array;     // HEAP backing for Lock/Unlock
     private dirtyFlags: Uint8Array;    // Boolean as byte
+    private dirtyStarts: Uint32Array;  // union of locked ranges since last upload
+    private dirtyEnds: Uint32Array;    // exclusive; end <= start = clean
     private generations: Uint16Array;
 
     // Handle mapping
@@ -43,6 +53,8 @@ export class VertexBufferStore {
         this.lockedOffsets = new Uint32Array(initialCapacity);
         this.guestPtrs = new Int32Array(initialCapacity).fill(-1);
         this.dirtyFlags = new Uint8Array(initialCapacity);
+        this.dirtyStarts = new Uint32Array(initialCapacity);
+        this.dirtyEnds = new Uint32Array(initialCapacity);
         this.generations = new Uint16Array(initialCapacity);
     }
 
@@ -66,6 +78,8 @@ export class VertexBufferStore {
         this.lockedOffsets[index] = 0;
         this.guestPtrs[index] = guestPtr;
         this.dirtyFlags[index] = 1;
+        this.dirtyStarts[index] = 0;
+        this.dirtyEnds[index] = size;
 
         const gen = this.generations[index];
         const packed = (gen << 16) | index;
@@ -115,10 +129,17 @@ export class VertexBufferStore {
     getGuestPtr(index: number): number { return this.guestPtrs[index]; }
     isDirty(index: number): boolean { return this.dirtyFlags[index] !== 0; }
     isLocked(index: number): boolean { return this.lockedPtrs[index] !== -1; }
+    getDirtyStart(index: number): number { return this.dirtyStarts[index]; }
+    getDirtyEnd(index: number): number { return this.dirtyEnds[index]; }
 
     // Setters
     setGpuBuffer(index: number, buffer: GPUBuffer): void { this.gpuBuffers[index] = buffer; }
-    setDirty(index: number, dirty: boolean): void { this.dirtyFlags[index] = dirty ? 1 : 0; }
+    /** `true` dirties the WHOLE buffer — the only thing a forced re-upload can safely mean. */
+    setDirty(index: number, dirty: boolean): void {
+        this.dirtyFlags[index] = dirty ? 1 : 0;
+        this.dirtyStarts[index] = 0;
+        this.dirtyEnds[index] = dirty ? this.sizes[index] : 0;
+    }
 
     /**
      * Device loss: the GPU copies are dead handles, the `data` shadow is not. Forgetting the
@@ -130,7 +151,7 @@ export class VertexBufferStore {
         let n = 0;
         for (let i = 0; i < this.count; i++) {
             if (this.gpuBuffers[i]) { this.gpuBuffers[i] = null; n++; }
-            this.dirtyFlags[i] = 1;
+            this.setDirty(i, true);
         }
         return n;
     }
@@ -157,6 +178,14 @@ export class VertexBufferStore {
         this.lockedPtrs[index] = -1;
         this.lockedSizes[index] = 0;
         this.lockedOffsets[index] = 0;
+        noteGuestBufferWrite("d3d9", size);
+        if (this.dirtyFlags[index] && this.dirtyEnds[index] > this.dirtyStarts[index]) {
+            this.dirtyStarts[index] = Math.min(this.dirtyStarts[index], offset);
+            this.dirtyEnds[index] = Math.max(this.dirtyEnds[index], offset + size);
+        } else {
+            this.dirtyStarts[index] = offset;
+            this.dirtyEnds[index] = offset + size;
+        }
         this.dirtyFlags[index] = 1;
     }
 
@@ -164,17 +193,23 @@ export class VertexBufferStore {
     uploadDirty(device: GPUDevice, queue: GPUQueue): number {
         let uploaded = 0;
         for (let i = 0; i < this.count; i++) {
-            if (this.dirtyFlags[i] && this.data[i]) {
+            const data = this.data[i];
+            if (this.dirtyFlags[i] && data) {
+                // A freshly created buffer holds nothing, so its first upload is whole
+                // regardless of how small the dirty range is.
+                let whole = false;
                 if (!this.gpuBuffers[i]) {
                     this.gpuBuffers[i] = device.createBuffer({
-                        size: this.sizes[i],
+                        size: (this.sizes[i] + 3) & ~3,
                         // COPY_SRC: the executor's robustness padding copies out of a slot a
                         // draw outruns (d3d9-backend-executor planVertexRangePadding).
                         usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
                     });
+                    whole = true;
                 }
-                queue.writeBuffer(this.gpuBuffers[i]!, 0, this.data[i]!);
-                this.dirtyFlags[i] = 0;
+                writeDirtyRange(queue, this.gpuBuffers[i]!, data,
+                    whole ? 0 : this.dirtyStarts[i], whole ? this.sizes[i] : this.dirtyEnds[i], "d3d9", whole);
+                this.setDirty(i, false);
                 uploaded++;
             }
         }
@@ -219,6 +254,14 @@ export class VertexBufferStore {
         const newDirtyFlags = new Uint8Array(newCapacity);
         newDirtyFlags.set(this.dirtyFlags);
         this.dirtyFlags = newDirtyFlags;
+
+        const newDirtyStarts = new Uint32Array(newCapacity);
+        newDirtyStarts.set(this.dirtyStarts);
+        this.dirtyStarts = newDirtyStarts;
+
+        const newDirtyEnds = new Uint32Array(newCapacity);
+        newDirtyEnds.set(this.dirtyEnds);
+        this.dirtyEnds = newDirtyEnds;
 
         const newGenerations = new Uint16Array(newCapacity);
         newGenerations.set(this.generations);
@@ -280,6 +323,8 @@ export class IndexBufferStore {
     private lockedOffsets: Uint32Array;
     private guestPtrs: Int32Array;
     private dirtyFlags: Uint8Array;
+    private dirtyStarts: Uint32Array;
+    private dirtyEnds: Uint32Array;
     private generations: Uint16Array;
 
     private handleToIndex: Map<number, number> = new Map();
@@ -295,6 +340,8 @@ export class IndexBufferStore {
         this.lockedOffsets = new Uint32Array(initialCapacity);
         this.guestPtrs = new Int32Array(initialCapacity).fill(-1);
         this.dirtyFlags = new Uint8Array(initialCapacity);
+        this.dirtyStarts = new Uint32Array(initialCapacity);
+        this.dirtyEnds = new Uint32Array(initialCapacity);
         this.generations = new Uint16Array(initialCapacity);
     }
 
@@ -318,6 +365,8 @@ export class IndexBufferStore {
         this.lockedOffsets[index] = 0;
         this.guestPtrs[index] = guestPtr;
         this.dirtyFlags[index] = 1;
+        this.dirtyStarts[index] = 0;
+        this.dirtyEnds[index] = size;
 
         const gen = this.generations[index];
         const packed = (gen << 16) | index;
@@ -365,16 +414,23 @@ export class IndexBufferStore {
     getGpuBuffer(index: number): GPUBuffer | null { return this.gpuBuffers[index]; }
     getGuestPtr(index: number): number { return this.guestPtrs[index]; }
     isDirty(index: number): boolean { return this.dirtyFlags[index] !== 0; }
+    getDirtyStart(index: number): number { return this.dirtyStarts[index]; }
+    getDirtyEnd(index: number): number { return this.dirtyEnds[index]; }
 
     setGpuBuffer(index: number, buffer: GPUBuffer): void { this.gpuBuffers[index] = buffer; }
-    setDirty(index: number, dirty: boolean): void { this.dirtyFlags[index] = dirty ? 1 : 0; }
+    /** `true` dirties the WHOLE buffer — see VertexBufferStore.setDirty. */
+    setDirty(index: number, dirty: boolean): void {
+        this.dirtyFlags[index] = dirty ? 1 : 0;
+        this.dirtyStarts[index] = 0;
+        this.dirtyEnds[index] = dirty ? this.sizes[index] : 0;
+    }
 
     /** Device loss — see VertexBufferStore.dropGpuResources. */
     dropGpuResources(): number {
         let n = 0;
         for (let i = 0; i < this.count; i++) {
             if (this.gpuBuffers[i]) { this.gpuBuffers[i] = null; n++; }
-            this.dirtyFlags[i] = 1;
+            this.setDirty(i, true);
         }
         return n;
     }
@@ -400,21 +456,33 @@ export class IndexBufferStore {
         this.lockedPtrs[index] = -1;
         this.lockedSizes[index] = 0;
         this.lockedOffsets[index] = 0;
+        noteGuestBufferWrite("d3d9", size);
+        if (this.dirtyFlags[index] && this.dirtyEnds[index] > this.dirtyStarts[index]) {
+            this.dirtyStarts[index] = Math.min(this.dirtyStarts[index], offset);
+            this.dirtyEnds[index] = Math.max(this.dirtyEnds[index], offset + size);
+        } else {
+            this.dirtyStarts[index] = offset;
+            this.dirtyEnds[index] = offset + size;
+        }
         this.dirtyFlags[index] = 1;
     }
 
     uploadDirty(device: GPUDevice, queue: GPUQueue): number {
         let uploaded = 0;
         for (let i = 0; i < this.count; i++) {
-            if (this.dirtyFlags[i] && this.data[i]) {
+            const data = this.data[i];
+            if (this.dirtyFlags[i] && data) {
+                let whole = false;
                 if (!this.gpuBuffers[i]) {
                     this.gpuBuffers[i] = device.createBuffer({
-                        size: this.sizes[i],
+                        size: (this.sizes[i] + 3) & ~3,
                         usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
                     });
+                    whole = true;
                 }
-                queue.writeBuffer(this.gpuBuffers[i]!, 0, this.data[i]!);
-                this.dirtyFlags[i] = 0;
+                writeDirtyRange(queue, this.gpuBuffers[i]!, data,
+                    whole ? 0 : this.dirtyStarts[i], whole ? this.sizes[i] : this.dirtyEnds[i], "d3d9", whole);
+                this.setDirty(i, false);
                 uploaded++;
             }
         }
@@ -459,6 +527,14 @@ export class IndexBufferStore {
         const newDirtyFlags = new Uint8Array(newCapacity);
         newDirtyFlags.set(this.dirtyFlags);
         this.dirtyFlags = newDirtyFlags;
+
+        const newDirtyStarts = new Uint32Array(newCapacity);
+        newDirtyStarts.set(this.dirtyStarts);
+        this.dirtyStarts = newDirtyStarts;
+
+        const newDirtyEnds = new Uint32Array(newCapacity);
+        newDirtyEnds.set(this.dirtyEnds);
+        this.dirtyEnds = newDirtyEnds;
 
         const newGenerations = new Uint16Array(newCapacity);
         newGenerations.set(this.generations);
@@ -635,6 +711,37 @@ export class TextureStore {
     isDirty(index: number): boolean { return this.dirtyFlags[index] !== 0; }
     isLocked(index: number): boolean { return this.lockedPtrs[index] !== -1; }
     getLockedPtr(index: number): number { return this.lockedPtrs[index]; }
+
+    /**
+     * The level-0 lock whose staging bytes contain `addr`, if any.
+     *
+     * A guest that hands a LockRect pointer to an outside decoder (Bink's
+     * BinkCopyToBuffer) is writing into a buffer its own UnlockRect will upload — so the
+     * write IS visible on a GPU presenter, unlike a bare heap buffer. Nothing else can
+     * tell those two apart from the pointer alone.
+     */
+    findLockedByPointer(addr: number): { pitch: number; width: number; height: number } | null {
+        const ptr = addr >>> 0;
+        if (!ptr) return null;
+        for (const [, packed] of this.handleToIndex.entries()) {
+            const index = packed & 0xFFFF;
+            const expectedGen = (packed >> 16) & 0xFFFF;
+            if (this.generations[index] !== expectedGen) continue;
+            const base = this.lockedPtrs[index];
+            if (base < 0) continue;
+            const pitch = this.pitches[index];
+            const height = this.heights[index];
+            // Rows, not height: a block-compressed level holds height/4 block rows, and
+            // claiming pitch*height would report a hit for pointers up to 4x past the
+            // texture's own allocation. Same source of truth as create()/unlock().
+            const rows = getD3DTextureLayout(this.formats[index], this.widths[index], height).rows;
+            const end = (base >>> 0) + pitch * rows;
+            if (ptr >= (base >>> 0) && ptr < end) {
+                return { pitch, width: this.widths[index], height };
+            }
+        }
+        return null;
+    }
 
     setGpuTexture(index: number, texture: GPUTexture, view: GPUTextureView): void {
         this.gpuTextures[index] = texture;

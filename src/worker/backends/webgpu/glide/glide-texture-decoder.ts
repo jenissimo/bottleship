@@ -53,9 +53,8 @@ function decodeYiqTexel(texel: number, ncc: DecodedNccTable): [number, number, n
     ];
 }
 
-export function estimateTextureSizeBytes(width: number, height: number, format: number): number {
-    const safeWidth = Math.max(1, width | 0);
-    const safeHeight = Math.max(1, height | 0);
+/** Source bytes per texel; every Glide format is a fixed 1 or 2 bytes. */
+function glideBytesPerTexel(format: number): number {
     switch (format | 0) {
         case GLIDE_TEXFMT_RGB_565:
         case GLIDE_TEXFMT_ARGB_1555:
@@ -64,7 +63,7 @@ export function estimateTextureSizeBytes(width: number, height: number, format: 
         case GLIDE_TEXFMT_ALPHA_INTENSITY_88:
         case GLIDE_TEXFMT_AP_88:
         case GLIDE_TEXFMT_AYIQ_8422: // 16-bit: 8-bit alpha + 8-bit YIQ index
-            return safeWidth * safeHeight * 2;
+            return 2;
         case GLIDE_TEXFMT_RGB_332:
         case GLIDE_TEXFMT_YIQ_422: // 8-bit YIQ index
         case GLIDE_TEXFMT_ALPHA_8:
@@ -72,8 +71,48 @@ export function estimateTextureSizeBytes(width: number, height: number, format: 
         case GLIDE_TEXFMT_ALPHA_INTENSITY_44:
         case GLIDE_TEXFMT_P_8:
         default:
-            return safeWidth * safeHeight;
+            return 1;
     }
+}
+
+export function estimateTextureSizeBytes(width: number, height: number, format: number): number {
+    return Math.max(1, width | 0) * Math.max(1, height | 0) * glideBytesPerTexel(format);
+}
+
+/**
+ * An NCC texel index is 8 bits, so the whole YIQ→RGB mapping is 256 entries;
+ * building it once per surface keeps the chroma arithmetic out of the texel loop.
+ */
+function buildYiqLut(ncc: DecodedNccTable): Uint8Array {
+    const lut = new Uint8Array(256 * 3);
+    for (let t = 0; t < 256; t++) {
+        const c = decodeYiqTexel(t, ncc);
+        lut[t * 3 + 0] = c[0];
+        lut[t * 3 + 1] = c[1];
+        lut[t * 3 + 2] = c[2];
+    }
+    return lut;
+}
+
+/**
+ * Copy the texel extent into a zero-filled buffer for the case where it is not
+ * wholly resident. The per-texel guards this replaces answered 0 for any texel
+ * not entirely inside `memory`, so those texels stay zero here: the accepted set
+ * is identical, the check just no longer runs per texel.
+ */
+function stageTexelExtent(
+    memory: Uint8Array,
+    dataPtr: number,
+    texels: number,
+    bytesPerTexel: number,
+): Uint8Array {
+    const staged = new Uint8Array(texels * bytesPerTexel);
+    for (let i = 0; i < texels; i++) {
+        const off = dataPtr + i * bytesPerTexel;
+        if (off < 0 || off + bytesPerTexel > memory.length) continue;
+        for (let b = 0; b < bytesPerTexel; b++) staged[i * bytesPerTexel + b] = memory[off + b];
+    }
+    return staged;
 }
 
 export function decodeGlideTexture(
@@ -87,186 +126,193 @@ export function decodeGlideTexture(
 ): Uint8Array {
     const safeWidth = Math.max(1, width | 0);
     const safeHeight = Math.max(1, height | 0);
-    const out = new Uint8Array(safeWidth * safeHeight * 4);
+    const texels = safeWidth * safeHeight;
+    const out = new Uint8Array(texels * 4);
 
-    const readU16 = (offset: number): number => {
-        if (offset < 0 || offset + 1 >= memory.length) return 0;
-        return memory[offset] | (memory[offset + 1] << 8);
-    };
+    // Validate the whole extent once at the boundary, then index it unchecked:
+    // format, palette and NCC table are all invariant over the surface, so the
+    // only thing the texel loop still has to do is convert.
+    const bpt = glideBytesPerTexel(format);
+    const resident = dataPtr >= 0 && dataPtr + texels * bpt <= memory.length;
+    const src = resident ? memory : stageTexelExtent(memory, dataPtr, texels, bpt);
+    const base = resident ? dataPtr : 0;
 
-    const readU32 = (offset: number): number => {
-        if (offset < 0 || offset + 3 >= memory.length) return 0;
-        return (
-            memory[offset] |
-            (memory[offset + 1] << 8) |
-            (memory[offset + 2] << 16) |
-            (memory[offset + 3] << 24)
-        ) >>> 0;
-    };
-
-    for (let y = 0; y < safeHeight; y++) {
-        for (let x = 0; x < safeWidth; x++) {
-            const srcIndex = y * safeWidth + x;
-            const dst = srcIndex * 4;
-
-            if (format === GLIDE_TEXFMT_RGB_332) {
-                const raw = memory[dataPtr + srcIndex] ?? 0;
+    switch (format) {
+        case GLIDE_TEXFMT_RGB_332:
+            for (let i = 0, dst = 0; i < texels; i++, dst += 4) {
+                const raw = src[base + i];
                 out[dst + 0] = ((raw >>> 5) & 0x07) * 255 / 7 | 0;
                 out[dst + 1] = ((raw >>> 2) & 0x07) * 255 / 7 | 0;
                 out[dst + 2] = (raw & 0x03) * 255 / 3 | 0;
                 out[dst + 3] = 255;
-                continue;
             }
+            return out;
 
-            if (format === GLIDE_TEXFMT_YIQ_422) {
-                const raw = memory[dataPtr + srcIndex] ?? 0;
-                if (ncc) {
-                    const c = decodeYiqTexel(raw, ncc);
-                    out[dst + 0] = c[0];
-                    out[dst + 1] = c[1];
-                    out[dst + 2] = c[2];
-                } else {
-                    // No NCC table downloaded yet: fall back to luminance from the index.
+        case GLIDE_TEXFMT_YIQ_422: {
+            const lut = ncc ? buildYiqLut(ncc) : null;
+            if (lut) {
+                for (let i = 0, dst = 0; i < texels; i++, dst += 4) {
+                    const e = src[base + i] * 3;
+                    out[dst + 0] = lut[e];
+                    out[dst + 1] = lut[e + 1];
+                    out[dst + 2] = lut[e + 2];
+                    out[dst + 3] = 255;
+                }
+            } else {
+                // No NCC table downloaded yet: fall back to luminance from the index.
+                for (let i = 0, dst = 0; i < texels; i++, dst += 4) {
+                    const raw = src[base + i];
                     out[dst + 0] = raw;
                     out[dst + 1] = raw;
                     out[dst + 2] = raw;
+                    out[dst + 3] = 255;
                 }
-                out[dst + 3] = 255;
-                continue;
             }
+            return out;
+        }
 
-            if (format === GLIDE_TEXFMT_AYIQ_8422) {
-                const raw = readU16(dataPtr + srcIndex * 2);
-                const yiq = raw & 0xff;
-                const alpha = (raw >>> 8) & 0xff;
-                if (ncc) {
-                    const c = decodeYiqTexel(yiq, ncc);
-                    out[dst + 0] = c[0];
-                    out[dst + 1] = c[1];
-                    out[dst + 2] = c[2];
+        case GLIDE_TEXFMT_AYIQ_8422: {
+            const lut = ncc ? buildYiqLut(ncc) : null;
+            for (let i = 0, dst = 0, off = base; i < texels; i++, dst += 4, off += 2) {
+                const yiq = src[off];
+                if (lut) {
+                    const e = yiq * 3;
+                    out[dst + 0] = lut[e];
+                    out[dst + 1] = lut[e + 1];
+                    out[dst + 2] = lut[e + 2];
                 } else {
                     out[dst + 0] = yiq;
                     out[dst + 1] = yiq;
                     out[dst + 2] = yiq;
                 }
-                out[dst + 3] = alpha;
-                continue;
+                out[dst + 3] = src[off + 1];
             }
+            return out;
+        }
 
-            if (format === GLIDE_TEXFMT_RGB_565) {
-                const raw = readU16(dataPtr + srcIndex * 2);
+        case GLIDE_TEXFMT_RGB_565:
+            for (let i = 0, dst = 0, off = base; i < texels; i++, dst += 4, off += 2) {
+                const raw = src[off] | (src[off + 1] << 8);
                 out[dst + 0] = (((raw >>> 11) & 0x1f) * 255 / 31) | 0;
                 out[dst + 1] = (((raw >>> 5) & 0x3f) * 255 / 63) | 0;
                 out[dst + 2] = ((raw & 0x1f) * 255 / 31) | 0;
                 out[dst + 3] = 255;
-                continue;
             }
+            return out;
 
-            if (format === GLIDE_TEXFMT_ARGB_1555) {
-                const raw = readU16(dataPtr + srcIndex * 2);
+        case GLIDE_TEXFMT_ARGB_1555:
+            for (let i = 0, dst = 0, off = base; i < texels; i++, dst += 4, off += 2) {
+                const raw = src[off] | (src[off + 1] << 8);
                 out[dst + 0] = (((raw >>> 10) & 0x1f) * 255 / 31) | 0;
                 out[dst + 1] = (((raw >>> 5) & 0x1f) * 255 / 31) | 0;
                 out[dst + 2] = ((raw & 0x1f) * 255 / 31) | 0;
                 out[dst + 3] = (raw & 0x8000) ? 255 : 0;
-                continue;
             }
+            return out;
 
-            if (format === GLIDE_TEXFMT_ARGB_4444) {
-                const raw = readU16(dataPtr + srcIndex * 2);
-                out[dst + 0] = ((raw >>> 8) & 0x0f) * 17;
-                out[dst + 1] = ((raw >>> 4) & 0x0f) * 17;
-                out[dst + 2] = (raw & 0x0f) * 17;
-                out[dst + 3] = ((raw >>> 12) & 0x0f) * 17;
-                continue;
+        case GLIDE_TEXFMT_ARGB_4444:
+            for (let i = 0, dst = 0, off = base; i < texels; i++, dst += 4, off += 2) {
+                const lo = src[off];
+                const hi = src[off + 1];
+                out[dst + 0] = (hi & 0x0f) * 17;
+                out[dst + 1] = ((lo >>> 4) & 0x0f) * 17;
+                out[dst + 2] = (lo & 0x0f) * 17;
+                out[dst + 3] = ((hi >>> 4) & 0x0f) * 17;
             }
+            return out;
 
-            if (format === GLIDE_TEXFMT_ARGB_8332) {
-                const raw = readU16(dataPtr + srcIndex * 2);
+        case GLIDE_TEXFMT_ARGB_8332:
+            for (let i = 0, dst = 0, off = base; i < texels; i++, dst += 4, off += 2) {
+                const raw = src[off];
                 out[dst + 0] = ((raw >>> 5) & 0x07) * 255 / 7 | 0;
                 out[dst + 1] = ((raw >>> 2) & 0x07) * 255 / 7 | 0;
                 out[dst + 2] = (raw & 0x03) * 255 / 3 | 0;
-                out[dst + 3] = (raw >>> 8) & 0xff;
-                continue;
+                out[dst + 3] = src[off + 1];
             }
+            return out;
 
-            if (format === GLIDE_TEXFMT_ALPHA_8) {
-                const a = memory[dataPtr + srcIndex] ?? 0;
+        case GLIDE_TEXFMT_ALPHA_8:
+            for (let i = 0, dst = 0; i < texels; i++, dst += 4) {
                 out[dst + 0] = 255;
                 out[dst + 1] = 255;
                 out[dst + 2] = 255;
-                out[dst + 3] = a;
-                continue;
+                out[dst + 3] = src[base + i];
             }
+            return out;
 
-            if (format === GLIDE_TEXFMT_INTENSITY_8) {
-                const i = memory[dataPtr + srcIndex] ?? 0;
-                out[dst + 0] = i;
-                out[dst + 1] = i;
-                out[dst + 2] = i;
+        case GLIDE_TEXFMT_INTENSITY_8:
+            for (let i = 0, dst = 0; i < texels; i++, dst += 4) {
+                const v = src[base + i];
+                out[dst + 0] = v;
+                out[dst + 1] = v;
+                out[dst + 2] = v;
                 out[dst + 3] = 255;
-                continue;
             }
+            return out;
 
-            if (format === GLIDE_TEXFMT_ALPHA_INTENSITY_44) {
-                const raw = memory[dataPtr + srcIndex] ?? 0;
-                const i = (raw & 0x0f) * 17;
-                const a = ((raw >>> 4) & 0x0f) * 17;
-                out[dst + 0] = i;
-                out[dst + 1] = i;
-                out[dst + 2] = i;
-                out[dst + 3] = a;
-                continue;
+        case GLIDE_TEXFMT_ALPHA_INTENSITY_44:
+            for (let i = 0, dst = 0; i < texels; i++, dst += 4) {
+                const raw = src[base + i];
+                const v = (raw & 0x0f) * 17;
+                out[dst + 0] = v;
+                out[dst + 1] = v;
+                out[dst + 2] = v;
+                out[dst + 3] = ((raw >>> 4) & 0x0f) * 17;
             }
+            return out;
 
-            if (format === GLIDE_TEXFMT_ALPHA_INTENSITY_88) {
-                const raw = readU16(dataPtr + srcIndex * 2);
-                const i = raw & 0xff;
-                const a = (raw >>> 8) & 0xff;
-                out[dst + 0] = i;
-                out[dst + 1] = i;
-                out[dst + 2] = i;
-                out[dst + 3] = a;
-                continue;
+        case GLIDE_TEXFMT_ALPHA_INTENSITY_88:
+            for (let i = 0, dst = 0, off = base; i < texels; i++, dst += 4, off += 2) {
+                const v = src[off];
+                out[dst + 0] = v;
+                out[dst + 1] = v;
+                out[dst + 2] = v;
+                out[dst + 3] = src[off + 1];
             }
+            return out;
 
-            if (format === GLIDE_TEXFMT_AP_88) {
-                const raw = readU16(dataPtr + srcIndex * 2);
-                const idx = raw & 0xff;
-                const a = (raw >>> 8) & 0xff;
-                if (palette) {
-                    const c = palette[idx] >>> 0;
+        case GLIDE_TEXFMT_AP_88:
+            if (palette) {
+                for (let i = 0, dst = 0, off = base; i < texels; i++, dst += 4, off += 2) {
+                    const c = palette[src[off]] >>> 0;
                     out[dst + 0] = (c >>> 16) & 0xff;
                     out[dst + 1] = (c >>> 8) & 0xff;
                     out[dst + 2] = c & 0xff;
-                    out[dst + 3] = a;
-                } else {
+                    out[dst + 3] = src[off + 1];
+                }
+            } else {
+                for (let i = 0, dst = 0, off = base; i < texels; i++, dst += 4, off += 2) {
+                    const idx = src[off];
                     out[dst + 0] = idx;
                     out[dst + 1] = idx;
                     out[dst + 2] = idx;
-                    out[dst + 3] = a;
+                    out[dst + 3] = src[off + 1];
                 }
-                continue;
             }
+            return out;
 
-            if (format === GLIDE_TEXFMT_P_8 && palette) {
-                const idx = memory[dataPtr + srcIndex] ?? 0;
-                const raw = palette[idx] >>> 0;
-                out[dst + 0] = (raw >>> 16) & 0xff;
-                out[dst + 1] = (raw >>> 8) & 0xff;
-                out[dst + 2] = raw & 0xff;
-                out[dst + 3] = (raw >>> 24) & 0xff;
-                continue;
+        case GLIDE_TEXFMT_P_8:
+            if (palette) {
+                for (let i = 0, dst = 0; i < texels; i++, dst += 4) {
+                    const raw = palette[src[base + i]] >>> 0;
+                    out[dst + 0] = (raw >>> 16) & 0xff;
+                    out[dst + 1] = (raw >>> 8) & 0xff;
+                    out[dst + 2] = raw & 0xff;
+                    out[dst + 3] = (raw >>> 24) & 0xff;
+                }
+                return out;
             }
-
-            // Fallback: grayscale from source byte
-            const gray = clampByte(memory[dataPtr + srcIndex] ?? 0);
-            out[dst + 0] = gray;
-            out[dst + 1] = gray;
-            out[dst + 2] = gray;
-            out[dst + 3] = 255;
-        }
+            break; // no palette downloaded: grayscale fallback
     }
 
+    // Fallback: grayscale from source byte.
+    for (let i = 0, dst = 0; i < texels; i++, dst += 4) {
+        const gray = src[base + i];
+        out[dst + 0] = gray;
+        out[dst + 1] = gray;
+        out[dst + 2] = gray;
+        out[dst + 3] = 255;
+    }
     return out;
 }
 

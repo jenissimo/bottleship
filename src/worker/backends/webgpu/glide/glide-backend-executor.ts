@@ -391,10 +391,24 @@ export class GlideBackendExecutor extends Legacy3DExecutor {
         await readback.mapAsync(GPUMapMode.READ);
         const mapped = new Uint8Array(readback.getMappedRange());
         const pixels = new Uint8ClampedArray(width * height * bytesPerPixel);
+        // The offscreen carries the canvas's preferred format (bgra8unorm on most desktops)
+        // while ImageData is always RGBA — copying rows straight through hands back a
+        // red/blue-swapped frame that still looks plausible. Same swizzle the screen route
+        // (WebGPUBackend.captureScreen) applies; the two must not disagree about colour.
+        const swapRB = (this.backend.getFormat() ?? "bgra8unorm") === "bgra8unorm";
         for (let y = 0; y < height; y++) {
             const src = y * paddedRowBytes;
             const dst = y * rowBytes;
-            pixels.set(mapped.subarray(src, src + rowBytes), dst);
+            if (!swapRB) {
+                pixels.set(mapped.subarray(src, src + rowBytes), dst);
+                continue;
+            }
+            for (let x = 0, s = src, d = dst; x < width; x++, s += 4, d += 4) {
+                pixels[d] = mapped[s + 2]!;
+                pixels[d + 1] = mapped[s + 1]!;
+                pixels[d + 2] = mapped[s]!;
+                pixels[d + 3] = mapped[s + 3]!;
+            }
         }
         readback.unmap();
         readback.destroy();

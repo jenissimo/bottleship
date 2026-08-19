@@ -508,4 +508,27 @@ export function registerTextureCommands(svc: HarnessService): void {
         }
         return dev.getDrawScrub();
     });
+
+    /** ffpShader({wgsl?}) — the fixed-function WGSL the CURRENT D3D9 state generates, plus
+     *  which layout owner won (`path`: "declaration" or "fvf") and the components it kept.
+     *
+     *  `captureFrame` reports the states a draw asked for; this reports what the shader built
+     *  from them actually reads. A vertex component the layout dropped — a declaration with no
+     *  COLOR, an FVF component past the bound stride — renders identically to a correct
+     *  white-diffuse draw, so nothing short of the emitted source distinguishes them. Pair it
+     *  with `drawScrub(N, N)`: cut to the draw, then read the shader that drew it.
+     *  The WGSL is large; omit `wgsl:true` for just the layout decision. */
+    svc.register("ffpShader", (args) => {
+        const opts = (args[0] ?? {}) as { wgsl?: boolean };
+        const dev: any = sys().services?.render?.getActive?.();
+        if (!dev?.describeFfpShader) {
+            throw new HarnessError("active presenter has no FFP shader dump (not D3D9)", HarnessErrorCode.UNSUPPORTED);
+        }
+        const out = dev.describeFfpShader() as Record<string, unknown>;
+        if (opts.wgsl === false || opts.wgsl === undefined) {
+            const { wgsl, ...rest } = out;
+            return { ...rest, wgslBytes: typeof wgsl === "string" ? wgsl.length : 0 };
+        }
+        return out;
+    });
 }

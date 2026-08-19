@@ -452,6 +452,14 @@ function decodeBc45ToRgba(
     }
 }
 
+/**
+ * Convert a packed (non-block-compressed) D3D surface to RGBA8, returning false
+ * for a format this decoder does not know so the caller can fall back to the
+ * generic surface converter.
+ *
+ * `format` is invariant over the whole surface, so it selects a specialized loop
+ * once rather than being re-dispatched per texel.
+ */
 function decodePackedD3DTextureToRgba8(
     src: Uint8Array,
     srcPtr: number,
@@ -462,33 +470,47 @@ function decodePackedD3DTextureToRgba8(
     out: Uint8Array,
     palette?: Uint32Array,
 ): boolean {
+    // An empty extent converts vacuously, for any format.
+    if (width <= 0 || height <= 0) return true;
     let dst = 0;
-    const view = new DataView(src.buffer, src.byteOffset, src.byteLength);
 
-    for (let y = 0; y < height; y++) {
-        let off = srcPtr + y * pitch;
-        for (let x = 0; x < width; x++) {
-            switch (format) {
-                case D3DFMT_A8:
+    switch (format) {
+        case D3DFMT_A8:
+            for (let y = 0; y < height; y++) {
+                let off = srcPtr + y * pitch;
+                for (let x = 0; x < width; x++, off += 1) {
                     out[dst++] = 255; out[dst++] = 255; out[dst++] = 255; out[dst++] = src[off] ?? 0;
-                    off += 1;
-                    break;
-                case D3DFMT_A8L8: {
+                }
+            }
+            return true;
+
+        case D3DFMT_A8L8:
+            for (let y = 0; y < height; y++) {
+                let off = srcPtr + y * pitch;
+                for (let x = 0; x < width; x++, off += 2) {
                     const l = src[off] ?? 0;
                     const a = src[off + 1] ?? 255;
                     out[dst++] = l; out[dst++] = l; out[dst++] = l; out[dst++] = a;
-                    off += 2;
-                    break;
                 }
-                case D3DFMT_A4L4: {
+            }
+            return true;
+
+        case D3DFMT_A4L4:
+            for (let y = 0; y < height; y++) {
+                let off = srcPtr + y * pitch;
+                for (let x = 0; x < width; x++, off += 1) {
                     const p = src[off] ?? 0;
                     const l = (p & 0x0f) * 17;
                     const a = ((p >>> 4) & 0x0f) * 17;
                     out[dst++] = l; out[dst++] = l; out[dst++] = l; out[dst++] = a;
-                    off += 1;
-                    break;
                 }
-                case D3DFMT_A8P8: {
+            }
+            return true;
+
+        case D3DFMT_A8P8:
+            for (let y = 0; y < height; y++) {
+                let off = srcPtr + y * pitch;
+                for (let x = 0; x < width; x++, off += 2) {
                     const idx = src[off] ?? 0;
                     const a = src[off + 1] ?? 255;
                     const c = palette?.[idx] ?? (0xff000000 | (idx << 16) | (idx << 8) | idx);
@@ -496,82 +518,124 @@ function decodePackedD3DTextureToRgba8(
                     out[dst++] = (c >>> 8) & 0xff;
                     out[dst++] = (c >>> 16) & 0xff;
                     out[dst++] = a;
-                    off += 2;
-                    break;
                 }
-                case D3DFMT_A16B16G16R16: {
+            }
+            return true;
+
+        case D3DFMT_A16B16G16R16: {
+            const view = new DataView(src.buffer, src.byteOffset, src.byteLength);
+            for (let y = 0; y < height; y++) {
+                let off = srcPtr + y * pitch;
+                for (let x = 0; x < width; x++, off += 8) {
+                    // All four channels are read before any is stored, so a
+                    // short source throws without leaving a half-written texel.
                     const r = view.getUint16(off, true) >>> 8;
                     const g = view.getUint16(off + 2, true) >>> 8;
                     const b = view.getUint16(off + 4, true) >>> 8;
                     const a = view.getUint16(off + 6, true) >>> 8;
                     out[dst++] = r; out[dst++] = g; out[dst++] = b; out[dst++] = a;
-                    off += 8;
-                    break;
                 }
-                case D3DFMT_V8U8: {
-                    const u = signed8ToByte(src[off] ?? 0);
-                    const v = signed8ToByte(src[off + 1] ?? 0);
-                    out[dst++] = u; out[dst++] = v; out[dst++] = 255; out[dst++] = 255;
-                    off += 2;
-                    break;
+            }
+            return true;
+        }
+
+        case D3DFMT_V8U8:
+            for (let y = 0; y < height; y++) {
+                let off = srcPtr + y * pitch;
+                for (let x = 0; x < width; x++, off += 2) {
+                    out[dst++] = signed8ToByte(src[off] ?? 0);
+                    out[dst++] = signed8ToByte(src[off + 1] ?? 0);
+                    out[dst++] = 255; out[dst++] = 255;
                 }
-                case D3DFMT_L6V5U5: {
+            }
+            return true;
+
+        case D3DFMT_L6V5U5: {
+            const view = new DataView(src.buffer, src.byteOffset, src.byteLength);
+            for (let y = 0; y < height; y++) {
+                let off = srcPtr + y * pitch;
+                for (let x = 0; x < width; x++, off += 2) {
                     const p = view.getUint16(off, true);
                     out[dst++] = signedNToByte(p, 5);
                     out[dst++] = signedNToByte(p >>> 5, 5);
                     out[dst++] = ((p >>> 10) & 0x3f) * 255 / 63 | 0;
                     out[dst++] = 255;
-                    off += 2;
-                    break;
                 }
-                case D3DFMT_X8L8V8U8: {
+            }
+            return true;
+        }
+
+        case D3DFMT_X8L8V8U8:
+            for (let y = 0; y < height; y++) {
+                let off = srcPtr + y * pitch;
+                for (let x = 0; x < width; x++, off += 4) {
                     out[dst++] = signed8ToByte(src[off] ?? 0);
                     out[dst++] = signed8ToByte(src[off + 1] ?? 0);
                     out[dst++] = src[off + 2] ?? 255;
                     out[dst++] = 255;
-                    off += 4;
-                    break;
                 }
-                case D3DFMT_Q8W8V8U8: {
+            }
+            return true;
+
+        case D3DFMT_Q8W8V8U8:
+            for (let y = 0; y < height; y++) {
+                let off = srcPtr + y * pitch;
+                for (let x = 0; x < width; x++, off += 4) {
                     out[dst++] = signed8ToByte(src[off] ?? 0);
                     out[dst++] = signed8ToByte(src[off + 1] ?? 0);
                     out[dst++] = signed8ToByte(src[off + 2] ?? 0);
                     out[dst++] = signed8ToByte(src[off + 3] ?? 0);
-                    off += 4;
-                    break;
                 }
-                case D3DFMT_V16U16: {
+            }
+            return true;
+
+        case D3DFMT_V16U16: {
+            const view = new DataView(src.buffer, src.byteOffset, src.byteLength);
+            for (let y = 0; y < height; y++) {
+                let off = srcPtr + y * pitch;
+                for (let x = 0; x < width; x++, off += 4) {
                     out[dst++] = signedNToByte(view.getUint16(off, true), 16);
                     out[dst++] = signedNToByte(view.getUint16(off + 2, true), 16);
                     out[dst++] = 255;
                     out[dst++] = 255;
-                    off += 4;
-                    break;
                 }
-                case D3DFMT_W11V11U10: {
+            }
+            return true;
+        }
+
+        case D3DFMT_W11V11U10: {
+            const view = new DataView(src.buffer, src.byteOffset, src.byteLength);
+            for (let y = 0; y < height; y++) {
+                let off = srcPtr + y * pitch;
+                for (let x = 0; x < width; x++, off += 4) {
                     const p = view.getUint32(off, true);
                     out[dst++] = signedNToByte(p, 10);
                     out[dst++] = signedNToByte(p >>> 10, 11);
                     out[dst++] = signedNToByte(p >>> 21, 11);
                     out[dst++] = 255;
-                    off += 4;
-                    break;
                 }
-                case D3DFMT_A2W10V10U10: {
+            }
+            return true;
+        }
+
+        case D3DFMT_A2W10V10U10: {
+            const view = new DataView(src.buffer, src.byteOffset, src.byteLength);
+            for (let y = 0; y < height; y++) {
+                let off = srcPtr + y * pitch;
+                for (let x = 0; x < width; x++, off += 4) {
                     const p = view.getUint32(off, true);
                     out[dst++] = signedNToByte(p, 10);
                     out[dst++] = signedNToByte(p >>> 10, 10);
                     out[dst++] = signedNToByte(p >>> 20, 10);
                     out[dst++] = ((p >>> 30) & 0x03) * 85;
-                    off += 4;
-                    break;
                 }
-                default:
-                    return false;
             }
+            return true;
         }
+
+        default:
+            return false;
     }
-    return true;
 }
 
 export function decodeD3DTextureToRgba8(

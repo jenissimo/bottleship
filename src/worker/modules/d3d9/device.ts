@@ -606,7 +606,7 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         // A cube-face surface carries its face index (GetCubeMapSurface recorded it); -1 = 2D RT.
         const face = meta?.face ?? -1;
         device.noteRtResolve(surfacePtr, true, texturePtr);
-        Logger.verbose(LogCategory.D3D9, `SetRenderTarget(index=${renderTargetIndex}, surface=0x${surfacePtr.toString(16)} -> tex=0x${texturePtr.toString(16)} face=${face})`);
+        Logger.verboseLazy(LogCategory.D3D9, () => `SetRenderTarget(index=${renderTargetIndex}, surface=0x${surfacePtr.toString(16)} -> tex=0x${texturePtr.toString(16)} face=${face})`);
         if (getDeviceRenderTarget(devicePtr, renderTargetIndex) !== surfacePtr) {
             rebindSurfaceSlot(devicePtr, renderTargetSlot(renderTargetIndex), surfacePtr);
             setDeviceRenderTarget(devicePtr, renderTargetIndex, surfacePtr);

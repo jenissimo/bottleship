@@ -133,3 +133,23 @@ export function resetD3D9SharedState(): void {
     resetShaderValidators();
     Logger.log(LogCategory.D3D9, 'D3D9 shared state reset');
 }
+
+/**
+ * Geometry of the D3D9 texture lock whose staging buffer contains `addr`, or null.
+ *
+ * Bink's BinkCopyToBuffer destination is a bare pointer; on a GPU presenter, writing to
+ * one is only visible when the guest itself uploads that memory. A LockRect staging
+ * buffer is exactly that case — UnlockRect uploads it — so the video must go INTO it
+ * and be composited by the game, not onto a video overlay that hides the game's own UI.
+ */
+export function resolveD3D9LockedTextureTarget(
+    addr: number,
+): { pitch: number; width: number; height: number } | null {
+    const ptr = addr >>> 0;
+    if (!ptr) return null;
+    for (const device of devices.values()) {
+        const hit = device.findLockedTextureByPointer?.(ptr);
+        if (hit) return hit;
+    }
+    return null;
+}

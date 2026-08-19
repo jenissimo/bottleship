@@ -163,6 +163,9 @@ export function decodeDxtToRgba(
     const isDxt1 = format === D3DFMT_DXT1;
     const isDxt5 = format === D3DFMT_DXT4 || format === D3DFMT_DXT5;
     const isDxt3 = format === D3DFMT_DXT2 || format === D3DFMT_DXT3;
+    // Whether the block carries a separate alpha sub-block is a property of the
+    // format, not of the texel.
+    const hasAlpha = isDxt3 || isDxt5;
 
     const palette = new Uint32Array(4);
     const alpha = new Uint8Array(16); // per-texel alpha (BC2/BC3), texel-major
@@ -223,7 +226,7 @@ export function decodeDxtToRgba(
                     rowBits >>= 2;
                     if (x >= width) continue;
                     let rgba = palette[ci];
-                    if (isDxt3 || isDxt5) {
+                    if (hasAlpha) {
                         rgba = (rgba & 0x00ffffff) | (alpha[ty * 4 + tx] << 24);
                     }
                     dst32[dstRow + x] = rgba >>> 0;

@@ -14,6 +14,7 @@ import { frameProfiler } from "../../../core/frame-profiler";
 import { statsOverlay } from "../../../core/stats-overlay";
 import { PROG_BIND } from "./shader";
 import { padRegion, vertexRangeEndBytes, zeroStreamBuffer } from "../shared/vertex-streams";
+import { noteBufferUpload } from "../buffer-upload";
 import { d3d9WasmArena, ArenaCommandType } from "./d3d9-wasm-arena";
 import { FFP_UNIFORM_BYTES, FFP_MAX_STAGES } from "./ffp-lighting";
 import { ColorKeyBlitPipeline } from "../ddraw/colorkey-blit-pipeline";
@@ -860,7 +861,10 @@ export class D3D9BackendExecutor {
         try {
             // Upload queued data
             for (let i = 0; i < frame.uploadBuffers.length; i++) {
-                queue.writeBuffer(frame.uploadBuffers[i], 0, frame.uploadData[i] as any);
+                const bytes = frame.uploadData[i] as Uint8Array;
+                queue.writeBuffer(frame.uploadBuffers[i], frame.uploadOffsets[i] ?? 0, bytes as any);
+                noteBufferUpload("d3d9", bytes.byteLength, (frame.uploadOffsets[i] ?? 0) === 0
+                    && bytes.byteLength >= frame.uploadBuffers[i]!.size);
             }
 
             // Pre-size the programmable per-draw uniform arenas for this frame.
@@ -1197,10 +1201,25 @@ export class D3D9BackendExecutor {
         await readback.mapAsync(GPUMapMode.READ);
         const mapped = new Uint8Array(readback.getMappedRange());
         const pixels = new Uint8ClampedArray(width * height * bytesPerPixel);
+        // The offscreen carries the CANVAS's preferred format, which is bgra8unorm on most
+        // desktops, while ImageData is always RGBA. Copying the rows straight through hands
+        // back a red/blue-swapped picture that still looks like a plausible frame — the
+        // screen path (WebGPUBackend.captureScreen) already swizzles, and these two routes
+        // to the same pixels must not disagree about colour.
+        const swapRB = this.backend.getFormat() === "bgra8unorm";
         for (let row = 0; row < height; row++) {
             const srcStart = row * paddedBytesPerRow;
-            const srcEnd = srcStart + unpaddedBytesPerRow;
-            pixels.set(mapped.subarray(srcStart, srcEnd), row * unpaddedBytesPerRow);
+            const dstStart = row * unpaddedBytesPerRow;
+            if (!swapRB) {
+                pixels.set(mapped.subarray(srcStart, srcStart + unpaddedBytesPerRow), dstStart);
+                continue;
+            }
+            for (let x = 0, s = srcStart, d = dstStart; x < width; x++, s += 4, d += 4) {
+                pixels[d] = mapped[s + 2]!;
+                pixels[d + 1] = mapped[s + 1]!;
+                pixels[d + 2] = mapped[s]!;
+                pixels[d + 3] = mapped[s + 3]!;
+            }
         }
         readback.unmap();
 

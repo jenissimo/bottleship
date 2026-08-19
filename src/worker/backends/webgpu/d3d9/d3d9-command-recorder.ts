@@ -92,10 +92,11 @@ export class D3D9CommandRecorder {
     }
 
     /**
-     * Queue a buffer upload for the current frame
+     * Queue a buffer upload for the current frame. `dstOffset` is where `data` lands in the
+     * target — a ranged upload writes only the bytes the guest rewrote.
      */
-    queueUpload(buffer: GPUBuffer, data: Uint8Array): void {
-        this.frame.queueUpload(buffer, data);
+    queueUpload(buffer: GPUBuffer, data: Uint8Array, dstOffset = 0): void {
+        this.frame.queueUpload(buffer, data, dstOffset);
     }
 
     /**

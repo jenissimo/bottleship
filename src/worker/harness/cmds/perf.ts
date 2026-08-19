@@ -19,6 +19,7 @@ import { frameProfiler, type BadFrameCapture, type FrameSample } from "../../cor
 import { profiler } from "../../core/profiler";
 import { readbackCounters } from "../../modules/ddraw/surface-sync";
 import { drawCostProfiler } from "../../backends/webgpu/ddraw/draw-cost-profiler";
+import { getBufferUploadCensus, resetBufferUploadCensus } from "../../backends/webgpu/buffer-upload";
 import { cpu, sys, symbolize } from "../serialize";
 import { HarnessError, HarnessErrorCode } from "../rpc";
 import { type FrameTail } from "../../core/frame-time-distribution";
@@ -617,6 +618,21 @@ export function registerPerfCommands(svc: HarnessService): void {
         };
         if (opts.reset) readbackCounters.reset();
         return snapshot;
+    });
+
+    /**
+     * bufferUploads({reset?}) — retained VB/IB upload census for D3D9 and D3D8.
+     *
+     * `amplification` is the number that matters: bytes uploaded per byte the guest actually
+     * wrote through Lock/Unlock. ~1 is healthy; a large value is the whole-buffer-per-lock
+     * defect, and it is invisible in fps until the frame is already lost to writeBuffer.
+     * null means no guest writes were seen in the window — read `observed` before believing
+     * any of it. Flow: bufferUploads({reset:true}) → tickFrames(N) → bufferUploads().
+     */
+    svc.register("bufferUploads", (args) => {
+        const opts = (args[0] ?? {}) as { reset?: boolean };
+        if (opts.reset) { resetBufferUploadCensus(); return getBufferUploadCensus(); }
+        return getBufferUploadCensus();
     });
 
     /**

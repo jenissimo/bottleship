@@ -17,7 +17,10 @@ export type CapturedDrawCall = {
     // Geometry
     primitiveType: number;
     primitiveTypeName: string;
-    vertexType: number;       // FVF
+    vertexType: number;       // FVF — 0 while a vertex declaration owns the layout
+    /** Active D3D9 vertex declaration, 0 for none. Non-zero means IT decides the layout,
+     *  not `vertexType`, and the FVF decode fields below are withheld rather than guessed. */
+    vertexDecl?: number;
     vertexCount: number;
     indexCount: number;
     isRHW: boolean;
@@ -32,6 +35,10 @@ export type CapturedDrawCall = {
     // For INDEXED draws these are buffer[0..3] (often unused/stale) — use
     // indexedVertices below for the vertices the draw actually references.
     firstVertices: Array<{x: number; y: number; z: number; w?: number; u?: number; v?: number; diffuse?: number}>;  // max 4
+    /** Why `firstVertices` is absent. Set instead of decoding when the FVF does not describe
+     *  these bytes — a wrong-layout decode reports plausible numbers for components the vertex
+     *  never had, which reads as a data bug in whatever consumes it. */
+    firstVerticesUnavailable?: string;
     // First raw index values (indexed draws only); 16-bit WORD indices (D3D7).
     firstIndices?: number[];
     // Vertices the draw ACTUALLY references — dereferenced through the first few

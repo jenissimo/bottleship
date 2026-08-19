@@ -64,6 +64,7 @@ import {
 } from "./surface-sync";
 import { propagateSurfaceStateToRegistry } from "./d3d/texture-manager";
 import { isValidAddress } from "../../core/memory/address-guard";
+import { toPlainGuestMemory } from "../../core/memory/guest-memory";
 import { markGpuSyncedFromCpu } from "./surface-sync";
 import { onFrameEnd as frameCaptureOnFrameEnd } from "./frame-capture";
 import { recordSurfaceOp } from "./surface-op-log";
@@ -74,6 +75,77 @@ import { collectFlipChain, findFlipBlockingLease, flipStorageCompatible, rotateF
 const rectPool = new RectPool(8);
 
 const missingFormatWarnedSurfacePtrs = new Set<number>();
+
+/**
+ * ColorFill of a rect in a surface's CPU pixel memory.
+ *
+ * The guest RAM a thunk is handed is v86's Proxy, where a per-byte store costs ~40x a
+ * word store through a plain view — a full-screen fill at that rate starves the audio
+ * pump long before it reads as a slow frame. So: one row is written through a 32-bit
+ * view (or, when the layout defeats a word view, one pixel grown by doubling memmoves),
+ * and the remaining rows are replicated with copyWithin. Rows are pitch-strided, not
+ * contiguous, so each one is its own copy.
+ *
+ * The extent is bounded against the view rather than the region map, matching
+ * fillZSurfaceMemory: surfacePtr is our own SURFACE allocation, not a borrowed pointer,
+ * and a rect that runs past the end fills the rows that fit — as it did before.
+ */
+export function fillSurfaceRectCpu(
+    mem: Uint8Array,
+    dstState: DirectDrawSurfaceState,
+    rect: Rect,
+    width: number,
+    height: number,
+    bytesPerPixel: number,
+    color: number,
+): void {
+    const plain = toPlainGuestMemory(mem);
+    const pitch = dstState.pitch;
+    const rowBytes = width * bytesPerPixel;
+    const firstRow = absToRel(plain, dstState.surfacePtr + rect.top * pitch + rect.left * bytesPerPixel);
+    if (firstRow < 0 || firstRow + rowBytes > plain.length) return;
+
+    // Trailing rows that fall outside the view are dropped, not clamped mid-row.
+    let rows = height;
+    if (pitch > 0) {
+        const fit = Math.floor((plain.length - firstRow - rowBytes) / pitch) + 1;
+        if (fit < rows) rows = fit;
+    } else if (rows > 1) {
+        rows = 1;
+    }
+    if (rows <= 0) return;
+
+    const wordBase = plain.byteOffset + firstRow;
+    if (bytesPerPixel === 1) {
+        plain.fill(color & 0xff, firstRow, firstRow + rowBytes);
+    } else if (bytesPerPixel === 4 && (wordBase & 3) === 0) {
+        new Uint32Array(plain.buffer, wordBase, width).fill(color >>> 0);
+    } else if (bytesPerPixel === 2 && (wordBase & 3) === 0) {
+        const c16 = color & 0xffff;
+        const pairs = width >>> 1;
+        if (pairs > 0) new Uint32Array(plain.buffer, wordBase, pairs).fill(((c16 << 16) | c16) >>> 0);
+        if (width & 1) {
+            const tail = firstRow + pairs * 4;
+            plain[tail] = c16 & 0xff;
+            plain[tail + 1] = c16 >>> 8;
+        }
+    } else {
+        // 24 bpp, or a start address a word view cannot address: write one pixel, then
+        // double it across the row. log2(width) memmoves instead of width*bpp stores.
+        for (let b = 0; b < bytesPerPixel; b++) plain[firstRow + b] = (color >>> (b * 8)) & 0xff;
+        let filled = bytesPerPixel;
+        while (filled < rowBytes) {
+            const n = Math.min(filled, rowBytes - filled);
+            plain.copyWithin(firstRow + filled, firstRow, firstRow + n);
+            filled += n;
+        }
+    }
+
+    for (let y = 1; y < rows; y++) {
+        const off = firstRow + y * pitch;
+        plain.copyWithin(off, firstRow, firstRow + rowBytes);
+    }
+}
 
 /**
  * Lazy GPU Promotion: Create GPU texture for surface on-demand when needed for GPU Blt.
@@ -753,27 +825,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
             }
 
             if (rectWidth > 0 && rectHeight > 0) {
-                for (let y = 0; y < rectHeight; y++) {
-                    const rowAddr = dstState.surfacePtr + (dstRect.top + y) * dstState.pitch + dstRect.left * bytesPerPixel;
-                    const relRowAddr = absToRel(mem, rowAddr);
-                    if (relRowAddr >= 0 && relRowAddr + rectWidth * bytesPerPixel <= mem.length) {
-                        if (bytesPerPixel === 2) {
-                            for (let x = 0; x < rectWidth; x++) {
-                                mem[relRowAddr + x * 2] = fillColor & 0xff;
-                                mem[relRowAddr + x * 2 + 1] = (fillColor >> 8) & 0xff;
-                            }
-                        } else if (bytesPerPixel === 4) {
-                            for (let x = 0; x < rectWidth; x++) {
-                                mem[relRowAddr + x * 4] = fillColor & 0xff;
-                                mem[relRowAddr + x * 4 + 1] = (fillColor >> 8) & 0xff;
-                                mem[relRowAddr + x * 4 + 2] = (fillColor >> 16) & 0xff;
-                                mem[relRowAddr + x * 4 + 3] = (fillColor >> 24) & 0xff;
-                            }
-                        } else {
-                            mem.fill(fillColor & 0xff, relRowAddr, relRowAddr + rectWidth * bytesPerPixel);
-                        }
-                    }
-                }
+                fillSurfaceRectCpu(mem, dstState, dstRect, rectWidth, rectHeight, bytesPerPixel, fillColor);
                 setAuthorityCpu(dstState);
                 unionSurfaceDirtyRegion(dstState, dstRect);
             }

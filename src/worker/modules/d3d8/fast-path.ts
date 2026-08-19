@@ -213,9 +213,13 @@ export function registerFastPathD3D8Functions(dispatcher: any): void {
             // Out of range, or an out-param we would have to validate against the region
             // map, falls through to the slow thunk — it owns Mem.writeUint32 and the
             // diagnostic. A raw view write past the end of guest memory would throw.
-            if (validateLockRange(vb.size, offset, size) === null) return null;
+            const vbLock = validateLockRange(vb.size, offset, size);
+            if (vbLock === null) return null;
             if (ppData + 4 > mem.length) return null;
             view.setUint32(ppData, (vb.guestPtr + offset) >>> 0, true);
+            // The upload path keys on this mark, so a fast path that skipped it would leave
+            // the buffer's new vertices on the CPU side and draw the previous frame's.
+            device.markBufferDirty("vb", pVB, offset, vbLock, vb.size);
             return D3D_OK;
         }, { trivial: true });
 
@@ -232,9 +236,11 @@ export function registerFastPathD3D8Functions(dispatcher: any): void {
             if (!ppData) return D3DERR_INVALIDCALL;
             const ib = device.ibData.get(pIB);
             if (!ib) return D3DERR_INVALIDCALL;
-            if (validateLockRange(ib.size, offset, size) === null) return null;
+            const ibLock = validateLockRange(ib.size, offset, size);
+            if (ibLock === null) return null;
             if (ppData + 4 > mem.length) return null;
             view.setUint32(ppData, (ib.guestPtr + offset) >>> 0, true);
+            device.markBufferDirty("ib", pIB, offset, ibLock, ib.size);
             return D3D_OK;
         }, { trivial: true });
 

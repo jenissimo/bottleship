@@ -79,6 +79,9 @@ export class RenderFrame {
     bufferRefs: GPUBuffer[] = [];
     uploadBuffers: GPUBuffer[] = [];
     uploadData: Uint8Array[] = [];
+    /** Destination byte offset per queued upload — a partial upload writes only the range
+     *  the guest rewrote, so the flush cannot assume 0. Always a multiple of 4. */
+    uploadOffsets: number[] = [];
     temporaryBuffers: GPUBuffer[] = [];
     /** Buffers acquired from a reuse pool (DrawPrimitiveUP vertex data). Unlike
      *  temporaryBuffers, these are NOT destroyed at frame end — the owner returns
@@ -103,6 +106,7 @@ export class RenderFrame {
         this.bufferRefs.length = 0;
         this.uploadBuffers.length = 0;
         this.uploadData.length = 0;
+        this.uploadOffsets.length = 0;
         this.temporaryBuffers.length = 0;
         this.pooledBuffers.length = 0;
         // Rewind the draw-state pool without dropping the slots (keeps their
@@ -257,10 +261,14 @@ export class RenderFrame {
         this.commandD.push(0);
     }
 
-    queueUpload(buffer: GPUBuffer, data: Uint8Array): void {
+    /** `dstOffset` is where `data` lands in the target buffer; it must be 4-aligned and the
+     *  padded length must still fit, which `alignUploadRange` guarantees for its callers. */
+    queueUpload(buffer: GPUBuffer, data: Uint8Array, dstOffset = 0): void {
         this.uploadBuffers.push(buffer);
+        this.uploadOffsets.push(dstOffset);
         // IMPORTANT: Make a copy! The source data may be a view into a shared
-        // conversion buffer that gets overwritten by subsequent DrawPrimitiveUP calls.
+        // conversion buffer that gets overwritten by subsequent DrawPrimitiveUP calls,
+        // or into a store shadow a later Unlock in this same frame refills.
         // The copy is padded to a 4-byte multiple: GPUQueue.writeBuffer THROWS an
         // OperationError on any other size (a 16-bit index buffer with an odd index
         // count is 2 mod 4), and one throw at flush time abandons every upload queued

@@ -28,15 +28,15 @@ export interface D3D9PerfSnapshot {
 
 /**
  * The frame's queued buffer uploads all run before its render pass, so a GPU buffer written
- * twice in one frame serves BOTH draws whatever the last upload wrote. Each upload snapshots
- * the WHOLE guest-side buffer, which is what makes the three re-upload cases differ:
+ * twice in one frame serves BOTH draws whatever the last upload wrote. An upload carries the
+ * range the guest rewrote (see buffer-upload.ts), which is what makes the three cases differ:
  *
- * - after D3DLOCK_NOOVERWRITE the later snapshot still carries the earlier bytes unchanged,
+ * - after D3DLOCK_NOOVERWRITE the guest promised not to touch bytes an earlier draw reads,
  *   so the earlier draw reads what it asked for (`overwriteNoOverwrite`, benign);
- * - after D3DLOCK_DISCARD it does not, and a fresh ring slot is what keeps the earlier draw
- *   correct (`overwriteRenamed`);
- * - after a PLAIN lock it does not either, and nothing covers it (`overwriteUnhandled`) —
- *   the earlier draw silently renders the later object's vertices.
+ * - after D3DLOCK_DISCARD that promise is off, and a fresh ring slot is what keeps the
+ *   earlier draw correct (`overwriteRenamed`);
+ * - after a PLAIN lock it is off too and nothing covers it (`overwriteUnhandled`) — the
+ *   earlier draw silently renders the later object's vertices wherever the ranges overlap.
  *
  * `lockDiscard` vs `lockPlain` is what says which of those a fix must target: keying renaming
  * on DISCARD cannot help a guest that re-fills with plain locks.

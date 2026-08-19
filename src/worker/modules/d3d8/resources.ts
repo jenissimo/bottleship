@@ -525,6 +525,9 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
             pool: Pool >>> 0,
         });
         resourceToDevice.set(vbPtr, device);
+        // A recycled COM pointer can land on a GPU buffer big enough to be reused, whose bytes
+        // belong to the dead resource: the new buffer's first upload must be whole.
+        device.markBufferAllDirty("vb", vbPtr, Length);
 
         Mem.writeUint32(ppVB, vbPtr);
 
@@ -577,6 +580,7 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
             pool: Pool >>> 0,
         });
         resourceToDevice.set(ibPtr, device);
+        device.markBufferAllDirty("ib", ibPtr, Length);
 
         Mem.writeUint32(ppIB, ibPtr);
 
@@ -599,12 +603,14 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
 
         const vb = device.vbData.get(pVB);
         if (!vb) return D3DERR_INVALIDCALL;
-        if (validateLockRange(vb.size, Offset, Size) === null) {
+        const lockSize = validateLockRange(vb.size, Offset, Size);
+        if (lockSize === null) {
             Logger.warn(LogCategory.SYSTEM, `D3D8 VB Lock: out-of-range lock offset=${Offset} size=${Size} vbSize=${vb.size}`);
             return D3DERR_INVALIDCALL;
         }
 
         if (!Mem.writeUint32(ppData, vb.guestPtr + Offset)) return D3DERR_INVALIDCALL;
+        device.markBufferDirty("vb", pVB, Offset, lockSize, vb.size);
         return D3D_OK;
     };
 
@@ -641,12 +647,14 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
 
         const ib = device.ibData.get(pIB);
         if (!ib) return D3DERR_INVALIDCALL;
-        if (validateLockRange(ib.size, Offset, Size) === null) {
+        const lockSize = validateLockRange(ib.size, Offset, Size);
+        if (lockSize === null) {
             Logger.warn(LogCategory.SYSTEM, `D3D8 IB Lock: out-of-range lock offset=${Offset} size=${Size} ibSize=${ib.size}`);
             return D3DERR_INVALIDCALL;
         }
 
         if (!Mem.writeUint32(ppData, ib.guestPtr + Offset)) return D3DERR_INVALIDCALL;
+        device.markBufferDirty("ib", pIB, Offset, lockSize, ib.size);
         return D3D_OK;
     };
 

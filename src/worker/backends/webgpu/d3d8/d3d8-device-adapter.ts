@@ -27,6 +27,7 @@ import { frameProfiler } from '../../../core/frame-profiler';
 import { profiler } from '../../../core/profiler';
 import { statsOverlay } from '../../../core/stats-overlay';
 import { WebGPUBackend } from '../webgpu-backend';
+import { alignUploadRange, noteBufferUpload, noteGuestBufferWrite } from '../buffer-upload';
 import { EmulatorConfig } from '../../../core/emulator-config-manager';
 import { getOverlayCompositePlan } from '../../../modules/user32/dialog-overlay';
 import {
@@ -180,6 +181,16 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
     private programmable: D3D8ProgrammableRenderer | null = null;
     private vbGpuBuffers = new Map<number, GPUBuffer>();
     private ibGpuBuffers = new Map<number, GPUBuffer>();
+    /**
+     * Byte range of each retained buffer the guest has rewritten since its last upload.
+     * D3D8 hands the guest a raw pointer into the buffer's guest memory and its Unlock is a
+     * no-op, so without this every draw re-uploaded every bound buffer whole. Writing to a
+     * vertex buffer outside a Lock/Unlock bracket is undefined behaviour in D3D8, which is
+     * what makes Lock the faithful "it changed" signal; the mark is taken at Lock rather than
+     * Unlock because the upload happens at draw time, strictly after both.
+     */
+    private vbDirty = new Map<number, { start: number; end: number }>();
+    private ibDirty = new Map<number, { start: number; end: number }>();
     private syntheticDeclFvf = 0;
     private syntheticDeclStride = 0;
     /** Multi-stream decl-only shaders: copy plan into the canonical FVF layout
@@ -382,6 +393,26 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         return null;
     }
 
+    /** Mark a retained buffer's rewritten range; `size` 0 means "to the end" (D3D8 Lock). */
+    markBufferDirty(kind: "vb" | "ib", ptr: number, offset: number, size: number, totalSize: number): void {
+        const end = size > 0 ? Math.min(offset + size, totalSize) : totalSize;
+        if (end <= offset) return;
+        noteGuestBufferWrite("d3d8", end - offset);
+        const map = kind === "vb" ? this.vbDirty : this.ibDirty;
+        const cur = map.get(ptr);
+        if (cur && cur.end > cur.start) {
+            cur.start = Math.min(cur.start, offset);
+            cur.end = Math.max(cur.end, end);
+        } else {
+            map.set(ptr, { start: offset, end });
+        }
+    }
+
+    /** Buffer created or re-created: nothing on the GPU corresponds to it yet. */
+    markBufferAllDirty(kind: "vb" | "ib", ptr: number, totalSize: number): void {
+        (kind === "vb" ? this.vbDirty : this.ibDirty).set(ptr, { start: 0, end: totalSize });
+    }
+
     private ensureVbGpuBuffer(vbPtr: number, size: number): GPUBuffer | null {
         const device = this.getGpuDevice();
         if (!device) return null;
@@ -389,11 +420,12 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         if (!buf || size > ((buf as GPUBuffer & { __size?: number }).__size ?? 0)) {
             buf?.destroy();
             buf = device.createBuffer({
-                size: Math.max(16, size),
+                size: Math.max(16, (size + 3) & ~3),
                 usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
             });
             (buf as GPUBuffer & { __size?: number }).__size = size;
             this.vbGpuBuffers.set(vbPtr, buf);
+            this.markBufferAllDirty("vb", vbPtr, size);
         }
         return buf;
     }
@@ -405,28 +437,58 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         if (!buf || size > ((buf as GPUBuffer & { __size?: number }).__size ?? 0)) {
             buf?.destroy();
             buf = device.createBuffer({
-                size: Math.max(16, size),
+                size: Math.max(16, (size + 3) & ~3),
                 usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
             });
             (buf as GPUBuffer & { __size?: number }).__size = size;
             this.ibGpuBuffers.set(ibPtr, buf);
+            this.markBufferAllDirty("ib", ibPtr, size);
         }
         return buf;
+    }
+
+    /**
+     * Copy the rewritten range of a retained buffer out of guest memory. Callers invoke this
+     * once per draw per bound buffer, so an unchanged buffer must cost nothing: the range is
+     * consumed here and only a fresh Lock refills it.
+     */
+    private uploadRetained(
+        kind: "vb" | "ib", buf: GPUBuffer, ptr: number, guestPtr: number, size: number, mem: Uint8Array,
+    ): void {
+        const device = this.getGpuDevice();
+        if (!device) return;
+        const map = kind === "vb" ? this.vbDirty : this.ibDirty;
+        const dirty = map.get(ptr);
+        if (!dirty || dirty.end <= dirty.start) return;
+        const { offset, length } = alignUploadRange(dirty.start, Math.min(dirty.end, size), buf.size);
+        dirty.start = 0;
+        dirty.end = 0;
+        if (length === 0) return;
+        // Rounding the range up to a 4-byte boundary can reach past the guest allocation by
+        // up to 3 bytes; those are padding the GPU buffer has room for but guest memory may
+        // not, so copy what exists and zero the rest rather than reading out of bounds.
+        const available = Math.max(0, Math.min(length, mem.length - (guestPtr + offset)));
+        if (available === length) {
+            device.queue.writeBuffer(buf, offset, mem.buffer, mem.byteOffset + guestPtr + offset, length);
+        } else {
+            const padded = new Uint8Array(length);
+            if (available > 0) padded.set(mem.subarray(guestPtr + offset, guestPtr + offset + available));
+            device.queue.writeBuffer(buf, offset, padded);
+        }
+        noteBufferUpload("d3d8", length, offset === 0 && length >= size);
     }
 
     private uploadVb(vbPtr: number, guestPtr: number, size: number, mem: Uint8Array): GPUBuffer | null {
         const buf = this.ensureVbGpuBuffer(vbPtr, size);
         if (!buf) return null;
-        const device = this.getGpuDevice();
-        device?.queue.writeBuffer(buf, 0, mem.buffer, mem.byteOffset + guestPtr, size);
+        this.uploadRetained("vb", buf, vbPtr, guestPtr, size, mem);
         return buf;
     }
 
     private uploadIb(ibPtr: number, guestPtr: number, size: number, mem: Uint8Array): GPUBuffer | null {
         const buf = this.ensureIbGpuBuffer(ibPtr, size);
         if (!buf) return null;
-        const device = this.getGpuDevice();
-        device?.queue.writeBuffer(buf, 0, mem.buffer, mem.byteOffset + guestPtr, size);
+        this.uploadRetained("ib", buf, ibPtr, guestPtr, size, mem);
         return buf;
     }
 

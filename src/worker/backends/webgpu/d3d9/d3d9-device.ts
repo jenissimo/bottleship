@@ -70,6 +70,7 @@ import {
     D3DMCS_COLOR2,
 } from "./ffp-lighting";
 import { FFP_FOG_WGSL, resolveFfpFogMode } from "./ffp-fog";
+import { alignUploadRange } from "../buffer-upload";
 import { FFP_IMPLEMENTED_OPS, emitFfpCombinerWgsl } from "./ffp-combiner";
 import {
     D3D9StateBlockRecorder,
@@ -363,15 +364,21 @@ export class D3D9Device {
     // [diag] dedup'd recent SetRenderTarget resolutions + RT texture creations (harness rtDebug verb).
     private rtResolveLog: string[] = [];
     private rtCreateLog: string[] = [];
-    /** Record a SetRenderTarget surface→texture resolution (dedup'd) for diagnostics. */
+    /** Raw form of the last recorded resolve, so a repeat costs a compare, not a format. */
+    private rtResolveLast = { surf: -1, metaHit: false, tex: -1, idx: -1 as number | null, isRT: false };
+    /** Record a SetRenderTarget surface→texture resolution (dedup'd) for diagnostics.
+     *  Called on every SetRenderTarget, and games set the target per pass, so the dedup
+     *  decision is made on the raw numbers — the string is built only when it changes. */
     noteRtResolve(surfacePtr: number, metaHit: boolean, texturePtr: number): void {
         const idx = texturePtr ? this.textures.getIndex(texturePtr) : null;
         const isRT = idx !== null && this.textures.isRenderTarget(idx);
-        const line = `surf=0x${surfacePtr.toString(16)} metaHit=${metaHit} tex=0x${texturePtr.toString(16)} idx=${idx} isRT=${isRT}`;
-        if (this.rtResolveLog[this.rtResolveLog.length - 1] !== line) {
-            this.rtResolveLog.push(line);
-            if (this.rtResolveLog.length > 16) this.rtResolveLog.shift();
-        }
+        const last = this.rtResolveLast;
+        if (last.surf === surfacePtr && last.metaHit === metaHit && last.tex === texturePtr
+            && last.idx === idx && last.isRT === isRT) return;
+        last.surf = surfacePtr; last.metaHit = metaHit; last.tex = texturePtr; last.idx = idx; last.isRT = isRT;
+        this.rtResolveLog.push(
+            `surf=0x${surfacePtr.toString(16)} metaHit=${metaHit} tex=0x${texturePtr.toString(16)} idx=${idx} isRT=${isRT}`);
+        if (this.rtResolveLog.length > 16) this.rtResolveLog.shift();
     }
     /** HARNESS rtDebug verb: what SetRenderTarget saw + which textures were created as RTs. */
     getRtDebug(): { resolves: string[]; creates: string[]; currentRtIndex: number | null } {
@@ -715,12 +722,30 @@ export class D3D9Device {
             this.recordStateBlock({ op: "fvf", value: fvf });
             return 0;
         }
+        // SetFVF(0) touches no state (DXVK D3D9DeviceEx::SetFVF returns D3D_OK immediately).
+        if (fvf === 0) return 0;
+        // SetFVF and SetVertexDeclaration are ONE state slot: D3D9 turns the FVF into a
+        // declaration and installs it, so an FVF draw following a declaration must stop using
+        // that declaration. Ahead of the tracker's unchanged-FVF dedupe, which must not be able
+        // to skip the handover.
+        this.clearActiveVertexDecl();
         if (d3d9WasmArena.isInitialized()) d3d9WasmArena.setFvf(fvf);
         if (!this.stateTracker.setFVF(fvf)) {
             d3d9PerfSkip("setFVF");
             return 0;
         }
         return 0;
+    }
+
+    /** Release the active declaration so the FVF path owns the slot again. */
+    private clearActiveVertexDecl(): void {
+        if (this.activeVertexDecl !== 0) {
+            this.activeVertexDecl = 0;
+            this.currentPipelineKey = null;
+            this.currentPipelineId = null;
+            if (d3d9WasmArena.isInitialized()) d3d9WasmArena.setVertexDeclaration(0);
+        }
+        this.activeVertexDeclComPtr = this.replaceHeldComRef(this.activeVertexDeclComPtr, 0);
     }
 
     getFVF(): number {
@@ -1114,6 +1139,12 @@ export class D3D9Device {
         if (this.recordingStateBlock) {
             this.recordStateBlock({ op: "vertexDeclaration", handle: comPtr });
             return 0;
+        }
+        // The other direction of the single slot setFVF documents: a real declaration replaces
+        // whatever SetFVF installed, and GetFVF then reads 0 off it.
+        if (internalHandle !== 0) {
+            this.stateTracker.setFVF(0);
+            if (d3d9WasmArena.isInitialized()) d3d9WasmArena.setFvf(0);
         }
         if (d3d9WasmArena.isInitialized()) d3d9WasmArena.setVertexDeclaration(internalHandle);
         if (this.activeVertexDecl === internalHandle && this.activeVertexDeclComPtr === comPtr) {
@@ -1514,12 +1545,16 @@ export class D3D9Device {
             this.dropBufferVersions(index, kind);
             ring = undefined;
         }
+        // A ring built now owns a buffer whose contents nothing has established — the store's
+        // own buffer may predate the shadow, a fresh one holds zeros. Its first upload is whole.
+        let ringIsNew = false;
         if (!ring) {
             const storeBuf = store.getGpuBuffer(index);
             const base = storeBuf && storeBuf.size >= gpuSize ? storeBuf : device.createBuffer({ size: gpuSize, usage });
             ring = [base];
             (isVb ? this.vbVersions : this.ibVersions).set(index, ring);
             slots.set(index, 0);
+            ringIsNew = true;
         }
 
         let slot = slots.get(index);
@@ -1541,13 +1576,27 @@ export class D3D9Device {
             d3d9PerfBufferUpload(renamed, overwrote, lastFlags, n);
             const target = ring[slot]!;
             store.setGpuBuffer(index, target);
-            this.commandRecorder.queueUpload(target, data);
+            // Partial uploads are only sound into a slot that already holds this buffer's
+            // previous bytes. A renamed slot and a just-built ring do not, so they take the
+            // whole shadow; slot 0 across frames does, because syncBufferFrame re-dirties in
+            // full any buffer whose frame ended on a higher slot.
+            const whole = renamed || ringIsNew;
+            const range = whole
+                ? { offset: 0, length: gpuSize }
+                : alignUploadRange(store.getDirtyStart(index), store.getDirtyEnd(index), gpuSize);
+            if (range.length > 0) {
+                this.commandRecorder.queueUpload(
+                    target, data.subarray(range.offset, Math.min(range.offset + range.length, data.length)),
+                    range.offset);
+            }
+            // The audit asks what the GPU will FETCH, which after a partial upload is the
+            // shadow all the same: every slot converges on it (see `whole` above).
             if (this.fetchAuditFramesLeft > 0) this.fetchAuditShadow.set(target, data.slice());
             store.setDirty(index, false);
             uploaded.add(index);
             if (this.frameSnapshot.frameCounters) {
                 this.frameSnapshot.frameCounters.uploads++;
-                this.frameSnapshot.frameCounters.vertexBytes += data.byteLength;
+                this.frameSnapshot.frameCounters.vertexBytes += range.length;
             }
         }
         discarded.delete(index);
@@ -2034,6 +2083,11 @@ export class D3D9Device {
         } finally {
             readback.destroy();
         }
+    }
+
+    /** Level-0 texture lock whose staging bytes contain `addr` (see TextureStore). */
+    findLockedTextureByPointer(addr: number): { pitch: number; width: number; height: number } | null {
+        return this.textures.findLockedByPointer(addr);
     }
 
     lockTexture(texPtr: number, level: number): { ptr: number; pitch: number } | null {
@@ -2942,6 +2996,54 @@ export class D3D9Device {
     }
 
     /**
+     * The fixed-function WGSL the CURRENT state generates, plus the layout decision behind it.
+     *
+     * A capture reports the states a draw ASKED for; it cannot say which of them the generated
+     * shader went on to read. The gap between the two is invisible in both a capture and a
+     * screenshot — a declaration carrying no COLOR and an FVF whose colour was dropped produce
+     * the same full-bright pixels as a correct white-diffuse draw — so the emitted source is
+     * the only direct evidence. `path` names which of the two layout owners won.
+     */
+    describeFfpShader(): Record<string, unknown> {
+        const declElements = this.activeVertexDecl > 0
+            ? (this.vsDeclRegistry.get(this.activeVertexDecl) ?? null)
+            : null;
+        const stageCount = this.activeStageCount();
+        const alphaTest = this.getAlphaTest();
+        const lit = this.stateTracker.getRenderState(D3DRS_LIGHTING) !== 0;
+        const fvf = this.stateTracker.getFVF();
+        const boundStride = this.slotStride(0, 0);
+        const common = {
+            decl: this.activeVertexDecl,
+            fvf,
+            boundStride,
+            stageCount,
+            lit,
+            alphaTest,
+        };
+        if (declElements && declElements.length > 0) {
+            const built = buildShaderFromDecl(declElements, alphaTest, lit, stageCount,
+                this.slotStrides(0), this.activeSlotMask(), this.texGenActive(stageCount));
+            return {
+                ...common,
+                path: "declaration",
+                elements: declElements.map(e => ({
+                    stream: e.stream, offset: e.offset, type: e.type,
+                    usage: e.usage, usageName: declUsageName(e.usage), usageIndex: e.usageIndex,
+                })),
+                buffers: built.buffers,
+                wgsl: built.wgsl,
+            };
+        }
+        return {
+            ...common,
+            path: "fvf",
+            plan: planFvf(fvf, boundStride),
+            wgsl: buildShader(fvf, alphaTest, lit, stageCount, this.texGenActive(stageCount), boundStride),
+        };
+    }
+
+    /**
      * No GPU device (lost, recreation in flight). Every draw/clear/present path dereferences
      * `backend.getDevice()!`, so without this a lost device turns each of them into a TypeError
      * thrown out of a guest thunk. The work is dropped instead: the frame is gone either way,
@@ -3055,7 +3157,16 @@ export class D3D9Device {
         const rt = this.currentRtIndex;
         const size = this.getCurrentTargetSize();
         const fvf = this.stateTracker.getFVF();
-        const isRhw = (fvf & D3DFVF_POSITION_MASK) === D3DFVF_XYZRHW;
+        // A declaration OWNS the vertex layout when one is active, so decoding the bytes by FVF
+        // reports components at offsets this vertex never had — position from a hole, a diffuse
+        // that is really padding. The numbers look plausible and are fiction, so the decode is
+        // withheld and the declaration named instead.
+        const declElems = this.activeVertexDecl > 0 ? this.vsDeclRegistry.get(this.activeVertexDecl) : null;
+        const declPos = declElems?.find(
+            e => e.usage === DECLUSAGE_POSITION_FFP || e.usage === DECLUSAGE_POSITIONT_FFP) ?? null;
+        const isRhw = declPos
+            ? (declPos.usage === DECLUSAGE_POSITIONT_FFP || declPos.type === 3 /* FLOAT4 */)
+            : (fvf & D3DFVF_POSITION_MASK) === D3DFVF_XYZRHW;
         const activeVs = this.getActiveVsShader();
         // Every field here is READ, not defaulted. D3D9 keeps one flat render-state array, so
         // the depth/blend/alpha/cull/lighting/fog states are as available as on the FFP path;
@@ -3072,8 +3183,16 @@ export class D3D9Device {
             vsWritesTexcoord: activeVs ? [...activeVs.analysis.writesTexcoord].sort((a, b) => a - b) : [],
             derivedUseTexture: stage0 != null,
             vertexType: fvf,
+            vertexDecl: this.activeVertexDecl,
             isRHW: isRhw,
-            ...(verts ? { firstVertices: this.decodeFirstVertices(verts, fvf), srcStride: verts.stride } : {}),
+            ...(verts
+                ? {
+                    ...(declElems
+                        ? { firstVerticesUnavailable: `vertex declaration ${this.activeVertexDecl} owns the layout` }
+                        : { firstVertices: this.decodeFirstVertices(verts, fvf) }),
+                    srcStride: verts.stride,
+                }
+                : {}),
             mvp: Array.from(this.stateTracker.getMVP()),
             viewport: { ...this.viewport },
             rtSurfacePtr: this.captureRtId(),
