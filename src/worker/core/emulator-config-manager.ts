@@ -301,7 +301,19 @@ export class EmulatorConfig {
     public quality: QualityConfig = { ...DEFAULT_QUALITY };
 
     // Skip video playback (BinkOpen/SmackOpen return stubs)
-    public skipVideo = false;
+    private skipVideoRequested = false;
+
+    /**
+     * A game whose MENU is built on video (CryEngine's background loops) breaks under a
+     * skip that reports the open as FAILED, so `__forceVideoPlayback` overrides the
+     * manifest without repacking a multi-gigabyte bundle — the A/B that tells a video
+     * bug apart from a skip artefact.
+     */
+    public get skipVideo(): boolean {
+        if ((globalThis as { __forceVideoPlayback?: boolean }).__forceVideoPlayback) return false;
+        return this.skipVideoRequested;
+    }
+    public set skipVideo(value: boolean) { this.skipVideoRequested = value; }
 
     // Strict x87 FPU: boot with relaxed-FPU (f64 fast path) DISABLED so all FPU runs at
     // full 80-bit extended precision. For titles whose code is precision-sensitive at the

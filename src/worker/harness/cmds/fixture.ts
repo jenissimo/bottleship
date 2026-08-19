@@ -32,6 +32,19 @@ async function containerDir(container: string, create: boolean): Promise<FileSys
     }
 }
 
+/** Sibling container names, for telling "no such container" apart from "nothing to delete". */
+async function listContainers(): Promise<string[]> {
+    try {
+        const root = await (navigator as any).storage.getDirectory();
+        const games = await (await root.getDirectoryHandle("bottleship")).getDirectoryHandle("games");
+        const names: string[] = [];
+        for await (const [name] of (games as any).entries()) names.push(name);
+        return names.sort();
+    } catch {
+        return [];
+    }
+}
+
 /** Resolve a container-relative path to its parent dir + leaf name. */
 async function resolvePath(
     container: string,
@@ -105,19 +118,80 @@ export function registerFixtureCommands(svc: HarnessService): void {
     });
 
     /** containerDelete(container, path?) — remove one file, or every file in the
-     *  container when path is omitted (reproduces a first-run overlay). */
+     *  container when path is omitted (reproduces a first-run overlay).
+     *
+     *  The whole-container wipe is IDEMPOTENT: a container that does not exist yet is already
+     *  in the state the caller is asking for. It used to raise NOT_FOUND, which aborted the
+     *  chain at step 0 on any machine that had never run the title — i.e. exactly the
+     *  first-run case the wipe exists to reproduce. A named path still errors, so a typo
+     *  stays visible. */
     svc.register("containerDelete", async (args) => {
         const container = String(args[0] ?? "");
-        const path = args[1] === undefined ? null : String(args[1]);
+        // JSON.stringify drops `undefined` in an array to `null`, so a DSL `.containerDelete(id)`
+        // (which pushes [id, undefined]) arrives as [id, null]. Guarding only `undefined` turned
+        // that into String(null) === "null" and a whole-container wipe silently became "delete the
+        // file named null" - NotFound, on every DSL caller, while the CLI form worked.
+        const rawPath = args[1];
+        const path = rawPath === undefined || rawPath === null || rawPath === "" ? null : String(rawPath);
         if (path) {
             const { dir, name } = await resolvePath(container, path, false);
             await dir.removeEntry(name);
             return { container, deleted: [path] };
         }
-        const dir = await containerDir(container, false);
-        const names: string[] = [];
-        for await (const [name] of (dir as any).entries()) names.push(name);
-        for (const name of names) await dir.removeEntry(name, { recursive: true });
-        return { container, deleted: names, wiped: true };
+        let dir: FileSystemDirectoryHandle;
+        try {
+            dir = await containerDir(container, false);
+        } catch (e) {
+            if (e instanceof HarnessError && e.code === HarnessErrorCode.NOT_FOUND) {
+                // Name the containers that DO exist. Idempotence alone would turn a mistyped id
+                // into a silent no-op, and a determinism wipe that quietly wiped nothing is
+                // indistinguishable from one that worked - the caller can compare against this.
+                return { container, deleted: [], wiped: true, existed: false, knownContainers: await listContainers() };
+            }
+            throw e;
+        }
+        // Enumeration itself can throw NotFound: a worker torn down by a page reload dies with
+        // a debounced OPFS flush in flight, so an entry can vanish mid-iteration. That is
+        // transient, so retry it - but COUNT the retries into the result, because a wipe that
+        // quietly needed three attempts is telling you something about teardown ordering.
+        let names: string[] = [];
+        const attempts: string[] = [];
+        for (let attempt = 1; ; attempt++) {
+            try {
+                const acc: string[] = [];
+                for await (const [name] of (dir as any).entries()) acc.push(name);
+                names = acc;
+                break;
+            } catch (e) {
+                attempts.push(`${(e as Error).name}: ${(e as Error).message}`);
+                if (attempt >= 3) {
+                    throw new HarnessError(
+                        `container '${container}': could not enumerate after ${attempt} attempts `
+                        + `(${attempts.join("; ")}) - first-run state was NOT reproduced`,
+                        HarnessErrorCode.INTERNAL);
+                }
+                await new Promise((r) => setTimeout(r, 250 * attempt));
+            }
+        }
+        // Name the entry that resisted. A bare OPFS "file or directory could not be found"
+        // aborts the whole chain without saying WHICH entry or WHICH container, and the wipe
+        // is usually step 0 of a scenario - the reader then blames the scenario, not the file.
+        const deleted: string[] = [];
+        const failed: Array<{ name: string; error: string }> = [];
+        for (const name of names) {
+            try {
+                await dir.removeEntry(name, { recursive: true });
+                deleted.push(name);
+            } catch (e) {
+                failed.push({ name, error: `${(e as Error).name}: ${(e as Error).message}` });
+            }
+        }
+        if (failed.length) {
+            throw new HarnessError(
+                `container '${container}': ${failed.length} of ${names.length} entries survived the wipe `
+                + `(${failed.map((f) => `${f.name} -> ${f.error}`).join("; ")}) - first-run state was NOT reproduced`,
+                HarnessErrorCode.INTERNAL);
+        }
+        return { container, deleted, wiped: true, existed: true, enumerateRetries: attempts.length, ...(attempts.length ? { enumerateErrors: attempts } : {}) };
     });
 }

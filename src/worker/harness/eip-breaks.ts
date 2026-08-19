@@ -34,6 +34,22 @@ import { dbg } from "../core/debug/dbg-commands";
  * continues. Lets you catch e.g. `core!StaticConstructObject` only when its class arg is NULL, instead
  * of stopping on all hundreds of constructs.
  */
+/**
+ * What to read AT the hit. The stack only belongs to the caller for the instant the wasm logs
+ * the armed eip, and nothing after the run resumes can recover it — a post-hoc `readBytes` races
+ * the guest and silently returns a half-overwritten frame (or zeros), which is indistinguishable
+ * from a wrong offset. So the reads are declared up front and settled synchronously here.
+ */
+export interface BreakCapture {
+    /** Dump this many cdecl/stdcall args from [ESP+4+i*4] (or [EBP+8+i*4] with `ebp`). */
+    args?: number;
+    /** Read `ebp:true`-style, for a bp that lands after PUSH EBP; MOV EBP,ESP. */
+    ebp?: boolean;
+    /** Dereference an arg: read `len` bytes at (arg[i] + offset). A NULL arg is reported as such
+     *  rather than read, so "pointer was NULL" never masquerades as "field was zero". */
+    follow?: Array<{ arg: number; offset?: number; len: number; label?: string }>;
+}
+
 export interface BreakWhen {
     /** Argument index (0-based). By default read from [ESP + 4 + arg*4] (entry convention).
      *  With `ebp:true`, read from [EBP + 8 + arg*4] — use this when the wasm advances past the
@@ -54,6 +70,7 @@ interface EipBreakEntry {
     runId: number | null;
     once: boolean;
     pause: boolean;
+    capture?: BreakCapture;
     when?: BreakWhen;
     onHit?: (snapshot: unknown) => void;
     hits: number;
@@ -83,7 +100,7 @@ class EipBreakRegistry {
         };
     }
 
-    arm(eip: number, opts: { runId?: number | null; once?: boolean; pause?: boolean; when?: BreakWhen; onHit?: (s: unknown) => void } = {}): number {
+    arm(eip: number, opts: { runId?: number | null; once?: boolean; pause?: boolean; when?: BreakWhen; capture?: BreakCapture; onHit?: (s: unknown) => void } = {}): number {
         this.ensureInterceptor();
         const id = this.nextId++;
         this.entries.push({
@@ -92,11 +109,57 @@ class EipBreakRegistry {
             runId: opts.runId ?? null,
             once: opts.once ?? true,
             pause: opts.pause ?? true,
+            capture: opts.capture,
             when: opts.when,
             onHit: opts.onHit,
             hits: 0,
         });
         return id;
+    }
+
+    /** Settle a BreakCapture against the live CPU/stack. Callers get hex, never a parsed guess. */
+    private evalCapture(capture: BreakCapture): unknown {
+        const c = cpu();
+        const mem = guestMem();
+        if (!mem || !c?.reg32) return { error: "no cpu/guest memory at hit" };
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const base = capture.ebp ? ((c.reg32[5] >>> 0) + 8) >>> 0 : ((c.reg32[4] >>> 0) + 4) >>> 0;
+        const u32 = (addr: number): number | null =>
+            addr >= 4 && addr + 4 <= mem.length ? view.getUint32(addr, true) >>> 0 : null;
+        const hex = (addr: number, len: number): string | null => {
+            if (addr < 4 || addr + len > mem.length) return null;
+            let out = "";
+            for (let i = 0; i < len; i++) out += mem[addr + i].toString(16).padStart(2, "0");
+            return out;
+        };
+        const args: Array<string | null> = [];
+        const argsAsked = capture.args ?? 0;
+        const followAsked = (capture.follow ?? []).length;
+        for (let i = 0; i < Math.min(argsAsked, 16); i++) {
+            const v = u32((base + i * 4) >>> 0);
+            args.push(v === null ? null : "0x" + v.toString(16));
+        }
+        const follow: unknown[] = [];
+        for (const f of (capture.follow ?? []).slice(0, 24)) {
+            const ptr = u32((base + (f.arg | 0) * 4) >>> 0);
+            const label = f.label ?? `arg${f.arg}+0x${(f.offset ?? 0).toString(16)}`;
+            if (ptr === null) { follow.push({ label, error: "arg slot out of range" }); continue; }
+            if (ptr === 0) { follow.push({ label, ptr: "0x0", error: "pointer is NULL — not read" }); continue; }
+            const at = (ptr + (f.offset ?? 0)) >>> 0;
+            const len = Math.min(Math.max(f.len | 0, 1), 4096);
+            const h = hex(at, len);
+            follow.push(h === null
+                ? { label, ptr: "0x" + ptr.toString(16), at: "0x" + at.toString(16), error: "out of guest range" }
+                : { label, ptr: "0x" + ptr.toString(16), at: "0x" + at.toString(16), len, hex: h });
+        }
+        // A silently short answer reads as "the guest had nothing there".
+        const truncated = argsAsked > args.length || followAsked > follow.length
+            ? { truncated: { argsAsked, argsReturned: args.length, followAsked, followReturned: follow.length } }
+            : {};
+        return {
+            convention: capture.ebp ? "[EBP+8+i*4]" : "[ESP+4+i*4]",
+            esp: "0x" + (c.reg32[4] >>> 0).toString(16), args, follow, ...truncated,
+        };
     }
 
     /** Evaluate a conditional-break predicate against the live CPU/stack at the armed eip. */
@@ -134,7 +197,8 @@ class EipBreakRegistry {
             e.hits++;
             // Conditional break: skip (keep running) until the arg/stack predicate holds.
             if (e.when && !this.evalWhen(e.when)) continue;
-            const snap = faultSnapshot();
+            const snap = faultSnapshot() as Record<string, unknown>;
+            if (e.capture) snap.captured = this.evalCapture(e.capture);
             harnessBus.emit("breakHit", snap, e.runId);
             if (e.pause) {
                 // Canonical pause (sets module-level isPaused) so the break actually

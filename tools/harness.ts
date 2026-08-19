@@ -407,8 +407,14 @@ async function cmdShot(out: string, ...flags: string[]): Promise<void> {
     if (out?.startsWith("--") || flags.includes("--verify")) await verifyShot(session);
 }
 
-/** Mean/max |Δluma| between two PNGs, both downscaled to a 32x32 grid in the page
- *  (the browser is the only decoder on hand, and it decodes both the same way). */
+/** Mean/max per-CHANNEL |Δ| between two PNGs, both downscaled to a 32x32 grid in the page
+ *  (the browser is the only decoder on hand, and it decodes both the same way).
+ *
+ *  Per channel, not luma: R and B carry only 0.299 and 0.114 of luminance, so a
+ *  channel-swapped capture — the exact defect a capture route produces when it reads BGRA
+ *  as RGBA — lands within the tolerance of a luma compare and reports AGREE for an image
+ *  that is visibly the wrong colour. The difference is defined as the WORST channel at a
+ *  cell so a swap cannot average itself away against the green that did not move. */
 async function comparePngs(session: CdpSession, aB64: string, bB64: string): Promise<{ mean: number; max: number } | null> {
     const r = (await pageEval(session, `(async () => {
         const grid = async (b64) => {
@@ -417,13 +423,18 @@ async function comparePngs(session: CdpSession, aB64: string, bB64: string): Pro
             const bmp = await createImageBitmap(new Blob([u8], { type: 'image/png' }));
             const c = new OffscreenCanvas(32, 32); const x = c.getContext('2d');
             x.drawImage(bmp, 0, 0, 32, 32);
-            const d = x.getImageData(0, 0, 32, 32).data; const g = new Float64Array(1024);
-            for (let i = 0; i < 1024; i++) g[i] = 0.299*d[i*4] + 0.587*d[i*4+1] + 0.114*d[i*4+2];
-            return g;
+            return x.getImageData(0, 0, 32, 32).data;
         };
         const [a, b] = await Promise.all([grid(${JSON.stringify(aB64)}), grid(${JSON.stringify(bB64)})]);
         let sum = 0, max = 0;
-        for (let i = 0; i < 1024; i++) { const d = Math.abs(a[i] - b[i]); sum += d; if (d > max) max = d; }
+        for (let i = 0; i < 1024; i++) {
+            const worst = Math.max(
+                Math.abs(a[i*4] - b[i*4]),
+                Math.abs(a[i*4+1] - b[i*4+1]),
+                Math.abs(a[i*4+2] - b[i*4+2]),
+            );
+            sum += worst; if (worst > max) max = worst;
+        }
         return { mean: sum / 1024, max };
     })()`, { timeoutMs: 20_000, awaitPromise: true })) as { mean: number; max: number; error?: string } | null;
     return r && !r.error ? r : null;
@@ -611,7 +622,7 @@ async function pipeAndCapture(stream: ReadableStream<Uint8Array> | null, sink: {
     return acc;
 }
 
-/** regress [--only <glob>] — run every checked-in scenario in tools/harness/regression/
+/** regress [--only <glob>] [--scenario-timeout <sec>] — run every checked-in scenario in tools/harness/regression/
  *  against the shared tab, one game at a time (a tab drives exactly one guest, so this
  *  cannot fan out the way `parallel` bring-up does). Each scenario is its own
  *  `harness run` subprocess: a script's thrown Error or explicit `process.exitCode`
@@ -623,6 +634,11 @@ async function cmdRegress(rest: string[]): Promise<void> {
     const onlyIdx = rest.indexOf("--only");
     const onlyRaw = onlyIdx >= 0 ? rest[onlyIdx + 1] : rest.find((a) => a.startsWith("--only="))?.slice("--only=".length);
     const onlyRe = onlyRaw ? globToRegExp(onlyRaw) : null;
+    // Generous by default: a real bring-up scenario legitimately spends minutes booting a
+    // multi-GB bundle and waiting for a menu, so this is a wedge detector, not a perf budget.
+    const timeoutIdx = rest.indexOf("--scenario-timeout");
+    const timeoutRaw = timeoutIdx >= 0 ? rest[timeoutIdx + 1] : rest.find((a) => a.startsWith("--scenario-timeout="))?.slice("--scenario-timeout=".length);
+    const scenarioTimeoutMs = Math.max(60, Number(timeoutRaw) || 900) * 1000;
 
     const files = readdirSync(REGRESSION_DIR)
         .filter((f) => f.endsWith(".harness.ts"))
@@ -647,19 +663,33 @@ async function cmdRegress(rest: string[]): Promise<void> {
             stdout: "pipe",
             stderr: "pipe",
         });
+        // Bound every scenario. A hung one used to take the WHOLE batch with it and report
+        // nothing — a bring-up chain waits on guest state, so "wedged" is a normal failure mode
+        // (a stale hover coordinate, a bundle that never finishes loading) and it must read as a
+        // failed scenario, not as an unattended machine. --scenario-timeout <sec> to override.
+        let timedOut = false;
+        const killTimer = setTimeout(() => {
+            timedOut = true;
+            console.error(`
+[regress] ${name}: TIMEOUT after ${Math.round(scenarioTimeoutMs / 1000)}s — killing`);
+            try { proc.kill(); } catch { /* already gone */ }
+        }, scenarioTimeoutMs);
         const [outText, errText, exitCode] = await Promise.all([
             pipeAndCapture(proc.stdout, process.stdout),
             pipeAndCapture(proc.stderr, process.stderr),
             proc.exited,
         ]);
+        clearTimeout(killTimer);
         const ms = Date.now() - t0;
-        const ok = exitCode === 0;
+        const ok = exitCode === 0 && !timedOut;
         const tail = (t: string) => t.trim().split("\n").filter(Boolean).pop() ?? "";
         // A scenario fails two ways: a thrown Error (message lands on stderr via the
         // CLI's own top-level catch) or an explicit process.exitCode with no throw
         // (blackwell-legacy's style, reason already printed on stdout) — surface
         // whichever the script actually gave, never invent a generic message.
-        const verdict = ok ? (tail(outText) || "OK") : (tail(errText) || tail(outText) || `exit ${exitCode}`);
+        const verdict = timedOut
+            ? `TIMEOUT after ${Math.round(scenarioTimeoutMs / 1000)}s (killed; last output: ${tail(outText) || "none"})`
+            : ok ? (tail(outText) || "OK") : (tail(errText) || tail(outText) || `exit ${exitCode}`);
 
         let shot = "(capture failed)";
         try {

@@ -21,6 +21,13 @@ function ser(args: unknown[]): unknown[] {
     return args.map((a) => (typeof a === "function" ? { __fn: a.toString() } : a));
 }
 
+/** What a breakpoint should read at the moment it fires (see `breakOnExport`). */
+export interface BreakCaptureSpec {
+    args?: number;
+    ebp?: boolean;
+    follow?: Array<{ arg: number; offset?: number; len: number; label?: string }>;
+}
+
 export class HarnessChain {
     private steps: HarnessStep[] = [];
     constructor(private readonly exec: StepExecutor) {}
@@ -166,6 +173,8 @@ export class HarnessChain {
     backtrace(esp?: number): this { return this.push("backtrace", [esp]); }
     /** Deduplicated registry of UNIMPLEMENTED thunks the guest called (id + count + caller). Firehose-immune stub finder. */
     stubs(): this { return this.push("stubs", []); }
+    /** Guest restart requests (image + command line + caller). Pair with setWorkerFlag('__noReExec', true) to stop a relaunch loop on its first iteration. */
+    reExecs(): this { return this.push("reExecs", []); }
     /** Runtime API coverage: GetProcAddress resolutions (and what each ACTUALLY resolved to),
      *  COM/vtable calls, silent stubs — the half `bun tools/api-census.ts` cannot see statically. */
     apiCoverage(limit?: number): this { return this.push("apiCoverage", [limit]); }
@@ -250,6 +259,10 @@ export class HarnessChain {
     perfSpikes(opts?: { top?: number; minMs?: number }): this { return this.push("perfSpikes", [opts]); }
     /** Latest + average frame sample, spike counts, and the frame-time tail summary. */
     perfStats(): this { return this.push("perfStats", []); }
+    /** Per-region allocator occupancy (HEAP/THUNK/SURFACE/ROM). Sample it across a load to
+     *  tell real demand (bumpMB and liveMB climbing together) from a reuse failure
+     *  (bumpMB climbing while liveMB is flat) behind an "HEAP exhausted" bad_alloc. */
+    heapBuckets(): this { return this.push("heapBuckets", []); }
     /** THE frame instrument: distribution tail (p50/p95/p99 + frames over BUDGET, never a
      *  hardcoded 16.7) + budget-missing frames coalesced into ranked classes with one
      *  representative each + window counter deltas (scheduler / fastmem-JIT / hypercalls) +
@@ -308,9 +321,11 @@ export class HarnessChain {
     // ── breakpoints / exec control ──
     // Breakpoints block until hit — unbounded RPC envelope (the CLI's CDP budget /
     // an explicit clearBreaks bounds them). Pass {continuous:true} to return at once.
-    breakOn(eip: number | string, opts?: { continuous?: boolean; pause?: boolean; fast?: boolean; when?: { arg: number; ebp?: boolean; eq?: number; ne?: number } }): this { return this.pushTimed("breakOn", [eip, opts], 0); }
-    breakOnExport(name: string, opts?: { continuous?: boolean; pause?: boolean; fast?: boolean; when?: { arg: number; ebp?: boolean; eq?: number; ne?: number } }): this { return this.pushTimed("breakOnExport", [name, opts], 0); }
-    breakOnSymbol(name: string, opts?: { continuous?: boolean; pause?: boolean; fast?: boolean; when?: { arg: number; ebp?: boolean; eq?: number; ne?: number } }): this { return this.pushTimed("breakOnSymbol", [name, opts], 0); }
+    breakOn(eip: number | string, opts?: { continuous?: boolean; pause?: boolean; fast?: boolean; when?: { arg: number; ebp?: boolean; eq?: number; ne?: number }; capture?: BreakCaptureSpec }): this { return this.pushTimed("breakOn", [eip, opts], 0); }
+    /** `capture` reads args (and dereferences them) AT the hit, where the stack is still the
+     *  caller's — a later readBytes races the resumed guest and answers with zeros. */
+    breakOnExport(name: string, opts?: { continuous?: boolean; pause?: boolean; fast?: boolean; when?: { arg: number; ebp?: boolean; eq?: number; ne?: number }; capture?: BreakCaptureSpec }): this { return this.pushTimed("breakOnExport", [name, opts], 0); }
+    breakOnSymbol(name: string, opts?: { continuous?: boolean; pause?: boolean; fast?: boolean; when?: { arg: number; ebp?: boolean; eq?: number; ne?: number }; capture?: BreakCaptureSpec }): this { return this.pushTimed("breakOnSymbol", [name, opts], 0); }
     /** `argEq` breaks only when a stack argument matches — the way to hit ONE call of a hot API. */
     breakOnApi(pattern: string, opts?: { continuous?: boolean; argEq?: { index: number; value: number } }): this { return this.pushTimed("breakOnApi", [pattern, opts], 0); }
     clearBreaks(): this { return this.push("clearBreaks", []); }

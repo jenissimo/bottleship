@@ -15,6 +15,7 @@ import { STATE_SECTIONS, serializeCpu, serializeThreads, sys, proc, symbolize } 
 import { buildHarnessReport } from "../build-report";
 import { getCxxExceptionRing, getActiveCatchRecords } from "../../core/seh-dispatch";
 import { faultRecorder } from "../../core/memory/fault-recorder";
+import { describeSyncRing, SYNC_RING_NOTE } from "../../core/scheduler/sync-objects";
 import { stubRegistry } from "../../core/diagnostics/stub-registry";
 import { getProcAddressRegistry } from "../../core/diagnostics/get-proc-address-registry";
 import { apiCensus } from "../../core/diagnostics/api-census";
@@ -450,6 +451,34 @@ export function registerStateCommands(svc: HarnessService): void {
         api: s.name, count: s.count, arity: s.arity,
         lastCaller: "0x" + s.lastCaller.toString(16), lastCallerSym: symbolize(s.lastCaller),
     })));
+
+    /**
+     * syncObjects() — every event/semaphore/mutex with its live state. Pair it with a
+     * thread dump's `waitHandles`: a hang where nobody runs is only diagnosable as
+     * "T1 waits on handle H" AND "H is not signalled, and nobody is left to signal it".
+     * `ringNote` travels with the ring because the ring cannot see hypercall-served signals.
+     */
+    svc.register("syncObjects", (args) => {
+        const scheduler = sys().scheduler as any;
+        if (!scheduler?.syncObjects) throw new HarnessError("no scheduler", HarnessErrorCode.NO_PROCESS);
+        return {
+            objects: scheduler.syncObjects.describeAll(),
+            ring: describeSyncRing(Number((args as unknown[])?.[0] ?? 120)),
+            ringNote: SYNC_RING_NOTE,
+        };
+    });
+
+    /**
+     * reExecs() — every guest restart request this worker session saw (image, command
+     * line, caller), newest last. A restart is a page reload, so a re-exec LOOP wipes
+     * the log stream and every ring once per iteration; pair this with
+     * `setWorkerFlag('__noReExec', true)`, which refuses the restart and leaves the
+     * guest standing at the call that asked for it.
+     */
+    svc.register("reExecs", () => {
+        const ring = (globalThis as { __bsReExecRequests?: unknown[] }).__bsReExecRequests;
+        return { armed: !!(globalThis as { __noReExec?: boolean }).__noReExec, requests: ring ?? [] };
+    });
 
     /**
      * backtrace(esp?) — on-demand guest call-stack reconstruction (module-labelled,

@@ -118,6 +118,20 @@ function pointerPosture(im: any): Record<string, unknown> | undefined {
     return p?.relative ? { relativeMouse: p } : undefined;
 }
 
+/**
+ * A coordinate must be a real number. `Number(undefined) | 0` is 0, so a missing or NaN argument
+ * used to click the top-left corner and report `{ok:true, x:0, y:0}` - a gesture that went
+ * nowhere, indistinguishable from one that landed, which is how a scenario "clicks" a menu for
+ * three runs while measuring only the idle animation.
+ */
+function coord(v: unknown, what: string): number {
+    const n = Number(v);
+    if (!Number.isFinite(n)) {
+        throw new HarnessError(`${what} must be a finite number, got ${JSON.stringify(v)}`, HarnessErrorCode.BAD_ARGS);
+    }
+    return n | 0;
+}
+
 function pressAndRelease(im: any, x: number, y: number, button: number, holdMs: number): void {
     const armed = pendingRelease.get(button);
     if (armed !== undefined) { clearTimeout(armed); pendingRelease.delete(button); }
@@ -148,7 +162,7 @@ export function applyInput(cmd: string, args: unknown[]): any {
             // a UI state machine that samples the button on its own slower tick can still be
             // between samples for the whole press — exactly as a 0 ms click would be on real
             // hardware. So release on a timer, like clickHold, just with a short human default.
-            const x = Number(args[0]) | 0, y = Number(args[1]) | 0;
+            const x = coord(args[0], "clickAt x"), y = coord(args[1], "clickAt y");
             pressAndRelease(im, x, y, 0, CLICK_HOLD_MS);
             return { ok: true, x, y, holdMs: CLICK_HOLD_MS, ...pointerPosture(im) };
         }
@@ -158,27 +172,28 @@ export function applyInput(cmd: string, args: unknown[]): any {
             // guest that polls BUTTON STATE (DInput / GetAsyncKeyState) at a low frame
             // rate never observes the held-down frame and drops the click. Holding
             // across real frames lets the guest's poll loop see the button down.
-            const x = Number(args[0]) | 0, y = Number(args[1]) | 0;
+            const x = coord(args[0], "clickHold x"), y = coord(args[1], "clickHold y");
             const holdMs = Number(args[2] ?? 200) | 0;
             const button = Number(args[3] ?? 0) | 0;
             pressAndRelease(im, x, y, button, holdMs);
             return { ok: true, x, y, holdMs, button, ...pointerPosture(im) };
         }
         case "move": {
-            const x = Number(args[0]) | 0, y = Number(args[1]) | 0;
+            const x = coord(args[0], "move x"), y = coord(args[1], "move y");
             return { ok: im.injectMoveAtScreen(x, y), x, y, ...pointerPosture(im) };
         }
         case "moveRelative": {
             // Raw relative motion — mouse-look, and the primitive aimCursor is built from.
-            const dx = Number(args[0]) | 0, dy = Number(args[1]) | 0;
+            const dx = coord(args[0], "moveRelative dx"), dy = coord(args[1], "moveRelative dy");
             return { ok: im.injectPointerDelta(dx, dy), dx, dy, ...pointerPosture(im) };
         }
         case "drag": {
-            const [x0, y0, x1, y1, button] = args.map((a, i) => (i < 4 ? Number(a) | 0 : Number(a ?? 0) | 0));
+            const [x0, y0, x1, y1] = [0, 1, 2, 3].map((i) => coord(args[i], `drag coord ${i}`));
+            const button = Number(args[4] ?? 0) | 0;
             return { ok: im.injectDragAtScreen(x0, y0, x1, y1, button ?? 0), from: [x0, y0], to: [x1, y1] };
         }
         case "wheel": {
-            const x = Number(args[0]) | 0, y = Number(args[1]) | 0, delta = Number(args[2]) | 0;
+            const x = coord(args[0], "wheel x"), y = coord(args[1], "wheel y"), delta = coord(args[2], "wheel delta");
             return { ok: im.injectWheelAtScreen(x, y, delta), x, y, delta };
         }
         case "key": {

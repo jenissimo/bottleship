@@ -60,6 +60,7 @@ import { Psapi } from "./modules/psapi";
 import { Iphlpapi } from "./modules/iphlpapi";
 import { Tapi32 } from "./modules/tapi32";
 import { Setupapi } from "./modules/setupapi";
+import { Hid } from "./modules/hid";
 import { Netapi32 } from "./modules/netapi32";
 import { ImageHlp } from "./modules/imagehlp";
 import { DbgHelp } from "./modules/dbghelp";
@@ -127,6 +128,8 @@ import { hookRegistry } from "./core/hooks";
 import { Galaxy } from "./modules/galaxy";
 import { registerFastPathMessageFunctions } from "./modules/user32/message";
 import { registerFastPathFileIOFunctions } from "./modules/kernel32/file-io";
+import { registerFastPathSyncFunctions } from "./modules/kernel32/sync";
+import { registerFastPathTimeFunctions } from "./modules/kernel32/time/time";
 import { registerFastPathLocaleFunctions } from "./modules/kernel32/locale";
 import { registerFastPathHeapFunctions, allocateHeapSlab, resetHeapSlab } from "./modules/kernel32/memory";
 import { registerFastPathMsvcrtFunctions } from "./modules/msvcrt";
@@ -311,6 +314,12 @@ let pendingReExecArgs: string | null = null;
 let pendingReExecImage: string | null = null;
 /** Bytes a launcher wrote into the child it created suspended, replayed after the PE loads. */
 let pendingReExecPatches: GuestImagePatch[] | null = null;
+/** Restart requests seen in THIS worker session, newest last — see requestSelfReExec. */
+const reExecRequests: Array<{ n: number; image: string; commandLine: string; patches: number; caller: string[] }> = [];
+let reExecRequestCount = 0;
+// Parked on globalThis rather than exported: the harness cmd modules must not import the
+// worker ENTRY (a cycle), and this is the same channel __bsExecBoot already uses.
+(globalThis as Record<string, unknown>).__bsReExecRequests = reExecRequests;
 let registrySaveTimeout: number | null = null;
 let registrySaveGeneration = 0;
 /** do_tick liveness counter — incremented in the tick_hooks_before guard every v86 do_tick().
@@ -2079,6 +2088,34 @@ const loadBundle = (payload: { data?: Uint8Array; url?: string; blob?: Blob; blo
  * returned its SE_ERR_/PROCESS_INFORMATION value and the guest is at a clean boundary.
  */
 const requestSelfReExec = (commandLine: string, imagePath?: string, imagePatches?: GuestImagePatch[]): boolean => {
+  // Every route that can restart the guest funnels through here, so this is where a
+  // request is recorded. A restart is a page reload, which wipes the log stream, the
+  // CDP session and every in-worker ring — so a re-exec LOOP erases its own evidence
+  // once per iteration. The ring is read live (harness `reExecs`); `__noReExec` refuses
+  // instead of restarting, which stops the loop on its first iteration and leaves the
+  // guest standing at the call for backtrace/report.
+  // Diagnostic only: a stack walk over a garbage ESP/EBP chain must not be able to turn the
+  // re-exec verdict into a thrown exception.
+  let bt: { frames?: Array<{ moduleName: string | null; moduleOffset: number; retAddr: number }> } | undefined;
+  try {
+    bt = System.getInstance().process?.dispatcher?.getGuestCallStack?.(undefined, 0x400, 12);
+  } catch { /* no backtrace for this request */ }
+  reExecRequests.push({
+    n: ++reExecRequestCount,
+    image: imagePath ?? "(self)",
+    commandLine,
+    patches: imagePatches?.length ?? 0,
+    caller: (bt?.frames ?? []).slice(0, 8).map((f) =>
+      f.moduleName ? `${f.moduleName}+0x${f.moduleOffset.toString(16)}` : `0x${f.retAddr.toString(16)}`),
+  });
+  if (reExecRequests.length > 32) reExecRequests.shift();
+  if ((globalThis as { __noReExec?: boolean }).__noReExec) {
+    Logger.warn(LogCategory.SYSTEM,
+      `[ReExec] REFUSED by __noReExec: image "${imagePath ?? "(self)"}" args "${commandLine}" ` +
+      `(request #${reExecRequestCount}) — the guest stays alive; read \`reExecs\` for the caller`);
+    return false;
+  }
+
   // Returns whether the re-exec was ACCEPTED. A launcher that exits believing it started a
   // child, when nothing was scheduled, is a silent vanish — shell32 reports our verdict.
   if (!lastBundlePayload) {
@@ -2294,6 +2331,9 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       system.setHostCursorWarpModeCallback((active) => {
         self.postMessage({ type: "cursor_warp", active });
       });
+      system.setHostCursorClipSignalCallback((active) => {
+        self.postMessage({ type: "clip_cursor", clip: active });
+      });
       system.setHostInputResetCallback(() => {
         self.postMessage({ type: "input_reset" });
       });
@@ -2378,6 +2418,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       const iphlpapi = new Iphlpapi();
       const tapi32 = new Tapi32();
       const setupapi = new Setupapi();
+      const hid = new Hid();
       const netapi32 = new Netapi32();
       const psapi = new Psapi();
       const imagehlp = new ImageHlp();
@@ -2457,6 +2498,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       wininet.initialize(process);
       tapi32.initialize(process);
       setupapi.initialize(process);
+      hid.initialize(process);
       netapi32.initialize(process);
 
       process.registerModule(kernel32.name, kernel32);
@@ -2515,6 +2557,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.registerModule(iphlpapi.name, iphlpapi);
       process.registerModule(tapi32.name, tapi32);
       process.registerModule(setupapi.name, setupapi);
+      process.registerModule(hid.name, hid);
       process.registerModule(netapi32.name, netapi32);
       process.registerModule(imagehlp.name, imagehlp);
       const dbghelp = new DbgHelp(process);
@@ -2585,6 +2628,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.dispatcher.registerModule(iphlpapi.name, iphlpapi.exports);
       process.dispatcher.registerModule(tapi32.name, tapi32.exports);
       process.dispatcher.registerModule(setupapi.name, setupapi.exports);
+      process.dispatcher.registerModule(hid.name, hid.exports);
       process.dispatcher.registerModule(netapi32.name, netapi32.exports);
       process.dispatcher.registerModule(imagehlp.name, imagehlp.exports);
       process.dispatcher.registerModule(dbghelp.name, dbghelp.exports);
@@ -2639,14 +2683,13 @@ const initV86 = async (canvas: OffscreenCanvas) => {
         ...KERNEL32_VISTA_WARMUP_EXPORTS,
       ]);
 
-      // Register fast path for time and sync functions if Kernel32 exports them
-      const k32 = kernel32 as any;
-      if (k32.registerFastPathTimeFunctions) {
-        k32.registerFastPathTimeFunctions(process.dispatcher);
-      }
-      if (k32.registerFastPathSyncFunctions) {
-        k32.registerFastPathSyncFunctions(process.dispatcher);
-      }
+      // Registered unconditionally, like every other registrar below. These two used to be
+      // called as `if (kernel32.registerFastPathX)` off the Kernel32 MODULE CLASS, which
+      // never carried either symbol — so both tiers silently never existed, and a fast path
+      // added to sync.ts registered nothing at all. An `if (fn)` guard around a tier cannot
+      // report its own absence; a direct import fails at build time instead.
+      registerFastPathTimeFunctions(process.dispatcher);
+      registerFastPathSyncFunctions(process.dispatcher);
       winmm.registerFastPathTimerFunctions(process.dispatcher);
       registerFastPathMessageFunctions(process.dispatcher);
       registerFastPathFileIOFunctions(process.dispatcher);

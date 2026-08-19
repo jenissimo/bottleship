@@ -299,8 +299,15 @@ class LoggerImpl {
     }
 
     /**
-     * Check if a log level is enabled for a category.
-     * Includes verbose storage/streaming for VERBOSE level.
+     * Would ANY sink capture an entry at this level — console, the IndexedDB verbose
+     * store, or an attached log stream?
+     *
+     * NOT a cheap-path gate. The harness attaches a stream for the whole session, so at
+     * VERBOSE this answers true in every harness run regardless of category levels: an
+     * `if (!Logger.isEnabled(cat, VERBOSE)) return;` guarding anything other than message
+     * construction is disabled exactly when we are measuring. Gate real work on
+     * `isConsoleEnabled` (or pass a closure to `verboseLazy`, which defers the string but
+     * still feeds every sink).
      */
     isEnabled(category: LogCategory, level: LogLevel): boolean {
         if (level === LogLevel.VERBOSE) {
@@ -311,6 +318,16 @@ class LoggerImpl {
             );
         }
         return this.getCategoryLevel(category) >= level;
+    }
+
+    /**
+     * Would this entry actually be WRITTEN to the console? Depends only on the kill switch
+     * and the configured level — no sink can turn it on behind the caller's back, which is
+     * what makes it safe to gate work on (the per-second console rate limiter is not
+     * consulted: it mutates its counters, so a predicate must not touch it).
+     */
+    isConsoleEnabled(category: LogCategory, level: LogLevel): boolean {
+        return this.globalEnabled && this.getCategoryLevel(category) >= level;
     }
 
     getCategoryLevel(category: LogCategory): LogLevel {
