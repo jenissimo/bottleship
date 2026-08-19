@@ -21,11 +21,80 @@ import {
 
 export type ThreadLookupFn = (threadId: number) => { state: ThreadState } | null;
 
+/**
+ * Ring of signal/wait transitions on kernel sync objects.
+ *
+ * A deadlock's state — "T1 waits on an unsignalled event" — never says WHY: the signal may
+ * have been lost, consumed by the wrong waiter, or reset from under the waiter. Only the
+ * ORDER answers that, and by the time the hang is observable the order is gone. Costs one
+ * array store per recorded transition; the ring is fixed-size and never grows.
+ *
+ * NOT A COMPLETE HISTORY, and it says so in its own readout: SetEvent on an event with no
+ * waiters, and an auto-reset consume, are served entirely inside the WASM hypercall tier and
+ * never reach JS. That is exactly the lost-signal shape (signal before the waiter parks), so
+ * an ABSENT entry must never be read as "the signal was never sent".
+ */
+export const SYNC_RING_NOTE =
+    "incomplete by construction: SetEvent with no waiters and auto-reset consumes are served "
+    + "in the WASM hypercall tier and never reach JS — a missing entry is not proof of a missing signal";
+const SYNC_RING_SIZE = 512;
+interface SyncRingEntry { t: number; op: string; handle: number; tid: number; detail?: string; repeat?: number }
+const syncRing: SyncRingEntry[] = [];
+let syncRingWrite = 0;
+
+export function recordSyncEvent(op: string, handle: number, tid: number, detail?: string): void {
+    // Coalesce an immediately-repeating transition into a count. A guest that polls an event
+    // in a 10 Hz reset+timed-wait loop otherwise floods the ring within seconds and scrolls
+    // out the one submission that explains the hang — the repetition is the least
+    // informative part of the history and must not cost the most space.
+    const prevIdx = (syncRingWrite - 1 + SYNC_RING_SIZE) % SYNC_RING_SIZE;
+    const prev = syncRing.length > 0 ? syncRing[Math.min(prevIdx, syncRing.length - 1)] : undefined;
+    if (prev && prev.op === op && prev.handle === (handle >>> 0) && prev.tid === (tid >>> 0) && prev.detail === detail) {
+        prev.repeat = (prev.repeat ?? 1) + 1;
+        prev.t = performance.now();
+        return;
+    }
+    const entry: SyncRingEntry = { t: performance.now(), op, handle: handle >>> 0, tid: tid >>> 0, detail };
+    if (syncRing.length < SYNC_RING_SIZE) syncRing.push(entry);
+    else syncRing[syncRingWrite] = entry;
+    syncRingWrite = (syncRingWrite + 1) % SYNC_RING_SIZE;
+}
+
+/** Oldest-first copy of the sync ring. */
+export function describeSyncRing(limit = SYNC_RING_SIZE): SyncRingEntry[] {
+    const ordered = syncRing.length < SYNC_RING_SIZE
+        ? syncRing.slice()
+        : syncRing.slice(syncRingWrite).concat(syncRing.slice(0, syncRingWrite));
+    return ordered.slice(-limit);
+}
+
 export class SyncObjectManager {
     private resourceProvider = SystemResourceProvider.getInstance();
     private eventHandles = new Set<number>();
     private semaphoreHandles = new Set<number>();
     private mutexHandles = new Set<number>();
+
+    /**
+     * Every event/semaphore/mutex with its live state — the other half of a thread dump's
+     * waitHandles. A deadlock is only readable as the PAIR: who waits on which handle, and
+     * whether that handle is signalled.
+     */
+    describeAll(): Array<Record<string, unknown>> {
+        const out: Array<Record<string, unknown>> = [];
+        for (const h of this.eventHandles) {
+            const e = this._getEvent(h);
+            if (e) out.push({ handle: h, kind: "event", manualReset: e.manualReset, signaled: e.signaled, pendingWake: e.pendingWake ?? false });
+        }
+        for (const h of this.semaphoreHandles) {
+            const s = this._getSemaphore(h);
+            if (s) out.push({ handle: h, kind: "semaphore", count: s.count, max: s.max });
+        }
+        for (const h of this.mutexHandles) {
+            const m = this._getMutex(h);
+            if (m) out.push({ handle: h, kind: "mutex", owner: m.ownerThreadId, recursion: m.recursion });
+        }
+        return out;
+    }
 
     // ─── Events ─────────────────────────────────────────────────────────────
 
@@ -166,6 +235,7 @@ export class SyncObjectManager {
         for (const h of decision.consumeAutoReset) {
             const e = this._getEvent(h);
             if (e && !e.manualReset) {
+                recordSyncEvent("consume", h, threadId);
                 e.signaled = false;
                 hypercallDataManager.writeEventMirrorSignaled(h, false, false);
             }

@@ -31,6 +31,16 @@ import {
 import { encodeAnsi } from '../codepage-utils';
 import { paintTraceEnabled, logPaintMsgDelivered, logPaintPendingBlocked, logPaintTrace } from './paint-trace';
 import { isValidGuestEip } from '../../core/scheduler/scheduler-context';
+import { WAIT_FAILED, WAIT_BLOCKED_NO_SWITCH } from '../../core/scheduler/types';
+import { deliverPendingApcs } from '../kernel32/sync';
+
+// MsgWaitForMultipleObjectsEx flags + the shared wait vocabulary.
+const MWMO_WAITALL = 0x0001;
+const MWMO_ALERTABLE = 0x0002;
+const MWMO_INPUTAVAILABLE = 0x0004;
+const MAXIMUM_WAIT_OBJECTS = 64;
+const WAIT_OBJECT_0 = 0;
+const ERROR_INVALID_PARAMETER = 87;
 
 const WM_TIMER = 0x0113;
 const WM_PAINT = 0x000F;
@@ -800,6 +810,87 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         // Thread is WAITING(MESSAGE); park at spin loop until postMessage wakes it.
         return { value: 1, blockedNoSwitch: true, stackCleanup: 0 };
     };
+
+    /**
+     * MsgWaitForMultipleObjects(Ex) — wait on handles OR on this thread's input queue.
+     *
+     * Win32 implements it by appending the thread's message-queue handle to the array
+     * and doing an ordinary wait over nCount+1 objects, which is why the queue's leg is
+     * reported as WAIT_OBJECT_0 + nCount; the scheduler mirrors that shape. Callers
+     * routinely branch on the exact value (LS3D's worker loop re-waits on anything that
+     * is not WAIT_OBJECT_0), so an out-of-contract return is not a soft failure — it
+     * sends the guest down a path Windows never produces.
+     *
+     * MWMO_INPUTAVAILABLE decides whether input ALREADY queued satisfies the wait;
+     * without it only input arriving after the call does. `dwWakeMask` is honoured only
+     * as "any input" — the queue does not carry per-QS_* class bits — which over-reports
+     * for a narrow mask. That direction is the safe one: the caller pumps, finds nothing
+     * it wants, and waits again, whereas under-reporting would hang it.
+     */
+    const msgWaitForMultipleObjects = (
+        ctx: X86Context, mem: Uint8Array,
+        nCount: number, lpHandles: number, dwMilliseconds: number, dwWakeMask: number, dwFlags: number,
+    ): ThunkResult | number => {
+        const system = System.getInstance();
+        const sched = system.scheduler;
+        const stackCleanup = 20; // 5 stdcall args, both entry points
+
+        // Windows caps the array one below MAXIMUM_WAIT_OBJECTS: the queue takes a slot.
+        if (nCount > MAXIMUM_WAIT_OBJECTS - 1 || (nCount > 0 && lpHandles === 0)) {
+            sched.setLastError(ERROR_INVALID_PARAMETER);
+            return WAIT_FAILED;
+        }
+
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        if (nCount > 0 && lpHandles + nCount * 4 > mem.length) {
+            sched.setLastError(ERROR_INVALID_PARAMETER);
+            return WAIT_FAILED;
+        }
+        const handles: number[] = [];
+        for (let i = 0; i < nCount; i++) handles.push(view.getUint32(lpHandles + i * 4, true) >>> 0);
+
+        const waitAll = (dwFlags & MWMO_WAITALL) !== 0;
+        const alertable = (dwFlags & MWMO_ALERTABLE) !== 0;
+        const inputResult = WAIT_OBJECT_0 + nCount;
+        const currentThreadId = sched.getCurrentThreadId();
+
+        // Flush SAB input into the queue first — same as GetMessage/WaitMessage, so
+        // "is there input" is asked of a queue that is up to date.
+        system.inputManager.poll(true);
+        if ((dwFlags & MWMO_INPUTAVAILABLE) !== 0
+            && system.windowManager.hasMessages(0, 0, currentThreadId)) {
+            return inputResult;
+        }
+
+        if (alertable) {
+            const apcResult = deliverPendingApcs(ctx, 'MsgWaitForMultipleObjectsEx:APC', stackCleanup);
+            if (apcResult) return apcResult;
+        }
+
+        const returnAddr = view.getUint32(ctx.esp >>> 0, true) >>> 0;
+        const postReturnEsp = (ctx.esp + 4 + stackCleanup) >>> 0;
+
+        const result = sched.waitForObjectsOrMessageWithContext(
+            handles, waitAll, dwMilliseconds, inputResult,
+            returnAddr, postReturnEsp,
+            { ecx: ctx.ecx, edx: ctx.edx, ebx: ctx.ebx, ebp: ctx.ebp, esi: ctx.esi, edi: ctx.edi, eflags: ctx.eflags },
+            alertable,
+        );
+
+        if (result === WAIT_BLOCKED_NO_SWITCH) {
+            return { value: 0, blockedNoSwitch: true, stackCleanup };
+        }
+        return result;
+    };
+
+    exports['MsgWaitForMultipleObjects'] = (ctx, mem, args) => msgWaitForMultipleObjects(
+        ctx, mem, args[0] >>> 0, args[1] >>> 0, args[3] >>> 0, args[4] >>> 0,
+        args[2] !== 0 ? MWMO_WAITALL : 0,
+    );
+
+    exports['MsgWaitForMultipleObjectsEx'] = (ctx, mem, args) => msgWaitForMultipleObjects(
+        ctx, mem, args[0] >>> 0, args[1] >>> 0, args[2] >>> 0, args[3] >>> 0, args[4] >>> 0,
+    );
 
     exports['WaitForInputIdle'] = (ctx, mem, args) => {
         const hProcess = args[0] >>> 0;

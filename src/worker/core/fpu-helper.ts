@@ -200,6 +200,11 @@ export function fpuPush(v86: any, value: number): void {
 //   [129]      fpu_stack_empty (u8  @ 816)
 //   [130..132) fpu_control_word(u16 @ 1036)
 //   [132..134) fpu_status_word (u16 @ 1040)
+//
+// The control word is written straight into wasm memory here, never through
+// set_control_word — so rounding/precision control is per-thread only as long as the
+// Rust side keeps reading RC/PC from the live word (softfloat.rs). Any cached copy of
+// those fields would survive this write and belong to the previous thread.
 
 const FPU_CONTROL_WORD_OFFSET = 1036;
 const FPU_STATUS_WORD_OFFSET = 1040;

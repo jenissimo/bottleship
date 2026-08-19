@@ -1541,6 +1541,12 @@ export class ThunkDispatcher {
         const thunkName = this.namesTable[functionId] || "unknown";
         const reg32Raw = this.cachedReg32Raw ?? cpu.reg32;
         const espAtEntry = reg32Raw[4];
+        if (this.traceEspInCallback) {
+            // Guest ESP at every thunk INSIDE a callback: a stack imbalance the callback
+            // itself introduces shows up here as a step that does not match the callee's
+            // RET N, which is what names the culprit call in a long guest chain.
+            Logger.warn(LogCategory.THUNK, `[ESPTRACE] ${thunkName} esp=0x${espAtEntry.toString(16)}`);
+        }
         // Debug session hook (zero-cost when disabled)
         if (debugSession.isEnabled()) {
             const eipNow = (this.cachedIpRaw ? this.cachedIpRaw[0] : (cpu.instruction_pointer?.[0] ?? 0)) >>> 0;
@@ -1699,6 +1705,7 @@ export class ThunkDispatcher {
             // counter across the call is how a slow thunk that never borrowed gets NAMED
             // (perfThunks `noBorrowMs`) rather than re-discovered by hand.
             memBorrowsBefore = guestMemoryBorrowCount();
+            if (this.checkCalleeSaved) this.snapshotCalleeSaved(cpu);
             result = impl(ctx, this.cachedMem8, this.reusableArgs);
         } catch (e) {
             this._slowPathHandleThunkError(functionId, thunkName, e, cpu);
@@ -1727,6 +1734,7 @@ export class ThunkDispatcher {
             }
             frameProfiler.markThunkEnd();
             this._handleSyncResult(result, functionId, thunkName, cpu, this.reusableContext, argCount, espAtEntry);
+            if (this.checkCalleeSaved) this.reportCalleeSavedDrift(cpu, thunkName);
 
             // Sync virtual time with wall-clock after each sync thunk.
             // Spin-wait loops (e.g. AVI: while (GetTickCount() < next) { SwapBuffers(); })
@@ -1974,6 +1982,45 @@ export class ThunkDispatcher {
     // =========================================================================
     // Sync Result Handling
     // =========================================================================
+
+    /**
+     * `__checkCalleeSaved`: name the thunk that does not give EBX/ESI/EDI/EBP back.
+     *
+     * A stdcall thunk must leave them exactly as it found them. When one does not, the
+     * guest faults at its NEXT use of that register — arbitrarily far from the thunk —
+     * and every symptom points at the innocent code that dereferenced it. Off by default:
+     * this sits in the hottest path in the worker.
+     */
+    private readonly calleeSavedBefore = new Uint32Array(4);
+    private get checkCalleeSaved(): boolean {
+        return !!(globalThis as { __checkCalleeSaved?: boolean }).__checkCalleeSaved;
+    }
+    /** Trace ESP only INSIDE a guest callback — a per-thunk line over the whole run drowns the archive. */
+    private get traceEspInCallback(): boolean {
+        return this.checkCalleeSaved && !!this._callbackManager?.isInsideSuspendedCallback();
+    }
+    private snapshotCalleeSaved(cpu: any): void {
+        const reg = cpu?.reg32;
+        if (!reg) return;
+        this.calleeSavedBefore[0] = reg[3]; this.calleeSavedBefore[1] = reg[6];
+        this.calleeSavedBefore[2] = reg[7]; this.calleeSavedBefore[3] = reg[5];
+    }
+    private reportCalleeSavedDrift(cpu: any, thunkName: string): void {
+        const reg = cpu?.reg32;
+        if (!reg) return;
+        const now = [reg[3], reg[6], reg[7], reg[5]];
+        const names = ["EBX", "ESI", "EDI", "EBP"];
+        let diff = "";
+        for (let i = 0; i < 4; i++) {
+            if ((this.calleeSavedBefore[i] >>> 0) !== (now[i] >>> 0)) {
+                diff += ` ${names[i]}: 0x${this.calleeSavedBefore[i].toString(16)} -> 0x${(now[i] >>> 0).toString(16)}`;
+            }
+        }
+        if (diff) {
+            Logger.warn(LogCategory.THUNK,
+                `Callee-saved register(s) CLOBBERED by thunk ${thunkName}:${diff}`);
+        }
+    }
 
     private _handleSyncResult(result: any, id: number, name: string, cpu: any, ctx: X86Context, argCount: number, espAtEntry: number): void {
         // Direct Int32Array view — bypasses v86 Proxy trap on reg32 access.
@@ -5336,6 +5383,20 @@ export class ThunkDispatcher {
             gameEsp: faultGameEsp,
             stackDump: faultStackDump,
         });
+
+        // A fault whose cause is a half-built guest STRUCTURE (a NULL array behind a
+        // non-zero count, a stale COM block) cannot be diagnosed from registers alone —
+        // it needs the memory those registers point at. By the time anything can ask,
+        // the guest has run its SEH and exited, and the heap is gone. Freeze here, after
+        // the record exists and BEFORE the SEH dispatch below unwinds anything, so the
+        // address space is exactly as the faulting instruction left it.
+        if ((globalThis as { __pauseOnFault?: boolean }).__pauseOnFault) {
+            const pause = (globalThis as { __harnessPause?: () => void }).__harnessPause;
+            Logger.error(LogCategory.SYSTEM,
+                `  !! __pauseOnFault: guest FROZEN at this fault${pause ? '' : ' — FAILED, no pause hook installed'}` +
+                `${pause ? ' — memory is live; read it, then resume()' : ''}`);
+            pause?.();
+        }
 
         const regs = cpu.reg32;
         Logger.error(LogCategory.SYSTEM,

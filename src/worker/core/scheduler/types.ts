@@ -130,6 +130,10 @@ export interface WaitInfo {
     /** EAX to deliver on the FINAL wake when a CV wake was requeued as a contended
      *  SRW acquire (the CV BOOL result must survive the second wait). */
     pendingEax?: number;
+    /** MsgWaitForMultipleObjects*: the thread's message queue is an extra wait slot
+     *  alongside `handles`, and this is the result its leg delivers (WAIT_OBJECT_0 +
+     *  nCount). Set means "arriving input also ends this wait", whatever the reason. */
+    messageWakeResult?: number;
 }
 
 // ─── APC ────────────────────────────────────────────────────────────────────────
@@ -137,6 +141,9 @@ export interface WaitInfo {
 export const enum ApcKind {
     USER32_QUEUE_USER_APC = 1,
     NTDLL_NT_QUEUE_APC = 2,
+    /** FILE_IO_COMPLETION_ROUTINE(dwErrorCode, dwBytesTransferred, lpOverlapped) —
+     *  ReadFileEx/WriteFileEx. Three args, cdecl-free stdcall, cleanup 12. */
+    IO_COMPLETION = 3,
 }
 
 export interface PendingApc {

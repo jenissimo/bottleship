@@ -183,6 +183,13 @@ export class CallbackManager {
     private frameEspEntry = new Uint32Array(SUSPENDED_FRAME_RING_SIZE);
     private frameReturnAddr = new Uint32Array(SUSPENDED_FRAME_RING_SIZE);
     private frameThunkCleanup = new Uint32Array(SUSPENDED_FRAME_RING_SIZE);
+    /**
+     * EBX/ESI/EDI/EBP as the SUSPENDED THUNK's caller left them. A guest callback must give
+     * these back untouched (stdcall/cdecl both make them callee-saved), so a difference at
+     * the direct restore is OUR bug, not the game's — and the symptom lands far away, at the
+     * caller's next use of the register. Nothing consumes this but the check below.
+     */
+    private frameCalleeSaved = new Uint32Array(SUSPENDED_FRAME_RING_SIZE * 4);
     private frameExpectedPostEsp = new Uint32Array(SUSPENDED_FRAME_RING_SIZE);
     private frameCallbackId = new Uint32Array(SUSPENDED_FRAME_RING_SIZE);
     private frameSource: string[] = new Array(SUSPENDED_FRAME_RING_SIZE).fill('');
@@ -699,6 +706,7 @@ export class CallbackManager {
 
             const preWriteEsp = cpu.reg32[4];
             const preWriteEip = cpu.instruction_pointer?.[0] ?? 0;
+            this.checkCalleeSavedAcrossCallback(frameIndex, frameId, this.frameSource[frameIndex] ?? '');
 
             // Direct-restore: do not resume the callback return stub (mid-stub OUT trap).
             // [frameEsp] may still hold spinLoopAddress from redirectStackToSpinLoop.
@@ -887,6 +895,7 @@ export class CallbackManager {
             return false;
         }
 
+        this.checkCalleeSavedAcrossCallback(frameIndex, deferred.frameId, deferred.source ?? '');
         cpu.reg32[0] = deferred.finalValue >>> 0;
         cpu.reg32[4] = targetEsp >>> 0;
         if (cpu.is_jumping !== undefined) cpu.is_jumping = true;
@@ -907,6 +916,9 @@ export class CallbackManager {
         }
         return true;
     }
+
+    /** True while a thunk is suspended inside a guest callback (diagnostics gate). */
+    public isInsideSuspendedCallback(): boolean { return this.frameStackDepth > 0; }
 
     private getTopSuspendedFrameId(): number {
         if (this.frameStackDepth <= 0) return 0;
@@ -954,6 +966,15 @@ export class CallbackManager {
         this.frameExpectedPostEsp[slot] = (espEntry + 4 + thunkCleanup) >>> 0;
         this.frameCallbackId[slot] = 0;
         this.frameSource[slot] = source;
+        if (this.checkCalleeSaved) {
+            const reg = this.guestRegFile();
+            if (reg) {
+                this.frameCalleeSaved[slot * 4] = reg[3]!;
+                this.frameCalleeSaved[slot * 4 + 1] = reg[6]!;
+                this.frameCalleeSaved[slot * 4 + 2] = reg[7]!;
+                this.frameCalleeSaved[slot * 4 + 3] = reg[5]!;
+            }
+        }
 
         this.frameStack[this.frameStackDepth++] = slot;
         this.frameWriteIdx = (slot + 1) % SUSPENDED_FRAME_RING_SIZE;
@@ -966,6 +987,45 @@ export class CallbackManager {
         } catch { /* scheduler not ready yet */ }
 
         return frameId;
+    }
+
+    /** Same `__checkCalleeSaved` switch the dispatcher's sibling check uses: this sits on the
+     *  guest-callback path (WndProc dispatch, enum callbacks, timer procs), so it is off by
+     *  default and allocates nothing when on. */
+    private get checkCalleeSaved(): boolean {
+        return !!(globalThis as { __checkCalleeSaved?: boolean }).__checkCalleeSaved;
+    }
+
+    /** The live register file, or null when the CPU is not up yet. */
+    private guestRegFile(): Int32Array | null {
+        const cpu = this.v86?.cpu || (this.v86?.v86 && this.v86.v86.cpu);
+        return cpu?.reg32 ?? null;
+    }
+
+    /**
+     * Loud on the ONE thing the direct restore cannot fix: it writes EAX/ESP/EIP, so a
+     * callee-saved register the callback did not give back stays wrong all the way to the
+     * caller's next instruction that reads it.
+     */
+    private checkCalleeSavedAcrossCallback(slot: number, frameId: number, source: string): void {
+        if (!this.checkCalleeSaved) return;
+        const reg = this.guestRegFile();
+        if (!reg) return;
+        const order = [3, 6, 7, 5];
+        const names = ["EBX", "ESI", "EDI", "EBP"];
+        let diff = "";
+        for (let i = 0; i < 4; i++) {
+            const before = this.frameCalleeSaved[slot * 4 + i] >>> 0;
+            const now = reg[order[i]!]! >>> 0;
+            if (before !== now) {
+                diff += ` ${names[i]}: 0x${before.toString(16)} -> 0x${now.toString(16)}`;
+            }
+        }
+        if (diff) {
+            Logger.warn(LogCategory.CALLBACK,
+                `Callee-saved register(s) CLOBBERED across callback (frameId=${frameId}, ` +
+                `thunk=${source}):${diff}`);
+        }
     }
 
     private releaseFrame(slot: number): void {

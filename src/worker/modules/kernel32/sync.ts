@@ -4,11 +4,12 @@
  * Atomic implementation for critical sections and debugging
  */
 
-import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
+import { ThunkImplementation, ThunkResult, X86Context } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
+import { recordSyncEvent } from '../../core/scheduler/sync-objects';
 import { System } from '../../core/system';
 import { EmulatorConfig, getCodePageDecoder } from '../../core/emulator-config-manager';
-import { WAIT_FAILED, WAIT_TIMEOUT, WAIT_BLOCKED_NO_SWITCH, TimerKind } from '../../core/scheduler/types';
+import { WAIT_FAILED, WAIT_TIMEOUT, WAIT_BLOCKED_NO_SWITCH, WAIT_IO_COMPLETION, TimerKind, ApcKind, PendingApc } from '../../core/scheduler/types';
 import { Mem } from '../../core/memory/mem-accessor';
 import { TimeService } from '../../runtime/time';
 import { asBufferSource } from '../../../dom-buffer';
@@ -16,6 +17,7 @@ import {
     ensureSrwWaitEvent,
     releaseSrwExclusive,
     releaseSrwShared,
+    srwWaitEvent,
     tryAcquireSrwExclusive,
     tryAcquireSrwShared,
 } from './srw-lock';
@@ -157,6 +159,52 @@ export function resetIoCompletionWaiters(): void {
         for (const waiter of list.slice()) waiter(IO_COMPLETION_ABANDONED);
     }
     ioCompletionWaiters.clear();
+}
+
+/**
+ * Run the thread's queued APCs, then return WAIT_IO_COMPLETION — what an ALERTABLE wait
+ * does on Windows. Returns null when nothing is queued, so the caller falls through to
+ * the ordinary wait. Chained: each APC's return re-enters and takes the next one, so a
+ * single alertable wait drains the queue instead of one APC per call.
+ *
+ * EVERY alertable entry point must call this. One that returns WAIT_IO_COMPLETION without
+ * draining tells the caller a routine ran when none did, and the canonical
+ * `while (WaitForMultipleObjectsEx(..., TRUE) == WAIT_IO_COMPLETION)` loop then spins for ever.
+ */
+export function deliverPendingApcs(ctx: X86Context, label: string, stackCleanup: number): ThunkResult | null {
+    const system = System.getInstance();
+    const sched = system.scheduler;
+    const tid = sched.getCurrentThread()?.id ?? 0;
+    if (!tid) return null;
+    const callbackManager = system.process?.dispatcher?.callbackManager;
+    if (!callbackManager) return null;
+    const first = sched.takePendingApc(tid);
+    if (!first) return null;
+
+    // Only QueueUserAPC's routine takes one argument. NtQueueApcThread's takes three
+    // (ApcContext, IoStatusBlock, Reserved), as does a FILE_IO_COMPLETION_ROUTINE — and the
+    // argument count IS the RET N, so getting it wrong leaves 8 bytes of caller stack behind.
+    const argsFor = (apc: PendingApc): number[] =>
+        apc.kind === ApcKind.USER32_QUEUE_USER_APC ? [apc.arg0] : [apc.arg0, apc.arg1, apc.arg2];
+    const cleanupFor = (apc: PendingApc): number => argsFor(apc).length * 4;
+
+    const frameId = callbackManager.saveSuspendedThunkContext(ctx, stackCleanup, label);
+    if (!frameId) {
+        // The APC was already dequeued; dropping it here would leave the issuer waiting on a
+        // completion that can never arrive — the deadlock this whole path exists to avoid.
+        sched.restorePendingApc(tid, first);
+        return null;
+    }
+
+    const next = (): number | null => {
+        const apc = sched.takePendingApc(tid);
+        if (!apc) return WAIT_IO_COMPLETION;
+        callbackManager.invokeCallback(apc.routine, argsFor(apc), cleanupFor(apc), next, false, label, frameId);
+        return null;
+    };
+    const { callbackId } = callbackManager.invokeCallback(
+        first.routine, argsFor(first), cleanupFor(first), next, false, label, frameId);
+    return { value: WAIT_IO_COMPLETION, suspendedForCallback: true, callbackId, stackCleanup };
 }
 
 const syncModule = (() => {
@@ -966,6 +1014,8 @@ const syncModule = (() => {
         const hEvent = args[0];
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         const returnAddr = view.getUint32(ctx.esp >>> 0, true) >>> 0;
+        recordSyncEvent("resetGuest", hEvent, System.getInstance().scheduler.getCurrentThreadId() ?? 0,
+            `ret=0x${returnAddr.toString(16)}`);
         const ok = System.getInstance().scheduler.resetEvent(hEvent);
         logResetEvent(hEvent, ok, returnAddr);
         return ok ? 1 : 0;
@@ -1229,6 +1279,11 @@ const syncModule = (() => {
             return WAIT_FAILED;
         }
 
+        if (bAlertable) {
+            const apcResult = deliverPendingApcs(ctx, 'WaitForSingleObjectEx:APC', 12);
+            if (apcResult) return apcResult;
+        }
+
         const result = sched.waitForSingleObjectExWithContext(
             hHandle,
             dwMilliseconds,
@@ -1324,6 +1379,11 @@ const syncModule = (() => {
         const handles: number[] = [];
         for (let i = 0; i < nCount; i++) {
             handles.push(view.getUint32(lpHandles + i * 4, true));
+        }
+
+        if (bAlertable) {
+            const apcResult = deliverPendingApcs(ctx, 'WaitForMultipleObjectsEx:APC', 20);
+            if (apcResult) return apcResult;
         }
 
         const returnAddr = view.getUint32(ctx.esp, true);
@@ -1853,6 +1913,60 @@ const syncModule = (() => {
         return 0;
     };
 
+    /**
+     * SRW acquire/release, uncontended only — the CriticalSection pair above is the model.
+     * SRWLOCK state is ours (srw-lock.ts), not a guest struct, so these call the very same
+     * helpers the slow path does; the fast path buys only the skipped thunk marshalling.
+     *
+     * Both refuse anything that could block or wake a thread: blocking and waking are thread
+     * switches, and those may only happen through the scheduler's switch primitive (§3.6).
+     */
+    const srwLockPtrArg = (cpu: any, mem8: Uint8Array, dataView: DataView): number => {
+        const esp = cpu.reg32[4] >>> 0;
+        if (esp + 8 > mem8.length) return 0;
+        return dataView.getUint32(esp + 4, true) >>> 0;
+    };
+
+    const srwCurrentThreadId = (): number => {
+        const sched: any = cachedScheduler || getScheduler();
+        return typeof sched?.getCurrentThreadId === 'function'
+            ? ((sched.getCurrentThreadId() as number) >>> 0)
+            : ((sched?.currentThreadId ?? 0) >>> 0);
+    };
+
+    const makeFastPathAcquireSrw = (exclusive: boolean) =>
+        (cpu: any, mem8: Uint8Array, _mem32: Uint32Array, dataView: DataView): number | null => {
+            const lockPtr = srwLockPtrArg(cpu, mem8, dataView);
+            if (lockPtr === 0) return null;
+            const tid = srwCurrentThreadId();
+            if (tid === 0) return null;
+            // A refused grant means this thread must park on the lock's wait event.
+            const granted = exclusive
+                ? tryAcquireSrwExclusive(lockPtr, tid)
+                : tryAcquireSrwShared(lockPtr, tid);
+            return granted ? 0 : null;
+        };
+
+    const makeFastPathReleaseSrw = (exclusive: boolean) =>
+        (cpu: any, mem8: Uint8Array, _mem32: Uint32Array, dataView: DataView): number | null => {
+            const lockPtr = srwLockPtrArg(cpu, mem8, dataView);
+            if (lockPtr === 0) return null;
+            const tid = srwCurrentThreadId();
+            if (tid === 0) return null;
+            // Mirrors the LockSemaphore check in fastPathLeaveCriticalSection. The slow path's
+            // wake is itself conditional on hasWaitersForHandle, so the question is not "was
+            // this lock ever contended" but "is a thread queued right now" — locks that
+            // blocked once and never again are the common case and stay on this tier.
+            const waitEvent = srwWaitEvent(lockPtr);
+            if (waitEvent !== 0) {
+                const sched: any = cachedScheduler || getScheduler();
+                if (sched?.hasWaitersForHandle?.(waitEvent)) return null;
+            }
+            if (exclusive) releaseSrwExclusive(lockPtr, tid);
+            else releaseSrwShared(lockPtr, tid);
+            return 0;
+        };
+
     const reset = (): void => {
         const wheel = cachedScheduler?.timerWheel;
         for (const timer of waitableTimers.values()) {
@@ -1884,6 +1998,10 @@ const syncModule = (() => {
             if (dispatcher && typeof dispatcher.registerFastPath === 'function') {
                 dispatcher.registerFastPath('kernel32', 'EnterCriticalSection', fastPathEnterCriticalSection);
                 dispatcher.registerFastPath('kernel32', 'LeaveCriticalSection', fastPathLeaveCriticalSection);
+                dispatcher.registerFastPath('kernel32', 'AcquireSRWLockExclusive', makeFastPathAcquireSrw(true));
+                dispatcher.registerFastPath('kernel32', 'AcquireSRWLockShared', makeFastPathAcquireSrw(false));
+                dispatcher.registerFastPath('kernel32', 'ReleaseSRWLockExclusive', makeFastPathReleaseSrw(true));
+                dispatcher.registerFastPath('kernel32', 'ReleaseSRWLockShared', makeFastPathReleaseSrw(false));
             }
         }
     };

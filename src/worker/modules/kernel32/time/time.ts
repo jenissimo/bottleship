@@ -8,6 +8,7 @@ import { System } from '../../../core/system';
 import { Mem } from '../../../core/memory/mem-accessor';
 import { WAIT_BLOCKED_NO_SWITCH, WAIT_IO_COMPLETION } from '../../../core/scheduler/types';
 import { encodeAnsi } from '../../codepage-utils';
+import { deliverPendingApcs } from '../sync';
 
 
 export const exports: Record<string, ThunkImplementation> = {};
@@ -249,6 +250,11 @@ function initTimeFunctions(): void {
             );
             lastSleepLog = now;
             sleepCallCount = 0;
+        }
+
+        if (bAlertable) {
+            const apcResult = deliverPendingApcs(ctx, 'SleepEx:APC', 8);
+            if (apcResult) return apcResult;
         }
 
         // Use post-return context path (same model as Sleep) because SleepEx is called from thunk code.

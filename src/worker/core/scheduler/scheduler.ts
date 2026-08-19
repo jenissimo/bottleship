@@ -37,7 +37,7 @@ import {
     simdSnapshot,
 } from '../fpu-helper';
 import { TimerWheel } from './timer-wheel';
-import { SyncObjectManager } from './sync-objects';
+import { SyncObjectManager, recordSyncEvent } from './sync-objects';
 import { WaitEngine } from './wait-engine';
 import { CallbackCoordinator } from './callback-coord';
 import { TARGET_INSN_PER_MS } from './timing';
@@ -2056,9 +2056,18 @@ export class Scheduler {
     wakeMessageWaiters(targetThreadId?: number): void {
         for (const thread of this.threads.values()) {
             if (thread.state !== ThreadState.WAITING) continue;
-            if (thread.waitInfo?.reason !== WaitReason.MESSAGE) continue;
+            const info = thread.waitInfo;
+            // WaitMessage parks with reason MESSAGE; MsgWaitForMultipleObjects parks on
+            // its handles with the queue as an extra slot, so its reason is a handle one.
+            if (!info || (info.reason !== WaitReason.MESSAGE && info.messageWakeResult === undefined)) continue;
             if (targetThreadId !== undefined && thread.id !== targetThreadId) continue;
-            this.wakeThread(thread, 1); // TRUE — WaitMessage return value
+            // bWaitAll means ALL the handles AND input; input alone does not end that wait.
+            if (info.waitAll && info.handles.length > 0) {
+                const decision = this.syncObjects.checkWait(
+                    info.handles, true, thread.id, (tid) => this.threads.get(tid) ?? null);
+                if (!decision.ready) continue;
+            }
+            this.wakeThread(thread, info.messageWakeResult ?? 1); // TRUE — WaitMessage return value
         }
     }
 
@@ -2156,6 +2165,62 @@ export class Scheduler {
         // Must NOT return WAIT_OBJECT_0 to the sync thunk — the thread is WAITING with a
         // saved post-return context; stub RET would resume guest code on a parked thread
         // (SS2 boot: T2 WFSO + T1 continues → stack corruption → 0x7c07).
+        return WAIT_BLOCKED_NO_SWITCH;
+    }
+
+    /**
+     * MsgWaitForMultipleObjects*: wait on `handles` OR on this thread's message queue,
+     * the queue being one more wait slot whose leg reports `messageResult`
+     * (WAIT_OBJECT_0 + nCount). Win32 models it exactly that way — the queue is a real
+     * waitable handle appended to the array — so the handle legs, the timeout and the
+     * return mapping stay identical to WaitForMultipleObjects.
+     *
+     * `handles` may be empty (the pure "wait for input" form), in which case the queue
+     * is the only slot and this degenerates into waitForMessage with a timeout.
+     */
+    waitForObjectsOrMessageWithContext(
+        handles: number[], waitAll: boolean, timeoutMs: number, messageResult: number,
+        returnAddr: number, postReturnEsp: number,
+        callerCtx: { ecx: number; edx: number; ebx: number; ebp: number; esi: number; edi: number; eflags: number },
+        alertable: boolean = false
+    ): number {
+        const thread = this.getCurrentThread();
+        if (!thread) return WAIT_FAILED;
+
+        let resolved: number[] = [];
+        if (handles.length > 0) {
+            resolved = this.resolveHandles(handles, thread);
+            if (!this.syncObjects.validateHandles(resolved)) return WAIT_FAILED;
+            const decision = this.syncObjects.checkWait(
+                resolved, waitAll, thread.id, (tid) => this.threads.get(tid) ?? null);
+            if (decision.ready) { this.syncObjects.consumeWait(decision, thread.id); return decision.result; }
+        }
+
+        if (alertable && thread.apcQueue.length > 0) return WAIT_IO_COMPLETION;
+        if (timeoutMs === 0) {
+            // Same as waitForObjectsWithContext: a zero timeout is a probe, never a park.
+            if (this.hasOtherRunnableThreads(thread.id)) this.requestSwitch();
+            return WAIT_TIMEOUT;
+        }
+
+        if (!isValidGuestEip(returnAddr)) {
+            Logger.error(LogCategory.THREAD,
+                `waitForObjectsOrMessageWithContext: invalid returnAddr=0x${returnAddr.toString(16)} T${thread.id} — returning WAIT_FAILED`);
+            return WAIT_FAILED;
+        }
+
+        const context = createPostReturnContext(returnAddr, postReturnEsp, callerCtx, WAIT_OBJECT_0);
+        const reason = resolved.length === 0
+            ? WaitReason.MESSAGE
+            : (waitAll ? WaitReason.MULTIPLE_OBJECTS : WaitReason.SINGLE_OBJECT);
+        this.blockThread(thread, reason, resolved, waitAll,
+            timeoutMs === INFINITE ? null : timeoutMs, alertable, 0, context,
+            false, false, false, messageResult);
+        if (this.hasOtherRunnableThreads(thread.id)) {
+            this.requestSwitch();
+        } else {
+            this.requestYieldToHost(this.computeYieldMs(timeoutMs), "msgWaitObj");
+        }
         return WAIT_BLOCKED_NO_SWITCH;
     }
 
@@ -2766,7 +2831,9 @@ export class Scheduler {
 
     setEvent(handle: number): boolean {
         const ok = this.syncObjects.setEvent(handle);
-        if (ok && this.waitEngine.getHandleWaiters(handle).length > 0) {
+        const waiters = ok ? this.waitEngine.getHandleWaiters(handle) : [];
+        recordSyncEvent("setBy", handle, this.currentThreadId ?? 0, `ok=${ok} waiters=${waiters.length}`);
+        if (ok && waiters.length > 0) {
             this.wakeWaitingThreadsForHandle(handle);
         }
         return ok;
@@ -3304,6 +3371,36 @@ export class Scheduler {
         if (!thread || thread.state === ThreadState.TERMINATED || !routine) return false;
         thread.apcQueue.push({ routine: routine >>> 0, arg0: arg0 >>> 0, arg1: 0, arg2: 0, kind: ApcKind.USER32_QUEUE_USER_APC });
         return true;
+    }
+
+    /**
+     * Queue a FILE_IO_COMPLETION_ROUTINE on the thread that issued the overlapped read.
+     * Windows runs it only while that thread is in an ALERTABLE wait, which is exactly
+     * where the caller then drains it — the routine is what tells the issuer the request
+     * finished, so a queue nobody drains is indistinguishable from a read that never
+     * completed (CryEngine's streaming engine then waits for a completion for ever).
+     */
+    queueIoCompletionApc(threadId: number, routine: number, errorCode: number, bytes: number, lpOverlapped: number): boolean {
+        const thread = this.threads.get(threadId >>> 0);
+        if (!thread || thread.state === ThreadState.TERMINATED || !routine) return false;
+        thread.apcQueue.push({
+            routine: routine >>> 0, arg0: errorCode >>> 0, arg1: bytes >>> 0, arg2: lpOverlapped >>> 0,
+            kind: ApcKind.IO_COMPLETION,
+        });
+        return true;
+    }
+
+    /** Put an APC back at the head of the queue — for a delivery that could not start. */
+    restorePendingApc(threadId: number, apc: PendingApc): void {
+        const thread = this.threads.get(threadId >>> 0);
+        if (thread) thread.apcQueue.unshift(apc);
+    }
+
+    /** Pop the next pending APC for a thread (null when the queue is empty). */
+    takePendingApc(threadId: number): PendingApc | null {
+        const thread = this.threads.get(threadId >>> 0);
+        if (!thread || thread.apcQueue.length === 0) return null;
+        return thread.apcQueue.shift() ?? null;
     }
 
     queueNtApcByHandle(threadHandle: number, routine: number, arg0: number, arg1: number, arg2: number): number {
@@ -4006,6 +4103,7 @@ export class Scheduler {
         srwWantExclusive = false,
         boolReturn = false,
         cvReacquireCs = false,
+        messageWakeResult?: number,
     ): void {
         // Create timeout timer if needed
         let timerId = 0;
@@ -4027,6 +4125,7 @@ export class Scheduler {
             srwWantExclusive,
             boolReturn: boolReturn || undefined,
             cvReacquireCs: cvReacquireCs || undefined,
+            messageWakeResult,
         };
 
         this.transitionTo(thread, ThreadState.WAITING, waitInfo, context);
