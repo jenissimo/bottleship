@@ -1207,6 +1207,17 @@ function reportHotGuestInstructions(eips: any[] | null): string | null {
   lines.push(`HOT GUEST INSTRUCTIONS (exact EIP — pinpoints the hot function within a page)`);
   lines.push(sep("═"));
   lines.push(`Source: bottleship.hotblocks mark · ${num(eips.length)} sampled EIPs (already samples-desc)`);
+  // The EIP sampler is a setInterval on the WORKER's event loop reading cpu.instruction_pointer
+  // (diagnostics-commands.ts eipSample). A timer can only fire when the worker yields, so these
+  // samples are taken at slice boundaries, NOT uniformly across guest execution. That biases them
+  // hard toward addresses where the guest happens to be parked — callback entries and the
+  // instruction after a thunk. Verified on Satinav: the two "hottest" EIPs at 21%/18% disassemble
+  // to a 25-byte field update and a 5-arg MM_WOM_DONE audio-callback entry, neither of which can
+  // hold a video decoder's time. Read this table as WHERE THE GUEST YIELDS, not where it burns
+  // CPU; for time, use the wasm/JIT-block attribution above, which is Chrome's own CPU profiler.
+  lines.push(`  NOTE: sampled at worker yield points, so this ranks WHERE THE GUEST PARKS, not`);
+  lines.push(`  where it spends time. A function ENTRY at the top usually means a hot callback`);
+  lines.push(`  dispatch, not a hot kernel — confirm by disassembling before optimizing it.`);
   lines.push(` #   ${pad("samples", 8, true)} ${pad("%hot", 6, true)}  ${pad("eip", 12)}  module+rva`);
   lines.push(` ${"-".repeat(72)}`);
   for (let i = 0; i < Math.min(25, eips.length); i++) {
@@ -1392,7 +1403,22 @@ function optBucket(frame: CallFrame): OptBucket {
   if (name.includes("jit_find_cache_entry")) return "indirect-jump (jit cache)";
   if (name.includes("interpreter")) return "interpreter (non-JIT)";
   if (/^(fpu_|f80_|f64_|f32_)/.test(name)) return "fpu primitives";
+  // v86 names its vector helpers after the OPCODE, never "sse_": instr_660FED (paddsw),
+  // instr_0F59 (mulps), instr_F30F10 (movss). The old /^sse_/ matched none of them, so every
+  // SSE/MMX helper fell through into "other v86 core" — a cutscene trace where four of them
+  // were 14.6% of all samples reported this bucket as 0.1%, which is how a real bottleneck
+  // got read as "not SSE". A 66/F2/F3-prefixed 0F helper is always a vector op; for the
+  // unprefixed form only the vector opcode ranges count (plain 0F is mostly Jcc/imul/bit ops).
   if (/^sse_/.test(name)) return "sse primitives";
+  const vec = /^instr_(66|F2|F3)?0F([0-9A-F]{2})(_reg|_mem)?$/.exec(name);
+  if (vec) {
+    if (vec[1]) return "sse primitives";
+    const op = parseInt(vec[2], 16);
+    const isVector = (op >= 0x10 && op <= 0x17) || (op >= 0x28 && op <= 0x2f)
+      || (op >= 0x50 && op <= 0x77) || (op >= 0x7e && op <= 0x7f)
+      || (op >= 0xc2 && op <= 0xc6) || (op >= 0xd0 && op <= 0xff);
+    if (isVector) return "sse primitives";
+  }
   if (
     name.includes("tlb_") ||
     name.startsWith("safe_read") ||
@@ -1451,7 +1477,17 @@ function reportOptimizationBuckets(analysis: ThreadAnalysis): string {
   lines.push(``);
   lines.push(`ROLL-UP (of busy time):`);
   lines.push(`  game's own code      ${pad(pct(game, busy), 7, true)}  → better dynarec / static-recomp / inner-loop hooking`);
-  lines.push(`  v86 full-system tax  ${pad(pct(tax, busy), 7, true)}  → relaxed-FPU / block-chaining / v86 JIT tuning`);
+  // Name the DOMINANT sub-bucket inside the tax, because the generic advice points at the
+  // wrong lever when one sub-bucket owns it: a cutscene trace read "relaxed-FPU /
+  // block-chaining" while 36% of busy was scalar SSE helpers waiting to become v128 ops.
+  // The same set `tax` is summed from, so the hint can never name a bucket outside it.
+  const taxTop = [...buckets.entries()]
+    .filter(([b]) => OPT_TAX_BUCKETS.has(b))
+    .sort((a, b) => b[1] - a[1])[0];
+  const taxHint = taxTop && tax > 0 && taxTop[1] / tax >= 0.4
+    ? `mostly ${taxTop[0]} (${pct(taxTop[1], busy)} of busy) — target that first`
+    : "relaxed-FPU / block-chaining / v86 JIT tuning";
+  lines.push(`  v86 full-system tax  ${pad(pct(tax, busy), 7, true)}  → ${taxHint}`);
   lines.push(`  JS HLE + glue        ${pad(pct(hle, busy), 7, true)}  → WASM hypercall tiers`);
   return lines.join("\n");
 }
