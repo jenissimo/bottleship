@@ -86,6 +86,8 @@ for (let i = 0; i < 64; i++) {
 export class Md5 {
     private state = new Uint32Array([0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476]);
     private buffer = new Uint8Array(64);
+    /** Per-block message schedule, reused: transform overwrites all 16 words. */
+    private readonly m = new Uint32Array(16);
     private bufLen = 0;
     private totalLen = 0;
 
@@ -98,12 +100,12 @@ export class Md5 {
             this.bufLen += take;
             i += take;
             if (this.bufLen === 64) {
-                this.transform(this.buffer);
+                this.transform(this.buffer, 0);
                 this.bufLen = 0;
             }
         }
         while (i + 64 <= end) {
-            this.transform(data.subarray(i, i + 64));
+            this.transform(data, i);
             i += 64;
         }
         if (i < end) {
@@ -128,10 +130,13 @@ export class Md5 {
         return out;
     }
 
-    private transform(block: Uint8Array): void {
-        const m = new Uint32Array(16);
-        const dv = new DataView(block.buffer, block.byteOffset, 64);
-        for (let i = 0; i < 16; i++) m[i] = dv.getUint32(i * 4, true);
+    /** `off` is the block start inside `block` — a subarray per block would allocate too. */
+    private transform(block: Uint8Array, off: number): void {
+        const m = this.m;
+        for (let i = 0; i < 16; i++) {
+            const o = off + i * 4;
+            m[i] = (block[o]! | (block[o + 1]! << 8) | (block[o + 2]! << 16) | (block[o + 3]! << 24)) >>> 0;
+        }
 
         let a = this.state[0]!;
         let b = this.state[1]!;
@@ -183,6 +188,8 @@ export class Sha1 {
     private h3 = 0x10325476;
     private h4 = 0xc3d2e1f0;
     private buffer = new Uint8Array(64);
+    /** Per-block message schedule, reused: transform overwrites all 80 words. */
+    private readonly w = new Uint32Array(80);
     private bufLen = 0;
     private totalLen = 0;
 
@@ -195,12 +202,12 @@ export class Sha1 {
             this.bufLen += take;
             i += take;
             if (this.bufLen === 64) {
-                this.transform(this.buffer);
+                this.transform(this.buffer, 0);
                 this.bufLen = 0;
             }
         }
         while (i + 64 <= end) {
-            this.transform(data.subarray(i, i + 64));
+            this.transform(data, i);
             i += 64;
         }
         if (i < end) {
@@ -228,10 +235,13 @@ export class Sha1 {
         return out;
     }
 
-    private transform(block: Uint8Array): void {
-        const w = new Uint32Array(80);
-        const b = new DataView(block.buffer, block.byteOffset, 64);
-        for (let i = 0; i < 16; i++) w[i] = b.getUint32(i * 4, false);
+    /** `off` is the block start inside `block` — a subarray per block would allocate too. */
+    private transform(block: Uint8Array, off: number): void {
+        const w = this.w;
+        for (let i = 0; i < 16; i++) {
+            const o = off + i * 4;
+            w[i] = ((block[o]! << 24) | (block[o + 1]! << 16) | (block[o + 2]! << 8) | block[o + 3]!) >>> 0;
+        }
         for (let i = 16; i < 80; i++) {
             w[i] = rotl(w[i - 3]! ^ w[i - 8]! ^ w[i - 14]! ^ w[i - 16]!, 1);
         }

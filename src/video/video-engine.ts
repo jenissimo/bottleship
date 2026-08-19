@@ -1,9 +1,15 @@
 /**
- * VideoEngine — lazy-loaded WASM video decoder for Bink (.bik), Smacker (.smk),
- * AVI, and MPEG-1/2 Program Stream (.mpg/.mpeg).
+ * VideoEngine — video decoding behind one handle-based, sync/pull API, over two backends:
  *
- * The WASM module is built from tools/build-ffmpeg-decoder/decoder_api.c using
- * Emscripten + a minimal FFmpeg (Bink/Smacker/AVI/MPEG demuxers + decoders).
+ *   1. WASM ffmpeg (the default) — Bink (.bik), Smacker (.smk), AVI, MPEG-1/2 PS. Built from
+ *      tools/build-ffmpeg-decoder/decoder_api.c with a minimal FFmpeg.
+ *   2. WebCodecs (`webcodecs-backend.ts`) — the browser's own decoders, for content the WASM
+ *      build has no demuxer/decoder for (VP8/VP9/H.264) and for the packet-fed path an
+ *      ffmpeg-DLL HLE needs, where the guest's own avformat did the demuxing.
+ *
+ * Backend selection is PER STREAM and never changes an existing caller's behavior: `open()`
+ * sniffs the EBML magic and only then takes the WebCodecs route; every other container goes to
+ * the WASM decoder exactly as before.
  *
  * Usage (in the emulator worker):
  *   const engine = videoEngine;
@@ -35,6 +41,13 @@ import {
     FLAG_CIRCULAR,
     FLAG_STREAMING,
 } from "../audio/audio-ring-buffer";
+import {
+    WebCodecsVideoSession, webCodecsAvailable,
+    type EncodedStreamConfig, type I420Frame, type WebCodecsStats,
+} from "./webcodecs-backend";
+import { WebmVideoSource, looksLikeWebm } from "./webm-source";
+
+export type { I420Frame, WebCodecsStats, EncodedStreamConfig };
 
 /** C ABI exported by tools/build-ffmpeg-decoder/decoder_api.c */
 interface DecoderWasmExports {
@@ -142,6 +155,17 @@ const WASI_IMPORTS = {
     }),
 };
 
+/** A WebCodecs-backed stream: the decoder session plus, for the container path, its feeder. */
+interface WebCodecsEntry {
+    session: WebCodecsVideoSession;
+    /** null for a packet-fed stream (openEncoded) — there is no container to pump. */
+    source: WebmVideoSource | null;
+    codecName: string;
+}
+
+/** How long open() waits for the first decoded frame before handing out the handle. */
+const WEBCODECS_PRIME_TIMEOUT_MS = 3000;
+
 /** Unique counter for audio stream IDs */
 let audioIdCounter = 1;
 /** Audio SAB size: ~4 seconds of 44100 Hz stereo S16 */
@@ -154,6 +178,8 @@ export class VideoEngine {
 
     /** Map from JS-side unique handle → session state */
     private sessions: Map<number, DecoderSession> = new Map();
+    /** WebCodecs-backed sessions. Disjoint from `sessions` — one handle space, two backends. */
+    private wcSessions: Map<number, WebCodecsEntry> = new Map();
     private nextJsHandle = 1;
 
     // ── Loader ───────────────────────────────────────────────────────────────
@@ -216,6 +242,14 @@ export class VideoEngine {
      * file contents.  Returns a JS handle (> 0) or throws.
      */
     async open(fileBytes: Uint8Array): Promise<number> {
+        // Matroska/WebM: the WASM build has no matroska demuxer and no VP8/VP9/H.264 decoder, so
+        // this is not a preference between backends — it is the only backend that can serve it.
+        if (looksLikeWebm(fileBytes) && webCodecsAvailable()) {
+            const handle = await this._openWebm(fileBytes);
+            if (handle > 0) return handle;
+            Logger.warn(LogCategory.SYSTEM,
+                "[VideoEngine] WebM/WebCodecs open failed — falling through to the WASM decoder, which has no matroska demuxer");
+        }
         await this.ensureLoaded();
         const exp  = this.exp();
         const size = fileBytes.byteLength;
@@ -319,6 +353,19 @@ export class VideoEngine {
      * Also pumps audio PCM into the SAB ring buffer.
      */
     doFrame(jsHandle: number): boolean {
+        const wc = this.wcSessions.get(jsHandle);
+        if (wc) {
+            // Keep the decoder fed before asking, so a starve means the decoder is genuinely
+            // behind rather than that nobody handed it work.
+            wc.source?.pump();
+            if (wc.session.doFrame()) return true;
+            // Every caller reads false as END OF STREAM (avifil32/lgvid/binkw32/MCI all stop
+            // the movie on it), but a browser decoder also answers false while it is merely
+            // behind — its output callback cannot run inside one guest slice. So a starve
+            // reports the CURRENT frame as still current and only real EOF returns false;
+            // the movie repeats a frame instead of ending after one.
+            return !wc.session.isEndOfStream();
+        }
         const s = this.sessions.get(jsHandle);
         if (!s) return false;
         const exp = this.exp();
@@ -338,6 +385,8 @@ export class VideoEngine {
      * Valid only until the next WASM operation.  Copy if needed.
      */
     getFrameBgra(jsHandle: number): Uint8Array | null {
+        const wc = this.wcSessions.get(jsHandle);
+        if (wc) return wc.session.getBgra();
         const s = this.sessions.get(jsHandle);
         if (!s) return null;
         const exp = this.exp();
@@ -354,6 +403,8 @@ export class VideoEngine {
      * The conversion is done in C/WASM — JS side just does memcpy per row.
      */
     getFrameRgb565(jsHandle: number): Uint8Array | null {
+        // No RGB565 route on the WebCodecs backend; callers already fall back to BGRA.
+        if (this.wcSessions.has(jsHandle)) return null;
         const s = this.sessions.get(jsHandle);
         if (!s) return null;
         const exp = this.exp();
@@ -371,6 +422,8 @@ export class VideoEngine {
      * The returned arrays are views into WASM memory — copy if needed.
      */
     getFramePal8(jsHandle: number): Pal8Frame | null {
+        // A browser decoder never outputs PAL8.
+        if (this.wcSessions.has(jsHandle)) return null;
         const s = this.sessions.get(jsHandle);
         if (!s) return null;
         const exp = this.exp();
@@ -401,6 +454,7 @@ export class VideoEngine {
      * this if you need the raw PCM (e.g., standalone test page).
      */
     drainAudio(jsHandle: number): Int16Array | null {
+        if (this.wcSessions.has(jsHandle)) return null;
         const s = this.sessions.get(jsHandle);
         if (!s || !s.hasAudio) return null;
         const exp = this.exp();
@@ -419,18 +473,32 @@ export class VideoEngine {
     }
 
     nextFrame(jsHandle: number): void {
+        // On the WebCodecs backend doFrame() both decodes and advances (frames arrive in
+        // presentation order and are consumed from the head of the ring), so advancing again
+        // here would skip one. The usual consumer sequence doFrame → read pixels → nextFrame is
+        // unaffected; two doFrame() calls with no read between them differ from the WASM
+        // backend, where the second would re-decode the same frame.
+        if (this.wcSessions.has(jsHandle)) return;
         const s = this.sessions.get(jsHandle);
         if (!s) return;
         this.exp().decoder_next_frame(s.wasmHandle);
     }
 
     gotoFrame(jsHandle: number, frame: number): void {
+        const wc = this.wcSessions.get(jsHandle);
+        if (wc) {
+            if (wc.source) wc.source.seekToFrame(frame);
+            else wc.session.setDiscardTarget(frame); // packet-fed: only the feeder can rewind
+            return;
+        }
         const s = this.sessions.get(jsHandle);
         if (!s) return;
         this.exp().decoder_goto_frame(s.wasmHandle, frame);
     }
 
     getInfo(jsHandle: number): VideoInfo | null {
+        const wc = this.wcSessions.get(jsHandle);
+        if (wc) return this._webCodecsInfo(wc);
         const s = this.sessions.get(jsHandle);
         if (!s) return null;
         const exp          = this.exp();
@@ -465,9 +533,22 @@ export class VideoEngine {
         for (const handle of Array.from(this.sessions.keys())) {
             this.close(handle);
         }
+        for (const handle of Array.from(this.wcSessions.keys())) {
+            this.close(handle);
+        }
     }
 
     close(jsHandle: number): void {
+        const wc = this.wcSessions.get(jsHandle);
+        if (wc) {
+            // Deterministic release: the source closes the session, which closes the decoder and
+            // drops every pooled frame buffer. No VideoFrame outlives its arrival callback.
+            if (wc.source) wc.source.close();
+            else wc.session.close();
+            this.wcSessions.delete(jsHandle);
+            Logger.log(LogCategory.SYSTEM, `[VideoEngine] close jsHandle=${jsHandle} (webcodecs)`);
+            return;
+        }
         const s = this.sessions.get(jsHandle);
         if (!s) return;
 
@@ -494,6 +575,11 @@ export class VideoEngine {
     getAudioSab(jsHandle: number): SharedArrayBuffer | null {
         const s = this.sessions.get(jsHandle);
         return s?.sab ?? null;
+    }
+
+    /** Whether this handle is served by the WebCodecs backend. */
+    isWebCodecsSession(jsHandle: number): boolean {
+        return this.wcSessions.has(jsHandle);
     }
 
     /** Unwrapped PCM bytes written to the SAB (not yet consumed by the worklet). */
@@ -572,6 +658,161 @@ export class VideoEngine {
 
     isLoaded(): boolean {
         return this.instance !== null;
+    }
+
+    // ── WebCodecs backend ─────────────────────────────────────────────────────
+
+    /** Whether the WebCodecs backend can be used in this scope at all. */
+    static webCodecsAvailable(): boolean {
+        return webCodecsAvailable();
+    }
+
+    /**
+     * Open a stream whose packets the CALLER demuxes — the entry point for an ffmpeg-DLL HLE,
+     * where the guest's own avformat already produced elementary-stream packets.
+     *
+     * Feed it with `pushPacket()`, then pull with the normal `doFrame()`/`getFrameBgra()` /
+     * `getFrameI420()`. There is no container, so `gotoFrame()` cannot rewind and `frameCount`
+     * is whatever the caller declared.
+     */
+    openEncoded(cfg: EncodedStreamConfig): number {
+        if (!webCodecsAvailable()) throw new Error("[VideoEngine] WebCodecs is not available in this scope");
+        const session = new WebCodecsVideoSession(cfg);
+        const jsHandle = this.nextJsHandle++;
+        this.wcSessions.set(jsHandle, { session, source: null, codecName: cfg.codec });
+        Logger.log(LogCategory.SYSTEM,
+            `[VideoEngine] openEncoded → jsHandle=${jsHandle} ${cfg.width}x${cfg.height} codec="${cfg.codec}"`);
+        return jsHandle;
+    }
+
+    /**
+     * Hand one compressed packet to a stream opened with `openEncoded`.
+     * Returns false when the pipeline is full — the caller must retry the SAME packet later.
+     */
+    pushPacket(jsHandle: number, data: Uint8Array, ptsUs: number, isKeyframe: boolean, durationUs = 0): boolean {
+        const wc = this.wcSessions.get(jsHandle);
+        if (!wc) return false;
+        return wc.session.pushPacket(data, ptsUs, isKeyframe, durationUs);
+    }
+
+    /** Declare that no further packets are coming, so `isEndOfStream()` can become true. */
+    signalEndOfInput(jsHandle: number): void {
+        this.wcSessions.get(jsHandle)?.session.signalEndOfInput();
+    }
+
+    /** Drain the decoder so every accepted packet has produced its frame. */
+    async flushDecoder(jsHandle: number): Promise<void> {
+        await this.wcSessions.get(jsHandle)?.session.flush();
+    }
+
+    /**
+     * Is a frame available RIGHT NOW? `doFrame()` returning false merges "still decoding" with
+     * "end of stream"; this plus `isEndOfStream()` separates them.
+     */
+    frameReady(jsHandle: number): boolean {
+        const wc = this.wcSessions.get(jsHandle);
+        if (wc) {
+            wc.source?.pump();
+            return wc.session.frameReady();
+        }
+        // The WASM backend decodes synchronously, so a frame is always "ready" to attempt.
+        return this.sessions.has(jsHandle);
+    }
+
+    /** Input finished AND every decoded frame consumed. False on the WASM backend, which has no
+     *  such notion — its doFrame() already returns false only at real EOF. */
+    isEndOfStream(jsHandle: number): boolean {
+        return this.wcSessions.get(jsHandle)?.session.isEndOfStream() ?? false;
+    }
+
+    /**
+     * Planar YUV 4:2:0 of the current frame — what an ffmpeg-ABI consumer wants
+     * (AV_PIX_FMT_YUV420P). Null on the WASM backend and when the browser handed back a
+     * non-I420 layout (in which case `getFrameBgra` still works).
+     */
+    getFrameI420(jsHandle: number): I420Frame | null {
+        return this.wcSessions.get(jsHandle)?.session.getI420() ?? null;
+    }
+
+    /** Presentation timestamp of the current WebCodecs frame, in microseconds. */
+    getFrameTimestampUs(jsHandle: number): number {
+        return this.wcSessions.get(jsHandle)?.session.currentTimestampUs() ?? 0;
+    }
+
+    /** Ring/backpressure/drop counters — the instrument for "is the bridge starving or leaking". */
+    getWebCodecsStats(jsHandle: number): WebCodecsStats | null {
+        return this.wcSessions.get(jsHandle)?.session.stats() ?? null;
+    }
+
+    /** Bytes held by a WebCodecs session's frame ring and buffer pool. */
+    getWebCodecsHeldBytes(jsHandle: number): number {
+        return this.wcSessions.get(jsHandle)?.session.heldBytes() ?? 0;
+    }
+
+    /** Open a WebM container on the WebCodecs backend. Returns 0 when it cannot be served. */
+    private async _openWebm(fileBytes: Uint8Array): Promise<number> {
+        let source: WebmVideoSource;
+        try {
+            source = new WebmVideoSource(fileBytes);
+        } catch (e) {
+            Logger.warn(LogCategory.SYSTEM,
+                `[VideoEngine] WebM open refused: ${e instanceof Error ? e.message : String(e)}`);
+            return 0;
+        }
+        const entry: WebCodecsEntry = {
+            session: source.session,
+            source,
+            codecName: source.track.codecId,
+        };
+        source.pump();
+        // Prime the ring before handing out the handle: consumers read doFrame()===false as EOF,
+        // and at open time there is nothing decoded yet, so an unprimed handle would look like an
+        // empty video.
+        const deadline = Date.now() + WEBCODECS_PRIME_TIMEOUT_MS;
+        while (!source.session.frameReady() && Date.now() < deadline) {
+            const stats = source.session.stats();
+            if (stats.error) break;
+            await new Promise<void>((r) => setTimeout(r, 1));
+            source.pump();
+        }
+        const stats = source.session.stats();
+        if (!source.session.frameReady()) {
+            Logger.warn(LogCategory.SYSTEM,
+                `[VideoEngine] WebM decode produced no frame in ${WEBCODECS_PRIME_TIMEOUT_MS}ms ` +
+                `(packets=${stats.packetsPushed} error=${stats.error ?? "none"})`);
+            source.close();
+            return 0;
+        }
+        const jsHandle = this.nextJsHandle++;
+        this.wcSessions.set(jsHandle, entry);
+        Logger.log(LogCategory.SYSTEM,
+            `[VideoEngine] open(webm) → jsHandle=${jsHandle} ${source.track.width}x${source.track.height} ` +
+            `fps=${source.fps.toFixed(2)} frames≈${source.frameCount} codec="${source.track.codecId}" ` +
+            `format=${stats.nativeFormat} ringCap=${stats.ringCapacity} ` +
+            `audio=${source.audioTrack ? `${source.audioTrack.codecId} (NOT decoded on this backend)` : "none"}`);
+        return jsHandle;
+    }
+
+    private _webCodecsInfo(wc: WebCodecsEntry): VideoInfo {
+        const s = wc.session;
+        return {
+            width: s.width,
+            height: s.height,
+            frameCount: s.frameCount,
+            currentFrame: s.currentFrameIndex(),
+            fps: s.fps,
+            // Audio is not decoded on this backend; reporting none is what keeps a consumer on
+            // its frame/virtual-time clock instead of waiting on a reference clock that will
+            // never tick.
+            hasAudio: false,
+            hasPal8: false,
+            sampleRate: 0,
+            channels: 0,
+            codecName: wc.codecName,
+            codecId: 0,
+            fourCC: "",
+            pixFmt: -1,
+        };
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────

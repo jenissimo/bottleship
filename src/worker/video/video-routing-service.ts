@@ -329,6 +329,10 @@ export class VideoRoutingService {
         if (session.hasAppManagedSink) return true;
         if (session.targetHint.kind === "ddraw_surface" && session.targetHint.valid) return true;
         if (session.targetHint.kind === "glide_lfb" && session.targetHint.valid) return true;
+        // A VALID app_buffer is one the guest itself uploads (a D3D9 LockRect staging
+        // buffer, a GPU-backed bitmap texture). The invalid case — a bare CPU buffer under
+        // a GPU presenter — is the Morrowind-Bink shape this deliberately keeps distrusting.
+        if (session.targetHint.kind === "app_buffer" && session.targetHint.valid) return true;
         return false;
     }
 

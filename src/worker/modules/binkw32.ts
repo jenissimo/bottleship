@@ -26,6 +26,7 @@ import { CTRL_PLAY_CURSOR, CTRL_BUFFER_BYTES, CTRL_BLOCK_ALIGN, CTRL_SAMPLE_RATE
 import { DirectDrawSurfaceObject, DirectDrawSurfaceState, isRenderSurface, type BitmapTextureSurface } from "./ddraw/com-objects";
 import { setAuthorityCpu } from "./ddraw/surface-sync";
 import { resolveD3D8TextureSurface } from "./d3d8/shared-state";
+import { resolveD3D9LockedTextureTarget } from "./d3d9/shared-state";
 import { readAnsiFromGuest } from "./codepage-utils";
 import { Mem } from "../core/memory/mem-accessor";
 import { overlapsThunkCode } from "../core/memory/address-guard";
@@ -39,6 +40,67 @@ import { BinkStructLayout, BINK_LAYOUT_DEFAULT, binkLayoutFor, selectBinkLayout 
 // populated header.  Allocate generously and zero-fill so all pointer fields
 // are NULL and all counts are 0 — prevents games from dereferencing garbage.
 const BINK_HANDLE_SIZE = 2048;
+
+/**
+ * BINKSURFACE* — the destination pixel format, named by the GAME in the low nibble
+ * (BINKSURFACEMASK) of the `flags` argument to BinkCopyToBuffer/BinkCopyToBufferRect.
+ *
+ * This is the only authoritative source for the format: the destination is a bare
+ * pointer + pitch, so nothing about its layout can be derived, and a title that never
+ * calls BinkDDSurfaceType/BinkBufferOpen declares its format here and nowhere else.
+ * Guessing bytes-per-pixel from `pitch / width` is a fallback for the flags==8P case
+ * only (see binkSurfaceFromFlags).
+ */
+const enum BinkSurface {
+    P8       = 0,   // 8-bit palette indices
+    BGR24    = 1,   // BINKSURFACE24
+    RGB24    = 2,   // BINKSURFACE24R
+    BGRA32   = 3,   // BINKSURFACE32
+    RGBA32   = 4,   // BINKSURFACE32R
+    BGRA32A  = 5,   // BINKSURFACE32A
+    RGBA32A  = 6,   // BINKSURFACE32RA
+    ARGB4444 = 7,
+    ARGB1555 = 8,   // BINKSURFACE5551
+    XRGB1555 = 9,   // BINKSURFACE555
+    RGB565   = 10,
+    RGB655   = 11,
+    RGB664   = 12,
+    YUY2     = 13,
+    UYVY     = 14,
+    YV12     = 15,
+}
+const BINKSURFACE_MASK = 0xF;
+
+/** Bytes per pixel per BINKSURFACE type; 0 = a packed/planar YUV we do not emit. */
+const BINK_SURFACE_BPP: readonly number[] = [1, 3, 3, 4, 4, 4, 4, 2, 2, 2, 2, 2, 2, 0, 0, 0];
+
+function binkSurfaceBpp(surf: BinkSurface): number {
+    return BINK_SURFACE_BPP[surf] || 4;
+}
+
+/**
+ * Destination format the game declared, or -1 when it declared nothing usable.
+ *
+ * BINKSURFACE8P is 0, which is indistinguishable from "passed no flags at all" — and
+ * our BinkDDSurfaceType hands back 0 precisely because we cannot know the caller's SDK
+ * constants — so 0 stays with the pitch/surface heuristic rather than forcing 8bpp
+ * palettized output. The YUV types have no BGRA-sourced packer here.
+ */
+function binkSurfaceFromFlags(flags: number): BinkSurface | -1 {
+    const surf = (flags & BINKSURFACE_MASK) as BinkSurface;
+    if (surf === BinkSurface.P8) return -1;
+    return BINK_SURFACE_BPP[surf] > 0 ? surf : -1;
+}
+
+/** The BINKSURFACE type the legacy bytes-per-pixel heuristic stands for. */
+function binkSurfaceFromBpp(bpp: number): BinkSurface {
+    switch (bpp) {
+        case 1:  return BinkSurface.P8;
+        case 2:  return BinkSurface.RGB565;
+        case 3:  return BinkSurface.BGR24;
+        default: return BinkSurface.BGRA32;
+    }
+}
 
 /**
  * Detect destination bytes-per-pixel from pitch and destination row width in pixels.
@@ -71,58 +133,97 @@ function isGpuVideoPresenterActive(): boolean {
     return !!System.getInstance().services.render.getActive()?.suppressGdiOverlay;
 }
 
+/** Pack one BGRA pixel into the 16-bit layout `surf` names. */
+function pack16(surf: BinkSurface, b: number, g: number, r: number, a: number): number {
+    switch (surf) {
+        case BinkSurface.ARGB4444: return ((a & 0xF0) << 8) | ((r & 0xF0) << 4) | (g & 0xF0) | (b >> 4);
+        case BinkSurface.ARGB1555: return (a >= 0x80 ? 0x8000 : 0) | ((r & 0xF8) << 7) | ((g & 0xF8) << 2) | (b >> 3);
+        case BinkSurface.XRGB1555: return ((r & 0xF8) << 7) | ((g & 0xF8) << 2) | (b >> 3);
+        case BinkSurface.RGB655:   return ((r & 0xFC) << 8) | ((g & 0xF8) << 2) | (b >> 3);
+        case BinkSurface.RGB664:   return ((r & 0xFC) << 8) | ((g & 0xFC) << 2) | (b >> 4);
+        default:                   return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3); // RGB565
+    }
+}
+
 /**
- * Copy one row of decoded 32bpp pixels to a destination with the given bpp.
- * BGRA byte order: [B, G, R, A]. As little-endian u32: A<<24 | R<<16 | G<<8 | B.
+ * Copy one row of decoded pixels into the destination format the game declared.
+ * The decoder emits BGRA: [B, G, R, A], i.e. little-endian u32 A<<24|R<<16|G<<8|B.
  *
- * For 16bpp: uses Uint32Array/Uint16Array views for ~3-5x speedup over byte-level.
- * For 32bpp: direct memcpy (already in native BGRA order for DDraw).
+ * The 16bpp packers use Uint32Array/Uint16Array views where alignment allows
+ * (~3-5x over byte-at-a-time); BINKSURFACE32 is already native DDraw order (memcpy).
  */
 function copyDecodedRow(
     src: Uint8Array, srcOff: number,
     dst: Uint8Array, dstOff: number,
-    width: number, destBpp: number,
+    width: number, surf: BinkSurface,
 ): void {
-    if (destBpp === 1) {
-        // 8-bit: BGRA → luminance as palette index (rough approximation)
-        for (let x = 0; x < width; x++) {
-            const si = srcOff + x * 4;
-            dst[dstOff + x] = (src[si + 2] * 77 + src[si + 1] * 150 + src[si] * 29) >> 8;
-        }
-    } else if (destBpp === 2) {
-        // BGRA → RGB565 via typed array views (bulk u32 read + u16 write)
-        const srcAbs = src.byteOffset + srcOff;
-        const dstAbs = dst.byteOffset + dstOff;
-        if ((srcAbs & 3) === 0 && (dstAbs & 1) === 0) {
-            const src32 = new Uint32Array(src.buffer, srcAbs, width);
-            const dst16 = new Uint16Array(dst.buffer, dstAbs, width);
-            for (let x = 0; x < width; x++) {
-                const px = src32[x];
-                // BGRA u32: A<<24|R<<16|G<<8|B → RGB565
-                dst16[x] = ((px & 0x00F80000) >>> 8) | ((px & 0x0000FC00) >> 5) | ((px & 0x000000F8) >> 3);
-            }
-        } else {
-            // Fallback for rare unaligned destinations
+    switch (surf) {
+        case BinkSurface.P8:
+            // BGRA → luminance as palette index (rough approximation)
             for (let x = 0; x < width; x++) {
                 const si = srcOff + x * 4;
-                const b0 = src[si], b1 = src[si + 1], b2 = src[si + 2];
-                const rgb565 = ((b2 >> 3) << 11) | ((b1 >> 2) << 5) | (b0 >> 3);
-                const di = dstOff + x * 2;
-                dst[di]     = rgb565 & 0xFF;
-                dst[di + 1] = (rgb565 >> 8) & 0xFF;
+                dst[dstOff + x] = (src[si + 2] * 77 + src[si + 1] * 150 + src[si] * 29) >> 8;
             }
+            return;
+
+        case BinkSurface.BGR24:
+            for (let x = 0; x < width; x++) {
+                const si = srcOff + x * 4;
+                const di = dstOff + x * 3;
+                dst[di] = src[si];
+                dst[di + 1] = src[si + 1];
+                dst[di + 2] = src[si + 2];
+            }
+            return;
+
+        case BinkSurface.RGB24:
+            for (let x = 0; x < width; x++) {
+                const si = srcOff + x * 4;
+                const di = dstOff + x * 3;
+                dst[di] = src[si + 2];
+                dst[di + 1] = src[si + 1];
+                dst[di + 2] = src[si];
+            }
+            return;
+
+        case BinkSurface.RGBA32:
+        case BinkSurface.RGBA32A:
+            for (let x = 0; x < width; x++) {
+                const si = srcOff + x * 4;
+                const di = dstOff + x * 4;
+                dst[di] = src[si + 2];
+                dst[di + 1] = src[si + 1];
+                dst[di + 2] = src[si];
+                dst[di + 3] = src[si + 3];
+            }
+            return;
+
+        case BinkSurface.BGRA32:
+        case BinkSurface.BGRA32A:
+            dst.set(src.subarray(srcOff, srcOff + width * 4), dstOff);
+            return;
+
+        default: {
+            const srcAbs = src.byteOffset + srcOff;
+            const dstAbs = dst.byteOffset + dstOff;
+            if ((srcAbs & 3) === 0 && (dstAbs & 1) === 0) {
+                const src32 = new Uint32Array(src.buffer, srcAbs, width);
+                const dst16 = new Uint16Array(dst.buffer, dstAbs, width);
+                for (let x = 0; x < width; x++) {
+                    const px = src32[x];
+                    dst16[x] = pack16(surf, px & 0xFF, (px >>> 8) & 0xFF, (px >>> 16) & 0xFF, (px >>> 24) & 0xFF);
+                }
+            } else {
+                for (let x = 0; x < width; x++) {
+                    const si = srcOff + x * 4;
+                    const v = pack16(surf, src[si], src[si + 1], src[si + 2], src[si + 3]);
+                    const di = dstOff + x * 2;
+                    dst[di]     = v & 0xFF;
+                    dst[di + 1] = (v >> 8) & 0xFF;
+                }
+            }
+            return;
         }
-    } else if (destBpp === 3) {
-        for (let x = 0; x < width; x++) {
-            const si = srcOff + x * 4;
-            const di = dstOff + x * 3;
-            dst[di] = src[si];
-            dst[di + 1] = src[si + 1];
-            dst[di + 2] = src[si + 2];
-        }
-    } else {
-        const bytes = width * 4;
-        dst.set(src.subarray(srcOff, srcOff + bytes), dstOff);
     }
 }
 
@@ -153,6 +254,10 @@ interface BinkSession {
     destBpp: number;
     explicitDdrawSurface: DirectDrawSurfaceState | null;
     explicitGlideSurfacePtr: number;
+    /** Geometry of the D3D9 texture lock the last copy destination fell inside, if any.
+     *  Sampled at COPY time — the guest unlocks right after, and by the time the sink is
+     *  chosen the lock is gone. */
+    d3d9LockTarget: { pitch: number; width: number; height: number } | null;
     lastCopyAtMs: number;
     hasBufferApiHint: boolean;
     hasPointerFault: boolean;
@@ -278,6 +383,10 @@ export class BinkW32 implements IModule {
 
     private updateExplicitSinkHints(s: BinkSession, surfacePtr: number): void {
         const bitmap = this.resolveBitmapTextureTarget(surfacePtr);
+        if (!bitmap) {
+            const locked = resolveD3D9LockedTextureTarget(surfacePtr);
+            if (locked) s.d3d9LockTarget = locked;
+        }
         s.explicitDdrawSurface = bitmap;
         if (bitmap && isRenderSurface(bitmap)) {
             setAuthorityCpu(bitmap);
@@ -293,17 +402,22 @@ export class BinkW32 implements IModule {
         destX: number,
         destY: number,
         storedBpp: number,
-    ): { destBpp: number; copyWidth: number; rows: number; destSurface: BitmapTextureSurface | null } {
+        flags: number,
+    ): { surf: BinkSurface; destBpp: number; copyWidth: number; rows: number; destSurface: BitmapTextureSurface | null } {
         const destSurface = this.resolveBitmapTextureTarget(destPtr);
+        const declared = binkSurfaceFromFlags(flags);
         const destRowPixels = inferDestRowPixels(pitch, storedBpp, destSurface);
-        const destBpp = storedBpp || detectDestBpp(pitch, destRowPixels || s.width);
+        const surf = declared !== -1
+            ? declared
+            : binkSurfaceFromBpp(storedBpp || detectDestBpp(pitch, destRowPixels || s.width));
+        const destBpp = binkSurfaceBpp(surf);
         const maxWidth = destRowPixels > 0 ? Math.max(0, destRowPixels - destX) : s.width;
         const maxHeight = destSurface
             ? Math.max(0, destSurface.height - destY)
             : Math.max(0, destH - destY);
         const copyWidth = Math.min(s.width, maxWidth);
         const rows = Math.min(s.height, destH - destY, maxHeight);
-        return { destBpp, copyWidth, rows, destSurface };
+        return { surf, destBpp, copyWidth, rows, destSurface };
     }
 
     private hasAppManagedSink(s: BinkSession): boolean {
@@ -341,13 +455,20 @@ export class BinkW32 implements IModule {
         if (s.destPtr || s.hasBufferApiHint) {
             const gpuPresenter = isGpuVideoPresenterActive();
             const resolvedSurface = s.destPtr ? this.resolveBitmapTextureTarget(s.destPtr) : null;
+            // A D3D9 LockRect staging buffer is uploaded by the guest's own UnlockRect, so
+            // it stays visible under a GPU presenter — without this the sink falls back to
+            // the video overlay, which presents the movie OVER the game's own frame and
+            // hides the UI a menu draws on top of its background loop.
+            const lockedTexture = resolvedSurface
+                ? null
+                : (s.destPtr ? resolveD3D9LockedTextureTarget(s.destPtr) : null) ?? s.d3d9LockTarget;
             return {
                 kind: "app_buffer",
-                valid: !gpuPresenter || !!resolvedSurface,
+                valid: !gpuPresenter || !!resolvedSurface || !!lockedTexture,
                 surfacePtr: s.destPtr || undefined,
-                pitch: s.destPitch || undefined,
-                width: resolvedSurface?.width ?? s.width,
-                height: resolvedSurface?.height ?? s.height,
+                pitch: s.destPitch || lockedTexture?.pitch || undefined,
+                width: resolvedSurface?.width ?? lockedTexture?.width ?? s.width,
+                height: resolvedSurface?.height ?? lockedTexture?.height ?? s.height,
             };
         }
         return { kind: "none", valid: false };
@@ -863,6 +984,7 @@ export class BinkW32 implements IModule {
                     destBpp: 0,
                     explicitDdrawSurface: null,
                     explicitGlideSurfacePtr: 0,
+                    d3d9LockTarget: null,
                     lastCopyAtMs: 0,
                     hasBufferApiHint: false,
                     hasPointerFault: false,
@@ -943,14 +1065,14 @@ export class BinkW32 implements IModule {
             if (!s || !destPtr) return 0;
             this._logApi(bink, "CopyToBuffer", `dest=0x${destPtr.toString(16)} pitch=${pitch}`);
 
-            const { destBpp, copyWidth, rows, destSurface } = this.getCopyGeometry(
-                s, destPtr, pitch, destH, destX, destY, this.lastSurfaceBpp,
+            const { surf, destBpp, copyWidth, rows, destSurface } = this.getCopyGeometry(
+                s, destPtr, pitch, destH, destX, destY, this.lastSurfaceBpp, rawFlags,
             );
             if (!s.loggedCopy) {
                 s.loggedCopy = true;
-                console.log(`[BINK] BinkCopyToBuffer: bink=0x${bink.toString(16)} dest=0x${destPtr.toString(16)} ` +
+                Logger.log(LogCategory.SYSTEM, `[BINK] BinkCopyToBuffer: bink=0x${bink.toString(16)} dest=0x${destPtr.toString(16)} ` +
                     `pitch=${pitch} destH=${destH} destX=${destX} destY=${destY} flags=0x${rawFlags.toString(16)} ` +
-                    `video=${s.width}x${s.height} copy=${copyWidth}x${rows} destBpp=${destBpp} ` +
+                    `video=${s.width}x${s.height} copy=${copyWidth}x${rows} surf=${surf} destBpp=${destBpp} ` +
                     `storedBpp=${this.lastSurfaceBpp} d3d8=${destSurface ? `${destSurface.width}x${destSurface.height}` : "no"}`);
             }
 
@@ -981,7 +1103,7 @@ export class BinkW32 implements IModule {
             };
 
             // 8bpp: use PAL8 indices directly if available
-            if (destBpp === 1) {
+            if (surf === BinkSurface.P8) {
                 const pal8 = videoEngine.getFramePal8(s.engineHandle);
                 if (pal8) {
                     for (let row = 0; row < rows; row++) {
@@ -1015,8 +1137,9 @@ export class BinkW32 implements IModule {
                 return 0;
             }
 
-            // 16bpp: prefer WASM-side RGB565 (memcpy per row, ~8-15x faster)
-            if (destBpp === 2) {
+            // RGB565 only: the WASM-side packer emits exactly that layout (memcpy per row,
+            // ~8-15x faster). Every other 16bpp BINKSURFACE goes through pack16.
+            if (surf === BinkSurface.RGB565) {
                 const rgb565 = videoEngine.getFrameRgb565(s.engineHandle);
                 if (rgb565) {
                     const srcPitch = s.width * 2;
@@ -1035,7 +1158,6 @@ export class BinkW32 implements IModule {
                 // Fallthrough: use JS-side typed array conversion (Tier 1)
             }
 
-            // 16bpp (fallback) / 32bpp: use BGRA frame
             const bgra = videoEngine.getFrameBgra(s.engineHandle);
             if (!bgra) return 0;
 
@@ -1044,7 +1166,7 @@ export class BinkW32 implements IModule {
             for (let row = 0; row < rows; row++) {
                 const srcOff = row * srcPitch;
                 const dstOff = destPtr + (destY + row) * pitch + destX * destBpp;
-                copyDecodedRow(bgra, srcOff, rowScratch, 0, copyWidth, destBpp);
+                copyDecodedRow(bgra, srcOff, rowScratch, 0, copyWidth, surf);
                 if (!this.writeBytesChecked(dstOff, rowScratch)) {
                     markPointerFault();
                     return 0;
@@ -1066,6 +1188,7 @@ export class BinkW32 implements IModule {
             const srcT    = args[7];
             const srcW    = args[8];
             const srcH2   = args[9];
+            const rawFlags = args[10];
 
             const s = this.sessions.get(bink);
             if (!s || !destPtr) return 0;
@@ -1075,7 +1198,22 @@ export class BinkW32 implements IModule {
             const clipW = Math.min(srcW, s.width - srcL);
             if (clipH <= 0 || clipW <= 0) return 0;
 
-            const destBpp = this.lastSurfaceBpp || detectDestBpp(pitch, clipW || inferDestRowPixels(pitch, this.lastSurfaceBpp, this.resolveBitmapTextureTarget(destPtr)));
+            const declared = binkSurfaceFromFlags(rawFlags);
+            const destSurface = this.resolveBitmapTextureTarget(destPtr);
+            // The heuristic needs the DESTINATION row width; clipW is the source rect's.
+            const surf = declared !== -1
+                ? declared
+                : binkSurfaceFromBpp(
+                    this.lastSurfaceBpp
+                    || detectDestBpp(pitch, inferDestRowPixels(pitch, this.lastSurfaceBpp, destSurface) || s.width));
+            const destBpp = binkSurfaceBpp(surf);
+            if (!s.loggedCopy) {
+                s.loggedCopy = true;
+                Logger.log(LogCategory.SYSTEM, `[BINK] BinkCopyToBufferRect: bink=0x${bink.toString(16)} dest=0x${destPtr.toString(16)} ` +
+                    `pitch=${pitch} destH=${destH} destX=${destX} destY=${destY} flags=0x${rawFlags.toString(16)} ` +
+                    `video=${s.width}x${s.height} copy=${clipW}x${clipH} surf=${surf} destBpp=${destBpp} ` +
+                    `storedBpp=${this.lastSurfaceBpp} d3d8=${destSurface ? `${destSurface.width}x${destSurface.height}` : "no"}`);
+            }
             s.destPtr = destPtr;
             s.destPitch = pitch;
             s.destHeight = destH;
@@ -1100,8 +1238,8 @@ export class BinkW32 implements IModule {
                 s.explicitGlideSurfacePtr = 0;
             };
 
-            // 16bpp: prefer WASM-side RGB565 (memcpy per row)
-            if (destBpp === 2) {
+            // RGB565 only — see BinkCopyToBuffer.
+            if (surf === BinkSurface.RGB565) {
                 const rgb565 = videoEngine.getFrameRgb565(s.engineHandle);
                 if (rgb565) {
                     const fullSrcPitch = s.width * 2;
@@ -1126,7 +1264,7 @@ export class BinkW32 implements IModule {
             for (let row = 0; row < clipH; row++) {
                 const srcOff = (srcT + row) * fullSrcPitch + srcL * 4;
                 const dstOff = destPtr + (destY + row) * pitch + destX * destBpp;
-                copyDecodedRow(bgra, srcOff, rowScratch, 0, clipW, destBpp);
+                copyDecodedRow(bgra, srcOff, rowScratch, 0, clipW, surf);
                 if (!this.writeBytesChecked(dstOff, rowScratch)) {
                     markPointerFault();
                     return 0;

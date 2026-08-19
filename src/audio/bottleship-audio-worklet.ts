@@ -123,6 +123,13 @@ type RingBufferSource = {
   id: number;
   ctrl: Int32Array;     // SAB control block view (32 Int32 entries)
   data: DataView;       // SAB data region view (includes ctrl block — use CTRL_BLOCK_BYTES offset)
+  // The same SAB through width-typed views. The mixer reads two samples per output
+  // sample per channel; through `data` that is two DataView calls, through these it is
+  // two loads. Built once at registration (a per-block view would allocate inside the
+  // render quantum) and used only when the frame layout is aligned for the width.
+  u8: Uint8Array;
+  i16: Int16Array;
+  f32: Float32Array;
   position: number;     // Fractional frame position (float)
   loopsCompleted: number;
 };
@@ -188,6 +195,11 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
           id,
           ctrl: new Int32Array(sab, 0, 32),
           data: new DataView(sab),
+          // Explicit lengths: a SAB whose byteLength is not a multiple of the element
+          // size would make the 1-argument constructor throw.
+          u8: new Uint8Array(sab),
+          i16: new Int16Array(sab, 0, sab.byteLength >> 1),
+          f32: new Float32Array(sab, 0, sab.byteLength >> 2),
           position: 0,
           loopsCompleted: 0,
         });
@@ -459,7 +471,12 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
       // Effective data size: for circular streaming (e.g. video audio), respect
       // dataLength until the ring buffer is fully populated to avoid reading
       // unwritten zeros as silence.
-      const effectiveBytes = Math.min(dataLength > 0 ? dataLength : bufferBytes, bufferBytes);
+      // Clamped to what the SAB actually holds: bufferBytes/dataLength come straight out of
+      // the ctrl block, and a bad one would send every read past the end. On the DataView
+      // path that is a RangeError thrown inside process(), which does not surface as an
+      // exception — it permanently disables the processor, i.e. silence for the session.
+      const declaredBytes = Math.min(dataLength > 0 ? dataLength : bufferBytes, bufferBytes);
+      const effectiveBytes = Math.min(declaredBytes, Math.max(0, rb.u8.length - CTRL_BLOCK_BYTES));
       if (effectiveBytes === 0) continue;
       const totalFrames = Math.floor(effectiveBytes / blockAlign);
       if (totalFrames === 0) continue;
@@ -653,6 +670,21 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
 
       const isStreaming = (flags & FLAG_STREAMING) !== 0;
       const dataView = rb.data;
+      const bytesPerSample = bitsPerSample >> 3;
+      // Which typed view can address this source's samples. CTRL_BLOCK_BYTES is a
+      // multiple of 4, so only blockAlign can misalign a frame; a layout that no view
+      // can address (or that runs past the SAB) stays on the DataView path, whose
+      // out-of-range behaviour is a throw rather than a silent NaN.
+      let fastRead = bitsPerSample === 8 ? 1
+        : bitsPerSample === 16 && (blockAlign & 1) === 0 ? 2
+        : bitsPerSample === 32 && (blockAlign & 3) === 0 ? 3
+        : 0;
+      if (CTRL_BLOCK_BYTES + (totalFrames - 1) * blockAlign + channels * bytesPerSample > rb.u8.length) {
+        fastRead = 0;
+      }
+      const u8 = rb.u8;
+      const i16 = rb.i16;
+      const f32 = rb.f32;
       let pos = rb.position;
       let loopsCompleted = rb.loopsCompleted;
       let alive = true;
@@ -735,8 +767,7 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
         for (let ch = 0; ch < outChannels; ch++) {
           const srcCh = Math.min(ch, channels - 1);
           // Current sample
-          const byteOff = CTRL_BLOCK_BYTES + (wrappedFrame * blockAlign) + (srcCh * (bitsPerSample >> 3));
-          const s0 = this.readSampleFloat(dataView, byteOff, bitsPerSample);
+          const byteOff = CTRL_BLOCK_BYTES + (wrappedFrame * blockAlign) + (srcCh * bytesPerSample);
 
           // Next sample for interpolation
           let nextFrame = wrappedFrame + 1;
@@ -745,8 +776,22 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
           } else {
             nextFrame = Math.min(nextFrame, totalFrames - 1);
           }
-          const byteOffNext = CTRL_BLOCK_BYTES + (nextFrame * blockAlign) + (srcCh * (bitsPerSample >> 3));
-          const s1 = this.readSampleFloat(dataView, byteOffNext, bitsPerSample);
+          const byteOffNext = CTRL_BLOCK_BYTES + (nextFrame * blockAlign) + (srcCh * bytesPerSample);
+
+          let s0: number, s1: number;
+          if (fastRead === 2) {
+            s0 = i16[byteOff >> 1] / 32768;
+            s1 = i16[byteOffNext >> 1] / 32768;
+          } else if (fastRead === 1) {
+            s0 = (u8[byteOff] - 128) / 128;
+            s1 = (u8[byteOffNext] - 128) / 128;
+          } else if (fastRead === 3) {
+            s0 = f32[byteOff >> 2];
+            s1 = f32[byteOffNext >> 2];
+          } else {
+            s0 = this.readSampleFloat(dataView, byteOff, bitsPerSample);
+            s1 = this.readSampleFloat(dataView, byteOffNext, bitsPerSample);
+          }
 
           const sample = s0 * (1 - frac) + s1 * frac;
           let gain: number;

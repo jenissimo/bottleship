@@ -23,6 +23,7 @@ import { leaseRegistry } from "../core/memory/lease-registry";
 import { memoryEventBuffer } from "../core/memory/memory-event-buffer";
 import { THREAD_STATE_NAMES, WAIT_REASON_NAMES } from "../core/scheduler/types";
 import { videoEngine } from "../../video/video-engine";
+import { getFfmpegHleStats } from "../modules/ffmpeg/native-patch";
 import { Logger, LogCategory } from "../core/logger";
 
 /* ───────────────────────── low-level access helpers ───────────────────────── */
@@ -115,6 +116,13 @@ export function serializeThreads(): unknown {
                 stateName: (THREAD_STATE_NAMES as Record<number, string>)[t.state] ?? String(t.state),
                 waitReason: t.waitInfo?.reason ?? null,
                 waitReasonName: t.waitInfo?.reason != null ? ((WAIT_REASON_NAMES as Record<number, string>)[t.waitInfo.reason] ?? null) : null,
+                // WHAT the thread is blocked on, not just that it is blocked — a deadlock
+                // reads as "everyone WAITING" without it, and the handles are what pair a
+                // stuck waiter with whoever should have signalled.
+                waitHandles: (t.waitInfo?.handles ?? []).map((h: number) => u32(h)),
+                waitAll: t.waitInfo?.waitAll ?? false,
+                waitCsAddress: u32(t.waitInfo?.csAddress ?? 0),
+                waitTimeoutTimerId: u32(t.waitInfo?.timeoutTimerId ?? 0),
                 eip,
                 eipSym: symbolize(eip),
                 esp,
@@ -282,6 +290,9 @@ export function serializeVideo(): unknown {
     return {
         loaded: !!videoEngine?.isLoaded?.(),
         routing: routing?.getDebugInfo?.() ?? null,
+        // Separates "we replaced the guest's ffmpeg decode" from "we declined and it is still
+        // running its own": `served` counts frames we published, `declined` calls handed back.
+        ffmpegHle: getFfmpegHleStats(),
     };
 }
 
