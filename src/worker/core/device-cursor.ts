@@ -21,6 +21,7 @@
  */
 import { System } from "./system";
 import type { HostCursorImage } from "./system";
+import type { DeviceCursorKind } from "./pointer-policy";
 import { syncHostCursorToGuestState, warpGuestCursorTo } from "../modules/user32/shared-state";
 
 /** SM_CXCURSOR / SM_CYCURSOR as user32 reports them (modules/user32/system.ts). */
@@ -111,6 +112,14 @@ export function isDeviceCursorVisible(): boolean {
 export function getActiveDeviceCursor(): HostCursorImage | null {
     const cursor = cursors.get(activeDevice);
     return cursor?.visible ? cursor.image : null;
+}
+
+/** How the drawn device cursor is realised — the two kinds answer differently to anything
+ *  that hides the OS pointer (see core/pointer-policy). */
+export function getActiveDeviceCursorKind(): DeviceCursorKind {
+    const cursor = cursors.get(activeDevice);
+    if (!cursor?.visible || !cursor.image) return "none";
+    return cursor.hardware ? "hardware" : "software";
 }
 
 /** Where a SOFTWARE device cursor must be drawn: the OS pointer never followed it, so the

@@ -22,6 +22,7 @@ import {
 } from "./dinput-action-helpers";
 import { DIK_TO_VK, vkToDik } from "./dinput-vk-dik";
 import { resetLosableDevices, trackLosableDevice, untrackLosableDevice } from "./device-presence";
+import { clearExclusiveMouseOwners, setExclusiveMouseOwner } from "../../core/pointer-policy";
 import { GUEST_INPUT_FLAG } from "../../../input/sab-layout";
 import { DInputNotifyRegistry, DI_OK, DIERR_INVALIDPARAM } from "./dinput-notify";
 
@@ -334,6 +335,9 @@ class DirectInputDeviceObject extends BaseComObject {
 
     protected destroy(): void {
         untrackLosableDevice(this);
+        // A device released while still acquired ends its acquisition; without this the
+        // pointer stays suppressed for the rest of the run.
+        setExclusiveMouseOwner(this, false);
         liveDInputDevices.delete(this);
         notifyRegistry.forget(this);
         Logger.verbose(LogCategory.COM, "DirectInputDeviceObject destroyed");
@@ -796,10 +800,10 @@ export class DInput implements IModule {
                 device.acquired = true;
                 device.inputLost = false; // re-Acquire is how an app clears DIERR_INPUTLOST
             }
-            // Exclusive-mode mouse acquire captures the cursor (relative mode) — faithful
-            // Windows hides+confines it here without the app calling ShowCursor/ClipCursor.
-            if (device && device.deviceType === "mouse" && device.exclusive) {
-                System.getInstance().requestHostMouseCapture(true);
+            // An acquired exclusive-mode mouse owns the pointer until something ends the
+            // acquisition; a NONEXCLUSIVE acquire must clear any claim this device still holds.
+            if (device && device.deviceType === "mouse") {
+                setExclusiveMouseOwner(device, device.exclusive);
             }
             if (device && (device.deviceType === "joystick" || device.deviceType === "gamepad")) {
                 System.getInstance().inputManager.noteGuestGamepadRead();
@@ -857,9 +861,9 @@ export class DInput implements IModule {
         this.exports["IDirectInputDeviceA_Unacquire"] = (ctx, mem, args) => {
             const device = this.getDevice(args[0]);
             if (device) device.acquired = false;
-            if (device && device.deviceType === "mouse" && device.exclusive) {
-                System.getInstance().requestHostMouseCapture(false);
-            }
+            // Released regardless of the current cooperative level: a SetCooperativeLevel
+            // between Acquire and Unacquire must not be able to strand the claim.
+            if (device && device.deviceType === "mouse") setExclusiveMouseOwner(device, false);
             Logger.verbose(LogCategory.SYSTEM, `IDirectInputDeviceA_Unacquire: this=0x${args[0].toString(16)}`);
             return DI_OK;
         };
@@ -896,8 +900,8 @@ export class DInput implements IModule {
                 device.exclusive = (dwFlags & DISCL_EXCLUSIVE) !== 0;
                 // If the app changes cooperative level while already acquired, keep host
                 // capture in sync with the new exclusivity.
-                if (device.acquired && device.deviceType === "mouse") {
-                    System.getInstance().requestHostMouseCapture(device.exclusive);
+                if (device.deviceType === "mouse") {
+                    setExclusiveMouseOwner(device, device.acquired && device.exclusive);
                 }
             }
             Logger.log(LogCategory.SYSTEM, `IDirectInputDeviceA_SetCooperativeLevel: this=0x${thisPtr.toString(16)} hwnd=0x${hwnd.toString(16)} flags=0x${dwFlags.toString(16)} type=${device?.deviceType ?? "null"} exclusive=${device?.exclusive ?? false}`);
@@ -2220,6 +2224,7 @@ export class DInput implements IModule {
         // recycled, so anything still tracked would signal an unrelated object / be
         // reported by the harness readout as a live device of the new process.
         notifyRegistry.reset();
+        clearExclusiveMouseOwners();
         liveDInputDevices.clear();
         if (this.dinputDataListener) {
             System.getInstance().inputManager.removeDInputDataListener(this.dinputDataListener);

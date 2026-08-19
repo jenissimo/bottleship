@@ -324,7 +324,19 @@ export class System {
             const base = clean(directory) || self.slice(0, self.lastIndexOf("\\") + 1);
             target = (base.endsWith("\\") ? base : base + "\\") + target.replace(/^\\+/, "");
         }
-        return target;
+        // Collapse "." / ".." and doubled separators the way Win32 canonicalizes a path
+        // before it opens the image. A launcher naming its child ".\setup.exe" is ordinary
+        // (Mafia's does), and an uncollapsed "C:\.\setup.exe" matches neither the running
+        // image nor a bundle entry — so the launch silently falls back to the manifest
+        // entrypoint, which for a self-launching game is the launcher again, forever.
+        const drive = /^[a-z]:/i.test(target) ? target.slice(0, 2) : "";
+        const parts: string[] = [];
+        for (const seg of target.slice(drive.length).split("\\")) {
+            if (!seg || seg === ".") continue;
+            if (seg === "..") parts.pop();
+            else parts.push(seg);
+        }
+        return `${drive}\\${parts.join("\\")}`;
     }
 
     /**
@@ -365,6 +377,8 @@ export class System {
     private hostCursorPositionState: string | null = null;
     private hostCursorWarpMode: ((active: boolean) => void) | null = null;
     private hostCursorWarpModeState = false;
+    private hostCursorClipSignal: ((active: boolean) => void) | null = null;
+    private hostCursorClipSignalState: boolean | null = null;
     private hostMouseCapture: ((capture: boolean) => void) | null = null;
     private hostMouseCaptureState: boolean | null = null;
     private hostWindowTitle: ((title: string) => void) | null = null;
@@ -767,6 +781,20 @@ export class System {
         }
     }
 
+    setHostCursorClipSignalCallback(callback: (active: boolean) => void): void {
+        this.hostCursorClipSignal = callback;
+    }
+
+    /**
+     * Confinement that means relative-mouse steering (see core/pointer-policy). The
+     * confinement itself we enforce ourselves — this is only the transport signal.
+     */
+    requestHostCursorClipSignal(active: boolean): void {
+        if (this.hostCursorClipSignalState === active) return;
+        this.hostCursorClipSignalState = active;
+        this.hostCursorClipSignal?.(active);
+    }
+
     /**
      * Forward the installed cursor's image to the host so it renders the guest's
      * pointer shape (real Windows: the system draws whatever SetCursor installed).
@@ -806,9 +834,8 @@ export class System {
 
     /**
      * Assert/release relative-mouse capture independently of ShowCursor/ClipCursor.
-     * Driven by DirectInput exclusive-mode mouse Acquire/Unacquire — on real Windows an
-     * exclusive-mode mouse acquisition implicitly hides and confines the cursor without the
-     * app touching ShowCursor, so this is a first-class pointer-lock trigger for the host.
+     * Transport only: the exclusive-DirectInput fact and the pointer suppression that
+     * comes with it are derived together in core/pointer-policy, the sole caller.
      */
     requestHostMouseCapture(capture: boolean): void {
         if (this.hostMouseCaptureState === capture) return;
@@ -914,6 +941,7 @@ export class System {
         this.hostCursorWarpModeState = false;
         this.hostCursorVisibleState = null;
         this.hostMouseCaptureState = null;
+        this.hostCursorClipSignalState = null;
         this.lastWindowTitleSkeleton = null;
 
         this.isExiting = false;

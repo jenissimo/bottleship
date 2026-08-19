@@ -1,7 +1,8 @@
 import { Logger, LogCategory } from "../../core/logger";
 import { System } from "../../core/system";
 import { EmulatorConfig } from "../../core/emulator-config-manager";
-import { getActiveDeviceCursor } from "../../core/device-cursor";
+import { getActiveDeviceCursor, getActiveDeviceCursorKind } from "../../core/device-cursor";
+import { resetPointerPolicy, setPointerClipped, setPointerVisibilityFacts, setPointerWarping } from "../../core/pointer-policy";
 import { IDC_ARROW, getSystemCursorHandle } from "./system-cursors";
 
 // Window storage
@@ -66,6 +67,9 @@ export interface WindowInfo {
     /** WM_SHOWWINDOW/WM_SIZE were delivered synchronously inside CreateWindowEx
      *  (Win32 order); the post-create path must not queue duplicates. */
     createSyncVisibleDelivered?: boolean;
+    /** The activation chain was SENT synchronously inside CreateWindowEx (Win32 activates a
+     *  window as it shows it); the post-create path must not queue it a second time. */
+    createSyncActivationDelivered?: boolean;
     /** False until WM_ACTIVATE is delivered (CreateDialog top-level); gates RDW_UPDATENOW paint. */
     activationDelivered?: boolean;
     /** True while WM_INITDIALOG callback is in flight (nested pump). */
@@ -643,7 +647,7 @@ export function getVirtualScreenRect(): CursorClipRect {
 
 export function setCursorClipRect(rect: CursorClipRect | null): void {
     cursorClipRect = rect;
-    publishCursorConfinementSignal();
+    setPointerClipped(rect !== null);
 }
 
 export function getCursorClipRect(): CursorClipRect | null {
@@ -666,19 +670,6 @@ export function clampToCursorClip(x: number, y: number): { x: number; y: number 
         x: Math.max(Math.min(x, clip.right - 1), clip.left),
         y: Math.max(Math.min(y, clip.bottom - 1), clip.top),
     };
-}
-
-// ClipCursor is confinement, NOT an intent to steer by motion: a windowed game that
-// clips to its own client rect is ordinary and keeps a visible pointer. What marks
-// relative-mouse emulation is confinement with a HIDDEN pointer, so that is what the
-// host is told — the confinement itself we enforce ourselves and it needs no transport.
-let lastPublishedClipSignal = false;
-
-function publishCursorConfinementSignal(): void {
-    const relative = cursorClipRect !== null && !isHostPointerShown();
-    if (relative === lastPublishedClipSignal) return;
-    lastPublishedClipSignal = relative;
-    self.postMessage({ type: "clip_cursor", clip: relative });
 }
 
 export function setCapture(hwnd: number): number {
@@ -799,24 +790,19 @@ export function isGuestCursorVisible(): boolean {
     return cursorDisplayCount >= 0 && currentCursorHandle !== 0;
 }
 
-/** Whether a pointer is drawn at all — the D3D device cursor outranks the Win32 one. */
-function isHostPointerShown(): boolean {
-    return !!getActiveDeviceCursor() || isGuestCursorVisible();
-}
-
 // Last cursor user object forwarded to the host — identity dedup (handles are
 // pool-reused, so dedup by handle value would go stale; see the ddraw
 // GetAttachedSurface cache for the same failure mode).
 let lastForwardedCursorImageObj: unknown = null;
 
 /**
- * Single sync point for the guest pointer → host: pushes visibility and the
- * installed shape. Real Windows draws whatever image SetCursor installed
- * whenever the cursor is visible — a game that renders its own pointer hides
- * the system one first (SetCursor(NULL) or ShowCursor to a negative count), so
- * a visible custom cursor means the HOST renders its image. Every cursor-state
- * mutator (SetCursor, ShowCursor, dialog forcing) must end here — do not
- * re-derive visibility at call sites.
+ * Single sync point for the guest pointer → host: pushes the visibility FACTS into
+ * core/pointer-policy (which owns whether a pointer is drawn at all) and forwards the
+ * installed shape. Real Windows draws whatever image SetCursor installed whenever the
+ * cursor is visible — a game that renders its own pointer hides the system one first
+ * (SetCursor(NULL) or ShowCursor to a negative count), so a visible custom cursor means
+ * the HOST renders its image. Every cursor-state mutator (SetCursor, ShowCursor, dialog
+ * forcing, the D3D device cursor) must end here — do not re-derive visibility at call sites.
  */
 export function syncHostCursorToGuestState(): void {
     const sys = System.getInstance();
@@ -824,18 +810,14 @@ export function syncHostCursorToGuestState(): void {
     // of the Win32 pointer: an app that enables it hides the Win32 one and still
     // expects a pointer, so while it is on it IS the pointer.
     const deviceCursor = getActiveDeviceCursor();
-    // Whether a pointer is drawn is half of the confinement signal (see
-    // publishCursorConfinementSignal), so re-derive it wherever visibility changes.
-    publishCursorConfinementSignal();
+    setPointerVisibilityFacts(isGuestCursorVisible(), getActiveDeviceCursorKind());
     if (deviceCursor) {
-        sys.requestHostCursorVisible(true);
         if (lastForwardedCursorImageObj !== deviceCursor) {
             lastForwardedCursorImageObj = deviceCursor;
             sys.requestHostCursorImage(deviceCursor);
         }
         return;
     }
-    sys.requestHostCursorVisible(isGuestCursorVisible());
     const obj = sys.resourceProvider.getUserObject?.(getCurrentCursorHandle());
     const image = (obj?.type === 'CURSOR'
         && obj.pixels instanceof Uint8Array
@@ -905,14 +887,14 @@ function noteCursorRecentre(fromX: number, fromY: number, toX: number, toY: numb
     while (recentreTimes.length > 0 && now - recentreTimes[0] >= RECENTRE_WINDOW_MS) recentreTimes.shift();
     if (!warpModeActive && recentreTimes.length >= RECENTRE_BURST_COUNT) {
         warpModeActive = true;
-        System.getInstance().requestHostCursorWarpMode(true);
+        setPointerWarping(true);
     }
     if (warpReleaseTimer) clearTimeout(warpReleaseTimer);
     warpReleaseTimer = setTimeout(() => {
         warpReleaseTimer = null;
         if (warpModeActive) {
             warpModeActive = false;
-            System.getInstance().requestHostCursorWarpMode(false);
+            setPointerWarping(false);
         }
     }, RECENTRE_RELEASE_MS);
 }
@@ -983,13 +965,13 @@ export function resetUser32SharedState(): void {
     windows.clear();
     cursorDisplayCount = 0;
     cursorClipRect = null;
-    lastPublishedClipSignal = false;
     currentCursorHandle = DEFAULT_CURSOR;
     lastForwardedCursorImageObj = null;
     recentreTimes = [];
     lastWarpTarget = null;
     warpModeActive = false;
     if (warpReleaseTimer) { clearTimeout(warpReleaseTimer); warpReleaseTimer = null; }
+    resetPointerPolicy();
     buttonCheckStates.clear();
     listControlStates.clear();
     trackbarStates.clear();

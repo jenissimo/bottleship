@@ -367,7 +367,9 @@ export class WindowManager {
                 this.activeHwnd = successor;
                 this.foregroundHwnd = successor;
                 this.focusHwnd = successor;
-                this.postActivationChain(successor, 0); // prev is gone; no deactivation target
+                // prev is gone; no deactivation target, and no application boundary:
+                // the destroyed window and its successor are both ours.
+                this.postActivationChain(successor, 0);
             } else {
                 if (wasActive) this.activeHwnd = 0;
                 if (wasForeground) this.foregroundHwnd = 0;
@@ -692,19 +694,24 @@ export class WindowManager {
 
     /**
      * Post the full activation chain to a newly activated top-level window (and the
-     * deactivation chain to prevHwnd if any). Same posting style as activation-messages.ts;
-     * used by the destroy-successor activation path.
+     * deactivation chain to prevHwnd if any). Same posting style as activation-messages.ts.
+     *
+     * `appBoundary` decides WM_ACTIVATEAPP alone: it is the APPLICATION-level notification
+     * (see activation-messages.ts), so activation moving between two windows of the SAME
+     * process must not carry it. The destroy-successor path is exactly that case — the app
+     * never lost the foreground — and telling the successor's WndProc otherwise replays a
+     * full alt-tab-return handler mid-run, long after the subsystems it pokes came up.
      */
-    private postActivationChain(newHwnd: number, prevHwnd: number): void {
+    private postActivationChain(newHwnd: number, prevHwnd: number, appBoundary = false): void {
         if (prevHwnd && prevHwnd !== newHwnd && this.windows.has(prevHwnd)) {
             this.postMessage(prevHwnd, WM_NCACTIVATE, 0, 0);
-            this.postMessage(prevHwnd, WM_ACTIVATEAPP, 0, 0);
+            if (appBoundary) this.postMessage(prevHwnd, WM_ACTIVATEAPP, 0, 0);
             this.postMessage(prevHwnd, WM_ACTIVATE, WA_INACTIVE, newHwnd >>> 0);
             this.postMessage(prevHwnd, WM_KILLFOCUS, newHwnd >>> 0, 0);
         }
         if (newHwnd && this.windows.has(newHwnd)) {
             this.postMessage(newHwnd, WM_NCACTIVATE, 1, 0);
-            this.postMessage(newHwnd, WM_ACTIVATEAPP, 1, 0);
+            if (appBoundary) this.postMessage(newHwnd, WM_ACTIVATEAPP, 1, 0);
             this.postMessage(newHwnd, WM_ACTIVATE, WA_ACTIVE, prevHwnd >>> 0);
             this.postMessage(newHwnd, WM_SETFOCUS, prevHwnd >>> 0, 0);
         }

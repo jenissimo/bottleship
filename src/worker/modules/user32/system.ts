@@ -29,6 +29,7 @@ import {
     getAbsoluteWindowPosition,
     installCursorAndUpdateHostVisibility,
     getCurrentCursorHandle,
+    isGuestCursorVisible,
     warpGuestCursorTo,
     getCursorClipRect,
     getVirtualScreenRect,
@@ -2490,8 +2491,11 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
             const mouseState = System.getInstance().inputManager.getMouseState();
             view.setUint32(pci + 0, 20, true); // cbSize
-            view.setUint32(pci + 4, 1, true); // flags (CURSOR_SHOWING)
-            view.setUint32(pci + 8, 0x100, true); // hCursor
+            // CURSOR_SHOWING and hCursor are the GUEST's own pointer state — the same
+            // display count ShowCursor returns and the handle GetCursor reports. Host-side
+            // pointer suppression (core/pointer-policy) must not be visible here.
+            view.setUint32(pci + 4, isGuestCursorVisible() ? 1 : 0, true);
+            view.setUint32(pci + 8, getCurrentCursorHandle(), true);
             view.setInt32(pci + 12, mouseState.x, true);
             view.setInt32(pci + 16, mouseState.y, true);
         }

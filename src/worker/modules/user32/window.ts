@@ -75,6 +75,7 @@ import {
     resolveForegroundTargets,
     reactivateOwnerIfNeeded,
     buildPendingActivationSteps,
+    buildInitialActivationSteps,
     markPendingActivation,
     markActivationDelivered,
     needsActivationDelivery,
@@ -762,7 +763,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         const WS_CHILD_STYLE = 0x40000000;
         const activatable = (windowInfo.style & WS_CHILD_STYLE) === 0
             && ((windowInfo.exStyle ?? 0) & WS_EX_NOACTIVATE) === 0;
-        if (activatable) {
+        if (activatable && !windowInfo.createSyncActivationDelivered) {
             if (system.windowManager.getActiveHwnd() === windowInfo.handle) {
                 postInitialActivationMessages(windowInfo.handle);
             } else {
@@ -1015,6 +1016,8 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
 
         // Phase layout: 0..totalCbtHooks-1 = CBT hooks, totalCbtHooks = WM_NCCREATE, totalCbtHooks+1 = WM_CREATE
         let phase = 0;
+        let activationSteps: ActivationStep[] = [];
+        let activationIndex = 0;
         const completeThunk = (_ret: number): number | null => {
             if (phase < totalCbtHooks) {
                 // More CBT hooks to fire
@@ -1132,6 +1135,47 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
                     } catch (e) {
                         Logger.warn(LogCategory.USER32, `${label}: WM_SIZE invoke failed: ${e}`);
                     }
+                }
+            }
+
+            // Win32 ACTIVATES the window it shows: WM_ACTIVATEAPP/WM_NCACTIVATE/WM_ACTIVATE/
+            // WM_SETFOCUS are SENT from inside CreateWindowEx, not queued (`__noSyncCreateActivation`
+            // restores the old queued behaviour, which is the A/B for this). Sent vs posted is
+            // load-bearing, not cosmetic: an activation handler that pokes engine subsystems
+            // sees them absent here (correct — nothing is initialized yet), whereas a queued
+            // copy is dispatched at the app's FIRST pump, which for a game that loads for
+            // half a minute before pumping lands after those subsystems came up and replays a
+            // full alt-tab-return path in the middle of the boot.
+            if (phase < totalCbtHooks + 5) {
+                phase = totalCbtHooks + 5;
+                const WS_EX_NOACTIVATE = 0x08000000;
+                const WS_CHILD_STYLE = 0x40000000;
+                const activatable = (windowInfo.style & WS_CHILD_STYLE) === 0
+                    && ((windowInfo.exStyle ?? 0) & WS_EX_NOACTIVATE) === 0;
+                if (guestVisibleProc && activatable
+                    && !(globalThis as { __noSyncCreateActivation?: boolean }).__noSyncCreateActivation
+                    && System.getInstance().windowManager.getActiveHwnd() === windowInfo.handle) {
+                    activationSteps = buildInitialActivationSteps(windowInfo.handle, windowInfo.wndProc);
+                    windowInfo.createSyncActivationDelivered = true;
+                    markActivationDelivered(windowInfo.handle);
+                }
+            }
+
+            while (activationIndex < activationSteps.length) {
+                const step = activationSteps[activationIndex++];
+                try {
+                    callbackManager.invokeCallback(
+                        step.wndProc,
+                        [step.hwnd, step.msg, step.wParam, step.lParam],
+                        0,
+                        completeThunk,
+                        false,
+                        `${label}:activation:${step.msg.toString(16)}`,
+                        frameId
+                    );
+                    return null;
+                } catch (e) {
+                    Logger.warn(LogCategory.USER32, `${label}: activation msg 0x${step.msg.toString(16)} invoke failed: ${e}`);
                 }
             }
 
