@@ -113,6 +113,45 @@ describe("crt-vc9-io", () => {
         }
     });
 
+    test("_findfirst with no wildcard stats the name instead of enumerating", () => {
+        const system = System.getInstance();
+        const originalList = system.fileSystem.listDirectory;
+        const originalStat = system.fileSystem.statEntry;
+        const entry: VfsEntry = {
+            path: "C:\\Games\\save.dat", name: "save.dat", kind: "file", size: 7, source: "rom",
+        };
+        let listCalls = 0;
+        let statPath = "";
+        system.fileSystem.listDirectory = ((p: string) => {
+            listCalls++;
+            return [];
+        }) as typeof system.fileSystem.listDirectory;
+        system.fileSystem.statEntry = ((p: string) => {
+            statPath = p;
+            return p.toLowerCase() === "c:\\games\\save.dat" ? entry : null;
+        }) as typeof system.fileSystem.statEntry;
+        try {
+            host.writeCString(0x100, "C:\\Games\\save.dat");
+            expect(exports["_findfirst"]!(null as any, mem, [0x100, 0x300])).toBeGreaterThan(0);
+            expect(statPath).toBe("C:\\Games\\save.dat");
+            expect(listCalls).toBe(0);
+            expect(host.readCString(0x300 + 20)).toBe("save.dat");
+
+            // A missing exact name still reports "not found" (errno 2 → -1).
+            host.writeCString(0x100, "C:\\Games\\absent.dat");
+            expect(exports["_findfirst"]!(null as any, mem, [0x100, 0x300])).toBe(-1);
+            expect(listCalls).toBe(0);
+
+            // A wildcard spec must keep enumerating.
+            host.writeCString(0x100, "C:\\Games\\*.dat");
+            expect(exports["_findfirst"]!(null as any, mem, [0x100, 0x300])).toBe(-1);
+            expect(listCalls).toBe(1);
+        } finally {
+            system.fileSystem.listDirectory = originalList;
+            system.fileSystem.statEntry = originalStat;
+        }
+    });
+
     test("_stat64i32 reports a directory with _S_IFDIR at st_mode (+6)", () => {
         const system = System.getInstance();
         const originalDir = system.fileSystem.directoryExists;

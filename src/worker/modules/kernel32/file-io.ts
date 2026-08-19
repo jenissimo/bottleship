@@ -1235,6 +1235,89 @@ const fileIoModule = (() => {
         return exports['MapViewOfFile']!(ctx, mem, args) as Promise<number>;
     };
 
+    /**
+     * BOOL ReadFileEx(HANDLE, LPVOID, DWORD, LPOVERLAPPED, LPOVERLAPPED_COMPLETION_ROUTINE)
+     *
+     * The APC form of an overlapped read: the completion routine — not an event, not a
+     * completion port — is what tells the ISSUING thread the request finished, and Windows
+     * runs it only while that thread sits in an alertable wait. We satisfy the read here
+     * and queue the routine; the alertable waits drain the queue. A stub instead leaves a
+     * streaming engine waiting on a completion that can never arrive (CryEngine hangs its
+     * whole level load on it), which looks like a deadlock nowhere near the read.
+     */
+    exports['ReadFileEx'] = (ctx, mem, args) => {
+        const hFile = args[0] >>> 0;
+        const lpBuffer = args[1] >>> 0;
+        const nNumberOfBytesToRead = args[2] >>> 0;
+        const lpOverlapped = args[3] >>> 0;
+        const lpCompletionRoutine = args[4] >>> 0;
+        const sched = System.getInstance().scheduler;
+
+        if (!lpOverlapped || lpOverlapped + 20 > mem.length) {
+            sched.setLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        const fileHandle = System.getInstance().resourceProvider.getFileHandle(hFile);
+        if (!fileHandle || isConsoleDeviceHandle(fileHandle)) {
+            sched.setLastError(ERROR_INVALID_HANDLE);
+            return 0;
+        }
+
+        // ReadFileEx ALWAYS takes its offset from OVERLAPPED and never advances the file
+        // pointer — the handle's own cursor belongs to whoever else is reading it, so the read
+        // runs over a DUPLICATE cursor (CLAUDE.md 3.2) rather than a save/restore that an await
+        // would tear.
+        const ovView = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const offset = ovView.getUint32(lpOverlapped + 8, true);
+        const wrapper = fileHandle as FileHandleWrapper;
+        const vfs = System.getInstance().fileSystem;
+        const cursor = vfs.duplicateHandle(wrapper.vfsHandle, offset);
+
+        const complete = (bytesRead: number): number => {
+            const freshMem = Mem.getView() || mem;
+            const outView = new DataView(freshMem.buffer, freshMem.byteOffset, freshMem.byteLength);
+            outView.setUint32(lpOverlapped, 0, true);              // Internal = STATUS_SUCCESS
+            outView.setUint32(lpOverlapped + 4, bytesRead, true);   // InternalHigh = bytes transferred
+
+            const tid = sched.getCurrentThread()?.id ?? 0;
+            if (lpCompletionRoutine && tid) {
+                sched.queueIoCompletionApc(tid, lpCompletionRoutine, 0, bytesRead, lpOverlapped);
+            }
+            Logger.log(LogCategory.KERNEL32,
+                `ReadFileEx(h=0x${hFile.toString(16)}, size=${nNumberOfBytesToRead}, offset=${offset}) -> ` +
+                `${bytesRead} byte(s), APC=0x${lpCompletionRoutine.toString(16)} on T${tid}`);
+            sched.setLastError(0);
+            return 1;
+        };
+
+        // null from the sync attempt is "not available synchronously", NOT end of file. Reporting
+        // it as a 0-byte SUCCESS would hand the completion routine a truncated file — a wrong
+        // answer the caller cannot detect — so the miss goes to the async read instead.
+        if (lpBuffer && lpBuffer + nNumberOfBytesToRead <= mem.length) {
+            const sync = vfs.readIntoSync(cursor, mem, lpBuffer, nNumberOfBytesToRead);
+            if (sync !== null) return complete(sync);
+        } else {
+            const data = vfs.readSync(cursor, nNumberOfBytesToRead);
+            if (data !== null) return complete(MemoryGuard.writeBytes(mem, lpBuffer, data, "ReadFileEx"));
+        }
+
+        return (async (): Promise<ThunkResult> => {
+            let bytesRead = 0;
+            try {
+                const freshMem = Mem.getView();
+                if (freshMem && lpBuffer && lpBuffer + nNumberOfBytesToRead <= freshMem.length) {
+                    bytesRead = await vfs.readInto(cursor, freshMem, lpBuffer, nNumberOfBytesToRead);
+                } else {
+                    const data = await vfs.read(cursor, nNumberOfBytesToRead);
+                    bytesRead = MemoryGuard.writeBytes(Mem.getView() || mem, lpBuffer, data, "ReadFileEx");
+                }
+            } catch (e) {
+                Logger.warn(LogCategory.KERNEL32, `ReadFileEx async read failed: ${e}`);
+            }
+            return { value: complete(bytesRead), stackCleanup: 20 };
+        })();
+    };
+
     exports['ReadFile'] = (ctx, mem, args) => {
         const hFile = args[0];
         const lpBuffer = args[1];
@@ -1855,6 +1938,33 @@ const fileIoModule = (() => {
         }
     };
 
+    // BOOL GetFileSizeEx(HANDLE hFile, PLARGE_INTEGER lpFileSize)
+    // Unlike GetFileSize there is no in-band error value: the size goes entirely through the
+    // out-param and the BOOL is the only status, so a caller has no reason to sanity-check
+    // what it reads back — it sizes a buffer with it directly.
+    exports['GetFileSizeEx'] = (ctx, mem, args) => {
+        const hFile = args[0];
+        const lpFileSize = args[1] >>> 0;
+
+        const fileHandle = System.getInstance().resourceProvider.getFileHandle(hFile);
+        if (!fileHandle) {
+            System.getInstance().scheduler.setLastError(ERROR_INVALID_HANDLE);
+            return 0; // FALSE
+        }
+        const size = fileHandle.size;
+        if (!lpFileSize
+            || !Mem.writeUint32(lpFileSize, size >>> 0)
+            || !Mem.writeUint32(lpFileSize + 4, Math.floor(size / 0x100000000) >>> 0)) {
+            System.getInstance().scheduler.setLastError(ERROR_INVALID_PARAMETER);
+            return 0; // FALSE
+        }
+
+        const vfsHandle = (fileHandle as FileHandleWrapper).vfsHandle;
+        Logger.verbose(LogCategory.KERNEL32,
+            `GetFileSizeEx(0x${hFile.toString(16)}, "${vfsHandle?.path ?? ''}") -> ${size}`);
+        return 1; // TRUE
+    };
+
     // All ANSI functions (ending with 'A') use UTF-8 encoding instead of system codepage (Windows-1251, Latin1, etc.)
     // This is a simplification for the emulator. Real Windows uses the current system ANSI codepage,
     // which may affect legacy applications with non-ASCII filenames.
@@ -2158,6 +2268,42 @@ const fileIoModule = (() => {
     //   DWORD nNumberOfBytesToUnlockLow, DWORD nNumberOfBytesToUnlockHigh)
     exports['UnlockFile'] = (ctx, mem, args) => {
         Logger.verbose(LogCategory.KERNEL32, `UnlockFile(0x${args[0].toString(16)}) -> stub`);
+        return 1; // TRUE
+    };
+
+    // BOOL LockFileEx(HANDLE hFile, DWORD dwFlags, DWORD dwReserved,
+    //   DWORD nNumberOfBytesToLockLow, DWORD nNumberOfBytesToLockHigh, LPOVERLAPPED lpOverlapped)
+    // One guest process owns the whole VFS, so a byte-range lock is never contended and
+    // always grants immediately — including LOCKFILE_FAIL_IMMEDIATELY, which only matters
+    // to a caller that would otherwise block. lpOverlapped carries the offset and is
+    // MANDATORY here (unlike LockFile): a caller that passes NULL gets the documented error
+    // rather than a lock over an offset we invented.
+    exports['LockFileEx'] = (ctx, mem, args) => {
+        const dwReserved = args[2] >>> 0;
+        const lpOverlapped = args[5] >>> 0;
+        if (dwReserved !== 0 || !lpOverlapped) {
+            System.getInstance().scheduler.setLastError(ERROR_INVALID_PARAMETER);
+            return 0; // FALSE
+        }
+        // Completed synchronously: Internal = STATUS_SUCCESS, InternalHigh = 0.
+        Mem.writeUint32(lpOverlapped, 0);
+        Mem.writeUint32(lpOverlapped + 4, 0);
+        Logger.verbose(LogCategory.KERNEL32, `LockFileEx(0x${args[0].toString(16)}) -> granted`);
+        return 1; // TRUE
+    };
+
+    // BOOL UnlockFileEx(HANDLE hFile, DWORD dwReserved, DWORD nNumberOfBytesToUnlockLow,
+    //   DWORD nNumberOfBytesToUnlockHigh, LPOVERLAPPED lpOverlapped)
+    exports['UnlockFileEx'] = (ctx, mem, args) => {
+        const dwReserved = args[1] >>> 0;
+        const lpOverlapped = args[4] >>> 0;
+        if (dwReserved !== 0 || !lpOverlapped) {
+            System.getInstance().scheduler.setLastError(ERROR_INVALID_PARAMETER);
+            return 0; // FALSE
+        }
+        Mem.writeUint32(lpOverlapped, 0);
+        Mem.writeUint32(lpOverlapped + 4, 0);
+        Logger.verbose(LogCategory.KERNEL32, `UnlockFileEx(0x${args[0].toString(16)}) -> released`);
         return 1; // TRUE
     };
 

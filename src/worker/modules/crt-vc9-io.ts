@@ -293,9 +293,15 @@ export function registerVc9IoExports(exports: Record<string, ThunkImplementation
     exports["_stati64"] = (_ctx, _mem, args) => statByPath(args[0] ?? 0, args[1] ?? 0, fillStati64);
     exports["_fstati64"] = (_ctx, _mem, args) => statByFd(args[0] ?? 0, args[1] ?? 0, fillStati64);
 
-    exports["_findfirst64i32"] = (_ctx, _mem, args) => {
-        const filespecPtr = args[0] ?? 0;
-        const dataPtr = args[1] ?? 0;
+    /**
+     * Shared body of the _findfirst variants: they differ only in the _finddata_t
+     * layout they fill.
+     */
+    const findFirstImpl = (
+        filespecPtr: number,
+        dataPtr: number,
+        fill: (structPtr: number, entry: VfsEntry, h: Vc9IoHost) => void,
+    ): number => {
         if (!filespecPtr || !dataPtr) {
             host.setErrno(22);
             return -1;
@@ -307,43 +313,32 @@ export function registerVc9IoExports(exports: Record<string, ThunkImplementation
         if (!searchDir.match(/^[A-Za-z]:/)) {
             searchDir = cwd.endsWith("\\") ? cwd + searchDir : `${cwd}\\${searchDir}`;
         }
-        const all = vfs.listDirectory(searchDir);
-        const matched = all.filter((e) => matchWildcard(e.name, pattern));
+
+        let matched: VfsEntry[];
+        // A filespec with no wildcard is an existence check, not an enumeration —
+        // stat the one name instead of listing (and pattern-matching) the directory.
+        // Same fast path as FindFirstFileA/W.
+        if (pattern && !/[*?]/.test(pattern)) {
+            const entry = vfs.statEntry(searchDir.endsWith("\\") ? searchDir + pattern : `${searchDir}\\${pattern}`);
+            matched = entry ? [entry] : [];
+        } else {
+            matched = vfs.listDirectory(searchDir).filter((e) => matchWildcard(e.name, pattern));
+        }
         if (matched.length === 0) {
             host.setErrno(2);
             return -1;
         }
         const handle = nextFindHandle++;
         findHandles.set(handle, { entries: matched, index: 0 });
-        fillFindData64i32(dataPtr, matched[0]!, host);
+        fill(dataPtr, matched[0]!, host);
         return handle;
     };
 
-    exports["_findfirst"] = (_ctx, _mem, args) => {
-        const filespecPtr = args[0] ?? 0;
-        const dataPtr = args[1] ?? 0;
-        if (!filespecPtr || !dataPtr) {
-            host.setErrno(22);
-            return -1;
-        }
-        const { dir, pattern } = parseFilespec(host.readCString(filespecPtr, 512));
-        const vfs = System.getInstance().fileSystem;
-        const cwd = (System.getInstance() as { currentDirectory?: string }).currentDirectory || "C:\\";
-        let searchDir = dir;
-        if (!searchDir.match(/^[A-Za-z]:/)) {
-            searchDir = cwd.endsWith("\\") ? cwd + searchDir : `${cwd}\\${searchDir}`;
-        }
-        const all = vfs.listDirectory(searchDir);
-        const matched = all.filter((e) => matchWildcard(e.name, pattern));
-        if (matched.length === 0) {
-            host.setErrno(2);
-            return -1;
-        }
-        const handle = nextFindHandle++;
-        findHandles.set(handle, { entries: matched, index: 0 });
-        fillFindData32(dataPtr, matched[0]!, host);
-        return handle;
-    };
+    exports["_findfirst64i32"] = (_ctx, _mem, args) =>
+        findFirstImpl(args[0] ?? 0, args[1] ?? 0, fillFindData64i32);
+
+    exports["_findfirst"] = (_ctx, _mem, args) =>
+        findFirstImpl(args[0] ?? 0, args[1] ?? 0, fillFindData32);
 
     exports["_findnext64i32"] = (_ctx, _mem, args) => {
         const handle = args[0] ?? 0;

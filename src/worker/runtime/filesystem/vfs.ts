@@ -40,6 +40,21 @@ export interface VfsFileHandle {
     io?: Promise<unknown>;
 }
 
+/**
+ * Direct children of one ROM directory, in ROM index order. Parallel arrays (DOD):
+ * `keys` is the romIndex key for a file or the lowercase directory path for a
+ * subdirectory (`isDir` selects which); `names` is the whole original-case rel path
+ * for a file and just the original-case segment for a subdirectory — which is exactly
+ * what each one's VfsEntry.path is built from.
+ */
+interface RomDirNode {
+    names: string[];
+    keys: string[];
+    isDir: boolean[];
+    /** An explicit ZIP directory entry (trailing "/") names this directory. */
+    selfEntry: boolean;
+}
+
 export interface VfsFindHandle {
     kind: "find";
     entries: VfsEntry[];
@@ -71,6 +86,14 @@ export class VirtualFileSystem {
      * the hot path for GetFileAttributes / _access existence probes.
      */
     private romDirs: Set<string> = new Set();
+    /**
+     * dirLower → its direct children, built in the same mount pass as romDirs so
+     * listRomDirectory() is O(children) instead of a full index scan (with a regex
+     * de-prefixing per entry) on every wildcard FindFirstFile/_findfirst.
+     * ROM is immutable, so this index is too: whiteouts are applied at READ time —
+     * baking them in would resurrect a deleted file on the next enumeration.
+     */
+    private romChildren: Map<string, RomDirNode> = new Map();
     private romCache = new LruCache<string, Uint8Array>({
         maxBytes: this.ROM_CACHE_MAX_BYTES,
         sizeOf: (value) => value.byteLength,
@@ -140,6 +163,7 @@ export class VirtualFileSystem {
         this.romArchive = null;
         this.romIndex.clear();
         this.romDirs.clear();
+        this.romChildren.clear();
         this.romCache.clear();
         this.romWhiteouts.clear();
         this.romLoadPromises.clear();
@@ -158,6 +182,7 @@ export class VirtualFileSystem {
         // Build case-insensitive index
         this.romIndex.clear();
         this.romDirs.clear();
+        this.romChildren.clear();
         this.romWhiteouts.clear();
         this.romPinned.clear();
         this.romPinnedBytes = 0;
@@ -178,6 +203,7 @@ export class VirtualFileSystem {
                 const slash = dir.lastIndexOf("/");
                 dir = slash === -1 ? "" : dir.slice(0, slash);
             }
+            this.indexRomChildren(lowerKey, entry);
             if (!entry.isDirectory && entry.compression !== 0) {
                 compressedEntries++;
                 if (firstCompressedName === null) {
@@ -1464,43 +1490,116 @@ export class VirtualFileSystem {
         }
 
         const rel = this.relRomPath(path).toLowerCase();
+        const node = this.romChildren.get(rel);
+        if (!node) return [];
+
         const prefix = rel ? `${rel}/` : "";
         const dirEntries: Map<string, VfsEntry> = new Map();
+        // Whiteouts are the only mutable part of the ROM view, and they are normally
+        // empty — skip the filtering work entirely then.
+        const filtering = this.romWhiteouts.size > 0;
 
-        for (const [relPath, entry] of this.romIndex.entries()) {
-            if (prefix && !relPath.startsWith(prefix)) continue;
-            if (this.romWhiteouts.has(relPath)) continue;
-            // Derive names from the archive's original path, not the lowercased index
-            // key. Guests can be case-sensitive about returned names: Python 1.5's
-            // import check_case compares FindFirstFile's cFileName via strncmp, so a
-            // lowercased "bladex.dll" makes Blade of Darkness `import Bladex` fail.
-            const originalRel = this.romEntryOriginalRel(entry, relPath);
-            const remainder = originalRel.slice(prefix.length);
-            const parts = remainder.split("/");
-            const name = parts[0];
-            if (!name) continue;
-            if (parts.length === 1) {
+        // Names come from the archive's original path, not the lowercased index key.
+        // Guests can be case-sensitive about returned names: Python 1.5's import
+        // check_case compares FindFirstFile's cFileName via strncmp, so a lowercased
+        // "bladex.dll" makes Blade of Darkness `import Bladex` fail.
+        for (let i = 0; i < node.keys.length; i++) {
+            const name = node.names[i];
+            const key = node.keys[i];
+            if (node.isDir[i]) {
+                // A subdirectory exists only as long as something under it is visible.
+                if (filtering && !this.romDirHasVisibleEntry(key)) continue;
+                if (dirEntries.has(name.toLowerCase())) continue;
                 dirEntries.set(name.toLowerCase(), {
-                    path: this.romPathFromRel(originalRel),
+                    path: this.romPathFromRel(`${prefix}${name}`),
                     name,
-                    kind: "file",
-                    size: entry.uncompressedSize,
+                    kind: "dir",
+                    size: 0,
                     source: "rom",
                 });
-            } else {
-                if (!dirEntries.has(name.toLowerCase())) {
-                    dirEntries.set(name.toLowerCase(), {
-                        path: this.romPathFromRel(`${prefix}${name}`.replace(/\/+$/, "")),
-                        name,
-                        kind: "dir",
-                        size: 0,
-                        source: "rom",
-                    });
-                }
+                continue;
             }
+            if (filtering && this.romWhiteouts.has(key)) continue;
+            const entry = this.romIndex.get(key);
+            if (!entry) continue;
+            // `names[i]` is the whole original-case rel path for a file child.
+            const fileName = name.slice(name.lastIndexOf("/") + 1);
+            dirEntries.set(fileName.toLowerCase(), {
+                path: this.romPathFromRel(name),
+                name: fileName,
+                kind: "file",
+                size: entry.uncompressedSize,
+                source: "rom",
+            });
         }
 
         return Array.from(dirEntries.values());
+    }
+
+    /** Get-or-create the child list of a ROM directory (mount-time only). */
+    private romDirNode(dir: string): RomDirNode {
+        let node = this.romChildren.get(dir);
+        if (!node) {
+            node = { names: [], keys: [], isDir: [], selfEntry: false };
+            this.romChildren.set(dir, node);
+        }
+        return node;
+    }
+
+    /**
+     * Record one ROM index key as a child of each directory along its path. Called
+     * from the mount loop that already walks every entry, so the index is free.
+     */
+    private indexRomChildren(lowerKey: string, entry: ZipEntry): void {
+        const segs = lowerKey.split("/");
+        const originalRel = this.romEntryOriginalRel(entry, lowerKey);
+        // Reuse the key's own string when the case matches, so the common all-lowercase
+        // archive pays no extra memory for the original-case index.
+        const original = (originalRel === lowerKey ? lowerKey : originalRel).split("/");
+        const originalFull = originalRel === lowerKey ? lowerKey : originalRel;
+        let parent = "";
+        for (let i = 0; i < segs.length; i++) {
+            const seg = segs[i];
+            const last = i === segs.length - 1;
+            if (!seg) {
+                // Trailing "/" names `parent` itself; an interior empty segment is a
+                // malformed key whose tail no enumeration prefix can reach.
+                if (last) this.romDirNode(parent).selfEntry = true;
+                break;
+            }
+            const child = parent ? `${parent}/${seg}` : seg;
+            const node = this.romDirNode(parent);
+            if (last) {
+                // Files carry the whole original-case rel path: it is the entry's `path`.
+                node.names.push(originalFull);
+                node.keys.push(lowerKey);
+                node.isDir.push(false);
+            } else if (!this.romChildren.has(child)) {
+                node.names.push(original[i] ?? seg);
+                node.keys.push(child);
+                node.isDir.push(true);
+                this.romDirNode(child);
+            }
+            parent = child;
+        }
+    }
+
+    /**
+     * True while any non-whited-out entry still lives under `dirKey`. Only consulted
+     * when whiteouts exist, and short-circuits on the first survivor.
+     */
+    private romDirHasVisibleEntry(dirKey: string): boolean {
+        const node = this.romChildren.get(dirKey);
+        if (!node) return false;
+        if (node.selfEntry) return true;
+        for (let i = 0; i < node.keys.length; i++) {
+            if (node.isDir[i]) {
+                if (this.romDirHasVisibleEntry(node.keys[i])) return true;
+            } else if (!this.romWhiteouts.has(node.keys[i])) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
