@@ -438,6 +438,207 @@ export function createProtoServStubs(process: Process, setLastError: (code: numb
     return { getprotobyname, getprotobynumber, getservbyname, getservbyport };
 }
 
+export interface AddrInfoStubs {
+    getaddrinfo: ThunkImplementation;
+    freeaddrinfo: ThunkImplementation;
+    getnameinfo: ThunkImplementation;
+    /** Game switch: the guest address space is rewound, so a chain recorded against the old
+     *  one would let a later free hand a recycled address back to the allocator. */
+    reset: () => void;
+}
+
+/**
+ * addrinfo (32-bit): +0 ai_flags +4 ai_family +8 ai_socktype +12 ai_protocol
+ *                   +16 ai_addrlen +20 ai_canonname(char*) +24 ai_addr(sockaddr*) +28 ai_next
+ */
+const ADDRINFO_SIZE = 32;
+const AI_PASSIVE = 0x01;
+const AI_CANONNAME = 0x02;
+const AI_NUMERICHOST = 0x04;
+const SOCK_STREAM = 1;
+const SOCK_DGRAM = 2;
+const IPPROTO_TCP = 6;
+const IPPROTO_UDP = 17;
+const AF_UNSPEC = 0;
+/** getaddrinfo error codes double as WSA errors on Windows (ws2tcpip.h). */
+const EAI_NONAME = 11001;   // WSAHOST_NOT_FOUND
+const EAI_SERVICE = 10109;   // WSATYPE_NOT_FOUND
+const EAI_FAMILY = 10047;    // WSAEAFNOSUPPORT
+const EAI_MEMORY = 10055;    // WSAENOBUFS
+const EAI_FAIL = 11003;      // WSANO_RECOVERY
+const NI_NUMERICHOST = 0x02;
+const NI_NUMERICSERV = 0x08;
+const NI_NAMEREQD = 0x04;
+
+/**
+ * getaddrinfo / freeaddrinfo / getnameinfo — the ws2tcpip resolver over the same offline
+ * name space the hostent stubs answer from (see createDnsStubs), so both spellings of "look
+ * this name up" agree instead of one succeeding and the other failing. A NULL node with
+ * AI_PASSIVE is INADDR_ANY (the bind case) and without it loopback, exactly as documented;
+ * anything else resolves to loopback.
+ *
+ * The result chain is allocated in guest memory and owned by us until freeaddrinfo — the
+ * caller must not free it itself, so a per-call allocation set is tracked and released as a
+ * unit. A dangling free (an addrinfo we never handed out) is ignored, matching the DLL's own
+ * tolerance rather than corrupting the heap.
+ */
+export function createAddrInfoStubs(process: Process, setLastError: (code: number) => void): AddrInfoStubs {
+    /** head addrinfo -> every guest block allocated for that chain, in allocation order. */
+    const chains = new Map<number, number[]>();
+
+    const parsePort = (service: string, hints: { socktype: number }): number | null => {
+        if (!service) return 0;
+        if (/^[0-9]+$/.test(service)) {
+            const p = parseInt(service, 10);
+            return p >= 0 && p <= 0xffff ? p : null;
+        }
+        const proto = hints.socktype === SOCK_DGRAM ? "udp" : hints.socktype === SOCK_STREAM ? "tcp" : "";
+        const entry = KNOWN_SERVICES.find((s) => s.name === service.toLowerCase() && (!proto || s.proto === proto));
+        return entry ? entry.port : null;
+    };
+
+    const getaddrinfo: ThunkImplementation = (_ctx, mem, args) => {
+        const nodePtr = args[0] >>> 0;
+        const servicePtr = args[1] >>> 0;
+        const hintsPtr = args[2] >>> 0;
+        const resultPtr = args[3] >>> 0;
+        if (!resultPtr) { setLastError(WSAEFAULT); return WSAEFAULT; }
+
+        let flags = 0, family = AF_UNSPEC, socktype = 0, protocol = 0;
+        if (hintsPtr) {
+            flags = (Mem.readUint32(hintsPtr) ?? 0) >>> 0;
+            family = (Mem.readUint32(hintsPtr + 4) ?? 0) | 0;
+            socktype = (Mem.readUint32(hintsPtr + 8) ?? 0) | 0;
+            protocol = (Mem.readUint32(hintsPtr + 12) ?? 0) | 0;
+        }
+        if (family !== AF_UNSPEC && family !== AF_INET) { setLastError(EAI_FAMILY); return EAI_FAMILY; }
+
+        const node = nodePtr ? Marshaler.readString(mem, nodePtr).trim() : "";
+        const service = servicePtr ? Marshaler.readString(mem, servicePtr).trim() : "";
+        const port = parsePort(service, { socktype });
+        if (port === null) { setLastError(EAI_SERVICE); return EAI_SERVICE; }
+
+        // A numeric node keeps its literal address; a name resolves to loopback (offline).
+        let addr: number;
+        if (node) {
+            const literal = parseInetAddr(node);
+            if (literal !== 0xffffffff) addr = literal;
+            else if (flags & AI_NUMERICHOST) { setLastError(EAI_NONAME); return EAI_NONAME; }
+            else addr = INADDR_LOOPBACK;
+        } else if (!servicePtr) {
+            // Both node and service NULL is the one input getaddrinfo rejects outright.
+            setLastError(EAI_NONAME);
+            return EAI_NONAME;
+        } else {
+            addr = (flags & AI_PASSIVE) ? 0 : INADDR_LOOPBACK;
+        }
+
+        // With no socktype hint, real Windows returns one addrinfo per socket type.
+        const kinds: Array<{ socktype: number; protocol: number }> = socktype
+            ? [{ socktype, protocol: protocol || (socktype === SOCK_DGRAM ? IPPROTO_UDP : IPPROTO_TCP) }]
+            : [{ socktype: SOCK_STREAM, protocol: IPPROTO_TCP }, { socktype: SOCK_DGRAM, protocol: IPPROTO_UDP }];
+
+        const owned: number[] = [];
+        const grab = (size: number): number => {
+            const p = process.memory.alloc(size, "THUNK_DATA", "rw");
+            if (p) owned.push(p >>> 0);
+            return (p ?? 0) >>> 0;
+        };
+        const abort = (code: number): number => {
+            for (const p of owned) process.memory.free(p);
+            setLastError(code);
+            return code;
+        };
+
+        let canonAddr = 0;
+        if (flags & AI_CANONNAME) {
+            const canon = node || LOOPBACK_HOST_NAME;
+            const bytes = new TextEncoder().encode(`${canon}\0`);
+            canonAddr = grab(bytes.length);
+            if (!canonAddr || Mem.writeBytes(canonAddr, bytes) !== bytes.length) return abort(EAI_MEMORY);
+        }
+
+        let head = 0, prev = 0;
+        for (const kind of kinds) {
+            const sa = grab(SOCKADDR_IN_SIZE);
+            const ai = grab(ADDRINFO_SIZE);
+            if (!sa || !ai) return abort(EAI_MEMORY);
+            // sockaddr_in: +0 sin_family +2 sin_port(net) +4 sin_addr +8 sin_zero[8]
+            const netPort = ((port & 0xff) << 8) | ((port >>> 8) & 0xff);
+            if (!Mem.writeUint16(sa, AF_INET) || !Mem.writeUint16(sa + 2, netPort) ||
+                !Mem.writeUint32(sa + 4, addr) ||
+                !Mem.writeUint32(sa + 8, 0) || !Mem.writeUint32(sa + 12, 0)) return abort(EAI_FAIL);
+            if (!Mem.writeUint32(ai, flags) || !Mem.writeUint32(ai + 4, AF_INET) ||
+                !Mem.writeUint32(ai + 8, kind.socktype) || !Mem.writeUint32(ai + 12, kind.protocol) ||
+                !Mem.writeUint32(ai + 16, SOCKADDR_IN_SIZE) ||
+                // ai_canonname is set on the FIRST result only, per the documented contract.
+                !Mem.writeUint32(ai + 20, prev ? 0 : canonAddr) ||
+                !Mem.writeUint32(ai + 24, sa) || !Mem.writeUint32(ai + 28, 0)) return abort(EAI_FAIL);
+            if (prev) { if (!Mem.writeUint32(prev + 28, ai)) return abort(EAI_FAIL); } else head = ai;
+            prev = ai;
+        }
+
+        if (!Mem.writeUint32(resultPtr, head)) return abort(WSAEFAULT);
+        chains.set(head, owned);
+        setLastError(0);
+        return 0;
+    };
+
+    const freeaddrinfo: ThunkImplementation = (_ctx, _mem, args) => {
+        const head = args[0] >>> 0;
+        const owned = chains.get(head);
+        if (!owned) return 0;
+        chains.delete(head);
+        for (const p of owned) process.memory.free(p);
+        return 0;
+    };
+
+    const getnameinfo: ThunkImplementation = (_ctx, _mem, args) => {
+        const saPtr = args[0] >>> 0;
+        const saLen = (args[1] ?? 0) | 0;
+        const hostPtr = args[2] >>> 0;
+        const hostLen = (args[3] ?? 0) >>> 0;
+        const servPtr = args[4] >>> 0;
+        const servLen = (args[5] ?? 0) >>> 0;
+        const flags = (args[6] ?? 0) >>> 0;
+        if (!saPtr || saLen < SOCKADDR_IN_SIZE) { setLastError(WSAEFAULT); return WSAEFAULT; }
+        if ((Mem.readUint16(saPtr) ?? 0) !== AF_INET) { setLastError(EAI_FAMILY); return EAI_FAMILY; }
+
+        const netPort = (Mem.readUint16(saPtr + 2) ?? 0) >>> 0;
+        const port = ((netPort & 0xff) << 8) | ((netPort >>> 8) & 0xff);
+        const a = (Mem.readUint32(saPtr + 4) ?? 0) >>> 0;
+        const dotted = `${a & 0xff}.${(a >>> 8) & 0xff}.${(a >>> 16) & 0xff}.${(a >>> 24) & 0xff}`;
+
+        const write = (text: string, ptr: number, len: number): boolean => {
+            if (!ptr || len === 0) return true;
+            const bytes = new TextEncoder().encode(`${text}\0`);
+            if (bytes.length > len) return false;
+            return Mem.writeBytes(ptr, bytes) === bytes.length;
+        };
+
+        if (hostPtr && hostLen) {
+            // Only loopback has a name offline; NI_NAMEREQD must fail rather than hand back a literal.
+            const named = !(flags & NI_NUMERICHOST) && a === INADDR_LOOPBACK;
+            if (!named && (flags & NI_NAMEREQD)) { setLastError(EAI_NONAME); return EAI_NONAME; }
+            if (!write(named ? LOOPBACK_HOST_NAME : dotted, hostPtr, hostLen)) {
+                setLastError(WSAEFAULT);
+                return WSAEFAULT;
+            }
+        }
+        if (servPtr && servLen) {
+            const entry = (flags & NI_NUMERICSERV) ? undefined : KNOWN_SERVICES.find((s) => s.port === port);
+            if (!write(entry ? entry.name : String(port), servPtr, servLen)) {
+                setLastError(WSAEFAULT);
+                return WSAEFAULT;
+            }
+        }
+        setLastError(0);
+        return 0;
+    };
+
+    return { getaddrinfo, freeaddrinfo, getnameinfo, reset: () => chains.clear() };
+}
+
 /** fd_set: +0 fd_count(u_int) +4 fd_array[fd_count] (SOCKET, 4 bytes each on 32-bit). */
 function parseFdSet(mem: Uint8Array, ptr: number): number[] {
     if (!ptr) return [];

@@ -8,6 +8,7 @@ import { System } from "../core/system";
 import { RegistryValue } from "../runtime/filesystem/registry";
 import { Logger, LogCategory } from "../core/logger";
 import { encodeAnsi } from "./codepage-utils";
+import { Md5, Sha1 } from "@bottleship/formats/unpack";
 
 const HKEY_CLASSES_ROOT = 0x80000000;
 const HKEY_CURRENT_USER = 0x80000001;
@@ -32,6 +33,46 @@ const SECURITY_DESCRIPTOR_REVISION = 1;
 const SECURITY_DESCRIPTOR_MIN_LENGTH = 20;
 const SE_DACL_PRESENT = 0x0004;
 const SE_DACL_DEFAULTED = 0x0008;
+
+/** wincrypt.h ALG_IDs we can compute for real; anything else has no digest to report. */
+const CALG_MD5 = 0x00008003;
+const CALG_SHA1 = 0x00008004;
+
+/** CryptGetHashParam dwParam values. */
+const HP_ALGID = 0x0001;
+const HP_HASHVAL = 0x0002;
+const HP_HASHSIZE = 0x0004;
+
+const ERROR_MORE_DATA = 234;
+const NTE_BAD_ALGID = 0x80090008 | 0;
+const NTE_BAD_KEY = 0x80090003 | 0;
+const NTE_BAD_HASH_STATE = 0x8009000b | 0;
+
+interface CryptHasher {
+    update(data: Uint8Array): void;
+    digest(): Uint8Array;
+    readonly size: number;
+}
+
+/**
+ * A real digest for the algorithms we implement, and NOTHING for the rest — a hash a
+ * caller can read back has to be the actual MD5/SHA-1 of the bytes it fed in, because the
+ * usual use is "hash this, compare with what I stored last run". An unsupported ALG_ID
+ * still gets a handle (CryptCreateHash succeeded on real Windows, and callers that only
+ * sign/verify never read the value) but CryptGetHashParam then fails with NTE_BAD_ALGID
+ * rather than invent bytes.
+ */
+function makeCryptHasher(algId: number): CryptHasher | null {
+    if (algId === CALG_MD5) {
+        const h = new Md5();
+        return { update: (d) => h.update(d), digest: () => h.finalize(), size: 16 };
+    }
+    if (algId === CALG_SHA1) {
+        const h = new Sha1();
+        return { update: (d) => h.update(d), digest: () => h.finalize(), size: 20 };
+    }
+    return null;
+}
 
 export class Advapi32 implements IModule {
     name = "advapi32";
@@ -2011,7 +2052,8 @@ export class Advapi32 implements IModule {
                 key: hKey,
                 flags: dwFlags,
                 bytesHashed: 0,
-                checksum: 0,
+                hasher: makeCryptHasher(algId),
+                finalDigest: null as Uint8Array | null,
             });
 
             if (!Mem.writeUint32(phHash, handle >>> 0)) {
@@ -2037,6 +2079,12 @@ export class Advapi32 implements IModule {
                 return { value: 0, stackCleanup: 16 };
             }
 
+            // Reading HP_HASHVAL finalizes the hash; feeding it more is the documented error.
+            if (hashObj.finalDigest) {
+                system.scheduler.setLastError(NTE_BAD_HASH_STATE);
+                return { value: 0, stackCleanup: 16 };
+            }
+
             if (dwDataLen > 0) {
                 if (!pbData || pbData + dwDataLen > mem.length || !isValidAddress(mem, pbData, dwDataLen, "r")) {
                     system.scheduler.setLastError(ERROR_INVALID_PARAMETER);
@@ -2047,12 +2095,8 @@ export class Advapi32 implements IModule {
                     system.scheduler.setLastError(ERROR_INVALID_PARAMETER);
                     return { value: 0, stackCleanup: 16 };
                 }
-                let checksum = (hashObj.checksum >>> 0) || 0;
-                for (let i = 0; i < chunk.length; i++) {
-                    checksum = (((checksum * 33) >>> 0) ^ chunk[i]!) >>> 0;
-                }
+                (hashObj.hasher as CryptHasher | null)?.update(chunk);
                 hashObj.bytesHashed = ((hashObj.bytesHashed >>> 0) + dwDataLen) >>> 0;
-                hashObj.checksum = checksum >>> 0;
             }
 
             Logger.verbose(
@@ -2137,6 +2181,100 @@ export class Advapi32 implements IModule {
             );
             system.scheduler.setLastError(0);
             return { value: 1, stackCleanup: 24 };
+        };
+
+        // BOOL CryptGetHashParam(HCRYPTHASH, DWORD dwParam, BYTE *pbData, DWORD *pdwDataLen, DWORD dwFlags)
+        this.exports["CryptGetHashParam"] = (ctx, mem, args) => {
+            const hHash = args[0] >>> 0;
+            const dwParam = args[1] >>> 0;
+            const pbData = args[2] >>> 0;
+            const pdwDataLen = args[3] >>> 0;
+
+            const hashObj = process.resourceProvider.getKernelObject(hHash);
+            if (!hashObj || hashObj.kind !== "crypt_hash") {
+                system.scheduler.setLastError(ERROR_INVALID_HANDLE);
+                return { value: 0, stackCleanup: 20 };
+            }
+            if (!pdwDataLen || !isValidAddress(mem, pdwDataLen, 4, "rw")) {
+                system.scheduler.setLastError(ERROR_INVALID_PARAMETER);
+                return { value: 0, stackCleanup: 20 };
+            }
+
+            const hasher = hashObj.hasher as CryptHasher | null;
+            let payload: Uint8Array;
+            switch (dwParam) {
+                case HP_ALGID: {
+                    payload = new Uint8Array(4);
+                    new DataView(payload.buffer).setUint32(0, hashObj.algId >>> 0, true);
+                    break;
+                }
+                case HP_HASHSIZE: {
+                    if (!hasher) { system.scheduler.setLastError(NTE_BAD_ALGID); return { value: 0, stackCleanup: 20 }; }
+                    payload = new Uint8Array(4);
+                    new DataView(payload.buffer).setUint32(0, hasher.size, true);
+                    break;
+                }
+                case HP_HASHVAL: {
+                    if (!hasher) { system.scheduler.setLastError(NTE_BAD_ALGID); return { value: 0, stackCleanup: 20 }; }
+                    // A NULL-buffer size query must NOT finalize: "ask the size, then keep
+                    // hashing" is the documented sequence, and finalizing here would make the
+                    // next CryptHashData fail with NTE_BAD_HASH_STATE.
+                    if (!pbData) {
+                        Mem.writeUint32(pdwDataLen, hasher.size);
+                        system.scheduler.setLastError(0);
+                        return { value: 1, stackCleanup: 20 };
+                    }
+                    // The digest is computed once and cached: a second read must return the
+                    // same bytes, and a streaming hasher cannot be finalized twice.
+                    if (!hashObj.finalDigest) hashObj.finalDigest = hasher.digest();
+                    payload = hashObj.finalDigest as Uint8Array;
+                    break;
+                }
+                default:
+                    system.scheduler.setLastError(ERROR_INVALID_PARAMETER);
+                    return { value: 0, stackCleanup: 20 };
+            }
+
+            // A NULL buffer is the documented "how big?" query; a short one is ERROR_MORE_DATA.
+            const avail = Mem.readUint32(pdwDataLen) ?? 0;
+            if (!pbData) {
+                Mem.writeUint32(pdwDataLen, payload.length);
+                system.scheduler.setLastError(0);
+                return { value: 1, stackCleanup: 20 };
+            }
+            if (avail < payload.length) {
+                Mem.writeUint32(pdwDataLen, payload.length);
+                system.scheduler.setLastError(ERROR_MORE_DATA);
+                return { value: 0, stackCleanup: 20 };
+            }
+            if (!isValidAddress(mem, pbData, payload.length, "rw") ||
+                Mem.writeBytes(pbData, payload) !== payload.length) {
+                system.scheduler.setLastError(ERROR_INVALID_PARAMETER);
+                return { value: 0, stackCleanup: 20 };
+            }
+            Mem.writeUint32(pdwDataLen, payload.length);
+            system.scheduler.setLastError(0);
+            return { value: 1, stackCleanup: 20 };
+        };
+
+        // BOOL CryptEncrypt(HCRYPTKEY, HCRYPTHASH, BOOL Final, DWORD dwFlags, BYTE *pbData,
+        //   DWORD *pdwDataLen, DWORD dwBufLen)
+        //
+        // CryptImportKey keeps no key MATERIAL (the blob is recorded, not parsed), so there is
+        // no cipher to run. Returning the plaintext unchanged would hand the caller data it
+        // believes is encrypted; failing with NTE_BAD_KEY is the answer a caller can actually
+        // detect. The warning names what a title needing this would require.
+        this.exports["CryptEncrypt"] = (ctx, mem, args) => {
+            const hKey = args[0] >>> 0;
+            const dwDataLenPtr = args[5] >>> 0;
+            const len = dwDataLenPtr ? (Mem.readUint32(dwDataLenPtr) ?? 0) : 0;
+            Logger.warn(
+                LogCategory.SYSTEM,
+                `CryptEncrypt(key=0x${hKey.toString(16)}, ${len} bytes) -> NTE_BAD_KEY ` +
+                `(no key material: CryptImportKey does not parse the blob)`
+            );
+            system.scheduler.setLastError(NTE_BAD_KEY);
+            return { value: 0, stackCleanup: 28 };
         };
 
         // BOOL CryptDestroyHash(HCRYPTHASH)

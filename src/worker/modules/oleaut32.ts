@@ -147,6 +147,17 @@ export class Oleaut32 implements IModule {
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
             return view.getUint32(bstr - 4, true) / 2;
         };
+        this.exports["SysStringLen"] = this.exports["ord_7"];
+
+        // UINT SysStringByteLen(BSTR) — OLEAUT32 ordinal 149. The prefix DWORD IS the
+        // byte count, so this is the raw value SysStringLen halves.
+        this.exports["ord_149"] = (ctx, mem, args) => {
+            const bstr = args[0] >>> 0;
+            if (!bstr || bstr < 4) return 0;
+            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            return view.getUint32(bstr - 4, true);
+        };
+        this.exports["SysStringByteLen"] = this.exports["ord_149"];
 
         // BSTR SysAllocStringByteLen(LPCSTR psz, UINT len) — OLEAUT32 ordinal 150.
         // Unlike SysAllocStringLen, len is a byte count and the source may be binary
@@ -214,28 +225,37 @@ export class Oleaut32 implements IModule {
         };
         this.exports["VariantCopyInd"] = this.exports["ord_11"];
 
-        const variantChangeType = (ctx: unknown, mem: Uint8Array, args: number[]) => {
-            const pvargDest = args[0] >>> 0;
-            const pvargSrc = args[1] >>> 0;
-            const vtNew = args[2] & VT_TYPEMASK;
+        // VariantChangeType(pvargDest, pvargSrc, wFlags, vt) — the TARGET TYPE is the LAST
+        // argument in both spellings, and wFlags sits between it and pvargSrc. Reading the
+        // flags as the type converts the overwhelmingly common `wFlags == 0` call to VT_EMPTY,
+        // and the caller then reads an empty variant as a missing value.
+        const variantChangeType = (mem: Uint8Array, dest: number, src: number, vt: number) => {
+            const pvargDest = dest >>> 0;
+            const pvargSrc = src >>> 0;
             if (!pvargDest || !pvargSrc) return E_INVALIDARG;
             if (pvargDest + 16 > mem.length || pvargSrc + 16 > mem.length) return E_INVALIDARG;
-            return this.variantChangeType(mem, pvargDest, pvargSrc, vtNew);
+            return this.variantChangeType(mem, pvargDest, pvargSrc, vt & VT_TYPEMASK);
         };
-        this.exports["ord_12"] = variantChangeType;
-        this.exports["VariantChangeType"] = variantChangeType;
+        this.exports["ord_12"] = (ctx, mem, args) => variantChangeType(mem, args[0], args[1], args[3]);
+        this.exports["VariantChangeType"] = this.exports["ord_12"];
+        // VariantChangeTypeEx(pvargDest, pvargSrc, lcid, wFlags, vt) — one more argument, and
+        // the LCID only matters for locale-sensitive string conversions we do not do.
         this.exports["VariantChangeTypeEx"] = (ctx, mem, args) =>
-            variantChangeType(ctx, mem, [args[0], args[1], args[3]]);
+            variantChangeType(mem, args[0], args[1], args[4]);
 
         // ---- Active Object Registration ----
 
+        // HRESULT RegisterActiveObject(IUnknown*, REFCLSID, DWORD, DWORD* pdwRegister)
         this.exports["ord_33"] = (ctx, mem, args) => {
             const pdwRegister = args[3] >>> 0;
             if (pdwRegister) Mem.writeUint32(pdwRegister, 0x2000);
             return S_OK;
         };
 
+        // HRESULT RevokeActiveObject(DWORD dwRegister, void* pvReserved)
         this.exports["ord_34"] = () => S_OK;
+        this.exports["RegisterActiveObject"] = this.exports["ord_33"];
+        this.exports["RevokeActiveObject"] = this.exports["ord_34"];
 
         // ---- Type Library ----
 
@@ -255,36 +275,44 @@ export class Oleaut32 implements IModule {
             return loadTypeLibImpl(ctx, mem, [args[0], args[2]]);
         };
 
+        // 162 is LoadRegTypeLib and 163 is RegisterTypeLib, per the export table —
+        // they are adjacent and easy to transpose, and a transposed pair both calls
+        // the wrong function AND cleans up the wrong number of stack bytes.
         this.exports["ord_162"] = (ctx, mem, args) => {
+            const pptlib = args[4] >>> 0;
+            if (!pptlib) return E_POINTER;
+            return this.typeLibRuntime.loadRegTypeLib(args[0] >>> 0, mem, pptlib);
+        };
+        this.exports["LoadRegTypeLib"] = this.exports["ord_162"];
+
+        this.exports["ord_163"] = (ctx, mem, args) => {
             const ptlib = args[0] >>> 0;
             const szFullPath = args[1] >>> 0;
             const path = szFullPath ? this.readOleString(mem, szFullPath) : "";
             return this.typeLibRuntime.registerTypeLib(ptlib, path);
         };
-        this.exports["RegisterTypeLib"] = this.exports["ord_162"];
-
-        this.exports["ord_163"] = (ctx, mem, args) => {
-            const pptlib = args[4] >>> 0;
-            if (!pptlib) return E_POINTER;
-            return this.typeLibRuntime.loadRegTypeLib(args[0] >>> 0, mem, pptlib);
-        };
-        this.exports["LoadRegTypeLib"] = this.exports["ord_163"];
+        this.exports["RegisterTypeLib"] = this.exports["ord_163"];
 
         // ---- Error Info ----
 
+        // HRESULT GetErrorInfo(ULONG dwReserved, IErrorInfo** pperrinfo)
         this.exports["ord_200"] = (ctx, mem, args) => {
-            const pperrinfo = args[0] >>> 0;
+            const pperrinfo = args[1] >>> 0;
             if (pperrinfo) Mem.writeUint32(pperrinfo, 0);
-            return 0x00000001;
+            return 0x00000001; // S_FALSE — no error object on this thread
         };
+        this.exports["GetErrorInfo"] = this.exports["ord_200"];
 
+        // HRESULT SetErrorInfo(ULONG dwReserved, IErrorInfo* perrinfo)
         this.exports["ord_201"] = () => S_OK;
+        this.exports["SetErrorInfo"] = this.exports["ord_201"];
 
-        this.exports["ord_202"] = (ctx, mem, args) => {
+        this.exports["CreateErrorInfo"] = (ctx, mem, args) => {
             const pperrinfo = args[0] >>> 0;
             if (pperrinfo) Mem.writeUint32(pperrinfo, 0);
             return 0x80004001;
         };
+        this.exports["ord_202"] = this.exports["CreateErrorInfo"];
 
         Object.assign(this.exports, this.safeArray.exports);
         Object.assign(this.exports, createVariantOpExports());

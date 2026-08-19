@@ -221,6 +221,7 @@ export const user32Module: ModuleDescriptor = {
         makeFunc("SetClassLongA", 3),
         makeFunc("SetClassLongW", 3),
         makeFunc("MsgWaitForMultipleObjects", 5),
+        makeFunc("MsgWaitForMultipleObjectsEx", 5),
         // Window state
         makeFunc("IsWindowEnabled", 1),
         makeFunc("IsWindowUnicode", 1),
@@ -422,7 +423,7 @@ export const user32Module: ModuleDescriptor = {
         makeFunc("CopyIcon", 1),
         makeFunc("CreateIconIndirect", 1),
         makeFunc("CreateIconFromResourceEx", 7),
-        makeFunc("CreateIconFromResource", 5),
+        makeFunc("CreateIconFromResource", 4),
         makeFunc("CreateIcon", 7),
         makeFunc("PrivateExtractIconsW", 8),
         makeFunc("PrivateExtractIconsA", 8),

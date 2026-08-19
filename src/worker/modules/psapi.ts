@@ -16,6 +16,10 @@ import { getVirtualProcessManager, VIRTUAL_CURRENT_PROCESS_ID } from "./kernel32
  * disagreement as a corrupted process image.
  */
 
+const ERROR_INSUFFICIENT_BUFFER = 122;
+const PROCESS_MEMORY_COUNTERS_SIZE = 40;
+const PROCESS_MEMORY_COUNTERS_EX_SIZE = 44;
+
 /** Modules a psapi walk may see: the EXE plus every real DLL mapped from the VFS. */
 function enumerableModules(): LoadedPEModule[] {
     const registry = System.getInstance().process?.moduleRegistry;
@@ -155,6 +159,48 @@ export class Psapi implements IModule {
             Logger.verbose(LogCategory.KERNEL32,
                 `GetModuleInformation(0x${(args[1] >>> 0).toString(16)}) -> "${mod.name}" ` +
                 `base=0x${mod.baseAddress.toString(16)} size=0x${mod.size.toString(16)}`);
+            return 1;
+        };
+
+        // BOOL GetProcessMemoryInfo(HANDLE hProcess, PPROCESS_MEMORY_COUNTERS ppsmemCounters, DWORD cb)
+        //
+        // PROCESS_MEMORY_COUNTERS: +0 cb +4 PageFaultCount +8 PeakWorkingSetSize
+        //   +12 WorkingSetSize +16/20 QuotaPeak/PagedPoolUsage +24/28 QuotaPeak/NonPagedPoolUsage
+        //   +32 PagefileUsage +36 PeakPagefileUsage  (40 bytes); the _EX form adds +40 PrivateUsage.
+        //
+        // Reported from the allocator's own accounting rather than a fixed number: a caller
+        // polls this to decide when to drop caches, and a constant makes it either never free
+        // anything or free constantly.
+        this.exports["GetProcessMemoryInfo"] = (ctx, mem, args) => {
+            const counters = args[1] >>> 0;
+            const cb = args[2] >>> 0;
+            if (!counters || cb < PROCESS_MEMORY_COUNTERS_SIZE) {
+                System.getInstance().scheduler.setLastError(ERROR_INSUFFICIENT_BUFFER);
+                return 0;
+            }
+
+            const metrics = System.getInstance().process?.memory.getMetrics();
+            const current = metrics?.currentBytes ?? 0;
+            const peak = metrics?.peakBytes ?? current;
+
+            const ok = Mem.writeUint32(counters, cb)
+                // No process-wide soft-fault counter exists (the recorder keeps a ring of
+                // FAULTS WE TRAPPED, not the demand-zero faults Windows counts here), so 0
+                // rather than a plausible-looking invention.
+                && Mem.writeUint32(counters + 4, 0)
+                && Mem.writeUint32(counters + 8, peak >>> 0)
+                && Mem.writeUint32(counters + 12, current >>> 0)
+                // No paged/non-paged pool quota accounting exists here; zero is what a
+                // process with no kernel-object churn legitimately reports.
+                && Mem.writeUint32(counters + 16, 0)
+                && Mem.writeUint32(counters + 20, 0)
+                && Mem.writeUint32(counters + 24, 0)
+                && Mem.writeUint32(counters + 28, 0)
+                // Nothing is ever paged out, so committed private bytes == working set.
+                && Mem.writeUint32(counters + 32, current >>> 0)
+                && Mem.writeUint32(counters + 36, peak >>> 0);
+            if (!ok) return 0;
+            if (cb >= PROCESS_MEMORY_COUNTERS_EX_SIZE && !Mem.writeUint32(counters + 40, current >>> 0)) return 0;
             return 1;
         };
     }

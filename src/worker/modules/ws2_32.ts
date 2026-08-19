@@ -18,6 +18,7 @@ import {
     inetAddr,
     createDnsStubs,
     createProtoServStubs,
+    createAddrInfoStubs,
     createAsyncLookupStubs,
     makeSelect,
     makeFdIsSet,
@@ -37,6 +38,7 @@ export class Ws2_32 implements IModule {
     name = "ws2_32";
     exports: Record<string, ThunkImplementation> = {};
     private socketTable = new WsaSocketTable();
+    private resetAddrInfo: (() => void) | null = null;
     private wsaStarted = false;
 
     initialize(process: Process): void {
@@ -68,6 +70,8 @@ export class Ws2_32 implements IModule {
         const socketExports = makeSocketExports(this.socketTable, setError);
         const dns = createDnsStubs(process, setError);
         const protoServ = createProtoServStubs(process, setError);
+        const addrInfo = createAddrInfoStubs(process, setError);
+        this.resetAddrInfo = addrInfo.reset;
         const asyncLookup = createAsyncLookupStubs(setError);
         const selectImpl = makeSelect(this.socketTable, setError);
         const fdIsSet = makeFdIsSet();
@@ -105,6 +109,9 @@ export class Ws2_32 implements IModule {
         this.exports["getprotobynumber"] = protoServ.getprotobynumber;
         this.exports["getservbyname"] = protoServ.getservbyname;
         this.exports["getservbyport"] = protoServ.getservbyport;
+        this.exports["getaddrinfo"] = addrInfo.getaddrinfo;
+        this.exports["freeaddrinfo"] = addrInfo.freeaddrinfo;
+        this.exports["getnameinfo"] = addrInfo.getnameinfo;
         this.exports["select"] = selectImpl;
         this.exports["__WSAFDIsSet"] = fdIsSet;
         this.exports["WSAAsyncSelect"] = (_ctx, _mem, args) => {
@@ -342,6 +349,7 @@ export class Ws2_32 implements IModule {
 
     reset(): void {
         this.socketTable.reset();
+        this.resetAddrInfo?.();
         this.wsaStarted = false;
     }
 }

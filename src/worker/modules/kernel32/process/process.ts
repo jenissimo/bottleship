@@ -21,6 +21,7 @@ import { isUe1RenderProbeCommandLine } from '../../../runtime/filesystem/ue1-fir
 import { getVirtualProcessManager, VIRTUAL_CURRENT_PROCESS_ID } from './virtual-process-manager';
 import { createActCtxExports } from './actctx';
 import { versionVerifyExports } from './version-verify';
+import { GUEST_COMPUTER_NAME } from '../../../core/guest-identity';
 
 const ERROR_INVALID_HANDLE = 6;
 const ERROR_ACCESS_DENIED = 5;
@@ -49,6 +50,7 @@ const IMAGE_FILE_DLL = 0x2000;
 // e_lfanew is a 32-bit offset, but a real image keeps its NT headers inside the first
 // page; a sniff that reads further would pay a second range read to reject junk.
 const PE_SNIFF_BYTES = 0x1000;
+const IMAGE_SUBSYSTEM_WINDOWS_CUI = 3;
 
 let currentPriorityClass = NORMAL_PRIORITY_CLASS;
 
@@ -587,6 +589,32 @@ const hasPeExecutableHeader = (path: string): boolean => {
 };
 
 /**
+ * True when the image's PE optional header says WINDOWS_CUI — a console tool.
+ *
+ * Handing our session over to a child (see the exec branches in createVirtualProcess)
+ * REPLACES the running process, which is only ever right for a launcher starting the
+ * game. A console tool is spawned to do a job and be waited on — CryEngine runs
+ * `Bin32\fxc.exe` to compile a shader mid-render — and its parent keeps running,
+ * so replacing the session on it destroys the very process waiting for the result.
+ * The subsystem field is the image's own statement of which of the two it is.
+ */
+const isConsoleSubsystemImage = (path: string): boolean => {
+    const vfs = System.getInstance().fileSystem;
+    const handle = vfs.openSync(path, GENERIC_READ, OPEN_EXISTING);
+    if (!handle) return false;
+    const head = vfs.readSync(handle, PE_SNIFF_BYTES);
+    if (!head || head.byteLength < 0x40) return false;
+
+    const view = new DataView(head.buffer, head.byteOffset, head.byteLength);
+    if (view.getUint16(0, true) !== IMAGE_DOS_SIGNATURE) return false;
+    const peOffset = view.getUint32(0x3c, true);
+    // NT signature (4) + file header (20) + Subsystem at optional-header offset 68.
+    if (peOffset + 24 + 70 > head.byteLength) return false;
+    if (view.getUint32(peOffset, true) !== IMAGE_NT_SIGNATURE) return false;
+    return view.getUint16(peOffset + 24 + 68, true) === IMAGE_SUBSYSTEM_WINDOWS_CUI;
+};
+
+/**
  * True when `path` names an executable that ships in the mounted bundle — the only kind
  * of child we can honour, because running it means remounting this bundle on that entry
  * point. An .exe the guest merely *names* (notepad, a system tool, an installer that was
@@ -740,15 +768,16 @@ const createVirtualProcess = (memory: Uint8Array, args: number[], isWide: boolea
         const imagePath = argv0 ? system.resolveImagePath(argv0, currentDirectory || "") : "";
         const deferExec = (dwCreationFlags & CREATE_SUSPENDED) !== 0
             || !!(globalThis as { __noSuspendedChildExec?: boolean }).__noSuspendedChildExec;
-        if (imagePath && isBundledImage(imagePath) && deferExec) {
+        // A console tool is never a session host: the parent spawned it to WAIT on it.
+        const execCandidate = !!imagePath && isBundledImage(imagePath) && !isConsoleSubsystemImage(imagePath);
+        if (execCandidate && deferExec) {
             return finishVirtualProcess(
                 lpProcessInformation, applicationName, commandLine,
                 currentDirectory, dwCreationFlags, isWide, true,
                 { imagePath, commandLine: reExecArgs },
             );
         }
-        if (imagePath && isBundledImage(imagePath)
-            && system.requestReExec(reExecArgs, imagePath)) {
+        if (execCandidate && system.requestReExec(reExecArgs, imagePath)) {
             Logger.log(LogCategory.SYSTEM,
                 `[KERNEL32] CreateProcess("${imagePath}", "${reExecArgs}") -> exec ` +
                 `(launcher starting another image from the bundle; restarting on it)`);
@@ -1788,11 +1817,25 @@ export const exports: Record<string, ThunkImplementation> = {
         return winDir.length;
     },
 
+    // BOOL IsWow64Process(HANDLE hProcess, PBOOL Wow64Process)
+    // A 32-bit process on a 32-bit Windows: never under WOW64. Callers branch on this to
+    // pick which registry view / Program Files path to use, so answering FALSE (rather
+    // than failing) is what keeps them on the 32-bit view we actually provide.
+    'IsWow64Process': (ctx, mem, args) => {
+        const wow64Ptr = args[1] >>> 0;
+        if (!wow64Ptr) {
+            System.getInstance().scheduler.setLastError(ERROR_INVALID_PARAMETER);
+            return 0; // FALSE
+        }
+        if (!Mem.writeUint32(wow64Ptr, 0)) return 0;
+        return 1; // TRUE — the call succeeded; *Wow64Process is the answer
+    },
+
     'GetComputerNameA': (ctx, mem, args) => {
         const lpBuffer = args[0];
         const lpnSize = args[1];
 
-        const name = 'BOTTLESHIP';
+        const name = GUEST_COMPUTER_NAME;
 
         if (!lpBuffer || !lpnSize) {
             return 0; // FALSE
@@ -1820,7 +1863,7 @@ export const exports: Record<string, ThunkImplementation> = {
         const lpBuffer = args[0];
         const lpnSize = args[1];
 
-        const name = 'BOTTLESHIP';
+        const name = GUEST_COMPUTER_NAME;
 
         if (!lpBuffer || !lpnSize) {
             return 0; // FALSE

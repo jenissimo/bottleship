@@ -10,6 +10,7 @@ import { allocateComObject } from "../core/com/com-memory";
 import { installComVtable, ComVtableMethod } from "../core/com/install-com-vtable";
 import { tryInprocCoCreateInstance, startInprocFromFactory } from "../core/com/inproc-com";
 import { Mem } from "../core/memory/mem-accessor";
+import { isValidAddress } from "../core/memory/address-guard";
 import { readGuidFromMem } from "../core/com/typelib/typelib-types";
 import { writeGuestCode } from "../core/memory/guest-code";
 import { MEM_THUNK_CODE_BASE, MEM_THUNK_CODE_SIZE } from "../core/cpu/emulator-config";
@@ -286,6 +287,43 @@ export class Ole32 implements IModule {
             view.setUint32(pclsid + 0, data1, true);
             view.setUint16(pclsid + 4, data2, true);
             view.setUint16(pclsid + 6, data3, true);
+            for (let i = 0; i < 8; i++) {
+                mem[pclsid + 8 + i] = parseInt(tail.slice(i * 2, i * 2 + 2), 16) & 0xff;
+            }
+            return S_OK;
+        };
+
+        // HRESULT CLSIDFromProgID(LPCOLESTR lpszProgID, LPCLSID lpclsid)
+        // The registry IS the lookup: HKCR\<ProgID>\CLSID's default value holds the
+        // string form, which the same parser as CLSIDFromString then turns into bytes.
+        this.exports["CLSIDFromProgID"] = (ctx, mem, args) => {
+            const lpszProgID = args[0] >>> 0;
+            const pclsid = args[1] >>> 0;
+            // The region map, not a bounds test: 16 bytes are about to be written through a
+            // guest-supplied pointer (CLAUDE.md 3.1).
+            if (!lpszProgID || !pclsid || !isValidAddress(mem, pclsid, 16, "rw")) return 0x80004003; // E_POINTER
+
+            const progId = this.readWide(mem, lpszProgID).trim();
+            const store = System.getInstance().registry;
+            const key = progId && store ? store.open("HKEY_CLASSES_ROOT", `${progId}\\CLSID`) : null;
+            const val = key ? store!.getValue(key, "") : null;
+            const clsidStr = val && val.type === "REG_SZ" ? String(val.data).trim() : "";
+            if (!clsidStr) {
+                Logger.log(LogCategory.COM, `CLSIDFromProgID("${progId}") -> CO_E_CLASSSTRING (not registered)`);
+                return CO_E_CLASSSTRING;
+            }
+
+            const text = this.normalizeGuid(clsidStr);
+            if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(text)) {
+                return CO_E_CLASSSTRING;
+            }
+
+            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            const parts = text.split("-");
+            view.setUint32(pclsid + 0, parseInt(parts[0], 16) >>> 0, true);
+            view.setUint16(pclsid + 4, parseInt(parts[1], 16) & 0xffff, true);
+            view.setUint16(pclsid + 6, parseInt(parts[2], 16) & 0xffff, true);
+            const tail = parts[3] + parts[4];
             for (let i = 0; i < 8; i++) {
                 mem[pclsid + 8 + i] = parseInt(tail.slice(i * 2, i * 2 + 2), 16) & 0xff;
             }

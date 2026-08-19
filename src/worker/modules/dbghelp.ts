@@ -5,6 +5,15 @@ import { Logger, LogCategory } from "../core/logger";
 import { Marshaler } from "../core/memory/marshaler";
 import { Mem } from "../core/memory/mem-accessor";
 import { encodeAnsi } from "./codepage-utils";
+import { isValidAddress } from "../core/memory/address-guard";
+import { System } from "../core/system";
+
+const MAX_PATH = 260;
+const ERROR_FILE_NOT_FOUND = 2;
+const ERROR_PATH_NOT_FOUND = 3;
+const ERROR_INVALID_PARAMETER = 87;
+const ERROR_INSUFFICIENT_BUFFER = 122;
+const ERROR_INVALID_ADDRESS = 487;
 
 export class DbgHelp implements IModule {
     name = "dbghelp";
@@ -45,6 +54,14 @@ export class DbgHelp implements IModule {
         // BOOL SymGetLineFromAddr(HANDLE, DWORD, PDWORD, PIMAGEHLP_LINE)
         exports['SymGetLineFromAddr'] = () => 0; // FALSE
 
+        // BOOL SymGetLineFromAddr64(HANDLE, DWORD64, PDWORD, PIMAGEHLP_LINE64)
+        // We carry no line-number data, and the documented "no line info" answer is
+        // FALSE + ERROR_INVALID_ADDRESS — callers branch on the code, not just the BOOL.
+        exports['SymGetLineFromAddr64'] = () => {
+            System.getInstance().scheduler.setLastError(ERROR_INVALID_ADDRESS);
+            return 0;
+        };
+
         // BOOL SymGetSymFromAddr(HANDLE, DWORD, PDWORD, PIMAGEHLP_SYMBOL)
         exports['SymGetSymFromAddr'] = () => 0; // FALSE
 
@@ -83,6 +100,85 @@ export class DbgHelp implements IModule {
             const nt = (base + lfanew) >>> 0;
             if (Mem.readUint32(nt) !== 0x00004550) return 0; // 'PE\0\0'
             return nt;
+        };
+
+        // BOOL MakeSureDirectoryPathExists(PCSTR DirPath)
+        // The trailing backslash is load-bearing: without one the last component is a
+        // FILE name and is not created, which is what callers passing a full file path rely on.
+        exports['MakeSureDirectoryPathExists'] = (_ctx, mem, args) => {
+            const pathPtr = args[0] >>> 0;
+            if (!pathPtr) {
+                System.getInstance().scheduler.setLastError(ERROR_INVALID_PARAMETER);
+                return 0;
+            }
+            const raw = Marshaler.readString(mem, pathPtr).replace(/\//g, "\\");
+            const lastSlash = raw.lastIndexOf("\\");
+            const dir = lastSlash >= 0 ? raw.slice(0, lastSlash) : "";
+            if (!dir) return 1;
+            const vfs = System.getInstance().fileSystem;
+            vfs.ensureDirTreeSync(dir);
+            if (vfs.directoryExists(vfs.resolvePath(dir))) return 1;
+            System.getInstance().scheduler.setLastError(ERROR_PATH_NOT_FOUND);
+            return 0;
+        };
+
+        // BOOL SearchTreeForFile(PCSTR RootPath, PCSTR InputPathName, PSTR OutputPathBuffer)
+        // Depth-first walk under RootPath for a file whose trailing components match
+        // InputPathName; the first hit's full path lands in OutputPathBuffer (MAX_PATH).
+        exports['SearchTreeForFile'] = (_ctx, mem, args) => {
+            const rootPtr = args[0] >>> 0;
+            const inputPtr = args[1] >>> 0;
+            const outPtr = args[2] >>> 0;
+            if (!rootPtr || !inputPtr || !outPtr) {
+                System.getInstance().scheduler.setLastError(ERROR_INVALID_PARAMETER);
+                return 0;
+            }
+            const vfs = System.getInstance().fileSystem;
+            const root = vfs.resolvePath(Marshaler.readString(mem, rootPtr).replace(/\//g, "\\"));
+            const wanted = Marshaler.readString(mem, inputPtr).replace(/\//g, "\\").replace(/^\\+/, "").toLowerCase();
+            if (!wanted || !vfs.directoryExists(root)) {
+                System.getInstance().scheduler.setLastError(ERROR_FILE_NOT_FOUND);
+                return 0;
+            }
+
+            const matches = (fullPath: string): boolean => {
+                const lower = fullPath.toLowerCase();
+                if (!lower.endsWith(wanted)) return false;
+                // Only whole components count: "\a\bfoo.pdb" must not match "foo.pdb".
+                const prefixLen = lower.length - wanted.length;
+                return prefixLen === 0 || lower[prefixLen - 1] === "\\";
+            };
+
+            const stack = [root];
+            let found: string | null = null;
+            while (stack.length > 0 && found === null) {
+                const dir = stack.pop()!;
+                const subdirs: string[] = [];
+                for (const entry of vfs.listDirectory(dir)) {
+                    if (entry.kind === "dir") { subdirs.push(entry.path); continue; }
+                    if (matches(entry.path)) { found = entry.path; break; }
+                }
+                // Reversed so the pop order stays the enumeration order.
+                for (let i = subdirs.length - 1; i >= 0; i--) stack.push(subdirs[i]);
+            }
+
+            if (found === null) {
+                System.getInstance().scheduler.setLastError(ERROR_FILE_NOT_FOUND);
+                return 0;
+            }
+
+            const bytes = encodeAnsi(found);
+            if (bytes.length + 1 > MAX_PATH) {
+                System.getInstance().scheduler.setLastError(ERROR_INSUFFICIENT_BUFFER);
+                return 0;
+            }
+            if (!isValidAddress(mem, outPtr, bytes.length + 1, "rw")) {
+                System.getInstance().scheduler.setLastError(ERROR_INVALID_PARAMETER);
+                return 0;
+            }
+            Mem.writeBytes(outPtr, bytes);
+            Mem.writeUint8(outPtr + bytes.length, 0);
+            return 1;
         };
     }
 }

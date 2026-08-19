@@ -30,11 +30,14 @@ export const dbghelpModule: ModuleDescriptor = {
         makeFunc("SymFunctionTableAccess", 2),
         makeFunc("SymFunctionTableAccess64", 3),
         makeFunc("SymGetLineFromAddr", 4),
+        makeFunc("SymGetLineFromAddr64", 5),
         makeFunc("SymGetSymFromAddr", 4),
         makeFunc("StackWalk", 9),
         makeFunc("StackWalk64", 9),
         makeFunc("UnDecorateSymbolName", 4),
         makeFunc("ImageNtHeader", 1),
+        makeFunc("MakeSureDirectoryPathExists", 1),
+        makeFunc("SearchTreeForFile", 3),
         makeFunc("SymFromAddr", 5), // hProcess, Address (DWORD64), Displacement, Symbol
         // hProcess, ProcessId, hFile, DumpType, ExceptionParam, UserStreamParam, CallbackParam
         makeFunc("MiniDumpWriteDump", 7),

@@ -477,7 +477,15 @@ export const kernel32Module: ModuleDescriptor = {
         makeFunc("SetProcessPriorityBoost", 2),
         makeFunc("SetThreadPriorityBoost", 2),
         makeFunc("SetThreadExecutionState", 1),
+        makeFunc("IsWow64Process", 2),
         makeFunc("VerifyVersionInfoW", 3, {
+            params: [
+                { name: "lpVersionInformation", type: "ptr" },
+                { name: "dwTypeMask", type: "u32" },
+                { name: "dwlConditionMask", type: "u64" },
+            ],
+        }),
+        makeFunc("VerifyVersionInfoA", 3, {
             params: [
                 { name: "lpVersionInformation", type: "ptr" },
                 { name: "dwTypeMask", type: "u32" },
@@ -577,6 +585,8 @@ export const kernel32Module: ModuleDescriptor = {
         makeFunc("ReadConsoleA", 5),
         makeFunc("LockFile", 5),
         makeFunc("UnlockFile", 5),
+        makeFunc("LockFileEx", 6),
+        makeFunc("UnlockFileEx", 5),
         makeFunc("CreatePipe", 4),
         makeFunc("LocalFileTimeToFileTime", 2),
         makeFunc("GetProcessTimes", 5),

@@ -26,5 +26,6 @@ export const psapiModule: ModuleDescriptor = {
         makeFunc("EnumProcesses", 3),
         makeFunc("EnumProcessModules", 4),
         makeFunc("EnumProcessModulesEx", 5),
+        makeFunc("GetProcessMemoryInfo", 3),
     ],
 };

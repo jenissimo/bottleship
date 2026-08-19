@@ -1,5 +1,6 @@
 import { ModuleDescriptor, calculateStackCleanup } from "../api/types";
 import { setupapiModule } from "../api/setupapi.api";
+import { hidModule } from "../api/hid.api";
 import { lgvidModule } from "../api/lgvid.api";
 import { oledlgModule } from "../api/oledlg.api";
 import { kernel32VistaSupplement } from "../api/kernel32-vista-supplement";
@@ -75,6 +76,7 @@ export class APIRegistry {
         // Static imports for modules added after the last Vite glob scan (import.meta.glob
         // is fixed at compile time — new *.api.ts files are invisible until rebuild).
         this.registerModule(setupapiModule);
+        this.registerModule(hidModule);
         this.registerModule(lgvidModule);
         this.registerModule(oledlgModule);
 
