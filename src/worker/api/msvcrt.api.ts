@@ -186,6 +186,10 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("_findfirst", 2),
         makeFunc("_findnext", 2),
         makeFunc("qsort", 4),
+        // Both resolve to native x86 (registerDataExport) so the guest comparator is called
+        // in guest space — but a data export only replaces a stub the descriptor asked for,
+        // so an undeclared name has no IAT entry to redirect and the native code is dead.
+        makeFunc("bsearch", 5),
         makeFunc("getenv", 1),
         makeFunc("_putenv", 1),
         makeFunc("_wputenv", 1),
@@ -410,7 +414,6 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("localtime", 1),
         makeFunc("ctime", 1),
         makeFunc("clearerr", 1),
-        makeFunc("_clearerr", 1),
         makeFunc("_open_osfhandle", 2),
         makeFunc("_fdopen", 2),
         makeFunc("__doserrno", 0),

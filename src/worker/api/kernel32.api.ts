@@ -280,6 +280,7 @@ export const kernel32Module: ModuleDescriptor = {
         makeFunc("GetConsoleCursorInfo", 2),
         makeFunc("SetConsoleCursorInfo", 2),
         makeFunc("FillConsoleOutputCharacterA", 5),
+        makeFunc("FillConsoleOutputCharacterW", 5),
         makeFunc("FillConsoleOutputAttribute", 5),
         makeFunc("WriteConsoleOutputCharacterA", 5),
         makeFunc("SetConsoleTitleA", 1),

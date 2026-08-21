@@ -234,7 +234,6 @@ export class Msvcrt implements IModule {
         exports["printf"] = (ctx, mem, args) => this.printf(args);
         exports["sscanf"] = (ctx, mem, args) => this.sscanf(args);
         exports["fscanf"] = (ctx, mem, args) => this.fscanf(args);
-        exports["_fscanf"] = exports["fscanf"];
         // setbuf/setvbuf — buffering is internal to our VFS; accept and no-op.
         exports["setbuf"] = () => 0;
         exports["setvbuf"] = () => 0;
@@ -525,27 +524,6 @@ export class Msvcrt implements IModule {
         exports["putc"] = exports["fputc"];
         exports["ungetc"] = (ctx, mem, args) => this.ungetc(args[0] ?? 0, args[1] ?? 0);
         exports["strerror"] = (ctx, mem, args) => this.strerror(args[0] ?? 0);
-
-        // MSVC decorated aliases (_fopen = fopen, etc.)
-        exports["_fopen"] = exports["fopen"];
-        exports["_fclose"] = exports["fclose"];
-        exports["_fread"] = exports["fread"];
-        exports["_fwrite"] = exports["fwrite"];
-        exports["_fgets"] = exports["fgets"];
-        exports["_fputs"] = exports["fputs"];
-        exports["_fseek"] = exports["fseek"];
-        exports["_ftell"] = exports["ftell"];
-        exports["_fflush"] = exports["fflush"];
-        exports["_fprintf"] = exports["fprintf"];
-        exports["_feof"] = exports["feof"];
-        exports["_ferror"] = exports["ferror"];
-        exports["_clearerr"] = exports["clearerr"];
-        exports["_rewind"] = exports["rewind"];
-        exports["_fgetc"] = exports["fgetc"];
-        exports["_fputc"] = exports["fputc"];
-        exports["_ungetc"] = exports["ungetc"];
-        exports["_fgetpos"] = exports["fgetpos"];
-        exports["_fsetpos"] = exports["fsetpos"];
 
         // --- Character classification ---
         exports["isalpha"] = (ctx, mem, args) => this.ischartype(args[0] ?? 0, 0x0100 | 0x0001 | 0x0002);

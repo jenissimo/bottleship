@@ -62,15 +62,17 @@ export function installCw3220Stdio(process: Process): Map<string, number> | null
     // [name, handler, argCount]. FILE*-consuming funcs MUST all be overridden so our
     // pseudo-FILE* never reaches real CW3220 code. fprintf/vfprintf are dropped (output
     // only, not needed to boot) but still overridden so they don't deref our FILE*.
+    // Borland decorates its exports with a leading underscore; msvcrt.dll does not, so the
+    // left column is CW3220's spelling and the right one is the msvcrt handler behind it.
     const table: Array<[string, ThunkImplementation | undefined, number]> = [
-        ["_fopen", m["_fopen"], 2],
-        ["_fclose", m["_fclose"], 1],
-        ["_fread", m["_fread"], 4],
-        ["_fwrite", m["_fwrite"], 4],
-        ["_fseek", m["_fseek"], 3],
-        ["_ftell", m["_ftell"], 1],
-        ["_fgets", m["_fgets"], 3],
-        ["__fgetc", m["_fgetc"], 1],   // Borland's getc spelling
+        ["_fopen", m["fopen"], 2],
+        ["_fclose", m["fclose"], 1],
+        ["_fread", m["fread"], 4],
+        ["_fwrite", m["fwrite"], 4],
+        ["_fseek", m["fseek"], 3],
+        ["_ftell", m["ftell"], 1],
+        ["_fgets", m["fgets"], 3],
+        ["__fgetc", m["fgetc"], 1],   // Borland's getc spelling
         ["_chdir", m["_chdir"], 1],
         ["_fprintf", noop0, 2],
         ["_vfprintf", noop0, 3],
