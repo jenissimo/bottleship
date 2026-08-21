@@ -1,5 +1,6 @@
 import { RegistryPersistence, RegistryAccessLogEntry, PersistedRegistryState } from "./registry-persistence";
 import { Logger, LogCategory } from "../../core/logger";
+import { EmulatorConfig } from "../../core/emulator-config-manager";
 
 export type RegistryValueType = "REG_SZ" | "REG_DWORD" | "REG_BINARY" | "REG_MULTI_SZ";
 
@@ -28,8 +29,85 @@ export interface RegistrySeed {
     values: RegistryValue[];
 }
 
+/** VER_PLATFORM_WIN32_WINDOWS — the Win9x branch of EmulatorConfig.osVersion. */
+const PLATFORM_WIN32_WINDOWS = 1;
+
+function sz(name: string, data: string): RegistryValue {
+    return { name, type: "REG_SZ", data };
+}
+
+/**
+ * The keys a Windows install ALWAYS has, which no bundle should have to ship.
+ *
+ * A launcher that reads HKLM\SOFTWARE\Microsoft\DirectX\Version and finds nothing does
+ * not conclude "unknown" — it concludes DirectX is absent and refuses to start, or
+ * offers to install it. Writing that into every bundle's registry.json would be a
+ * per-game crutch for a fact about the SYSTEM, so the system provides it.
+ *
+ * Built on first READ, never at seed time: the manifest's osVersion is applied after
+ * boot seeding, and these values must describe the OS we actually report to
+ * GetVersionEx. They live outside the key store, so a bundle seed or a value the game
+ * writes shadows them, and nothing here is ever persisted as if the game had written it.
+ */
+function buildSystemDefaults(osVersion: {
+    major: number; minor: number; build: number; platformId: number;
+}): RegistrySeed[] {
+    const { major, minor, build, platformId } = osVersion;
+    const isWin9x = platformId === PLATFORM_WIN32_WINDOWS;
+    const productName = isWin9x
+        ? (minor >= 90 ? "Microsoft Windows Me" : minor >= 10 ? "Microsoft Windows 98" : "Microsoft Windows 95")
+        : (major === 5 && minor === 0 ? "Microsoft Windows 2000" : "Microsoft Windows XP");
+
+    // The shared HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion values every installer
+    // reads, plus the OS identity in the place THIS platform keeps it: Win9x under
+    // Windows\CurrentVersion, NT under Windows NT\CurrentVersion.
+    const commonCurrentVersion: RegistryValue[] = [
+        sz("ProgramFilesDir", "C:\\Program Files"),
+        sz("CommonFilesDir", "C:\\Program Files\\Common Files"),
+        sz("SystemRoot", "C:\\WINDOWS"),
+        sz("DevicePath", "C:\\WINDOWS\\INF"),
+    ];
+    const osIdentity: RegistryValue[] = isWin9x
+        ? [
+            sz("Version", productName.replace("Microsoft ", "")),
+            sz("VersionNumber", `${major}.${minor}.${build}`),
+            sz("SubVersionNumber", ""),
+            sz("ProductName", productName),
+        ]
+        : [
+            sz("CurrentVersion", `${major}.${minor}`),
+            sz("CurrentBuildNumber", String(build)),
+            sz("CurrentBuild", String(build)),
+            sz("ProductName", productName),
+            sz("CSDVersion", ""),
+            sz("SystemRoot", "C:\\WINDOWS"),
+        ];
+
+    const seeds: RegistrySeed[] = [
+        {
+            root: "HKLM", path: "Software\\Microsoft\\Windows\\CurrentVersion",
+            values: isWin9x ? [...commonCurrentVersion, ...osIdentity] : commonCurrentVersion,
+        },
+        // DirectX 9.0c — the highest version we implement (ddraw/d3d7/d3d8/d3d9). The
+        // string form is what the DX runtime writes and what launchers compare against.
+        {
+            root: "HKLM", path: "Software\\Microsoft\\DirectX",
+            values: [sz("Version", "4.09.00.0904")],
+        },
+    ];
+    if (!isWin9x) {
+        seeds.push({
+            root: "HKLM", path: "Software\\Microsoft\\Windows NT\\CurrentVersion",
+            values: osIdentity,
+        });
+    }
+    return seeds;
+}
+
 export class RegistryStore {
     private keys: Map<string, Map<string, RegistryValue>> = new Map();
+    /** Lazily built system baseline (see buildSystemDefaults); null until first read. */
+    private systemDefaults: Map<string, Map<string, RegistryValue>> | null = null;
     private gameId: string = "";
     private accessLogBuffer: RegistryAccessLogEntry[] = [];
     private onChangeCallback: (() => void) | null = null;
@@ -37,9 +115,35 @@ export class RegistryStore {
 
     reset(): void {
         this.keys.clear();
+        this.systemDefaults = null;
         this.accessLogBuffer = [];
         this.gameId = "";
         this.onChangeCallback = null;
+    }
+
+    /** The system baseline, built on first use so it reflects the manifest's osVersion
+     *  (applied after boot seeding) rather than the pre-manifest default. */
+    private defaults(): Map<string, Map<string, RegistryValue>> {
+        if (this.systemDefaults) return this.systemDefaults;
+        const map = new Map<string, Map<string, RegistryValue>>();
+        for (const seed of buildSystemDefaults(EmulatorConfig.getInstance().osVersion)) {
+            const values = new Map<string, RegistryValue>();
+            for (const value of seed.values) values.set(value.name.toLowerCase(), value);
+            map.set(this.normalizeKey(seed.root, seed.path), values);
+        }
+        this.systemDefaults = map;
+        return map;
+    }
+
+    /** Stored values shadow the baseline, name by name. */
+    private mergedValues(keyHandle: string): Map<string, RegistryValue> | null {
+        const stored = this.keys.get(keyHandle);
+        const base = this.defaults().get(keyHandle);
+        if (!base) return stored ?? null;
+        if (!stored) return base;
+        const merged = new Map(base);
+        for (const [name, value] of stored) merged.set(name, value);
+        return merged;
     }
 
     seed(seed: RegistrySeed | RegistrySeed[] | any): void {
@@ -108,10 +212,11 @@ export class RegistryStore {
         const key = this.normalizeKey(root, path);
         if (this.keys.has(key)) return key;
         if (IMPLICIT_EMPTY_KEYS.has(key)) return key;
+        if (this.defaults().has(key)) return key;
         // Support opening intermediate keys: if any stored key starts with this prefix,
         // the intermediate key implicitly exists (Windows registry semantics).
         const prefix = key + "\\";
-        for (const k of this.keys.keys()) {
+        for (const k of [...this.keys.keys(), ...this.defaults().keys()]) {
             if (k.startsWith(prefix)) {
                 // Create the intermediate key so future lookups are O(1)
                 this.keys.set(key, new Map());
@@ -122,7 +227,7 @@ export class RegistryStore {
     }
 
     getValue(keyHandle: string, valueName: string): RegistryValue | null {
-        const values = this.keys.get(keyHandle);
+        const values = this.mergedValues(keyHandle);
         const value = values ? values.get(valueName.toLowerCase()) ?? null : null;
 
         // Log access
@@ -246,13 +351,13 @@ export class RegistryStore {
     }
 
     enumValues(keyHandle: string): RegistryValue[] {
-        const values = this.keys.get(keyHandle);
+        const values = this.mergedValues(keyHandle);
         if (!values) return [];
         return Array.from(values.values());
     }
 
     getKeyInfo(keyHandle: string): { valueCount: number; maxValueNameLen: number; maxValueDataLen: number } {
-        const values = this.keys.get(keyHandle);
+        const values = this.mergedValues(keyHandle);
         if (!values) return { valueCount: 0, maxValueNameLen: 0, maxValueDataLen: 0 };
 
         let maxNameLen = 0;
@@ -276,7 +381,7 @@ export class RegistryStore {
         const prefix = `${fullKey}\\`;
         const names = new Set<string>();
 
-        for (const key of this.keys.keys()) {
+        for (const key of [...this.keys.keys(), ...this.defaults().keys()]) {
             if (!key.startsWith(prefix)) continue;
             const remainder = key.slice(prefix.length);
             const next = remainder.split("\\")[0];

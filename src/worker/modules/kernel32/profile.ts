@@ -18,9 +18,14 @@ type IniData = Map<string, Map<string, string>>;
 
 // Cache: normalized file path -> parsed data
 const iniCache = new Map<string, IniData>();
+// Raw file text per normalized path. Windows edits the FILE, not a model of it: comments,
+// key order and unknown sections all survive a WritePrivateProfileString, and an app that
+// hand-edits its own ini alongside the API must not have the rest of it rewritten away.
+const iniText = new Map<string, string>();
 
 export function resetIniCache(): void {
     iniCache.clear();
+    iniText.clear();
 }
 
 /**
@@ -141,10 +146,115 @@ function lookupIniData(fileName: string): IniLookup {
 }
 
 function cacheParsedIni(cacheKey: string, fileName: string, data: Uint8Array): IniData {
-    const parsed = parseIniContent(new TextDecoder('latin1').decode(data));
+    const text = new TextDecoder('latin1').decode(data);
+    const parsed = parseIniContent(text);
     Logger.log(LogCategory.KERNEL32, `INI: parsed "${fileName}" -> ${parsed.size} sections`);
     iniCache.set(cacheKey, parsed);
+    iniText.set(cacheKey, text);
     return parsed;
+}
+
+/**
+ * Apply one WritePrivateProfileString edit to raw INI text, Win32-style.
+ *
+ * `key === null` deletes the whole section; `value === null` deletes the key. A key set in
+ * a section that exists is rewritten IN PLACE (order and comments preserved); a new key is
+ * appended to the end of its section, and a new section to the end of the file.
+ */
+function applyIniEdit(text: string, section: string, key: string | null, value: string | null): string {
+    const eol = text.includes('\r\n') || text === '' ? '\r\n' : '\n';
+    const lines = text.length ? text.split(/\r?\n/) : [];
+    const isHeader = (l: string): RegExpMatchArray | null => l.trim().match(/^\[([^\]]*)\]$/);
+    const want = section.toLowerCase();
+
+    let start = -1;   // index of the section header
+    let end = lines.length; // first line past the section body
+    for (let i = 0; i < lines.length; i++) {
+        const h = isHeader(lines[i]);
+        if (!h) continue;
+        if (start === -1 && h[1].trim().toLowerCase() === want) start = i;
+        else if (start !== -1) { end = i; break; }
+    }
+
+    if (key === null) {
+        if (start === -1) return text;
+        lines.splice(start, end - start);
+        return lines.join(eol);
+    }
+
+    const wantKey = key.toLowerCase();
+    if (start !== -1) {
+        for (let i = start + 1; i < end; i++) {
+            const eq = lines[i].indexOf('=');
+            if (eq === -1 || lines[i].trim().startsWith(';') || lines[i].trim().startsWith('#')) continue;
+            if (lines[i].slice(0, eq).trim().toLowerCase() !== wantKey) continue;
+            if (value === null) lines.splice(i, 1);
+            else lines[i] = `${key}=${value}`;
+            return lines.join(eol);
+        }
+        if (value === null) return text;
+        // Append inside the section, before the blank lines that separate it from the next.
+        let at = end;
+        while (at > start + 1 && lines[at - 1].trim() === '') at--;
+        lines.splice(at, 0, `${key}=${value}`);
+        return lines.join(eol);
+    }
+
+    if (value === null) return text;
+    while (lines.length && lines[lines.length - 1].trim() === '') lines.pop();
+    if (lines.length) lines.push('');
+    lines.push(`[${section}]`, `${key}=${value}`, '');
+    return lines.join(eol);
+}
+
+/**
+ * WritePrivateProfileString — the real thing: edit the file on disk.
+ *
+ * Returning TRUE while only touching an in-memory model is a wrong answer the caller cannot
+ * detect: the write "succeeds", nothing lands, and every setting is lost the moment the
+ * process (or the page) goes away. Games hand their whole detected-hardware/graphics config
+ * over this API and read it back in a LATER process, so the file is the contract.
+ */
+function writeIniValue(
+    fileName: string | null, section: string | null, key: string | null, value: string | null,
+    who: string,
+): number {
+    // lpAppName === NULL is "flush my cached writes" — we never defer, so it is already true.
+    if (!fileName || section === null) return 1;
+
+    const vfs = System.getInstance().fileSystem;
+    const resolved = vfs.resolvePath(fileName);
+    const cacheKey = resolved.toLowerCase();
+
+    let text = iniText.get(cacheKey);
+    if (text === undefined) {
+        // Not read yet this session. Pull the current bytes so unrelated content survives;
+        // a miss is an absent/empty file, which an edit legitimately creates.
+        text = '';
+        const handle = vfs.openSync(fileName, 0x80000000 /* GENERIC_READ */, 3 /* OPEN_EXISTING */);
+        if (handle) {
+            const size = vfs.getFileSize(handle.path);
+            const data = size > 0 ? vfs.readSync(handle, size) : null;
+            if (data && data.length >= size) text = new TextDecoder('latin1').decode(data);
+        }
+    }
+
+    const updated = applyIniEdit(text, section, key, value);
+    iniText.set(cacheKey, updated);
+    iniCache.set(cacheKey, parseIniContent(updated));
+
+    const out = vfs.openSync(fileName, 0x40000000 /* GENERIC_WRITE */, 2 /* CREATE_ALWAYS */);
+    if (!out) {
+        Logger.warn(LogCategory.KERNEL32, `${who}: cannot open "${resolved}" for write`);
+        return 0;
+    }
+    const bytes = encodeAnsi(updated);
+    const written = vfs.writeSync(out, bytes);
+    if (written < 0) {
+        Logger.warn(LogCategory.KERNEL32, `${who}: write to "${resolved}" failed`);
+        return 0;
+    }
+    return 1;
 }
 
 /**
@@ -426,21 +536,7 @@ export const exports: Record<string, ThunkImplementation> = {
 
         Logger.log(LogCategory.KERNEL32, `WritePrivateProfileStringA: [${section}] ${key}=${value} in "${fileName}"`);
 
-        // Update in-memory cache if the file was already parsed
-        if (fileName && section && key && value !== null) {
-            const system = System.getInstance();
-            const resolved = system.fileSystem.resolvePath(fileName).toLowerCase();
-            const cached = iniCache.get(resolved);
-            if (cached) {
-                const sectionKey = section.toLowerCase();
-                if (!cached.has(sectionKey)) {
-                    cached.set(sectionKey, new Map());
-                }
-                cached.get(sectionKey)!.set(key.toLowerCase(), value);
-            }
-        }
-
-        return 1; // TRUE
+        return writeIniValue(fileName, section, key, value, 'WritePrivateProfileStringA');
     },
 
     'WritePrivateProfileStringW': (ctx, mem, args) => {
@@ -456,21 +552,7 @@ export const exports: Record<string, ThunkImplementation> = {
 
         Logger.log(LogCategory.KERNEL32, `WritePrivateProfileStringW: [${section}] ${key}=${value} in "${fileName}"`);
 
-        // Update in-memory cache if the file was already parsed
-        if (fileName && section && key && value !== null) {
-            const system = System.getInstance();
-            const resolved = system.fileSystem.resolvePath(fileName).toLowerCase();
-            const cached = iniCache.get(resolved);
-            if (cached) {
-                const sectionKey = section.toLowerCase();
-                if (!cached.has(sectionKey)) {
-                    cached.set(sectionKey, new Map());
-                }
-                cached.get(sectionKey)!.set(key.toLowerCase(), value);
-            }
-        }
-
-        return 1; // TRUE
+        return writeIniValue(fileName, section, key, value, 'WritePrivateProfileStringW');
     },
 
     'GetPrivateProfileStringW': (ctx, mem, args) => {
