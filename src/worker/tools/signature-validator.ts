@@ -10,6 +10,11 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as ts from 'typescript';
 
+/** `IFoo_Method` — a COM vtable slot, declared as an Interface/method pair rather than a flat export. */
+// Case-insensitive: the implementation table lowercases its keys while the descriptors
+// are written in the SDK's casing, so a case-sensitive test silently matches neither.
+const COM_METHOD_NAME = /^i[a-z0-9][a-z0-9]*_[a-z0-9_]+$/i;
+
 export interface ValidationResult {
     moduleName: string;
     valid: boolean;
@@ -597,6 +602,7 @@ export class SignatureValidator {
         const apiContent = fs.readFileSync(apiFile, 'utf-8');
         const apiFunctions = this.extractApiFunctions(apiFile, apiContent);
         const apiInterfaces = this.extractApiInterfaces(apiFile, apiContent);
+        let unverifiable = 0;
 
         // Build set of implemented function names (lowercase for case-insensitive check)
         const implementedNames = new Set(implemented.map(f => f.name.toLowerCase()));
@@ -619,13 +625,33 @@ export class SignatureValidator {
             }
 
             if (expectedArgs === undefined) {
-                // If it's a D3D9 method, it might be in a different format, skip for now
-                if (moduleName === 'd3d9' || moduleName === 'dsound') continue;
-
+                // Two very different things reach here, and reporting them as one is why this
+                // warning fired 297 times — the whole of the gate's warning output — and was
+                // silenced for two modules by NAME rather than by mechanism. A check that
+                // calls its entire input suspect says the same as a check that says nothing:
+                // the one real finding in that list (an implemented export absent from its
+                // .api.ts, and therefore unreachable) stayed invisible until a title went
+                // silent.
+                //
+                // A COM vtable method is declared as an Interface/method pair, and
+                // extractApiInterfaces openly cannot enumerate a method list built by a
+                // computed spread. So for those names this check is UNVERIFIABLE, not failing,
+                // and it must say so — the same vocabulary the export-binding section uses.
+                //
+                // A flat export missing from the descriptor is a real finding, but state it
+                // no harder than it is: APIRegistry.getArgCount ends in an `@N` parse, so a
+                // decorated stdcall name still binds — undeclared, its ABI is INFERRED from
+                // the name rather than stated. An undecorated one has nothing to infer from:
+                // a static import cannot be given a stub at all, and GetProcAddress hands out
+                // a RET-0 stub for what may be a stdcall export.
+                if (COM_METHOD_NAME.test(impl.name)) {
+                    unverifiable++;
+                    continue;
+                }
                 warnings.push({
                     type: 'incomplete_implementation',
                     functionName: impl.name,
-                    message: `Function implemented but not found in ${path.basename(apiFile)}`
+                    message: `implemented but NOT DECLARED in ${path.basename(apiFile)} — nothing states its ABI, so the loader must infer one from the name or refuse the import`
                 });
                 continue;
             }
@@ -921,6 +947,7 @@ export class SignatureValidator {
                 if (!ts.isObjectLiteralExpression(element)) continue;
                 let funcName: string | null = null;
                 let paramCount: number | null = null;
+                let ordinal: number | null = null;
                 for (const prop of element.properties) {
                     if (!ts.isPropertyAssignment(prop)) continue;
                     const propName = ts.isIdentifier(prop.name) ? prop.name.text : null;
@@ -928,10 +955,18 @@ export class SignatureValidator {
                         funcName = getStringLiteral(prop.initializer);
                     } else if (propName === 'params' && ts.isArrayLiteralExpression(prop.initializer)) {
                         paramCount = prop.initializer.elements.length;
+                    } else if (propName === 'ordinal') {
+                        ordinal = getNumberLiteral(prop.initializer);
                     }
                 }
                 if (funcName && paramCount !== null) {
                     addFunction(funcName, paramCount);
+                    // An `ordinal:` declaration makes the export reachable by ordinal ALONE —
+                    // dsound/dplayx ship most of theirs nameless. The loader resolves ordinal N
+                    // through this same descriptor, and modules register the handler under the
+                    // `ord_N` spelling the import table hands them. One declaration, two legal
+                    // names: register both, or every by-ordinal export reads as undeclared.
+                    if (ordinal !== null) addFunction(`ord_${ordinal}`, paramCount);
                 }
             }
         };
