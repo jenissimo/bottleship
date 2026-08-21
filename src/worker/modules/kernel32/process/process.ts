@@ -970,6 +970,9 @@ export const exports: Record<string, ThunkImplementation> = {
             case 6:  // PF_XMMI_INSTRUCTIONS_AVAILABLE (SSE)
             case 8:  // PF_RDTSC_INSTRUCTION_AVAILABLE
             case 10: // PF_XMMI64_INSTRUCTIONS_AVAILABLE (SSE2)
+            case 13: // PF_SSE3_INSTRUCTIONS_AVAILABLE — CPUID.1:ECX[0] is set, so this must be
+                     // too: a runtime that dispatches on the pair takes the SSE3 path either way
+                     // and only the disagreement is observable.
                 supported = 1;
                 break;
             case 1:  // PF_FLOATING_POINT_EMULATED
@@ -1635,18 +1638,19 @@ export const exports: Record<string, ThunkImplementation> = {
         const returnLengthPtr = args[1] >>> 0;
         const required = 24; // sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION) on x86
 
-        if (returnLengthPtr) {
-            Mem.writeUint32(returnLengthPtr, required);
-        }
-
-        if (!bufferPtr) {
-            System.getInstance().process!.lastError = 122; // ERROR_INSUFFICIENT_BUFFER
+        if (!returnLengthPtr) {
+            System.getInstance().process!.lastError = 87; // ERROR_INVALID_PARAMETER
             return 0;
         }
 
+        // ReturnedLength is in/out: on entry it carries the caller's buffer size. Read it BEFORE
+        // writing the required size back, or the capacity check compares `required` with itself
+        // and a too-small buffer gets 24 bytes written over whatever follows it.
         const length = Mem.readUint32(returnLengthPtr) ?? 0;
-        if (length < required) {
-            System.getInstance().process!.lastError = 122;
+        Mem.writeUint32(returnLengthPtr, required);
+
+        if (!bufferPtr || length < required) {
+            System.getInstance().process!.lastError = 122; // ERROR_INSUFFICIENT_BUFFER
             return 0;
         }
 

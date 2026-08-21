@@ -26,6 +26,8 @@
  */
 
 import { Logger, LogCategory } from './logger';
+import { EmulatorConfig } from './emulator-config-manager';
+import { GUEST_NUMBER_OF_PROCESSORS } from './guest-cpu-identity';
 
 // TEB field offsets
 const TEB_EXCEPTION_LIST    = 0x00;
@@ -39,7 +41,9 @@ const TEB_PEB               = 0x30;
 const TEB_LAST_ERROR        = 0x34;
 
 const TEB_SIZE = 4096;          // One page per TEB
-const PEB_SIZE = 256;           // PEB header proper
+// A 32-bit NT 5.x PEB is 0x210 bytes. Anything we place at PEB+offset below that lands inside a
+// real field (0x100 is in the middle of GdiHandleBuffer), so the header proper is reserved whole.
+const PEB_SIZE = 0x230;
 const TLS_MINIMUM_AVAILABLE = 64;
 const TLS_ARRAY_SIZE = TLS_MINIMUM_AVAILABLE * 4; // 64 slots * 4 bytes each
 
@@ -49,6 +53,12 @@ const FAKE_PID = 1234;
 const PEB_BEING_DEBUGGED       = 0x02; // BOOLEAN (byte)
 const PEB_IMAGE_BASE           = 0x08; // PVOID
 const PEB_PROCESS_PARAMETERS   = 0x10; // PRTL_USER_PROCESS_PARAMETERS
+const PEB_NUMBER_OF_PROCESSORS = 0x64; // ULONG
+const PEB_OS_MAJOR_VERSION     = 0xA4; // ULONG
+const PEB_OS_MINOR_VERSION     = 0xA8; // ULONG
+const PEB_OS_BUILD_NUMBER      = 0xAC; // USHORT
+const PEB_OS_CSD_VERSION       = 0xAE; // USHORT
+const PEB_OS_PLATFORM_ID       = 0xB0; // ULONG
 
 // RTL_USER_PROCESS_PARAMETERS (32-bit) — only the head scalar fields matter for us;
 // the rest stays zeroed (empty/valid). Real CRTs read ProcessParameters->Flags (+8),
@@ -103,6 +113,7 @@ export class TebManager {
         view.setUint8(this.pebAddress + PEB_BEING_DEBUGGED, 0);
         view.setUint32(this.pebAddress + PEB_IMAGE_BASE, imageBase, true);
 
+        this.writePebSystemFields();
         this.ensureProcessParameters();
 
         Logger.log(LogCategory.THREAD,
@@ -147,7 +158,28 @@ export class TebManager {
         if (view) {
             view.setUint32(this.pebAddress + PEB_IMAGE_BASE, imageBase, true);
         }
+        this.writePebSystemFields();
         this.ensureProcessParameters();
+    }
+
+    /**
+     * OS version + processor count as the loader publishes them. Code that avoids the call
+     * overhead of GetVersionEx reads these inline through fs:[0x30]; left zeroed they say
+     * "Windows 0.0, platform 0", which every version gate reads as an OS older than anything
+     * it supports. Re-written on every image (re)load because the manifest that carries
+     * osVersion is applied after the PEB is first allocated, and reset() zeroes it.
+     */
+    private writePebSystemFields(): void {
+        if (!this.pebAddress) return;
+        const view = this.getView();
+        if (!view) return;
+        const { major, minor, build, platformId } = EmulatorConfig.getInstance().osVersion;
+        view.setUint32(this.pebAddress + PEB_OS_MAJOR_VERSION, major >>> 0, true);
+        view.setUint32(this.pebAddress + PEB_OS_MINOR_VERSION, minor >>> 0, true);
+        view.setUint16(this.pebAddress + PEB_OS_BUILD_NUMBER, build & 0xFFFF, true);
+        view.setUint16(this.pebAddress + PEB_OS_CSD_VERSION, 0, true); // no service pack
+        view.setUint32(this.pebAddress + PEB_OS_PLATFORM_ID, platformId >>> 0, true);
+        view.setUint32(this.pebAddress + PEB_NUMBER_OF_PROCESSORS, GUEST_NUMBER_OF_PROCESSORS, true);
     }
 
     /**

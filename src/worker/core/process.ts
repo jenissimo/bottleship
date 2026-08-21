@@ -10,6 +10,13 @@ import { Mem } from './memory/mem-accessor';
 import { MAX_ALLOC_BYTES, MEM_LOWMEM_SIZE, MEM_HEAP_BASE } from './cpu/emulator-config';
 import { Logger, LogCategory } from './logger';
 import { GUEST_COMPUTER_NAME } from './guest-identity';
+import {
+    GUEST_NUMBER_OF_PROCESSORS,
+    GUEST_PROCESSOR_ARCHITECTURE,
+    GUEST_PROCESSOR_IDENTIFIER,
+    GUEST_PROCESSOR_LEVEL,
+    GUEST_PROCESSOR_REVISION_STRING,
+} from './guest-cpu-identity';
 import { ModuleRegistry } from './module-registry';
 import { memoryEventBuffer, MemoryEventType } from './memory/memory-event-buffer';
 import { ensureGuestPagesCommitted } from './memory/guest-page-commit';
@@ -1003,14 +1010,7 @@ export class Process {
             Logger.error(LogCategory.SYSTEM, `Failed to initialize thunk memory: ${err}`);
         });
 
-        // Default environment
-        this.environment.set("PATH", "C:\\WINDOWS\\SYSTEM32;C:\\WINDOWS;C:\\");
-        this.environment.set("SYSTEMROOT", "C:\\WINDOWS");
-        this.environment.set("WINDIR", "C:\\WINDOWS");
-        this.environment.set("TEMP", "C:\\TEMP");
-        this.environment.set("TMP", "C:\\TEMP");
-        this.environment.set("USERNAME", "BottleShip");
-        this.environment.set("COMPUTERNAME", GUEST_COMPUTER_NAME);
+        this.setDefaultEnvironment();
 
         // Initialize callback manager for x86 callback invocation (WndProc, etc.)
         // Pass thunk memory manager to dispatcher so it can use dynamic addresses
@@ -1165,6 +1165,21 @@ export class Process {
 
         // Restore default environment
         this.environment.clear();
+        this.setDefaultEnvironment();
+
+        this.lastError = 0;
+
+        Logger.log(LogCategory.SYSTEM, "Process reset");
+    }
+
+    /**
+     * The environment block a fresh NT process inherits. The PROCESSOR_* set is not decoration:
+     * build tools, script hosts and a fair number of engine launchers read %PROCESSOR_IDENTIFIER%
+     * or %PROCESSOR_LEVEL% instead of calling CPUID, and an absent variable reads as "unknown CPU"
+     * — the same wrong branch a wrong value would pick. Derived from guest-cpu-identity so this
+     * cannot drift away from CPUID and GetSystemInfo.
+     */
+    private setDefaultEnvironment(): void {
         this.environment.set("PATH", "C:\\WINDOWS\\SYSTEM32;C:\\WINDOWS;C:\\");
         this.environment.set("SYSTEMROOT", "C:\\WINDOWS");
         this.environment.set("WINDIR", "C:\\WINDOWS");
@@ -1172,9 +1187,10 @@ export class Process {
         this.environment.set("TMP", "C:\\TEMP");
         this.environment.set("USERNAME", "BottleShip");
         this.environment.set("COMPUTERNAME", GUEST_COMPUTER_NAME);
-
-        this.lastError = 0;
-
-        Logger.log(LogCategory.SYSTEM, "Process reset");
+        this.environment.set("NUMBER_OF_PROCESSORS", String(GUEST_NUMBER_OF_PROCESSORS));
+        this.environment.set("PROCESSOR_ARCHITECTURE", GUEST_PROCESSOR_ARCHITECTURE);
+        this.environment.set("PROCESSOR_IDENTIFIER", GUEST_PROCESSOR_IDENTIFIER);
+        this.environment.set("PROCESSOR_LEVEL", String(GUEST_PROCESSOR_LEVEL));
+        this.environment.set("PROCESSOR_REVISION", GUEST_PROCESSOR_REVISION_STRING);
     }
 }
