@@ -12,6 +12,7 @@ import { APIRegistry } from "./core/api-registry";
 import { memoryWatch } from "./core/memory/memory-watch";
 import { memWriteTrap } from "./core/memory/mem-write-trap";
 import { Kernel32 } from "./modules/kernel32";
+import { adoptNamedObjects, namedObjects, type NamedObjectSpec } from "./modules/kernel32/named-objects";
 import { User32 } from "./modules/user32";
 import { GDI32 } from "./modules/gdi32";
 import { D3D9 } from "./modules/d3d9";
@@ -36,6 +37,7 @@ import { OpenGL32 } from "./modules/opengl32";
 import { Glu32 } from "./modules/glu32";
 import { Wsock32 } from "./modules/wsock32";
 import { Shell32 } from "./modules/shell32";
+import { Shfolder } from "./modules/shfolder";
 import { Shlwapi } from "./modules/shlwapi";
 import { Comdlg32 } from "./modules/comdlg32";
 import { Comctl32 } from "./modules/comctl32";
@@ -314,6 +316,10 @@ let pendingReExecArgs: string | null = null;
 let pendingReExecImage: string | null = null;
 /** Bytes a launcher wrote into the child it created suspended, replayed after the PE loads. */
 let pendingReExecPatches: GuestImagePatch[] | null = null;
+/** Named kernel objects the launcher held open when it started the game — see adoptNamedObjects. */
+let pendingInheritedObjects: NamedObjectSpec[] | null = null;
+/** How long a re-exec waits for the VFS to become durable before restarting regardless. */
+const REEXEC_FLUSH_BUDGET_MS = 3000;
 /** Restart requests seen in THIS worker session, newest last — see requestSelfReExec. */
 const reExecRequests: Array<{ n: number; image: string; commandLine: string; patches: number; caller: string[] }> = [];
 let reExecRequestCount = 0;
@@ -1022,6 +1028,9 @@ const loadPeData = async (peData: Uint8Array, skipReset: boolean = false) => {
     system.process.dispatcher.applyPendingRegistrations();
     // Before the cache: it keys on the HMODULE, and the HMODULE is the image's base.
     materializeHleModuleImages(system.process);
+    // The images allocate a fresh stub per declared export, so the pass above left them
+    // with no handler attached — a second pass binds them before anything can hand one out.
+    system.process.dispatcher.applyPendingRegistrations();
     prePopulateGetProcAddressCache(system.process.dispatcher);
     ensureGetProcAddressDynamicExports(system.process.dispatcher, [
       { dll: "d3d9", name: "Direct3DShaderValidatorCreate9" },
@@ -2004,6 +2013,20 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
     // manifest's boot args for exactly one boot, then the manifest applies again.
     system.executableArgs = pendingReExecArgs ?? bundle.manifest.args ?? "";
     pendingReExecArgs = null;
+    // The launcher that started this image is, on real Windows, still running — republish the
+    // names it holds so the game's "was I started by the launcher?" check sees them.
+    if (pendingInheritedObjects?.length) {
+      const sched = system.scheduler;
+      const adopted = adoptNamedObjects(pendingInheritedObjects, {
+        event: (manualReset, initialState) => sched.createEvent(manualReset, initialState),
+        mutex: () => sched.createMutex(false),
+        semaphore: (initialCount, maximumCount) => sched.createSemaphore(initialCount, maximumCount),
+      });
+      Logger.log(LogCategory.SYSTEM,
+        `[ReExec] adopted ${adopted}/${pendingInheritedObjects.length} named object(s) from the launcher: ` +
+        pendingInheritedObjects.map((s) => `${s.kind}:${s.name}`).join(", "));
+      pendingInheritedObjects = null;
+    }
     const lastSlashIdx = executablePath.lastIndexOf("\\");
     const executableDir = lastSlashIdx > 2 ? executablePath.slice(0, lastSlashIdx + 1) : "C:\\";
     system.fileSystem.setCurrentDirectory(executableDir);
@@ -2132,6 +2155,12 @@ const requestSelfReExec = (commandLine: string, imagePath?: string, imagePatches
   pendingReExecArgs = commandLine;
   pendingReExecImage = imagePath ?? null;
   pendingReExecPatches = imagePatches?.length ? imagePatches : null;
+  // A launcher starting the GAME (a different image) is still running while the game boots
+  // on real Windows, so the names it holds open stay visible to the child. A SELF re-exec is
+  // the other pattern — the launcher hands its command line over and exits — so nothing of
+  // its namespace outlives it. Snapshot here: this is the CreateProcess call itself, the
+  // moment at which the parent provably still holds every handle it opened.
+  pendingInheritedObjects = imagePath ? namedObjects.snapshot() : null;
   System.getInstance().isReExecPending = true;
   const payload = lastBundlePayload;
 
@@ -2143,10 +2172,26 @@ const requestSelfReExec = (commandLine: string, imagePath?: string, imagePatches
   if (payload?.url) {
     Logger.log(LogCategory.SYSTEM,
       `[ReExec] requesting host page-reload restart, image "${pendingReExecImage ?? "(self)"}" args "${commandLine}"`);
-    self.postMessage({
+    // Drain the VFS FIRST. The reload is a teardown that drops buffered writes, and it is
+    // requested here — at CreateProcess — not at the launcher's ExitProcess, so the exit
+    // path's durability barrier never runs for it. A launcher's whole job is often to write
+    // something the game then reads (a detected-hardware profile, a settings file); handing
+    // the game a half-written file is worse than not writing it, because a short read looks
+    // like valid-but-empty data. Bounded: a stuck flush must not strand the restart.
+    const post = (): void => self.postMessage({
       type: "reexec", args: commandLine, url: payload.url, image: pendingReExecImage,
-      patches: pendingReExecPatches,
+      patches: pendingReExecPatches, inherited: pendingInheritedObjects,
     });
+    let posted = false;
+    const once = (): void => { if (!posted) { posted = true; post(); } };
+    const budget = setTimeout(() => {
+      Logger.warn(LogCategory.SYSTEM,
+        `[ReExec] flushAll did not drain within ${REEXEC_FLUSH_BUDGET_MS}ms — restarting anyway`);
+      once();
+    }, REEXEC_FLUSH_BUDGET_MS);
+    System.getInstance().fileSystem.flushAll()
+      .catch((e) => Logger.warn(LogCategory.SYSTEM, `[ReExec] flushAll failed: ${e}`))
+      .then(() => { clearTimeout(budget); once(); });
     return true;
   }
 
@@ -2395,6 +2440,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       const glu32 = new Glu32();
       const wsock32 = new Wsock32();
       const shell32 = new Shell32();
+      const shfolder = new Shfolder();
       const shlwapi = new Shlwapi();
       const comdlg32 = new Comdlg32();
       const comctl32 = new Comctl32();
@@ -2464,6 +2510,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       glu32.initialize(process);
       wsock32.initialize(process);
       shell32.initialize(process);
+      shfolder.initialize(process);
       shlwapi.initialize(process);
       comdlg32.initialize(process);
       comctl32.initialize(process);
@@ -2533,6 +2580,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.registerModule(glu32.name, glu32);
       process.registerModule(wsock32.name, wsock32);
       process.registerModule(shell32.name, shell32);
+      process.registerModule(shfolder.name, shfolder);
       process.registerModule(shlwapi.name, shlwapi);
       process.registerModule(comdlg32.name, comdlg32);
       process.registerModule(comctl32.name, comctl32);
@@ -2603,6 +2651,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.dispatcher.registerModule(glu32.name, glu32.exports);
       process.dispatcher.registerModule(wsock32.name, wsock32.exports);
       process.dispatcher.registerModule(shell32.name, shell32.exports);
+      process.dispatcher.registerModule(shfolder.name, shfolder.exports);
       process.dispatcher.registerModule(shlwapi.name, shlwapi.exports);
       // shfolder.dll forwarding handled by ThunkDispatcher.DLL_FORWARDS
       process.dispatcher.registerModule(comdlg32.name, comdlg32.exports);
@@ -2672,6 +2721,9 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       // (this also registers matching functions with hypercallDataManager)
       process.dispatcher.applyPendingRegistrations();
       materializeHleModuleImages(process);
+      // The images allocate a fresh stub per declared export, so the pass above left them
+      // with no handler attached — a second pass binds them before anything can hand one out.
+      process.dispatcher.applyPendingRegistrations();
       prePopulateGetProcAddressCache(process.dispatcher);
       ensureGetProcAddressDynamicExports(process.dispatcher, [
         { dll: "d3d9", name: "Direct3DShaderValidatorCreate9" },
@@ -2985,6 +3037,12 @@ self.onmessage = (event: MessageEvent) => {
     // e.g. __noHeapSlab to A/B the WASM heap slab. Survives page F5 because the host
     // replays it on every worker init. Must arrive before load_bundle (PE-load reads it).
     if (typeof message.key === "string") (globalThis as any)[message.key] = message.value;
+    // The log ring is normally armed by a harness call, which a page reload wipes — and a
+    // re-exec IS a page reload, so the boot that follows one is the single window the
+    // 50-entry default cannot cover. As a flag it is replayed before any bundle loads.
+    if (message.key === "__logRingSize" && typeof message.value === "number") {
+      Logger.setBufferSize(Math.max(50, Math.min(200000, message.value)));
+    }
     return;
   }
 
@@ -2996,6 +3054,9 @@ self.onmessage = (event: MessageEvent) => {
     pendingReExecImage = typeof message.image === "string" && message.image ? message.image : null;
     pendingReExecPatches = Array.isArray(message.patches) && message.patches.length
       ? (message.patches as GuestImagePatch[])
+      : null;
+    pendingInheritedObjects = Array.isArray(message.inherited) && message.inherited.length
+      ? (message.inherited as NamedObjectSpec[])
       : null;
     Logger.log(LogCategory.SYSTEM,
       `[ReExec] boot from host: image "${pendingReExecImage ?? "(manifest)"}" args "${pendingReExecArgs ?? ""}"`);

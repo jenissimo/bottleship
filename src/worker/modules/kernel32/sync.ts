@@ -854,7 +854,7 @@ const syncModule = (() => {
 
         const handle = sched.createEvent(bManualReset, bInitialState);
         if (name) {
-            namedObjects.register('event', name, handle);
+            namedObjects.register('event', name, handle, { manualReset: bManualReset, initialState: bInitialState });
         }
         // A NEW named object sets last-error to ERROR_SUCCESS; apps single-instance-guard
         // on GetLastError()==ERROR_ALREADY_EXISTS, so a stale prior error must not leak.
@@ -889,7 +889,7 @@ const syncModule = (() => {
 
         const handle = sched.createEvent(bManualReset, bInitialState);
         if (name) {
-            namedObjects.register('event', name, handle);
+            namedObjects.register('event', name, handle, { manualReset: bManualReset, initialState: bInitialState });
         }
         sched.setLastError(0); // ERROR_SUCCESS — newly created (see CreateEventA)
         Logger.log(
@@ -1155,7 +1155,7 @@ const syncModule = (() => {
 
         const handle = sched.createSemaphore(lInitialCount, lMaximumCount);
         if (name) {
-            namedObjects.register('semaphore', name, handle);
+            namedObjects.register('semaphore', name, handle, { initialCount: lInitialCount, maximumCount: lMaximumCount });
         }
         sched.setLastError(0); // ERROR_SUCCESS — newly created (see CreateEventA)
         return handle;
@@ -1178,7 +1178,7 @@ const syncModule = (() => {
 
         const handle = sched.createSemaphore(lInitialCount, lMaximumCount);
         if (name) {
-            namedObjects.register('semaphore', name, handle);
+            namedObjects.register('semaphore', name, handle, { initialCount: lInitialCount, maximumCount: lMaximumCount });
         }
         sched.setLastError(0); // ERROR_SUCCESS — newly created (see CreateEventA)
         return handle;

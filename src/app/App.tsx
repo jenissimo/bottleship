@@ -953,9 +953,12 @@ export default function App() {
         const pendingReExec = sessionStorage.getItem(REEXEC_KEY);
         if (pendingReExec) {
           sessionStorage.removeItem(REEXEC_KEY);
-          const { args, url, image, patches } = JSON.parse(pendingReExec) as
-            { args: string; url: string | null; image?: string | null; patches?: unknown[] | null };
-          globalWorker.postMessage({ type: "set_boot_args", args, image: image ?? null, patches: patches ?? null });
+          const { args, url, image, patches, inherited } = JSON.parse(pendingReExec) as
+            { args: string; url: string | null; image?: string | null; patches?: unknown[] | null; inherited?: unknown[] | null };
+          globalWorker.postMessage({
+            type: "set_boot_args", args, image: image ?? null,
+            patches: patches ?? null, inherited: inherited ?? null,
+          });
           console.info("[bs] re-exec boot:", image ?? "(manifest entrypoint)", args, url ? `(url ${url})` : "");
           if (url) reExecBundleUrl = url;
         }
@@ -1268,6 +1271,9 @@ export default function App() {
             // code, for the encrypt-on-disk launchers). Without it the restart runs the
             // untouched, still-encrypted image.
             patches: Array.isArray(event.data.patches) ? event.data.patches : null,
+            // Named kernel objects the launcher holds open. It keeps running on real
+            // Windows while the game boots, so the game must still see them.
+            inherited: Array.isArray(event.data.inherited) ? event.data.inherited : null,
           }));
           window.location.reload();
         } catch (e) {
