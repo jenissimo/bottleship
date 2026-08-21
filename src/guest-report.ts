@@ -34,6 +34,11 @@ export interface CrashFault {
     firstCaller: number | string; firstCallerSym: string | null;
     lastCaller?: number | string; lastCallerSym?: string | null;
   }>;
+  moduleHandleMisses?: Array<{
+    name: string; api: string; count: number;
+    firstCaller: number | string; firstCallerSym: string | null;
+    lastCaller?: number | string; lastCallerSym?: string | null;
+  }>;
   silentStubs?: Array<{ api: string; count: number; arity?: number; lastCaller: number | string; lastCallerSym: string | null }>;
   recentGetProc?: Array<{
     module: string; proc: string; addr: string | null; kind?: string;
@@ -43,7 +48,7 @@ export interface CrashFault {
     module: string; proc: string; kind: string; count: number;
     lastCaller: number | string; lastCallerSym: string | null;
   }>;
-  faults?: Array<{ eip: string; faultAddr: string; lastThunk: string; threadId: number | null }>;
+  faults?: Array<{ ageMs?: number; eip: string; faultAddr: string; lastThunk: string; threadId: number | null }>;
   cxxExceptions?: Array<{ seq: number; threadId: number; type: string; thrown: string; throwModule: string; rethrow: boolean; outcome: string; caughtBy: string }>;
   recentFaults?: Array<{ eip: number; faultAddr: number; lastThunk: string; threadId: number | null; kind: string }>;
   threads?: {
@@ -197,6 +202,12 @@ export function formatGuestReport(f: CrashFault, gameName: string, crashed: bool
         `  ${hx(h.module)}:"${h.proc}" ×${h.count}  first@${hx(h.firstCaller)}${h.firstCallerSym ? ` ${h.firstCallerSym}` : ""}` +
         (h.lastCaller != null ? `  last@${hx(h.lastCaller)}${h.lastCallerSym ? ` ${h.lastCallerSym}` : ""}` : "")));
   }
+  if (f.moduleHandleMisses?.length) {
+    lines.push(``, `GetModuleHandle misses (${f.moduleHandleMisses.length}) — modules the guest could not find:`,
+      ...f.moduleHandleMisses.map((h) =>
+        `  ${h.api}("${h.name}") ×${h.count}  first@${hx(h.firstCaller)}${h.firstCallerSym ? ` ${h.firstCallerSym}` : ""}` +
+        (h.lastCaller != null ? `  last@${hx(h.lastCaller)}${h.lastCallerSym ? ` ${h.lastCallerSym}` : ""}` : "")));
+  }
   if (f.recentGetProc?.length) {
     lines.push(``, `recent GetProcAddress (${f.recentGetProc.length}, newest last):`,
       ...f.recentGetProc.map((h) =>
@@ -219,7 +230,9 @@ export function formatGuestReport(f: CrashFault, gameName: string, crashed: bool
   }
   if (f.faults?.length) {
     lines.push(``, `recent page faults (newest last):`,
-      ...f.faults.map((pf) => `  eip=${pf.eip} addr=${pf.faultAddr} T${pf.threadId ?? "?"} ${pf.lastThunk || ""}`.trimEnd()));
+      ...f.faults.map((pf) =>
+        `  ${pf.ageMs != null ? `${(pf.ageMs / 1000).toFixed(1)}s ago  ` : ""}` +
+        `eip=${pf.eip} addr=${pf.faultAddr} T${pf.threadId ?? "?"} ${pf.lastThunk || ""}`.trimEnd()));
   } else if (f.recentFaults?.length) {
     lines.push(``, `recent page faults (newest last):`,
       ...f.recentFaults.map((pf) => `  eip=${hx(pf.eip)} addr=${hx(pf.faultAddr)} [${pf.kind}] T${pf.threadId ?? "?"} ${pf.lastThunk || ""}`.trimEnd()));

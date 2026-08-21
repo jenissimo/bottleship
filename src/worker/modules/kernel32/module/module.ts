@@ -14,6 +14,7 @@ import { FORCE_NATIVE_PACKAGE_LOAD, isUnderSystemDirectory } from '../../../core
 import { findDllRule } from '../../../core/dll-rules';
 import { hleImageBase, hleModuleNameByBase, isHleModuleLoaded, markHleModuleLoaded } from '../../../core/hle-module-images';
 import { getProcAddressRegistry, type GetProcResolution } from '../../../core/diagnostics/get-proc-address-registry';
+import { moduleHandleMissRegistry } from '../../../core/diagnostics/module-handle-miss-registry';
 import { SILENT_STUBS } from '../../../core/diagnostics/api-census';
 import { resolveHleExportAddress } from '../../../core/thunking/export-resolver';
 
@@ -60,6 +61,7 @@ function ensureProcessLocalCaches(): void {
     getProcAddressPointerCache.clear();
     loggedUnknownModuleHandles.clear();
     getProcAddressRegistry.clear();
+    moduleHandleMissRegistry.clear();
     pinnedModuleBases.clear();
     dynamicLoadRefs.clear();
 }
@@ -438,6 +440,20 @@ function tryBlockThunkedDllLoad(
 }
 
 function initModuleFunctions(): void {
+    /**
+     * A module handle the guest could not get is a fork in its control flow — and the log
+     * line naming it is long gone by the time a late crash is investigated. Recording the
+     * NAME (with the guest caller, read off the stack the way GetProcAddress does) is what
+     * lets a fault snapshot say WHICH module was missing rather than just "-> 0".
+     */
+    const recordModuleHandleMiss = (api: string, name: string, ctx: any, mem: Uint8Array): void => {
+        const esp = ctx?.esp >>> 0;
+        const caller = (esp && esp + 4 <= mem.length)
+            ? new DataView(mem.buffer, mem.byteOffset, mem.byteLength).getUint32(esp, true) >>> 0
+            : 0;
+        moduleHandleMissRegistry.record(api, name, caller);
+    };
+
     exports['GetModuleHandleA'] = (ctx, mem, args) => {
         const lpModuleNameAddr = args[0];
         const system = System.getInstance();
@@ -483,6 +499,7 @@ function initModuleFunctions(): void {
 
 
         Logger.log(LogCategory.KERNEL32, `GetModuleHandleA("${name}") -> 0 (not found)`);
+        recordModuleHandleMiss('GetModuleHandleA', name, ctx, mem);
         system.process!.lastError = 126; // ERROR_MOD_NOT_FOUND
         return { value: 0, stackCleanup: 4 };
     };
@@ -531,6 +548,7 @@ function initModuleFunctions(): void {
 
 
         Logger.verbose(LogCategory.KERNEL32, `GetModuleHandleW("${name}") -> 0 (not found)`);
+        recordModuleHandleMiss('GetModuleHandleW', name, ctx, mem);
         system.process!.lastError = 126; // ERROR_MOD_NOT_FOUND
         return { value: 0, stackCleanup: 4 };
     };

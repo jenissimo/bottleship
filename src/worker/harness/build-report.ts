@@ -7,6 +7,7 @@ import { serializeCpu, serializeThreads, proc, symbolize, guestMem } from "./ser
 import { faultRecorder } from "../core/memory/fault-recorder";
 import { stubRegistry } from "../core/diagnostics/stub-registry";
 import { getProcAddressRegistry } from "../core/diagnostics/get-proc-address-registry";
+import { moduleHandleMissRegistry } from "../core/diagnostics/module-handle-miss-registry";
 import { apiCensus } from "../core/diagnostics/api-census";
 import { getCxxExceptionRing, getSehDispatchTrace } from "../core/seh-dispatch";
 import { getStackGuardViolations } from "../core/memory/stack-write-guard";
@@ -61,6 +62,17 @@ export interface HarnessReport {
         firstCaller: string; firstCallerSym: string | null;
         lastCaller: string; lastCallerSym: string | null;
     }>;
+    /**
+     * GetModuleHandle* lookups that answered NULL, by NAME. Usually the last fork before a
+     * guest gives up (a crash handler that cannot find its reporting DLL, an optional
+     * feature that disables itself) — and the only place the argument survives, since the
+     * thunk ring records the call, not the string it was given.
+     */
+    moduleHandleMisses: Array<{
+        name: string; api: string; count: number;
+        firstCaller: string; firstCallerSym: string | null;
+        lastCaller: string; lastCallerSym: string | null;
+    }>;
     recentGetProc: Array<{
         module: string; proc: string; addr: string | null; kind: string;
         caller: string; callerSym: string | null;
@@ -78,6 +90,9 @@ export interface HarnessReport {
     /** `eipTrusted:false` ⇒ no instruction at `eip` addresses CR2 (the jit materializes only
      *  eip's low 12 bits) — read `cr2Candidates`/`badCall` instead of chasing that EIP. */
     faults: Array<{
+        /** How long ago this fault happened, in ms. The ring is not time-bounded, so an
+         *  entry near the top of the list is not thereby near the crash in time. */
+        ageMs: number;
         eip: string; eipTrusted?: boolean; faultAddr: string; cr2Candidates?: string[];
         badCall?: { callSite: number; slotAddr: number; slotValue: number; operand: string };
         lastThunk: string; threadId: number | null; outcome?: string;
@@ -200,6 +215,15 @@ export function buildHarnessReport(esp?: number): HarnessReport {
             lastCaller: hx(h.lastCaller),
             lastCallerSym: symbolize(h.lastCaller),
         })),
+        moduleHandleMisses: moduleHandleMissRegistry.list().map((h) => ({
+            name: h.name,
+            api: h.api,
+            count: h.count,
+            firstCaller: hx(h.firstCaller),
+            firstCallerSym: symbolize(h.firstCaller),
+            lastCaller: hx(h.lastCaller),
+            lastCallerSym: symbolize(h.lastCaller),
+        })),
         recentGetProc: getProcAddressRegistry.recent(16).map((h) => ({
             module: hx(h.hModule),
             proc: h.procName,
@@ -220,6 +244,10 @@ export function buildHarnessReport(esp?: number): HarnessReport {
                 lastCallerSym: symbolize(h.lastCaller),
             })),
         faults: faultRecorder.recent(8).map((f) => ({
+            // WHEN, not just what. "recent" is a ring of the last few faults with no
+            // relation to now: without an age, a fault from the loading screen sits next
+            // to a crash an hour later and reads as its cause.
+            ageMs: Math.max(0, Math.round(performance.now() - f.ts)),
             eip: hx(f.eip),
             eipTrusted: f.eipTrusted,
             faultAddr: hx(f.faultAddr),
