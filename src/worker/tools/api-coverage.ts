@@ -55,6 +55,17 @@ export interface ExportCoverage {
     /** Repo-relative source location of the handler. */
     file?: string;
     line?: number;
+    /**
+     * Every distinct RET N the handler hard-codes across its return paths. More than one
+     * value is itself a defect — a stdcall thunk pops the same amount on every path.
+     */
+    stackCleanups?: number[];
+    /**
+     * The HLE module the handler's source belongs to, when it is not this one — imagehlp
+     * serving dbghelp's table, wsock32 serving ws2_32's. A shared handler is reached
+     * through BOTH descriptors, so both must agree about its ABI.
+     */
+    origin?: string;
 }
 
 export interface ModuleCoverage {
@@ -67,6 +78,20 @@ export interface ModuleCoverage {
     exports: Map<string, ExportCoverage>;
     /** Ordinal → lowercased export name, for imports that carry no name at all. */
     ordinals: Map<number, string>;
+    /**
+     * Export-table merges this scanner could not follow. NON-EMPTY means every
+     * `declared-stub` verdict in this module is a GUESS: the handler may well be in the
+     * table the merge contributes. Consumers must report this rather than print the count
+     * as if it were known.
+     */
+    unresolvedMerges: UnresolvedMerge[];
+    /**
+     * Export-table merge sites seen in this module's sources, followed or not. A consumer
+     * that finds ZERO across the whole tree is looking at a scanner that has stopped
+     * working, not at a repo without merges — and "no unresolved merges" would then be a
+     * green light produced by looking at nothing.
+     */
+    mergeSites: number;
 }
 
 /** One handler found in the implementation sources. `arity === -1` ⇒ unknown. */
@@ -75,6 +100,29 @@ interface ImplRecord {
     arity: number;
     file: string;
     line: number;
+    /** Distinct literal `stackCleanup:` values the handler returns. */
+    cleanups?: number[];
+}
+
+/**
+ * A merge into a module's export table (`Object.assign(this.exports, …)`, `assignStubsOnce`,
+ * a `...spread` inside an export map) whose source this scanner could not follow to the
+ * names it contributes.
+ *
+ * This is the category that must exist for the census to be honest. A module assembled by
+ * a shape we cannot resolve has an export table we do not know, and reporting its
+ * declarations as "no handler" would be a WRONG number wearing a confident face — the
+ * failure mode CLAUDE.md's quality-gate rule is about. Every such site is named here so a
+ * reader can see exactly how much of the answer is guesswork.
+ */
+export interface UnresolvedMerge {
+    /** Repo-relative file containing the merge. */
+    file: string;
+    line: number;
+    /** The merge expression's source text, trimmed. */
+    text: string;
+    /** Why the scanner could not follow it. */
+    reason: string;
 }
 
 /**
@@ -87,13 +135,17 @@ function toPosix(p: string): string {
     return p.replace(/\\/g, '/');
 }
 
+/** Which HLE module a handler's source file belongs to (`modules/dbghelp.ts` → dbghelp). */
+function moduleOfImplFile(modulesDir: string, file: string): string | null {
+    const rel = path.relative(modulesDir, file);
+    if (!rel || rel.startsWith('..')) return null;
+    const head = toPosix(rel).split('/')[0];
+    return head.replace(/\.ts$/, '').toLowerCase();
+}
+
 /** Strip a stdcall/cdecl decoration (`_Foo@8`, `Foo@8`) down to the bare name. */
 function undecorate(name: string): string {
     return name.replace(/^_+/, '').replace(/@\d+$/, '');
-}
-
-function paramCount(node: ts.ArrowFunction | ts.FunctionExpression | ts.FunctionDeclaration): number {
-    return node.parameters.length;
 }
 
 /**
@@ -126,6 +178,442 @@ function scanOrdinals(apiFile: string, content: string): Map<number, string> {
     return out;
 }
 
+/** Result of following one merge source: the handlers it names, or why we could not. */
+interface Harvest {
+    records: ImplRecord[];
+    /** Non-null when nothing could be enumerated — the confession text. */
+    reason: string | null;
+    /** The file the source was traced into, even when its names stayed opaque. */
+    file: string | null;
+}
+
+/**
+ * Cross-file resolver for export-table assembly.
+ *
+ * A module's export table is not written in one place: `imagehlp.ts` merges the whole
+ * dbghelp surface with `Object.assign(this.exports, createDbgHelpExports())`, kernel32
+ * merges eighteen per-area `exports` objects, ddraw merges factory results and stub
+ * tables. A scanner that only looks at assignments it can see IN THE FILE reports those
+ * exports as unimplemented — a wrong number that passes silently.
+ *
+ * So the merge is modelled as what it is: follow the source expression to the symbol it
+ * names, follow the symbol to its defining file (across modules — the whole point of the
+ * imagehlp/dbghelp case), and harvest the object literal it ultimately produces. What
+ * cannot be followed is recorded as an {@link UnresolvedMerge}, never silently dropped.
+ */
+class SourceGraph {
+    private parsed = new Map<string, ts.SourceFile | null>();
+    /** file → local name → where it was imported from. */
+    private importsOf = new Map<string, Map<string, { file: string | null; symbol: string; specifier: string }>>();
+
+    parse(file: string): ts.SourceFile | null {
+        if (this.parsed.has(file)) return this.parsed.get(file)!;
+        let sf: ts.SourceFile | null = null;
+        try {
+            sf = ts.createSourceFile(file, fs.readFileSync(file, 'utf-8'), ts.ScriptTarget.Latest, true);
+        } catch { sf = null; }
+        this.parsed.set(file, sf);
+        return sf;
+    }
+
+    /** Resolve a relative module specifier the way the bundler does (`./x` → x.ts | x/index.ts). */
+    resolveSpecifier(fromFile: string, specifier: string): string | null {
+        if (!specifier.startsWith('.')) return null;
+        const base = path.resolve(path.dirname(fromFile), specifier);
+        for (const candidate of [`${base}.ts`, path.join(base, 'index.ts'), `${base}.tsx`]) {
+            if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+        }
+        return null;
+    }
+
+    private imports(file: string): Map<string, { file: string | null; symbol: string; specifier: string }> {
+        const cached = this.importsOf.get(file);
+        if (cached) return cached;
+        const map = new Map<string, { file: string | null; symbol: string; specifier: string }>();
+        this.importsOf.set(file, map);
+        const sf = this.parse(file);
+        if (!sf) return map;
+        for (const stmt of sf.statements) {
+            if (!ts.isImportDeclaration(stmt) || !ts.isStringLiteral(stmt.moduleSpecifier)) continue;
+            const specifier = stmt.moduleSpecifier.text;
+            const target = this.resolveSpecifier(file, specifier);
+            const bindings = stmt.importClause?.namedBindings;
+            if (bindings && ts.isNamedImports(bindings)) {
+                for (const el of bindings.elements) {
+                    map.set(el.name.text, { file: target, symbol: (el.propertyName ?? el.name).text, specifier });
+                }
+            } else if (bindings && ts.isNamespaceImport(bindings)) {
+                map.set(bindings.name.text, { file: target, symbol: '*', specifier });
+            }
+            if (stmt.importClause?.name) {
+                map.set(stmt.importClause.name.text, { file: target, symbol: 'default', specifier });
+            }
+        }
+        return map;
+    }
+
+    /**
+     * Harvest the handlers an expression contributes to an export table.
+     *
+     * `file` in the result is the source file the expression was traced INTO, whether or
+     * not names came back. That is what lets a caller distinguish "followed it, and the
+     * file is one we already scan" from "no idea where this table comes from" — the second
+     * being the only case that has to be confessed.
+     */
+    harvestExpression(expr: ts.Node, file: string, seen: Set<string>): Harvest {
+        const sf = this.parse(file);
+        if (!sf) return { records: [], reason: `cannot parse ${toPosix(file)}`, file: null };
+
+        if (ts.isObjectLiteralExpression(expr)) {
+            return { records: this.harvestObject(expr, file, sf, seen), reason: null, file };
+        }
+        if (ts.isCallExpression(expr)) {
+            // An IIFE builds the table right here; anything else names a factory whose
+            // RESULT is the table (`createFooExports(ctx)`, `makeSocketExports(a, b)`).
+            const callee = expr.expression;
+            if (ts.isArrowFunction(callee) || ts.isFunctionExpression(callee)
+                || (ts.isParenthesizedExpression(callee)
+                    && (ts.isArrowFunction(callee.expression) || ts.isFunctionExpression(callee.expression)))) {
+                const fn = ts.isParenthesizedExpression(callee) ? callee.expression : callee;
+                return {
+                    records: this.harvestFunctionResult(fn as ts.ArrowFunction, file, sf, seen),
+                    reason: null,
+                    file,
+                };
+            }
+            return this.harvestExpression(callee, file, seen);
+        }
+        if (ts.isAsExpression(expr) || ts.isParenthesizedExpression(expr) || ts.isNonNullExpression(expr)) {
+            return this.harvestExpression(expr.expression, file, seen);
+        }
+        if (ts.isArrowFunction(expr) || ts.isFunctionExpression(expr)) {
+            return { records: this.harvestFunctionResult(expr, file, sf, seen), reason: null, file };
+        }
+        if (ts.isIdentifier(expr)) {
+            return this.harvestSymbol(file, expr.text, seen);
+        }
+        if (ts.isPropertyAccessExpression(expr) && ts.isIdentifier(expr.name)) {
+            const obj = expr.expression;
+            // `ns.createFooExports` after `import * as ns`.
+            if (ts.isIdentifier(obj)) {
+                const imported = this.imports(file).get(obj.text);
+                if (imported?.symbol === '*' && imported.file) {
+                    return this.harvestSymbol(imported.file, expr.name.text, seen);
+                }
+            }
+            // `fileIoModule.exports` / `this.safeArray.exports` — a runtime object graph.
+            // We cannot enumerate its properties, but we CAN say which file builds it, and
+            // that is enough to tell a covered merge from an opaque one.
+            const owner = this.definingFileOf(obj, file, seen);
+            return {
+                records: [],
+                reason: `source is a runtime property access (${expr.getText(sf).slice(0, 60)})`,
+                file: owner,
+            };
+        }
+        return { records: [], reason: `unsupported merge source (${ts.SyntaxKind[expr.kind]})`, file: null };
+    }
+
+    /** The file that builds the object an expression denotes, without enumerating it. */
+    private definingFileOf(expr: ts.Node, file: string, seen: Set<string>): string | null {
+        if (ts.isIdentifier(expr)) {
+            const imported = this.imports(file).get(expr.text);
+            if (imported?.file) return imported.file;
+            const init = this.findInitializer(file, expr.text);
+            if (init && ts.isCallExpression(init)) {
+                const res = this.harvestExpression(init.expression, file, new Set(seen));
+                if (res.file) return res.file;
+            }
+            return init ? file : null;
+        }
+        // `this.safeArray` — the class field's initializer says where the object is built.
+        if (ts.isPropertyAccessExpression(expr) && expr.expression.kind === ts.SyntaxKind.ThisKeyword
+            && ts.isIdentifier(expr.name)) {
+            const init = this.findClassFieldInitializer(file, expr.name.text);
+            if (init && ts.isCallExpression(init)) {
+                const res = this.harvestExpression(init.expression, file, new Set(seen));
+                if (res.file) return res.file;
+            }
+            return init ? file : null;
+        }
+        return null;
+    }
+
+    private findInitializer(file: string, name: string): ts.Expression | null {
+        const sf = this.parse(file);
+        if (!sf) return null;
+        let out: ts.Expression | null = null;
+        const visit = (node: ts.Node): void => {
+            if (out) return;
+            if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)
+                && node.name.text === name && node.initializer) {
+                out = node.initializer;
+                return;
+            }
+            ts.forEachChild(node, visit);
+        };
+        visit(sf);
+        return out;
+    }
+
+    private findClassFieldInitializer(file: string, name: string): ts.Expression | null {
+        const sf = this.parse(file);
+        if (!sf) return null;
+        let out: ts.Expression | null = null;
+        const visit = (node: ts.Node): void => {
+            if (out) return;
+            if (ts.isPropertyDeclaration(node) && ts.isIdentifier(node.name)
+                && node.name.text === name && node.initializer) {
+                out = node.initializer;
+                return;
+            }
+            ts.forEachChild(node, visit);
+        };
+        visit(sf);
+        return out;
+    }
+
+    /** Follow one symbol name to its definition — locally, then through imports/re-exports. */
+    harvestSymbol(file: string, symbol: string, seen: Set<string>): Harvest {
+        const key = `${file}#${symbol}`;
+        if (seen.has(key)) return { records: [], reason: null, file }; // cycle: already accounted for
+        seen.add(key);
+
+        const sf = this.parse(file);
+        if (!sf) return { records: [], reason: `cannot parse ${toPosix(file)}`, file: null };
+
+        let found: Harvest | null = null;
+
+        const visit = (node: ts.Node): void => {
+            if (found) return;
+            if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === symbol && node.initializer) {
+                const res = this.harvestExpression(node.initializer, file, seen);
+                // `export const exports: Record<…> = {}` populated by later top-level
+                // `exports['Name'] = …` statements — the table is the declaration PLUS
+                // every assignment to it in the same file.
+                const assigned = this.harvestAssignmentsTo(file, symbol, sf);
+                found = {
+                    records: [...res.records, ...assigned],
+                    reason: (res.records.length + assigned.length) > 0 ? null : res.reason,
+                    file: res.file ?? file,
+                };
+                return;
+            }
+            if (ts.isFunctionDeclaration(node) && node.name?.text === symbol && node.body) {
+                found = { records: this.harvestFunctionResult(node, file, sf, seen), reason: null, file };
+                return;
+            }
+            ts.forEachChild(node, visit);
+        };
+        visit(sf);
+        if (found) return found;
+
+        // `export { createX } from './y'` / `export * from './y'`
+        for (const stmt of sf.statements) {
+            if (!ts.isExportDeclaration(stmt) || !stmt.moduleSpecifier || !ts.isStringLiteral(stmt.moduleSpecifier)) continue;
+            const target = this.resolveSpecifier(file, stmt.moduleSpecifier.text);
+            if (!target) continue;
+            if (stmt.exportClause && ts.isNamedExports(stmt.exportClause)) {
+                for (const el of stmt.exportClause.elements) {
+                    if (el.name.text === symbol) return this.harvestSymbol(target, (el.propertyName ?? el.name).text, seen);
+                }
+            } else if (!stmt.exportClause) {
+                const res = this.harvestSymbol(target, symbol, seen);
+                if (res.records.length > 0) return res;
+            }
+        }
+
+        const imported = this.imports(file).get(symbol);
+        if (imported) {
+            if (!imported.file) {
+                return { records: [], reason: `import "${imported.specifier}" does not resolve to a source file`, file: null };
+            }
+            return this.harvestSymbol(imported.file, imported.symbol, seen);
+        }
+
+        return { records: [], reason: `no definition of \`${symbol}\` in ${toPosix(path.basename(file))}`, file: null };
+    }
+
+    /** Every `<table>['Name'] = handler` in one file, for a table held in a variable. */
+    private harvestAssignmentsTo(file: string, tableName: string, sf: ts.SourceFile): ImplRecord[] {
+        const out: ImplRecord[] = [];
+        const walk = (n: ts.Node): void => {
+            if (ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.EqualsToken
+                && ts.isElementAccessExpression(n.left) && ts.isIdentifier(n.left.expression)
+                && n.left.expression.text === tableName) {
+                const key = literalTextOf(n.left.argumentExpression);
+                if (key) out.push(makeRecord(key, n.right, file, sf, n));
+            }
+            ts.forEachChild(n, walk);
+        };
+        walk(sf);
+        return out;
+    }
+
+    /** Object literals a function returns — the `create*Exports` shape, block-bodied or not. */
+    private harvestFunctionResult(
+        node: ts.FunctionDeclaration | ts.ArrowFunction | ts.FunctionExpression,
+        file: string,
+        sf: ts.SourceFile,
+        seen: Set<string>
+    ): ImplRecord[] {
+        const out: ImplRecord[] = [];
+        if (!node.body) return out;
+        if (!ts.isBlock(node.body)) {
+            out.push(...this.harvestExpression(node.body, file, seen).records);
+            return out;
+        }
+        const isNested = (n: ts.Node): boolean =>
+            ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n) || ts.isArrowFunction(n)
+            || ts.isMethodDeclaration(n) || ts.isClassDeclaration(n) || ts.isClassExpression(n);
+        const locals = new Map<string, ts.ObjectLiteralExpression>();
+        const walk = (n: ts.Node): void => {
+            if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name) && n.initializer
+                && ts.isObjectLiteralExpression(n.initializer)) {
+                locals.set(n.name.text, n.initializer);
+            }
+            if (ts.isReturnStatement(n) && n.expression) {
+                const expr = n.expression;
+                if (ts.isObjectLiteralExpression(expr)) out.push(...this.harvestObject(expr, file, sf, seen));
+                else if (ts.isIdentifier(expr) && locals.has(expr.text)) {
+                    out.push(...this.harvestObject(locals.get(expr.text)!, file, sf, seen));
+                } else out.push(...this.harvestExpression(expr, file, seen).records);
+            }
+            ts.forEachChild(n, child => { if (!isNested(child)) walk(child); });
+        };
+        for (const stmt of node.body.statements) walk(stmt);
+
+        // A factory that builds its table by assignment (`exports["X"] = …`) instead of a
+        // literal — same shape scanExtraExports handles at file scope.
+        const assignWalk = (n: ts.Node): void => {
+            if (ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.EqualsToken
+                && ts.isElementAccessExpression(n.left)) {
+                const key = literalTextOf(n.left.argumentExpression);
+                if (key && isExportTableExpression(n.left.expression)) {
+                    out.push(makeRecord(key, n.right, file, sf, n));
+                }
+            }
+            ts.forEachChild(n, assignWalk);
+        };
+        assignWalk(node.body);
+        return out;
+    }
+
+    harvestObject(obj: ts.ObjectLiteralExpression, file: string, sf: ts.SourceFile, seen: Set<string>): ImplRecord[] {
+        const out: ImplRecord[] = [];
+        for (const prop of obj.properties) {
+            if (ts.isSpreadAssignment(prop)) {
+                out.push(...this.harvestExpression(prop.expression, file, seen).records);
+            } else if (ts.isPropertyAssignment(prop)) {
+                const name = literalTextOf(prop.name) ?? (ts.isIdentifier(prop.name) ? prop.name.text : null);
+                if (name) out.push(makeRecord(name, prop.initializer, file, sf, prop));
+            } else if (ts.isMethodDeclaration(prop)) {
+                const name = literalTextOf(prop.name) ?? (ts.isIdentifier(prop.name) ? prop.name.text : null);
+                if (name) {
+                    out.push({ name, arity: prop.parameters.length, file, line: lineOf(sf, prop), ...cleanupOf(prop) });
+                }
+            } else if (ts.isShorthandPropertyAssignment(prop)) {
+                out.push({ name: prop.name.text, arity: -1, file, line: lineOf(sf, prop) });
+            }
+        }
+        return out;
+    }
+}
+
+function lineOf(sf: ts.SourceFile, node: ts.Node): number {
+    return sf.getLineAndCharacterOfPosition(node.getStart()).line + 1;
+}
+
+function literalTextOf(node: ts.Node | undefined): string | null {
+    if (!node) return null;
+    if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return node.text;
+    return null;
+}
+
+/**
+ * The RET N a handler hard-codes. A `{ value, stackCleanup: N }` is the thunk's own claim
+ * about its ABI, independent of the descriptor — which is exactly what makes the pair
+ * checkable. Returns disagreeing about N leave nothing to check.
+ */
+function cleanupOf(node: ts.Node): { cleanups?: number[] } {
+    const values = new Set<number>();
+    const walk = (n: ts.Node): void => {
+        if (ts.isPropertyAssignment(n) && ts.isIdentifier(n.name) && n.name.text === 'stackCleanup') {
+            // A computed value is the descriptor's own arg count in disguise; only literals
+            // are a claim independent enough to compare against it.
+            if (ts.isNumericLiteral(n.initializer)) values.add(parseInt(n.initializer.text, 10));
+        }
+        ts.forEachChild(n, walk);
+    };
+    ts.forEachChild(node, walk);
+    return values.size > 0 ? { cleanups: [...values].sort((a, b) => a - b) } : {};
+}
+
+/** `exports`, `this.exports`, `foo.exports`, `socketExports` — the shapes an export table is held in. */
+function isExportTableExpression(expr: ts.Node): boolean {
+    if (ts.isIdentifier(expr)) return /^(exports|.*Exports)$/.test(expr.text);
+    if (ts.isPropertyAccessExpression(expr) && ts.isIdentifier(expr.name)) {
+        return /^(exports|.*Exports)$/.test(expr.name.text);
+    }
+    return false;
+}
+
+function makeRecord(name: string, init: ts.Expression, file: string, sf: ts.SourceFile, at: ts.Node): ImplRecord {
+    const arity = (ts.isArrowFunction(init) || ts.isFunctionExpression(init)) ? init.parameters.length : -1;
+    return { name, arity, file, line: lineOf(sf, at), ...cleanupOf(init) };
+}
+
+/**
+ * Every merge into an export table in one file, resolved to the handlers it contributes.
+ * Sites that cannot be followed come back in `unresolved` — the honest half of the answer.
+ */
+function scanExportMerges(
+    file: string,
+    graph: SourceGraph,
+    isScanned: (f: string) => boolean
+): { records: ImplRecord[]; unresolved: UnresolvedMerge[]; sites: number } {
+    const sf = graph.parse(file);
+    const records: ImplRecord[] = [];
+    const unresolved: UnresolvedMerge[] = [];
+    let sites = 0;
+    if (!sf) return { records, unresolved, sites };
+
+    const take = (src: ts.Expression, at: ts.Node): void => {
+        sites++;
+        const res = graph.harvestExpression(src, file, new Set());
+        records.push(...res.records);
+        if (res.records.length > 0) return;
+        // Nothing enumerated — but if the source was traced into a file this module already
+        // scans handler-by-handler, its names are in the census anyway and the merge is
+        // accounted for. Only a source we could neither enumerate NOR place is a hole.
+        if (res.file && isScanned(res.file)) return;
+        if (!res.reason) return;
+        unresolved.push({
+            file,
+            line: lineOf(sf, at),
+            text: at.getText(sf).replace(/\s+/g, ' ').slice(0, 100),
+            reason: res.reason,
+        });
+    };
+
+    const visit = (node: ts.Node): void => {
+        if (ts.isCallExpression(node)) {
+            const callee = node.expression;
+            const isObjectAssign = ts.isPropertyAccessExpression(callee)
+                && ts.isIdentifier(callee.expression) && callee.expression.text === 'Object'
+                && ts.isIdentifier(callee.name) && callee.name.text === 'assign';
+            const isStubMerge = ts.isIdentifier(callee) && callee.text === 'assignStubsOnce';
+            if ((isObjectAssign || isStubMerge) && node.arguments.length >= 2
+                && isExportTableExpression(node.arguments[0])) {
+                for (const arg of node.arguments.slice(1, isStubMerge ? 2 : undefined)) take(arg, node);
+            }
+        }
+        ts.forEachChild(node, visit);
+    };
+    visit(sf);
+    return { records, unresolved, sites };
+}
+
 /**
  * Registration shapes SignatureValidator.scanImplementationFile does not model, all of
  * which produce a genuinely dispatched handler:
@@ -135,38 +623,16 @@ function scanOrdinals(apiFile: string, content: string): Map<number, string> {
  * Missing these reads a fully working export as unimplemented, which is the difference
  * between a useful census and a misleading one.
  */
-function scanExtraExports(filePath: string): ImplRecord[] {
-    const content = fs.readFileSync(filePath, 'utf-8');
-    const sf = ts.createSourceFile(filePath, content, ts.ScriptTarget.Latest, true);
+function scanExtraExports(filePath: string, graph: SourceGraph): ImplRecord[] {
+    const sf = graph.parse(filePath);
     const out: ImplRecord[] = [];
-    const lineOf = (node: ts.Node): number => sf.getLineAndCharacterOfPosition(node.getStart()).line + 1;
+    if (!sf) return out;
 
-    const add = (name: string, arity: number, node: ts.Node): void => {
-        if (name) out.push({ name, arity, file: filePath, line: lineOf(node) });
-    };
+    const literalText = literalTextOf;
 
-    const literalText = (node: ts.Node | undefined): string | null => {
-        if (!node) return null;
-        if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return node.text;
-        return null;
-    };
-
-    /** Harvest `{ 'Name': impl, Name2: impl2 }` as an export map. */
+    /** Harvest `{ 'Name': impl, …spread }` as an export map — spreads followed like any merge. */
     const harvestObjectLiteral = (obj: ts.ObjectLiteralExpression): void => {
-        for (const prop of obj.properties) {
-            if (ts.isPropertyAssignment(prop)) {
-                const name = literalText(prop.name) ?? (ts.isIdentifier(prop.name) ? prop.name.text : null);
-                if (!name) continue;
-                const init = prop.initializer;
-                if (ts.isArrowFunction(init) || ts.isFunctionExpression(init)) add(name, paramCount(init), prop);
-                else add(name, -1, prop); // an identifier/call reference — a real handler, arity unknown
-            } else if (ts.isMethodDeclaration(prop)) {
-                const name = literalText(prop.name) ?? (ts.isIdentifier(prop.name) ? prop.name.text : null);
-                if (name) add(name, prop.parameters.length, prop);
-            } else if (ts.isShorthandPropertyAssignment(prop)) {
-                add(prop.name.text, -1, prop);
-            }
-        }
+        out.push(...graph.harvestObject(obj, filePath, sf, new Set()));
     };
 
     const looksLikeExportMap = (decl: ts.VariableDeclaration): boolean => {
@@ -205,11 +671,7 @@ function scanExtraExports(filePath: string): ImplRecord[] {
             const onExports = (ts.isIdentifier(obj) && obj.text === 'exports')
                 || (ts.isPropertyAccessExpression(obj) && ts.isIdentifier(obj.name) && obj.name.text === 'exports');
             const key = literalText(node.left.argumentExpression);
-            if (onExports && key) {
-                const rhs = node.right;
-                const arity = (ts.isArrowFunction(rhs) || ts.isFunctionExpression(rhs)) ? paramCount(rhs) : -1;
-                add(key, arity, node);
-            }
+            if (onExports && key) out.push(makeRecord(key, node.right, filePath, sf, node));
         }
 
         if (ts.isCallExpression(node)) {
@@ -219,7 +681,7 @@ function scanExtraExports(filePath: string): ImplRecord[] {
                 : (ts.isIdentifier(callee) ? callee.text : '');
             if ((fname === 'registerFastPath' || fname === 'registerDataExport') && node.arguments.length >= 2) {
                 const exportName = literalText(node.arguments[1]);
-                if (exportName) add(exportName, -1, node);
+                if (exportName) out.push({ name: exportName, arity: -1, file: filePath, line: lineOf(sf, node) });
             }
         }
 
@@ -250,6 +712,7 @@ export class ApiCoverageIndex {
         const apiDir = path.join(repoRoot, 'src/worker/api');
         const modulesDir = path.join(repoRoot, 'src/worker/modules');
         const validator = new SignatureValidator();
+        const graph = new SourceGraph();
 
         const apiFiles = fs.existsSync(apiDir)
             ? fs.readdirSync(apiDir).filter(f => f.endsWith('.api.ts'))
@@ -265,20 +728,35 @@ export class ApiCoverageIndex {
 
             const implFiles = collectImplFiles(modulesDir, moduleName, apiModuleNames);
             const implemented = new Map<string, ImplRecord>();
+            const unresolvedMerges: UnresolvedMerge[] = [];
+            let mergeSites = 0;
             // Keep the most informative sighting of a name: a known arity beats an
             // opaque one (-1), and a handler that takes arguments beats a `() => 0`
             // alias of the same name.
             const remember = (rec: ImplRecord): void => {
                 const key = undecorate(rec.name).toLowerCase();
                 const prev = implemented.get(key);
-                if (!prev || rec.arity > prev.arity) implemented.set(key, rec);
+                // Sightings of one name are complementary, not competing: the validator's scan
+                // knows the parameter list, the merge scan knows the hard-coded RET N. Keep the
+                // more informative arity, but never drop an ABI claim by preferring it.
+                const keepCleanup = (a: ImplRecord, b: ImplRecord | undefined) =>
+                    (a.cleanups === undefined && b?.cleanups) ? { ...a, cleanups: b.cleanups } : a;
+                if (!prev || rec.arity > prev.arity) implemented.set(key, keepCleanup(rec, prev));
+                else implemented.set(key, keepCleanup(prev, rec));
             };
             for (const f of implFiles) {
                 try {
                     for (const info of validator.scanImplementationFile(f)) {
                         remember({ name: info.name, arity: info.params.length, file: info.filePath, line: info.line });
                     }
-                    for (const rec of scanExtraExports(f)) remember(rec);
+                    for (const rec of scanExtraExports(f, graph)) remember(rec);
+                    // Merges are how most modules actually assemble their table; a scan that
+                    // stops at the file boundary reads imagehlp as 3 exports instead of 25.
+                    const scannedSet = new Set(implFiles.map(p => path.resolve(p)));
+                    const merged = scanExportMerges(f, graph, target => scannedSet.has(path.resolve(target)));
+                    for (const rec of merged.records) remember(rec);
+                    mergeSites += merged.sites;
+                    unresolvedMerges.push(...merged.unresolved.map(u => ({ ...u, file: toPosix(path.relative(repoRoot, u.file)) })));
                 } catch { /* an unparseable file must not sink the whole census */ }
             }
 
@@ -294,12 +772,15 @@ export class ApiCoverageIndex {
                 // `timeGetTime()` legitimately needs none.
                 const ignoresArgs = impl.arity === 0 && (argCount ?? 0) > 0;
                 const curated = SILENT_STUBS.has(`${moduleName}:${impl.name}`);
+                const originModule = moduleOfImplFile(modulesDir, impl.file);
                 exports.set(key, {
                     status: (ignoresArgs || curated) ? 'silent-stub' : 'implemented',
                     argCount,
                     arity: impl.arity,
                     file: toPosix(path.relative(repoRoot, impl.file)),
                     line: impl.line,
+                    stackCleanups: impl.cleanups,
+                    origin: originModule && originModule !== moduleName ? originModule : undefined,
                 });
             };
 
@@ -322,6 +803,8 @@ export class ApiCoverageIndex {
                 implFiles: implFiles.map(f => toPosix(path.relative(repoRoot, f))),
                 exports,
                 ordinals,
+                unresolvedMerges,
+                mergeSites,
             });
         }
 

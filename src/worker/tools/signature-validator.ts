@@ -1038,7 +1038,10 @@ export function validateSignatures(apiDir: string = 'src/worker/api', modulesDir
 
         console.log(`\nModule: ${result.moduleName}`);
         console.log(`Status: ${result.valid ? '✅ PASS' : '❌ FAIL'}`);
-        console.log(`Functions: ${result.stats.totalFunctions} implemented`);
+        // "in its own files" is load-bearing: a module that merges another's table
+        // (imagehlp ← createDbgHelpExports) binds far more than this pass can see. The
+        // export-binding section of validate-signatures is what counts the real table.
+        console.log(`Functions: ${result.stats.totalFunctions} handlers in its own files`);
 
         if (result.errors.length > 0) {
             console.log('Errors:');
