@@ -516,6 +516,11 @@ export class Msvcrt implements IModule {
         exports["fsetpos"] = (ctx, mem, args) => this.fsetpos(args[0] ?? 0, args[1] ?? 0);
         exports["fgetc"] = (ctx, mem, args) => this.fgetc(args[0] ?? 0);
         exports["getc"] = exports["fgetc"];
+        // MSVC's getc/putc macros decrement FILE->_cnt themselves and land here when it
+        // goes negative — which ours always does, so these ARE the getc/putc path for
+        // every MSVC-compiled caller. Re-zero _cnt so the next macro call comes back.
+        exports["_filbuf"] = (ctx, mem, args) => this.filbuf(args[0] ?? 0);
+        exports["_flsbuf"] = (ctx, mem, args) => this.flsbuf(args[0] ?? 0, args[1] ?? 0);
         exports["fputc"] = (ctx, mem, args) => this.fputc(args[0] ?? 0, args[1] ?? 0);
         exports["putc"] = exports["fputc"];
         exports["ungetc"] = (ctx, mem, args) => this.ungetc(args[0] ?? 0, args[1] ?? 0);
@@ -2782,6 +2787,24 @@ export class Msvcrt implements IModule {
      * implement. Enabled via enableRealFileStructs() (see modules/cw3220).
      */
     private useRealFileStructs = false;
+    /**
+     * MSVC `struct _iobuf` (32-bit): char *_ptr@0, int _cnt@4, char *_base@8,
+     * int _flag@12, int _file@16, int _charbuf@20, int _bufsiz@24, char *_tmpfname@28.
+     * MSVC compiles ferror/feof/getc/putc/fileno as MACROS straight over these fields,
+     * so a FILE* has to be real guest memory with live values — a bare token makes
+     * `ferror(f)` read whatever happens to sit at that address (Serious Sam read a
+     * stray _IOERR bit and rejected every .gro it had just parsed correctly).
+     * `_cnt`=0 with a NULL `_ptr` keeps getc/putc on the _filbuf/_flsbuf path.
+     */
+    private static readonly MSVC_FILE_SIZE = 32;
+    private static readonly MSVC_FILE_CNT_OFF = 4;
+    private static readonly MSVC_FILE_FLAG_OFF = 12;
+    private static readonly MSVC_FILE_FD_OFF = 16;
+    private static readonly MSVC_IOREAD = 0x0001;
+    private static readonly MSVC_IOWRT = 0x0002;
+    private static readonly MSVC_IOEOF = 0x0010;
+    private static readonly MSVC_IOERR = 0x0020;
+    private static readonly MSVC_IORW = 0x0080;
     /** Borland CW3220/Turbo-C FILE layout (32-bit): int level, …, char *curp @ +20. */
     private static readonly BORLAND_FILE_SIZE = 32;
     private static readonly BORLAND_FILE_LEVEL_OFF = 0;
@@ -2880,31 +2903,68 @@ export class Msvcrt implements IModule {
         const fd = this.nextFd();
         this.fds.set(fd, handle);
 
+        return this.createFileStream(fd, handle, mode);
+    }
+
+    /**
+     * Allocate the guest-visible FILE object and register the stream. Both CRT
+     * families inline stdio macros over FILE internals, so the pointer must be real
+     * guest memory — see MSVC_FILE_SIZE (default) and BORLAND_FILE_SIZE
+     * (enableRealFileStructs, which also drives the buffered-getc path).
+     */
+    private createFileStream(fd: number, handle: VfsFileHandle, mode: string): number {
+        const borland = this.useRealFileStructs;
+        const size = borland ? Msvcrt.BORLAND_FILE_SIZE : Msvcrt.MSVC_FILE_SIZE;
+        let structPtr: number | undefined = this.malloc(size) >>> 0;
         let filePtr: number;
-        let structPtr: number | undefined;
-        if (this.useRealFileStructs) {
-            // Real, zeroed FILE struct so inlined getc/putc (Borland/Watcom) read
-            // valid memory: level(+8)=0 keeps the macro on the _fgetc/_fputc path.
-            structPtr = this.malloc(Msvcrt.BORLAND_FILE_SIZE) >>> 0;
-            if (structPtr) {
-                this.memset(structPtr, 0, Msvcrt.BORLAND_FILE_SIZE);
-                filePtr = structPtr;
-            } else {
-                filePtr = this.nextFilePtr;   // OOM — fall back to a token
-                this.nextFilePtr += 4;
-                structPtr = undefined;
-            }
+        if (structPtr) {
+            this.memset(structPtr, 0, size);
+            filePtr = structPtr;
         } else {
-            filePtr = this.nextFilePtr;
+            filePtr = this.nextFilePtr;   // OOM — fall back to a token
             this.nextFilePtr += 4;
+            structPtr = undefined;
         }
         // Text mode (no "b") strips CRLF→LF on read, matching the MSVC CRT. SS2's config
         // files are CRLF; without this, fgets returns "...install.cfg\r\n" and the parsed
         // directive value keeps a trailing \r → fopen("install.cfg\r") fails → resources
         // never load. Binary mode ("b") reads bytes verbatim.
         const text = !mode.includes("b");
-        this.fileStreams.set(filePtr, { fd, handle, ungetChar: -1, text, eof: false, err: false, structPtr });
+        const flagBase = borland
+            ? undefined
+            : mode.includes("+") ? Msvcrt.MSVC_IORW
+                : mode.includes("r") ? Msvcrt.MSVC_IOREAD : Msvcrt.MSVC_IOWRT;
+        if (structPtr && flagBase !== undefined) {
+            Mem.writeUint32(structPtr + Msvcrt.MSVC_FILE_FLAG_OFF, flagBase);
+            Mem.writeUint32(structPtr + Msvcrt.MSVC_FILE_FD_OFF, fd);
+        }
+        this.fileStreams.set(filePtr, this.makeFileStream(fd, handle, text, structPtr, flagBase));
         return filePtr >>> 0;
+    }
+
+    /**
+     * eof/err write THROUGH to the guest FILE's `_flag` — MSVC's ferror/feof are
+     * macros that never call us, so the struct IS the answer the app reads. One
+     * place, so every existing `stream.err = true` stays honest.
+     */
+    private makeFileStream(
+        fd: number, handle: VfsFileHandle, text: boolean,
+        structPtr: number | undefined, flagBase: number | undefined,
+    ): MsvcrtFileStream {
+        let eof = false;
+        let err = false;
+        const sync = (): void => {
+            if (structPtr === undefined || flagBase === undefined) return;
+            Mem.writeUint32(structPtr + Msvcrt.MSVC_FILE_FLAG_OFF,
+                flagBase | (eof ? Msvcrt.MSVC_IOEOF : 0) | (err ? Msvcrt.MSVC_IOERR : 0));
+        };
+        return {
+            fd, handle, ungetChar: -1, text, structPtr,
+            get eof(): boolean { return eof; },
+            set eof(v: boolean) { eof = v; sync(); },
+            get err(): boolean { return err; },
+            set err(v: boolean) { err = v; sync(); },
+        };
     }
 
     private fclose(filePtr: number): number {
@@ -3202,25 +3262,7 @@ export class Msvcrt implements IModule {
         const mode = this.readCString(modePtr, 16);
         if (!mode) return 0;
 
-        let filePtr: number;
-        let structPtr: number | undefined;
-        if (this.useRealFileStructs) {
-            structPtr = this.malloc(Msvcrt.BORLAND_FILE_SIZE) >>> 0;
-            if (structPtr) {
-                this.memset(structPtr, 0, Msvcrt.BORLAND_FILE_SIZE);
-                filePtr = structPtr;
-            } else {
-                filePtr = this.nextFilePtr;
-                this.nextFilePtr += 4;
-                structPtr = undefined;
-            }
-        } else {
-            filePtr = this.nextFilePtr;
-            this.nextFilePtr += 4;
-        }
-        const text = !mode.includes("b");
-        this.fileStreams.set(filePtr, { fd, handle, ungetChar: -1, text, eof: false, err: false, structPtr });
-        return filePtr >>> 0;
+        return this.createFileStream(fd, handle, mode);
     }
 
     private rewind_fn(filePtr: number): number {
@@ -3247,6 +3289,24 @@ export class Msvcrt implements IModule {
         const pos = Mem.readUint32(posPtr) ?? 0;
         stream.handle.position = pos;
         return 0;
+    }
+
+    /** _filbuf(FILE*) — MSVC's getc-macro slow path. Unbuffered: one char, _cnt back to 0. */
+    private filbuf(filePtr: number): number | Promise<ThunkResult> {
+        this.resetFileCnt(filePtr);
+        return this.fgetc(filePtr);
+    }
+
+    /** _flsbuf(int c, FILE*) — MSVC's putc-macro slow path. */
+    private flsbuf(ch: number, filePtr: number): number {
+        this.resetFileCnt(filePtr);
+        return this.fputc(ch, filePtr);
+    }
+
+    private resetFileCnt(filePtr: number): void {
+        const stream = this.fileStreams.get(filePtr);
+        if (!stream || stream.structPtr === undefined || this.useRealFileStructs) return;
+        Mem.writeUint32(stream.structPtr + Msvcrt.MSVC_FILE_CNT_OFF, 0);
     }
 
     private fgetc(filePtr: number): number | Promise<ThunkResult> {

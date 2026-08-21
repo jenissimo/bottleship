@@ -9,6 +9,7 @@ const buildParams = (count: number): ParameterDescriptor[] => {
 };
 
 const makeFunc = (name: string, argCount: number, overrides: Partial<FunctionDescriptor> = {}): FunctionDescriptor => ({
+    ...overrides,
     name,
     params: overrides.params ?? buildParams(argCount),
     returnType: overrides.returnType ?? "u32",
@@ -285,6 +286,8 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("fflush", 1),
         makeFunc("fprintf", 16),
         makeFunc("feof", 1),
+        makeFunc("_filbuf", 1),
+        makeFunc("_flsbuf", 2),
         makeFunc("ferror", 1),
         makeFunc("rewind", 1),
         makeFunc("fgetpos", 2),
