@@ -9,9 +9,37 @@ const CEN_SIGNATURE = 0x02014b50;
 const LOC_SIGNATURE = 0x04034b50;
 const MAX_EOCD_SEARCH = 0x10000 + 22;
 
+/**
+ * What the layer that holds the FILE knows and the layers below it cannot infer:
+ * which entry this read belongs to, where its cursor is, and whether the caller is
+ * scanning. Everything below `ZipArchive` sees archive offsets only, so it cannot
+ * tell "sequential through a 50 MB entry" from "two unrelated adjacent reads" —
+ * which is the difference between a readahead that lands and one that evicts live
+ * data. Mirrors NT's per-file shared cache map: `CcScheduleReadAhead` reads ahead
+ * inside the file's extent, on the file object's own sequential state.
+ *
+ * All offsets are ARCHIVE offsets (the entry's data start, not 0), because that is
+ * the coordinate space every consumer of this hint already works in.
+ */
+export interface ReadHint {
+    /** Archive offset of the entry's first data byte. */
+    entryStart: number;
+    /** Archive offset one past the entry's last data byte. Readahead must not cross it. */
+    entryEnd: number;
+    /** Archive offset this read starts at (the file object's cursor). */
+    cursor: number;
+    /** FILE_FLAG_SEQUENTIAL_SCAN, or NT's heuristic: two consecutive contiguous
+     *  requests on the same file object. Only a sequential caller is speculated on. */
+    sequential: boolean;
+    /** This read is itself readahead — nobody is waiting on it. Without the
+     *  distinction a transport serves speculation and a caller's blocking read from
+     *  the same connection budget, and the blocking one waits behind the guesses. */
+    speculative?: boolean;
+}
+
 export interface ZipSource {
     size: number;
-    readRange(start: number, end: number): Promise<Uint8Array>;
+    readRange(start: number, end: number, hint?: ReadHint): Promise<Uint8Array>;
     /**
      * Optional sync range read. Returns the bytes when they can be served
      * synchronously (BufferSource / SAH always can), or `null` when a sync read
@@ -19,7 +47,7 @@ export interface ZipSource {
      * must then fall back to the async `readRange`. Existing always-sync sources
      * never return null, so this widening is behavior-preserving for them.
      */
-    readRangeSync?(start: number, end: number): Uint8Array | null;
+    readRangeSync?(start: number, end: number, hint?: ReadHint): Uint8Array | null;
 }
 
 export interface ZipEntry {
@@ -383,8 +411,8 @@ export class ZipArchive {
     /**
      * Reads an uncompressed (STORED) entry range without loading the whole file.
      */
-    async readEntryRange(entry: ZipEntry, offset: number, length: number): Promise<Uint8Array> {
-        const sync = this.readEntryRangeSync(entry, offset, length);
+    async readEntryRange(entry: ZipEntry, offset: number, length: number, sequential = false): Promise<Uint8Array> {
+        const sync = this.readEntryRangeSync(entry, offset, length, sequential);
         if (sync) return sync;
         if (entry.compression !== 0) {
             throw new Error(`Range read is supported only for STORED entries (${entry.name})`);
@@ -400,11 +428,18 @@ export class ZipArchive {
         }
 
         const dataStart = await this.getEntryDataStart(entry);
-        return this.source.readRange(dataStart + clampedOffset, dataStart + clampedEnd);
+        return this.source.readRange(dataStart + clampedOffset, dataStart + clampedEnd, {
+            entryStart: dataStart,
+            entryEnd: dataStart + entry.uncompressedSize,
+            cursor: dataStart + clampedOffset,
+            sequential,
+        });
     }
 
-    /** Sync range read for STORED entries when ZipSource supports readRangeSync. */
-    readEntryRangeSync(entry: ZipEntry, offset: number, length: number): Uint8Array | null {
+    /** Sync range read for STORED entries when ZipSource supports readRangeSync.
+     *  `sequential` is the caller's own read-pattern state (it owns the file object);
+     *  this is the layer that can turn it into an entry-bounded {@link ReadHint}. */
+    readEntryRangeSync(entry: ZipEntry, offset: number, length: number, sequential = false): Uint8Array | null {
         if (entry.compression !== 0 || !this.source.readRangeSync) return null;
         if (length <= 0 || offset >= entry.uncompressedSize) return new Uint8Array();
         const clampedOffset = Math.max(0, offset);
@@ -412,7 +447,13 @@ export class ZipArchive {
         if (clampedOffset >= clampedEnd) return new Uint8Array();
         const dataStart = this.getEntryDataStartSync(entry);
         if (dataStart === null) return null;
-        return this.source.readRangeSync(dataStart + clampedOffset, dataStart + clampedEnd);
+        const hint: ReadHint = {
+            entryStart: dataStart,
+            entryEnd: dataStart + entry.uncompressedSize,
+            cursor: dataStart + clampedOffset,
+            sequential,
+        };
+        return this.source.readRangeSync(dataStart + clampedOffset, dataStart + clampedEnd, hint);
     }
 
     private async getEntryDataStart(entry: ZipEntry): Promise<number> {
