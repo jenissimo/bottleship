@@ -215,6 +215,11 @@ function applyIniEdit(text: string, section: string, key: string | null, value: 
  * process (or the page) goes away. Games hand their whole detected-hardware/graphics config
  * over this API and read it back in a LATER process, so the file is the contract.
  */
+/** Guest ANSI string -> the one-char-per-byte form the ini text is held in. */
+function toLatin1(value: string): string {
+    return new TextDecoder('latin1').decode(encodeAnsi(value));
+}
+
 function writeIniValue(
     fileName: string | null, section: string | null, key: string | null, value: string | null,
     who: string,
@@ -228,18 +233,36 @@ function writeIniValue(
 
     let text = iniText.get(cacheKey);
     if (text === undefined) {
-        // Not read yet this session. Pull the current bytes so unrelated content survives;
-        // a miss is an absent/empty file, which an edit legitimately creates.
-        text = '';
+        // Not read yet this session. Pull the current bytes so unrelated content survives.
+        // A sync read can MISS on a file that exists — an active writer's buffer that cannot
+        // serve the range, a pending flush, no handle in the LRU cache — and the write below
+        // is CREATE_ALWAYS. Treating a miss as "empty file" would truncate a 200-line ini to
+        // the one key being written, which is exactly the wrong answer a caller cannot detect.
+        // Absent is the only case an edit may legitimately create from nothing.
         const handle = vfs.openSync(fileName, 0x80000000 /* GENERIC_READ */, 3 /* OPEN_EXISTING */);
-        if (handle) {
+        if (!handle) {
+            text = '';
+        } else {
             const size = vfs.getFileSize(handle.path);
-            const data = size > 0 ? vfs.readSync(handle, size) : null;
-            if (data && data.length >= size) text = new TextDecoder('latin1').decode(data);
+            if (size <= 0) {
+                text = '';
+            } else {
+                const data = vfs.readSync(handle, size);
+                if (!data || data.length < size) {
+                    Logger.warn(LogCategory.KERNEL32,
+                        `${who}: refusing to rewrite "${resolved}" — its ${size} bytes are not readable synchronously right now (would truncate)`);
+                    return 0;
+                }
+                text = new TextDecoder('latin1').decode(data);
+            }
         }
     }
 
-    const updated = applyIniEdit(text, section, key, value);
+    // The file is held as latin1, i.e. one char per byte, so bytes we did not touch survive
+    // verbatim. The incoming strings arrive decoded from the guest's ANSI codepage, so they
+    // have to be re-encoded to bytes before being spliced into that representation — otherwise
+    // a cp1251 value round-trips through encodeAnsi's '?' substitution.
+    const updated = applyIniEdit(text, toLatin1(section), key === null ? null : toLatin1(key), value === null ? null : toLatin1(value));
     iniText.set(cacheKey, updated);
     iniCache.set(cacheKey, parseIniContent(updated));
 
@@ -248,7 +271,7 @@ function writeIniValue(
         Logger.warn(LogCategory.KERNEL32, `${who}: cannot open "${resolved}" for write`);
         return 0;
     }
-    const bytes = encodeAnsi(updated);
+    const bytes = Uint8Array.from(updated, (ch) => ch.charCodeAt(0) & 0xff);
     const written = vfs.writeSync(out, bytes);
     if (written < 0) {
         Logger.warn(LogCategory.KERNEL32, `${who}: write to "${resolved}" failed`);

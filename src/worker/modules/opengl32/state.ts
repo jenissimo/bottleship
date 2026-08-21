@@ -6,7 +6,7 @@
 import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import {
     OpenGLContext, GLDrawCommandType, GLTexGenState, mat4Multiply, VERT_FLOATS,
-    CMD_I32, CMD_F32,
+    CMD_I32, CMD_F32, CI_TYPE,
     CI_MODE, CI_VERT_OFFSET, CI_VERT_COUNT, CI_FLAGS, CI_DEPTH_FUNC, CI_BLEND_SRC, CI_BLEND_DST,
     CI_ALPHA_FUNC, CI_CULL_FACE, CI_FRONT_FACE, CI_TEX_ID0, CI_TEX_ID1, CI_TEXENV0, CI_TEXENV1,
     CI_SHADE_MODEL, CI_FOG_MODE, CI_POLYGON_MODE, CI_STENCIL_FUNC, CI_STENCIL_REF, CI_STENCIL_MASK,
@@ -183,6 +183,8 @@ for (let i = 0; i < 8; i++) KNOWN_CAPS.add(GL_LIGHT0 + i);
  * exactly the region GL would have cleared.
  */
 function emitScissorColorClear(ctx: OpenGLContext): void {
+    // Same rule pushGLDrawCommand applies: nothing rasterizes outside GL_RENDER.
+    if (ctx.renderMode !== GL_RENDER) return;
     const base = arenaReserve(ctx, 6);
     const arena = ctx.vertArena;
     const d = arena.data;
@@ -207,6 +209,14 @@ function emitScissorColorClear(ctx: OpenGLContext): void {
     const idx = stream.alloc(GLDrawCommandType.DRAW);
     const I = stream.i32;
     const i = idx * CMD_I32;
+    // alloc() does not clear the record — it hands back a recycled ring slot and expects the
+    // emitter to write every field its command type reads. This one writes far fewer fields
+    // than a real draw, so anything left over would come from whatever draw held the slot last
+    // frame: a stale CI_TEX_ID0 samples the clear through that texture, a stale
+    // CI_POLYGON_MODE turns it into a wireframe X. Zero first, then write what a clear means.
+    I.fill(0, i, i + CMD_I32);
+    stream.f32.fill(0, idx * CMD_F32, (idx + 1) * CMD_F32);
+    I[i + CI_TYPE] = GLDrawCommandType.DRAW;
     I[i + CI_MODE] = GL_TRIANGLES;
     I[i + CI_VERT_OFFSET] = base;
     I[i + CI_VERT_COUNT] = 6;

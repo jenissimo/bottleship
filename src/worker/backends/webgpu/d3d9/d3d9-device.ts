@@ -1373,8 +1373,12 @@ export class D3D9Device {
 
     /**
      * True when the ACTIVE declaration hands the pipeline positions that are already in
-     * screen space — D3DDECLUSAGE_POSITIONT, or a POSITION declared as FLOAT4 (the shape
-     * XYZRHW takes when an app builds the declaration by hand).
+     * screen space: D3DDECLUSAGE_POSITIONT, or FVF XYZRHW when no declaration is bound.
+     *
+     * POSITION declared as FLOAT4 does NOT count. It is an ordinary declaration — apps use the
+     * w lane for w-tricks and pre-scaled positions — and wined3d sets position_transformed only
+     * for POSITIONT. Counting it here would take the vertex stage away from a bound shader and
+     * feed model-space coordinates to a screen-space stage, with nothing logged.
      */
     private ptMemoDecl = -1;
     private ptMemoFvf = -1;
@@ -1387,8 +1391,7 @@ export class D3D9Device {
         const decl = this.activeVertexDecl > 0 ? this.vsDeclRegistry.get(this.activeVertexDecl) : null;
         this.ptMemoValue = (!decl || decl.length === 0)
             ? (fvf & D3DFVF_POSITION_MASK) === D3DFVF_XYZRHW
-            : decl.some(e => e.usage === DECLUSAGE_POSITIONT_FFP
-                || (e.usage === DECLUSAGE_POSITION_FFP && e.type === 3));
+            : decl.some(e => e.usage === DECLUSAGE_POSITIONT_FFP);
         this.ptMemoDecl = this.activeVertexDecl;
         this.ptMemoFvf = fvf;
         return this.ptMemoValue;

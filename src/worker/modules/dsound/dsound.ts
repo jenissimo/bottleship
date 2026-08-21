@@ -94,6 +94,8 @@ const DSBCAPS_CTRLPOSITIONNOTIFY = 0x00000100;
 const DSERR_UNSUPPORTED = 0x80004001;
 const DSERR_INVALIDCALL = 0x88780032;
 const DSERR_CONTROLUNAVAIL = 0x8878001e;
+/** DSFXR_* (dsound.h): PRESENT=0 … UNKNOWN=5. Zero is the SUCCESS value here. */
+const DSFXR_UNKNOWN = 5;
 const DSERR_BADFORMAT = 0x88780064;
 const DSERR_NODRIVER = 0x88780078;
 const DSERR_BUFFERLOST_HR = 0x88780096;
@@ -2146,18 +2148,30 @@ export class DSound implements IModule {
             const pdwResultCodes = args[3] >>> 0;
             if (pdwResultCodes && dwEffectsCount && dwEffectsCount < 0x1000
                 && isValidAddress(mem, pdwResultCodes, dwEffectsCount * 4, "rw")) {
-                // DSFXR_UNKNOWN — no effect was located, one entry per requested effect.
-                for (let i = 0; i < dwEffectsCount; i++) Mem.writeUint32(pdwResultCodes + i * 4, 0);
+                // DSFXR_UNKNOWN (5) — no effect was located, one entry per requested effect.
+                // NOT 0: that is DSFXR_PRESENT, which would tell a caller inspecting the array
+                // to find WHICH effect failed that all of them are in place.
+                for (let i = 0; i < dwEffectsCount; i++) Mem.writeUint32(pdwResultCodes + i * 4, DSFXR_UNKNOWN);
             }
             Logger.warn(LogCategory.SYSTEM, "dsound: SetFX -> DSERR_CONTROLUNAVAIL (no DMO effects chain)");
             return DSERR_CONTROLUNAVAIL;
         };
-        this.exports["idirectsoundbuffer8_acquireresources"] = () => DSERR_CONTROLUNAVAIL;
+        // AcquireResources carries the same per-effect out-array as SetFX and must fill it
+        // for the same reason.
+        this.exports["idirectsoundbuffer8_acquireresources"] = (ctx, mem, args) => {
+            const dwEffectsCount = args[2] >>> 0;
+            const pdwResultCodes = args[3] >>> 0;
+            if (pdwResultCodes && dwEffectsCount && dwEffectsCount < 0x1000
+                && isValidAddress(mem, pdwResultCodes, dwEffectsCount * 4, "rw")) {
+                for (let i = 0; i < dwEffectsCount; i++) Mem.writeUint32(pdwResultCodes + i * 4, DSFXR_UNKNOWN);
+            }
+            return DSERR_CONTROLUNAVAIL;
+        };
         // GetObjectInPath hands back an effect/renderer interface pointer. There is no
         // object in any path here, and the capture buffer's twin already says so.
         this.exports["idirectsoundbuffer8_getobjectinpath"] = (ctx, mem, args) => {
             const ppObject = args[4] >>> 0;
-            if (ppObject) Mem.writeUint32(ppObject, 0);
+            if (ppObject && isValidAddress(mem, ppObject, 4, "rw")) Mem.writeUint32(ppObject, 0);
             return DSERR_OBJECTNOTFOUND;
         };
 

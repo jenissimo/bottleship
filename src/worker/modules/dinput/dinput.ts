@@ -290,13 +290,15 @@ const IDirectInputA_StubMethods = ["RunControlPanel", "Initialize"];
 const IID_IUNKNOWN = "00000000-0000-0000-c000-000000000046";
 const IID_IDIRECTINPUTA = "89521360-aa8a-11cf-bfc7-444553540000";
 const IID_IDIRECTINPUTW = "89521361-aa8a-11cf-bfc7-444553540000";
+/** The only pre-DI8 IID with a registered factory; its vtable is a superset of 2A/7W. */
+const IID_IDIRECTINPUT7A = "9a4cb684-236d-11d3-8e9d-00c04f6844ae";
 const DIRECTINPUT_QI_IIDS = new Set([
     IID_IUNKNOWN,
     IID_IDIRECTINPUTA,
     IID_IDIRECTINPUTW,
     "5944e662-aa8a-11cf-bfc7-444553540000", // IDirectInput2A
     "5944e663-aa8a-11cf-bfc7-444553540000", // IDirectInput2W
-    "9a4cb684-236d-11d3-8e9d-00c04f6844ae", // IDirectInput7A
+    IID_IDIRECTINPUT7A,
     "9a4cb685-236d-11d3-8e9d-00c04f6844ae", // IDirectInput7W
 ]);
 
@@ -437,7 +439,7 @@ export class DInput implements IModule {
 
         // Register COM object factories
         ComObjectFactory.register("89521360-AA8A-11CF-BFC7-444553540000", DirectInputObject); // IDirectInputA
-        ComObjectFactory.register("9a4cb684-236d-11d3-8e9d-00c04f6844ae", DirectInputObject); // IDirectInput7A
+        ComObjectFactory.register(IID_IDIRECTINPUT7A, DirectInputObject);
         ComObjectFactory.register(IID_IDIRECTINPUT8A, DirectInputObject); // IDirectInput8A
         ComObjectFactory.register(IID_IDIRECTINPUT8W, DirectInputObject); // IDirectInput8W
         ComObjectFactory.register("5944e680-c92e-11cf-bfc7-444553540000", DirectInputDeviceObject); // IDirectInputDeviceA
@@ -591,7 +593,10 @@ export class DInput implements IModule {
             }
             const longVtable = vtableOf("IDirectInput7A");
             if (!longVtable) return fail();
-            const promoted = ComObjectFactory.create(iid, longVtable);
+            // The factory registry is keyed by the interfaces we implement, not by every IID a
+            // client may ask for: IDirectInput2A/2W/7W have no factory of their own and are
+            // served by the 7A object, whose vtable is a strict superset.
+            const promoted = ComObjectFactory.create(IID_IDIRECTINPUT7A, longVtable);
             if (!promoted) return fail();
             const addr = allocateComObject(this.process.memory, this.getMemory(), longVtable);
             resourceProvider.mapAddressToHandle(addr, promoted.handle);
@@ -1879,7 +1884,7 @@ export class DInput implements IModule {
         mem: Uint8Array,
         riidPtr: number,
     ): { iid: string; vtableName: "IDirectInputA" | "IDirectInput7A" } {
-        const DI7A = { iid: "9a4cb684-236d-11d3-8e9d-00c04f6844ae", vtableName: "IDirectInput7A" as const };
+        const DI7A = { iid: IID_IDIRECTINPUT7A, vtableName: "IDirectInput7A" as const };
         if (!riidPtr) return DI7A;
         const b = this.readGuidBytes(mem, riidPtr);
         // Data1 little-endian: IID_IDirectInputA = 0x89521360, IID_IDirectInput2A = 0x5944e662.
