@@ -10,7 +10,10 @@ import {
     readFilenameArg, isEncodedFormat, MSS_SAMPLE_STRUCT_SIZE,
     computeSampleVolumes, getPlaybackLengthBytes, writeSamplePosition,
 } from "./helpers";
-import { decodeAudioFile } from "./audio-decode";
+import {
+    AILSOUNDINFO_SIZE, DIG_F_16BITS_MASK, DIG_F_ADPCM_MASK, DIG_F_STEREO_MASK,
+    convertToFloat, decodeAudioFile, readAilSoundInfo,
+} from "./audio-decode";
 import { playSample, updateSamplePlayback, stopRingBuffer, resumeRingBuffer, seekRingBuffer, applySample3D } from "./playback-engine";
 import { System } from "../../core/system";
 import { i32ToFloat } from "../../../audio/audio-ring-buffer";
@@ -486,6 +489,101 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
         return 1;
     };
 
+    // S32 AIL_set_sample_info(HSAMPLE S, AILSOUNDINFO const *info)
+    //
+    // The memory-image twin of AIL_set_sample_file: rather than a file to parse, the app
+    // hands Miles a buffer it has already described — format, data pointer, length, rate,
+    // bits, channels, block size. A title that loads one bank into memory once and plays
+    // slices out of it never calls set_sample_file at all, so a missing set_sample_info
+    // leaves the voice allocated, "configured" into nothing, and silent while every status
+    // the guest can read says PLAYING.
+    //
+    // `format` is the DIG_F_* bitmask AIL_WAV_info emits (this module's own convention,
+    // and what _AIL_decompress_ADPCM@12 already reads); WAVE_FORMAT_IMA_ADPCM (17) is
+    // accepted too since it cannot collide with a DIG_F value (0..7). DIG_F says only
+    // "ADPCM or not" — which ADPCM flavour comes from the AIL_WAV_info that described
+    // this same buffer, exactly as decompress_ADPCM resolves it.
+    const setSampleInfo: ThunkImplementation = (ctxThunk, mem, args) => {
+        const handle = args[0];
+        const infoPtr = args[1];
+
+        const sampleObj = ctx.samples.get(handle);
+        if (!sampleObj) {
+            Logger.warn(LogCategory.SYSTEM, `MSS32: AIL_set_sample_info: invalid sample handle 0x${handle.toString(16)}`);
+            return 0;
+        }
+        if (!infoPtr || !isValidAddress(mem, infoPtr, AILSOUNDINFO_SIZE, "r")) {
+            Logger.warn(LogCategory.SYSTEM, `MSS32: AIL_set_sample_info: unreadable AILSOUNDINFO at 0x${infoPtr.toString(16)}`);
+            return 0;
+        }
+        const info = readAilSoundInfo(mem, infoPtr);
+        if (!info) return 0;
+
+        if (!info.dataPtr || info.dataLen <= 0) {
+            Logger.warn(LogCategory.SYSTEM, `MSS32: AIL_set_sample_info: empty sound image (ptr=0x${info.dataPtr.toString(16)} len=${info.dataLen})`);
+            return 0;
+        }
+        // Whole extent up front, against the region map — the app owns this buffer and it
+        // is the only thing standing between a bogus data_len and a read off a live region.
+        if (!isValidAddress(mem, info.dataPtr, info.dataLen, "r")) {
+            Logger.warn(LogCategory.SYSTEM, `MSS32: AIL_set_sample_info: sound image out of bounds ptr=0x${info.dataPtr.toString(16)} len=${info.dataLen}`);
+            return 0;
+        }
+
+        const isAdpcm = (info.format & DIG_F_ADPCM_MASK) !== 0 || info.format === 17;
+        const channels = info.channels > 0 ? info.channels : ((info.format & DIG_F_STEREO_MASK) ? 2 : 1);
+        const bits = info.bits > 0 ? info.bits : (isAdpcm ? 4 : ((info.format & DIG_F_16BITS_MASK) ? 16 : 8));
+        const formatTag = isAdpcm
+            ? (ctx.wavFormatByDataPtr.get(info.dataPtr) ?? 17)
+            : (bits === 32 ? 3 : 1);
+        // block_size describes an ADPCM block and is meaningless for PCM, where the frame
+        // size is fixed by channels x bits. Apps leave it uninitialized on the PCM path —
+        // GTA III's carries a leftover stack address — so reading it there turns a good
+        // sample into a fraction of itself or into nothing at all.
+        const blockAlign = isAdpcm && info.blockSize > 0
+            ? info.blockSize
+            : channels * Math.max(1, bits >> 3);
+
+        // Real Miles auto-inits the sample here, same as set_sample_file — loop state goes
+        // back to the one-shot default, or a reused voice inherits the last sound's looping.
+        resetSampleLoopState(sampleObj);
+        sampleObj.isStopped = false;
+
+        sampleObj.fileData = mem.slice(info.dataPtr, info.dataPtr + info.dataLen);
+        sampleObj.fileDataAllocated = false;
+        sampleObj.fileDataAddress = info.dataPtr;
+        sampleObj.fileFormat = "wav";
+        sampleObj.sampleRate = info.rate > 0 ? info.rate : 22050;
+        sampleObj.channels = channels;
+        sampleObj.bitsPerSample = bits;
+        sampleObj.formatTag = formatTag;
+        sampleObj.blockAlign = blockAlign;
+        sampleObj.encodedDurationMs = undefined;
+        sampleObj.decodedData = convertToFloat(sampleObj.fileData, channels, bits, formatTag, blockAlign);
+        // len/done are SOURCE bytes — what the app seeks in — not decoded floats.
+        sampleObj.pcmBytes = info.dataLen;
+
+        updateSampleMemory(ctx, sampleObj, info.dataPtr, info.dataLen);
+        refreshSampleLenDone(ctx, sampleObj);
+
+        Logger.log(
+            LogCategory.SYSTEM,
+            `MSS32: AIL_set_sample_info: sample=0x${handle.toString(16)} fmt=${info.format}${isAdpcm ? `(adpcm tag=${formatTag})` : ""} ` +
+            `${channels}ch ${sampleObj.sampleRate}Hz ${bits}bit data=0x${info.dataPtr.toString(16)} len=${info.dataLen} -> ${sampleObj.decodedData.length} floats`
+        );
+
+        if (sampleObj.decodedData.length === 0) {
+            Logger.warn(LogCategory.SYSTEM, `MSS32: AIL_set_sample_info: decoded 0 samples from ${info.dataLen} bytes (fmt=${info.format} ${bits}bit block=${blockAlign})`);
+            return 0;
+        }
+        if (sampleObj.pendingStart) {
+            playSample(ctx, sampleObj);
+        }
+        return 1;
+    };
+    exports["_AIL_set_sample_info@8"] = setSampleInfo;
+    exports["AIL_set_sample_info"] = setSampleInfo;
+
     // _AIL_set_sample_address@8
     exports["_AIL_set_sample_address@8"] = (ctxThunk, mem, args) => {
         const sample = args[0];
@@ -697,6 +795,11 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
     // _AIL_set_3D_sample_file@8(S3D, file_image) — WAV in guest memory, parses RIFF size itself
     exports["_AIL_set_3D_sample_file@8"] = (ctxThunk, mem, args) =>
         exports["_AIL_set_sample_file@12"]!(ctxThunk, mem, [args[0], args[1], 0]);
+
+    // H3DSAMPLE is a sample handle from the same pool, and the AILSOUNDINFO contract is
+    // identical — the 3D variant only differs in which pool allocate_* drew the voice from.
+    exports["_AIL_set_3D_sample_info@8"] = setSampleInfo;
+    exports["AIL_set_3D_sample_info"] = setSampleInfo;
 
     exports["_AIL_start_3D_sample@4"] = (ctxThunk, mem, args) => {
         const r = exports["_AIL_start_sample@4"]!(ctxThunk, mem, args);

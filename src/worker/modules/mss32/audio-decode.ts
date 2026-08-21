@@ -234,7 +234,9 @@ export function decodeStreamFile(ctx: MSSContext, stream: MSSStream): boolean {
     return false;
 }
 
-// Miles DIG_F_* format flags (tools/reference/mss32/mss.h)
+// Miles DIG_F_* format flags. We hold no Miles header — this bit layout is OUR
+// reconstruction from what guests hand us (a mono-16 sample arrives as format=1) and
+// is consistent with every AILSOUNDINFO seen so far. Treat it as convention, not spec.
 export const DIG_F_16BITS_MASK = 1;
 export const DIG_F_STEREO_MASK = 2;
 export const DIG_F_ADPCM_MASK = 4;

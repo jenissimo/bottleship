@@ -11,9 +11,16 @@ import {
     setStreamStatus, writeStreamPosition, writeStreamVolume, writeStreamPan,
     writeStreamPlaybackRate, refreshStreamLenDone, isEncodedFormat,
 } from "./helpers";
-import { playStream, updateStreamPlayback, stopRingBuffer, resumeRingBuffer } from "./playback-engine";
+import {
+    playStream, updateStreamPlayback, stopRingBuffer, resumeRingBuffer,
+    incrementalStreamPosition, releaseStreamRing,
+} from "./playback-engine";
 import { decodeStreamFile } from "./audio-decode";
 import { GuestCallChain, hasAppFileCallbacks, readWholeFileViaApp, runGuestCallChain } from "./app-file-io";
+import {
+    closeStreamSource, closeVfsStreamSource, openStreamSource, openVfsStreamSource,
+    seekIncrementalStream, serveIncrementalStreams, sniffVfsStream, startIncrementalStream,
+} from "./stream-engine";
 
 export function createStreamExports(ctx: MSSContext): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
@@ -78,6 +85,14 @@ export function createStreamExports(ctx: MSSContext): Record<string, ThunkImplem
 
         if (filenameStr && hasAppFileCallbacks(ctx)) {
             const chain = (function* (): GuestCallChain {
+                // Incremental first: one open handle plus a fixed ring, so the app's
+                // reader is asked for a buffer at a time instead of the whole file.
+                if (yield* openStreamSource(ctx, stream, filenamePtr, filenameStr)) {
+                    Logger.log(LogCategory.SYSTEM,
+                        `MSS32: _AIL_open_stream@12 -> 0x${handle.toString(16)} (streamId=${streamId}, incremental via app callbacks)`);
+                    if (stream.pendingStart) startIncrementalStream(ctx, stream);
+                    return handle;
+                }
                 const data = yield* readWholeFileViaApp(ctx, filenamePtr, filenameStr);
                 if (!data) {
                     discardStream(ctx, stream);
@@ -93,9 +108,21 @@ export function createStreamExports(ctx: MSSContext): Record<string, ThunkImplem
         }
 
         if (filenameStr) {
-            loadStreamFile(ctx, stream).catch(err => {
-                Logger.error(LogCategory.SYSTEM, `MSS32: Failed to load stream file "${filenameStr}": ${err}`);
-            });
+            // Answer the way Miles does: synchronously, and with 0 for a file that is
+            // not a stream. The sniff is one resident header read; when it adopts, the
+            // stream is already playable before this call returns.
+            const sniff = sniffVfsStream(ctx, stream, filenameStr);
+            if (sniff === "not-audio") {
+                Logger.warn(LogCategory.SYSTEM,
+                    `MSS32: _AIL_open_stream@12: "${filenameStr}" is not a stream Miles can play — returning 0`);
+                discardStream(ctx, stream, "not a playable stream format");
+                return 0;
+            }
+            if (sniff !== "incremental") {
+                loadStreamFile(ctx, stream, sniff === "unknown").catch(err => {
+                    Logger.error(LogCategory.SYSTEM, `MSS32: Failed to load stream file "${filenameStr}": ${err}`);
+                });
+            }
         }
 
         Logger.log(LogCategory.SYSTEM, `MSS32: _AIL_open_stream@12 -> 0x${handle.toString(16)} (streamId=${streamId})`);
@@ -118,13 +145,33 @@ export function createStreamExports(ctx: MSSContext): Record<string, ThunkImplem
                 self.postMessage({ type: "audio_stop", payload: { id: stream.id } });
             }
         }
-        if (stream.streamDummyBuffer) {
-            ctx.process.memory.free(stream.streamDummyBuffer);
+
+        const teardown = (): void => {
+            releaseStreamRing(stream.id);
+            if (stream.streamDummyBuffer) {
+                ctx.process.memory.free(stream.streamDummyBuffer);
+            }
+            ctx.process.memory.free(streamHandle);
+            ctx.streamsById.delete(stream.id);
+            ctx.streams.delete(streamHandle);
+            ctx.streamCallbacks.delete(streamHandle);
+            ctx.streamUserData.delete(streamHandle);
+            Logger.log(LogCategory.SYSTEM, `MSS32: _AIL_close_stream@4: Stream closed (id=${stream.id})`);
+        };
+
+        // An app-backed source owns one of the app's OWN file handles; closing it is
+        // the app's close callback, i.e. guest code, so the caller parks until it ran.
+        if (stream.source?.kind === "app") {
+            const chain = (function* (): GuestCallChain {
+                yield* closeStreamSource(ctx, stream);
+                teardown();
+                return 0;
+            })();
+            return runGuestCallChain(ctx, ctxThunk, 4, "mss32:AIL_close_stream", chain);
         }
-        ctx.process.memory.free(streamHandle);
-        ctx.streamsById.delete(stream.id);
-        ctx.streams.delete(streamHandle);
-        Logger.log(LogCategory.SYSTEM, `MSS32: _AIL_close_stream@4: Stream closed (id=${stream.id})`);
+
+        closeVfsStreamSource(stream);
+        teardown();
         return 0;
     };
 
@@ -195,6 +242,14 @@ export function createStreamExports(ctx: MSSContext): Record<string, ThunkImplem
         const stream = ctx.streams.get(streamHandle);
         if (!stream) return 0;
 
+        // An incremental stream's position is what the WORKLET has consumed, not what
+        // the wall clock says it should have: a stalled mixer must not run the guest's
+        // radio clock past audio nobody has heard.
+        if (stream.source) {
+            stream.position = incrementalStreamPosition(stream);
+            return stream.position;
+        }
+
         if (stream.isPlaying && stream.startTime && !stream.isPaused) {
             const elapsed = performance.now() - stream.startTime;
             const bytesPerSec = getBytesPerSecond(stream);
@@ -236,6 +291,13 @@ export function createStreamExports(ctx: MSSContext): Record<string, ThunkImplem
         stream.position = position;
         writeStreamPosition(ctx, stream, position);
 
+        // Incremental: re-anchor the source and drop the ring. Nothing to seek in the
+        // host audio element, and the ring's contents are now the wrong second.
+        if (stream.source) {
+            seekIncrementalStream(stream, position);
+            return 0;
+        }
+
         if (stream.isPlaying) {
             const bytesPerSec = getBytesPerSecond(stream);
             const seekTimeMs = bytesPerSec > 0 ? (position / bytesPerSec) * 1000 : 0;
@@ -245,6 +307,16 @@ export function createStreamExports(ctx: MSSContext): Record<string, ThunkImplem
             });
         }
         return 0;
+    };
+
+    // void AIL_set_stream_ms_position(HSTREAM S, S32 milliseconds) — the ms twin of
+    // set_stream_position, converted with the stream's own bytes-per-second so the seek
+    // and the rounding both happen in exactly one place.
+    exports["_AIL_set_stream_ms_position@8"] = (ctxThunk, mem, args) => {
+        const stream = ctx.streams.get(args[0]);
+        if (!stream) return 0;
+        const bytes = Math.max(0, Math.round(getBytesPerSecond(stream) * (args[1] | 0) / 1000));
+        return exports["_AIL_set_stream_position@8"]!(ctxThunk, mem, [args[0], bytes]);
     };
 
     // _AIL_set_stream_volume@8
@@ -347,9 +419,8 @@ export function createStreamExports(ctx: MSSContext): Record<string, ThunkImplem
     };
 
     // _AIL_register_stream_callback@8(stream, callback) -> previous callback.
-    // The app's data pump: Miles calls it when the stream needs more data. Ours
-    // reads the whole file at open, so there is no refill to ask for — recorded
-    // against a future incremental stream engine.
+    // Miles calls it when an incrementally fed stream reaches the end of its source
+    // (see stream-engine's rollOver); a whole-file stream never reaches one.
     exports["_AIL_register_stream_callback@8"] = (ctxThunk, mem, args) => {
         const streamHandle = args[0];
         const callback = args[1] >>> 0;
@@ -419,11 +490,25 @@ export function createStreamExports(ctx: MSSContext): Record<string, ThunkImplem
     // resolve to whichever `AIL_stream_info` variant registered last.
     exports["AIL_stream_info"] = streamInfo5;
 
-    // _AIL_service_stream@8
+    // _AIL_service_stream@8 — the app asking Miles to top its stream buffers up. For an
+    // incrementally fed stream that is literally the work: read the next slab through
+    // the app's own file callbacks, which is guest code, so the caller may park here.
     exports["_AIL_service_stream@8"] = (ctxThunk, mem, args) => {
         const streamHandle = args[0];
         const stream = ctx.streams.get(streamHandle);
         if (!stream) return 0;
+
+        if (stream.source?.kind === "app") {
+            const served = serveIncrementalStreams(ctx, ctxThunk, 8, "mss32:AIL_service_stream");
+            if (served) return served;
+        }
+
+        if (stream.source) {
+            const position = incrementalStreamPosition(stream);
+            stream.position = position;
+            writeStreamPosition(ctx, stream, position);
+            return stream.isPlaying && !stream.isPaused ? 1 : 0;
+        }
 
         if (stream.isPlaying && !stream.isPaused) {
             const position = exports["_AIL_stream_position@4"]!(ctxThunk, mem, [streamHandle]) as number;
@@ -452,6 +537,12 @@ export function createStreamExports(ctx: MSSContext): Record<string, ThunkImplem
 function startStream(ctx: MSSContext, stream: MSSStream, who: string): void {
     stream.startTime = performance.now();
     stream.isPaused = false;
+
+    if (stream.source) {
+        startIncrementalStream(ctx, stream);
+        Logger.log(LogCategory.SYSTEM, `MSS32: ${who}: Started incremental stream playback`);
+        return;
+    }
 
     if (!stream.decodedData) {
         if (stream.fileData && isEncodedFormat(stream.fileFormat)) {
@@ -496,9 +587,9 @@ function unpauseStream(ctx: MSSContext, stream: MSSStream): void {
 
 /** Tear a half-built stream back down: AIL_open_stream answers 0, so the app must
  *  never be able to reach the handle we already allocated. */
-function discardStream(ctx: MSSContext, stream: MSSStream): void {
+function discardStream(ctx: MSSContext, stream: MSSStream, why = "could not be read through the app's file callbacks"): void {
     Logger.error(LogCategory.SYSTEM,
-        `MSS32: _AIL_open_stream@12: "${stream.filename}" could not be read through the app's file callbacks — returning failure`);
+        `MSS32: _AIL_open_stream@12: "${stream.filename}" ${why} — returning failure`);
     if (stream.streamDummyBuffer) ctx.process.memory.free(stream.streamDummyBuffer);
     ctx.process.memory.free(stream.handle);
     ctx.streamsById.delete(stream.id);
@@ -507,7 +598,7 @@ function discardStream(ctx: MSSContext, stream: MSSStream): void {
     ctx.streamUserData.delete(stream.handle);
 }
 
-async function loadStreamFile(ctx: MSSContext, stream: MSSStream): Promise<void> {
+async function loadStreamFile(ctx: MSSContext, stream: MSSStream, tryIncremental = true): Promise<void> {
     if (!stream.filename) {
         Logger.warn(LogCategory.SYSTEM, `MSS32: loadStreamFile: No filename provided`);
         return;
@@ -515,6 +606,15 @@ async function loadStreamFile(ctx: MSSContext, stream: MSSStream): Promise<void>
 
     try {
         const system = System.getInstance();
+
+        // Incremental first — hold the file open and feed a fixed ring. Only reached
+        // when the synchronous sniff could not read the header; a format we do not feed
+        // a slab at a time falls through to the whole-file read below, which is what
+        // the host media element needs anyway.
+        if (tryIncremental && await openVfsStreamSource(ctx, stream, stream.filename)) {
+            if (stream.pendingStart) startIncrementalStream(ctx, stream);
+            return;
+        }
 
         let handle = system.fileSystem.openSync(stream.filename, 0x80000000, 3);
         if (!handle) {

@@ -212,4 +212,141 @@ export function registerAudioCommands(svc: HarnessService): void {
 
         return { worklet, host: getHostAudioStats(), buffers };
     });
+
+    /** mssStreams() — the Miles stream engine's own state, per HSTREAM.
+     *
+     *  "Did the radio play?" is not answerable from a screenshot and not answerable
+     *  from a decode call count either. It needs three things at once, and this verb
+     *  is the only place all three are visible together:
+     *
+     *    - `ring.playCursor` MOVING between two samples (the worklet consumed audio),
+     *    - `ring.ringPeak` > 0 (what it consumed was signal, not a ring of zeros),
+     *    - `ring.used` staying above 0 and `worklet.starvedBlocks` flat (it never ran
+     *      dry — a stream that loops one buffered second forever has an advancing
+     *      cursor and a healthy peak, and only `used` collapsing gives it away).
+     *
+     *  `source` is the incremental engine: `readOffset` climbing through
+     *  [dataStart,dataEnd) proves the file is being consumed a slab at a time rather
+     *  than re-read whole. `source:null` means the stream took the whole-file path. */
+    svc.register("mssStreams", async () => {
+        const mss: any = getModule("mss32");
+        const ctx = mss?.ctx ?? mss?.["ctx"];
+        if (!ctx) return { error: "no mss32 module" };
+        const pe = await import("../../modules/mss32/playback-engine");
+        const eng = await import("../../modules/mss32/stream-engine");
+
+        const streams: unknown[] = [];
+        for (const s of ctx.streams.values()) {
+            const src = s.source ?? null;
+            streams.push({
+                id: s.id,
+                handle: s.handle,
+                filename: s.filename,
+                format: s.fileFormat,
+                sampleRate: s.sampleRate,
+                channels: s.channels,
+                isPlaying: !!s.isPlaying,
+                isPaused: !!s.isPaused,
+                loopCount: s.loopCount,
+                position: s.position,
+                pcmBytes: s.pcmBytes ?? null,
+                hasCallback: (ctx.streamCallbacks?.get(s.handle) ?? 0) !== 0,
+                wholeFileBytes: s.fileData?.length ?? null,
+                source: src ? {
+                    fileHandle: src.fileHandle,
+                    fileSize: src.fileSize,
+                    dataStart: src.dataStart,
+                    dataEnd: src.dataEnd,
+                    readOffset: src.readOffset,
+                    cursor: src.cursor,
+                    framesDecoded: src.framesDecoded,
+                    totalFrames: src.totalFrames,
+                    blockBytes: src.blockBytes,
+                    busy: !!src.busy,
+                    exhausted: !!src.exhausted,
+                    pendingFloats: src.pending ? src.pending.floats.length - src.pending.at : 0,
+                } : null,
+                ring: pe.describeRing(s.id),
+            });
+        }
+        return { streams, count: streams.length, engine: { ...eng.streamEngineStats } };
+    });
+
+    /** mssSamples() — the Miles VOICE pool, per HSAMPLE. The sample-side twin of
+     *  mssStreams, and the answer to "the SFX are silent but everything looks fine".
+     *
+     *  A voice that is allocated, configured and started but carries no audio is
+     *  silence with paperwork, and NOTHING upstream reports it: allocate succeeds,
+     *  start_sample returns 1, the guest's status reads PLAYING. The three fields
+     *  that separate a sounding voice from a silent one are:
+     *
+     *    - `pcmFrames` > 0 (the voice HAS decoded audio at all; 0 means whatever
+     *      configured it — set_sample_file / set_sample_info / an unimplemented
+     *      export — never handed us bytes),
+     *    - `ring` non-null with `ringPeak` > 0 (the SAB carries signal, not zeros),
+     *    - `ring.playCursor` MOVING between two calls (the worklet consumes it).
+     *
+     *  `configuredEmpty` is the census that matters: voices the guest pointed at a
+     *  source buffer that decoded to nothing. That is where a dropped configuration
+     *  path actually shows up, because playSample refuses a voice with no data and
+     *  clears isPlaying — so the voice never reaches a "playing but silent" state and
+     *  `silentStarted` stays 0 through the whole bug. Read `configuredEmpty` first;
+     *  `silentStarted` only covers the narrower case of a started voice losing its
+     *  data afterwards. Encoded samples (mp3/ogg) legitimately have no PCM and no
+     *  ring — they play on a host media element — so they are excluded from both and
+     *  counted under `encodedPlaying`. */
+    svc.register("mssSamples", async () => {
+        const mss: any = getModule("mss32");
+        const ctx = mss?.ctx ?? mss?.["ctx"];
+        if (!ctx) return { error: "no mss32 module" };
+        const pe = await import("../../modules/mss32/playback-engine");
+
+        const samples: unknown[] = [];
+        let silentStarted = 0;
+        let encodedPlaying = 0;
+        let sounding = 0;
+        let configuredEmpty = 0;
+        for (const s of ctx.samples.values()) {
+            const pcmFrames = s.decodedData && s.channels > 0 ? (s.decodedData.length / s.channels) | 0 : 0;
+            const ring = pe.describeRing(s.id);
+            const encoded = s.fileFormat === "mp3" || s.fileFormat === "ogg";
+            const srcBytes = s.fileData?.length ?? 0;
+            if (srcBytes > 0 && pcmFrames === 0 && !encoded) configuredEmpty++;
+            if (s.isPlaying) {
+                if (encoded && !pcmFrames) encodedPlaying++;
+                else if (!pcmFrames) silentStarted++;
+                else sounding++;
+            }
+            samples.push({
+                id: s.id,
+                handle: s.handle,
+                is3D: !!s.is3D,
+                format: s.fileFormat ?? null,
+                sampleRate: s.sampleRate,
+                channels: s.channels,
+                bits: s.bitsPerSample,
+                formatTag: s.formatTag,
+                isPlaying: !!s.isPlaying,
+                isStopped: !!s.isStopped,
+                pendingStart: !!s.pendingStart,
+                loopCount: s.loopCount,
+                volume: s.volume,
+                position: s.position,
+                pcmBytes: s.pcmBytes ?? null,
+                pcmFrames,
+                srcBytes,
+                srcAddr: s.fileDataAddress ?? 0,
+                ring,
+            });
+        }
+        return {
+            samples,
+            count: samples.length,
+            playing: silentStarted + encodedPlaying + sounding,
+            sounding,
+            encodedPlaying,
+            silentStarted,
+            configuredEmpty,
+        };
+    });
 }
