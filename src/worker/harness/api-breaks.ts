@@ -12,6 +12,7 @@
 
 import { harnessBus } from "./event-bus";
 import { readCallSnapshot } from "./serialize";
+import { breakEvents } from "./break-events";
 
 /** Break only when a stack argument equals a value — `{ index, value }`, index 0-based
  *  over the cdecl/stdcall args at [ESP+4].. . Without it a breakpoint on a hot API
@@ -98,6 +99,9 @@ class ApiBreakRegistry {
                 if ((args[e.argEq.index] >>> 0) !== (e.argEq.value >>> 0)) continue;
             }
             e.hits++;
+            // Same durability rule as EIP breaks: a continuous break's evidence lives in the
+            // worker ring, so the death of whatever is reading it loses nothing (`breakEvents`).
+            breakEvents.push("api", e.id, thunkName, snapshot);
             harnessBus.emit("apiBreak", snapshot, e.runId);
             if (e.onHit) e.onHit(snapshot);
             if (!e.continuous) this.disarm(e.id);

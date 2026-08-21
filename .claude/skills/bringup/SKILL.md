@@ -121,6 +121,18 @@ CLI invocation reconnects without it.
   `breakOn(eip)` — all require **JIT OFF** (auto-enabled; **perf collapses while
   armed** — `clearBreaks()` to restore). Addresses inside the async-park spin loop
   are refused (CLAUDE.md §3.5).
+- "WHO calls this guest function, and with what?" — arm the function ENTRY and read
+  `callsite` off the hit: `retAddr` + `retAddrSym`, a `retAddrTrust` verdict, the
+  module-labelled backtrace, a stack window, and `capture.reads`
+  (`{reg:'esi',offset:12,size:4}` — add `deref` to follow the pointer). Present in EVERY
+  mode, continuous included. Trust the caller only on `verdict:"verified"` (the E8 before
+  `[ESP]` targets the armed eip); `untrusted`/`unreadable` means the armed address is not a
+  function entry and `retAddr` names nobody.
+- Hits also land in a WORKER-side ring — read them with `breakEvents({since,limit})`, from
+  any process, at any later time. Never accumulate hits in a script and print at the end: a
+  60s `pageEval`/RPC timeout takes the whole run's evidence with it, the ring does not. It
+  reports `evicted`/`gap` instead of silently returning a shorter list, and says out loud
+  that 0 events is not evidence the code did not run (block-entry rule).
 - Read the streamed log; `events(n)` shows recent harness events; on a WASM trap a
   `fault` event carries the fault-grade snapshot.
 - The ring holds a fixed number of ENTRIES, so on a ddraw/d3d title the per-frame spam

@@ -24,6 +24,7 @@ import { sys, proc } from "../serialize";
 import { dbg } from "../../core/debug/dbg-commands";
 import { apiBreaks } from "../api-breaks";
 import { eipBreaks, type BreakWhen, type BreakCapture } from "../eip-breaks";
+import { breakEvents } from "../break-events";
 import { symbolMap } from "../symbol-map";
 
 function toAddr(x: number | string): number {
@@ -60,7 +61,9 @@ function armEip(addr: number, ctx: HarnessCtx, opts: { continuous?: boolean; pau
     }
     warning += " BLOCK ENTRIES ONLY: this fires only if the address is where v86 starts a block " +
         "(function entry / after a call or ret). A mid-function instruction NEVER fires even while the " +
-        "code runs — 0 hits is not evidence it did not execute. For 'who writes X', use trapWrites.";
+        "code runs — 0 hits is not evidence it did not execute. For 'who writes X', use trapWrites." +
+        " Every hit carries `callsite` (retAddr + retAddrTrust + module-labelled backtrace + stack) and is " +
+        "recorded in the worker ring — read it with breakEvents(), which outlives whatever armed the break.";
     return new Promise((resolve) => {
         const id = eipBreaks.arm(addr, {
             runId: ctx.runId,
@@ -233,7 +236,7 @@ export function registerBreakpointCommands(svc: HarnessService): void {
         dbg.maxDumps(1_000_000);   // hot-address captures blow the 4000-line default silently
         const g = globalThis as any;
         const id = eipBreaks.arm(addr, {
-            runId: ctx.runId, once: false, pause: false,
+            runId: ctx.runId, once: false, pause: false, callsite: false,   // own recorder; armed at hot addresses
             onHit: () => {
                 try {
                     const c: any = proc()?.v86?.cpu ?? (proc() as any)?.v86?.v86?.cpu;
@@ -277,6 +280,19 @@ export function registerBreakpointCommands(svc: HarnessService): void {
             },
         });
         return { armed: true, id, addr: addr >>> 0, note: "records to globalThis.__bpcap (JIT off, non-pausing)" };
+    });
+
+    /** breakEvents({since?, limit?, clear?, capacity?}) — every breakpoint hit this worker
+     *  recorded, EIP and API alike, newest last. The durable half of a continuous break:
+     *  hits land in the worker ring as they happen, so a reader that dies at its RPC/pageEval
+     *  timeout loses nothing — poll again with `since: lastSeq`. Reports `evicted` and an
+     *  explicit `gap` rather than silently returning a shorter list. */
+    svc.register("breakEvents", (args) => {
+        const opts = (args[0] ?? {}) as { since?: number; limit?: number; clear?: boolean; capacity?: number };
+        if (typeof opts.capacity === "number") breakEvents.setCapacity(opts.capacity);
+        const out = breakEvents.read({ since: opts.since, limit: opts.limit });
+        if (opts.clear) (out as Record<string, unknown>).cleared = breakEvents.clear();
+        return out;
     });
 
     /** breaks() — list all armed breakpoints. */

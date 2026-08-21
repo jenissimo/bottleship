@@ -60,6 +60,10 @@ export function registerLogCommands(svc: HarnessService): void {
      * the fault", but 50 entries is a fraction of one boot's SYSTEM chatter, so
      * the interesting lines are gone before `logs()` runs. Widen it BEFORE the
      * repro. Resizing drops the current contents (the ring is reallocated).
+     *
+     * A page reload resets it, so the boot that FOLLOWS a re-exec cannot be armed this
+     * way at all — for that window use the persisted flag, which the host replays before
+     * any bundle loads: `dbgFlag('__logRingSize', 100000, {scope:'session'})`.
      */
     svc.register("logRing", (args) => {
         const size = typeof args[0] === "number" ? Math.max(50, Math.min(200000, args[0] as number)) : 50;

@@ -26,6 +26,13 @@ export interface BreakCaptureSpec {
     args?: number;
     ebp?: boolean;
     follow?: Array<{ arg: number; offset?: number; len: number; label?: string }>;
+    /** Register-relative reads settled at the hit: `{reg:'esi', offset:12, size:4}` reads 4 bytes
+     *  at ESI+0xc; `deref:true` reads at *(ESI+0xc). */
+    reads?: Array<{ reg: string; offset?: number; size?: number; deref?: boolean; label?: string }>;
+    /** Backtrace frames (default 12); `false` opts out for a very hot continuous bp. */
+    backtrace?: boolean | number;
+    /** Raw dwords from [ESP] up (default 8). */
+    stack?: number;
 }
 
 export class HarnessChain {
@@ -328,6 +335,13 @@ export class HarnessChain {
     breakOnSymbol(name: string, opts?: { continuous?: boolean; pause?: boolean; fast?: boolean; when?: { arg: number; ebp?: boolean; eq?: number; ne?: number }; capture?: BreakCaptureSpec }): this { return this.pushTimed("breakOnSymbol", [name, opts], 0); }
     /** `argEq` breaks only when a stack argument matches — the way to hit ONE call of a hot API. */
     breakOnApi(pattern: string, opts?: { continuous?: boolean; argEq?: { index: number; value: number } }): this { return this.pushTimed("breakOnApi", [pattern, opts], 0); }
+    /** Armed breakpoints + their hit counts. A `0 hits` eip entry comes back with the
+     *  block-entry caveat attached — it is not evidence the code did not run. */
+    breaks(): this { return this.push("breaks", []); }
+    /** Breakpoint hits recorded in the WORKER ring (EIP + API), with call-site evidence.
+     *  Read this instead of accumulating hits in a script: a continuous break outlives every
+     *  reader's timeout, the ring keeps the evidence, and `since: lastSeq` resumes without a gap. */
+    breakEvents(opts?: { since?: number; limit?: number; clear?: boolean; capacity?: number }): this { return this.push("breakEvents", [opts]); }
     clearBreaks(): this { return this.push("clearBreaks", []); }
     watchMem(addr: number | string, opts?: { onWrite?: boolean }): this { return this.push("watchMem", [addr, opts]); }
     pause(): this { return this.push("pause", []); }
