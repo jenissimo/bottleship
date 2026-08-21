@@ -9,6 +9,7 @@ const buildParams = (count: number): ParameterDescriptor[] => {
 };
 
 const makeFunc = (name: string, argCount: number, overrides: Partial<FunctionDescriptor> = {}): FunctionDescriptor => ({
+    ...overrides,
     name,
     ordinal: overrides.ordinal,
     params: overrides.params ?? buildParams(argCount),
@@ -39,21 +40,21 @@ export const oleaut32Module: ModuleDescriptor = {
         makeFunc("ord_8", 1, { ordinal: 8 }),     // VariantInit(VARIANT*)
         makeFunc("VariantInit", 1),
         makeFunc("ord_9", 1, { ordinal: 9 }),     // VariantClear(VARIANT*)
-        makeFunc("VariantClear", 1),
+        makeFunc("VariantClear", 1, { onUnimplemented: "hresult" }),
         makeFunc("ord_10", 2, { ordinal: 10 }),   // VariantCopy(VARIANT*, VARIANT*)
-        makeFunc("VariantCopy", 2),
+        makeFunc("VariantCopy", 2, { onUnimplemented: "hresult" }),
         makeFunc("ord_11", 2, { ordinal: 11 }),   // VariantCopyInd(VARIANT*, VARIANT*)
-        makeFunc("VariantCopyInd", 2),
+        makeFunc("VariantCopyInd", 2, { onUnimplemented: "hresult" }),
         makeFunc("ord_12", 4, { ordinal: 12 }),   // VariantChangeType
-        makeFunc("VariantChangeType", 4),
+        makeFunc("VariantChangeType", 4, { onUnimplemented: "hresult" }),
         makeFunc("ord_13", 4, { ordinal: 13 }),   // VariantTimeToDosDateTime(DATE, USHORT*, USHORT*)
-        makeFunc("VariantChangeTypeEx", 5),
+        makeFunc("VariantChangeTypeEx", 5, { onUnimplemented: "hresult" }),
 
         // Active object registration (ordinal + named alias)
         makeFunc("ord_33", 4, { ordinal: 33 }),   // RegisterActiveObject
-        makeFunc("RegisterActiveObject", 4),
+        makeFunc("RegisterActiveObject", 4, { onUnimplemented: "hresult" }),
         makeFunc("ord_34", 2, { ordinal: 34 }),   // RevokeActiveObject
-        makeFunc("RevokeActiveObject", 2),
+        makeFunc("RevokeActiveObject", 2, { onUnimplemented: "hresult" }),
 
         // SafeArray. Ordinals 15-26 are contiguous in the export table and are all declared,
         // because one unbindable ordinal import fails the whole PE load. Each is aliased to the
@@ -84,20 +85,20 @@ export const oleaut32Module: ModuleDescriptor = {
 
         // Type library (ordinal + named alias)
         makeFunc("ord_161", 2, { ordinal: 161 }), // LoadTypeLib
-        makeFunc("LoadTypeLib", 2),
+        makeFunc("LoadTypeLib", 2, { onUnimplemented: "hresult" }),
         makeFunc("ord_162", 5, { ordinal: 162 }), // LoadRegTypeLib
-        makeFunc("LoadRegTypeLib", 5),
+        makeFunc("LoadRegTypeLib", 5, { onUnimplemented: "hresult" }),
         makeFunc("ord_163", 3, { ordinal: 163 }), // RegisterTypeLib
-        makeFunc("RegisterTypeLib", 3),
+        makeFunc("RegisterTypeLib", 3, { onUnimplemented: "hresult" }),
 
         // Variant conversion functions
-        makeFunc("VarI2FromStr", 4),
-        makeFunc("VarI4FromStr", 4),
-        makeFunc("VarR4FromStr", 4),
-        makeFunc("VarR8FromStr", 4),
-        makeFunc("VarBstrFromI2", 4),
-        makeFunc("VarUI4FromStr", 4),
-        makeFunc("VarUI1FromStr", 4),
+        makeFunc("VarI2FromStr", 4, { onUnimplemented: "hresult" }),
+        makeFunc("VarI4FromStr", 4, { onUnimplemented: "hresult" }),
+        makeFunc("VarR4FromStr", 4, { onUnimplemented: "hresult" }),
+        makeFunc("VarR8FromStr", 4, { onUnimplemented: "hresult" }),
+        makeFunc("VarBstrFromI2", 4, { onUnimplemented: "hresult" }),
+        makeFunc("VarUI4FromStr", 4, { onUnimplemented: "hresult" }),
+        makeFunc("VarUI1FromStr", 4, { onUnimplemented: "hresult" }),
         makeFunc("ord_30", 8, { ordinal: 30 }),   // DispInvoke
         makeFunc("ord_108", 4, { ordinal: 108 }), // VarBstrFromUI1
         makeFunc("ord_110", 4, { ordinal: 110 }), // VarBstrFromI4
@@ -123,46 +124,46 @@ export const oleaut32Module: ModuleDescriptor = {
 
         // Error info (ordinal + named alias)
         makeFunc("ord_200", 2, { ordinal: 200 }), // GetErrorInfo
-        makeFunc("GetErrorInfo", 2),
+        makeFunc("GetErrorInfo", 2, { onUnimplemented: "hresult" }),
         makeFunc("ord_201", 2, { ordinal: 201 }), // SetErrorInfo
-        makeFunc("SetErrorInfo", 2),
+        makeFunc("SetErrorInfo", 2, { onUnimplemented: "hresult" }),
         makeFunc("ord_202", 1, { ordinal: 202 }), // CreateErrorInfo
-        makeFunc("CreateErrorInfo", 1),
+        makeFunc("CreateErrorInfo", 1, { onUnimplemented: "hresult" }),
 
         // BSTR byte-length functions
         makeFunc("SysStringByteLen", 1),
         makeFunc("SysAllocStringByteLen", 2),
 
         // Dispatch
-        makeFunc("DispGetParam", 5),
-        makeFunc("DispInvoke", 8),
-        makeFunc("DispCallFunc", 8),
+        makeFunc("DispGetParam", 5, { onUnimplemented: "hresult" }),
+        makeFunc("DispInvoke", 8, { onUnimplemented: "hresult" }),
+        makeFunc("DispCallFunc", 8, { onUnimplemented: "hresult" }),
 
         // OLE create helpers
-        makeFunc("OleCreateFontIndirect", 3),
-        makeFunc("OleCreatePictureIndirect", 4),
-        makeFunc("OleCreatePropertyFrame", 11),
-        makeFunc("OleLoadPicture", 5),
-        makeFunc("OleLoadPictureEx", 8),
-        makeFunc("OleSavePictureFile", 2),
-        makeFunc("OleLoadPicturePath", 6),
+        makeFunc("OleCreateFontIndirect", 3, { onUnimplemented: "hresult" }),
+        makeFunc("OleCreatePictureIndirect", 4, { onUnimplemented: "hresult" }),
+        makeFunc("OleCreatePropertyFrame", 11, { onUnimplemented: "hresult" }),
+        makeFunc("OleLoadPicture", 5, { onUnimplemented: "hresult" }),
+        makeFunc("OleLoadPictureEx", 8, { onUnimplemented: "hresult" }),
+        makeFunc("OleSavePictureFile", 2, { onUnimplemented: "hresult" }),
+        makeFunc("OleLoadPicturePath", 6, { onUnimplemented: "hresult" }),
         makeFunc("OleIconToCursor", 2),
-        makeFunc("OleTranslateColor", 3),
+        makeFunc("OleTranslateColor", 3, { onUnimplemented: "hresult" }),
 
         // Type info
-        makeFunc("CreateDispTypeInfo", 3),
-        makeFunc("CreateStdDispatch", 4),
-        makeFunc("LoadTypeLibEx", 3),
-        makeFunc("UnRegisterTypeLib", 5),
-        makeFunc("QueryPathOfRegTypeLib", 5),
+        makeFunc("CreateDispTypeInfo", 3, { onUnimplemented: "hresult" }),
+        makeFunc("CreateStdDispatch", 4, { onUnimplemented: "hresult" }),
+        makeFunc("LoadTypeLibEx", 3, { onUnimplemented: "hresult" }),
+        makeFunc("UnRegisterTypeLib", 5, { onUnimplemented: "hresult" }),
+        makeFunc("QueryPathOfRegTypeLib", 5, { onUnimplemented: "hresult" }),
 
         // Misc
         makeFunc("DosDateTimeToVariantTime", 3),
         makeFunc("VariantTimeToDosDateTime", 4),
         makeFunc("SystemTimeToVariantTime", 2),
         makeFunc("VariantTimeToSystemTime", 3),
-        makeFunc("VarDateFromStr", 4),
-        makeFunc("VarBstrFromDate", 5),
-        makeFunc("VarFormat", 6),
+        makeFunc("VarDateFromStr", 4, { onUnimplemented: "hresult" }),
+        makeFunc("VarBstrFromDate", 5, { onUnimplemented: "hresult" }),
+        makeFunc("VarFormat", 6, { onUnimplemented: "hresult" }),
     ]
 };

@@ -1630,7 +1630,7 @@ export class PELoader {
                     });
 
                     markHleModuleLoaded(dllName);
-                    const stubDll = this.thunkGenerator.generateStubDll(dllName, stubInfos);
+                    const stubDll = this.thunkGenerator.generateStubDll(dllName, stubInfos, { absentDll: true });
 
                     // Patch IAT with stub addresses
                     for (const func of functions) {

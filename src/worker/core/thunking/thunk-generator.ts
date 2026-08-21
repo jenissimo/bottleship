@@ -12,6 +12,13 @@ export interface ThunkStub {
     argCount?: number;  // Number of arguments (for reading stack)
     /** Bytes callee pops on RET (for ESP checks). Use when decoration differs from params (e.g. _AIL_file_read@8). */
     stackCleanupBytes?: number;
+    /**
+     * This export belongs to a DLL we deliberately refuse to load, so "absent" — not
+     * "call failed" — is the honest answer: the default ERROR_NOT_SUPPORTED (50) reads
+     * as a valid pointer/handle to a caller that stores the result (Serious Sam's
+     * ImmWrapper kept 50 as its CImmDevice* and dereferenced it).
+     */
+    absentDll?: boolean;
 }
 
 /** Size of the shared "missing import" trap stub (UD2) – must be 16-byte aligned like other stubs */
@@ -153,7 +160,7 @@ export class ThunkGenerator {
         return writeGuestCode(mem, this.getTrapStubCode(), addr);
     }
 
-    generateStubDll(dllName: string, exports: { name: string, argCount?: number, stackCleanupBytes?: number, callingConvention?: string }[]): {
+    generateStubDll(dllName: string, exports: { name: string, argCount?: number, stackCleanupBytes?: number, callingConvention?: string }[], opts?: { absentDll?: boolean }): {
         baseAddress: number;
         stubCode: Uint8Array;
         exportTable: Map<string, number>;
@@ -236,6 +243,7 @@ export class ThunkGenerator {
                 functionId,
                 argCount: info.argCount,
                 stackCleanupBytes: isStdcall ? bytesToPop : 0,
+                absentDll: opts?.absentDll,
             };
 
             this.stubs.set(functionId, stub);

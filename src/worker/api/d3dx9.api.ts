@@ -14,6 +14,7 @@ const buildParams = (count: number): ParameterDescriptor[] => {
 };
 
 const makeFunc = (name: string, argCount: number, overrides: Partial<FunctionDescriptor> = {}): FunctionDescriptor => ({
+    ...overrides,
     name,
     params: overrides.params ?? buildParams(argCount),
     returnType: overrides.returnType ?? "u32",
@@ -49,11 +50,11 @@ export const d3dx9Module: ModuleDescriptor = {
         makeFunc("D3DXCreateTextureFromFileInMemoryEx", 15),
         makeFunc("D3DXGetImageInfoFromFileA", 3),
         makeFunc("D3DXGetImageInfoFromFileW", 3),
-        makeFunc("D3DXCreateFontA", 7),
-        makeFunc("D3DXCreateFontW", 7),
-        makeFunc("D3DXCreateFontIndirectA", 4),
-        makeFunc("D3DXCreateFontIndirectW", 4),
-        makeFunc("D3DXCreateSprite", 2),
+        makeFunc("D3DXCreateFontA", 7, { onUnimplemented: "hresult" }),
+        makeFunc("D3DXCreateFontW", 7, { onUnimplemented: "hresult" }),
+        makeFunc("D3DXCreateFontIndirectA", 4, { onUnimplemented: "hresult" }),
+        makeFunc("D3DXCreateFontIndirectW", 4, { onUnimplemented: "hresult" }),
+        makeFunc("D3DXCreateSprite", 2, { onUnimplemented: "hresult" }),
         // D3D8→D3D9 wrappers resolve the assemble/disassemble pair by GetProcAddress and
         // translate every D3D8 shader through it (disassemble → patch text → assemble);
         // both hand back the ID3DXBuffer that D3DXCreateBuffer also produces.

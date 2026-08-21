@@ -14,6 +14,7 @@ const buildParams = (count: number): ParameterDescriptor[] => {
 };
 
 const makeFunc = (name: string, argCount: number, overrides: Partial<FunctionDescriptor> = {}): FunctionDescriptor => ({
+    ...overrides,
     name,
     params: overrides.params ?? buildParams(argCount),
     returnType: overrides.returnType ?? "u32",
@@ -33,26 +34,26 @@ export const shell32Module: ModuleDescriptor = {
         makeFunc("DragQueryFileW", 4), // hDrop, iFile, lpszFile, cch
         makeFunc("DragFinish", 1), // hDrop
         makeFunc("FindExecutableA", 3), // lpFile, lpDirectory, lpResult
-        makeFunc("SHGetSpecialFolderLocation", 3), // hwnd, csidl, ppidl
-        makeFunc("SHGetPathFromIDListA", 2), // pidl, pszPath
+        makeFunc("SHGetSpecialFolderLocation", 3, { onUnimplemented: "hresult" }), // hwnd, csidl, ppidl
+        makeFunc("SHGetPathFromIDListA", 2, { onUnimplemented: "zero" }), // pidl, pszPath
         makeFunc("SHGetPathFromIDListW", 2), // pidl, pszPath
-        makeFunc("SHGetMalloc", 1),
+        makeFunc("SHGetMalloc", 1, { onUnimplemented: "hresult" }),
         makeFunc("SHGetSpecialFolderPathA", 4), // hwnd, pszPath, csidl, fCreate
         makeFunc("SHGetSpecialFolderPathW", 4), // hwnd, pszPath, csidl, fCreate
         makeFunc("SHAppBarMessage", 2), // dwMessage, pData
-        makeFunc("SHGetFolderPathA", 5), // hwnd, csidl, hToken, dwFlags, pszPath
-        makeFunc("SHGetFolderPathW", 5),
+        makeFunc("SHGetFolderPathA", 5, { onUnimplemented: "hresult" }), // hwnd, csidl, hToken, dwFlags, pszPath
+        makeFunc("SHGetFolderPathW", 5, { onUnimplemented: "hresult" }),
         makeFunc("SHGetKnownFolderPath", 4), // rfid, dwFlags, hToken, ppszPath
         makeFunc("CommandLineToArgvW", 2), // lpCmdLine, pNumArgs
         makeFunc("DragAcceptFiles", 2), // hWnd, fAccept
         makeFunc("IsUserAnAdmin", 0),
         makeFunc("SHBrowseForFolderA", 1),
         makeFunc("SHBrowseForFolderW", 1),
-        makeFunc("SHGetDesktopFolder", 1),
-        makeFunc("SHCreateDirectoryExA", 3),
-        makeFunc("SHCreateDirectoryExW", 3),
-        makeFunc("SHFileOperationA", 1),
-        makeFunc("SHFileOperationW", 1),
+        makeFunc("SHGetDesktopFolder", 1, { onUnimplemented: "hresult" }),
+        makeFunc("SHCreateDirectoryExA", 3, { onUnimplemented: "win32Status" }),
+        makeFunc("SHCreateDirectoryExW", 3, { onUnimplemented: "win32Status" }),
+        makeFunc("SHFileOperationA", 1, { onUnimplemented: "win32Status" }),
+        makeFunc("SHFileOperationW", 1, { onUnimplemented: "win32Status" }),
         makeFunc("ExtractAssociatedIconA", 3),
         makeFunc("ExtractIconA", 3),
         makeFunc("ExtractIconW", 3),

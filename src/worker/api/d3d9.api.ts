@@ -68,6 +68,7 @@ const makeMethod = (
     argCount: number,
     overrides: Partial<FunctionDescriptor> = {}
 ): FunctionDescriptor => ({
+    ...overrides,
     name,
     params: overrides.params ?? buildParams(argCount),
     returnType: overrides.returnType ?? "u32",

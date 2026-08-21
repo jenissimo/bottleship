@@ -38,6 +38,7 @@ const makeFunc = (
 
 ): FunctionDescriptor => ({
 
+    ...overrides,
     name,
 
     params: overrides.params ?? buildParams(argCount),

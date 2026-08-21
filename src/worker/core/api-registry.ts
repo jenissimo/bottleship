@@ -1,4 +1,4 @@
-import { ModuleDescriptor, calculateStackCleanup } from "../api/types";
+import { ModuleDescriptor, UnimplementedReturn, calculateStackCleanup } from "../api/types";
 import { setupapiModule } from "../api/setupapi.api";
 import { hidModule } from "../api/hid.api";
 import { lgvidModule } from "../api/lgvid.api";
@@ -27,6 +27,8 @@ export class APIRegistry {
     private callingConventionCache: Map<string, string> = new Map();
     /** baseName (dll:name without @N) -> full cache keys. For single-variant fallback and duplicate diagnostic. */
     private baseNameToKeys: Map<string, string[]> = new Map();
+    /** dll:func -> declared failure class, for exports that have no handler. */
+    private unimplementedReturnCache: Map<string, UnimplementedReturn> = new Map();
 
     private constructor() {
         this.loadFromApiFiles();
@@ -123,6 +125,7 @@ export class APIRegistry {
 
     private cacheFunction(moduleName: string, func: ModuleDescriptor["functions"][number]): void {
         const key = `${moduleName}:${func.name.toLowerCase()}`;
+        if (func.onUnimplemented) this.unimplementedReturnCache.set(key, func.onUnimplemented);
         const stackBytes = func.stackCleanupBytes ?? calculateStackCleanup(func.params);
         const dwordSlots = stackBytes >> 2;
         this.argCountCache.set(key, dwordSlots);
@@ -151,6 +154,8 @@ export class APIRegistry {
                     const methStackBytes = calculateStackCleanup(method.params);
                     this.argCountCache.set(key, methStackBytes >> 2);
                     this.callingConventionCache.set(key, method.callingConvention);
+                    // A vtable slot returns an HRESULT unless the descriptor says otherwise.
+                    this.unimplementedReturnCache.set(key, method.onUnimplemented ?? "hresult");
                 }
             }
         }
@@ -356,6 +361,25 @@ export class APIRegistry {
         if (!mod?.functions?.length) return false;
         const func = functionName.toLowerCase();
         return mod.functions.some((f) => f.name.toLowerCase() === func);
+    }
+
+    /**
+     * Declared failure class for a name with no handler. Undefined ⇒ the caller applies
+     * the default (see unimplemented-return.ts); this returns only what a descriptor said.
+     * A COM vtable slot arrives here as "module:iface_method" and is always answered.
+     */
+    public getUnimplementedReturnClass(dllName: string, functionName: string): UnimplementedReturn | undefined {
+        const dll = dllName.toLowerCase().replace(/\.dll$/, "");
+        const func = functionName.toLowerCase();
+        const exact = this.unimplementedReturnCache.get(`${dll}:${func}`);
+        if (exact) return exact;
+        // Same undecoration the argCount lookup uses: an IAT name may carry _Foo@8.
+        const undecorated = func.replace(/^_+/, "").replace(/@\d+$/, "");
+        if (undecorated !== func) {
+            const hit = this.unimplementedReturnCache.get(`${dll}:${undecorated}`);
+            if (hit) return hit;
+        }
+        return undefined;
     }
 
     /** True when this module, rather than some other descriptor, owns the function signature. */

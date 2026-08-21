@@ -9,6 +9,7 @@ const buildParams = (count: number): ParameterDescriptor[] => {
 };
 
 const makeFunc = (name: string, argCount: number, overrides: Partial<FunctionDescriptor> = {}): FunctionDescriptor => ({
+    ...overrides,
     name,
     params: overrides.params ?? buildParams(argCount),
     returnType: overrides.returnType ?? "u32",
@@ -46,7 +47,7 @@ export const shlwapiModule: ModuleDescriptor = {
         makeFunc("PathRemoveExtensionW", 1),
         makeFunc("PathRenameExtensionA", 2), // pszPath, pszExt
         makeFunc("PathRenameExtensionW", 2),
-        makeFunc("UrlUnescapeA", 4),
-        makeFunc("UrlUnescapeW", 4),
+        makeFunc("UrlUnescapeA", 4, { onUnimplemented: "hresult" }),
+        makeFunc("UrlUnescapeW", 4, { onUnimplemented: "hresult" }),
     ],
 };

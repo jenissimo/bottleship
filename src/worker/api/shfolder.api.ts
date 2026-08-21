@@ -15,19 +15,20 @@ const buildParams = (count: number): ParameterDescriptor[] => {
     return params;
 };
 
-const makeFunc = (name: string, argCount: number): FunctionDescriptor => ({
+const makeFunc = (name: string, argCount: number, overrides: Partial<FunctionDescriptor> = {}): FunctionDescriptor => ({
+    ...overrides,
     name,
-    params: buildParams(argCount),
-    returnType: "u32",
-    callingConvention: "stdcall",
+    params: overrides.params ?? buildParams(argCount),
+    returnType: overrides.returnType ?? "u32",
+    callingConvention: overrides.callingConvention ?? "stdcall",
 });
 
 export const shfolderModule: ModuleDescriptor = {
     name: "shfolder",
     functions: [
         // HRESULT SHGetFolderPathA(HWND hwnd, int csidl, HANDLE hToken, DWORD dwFlags, LPSTR pszPath)
-        makeFunc("SHGetFolderPathA", 5),
+        makeFunc("SHGetFolderPathA", 5, { onUnimplemented: "hresult" }),
         // HRESULT SHGetFolderPathW(HWND hwnd, int csidl, HANDLE hToken, DWORD dwFlags, LPWSTR pszPath)
-        makeFunc("SHGetFolderPathW", 5),
+        makeFunc("SHGetFolderPathW", 5, { onUnimplemented: "hresult" }),
     ],
 };

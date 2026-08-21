@@ -29,6 +29,16 @@ export function resolveHleExportAddress(
     const tg = dispatcher?.thunkGenerator;
     if (!tg) return 0;
 
+    // An export with no failure encoding (see UnimplementedReturn "unresolvable") cannot
+    // be handed out: the guest would take the value as data. NULL is the honest answer and
+    // the one a Windows without the function gives — the caller's own fallback then runs.
+    if (APIRegistry.getInstance().getUnimplementedReturnClass(dllName, exportName) === 'unresolvable') {
+        Logger.log(LogCategory.KERNEL32,
+            `resolveHleExport: ${dllName}:${exportName} is not implemented and has no failure value — ` +
+            `answering NULL, as a Windows without the export would`);
+        return 0;
+    }
+
     const dataAddr = tg.getDataExportAddress(dllName, exportName);
     if (dataAddr !== undefined) return dataAddr >>> 0;
 
