@@ -182,10 +182,13 @@ describe("vs codegen", () => {
         ]);
         const vs = compileVertexShader(vsTokens);
         expect(vs.prog.usesRelativeConst).toBe(true);
-        expect(vs.analysis.constantCount).toBe(96);
+        // The whole register file (c0-c255), not the statically-referenced high-water mark:
+        // a relative read is clamped to the last element, so a smaller array resolves a
+        // matrix-palette index past its end to one fixed bone instead of failing.
+        expect(vs.analysis.constantCount).toBe(256);
         const res = linkProgram({ vs, ps: null, declElements: decl, streamStride: 20 });
-        expect(res.wgsl).toContain("array<vec4<f32>, 96>");
-        expect(res.wgsl).toContain("clamp(a0 + 0, 0, 95)");
+        expect(res.wgsl).toContain("array<vec4<f32>, 256>");
+        expect(res.wgsl).toContain("clamp(a0 + 0, 0, 255)");
     });
 
     test("links a VS-only program to a complete WGSL module", () => {
