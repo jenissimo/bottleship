@@ -20,7 +20,7 @@ import { profiler } from "../../core/profiler";
 import { readbackCounters } from "../../modules/ddraw/surface-sync";
 import { drawCostProfiler } from "../../backends/webgpu/ddraw/draw-cost-profiler";
 import { getBufferUploadCensus, resetBufferUploadCensus } from "../../backends/webgpu/buffer-upload";
-import { cpu, sys, symbolize } from "../serialize";
+import { cpu, sys, symbolize, proc } from "../serialize";
 import { HarnessError, HarnessErrorCode } from "../rpc";
 import { type FrameTail } from "../../core/frame-time-distribution";
 import { dbg } from "../../core/debug/dbg-commands";
@@ -599,6 +599,40 @@ export function registerPerfCommands(svc: HarnessService): void {
     svc.register("perfThunks", (args) => {
         const opts = (args[0] ?? {}) as { top?: number; filter?: string };
         return frameProfiler.getThunkReport(opts.top ?? 20, opts.filter);
+    });
+
+    /**
+     * slowPathThunks({enable?, reset?, top?=20}) — per-thunk hit counts for the
+     * dispatcher's SLOW path (_handlePortWriteSlow), i.e. every call with no fast-path
+     * or Tier-0 write-buffer registration. This is the COUNT-based instrument for
+     * "which thunk should get a fast path next", and the honest before/after for one:
+     * `perfThunks` prices fast-pathed and slow-pathed calls alike, so a registration
+     * shows up there as a cost change (noise-prone) but here as a hit count that must
+     * go to ZERO.
+     *
+     * `enabled` is reported so a zero-row answer cannot be misread as "nothing hit the
+     * slow path" when collection was simply never armed — the counting costs one
+     * Map.set per slow-path call and is off by default.
+     *
+     * Flow: slowPathThunks({enable:true, reset:true}) → drive → slowPathThunks().
+     */
+    svc.register("slowPathThunks", (args) => {
+        const opts = (args[0] ?? {}) as { enable?: boolean; reset?: boolean; top?: number };
+        const d: any = proc()?.dispatcher;
+        if (!d?.getSlowPathReport) {
+            return { available: false, reason: "no process / dispatcher lacks getSlowPathReport" };
+        }
+        if (opts.enable === true) d.enableSlowPathProfile?.();
+        else if (opts.enable === false) d.disableSlowPathProfile?.();
+        if (opts.reset) d.resetSlowPathStats?.();
+        const rows = d.getSlowPathReport() as Array<{ name: string; hits: number }>;
+        const total = rows.reduce((a, r) => a + r.hits, 0);
+        return {
+            available: true,
+            enabled: !!d.profileSlowPathEnabled,
+            total,
+            rows: rows.slice(0, opts.top ?? 20),
+        };
     });
 
     /** readbackStats({reset?}) — GPU→CPU surface readback accounting. Duration hides the

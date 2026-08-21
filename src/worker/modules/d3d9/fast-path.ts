@@ -28,7 +28,7 @@
  */
 
 import { Logger, LogCategory } from '../../core/logger';
-import { devices, stateBlocks } from './shared-state';
+import { devices, stateBlocks, resourceToDevice } from './shared-state';
 import { addD3D9ComRef, releaseD3D9ComRef } from './state';
 import {
     resolveVertexShaderComPtr,
@@ -299,6 +299,65 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
         if (!block || !device) return D3DERR_INVALIDCALL;
         return device.captureStateBlockData(block);
     }, { trivial: true });
+
+    // ── VB/IB Lock/Unlock — the per-draw RenderWare pattern (Lock(NOOVERWRITE) →
+    // guest writes vertices → Unlock → Draw), and the largest remaining slow-path
+    // consumer in GTA III gameplay.
+    //
+    // These qualify despite being "Lock": a D3D9 vertex/index buffer's storage is a
+    // guest HEAP allocation made once at Create time, so Lock is not an allocation and
+    // not a GPU map — it computes guestBase+offset, records the locked range, and hands
+    // the pointer back. Unlock copies that range into the CPU shadow and widens the
+    // dirty span; the actual GPU upload is batched at draw/present time. No await, no
+    // host allocation, no LeaseRegistry entry (§3.1's lease model covers DDraw/GDI
+    // surface pixels, whose pointers are borrowed and whose upload paths validate a
+    // lease — the buffer stores own their memory and track the lock in lockedPtrs/
+    // lockedSizes themselves, which unlock() checks).
+    //
+    // FastPath (OUT trap), NOT write-buffer: Lock returns a pointer the guest
+    // dereferences on the very next instruction, so it cannot be deferred to a drain;
+    // and a deferred Unlock would read the guest bytes at drain time, after a later
+    // Lock(DISCARD) may have refilled the same range. The trap-time drain of the ring
+    // (handlePortWrite → drainWriteBuffer) keeps both correctly ordered against the
+    // buffered setters and draws.
+    //
+    // Returning null (→ slow path) is only used BEFORE any side effect, so the slow
+    // path's re-execution is a first execution.
+    for (const [iface, lockFn, unlockFn] of [
+        ['IDirect3DVertexBuffer9', 'lockVertexBuffer', 'unlockVertexBuffer'],
+        ['IDirect3DIndexBuffer9', 'lockIndexBuffer', 'unlockIndexBuffer'],
+    ] as const) {
+        // Lock(thisPtr, OffsetToLock, SizeToLock, ppbData, Flags)
+        dispatcher.registerFastPath('d3d9', `${iface}_Lock`, (cpu: any, mem: Uint8Array, _mem32: Uint32Array, view: DataView): number | null => {
+            const esp = cpu.reg32[4];
+            const pBuf = view.getUint32(esp + 4, true);
+            const device = resourceToDevice.get(pBuf);
+            // Unknown buffer / bad out-param: no state touched yet, so let the slow path
+            // run it and produce the diagnostic.
+            if (!device) return null;
+            const ppbData = view.getUint32(esp + 16, true);
+            if (ppbData !== 0 && !validGuestRange(mem, ppbData, 4)) return null;
+            const dataPtr = (device as any)[lockFn](
+                pBuf, view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 20, true));
+            if (dataPtr === 0) {
+                // The lock recorded its flags before refusing, so this cannot fall through.
+                Logger.error(LogCategory.D3D9, `${iface}::Lock failed for 0x${pBuf.toString(16)}`);
+                if (ppbData !== 0) view.setUint32(ppbData, 0, true);
+                return D3DERR_INVALIDCALL;
+            }
+            if (ppbData !== 0) view.setUint32(ppbData, dataPtr >>> 0, true);
+            return D3D_OK;
+        }, { trivial: true });
+
+        // Unlock(thisPtr)
+        dispatcher.registerFastPath('d3d9', `${iface}_Unlock`, (cpu: any, mem: Uint8Array, _mem32: Uint32Array, view: DataView): number | null => {
+            const pBuf = view.getUint32(cpu.reg32[4] + 4, true);
+            const device = resourceToDevice.get(pBuf);
+            if (!device) return null;
+            (device as any)[unlockFn](pBuf, mem);
+            return D3D_OK;
+        }, { trivial: true });
+    }
 
     // Resource AddRef/Release — pure JS bookkeeping over the same registry the thunk
     // handlers use, so the refcount stays exact while skipping the slow-path ladder.
