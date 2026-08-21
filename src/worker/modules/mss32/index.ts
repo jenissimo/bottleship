@@ -6,9 +6,10 @@ import { System } from "../../core/system";
 import { TimerKind } from "../../core/scheduler/types";
 import { TimeService } from "../../runtime/time";
 import { MSSContext, createMSSContext, SMP_DONE, SMP_PLAYING } from "./context";
-import { finishSamplePlayback, getBytesPerSecond, getPlaybackLengthBytes, setSampleStatus, setStreamStatus, writeSamplePosition, writeStreamPosition, stopHeartbeat } from "./helpers";
+import { finishSamplePlayback, getBytesPerSecond, getPlaybackLengthBytes, setSampleStatus, setStreamStatus, writeSamplePosition, writeStreamPosition, startHeartbeat, stopHeartbeat } from "./helpers";
 import { updateEmulatorState, playSample, appendDecodedChunk, resetMssRingBuffers } from "./playback-engine";
 import { invokeEOSCallback } from "./callbacks";
+import { pumpVfsStreams } from "./stream-engine";
 import { convertToFloat } from "./audio-decode";
 import { createCoreExports } from "./core";
 import { createDigitalDriverExports } from "./digital-driver";
@@ -32,20 +33,15 @@ export class MSS32 implements IModule {
     initialize(process: Process): void {
         this.ctx = createMSSContext(process);
 
-        // Start the heartbeat loop to sync emulator memory with playback state (50Hz / 20ms):
-        // EOS detection (samples reaching SMP_DONE) + position writeback. Driven by the scheduler
-        // virtual-time timer wheel, NOT host setInterval — a busy-spinning guest thread starves
-        // host macrotasks, freezing sample completion → MSS32 voice-pool saturation hang (mac).
-        const scheduler = System.getInstance().scheduler;
-        if (scheduler) {
-            this.ctx.updateInterval = scheduler.timerWheel.add(
-                20, true, TimerKind.MSS_TIMER,
-                () => updateEmulatorState(this.ctx),
-                TimeService.getInstance().nowMs(),
-            );
-        } else {
-            Logger.warn(LogCategory.SYSTEM, "MSS32: scheduler unavailable at initialize — playback-state heartbeat disabled");
-        }
+        // The heartbeat syncs emulator memory with playback state (50Hz / 20ms): EOS
+        // detection (samples reaching SMP_DONE), position writeback, and the service
+        // point for VFS-backed incremental streams (no guest call to hang a refill on).
+        // Driven by the scheduler virtual-time timer wheel, NOT host setInterval — a
+        // busy-spinning guest thread starves host macrotasks, freezing sample completion
+        // → MSS32 voice-pool saturation hang (mac). startHeartbeat re-arms it whenever a
+        // digital driver is (re)opened; closing one stops it.
+        this.ctx.heartbeatTick = () => { pumpVfsStreams(this.ctx); updateEmulatorState(this.ctx); };
+        startHeartbeat(this.ctx);
 
         // Merge all domain exports
         Object.assign(this.exports, createCoreExports(this.ctx));

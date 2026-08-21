@@ -4,9 +4,10 @@ import { Marshaler } from "../../core/memory/marshaler";
 import { MemoryGuard } from "../../core/memory/mem-guard";
 import { isValidAddress } from "../../core/memory/address-guard";
 import { MSSContext, SMP_PLAYING } from "./context";
-import { ensureDriverHandle, stopHeartbeat, freeDriverResources, getBytesPerSecond, getPlaybackLengthBytes } from "./helpers";
+import { ensureDriverHandle, startHeartbeat, stopHeartbeat, freeDriverResources, getBytesPerSecond, getPlaybackLengthBytes } from "./helpers";
 import { updateEmulatorState, stopRingBuffer } from "./playback-engine";
-import { processPendingTimerCallbacks, processPendingEOSCallbacks } from "./callbacks";
+import { processPendingTimerCallbacks, processPendingEOSCallbacks, processPendingStreamCallbacks } from "./callbacks";
+import { pumpVfsStreams, serveIncrementalStreams } from "./stream-engine";
 import { ensureListener3D } from "./spatial";
 
 /** Fake 3D provider handle — games null-check but never dereference internals */
@@ -42,6 +43,7 @@ export function createCoreExports(ctx: MSSContext): Record<string, ThunkImplemen
         Logger.log(LogCategory.SYSTEM, 'MSS32: _AIL_startup@0 called');
         ctx.initialized = true;
         ctx.startupTime = performance.now();
+        startHeartbeat(ctx);
         return 1;
     };
 
@@ -136,15 +138,22 @@ export function createCoreExports(ctx: MSSContext): Record<string, ThunkImplemen
         ctx.insideAilServe = true;
         ctx.serveDepth++;
         try {
+            pumpVfsStreams(ctx);
             updateEmulatorState(ctx);
 
             const timerInvoked = processPendingTimerCallbacks(ctx);
             const eosInvoked = processPendingEOSCallbacks(ctx);
+            const streamInvoked = processPendingStreamCallbacks(ctx);
 
-            if (timerInvoked || eosInvoked) {
-                Logger.verbose(LogCategory.SYSTEM, `MSS32: Suspending _AIL_serve for callback (invoked: timer=${timerInvoked}, eos=${eosInvoked})`);
+            if (timerInvoked || eosInvoked || streamInvoked) {
+                Logger.verbose(LogCategory.SYSTEM, `MSS32: Suspending _AIL_serve for callback (invoked: timer=${timerInvoked}, eos=${eosInvoked}, stream=${streamInvoked})`);
                 return { value: 0, suspendedForCallback: true, stackCleanup: 0 };
             }
+
+            // Servicing a stream means running the app's own file callbacks, which is
+            // guest code: this is the point at which real Miles tops its buffers up.
+            const served = serveIncrementalStreams(ctx, ctxThunk, 0, "mss32:AIL_serve");
+            if (served) return served;
         } finally {
             ctx.serveDepth--;
             ctx.insideAilServe = false;

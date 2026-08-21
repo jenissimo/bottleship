@@ -63,6 +63,29 @@ export function processPendingTimerCallbacks(ctx: MSSContext): boolean {
 }
 
 /**
+ * Process one pending stream callback (AIL_register_stream_callback), queued when an
+ * incrementally fed stream reached the end of its source outside a guest call chain.
+ * Miles declares AILSTREAMCB as one argument, HSTREAM — do not pass a second.
+ */
+export function processPendingStreamCallbacks(ctx: MSSContext): boolean {
+    if (ctx.pendingStreamCallbacks.length === 0) return false;
+
+    const cm = ctx.process?.dispatcher?.callbackManager;
+    if (!cm) return false;
+
+    const pending = ctx.pendingStreamCallbacks.shift();
+    if (!pending) return false;
+
+    try {
+        cm.invokeCallback(pending.callback, [pending.handle], 0);
+        return true;
+    } catch (e) {
+        Logger.warn(LogCategory.SYSTEM, `MSS32: stream callback invoke failed: ${e}`);
+        return false;
+    }
+}
+
+/**
  * Process pending EOS callbacks that were queued from the scheduler timer wheel.
  * Called during _AIL_serve@0 when CPU state is stable.
  * Only processes ONE callback per call to avoid re-entrancy issues.

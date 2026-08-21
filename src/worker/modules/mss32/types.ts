@@ -78,6 +78,51 @@ export interface MSSWaveOut {
     preparedHeaders?: Map<number, { ptr: number; len: number; flags: number }>;
 }
 
+/**
+ * A stream's live source: the file held OPEN for the life of the HSTREAM, plus
+ * where in it the engine has read to. Present only for streams fed incrementally
+ * (see stream-engine.ts); a whole-file stream has `fileData` instead.
+ *
+ * Two backings, because Miles has two ways to reach a stream's bytes and both are
+ * real: "app" is the title's own AILCALLBACK file I/O (guest code, so a refill is
+ * a guest call chain), "vfs" is our file system (an ordinary async read).
+ */
+export interface MSSStreamSource {
+    kind: "app" | "vfs";
+    /** app: handle the app's open callback returned. Closed by close_stream, never before. */
+    fileHandle: number;
+    /** app: guest allocation — 4-byte handle out-param followed by the read buffer. */
+    scratch: number;
+    /** vfs: our own file object. Nothing else reads through it, so its cursor is ours. */
+    vfsHandle: import("../../runtime/filesystem/vfs").VfsFileHandle | null;
+    fileSize: number;
+    /** Format of the source bytes — what convertToFloat is called with each refill. */
+    info: import("./audio-decode").WavChunkInfo;
+    /** Source bytes that decode as one indivisible unit (an ADPCM block, or a PCM frame). */
+    blockBytes: number;
+    /** Decoded frames one such block yields. */
+    framesPerBlock: number;
+    /** Data-chunk extent in FILE bytes. */
+    dataStart: number;
+    dataEnd: number;
+    /** Decoded frames in the whole data chunk — the stream's length. */
+    totalFrames: number;
+    /** Next file offset the engine will read from. */
+    readOffset: number;
+    /** Where the file object's cursor is, so a refill only seeks when it has to. -1 = unknown. */
+    cursor: number;
+    /** Frames handed to the ring since the stream opened (monotonic across loops). */
+    framesDecoded: number;
+    /** A refill is in flight on the guest call chain; do not start a second. */
+    busy: boolean;
+    /** Source spent and not looping — the stream ends when the ring drains. */
+    exhausted: boolean;
+    /** The app's stream callback has already been told about this end-of-source. */
+    endReported: boolean;
+    /** Decoded tail the ring had no room for; consumed first on the next refill. */
+    pending: { floats: Float32Array; at: number } | null;
+}
+
 // Miles Sound System stream handle (for streaming audio playback - e.g., Smacker video audio)
 export interface MSSStream {
     id: number;
@@ -109,6 +154,8 @@ export interface MSSStream {
     lastAudioPositionBytes?: number;
     /** Estimated decoded duration for encoded formats decoded by the host audio stack. */
     encodedDurationMs?: number;
+    /** Incremental source (one open handle + a ring), or null for a whole-file stream. */
+    source?: MSSStreamSource | null;
 }
 
 // MIDI/XMIDI sequence handle (stub — no actual playback)

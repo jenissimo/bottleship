@@ -73,6 +73,8 @@ export interface MSSContext {
     midiDriverHandle: number;
     midiMasterVolume: number;
     updateInterval: any;
+    /** The heartbeat's tick, kept so it can be re-armed after a driver close. */
+    heartbeatTick: (() => void) | null;
     startupTime: number;
     lastErrorPtr: number;
     lastErrorStr: string;
@@ -83,6 +85,9 @@ export interface MSSContext {
     pendingTimerCallbacks: Array<{ callback: number; user: number }>;
     /** Queue of pending EOS callbacks - processed during _AIL_serve to avoid corrupting CPU state */
     pendingEOSCallbacks: Array<{ callback: number; handle: number; user: number }>;
+    /** Stream callbacks (AIL_register_stream_callback) an incremental stream hit the end
+     *  of source on. One arg, HSTREAM — drained in _AIL_serve like the EOS queue. */
+    pendingStreamCallbacks: Array<{ callback: number; handle: number }>;
     /** Flag to track if we're inside _AIL_serve (safe to invoke callbacks) */
     insideAilServe: boolean;
     /** H3 Async: reentrancy depth of _AIL_serve (nested serve = possible stack/callback conflict) */
@@ -172,6 +177,7 @@ export function createMSSContext(process: Process): MSSContext {
         midiDriverHandle: 0,
         midiMasterVolume: 127,
         updateInterval: null,
+        heartbeatTick: null,
         startupTime: 0,
         lastErrorPtr: 0,
         lastErrorStr: "",
@@ -179,6 +185,7 @@ export function createMSSContext(process: Process): MSSContext {
         memAllocatedByMss: new Set(),
         pendingTimerCallbacks: [],
         pendingEOSCallbacks: [],
+        pendingStreamCallbacks: [],
         insideAilServe: false,
         serveDepth: 0,
         wavFormatByDataPtr: new Map(),

@@ -2,6 +2,8 @@ import { Logger, LogCategory, LogLevel } from "../../core/logger";
 import { Marshaler } from "../../core/memory/marshaler";
 import { MemoryGuard } from "../../core/memory/mem-guard";
 import { System } from "../../core/system";
+import { TimerKind } from "../../core/scheduler/types";
+import { TimeService } from "../../runtime/time";
 import { MSSContext, SMP_DONE, SMP_FREE, SMP_PLAYING } from "./context";
 import { MSSSample, MSSStream } from "./types";
 
@@ -489,9 +491,38 @@ export function ensureDriverHandle(ctx: MSSContext, mem: Uint8Array): number {
 
     reinitDriverFields(ctx, driverHandle, dummyBuffer, waveFormat, noopTable, 0, mem, 0);
 
+    // A driver exists again, so the playback heartbeat must be running again.
+    startHeartbeat(ctx);
+
     Logger.log(LogCategory.SYSTEM, `MSS32: ensureDriverHandle created driver at 0x${driverHandle.toString(16)}, noopStub=0x${noopStub.toString(16)}`);
     return driverHandle;
 }
+
+/**
+ * (Re)arm the 20 ms playback heartbeat: EOS detection, guest-visible position
+ * writeback, and the service point for incrementally fed streams.
+ *
+ * It is a property of "a digital driver is open", NOT of module construction —
+ * close_digital_driver / shutdown / waveOutClose all stop it, and a title that
+ * reopens its driver (changing an audio setting does exactly that) would otherwise
+ * run the rest of the session with no clock at all: positions frozen, samples never
+ * reaching DONE, and a streaming ring nobody refills.
+ */
+export function startHeartbeat(ctx: MSSContext): void {
+    if (ctx.updateInterval || !ctx.heartbeatTick) return;
+    const scheduler = System.getInstance().scheduler;
+    if (!scheduler) {
+        Logger.warn(LogCategory.SYSTEM, "MSS32: scheduler unavailable — playback heartbeat not armed");
+        return;
+    }
+    ctx.updateInterval = scheduler.timerWheel.add(
+        HEARTBEAT_MS, true, TimerKind.MSS_TIMER, ctx.heartbeatTick,
+        TimeService.getInstance().nowMs(),
+    );
+}
+
+/** Heartbeat period. 50 Hz: fine enough for EOS latency, coarse enough to be free. */
+export const HEARTBEAT_MS = 20;
 
 /** Stop the heartbeat timer; call on shutdown/close_driver to avoid writing to stale memory.
  *  updateInterval now holds a scheduler timer-wheel id (not a setInterval handle). */
