@@ -12,7 +12,7 @@ import {
     writeUpDrawCaptureTrampoline,
 } from '../../modules/d3d9/capture-trampolines';
 import type { ShadowTrampolineSpec } from '../../modules/d3d9/capture-trampolines';
-import { sehOnCatchCompletion } from '../seh-dispatch';
+import { sehOnCatchCompletion, dispatchCxxException } from '../seh-dispatch';
 import { JMP_REL8, JMP_LOOP, HLT } from './thunk-constants';
 import { parseStdcallCleanup, normalizeApiName } from './thunk-utils';
 import { BusyWaitDetector } from './busy-wait-detector';
@@ -21,7 +21,11 @@ import { dumpExceptionContext } from './exception-context-dumper';
 import { guardStackWrite } from '../memory/stack-write-guard';
 import { guestMemoryBorrowCount } from '../memory/guest-memory';
 import * as DispatcherForensics from './dispatcher-forensics';
-import { ERROR_NOT_SUPPORTED } from './thunk-errors';
+import { APIRegistry } from '../api-registry';
+import {
+    COM_METHOD_UNIMPLEMENTED_RETURN, DEFAULT_UNIMPLEMENTED_RETURN,
+    ERROR_CALL_NOT_IMPLEMENTED, unimplementedReturnValue,
+} from './unimplemented-return';
 import { thunkChecksumManager } from '../memory/thunk-checksum';
 import { invalidateGuestCode } from '../memory/guest-code';
 import { hypercallDataManager } from '../cpu/hypercall-data';
@@ -162,6 +166,9 @@ interface SehDispatchContext {
     scratchAddr: number;
     lastFaultSignature: SehFaultSignature | null;
     kind: 'av' | 'cxx';
+    /** For 'cxx': what the throw carried, so an exhausted x86 chain can still be
+     *  re-walked in JS for a catch the native handlers could not serve. */
+    cxx?: { pObj: number; pThrow: number; cleanupBytes: number; throwEsp: number };
 }
 
 // Configuration
@@ -536,7 +543,7 @@ export class ThunkDispatcher {
     /**
      * What a thunk id will actually do when called: the handler's declared parameter
      * count and the export's declared argument count, or null when nothing is
-     * registered (the dispatcher would answer ERROR_NOT_SUPPORTED).
+     * registered (the dispatcher would answer the export's declared failure value).
      *
      * Lets a caller that only holds an ADDRESS — GetProcAddress handing a stub back to
      * the guest — say whether that address leads to a real handler, to a stub, or to a
@@ -3309,8 +3316,14 @@ export class ThunkDispatcher {
             ownerDisarm: opts?.ownerDisarm,
         });
 
-        const stub = this.findStubsByName(dllName, funcName)[0];
-        if (!stub || stub.functionId >= MAX_THUNK_ID) {
+        // EVERY stub for the name, not just the first: an export reached through both an
+        // import table and GetProcAddress/wglGetProcAddress owns two stubs with different
+        // functionIds, and the late one is created after this registration. Patching only
+        // [0] leaves the on-demand entry point trapping (mirrors registerFastPath, which
+        // has always applied to all of them).
+        const stubs = this.findStubsByName(dllName, funcName)
+            .filter(s => s.functionId < MAX_THUNK_ID);
+        if (stubs.length === 0) {
             Logger.verbose(LogCategory.THUNK,
                 `Write-buffer stub not found for ${dllName}:${funcName}, registration deferred`);
             return;
@@ -3341,62 +3354,74 @@ export class ThunkDispatcher {
                 `registerWriteBufferFunction: mem8 not ready, cannot patch stub for ${dllName}:${funcName}`);
             return;
         }
-        const stubAddr = stub.address;
-        const rel32 = (trampolineAddr - (stubAddr + 10)) | 0;
-        mem8[stubAddr + 5]  = 0xE9;
-        mem8[stubAddr + 6]  = rel32 & 0xFF;
-        mem8[stubAddr + 7]  = (rel32 >> 8)  & 0xFF;
-        mem8[stubAddr + 8]  = (rel32 >> 16) & 0xFF;
-        mem8[stubAddr + 9]  = (rel32 >> 24) & 0xFF;
-        // Bytes 10..15 (the original OUT + RET N) are left ALONE: unreachable through the
-        // JMP, but they are the exact sequence a guest PARKED IN THIS STUB'S OUT resumes
-        // into, and registration can happen during that very trap (a lazily bound export
-        // patches on its first call). NOPing the tail drops that guest through the arena
-        // into the NEXT stub's RET N — a different stack cleanup, so the caller's frame is
-        // silently skewed and its own return pops an argument instead of an address.
-
-        // Drop the cached OUT-trap block so the new JMP bytes are re-compiled.
-        const jitDirtied = invalidateGuestCode(stubAddr, 16);
-
-        // Register the drain handler
-        const id = stub.functionId;
-        this.writeBufHandlerTable[id]  = handler;
-        this.writeBufArgCountTable[id] = argCount;
-        this.writeBufCoalesceMaskTable[id] = coalesceArgMask & 0x7;
-        this.writeBufBarrierTable[id] = opts?.barrier ? 1 : 0;
-        // Ring-level coalescing is DEFAULT-OFF: the guest-side setter
-        // shadow already kills ~97% of redundant setters before they reach the ring, and
-        // draws-on-ring barrier segments split what's left — measured NFSU in-race skip
-        // rate fell to ~2.2% of entries while the coalesce-index build+hash walks EVERY
-        // entry twice (~0.8 ms/frame, wbufCoalesceSlot visible in profiles). Masks stay
-        // registered; opt back in via globalThis.__wbufCoalesce = true (boot) or
-        // dispatcher.wbufCoalescingEnabled = true (live) if a profile justifies it.
-        if (coalesceArgMask && (globalThis as { __wbufCoalesce?: boolean }).__wbufCoalesce) {
-            this.wbufCoalescingEnabled = true;
-        }
-
-        // Read-back verification: confirm patch bytes are visible in memory
-        const readBack = Array.from(mem8.slice(stubAddr, stubAddr + 16)).map(b => b.toString(16).padStart(2, '0')).join(' ');
-        const patchOk = mem8[stubAddr + 5] === 0xE9;
-
-        // Also check via fresh memory reference to detect stale cachedMem8
-        let freshMatch = true;
-        if (this.getMemory) {
-            const freshMem = this.getMemory();
-            freshMatch = freshMem[stubAddr + 5] === 0xE9;
-            if (!freshMatch) {
-                Logger.error(LogCategory.THUNK,
-                    `[WBUF] STALE MEMORY! cachedMem8 patch ok but fresh getMemory() shows byte5=0x${freshMem[stubAddr + 5].toString(16)}. ` +
-                    `cachedMem8.buffer === freshMem.buffer: ${mem8.buffer === freshMem.buffer}`);
+        for (let si = 0; si < stubs.length; si++) {
+            const stub = stubs[si];
+            // The trampoline pops argCount DWORDs; a stub declaring a different arity would
+            // return on the wrong stack depth. Only the ADDITIONAL stubs are gated — the
+            // first one is what every existing registration has always patched.
+            if (si > 0 && typeof stub.argCount === "number" && stub.argCount !== argCount) {
+                Logger.warn(LogCategory.THUNK,
+                    `registerWriteBufferFunction: skipping ${dllName}:${funcName} stub id=${stub.functionId} ` +
+                    `(argCount=${stub.argCount}, registered ${argCount})`);
+                continue;
             }
-        }
+            const stubAddr = stub.address;
+            const rel32 = (trampolineAddr - (stubAddr + 10)) | 0;
+            mem8[stubAddr + 5]  = 0xE9;
+            mem8[stubAddr + 6]  = rel32 & 0xFF;
+            mem8[stubAddr + 7]  = (rel32 >> 8)  & 0xFF;
+            mem8[stubAddr + 8]  = (rel32 >> 16) & 0xFF;
+            mem8[stubAddr + 9]  = (rel32 >> 24) & 0xFF;
+            // Bytes 10..15 (the original OUT + RET N) are left ALONE: unreachable through the
+            // JMP, but they are the exact sequence a guest PARKED IN THIS STUB'S OUT resumes
+            // into, and registration can happen during that very trap (a lazily bound export
+            // patches on its first call). NOPing the tail drops that guest through the arena
+            // into the NEXT stub's RET N — a different stack cleanup, so the caller's frame is
+            // silently skewed and its own return pops an argument instead of an address.
 
-        Logger.log(LogCategory.THUNK,
-            `[WBUF] Registered [${id}] ${dllName}:${funcName} ` +
-            `(${argCount} args, ${isStdcall ? 'stdcall' : 'cdecl'}, stub=0x${stubAddr.toString(16)}, trampoline=0x${trampolineAddr.toString(16)}, ` +
-            `${coalesceArgMask ? `coalesceMask=0x${(coalesceArgMask & 0x7).toString(16)}, ` : ''}` +
-            `jit_dirty=${jitDirtied}, deferred=${!jitDirtied}, readback=${patchOk?'OK':'FAIL'}, freshMem=${freshMatch?'OK':'STALE'}) ` +
-            `bytes=[${readBack}]`);
+            // Drop the cached OUT-trap block so the new JMP bytes are re-compiled.
+            const jitDirtied = invalidateGuestCode(stubAddr, 16);
+
+            // Register the drain handler
+            const id = stub.functionId;
+            this.writeBufHandlerTable[id]  = handler;
+            this.writeBufArgCountTable[id] = argCount;
+            this.writeBufCoalesceMaskTable[id] = coalesceArgMask & 0x7;
+            this.writeBufBarrierTable[id] = opts?.barrier ? 1 : 0;
+            // Ring-level coalescing is DEFAULT-OFF: the guest-side setter
+            // shadow already kills ~97% of redundant setters before they reach the ring, and
+            // draws-on-ring barrier segments split what's left — measured NFSU in-race skip
+            // rate fell to ~2.2% of entries while the coalesce-index build+hash walks EVERY
+            // entry twice (~0.8 ms/frame, wbufCoalesceSlot visible in profiles). Masks stay
+            // registered; opt back in via globalThis.__wbufCoalesce = true (boot) or
+            // dispatcher.wbufCoalescingEnabled = true (live) if a profile justifies it.
+            if (coalesceArgMask && (globalThis as { __wbufCoalesce?: boolean }).__wbufCoalesce) {
+                this.wbufCoalescingEnabled = true;
+            }
+
+            // Read-back verification: confirm patch bytes are visible in memory
+            const readBack = Array.from(mem8.slice(stubAddr, stubAddr + 16)).map(b => b.toString(16).padStart(2, '0')).join(' ');
+            const patchOk = mem8[stubAddr + 5] === 0xE9;
+
+            // Also check via fresh memory reference to detect stale cachedMem8
+            let freshMatch = true;
+            if (this.getMemory) {
+                const freshMem = this.getMemory();
+                freshMatch = freshMem[stubAddr + 5] === 0xE9;
+                if (!freshMatch) {
+                    Logger.error(LogCategory.THUNK,
+                        `[WBUF] STALE MEMORY! cachedMem8 patch ok but fresh getMemory() shows byte5=0x${freshMem[stubAddr + 5].toString(16)}. ` +
+                        `cachedMem8.buffer === freshMem.buffer: ${mem8.buffer === freshMem.buffer}`);
+                }
+            }
+
+            Logger.log(LogCategory.THUNK,
+                `[WBUF] Registered [${id}] ${dllName}:${funcName} ` +
+                `(${argCount} args, ${isStdcall ? 'stdcall' : 'cdecl'}, stub=0x${stubAddr.toString(16)}, trampoline=0x${trampolineAddr.toString(16)}, ` +
+                `${coalesceArgMask ? `coalesceMask=0x${(coalesceArgMask & 0x7).toString(16)}, ` : ''}` +
+                `jit_dirty=${jitDirtied}, deferred=${!jitDirtied}, readback=${patchOk?'OK':'FAIL'}, freshMem=${freshMatch?'OK':'STALE'}) ` +
+                `bytes=[${readBack}]`);
+        }
     }
 
     /**
@@ -3618,8 +3643,10 @@ export class ThunkDispatcher {
             argCount: floatCount, isStdcall, ptrDeref: true, floatCount,
         });
 
-        const stub = this.findStubsByName(dllName, funcName)[0];
-        if (!stub || stub.functionId >= MAX_THUNK_ID) {
+        // All stubs for the name — see registerWriteBufferFunction.
+        const stubs = this.findStubsByName(dllName, funcName)
+            .filter(s => s.functionId < MAX_THUNK_ID);
+        if (stubs.length === 0) {
             Logger.verbose(LogCategory.THUNK,
                 `PtrDeref write-buffer stub not found for ${dllName}:${funcName}, registration deferred`);
             return;
@@ -3647,32 +3674,44 @@ export class ThunkDispatcher {
                 `registerPtrDerefWriteBufferFunction: mem8 not ready, cannot patch stub for ${dllName}:${funcName}`);
             return;
         }
-        const stubAddr = stub.address;
-        const rel32 = (trampolineAddr - (stubAddr + 10)) | 0;
-        mem8[stubAddr + 5]  = 0xE9;
-        mem8[stubAddr + 6]  = rel32 & 0xFF;
-        mem8[stubAddr + 7]  = (rel32 >> 8)  & 0xFF;
-        mem8[stubAddr + 8]  = (rel32 >> 16) & 0xFF;
-        mem8[stubAddr + 9]  = (rel32 >> 24) & 0xFF;
-        // Bytes 10..15 (the original OUT + RET N) are left ALONE: unreachable through the
-        // JMP, but they are the exact sequence a guest PARKED IN THIS STUB'S OUT resumes
-        // into, and registration can happen during that very trap (a lazily bound export
-        // patches on its first call). NOPing the tail drops that guest through the arena
-        // into the NEXT stub's RET N — a different stack cleanup, so the caller's frame is
-        // silently skewed and its own return pops an argument instead of an address.
+        for (let si = 0; si < stubs.length; si++) {
+            const stub = stubs[si];
+            // The PtrDeref trampoline's RET is fixed at one pointer argument; a stub that
+            // disagrees would return on the wrong stack depth. Only the ADDITIONAL stubs are
+            // gated — the first one is what every existing registration has always patched.
+            if (si > 0 && typeof stub.argCount === "number" && stub.argCount !== 1) {
+                Logger.warn(LogCategory.THUNK,
+                    `registerPtrDerefWriteBufferFunction: skipping ${dllName}:${funcName} stub id=${stub.functionId} ` +
+                    `(argCount=${stub.argCount}, expected 1)`);
+                continue;
+            }
+            const stubAddr = stub.address;
+            const rel32 = (trampolineAddr - (stubAddr + 10)) | 0;
+            mem8[stubAddr + 5]  = 0xE9;
+            mem8[stubAddr + 6]  = rel32 & 0xFF;
+            mem8[stubAddr + 7]  = (rel32 >> 8)  & 0xFF;
+            mem8[stubAddr + 8]  = (rel32 >> 16) & 0xFF;
+            mem8[stubAddr + 9]  = (rel32 >> 24) & 0xFF;
+            // Bytes 10..15 (the original OUT + RET N) are left ALONE: unreachable through the
+            // JMP, but they are the exact sequence a guest PARKED IN THIS STUB'S OUT resumes
+            // into, and registration can happen during that very trap (a lazily bound export
+            // patches on its first call). NOPing the tail drops that guest through the arena
+            // into the NEXT stub's RET N — a different stack cleanup, so the caller's frame is
+            // silently skewed and its own return pops an argument instead of an address.
 
-        invalidateGuestCode(stubAddr, 16);
+            invalidateGuestCode(stubAddr, 16);
 
-        // Register drain handler — floatCount is the argCount for stride calculation
-        const id = stub.functionId;
-        this.writeBufHandlerTable[id]  = handler;
-        this.writeBufArgCountTable[id] = floatCount;
-        this.writeBufCoalesceMaskTable[id] = 0;
-        this.writeBufBarrierTable[id] = 0;
+            // Register drain handler — floatCount is the argCount for stride calculation
+            const id = stub.functionId;
+            this.writeBufHandlerTable[id]  = handler;
+            this.writeBufArgCountTable[id] = floatCount;
+            this.writeBufCoalesceMaskTable[id] = 0;
+            this.writeBufBarrierTable[id] = 0;
 
-        Logger.log(LogCategory.THUNK,
-            `[WBUF] Registered PtrDeref [${id}] ${dllName}:${funcName} ` +
-            `(${floatCount} floats, ${isStdcall ? 'stdcall' : 'cdecl'}, stub=0x${stubAddr.toString(16)}, trampoline=0x${trampolineAddr.toString(16)})`);
+            Logger.log(LogCategory.THUNK,
+                `[WBUF] Registered PtrDeref [${id}] ${dllName}:${funcName} ` +
+                `(${floatCount} floats, ${isStdcall ? 'stdcall' : 'cdecl'}, stub=0x${stubAddr.toString(16)}, trampoline=0x${trampolineAddr.toString(16)})`);
+        }
     }
 
     /**
@@ -4851,7 +4890,41 @@ export class ThunkDispatcher {
             // Unhandled — all handlers returned ContinueSearch.
             // Try UnhandledExceptionFilter before halting.
             // Covers BOTH the UEF and halt paths.
+            // A C++ throw deferred to the x86 chain (because an __except frame stood
+            // between the throw and the catch, and its filter had to run natively) can
+            // exhaust that chain without ever reaching the catch: our __CxxFrameHandler
+            // answers ContinueSearch, so a C++ catch ABOVE the __except frame is served
+            // by nobody. Windows' __CxxFrameHandler would have entered it, so re-walk in
+            // JS with the defer verdict suppressed before declaring the throw unhandled.
+            // emitCatchDispatch leaves ESP on the trampoline's return slot, which is
+            // exactly what this stub's own RET pops.
+            if (ctx?.kind === 'cxx' && ctx.cxx && this.cachedMem8) {
+                const savedEsp = cpu.reg32[4];
+                cpu.reg32[4] = ctx.cxx.throwEsp | 0;
+                const retry = dispatchCxxException(
+                    this.cachedMem8, cpu, ctx.cxx.pObj, ctx.cxx.pThrow, ctx.cxx.cleanupBytes,
+                    { allowDeferToX86: false });
+                if (retry && !('deferToX86' in retry)) {
+                    Logger.warn(LogCategory.SYSTEM,
+                        `SEH dispatch: x86 chain exhausted for a C++ throw — served the catch ` +
+                        `the native handlers skipped (JS walk, defer suppressed)`);
+                    return;
+                }
+                cpu.reg32[4] = savedEsp;
+            }
+
             this._recordFaultEip(faultingEip);
+            // The one fault that matters on a demand-paged guest is the one nobody
+            // claimed. __pauseOnFault freezes at EVERY fault, which is useless when
+            // thousands are routine — this stops exactly here, before the UEF runs and
+            // tears the address space down, so the guest's own bookkeeping is still live.
+            if ((globalThis as { __pauseOnUnhandledFault?: boolean }).__pauseOnUnhandledFault) {
+                const pause = (globalThis as { __harnessPause?: () => void }).__harnessPause;
+                Logger.error(LogCategory.SYSTEM,
+                    `  !! __pauseOnUnhandledFault: guest FROZEN at the UNCLAIMED fault (EIP=0x${faultingEip.toString(16)})` +
+                    `${pause ? ' — memory is live; read it, then resume()' : ' — FAILED, no pause hook installed'}`);
+                pause?.();
+            }
             Logger.warn(LogCategory.SYSTEM,
                 `SEH dispatch: unhandled result=${result} lastDisposition=0x${lastHandlerResult.toString(16)} ` +
                 `lastFrame=0x${lastHandlerFrame.toString(16)} lastHandler=0x${lastHandlerAddr.toString(16)}`);
@@ -5398,14 +5471,28 @@ export class ThunkDispatcher {
             pause?.();
         }
 
+        // A demand-paged guest (reserve a window, commit from the fault filter — Serious
+        // Engine's stream buffer) faults thousands of times per load, ALL recovered.
+        // Dumping registers + 32 stack words + 50 thunks for each drowns the durable
+        // archive and hides the one fault that was NOT recovered, so the full picture is
+        // capped; the one-line record above always survives, as does faults().
+        const pfVerbose = this.pfDumpBudget > 0;
+        if (pfVerbose) {
+            this.pfDumpBudget--;
+        } else if (this.pfDumpBudget === 0) {
+            this.pfDumpBudget = -1;
+            Logger.error(LogCategory.SYSTEM,
+                `#PF: detail budget spent — further faults log one line only`);
+        }
+
         const regs = cpu.reg32;
-        Logger.error(LogCategory.SYSTEM,
+        if (pfVerbose) Logger.error(LogCategory.SYSTEM,
             `  EAX=0x${savedEax.toString(16)} ECX=0x${(regs[1] >>> 0).toString(16)} ` +
             `EDX=0x${savedEdx.toString(16)} EBX=0x${(regs[3] >>> 0).toString(16)}\n` +
             `  ESP=0x${esp.toString(16)} EBP=0x${(regs[5] >>> 0).toString(16)} ` +
             `ESI=0x${(regs[6] >>> 0).toString(16)} EDI=0x${(regs[7] >>> 0).toString(16)}`);
         if (cr2Candidates.length) {
-            Logger.error(LogCategory.SYSTEM, `  CR2 = ${cr2Candidates.join(' | ')}`);
+            if (pfVerbose) Logger.error(LogCategory.SYSTEM, `  CR2 = ${cr2Candidates.join(' | ')}`);
         }
         if (eipConsistent === false) {
             Logger.error(LogCategory.SYSTEM,
@@ -5436,7 +5523,7 @@ export class ThunkDispatcher {
         // CPU pushes: error_code + EIP + CS + EFLAGS = 16 bytes
         // Total: 24 bytes above current esp
         const gameEsp = esp + 24;
-        Logger.error(LogCategory.SYSTEM, `  Game ESP before fault: 0x${gameEsp.toString(16)}`);
+        if (pfVerbose) Logger.error(LogCategory.SYSTEM, `  Game ESP before fault: 0x${gameEsp.toString(16)}`);
         if (view && gameEsp > 0 && gameEsp + 128 <= this.memLength) {
             const stackWords: string[] = [];
             for (let i = 0; i < 32; i++) {
@@ -5458,7 +5545,7 @@ export class ThunkDispatcher {
         }
 
         // Dump recent thunk calls (ring buffer) for crash diagnosis
-        {
+        if (pfVerbose) {
             const lines = this.winApiRing.getCrashTraceLines(50);
             Logger.error(LogCategory.SYSTEM, `#PF crash trace — last ${lines.length} thunks:\n${lines.join('\n')}`);
         }
@@ -6010,6 +6097,12 @@ export class ThunkDispatcher {
             scratchAddr,
             lastFaultSignature: null,
             kind: 'cxx',
+            cxx: {
+                pObj: lpArguments ? view.getUint32(lpArguments + 4, true) >>> 0 : 0,
+                pThrow: lpArguments ? view.getUint32(lpArguments + 8, true) >>> 0 : 0,
+                cleanupBytes: thunkCleanupBytes,
+                throwEsp: thunkEsp >>> 0,
+            },
         };
         this.sehDispatchStack.push(dispatchCtx);
         this._enterSehCriticalRuntime(this.sehDispatchGeneration);
@@ -6739,16 +6832,53 @@ export class ThunkDispatcher {
 
     /**
      * Startup-ordering invariant: no guest instruction may execute before HLE module
-     * registration completes. Until it does, EVERY import looks unimplemented and gets
-     * ERROR_NOT_SUPPORTED (50) — a guest that calls the result as a function pointer (a
-     * DllMain resolving GetProcAddress, say) ends up at EIP 0x32 and dies far from the
-     * cause. The load path awaits readiness, so reaching the sentinel while this is false
-     * is a broken gate, not a missing handler: say so instead of returning 50 quietly.
+     * registration completes. Until it does, EVERY import looks unimplemented and fails —
+     * a guest that calls the result as a function pointer (a DllMain resolving
+     * GetProcAddress, say) ends up at a wild EIP and dies far from the cause. The load
+     * path awaits readiness, so reaching the sentinel while this is false is a broken
+     * gate, not a missing handler: say so instead of failing the call quietly.
      */
     markHleRegistrationComplete(): void {
         this.hleRegistrationComplete = true;
     }
     private hleRegistrationComplete = false;
+
+    /** Full-detail #PF dumps left before the fault log degrades to one line each. */
+    private pfDumpBudget = 8;
+
+    /** functionId -> failure value, memoized: an unimplemented export can be called per frame. */
+    private unimplementedReturnCache = new Map<number, number>();
+
+    /**
+     * The failure value for a declared export with no handler.
+     *
+     * Order: the descriptor's own `onUnimplemented` → "it is a COM vtable slot, so an
+     * HRESULT" → the default (0). The COM test is the `IFoo_Method` naming every vtable
+     * registration in this repo uses; a descriptor-declared interface method is already
+     * covered by the first step, so this only catches interfaces implemented in JS
+     * without an api-table entry.
+     */
+    private unimplementedReturnFor(functionId: number, stub: ThunkStub | undefined, name: string): number {
+        const cached = this.unimplementedReturnCache.get(functionId);
+        if (cached !== undefined) return cached;
+
+        // Fall back to parsing "module:Func" when no stub record exists (vtable dispatch).
+        const ci = name.indexOf(":");
+        const dll = stub?.dllName ?? (ci > 0 ? name.slice(0, ci) : "");
+        const func = stub?.functionName ?? (ci > 0 ? name.slice(ci + 1) : name);
+
+        let value: number;
+        const declared = dll ? APIRegistry.getInstance().getUnimplementedReturnClass(dll, func) : undefined;
+        if (declared) {
+            value = unimplementedReturnValue(declared);
+        } else if (/^I[A-Z][A-Za-z0-9]*_/.test(func)) {
+            value = COM_METHOD_UNIMPLEMENTED_RETURN;
+        } else {
+            value = DEFAULT_UNIMPLEMENTED_RETURN;
+        }
+        this.unimplementedReturnCache.set(functionId, value >>> 0);
+        return value >>> 0;
+    }
 
     private _slowPathMissingImplementation(functionId: number, cpu: any, name: string): void {
         if (!this.hleRegistrationComplete) {
@@ -6756,18 +6886,19 @@ export class ThunkDispatcher {
                 `[ORDERING] ${name} (id=0x${functionId.toString(16)}) hit the UNIMPLEMENTED path ` +
                 `BEFORE HLE registration completed — the dispatch table is still empty, so this is ` +
                 `an ordering violation, not a missing handler. Every import in this window returns ` +
-                `ERROR_NOT_SUPPORTED and any guest that calls the result crashes with a wild EIP. ` +
+                `a failure value and any guest that calls the result crashes with a wild EIP. ` +
                 `The load path must await HLE readiness before the guest runs.`);
         }
         const stub = this.thunkGenerator.getStubById(functionId);
         const esp = cpu.reg32[4];
         const argCount = stub?.argCount ?? this.argCountsTable[functionId] ?? 0;
 
-        // Video codecs (Smacker, Bink) should return 0 (NULL) so game skips video
-        // ERROR_NOT_SUPPORTED (50) would be interpreted as valid handle!
+        // Video codecs (Smacker, Bink) should return 0 (NULL) so game skips video.
         const dllNameLower = stub?.dllName?.toLowerCase() || '';
         const isVideoCodec = dllNameLower.includes('smack') || dllNameLower.includes('bink');
-        const returnValue = isVideoCodec ? 0 : ERROR_NOT_SUPPORTED;
+        // A stub for a DLL we refuse to load answers "absent" (NULL) — see ThunkStub.absentDll.
+        const returnsNull = isVideoCodec || stub?.absentDll === true;
+        const returnValue = returnsNull ? 0 : this.unimplementedReturnFor(functionId, stub, name);
 
         // Caller (guest return address) — the RE entry point for "who hit this stub".
         const caller = (this.cachedDataView && this.isDataViewValid() && esp < this.memLength - 4)
@@ -6777,7 +6908,8 @@ export class ThunkDispatcher {
         if (stub) {
             Logger.warn(LogCategory.THUNK,
                 `UNIMPLEMENTED: ${stub.dllName}:${stub.functionName} (id=0x${functionId.toString(16)}) ` +
-                `ESP=0x${esp.toString(16)} argCount=${argCount} caller=0x${caller.toString(16)} -> returning ${isVideoCodec ? '0 (skip video)' : 'ERROR_NOT_SUPPORTED'}`);
+                `ESP=0x${esp.toString(16)} argCount=${argCount} caller=0x${caller.toString(16)} ` +
+                `-> returning ${returnsNull ? '0 (absent)' : `0x${returnValue.toString(16)}`}`);
             Logger.unimplemented(stub.dllName, stub.functionName);
             stubRegistry.record(stub.dllName, stub.functionName, functionId, caller);
         } else {
@@ -6790,6 +6922,10 @@ export class ThunkDispatcher {
             stubRegistry.record(ci > 0 ? name.slice(0, ci) : "", ci > 0 ? name.slice(ci + 1) : name, functionId, caller);
         }
         cpu.reg32[0] = returnValue;
+        // The other half of an honest refusal: a Win32 caller that sees FALSE/NULL asks
+        // GetLastError next, and without this it reads whatever the last real call left.
+        // ERROR_CALL_NOT_IMPLEMENTED is what Windows (and Wine's stubs) report for this.
+        try { this.ensureScheduler().setLastError(ERROR_CALL_NOT_IMPLEMENTED); } catch { /* pre-scheduler */ }
     }
 
     private _slowPathHandleThunkError(id: number, name: string, e: any, cpu: any): void {
@@ -7107,6 +7243,7 @@ export class ThunkDispatcher {
         this.writeBufCoalesceMaskTable.fill(0);
         this.wbufCoalescingEnabled = false;
         this.argCountsTable.fill(-1);
+        this.unimplementedReturnCache.clear();
         this.namesTable.fill(null);
         if (this._callbackManager) this._callbackManager.reset();
         this.winApiRing.reset();

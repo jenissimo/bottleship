@@ -537,8 +537,10 @@ class LoggerImpl {
         if (this.streamCallback) {
             const shouldStream = !this.streamCategories || this.streamCategories.has(category);
             if (shouldStream) {
-                // Apply rate limiting for high-frequency categories
-                if (this.shouldSample(category)) {
+                // Apply rate limiting for high-frequency categories — but never to an
+                // error or warning: those are the lines a crash window is read for, and
+                // dropping them makes the archive claim a fault simply never happened.
+                if (level <= LogLevel.WARN || this.shouldSample(category)) {
                     this.addToStreamBatch(entry);
                 }
             }
