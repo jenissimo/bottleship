@@ -111,8 +111,57 @@ export const CTL_IO_CFG_MAX_INFLIGHT = 19;
 /** 1 once the I/O worker has installed the SAB and is counting. A zero row with
  *  ARMED=0 means "nothing was counting", not "nothing happened". */
 export const CTL_IO_ARMED = 20;
+/** Bytes actually pulled over the network by this worker (cold + speculative), KiB.
+ *  The numerator of "cold network bytes per unique guest byte first touched" — the
+ *  only ratio that cannot be improved by the guest merely re-reading warm data. */
+export const CTL_IO_NET_KB = 21;
+/** Bytes of SPECULATIVELY fetched chunks that were evicted without ever being read
+ *  by a guest request, KiB. Named for what it counts: "never read", not "wasted" —
+ *  a chunk consumed by a different read than the one that motivated it is not in here. */
+export const CTL_IO_PREFETCH_EVICTED_UNREAD_KB = 22;
+/** Async (non-blocking) requests served over the postMessage channel. */
+export const CTL_IO_ASYNC_REQS = 23;
 
 export const CTL_WORDS = 32;
+
+/**
+ * The shape of the shared arena, as the compiling side sees it. Both workers import
+ * these constants from THIS file, so a mismatch can only come from a stale bundle —
+ * and a stale bundle here does not fail, it serves bytes from the wrong offsets.
+ * The guest ships its own view of the layout in `init` and the I/O worker refuses to
+ * serve when it disagrees, so the failure is loud instead of silent.
+ */
+export interface SabLayout {
+    ctlWords: number;
+    metaOffsetBytes: number;
+    metaWords: number;
+    dataOffsetBytes: number;
+    dataBytes: number;
+    totalBytes: number;
+}
+
+export function sabLayout(): SabLayout {
+    return {
+        ctlWords: CTL_WORDS,
+        metaOffsetBytes: META_OFFSET_BYTES,
+        metaWords: META_WORDS,
+        dataOffsetBytes: DATA_OFFSET_BYTES,
+        dataBytes: DATA_BYTES,
+        totalBytes: SAB_TOTAL_BYTES,
+    };
+}
+
+/** null when `remote` matches this build's layout; otherwise the first field that
+ *  differs, so the mismatch names itself in a log line. */
+export function layoutMismatch(remote: Partial<SabLayout> | undefined | null): string | null {
+    if (!remote) return "peer sent no layout";
+    const mine = sabLayout() as unknown as Record<string, number>;
+    const theirs = remote as unknown as Record<string, number>;
+    for (const k of Object.keys(mine)) {
+        if (theirs[k] !== mine[k]) return `${k}: peer ${String(theirs[k])} != ${mine[k]}`;
+    }
+    return null;
+}
 
 // ---- meta Float64Array indices (64-bit safe for >2 GB bundles) ----
 export const META_REQ_OFF = 0;
@@ -181,6 +230,9 @@ export interface IoWorkerStats {
     requestsNoNewFetch: number;
     evictions: number;
     residentKB: number;
+    netKB: number;
+    prefetchEvictedUnreadKB: number;
+    asyncRequests: number;
     config: { chunkKB: number; cacheMB: number; prefetchChunks: number; maxInflight: number };
 }
 
@@ -201,6 +253,9 @@ export function readIoWorkerStats(ctl: Int32Array): IoWorkerStats {
         requestsNoNewFetch: g(CTL_IO_REQS_NO_NEW_FETCH),
         evictions: g(CTL_IO_EVICTIONS),
         residentKB: g(CTL_IO_RESIDENT_KB),
+        netKB: g(CTL_IO_NET_KB),
+        prefetchEvictedUnreadKB: g(CTL_IO_PREFETCH_EVICTED_UNREAD_KB),
+        asyncRequests: g(CTL_IO_ASYNC_REQS),
         config: {
             chunkKB: g(CTL_IO_CFG_CHUNK_KB),
             cacheMB: g(CTL_IO_CFG_CACHE_MB),

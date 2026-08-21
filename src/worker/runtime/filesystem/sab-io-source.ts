@@ -19,9 +19,10 @@ import {
     META_OFFSET_BYTES, META_REQ_OFF, META_REQ_LEN, META_REQ_SEQ, META_WORDS,
     DATA_OFFSET_BYTES, DATA_BYTES,
     ST_IDLE, ST_REQ, ST_ERR, WAIT_TIMEOUT_MS,
-    readIoWorkerStats,
+    readIoWorkerStats, sabLayout,
 } from "./sab-io-protocol";
 import type { IoWorkerStats } from "./sab-io-protocol";
+import type { ReadHint } from "@bottleship/formats/zip";
 
 /**
  * Upper edges (ms) of the block-time histogram. Log-ish, because the two answers
@@ -71,10 +72,32 @@ export interface SabWaitStats {
     recent: { n: number; p50Ms: number; p95Ms: number; p99Ms: number; maxMs: number };
 }
 
+/** The async channel's own numbers. `maxInFlight` is the one that means anything:
+ *  wall time falls for free once a cache is warm, and a caller that awaits its reads
+ *  one at a time gets a promise-shaped blocking channel and no overlap at all. */
+export interface SabAsyncStats {
+    requests: number;
+    completed: number;
+    failed: number;
+    inFlight: number;
+    maxInFlight: number;
+    /** Summed request→response latency. Overlapped, so it exceeds wall time. */
+    latencyMs: number;
+    bytes: number;
+}
+
+/** The subset of `Worker` this source uses, so a test can drive the channel with a
+ *  stub instead of spawning the real I/O worker (which needs fetch + a live URL). */
+export interface SabWorkerLike {
+    postMessage(msg: unknown, transfer?: Transferable[]): void;
+    onmessage: ((e: MessageEvent) => void) | null;
+    terminate(): void;
+}
+
 export class SabIoSource implements ZipSource {
     readonly size: number;
 
-    private readonly worker: Worker;
+    private readonly worker: SabWorkerLike;
     private readonly ctl: Int32Array;
     private readonly meta: Float64Array;
     private readonly data: Uint8Array;
@@ -98,7 +121,19 @@ export class SabIoSource implements ZipSource {
     /** Request tag echoed back in CTL_RESP_SEQ — see sab-io-protocol. */
     private _seq = 0;
 
-    private constructor(worker: Worker, sab: SharedArrayBuffer, size: number) {
+    // ---- async channel (postMessage + transferable response; no SAB, no wait) ----
+    private _asyncId = 0;
+    private readonly _pending = new Map<number, {
+        resolve: (b: Uint8Array) => void; reject: (e: Error) => void; at: number; timer: ReturnType<typeof setTimeout>;
+    }>();
+    private _asyncRequests = 0;
+    private _asyncCompleted = 0;
+    private _asyncFailed = 0;
+    private _asyncMaxInFlight = 0;
+    private _asyncLatencyMs = 0;
+    private _asyncBytes = 0;
+
+    private constructor(worker: SabWorkerLike, sab: SharedArrayBuffer, size: number) {
         this.worker = worker;
         this.ctl = new Int32Array(sab, 0, CTL_WORDS);
         this.meta = new Float64Array(sab, META_OFFSET_BYTES, META_WORDS);
@@ -133,24 +168,50 @@ export class SabIoSource implements ZipSource {
             worker.onerror = (e: ErrorEvent) => { clearTimeout(timer); reject(new Error(`io-worker error: ${e.message}`)); };
             // Dev-only I/O tuning knob (prefetch window / concurrency / cache MB).
             const tune = (globalThis as unknown as { __wgbIoTune?: unknown }).__wgbIoTune;
-            worker.postMessage({ type: "init", sab, url, tune });
+            // The layout THIS build compiled against; the I/O worker refuses to serve if
+            // its own differs, because the failure mode of a silent disagreement is bytes
+            // read from the wrong offsets.
+            worker.postMessage({ type: "init", sab, url, tune, layout: sabLayout() });
         });
 
-        // Keep forwarding I/O-worker logs after init.
-        worker.onmessage = (e: MessageEvent) => {
-            if (e.data?.type === "log") Logger.log(LogCategory.SYSTEM, `[io-worker] ${e.data.msg}`);
-        };
-
-        return new SabIoSource(worker, sab, size);
+        const src = new SabIoSource(worker, sab, size);
+        worker.onmessage = (e: MessageEvent) => src.onWorkerMessage(e.data);
+        return src;
     }
 
-    readRangeSync(start: number, end: number): Uint8Array {
+    /** Bind a source to an already-created worker + SAB. `create` is the real entry
+     *  point; this exists so the async channel can be exercised against a stub worker. */
+    static attachForTest(worker: SabWorkerLike, sab: SharedArrayBuffer, size: number): SabIoSource {
+        const src = new SabIoSource(worker, sab, size);
+        worker.onmessage = (e: MessageEvent) => src.onWorkerMessage(e.data);
+        return src;
+    }
+
+    private onWorkerMessage(msg: { type?: string; msg?: string; id?: number; ok?: boolean; buf?: ArrayBuffer; message?: string }): void {
+        if (msg?.type === "log") { Logger.log(LogCategory.SYSTEM, `[io-worker] ${msg.msg}`); return; }
+        if (msg?.type !== "aresp") return;
+        const p = this._pending.get(msg.id!);
+        if (!p) return; // a response to a request that already timed out
+        this._pending.delete(msg.id!);
+        clearTimeout(p.timer);
+        this._asyncLatencyMs += performance.now() - p.at;
+        if (msg.ok && msg.buf) {
+            this._asyncCompleted++;
+            this._asyncBytes += msg.buf.byteLength;
+            p.resolve(new Uint8Array(msg.buf));
+        } else {
+            this._asyncFailed++;
+            p.reject(new Error(`SabIoSource: async read failed: ${msg.message ?? "unknown"}`));
+        }
+    }
+
+    readRangeSync(start: number, end: number, hint?: ReadHint): Uint8Array {
         const s = Math.max(0, Math.min(Math.floor(start), this.size));
         const e = Math.max(s, Math.min(Math.floor(end), this.size));
         if (e <= s) return new Uint8Array(0);
 
         const total = e - s;
-        if (total <= DATA_BYTES) return this.request(s, total);
+        if (total <= DATA_BYTES) return this.request(s, total, hint);
 
         // A read larger than the SAB payload arena (rare — oversized central
         // directory): satisfy it in DATA_BYTES-sized pieces.
@@ -158,17 +219,37 @@ export class SabIoSource implements ZipSource {
         let off = 0;
         while (off < total) {
             const chunk = Math.min(DATA_BYTES, total - off);
-            out.set(this.request(s + off, chunk), off);
+            out.set(this.request(s + off, chunk, hint), off);
             off += chunk;
         }
         return out;
     }
 
-    /** Async read (used by ZipArchive.init and non-sync consumers). In a worker
-     *  the sync round-trip is available, so reuse it — init is a short, serial
-     *  prelude, so briefly blocking there is fine. */
-    async readRange(start: number, end: number): Promise<Uint8Array> {
-        return this.readRangeSync(start, end);
+    /**
+     * Async read. NOT the sync round-trip wearing a Promise: the request goes over
+     * postMessage, the response comes back as a transferred ArrayBuffer, and nothing
+     * on this path touches Atomics.wait — so many reads are in flight at once and the
+     * guest's event loop (other threads, the audio pump, the frame loop) keeps running
+     * while they land. This is what makes a background prefetcher over this source
+     * background work rather than more blocking on the guest thread.
+     */
+    readRange(start: number, end: number, hint?: ReadHint): Promise<Uint8Array> {
+        const s = Math.max(0, Math.min(Math.floor(start), this.size));
+        const e = Math.max(s, Math.min(Math.floor(end), this.size));
+        if (e <= s) return Promise.resolve(new Uint8Array(0));
+
+        const id = ++this._asyncId;
+        this._asyncRequests++;
+        return new Promise<Uint8Array>((resolve, reject) => {
+            const timer = setTimeout(() => {
+                if (!this._pending.delete(id)) return;
+                this._asyncFailed++;
+                reject(new Error(`SabIoSource: async read timed out (off=${s} len=${e - s})`));
+            }, WAIT_TIMEOUT_MS);
+            this._pending.set(id, { resolve, reject, at: performance.now(), timer });
+            if (this._pending.size > this._asyncMaxInFlight) this._asyncMaxInFlight = this._pending.size;
+            this.worker.postMessage({ type: "areq", id, off: s, len: e - s, hint });
+        });
     }
 
     /** Monotonic request tag; 0 is reserved as "no response yet". */
@@ -179,7 +260,7 @@ export class SabIoSource implements ZipSource {
     }
 
     /** One SAB request/response round-trip. `len` must be ≤ DATA_BYTES. */
-    private request(off: number, len: number): Uint8Array {
+    private request(off: number, len: number, hint?: ReadHint): Uint8Array {
         this._requests++;
         const seq = this.nextSeq();
         this.meta[META_REQ_OFF] = off;
@@ -187,7 +268,10 @@ export class SabIoSource implements ZipSource {
         this.meta[META_REQ_SEQ] = seq;
         Atomics.store(this.ctl, CTL_ERRNO, 0);
         Atomics.store(this.ctl, CTL_STATE, ST_REQ);
-        this.worker.postMessage({ type: "req" });
+        // The hint rides the wakeup message rather than the SAB: the request meta is a
+        // single fixed slot and widening it is a wire-format change, while this message
+        // is already sent per request and carries the same ordering.
+        this.worker.postMessage({ type: "req", hint });
 
         // Park on the SEQUENCE word, not on STATE: STATE only says "a response exists",
         // and after an abandoned request that can be someone else's. Re-loading the
@@ -239,7 +323,7 @@ export class SabIoSource implements ZipSource {
 
     /** Diagnostics: guest-side counters + the I/O worker's published counters
      *  (read straight off the SAB, no message round-trip). */
-    stats(): { wait: SabWaitStats; io: IoWorkerStats } {
+    stats(): { wait: SabWaitStats; async: SabAsyncStats; io: IoWorkerStats } {
         const n = this._recentN;
         const sorted = Array.prototype.slice.call(this._recent, 0, n).sort((a: number, b: number) => a - b) as number[];
         const q = (p: number) => (n === 0 ? 0 : sorted[Math.min(n - 1, Math.floor(p * n))]);
@@ -256,11 +340,27 @@ export class SabIoSource implements ZipSource {
                 bucketsMs: Array.from(WAIT_BUCKETS_MS),
                 recent: { n, p50Ms: q(0.5), p95Ms: q(0.95), p99Ms: q(0.99), maxMs: n ? sorted[n - 1] : 0 },
             },
+            async: {
+                requests: this._asyncRequests,
+                completed: this._asyncCompleted,
+                failed: this._asyncFailed,
+                inFlight: this._pending.size,
+                maxInFlight: this._asyncMaxInFlight,
+                latencyMs: +this._asyncLatencyMs.toFixed(2),
+                bytes: this._asyncBytes,
+            },
             io: readIoWorkerStats(this.ctl),
         };
     }
 
     close(): void {
+        // Settle everything still in flight: after terminate() no response can arrive,
+        // and a prefetch awaiting a promise that never settles pins its caller forever.
+        for (const [, p] of this._pending) {
+            clearTimeout(p.timer);
+            p.reject(new Error("SabIoSource: closed"));
+        }
+        this._pending.clear();
         try { this.worker.terminate(); } catch { /* best-effort */ }
     }
 }
