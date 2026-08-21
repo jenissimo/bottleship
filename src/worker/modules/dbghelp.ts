@@ -7,6 +7,9 @@ import { Mem } from "../core/memory/mem-accessor";
 import { encodeAnsi } from "./codepage-utils";
 import { isValidAddress } from "../core/memory/address-guard";
 import { System } from "../core/system";
+import {
+    stackWalk32, stackWalk64, symGetModuleBase32, symGetModuleBase64,
+} from "./dbghelp-stackwalk";
 
 const MAX_PATH = 260;
 const ERROR_FILE_NOT_FOUND = 2;
@@ -15,14 +18,13 @@ const ERROR_INVALID_PARAMETER = 87;
 const ERROR_INSUFFICIENT_BUFFER = 122;
 const ERROR_INVALID_ADDRESS = 487;
 
-export class DbgHelp implements IModule {
-    name = "dbghelp";
-    exports: Record<string, ThunkImplementation> = {};
-
-    initialize(_process: Process): void {}
-
-    constructor(_process: Process) {
-        const exports = this.exports;
+/**
+ * The dbghelp export surface, as a table rather than a class member: imagehlp.dll offers
+ * the very same functions (on NT the two are built from one source and imagehlp re-exports
+ * them), so both modules serve THIS table instead of two implementations free to drift.
+ */
+export function createDbgHelpExports(): Record<string, ThunkImplementation> {
+        const exports: Record<string, ThunkImplementation> = {};
 
         // BOOL SymInitialize(HANDLE hProcess, PCSTR UserSearchPath, BOOL fInvadeProcess)
         exports['SymInitialize'] = () => 1; // TRUE
@@ -37,13 +39,18 @@ export class DbgHelp implements IModule {
         exports['SymGetOptions'] = () => 0;
 
         // DWORD SymGetModuleBase(HANDLE hProcess, DWORD dwAddr)
-        exports['SymGetModuleBase'] = () => 0;
+        exports['SymGetModuleBase'] = symGetModuleBase32;
 
         // DWORD64 SymGetModuleBase64(HANDLE hProcess, DWORD64 dwAddr)
-        exports['SymGetModuleBase64'] = () => 0;
+        exports['SymGetModuleBase64'] = symGetModuleBase64;
 
-        // DWORD SymLoadModule(HANDLE, HANDLE, PCSTR, PCSTR, DWORD, DWORD)
-        exports['SymLoadModule'] = () => 0;
+        // DWORD SymLoadModule(HANDLE, HANDLE, PCSTR, PCSTR, DWORD BaseOfDll, DWORD)
+        // The documented return is the module's base, and the caller already told us which
+        // one — the *64 form takes BaseOfDll as a DWORD64, whose low half sits at the same
+        // argument index. Zero means "work it out from the file", which we cannot.
+        const symLoadModule: ThunkImplementation = (_ctx, _mem, args) => args[4] >>> 0;
+        exports['SymLoadModule'] = symLoadModule;
+        exports['SymLoadModule64'] = symLoadModule;
 
         // PVOID SymFunctionTableAccess(HANDLE hProcess, DWORD AddrBase)
         exports['SymFunctionTableAccess'] = () => 0;
@@ -63,13 +70,21 @@ export class DbgHelp implements IModule {
         };
 
         // BOOL SymGetSymFromAddr(HANDLE, DWORD, PDWORD, PIMAGEHLP_SYMBOL)
-        exports['SymGetSymFromAddr'] = () => 0; // FALSE
+        // We carry no symbol table; FALSE + ERROR_INVALID_ADDRESS is the "no symbol here"
+        // answer, and callers fall back to printing module+offset.
+        const symGetSymFromAddr: ThunkImplementation = () => {
+            System.getInstance().scheduler.setLastError(ERROR_INVALID_ADDRESS);
+            return 0;
+        };
+        exports['SymGetSymFromAddr'] = symGetSymFromAddr;
+        exports['SymGetSymFromAddr64'] = symGetSymFromAddr;
+        exports['SymFromAddr'] = symGetSymFromAddr;
 
         // BOOL StackWalk(DWORD, HANDLE, HANDLE, LPSTACKFRAME, PVOID, PREAD_PROCESS_MEMORY_ROUTINE, PFUNCTION_TABLE_ACCESS_ROUTINE, PGET_MODULE_BASE_ROUTINE, PTRANSLATE_ADDRESS_ROUTINE)
-        exports['StackWalk'] = () => 0; // FALSE — no frames
+        exports['StackWalk'] = stackWalk32;
 
         // BOOL StackWalk64(DWORD, HANDLE, HANDLE, LPSTACKFRAME64, PVOID, PREAD_PROCESS_MEMORY_ROUTINE64, PFUNCTION_TABLE_ACCESS_ROUTINE64, PGET_MODULE_BASE_ROUTINE64, PTRANSLATE_ADDRESS_ROUTINE64)
-        exports['StackWalk64'] = () => 0; // FALSE — no frames
+        exports['StackWalk64'] = stackWalk64;
 
         // DWORD UnDecorateSymbolName(PCSTR name, PSTR out, DWORD maxLen, DWORD flags)
         // We carry no MSVC demangler; the real function also passes an undecorated name
@@ -180,5 +195,15 @@ export class DbgHelp implements IModule {
             Mem.writeUint8(outPtr + bytes.length, 0);
             return 1;
         };
-    }
+
+        return exports;
+}
+
+export class DbgHelp implements IModule {
+    name = "dbghelp";
+    exports: Record<string, ThunkImplementation> = createDbgHelpExports();
+
+    initialize(_process: Process): void {}
+
+    constructor(_process?: Process) {}
 }

@@ -9,6 +9,7 @@ const buildParams = (count: number): ParameterDescriptor[] => {
 };
 
 const makeFunc = (name: string, argCount: number, overrides: Partial<FunctionDescriptor> = {}): FunctionDescriptor => ({
+    ...overrides,
     name,
     params: overrides.params ?? buildParams(argCount),
     returnType: overrides.returnType ?? "u32",
@@ -27,11 +28,13 @@ export const dbghelpModule: ModuleDescriptor = {
         // and SymFromAddr take one, so their RET N is one dword wider than the 32-bit form.
         makeFunc("SymGetModuleBase64", 3),
         makeFunc("SymLoadModule", 6),
+        makeFunc("SymLoadModule64", 7),
         makeFunc("SymFunctionTableAccess", 2),
         makeFunc("SymFunctionTableAccess64", 3),
         makeFunc("SymGetLineFromAddr", 4),
         makeFunc("SymGetLineFromAddr64", 5),
         makeFunc("SymGetSymFromAddr", 4),
+        makeFunc("SymGetSymFromAddr64", 5),
         makeFunc("StackWalk", 9),
         makeFunc("StackWalk64", 9),
         makeFunc("UnDecorateSymbolName", 4),

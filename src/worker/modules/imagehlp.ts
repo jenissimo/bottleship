@@ -6,6 +6,7 @@ import { Mem } from "../core/memory/mem-accessor";
 import { isValidAddress } from "../core/memory/address-guard";
 import { System } from "../core/system";
 import { Logger, LogCategory } from "../core/logger";
+import { createDbgHelpExports } from "./dbghelp";
 
 const TRUE = 1;
 const FALSE = 0;
@@ -51,6 +52,13 @@ export class ImageHlp implements IModule {
 
     initialize(process: Process): void {
         const system = System.getInstance();
+
+        // imagehlp.dll exports the whole Sym*/StackWalk* surface in its own right (NT builds
+        // both DLLs from one source and re-exports them here), and GetProcAddress is scoped
+        // by HMODULE — so a crash handler that loads imagehlp rather than dbghelp must find
+        // them under THIS handle or it silently loses its stack walk. Assigned first so
+        // imagehlp's own MapAndLoad/UnMapAndLoad/ImageRvaToVa below always win.
+        Object.assign(this.exports, createDbgHelpExports());
 
         /**
          * Resolve an image name the way MapAndLoad does — as given, then against DllPath,
