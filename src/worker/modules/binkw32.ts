@@ -854,10 +854,13 @@ export class BinkW32 implements IModule {
 
             await this.ensureLayout();
 
-            // BINKFILEHANDLE: arg0 is a Win32 HANDLE, not a string pointer.
-            // Different Bink SDK versions use different flag bits:
-            //   Bink 1.x: 0x00800000, some versions: 0x08000000
-            const isFileHandle = !!(flags & (0x00800000 | 0x08000000));
+            // BINKFILEHANDLE: arg0 is a Win32 HANDLE, not a string pointer. It is ONE bit —
+            // 0x08000000 is its NEIGHBOUR, BINKNOTHREADEDIO, which says nothing about arg0
+            // and which titles pass with an ordinary filename (the rest of the block, in
+            // ascending order: BINKIOSIZE 0x01000000, BINKIOPROCESSOR 0x02000000,
+            // BINKFROMMEMORY 0x04000000). Reading a filename pointer as a handle fails the
+            // open, and a game that never checks HBINK dereferences NULL a frame later.
+            const isFileHandle = !!(flags & 0x00800000);
 
             let bytes: Uint8Array | null = null;
             let label: string;
