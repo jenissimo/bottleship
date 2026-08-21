@@ -20,6 +20,8 @@ import { registerBreakpointCommands } from "./cmds/breakpoints";
 import { registerTextureCommands } from "./cmds/textures";
 import { registerGlCommands } from "./cmds/gl";
 import { registerFsCommands } from "./cmds/fs";
+import { registerIoCommands } from "./cmds/io";
+import { registerPacingCommands } from "./cmds/pacing";
 import { registerFixtureCommands } from "./cmds/fixture";
 import { registerRegistryCommands } from "./cmds/reg";
 import { registerWmTraceCommands } from "./cmds/wm-trace";
@@ -54,6 +56,8 @@ export function installHarnessCommands(): void {
     registerGlCommands(harnessService);
     registerGpuCommands(harnessService);
     registerFsCommands(harnessService);
+    registerIoCommands(harnessService);
+    registerPacingCommands(harnessService);
     registerFixtureCommands(harnessService);
     registerRegistryCommands(harnessService);
     registerWmTraceCommands(harnessService);

@@ -1,0 +1,98 @@
+/**
+ * Frame-pacing readout: the inter-present intervals as a SEQUENCE, plus what that
+ * sequence's shape implies.
+ *
+ * `frameReport` answers "how bad" — percentiles, buckets, frames over budget. It cannot
+ * answer "in what pattern", because every summary in it destroys ordering. A pacing
+ * oscillation is a property of the sequence: a beat between two clocks drifts and snaps
+ * with a period, and that period is the fingerprint that says WHICH pair of our constants
+ * produced it. So this verb hands back the raw series and a small amount of arithmetic
+ * over it, and deliberately does not smooth anything.
+ *
+ * The series comes from the stats overlay's ring, which records one sample per present
+ * with nothing decimated (`statsOverlay.samples()`), so it must be enabled to collect —
+ * the report says so rather than returning an empty series that reads as "no jitter".
+ */
+
+import { statsOverlay } from "../../core/stats-overlay";
+import type { HarnessService } from "../service";
+
+/** Mean, and the mean absolute deviation from it — a jitter measure that does not assume a shape. */
+function centre(xs: number[]): { meanMs: number; madMs: number; minMs: number; maxMs: number } {
+    let sum = 0, min = Infinity, max = 0;
+    for (const x of xs) { sum += x; if (x < min) min = x; if (x > max) max = x; }
+    const meanMs = sum / xs.length;
+    let dev = 0;
+    for (const x of xs) dev += Math.abs(x - meanMs);
+    return { meanMs, madMs: dev / xs.length, minMs: min, maxMs: max };
+}
+
+/**
+ * Dominant period of the oscillation, in FRAMES, by autocorrelation of the mean-removed
+ * series. Returns null when no lag beats the noise — an honest "no periodicity found"
+ * rather than the argmax of a flat curve, which would always name something.
+ */
+function dominantPeriod(xs: number[], meanMs: number): { lagFrames: number; strength: number } | null {
+    const n = xs.length;
+    if (n < 16) return null;
+    const d = xs.map((x) => x - meanMs);
+    let energy = 0;
+    for (const v of d) energy += v * v;
+    if (energy <= 0) return null;
+
+    const maxLag = Math.floor(n / 2);
+    let bestLag = 0, bestR = 0;
+    for (let lag = 2; lag <= maxLag; lag++) {
+        let acc = 0;
+        for (let i = 0; i + lag < n; i++) acc += d[i]! * d[i + lag]!;
+        const r = acc / energy;
+        if (r > bestR) { bestR = r; bestLag = lag; }
+    }
+    // A genuine beat correlates strongly with itself one period away. Below this the
+    // "best" lag is just the largest of many equally meaningless numbers.
+    return bestR >= 0.2 ? { lagFrames: bestLag, strength: +bestR.toFixed(3) } : null;
+}
+
+export function registerPacingCommands(svc: HarnessService): void {
+    /**
+     * framePacing() — the raw inter-present series and its shape.
+     *
+     * Read `series` when you want to plot or fit it yourself; read `period` when you want
+     * the beat's fingerprint. `armed:false` means the overlay was not collecting, which is
+     * NOT the same as "the pacing was smooth".
+     */
+    svc.register("framePacing", () => {
+        if (!statsOverlay.isEnabled()) {
+            return {
+                armed: false,
+                reason: "stats overlay is off, so no per-present samples are being recorded — "
+                    + "enable it and let the window fill before reading. An empty series here "
+                    + "means 'not measured', never 'no jitter'.",
+                series: [],
+            };
+        }
+        const series = statsOverlay.samples().map((v) => +v.toFixed(3));
+        if (series.length === 0) {
+            return { armed: true, n: 0, reason: "overlay armed but no presents recorded yet", series };
+        }
+        const c = centre(series);
+        const period = dominantPeriod(series, c.meanMs);
+        return {
+            armed: true,
+            n: series.length,
+            windowMs: +series.reduce((a, b) => a + b, 0).toFixed(1),
+            meanMs: +c.meanMs.toFixed(3),
+            /** Mean absolute deviation: how far a typical frame sits from the mean. */
+            jitterMadMs: +c.madMs.toFixed(3),
+            minMs: +c.minMs.toFixed(3),
+            maxMs: +c.maxMs.toFixed(3),
+            /** Peak-to-peak of the whole window; with a beat this is the swing, not an outlier. */
+            spreadMs: +(c.maxMs - c.minMs).toFixed(3),
+            period,
+            periodNote: period
+                ? `dominant lag ${period.lagFrames} frames (~${(period.lagFrames * c.meanMs).toFixed(0)} ms), autocorrelation ${period.strength}`
+                : "no lag correlated above 0.2 — the variation is not periodic at this window length, or the window is too short to see its period",
+            series,
+        };
+    });
+}
