@@ -16,12 +16,60 @@ import type { ZipSource } from "@bottleship/formats/zip";
 import { Logger, LogCategory } from "../../core/logger";
 import {
     SAB_TOTAL_BYTES, CTL_WORDS, CTL_STATE, CTL_RESP_LEN, CTL_ERRNO, CTL_RESP_SEQ,
-    CTL_IO_NET_FETCHES, CTL_IO_PREFETCHES, CTL_IO_CACHE_SERVES, CTL_REQS,
     META_OFFSET_BYTES, META_REQ_OFF, META_REQ_LEN, META_REQ_SEQ, META_WORDS,
     DATA_OFFSET_BYTES, DATA_BYTES,
     ST_IDLE, ST_REQ, ST_ERR, WAIT_TIMEOUT_MS,
+    readIoWorkerStats,
 } from "./sab-io-protocol";
 import type { IoWorkerStats } from "./sab-io-protocol";
+
+/**
+ * Upper edges (ms) of the block-time histogram. Log-ish, because the two answers
+ * this histogram has to separate are three orders of magnitude apart: a SAB
+ * round-trip (tens of microseconds) and a cold network fetch (tens of ms).
+ * A fat tail past 20 ms means bandwidth, not round-trip — which decides whether
+ * parking the caller or fixing the prefetcher comes first.
+ */
+export const WAIT_BUCKETS_MS = [
+    0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, Infinity,
+] as const;
+
+function bucketOf(ms: number): number {
+    for (let i = 0; i < WAIT_BUCKETS_MS.length; i++) if (ms <= WAIT_BUCKETS_MS[i]) return i;
+    return WAIT_BUCKETS_MS.length - 1;
+}
+
+/** Per-request block time, exact, over the most recent window. The histogram is
+ *  lifetime but bucket-quantized; this is quantization-free but bounded. Both are
+ *  reported, and they must broadly agree. */
+const RECENT_SAMPLES = 4096;
+
+export interface SabWaitStats {
+    /** Requests issued (one SAB round-trip each). */
+    requests: number;
+    /** Atomics.wait CALLS. Note this is ≥ requests by construction: the first
+     *  iteration cannot see a response published microseconds earlier in the same
+     *  JS turn, because the I/O worker has not been scheduled yet. On its own it
+     *  says nothing about blocking — that is `waitsBlocked`. */
+    waitCalls: number;
+    /** Waits that actually parked and were woken by the I/O worker's notify. */
+    waitsBlocked: number;
+    /** Waits that returned "not-equal" — the response landed between the load and
+     *  the wait, so the guest never blocked. The only way this counter moves is a
+     *  genuinely free round-trip. */
+    waitsNotEqual: number;
+    /** Waits that hit WAIT_TIMEOUT_MS. */
+    waitsTimedOut: number;
+    timeouts: number;
+    /** Wall-clock ms spent inside Atomics.wait, summed. EXCLUDES the postMessage
+     *  marshalling before it and the copy-out after, so it reads slightly BELOW the
+     *  self-time a profiler attributes to `request`. */
+    waitMs: number;
+    /** Per-request block time, lifetime, quantized to WAIT_BUCKETS_MS. */
+    histogram: number[];
+    bucketsMs: number[];
+    recent: { n: number; p50Ms: number; p95Ms: number; p99Ms: number; maxMs: number };
+}
 
 export class SabIoSource implements ZipSource {
     readonly size: number;
@@ -33,8 +81,20 @@ export class SabIoSource implements ZipSource {
 
     // Guest-side interplay counters (mirror CachedSource's for diagnostics).
     private _requests = 0;
-    private _waits = 0;
+    private _waitCalls = 0;
+    private _waitsBlocked = 0;
+    private _waitsNotEqual = 0;
+    private _waitsTimedOut = 0;
     private _timeouts = 0;
+    /** Accumulated ms inside Atomics.wait. Two performance.now() calls per wait —
+     *  ~100 ns each against a round-trip measured in tens of microseconds at best,
+     *  so under 0.5% of the thing being measured, and zero cost on the warm path
+     *  (CachedSource serves those without ever reaching here). */
+    private _waitMs = 0;
+    private readonly _hist = new Float64Array(WAIT_BUCKETS_MS.length);
+    private readonly _recent = new Float64Array(RECENT_SAMPLES);
+    private _recentN = 0;
+    private _recentPos = 0;
     /** Request tag echoed back in CTL_RESP_SEQ — see sab-io-protocol. */
     private _seq = 0;
 
@@ -133,17 +193,28 @@ export class SabIoSource implements ZipSource {
         // and after an abandoned request that can be someone else's. Re-loading the
         // observed value before each wait closes the lost-wakeup race — if the worker
         // published between the load and the wait, Atomics.wait returns "not-equal".
+        // Bracket the BLOCK, not the loop: `_waitCalls` is what the old `waits` counted
+        // and it can never fall below `requests`, so only the bracketed time and the
+        // wait's own return value say whether the guest actually stopped.
+        let blockedMs = 0;
         for (;;) {
             const seen = Atomics.load(this.ctl, CTL_RESP_SEQ);
             if (seen === seq) break;
-            this._waits++;
+            this._waitCalls++;
+            const t0 = performance.now();
             const r = Atomics.wait(this.ctl, CTL_RESP_SEQ, seen, WAIT_TIMEOUT_MS);
+            blockedMs += performance.now() - t0;
+            if (r === "ok") this._waitsBlocked++;
+            else if (r === "not-equal") this._waitsNotEqual++;
+            else this._waitsTimedOut++;
             if (r === "timed-out" && Atomics.load(this.ctl, CTL_RESP_SEQ) !== seq) {
                 this._timeouts++;
+                this.recordBlock(blockedMs);
                 Atomics.store(this.ctl, CTL_STATE, ST_IDLE);
                 throw new Error(`SabIoSource: read timed out (off=${off} len=${len} seq=${seq})`);
             }
         }
+        this.recordBlock(blockedMs);
 
         if (Atomics.load(this.ctl, CTL_STATE) === ST_ERR) {
             Atomics.store(this.ctl, CTL_STATE, ST_IDLE);
@@ -157,19 +228,35 @@ export class SabIoSource implements ZipSource {
         return buf;
     }
 
+    /** One request's total block time (0 when the response was already there). */
+    private recordBlock(ms: number): void {
+        this._waitMs += ms;
+        this._hist[bucketOf(ms)]++;
+        this._recent[this._recentPos] = ms;
+        this._recentPos = (this._recentPos + 1) % RECENT_SAMPLES;
+        if (this._recentN < RECENT_SAMPLES) this._recentN++;
+    }
+
     /** Diagnostics: guest-side counters + the I/O worker's published counters
      *  (read straight off the SAB, no message round-trip). */
-    stats(): { requests: number; waits: number; timeouts: number; io: IoWorkerStats } {
+    stats(): { wait: SabWaitStats; io: IoWorkerStats } {
+        const n = this._recentN;
+        const sorted = Array.prototype.slice.call(this._recent, 0, n).sort((a: number, b: number) => a - b) as number[];
+        const q = (p: number) => (n === 0 ? 0 : sorted[Math.min(n - 1, Math.floor(p * n))]);
         return {
-            requests: this._requests,
-            waits: this._waits,
-            timeouts: this._timeouts,
-            io: {
-                netFetches: Atomics.load(this.ctl, CTL_IO_NET_FETCHES),
-                prefetches: Atomics.load(this.ctl, CTL_IO_PREFETCHES),
-                cacheServes: Atomics.load(this.ctl, CTL_IO_CACHE_SERVES),
-                requests: Atomics.load(this.ctl, CTL_REQS),
+            wait: {
+                requests: this._requests,
+                waitCalls: this._waitCalls,
+                waitsBlocked: this._waitsBlocked,
+                waitsNotEqual: this._waitsNotEqual,
+                waitsTimedOut: this._waitsTimedOut,
+                timeouts: this._timeouts,
+                waitMs: this._waitMs,
+                histogram: Array.from(this._hist),
+                bucketsMs: Array.from(WAIT_BUCKETS_MS),
+                recent: { n, p50Ms: q(0.5), p95Ms: q(0.95), p99Ms: q(0.99), maxMs: n ? sorted[n - 1] : 0 },
             },
+            io: readIoWorkerStats(this.ctl),
         };
     }
 

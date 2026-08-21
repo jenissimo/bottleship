@@ -16,7 +16,12 @@ import { HttpRangeSource } from "@bottleship/formats/zip";
 import type { ZipSource } from "@bottleship/formats/zip";
 import {
     CTL_WORDS,
-    CTL_IO_NET_FETCHES, CTL_IO_PREFETCHES, CTL_IO_CACHE_SERVES, CTL_REQS,
+    CTL_IO_NET_FETCHES, CTL_IO_PREFETCHES, CTL_REQS,
+    CTL_IO_CHUNKS_NEEDED, CTL_IO_CHUNKS_RESIDENT_HIT, CTL_IO_CHUNKS_JOINED_INFLIGHT,
+    CTL_IO_CHUNKS_FETCHED_COLD, CTL_IO_CHUNKS_REFETCHED_AFTER_EVICT,
+    CTL_IO_REQS_ALL_RESIDENT, CTL_IO_REQS_NO_NEW_FETCH,
+    CTL_IO_EVICTIONS, CTL_IO_RESIDENT_KB, CTL_IO_ARMED,
+    CTL_IO_CFG_CHUNK_KB, CTL_IO_CFG_CACHE_MB, CTL_IO_CFG_PREFETCH_CHUNKS, CTL_IO_CFG_MAX_INFLIGHT,
     META_OFFSET_BYTES, META_REQ_OFF, META_REQ_LEN, META_REQ_SEQ, META_WORDS,
     DATA_OFFSET_BYTES, DATA_BYTES,
     publishResponse,
@@ -55,8 +60,39 @@ let residentBytes = 0;
 
 let netFetches = 0;   // cold, on the guest's critical path
 let prefetches = 0;   // speculative, ahead of the cursor
-let cacheServes = 0;  // requests answered with zero cold fetch
 let requests = 0;
+let evictions = 0;
+
+// Per-chunk accounting for the chunks a GUEST request needed. The three outcomes
+// partition `chunksNeeded`, so the report can assert they add up — the check the
+// counter these replace never had.
+let chunksNeeded = 0;
+let chunksResidentHit = 0;
+let chunksJoinedInflight = 0;
+let chunksFetchedCold = 0;
+let requestsAllResident = 0;
+let requestsNoNewFetch = 0;
+let chunksRefetchedAfterEvict = 0;
+
+/** Recently-evicted chunk indices, so a fetch of a chunk we already had (and threw
+ *  away) is identifiable. A bounded ring: `evictedCount` is the multiset, `evictedRing`
+ *  the eviction order, so an index that falls out of the window stops being counted
+ *  rather than accumulating forever. Sized to ~one LRU's worth of 2 MiB chunks. */
+const EVICTED_RING = 4096;
+const evictedRing = new Int32Array(EVICTED_RING).fill(-1);
+const evictedCount = new Map<number, number>();
+let evictedPos = 0;
+
+function noteEvicted(ci: number): void {
+    const old = evictedRing[evictedPos];
+    if (old >= 0) {
+        const n = (evictedCount.get(old) ?? 1) - 1;
+        if (n > 0) evictedCount.set(old, n); else evictedCount.delete(old);
+    }
+    evictedRing[evictedPos] = ci;
+    evictedPos = (evictedPos + 1) % EVICTED_RING;
+    evictedCount.set(ci, (evictedCount.get(ci) ?? 0) + 1);
+}
 
 function touch(ci: number): void {
     const i = lru.indexOf(ci);
@@ -68,7 +104,7 @@ function evictIfNeeded(): void {
     while (residentBytes > MAX_CACHE_BYTES && lru.length > 1) {
         const victim = lru.shift()!;
         const b = chunks.get(victim);
-        if (b) { residentBytes -= b.byteLength; chunks.delete(victim); }
+        if (b) { residentBytes -= b.byteLength; chunks.delete(victim); evictions++; noteEvicted(victim); }
     }
 }
 
@@ -82,6 +118,7 @@ function getChunk(ci: number, prefetch: boolean): Promise<Uint8Array> {
     const src = source!;
     const start = ci * CHUNK;
     const end = Math.min(src.size, start + CHUNK);
+    if (evictedCount.has(ci)) chunksRefetchedAfterEvict++;
     if (prefetch) prefetches++; else netFetches++;
     const p = src.readRange(start, end)
         .then((buf) => {
@@ -115,8 +152,23 @@ async function serve(off: number, len: number): Promise<Uint8Array> {
     const e = Math.min(src.size, off + len);
     const first = Math.floor(off / CHUNK);
     const last = Math.floor((e - 1) / CHUNK);
-    const allResident = (() => { for (let c = first; c <= last; c++) if (!chunks.has(c)) return false; return true; })();
-    if (allResident) cacheServes++;
+
+    // Classify BEFORE fetching: once getChunk runs, a chunk it started is resident-or-
+    // in-flight and the distinction the counters exist for is gone. A chunk already in
+    // `inflight` is a prefetch this request rides on — the case the old `cacheServes`
+    // scored as a miss.
+    let resident = 0, joined = 0, cold = 0;
+    for (let c = first; c <= last; c++) {
+        if (chunks.has(c)) resident++;
+        else if (inflight.has(c)) joined++;
+        else cold++;
+    }
+    chunksNeeded += last - first + 1;
+    chunksResidentHit += resident;
+    chunksJoinedInflight += joined;
+    chunksFetchedCold += cold;
+    if (cold === 0 && joined === 0) requestsAllResident++;
+    if (cold === 0) requestsNoNewFetch++;
 
     const need: Array<Promise<Uint8Array>> = [];
     for (let c = first; c <= last; c++) need.push(getChunk(c, false));
@@ -152,12 +204,24 @@ function prefetchAhead(fromOff: number): void {
     }
 }
 
+/** Publish the counters into the SAB. Called after each request completes, so a
+ *  purely prefetch-driven change (an eviction, a speculative fetch) becomes visible
+ *  at the next request rather than instantly — a report taken mid-idle can lag the
+ *  worker's true state by one request. */
 function publishStats(): void {
     if (!ctl) return;
     Atomics.store(ctl, CTL_IO_NET_FETCHES, netFetches | 0);
     Atomics.store(ctl, CTL_IO_PREFETCHES, prefetches | 0);
-    Atomics.store(ctl, CTL_IO_CACHE_SERVES, cacheServes | 0);
     Atomics.store(ctl, CTL_REQS, requests | 0);
+    Atomics.store(ctl, CTL_IO_CHUNKS_NEEDED, chunksNeeded | 0);
+    Atomics.store(ctl, CTL_IO_CHUNKS_RESIDENT_HIT, chunksResidentHit | 0);
+    Atomics.store(ctl, CTL_IO_CHUNKS_JOINED_INFLIGHT, chunksJoinedInflight | 0);
+    Atomics.store(ctl, CTL_IO_CHUNKS_FETCHED_COLD, chunksFetchedCold | 0);
+    Atomics.store(ctl, CTL_IO_CHUNKS_REFETCHED_AFTER_EVICT, chunksRefetchedAfterEvict | 0);
+    Atomics.store(ctl, CTL_IO_REQS_ALL_RESIDENT, requestsAllResident | 0);
+    Atomics.store(ctl, CTL_IO_REQS_NO_NEW_FETCH, requestsNoNewFetch | 0);
+    Atomics.store(ctl, CTL_IO_EVICTIONS, evictions | 0);
+    Atomics.store(ctl, CTL_IO_RESIDENT_KB, (residentBytes / 1024) | 0);
 }
 
 /** Sequence of the newest request the guest published. A completion for anything older
@@ -199,6 +263,13 @@ self.onmessage = (e: MessageEvent) => {
             if (typeof tune.maxInflight === "number") MAX_INFLIGHT = Math.max(1, tune.maxInflight | 0);
             if (typeof tune.cacheMB === "number") MAX_CACHE_BYTES = Math.max(16, tune.cacheMB | 0) * 1024 * 1024;
         }
+        // Echo the EFFECTIVE tuning and arm the counters, so a report can say what
+        // configuration produced its numbers and distinguish "zero" from "not counting".
+        Atomics.store(ctl, CTL_IO_CFG_CHUNK_KB, (CHUNK / 1024) | 0);
+        Atomics.store(ctl, CTL_IO_CFG_CACHE_MB, (MAX_CACHE_BYTES / (1024 * 1024)) | 0);
+        Atomics.store(ctl, CTL_IO_CFG_PREFETCH_CHUNKS, PREFETCH_AHEAD_CHUNKS | 0);
+        Atomics.store(ctl, CTL_IO_CFG_MAX_INFLIGHT, MAX_INFLIGHT | 0);
+        Atomics.store(ctl, CTL_IO_ARMED, 1);
         HttpRangeSource.create(msg.url)
             .then((s) => {
                 source = s;
