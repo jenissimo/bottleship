@@ -68,6 +68,8 @@ import {
     LCTRL_DOPPLER_FACTOR,
 } from "../../../audio/audio-ring-buffer";
 import { ensureAudioStatsSab } from "../audio-stats-sab";
+import { Mem } from "../../core/memory/mem-accessor";
+import { isValidAddress } from "../../core/memory/address-guard";
 
 const DS_OK = 0;
 const DSERR_INVALIDPARAM = 0x88780007;
@@ -2135,9 +2137,29 @@ export class DSound implements IModule {
             buffer.bufferLost = false;
             return DS_OK;
         };
-        this.exports["idirectsoundbuffer8_setfx"] = () => DS_OK;
-        this.exports["idirectsoundbuffer8_acquireresources"] = () => DS_OK;
-        this.exports["idirectsoundbuffer8_getobjectinpath"] = () => DS_OK;
+        // The DMO effects chain (DSBCAPS_CTRLFX) is not implemented: CreateSoundBuffer
+        // never honours the flag, so no buffer here has an effects chain to configure.
+        // DS_OK would tell the app its reverb/echo is running and leave the per-effect
+        // result codes — which it reads to find out WHICH effect failed — untouched.
+        this.exports["idirectsoundbuffer8_setfx"] = (ctx, mem, args) => {
+            const dwEffectsCount = args[1] >>> 0;
+            const pdwResultCodes = args[3] >>> 0;
+            if (pdwResultCodes && dwEffectsCount && dwEffectsCount < 0x1000
+                && isValidAddress(mem, pdwResultCodes, dwEffectsCount * 4, "rw")) {
+                // DSFXR_UNKNOWN — no effect was located, one entry per requested effect.
+                for (let i = 0; i < dwEffectsCount; i++) Mem.writeUint32(pdwResultCodes + i * 4, 0);
+            }
+            Logger.warn(LogCategory.SYSTEM, "dsound: SetFX -> DSERR_CONTROLUNAVAIL (no DMO effects chain)");
+            return DSERR_CONTROLUNAVAIL;
+        };
+        this.exports["idirectsoundbuffer8_acquireresources"] = () => DSERR_CONTROLUNAVAIL;
+        // GetObjectInPath hands back an effect/renderer interface pointer. There is no
+        // object in any path here, and the capture buffer's twin already says so.
+        this.exports["idirectsoundbuffer8_getobjectinpath"] = (ctx, mem, args) => {
+            const ppObject = args[4] >>> 0;
+            if (ppObject) Mem.writeUint32(ppObject, 0);
+            return DSERR_OBJECTNOTFOUND;
+        };
 
         this.exports["idirectsoundcapture_createcapturebuffer"] = (ctx, mem, args) => {
             const descPtr = args[1] >>> 0;
