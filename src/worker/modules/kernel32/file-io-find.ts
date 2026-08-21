@@ -63,6 +63,9 @@ const splitFindPattern = (rawPattern: string): { searchPath: string; searchMask:
     }
 
     if (searchPath === '') searchPath = '\\';
+    // "C:\*.gro" splits to a bare "C:", which is drive-RELATIVE (the drive's current
+    // directory) — put the separator back so the root is searched, not the CWD.
+    if (/^[A-Za-z]:$/.test(searchPath) && lastSlash !== -1) searchPath += '\\';
     if (searchMask === '') searchMask = '*';
     return { searchPath, searchMask };
 };

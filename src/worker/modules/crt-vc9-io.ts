@@ -67,8 +67,19 @@ export function gcvtFormat(val: number, ndec: number): string {
 function parseFilespec(filespec: string): { dir: string; pattern: string } {
     const normalized = filespec.replace(/\//g, "\\");
     const slash = normalized.lastIndexOf("\\");
-    if (slash < 0) return { dir: ".", pattern: normalized };
-    return { dir: normalized.slice(0, slash) || ".", pattern: normalized.slice(slash + 1) };
+    if (slash < 0) {
+        // "C:*.gro" is drive-RELATIVE — the drive's current directory, not its root.
+        const driveRelative = normalized.match(/^([A-Za-z]:)(.*)$/);
+        if (driveRelative) return { dir: driveRelative[1]!, pattern: driveRelative[2] || "*" };
+        return { dir: ".", pattern: normalized };
+    }
+    const dir = normalized.slice(0, slash);
+    const pattern = normalized.slice(slash + 1);
+    // The separator is load-bearing: "C:\*" is the drive ROOT, while a bare "C:"
+    // is the drive's current directory — dropping it silently enumerates the CWD.
+    if (dir === "") return { dir: "\\", pattern };
+    if (/^[A-Za-z]:$/.test(dir)) return { dir: `${dir}\\`, pattern };
+    return { dir, pattern };
 }
 
 function matchWildcard(name: string, pattern: string): boolean {
@@ -308,11 +319,9 @@ export function registerVc9IoExports(exports: Record<string, ThunkImplementation
         }
         const { dir, pattern } = parseFilespec(host.readCString(filespecPtr, 512));
         const vfs = System.getInstance().fileSystem;
-        const cwd = (System.getInstance() as { currentDirectory?: string }).currentDirectory || "C:\\";
-        let searchDir = dir;
-        if (!searchDir.match(/^[A-Za-z]:/)) {
-            searchDir = cwd.endsWith("\\") ? cwd + searchDir : `${cwd}\\${searchDir}`;
-        }
+        // Relative dirs stay relative — vfs.resolvePath owns the current directory,
+        // and it is the same one openSync resolves against.
+        const searchDir = dir === "." ? vfs.currentDir : dir;
 
         let matched: VfsEntry[];
         // A filespec with no wildcard is an existence check, not an enumeration —

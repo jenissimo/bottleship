@@ -84,8 +84,56 @@ const writeWideDeviceList = (buffer: number, maxChars: number, text: string): nu
     return text.length;
 };
 
-const DISK_FREE_BYTES = 262144 * 8 * 512; // 1 GiB — matches GetDiskFreeSpaceA cluster math
-const DISK_TOTAL_BYTES = 524288 * 8 * 512; // 2 GiB
+// The guest volume is the OPFS store, so its size is the origin's storage quota. One source for
+// every free-space API: an installer that compares its payload size against a hardcoded 1 GiB
+// does not render a smaller progress bar, it refuses to install.
+const BYTES_PER_SECTOR = 512;
+const SECTORS_PER_CLUSTER = 8;
+const BYTES_PER_CLUSTER = BYTES_PER_SECTOR * SECTORS_PER_CLUSTER;
+
+// Used until the first navigator.storage.estimate() resolves, and whenever it is unavailable.
+// Large enough that no era-appropriate installer's minimum-space gate trips on it.
+const FALLBACK_TOTAL_BYTES = 64 * 1024 * 1024 * 1024;
+const FALLBACK_FREE_BYTES = 32 * 1024 * 1024 * 1024;
+
+// GetDiskFreeSpace's outputs are cluster COUNTS in DWORDs; Windows itself clamps what it reports
+// there to 2GB so that pre-OSR2 callers' `clusters * sectors * bytes` arithmetic cannot overflow.
+const LEGACY_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+
+let volumeTotalBytes = FALLBACK_TOTAL_BYTES;
+let volumeFreeBytes = FALLBACK_FREE_BYTES;
+let volumeEstimateInFlight = false;
+let volumeEstimateAt = 0;
+const VOLUME_ESTIMATE_TTL_MS = 5000;
+
+/**
+ * Refresh the cached quota out of band. The free-space APIs are synchronous thunks, so they read
+ * the cache and kick this off; a stale-by-seconds figure is the same thing a real volume gives
+ * you (the number is out of date the moment it is returned).
+ */
+function refreshVolumeEstimate(): void {
+    const now = Date.now();
+    if (volumeEstimateInFlight || now - volumeEstimateAt < VOLUME_ESTIMATE_TTL_MS) return;
+    volumeEstimateInFlight = true;
+    volumeEstimateAt = now;
+    Promise.resolve()
+        .then(() => navigator.storage?.estimate?.())
+        .then(est => {
+            const quota = est?.quota ?? 0;
+            const usage = est?.usage ?? 0;
+            if (quota > 0) {
+                volumeTotalBytes = quota;
+                volumeFreeBytes = Math.max(0, quota - usage);
+            }
+        })
+        .catch(() => { /* keep the previous figure */ })
+        .finally(() => { volumeEstimateInFlight = false; });
+}
+
+function getVolumeBytes(): { total: number; free: number } {
+    refreshVolumeEstimate();
+    return { total: volumeTotalBytes, free: volumeFreeBytes };
+}
 
 const writeU64 = (view: DataView, addr: number, value: number): void => {
     if (!addr) return;
@@ -94,6 +142,11 @@ const writeU64 = (view: DataView, addr: number, value: number): void => {
 };
 
 export function registerFileIoVolumeExports(exports: Record<string, ThunkImplementation>): void {
+    // Prime the quota at registration, not on the first guest call — an installer's very first
+    // act is its space check, and serving that one the fallback would answer with a number we
+    // know is wrong while every later call answers correctly.
+    refreshVolumeEstimate();
+
     exports['GetLogicalDrives'] = (ctx, mem, args) => {
         // Return bitmask of available drives
         // Bit 0 = A:, Bit 1 = B:, Bit 2 = C:, Bit 3 = D:, etc.
@@ -260,31 +313,32 @@ export function registerFileIoVolumeExports(exports: Record<string, ThunkImpleme
         return driveType;
     };
 
-    exports['GetDiskFreeSpaceA'] = (ctx, mem, args) => {
-        const lpRootPathName = args[0];
+    const getDiskFreeSpace = (mem: Uint8Array, args: number[], rootPath: string): number => {
         const lpSectorsPerCluster = args[1];
         const lpBytesPerSector = args[2];
         const lpNumberOfFreeClusters = args[3];
         const lpTotalNumberOfClusters = args[4];
 
-        const rootPath = lpRootPathName ? readStringA(mem, lpRootPathName) : 'C:\\';
-        Logger.verbose(LogCategory.KERNEL32, `GetDiskFreeSpaceA("${rootPath}")`);
-
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
 
-        // Return fake disk space: 1GB free out of 2GB total
-        const sectorsPerCluster = 8;
-        const bytesPerSector = 512;
-        const totalClusters = 524288; // 2GB / (8 * 512)
-        const freeClusters = 262144;  // 1GB / (8 * 512)
+        const { total, free } = getVolumeBytes();
+        const totalClusters = Math.floor(Math.min(total, LEGACY_MAX_BYTES) / BYTES_PER_CLUSTER);
+        const freeClusters = Math.floor(Math.min(free, total, LEGACY_MAX_BYTES) / BYTES_PER_CLUSTER);
 
-        if (lpSectorsPerCluster) view.setUint32(lpSectorsPerCluster, sectorsPerCluster, true);
-        if (lpBytesPerSector) view.setUint32(lpBytesPerSector, bytesPerSector, true);
+        if (lpSectorsPerCluster) view.setUint32(lpSectorsPerCluster, SECTORS_PER_CLUSTER, true);
+        if (lpBytesPerSector) view.setUint32(lpBytesPerSector, BYTES_PER_SECTOR, true);
         if (lpNumberOfFreeClusters) view.setUint32(lpNumberOfFreeClusters, freeClusters, true);
         if (lpTotalNumberOfClusters) view.setUint32(lpTotalNumberOfClusters, totalClusters, true);
 
+        Logger.verbose(LogCategory.KERNEL32, `GetDiskFreeSpace("${rootPath}") -> ${freeClusters}/${totalClusters} clusters`);
         return 1; // TRUE
     };
+
+    exports['GetDiskFreeSpaceA'] = (ctx, mem, args) =>
+        getDiskFreeSpace(mem, args, args[0] ? readStringA(mem, args[0]) : 'C:\\');
+
+    exports['GetDiskFreeSpaceW'] = (ctx, mem, args) =>
+        getDiskFreeSpace(mem, args, args[0] ? readStringW(mem, args[0]) : 'C:\\');
 
     exports['GetDiskFreeSpaceExA'] = (ctx, mem, args) => {
         const lpDirectoryName = args[0];
@@ -296,9 +350,10 @@ export function registerFileIoVolumeExports(exports: Record<string, ThunkImpleme
         Logger.verbose(LogCategory.KERNEL32, `GetDiskFreeSpaceExA("${rootPath}")`);
 
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-        writeU64(view, lpFreeBytesAvailable, DISK_FREE_BYTES);
-        writeU64(view, lpTotalNumberOfBytes, DISK_TOTAL_BYTES);
-        writeU64(view, lpTotalNumberOfFreeBytes, DISK_FREE_BYTES);
+        const { total, free } = getVolumeBytes();
+        writeU64(view, lpFreeBytesAvailable, free);
+        writeU64(view, lpTotalNumberOfBytes, total);
+        writeU64(view, lpTotalNumberOfFreeBytes, free);
 
         return 1; // TRUE
     };
@@ -313,9 +368,10 @@ export function registerFileIoVolumeExports(exports: Record<string, ThunkImpleme
         Logger.verbose(LogCategory.KERNEL32, `GetDiskFreeSpaceExW("${rootPath}")`);
 
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-        writeU64(view, lpFreeBytesAvailable, DISK_FREE_BYTES);
-        writeU64(view, lpTotalNumberOfBytes, DISK_TOTAL_BYTES);
-        writeU64(view, lpTotalNumberOfFreeBytes, DISK_FREE_BYTES);
+        const { total, free } = getVolumeBytes();
+        writeU64(view, lpFreeBytesAvailable, free);
+        writeU64(view, lpTotalNumberOfBytes, total);
+        writeU64(view, lpTotalNumberOfFreeBytes, free);
 
         return 1; // TRUE
     };

@@ -13,6 +13,7 @@ import { type RegionPerms } from '../../core/memory/address-space';
 import { Mem } from '../../core/memory/mem-accessor';
 import { registerGuestCommitNotifier } from '../../core/memory/guest-page-commit';
 import { profiler } from '../../core/profiler';
+import { GUEST_PROCESSOR_TYPE, GUEST_PROCESSOR_LEVEL, GUEST_PROCESSOR_REVISION } from '../../core/guest-cpu-identity';
 import { hypercallDataManager } from '../../core/cpu/hypercall-data';
 import {
     MEM_HEAP_BASE,
@@ -734,6 +735,41 @@ export const exports: Record<string, ThunkImplementation> = (() => {
     registerGuestCommitNotifier(clearDecommittedRange);
 
     /**
+     * Take a page range out of the committed set: clear Present so a guest touch
+     * raises #PF (which the SEH path turns into EXCEPTION_ACCESS_VIOLATION), and
+     * record it so VirtualQuery answers MEM_RESERVE. Shared by VirtualFree's
+     * MEM_DECOMMIT and by a MEM_RESERVE that carries no MEM_COMMIT — reserved-but-
+     * uncommitted pages that quietly read back as zeros are the difference between
+     * a demand-paging fault handler running and a game silently parsing zeros.
+     */
+    function markDecommitted(alignedAddress: number, alignedSize: number): void {
+        const proc = System.getInstance().process;
+        if (!proc) return;
+        const ptm = proc.pageTableManager;
+        if (ptm?.isPagingEnabled()) {
+            ptm.decommitPages(alignedAddress, alignedSize);
+        } else {
+            // Fallback: poison bytes (pre-paging or paging disabled)
+            proc.addressSpace.fill(alignedAddress, alignedSize, 0xFE);
+        }
+
+        // Merge with existing decommitted entries to keep the map compact.
+        let mergeBase = alignedAddress;
+        let mergeEnd = alignedAddress + alignedSize;
+        const toRemove: number[] = [];
+        for (const [dcBase, dcSize] of decommittedPages) {
+            const dcEnd = dcBase + dcSize;
+            if (dcEnd >= mergeBase && dcBase <= mergeEnd) {
+                mergeBase = Math.min(mergeBase, dcBase);
+                mergeEnd = Math.max(mergeEnd, dcEnd);
+                toRemove.push(dcBase);
+            }
+        }
+        for (const key of toRemove) decommittedPages.delete(key);
+        decommittedPages.set(mergeBase, mergeEnd - mergeBase);
+    }
+
+    /**
      * MEM_COMMIT over a range that may already be committed. Win32: "if the memory is
      * already committed, the function does not change its contents" — only pages that
      * were never committed (or were decommitted) come back zeroed. Blanket-zeroing here
@@ -1405,10 +1441,12 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         view.setUint32(lpSystemInfo + 12, maxAppAddr, true); // lpMaximumApplicationAddress
         view.setUint32(lpSystemInfo + 16, 1, true); // dwActiveProcessorMask
         view.setUint32(lpSystemInfo + 20, 1, true); // dwNumberOfProcessors
-        view.setUint32(lpSystemInfo + 24, 586, true); // dwProcessorType (Pentium)
+        view.setUint32(lpSystemInfo + 24, GUEST_PROCESSOR_TYPE, true); // dwProcessorType
         view.setUint32(lpSystemInfo + 28, 0x10000, true); // dwAllocationGranularity
-        view.setUint16(lpSystemInfo + 32, 5, true); // wProcessorLevel
-        view.setUint16(lpSystemInfo + 34, 0, true); // wProcessorRevision
+        // Both derived from the same family/model/stepping CPUID reports, the way NT derives
+        // them — a level of 5 against a CPUID family of 6 sends engines down their P5 path.
+        view.setUint16(lpSystemInfo + 32, GUEST_PROCESSOR_LEVEL, true); // wProcessorLevel
+        view.setUint16(lpSystemInfo + 34, GUEST_PROCESSOR_REVISION, true); // wProcessorRevision
         return 0;
     };
 
@@ -1427,6 +1465,12 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         return 1;
     };
 
+    // Size of the 32-bit user-mode address space. On Win32 this is an architectural constant
+    // (2GB minus the 64KB no-access boundary), NOT a function of installed RAM — a title that
+    // sizes its address-space budget from dwTotalVirtual reads a RAM figure as an address-space
+    // limit and picks its small-world code path.
+    const USER_VIRTUAL_TOTAL_BYTES = 0x7FFE0000;
+
     exports['GlobalMemoryStatus'] = (ctx, mem, args) => {
         const lpBuffer = args[0];
         if (!lpBuffer || lpBuffer + 32 > mem.length) {
@@ -1444,8 +1488,8 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         view.setUint32(lpBuffer + 12, avail >>> 0, true); // dwAvailPhys
         view.setUint32(lpBuffer + 16, total >>> 0, true); // dwTotalPageFile
         view.setUint32(lpBuffer + 20, avail >>> 0, true); // dwAvailPageFile
-        view.setUint32(lpBuffer + 24, total >>> 0, true); // dwTotalVirtual
-        view.setUint32(lpBuffer + 28, avail >>> 0, true); // dwAvailVirtual
+        view.setUint32(lpBuffer + 24, USER_VIRTUAL_TOTAL_BYTES, true); // dwTotalVirtual
+        view.setUint32(lpBuffer + 28, Math.min(avail, USER_VIRTUAL_TOTAL_BYTES) >>> 0, true); // dwAvailVirtual
 
         return 0;
     };
@@ -1475,8 +1519,8 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         view.setBigUint64(lpBuffer + 16, avail64, true); // ullAvailPhys
         view.setBigUint64(lpBuffer + 24, total64, true); // ullTotalPageFile
         view.setBigUint64(lpBuffer + 32, avail64, true); // ullAvailPageFile
-        view.setBigUint64(lpBuffer + 40, total64, true); // ullTotalVirtual
-        view.setBigUint64(lpBuffer + 48, avail64, true); // ullAvailVirtual
+        view.setBigUint64(lpBuffer + 40, BigInt(USER_VIRTUAL_TOTAL_BYTES), true); // ullTotalVirtual
+        view.setBigUint64(lpBuffer + 48, BigInt(Math.min(avail, USER_VIRTUAL_TOTAL_BYTES) >>> 0), true); // ullAvailVirtual
         view.setBigUint64(lpBuffer + 56, 0n, true); // ullAvailExtendedVirtual
 
         return 1;
@@ -2060,6 +2104,11 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 
         if (flAllocationType & MEM_RESERVE) {
             reservedPages.set(address, committedSize);
+            // Reserve WITHOUT commit hands back address space, not memory. Leaving the
+            // pages present makes a demand-paging design (reserve a window, commit each
+            // page from the access-violation filter) never fault, so the app reads zeros
+            // where it expected the bytes its handler would have paged in.
+            if (!(flAllocationType & MEM_COMMIT)) markDecommitted(address, committedSize);
             Logger.verbose(LogCategory.KERNEL32, `VirtualAlloc: Reserved ${committedSize} bytes at 0x${address.toString(16)}`);
         }
 
@@ -2143,6 +2192,14 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             clearDecommittedRange(lpAddress, trackedSize);
             reservedPages.delete(lpAddress);
             virtualAllocRegions.delete(lpAddress);
+            // Released VA goes back to the allocator, so any protection the app applied
+            // to it dies with the reservation. Leaving a PAGE_READONLY page behind hands
+            // the next owner memory it cannot write — and the recommit-on-handout path
+            // only revives NOT-PRESENT pages, so a read-only one stays read-only forever.
+            {
+                const ptm = process.pageTableManager;
+                if (ptm?.isPagingEnabled()) ptm.setProtection(lpAddress, trackedSize, PAGE_READWRITE);
+            }
 
             const allocSize = process.memory.getSize(lpAddress);
             if (allocSize === undefined) {
@@ -2174,31 +2231,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             return 0; // FALSE
         }
 
-        const ptm = process.pageTableManager;
-        if (ptm?.isPagingEnabled()) {
-            // Clear Present bit in PTEs; access will fault via #PF.
-            ptm.decommitPages(alignedAddress, alignedSize);
-        } else {
-            // Fallback: poison bytes (pre-paging or paging disabled)
-            process.addressSpace.fill(alignedAddress, alignedSize, 0xFE);
-        }
-
-        // Merge with existing decommitted entries to keep the map compact.
-        // Remove any existing entries that overlap, then add the union range.
-        let mergeBase = alignedAddress;
-        let mergeEnd = alignedAddress + alignedSize;
-        const toRemove: number[] = [];
-        for (const [dcBase, dcSize] of decommittedPages) {
-            const dcEnd = dcBase + dcSize;
-            // Check if adjacent or overlapping
-            if (dcEnd >= mergeBase && dcBase <= mergeEnd) {
-                mergeBase = Math.min(mergeBase, dcBase);
-                mergeEnd = Math.max(mergeEnd, dcEnd);
-                toRemove.push(dcBase);
-            }
-        }
-        for (const key of toRemove) decommittedPages.delete(key);
-        decommittedPages.set(mergeBase, mergeEnd - mergeBase);
+        markDecommitted(alignedAddress, alignedSize);
 
         Logger.verbose(LogCategory.KERNEL32,
             `VirtualFree: Decommitted ${alignedSize} bytes at 0x${alignedAddress.toString(16)}`);
