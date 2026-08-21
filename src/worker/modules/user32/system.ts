@@ -9,6 +9,7 @@ import { parseBMPHeader, parseBMPPixels } from '../gdi32/gdi-raster';
 import { Logger, LogCategory } from '../../core/logger';
 import { Marshaler } from '../../core/memory/marshaler';
 import { Mem } from '../../core/memory/mem-accessor';
+import { isValidAddress } from '../../core/memory/address-guard';
 import { System } from '../../core/system';
 import { EMU_NATIVE_VIDEO_DLLS } from '../../core/cpu/emulator-config';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
@@ -43,6 +44,13 @@ import { invokeWindowMessageSync } from './message';
 // sized to the API's own 1024 code-unit budget including the terminator.
 const wsprintfScratch = new Uint8Array(1024 * 2);
 const wsprintfScratchView = new DataView(wsprintfScratch.buffer);
+
+/** The DBCS ANSI code pages (Shift-JIS, GBK, Wansung, Big5) — the ones whose
+ *  MaximumCharacterSize is 2 and which therefore make SM_DBCSENABLED true. */
+const DBCS_CODE_PAGES = new Set([932, 936, 949, 950, 1361]);
+function isDbcsCodePage(cp: number): boolean {
+    return DBCS_CODE_PAGES.has(cp);
+}
 
 /** '#RRGGBB' → COLORREF 0x00BBGGRR, so one palette can serve both painters and the API. */
 function cssToColorRef(css: string): number {
@@ -231,6 +239,101 @@ function vkToChar(vk: number): number {
     return VK_TO_CHAR[vk] ?? 0;
 }
 
+// SPI_* actions (winuser.h). Only the ones we answer are named; an action absent from
+// this file is answered with FALSE rather than a silent TRUE.
+const SPI_GETBEEP = 1, SPI_SETBEEP = 2, SPI_GETMOUSE = 3, SPI_SETMOUSE = 4;
+const SPI_GETBORDER = 5, SPI_SETBORDER = 6;
+const SPI_GETKEYBOARDSPEED = 10, SPI_SETKEYBOARDSPEED = 11;
+const SPI_ICONHORIZONTALSPACING = 13;
+const SPI_GETSCREENSAVETIMEOUT = 14, SPI_SETSCREENSAVETIMEOUT = 15;
+const SPI_GETSCREENSAVEACTIVE = 16, SPI_SETSCREENSAVEACTIVE = 17;
+const SPI_GETGRIDGRANULARITY = 18, SPI_SETGRIDGRANULARITY = 19;
+const SPI_SETDESKWALLPAPER = 20, SPI_SETDESKPATTERN = 21;
+const SPI_GETKEYBOARDDELAY = 22, SPI_SETKEYBOARDDELAY = 23;
+const SPI_ICONVERTICALSPACING = 24;
+const SPI_GETICONTITLEWRAP = 25, SPI_SETICONTITLEWRAP = 26;
+const SPI_GETMENUDROPALIGNMENT = 27, SPI_SETMENUDROPALIGNMENT = 28;
+const SPI_SETDOUBLECLKWIDTH = 29, SPI_SETDOUBLECLKHEIGHT = 30;
+const SPI_GETICONTITLELOGFONT = 31, SPI_SETICONTITLELOGFONT = 34;
+const SPI_SETDOUBLECLICKTIME = 32, SPI_SETMOUSEBUTTONSWAP = 33;
+const SPI_GETFASTTASKSWITCH = 35, SPI_SETFASTTASKSWITCH = 36;
+const SPI_SETDRAGFULLWINDOWS = 37, SPI_GETDRAGFULLWINDOWS = 38;
+const SPI_GETNONCLIENTMETRICS = 41, SPI_SETNONCLIENTMETRICS = 42;
+const SPI_GETMINIMIZEDMETRICS = 43, SPI_SETMINIMIZEDMETRICS = 44;
+const SPI_GETICONMETRICS = 45, SPI_SETICONMETRICS = 46;
+const SPI_SETWORKAREA = 47, SPI_GETWORKAREA = 48;
+const SPI_GETFILTERKEYS = 50, SPI_GETTOGGLEKEYS = 52, SPI_GETMOUSEKEYS = 54;
+const SPI_GETSHOWSOUNDS = 56, SPI_SETSHOWSOUNDS = 57;
+const SPI_GETSTICKYKEYS = 58, SPI_GETACCESSTIMEOUT = 60, SPI_GETSOUNDSENTRY = 64;
+const SPI_GETHIGHCONTRAST = 66;
+const SPI_GETKEYBOARDPREF = 68, SPI_GETSCREENREADER = 70;
+const SPI_GETANIMATION = 72, SPI_SETANIMATION = 73;
+const SPI_GETFONTSMOOTHING = 74, SPI_SETFONTSMOOTHING = 75;
+const SPI_SETDRAGWIDTH = 76, SPI_SETDRAGHEIGHT = 77;
+const SPI_GETLOWPOWERTIMEOUT = 79, SPI_GETPOWEROFFTIMEOUT = 80;
+const SPI_SETLOWPOWERTIMEOUT = 81, SPI_SETPOWEROFFTIMEOUT = 82;
+const SPI_GETLOWPOWERACTIVE = 83, SPI_GETPOWEROFFACTIVE = 84;
+const SPI_SETLOWPOWERACTIVE = 85, SPI_SETPOWEROFFACTIVE = 86;
+const SPI_SETDEFAULTINPUTLANG = 90, SPI_SETLANGTOGGLE = 91;
+const SPI_GETMOUSETRAILS = 94, SPI_SETMOUSETRAILS = 93;
+const SPI_SETSCREENSAVERRUNNING = 97;
+const SPI_SETCURSORS = 87, SPI_SETICONS = 88;
+const SPI_GETMOUSEHOVERWIDTH = 98, SPI_SETMOUSEHOVERWIDTH = 99;
+const SPI_GETMOUSEHOVERHEIGHT = 100, SPI_SETMOUSEHOVERHEIGHT = 101;
+const SPI_GETMOUSEHOVERTIME = 102, SPI_SETMOUSEHOVERTIME = 103;
+const SPI_GETWHEELSCROLLLINES = 104, SPI_SETWHEELSCROLLLINES = 105;
+const SPI_GETMENUSHOWDELAY = 106, SPI_SETMENUSHOWDELAY = 107;
+const SPI_GETWHEELSCROLLCHARS = 108, SPI_SETWHEELSCROLLCHARS = 109;
+const SPI_GETDEFAULTINPUTLANG = 89;
+const SPI_GETMOUSESPEED = 112, SPI_SETMOUSESPEED = 113;
+const SPI_GETSCREENSAVERRUNNING = 114, SPI_GETDESKWALLPAPER = 115;
+const SPI_GETFOREGROUNDLOCKTIMEOUT = 0x2000, SPI_SETFOREGROUNDLOCKTIMEOUT = 0x2001;
+const SPI_GETFOREGROUNDFLASHCOUNT = 0x2004, SPI_SETFOREGROUNDFLASHCOUNT = 0x2005;
+const SPI_GETCARETWIDTH = 0x2006, SPI_SETCARETWIDTH = 0x2007;
+/** SM_CXDRAG/SM_CYDRAG have no GET action of their own — only SPI_SETDRAGWIDTH/HEIGHT
+ *  write them. These private slot ids keep the stored value out of the action space. */
+const SPI_GETDRAGWIDTH_X = -1, SPI_GETDRAGHEIGHT_Y = -2;
+
+/** The GET half of the visual-effect pairs (0x1000 block + SPI_GETUIEFFECTS). */
+const SPI_UI_EFFECT_GETS = [
+    0x1000, 0x1002, 0x1004, 0x1006, 0x1008, 0x100A, 0x100C, 0x100E,
+    0x1012, 0x1014, 0x1016, 0x1018, 0x101A, 0x101C, 0x101E, 0x1020,
+    0x1022, 0x1024, 0x1026, 0x103E,
+];
+/** Their SET counterparts sit one above each GET. */
+const SPI_UI_EFFECT_SET_TO_GET: Array<[number, number]> =
+    SPI_UI_EFFECT_GETS.map((get) => [get + 1, get]);
+
+/** SETs whose new value arrives in pvParam (cast to a value) rather than uiParam. */
+const SPI_SET_VALUE_IN_PVPARAM = new Set<number>([
+    SPI_SETMOUSESPEED, SPI_SETFOREGROUNDLOCKTIMEOUT, SPI_SETFOREGROUNDFLASHCOUNT,
+    SPI_SETCARETWIDTH,
+    ...SPI_UI_EFFECT_SET_TO_GET.map(([set]) => set),
+]);
+
+/** The classic UI face — the same one the JS control painters use (tab-control.ts),
+ *  so a caller that creates a font from these metrics matches what we draw. */
+const CLASSIC_UI_FACE = 'MS Sans Serif';
+
+/** LOGFONTA (60 bytes) / LOGFONTW (92): the first 28 bytes are shared, then the face
+ *  name array. Written whole — a partially filled LOGFONT is a garbage font request. */
+function writeLogFont(
+    mem: Uint8Array, ptr: number, wide: boolean, height: number, weight: number, face: string,
+): void {
+    const size = wide ? 92 : 60;
+    for (let i = 0; i < size; i++) mem[ptr + i] = 0;
+    const v = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+    v.setInt32(ptr, height, true);        // lfHeight (negative = character height)
+    v.setInt32(ptr + 16, weight, true);   // lfWeight
+    mem[ptr + 23] = 1;                    // lfCharSet = DEFAULT_CHARSET
+    mem[ptr + 27] = 0x22;                 // lfPitchAndFamily = VARIABLE_PITCH | FF_SWISS
+    const chars = Math.min(face.length, 31);
+    for (let i = 0; i < chars; i++) {
+        if (wide) v.setUint16(ptr + 28 + i * 2, face.charCodeAt(i), true);
+        else mem[ptr + 28 + i] = face.charCodeAt(i) & 0xff;
+    }
+}
+
 export function createSystemExports(): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
     let mouseButtonsSwapped = false;
@@ -286,13 +389,46 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
     const SM_CYSMSIZE = 53;      // Small caption button height
     const SM_CXMENUSIZE = 54;    // Menu bar button width
     const SM_CYMENUSIZE = 55;    // Menu bar button height
-    const SM_IMMENABLED = 74;    // IME enabled
-    const SM_CXFOCUSBORDER = 75; // Focus border width
+    const SM_SECURE = 44;        // Security present
+    const SM_CXEDGE = 45;        // 3D border width
+    const SM_CYEDGE = 46;        // 3D border height
+    const SM_CXMINSPACING = 47;  // Minimized-window grid cell width
+    const SM_CYMINSPACING = 48;  // Minimized-window grid cell height
+    const SM_ARRANGE = 56;       // How minimized windows arrange
+    const SM_CXMINIMIZED = 57;   // Minimized-window width
+    const SM_CYMINIMIZED = 58;   // Minimized-window height
+    const SM_CXMAXTRACK = 59;    // Max tracking width
+    const SM_CYMAXTRACK = 60;    // Max tracking height
+    const SM_CXMAXIMIZED = 61;   // Maximized-window width
+    const SM_CYMAXIMIZED = 62;   // Maximized-window height
+    const SM_NETWORK = 63;       // Bit 0 = a network is present
+    const SM_CLEANBOOT = 67;     // Safe-mode boot
+    const SM_CXDRAG = 68;        // Drag-start threshold X
+    const SM_CYDRAG = 69;        // Drag-start threshold Y
+    const SM_SHOWSOUNDS = 70;    // Accessibility: visual cue for sounds
+    const SM_CXMENUCHECK = 71;   // Menu check-mark width
+    const SM_CYMENUCHECK = 72;   // Menu check-mark height
+    const SM_SLOWMACHINE = 73;   // Low-end machine
+    const SM_MIDEASTENABLED = 74; // Hebrew/Arabic support installed
+    const SM_MOUSEWHEELPRESENT = 75; // Wheel present
     const SM_XVIRTUALSCREEN = 76; // Virtual screen origin X (single monitor = 0)
     const SM_YVIRTUALSCREEN = 77;
     const SM_CXVIRTUALSCREEN = 78;
     const SM_CYVIRTUALSCREEN = 79;
     const SM_CMONITORS = 80;
+    const SM_SAMEDISPLAYFORMAT = 81; // All monitors share one colour format
+    const SM_IMMENABLED = 82;    // IME enabled
+    const SM_CXFOCUSBORDER = 83; // Focus border width
+    const SM_CYFOCUSBORDER = 84; // Focus border height
+    const SM_TABLETPC = 86;
+    const SM_MEDIACENTER = 87;
+    const SM_STARTER = 88;
+    const SM_SERVERR2 = 89;
+    const SM_MOUSEHORIZONTALWHEELPRESENT = 91;
+    const SM_CXPADDEDBORDER = 92; // Themed extra frame padding (0 = classic)
+    const SM_REMOTESESSION = 0x1000;
+    const SM_SHUTTINGDOWN = 0x2000;
+    const SM_REMOTECONTROL = 0x2001;
 
     const DEFAULT_DISPLAY_REFRESH_RATE = 60;
     type DisplayMode = { width: number; height: number; bpp: number; refreshRate: number };
@@ -368,7 +504,9 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
             case SM_CYICONSPACING:  return 75;   // Icon vertical spacing
             case SM_MENUDROPALIGNMENT: return 0; // Menu drops aligned left
             case SM_PENWINDOWS:     return 0;    // No pen support
-            case SM_DBCSENABLED:    return 0;    // No DBCS
+            // "A DBCS version of user32 is installed" — true exactly when the ANSI code
+            // page is multi-byte, which is what the bundle's codepage setting decides.
+            case SM_DBCSENABLED:    return isDbcsCodePage(getAnsiCodePage()) ? 1 : 0;
             case SM_CMOUSEBUTTONS:  return 3;    // 3 mouse buttons
             case SM_CXSMICON:       return 16;   // Small icon width
             case SM_CYSMICON:       return 16;   // Small icon height
@@ -377,13 +515,58 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
             case SM_CYSMSIZE:       return 14;   // Small caption button height
             case SM_CXMENUSIZE:     return 18;   // Menu bar button width
             case SM_CYMENUSIZE:     return 18;   // Menu bar button height
-            case SM_IMMENABLED:     return 0;    // No IME
-            case SM_CXFOCUSBORDER:  return 1;    // Focus border width
+            case SM_SECURE:         return 0;    // No security (Win9x-class desktop)
+            // The 3D edge is one border plus one highlight, which is what the classic
+            // painters draw — see controls.ts's SM_CXEDGE note.
+            case SM_CXEDGE:         return 2;
+            case SM_CYEDGE:         return 2;
+            case SM_CXMINIMIZED:    return 160;  // MINIMIZEDMETRICS iWidth (154) + 6
+            case SM_CYMINIMIZED:    return 24;   // SM_CYSIZE (18) + 6
+            case SM_CXMINSPACING:   return 160;  // + iHorzGap (0)
+            case SM_CYMINSPACING:   return 24;   // + iVertGap (0)
+            case SM_ARRANGE:        return 8;    // ARW_HIDE — the MINIMIZEDMETRICS default
+            // A maximized window's frame hangs off-screen; we model no taskbar, so the
+            // work area is the whole screen and nothing is subtracted.
+            case SM_CXMAXIMIZED:    return screenW + 2 * 4;   // + 2 * SM_CXFRAME
+            case SM_CYMAXIMIZED:    return screenH + 2 * 19;  // + 2 * SM_CYCAPTION
+            case SM_CXMAXTRACK:     return screenW + 4 + 2 * 4;
+            case SM_CYMAXTRACK:     return screenH + 4 + 2 * 4;
+            // Bit 0 = "a network is present". We serve winsock/wsock32 and the DPlay
+            // transports, so a title gating multiplayer on this must not be told there is
+            // no adapter — the menu item greys out and the whole path becomes unreachable.
+            case SM_NETWORK:        return 3;
+            case SM_CLEANBOOT:      return 0;    // Normal boot, not safe mode
+            case SM_CXDRAG:         return 4;    // Drag threshold (SPI_GETDRAGWIDTH default)
+            case SM_CYDRAG:         return 4;
+            case SM_SHOWSOUNDS:     return 0;    // No visual-cue accessibility mode
+            case SM_CXMENUCHECK:    return 13;   // Classic Marlett check cell (classic-theme.ts)
+            case SM_CYMENUCHECK:    return 13;
+            case SM_SLOWMACHINE:    return 0;
+            case SM_MIDEASTENABLED: return 0;    // No bidi user32
+            // The wheel is real: the host publishes deltas (INPUT_INDEX.mouseWheel), we
+            // dispatch WM_MOUSEWHEEL (message.ts) and DirectInput reports the Z axis with
+            // a 120 granularity. Answering 0 makes an engine that gates its wheel handler
+            // on this metric fall back to keys and ignore the messages we do deliver.
+            case SM_MOUSEWHEELPRESENT: return 1;
             case SM_XVIRTUALSCREEN: return 0;    // Single monitor, origin 0
             case SM_YVIRTUALSCREEN: return 0;
             case SM_CXVIRTUALSCREEN: return screenW;
             case SM_CYVIRTUALSCREEN: return screenH;
             case SM_CMONITORS:      return 1;    // Single monitor
+            case SM_SAMEDISPLAYFORMAT: return 1; // One monitor, so trivially the same format
+            case SM_IMMENABLED:     return 0;    // No IME
+            case SM_CXFOCUSBORDER:  return 1;    // Focus border width
+            case SM_CYFOCUSBORDER:  return 1;
+            case SM_TABLETPC:       return 0;
+            case SM_MEDIACENTER:    return 0;
+            case SM_STARTER:        return 0;
+            case SM_SERVERR2:       return 0;
+            // Nothing publishes a horizontal wheel and no WM_MOUSEHWHEEL is dispatched.
+            case SM_MOUSEHORIZONTALWHEELPRESENT: return 0;
+            case SM_CXPADDEDBORDER: return 0;    // Classic frame has no padded border
+            case SM_REMOTESESSION:  return 0;
+            case SM_SHUTTINGDOWN:   return 0;
+            case SM_REMOTECONTROL:  return 0;
             default:
                 Logger.warn(LogCategory.USER32, `GetSystemMetrics: unknown index ${nIndex}`);
                 return 0;
@@ -1461,17 +1644,286 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         return prev;
     };
 
-    // SystemParametersInfo - retrieves or sets system-wide parameters
-    exports['SystemParametersInfoA'] = (ctx, mem, args) => {
-        const uiAction = args[0];
-        const uiParam = args[1];
-        const pvParam = args[2];
-        const fWinIni = args[3];
-        Logger.verbose(LogCategory.USER32, `SystemParametersInfoA(action=0x${uiAction.toString(16)}, param=${uiParam}, pvParam=0x${pvParam.toString(16)}, fWinIni=0x${fWinIni.toString(16)})`);
-        // Return TRUE for most queries to indicate success
-        return 1;
+    // ==================== SystemParametersInfo ====================
+
+    // The scalar settings, with Windows' own defaults. A GET reads from here and a SET
+    // writes to it, so a caller that sets a value and reads it back sees its own value —
+    // the property games actually depend on (mouse speed, wheel lines, drag thresholds).
+    const spiSettings = new Map<number, number>([
+        [SPI_GETBEEP, 1],
+        [SPI_GETBORDER, 1],
+        [SPI_GETKEYBOARDSPEED, 31],
+        [SPI_GETKEYBOARDDELAY, 1],
+        [SPI_GETSCREENSAVETIMEOUT, 600],
+        [SPI_GETSCREENSAVEACTIVE, 0],
+        [SPI_GETGRIDGRANULARITY, 0],
+        [SPI_GETICONTITLEWRAP, 1],
+        [SPI_GETMENUDROPALIGNMENT, 0],
+        [SPI_GETFASTTASKSWITCH, 1],
+        [SPI_GETDRAGFULLWINDOWS, 1],
+        [SPI_GETSHOWSOUNDS, 0],
+        [SPI_GETKEYBOARDPREF, 0],
+        [SPI_GETSCREENREADER, 0],
+        [SPI_GETFONTSMOOTHING, 0],
+        [SPI_GETLOWPOWERTIMEOUT, 0],
+        [SPI_GETPOWEROFFTIMEOUT, 0],
+        [SPI_GETLOWPOWERACTIVE, 0],
+        [SPI_GETPOWEROFFACTIVE, 0],
+        [SPI_GETMOUSEHOVERWIDTH, 4],
+        [SPI_GETMOUSEHOVERHEIGHT, 4],
+        [SPI_GETMOUSEHOVERTIME, 400],
+        // A wheel notch is WHEEL_DELTA (120) and this is the divisor a scroller applies to
+        // it. Leaving it unwritten is the "NaN out of granularity" shape: the caller keeps
+        // whatever its stack held and scrolls by a garbage amount, or divides by zero.
+        [SPI_GETWHEELSCROLLLINES, 3],
+        [SPI_GETWHEELSCROLLCHARS, 3],
+        [SPI_GETMENUSHOWDELAY, 400],
+        [SPI_GETMOUSESPEED, 10],
+        [SPI_GETSCREENSAVERRUNNING, 0],
+        [SPI_GETFOREGROUNDLOCKTIMEOUT, 0],
+        [SPI_GETFOREGROUNDFLASHCOUNT, 3],
+        [SPI_GETDRAGWIDTH_X, 4],
+        [SPI_GETDRAGHEIGHT_Y, 4],
+        [SPI_GETCARETWIDTH, 1],
+        [SPI_GETMOUSETRAILS, 0],
+    ]);
+    // Classic desktop: every visual effect is off, and off is the truth — we animate
+    // nothing, fade nothing and draw no drop shadows.
+    for (const action of SPI_UI_EFFECT_GETS) spiSettings.set(action, 0);
+
+    /** GET action → the SET action that writes the same slot. */
+    const spiSetToGet = new Map<number, number>([
+        [SPI_SETBEEP, SPI_GETBEEP],
+        [SPI_SETBORDER, SPI_GETBORDER],
+        [SPI_SETKEYBOARDSPEED, SPI_GETKEYBOARDSPEED],
+        [SPI_SETKEYBOARDDELAY, SPI_GETKEYBOARDDELAY],
+        [SPI_SETSCREENSAVETIMEOUT, SPI_GETSCREENSAVETIMEOUT],
+        [SPI_SETSCREENSAVEACTIVE, SPI_GETSCREENSAVEACTIVE],
+        [SPI_SETGRIDGRANULARITY, SPI_GETGRIDGRANULARITY],
+        [SPI_SETICONTITLEWRAP, SPI_GETICONTITLEWRAP],
+        [SPI_SETMENUDROPALIGNMENT, SPI_GETMENUDROPALIGNMENT],
+        [SPI_SETFASTTASKSWITCH, SPI_GETFASTTASKSWITCH],
+        [SPI_SETDRAGFULLWINDOWS, SPI_GETDRAGFULLWINDOWS],
+        [SPI_SETSHOWSOUNDS, SPI_GETSHOWSOUNDS],
+        [SPI_SETFONTSMOOTHING, SPI_GETFONTSMOOTHING],
+        [SPI_SETMOUSEHOVERWIDTH, SPI_GETMOUSEHOVERWIDTH],
+        [SPI_SETMOUSEHOVERHEIGHT, SPI_GETMOUSEHOVERHEIGHT],
+        [SPI_SETMOUSEHOVERTIME, SPI_GETMOUSEHOVERTIME],
+        [SPI_SETWHEELSCROLLLINES, SPI_GETWHEELSCROLLLINES],
+        [SPI_SETWHEELSCROLLCHARS, SPI_GETWHEELSCROLLCHARS],
+        [SPI_SETMENUSHOWDELAY, SPI_GETMENUSHOWDELAY],
+        [SPI_SETMOUSESPEED, SPI_GETMOUSESPEED],
+        [SPI_SETDRAGWIDTH, SPI_GETDRAGWIDTH_X],
+        [SPI_SETDRAGHEIGHT, SPI_GETDRAGHEIGHT_Y],
+        [SPI_SETFOREGROUNDLOCKTIMEOUT, SPI_GETFOREGROUNDLOCKTIMEOUT],
+        [SPI_SETFOREGROUNDFLASHCOUNT, SPI_GETFOREGROUNDFLASHCOUNT],
+        [SPI_SETCARETWIDTH, SPI_GETCARETWIDTH],
+        [SPI_SETMOUSETRAILS, SPI_GETMOUSETRAILS],
+        [SPI_SETLOWPOWERTIMEOUT, SPI_GETLOWPOWERTIMEOUT],
+        [SPI_SETPOWEROFFTIMEOUT, SPI_GETPOWEROFFTIMEOUT],
+        [SPI_SETLOWPOWERACTIVE, SPI_GETLOWPOWERACTIVE],
+        [SPI_SETPOWEROFFACTIVE, SPI_GETPOWEROFFACTIVE],
+    ]);
+    for (const [set, get] of SPI_UI_EFFECT_SET_TO_GET) spiSetToGet.set(set, get);
+
+    /** SPI_SETMOUSE's three-int accel curve, and what SPI_GETMOUSE reads back. */
+    const mouseAccel = [6, 10, 1];
+
+    const systemParametersInfo = (wide: boolean): ThunkImplementation => (ctx, mem, args) => {
+        const uiAction = args[0] >>> 0;
+        const uiParam = args[1] >>> 0;
+        const pvParam = args[2] >>> 0;
+        const api = wide ? 'SystemParametersInfoW' : 'SystemParametersInfoA';
+        const v = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const canWrite = (bytes: number) =>
+            pvParam !== 0 && isValidAddress(mem, pvParam, bytes, 'rw');
+        const putDword = (value: number): number => {
+            if (!canWrite(4)) return 0;
+            v.setUint32(pvParam, value >>> 0, true);
+            return 1;
+        };
+        const logFontSize = wide ? 92 : 60;
+
+        // A scalar GET: pvParam is a DWORD out-param. Never report success without
+        // writing it — the caller cannot tell an unwritten buffer from an answer.
+        if (spiSettings.has(uiAction)) {
+            return putDword(spiSettings.get(uiAction)!);
+        }
+        const getSlot = spiSetToGet.get(uiAction);
+        if (getSlot !== undefined) {
+            // Windows takes the new value from uiParam for most SETs, and from pvParam for
+            // the ones whose value does not fit a UINT range check (the wheel/hover family).
+            const fromPv = SPI_SET_VALUE_IN_PVPARAM.has(uiAction);
+            spiSettings.set(getSlot, fromPv ? pvParam : uiParam);
+            return 1;
+        }
+
+        switch (uiAction) {
+            // --- pointer / input -------------------------------------------------
+            case SPI_GETMOUSE:
+                if (!canWrite(12)) return 0;
+                for (let i = 0; i < 3; i++) v.setInt32(pvParam + i * 4, mouseAccel[i]!, true);
+                return 1;
+            case SPI_SETMOUSE:
+                if (!canWrite(12)) return 0;
+                for (let i = 0; i < 3; i++) mouseAccel[i] = v.getInt32(pvParam + i * 4, true);
+                return 1;
+            case SPI_SETDOUBLECLICKTIME:
+                doubleClickTimeMs = uiParam || 500;
+                return 1;
+            case SPI_SETMOUSEBUTTONSWAP:
+                mouseButtonsSwapped = uiParam !== 0;
+                return 1;
+            case SPI_SETDOUBLECLKWIDTH:
+            case SPI_SETDOUBLECLKHEIGHT:
+                return 1;
+
+            // --- desktop geometry -------------------------------------------------
+            case SPI_GETWORKAREA: {
+                // No taskbar is modelled, so the work area IS the virtual screen. A caller
+                // left with an unwritten RECT sizes and positions its window from stack
+                // garbage — off-screen, or a few million pixels wide.
+                if (!canWrite(16)) return 0;
+                const r = getVirtualScreenRect();
+                v.setInt32(pvParam, r.left, true);
+                v.setInt32(pvParam + 4, r.top, true);
+                v.setInt32(pvParam + 8, r.right, true);
+                v.setInt32(pvParam + 12, r.bottom, true);
+                return 1;
+            }
+            case SPI_SETWORKAREA:
+                // The work area is ours to publish, not the app's to shrink.
+                return 1;
+            case SPI_ICONHORIZONTALSPACING:
+            case SPI_ICONVERTICALSPACING:
+                // Dual-purpose: pvParam non-NULL is the GET, otherwise uiParam is the SET.
+                return pvParam ? putDword(75) : 1;
+
+            // --- metric structs ---------------------------------------------------
+            case SPI_GETNONCLIENTMETRICS: {
+                const size = wide ? 500 : 340;
+                const cb = pvParam && isValidAddress(mem, pvParam, 4, 'rw') ? v.getUint32(pvParam, true) : 0;
+                // XP appended iPaddedBorderWidth; both sizes are legal, nothing else is.
+                if (cb !== size && cb !== size + 4) return 0;
+                if (!canWrite(cb)) return 0;
+                let o = 4;
+                const putInt = (value: number) => { v.setInt32(pvParam + o, value, true); o += 4; };
+                const putFont = (height: number, weight: number) => {
+                    writeLogFont(mem, pvParam + o, wide, height, weight, CLASSIC_UI_FACE);
+                    o += logFontSize;
+                };
+                putInt(1);   // iBorderWidth  (SM_CXBORDER)
+                putInt(16);  // iScrollWidth  (SM_CXVSCROLL)
+                putInt(16);  // iScrollHeight (SM_CYHSCROLL)
+                putInt(18);  // iCaptionWidth (SM_CXSIZE)
+                putInt(18);  // iCaptionHeight — SM_CYCAPTION is this + 1
+                putFont(-11, 700);  // lfCaptionFont (bold 8pt)
+                putInt(12);  // iSmCaptionWidth  (SM_CXSMSIZE)
+                putInt(14);  // iSmCaptionHeight (SM_CYSMSIZE)
+                putFont(-11, 700);  // lfSmCaptionFont
+                putInt(18);  // iMenuWidth  (SM_CXMENUSIZE)
+                putInt(18);  // iMenuHeight — SM_CYMENU is this + 1
+                putFont(-11, 400);  // lfMenuFont
+                putFont(-11, 400);  // lfStatusFont
+                putFont(-11, 400);  // lfMessageFont
+                if (cb === size + 4) v.setInt32(pvParam + o, 0, true); // iPaddedBorderWidth
+                return 1;
+            }
+            case SPI_GETICONMETRICS: {
+                const size = wide ? 108 : 76;
+                const cb = pvParam && isValidAddress(mem, pvParam, 4, 'rw') ? v.getUint32(pvParam, true) : 0;
+                if (cb !== size || !canWrite(size)) return 0;
+                v.setInt32(pvParam + 4, 75, true);   // iHorzSpacing (SM_CXICONSPACING)
+                v.setInt32(pvParam + 8, 75, true);   // iVertSpacing
+                v.setInt32(pvParam + 12, 1, true);   // iTitleWrap
+                writeLogFont(mem, pvParam + 16, wide, -11, 400, CLASSIC_UI_FACE);
+                return 1;
+            }
+            case SPI_GETMINIMIZEDMETRICS: {
+                const cb = pvParam && isValidAddress(mem, pvParam, 4, 'rw') ? v.getUint32(pvParam, true) : 0;
+                if (cb !== 20 || !canWrite(20)) return 0;
+                v.setInt32(pvParam + 4, 154, true);  // iWidth  (SM_CXMINIMIZED is this + 6)
+                v.setInt32(pvParam + 8, 0, true);    // iHorzGap
+                v.setInt32(pvParam + 12, 0, true);   // iVertGap
+                v.setInt32(pvParam + 16, 8, true);   // iArrange = ARW_HIDE (SM_ARRANGE)
+                return 1;
+            }
+            case SPI_GETICONTITLELOGFONT:
+                if (uiParam < logFontSize || !canWrite(logFontSize)) return 0;
+                writeLogFont(mem, pvParam, wide, -11, 400, CLASSIC_UI_FACE);
+                return 1;
+            case SPI_GETANIMATION: {
+                const cb = pvParam && isValidAddress(mem, pvParam, 4, 'rw') ? v.getUint32(pvParam, true) : 0;
+                if (cb !== 8 || !canWrite(8)) return 0;
+                v.setInt32(pvParam + 4, 0, true);    // iMinAnimate — no minimize animation
+                return 1;
+            }
+            case SPI_GETHIGHCONTRAST: {
+                const cb = pvParam && isValidAddress(mem, pvParam, 4, 'rw') ? v.getUint32(pvParam, true) : 0;
+                if (cb !== 12 || !canWrite(12)) return 0;
+                v.setUint32(pvParam + 4, 0x00000002, true); // HCF_AVAILABLE, not HCF_HIGHCONTRASTON
+                v.setUint32(pvParam + 8, 0, true);          // lpszDefaultScheme
+                return 1;
+            }
+            // Accessibility feature blocks. Every one of them is off here, and "off" is a
+            // real answer: zeroing the struct past cbSize says exactly that.
+            case SPI_GETFILTERKEYS:
+            case SPI_GETSTICKYKEYS:
+            case SPI_GETTOGGLEKEYS:
+            case SPI_GETMOUSEKEYS:
+            case SPI_GETACCESSTIMEOUT:
+            case SPI_GETSOUNDSENTRY: {
+                const cb = pvParam && isValidAddress(mem, pvParam, 4, 'rw') ? v.getUint32(pvParam, true) : 0;
+                if (cb < 8 || cb > 256 || !canWrite(cb)) return 0;
+                for (let i = 4; i < cb; i++) mem[pvParam + i] = 0;
+                return 1;
+            }
+
+            case SPI_GETDEFAULTINPUTLANG: {
+                // The one HKL GetKeyboardLayout hands out — two answers about the same
+                // layout must not disagree.
+                const langId = EmulatorConfig.getInstance().lcid & 0xffff;
+                return putDword((langId << 16) | langId);
+            }
+
+            // --- strings ---------------------------------------------------------
+            case SPI_GETDESKWALLPAPER: {
+                // There is no wallpaper; the empty string is what Windows returns then.
+                const bytes = wide ? 2 : 1;
+                if (uiParam < 1 || !canWrite(bytes)) return 0;
+                if (wide) v.setUint16(pvParam, 0, true); else mem[pvParam] = 0;
+                return 1;
+            }
+
+            // --- accepted no-ops --------------------------------------------------
+            // Settings that describe a desktop we do not draw. Accepting them is faithful
+            // (the value is stored by the shell, not observed by the app) and refusing
+            // would fail an installer's cosmetic pass for no reason.
+            case SPI_SETDESKWALLPAPER:
+            case SPI_SETDESKPATTERN:
+            case SPI_SETCURSORS:
+            case SPI_SETICONS:
+            case SPI_SETICONTITLELOGFONT:
+            case SPI_SETNONCLIENTMETRICS:
+            case SPI_SETICONMETRICS:
+            case SPI_SETMINIMIZEDMETRICS:
+            case SPI_SETANIMATION:
+            case SPI_SETDEFAULTINPUTLANG:
+            case SPI_SETLANGTOGGLE:
+            case SPI_SETSCREENSAVERRUNNING:
+                return 1;
+
+            default:
+                // Everything else: we do not know the parameter, so we cannot answer it.
+                // TRUE with an untouched pvParam is the one answer the caller cannot
+                // detect — it would read its own stack as the setting.
+                Logger.warn(LogCategory.USER32,
+                    `${api}: unimplemented action 0x${uiAction.toString(16)} -> FALSE (pvParam untouched)`);
+                return 0;
+        }
     };
-    exports['SystemParametersInfoW'] = exports['SystemParametersInfoA'];
+    exports['SystemParametersInfoA'] = systemParametersInfo(false);
+    exports['SystemParametersInfoW'] = systemParametersInfo(true);
 
     // ==================== Rect Functions ====================
 
