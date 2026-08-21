@@ -395,19 +395,19 @@ export class GlideBackendExecutor extends Legacy3DExecutor {
         // while ImageData is always RGBA — copying rows straight through hands back a
         // red/blue-swapped frame that still looks plausible. Same swizzle the screen route
         // (WebGPUBackend.captureScreen) applies; the two must not disagree about colour.
+        // Alpha forced opaque, as on the screen route (WebGPUBackend.captureMirroredFrame):
+        // this offscreen is the swap-chain image and the canvas is alphaMode:"opaque", so its
+        // alpha is not coverage. Carried into ImageData it premultiplies the picture away and
+        // the capture returns a transparent PNG that reads as a plausible black frame.
         const swapRB = (this.backend.getFormat() ?? "bgra8unorm") === "bgra8unorm";
         for (let y = 0; y < height; y++) {
             const src = y * paddedRowBytes;
             const dst = y * rowBytes;
-            if (!swapRB) {
-                pixels.set(mapped.subarray(src, src + rowBytes), dst);
-                continue;
-            }
             for (let x = 0, s = src, d = dst; x < width; x++, s += 4, d += 4) {
-                pixels[d] = mapped[s + 2]!;
+                pixels[d] = mapped[s + (swapRB ? 2 : 0)]!;
                 pixels[d + 1] = mapped[s + 1]!;
-                pixels[d + 2] = mapped[s]!;
-                pixels[d + 3] = mapped[s + 3]!;
+                pixels[d + 2] = mapped[s + (swapRB ? 0 : 2)]!;
+                pixels[d + 3] = 255;
             }
         }
         readback.unmap();

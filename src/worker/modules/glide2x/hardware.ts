@@ -7,8 +7,11 @@ import { framePacer } from "../../core/frame-pacer";
 import {
     FXFALSE,
     FXTRUE,
+    GLIDE_FBI_REV,
     GLIDE_FBRAM_MB,
+    GLIDE_TMU_COUNT,
     GLIDE_TMU_MEMORY_BYTES,
+    GLIDE_TMU_REV,
     GLIDE_VERSION_STRING,
     GR_BUFFER_BACKBUFFER,
     GR_BUFFER_FRONTBUFFER,
@@ -123,17 +126,39 @@ export function createHardwareExports(context: GlideContext): Record<string, Thu
         "_grSstQueryHardware@4": (_ctx, _mem, args) => {
             const cfgPtr = args[0] >>> 0;
             if (!cfgPtr) return FXFALSE;
-            const ok = hwConfigView.setPtr(cfgPtr).writeSingleVoodoo(GLIDE_FBRAM_MB, 0);
-            context.diagnostics.push("init", `grSstQueryHardware cfg=0x${cfgPtr.toString(16)} ok=${ok ? 1 : 0}`);
+            const ok = hwConfigView.setPtr(cfgPtr).writeSingleVoodoo(
+                GLIDE_FBRAM_MB, GLIDE_FBI_REV, GLIDE_TMU_COUNT, GLIDE_TMU_MEMORY_BYTES >>> 20, GLIDE_TMU_REV);
+            context.diagnostics.push("init",
+                `grSstQueryHardware cfg=0x${cfgPtr.toString(16)} ok=${ok ? 1 : 0} ` +
+                `fbRam=${GLIDE_FBRAM_MB}MB nTexelfx=${GLIDE_TMU_COUNT} tmuRam=${GLIDE_TMU_MEMORY_BYTES >>> 20}MB`);
+            Logger.log(LogCategory.SYSTEM,
+                `[Glide] grSstQueryHardware -> 1 board, fbRam=${GLIDE_FBRAM_MB}MB fbiRev=${GLIDE_FBI_REV} ` +
+                `nTexelfx=${GLIDE_TMU_COUNT} tmuRev=${GLIDE_TMU_REV} tmuRam=${GLIDE_TMU_MEMORY_BYTES >>> 20}MB ok=${ok ? 1 : 0}`);
             return ok ? FXTRUE : FXFALSE;
         },
 
         "_grSstQueryBoards@4": (_ctx, _mem, args) => {
             const cfgPtr = args[0] >>> 0;
             if (!cfgPtr) return FXFALSE;
-            const ok = hwConfigView.setPtr(cfgPtr).writeSingleVoodoo(GLIDE_FBRAM_MB, 0);
+            const ok = hwConfigView.setPtr(cfgPtr).writeSingleVoodoo(
+                GLIDE_FBRAM_MB, GLIDE_FBI_REV, GLIDE_TMU_COUNT, GLIDE_TMU_MEMORY_BYTES >>> 20, GLIDE_TMU_REV);
             return ok ? FXTRUE : FXFALSE;
         },
+
+        // The resolution grSstWinOpen actually gave us. Titles read these instead of
+        // re-deriving the mode they asked for, and a garbage answer scales the HUD /
+        // sizes an LFB copy against the wrong stride.
+        "_grSstScreenWidth@0": () => context.width >>> 0,
+        "_grSstScreenHeight@0": () => context.height >>> 0,
+
+        // We render each Glide command synchronously, so the FIFO is never backed up;
+        // a title polling grSstIsBusy() before touching the LFB must see FXFALSE or it
+        // spins forever.
+        "_grSstIsBusy@0": () => FXFALSE,
+
+        // No beam: a title gating an LFB write on "are we in retrace" must be able to
+        // proceed, so the window is always open. FXFALSE here is the shape that hangs.
+        "_grSstVRetraceOn@0": () => FXTRUE,
 
         "_grSstSelect@4": (_ctx, _mem, args) => {
             context.selectedSst = args[0] | 0;

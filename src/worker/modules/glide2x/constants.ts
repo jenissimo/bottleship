@@ -10,16 +10,38 @@ export const GLIDE_MAX_SSTS = 1;
 export const GLIDE_FBRAM_MB = 4;
 export const GLIDE_TMU_COUNT = 2;
 export const GLIDE_TMU_MEMORY_BYTES = 4 * 1024 * 1024;
+/** Silicon revisions reported in GrVoodooConfig_t / GrTMUConfig_t. Retail Voodoo
+ *  Graphics: FBI rev 2, TREX rev 1 — 0 is the prototype stepping some titles reject. */
+export const GLIDE_FBI_REV = 2;
+export const GLIDE_TMU_REV = 1;
 
 export const GLIDE_EVENT_RING_CAPACITY = 256;
 export const GLIDE_LFB_GUARD_BYTES = 32;
 export const GLIDE_LFB_CANARY_VALUE = 0xa5;
 
-// GrHwConfiguration (minimal subset used by games/drivers)
+// GrHwConfiguration (glide.h):
+//   int num_sst;
+//   struct { GrSstType type; union { GrVoodooConfig_t VoodooConfig; ... } sstBoard; } SSTs[MAX_NUM_SST];
+// GrVoodooConfig_t = { int fbRam; int fbiRev; int nTexelfx; FxBool sliDetect;
+//                      GrTMUConfig_t tmuConfig[GLIDE_NUM_TMU]; }
+// GrTMUConfig_t    = { int tmuRev; int tmuRam; }
+// The board query is how a Glide title asks "what silicon is this?" — it sizes its
+// texture cache from tmuRam and picks single- vs multi-pass from nTexelfx, so the
+// tail of this struct is not optional detail: left zeroed it reads as a board with
+// no texture units and no texture memory.
 export const GR_HWCONFIG_NUM_SST_OFFSET = 0x00;
 export const GR_HWCONFIG_SST0_TYPE_OFFSET = 0x04;
 export const GR_HWCONFIG_SST0_FBRAM_OFFSET = 0x08;
 export const GR_HWCONFIG_SST0_FBIREV_OFFSET = 0x0c;
+export const GR_HWCONFIG_SST0_NTEXELFX_OFFSET = 0x10;
+export const GR_HWCONFIG_SST0_SLIDETECT_OFFSET = 0x14;
+export const GR_HWCONFIG_SST0_TMUCONFIG_OFFSET = 0x18;
+export const GR_TMUCONFIG_TMUREV_OFFSET = 0x00;
+export const GR_TMUCONFIG_TMURAM_OFFSET = 0x04;
+export const GR_TMUCONFIG_SIZE = 0x08;
+
+/** GrSstType: the board kind reported in SSTs[n].type. */
+export const GR_SSTTYPE_VOODOO = 0;
 
 // GrTexInfo
 export const GR_TEXINFO_SMALL_LOD_OFFSET = 0x00;
