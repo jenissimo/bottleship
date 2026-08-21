@@ -21,6 +21,8 @@ import {
     CI_TYPE, CI_MODE, CI_VERT_OFFSET, CI_VERT_COUNT, CI_FLAGS, CI_TEX_ID0, CI_TEX_ID1,
     CI_SCISSOR_X, CI_SCISSOR_Y, CI_SCISSOR_W, CI_SCISSOR_H,
     CI_VP_X, CI_VP_Y, CI_VP_W, CI_VP_H, CI_CLEAR_MASK,
+    CI_TEXENV0, CI_TEXENV1, CI_COMBINE0_RGB, CI_COMBINE0_ALPHA, CI_COMBINE1_RGB, CI_COMBINE1_ALPHA,
+    CF_ENV_COLOR0, CF_ENV_COLOR1,
 } from "../../modules/opengl32/context";
 import { armGLFrameCapture, takeGLFrameCapture } from "../../modules/opengl32/frame-capture";
 import type { OpenGLContext, GLTextureObject } from "../../modules/opengl32/context";
@@ -33,6 +35,50 @@ function glCtx(): OpenGLContext {
 }
 
 const round = (v: number): number => Math.round(v * 1000) / 1000;
+
+// ---- Texture environment decoding ----
+//
+// "Does this title actually take the GL_COMBINE path, and with what?" is not answerable
+// from a screenshot — a wrong combiner and a missing one both just look wrong. These
+// decoders print the per-draw texture environment the executor is about to run, which
+// is the positive control for the combiner: a draw that reads `MODULATE` never entered
+// it, and a draw that reads e.g. `MODULATE(TEXTURE.rgb, PREVIOUS.rgb) x2` did.
+
+const TEX_ENV_MODE_NAMES: Record<number, string> = {
+    0x2100: "MODULATE", 0x2101: "DECAL", 0x1E01: "REPLACE", 0x0104: "ADD",
+    0x0BE2: "BLEND", 0x8570: "COMBINE",
+};
+const COMBINER_FN_NAMES = [
+    "REPLACE", "MODULATE", "ADD", "ADD_SIGNED", "INTERPOLATE", "SUBTRACT", "DOT3_RGB", "DOT3_RGBA",
+];
+const COMBINER_FN_ARITY = [1, 2, 2, 2, 3, 2, 2, 2];
+const COMBINER_SRC_NAMES = ["TEXTURE", "CONSTANT", "PRIMARY", "PREVIOUS"];
+const COMBINER_OP_SUFFIX = [".rgb", ".1-rgb", ".a", ".1-a"];
+
+function decodeCombinerWord(word: number): string {
+    const fn = word & 15;
+    const args: string[] = [];
+    for (let a = 0; a < (COMBINER_FN_ARITY[fn] ?? 2); a++) {
+        const src = (word >>> (4 + a * 4)) & 3;
+        const op = (word >>> (6 + a * 4)) & 3;
+        args.push(`${COMBINER_SRC_NAMES[src]}${COMBINER_OP_SUFFIX[op]}`);
+    }
+    const scale = 1 << ((word >>> 16) & 3);
+    return `${COMBINER_FN_NAMES[fn]}(${args.join(", ")})${scale > 1 ? ` x${scale}` : ""}`;
+}
+
+function decodeTexEnv(
+    mode: number, rgbWord: number, alphaWord: number, F: Float32Array, colorBase: number,
+): unknown {
+    const name = TEX_ENV_MODE_NAMES[mode] ?? "0x" + (mode >>> 0).toString(16);
+    if (mode !== 0x8570) return name;
+    return {
+        mode: name,
+        rgb: decodeCombinerWord(rgbWord),
+        alpha: decodeCombinerWord(alphaWord),
+        constant: [F[colorBase], F[colorBase + 1], F[colorBase + 2], F[colorBase + 3]].map(round),
+    };
+}
 
 export function registerGlCommands(svc: HarnessService): void {
     svc.register("glFrame", async (args) => {
@@ -87,6 +133,8 @@ export function registerGlCommands(svc: HarnessService): void {
             commands.push({
                 k, cmd: "DRAW", mode: I[i + CI_MODE], verts: n,
                 tex0: I[i + CI_TEX_ID0], tex1: I[i + CI_TEX_ID1],
+                env0: decodeTexEnv(I[i + CI_TEXENV0], I[i + CI_COMBINE0_RGB], I[i + CI_COMBINE0_ALPHA], F, f + CF_ENV_COLOR0),
+                env1: decodeTexEnv(I[i + CI_TEXENV1], I[i + CI_COMBINE1_RGB], I[i + CI_COMBINE1_ALPHA], F, f + CF_ENV_COLOR1),
                 flags: "0x" + (I[i + CI_FLAGS] >>> 0).toString(16),
                 vp, scissor: [I[i + CI_SCISSOR_X], I[i + CI_SCISSOR_Y], I[i + CI_SCISSOR_W], I[i + CI_SCISSOR_H]],
                 ndc: n ? [round(x0), round(x1), round(y0), round(y1)] : null,

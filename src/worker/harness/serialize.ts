@@ -25,6 +25,7 @@ import { THREAD_STATE_NAMES, WAIT_REASON_NAMES } from "../core/scheduler/types";
 import { videoEngine } from "../../video/video-engine";
 import { getFfmpegHleStats } from "../modules/ffmpeg/native-patch";
 import { Logger, LogCategory } from "../core/logger";
+import { getSurfaceFormatLayout } from "../backends/webgpu/shared/texture-formats";
 
 /* ───────────────────────── low-level access helpers ───────────────────────── */
 
@@ -177,6 +178,18 @@ export function serializeSurfaces(): unknown {
             height: st.height,
             pitch: st.pitch ?? 0,
             bpp: st.format?.bpp ?? 0,
+            // A DDPF_FOURCC surface carries NO bit count and no masks by contract, so bpp
+            // alone renders a DXT surface indistinguishable from an RGB one in this dump —
+            // and "the pitch is linear where it should be blocked" is exactly the bug shape
+            // that hides there. expectedPitch is what the format's own layout demands.
+            fourCC: st.format?.fourCC
+                ? String.fromCharCode(
+                    st.format.fourCC & 0xff, (st.format.fourCC >>> 8) & 0xff,
+                    (st.format.fourCC >>> 16) & 0xff, (st.format.fourCC >>> 24) & 0xff)
+                : null,
+            expectedPitch: st.format
+                ? getSurfaceFormatLayout(st.format, st.width, st.height).pitch
+                : null,
             caps: u32(st.caps),
             surfaceType: st.surfaceType ?? null,
             mode: st.mode ?? null,

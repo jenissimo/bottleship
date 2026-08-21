@@ -117,9 +117,21 @@ export function registerTextureCommands(svc: HarnessService): void {
     /** A D3D9 TextureStore handle, decoded to RGBA — the store DDraw's readSurfaceRGBA
      *  cannot see. Tried whenever the selector is not a DDraw surface, so one verb serves
      *  both backends and a d3d9-only title is no longer a dead end. */
-    const dumpD3d9 = async (ptr: number): Promise<{ rgba: Uint8Array; w: number; h: number; format: number } | { err: string } | null> => {
+    const dumpD3d9 = async (
+        ptr: number,
+        from?: "auto" | "gpu" | "scratch",
+    ): Promise<{ rgba: Uint8Array; w: number; h: number; format: number } | { err: string } | null> => {
         let reason: { err: string } | null = null;
         for (const dev of d3d9Devices.values()) {
+            // "the store has the pixels, does the GPU copy?" is the whole question when a draw
+            // with correct geometry and a populated texture renders nothing — a missed upload
+            // is invisible from the store side, which is the side every other verb reads.
+            if (from === "gpu") {
+                const g = await (dev as any).readRenderTargetRgba?.(ptr);
+                if (g && !("err" in g)) return g;
+                reason = g ?? reason;
+                continue;
+            }
             const r = (dev as any).readTextureRgba?.(ptr);
             if (!r) continue;
             if (!("err" in r)) return r;
@@ -174,22 +186,23 @@ export function registerTextureCommands(svc: HarnessService): void {
             return { saved: debugDumpPath(name), ptr: "0x" + ptr.toString(16), w, h, source };
         };
 
+        const d9Source = opts.from === "gpu" ? "d3d9-gpu" : "d3d9-store";
         const d8 = dumpD3d8(ptr);
         if (d8) return emit(d8.rgba, d8.w, d8.h, `d3d8-texture(fmt ${d8.d3dFormat})`);
 
         const dd = ddraw();
-        if (dd?.readSurfaceRGBA) {
+        if (dd?.readSurfaceRGBA && opts.from !== "gpu") {
             const r = await dd.readSurfaceRGBA(ptr, opts.from ?? "auto");
             if (!("err" in r)) return emit(r.rgba, r.w, r.h, r.source);
-            const d9 = await dumpD3d9(ptr);
+            const d9 = await dumpD3d9(ptr, opts.from);
             if (!d9) throw new HarnessError(`readSurfaceRGBA: ${r.err} (and no d3d9 texture with that handle)`, HarnessErrorCode.INTERNAL);
             if ("err" in d9) throw new HarnessError(`d3d9 texture 0x${ptr.toString(16)}: ${d9.err}`, HarnessErrorCode.UNSUPPORTED);
-            return emit(d9.rgba, d9.w, d9.h, `d3d9-store(fmt ${d9.format})`);
+            return emit(d9.rgba, d9.w, d9.h, `${d9Source}(fmt ${d9.format})`);
         }
-        const d9 = await dumpD3d9(ptr);
+        const d9 = await dumpD3d9(ptr, opts.from);
         if (!d9) throw new HarnessError("no DDraw surface and no D3D9 texture with that handle", HarnessErrorCode.NOT_FOUND);
         if ("err" in d9) throw new HarnessError(`d3d9 texture 0x${ptr.toString(16)}: ${d9.err}`, HarnessErrorCode.UNSUPPORTED);
-        return emit(d9.rgba, d9.w, d9.h, `d3d9-store(fmt ${d9.format})`);
+        return emit(d9.rgba, d9.w, d9.h, `${d9Source}(fmt ${d9.format})`);
     };
     svc.register("dumpSurface", dump);
     svc.register("dumpTexture", dump);
@@ -472,20 +485,53 @@ export function registerTextureCommands(svc: HarnessService): void {
      *  Reading the same answer out of the log firehose is not possible — the flags change
      *  the picture, and the picture is the measurement.
      *
-     *  Call with no name to read the current flags. Toggles are sticky; clear them when
-     *  done or every later observation inherits them. */
+     *  The D3D9 backend carries the four stage-removal levers (`forceCullNone`,
+     *  `forceDisableZTest`, `forceDisableAlphaTest`, `forceDisableAlphaBlend`); DDraw/D3D7/D3D8
+     *  carry the fuller set above. A name no live backend owns is an ERROR, never a no-op.
+     *
+     *  Call with no name to read the current flags, keyed by backend. Toggles are sticky;
+     *  clear them when done or every later observation inherits them. */
     svc.register("gpuToggle", (args) => {
         const name = args[0] as string | undefined;
-        const exec = ddraw()?.context?.executor;
-        if (!exec) throw new HarnessError("ddraw executor not available (no DDraw/D3D7 backend)", HarnessErrorCode.UNSUPPORTED);
-        if (name === undefined) return exec.getDebugFlags?.() ?? null;
-        if (typeof exec.setDebugToggle !== "function") {
-            throw new HarnessError("executor has no setDebugToggle", HarnessErrorCode.UNSUPPORTED);
+        // Every live render backend, not just DDraw: a D3D9-only title used to get UNSUPPORTED
+        // here and the A/B had to be done with live patches through evalWorker.
+        const targets: Array<{ backend: string; obj: any }> = [];
+        const ddrawExec = ddraw()?.context?.executor;
+        if (ddrawExec) targets.push({ backend: "ddraw", obj: ddrawExec });
+        for (const [ptr, dev] of d3d9Devices) {
+            if ((dev as any).setDebugToggle) targets.push({ backend: `d3d9:0x${(ptr >>> 0).toString(16)}`, obj: dev });
         }
+        if (!targets.length) {
+            throw new HarnessError("no render backend with debug toggles (no DDraw/D3D7 executor, no D3D9 device)", HarnessErrorCode.UNSUPPORTED);
+        }
+
+        const flagsOf = (t: { backend: string; obj: any }) => t.obj.getDebugFlags?.() ?? null;
+        if (name === undefined) {
+            return Object.fromEntries(targets.map((t) => [t.backend, flagsOf(t)]));
+        }
+
         const enabled = args[1] === undefined ? true : !!args[1];
         const value = args[2] as number | undefined;
-        exec.setDebugToggle(name, enabled, value);
-        return { toggle: name, enabled, value: value ?? null, flags: exec.getDebugFlags?.() ?? null };
+        // A toggle nobody owns must be an ERROR: a silently ignored name is an A/B that
+        // measures nothing while reading as "this stage is not the cause".
+        const applied: string[] = [];
+        for (const t of targets) {
+            const flags = flagsOf(t);
+            if (!flags || !(name in flags)) continue;
+            t.obj.setDebugToggle(name, enabled, value);
+            applied.push(t.backend);
+        }
+        if (!applied.length) {
+            const known = [...new Set(targets.flatMap((t) => Object.keys(flagsOf(t) ?? {})))].sort();
+            throw new HarnessError(
+                `no live backend has a debug toggle named '${name}'. Available: ${known.join(", ")}`,
+                HarnessErrorCode.BAD_ARGS,
+            );
+        }
+        return {
+            toggle: name, enabled, value: value ?? null, applied,
+            flags: Object.fromEntries(targets.map((t) => [t.backend, flagsOf(t)])),
+        };
     });
 
     /** drawScrub(min?, max?) — RenderDoc-style bisect for the D3D9 backend: render only

@@ -77,7 +77,17 @@ export function registerScreenCommands(svc: HarnessService): void {
                     HarnessErrorCode.UNSUPPORTED,
                 );
             }
-            blob = await active.capturePresentedLayer();
+            // A presenter that refuses is saying "I have no layer to show you". Report that
+            // reason — the alternative every layer capture used to take was a black PNG.
+            try {
+                blob = await active.capturePresentedLayer();
+            } catch (err) {
+                throw new HarnessError(
+                    `presenter layer capture refused: ${(err as Error).message}.`
+                    + " Use the default source:'screen'.",
+                    HarnessErrorCode.UNSUPPORTED,
+                );
+            }
             source = "layer";
             warning = LAYER_BLIND_SPOT;
         } else {
@@ -441,5 +451,19 @@ export function registerScreenCommands(svc: HarnessService): void {
         const snapshot = active.declCensus();
         if (opts.reset) active.resetDeclCensus();
         return snapshot;
+    });
+
+    /** shaderCensus() — the compiled D3D9 vertex/pixel shaders: version, the constant-array
+     *  bound the generated WGSL was given, the highest STATICALLY referenced register, and
+     *  whether the program reads constants relatively (c[a0+n]).
+     *
+     *  `relative:true` with `constants` below `registerFile` is a silent wrong answer waiting
+     *  to happen: an out-of-range relative read is clamped, never faulted, so a matrix-palette
+     *  index past the array resolves to one fixed matrix and those vertices erupt out of the
+     *  mesh. The picture reads as a skinning/declaration bug and nothing else names the cause. */
+    svc.register("shaderCensus", () => {
+        const active: any = sys().services?.render?.getActive?.();
+        if (!active?.shaderCensus) throw new HarnessError("active presenter has no shaderCensus (not D3D9)", HarnessErrorCode.UNSUPPORTED);
+        return active.shaderCensus();
     });
 }

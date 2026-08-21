@@ -9,7 +9,8 @@
  *   bun tools/re/re.ts decompile <addr|name>
  *   bun tools/re/re.ts disasm <addr> [len]
  *   bun tools/re/re.ts callers|xrefs <addr>
- *   bun tools/re/re.ts symbols | strings | info | doctor
+ *   bun tools/re/re.ts symbols | strings | info
+ *   bun tools/re/re.ts doctor                  backend availability; answers with the service down too
  *   bun tools/re/re.ts resolve <eip> [--base <liveModuleBase>]   wild-EIP -> func
  *   bun tools/re/re.ts exportSymbolMap [--out game.symbols.json] [--module name]
  *
@@ -20,26 +21,76 @@
  *    loadSymbols(module, symbols) so breakOnSymbol('mod!Func') works.
  */
 
-import { openSync } from "node:fs";
-import { delimiter as PATH_DELIM } from "node:path";
+import { existsSync, openSync } from "node:fs";
+import { delimiter as PATH_DELIM, join } from "node:path";
 import { ensureReEnv } from "./bootstrap";
 
-const PORT = 9334;
+// Overridable so the service-down path stays exercisable (point it at a dead port); the
+// default is what every caller and the spawned service use.
+const PORT = Number(process.env.RE_PORT ?? 9334);
 const HERE = import.meta.dir;
 
+const NOT_RUNNING = `the RE service is not running on port ${PORT}.\n`
+    + `  Start it (this also opens the binary and runs the one-time analysis):\n`
+    + `      bun tools/re/re.ts start <binary>\n`
+    + `  Then re-run this command. \`re doctor\` reports backend availability without the service.`;
+
+/** Rewrite the service's own failures into something that names the fix. */
+function explain(cmd: string, error: string): string {
+    if (/LockException|Unable to lock project/i.test(error)) {
+        return `${cmd}: the cached Ghidra project is locked.\n`
+            + `  The service holds one binary at a time and the first \`open\` keeps the lock for the whole\n`
+            + `  analysis (minutes on a large image). Wait for it to finish — \`re doctor\` shows "open" once\n`
+            + `  it has — rather than issuing a second \`open\`.\n`
+            + `  If no re-service.py process is alive, the lock is stale: delete the *.lock/*.lock~ under the\n`
+            + `  project's own hash directory (see projectRoot in \`re doctor\`) and retry.\n`
+            + `  raw: ${error}`;
+    }
+    if (/no program open/i.test(error)) {
+        return `${cmd}: no binary is open in the service — run \`bun tools/re/re.ts open <binary>\` first.`;
+    }
+    return `${cmd}: ${error}`;
+}
+
 async function call(cmd: string, args: unknown[] = []): Promise<any> {
-    const r = await fetch(`http://localhost:${PORT}/`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cmd, args }),
-    });
+    let r: Response;
+    try {
+        r = await fetch(`http://localhost:${PORT}/`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ cmd, args }),
+        });
+    } catch {
+        // A bare fetch error here reads as a network problem and sends people looking in the
+        // wrong place; the only real cause is that nobody started the service.
+        throw new Error(`${cmd}: ${NOT_RUNNING}`);
+    }
     const j = await r.json();
-    if (!j.ok) throw new Error(`${cmd}: ${j.error}`);
+    if (!j.ok) throw new Error(explain(cmd, String(j.error)));
     return j.result;
 }
 
 async function serviceUp(): Promise<boolean> {
     try { return (await fetch(`http://localhost:${PORT}/health`)).ok; } catch { return false; }
+}
+
+/** Backend availability that can be answered without the service — what `doctor` falls back to. */
+function localDoctor(): Record<string, unknown> {
+    const repo = join(HERE, "..", "..");
+    const exe = process.platform === "win32" ? ".bat" : "";
+    const envGhidra = process.env.GHIDRA_INSTALL_DIR;
+    return {
+        serviceRunning: false,
+        port: PORT,
+        ghidraInstallDir: envGhidra ?? null,
+        ghidraInstallDirUsable: !!envGhidra && existsSync(join(envGhidra, "support", `analyzeHeadless${exe}`)),
+        repoLocalGhidraDir: existsSync(join(repo, ".ghidra")),
+        repoLocalJdkOrVenvDir: existsSync(join(repo, ".ghidra-home")),
+        peDisasFallback: existsSync(join(repo, "tools", "pe-disas.py")),
+        projectRoot: join(repo, "tmp", "ghidra_project"),
+        serviceLog: join(repo, ".ghidra-home", "re-service.log"),
+        hint: "run `bun tools/re/re.ts start <binary>`; it bootstraps Ghidra + JDK 21 + pyghidra if missing",
+    };
 }
 
 function flag(name: string): string | undefined {
@@ -83,7 +134,17 @@ async function main(): Promise<void> {
     const positional = rest.filter((a, i) => !a.startsWith("--") && !(i > 0 && rest[i - 1].startsWith("--")));
     switch (cmd) {
         case "start": await startService(positional[0]); break;
-        case "doctor": console.log(JSON.stringify(await call("doctor"), null, 2)); break;
+        case "doctor": {
+            // The one command that must answer with the service down — it is what people run to
+            // find out WHY nothing works, so it may not itself fail with a connection error.
+            if (!(await serviceUp())) {
+                console.error(NOT_RUNNING);
+                console.log(JSON.stringify(localDoctor(), null, 2));
+                process.exit(1);
+            }
+            console.log(JSON.stringify({ serviceRunning: true, port: PORT, ...(await call("doctor")) }, null, 2));
+            break;
+        }
         case "resolve": {
             const eip = positional[0];
             const liveBase = flag("--base");
