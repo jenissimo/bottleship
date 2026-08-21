@@ -319,6 +319,26 @@ function createDefaultRenderStates(): Int32Array {
     rs[D3DRENDERSTATE_SPECULARMATERIALSOURCE] = 2; // D3DMCS_COLOR2
     rs[D3DRENDERSTATE_EMISSIVEMATERIALSOURCE] = 0; // D3DMCS_MATERIAL
 
+    // --- States above the D3D7 enum that the shared FFP pipeline still reads ---
+    // The D3D7 render-state enum stops at 152, but the pipeline factory is shared with D3D8
+    // and consults COLORWRITEENABLE and BLENDOP. Both have a falsy-zero trap: 0 is a LEGAL
+    // COLORWRITEENABLE meaning "write no channel at all", so an unseeded slot reads as a
+    // legitimate instruction to blacken every title that never touches the state, and 0 is
+    // not a valid D3DBLENDOP at all. Seed the API defaults, as d3d9-state-tracker does.
+    const D3DRS_COLORWRITEENABLE = 168, D3DRS_BLENDOP = 171;
+    const ALL_CHANNELS = 0xf, D3DBLENDOP_ADD = 1;
+    rs[D3DRS_COLORWRITEENABLE] = ALL_CHANNELS;
+    rs[D3DRS_BLENDOP] = D3DBLENDOP_ADD;
+
+    // The stencil masks are the same trap one enum lower: 0 is a legal mask meaning "no
+    // bits", so a title that enables stencil without setting them would test against nothing
+    // and write nothing. The pipeline's `?? 0xff` cannot rescue it — an Int32Array element is
+    // never undefined, so the fallback is dead code and the seed is the only defence. All
+    // bits of the stencil8 attachment we actually allocate is 0xff.
+    const D3DRS_STENCILMASK = 58, D3DRS_STENCILWRITEMASK = 59, ALL_STENCIL_BITS = 0xff;
+    rs[D3DRS_STENCILMASK] = ALL_STENCIL_BITS;
+    rs[D3DRS_STENCILWRITEMASK] = ALL_STENCIL_BITS;
+
     return rs;
 }
 

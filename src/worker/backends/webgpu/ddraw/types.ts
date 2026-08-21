@@ -4,6 +4,22 @@
 
 import type { StageSamplerState } from "./ffp-stages";
 
+/** The vertex shader's `isRHW` slot is a BITFIELD, not a bool — bit 0 says the vertex is
+ *  pre-transformed (skip the MVP), bit 1 says clamp its depth instead of letting the
+ *  clipper reject it. Widening it in place keeps both uniform layouts (and their offset
+ *  tables) untouched; every reader must mask, never compare against 1. */
+export const RHW_PRETRANSFORMED = 1;
+/** Depth CLAMP instead of depth CLIP for this draw. A pre-transformed vertex carries device
+ *  coordinates, and with D3DRS_ZENABLE=FALSE its z is read by nothing: no depth test, no
+ *  depth write (see pipeline-factory — both are forced off). Real hardware still rasterizes
+ *  such a quad whatever z holds, and games leave that field stale in the vertex buffer they
+ *  reuse for HUD sprites. WebGPU clips against the view volume unconditionally unless the
+ *  optional `depth-clip-control` feature is enabled, so an out-of-range z silently deletes
+ *  the primitive — and a quad whose vertices straddle the plane loses part of itself, which
+ *  looks exactly like an invisible plane cutting the HUD. Clamping in the shader reproduces
+ *  `unclippedDepth` without depending on an optional feature. */
+export const RHW_DEPTH_CLAMP = 2;
+
 /**
  * Debug flags for active diagnostics (3D blank-screen debugging)
  */
@@ -58,6 +74,18 @@ export interface DebugFlags {
     skipMegaBatchMinIdx: number;
     /** Force the CPU vertex-conversion path for all draws, bypassing the GPU compute converter */
     forceCpuVertexPath: boolean;
+    /** DIAG: override D3DRS_COLORWRITEENABLE for every draw (-1 = off, use the app's mask).
+     *  0 is the positive control for the write mask itself: with the plumbing live the
+     *  frame must lose all colour writes while still clearing/depth-testing, which is the
+     *  only way to tell "the mask is applied" from "the mask is never consulted". */
+    forceColorWriteMask: number;
+    /** DIAG: stop clamping depth for pre-transformed draws that have depth testing off
+     *  (RHW_DEPTH_CLAMP), i.e. hand their z back to WebGPU's unconditional depth CLIP.
+     *  The A/B for "is this primitive being deleted by the clipper?": with the flag on, a
+     *  HUD quad whose stale z sits outside [0,1] disappears again, and one whose vertices
+     *  straddle the plane loses the far half. Takes effect on the next draw — the bit rides
+     *  a uniform, so no pipeline or shader is rebuilt. */
+    disableRhwDepthClamp: boolean;
     /** DIAG: render only the first N+1 draws of every frame (-1 = off, render all).
      *  The frame capture numbers draws in the same order, so bisecting this NAMES the draw
      *  that first covers a region — the only way to find which draw wrote the depth (or the
@@ -89,6 +117,8 @@ export const DEFAULT_DEBUG_FLAGS: DebugFlags = {
     skipMegaBatchDrawsRender: false,
     skipMegaBatchMinIdx: 0,
     forceCpuVertexPath: false,
+    forceColorWriteMask: -1,
+    disableRhwDepthClamp: false,
     drawScrubMax: -1,
 };
 
@@ -337,7 +367,13 @@ export interface PipelineKeyConfig {
     alphaTest: number;
     srcBlend: number;
     dstBlend: number;
+    // D3DRS_BLENDOP (add/subtract/reverse-subtract/min/max), 0 when blending is off.
+    blendOp: number;
     alphaFunc: number;
+    // D3DRS_COLORWRITEENABLE as a 4-bit RGBA mask. It is baked into the colour target
+    // state, so it MUST be keyed: without it the first pipeline built for a state wins and
+    // every later draw sharing that state inherits a foreign write mask.
+    colorWriteMask: number;
     colorKeyEnabled: number; // Affects shader: color key discard block
     // Stencil states (affect pipeline: depthStencil.stencilFront/Back)
     stencilEnable: number;
@@ -368,7 +404,8 @@ export function makeEmptyPipelineKeyConfig(): PipelineKeyConfig {
         vertexType: 0, primitiveType: 0, sampledMask: 0, stageCount: 0,
         missingTexture: false, cullMode: 0, zEnable: 0, zFunc: 0, zWrite: 0, zBias: 0,
         coplanarPass: 0,
-        alphaBlend: 0, alphaTest: 0, srcBlend: 0, dstBlend: 0, alphaFunc: 0, colorKeyEnabled: 0,
+        alphaBlend: 0, alphaTest: 0, srcBlend: 0, dstBlend: 0, blendOp: 0, alphaFunc: 0,
+        colorWriteMask: 0xf, colorKeyEnabled: 0,
         stencilEnable: 0, stencilFunc: 0, stencilFail: 0, stencilZFail: 0, stencilPass: 0,
         stencilRef: 0, stencilMask: 0, stencilWriteMask: 0,
         forceZMidpoint: false, forceCullNone: false, forceDisableZTest: false, forceDisableZWrite: false,
@@ -396,7 +433,9 @@ export function generatePipelineKey(config: PipelineKeyConfig): string {
         `at:${config.alphaTest}`,
         `sb:${config.srcBlend}`,
         `db:${config.dstBlend}`,
+        `bop:${config.blendOp}`,
         `af:${config.alphaFunc}`,
+        `cwm:${config.colorWriteMask}`,
         `ck:${config.colorKeyEnabled}`,
         `se:${config.stencilEnable}`,
         `sf:${config.stencilFunc}`,
@@ -437,6 +476,8 @@ export function generateMegaBatchPipelineKey(config: PipelineKeyConfig): string 
         // NOTE: alphaTest (at) and alphaFunc (af) are EXCLUDED - they're dynamic uniforms now
         `sb:${config.srcBlend}`,
         `db:${config.dstBlend}`,
+        `bop:${config.blendOp}`,
+        `cwm:${config.colorWriteMask}`,
         `ck:${config.colorKeyEnabled}`,
         `se:${config.stencilEnable}`,
         `sf:${config.stencilFunc}`,
@@ -475,7 +516,9 @@ export function pipelineKeyConfigsEqual(a: PipelineKeyConfig, b: PipelineKeyConf
         a.alphaTest === b.alphaTest &&
         a.srcBlend === b.srcBlend &&
         a.dstBlend === b.dstBlend &&
+        a.blendOp === b.blendOp &&
         a.alphaFunc === b.alphaFunc &&
+        a.colorWriteMask === b.colorWriteMask &&
         a.colorKeyEnabled === b.colorKeyEnabled &&
         a.stencilEnable === b.stencilEnable &&
         a.stencilFunc === b.stencilFunc &&
@@ -511,6 +554,8 @@ export function megaBatchPipelineKeyConfigsEqual(a: PipelineKeyConfig, b: Pipeli
         a.alphaBlend === b.alphaBlend &&
         a.srcBlend === b.srcBlend &&
         a.dstBlend === b.dstBlend &&
+        a.blendOp === b.blendOp &&
+        a.colorWriteMask === b.colorWriteMask &&
         a.colorKeyEnabled === b.colorKeyEnabled &&
         a.stencilEnable === b.stencilEnable &&
         a.stencilFunc === b.stencilFunc &&
@@ -573,6 +618,7 @@ export interface UniformSlotData {
     alphaRef255: number; // u32: D3DRENDERSTATE_ALPHAREF (0..255), stored as u32 in uniform buffer
     colorOp: number; // u32
     alphaOp: number; // u32
+    /** RHW_PRETRANSFORMED | RHW_DEPTH_CLAMP bitfield */
     isRHW: number; // u32
     lightingEnabled: number; // u32
     colorKeyEnabled: number; // u32
@@ -710,7 +756,7 @@ export interface DrawUniforms {
     alphaOp: number;
     /** Alpha reference (0-255) */
     alphaRef255: number;
-    /** Is RHW vertex format (pre-transformed) */
+    /** RHW_PRETRANSFORMED | RHW_DEPTH_CLAMP bitfield */
     isRHW: number;
     /** Lighting enabled flag */
     lightingEnabled: number;

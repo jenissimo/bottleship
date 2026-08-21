@@ -4,7 +4,14 @@
  * and GetCaps (IDirect3DDevice3) paths.
  */
 import { Logger, LogCategory } from "../../../core/logger";
-import { DDBD_16, DDBD_24, DDBD_32 } from "../constants";
+import {
+    DDBD_16,
+    DDBD_32,
+    D3DPMISCCAPS_MASKZ,
+    D3DPMISCCAPS_CULLNONE,
+    D3DPMISCCAPS_CULLCW,
+    D3DPMISCCAPS_CULLCCW,
+} from "../constants";
 import {
     D3DDEVICEDESC_OFFSETS,
     D3DPRIMCAPS_OFFSETS,
@@ -26,7 +33,38 @@ import {
 } from "../../../core/cpu/emulator-config";
 import { EmulatorConfig } from "../../../core/emulator-config-manager";
 
-export const zBufferMask = DDBD_16 | DDBD_24 | DDBD_32;
+/**
+ * Bit depths reported for render targets and depth buffers alike. Both lists are the same
+ * because both are bounded by what we actually serve: EnumDisplayModes offers 16 and 32 bpp,
+ * and EnumZBufferFormats offers D16 / D24X8 / D24S8 — the last two being 32 TOTAL bits, which
+ * is how every real driver reports a 24-bit depth buffer. Nothing anywhere produces a surface
+ * of 24 total bits, so DDBD_24 was a bit no code held.
+ */
+export const zBufferMask = DDBD_16 | DDBD_32;
+
+/**
+ * D3DPRIMCAPS.dwMiscCaps — only what the ddraw pipeline actually implements:
+ *   MASKZ    — D3DRENDERSTATE_ZWRITEENABLE reaches depthWriteEnabled (d3d/draw-handler.ts).
+ *   CULLNONE/CULLCW/CULLCCW — D3DRENDERSTATE_CULLMODE maps to a GPUCullMode in
+ *                             backends/webgpu/ddraw/pipeline-factory.ts, all three values.
+ * NOT MASKPLANES: there is no per-channel colour write mask on this path.
+ * NOT LINEPATTERNREP, NOT CONFORMANT.
+ */
+const D3D_PRIMCAPS_MISC =
+    D3DPMISCCAPS_MASKZ | D3DPMISCCAPS_CULLNONE | D3DPMISCCAPS_CULLCW | D3DPMISCCAPS_CULLCCW;
+
+/**
+ * dwTextureOpCaps — the D3DTOP values applyColorOp/applyAlphaOp really evaluate
+ * (backends/webgpu/ddraw/shader-generator.ts). DISABLE..SUBTRACT is contiguous (0x3ff), and
+ * the three alpha blends sit above ADDSMOOTH, which has no WGSL body and is therefore absent.
+ * Everything from BLENDTEXTUREALPHAPM up (premultiplied, MODULATE*_ADD*, bump env, DOTPRODUCT3)
+ * is unimplemented and stays unclaimed.
+ */
+const D3D_TEXTURE_OP_CAPS =
+    0x000003ff |  // DISABLE, SELECTARG1/2, MODULATE/2X/4X, ADD, ADDSIGNED/2X, SUBTRACT
+    0x00000800 |  // BLENDDIFFUSEALPHA
+    0x00001000 |  // BLENDTEXTUREALPHA
+    0x00002000;   // BLENDFACTORALPHA
 export const D3DDEVICEDESC7_SIZE = 236;
 
 // IID_IDirect3DRGBDevice = {A4665C60-2673-11CF-A31A-00AA00B93356}
@@ -165,7 +203,7 @@ export const fillDeviceDesc = (view: DataView, addr: number, software = false): 
     // Fill D3DPRIMCAPS
     const fillPrimCaps = (baseOffset: number, name: string) => {
         write32(baseOffset + primOff.dwSize, 56);
-        write32(baseOffset + primOff.dwMiscCaps, 0);
+        write32(baseOffset + primOff.dwMiscCaps, D3D_PRIMCAPS_MISC);
         write32(baseOffset + primOff.dwRasterCaps, caps.dwRasterCaps);
         write32(baseOffset + primOff.dwZCmpCaps, caps.dwZCmpCaps);
         write32(baseOffset + primOff.dwSrcBlendCaps, caps.dwBlendCaps);
@@ -214,7 +252,7 @@ export const fillDeviceDesc = (view: DataView, addr: number, software = false): 
     // DX6+ fields
     write32(descOff.dwStencilCaps, caps.dwStencilCaps);
     write32(descOff.dwFVFCaps, 0x80008); // D3DFVFCAPS_DONOTSTRIPELEMENTS | max streams
-    write32(descOff.dwTextureOpCaps, 0x3FF); // All texture ops
+    write32(descOff.dwTextureOpCaps, D3D_TEXTURE_OP_CAPS);
     write16(descOff.wMaxTextureBlendStages, caps.wMaxTextureBlendStages);
     write16(descOff.wMaxSimultaneousTextures, caps.wMaxSimultaneousTextures);
 };
@@ -243,7 +281,7 @@ export const fillDeviceDesc7 = (
 
     const fillPrimCaps7 = (base: number) => {
         view.setUint32(base + primOff.dwSize, 56, true);
-        view.setUint32(base + primOff.dwMiscCaps, 0, true);
+        view.setUint32(base + primOff.dwMiscCaps, D3D_PRIMCAPS_MISC, true);
         view.setUint32(base + primOff.dwRasterCaps, caps.dwRasterCaps, true);
         view.setUint32(base + primOff.dwZCmpCaps, caps.dwZCmpCaps, true);
         view.setUint32(base + primOff.dwSrcBlendCaps, caps.dwBlendCaps, true);
@@ -285,7 +323,7 @@ export const fillDeviceDesc7 = (
     // 172..186: caps and texture stages
     view.setUint32(addr + 172, caps.dwStencilCaps, true);
     view.setUint32(addr + 176, 0x80008, true); // D3DFVFCAPS_DONOTSTRIPELEMENTS | max streams
-    view.setUint32(addr + 180, 0x3ff, true);   // TextureOp caps
+    view.setUint32(addr + 180, D3D_TEXTURE_OP_CAPS, true);
     view.setUint16(addr + 184, caps.wMaxTextureBlendStages, true);
     view.setUint16(addr + 186, caps.wMaxSimultaneousTextures, true);
     // 188..195: light/vertex W

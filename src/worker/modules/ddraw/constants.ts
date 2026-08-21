@@ -43,9 +43,25 @@ export const DDGFS_ISFLIPDONE = 0x00000002;
 
 export const DDPF_ALPHAPIXELS = 0x00000001;
 export const DDPF_FOURCC = 0x00000004;
+export const DDPF_PALETTEINDEXED4 = 0x00000008;
+export const DDPF_PALETTEINDEXEDTO8 = 0x00000010;
 export const DDPF_PALETTEINDEXED8 = 0x00000020;
 export const DDPF_RGB = 0x00000040;
+export const DDPF_PALETTEINDEXED1 = 0x00000800;
+export const DDPF_PALETTEINDEXED2 = 0x00001000;
+/** Any "the texel is a palette index" flag — the index width lives in dwRGBBitCount. */
+export const DDPF_PALETTEINDEXED_ANY =
+    DDPF_PALETTEINDEXED1 | DDPF_PALETTEINDEXED2 | DDPF_PALETTEINDEXED4 | DDPF_PALETTEINDEXED8;
 export const DDPF_ZBUFFER = 0x00000400;
+export const DDPF_STENCILBUFFER = 0x00004000;
+
+/** FourCC codes we genuinely decode (backends/webgpu/shared/dxt.ts isDxtFormat) — the answer
+ *  to IDirectDraw::GetFourCCCodes and the compressed tail of EnumTextureFormats. */
+const fourCC = (s: string): number =>
+    (s.charCodeAt(0) | (s.charCodeAt(1) << 8) | (s.charCodeAt(2) << 16) | (s.charCodeAt(3) << 24)) >>> 0;
+export const SUPPORTED_FOURCC_CODES: ReadonlyArray<number> = [
+    fourCC("DXT1"), fourCC("DXT2"), fourCC("DXT3"), fourCC("DXT4"), fourCC("DXT5"),
+];
 
 export const DDBD_8  = 0x00000800;
 export const DDBD_16 = 0x00000400;
@@ -72,6 +88,8 @@ export const DDSD_HEIGHT = 0x00000002;
 export const DDSD_WIDTH = 0x00000004;
 export const DDSD_PITCH = 0x00000008;
 export const DDSD_BACKBUFFERCOUNT = 0x00000020;
+/** DDSURFACEDESC only — the pre-DX6 depth request, in the union at offset 24. */
+export const DDSD_ZBUFFERBITDEPTH = 0x00000040;
 export const DDSD_PIXELFORMAT = 0x00001000;
 export const DDSD_LPSURFACE = 0x00000800;
 export const DDSD_CKDESTOVERLAY = 0x00002000; // ddckCKDestOverlay is valid
@@ -260,9 +278,14 @@ export const DDFXCAPS_COMBINED =
     DDFXCAPS_BLTSTRETCHX |
     DDFXCAPS_BLTSTRETCHY;
 
+export const DDPCAPS_8BITENTRIES = 0x00000002; // entries index a destination palette (1/2/4-bit palettes)
 export const DDPCAPS_8BIT = 0x00000004;
-export const DDPCAPS_ALLOW256 = 0x00000002;
-export const DDPCAPS_COMBINED = DDPCAPS_8BIT | DDPCAPS_ALLOW256; // 0x00000006
+export const DDPCAPS_PRIMARYSURFACE = 0x00000010;
+export const DDPCAPS_ALLOW256 = 0x00000040;
+// What the palette implementation actually holds: 256-entry 8-bit palettes (setEntries
+// accepts all 256, index 0 and 255 included) attachable to the primary. NOT 8BITENTRIES —
+// there is no sub-8-bit palette whose entries could index another palette.
+export const DDPCAPS_COMBINED = DDPCAPS_8BIT | DDPCAPS_ALLOW256 | DDPCAPS_PRIMARYSURFACE; // 0x00000054
 
 export const DDSCAPS_COMBINED_3D = DDSCAPS_3DDEVICE | DDSCAPS_TEXTURE | DDSCAPS_ZBUFFER | DDSCAPS_VIDEOMEMORY | DDSCAPS_LOCALVIDMEM; // 0x10022000
 
@@ -311,10 +334,9 @@ export const HIGH_MEMORY_COM_AREA = 0x10000000; // COM/thunk allocation area
 // Debug/test constants
 export const RGB565_MAGENTA = 0xF81F; // Magenta color in RGB565 format for debug fills
 
-// Default device identifiers
-export const DEFAULT_VENDOR_ID_AMD = 0x1002;
-export const DEFAULT_DEVICE_ID_FAKE = 0x9999;
-export const DEFAULT_DRIVER_VERSION = 0x0006000400020001n; // Version 6.4.2.1
+// Adapter identity is NOT defined here — GetDeviceIdentifier answers "what card is this",
+// and the process may ask the same question through D3D8/D3D9 in the same breath. The one
+// answer lives in backends/webgpu/shared/dx-adapter-identifier.ts.
 
 export const DDPIXELFORMAT_OFFSETS = {
     size: 0,
@@ -390,6 +412,15 @@ export const D3DRENDERSTATE_COLORKEYENABLE = 41;
 // Depth bias for z-fighting prevention (D3DRENDERSTATE_ZBIAS)
 // Range: 0-16, where 0 = no bias, higher values push geometry toward camera
 export const D3DRENDERSTATE_ZBIAS = 47;
+
+// D3DPRIMCAPS.dwMiscCaps
+export const D3DPMISCCAPS_MASKPLANES = 0x00000001;
+export const D3DPMISCCAPS_MASKZ = 0x00000002;
+export const D3DPMISCCAPS_LINEPATTERNREP = 0x00000004;
+export const D3DPMISCCAPS_CONFORMANT = 0x00000008;
+export const D3DPMISCCAPS_CULLNONE = 0x00000010;
+export const D3DPMISCCAPS_CULLCW = 0x00000020;
+export const D3DPMISCCAPS_CULLCCW = 0x00000040;
 
 // Stencil render states (D3DRS_STENCIL*)
 export const D3DRENDERSTATE_STENCILENABLE = 52;

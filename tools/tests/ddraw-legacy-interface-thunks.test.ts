@@ -20,6 +20,13 @@ import { describe, expect, test } from "bun:test";
 import { createDirectDrawExports } from "../../src/worker/modules/ddraw/directdraw";
 import { createSurfaceExports } from "../../src/worker/modules/ddraw/surface";
 import { rasterStatusAt } from "../../src/worker/modules/ddraw/raster-status";
+import { SUPPORTED_FOURCC_CODES } from "../../src/worker/modules/ddraw/constants";
+import {
+    DEFAULT_VENDOR_ID,
+    DEFAULT_DEVICE_ID,
+    DEFAULT_DRIVER_VERSION,
+    DEFAULT_DEVICE_DESC,
+} from "../../src/worker/backends/webgpu/shared/dx-adapter-identifier";
 
 const DD_OK = 0;
 const DDERR_CANTDUPLICATE = 0x88760247;
@@ -131,11 +138,24 @@ describe("IDirectDraw out-parameters that are dereferenced by the caller", () =>
         expect(h.view.getUint32(OUT, true)).toBe(75);
     });
 
-    test("GetFourCCCodes reports a count, so the caller does not walk a garbage array", () => {
+    test("GetFourCCCodes reports the count we can actually blit, so the caller does not walk a garbage array", () => {
         const h = harness();
+        // lpCodes NULL: the count query. It must match DDCAPS_BLTFOURCC — a zero here while
+        // the caps say we do FourCC blits is a contradiction the app cannot detect.
         h.poison(OUT, 1);
         expect(h.call(h.dd, "IDirectDraw_GetFourCCCodes", 0, OUT, 0)).toBe(DD_OK);
-        expect(h.view.getUint32(OUT, true)).toBe(0);
+        const count = h.view.getUint32(OUT, true);
+        expect(count).toBe(SUPPORTED_FOURCC_CODES.length);
+
+        // lpCodes non-NULL: *lpNumCodes is the caller's capacity on the way in. Asking for
+        // fewer than exist fills exactly that many and still reports the true total.
+        h.poison(OUT, 1 + count + 1);
+        h.view.setUint32(OUT, 2, true);
+        expect(h.call(h.dd, "IDirectDraw_GetFourCCCodes", 0, OUT, OUT + 4)).toBe(DD_OK);
+        expect(h.view.getUint32(OUT, true)).toBe(count);
+        expect(h.view.getUint32(OUT + 4, true)).toBe(SUPPORTED_FOURCC_CODES[0]);
+        expect(h.view.getUint32(OUT + 8, true)).toBe(SUPPORTED_FOURCC_CODES[1]);
+        expect(h.view.getUint32(OUT + 12, true)).toBe(POISON); // capacity 2 honoured
     });
 
     test("DuplicateSurface fails honestly with a NULL interface rather than DD_OK over stack garbage", () => {
@@ -144,6 +164,31 @@ describe("IDirectDraw out-parameters that are dereferenced by the caller", () =>
         expect(h.call(h.dd, "IDirectDraw_DuplicateSurface", 0, SURFACE_PTR, OUT)).toBe(DDERR_CANTDUPLICATE);
         expect(h.view.getUint32(OUT, true)).toBe(0);
     });
+});
+
+describe("GetDeviceIdentifier answers for the same machine D3D does", () => {
+    // dwVendorId + dwDeviceId is what a title matches against its own table of known cards
+    // to arm or disarm per-card work-arounds. Two backends in one process describing two
+    // different machines is a contradiction the app cannot resolve, and the pair must be one
+    // that actually shipped — an invented DeviceId matches nothing by construction.
+    const DDDEVICEIDENTIFIER2 = { szDescription: 512, liDriverVersion: 1024, dwVendorId: 1032, dwDeviceId: 1036 };
+    const readString = (mem: Uint8Array, addr: number) => {
+        let end = addr;
+        while (end < mem.length && mem[end] !== 0) end++;
+        return new TextDecoder().decode(mem.subarray(addr, end));
+    };
+
+    for (const iface of ["IDirectDraw4", "IDirectDraw7"]) {
+        test(`${iface} reports the shared adapter identity`, () => {
+            const h = harness();
+            h.poison(OUT, 300);
+            expect(h.call(h.dd, `${iface}_GetDeviceIdentifier`, 0, OUT, 0)).toBe(DD_OK);
+            expect(h.view.getUint32(OUT + DDDEVICEIDENTIFIER2.dwVendorId, true)).toBe(DEFAULT_VENDOR_ID);
+            expect(h.view.getUint32(OUT + DDDEVICEIDENTIFIER2.dwDeviceId, true)).toBe(DEFAULT_DEVICE_ID);
+            expect(h.view.getBigUint64(OUT + DDDEVICEIDENTIFIER2.liDriverVersion, true)).toBe(DEFAULT_DRIVER_VERSION);
+            expect(readString(h.mem, OUT + DDDEVICEIDENTIFIER2.szDescription)).toBe(DEFAULT_DEVICE_DESC);
+        });
+    }
 });
 
 describe("IDirectDrawSurface (v1/v2/v3) GetCaps takes DDSCAPS, not DDSCAPS2", () => {

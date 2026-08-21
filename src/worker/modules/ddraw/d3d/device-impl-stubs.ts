@@ -23,11 +23,8 @@ export function createDeviceStubsExports(): Record<string, ThunkImplementation> 
     ]);
 
     const d3dDevice7Stubs = [
-        "SetClipStatus",
-        "GetClipStatus",
         "DrawPrimitiveStrided",
         "DrawIndexedPrimitiveStrided",
-        "ComputeSphereVisibility",
         "SetClipPlane",
         "GetClipPlane",
         "GetInfo",
@@ -50,9 +47,6 @@ export function createDeviceStubsExports(): Record<string, ThunkImplementation> 
         "End",
         "GetLightState",
         "SetLightState",
-        "SetClipStatus",
-        "GetClipStatus",
-        "ComputeSphereVisibility",
     ];
 
     for (const method of d3dDevice3Stubs) {

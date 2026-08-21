@@ -10,10 +10,17 @@ import { System } from "../../core/system";
 import { DDrawContext } from "./context";
 import { isValidAddress } from "../../core/memory/address-guard";
 import {
-    DD_OK, E_POINTER, DEFAULT_DEVICE_ID_FAKE, DEFAULT_VENDOR_ID_AMD, DEFAULT_DRIVER_VERSION,
+    DD_OK, E_POINTER,
     DDDEVICEIDENTIFIER_SIZE, DDDEVICEIDENTIFIER2_OFFSETS, DDDEVICEIDENTIFIER2_STRING_SIZE,
     IID_IDirectDrawSurface,
 } from "./constants";
+import {
+    DEFAULT_VENDOR_ID,
+    DEFAULT_DEVICE_ID,
+    DEFAULT_DRIVER_VERSION,
+    DEFAULT_DEVICE_DESC,
+    DEFAULT_DRIVER_DLL,
+} from "../../backends/webgpu/shared/dx-adapter-identifier";
 
 interface DirectDraw2Deps {
     commonQueryInterface: (thisPtr: number, riidPtr: number, ppvObject: number, mem: Uint8Array) => number;
@@ -135,23 +142,26 @@ export function registerDirectDraw2Exports(
         // Zero DDDEVICEIDENTIFIER (DX6, 1064 bytes — no dwWHQLLevel)
         mem.fill(0, lpdddi, lpdddi + DDDEVICEIDENTIFIER_SIZE);
 
-        // szDriver at offset 0
-        const driverBytes = new TextEncoder().encode("display");
+        // The SAME adapter D3D8/D3D9 report — see dx-adapter-identifier.ts. An app that
+        // asks both interfaces in one process must not be told it is on two machines.
+        // szDriver at offset 0 — the display driver's file name, not a category word.
+        const driverBytes = new TextEncoder().encode(DEFAULT_DRIVER_DLL);
         const driverLen = Math.min(driverBytes.length, DDDEVICEIDENTIFIER2_STRING_SIZE - 1);
         for (let i = 0; i < driverLen; i++) mem[lpdddi + i] = driverBytes[i];
 
         // szDescription at offset 512
-        const descBytes = new TextEncoder().encode("BottleShip Display Driver");
+        const descBytes = new TextEncoder().encode(DEFAULT_DEVICE_DESC);
         const descLen = Math.min(descBytes.length, DDDEVICEIDENTIFIER2_STRING_SIZE - 1);
         for (let i = 0; i < descLen; i++) mem[lpdddi + 512 + i] = descBytes[i];
 
         // liDriverVersion at offset 1024
         view.setBigUint64(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.liDriverVersion, DEFAULT_DRIVER_VERSION, true);
         // dwVendorId at offset 1032
-        view.setUint32(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.dwVendorId, DEFAULT_VENDOR_ID_AMD, true);
+        view.setUint32(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.dwVendorId, DEFAULT_VENDOR_ID, true);
         // dwDeviceId at offset 1036
-        view.setUint32(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.dwDeviceId, DEFAULT_DEVICE_ID_FAKE, true);
-        // dwSubSysId at offset 1040, dwRevision at 1044 — left zero by fill above
+        view.setUint32(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.dwDeviceId, DEFAULT_DEVICE_ID, true);
+        // dwSubSysId at offset 1040 stays zero; dwRevision at 1044 matches the D3D answer.
+        view.setUint32(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.dwRevision, 1, true);
         // guidDeviceIdentifier at offset 1048 (16 bytes)
         for (let i = 0; i < 16; i++) mem[lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.guidDeviceIdentifier + i] = i;
         // NO dwWHQLLevel write — field does not exist in DX6 DDDEVICEIDENTIFIER

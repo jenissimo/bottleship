@@ -3,7 +3,7 @@
  */
 import type { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../../core/logger";
-import { DD_OK, DDERR_INVALIDPARAMS, DDERR_CANTDUPLICATE } from "./constants";
+import { DD_OK, DDERR_INVALIDPARAMS, DDERR_CANTDUPLICATE, SUPPORTED_FOURCC_CODES } from "./constants";
 import { isValidAddress } from "../../core/memory/address-guard";
 import type { DDrawContext } from "./context";
 import { System } from "../../core/system";
@@ -48,14 +48,22 @@ export function createDirectDrawStubsExports(context: DDrawContext): Record<stri
     };
 
     // GetFourCCCodes(LPDWORD lpNumCodes, LPDWORD lpCodes) — *lpNumCodes is IN (array
-    // capacity) and OUT (number of codes available). We expose no FourCC blit formats,
-    // so the honest answer is zero; leaving it unwritten made the caller walk lpCodes
-    // for however many entries its stack happened to hold.
+    // capacity, only when lpCodes is non-NULL) and OUT (how many codes exist). Answering
+    // zero while DDCAPS advertises DDCAPS_BLTFOURCC contradicted the Blt path, which really
+    // does take a block-compressed source (surface-blt-flip copyCompressedSurfaceRegion →
+    // decodeD3DTextureToRgba8). These five are exactly the FourCCs that decoder accepts.
     exports["IDirectDraw7_GetFourCCCodes"] = (ctx, mem, args) => {
         const lpNumCodes = args[1];
+        const lpCodes = args[2];
         if (!lpNumCodes || !isValidAddress(mem, lpNumCodes, 4)) return DDERR_INVALIDPARAMS;
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-        view.setUint32(lpNumCodes, 0, true);
+        const capacity = lpCodes ? view.getUint32(lpNumCodes, true) : 0;
+        view.setUint32(lpNumCodes, SUPPORTED_FOURCC_CODES.length, true);
+        if (!lpCodes) return DD_OK;
+        // Real DDraw fills up to the caller's capacity and reports the full count.
+        const n = Math.min(capacity, SUPPORTED_FOURCC_CODES.length);
+        if (n > 0 && !isValidAddress(mem, lpCodes, n * 4, "rw")) return DDERR_INVALIDPARAMS;
+        for (let i = 0; i < n; i++) view.setUint32(lpCodes + i * 4, SUPPORTED_FOURCC_CODES[i], true);
         return DD_OK;
     };
 

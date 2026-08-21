@@ -15,6 +15,14 @@ import {
 import { EmulatorConfig } from "../../core/emulator-config-manager";
 import { framePacer } from "../../core/frame-pacer";
 import { initReturnPtr } from "../../backends/webgpu/shared/dx-com-helpers";
+import { getSurfaceFormatLayout } from "../../backends/webgpu/shared/texture-formats";
+import {
+    DEFAULT_VENDOR_ID,
+    DEFAULT_DEVICE_ID,
+    DEFAULT_DRIVER_VERSION,
+    DEFAULT_DEVICE_DESC,
+    DEFAULT_DRIVER_DLL,
+} from "../../backends/webgpu/shared/dx-adapter-identifier";
 import {
     allocateComObject,
     checkComGuard,
@@ -33,9 +41,6 @@ import {
     DDDEVICEIDENTIFIER2_SIZE,
     DDDEVICEIDENTIFIER2_OFFSETS,
     DDDEVICEIDENTIFIER2_STRING_SIZE,
-    DEFAULT_VENDOR_ID_AMD,
-    DEFAULT_DEVICE_ID_FAKE,
-    DEFAULT_DRIVER_VERSION,
     DDSD_CAPS,
     DDSD_LPSURFACE,
     DDSD_PITCH,
@@ -84,6 +89,8 @@ import {
     DDSCL_NORMAL,
     DDSCL_EXCLUSIVE,
     DDSCL_FULLSCREEN,
+    DDSURFACEDESC2_OFFSETS,
+    DDPIXELFORMAT_OFFSETS,
 } from "./constants";
 import { bytesToGuid, surfaceAt } from "./helpers";
 import { resolveDDrawTearOff } from "./com-tearoff";
@@ -105,6 +112,30 @@ import { resizeFullscreenWindowToMode } from "../../runtime/windowing/fullscreen
 import { repaintDialogOverlayIfVisible, requestGuestDialogPaint } from "../user32/dialog-paint";
 
 type DDEnumCallback = (lpGUID: number, lpDriverDescription: number, lpDriverName: number, lpContext: number) => number;
+
+/**
+ * One log line per distinct DDPIXELFORMAT shape a title ever ASKS CreateSurface for, read
+ * straight out of the guest descriptor. Deliberately upstream of readPixelFormat: a probe
+ * placed after normalization can only ever report the format we decided on, so it cannot
+ * distinguish "the title asked for RGB565" from "the title asked for DXT1 and we rewrote it".
+ * dwSize is printed because an engine legitimately leaves it zero.
+ */
+const seenPixelFormatRequests = new Set<number>();
+function notePixelFormatRequest(view: DataView, pfAddr: number): void {
+    const size = view.getUint32(pfAddr + DDPIXELFORMAT_OFFSETS.size, true);
+    const flags = view.getUint32(pfAddr + DDPIXELFORMAT_OFFSETS.flags, true);
+    const fourCC = view.getUint32(pfAddr + DDPIXELFORMAT_OFFSETS.fourCC, true);
+    const bpp = view.getUint32(pfAddr + DDPIXELFORMAT_OFFSETS.rgbBitCount, true);
+    const key = ((flags ^ fourCC) >>> 0) * 65536 + ((bpp & 0xff) << 8) + (size & 0xff);
+    if (seenPixelFormatRequests.has(key)) return;
+    seenPixelFormatRequests.add(key);
+    const tag = fourCC
+        ? ` fourCC='${String.fromCharCode(fourCC & 0xff, (fourCC >>> 8) & 0xff, (fourCC >>> 16) & 0xff, (fourCC >>> 24) & 0xff)}'`
+        : "";
+    Logger.log(LogCategory.DDRAW,
+        `CreateSurface REQUESTED ddpf: dwSize=${size} dwFlags=0x${flags.toString(16)} ` +
+        `dwRGBBitCount=${bpp}${tag}`);
+}
 
 function resizeFullscreenWindow(system: System, width: number, height: number): void {
     const hwnd = system.ddrawContext?.cooperative.hwnd;
@@ -304,6 +335,10 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         if (!rawDesc) {
             view.setUint32(lplpSurf, 0, true);
             return E_INVALIDARG;
+        }
+
+        if (lpDesc && (rawDesc.flags & DDSD_PIXELFORMAT) !== 0) {
+            notePixelFormatRequest(view, lpDesc + DDSURFACEDESC2_OFFSETS.pixelFormat);
         }
 
         const isTexture = (rawDesc.caps & DDSCAPS_TEXTURE) !== 0;
@@ -812,8 +847,17 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
             for (let level = 1; level < requestedMipLevels; level++) {
                 mipWidth = Math.max(1, mipWidth >> 1);
                 mipHeight = Math.max(1, mipHeight >> 1);
-                const mipPitch = Math.max(mipWidth * bytesPerPixel, computePitch(mipWidth, surfaceState.format.bpp));
-                const mipSize = Math.max(MIN_SURFACE_SIZE, mipPitch * mipHeight);
+                // A sublevel inherits the ROOT's pixel format, so its pitch has to come from
+                // that format's own layout: computePitch is a bits-per-pixel formula and a
+                // DDPF_FOURCC format has no bits per pixel, which would silently hand a
+                // block-compressed level a linear stride.
+                const mipLayout = getSurfaceFormatLayout(surfaceState.format, mipWidth, mipHeight);
+                const mipPitch = mipLayout.compressed
+                    ? mipLayout.pitch
+                    : Math.max(mipWidth * bytesPerPixel, computePitch(mipWidth, surfaceState.format.bpp));
+                const mipSize = Math.max(
+                    MIN_SURFACE_SIZE,
+                    mipLayout.compressed ? mipLayout.bytes : mipPitch * mipHeight);
                 let mipSurfacePtr = 0;
                 try {
                     mipSurfacePtr = context.process.allocateSurface(mipSize);
@@ -2291,18 +2335,24 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         // Zero the entire structure first
         mem.fill(0, lpdddi, lpdddi + DDDEVICEIDENTIFIER2_SIZE);
 
-        // Write device info
-        writeString(DDDEVICEIDENTIFIER2_OFFSETS.szDriver, "display", DDDEVICEIDENTIFIER2_STRING_SIZE);
-        writeString(DDDEVICEIDENTIFIER2_OFFSETS.szDescription, "BottleShip Display Driver", DDDEVICEIDENTIFIER2_STRING_SIZE);
+        // The SAME adapter D3D8/D3D9 report — see dx-adapter-identifier.ts. dwVendorId +
+        // dwDeviceId is what an app matches against its own table of known cards to switch
+        // work-arounds on and off; a pair that never shipped (the old ATI 0x1002 / 0x9999)
+        // matches nothing, and a period-correct card would be worse still — it would ARM
+        // work-arounds written for that silicon's bugs, which this renderer does not have.
+        // An adapter newer than the title is the case with real evidence behind it: it is
+        // exactly what these games get on a modern Windows machine, where they run.
+        // szDriver is the display driver's file name, not a category word.
+        writeString(DDDEVICEIDENTIFIER2_OFFSETS.szDriver, DEFAULT_DRIVER_DLL, DDDEVICEIDENTIFIER2_STRING_SIZE);
+        writeString(DDDEVICEIDENTIFIER2_OFFSETS.szDescription, DEFAULT_DEVICE_DESC, DDDEVICEIDENTIFIER2_STRING_SIZE);
 
-        // Set some reasonable GUID values
         // liDriverVersion (LARGE_INTEGER = 8 bytes)
         view.setBigUint64(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.liDriverVersion, DEFAULT_DRIVER_VERSION, true);
 
         // dwVendorId
-        view.setUint32(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.dwVendorId, DEFAULT_VENDOR_ID_AMD, true);
+        view.setUint32(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.dwVendorId, DEFAULT_VENDOR_ID, true);
         // dwDeviceId
-        view.setUint32(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.dwDeviceId, DEFAULT_DEVICE_ID_FAKE, true);
+        view.setUint32(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.dwDeviceId, DEFAULT_DEVICE_ID, true);
         // dwSubSysId
         view.setUint32(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.dwSubSysId, 0, true);
         // dwRevision

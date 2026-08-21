@@ -119,6 +119,16 @@ export function generateAlphaTestExpr(alphaFunc: number): string {
     }
 }
 
+/** Depth CLAMP for a pre-transformed draw whose depth state makes z inert (RHW_DEPTH_CLAMP).
+ *  WebGPU always clips against 0 <= z <= w — `depth-clip-control`/`unclippedDepth` is optional
+ *  and not requested — while real hardware rasterizes a TL quad whatever its z holds, and games
+ *  leave that field stale in the vertex buffer they reuse for HUD sprites. Pulling z inside the
+ *  volume is what unclippedDepth would do, minus the feature dependency; nothing reads the
+ *  result, since ZENABLE=FALSE forces the compare to ALWAYS and depth writes off. */
+const RHW_DEPTH_CLAMP_WGSL = `let zw = out.position.w;
+                        let zNdc = select(0.0, out.position.z / zw, zw != 0.0);
+                        out.position.z = clamp(zNdc, 0.0, 1.0) * zw;`;
+
 /**
  * Generate WGSL code for Z transformation block
  */
@@ -461,8 +471,11 @@ export function generateShaderCode(config: ShaderConfig): string {
                 ${needsUVFlip ? 'src0 = vec4f(src0.x, 1.0 - src0.y, src0.z, src0.w);' : ''}
                 var adjustedUV = applyTexXform(src0, uniforms.texMat0, uniforms.stages[0].w);
 
-                if (uniforms.isRHW != 0u) {
+                if ((uniforms.isRHW & 1u) != 0u) {
                     out.position = pos;
+                    if ((uniforms.isRHW & 2u) != 0u) {
+                        ${RHW_DEPTH_CLAMP_WGSL}
+                    }
                 } else {
                     out.position = uniforms.mvp * vec4f(pos.xyz, 1.0);
                     ${zBlock}
@@ -478,7 +491,7 @@ export function generateShaderCode(config: ShaderConfig): string {
                 // Summing alphas produces 2×matAlpha (emissive + ambient*1.0 for a typical
                 // all-white material with global ambient alpha=1.0), which clamps to 1.0
                 // once matAlpha>=0.5 and turns smooth crossfades into binary flickers.
-                if (uniforms.lightingEnabled != 0u && uniforms.isRHW == 0u) {
+                if (uniforms.lightingEnabled != 0u && (uniforms.isRHW & 1u) == 0u) {
                     // Full D3D fixed-function lighting (all enabled lights from the shared light set,
                     // directional/point/spot + attenuation + spot cone + specular). Computed in VIEW
                     // space (worldView), matching the D3D9 reference path: the shared math's infinite
@@ -527,7 +540,7 @@ export function generateShaderCode(config: ShaderConfig): string {
                 // for pre-transformed (XYZRHW) draws — those have no meaningful world transform.
                 var cpaClip = vec4f(1.0, 1.0, 1.0, 1.0);
                 var cpbClip = vec2f(1.0, 1.0);
-                if (uniforms.clipPlaneEnable != 0u && uniforms.isRHW == 0u) {
+                if (uniforms.clipPlaneEnable != 0u && (uniforms.isRHW & 1u) == 0u) {
                     let worldPos = uniforms.world * vec4f(pos.xyz, 1.0);
                     cpaClip = vec4f(
                         dot(worldPos, ffpClipPlanes.planes[0]),
@@ -661,7 +674,7 @@ ${fragmentShader}`;
  *  112..128  fogColor: vec4f
  *  128..144  fogParams: vec4f (start, end, density, mode)
  *  144..160  viewport: vec4f (width, height, minZ, maxZ)
- *  160..176  misc: vec4u (alphaRef255, isRHW, lightingEnabled, colorKeyEnabled)
+ *  160..176  misc: vec4u (alphaRef255, rhwFlags, lightingEnabled, colorKeyEnabled)
  *  176..192  misc2: vec4u (premultiplyOutput, alphaTestEnabled, alphaFunc, specularEnable)
  *  192..320  stages: array<vec4u, MAX_FFP_STAGES>
  *  320..384  world: mat4x4<f32>
@@ -744,8 +757,11 @@ export function generateMegaBatchShaderCode(config: ShaderConfig): string {
                 var adjustedUV = selectTexCoord(draw.stages[0].z, uv, uv1, uv2);
                 ${needsUVFlip ? 'adjustedUV.y = 1.0 - adjustedUV.y;' : ''}
 
-                if (draw.misc.y != 0u) { // isRHW
+                if ((draw.misc.y & 1u) != 0u) { // isRHW
                     out.position = pos;
+                    if ((draw.misc.y & 2u) != 0u) {
+                        ${RHW_DEPTH_CLAMP_WGSL}
+                    }
                 } else {
                     out.position = draw.mvp * vec4f(pos.xyz, 1.0);
                     // Z remap
@@ -767,7 +783,7 @@ export function generateMegaBatchShaderCode(config: ShaderConfig): string {
                 // source-selected diffuse alpha (matDiffuse.a for MATERIAL, vDiffuse.a
                 // for COLOR1). Summing alphas across emissive/ambient/lights produces
                 // 2×matAlpha and saturates fades to opaque past 0.5.
-                if (draw.misc.z != 0u && draw.misc.y == 0u) { // lightingEnabled && !isRHW
+                if (draw.misc.z != 0u && (draw.misc.y & 1u) == 0u) { // lightingEnabled && !isRHW
                     let worldNorm = normalize((draw.world * vec4f(normal, 0.0)).xyz);
 
                     let emissiveColor = select(draw.matEmissive.rgb, vDiffuse.rgb, draw.matSrcs.w == 1u);

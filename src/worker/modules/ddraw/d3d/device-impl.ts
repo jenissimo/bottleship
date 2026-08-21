@@ -14,6 +14,9 @@ import { asArrayBuffer } from "../../../../dom-buffer";
 import {
     DDPF_ALPHAPIXELS,
     DDPF_RGB,
+    DDPF_FOURCC,
+    DDPF_PALETTEINDEXED8,
+    SUPPORTED_FOURCC_CODES,
     DDPIXELFORMAT_OFFSETS,
     DDSCAPS_TEXTURE,
     DDSD_CAPS,
@@ -71,6 +74,7 @@ import {
 import { setDeviceRenderTarget } from "./texture-manager";
 import { surfaceSyncManager, syncActiveGdiContextBeforeD3D } from "../surface-sync";
 import { createDeviceStubsExports } from "./device-impl-stubs";
+import { frustumPlanesFromCombined, sphereVisibilityBits, clipBitsToD3dVis } from "./sphere-visibility";
 import {
     fillDeviceDesc,
     fillDeviceDesc7,
@@ -78,6 +82,63 @@ import {
     D3D7_HAL_DEVICE_GUID_BYTES,
     d3d7DeviceGuidForKind,
 } from "./d3d-caps-utils";
+
+interface EnumTextureFormat {
+    bpp: number;
+    r: number;
+    g: number;
+    b: number;
+    a: number;
+    flags: number;
+    fourCC?: number;
+}
+
+/**
+ * The uncompressed RGB formats EnumTextureFormats has always offered. ARGB1555 comes before
+ * XRGB1555 so games needing alpha (foliage, particles) get it; transparency for alpha=0 is
+ * then handled by blend state, and when blending is off the shader forces alpha=1.0 so black
+ * objects do not turn transparent. Thief needs ARGB1555 and RGB565 present to accept
+ * hardware mode. Order is load-bearing beyond that too: apps stop enumerating as soon as
+ * they find a format they like, so nothing may be inserted ABOVE these six.
+ */
+const ENUM_TEXTURE_FORMATS_RGB: ReadonlyArray<EnumTextureFormat> = [
+    { bpp: 16, r: 0xF800, g: 0x07E0, b: 0x001F, a: 0x0000, flags: DDPF_RGB },                                            // RGB565
+    { bpp: 16, r: 0x7C00, g: 0x03E0, b: 0x001F, a: 0x8000, flags: DDPF_RGB | DDPF_ALPHAPIXELS },                         // ARGB1555
+    { bpp: 16, r: 0x7C00, g: 0x03E0, b: 0x001F, a: 0x0000, flags: DDPF_RGB },                                            // XRGB1555
+    { bpp: 32, r: 0x00FF0000, g: 0x0000FF00, b: 0x000000FF, a: 0x00000000, flags: DDPF_RGB },                            // X8R8G8B8
+    { bpp: 16, r: 0x0F00, g: 0x00F0, b: 0x000F, a: 0xF000, flags: DDPF_RGB | DDPF_ALPHAPIXELS },                         // ARGB4444
+    { bpp: 32, r: 0x00FF0000, g: 0x0000FF00, b: 0x000000FF, a: 0xFF000000, flags: DDPF_RGB | DDPF_ALPHAPIXELS },         // A8R8G8B8
+];
+
+/**
+ * Palettised 8-bit. The surface path handles it end to end — detectPixelFormat →
+ * PixelFormat.PALETTE8, a palette-aware decode, a GPU LUT upload, and colour-key compared as
+ * a palette INDEX. Never enumerating it told every palettised title the hardware had no such
+ * texture format, which costs it palette-cycling animation as a MECHANISM, not just a layout.
+ */
+const ENUM_TEXTURE_FORMAT_P8: EnumTextureFormat =
+    { bpp: 8, r: 0, g: 0, b: 0, a: 0, flags: DDPF_PALETTEINDEXED8 | DDPF_RGB };
+
+/**
+ * DXT1..DXT5 (DX6 and later — absent from the IDirect3DDevice2/DX5 list for that reason).
+ * A DDPF_FOURCC descriptor carries no masks and no bit count by contract; the block layout
+ * comes from the FourCC alone, and decodeSurfaceFormatToRgba8 routes it to the block decoder.
+ * Descriptor and ordering match a real driver's (Wine ddrawformat_from_wined3dformat:
+ * DDPF_FOURCC + dwFourCC, everything else zero; DXT last, after P8; absent from the DX5 list).
+ */
+const ENUM_TEXTURE_FORMATS_DXT: ReadonlyArray<EnumTextureFormat> = SUPPORTED_FOURCC_CODES.map(
+    (code) => ({ bpp: 0, r: 0, g: 0, b: 0, a: 0, flags: DDPF_FOURCC, fourCC: code })
+);
+
+/** DX6+ (IDirect3DDevice3 / IDirect3DDevice7). */
+const ENUM_TEXTURE_FORMATS: ReadonlyArray<EnumTextureFormat> = [
+    ...ENUM_TEXTURE_FORMATS_RGB, ENUM_TEXTURE_FORMAT_P8, ...ENUM_TEXTURE_FORMATS_DXT,
+];
+
+/** DX5 (IDirect3DDevice2) — no block-compressed formats existed yet. */
+const ENUM_TEXTURE_FORMATS_DX5: ReadonlyArray<EnumTextureFormat> = [
+    ...ENUM_TEXTURE_FORMATS_RGB, ENUM_TEXTURE_FORMAT_P8,
+];
 
 export const createDeviceExports = (
     context: DDrawContext,
@@ -1962,18 +2023,7 @@ export const createDeviceExports = (
         const pfAddr = context.process.memory.alloc(pixelFormatSize);
         const view = getDataView(mem);
 
-        const formats = [
-            // ARGB1555 before XRGB1555: games needing alpha (foliage, particles) get it.
-            // Transparency for alpha=0 pixels is handled by blend state (SRCALPHA/INVSRCALPHA
-            // or additive ONE/ONE). When blending is disabled, the shader forces alpha=1.0
-            // to prevent black objects (tires) from appearing transparent.
-            { bpp: 16, r: 0xF800, g: 0x07E0, b: 0x001F, a: 0x0000, flags: DDPF_RGB }, // RGB565
-            { bpp: 16, r: 0x7C00, g: 0x03E0, b: 0x001F, a: 0x8000, flags: DDPF_RGB | DDPF_ALPHAPIXELS }, // ARGB1555
-            { bpp: 16, r: 0x7C00, g: 0x03E0, b: 0x001F, a: 0x0000, flags: DDPF_RGB }, // XRGB1555 (fallback if alpha rejected)
-            { bpp: 32, r: 0x00FF0000, g: 0x0000FF00, b: 0x000000FF, a: 0x00000000, flags: DDPF_RGB }, // X8R8G8B8
-            { bpp: 16, r: 0x0F00, g: 0x00F0, b: 0x000F, a: 0xF000, flags: DDPF_RGB | DDPF_ALPHAPIXELS }, // ARGB4444
-            { bpp: 32, r: 0x00FF0000, g: 0x0000FF00, b: 0x000000FF, a: 0xFF000000, flags: DDPF_RGB | DDPF_ALPHAPIXELS }, // A8R8G8B8
-        ];
+        const formats = ENUM_TEXTURE_FORMATS;
 
         callbackManager.saveSuspendedThunkContext(ctx, 12);
         let index = 0;
@@ -1997,7 +2047,7 @@ export const createDeviceExports = (
             // DDPIXELFORMAT structure
             view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.size, pixelFormatSize, true);
             view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.flags, f.flags, true);
-            view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.fourCC, 0, true);
+            view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.fourCC, f.fourCC ?? 0, true);
             view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.rgbBitCount, f.bpp, true);
             view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.rMask, f.r, true);
             view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.gMask, f.g, true);
@@ -2049,15 +2099,7 @@ export const createDeviceExports = (
         const pfAddr = context.process.memory.alloc(pixelFormatSize);
         const view = getDataView(mem);
 
-        const formats = [
-            // ARGB1555 before XRGB1555 — see Device3 comment for rationale.
-            { bpp: 16, r: 0xF800, g: 0x07E0, b: 0x001F, a: 0x0000, flags: DDPF_RGB }, // RGB565
-            { bpp: 16, r: 0x7C00, g: 0x03E0, b: 0x001F, a: 0x8000, flags: DDPF_RGB | DDPF_ALPHAPIXELS }, // ARGB1555
-            { bpp: 16, r: 0x7C00, g: 0x03E0, b: 0x001F, a: 0x0000, flags: DDPF_RGB }, // XRGB1555 (fallback if alpha rejected)
-            { bpp: 32, r: 0x00FF0000, g: 0x0000FF00, b: 0x000000FF, a: 0x00000000, flags: DDPF_RGB }, // X8R8G8B8
-            { bpp: 16, r: 0x0F00, g: 0x00F0, b: 0x000F, a: 0xF000, flags: DDPF_RGB | DDPF_ALPHAPIXELS }, // ARGB4444
-            { bpp: 32, r: 0x00FF0000, g: 0x0000FF00, b: 0x000000FF, a: 0xFF000000, flags: DDPF_RGB | DDPF_ALPHAPIXELS }, // A8R8G8B8
-        ];
+        const formats = ENUM_TEXTURE_FORMATS;
 
         callbackManager.saveSuspendedThunkContext(ctx, 12);
         let index = 0;
@@ -2081,7 +2123,7 @@ export const createDeviceExports = (
             // DDPIXELFORMAT structure
             view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.size, pixelFormatSize, true);
             view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.flags, f.flags, true);
-            view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.fourCC, 0, true);
+            view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.fourCC, f.fourCC ?? 0, true);
             view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.rgbBitCount, f.bpp, true);
             view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.rMask, f.r, true);
             view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.gMask, f.g, true);
@@ -2118,8 +2160,129 @@ export const createDeviceExports = (
         return { value: 0, suspendedForCallback: true, callbackId: firstCallbackId || 0, stackCleanup: 12 };
     };
 
-    exports["IDirect3DDevice3_ValidateDevice"] = () => D3D_OK;
-    exports["IDirect3DDevice7_ValidateDevice"] = () => D3D_OK;
+    // ValidateDevice(LPDWORD lpdwPasses) — the pass count the CURRENT texture-stage setup
+    // would need. Our stage resolver evaluates every advertised D3DTOP in one shader
+    // (backends/webgpu/ddraw/ffp-stages.ts), so the answer is one pass — but it has to be
+    // WRITTEN: a D3D_OK over an untouched DWORD leaves the caller reading its own stack and
+    // deciding, from garbage, to split the material into passes it never needed.
+    const validateDevice: ThunkImplementation = (ctx, mem, args) => {
+        const lpdwPasses = args[1];
+        if (!lpdwPasses || !isValidAddress(mem, lpdwPasses, 4)) return D3DERR_INVALIDCALL;
+        getDataView(mem).setUint32(lpdwPasses, 1, true);
+        return D3D_OK;
+    };
+    exports["IDirect3DDevice3_ValidateDevice"] = validateDevice;
+    exports["IDirect3DDevice7_ValidateDevice"] = validateDevice;
+
+    // --- Clip status (D3DCLIPSTATUS: dwFlags, dwStatus, minx, maxx, miny, maxy, minz, maxz) ---
+    // SetClipStatus is a promise from the app about where its geometry lies; nothing in this
+    // renderer consumes it, so accepting it is faithful. GetClipStatus is the dangerous half:
+    // it is pure OUT, and the app reads the extents back to size its own 2D work.
+    const D3DCLIPSTATUS_SIZE = 32;
+    const D3DCLIPSTATUS_EXTENTS2 = 0x00000002;
+
+    const setClipStatus: ThunkImplementation = (ctx, mem, args) => {
+        const lpClipStatus = args[1];
+        if (!lpClipStatus || !isValidAddress(mem, lpClipStatus, D3DCLIPSTATUS_SIZE)) return D3DERR_INVALIDCALL;
+        return D3D_OK;
+    };
+
+    /** Screen extents of whatever viewport the device is currently rendering through. */
+    const deviceViewportExtents = (thisPtr: number): { x: number; y: number; w: number; h: number } => {
+        const obj = resourceProvider.getComObjectByAddress(thisPtr);
+        if (obj instanceof Direct3DDevice7Object) {
+            const vp = obj.getViewportData();
+            if (vp) return { x: vp.x, y: vp.y, w: vp.width, h: vp.height };
+        } else if (obj instanceof Direct3DDevice3Object) {
+            const vpAddr = obj.getCurrentViewport();
+            const vpObj = vpAddr
+                ? (resourceProvider.getComObjectByAddress(vpAddr) as Direct3DViewport3Object | null)
+                : null;
+            if (vpObj) {
+                const vp = vpObj.getViewport();
+                return { x: vp.x, y: vp.y, w: vp.width, h: vp.height };
+            }
+        }
+        const rtAddr = context.surfaces.backBuffer || context.surfaces.primary;
+        const rtState = rtAddr
+            ? (resourceProvider.getComObjectByAddress(rtAddr) as DirectDrawSurfaceObject | null)?.getState()
+            : null;
+        return { x: 0, y: 0, w: rtState?.width ?? 0, h: rtState?.height ?? 0 };
+    };
+
+    const getClipStatus: ThunkImplementation = (ctx, mem, args) => {
+        const lpClipStatus = args[1];
+        if (!lpClipStatus || !isValidAddress(mem, lpClipStatus, D3DCLIPSTATUS_SIZE)) return D3DERR_INVALIDCALL;
+        const { x, y, w, h } = deviceViewportExtents(args[0]);
+        const view = getDataView(mem);
+        // We do not accumulate per-draw clip results, so dwStatus is 0 (nothing was clipped)
+        // and the extents are the whole viewport — the widest honest answer, and the one that
+        // cannot make an app discard geometry it did draw.
+        view.setUint32(lpClipStatus + 0, D3DCLIPSTATUS_EXTENTS2, true);
+        view.setUint32(lpClipStatus + 4, 0, true);
+        view.setFloat32(lpClipStatus + 8, x, true);
+        view.setFloat32(lpClipStatus + 12, x + w, true);
+        view.setFloat32(lpClipStatus + 16, y, true);
+        view.setFloat32(lpClipStatus + 20, y + h, true);
+        view.setFloat32(lpClipStatus + 24, 0, true);
+        view.setFloat32(lpClipStatus + 28, 0, true);
+        return D3D_OK;
+    };
+
+    exports["IDirect3DDevice3_SetClipStatus"] = setClipStatus;
+    exports["IDirect3DDevice7_SetClipStatus"] = setClipStatus;
+    exports["IDirect3DDevice3_GetClipStatus"] = getClipStatus;
+    exports["IDirect3DDevice7_GetClipStatus"] = getClipStatus;
+
+    // --- ComputeSphereVisibility ---
+    // The DX6/DX7 visibility query: the app hands us bounding spheres in WORLD space and we
+    // classify each against the current frustum. It is pure OUT through lpdwReturnValues, and
+    // a D3D_OK over an untouched array is the worst shape of all — the engine reads its own
+    // stack as D3DVIS_OUTSIDE_* and drops objects that are on screen.
+    //
+    // The frustum planes come straight out of the combined world*view*projection matrix
+    // (a clip-space plane pulled back into world space is a row combination of that matrix),
+    // so the device already holds everything needed; no renderer state is involved.
+    const computeSphereVisibility = (
+        mem: Uint8Array, args: number[], legacyEncoding: boolean
+    ): number => {
+        const obj = resourceProvider.getComObjectByAddress(args[0]) as
+            Direct3DDevice3Object | Direct3DDevice7Object | null;
+        const lpCenters = args[1];
+        const lpRadii = args[2];
+        const count = args[3] >>> 0;
+        const lpdwReturnValues = args[5];
+        if (!obj || !lpCenters || !lpRadii || !lpdwReturnValues) return D3DERR_INVALIDCALL;
+        if (count === 0) return D3D_OK;
+        if (!isValidAddress(mem, lpCenters, count * 12) ||
+            !isValidAddress(mem, lpRadii, count * 4) ||
+            !isValidAddress(mem, lpdwReturnValues, count * 4)) {
+            return D3DERR_INVALIDCALL;
+        }
+
+        const planes = frustumPlanesFromCombined(multiplyMatrices(
+            multiplyMatrices(obj.getWorldMatrix(), obj.getViewMatrix()),
+            obj.getProjMatrix()
+        ));
+        const view = getDataView(mem);
+        for (let s = 0; s < count; s++) {
+            const bits = sphereVisibilityBits(
+                planes,
+                view.getFloat32(lpCenters + s * 12, true),
+                view.getFloat32(lpCenters + s * 12 + 4, true),
+                view.getFloat32(lpCenters + s * 12 + 8, true),
+                view.getFloat32(lpRadii + s * 4, true),
+                legacyEncoding
+            );
+            view.setUint32(lpdwReturnValues + s * 4, legacyEncoding ? clipBitsToD3dVis(bits) : bits, true);
+        }
+        return D3D_OK;
+    };
+
+    exports["IDirect3DDevice3_ComputeSphereVisibility"] = (ctx, mem, args) =>
+        computeSphereVisibility(mem, args, true);
+    exports["IDirect3DDevice7_ComputeSphereVisibility"] = (ctx, mem, args) =>
+        computeSphereVisibility(mem, args, false);
 
     // --- IDirect3DDevice2 ---
     // Device2 vtable has SwapTextureHandles at index 4 (absent in Device3),
@@ -2147,15 +2310,7 @@ export const createDeviceExports = (
         const sdAddr = context.process.memory.alloc(DDSURFACEDESC_SIZE);
         const view = getDataView(mem);
 
-        // Same format list as Device3 — Thief needs ARGB1555 and RGB565 to accept hardware mode.
-        const formats = [
-            { bpp: 16, r: 0xF800, g: 0x07E0, b: 0x001F, a: 0x0000, flags: DDPF_RGB },                       // RGB565
-            { bpp: 16, r: 0x7C00, g: 0x03E0, b: 0x001F, a: 0x8000, flags: DDPF_RGB | DDPF_ALPHAPIXELS },    // ARGB1555
-            { bpp: 16, r: 0x7C00, g: 0x03E0, b: 0x001F, a: 0x0000, flags: DDPF_RGB },                       // XRGB1555
-            { bpp: 32, r: 0x00FF0000, g: 0x0000FF00, b: 0x000000FF, a: 0x00000000, flags: DDPF_RGB },        // X8R8G8B8
-            { bpp: 16, r: 0x0F00, g: 0x00F0, b: 0x000F, a: 0xF000, flags: DDPF_RGB | DDPF_ALPHAPIXELS },    // ARGB4444
-            { bpp: 32, r: 0x00FF0000, g: 0x0000FF00, b: 0x000000FF, a: 0xFF000000, flags: DDPF_RGB | DDPF_ALPHAPIXELS }, // A8R8G8B8
-        ];
+        const formats = ENUM_TEXTURE_FORMATS_DX5;
 
         callbackManager.saveSuspendedThunkContext(ctx, 12);
         let index = 0;
@@ -2184,7 +2339,7 @@ export const createDeviceExports = (
             const pfAddr = sdAddr + DDSURFACEDESC_OFFSETS.pixelFormat;
             view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.size,        32, true);
             view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.flags,       f.flags, true);
-            view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.fourCC,      0, true);
+            view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.fourCC,      f.fourCC ?? 0, true);
             view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.rgbBitCount, f.bpp, true);
             view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.rMask,       f.r, true);
             view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.gMask,       f.g, true);

@@ -569,11 +569,14 @@ export const EMU_DDRAW_DEFAULT_CAPS = {
         DDCAPS_BLTFOURCC |
         DDCAPS_BLTSTRETCH |
         DDCAPS_GDI |
+        DDCAPS_PALETTE |          // CreatePalette + SetPalette + palettised present (ddraw/presenter.ts)
+        DDCAPS_READSCANLINE |     // GetScanLine answers from a real beam model (ddraw/raster-status.ts)
         DDCAPS_ZBLTS |
         DDCAPS_COLORKEY |
         DDCAPS_ALPHA |
         DDCAPS_COLORKEYHWASSIST |
         DDCAPS_BLTCOLORFILL |
+        DDCAPS_BLTDEPTHFILL |     // DDBLT_DEPTHFILL clears the depth attachment (ddraw/depth-fill.ts)
         DDCAPS_CANBLTSYSMEM,
     dwCaps2:
         DDCAPS2_CERTIFIED |

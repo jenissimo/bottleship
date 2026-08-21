@@ -154,6 +154,7 @@ import {
     MegaBatchDraw,
     DrawUniformsAllocation,
 } from "./types";
+import { RHW_PRETRANSFORMED, RHW_DEPTH_CLAMP } from "./types";
 import { RingBufferManager } from "./ring-buffer-manager";
 import { BindGroupManager, FFP_CLIP_PLANES_BYTES } from "./bind-group-manager";
 import { DepthManager } from "./depth-manager";
@@ -914,6 +915,9 @@ export class DDrawWebGPUExecutor {
             case "forceZMidpoint":
                 this.debugFlags.forceZMidpoint = enabled;
                 break;
+            case "disableRhwDepthClamp":
+                this.debugFlags.disableRhwDepthClamp = enabled;
+                break;
             case "forceCullNone":
                 this.debugFlags.forceCullNone = enabled;
                 break;
@@ -949,6 +953,12 @@ export class DDrawWebGPUExecutor {
                 break;
             case "forceCpuVertexPath":
                 this.debugFlags.forceCpuVertexPath = enabled;
+                break;
+            case "forceColorWriteMask":
+                // Positive control for D3DRS_COLORWRITEENABLE: `gpuToggle('forceColorWriteMask',
+                // true, 0)` must make every draw stop writing colour. If the picture survives,
+                // the mask is not reaching the colour target state at all.
+                this.debugFlags.forceColorWriteMask = enabled ? ((value ?? 0) | 0) & 0xf : -1;
                 break;
             case "forceDisableZWrite":
                 this.debugFlags.forceDisableZWrite = enabled;
@@ -4232,7 +4242,14 @@ export class DDrawWebGPUExecutor {
         const isXYZWVertex = posType === D3DFVF_XYZW;
         const isPreTransformed = isRHWVertex || isXYZWVertex;
         const isXYZVertex = posType === D3DFVF_XYZ;
-        const isRHW = isPreTransformed ? 1 : 0;
+        // Depth CLAMP, not CLIP, for a pre-transformed draw with depth testing off: with
+        // D3DRS_ZENABLE=FALSE nothing reads or writes depth, so z can only decide whether the
+        // clipper keeps the primitive — and real hardware keeps it. See RHW_DEPTH_CLAMP.
+        const depthUnused = (renderStates[D3DRENDERSTATE_ZENABLE] || 0) === 0;
+        const clampDepth = depthUnused && !this.debugFlags.disableRhwDepthClamp;
+        const isRHW = isPreTransformed
+            ? (RHW_PRETRANSFORMED | (clampDepth ? RHW_DEPTH_CLAMP : 0))
+            : 0;
 
 
         // XYZ vertices without MVP matrix cause "vertex explosion"

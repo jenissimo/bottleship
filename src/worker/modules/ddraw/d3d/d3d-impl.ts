@@ -18,6 +18,7 @@ import {
     allocateComObject,
     COM_OBJECT_SIZE,
     DDPF_ZBUFFER,
+    DDPF_STENCILBUFFER,
     DDPIXELFORMAT_Z_OFFSETS,
 } from "../constants";
 import {
@@ -58,6 +59,47 @@ const colorValueToArgb = (c?: D3DColorValue): number => {
     if (!c) return 0xffffffff;
     const q = (v: number) => Math.max(0, Math.min(255, Math.round(v * 255)));
     return ((q(c.a) << 24) | (q(c.r) << 16) | (q(c.g) << 8) | q(c.b)) >>> 0;
+};
+
+/**
+ * Depth formats EnumZBufferFormats offers, in the order real drivers list them (wine
+ * ddraw.c d3d7_EnumZBufferFormats) — 16-bit first, because an app that accepts the first
+ * usable entry must not be pushed onto a 32-bit buffer it did not want.
+ *
+ * Only formats the ddraw executor's depth24plus-stencil8 attachment genuinely backs are
+ * listed. That leaves out S1_UINT_D15 and S4X4_UINT_D24, whose 1- and 4-bit stencils are a
+ * stencil width we do not have; D24S8 is in, and without it the stencil ops advertised in
+ * dwStencilCaps are unreachable, since a game can only get stencil by picking a format that
+ * carries it.
+ *
+ * dwZBufferBitDepth names the DEPTH, not the surface width — and drivers disagreed on it for
+ * X8D24: some said 24, some 32, and the pitch is a 32-bpp pitch either way. Vista and newer
+ * enumerate BOTH spellings (wine bug 22434), so the trailing entry repeats X8D24 with 24 for
+ * an app that only accepts a "24-bit" depth buffer. readPixelFormat is what keeps its surface
+ * 32 bpp wide.
+ */
+const Z_BUFFER_FORMATS: ReadonlyArray<{
+    bitDepth: number;
+    stencilBitDepth: number;
+    zBitMask: number;
+    stencilBitMask: number;
+}> = [
+    { bitDepth: 16, stencilBitDepth: 0, zBitMask: 0x0000ffff, stencilBitMask: 0x00000000 }, // D16
+    { bitDepth: 32, stencilBitDepth: 0, zBitMask: 0x00ffffff, stencilBitMask: 0x00000000 }, // X8D24
+    { bitDepth: 32, stencilBitDepth: 8, zBitMask: 0x00ffffff, stencilBitMask: 0xff000000 }, // D24S8
+    { bitDepth: 24, stencilBitDepth: 0, zBitMask: 0x00ffffff, stencilBitMask: 0x00000000 }, // X8D24, 24-bit spelling
+];
+
+/** dwZBitMask/dwStencilBitMask are union members over dwGBitMask/dwBBitMask — an app that
+ *  computes its DDBLT_DEPTHFILL value from dwZBitMask reads them there. */
+const writeZBufferFormat = (view: DataView, addr: number, index: number): void => {
+    const f = Z_BUFFER_FORMATS[index];
+    const O = DDPIXELFORMAT_Z_OFFSETS;
+    view.setUint32(addr + 4, f.stencilBitDepth ? DDPF_ZBUFFER | DDPF_STENCILBUFFER : DDPF_ZBUFFER, true);
+    view.setUint32(addr + O.zBufferBitDepth, f.bitDepth, true);
+    view.setUint32(addr + O.stencilBitDepth, f.stencilBitDepth, true);
+    view.setUint32(addr + O.zBitMask, f.zBitMask, true);
+    view.setUint32(addr + O.stencilBitMask, f.stencilBitMask, true);
 };
 
 export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => {
@@ -271,12 +313,9 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         mem.fill(0, formatAddr, formatAddr + pixelFormatSize);
         view.setUint32(formatAddr, pixelFormatSize, true);
-        view.setUint32(formatAddr + 4, DDPF_ZBUFFER, true);
-        
-        // RE-VOLT FIX: Offer only 16-bit Z-Buffer
-        // Old games (1999 era) often crash if given 24/32-bit Z-buffer with 16-bit color depth
-        // 16-bit Z-buffer (DDBD_16) is the golden standard for that era
-        const depths = [16];
+        // IDirect3D3 and IDirect3D7 enumerate the SAME set — the interface version never
+        // changed which depth buffers the hardware had.
+        const depths = Z_BUFFER_FORMATS;
         let index = 0;
 
         const callbackManager = context.process.dispatcher.callbackManager;
@@ -289,22 +328,7 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
                 return;
             }
 
-            const depth = depths[index];
-            view.setUint32(formatAddr + DDPIXELFORMAT_Z_OFFSETS.zBufferBitDepth, depth, true);
-
-            // dwZBitMask/dwStencilBitMask are union members over dwGBitMask/dwBBitMask —
-            // an app that computes its DDBLT_DEPTHFILL value from dwZBitMask reads them there.
-            if (depth === 16) {
-                view.setUint32(formatAddr + DDPIXELFORMAT_Z_OFFSETS.zBitMask, 0x0000ffff, true);
-                view.setUint32(formatAddr + DDPIXELFORMAT_Z_OFFSETS.stencilBitMask, 0x00000000, true);
-            } else if (depth === 24) {
-                view.setUint32(formatAddr + DDPIXELFORMAT_Z_OFFSETS.zBitMask, 0x00ffffff, true);
-                view.setUint32(formatAddr + DDPIXELFORMAT_Z_OFFSETS.stencilBitMask, 0x00000000, true);
-            } else if (depth === 32) {
-                view.setUint32(formatAddr + DDPIXELFORMAT_Z_OFFSETS.zBitMask, 0xffffffff, true);
-                view.setUint32(formatAddr + DDPIXELFORMAT_Z_OFFSETS.stencilBitMask, 0x00000000, true);
-            }
-
+            writeZBufferFormat(view, formatAddr, index);
             index++;
 
             const { callbackId } = callbackManager.invokeCallback(
@@ -852,8 +876,7 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         mem.fill(0, formatAddr, formatAddr + pixelFormatSize);
         view.setUint32(formatAddr, pixelFormatSize, true);
-        view.setUint32(formatAddr + 4, DDPF_ZBUFFER, true);
-        const depths = [16, 24, 32];
+        const depths = Z_BUFFER_FORMATS;
         let index = 0;
 
         const callbackManager = context.process.dispatcher.callbackManager;
@@ -866,22 +889,7 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
                 return;
             }
 
-            const depth = depths[index];
-            view.setUint32(formatAddr + DDPIXELFORMAT_Z_OFFSETS.zBufferBitDepth, depth, true);
-
-            // dwZBitMask/dwStencilBitMask are union members over dwGBitMask/dwBBitMask —
-            // an app that computes its DDBLT_DEPTHFILL value from dwZBitMask reads them there.
-            if (depth === 16) {
-                view.setUint32(formatAddr + DDPIXELFORMAT_Z_OFFSETS.zBitMask, 0x0000ffff, true);
-                view.setUint32(formatAddr + DDPIXELFORMAT_Z_OFFSETS.stencilBitMask, 0x00000000, true);
-            } else if (depth === 24) {
-                view.setUint32(formatAddr + DDPIXELFORMAT_Z_OFFSETS.zBitMask, 0x00ffffff, true);
-                view.setUint32(formatAddr + DDPIXELFORMAT_Z_OFFSETS.stencilBitMask, 0x00000000, true);
-            } else if (depth === 32) {
-                view.setUint32(formatAddr + DDPIXELFORMAT_Z_OFFSETS.zBitMask, 0xffffffff, true);
-                view.setUint32(formatAddr + DDPIXELFORMAT_Z_OFFSETS.stencilBitMask, 0x00000000, true);
-            }
-
+            writeZBufferFormat(view, formatAddr, index);
             index++;
 
             const { callbackId } = callbackManager.invokeCallback(

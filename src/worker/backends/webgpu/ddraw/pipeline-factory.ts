@@ -87,6 +87,29 @@ function mapBlendFactor(blend: number): GPUBlendFactor {
     }
 }
 
+/** D3DRS_COLORWRITEENABLE / D3DRS_BLENDOP (d3d8types.h). D3D7's render-state enum stops at
+ *  152 and has neither, so on the DDraw/D3D7 half of this shared factory the seeded
+ *  defaults (all channels, ADD) are what every draw reads — exactly D3D7's fixed
+ *  behaviour. The DX and WebGPU channel bits agree bit-for-bit (RED=1, GREEN=2, BLUE=4,
+ *  ALPHA=8), so the mask needs no translation. */
+const D3DRENDERSTATE_COLORWRITEENABLE = 168;
+const D3DRENDERSTATE_BLENDOP = 171;
+const COLOR_WRITE_ALL = 0xf;
+
+/**
+ * Maps D3DBLENDOP to a WebGPU blend operation. Anything outside 1..5 — including the 0 the
+ * key carries while blending is off — is ADD, the state's D3D default.
+ */
+function mapBlendOperation(d3dBlendOp: number): GPUBlendOperation {
+    switch (d3dBlendOp | 0) {
+        case 2: return "subtract";          // D3DBLENDOP_SUBTRACT
+        case 3: return "reverse-subtract";  // D3DBLENDOP_REVSUBTRACT
+        case 4: return "min";               // D3DBLENDOP_MIN
+        case 5: return "max";               // D3DBLENDOP_MAX
+        default: return "add";              // D3DBLENDOP_ADD (1) and the unwritten default
+    }
+}
+
 /**
  * Maps D3D depth compare function to WebGPU compare function
  */
@@ -188,6 +211,18 @@ export class PipelineFactory {
     // Warn-once flag for XYZ without MVP
     private warnedXYZNoMVP = false;
 
+    /**
+     * D3DRS_COLORWRITEENABLE for this draw, as a 4-bit RGBA mask, read literally: 0 is the
+     * app asking for a depth/stencil-only pass, not an unwritten slot. Both state tables
+     * that reach this factory seed the API default 0xF (ddraw's createDefaultRenderStates,
+     * the D3D8 adapter's reset defaults), verified on a live device of each kind.
+     */
+    private colorWriteMask(renderStates: Int32Array): number {
+        const forced = this.debugFlags.forceColorWriteMask;
+        if (forced >= 0) return forced & COLOR_WRITE_ALL;
+        return renderStates[D3DRENDERSTATE_COLORWRITEENABLE] & COLOR_WRITE_ALL;
+    }
+
     constructor(
         device: GPUDevice,
         shaderGenerator: ShaderGenerator,
@@ -221,11 +256,7 @@ export class PipelineFactory {
      */
     setDebugFlags(flags: DebugFlags): void {
         this.debugFlags = flags;
-        this.pipelineCache.clear();
-        this.lastGetPipelineConfig = null;
-        this.lastGetPipelinePipeline = null;
-        this.lastMegaBatchConfig = null;
-        this.lastMegaBatchPipeline = null;
+        this.invalidateCache();
     }
 
     /**
@@ -239,7 +270,6 @@ export class PipelineFactory {
         if (clamped === this.sampleCount) return false;
         this.sampleCount = clamped;
         this.invalidateCache();
-        this.megaBatchPipelineCache.clear();
         return true;
     }
 
@@ -257,6 +287,10 @@ export class PipelineFactory {
      */
     invalidateCache(): void {
         this.pipelineCache.clear();
+        // Both caches: the MegaBatch pipelines bake the same debug flags and sample count,
+        // so leaving them behind makes a flag A/B read as "no effect" on every batched
+        // draw — which is most of them.
+        this.megaBatchPipelineCache.clear();
         this.lastGetPipelineConfig = null;
         this.lastGetPipelinePipeline = null;
         this.lastMegaBatchConfig = null;
@@ -289,6 +323,8 @@ export class PipelineFactory {
         const dstBlend = renderStates[D3DRENDERSTATE_DESTBLEND];
         const alphaFunc = renderStates[D3DRENDERSTATE_ALPHAFUNC];
         const colorKeyEnabled = renderStates[D3DRENDERSTATE_COLORKEYENABLE] || 0;
+        const colorWriteMask = this.colorWriteMask(renderStates);
+        const blendOp = renderStates[D3DRENDERSTATE_BLENDOP];
         const colorKeyActive = useTexture && !!texture?.srcColorKey && colorKeyEnabled !== 0;
 
         // Read stencil states
@@ -298,8 +334,10 @@ export class PipelineFactory {
         const stencilZFail = renderStates[D3DRENDERSTATE_STENCILZFAIL] || D3DSTENCILOP_KEEP;
         const stencilPass = renderStates[D3DRENDERSTATE_STENCILPASS] || D3DSTENCILOP_KEEP;
         const stencilRef = renderStates[D3DRENDERSTATE_STENCILREF] || 0;
-        const stencilMask = renderStates[D3DRENDERSTATE_STENCILMASK] ?? 0xff;
-        const stencilWriteMask = renderStates[D3DRENDERSTATE_STENCILWRITEMASK] ?? 0xff;
+        // No `?? 0xff` fallback: an Int32Array element is never undefined, so the old one
+        // could never fire. The masks' 0xFF defaults are seeded in the state tables.
+        const stencilMask = renderStates[D3DRENDERSTATE_STENCILMASK];
+        const stencilWriteMask = renderStates[D3DRENDERSTATE_STENCILWRITEMASK];
 
         const effectiveAlphaBlend = alphaBlend ? 1 : 0;
         const effectiveSrcBlend = effectiveAlphaBlend ? (srcBlend || 2) : 0;
@@ -345,7 +383,9 @@ export class PipelineFactory {
         keyConfig.alphaTest = alphaTest;
         keyConfig.srcBlend = effectiveSrcBlend;
         keyConfig.dstBlend = effectiveDstBlend;
+        keyConfig.blendOp = effectiveAlphaBlend ? blendOp : 0;
         keyConfig.alphaFunc = alphaFunc;
+        keyConfig.colorWriteMask = colorWriteMask;
         keyConfig.colorKeyEnabled = colorKeyEnabled > 0 ? 1 : 0;
         keyConfig.stencilEnable = stencilEnable > 0 ? 1 : 0;
         keyConfig.stencilFunc = stencilEnable > 0 ? stencilFunc : 0;
@@ -427,7 +467,9 @@ export class PipelineFactory {
             stencilMask,
             stencilWriteMask,
             needsUVFlip,
-            keyConfig.flatShading
+            keyConfig.flatShading,
+            colorWriteMask,
+            blendOp
         );
 
         this.pipelineCache.set(key, pipeline);
@@ -467,6 +509,8 @@ export class PipelineFactory {
         const dstBlend = renderStates[D3DRENDERSTATE_DESTBLEND];
         const alphaFunc = renderStates[D3DRENDERSTATE_ALPHAFUNC];
         const colorKeyEnabled = renderStates[D3DRENDERSTATE_COLORKEYENABLE] || 0;
+        const colorWriteMask = this.colorWriteMask(renderStates);
+        const blendOp = renderStates[D3DRENDERSTATE_BLENDOP];
         const colorKeyActive = useTexture && !!texture?.srcColorKey && colorKeyEnabled !== 0;
         const stencilEnable = renderStates[D3DRENDERSTATE_STENCILENABLE] || 0;
         const stencilFunc = renderStates[D3DRENDERSTATE_STENCILFUNC] || D3DCMP_ALWAYS;
@@ -474,8 +518,9 @@ export class PipelineFactory {
         const stencilZFail = renderStates[D3DRENDERSTATE_STENCILZFAIL] || D3DSTENCILOP_KEEP;
         const stencilPass = renderStates[D3DRENDERSTATE_STENCILPASS] || D3DSTENCILOP_KEEP;
         const stencilRef = renderStates[D3DRENDERSTATE_STENCILREF] || 0;
-        const stencilMask = renderStates[D3DRENDERSTATE_STENCILMASK] ?? 0xff;
-        const stencilWriteMask = renderStates[D3DRENDERSTATE_STENCILWRITEMASK] ?? 0xff;
+        // See getOrCreatePipeline: the `??` fallback this used to carry was dead code.
+        const stencilMask = renderStates[D3DRENDERSTATE_STENCILMASK];
+        const stencilWriteMask = renderStates[D3DRENDERSTATE_STENCILWRITEMASK];
 
         const effectiveAlphaBlend = alphaBlend ? 1 : 0;
         const effectiveSrcBlend = effectiveAlphaBlend ? (srcBlend || 2) : 0;
@@ -521,7 +566,9 @@ export class PipelineFactory {
         keyConfig.alphaTest = alphaTest;
         keyConfig.srcBlend = effectiveSrcBlend;
         keyConfig.dstBlend = effectiveDstBlend;
+        keyConfig.blendOp = effectiveAlphaBlend ? blendOp : 0;
         keyConfig.alphaFunc = alphaFunc;
+        keyConfig.colorWriteMask = colorWriteMask;
         keyConfig.colorKeyEnabled = colorKeyEnabled > 0 ? 1 : 0;
         keyConfig.stencilEnable = stencilEnable > 0 ? 1 : 0;
         keyConfig.stencilFunc = stencilEnable > 0 ? stencilFunc : 0;
@@ -590,7 +637,9 @@ export class PipelineFactory {
             stencilMask,
             stencilWriteMask,
             needsUVFlip,
-            keyConfig.flatShading
+            keyConfig.flatShading,
+            colorWriteMask,
+            blendOp
         );
 
         this.megaBatchPipelineCache.set(key, pipeline);
@@ -628,7 +677,9 @@ export class PipelineFactory {
         stencilMask: number,
         stencilWriteMask: number,
         needsUVFlip: boolean,
-        flatShading: boolean
+        flatShading: boolean,
+        colorWriteMask: number,
+        blendOp: number
     ): GPURenderPipeline {
         const useTexture = (sampledMask & 1) !== 0;
         const isRHWVertex = (vertexType & D3DFVF_XYZRHW) !== 0;
@@ -695,12 +746,12 @@ export class PipelineFactory {
                   color: {
                       srcFactor: mapBlendFactor(effectiveSrcBlend),
                       dstFactor: mapBlendFactor(effectiveDstBlend),
-                      operation: "add" as GPUBlendOperation,
+                      operation: mapBlendOperation(blendOp),
                   },
                   alpha: {
                       srcFactor: mapBlendFactor(effectiveSrcBlend),
                       dstFactor: mapBlendFactor(effectiveDstBlend),
-                      operation: "add" as GPUBlendOperation,
+                      operation: mapBlendOperation(blendOp),
                   },
               }
             : undefined;
@@ -735,6 +786,9 @@ export class PipelineFactory {
                 targets: [
                     {
                         format: this.colorFormat,
+                        // D3DRS_COLORWRITEENABLE. A depth-only or stencil-only pass sets it
+                        // to 0 and expects its geometry to leave no pixels behind.
+                        writeMask: colorWriteMask as GPUColorWriteFlags,
                         blend: blendState,
                     },
                 ],
@@ -809,7 +863,9 @@ export class PipelineFactory {
         stencilMask: number,
         stencilWriteMask: number,
         needsUVFlip: boolean,
-        flatShading: boolean
+        flatShading: boolean,
+        colorWriteMask: number,
+        blendOp: number
     ): GPURenderPipeline {
         const useTexture = (sampledMask & 1) !== 0;
         const isRHWVertex = (vertexType & D3DFVF_XYZRHW) !== 0;
@@ -886,12 +942,12 @@ export class PipelineFactory {
                   color: {
                       srcFactor: mapBlendFactor(effectiveSrcBlend),
                       dstFactor: mapBlendFactor(effectiveDstBlend),
-                      operation: "add" as GPUBlendOperation,
+                      operation: mapBlendOperation(blendOp),
                   },
                   alpha: {
                       srcFactor: mapBlendFactor(effectiveSrcBlend),
                       dstFactor: mapBlendFactor(effectiveDstBlend),
-                      operation: "add" as GPUBlendOperation,
+                      operation: mapBlendOperation(blendOp),
                   },
               }
             : undefined;
@@ -933,6 +989,9 @@ export class PipelineFactory {
                 targets: [
                     {
                         format: this.colorFormat, // The render target's own format (see colorFormat)
+                        // D3DRS_COLORWRITEENABLE. A depth-only or stencil-only pass sets it
+                        // to 0 and expects its geometry to leave no pixels behind.
+                        writeMask: colorWriteMask as GPUColorWriteFlags,
                         blend: blendState,
                     },
                 ],
