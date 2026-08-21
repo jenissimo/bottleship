@@ -1152,6 +1152,117 @@ function reportWorstFrames(
   return lines.join("\n");
 }
 
+/**
+ * TAIL COMPOSITION — which bucket actually CAUSES the tail, as opposed to merely being
+ * present in it. A bucket that is 9% of every frame is 9% of a slow frame too, so it shows
+ * up as a "hot leaf in the worst frames" while explaining none of the excess. The only
+ * statistic that discriminates is EXCESS ms/frame: bucket ms/frame in the tail band minus
+ * bucket ms/frame in the median band. Those must sum to the frame-length excess, which is
+ * printed so the attribution can be checked against it rather than trusted.
+ *
+ * Bands are taken from the frame-length distribution itself (median = p45..p55, tail =
+ * >= p90 and under 2x budget) so the two populations a stalled title shows — a persistent
+ * tail and rare catastrophic frames — are never averaged together; frames past 2x budget
+ * are counted and excluded, never silently folded in.
+ */
+function reportTailComposition(
+  renderFrames: RenderFrameAnalysis | null,
+  workerProfile: MergedProfile | null
+): string | null {
+  if (!renderFrames || !workerProfile || !Number.isFinite(workerProfile.startTs)) return null;
+  const ivs = renderFrames.intervals;
+  if (ivs.length === 0) return null;
+
+  const sorted = ivs.slice().sort((a, b) => a.frameMs - b.frameMs);
+  const at = (q: number) => sorted[Math.min(sorted.length - 1, Math.max(0, Math.floor(q * sorted.length)))]!.frameMs;
+  const budget = renderFrames.budgetMs ?? at(0.5);
+  const outlierCut = budget * 2;
+
+  const median = ivs.filter(i => i.frameMs >= at(0.45) && i.frameMs <= at(0.55));
+  const tail = ivs.filter(i => i.frameMs >= at(0.90) && i.frameMs < outlierCut);
+  const outliers = ivs.filter(i => i.frameMs >= outlierCut);
+
+  const lines: string[] = [];
+  lines.push(`\n${sep("═")}`);
+  lines.push(`TAIL COMPOSITION — per-bucket EXCESS ms/frame (tail band vs median band)`);
+  lines.push(sep("═"));
+
+  if (ivs.length < 40 || median.length < 5 || tail.length < 5) {
+    lines.push(`REFUSED: ${ivs.length} frames in window — median band ${median.length}, tail band ${tail.length}.`);
+    lines.push(`Under 40 frames overall or 5 in either band, a per-bucket mean is noise, not a measurement.`);
+    lines.push(`Record a longer window (or widen --range).`);
+    return lines.join("\n");
+  }
+
+  // One pass over samples, charging each to whichever band's frame window contains it.
+  const acc = (band: RenderFrameInterval[]) => {
+    const wins = band.slice().sort((a, b) => a.startTsUs - b.startTsUs);
+    const buckets = new Map<OptBucket, number>();
+    let sampledUs = 0;
+    let spanUs = 0;
+    for (const w of wins) spanUs += w.endTsUs - w.startTsUs;
+    let cumulativeUs = 0;
+    let wi = 0;
+    for (let i = 0; i < workerProfile.samples.length; i++) {
+      const dt = workerProfile.timeDeltas[i] ?? 0;
+      cumulativeUs += dt;
+      const abs = workerProfile.startTs + cumulativeUs;
+      while (wi < wins.length && wins[wi]!.endTsUs <= abs) wi++;
+      if (wi >= wins.length) break;
+      if (abs < wins[wi]!.startTsUs) continue;
+      const node = workerProfile.nodes.get(workerProfile.samples[i]!);
+      if (!node) continue;
+      const b = optBucket(node.callFrame);
+      buckets.set(b, (buckets.get(b) ?? 0) + dt);
+      sampledUs += dt;
+    }
+    return { buckets, sampledUs, spanUs, n: band.length };
+  };
+
+  const M = acc(median);
+  const T = acc(tail);
+  const cov = (a: typeof M) => (a.spanUs > 0 ? (a.sampledUs / a.spanUs) * 100 : 0);
+  const covM = cov(M), covT = cov(T);
+
+  const mMs = M.spanUs / 1000 / M.n;
+  const tMs = T.spanUs / 1000 / T.n;
+  lines.push(`median band  p45..p55  ${String(M.n).padStart(4)} frames  ${mMs.toFixed(2)} ms/frame  sample coverage ${covM.toFixed(0)}%`);
+  lines.push(`tail band     >=p90    ${String(T.n).padStart(4)} frames  ${tMs.toFixed(2)} ms/frame  sample coverage ${covT.toFixed(0)}%`);
+  if (outliers.length > 0) {
+    lines.push(`excluded: ${outliers.length} frame(s) past 2x budget (${outliers.map(o => o.frameMs.toFixed(0) + "ms").join(", ")}) — a separate population, not this tail`);
+  }
+  if (covM < 80 || covT < 80) {
+    lines.push(`! coverage under 80% in a band — the excess below is attributed from a partial sample and`);
+    lines.push(`  cannot account for the whole frame-length difference. Treat signs only, not magnitudes.`);
+  }
+  lines.push(``);
+  lines.push(`Frame-length excess to explain: ${(tMs - mMs).toFixed(2)} ms/frame`);
+  lines.push(` ${pad("bucket", 28)} ${pad("median", 10, true)} ${pad("tail", 10, true)} ${pad("excess", 10, true)} ${pad("%excess", 8, true)}`);
+  lines.push(` ${"-".repeat(70)}`);
+
+  const names = new Set<OptBucket>([...M.buckets.keys(), ...T.buckets.keys()]);
+  const rows = [...names].map(b => {
+    const m = (M.buckets.get(b) ?? 0) / 1000 / M.n;
+    const t = (T.buckets.get(b) ?? 0) / 1000 / T.n;
+    return { b, m, t, d: t - m };
+  }).sort((a, b) => b.d - a.d);
+
+  const totalExcess = tMs - mMs;
+  for (const r of rows) {
+    const share = totalExcess > 0 ? `${((r.d / totalExcess) * 100).toFixed(0)}%` : "-";
+    lines.push(
+      ` ${pad(r.b, 28)} ${pad(r.m.toFixed(2), 10, true)} ${pad(r.t.toFixed(2), 10, true)} ` +
+      `${pad((r.d >= 0 ? "+" : "") + r.d.toFixed(2), 10, true)} ${pad(share, 8, true)}`
+    );
+  }
+  const sumD = rows.reduce((s, r) => s + r.d, 0);
+  lines.push(` ${"-".repeat(70)}`);
+  lines.push(` ${pad("sum of excess", 28)} ${pad("", 10, true)} ${pad("", 10, true)} ${pad((sumD >= 0 ? "+" : "") + sumD.toFixed(2), 10, true)}`);
+  lines.push(`  (sum should track the frame-length excess above; a large gap means sampling missed the difference)`);
+  lines.push(`  A bucket present in the tail at its ORDINARY share has excess ~0 — it is a passenger, not a cause.`);
+  return lines.join("\n");
+}
+
 // Primary guest-code attribution: the EIP sampler embedded in the bottleship.hotblocks
 // mark counts samples per guest PAGE. This is trustworthy, unlike the idx↔wasm-function[N]
 // join (v86 wasm-table indices don't match Chrome's wasm-function[N] numbering, and table
@@ -1840,6 +1951,11 @@ async function main() {
   const worstFrameReport = reportWorstFrames(renderFrames, workerThreads[0]?.profile ?? null, 10);
   if (worstFrameReport) {
     console.log(worstFrameReport);
+  }
+
+  const tailCompReport = reportTailComposition(renderFrames, workerThreads[0]?.profile ?? null);
+  if (tailCompReport) {
+    console.log(tailCompReport);
   }
 
   // The join seam: a live `frameReport({reset:true})` publishes its window as UserTiming
