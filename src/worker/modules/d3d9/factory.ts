@@ -130,7 +130,11 @@ export function createFactoryExports(): Record<string, ThunkImplementation> {
             return 0;
         }
 
-        return buildModeList(format).length;
+        const count = buildModeList(format).length;
+        // A game that finds no mode it can use exits before it ever presents, and the
+        // format it asked for is the whole story — log the question, not just the answer.
+        Logger.log(LogCategory.D3D9, `GetAdapterModeCount(format=${format}) -> ${count}`);
+        return count;
     };
 
     exports['IDirect3D9_EnumAdapterModes'] = (_ctx, _mem, args) => {
@@ -146,8 +150,12 @@ export function createFactoryExports(): Record<string, ThunkImplementation> {
         const modes = buildModeList(format);
         const mode = modes[modeIndex];
         if (!mode) {
+            Logger.log(LogCategory.D3D9,
+                `EnumAdapterModes(format=${format}, index=${modeIndex}) -> INVALIDCALL (${modes.length} mode(s))`);
             return D3DERR_INVALIDCALL;
         }
+        Logger.verbose(LogCategory.D3D9,
+            `EnumAdapterModes(format=${format}, index=${modeIndex}) -> ${mode.width}x${mode.height}@${mode.refreshRate}`);
 
         return writeDisplayMode(pMode, mode) ? D3D_OK : D3DERR_INVALIDCALL;
     };

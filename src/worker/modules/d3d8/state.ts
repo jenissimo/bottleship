@@ -8,7 +8,7 @@ import { Logger, LogCategory } from '../../core/logger';
 import { Mem } from '../../core/memory/mem-accessor';
 import { isValidAddress } from '../../core/memory/address-guard';
 import { sanitizeViewport } from '../../backends/webgpu/ddraw/types';
-import { addComRef, createComObject, devices, deviceBoundDepthStencil, deviceCreationParams, deviceRenderTargetOverride, deviceWindowed, getVTables, releaseComRef, resourceToDevice, surfaceInfo, textureD3DFormat, isComObjectLive } from './shared-state';
+import { addComRef, createComObject, devices, deviceBoundDepthStencil, deviceClipStatus, deviceCreationParams, deviceRenderTargetOverride, deviceWindowed, getVTables, releaseComRef, resourceToDevice, surfaceInfo, textureD3DFormat, isComObjectLive } from './shared-state';
 import { bindAutoDepthStencil, invalidateDevicePresentationSurfaces, resizeFullscreenDeviceWindow } from './device-lifecycle';
 import { isBitmapTexture } from '../ddraw/com-objects';
 import { D3DMaterial7Data, D3DLight7Data } from '../ddraw/d3d/types';
@@ -535,9 +535,17 @@ export function createStateExports(): Record<string, ThunkImplementation> {
         return D3D_OK;
     };
 
-    // Resource creation stubs (volume/cube textures not needed for Montezuma)
-    exports['IDirect3DDevice8_CreateVolumeTexture'] = () => D3DERR_INVALIDCALL;
-    exports['IDirect3DDevice8_CreateCubeTexture'] = () => D3DERR_INVALIDCALL;
+    // Volume/cube textures are not implemented, and D3DCAPS8 says so (caps.ts clears
+    // VOLUMEMAP/CUBEMAP). Refuse with the out-param NULLed the way a real Create* does on
+    // failure — a caller that ignores the HRESULT then derefs NULL instead of stack garbage.
+    exports['IDirect3DDevice8_CreateVolumeTexture'] = (_ctx, _mem, args) => {
+        if (args[8]) Mem.writeUint32(args[8], 0);
+        return D3DERR_INVALIDCALL;
+    };
+    exports['IDirect3DDevice8_CreateCubeTexture'] = (_ctx, _mem, args) => {
+        if (args[6]) Mem.writeUint32(args[6], 0);
+        return D3DERR_INVALIDCALL;
+    };
 
     // Front buffer
     exports['IDirect3DDevice8_GetFrontBuffer'] = async (_ctx, _mem, args) => {
@@ -835,9 +843,29 @@ export function createStateExports(): Record<string, ThunkImplementation> {
         return D3D_OK;
     };
 
-    // Clip status
-    exports['IDirect3DDevice8_SetClipStatus'] = () => D3D_OK;
-    exports['IDirect3DDevice8_GetClipStatus'] = () => D3D_OK;
+    // Clip status — D3DCLIPSTATUS8 {DWORD ClipUnion; DWORD ClipIntersection;}. Reporting
+    // success while leaving the app's struct untouched hands it whatever was on the stack;
+    // store what was written and answer with the "nothing clipped / full extents" default
+    // until something is. Matches DXVK's D3D9 contract (identical struct in D3D8).
+    exports['IDirect3DDevice8_SetClipStatus'] = (_ctx, _mem, args) => {
+        const pDevice = args[0] >>> 0;
+        const pClipStatus = args[1];
+        if (!devices.has(pDevice) || !pClipStatus) return D3DERR_INVALIDCALL;
+        const clipUnion = Mem.readUint32(pClipStatus);
+        const clipIntersection = Mem.readUint32(pClipStatus + 4);
+        if (clipUnion === null || clipIntersection === null) return D3DERR_INVALIDCALL;
+        deviceClipStatus.set(pDevice, { clipUnion, clipIntersection });
+        return D3D_OK;
+    };
+    exports['IDirect3DDevice8_GetClipStatus'] = (_ctx, _mem, args) => {
+        const pDevice = args[0] >>> 0;
+        const pClipStatus = args[1];
+        if (!devices.has(pDevice) || !pClipStatus) return D3DERR_INVALIDCALL;
+        const status = deviceClipStatus.get(pDevice);
+        if (!Mem.writeUint32(pClipStatus, status ? status.clipUnion : 0)) return D3DERR_INVALIDCALL;
+        if (!Mem.writeUint32(pClipStatus + 4, status ? status.clipIntersection : 0xFFFFFFFF)) return D3DERR_INVALIDCALL;
+        return D3D_OK;
+    };
 
     // Validate
     exports['IDirect3DDevice8_ValidateDevice'] = (_ctx, mem, args) => {

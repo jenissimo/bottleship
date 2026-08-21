@@ -1164,14 +1164,30 @@ export class D3D9BackendExecutor {
     }
 
     /**
-     * Capture the current offscreen texture to a blob
+     * Capture the presented swap-chain image to a blob.
+     *
+     * Refuses instead of answering when no complete frame exists yet: with a DISCARD swap
+     * chain the live offscreen is deliberately cleared after every present, so reading it
+     * hands back a plausible black PNG that no caller can tell from a black game.
      */
     async captureFrame(): Promise<Blob> {
         const device = this.backend.getDevice()!;
         const queue = this.backend.getQueue()!;
-        const size = this.getCanvasSize();
-        const width = size.width;
-        const height = size.height;
+        // Read the last COMPLETE presented frame when available (the live offscreen is transiently
+        // black mid-frame), so screenshots/readback match what the user actually sees on the canvas.
+        const captureSrc = (this.hasPresented && this.presentedTexture) ? this.presentedTexture : this.offscreenTexture;
+        if (!captureSrc) {
+            throw new Error("d3d9 presenter has no frame to capture — nothing has been rendered yet");
+        }
+        if (!this.hasPresented) {
+            throw new Error("d3d9 presenter has not completed a frame yet — the live offscreen is"
+                + " cleared after a DISCARD present, so it would read black whatever the game drew");
+        }
+        // The SOURCE's extent, not the canvas's: a resize between the last present and this
+        // readback leaves the two disagreeing, and a mismatched copyTextureToBuffer is a
+        // WebGPU validation error — which never throws, it just leaves the buffer zeroed.
+        const width = captureSrc.width;
+        const height = captureSrc.height;
 
         const bytesPerPixel = 4;
         const unpaddedBytesPerRow = width * bytesPerPixel;
@@ -1184,9 +1200,6 @@ export class D3D9BackendExecutor {
             usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
         });
 
-        // Read the last COMPLETE presented frame when available (the live offscreen is transiently
-        // black mid-frame), so screenshots/readback match what the user actually sees on the canvas.
-        const captureSrc = (this.hasPresented && this.presentedTexture) ? this.presentedTexture : this.offscreenTexture!;
         const encoder = device.createCommandEncoder();
         encoder.copyTextureToBuffer(
             { texture: captureSrc },
@@ -1201,24 +1214,22 @@ export class D3D9BackendExecutor {
         await readback.mapAsync(GPUMapMode.READ);
         const mapped = new Uint8Array(readback.getMappedRange());
         const pixels = new Uint8ClampedArray(width * height * bytesPerPixel);
-        // The offscreen carries the CANVAS's preferred format, which is bgra8unorm on most
-        // desktops, while ImageData is always RGBA. Copying the rows straight through hands
-        // back a red/blue-swapped picture that still looks like a plausible frame — the
-        // screen path (WebGPUBackend.captureScreen) already swizzles, and these two routes
-        // to the same pixels must not disagree about colour.
+        // Swizzle AND alpha exactly as the screen route does (WebGPUBackend.captureMirroredFrame),
+        // because both routes must agree about the same pixels. The offscreen carries the
+        // canvas's preferred format (bgra8unorm on most desktops) while ImageData is RGBA; and
+        // the canvas is alphaMode:"opaque", so this swap-chain image's alpha is not coverage —
+        // D3D9 apps routinely leave it 0, and carrying that into ImageData makes putImageData
+        // premultiply the picture away, yielding a transparent PNG that reads as a plausible
+        // black frame and is byte-identical every time.
         const swapRB = this.backend.getFormat() === "bgra8unorm";
         for (let row = 0; row < height; row++) {
             const srcStart = row * paddedBytesPerRow;
             const dstStart = row * unpaddedBytesPerRow;
-            if (!swapRB) {
-                pixels.set(mapped.subarray(srcStart, srcStart + unpaddedBytesPerRow), dstStart);
-                continue;
-            }
             for (let x = 0, s = srcStart, d = dstStart; x < width; x++, s += 4, d += 4) {
-                pixels[d] = mapped[s + 2]!;
+                pixels[d] = mapped[s + (swapRB ? 2 : 0)]!;
                 pixels[d + 1] = mapped[s + 1]!;
-                pixels[d + 2] = mapped[s]!;
-                pixels[d + 3] = mapped[s + 3]!;
+                pixels[d + 2] = mapped[s + (swapRB ? 0 : 2)]!;
+                pixels[d + 3] = 255;
             }
         }
         readback.unmap();

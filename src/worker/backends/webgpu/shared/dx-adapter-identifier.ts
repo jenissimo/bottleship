@@ -12,16 +12,21 @@ export const D3DENUM_WHQL_LEVEL = 0x00000002;
 /** NVIDIA — matches DXVK d3d9_adapter.cpp GetDriverDLL path. */
 export const DEFAULT_VENDOR_ID = 0x10de;
 /**
- * GeForce 6800 Ultra class (NV40). Chosen over the earlier FX 5900 (NV35) so the
- * advertised card is consistent with reporting 16x anisotropic filtering — the
- * NV3x family capped at 8x; 16x aniso first shipped on the GeForce 6 (NV40).
+ * GA102 — the SAME card d3d9/caps.ts dumps its D3DCAPS9 from. Identifier and caps are
+ * one answer to "what hardware is this", and an engine may combine them: a pair that
+ * never shipped puts it in a state no real machine produced. An older DeviceId is not
+ * the safe conservative choice it looks like — PoP:SoT clears its occlusion-capability
+ * bit for any NVIDIA DeviceId <= 0x24f, a 2003 blacklist aimed at GeForce 2/3/4 that
+ * NV40's numerically low 0x0040 fell into.
+ *
  * DeviceId is a stable cache key for RenderWare titles (GTA III CAPS.DAT / txd.*);
- * changing it just forces a one-time texture-cache rebuild, not a correctness break.
+ * changing it forces a one-time texture-cache rebuild, not a correctness break.
  */
-export const DEFAULT_DEVICE_ID = 0x0040;
-export const DEFAULT_DRIVER_VERSION = 0x0006000400020001n;
+export const DEFAULT_DEVICE_ID = 0x2204;
+/** UMD file version 31.0.15.3699, packed as D3D9 does: (major<<16|minor, build<<16|rev). */
+export const DEFAULT_DRIVER_VERSION = 0x001f0000000f0e73n;
 export const DEFAULT_DRIVER_DLL = 'nvd3dum.dll';
-export const DEFAULT_DEVICE_DESC = 'NVIDIA GeForce 6800 Ultra';
+export const DEFAULT_DEVICE_DESC = 'NVIDIA GeForce RTX 3090';
 
 export const D3DADAPTER_IDENTIFIER8_SIZE = 1068;
 

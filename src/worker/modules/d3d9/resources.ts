@@ -330,6 +330,17 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         return D3D_OK;
     };
 
+    // Volume textures are not implemented (no IDirect3DVolumeTexture9 creation path), and
+    // D3DCAPS9 now says so — caps.ts clears VOLUMEMAP/MIPVOLUMEMAP. Refuse explicitly with
+    // ppVolumeTexture NULLed instead of falling through to the generic unimplemented path,
+    // whose return code and untouched out-param are not this method's contract.
+    exports['IDirect3DDevice9_CreateVolumeTexture'] = (_ctx, _mem, args) => {
+        const ppVolumeTexture = args[8];
+        if (!ppVolumeTexture) return D3DERR_INVALIDCALL;
+        initReturnPtr(ppVolumeTexture);
+        return D3DERR_INVALIDCALL;
+    };
+
     exports['IDirect3DDevice9_CreateCubeTexture'] = (ctx, mem, args) => {
         const pDevice = args[0];
         const EdgeLength = args[1];

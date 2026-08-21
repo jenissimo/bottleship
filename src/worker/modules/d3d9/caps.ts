@@ -46,11 +46,25 @@ const REAL_CAPS9 = hexToBytes(REAL_CAPS9_HEX);
 //   - VertexProcessingCaps (off 156): clear D3DVTXPCAPS_TWEENING (0x40). We don't implement
 //     morph-target tweening (no D3DRS_TWEENFACTOR consumer); advertising it invites a
 //     tween path that silently does nothing. D3D8 already omits this bit.
+//   - VertexTextureFilterCaps (off 284): dump says 0x1B031B00; our vertex-shader codegen
+//     (shader/vs-codegen.ts) emits no texture sampling at all, and CheckDeviceFormat refuses
+//     D3DUSAGE_QUERY_VERTEXTEXTURE. A non-zero filter cap here is the OTHER half of that
+//     answer, so leaving it set makes the two disagree. vs_3_0 without vertex textures is a
+//     shipped hardware configuration (ATI X1000), so engines have the fallback.
 {
     const dv = new DataView(REAL_CAPS9.buffer, REAL_CAPS9.byteOffset, REAL_CAPS9.byteLength);
     dv.setUint32(160, 8, true); // MaxActiveLights: match FFP_MAX_LIGHTS
     const vpCaps = dv.getUint32(156, true);
     dv.setUint32(156, vpCaps & ~0x00000040, true); // clear D3DVTXPCAPS_TWEENING
+    dv.setUint32(284, 0, true); // VertexTextureFilterCaps: no vertex-texture sampling
+    // Volume textures: CreateVolumeTexture has no implementation, so clear VOLUMEMAP (0x2000)
+    // and MIPVOLUMEMAP (0x8000) from TextureCaps and zero the volume filter/address/extent
+    // fields. Advertising them makes an engine commit to a 3D-texture path (volumetric fog,
+    // 3D lookup tables) that cannot be created — a mechanism it has a documented fallback for.
+    dv.setUint32(60, dv.getUint32(60, true) & ~0x0000A000, true);
+    dv.setUint32(72, 0, true);  // VolumeTextureFilterCaps
+    dv.setUint32(80, 0, true);  // VolumeTextureAddressCaps
+    dv.setUint32(96, 0, true);  // MaxVolumeExtent
 }
 
 export function writeDeviceCaps9(pCaps: number): boolean {

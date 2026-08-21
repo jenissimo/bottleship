@@ -697,6 +697,21 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
 
         Logger.verbose(LogCategory.D3D9, `Clear(Count=${Count}, Flags=0x${Flags.toString(16)}, Color=0x${Color.toString(16)}, Z=${Z}, Stencil=${Stencil})`);
 
+        // A rect list makes Clear a SCISSORED clear: only those rectangles are touched, and
+        // everything already drawn outside them survives. We clear the whole attachment
+        // (WebGPU's loadOp has no sub-rect form; a scissored clear has to be a draw), so a
+        // guest that fills one UI panel this way has its entire frame wiped instead — the
+        // screen becomes one flat fill in this call's colour with only later draws on it.
+        // Say so: the wipe is invisible in every other instrument, and D3D_OK is the answer
+        // either way. `colorFillSurface` refuses its twin case for the same reason.
+        if (Count > 0 && pRects) {
+            const first = Mem.readInt32(pRects) ?? 0;
+            Logger.warn(LogCategory.D3D9,
+                `Clear: ${Count} rect(s) IGNORED — clearing the whole target instead ` +
+                `(flags=0x${Flags.toString(16)}, first.x1=${first}); anything drawn outside ` +
+                `those rects this frame is being wiped`);
+        }
+
         // Clear expects ARGB color as single number
         device.clear(Flags, Color, Z, Stencil);
         return D3D_OK;

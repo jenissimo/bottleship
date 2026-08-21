@@ -75,6 +75,15 @@ export const resourceToDevice: Map<number, D3D9Device> = new Map();
 export const stateBlocks: Map<number, D3D9StateBlockData> = new Map();
 
 /**
+ * Device COM ptr → D3DCLIPSTATUS9 {ClipUnion, ClipIntersection}, as last written by
+ * SetClipStatus. Absent = the device default, "nothing was clipped, full extents"
+ * (ClipUnion 0 / ClipIntersection 0xFFFFFFFF — same as DXVK's D3D9State initializer).
+ * Clip status is pure app-visible bookkeeping in D3D9 (it only ever reports what
+ * ProcessVertices found), so store-and-return IS the faithful implementation.
+ */
+export const deviceClipStatus: Map<number, { clipUnion: number; clipIntersection: number }> = new Map();
+
+/**
  * Create a COM object in guest memory. Guard-worded and drawn from the
  * system-object pool (as d3d8/ddraw do), and returned to that pool when the last
  * reference goes — a real refcount layer means these are no longer immortal.
@@ -127,6 +136,7 @@ export function resetD3D9SharedState(): void {
     deviceBackBufferInfo.clear();
     resourceToDevice.clear();
     stateBlocks.clear();
+    deviceClipStatus.clear();
     d3d9WasmArena.resetBlockSlots(); // every block ptr just dropped — slot ownership resets with them
     clearD3D9ComObjectRegistries();
     clearResourceRegistry();

@@ -13,6 +13,10 @@ import {
     ShaderCtx, srcExpr, emitAlu, emitStore, colField, texField,
 } from "./sm-wgsl";
 
+/** Float constant registers a vs_3_0 device exposes (c0-c255) — the file
+ *  SetVertexShaderConstantF writes into and the bound a relative read must span. */
+export const VS_FLOAT_REGISTER_COUNT = 256;
+
 export interface VsAnalysis {
     /** dcl_usage v# input declarations. */
     inputDcls: { usage: number; usageIndex: number; reg: number }[];
@@ -72,10 +76,13 @@ export function analyzeVs(prog: SmProgram): VsAnalysis {
         if (def.reg.type === RegType.CONST && def.kind === "f") defConsts.set(def.reg.num, def.values);
     }
 
-    // Relative addressing (c[a0+n]) can index anywhere in the register file, so
-    // the static maxConst is not a safe array bound — size to the vs_1_1 ceiling.
+    // Relative addressing (c[a0+n]) can index anywhere in the register file, so the static
+    // maxConst is no bound at all — size to the WHOLE file we advertise (vs_3_0 / 256 float
+    // registers, the same file SetVertexShaderConstantF writes into). A smaller array does not
+    // fail: the read is clamped to the last element, so a matrix-palette index past the array
+    // silently resolves to one fixed bone and those vertices erupt from the mesh.
     let constantCount = prog.maxConst + 1;
-    if (prog.usesRelativeConst) constantCount = Math.min(256, Math.max(constantCount, 96));
+    if (prog.usesRelativeConst) constantCount = VS_FLOAT_REGISTER_COUNT;
 
     return {
         inputDcls,

@@ -67,6 +67,11 @@ export const deviceWindowed: Map<number, boolean> = new Map();
 /** Device COM ptr -> explicit SetRenderTarget color surface (0 = use back buffer). */
 export const deviceRenderTargetOverride: Map<number, number> = new Map();
 
+/** Device COM ptr -> D3DCLIPSTATUS8 {ClipUnion, ClipIntersection}, as last written by
+ *  SetClipStatus. Absent = the device default "nothing was clipped, full extents"
+ *  (0 / 0xFFFFFFFF). Same contract as the D3D9 path — see modules/d3d9/shared-state.ts. */
+export const deviceClipStatus: Map<number, { clipUnion: number; clipIntersection: number }> = new Map();
+
 /** Resolve the live surface backing a LockRect/GetDesc call. */
 export function resolveLockSurface(info: D3D8SurfaceInfo, device: D3D8DeviceAdapter | undefined): DirectDrawSurfaceState {
     if (info.role === 'backbuffer' && device) {
@@ -227,6 +232,7 @@ export function resetD3D8SharedState(): void {
     implicitDepthStencils.clear();
     deviceBackBufferSurfaces.clear();
     deviceRenderTargetOverride.clear();
+    deviceClipStatus.clear();
     deviceWindowed.clear();
     deviceCreationParams.clear();
     comRefCounts.clear();

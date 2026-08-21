@@ -1,9 +1,16 @@
 /**
  * IDirect3DQuery9 — asynchronous query objects.
  *
- * Only D3DQUERYTYPE_EVENT is backed by a real object; every other type answers
+ * EVENT and OCCLUSION are backed by real objects; every other type answers
  * D3DERR_NOTAVAILABLE at CreateQuery, which is the faithful "this device does not
  * support that query" (a caller MUST handle it — real drivers differ in coverage).
+ *
+ * OCCLUSION is answered conservatively (whole viewport visible) rather than measured.
+ * Saying NOTAVAILABLE is not the neutral choice it looks like: an engine that probes
+ * for occlusion support and does not get it falls back to a coarser visibility scheme
+ * of its own, which can reject geometry that is plainly on screen. A count is an upper
+ * bound the caller can only use to draw MORE, so it cannot hide anything; a real
+ * measurement needs a WebGPU occlusion query set resolved across the frame boundary.
  *
  * EVENT queries are always signaled by the time the guest can observe them, and this
  * is a statement about our runtime rather than a shortcut. Present is an async thunk:
@@ -42,6 +49,7 @@ const D3DERR_NOTAVAILABLE = 0x8876086a;
 const D3DERR_INVALIDCALL = 0x8876086c;
 
 const D3DQUERYTYPE_EVENT = 8;
+const D3DQUERYTYPE_OCCLUSION = 9;
 const D3DISSUE_END = 1 << 0;
 
 /** IID_IDirect3DQuery9 {D9771460-A695-4F26-BBD3-27B840B541CC} as raw guest bytes. */
@@ -54,7 +62,8 @@ const IID_IUNKNOWN = '0000000000000000c000000000000046';
  * from it is the one CreateQuery reports as D3DERR_NOTAVAILABLE.
  */
 const QUERY_DATA_SIZE: Record<number, number> = {
-    [D3DQUERYTYPE_EVENT]: 4, // sizeof(BOOL)
+    [D3DQUERYTYPE_EVENT]: 4,      // sizeof(BOOL)
+    [D3DQUERYTYPE_OCCLUSION]: 4,  // sizeof(DWORD) — visible pixel count
 };
 
 type QueryRecord = {
@@ -66,6 +75,26 @@ type QueryRecord = {
 };
 
 const queries: Map<number, QueryRecord> = new Map();
+
+/**
+ * The DATA a completed query reports. EVENT is a BOOL (see the file header). OCCLUSION
+ * answers the whole viewport — the count a fully unoccluded draw would produce, which is
+ * the only answer that cannot make a caller hide geometry that is actually on screen.
+ */
+function issuedQueryValue(query: QueryRecord): number {
+    if (query.type !== D3DQUERYTYPE_OCCLUSION) return 1;
+    // Which constant is the SAFE one depends on how the caller uses the count, and the two
+    // uses want opposite answers: a query around the object itself reads "0 = hide me",
+    // while a query around an OCCLUDER reads "0 = this blocker is not on screen, cull
+    // nothing behind it". `__occlusionPixels` names that fork so it can be A/B'd live
+    // instead of guessed; it is read per GetData, so a running game answers the new value
+    // on its next query.
+    const override = (globalThis as { __occlusionPixels?: unknown }).__occlusionPixels;
+    if (typeof override === 'number') return override >>> 0;
+    const vp = devices.get(query.devicePtr)?.getViewport?.();
+    const pixels = vp ? (vp.width >>> 0) * (vp.height >>> 0) : 0;
+    return pixels > 0 ? pixels >>> 0 : 1;
+}
 
 /** Writes the low `count` bytes of a DWORD, so a caller's short buffer is not overrun. */
 function writeQueryData(pData: number, count: number, value: number): boolean {
@@ -196,7 +225,7 @@ export function createQueryExports(): Record<string, ThunkImplementation> {
         const count = Math.min(size, query.dataSize);
         if (count === 0) return D3D_OK;
 
-        const value = query.issued ? 1 : 0xdddddddd;
+        const value = query.issued ? issuedQueryValue(query) : 0xdddddddd;
         return writeQueryData(pData, count, value) ? D3D_OK : D3DERR_INVALIDCALL;
     };
 

@@ -9,6 +9,7 @@ import { Logger, LogCategory } from '../../core/logger';
 import { Mem } from '../../core/memory/mem-accessor';
 import {
     addComRef,
+    deviceClipStatus,
     devices,
     getVTables,
     createComObject,
@@ -491,6 +492,34 @@ export function createStateExports(): Record<string, ThunkImplementation> {
         for (let i = 0; i < 4; i++) {
             if (!Mem.writeFloat32(pPlane + i * 4, plane[i]!)) return D3DERR_INVALIDCALL;
         }
+        return D3D_OK;
+    };
+
+    // Clip status — D3DCLIPSTATUS9 {DWORD ClipUnion; DWORD ClipIntersection;}. The device
+    // only ever reports back what the app wrote (ProcessVertices is the sole producer on
+    // real hardware and we do not run it through the clipper), so store-and-return matches
+    // DXVK. A NULL pointer is D3DERR_INVALIDCALL, not a silent success: an app reading an
+    // untouched struct behind a SUCCEEDED() would treat garbage as "everything clipped".
+    exports['IDirect3DDevice9_SetClipStatus'] = (_ctx, _mem, args) => {
+        const pDevice = args[0] >>> 0;
+        const pClipStatus = args[1];
+        if (!devices.has(pDevice) || !pClipStatus) return D3DERR_INVALIDCALL;
+        const clipUnion = Mem.readUint32(pClipStatus);
+        const clipIntersection = Mem.readUint32(pClipStatus + 4);
+        if (clipUnion === null || clipIntersection === null) return D3DERR_INVALIDCALL;
+        deviceClipStatus.set(pDevice, { clipUnion, clipIntersection });
+        return D3D_OK;
+    };
+
+    exports['IDirect3DDevice9_GetClipStatus'] = (_ctx, _mem, args) => {
+        const pDevice = args[0] >>> 0;
+        const pClipStatus = args[1];
+        if (!devices.has(pDevice) || !pClipStatus) return D3DERR_INVALIDCALL;
+        const status = deviceClipStatus.get(pDevice);
+        const clipUnion = status ? status.clipUnion : 0;
+        const clipIntersection = status ? status.clipIntersection : 0xFFFFFFFF;
+        if (!Mem.writeUint32(pClipStatus, clipUnion)) return D3DERR_INVALIDCALL;
+        if (!Mem.writeUint32(pClipStatus + 4, clipIntersection)) return D3DERR_INVALIDCALL;
         return D3D_OK;
     };
 

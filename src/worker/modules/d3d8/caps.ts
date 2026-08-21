@@ -76,10 +76,34 @@ export function writeDeviceCaps8(pCaps: number, mem: Uint8Array): boolean {
 
     u32(0, 1);              // DeviceType = D3DDEVTYPE_HAL
     u32(8, 0x00020000);     // Caps = D3DCAPS_READ_SCANLINE
+    // Caps2 = DYNAMICTEXTURES | CANRENDERWINDOWED | FULLSCREENGAMMA. A zero here is a
+    // DENIAL that changes the MECHANISM: no CANRENDERWINDOWED and a title refuses windowed
+    // mode; no DYNAMICTEXTURES and video/procedural code takes sysmem + UpdateTexture.
+    // Each bit is backed — factory.ts honours PresentParams.Windowed, resources.ts accepts
+    // D3DUSAGE_DYNAMIC + D3DLOCK_DISCARD, state.ts routes Set/GetGammaRamp to gammaService
+    // — and the last two match the real-hardware D3D9 dump (0xE0020000), which the D3D8
+    // path used to contradict. Not set: CANMANAGERESOURCE (driver-side pool management),
+    // CANCALIBRATEGAMMA, NO2DDURING3DSCENE (a limitation we don't have).
+    u32(12, 0x200A0000);
+    // Caps3 = 0: D3D8's only non-reserved bit is ALPHA_FULLSCREEN_FLIP_OR_DISCARD and the
+    // present path does not preserve back-buffer alpha across a flip. (The D3D9 dump's
+    // extra 0x3A0 bits don't exist in D3D8.)
+    u32(16, 0x00000000);
     u32(20, 0x80000001);    // PresentationIntervals = IMMEDIATE | ONE
     u32(24, 0x00000001);    // CursorCaps = D3DCURSORCAPS_COLOR
     u32(28, 0x001FFFFF);    // DevCaps
-    u32(32, 0x000000CF);    // PrimitiveMiscCaps
+    // PrimitiveMiscCaps = MASKZ | CULLNONE | CULLCW | CULLCCW | COLORWRITEENABLE |
+    // CLIPTLVERTS | BLENDOP. The old 0xCF was a D3D7-era pattern: it granted CULLCCW while
+    // denying CULLNONE/CULLCW, so an engine drew two-sided geometry as two flipped-winding
+    // passes instead of one. pipeline-factory maps all three D3DCULL modes; ZWRITEENABLE
+    // reaches the depth state (MASKZ); the GPU clips post-transform (incl. XYZRHW)
+    // primitives (CLIPTLVERTS); D3DRS_COLORWRITEENABLE drives the colour target's writeMask
+    // and D3DRS_BLENDOP its blend operation on BOTH draw paths (the FFP pipeline factory and
+    // the programmable path's d3d9-blend), each keyed into the pipeline cache. Not set
+    // because nothing implements them: LINEPATTERNREP, TSSARGTEMP (no D3DTA_TEMP in the FFP
+    // combiner D3D8 uses), CLIPPLANESCALEDPOINTS (MaxUserClipPlanes is 0), NULLREFERENCE —
+    // plus 0xCF's two reserved bits, which real hardware leaves clear.
+    u32(32, 0x00000AF2);
     u32(36, 0x00770077);    // RasterCaps
     u32(40, 0x000000FF);    // ZCmpCaps: all compare funcs
     u32(44, 0x00001FFF);    // SrcBlendCaps: all D3D8 blend factors
@@ -88,18 +112,24 @@ export function writeDeviceCaps8(pCaps: number, mem: Uint8Array): boolean {
     // ShadeCaps: COLORGOURAUDRGB | SPECULARGOURAUDRGB | ALPHAGOURAUDBLEND | FOGGOURAUD.
     // ALPHAGOURAUDBLEND is load-bearing: engines gate lit-geometry transparency on it.
     u32(56, 0x00084208);
-    u32(60, 0x0001FFD3);    // TextureCaps (no SQUAREONLY — real DX8 GPUs don't have it)
+    // TextureCaps (no SQUAREONLY — real DX8 GPUs don't have it). CUBEMAP/MIPCUBEMAP and
+    // VOLUMEMAP/MIPVOLUMEMAP are CLEARED: IDirect3DDevice8::CreateCubeTexture and
+    // CreateVolumeTexture return D3DERR_INVALIDCALL, so advertising them let an engine
+    // commit to a cube-map/volume path and then fail at creation — the documented gate is
+    // this cap, and a card without it is a configuration engines already have a fallback
+    // for. ALPHA is set: every accepted format is decoded to RGBA8 with its alpha intact.
+    u32(60, 0x000057D7);
     // TextureFilterCaps: point+linear+anisotropic MIN/MAG, point+linear MIP —
     // honored by our sampler translation (D3DSAMP_MAXANISOTROPY respected).
     u32(64, 0x07070700);
-    u32(68, 0x07070700);    // CubeTextureFilterCaps = TextureFilterCaps
-    u32(72, 0x03030300);    // VolumeTextureFilterCaps (no aniso on volumes)
+    u32(68, 0x00000000);    // CubeTextureFilterCaps: no cube textures (see TextureCaps)
+    u32(72, 0x00000000);    // VolumeTextureFilterCaps: no volume textures
     u32(76, 0x0000003F);    // TextureAddressCaps: WRAP|MIRROR|CLAMP|BORDER|INDEPENDENTUV|MIRRORONCE
-    u32(80, 0x0000003F);    // VolumeTextureAddressCaps
+    u32(80, 0x00000000);    // VolumeTextureAddressCaps: no volume textures
     u32(84, 0x0000001F);    // LineCaps: TEXTURE|ZTEST|BLEND|ALPHACMP|FOG
     u32(88, 4096);          // MaxTextureWidth
     u32(92, 4096);          // MaxTextureHeight
-    u32(96, 2048);          // MaxVolumeExtent
+    u32(96, 0);             // MaxVolumeExtent: no volume textures (see TextureCaps)
     u32(100, 8192);         // MaxTextureRepeat
     u32(104, 8192);         // MaxTextureAspectRatio
     u32(108, 16);           // MaxAnisotropy

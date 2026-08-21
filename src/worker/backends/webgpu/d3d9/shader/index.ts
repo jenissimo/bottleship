@@ -125,6 +125,126 @@ export interface LinkOptions {
     /** With a programmable VS but no PS, D3D still runs the fixed-function texture-stage
      *  cascade. This is the number of enabled stages, baked into the generated fragment entry. */
     ffpStageCount?: number;
+    /** The MIRROR case: the declaration is pre-transformed (POSITIONT), so the fixed function
+     *  owns the VERTEX stage while a bound pixel shader keeps running — Wine's use_vs/use_ps
+     *  pair. `vs` is ignored for codegen; the vertex stage is generated from the declaration
+     *  and the viewport it maps against (baked in, so the pipeline key must carry the size). */
+    preTransformed?: { viewportWidth: number; viewportHeight: number } | null;
+}
+
+/** WGSL locations for the pre-transformed passthrough vertex stage. Fixed, because there is
+ *  no shader whose input dcls could assign them. */
+const PT_LOC_POSITION = 0;
+const PT_LOC_COLOR = 1;          // + usageIndex (0,1)
+const PT_LOC_TEXCOORD = 3;       // + usageIndex
+
+/**
+ * Vertex inputs for the pre-transformed stage, taken from the DECLARATION rather than from a
+ * shader's input dcls (there is no shader here). Mirrors buildVertexInputs' contract: one
+ * layout per stream slot, plus a per-location WGSL expression that expands to vec4<f32>.
+ */
+function buildPreTransformedInputs(
+    declElements: RawVertexElement[],
+    streamStride: number | null,
+    streamStrides: (number | null)[] | null,
+): {
+    fields: string[];
+    attributes: GPUVertexAttribute[];
+    inputExprs: Map<number, string>;
+    stride: number;
+    vertexBuffers: (GPUVertexBufferLayout | null)[];
+} {
+    const multiStream = streamStrides !== null;
+    const fields: string[] = [];
+    const inputExprs = new Map<number, string>();
+    const perStreamAttrs = new Map<number, GPUVertexAttribute[]>();
+    const perStreamMaxEnd = new Map<number, number>();
+
+    const locationOf = (e: RawVertexElement): number | null => {
+        if (e.usage === 9 /* POSITIONT */ || e.usage === 0 /* POSITION */) return PT_LOC_POSITION;
+        if (e.usage === 10 /* COLOR */ && e.usageIndex <= 1) return PT_LOC_COLOR + e.usageIndex;
+        if (e.usage === 5 /* TEXCOORD */ && e.usageIndex < 8) return PT_LOC_TEXCOORD + e.usageIndex;
+        return null;
+    };
+
+    const taken = new Set<number>();
+    for (const e of declElements) {
+        const loc = locationOf(e);
+        if (loc === null || taken.has(loc)) continue;
+        const stream = multiStream ? e.stream : 0;
+        if (!multiStream && e.stream !== 0) continue;
+        const info = declTypeInfo(e.type);
+        // An element outside the BOUND stride has no attribute to read — same rule as the
+        // shader path: a WGSL @location the vertex state cannot supply invalidates the
+        // pipeline, and that costs the whole frame rather than this draw.
+        const bound = (multiStream ? streamStrides![stream] : streamStride) ?? 0;
+        if (bound > 0 && e.offset + info.size > bound) continue;
+        taken.add(loc);
+        fields.push(`@location(${loc}) v${loc}: ${info.wgslType}`);
+        let attrs = perStreamAttrs.get(stream);
+        if (!attrs) { attrs = []; perStreamAttrs.set(stream, attrs); }
+        attrs.push({ shaderLocation: loc, offset: e.offset, format: info.format });
+        inputExprs.set(loc, info.expand(`in.v${loc}`));
+        perStreamMaxEnd.set(stream, Math.max(perStreamMaxEnd.get(stream) ?? 0, e.offset + info.size));
+    }
+
+    const attributes = perStreamAttrs.get(0) ?? [];
+    const stride0Source = multiStream ? (streamStrides![0] ?? null) : streamStride;
+    const stride = stride0Source && stride0Source > 0 ? stride0Source : (perStreamMaxEnd.get(0) ?? 0);
+    const vertexBuffers: (GPUVertexBufferLayout | null)[] = [];
+    if (multiStream) {
+        let maxStream = 0;
+        for (const st of perStreamAttrs.keys()) maxStream = Math.max(maxStream, st);
+        for (let st = 0; st <= maxStream; st++) {
+            const attrs = perStreamAttrs.get(st);
+            if (!attrs || attrs.length === 0) { vertexBuffers.push(null); continue; }
+            const bound = streamStrides![st] ?? 0;
+            vertexBuffers.push({
+                arrayStride: bound > 0 ? bound : (perStreamMaxEnd.get(st) ?? 0),
+                attributes: attrs,
+            });
+        }
+    } else if (attributes.length > 0) {
+        vertexBuffers.push({ arrayStride: stride, attributes });
+    }
+    return { fields, attributes, inputExprs, stride, vertexBuffers };
+}
+
+/**
+ * The fixed-function vertex stage for pre-transformed vertices: map screen pixels to clip
+ * space and hand the colours/coordinates straight to the interpolants.
+ *
+ * D3D9 pre-transformed vertices carry x,y in PIXELS, z already in [0,1], and RHW = 1/w. The
+ * rasterizer divides by w, so emitting w = 1 with x,y already mapped reproduces it; RHW only
+ * matters for perspective-correct interpolation, which screen-space UI does not use.
+ */
+function emitPreTransformedVsMain(
+    interpColors: [boolean, boolean],
+    interpTexcoords: number[],
+    inputExprs: Map<number, string>,
+    viewportWidth: number,
+    viewportHeight: number,
+): string {
+    const pos = inputExprs.get(PT_LOC_POSITION) ?? "vec4<f32>(0.0, 0.0, 0.0, 1.0)";
+    const vw = Math.max(1, viewportWidth), vh = Math.max(1, viewportHeight);
+    const lines: string[] = [];
+    lines.push(`@vertex`);
+    lines.push(`fn vs_main(in: VsInput) -> Interp {`);
+    lines.push(`    var out: Interp;`);
+    lines.push(`    let _p = ${pos};`);
+    lines.push(`    out.pos = vec4<f32>(_p.x / ${vw.toFixed(1)} * 2.0 - 1.0, 1.0 - _p.y / ${vh.toFixed(1)} * 2.0, _p.z, 1.0);`);
+    for (const i of [0, 1] as const) {
+        if (!interpColors[i]) continue;
+        const e = inputExprs.get(PT_LOC_COLOR + i);
+        lines.push(`    out.${colField(i)} = ${e ?? (i === 0 ? "vec4<f32>(1.0)" : "vec4<f32>(0.0)")};`);
+    }
+    for (const n of interpTexcoords) {
+        const e = inputExprs.get(PT_LOC_TEXCOORD + n);
+        lines.push(`    out.${texField(n)} = ${e ?? "vec4<f32>(0.0, 0.0, 0.0, 1.0)"};`);
+    }
+    lines.push(`    return out;`);
+    lines.push(`}`);
+    return lines.join("\n");
 }
 
 export function linkProgram(opts: LinkOptions): LinkResult {
@@ -144,7 +264,13 @@ export function linkProgram(opts: LinkOptions): LinkResult {
     const interpTexcoords = [...texcoordSet].sort((a, b) => a - b);
 
     // ── Vertex input reconciliation against the active declaration ─────────
-    const vin = buildVertexInputs(vsA, declElements, streamStride, opts.streamStrides ?? null);
+    // A pre-transformed declaration takes the vertex stage away from the shader, so the inputs
+    // come from the declaration itself; everything downstream is unchanged.
+    const preTransformed = (opts.preTransformed && declElements && declElements.length > 0)
+        ? opts.preTransformed : null;
+    const vin = preTransformed
+        ? buildPreTransformedInputs(declElements!, streamStride, opts.streamStrides ?? null)
+        : buildVertexInputs(vsA, declElements, streamStride, opts.streamStrides ?? null);
     let { fields, attributes, vertexBuffers } = vin;
     const inputExprs = vin.inputExprs;
     let stride = vin.stride;
@@ -225,12 +351,15 @@ export function linkProgram(opts: LinkOptions): LinkResult {
     lines.push(`}`);
     lines.push("");
 
-    lines.push(emitVsMain(vs.prog, vsA, {
-        interpColors,
-        interpTexcoords,
-        inputExprs,
-        constantCount: vsConstantCount,
-    }));
+    lines.push(preTransformed
+        ? emitPreTransformedVsMain(interpColors, interpTexcoords, inputExprs,
+            preTransformed.viewportWidth, preTransformed.viewportHeight)
+        : emitVsMain(vs.prog, vsA, {
+            interpColors,
+            interpTexcoords,
+            inputExprs,
+            constantCount: vsConstantCount,
+        }));
     lines.push("");
 
     if (ps) {

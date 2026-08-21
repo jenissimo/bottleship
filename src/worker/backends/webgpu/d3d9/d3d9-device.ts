@@ -49,6 +49,7 @@ import {
 } from "./shader";
 import { AlphaTest, alphaTestSnippet } from "./shader/sm-wgsl";
 import { Op, opName } from "./shader/sm-enums";
+import { VS_FLOAT_REGISTER_COUNT } from "./shader/vs-codegen";
 import {
     FFP_UNIFORM_STRUCT_WGSL,
     FFP_SELECT_COLOR_WGSL,
@@ -119,6 +120,30 @@ const D3DFMT_INDEX16 = 101;
 const PS_FLOAT_REGISTER_COUNT = 224;
 const PS_BOOL_REGISTER_COUNT = 16;
 const PS_BOOL_UNIFORM_BASE = PS_FLOAT_REGISTER_COUNT;
+
+/**
+ * D3D9 diagnostic toggles — the D3D9 half of the DDraw executor's DebugFlags, in the same
+ * shape (`gpuToggle` addresses either backend). Each flag deletes exactly ONE pipeline
+ * stage, so a picture that comes back under one of them names the stage that was hiding it.
+ * Nothing here is a rendering option: they are all wrong on purpose.
+ */
+export interface D3D9DebugFlags {
+    /** Ignore D3DRS_CULLMODE — is back-face culling eating the geometry? */
+    forceCullNone: boolean;
+    /** Ignore D3DRS_ZENABLE (no depth test AND no depth write) — is depth rejecting it? */
+    forceDisableZTest: boolean;
+    /** Ignore D3DRS_ALPHATESTENABLE — is the fragment being discarded by the alpha test? */
+    forceDisableAlphaTest: boolean;
+    /** Ignore D3DRS_ALPHABLENDENABLE — is the draw blending itself into invisibility? */
+    forceDisableAlphaBlend: boolean;
+}
+
+export const DEFAULT_D3D9_DEBUG_FLAGS: D3D9DebugFlags = {
+    forceCullNone: false,
+    forceDisableZTest: false,
+    forceDisableAlphaTest: false,
+    forceDisableAlphaBlend: false,
+};
 
 // Alpha-test render states + D3DCMPFUNC ALWAYS (the no-op compare).
 const D3DRS_ALPHAREF = 24;
@@ -295,6 +320,11 @@ export class D3D9Device {
     private pipelineCacheMaxSize = 128;
     private currentPipelineKey: string | null = null;
     private currentPipelineId: number | null = null;
+
+    /** Diagnostic overrides — each removes exactly ONE pipeline stage, so the first toggle
+     *  that makes an invisible draw appear NAMES the stage. Sticky; read them back with
+     *  getDebugFlags() before trusting any later observation. */
+    private debugFlags: D3D9DebugFlags = { ...DEFAULT_D3D9_DEBUG_FLAGS };
 
     private clearState: ClearState = {
         color: { r: 0, g: 0, b: 0, a: 1 },
@@ -494,7 +524,7 @@ export class D3D9Device {
     private vsShaderRegistry = new Map<number, CompiledVs>();
     private vsNextHandle = 1;
     private activeVertexShader: number = 0;   // 0 = FFP mode
-    private vsConstants = new Float32Array(256 * 4);   // c0-c255
+    private vsConstants = new Float32Array(VS_FLOAT_REGISTER_COUNT * 4);   // c0-c255
     private vsConstantBits = new Uint32Array(this.vsConstants.buffer);
     private vsConstantsVersion = 0;
 
@@ -1131,6 +1161,7 @@ export class D3D9Device {
     createVertexDeclaration(elements: RawVertexElement[]): { hr: number; handle: number } {
         const handle = this.vsDeclNextHandle++;
         this.vsDeclRegistry.set(handle, elements);
+        this.ptMemoDecl = -1;   // a handle just gained (or changed) elements — re-answer the layout question
         return { hr: 0, handle };
     }
 
@@ -1242,6 +1273,35 @@ export class D3D9Device {
         return this.vsShaderRegistry.get(this.activeVertexShader) ?? null;
     }
 
+    /**
+     * Per-shader census: version, how many float constants the generated WGSL array spans,
+     * and whether the program indexes constants RELATIVELY (c[a0+n]).
+     *
+     * `relative` is the one property no capture and no screenshot can show: a relative read
+     * past the array end is CLAMPED, not faulted, so a matrix-palette index the array does not
+     * cover silently resolves to one fixed matrix and those vertices erupt from the mesh —
+     * a picture that reads as a skinning or declaration bug. `constants` is the bound that
+     * must cover the register file the app writes, and this is where the two are comparable.
+     */
+    shaderCensus(): Record<string, unknown> {
+        const vs = [...this.vsShaderRegistry].map(([handle, s]) => ({
+            handle,
+            version: `vs_${s.prog.major}_${s.prog.minor}`,
+            constants: s.analysis.constantCount,
+            maxStaticConst: s.prog.maxConst,
+            relative: s.prog.usesRelativeConst,
+            inputs: s.analysis.inputDcls.map(d => ({ reg: d.reg, usage: d.usage, usageIndex: d.usageIndex })),
+        }));
+        const ps = [...this.psShaderRegistry].map(([handle, s]) => ({
+            handle,
+            version: `ps_${s.prog.major}_${s.prog.minor}`,
+            constants: s.analysis.constantCount,
+            maxStaticConst: s.prog.maxConst,
+            relative: s.prog.usesRelativeConst,
+        }));
+        return { registerFile: VS_FLOAT_REGISTER_COUNT, vs, ps };
+    }
+
     /** Get active compiled PS (null if none). */
     getActivePsShader(): CompiledPs | null {
         if (this.activePixelShader === 0) return null;
@@ -1311,9 +1371,49 @@ export class D3D9Device {
         };
     }
 
-    /** True when a programmable vertex shader is bound (the new render path). */
+    /**
+     * True when the ACTIVE declaration hands the pipeline positions that are already in
+     * screen space — D3DDECLUSAGE_POSITIONT, or a POSITION declared as FLOAT4 (the shape
+     * XYZRHW takes when an app builds the declaration by hand).
+     */
+    private ptMemoDecl = -1;
+    private ptMemoFvf = -1;
+    private ptMemoValue = false;
+    private activeDeclIsPreTransformed(): boolean {
+        // Per-DRAW question on the pipeline fast path, but it only changes when the layout does —
+        // memoize on (declaration, FVF) so the common case is two integer compares.
+        const fvf = this.stateTracker.getFVF();
+        if (this.ptMemoDecl === this.activeVertexDecl && this.ptMemoFvf === fvf) return this.ptMemoValue;
+        const decl = this.activeVertexDecl > 0 ? this.vsDeclRegistry.get(this.activeVertexDecl) : null;
+        this.ptMemoValue = (!decl || decl.length === 0)
+            ? (fvf & D3DFVF_POSITION_MASK) === D3DFVF_XYZRHW
+            : decl.some(e => e.usage === DECLUSAGE_POSITIONT_FFP
+                || (e.usage === DECLUSAGE_POSITION_FFP && e.type === 3));
+        this.ptMemoDecl = this.activeVertexDecl;
+        this.ptMemoFvf = fvf;
+        return this.ptMemoValue;
+    }
+
+    /**
+     * True when a programmable vertex shader is bound (the new render path).
+     *
+     * A PRE-TRANSFORMED declaration overrides a bound vertex shader: the vertices are already
+     * in screen space, so there is nothing for a vertex shader to transform and the runtime
+     * runs the fixed function. Wine encodes the same rule (`use_vs`, wined3d_private.h:
+     * shader && (!decl || !decl->position_transformed)); the pixel shader is deliberately NOT
+     * disabled with it (`use_ps` has no such clause). Without this a UI/post-process quad
+     * whose engine left a shader bound feeds screen coordinates into a shader expecting model
+     * space: the geometry lands off-screen or skewed, which is a menu that never appears and a
+     * full-screen composite that ghosts — with nothing logged, because every draw "succeeded".
+     */
     private isProgrammable(): boolean {
-        return this.activeVertexShader !== 0 && this.vsShaderRegistry.has(this.activeVertexShader);
+        if (this.activeVertexShader === 0 || !this.vsShaderRegistry.has(this.activeVertexShader)) return false;
+        if (!this.activeDeclIsPreTransformed()) return true;
+        // The PIXEL shader survives a pre-transformed declaration (`use_ps` carries no such
+        // clause), so a draw that has one stays on this path and gets the fixed-function vertex
+        // stage from the linker instead. Only a draw whose pixel side is fixed-function too can
+        // go to the FFP path wholesale.
+        return this.getActivePsShader() !== null;
     }
 
     setStreamSource(streamNumber: number, vbPtr: number, offset: number, stride: number): number {
@@ -2750,15 +2850,10 @@ export class D3D9Device {
     ): Float32Array {
         const rs = (s: number) => this.stateTracker.getRenderState(s);
 
-        const fvf = this.stateTracker.getFVF();
-        const decl = this.activeVertexDecl > 0 ? this.vsDeclRegistry.get(this.activeVertexDecl) : null;
         const { hasColor, hasSpecular, hasNormal: hasNormalDecl } = this.resolveFfpVertexColors(slotMask);
-        // Pre-transformed position — decides which fog the FFP runs (see resolveFfpFogMode).
-        // Same POSITIONT-or-POSITION+FLOAT4 rule buildShaderFromDecl uses.
-        const isRHW = decl && decl.length > 0
-            ? decl.some(e => e.usage === DECLUSAGE_POSITIONT_FFP
-                || (e.usage === DECLUSAGE_POSITION_FFP && e.type === 3))
-            : (fvf & D3DFVF_POSITION_MASK) === D3DFVF_XYZRHW;
+        // Pre-transformed position — decides which fog the FFP runs (see resolveFfpFogMode),
+        // and (isProgrammable) whether a bound vertex shader runs at all. One rule, one owner.
+        const isRHW = this.activeDeclIsPreTransformed();
         // A pre-transformed vertex is never lit, so it never has a usable normal either —
         // the shader builders drop the normal attribute for XYZRHW.
         const hasNormal = hasNormalDecl && !isRHW;
@@ -3188,7 +3283,12 @@ export class D3D9Device {
             ...(verts
                 ? {
                     ...(declElems
-                        ? { firstVerticesUnavailable: `vertex declaration ${this.activeVertexDecl} owns the layout` }
+                        ? (() => {
+                            const decoded = this.decodeFirstVerticesByDecl(verts, declElems, declPos?.stream ?? 0);
+                            return decoded.length
+                                ? { firstVertices: decoded, firstVerticesFrom: `decl ${this.activeVertexDecl}` }
+                                : { firstVerticesUnavailable: `vertex declaration ${this.activeVertexDecl} puts position on a stream this capture does not carry` };
+                        })()
                         : { firstVertices: this.decodeFirstVertices(verts, fvf) }),
                     srcStride: verts.stride,
                 }
@@ -3263,6 +3363,56 @@ export class D3D9Device {
      *  Honors `setWorkerFlag('__captureVertsMax', N)` like the DDraw producer: four vertices
      *  answer "what kind of draw is this", but "which draws cover this patch of screen" needs
      *  the whole mesh, and a capture that silently caps at 4 answers that question wrongly. */
+    /**
+     * First vertices decoded through the active DECLARATION rather than the FVF.
+     *
+     * A declaration owns the layout, so the FVF decode is fiction there — but withholding the
+     * numbers entirely leaves "are these quads even on screen, and what colour are they
+     * modulated by" unanswerable for every shader-era title, which is most of them. The
+     * declaration says exactly where each component sits, so decode from it.
+     *
+     * Only the captured stream can be read (the capture carries one vertex buffer), so an
+     * element on another stream is reported as absent rather than decoded from the wrong bytes.
+     */
+    private decodeFirstVerticesByDecl(
+        verts: { data: Uint8Array; offset: number; stride: number; count: number },
+        elems: RawVertexElement[],
+        stream: number,
+    ): Array<{ x: number; y: number; z: number; w?: number; u?: number; v?: number; diffuse?: number }> {
+        const out: Array<{ x: number; y: number; z: number; w?: number; u?: number; v?: number; diffuse?: number }> = [];
+        const { data, offset, stride, count } = verts;
+        if (stride <= 0) return out;
+        const on = elems.filter(e => e.stream === stream && e.type !== 17 /* UNUSED */);
+        const pos = on.find(e => e.usage === DECLUSAGE_POSITIONT_FFP)
+            ?? on.find(e => e.usage === DECLUSAGE_POSITION_FFP);
+        if (!pos) return out;
+        const color = on.find(e => e.usage === 10 /* COLOR */ && e.usageIndex === 0);
+        const tex = on.find(e => e.usage === 5 /* TEXCOORD */ && e.usageIndex === 0);
+        const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+        const cfgMax = ((globalThis as unknown as Record<string, unknown>).__captureVertsMax as number) >>> 0;
+        const n = Math.min(count, cfgMax > 0 ? cfgMax : 4);
+        for (let i = 0; i < n; i++) {
+            const base = offset + i * stride;
+            if (base + stride > data.byteLength) break;
+            const end = Math.min(base + stride, data.byteLength);
+            const f32 = (off: number): number | undefined =>
+                base + off + 4 <= end ? view.getFloat32(base + off, true) : undefined;
+            const v: { x: number; y: number; z: number; w?: number; u?: number; v?: number; diffuse?: number } = {
+                x: f32(pos.offset) ?? 0,
+                y: f32(pos.offset + 4) ?? 0,
+                z: f32(pos.offset + 8) ?? 0,
+            };
+            // FLOAT4 position carries w (RHW on a POSITIONT stream); FLOAT3 does not.
+            if (pos.type === 3) v.w = f32(pos.offset + 12);
+            if (color && color.type === 4 /* D3DCOLOR */ && base + color.offset + 4 <= end) {
+                v.diffuse = view.getUint32(base + color.offset, true);
+            }
+            if (tex) { v.u = f32(tex.offset); v.v = f32(tex.offset + 4); }
+            out.push(v);
+        }
+        return out;
+    }
+
     private decodeFirstVertices(
         verts: { data: Uint8Array; offset: number; stride: number; count: number },
         fvf: number,
@@ -4344,10 +4494,17 @@ export class D3D9Device {
     async captureFrame(): Promise<Blob> {
         const screen = await System.getInstance().services.render.tryCaptureScreen();
         if (screen) return screen;
-        return (await this.capturePresentedLayer()) ?? new Blob();
+        // The fallback refuses when there is no complete frame; an empty Blob is the
+        // contract's "no image", which every caller already reports as a failed capture.
+        try {
+            return (await this.capturePresentedLayer()) ?? new Blob();
+        } catch {
+            return new Blob();
+        }
     }
 
-    /** The presented offscreen target — the 3D frame before it reaches the canvas. */
+    /** The presented swap-chain image — the 3D frame before it reaches the canvas.
+     *  Throws (never a black stand-in) when no complete frame has been presented. */
     async capturePresentedLayer(): Promise<Blob | null> {
         this.submitFrame(false);
         return this.backendExecutor.captureFrame();
@@ -4593,8 +4750,18 @@ export class D3D9Device {
         return (key + topologyOffset + cullOffset) >>> 0;
     }
 
-    /** Bound render-state reader for the blend helpers. */
-    private getRS = (state: number): number => this.stateTracker.getRenderState(state);
+    /** Bound render-state reader for the blend/depth/alpha-test helpers — and the single
+     *  place the diagnostic toggles below take effect. Every one of those helpers feeds BOTH
+     *  the pipeline descriptor and its cache-key fragment (computeBlendKey/computeDepthKey/
+     *  alphaTestKey), so overriding here re-keys the caches too and a flipped toggle cannot
+     *  silently reuse a pipeline built under the opposite setting. */
+    private getRS = (state: number): number => {
+        const f = this.debugFlags;
+        if (f.forceDisableZTest && state === D3DRS_ZENABLE) return 0;
+        if (f.forceDisableAlphaTest && state === D3DRS_ALPHATESTENABLE) return 0;
+        if (f.forceDisableAlphaBlend && state === D3DRS_ALPHABLENDENABLE) return 0;
+        return this.stateTracker.getRenderState(state);
+    };
 
     /**
      * Current D3D9 fixed-function alpha test, or null when disabled / ALWAYS.
@@ -4816,6 +4983,10 @@ export class D3D9Device {
         stride0Override = 0,
         slotMask = this.activeSlotMask(),
     ): number {
+        // Cull is not read through getRS (it rides the numeric pipeline key), so the toggle
+        // joins the per-draw override here; setDebugToggle drops the caches, so no entry
+        // built under the opposite setting survives to be reused.
+        forceCullNone = forceCullNone || this.debugFlags.forceCullNone;
         // Synthetic-FVF pipelines (point sprites) get their own cache namespace so they never
         // alias the game's decl/FVF pipelines that hash to the same numeric key.
         const cacheKey = fvfOverride !== undefined
@@ -4954,6 +5125,8 @@ export class D3D9Device {
         arenaKey?: number,
         slotMask: number = this.activeSlotMask(),
     ): number {
+        // See resolvePipelineId: cull rides the numeric key, so the toggle joins here.
+        forceCullNone = forceCullNone || this.debugFlags.forceCullNone;
         const vs = this.getActiveVsShader();
         if (!vs) return -1;
         const ps = this.getActivePsShader();
@@ -4974,6 +5147,16 @@ export class D3D9Device {
         const streamStrides = multiSlot ? this.slotStrides(stride ?? 0) : null;
         const streamHash = this.streamHash(slotMask, stride ?? 0);
 
+        // Pre-transformed declaration + a bound pixel shader: the fixed function owns the VERTEX
+        // stage, the shader keeps the pixel stage (Wine use_vs/use_ps). The viewport is baked
+        // into the generated vertex entry, so it is part of the pipeline identity — and both
+        // fast paths below key on state that does not carry it, so those are skipped.
+        const ptSize = this.getCurrentTargetSize();
+        const preTransformed = this.activeDeclIsPreTransformed()
+            ? { viewportWidth: this.viewport.width || ptSize.w, viewportHeight: this.viewport.height || ptSize.h }
+            : null;
+        const ptKey = preTransformed ? `:pt${preTransformed.viewportWidth}x${preTransformed.viewportHeight}` : "";
+
         const alphaTest = this.getAlphaTest();
         // Effective cube mask (dcl_cube ∪ bound cube textures) — part of the pipeline identity since
         // the same shader sampled with a 2D vs a cube texture compiles to different texN dimensions.
@@ -4988,7 +5171,7 @@ export class D3D9Device {
         // Fast path: identical pipeline identity as the previous draw → return without building the
         // key string or touching the Map (the dominant case within a batch). Shared by both the
         // legacy and arena-keyed paths below — whichever cache backed `_lrPipelineId` last time.
-        if (this._lrValid
+        if (!preTransformed && this._lrValid
             && this._lrVs === this.activeVertexShader && this._lrPs === this.activePixelShader
             && this._lrDecl === this.activeVertexDecl && this._lrStride === stride
             && this._lrStateBits === stateBits && this._lrTopo === topology
@@ -5013,7 +5196,7 @@ export class D3D9Device {
         // the ordinary cache whose identity includes `hybridStages`.
         // The arena key encodes stream 0's stride alone, so it cannot distinguish two
         // multi-stream layouts; those resolve through the string-keyed cache below.
-        if (ps && arenaKey !== undefined && arenaKey >= 0 && !multiSlot && isWasmPathEnabled()) {
+        if (ps && !preTransformed && arenaKey !== undefined && arenaKey >= 0 && !multiSlot && isWasmPathEnabled()) {
             const cachedViaArena = this.arenaPipelineCache.get(arenaKey);
             if (cachedViaArena !== undefined) {
                 d3d9PerfBackendInc("progPipelineCacheHits");
@@ -5029,20 +5212,24 @@ export class D3D9Device {
             return built;
         }
 
-        const cacheKey = `${this.activeVertexShader}:${this.activePixelShader}:${this.activeVertexDecl}:${stateBits}:${topology}:${forceCullNone ? 1 : 0}:${blendKey}:${alphaKey}:${depthKey}:cm${cubeMask}:pj${projKey}:hs${hybridStages}${this.streamKey(slotMask, stride ?? 0)}`;
+        const cacheKey = `${this.activeVertexShader}:${this.activePixelShader}:${this.activeVertexDecl}:${stateBits}:${topology}:${forceCullNone ? 1 : 0}:${blendKey}:${alphaKey}:${depthKey}:cm${cubeMask}:pj${projKey}:hs${hybridStages}${ptKey}${this.streamKey(slotMask, stride ?? 0)}`;
         const cached = this.progPipelineCache.get(cacheKey);
         if (cached !== undefined) {
             d3d9PerfBackendInc("progPipelineCacheHits");
             if (this.frameSnapshot.frameCounters) this.frameSnapshot.frameCounters.cacheHits++;
-            this._storeLastResolve(stride, stateBits, topology, forceCullNone, blendKey, alphaKey, depthKey, cubeMask, projKey, hybridStages, streamHash, cached);
+            if (!preTransformed) {
+                this._storeLastResolve(stride, stateBits, topology, forceCullNone, blendKey, alphaKey, depthKey, cubeMask, projKey, hybridStages, streamHash, cached);
+            }
             return cached;
         }
         d3d9PerfBackendInc("progPipelineCacheMisses");
         if (this.frameSnapshot.frameCounters) this.frameSnapshot.frameCounters.cacheMisses++;
 
-        const pipelineId = this.buildProgrammablePipeline(vs, ps, declElements, stride, stateBits, topology, forceCullNone, alphaTest, cubeMask, projKey, hybridStages, streamStrides);
+        const pipelineId = this.buildProgrammablePipeline(vs, ps, declElements, stride, stateBits, topology, forceCullNone, alphaTest, cubeMask, projKey, hybridStages, streamStrides, preTransformed);
         this.progPipelineCache.set(cacheKey, pipelineId);
-        this._storeLastResolve(stride, stateBits, topology, forceCullNone, blendKey, alphaKey, depthKey, cubeMask, projKey, hybridStages, streamHash, pipelineId);
+        if (!preTransformed) {
+            this._storeLastResolve(stride, stateBits, topology, forceCullNone, blendKey, alphaKey, depthKey, cubeMask, projKey, hybridStages, streamHash, pipelineId);
+        }
         return pipelineId;
     }
 
@@ -5061,9 +5248,10 @@ export class D3D9Device {
         projectedStages: number,
         hybridStages: number,
         streamStrides: number[] | null,
+        preTransformed: { viewportWidth: number; viewportHeight: number } | null = null,
     ): number {
         try {
-            const link = linkProgram({ vs, ps, declElements, streamStride: stride, streamStrides, alphaTest, cubeMask, projectedStages, ffpStageCount: hybridStages || undefined });
+            const link = linkProgram({ vs, ps, declElements, streamStride: stride, streamStrides, alphaTest, cubeMask, projectedStages, ffpStageCount: hybridStages || undefined, preTransformed });
             const gpuDevice = this.backend.getDevice()!;
             const format = this.backend.getFormat()!;
             const module = gpuDevice.createShaderModule({ code: link.wgsl });
@@ -5863,12 +6051,33 @@ export class D3D9Device {
         return { ...this.frameSnapshot };
     }
 
+    /** Current diagnostic overrides — they are sticky, and a forgotten one silently
+     *  colours every later observation, so a caller must be able to read them back. */
+    getDebugFlags(): D3D9DebugFlags {
+        return { ...this.debugFlags };
+    }
+
     /**
-     * Set debug toggle (for debug panel)
+     * Arm/disarm one diagnostic override. Unknown names are REFUSED (false), because a
+     * silently ignored toggle is an A/B that measures nothing while reading as "this stage
+     * is not the cause" — the failure mode these knobs exist to avoid.
      */
-    setDebugToggle(toggle: string, enabled: boolean): void {
-        // D3D9 debug toggles can be implemented here if needed
-        // For now, just acknowledge the call
+    setDebugToggle(toggle: string, enabled: boolean): boolean {
+        if (!(toggle in this.debugFlags)) return false;
+        const key = toggle as keyof D3D9DebugFlags;
+        if (this.debugFlags[key] === enabled) return true;
+        this.debugFlags[key] = enabled;
+        // Every pipeline in flight was built under the previous setting; the string keys
+        // re-derive from getRS (so they would separate on their own), but the arena cache is
+        // keyed by a Rust identity that does not encode these states and the last-resolve
+        // memo short-circuits ahead of both. Drop all three rather than reason about which.
+        this.pipelineCache.clear();
+        this.progPipelineCache.clear();
+        this.arenaPipelineCache.clear();
+        this._lrValid = false;
+        this.currentPipelineKey = null;
+        this.currentPipelineId = null;
+        return true;
     }
 
     // ── State blocks ─────────────────────────────────────────────────────

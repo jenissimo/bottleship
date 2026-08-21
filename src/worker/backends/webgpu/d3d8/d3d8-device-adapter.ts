@@ -54,6 +54,8 @@ import {
     D3DRENDERSTATE_SHADEMODE,
     D3DRENDERSTATE_SPECULARENABLE,
     D3DRENDERSTATE_SRCBLEND,
+    D3DRENDERSTATE_STENCILMASK,
+    D3DRENDERSTATE_STENCILWRITEMASK,
     D3DRENDERSTATE_TEXTUREFACTOR,
     D3DRENDERSTATE_ZENABLE,
     D3DRENDERSTATE_ZFUNC,
@@ -136,6 +138,11 @@ const D3DTS_VIEW       = 2;
 const D3DTS_PROJECTION = 3;
 const D3DTS_WORLD      = 256; // 0x100
 const D3DTS_TEXTURE0   = 16;  // D3DTS_TEXTURE0..7 = 16..23
+
+// D3D8-only render states (d3d8types.h) — D3D7's enum stops at 152, so they have no
+// entry in the shared ddraw constants the rest of this adapter imports.
+const D3DRENDERSTATE_COLORWRITEENABLE = 168;
+const D3DRENDERSTATE_BLENDOP          = 171;
 
 export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
     readonly suppressGdiOverlay = true;
@@ -595,6 +602,20 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         this.renderStates[D3DRENDERSTATE_POINTSIZE] = 0x3F800000;     // 1.0f
         this.renderStates[D3DRENDERSTATE_POINTSIZE_MIN] = 0x3F800000; // 1.0f
         this.renderStates[D3DRENDERSTATE_POINTSIZE_MAX] = 0x46000000; // 8192.0f (advertised MaxPointSize)
+
+        // COLORWRITEENABLE's D3D default is ALL channels and BLENDOP's is ADD, and an
+        // unseeded slot reads 0 — which for COLORWRITEENABLE is the LEGAL value "write no
+        // colour", so the difference between "app asked for a depth-only pass" and "app
+        // never touched the state" is not recoverable from the array. Seed both, the way
+        // d3d9-state-tracker does; GetRenderState then reports the D3D defaults too.
+        this.renderStates[D3DRENDERSTATE_COLORWRITEENABLE] = 0xF;
+        this.renderStates[D3DRENDERSTATE_BLENDOP] = 1; // D3DBLENDOP_ADD
+
+        // Same trap for the stencil masks: 0 is the legal mask "no bits", so a title that
+        // enables stencil without setting them tests against nothing and writes nothing.
+        // All bits of the stencil8 attachment we allocate is 0xff (matches the D3D7 defaults).
+        this.renderStates[D3DRENDERSTATE_STENCILMASK] = 0xff;
+        this.renderStates[D3DRENDERSTATE_STENCILWRITEMASK] = 0xff;
 
         // Stage 0: modulate texture with diffuse, alpha from texture.
         this.textureStates[0 * 32 + D3DTSS_COLOROP] = D3DTOP_MODULATE;
@@ -1114,10 +1135,10 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             worldMatrix: this.transforms.get(D3DTS_WORLD) ?? identityMatrix(),
             worldViewMatrix: this.getWorldViewMatrix(),
             viewMatrix: this.transforms.get(D3DTS_VIEW) ?? identityMatrix(),
-            diffuseSource: this.renderStates[D3DRENDERSTATE_DIFFUSEMATERIALSOURCE] ?? 0,
-            ambientSource: this.renderStates[D3DRENDERSTATE_AMBIENTMATERIALSOURCE] ?? 0,
-            specularSource: this.renderStates[D3DRENDERSTATE_SPECULARMATERIALSOURCE] ?? 0,
-            emissiveSource: this.renderStates[D3DRENDERSTATE_EMISSIVEMATERIALSOURCE] ?? 0,
+            diffuseSource: this.renderStates[D3DRENDERSTATE_DIFFUSEMATERIALSOURCE],
+            ambientSource: this.renderStates[D3DRENDERSTATE_AMBIENTMATERIALSOURCE],
+            specularSource: this.renderStates[D3DRENDERSTATE_SPECULARMATERIALSOURCE],
+            emissiveSource: this.renderStates[D3DRENDERSTATE_EMISSIVEMATERIALSOURCE],
         };
     }
 
@@ -1329,11 +1350,11 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             : "LIGHT[null]";
         const rs = this.renderStates;
         const stateTag =
-            `LIGHTING=${rs[D3DRENDERSTATE_LIGHTING] ?? 0} ` +
-            `aBlend=${rs[D3DRENDERSTATE_ALPHABLENDENABLE] ?? 0} src=${rs[D3DRENDERSTATE_SRCBLEND] ?? 0} dst=${rs[D3DRENDERSTATE_DESTBLEND] ?? 0} ` +
-            `aTest=${rs[D3DRENDERSTATE_ALPHATESTENABLE] ?? 0} aRef=${rs[D3DRENDERSTATE_ALPHAREF] ?? 0} aFunc=${rs[D3DRENDERSTATE_ALPHAFUNC] ?? 0} ` +
+            `LIGHTING=${rs[D3DRENDERSTATE_LIGHTING]} ` +
+            `aBlend=${rs[D3DRENDERSTATE_ALPHABLENDENABLE]} src=${rs[D3DRENDERSTATE_SRCBLEND]} dst=${rs[D3DRENDERSTATE_DESTBLEND]} ` +
+            `aTest=${rs[D3DRENDERSTATE_ALPHATESTENABLE]} aRef=${rs[D3DRENDERSTATE_ALPHAREF]} aFunc=${rs[D3DRENDERSTATE_ALPHAFUNC]} ` +
             `texF=0x${(rs[D3DRENDERSTATE_TEXTUREFACTOR] >>> 0).toString(16)} ` +
-            `cOp=${this.textureStates[0 * 32 + D3DTSS_COLOROP] ?? 0} aOp=${this.textureStates[0 * 32 + D3DTSS_ALPHAOP] ?? 0}`;
+            `cOp=${this.textureStates[0 * 32 + D3DTSS_COLOROP]} aOp=${this.textureStates[0 * 32 + D3DTSS_ALPHAOP]}`;
 
         const line =
             `#${this.drawDiagCount} ${kind} fvf=0x${fvf.toString(16)}(${fvfType}) stride=${stride} ` +
