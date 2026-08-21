@@ -60,6 +60,10 @@ import {
     ffpStageOffset,
     FFP_MAX_LIGHTS,
     packFfpUniforms,
+    makeFfpParams,
+    newFfpColor,
+    readFfpColor,
+    unpackD3dColor,
     type FfpColor,
     type FfpLightInput,
     type FfpMaterial,
@@ -95,6 +99,9 @@ import {
     D3DFVF_XYZ, D3DFVF_XYZRHW, D3DFVF_POSITION_MASK, D3DFVF_NORMAL, D3DFVF_PSIZE, D3DFVF_DIFFUSE,
     D3DFVF_SPECULAR, D3DFVF_TEX1,
 } from "./shader/fvf-layout";
+
+/** Numeric sort comparator, hoisted: the light gather sorts per draw. */
+const ascending = (a: number, b: number): number => a - b;
 
 /** A *UP draw binds only the inline vertex data — slot 0 and nothing else. */
 const UP_STREAM_SLOTS = 1;
@@ -2651,29 +2658,42 @@ export class D3D9Device {
     // resolveFfpStages overwrites, `ffpStages` is the list its callers read.
     private ffpStagePool: FfpResolvedStage[] = [];
     private ffpStages: FfpResolvedStage[] = [];
+    // The rest of the per-draw gather, pooled on the same rule: buildFfpUniformBlock runs per
+    // draw, so every object literal it used to write out was ~500 short-lived allocations a
+    // frame feeding the GC. packFfpUniforms reads the params synchronously into a Float32Array
+    // and keeps nothing, which is what makes one reused record correct here.
+    private readonly materialView = new DataView(
+        this.materialData.buffer, this.materialData.byteOffset, this.materialData.byteLength);
+    private ffpMaterial: FfpMaterial = {
+        diffuse: newFfpColor(), ambient: newFfpColor(),
+        specular: newFfpColor(), emissive: newFfpColor(), power: 0,
+    };
+    private ffpGlobalAmbient = newFfpColor();
+    private ffpTFactor = newFfpColor();
+    private ffpFogColor = newFfpColor();
+    private ffpVertexColors = { hasColor: false, hasSpecular: false, hasNormal: false };
+    private ffpParams: FfpUniformParams | null = null;
 
-    /** Parse the stored D3DMATERIAL9 bytes into float colours + power. */
+    /** Parse the stored D3DMATERIAL9 bytes into float colours + power.
+     *  Returns the REUSED record (this runs per draw) — callers must read it, not keep it. */
     private parseMaterial(): FfpMaterial {
-        const dv = new DataView(this.materialData.buffer, this.materialData.byteOffset, this.materialData.byteLength);
-        const color = (o: number) => ({
-            r: dv.getFloat32(o, true), g: dv.getFloat32(o + 4, true),
-            b: dv.getFloat32(o + 8, true), a: dv.getFloat32(o + 12, true),
-        });
-        return {
-            diffuse: color(0), ambient: color(16), specular: color(32), emissive: color(48),
-            power: dv.getFloat32(64, true),
-        };
+        const dv = this.materialView;
+        const m = this.ffpMaterial;
+        readFfpColor(dv, 0, m.diffuse);
+        readFfpColor(dv, 16, m.ambient);
+        readFfpColor(dv, 32, m.specular);
+        readFfpColor(dv, 48, m.emissive);
+        m.power = dv.getFloat32(64, true);
+        return m;
     }
 
     /** Overwrite `out` with one stored D3DLIGHT9 record. */
     private parseLightInto(data: Uint8Array, out: FfpLightInput): void {
         const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-        const color = (o: number, c: FfpColor) => {
-            c.r = dv.getFloat32(o, true); c.g = dv.getFloat32(o + 4, true);
-            c.b = dv.getFloat32(o + 8, true); c.a = dv.getFloat32(o + 12, true);
-        };
         out.type = dv.getUint32(0, true);
-        color(4, out.diffuse); color(20, out.specular); color(36, out.ambient);
+        readFfpColor(dv, 4, out.diffuse);
+        readFfpColor(dv, 20, out.specular);
+        readFfpColor(dv, 36, out.ambient);
         out.position[0] = dv.getFloat32(52, true);
         out.position[1] = dv.getFloat32(56, true);
         out.position[2] = dv.getFloat32(60, true);
@@ -2749,23 +2769,26 @@ export class D3D9Device {
     private resolveFfpVertexColors(
         slotMask: number = this.activeSlotMask(),
     ): { hasColor: boolean; hasSpecular: boolean; hasNormal: boolean } {
+        // The REUSED record — this runs per draw, so neither the result nor a per-usage
+        // predicate closure may be allocated. Callers destructure it; none keep it.
+        const out = this.ffpVertexColors;
         const decl = this.activeVertexDecl > 0 ? this.vsDeclRegistry.get(this.activeVertexDecl) : null;
         if (decl && decl.length > 0) {
-            // Predicate rather than a filtered copy — this runs per draw.
-            const has = (usage: number, index: number): boolean => decl.some(e =>
-                e.usage === usage && e.usageIndex === index && ((slotMask >>> e.stream) & 1) !== 0);
-            return {
-                hasColor: has(DECLUSAGE_COLOR_FFP, 0),
-                hasSpecular: has(DECLUSAGE_COLOR_FFP, 1),
-                hasNormal: has(DECLUSAGE_NORMAL_FFP, 0),
-            };
+            out.hasColor = out.hasSpecular = out.hasNormal = false;
+            for (let i = 0; i < decl.length; i++) {
+                const e = decl[i]!;
+                if (((slotMask >>> e.stream) & 1) === 0) continue;
+                if (e.usage === DECLUSAGE_COLOR_FFP && e.usageIndex === 0) out.hasColor = true;
+                else if (e.usage === DECLUSAGE_COLOR_FFP && e.usageIndex === 1) out.hasSpecular = true;
+                else if (e.usage === DECLUSAGE_NORMAL_FFP && e.usageIndex === 0) out.hasNormal = true;
+            }
+            return out;
         }
         const fvf = this.stateTracker.getFVF();
-        return {
-            hasColor: (fvf & D3DFVF_DIFFUSE) !== 0,
-            hasSpecular: (fvf & D3DFVF_SPECULAR) !== 0,
-            hasNormal: (fvf & D3DFVF_NORMAL) !== 0,
-        };
+        out.hasColor = (fvf & D3DFVF_DIFFUSE) !== 0;
+        out.hasSpecular = (fvf & D3DFVF_SPECULAR) !== 0;
+        out.hasNormal = (fvf & D3DFVF_NORMAL) !== 0;
+        return out;
     }
 
     /**
@@ -2869,7 +2892,7 @@ export class D3D9Device {
         for (const [idx, on] of this.lightEnables) {
             if (on !== 0) enabled.push(idx);
         }
-        enabled.sort((a, b) => a - b);
+        enabled.sort(ascending);
         const lights = this.ffpLights;
         lights.length = 0;
         for (const idx of enabled) {
@@ -2896,53 +2919,42 @@ export class D3D9Device {
             }
         }
 
-        const ambientVal = rs(D3DRS_AMBIENT) >>> 0;
         // One worldView for both the uniform and the normal matrix — multiplyMatrices allocates.
         const worldView = this.stateTracker.getWorldView();
-        const params: FfpUniformParams = {
-            viewportW: vpW,
-            viewportH: vpH,
-            mvp: this.stateTracker.getMVP(),
-            worldView,
-            normalMatrix: this.buildNormalMatrix(worldView),
-            view: this.stateTracker.getViewMatrix(),
-            world: this.stateTracker.getWorldMatrix(),
-            clipPlanes: this.ffpClipPlanesScratch,
-            clipPlaneEnable,
-            material: this.parseMaterial(),
-            globalAmbient: {
-                r: ((ambientVal >> 16) & 0xff) / 255,
-                g: ((ambientVal >> 8) & 0xff) / 255,
-                b: (ambientVal & 0xff) / 255,
-                a: ((ambientVal >> 24) & 0xff) / 255,
-            },
-            lightingEnabled: rs(D3DRS_LIGHTING) !== 0,
-            specularEnable: rs(D3DRS_SPECULARENABLE) !== 0,
-            localViewer: rs(D3DRS_LOCALVIEWER) !== 0,
-            diffuseSrc: this.effectiveColorSource(rs(D3DRS_DIFFUSEMATERIALSOURCE), colorVertex, hasColor, hasSpecular),
-            ambientSrc: this.effectiveColorSource(rs(D3DRS_AMBIENTMATERIALSOURCE), colorVertex, hasColor, hasSpecular),
-            specularSrc: this.effectiveColorSource(rs(D3DRS_SPECULARMATERIALSOURCE), colorVertex, hasColor, hasSpecular),
-            emissiveSrc: this.effectiveColorSource(rs(D3DRS_EMISSIVEMATERIALSOURCE), colorVertex, hasColor, hasSpecular),
-            hasNormal,
-            normalizeNormals: rs(D3DRS_NORMALIZENORMALS) !== 0,
-            lights,
-            stages,
-            texMatrices: this.stateTracker.getTextureMatrices(),
-            tfactor: (() => {
-                const tf = rs(60) >>> 0; // D3DRS_TEXTUREFACTOR (tracker seeds the white default)
-                return { r: ((tf >> 16) & 0xff) / 255, g: ((tf >> 8) & 0xff) / 255, b: (tf & 0xff) / 255, a: ((tf >> 24) & 0xff) / 255 };
-            })(),
-            fogColor: (() => {
-                const fc = rs(D3DRS_FOGCOLOR) >>> 0;
-                return { r: ((fc >> 16) & 0xff) / 255, g: ((fc >> 8) & 0xff) / 255, b: (fc & 0xff) / 255, a: 1 };
-            })(),
-            fogStart: this.rsFloat(rs(D3DRS_FOGSTART)),
-            fogEnd: this.rsFloat(rs(D3DRS_FOGEND)),
-            fogDensity: this.rsFloat(rs(D3DRS_FOGDENSITY)),
-            fogMode: resolveFfpFogMode(
-                rs(D3DRS_FOGENABLE), rs(D3DRS_FOGTABLEMODE), rs(D3DRS_FOGVERTEXMODE), isRHW, hasSpecular,
-            ),
-        };
+        const params = (this.ffpParams ??= makeFfpParams());
+        params.viewportW = vpW;
+        params.viewportH = vpH;
+        params.mvp = this.stateTracker.getMVP();
+        params.worldView = worldView;
+        params.normalMatrix = this.buildNormalMatrix(worldView);
+        params.view = this.stateTracker.getViewMatrix();
+        params.world = this.stateTracker.getWorldMatrix();
+        params.clipPlanes = this.ffpClipPlanesScratch;
+        params.clipPlaneEnable = clipPlaneEnable;
+        params.material = this.parseMaterial();
+        params.globalAmbient = unpackD3dColor(rs(D3DRS_AMBIENT) >>> 0, this.ffpGlobalAmbient);
+        params.lightingEnabled = rs(D3DRS_LIGHTING) !== 0;
+        params.specularEnable = rs(D3DRS_SPECULARENABLE) !== 0;
+        params.localViewer = rs(D3DRS_LOCALVIEWER) !== 0;
+        params.diffuseSrc = this.effectiveColorSource(rs(D3DRS_DIFFUSEMATERIALSOURCE), colorVertex, hasColor, hasSpecular);
+        params.ambientSrc = this.effectiveColorSource(rs(D3DRS_AMBIENTMATERIALSOURCE), colorVertex, hasColor, hasSpecular);
+        params.specularSrc = this.effectiveColorSource(rs(D3DRS_SPECULARMATERIALSOURCE), colorVertex, hasColor, hasSpecular);
+        params.emissiveSrc = this.effectiveColorSource(rs(D3DRS_EMISSIVEMATERIALSOURCE), colorVertex, hasColor, hasSpecular);
+        params.hasNormal = hasNormal;
+        params.normalizeNormals = rs(D3DRS_NORMALIZENORMALS) !== 0;
+        params.lights = lights;
+        params.stages = stages;
+        params.texMatrices = this.stateTracker.getTextureMatrices();
+        // D3DRS_TEXTUREFACTOR (60) — the tracker seeds the white default.
+        params.tfactor = unpackD3dColor(rs(60) >>> 0, this.ffpTFactor);
+        params.fogColor = unpackD3dColor(rs(D3DRS_FOGCOLOR) >>> 0, this.ffpFogColor);
+        params.fogColor.a = 1;
+        params.fogStart = this.rsFloat(rs(D3DRS_FOGSTART));
+        params.fogEnd = this.rsFloat(rs(D3DRS_FOGEND));
+        params.fogDensity = this.rsFloat(rs(D3DRS_FOGDENSITY));
+        params.fogMode = resolveFfpFogMode(
+            rs(D3DRS_FOGENABLE), rs(D3DRS_FOGTABLEMODE), rs(D3DRS_FOGVERTEXMODE), isRHW, hasSpecular,
+        );
         packFfpUniforms(this.ffpUniformBlock, params);
         return this.ffpUniformBlock;
     }
@@ -4531,6 +4543,7 @@ export class D3D9Device {
             pipelineSets: executorMetrics.pipelineSets,
             bindGroupSets: executorMetrics.bindGroupSets,
             bindGroupCacheHits: executorMetrics.bindGroupCacheHits,
+            bindGroupBuilds: executorMetrics.bindGroupBuilds,
         };
     }
 

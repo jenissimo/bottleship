@@ -120,6 +120,26 @@ const L_SPOT = 24;      // vec4: cos(theta/2), cos(phi/2), 0, 0
 
 export interface FfpColor { r: number; g: number; b: number; a: number; }
 
+/** A zeroed colour record, for the pools the per-draw gather reuses. */
+export function newFfpColor(): FfpColor { return { r: 0, g: 0, b: 0, a: 0 }; }
+
+/** Read one float RGBA quad at `off` into `c` (D3D order: r,g,b,a, little-endian). */
+export function readFfpColor(dv: DataView, off: number, c: FfpColor): void {
+    c.r = dv.getFloat32(off, true);
+    c.g = dv.getFloat32(off + 4, true);
+    c.b = dv.getFloat32(off + 8, true);
+    c.a = dv.getFloat32(off + 12, true);
+}
+
+/** Unpack a D3DCOLOR (0xAARRGGBB) into `c` as floats. */
+export function unpackD3dColor(argb: number, c: FfpColor): FfpColor {
+    c.r = ((argb >> 16) & 0xff) / 255;
+    c.g = ((argb >> 8) & 0xff) / 255;
+    c.b = (argb & 0xff) / 255;
+    c.a = ((argb >>> 24) & 0xff) / 255;
+    return c;
+}
+
 export interface FfpMaterial {
     diffuse: FfpColor;
     ambient: FfpColor;
@@ -210,6 +230,26 @@ export interface FfpUniformParams {
     fogEnd: number;
     fogDensity: number;
     fogMode: number;
+}
+
+/** A params record with every field present, for the per-draw gather to overwrite in place.
+ *  Every value here is replaced before packFfpUniforms sees it. */
+export function makeFfpParams(): FfpUniformParams {
+    const m = new Float32Array(16);
+    return {
+        viewportW: 0, viewportH: 0,
+        mvp: m, worldView: m, normalMatrix: m, view: m, world: m,
+        clipPlanes: new Float32Array(24), clipPlaneEnable: 0,
+        material: { diffuse: newFfpColor(), ambient: newFfpColor(), specular: newFfpColor(), emissive: newFfpColor(), power: 0 },
+        globalAmbient: newFfpColor(),
+        lightingEnabled: false, specularEnable: false, localViewer: false,
+        diffuseSrc: 0, ambientSrc: 0, specularSrc: 0, emissiveSrc: 0,
+        hasNormal: false, normalizeNormals: false,
+        lights: [], stages: [],
+        texMatrices: new Float32Array(FFP_MAX_TEX_MATRICES * 16),
+        tfactor: newFfpColor(), fogColor: newFfpColor(),
+        fogStart: 0, fogEnd: 0, fogDensity: 0, fogMode: 0,
+    };
 }
 
 /** Transform a world-space point by a D3D row-major matrix (row-vector × matrix). */
