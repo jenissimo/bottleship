@@ -1270,6 +1270,23 @@ export function sehOnCatchCompletion(cpu: any): void {
         dv.setUint32((rec.pRN - 4) >>> 0, rec.savedTryEsp >>> 0, true);
     }
 
+    // RELINK the catching frame. Catch entry sets FS:[0] to the frame's `next` so a throw
+    // from INSIDE the catch body resumes above it (__CxxFrameHandler gets that from the
+    // frame's state, we get it by unlinking). That unlink is only valid for the duration of
+    // the catch body: the function keeps running afterwards, and MSVC never removes a live
+    // frame's registration. Leaving it out means every LATER throw from another try block of
+    // the same function finds no handler — Serious Sam caught its Controls/ConsoleHistory
+    // opens and then died on the next one because CGame::InitInternal was no longer on the
+    // chain. Only undo OUR OWN unlink: relink when the head is still exactly this frame's
+    // next, so a try registered deeper since is never clobbered.
+    if (rec.pRN >= 0x1000 && rec.pRN + 4 <= mem.length) {
+        const frameNext = dv.getUint32(rec.pRN, true) >>> 0;
+        const head = dv.getUint32(tebAddr, true) >>> 0;
+        if (head === frameNext) {
+            dv.setUint32(tebAddr, rec.pRN >>> 0, true);
+        }
+    }
+
     if ((globalThis as Record<string, unknown>).__sehNoObjDtor) return;
     const pmfnUnwind = readThrowInfoUnwindFunc(dv, mem, rec.pThrowInfo);
     if (!pmfnUnwind || !rec.pExceptionObject || !rec.stubHome || !rec.scratchEsp) return;
