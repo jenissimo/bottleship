@@ -279,24 +279,40 @@ export function installHarnessFacade(worker: Worker, getInputView?: () => Int32A
     }
 
     /** Wait for a raw worker message matching a predicate (load completion etc.). */
-    function waitForWorkerMessage(pred: (m: any) => boolean, timeoutMs: number): Promise<any> {
+    /**
+     * Wait for a worker message matching `pred`.
+     *
+     * `timeoutMs` bounds SILENCE, not the whole wait, when `progress` is given: every message
+     * the predicate accepts as progress restarts the clock. A total-duration bound is the wrong
+     * shape for anything whose duration scales with input — a cold multi-gigabyte bundle load
+     * legitimately outruns any constant, so a constant either fails a healthy load or waits out
+     * a dead one. A stall bound fails the dead load faster AND never fails the healthy one.
+     */
+    function waitForWorkerMessage(
+        pred: (m: any) => boolean,
+        timeoutMs: number,
+        progress?: (m: any) => boolean,
+    ): Promise<any> {
         return new Promise((resolve) => {
             let done = false;
-            const onMsg = (ev: MessageEvent) => {
-                if (done) return;
-                if (pred(ev.data)) {
-                    done = true;
-                    clearTimeout(timer);
-                    worker.removeEventListener("message", onMsg);
-                    resolve(ev.data);
-                }
-            };
-            const timer = setTimeout(() => {
+            let timer: ReturnType<typeof setTimeout>;
+            const finish = (value: any) => {
                 if (done) return;
                 done = true;
+                clearTimeout(timer);
                 worker.removeEventListener("message", onMsg);
-                resolve(null);
-            }, timeoutMs);
+                resolve(value);
+            };
+            const arm = () => {
+                clearTimeout(timer);
+                timer = setTimeout(() => finish(null), timeoutMs);
+            };
+            const onMsg = (ev: MessageEvent) => {
+                if (done) return;
+                if (pred(ev.data)) { finish(ev.data); return; }
+                if (progress?.(ev.data)) arm();
+            };
+            arm();
             worker.addEventListener("message", onMsg);
         });
     }
@@ -338,9 +354,13 @@ export function installHarnessFacade(worker: Worker, getInputView?: () => Int32A
         // waiting only for "done" turns every load failure into a 120s stall that still
         // reports ok — the run then fails later, somewhere unrelated, with the real reason
         // only in the log. Watch for both and let the error be the answer.
+        // 120s of SILENCE, not 120s total: a cold 2.2 GB bundle load takes longer than any
+        // constant worth hardcoding, but it reports loading_progress throughout, so a stall
+        // bound is both safer and stricter than the total bound this used to have.
         const loadDone = waitForWorkerMessage(
             (m) => (m?.type === "loading_progress" && m.phase === "done") || m?.type === "error",
             120_000,
+            (m) => m?.type === "loading_progress",
         );
         if (opts?.hle && typeof w.enableHleAndLoad === "function") {
             await w.enableHleAndLoad(path, !!opts.logOnly);
