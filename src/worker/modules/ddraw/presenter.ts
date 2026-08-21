@@ -299,7 +299,6 @@ export class DDrawPresenter implements RenderActive {
         try {
             const now = performance.now();
             const prevPresentTime = this.lastPresentTime;
-            this.lastPresentTime = now;
 
             // Check for early returns (no throttle – we're not presenting)
             if (!surface.surfacePtr || surface.width <= 0 || surface.height <= 0) {
@@ -530,10 +529,13 @@ export class DDrawPresenter implements RenderActive {
                     system.services.render.notifyPresent("ddraw");
                     didPresent = true;
 
-                    // Feed frame time to stats overlay
+                    // Inter-present interval. The clock is stamped HERE, not at entry:
+                    // drawFrame has several early returns that present nothing, and resetting
+                    // it there shortens the next interval and over-reports fps.
                     if (prevPresentTime > 0) {
                         statsOverlay.updateMetrics(now - prevPresentTime);
                     }
+                    this.lastPresentTime = now;
 
                     // Frame capture: finalize captured draw calls
                     frameCaptureOnFrameEnd();
