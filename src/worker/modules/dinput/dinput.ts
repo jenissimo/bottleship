@@ -10,6 +10,7 @@ import { readGuidFromMem } from "../../core/com/typelib/typelib-types";
 import { BaseComObject, ComObjectFactory } from "../../core/com/base-com-object";
 import { SystemResourceProvider } from "../../core/resources/system-resource-provider";
 import { Mem } from "../../core/memory/mem-accessor";
+import { Marshaler } from "../../core/memory/marshaler";
 
 import { allocateComObject } from "../../core/com/com-memory";
 import { encodeAnsi } from "../codepage-utils";
@@ -25,12 +26,14 @@ import { resetLosableDevices, trackLosableDevice, untrackLosableDevice } from ".
 import { clearExclusiveMouseOwners, setExclusiveMouseOwner } from "../../core/pointer-policy";
 import { GUEST_INPUT_FLAG } from "../../../input/sab-layout";
 import { DInputNotifyRegistry, DI_OK, DIERR_INVALIDPARAM } from "./dinput-notify";
+import { GAMEPAD_BUTTONS, POV_CENTERED, gamepadPovAngle } from "./emulated-gamepad";
 
 // DirectInput error codes (HRESULT = MAKE_HRESULT(ERROR, FACILITY_WIN32, win32err))
 const DIERR_OUTOFMEMORY = 0x8007000E;
 const DIERR_NOTACQUIRED = 0x8007000C; // ERROR_INVALID_ACCESS (0x0C)
 const DIERR_INPUTLOST = 0x8007001E;   // ERROR_READ_FAULT (0x1E)
 const DIERR_DEVICENOTREG = 0x80040154; // REGDB_E_CLASSNOTREG
+const DI_NOTATTACHED = 0x00000001;     // S_FALSE — "the device is known but not attached"
 
 // DI8 action-mapping constants (dinput.h) — keyboard semantics / defaults live in dinput-action-maps.ts
 const DIDFT_BUTTON = 0x0000000c;
@@ -106,6 +109,11 @@ const DIPROP_BUFFERSIZE = 1;
 const DIPROP_AXISMODE = 2;
 const DIPROP_GRANULARITY = 3;
 const DIPROP_RANGE = 4;
+const DIPROP_KEYNAME = 20;
+/** sizeof(DIPROPSTRING) — DIPROPHEADER(16) + WCHAR wsz[MAX_PATH]. Always WIDE, even
+ *  through the ANSI interface; DirectInput rejects any other dwSize. */
+const DIPROPSTRING_SIZE = 16 + 260 * 2;
+const DIPROPSTRING_MAX_CHARS = 260;
 const DIPROPRANGE_NOMIN = 0x80000000;
 const DIPROPRANGE_NOMAX = 0x7FFFFFFF;
 const DIERR_UNSUPPORTED = 0x80004001; // E_NOTIMPL
@@ -116,6 +124,7 @@ const DIDFT_RELAXIS = 0x00000001;
 const DIDFT_ABSAXIS = 0x00000002;
 const DIDFT_PSHBUTTON = 0x00000004;
 const DIDFT_POV = 0x00000010;
+const DIPH_DEVICE = 0;
 const DIPH_BYOFFSET = 1;
 const DIPH_BYID = 2;
 const DIDEVICEOBJECTINSTANCEA_SIZE = 316; // DX5+ A variant; DX3 subset is the first 288 bytes
@@ -183,12 +192,43 @@ function getDeviceObjectSpecs(deviceType: string): DeviceObjectSpec[] {
             { name: "Ry-axis", dwOfs: 16, dwType: DIDFT_ABSAXIS | (3 << 8), guid: GUID_RYAXIS },
             { name: "POV",     dwOfs: 32, dwType: DIDFT_POV     | (4 << 8), guid: GUID_POVOBJ },
         ];
-        for (let i = 0; i < 32; i++) {
+        for (let i = 0; i < GAMEPAD_BUTTONS; i++) {
             objs.push({ name: `Button ${i}`, dwOfs: 48 + i, dwType: DIDFT_PSHBUTTON | ((5 + i) << 8), guid: GUID_BUTTON });
         }
         return objs;
     }
     return [];
+}
+
+/**
+ * DIDEVCAPS dwAxes/dwButtons/dwPOVs, counted off the very table EnumObjects walks.
+ * A device that enumerates objects it says it does not have (or the reverse) sends a
+ * key-binding screen blank and makes an engine testing `dwAxes >= 2` reject the stick
+ * and fall back to the keyboard — with no error for anyone to see.
+ */
+function countDeviceObjects(deviceType: string): { axes: number; buttons: number; povs: number } {
+    let axes = 0, buttons = 0, povs = 0;
+    for (const o of getDeviceObjectSpecs(deviceType)) {
+        if (o.dwType & (DIDFT_ABSAXIS | DIDFT_RELAXIS)) axes++;
+        else if (o.dwType & DIDFT_PSHBUTTON) buttons++;
+        else if (o.dwType & DIDFT_POV) povs++;
+    }
+    return { axes, buttons, povs };
+}
+
+/** DIPROPHEADER dwObj/dwHow addressing, shared by GetObjectInfo and the per-object
+ *  properties. DIPH_BYID compares the instance number and the type bits the caller asked
+ *  for; DIPH_DEVICE addresses the device itself and names no object. */
+function findDeviceObject(
+    objects: DeviceObjectSpec[], dwObj: number, dwHow: number,
+): DeviceObjectSpec | undefined {
+    if (dwHow === DIPH_BYOFFSET) return objects.find(o => o.dwOfs === dwObj);
+    if (dwHow === DIPH_BYID) {
+        return objects.find(o =>
+            (o.dwType & 0xFF00) === (dwObj & 0xFF00) &&
+            ((dwObj & 0xFF & o.dwType) !== 0 || (dwObj & 0xFF) === 0));
+    }
+    return undefined;
 }
 
 // DIDEVCAPS.dwFlags bits (dinput.h). Games gate device presence on DIDC_ATTACHED —
@@ -238,8 +278,27 @@ interface SavedActionBinding {
     how: number;
 }
 
-// Stub methods for IDirectInputA (methods that just return DI_OK)
-const IDirectInputA_StubMethods = ["GetDeviceStatus", "RunControlPanel", "Initialize"];
+// Stub methods for IDirectInputA (methods that just return DI_OK).
+// GetDeviceStatus is NOT here: DI_OK means "that device is attached right now", and
+// answering it for a pad nobody plugged in makes a game take the joystick path and read
+// a permanently neutral stick instead of falling back to the keyboard.
+const IDirectInputA_StubMethods = ["RunControlPanel", "Initialize"];
+
+/** Every IID an IDirectInput object answers to. The DX3/5/7 A and W chains share one
+ *  vtable shape here; the DX8 interfaces are separate objects with their own tables and
+ *  are deliberately NOT reachable through this QueryInterface. */
+const IID_IUNKNOWN = "00000000-0000-0000-c000-000000000046";
+const IID_IDIRECTINPUTA = "89521360-aa8a-11cf-bfc7-444553540000";
+const IID_IDIRECTINPUTW = "89521361-aa8a-11cf-bfc7-444553540000";
+const DIRECTINPUT_QI_IIDS = new Set([
+    IID_IUNKNOWN,
+    IID_IDIRECTINPUTA,
+    IID_IDIRECTINPUTW,
+    "5944e662-aa8a-11cf-bfc7-444553540000", // IDirectInput2A
+    "5944e663-aa8a-11cf-bfc7-444553540000", // IDirectInput2W
+    "9a4cb684-236d-11d3-8e9d-00c04f6844ae", // IDirectInput7A
+    "9a4cb685-236d-11d3-8e9d-00c04f6844ae", // IDirectInput7W
+]);
 
 // Stub methods for IDirectInputDeviceA (methods that just return DI_OK).
 // EnumObjects/GetObjectInfo are NOT here — they have real implementations below;
@@ -247,8 +306,13 @@ const IDirectInputA_StubMethods = ["GetDeviceStatus", "RunControlPanel", "Initia
 // broke Max Payne (GetProperty granularity → 0 divisor → NaN wheel tracker).
 const IDirectInputDeviceA_StubMethods = ["RunControlPanel", "Initialize"];
 
-// Stub methods for IDirectInputDevice2A (additional methods that just return DI_OK)
-const IDirectInputDevice2A_StubMethods = ["CreateEffect", "EnumEffects", "GetEffectInfo", "GetForceFeedbackState", "SendForceFeedbackCommand", "EnumCreatedEffectObjects", "Escape", "SendDeviceData"];
+// Stub methods for IDirectInputDevice2A (methods that just return DI_OK). Only the two
+// enumerations are here, and only because an enumeration over an empty set IS a success
+// that calls back zero times. Everything else in the force-feedback group answers
+// DIERR_UNSUPPORTED below — GetCaps never reports DIDC_FORCEFEEDBACK, so a DI_OK that
+// leaves an effect pointer or a state DWORD untouched contradicts our own capabilities
+// and hands the caller its own stack to dispatch through.
+const IDirectInputDevice2A_StubMethods = ["EnumEffects", "EnumCreatedEffectObjects"];
 
 /** Devices with an armed SetEventNotification handle. */
 const notifyRegistry = new DInputNotifyRegistry({
@@ -473,16 +537,68 @@ export class DInput implements IModule {
             return DI_OK;
         };
 
-        // IDirectInputA IUnknown methods
+        // IDirectInputA IUnknown methods.
+        // The IID is checked for real: accepting any IID and handing back `this` gives a
+        // caller that asked for IDirectInput7A the SHORT DX3 vtable, and its first call to
+        // FindDevice/CreateDeviceEx reads past the table's end into whatever follows. That
+        // is the defect DirectInputCreateEx was fixed for; QI is the other way in.
         this.exports["IDirectInputA_QueryInterface"] = (ctx, mem, args) => {
             const thisPtr = args[0];
+            const riidPtr = args[1];
             const ppvObject = args[2];
-            const obj = resourceProvider.getComObjectByAddress(thisPtr);
-            if (!obj) return 0x80004002; // E_NOINTERFACE
             const freshMem = this.getMemory();
             const view = new DataView(freshMem.buffer, freshMem.byteOffset, freshMem.byteLength);
-            if (ppvObject) view.setUint32(ppvObject, thisPtr, true);
-            obj.addRef();
+            const fail = (): number => {
+                // A failed QI must NULL the out-pointer: the caller is entitled to test it
+                // instead of the HRESULT, and stale stack there becomes a wild vtable.
+                if (ppvObject) view.setUint32(ppvObject, 0, true);
+                return 0x80004002; // E_NOINTERFACE
+            };
+            const obj = resourceProvider.getComObjectByAddress(thisPtr);
+            if (!obj) return fail();
+
+            const iid = readGuidFromMem(freshMem, riidPtr).toLowerCase();
+            const vtableOf = (name: string): number => this.vtables[name]?.address ?? 0;
+            const currentVtable = view.getUint32(thisPtr, true);
+            const isDi8 = currentVtable === vtableOf("IDirectInput8A")
+                || currentVtable === vtableOf("IDirectInput8W");
+
+            const succeed = (addr: number, o: { addRef(): number }): number => {
+                if (ppvObject) view.setUint32(ppvObject, addr, true);
+                o.addRef();
+                return DI_OK;
+            };
+            if (iid === IID_IUNKNOWN) return succeed(thisPtr, obj);
+            if (isDi8) {
+                // dinput8's object does not implement the DX3-7 interfaces, and neither
+                // does ours — the DX7 vtable it would need is a different table.
+                if (iid === IID_IDIRECTINPUT8A || iid === IID_IDIRECTINPUT8W) {
+                    return succeed(thisPtr, obj);
+                }
+                Logger.log(LogCategory.SYSTEM, `IDirectInput8_QueryInterface: unsupported iid=${iid}`);
+                return fail();
+            }
+            if (!DIRECTINPUT_QI_IIDS.has(iid)) {
+                Logger.log(LogCategory.SYSTEM, `IDirectInputA_QueryInterface: unsupported iid=${iid}`);
+                return fail();
+            }
+            // IDirectInput2/7 add FindDevice and CreateDeviceEx past the DX3 vtable, so
+            // they can only be served by the longer table. A DX3 request is satisfied by
+            // either, since the long table is a strict superset.
+            const needsLongVtable = iid !== IID_IDIRECTINPUTA && iid !== IID_IDIRECTINPUTW;
+            if (!needsLongVtable || currentVtable === vtableOf("IDirectInput7A")) {
+                return succeed(thisPtr, obj);
+            }
+            const longVtable = vtableOf("IDirectInput7A");
+            if (!longVtable) return fail();
+            const promoted = ComObjectFactory.create(iid, longVtable);
+            if (!promoted) return fail();
+            const addr = allocateComObject(this.process.memory, this.getMemory(), longVtable);
+            resourceProvider.mapAddressToHandle(addr, promoted.handle);
+            const wv = this.freshView();
+            if (ppvObject) wv.setUint32(ppvObject, addr, true);
+            Logger.log(LogCategory.SYSTEM,
+                `IDirectInputA_QueryInterface: ${iid} -> new IDirectInput7A object 0x${addr.toString(16)}`);
             return DI_OK;
         };
         this.exports["IDirectInputA_AddRef"] = (ctx, mem, args) => {
@@ -498,6 +614,32 @@ export class DInput implements IModule {
         for (const method of IDirectInputA_StubMethods) {
             this.exports[`IDirectInputA_${method}`] = () => DI_OK;
         }
+
+        // HRESULT GetDeviceStatus(REFGUID rguidInstance) — DI_OK means "attached and
+        // usable right now", DI_NOTATTACHED means the instance is known but absent. The
+        // same presence test EnumDevices and GetCapabilities use answers it, so the three
+        // cannot disagree about one device.
+        this.exports["IDirectInputA_GetDeviceStatus"] = (ctx, mem, args) => {
+            const rguid = args[1] >>> 0;
+            const deviceType = this.resolveDeviceType(this.getMemory(), rguid);
+            let attached: boolean;
+            switch (deviceType) {
+                case "keyboard":
+                case "mouse":
+                    attached = true;
+                    break;
+                case "joystick":
+                case "gamepad":
+                    attached = System.getInstance().inputManager.getGamepadState().connected;
+                    break;
+                default:
+                    // Not one of the system devices we present at all.
+                    return DIERR_DEVICENOTREG;
+            }
+            Logger.verbose(LogCategory.SYSTEM,
+                `IDirectInputA_GetDeviceStatus(${deviceType}) -> ${attached ? "DI_OK" : "DI_NOTATTACHED"}`);
+            return attached ? DI_OK : DI_NOTATTACHED;
+        };
 
         // Custom implementation for IDirectInputA_EnumDevices with proper callback invocation
         this.exports["IDirectInputA_EnumDevices"] = (ctx, mem, args) => {
@@ -944,11 +1086,13 @@ export class DInput implements IModule {
             view.setUint32(lpDIDevCaps + 4, dwFlags, true);
             view.setUint32(lpDIDevCaps + 8, devType, true);
 
+            // dwAxes/dwButtons/dwPOVs come from the same object table EnumObjects and
+            // GetObjectInfo answer from, so the count and the enumeration cannot drift.
             if (size >= 20) {
-                const axes = device?.deviceType === "mouse" ? 3 : 0;    // X, Y, Z (wheel)
-                const btns = device?.deviceType === "mouse" ? 5 : 0;    // L, R, M, X1, X2
-                view.setUint32(lpDIDevCaps + 12, axes, true);
-                view.setUint32(lpDIDevCaps + 16, btns, true);
+                const counts = countDeviceObjects(device?.deviceType ?? "unknown");
+                view.setUint32(lpDIDevCaps + 12, counts.axes, true);
+                view.setUint32(lpDIDevCaps + 16, counts.buttons, true);
+                if (size >= 24) view.setUint32(lpDIDevCaps + 20, counts.povs, true);
             }
 
             return DI_OK;
@@ -1074,13 +1218,15 @@ export class DInput implements IModule {
                 view.setInt32(lpvData + 20, 0, true);
                 view.setUint32(lpvData + 24, 0, true);
                 view.setUint32(lpvData + 28, 0, true);
-                view.setUint32(lpvData + 32, 0xFFFFFFFF, true);
-                view.setUint32(lpvData + 36, 0xFFFFFFFF, true);
-                view.setUint32(lpvData + 40, 0xFFFFFFFF, true);
-                view.setUint32(lpvData + 44, 0xFFFFFFFF, true);
-
                 const buttonsMask = gamepad.connected ? gamepad.buttons : 0;
-                for (let i = 0; i < 32; i++) {
+                // rgdwPOV[0] is the d-pad; the pad has one hat, so the other three stay
+                // centred (DIDEVCAPS.dwPOVs says one, and the two must agree).
+                view.setUint32(lpvData + 32, gamepadPovAngle(buttonsMask), true);
+                view.setUint32(lpvData + 36, POV_CENTERED, true);
+                view.setUint32(lpvData + 40, POV_CENTERED, true);
+                view.setUint32(lpvData + 44, POV_CENTERED, true);
+
+                for (let i = 0; i < GAMEPAD_BUTTONS; i++) {
                     mem[lpvData + 48 + i] = (buttonsMask & (1 << i)) ? 0x80 : 0x00;
                 }
                 return DI_OK;
@@ -1235,6 +1381,29 @@ export class DInput implements IModule {
                 return DI_OK;
             }
 
+            if ((rguidProp & 0xFFFF0000) === 0 && rguidProp === DIPROP_KEYNAME) {
+                // DIPROPSTRING out-param carrying the object's own tszName — the same table
+                // GetObjectInfo answers from (Wine keyboard_get_property). A game that renders
+                // "press [W]" reads its binding names through this and NOTHING else, so failing
+                // it leaves the caller's fixed-size name buffer at whatever it was pre-filled
+                // with. Keys only: a device with axes and no key objects has no key names.
+                const view = this.freshView();
+                const device = this.getDevice(thisPtr);
+                if (device?.deviceType !== "keyboard") return DIERR_UNSUPPORTED;
+                if (view.getUint32(pdiph, true) !== DIPROPSTRING_SIZE) return DIERR_INVALIDPARAM;
+                const dwObj = view.getUint32(pdiph + 8, true);
+                const dwHow = view.getUint32(pdiph + 12, true);
+                if (dwHow === DIPH_DEVICE) return DIERR_INVALIDPARAM;
+                const match = findDeviceObject(getDeviceObjectSpecs("keyboard"), dwObj, dwHow);
+                if (!match) {
+                    Logger.log(LogCategory.SYSTEM,
+                        `IDirectInputDeviceA_GetProperty: KEYNAME dwObj=0x${dwObj.toString(16)} how=${dwHow} -> NOT FOUND`);
+                    return DIERR_OBJECTNOTFOUND;
+                }
+                Marshaler.writeWideString(this.getMemory(), pdiph + 16, match.name, DIPROPSTRING_MAX_CHARS);
+                return DI_OK;
+            }
+
             // Unknown property: real DirectInput fails (DIERR_UNSUPPORTED) rather than
             // succeeding with an untouched output struct — a fake DI_OK here is exactly
             // how the granularity bug stayed invisible. NORMAL-level log so any game
@@ -1364,17 +1533,10 @@ export class DInput implements IModule {
 
             const device = this.getDevice(thisPtr);
             const objects = getDeviceObjectSpecs(device?.deviceType ?? "unknown");
-            let match: DeviceObjectSpec | undefined;
-            if (dwHow === DIPH_BYOFFSET) {
-                match = objects.find(o => o.dwOfs === dwObj);
-            } else if (dwHow === DIPH_BYID) {
-                match = objects.find(o =>
-                    (o.dwType & 0xFF00) === (dwObj & 0xFF00) &&
-                    ((dwObj & 0xFF & o.dwType) !== 0 || (dwObj & 0xFF) === 0)
-                );
-            } else {
+            if (dwHow !== DIPH_BYOFFSET && dwHow !== DIPH_BYID) {
                 return DIERR_INVALIDPARAM; // DIPH_DEVICE is not valid for GetObjectInfo
             }
+            const match = findDeviceObject(objects, dwObj, dwHow);
             if (!match) {
                 Logger.log(LogCategory.SYSTEM,
                     `IDirectInputDeviceA_GetObjectInfo: type=${device?.deviceType} dwObj=0x${dwObj.toString(16)} how=${dwHow} -> NOT FOUND`);
@@ -1495,6 +1657,29 @@ export class DInput implements IModule {
             this.exports[`IDirectInputDevice2A_${method}`] = () => DI_OK;
         }
 
+        // CreateEffect(rguid, lpeff, ppdeff, punkOuter) — no device here reports
+        // DIDC_FORCEFEEDBACK, so there is no effect to create. NULL the out pointer: the
+        // caller stores it and later calls Start/Unload through it.
+        this.exports["IDirectInputDevice2A_CreateEffect"] = (ctx, mem, args) => {
+            const ppdeff = args[3] >>> 0;
+            if (ppdeff) Mem.writeUint32(ppdeff, 0);
+            Logger.log(LogCategory.SYSTEM, "IDirectInputDevice2A_CreateEffect -> DIERR_UNSUPPORTED (no force feedback)");
+            return DIERR_UNSUPPORTED;
+        };
+        // GetForceFeedbackState(pdwOut) — the state DWORD is the whole answer; leaving it
+        // untouched is the one failure the caller cannot see.
+        this.exports["IDirectInputDevice2A_GetForceFeedbackState"] = (ctx, mem, args) => {
+            const pdwOut = args[1] >>> 0;
+            if (pdwOut) Mem.writeUint32(pdwOut, 0);
+            return DIERR_UNSUPPORTED;
+        };
+        this.exports["IDirectInputDevice2A_GetEffectInfo"] = () => DIERR_UNSUPPORTED;
+        this.exports["IDirectInputDevice2A_SendForceFeedbackCommand"] = () => DIERR_UNSUPPORTED;
+        // Escape is a driver-specific passthrough and SendDeviceData writes to output
+        // objects; we have neither, and DI_OK would claim the command was carried out.
+        this.exports["IDirectInputDevice2A_Escape"] = () => DIERR_UNSUPPORTED;
+        this.exports["IDirectInputDevice2A_SendDeviceData"] = () => DIERR_UNSUPPORTED;
+
         // IDirectInputDevice2A_Poll - specifically log this as it's a hot path
         this.exports["IDirectInputDevice2A_Poll"] = (ctx, mem, args) => {
             const device = this.getDevice(args[0]);
@@ -1569,7 +1754,7 @@ export class DInput implements IModule {
         this.exports["IDirectInput8W_GetDeviceStatus"] = this.exports["IDirectInputA_GetDeviceStatus"];
         this.exports["IDirectInput8W_RunControlPanel"] = this.exports["IDirectInputA_RunControlPanel"];
         this.exports["IDirectInput8W_Initialize"] = this.exports["IDirectInputA_Initialize"];
-        this.exports["IDirectInput8W_FindDevice"] = () => DI_OK;
+        this.exports["IDirectInput8W_FindDevice"] = this.exports["IDirectInput7A_FindDevice"];
         this.exports["IDirectInput8W_CreateDevice"] = (ctx, mem, args) => {
             const rguid = args[1];
             const lplpDevice = args[2];

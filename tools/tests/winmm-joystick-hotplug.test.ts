@@ -11,6 +11,7 @@ import { describe, expect, test, beforeEach } from "bun:test";
 import { System } from "../../src/worker/core/system";
 import { INPUT_BUFFER_SIZE, INPUT_INDEX, beginInputWrite, endInputWrite } from "../../src/input/sab-layout";
 import { registerWinmmJoystickExports, resetWinmmJoystick } from "../../src/worker/modules/winmm-joystick";
+import { GAMEPAD_AXES, GAMEPAD_BUTTONS } from "../../src/worker/modules/dinput/emulated-gamepad";
 import { TimeService } from "../../src/worker/runtime/time";
 import type { ThunkImplementation } from "../../src/worker/core/thunking/thunk-dispatcher";
 
@@ -104,8 +105,8 @@ describe("winmm joystick hot-plug", () => {
 
         // Fixed fields live at 4 + 32*2 = 68, i.e. 32 bytes past their ANSI offsets.
         expect(view.getUint32(PJI + 68 + 4, true)).toBe(0xFFFF); // wXmax
-        expect(view.getUint32(PJI + 68 + 24, true)).toBe(8);     // wNumButtons
-        expect(view.getUint32(PJI + 68 + 68, true)).toBe(4);     // wNumAxes
+        expect(view.getUint32(PJI + 68 + 24, true)).toBe(GAMEPAD_BUTTONS); // wNumButtons
+        expect(view.getUint32(PJI + 68 + 68, true)).toBe(GAMEPAD_AXES);    // wNumAxes
 
         // ...and the ANSI slots they would have occupied stay zero.
         expect(view.getUint32(PJI + 60, true)).toBe(0);
@@ -128,14 +129,14 @@ describe("winmm joystick hot-plug", () => {
         expect(call("joyGetPos", 1, PJI)).toBe(JOYERR_UNPLUGGED);
     });
 
-    // JOYCAPS advertises wNumButtons = 8, so nothing above bit 7 may appear in
-    // dwButtons — and dwButtonNumber is a popcount over that set, so an unmasked host
+    // JOYCAPS advertises the shared pad's button count, so nothing above it may appear
+    // in dwButtons — and dwButtonNumber is a popcount over that set, so an unmasked host
     // mask makes it exceed the advertised count.
     test("dwButtons/dwButtonNumber stay within the advertised wNumButtons", () => {
         setPad(true, 0xFFFF);
         expect(posEx()).toBe(JOYERR_NOERROR);
-        expect(view.getUint32(PJI + 32, true)).toBe(0xFF);
-        expect(view.getUint32(PJI + 36, true)).toBe(8);
+        expect(view.getUint32(PJI + 32, true)).toBe((1 << GAMEPAD_BUTTONS) - 1);
+        expect(view.getUint32(PJI + 36, true)).toBe(GAMEPAD_BUTTONS);
 
         // JOYINFO.wButtons is only the four JOY_BUTTON1..4 bits, per the struct.
         expect(call("joyGetPos", 0, PJI)).toBe(JOYERR_NOERROR);

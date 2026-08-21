@@ -1,8 +1,20 @@
 /**
- * winmm device-caps / stub handlers (waveIn*, midiIn*, mixer*, aux*). No real
- * capture/mixer/aux device is emulated — faithful "one emulated device" caps
- * reporters and success stubs. Aux master volume lives in the registration
- * closure (one WinMM registration per process).
+ * winmm device-caps handlers (waveIn*, midi*, mixer*, aux*).
+ *
+ * A device count here is a PROMISE: an app that reads N > 0 goes on to open device 0
+ * and drive it, and a count we cannot back is worse than a zero — the open fails deep
+ * inside the app's audio init instead of at the one call that asks "is there one?".
+ * So the numbers state what is actually behind each API:
+ *   - aux: one device, and its volume really does drive the CD-audio line.
+ *   - waveIn: one device (the capture stubs accept and complete headers).
+ *   - MIDI out/in: NONE. There is no synthesizer and no MIDI port; a game told
+ *     otherwise plays its whole soundtrack into a sink and hears silence, or fails
+ *     inside midiOutOpen with no way to fall back.
+ *   - mixer: NONE. No mixer line/control topology is implemented, and returning
+ *     MMSYSERR_NOERROR from mixerGetLineInfo with the caller's MIXERLINE untouched
+ *     hands it stack garbage as a line id it then queries controls for.
+ * Aux master volume lives in the registration closure (one WinMM registration per
+ * process).
  */
 import { ThunkImplementation } from '../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../core/logger';
@@ -10,6 +22,7 @@ import { virtualCd } from '../core/audio/virtual-cd';
 
 const MMSYSERR_NOERROR = 0;
 const MMSYSERR_BADDEVICEID = 2;
+const MMSYSERR_INVALHANDLE = 5;
 const MMSYSERR_INVALPARAM = 11;
 const AUX_MAPPER = 0xFFFFFFFF;
 const AUXCAPS_VOLUME = 0x0001;
@@ -20,30 +33,11 @@ function isValidAuxDeviceId(uDeviceID: number): boolean {
     return uDeviceID === 0 || uDeviceID === AUX_MAPPER;
 }
 
-function isValidMidiInDeviceId(uDeviceID: number): boolean {
-    return uDeviceID === 0;
-}
-
-function writeMidiInCaps(mem: Uint8Array, pmic: number, isWide: boolean): void {
-    const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-    view.setUint16(pmic + 0, 0xFFFF, true); // wMid
-    view.setUint16(pmic + 2, 0x0001, true); // wPid
-    view.setUint32(pmic + 4, 0x0100, true); // vDriverVersion
-
-    const name = "BottleShip MIDI In";
-    if (isWide) {
-        for (let i = 0; i < 32; i++) {
-            const code = i < name.length ? name.charCodeAt(i) : 0;
-            view.setUint16(pmic + 8 + i * 2, code, true);
-        }
-        view.setUint32(pmic + 72, 0, true); // dwSupport (reserved)
-    } else {
-        for (let i = 0; i < 32; i++) {
-            mem[pmic + 8 + i] = i < name.length ? name.charCodeAt(i) : 0;
-        }
-        view.setUint32(pmic + 40, 0, true); // dwSupport (reserved)
-    }
-}
+/** MIDI output devices we can serve. There is no synth, so there are none, and
+ *  MIDI_MAPPER has nothing to map to either. */
+const MIDI_OUT_DEVICES = 0;
+/** MIDI input devices — no port, no host MIDI capture. */
+const MIDI_IN_DEVICES = 0;
 
 function writeAuxCaps(mem: Uint8Array, pac: number, isWide: boolean): void {
     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
@@ -145,70 +139,76 @@ export function registerWinmmCapsExports(exports: Record<string, ThunkImplementa
 
     // ==================== MIDI Input Functions ====================
 
-    exports["midiInGetNumDevs"] = () => 1;
+    exports["midiInGetNumDevs"] = () => MIDI_IN_DEVICES;
+    exports["midiInGetDevCapsA"] = () => MMSYSERR_BADDEVICEID;
+    exports["midiInGetID"] = () => MMSYSERR_INVALHANDLE;
+    exports["midiInOpen"] = () => MMSYSERR_BADDEVICEID;
+    // Nothing can hold a MIDI-in handle when the open always fails, so every call that
+    // takes one is answering about a handle we never issued.
+    for (const name of ["midiInClose", "midiInStart", "midiInStop", "midiInReset",
+                        "midiInAddBuffer", "midiInPrepareHeader", "midiInUnprepareHeader",
+                        "midiInMessage"]) {
+        exports[name] = () => MMSYSERR_INVALHANDLE;
+    }
 
-    exports["midiInGetDevCapsA"] = (ctx, mem, args) => {
-        const uDeviceID = args[0] >>> 0;
-        const pmic = args[1] >>> 0;
-        const cbmic = args[2] >>> 0;
+    // ==================== MIDI Output Functions ====================
 
-        if (!isValidMidiInDeviceId(uDeviceID)) {
-            return MMSYSERR_BADDEVICEID;
+    // No synthesizer is emulated. Saying so at midiOutGetNumDevs is the difference
+    // between a game disabling its MIDI music (and often falling back to CD/wave audio)
+    // and a game handing every note to an open that fails for no stated reason.
+    exports["midiOutGetNumDevs"] = () => MIDI_OUT_DEVICES;
+    exports["midiOutGetDevCapsA"] = () => MMSYSERR_BADDEVICEID;
+    exports["midiOutOpen"] = (ctx, mem, args) => {
+        const phmo = args[0] >>> 0;
+        // The handle is the caller's whole result; leaving it as stack garbage on a
+        // failure it may not check is how a NULL-ish handle becomes a wild call.
+        if (phmo && phmo + 4 <= mem.length) {
+            new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setUint32(phmo, 0, true);
         }
-        if (!pmic || cbmic < 44 || pmic + 44 > mem.length) {
-            return MMSYSERR_INVALPARAM;
-        }
-        writeMidiInCaps(mem, pmic, false);
-        return MMSYSERR_NOERROR;
+        Logger.log(LogCategory.SYSTEM, "midiOutOpen -> MMSYSERR_BADDEVICEID (no MIDI synthesizer)");
+        return MMSYSERR_BADDEVICEID;
     };
-
-    // ==================== Mixer Functions (Stubs) ====================
-    exports["mixerGetNumDevs"] = () => 1;
-    exports["mixerGetDevCapsA"] = (ctx, mem, args) => {
-        const pmc = args[1];
-        if (pmc) {
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            view.setUint16(pmc + 0, 0xFFFF, true);
-            const name = "BottleShip Mixer\0";
-            for (let i = 0; i < 32; i++) {
-                mem[pmc + 4 + i] = i < name.length ? name.charCodeAt(i) : 0;
-            }
+    exports["midiOutGetID"] = () => MMSYSERR_INVALHANDLE;
+    for (const name of ["midiOutClose", "midiOutReset", "midiOutShortMsg", "midiOutLongMsg",
+                        "midiOutPrepareHeader", "midiOutUnprepareHeader", "midiOutGetVolume",
+                        "midiOutSetVolume", "midiOutMessage", "midiConnect", "midiDisconnect"]) {
+        exports[name] = () => MMSYSERR_INVALHANDLE;
+    }
+    // The stream API is the same output device by another name.
+    exports["midiStreamOpen"] = (ctx, mem, args) => {
+        const phms = args[0] >>> 0;
+        if (phms && phms + 4 <= mem.length) {
+            new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setUint32(phms, 0, true);
         }
-        return MMSYSERR_NOERROR;
+        return MMSYSERR_BADDEVICEID;
     };
+    for (const name of ["midiStreamClose", "midiStreamOut", "midiStreamPause",
+                        "midiStreamPosition", "midiStreamProperty", "midiStreamRestart",
+                        "midiStreamStop"]) {
+        exports[name] = () => MMSYSERR_INVALHANDLE;
+    }
+
+    // ==================== Mixer Functions ====================
+
+    // No mixer topology is implemented — no destination lines, no source lines, no
+    // controls. Reporting one device and then answering mixerGetLineInfo with
+    // MMSYSERR_NOERROR left the caller's MIXERLINE untouched: it read its own stack as
+    // dwLineID and dwComponentType and went on to ask for that line's controls.
+    // "No mixer driver" is a state Windows itself has, and one an app can act on.
+    exports["mixerGetNumDevs"] = () => 0;
+    exports["mixerGetDevCapsA"] = () => MMSYSERR_BADDEVICEID;
     exports["mixerOpen"] = (ctx, mem, args) => {
-        const phmx = args[0];
-        if (phmx) {
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            view.setUint32(phmx, 0x40000001, true);
+        const phmx = args[0] >>> 0;
+        if (phmx && phmx + 4 <= mem.length) {
+            new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setUint32(phmx, 0, true);
         }
-        return MMSYSERR_NOERROR;
+        return MMSYSERR_BADDEVICEID;
     };
-    exports["mixerClose"] = () => MMSYSERR_NOERROR;
-    exports["mixerGetLineInfoA"] = (ctx, mem, args) => {
-        Logger.log(LogCategory.SYSTEM, `mixerGetLineInfoA: hmx=0x${args[0].toString(16)}, pmxl=0x${args[1].toString(16)}, flags=0x${args[2].toString(16)}`);
-        return MMSYSERR_NOERROR;
-    };
-    exports["mixerGetControlDetailsA"] = (ctx, mem, args) => {
-        Logger.log(LogCategory.SYSTEM, `mixerGetControlDetailsA: hmx=0x${args[0].toString(16)}, pmxcd=0x${args[1].toString(16)}, flags=0x${args[2].toString(16)}`);
-        return MMSYSERR_NOERROR;
-    };
-    exports["mixerSetControlDetails"] = (ctx, mem, args) => {
-        Logger.log(LogCategory.SYSTEM, `mixerSetControlDetails: hmx=0x${args[0].toString(16)}, pmxcd=0x${args[1].toString(16)}, flags=0x${args[2].toString(16)}`);
-        return MMSYSERR_NOERROR;
-    };
-    exports["mixerGetID"] = (ctx, mem, args) => {
-        const puMxId = args[1];
-        if (puMxId) {
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            view.setUint32(puMxId, 0, true); // device ID 0
-        }
-        return MMSYSERR_NOERROR;
-    };
-    exports["mixerGetLineControlsA"] = (ctx, mem, args) => {
-        Logger.log(LogCategory.SYSTEM, `mixerGetLineControlsA: hmx=0x${args[0].toString(16)}, pmxlc=0x${args[1].toString(16)}, flags=0x${args[2].toString(16)}`);
-        return MMSYSERR_NOERROR;
-    };
+    exports["mixerGetID"] = () => MMSYSERR_INVALHANDLE;
+    for (const name of ["mixerClose", "mixerGetLineInfoA", "mixerGetLineControlsA",
+                        "mixerGetControlDetailsA", "mixerSetControlDetails"]) {
+        exports[name] = () => MMSYSERR_INVALHANDLE;
+    }
 
     // ==================== Auxiliary Audio Functions ====================
 

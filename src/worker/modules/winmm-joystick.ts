@@ -16,6 +16,7 @@ import { ThunkImplementation } from '../core/thunking/thunk-dispatcher';
 import { System } from '../core/system';
 import { TimerKind } from '../core/scheduler/types';
 import { TimeService } from '../runtime/time';
+import { GAMEPAD_AXES, GAMEPAD_BUTTONS, POV_CENTERED, gamepadPovAngle } from './dinput/emulated-gamepad';
 
 const MMSYSERR_NOERROR = 0;
 const MMSYSERR_INVALPARAM = 11;
@@ -55,9 +56,19 @@ const JOYINFOEX_SIZE = 52;
  *  JOYINFO.wButtons is the same four bits; JOYINFOEX.dwButtons is the wider set. */
 const JOY_BUTTON_MASK = 0x0F;
 const JOY_BUTTON1CHG = 0x0100;
-/** JOYCAPS.wNumButtons — nothing above it may appear in dwButtons/dwButtonNumber. */
-const JOY_NUM_BUTTONS = 8;
-const JOY_BUTTON_MASK_EX = (1 << JOY_NUM_BUTTONS) - 1;
+/** JOYCAPS.wNumButtons/wNumAxes — nothing above them may appear in dwButtons or be
+ *  claimed in JOYCAPS. Both come from the shared pad description, so this driver and
+ *  DirectInput cannot end up describing the same physical device differently. */
+const JOY_NUM_BUTTONS = GAMEPAD_BUTTONS;
+const JOY_NUM_AXES = GAMEPAD_AXES;
+const JOY_BUTTON_MASK_EX = ((1 << JOY_NUM_BUTTONS) - 1) >>> 0;
+
+// JOYCAPS.wCaps bits (mmsystem.h) and JOYINFOEX's "hat centred" value.
+const JOYCAPS_HASZ = 0x0001;
+const JOYCAPS_HASR = 0x0002;
+const JOYCAPS_HASPOV = 0x0010;
+const JOYCAPS_POV4DIR = 0x0020;
+const JOY_POVCENTERED = 0xFFFF;
 
 interface JoyCapture {
     hwnd: number;
@@ -117,6 +128,12 @@ function readJoystick(joyId: number, guestRead: boolean): JoyPos {
         x: toAxis(ax0), y: toAxis(ax1), z: toAxis(ax2), r: toAxis(ax3),
         buttons: (input.buttons >>> 0) & JOY_BUTTON_MASK_EX,
     };
+}
+
+/** JOYINFOEX.dwPOV — the shared d-pad angle, in winmm's own centred encoding. */
+function joyPov(buttons: number): number {
+    const angle = gamepadPovAngle(buttons);
+    return angle === POV_CENTERED ? JOY_POVCENTERED : angle;
 }
 
 function makeLParam(lo: number, hi: number): number {
@@ -229,9 +246,12 @@ export function registerWinmmJoystickExports(exports: Record<string, ThunkImplem
             put(b + 48, AXIS_MAX);   // wUmax
             put(b + 52, AXIS_MIN);   // wVmin
             put(b + 56, AXIS_MAX);   // wVmax
-            put(b + 60, 0);          // wCaps — no POV/rudder reported
-            put(b + 64, 4);          // wMaxAxes
-            put(b + 68, 4);          // wNumAxes
+            // wCaps: HASZ | HASR (joyGetPosEx fills dwZpos/dwRpos) | HASPOV | POV4DIR
+            // (the d-pad, reported through dwPOV). A capability we DO serve and do not
+            // declare is dropped by the caller as surely as one we never had.
+            put(b + 60, JOYCAPS_HASZ | JOYCAPS_HASR | JOYCAPS_HASPOV | JOYCAPS_POV4DIR);
+            put(b + 64, JOY_NUM_AXES); // wMaxAxes
+            put(b + 68, JOY_NUM_AXES); // wNumAxes
             put(b + 72, JOY_NUM_BUTTONS); // wMaxButtons
             return MMSYSERR_NOERROR;
         };
@@ -282,7 +302,7 @@ export function registerWinmmJoystickExports(exports: Record<string, ThunkImplem
             view.setUint32(pji + 28, 0, true); // dwVpos
             view.setUint32(pji + 32, pos.buttons, true); // dwButtons
             view.setUint32(pji + 36, popcount(pos.buttons), true); // dwButtonNumber
-            view.setUint32(pji + 40, 0xFFFF, true); // dwPOV (centered)
+            view.setUint32(pji + 40, joyPov(pos.buttons), true); // dwPOV
             view.setUint32(pji + 44, 0, true); // dwReserved1
             view.setUint32(pji + 48, 0, true); // dwReserved2
 
