@@ -171,6 +171,52 @@ function ensureSpecialFolderPath(path: string): void {
     }
 }
 
+/**
+ * SHGetFolderPathA/W, shared by shell32 and shfolder.
+ *
+ * shfolder.dll is a forwarder on real Windows, and the dispatcher can forward at run time —
+ * but only once a shell32 stub for the same name has been materialized, so a title that loads
+ * shfolder alone would get the no-handler answer instead of a path. One table, two modules,
+ * no load-order dependency.
+ */
+export function createFolderPathExports(): Record<string, ThunkImplementation> {
+    const exports: Record<string, ThunkImplementation> = {};
+
+    // HRESULT SHGetFolderPathA(HWND hwnd, int csidl, HANDLE hToken, DWORD dwFlags, LPSTR pszPath)
+    // Same logic as SHGetSpecialFolderPathA but args are (hwnd, csidl, hToken, dwFlags, pszPath)
+    // and returns HRESULT (S_OK=0, E_FAIL=0x80004005).
+    exports["SHGetFolderPathA"] = (ctx, mem, args) => {
+        const csidl = args[1] >>> 0;
+        const pszPath = args[4] >>> 0;
+
+        if (pszPath) {
+            const path = getSpecialFolderPath(csidl);
+            ensureSpecialFolderPath(path); // always exists on real Windows — see SHGetSpecialFolderPathA
+            const bytes = encodeAnsi(path + "\0");
+            Mem.writeBytes(pszPath, bytes);
+        }
+        return 0; // S_OK
+    };
+
+    exports["SHGetFolderPathW"] = (ctx, mem, args) => {
+        const csidl = args[1] >>> 0;
+        const pszPath = args[4] >>> 0;
+
+        if (pszPath) {
+            const path = getSpecialFolderPath(csidl);
+            ensureSpecialFolderPath(path); // always exists on real Windows — see SHGetSpecialFolderPathA
+            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            for (let i = 0; i < path.length; i++) {
+                view.setUint16(pszPath + i * 2, path.charCodeAt(i), true);
+            }
+            view.setUint16(pszPath + path.length * 2, 0, true);
+        }
+        return 0; // S_OK
+    };
+
+    return exports;
+}
+
 export class Shell32 implements IModule {
     name = "shell32";
     exports: Record<string, ThunkImplementation> = {};
@@ -577,37 +623,7 @@ export class Shell32 implements IModule {
             return 1; // TRUE
         };
 
-        // HRESULT SHGetFolderPathA(HWND hwnd, int csidl, HANDLE hToken, DWORD dwFlags, LPSTR pszPath)
-        // Same logic as SHGetSpecialFolderPathA but args are (hwnd, csidl, hToken, dwFlags, pszPath)
-        // and returns HRESULT (S_OK=0, E_FAIL=0x80004005).
-        this.exports["SHGetFolderPathA"] = (ctx, mem, args) => {
-            const csidl = args[1] >>> 0;
-            const pszPath = args[4] >>> 0;
-
-            if (pszPath) {
-                const path = getSpecialFolderPath(csidl);
-                ensureSpecialFolderPath(path); // always exists on real Windows — see SHGetSpecialFolderPathA
-                const bytes = encodeAnsi(path + "\0");
-                Mem.writeBytes(pszPath, bytes);
-            }
-            return 0; // S_OK
-        };
-
-        this.exports["SHGetFolderPathW"] = (ctx, mem, args) => {
-            const csidl = args[1] >>> 0;
-            const pszPath = args[4] >>> 0;
-
-            if (pszPath) {
-                const path = getSpecialFolderPath(csidl);
-                ensureSpecialFolderPath(path); // always exists on real Windows — see SHGetSpecialFolderPathA
-                const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-                for (let i = 0; i < path.length; i++) {
-                    view.setUint16(pszPath + i * 2, path.charCodeAt(i), true);
-                }
-                view.setUint16(pszPath + path.length * 2, 0, true);
-            }
-            return 0; // S_OK
-        };
+        Object.assign(this.exports, createFolderPathExports());
 
         // HRESULT SHGetKnownFolderPath(REFKNOWNFOLDERID rfid, DWORD dwFlags, HANDLE hToken,
         //                              PWSTR *ppszPath)
