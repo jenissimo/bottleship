@@ -24,6 +24,7 @@ type Snapshot = ReturnType<SabIoSource["stats"]>;
 type BlockCacheStats = {
     syncHits: number; syncMisses: number; faults: number;
     blockingFaults: number; prefetchRuns: number; residentBytes: number; blocks: number;
+    uniqueTouchedBytes: number; touchGranuleBytes: number; prefetchEvictedUnreadBytes: number;
 };
 
 interface Mark { at: number; io: Snapshot; cache: BlockCacheStats | null }
@@ -131,7 +132,13 @@ export function registerIoCommands(svc: HarnessService): void {
             }
             : now.io;
         const cache = windowed && cacheNow && mark!.cache
-            ? { ...diffNumbers(cacheNow, mark!.cache), residentBytes: cacheNow.residentBytes, blocks: cacheNow.blocks }
+            ? {
+                ...diffNumbers(cacheNow, mark!.cache),
+                residentBytes: cacheNow.residentBytes, blocks: cacheNow.blocks,
+                // The granule size is the map's AXIS, not a counter: diffed it reads 0,
+                // and a 0 there would make the byte figure above it unreadable.
+                touchGranuleBytes: cacheNow.touchGranuleBytes,
+            }
             : cacheNow;
 
         const p = (q: number) => histPercentile(wait.histogram, wait.bucketsMs, q);
@@ -183,8 +190,33 @@ export function registerIoCommands(svc: HarnessService): void {
                 noNewFetchRate: io.requests ? +(io.requestsNoNewFetch / io.requests).toFixed(3) : 0,
                 allResidentRate: io.requests ? +(io.requestsAllResident / io.requests).toFixed(3) : 0,
                 residentKB: io.residentKB,
+                netKB: io.netKB,
+                asyncRequests: io.asyncRequests,
                 config: io.config,
             },
+
+            // The async channel. maxInFlight is lifetime (a high-water mark does not
+            // subtract), and it is the only number here that says the channel overlaps
+            // anything: latency falls for free on a warm cache, concurrency does not.
+            asyncChannel: windowed
+                ? { ...diffNumbers(now.async, mark!.io.async), maxInFlight: now.async.maxInFlight, inFlight: now.async.inFlight }
+                : now.async,
+
+            // Stage 3's headline. The denominator is UNIQUE bytes first delivered, not
+            // bytes delivered: this workload re-opens and re-reads the same station, and
+            // against delivered bytes the ratio improves whenever the guest re-reads warm
+            // data — a win nobody earned. Granule-rounded (see touchGranuleBytes), so the
+            // denominator is if anything generous and the ratio pessimistic.
+            efficiency: cache && cache.uniqueTouchedBytes > 0 ? {
+                netKB: io.netKB,
+                uniqueTouchedKB: (cache.uniqueTouchedBytes / 1024) | 0,
+                coldBytesPerUniqueByte: +(io.netKB / (cache.uniqueTouchedBytes / 1024)).toFixed(3),
+                // Prefetched, evicted, never read — at both layers. "Never read" is
+                // literal: a chunk consumed by a read other than the one that motivated
+                // it left the set on that read and is not counted here.
+                ioWorkerPrefetchEvictedUnreadKB: io.prefetchEvictedUnreadKB,
+                blockCachePrefetchEvictedUnreadKB: (cache.prefetchEvictedUnreadBytes / 1024) | 0,
+            } : { note: "needs the dev block cache (__wgbBlockCache) for the unique-touch denominator" },
 
             // The guest-local block cache in front of all of it: only its misses ever
             // become a SAB request, so `guest.requests` should track `blockingFaults`.

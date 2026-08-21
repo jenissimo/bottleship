@@ -38,6 +38,14 @@ export interface VfsFileHandle {
     prefetchEpoch?: number;
     /** Serialises async reads on this handle — see `read()`. */
     io?: Promise<unknown>;
+    /** FILE_FLAG_SEQUENTIAL_SCAN as the opener passed it: the caller's own promise
+     *  that it will scan, which NT takes at face value. */
+    sequentialFlag?: boolean;
+    /** Where the previous read on this file object ended. A read starting exactly
+     *  here is the second of two contiguous requests — NT's own sequential test
+     *  (CcScheduleReadAhead). A seek moves `position` and leaves this behind, which
+     *  is what makes the pattern un-detect itself the instant the guest jumps. */
+    lastReadEnd?: number;
 }
 
 /**
@@ -700,7 +708,7 @@ export class VirtualFileSystem {
             // Large uncached STORED ROM entries: sync range read (BufferSource WGB cache).
             const entry = this.romIndex.get(rel);
             if (entry && this.romArchive && entry.compression === 0) {
-                const data = this.romArchive.readEntryRangeSync(entry, handle.position, length);
+                const data = this.romArchive.readEntryRangeSync(entry, handle.position, length, this.isSequentialRead(handle));
                 if (data) {
                     this.advanceCursor(handle, data.length);
                     return data;
@@ -854,7 +862,7 @@ export class VirtualFileSystem {
 
             const entry = this.romIndex.get(rel);
             if (entry && this.romArchive && entry.compression === 0) {
-                const data = this.romArchive.readEntryRangeSync(entry, handle.position, length);
+                const data = this.romArchive.readEntryRangeSync(entry, handle.position, length, this.isSequentialRead(handle));
                 if (data && data.length > 0) {
                     target.set(data, targetOffset);
                     this.advanceCursor(handle, data.length);
@@ -1125,6 +1133,18 @@ export class VirtualFileSystem {
      */
     private advanceCursor(handle: VfsFileHandle, bytes: number): void {
         handle.position = handle.position + bytes;
+        handle.lastReadEnd = handle.position;
+    }
+
+    /**
+     * Does this read continue the previous one on the same file object? That, or the
+     * opener's FILE_FLAG_SEQUENTIAL_SCAN, is the whole of NT's readahead trigger, and
+     * it is the only thing below this layer that can tell "streaming a 50 MB station"
+     * from "two unrelated reads that happen to be adjacent in the archive".
+     * Must be asked BEFORE the cursor advances for this read.
+     */
+    private isSequentialRead(handle: VfsFileHandle): boolean {
+        return handle.sequentialFlag === true || handle.lastReadEnd === handle.position;
     }
 
     duplicateHandle(handle: VfsFileHandle, position = 0): VfsFileHandle {

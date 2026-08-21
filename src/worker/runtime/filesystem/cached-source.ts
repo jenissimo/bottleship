@@ -25,7 +25,20 @@
 // coalesced) calls to the inner source. No worker/DOM dependencies — unit
 // testable in isolation.
 
-import type { ZipSource } from "@bottleship/formats/zip";
+import type { ReadHint, ZipSource } from "@bottleship/formats/zip";
+
+/** Granularity of the unique-first-touch map. Measurement resolution only — nothing
+ *  branches on it. Coarse on purpose: a bit per 64 KiB maps a multi-GB archive in a
+ *  few KB, and it ROUNDS UP, so the denominator it feeds can overstate what was
+ *  touched and never understate it — the direction that keeps the ratio pessimistic
+ *  rather than flattering. Hence the label "unique 64 KiB granules touched, in
+ *  bytes", which is what the report prints. */
+const TOUCH_GRANULE = 64 * 1024;
+
+/** How many entries keep a live readahead window at once. Bounds memory only: an
+ *  entry dropped from here restarts its window on the next read, so a workload that
+ *  interleaves more files than this loses readahead accuracy, never correctness. */
+const MAX_ENTRY_STATES = 32;
 
 /** Default block granularity. Matches the msvcrt getc refill chunk (256 KiB),
  *  which is a good amortization point for async fault-ins. */
@@ -92,13 +105,14 @@ export class CachedSource implements ZipSource {
     private readonly prefetchDepthRuns: number;
     /** Number of prefetch runs currently in flight (bounded by prefetchDepthRuns). */
     private prefetchInflightCount = 0;
-    /** Next block index the prefetcher will consider — everything below is
-     *  resident or already scheduled. Advances with the read cursor; re-anchored
-     *  forward on a cold sync fault (a seek / new file the prefetch didn't cover). */
-    private prefetchFrontier = 0;
-    /** Highest block the guest requested via the SYNC path — the prefetch window
-     *  is kept `prefetchAhead * prefetchDepthRuns` blocks ahead of this. */
-    private readCursorBlock = -1;
+    /** Readahead position for an UN-hinted source: everything below is resident or
+     *  already scheduled. Advances with the read cursor; re-anchored forward on a cold
+     *  sync fault (a seek the prefetch window didn't cover). A hinted source keeps one
+     *  of these per ENTRY instead — see `entryState`. */
+    private globalFrontier = 0;
+    /** Highest block requested via the SYNC path — the prefetch window is kept
+     *  `prefetchAhead * prefetchDepthRuns` blocks ahead of this. */
+    private globalCursorBlock = -1;
     private readonly name: string;
 
     /** blockIndex → resident block bytes (last block may be shorter at EOF). */
@@ -121,6 +135,36 @@ export class CachedSource implements ZipSource {
      *  blocking path). */
     private _prefetchRuns = 0;
 
+    // ---- cursor hint (see ReadHint) ----
+    /**
+     * Readahead state per ARCHIVE ENTRY, keyed by the entry's data start. NT keeps a
+     * shared cache map per file for the same reason: a guest that interleaves two
+     * files through one cache — a radio station and the level's models, here — must
+     * not have each read re-anchor the other's window, or every alternation throws the
+     * window away and re-speculates, and the speculation becomes the load.
+     * Bounded, since a long session touches thousands of entries.
+     */
+    private readonly entryState = new Map<number, { entryEnd: number; frontier: number; cursorBlock: number }>();
+    /** The entry the last hinted read named — whose window the prefetcher works on. */
+    private current: { entryEnd: number; frontier: number; cursorBlock: number } | null = null;
+    /** Entry extent of the most recent hinted read; null until a caller hints. */
+    private hintEntryStart: number | null = null;
+    private hintEntryEnd: number | null = null;
+    /** null = this source has never been hinted (a plain Blob / OPFS caller), and
+     *  prefetch keeps its unconditional behaviour. false = the hinting caller says it
+     *  is NOT scanning, and speculating on it is how a window of wasted fetches gets
+     *  bought at the price of the bytes actually needed. */
+    private hintSequential: boolean | null = null;
+
+    /** One bit per TOUCH_GRANULE, set when bytes are DELIVERED to a caller. */
+    private readonly touched: Uint8Array;
+    private _touchedGranules = 0;
+    /** Blocks a prefetch pulled that no read has consumed yet — a block leaves the
+     *  set as soon as a read covers it, so what remains at eviction really was never
+     *  read (not "wasted": a block a different read consumed is not in here). */
+    private readonly prefetchedUnread = new Set<number>();
+    private _prefetchEvictedUnreadBytes = 0;
+
     constructor(inner: ZipSource, opts: CachedSourceOptions = {}) {
         this.inner = inner;
         this.size = inner.size;
@@ -130,6 +174,7 @@ export class CachedSource implements ZipSource {
         this.prefetchAhead = Math.max(0, Math.floor(opts.prefetchAheadBlocks ?? 0));
         this.prefetchDepthRuns = Math.max(1, Math.floor(opts.prefetchDepthRuns ?? 1));
         this.name = opts.name ?? "cached";
+        this.touched = new Uint8Array(Math.ceil(Math.max(1, this.size) / TOUCH_GRANULE / 8));
     }
 
     // ---- ZipSource ----
@@ -141,12 +186,13 @@ export class CachedSource implements ZipSource {
      *  caller falls back to async readRange. This block cache keeps hot streaming
      *  (msvcrt getc) off a per-byte inner read: one inner fault per 256 KiB block,
      *  the rest from RAM. */
-    readRangeSync(start: number, end: number): Uint8Array | null {
+    readRangeSync(start: number, end: number, hint?: ReadHint): Uint8Array | null {
         const [s, e] = this.clamp(start, end);
         if (e <= s) return new Uint8Array(0);
 
         const first = Math.floor(s / this.blockSize);
         const last = Math.floor((e - 1) / this.blockSize);
+        if (hint) this.noteHint(hint, first);
 
         const innerSync = this.inner.readRangeSync?.bind(this.inner);
 
@@ -159,15 +205,17 @@ export class CachedSource implements ZipSource {
                 this.touch(b);
             } else {
                 if (!innerSync) { this._syncMisses++; return null; }
-                const buf = this.faultRunSync(b, innerSync);
+                const buf = this.faultRunSync(b, innerSync, hint);
                 if (!buf) { this._syncMisses++; return null; }
                 data = buf;
             }
+            this.prefetchedUnread.delete(b);
             datas.push(data);
         }
 
         const out = this.assemble(datas, first, last, s, e);
         this._syncHits++;
+        this.markTouched(s, e);
         // Advance the read cursor and top the prefetch pipeline back up — done on
         // resident HITS too, so a sequential scan through already-prefetched blocks
         // keeps the window full instead of draining until the next cold fault.
@@ -178,20 +226,23 @@ export class CachedSource implements ZipSource {
 
     /** Asynchronous read. Faults in any missing covering blocks (coalesced),
      *  caches them, then assembles. */
-    async readRange(start: number, end: number): Promise<Uint8Array> {
+    async readRange(start: number, end: number, hint?: ReadHint): Promise<Uint8Array> {
         const [s, e] = this.clamp(start, end);
         if (e <= s) return new Uint8Array(0);
 
         const first = Math.floor(s / this.blockSize);
         const last = Math.floor((e - 1) / this.blockSize);
+        if (hint) this.noteHint(hint, first);
 
         // Hold direct references to every covering block's bytes so assembly is
         // immune to eviction that may happen as later blocks are inserted.
         const datas: Uint8Array[] = [];
         for (let b = first; b <= last; b++) {
-            datas.push(await this.ensureBlock(b));
+            datas.push(await this.ensureBlock(b, hint));
+            this.prefetchedUnread.delete(b);
         }
 
+        this.markTouched(s, e);
         return this.assemble(datas, first, last, s, e);
     }
 
@@ -204,9 +255,14 @@ export class CachedSource implements ZipSource {
         this.blocks.clear();
         this.lru.length = 0;
         this.residentBytes = 0;
+        this.prefetchedUnread.clear();
     }
 
-    stats(): { syncHits: number; syncMisses: number; faults: number; blockingFaults: number; prefetchRuns: number; residentBytes: number; blocks: number } {
+    stats(): {
+        syncHits: number; syncMisses: number; faults: number; blockingFaults: number;
+        prefetchRuns: number; residentBytes: number; blocks: number;
+        uniqueTouchedBytes: number; touchGranuleBytes: number; prefetchEvictedUnreadBytes: number;
+    } {
         return {
             syncHits: this._syncHits,
             syncMisses: this._syncMisses,
@@ -215,10 +271,61 @@ export class CachedSource implements ZipSource {
             prefetchRuns: this._prefetchRuns,
             residentBytes: this.residentBytes,
             blocks: this.blocks.size,
+            /** Distinct bytes ever DELIVERED to a caller, rounded up to TOUCH_GRANULE.
+             *  Denominator of "network bytes per unique byte first touched" — the ratio
+             *  against delivered bytes improves for free when the guest re-reads. */
+            uniqueTouchedBytes: this._touchedGranules * TOUCH_GRANULE,
+            touchGranuleBytes: TOUCH_GRANULE,
+            prefetchEvictedUnreadBytes: this._prefetchEvictedUnreadBytes,
         };
     }
 
     // ---- internals ----
+
+    /** Readahead position: the current ENTRY's when hinted, the source-wide one
+     *  otherwise. Everything below reads and writes these, so the hinted and
+     *  un-hinted cases cannot drift into two different algorithms. */
+    private get prefetchFrontier(): number { return this.current ? this.current.frontier : this.globalFrontier; }
+    private set prefetchFrontier(v: number) { if (this.current) this.current.frontier = v; else this.globalFrontier = v; }
+    private get readCursorBlock(): number { return this.current ? this.current.cursorBlock : this.globalCursorBlock; }
+    private set readCursorBlock(v: number) { if (this.current) this.current.cursorBlock = v; else this.globalCursorBlock = v; }
+
+    /**
+     * Adopt the caller's cursor hint. The load-bearing part is the entry CHANGE: a
+     * seek into a different file makes every block the window was filling irrelevant,
+     * and a frontier that only ever moves forward would keep fetching for the file the
+     * guest just left (and would never re-anchor at all for a jump backwards).
+     */
+    private noteHint(hint: ReadHint, firstBlock: number): void {
+        let st = this.entryState.get(hint.entryStart);
+        if (!st || st.entryEnd !== hint.entryEnd) {
+            // Unknown entry, or the same offset re-used by a different file: start its
+            // window here rather than inheriting a stranger's position.
+            st = { entryEnd: hint.entryEnd, frontier: firstBlock, cursorBlock: firstBlock - 1 };
+            this.entryState.set(hint.entryStart, st);
+            while (this.entryState.size > MAX_ENTRY_STATES) {
+                const oldest = this.entryState.keys().next().value as number | undefined;
+                if (oldest === undefined || oldest === hint.entryStart) break;
+                this.entryState.delete(oldest);
+            }
+        }
+        this.hintEntryStart = hint.entryStart;
+        this.hintEntryEnd = hint.entryEnd;
+        this.current = st;
+        this.hintSequential = hint.sequential;
+    }
+
+    /** Mark [s,e) delivered. Granule-rounded, so it over-states a scattered read and
+     *  cannot under-state one — the direction that keeps the ratio it feeds honest. */
+    private markTouched(s: number, e: number): void {
+        const firstG = Math.floor(s / TOUCH_GRANULE);
+        const lastG = Math.floor((e - 1) / TOUCH_GRANULE);
+        for (let g = firstG; g <= lastG; g++) {
+            const byte = g >> 3, bit = 1 << (g & 7);
+            if (byte >= this.touched.length) break;
+            if ((this.touched[byte] & bit) === 0) { this.touched[byte] |= bit; this._touchedGranules++; }
+        }
+    }
 
     private clamp(start: number, end: number): [number, number] {
         const s = Math.max(0, Math.min(Math.floor(start), this.size));
@@ -267,9 +374,10 @@ export class CachedSource implements ZipSource {
      *  block `b`'s bytes, or null if the inner sync read failed. */
     private faultRunSync(
         b: number,
-        innerSync: (start: number, end: number) => Uint8Array | null,
+        innerSync: (start: number, end: number, hint?: ReadHint) => Uint8Array | null,
+        hint?: ReadHint,
     ): Uint8Array | null {
-        const lastBlock = Math.floor((this.size - 1) / this.blockSize);
+        const lastBlock = this.lastBlockFor(hint);
         let endBlock = b;
         while (
             endBlock - b + 1 < this.syncReadahead &&
@@ -281,7 +389,7 @@ export class CachedSource implements ZipSource {
 
         const runStart = b * this.blockSize;
         const runEnd = Math.min(this.size, (endBlock + 1) * this.blockSize);
-        const buf = innerSync(runStart, runEnd);
+        const buf = innerSync(runStart, runEnd, hint);
         if (!buf) return null;
         this._faults++;
         this._blockingFaults++;
@@ -331,7 +439,10 @@ export class CachedSource implements ZipSource {
      *  swallowed — the sync path re-faults on demand. */
     private pumpPrefetch(): void {
         if (!this.prefetchAhead || this.size === 0) return;
-        const lastBlock = Math.floor((this.size - 1) / this.blockSize);
+        // A hinting caller that says it is not scanning gets no speculation: NT reads
+        // ahead off the file object's own sequential state for the same reason.
+        if (this.hintSequential === false) return;
+        const lastBlock = this.lastBlockFor(this.currentHint());
         const windowEnd = this.readCursorBlock + this.prefetchAhead * this.prefetchDepthRuns;
 
         while (this.prefetchInflightCount < this.prefetchDepthRuns) {
@@ -358,8 +469,15 @@ export class CachedSource implements ZipSource {
             this.prefetchInflightCount++;
             this._faults++;
             this._prefetchRuns++;
-            this.inner.readRange(runStart, runEnd)
-                .then((buf) => { this.insertRun(b, endBlock, buf); })
+            // The hint travels with the speculative read too, so the layer below reads
+            // ahead inside the same entry instead of guessing from an archive offset.
+            this.inner.readRange(runStart, runEnd, this.currentHint(runStart, true))
+                .then((buf) => {
+                    this.insertRun(b, endBlock, buf);
+                    for (let rb = b; rb <= endBlock; rb++) {
+                        if (this.blocks.has(rb)) this.prefetchedUnread.add(rb);
+                    }
+                })
                 .catch(() => { /* re-fault on demand */ })
                 .finally(() => {
                     this.prefetchInflightCount--;
@@ -368,7 +486,30 @@ export class CachedSource implements ZipSource {
         }
     }
 
-    private ensureBlock(b: number): Promise<Uint8Array> {
+    /** Highest block readahead may touch: the entry's last block when a caller has
+     *  hinted one, the archive's otherwise. Crossing it means fetching a file nobody
+     *  asked for and evicting one somebody is reading. */
+    private lastBlockFor(hint: ReadHint | undefined): number {
+        const archiveLast = Math.floor((this.size - 1) / this.blockSize);
+        const entryEnd = hint?.entryEnd ?? this.hintEntryEnd;
+        if (entryEnd === null || entryEnd === undefined || entryEnd <= 0) return archiveLast;
+        return Math.min(archiveLast, Math.floor((Math.min(entryEnd, this.size) - 1) / this.blockSize));
+    }
+
+    /** The last hint, re-pointed at `cursor` — the prefetcher speculates ahead of the
+     *  guest, so its reads carry the same entry with the position it is fetching. */
+    private currentHint(cursor?: number, speculative = false): ReadHint | undefined {
+        if (this.hintEntryStart === null || this.hintEntryEnd === null) return undefined;
+        return {
+            entryStart: this.hintEntryStart,
+            entryEnd: this.hintEntryEnd,
+            cursor: cursor ?? this.readCursorBlock * this.blockSize,
+            sequential: this.hintSequential === true,
+            speculative,
+        };
+    }
+
+    private ensureBlock(b: number, hint?: ReadHint): Promise<Uint8Array> {
         const resident = this.blocks.get(b);
         if (resident) {
             this.touch(b);
@@ -379,7 +520,7 @@ export class CachedSource implements ZipSource {
 
         const [blockStart, blockEnd] = this.blockBounds(b);
         this._faults++;
-        const p = this.inner.readRange(blockStart, blockEnd)
+        const p = this.inner.readRange(blockStart, blockEnd, hint ?? this.currentHint(blockStart))
             .then((buf) => {
                 this.insert(b, buf);
                 this.inflight.delete(b);
@@ -426,6 +567,7 @@ export class CachedSource implements ZipSource {
             if (data) {
                 this.residentBytes -= data.byteLength;
                 this.blocks.delete(victim);
+                if (this.prefetchedUnread.delete(victim)) this._prefetchEvictedUnreadBytes += data.byteLength;
             }
         }
     }

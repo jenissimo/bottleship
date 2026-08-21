@@ -17,6 +17,11 @@ import { WgbCache } from "./wgb-cache";
  *  - BufferSource / SyncAccessHandleSource: already cheap-sync (RAM / OPFS SAH) —
  *    returned untouched; caching would only duplicate already-fast bytes.
  */
+/** 256 KiB cache blocks per 1 MiB I/O-worker chunk — the unit the blocking read and
+ *  the speculative run below are both expressed in, so they follow the transport's
+ *  granularity instead of drifting from it. */
+const SAB_BLOCKS_PER_CHUNK = 4;
+
 function withBlockCache(source: ZipSource): ZipSource {
     // Cheap-sync sources (RAM BufferSource, OPFS SyncAccessHandleSource) are returned
     // untouched. BlobSource (FileReaderSync) and SyncHttpRangeSource (a sync-XHR round
@@ -45,18 +50,25 @@ function withBlockCache(source: ZipSource): ZipSource {
     // (refilled on hits, chained on completion), so the scan streams off RAM and
     // stops blocking on cold sync faults. Depth 4 = up to 4 concurrent range
     // fetches, leaving connection-pool room for the critical blocking sync read.
-    // Over a SabIoSource the I/O worker already fetches in parallel and prefetches
-    // ahead on its own free thread; a guest-side prefetch would only spam the SAB
-    // request channel and contend with real cold reads. So the guest keeps just
-    // readahead (coalesce a run into one SAB request) with prefetch OFF.
+    // Over a SabIoSource the two halves of that trade separate, because prefetch now
+    // runs on the ASYNC channel (postMessage + transferred response, no Atomics.wait)
+    // and is real background work. So the BLOCKING half is sized to the transport's
+    // own fetch granularity — one I/O-worker chunk, 1 MiB / SAB_BLOCKS_PER_CHUNK below
+    // — because a blocking read that spans more chunks than it needs waits on transfer
+    // it will not use, and a seek into a new file (a station switch) is the one read
+    // nobody can prefetch. The SPECULATIVE half stays ahead of the cursor on the async
+    // channel in runs of twice that, deep enough that one run lands while another is
+    // being consumed. This is also the layer that gets the cursor hint, so it is the
+    // only one that speculates: the I/O worker below reads ahead only inside the entry
+    // the hint names.
     const overSabIo = source instanceof SabIoSource;
     const dev = (globalThis as unknown as { __wgbTune?: { depth?: number; readahead?: number; budgetMB?: number } }).__wgbTune;
     const cache = new CachedSource(source, {
         maxBytes: dev?.budgetMB ? dev.budgetMB * 1024 * 1024 : maxBytes,
         name,
-        syncReadaheadBlocks: dev?.readahead ?? 32,
-        prefetchAheadBlocks: overSabIo ? 0 : 32,
-        prefetchDepthRuns: overSabIo ? 1 : (dev?.depth ?? 4),
+        syncReadaheadBlocks: dev?.readahead ?? (overSabIo ? SAB_BLOCKS_PER_CHUNK : 32),
+        prefetchAheadBlocks: overSabIo ? SAB_BLOCKS_PER_CHUNK * 2 : 32,
+        prefetchDepthRuns: overSabIo ? 2 : (dev?.depth ?? 4),
     });
     // Dev-only diagnostic handle: `worker-eval globalThis.__wgbBlockCache.stats()`
     // exposes the getc↔streaming interplay (blockingFaults vs syncHits/prefetchRuns).

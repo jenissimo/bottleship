@@ -161,6 +161,14 @@ const GENERIC_READ = 0x80000000;
 const GENERIC_WRITE = 0x40000000;
 const OPEN_EXISTING = 3;
 const CREATE_ALWAYS = 2;
+const FILE_FLAG_SEQUENTIAL_SCAN = 0x08000000;
+
+/** Record the caller's declared access pattern on the file object. NT takes this at
+ *  face value and reads ahead on it; below us it is what tells the block cache that a
+ *  read run is a scan through one file rather than two adjacent unrelated reads. */
+function applyOpenFlags(handle: VfsFileHandle, dwFlagsAndAttributes: number): void {
+    if ((dwFlagsAndAttributes & FILE_FLAG_SEQUENTIAL_SCAN) !== 0) handle.sequentialFlag = true;
+}
 
 /**
  * Generic Unreal Engine 1 first-run handler — reactive layer at the file-open
@@ -525,6 +533,7 @@ const fileIoModule = (() => {
         // Fast path: try synchronous open first (avoids Promise overhead)
         const syncHandle = vfs.openSync(filename, dwDesiredAccess, dwCreationDisposition);
         if (syncHandle !== null) {
+            applyOpenFlags(syncHandle, dwFlagsAndAttributes);
             const handle = new FileHandleWrapper(syncHandle, vfs);
             const resourceProvider = System.getInstance().resourceProvider;
             const handleId = resourceProvider.registerFileHandle(handle);
@@ -568,6 +577,7 @@ const fileIoModule = (() => {
                 if (materialized) {
                     const vfsHandle = await vfs.open(filename, dwDesiredAccess, dwCreationDisposition);
                     if (vfsHandle) {
+                        applyOpenFlags(vfsHandle, dwFlagsAndAttributes);
                         const handle = new FileHandleWrapper(vfsHandle, vfs);
                         const handleId = System.getInstance().resourceProvider.registerFileHandle(handle);
                         System.getInstance().scheduler.setLastError(0);
@@ -617,6 +627,7 @@ const fileIoModule = (() => {
                     return INVALID_HANDLE_VALUE;
                 }
 
+                applyOpenFlags(vfsHandle, dwFlagsAndAttributes);
                 const handle = new FileHandleWrapper(vfsHandle, vfs);
                 const resourceProvider = System.getInstance().resourceProvider;
                 const handleId = resourceProvider.registerFileHandle(handle);
@@ -690,6 +701,7 @@ const fileIoModule = (() => {
         const lpFileName = args[0];
         const dwDesiredAccess = args[1];
         const dwCreationDisposition = args[4];
+        const dwFlagsAndAttributes = args[5];
 
         // For simplicity, convert wide string to ASCII
         const filename = lpFileName ? readStringW(mem, lpFileName) : '';
@@ -719,6 +731,7 @@ const fileIoModule = (() => {
         // FILE* with _file=-1 that later _close(-1)s → _invalid_parameter throw.
         const syncHandle = vfs.openSync(filename, dwDesiredAccess, dwCreationDisposition);
         if (syncHandle !== null) {
+            applyOpenFlags(syncHandle, dwFlagsAndAttributes);
             const handle = new FileHandleWrapper(syncHandle, vfs);
             const handleId = System.getInstance().resourceProvider.registerFileHandle(handle);
             Logger.log(LogCategory.KERNEL32, `CreateFileW: OK "${filename}" handle=0x${handleId.toString(16)} (sync, source=${syncHandle.source})`);
@@ -746,6 +759,7 @@ const fileIoModule = (() => {
                     System.getInstance().scheduler.setLastError(openFailure || ERROR_FILE_NOT_FOUND);
                     return INVALID_HANDLE_VALUE;
                 }
+                applyOpenFlags(vfsHandle, dwFlagsAndAttributes);
                 const handle = new FileHandleWrapper(vfsHandle, vfs);
                 const handleId = System.getInstance().resourceProvider.registerFileHandle(handle);
                 Logger.verbose(LogCategory.KERNEL32, `CreateFileW: opened file handle 0x${handleId.toString(16)} source=${vfsHandle.source}`);
