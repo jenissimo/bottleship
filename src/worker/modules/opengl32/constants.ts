@@ -205,6 +205,8 @@ export const GL_ONE_MINUS_DST_COLOR = 0x0307;
 export const GL_SRC_ALPHA_SATURATE = 0x0308;
 
 // Render Mode
+/** GL_MAX_NAME_STACK_DEPTH we publish; GL 1.3 requires at least 64. */
+export const NAME_STACK_MAX_DEPTH = 64;
 export const GL_FEEDBACK = 0x1C01;
 export const GL_RENDER = 0x1C00;
 export const GL_SELECT = 0x1C02;
@@ -321,6 +323,16 @@ export const GL_TEXTURE_WIDTH = 0x1000;
 export const GL_TEXTURE_HEIGHT = 0x1001;
 export const GL_TEXTURE_COMPONENTS = 0x1003;
 export const GL_TEXTURE_INTERNAL_FORMAT = 0x1003;
+export const GL_TEXTURE_BORDER = 0x1005;
+export const GL_TEXTURE_RED_SIZE = 0x805C;
+export const GL_TEXTURE_GREEN_SIZE = 0x805D;
+export const GL_TEXTURE_BLUE_SIZE = 0x805E;
+export const GL_TEXTURE_ALPHA_SIZE = 0x805F;
+export const GL_TEXTURE_LUMINANCE_SIZE = 0x8060;
+export const GL_TEXTURE_INTENSITY_SIZE = 0x8061;
+export const GL_TEXTURE_DEPTH = 0x8071;
+export const GL_TEXTURE_COMPRESSED = 0x86A1;
+export const GL_TEXTURE_COMPRESSED_IMAGE_SIZE = 0x86A0;
 export const GL_NEAREST_MIPMAP_NEAREST = 0x2700;
 export const GL_LINEAR_MIPMAP_NEAREST = 0x2701;
 export const GL_NEAREST_MIPMAP_LINEAR = 0x2702;
@@ -378,6 +390,11 @@ export const GL_ALL_ATTRIB_BITS = 0x000FFFFF;
 // OpenGL 1.1
 export const GL_PROXY_TEXTURE_1D = 0x8063;
 export const GL_PROXY_TEXTURE_2D = 0x8064;
+
+/** The GL_MAX_TEXTURE_SIZE we publish. One constant, because the proxy-texture probe
+ *  and glGetIntegerv must agree — a probe that says "fits" for a size the query calls
+ *  too large is worse than either answer alone. */
+export const GL_IMPL_MAX_TEXTURE_SIZE = 2048;
 export const GL_TEXTURE_BINDING_1D = 0x8068;
 export const GL_TEXTURE_BINDING_2D = 0x8069;
 export const GL_ALPHA4 = 0x803B;
@@ -496,6 +513,11 @@ export const GL_PRIMARY_COLOR = 0x8577;
 export const GL_PREVIOUS = 0x8578;
 export const GL_DOT3_RGB = 0x86AE;
 export const GL_DOT3_RGBA = 0x86AF;
+/** EXT_texture_env_dot3 spells the two DOT3 functions with its own values; every other
+ *  token of EXT_ and ARB_texture_env_combine is numerically identical. */
+export const GL_DOT3_RGB_EXT = 0x8740;
+export const GL_DOT3_RGBA_EXT = 0x8741;
+export const GL_ALPHA_SCALE = 0x0D1C;
 
 // Cube map
 export const GL_TEXTURE_CUBE_MAP = 0x8513;

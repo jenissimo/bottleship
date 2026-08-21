@@ -11,13 +11,14 @@ import {
     CF_DEPTH_RANGE_NEAR, CF_DEPTH_RANGE_FAR,
     DF_DEPTH_TEST, DF_DEPTH_MASK, DF_BLEND, DF_ALPHA_TEST, DF_CULL, DF_FOG,
     DF_COLOR_MASK_R, DF_COLOR_MASK_G, DF_COLOR_MASK_B, DF_COLOR_MASK_A, DF_STENCIL_TEST, DF_SCISSOR,
+    writeTexEnvSlots,
 } from "./context";
 import {
     GL_TRIANGLES, GL_TRIANGLE_STRIP, GL_TRIANGLE_FAN, GL_QUADS, GL_QUAD_STRIP,
     GL_POLYGON, GL_POINTS, GL_LINES, GL_LINE_STRIP, GL_LINE_LOOP,
     GL_INVALID_OPERATION,
     GL_TEXTURE_GEN_S, GL_TEXTURE_GEN_T,
-    GL_OBJECT_LINEAR, GL_EYE_LINEAR, GL_SPHERE_MAP, GL_STENCIL_TEST,
+    GL_OBJECT_LINEAR, GL_EYE_LINEAR, GL_SPHERE_MAP, GL_STENCIL_TEST, GL_RENDER,
 } from "./constants";
 import { Logger, LogCategory } from "../../core/logger";
 import { guestViews } from "./client-arrays";
@@ -290,6 +291,11 @@ function drawStateEqual(i32: Int32Array, f32: Float32Array, a: number, b: number
 }
 
 function pushGLDrawCommand(ctx: OpenGLContext, mode: number, vertOffset: number, vertCount: number): void {
+    // GL_SELECT and GL_FEEDBACK do not touch the framebuffer (GL 1.3 §5.2). A picking
+    // pass re-renders the whole scene, so rasterizing it would overwrite the frame the
+    // guest just presented.
+    if (ctx.renderMode !== GL_RENDER) return;
+
     const unit0 = ctx.textureUnits[0];
     const unit1 = ctx.textureUnits[1];
     const fc = ctx.fogColor;
@@ -329,6 +335,7 @@ function pushGLDrawCommand(ctx: OpenGLContext, mode: number, vertOffset: number,
     I[i + CI_TEX_ID1] = unit1.enabled2d ? unit1.boundTexture : 0;
     I[i + CI_TEXENV0] = unit0.texEnvMode;
     I[i + CI_TEXENV1] = unit1.texEnvMode;
+    writeTexEnvSlots(I, F, i, f, unit0, unit1);
     I[i + CI_SHADE_MODEL] = ctx.shadeModel;
     I[i + CI_FOG_MODE] = ctx.fogMode;
     I[i + CI_POLYGON_MODE] = ctx.polygonModeFront;

@@ -25,6 +25,194 @@ export function getLastGetDIBitsBuffer(): { address: number; width: number; heig
 /** Allocation guard for a DIB claimed by guest-supplied header fields (~64 Mpx). */
 const MAX_DIB_PIXELS = 1 << 26;
 
+// ---- WGL pixel formats ----
+//
+// The format list is a CAPABILITY ENUMERATION: an engine walks it, scores every entry,
+// and picks a rendering path from what it finds. Publishing a single hardcoded entry
+// (and answering ChoosePixelFormat without reading the request) tells every engine the
+// same thing regardless of what it asked for, so one that wants 16-bit colour, no
+// stencil or a single buffer concludes the driver cannot serve it.
+//
+// Every entry below is backed by what the GL executor actually renders: an RGBA8
+// offscreen colour target with a depth24plus-stencil8 attachment, presented on
+// SwapBuffers. Depth/stencil widths are the MINIMUM an entry promises (GL guarantees
+// "at least"), so a 16-bit-depth entry served by depth24 is honest. There are no
+// colour-index, stereo, accumulation, aux-buffer, draw-to-bitmap, GDI-shared or
+// multisampled entries because none of those are implemented.
+
+const PFD_DOUBLEBUFFER = 0x00000001;
+const PFD_STEREO = 0x00000002;
+const PFD_DRAW_TO_WINDOW = 0x00000004;
+const PFD_DRAW_TO_BITMAP = 0x00000008;
+const PFD_SUPPORT_GDI = 0x00000010;
+const PFD_SUPPORT_OPENGL = 0x00000020;
+const PFD_SWAP_COPY = 0x00000400;
+const PFD_DEPTH_DONTCARE = 0x20000000;
+const PFD_DOUBLEBUFFER_DONTCARE = 0x40000000;
+const PFD_STEREO_DONTCARE = 0x80000000;
+
+const PFD_TYPE_RGBA = 0;
+
+interface WglPixelFormat {
+    colorBits: number;
+    redBits: number; redShift: number;
+    greenBits: number; greenShift: number;
+    blueBits: number; blueShift: number;
+    alphaBits: number; alphaShift: number;
+    depthBits: number;
+    stencilBits: number;
+    doubleBuffer: boolean;
+}
+
+function rgbaFormat(colorBits: number, depthBits: number, stencilBits: number, doubleBuffer: boolean): WglPixelFormat {
+    // 32bpp is BGRA in memory (the layout GDI and our surfaces use), 16bpp is 5:6:5.
+    return colorBits >= 32
+        ? {
+            colorBits: 32,
+            redBits: 8, redShift: 16,
+            greenBits: 8, greenShift: 8,
+            blueBits: 8, blueShift: 0,
+            alphaBits: 8, alphaShift: 24,
+            depthBits, stencilBits, doubleBuffer,
+        }
+        : {
+            colorBits: 16,
+            redBits: 5, redShift: 11,
+            greenBits: 6, greenShift: 5,
+            blueBits: 5, blueShift: 0,
+            alphaBits: 0, alphaShift: 0,
+            depthBits, stencilBits, doubleBuffer,
+        };
+}
+
+const WGL_PIXEL_FORMATS: WglPixelFormat[] = [
+    rgbaFormat(32, 24, 8, true),
+    rgbaFormat(32, 24, 0, true),
+    rgbaFormat(32, 16, 0, true),
+    rgbaFormat(32, 0, 0, true),
+    rgbaFormat(32, 24, 8, false),
+    rgbaFormat(32, 16, 0, false),
+    rgbaFormat(16, 24, 8, true),
+    rgbaFormat(16, 16, 0, true),
+];
+
+function pixelFormatFlags(fmt: WglPixelFormat): number {
+    // Neither PFD_GENERIC_FORMAT nor PFD_GENERIC_ACCELERATED: that pair is how Windows
+    // spells "full ICD", and engines reject a format with PFD_GENERIC_FORMAT set as a
+    // software rasterizer. PFD_SWAP_COPY because our colour target survives the present.
+    let flags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL;
+    if (fmt.doubleBuffer) flags |= PFD_DOUBLEBUFFER | PFD_SWAP_COPY;
+    return flags >>> 0;
+}
+
+export function getWglPixelFormatCount(): number {
+    return WGL_PIXEL_FORMATS.length;
+}
+
+/**
+ * DescribePixelFormat / wglDescribePixelFormat — one implementation, because two
+ * copies of a struct layout drift and the guest cannot tell which one it got.
+ * Returns the number of formats (0 only for an out-of-range index).
+ */
+export function describeWglPixelFormat(
+    mem: Uint8Array,
+    iPixelFormat: number,
+    nBytes: number,
+    ppfd: number,
+): number {
+    const count = WGL_PIXEL_FORMATS.length;
+    if (iPixelFormat <= 0 || iPixelFormat > count) return 0;
+    if (!ppfd || nBytes < 40 || ppfd + 40 > mem.length) return count;
+
+    const fmt = WGL_PIXEL_FORMATS[iPixelFormat - 1];
+    const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+    view.setUint16(ppfd + 0, 40, true);                    // nSize
+    view.setUint16(ppfd + 2, 1, true);                     // nVersion
+    view.setUint32(ppfd + 4, pixelFormatFlags(fmt), true); // dwFlags
+    view.setUint8(ppfd + 8, PFD_TYPE_RGBA);                // iPixelType
+    view.setUint8(ppfd + 9, fmt.colorBits);                // cColorBits
+    view.setUint8(ppfd + 10, fmt.redBits);
+    view.setUint8(ppfd + 11, fmt.redShift);
+    view.setUint8(ppfd + 12, fmt.greenBits);
+    view.setUint8(ppfd + 13, fmt.greenShift);
+    view.setUint8(ppfd + 14, fmt.blueBits);
+    view.setUint8(ppfd + 15, fmt.blueShift);
+    view.setUint8(ppfd + 16, fmt.alphaBits);
+    view.setUint8(ppfd + 17, fmt.alphaShift);
+    view.setUint8(ppfd + 18, 0);                           // cAccumBits
+    view.setUint8(ppfd + 19, 0);                           // cAccumRedBits
+    view.setUint8(ppfd + 20, 0);                           // cAccumGreenBits
+    view.setUint8(ppfd + 21, 0);                           // cAccumBlueBits
+    view.setUint8(ppfd + 22, 0);                           // cAccumAlphaBits
+    view.setUint8(ppfd + 23, fmt.depthBits);
+    view.setUint8(ppfd + 24, fmt.stencilBits);
+    view.setUint8(ppfd + 25, 0);                           // cAuxBuffers
+    view.setUint8(ppfd + 26, 0);                           // iLayerType = PFD_MAIN_PLANE
+    view.setUint8(ppfd + 27, 0);                           // bReserved
+    view.setUint32(ppfd + 28, 0, true);                    // dwLayerMask
+    view.setUint32(ppfd + 32, 0, true);                    // dwVisibleMask
+    view.setUint32(ppfd + 36, 0, true);                    // dwDamageMask
+    return count;
+}
+
+/**
+ * ChoosePixelFormat — score the published table against what the caller asked for.
+ * Hard requirements (an unmet one disqualifies a format outright) are the ones whose
+ * absence changes what the app may legally do with the DC; everything else is a
+ * weighted distance, with "more than asked" cheaper than "less than asked".
+ */
+export function chooseWglPixelFormat(mem: Uint8Array, ppfd: number): number {
+    if (!ppfd || ppfd + 40 > mem.length) return 1;
+    const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+    const wantFlags = view.getUint32(ppfd + 4, true) >>> 0;
+    const wantType = view.getUint8(ppfd + 8);
+    const wantColor = view.getUint8(ppfd + 9);
+    const wantAlpha = view.getUint8(ppfd + 16);
+    const wantAccum = view.getUint8(ppfd + 18);
+    const wantDepth = view.getUint8(ppfd + 23);
+    const wantStencil = view.getUint8(ppfd + 24);
+    const wantAux = view.getUint8(ppfd + 25);
+
+    // Capabilities we do not have. Answering with a format anyway would hand the app a
+    // DC it can never use as it intends — the honest answer is the documented failure.
+    if (wantType !== PFD_TYPE_RGBA) return 0;                                        // no colour-index
+    if ((wantFlags & PFD_STEREO) && !(wantFlags & PFD_STEREO_DONTCARE)) return 0;
+    if (wantFlags & PFD_DRAW_TO_BITMAP) return 0;                                    // GL renders to the window only
+    if (wantFlags & PFD_SUPPORT_GDI) return 0;                                       // no GDI drawing into a GL surface
+    if (wantAccum > 0) return 0;                                                     // no accumulation buffer
+    if (wantAux > 0) return 0;                                                       // no aux buffers
+
+    const distance = (have: number, want: number, shortfallWeight: number): number =>
+        have >= want ? (have - want) : (want - have) * shortfallWeight;
+
+    let best = 0;
+    let bestCost = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < WGL_PIXEL_FORMATS.length; i++) {
+        const fmt = WGL_PIXEL_FORMATS[i];
+        if (!(wantFlags & PFD_DOUBLEBUFFER_DONTCARE)) {
+            const wantDouble = (wantFlags & PFD_DOUBLEBUFFER) !== 0;
+            if (wantDouble !== fmt.doubleBuffer) continue;
+        }
+        let cost = 0;
+        cost += distance(fmt.colorBits, wantColor, 8) * 4;
+        cost += distance(fmt.alphaBits, wantAlpha, 8) * 2;
+        if (!(wantFlags & PFD_DEPTH_DONTCARE)) cost += distance(fmt.depthBits, wantDepth, 8) * 2;
+        cost += distance(fmt.stencilBits, wantStencil, 16) * 2;
+        if (cost < bestCost) { bestCost = cost; best = i + 1; }
+    }
+    return best;
+}
+
+export function setWglPixelFormat(hdc: number, format: number): boolean {
+    if (format <= 0 || format > WGL_PIXEL_FORMATS.length) return false;
+    pixelFormatByHdc.set(hdc, format);
+    return true;
+}
+
+export function getWglPixelFormat(hdc: number): number {
+    return pixelFormatByHdc.get(hdc) ?? 1;
+}
+
 /** Optional scan-line window for SetDIBitsToDevice / StretchDIBits partial DIB copies. */
 interface DibScanRange {
     uStartScan?: number;
@@ -544,10 +732,9 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
     exports['ChoosePixelFormat'] = (ctx, mem, args): number => {
         const hdc = args[0] >>> 0;
         const ppfd = args[1] >>> 0;
-        // Minimal Win32-compatible behavior for legacy OpenGL bootstrap.
-        // Return a stable, valid (>0) pixel format index.
-        Logger.verbose(LogCategory.GDI32, `ChoosePixelFormat(hdc=0x${hdc.toString(16)}, ppfd=0x${ppfd.toString(16)}) -> 1`);
-        return 1;
+        const format = chooseWglPixelFormat(mem, ppfd);
+        Logger.verbose(LogCategory.GDI32, `ChoosePixelFormat(hdc=0x${hdc.toString(16)}, ppfd=0x${ppfd.toString(16)}) -> ${format}`);
+        return format;
     };
 
     // BOOL SetPixelFormat(HDC hdc, int format, const PIXELFORMATDESCRIPTOR *ppfd)
@@ -555,11 +742,10 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         const hdc = args[0] >>> 0;
         const format = args[1] | 0;
         const ppfd = args[2] >>> 0;
-        if (format <= 0) {
+        if (!setWglPixelFormat(hdc, format)) {
             Logger.warn(LogCategory.GDI32, `SetPixelFormat(hdc=0x${hdc.toString(16)}, format=${format}, ppfd=0x${ppfd.toString(16)}) -> FALSE`);
             return 0;
         }
-        pixelFormatByHdc.set(hdc, format);
         Logger.verbose(LogCategory.GDI32, `SetPixelFormat(hdc=0x${hdc.toString(16)}, format=${format}, ppfd=0x${ppfd.toString(16)}) -> TRUE`);
         return 1;
     };
@@ -570,50 +756,18 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         const iPixelFormat = args[1] | 0;
         const nBytes = args[2] >>> 0;
         const ppfd = args[3] >>> 0;
-
-        // Single emulated pixel format for legacy OpenGL bootstrap.
-        const maxFormats = 1;
-        if (iPixelFormat <= 0 || iPixelFormat > maxFormats) {
-            Logger.verbose(
-                LogCategory.GDI32,
-                `DescribePixelFormat(hdc=0x${hdc.toString(16)}, fmt=${iPixelFormat}, nBytes=${nBytes}, ppfd=0x${ppfd.toString(16)}) -> 0`
-            );
-            return 0;
-        }
-
-        if (ppfd && nBytes >= 40 && ppfd + 40 <= mem.length) {
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            // PIXELFORMATDESCRIPTOR (40 bytes)
-            view.setUint16(ppfd + 0, 40, true);      // nSize
-            view.setUint16(ppfd + 2, 1, true);       // nVersion
-            view.setUint32(ppfd + 4, 0x00000025, true); // PFD_DRAW_TO_WINDOW|PFD_SUPPORT_OPENGL|PFD_DOUBLEBUFFER
-            view.setUint8(ppfd + 8, 0);              // iPixelType = PFD_TYPE_RGBA
-            view.setUint8(ppfd + 9, 32);             // cColorBits
-            view.setUint8(ppfd + 10, 8);             // cRedBits
-            view.setUint8(ppfd + 11, 16);            // cRedShift
-            view.setUint8(ppfd + 12, 8);             // cGreenBits
-            view.setUint8(ppfd + 13, 8);             // cGreenShift
-            view.setUint8(ppfd + 14, 8);             // cBlueBits
-            view.setUint8(ppfd + 15, 0);             // cBlueShift
-            view.setUint8(ppfd + 16, 8);             // cAlphaBits
-            view.setUint8(ppfd + 17, 24);            // cAlphaShift
-            view.setUint8(ppfd + 23, 24);            // cDepthBits
-            view.setUint8(ppfd + 24, 8);             // cStencilBits
-            view.setUint8(ppfd + 25, 0);             // cAuxBuffers
-            view.setUint8(ppfd + 26, 0);             // iLayerType = PFD_MAIN_PLANE
-        }
-
+        const result = describeWglPixelFormat(mem, iPixelFormat, nBytes, ppfd);
         Logger.verbose(
             LogCategory.GDI32,
-            `DescribePixelFormat(hdc=0x${hdc.toString(16)}, fmt=${iPixelFormat}, nBytes=${nBytes}, ppfd=0x${ppfd.toString(16)}) -> ${maxFormats}`
+            `DescribePixelFormat(hdc=0x${hdc.toString(16)}, fmt=${iPixelFormat}, nBytes=${nBytes}, ppfd=0x${ppfd.toString(16)}) -> ${result}`
         );
-        return maxFormats;
+        return result;
     };
 
     // int GetPixelFormat(HDC hdc)
     exports['GetPixelFormat'] = (ctx, mem, args): number => {
         const hdc = args[0] >>> 0;
-        const format = pixelFormatByHdc.get(hdc) ?? 1;
+        const format = getWglPixelFormat(hdc);
         Logger.verbose(LogCategory.GDI32, `GetPixelFormat(hdc=0x${hdc.toString(16)}) -> ${format}`);
         return format;
     };

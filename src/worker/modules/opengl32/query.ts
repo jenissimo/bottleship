@@ -28,12 +28,44 @@ import {
     GL_COMPRESSED_LUMINANCE_ALPHA_LATC2_EXT, GL_COMPRESSED_SIGNED_LUMINANCE_ALPHA_LATC2_EXT,
     GL_SAMPLE_BUFFERS, GL_SAMPLES,
     GL_TEXTURE0, GL_TRUE, GL_FALSE,
+    GL_IMPL_MAX_TEXTURE_SIZE, GL_PROXY_TEXTURE_2D,
+    GL_TEXTURE_ENV_MODE, GL_TEXTURE_ENV_COLOR,
+    GL_COMBINE_RGB, GL_COMBINE_ALPHA, GL_RGB_SCALE, GL_ALPHA_SCALE,
+    GL_SOURCE0_RGB, GL_SOURCE1_RGB, GL_SOURCE2_RGB,
+    GL_SOURCE0_ALPHA, GL_SOURCE1_ALPHA, GL_SOURCE2_ALPHA,
+    GL_OPERAND0_RGB, GL_OPERAND1_RGB, GL_OPERAND2_RGB,
+    GL_OPERAND0_ALPHA, GL_OPERAND1_ALPHA, GL_OPERAND2_ALPHA,
+    GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T, GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER,
+    GL_TEXTURE_WIDTH, GL_TEXTURE_HEIGHT, GL_TEXTURE_DEPTH, GL_TEXTURE_INTERNAL_FORMAT,
+    GL_TEXTURE_BORDER, GL_TEXTURE_RED_SIZE, GL_TEXTURE_GREEN_SIZE, GL_TEXTURE_BLUE_SIZE,
+    GL_TEXTURE_ALPHA_SIZE, GL_TEXTURE_LUMINANCE_SIZE, GL_TEXTURE_INTENSITY_SIZE,
+    GL_TEXTURE_COMPRESSED, GL_TEXTURE_COMPRESSED_IMAGE_SIZE,
+    NAME_STACK_MAX_DEPTH,
 } from "./constants";
+import { Logger, LogCategory } from "../../core/logger";
 
 const GL_RED_BITS = 0x0D52;
 const GL_GREEN_BITS = 0x0D53;
 const GL_BLUE_BITS = 0x0D54;
 const GL_ALPHA_BITS = 0x0D55;
+const GL_SUBPIXEL_BITS = 0x0D50;
+const GL_INDEX_BITS = 0x0D51;
+const GL_MAX_NAME_STACK_DEPTH = 0x0D37;
+const GL_MAX_LIST_NESTING = 0x0B31;
+const GL_AUX_BUFFERS = 0x0C00;
+const GL_STEREO = 0x0C33;
+const GL_RENDER_MODE = 0x0C40;
+const GL_ACCUM_RED_BITS = 0x0D58;
+const GL_ACCUM_GREEN_BITS = 0x0D59;
+const GL_ACCUM_BLUE_BITS = 0x0D5A;
+const GL_ACCUM_ALPHA_BITS = 0x0D5B;
+
+const queryWarned = new Set<string>();
+function warnOnceQuery(message: string): void {
+    if (queryWarned.has(message)) return;
+    queryWarned.add(message);
+    Logger.warn(LogCategory.GDI32, `OpenGL query: ${message}`);
+}
 const COMPRESSED_TEXTURE_FORMATS = [
     GL_COMPRESSED_RGB_S3TC_DXT1_EXT,
     GL_COMPRESSED_RGBA_S3TC_DXT1_EXT,
@@ -81,7 +113,28 @@ export function createQueryExports(ctx: OpenGLContext): Record<string, ThunkImpl
             case GL_RENDERER: str = "BottleShip WebGPU"; break;
             case GL_VERSION: str = "1.3.0"; break;
             case GL_EXTENSIONS:
-                str = "GL_ARB_multitexture GL_EXT_compiled_vertex_array GL_ARB_texture_env_combine GL_ARB_texture_compression GL_EXT_texture_compression_s3tc GL_ARB_texture_compression_rgtc GL_EXT_texture_compression_latc";
+                // Every name here must have code behind it — an engine reads this string
+                // to CHOOSE A RENDERING PATH, and one it believes in makes it discard the
+                // fallback it would otherwise have drawn correctly.
+                //
+                // combine/dot3 are published in both spellings deliberately: EXT_ and
+                // ARB_texture_env_combine share every token value, and Quake3-lineage
+                // engines only ever look for the EXT name. env_add is the GL_ADD texture
+                // env mode (applyTexEnv), also spelled both ways by different engines.
+                str = [
+                    "GL_ARB_multitexture",
+                    "GL_EXT_compiled_vertex_array",
+                    "GL_ARB_texture_env_add",
+                    "GL_EXT_texture_env_add",
+                    "GL_ARB_texture_env_combine",
+                    "GL_EXT_texture_env_combine",
+                    "GL_ARB_texture_env_dot3",
+                    "GL_EXT_texture_env_dot3",
+                    "GL_ARB_texture_compression",
+                    "GL_EXT_texture_compression_s3tc",
+                    "GL_ARB_texture_compression_rgtc",
+                    "GL_EXT_texture_compression_latc",
+                ].join(" ");
                 break;
             default: return 0;
         }
@@ -100,8 +153,21 @@ export function createQueryExports(ctx: OpenGLContext): Record<string, ThunkImpl
         const writeInts = (vals: number[]) => { for (let i = 0; i < vals.length; i++) Mem.writeUint32(ptr + i * 4, vals[i]); };
 
         switch (pname) {
-            case GL_MAX_TEXTURE_SIZE: writeInt(2048); break;
+            case GL_MAX_TEXTURE_SIZE: writeInt(GL_IMPL_MAX_TEXTURE_SIZE); break;
             case GL_MAX_TEXTURE_UNITS: writeInt(2); break;
+            // GL 1.3 mandates a floor for these; 0 is not a legal answer and an engine
+            // that sizes a stack or a rasteriser tolerance from it gets a value no
+            // conformant driver could return.
+            case GL_SUBPIXEL_BITS: writeInt(4); break;
+            case GL_MAX_NAME_STACK_DEPTH: writeInt(NAME_STACK_MAX_DEPTH); break;
+            case GL_MAX_LIST_NESTING: writeInt(64); break;
+            // Genuinely absent, and 0 is the correct way to say so.
+            case GL_AUX_BUFFERS: writeInt(0); break;
+            case GL_INDEX_BITS: writeInt(0); break;
+            case GL_STEREO: writeInt(0); break;
+            case GL_ACCUM_RED_BITS: case GL_ACCUM_GREEN_BITS:
+            case GL_ACCUM_BLUE_BITS: case GL_ACCUM_ALPHA_BITS: writeInt(0); break;
+            case GL_RENDER_MODE: writeInt(ctx.renderMode); break;
             case GL_MAX_MODELVIEW_STACK_DEPTH: writeInt(32); break;
             case GL_MAX_PROJECTION_STACK_DEPTH: writeInt(32); break;
             case GL_MAX_TEXTURE_STACK_DEPTH: writeInt(32); break;
@@ -146,7 +212,13 @@ export function createQueryExports(ctx: OpenGLContext): Record<string, ThunkImpl
             case GL_COMPRESSED_TEXTURE_FORMATS: writeInts(COMPRESSED_TEXTURE_FORMATS); break;
             case GL_SAMPLE_BUFFERS: writeInt(0); break;
             case GL_SAMPLES: writeInt(0); break;
-            default: writeInt(0); break;
+            default:
+                // 0 is a real answer for some pnames and a wrong one for others, and the
+                // caller cannot tell which it got. Name the pname so the next one that
+                // matters gets a real entry above instead of a silent zero.
+                warnOnceQuery(`glGetIntegerv(0x${pname.toString(16)}) unhandled -> 0`);
+                writeInt(0);
+                break;
         }
         return 0;
     };
@@ -246,17 +318,149 @@ export function createQueryExports(ctx: OpenGLContext): Record<string, ThunkImpl
         return ctx.enableFlags.has(args[0] >>> 0) ? GL_TRUE : GL_FALSE;
     };
 
-    // Stub getters that need guest memory writes
-    exports['glGetTexEnvfv'] = (): number => 0;
-    exports['glGetTexEnviv'] = (): number => 0;
+    // ---- Getters ----
+    //
+    // A getter that returns without writing *ppfd leaves the caller reading its own
+    // uninitialized stack slot, so the same query answers differently run to run. Any
+    // getter still stubbed below writes nothing on purpose ONLY where no caller has been
+    // observed; the ones an engine uses to decide something are implemented.
+
+    /** GL_TEXTURE_ENV state of the active unit (both spellings share the enums). */
+    function texEnvValue(pname: number): number | number[] | null {
+        const unit = ctx.textureUnits[ctx.activeTextureUnit];
+        switch (pname) {
+            case GL_TEXTURE_ENV_MODE: return unit.texEnvMode;
+            case GL_TEXTURE_ENV_COLOR: return [unit.envColor[0], unit.envColor[1], unit.envColor[2], unit.envColor[3]];
+            case GL_COMBINE_RGB: return unit.combineRgb;
+            case GL_COMBINE_ALPHA: return unit.combineAlpha;
+            case GL_SOURCE0_RGB: return unit.srcRgb[0];
+            case GL_SOURCE1_RGB: return unit.srcRgb[1];
+            case GL_SOURCE2_RGB: return unit.srcRgb[2];
+            case GL_SOURCE0_ALPHA: return unit.srcAlpha[0];
+            case GL_SOURCE1_ALPHA: return unit.srcAlpha[1];
+            case GL_SOURCE2_ALPHA: return unit.srcAlpha[2];
+            case GL_OPERAND0_RGB: return unit.opRgb[0];
+            case GL_OPERAND1_RGB: return unit.opRgb[1];
+            case GL_OPERAND2_RGB: return unit.opRgb[2];
+            case GL_OPERAND0_ALPHA: return unit.opAlpha[0];
+            case GL_OPERAND1_ALPHA: return unit.opAlpha[1];
+            case GL_OPERAND2_ALPHA: return unit.opAlpha[2];
+            case GL_RGB_SCALE: return unit.rgbScale;
+            case GL_ALPHA_SCALE: return unit.alphaScale;
+            default: return null;
+        }
+    }
+
+    exports['glGetTexEnvfv'] = (_ctx, _mem, args): number => {
+        const ptr = args[2] >>> 0;
+        if (!ptr) return 0;
+        const v = texEnvValue(args[1] >>> 0);
+        if (v === null) { warnOnceQuery(`glGetTexEnvfv(0x${(args[1] >>> 0).toString(16)}) unhandled`); return 0; }
+        const mem = ctx.process.getCurrentMemory();
+        const view = new DataView(mem.buffer, mem.byteOffset);
+        if (Array.isArray(v)) { for (let i = 0; i < v.length; i++) view.setFloat32(ptr + i * 4, v[i], true); }
+        else view.setFloat32(ptr, v, true);
+        return 0;
+    };
+
+    exports['glGetTexEnviv'] = (_ctx, _mem, args): number => {
+        const ptr = args[2] >>> 0;
+        if (!ptr) return 0;
+        const v = texEnvValue(args[1] >>> 0);
+        if (v === null) { warnOnceQuery(`glGetTexEnviv(0x${(args[1] >>> 0).toString(16)}) unhandled`); return 0; }
+        if (Array.isArray(v)) {
+            // Colour components come back scaled to the full int range (GL 1.3 §6.1.2).
+            for (let i = 0; i < v.length; i++) Mem.writeUint32(ptr + i * 4, Math.round(v[i] * 2147483647) | 0);
+        } else Mem.writeUint32(ptr, v | 0);
+        return 0;
+    };
+
     exports['glGetLightfv'] = (): number => 0;
     exports['glGetLightiv'] = (): number => 0;
     exports['glGetMaterialfv'] = (): number => 0;
     exports['glGetMaterialiv'] = (): number => 0;
-    exports['glGetTexParameterfv'] = (): number => 0;
-    exports['glGetTexParameteriv'] = (): number => 0;
-    exports['glGetTexLevelParameterfv'] = (): number => 0;
-    exports['glGetTexLevelParameteriv'] = (): number => 0;
+
+    function texParameterValue(pname: number): number | null {
+        const tex = ctx.textures.get(ctx.textureUnits[ctx.activeTextureUnit].boundTexture);
+        if (!tex) return null;
+        switch (pname) {
+            case GL_TEXTURE_WRAP_S: return tex.wrapS;
+            case GL_TEXTURE_WRAP_T: return tex.wrapT;
+            case GL_TEXTURE_MIN_FILTER: return tex.minFilter;
+            case GL_TEXTURE_MAG_FILTER: return tex.magFilter;
+            default: return null;
+        }
+    }
+
+    exports['glGetTexParameterfv'] = (_ctx, _mem, args): number => {
+        const ptr = args[2] >>> 0;
+        const v = texParameterValue(args[1] >>> 0);
+        if (!ptr || v === null) return 0;
+        const mem = ctx.process.getCurrentMemory();
+        new DataView(mem.buffer, mem.byteOffset).setFloat32(ptr, v, true);
+        return 0;
+    };
+
+    exports['glGetTexParameteriv'] = (_ctx, _mem, args): number => {
+        const ptr = args[2] >>> 0;
+        const v = texParameterValue(args[1] >>> 0);
+        if (!ptr || v === null) return 0;
+        Mem.writeUint32(ptr, v | 0);
+        return 0;
+    };
+
+    /**
+     * glGetTexLevelParameter — for GL_PROXY_TEXTURE_2D this is the OTHER half of the
+     * "will this texture fit?" probe: the proxy glTexImage2D records the verdict and
+     * this reads it back. Answering 0 without writing left the verdict as whatever was
+     * on the caller's stack, so a format probe was nondeterministic.
+     */
+    function texLevelValue(target: number, level: number, pname: number): number | null {
+        let width: number, height: number, internalFormat: number;
+        if (target === GL_PROXY_TEXTURE_2D) {
+            width = ctx.proxyTextureWidth;
+            height = ctx.proxyTextureHeight;
+            internalFormat = ctx.proxyTextureInternalFormat;
+        } else {
+            const tex = ctx.textures.get(ctx.textureUnits[ctx.activeTextureUnit].boundTexture);
+            if (!tex || level !== 0) return 0;
+            width = tex.width; height = tex.height; internalFormat = tex.internalFormat;
+        }
+        const present = width > 0 && height > 0;
+        switch (pname) {
+            case GL_TEXTURE_WIDTH: return width;
+            case GL_TEXTURE_HEIGHT: return height;
+            case GL_TEXTURE_DEPTH: return present ? 1 : 0;
+            case GL_TEXTURE_INTERNAL_FORMAT: return internalFormat;
+            case GL_TEXTURE_BORDER: return 0;
+            // We decompress on upload and store RGBA8, so the component sizes a caller
+            // sees are the ones it will actually sample.
+            case GL_TEXTURE_RED_SIZE: case GL_TEXTURE_GREEN_SIZE:
+            case GL_TEXTURE_BLUE_SIZE: case GL_TEXTURE_ALPHA_SIZE: return present ? 8 : 0;
+            case GL_TEXTURE_LUMINANCE_SIZE: case GL_TEXTURE_INTENSITY_SIZE: return 0;
+            case GL_TEXTURE_COMPRESSED: return GL_FALSE;
+            case GL_TEXTURE_COMPRESSED_IMAGE_SIZE: return width * height * 4;
+            default: return null;
+        }
+    }
+
+    exports['glGetTexLevelParameterfv'] = (_ctx, _mem, args): number => {
+        const ptr = args[3] >>> 0;
+        const v = texLevelValue(args[0] >>> 0, args[1] | 0, args[2] >>> 0);
+        if (!ptr || v === null) return 0;
+        const mem = ctx.process.getCurrentMemory();
+        new DataView(mem.buffer, mem.byteOffset).setFloat32(ptr, v, true);
+        return 0;
+    };
+
+    exports['glGetTexLevelParameteriv'] = (_ctx, _mem, args): number => {
+        const ptr = args[3] >>> 0;
+        const v = texLevelValue(args[0] >>> 0, args[1] | 0, args[2] >>> 0);
+        if (!ptr || v === null) return 0;
+        Mem.writeUint32(ptr, v | 0);
+        return 0;
+    };
+
     exports['glGetTexImage'] = (): number => 0;
     exports['glGetPointerv'] = (): number => 0;
     exports['glAreTexturesResident'] = (): number => GL_TRUE;

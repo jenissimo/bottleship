@@ -3,6 +3,7 @@ import { Mem } from "../../core/memory/mem-accessor";
 import { OpenGLContext, GLTextureObject } from "./context";
 import {
     GL_TEXTURE_1D, GL_TEXTURE_2D, GL_TEXTURE_3D, GL_RGBA,
+    GL_PROXY_TEXTURE_2D, GL_IMPL_MAX_TEXTURE_SIZE,
     GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T, GL_TEXTURE_MAG_FILTER, GL_TEXTURE_MIN_FILTER,
     GL_INVALID_ENUM, GL_INVALID_VALUE,
     GL_REPEAT, GL_NEAREST,
@@ -292,6 +293,20 @@ export function createTextureExports(ctx: OpenGLContext): Record<string, ThunkIm
         const format = args[6] >>> 0;
         const type = args[7] >>> 0;
         const pixels = args[8] >>> 0;
+
+        // GL_PROXY_TEXTURE_2D allocates nothing: it asks "would this image fit, in this
+        // format?" and the answer is READ BACK with glGetTexLevelParameter. Ignoring the
+        // call left that answer as whatever was in the caller's variable, so the same
+        // probe could pass or fail run to run.
+        if (target === GL_PROXY_TEXTURE_2D) {
+            const fits = level >= 0
+                && width > 0 && height > 0
+                && width <= GL_IMPL_MAX_TEXTURE_SIZE && height <= GL_IMPL_MAX_TEXTURE_SIZE;
+            ctx.proxyTextureWidth = fits ? width : 0;
+            ctx.proxyTextureHeight = fits ? height : 0;
+            ctx.proxyTextureInternalFormat = fits ? internalformat : 0;
+            return 0;
+        }
 
         if (target !== GL_TEXTURE_2D || level !== 0) return 0;
 

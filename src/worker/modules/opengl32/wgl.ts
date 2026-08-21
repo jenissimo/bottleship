@@ -5,6 +5,12 @@ import { OpenGLBackendExecutor } from "../../backends/webgpu/opengl/opengl-backe
 import { System } from "../../core/system";
 import { gammaService } from "../../core/gamma-service";
 import { resolveHleExportAddress } from "../../core/thunking/export-resolver";
+import {
+    chooseWglPixelFormat,
+    describeWglPixelFormat,
+    getWglPixelFormat,
+    setWglPixelFormat,
+} from "../gdi32/painting";
 
 interface WGLContextBinding {
     hglrc: number;
@@ -181,40 +187,25 @@ export function createWglExports(ctx: OpenGLContext): Record<string, ThunkImplem
         return 1;
     };
 
-    exports['wglChoosePixelFormat'] = (_c, _m, args): number => {
-        return 1; // Return format index 1
+    // The wgl* pixel-format entry points are the SAME driver-side query gdi32's
+    // Choose/Describe/Set/GetPixelFormat forward to on real Windows, so they share the
+    // one implementation. Two copies of the PIXELFORMATDESCRIPTOR layout is exactly how
+    // this one rotted: the gdi32 twin wrote green/blue/alpha at their real offsets while
+    // this one dropped them into cAlphaShift/cAccumBits, publishing a 32-bit format with
+    // zero green and blue for any engine that scored the table.
+    exports['wglChoosePixelFormat'] = (_c, mem, args): number => {
+        return chooseWglPixelFormat(mem, args[1] >>> 0);
     };
 
-    exports['wglDescribePixelFormat'] = (_c, _m, args): number => {
-        const hdc = args[0] >>> 0;
-        const pixelFormat = args[1] | 0;
-        const nBytes = args[2] >>> 0;
-        const ppfd = args[3] >>> 0;
-
-        if (ppfd && nBytes >= 40) {
-            // PIXELFORMATDESCRIPTOR is 40 bytes
-            const mem = ctx.process.getCurrentMemory();
-            const view = new DataView(mem.buffer, mem.byteOffset);
-            view.setUint16(ppfd + 0, 40, true);      // nSize
-            view.setUint16(ppfd + 2, 1, true);        // nVersion
-            view.setUint32(ppfd + 4, 0x25, true);     // dwFlags: PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER
-            view.setUint8(ppfd + 8, 0);               // iPixelType: PFD_TYPE_RGBA
-            view.setUint8(ppfd + 9, 32);              // cColorBits
-            view.setUint8(ppfd + 10, 8);              // cRedBits
-            view.setUint8(ppfd + 17, 8);              // cGreenBits
-            view.setUint8(ppfd + 18, 8);              // cBlueBits
-            view.setUint8(ppfd + 19, 8);              // cAlphaBits
-            view.setUint8(ppfd + 23, 24);             // cDepthBits
-            view.setUint8(ppfd + 24, 8);              // cStencilBits
-        }
-        return 1; // Number of pixel formats
+    exports['wglDescribePixelFormat'] = (_c, mem, args): number => {
+        return describeWglPixelFormat(mem, args[1] | 0, args[2] >>> 0, args[3] >>> 0);
     };
 
     exports['wglSetPixelFormat'] = (_c, _m, args): number => {
-        return 1; // TRUE
+        return setWglPixelFormat(args[0] >>> 0, args[1] | 0) ? 1 : 0;
     };
 
-    exports['wglGetPixelFormat'] = (): number => 1;
+    exports['wglGetPixelFormat'] = (_c, _m, args): number => getWglPixelFormat(args[0] >>> 0);
 
     exports['wglCopyContext'] = (): number => 0;
     exports['wglCreateLayerContext'] = (_c, _m, args): number => {
@@ -237,7 +228,11 @@ export function createWglExports(ctx: OpenGLContext): Record<string, ThunkImplem
     };
 
     exports['wglGetExtensionsStringARB'] = (_c, _m, args): number => {
-        const str = "WGL_ARB_extensions_string WGL_ARB_multisample";
+        // Only what has an entry point behind it. WGL_ARB_multisample was listed here
+        // with no wglChoosePixelFormatARB/wglGetPixelFormatAttribivARB to query it and
+        // no multisampled pixel format to find — a lenient caller resolves NULL and
+        // calls address 0, a careful one enables an AA path we never render.
+        const str = "WGL_ARB_extensions_string";
         const addr = ctx.process.memory.alloc(str.length + 1);
         if (addr) {
             const bytes = new TextEncoder().encode(str + "\0");

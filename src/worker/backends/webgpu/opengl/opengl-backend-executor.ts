@@ -23,6 +23,12 @@ import {
     CI_CLEAR_MASK, CI_CLEAR_STENCIL,
     CF_ALPHA_REF, CF_FOG_R, CF_FOG_G, CF_FOG_B, CF_FOG_A, CF_FOG_DENSITY, CF_FOG_START, CF_FOG_END,
     CF_DEPTH_RANGE_NEAR, CF_DEPTH_RANGE_FAR,
+    CI_COMBINE0_RGB, CI_COMBINE0_ALPHA, CI_COMBINE1_RGB, CI_COMBINE1_ALPHA,
+    CF_ENV_COLOR0, CF_ENV_COLOR1,
+    COMBINER_FN_REPLACE, COMBINER_FN_MODULATE, COMBINER_FN_ADD, COMBINER_FN_ADD_SIGNED,
+    COMBINER_FN_INTERPOLATE, COMBINER_FN_SUBTRACT, COMBINER_FN_DOT3_RGB, COMBINER_FN_DOT3_RGBA,
+    COMBINER_SRC_CONSTANT, COMBINER_SRC_PRIMARY, COMBINER_SRC_PREVIOUS,
+    COMBINER_OP_ONE_MINUS_SRC_COLOR, COMBINER_OP_SRC_ALPHA, COMBINER_OP_ONE_MINUS_SRC_ALPHA,
     CF_CLEAR_R, CF_CLEAR_G, CF_CLEAR_B, CF_CLEAR_A, CF_CLEAR_DEPTH,
     DF_DEPTH_TEST, DF_DEPTH_MASK, DF_BLEND, DF_ALPHA_TEST, DF_CULL, DF_FOG,
     DF_COLOR_MASK_R, DF_COLOR_MASK_G, DF_COLOR_MASK_B, DF_COLOR_MASK_A, DF_STENCIL_TEST, DF_SCISSOR,
@@ -35,6 +41,7 @@ import {
     GL_CLAMP_TO_EDGE,
     GL_CCW,
     GL_COLOR_BUFFER_BIT,
+    GL_COMBINE,
     GL_DECAL,
     GL_DECR,
     GL_DEPTH_BUFFER_BIT,
@@ -116,7 +123,7 @@ interface SelectedVertices {
 
 const VERTEX_FLOAT_STRIDE = 12; // pos.xyz + color.rgba + uv0.xy + uv1.xy + pad
 const VERTEX_BYTE_STRIDE = VERTEX_FLOAT_STRIDE * 4;
-const UNIFORM_BLOCK_SIZE = 96;
+const UNIFORM_BLOCK_SIZE = 144;
 
 export class OpenGLBackendExecutor {
     private readonly backend: WebGPUBackend;
@@ -658,6 +665,69 @@ export class OpenGLBackendExecutor {
         this.depthStencilInitialized = false;
     }
 
+    /**
+     * Read a rectangle of the colour buffer back as RGBA8, GL orientation (row 0 is the
+     * BOTTOM row, as glReadPixels defines it).
+     *
+     * The source is the offscreen colour target, which holds the most recently EXECUTED
+     * frame: commands accumulate until present, so a read issued before SwapBuffers sees
+     * the previous frame. That is a one-frame lag, not undefined data — and the caller
+     * gets a real image either way.
+     *
+     * Returns null when there is nothing rendered yet or the rect falls outside it; the
+     * caller must then say so rather than leave the guest buffer untouched.
+     */
+    async readPixels(x: number, y: number, width: number, height: number): Promise<Uint8Array | null> {
+        const device = this.backend.getDevice();
+        const queue = this.backend.getQueue();
+        const texture = this.offscreenTexture;
+        const size = this.offscreenSize;
+        if (!device || !queue || !texture || !size || !this.offscreenInitialized) return null;
+        if (width <= 0 || height <= 0) return null;
+        if (x < 0 || y < 0 || x + width > size.width || y + height > size.height) return null;
+
+        // GL's y counts up from the bottom of the drawable; the texture's counts down.
+        const topY = size.height - (y + height);
+        const bytesPerRow = (width * 4 + 255) & ~255;
+        const staging = device.createBuffer({
+            size: bytesPerRow * height,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
+        try {
+            const encoder = device.createCommandEncoder();
+            encoder.copyTextureToBuffer(
+                { texture, origin: { x, y: topY, z: 0 } },
+                { buffer: staging, bytesPerRow, rowsPerImage: height },
+                { width, height, depthOrArrayLayers: 1 },
+            );
+            queue.submit([encoder.finish()]);
+            await staging.mapAsync(GPUMapMode.READ);
+            const mapped = new Uint8Array(staging.getMappedRange());
+            const out = new Uint8Array(width * height * 4);
+            const bgra = this.targetFormat === "bgra8unorm";
+            for (let row = 0; row < height; row++) {
+                // Flip vertically on the way out: the last texture row is GL's row 0.
+                const src = (height - 1 - row) * bytesPerRow;
+                const dst = row * width * 4;
+                if (bgra) {
+                    for (let px = 0; px < width; px++) {
+                        const s = src + px * 4, d = dst + px * 4;
+                        out[d] = mapped[s + 2];
+                        out[d + 1] = mapped[s + 1];
+                        out[d + 2] = mapped[s];
+                        out[d + 3] = mapped[s + 3];
+                    }
+                } else {
+                    out.set(mapped.subarray(src, src + width * 4), dst);
+                }
+            }
+            staging.unmap();
+            return out;
+        } finally {
+            staging.destroy();
+        }
+    }
+
     private pruneTextureCache(textures: Map<number, GLTextureObject>): void {
         let removed = false;
         for (const [id, cached] of this.textureCache.entries()) {
@@ -1197,6 +1267,19 @@ export class OpenGLBackendExecutor {
         this.readDepthRange(F, f);
         this.uniformScratchU32[20] = this.depthRangeReversed ? 1 : 0;
 
+        // 84..100 — packed GL_COMBINE words, decoded in the shader by the same layout
+        // context.ts encodes them with.
+        this.uniformScratchU32[21] = I[i + CI_COMBINE0_RGB] >>> 0;
+        this.uniformScratchU32[22] = I[i + CI_COMBINE0_ALPHA] >>> 0;
+        this.uniformScratchU32[23] = I[i + CI_COMBINE1_RGB] >>> 0;
+        this.uniformScratchU32[24] = I[i + CI_COMBINE1_ALPHA] >>> 0;
+
+        // 112..144 — GL_TEXTURE_ENV_COLOR per unit (vec4 alignment leaves 100..112 pad)
+        for (let k = 0; k < 4; k++) {
+            this.uniformScratchF32[28 + k] = this.clamp01(F[f + CF_ENV_COLOR0 + k]);
+            this.uniformScratchF32[32 + k] = this.clamp01(F[f + CF_ENV_COLOR1 + k]);
+        }
+
         queue.writeBuffer(this.uniformBuffer!, offset, this.uniformScratchBuffer, 0, UNIFORM_BLOCK_SIZE);
     }
 
@@ -1422,6 +1505,15 @@ struct Uniforms {
     _pad1: f32,             // 60..64
     fogColor: vec4f,        // 64..80
     depthFlip: u32,         // 80..84
+    comb0Rgb: u32,          // 84..88
+    comb0Alpha: u32,        // 88..92
+    comb1Rgb: u32,          // 92..96
+    comb1Alpha: u32,        // 96..100
+    _pad2: u32,             // 100..104
+    _pad3: u32,             // 104..108
+    _pad4: u32,             // 108..112
+    envColor0: vec4f,       // 112..128
+    envColor1: vec4f,       // 128..144
 };
 
 struct VertexIn {
@@ -1445,7 +1537,86 @@ struct VertexOut {
 @group(0) @binding(3) var samp1: sampler;
 @group(0) @binding(4) var tex1: texture_2d<f32>;
 
-fn applyTexEnv(mode: u32, incoming: vec4f, texel: vec4f) -> vec4f {
+// ---- ARB/EXT_texture_env_combine ----
+//
+// The packed word layout is defined in modules/opengl32/context.ts; these decoders are
+// the other half of that contract. GL_COMBINE is the reason an engine drops its
+// multi-pass lightmap path, so evaluating it as plain MODULATE is not a lost effect —
+// it is the wrong image for geometry the engine deliberately stopped drawing twice.
+
+fn combSource(src: u32, texel: vec4f, primary: vec4f, previous: vec4f, konst: vec4f) -> vec4f {
+    if (src == ${COMBINER_SRC_CONSTANT}u) { return konst; }
+    if (src == ${COMBINER_SRC_PRIMARY}u) { return primary; }
+    if (src == ${COMBINER_SRC_PREVIOUS}u) { return previous; }
+    return texel;
+}
+
+fn combOperandRgb(op: u32, v: vec4f) -> vec3f {
+    if (op == ${COMBINER_OP_ONE_MINUS_SRC_COLOR}u) { return vec3f(1.0) - v.rgb; }
+    if (op == ${COMBINER_OP_SRC_ALPHA}u) { return vec3f(v.a); }
+    if (op == ${COMBINER_OP_ONE_MINUS_SRC_ALPHA}u) { return vec3f(1.0 - v.a); }
+    return v.rgb;
+}
+
+// Alpha arguments accept only SRC_ALPHA / ONE_MINUS_SRC_ALPHA.
+fn combOperandAlpha(op: u32, v: vec4f) -> f32 {
+    if (op == ${COMBINER_OP_ONE_MINUS_SRC_ALPHA}u) { return 1.0 - v.a; }
+    return v.a;
+}
+
+fn combArg(word: u32, index: u32, texel: vec4f, primary: vec4f, previous: vec4f, konst: vec4f) -> vec4f {
+    let shift = 4u + index * 4u;
+    let src = (word >> shift) & 3u;
+    return combSource(src, texel, primary, previous, konst);
+}
+
+fn combOpBits(word: u32, index: u32) -> u32 {
+    return (word >> (6u + index * 4u)) & 3u;
+}
+
+fn combineRgb(word: u32, texel: vec4f, primary: vec4f, previous: vec4f, konst: vec4f) -> vec3f {
+    let fn_ = word & 15u;
+    let a0 = combOperandRgb(combOpBits(word, 0u), combArg(word, 0u, texel, primary, previous, konst));
+    let a1 = combOperandRgb(combOpBits(word, 1u), combArg(word, 1u, texel, primary, previous, konst));
+    let a2 = combOperandRgb(combOpBits(word, 2u), combArg(word, 2u, texel, primary, previous, konst));
+    var rgb: vec3f;
+    if (fn_ == ${COMBINER_FN_REPLACE}u) { rgb = a0; }
+    else if (fn_ == ${COMBINER_FN_ADD}u) { rgb = a0 + a1; }
+    else if (fn_ == ${COMBINER_FN_ADD_SIGNED}u) { rgb = a0 + a1 - vec3f(0.5); }
+    else if (fn_ == ${COMBINER_FN_INTERPOLATE}u) { rgb = a0 * a2 + a1 * (vec3f(1.0) - a2); }
+    else if (fn_ == ${COMBINER_FN_SUBTRACT}u) { rgb = a0 - a1; }
+    else if (fn_ == ${COMBINER_FN_DOT3_RGB}u || fn_ == ${COMBINER_FN_DOT3_RGBA}u) {
+        rgb = vec3f(4.0 * dot(a0 - vec3f(0.5), a1 - vec3f(0.5)));
+    }
+    else { rgb = a0 * a1; }   // ${COMBINER_FN_MODULATE}
+    let scale = f32(1u << ((word >> 16u) & 3u));
+    return clamp(rgb * scale, vec3f(0.0), vec3f(1.0));
+}
+
+fn combineAlpha(word: u32, rgbWord: u32, texel: vec4f, primary: vec4f, previous: vec4f, konst: vec4f) -> f32 {
+    // DOT3_RGBA replaces alpha with the same dot product, ignoring the alpha combiner.
+    if ((rgbWord & 15u) == ${COMBINER_FN_DOT3_RGBA}u) {
+        return combineRgb(rgbWord, texel, primary, previous, konst).r;
+    }
+    let fn_ = word & 15u;
+    let a0 = combOperandAlpha(combOpBits(word, 0u), combArg(word, 0u, texel, primary, previous, konst));
+    let a1 = combOperandAlpha(combOpBits(word, 1u), combArg(word, 1u, texel, primary, previous, konst));
+    let a2 = combOperandAlpha(combOpBits(word, 2u), combArg(word, 2u, texel, primary, previous, konst));
+    var a: f32;
+    if (fn_ == ${COMBINER_FN_REPLACE}u) { a = a0; }
+    else if (fn_ == ${COMBINER_FN_ADD}u) { a = a0 + a1; }
+    else if (fn_ == ${COMBINER_FN_ADD_SIGNED}u) { a = a0 + a1 - 0.5; }
+    else if (fn_ == ${COMBINER_FN_INTERPOLATE}u) { a = a0 * a2 + a1 * (1.0 - a2); }
+    else if (fn_ == ${COMBINER_FN_SUBTRACT}u) { a = a0 - a1; }
+    else { a = a0 * a1; }
+    let scale = f32(1u << ((word >> 16u) & 3u));
+    return clamp(a * scale, 0.0, 1.0);
+}
+
+fn applyTexEnv(
+    mode: u32, incoming: vec4f, texel: vec4f,
+    primary: vec4f, combRgb: u32, combAlpha: u32, konst: vec4f,
+) -> vec4f {
     if (mode == ${GL_REPLACE}u) {
         return texel;
     }
@@ -1454,6 +1625,12 @@ fn applyTexEnv(mode: u32, incoming: vec4f, texel: vec4f) -> vec4f {
     }
     if (mode == ${GL_ADD}u) {
         return vec4f(min(incoming.rgb + texel.rgb, vec3f(1.0)), min(incoming.a + texel.a, 1.0));
+    }
+    if (mode == ${GL_COMBINE}u) {
+        return vec4f(
+            combineRgb(combRgb, texel, primary, incoming, konst),
+            combineAlpha(combAlpha, combRgb, texel, primary, incoming, konst),
+        );
     }
     return incoming * texel; // GL_MODULATE / default
 }
@@ -1506,13 +1683,18 @@ fn vs_main(input: VertexIn) -> VertexOut {
 fn fs_main(input: VertexOut) -> @location(0) vec4f {
     var color = input.color;
 
+    // GL_PRIMARY_COLOR is the fragment's interpolated colour for EVERY unit; GL_PREVIOUS
+    // is the running result, which at unit 0 is the same thing.
+    let primary = input.color;
     if (uniforms.useTex0 != 0u) {
         let t0 = textureSample(tex0, samp0, input.uv0);
-        color = applyTexEnv(uniforms.texEnv0, color, t0);
+        color = applyTexEnv(uniforms.texEnv0, color, t0, primary,
+                            uniforms.comb0Rgb, uniforms.comb0Alpha, uniforms.envColor0);
     }
     if (uniforms.useTex1 != 0u) {
         let t1 = textureSample(tex1, samp1, input.uv1);
-        color = applyTexEnv(uniforms.texEnv1, color, t1);
+        color = applyTexEnv(uniforms.texEnv1, color, t1, primary,
+                            uniforms.comb1Rgb, uniforms.comb1Alpha, uniforms.envColor1);
     }
 
     color = vec4f(clamp(color.rgb, vec3f(0.0), vec3f(1.0)), clamp(color.a, 0.0, 1.0));

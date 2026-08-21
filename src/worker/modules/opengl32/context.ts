@@ -8,7 +8,13 @@ import { WebGPUBackend } from "../../backends/webgpu/webgpu-backend";
 import { GLCvaState, createCvaState } from "./client-arrays";
 import { GL_MODELVIEW, GL_LESS, GL_ONE, GL_ZERO, GL_ALWAYS, GL_BACK, GL_CCW, GL_SMOOTH,
          GL_FILL, GL_LINEAR, GL_MODULATE, GL_NEAREST, GL_REPEAT, GL_TEXTURE0,
-         GL_EYE_LINEAR } from "./constants";
+         GL_EYE_LINEAR,
+         GL_ADD, GL_REPLACE, GL_ADD_SIGNED, GL_INTERPOLATE, GL_SUBTRACT,
+         GL_DOT3_RGB, GL_DOT3_RGBA, GL_DOT3_RGB_EXT, GL_DOT3_RGBA_EXT,
+         GL_TEXTURE, GL_CONSTANT, GL_PRIMARY_COLOR, GL_PREVIOUS,
+         GL_SRC_COLOR, GL_ONE_MINUS_SRC_COLOR, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
+         GL_COMBINE, GL_RENDER, NAME_STACK_MAX_DEPTH,
+       } from "./constants";
 
 // ---- Draw command types ----
 
@@ -38,9 +44,9 @@ export const enum GLDrawCommandType {
 // command or an arena slice past executeFrame().
 
 /** Int32 slots per command record. */
-export const CMD_I32 = 33;
+export const CMD_I32 = 37;
 /** Float32 slots per command record. */
-export const CMD_F32 = 10;
+export const CMD_F32 = 18;
 
 export const CI_TYPE = 0;
 
@@ -79,6 +85,12 @@ export const CI_VP_X = 29;
 export const CI_VP_Y = 30;
 export const CI_VP_W = 31;
 export const CI_VP_H = 32;
+/** Packed GL_COMBINE state per unit (see "Combiner encoding" below). Only read when
+ *  the matching CI_TEXENV slot is GL_COMBINE. */
+export const CI_COMBINE0_RGB = 33;
+export const CI_COMBINE0_ALPHA = 34;
+export const CI_COMBINE1_RGB = 35;
+export const CI_COMBINE1_ALPHA = 36;
 
 // CLEAR — aliases over the same slots (a record is only ever one command type)
 export const CI_CLEAR_MASK = 1;
@@ -95,6 +107,9 @@ export const CF_FOG_START = 6;
 export const CF_FOG_END = 7;
 export const CF_DEPTH_RANGE_NEAR = 8;
 export const CF_DEPTH_RANGE_FAR = 9;
+/** GL_TEXTURE_ENV_COLOR per unit — the GL_CONSTANT combiner argument. */
+export const CF_ENV_COLOR0 = 10; // ..13
+export const CF_ENV_COLOR1 = 14; // ..17
 
 // CLEAR — float aliases
 export const CF_CLEAR_R = 0;
@@ -210,6 +225,162 @@ export interface GLTextureUnit {
     enabled2d: boolean;
     boundTexture: number; // texture name (0=none)
     texEnvMode: number;
+    /** GL_TEXTURE_ENV_COLOR — the GL_CONSTANT combiner argument. */
+    envColor: Float32Array;
+    // ARB/EXT_texture_env_combine. Defaults are the spec's (GL 1.3 table 3.20), which
+    // reproduce GL_MODULATE exactly, so a unit that never sets them behaves as before.
+    combineRgb: number;
+    combineAlpha: number;
+    srcRgb: Int32Array;    // [SOURCE0_RGB, SOURCE1_RGB, SOURCE2_RGB]
+    srcAlpha: Int32Array;
+    opRgb: Int32Array;     // [OPERAND0_RGB, OPERAND1_RGB, OPERAND2_RGB]
+    opAlpha: Int32Array;
+    rgbScale: number;      // GL_RGB_SCALE: 1, 2 or 4
+    alphaScale: number;    // GL_ALPHA_SCALE
+}
+
+export function createTextureUnit(): GLTextureUnit {
+    return {
+        enabled2d: false,
+        boundTexture: 0,
+        texEnvMode: GL_MODULATE,
+        envColor: new Float32Array([0, 0, 0, 0]),
+        combineRgb: GL_MODULATE,
+        combineAlpha: GL_MODULATE,
+        srcRgb: new Int32Array([GL_TEXTURE, GL_PREVIOUS, GL_CONSTANT]),
+        srcAlpha: new Int32Array([GL_TEXTURE, GL_PREVIOUS, GL_CONSTANT]),
+        opRgb: new Int32Array([GL_SRC_COLOR, GL_SRC_COLOR, GL_SRC_ALPHA]),
+        opAlpha: new Int32Array([GL_SRC_ALPHA, GL_SRC_ALPHA, GL_SRC_ALPHA]),
+        rgbScale: 1,
+        alphaScale: 1,
+    };
+}
+
+// ---- Combiner encoding ----
+//
+// The whole per-unit combiner is squeezed into ONE int per channel so a DRAW record
+// stays flat and the merge comparison in commandsEqual keeps working by value. The
+// executor decodes the same two words in WGSL; the two encodings are defined here and
+// mirrored in the shader, so they cannot be edited independently.
+//
+//   bits 0..3   function        (COMBINER_FN_*)
+//   bits 4..5   arg0 source     (COMBINER_SRC_*)
+//   bits 6..7   arg0 operand    (COMBINER_OP_*)
+//   bits 8..9   arg1 source     bits 10..11 arg1 operand
+//   bits 12..13 arg2 source     bits 14..15 arg2 operand
+//   bits 16..17 log2(scale)     (0, 1 or 2 => 1x, 2x, 4x)
+
+export const COMBINER_FN_REPLACE = 0;
+export const COMBINER_FN_MODULATE = 1;
+export const COMBINER_FN_ADD = 2;
+export const COMBINER_FN_ADD_SIGNED = 3;
+export const COMBINER_FN_INTERPOLATE = 4;
+export const COMBINER_FN_SUBTRACT = 5;
+export const COMBINER_FN_DOT3_RGB = 6;
+export const COMBINER_FN_DOT3_RGBA = 7;
+
+export const COMBINER_SRC_TEXTURE = 0;
+export const COMBINER_SRC_CONSTANT = 1;
+export const COMBINER_SRC_PRIMARY = 2;
+export const COMBINER_SRC_PREVIOUS = 3;
+
+export const COMBINER_OP_SRC_COLOR = 0;
+export const COMBINER_OP_ONE_MINUS_SRC_COLOR = 1;
+export const COMBINER_OP_SRC_ALPHA = 2;
+export const COMBINER_OP_ONE_MINUS_SRC_ALPHA = 3;
+
+function combinerFn(glEnum: number): number {
+    switch (glEnum) {
+        case GL_REPLACE: return COMBINER_FN_REPLACE;
+        case GL_ADD: return COMBINER_FN_ADD;
+        case GL_ADD_SIGNED: return COMBINER_FN_ADD_SIGNED;
+        case GL_INTERPOLATE: return COMBINER_FN_INTERPOLATE;
+        case GL_SUBTRACT: return COMBINER_FN_SUBTRACT;
+        case GL_DOT3_RGB: case GL_DOT3_RGB_EXT: return COMBINER_FN_DOT3_RGB;
+        case GL_DOT3_RGBA: case GL_DOT3_RGBA_EXT: return COMBINER_FN_DOT3_RGBA;
+        default: return COMBINER_FN_MODULATE;
+    }
+}
+
+function combinerSrc(glEnum: number): number {
+    switch (glEnum) {
+        case GL_CONSTANT: return COMBINER_SRC_CONSTANT;
+        case GL_PRIMARY_COLOR: return COMBINER_SRC_PRIMARY;
+        case GL_PREVIOUS: return COMBINER_SRC_PREVIOUS;
+        default: return COMBINER_SRC_TEXTURE;
+    }
+}
+
+function combinerOp(glEnum: number): number {
+    switch (glEnum) {
+        case GL_ONE_MINUS_SRC_COLOR: return COMBINER_OP_ONE_MINUS_SRC_COLOR;
+        case GL_SRC_ALPHA: return COMBINER_OP_SRC_ALPHA;
+        case GL_ONE_MINUS_SRC_ALPHA: return COMBINER_OP_ONE_MINUS_SRC_ALPHA;
+        default: return COMBINER_OP_SRC_COLOR;
+    }
+}
+
+function scaleLog2(scale: number): number {
+    if (scale >= 4) return 2;
+    if (scale >= 2) return 1;
+    return 0;
+}
+
+function packCombinerWord(fn: number, src: Int32Array, op: Int32Array, scale: number): number {
+    return (combinerFn(fn)
+        | (combinerSrc(src[0]) << 4) | (combinerOp(op[0]) << 6)
+        | (combinerSrc(src[1]) << 8) | (combinerOp(op[1]) << 10)
+        | (combinerSrc(src[2]) << 12) | (combinerOp(op[2]) << 14)
+        | (scaleLog2(scale) << 16)) | 0;
+}
+
+export function packCombinerRgb(unit: GLTextureUnit): number {
+    return packCombinerWord(unit.combineRgb, unit.srcRgb, unit.opRgb, unit.rgbScale);
+}
+
+export function packCombinerAlpha(unit: GLTextureUnit): number {
+    return packCombinerWord(unit.combineAlpha, unit.srcAlpha, unit.opAlpha, unit.alphaScale);
+}
+
+/** Neutral combiner word for a synthesized draw that does not use GL_COMBINE. Slots
+ *  are never cleared by alloc(), so every DRAW emitter must write them regardless. */
+export const COMBINER_WORD_DEFAULT = (COMBINER_FN_MODULATE
+    | (COMBINER_SRC_TEXTURE << 4) | (COMBINER_OP_SRC_COLOR << 6)
+    | (COMBINER_SRC_PREVIOUS << 8) | (COMBINER_OP_SRC_COLOR << 10)
+    | (COMBINER_SRC_CONSTANT << 12) | (COMBINER_OP_SRC_ALPHA << 14)) | 0;
+
+/**
+ * Write the combiner + env-colour slots of one DRAW record. Units NOT in GL_COMBINE
+ * get the neutral word and a zero constant so two draws that differ only in combiner
+ * state they never consult still merge.
+ */
+export function writeTexEnvSlots(
+    I: Int32Array, F: Float32Array, i: number, f: number,
+    unit0: GLTextureUnit, unit1: GLTextureUnit,
+): void {
+    writeOneTexEnvSlot(I, F, i + CI_COMBINE0_RGB, i + CI_COMBINE0_ALPHA, f + CF_ENV_COLOR0, unit0);
+    writeOneTexEnvSlot(I, F, i + CI_COMBINE1_RGB, i + CI_COMBINE1_ALPHA, f + CF_ENV_COLOR1, unit1);
+}
+
+function writeOneTexEnvSlot(
+    I: Int32Array, F: Float32Array,
+    rgbSlot: number, alphaSlot: number, colorSlot: number, unit: GLTextureUnit,
+): void {
+    if (unit.texEnvMode === GL_COMBINE) {
+        I[rgbSlot] = packCombinerRgb(unit);
+        I[alphaSlot] = packCombinerAlpha(unit);
+        F[colorSlot] = unit.envColor[0];
+        F[colorSlot + 1] = unit.envColor[1];
+        F[colorSlot + 2] = unit.envColor[2];
+        F[colorSlot + 3] = unit.envColor[3];
+    } else {
+        I[rgbSlot] = COMBINER_WORD_DEFAULT;
+        I[alphaSlot] = COMBINER_WORD_DEFAULT;
+        F[colorSlot] = 0;
+        F[colorSlot + 1] = 0;
+        F[colorSlot + 2] = 0;
+        F[colorSlot + 3] = 0;
+    }
 }
 
 // ---- Matrix stack ----
@@ -356,6 +527,26 @@ export interface OpenGLContext {
     textureUnits: GLTextureUnit[];
     textures: Map<number, GLTextureObject>;
     nextTextureId: number;
+    /** 6 user clip plane equations (4 doubles each), as glClipPlane was given them. */
+    clipPlanes: Float64Array;
+
+    // ---- Selection / feedback ----
+    /** GL_RENDER, GL_SELECT or GL_FEEDBACK. Only GL_RENDER rasterizes. */
+    renderMode: number;
+    nameStack: Int32Array;
+    /** Index of the top entry, -1 when the stack is empty. */
+    nameStackTop: number;
+    selectBufferPtr: number;
+    selectBufferSize: number;
+    feedbackBufferPtr: number;
+    feedbackBufferSize: number;
+    feedbackBufferType: number;
+
+    /** GL_PROXY_TEXTURE_2D result of the last proxy glTexImage2D. All zero means the
+     *  request would NOT fit — that is the only way glGetTexLevelParameter can say no. */
+    proxyTextureWidth: number;
+    proxyTextureHeight: number;
+    proxyTextureInternalFormat: number;
 
     // Immediate mode
     immediateMode: boolean;
@@ -589,12 +780,21 @@ export function createOpenGLContext(process: Process): OpenGLContext {
 
         activeTextureUnit: 0,
         clientActiveTextureUnit: 0,
-        textureUnits: [
-            { enabled2d: false, boundTexture: 0, texEnvMode: GL_MODULATE },
-            { enabled2d: false, boundTexture: 0, texEnvMode: GL_MODULATE },
-        ],
+        textureUnits: [createTextureUnit(), createTextureUnit()],
         textures: new Map(),
         nextTextureId: 1,
+        clipPlanes: new Float64Array(24),
+        renderMode: GL_RENDER,
+        nameStack: new Int32Array(NAME_STACK_MAX_DEPTH),
+        nameStackTop: -1,
+        selectBufferPtr: 0,
+        selectBufferSize: 0,
+        feedbackBufferPtr: 0,
+        feedbackBufferSize: 0,
+        feedbackBufferType: 0,
+        proxyTextureWidth: 0,
+        proxyTextureHeight: 0,
+        proxyTextureInternalFormat: 0,
 
         immediateMode: false,
         immediateFlatBuf: new Float32Array(65536 * 15),
