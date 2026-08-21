@@ -191,7 +191,10 @@ export function registerTextureCommands(svc: HarnessService): void {
         if (d8) return emit(d8.rgba, d8.w, d8.h, `d3d8-texture(fmt ${d8.d3dFormat})`);
 
         const dd = ddraw();
-        if (dd?.readSurfaceRGBA && opts.from !== "gpu") {
+        // readSurfaceRGBA takes "gpu" itself and is the only route to a DDraw surface's GPU
+        // copy — excluding it here fell through to the d3d9 path and reported "not found"
+        // for the exact store-vs-GPU question this option exists to answer.
+        if (dd?.readSurfaceRGBA) {
             const r = await dd.readSurfaceRGBA(ptr, opts.from ?? "auto");
             if (!("err" in r)) return emit(r.rgba, r.w, r.h, r.source);
             const d9 = await dumpD3d9(ptr, opts.from);
