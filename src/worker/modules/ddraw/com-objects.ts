@@ -29,8 +29,6 @@ import {
     IID_IDirect3DLight,
     IID_IDirect3DMaterial3,
     IID_IDirect3DVertexBuffer,
-    DDSCAPS_FLIP,
-    DDSCAPS_PRIMARYSURFACE,
     D3DRENDERSTATE_LIGHTING,
     D3DRENDERSTATE_AMBIENT,
     D3DRENDERSTATE_DIFFUSEMATERIALSOURCE,
@@ -481,44 +479,56 @@ export class DirectDrawSurfaceObject extends BaseComObject {
     }
 
     /**
-     * Releasing the primary of a flipping chain also releases attached chain members
-     * (MSDN IDirectDrawSurface::Release). Without this, backbuffers stay at refCount=1
-     * until IDirectDraw cascade forceRelease - wrong teardown order for ref_soft/Q2 VID_restart.
+     * A surface DirectDraw created as part of a complex one — a mip sublevel, a back buffer
+     * of a DDSD_BACKBUFFERCOUNT chain — belongs to the root, not to the app: the app's
+     * Release may take its count to zero, and DirectDraw IGNORES that. It dies with the root
+     * (Wine surface.c ddraw_surface_release_iface: `if (This->is_implicit) ... return;`,
+     * and ddraw_surface_cleanup destroys the complex members regardless of their count).
      *
-     * IMPLICIT members only. A chain the app built itself with AddAttachedSurface holds the
-     * app's own reference plus the attachment reference; the root's destruction drops the
-     * attachment reference (releaseAttachRefs) and nothing else — releasing the app's
-     * reference for it would destroy a surface the app still owns.
+     * NFS Porsche's dx7z walks a mip chain per texture update — GetAttachedSurface, use the
+     * level, Release it — so destroying a level at zero hands the next iteration a freed COM
+     * block, and the block pool then dispatches the guest through whatever reused it.
      */
-    private releaseFlipChainAttached(): void {
-        const caps = this.state.caps >>> 0;
-        if ((caps & DDSCAPS_PRIMARYSURFACE) === 0 || (caps & DDSCAPS_FLIP) === 0) {
-            return;
-        }
+    protected get leakOnZeroRef(): boolean {
+        return this.state.implicitChainMember === true;
+    }
 
+    /** The complex root reaps its members (destroyImplicitMembers) — that is the whole
+     *  point of keeping them past zero, so the root's teardown must be able to. */
+    protected get reapableAtZero(): boolean {
+        return this.state.implicitChainMember === true;
+    }
+
+    /**
+     * Destroy the complex members this surface owns. Both chains DirectDraw builds itself
+     * are followed: the flip ring (attachedSurfaceAddr, circular back to this) and the mip
+     * chain. Implicit members only — a surface the app attached itself holds its own
+     * reference and only loses the attachment one (releaseAttachRefs).
+     */
+    private destroyImplicitMembers(): void {
         const resourceProvider = SystemResourceProvider.getInstance();
-        const myAddr = resourceProvider.getAddressForHandle(this.handle);
-        if (!myAddr) return;
+        const myAddr = (resourceProvider.getAddressForHandle(this.handle) ?? 0) >>> 0;
+        const visited = new Set<number>([myAddr]);
+        const queue: number[] = [this.state.attachedSurfaceAddr >>> 0,
+                                 ...(this.state.attachedSurfaceAddrs ?? [])];
 
-        let currentAddr = this.state.attachedSurfaceAddr >>> 0;
-        const visited = new Set<number>();
-
-        while (currentAddr && currentAddr !== myAddr && !visited.has(currentAddr)) {
-            visited.add(currentAddr);
-            const resolved = resourceProvider.getComObjectByAddress(currentAddr);
-            // A released chain member's COM slot can already hold a device/texture.
-            if (!(resolved instanceof DirectDrawSurfaceObject)) break;
-            const attached = resolved;
-            const nextAddr = attached.getState().attachedSurfaceAddr >>> 0;
-            if (attached.getState().implicitChainMember) attached.release();
-            currentAddr = nextAddr;
+        while (queue.length) {
+            const addr = queue.shift()! >>> 0;
+            if (!addr || visited.has(addr)) continue;
+            visited.add(addr);
+            const resolved = resourceProvider.getComObjectByAddress(addr);
+            // A released member's COM block can already hold a device/texture.
+            if (!(resolved instanceof DirectDrawSurfaceObject)) continue;
+            const state = resolved.getState();
+            if (!state.implicitChainMember) continue;
+            queue.push(state.attachedSurfaceAddr >>> 0, ...(state.attachedSurfaceAddrs ?? []));
+            resolved.forceRelease();
         }
     }
 
     release(): number {
         if (this.refCount === 1) {
             this.releaseAttachRefs();
-            this.releaseFlipChainAttached();
         }
 
         const newRefCount = super.release();
@@ -556,6 +566,8 @@ export class DirectDrawSurfaceObject extends BaseComObject {
     }
 
     protected destroy(): void {
+        this.destroyImplicitMembers();
+
         const depthSurfacePtr =
             this.state.surfacePtrAllocated && this.state.surfacePtr > 0
                 ? (this.state.surfacePtr >>> 0)

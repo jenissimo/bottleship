@@ -28,6 +28,8 @@ export abstract class BaseComObject implements IVTable {
     private _vtableAddress: number; // Address of VTable in memory
     private _ifaceRefs: Map<number, number> | null = null; // interface ptr -> its own refcount
     private _liveIfaces: number = 0;                       // interfaces whose count is > 0
+    private _destroyed: boolean = false;                   // destroy() has run; never run it twice
+    private _zeroRefKeptLogged: boolean = false;
 
     constructor(iid: string, vtableAddress: number) {
         this._iid = iid;
@@ -175,13 +177,18 @@ export abstract class BaseComObject implements IVTable {
     /** Refcount reached zero: either the leak guard keeps the object, or it is destroyed. */
     private onLastReferenceGone(): number {
         if (this.leakOnZeroRef) {
-            // Some objects (D3D devices in Blade of Darkness) are over-released by the guest's
-            // cleanup-on-failure / enumeration churn yet kept in use afterwards. Destroying them
-            // here leaves the guest spinning on a dead pointer (`Object not found`) and later
-            // corrupts SmartHeap. Keep them registered (a bounded, harmless leak) so the guest's
-            // stale pointer keeps resolving. Report 0 to the caller as a real Release would.
+            // Two reasons an object outlives its own zero: it is a complex sublevel whose
+            // lifetime belongs to its root (see DirectDrawSurfaceObject), or it is
+            // over-released by the guest's cleanup-on-failure / enumeration churn yet kept
+            // in use afterwards (D3D devices in Blade of Darkness). Either way, destroying
+            // here leaves the guest dispatching through a dead pointer. Stay registered and
+            // report 0 to the caller as a real Release would; the owner's teardown
+            // (forceRelease) is what actually destroys us.
             this._refCount = 0;
-            Logger.log(LogCategory.COM, `${this.constructor.name} reached 0 refs — kept registered (leak-on-zero-ref guard) handle=0x${this._handle.toString(16)}`);
+            // Routine for a mip chain the guest re-walks every frame, so say it once per object.
+            const line = `${this.constructor.name} reached 0 refs — kept registered (leak-on-zero-ref guard) handle=0x${this._handle.toString(16)}`;
+            if (this._zeroRefKeptLogged) Logger.verbose(LogCategory.COM, line);
+            else { this._zeroRefKeptLogged = true; Logger.log(LogCategory.COM, line); }
             return 0;
         }
 
@@ -206,6 +213,7 @@ export abstract class BaseComObject implements IVTable {
         Logger.log(LogCategory.COM, `Destroying COM object ${this.constructor.name} handle=0x${this._handle.toString(16)}`);
         // Track COM release for cleanup detection
         System.getInstance().trackComRelease();
+        this._destroyed = true;
         this.destroy();
         SystemResourceProvider.getInstance().unregisterComObject(this._handle);
         return 0;
@@ -279,19 +287,30 @@ export abstract class BaseComObject implements IVTable {
     }
 
     /**
+     * Whether an owner's teardown may destroy this object while it sits at zero refs.
+     * Only meaningful for a leakOnZeroRef object: the guard exists either because the
+     * object's lifetime belongs to an owner that will reap it (true), or because the
+     * guest over-releases it and keeps using the pointer, so nothing may reap it (false).
+     */
+    protected get reapableAtZero(): boolean {
+        return false;
+    }
+
+    /**
      * Force-release this COM object regardless of refcount.
-     * Called during shutdown to prevent leaks.
+     * Called during shutdown, and by an owner tearing down what it created.
      */
     forceRelease(): void {
-        if (this._refCount > 0) {
-            Logger.log(LogCategory.COM,
-                `Force-releasing ${this.constructor.name} handle=0x${this._handle.toString(16)} (refCount was ${this._refCount})`);
-            this._refCount = 0;
-            this._ifaceRefs?.clear();
-            this._liveIfaces = 0;
-            this.destroy();
-            SystemResourceProvider.getInstance().unregisterComObject(this._handle);
-        }
+        if (this._destroyed) return;
+        if (this._refCount === 0 && !this.reapableAtZero) return;
+        Logger.log(LogCategory.COM,
+            `Force-releasing ${this.constructor.name} handle=0x${this._handle.toString(16)} (refCount was ${this._refCount})`);
+        this._refCount = 0;
+        this._ifaceRefs?.clear();
+        this._liveIfaces = 0;
+        this._destroyed = true;
+        this.destroy();
+        SystemResourceProvider.getInstance().unregisterComObject(this._handle);
     }
 
     /**
