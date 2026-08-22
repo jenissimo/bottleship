@@ -38,6 +38,7 @@ import { registerResourceCommands } from "./cmds/resources";
 import { registerHeapCommands } from "./cmds/heap";
 import { registerGpuCommands } from "./cmds/gpu";
 import { registerReferenceCommands } from "./cmds/reference";
+import { registerDDrawConformanceCommands } from "./cmds/ddraw-conformance";
 
 let installed = false;
 
@@ -73,6 +74,7 @@ export function installHarnessCommands(): void {
     registerResourceCommands(harnessService);
     registerHeapCommands(harnessService);
     registerReferenceCommands(harnessService);
+    registerDDrawConformanceCommands(harnessService);
 }
 
 // Install on import so a bare `import './harness/commands'` is sufficient.
