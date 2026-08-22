@@ -20,6 +20,7 @@ import { profiler } from "../../core/profiler";
 import { readbackCounters } from "../../modules/ddraw/surface-sync";
 import { readLockDivergenceCounters } from "../../modules/ddraw/lock-flags";
 import { d3d8LockCounters } from "../../modules/d3d8/lock-flags";
+import { d3d9LockCounters, d3d9ReadbackCounters } from "../../modules/d3d9/lock-stats";
 import { prefetchCounters } from "../../modules/ddraw/surface-readback-prefetch";
 import { drawCostProfiler } from "../../backends/webgpu/ddraw/draw-cost-profiler";
 import { lockCostProfiler } from "../../modules/ddraw/lock-cost-profiler";
@@ -696,6 +697,37 @@ export function registerPerfCommands(svc: HarnessService): void {
             invalidCombos: c.invalidCombos,
         };
         if (opts.reset) c.reset();
+        return snapshot;
+    });
+
+    /** d3d9LockStats({reset?}) — the D3D9 LockRect census and what serving a lock cost.
+     *  `publishes` is the CPU→guest memcpy a lock needed because the CPU copy had moved;
+     *  `lockReadbacks` is the GPU round trip a lock of a renderable image needed. They price
+     *  very differently, so a single "locks got slower" number could not tell them apart.
+     *  `downloads: 0` while a game visibly reads its own frame means the readback is not
+     *  wired — a different statement from "nothing asked for one". */
+    svc.register("d3d9LockStats", (args) => {
+        const opts = (args[0] ?? {}) as { reset?: boolean };
+        const c = d3d9LockCounters;
+        const r = d3d9ReadbackCounters;
+        const snapshot = {
+            locks: c.locks,
+            renderSurfaceLocks: c.renderSurfaceLocks,
+            partialRectLocks: c.partialRectLocks,
+            readLocks: c.readLocks,
+            requestedPixels: c.requestedPixels,
+            surfacePixels: c.surfacePixels,
+            requestedFraction: c.surfacePixels > 0 ? c.requestedPixels / c.surfacePixels : null,
+            discardRequested: c.discardRequested,
+            discardStripped: c.discardStripped,
+            invalidCombos: c.invalidCombos,
+            downloads: r.downloads,
+            downloadedPixels: r.downloadedPixels,
+            getRenderTargetData: r.getRenderTargetData,
+            lockReadbacks: r.lockReadbacks,
+            publishes: r.publishes,
+        };
+        if (opts.reset) { c.reset(); r.reset(); }
         return snapshot;
     });
 

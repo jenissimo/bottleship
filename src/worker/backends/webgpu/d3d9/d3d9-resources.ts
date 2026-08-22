@@ -602,6 +602,9 @@ export class TextureStore {
     private pitches: Uint32Array;
     private dirtyFlags: Uint8Array;
     private generations: Uint16Array;
+    // Split-storage coherence: see guestCopyIsStale.
+    private dataSerials: Uint32Array;
+    private guestSerials: Uint32Array;
     // 1 = render-target texture (rendered into, no guest pixel upload). See markRenderTarget.
     private rtFlags: Uint8Array;
     // 1 = cube texture (6 array layers; sampling view is dimension:"cube"). See markCube.
@@ -623,6 +626,8 @@ export class TextureStore {
         this.pitches = new Uint32Array(initialCapacity);
         this.dirtyFlags = new Uint8Array(initialCapacity);
         this.generations = new Uint16Array(initialCapacity);
+        this.dataSerials = new Uint32Array(initialCapacity);
+        this.guestSerials = new Uint32Array(initialCapacity);
         this.rtFlags = new Uint8Array(initialCapacity);
         this.cubeFlags = new Uint8Array(initialCapacity);
     }
@@ -655,6 +660,10 @@ export class TextureStore {
         this.guestPtrs[index] = guestPtr;
         this.pitches[index] = layout.pitch;
         this.dirtyFlags[index] = 1;
+        // Fresh zeroed `data` and a fresh guest allocation: neither holds pixels, and a
+        // recycled index must not inherit the previous texture's agreement.
+        this.dataSerials[index] = 0;
+        this.guestSerials[index] = 0;
         this.rtFlags[index] = 0;
         this.cubeFlags[index] = 0;
 
@@ -747,7 +756,26 @@ export class TextureStore {
         this.gpuTextures[index] = texture;
         this.views[index] = view;
     }
-    setDirty(index: number, dirty: boolean): void { this.dirtyFlags[index] = dirty ? 1 : 0; }
+    /**
+     * `dirty` means "the CPU copy changed and the GPU must be re-uploaded from it", which is
+     * also exactly when the guest buffer stops mirroring `data` — so this is the one
+     * chokepoint that bumps the data generation. Routing every `data` writer through it is
+     * what makes publish-on-lock complete without each writer knowing the mechanism exists.
+     */
+    setDirty(index: number, dirty: boolean): void {
+        this.dirtyFlags[index] = dirty ? 1 : 0;
+        if (dirty) this.noteDataWritten(index);
+    }
+
+    /**
+     * `data[index]` changed, so the guest buffer no longer mirrors it. Separate from
+     * `setDirty` because a GPU readback lands in `data` WITHOUT the texture needing to be
+     * uploaded back to the GPU — raising the upload flag there would push the pixels we just
+     * downloaded straight back up every frame.
+     */
+    noteDataWritten(index: number): void {
+        this.dataSerials[index] = (this.dataSerials[index] + 1) >>> 0;
+    }
 
     /**
      * Device loss. A sampled texture keeps its `data` shadow and is restored by re-raising
@@ -774,28 +802,75 @@ export class TextureStore {
     markCube(index: number): void { this.cubeFlags[index] = 1; }
     isCubeMap(index: number): boolean { return this.cubeFlags[index] !== 0; }
 
-    lock(index: number): { ptr: number; pitch: number } | null {
-        const guestBase = this.guestPtrs[index];
-        if (guestBase < 0) return null;
-        this.lockedPtrs[index] = guestBase;
-        return { ptr: guestBase, pitch: this.pitches[index] };
+    /** Level-0 byte count: block rows for a compressed format, plain rows otherwise. */
+    levelBytes(index: number): number {
+        const rows = getD3DTextureLayout(
+            this.formats[index], this.widths[index], this.heights[index]).rows;
+        return this.pitches[index] * rows;
     }
 
-    unlock(index: number, memory: Uint8Array): void {
+    /**
+     * The generation of `data[index]`, and the generation the guest buffer last mirrored.
+     *
+     * Storage here is SPLIT: `data` is the CPU copy every JS writer (GetRenderTargetData, a
+     * GPU readback, UpdateTexture, a colour fill) lands in, while `guestPtrs` is the separate
+     * HEAP buffer the guest gets a pointer to. Equal generations mean the guest buffer already
+     * holds those bytes, so a Lock costs nothing; a difference is the only thing that makes a
+     * publish necessary — this is DXVK's per-subresource `NeedsReadback` flag under another
+     * name (d3d9_device.cpp:5037).
+     */
+    guestCopyIsStale(index: number): boolean {
+        return this.guestSerials[index] !== this.dataSerials[index];
+    }
+
+    /**
+     * Acquire the lock and, unless the caller says the old contents are not needed, publish
+     * `data` into the guest buffer so the pointer we hand back addresses the current pixels.
+     *
+     * Without this the two halves of the split never meet: a readback populates `data` and
+     * Lock returns a pointer to a buffer nobody wrote.
+     */
+    lock(index: number, memory: Uint8Array, opts: { publish: boolean } = { publish: true })
+        : { ptr: number; pitch: number; published: boolean } | null {
+        const guestBase = this.guestPtrs[index];
+        if (guestBase < 0) return null;
+        let published = false;
+        const data = this.data[index];
+        if (opts.publish && data && this.guestCopyIsStale(index)) {
+            const bytes = Math.min(this.levelBytes(index), data.length);
+            memory.set(data.subarray(0, bytes), guestBase);
+            this.guestSerials[index] = this.dataSerials[index];
+            published = true;
+        }
+        this.lockedPtrs[index] = guestBase;
+        return { ptr: guestBase, pitch: this.pitches[index], published };
+    }
+
+    /**
+     * Release the lock. `readOnly` is the app's promise that it wrote nothing, so the guest
+     * bytes are not copied back — but they are also no longer trusted to match `data` (the app
+     * may have scribbled through the pointer anyway), so the guest copy is marked stale and the
+     * next Lock republishes. DXVK gates its dirty-box accumulation the same way
+     * (d3d9_device.cpp:5157-5173).
+     */
+    unlock(index: number, memory: Uint8Array, opts: { readOnly?: boolean } = {}): void {
         const guestBase = this.guestPtrs[index];
         if (guestBase < 0 || this.lockedPtrs[index] === -1) return;
-        const pitch = this.pitches[index];
-        const height = this.heights[index];
-        // Compressed surfaces hold height/4 block rows, not `height` rows; with the
-        // block-row pitch this avoids copying ~height*3/4 of adjacent guest memory.
-        const rows = getD3DTextureLayout(this.formats[index], this.widths[index], height).rows;
-        const bytes = pitch * rows;
+        this.lockedPtrs[index] = -1;
+        if (opts.readOnly) {
+            this.guestSerials[index] = (this.dataSerials[index] - 1) >>> 0;
+            return;
+        }
         const data = this.data[index];
         if (data) {
+            // Compressed surfaces hold height/4 block rows, not `height` rows; with the
+            // block-row pitch this avoids copying ~height*3/4 of adjacent guest memory.
+            const bytes = this.levelBytes(index);
             data.set(memory.subarray(guestBase, guestBase + bytes));
         }
-        this.lockedPtrs[index] = -1;
-        this.dirtyFlags[index] = 1;
+        this.setDirty(index, true);
+        // The guest buffer IS what `data` was just set from, so it is in sync by construction.
+        this.guestSerials[index] = this.dataSerials[index];
     }
 
     private grow(): void {
@@ -848,6 +923,14 @@ export class TextureStore {
         const newGenerations = new Uint16Array(newCapacity);
         newGenerations.set(this.generations);
         this.generations = newGenerations;
+
+        const newDataSerials = new Uint32Array(newCapacity);
+        newDataSerials.set(this.dataSerials);
+        this.dataSerials = newDataSerials;
+
+        const newGuestSerials = new Uint32Array(newCapacity);
+        newGuestSerials.set(this.guestSerials);
+        this.guestSerials = newGuestSerials;
 
         const newRtFlags = new Uint8Array(newCapacity);
         newRtFlags.set(this.rtFlags);

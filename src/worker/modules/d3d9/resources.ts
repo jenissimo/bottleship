@@ -39,6 +39,14 @@ import {
     normalizePalettizedTexturePool,
 } from '../../backends/webgpu/shared/dx-com-helpers';
 import { isDxExclusiveFormat, isDxRenderableFormat } from '../../backends/webgpu/shared/dx-format-support';
+import {
+    D3DLOCK_DISCARD,
+    decideLockFlags,
+    noteLock,
+    type LockRect,
+} from '../d3d-common/lock-flags';
+import { d3d9LockCounters } from './lock-stats';
+import type { D3D9Device } from '../../backends/webgpu/d3d9/d3d9-device';
 
 const D3DERR_NOTAVAILABLE = 0x8876086a;
 const D3DFMT_A8R8G8B8 = 21;
@@ -86,6 +94,120 @@ function resolveDevicePtr(deviceInstance: unknown): number {
         }
     }
     return 0;
+}
+
+/**
+ * The LockRect prologue, shared by Texture9 and Surface9.
+ *
+ * Our textures have SPLIT storage: a JS-side `data` copy that every GPU readback and
+ * CPU-side writer lands in, and a separate guest HEAP buffer the app gets a pointer to.
+ * The prologue decides which of the two must move before the pointer is handed out, and
+ * starts the GPU round trip when the level is renderable — it is a Promise ONLY then, so
+ * an ordinary texture-upload lock stays a synchronous thunk.
+ */
+interface D3D9LockPlan {
+    /** A surviving D3DLOCK_DISCARD: do not produce the old contents at all. */
+    discard: boolean;
+    /** D3DLOCK_READONLY: UnlockRect must not copy the guest bytes back. */
+    readOnly: boolean;
+    /** The GPU→CPU readback this lock needs, or null when it needs none. */
+    pending: Promise<boolean> | null;
+}
+
+/** Whether the D3DLOCK_* algebra is consulted at all — off restores the pre-change behaviour
+ *  of discarding the flag word. */
+const lockFlagsHonoured = (): boolean =>
+    (globalThis as { __noD3D9LockFlags?: boolean }).__noD3D9LockFlags !== true;
+
+/**
+ * READONLY reaches UnlockRect, which is handed no flags of its own. Keyed by the same
+ * (texture, level) pair the lock is: a surface lock and its parent texture's lock are the
+ * same subresource and must not each remember a different promise.
+ */
+const activeLockReadOnly = new Map<string, boolean>();
+
+const readLockRect = (pRect: number): LockRect | null => {
+    if (!pRect) return null;
+    return {
+        left: Mem.readInt32(pRect) ?? 0,
+        top: Mem.readInt32(pRect + 4) ?? 0,
+        right: Mem.readInt32(pRect + 8) ?? 0,
+        bottom: Mem.readInt32(pRect + 12) ?? 0,
+    };
+};
+
+/** Resolve the flags and start the readback. Null means the combination is illegal. */
+function planTextureLock(
+    device: D3D9Device,
+    texPtr: number,
+    level: number,
+    width: number,
+    height: number,
+    poolDefault: boolean,
+    pRect: number,
+    flags: number,
+): D3D9LockPlan | null {
+    if (!lockFlagsHonoured()) {
+        return { discard: false, readOnly: false, pending: device.textureReadbackForLock(texPtr, level, false) };
+    }
+    const decision = decideLockFlags(flags, readLockRect(pRect), width, height, poolDefault);
+    // A DISCARD honoured at the whole-surface extent when the app named a sub-rect is the
+    // bug this switch reproduces on demand; see the d3d9 conformance scene.
+    const discard = (globalThis as { __d3d9LockDiscardWholeSurface?: boolean })
+        .__d3d9LockDiscardWholeSurface === true
+        ? (flags & D3DLOCK_DISCARD) !== 0
+        : decision.discard;
+    noteLock(
+        d3d9LockCounters,
+        { width, height, splitStorage: device.isRenderTargetTexture(texPtr) },
+        decision,
+        { discard: (flags & D3DLOCK_DISCARD) !== 0, read: !discard, scopable: decision.readOnly },
+    );
+    if (decision.invalid) return null;
+    return {
+        discard,
+        readOnly: decision.readOnly,
+        pending: device.textureReadbackForLock(texPtr, level, discard),
+    };
+}
+
+/** Take the lock the plan decided on and fill the guest's D3DLOCKED_RECT. */
+function completeTextureLock(
+    device: D3D9Device,
+    texPtr: number,
+    level: number,
+    plan: D3D9LockPlan,
+    format: number,
+    width: number,
+    height: number,
+    pRect: number,
+    pLockedRect: number,
+    mem: Uint8Array,
+): number {
+    const D3DERR_INVALIDCALL = 0x8876086c;
+    const lockInfo = device.lockTexture(texPtr, level, plan.discard);
+    if (!lockInfo) return D3DERR_INVALIDCALL;
+    activeLockReadOnly.set(`${texPtr}:${level}`, plan.readOnly);
+
+    let pBits = lockInfo.ptr >>> 0;
+    if (pRect) {
+        const left = Mem.readInt32(pRect) ?? 0;
+        const top = Mem.readInt32(pRect + 4) ?? 0;
+        pBits = (pBits + computeLockRectOffset(format, width, height, lockInfo.pitch, left, top)) >>> 0;
+    }
+    if (!Mem.writeUint32(pLockedRect, lockInfo.pitch >>> 0) || !Mem.writeUint32(pLockedRect + 4, pBits)) {
+        finishTextureUnlock(device, texPtr, level, mem);
+        return D3DERR_INVALIDCALL;
+    }
+    return 0;
+}
+
+/** UnlockRect for both interfaces: consumes the READONLY promise the lock recorded. */
+function finishTextureUnlock(device: D3D9Device, texPtr: number, level: number, mem: Uint8Array): void {
+    const key = `${texPtr}:${level}`;
+    const readOnly = activeLockReadOnly.get(key) === true;
+    activeLockReadOnly.delete(key);
+    device.unlockTexture(texPtr, level, mem, readOnly);
 }
 
 function computeLockRectOffset(format: number, width: number, height: number, pitch: number, left: number, top: number): number {
@@ -674,9 +796,31 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         const pDestSurface = args[2] >>> 0;
 
         const device = devices.get(pDevice);
+        // Either pointer NULL is D3DERR_INVALIDCALL — Wine pins all three combinations
+        // (dlls/d3d9/tests/device.c:12870-12877), and the runtime checks them first
+        // (DXVK d3d9_device.cpp:1143-1144).
+        if (!device || !pRenderTarget || !pDestSurface) return D3DERR_INVALIDCALL;
+        // Copying a surface onto itself is a silent no-op, not an error (DXVK :1146-1147).
+        if (pRenderTarget === pDestSurface) return D3D_OK;
+
         const srcMeta = surfaceMeta.get(pRenderTarget);
         const dstMeta = surfaceMeta.get(pDestSurface);
-        if (!device || !srcMeta?.texturePtr || !dstMeta?.texturePtr) return D3DERR_INVALIDCALL;
+        if (!srcMeta?.texturePtr || !dstMeta?.texturePtr) return D3DERR_INVALIDCALL;
+
+        if ((globalThis as { __noD3D9GetRenderTargetDataChecks?: boolean })
+            .__noD3D9GetRenderTargetDataChecks !== true) {
+            // A multisampled source cannot be copied out this way — Wine returns
+            // D3DERR_INVALIDCALL (dlls/d3d9/device.c:1956) and asserts it
+            // (dlls/d3d9/tests/visual.c:17149-17150).
+            if (srcMeta.multiSampleType !== D3DMULTISAMPLE_NONE) return D3DERR_INVALIDCALL;
+            // Exact format and exact extent (DXVK :1152-1156). Answering D3D_OK for a
+            // mismatch and then converting is a false capability: the app reads a buffer
+            // laid out differently from the one it asked for and cannot tell.
+            if (srcMeta.format !== dstMeta.format) return D3DERR_INVALIDCALL;
+            if (srcMeta.width !== dstMeta.width || srcMeta.height !== dstMeta.height) {
+                return D3DERR_INVALIDCALL;
+            }
+        }
 
         return device.readTextureIntoGuestTexture(srcMeta.texturePtr, dstMeta.texturePtr);
     };
@@ -790,34 +934,19 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
 
         Logger.verbose(LogCategory.D3D9, `Texture::LockRect(Level=${Level})`);
 
-        const lockInfo = device.lockTexture(pTexture, Level);
-        if (!lockInfo) {
-            Logger.error(LogCategory.D3D9, `Texture::LockRect failed for 0x${pTexture.toString(16)}`);
-            return D3DERR_INVALIDCALL;
-        }
+        const meta = textureMeta.get(pTexture);
+        const dims = meta ? getTextureLevelDims(meta.width, meta.height, Level) : { width: 1, height: 1 };
+        const format = meta?.format ?? D3DFMT_A8R8G8B8;
+        const plan = planTextureLock(
+            device, pTexture, Level, dims.width, dims.height,
+            (meta?.pool ?? D3DPOOL_DEFAULT) === D3DPOOL_DEFAULT, pRect, Flags);
+        if (!plan) return D3DERR_INVALIDCALL;
 
-        let pBits = lockInfo.ptr >>> 0;
-        if (pRect) {
-            const meta = textureMeta.get(pTexture);
-            const dims = meta
-                ? getTextureLevelDims(meta.width, meta.height, Level)
-                : { width: 1, height: 1 };
-            const format = meta?.format ?? D3DFMT_A8R8G8B8;
-            const left = Mem.readInt32(pRect) ?? 0;
-            const top = Mem.readInt32(pRect + 4) ?? 0;
-            pBits = (pBits + computeLockRectOffset(format, dims.width, dims.height, lockInfo.pitch, left, top)) >>> 0;
-        }
-
-        // Fill D3DLOCKED_RECT structure
-        const wrotePitch = Mem.writeUint32(pLockedRect, lockInfo.pitch);
-        const wroteBits = Mem.writeUint32(pLockedRect + 4, pBits);
-        if (!wrotePitch || !wroteBits) {
-            Logger.error(LogCategory.D3D9, `Texture::LockRect: failed to write D3DLOCKED_RECT @0x${pLockedRect.toString(16)}`);
-            device.unlockTexture(pTexture, Level, mem);
-            return D3DERR_INVALIDCALL;
-        }
-
-        return D3D_OK;
+        const finish = (): number => completeTextureLock(
+            device, pTexture, Level, plan, format, dims.width, dims.height, pRect, pLockedRect, mem);
+        // Async ONLY when a GPU round trip is genuinely pending; see planTextureLock.
+        const pending: Promise<number> | null = plan.pending ? plan.pending.then(finish) : null;
+        return pending ?? finish();
     };
 
     exports['IDirect3DTexture9_UnlockRect'] = (ctx, mem, args) => {
@@ -831,7 +960,7 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         }
 
         Logger.verbose(LogCategory.D3D9, `Texture::UnlockRect(Level=${Level})`);
-        device.unlockTexture(pTexture, Level, mem);
+        finishTextureUnlock(device, pTexture, Level, mem);
         return D3D_OK;
     };
 
@@ -1082,7 +1211,7 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         const pSurface = args[0];
         const pLockedRect = args[1];
         const pRect = args[2];
-        const _flags = args[3];
+        const flags = args[3] >>> 0;
 
         const meta = surfaceMeta.get(pSurface);
         const device = resourceToDevice.get(pSurface);
@@ -1091,26 +1220,17 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         }
 
         const level = meta.level ?? 0;
-        const lockInfo = device.lockTexture(meta.texturePtr, level);
-        if (!lockInfo) {
-            return D3DERR_INVALIDCALL;
-        }
+        const texPtr = meta.texturePtr;
+        const plan = planTextureLock(
+            device, texPtr, level, meta.width, meta.height,
+            meta.pool === D3DPOOL_DEFAULT, pRect, flags);
+        if (!plan) return D3DERR_INVALIDCALL;
 
-        let pBits = lockInfo.ptr >>> 0;
-        if (pRect) {
-            const left = Mem.readInt32(pRect) ?? 0;
-            const top = Mem.readInt32(pRect + 4) ?? 0;
-            pBits = (pBits + computeLockRectOffset(meta.format, meta.width, meta.height, lockInfo.pitch, left, top)) >>> 0;
-        }
-
-        const wrotePitch = Mem.writeUint32(pLockedRect + 0, lockInfo.pitch >>> 0);
-        const wroteBits = Mem.writeUint32(pLockedRect + 4, pBits);
-        if (!wrotePitch || !wroteBits) {
-            device.unlockTexture(meta.texturePtr, level, mem);
-            return D3DERR_INVALIDCALL;
-        }
-
-        return D3D_OK;
+        const finish = (): number => completeTextureLock(
+            device, texPtr, level, plan, meta.format, meta.width, meta.height, pRect, pLockedRect, mem);
+        // Async ONLY when a GPU round trip is genuinely pending; see planTextureLock.
+        const pending: Promise<number> | null = plan.pending ? plan.pending.then(finish) : null;
+        return pending ?? finish();
     };
 
     exports['IDirect3DSurface9_UnlockRect'] = (_ctx, mem, args) => {
@@ -1122,8 +1242,7 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
             return D3DERR_INVALIDCALL;
         }
 
-        const level = meta.level ?? 0;
-        device.unlockTexture(meta.texturePtr, level, mem);
+        finishTextureUnlock(device, meta.texturePtr, meta.level ?? 0, mem);
         return D3D_OK;
     };
 

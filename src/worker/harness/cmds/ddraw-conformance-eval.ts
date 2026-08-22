@@ -9,6 +9,8 @@
  * that the assertion works. See `tools/tests/ddraw-conformance-scene.test.ts`.
  */
 
+import { groupVerdict, type GroupVerdict } from "./conformance-verdict";
+
 export interface PixelFormat { bpp: number; rMask: number; gMask: number; bMask: number; aMask: number }
 
 export interface ConformanceCheck {
@@ -72,19 +74,8 @@ export function mutationVerdict(
     baseline: ConformanceCheck[],
     mutated: ConformanceCheck[],
     mutation: Mutation,
-): { caught: string[]; blind: string[]; unprovable: string[] } {
-    const caught: string[] = [];
-    const blind: string[] = [];
-    const unprovable: string[] = [];
-    for (const g of MUTATIONS[mutation].groups) {
-        const before = baseline.filter((c) => c.name.startsWith(g));
-        const passedBefore = before.filter((c) => c.pass);
-        if (passedBefore.length === 0) { unprovable.push(g); continue; }
-        const brokeOne = passedBefore.some(
-            (b) => mutated.some((m) => m.name === b.name && !m.pass));
-        (brokeOne ? caught : blind).push(g);
-    }
-    return { caught, blind, unprovable };
+): GroupVerdict {
+    return groupVerdict(MUTATIONS[mutation].groups, baseline, mutated);
 }
 
 /** The groups a mutation was supposed to break and did not, judged against the clean run. */

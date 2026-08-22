@@ -36,6 +36,7 @@ import {
     d3d9PerfFfpUnimplemented, d3d9PerfFfpOp, d3d9PerfMaterialSet,
 } from "../../../modules/d3d9/d3d9-perf";
 import { addComRef, releaseComRef } from "../../../modules/d3d9/com-refs";
+import { d3d9ReadbackCounters } from "../../../modules/d3d9/lock-stats";
 import { isValidAddress } from "../../../core/memory/address-guard";
 import { Mem } from "../../../core/memory/mem-accessor";
 import { fullTargetViewport, sanitizeViewport } from "../ddraw/types";
@@ -2110,34 +2111,44 @@ export class D3D9Device {
         return 0;
     }
 
-    /** GetRenderTargetData: read the src texture's GPU pixels back into the dst
-     *  texture's CPU/guest store, converted to the dst's D3D format layout.
-     *  Resolves 0 (D3D_OK) or D3DERR_INVALIDCALL. */
-    async readTextureIntoGuestTexture(srcTexPtr: number, dstTexPtr: number): Promise<number> {
-        const D3DERR_INVALIDCALL = 0x8876086c;
-        const srcIdx = this.textures.getIndex(srcTexPtr);
-        const dstIdx = this.textures.getIndex(dstTexPtr);
-        if (srcIdx === null || dstIdx === null) return D3DERR_INVALIDCALL;
+    /**
+     * Copy one level-0 GPU image into a CPU (`data`) store, converted to the destination's D3D
+     * format layout. The one downloader behind both GetRenderTargetData and the read-lock of a
+     * render target, so those two cannot disagree about channel order.
+     *
+     * Channel order comes from the GPU texture's OWN format, not from an assumption: a render
+     * target is created in the swap chain's format (typically bgra8unorm) while a sampled
+     * texture is rgba8unorm, and reading one as the other is right bytes in wrong lanes — a
+     * colour that is exactly wrong rather than obviously broken.
+     */
+    private async downloadGpuTextureIntoData(srcIdx: number, dstIdx: number): Promise<boolean> {
         const gpuTex = this.textures.getGpuTexture(srcIdx);
         const device = this.backend.getDevice();
         const queue = this.backend.getQueue();
-        if (!gpuTex || !device || !queue) return D3DERR_INVALIDCALL;
+        if (!gpuTex || !device || !queue) return false;
 
         const width = Math.min(this.textures.getWidth(srcIdx), this.textures.getWidth(dstIdx));
         const height = Math.min(this.textures.getHeight(srcIdx), this.textures.getHeight(dstIdx));
-        if (width <= 0 || height <= 0) return D3DERR_INVALIDCALL;
+        if (width <= 0 || height <= 0) return false;
 
         // 21/22 = [A|X]R8G8B8, 23 = R5G6B5, 24 = X1R5G5B5.
         const dstFormat = this.textures.getFormat(dstIdx);
         const dstIs32 = dstFormat === 21 || dstFormat === 22;
-        if (!dstIs32 && dstFormat !== 23 && dstFormat !== 24) return D3DERR_INVALIDCALL;
+        if (!dstIs32 && dstFormat !== 23 && dstFormat !== 24) {
+            Logger.warn(LogCategory.D3D9,
+                `texture readback: no conversion for D3D format ${dstFormat} — refusing rather ` +
+                `than leaving the guest to read pixels nobody wrote`);
+            return false;
+        }
+        // Which mapped byte holds red. bgra8unorm stores B,G,R,A; rgba8unorm stores R,G,B,A.
+        const bgra = gpuTex.format.startsWith("bgra");
+        const rOff = bgra ? 2 : 0, bOff = bgra ? 0 : 2;
 
         // Flush pending recorded draws so the readback sees this frame's rendering
         // (no-op when the recorder is empty).
         this.submitFrame(false);
 
-        const unpadded = width * 4;
-        const padded = Math.ceil(unpadded / 256) * 256;
+        const padded = Math.ceil(width * 4 / 256) * 256;
         const readback = device.createBuffer({
             size: padded * height,
             usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
@@ -2154,31 +2165,31 @@ export class D3D9Device {
             const mapped = new Uint8Array(readback.getMappedRange());
 
             const dstData = this.textures.getData(dstIdx);
-            if (!dstData) return D3DERR_INVALIDCALL;
+            if (!dstData) return false;
             const dstPitch = this.textures.getPitch(dstIdx);
             if (dstIs32) {
-                // rgba8 → D3D 32-bit [A|X]RGB byte order (B,G,R,A little-endian).
+                // D3D 32-bit [A|X]RGB is B,G,R,A little-endian.
                 for (let y = 0; y < height; y++) {
                     const srcRow = y * padded;
                     const dstRow = y * dstPitch;
                     for (let x = 0; x < width; x++) {
                         const s = srcRow + x * 4;
                         const d = dstRow + x * 4;
-                        dstData[d] = mapped[s + 2];
+                        dstData[d] = mapped[s + bOff];
                         dstData[d + 1] = mapped[s + 1];
-                        dstData[d + 2] = mapped[s];
+                        dstData[d + 2] = mapped[s + rOff];
                         dstData[d + 3] = mapped[s + 3];
                     }
                 }
             } else {
-                // rgba8 → R5G6B5 / X1R5G5B5, little-endian 16-bit.
+                // → R5G6B5 / X1R5G5B5, little-endian 16-bit.
                 const is565 = dstFormat === 23;
                 for (let y = 0; y < height; y++) {
                     const srcRow = y * padded;
                     const dstRow = y * dstPitch;
                     for (let x = 0; x < width; x++) {
                         const s = srcRow + x * 4;
-                        const r = mapped[s], g = mapped[s + 1], b = mapped[s + 2];
+                        const r = mapped[s + rOff], g = mapped[s + 1], b = mapped[s + bOff];
                         const packed = is565
                             ? ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
                             : ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
@@ -2189,10 +2200,55 @@ export class D3D9Device {
                 }
             }
             readback.unmap();
-            return 0;
+            // The CPU copy moved, so the guest buffer no longer mirrors it and the next Lock
+            // republishes. NOT setDirty: these pixels came FROM the GPU and must not be
+            // uploaded straight back to it.
+            this.textures.noteDataWritten(dstIdx);
+            d3d9ReadbackCounters.downloads++;
+            d3d9ReadbackCounters.downloadedPixels += width * height;
+            return true;
         } finally {
             readback.destroy();
         }
+    }
+
+    /** GetRenderTargetData: read the src texture's GPU pixels back into the dst texture's
+     *  CPU store. Resolves 0 (D3D_OK) or D3DERR_INVALIDCALL. */
+    async readTextureIntoGuestTexture(srcTexPtr: number, dstTexPtr: number): Promise<number> {
+        const D3DERR_INVALIDCALL = 0x8876086c;
+        const srcIdx = this.textures.getIndex(srcTexPtr);
+        const dstIdx = this.textures.getIndex(dstTexPtr);
+        if (srcIdx === null || dstIdx === null) return D3DERR_INVALIDCALL;
+        d3d9ReadbackCounters.getRenderTargetData++;
+        return (await this.downloadGpuTextureIntoData(srcIdx, dstIdx)) ? 0 : D3DERR_INVALIDCALL;
+    }
+
+    /**
+     * The GPU→CPU round trip a Lock of this level needs, or null when it needs none.
+     *
+     * DXVK reads a renderable image back on EVERY Map because the GPU is the only place its
+     * current contents exist (d3d9_device.cpp:5036-5041: `needsReadback = NeedsReadback() ||
+     * renderable`, then `&= GetImage() != nullptr || !DISCARD`). Everything else is served from
+     * the CPU copy we already hold. Returning null rather than a resolved promise is
+     * load-bearing: it keeps the ordinary upload lock a SYNCHRONOUS thunk, so the path every
+     * texture upload takes pays nothing for this.
+     */
+    textureReadbackForLock(texPtr: number, level: number, discard: boolean): Promise<boolean> | null {
+        if ((globalThis as { __noD3D9LockReadback?: boolean }).__noD3D9LockReadback === true) return null;
+        // Only level 0 is GPU-backed here; deeper mips live in the side buffer.
+        if (level !== 0 || discard) return null;
+        const index = this.textures.getIndex(texPtr);
+        if (index === null) return null;
+        if (!this.textures.isRenderTarget(index) || !this.textures.getGpuTexture(index)) return null;
+        d3d9ReadbackCounters.lockReadbacks++;
+        return this.downloadGpuTextureIntoData(index, index);
+    }
+
+    /** Whether this texture's pixels are authored by the GPU — the `renderable` term of
+     *  DXVK's readback rule, and what makes a lock's storage genuinely split. */
+    isRenderTargetTexture(texPtr: number): boolean {
+        const index = this.textures.getIndex(texPtr);
+        return index !== null && this.textures.isRenderTarget(index);
     }
 
     /** Level-0 texture lock whose staging bytes contain `addr` (see TextureStore). */
@@ -2200,7 +2256,13 @@ export class D3D9Device {
         return this.textures.findLockedByPointer(addr);
     }
 
-    lockTexture(texPtr: number, level: number): { ptr: number; pitch: number } | null {
+    /**
+     * `discard` is a surviving D3DLOCK_DISCARD: the app has promised it will overwrite the
+     * whole resource, so the current contents need not be produced in the buffer we hand back.
+     * Absent it, the level's CPU copy is PUBLISHED into the guest buffer — without that the two
+     * halves of our split storage never meet and the pointer addresses bytes nobody wrote.
+     */
+    lockTexture(texPtr: number, level: number, discard = false): { ptr: number; pitch: number } | null {
         const index = this.textures.getIndex(texPtr);
         if (index === null) return null;
 
@@ -2212,7 +2274,11 @@ export class D3D9Device {
                     return { ptr, pitch: this.textures.getPitch(index) };
                 }
             }
-            return this.textures.lock(index);
+            const publish = !discard
+                && (globalThis as { __noD3D9LockReadback?: boolean }).__noD3D9LockReadback !== true;
+            const held = this.textures.lock(index, this.memory, { publish });
+            if (held?.published) d3d9ReadbackCounters.publishes++;
+            return held;
         }
 
         // Compatibility path for mip levels > 0: provide a writable temp buffer and
@@ -2335,7 +2401,8 @@ export class D3D9Device {
         }
     }
 
-    unlockTexture(texPtr: number, level: number, memory: Uint8Array): number {
+    /** `readOnly` is the app's D3DLOCK_READONLY promise — the guest bytes are not copied back. */
+    unlockTexture(texPtr: number, level: number, memory: Uint8Array, readOnly = false): number {
         const index = this.textures.getIndex(texPtr);
         if (index === null) return 0;
 
@@ -2358,7 +2425,7 @@ export class D3D9Device {
             return 0;
         }
 
-        this.textures.unlock(index, memory);
+        this.textures.unlock(index, memory, { readOnly });
         return 0;
     }
 
