@@ -306,6 +306,14 @@ export class HarnessChain {
      *  Off by default and zero-cost while off; measurement itself costs ~0.1-0.2ms/frame.
      *  Flow: drawCost({enable:true, reset:true}) -> play/tickFrames -> drawCost(). */
     drawCost(opts?: { enable?: boolean; reset?: boolean }): this { return this.push("drawCost", [opts]); }
+    /** Per-Lock/Unlock CPU breakdown inside the ddraw surface path (setup / gdi / decide /
+     *  scratch / readback / convert / validate / desc / lease / snap + the Unlock phases) —
+     *  the phase attribution behind a fat IDirectDrawSurface7_Lock thunk. Rows are split by
+     *  lock class (write / read / other) so a WRITEONLY and a READONLY lock are never
+     *  averaged together, and every phase reports its own `calls` so a never-wired phase is
+     *  distinguishable from a free one. Off by default and zero-cost while off.
+     *  Flow: lockCost({enable:true, reset:true}) -> play/tickFrames -> lockCost(). */
+    lockCost(opts?: { enable?: boolean; reset?: boolean }): this { return this.push("lockCost", [opts]); }
     /** Named-bucket sub-phase timings (avg/total/max/count). filter by substring; maxMs = worst single call. */
     profilerStats(opts?: { filter?: string; top?: number; sort?: "max" | "total" | "avg" }): this { return this.push("profilerStats", [opts]); }
     /** Where the GUEST burns CPU: symbolized EIP/page histogram over a sampling window.
@@ -319,6 +327,10 @@ export class HarnessChain {
      *  redundant (must be 0). {reset:true} zeroes after reading, so bracketing a
      *  tickFrames(N) gives round trips per frame. */
     readbackStats(opts?: { reset?: boolean }): this { return this.push("readbackStats", [opts]); }
+    /** How stale would a READONLY Lock be if served without the round trip? Arm with
+     *  setWorkerFlag('__noReadLockReadback', true); `framesDiverged` only means something
+     *  once `readbacksCompared` > 0. */
+    readLockDivergence(opts?: { reset?: boolean }): this { return this.push("readLockDivergence", [opts]); }
 
     // ── time ──
     time(action: "freeze" | "advance" | "realtime", ms?: number): this { return this.push("time", [action, ms]); }

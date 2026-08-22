@@ -38,7 +38,8 @@ import {
     needsRenderTargetUploadBeforeDraw,
     logSurfaceState,
 } from "../../../modules/ddraw/surface-sync";
-import { pumpReadbackPrefetch } from "../../../modules/ddraw/surface-readback-prefetch";
+import { pumpReadbackPrefetch, prefetchAfterFlip } from "../../../modules/ddraw/surface-readback-prefetch";
+import type { LockRect } from "../../../modules/ddraw/lock-flags";
 // Side-effect import: registers the surface-side device-loss observer. Loaded here because
 // every ddraw AND d3d8 path goes through this executor, so no consumer can miss it.
 import "../../../modules/ddraw/surface-device-loss";
@@ -811,6 +812,17 @@ export class DDrawWebGPUExecutor {
         return this.renderStats;
     }
 
+    /** Upload the vertex converter's staged params. Every submit path that can carry a GPU
+     *  vertex conversion must call this BEFORE queue.submit() — see VertexConverter. */
+    flushVertexParams(): void {
+        this.vertexConverter.flushParams();
+    }
+
+    /** Vertex scratch-pool counters (see VertexConverter.getScratchStats). */
+    getVertexScratchStats(): ReturnType<VertexConverter["getScratchStats"]> {
+        return this.vertexConverter.getScratchStats();
+    }
+
     /** Per-frame delta ring over renderStats + ring-buffer high-water offsets, sampled
      *  at the endFrame chokepoint BEFORE ring rotation. Answers "did the engine emit
      *  fewer draws this frame, or did we drop them (and was any ring near capacity)"
@@ -818,6 +830,7 @@ export class DDrawWebGPUExecutor {
     private frameStatsRing: Array<Record<string, number>> = [];
     private frameStatsPrev: typeof this.renderStats | null = null;
     private frameStatsPrevLightsOvf = 0;
+    private frameStatsPrevVc = { conversions: 0, gpuObjects: 0, perDraw: 0 };
     private frameStatsSerial = 0;
     private static readonly FRAME_STATS_CAPACITY = 1024;
 
@@ -830,6 +843,10 @@ export class DDrawWebGPUExecutor {
         const s = this.renderStats;
         const p = this.frameStatsPrev;
         const usage = this.ringBufferManager.getFrameUsage();
+        // vcConv is the denominator for vcAlloc: "no GPU objects created this frame" only
+        // means the vertex scratch pool held if conversions actually ran. vcPerDraw > 0 with
+        // the pool enabled means it fell back, not that it was switched off.
+        const vc = this.vertexConverter.getScratchStats();
         this.frameStatsRing.push({
             n: ++this.frameStatsSerial,
             t: Math.round(performance.now()),
@@ -845,10 +862,18 @@ export class DDrawWebGPUExecutor {
             passes: s.passes - (p?.passes ?? 0),
             nanVerts: s.nanVerts - (p?.nanVerts ?? 0),
             lightsOvf: usage.lightsOverflow - this.frameStatsPrevLightsOvf,
+            vcConv: vc.conversions - this.frameStatsPrevVc.conversions,
+            vcAlloc: vc.gpuObjects - this.frameStatsPrevVc.gpuObjects,
+            vcPerDraw: vc.perDraw - this.frameStatsPrevVc.perDraw,
             vHW: usage.v, iHW: usage.i, uHW: usage.u, lHW: usage.l, sHW: usage.s,
         });
         this.frameStatsPrev = { ...s };
         this.frameStatsPrevLightsOvf = usage.lightsOverflow;
+        this.frameStatsPrevVc = {
+            conversions: vc.conversions,
+            gpuObjects: vc.gpuObjects,
+            perDraw: vc.perDraw,
+        };
         const over = this.frameStatsRing.length - DDrawWebGPUExecutor.FRAME_STATS_CAPACITY;
         if (over > 0) this.frameStatsRing.splice(0, over);
     }
@@ -1703,7 +1728,10 @@ export class DDrawWebGPUExecutor {
         }
     }
 
-    async syncSurfaceToMemory(state: DirectDrawSurfaceState): Promise<void> {
+    /** `box` scopes the download to the rect a Lock exposed; omit it for the whole
+     *  surface. A boxed download deliberately does NOT record cpuSyncedVersion, so
+     *  needsCPUSync keeps asking — that is the memo staying honest, not a failure. */
+    async syncSurfaceToMemory(state: DirectDrawSurfaceState, box?: LockRect | null): Promise<void> {
         // A speculative prefetch or direct map may complete after a newer GPU write.
         // syncToCPU rejects that version at its commit point; retry version races
         // so a guest Lock never resumes with bytes from the superseded frame.
@@ -1712,7 +1740,7 @@ export class DDrawWebGPUExecutor {
             this.ensureSurfaceGPUResources(state);
             const attemptedVersion = isRenderSurface(state) ? state.version : -1;
             const synced = await surfaceSyncManager.syncToCPU(
-                state, this.device, this.queue, this.textureConverter
+                state, this.device, this.queue, this.textureConverter, { box }
             );
             if (synced || !surfaceSyncManager.needsCPUSync(state).needed) return;
             // False can also mean an invalid pointer, active write lease, or a GPU
@@ -3340,6 +3368,7 @@ export class DDrawWebGPUExecutor {
         if (this.deviceLost) return;
         this.renderStats.flushes++;
         this.flushBatch();
+        this.vertexConverter.flushParams();
         this.ringBufferManager.flushUniforms();
         this.ringBufferManager.flushLights();
         this.ringBufferManager.flushStorageBuffer();
@@ -3452,6 +3481,7 @@ export class DDrawWebGPUExecutor {
      */
     finalizePendingDraws(): GPUCommandEncoder | null {
         this.flushBatch();
+        this.vertexConverter.flushParams();
         this.ringBufferManager.flushUniforms();
         this.ringBufferManager.flushLights();
         this.ringBufferManager.flushStorageBuffer();
@@ -3536,6 +3566,19 @@ export class DDrawWebGPUExecutor {
             this.frameDrawIndex = 0;
         }
         return this.frameDrawIndex++ > this.debugFlags.drawScrubMax;
+    }
+
+    /**
+     * Start the post-Flip readback prefetch for the chain members that just rotated.
+     * Public because the FLIP handler owns the moment: the rotation has settled, and the
+     * frame-pacer wait that follows is dead time the copy can hide in.
+     */
+    prefetchRotatedForReadback(states: readonly DirectDrawSurfaceState[]): void {
+        prefetchAfterFlip(states, (state) =>
+            surfaceSyncManager.syncToCPU(state, this.device, this.queue, this.textureConverter, {
+                fromPrefetch: true,
+            })
+        );
     }
 
     endFrame(): void {

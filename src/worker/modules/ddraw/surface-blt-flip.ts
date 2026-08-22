@@ -7,6 +7,7 @@ import { System } from "../../core/system";
 import { profiler } from "../../core/profiler";
 import { frameProfiler } from "../../core/frame-profiler";
 import { framePacer, PRESENT_INTERVAL_ONE } from "../../core/frame-pacer";
+import { lockCostProfiler } from "./lock-cost-profiler";
 import { DDrawContext } from "./context";
 import {
     DD_OK,
@@ -391,6 +392,9 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
         const thisPtr = args[0];
         const lpDDSurfaceTargetOverride = args[1];
         const presentInterval = flipPresentInterval(args[2] >>> 0);
+        // The frame denominator for lockCost. A Blt-presenting title never flips, and its
+        // report then says `flips: 0` / `locksPerFrame: null` rather than inventing one.
+        lockCostProfiler.countFlip();
         profiler.start('Flip:lookup');
         const obj = surfaceAt(context.resourceProvider, thisPtr);
         if (!obj) return E_FAIL;
@@ -524,6 +528,11 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
             profiler.start('Flip:flush');
             if (context.executor) context.executor.flush();
             profiler.end('Flip:flush');
+
+            // The rotation has settled and the pacer wait below is dead time: start the
+            // GPU→CPU copy for the chain members the guest read-Locks now, so the Lock
+            // that follows finds the pixels already in guest memory.
+            context.executor?.prefetchRotatedForReadback(rotateSpan);
 
             // Frame capture: finalize captured draw calls for this frame
             frameCaptureOnFrameEnd();

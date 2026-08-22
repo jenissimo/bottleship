@@ -11,6 +11,7 @@ import { System } from "../../core/system";
 import { isValidAddress, overlapsThunkCode } from "../../core/memory/address-guard";
 import { toPlainGuestMemory } from "../../core/memory/guest-memory";
 import { DDPF_FOURCC } from "./constants";
+import { lockCostProfiler, LP } from "./lock-cost-profiler";
 import type { DirectDrawSurfaceState } from "./com-objects";
 
 // ============================================================================
@@ -818,6 +819,55 @@ function convertXRGB8888ToRGBA(
 // ============================================================================
 
 /**
+ * The read leg (surface→RGBA) has always swizzled whole words; the write leg below stores
+ * 2–4 separate bytes per pixel, which on a full-screen GPU→CPU sync is the dominant cost of
+ * a Lock. These helpers give the write leg the same word-wide treatment: one typed view over
+ * the whole destination span (not per row — that would allocate per row), used only when the
+ * caller has already validated the extent and the guest pitch keeps every row aligned.
+ *
+ * `setWorkerFlag('__noFastPixelStore', true)` forces the byte loops back for an A/B.
+ */
+function fastPixelStoreEnabled(): boolean {
+    return !(globalThis as { __noFastPixelStore?: boolean }).__noFastPixelStore;
+}
+
+/** Whole-span destination view, or null when alignment/bounds rule it out. */
+function alignedDstView(
+    dst: Uint8Array, dstOffset: number, dstPitch: number,
+    width: number, height: number, bytesPerPixel: 2): Uint16Array | null;
+function alignedDstView(
+    dst: Uint8Array, dstOffset: number, dstPitch: number,
+    width: number, height: number, bytesPerPixel: 4): Uint32Array | null;
+function alignedDstView(
+    dst: Uint8Array,
+    dstOffset: number,
+    dstPitch: number,
+    width: number,
+    height: number,
+    bytesPerPixel: 2 | 4
+): Uint16Array | Uint32Array | null {
+    const byteStart = dst.byteOffset + dstOffset;
+    const mask = bytesPerPixel - 1;
+    if ((byteStart & mask) !== 0 || (dstPitch & mask) !== 0) return null;
+    const span = (height - 1) * dstPitch + width * bytesPerPixel;
+    if (span <= 0 || dstOffset < 0 || dstOffset + span > dst.length) return null;
+    const elements = span / bytesPerPixel;
+    return bytesPerPixel === 2
+        ? new Uint16Array(dst.buffer, byteStart, elements)
+        : new Uint32Array(dst.buffer, byteStart, elements);
+}
+
+/** RGBA source as words, or null when it is not 4-aligned. */
+function rgbaAsWords(rgbaData: Uint8ClampedArray): Uint32Array | null {
+    if (rgbaData.byteOffset % 4 !== 0 || rgbaData.length % 4 !== 0) return null;
+    try {
+        return new Uint32Array(rgbaData.buffer, rgbaData.byteOffset, rgbaData.length / 4);
+    } catch {
+        return null;
+    }
+}
+
+/**
  * Convert RGBA8888 (from GDI canvas) to RGB565 surface
  */
 export function convertRGBAToRGB565(
@@ -830,16 +880,26 @@ export function convertRGBAToRGB565(
     skipBoundsCheck: boolean = false
 ): void {
     const relativeDstOffset = dstOffset;
-    const canUseUint32 = rgbaData.byteOffset % 4 === 0 && rgbaData.length % 4 === 0;
-    let rgba32: Uint32Array | null = null;
-    
-    if (canUseUint32) {
-        try {
-            rgba32 = new Uint32Array(rgbaData.buffer, rgbaData.byteOffset, rgbaData.length / 4);
-        } catch (e) {
-            rgba32 = null;
+    const rgba32: Uint32Array | null = rgbaAsWords(rgbaData);
+
+    if (skipBoundsCheck && rgba32 && fastPixelStoreEnabled()) {
+        const d16 = alignedDstView(dst, relativeDstOffset, dstPitch, width, height, 2);
+        if (d16) {
+            // Source word is 0xAABBGGRR; pack R5 G6 B5 straight out of it.
+            const pitch16 = dstPitch >> 1;
+            for (let y = 0; y < height; y++) {
+                const dstRow = y * pitch16;
+                const srcRow = y * width;
+                for (let x = 0; x < width; x++) {
+                    const p = rgba32[srcRow + x];
+                    d16[dstRow + x] =
+                        ((p & 0xF8) << 8) | ((p & 0xFC00) >> 5) | ((p & 0xF80000) >> 19);
+                }
+            }
+            return;
         }
     }
+
     if (skipBoundsCheck) {
         for (let y = 0; y < height; y++) {
             let dstIdx = relativeDstOffset + y * dstPitch;
@@ -904,13 +964,22 @@ export function convertRGBAToRGB555(
     skipBoundsCheck: boolean = false
 ): void {
     const relativeDstOffset = dstOffset;
-    const canUseUint32 = rgbaData.byteOffset % 4 === 0 && rgbaData.length % 4 === 0;
-    let rgba32: Uint32Array | null = null;
-    if (canUseUint32) {
-        try {
-            rgba32 = new Uint32Array(rgbaData.buffer, rgbaData.byteOffset, rgbaData.length / 4);
-        } catch (e) {
-            rgba32 = null;
+    const rgba32: Uint32Array | null = rgbaAsWords(rgbaData);
+
+    if (skipBoundsCheck && rgba32 && fastPixelStoreEnabled()) {
+        const d16 = alignedDstView(dst, relativeDstOffset, dstPitch, width, height, 2);
+        if (d16) {
+            const pitch16 = dstPitch >> 1;
+            for (let y = 0; y < height; y++) {
+                const dstRow = y * pitch16;
+                const srcRow = y * width;
+                for (let x = 0; x < width; x++) {
+                    const p = rgba32[srcRow + x];
+                    d16[dstRow + x] =
+                        ((p & 0xF8) << 7) | ((p & 0xF800) >> 6) | ((p & 0xF80000) >> 19);
+                }
+            }
+            return;
         }
     }
 
@@ -978,6 +1047,26 @@ export function convertRGBAToARGB8888(
     skipBoundsCheck: boolean = false
 ): void {
     const relativeDstOffset = dstOffset;
+
+    if (skipBoundsCheck && fastPixelStoreEnabled()) {
+        const rgba32 = rgbaAsWords(rgbaData);
+        const d32 = rgba32
+            ? alignedDstView(dst, relativeDstOffset, dstPitch, width, height, 4)
+            : null;
+        if (rgba32 && d32) {
+            // 0xAABBGGRR → 0xAARRGGBB: keep A and G, swap R and B.
+            const pitch32 = dstPitch >> 2;
+            for (let y = 0; y < height; y++) {
+                const dstRow = y * pitch32;
+                const srcRow = y * width;
+                for (let x = 0; x < width; x++) {
+                    const p = rgba32[srcRow + x];
+                    d32[dstRow + x] = (p & 0xFF00FF00) | ((p & 0xFF) << 16) | ((p >>> 16) & 0xFF);
+                }
+            }
+            return;
+        }
+    }
 
     if (skipBoundsCheck) {
         for (let y = 0; y < height; y++) {
@@ -1218,6 +1307,7 @@ export function convertRGBAToSurface(
         return; // ABORT write to prevent corruption
     }
 
+    const lcConvert = lockCostProfiler.now();
     switch (pixelFormat) {
         case PixelFormat.RGB565:
             convertRGBAToRGB565(rgbaData, mem, surfacePtr, pitch, width, height, inBounds);
@@ -1233,6 +1323,7 @@ export function convertRGBAToSurface(
             convertGenericRGBAToSurface(rgbaData, mem, surfacePtr, width, height, pitch, format, options?.clearAlphaBit);
             break;
     }
+    lockCostProfiler.add(LP.convert, lcConvert);
 }
 
 function convertGenericRGBAToSurface(

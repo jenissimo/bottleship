@@ -18,7 +18,10 @@ import type { HarnessService } from "../service";
 import { frameProfiler, type BadFrameCapture, type FrameSample } from "../../core/frame-profiler";
 import { profiler } from "../../core/profiler";
 import { readbackCounters } from "../../modules/ddraw/surface-sync";
+import { readLockDivergenceCounters } from "../../modules/ddraw/lock-flags";
+import { prefetchCounters } from "../../modules/ddraw/surface-readback-prefetch";
 import { drawCostProfiler } from "../../backends/webgpu/ddraw/draw-cost-profiler";
+import { lockCostProfiler } from "../../modules/ddraw/lock-cost-profiler";
 import { getBufferUploadCensus, resetBufferUploadCensus } from "../../backends/webgpu/buffer-upload";
 import { cpu, sys, symbolize, proc } from "../serialize";
 import { HarnessError, HarnessErrorCode } from "../rpc";
@@ -645,12 +648,51 @@ export function registerPerfCommands(svc: HarnessService): void {
         const opts = (args[0] ?? {}) as { reset?: boolean };
         const snapshot = {
             calls: readbackCounters.calls,
+            callsFromPrefetch: readbackCounters.callsFromPrefetch,
+            // Round trips a Lock STARTED. Zero here does NOT mean no Lock waited — pair it
+            // with readbackPrefetch().awaitedInflight, which counts the Locks that blocked
+            // on a prefetch already in flight.
+            roundTripsStartedByLock: readbackCounters.calls - readbackCounters.callsFromPrefetch,
             roundTrips: readbackCounters.roundTrips,
+            // Of `roundTrips`: how many pulled the whole surface (the only kind that can
+            // memoise) versus a Lock's rect. `pixelsAvoided` is the saving the box buys;
+            // partialRoundTrips>0 with pixelsAvoided≈0 means the rects cover the surface
+            // anyway and the box is buying nothing.
+            fullRoundTrips: readbackCounters.fullRoundTrips,
+            partialRoundTrips: readbackCounters.partialRoundTrips,
+            pixelsDownloaded: readbackCounters.pixelsDownloaded,
+            pixelsAvoided: readbackCounters.pixelsAvoided,
             memoHits: readbackCounters.memoHits,
             scratchHits: readbackCounters.scratchHits,
             redundant: readbackCounters.redundant,
         };
         if (opts.reset) readbackCounters.reset();
+        return snapshot;
+    });
+
+    /**
+     * readLockDivergence({reset?}) — how wrong would we be if a READONLY Lock were served
+     * from the CPU bytes we already hold, instead of paying the GPU→CPU round trip?
+     *
+     * Arm with setWorkerFlag('__noReadLockReadback', true): the Lock returns at once, the
+     * readback still runs, and when it lands the bytes we served are compared against it.
+     * `enabled:false` ⇒ nothing is served stale and every row below is a structural zero.
+     * Read `readbacksCompared` FIRST: `framesDiverged: 0` is evidence of agreement only
+     * when it is non-zero, and `comparisonsSkipped` counts the serves whose readback came
+     * back on a path that cannot compare (CPU slow path — RGBA, not surface format).
+     */
+    svc.register("readLockDivergence", (args) => {
+        const opts = (args[0] ?? {}) as { reset?: boolean };
+        const snapshot = {
+            enabled: (globalThis as { __noReadLockReadback?: boolean }).__noReadLockReadback === true,
+            locksServedStale: readLockDivergenceCounters.locksServedStale,
+            readbacksCompared: readLockDivergenceCounters.readbacksCompared,
+            comparisonsSkipped: readLockDivergenceCounters.comparisonsSkipped,
+            framesDiverged: readLockDivergenceCounters.framesDiverged,
+            pixelsDiverged: readLockDivergenceCounters.pixelsDiverged,
+            maxChannelDelta: readLockDivergenceCounters.maxChannelDelta,
+        };
+        if (opts.reset) readLockDivergenceCounters.reset();
         return snapshot;
     });
 
@@ -663,6 +705,16 @@ export function registerPerfCommands(svc: HarnessService): void {
      * null means no guest writes were seen in the window — read `observed` before believing
      * any of it. Flow: bufferUploads({reset:true}) → tickFrames(N) → bufferUploads().
      */
+    /** readbackPrefetch — is the endFrame prefetch actually hiding Lock readbacks?
+     *  `servedFresh` is the only success row; a window with started>0 and servedFresh=0
+     *  means the work was done and thrown away, and the skipped* rows name the gate. */
+    svc.register("readbackPrefetch", (args) => {
+        const opts = (args[0] ?? {}) as { reset?: boolean };
+        const snapshot = { ...prefetchCounters } as Record<string, unknown>;
+        delete snapshot.reset;
+        if (opts.reset) prefetchCounters.reset();
+        return snapshot;
+    });
     svc.register("bufferUploads", (args) => {
         const opts = (args[0] ?? {}) as { reset?: boolean };
         if (opts.reset) { resetBufferUploadCensus(); return getBufferUploadCensus(); }
@@ -683,6 +735,29 @@ export function registerPerfCommands(svc: HarnessService): void {
         else if (opts.enable === false) drawCostProfiler.disable();
         else if (opts.reset) drawCostProfiler.reset();
         return { enabled: drawCostProfiler.isEnabled(), ...drawCostProfiler.report() };
+    });
+
+    /**
+     * lockCost({enable?, reset?}) — per-Lock/Unlock CPU breakdown inside the ddraw surface
+     * handlers, off by default and zero-cost while off. Same shape as `drawCost`, but rows
+     * are split by lock class (`write` / `read` / `other`) because a writable and a
+     * read-only Lock take different branches; `other` is conversion work reached from
+     * outside a Lock (the readback prefetch, Flip's GDI sync), so that row growing while
+     * the Lock rows shrink is what "moved off the critical path" looks like.
+     *
+     * Each phase carries its own `calls`: a phase that was never wired reads `calls: 0`,
+     * not a plausible zero. `perCallUs` is per phase entry; the class-level `perCallUs`
+     * and `msPerFrame` price the whole Lock+Unlock pair. `fastPixelStore` echoes whether
+     * the word-wide RGBA→native store is on, so an A/B window is self-labelling.
+     *
+     * Flow: lockCost({enable:true,reset:true}) → tickFrames(N) → lockCost().
+     */
+    svc.register("lockCost", (args) => {
+        const opts = (args[0] ?? {}) as { enable?: boolean; reset?: boolean };
+        if (opts.enable === true) lockCostProfiler.enable();
+        else if (opts.enable === false) lockCostProfiler.disable();
+        else if (opts.reset) lockCostProfiler.reset();
+        return { enabled: lockCostProfiler.isEnabled(), ...lockCostProfiler.report() };
     });
 
     /** perfStats() — latest + average frame sample, plus the frame-time TAIL summary.

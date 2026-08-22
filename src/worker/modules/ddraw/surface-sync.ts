@@ -23,6 +23,8 @@ import {
     getSurfaceFormatLayout,
 } from "../../backends/webgpu/shared/texture-formats";
 import { awaitInflightPrefetch } from "./surface-readback-prefetch";
+import { compareStaleServe, skipStaleServeComparison } from "./lock-flags";
+import { clipLockRect, landRegionRows, regionOfBox, type LockRect } from "./readback-region";
 
 // ============================================================================
 // LEASE VALIDATION (single source of truth for pixel-write safety)
@@ -271,6 +273,12 @@ export const invalidateCpuSyncedVersion = (state: DirectDrawSurfaceState): void 
 export const readbackCounters = {
     /** syncToCPU entered with a real sync decision. */
     calls: 0,
+    /** Of `calls`, the ones the prefetch kicked. This counts who STARTED a round trip, not
+     *  who WAITED for one: a Lock that blocks on an in-flight prefetch leaves this row (and
+     *  its `onLockCriticalPath` complement) untouched while still paying the latency. The row
+     *  that says a Lock blocked is `prefetchCounters.awaitedInflight`; read the two together
+     *  or a fully-hidden readback and a merely-relocated one look identical. */
+    callsFromPrefetch: 0,
     /** Served from the cached RGBA copy, no GPU work. */
     scratchHits: 0,
     /** needsCPUSync answered "no" because this version was already read back. */
@@ -279,12 +287,28 @@ export const readbackCounters = {
     roundTrips: 0,
     /** Round trips that repeated a (surface, version) already read back — must be 0. */
     redundant: 0,
+    /** Round trips that COMMITTED a whole-surface download. Only these may record
+     *  `cpuSyncedVersion`, so this is also the count of trips that can memoise.
+     *  full + partial < roundTrips means trips were started and thrown away. */
+    fullRoundTrips: 0,
+    /** Round trips that committed a download scoped to a Lock's rect. */
+    partialRoundTrips: 0,
+    /** Pixels actually pulled across the bus. */
+    pixelsDownloaded: 0,
+    /** Pixels a partial trip did NOT pull (whole surface minus its box) — the saving. Zero
+     *  with partialRoundTrips>0 would mean the boxes are covering the surface anyway. */
+    pixelsAvoided: 0,
     reset(): void {
         this.calls = 0;
+        this.callsFromPrefetch = 0;
         this.scratchHits = 0;
         this.memoHits = 0;
         this.roundTrips = 0;
         this.redundant = 0;
+        this.fullRoundTrips = 0;
+        this.partialRoundTrips = 0;
+        this.pixelsDownloaded = 0;
+        this.pixelsAvoided = 0;
     },
 };
 
@@ -1104,7 +1128,7 @@ export class SurfaceSyncManager {
         device: GPUDevice,
         queue: GPUQueue,
         textureConverter?: TextureConverter,
-        opts?: { fromPrefetch?: boolean }
+        opts?: { fromPrefetch?: boolean; box?: LockRect | null }
     ): Promise<boolean> {
         // A GPU→CPU readback on a lost device submits into nothing and then awaits a mapAsync
         // that will never be satisfied by real work — the shape that turns one device loss
@@ -1126,6 +1150,7 @@ export class SurfaceSyncManager {
             return false;
         }
         readbackCounters.calls++;
+        if (opts?.fromPrefetch) readbackCounters.callsFromPrefetch++;
 
         // Token span: syncToCPU crosses awaits, so concurrent readbacks would corrupt
         // each other's start time under the Map-keyed start/end. The token is closed
@@ -1178,6 +1203,30 @@ export class SurfaceSyncManager {
             // while mapAsync is pending.
             const readbackVersion = state.version;
 
+            // The Lock's rect, or the whole surface. A PARTIAL download must never record
+            // cpuSyncedVersion: the memo claims every byte of this version is in guest
+            // memory, and outside the box none of them are.
+            const box = clipLockRect(opts?.box, width, height);
+            const region = regionOfBox(box, width, height);
+            const wholeSurface = !box;
+            const regionPtr = state.surfacePtr + region.y * pitch + region.x * bytesPerPixel;
+            const regionRowBytes = region.width * bytesPerPixel;
+            const regionBytes = regionRowBytes * region.height;
+            const noteRegionDownloaded = (): void => {
+                readbackCounters.pixelsDownloaded += region.width * region.height;
+                if (wholeSurface) {
+                    readbackCounters.fullRoundTrips++;
+                } else {
+                    readbackCounters.partialRoundTrips++;
+                    readbackCounters.pixelsAvoided += width * height - region.width * region.height;
+                }
+            };
+            /** True when `versionStillCurrent`; only a whole-surface trip may memoise. */
+            const commitReadback = (): boolean =>
+                wholeSurface
+                    ? markCpuSyncedFromGpu(state, readbackVersion)
+                    : state.version === readbackVersion;
+
             // ================================================================
             // GPU COMPUTE FAST PATH: Use compute shader for format conversion
             // This avoids expensive CPU loops (187ms → ~5ms)
@@ -1197,64 +1246,52 @@ export class SurfaceSyncManager {
             if (gpuConvertSupported) {
                 const gpuConvertToken = profiler.startToken("syncToCPU:gpuConvert");
                 Logger.log(LogCategory.DDRAW,
-                    `🚀 syncToCPU GPU COMPUTE PATH: Converting ${width}x${height} format=${surfacePixelFormat} on GPU`);
+                    `🚀 syncToCPU GPU COMPUTE PATH: Converting ${region.width}x${region.height} ` +
+                    `@(${region.x},${region.y}) format=${surfacePixelFormat} on GPU`);
 
-                noteGpuRoundTrip(state, "gpuConvert");
+                noteGpuRoundTrip(state, "gpuConvert", wholeSurface);
                 attemptedGpuRoundTrip = true;
                 const gpuFormat = state.gpuTextureFormat ?? "rgba8unorm";
+                // The mapped range lands straight in guest memory: an intermediate array
+                // would be a second copy of the whole surface plus an allocation per
+                // readback. The view is re-derived inside the callback — it runs after a
+                // mapAsync, which is exactly where WASM growth detaches a plain guest view.
                 const converted = await textureConverter.convertFromTexture(
                     state.gpuTexture!,
                     gpuFormat,
                     surfacePixelFormat,
-                    width,
-                    height,
-                    pitch
+                    region,
+                    (mapped, rowBytes, rows): boolean => {
+                        const memNow = process.getCurrentMemory();
+                        // NOTE: surfacePtr is a guest address that maps directly to mem[]
+                        // index. Do NOT subtract mem.byteOffset.
+                        const writeSpan = (rows - 1) * pitch + rowBytes;
+                        const inBounds = regionPtr >= 0 && regionPtr + writeSpan <= memNow.length;
+                        if (!inBounds || overlapsThunkCode(regionPtr, writeSpan)) {
+                            Logger.warn(LogCategory.DDRAW,
+                                `syncToCPU: GPU convert succeeded but write blocked ` +
+                                `(bounds=${inBounds}, thunk=${overlapsThunkCode(regionPtr, writeSpan)})`);
+                            return false;
+                        }
+                        compareStaleServe(state, readbackVersion, memNow, regionPtr, pitch,
+                            mapped, rowBytes, rows, bytesPerPixel);
+                        landRegionRows(mapped, rowBytes, rows, memNow, regionPtr, pitch);
+                        return true;
+                    }
                 );
 
                 if (converted) {
-                    // Write converted data directly to surface memory
-                    // NOTE: surfacePtr is a guest address that maps directly to mem[] index.
-                    // Do NOT subtract mem.byteOffset — that would write to the wrong location.
-                    const totalWriteSize = pitch * height;
-                    const inBounds = state.surfacePtr >= 0 && state.surfacePtr + totalWriteSize <= mem.length;
-
-                    if (inBounds && !overlapsThunkCode(state.surfacePtr, totalWriteSize)) {
-                        mem.set(converted.subarray(0, totalWriteSize), state.surfacePtr);
-                        const versionStillCurrent = markCpuSyncedFromGpu(state, readbackVersion);
-
-                        profiler.increment("SurfaceSyncManager.syncToCPU", "bytes", totalWriteSize);
-                        profiler.endToken(gpuConvertToken);
-
-                        // DIAGNOSTIC: Pixel dump to verify readback is not all-black
-                        {
-                            const u16 = new Uint16Array(converted.buffer, converted.byteOffset, Math.min(16, converted.length >> 1));
-                            const px = Array.from(u16.subarray(0, 8)).map(v => `0x${v.toString(16).padStart(4, '0')}`);
-                            const allZero = u16.every(v => v === 0);
-                            Logger.log(LogCategory.DDRAW,
-                                `PIXEL DUMP after readback 0x${state.surfacePtr.toString(16)}: [${px.join(', ')}] allZero=${allZero}`);
-                        }
-                        // DIAGNOSTIC: Verify data actually landed in mem at the correct offset
-                        {
-                            if (state.surfacePtr >= 0 && state.surfacePtr + 16 <= mem.length) {
-                                const u16v = new Uint16Array(mem.buffer, mem.byteOffset + state.surfacePtr, 8);
-                                const pxv = Array.from(u16v).map(v => `0x${v.toString(16).padStart(4, '0')}`);
-                                Logger.log(LogCategory.DDRAW,
-                                    `VERIFY mem[0x${state.surfacePtr.toString(16)}] after write: [${pxv.join(', ')}]`);
-                            }
-                        }
-
-                        Logger.log(LogCategory.DDRAW,
-                            `syncToCPU GPU COMPUTE PATH completed for 0x${state.surfacePtr.toString(16)} ` +
-                            `(${totalWriteSize} bytes, format=${surfacePixelFormat})`);
-                        return versionStillCurrent;
-                    } else {
-                        Logger.warn(LogCategory.DDRAW,
-                            `syncToCPU: GPU convert succeeded but write blocked (bounds=${inBounds}, thunk=${overlapsThunkCode(state.surfacePtr, totalWriteSize)})`);
-                    }
-                } else {
-                    Logger.warn(LogCategory.DDRAW,
-                        `syncToCPU: GPU convert failed, falling back to CPU path`);
+                    const versionStillCurrent = commitReadback();
+                    noteRegionDownloaded();
+                    profiler.increment("SurfaceSyncManager.syncToCPU", "bytes", regionBytes);
+                    profiler.endToken(gpuConvertToken);
+                    Logger.log(LogCategory.DDRAW,
+                        `syncToCPU GPU COMPUTE PATH completed for 0x${regionPtr.toString(16)} ` +
+                        `(${regionBytes} bytes, format=${surfacePixelFormat}, whole=${wholeSurface})`);
+                    return versionStillCurrent;
                 }
+                Logger.warn(LogCategory.DDRAW,
+                    `syncToCPU: GPU convert failed, falling back to CPU path`);
                 profiler.endToken(gpuConvertToken);
                 // Fall through to CPU path
             }
@@ -1262,14 +1299,18 @@ export class SurfaceSyncManager {
             // ================================================================
             // CPU SLOW PATH: Traditional readback with CPU format conversion
             // ================================================================
+            // This path's bytes are RGBA, not surface format, so a stale serve waiting on
+            // this readback cannot be compared against what we served. Say so rather than
+            // leaving the debt to be silently attributed to a later readback.
+            skipStaleServeComparison(state);
 
             // WebGPU alignment: 256 bytes per row
-            const unpaddedBytesPerRow = width * 4;
+            const unpaddedBytesPerRow = region.width * 4;
             const align = 256;
             const paddedBytesPerRow = Math.ceil(unpaddedBytesPerRow / align) * align;
-            const bufferSize = paddedBytesPerRow * height;
+            const bufferSize = paddedBytesPerRow * region.height;
 
-            noteGpuRoundTrip(state, "copyTextureToBuffer", !attemptedGpuRoundTrip);
+            noteGpuRoundTrip(state, "copyTextureToBuffer", !attemptedGpuRoundTrip && wholeSurface);
 
             const { buffer: readback, release: releaseReadback } =
                 acquireReadbackBuffer(device, state, bufferSize);
@@ -1277,9 +1318,9 @@ export class SurfaceSyncManager {
 
             const encoder = device.createCommandEncoder();
             encoder.copyTextureToBuffer(
-                { texture: state.gpuTexture! },
+                { texture: state.gpuTexture!, origin: { x: region.x, y: region.y } },
                 { buffer: readback, bytesPerRow: paddedBytesPerRow },
-                { width, height, depthOrArrayLayers: 1 }
+                { width: region.width, height: region.height, depthOrArrayLayers: 1 }
             );
             queue.submit([encoder.finish()]);
 
@@ -1287,7 +1328,7 @@ export class SurfaceSyncManager {
             const beforeWait = performance.now();
             Logger.warn(LogCategory.DDRAW,
                 `⚠️ syncToCPU BLOCKING: Starting GPU→CPU readback for surface 0x${state.surfacePtr.toString(16)} ` +
-                `(${width}x${height} = ${bufferSize} bytes). This will STALL the frame!`
+                `(${region.width}x${region.height} = ${bufferSize} bytes). This will STALL the frame!`
             );
 
             // mapAsync already resolves after the submitted copy completes; an
@@ -1302,11 +1343,14 @@ export class SurfaceSyncManager {
             const mapped = new Uint8Array(readback.getMappedRange());
 
             const copyConvertToken = profiler.startToken("syncToCPU:copyConvert");
+            // Re-derived after the await: a plain guest view detaches on WASM growth, and
+            // mapAsync is precisely the window in which that happens.
+            const memNow = process.getCurrentMemory();
             const gpuFormat = state.gpuTextureFormat ?? "rgba8unorm";
             const pixelFormat = detectPixelFormat(state.format);
-            const totalWriteSize = pitch * height;
+            const regionWriteSpan = (region.height - 1) * pitch + region.width * bytesPerPixel;
             // NOTE: surfacePtr maps directly to mem[] index. Do NOT subtract mem.byteOffset.
-            const inBounds = state.surfacePtr >= 0 && state.surfacePtr + totalWriteSize <= mem.length;
+            const inBounds = regionPtr >= 0 && regionPtr + regionWriteSpan <= memNow.length;
 
             // FAST PATH: BGRA readback -> ARGB/XRGB surface is a direct row copy (no swizzle/convert).
             if (
@@ -1314,41 +1358,45 @@ export class SurfaceSyncManager {
                 (pixelFormat === PixelFormat.ARGB8888 || pixelFormat === PixelFormat.XRGB8888) &&
                 pitch >= unpaddedBytesPerRow &&
                 inBounds &&
-                !overlapsThunkCode(state.surfacePtr, totalWriteSize)
+                !overlapsThunkCode(regionPtr, regionWriteSpan)
             ) {
                 if (paddedBytesPerRow === unpaddedBytesPerRow && pitch === unpaddedBytesPerRow) {
-                    mem.set(mapped.subarray(0, unpaddedBytesPerRow * height), state.surfacePtr);
+                    memNow.set(mapped.subarray(0, unpaddedBytesPerRow * region.height), regionPtr);
                 } else {
-                    for (let row = 0; row < height; row++) {
+                    for (let row = 0; row < region.height; row++) {
                         const srcStart = row * paddedBytesPerRow;
-                        const dstStart = state.surfacePtr + row * pitch;
-                        mem.set(mapped.subarray(srcStart, srcStart + unpaddedBytesPerRow), dstStart);
+                        const dstStart = regionPtr + row * pitch;
+                        memNow.set(mapped.subarray(srcStart, srcStart + unpaddedBytesPerRow), dstStart);
                     }
                 }
 
                 releaseReadback();
 
                 profiler.endToken(copyConvertToken);
-                const versionStillCurrent = markCpuSyncedFromGpu(state, readbackVersion);
-                profiler.increment("SurfaceSyncManager.syncToCPU", "bytes", unpaddedBytesPerRow * height);
+                const versionStillCurrent = commitReadback();
+                noteRegionDownloaded();
+                profiler.increment("SurfaceSyncManager.syncToCPU", "bytes", unpaddedBytesPerRow * region.height);
                 Logger.log(
                     LogCategory.DDRAW,
-                    `syncToCPU: FAST BGRA copy completed for 0x${state.surfacePtr.toString(16)} ${width}x${height}`
+                    `syncToCPU: FAST BGRA copy completed for 0x${regionPtr.toString(16)} ${region.width}x${region.height}`
                 );
                 return versionStillCurrent;
             }
 
             // Extract RGBA data (remove padding when needed)
-            const unpaddedSize = unpaddedBytesPerRow * height;
+            const unpaddedSize = unpaddedBytesPerRow * region.height;
             let rgbaData: Uint8Array;
-            const canReuseScratch = isRenderSurface(state) && state.rgbaScratch && state.rgbaScratch.length === unpaddedSize;
+            // The scratch is the WHOLE surface's RGBA; a sub-rect readback neither fills it
+            // nor may be staged in it.
+            const canReuseScratch = wholeSurface && isRenderSurface(state)
+                && state.rgbaScratch && state.rgbaScratch.length === unpaddedSize;
             const needsDepad = paddedBytesPerRow !== unpaddedBytesPerRow;
 
             if (!needsDepad) {
                 rgbaData = mapped.subarray(0, unpaddedSize);
             } else {
                 rgbaData = canReuseScratch ? state.rgbaScratch! : new Uint8Array(unpaddedSize);
-                for (let row = 0; row < height; row++) {
+                for (let row = 0; row < region.height; row++) {
                     const srcStart = row * paddedBytesPerRow;
                     const dstStart = row * unpaddedBytesPerRow;
                     rgbaData.set(mapped.subarray(srcStart, srcStart + unpaddedBytesPerRow), dstStart);
@@ -1373,7 +1421,7 @@ export class SurfaceSyncManager {
             // rgbaScratchVersion===version, so any GPU write (which bumps version)
             // correctly invalidates this. Covers BOTH needsDepad and !needsDepad — the
             // latter previously skipped caching, so 256-aligned widths re-read every time.
-            if (isRenderSurface(state) && rgbaData.length === unpaddedSize) {
+            if (wholeSurface && isRenderSurface(state) && rgbaData.length === unpaddedSize) {
                 if (needsDepad) {
                     // rgbaData is already a standalone buffer (the depad target).
                     state.rgbaScratch = rgbaData;
@@ -1391,25 +1439,20 @@ export class SurfaceSyncManager {
                 ? rgbaData
                 : new Uint8ClampedArray(rgbaData.buffer, rgbaData.byteOffset, rgbaData.byteLength);
 
-            // DIAGNOSTIC: Log where we're about to write
-            Logger.log(
-                LogCategory.DDRAW,
-                `syncToCPU: Writing ${width}x${height} (${totalWriteSize} bytes) to surfacePtr=0x${state.surfacePtr.toString(16)} ` +
-                `mem.byteOffset=0x${mem.byteOffset.toString(16)} mem.length=0x${mem.length.toString(16)}`
-            );
-
             try {
-                convertRGBAToSurface(rgbaClamped, mem, state.surfacePtr, width, height, pitch, state.format);
+                convertRGBAToSurface(rgbaClamped, memNow, regionPtr,
+                    region.width, region.height, pitch, state.format);
             } finally {
                 releaseReadback();
             }
             profiler.endToken(copyConvertToken);
-            const versionStillCurrent = markCpuSyncedFromGpu(state, readbackVersion);
+            const versionStillCurrent = commitReadback();
+            noteRegionDownloaded();
 
             profiler.increment("SurfaceSyncManager.syncToCPU", "bytes", rgbaData.byteLength);
             Logger.log(
                 LogCategory.DDRAW,
-                `syncToCPU: completed for 0x${state.surfacePtr.toString(16)} ${width}x${height}`
+                `syncToCPU: completed for 0x${regionPtr.toString(16)} ${region.width}x${region.height}`
             );
             return versionStillCurrent;
         } catch (e) {

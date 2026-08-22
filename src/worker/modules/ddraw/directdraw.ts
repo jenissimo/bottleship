@@ -91,6 +91,9 @@ import {
     DDSCL_FULLSCREEN,
     DDSURFACEDESC2_OFFSETS,
     DDPIXELFORMAT_OFFSETS,
+    DDSCAPS_OFFSCREENPLAIN,
+    DDSCAPS_LOCALVIDMEM,
+    DDSCAPS_FRONTBUFFER,
 } from "./constants";
 import { bytesToGuid, surfaceAt } from "./helpers";
 import { resolveDDrawTearOff } from "./com-tearoff";
@@ -957,8 +960,17 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
             context.surfaces.backBuffer = objAddr;
         }
 
-        // Create flipping chain for Primary + BackBuffers
-        if ((surfaceState.caps & DDSCAPS_PRIMARYSURFACE) && normalizedDesc.backBufferCount > 0) {
+        // dwBackBufferCount builds a flip chain, and DirectDraw does not reserve that for the
+        // primary: an app may create an OFFSCREENPLAIN|3DDEVICE|FLIP|COMPLEX chain and flip it
+        // off-screen (Wine ddraw7.c:20301 test_flip_3d does exactly that). The surface the app
+        // asked for becomes the FRONT buffer of the chain either way.
+        const buildsFlipChain = normalizedDesc.backBufferCount > 0
+            && ((surfaceState.caps & DDSCAPS_PRIMARYSURFACE) !== 0
+                || (surfaceState.caps & (DDSCAPS_FLIP | DDSCAPS_COMPLEX)) !== 0);
+        if (buildsFlipChain && (surfaceState.caps & DDSCAPS_PRIMARYSURFACE) === 0) {
+            surfaceState.caps |= DDSCAPS_FLIP | DDSCAPS_FRONTBUFFER;
+        }
+        if (buildsFlipChain) {
             let lastAddr = objAddr;
             let firstBackbufferAddr = 0;
 
@@ -980,7 +992,14 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
                 const backbufferState: DirectDrawSurfaceState = {
                     ...surfaceState,
                     surfaceType: "render_surface", // Explicit type (spread copies from primary)
-                    caps: DDSCAPS_BACKBUFFER | DDSCAPS_VIDEOMEMORY | (normalizedDesc.backBufferCount > 1 ? DDSCAPS_COMPLEX : 0) | DDSCAPS_FLIP | (surfaceState.caps & DDSCAPS_3DDEVICE),
+                    // A back buffer keeps the chain root's residency and purpose bits (an
+                    // off-screen 3D chain is not video memory just because a primary's is) and
+                    // never inherits the bits that name the root: PRIMARYSURFACE, FRONTBUFFER.
+                    caps: DDSCAPS_BACKBUFFER | DDSCAPS_FLIP
+                        | (normalizedDesc.backBufferCount > 1 ? DDSCAPS_COMPLEX : 0)
+                        | (surfaceState.caps & (DDSCAPS_3DDEVICE | DDSCAPS_OFFSCREENPLAIN
+                            | DDSCAPS_VIDEOMEMORY | DDSCAPS_SYSTEMMEMORY | DDSCAPS_LOCALVIDMEM))
+                        | ((surfaceState.caps & DDSCAPS_PRIMARYSURFACE) ? DDSCAPS_VIDEOMEMORY : 0),
                     surfacePtr: backbufferSurfacePtr,
                     surfacePtrAllocated: true,
                     attachedSurfaceAddr: 0,

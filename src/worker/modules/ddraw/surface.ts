@@ -50,7 +50,8 @@ import {
     IID_IDirect3DRampDevice,
     IID_IDirect3DMMXDevice,
     D3DRENDERSTATE_COLORKEYENABLE,
-    DDERR_CANNOTDETACHSURFACE, DDERR_SURFACENOTATTACHED, DDERR_INVALIDOBJECT,
+    DDERR_CANNOTDETACHSURFACE, DDERR_SURFACENOTATTACHED, DDERR_INVALIDOBJECT, DDERR_SURFACEBUSY,
+    DDERR_WASSTILLDRAWING,
 } from "./constants";
 import { bytesToGuid, readRect, Rect, absToRel, readU16Abs, readU32Abs, surfaceAt } from "./helpers";
 import { writeSurfaceDescV1 } from "./structs";
@@ -62,7 +63,8 @@ import { ComObjectFactory } from "../../core/com/base-com-object";
 import { convertRGBAToSurface, uploadToGPUTexture, convertSurfaceToRGBA } from "./gpu-texture-utils";
 import { setAuthorityCpu, setAuthorityGpu, markCpuSyncedFromGpu, invalidateCpuSyncedVersion, syncActiveGdiContext, surfaceSyncManager, logSurfaceState, demoteSurfaceToCpu } from "./surface-sync";
 import { noteReadLockCandidate } from "./surface-readback-prefetch";
-import { lockNeedsGpuReadback } from "./lock-flags";
+import { lockCostProfiler, LP, LC, type LockClass } from "./lock-cost-profiler";
+import { decideLockSync, lockMustNotBlock, noteReadLockServedStale } from "./lock-flags";
 import { recordSurfaceOp, surfaceOpsArmed } from "./surface-op-log";
 import { isZBufferSurface, syncZBufferWriteToDepth } from "./depth-fill";
 import { propagateSurfaceStateToRegistry } from "./d3d/texture-manager";
@@ -146,6 +148,24 @@ const leaseRegionUnchanged = (
     return true;
 };
 
+/**
+ * A surface already handed out a Lock pointer, so a second Lock is refused —
+ * DirectDraw maps one sub-resource at a time regardless of the rects asked for
+ * (Wine surface.c:1138-1141 maps the wined3d "already mapped" error to this, and
+ * ddraw7.c:14292-14300 asserts it for two whole-surface READONLY|WAIT locks).
+ *
+ * Kill switch for a title that relied on the old permissiveness:
+ * setWorkerFlag('__noLockExclusivity', true).
+ */
+const surfaceAlreadyLocked = (state: DirectDrawSurfaceState): boolean => {
+    if ((globalThis as { __noLockExclusivity?: boolean }).__noLockExclusivity === true) return false;
+    if (state.activeLeaseId === undefined) return false;
+    if (leaseRegistry.validateLease(state.activeLeaseId)) return true;
+    // A revoked lease is not a lock: drop the stale id rather than refuse forever.
+    state.activeLeaseId = undefined;
+    return false;
+};
+
 const consumeActiveLeaseWriteState = (
     mem: Uint8Array,
     state: DirectDrawSurfaceState
@@ -184,7 +204,10 @@ const consumeActiveLeaseWriteState = (
     if (changed && isRenderSurface(state) && state.width > 0 && state.height > 0) {
         const bpp = Math.max(1, Math.floor(state.format.bpp / 8));
         const pitch = Math.max(state.pitch, state.width * bpp);
+        // Only a writable lease reaches here, so the class is never in doubt.
+        const lcDirty = lockCostProfiler.now();
         const box = dirtyBoxFromLeaseDiff(mem, base, snapshot, pitch, bpp, state.width, state.height);
+        lockCostProfiler.add(LP.udirty, lcDirty, LC.write);
         if (box) {
             state.dirtyRegion = box;
         }
@@ -750,6 +773,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         if (!isValidAddress(mem, lpDDSurfaceDesc, 4)) return E_POINTER;
 
         const state = obj.getState();
+        if (surfaceAlreadyLocked(state)) return DDERR_SURFACEBUSY;
 
         // SYNC: If GPU has current content and CPU doesn't, readback before game reads/writes pixels
         const isDiscard = (dwFlags & DDLOCK_DISCARDCONTENTS) !== 0;
@@ -759,8 +783,12 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         // depth words replaces the app's own clear value with zeros — the app then appears
         // to clear depth to "near" and every later draw z-fails.
         const needsReadback = surfaceSyncManager.needsCPUSync(state).needed && !isZBufferSurface(state);
-        const needsGpuContents = lockNeedsGpuReadback(dwFlags, isRenderSurface(state));
-        const needsAsyncReadback = needsReadback && !!context.executor && needsGpuContents;
+        const sync = decideLockSync(
+            { width: state.width, height: state.height, splitStorage: isRenderSurface(state) },
+            dwFlags,
+            lpDestRect && isValidAddress(mem, lpDestRect, 16) ? readRect(mem, lpDestRect) : null
+        );
+        const needsAsyncReadback = needsReadback && !!context.executor && sync.read;
         const snapshotSkippedReadback = needsReadback && !needsAsyncReadback && !isReadOnlyFlags && !isDiscard;
 
         // DirectDraw has no depth API: a writable Lock on a z surface is how the app clears
@@ -772,7 +800,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                 zRect ? clipRect(zRect, state.width, state.height) : null);
         }
 
-        if (needsGpuContents && isRenderSurface(state)) {
+        if (sync.read && isRenderSurface(state)) {
             noteReadLockCandidate(state);
         }
 
@@ -898,11 +926,18 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
             if (context.executor.syncSurfaceToMemoryFromScratch(state, mem)) {
                 return completeLock(true, 0);
             }
+            if (sync.serveStale && isRenderSurface(state)) {
+                noteReadLockServedStale(state, state.version);
+                void context.executor.syncSurfaceToMemory(state, sync.box).catch((e) =>
+                    Logger.warn(LogCategory.DDRAW, `read-lock divergence readback failed: ${e}`));
+                return completeLock(false, 0);
+            }
+            if (lockMustNotBlock(sync, dwFlags)) return DDERR_WASSTILLDRAWING;
             Logger.log(LogCategory.DDRAW,
                 `IDirectDrawSurface4_Lock: Syncing GPU -> CPU for surface 0x${thisPtr.toString(16)} (authority=gpu)`
             );
             const before = performance.now();
-            return context.executor.syncSurfaceToMemory(state).then((): number => {
+            return context.executor.syncSurfaceToMemory(state, sync.box).then((): number => {
                 const readbackTime = performance.now() - before;
                 return completeLock(true, readbackTime);
             });
@@ -926,6 +961,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         if (!isValidAddress(mem, lpDDSurfaceDesc, 4)) return E_POINTER;
 
         const state = obj.getState();
+        if (surfaceAlreadyLocked(state)) return DDERR_SURFACEBUSY;
 
         // SYNC: If GPU has current content and CPU doesn't, readback before game reads/writes pixels
         const isDiscard = (dwFlags & DDLOCK_DISCARDCONTENTS) !== 0;
@@ -935,8 +971,12 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         // depth words replaces the app's own clear value with zeros — the app then appears
         // to clear depth to "near" and every later draw z-fails.
         const needsReadback = surfaceSyncManager.needsCPUSync(state).needed && !isZBufferSurface(state);
-        const needsGpuContents = lockNeedsGpuReadback(dwFlags, isRenderSurface(state));
-        const needsAsyncReadback = needsReadback && !!context.executor && needsGpuContents;
+        const sync = decideLockSync(
+            { width: state.width, height: state.height, splitStorage: isRenderSurface(state) },
+            dwFlags,
+            lpDestRect && isValidAddress(mem, lpDestRect, 16) ? readRect(mem, lpDestRect) : null
+        );
+        const needsAsyncReadback = needsReadback && !!context.executor && sync.read;
         const snapshotSkippedReadback = needsReadback && !needsAsyncReadback && !isReadOnlyFlags && !isDiscard;
 
         // DirectDraw has no depth API: a writable Lock on a z surface is how the app clears
@@ -948,7 +988,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                 zRect ? clipRect(zRect, state.width, state.height) : null);
         }
 
-        if (needsGpuContents && isRenderSurface(state)) {
+        if (sync.read && isRenderSurface(state)) {
             noteReadLockCandidate(state);
         }
 
@@ -1075,11 +1115,18 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
             if (context.executor.syncSurfaceToMemoryFromScratch(state, mem)) {
                 return completeLock(true, 0);
             }
+            if (sync.serveStale && isRenderSurface(state)) {
+                noteReadLockServedStale(state, state.version);
+                void context.executor.syncSurfaceToMemory(state, sync.box).catch((e) =>
+                    Logger.warn(LogCategory.DDRAW, `read-lock divergence readback failed: ${e}`));
+                return completeLock(false, 0);
+            }
+            if (lockMustNotBlock(sync, dwFlags)) return DDERR_WASSTILLDRAWING;
             Logger.log(LogCategory.DDRAW,
                 `IDirectDrawSurface_Lock: Syncing GPU -> CPU for surface 0x${thisPtr.toString(16)} (authority=gpu)`
             );
             const before = performance.now();
-            return context.executor.syncSurfaceToMemory(state).then((): number => {
+            return context.executor.syncSurfaceToMemory(state, sync.box).then((): number => {
                 const readbackTime = performance.now() - before;
                 return completeLock(true, readbackTime);
             });
@@ -1098,6 +1145,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
     // and IDirect3DTexture_Load.
     exports["IDirectDrawSurface7_Lock"] = (ctx, mem, args): ThunkResult | Promise<ThunkResult> => {
         const lockStart = performance.now();
+        const lcSetup = lockCostProfiler.now();
         // Token span: this handler returns a Promise when a GPU readback is needed, so two
         // Locks overlap across the await and a Map-keyed start/end would attribute one
         // lock's start time to the other's end.
@@ -1143,6 +1191,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         }
 
         const state = obj.getState();
+        if (surfaceAlreadyLocked(state)) return { value: DDERR_SURFACEBUSY };
         profiler.end("Lock:setup");
         const isTexture = (state.caps & DDSCAPS_TEXTURE) !== 0;
 
@@ -1150,7 +1199,13 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         const isReadOnly = (dwFlags & DDLOCK_READONLY) !== 0;
         const isDiscard = (dwFlags & DDLOCK_DISCARDCONTENTS) !== 0;
 
+        const lcClass: LockClass = isReadOnly ? LC.read : LC.write;
+        lockCostProfiler.add(LP.setup, lcSetup, lcClass);
+        lockCostProfiler.countLock(lcClass);
+
         profiler.start("Lock:gdiSync");
+        const lcGdi = lockCostProfiler.now();
+        lockCostProfiler.activeClass = lcClass;
         const system = System.getInstance();
         const gdiContext = system.gdiContext;
         const hdc = gdiContext.getHDCBySurface(thisPtr);
@@ -1159,7 +1214,10 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
             syncActiveGdiContext(state, thisPtr, mem);
             gdiContext.clearDirty(hdc);
         }
+        lockCostProfiler.activeClass = LC.other;
+        lockCostProfiler.add(LP.gdi, lcGdi, lcClass);
         profiler.end("Lock:gdiSync");
+        const lcDecide = lockCostProfiler.now();
 
         // Check if GPU has authoritative data that needs readback before game accesses guest memory.
         // This covers BOTH GPU_ONLY and CPU-mode surfaces where D3D rendered after a previous Lock
@@ -1179,20 +1237,20 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                 zRect ? clipRect(zRect, state.width, state.height) : null);
         }
 
-        // Native WRITEONLY can map the driver's current resource storage. Our guest
-        // CPU buffer is separate and may be stale, so a render surface still needs its
-        // current GPU bytes unless the app explicitly discards them. Snapshot diff is
-        // not sufficient: restoring an old GPU pixel to the same stale CPU value is an
-        // invisible write and produces sprite trails.
         const isRT = isRenderSurface(state);
-        const needsGpuContents = lockNeedsGpuReadback(dwFlags, isRT);
-        const needsAsyncReadback = needsReadback && !!context.executor && needsGpuContents;
+        const sync = decideLockSync(
+            { width: state.width, height: state.height, splitStorage: isRT },
+            dwFlags,
+            lpDestRect && isValidAddress(mem, lpDestRect, 16) ? readRect(mem, lpDestRect) : null
+        );
+        const needsAsyncReadback = needsReadback && !!context.executor && sync.read;
         // Stale CPU + WRITEONLY skip: snapshot so Unlock can dirty-box guest writes.
         const snapshotSkippedReadback = needsReadback && !needsAsyncReadback && !isReadOnly && !isDiscard;
 
-        if (needsGpuContents && isRT) {
+        if (sync.read && isRT) {
             noteReadLockCandidate(state);
         }
+        lockCostProfiler.add(LP.decide, lcDecide, lcClass);
 
         // Tail of the Lock operation — runs after optional GPU readback. Updates surface
         // authority state, validates the pointer, writes DDSURFACEDESC2, and registers the
@@ -1249,6 +1307,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         // The massive validation/writeDesc/lease/return block stays inline (it closes over
         // many locals), wrapped in a thunk-returning function so both paths share it.
         const finalizeLock = (): ThunkResult => {
+        const lcValidate = lockCostProfiler.now();
         profiler.start("Lock:validation");
         // Read caller's dwSize to preserve it (caller fills it before call)
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
@@ -1389,7 +1448,9 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
             }
         }
         profiler.end("Lock:regions");
+        lockCostProfiler.add(LP.validate, lcValidate, lcClass);
 
+        const lcDesc = lockCostProfiler.now();
         profiler.start("Lock:writeDesc");
         writeSurfaceDesc(mem, lpDDSurfaceDesc, desc);
         profiler.end("Lock:writeDesc");
@@ -1410,6 +1471,9 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
             return { value: E_FAIL, stackCleanup: 20 };
         }
 
+        lockCostProfiler.add(LP.desc, lcDesc, lcClass);
+
+        const lcLease = lockCostProfiler.now();
         profiler.start("Lock:lease");
         const leaseId = leaseRegistry.createLease(
             desc.surfacePtr,
@@ -1427,7 +1491,9 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         // WRITEONLY skip-readback: snapshot backbuffers too so Unlock can dirty-box.
         if (leaseId !== 0 && !isReadOnly &&
             ((state.caps & DDSCAPS_TEXTURE) !== 0 || snapshotSkippedReadback)) {
+            const lcSnap = lockCostProfiler.now();
             captureActiveLeaseSnapshot(mem, state, leaseId);
+            lockCostProfiler.add(LP.snap, lcSnap, lcClass);
         }
 
         // Primary front-buffer writes may be visible while locked on old renderers.
@@ -1474,6 +1540,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         }
 
         profiler.end("Lock:lease");
+        lockCostProfiler.add(LP.lease, lcLease, lcClass);
 
         // DIAGNOSTIC: Validate thunk code integrity after Lock (EXPENSIVE: ~1ms per call!)
         // Disabled in production (ENABLE_LOCK_THUNK_VALIDATION = false) — dead code below.
@@ -1508,8 +1575,23 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
 
         // Dispatch: sync when no GPU readback is needed, Promise chain otherwise.
         if (needsAsyncReadback) {
-            if (context.executor!.syncSurfaceToMemoryFromScratch(state, mem)) {
+            const lcScratch = lockCostProfiler.now();
+            lockCostProfiler.activeClass = lcClass;
+            const servedFromScratch = context.executor!.syncSurfaceToMemoryFromScratch(state, mem);
+            lockCostProfiler.activeClass = LC.other;
+            lockCostProfiler.add(LP.scratch, lcScratch, lcClass);
+            if (servedFromScratch) {
                 return finalize(true, 0);
+            }
+            if (sync.serveStale && isRenderSurface(state)) {
+                noteReadLockServedStale(state, state.version);
+                void context.executor!.syncSurfaceToMemory(state, sync.box).catch((e) =>
+                    Logger.warn(LogCategory.DDRAW, `read-lock divergence readback failed: ${e}`));
+                return finalize(false, 0);
+            }
+            if (lockMustNotBlock(sync, dwFlags)) {
+                profiler.endToken(lockToken);
+                return { value: DDERR_WASSTILLDRAWING, stackCleanup: 20 };
             }
             const modeStr = isRenderSurface(state) ? state.mode : "bitmap";
             Logger.log(LogCategory.DDRAW,
@@ -1517,7 +1599,11 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                 `(${state.width}x${state.height}) mode=${modeStr}`
             );
             const before = performance.now();
-            return context.executor!.syncSurfaceToMemory(state).then((): ThunkResult => {
+            const lcReadback = lockCostProfiler.now();
+            lockCostProfiler.activeClass = lcClass;
+            return context.executor!.syncSurfaceToMemory(state, sync.box).then((): ThunkResult => {
+                lockCostProfiler.add(LP.readback, lcReadback, lcClass);
+                lockCostProfiler.activeClass = LC.other;
                 return finalize(true, performance.now() - before);
             });
         }
@@ -1542,9 +1628,14 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
             const state = obj.getState();
             const isTexture = (state.caps & DDSCAPS_TEXTURE) !== 0;
             profiler.start("Unlock:leaseCompare");
+            const lcCompare = lockCostProfiler.now();
             const leaseWriteState = consumeActiveLeaseWriteState(mem, state);
             profiler.end("Unlock:leaseCompare");
             const wasReadOnly = leaseWriteState.wasReadOnly;
+            const ucClass: LockClass = wasReadOnly ? LC.read : LC.write;
+            lockCostProfiler.countUnlock(ucClass);
+            lockCostProfiler.add(LP.ucompare, lcCompare, ucClass);
+            const lcState = lockCostProfiler.now();
             const didWritePixels = leaseWriteState.changed;
             const previousSurfaceEverWritten = state.surfaceEverWritten;
             const previousWriteGeneration = state.writeGeneration;
@@ -1717,7 +1808,9 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                     // directly to the primary via Lock/Unlock without calling Flip.
                     const isPrimary = (state.caps & DDSCAPS_PRIMARYSURFACE) !== 0;
                     if (isPrimary && context.presenter && !context.suppressPresent) {
+                        const lcPresent = lockCostProfiler.now();
                         void context.presenter.present(state, mem, { throttle: true });
+                        lockCostProfiler.add(LP.upresent, lcPresent, ucClass);
                     }
                 } else {
                     // BitmapTexture path (shouldn't be locked for writes, but handle gracefully)
@@ -1751,6 +1844,8 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                 leaseRegistry.revokeLease(state.activeLeaseId);
                 state.activeLeaseId = undefined;
             }
+            lockCostProfiler.add(LP.ustate, lcState, ucClass);
+            const lcUpload = lockCostProfiler.now();
 
             // Texture writes are committed by the dirty/version state above. Keep the
             // actual GPU upload out of the Unlock thunk; WebGPU conversion/pipeline work
@@ -1768,6 +1863,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                 }
                 context.deferredUploadManager?.markDirty(state, false);
             }
+            lockCostProfiler.add(LP.uupload, lcUpload, ucClass);
 
             // Track Lock/Unlock pattern for optimization detection
             // dataAccessed = true for now (we don't have memory access tracking yet)

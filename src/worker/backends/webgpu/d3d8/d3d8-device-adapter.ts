@@ -2149,6 +2149,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
                 }
             }
 
+            this.renderer.flushVertexParams();
             this.renderer.ringBufferManager.flushUniforms();
             this.renderer.ringBufferManager.flushStorageBuffer();
 

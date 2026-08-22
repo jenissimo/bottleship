@@ -2280,6 +2280,19 @@ export const dbg = {
             return stats ? { ...stats } : null;
         } catch (e) { console.warn('[dbg] rstats err', e); return null; }
     },
+    /** Vertex scratch-pool counters: whether the pool is on, how many GPU conversions ran,
+     *  how many GPUBuffer/GPUBindGroup objects the converter created, and how many draws
+     *  fell back to the per-draw allocation path. `gpuObjects` is only readable next to
+     *  `conversions` — zero of the first means nothing if the second is also zero. */
+    vcstats(): unknown {
+        try {
+            const dd = System.getInstance().process?.getModule?.('ddraw') as any;
+            const exec = dd?.context?.executor ?? (globalThis as any).__ddrawExecutor;
+            const stats = exec?.getVertexScratchStats?.() ?? null;
+            console.log(`[dbg][vcstats][JSON] ${JSON.stringify(stats)}`);
+            return stats;
+        } catch (e) { console.warn('[dbg] vcstats err', e); return null; }
+    },
     /** Per-frame renderStats deltas + ring high-water marks for the last n frames
      *  (newest last). One call after a visual glitch answers: did the draw count DROP
      *  (engine stopped emitting) or did skip counters / lightsOvf RISE (we dropped or

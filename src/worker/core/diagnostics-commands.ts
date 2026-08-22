@@ -16,6 +16,7 @@ import { invalidateGuestCode, writeGuestCode } from './memory/guest-code';
 import { framePacer } from './frame-pacer';
 import { frameProfiler } from './frame-profiler';
 import { drawCostProfiler } from '../backends/webgpu/ddraw/draw-cost-profiler';
+import { lockCostProfiler } from '../modules/ddraw/lock-cost-profiler';
 import { Logger, LogCategory } from './logger';
 import { System } from './system';
 import { debugSession, watchThunk } from './debug/debug-session';
@@ -614,6 +615,26 @@ if (typeof globalThis !== 'undefined') {
         const r = drawCostProfiler.report();
         console.log('[drawCost][JSON] ' + JSON.stringify(r));
         console.table(r.phases);
+        return r;
+    };
+    // Per-Lock cost profiler — the same shape for IDirectDrawSurface7_Lock/_Unlock, split
+    // by lock class. lockCostEnable() → play a window → lockCostReport().
+    (globalThis as any).lockCostEnable = () => {
+        lockCostProfiler.enable();
+        console.log('[lockCost] enabled — play a Lock-heavy scene, then lockCostReport()');
+    };
+    (globalThis as any).lockCostDisable = () => {
+        lockCostProfiler.disable();
+        console.log('[lockCost] disabled');
+    };
+    (globalThis as any).lockCostReset = () => {
+        lockCostProfiler.reset();
+        console.log('[lockCost] window reset');
+    };
+    (globalThis as any).lockCostReport = () => {
+        const r = lockCostProfiler.report();
+        console.log('[lockCost][JSON] ' + JSON.stringify(r));
+        for (const c of r.classes) console.table(c.phases);
         return r;
     };
     (globalThis as any).slowPathReport = slowPathReport;

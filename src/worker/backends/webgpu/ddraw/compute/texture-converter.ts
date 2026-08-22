@@ -144,10 +144,10 @@ function generateReverseConverterShader(targetFormat: PixelFormat, srcTextureFor
 
     return `
 struct Params {
-    width: u32,
-    height: u32,
-    pitch: u32,  // Output pitch in bytes (may include padding)
-    _pad: u32,
+    width: u32,    // width of the requested BOX, not of the texture
+    height: u32,   // height of the requested BOX
+    originX: u32,  // box origin in the source texture
+    originY: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -164,7 +164,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     // NOTE: WebGPU textureLoad on bgra8unorm already normalizes to RGBA component order
     // (texel.r=R, texel.g=G, texel.b=B, texel.a=A) regardless of memory layout.
     // No manual swizzle is needed.
-    let texel = textureLoad(srcTexture, vec2i(gid.xy), 0);
+    let texel = textureLoad(srcTexture, vec2i(gid.xy) + vec2i(i32(params.originX), i32(params.originY)), 0);
 
     let r = texel.r;
     let g = texel.g;
@@ -1565,7 +1565,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3u) {
         return pipeline;
     }
 
-    /** Reusable GPU objects for one (texture, format, size, pitch) readback shape.
+    /** Reusable GPU objects for one (texture, format, box size) readback shape.
+     *  The box ORIGIN is deliberately not part of the key: it changes nothing about the
+     *  buffer sizes, so it is re-uploaded into the params buffer on every acquire and a
+     *  title that reads a moving rect keeps one pooled set instead of one per position.
      *  `pooled` is false for the set handed out while another readback of the same
      *  shape is still holding the pooled one — that set is destroyed on release. */
     private acquireReverseResources(
@@ -1574,10 +1577,11 @@ fn main(@builtin(global_invocation_id) global_id: vec3u) {
         targetFormat: PixelFormat,
         width: number,
         height: number,
-        pitch: number,
+        originX: number,
+        originY: number,
         outputBufferSize: number
     ): ReverseConvertResources {
-        const key = `${textureFormat}|${targetFormat}|${width}x${height}|${pitch}|${outputBufferSize}`;
+        const key = `${textureFormat}|${targetFormat}|${width}x${height}|${outputBufferSize}`;
         let perTexture = this.reverseResources.get(texture);
         if (!perTexture) {
             perTexture = new Map();
@@ -1586,6 +1590,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3u) {
         const existing = perTexture.get(key);
         if (existing && !existing.busy) {
             existing.busy = true;
+            this.queue.writeBuffer(existing.paramsBuffer, 0,
+                new Uint32Array([width, height, originX, originY]));
             return existing;
         }
 
@@ -1598,7 +1604,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3u) {
             size: 16, // 4 x u32
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
-        this.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([width, height, pitch, 0]));
+        this.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([width, height, originX, originY]));
         const stagingBuffer = this.device.createBuffer({
             size: outputBufferSize,
             usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
@@ -1640,36 +1646,36 @@ fn main(@builtin(global_invocation_id) global_id: vec3u) {
     }
 
     /**
-     * Convert GPU texture to surface format using compute shader.
-     * This is MUCH faster than CPU conversion for readback operations.
+     * Convert a box of a GPU texture to surface format using a compute shader, and hand
+     * the mapped result to `receive` while it is still mapped.
      *
      * Flow:
-     * 1. GPU compute shader reads texture, converts to target format, writes to buffer
+     * 1. GPU compute shader reads the box, converts to target format, writes to buffer
      * 2. Copy buffer to staging buffer (MAP_READ)
-     * 3. Map staging buffer and copy to CPU memory
+     * 3. Map staging buffer and let the caller land it wherever it belongs
      *
-     * @param texture Source GPU texture
-     * @param textureFormat Format of the source texture (rgba8unorm or bgra8unorm)
-     * @param targetFormat Target surface pixel format
-     * @param width Texture width
-     * @param height Texture height
-     * @param pitch Output pitch in bytes (must be >= width * bytesPerPixel)
-     * @returns Uint8Array with converted pixel data, or null on failure
+     * The result is delivered as the TIGHTLY PACKED mapped range rather than as a
+     * pitch-strided copy: the caller's destination is guest memory, and staging it through
+     * an intermediate array is a second full-surface copy plus an allocation per readback.
+     * `receive` must not await — the mapping is unmapped as soon as it returns.
+     *
+     * @param box Region of the source texture to convert
+     * @returns whether `receive` committed the bytes
      */
     async convertFromTexture(
         texture: GPUTexture,
         textureFormat: GPUTextureFormat,
         targetFormat: PixelFormat,
-        width: number,
-        height: number,
-        pitch: number
-    ): Promise<Uint8Array | null> {
+        box: { x: number; y: number; width: number; height: number },
+        receive: (mapped: Uint8Array, rowBytes: number, rows: number) => boolean
+    ): Promise<boolean> {
         // Token span: this method awaits the GPU, so concurrent readbacks would
         // corrupt each other under the Map-keyed start/end.
         const convertToken = profiler.startToken("TextureConverter.convertFromTexture");
         let acquired: ReverseConvertResources | null = null;
 
         try {
+            const { width, height } = box;
             const bytesPerPixel = targetFormat === PixelFormat.RGB565 || targetFormat === PixelFormat.RGB555
                 ? 2
                 : 4;
@@ -1683,15 +1689,15 @@ fn main(@builtin(global_invocation_id) global_id: vec3u) {
             const outputBufferSize = wordCount * 4; // Always 32-bit words
 
             // The reverse shader writes pixels TIGHTLY PACKED (output index = y*width + x),
-            // i.e. the output buffer has a row stride of `width * bytesPerPixel`, NOT `pitch`.
-            // Stage exactly that tight payload, then de-pad into the pitch-strided surface buffer.
+            // i.e. the output buffer has a row stride of `width * bytesPerPixel`. The
+            // destination's own pitch is the receiver's business.
             const tightRowBytes = width * bytesPerPixel;
 
             // Pooled per (texture, shape): the three buffers + bind group + view are
             // identical for every readback of the same surface at the same size, so
             // creating and destroying them per call was pure churn.
             const resources = this.acquireReverseResources(
-                texture, textureFormat, targetFormat, width, height, pitch, outputBufferSize
+                texture, textureFormat, targetFormat, width, height, box.x, box.y, outputBufferSize
             );
             acquired = resources;
             const { outputBuffer, stagingBuffer, bindGroup } = resources;
@@ -1729,19 +1735,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3u) {
             profiler.endToken(mapAsyncToken);
 
             const mapped = new Uint8Array(stagingBuffer.getMappedRange());
-            // Output is pitch*height so the caller can write it straight into surface
-            // memory at the surface's pitch. When pitch > tightRowBytes (padded pitch),
-            // copy row-by-row to avoid the shear bug; otherwise a single copy suffices.
-            const readbackSize = pitch * height;
-            const result = new Uint8Array(readbackSize);
-            if (pitch === tightRowBytes) {
-                result.set(mapped.subarray(0, Math.min(mapped.length, readbackSize)));
-            } else {
-                for (let y = 0; y < height; y++) {
-                    const srcOff = y * tightRowBytes;
-                    result.set(mapped.subarray(srcOff, srcOff + tightRowBytes), y * pitch);
-                }
-            }
+            const committed = receive(mapped, tightRowBytes, height);
 
             // Return the pooled set (unmap only — the buffers outlive the call).
             this.releaseReverseResources(resources);
@@ -1749,17 +1743,17 @@ fn main(@builtin(global_invocation_id) global_id: vec3u) {
             profiler.endToken(convertToken);
 
             Logger.log(LogCategory.DDRAW,
-                `TextureConverter.convertFromTexture: ${width}x${height} ${textureFormat} → ` +
-                `format=${targetFormat} (${readbackSize} bytes)`);
+                `TextureConverter.convertFromTexture: ${width}x${height}@(${box.x},${box.y}) ` +
+                `${textureFormat} → format=${targetFormat} committed=${committed}`);
 
-            return result;
+            return committed;
         } catch (e) {
             Logger.warn(LogCategory.SYSTEM, `TextureConverter.convertFromTexture failed: ${e}`);
             // Must free the pool slot: a set left `busy` forces every later readback of
             // this surface onto throwaway buffers.
             if (acquired) this.releaseReverseResources(acquired);
             profiler.endToken(convertToken);
-            return null;
+            return false;
         }
     }
 
