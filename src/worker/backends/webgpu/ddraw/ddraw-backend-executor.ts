@@ -1728,6 +1728,23 @@ export class DDrawWebGPUExecutor {
         }
     }
 
+    /**
+     * Kick readback prefetches for the surfaces that have been read-Locked. The caller
+     * must already have flushed — the readback has to see the draws of the frame it is
+     * being started for.
+     *
+     * Shared with D3D8, whose render surfaces are these surfaces and whose LockRect is
+     * answered by this same sync manager. Its frame boundary is EndScene/Present rather
+     * than a Blt, so it kicks from there instead of from endFrame.
+     */
+    pumpLockReadbackPrefetch(): void {
+        pumpReadbackPrefetch((state) =>
+            surfaceSyncManager.syncToCPU(state, this.device, this.queue, this.textureConverter, {
+                fromPrefetch: true,
+            })
+        );
+    }
+
     /** `box` scopes the download to the rect a Lock exposed; omit it for the whole
      *  surface. A boxed download deliberately does NOT record cpuSyncedVersion, so
      *  needsCPUSync keeps asking — that is the memo staying honest, not a failure. */
@@ -3591,11 +3608,7 @@ export class DDrawWebGPUExecutor {
         }
         // Overlap GPU→CPU readback with the next scene for surfaces that read-Lock
         // (R-D). Do not go through syncSurfaceToMemory — that re-flushes.
-        pumpReadbackPrefetch((state) =>
-            surfaceSyncManager.syncToCPU(state, this.device, this.queue, this.textureConverter, {
-                fromPrefetch: true,
-            })
-        );
+        this.pumpLockReadbackPrefetch();
         this.sampleFrameStats();
         this.ringBufferManager.nextFrame();
         this.depthManager.resetFrameDirtyFlags();

@@ -64,6 +64,9 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
     exports['IDirect3DDevice8_EndScene'] = (_ctx, _mem, args) => {
         const device = devices.get(args[0]);
         if (!device) return D3DERR_INVALIDCALL;
+        // The frame's pixels are final here, and a title that read-Locks the finished
+        // frame does so between this call and Present — the only kick early enough.
+        device.pumpLockReadbackPrefetch("endScene");
         return D3D_OK;
     };
 

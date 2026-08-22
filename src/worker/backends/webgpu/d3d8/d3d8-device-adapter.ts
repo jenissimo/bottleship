@@ -894,6 +894,37 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         return true;
     }
 
+    /**
+     * Start the GPU→CPU readback for render surfaces the guest read-Locks, so the copy
+     * can overlap guest work instead of stalling the Lock that asks for it.
+     *
+     * OPT-IN (`__d3d8LockPrefetch`), because hiding a round trip needs a GAP between the
+     * moment the pixels are final and the Lock that reads them, and whether one exists is
+     * a property of the title, not of this code. Warcraft III has none — it locks
+     * immediately after EndScene, so the kick lands microseconds early and the Lock still
+     * blocks for the full trip. Measured there: `fromPrefetch` 239/239 and `memoHits` 0,
+     * i.e. every readback relocated and none hidden, p50 25.5→27.0 ms. Reach for this
+     * when `readbackStats` shows a title whose Lock is NOT adjacent to its EndScene.
+     *
+     * Two kick points, because which one can pay depends on where the title locks:
+     * EndScene is the earliest moment the frame's pixels are final and covers a title that
+     * reads the finished frame before presenting it; Present covers one that locks after.
+     *
+     * The row that tells them apart is `readbackStats.memoHits` (the Lock never entered
+     * syncToCPU at all — hidden) against `readbackPrefetch.awaitedInflight` (it did, and
+     * blocked — merely moved). Reading `fromPrefetch` alone cannot distinguish the two.
+     */
+    pumpLockReadbackPrefetch(phase: "endScene" | "present"): void {
+        const g = globalThis as Record<string, unknown>;
+        if (g["__d3d8LockPrefetch"] !== true) return;
+        const off = phase === "endScene"
+            ? "__noD3D8EndScenePrefetch"
+            : "__noD3D8PresentPrefetch";
+        if (g[off] === true) return;
+        this.renderer.flush();
+        this.renderer.pumpLockReadbackPrefetch();
+    }
+
     /** GPU→CPU readback of the device render target, then row-copy into dest. */
     async readRenderTargetToBitmapSurface(dest: BitmapTextureSurface): Promise<boolean> {
         const process = System.getInstance().process;
@@ -2198,6 +2229,9 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             this.frameSnapshot.drawCalls = 0;
             system.services.render.notifyPresent("d3d8");
             frameCapture.onFrameEnd("d3d8"); // harness CaptureBus frame boundary (D3D8)
+            // Complementary to the EndScene kick: covers a title that read-Locks the
+            // frame it has just presented rather than the one it is about to.
+            this.pumpLockReadbackPrefetch("present");
 
             const now = performance.now();
             if (this.prevPresentTime > 0) {

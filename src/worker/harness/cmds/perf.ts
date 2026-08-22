@@ -19,6 +19,7 @@ import { frameProfiler, type BadFrameCapture, type FrameSample } from "../../cor
 import { profiler } from "../../core/profiler";
 import { readbackCounters } from "../../modules/ddraw/surface-sync";
 import { readLockDivergenceCounters } from "../../modules/ddraw/lock-flags";
+import { d3d8LockCounters } from "../../modules/d3d8/lock-flags";
 import { prefetchCounters } from "../../modules/ddraw/surface-readback-prefetch";
 import { drawCostProfiler } from "../../backends/webgpu/ddraw/draw-cost-profiler";
 import { lockCostProfiler } from "../../modules/ddraw/lock-cost-profiler";
@@ -667,6 +668,34 @@ export function registerPerfCommands(svc: HarnessService): void {
             redundant: readbackCounters.redundant,
         };
         if (opts.reset) readbackCounters.reset();
+        return snapshot;
+    });
+
+    /** d3d8LockStats({reset?}) — the D3D8 LockRect census, recorded at the decision point.
+     *  `requestedPixels/surfacePixels` is the ceiling on what scoping the download to the
+     *  app's rect can save; equal totals mean the locks cover the surface anyway and the
+     *  box buys nothing. `locks: 0` while readbackStats counts round trips means this
+     *  census is not wired, which is a different statement from "no locks happened".
+     *  `discardStripped` counts the DISCARD locks that used to wipe a whole surface. */
+    svc.register("d3d8LockStats", (args) => {
+        const opts = (args[0] ?? {}) as { reset?: boolean };
+        const c = d3d8LockCounters;
+        const snapshot = {
+            locks: c.locks,
+            renderSurfaceLocks: c.renderSurfaceLocks,
+            partialRectLocks: c.partialRectLocks,
+            readLocks: c.readLocks,
+            scopableLocks: c.scopableLocks,
+            requestedPixels: c.requestedPixels,
+            surfacePixels: c.surfacePixels,
+            requestedFraction: c.surfacePixels > 0
+                ? c.requestedPixels / c.surfacePixels
+                : null,
+            discardRequested: c.discardRequested,
+            discardStripped: c.discardStripped,
+            invalidCombos: c.invalidCombos,
+        };
+        if (opts.reset) c.reset();
         return snapshot;
     });
 

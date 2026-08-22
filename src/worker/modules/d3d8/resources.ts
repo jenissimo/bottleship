@@ -37,6 +37,10 @@ import {
 import type { BitmapTextureSurface, DirectDrawSurfaceState, RenderSurface } from '../../modules/ddraw/com-objects';
 import { isBitmapTexture, isRenderSurface } from '../../modules/ddraw/com-objects';
 import { surfaceSyncManager } from '../ddraw/surface-sync';
+import { lockCostProfiler, LP, LC } from '../ddraw/lock-cost-profiler';
+import { decideD3D8LockSync, noteD3D8Lock } from './lock-flags';
+import { noteReadLockCandidate, awaitInflightPrefetch } from '../ddraw/surface-readback-prefetch';
+import { noteReadLockServedStale } from '../ddraw/lock-flags';
 
 import {
     D3DFMT_UNKNOWN,
@@ -267,25 +271,41 @@ function lockRenderSurfaceRect(
     mem: Uint8Array,
     d3dFormat: number,
 ): number | Promise<number> {
-    const isDiscard = (flags & D3DLOCK_DISCARD) !== 0;
+    const rect = pRect ? readRect(mem, pRect) : null;
+    const shape = {
+        width: surface.width,
+        height: surface.height,
+        splitStorage: true,
+        // A render surface is device memory; D3DPOOL_DEFAULT is the only pool it can be in.
+        poolDefault: true,
+    };
+    const decision = decideD3D8LockSync(shape, flags, rect);
+    noteD3D8Lock(shape, flags, rect, decision);
+    if (decision.invalid) return D3DERR_INVALIDCALL;
+
     // Tracks the lock Unlock will answer for. `undefined` means "no lock is outstanding",
     // so an Unlock that never had a Lock (or one whose Lock failed before this point)
     // takes the write path — the conservative one. A second, WRITABLE lock of the same
     // surface (D3D8 permits it for disjoint rects) latches false and keeps it: a read-only
     // Unlock arriving after a write lock must never suppress the write's CPU-dirty mark.
-    if ((flags & D3DLOCK_READONLY) !== 0) surface.lastLockReadOnly ??= true;
+    if (!decision.write) surface.lastLockReadOnly ??= true;
     else surface.lastLockReadOnly = false;
     if (!ensureRenderSurfaceGuestMemory(surface)) return D3DERR_INVALIDCALL;
 
+    const lcSetup = lockCostProfiler.now();
+    const lockClass = decision.write ? LC.write : LC.read;
     const finish = (): number => {
+        const lcDesc = lockCostProfiler.now();
         const offset = lockRectOffsetBits(surface, d3dFormat, surface.surfacePtr, pRect, mem);
         if (!offset) return D3DERR_INVALIDCALL;
         writeLockedRect(mem, pLockedRect, offset.pitch, offset.pBits);
         surface.everLocked = true;
+        lockCostProfiler.add(LP.desc, lcDesc, lockClass);
+        lockCostProfiler.countLock(lockClass);
         return D3D_OK;
     };
 
-    if (isDiscard) {
+    if (decision.discard) {
         const rowBytes = Math.min(
             surface.width * Math.max(1, Math.floor(surface.format.bpp / 8)),
             surface.pitch,
@@ -294,18 +314,61 @@ function lockRenderSurfaceRect(
             const rowStart = surface.surfacePtr + row * surface.pitch;
             mem.fill(0, rowStart, rowStart + rowBytes);
         }
+        lockCostProfiler.add(LP.setup, lcSetup, lockClass);
         return finish();
     }
 
+    // A surface the guest reads becomes a prefetch candidate, so the NEXT frame's readback
+    // can be started at EndScene instead of here.
+    if (decision.read && !decision.write) noteReadLockCandidate(surface);
+
+    const lcScratch = lockCostProfiler.now();
     if (surfaceSyncManager.syncToCPUFromScratch(surface, mem)) {
+        lockCostProfiler.add(LP.scratch, lcScratch, lockClass);
+        return finish();
+    }
+    lockCostProfiler.add(LP.scratch, lcScratch, lockClass);
+
+    const lcDecide = lockCostProfiler.now();
+    const needed = surfaceSyncManager.needsCPUSync(surface).needed;
+    lockCostProfiler.add(LP.decide, lcDecide, lockClass);
+    if (!decision.read || !needed) {
+        lockCostProfiler.add(LP.setup, lcSetup, lockClass);
         return finish();
     }
 
-    if (!surfaceSyncManager.needsCPUSync(surface).needed) {
+    // The rect the app named scopes the download. A read-only lock is the only one that
+    // may be scoped (see decideD3D8LockSync), and a scoped download deliberately does not
+    // memoise the whole surface.
+    const box = lockReadbackScopingEnabled() ? decision.box : null;
+
+    // Diagnostic: answer the Lock from the bytes we already hold and start the round trip
+    // anyway, so that when it lands we can say by how much that answer was wrong. This is
+    // how "could this readback be elided?" becomes a measurement instead of an argument.
+    // Read it with `readLockDivergence`; framesDiverged is only evidence when
+    // readbacksCompared > 0.
+    if ((globalThis as { __d3d8NoReadLockReadback?: boolean }).__d3d8NoReadLockReadback === true) {
+        noteReadLockServedStale(surface, surface.version);
+        void adapter.renderer.syncSurfaceToMemory(surface, box);
+        lockCostProfiler.add(LP.setup, lcSetup, lockClass);
         return finish();
     }
 
-    return adapter.renderer.syncSurfaceToMemory(surface).then(() => finish());
+    const lcReadback = lockCostProfiler.now();
+    // A prefetch already in flight for THIS version is the readback this Lock needs;
+    // awaiting it pays only the remainder. A mismatched one is never served.
+    return awaitInflightPrefetch(surface)
+        .then((served) => (served && !box ? null : adapter.renderer.syncSurfaceToMemory(surface, box)))
+        .then(() => {
+            lockCostProfiler.add(LP.readback, lcReadback, lockClass);
+            return finish();
+        });
+}
+
+/** `setWorkerFlag('__noD3D8LockRectScope', true)` restores the whole-surface download that
+ *  ignored the app's rect — the OLD behaviour, not a cheaper one. */
+function lockReadbackScopingEnabled(): boolean {
+    return (globalThis as { __noD3D8LockRectScope?: boolean }).__noD3D8LockRectScope !== true;
 }
 
 /** Stable IDirect3DSurface8 per (texture, level); mirrors Wine pre-create + DXVK cache.
@@ -856,8 +919,12 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
             syncBitmapSurfaceFromGuest(surface);
         } else if (isRenderSurface(surface)) {
             const wasReadOnly = surface.lastLockReadOnly === true;
+            const lcState = lockCostProfiler.now();
+            const lockClass = wasReadOnly ? LC.read : LC.write;
+            lockCostProfiler.countUnlock(lockClass);
             surface.lastLockReadOnly = undefined;   // no lock outstanding
             if (wasReadOnly) {
+                lockCostProfiler.add(LP.ustate, lcState, lockClass);
                 // A READ-ONLY lock modifies nothing, so claiming CPU authority here would
                 // upload the CPU copy over the GPU's own render target next frame. The
                 // readback memo stays valid because every writer bumps `version`
@@ -869,6 +936,7 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
             surface.gpuDirty = true;
             surface.mode = 'CPU';
             surface.everLocked = true;
+            lockCostProfiler.add(LP.ustate, lcState, lockClass);
             Logger.log(LogCategory.SYSTEM, `D3D8 UnlockRect on render_surface 0x${args[0].toString(16)}: marked CPU-dirty, version=${surface.version}`);
         }
         return D3D_OK;
