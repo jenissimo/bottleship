@@ -97,3 +97,6 @@ tools/bench-v86/results/
 # AOT capture/compile outputs — per-machine, keyed to one engine binary
 tools/aot/jobs/
 tools/aot/units/
+
+# Screenshots dropped in the repo root during investigation — they belong in logs/.
+/*.png
