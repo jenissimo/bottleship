@@ -49,6 +49,27 @@ describe("MSS32 Miles ABI fixes", () => {
         expect(view.getInt32(0x10c, true)).toBe(8192);
     });
 
+    test("_AIL_stream_ms_position@12 writes total and current milliseconds", () => {
+        const memory = new Uint8Array(0x1000);
+        Mem.bind(() => memory);
+        const ctx = minimalContext(memory);
+        ctx.streams.set(0x400, {
+            id: 1, handle: 0x400, fileData: new Uint8Array(176400), decodedData: null,
+            filename: null, sampleRate: 22050, channels: 2, bitsPerSample: 16,
+            formatTag: 1, blockAlign: 4, streamMemory: 8192, volume: 127, pan: 64,
+            playbackRate: 1, loopCount: 1, isPlaying: false, isPaused: false,
+            position: 44100, pendingStart: false, pcmBytes: 176400,
+        });
+        const exports = createStreamExports(ctx);
+        const fn = exports["_AIL_stream_ms_position@12"]!;
+        expect(mss32Module.functions.find((entry) => entry.name === "_AIL_stream_ms_position@12")?.params.length).toBe(3);
+
+        expect(fn({} as never, memory, [0x400, 0x100, 0x104])).toBe(0);
+        const view = new DataView(memory.buffer);
+        expect(view.getUint32(0x100, true)).toBe(2000);
+        expect(view.getUint32(0x104, true)).toBe(500);
+    });
+
     test("RIB provider handles retain registered interface tokens", () => {
         const memory = new Uint8Array(0x1000);
         Mem.bind(() => memory);

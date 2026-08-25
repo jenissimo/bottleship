@@ -537,7 +537,7 @@ export function registerTextureCommands(svc: HarnessService): void {
         };
     });
 
-    /** drawScrub(min?, max?) — RenderDoc-style bisect for the D3D9 backend: render only
+    /** drawScrub(min?, max?) — RenderDoc-style bisect for the active 3D backend: render only
      *  draws [min, max] of every frame, numbered exactly as `captureFrame`'s `index`.
      *
      *  A capture says what was SUBMITTED; it cannot say what each draw did to the target.
@@ -549,7 +549,7 @@ export function registerTextureCommands(svc: HarnessService): void {
      *  ONE draw's contribution over whatever the previous frame left behind. */
     svc.register("drawScrub", (args) => {
         const dev: any = sys().services?.render?.getActive?.();
-        if (!dev?.setDrawScrub) throw new HarnessError("active presenter has no draw scrub (not D3D9)", HarnessErrorCode.UNSUPPORTED);
+        if (!dev?.setDrawScrub) throw new HarnessError("active presenter has no draw scrub", HarnessErrorCode.UNSUPPORTED);
         if (args.length > 0) {
             const min = Number(args[0] ?? 0) | 0;
             const max = args[1] === undefined ? -1 : Number(args[1]) | 0;

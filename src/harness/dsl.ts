@@ -356,6 +356,12 @@ export class HarnessChain {
     breakEvents(opts?: { since?: number; limit?: number; clear?: boolean; capacity?: number }): this { return this.push("breakEvents", [opts]); }
     clearBreaks(): this { return this.push("clearBreaks", []); }
     watchMem(addr: number | string, opts?: { onWrite?: boolean }): this { return this.push("watchMem", [addr, opts]); }
+    trapWrites(addr: number | string, len?: number, label?: string,
+        opts?: { trace?: boolean; watch?: boolean; recordAddr?: number; recordLen?: number; slice?: number }): this {
+        return this.push("trapWrites", [addr, len, label, opts]);
+    }
+    memTrapReport(): this { return this.push("memTrapReport", []); }
+    memTrapClear(): this { return this.push("memTrapClear", []); }
     pause(): this { return this.push("pause", []); }
     resume(): this { return this.push("resume", []); }
 

@@ -16,6 +16,7 @@
 import type { HarnessService } from "../service";
 import { dbg } from "../../core/debug/dbg-commands";
 import { System } from "../../core/system";
+import { getSehUnwindTrace } from "../../core/seh-dispatch";
 import { guestCodeInvalidationStats, takeGuestCodeAuditPages } from "../../core/memory/guest-code";
 import { localeFastPathStats } from "../../modules/kernel32/locale";
 import type { RegionKind } from "../../core/memory/address-space";
@@ -56,6 +57,19 @@ function peExecutableSections(mem: Uint8Array, base: number): Array<[number, num
 }
 
 export function registerDbgCommands(svc: HarnessService): void {
+    /**
+     * sehTrace({clear}) — the RtlUnwind frame-by-frame decision log: for each unwind,
+     * the chain head, the target frame, and for every frame in between its handler,
+     * how it was classified and therefore whether its handler ran. A runtime that is
+     * not MSVC (LuaJIT, a custom VM) does its teardown ONLY on that pass, so a frame
+     * skipped here is a runtime left half-unwound — a corruption that surfaces much
+     * later and nowhere near the unwind. Not derivable from the log stream: the
+     * per-frame lines are VERBOSE and the socket drops them under load.
+     */
+    svc.register("sehTrace", (...args: unknown[]) => ({
+        lines: getSehUnwindTrace((args[0] as { clear?: boolean } | undefined)?.clear === true),
+    }));
+
     /**
      * comVtable(module, iface?) — dump a module's COM vtables slot by slot, resolving each
      * slot to the thunk it points at.

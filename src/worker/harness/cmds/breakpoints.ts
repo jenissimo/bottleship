@@ -20,7 +20,7 @@
 
 import type { HarnessService, HarnessCtx } from "../service";
 import { HarnessError, HarnessErrorCode } from "../rpc";
-import { sys, proc } from "../serialize";
+import { sys, proc, symbolize } from "../serialize";
 import { dbg } from "../../core/debug/dbg-commands";
 import { apiBreaks } from "../api-breaks";
 import { eipBreaks, type BreakWhen, type BreakCapture } from "../eip-breaks";
@@ -138,13 +138,14 @@ export function registerBreakpointCommands(svc: HarnessService): void {
         return { armed: true, addr, note: "watched value appears in [DBG] traces — use streamLogs(['SYSTEM']) to observe; JIT is OFF" };
     });
 
-    /** headWatch(headAddr, loEip, hiEip) — TEMP crash-hunt: snapshot a guest list head
+    /** headWatch(headAddr, loEip, hiEip, threadId?) — TEMP crash-hunt: snapshot a guest list head
      *  across context switches, log switch-outs mid-mutation and torn (0) states.
      *  JIT stays ON (deterministic-preserving). headWatch(0) disarms. */
     svc.register("headWatch", (args) => {
         const headAddr = toAddr(args[0] as number | string);
         const loEip = args[1] != null ? toAddr(args[1] as number | string) : 0;
         const hiEip = args[2] != null ? toAddr(args[2] as number | string) : 0;
+        const threadId = args[3] != null ? Number(args[3]) | 0 : 0;
         const sched: any = sys().scheduler as any;
         if (typeof sched?.setDebugHeadWatch !== "function") throw new HarnessError("scheduler.setDebugHeadWatch unavailable", HarnessErrorCode.BAD_ARGS);
         sched.setDebugHeadWatch(headAddr, loEip, hiEip);
@@ -152,8 +153,48 @@ export function registerBreakpointCommands(svc: HarnessService): void {
         if (disp) {
             disp.hcWatchAddr = headAddr >>> 0;
             disp.hcRingEnabled = !!headAddr;            // arm/disarm the hot-path hypercall ring with the watch
+            disp.hcRingThreadFilter = threadId;
         }
-        return { armed: !!headAddr, headAddr, loEip, hiEip, note: "events captured to scheduler ring — read with `headWatchDump`; head sampled per-hypercall in report.lastHypercalls" };
+        return { armed: !!headAddr, headAddr, loEip, hiEip, threadId, note: "events captured to scheduler ring — read with `headWatchDump`; head sampled per-hypercall in report.lastHypercalls" };
+    });
+
+    /** wordWatch(addr) — sample one guest dword at scheduler tick boundaries with JIT on. */
+    svc.register("wordWatch", (args) => {
+        const addr = toAddr(args[0] as number | string);
+        const sched: any = sys().scheduler as any;
+        if (typeof sched?.setDebugWordWatch !== "function") throw new HarnessError("scheduler.setDebugWordWatch unavailable", HarnessErrorCode.BAD_ARGS);
+        sched.setDebugWordWatch(addr);
+        return { armed: !!addr, addr, note: "value transitions captured with TID/EIP; read with wordWatchDump" };
+    });
+
+    svc.register("wordWatchDump", () => {
+        const sched: any = sys().scheduler as any;
+        const events = typeof sched?.getDebugWordWatchLog === "function" ? sched.getDebugWordWatchLog() : [];
+        return { count: events.length, events };
+    });
+
+    /** writeWatch(addr, matchValue?, traceInstructions?) — exact last guest store to one dword using
+     *  v86's interpreted store path. A zero address disarms it. */
+    svc.register("writeWatch", (args) => {
+        const addr = toAddr(args[0] as number | string);
+        const matchValue = args[1] === undefined ? undefined : toAddr(args[1] as number | string);
+        const traceInstructions = args[2] === undefined ? 0 : toAddr(args[2] as number | string);
+        if (!dbg.writeWatch(addr, matchValue, traceInstructions)) throw new HarnessError("v86 write-watch exports unavailable", HarnessErrorCode.BAD_ARGS);
+        return { armed: !!addr, addr, matchValue, traceInstructions, note: "disable guest JIT for exact coverage; read with writeWatchReport" };
+    });
+
+    svc.register("writeWatchReport", () => {
+        const report = dbg.writeWatchReport();
+        if (!report) throw new HarnessError("v86 write-watch exports unavailable", HarnessErrorCode.BAD_ARGS);
+        return {
+            ...report,
+            lastEipSym: symbolize(report.lastEip),
+            lastPrevSym: symbolize(report.lastPrev),
+            zeroEipSym: symbolize(report.zeroEip),
+            zeroPrevSym: symbolize(report.zeroPrev),
+            matchEipSym: symbolize(report.matchEip),
+            matchPrevSym: symbolize(report.matchPrev),
+        };
     });
 
     /** xlate(vaddr) — compare physical (identity) read vs CPU paged translation of a guest

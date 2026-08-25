@@ -76,7 +76,9 @@ const DESCRIPTOR_HELPER = /\bconst\s+([A-Za-z_$][\w$]*)\s*=\s*\((?:(?!=>|\bconst
  * exactly the entries a module keeps in named groups.
  *
  * `makeMethod` is excluded — those are COM vtable slots, not DLL exports, and
- * folding them in would let a missing export read as bindable.
+ * folding them in would let a missing export read as bindable. Inline literals get
+ * the same exclusion by POSITION (see below), since shape alone cannot tell a method
+ * literal from an export literal.
  */
 function exportNames(text: string): string[] {
     const helpers = new Set<string>(["makeFunc"]);
@@ -87,7 +89,35 @@ function exportNames(text: string): string[] {
     for (const m of text.matchAll(/\b([A-Za-z_$][\w$]*)\(\s*"([^"]+)"/g)) {
         if (helpers.has(m[1])) names.push(m[2]);
     }
+    // Inline literals must be sliced to `functions:` even though the helper sweep above
+    // is not: a COM method written out as a literal is the same SHAPE as an export
+    // literal, so only position separates them. File-wide, this folded all 55 of d3d9's
+    // vtable slots into the export set — Present, LockRect, SetTexture — and a missing
+    // export whose name collides with a method would then read as bindable.
+    const exportArrays = bracketSpans(text, /\bfunctions\s*:\s*\[/g);
+    for (const m of text.matchAll(/\{\s*name:\s*"([^"]+)"\s*,\s*params:\s*\[/g)) {
+        const at = m.index ?? 0;
+        if (exportArrays.some(([from, to]) => at >= from && at < to)) names.push(m[1]);
+    }
     return names;
+}
+
+/** Byte ranges of each array opened by `opener`, matched by bracket depth so nested
+ *  arrays cannot end a span early. */
+function bracketSpans(text: string, opener: RegExp): Array<[number, number]> {
+    const spans: Array<[number, number]> = [];
+    for (const m of text.matchAll(opener)) {
+        const start = (m.index ?? 0) + m[0].length - 1;
+        let depth = 0;
+        let i = start;
+        for (; i < text.length; i++) {
+            const c = text[i];
+            if (c === "[") depth++;
+            else if (c === "]" && --depth === 0) break;
+        }
+        spans.push([start, i]);
+    }
+    return spans;
 }
 
 /** Names the thunk generator can size, per HLE module. */

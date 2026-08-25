@@ -43,9 +43,27 @@ interface InFlight {
     timer: ReturnType<typeof setTimeout> | null;
 }
 
+/**
+ * Verbs that only mean anything while the guest is executing: they wait for it to make
+ * progress, hand it input, or judge what it drew. On a crashed guest each one still
+ * "succeeds" — zero presents look like a slow frame, a click lands in a dead queue — so
+ * the run marches on and the crash surfaces much later as a confusing screenshot.
+ * Everything NOT listed here stays available for the post-mortem (report, state, shot,
+ * logs, fs*, break*, textures, …), which is the whole point of stopping here.
+ */
+const NEEDS_LIVE_GUEST = new Set([
+    "tickFrames", "watchFrames", "waitUntil", "waitForEvent", "waitForControl", "sleep",
+    "click", "clickAt", "clickHold", "clickHere", "key", "keyHold", "type",
+    "move", "moveRelative", "drag", "wheel", "inputSab", "padPlug",
+    "tap", "touchDrag", "longPress", "twoFingerTap", "pinch",
+    "expectDialog", "expectSurfaceNonBlack", "expectThread", "expectFileExists", "expectMessages",
+]);
+
 export class HarnessService {
     private handlers = new Map<string, HarnessHandler>();
     private inFlight = new Map<number, InFlight>();
+    /** Set by a fatal fault; every later command fails until the guest is reloaded. */
+    private crashed: HarnessError | null = null;
 
     constructor() {
         // A fatal guest crash ends every wait NOW. Without this a script that was
@@ -54,11 +72,22 @@ export class HarnessService {
         harnessBus.onLocal("fault", (data) => {
             const fault = data as { fatal?: boolean; reason?: string } | null;
             if (!fault?.fatal) return; // per-thread faults leave the process running
-            this.abortAll(new HarnessError(
+            const err = new HarnessError(
                 `guest crashed: ${fault.reason ?? "unknown"} — see report()`,
                 HarnessErrorCode.CRASHED,
-            ));
+            );
+            // Latch it. Aborting only the in-flight call leaves a dead guest that every
+            // SUBSEQUENT verb happily "succeeds" against — a click nobody receives, a
+            // tickFrames over presents that stopped — so the crash surfaces as a puzzling
+            // screenshot minutes later instead of as the failing step.
+            this.crashed = err;
+            this.abortAll(err);
         });
+    }
+
+    /** Clear the crash latch — the guest is being (re)started. */
+    clearCrashLatch(): void {
+        this.crashed = null;
     }
 
     /** Abort every in-flight call (crash teardown). */
@@ -89,6 +118,10 @@ export class HarnessService {
     /** Dispatch a harness_rpc message, posting the correlated reply. */
     async dispatch(msg: HarnessRequest): Promise<void> {
         const { id, cmd, args, opts } = msg;
+        if (this.crashed && NEEDS_LIVE_GUEST.has(cmd)) {
+            this.reply({ type: HARNESS_REPLY, id, ok: false, error: toErrorPayload(this.crashed) });
+            return;
+        }
         const handler = this.handlers.get(cmd);
         if (!handler) {
             this.reply({ type: HARNESS_REPLY, id, ok: false, error: toErrorPayload(new HarnessError(`unknown command: ${cmd}`, HarnessErrorCode.UNKNOWN_CMD)) });
