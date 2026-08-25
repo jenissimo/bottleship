@@ -316,7 +316,14 @@ const fileIoModule = (() => {
     interface FileMappingObject {
         kind: 'file_mapping';
         size: number;
-        fileHandle: number | null;
+        /**
+         * The section's OWN reference to the backing file, not the caller's handle.
+         * Win32 lets the guest CloseHandle its file the moment CreateFileMapping
+         * returns — the section keeps the file object alive — and handle numbers are
+         * recycled, so re-resolving a stored handle number later can land on whatever
+         * file now owns that slot and write the mapped image over it.
+         */
+        file: VfsFileHandle | null;
         protect: number;
     }
 
@@ -326,7 +333,7 @@ const fileIoModule = (() => {
     // for the write-back: without them a mapped view is effectively read-only and
     // any data the guest writes through the view is silently lost (some titles save
     // profiles via CreateFileMapping+MapViewOfFile, no WriteFile).
-    const fileMappingViews: Map<number, { mappingHandle: number; size: number; offset: number; fileHandle: number | null; writable: boolean }> = new Map();
+    const fileMappingViews: Map<number, { mappingHandle: number; size: number; offset: number; file: VfsFileHandle | null; writable: boolean }> = new Map();
 
     // MapViewOfFile dwDesiredAccess flags
     const FILE_MAP_COPY = 0x0001;
@@ -338,18 +345,15 @@ const fileIoModule = (() => {
     // Write a mapped view's current guest-memory contents back to its backing VFS
     // file at the mapped offset. No-op for anonymous (pagefile-backed), read-only,
     // or copy-on-write views.
-    const flushMappedView = async (base: number, view: { size: number; offset: number; fileHandle: number | null; writable: boolean }): Promise<void> => {
-        if (!view.writable || view.fileHandle === null) return;
-        const resourceProvider = System.getInstance().resourceProvider;
-        const fileObj = resourceProvider.getFileHandle(view.fileHandle);
-        if (!fileObj || isConsoleDeviceHandle(fileObj)) return;
+    const flushMappedView = async (base: number, view: { size: number; offset: number; file: VfsFileHandle | null; writable: boolean }): Promise<void> => {
+        if (!view.writable || view.file === null) return;
         const data = Mem.readBytes(base, view.size);
         if (!data) return;
         const vfs = System.getInstance().fileSystem;
         // Write-back runs on its OWN cursor. FlushViewOfFile does not move the file
         // pointer, and a save/restore around these awaits cannot emulate that: the guest
         // may legitimately seek during the yield, and the restore then reverts its seek.
-        const viewHandle = vfs.duplicateHandle((fileObj as FileHandleWrapper).vfsHandle, view.offset);
+        const viewHandle = vfs.duplicateHandle(view.file, view.offset);
         let off = 0;
         while (off < data.length) {
             const chunk = data.subarray(off, Math.min(off + 256 * 1024, data.length));
@@ -1026,7 +1030,8 @@ const fileIoModule = (() => {
         }
 
         let size = dwMaxSizeHigh * 0x100000000 + dwMaxSizeLow;
-        let fileHandle: number | null = null;
+        let mappingFile: VfsFileHandle | null = null;
+        const vfs0 = System.getInstance().fileSystem;
 
         if (hFile !== INVALID_HANDLE_VALUE && hFile !== 0) {
             const resourceProvider = System.getInstance().resourceProvider;
@@ -1035,11 +1040,9 @@ const fileIoModule = (() => {
                 System.getInstance().scheduler.setLastError(ERROR_INVALID_HANDLE);
                 return 0;
             }
-            fileHandle = hFile;
+            mappingFile = vfs0.duplicateHandle((fileObj as FileHandleWrapper).vfsHandle, 0);
             if (size === 0) {
-                const vfsHandle = (fileObj as FileHandleWrapper).vfsHandle;
-                const vfs = System.getInstance().fileSystem;
-                size = vfs.getFileSize(vfsHandle.path);
+                size = vfs0.getFileSize(mappingFile.path);
             }
         }
 
@@ -1050,7 +1053,7 @@ const fileIoModule = (() => {
         const mapping: FileMappingObject = {
             kind: 'file_mapping',
             size,
-            fileHandle,
+            file: mappingFile,
             protect: flProtect,
         };
 
@@ -1078,7 +1081,8 @@ const fileIoModule = (() => {
         }
 
         let size = dwMaxSizeHigh * 0x100000000 + dwMaxSizeLow;
-        let fileHandle: number | null = null;
+        let mappingFile: VfsFileHandle | null = null;
+        const vfs0 = System.getInstance().fileSystem;
 
         if (hFile !== INVALID_HANDLE_VALUE && hFile !== 0) {
             const resourceProvider = System.getInstance().resourceProvider;
@@ -1087,11 +1091,9 @@ const fileIoModule = (() => {
                 System.getInstance().scheduler.setLastError(ERROR_INVALID_HANDLE);
                 return 0;
             }
-            fileHandle = hFile;
+            mappingFile = vfs0.duplicateHandle((fileObj as FileHandleWrapper).vfsHandle, 0);
             if (size === 0) {
-                const vfsHandle = (fileObj as FileHandleWrapper).vfsHandle;
-                const vfs = System.getInstance().fileSystem;
-                size = vfs.getFileSize(vfsHandle.path);
+                size = vfs0.getFileSize(mappingFile.path);
             }
         }
 
@@ -1102,7 +1104,7 @@ const fileIoModule = (() => {
         const mapping: FileMappingObject = {
             kind: 'file_mapping',
             size,
-            fileHandle,
+            file: mappingFile,
             protect: flProtect,
         };
 
@@ -1169,15 +1171,13 @@ const fileIoModule = (() => {
             Mem.writeBytes(base + wrote, zeroChunk.subarray(0, chunkSize));
         }
 
-        if (mapping.fileHandle !== null) {
-            const resourceProvider = System.getInstance().resourceProvider;
-            const fileObj = resourceProvider.getFileHandle(mapping.fileHandle);
-            if (fileObj && !isConsoleDeviceHandle(fileObj)) {
+        if (mapping.file !== null) {
+            {
                 const vfs = System.getInstance().fileSystem;
                 // Populating the view runs on its OWN cursor: MapViewOfFile does not touch
                 // the file pointer at all, and save/restore around these awaits would clobber
                 // any seek the guest performs during the yield.
-                const viewHandle = vfs.duplicateHandle((fileObj as FileHandleWrapper).vfsHandle, offset);
+                const viewHandle = vfs.duplicateHandle(mapping.file, offset);
 
                 const chunkSize = 256 * 1024;
                 let remaining = size;
@@ -1200,9 +1200,9 @@ const fileIoModule = (() => {
         const mappingWritable = (mapping.protect & PAGE_WRITE_MASK) !== 0;
         const accessWrite = (dwDesiredAccess & (FILE_MAP_WRITE | FILE_MAP_ALL_ACCESS)) !== 0;
         const isCopy = (dwDesiredAccess & FILE_MAP_COPY) !== 0 && !accessWrite;
-        const writable = mapping.fileHandle !== null && mappingWritable && accessWrite && !isCopy;
+        const writable = mapping.file !== null && mappingWritable && accessWrite && !isCopy;
 
-        fileMappingViews.set(base, { mappingHandle: hFileMappingObject, size, offset, fileHandle: mapping.fileHandle, writable });
+        fileMappingViews.set(base, { mappingHandle: hFileMappingObject, size, offset, file: mapping.file, writable });
         return base;
     };
 

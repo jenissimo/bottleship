@@ -76,12 +76,14 @@ export class SystemResourceProvider {
     private nextUserHandle   = 0x40000;
     private nextFileHandle   = 0x50000;
 
-    // Free lists for handle recycling (COM objects are created/destroyed frequently).
+    // Free lists for handle recycling.
     // Holds RAW slot values (not the generation-tagged handle). FIFO (push/shift) so reuse
     // is spread across all freed slots → a single slot's generation wraps slowly.
     private freeComHandles: number[] = [];
     /** Freed USER handle SLOTS (generation stripped), reused FIFO (see registerUserObject). */
     private freeUserHandles: number[] = [];
+    /** Closed FILE handle slots, reused FIFO like the Win32 process handle table. */
+    private freeFileHandles: number[] = [];
 
     // Generation tagging for COM handles. COM is the only recycled handle class, and a guest
     // that caches a D3DTEXTUREHANDLE across a destroy+recreate (UE1 level load) would otherwise
@@ -420,12 +422,17 @@ export class SystemResourceProvider {
      * Register a file handle
      */
     registerFileHandle(obj: any): number {
-        const handle = this.nextFileHandle;
-        if (handle >= 0x60000) {
-            Logger.error(LogCategory.RESOURCE, `File handle range exhausted! handle=0x${handle.toString(16)}`);
+        let handle: number;
+        if (this.freeFileHandles.length > 0) {
+            handle = this.freeFileHandles.shift()!;
+        } else {
+            handle = this.nextFileHandle;
+            if (handle >= 0x60000) {
+                Logger.error(LogCategory.RESOURCE, `File handle range exhausted! handle=0x${handle.toString(16)}`);
+            }
+            this.nextFileHandle += 4;
         }
         this.fileHandles.create(handle, obj);
-        this.nextFileHandle += 4;
 
         Logger.verbose(LogCategory.RESOURCE, `Registered file handle=0x${handle.toString(16)}`);
         return handle;
@@ -442,7 +449,11 @@ export class SystemResourceProvider {
      * Unregister a file handle
      */
     unregisterFileHandle(handle: number): any {
-        return this.fileHandles.release(handle);
+        const obj = this.fileHandles.release(handle);
+        if (obj !== null && obj !== undefined) {
+            this.freeFileHandles.push(handle >>> 0);
+        }
+        return obj;
     }
 
     /**
@@ -581,6 +592,7 @@ export class SystemResourceProvider {
         this.nextFileHandle   = 0x50000;
         this.freeComHandles   = [];
         this.freeUserHandles  = [];
+        this.freeFileHandles  = [];
         this.comSlotGeneration.clear();
         this.userSlotGeneration.clear();
     }
