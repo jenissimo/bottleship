@@ -7,7 +7,7 @@ import { MSSContext, SMP_DONE, SMP_PLAYING } from "./context";
 import { MSSStream } from "./types";
 import { System } from "../../core/system";
 import {
-    getBytesPerSecond,
+    getBytesPerSecond, getPlaybackLengthBytes,
     setStreamStatus, writeStreamPosition, writeStreamVolume, writeStreamPan,
     writeStreamPlaybackRate, refreshStreamLenDone, isEncodedFormat,
 } from "./helpers";
@@ -21,6 +21,18 @@ import {
     closeStreamSource, closeVfsStreamSource, openStreamSource, openVfsStreamSource,
     seekIncrementalStream, serveIncrementalStreams, sniffVfsStream, startIncrementalStream,
 } from "./stream-engine";
+
+/** The NUL-terminated bytes at `ptr`, copied out of guest memory (host-side, so it
+ *  survives the yields the caller makes). Bounded — a missing terminator is a bad
+ *  pointer, not a reason to walk the address space. */
+function readGuestCString(ctx: MSSContext, ptr: number, maxBytes = 512): Uint8Array {
+    const mem = ctx.process.getCurrentMemory();
+    const start = ptr >>> 0;
+    let end = start;
+    const limit = Math.min(mem.length, start + maxBytes);
+    while (end < limit && mem[end] !== 0) end++;
+    return mem.slice(start, end);
+}
 
 export function createStreamExports(ctx: MSSContext): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
@@ -85,24 +97,50 @@ export function createStreamExports(ctx: MSSContext): Record<string, ThunkImplem
 
         if (filenameStr && hasAppFileCallbacks(ctx)) {
             const chain = (function* (): GuestCallChain {
-                // Incremental first: one open handle plus a fixed ring, so the app's
-                // reader is asked for a buffer at a time instead of the whole file.
-                if (yield* openStreamSource(ctx, stream, filenamePtr, filenameStr)) {
-                    Logger.log(LogCategory.SYSTEM,
-                        `MSS32: _AIL_open_stream@12 -> 0x${handle.toString(16)} (streamId=${streamId}, incremental via app callbacks)`);
-                    if (stream.pendingStart) startIncrementalStream(ctx, stream);
-                    return handle;
-                }
-                const data = yield* readWholeFileViaApp(ctx, filenamePtr, filenameStr);
-                if (!data) {
-                    discardStream(ctx, stream);
+                // Miles owns a stable copy of the name while it probes and potentially
+                // reopens a stream. Some app callbacks use their input buffer as scratch;
+                // passing the caller's live pointer through both phases lets the probe
+                // silently change the fallback filename.
+                // Copied BYTE for byte, not decoded and re-encoded: an archive entry
+                // name in a DBCS codepage can carry a sequence the ANSI round trip
+                // turns into '?', and the app's own reader would then fail to open a
+                // name it wrote itself.
+                const nameBytes = readGuestCString(ctx, filenamePtr);
+                const nameCopy = ctx.process.memory.alloc(nameBytes.length + 1);
+                if (!nameCopy) {
+                    discardStream(ctx, stream, "could not allocate the stream filename");
                     return 0;
                 }
-                stream.fileData = data;
-                decodeStreamFile(ctx, stream);
-                Logger.log(LogCategory.SYSTEM,
-                    `MSS32: _AIL_open_stream@12 -> 0x${handle.toString(16)} (streamId=${streamId}, ${data.length} bytes via app callbacks)`);
-                return handle;
+                const restoreName = (): void => {
+                    // Re-derived per call: a plain guest view does not survive a yield (§3.1).
+                    const guest = ctx.process.getCurrentMemory();
+                    guest.set(nameBytes, nameCopy);
+                    guest[nameCopy + nameBytes.length] = 0;
+                };
+                try {
+                    restoreName();
+                    // Incremental first: one open handle plus a fixed ring, so the app's
+                    // reader is asked for a buffer at a time instead of the whole file.
+                    if (yield* openStreamSource(ctx, stream, nameCopy, filenameStr)) {
+                        Logger.log(LogCategory.SYSTEM,
+                            `MSS32: _AIL_open_stream@12 -> 0x${handle.toString(16)} (streamId=${streamId}, incremental via app callbacks)`);
+                        if (stream.pendingStart) startIncrementalStream(ctx, stream);
+                        return handle;
+                    }
+                    restoreName();
+                    const data = yield* readWholeFileViaApp(ctx, nameCopy, filenameStr);
+                    if (!data) {
+                        discardStream(ctx, stream);
+                        return 0;
+                    }
+                    stream.fileData = data;
+                    decodeStreamFile(ctx, stream);
+                    Logger.log(LogCategory.SYSTEM,
+                        `MSS32: _AIL_open_stream@12 -> 0x${handle.toString(16)} (streamId=${streamId}, ${data.length} bytes via app callbacks)`);
+                    return handle;
+                } finally {
+                    ctx.process.memory.free(nameCopy);
+                }
             })();
             return runGuestCallChain(ctx, ctxThunk, 12, "mss32:AIL_open_stream", chain);
         }
@@ -278,6 +316,25 @@ export function createStreamExports(ctx: MSSContext): Record<string, ThunkImplem
     };
     exports["_AIL_stream_ms_position@4"] = streamMsPosition;
     exports["_AIL_stream_position_ms@4"] = streamMsPosition;
+    exports["_AIL_stream_ms_position@12"] = (ctxThunk, mem, args) => {
+        const streamHandle = args[0];
+        const stream = ctx.streams.get(streamHandle);
+        const bytesPerSec = stream ? getBytesPerSecond(stream) : 0;
+        const position = stream && bytesPerSec > 0
+            ? exports["_AIL_stream_position@4"]!(ctxThunk, mem, [streamHandle]) as number
+            : 0;
+        // getPlaybackLengthBytes, not the raw byte count: an MP3/OGG stream has no
+        // pcmBytes until it is decoded, and its encoded size over a DECODED rate reports
+        // a fraction of the real duration — a title watching for current >= total then
+        // skips the track almost immediately.
+        const totalBytes = stream ? getPlaybackLengthBytes(stream) : 0;
+        const totalMs = bytesPerSec > 0 ? Math.round(totalBytes * 1000 / bytesPerSec) : 0;
+        const currentMs = bytesPerSec > 0 ? Math.round(position * 1000 / bytesPerSec) : 0;
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        if (args[1] && isValidAddress(mem, args[1], 4, "rw")) view.setUint32(args[1], totalMs >>> 0, true);
+        if (args[2] && isValidAddress(mem, args[2], 4, "rw")) view.setUint32(args[2], currentMs >>> 0, true);
+        return 0;
+    };
 
     // _AIL_set_stream_position@8
     exports["_AIL_set_stream_position@8"] = (ctxThunk, mem, args) => {

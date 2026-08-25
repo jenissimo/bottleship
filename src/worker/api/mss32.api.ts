@@ -121,6 +121,7 @@ export const mss32Module: ModuleDescriptor = {
         makeFunc("_AIL_pause_stream@4", 1),
         makeFunc("_AIL_resume_stream@4", 1),
         makeFunc("_AIL_stream_position_ms@4", 1),
+        makeFunc("_AIL_stream_ms_position@12", 3),
         makeFunc("_AIL_set_stream_position@8", 2),
         makeFunc("_AIL_set_stream_ms_position@8", 2),
         makeFunc("_AIL_stream_ms_position@4", 1),
