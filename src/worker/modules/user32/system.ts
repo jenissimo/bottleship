@@ -2429,6 +2429,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         dmDriverVersion: 34,
         dmSize: 36,
         dmFields: 40,
+        dmPosition: 44,
         dmBitsPerPel: 104,
         dmPelsWidth: 108,
         dmPelsHeight: 112,
@@ -2441,6 +2442,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         dmDriverVersion: 66,
         dmSize: 68,
         dmFields: 72,
+        dmPosition: 76,
         dmBitsPerPel: 168,
         dmPelsWidth: 172,
         dmPelsHeight: 176,
@@ -2449,6 +2451,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         minSize: 188,
     };
     type DevModeOffsets = typeof DEVMODEA_OFFSETS;
+    const DM_POSITION   = 0x00000020;
     const DM_BITSPERPEL = 0x00040000;
     const DM_PELSWIDTH  = 0x00080000;
     const DM_PELSHEIGHT = 0x00100000;
@@ -2465,7 +2468,15 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         return (
             Mem.writeUint16(lpDevMode + offsets.dmSpecVersion, 0x0401) &&
             Mem.writeUint16(lpDevMode + offsets.dmDriverVersion, 0x0401) &&
-            Mem.writeUint32(lpDevMode + offsets.dmFields, DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY) &&
+            Mem.writeUint32(lpDevMode + offsets.dmFields,
+                DM_POSITION | DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY) &&
+            // The display's origin in the virtual desktop. Windows always fills it, and a
+            // caller that reads it out of an uninitialized DEVMODE gets stack garbage:
+            // SDL2 resolves SDL_WINDOWPOS_CENTERED from exactly this field, so leaving it
+            // put every SDL window at a nonsense origin — and mouse messages, whose lParam
+            // is screen-minus-window, then carried a clamped client point instead of one.
+            Mem.writeUint32(lpDevMode + offsets.dmPosition, 0) &&
+            Mem.writeUint32(lpDevMode + offsets.dmPosition + 4, 0) &&
             Mem.writeUint32(lpDevMode + offsets.dmBitsPerPel, mode.bpp >>> 0) &&
             Mem.writeUint32(lpDevMode + offsets.dmPelsWidth, mode.width >>> 0) &&
             Mem.writeUint32(lpDevMode + offsets.dmPelsHeight, mode.height >>> 0) &&

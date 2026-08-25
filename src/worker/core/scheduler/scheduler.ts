@@ -491,6 +491,32 @@ export class Scheduler {
     getDebugHeadWatchLog(): string[] { return this.debugHeadWatchLog; }
     getDebugHeadZeroSnaps(): string[] { return this.debugHeadZeroSnaps; }
 
+    private debugWordWatchAddr = 0;
+    private debugWordWatchPrev = -1;
+    private debugWordWatchLog: string[] = [];
+    setDebugWordWatch(addr: number): void {
+        this.debugWordWatchAddr = addr >>> 0;
+        this.debugWordWatchPrev = -1;
+        this.debugWordWatchLog = [];
+    }
+    getDebugWordWatchLog(): string[] { return this.debugWordWatchLog; }
+
+    private sampleDebugWordWatch(cpu: V86Cpu): void {
+        if (!this.debugWordWatchAddr) return;
+        const value = (Mem.readUint32(this.debugWordWatchAddr) ?? 0) >>> 0;
+        if (value === this.debugWordWatchPrev) return;
+        const prev = this.debugWordWatchPrev;
+        this.debugWordWatchPrev = value;
+        const eip = cpu.instruction_pointer[0] >>> 0;
+        const entry = `0x${(prev >>> 0).toString(16)}->0x${value.toString(16)} ` +
+            `T${this.currentThreadId ?? 0}@0x${eip.toString(16)} insn=${this.retiredInsns(cpu) >>> 0}`;
+        if (this.debugWordWatchLog.length < 4096) this.debugWordWatchLog.push(entry);
+        else {
+            this.debugWordWatchLog.copyWithin(0, 1);
+            this.debugWordWatchLog[4095] = entry;
+        }
+    }
+
     /** Per-tick head sample: record the EDGE where the guest list head flips to/from 0.
      *  The current thread + live EIP at the flip-to-0 IS the corrupting writer. Cheap
      *  (one dword read per ~100k-insn tick). Called at the TOP of preemptAtTickBoundary. */
@@ -796,7 +822,8 @@ export class Scheduler {
         this.callbackCoord.dispatchOne();
 
         // 4. Check quantum expiry → request switch (retired-instruction quantum, not wall-clock)
-        if (!this.switchRequested && this.runQueue.length > 0) {
+        if (!this.switchRequested && this.runQueue.length > 0 &&
+            !(globalThis as { __noQuantumPreempt?: boolean }).__noQuantumPreempt) {
             const current = this.getCurrentThread();
             if (current && this.quantumExpired(current, cpu)) {
                 this.switchRequested = true;
@@ -857,6 +884,7 @@ export class Scheduler {
         if (!this.process) return;
 
         if (this.debugHeadWatch) this.sampleDebugHeadWatch(cpu); // TEMP crash-hunt
+        this.sampleDebugWordWatch(cpu);
 
         if (this.handleUnhandledFaultHalt(cpu, "preemptAtTickBoundary")) return;
 
@@ -1042,8 +1070,10 @@ export class Scheduler {
                 if (this.spinLoopBase > 0 && (cpu.instruction_pointer[0] >>> 0) === this.spinLoopBase) {
                     this.switchRequested = true;
                 }
-                if (!(this.switchRequested || this.quantumExpired(current, cpu))) this.lastTickExit = 7;
-                if (this.switchRequested || this.quantumExpired(current, cpu)) {
+                const quantumExpired = !(globalThis as { __noQuantumPreempt?: boolean }).__noQuantumPreempt &&
+                    this.quantumExpired(current, cpu);
+                if (!(this.switchRequested || quantumExpired)) this.lastTickExit = 7;
+                if (this.switchRequested || quantumExpired) {
                     if (this.shouldDeferSwitchForCriticalRuntime(cpu, ThunkBoundaryKind.GUEST_CODE)) {
                         this.switchRequested = true;
                         return;
@@ -1511,6 +1541,11 @@ export class Scheduler {
         let current = this.getCurrentThread();
         this.recordSwitchTrace(cpu, kind, cleanup);
 
+        if ((globalThis as { __pinRunningMainThread?: boolean }).__pinRunningMainThread &&
+            current?.id === this.mainThreadId && current.state === ThreadState.RUNNING) {
+            return false;
+        }
+
         // Save current thread context if RUNNING
         if (current && current.state === ThreadState.RUNNING) {
             // Sync lastError from WASM hypercall page
@@ -1596,7 +1631,8 @@ export class Scheduler {
         const inThunkRegion = (currentEip >= this.thunkStubBase && currentEip < this.thunkStubEnd) ||
             (this.callbackStubBase > 0 && currentEip >= this.callbackStubBase && currentEip < this.callbackStubEnd);
 
-        if (inThunkRegion && kind === ThunkBoundaryKind.THUNK_STUB) {
+        if (inThunkRegion && kind === ThunkBoundaryKind.THUNK_STUB &&
+            !(globalThis as { __noStackBasedRestore?: boolean }).__noStackBasedRestore) {
             // Stack-based restore: compute adjusted ESP, write target EIP, let RET N pop naturally
             this.stackBasedRestore(cpu, savedCtx, cleanup, next.id);
         } else {
@@ -1965,28 +2001,32 @@ export class Scheduler {
         }
 
         if (!this.hasOtherRunnableThreads(thread.id)) {
-            // Short sole-runnable Sleep: stay RUNNING, credit virtual time, yield to host.
-            // Virtual-time gap: no guest instructions during yield → updateTimeData() never ticks;
-            // timeGetTime-paced loops (NFSU audio pump EDI+=10) see a frozen clock without
-            // credit. Idle-pump in pollTimeouts() is gated off while any thread is RUNNING.
-            // A/B kill-switch: globalThis.__noSleepVirtualCredit = true
+            // A Sleep is an NT delay wait even when it is the last runnable thread, so the
+            // DEFAULT for every duration is blockThread + the timer wheel. That includes
+            // Sleep(INFINITE), which parks with no timeout and nothing left to wake it —
+            // faithful, since a sole thread sleeping forever is exactly what NT does.
             //
-            // Long sole-runnable Sleep(>50): blockThread + timer wheel — crediting full `ms`
-            // while host yield is capped at 50ms would fast-forward virtual time (menu/loading).
-            if (ms !== INFINITE && ms <= SOLE_RUNNABLE_SLEEP_CREDIT_MAX_MS) {
+            // Setting __noSoleRunnableSleepBlock takes the host-yield path for short sleeps
+            // instead: stay RUNNING, credit virtual time, yield. That credit exists because
+            // a yield retires no guest instructions, so updateTimeData() never ticks and a
+            // timeGetTime-paced loop sees a frozen clock; pollTimeouts()' idle pump is gated
+            // off while any thread is RUNNING. It is capped at SOLE_RUNNABLE_SLEEP_CREDIT_MAX_MS
+            // because crediting a full long `ms` against a host yield capped at 50ms would
+            // fast-forward virtual time.
+            // A/B kill-switches: __noSoleRunnableSleepBlock (path), __noSleepVirtualCredit (credit)
+            if (ms !== INFINITE && ms <= SOLE_RUNNABLE_SLEEP_CREDIT_MAX_MS
+                && (globalThis as { __noSoleRunnableSleepBlock?: boolean }).__noSoleRunnableSleepBlock) {
                 this.sleepPathStats.soleRunnableYield++;
                 this.creditVirtualTimeForSoleRunnableSleep(ms);
                 this.requestYieldToHost(ms, "sleepN");
                 return 0;
             }
-            if (ms !== INFINITE) {
-                const context = createPostReturnContext(returnAddr, postReturnEsp, callerCtx, 0);
-                this.sleepPathStats.blockedWait++;
-                this.blockThread(thread, WaitReason.SLEEP, [], false, ms, alertable, 0, context);
-                this.requestYieldToHost(this.computeYieldMs(ms), "sleepNLong");
-                return WAIT_BLOCKED_NO_SWITCH;
-            }
-            return 0;
+            const context = createPostReturnContext(returnAddr, postReturnEsp, callerCtx, 0);
+            this.sleepPathStats.blockedWait++;
+            this.blockThread(thread, WaitReason.SLEEP, [], false,
+                ms === INFINITE ? null : ms, alertable, 0, context);
+            this.requestYieldToHost(this.computeYieldMs(ms === INFINITE ? 50 : ms), "sleepNLong");
+            return WAIT_BLOCKED_NO_SWITCH;
         }
 
         const context = createPostReturnContext(returnAddr, postReturnEsp, callerCtx, 0);
@@ -3185,6 +3225,10 @@ export class Scheduler {
         return t ? (t.tlsValues.get(index) ?? 0) : 0;
     }
 
+    tlsIsAllocated(index: number): boolean {
+        return this.tlsSlots.has(index);
+    }
+
     tlsSetValue(index: number, value: number): boolean {
         const t = this.getCurrentThread();
         if (!t || !this.tlsSlots.has(index)) return false;
@@ -4245,7 +4289,8 @@ export class Scheduler {
         Logger.verbose(LogCategory.THREAD,
             `wakeThread: T${thread.id} ${reason !== undefined ? WAIT_REASON_NAMES[reason] : '?'} -> READY, result=0x${result.toString(16)}`);
 
-        if (this.currentThreadId !== null && this.currentThreadId !== thread.id) {
+        if (this.currentThreadId !== null && this.currentThreadId !== thread.id &&
+            !(globalThis as { __noWakePreempt?: boolean }).__noWakePreempt) {
             this.requestSwitch();
         }
         // If the worker is parked in a setTimeout idle-yield (all threads were blocked)

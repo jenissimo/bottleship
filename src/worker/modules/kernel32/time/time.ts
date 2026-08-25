@@ -15,6 +15,10 @@ export const exports: Record<string, ThunkImplementation> = {};
 let lastSleepLog = 0;
 let sleepCallCount = 0;
 let lastSleepMs = 0;
+// Sleep is the top thunk in spin-yield titles, and "how many" is useless without
+// "of what": a Sleep(0) yield and a Sleep(2) block are different bugs, and the
+// last-value-seen the line used to print names neither.
+const sleepArgHist = { zero: 0, one: 0, two: 0, more: 0 };
 let lastSleepExApcDepth = -1;
 let sleepExStormUnchangedTicks = 0;
 let lastSleepExStormWarnMs = 0;
@@ -178,13 +182,19 @@ function initTimeFunctions(): void {
         const now = performance.now();
         sleepCallCount += 1;
         lastSleepMs = dwMilliseconds;
+        if (dwMilliseconds === 0) sleepArgHist.zero++;
+        else if (dwMilliseconds === 1) sleepArgHist.one++;
+        else if (dwMilliseconds === 2) sleepArgHist.two++;
+        else sleepArgHist.more++;
         if (now - lastSleepLog >= 1000) {
             Logger.log(
                 LogCategory.KERNEL32,
-                `Sleep: calls=${sleepCallCount} lastMs=${lastSleepMs}`
+                `Sleep: calls=${sleepCallCount} lastMs=${lastSleepMs} ` +
+                `ms0=${sleepArgHist.zero} ms1=${sleepArgHist.one} ms2=${sleepArgHist.two} ms3+=${sleepArgHist.more}`
             );
             lastSleepLog = now;
             sleepCallCount = 0;
+            sleepArgHist.zero = sleepArgHist.one = sleepArgHist.two = sleepArgHist.more = 0;
         }
 
         const sched = System.getInstance().scheduler;

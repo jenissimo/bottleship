@@ -189,6 +189,21 @@ describe("ThunkGenerator hands out no executable space without invalidating it",
         expect(covers(address, 16)).toBe(true);
     });
 
+    test("an in-image alias reuses the canonical function ID", () => {
+        const gen = new ThunkGenerator();
+        gen.setBaseAddress(0x21046000);
+        const canonical = gen.allocateOneStub("kernel32", "QueryPerformanceCounter", 1, "stdcall");
+        const target = gen.getStubByAddress(canonical.address)!;
+
+        const alias = gen.allocateAliasStubAt(0x2a001000, target, 1, "stdcall");
+        const next = gen.allocateOneStub("kernel32", "QueryPerformanceFrequency", 1, "stdcall");
+
+        const aliasId = new DataView(alias.code.buffer).getUint32(1, true);
+        expect(aliasId).toBe(target.functionId);
+        expect(gen.getStubByAddress(alias.address)?.functionId).toBe(target.functionId);
+        expect(gen.getStubByAddress(next.address)?.functionId).toBe(target.functionId + 1);
+    });
+
     test("allocateRawCodeArea invalidates the reserved area", () => {
         const gen = new ThunkGenerator();
         gen.setBaseAddress(0x21046000);

@@ -1677,6 +1677,25 @@ function mkBlockableCurrent(s: Scheduler, id: number): Thread {
     return t;
 }
 
+const CALLER_CONTEXT = {
+    ecx: 0, edx: 0, ebx: 0, ebp: 0, esi: 0, edi: 0, eflags: 0x202,
+};
+
+describe("scheduler/NT delay semantics", () => {
+    test("sole-runnable Sleep(INFINITE) remains blocked without a timeout timer", () => {
+        const s = new Scheduler();
+        const t = mkBlockableCurrent(s, 1);
+
+        const ret = s.sleepWithContext(INFINITE, 0x401000, 0x10ffa00, CALLER_CONTEXT);
+
+        expect(ret).toBe(WAIT_BLOCKED_NO_SWITCH);
+        expect(t.state).toBe(ThreadState.WAITING);
+        expect(t.waitInfo?.reason).toBe(WaitReason.SLEEP);
+        expect(t.waitInfo?.timeoutTimerId).toBe(0);
+        expect((s as any).runQueue).toHaveLength(0);
+    });
+});
+
 describe("scheduler/blockThread — lost-wakeup guard (WASM SetEvent/Wait race)", () => {
     test("auto-reset event latched in the mirror during the window wakes the thread (not stuck WAITING)", () => {
         const s = new Scheduler();

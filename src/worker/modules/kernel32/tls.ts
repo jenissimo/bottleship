@@ -28,8 +28,15 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         const dwTlsIndex = args[0];
 
         Logger.verbose(LogCategory.KERNEL32, `TlsGetValue(${dwTlsIndex})`);
-
-        return System.getInstance().scheduler.tlsGetValue(dwTlsIndex);
+        const scheduler = System.getInstance().scheduler;
+        if (!scheduler.tlsIsAllocated(dwTlsIndex)) {
+            scheduler.setLastError(87); // ERROR_INVALID_PARAMETER
+            return 0;
+        }
+        // A NULL value is a successful result. Win32 makes it distinguishable from
+        // failure by clearing LastError on every successful TlsGetValue call.
+        scheduler.setLastError(0);
+        return scheduler.tlsGetValue(dwTlsIndex);
     };
 
     exports['TlsSetValue'] = (ctx, mem, args) => {

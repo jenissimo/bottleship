@@ -138,7 +138,7 @@ import { registerFastPathMsvcrtFunctions } from "./modules/msvcrt";
 import { registerFastPathPointerFunctions } from "./modules/kernel32/exception";
 import { registerFastPathProcessFunctions } from "./modules/kernel32/process/process";
 import { prePopulateGetProcAddressCache, registerFastPathModuleFunctions, ensureGetProcAddressDynamicExports } from "./modules/kernel32/module/module";
-import { materializeHleModuleImages } from "./core/hle-module-images";
+import { loadedHleModules, materializedHleModules, materializeHleModuleImages } from "./core/hle-module-images";
 import { KERNEL32_VISTA_WARMUP_EXPORTS } from "./api/kernel32-vista-supplement";
 // Load diagnostics commands (exposes frameDiagnostics to console)
 import "./core/diagnostics-commands";
@@ -962,6 +962,11 @@ const loadPeData = async (peData: Uint8Array, skipReset: boolean = false) => {
     await prepareFullGameSwitch();
   }
 
+  // Imports mark HLE modules as loaded while loadExecutable walks the import table.
+  // Publish the synthetic images first so those marks have process-local slots to target.
+  materializeHleModuleImages(system.process);
+  system.process.dispatcher.applyPendingRegistrations();
+
   // Restart placeholder drawing
   placeholderActive = true;
   if (state.ctx) {
@@ -1031,6 +1036,39 @@ const loadPeData = async (peData: Uint8Array, skipReset: boolean = false) => {
     // The images allocate a fresh stub per declared export, so the pass above left them
     // with no handler attached — a second pass binds them before anything can hand one out.
     system.process.dispatcher.applyPendingRegistrations();
+    {
+      const nativeModules = system.process.moduleRegistry.getAllModules().map((m: any) => ({
+        name: m.isExecutable ? `${m.name}.exe` : `${m.name}.dll`, path: m.path,
+        base: m.baseAddress, size: m.size,
+        entryPoint: m.entryPoint ? (m.baseAddress + m.entryPoint) >>> 0 : 0,
+      }));
+      const hleModules = loadedHleModules().map(m => ({
+        name: m.name === 'kernel32' ? 'KERNEL32.DLL' : `${m.name}.dll`,
+        path: `C:\\Windows\\System32\\${m.name}.dll`,
+        base: m.base, size: m.size, entryPoint: 0,
+      }));
+      // ntdll is mapped by the OS bootstrap, not by the executable import table.
+      // Native startup code nevertheless finds it first in InInitializationOrder.
+      if (!hleModules.some(m => m.name.toLowerCase() === 'ntdll.dll')) {
+        const ntdll = materializedHleModules().find(m => m.name === 'ntdll');
+        if (ntdll) hleModules.push({
+          name: 'ntdll.dll', path: 'C:\\Windows\\System32\\ntdll.dll',
+          base: ntdll.base, size: ntdll.size, entryPoint: 0,
+        });
+      }
+      const allModules = [...nativeModules, ...hleModules];
+      const take = (predicate: (m: typeof allModules[number]) => boolean) => {
+        const i = allModules.findIndex(predicate);
+        return i >= 0 ? allModules.splice(i, 1)[0] : undefined;
+      };
+      const loaderOrder = [
+        take(m => m.name.toLowerCase().endsWith('.exe')),
+        take(m => m.name.toLowerCase() === 'ntdll.dll'),
+        take(m => m.name.toLowerCase() === 'kernel32.dll'),
+        ...allModules,
+      ].filter((m): m is typeof allModules[number] => !!m);
+      system.scheduler?.tebManager.syncLoaderData(loaderOrder);
+    }
     prePopulateGetProcAddressCache(system.process.dispatcher);
     ensureGetProcAddressDynamicExports(system.process.dispatcher, [
       { dll: "d3d9", name: "Direct3DShaderValidatorCreate9" },
@@ -2065,6 +2103,10 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
 
     // Signal host that loading is done and the game is starting
     self.postMessage({ type: "loading_progress", phase: "done", percent: 100, label: "" });
+    // A previous run's crash is not this run's state. Dropped HERE, not at load start:
+    // tearing the old process down runs its exit paths, and one of those re-arms the
+    // latch — so a clear taken any earlier is undone before the new guest exists.
+    harnessService.clearCrashLatch();
     // Arm the first-present hook HERE (not at load start): the host has just switched
     // the overlay to "booting", and the guest's first real composite happens strictly
     // after this point. This makes first_present arrive AFTER "done" so the one-shot

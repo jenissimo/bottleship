@@ -53,6 +53,7 @@ const FAKE_PID = 1234;
 const PEB_BEING_DEBUGGED       = 0x02; // BOOLEAN (byte)
 const PEB_IMAGE_BASE           = 0x08; // PVOID
 const PEB_PROCESS_PARAMETERS   = 0x10; // PRTL_USER_PROCESS_PARAMETERS
+const PEB_LDR                  = 0x0C; // PPEB_LDR_DATA
 const PEB_NUMBER_OF_PROCESSORS = 0x64; // ULONG
 const PEB_OS_MAJOR_VERSION     = 0xA4; // ULONG
 const PEB_OS_MINOR_VERSION     = 0xA8; // ULONG
@@ -75,8 +76,18 @@ const RTL_USER_PROC_PARAMS_NORMALIZED = 0x01; // pointers are absolute (running 
 // heap-base), a fresh alloc would land on 0x1000000 — the same address the persistent
 // PEB occupies (it sits at the main thread's stack bottom and is reused in place). A
 // fixed sub-region avoids that collision; updatePebImageBase re-writes it post-reset.
-const PEB_ALLOC_SIZE           = PEB_SIZE + PROC_PARAMS_SIZE;
+const LDR_OFFSET_IN_PEB        = PEB_SIZE + PROC_PARAMS_SIZE;
+const LDR_STORAGE_SIZE         = 0x8000;
+const PEB_ALLOC_SIZE           = LDR_OFFSET_IN_PEB + LDR_STORAGE_SIZE;
 const PP_OFFSET_IN_PEB         = PEB_SIZE; // ProcessParameters immediately follows the PEB header
+
+export interface PebLoaderModule {
+    name: string;
+    path: string;
+    base: number;
+    size: number;
+    entryPoint: number;
+}
 
 interface MemoryManager {
     alloc(size: number, kind?: string, perms?: string): number;
@@ -102,6 +113,8 @@ export class TebManager {
      */
     initProcess(getMemory: () => Uint8Array, memoryManager: MemoryManager, imageBase: number = 0x00400000): void {
         this.getMemory = getMemory;
+        this.tebMap.clear();
+        this.tlsArrayMap.clear();
 
         // Allocate PEB + its embedded ProcessParameters as one block.
         this.pebAddress = memoryManager.alloc(PEB_ALLOC_SIZE);
@@ -160,6 +173,71 @@ export class TebManager {
         }
         this.writePebSystemFields();
         this.ensureProcessParameters();
+    }
+
+    /** Publish the 32-bit NT loader lists used by code that resolves exports through
+     * PEB->Ldr instead of calling GetModuleHandle/GetProcAddress. */
+    syncLoaderData(modules: PebLoaderModule[]): void {
+        if (!this.pebAddress || !this.getMemory) return;
+        const mem = this.getMemory();
+        const view = this.getView();
+        if (!view) return;
+
+        const ldr = this.pebAddress + LDR_OFFSET_IN_PEB;
+        const storageEnd = ldr + LDR_STORAGE_SIZE;
+        mem.fill(0, ldr, storageEnd);
+        view.setUint32(this.pebAddress + PEB_LDR, ldr, true);
+        view.setUint32(ldr, 0x30, true);
+        view.setUint8(ldr + 4, 1);
+
+        const entrySize = 0x50;
+        let cursor = ldr + 0x30 + modules.length * entrySize;
+        const entries: number[] = [];
+        const writeUnicodeString = (descriptor: number, value: string): void => {
+            const byteLength = value.length * 2;
+            if (cursor + byteLength + 2 > storageEnd) throw new Error('PEB loader storage exhausted');
+            for (let i = 0; i < value.length; i++) view.setUint16(cursor + i * 2, value.charCodeAt(i), true);
+            view.setUint16(cursor + byteLength, 0, true);
+            view.setUint16(descriptor, byteLength, true);
+            view.setUint16(descriptor + 2, byteLength + 2, true);
+            view.setUint32(descriptor + 4, cursor, true);
+            cursor += byteLength + 2;
+            cursor = (cursor + 3) & ~3;
+        };
+
+        for (let i = 0; i < modules.length; i++) {
+            const mod = modules[i]!;
+            const entry = ldr + 0x30 + i * entrySize;
+            entries.push(entry);
+            view.setUint32(entry + 0x18, mod.base >>> 0, true);
+            view.setUint32(entry + 0x1C, mod.entryPoint >>> 0, true);
+            view.setUint32(entry + 0x20, mod.size >>> 0, true);
+            writeUnicodeString(entry + 0x24, mod.path);
+            writeUnicodeString(entry + 0x2C, mod.name);
+            view.setUint16(entry + 0x38, 0xFFFF, true);
+        }
+
+        const linkList = (head: number, linkOffset: number, listEntries = entries): void => {
+            if (listEntries.length === 0) {
+                view.setUint32(head, head, true);
+                view.setUint32(head + 4, head, true);
+                return;
+            }
+            for (let i = 0; i < listEntries.length; i++) {
+                const link = listEntries[i]! + linkOffset;
+                const next = i + 1 < listEntries.length ? listEntries[i + 1]! + linkOffset : head;
+                const prev = i > 0 ? listEntries[i - 1]! + linkOffset : head;
+                view.setUint32(link, next, true);
+                view.setUint32(link + 4, prev, true);
+            }
+            view.setUint32(head, listEntries[0]! + linkOffset, true);
+            view.setUint32(head + 4, listEntries[listEntries.length - 1]! + linkOffset, true);
+        };
+        linkList(ldr + 0x0C, 0x00);
+        linkList(ldr + 0x14, 0x08);
+        // The process image is present in load/memory order, but Windows does not put
+        // it in InInitializationOrder. Bootstrap resolvers rely on ntdll being first.
+        linkList(ldr + 0x1C, 0x10, entries.filter((_, i) => !modules[i]!.name.toLowerCase().endsWith('.exe')));
     }
 
     /**

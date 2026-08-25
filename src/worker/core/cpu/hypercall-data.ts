@@ -69,6 +69,9 @@ const OFF_HC_RAND_SEED = 0x0B0;
 // buffer-change resync (rewriteState).
 const OFF_HC_CAPTURE_HWND = 0x0B4;
 const OFF_HC_DISPATCH_TABLE = 0x100;
+const OFF_HC_DISPATCH_TABLE_EXT = 0x4000;
+const HC_DISPATCH_LIMIT = 0x10000;
+const HC_DISPATCH_EXT_COUNT = HC_DISPATCH_LIMIT - 4096;
 const OFF_HC_FLS_ALLOCATED = 0x1100; // 129 bytes, one allocation flag per FLS slot (slot 0 unused)
 const OFF_HC_FLS_VALUES = 0x1184;    // 129 * u32 slot values
 // EAGL token-dispatch config pointer (handler 132) — must match hypercall.rs.
@@ -540,6 +543,21 @@ export class HypercallDataManager {
         }
     }
 
+    private dispatchEntryOffset(functionId: number): number {
+        return functionId < 4096
+            ? OFF_HC_DISPATCH_TABLE + functionId
+            : OFF_HC_DISPATCH_TABLE_EXT + functionId - 4096;
+    }
+
+    /** Diagnostic write used by hcoff/hcon as well as the normal registration path. */
+    setDispatchEntry(functionId: number, handlerId: number): boolean {
+        if (functionId <= 0 || functionId >= HC_DISPATCH_LIMIT || handlerId < 0 || handlerId > 255) return false;
+        this.refreshViews();
+        if (!this.view) return false;
+        this.view.setUint8(this.hpBase + this.dispatchEntryOffset(functionId), handlerId);
+        return true;
+    }
+
     /** Re-write all JS-owned state into HYPERCALL_PAGE after buffer change. */
     private rewriteState(): void {
         if (!this.view) return;
@@ -551,7 +569,7 @@ export class HypercallDataManager {
         // Dispatch table entries
         for (const [functionId, handlerId] of this.registeredEntries) {
             const suppressed = this.wasmStringWritersOff && WASM_WRITE_HANDLERS.has(handlerId);
-            this.view.setUint8(this.hpBase + OFF_HC_DISPATCH_TABLE + functionId, suppressed ? 0 : handlerId);
+            this.view.setUint8(this.hpBase + this.dispatchEntryOffset(functionId), suppressed ? 0 : handlerId);
         }
 
         // Slab control-block pointer (the slab control fields themselves live in guest RAM,
@@ -936,7 +954,7 @@ export class HypercallDataManager {
      */
     registerFunction(dllName: string, functionName: string, functionId: number): void {
         if (!this.initialized || !this.view) return;
-        if (functionId <= 0 || functionId >= 4096) return;
+        if (functionId <= 0 || functionId >= HC_DISPATCH_LIMIT) return;
 
         const key = `${dllName.toLowerCase()}.${functionName.toLowerCase()}`;
         const handlerId = HANDLER_MAP[key];
@@ -946,7 +964,7 @@ export class HypercallDataManager {
         if (!this.view) return;
 
         // Write handler_id into dispatch_table[functionId]
-        const offset = this.hpBase + OFF_HC_DISPATCH_TABLE + functionId;
+        const offset = this.hpBase + this.dispatchEntryOffset(functionId);
         // Use setUint8 since dispatch table entries are single bytes
         const suppressed = this.wasmStringWritersOff && WASM_WRITE_HANDLERS.has(handlerId);
         this.view.setUint8(offset, suppressed ? 0 : handlerId);
@@ -966,7 +984,7 @@ export class HypercallDataManager {
      * Idempotent; survives dispatch-table rebuild via registeredEntries.
      */
     registerRawHandler(functionId: number, handlerId: number): void {
-        if (functionId <= 0 || functionId >= 4096) {
+        if (functionId <= 0 || functionId >= HC_DISPATCH_LIMIT) {
             Logger.warn(LogCategory.SYSTEM,
                 `[HYPERCALL] registerRawHandler: functionId ${functionId} out of dispatch-table range`);
             return;
@@ -979,7 +997,7 @@ export class HypercallDataManager {
         this.registeredEntries.set(functionId, handlerId);
         this.refreshViews();
         if (this.view) {
-            this.view.setUint8(this.hpBase + OFF_HC_DISPATCH_TABLE + functionId, handlerId);
+            this.view.setUint8(this.hpBase + this.dispatchEntryOffset(functionId), handlerId);
         }
         Logger.log(LogCategory.SYSTEM,
             `[HYPERCALL] Registered raw funcId=${functionId} → handler ${handlerId} (inner-loop HLE)`);
@@ -1005,7 +1023,7 @@ export class HypercallDataManager {
             if (!writers.has(handlerId)) continue;
             affected.push(functionId);
             if (this.view) {
-                this.view.setUint8(this.hpBase + OFF_HC_DISPATCH_TABLE + functionId, on ? handlerId : 0);
+                this.view.setUint8(this.hpBase + this.dispatchEntryOffset(functionId), on ? handlerId : 0);
             }
         }
         Logger.log(LogCategory.SYSTEM,
@@ -1021,11 +1039,11 @@ export class HypercallDataManager {
 
     /** Remove a raw dispatch-table binding (inner-loop hook unpatch). */
     unregisterRawHandler(functionId: number): void {
-        if (functionId <= 0 || functionId >= 4096) return;
+        if (functionId <= 0 || functionId >= HC_DISPATCH_LIMIT) return;
         this.registeredEntries.delete(functionId);
         this.refreshViews();
         if (this.view) {
-            this.view.setUint8(this.hpBase + OFF_HC_DISPATCH_TABLE + functionId, 0);
+            this.view.setUint8(this.hpBase + this.dispatchEntryOffset(functionId), 0);
         }
     }
 
@@ -1084,8 +1102,8 @@ export class HypercallDataManager {
 
         // Dump dispatch table entries for string/memory handlers (51+) for diagnostics
         const activeHandlers: string[] = [];
-        for (let fid = 0; fid < 4096; fid++) {
-            const hid = this.view.getUint8(this.hpBase + OFF_HC_DISPATCH_TABLE + fid);
+        for (const fid of this.registeredEntries.keys()) {
+            const hid = this.view.getUint8(this.hpBase + this.dispatchEntryOffset(fid));
             if (hid >= 51) {
                 activeHandlers.push(`${fid}→${hid}`);
             }
@@ -1112,9 +1130,8 @@ export class HypercallDataManager {
     resetDispatchTable(): void {
         this.refreshViews();
         if (this.view && this.hpBase !== 0) {
-            for (let i = 0; i < 4096; i++) {
-                this.view.setUint8(this.hpBase + OFF_HC_DISPATCH_TABLE + i, 0);
-            }
+            new Uint8Array(this.view.buffer, this.hpBase + OFF_HC_DISPATCH_TABLE, 4096).fill(0);
+            new Uint8Array(this.view.buffer, this.hpBase + OFF_HC_DISPATCH_TABLE_EXT, HC_DISPATCH_EXT_COUNT).fill(0);
             this.view.setUint32(this.hpBase + OFF_HC_ENABLED, 0, true);
         }
         this.registeredEntries.clear();

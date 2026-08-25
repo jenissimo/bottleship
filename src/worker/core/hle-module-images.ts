@@ -111,6 +111,11 @@ export function materializedHleModules(): Array<{ name: string; base: number; si
         .map(([name, slot]) => ({ name, base: hleImageBaseForSlot(slot), size: HLE_IMAGE_SLOT_SIZE }));
 }
 
+/** HLE images the process has actually loaded, in loader order (slot order). */
+export function loadedHleModules(): Array<{ name: string; base: number; size: number }> {
+    return materializedHleModules().filter(({ name }) => isHleModuleLoaded(name));
+}
+
 /**
  * Assign slots and publish the images. Idempotent per (process, resetGeneration) — the
  * same guard shape kernel32's module caches use, since Process.reset() reuses the object
@@ -177,13 +182,16 @@ export function materializeHleModuleImages(process: any): void {
             // A stdcall export we cannot size would throw here and take the whole arena
             // with it; skipping keeps it resolvable through the on-demand path instead.
             try {
-                const { code } = generator.allocateStubAt(
-                    (base + 0x1000 + exports.length * 16) >>> 0,
-                    name, fn.name,
-                    fn.params ? calculateStackCleanup(fn.params) >> 2 : undefined,
-                    fn.callingConvention,
-                    fn.stackCleanupBytes,
-                );
+                const address = (base + 0x1000 + exports.length * 16) >>> 0;
+                const args = fn.params ? calculateStackCleanup(fn.params) >> 2 : undefined;
+                const existing = generator.findStubsByName(name, fn.name)[0];
+                const { code } = existing
+                    ? generator.allocateAliasStubAt(
+                        address, existing, args, fn.callingConvention, fn.stackCleanupBytes,
+                    )
+                    : generator.allocateStubAt(
+                        address, name, fn.name, args, fn.callingConvention, fn.stackCleanupBytes,
+                    );
                 exports.push({ name: fn.name, code });
             } catch (e) {
                 Logger.verbose(LogCategory.SYSTEM, `[HleImages] ${name}:${fn.name} not stubbable — ${e}`);

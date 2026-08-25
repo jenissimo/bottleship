@@ -971,6 +971,13 @@ export class System {
         // Reset process if exists
         if (this.process) {
             await this.process.reset();
+            // Process.reset() clears HEAP and rewinds its allocator. The old PEB/TEB
+            // addresses would otherwise be handed to the first guest allocation and
+            // silently overwritten while FS still points at them.
+            this.scheduler.tebManager.initProcess(
+                () => this.process!.getCurrentMemory(),
+                this.process.memory,
+            );
         }
 
         // Recreate vtables after memory reset (memory at 0x03000000+ gets zeroed)

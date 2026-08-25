@@ -49,5 +49,6 @@ export const shlwapiModule: ModuleDescriptor = {
         makeFunc("PathRenameExtensionW", 2),
         makeFunc("UrlUnescapeA", 4, { onUnimplemented: "hresult" }),
         makeFunc("UrlUnescapeW", 4, { onUnimplemented: "hresult" }),
+        makeFunc("SHDeleteKeyW", 2, { onUnimplemented: "win32Status" }),
     ],
 };

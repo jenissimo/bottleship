@@ -232,6 +232,39 @@ export const dbg = {
         const w = wasm(); if (w) { w.dbg_add_watch(x); if (indirect) w.dbg_set_indirect(1); }
         console.log(`[dbg] watch [0x${x.toString(16)}]${indirect ? " (indirect: logs *value + byte)" : ""}`);
     },
+    /** Arm the v86 interpreted store-path watchpoint for one guest dword. */
+    writeWatch(a: number | string, matchValue?: number | string, traceInstructions = 0): boolean {
+        const w = wasm(); if (!w?.dbg_set_write_watch) return false;
+        w.dbg_set_write_watch(toAddr(a));
+        if (w.dbg_set_write_watch_match) {
+            w.dbg_set_write_watch_match(matchValue === undefined ? 0 : 1, matchValue === undefined ? 0 : toAddr(matchValue));
+        }
+        w.dbg_set_ww_trace?.(traceInstructions >>> 0);
+        return true;
+    },
+    writeWatchReport(): { hits: number; lastEip: number; lastPrev: number; lastValue: number; zeroHits: number; zeroEip: number; zeroPrev: number; matchHits: number; matchEip: number; matchPrev: number; matchRegs: number[]; matchCodeBase: number; matchCodeHex: string; trace: Array<{ eip: number; regs: number[] }> } | null {
+        const w = wasm(); if (!w?.dbg_ww_hits) return null;
+        const traceCount = Math.min(w.dbg_ww_trace_count?.() >>> 0 || 0, 4096);
+        return {
+            hits: w.dbg_ww_hits() >>> 0,
+            lastEip: w.dbg_ww_last_eip() >>> 0,
+            lastPrev: w.dbg_ww_last_prev() >>> 0,
+            lastValue: w.dbg_ww_last_val() >>> 0,
+            zeroHits: w.dbg_ww_zero_hits() >>> 0,
+            zeroEip: w.dbg_ww_zero_eip() >>> 0,
+            zeroPrev: w.dbg_ww_zero_prev() >>> 0,
+            matchHits: w.dbg_ww_match_hits?.() >>> 0 || 0,
+            matchEip: w.dbg_ww_match_eip?.() >>> 0 || 0,
+            matchPrev: w.dbg_ww_match_prev?.() >>> 0 || 0,
+            matchRegs: Array.from({ length: 8 }, (_, i) => w.dbg_ww_match_reg?.(i) >>> 0 || 0),
+            matchCodeBase: w.dbg_ww_match_code_base?.() >>> 0 || 0,
+            matchCodeHex: Array.from({ length: 256 }, (_, i) => (w.dbg_ww_match_code_byte?.(i) >>> 0 || 0).toString(16).padStart(2, "0")).join(""),
+            trace: Array.from({ length: traceCount }, (_, i) => ({
+                eip: w.dbg_ww_trace_eip?.(i) >>> 0 || 0,
+                regs: Array.from({ length: 8 }, (__, reg) => w.dbg_ww_trace_reg?.(i, reg) >>> 0 || 0),
+            })),
+        };
+    },
     /** Cap on total dump lines (runaway-trace guard). Default 4000. */
     maxDumps(n: number): void { cfg.maxDumps = n >>> 0; const w = wasm(); w?.dbg_set_max_dumps(n >>> 0); console.log(`[dbg] maxDumps = ${n}`); },
     /** Read a u32 from guest memory (logs + returns; via postMessage the return is not seen, read the log). */
@@ -1638,7 +1671,7 @@ export const dbg = {
             if (!hc?.view || hc.hpBase == null) { console.log('[dbg][hcoff][JSON] {"err":"no hypercall manager"}'); return; }
             let n = 0;
             for (const [fid, hid] of hc.registeredEntries as Map<number, number>) {
-                if (hid === handlerId) { hc.view.setUint8(hc.hpBase + 0x100 + fid, 0); n++; }
+                if (hid === handlerId && hc.setDispatchEntry(fid, 0)) n++;
             }
             console.log(`[dbg][hcoff][JSON] ${JSON.stringify({ handlerId, zeroed: n })}`);
         } catch (e) { console.warn('[dbg] hcoff err', e); }
@@ -1649,7 +1682,9 @@ export const dbg = {
             const hc = (globalThis as any).hypercall;
             if (!hc?.view || hc.hpBase == null) { console.log('[dbg][hcon][JSON] {"err":"no hypercall manager"}'); return; }
             let n = 0;
-            for (const [fid, hid] of hc.registeredEntries as Map<number, number>) { hc.view.setUint8(hc.hpBase + 0x100 + fid, hid); n++; }
+            for (const [fid, hid] of hc.registeredEntries as Map<number, number>) {
+                if (hc.setDispatchEntry(fid, hid)) n++;
+            }
             console.log(`[dbg][hcon][JSON] ${JSON.stringify({ restored: n })}`);
         } catch (e) { console.warn('[dbg] hcon err', e); }
     },
@@ -1688,7 +1723,7 @@ export const dbg = {
      *  v86 read_tsc falls back to raw wall clock (frozen per-frame delta). vtActive=false means
      *  enableVirtualTime() never ran. Existence of THIS command confirms the latest worker TS is
      *  loaded (rules out a stale worker bundle). JSON. */
-    hcstate(): void {
+    hcstate(): Record<string, unknown> | void {
         try {
             const hc = (globalThis as any).hypercall;
             const ts = TimeService.getInstance();
@@ -1715,6 +1750,7 @@ export const dbg = {
                 };
             }
             console.log(`[dbg][hcstate][JSON] ${JSON.stringify(out)}`);
+            return out;
         } catch (e) { console.warn('[dbg] hcstate err', e); }
     },
     /** Dump the last N WinAPI calls from the dispatcher ring buffer — reveals
@@ -2387,13 +2423,13 @@ export const dbg = {
     /** Dump a guest memory range as base64 (one console line) so a packed/unparseable
      *  module's RUNTIME (unpacked) image can be reconstructed offline and fed to Ghidra
      *  at its load base. len capped at 256 KB. */
-    dumpb64(a: number | string, len = 0x2000): void {
+    dumpb64(a: number | string, len = 0x2000): { base: string; len: number; b64: string } | null {
         try {
             const base = toAddr(a);
             len = Math.min(len >>> 0, 0x40000);
             const mem: Uint8Array | undefined = System.getInstance().process?.getCurrentMemory?.();
-            if (!mem) { console.warn('[dbg] dumpb64: no guest memory'); return; }
-            if (base + len > mem.length) { console.warn(`[dbg] dumpb64: range exceeds mem (${mem.length})`); return; }
+            if (!mem) { console.warn('[dbg] dumpb64: no guest memory'); return null; }
+            if (base + len > mem.length) { console.warn(`[dbg] dumpb64: range exceeds mem (${mem.length})`); return null; }
             const slice = mem.subarray(base, base + len);
             // base64 in chunks (String.fromCharCode arg-count limit)
             let bin = '';
@@ -2402,8 +2438,10 @@ export const dbg = {
                 bin += String.fromCharCode.apply(null, slice.subarray(i, Math.min(i + CH, slice.length)) as any);
             }
             const b64 = (globalThis as any).btoa(bin);
-            console.log(`[dbg][dumpb64][JSON] ${JSON.stringify({ base: `0x${base.toString(16)}`, len, b64 })}`);
-        } catch (e) { console.warn('[dbg] dumpb64 err', e); }
+            const out = { base: `0x${base.toString(16)}`, len, b64 };
+            console.log(`[dbg][dumpb64][JSON] ${JSON.stringify(out)}`);
+            return out;
+        } catch (e) { console.warn('[dbg] dumpb64 err', e); return null; }
     },
     /** Capture the wide-string PAIRS passed to wcscmp/_wcsicmp/wcsstr over a window
      *  (what names the intro VM compares each frame). Logs a frequency histogram JSON.

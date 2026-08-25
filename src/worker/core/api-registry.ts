@@ -3,6 +3,7 @@ import { setupapiModule } from "../api/setupapi.api";
 import { hidModule } from "../api/hid.api";
 import { lgvidModule } from "../api/lgvid.api";
 import { oledlgModule } from "../api/oledlg.api";
+import { msiModule } from "../api/msi.api";
 import { kernel32VistaSupplement } from "../api/kernel32-vista-supplement";
 import { REFERENCE_ARG_COUNTS } from "../reference-argcounts.generated";
 import { Logger, LogCategory } from "./logger";
@@ -81,6 +82,7 @@ export class APIRegistry {
         this.registerModule(hidModule);
         this.registerModule(lgvidModule);
         this.registerModule(oledlgModule);
+        this.registerModule(msiModule);
 
         try {
             const apiModules = import.meta.glob('../api/*.api.ts', { eager: true });

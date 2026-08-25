@@ -378,6 +378,52 @@ export class ThunkGenerator {
     }
 
     /**
+     * Publish a second entry point for an existing thunk without consuming another
+     * function ID. Synthetic HLE PE images need export bodies inside their own .text,
+     * while dispatch identity belongs to the API, not to the address used to enter it.
+     */
+    allocateAliasStubAt(
+        address: number,
+        target: ThunkStub,
+        argCount?: number,
+        callingConvention?: string,
+        stackCleanupBytes?: number
+    ): { address: number; code: Uint8Array } {
+        const isStdcall = !callingConvention || callingConvention === 'stdcall';
+        const bytesToPop = this.resolveBytesToPop(target.functionName, isStdcall, argCount, stackCleanupBytes);
+        if (isStdcall && bytesToPop === undefined) {
+            throw new Error(
+                `[ThunkGenerator] allocateAliasStubAt requires argCount or stackCleanupBytes for stdcall: ` +
+                `${target.dllName}:${target.functionName}`
+            );
+        }
+
+        const functionId = target.functionId;
+        const codeChunks: number[] = [
+            0xB8, functionId & 0xFF, (functionId >> 8) & 0xFF, (functionId >> 16) & 0xFF, (functionId >> 24) & 0xFF,
+            0xBA, 0x77, 0xB0, 0x00, 0x00,
+            0xEF,
+        ];
+        if (isStdcall && bytesToPop && bytesToPop > 0) {
+            codeChunks.push(0xC2, bytesToPop & 0xFF, (bytesToPop >> 8) & 0xFF);
+        } else {
+            codeChunks.push(0xC3);
+        }
+        while (codeChunks.length % 16 !== 0) codeChunks.push(0x90);
+
+        const alias: ThunkStub = {
+            address: address >>> 0,
+            dllName: target.dllName,
+            functionName: target.functionName,
+            functionId,
+            argCount,
+            stackCleanupBytes: isStdcall ? bytesToPop : 0,
+        };
+        this.addressToStub.set(alias.address, alias);
+        return { address: alias.address, code: new Uint8Array(codeChunks) };
+    }
+
+    /**
      * Reserve a raw, 16-byte-granular executable area in THUNK_CODE with no
      * stub/functionId registration. Used by hle-lib for relocated-prologue
      * trampolines (Guarded Inner-Loop HLE): the caller writes the bytes and
