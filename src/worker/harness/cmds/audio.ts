@@ -253,6 +253,11 @@ export function registerAudioCommands(svc: HarnessService): void {
                 hasCallback: (ctx.streamCallbacks?.get(s.handle) ?? 0) !== 0,
                 wholeFileBytes: s.fileData?.length ?? null,
                 source: src ? {
+                    // Which refill path this stream is on: "vfs" is topped up by the
+                    // playback heartbeat, "app" only from the guest's own AIL_serve.
+                    // A stream starved on one path looks identical to one starved on
+                    // the other until you can see which path it is.
+                    kind: src.kind ?? null,
                     fileHandle: src.fileHandle,
                     fileSize: src.fileSize,
                     dataStart: src.dataStart,

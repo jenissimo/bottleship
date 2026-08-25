@@ -32,9 +32,11 @@ export const AIL_FILE_SEEK_END = 2;
  *  of round trips, small enough to keep one guest-visible buffer modest. */
 const READ_CHUNK = 256 * 1024;
 
-/** Refuse to whole-file a stream larger than this — a decode buffer that size is
- *  not a stream, and failing loudly beats silently truncating one. */
-const MAX_WHOLE_FILE = 64 * 1024 * 1024;
+/** Refuse to whole-file a stream larger than this — a decode buffer that size is not
+ *  a stream, and failing loudly beats silently truncating one. Sized to admit a
+ *  CD-era encoded radio bank, which the browser decoder still takes as one buffer;
+ *  the peak cost is roughly twice this while the chunks are copied into one array. */
+const MAX_WHOLE_FILE = 96 * 1024 * 1024;
 
 /** One guest call in a chain: stdcall `fn(args…)`, result delivered to the yield. */
 export interface GuestCall {
@@ -103,8 +105,11 @@ export function runGuestCallChain(
             callbackId = 0;
         }
         if (!callbackId) {
-            // The frame is parked with nothing left to wake it; drop the chain's
-            // resources and let the fatal path the manager already reported stand.
+            // The frame is parked with nothing left to wake it. Releasing it is what
+            // unpins the owning thread — without this the thread waits forever for a
+            // callback nobody will issue, and the leaked frame also makes the
+            // dispatcher skip its auto-save for the NEXT suspending thunk anywhere.
+            cm.abandonSuspendedFrame(frameId);
             abandon(chain);
             return;
         }
@@ -119,7 +124,10 @@ export function runGuestCallChain(
     };
 
     issue(step.value as GuestCall);
-    if (!firstCallbackId) return 0;
+    if (!firstCallbackId) {
+        cm.abandonSuspendedFrame(frameId);
+        return 0;
+    }
 
     return { value: 0, suspendedForCallback: true, callbackId: firstCallbackId, stackCleanup };
 }

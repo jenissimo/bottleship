@@ -62,14 +62,33 @@ const RING_SECONDS = 2.0;
 const REFILL_THRESHOLD = 0.35;
 
 /**
- * Service-point accounting. A starving ring has exactly three causes and they are
- * indistinguishable from the ring itself: the pump never ran (`pumps` flat), it ran
- * and decided nothing wanted data (`pumps` climbing, `wanted` flat), or the read
- * itself came back empty (`refills` climbing, `refillBytes` flat). Without these the
- * only symptom is silence, which every one of them produces.
+ * Service-point accounting. A starving ring has a handful of causes that are
+ * indistinguishable from the ring itself — silence is all any of them produce — so
+ * each step of the path gets its own counter and the reading is a walk down the list:
+ * nothing serviced it (`pumps` + `servicePoints` flat), it was serviced and nothing
+ * wanted data (`wanted` flat), it wanted data but no read went out (`refills` flat),
+ * or reads went out and returned nothing (`refillBytes` flat).
+ *
+ * The two paths are counted separately at the top because they are driven by
+ * different things: VFS streams by the heartbeat, app-backed ones by guest entry
+ * points. `wanted` and everything below it is the sum of both.
  */
 export const streamEngineStats = {
-    adopted: 0, pumps: 0, wanted: 0, refills: 0, refillBytes: 0,
+    adopted: 0,
+    /** Heartbeat pump invocations — the VFS path's service points. */
+    pumps: 0,
+    /** mss32 exports that ran the service check — the app path's `pumps`. */
+    servicePoints: 0,
+    /** Times a service point found a stream that wanted data (either path). */
+    wanted: 0,
+    /** Refills that actually issued a read; the denominator for `refillBytes`. */
+    refills: 0,
+    /** SOURCE bytes absorbed by those reads — encoded, so well under `ringBytes` for
+     *  ADPCM. Not the same quantity as what reached the ring. */
+    refillBytes: 0,
+    /** Decoded bytes delivered INTO a ring, including tails a full ring held back and
+     *  a later refill drained. This is the one that answers "did audio arrive". */
+    ringBytes: 0,
     shortReads: 0, rollovers: 0, errors: 0,
 };
 
@@ -283,6 +302,10 @@ export function streamNeedsRefill(stream: MSSStream): boolean {
 
 /** Any app-backed stream in `ctx` that wants a refill right now (AIL_serve's work). */
 export function findStreamNeedingRefill(ctx: MSSContext): MSSStream | null {
+    // Miles' timer stops when Miles is shut down, and so must we: past AIL_shutdown /
+    // AIL_close_digital_driver the app is free to tear its own reader down, and driving
+    // its file callbacks then reads through a handle it already considers closed.
+    if (!ctx.initialized || !ctx.digitalDriverHandle) return null;
     for (const stream of ctx.streams.values()) {
         if (!stream.isPlaying || stream.isPaused) continue;
         if (stream.source?.kind === "app" && streamNeedsRefill(stream)) return stream;
@@ -294,26 +317,55 @@ export function findStreamNeedingRefill(ctx: MSSContext): MSSStream | null {
  * Miles' stream service point: top up ONE app-backed stream whose ring wants data.
  * Returns the suspended-thunk result when a guest chain started (the caller must
  * return it unchanged), or null when there was nothing to do.
+ *
+ * `answer` is what the guest gets once the chain finishes — the value the calling
+ * export had already computed. Refilling parks the caller, so the chain's return IS
+ * that export's return; passing it through is what lets an ordinary query double as
+ * a service point instead of having its result replaced by the refill's.
  */
 export function serveIncrementalStreams(
     ctx: MSSContext,
     thunkCtx: unknown,
     stackCleanup: number,
     source: string,
+    answer = 0,
 ): ThunkResult | null {
+    streamEngineStats.servicePoints++;
+    if (refillChainInFlight) return null;
+    // Entered from guest code WE invoked (an EOS/timer/stream callback): [ESP] points
+    // into the callback stub pool, so this thunk cannot be parked as a fresh frame.
+    // Servicing is best-effort and there are hundreds of entry points a second — skip
+    // quietly rather than log a failure the caller is not entitled to care about.
+    const cm = (ctx.process as any)?.dispatcher?.callbackManager;
+    if (cm?.getActiveSuspendedFrameId?.()) return null;
     const stream = findStreamNeedingRefill(ctx);
     if (!stream) return null;
+    streamEngineStats.wanted++;
+    refillChainInFlight = true;
     const result = runGuestCallChain(ctx, thunkCtx, stackCleanup, source, (function* (): GuestCallChain {
-        yield* refillStream(ctx, stream);
-        return 0;
+        try {
+            yield* refillStream(ctx, stream);
+            return answer;
+        } finally {
+            refillChainInFlight = false;
+        }
     })());
     return typeof result === "number" ? null : result;
 }
+
+/**
+ * Real Miles serves every stream from ONE thread, so a title's file callbacks are
+ * entitled to be non-reentrant. A service point on every export means two guest
+ * threads could otherwise be parked in a chain at once and interleave seeks and reads
+ * on whatever cursor those callbacks share. One chain in flight restores the contract.
+ */
+let refillChainInFlight = false;
 
 /** Consume the tail a full ring made us hold back. True = ring still full, stop here. */
 function drainPending(stream: MSSStream, src: MSSStreamSource): boolean {
     if (!src.pending) return false;
     const consumed = appendStreamingRing(stream, src.pending.floats, src.pending.at);
+    streamEngineStats.ringBytes += consumed * 4;
     src.framesDecoded += consumed / Math.max(1, stream.channels);
     src.pending.at += consumed;
     if (src.pending.at >= src.pending.floats.length) src.pending = null;
@@ -371,6 +423,10 @@ export function* refillStream(ctx: MSSContext, stream: MSSStream): Generator<Gue
 
         if (src.readOffset >= src.dataEnd) {
             if (!(yield* rollOver(ctx, stream))) return 0;
+            // rollOver hands the app its stream callback, whose canonical job is
+            // close-and-open-the-next-track. Everything below dereferences `src` and
+            // writes into its scratch, both of which that callback may have freed.
+            if (stream.source !== src) return 0;
         }
 
         const ask = planRefill(stream, src);
@@ -378,11 +434,17 @@ export function* refillStream(ctx: MSSContext, stream: MSSStream): Generator<Gue
 
         if (src.cursor !== src.readOffset) {
             yield { fn: cb.seek, args: [src.fileHandle, src.readOffset, AIL_FILE_SEEK_BEGIN], label: "seek" };
+            if (stream.source !== src) return 0;
             src.cursor = src.readOffset;
         }
 
         const buffer = src.scratch + 4;
+        streamEngineStats.refills++;
         const got = (yield { fn: cb.read, args: [src.fileHandle, buffer, ask], label: "read" }) >>> 0;
+        // Closed, or re-seeked by AIL_set_stream_position, while the read was in flight:
+        // those bytes describe a stream that no longer exists at that offset, and
+        // absorbing them would advance a dead or relocated cursor.
+        if (stream.source !== src || src.cursor !== src.readOffset) return 0;
         if (got === 0 || got > ask) {
             reportShortRead(stream, src, got, ask);
             return 0;
@@ -395,7 +457,9 @@ export function* refillStream(ctx: MSSContext, stream: MSSStream): Generator<Gue
             Logger.error(LogCategory.SYSTEM, `MSS32: stream "${stream.filename}": refill buffer out of range`);
             return 0;
         }
-        return absorb(stream, src, mem.slice(buffer, buffer + got));
+        const used = absorb(stream, src, mem.slice(buffer, buffer + got));
+        streamEngineStats.refillBytes += used;
+        return used;
     } finally {
         src.busy = false;
     }
@@ -519,7 +583,6 @@ export async function refillVfsStream(ctx: MSSContext, stream: MSSStream): Promi
     const fs = System.getInstance().fileSystem;
 
     src.busy = true;
-    streamEngineStats.refills++;
     try {
         if (drainPending(stream, src)) return 0;
         if (src.readOffset >= src.dataEnd && !rollOverVfs(ctx, stream)) return 0;
@@ -531,6 +594,7 @@ export async function refillVfsStream(ctx: MSSContext, stream: MSSStream): Promi
             fs.setPosition(handle, src.readOffset, 0);
             src.cursor = src.readOffset;
         }
+        streamEngineStats.refills++;
         const slab = fs.readSync(handle, ask) ?? await fs.read(handle, ask);
         // Closed (or re-seeked) while the read was in flight: those bytes describe a
         // stream that no longer exists, and absorbing them would advance a dead cursor.
@@ -629,6 +693,7 @@ function pushDecoded(stream: MSSStream, srcBytes: Uint8Array): void {
     const floats = convertToFloat(srcBytes, info.channels, info.bitsPerSample, info.formatTag, info.blockAlign);
     if (floats.length === 0) return;
     const consumed = appendStreamingRing(stream, floats, 0);
+    streamEngineStats.ringBytes += consumed * 4;
     src.framesDecoded += consumed / Math.max(1, info.channels);
     if (consumed < floats.length) src.pending = { floats, at: consumed };
 }
