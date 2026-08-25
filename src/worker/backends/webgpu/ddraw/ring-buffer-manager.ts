@@ -20,6 +20,7 @@ import { FFPLightingState } from "../../../modules/ddraw/d3d/ffp-lighting";
 import { packFfpLightSet, FFP_LIGHTSET_FLOATS, FFP_LIGHTSET_BYTES, FfpLightInput } from "../d3d9/ffp-lighting";
 import { FfpStagesState, MAX_FFP_TEX_MATRICES } from "./ffp-stages";
 import { writeMvpWithPixelCenter } from "../pixel-center";
+import { GeometryUploadWindow } from "./geometry-upload-window";
 
 /**
  * Manages GPU ring buffers for vertex, index, and uniform data.
@@ -56,6 +57,11 @@ export class RingBufferManager {
     private uniformStagingBuffers: Uint8Array[] = [];
     private uniformDirtyOffsets: number[] = [];
 
+    // Geometry is accumulated between submits so thousands of small D3D draws become one
+    // queue.writeBuffer range per ring.
+    private vertexUploadWindows: GeometryUploadWindow[] = [];
+    private indexUploadWindows: GeometryUploadWindow[] = [];
+
     // Per-draw FFP light-set ring (binding 5, dynamic offset). Mirrors the uniform ring so each
     // draw can carry its own active light set (Gamebryo re-picks lights per object) without a
     // per-draw writeBuffer. Slot size = FFP_LIGHTSET_BYTES aligned to lightsAlignment.
@@ -72,6 +78,7 @@ export class RingBufferManager {
 
     // Current frame index for ring buffer rotation
     private currentFrameIndex = 0;
+    private geometryStagingEnabled = true;
 
     // Throttle >80% warnings: only log once per 10% usage bucket per frame
     private lastVertexWarnBucket = 0;
@@ -187,6 +194,8 @@ export class RingBufferManager {
                     usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
                 })
             );
+            this.vertexUploadWindows.push(new GeometryUploadWindow());
+            this.indexUploadWindows.push(new GeometryUploadWindow());
 
             // Uniform ring buffer
             this.uniformRingBuffers.push(
@@ -245,6 +254,25 @@ export class RingBufferManager {
      */
     getCurrentUniformBuffer(): GPUBuffer {
         return this.uniformRingBuffers[this.currentFrameIndex];
+    }
+
+    /** Publish staged vertex/index ranges before the encoder that consumes them is submitted. */
+    flushGeometry(): void {
+        const fi = this.currentFrameIndex;
+        this.vertexUploadWindows[fi].flush(this.queue, this.vertexRingBuffers[fi], this.vertexRingOffsets[fi]);
+        this.indexUploadWindows[fi].flush(this.queue, this.indexRingBuffers[fi], this.indexRingOffsets[fi]);
+    }
+
+    setGeometryStagingEnabled(enabled: boolean): void {
+        if (this.geometryStagingEnabled === enabled) return;
+        const fi = this.currentFrameIndex;
+        if (!enabled) {
+            this.flushGeometry();
+        } else {
+            this.vertexUploadWindows[fi].advanceTo(this.vertexRingOffsets[fi]);
+            this.indexUploadWindows[fi].advanceTo(this.indexRingOffsets[fi]);
+        }
+        this.geometryStagingEnabled = enabled;
     }
 
     /**
@@ -680,6 +708,8 @@ export class RingBufferManager {
             this.currentFrameIndex = (this.currentFrameIndex + 1) % this.ringBufferCount;
             this.vertexRingOffsets[this.currentFrameIndex] = 0;
             this.indexRingOffsets[this.currentFrameIndex] = 0;
+            this.vertexUploadWindows[this.currentFrameIndex].reset();
+            this.indexUploadWindows[this.currentFrameIndex].reset();
             this.uniformRingOffsets[this.currentFrameIndex] = 0;
             this.uniformDirtyOffsets[this.currentFrameIndex] = 0;
             this.lightsRingOffsets[this.currentFrameIndex] = 0;
@@ -724,13 +754,16 @@ export class RingBufferManager {
             return { buffer, offset: 0, overflow: true };
         }
 
-        this.queue.writeBuffer(
-            buffer,
-            offset,
-            data.buffer as ArrayBuffer,
-            data.byteOffset,
-            data.byteLength
-        );
+        if (this.geometryStagingEnabled) {
+            this.vertexUploadWindows[this.currentFrameIndex].stage(offset, data);
+        } else {
+            this.queue.writeBuffer(buffer, offset, data.buffer as ArrayBuffer, data.byteOffset, data.byteLength);
+            // These bytes are already on the queue. The window's cursor has to follow the
+            // ring even when it is not staging, or the next flush republishes this range
+            // out of a staging array that never received it — an empty one throws, and a
+            // stale one overwrites the frame's real geometry.
+            this.vertexUploadWindows[this.currentFrameIndex].advanceTo(offset + alignedSize);
+        }
         this.vertexRingOffsets[this.currentFrameIndex] = offset + alignedSize;
 
         return { buffer, offset };
@@ -769,9 +802,13 @@ export class RingBufferManager {
             return { buffer, offset: 0, overflow: true };
         }
 
-        // Copy directly from GPU buffer to ring buffer (no CPU round-trip)
+        // Publish any CPU-staged prefix first, then exclude the GPU-produced range from the
+        // next staging upload so a later flush cannot overwrite the copy with stale bytes.
+        const uploadWindow = this.vertexUploadWindows[this.currentFrameIndex];
+        uploadWindow.flush(this.queue, buffer, dstOffset);
         encoder.copyBufferToBuffer(srcBuffer, srcOffset, buffer, dstOffset, size);
         this.vertexRingOffsets[this.currentFrameIndex] = dstOffset + alignedSize;
+        uploadWindow.advanceTo(dstOffset + alignedSize);
 
         return { buffer, offset: dstOffset };
     }
@@ -803,13 +840,16 @@ export class RingBufferManager {
             return { buffer, offset: 0, overflow: true };
         }
 
-        this.queue.writeBuffer(
-            buffer,
-            offset,
-            data.buffer as ArrayBuffer,
-            data.byteOffset,
-            data.byteLength
-        );
+        if (this.geometryStagingEnabled) {
+            this.indexUploadWindows[this.currentFrameIndex].stage(offset, data);
+        } else {
+            this.queue.writeBuffer(buffer, offset, data.buffer as ArrayBuffer, data.byteOffset, data.byteLength);
+            // These bytes are already on the queue. The window's cursor has to follow the
+            // ring even when it is not staging, or the next flush republishes this range
+            // out of a staging array that never received it — an empty one throws, and a
+            // stale one overwrites the frame's real geometry.
+            this.indexUploadWindows[this.currentFrameIndex].advanceTo(offset + alignedSize);
+        }
         this.indexRingOffsets[this.currentFrameIndex] = offset + alignedSize;
 
         return { buffer, offset };
@@ -1129,6 +1169,8 @@ export class RingBufferManager {
         this.currentFrameIndex = (this.currentFrameIndex + 1) % this.ringBufferCount;
         this.vertexRingOffsets[this.currentFrameIndex] = 0;
         this.indexRingOffsets[this.currentFrameIndex] = 0;
+        this.vertexUploadWindows[this.currentFrameIndex].reset();
+        this.indexUploadWindows[this.currentFrameIndex].reset();
         this.uniformRingOffsets[this.currentFrameIndex] = 0;
         this.uniformDirtyOffsets[this.currentFrameIndex] = 0;
         this.lightsRingOffsets[this.currentFrameIndex] = 0;
@@ -1172,5 +1214,7 @@ export class RingBufferManager {
         this.uniformRingBuffers = [];
         this.lightsRingBuffers = [];
         this.storageRingBuffers = [];
+        this.vertexUploadWindows = [];
+        this.indexUploadWindows = [];
     }
 }

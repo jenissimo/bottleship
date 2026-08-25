@@ -580,6 +580,8 @@ export const D3DTSS_ALPHAOP = 4;
 export const D3DTSS_ALPHAARG1 = 5;
 export const D3DTSS_ALPHAARG2 = 6;
 export const D3DTSS_TEXTURETRANSFORMFLAGS = 24;
+export const D3DTSS_COLORARG0 = 26;
+export const D3DTSS_ALPHAARG0 = 27;
 
 // Texture coordinate transform flags (value of D3DTSS_TEXTURETRANSFORMFLAGS).
 // COUNTn = number of output coordinates produced by the stage's texture matrix;
@@ -645,6 +647,8 @@ export const D3DTOP_ADDSMOOTH = 11;          // Output = arg1 + arg2 - arg1*arg2
 export const D3DTOP_BLENDDIFFUSEALPHA = 12;  // Output = arg1 * diffuse.a + arg2 * (1 - diffuse.a)
 export const D3DTOP_BLENDTEXTUREALPHA = 13;  // Output = arg1 * tex.a     + arg2 * (1 - tex.a)
 export const D3DTOP_BLENDFACTORALPHA = 14;   // Output = arg1 * factor.a  + arg2 * (1 - factor.a)
+export const D3DTOP_MULTIPLYADD = 25;        // Output = arg1 * arg2 + arg0
+export const D3DTOP_LERP = 26;               // Output = arg1 * arg0 + arg2 * (1 - arg0)
 
 // Texture argument flags (D3DTA_*)
 export const D3DTA_SELECTMASK = 0x0000000f;  // Mask for argument selection

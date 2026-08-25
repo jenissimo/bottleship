@@ -8,7 +8,7 @@
  * the legacy uniform slot and the MegaBatch storage slot.
  *
  * Per-stage vec4u packing (16 bytes/stage):
- *   x = colorOp | alphaOp << 16
+ *   x = colorOp | alphaOp << 8 | colorArg0 << 16 | alphaArg0 << 24
  *   y = colorArg1 | colorArg2 << 8 | alphaArg1 << 16 | alphaArg2 << 24
  *       (D3DTA select mask 0x0F + COMPLEMENT 0x10 + ALPHAREPLICATE 0x20 fit in a byte)
  *   z = raw D3DTSS_TEXCOORDINDEX (low 16 = UV set, high 16 = D3DTSS_TCI_* texgen mode)
@@ -30,6 +30,8 @@ import {
     D3DTSS_ALPHAOP,
     D3DTSS_ALPHAARG1,
     D3DTSS_ALPHAARG2,
+    D3DTSS_COLORARG0,
+    D3DTSS_ALPHAARG0,
     D3DTSS_TEXCOORDINDEX,
     D3DTSS_MINFILTER,
     D3DTSS_MAGFILTER,
@@ -39,6 +41,8 @@ import {
     D3DTSS_ADDRESSV,
     D3DTADDRESS_WRAP,
     D3DTFP_NONE,
+    D3DTOP_MULTIPLYADD,
+    D3DTOP_LERP,
 } from "../../../modules/ddraw/constants";
 
 /** Cascade depth we implement — matches the advertised MaxTextureBlendStages. */
@@ -79,6 +83,8 @@ export class FfpStagesState {
     readonly colorArg2 = new Int32Array(MAX_FFP_STAGES);
     readonly alphaArg1 = new Int32Array(MAX_FFP_STAGES);
     readonly alphaArg2 = new Int32Array(MAX_FFP_STAGES);
+    readonly colorArg0 = new Int32Array(MAX_FFP_STAGES);
+    readonly alphaArg0 = new Int32Array(MAX_FFP_STAGES);
     readonly tci = new Int32Array(MAX_FFP_STAGES);
     readonly texXformFlags = new Int32Array(MAX_FFP_STAGES);
 
@@ -155,6 +161,8 @@ export class FfpStagesState {
             let colorArg2 = readStageArg(textureStates, base, D3DTSS_COLORARG2, defArg2);
             let alphaArg1 = readStageArg(textureStates, base, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
             let alphaArg2 = readStageArg(textureStates, base, D3DTSS_ALPHAARG2, defArg2);
+            let colorArg0 = readStageArg(textureStates, base, D3DTSS_COLORARG0, D3DTA_CURRENT);
+            let alphaArg0 = readStageArg(textureStates, base, D3DTSS_ALPHAARG0, D3DTA_CURRENT);
 
             if (s === 0) {
                 // D3DTA_CURRENT on stage 0 resolves to DIFFUSE (no previous stage).
@@ -162,16 +170,26 @@ export class FfpStagesState {
                 colorArg2 = currentToDiffuse(colorArg2);
                 alphaArg1 = currentToDiffuse(alphaArg1);
                 alphaArg2 = currentToDiffuse(alphaArg2);
+                colorArg0 = currentToDiffuse(colorArg0);
+                alphaArg0 = currentToDiffuse(alphaArg0);
             }
 
             // Captured BEFORE the missing-texture remap: distinguishes a true arithmetic
             // stage (args never reference TEXTURE, e.g. CURRENT×TFACTOR fade) from a
             // textured stage degraded by a missing texture.
+            // ARG0 counts only when the op READS it — MULTIPLYADD and LERP are the only
+            // two that do. Every other op ignores ARG0, and the state persists across
+            // draws, so a stale ARG0=TEXTURE from an earlier LERP would otherwise make a
+            // pure-arithmetic stage look textured and drop it (and everything above it)
+            // out of the cascade.
+            const readsArg0 = (op: number): boolean => op === D3DTOP_MULTIPLYADD || op === D3DTOP_LERP;
             const wantsTexture =
                 (colorArg1 & D3DTA_SELECTMASK) === D3DTA_TEXTURE ||
                 (colorArg2 & D3DTA_SELECTMASK) === D3DTA_TEXTURE ||
                 (alphaArg1 & D3DTA_SELECTMASK) === D3DTA_TEXTURE ||
-                (alphaArg2 & D3DTA_SELECTMASK) === D3DTA_TEXTURE;
+                (alphaArg2 & D3DTA_SELECTMASK) === D3DTA_TEXTURE ||
+                (readsArg0(colorOp) && (colorArg0 & D3DTA_SELECTMASK) === D3DTA_TEXTURE) ||
+                (readsArg0(alphaOp) && (alphaArg0 & D3DTA_SELECTMASK) === D3DTA_TEXTURE);
 
             if (!hasRealTexture) {
                 // TEXTURE args with no texture bound resolve to DIFFUSE.
@@ -179,6 +197,8 @@ export class FfpStagesState {
                 colorArg2 = textureToDiffuse(colorArg2);
                 alphaArg1 = textureToDiffuse(alphaArg1);
                 alphaArg2 = textureToDiffuse(alphaArg2);
+                colorArg0 = textureToDiffuse(colorArg0);
+                alphaArg0 = textureToDiffuse(alphaArg0);
 
                 if (s === 0) {
                     // MODULATE(DIFFUSE, DIFFUSE) darkens vertex-color rendering
@@ -242,6 +262,8 @@ export class FfpStagesState {
             this.colorArg2[s] = colorArg2;
             this.alphaArg1[s] = alphaArg1;
             this.alphaArg2[s] = alphaArg2;
+            this.colorArg0[s] = colorArg0;
+            this.alphaArg0[s] = alphaArg0;
             this.tci[s] = tci;
             this.texXformFlags[s] = 0; // filled by the executor's texture-transform resolver
 
@@ -292,7 +314,11 @@ export class FfpStagesState {
             const enabled = (this.enabledMask & (1 << s)) !== 0;
             const colorOp = enabled ? this.colorOp[s] : D3DTOP_DISABLE;
             const alphaOp = enabled ? this.alphaOp[s] : D3DTOP_DISABLE;
-            p[s * 4 + 0] = (colorOp & 0xffff) | ((alphaOp & 0xffff) << 16);
+            p[s * 4 + 0] =
+                (colorOp & 0xff) |
+                ((alphaOp & 0xff) << 8) |
+                ((this.colorArg0[s] & 0xff) << 16) |
+                ((this.alphaArg0[s] & 0xff) << 24);
             p[s * 4 + 1] =
                 (this.colorArg1[s] & 0xff) |
                 ((this.colorArg2[s] & 0xff) << 8) |

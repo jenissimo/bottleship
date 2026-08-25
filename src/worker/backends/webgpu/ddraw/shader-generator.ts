@@ -22,6 +22,8 @@ import {
     D3DTOP_BLENDTEXTUREALPHA,
     D3DTOP_BLENDFACTORALPHA,
     D3DTOP_BLENDDIFFUSEALPHA,
+    D3DTOP_MULTIPLYADD,
+    D3DTOP_LERP,
     D3DTA_TEXTURE,
     D3DTA_DIFFUSE,
     D3DTA_TFACTOR,
@@ -215,7 +217,7 @@ fn resolveAlphaArg(arg: u32, texAlpha: f32, currentAlpha: f32, diffuseAlpha: f32
     return result;
 }
 
-fn applyColorOp(op: u32, arg1: vec3f, arg2: vec3f, texAlpha: f32, factorAlpha: f32, diffuseAlpha: f32) -> vec3f {
+fn applyColorOp(op: u32, arg0: vec3f, arg1: vec3f, arg2: vec3f, texAlpha: f32, factorAlpha: f32, diffuseAlpha: f32) -> vec3f {
     if (op == ${D3DTOP_SELECTARG1}u) { return arg1; }
     if (op == ${D3DTOP_SELECTARG2}u) { return arg2; }
     if (op == ${D3DTOP_MODULATE}u)   { return arg1 * arg2; }
@@ -234,10 +236,12 @@ fn applyColorOp(op: u32, arg1: vec3f, arg2: vec3f, texAlpha: f32, factorAlpha: f
     if (op == ${D3DTOP_BLENDFACTORALPHA}u) {
         return arg1 * factorAlpha + arg2 * (1.0 - factorAlpha);
     }
+    if (op == ${D3DTOP_MULTIPLYADD}u) { return clamp(arg0 + arg1 * arg2, vec3f(0.0), vec3f(1.0)); }
+    if (op == ${D3DTOP_LERP}u) { return arg1 * arg0 + arg2 * (vec3f(1.0) - arg0); }
     return arg1 * arg2; // Default to MODULATE
 }
 
-fn applyAlphaOp(op: u32, currentAlpha: f32, a1: f32, a2: f32, texAlpha: f32, factorAlpha: f32, diffuseAlpha: f32) -> f32 {
+fn applyAlphaOp(op: u32, currentAlpha: f32, a0: f32, a1: f32, a2: f32, texAlpha: f32, factorAlpha: f32, diffuseAlpha: f32) -> f32 {
     if (op == ${D3DTOP_DISABLE}u)    { return currentAlpha; }
     if (op == ${D3DTOP_SELECTARG1}u) { return a1; }
     if (op == ${D3DTOP_SELECTARG2}u) { return a2; }
@@ -257,6 +261,8 @@ fn applyAlphaOp(op: u32, currentAlpha: f32, a1: f32, a2: f32, texAlpha: f32, fac
     if (op == ${D3DTOP_BLENDFACTORALPHA}u) {
         return a1 * factorAlpha + a2 * (1.0 - factorAlpha);
     }
+    if (op == ${D3DTOP_MULTIPLYADD}u) { return clamp(a0 + a1 * a2, 0.0, 1.0); }
+    if (op == ${D3DTOP_LERP}u) { return a1 * a0 + a2 * (1.0 - a0); }
     return a1 * a2; // Default to MODULATE
 }
 `;
@@ -292,8 +298,8 @@ function emitStageBlock(s: number, prefix: string, sampled: boolean): string {
     return `
                 // ---- FFP stage ${s} ----
                 let sp${s} = ${prefix}.stages[${s}];
-                let colorOp${s} = sp${s}.x & 0xffffu;
-                let alphaOp${s} = sp${s}.x >> 16u;
+                let colorOp${s} = sp${s}.x & 0xffu;
+                let alphaOp${s} = (sp${s}.x >> 8u) & 0xffu;
                 // Non-sampling stages never reference tex${s}Color: the resolver
                 // remaps/never-produces D3DTA_TEXTURE args for them.
                 var tex${s}Color = ${texColorExpr};
@@ -301,13 +307,15 @@ function emitStageBlock(s: number, prefix: string, sampled: boolean): string {
 
                 let cArg1_${s} = resolveColorArg(sp${s}.y & 0xffu, tex${s}Color.rgb, currentColor, diffuse.rgb, ${prefix}.textureFactor.rgb, tex${s}Alpha, currentAlpha, diffuse.a, factorAlpha);
                 let cArg2_${s} = resolveColorArg((sp${s}.y >> 8u) & 0xffu, tex${s}Color.rgb, currentColor, diffuse.rgb, ${prefix}.textureFactor.rgb, tex${s}Alpha, currentAlpha, diffuse.a, factorAlpha);
+                let cArg0_${s} = resolveColorArg((sp${s}.x >> 16u) & 0xffu, tex${s}Color.rgb, currentColor, diffuse.rgb, ${prefix}.textureFactor.rgb, tex${s}Alpha, currentAlpha, diffuse.a, factorAlpha);
                 if (colorOp${s} != ${D3DTOP_DISABLE}u) {
-                    currentColor = applyColorOp(colorOp${s}, cArg1_${s}, cArg2_${s}, tex${s}Alpha, factorAlpha, diffuse.a);
+                    currentColor = applyColorOp(colorOp${s}, cArg0_${s}, cArg1_${s}, cArg2_${s}, tex${s}Alpha, factorAlpha, diffuse.a);
                 }
 
                 let aArg1_${s} = resolveAlphaArg((sp${s}.y >> 16u) & 0xffu, tex${s}Alpha, currentAlpha, diffuse.a, factorAlpha);
                 let aArg2_${s} = resolveAlphaArg((sp${s}.y >> 24u) & 0xffu, tex${s}Alpha, currentAlpha, diffuse.a, factorAlpha);
-                currentAlpha = applyAlphaOp(alphaOp${s}, currentAlpha, aArg1_${s}, aArg2_${s}, tex${s}Alpha, factorAlpha, diffuse.a);
+                let aArg0_${s} = resolveAlphaArg((sp${s}.x >> 24u) & 0xffu, tex${s}Alpha, currentAlpha, diffuse.a, factorAlpha);
+                currentAlpha = applyAlphaOp(alphaOp${s}, currentAlpha, aArg0_${s}, aArg1_${s}, aArg2_${s}, tex${s}Alpha, factorAlpha, diffuse.a);
 `;
 }
 

@@ -642,11 +642,13 @@ export const createDrawHandler = (context: DDrawContext, textureManager: Texture
                 rtState,
                 texStateObj: texStateObj ?? null,
                 texStateObj1: texStateObj1 ?? null,
+                stageTextures: stageTexturesScratch,
                 renderStates,
                 texStates,
                 sourceStride: computeFvfStride(vtype),
                 mvp: mvpMatrix ?? null,
                 viewport: viewportScratch,
+                lighting: devObj?.getFFPLightingState() ?? null,
                 executionDiagnostics: context.executor.getLastDrawDiagnostics(),
             });
         }

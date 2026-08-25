@@ -177,6 +177,7 @@ const UNIFORM_SLOT_SIZE = DEFAULT_UNIFORM_BUFFER_CONFIG.slotSize;
 import { toPlainGuestMemory } from "../../../core/memory/guest-memory";
 import { sanitizeViewportInto, type SanitizedViewport } from "./types";
 import { dwordToFloat } from './dword-float';
+import { dwordToUnsignedLong } from '../shared/dword';
 import { resolveFfpFogMode } from '../d3d9/ffp-fog';
 import { maybeClampContainedUv, applySamplerDebugOverrides, updateLastDrawDiagnostics } from './executor-draw-debug';
 import {
@@ -931,6 +932,9 @@ export class DDrawWebGPUExecutor {
             case "forceDisableAlphaBlend":
                 this.debugFlags.forceDisableAlphaBlend = enabled;
                 break;
+            case "forceDisableLighting":
+                this.debugFlags.forceDisableLighting = enabled;
+                break;
             case "forceDisableZTest":
                 this.debugFlags.forceDisableZTest = enabled;
                 break;
@@ -969,6 +973,10 @@ export class DDrawWebGPUExecutor {
                 break;
             case "disableMegaBatchAccumulate":
                 this.debugFlags.disableMegaBatchAccumulate = enabled;
+                break;
+            case "disableGeometryStaging":
+                this.debugFlags.disableGeometryStaging = enabled;
+                this.ringBufferManager.setGeometryStagingEnabled(!enabled);
                 break;
             case "disableCpuTextureHash":
                 this.debugFlags.disableCpuTextureHash = enabled;
@@ -3385,10 +3393,21 @@ export class DDrawWebGPUExecutor {
         if (this.deviceLost) return;
         this.renderStats.flushes++;
         this.flushBatch();
-        this.vertexConverter.flushParams();
-        this.ringBufferManager.flushUniforms();
-        this.ringBufferManager.flushLights();
-        this.ringBufferManager.flushStorageBuffer();
+        // These publish this frame's staged uploads. A throw here — an oversize or
+        // misaligned writeBuffer — would otherwise skip the submit AND its teardown
+        // below, leaving currentEncoder alive with an open pass for every later frame
+        // to append to: one bad frame becomes every frame after it. Losing this frame's
+        // uploads is recoverable; losing the encoder is not.
+        try {
+            this.vertexConverter.flushParams();
+            this.ringBufferManager.flushGeometry();
+            this.ringBufferManager.flushUniforms();
+            this.ringBufferManager.flushLights();
+            this.ringBufferManager.flushStorageBuffer();
+        } catch (e) {
+            recordGpuError("throw", "ddrawExecutor.flushUploads", String(e));
+            Logger.error(LogCategory.DDRAW, `[WEBGPU] flush() upload publish failed — frame's uploads dropped: ${e}`);
+        }
 
         if (drainDeferredClears && this.surfacesNeedingClear.size > 0) {
             Logger.log(LogCategory.DDRAW,
@@ -3499,6 +3518,7 @@ export class DDrawWebGPUExecutor {
     finalizePendingDraws(): GPUCommandEncoder | null {
         this.flushBatch();
         this.vertexConverter.flushParams();
+        this.ringBufferManager.flushGeometry();
         this.ringBufferManager.flushUniforms();
         this.ringBufferManager.flushLights();
         this.ringBufferManager.flushStorageBuffer();
@@ -4273,7 +4293,7 @@ export class DDrawWebGPUExecutor {
                 sp.addressU = D3DTADDRESS_WRAP;
                 sp.addressV = D3DTADDRESS_WRAP;
             }
-            pr.stencilRef = renderStates[D3DRENDERSTATE_STENCILREF] || 0;
+            pr.stencilRef = dwordToUnsignedLong(renderStates[D3DRENDERSTATE_STENCILREF]);
             applySamplerDebugOverrides(this, pr);
             updateLastDrawDiagnostics(this, pr);
             return pr;
@@ -4438,7 +4458,9 @@ export class DDrawWebGPUExecutor {
         }
 
         // Read lighting and ambient
-        const lightingEnabled = renderStates[D3DRENDERSTATE_LIGHTING] || 0;
+        const lightingEnabled = this.debugFlags.forceDisableLighting
+            ? 0
+            : (renderStates[D3DRENDERSTATE_LIGHTING] || 0);
         const ambientDword = renderStates[D3DRENDERSTATE_AMBIENT] || 0;
         const ambientR = ((ambientDword >> 16) & 0xff) / 255.0;
         const ambientG = ((ambientDword >> 8) & 0xff) / 255.0;
@@ -4849,7 +4871,7 @@ export class DDrawWebGPUExecutor {
         }
 
         applySamplerDebugOverrides(this, pr);
-        pr.stencilRef = renderStates[D3DRENDERSTATE_STENCILREF] || 0;
+        pr.stencilRef = dwordToUnsignedLong(renderStates[D3DRENDERSTATE_STENCILREF]);
         updateLastDrawDiagnostics(this, pr);
         return pr;
     }

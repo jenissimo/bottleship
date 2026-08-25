@@ -64,6 +64,7 @@ import { ShaderGenerator, ShaderConfig } from "./shader-generator";
 import { BindGroupManager } from "./bind-group-manager";
 import { DirectDrawSurfaceState } from "../../../modules/ddraw/com-objects";
 import { FfpStagesState, MAX_FFP_SAMPLED_STAGES } from "./ffp-stages";
+import { dwordToUnsignedLong } from "../shared/dword";
 
 /**
  * Maps D3D blend factor to WebGPU blend factor
@@ -333,11 +334,11 @@ export class PipelineFactory {
         const stencilFail = renderStates[D3DRENDERSTATE_STENCILFAIL] || D3DSTENCILOP_KEEP;
         const stencilZFail = renderStates[D3DRENDERSTATE_STENCILZFAIL] || D3DSTENCILOP_KEEP;
         const stencilPass = renderStates[D3DRENDERSTATE_STENCILPASS] || D3DSTENCILOP_KEEP;
-        const stencilRef = renderStates[D3DRENDERSTATE_STENCILREF] || 0;
+        const stencilRef = dwordToUnsignedLong(renderStates[D3DRENDERSTATE_STENCILREF]);
         // No `?? 0xff` fallback: an Int32Array element is never undefined, so the old one
         // could never fire. The masks' 0xFF defaults are seeded in the state tables.
-        const stencilMask = renderStates[D3DRENDERSTATE_STENCILMASK];
-        const stencilWriteMask = renderStates[D3DRENDERSTATE_STENCILWRITEMASK];
+        const stencilMask = dwordToUnsignedLong(renderStates[D3DRENDERSTATE_STENCILMASK]);
+        const stencilWriteMask = dwordToUnsignedLong(renderStates[D3DRENDERSTATE_STENCILWRITEMASK]);
 
         const effectiveAlphaBlend = alphaBlend ? 1 : 0;
         const effectiveSrcBlend = effectiveAlphaBlend ? (srcBlend || 2) : 0;
@@ -517,10 +518,10 @@ export class PipelineFactory {
         const stencilFail = renderStates[D3DRENDERSTATE_STENCILFAIL] || D3DSTENCILOP_KEEP;
         const stencilZFail = renderStates[D3DRENDERSTATE_STENCILZFAIL] || D3DSTENCILOP_KEEP;
         const stencilPass = renderStates[D3DRENDERSTATE_STENCILPASS] || D3DSTENCILOP_KEEP;
-        const stencilRef = renderStates[D3DRENDERSTATE_STENCILREF] || 0;
+        const stencilRef = dwordToUnsignedLong(renderStates[D3DRENDERSTATE_STENCILREF]);
         // See getOrCreatePipeline: the `??` fallback this used to carry was dead code.
-        const stencilMask = renderStates[D3DRENDERSTATE_STENCILMASK];
-        const stencilWriteMask = renderStates[D3DRENDERSTATE_STENCILWRITEMASK];
+        const stencilMask = dwordToUnsignedLong(renderStates[D3DRENDERSTATE_STENCILMASK]);
+        const stencilWriteMask = dwordToUnsignedLong(renderStates[D3DRENDERSTATE_STENCILWRITEMASK]);
 
         const effectiveAlphaBlend = alphaBlend ? 1 : 0;
         const effectiveSrcBlend = effectiveAlphaBlend ? (srcBlend || 2) : 0;

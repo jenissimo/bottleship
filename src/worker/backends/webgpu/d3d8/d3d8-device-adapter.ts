@@ -1018,6 +1018,23 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         };
     }
 
+    /** Harness draw bisect. The shared DDraw executor supports a cumulative upper cut. */
+    setDrawScrub(min: number, max: number): void {
+        if ((min | 0) !== 0 && (max | 0) >= 0) {
+            throw new Error("D3D8 draw scrub currently supports min=0 only");
+        }
+        this.renderer.setDebugToggle("drawScrubMax", (max | 0) >= 0, max | 0);
+    }
+
+    getDrawScrub(): { min: number; max: number; lastFrameDraws: number } {
+        const flags = this.renderer.getDebugFlags();
+        return {
+            min: 0,
+            max: flags.drawScrubMax,
+            lastFrameDraws: flags.scrubLastFrameDraws,
+        };
+    }
+
     getAllTransforms(): { state: number; matrix: Float32Array }[] {
         const out: { state: number; matrix: Float32Array }[] = [];
         for (const [state, matrix] of this.transforms) out.push({ state, matrix });
@@ -1418,6 +1435,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             rtState: this.activeRenderTarget,
             texStateObj: this.textures[0] ?? null,
             texStateObj1: this.textures[1] ?? null,
+            stageTextures: this.textures,
             renderStates: this.renderStates,
             texStates: this.textureStates,
             backend: "d3d8",
@@ -1428,6 +1446,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
                 width: this.viewport.width, height: this.viewport.height,
                 minZ: this.viewport.minZ ?? 0, maxZ: this.viewport.maxZ ?? 1,
             },
+            lighting: this.getFFPLightingState(),
             executionDiagnostics: (this.renderer as any).getLastDrawDiagnostics?.() ?? null,
         });
     }

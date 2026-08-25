@@ -5,6 +5,7 @@
 
 import type { CapturedClear, CapturedDrawCall, CapturedFrame } from "./frame-capture-types";
 import { type DirectDrawSurfaceState, isRenderSurface } from "./com-objects";
+import type { FFPLightingState } from "./d3d/ffp-lighting";
 import {
     D3DCLEAR_TARGET,
     D3DCLEAR_ZBUFFER,
@@ -42,14 +43,19 @@ import {
     D3DTSS_ALPHAOP,
     D3DTSS_ALPHAARG1,
     D3DTSS_ALPHAARG2,
+    D3DTSS_COLORARG0,
+    D3DTSS_ALPHAARG0,
     D3DTSS_MINFILTER,
     D3DTSS_MAGFILTER,
     D3DTSS_MIPFILTER,
     D3DTSS_ADDRESSU,
     D3DTSS_ADDRESSV,
     D3DTSS_MAXANISOTROPY,
+    D3DTSS_TEXCOORDINDEX,
+    D3DTSS_TEXTURETRANSFORMFLAGS,
     D3DFVF_XYZRHW,
 } from "./constants";
+import { MAX_FFP_STAGES } from "../../backends/webgpu/ddraw/ffp-stages";
 
 /** Fog range render states carry float BITS in the DWORD slot. */
 const dwordBitsScratch = new DataView(new ArrayBuffer(4));
@@ -355,6 +361,7 @@ export type RecordDrawCallParams = {
     rtState: DirectDrawSurfaceState;
     texStateObj: DirectDrawSurfaceState | null;
     texStateObj1: DirectDrawSurfaceState | null;
+    stageTextures?: readonly (DirectDrawSurfaceState | null)[] | null;
     renderStates: Int32Array | Uint32Array | number[];
     texStates: Int32Array | Uint32Array | number[];
     /** Producer backend tag (default "ddraw"; D3D8 passes "d3d8"). */
@@ -366,6 +373,8 @@ export type RecordDrawCallParams = {
     mvp?: Float32Array | number[] | null;
     /** Draw-time viewport as handed to the executor. */
     viewport?: { x: number; y: number; width: number; height: number; minZ: number; maxZ: number } | null;
+    /** Draw-time FFP lighting state. It is copied into plain data before capture returns. */
+    lighting?: FFPLightingState | null;
     executionDiagnostics: {
         useTexture: boolean;
         minFilter: number;
@@ -382,6 +391,45 @@ export function recordDrawCall(p: RecordDrawCallParams): void {
     const rs = p.renderStates;
     const ts = p.texStates;
     const isRHW = (p.vertexType & D3DFVF_XYZRHW) !== 0;
+    const lighting = p.lighting ? {
+        material: {
+            diffuse: { ...p.lighting.material.diffuse },
+            ambient: { ...p.lighting.material.ambient },
+            specular: { ...p.lighting.material.specular },
+            emissive: { ...p.lighting.material.emissive },
+            power: p.lighting.material.power,
+        },
+        ambient: { ...p.lighting.ambientColor },
+        lightCount: p.lighting.lights.length,
+        sources: {
+            diffuse: p.lighting.diffuseSource,
+            ambient: p.lighting.ambientSource,
+            specular: p.lighting.specularSource,
+            emissive: p.lighting.emissiveSource,
+        },
+    } : undefined;
+    const stages: CapturedDrawCall["stages"] = [];
+    for (let stage = 0; stage < MAX_FFP_STAGES; stage++) {
+        const base = stage * 32;
+        const texture = p.stageTextures?.[stage]
+            ?? (stage === 0 ? p.texStateObj : stage === 1 ? p.texStateObj1 : null);
+        stages.push({
+            stage,
+            colorOp: ts[base + D3DTSS_COLOROP] ?? 0,
+            colorArg1: ts[base + D3DTSS_COLORARG1] ?? 0,
+            colorArg2: ts[base + D3DTSS_COLORARG2] ?? 0,
+            alphaOp: ts[base + D3DTSS_ALPHAOP] ?? 0,
+            alphaArg1: ts[base + D3DTSS_ALPHAARG1] ?? 0,
+            alphaArg2: ts[base + D3DTSS_ALPHAARG2] ?? 0,
+            colorArg0: ts[base + D3DTSS_COLORARG0] ?? 0,
+            alphaArg0: ts[base + D3DTSS_ALPHAARG0] ?? 0,
+            texCoordIndex: ts[base + D3DTSS_TEXCOORDINDEX] ?? 0,
+            textureTransformFlags: ts[base + D3DTSS_TEXTURETRANSFORMFLAGS] ?? 0,
+            textureWidth: texture?.width ?? 0,
+            textureHeight: texture?.height ?? 0,
+            texturePtr: texture?.surfacePtr ?? 0,
+        });
+    }
 
     // Decode FVF layout (component byte offsets) and read vertices with UV/diffuse.
     const L = fvfLayout(p.vertexType);
@@ -610,6 +658,8 @@ export function recordDrawCall(p: RecordDrawCallParams): void {
         zFunc,
         cullMode,
         lightingEnabled,
+        lighting,
+        stages,
         fogEnabled,
         fog,
         clipPlaneEnable,

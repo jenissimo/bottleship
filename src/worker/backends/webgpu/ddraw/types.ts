@@ -30,6 +30,8 @@ export interface DebugFlags {
     debugView: "normal" | "uv" | "vertexcolor" | "alpha" | "solid";
     /** Force disable alpha blending */
     forceDisableAlphaBlend: boolean;
+    /** Force FFP lighting off while preserving material, texture, and vertex inputs. */
+    forceDisableLighting: boolean;
     /** Force disable Z test */
     forceDisableZTest: boolean;
     /** DIAG: keep the depth TEST but let no draw WRITE depth. Splits forceDisableZTest into
@@ -61,6 +63,8 @@ export interface DebugFlags {
      *  back under this one blames the grouping, and one that needs the full flag blames
      *  the storage/shader path. */
     disableMegaBatchAccumulate: boolean;
+    /** DIAG: restore one queue.writeBuffer call per CPU vertex/index allocation. */
+    disableGeometryStaging: boolean;
     /** DIAG: skip the guest-memory content hash that detects texel writes a game made
      *  through a cached lpSurface (see prepareStageTexture). Off = hashing on. */
     disableCpuTextureHash: boolean;
@@ -100,6 +104,7 @@ export const DEFAULT_DEBUG_FLAGS: DebugFlags = {
     forceMissingTextureMagenta: false,
     debugView: "normal",
     forceDisableAlphaBlend: false,
+    forceDisableLighting: false,
     forceDisableZTest: false,
     forceDisableZWrite: false,
     forceWireColor: false,
@@ -112,6 +117,7 @@ export const DEFAULT_DEBUG_FLAGS: DebugFlags = {
     textureConverterDebugMode: 0,
     disableMegaBatch: false,
     disableMegaBatchAccumulate: false,
+    disableGeometryStaging: false,
     disableCpuTextureHash: false,
     disableTextureOverwriteSubmit: false,
     skipMegaBatchDrawsRender: false,

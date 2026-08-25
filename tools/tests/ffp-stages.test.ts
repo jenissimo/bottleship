@@ -31,9 +31,13 @@ import {
     D3DTSS_ALPHAOP,
     D3DTSS_ALPHAARG1,
     D3DTSS_ALPHAARG2,
+    D3DTSS_COLORARG0,
+    D3DTSS_ALPHAARG0,
     D3DTOP_DISABLE,
     D3DTOP_MODULATE,
     D3DTOP_SELECTARG1,
+    D3DTOP_MULTIPLYADD,
+    D3DTOP_LERP,
     D3DTA_TEXTURE,
     D3DTA_DIFFUSE,
     D3DTA_CURRENT,
@@ -91,6 +95,51 @@ describe("FfpStagesState.resolve", () => {
         // Stage 1+ defaults blend against CURRENT
         expect(st.colorArg2[1]).toBe(D3DTA_CURRENT);
         expect(st.alphaOp[1]).toBe(D3DTOP_SELECTARG1);
+    });
+
+    test("MULTIPLYADD preserves COLORARG0 for the third combiner operand", () => {
+        const states = makeStates();
+        set(states, 1, D3DTSS_COLOROP, D3DTOP_MULTIPLYADD);
+        set(states, 1, D3DTSS_COLORARG0, D3DTA_CURRENT);
+        set(states, 1, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+        set(states, 1, D3DTSS_COLORARG2, D3DTA_TFACTOR);
+        const st = new FfpStagesState();
+        st.resolve(states, 0b11, true, true);
+        expect(st.colorArg0[1]).toBe(D3DTA_CURRENT);
+        st.pack();
+        expect((st.packed[4] >>> 16) & 0xff).toBe(D3DTA_CURRENT);
+    });
+
+    test("a stale ARG0 on a non-ARG0 op does not make an arithmetic stage look textured", () => {
+        // ARG0 persists across draws, so a stage that ran LERP with ARG0=TEXTURE and is
+        // then reused as a pure CURRENT×TFACTOR fade still carries it. Only MULTIPLYADD
+        // and LERP read ARG0; counting it anywhere else drops the stage — and every stage
+        // above it — out of the cascade, and the fade silently vanishes.
+        const states = makeStates();
+        set(states, 1, D3DTSS_COLOROP, D3DTOP_MODULATE);
+        set(states, 1, D3DTSS_COLORARG1, D3DTA_CURRENT);
+        set(states, 1, D3DTSS_COLORARG2, D3DTA_TFACTOR);
+        set(states, 1, D3DTSS_COLORARG0, D3DTA_TEXTURE);   // stale, MODULATE ignores it
+        set(states, 1, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+        set(states, 1, D3DTSS_ALPHAARG1, D3DTA_CURRENT);
+        set(states, 1, D3DTSS_ALPHAARG2, D3DTA_CURRENT);
+        set(states, 1, D3DTSS_ALPHAARG0, D3DTA_TEXTURE);   // stale, SELECTARG1 ignores it
+        const st = new FfpStagesState();
+        st.resolve(states, 0b01, true, true);              // no stage-1 texture
+        expect(st.enabledMask).toBe(0b11);                 // cascade survives
+        expect(st.sampledMask).toBe(0b01);
+        expect(st.missingMask & 0b10).toBe(0);             // arithmetic, not "missing"
+    });
+
+    test("LERP still counts ARG0, so a missing texture is reported", () => {
+        const states = makeStates();
+        set(states, 1, D3DTSS_COLOROP, D3DTOP_LERP);
+        set(states, 1, D3DTSS_COLORARG0, D3DTA_TEXTURE);   // LERP reads it
+        set(states, 1, D3DTSS_COLORARG1, D3DTA_CURRENT);
+        set(states, 1, D3DTSS_COLORARG2, D3DTA_TFACTOR);
+        const st = new FfpStagesState();
+        st.resolve(states, 0b01, true, true);              // no stage-1 texture
+        expect(st.missingMask & 0b10).not.toBe(0);
     });
 
     test("arithmetic stage 1 (CURRENT×TFACTOR fade) runs without sampling", () => {
@@ -177,15 +226,17 @@ describe("FfpStagesState.resolve", () => {
         st.tci[1] = 0x00020001; // texgen mode 2 + UV set 1
         st.texXformFlags[1] = 0x102;
         st.pack();
-        // stage 1: x = colorOp | alphaOp<<16
-        expect(st.packed[1 * 4 + 0]).toBe(D3DTOP_MODULATE | (D3DTOP_SELECTARG1 << 16));
+        // stage 1: ops and ARG0 values are packed as u8×4.
+        expect(st.packed[1 * 4 + 0]).toBe(
+            D3DTOP_MODULATE | (D3DTOP_SELECTARG1 << 8) |
+            (D3DTA_CURRENT << 16) | (D3DTA_CURRENT << 24));
         // y = args u8×4 (defaults TEXTURE/CURRENT for stage 1)
         expect(st.packed[1 * 4 + 1]).toBe(
             D3DTA_TEXTURE | (D3DTA_CURRENT << 8) | (D3DTA_TEXTURE << 16) | (D3DTA_CURRENT << 24));
         expect(st.packed[1 * 4 + 2]).toBe(0x00020001);
         expect(st.packed[1 * 4 + 3]).toBe(0x102);
         // stage 2 disabled → DISABLE ops
-        expect(st.packed[2 * 4 + 0] & 0xffff).toBe(D3DTOP_DISABLE);
+        expect(st.packed[2 * 4 + 0] & 0xff).toBe(D3DTOP_DISABLE);
     });
 });
 
@@ -211,6 +262,7 @@ describe("shader generation (stage-generic WGSL)", () => {
         for (const s of [0, 1, 2, 3]) expect(code).toContain(`uniforms.stages[${s}]`);
         expect(code).toContain(`stages: array<vec4u, ${MAX_FFP_STAGES}>`);
         expect(code).toContain("var tex2Color = vec4f(0.0, 0.0, 0.0, 1.0)");
+        expect(code).toContain("arg0 + arg1 * arg2");
     });
 
     test("legacy shader: untextured stage 0 falls back to diffuse", () => {
