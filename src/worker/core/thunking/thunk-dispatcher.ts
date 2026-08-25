@@ -168,7 +168,7 @@ interface SehDispatchContext {
     kind: 'av' | 'cxx';
     /** For 'cxx': what the throw carried, so an exhausted x86 chain can still be
      *  re-walked in JS for a catch the native handlers could not serve. */
-    cxx?: { pObj: number; pThrow: number; cleanupBytes: number; throwEsp: number };
+    cxx?: { pObj: number; pThrow: number; cleanupBytes: number; throwEsp: number; returnAddr: number };
 }
 
 // Configuration
@@ -391,6 +391,7 @@ export class ThunkDispatcher {
     private hcRingHead = new Int32Array(256);   // guest [hcWatchAddr] at each hypercall
     private hcRingPos = 0;
     hcWatchAddr = 0;                            // set from harness to sample a guest dword per hypercall
+    hcRingThreadFilter = 0;                     // 0 records all threads
     // Default OFF: recording every hypercall (incl. fast-path Tier 1-3) is measurable on the
     // hottest path (~5 typed-array writes + a DataView read per OUT 0xB077). Armed by the
     // `headWatch` harness verb for crash-hunt; the slow-path winApiRing still feeds the fault
@@ -1205,7 +1206,7 @@ export class ThunkDispatcher {
 
         // ── Hypercall ring (crash-hunt): record EVERY hypercall (fast + slow). Zero-alloc.
         // Gated: only records when armed (headWatch verb) — off by default to keep the hot path free.
-        if (this.hcRingEnabled) {
+        if (this.hcRingEnabled && (!this.hcRingThreadFilter || this.currentThreadId === this.hcRingThreadFilter)) {
             const p = this.hcRingPos++ & 255;
             this.hcRingId[p] = functionId | 0;
             this.hcRingThread[p] = (this.currentThreadId ?? 0) | 0;
@@ -4862,8 +4863,20 @@ export class ThunkDispatcher {
             cpu.reg32[1] = view.getUint32(ctxBase + 0xAC, true); // ECX
             cpu.reg32[0] = view.getUint32(ctxBase + 0xB0, true); // EAX
             cpu.reg32[5] = view.getUint32(ctxBase + 0xB4, true); // EBP
-            const ctxEip = view.getUint32(ctxBase + 0xB8, true); // EIP from CONTEXT
-            const ctxEsp = view.getUint32(ctxBase + 0xC4, true) >>> 0; // ESP from CONTEXT
+            let ctxEip = view.getUint32(ctxBase + 0xB8, true) >>> 0; // EIP from CONTEXT
+            let ctxEsp = view.getUint32(ctxBase + 0xC4, true) >>> 0; // ESP from CONTEXT
+
+            // A SOFTWARE raise (RaiseException / _CxxThrowException) captured the CONTEXT
+            // at the raising thunk's own trap, so resuming there re-raises forever — the
+            // JS stack overflows before the guest notices. Windows captures it inside
+            // RtlRaiseException, one frame deeper: continuing there unwinds back out and
+            // the API simply RETURNS to its caller. Reproduce that contract — unless a
+            // filter rewrote the context, in which case its EIP/ESP are the answer.
+            const raised = ctx?.kind === 'cxx' ? ctx.cxx : undefined;
+            if (raised && ctxEip === faultingEip && ctxEsp === raised.throwEsp) {
+                ctxEip = raised.returnAddr;
+                ctxEsp = (raised.throwEsp + 4 + raised.cleanupBytes) >>> 0;
+            }
 
             // ESP is part of the context, not an exception to it. Dispatch runs on a
             // scratch stack 0x200 below the fault, so resuming on the dispatcher's own ESP
@@ -5663,7 +5676,9 @@ export class ThunkDispatcher {
                 `scope[0..31]=${previewBytes(scopeTable, 32)}`);
 
             // Check if this is an __except_handler3 frame (scopeTable is a valid pointer, trylevel in range)
-            const isHandler3 = scopeTable >= 0x10000 && trylevel >= -1 && trylevel <= 255;
+            const isHandler3 = scopeTable >= 0x10000 &&
+                scopeTable <= this.memLength - 4 &&
+                trylevel >= -1 && trylevel <= 255;
 
             if (!isHandler3) {
                 // Raw SEH handler or VC7+ __CxxFrameHandler3 — can't evaluate statically
@@ -6086,7 +6101,12 @@ export class ThunkDispatcher {
         // --- Set up CPU to jump to dispatch stub ---
         cpu.reg32[7] = scratchAddr | 0;  // EDI = paramBase
 
-        // Overwrite [ESP] with dispatch stub address so RET N lands there.
+        // Overwrite [ESP] with dispatch stub address so RET N lands there. The raise
+        // site's own return address has to survive that: a filter answering
+        // CONTINUE_EXECUTION resumes by RETURNING from the raising API (see the
+        // continue branch in _handleSehDispatchResult), and this slot is the only
+        // place it was recorded.
+        const raiseReturnAddr = view.getUint32(thunkEsp, true) >>> 0;
         view.setUint32(thunkEsp, this.sehDispatchStubAddress, true);
 
         // --- Push dispatch context ---
@@ -6102,6 +6122,7 @@ export class ThunkDispatcher {
                 pThrow: lpArguments ? view.getUint32(lpArguments + 8, true) >>> 0 : 0,
                 cleanupBytes: thunkCleanupBytes,
                 throwEsp: thunkEsp >>> 0,
+                returnAddr: raiseReturnAddr,
             },
         };
         this.sehDispatchStack.push(dispatchCtx);

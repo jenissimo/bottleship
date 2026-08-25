@@ -8,7 +8,7 @@ import { ThunkImplementation, ThunkResult } from '../../core/thunking/thunk-disp
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { getCPU } from '../../core/thunking/thunk-utils';
-import { dispatchCxxException, dispatchFinallyUnwind } from '../../core/seh-dispatch';
+import { dispatchCxxException, dispatchUnwindPass } from '../../core/seh-dispatch';
 import { readAnsiFromGuest } from '../codepage-utils';
 
 function tryReadUeAnsiFString(mem: Uint8Array, arrayPtr: number, maxChars = 512): string | null {
@@ -503,27 +503,31 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             `RtlUnwind(targetFrame=0x${targetFrame.toString(16)}, excRec=0x${pExceptionRecord.toString(16)}, ` +
             `retVal=0x${returnValue.toString(16)}) sehHead=0x${sehHead.toString(16)}`);
 
-        // Set EH_UNWINDING flag on the exception record so handlers know this is an unwind pass
+        // Mark the record as an unwind pass. A missing TargetFrame is an EXIT unwind (the
+        // whole chain goes), which handlers distinguish from a normal one — Windows sets
+        // both bits here, and a runtime that only tests EH_EXIT_UNWIND sees nothing without
+        // it. A NULL record is synthesized further down, where there is scratch to put it.
         if (pExceptionRecord !== 0 && pExceptionRecord + 8 <= mem.length) {
-            const EH_UNWINDING = 0x02;
+            const EH_UNWINDING = 0x02, EH_EXIT_UNWIND = 0x04;
             const oldFlags = view.getUint32(pExceptionRecord + 4, true);
-            view.setUint32(pExceptionRecord + 4, oldFlags | EH_UNWINDING, true);
+            view.setUint32(pExceptionRecord + 4,
+                oldFlags | EH_UNWINDING | (targetFrame !== 0 ? 0 : EH_EXIT_UNWIND), true);
         }
 
         // RtlUnwind is stdcall with 4 args → stub does RET 16
         const RTLUNWIND_CLEANUP = 16;
 
-        // Try to run __finally blocks via trampoline on the dead stack.
-        // dispatchFinallyUnwind walks __except_handler3 frames from FS:[0] to targetFrame,
-        // collects scope table entries with filterAddr==0, and emits a trampoline that
-        // calls each funclet (MOV EBP, frame+16; CALL handler), updates FS:[0], then
-        // returns to our caller via MOV ESP, callerEsp; JMP retAddr.
-        const trampolineResult = dispatchFinallyUnwind(
+        // Run the unwind pass on the dead stack: dispatchUnwindPass walks FS:[0] to
+        // targetFrame and emits a trampoline that calls every frame's handler with
+        // EH_UNWINDING, popping each frame after its handler, then returns to our caller
+        // via MOV ESP, callerEsp; JMP retAddr.
+        const trampolineResult = dispatchUnwindPass(
             mem, cpu, ctx.esp, tebAddr, targetFrame, returnValue, RTLUNWIND_CLEANUP,
+            pExceptionRecord,
         );
         if (trampolineResult) return trampolineResult;
 
-        // No __finally blocks found — simple path: just unlink frames and return.
+        // Nothing between FS:[0] and targetFrame — simple path: unlink and return.
         // Windows RtlUnwind unlinks all frames from FS:[0] up to but NOT INCLUDING
         // targetFrame, leaving FS:[0] = targetFrame. The target is the catching frame and
         // STAYS in the chain: for C-style SEH (_except_handler3, one registration per
@@ -539,7 +543,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         if (targetFrame !== 0) {
             view.setUint32(tebAddr, targetFrame, true);
             Logger.log(LogCategory.KERNEL32,
-                `RtlUnwind: no __finally blocks, FS:[0] = 0x${targetFrame.toString(16)} (targetFrame stays — Win32 contract)`);
+                `RtlUnwind: nothing to unwind, FS:[0] = 0x${targetFrame.toString(16)} (targetFrame stays — Win32 contract)`);
         }
 
         cpu.reg32[0] = returnValue | 0;
