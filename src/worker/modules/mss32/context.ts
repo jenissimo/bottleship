@@ -58,8 +58,10 @@ export interface MSSContext {
     driverAuxBuffer1: number;
     driverAuxBuffer2: number;
     driverAuxBuffer3: number;
-    /** Guest-memory string for fake 3D provider name — returned by _AIL_enumerate_3D_providers */
-    provider3DNamePtr: number;
+    /** Guest-memory copies of the 3D provider names, one per PROVIDERS_3D entry.
+     *  Engines keep the pointer past the enumerating call, so these live for the
+     *  life of the process. */
+    provider3DNamePtrs: number[];
     /** Miles 3D listener (created by _AIL_open_3D_listener). Distinct handle from sample handles. */
     listener3D: MSSListener3D | null;
     /** Global listener SAB shared with the audio worklet (LCTRL_* layout). */
@@ -153,7 +155,7 @@ export function createMSSContext(process: Process): MSSContext {
         driverAuxBuffer1: 0,
         driverAuxBuffer2: 0,
         driverAuxBuffer3: 0,
-        provider3DNamePtr: 0,
+        provider3DNamePtrs: [],
         listener3D: null,
         listenerSab: null,
         speakerType3D: 0,

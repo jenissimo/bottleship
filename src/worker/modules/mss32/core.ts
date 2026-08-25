@@ -10,8 +10,11 @@ import { processPendingTimerCallbacks, processPendingEOSCallbacks, processPendin
 import { pumpVfsStreams, serveIncrementalStreams } from "./stream-engine";
 import { ensureListener3D } from "./spatial";
 
-/** Fake 3D provider handle — games null-check but never dereference internals */
-const FAKE_3D_PROVIDER_HANDLE = 0xDEAD3D01;
+/** The software 3D providers we publish, in the order Miles lists its redist. */
+const PROVIDERS_3D: ReadonlyArray<{ name: string; handle: number }> = [
+    { name: "DirectSound3D Software Emulation", handle: 0xDEAD3D01 },
+    { name: "Miles Fast 2D Positional Audio", handle: 0xDEAD3D02 },
+];
 /** 3D voices we advertise. Miles' own software providers report 32; engines size their
  *  voice pools from this and treat a small number as "provider not worth keeping". */
 const MAX_3D_SAMPLES = 32;
@@ -210,11 +213,23 @@ export function createCoreExports(ctx: MSSContext): Record<string, ThunkImplemen
 
     // _AIL_enumerate_3D_providers@12
     // Signature: S32 AIL_enumerate_3D_providers(HPROENUM* next, HPROVIDER* dest, char** name)
-    // Returns 1 if provider found, 0 if no more.
-    // Must return at least one provider with a valid name string.
-    // Re-Volt stores provider names during first boot and reuses them during level
-    // transition reinit. With 0 providers, the stored name is NULL → strncpy(buf, NULL, 128)
-    // → #PF crash at EIP=0x4a9ff6 during reinit.
+    // Returns 1 while a provider is handed out, 0 once the list is exhausted.
+    //
+    // Real Miles builds this list from the `.m3d` RIB providers in its redist directory,
+    // and the NAME is load-bearing: engines pick their provider by string, not by
+    // position. GTA Vice City walks the enumerated names looking for exactly
+    // "DirectSound3D Software Emulation" (mssds3ds.m3d) and, finding none, tears the
+    // whole sound system down and reports "no sound card" — so a single generically
+    // named provider is not enough.
+    //
+    // We publish the two SOFTWARE providers every MSS redist ships, because those are
+    // the two we actually are: a 3D mixer over the digital driver, and a plain panner.
+    // The hardware-backed ones (DirectSound3D Hardware Support, EAX, A3D) stay out —
+    // claiming them would only make an engine choose a path we cannot honour.
+    //
+    // At least one provider must always be enumerated: Re-Volt stores the name at first
+    // boot and reuses it on level-transition reinit, so an empty list becomes
+    // strncpy(buf, NULL, 128) → #PF.
     exports["_AIL_enumerate_3D_providers@12"] = (ctxThunk, mem, args) => {
         const nextPtr = args[0];  // HPROENUM* (in/out enumeration state)
         const destPtr = args[1];  // HPROVIDER* (out: provider handle)
@@ -222,41 +237,54 @@ export function createCoreExports(ctx: MSSContext): Record<string, ThunkImplemen
 
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
 
-        // Read enumeration state — 0 = first call
+        // The enumeration state is the caller's cursor: 0 on the first call, then
+        // whatever we last wrote back.
         let enumState = 0;
         if (nextPtr && MemoryGuard.isValidRange(mem, nextPtr, 4)) {
             enumState = view.getUint32(nextPtr, true);
         }
 
-        if (enumState === 0) {
-            // First call: return one fake provider
-            if (!ctx.provider3DNamePtr) {
-                const name = "Miles Fast 2D Positional Audio";
-                ctx.provider3DNamePtr = ctx.process.memory.alloc(name.length + 1);
-                for (let i = 0; i < name.length; i++) {
-                    mem[ctx.provider3DNamePtr + i] = name.charCodeAt(i);
-                }
-                mem[ctx.provider3DNamePtr + name.length] = 0;
-            }
-
-            if (destPtr && MemoryGuard.isValidRange(mem, destPtr, 4)) {
-                view.setUint32(destPtr, FAKE_3D_PROVIDER_HANDLE, true);
-            }
-            if (namePtr && MemoryGuard.isValidRange(mem, namePtr, 4)) {
-                view.setUint32(namePtr, ctx.provider3DNamePtr, true);
-            }
-            if (nextPtr && MemoryGuard.isValidRange(mem, nextPtr, 4)) {
-                view.setUint32(nextPtr, 1, true);
-            }
-
-            Logger.log(LogCategory.SYSTEM,
-                `MSS32: _AIL_enumerate_3D_providers@12 → 1 (fake provider "${("Miles Fast 2D Positional Audio")}" at 0x${ctx.provider3DNamePtr.toString(16)})`);
-            return 1;
+        if (enumState >= PROVIDERS_3D.length) {
+            Logger.verbose(LogCategory.SYSTEM, `MSS32: _AIL_enumerate_3D_providers@12 enumState=${enumState} → 0 (done)`);
+            return 0;
         }
 
-        // Subsequent calls: no more providers
-        Logger.verbose(LogCategory.SYSTEM, `MSS32: _AIL_enumerate_3D_providers@12 enumState=${enumState} → 0 (done)`);
-        return 0;
+        // Names live in guest memory for the life of the process — engines keep the
+        // pointer well past this call and compare it later.
+        if (!ctx.provider3DNamePtrs.length) {
+            for (const p of PROVIDERS_3D) {
+                const ptr = ctx.process.memory.alloc(p.name.length + 1);
+                if (!ptr) break;
+                // A refused write would leave zeroed memory behind, and an empty name
+                // is exactly what makes a title decide it has no usable provider.
+                if (!Marshaler.writeString(mem, ptr, p.name, p.name.length + 1)) {
+                    Logger.error(LogCategory.SYSTEM,
+                        `MSS32: could not publish 3D provider name "${p.name}" at 0x${ptr.toString(16)}`);
+                    break;
+                }
+                ctx.provider3DNamePtrs.push(ptr);
+            }
+        }
+        if (enumState >= ctx.provider3DNamePtrs.length) {
+            Logger.log(LogCategory.SYSTEM,
+                `MSS32: _AIL_enumerate_3D_providers@12 → 0 (could not publish provider name #${enumState})`);
+            return 0;
+        }
+
+        const provider = PROVIDERS_3D[enumState];
+        if (destPtr && MemoryGuard.isValidRange(mem, destPtr, 4)) {
+            view.setUint32(destPtr, provider.handle, true);
+        }
+        if (namePtr && MemoryGuard.isValidRange(mem, namePtr, 4)) {
+            view.setUint32(namePtr, ctx.provider3DNamePtrs[enumState], true);
+        }
+        if (nextPtr && MemoryGuard.isValidRange(mem, nextPtr, 4)) {
+            view.setUint32(nextPtr, enumState + 1, true);
+        }
+
+        Logger.log(LogCategory.SYSTEM,
+            `MSS32: _AIL_enumerate_3D_providers@12 → 1 ("${provider.name}" handle=0x${provider.handle.toString(16)} at 0x${ctx.provider3DNamePtrs[enumState].toString(16)})`);
+        return 1;
     };
 
     // _AIL_enumerate_filters@12
