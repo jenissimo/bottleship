@@ -216,6 +216,8 @@ export function serializeWindows(): unknown {
     const out: unknown[] = [];
     const wm = sys().windowManager;
     const activeHwnd = wm.getActiveHwnd();
+    const focusHwnd = wm.getFocusHwnd();
+    const foregroundHwnd = wm.getForegroundHwnd();
     const zOrder = wm.getZOrder();
     for (const [hwnd, w] of windows) {
         const abs = getAbsoluteWindowPosition(w);
@@ -228,7 +230,13 @@ export function serializeWindows(): unknown {
             x: abs.x, y: abs.y, w: width, h: height,
             cx: abs.x + (width >> 1), cy: abs.y + (height >> 1),
             visible: !!w.visible,
+            // ACTIVE, FOCUS and FOREGROUND are three different answers in Win32, and a game
+            // that polls GetFocus()/GetActiveWindow() every frame to decide whether to render
+            // reads whichever one we get wrong. Reporting only `active` left a zero focus
+            // invisible — which reads as "the window is fine" while the guest sees otherwise.
             active: hwnd === activeHwnd,
+            focused: hwnd === focusHwnd,
+            foreground: hwnd === foregroundHwnd,
             zIndex: zOrder.indexOf(hwnd),
             parent: w.parent ?? null,
             childCount: w.children?.length ?? 0,
