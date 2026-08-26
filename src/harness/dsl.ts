@@ -195,6 +195,12 @@ export class HarnessChain {
     codeAudit(opts?: { dump?: boolean; kinds?: string[]; wholeImage?: boolean }): this { return this.push("codeAudit", [opts]); }
     /** Recent guest page faults (EIP / fault addr / thread / last thunk / regs). */
     faults(n?: number): this { return this.push("faults", [n]); }
+    /** Is every thunked import bound to the address GetProcAddress hands out for that
+     *  export? Wrappers (ASI/mod loaders, ddraw and d3d shims) hook by scanning an IAT
+     *  for that value, so a second address makes them install nothing, silently.
+     *  `diverged` is that bug class only; guest hooks and our inline fast paths are
+     *  counted apart. Positive control: setWorkerFlag('__noImageIatBinding', true). */
+    importAudit(limit?: number): this { return this.push("importAudit", [limit]); }
     /** Raw guest memory as hex — read a struct, a stack frame, or unpacked code. */
     readBytes(addr: number | string, len?: number): this { return this.push("readBytes", [addr, len]); }
     /** PNG of the SCREEN (canvas, overlays composited). `source:'layer'` asks for the

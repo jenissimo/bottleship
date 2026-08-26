@@ -14,6 +14,7 @@ import { registerStateCommands } from "./cmds/state";
 import { registerDInputCommands } from "./cmds/dinput";
 import { registerInputCommands } from "./cmds/input";
 import { registerTimeCommands } from "./cmds/time";
+import { registerImportCommands } from "./cmds/imports";
 import { registerLogCommands } from "./cmds/logs";
 import { registerScreenCommands } from "./cmds/screen";
 import { registerBreakpointCommands } from "./cmds/breakpoints";
@@ -40,6 +41,7 @@ import { registerGpuCommands } from "./cmds/gpu";
 import { registerReferenceCommands } from "./cmds/reference";
 import { registerDDrawConformanceCommands } from "./cmds/ddraw-conformance";
 import { registerD3D9ConformanceCommands } from "./cmds/d3d9-conformance";
+import { registerShaderCommands } from "./cmds/shader";
 
 let installed = false;
 
@@ -51,6 +53,7 @@ export function installHarnessCommands(): void {
     registerDInputCommands(harnessService);
     registerInputCommands(harnessService);
     registerTimeCommands(harnessService);
+    registerImportCommands(harnessService);
     registerLogCommands(harnessService);
     registerScreenCommands(harnessService);
     registerBreakpointCommands(harnessService);
@@ -77,6 +80,7 @@ export function installHarnessCommands(): void {
     registerReferenceCommands(harnessService);
     registerDDrawConformanceCommands(harnessService);
     registerD3D9ConformanceCommands(harnessService);
+    registerShaderCommands(harnessService);
 }
 
 // Install on import so a bare `import './harness/commands'` is sufficient.

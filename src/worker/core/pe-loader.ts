@@ -2,7 +2,7 @@
 // Portably parses Win32 PE files and loads them into emulator memory
 
 import { ThunkGenerator } from './thunking/thunk-generator';
-import { markHleModuleLoaded } from './hle-module-images';
+import { hleImageExportAddress, markHleModuleLoaded } from './hle-module-images';
 import { deriveStackCleanupFromMangledName } from './thunking/msvc-mangling';
 import { APIRegistry } from './api-registry';
 import { System } from './system';
@@ -1541,6 +1541,16 @@ export class PELoader {
                         // is deliberately routed there for Rust zero_block; uninitialized slab /
                         // dwBytes=0 / >4KB / exhausted cases can still fall through to JS.
                         let stubAddress = stubDll.exportTable.get(funcKey);
+                        // Windows binds an import to the export's address inside the
+                        // exporting image, and GetProcAddress returns that same address.
+                        // Wrappers the games in this era ship (ASI/mod loaders, ddraw and
+                        // d3d shims) hook by scanning the IAT for the value GetProcAddress
+                        // gave them, so a second address for one export makes them install
+                        // nothing at all — silently. Bind to the in-image body wherever the
+                        // HLE module has one; the arena stub stays the fallback for exports
+                        // no image could hold.
+                        const imageExport = hleImageExportAddress(dllName, funcKey);
+                        if (imageExport !== undefined && !(globalThis as any).__noImageIatBinding) stubAddress = imageExport;
                         // The kernel32/CRT heap-slab fast path is DEFAULT-ON. The slab control block
                         // lives in guest RAM so it is reachable from guest code; RMW atomicity vs
                         // thread switch is covered by the non-preemptible stub region.

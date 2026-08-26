@@ -29,6 +29,9 @@ import { calculateStackCleanup } from "../api/types";
 let slotByName = new Map<string, number>();
 /** name -> its image's export name -> absolute address. */
 let exportsByName = new Map<string, Map<string, number>>();
+/** The same map keyed by lowercased export name — import binding and GetProcAddress
+ *  both look up case-insensitively. */
+let exportsByLowerName = new Map<string, Map<string, number>>();
 let ordinalsByName = new Map<string, Map<number, number>>();
 let owner: unknown = null;
 let ownerGeneration = -1;
@@ -100,6 +103,20 @@ export function hleImageExports(dllName: string): Map<string, number> {
     return exportsByName.get(canonicalHleModuleName(dllName)) ?? new Map();
 }
 
+/**
+ * The in-image body of one export, keyed case-insensitively, or undefined when the
+ * module has no image or the export was not stubbable.
+ *
+ * This is the address Windows puts in an importer's IAT and hands back from
+ * GetProcAddress — one address per export. The PE loader binds through here so those
+ * two cannot disagree: an IAT-hooking wrapper finds its slot by comparing the IAT
+ * against the GetProcAddress result, and a second address for the same export makes
+ * every such hook silently install nothing.
+ */
+export function hleImageExportAddress(dllName: string, exportName: string): number | undefined {
+    return exportsByLowerName.get(canonicalHleModuleName(dllName))?.get(exportName.toLowerCase());
+}
+
 export function hleImageOrdinalExports(dllName: string): Map<number, number> {
     return ordinalsByName.get(canonicalHleModuleName(dllName)) ?? new Map();
 }
@@ -136,6 +153,7 @@ export function materializeHleModuleImages(process: any): void {
 
     slotByName = new Map();
     exportsByName = new Map();
+    exportsByLowerName = new Map();
     ordinalsByName = new Map();
     loadedNames = new Set();
 
@@ -220,6 +238,8 @@ export function materializeHleModuleImages(process: any): void {
 
         slotByName.set(name, slot);
         exportsByName.set(name, image.exportAddresses);
+        exportsByLowerName.set(name, new Map(
+            [...image.exportAddresses].map(([n, a]) => [n.toLowerCase(), a])));
         ordinalsByName.set(name, image.ordinalAddresses);
         built++;
     }
