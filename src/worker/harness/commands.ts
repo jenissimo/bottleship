@@ -14,7 +14,7 @@ import { registerStateCommands } from "./cmds/state";
 import { registerDInputCommands } from "./cmds/dinput";
 import { registerInputCommands } from "./cmds/input";
 import { registerTimeCommands } from "./cmds/time";
-import { registerImportCommands } from "./cmds/imports";
+import { registerAbiAuditCommand, registerImportCommands } from "./cmds/imports";
 import { registerLogCommands } from "./cmds/logs";
 import { registerScreenCommands } from "./cmds/screen";
 import { registerBreakpointCommands } from "./cmds/breakpoints";
@@ -54,6 +54,7 @@ export function installHarnessCommands(): void {
     registerInputCommands(harnessService);
     registerTimeCommands(harnessService);
     registerImportCommands(harnessService);
+    registerAbiAuditCommand(harnessService);
     registerLogCommands(harnessService);
     registerScreenCommands(harnessService);
     registerBreakpointCommands(harnessService);

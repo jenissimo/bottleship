@@ -558,6 +558,34 @@ export class ThunkDispatcher {
     }
 
     /**
+     * Diagnostics: which export names a module actually has a handler for, and what
+     * every live stub's dispatch slot was registered AS.
+     *
+     * `register()` binds `findStubsByName(...)[0]`, so the name a handler was written
+     * under and the name the guest imported are not necessarily the same string. When
+     * they differ only in `_`/case that is spelling; when the stdcall decoration differs
+     * it is a different argument list, and the handler is reading arguments the caller
+     * never pushed. Nothing else can see that pairing — the guest gets an answer either
+     * way — so it is published here for `abiAudit` to judge.
+     */
+    public getBindingCensus(): {
+        implemented: string[];
+        bindings: Array<{ dll: string; stub: string; bound: string | null }>;
+    } {
+        const implemented = new Set<string>(this.pendingRegistrations.keys());
+        const bindings: Array<{ dll: string; stub: string; bound: string | null }> = [];
+        for (const stub of this.thunkGenerator.getAllStubs()) {
+            const id = stub.functionId;
+            const bound = id < MAX_THUNK_ID && this.dispatchTable[id]
+                ? this.namesTable[id] ?? null
+                : null;
+            if (bound) implemented.add(bound.toLowerCase());
+            bindings.push({ dll: stub.dllName, stub: stub.functionName, bound });
+        }
+        return { implemented: [...implemented], bindings };
+    }
+
+    /**
      * Call this whenever emulator memory buffer might have changed (resize/init)
      */
     public updateMemoryCache(): void {

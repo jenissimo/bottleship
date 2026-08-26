@@ -138,3 +138,103 @@ export function registerImportCommands(svc: HarnessService): void {
         };
     });
 }
+
+/** The stdcall byte count in a decorated export name, or null when undecorated. */
+function decorationOf(name: string): string | null {
+    const m = /@(\d+)$/.exec(name);
+    return m ? m[1]! : null;
+}
+
+/** `dll:name` -> the bare name, lowercased and stripped of a leading underscore. */
+function bareName(qualified: string): string {
+    const name = qualified.includes(":") ? qualified.slice(qualified.indexOf(":") + 1) : qualified;
+    return name.toLowerCase().replace(/^_+/, "");
+}
+
+export function registerAbiAuditCommand(svc: HarnessService): void {
+    /**
+     * abiAudit() — is every guest call reaching the handler written for ITS argument list?
+     *
+     * Two ways it might not be, both invisible from outside because the guest gets an
+     * answer either way:
+     *
+     *   - `servedByOtherDecoration`: the guest imported `_AIL_pause_stream@8` and the
+     *     handler bound to it was written as `@4` — a different function with a different
+     *     argument list. This is the bug class that froze GTA III's intro cutscene, and it
+     *     must read 0.
+     *   - `declaredNoHandler`: an export the API registry declares that nothing implements.
+     *     Harmless on its own (it answers its declared failure), but `siblingImplemented`
+     *     picks out the ones where ANOTHER decoration of the same base name IS implemented
+     *     — those are precisely the calls that used to be served by the wrong variant, so
+     *     they are the work list for this class rather than a general TODO.
+     *
+     * `servedBySpelling` is the benign remainder: same argument list, different spelling
+     * (`AIL_pause_stream` handling `_AIL_pause_stream@8`), which is how an undecorated
+     * table is meant to serve a decorated import.
+     */
+    svc.register("abiAudit", (args) => {
+        const limit = typeof args[0] === "number" ? Math.max(1, args[0] as number) : 40;
+        const dispatcher = sys().process?.dispatcher as
+            { getBindingCensus?: () => { implemented: string[]; bindings: Array<{ dll: string; stub: string; bound: string | null }> } }
+            | undefined;
+        const census = dispatcher?.getBindingCensus?.();
+        if (!census) return { error: "no dispatcher" };
+
+        const implemented = new Set(census.implemented.map((k) => k.toLowerCase()));
+        const wrongDecoration: Array<{ dll: string; imported: string; servedBy: string }> = [];
+        let servedBySpelling = 0, exact = 0, unbound = 0;
+
+        for (const b of census.bindings) {
+            if (!b.bound) { unbound++; continue; }
+            const boundName = b.bound.includes(":") ? b.bound.slice(b.bound.indexOf(":") + 1) : b.bound;
+            if (boundName.toLowerCase() === b.stub.toLowerCase()) { exact++; continue; }
+            const want = decorationOf(b.stub);
+            const got = decorationOf(boundName);
+            if (want !== null && got !== null && want !== got) {
+                if (wrongDecoration.length < limit) {
+                    wrongDecoration.push({ dll: b.dll, imported: b.stub, servedBy: boundName });
+                }
+            } else {
+                servedBySpelling++;
+            }
+        }
+
+        // Declared-but-unimplemented, with the dangerous subset called out.
+        const declaredNoHandler: Array<{ dll: string; name: string; siblingImplemented: string[] }> = [];
+        let declaredTotal = 0, missingTotal = 0;
+        for (const mod of APIRegistry.getInstance().getModules()) {
+            const dll = mod.name.toLowerCase();
+            const names = (mod.functions ?? []).map((f) => f.name);
+            const implementedHere = names.filter((n) => implemented.has(`${dll}:${n}`.toLowerCase()));
+            const byBase = new Map<string, string[]>();
+            for (const n of implementedHere) {
+                const base = bareName(n).replace(/@\d+$/, "");
+                byBase.set(base, [...(byBase.get(base) ?? []), n]);
+            }
+            for (const n of names) {
+                declaredTotal++;
+                if (implemented.has(`${dll}:${n}`.toLowerCase())) continue;
+                missingTotal++;
+                const siblings = byBase.get(bareName(n).replace(/@\d+$/, "")) ?? [];
+                if (siblings.length > 0 && declaredNoHandler.length < limit) {
+                    declaredNoHandler.push({ dll, name: n, siblingImplemented: siblings });
+                }
+            }
+        }
+
+        return {
+            stubs: census.bindings.length,
+            exact,
+            servedBySpelling,
+            unbound,
+            wrongDecorationCount: wrongDecoration.length,
+            wrongDecoration,
+            declaredTotal,
+            declaredNoHandlerTotal: missingTotal,
+            declaredNoHandlerWithImplementedSibling: declaredNoHandler,
+            note: wrongDecoration.length === 0
+                ? "every bound stub is served by a handler written for its own argument list"
+                : "these imports are served by a handler written for a DIFFERENT argument list — it reads arguments the caller never pushed",
+        };
+    });
+}
