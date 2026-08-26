@@ -28,6 +28,9 @@ const result: any = await harness()
     // control zoo presents nothing, and waiting on presents that never come reads exactly
     // like a hang.
     .call("importAudit", 10)
+    // bs_debug_flags is persisted (session-scoped) localStorage: leaving the control set
+    // would silently put every later run in this tab on the broken binding.
+    .call("setWorkerFlag", "__noImageIatBinding", null)
     .run();
 
 if (result.ok === false) {

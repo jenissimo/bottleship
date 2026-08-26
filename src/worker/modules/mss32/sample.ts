@@ -615,6 +615,41 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
         return 1;
     };
 
+    /**
+     * _AIL_set_sample_address@12 — (HSAMPLE, start, len). The @8 variant has no length
+     * and has to guess one from the voice's previous contents; here the app states it,
+     * so the sound image is exactly what it points at. Separate export, not a spelling:
+     * serving one with the other either invents a length or drops the app's.
+     */
+    exports["_AIL_set_sample_address@12"] = (ctxThunk, mem, args) => {
+        const sample = args[0];
+        const address = args[1] >>> 0;
+        const len = args[2] >>> 0;
+        const sampleObj = ctx.samples.get(sample);
+        if (!sampleObj || !address || !len) return 0;
+
+        const memRef = getMemory(ctx);
+        if (!MemoryGuard.isValidRange(memRef, address, len)) {
+            Logger.warn(LogCategory.SYSTEM,
+                `MSS32: _AIL_set_sample_address@12: sound image out of bounds ptr=0x${address.toString(16)} len=${len}`);
+            return 0;
+        }
+
+        sampleObj.fileDataAddress = address;
+        sampleObj.fileDataAllocated = false;
+        sampleObj.decodedData = null;
+        sampleObj.fileData = memRef.slice(address, address + len);
+        decodeAudioFile(ctx, sampleObj);
+
+        updateSampleMemory(ctx, sampleObj, address, sampleObj.pcmBytes ?? len);
+        if (sampleObj.pcmBytes !== undefined) {
+            refreshSampleLenDone(ctx, sampleObj);
+        }
+        Logger.verbose(LogCategory.SYSTEM,
+            `MSS32: _AIL_set_sample_address@12: sample=0x${sample.toString(16)} ptr=0x${address.toString(16)} len=${len}`);
+        return 1;
+    };
+
     // _AIL_sample_volume@4
     exports["_AIL_sample_volume@4"] = (ctxThunk, mem, args) => {
         const sample = ctx.samples.get(args[0]);

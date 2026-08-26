@@ -36,6 +36,12 @@ function buildNormalizedThunkKey(dllName: string, functionName: string): string 
     return `${dllName.toLowerCase()}:${normalizeThunkExportName(functionName)}`;
 }
 
+/** The stdcall byte count in a decorated name (`_AIL_pause_stream@8` -> "8"), or null. */
+function thunkDecoration(name: string): string | null {
+    const m = /@(\d+)$/.exec(name);
+    return m ? m[1]! : null;
+}
+
 /** CRT/versioned DLL aliases — data exports registered on the canonical name only. */
 const DATA_EXPORT_DLL_FORWARDS: Record<string, string> = {
     msvcr90: "msvcrt",
@@ -452,13 +458,26 @@ export class ThunkGenerator {
     /**
      * Find stubs by qualified name without scanning the full stub table.
      * Uses exact case-insensitive match first, then normalized-name fallback.
+     *
+     * The fallback exists for the undecorated/decorated spelling gap, and it must not
+     * reach ACROSS decorations: `@N` is the argument list, not spelling. `_AIL_pause_stream@4`
+     * (MSS 3.x: one argument, always pauses) and `@8` (HSTREAM + onoff) are different
+     * functions, and letting one bind into the other's stub silently drops an argument —
+     * GTA III's per-frame `AIL_pause_stream(stream, 0)`, which means RESUME, reached the
+     * 1-arg handler and paused the cutscene line it was keeping alive.
      */
     findStubsByName(dllName: string, functionName: string): ThunkStub[] {
         const exact = this.exactNameToStubs.get(buildQualifiedThunkKey(dllName, functionName));
         if (exact && exact.length > 0) {
             return exact;
         }
-        return this.normalizedNameToStubs.get(buildNormalizedThunkKey(dllName, functionName)) ?? [];
+        const normalized = this.normalizedNameToStubs.get(buildNormalizedThunkKey(dllName, functionName)) ?? [];
+        const want = thunkDecoration(functionName);
+        if (want === null) return normalized;
+        return normalized.filter((s) => {
+            const got = thunkDecoration(s.functionName);
+            return got === null || got === want;
+        });
     }
 
     /**
