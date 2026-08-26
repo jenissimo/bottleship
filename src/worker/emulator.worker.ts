@@ -301,6 +301,9 @@ let registryFlushInterval: number | null = null;
 let gdiPresentRafId: number | null = null;
 let gdiPresentKickPending = false;
 let gdiPresentDiagLogged = false;
+/** Guest present serial seen at the previous animation frame — see the repaint gate in
+ *  gdiPresentOnce. -1 means "no frame observed yet", which forces the first repaint. */
+let gdiLastGuestPresentSerial = -1;
 let isPaused = false;
 let _prefetchController: AbortController | null = null;
 /** Serializes load_bundle so a new game always waits for the previous switch teardown. */
@@ -406,14 +409,28 @@ const gdiPresentOnce = () => {
 
     if (plan.mode !== 'full') {
       // Game owns the screen. Drop stale dirty flags so a later composite (e.g. after
-      // returning to the launcher) starts clean, then re-present the last frame so the
-      // canvas keeps showing it at display rate (a 3D renderer presents at ~8-12fps and
-      // the WebGPU canvas otherwise goes black between presents; the DDraw presenter lacks
-      // repaintLastFrame and re-presents each Flip, so this is a no-op there). The only GDI
-      // that overlays the frame here is live modal dialog rects (plan.mode === 'rects').
+      // returning to the launcher) starts clean, then keep the canvas showing the last
+      // frame at display rate (a 3D renderer presents at ~8-12fps and the WebGPU canvas
+      // otherwise goes black between presents; the DDraw presenter lacks repaintLastFrame
+      // and re-presents each Flip, so this is a no-op there). The only GDI that overlays
+      // the frame here is live modal dialog rects (plan.mode === 'rects').
       if (gdiDirty) gdi.clearOverlayDirty();
       if (videoOverlay.isDirty()) videoOverlay.consumeDirty();
-      (renderActive as { repaintLastFrame?(): void } | null)?.repaintLastFrame?.();
+
+      // Repaint only when the canvas would otherwise not hold a current frame. A repaint is
+      // a full canvas presentation, and two presentations per refresh on one swap chain
+      // serialize: a guest presenting AT display rate loses frames to its own repaint. The
+      // sparse-presenter case this loop exists for is untouched — that serial is unchanged
+      // on nearly every animation frame. Video and dialog rects force it regardless: both
+      // draw onto a fresh, blank swap texture and need the frame under them restored first.
+      const videoWillComposite = !!videoCanvas && system.videoRouting.isOverlayPlaybackLive();
+      const rectsWillComposite = plan.mode === 'rects' && !!backend.compositeRects;
+      const guestPresentSerial = system.services.render.getGuestPresentSerial();
+      const guestPresentedSinceLastFrame = guestPresentSerial !== gdiLastGuestPresentSerial;
+      gdiLastGuestPresentSerial = guestPresentSerial;
+      if (videoWillComposite || rectsWillComposite || !guestPresentedSinceLastFrame) {
+        (renderActive as { repaintLastFrame?(): void } | null)?.repaintLastFrame?.();
+      }
 
       // The video plane is NOT GDI window output, so the overlay plan does not govern it.
       // A fullscreen movie is on screen on real Windows whether or not a 3D device exists,
@@ -421,14 +438,14 @@ const gdiPresentOnce = () => {
       // paths that normally composite it never run. Re-composited every frame, not only when
       // dirty: repaintLastFrame above would otherwise flip the screen back to the last game
       // frame on the animation frames a 15 fps movie does not update.
-      if (videoCanvas && system.videoRouting.isOverlayPlaybackLive()) {
-        backend.composite(videoCanvas, false);
+      if (videoWillComposite) {
+        backend.composite(videoCanvas!, false);
         system.services.render.notifyPresent("video");
       }
 
-      if (plan.mode === 'rects' && backend.compositeRects) {
+      if (rectsWillComposite) {
         const overlayCanvas = gdi.getOverlayCanvas();
-        if (overlayCanvas) backend.compositeRects(overlayCanvas, plan.rects);
+        if (overlayCanvas) backend.compositeRects!(overlayCanvas, plan.rects);
       }
       return;
     }
@@ -1402,6 +1419,7 @@ const prepareFullGameSwitch = async (): Promise<void> => {
   }
   __wasmTrapReported = false;
   gdiPresentDiagLogged = false;
+  gdiLastGuestPresentSerial = -1;
   _prefetchController?.abort();
   _prefetchController = null;
   WgbCache.releaseMountedSource();
