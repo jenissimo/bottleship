@@ -871,6 +871,11 @@ const surfaceMethodSpecs = [
     { name: "SetPrivateData", args: 5 },
     { name: "GetPrivateData", args: 4 },
     { name: "FreePrivateData", args: 2 },
+    // IDirect3DSurface9 derives from IDirect3DResource9, so these four sit BETWEEN
+    // FreePrivateData and GetContainer (d3d9.h). Dropping them shifts every slot from
+    // GetContainer on by four, and the shift is silent: the guest's
+    // GetContainer(riid, ppContainer) lands in GetDC(phdc), writes an HDC over its own
+    // REFIID constant and leaves ppContainer untouched — a NULL vcall far from here.
     { name: "SetPriority", args: 2 },
     { name: "GetPriority", args: 1 },
     { name: "PreLoad", args: 1 },
