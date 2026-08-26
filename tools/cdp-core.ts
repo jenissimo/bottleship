@@ -302,7 +302,16 @@ export class CdpSession {
 export async function captureTrace(
     outFile: string,
     seconds: number,
-    opts: { port?: number; categories?: string[]; during?: (elapsedMs: number) => Promise<void> } = {},
+    opts: {
+        port?: number;
+        categories?: string[];
+        during?: (elapsedMs: number) => Promise<void>;
+        /** Runs the instant recording starts, so t=0 of the artifact is the instant the work
+         *  begins. `during` fires a third of the way in and is therefore useless for anything
+         *  whose FIRST milliseconds are the subject (a cold boot). Keep it short — the window
+         *  is already running while it awaits. */
+        onStarted?: () => Promise<void>;
+    } = {},
 ): Promise<{ file: string; events: number; bytes: number }> {
     const port = opts.port ?? DEFAULT_CDP_PORT;
     const version = await fetchJson(port, "/json/version");
@@ -330,6 +339,9 @@ export async function captureTrace(
     const totalMs = seconds * 1000;
     const t0 = Date.now();
     const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    if (opts.onStarted) {
+        try { await opts.onStarted(); } catch (e) { console.warn(`[captureTrace] onStarted hook failed: ${e}`); }
+    }
     if (opts.during) {
         await sleep(Math.min(Math.max(500, totalMs / 3), Math.max(0, totalMs - 500)));
         try { await opts.during(Date.now() - t0); } catch (e) { console.warn(`[captureTrace] during-window hook failed: ${e}`); }

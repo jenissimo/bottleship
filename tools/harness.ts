@@ -567,8 +567,20 @@ async function cmdGridShot(out: string, stepArg?: string): Promise<void> {
  *  records every renderer), and two guests share the CPU, so both the trace contents and
  *  any timing read off it describe a machine nobody was measuring. Parallel sessions are
  *  a bring-up tool; measurement is single-tab. `BS_ALLOW_PARALLEL_TRACE=1` to override. */
-async function cmdTrace(secondsArg?: string, out?: string): Promise<void> {
+/** trace <sec> [out.json.gz] [--boot <wgb>]
+ *
+ *  `--boot` makes t=0 of the artifact the instant the bundle load starts: the page is
+ *  reloaded first (fresh worker), recording is armed, and only then is loadApp fired —
+ *  without awaiting it, because the whole point is to record the boot as it happens. This is
+ *  the only way to see the pre-first-present window; a trace armed after the fact has already
+ *  missed it. */
+async function cmdTrace(secondsArg?: string, out?: string, ...rest: string[]): Promise<void> {
     const seconds = Number(secondsArg ?? 10);
+    const argv = [out, ...rest].filter((a): a is string => a !== undefined);
+    const bootIdx = argv.indexOf("--boot");
+    const bootBundle = bootIdx >= 0 ? argv[bootIdx + 1] : undefined;
+    if (bootIdx >= 0 && !bootBundle) throw new Error("trace --boot needs a bundle id or path");
+    out = argv.find((a, i) => a !== "--boot" && argv[i - 1] !== "--boot");
     const tabs = await listSessionTabs().catch(() => []);
     if (tabs.length > 1 && process.env.BS_ALLOW_PARALLEL_TRACE !== "1") {
         throw new Error(
@@ -577,7 +589,15 @@ async function cmdTrace(secondsArg?: string, out?: string): Promise<void> {
             "  Close the other sessions' tabs, or set BS_ALLOW_PARALLEL_TRACE=1 if you really only want the trace shape.",
         );
     }
-    const file = out ?? artifact(`logs/trace-${seconds}s.json.gz`);
+    const file = out ?? artifact(`logs/trace-${seconds}s${bootBundle ? "-boot" : ""}.json.gz`);
+    // A cold boot needs a fresh worker, and the reload must be OUTSIDE the window — otherwise
+    // page teardown/startup is the first thing the trace shows instead of the boot itself.
+    let bootSession: Awaited<ReturnType<typeof ensureSession>> | null = null;
+    if (bootBundle) {
+        bootSession = await ensureSession();
+        await reloadPageAndWait(bootSession);
+        console.log(`page reloaded; recording ${seconds}s from the first byte of ${bootBundle} …`);
+    }
     console.log(`tracing ${seconds}s -> ${file} …`);
     // Arm the guest-attribution mark INSIDE the window: without bottleship.hotblocks every
     // wasm frame in the artifact stays an opaque wasm-function[N] (v86's table indices do not
@@ -586,6 +606,17 @@ async function cmdTrace(secondsArg?: string, out?: string): Promise<void> {
     let hotBlocks: { blocks?: number; marked?: boolean; note?: string } | null = null;
     const sampleMs = Math.min(3000, Math.max(800, (seconds * 1000) / 4));
     const r = await captureTrace(file, seconds, {
+        onStarted: bootBundle && bootSession
+            // Deliberately NOT awaited: openWgb resolves only when the load completes, which
+            // is the very thing being measured.
+            ? async () => {
+                await pageEval(
+                    bootSession!,
+                    `(window.__BS__.harness.openWgb(${JSON.stringify(bootBundle)}), "started")`,
+                    { timeoutMs: 30_000, awaitPromise: false, userGesture: true },
+                );
+            }
+            : undefined,
         during: async () => {
             try {
                 const res = await execViaCdp([{ cmd: "hotBlocksMark", args: [{ ms: sampleMs }], opts: { timeoutMs: sampleMs + 30_000 } } as unknown as HarnessStep]);
@@ -754,7 +785,7 @@ async function main(): Promise<void> {
         case "fixture": await cmdFixture(rest[0], rest[1], rest.slice(2)); break;
         case "shot": await cmdShot(rest[0], ...rest.slice(1)); break;
         case "gridShot": case "gridshot": await cmdGridShot(rest[0], rest[1]); break;
-        case "trace": await cmdTrace(rest[0], rest[1]); break;
+        case "trace": await cmdTrace(rest[0], rest[1], ...rest.slice(2)); break;
         case "reload": await cmdReload(); break;
         case "regress": await cmdRegress(rest); break;
         case undefined:
