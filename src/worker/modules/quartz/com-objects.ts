@@ -633,6 +633,9 @@ export class FilterGraphObject extends BaseComObject {
                 data: payloadData,
                 mimeType: this.audioMimeType || "application/octet-stream",
                 playbackRate: this.audioRate,
+                // handleAudioPosition divides by audioSampleRate, so the host must count
+                // in that rate; undeclared it counts in the device's instead.
+                positionRateHz: this.audioSampleRate > 0 ? this.audioSampleRate : undefined,
                 volume: this.centibelToLinear(this.audioVolume),
                 pan: this.audioBalance / 10000,
                 loopCount: 1,

@@ -381,6 +381,9 @@ export function playSample(ctx: MSSContext, sample: MSSSample): void {
                     data: payloadData,
                     mimeType: encodedMimeType(sample.fileFormat),
                     playbackRate: sample.playbackRate,
+                    // Positions come back in the unit we declare — the sample's own rate,
+                    // which is the timebase its bytes-per-second conversion assumes.
+                    positionRateHz: sample.sampleRate,
                     volume: volume,
                     pan: pan,
                     loopCount: sample.loopCount
@@ -647,6 +650,14 @@ export function playStream(ctx: MSSContext, stream: MSSStream): void {
                     data: payloadData,
                     mimeType: encodedMimeType(stream.fileFormat),
                     playbackRate: stream.playbackRate,
+                    // The host decodes this container itself and reports element time
+                    // scaled by whatever rate we declare. Undeclared, it substitutes the
+                    // DEVICE rate — a different quantity — and every position we then
+                    // convert with the stream's own bytes-per-second is off by
+                    // device/source (48000/44100 = +8.8% on a typical machine). The
+                    // guest reads that position as elapsed audio, so a cutscene keyed to
+                    // it runs ahead of its own soundtrack.
+                    positionRateHz: stream.sampleRate,
                     volume: volume,
                     pan: pan,
                     loopCount: stream.loopCount

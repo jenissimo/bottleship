@@ -113,6 +113,45 @@ export function registerAudioCommands(svc: HarnessService): void {
         };
     });
 
+    /** mssAudio({sampleMs?}) — the Miles (mss32) census: every open stream and sample,
+     *  with the position the GUEST reads (handle+0x18) next to our own cursor.
+     *
+     *  Miles titles gate real logic on these answers — a GTA-class cutscene advances with
+     *  the stream position, a ZenGin-class teardown spins on a sample status — so a wrong
+     *  one is a skipped scene or a hang, not a wrong sound. With `sampleMs` it re-reads
+     *  after that wall window and reports `rate` per stream: published-ms advanced per
+     *  wall-ms. A faithful stream reads ~1.0; the failure this exists to catch reads far
+     *  from it in either direction. `rate` is null when the stream did not move (stopped,
+     *  or nothing published) rather than 0, so "not measured" cannot pass as "stalled". */
+    svc.register("mssAudio", async (args) => {
+        const opts = (args[0] ?? {}) as { sampleMs?: number };
+        const mss: any = getModule("mss32");
+        if (!mss?.dbgMssCensus) return { available: false, reason: "mss32 module not loaded" };
+
+        const first = mss.dbgMssCensus();
+        const windowMs = Math.min(30_000, Math.max(0, opts.sampleMs ?? 0));
+        if (windowMs === 0) return { available: true, ...first };
+
+        const t0 = performance.now();
+        await new Promise((r) => setTimeout(r, windowMs));
+        const elapsed = performance.now() - t0;
+        const second = mss.dbgMssCensus();
+
+        const byId = new Map<number, any>(first.streams.map((s: any) => [s.id, s]));
+        const streams = second.streams.map((s: any) => {
+            const was = byId.get(s.id);
+            const dPub = was && s.publishedMs !== null && was.publishedMs !== null
+                ? s.publishedMs - was.publishedMs : null;
+            return {
+                ...s,
+                deltaPublishedMs: dPub,
+                rate: dPub !== null && dPub !== 0 && elapsed > 0
+                    ? Math.round((dPub / elapsed) * 1000) / 1000 : null,
+            };
+        });
+        return { available: true, windowMs: Math.round(elapsed), ...second, streams };
+    });
+
     /** audioBuffers() — full per-buffer dsound snapshot (id/ptr, isPlaying, isLooping,
      *  bytes, sabState, cursors). The lever for the "stuck looping sample" class: after a
      *  looping-music change, a buffer left isPlaying/sabState=PLAYING with the guest no
