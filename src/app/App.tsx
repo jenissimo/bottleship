@@ -973,14 +973,25 @@ export default function App() {
       const flagKeys = session ? ["bs_debug_flags", `bs_debug_flags:${session}`] : ["bs_debug_flags"];
       try {
         const merged: Record<string, unknown> = {};
-        for (const k of flagKeys) Object.assign(merged, JSON.parse(localStorage.getItem(k) || "{}"));
+        for (const [index, k] of flagKeys.entries()) {
+          const flags = JSON.parse(localStorage.getItem(k) || "{}") as Record<string, unknown>;
+          // Host-tool execution is a per-harness-session capability. Never replay a stale
+          // origin-wide value, including when this page has no session at all.
+          if (index === 0) delete flags.__hostTools;
+          Object.assign(merged, flags);
+        }
         for (const [key, value] of Object.entries(merged)) {
           globalWorker.postMessage({ type: "set_debug_flag", key, value });
         }
         if (Object.keys(merged).length) console.info("[bs] replayed debug flags:", merged);
       } catch { /* corrupt/no flags */ }
       (window as any).dbgFlag = (key: string, value: unknown, opts?: { scope?: "session" | "global" }) => {
-        const store = opts?.scope === "session" && session ? `bs_debug_flags:${session}` : "bs_debug_flags";
+        if (key === "__hostTools" && !session) {
+          throw new Error("dbgFlag('__hostTools', ...): a ?bs=<session> URL is required");
+        }
+        const store = key === "__hostTools"
+          ? `bs_debug_flags:${session}`
+          : (opts?.scope === "session" && session ? `bs_debug_flags:${session}` : "bs_debug_flags");
         const flags = JSON.parse(localStorage.getItem(store) || "{}");
         if (value === undefined || value === null) delete flags[key]; else flags[key] = value;
         localStorage.setItem(store, JSON.stringify(flags));

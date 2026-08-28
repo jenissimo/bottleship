@@ -1931,7 +1931,7 @@ export const dbg = {
             const drain = {
                 setPipelineCount: 0, pipelineHits: 0, pipelineMisses: 0,
                 bindProgrammableCount: 0, drawCount: 0, drawIndexedCount: 0,
-                drawUPCount: 0, drawIndexedUPCount: 0,
+                drawUPCount: 0, upUploadFailures: 0,
             };
             for (const dev of devices.values()) {
                 const s = dev.getArenaDrainStats();
@@ -1947,7 +1947,7 @@ export const dbg = {
      *  untouched — see memory d3d9-wasm-arena-phase-ab for the design rationale. */
     d3dWasmPath(on = true): void {
         setWasmPathEnabled(!!on);
-        console.log(`[dbg] d3dWasmPath=${on ? 1 : 0} (real bypass: arena-keyed pipeline cache for programmable draws)`);
+        console.log(`[dbg] d3dWasmPath=${on ? 1 : 0} (arena identity + linked programmable draw encoding)`);
     },
     /** Optional diagnostic-only exercise of the executor's arena-drain code path (never
      *  touches a GPU encoder). Decoupled from d3dWasmPath — leave OFF for a clean bypass
@@ -2244,11 +2244,37 @@ export const dbg = {
                     }
                 }
             }
+            // The COM-pointer shadows (SetTexture / SetVertexShader / SetPixelShader) diff against
+            // the device's own bound pointers. A shadow ahead of the device is the wrong-skip that
+            // would leave a stale texture or shader bound for the rest of the frame.
+            const devPtrs = dev as unknown as {
+                getBoundTexturePtr?: (stage: number) => number;
+                getVertexShaderComPtr?: () => number;
+                getPixelShaderComPtr?: () => number;
+            } | undefined;
+            const ptrMism: Array<{ setter: string; slot: number; shadow: number; device: number }> = [];
+            const diffPtr = (fn: string, slots: number, actual: (slot: number) => number | undefined) => {
+                const sh = disp?.dumpShadowValues?.('d3d9', fn) ?? null;
+                if (!sh) return;
+                for (let i = 0; i < slots; i++) {
+                    const shadowV = sh[i] | 0;
+                    if (shadowV === SENT) continue;
+                    const dv = actual(i);
+                    if (dv === undefined) continue;
+                    if ((shadowV >>> 0) !== (dv >>> 0)) {
+                        ptrMism.push({ setter: fn, slot: i, shadow: shadowV >>> 0, device: dv >>> 0 });
+                    }
+                }
+            };
+            diffPtr('IDirect3DDevice9_SetTexture', 16, (s) => devPtrs?.getBoundTexturePtr?.(s));
+            diffPtr('IDirect3DDevice9_SetVertexShader', 1, () => devPtrs?.getVertexShaderComPtr?.());
+            diffPtr('IDirect3DDevice9_SetPixelShader', 1, () => devPtrs?.getPixelShaderComPtr?.());
             const out = {
                 ownerGlobal: disp?.shadowOwnerGlobal, skips: disp?.getShadowStats?.() ?? null,
                 hasShadow: !!rsShadow, hasTracker: !!trackerRS,
                 rsMismatchCount: mism.length, rsMismatches: mism,
                 ssMismatchCount: ssMism.length, ssMismatches: ssMism.slice(0, 40),
+                ptrMismatchCount: ptrMism.length, ptrMismatches: ptrMism.slice(0, 40),
             };
             console.log(`[dbg][shadowDiff][JSON] ${JSON.stringify(out)}`);
         } catch (e) { console.warn('[dbg] shadowDiff err', e); }

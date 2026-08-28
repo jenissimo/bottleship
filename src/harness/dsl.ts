@@ -294,6 +294,11 @@ export class HarnessChain {
     guestBlocks(opts?: {
         ms?: number; intervalMs?: number; top?: number;
         phase?: "arm" | "read"; maxPages?: number; keepArmed?: boolean;
+        pages?: Array<number | string>;
+        /** Roll the counted census into named guest spans (`from`/`to` accept `mod+0xRVA`).
+         *  A top-N ranking cannot size a function whose body is a dozen sub-cut blocks;
+         *  this sums them, arms their pages first, and reports the unattributed remainder. */
+        ranges?: Array<{ name: string; from: number | string; to: number | string }>;
     }): this {
         return this.pushTimed("guestBlocks", [opts], (opts?.phase ? 0 : (opts?.ms ?? 2000)) + 30_000);
     }

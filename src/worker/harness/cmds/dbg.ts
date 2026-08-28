@@ -143,8 +143,15 @@ export function registerDbgCommands(svc: HarnessService): void {
             mbtwcUnbound: localeFastPathStats.mbtwcThunk - localeFastPathStats.mbtwcSlow,
             bail: { ...localeFastPathStats.mbtwcBail },
             lastCodePage: localeFastPathStats.lastCodePage,
+            wctmbFast: localeFastPathStats.wctmbFast,
+            wctmbBail: { ...localeFastPathStats.wctmbBail },
             lcmapFast: localeFastPathStats.lcmapFast,
             lcmapDeclined: localeFastPathStats.lcmapDeclined,
+            lcmapBail: { ...localeFastPathStats.lcmapBail },
+            glinfoCalls: localeFastPathStats.glinfoCalls,
+            glinfoTypes: [...localeFastPathStats.glinfoTypes.entries()]
+                .sort((a, b) => b[1] - a[1]).slice(0, 12)
+                .map(([t, n]) => ({ lcType: `0x${t.toString(16)}`, calls: n })),
             lcmapFlags: [...localeFastPathStats.lcmapFlags.entries()]
                 .sort((a, b) => b[1] - a[1]).slice(0, 8)
                 .map(([f, n]) => ({ flags: `0x${f.toString(16)}`, calls: n })),

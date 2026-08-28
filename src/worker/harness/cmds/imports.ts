@@ -1,25 +1,31 @@
 /**
- * importAudit() — does a bound import point at the SAME address GetProcAddress
- * hands out for that export?
+ * importAudit() — does a bound import point at the SAME address the export itself
+ * has?
  *
- * On Windows those two are one address: the export's body inside the exporting
- * image. Wrappers this era's games ship (ASI/mod loaders, ddraw and d3d shims)
- * install their hooks by scanning an IAT for the value GetProcAddress just gave
- * them, so a second address for one export makes every such hook install NOTHING
- * — no error, no log line, the plugin ecosystem of the title simply never runs.
- * That is invisible from the outside, which is why it is worth a verb.
+ * On Windows an export has one address: its body inside the exporting image, which
+ * is what the export directory publishes and what GetProcAddress returns. Wrappers
+ * this era's games ship (ASI/mod loaders, ddraw and d3d shims) install their hooks
+ * by scanning an IAT for that value, so a second address for one export makes every
+ * such hook install NOTHING — no error, no log line, the plugin ecosystem of the
+ * title simply never runs. That is invisible from the outside, which is why it is
+ * worth a verb.
+ *
+ * Expected comes from hleExportBindingAddress, the single owner of that address
+ * (core/thunking/export-resolver.ts). NOTE it is not yet what GetProcAddress-BY-NAME
+ * answers for an HLE module: that path still resolves to the arena stub, so the two
+ * agree only for a data export. This audit measures the IAT against the image, which
+ * is what an export-directory-walking wrapper compares against.
  *
  * The audit classifies each thunked import instead of just counting mismatches:
  * a guest hook is a mismatch we WANT (the wrapper is doing its job), and our own
  * inline fast paths (heap slab, CRT math, case fold) are deliberate. `diverged`
  * is the bug class only: our stub for the export in the IAT, our OTHER stub for
- * the same export from GetProcAddress.
+ * the same export everywhere else.
  */
 
 import type { HarnessService } from "../service";
 import { sys } from "../serialize";
-import { hleImageExportAddress } from "../../core/hle-module-images";
-import { resolveHleExportAddress } from "../../core/thunking/export-resolver";
+import { hleExportBindingAddress, resolveHleExportAddress } from "../../core/thunking/export-resolver";
 import { APIRegistry } from "../../core/api-registry";
 import { resolveThunkedDllAlias } from "../../core/dll-aliases";
 
@@ -98,9 +104,12 @@ export function registerImportCommands(svc: HarnessService): void {
                 if (!api.hasModule(dll)) return; // a real DLL's import — not ours to compare
                 imports++;
                 const iatValue = view.getUint32(iatAddr, true) >>> 0;
-                // What GetProcAddress answers for the same export, resolved through the
-                // very functions it uses — so the audit cannot drift from the real answer.
-                const expected = hleImageExportAddress(dll, name)
+                // The one address this export has, resolved through the very function the
+                // PE loader binds with — so the audit cannot drift from the real decision:
+                // a registered data export, else the body the module's image publishes,
+                // which is what a wrapper reads out of the export directory. The arena
+                // stub is the fallback for an export no image holds.
+                const expected = hleExportBindingAddress(generator, dll, name)
                     ?? (resolveHleExportAddress(dispatcher, dll, name) || undefined);
                 if (expected === undefined) return;
                 if (iatValue === expected) { matching++; return; }
@@ -132,8 +141,8 @@ export function registerImportCommands(svc: HarnessService): void {
             divergedCount,
             diverged,
             note: divergedCount === 0
-                ? "every thunked import points at the address GetProcAddress hands out — an IAT-hooking wrapper can find its slot"
-                : "these imports are bound to a DIFFERENT stub of the same export than GetProcAddress returns; "
+                ? "every thunked import points at the one address its export has — an IAT-hooking wrapper can find its slot"
+                : "these imports are bound to a DIFFERENT stub of the same export than the export itself has; "
                     + "an IAT hook that matches by address installs nothing and says nothing",
         };
     });

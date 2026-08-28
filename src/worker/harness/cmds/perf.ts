@@ -311,12 +311,85 @@ type CountedWindow = {
     armedAtMs: number;
     presentSerialBegin: number | null;
     watchedPages: number;
+    /** Split, because a REQUESTED page is usually not tier-2: charging it to tier-2 coverage
+     *  makes `tier2Total - watched` non-positive and silences the selection warning while most
+     *  of the tier-2 set is in fact uninstrumented. */
+    watchedRequested: number;
+    watchedTier2: number;
     tier2Total: number;
     requestedPages: number;
+    /** Requested pages that got no slot (table full) or that v86 refused. */
+    requestedDropped: string[];
     armedRequested: string[];
+    /** Retired guest instructions over the window, accumulated by the ticker below. */
+    retired: RetiredAccumulator;
 };
 
+/**
+ * The DENOMINATOR the counted channel could not previously state. trace2 only instruments
+ * the armed pages, so a `sharePct` is a share of an arbitrary subset — the difference between
+ * that and a share of all guest work was an unbounded caveat in prose. `cpu.instruction_counter`
+ * counts every retired instruction, in the SAME unit trace2 weights blocks by, so the two
+ * divide into a measured coverage figure.
+ *
+ * It is a 32-bit counter that wraps (~40s of guest execution), so the window is accumulated
+ * from periodic deltas rather than from one end-to-end subtraction — a single subtraction
+ * across a wrap yields a plausible small number, which is exactly the failure this project
+ * keeps rediscovering.
+ */
+type RetiredAccumulator = { total: number; last: number; timer: number | null; wraps: number };
+
+/** Wrap-safe delta of the 32-bit retired-instruction counter. A plain `now - prev` across a
+ *  wrap yields a large NEGATIVE number, and clamping it to 0 would silently drop ~4.3e9
+ *  instructions from a denominator — a plausible answer to the wrong question. */
+export function retiredDelta(prev: number, now: number): number {
+    const d = now - prev;
+    return d < 0 ? d + 0x1_0000_0000 : d;
+}
+
+const readInsnCounter = (): number | null => {
+    const c = cpu() as { instruction_counter?: Int32Array } | null;
+    return c?.instruction_counter ? c.instruction_counter[0] >>> 0 : null;
+};
+
+function startRetiredAccumulator(): RetiredAccumulator {
+    const acc: RetiredAccumulator = { total: 0, last: readInsnCounter() ?? 0, timer: null, wraps: 0 };
+    const tick = () => {
+        const now = readInsnCounter();
+        if (now === null) return;
+        if (now < acc.last) acc.wraps++;
+        acc.total += retiredDelta(acc.last, now);
+        acc.last = now;
+    };
+    // 1s is far inside the ~40s wrap period, so no single delta can span two wraps.
+    acc.timer = setInterval(tick, 1000) as unknown as number;
+    return acc;
+}
+
+/** Fold the counter's current value in and return the running total, leaving the ticker
+ *  RUNNING. A read against a still-armed window must not stop it: with the ticker dead the
+ *  next read has only one end-to-end subtraction to work from, which is exactly the
+ *  wrap-unsafe number this accumulator exists to replace. */
+function peekRetiredTotal(acc: RetiredAccumulator): number {
+    const now = readInsnCounter();
+    if (now !== null) {
+        if (now < acc.last) acc.wraps++;
+        acc.total += retiredDelta(acc.last, now);
+        acc.last = now;
+    }
+    return acc.total;
+}
+
+function stopRetiredAccumulator(acc: RetiredAccumulator): number {
+    const total = peekRetiredTotal(acc);
+    if (acc.timer !== null) { clearInterval(acc.timer); acc.timer = null; }
+    return total;
+}
+
 let countedWindow: CountedWindow | null = null;
+/** Ranges the ARMED window covers, so `phase:'read'` rolls up against exactly the spans
+ *  whose pages `phase:'arm'` guaranteed a slot to. */
+let countedRanges: { resolved: ResolvedRange[]; unresolved: string[] } = { resolved: [], unresolved: [] };
 
 const traceExports = (): TraceExports | undefined =>
     (globalThis as { preemption?: { getWasmExports?: () => TraceExports | null } }).preemption?.getWasmExports?.() ?? undefined;
@@ -345,16 +418,23 @@ function armCountedRecorder(render: RenderLike | undefined, maxPages: number, re
     }
     w.trace2_reset();
     let watched = 0;
+    let watchedRequested = 0;
+    let watchedTier2 = 0;
     const armedRequested: string[] = [];
+    const requestedDropped: string[] = [];
     for (const addr of requested) {
-        if (watched >= maxPages) break;
-        if (w.trace2_watch_page(addr >>> 0) >>> 0) { watched++; armedRequested.push("0x" + ((addr >>> 0) & ~0xfff).toString(16)); }
+        const page = "0x" + ((addr >>> 0) & ~0xfff).toString(16);
+        // A page the caller NAMED and did not get is the difference between "did not run" and
+        // "was never watched", so it is recorded rather than dropped on the floor.
+        if (watched >= maxPages) { requestedDropped.push(page); continue; }
+        if (w.trace2_watch_page(addr >>> 0) >>> 0) { watched++; watchedRequested++; armedRequested.push(page); }
+        else requestedDropped.push(page);
     }
     const tier2Total = w.jit_get_tier2_page_count() >>> 0;
     for (let i = 0; i < tier2Total && watched < maxPages; i++) {
         const addr = w.jit_get_tier2_page_at(i) >>> 0;
         if (!addr) break;
-        if (w.trace2_watch_page(addr) >>> 0) watched++;
+        if (w.trace2_watch_page(addr) >>> 0) { watched++; watchedTier2++; }
     }
     if (watched === 0) {
         return {
@@ -371,7 +451,9 @@ function armCountedRecorder(render: RenderLike | undefined, maxPages: number, re
         ok: true,
         window: {
             armedAtMs: performance.now(), presentSerialBegin: render?.getPresentSerial?.() ?? null,
-            watchedPages: watched, tier2Total, requestedPages: requested.length, armedRequested,
+            watchedPages: watched, watchedRequested, watchedTier2,
+            tier2Total, requestedPages: requested.length, requestedDropped, armedRequested,
+            retired: startRetiredAccumulator(),
         },
     };
 }
@@ -383,6 +465,15 @@ function disarmCountedRecorder(): boolean {
     return true;
 }
 
+/** End the window: the retired-instruction ticker belongs to it, so it stops HERE and nowhere
+ *  else — a read leaves it running (see peekRetiredTotal). */
+function tearDownCountedWindow(): void {
+    if (countedWindow) stopRetiredAccumulator(countedWindow.retired);
+    disarmCountedRecorder();
+    countedWindow = null;
+    countedRanges = { resolved: [], unresolved: [] };
+}
+
 type CountedBlocks = {
     available: boolean;
     note?: string;
@@ -391,8 +482,130 @@ type CountedBlocks = {
     blocks?: number;
     totalWeightedIns?: number;
     saturated?: string[];
+    retiredIns?: number;
+    countedCoveragePct?: number | null;
     rows?: Array<{ addr: string; module: string | null; exec: number; ins: number; weightedIns: number; sharePct: number; kind: string }>;
+    ranges?: CountedRanges;
 };
+
+/** A named guest address span to roll counted blocks into. `from`/`to` accept a raw address
+ *  or `module+0xRVA`; `to` is exclusive. */
+export type GuestRangeSpec = { name: string; from: number | string; to: number | string };
+
+export type ResolvedRange = { name: string; from: number; to: number };
+
+type CountedRanges = {
+    rows: Array<{ name: string; from: string; to: string; blocks: number; exec: number; weightedIns: number; sharePct: number; sharePctOfGuest: number | null }>;
+    /** Counted work that fell in none of the named ranges — present so a share reads as a
+     *  share of a whole rather than of an unstated remainder. */
+    unattributed: { weightedIns: number; sharePct: number };
+    unresolved?: string[];
+    /** Ranges an EARLIER range overlaps. First-match-wins means their rows are charged short —
+     *  possibly to 0 — which is indistinguishable from "did not run" unless it is said here. */
+    shadowed?: string[];
+    note: string;
+};
+
+/** Resolve `module+0xRVA` (or a raw address) against the LIVE module registry. */
+function resolveGuestAddr(spec: number | string): number | null {
+    if (typeof spec === "number") return spec >>> 0;
+    const s = String(spec).trim();
+    const plus = s.indexOf("+");
+    if (plus > 0) {
+        // Extension kept: getByName deliberately refuses to answer "hl.dll" with the main EXE,
+        // and stripping it resolves the range against the wrong image — whose blocks then read
+        // as 0, i.e. "did not run", for code that ran.
+        const name = s.slice(0, plus).trim();
+        const mreg = (sys().process as { moduleRegistry?: { getByName?: (n: string) => { baseAddress: number } | null | undefined } } | null)?.moduleRegistry;
+        const mod = mreg?.getByName?.(name);
+        if (!mod) return null;
+        const rvaStr = s.slice(plus + 1).trim();
+        const rva = rvaStr.startsWith("0x") || rvaStr.startsWith("0X") ? Number.parseInt(rvaStr.slice(2), 16) : Number.parseInt(rvaStr, 16);
+        if (!Number.isFinite(rva)) return null;
+        return (mod.baseAddress + rva) >>> 0;
+    }
+    const v = s.startsWith("0x") || s.startsWith("0X") ? Number.parseInt(s.slice(2), 16) : Number.parseInt(s, 16);
+    return Number.isFinite(v) ? v >>> 0 : null;
+}
+
+function resolveRanges(specs: GuestRangeSpec[]): { resolved: ResolvedRange[]; unresolved: string[] } {
+    const resolved: ResolvedRange[] = [];
+    const unresolved: string[] = [];
+    for (const s of specs) {
+        const from = resolveGuestAddr(s.from);
+        const to = resolveGuestAddr(s.to);
+        if (from === null || to === null || to <= from) { unresolved.push(`${s.name} (${s.from}..${s.to})`); continue; }
+        resolved.push({ name: s.name, from, to });
+    }
+    return { resolved, unresolved };
+}
+
+/** Every 4 KiB page any resolved range touches — armed first so a named suspect is never
+ *  crowded out of v86's 64-entry watch table by an unrelated tier-2 page. The table is still
+ *  64 entries: ranges spanning more than that lose the surplus, which the window reports as
+ *  `requestedPagesDropped` rather than leaving it to read as "did not run". */
+export function pagesForRanges(ranges: ResolvedRange[]): number[] {
+    const pages = new Set<number>();
+    for (const r of ranges) for (let p = r.from & ~0xfff; p < r.to; p += 0x1000) pages.add(p >>> 0);
+    return [...pages];
+}
+
+export type CountedBlockSample = { addr: number; exec: number; ins: number };
+
+/**
+ * Sum counted blocks into named spans. Pure, so the attribution rule below is testable
+ * without a live guest.
+ *
+ * A block is attributed by its ENTRY address: trace2 counts a block once, at entry, so the
+ * entry is the only address whose count is defined. A block entered before a range and
+ * running into it is therefore charged OUTSIDE it — which under-, never over-, states a
+ * range. First matching range wins, so overlapping spans never double-count.
+ */
+export function rollUpRanges(
+    blocks: CountedBlockSample[],
+    ranges: ResolvedRange[],
+    total: number,
+    retiredIns: number,
+    unresolvedRanges: string[] = [],
+): CountedRanges {
+    const acc = ranges.map((r) => ({ ...r, blocks: 0, exec: 0, weightedIns: 0 }));
+    // First-match-wins is what stops overlaps double-counting, but it also charges a shadowed
+    // range short — to 0 when the overlap is total. That is byte-identical to "never ran", so
+    // it has to be named rather than inferred from the caller remembering its own ordering.
+    const shadowed = ranges
+        .filter((r, i) => ranges.slice(0, i).some((e) => e.from < r.to && r.from < e.to))
+        .map((r) => r.name);
+    let attributed = 0;
+    for (const b of blocks) {
+        const weighted = b.exec * b.ins;
+        for (const a of acc) {
+            if (b.addr >= a.from && b.addr < a.to) { a.blocks++; a.exec += b.exec; a.weightedIns += weighted; attributed += weighted; break; }
+        }
+    }
+    return {
+        rows: acc.map((a) => ({
+            name: a.name,
+            from: "0x" + a.from.toString(16),
+            to: "0x" + a.to.toString(16),
+            blocks: a.blocks,
+            exec: a.exec,
+            weightedIns: a.weightedIns,
+            sharePct: total > 0 ? Math.round((a.weightedIns / total) * 1000) / 10 : 0,
+            sharePctOfGuest: retiredIns > 0 ? Math.round((a.weightedIns / retiredIns) * 1000) / 10 : null,
+        })),
+        unattributed: {
+            weightedIns: total - attributed,
+            sharePct: total > 0 ? Math.round(((total - attributed) / total) * 1000) / 10 : 0,
+        },
+        ...(unresolvedRanges.length ? { unresolved: unresolvedRanges } : {}),
+        ...(shadowed.length ? { shadowed } : {}),
+        note: "sharePct is of the COUNTED total (the armed pages); sharePctOfGuest divides by the CPU's own retired-instruction "
+            + "counter over the same window, which is the share of ALL guest work and the number a go/no-go should quote. "
+            + "A range with blocks:0 either did not execute or sits on a page that was not armed; ranges arm their own "
+            + "pages first, so with no selectionWarning and requestedPagesDropped:0 above, blocks:0 means it did not run — "
+            + "UNLESS the range is listed in `shadowed`, where an earlier range took its blocks and 0 means nothing at all.",
+    };
+}
 
 /**
  * trace2's per-block census ranked by `exec * instructions` — retired guest instructions per
@@ -404,7 +617,7 @@ type CountedBlocks = {
  * `trace2_enabled()` still set at read time the window ended early. Both failure modes look
  * exactly like a valid answer in the numbers alone, so they are checked, never assumed.
  */
-function countedGuestBlocks(top: number, window: CountedWindow | null, render: RenderLike | undefined): CountedBlocks {
+function countedGuestBlocks(top: number, window: CountedWindow | null, render: RenderLike | undefined, ranges: ResolvedRange[] = [], unresolvedRanges: string[] = []): CountedBlocks {
     const w = traceExports();
     if (!w?.trace2_block_snapshot) {
         return { available: false, note: "trace2 snapshot exports missing — rebuild vendor/v86 (build-wasm.sh)" };
@@ -420,6 +633,7 @@ function countedGuestBlocks(top: number, window: CountedWindow | null, render: R
     const stillRecording = w.trace2_enabled ? (w.trace2_enabled() >>> 0) === 1 : false;
     const watchedNow = w.trace2_watched_page_count ? w.trace2_watched_page_count() >>> 0 : -1;
     if (!stillRecording) {
+        stopRetiredAccumulator(window.retired);
         return {
             available: false,
             note: `REFUSED: recorder is disarmed at read time (trace2_enabled=0, watched=${watchedNow}) — something reset or `
@@ -429,9 +643,13 @@ function countedGuestBlocks(top: number, window: CountedWindow | null, render: R
         };
     }
     const n = w.trace2_block_snapshot() >>> 0;
+    const retiredIns = peekRetiredTotal(window.retired);
     const readAtMs = performance.now();
     const presentSerialEnd = render?.getPresentSerial?.() ?? null;
-    const uncovered = Math.max(0, window.tier2Total - window.watchedPages);
+    // Tier-2 coverage is measured against the pages armed FROM the tier-2 set only. Counting
+    // the caller's requested pages here (they are usually not tier-2) hides a census that
+    // instrumented almost none of it behind a non-positive difference.
+    const uncovered = Math.max(0, window.tier2Total - window.watchedTier2);
     const windowOut = {
         armedAtMs: Math.round(window.armedAtMs),
         readAtMs: Math.round(readAtMs),
@@ -440,11 +658,26 @@ function countedGuestBlocks(top: number, window: CountedWindow | null, render: R
         presentSerialBegin: window.presentSerialBegin,
         presentSerialEnd,
         watchedPages: window.watchedPages,
+        watchedRequestedPages: window.watchedRequested,
+        watchedTier2Pages: window.watchedTier2,
         watchedPagesNow: watchedNow,
+        retiredIns,
+        ...(window.retired.wraps ? { retiredCounterWraps: window.retired.wraps } : {}),
         tier2Total: window.tier2Total,
         tier2PagesUnwatched: uncovered,
         requestedPages: window.requestedPages,
         armedRequestedPages: window.armedRequested,
+        requestedPagesDropped: window.requestedDropped.length,
+        ...(window.requestedDropped.length
+            ? {
+                requestedPagesDroppedWarning:
+                    `${window.requestedDropped.length} of ${window.requestedPages} REQUESTED page(s) were never armed `
+                    + `(${window.requestedDropped.slice(0, 8).join(", ")}${window.requestedDropped.length > 8 ? ", …" : ""}) — `
+                    + "v86's watch table holds 64. Anything on them, INCLUDING a named range, is absent from this census: "
+                    + "`blocks: 0` for such a range means 'never instrumented', not 'did not run'. Ask for fewer pages.",
+                requestedPagesDroppedList: window.requestedDropped,
+            }
+            : {}),
         zeroedByThisCall: true,
         slotOverflow: w.trace2_slot_overflow ? w.trace2_slot_overflow() >>> 0 : null,
         coverage: `only the ${window.watchedPages} armed page(s) are counted; guest work anywhere else (interpreted code, `
@@ -498,14 +731,33 @@ function countedGuestBlocks(top: number, window: CountedWindow | null, render: R
     }
     rows.sort((a, b) => b.weightedIns - a.weightedIns);
     for (const r of rows) r.sharePct = total > 0 ? Math.round((r.weightedIns / total) * 1000) / 10 : 0;
+
+    // The roll-up exists because a top-N ranking structurally CANNOT size a function: a
+    // 1.6 KB inner loop is a dozen blocks, each individually below the cut, and their sum
+    // is the only number that answers "how much is this function worth".
+    let rangesOut: CountedRanges | undefined;
+    if (ranges.length || unresolvedRanges.length) {
+        const observed: CountedBlockSample[] = [];
+        for (let i = 0; i < n; i++) {
+            observed.push({ addr: w.trace2_block_addr(i) >>> 0, exec: w.trace2_block_exec(i) >>> 0, ins: w.trace2_block_instructions(i) >>> 0 });
+        }
+        rangesOut = rollUpRanges(observed, ranges, total, retiredIns, unresolvedRanges);
+    }
+
     return {
         available: true,
         weighting: "COUNT-weighted (exec x static instructions = retired guest instructions): survives a noisy machine because it never looks at time.",
         window: windowOut,
         blocks: n,
         totalWeightedIns: total,
+        retiredIns,
+        // What fraction of all retired guest instructions this census actually saw. Without it a
+        // sharePct is a share of an unstated subset; with it the subset has a measured size, and
+        // a value near or above 100 is the census contradicting itself rather than a good result.
+        countedCoveragePct: retiredIns > 0 ? Math.round((total / retiredIns) * 1000) / 10 : null,
         ...(saturated.length ? { saturated } : {}),
         rows: rows.slice(0, top),
+        ...(rangesOut ? { ranges: rangesOut } : {}),
     };
 }
 
@@ -965,6 +1217,12 @@ export function registerPerfCommands(svc: HarnessService): void {
      * ranking counters of unknown age, because a stale census is numerically indistinguishable
      * from a live one.
      *
+     * `ranges:[{name,from,to}]` rolls the counted census into named guest spans (`from`/`to`
+     * take `mod+0xRVA`), because a top-N block ranking structurally cannot size a FUNCTION:
+     * a 1.6 KB inner loop is a dozen blocks each below the cut. Named ranges arm their own
+     * pages first, and the roll-up reports the unattributed remainder, so a share is a share
+     * of a stated whole and `blocks: 0` means "did not run", not "was never instrumented".
+     *
      * `phase` splits the window when the scene must be driven by hand:
      * `{phase:'arm'}` zeroes+arms and returns immediately, `{phase:'read'}` reads the census
      * against that window (and leaves it running unless `keepArmed:false`). Default (no phase)
@@ -983,14 +1241,22 @@ export function registerPerfCommands(svc: HarnessService): void {
         const opts = (args[0] ?? {}) as {
             ms?: number; intervalMs?: number; top?: number; phase?: "arm" | "read";
             maxPages?: number; keepArmed?: boolean; pages?: Array<number | string>;
+            ranges?: GuestRangeSpec[];
         };
         const ms = Math.max(200, Math.min(30_000, opts.ms ?? 2000));
         const intervalMs = Math.max(1, opts.intervalMs ?? 5);
         const top = opts.top ?? 15;
         const maxPages = Math.max(1, Math.min(64, opts.maxPages ?? 64));
-        const pages = (opts.pages ?? [])
-            .map((p) => (typeof p === "string" ? Number.parseInt(p, 16) : p) >>> 0)
-            .filter((p) => p > 0);
+        const specs = opts.ranges ?? [];
+        const ranges = resolveRanges(specs);
+        // A named range arms its own pages, so "the range is absent" can never mean "its page
+        // never got a slot in the 64-entry watch table".
+        const pages = [
+            ...pagesForRanges(ranges.resolved),
+            ...(opts.pages ?? [])
+                .map((p) => (typeof p === "string" ? Number.parseInt(p, 16) : p) >>> 0)
+                .filter((p) => p > 0),
+        ];
         const render = sys().services?.render as RenderLike | undefined;
 
         const BIAS = "trace2 arming instruments every block on the armed pages (trace2_record_*), which SLOWS the guest. "
@@ -999,8 +1265,10 @@ export function registerPerfCommands(svc: HarnessService): void {
             + "them if you were mid region-formation.";
 
         if (opts.phase === "arm") {
+            tearDownCountedWindow();   // a previous window's ticker would otherwise run forever
             const arm = armCountedRecorder(render, maxPages, pages);
             countedWindow = arm.ok ? arm.window : null;
+            countedRanges = ranges;
             return arm.ok
                 ? {
                     phase: "arm", armed: true, window: { ...arm.window, armedAtMs: Math.round(arm.window.armedAtMs) },
@@ -1010,8 +1278,9 @@ export function registerPerfCommands(svc: HarnessService): void {
         }
 
         if (opts.phase === "read") {
-            const counted = countedGuestBlocks(top, countedWindow, render);
-            if (opts.keepArmed === false) { disarmCountedRecorder(); countedWindow = null; }
+            const rr = specs.length ? resolveRanges(specs) : countedRanges;
+            const counted = countedGuestBlocks(top, countedWindow, render, rr.resolved, rr.unresolved);
+            if (opts.keepArmed === false) tearDownCountedWindow();
             return {
                 phase: "read",
                 sampled: { available: false, note: "phase:'read' reads the counted census only — the time-weighted channel needs its own live sampling window (call guestBlocks() with no phase, disarmed, for that)." },
@@ -1021,13 +1290,15 @@ export function registerPerfCommands(svc: HarnessService): void {
             };
         }
 
+        tearDownCountedWindow();
         const arm = armCountedRecorder(render, maxPages, pages);
         countedWindow = arm.ok ? arm.window : null;
+        countedRanges = ranges;
         // Both channels observe the same wall-clock window: the sampler's own duration IS the
         // counted window, so a disagreement between them cannot be blamed on different spans.
         const sampled = await sampledGuestBlocks(ms, intervalMs, top);
-        const counted = countedGuestBlocks(top, countedWindow, render);
-        if (opts.keepArmed !== true) { disarmCountedRecorder(); countedWindow = null; }
+        const counted = countedGuestBlocks(top, countedWindow, render, ranges.resolved, ranges.unresolved);
+        if (opts.keepArmed !== true) tearDownCountedWindow();
         return {
             window: { ms, intervalMs },
             armed: arm.ok,

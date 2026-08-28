@@ -3,8 +3,11 @@
  *
  * - textures(): a backend-agnostic gallery — DDraw/D3D7/D3D8 surfaces + D3D9
  *   TextureStore slots.
- * - dumpSurface(sel)/dumpTexture(sel): full-RGBA readback -> PNG (logs/debug/),
- *   preferring the authoritative rgbaScratch (zero GPU) for bitmap textures.
+ * - dumpSurface(sel, {save?, from?, level?})/dumpTexture(...): full-RGBA readback -> PNG
+ *   (logs/debug/), preferring the authoritative rgbaScratch (zero GPU) for bitmap textures.
+ *   `from:"gpu"` on a D3D8 selector reads the live GPUTexture (source `d3d8-gpu`) instead of
+ *   guest memory — the only route into a D3D8 render-target texture (surfacePtr=0 by
+ *   construction: the guest never Locks it, it only renders/composites into it).
  * - expectSurfaceNonBlack(sel): cheap liveness assertion over a subsampled
  *   readback (reuses the existing dbgReadSurfacePixels nonBlackPct).
  * - captureFrame(): the RenderDoc-style per-draw capture. Works for the FFP
@@ -17,11 +20,13 @@ import { HarnessError, HarnessErrorCode } from "../rpc";
 import { getModule, guestMem, serializeSurfaces, sys } from "../serialize";
 import { bytesToBase64, debugDumpPath } from "./screen";
 import { devices as d3d9Devices } from "../../modules/d3d9/shared-state";
-import { surfaceInfo as d3d8SurfaceInfo } from "../../modules/d3d8/shared-state";
+import { surfaceInfo as d3d8SurfaceInfo, devices as d3d8Devices } from "../../modules/d3d8/shared-state";
 import { cancelCapture as frameCaptureCancel, startCapture as frameCaptureStart } from "../../modules/ddraw/frame-capture";
 import { armSurfaceOps, takeSurfaceOps } from "../../modules/ddraw/surface-op-log";
 import { asArrayBufferView } from "../../../dom-buffer";
 import { getSurfaceFormatLayout, getD3DTextureLayout, decodeD3DTextureToRgba8 } from "../../backends/webgpu/shared/texture-formats";
+import { readGpuTextureRgba } from "../../backends/webgpu/shared/gpu-readback";
+import { WebGPUBackend } from "../../backends/webgpu/webgpu-backend";
 
 function ddraw(): any {
     return getModule("ddraw");
@@ -152,19 +157,24 @@ export function registerTextureCommands(svc: HarnessService): void {
      *  path makes — NOT from rgbaScratch: that buffer is a cache the palette-bake step
      *  fills lazily, so a texture the screen clearly shows can read back as flat black.
      *  Without this a d3d8-only title could see its textures listed but never dump one. */
-    const dumpD3d8 = (ptr: number): { rgba: Uint8Array; w: number; h: number; d3dFormat: number } | null => {
+    const dumpD3d8 = (ptr: number): { rgba: Uint8Array; w: number; h: number; d3dFormat: number } | { err: string } | null => {
         for (const [comPtr, info] of d3d8SurfaceInfo) {
             const s = info.surface as any;
             if (!s) continue;
             if ((comPtr >>> 0) !== ptr && ((s.surfacePtr ?? 0) >>> 0) !== ptr) continue;
             const w = s.width | 0, h = s.height | 0;
             const src = s.surfacePtr >>> 0;
-            if (!src || w <= 0 || h <= 0) return null;
+            if (w <= 0 || h <= 0) return { err: `degenerate size ${w}x${h}` };
+            // A render-target texture (the whole-scene-into-an-RT pattern) has no guest
+            // backing by construction — surfacePtr is 0 or the guest range is unmapped.
+            // Report that explicitly rather than falling through to a GPU route that a
+            // guest-backed surface would never need, so the two failure modes stay distinct.
+            if (!src) return { err: "no guest pixel backing (surfacePtr=0) — this is a render-target texture; retry with the GPU route" };
             const mem = guestMem();
-            if (!mem) return null;
+            if (!mem) return { err: "guest memory unavailable (no process loaded?)" };
             const layout = getD3DTextureLayout(info.d3dFormat, w, h);
             const pitch = s.pitch || layout.pitch;
-            if (src + pitch * h > mem.length) return null;
+            if (src + pitch * h > mem.length) return { err: `guest range 0x${src.toString(16)}+${pitch * h} exceeds memory (len=${mem.length})` };
             const rgba = decodeD3DTextureToRgba8(mem, src, w, h, info.d3dFormat, {
                 pitch,
                 surfaceFormat: s.format,
@@ -175,10 +185,65 @@ export function registerTextureCommands(svc: HarnessService): void {
         return null;
     };
 
+    /** GPU readback for a D3D8 surface/texture that has a `gpuTexture` but no guest pixel
+     *  backing — a render target the game only ever draws into and composites, never Locks.
+     *  `level` picks a mip when the matched surface's OWN state has no texture but its
+     *  parent (GetSurfaceLevel's level-0 owner) does — sublevels above 0 are separate
+     *  DirectDrawSurfaceState objects that share the parent's GPUTexture's mip chain, not
+     *  their own. Named `d3d8-gpu` in the result so a caller can tell this apart from the
+     *  guest-memory decode above (dumpD3d8 up top). */
+    const dumpD3d8Gpu = async (ptr: number, level?: number): Promise<{ rgba: Uint8Array; w: number; h: number; d3dFormat: number } | { err: string } | null> => {
+        for (const [comPtr, info] of d3d8SurfaceInfo) {
+            const s = info.surface as any;
+            if (!s) continue;
+            if ((comPtr >>> 0) !== ptr && ((s.surfacePtr ?? 0) >>> 0) !== ptr) continue;
+            let gpuState = s;
+            let mipLevel = level ?? 0;
+            if (!gpuState.gpuTexture && info.texturePtr) {
+                const parentInfo = d3d8SurfaceInfo.get(info.texturePtr);
+                if (parentInfo?.surface && (parentInfo.surface as any).gpuTexture) {
+                    gpuState = parentInfo.surface as any;
+                    mipLevel = level ?? info.level;
+                }
+            }
+            const tex = gpuState.gpuTexture as GPUTexture | undefined;
+            if (!tex) return { err: "surface has no GPU texture (never rendered to / never uploaded to the GPU)" };
+            const backend = sys().services?.render?.getBackend?.();
+            if (backend?.kind !== "webgpu") return { err: "active render backend is not webgpu" };
+            const device = (backend as WebGPUBackend).getDevice();
+            const queue = (backend as WebGPUBackend).getQueue();
+            if (!device || !queue) return { err: "webgpu device unavailable" };
+            const shift = Math.max(0, mipLevel | 0);
+            const w = Math.max(1, gpuState.width >>> shift);
+            const h = Math.max(1, gpuState.height >>> shift);
+            // Flush every live device's pending programmable batch so the readback observes
+            // this frame's draws, not whatever the GPU texture held before them — the same
+            // reason the D3D9 GPU route calls submitFrame(false) before its own copy.
+            for (const dev of d3d8Devices.values()) dev.flushProgrammablePending();
+            // WebGPU never throws for validation: a dropped copyTextureToBuffer (missing
+            // COPY_SRC usage, a mip out of range) still resolves mapAsync, and the verb would
+            // hand back a BLACK png labelled d3d8-gpu — read as "the render target is black".
+            device.pushErrorScope("validation");
+            let rgba: Uint8Array;
+            try {
+                rgba = await readGpuTextureRgba(device, queue, tex, w, h, mipLevel);
+            } catch (e) {
+                await device.popErrorScope().catch(() => null);
+                return { err: `d3d8 GPU readback failed: ${e}` };
+            }
+            const validationError = await device.popErrorScope().catch(() => null);
+            if (validationError) {
+                return { err: `d3d8 GPU readback was dropped by WebGPU validation (the pixels would be black, not the surface): ${validationError.message}` };
+            }
+            return { rgba, w, h, d3dFormat: info.d3dFormat };
+        }
+        return null;
+    };
+
     const dump = async (args: unknown[]) => {
         const ptr = resolvePtr(args[0]);
         if (!ptr) throw new HarnessError("surface pointer is 0 (no such surface / not initialized)", HarnessErrorCode.NOT_FOUND);
-        const opts = (args[1] ?? {}) as { save?: string; from?: "auto" | "gpu" | "scratch" };
+        const opts = (args[1] ?? {}) as { save?: string; from?: "auto" | "gpu" | "scratch"; level?: number };
         const emit = async (rgba: Uint8Array, w: number, h: number, source: string) => {
             const name = (opts.save ?? `surf_${ptr.toString(16)}_${w}x${h}`).replace(/\.png$/i, "");
             const base64 = await encodePngBase64(rgba, w, h);
@@ -187,8 +252,24 @@ export function registerTextureCommands(svc: HarnessService): void {
         };
 
         const d9Source = opts.from === "gpu" ? "d3d9-gpu" : "d3d9-store";
-        const d8 = dumpD3d8(ptr);
-        if (d8) return emit(d8.rgba, d8.w, d8.h, `d3d8-texture(fmt ${d8.d3dFormat})`);
+        // "gpu" skips the guest-memory decode outright — a render target's guest bytes (if
+        // any) are stale by construction, and reading them would silently answer the wrong
+        // question. Otherwise try guest memory first (cheap, no GPU round-trip) and fall back
+        // to the GPU route only when this IS a d3d8 surface but has no guest pixel backing —
+        // never fall through to ddraw/d3d9 for a ptr that d3d8 already claimed.
+        if (opts.from !== "gpu") {
+            const d8 = dumpD3d8(ptr);
+            if (d8 && !("err" in d8)) return emit(d8.rgba, d8.w, d8.h, `d3d8-texture(fmt ${d8.d3dFormat})`);
+            if (d8 && "err" in d8) {
+                const g8 = await dumpD3d8Gpu(ptr, opts.level);
+                if (g8 && !("err" in g8)) return emit(g8.rgba, g8.w, g8.h, `d3d8-gpu(fmt ${g8.d3dFormat})`);
+                throw new HarnessError(`d3d8 surface 0x${ptr.toString(16)}: guest decode failed (${d8.err}); GPU readback also failed (${g8 ? g8.err : "no GPU texture"})`, HarnessErrorCode.UNSUPPORTED);
+            }
+        } else {
+            const g8 = await dumpD3d8Gpu(ptr, opts.level);
+            if (g8 && !("err" in g8)) return emit(g8.rgba, g8.w, g8.h, `d3d8-gpu(fmt ${g8.d3dFormat})`);
+            if (g8 && "err" in g8) throw new HarnessError(`d3d8 surface 0x${ptr.toString(16)}: GPU readback failed (${g8.err})`, HarnessErrorCode.UNSUPPORTED);
+        }
 
         const dd = ddraw();
         // readSurfaceRGBA takes "gpu" itself and is the only route to a DDraw surface's GPU
@@ -431,11 +512,19 @@ export function registerTextureCommands(svc: HarnessService): void {
     });
 
     /** captureFrame(opts) — arm the per-draw CaptureBus for the next complete frame. Backend-
-     *  agnostic now: DDraw/D3D7 (full FFP), D3D8 (full FFP via the shared executor),
-     *  D3D9 (backend-tagged minimal draws). The in-progress frame is discarded at its
-     *  present boundary, then the following frame is recorded through onFrameEnd(). */
+     *  agnostic now: DDraw/D3D7 (full FFP), D3D8 (full FFP via the shared executor, INCLUDING
+     *  indexed draws through a decl-interleaved scratch buffer), D3D9 (backend-tagged minimal
+     *  draws). The in-progress frame is discarded at its present boundary, then the following
+     *  frame is recorded through onFrameEnd().
+     *
+     *  `maxVerts`/`maxIndexedVerts` size each draw's `firstVertices`/`indexedVertices` sample
+     *  (default 4/6); echoed back as `captureConfig` so a caller can tell an honoured override
+     *  from a default. A draw that cannot resolve vertices (no VB bound, an out-of-range
+     *  index/vertex address, a stride the FVF doesn't describe) names the reason in
+     *  `firstVerticesUnavailable`/`indexedVerticesUnavailable` — the arrays are never silently
+     *  empty. */
     svc.register("captureFrame", async (args, ctx: HarnessCtx) => {
-        const opts = (args[0] ?? {}) as { timeoutMs?: number; backend?: string; dumpTargets?: boolean };
+        const opts = (args[0] ?? {}) as { timeoutMs?: number; backend?: string; dumpTargets?: boolean; maxVerts?: number; maxIndexedVerts?: number };
         const timeoutMs = opts.timeoutMs ?? 5000;
         let timeout: ReturnType<typeof setTimeout> | undefined;
         let abortReason: Error | undefined;
@@ -451,7 +540,7 @@ export function registerTextureCommands(svc: HarnessService): void {
         });
         let frame: { drawCalls: Array<{ rtSurfacePtr: number; rtWidth: number; rtHeight: number; rtFormat?: string | null }> };
         try {
-            frame = await Promise.race([frameCaptureStart(opts.backend), aborted]);
+            frame = await Promise.race([frameCaptureStart(opts.backend, { maxVerts: opts.maxVerts, maxIndexedVerts: opts.maxIndexedVerts }), aborted]);
         } catch (e) {
             frameCaptureCancel(e instanceof Error ? e : abortReason ?? new Error(String(e)));
             throw e;
@@ -514,7 +603,9 @@ export function registerTextureCommands(svc: HarnessService): void {
         }
 
         const enabled = args[1] === undefined ? true : !!args[1];
-        const value = args[2] as number | undefined;
+        // debugView's value is a mode NAME; every other toggle's is numeric. Pass both through
+        // untouched — coercing a string to a number here is how the mode silently became 0.
+        const value = args[2] as number | string | undefined;
         // A toggle nobody owns must be an ERROR: a silently ignored name is an A/B that
         // measures nothing while reading as "this stage is not the cause".
         const applied: string[] = [];

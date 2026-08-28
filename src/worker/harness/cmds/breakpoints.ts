@@ -33,6 +33,33 @@ function toAddr(x: number | string): number {
     return (s.startsWith("0x") || s.startsWith("0X") ? parseInt(s.slice(2), 16) : parseInt(s, 16)) >>> 0;
 }
 
+/** Resolve a breakpoint target: a raw EIP, `module+0xRVA`, or `module!Export`. Module bases
+ *  come from the live registry, so a script written against one run works in the next. */
+function resolveGuestTarget(target: unknown): number {
+    if (typeof target === "number") return target >>> 0;
+    const s = String(target ?? "").trim();
+    if (!s) throw new HarnessError("reached expects an address, 'mod+0xRVA' or 'mod!Export'", HarnessErrorCode.BAD_ARGS);
+    const bang = s.indexOf("!");
+    if (bang > 0) {
+        // The extension is kept: getByName refuses to answer a ".dll" request with the main
+        // EXE (hl.dll vs hl.exe), and stripping it hands back the wrong image's export.
+        const mod = s.slice(0, bang);
+        const exp = s.slice(bang + 1);
+        const addr = (proc()?.moduleRegistry as any)?.getExportAddress?.(mod, exp);
+        if (addr === undefined) throw new HarnessError(`export ${mod}!${exp} not found (module loaded yet?)`, HarnessErrorCode.NOT_FOUND);
+        return addr >>> 0;
+    }
+    const plus = s.indexOf("+");
+    if (plus > 0) {
+        const name = s.slice(0, plus).trim();
+        const mod = (proc()?.moduleRegistry as any)?.getByName?.(name);
+        if (!mod) throw new HarnessError(`module '${name}' not loaded`, HarnessErrorCode.NOT_FOUND);
+        const rva = toAddr(s.slice(plus + 1).trim());
+        return (mod.baseAddress + rva) >>> 0;
+    }
+    return toAddr(s);
+}
+
 /** Refuse EIP breakpoints inside the async-park spin loop. */
 function assertNotSpinLoop(addr: number): void {
     const sched: any = sys().scheduler as any;
@@ -59,6 +86,12 @@ function armEip(addr: number, ctx: HarnessCtx, opts: { continuous?: boolean; pau
         dbg.bp(addr);        // arm the wasm interpreter breakpoint (persists across reloads via cfg)
         warning = "JIT is OFF while this breakpoint is armed — emulator perf collapses. clearBreaks() to restore.";
     }
+    warning += opts.pause === false
+        ? " pause:false — the guest keeps running through the hit."
+        : " THE GUEST IS PAUSED AT THE HIT and stays stopped until resume(): every later" +
+          " observation (frame counters, screenshots, other breakpoints) then reads a frozen" +
+          " game and reports nothing happening. Pass pause:false to just ask whether the" +
+          " address is reached.";
     warning += " BLOCK ENTRIES ONLY: this fires only if the address is where v86 starts a block " +
         "(function entry / after a call or ret). A mid-function instruction NEVER fires even while the " +
         "code runs — 0 hits is not evidence it did not execute. For 'who writes X', use trapWrites." +
@@ -71,7 +104,9 @@ function armEip(addr: number, ctx: HarnessCtx, opts: { continuous?: boolean; pau
             pause: opts.pause !== false,
             when: opts.when,
             capture: opts.capture,
-            onHit: opts.continuous ? undefined : (snap) => resolve({ hit: snap, addr: addr >>> 0, warning, ...extra }),
+            onHit: opts.continuous ? undefined : (snap) => resolve({
+                hit: snap, addr: addr >>> 0, paused: opts.pause !== false, warning, ...extra,
+            }),
         });
         if (opts.continuous) resolve({ armed: true, id, addr: addr >>> 0, continuous: true, warning, ...extra });
         ctx.signal.addEventListener("abort", () => eipBreaks.disarm(id), { once: true });
@@ -90,7 +125,7 @@ export function registerBreakpointCommands(svc: HarnessService): void {
         const name = String(args[0] ?? "");
         const bang = name.indexOf("!");
         if (bang < 0) throw new HarnessError("breakOnExport expects 'module!Export'", HarnessErrorCode.BAD_ARGS);
-        const mod = name.slice(0, bang).replace(/\.dll$/i, "");
+        const mod = name.slice(0, bang);   // extension kept — see resolveGuestTarget
         const exp = name.slice(bang + 1);
         const mr: any = proc()?.moduleRegistry as any;
         const addr = mr?.getExportAddress?.(mod, exp);
@@ -126,6 +161,58 @@ export function registerBreakpointCommands(svc: HarnessService): void {
             if (opts.continuous) resolve({ armed: true, id, pattern, continuous: true });
             ctx.signal.addEventListener("abort", () => apiBreaks.disarm(id), { once: true });
         });
+    });
+
+    /**
+     * reached('mod+0xRVA' | 'mod!Export' | 0xEIP, {ms?=8000}) — did the guest execute this?
+     *
+     * The one-line form of "walk the guest's own control flow": arm a FAST, NON-PAUSING
+     * breakpoint, wait, and answer `reached: true|false`. Hand-rolling this over breakOn is
+     * how the answer goes wrong twice — `run()` RESOLVES with ok:false on a step timeout (so
+     * a bare await reads every address as reached), and breakOn's default PAUSES the guest on
+     * the hit, after which every subsequent probe reads a frozen game and reports "not
+     * reached". Both are settled here, and the verdict carries its own timeout so a miss is a
+     * miss and not a stall.
+     *
+     * Module-relative targets are resolved against the LIVE base, so the same call survives a
+     * reload. Same block-entry rule as breakOn: arm a function ENTRY.
+     */
+    svc.register("reached", async (args, ctx) => {
+        const target = args[0];
+        const opts = (args[1] ?? {}) as { ms?: number };
+        const ms = Math.max(1, Number(opts.ms ?? 8000));
+        const addr = resolveGuestTarget(target);
+        const t0 = Date.now();
+        // A refused arm makes every answer below "not reached" — i.e. "the guest never
+        // executed this" — for an address nothing was ever watching.
+        if (!dbg.bpFast(addr)) {
+            throw new HarnessError(
+                `cannot arm a fast breakpoint at 0x${addr.toString(16)} (v86 debug exports unavailable — no guest running, or a build without the page gate); ` +
+                "`reached:false` from an unarmed breakpoint would be indistinguishable from 'did not execute'",
+                HarnessErrorCode.UNSUPPORTED,
+            );
+        }
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const id = { v: -1 };
+        // eipBreaks.disarm clears the wasm bp (and its page gate) once the last JS entry
+        // goes, so a timeout does not leave this page interpreted for the session.
+        const cleanup = () => { if (id.v >= 0) { eipBreaks.disarm(id.v); id.v = -1; } };
+        const onAbort = () => { cleanup(); };
+        ctx.signal.addEventListener("abort", onAbort, { once: true });
+        const hit = await new Promise<boolean>((resolve) => {
+            timer = setTimeout(() => resolve(false), ms);
+            id.v = eipBreaks.arm(addr, {
+                runId: ctx.runId,
+                once: true,
+                pause: false,
+                onHit: () => resolve(true),
+            });
+        });
+        if (timer) clearTimeout(timer);
+        ctx.signal.removeEventListener("abort", onAbort);
+        cleanup();
+        return { target: typeof target === "number" ? `0x${(target >>> 0).toString(16)}` : String(target),
+            addr: addr >>> 0, addrHex: `0x${addr.toString(16)}`, reached: hit, waitedMs: Date.now() - t0, timeoutMs: ms };
     });
 
     /** watchMem(addr, {indirect?}) — arm a wasm memory watch (value logged in [DBG]

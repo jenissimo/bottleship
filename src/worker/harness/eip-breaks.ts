@@ -163,15 +163,23 @@ function analyzeRetAddr(mem: Uint8Array, ret: number, armedEip: number): {
 class EipBreakRegistry {
     private entries: EipBreakEntry[] = [];
     private nextId = 1;
-    private installed = false;
+    /** Our current console.error wrapper, or null before the first arm. Compared by
+     *  IDENTITY on every arm: installing once and trusting a boolean is how this
+     *  instrument dies silently — anything that replaces console.error afterwards (log
+     *  streaming, a later reload's own wrapper) drops us out of the chain for good, while
+     *  arm() keeps reporting success and every breakpoint quietly never fires. Re-wrapping
+     *  whatever is current chains onto it instead of fighting it. */
+    private hook: ((...args: unknown[]) => void) | null = null;
 
     private ensureInterceptor(): void {
-        if (this.installed) return;
-        this.installed = true;
+        if (this.hook && console.error === this.hook) return;
         const orig = console.error.bind(console);
         const reg = this;
-        console.error = (...args: unknown[]) => {
+        const hook = (...args: unknown[]): void => {
             orig(...args);
+            // Re-wrapping chains onto the PREVIOUS hook, which matches <BP> too — so without
+            // this every hit would be counted once per generation of the chain.
+            if (console.error !== hook) return;
             if (!reg.entries.length) return;
             const first = args[0];
             if (typeof first === "string" && first.indexOf("<BP>") !== -1) {
@@ -179,6 +187,8 @@ class EipBreakRegistry {
                 if (m) reg.onHit(parseInt(m[1], 16) >>> 0);
             }
         };
+        console.error = hook;
+        this.hook = hook;
     }
 
     arm(eip: number, opts: { runId?: number | null; once?: boolean; pause?: boolean; when?: BreakWhen; capture?: BreakCapture; callsite?: boolean; onHit?: (s: unknown) => void } = {}): number {
@@ -358,6 +368,19 @@ class EipBreakRegistry {
 
     disarm(id: number): void {
         this.entries = this.entries.filter((e) => e.id !== id);
+        this.clearWasmWhenIdle();
+    }
+
+    /**
+     * The wasm side has no per-breakpoint removal, so dropping the last JS entry without
+     * clearing it leaves the address armed AND its 4 KiB page interpreted (the bpFast
+     * page-gate) for the rest of the session — every later measurement on that page is then
+     * taken under the interpreter. Entries that remain keep their own arming: dbg.clear() is
+     * only reached when none are left.
+     */
+    private clearWasmWhenIdle(): void {
+        if (this.entries.length > 0) return;
+        try { dbg.clear(); } catch { /* */ }
     }
 
     clear(): number {
@@ -398,12 +421,9 @@ class EipBreakRegistry {
             if (e.once) this.disarm(e.id);
         }
         // When the last entry auto-disarms, clear the wasm interpreter breakpoints
-        // too — the wasm has no per-bp removal, so it would keep logging "<BP>" on
-        // every pass and spamming console.error. (JIT stays off until reload /
-        // dbg.jitOn(); see clearBreaks.)
-        if (this.entries.length === 0) {
-            try { dbg.clear(); } catch { /* */ }
-        }
+        // too — otherwise it keeps logging "<BP>" on every pass. (JIT stays off until
+        // reload / dbg.jitOn(); see clearBreaks.)
+        this.clearWasmWhenIdle();
     }
 }
 

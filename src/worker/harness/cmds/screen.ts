@@ -438,6 +438,18 @@ export function registerScreenCommands(svc: HarnessService): void {
         return active.getRtDebug();
     });
 
+    /** passCensus() — what each recently submitted D3D9 render pass was OPENED with:
+     *  command/draw counts, the attachment kind, and the viewport applied to the whole pass.
+     *
+     *  `captureFrame` reports the viewport each DRAW asked for; a pass carries one opening
+     *  viewport for all of them. When those disagree the frame renders into a rectangle no
+     *  single draw ever requested — which is invisible to every per-draw instrument. */
+    svc.register("passCensus", () => {
+        const active: any = sys().services?.render?.getActive?.();
+        if (!active?.getPassDebug) throw new HarnessError("active presenter has no pass census (not D3D9)", HarnessErrorCode.UNSUPPORTED);
+        return active.getPassDebug();
+    });
+
     /** declCensus({reset?}) — D3D9 vertex declarations the game draws with, the streams each
      *  spans, and per declaration the FFP semantics we DROP because the fixed-function
      *  shader/layout is built from stream 0 only. `drawsDropping` vs `drawsTotal` prices it:

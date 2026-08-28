@@ -16,6 +16,8 @@ import { loadDiagnostics } from "../core/diagnostics/load-diagnostics";
 import { getGpuErrorReport, type GpuErrorReport } from "../core/gpu-error-log";
 import { gpuDeviceLifecycle, type GpuDeviceLifecycleReport } from "../core/gpu/gpu-device-lifecycle";
 import { pendingMessageBoxes } from "../runtime/dialog-bridge";
+import { getD3D9PerfSnapshot, type D3D9PerfSnapshot } from "../modules/d3d9/d3d9-perf";
+import { collectShaderCensus, censusComplete } from "./shader-census";
 
 const hx = (v: number) => "0x" + (v >>> 0).toString(16);
 
@@ -29,6 +31,95 @@ export interface SerializedCpuSnapshot {
     eflags: number;
     segments: { es: number; cs: number; ss: number; ds: number; fs: number; gs: number } | null;
     fsBase: number;
+}
+
+interface HarnessD3D9Census {
+    /** False when a device's snapshot threw AND when there is no D3D9 device at all — a
+     *  DDraw/D3D8 title must not report a complete shader census. */
+    complete: boolean;
+    /** Live D3D9 devices the census walked; 0 explains an empty census. */
+    deviceCount: number;
+    /** Devices whose snapshot threw or exposed no instrumentation seam. */
+    snapshotFailures: number;
+    source: string;
+    unsupportedOps: string[];
+    unsupportedCount: number;
+    shaderCount: number;
+    pairCount: number;
+    drawsIssued: number;
+    programmableDraws: number;
+    unattributedDraws: number;
+}
+
+type HarnessD3D9Report = D3D9PerfSnapshot & {
+    /** Stable report spelling; `droppedDraws` remains for the existing dbg.d3d9Perf shape. */
+    dropDraws: Record<string, number>;
+    shaderBuildFailures: number;
+    gpuPipelineValidationFailures: number;
+    census: HarnessD3D9Census;
+};
+
+function numberOrZero(value: unknown): number {
+    return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function buildD3D9Report(): HarnessD3D9Report {
+    const perf = getD3D9PerfSnapshot();
+    // Same collector the shaderOps verb uses: a device torn down mid-query must not be
+    // swallowed into a census that then calls itself complete.
+    const collection = collectShaderCensus(false);
+    const snapshots = collection.snapshots;
+
+    const unsupportedOps = new Set<string>();
+    let shaderBuildFailures = 0;
+    let gpuPipelineValidationFailures = 0;
+    let shaderCount = 0;
+    let pairCount = 0;
+    let drawsIssued = 0;
+    let programmableDraws = 0;
+    let unattributedDraws = 0;
+    let complete = censusComplete(collection);
+    let source = "emitter-dispatch";
+    for (const snapshot of snapshots) {
+        shaderBuildFailures += numberOrZero(snapshot.shaderBuildFailures);
+        gpuPipelineValidationFailures += numberOrZero(snapshot.gpuPipelineValidationFailures);
+        const census = snapshot.census as { complete?: unknown; source?: unknown } | undefined;
+        if (census?.complete === false) complete = false;
+        if (typeof census?.source === "string") source = census.source;
+        const shaders = Array.isArray(snapshot.shaders) ? snapshot.shaders : [];
+        shaderCount += shaders.length;
+        for (const shader of shaders) {
+            const unsupported = (shader as { unsupported?: unknown }).unsupported;
+            if (Array.isArray(unsupported)) {
+                for (const op of unsupported) if (typeof op === "string") unsupportedOps.add(op);
+            }
+        }
+        pairCount += Array.isArray(snapshot.pairs) ? snapshot.pairs.length : 0;
+        drawsIssued += numberOrZero(snapshot.drawsIssued);
+        const attribution = snapshot.attribution as { programmableDraws?: unknown; unattributed?: unknown } | undefined;
+        programmableDraws += numberOrZero(attribution?.programmableDraws);
+        unattributedDraws += numberOrZero(attribution?.unattributed);
+    }
+
+    return {
+        ...perf,
+        dropDraws: { ...perf.droppedDraws },
+        shaderBuildFailures,
+        gpuPipelineValidationFailures,
+        census: {
+            complete,
+            deviceCount: collection.deviceCount,
+            snapshotFailures: collection.snapshotFailures,
+            source,
+            unsupportedOps: [...unsupportedOps].sort(),
+            unsupportedCount: unsupportedOps.size,
+            shaderCount,
+            pairCount,
+            drawsIssued,
+            programmableDraws,
+            unattributedDraws,
+        },
+    };
 }
 
 export interface HarnessReport {
@@ -50,6 +141,8 @@ export interface HarnessReport {
      * one that separates "the guest stopped drawing" from "the GPU stopped listening".
      */
     gpuDevice: GpuDeviceLifecycleReport;
+    /** D3D9 drop-draw and feature census; empty droppedDraws is the healthy state. */
+    d3d9: HarnessD3D9Report;
     /**
      * Message boxes the guest is blocked on. The host draws them as DOM, so no canvas
      * capture can show one: without this, a guest waiting on an error box is indistinguishable
@@ -96,6 +189,16 @@ export interface HarnessReport {
         eip: string; eipTrusted?: boolean; faultAddr: string; cr2Candidates?: string[];
         badCall?: { callSite: number; slotAddr: number; slotValue: number; operand: string };
         lastThunk: string; threadId: number | null; outcome?: string;
+        /** Registers AT THE FAULT. The post-mortem dump in a crash report is taken at
+         *  ExitProcess — frames later — so reading a register value from there and calling
+         *  it "the value at the fault" is simply wrong. These are the recorded ones. */
+        regs?: Record<string, string>;
+        /** Guest ESP at the fault and the words above it: the return-address chain that says
+         *  WHICH call site a bad indirect call was actually reached from. */
+        gameEsp?: string;
+        stackDump?: string[];
+        /** WinAPI call ring leading into the fault (newest last). */
+        recentCalls?: string[];
     }>;
     /** Recent C++ (0xe06d7363) exceptions: decoded type/message + caught/unhandled outcome.
      *  The usual root cause of an MSVC/UE "Runtime Error! terminate" is an `unhandled` entry. */
@@ -191,6 +294,7 @@ export function buildHarnessReport(esp?: number): HarnessReport {
         lastThunks: bt?.recent ?? [],
         gpuErrors: getGpuErrorReport(),
         gpuDevice: gpuDeviceLifecycle.report(),
+        d3d9: buildD3D9Report(),
         pendingModals: pendingMessageBoxes(),
         stubs: stubRegistry.list().map((s) => ({
             api: s.key,
@@ -256,6 +360,12 @@ export function buildHarnessReport(esp?: number): HarnessReport {
             lastThunk: f.lastThunk,
             threadId: f.threadId,
             outcome: f.outcome,
+            regs: f.regs
+                ? Object.fromEntries(Object.entries(f.regs).map(([k, v]) => [k, hx((v ?? 0) >>> 0)]))
+                : undefined,
+            gameEsp: hx(f.gameEsp >>> 0),
+            stackDump: (f.stackDump ?? []).map((w) => hx(w >>> 0)),
+            recentCalls: (f.recentCalls ?? []).slice(-10),
         })),
         cxxExceptions: getCxxExceptionRing().slice(-12).map((e) => ({
             seq: e.seq,

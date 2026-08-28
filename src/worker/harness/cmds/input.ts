@@ -364,6 +364,12 @@ export function registerInputCommands(svc: HarnessService): void {
         return { ok: true, active: !!probe, entries: probe ? probe.entries : [] };
     });
 
+    /** dinputDiag() — buffered queues, the immediate-mouse handoff counters, and the
+     *  produced-event trail. Read this instead of snapshotting the guest's own
+     *  DIMOUSESTATE: the guest polls at frame rate and takes the motion on its first
+     *  read, so a later look at that struct sees only the zeros after it. */
+    svc.register("dinputDiag", () => input().getDInputDiagnostics());
+
     /** dialogs() — enumerate all windows/controls with GLOBAL coords (read-only). */
     svc.register("dialogs", () => {
         const out = [];

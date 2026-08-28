@@ -11,7 +11,15 @@
  */
 
 import type { HarnessService } from "../service";
-import { slabReport, queryVirtualMemory } from "../../modules/kernel32/memory";
+import { slabReport, queryVirtualMemory, virtualQueryFastStats, resetVirtualQueryFastStats } from "../../modules/kernel32/memory";
+import { getLocaleInlineStubs } from "../../modules/kernel32/locale-stubs";
+import { LOCALE_STUB_ANSWERED_OFF, LOCALE_STUB_BAIL_OFF, LOCALE_STUB_BAIL_REASONS } from "../../modules/kernel32/locale-data";
+import { getMbwcInlineStubs } from "../../modules/kernel32/mbwc-stubs";
+import {
+    MBWC_ANSWERED_MBTWC_OFF, MBWC_ANSWERED_WCTMB_OFF, MBWC_MBTWC_BAIL_OFF,
+    MBWC_WCTMB_BAIL_OFF, MBTWC_BAIL_REASONS, WCTMB_BAIL_REASONS,
+} from "../../modules/kernel32/codepage-lut";
+import { Mem } from "../../core/memory/mem-accessor";
 import { HarnessError, HarnessErrorCode } from "../rpc";
 import { sys } from "../serialize";
 
@@ -50,6 +58,101 @@ export function registerHeapCommands(svc: HarnessService): void {
             });
         }
         return { threads: rows, allReportReservation: rows.length > 0 && rows.every((r) => r.reservationReported) };
+    });
+
+    /** vaFastStats({reset?}) — did the VirtualQuery fast tier actually serve the calls?
+     *  `hits` vs `defers` is the tier split; `slowPathThunks` going to zero says the
+     *  dispatch disappeared, this says WHICH tier absorbed it. With
+     *  `setWorkerFlag('__virtualQueryFastAudit', true)` armed, `auditChecked` is how many
+     *  fast answers were differenced against the full body and `auditMismatches` must
+     *  stay 0 — a non-zero count also logs the address and both records. */
+    svc.register("vaFastStats", (args) => {
+        const opts = (args[0] ?? {}) as { reset?: boolean };
+        const stats = virtualQueryFastStats();
+        if (opts.reset) resetVirtualQueryFastStats();
+        return stats;
+    });
+
+    /** localeStubStats({reset?}) — did the trap-free GetLocaleInfoW stub answer?
+     *
+     *  An inline stub answers inside guest code, so the calls it absorbs vanish from
+     *  slowPathThunks, apiCensus, the fast-path census and breakOnApi alike — "the stub
+     *  works" and "the stub was never installed" are the same zero everywhere else.
+     *  These two counters live in the stub's own guest-RAM table and are the only
+     *  instrument that can tell them apart. Acceptance is `answered` in the millions with
+     *  `bailed` small; `installed: false` means the IAT redirect never happened (check the
+     *  title reaches GetLocaleInfoW through its IAT, not GetProcAddress). */
+    svc.register("localeStubStats", (args) => {
+        const opts = (args[0] ?? {}) as { reset?: boolean };
+        const stubs = getLocaleInlineStubs();
+        if (!stubs) return { installed: false, answered: 0, bailed: 0, bail: {} };
+        const rd = (off: number) => (Mem.readUint32(stubs.tableAddr + off) ?? 0) >>> 0;
+        const answered = rd(LOCALE_STUB_ANSWERED_OFF);
+        const bail: Record<string, number> = {};
+        let bailed = 0;
+        LOCALE_STUB_BAIL_REASONS.forEach((reason, i) => {
+            const n = rd(LOCALE_STUB_BAIL_OFF + i * 4);
+            bailed += n;
+            if (n) bail[reason] = n;
+        });
+        if (opts.reset) {
+            Mem.writeUint32(stubs.tableAddr + LOCALE_STUB_ANSWERED_OFF, 0);
+            LOCALE_STUB_BAIL_REASONS.forEach((_r, i) => Mem.writeUint32(stubs.tableAddr + LOCALE_STUB_BAIL_OFF + i * 4, 0));
+        }
+        return {
+            installed: true,
+            stubAddr: `0x${stubs.getLocaleInfoWStub.toString(16)}`,
+            tableAddr: `0x${stubs.tableAddr.toString(16)}`,
+            answered,
+            bailed,
+            bail,
+            bailPct: answered + bailed > 0 ? Math.round((bailed / (answered + bailed)) * 1000) / 10 : 0,
+        };
+    });
+
+    /** mbwcStubStats({reset?}) — did the trap-free MultiByteToWideChar / WideCharToMultiByte
+     *  stubs answer? Same blindness as localeStubStats: an inline stub answers inside guest
+     *  code, so its calls leave slowPathThunks / apiCensus / breakOnApi and the fast-path
+     *  census alike, and "it works" and "it was never installed" are the same zero
+     *  everywhere else. Read alongside localeFastPath(): `answered` here should rise by
+     *  what `mbtwcThunk` / `wctmbFast` there lose. A `bail` reason dominating names the
+     *  case the stubs do not cover — `otherCodePage` means the title converts through a
+     *  page the table does not hold, which is a contract limit, not a defect. */
+    svc.register("mbwcStubStats", (args) => {
+        const opts = (args[0] ?? {}) as { reset?: boolean };
+        const stubs = getMbwcInlineStubs();
+        if (!stubs) return { installed: false, mbToWc: { answered: 0, bailed: 0, bail: {} }, wcToMb: { answered: 0, bailed: 0, bail: {} } };
+        const rd = (off: number) => (Mem.readUint32(stubs.tableAddr + off) ?? 0) >>> 0;
+        const side = (answeredOff: number, bailOff: number, reasons: readonly string[]) => {
+            const answered = rd(answeredOff);
+            const bail: Record<string, number> = {};
+            let bailed = 0;
+            reasons.forEach((reason, i) => {
+                const n = rd(bailOff + i * 4);
+                bailed += n;
+                if (n) bail[reason] = n;
+            });
+            return {
+                answered, bailed, bail,
+                bailPct: answered + bailed > 0 ? Math.round((bailed / (answered + bailed)) * 1000) / 10 : 0,
+            };
+        };
+        const out = {
+            installed: true,
+            codePage: stubs.codePage,
+            mbToWcStub: `0x${stubs.mbToWcStub.toString(16)}`,
+            wcToMbStub: `0x${stubs.wcToMbStub.toString(16)}`,
+            tableAddr: `0x${stubs.tableAddr.toString(16)}`,
+            mbToWc: side(MBWC_ANSWERED_MBTWC_OFF, MBWC_MBTWC_BAIL_OFF, MBTWC_BAIL_REASONS),
+            wcToMb: side(MBWC_ANSWERED_WCTMB_OFF, MBWC_WCTMB_BAIL_OFF, WCTMB_BAIL_REASONS),
+        };
+        if (opts.reset) {
+            Mem.writeUint32(stubs.tableAddr + MBWC_ANSWERED_MBTWC_OFF, 0);
+            Mem.writeUint32(stubs.tableAddr + MBWC_ANSWERED_WCTMB_OFF, 0);
+            MBTWC_BAIL_REASONS.forEach((_r, i) => Mem.writeUint32(stubs.tableAddr + MBWC_MBTWC_BAIL_OFF + i * 4, 0));
+            WCTMB_BAIL_REASONS.forEach((_r, i) => Mem.writeUint32(stubs.tableAddr + MBWC_WCTMB_BAIL_OFF + i * 4, 0));
+        }
+        return out;
     });
 
     /** heapSlab() — slab arena snapshot: alloc/free/fallback counters, active-slab

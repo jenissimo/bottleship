@@ -393,6 +393,9 @@ export function installHarnessFacade(worker: Worker, getInputView?: () => Int32A
         // Session-scoped store when this tab has a ?bs=<name>: localStorage is origin-wide,
         // so a global flag would silently apply to every parallel agent's tab too.
         const session = sessionFromLocation(window.location.search);
+        if (key === "__hostTools" && !session) {
+            throw new Error("setWorkerFlag('__hostTools', ...): a ?bs=<session> URL is required");
+        }
         const store = session ? `bs_debug_flags:${session}` : "bs_debug_flags";
         let persisted = false;
         try {

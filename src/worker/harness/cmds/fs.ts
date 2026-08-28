@@ -13,6 +13,7 @@ import { HarnessError, HarnessErrorCode } from "../rpc";
 import { sys } from "../serialize";
 import { bytesToBase64 } from "./screen";
 import { harnessBus } from "../event-bus";
+import { vfsIoCensus } from "../../runtime/filesystem/vfs";
 
 const GENERIC_READ = 0x80000000;
 const GENERIC_WRITE = 0x40000000;
@@ -254,4 +255,83 @@ export function registerFsCommands(svc: HarnessService): void {
         if (action === "clear") { probe.entries.length = 0; return { ok: true, entries: [] }; }
         return { ok: true, tracing: true, entries: probe.entries };
     });
+
+    /** fsIoReport({top?=20, reset?, sort?}) — the session-wide read census (vfsIoCensus).
+     *
+     *  This is the BOOT instrument: `ioReport` only counts when a streamed SabIoSource is
+     *  armed, and the frame profiler only accumulates once frames run — so the phase that
+     *  is almost entirely file I/O had no numbers at all.
+     *
+     *  `arms` partitions the reads the sync ladder answered; `asyncFallbacks` is the count
+     *  it could NOT, each of which parks the guest thread. `asyncMs` is measured around the
+     *  queued promise, so it includes waiting behind another read on the same handle — but
+     *  still EXCLUDES the dispatcher's park/resume, so an async read costs more than it says.
+     *
+     *  `armsSumOk` is the cross-check: the arms plus asyncFallbacks must equal `reads`, or
+     *  the ladder grew a branch that reports nothing and every rate below is understated.
+     */
+    svc.register("fsIoReport", (args) => {
+        const opts = (args[0] ?? {}) as { top?: number; reset?: boolean; sort?: string };
+        const c = vfsIoCensus;
+        const armsSum = c.hitHandleWindow + c.hitRomCache + c.hitRomRangeSync + c.hitOverlaySync;
+        const sortKey = opts.sort === "reads" ? "reads" : opts.sort === "bytes" ? "bytes"
+            : opts.sort === "opens" ? "opens" : "ms";
+        const rows = [...c.perPath.entries()]
+            .map(([path, v]) => ({ path, ...v, ms: +v.ms.toFixed(2), readsPerOpen: v.opens ? +(v.reads / v.opens).toFixed(2) : 0 }))
+            .sort((a, b) => (b as any)[sortKey] - (a as any)[sortKey])
+            .slice(0, opts.top ?? 20);
+        const out = {
+            /** With the census off every number below is 0 — which reads exactly like a boot
+             *  that did no I/O. A consumer must judge on this, not on the zeros. */
+            enabled: c.enabled,
+            reads: c.reads,
+            bytesMB: +(c.bytes / 1048576).toFixed(2),
+            /** Guest file opens. A re-open-per-asset archive reader is visible only here. */
+            opens: c.opens,
+            /** Reads that could not be classified tail/payload because the path had no
+             *  size. Non-zero ⇒ every row's tailReads is a LOWER bound, not a reading. */
+            tailUnsized: c.tailUnsized,
+            arms: {
+                hitHandleWindow: c.hitHandleWindow,
+                hitRomCache: c.hitRomCache,
+                hitRomRangeSync: c.hitRomRangeSync,
+                hitOverlaySync: c.hitOverlaySync,
+            },
+            asyncFallbacks: c.asyncFallbacks,
+            /** Reads the ladder served without naming an arm. MUST be 0 — see vfsIoCensus. */
+            armUnattributed: c.armUnattributed,
+            /** null with no reads: a cross-check over an empty census is vacuously true, and
+             *  `true` there is a PASS nobody measured. */
+            armsSumOk: c.reads === 0
+                ? null
+                : armsSum + c.asyncFallbacks + c.armUnattributed === c.reads && c.armUnattributed === 0,
+            asyncRate: c.reads ? +(c.asyncFallbacks / c.reads).toFixed(4) : 0,
+            syncMs: +c.syncMs.toFixed(1),
+            asyncMs: +c.asyncMs.toFixed(1),
+            asyncReads: c.asyncReads,
+            asyncBytesMB: +(c.asyncBytes / 1048576).toFixed(2),
+            msPerAsyncRead: c.asyncReads ? +(c.asyncMs / c.asyncReads).toFixed(3) : 0,
+            /** Per read ATTEMPT, not per served sync read: syncMs accumulates on every ladder
+             *  entry, including the ones that fall through to async. */
+            usPerReadAttempt: c.reads ? +((c.syncMs * 1000) / c.reads).toFixed(2) : 0,
+            /** §4.2 overlay warm. warmAttempted 0 with a nonzero skip reason says the
+             *  warm never ran and why; warmLanded far below warmAttempted says it ran
+             *  and lost the race. Either way the answer is not "it did nothing". */
+            warm: {
+                attempted: c.warmAttempted,
+                landed: c.warmLanded,
+                skippedHandle: c.warmSkippedHandle,
+                skippedEphemeral: c.warmSkippedEphemeral,
+                skippedCached: c.warmSkippedCached,
+                skippedNoFile: c.warmSkippedNoFile,
+                skippedWriter: c.warmSkippedWriter,
+                skippedCapacity: c.warmSkippedCapacity,
+            },
+            pathsTracked: c.perPath.size,
+            top: rows,
+        };
+        if (opts.reset) c.reset();
+        return out;
+    });
+
 }
