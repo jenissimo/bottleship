@@ -362,9 +362,9 @@ export function createCoreExports(ctx: MSSContext): Record<string, ThunkImplemen
 
     // ==================== 3D Audio Provider ====================
     // The fake provider opens successfully (M3D_NOERR). 3D sample handles are real
-    // and route through the audio worklet's 3D mixer (see mss32/sample.ts 3D block +
-    // mss32/spatial.ts listener SAB). Per-sample 3D ops (allocate/start/position/...)
-    // are defined in sample.ts and override the older stubs left below.
+    // and route through the audio worklet's 3D mixer: every per-sample 3D op
+    // (allocate/file/start/stop/status/position/...) lives in mss32/sample.ts, which
+    // owns the voice pool, alongside the listener SAB in mss32/spatial.ts.
     //
     // M3DRESULT: 0=M3D_NOERR (success), 1=M3D_NOT_ENABLED, 8=M3D_NOT_INIT.
     // Returning 0 is REQUIRED by titles with no 2D fallback (Blade of Darkness treats
@@ -375,55 +375,6 @@ export function createCoreExports(ctx: MSSContext): Record<string, ThunkImplemen
     };
 
     exports["_AIL_close_3D_provider@4"] = (ctxThunk, mem, args) => {
-        return 0;
-    };
-
-    exports["_AIL_allocate_3D_sample_handle@4"] = (ctxThunk, mem, args) => {
-        Logger.verbose(LogCategory.SYSTEM, `MSS32: _AIL_allocate_3D_sample_handle@4 prov=0x${args[0].toString(16)} -> 0 (NULL)`);
-        return 0;
-    };
-
-    exports["_AIL_release_3D_sample_handle@4"] = (ctxThunk, mem, args) => {
-        return 0;
-    };
-
-    exports["_AIL_set_3D_sample_file@8"] = (ctxThunk, mem, args) => {
-        return 0;
-    };
-
-    exports["_AIL_start_3D_sample@4"] = (ctxThunk, mem, args) => {
-        return 0;
-    };
-
-    exports["_AIL_stop_3D_sample@4"] = (ctxThunk, mem, args) => {
-        return 0;
-    };
-
-    exports["_AIL_set_3D_position@16"] = (ctxThunk, mem, args) => {
-        return 0;
-    };
-
-    exports["_AIL_set_3D_velocity@20"] = (ctxThunk, mem, args) => {
-        return 0;
-    };
-
-    exports["_AIL_set_3D_velocity_vector@16"] = (ctxThunk, mem, args) => {
-        return 0;
-    };
-
-    exports["_AIL_end_3D_sample@4"] = (ctxThunk, mem, args) => {
-        return 0;
-    };
-
-    exports["_AIL_set_3D_sample_volume@8"] = (ctxThunk, mem, args) => {
-        return 0;
-    };
-
-    exports["_AIL_set_3D_sample_distances@12"] = (ctxThunk, mem, args) => {
-        return 0;
-    };
-
-    exports["_AIL_3D_sample_volume@4"] = (ctxThunk, mem, args) => {
         return 0;
     };
 
@@ -533,36 +484,6 @@ export function createCoreExports(ctx: MSSContext): Record<string, ThunkImplemen
     // _AIL_set_3D_provider_preference@12(prov, name, value)
     exports["_AIL_set_3D_provider_preference@12"] = (ctxThunk, mem, args) => {
         return 0;
-    };
-
-    // _AIL_set_3D_orientation@28(obj, X_face, Y_face, Z_face, X_up, Y_up, Z_up)
-    exports["_AIL_set_3D_orientation@28"] = (ctxThunk, mem, args) => {
-        return 0;
-    };
-
-    // _AIL_set_3D_sample_playback_rate@8(sample, rate)
-    exports["_AIL_set_3D_sample_playback_rate@8"] = (ctxThunk, mem, args) => {
-        return 0;
-    };
-
-    // _AIL_set_3D_sample_effects_level@8(sample, level)
-    exports["_AIL_set_3D_sample_effects_level@8"] = (ctxThunk, mem, args) => {
-        return 0;
-    };
-
-    // _AIL_resume_3D_sample@4(sample)
-    exports["_AIL_resume_3D_sample@4"] = (ctxThunk, mem, args) => {
-        return 0;
-    };
-
-    // _AIL_set_3D_sample_loop_count@8(sample, count)
-    exports["_AIL_set_3D_sample_loop_count@8"] = (ctxThunk, mem, args) => {
-        return 0;
-    };
-
-    // _AIL_3D_sample_status@4(sample) → 2 (SMP_DONE)
-    exports["_AIL_3D_sample_status@4"] = (ctxThunk, mem, args) => {
-        return 2;
     };
 
     // ==================== RIB / Processor Chain Stubs ====================

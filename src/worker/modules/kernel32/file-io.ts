@@ -2333,13 +2333,6 @@ const fileIoModule = (() => {
         return 1; // TRUE
     };
 
-    exports['SetHandleCount'] = (ctx, mem, args) => {
-        const uNumber = args[0];
-        Logger.log(LogCategory.KERNEL32, `SetHandleCount called: uNumber=${uNumber}`);
-        // Legacy function, return default handle count
-        return 512;
-    };
-
     // PeekNamedPipe - peeks at data available in a named pipe
     exports['PeekNamedPipe'] = (ctx, mem, args) => {
         const hNamedPipe = args[0];

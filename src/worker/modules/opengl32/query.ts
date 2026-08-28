@@ -310,10 +310,6 @@ export function createQueryExports(ctx: OpenGLContext): Record<string, ThunkImpl
         return ctx.textures.has(args[0] >>> 0) ? GL_TRUE : GL_FALSE;
     };
 
-    exports['glIsList'] = (_ctx, _mem, args): number => {
-        return ctx.displayLists.has(args[0] >>> 0) ? GL_TRUE : GL_FALSE;
-    };
-
     exports['glIsEnabled'] = (_ctx, _mem, args): number => {
         return ctx.enableFlags.has(args[0] >>> 0) ? GL_TRUE : GL_FALSE;
     };

@@ -8,8 +8,9 @@ import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 
 import { createFactoryExports } from './factory';
 import { createDeviceExports } from './device';
-import { createStateExports } from './state';
+import { createStateExports, createComTripleStubs } from './state';
 import { createResourcesExports } from './resources';
+import { assignStubsOnce } from '../../core/thunking/stub-merge';
 import { registerFastPathD3D8Functions } from './fast-path';
 import { resetD3D8SharedState } from './shared-state';
 
@@ -22,6 +23,7 @@ export class D3D8 implements IModule {
         Object.assign(this.exports, createDeviceExports());
         Object.assign(this.exports, createStateExports());
         Object.assign(this.exports, createResourcesExports());
+        assignStubsOnce(this.exports, createComTripleStubs(), 'd3d8 COM triple');
 
         // Move the hot device setters + draws off the OUT-trap slow path (see fast-path.ts).
         registerFastPathD3D8Functions(process.dispatcher);

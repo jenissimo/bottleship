@@ -573,15 +573,6 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         }
     };
 
-    // GetActiveWindow - return handle of the active window (NULL if none)
-    exports['GetActiveWindow'] = () => {
-        return System.getInstance().windowManager.getActiveHwnd();
-    };
-
-    exports['GetForegroundWindow'] = () => {
-        return System.getInstance().windowManager.getActiveHwnd();
-    };
-
     // BOOL AttachThreadInput(DWORD idAttach, DWORD idAttachTo, BOOL fAttach)
     // Attaches/detaches one thread's input-processing mechanism to another's,
     // making them share a single input queue (focus/active/capture/key state).
@@ -877,13 +868,6 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
             off += 2;
         }
         return lpStr;
-    };
-
-    // GetLastActivePopup - return last active popup for the given window (minimal: return hwnd or NULL)
-    exports['GetLastActivePopup'] = (ctx, mem, args) => {
-        const hWnd = args[0];
-        Logger.verbose(LogCategory.USER32, `GetLastActivePopup(0x${hWnd.toString(16)})`);
-        return { value: hWnd || 0, stackCleanup: 4 };
     };
 
     // ReleaseCapture - release mouse capture

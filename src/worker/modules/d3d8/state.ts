@@ -141,6 +141,54 @@ export function readD3DLight8(view: DataView, pLight: number): D3DLight7Data {
  *  makes sure the FIRST occurrence is loud instead of the guest just asserting cold. */
 let loggedViewportOverflow = false;
 
+/**
+ * The generic COM triple (QueryInterface/AddRef/Release) for every D3D8 interface.
+ *
+ * Merged with `assignStubsOnce` so a resource that owns its own lifetime — a texture whose
+ * Release must free its storage, a sub-surface whose refcount lives on the parent texture —
+ * wins regardless of merge order. As a plain `Object.assign` this loop silently replaced
+ * four of those with the generic pair whenever it happened to be merged last.
+ */
+export function createComTripleStubs(): Record<string, ThunkImplementation> {
+    const exports: Record<string, ThunkImplementation> = {};
+
+    // COM stubs for all D3D8 interfaces
+    const comPrefixes = [
+        'IDirect3D8', 'IDirect3DDevice8',
+        'IDirect3DTexture8', 'IDirect3DSurface8',
+        'IDirect3DVertexBuffer8', 'IDirect3DIndexBuffer8',
+    ];
+
+    for (const prefix of comPrefixes) {
+        // QueryInterface MUST write the interface pointer into *ppvObject (out-param) and AddRef.
+        // Returning S_OK without writing it left the caller with a garbage pointer it then derefs.
+        // Our D3D8 interfaces are a single fat object, so every accepted IID maps back to `this`.
+        exports[`${prefix}_QueryInterface`] = (_ctx, mem, args) => {
+            const thisPtr = args[0] >>> 0;
+            const ppvObject = args[2] >>> 0;
+            if (ppvObject && isValidAddress(mem, ppvObject, 4)) {
+                Mem.writeUint32(ppvObject, thisPtr);
+                addComRef(thisPtr);
+            }
+            return D3D_OK;
+        };
+        exports[`${prefix}_AddRef`] = (_ctx, _mem, args) => {
+            const refCount = addComRef(args[0]);
+            return refCount ?? 2;
+        };
+        exports[`${prefix}_Release`] = (_ctx, _mem, args) => {
+            const ptr = args[0] >>> 0;
+            const refCount = releaseComRef(ptr);
+            // Final Release of a device: its cursor dies with it (wined3d_device_uninit_3d
+            // drops cursor_texture), so the host must stop being told to draw it.
+            if (refCount === 0 && devices.has(ptr)) releaseDeviceCursor(ptr);
+            return refCount ?? 1;
+        };
+    }
+
+    return exports;
+}
+
 export function createStateExports(): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
 
@@ -1056,40 +1104,6 @@ export function createStateExports(): Record<string, ThunkImplementation> {
     exports['IDirect3DDevice8_DrawRectPatch'] = () => D3D_OK;
     exports['IDirect3DDevice8_DrawTriPatch'] = () => D3D_OK;
     exports['IDirect3DDevice8_DeletePatch'] = () => D3D_OK;
-
-    // COM stubs for all D3D8 interfaces
-    const comPrefixes = [
-        'IDirect3D8', 'IDirect3DDevice8',
-        'IDirect3DTexture8', 'IDirect3DSurface8',
-        'IDirect3DVertexBuffer8', 'IDirect3DIndexBuffer8',
-    ];
-
-    for (const prefix of comPrefixes) {
-        // QueryInterface MUST write the interface pointer into *ppvObject (out-param) and AddRef.
-        // Returning S_OK without writing it left the caller with a garbage pointer it then derefs.
-        // Our D3D8 interfaces are a single fat object, so every accepted IID maps back to `this`.
-        exports[`${prefix}_QueryInterface`] = (_ctx, mem, args) => {
-            const thisPtr = args[0] >>> 0;
-            const ppvObject = args[2] >>> 0;
-            if (ppvObject && isValidAddress(mem, ppvObject, 4)) {
-                Mem.writeUint32(ppvObject, thisPtr);
-                addComRef(thisPtr);
-            }
-            return D3D_OK;
-        };
-        exports[`${prefix}_AddRef`] = (_ctx, _mem, args) => {
-            const refCount = addComRef(args[0]);
-            return refCount ?? 2;
-        };
-        exports[`${prefix}_Release`] = (_ctx, _mem, args) => {
-            const ptr = args[0] >>> 0;
-            const refCount = releaseComRef(ptr);
-            // Final Release of a device: its cursor dies with it (wined3d_device_uninit_3d
-            // drops cursor_texture), so the host must stop being told to draw it.
-            if (refCount === 0 && devices.has(ptr)) releaseDeviceCursor(ptr);
-            return refCount ?? 1;
-        };
-    }
 
     return exports;
 }

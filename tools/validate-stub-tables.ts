@@ -45,8 +45,14 @@ const rel = (f: string) => relative(ROOT, f).split("/").join(sep);
  */
 const ACC = String.raw`(?:this\.)?[A-Za-z_$][\w$]*`;
 
-/** `<acc>["Interface_Method"] = ` — a literal registration. */
-const LITERAL_KEY = new RegExp(String.raw`\b${ACC}\[\s*["']([A-Za-z_][A-Za-z0-9_]*)["']\s*\]\s*=`, "g");
+/**
+ * `<acc>["Interface_Method"] = ` — a literal registration.
+ *
+ * The trailing `@N` is part of the key: a whole DLL surface can be decorated stdcall
+ * (`_AIL_start_3D_sample@4`), and a charset that stopped at the `@` matched none of it —
+ * mss32's ~300 exports were invisible to both halves of this check.
+ */
+const LITERAL_KEY = new RegExp(String.raw`\b${ACC}\[\s*["']([A-Za-z_][A-Za-z0-9_]*(?:@\d+)?)["']\s*\]\s*=`, "g");
 /** `const someNames = [ "A", "B", … ]` — the name array a registration loop iterates. */
 const NAME_ARRAY = /\bconst\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=]+)?=\s*\[([^\]]*)\]/g;
 /** `for (const method of someNames)` — binds the loop variable to that array. */
@@ -68,24 +74,38 @@ interface Site { key: string; file: string; line: number; }
 
 const allFiles = [...walk(MODULES)];
 
-/** Which generated index each FACTORY file feeds. Used ONLY to scope the duplicate-ownership
- * check below: the merge boundary is the index, so the same method name in another DLL is not
- * a collision. It must never gate the SHADOWING check — a real handler is real whether or not
- * its file is the one the index imports a `create*Exports` from (most modules register through
- * helper files), and scoping that half made every kernel32/user32/ddraw handler invisible. */
+/** Which MERGE SITE each FACTORY file feeds. Used ONLY to scope the duplicate-ownership
+ * check below: the merge boundary is the file that `Object.assign`s the factories together,
+ * so the same method name in another DLL is not a collision. It must never gate the
+ * SHADOWING check — a real handler is real whether or not its file is the one the merge site
+ * imports a `create*Exports` from (most modules register through helper files), and scoping
+ * that half made every kernel32/user32/ddraw handler invisible.
+ *
+ * A merge site is ANY file that pulls factories in over a relative import — not only a
+ * generated index. Most hand-composed module entries (mss32, user32, ddraw, d3d8, …) carry
+ * no generated header, and requiring one left 15 of 17 merge sites unscoped: mss32's core.ts
+ * and sample.ts both registered the same five `_AIL_*_3D_sample_*` keys, with which one the
+ * guest reaches decided purely by `Object.assign` order. */
 const factoryScopesByFile = new Map<string, string[]>();
+/** `<scope>|<factory file>` for a factory the scope merges through `assignStubsOnce`. */
+const stubMergedInScope = new Set<string>();
 for (const indexFile of allFiles) {
     const indexText = readFileSync(indexFile, "utf8");
-    if (!indexText.includes("Auto-generated index for")) continue;
     const scope = rel(indexFile);
+    /** Identifiers this file hands to assignStubsOnce — the order-independent merge. */
+    const stubMergedNames = new Set(
+        [...indexText.matchAll(/assignStubsOnce\s*\(\s*[^,]+,\s*([A-Za-z_$][\w$]*)/g)].map((m) => m[1]!),
+    );
     for (const match of indexText.matchAll(
-        /import\s+\{[^}]*\b(?:create[A-Za-z0-9_]+Exports|exports)\b[^}]*\}\s+from\s+["']([^"']+)["']/g,
+        /import\s+\{([^}]*\b(?:create[A-Za-z0-9_]+Exports|exports)\b[^}]*)\}\s+from\s+["']([^"']+)["']/g,
     )) {
-        const importPath = match[1]!;
+        const importPath = match[2]!;
         if (!importPath.startsWith(".")) continue;
         const base = join(indexFile, "..", importPath);
         const source = base.endsWith(".ts") ? base : `${base}.ts`;
         if (!existsSync(source)) continue;
+        const imported = match[1]!.split(",").map((n) => n.trim().split(/\s+as\s+/).pop()!.trim());
+        if (imported.some((n) => stubMergedNames.has(n))) stubMergedInScope.add(`${scope}|${rel(source)}`);
         const scopes = factoryScopesByFile.get(source) ?? [];
         scopes.push(scope);
         factoryScopesByFile.set(source, scopes);
@@ -173,7 +193,11 @@ for (const stub of stubSites) {
 const duplicateFactories: string[] = [];
 for (const [scope, sites] of realSitesByScope) {
     for (const [key, registrations] of sites) {
-        const files = new Set(registrations.map(site => site.file));
+        // A factory the scope merges via `assignStubsOnce` cannot shadow anybody: the winner
+        // is decided by the mechanism, not by `Object.assign` order. Only registrations whose
+        // precedence IS the merge order can collide.
+        const ordered = registrations.filter((site) => !stubMergedInScope.has(`${scope}|${site.file}`));
+        const files = new Set(ordered.map(site => site.file));
         if (files.size < 2) continue;
         duplicateFactories.push(
             `${key} (${scope})\n${registrations.map(site => `    registered at ${site.file}:${site.line}`).join("\n")}`,
