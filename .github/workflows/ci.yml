@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    # This repo's default branch is `main` and work lands on `develop`; there is no `master`,
+    # so the push job used to never run.
+    branches: [main, develop]
   pull_request:
   workflow_dispatch:
 
@@ -12,9 +14,13 @@ concurrency:
 
 jobs:
   quality-gate:
-    name: Quality gate (index / signatures / struct-offsets / typecheck / tests)
+    name: Quality gate (bun run gate)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
+    env:
+      # Pinned so a naga release cannot change what CI validates without a commit, and so the
+      # cache key below is meaningful.
+      NAGA_VERSION: "30.0.1"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -29,21 +35,23 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      # The canonical quality gate, in its mandatory order (CLAUDE.md §4).
-      - name: Generate module indexes
-        run: bun tools/generate-index.ts
+      - name: Cache offline WGSL validator
+        id: naga-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/naga
+          key: naga-cli-${{ env.NAGA_VERSION }}-${{ runner.os }}
 
-      - name: Validate API signatures
-        run: bun tools/validate-signatures.ts
+      - name: Install offline WGSL validator
+        if: steps.naga-cache.outputs.cache-hit != 'true'
+        run: cargo install naga-cli --locked --version ${{ env.NAGA_VERSION }}
 
-      - name: Validate struct offsets
-        run: bun tools/validate-struct-offsets.ts
-
-      - name: Typecheck
-        run: bun run typecheck
-
-      - name: Unit tests
-        run: bun test
+      # THE canonical quality gate (CLAUDE.md §4) — the whole ordered list, not a subset.
+      # Running the `gate` script rather than re-listing the steps is what keeps this file
+      # from drifting away from the definition it claims to run; the gate itself sets
+      # BS_REQUIRE_WGSL_VALIDATOR for the validator report and the test suite.
+      - name: Quality gate
+        run: bun run gate
 
   dedup-scan:
     name: Dedup / dead-export scan (advisory)

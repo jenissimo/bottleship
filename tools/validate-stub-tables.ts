@@ -21,7 +21,7 @@
  * Usage: bun tools/validate-stub-tables.ts
  */
 
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 
 const ROOT = join(import.meta.dir, "..");
@@ -66,8 +66,35 @@ function blockAfter(text: string, from: number): string {
 
 interface Site { key: string; file: string; line: number; }
 
+const allFiles = [...walk(MODULES)];
+
+/** Which generated index each FACTORY file feeds. Used ONLY to scope the duplicate-ownership
+ * check below: the merge boundary is the index, so the same method name in another DLL is not
+ * a collision. It must never gate the SHADOWING check — a real handler is real whether or not
+ * its file is the one the index imports a `create*Exports` from (most modules register through
+ * helper files), and scoping that half made every kernel32/user32/ddraw handler invisible. */
+const factoryScopesByFile = new Map<string, string[]>();
+for (const indexFile of allFiles) {
+    const indexText = readFileSync(indexFile, "utf8");
+    if (!indexText.includes("Auto-generated index for")) continue;
+    const scope = rel(indexFile);
+    for (const match of indexText.matchAll(
+        /import\s+\{[^}]*\b(?:create[A-Za-z0-9_]+Exports|exports)\b[^}]*\}\s+from\s+["']([^"']+)["']/g,
+    )) {
+        const importPath = match[1]!;
+        if (!importPath.startsWith(".")) continue;
+        const base = join(indexFile, "..", importPath);
+        const source = base.endsWith(".ts") ? base : `${base}.ts`;
+        if (!existsSync(source)) continue;
+        const scopes = factoryScopesByFile.get(source) ?? [];
+        scopes.push(scope);
+        factoryScopesByFile.set(source, scopes);
+    }
+}
+
 const stubSites: Site[] = [];
-const realSites = new Map<string, Site>();
+const realSites = new Map<string, Site[]>();
+const realSitesByScope = new Map<string, Map<string, Site[]>>();
 
 const lineOf = (text: string, index: number) => text.slice(0, index).split(/\r?\n/).length;
 
@@ -104,7 +131,7 @@ function templatedKeys(text: string, file: string): Site[] {
     return out;
 }
 
-for (const file of walk(MODULES)) {
+for (const file of allFiles) {
     const text = readFileSync(file, "utf8");
     const isStubFile = /-stubs\.ts$/.test(file);
     const here = rel(file);
@@ -115,15 +142,27 @@ for (const file of walk(MODULES)) {
     sites.push(...templatedKeys(text, here));
 
     for (const site of sites) {
-        if (isStubFile) stubSites.push(site);
-        else if (!realSites.has(site.key)) realSites.set(site.key, site);
+        if (isStubFile) { stubSites.push(site); continue; }
+        const registrations = realSites.get(site.key) ?? [];
+        registrations.push(site);
+        realSites.set(site.key, registrations);
+        for (const scope of factoryScopesByFile.get(file) ?? []) {
+            let scopeSites = realSitesByScope.get(scope);
+            if (!scopeSites) {
+                scopeSites = new Map();
+                realSitesByScope.set(scope, scopeSites);
+            }
+            const scoped = scopeSites.get(site.key) ?? [];
+            scoped.push(site);
+            scopeSites.set(site.key, scoped);
+        }
     }
 }
 
 const violations: string[] = [];
 const seen = new Set<string>();
 for (const stub of stubSites) {
-    const real = realSites.get(stub.key);
+    const real = realSites.get(stub.key)?.[0];
     if (!real || seen.has(stub.key)) continue;
     seen.add(stub.key);
     violations.push(
@@ -131,14 +170,33 @@ for (const stub of stubSites) {
     );
 }
 
-if (violations.length > 0) {
-    console.error("Stub tables shadowing real implementations:\n");
-    for (const v of violations) console.error(`  ${v}\n`);
-    console.error(
-        `${violations.length} collision(s). Remove the name from the stub table — the real handler\n` +
-        "is the one the guest needs, and assignStubsOnce already drops the stub at runtime.\n",
-    );
+const duplicateFactories: string[] = [];
+for (const [scope, sites] of realSitesByScope) {
+    for (const [key, registrations] of sites) {
+        const files = new Set(registrations.map(site => site.file));
+        if (files.size < 2) continue;
+        duplicateFactories.push(
+            `${key} (${scope})\n${registrations.map(site => `    registered at ${site.file}:${site.line}`).join("\n")}`,
+        );
+    }
+}
+
+if (violations.length > 0 || duplicateFactories.length > 0) {
+    if (duplicateFactories.length > 0) {
+        console.error("Duplicate real registrations across module factories:\n");
+        for (const v of duplicateFactories) console.error(`  ${v}\n`);
+        console.error(`${duplicateFactories.length} duplicate factory registration(s). Keep one owner for each export key.\n`);
+    }
+    if (violations.length > 0) {
+        console.error("Stub tables shadowing real implementations:\n");
+        for (const v of violations) console.error(`  ${v}\n`);
+        console.error(
+            `${violations.length} collision(s). Remove the name from the stub table — the real handler\n` +
+            "is the one the guest needs, and assignStubsOnce already drops the stub at runtime.\n",
+        );
+    }
     process.exit(1);
 }
 
-console.log(`validate-stub-tables: OK (${stubSites.length} stub entries, ${realSites.size} implementations)`);
+const implementationCount = [...realSites.values()].reduce((total, sites) => total + sites.length, 0);
+console.log(`validate-stub-tables: OK (${stubSites.length} stub entries, ${implementationCount} implementations)`);

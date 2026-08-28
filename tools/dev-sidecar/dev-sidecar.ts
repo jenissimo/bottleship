@@ -1,6 +1,6 @@
 /**
  * BottleShip dev sidecar (:3001) — the local process that does the things the browser cannot,
- * for both the app and the agent harness. Four roles:
+ * for both the app and the agent harness. Five roles:
  *
  *  - **log archive** — the durable tier behind the in-worker ring (`log-hub.ts`): WS ingest,
  *    per-game rotation, size/age pruning. One archive per harness session (the page announces
@@ -9,6 +9,8 @@
  *    `logs/debug/` (a page cannot write to the repo). The client prefixes its session dir.
  *  - **bundle delivery** — `GET /wgb?path=…` with Range, deliberately NOT via the Vite dev
  *    server (see serveWgb below).
+ *  - **host tools** — `POST /tool/run`, how a guest that compiles its shaders by spawning
+ *    `fxc.exe` gets an answer on a dev box (see runHostTool). Opt-in via `BS_HOST_TOOLS`.
  *  - **liveness** — `/health`, one of the three services `harness up` probes, and `/stats`,
  *    which reports what the archive is actually doing (buffered, written, DROPPED).
  *
@@ -16,7 +18,7 @@
  * Load-test it with `tools/dev-sidecar/sidecar-loadtest.ts`.
  */
 
-import { appendFile, readdir, unlink, stat, mkdir, writeFile } from "node:fs/promises";
+import { appendFile, readdir, unlink, stat, mkdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { existsSync } from "node:fs";
 import { normalizeSession, sessionLogDir } from "../../src/harness/session";
@@ -481,6 +483,125 @@ async function serveWgb(req: Request, url: URL): Promise<Response> {
   return new Response(f, { status: 200, headers });
 }
 
+/**
+ * Host tools the guest may run (`POST /tool/run`) — the dev half of the shader oven.
+ *
+ * A 2004 engine that compiles its shaders by spawning `fxc.exe` mid-render gets an honest
+ * refusal from our CreateProcess: we have no x86 console host. But the dev box IS Windows,
+ * and the compiler is right there in the bundle. This route runs one of those tools on the
+ * host so the guest can populate its own on-disk shader cache once; the cache then ships in
+ * the bundle and no player ever needs this.
+ *
+ * Spawning a named executable on request is the most dangerous thing this process can do, so
+ * the tool set is EMPTY unless the dev names it: `BS_HOST_TOOLS="fxc=C:/…/fxc.exe;cgc=…"`.
+ * A key not in that map is refused; the request never supplies a path.
+ */
+const HOST_TOOLS: Map<string, string> = new Map(
+  (process.env.BS_HOST_TOOLS ?? "").split(";").flatMap((pair) => {
+    const eq = pair.indexOf("=");
+    if (eq <= 0) return [];
+    const key = pair.slice(0, eq).trim().toLowerCase();
+    const exe = pair.slice(eq + 1).trim();
+    return key && exe ? [[key, resolve(exe)] as [string, string]] : [];
+  }),
+);
+
+const TOOL_LIMITS = {
+  /** One shader source is a few KB; this bounds a runaway upload, not a real workload. */
+  MAX_INPUT_BYTES: 8 * 1024 * 1024,
+  MAX_OUTPUT_BYTES: 8 * 1024 * 1024,
+  TIMEOUT_MS: 30_000,
+} as const;
+
+interface ToolRunRequest {
+  tool: string;
+  args: string[];
+  /** Files the guest named on the command line, base64, keyed by the bare name the tool sees. */
+  files: Array<{ name: string; base64: string }>;
+}
+
+/**
+ * Run one allow-listed tool in a scratch directory seeded with the guest's input files, and
+ * return everything it PRODUCED there. Returning the directory diff rather than a declared
+ * output list keeps this tool-agnostic: the caller does not have to know that `/Fc` means
+ * "listing" or that a compiler drops a second file next to it.
+ */
+async function runHostTool(req: Request): Promise<Response> {
+  const cors = {
+    ...wgbHeaders(req),
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+  };
+  if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
+  const origin = req.headers.get("origin");
+  if (!origin || !DEV_ORIGINS.has(origin)) {
+    return new Response("forbidden origin", { status: 403, headers: cors });
+  }
+  if (HOST_TOOLS.size === 0) {
+    return Response.json({ ok: false, error: "no host tools configured (set BS_HOST_TOOLS)" },
+      { status: 403, headers: cors });
+  }
+
+  let body: ToolRunRequest;
+  try { body = await req.json() as ToolRunRequest; }
+  catch { return Response.json({ ok: false, error: "bad json" }, { status: 400, headers: cors }); }
+
+  const exe = HOST_TOOLS.get(String(body.tool ?? "").toLowerCase());
+  if (!exe) {
+    return Response.json({ ok: false, error: `tool '${body.tool}' is not allow-listed` },
+      { status: 403, headers: cors });
+  }
+  const args = Array.isArray(body.args) ? body.args.map(String) : [];
+  const unsafeArg = args.find((arg) =>
+    arg.includes("/") || arg.includes("\\") || arg.includes("..") || /[A-Za-z]:/.test(arg));
+  if (unsafeArg !== undefined) {
+    return Response.json({ ok: false, error: `path-bearing tool argument is not allowed: '${unsafeArg}'` },
+      { status: 400, headers: cors });
+  }
+  const files = Array.isArray(body.files) ? body.files : [];
+  const total = files.reduce((n, f) => n + (f.base64?.length ?? 0), 0);
+  if (total > TOOL_LIMITS.MAX_INPUT_BYTES) {
+    return Response.json({ ok: false, error: "inputs too large" }, { status: 413, headers: cors });
+  }
+
+  const dir = join(resolve(CONFIG.LOG_DIR), "host-tool", `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+  await mkdir(dir, { recursive: true });
+  try {
+    for (const f of files) {
+      const name = String(f.name ?? "");
+      // The tool runs with `dir` as its cwd, so a name with a separator would escape it.
+      if (!name || name.includes("/") || name.includes("\\") || name.includes("..")) {
+        return Response.json({ ok: false, error: `bad input name '${name}'` }, { status: 400, headers: cors });
+      }
+      await writeFile(join(dir, name), Buffer.from(String(f.base64 ?? ""), "base64"));
+    }
+    const before = new Set(await readdir(dir));
+
+    const proc = Bun.spawn([exe, ...args], { cwd: dir, stdout: "pipe", stderr: "pipe" });
+    const timer = setTimeout(() => proc.kill(), TOOL_LIMITS.TIMEOUT_MS);
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited,
+    ]);
+    clearTimeout(timer);
+
+    const outputs: Array<{ name: string; base64: string }> = [];
+    for (const name of await readdir(dir)) {
+      if (before.has(name)) continue;
+      const data = await Bun.file(join(dir, name)).arrayBuffer();
+      if (data.byteLength > TOOL_LIMITS.MAX_OUTPUT_BYTES) continue;
+      outputs.push({ name, base64: Buffer.from(data).toString("base64") });
+    }
+    console.log(`[TOOL] ${body.tool} ${args.join(" ")} -> exit=${exitCode} produced=${outputs.map(o => o.name).join(",") || "-"}`);
+    return Response.json({ ok: true, exitCode, stdout, stderr, outputs }, { headers: cors });
+  } catch (e) {
+    return Response.json({ ok: false, error: String((e as Error).message ?? e) }, { status: 500, headers: cors });
+  } finally {
+    // Tool inputs and outputs are transient; durable diagnostics belong in the response/log,
+    // not in one scratch directory per request.
+    await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
 /** Per-connection state: which session's archive this client's lines belong to
  *  (set by the `log_session` message the page sends on connect), plus the write budget. */
 interface SocketData { session: string; writes: number; windowStart: number }
@@ -519,6 +640,7 @@ const server = Bun.serve<SocketData>({
     }
     const url = new URL(req.url);
     if (url.pathname === "/wgb") return serveWgb(req, url);
+    if (url.pathname === "/tool/run") return runHostTool(req);
     if (url.pathname.endsWith("/stats")) {
       return new Response(JSON.stringify(archiveStats()), {
         headers: { ...wgbHeaders(req), "Content-Type": "application/json" },

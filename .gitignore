@@ -100,3 +100,8 @@ tools/aot/units/
 
 # Screenshots dropped in the repo root during investigation — they belong in logs/.
 /*.png
+
+# .NET build output of the native D3D9 parity probe — rebuilt with `dotnet build`
+# (tools/d3d9-parity/native-probe/README.md); obj/ also embeds this machine's paths.
+tools/d3d9-parity/native-probe/bin/
+tools/d3d9-parity/native-probe/obj/

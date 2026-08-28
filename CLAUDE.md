@@ -355,16 +355,50 @@ Quality Gate (mandatory order):
   2. bun tools/validate-signatures.ts
   3. bun tools/validate-struct-offsets.ts
   4. bun tools/validate-guest-code-writes.ts
-  5. bun tools/validate-stub-tables.ts
-  6. bun tools/validate-file-cursor.ts
-  7. bun tools/validate-jit-exports.ts   (checks the BUILT v86 artifact — skips cleanly if absent)
-  8. bun tools/validate-guest-pointer-guards.ts
-  9. bun tools/validate-guest-memory-borrow.ts   (raw guest-memory Proxy access confined to its owners)
- 10. bun tools/validate-guest-memory-views.ts    (no PLAIN guest view stored past the turn that derived it)
- 11. bun tools/validate-hypercall-abi.ts         (Rust/TS hypercall page offsets + handler ids agree)
- 12. bun run typecheck
+  5. bun tools/validate-stub-tables.ts   (a stub table shadowing a real handler; ALSO one export
+     key registered by two factories merged into the same generated index)
+  6. bun tools/validate-data-export-binding.ts   (one address per HLE export: `hleImageExportAddress`
+     stays private to the precedence owner, plus a pinned census of API-descriptor/registerDataExport
+     doubles)
+  7. bun tools/validate-d3d9-export-collisions.ts   (the hand-composed d3d9 tables: a resource
+     constructor has ONE owner, so merge order cannot pick the fallback)
+  8. bun tools/validate-unimplemented-returns.ts  (a declared export with no handler must answer
+     FAILURE — the default "zero" is SUCCESS under HRESULT/MMSYSERR/MCI/LSTATUS, so those
+     descriptors must carry onUnimplemented, and a makeFunc factory must spread its overrides)
+  9. bun tools/validate-file-cursor.ts
+ 10. bun tools/validate-jit-exports.ts   (checks the BUILT v86 artifact — skips cleanly if absent)
+ 11. bun tools/validate-guest-pointer-guards.ts   (ddraw + d3d9 HANDLER tables. It models
+     `Iface_Method: (ctx, mem, args) => …`; the d3d9 backend draw paths take guest pointers
+     too and are outside that model — a code-shape gap, not a scope one)
+ 12. bun tools/validate-guest-memory-borrow.ts   (raw guest-memory Proxy access confined to its owners)
+ 13. bun tools/validate-guest-memory-views.ts    (no PLAIN guest view stored past the turn that derived it)
+ 14. bun tools/validate-hypercall-abi.ts         (Rust/TS hypercall page offsets + handler ids agree)
+ 15. bun tools/validate-wgsl-calls.ts            (every call to a WGSL helper we wrote passes the
+     arity that helper declares — our shaders are template strings, invisible to the typechecker,
+     and one bad call blackens a whole pass)
+ 16. bun tools/validate-d3d9-arena-abi.ts        (LayoutIdx order/length matches arena.rs
+     LAYOUT_TABLE, and the arena exports in public/v86.wasm match the ones arena.rs declares —
+     missing AND stale extras, so a not-rebuilt artifact cannot silently disable the arena)
+ 17. bun tools/validate-d3d9-capability-contracts.ts   (the MSAA/float/volume contracts are measured
+     from the live device, not read off globalThis, and the probe is AWAITED as an unconditional
+     statement before the device is published)
+ 18. bun tools/d3d9-parity/validate-caps.ts      (`bun run validate-d3d9-caps` — the name no longer
+     predicts the path: the checked-in reference D3DCAPS9 blob AND the caps we answer with)
+ 19. bun tools/validate-snapshots.ts             (every toMatchSnapshot() has a TRACKED .snap: bun
+     writes a missing snapshot and exits 0, so without the file the assertion asserts nothing)
+ 20. bun run gate:d3d9-capture                   (differential native-D3D9 capture. `report:d3d9-capture`
+     is reporting-only and exits 0 for everything; this wrapper fails on an unreadable/invalid
+     capture and on any divergence NOT recorded in tools/d3d9-capture-expected.json — the
+     intentional ones of plan/dx9c-review-findings-2026-08-26.md §B2. Record a new intentional
+     one with `--update-baseline`)
+ 21. bun run report:d3d9-wgsl-validator          (with BS_REQUIRE_WGSL_VALIDATOR=1, so a missing
+     naga is an error instead of a silent skip)
+ 22. bun run typecheck
+ 23. bun test                                    (also with BS_REQUIRE_WGSL_VALIDATOR=1 — otherwise
+     every describe.skipIf in wgsl-smoke.test.ts vanishes and the suite is green without it)
 
-`bun run gate` runs all of it in order.
+`bun run gate` runs all of it in order — including the test suite as the final step. CI runs
+that same script, not a hand-copied subset (.github/workflows/ci.yml), so the two cannot drift.
 
 A validator that cannot fail is worse than no validator: it converts an unchecked invariant
 into a false assurance. When one of these passes, confirm it CAN fail — feed it the bypass it

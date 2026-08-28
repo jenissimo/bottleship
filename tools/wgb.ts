@@ -7,6 +7,7 @@
  *   bun tools/wgb.ts cat      <archive.wgb> <entry>                — print entry to stdout
  *   bun tools/wgb.ts extract  <archive.wgb> <entry> <output-path>  — extract entry to file
  *   bun tools/wgb.ts replace  <archive.wgb> <entry> <input-path>   — replace entry from file
+ *   bun tools/wgb.ts add-dir  <archive.wgb> <prefix> <local-dir>   — add/overwrite a tree in one rewrite
  *   bun tools/wgb.ts manifest <archive.wgb>                        — pretty-print manifest.json
  *   bun tools/wgb.ts set-manifest <archive.wgb> <manifest.json>    — replace manifest from file
  *   bun tools/wgb.ts patch-manifest <archive.wgb> <json-path> <value> — set a single JSON path
@@ -22,7 +23,7 @@
  * to unsigned integer" — a >2GB Buffer length overflow).
  */
 
-import { openSync, readSync, writeSync, closeSync, fstatSync, renameSync, unlinkSync } from "fs";
+import { openSync, readSync, writeSync, closeSync, fstatSync, renameSync, unlinkSync, readdirSync } from "fs";
 import { inflateRawSync } from "zlib";
 import {
     crc32, lfhFor, cdhFor, type OutEntry,
@@ -323,6 +324,40 @@ function cmdReplace(wgbPath: string, entryName: string, inputPath: string, outpu
     writeOverride(wgbPath, entryName, newData, outputPath);
 }
 
+/**
+ * Add every file under `localDir` to the archive as `<entryPrefix>/<relative path>`, in ONE
+ * rewrite. One-at-a-time `replace` would copy a multi-GB bundle once per file, which for a
+ * shader cache (hundreds of small entries) is the difference between minutes and hours.
+ * An entry that already exists is overwritten in place, so re-baking is idempotent.
+ */
+function cmdAddDir(wgbPath: string, entryPrefix: string, localDir: string) {
+    const prefix = entryPrefix.replace(/[/]+$/, "");
+    const files: { name: string; data: Buffer }[] = [];
+    const walk = (dir: string, rel: string) => {
+        for (const de of readdirSync(dir, { withFileTypes: true })) {
+            const child = `${dir}/${de.name}`;
+            const childRel = rel ? `${rel}/${de.name}` : de.name;
+            if (de.isDirectory()) { walk(child, childRel); continue; }
+            const fd = openSync(child, "r");
+            try { files.push({ name: `${prefix}/${childRel}`, data: readRange(fd, 0, fstatSync(fd).size) }); }
+            finally { closeSync(fd); }
+        }
+    };
+    walk(localDir, "");
+    if (files.length === 0) { console.error(`No files under ${localDir}`); process.exit(1); }
+
+    const tmp = `${wgbPath}.wgbtmp`;
+    const result = withArchive(wgbPath, (fd, _size, entries) => {
+        const byName = new Map(files.map(f => [f.name, f.data]));
+        const existing = new Set(entries.map(e => e.name));
+        const extra = files.filter(f => !existing.has(f.name));
+        return rebuildStreaming(fd, entries, tmp, (n) => byName.get(n) ?? null, extra);
+    });
+    renameSync(tmp, wgbPath);
+    const bytes = files.reduce((n, f) => n + f.data.length, 0);
+    console.log(`Added ${files.length} file(s) under ${prefix}/ (${bytes} bytes) -> ${wgbPath} [${result.entries} entries, ${result.bytes} bytes]`);
+}
+
 function cmdManifest(wgbPath: string) {
     withArchive(wgbPath, (fd, _size, entries) => {
         const entry = findEntry(entries, "manifest.json");
@@ -410,6 +445,7 @@ Usage:
   bun tools/wgb.ts cat           <archive.wgb> <entry>
   bun tools/wgb.ts extract       <archive.wgb> <entry> <output>
   bun tools/wgb.ts replace       <archive.wgb> <entry> <input> [output]
+  bun tools/wgb.ts add-dir       <archive.wgb> <entry-prefix> <local-dir>  — add/overwrite a whole tree in one rewrite
   bun tools/wgb.ts repack        <archive.wgb>                    — rewrite as Store-only (decompress Deflate entries)
   bun tools/wgb.ts manifest      <archive.wgb>
   bun tools/wgb.ts set-manifest  <archive.wgb> <manifest.json>
@@ -438,6 +474,10 @@ switch (cmd) {
     case "replace":
         if (!args[0] || !args[1] || !args[2]) { console.error("Usage: wgb.ts replace <archive> <entry> <input> [output]"); process.exit(1); }
         cmdReplace(args[0], args[1], args[2], args[3]);
+        break;
+    case "add-dir":
+        if (!args[0] || !args[1] || !args[2]) { console.error("Usage: wgb.ts add-dir <archive> <entry-prefix> <local-dir>"); process.exit(1); }
+        cmdAddDir(args[0], args[1], args[2]);
         break;
     case "repack":
         if (!args[0]) { console.error("Usage: wgb.ts repack <archive>"); process.exit(1); }

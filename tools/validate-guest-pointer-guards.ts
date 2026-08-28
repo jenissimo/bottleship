@@ -31,7 +31,15 @@ import { join, relative, sep } from "node:path";
 import * as ts from "typescript";
 
 const ROOT = join(import.meta.dir, "..");
-const SCOPE = join(ROOT, "src", "worker", "modules", "ddraw");
+/**
+ * Handler tables only — the shape this tool models is `Iface_Method: (ctx, mem, args) => …`.
+ * The d3d9 BACKEND draw paths take guest pointers too (DrawPrimitiveUP and friends) and are
+ * structurally outside that model; guarding those is a code-shape problem, not a scope one.
+ */
+const SCOPES = [
+    join(ROOT, "src", "worker", "modules", "ddraw"),
+    join(ROOT, "src", "worker", "modules", "d3d9"),
+];
 
 /** Anything that consults the region map, or an accessor that does it internally. */
 const VALIDATORS = [
@@ -83,16 +91,43 @@ function* walk(dir: string): Generator<string> {
     }
 }
 
-/** `exports["IFoo_Bar"] = <fn>` — the shape every thunk table uses. */
-function handlerName(node: ts.Node): string | null {
+type HandlerFn = ts.ArrowFunction | ts.FunctionExpression | ts.FunctionDeclaration;
+
+/**
+ * Every named function in the file, so a table entry may point at one instead of inlining
+ * it. `modules/d3d9/swapchain.ts` writes its whole table as `exports[...] = namedFn`, and
+ * a matcher that only accepts an inline function expression reports a clean file having
+ * looked at none of it.
+ */
+function namedFunctions(sf: ts.SourceFile): Map<string, HandlerFn> {
+    const fns = new Map<string, HandlerFn>();
+    const visit = (n: ts.Node) => {
+        if (ts.isFunctionDeclaration(n) && n.name && n.body) fns.set(n.name.text, n);
+        if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name) && n.initializer
+            && (ts.isArrowFunction(n.initializer) || ts.isFunctionExpression(n.initializer))) {
+            fns.set(n.name.text, n.initializer);
+        }
+        ts.forEachChild(n, visit);
+    };
+    visit(sf);
+    return fns;
+}
+
+/** `exports["IFoo_Bar"] = <fn | namedFn>` — the shape every thunk table uses. */
+function handlerEntry(node: ts.Node, named: Map<string, HandlerFn>): { name: string; fn: HandlerFn } | null {
     if (!ts.isBinaryExpression(node)) return null;
     if (node.operatorToken.kind !== ts.SyntaxKind.EqualsToken) return null;
     const lhs = node.left;
     if (!ts.isElementAccessExpression(lhs)) return null;
     if (!ts.isStringLiteral(lhs.argumentExpression)) return null;
-    const fn = node.right;
-    if (!ts.isArrowFunction(fn) && !ts.isFunctionExpression(fn)) return null;
-    return lhs.argumentExpression.text;
+    const rhs = node.right;
+    const name = lhs.argumentExpression.text;
+    if (ts.isArrowFunction(rhs) || ts.isFunctionExpression(rhs)) return { name, fn: rhs };
+    if (ts.isIdentifier(rhs)) {
+        const fn = named.get(rhs.text);
+        if (fn) return { name, fn };
+    }
+    return null;
 }
 
 /** Locals bound directly from `args[N]` — i.e. values the guest chose. */
@@ -130,11 +165,12 @@ function analyse(file: string, findings: Finding[]): void {
     const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
     const rel = relative(ROOT, file);
 
+    const named = namedFunctions(sf);
     const visitTop = (node: ts.Node) => {
-        const name = handlerName(node);
-        if (name) {
-            const fn = (node as ts.BinaryExpression).right as ts.ArrowFunction;
-            const body = fn.body;
+        const entry = handlerEntry(node, named);
+        if (entry) {
+            const { name, fn } = entry;
+            const body = fn.body!;
             const guestPtrs = guestPointerLocals(body);
             const memParam = fn.parameters[1] && ts.isIdentifier(fn.parameters[1].name)
                 ? fn.parameters[1].name.text : "mem";
@@ -189,10 +225,10 @@ function analyse(file: string, findings: Finding[]): void {
 }
 
 const findings: Finding[] = [];
-for (const file of walk(SCOPE)) analyse(file, findings);
+for (const scope of SCOPES) for (const file of walk(scope)) analyse(file, findings);
 
 if (findings.length === 0) {
-    console.log(`Guest-pointer guards OK — every ddraw handler that writes through a guest pointer validates it.`);
+    console.log(`Guest-pointer guards OK — every ddraw/d3d9 handler that writes through a guest pointer validates it.`);
     process.exit(0);
 }
 
