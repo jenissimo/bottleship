@@ -1928,9 +1928,11 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             // machinery the fast tier does not carry.
             const zeroMemory = (dwFlags & HEAP_ZERO_MEMORY_FLAG) !== 0;
             if (lpMem) {
-                let capacity = getSlabSizeForPtr(lpMem);
+                const slabCapacity = getSlabSizeForPtr(lpMem);
+                let capacity = slabCapacity;
                 if (capacity === undefined) capacity = process.memory.getSize(lpMem);
                 if (capacity !== undefined && dwBytes <= capacity) {
+                    if (zeroMemory) noteZeroGrowInPlace(dwBytes, capacity, slabCapacity !== undefined, ctx, mem);
                     heapWatch('realloc-inplace', ctx, mem, [lpMem], `size=${dwBytes} cap=${capacity}`);
                     Logger.verboseLazy(LogCategory.KERNEL32,
                         () => `HeapReAlloc in-place 0x${lpMem.toString(16)} (size=${dwBytes} <= cap=${capacity})`);
@@ -3396,6 +3398,63 @@ const virtualQueryFastPath: FastPathImplementation = (cpu, mem8, _mem32, view) =
     }
     return MBI_SIZE;
 };
+
+/**
+ * HeapReAlloc(HEAP_ZERO_MEMORY) satisfied WITHOUT moving the block.
+ *
+ * The caller is entitled to zeros over [previously requested size, dwBytes). No tier holds
+ * the previously REQUESTED size -- capacity is what the allocator handed out (a slab bin, or
+ * the request rounded up) -- so when the new size still fits, the block is returned unchanged
+ * and that window keeps the previous tenant's bytes.
+ *
+ * Fixing it means the guest-side slab allocator recording the request, which is a Rust and
+ * inline-stub change plus a wasm rebuild. This counts the case instead, because "how often
+ * does a title actually take it" is the number that decides whether to pay for that, and
+ * `slab` is the half that matters: a tracked allocation's window is at most the 8/16-byte
+ * rounding, while a slab bin's is up to the bin.
+ */
+const zeroGrowInPlace = {
+    slab: 0,
+    tracked: 0,
+    /** Largest request served this way, and the capacity behind it. */
+    maxBytes: 0,
+    maxCapacity: 0,
+    /** First caller seen, so a non-zero count can be traced back to real code. */
+    firstCaller: "" as string,
+};
+
+function noteZeroGrowInPlace(
+    dwBytes: number, capacity: number, fromSlab: boolean, ctx: X86Context, mem: Uint8Array,
+): void {
+    if (fromSlab) zeroGrowInPlace.slab++; else zeroGrowInPlace.tracked++;
+    if (dwBytes > zeroGrowInPlace.maxBytes) {
+        zeroGrowInPlace.maxBytes = dwBytes;
+        zeroGrowInPlace.maxCapacity = capacity;
+    }
+    if (!zeroGrowInPlace.firstCaller) {
+        zeroGrowInPlace.firstCaller = formatCallSite(ctx, mem, 4, [], []);
+    }
+}
+
+/** Harness: how often a zero-initialising realloc was served in place -- see zeroGrowInPlace. */
+export function heapZeroGrowStats(): Record<string, unknown> {
+    return {
+        slab: zeroGrowInPlace.slab,
+        tracked: zeroGrowInPlace.tracked,
+        total: zeroGrowInPlace.slab + zeroGrowInPlace.tracked,
+        maxBytes: zeroGrowInPlace.maxBytes,
+        maxCapacity: zeroGrowInPlace.maxCapacity,
+        firstCaller: zeroGrowInPlace.firstCaller,
+    };
+}
+
+export function resetHeapZeroGrowStats(): void {
+    zeroGrowInPlace.slab = 0;
+    zeroGrowInPlace.tracked = 0;
+    zeroGrowInPlace.maxBytes = 0;
+    zeroGrowInPlace.maxCapacity = 0;
+    zeroGrowInPlace.firstCaller = "";
+}
 
 /** Harness: did the fast tier actually serve the calls, and does the audit agree? */
 export function virtualQueryFastStats(): Record<string, unknown> {

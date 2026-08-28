@@ -19,6 +19,8 @@ import {
     heapReAllocFastPath,
     allocateHeapSlab,
     resetHeapSlab,
+    heapZeroGrowStats,
+    resetHeapZeroGrowStats,
 } from "../../src/worker/modules/kernel32/memory";
 
 const MEM_SIZE = 0x02000000;         // 32 MB
@@ -232,6 +234,34 @@ describe("HeapSize / HeapReAlloc fast path == slow path", () => {
         const ptr = slabBlock(0xD0000, 4); // 256-byte bin
         expect(fastReAlloc(0, ptr, 128)).toBe(ptr);
         expect(fastReAlloc(HEAP_ZERO_MEMORY, ptr, 128)).toBeNull();
+    });
+
+    test("a zeroing realloc kept in place is counted, with the slab window called out", () => {
+        // The one case neither tier can serve correctly: the block still fits, so it does
+        // not move, and the window the caller expects zeroed starts at a size nobody holds.
+        // Counting it is what decides whether recording the request in the slab header --
+        // a Rust and inline-stub change -- is worth paying for.
+        resetHeapZeroGrowStats();
+        expect(heapZeroGrowStats().total).toBe(0);
+
+        const slabPtr = slabBlock(0xD1000, 4);        // 256-byte bin
+        expect(slowReAlloc(HEAP_ZERO_MEMORY, slabPtr, 200)).toBe(slabPtr);
+        const tracked = (System.getInstance() as any).process.memory.alloc(256) as number;
+        expect(slowReAlloc(HEAP_ZERO_MEMORY, tracked, 200)).toBe(tracked);
+
+        const stats = heapZeroGrowStats();
+        expect(stats.slab).toBe(1);
+        expect(stats.tracked).toBe(1);
+        expect(stats.total).toBe(2);
+        expect(stats.maxBytes).toBe(200);
+        expect(stats.maxCapacity).toBe(256);
+
+        // A realloc that MOVES is the case the slow tier does zero, so it must not be
+        // counted here — otherwise the number stops meaning "we may have handed back stale
+        // bytes" and starts meaning "a zeroing realloc happened".
+        resetHeapZeroGrowStats();
+        expect(slowReAlloc(HEAP_ZERO_MEMORY, slabPtr, 4096)).not.toBe(slabPtr);
+        expect(heapZeroGrowStats().total).toBe(0);
     });
 
     test("the slow tier zeroes the grown tail when the block has to move", () => {

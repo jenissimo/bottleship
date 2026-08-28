@@ -11,7 +11,10 @@
  */
 
 import type { HarnessService } from "../service";
-import { slabReport, queryVirtualMemory, virtualQueryFastStats, resetVirtualQueryFastStats } from "../../modules/kernel32/memory";
+import {
+    slabReport, queryVirtualMemory, virtualQueryFastStats, resetVirtualQueryFastStats,
+    heapZeroGrowStats, resetHeapZeroGrowStats,
+} from "../../modules/kernel32/memory";
 import { getLocaleInlineStubs } from "../../modules/kernel32/locale-stubs";
 import { LOCALE_STUB_ANSWERED_OFF, LOCALE_STUB_BAIL_OFF, LOCALE_STUB_BAIL_REASONS } from "../../modules/kernel32/locale-data";
 import { getMbwcInlineStubs } from "../../modules/kernel32/mbwc-stubs";
@@ -159,6 +162,21 @@ export function registerHeapCommands(svc: HarnessService): void {
      *  occupancy, and the retired-generation history. `current.fallbacks` climbing
      *  means allocation has dropped to the JS thunk; `totalMB` near `totalCap` means
      *  it can never climb back out. */
+    /** heapZeroGrow({reset?}) — how often HeapReAlloc(HEAP_ZERO_MEMORY) was answered
+     *  WITHOUT moving the block, which is the one case no tier can serve correctly: the
+     *  window the caller expects zeroed starts at a size neither the slab nor the
+     *  allocation map records. `slab` is the half that matters (its window is up to the
+     *  bin; a tracked block's is the 8/16-byte rounding). A zero total over a real boot is
+     *  the evidence that recording the request in the slab header — a Rust and inline-stub
+     *  change plus a wasm rebuild — is not worth paying for; a non-zero one names its
+     *  first caller so the claim can be checked against real code. */
+    svc.register("heapZeroGrow", (args) => {
+        const opts = (args[0] ?? {}) as { reset?: boolean };
+        const stats = heapZeroGrowStats();
+        if (opts.reset) resetHeapZeroGrowStats();
+        return stats;
+    });
+
     svc.register("heapSlab", () => slabReport());
 
     /** heapSlabRates({ms?=2000}) — the same counters as deltas/sec over a wall-clock
