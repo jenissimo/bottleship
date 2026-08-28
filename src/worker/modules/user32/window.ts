@@ -27,7 +27,7 @@ import {
 } from './paint-region';
 import { WH_CBT, HCBT_CREATEWND, getHooksOfType } from './hooks';
 import { registerWindowDrawingExports, eraseWindowBackgroundWithClassBrush } from './window-drawing';
-import { registerWindowGeometryExports, removeWindowPlacement } from './window-geometry';
+import { registerWindowGeometryExports, removeWindowPlacement, clientSizeFromWindowSize } from './window-geometry';
 import { registerWindowQueryExports } from './window-query';
 import { registerWindowPropExports } from './window-props';
 import { GDIContext } from '../gdi32/context';
@@ -120,6 +120,23 @@ const SWP_NOSIZE_GEO = 0x0001;
  */
 export function controlIdFromCreateWindow(style: number, hMenu: number): number | undefined {
     return (style & 0x40000000) !== 0 ? hMenu >>> 0 : undefined;
+}
+
+/**
+ * CreateWindowEx is given the WINDOW size; WindowInfo.width/height is the CLIENT size
+ * (GetWindowInfo adds the frame back, SetWindowPos converts outer→client on every move).
+ * Storing the outer size makes GetClientRect answer with the frame included, so an app
+ * that AdjustWindowRect's an exact client area and then sizes its backbuffer and
+ * projection from GetClientRect renders rows that fall outside what is presented.
+ *
+ * hMenu is the menu handle only for a TOP-LEVEL window; on a WS_CHILD it is the control
+ * id, and a child has no frame to subtract at all.
+ */
+export function clientSizeFromCreateWindow(
+    style: number, exStyle: number, hMenu: number, width: number, height: number,
+): { width: number; height: number } {
+    if ((style & 0x40000000) !== 0) return { width, height };
+    return clientSizeFromWindowSize(style, exStyle, (hMenu >>> 0) !== 0, width, height);
 }
 
 const makeGeometryLParam = (lo: number, hi: number): number =>
@@ -842,9 +859,12 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
 
         // CW_USEDEFAULT / zero-size defaults are a top-level concept; a child control
         // keeps its requested size (games create 0-sized or tiny controls on purpose).
-        const size = (builtinDescr && isChildWindow)
+        const outerSize = (builtinDescr && isChildWindow)
             ? { width: Math.max(0, nWidth | 0), height: Math.max(0, nHeight | 0) }
             : resolveSize(nWidth, nHeight);
+
+        const size = clientSizeFromCreateWindow(
+            dwStyle, dwExStyle, hMenu, outerSize.width, outerSize.height);
 
         const resolvedClassName = typeof className === 'string'
             ? (builtinDescr?.name ?? className)

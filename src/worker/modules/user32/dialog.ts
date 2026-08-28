@@ -42,17 +42,8 @@ import {
     isCreateInProgress,
 } from './activation-messages';
 import { getSystemColorRef, COLOR_BTNFACE_INDEX } from './system';
-
-// Track active dialogs for EndDialog result capture
-const activeDialogs = new Map<number, {
-    hwnd: number;
-    dlgProc: number;
-    result: number;
-    closed: boolean;
-    teardownStarted?: boolean;
-    /** Owner we disabled for modality (Wine/NT); re-enabled on EndDialog. */
-    disabledOwner?: number;
-}>();
+// Active-dialog registry + modal-pump lifetime binding.
+import { activeDialogs, createPumpScheduler } from './modal-dialog-state';
 
 const SS_TYPEMASK = 0x001F;
 const SS_BITMAP = 0x000E;
@@ -937,11 +928,47 @@ function runModalDialog(
     };
 
     // -------------------------------------------------------------------------
-    // Pump step - called from setTimeout between x86 callbacks.
+    // Pump step - re-armed via schedulePump() between x86 callbacks.
     // Dequeues one dialog message and dispatches it (or yields for 8 ms if idle).
+    //
+    // The pump is bound to THIS process: its dispatches ride the suspended thunk
+    // frame above, which dies with the process. schedulePump is the only way it
+    // may re-arm, so a torn-down process cannot leave a pump firing into the next
+    // guest (pumpScheduler epoch), and a dead process stops it on the next step.
     // -------------------------------------------------------------------------
     let pumpIterations = 0;
     let pumpCompleteThunk: (_ret: number) => number | null;
+
+    const pumpScheduler = createPumpScheduler();
+    const schedulePump = (delayMs: number): void => pumpScheduler.schedule(pumpStep, delayMs);
+    /**
+     * The pump can no longer deliver messages. DialogBoxParam's caller is suspended in
+     * `frameId`, so this must still END the dialog rather than just stop: dropping the
+     * registry entry first would leave completeClosedDialog with no dialog to close and
+     * the guest thread parked at the spin loop for good. An abandoned modal answers
+     * IDCANCEL, and its teardown chain is what completes the frame — a non-null return
+     * means the chain finished without dispatching a guest callback, so nothing else
+     * will, and the frame is released instead of staying pinned.
+     */
+    const abandonPump = (why: string): void => {
+        if (!pumpScheduler.isLive()) return;
+        pumpScheduler.abandon();
+        Logger.error(LogCategory.USER32,
+            `${label}: abandoning modal pump for hwnd=0x${dialogHwnd.toString(16)} - ${why}`);
+        const dialog = activeDialogs.get(dialogHwnd);
+        if (!dialog) {
+            restoreOwnerActivation();
+            callbackManager.abandonSuspendedFrame(frameId);
+            return;
+        }
+        dialog.result = IDCANCEL;
+        dialog.closed = true;
+        if (completeClosedDialog('abandoned') !== null) {
+            callbackManager.abandonSuspendedFrame(frameId);
+        }
+    };
+    const MAX_PUMP_DISPATCH_FAILURES = 16;
+    let pumpDispatchFailures = 0;
 
     const dispatchPendingControlNotification = (): boolean => {
         const control = takePendingControlNotification();
@@ -971,6 +998,13 @@ function runModalDialog(
     };
 
     const pumpStep = (): void => {
+        if (system.isExiting) {
+            // The process this pump belongs to is gone; its suspended frame with it.
+            pumpScheduler.abandon();
+            Logger.log(LogCategory.USER32,
+                `${label}: process exiting, stopping modal pump for hwnd=0x${dialogHwnd.toString(16)}`);
+            return;
+        }
         pumpIterations++;
         const dialog = activeDialogs.get(dialogHwnd);
         if (!dialog || dialog.closed) {
@@ -994,7 +1028,7 @@ function runModalDialog(
                 Logger.warn(LogCategory.USER32,
                     `${label}: pumpStep #${pumpIterations} - no message (queue empty)`);
             }
-            setTimeout(pumpStep, 8);
+            schedulePump(8);
             return;
         }
 
@@ -1009,14 +1043,14 @@ function runModalDialog(
 
         if (message === WM_PAINT && targetInfo && !isEffectivelyVisible(targetInfo)) {
             validateWindow(hwnd, null);
-            setTimeout(pumpStep, 0);
+            schedulePump(0);
             return;
         }
 
         // --- IsDialogMessage equivalent: Tab / Enter-via-DEFID / Esc / arrows ---
         if (handleDialogKeyMessage(dialogHwnd, message, wParam)) {
             if (dispatchPendingControlNotification()) return;
-            setTimeout(pumpStep, 0);
+            schedulePump(0);
             return;
         }
 
@@ -1030,7 +1064,7 @@ function runModalDialog(
             const { x: dlgClientX, y: dlgClientY } = screenToDialogClient(dialogHwnd, screenX, screenY);
             if (dispatchSystemControlClick(label, dialogHwnd, message, wParam, screenX, screenY)) {
                 if (dispatchPendingControlNotification()) return;
-                setTimeout(pumpStep, 0);
+                schedulePump(0);
                 return;
             }
             if (message === WM_MOUSEMOVE) {
@@ -1041,7 +1075,7 @@ function runModalDialog(
                         const { x: ctrlX, y: ctrlY } = screenToWindowClient(hitControl.handle, screenX, screenY);
                         handleSystemControlMessage(hitControl, message, wParam, makeMouseLParam(ctrlX, ctrlY), mem8);
                     }
-                    setTimeout(pumpStep, 0);
+                    schedulePump(0);
                     return;
                 }
             }
@@ -1056,7 +1090,7 @@ function runModalDialog(
                     screenY,
                 );
             }
-            setTimeout(pumpStep, 0);
+            schedulePump(0);
             return;
         }
 
@@ -1066,7 +1100,7 @@ function runModalDialog(
             const { x: screenX, y: screenY } = clientLParamToScreen(hwnd, lParam);
             if (dispatchSystemControlClick(label, dialogHwnd, message, wParam, screenX, screenY)) {
                 if (dispatchPendingControlNotification()) return;
-                setTimeout(pumpStep, 0);
+                schedulePump(0);
                 return;
             }
         }
@@ -1093,7 +1127,7 @@ function runModalDialog(
                     }
                 }
             }
-            setTimeout(pumpStep, 0);
+            schedulePump(0);
             return;
         }
 
@@ -1122,19 +1156,31 @@ function runModalDialog(
                     frameId,
                 );
                 if (result.callbackId === 0) {
-                    Logger.warn(LogCategory.USER32,
-                        `${label}: invokeCallback returned callbackId=0! Pump will stall. Scheduling recovery.`);
-                    setTimeout(pumpStep, 0);
+                    // The dispatch could not be SET UP. The callback-nesting limit is a
+                    // transient one — the chain in flight unwinds and the next step gets
+                    // through — so it rides the same bounded counter as a throwing dispatch
+                    // rather than ending a dialog that is still perfectly alive.
+                    if (++pumpDispatchFailures >= MAX_PUMP_DISPATCH_FAILURES) {
+                        abandonPump(`${pumpDispatchFailures} consecutive dispatch set-up failures`);
+                        return;
+                    }
+                    schedulePump(0);
+                    return;
                 }
+                pumpDispatchFailures = 0;
             } catch (e) {
                 Logger.warn(LogCategory.USER32, `${label}: dispatch msg=0x${message.toString(16)} failed: ${e}`);
-                setTimeout(pumpStep, 0);
+                if (++pumpDispatchFailures >= MAX_PUMP_DISPATCH_FAILURES) {
+                    abandonPump(`${pumpDispatchFailures} consecutive dispatch failures`);
+                    return;
+                }
+                schedulePump(0);
             }
         } else {
             // Unknown target or no wndProc - continue pump
             Logger.verbose(LogCategory.USER32,
                 `${label}: No wndProc for hwnd=0x${hwnd.toString(16)} msg=0x${message.toString(16)}, skipping`);
-            setTimeout(pumpStep, 0);
+            schedulePump(0);
         }
     };
 
@@ -1152,7 +1198,7 @@ function runModalDialog(
         // Still open: schedule next poll iteration.
         Logger.log(LogCategory.USER32,
             `${label}: pumpCompleteThunk - callback returned 0x${_ret.toString(16)}, scheduling next pump`);
-        setTimeout(pumpStep, 0);
+        schedulePump(0);
         return null;
     };
 
@@ -1232,7 +1278,7 @@ function runModalDialog(
         // Start the async message pump (yields to JS event loop between callbacks).
         Logger.log(LogCategory.USER32,
             `${label}: WM_INITDIALOG complete, starting modal dialog pump for hwnd=0x${dialogHwnd.toString(16)}`);
-        setTimeout(pumpStep, 0);
+        schedulePump(0);
         return null;  // Keep frame alive while pump runs
     };
 

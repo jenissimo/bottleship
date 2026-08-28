@@ -18,6 +18,7 @@ import { getChildZOrder, resetUser32SharedState } from './shared-state';
 import { resetUser32Classes } from './class';
 import { resetDeviceNotifications } from './device-notify';
 import { resetHooks } from './hooks';
+import { resetDialogPumps } from './modal-dialog-state';
 import { resetOwnerDrawScratch } from './owner-draw';
 import { resetSystemCursorHandles } from './system-cursors';
 import { resetMenuState } from './menu';
@@ -56,6 +57,7 @@ export class User32 implements IModule {
         resetUser32Classes();
         resetOwnerDrawScratch();
         resetHooks();
+        resetDialogPumps();
         resetDeviceNotifications();
         resetMenuState();
         resetScrollState();

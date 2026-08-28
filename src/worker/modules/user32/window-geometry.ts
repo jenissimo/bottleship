@@ -162,7 +162,7 @@ function adjustWindowRectCore(mem: Uint8Array, lpRect: number, dwStyle: number, 
     return 1;
 }
 
-function getWindowFrameMetrics(dwStyle: number, dwExStyle: number, hasMenu: boolean): {
+export function getWindowFrameMetrics(dwStyle: number, dwExStyle: number, hasMenu: boolean): {
     padTop: number;
     padSide: number;
     padBottom: number;
@@ -203,6 +203,30 @@ function getWindowFrameMetrics(dwStyle: number, dwExStyle: number, hasMenu: bool
         padBottom,
         borderX: padSide,
         borderY: borderWidth + exBorder,
+    };
+}
+
+/**
+ * The client size inside a window of the given OUTER size — the exact inverse of what
+ * AdjustWindowRect adds, computed from the same frame metrics so the two cannot drift.
+ *
+ * CreateWindowEx is handed the outer size while WindowInfo.width/height is the client size
+ * (GetWindowInfo adds the frame back; SetWindowPos converts outer→client on every move), so
+ * this is the conversion that boundary owes. An app that does the correct thing — expand an
+ * exact client rect with AdjustWindowRect, create the window, then size its backbuffer and
+ * projection aspect from GetClientRect — must get back the client area it asked for.
+ */
+export function clientSizeFromWindowSize(
+    dwStyle: number,
+    dwExStyle: number,
+    hasMenu: boolean,
+    width: number,
+    height: number,
+): { width: number; height: number } {
+    const frame = getWindowFrameMetrics(dwStyle >>> 0, dwExStyle >>> 0, hasMenu);
+    return {
+        width: Math.max(1, width - frame.padSide * 2),
+        height: Math.max(1, height - frame.padTop - frame.padBottom),
     };
 }
 
