@@ -14,6 +14,8 @@ import { describe, it, expect } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { writeHeapSlabStubs } from '../../src/worker/modules/kernel32/heap-slab-stubs';
 import { writeCrtSlabStubs, writeGetcStub, writeCaseFoldStubs } from '../../src/worker/modules/crt-slab-stubs';
+import { writeLocaleStubs } from '../../src/worker/modules/kernel32/locale-stubs';
+import { writeMbwcStubs } from '../../src/worker/modules/kernel32/mbwc-stubs';
 import {
     writeShadowTrampoline,
     writeOwnerDisarmScalarTrampoline,
@@ -22,6 +24,7 @@ import {
 } from '../../src/worker/modules/d3d9/capture-trampolines';
 import type { ShadowTrampolineSpec } from '../../src/worker/modules/d3d9/capture-trampolines';
 import type { StubAllocator } from '../../src/worker/core/thunking/thunk-memory-manager';
+import { LOCALE_STUB_BAIL_REASONS } from '../../src/worker/modules/kernel32/locale-data';
 
 const PRINT = !!process.env.SNAPSHOT_PRINT;
 
@@ -105,6 +108,15 @@ const cases: Record<string, (ctx: Ctx) => Snapshot> = {
         const r = writeCaseFoldStubs(ctx.allocator, ctx.getMemory, LUT, LUT + 0x100);
         return { result: r, hashes: { region: sha(ctx.mem, r.regionBase, r.regionEnd) } };
     },
+    localeStubs: (ctx) => {
+        const r = writeLocaleStubs(ctx.allocator, ctx.getMemory, SLAB_CTL, TRAP_A);
+        return { result: r, hashes: { region: sha(ctx.mem, r.regionBase, r.regionEnd) } };
+    },
+    mbwcStubs: (ctx) => {
+        // cp 1252 with CP_OEMCP aliased in — the shape that emits BOTH extra compares.
+        const r = writeMbwcStubs(ctx.allocator, ctx.getMemory, SLAB_CTL, 1252, true, TRAP_A, TRAP_B);
+        return { result: r, hashes: { region: sha(ctx.mem, r.regionBase, r.regionEnd) } };
+    },
     shadowTrampolineSampler: (ctx) => {
         const r = writeShadowTrampoline(
             ctx.allocator, ctx.getMemory, RING_CTRL, RING_DATA, RING_CAP, OWNER_GLOBAL, SAMPLER_SPEC);
@@ -152,12 +164,40 @@ const EXPECTED: Record<string, Snapshot> = {
     crtSlabStubs: {"result":{"mallocStub":4096,"freeStub":4235,"regionBase":4096,"regionEnd":4608},"hashes":{"region":"de7b6017ea9cffbcc44163c6080690d0a9d212f9cc38f796c5936b412579fbaa"}},
     getcStub: {"result":{"getcStub":4096,"regionBase":4096,"regionEnd":4160},"hashes":{"region":"7164114dee4b9bf1cf713e04d53500a1cf0aa472b1aa6cdc1b8a3dfad854f2c0"}},
     caseFoldStubs: {"result":{"tolowerStub":4096,"toupperStub":4108,"regionBase":4096,"regionEnd":4128},"hashes":{"region":"361bd870014fab9f407fc15d3cfe66b4e9468a933f6d6ca6aae0640e20fb0946"}},
+    localeStubs: {"result":{"getLocaleInfoWStub":4096,"tableAddr":131072,"regionBase":4096,"regionEnd":4480},"hashes":{"region":"e95d8aa2c469c375bbaa8301d0727f91f1c40bb67eb48d98541cca811b745c6a"}},
+    mbwcStubs: {"result":{"mbToWcStub":4096,"wcToMbStub":4570,"tableAddr":131072,"codePage":1252,"regionBase":4096,"regionEnd":5632},"hashes":{"region":"60837cbfa0d2213d9d44b4db927a172c19ad782330c129662a1065054d51dc79"}},
     shadowTrampolineSampler: {"result":{"trampAddr":5136,"shadowBase":4100,"slotCount":256,"sentinel":2147483648,"skipCounterAddr":4096,"dataRegionBase":4096,"dataRegionEnd":5124,"codeRegionBase":5136,"codeRegionEnd":5392},"hashes":{"code":"741930ffcf73a40db8441fb9bb641dfbccba2b2c42557dcd7a699f5a89bd1b49","data":"496f0eda84c76c10945e95128f4f8b16a640633720f19ab135d044da70da04fc"}},
     shadowTrampolineRenderStateNoOwner: {"result":{"trampAddr":5136,"shadowBase":4100,"slotCount":256,"sentinel":2147483648,"skipCounterAddr":4096,"dataRegionBase":4096,"dataRegionEnd":5124,"codeRegionBase":5136,"codeRegionEnd":5392},"hashes":{"code":"7a68f74852f7dd022d3f1da86a9ff701adc75aecd71a88664f10eb1a70b42d49","data":"496f0eda84c76c10945e95128f4f8b16a640633720f19ab135d044da70da04fc"}},
     ownerDisarmScalarTrampoline: {"result":{"trampAddr":4096,"codeRegionBase":4096,"codeRegionEnd":4224},"hashes":{"code":"3872c71deed97fde2196b52379f1d1aa7abdf8847b81c6ffa488340c96ccc8c6"}},
     structCaptureTrampoline: {"result":{"trampAddr":4096,"codeRegionBase":4096,"codeRegionEnd":4320},"hashes":{"code":"5ce49653ab8f3fa8c1218565df2c2234c05169a2d00d54a57c64d1602f2fbbed"}},
     upDrawCaptureTrampoline: {"result":{"trampAddr":4096,"codeRegionBase":4096,"codeRegionEnd":4480},"hashes":{"code":"b4d6979e6cae69666eaacb40eb06265e73b17a766266b692442734350baf3642"}},
 };
+
+describe('an emitter that outgrows its region writes nothing outside it', () => {
+    // The region check used to run AFTER the overflowing bytes had landed, and pe-loader
+    // downgrades the throw to a warn — so the damage stayed in whatever THUNK_CODE follows.
+    // Forcing an overflow is the only way to see the difference: the locale stub emits one
+    // 9-byte landing pad per bail reason, so extra reasons grow it past its 384B region.
+    it('the GetLocaleInfoW stub refuses to emit past its region', () => {
+        const ctx = mkCtx();
+        const reasons = LOCALE_STUB_BAIL_REASONS as unknown as string[];
+        const added = 64;
+        for (let i = 0; i < added; i++) reasons.push(`overflowProbe${i}`);
+        try {
+            const base = 0x1000;
+            const REGION_SIZE = 384;   // writeLocaleStubs' own region
+            const tail = base + REGION_SIZE;
+            ctx.mem.fill(0xA5, tail, tail + 0x400);
+            expect(() => writeLocaleStubs(ctx.allocator, ctx.getMemory, SLAB_CTL, TRAP_A))
+                .toThrow(/emit past/);
+            for (let i = 0; i < 0x400; i++) {
+                expect(`+${i}:${ctx.mem[tail + i]}`).toBe(`+${i}:165`);
+            }
+        } finally {
+            reasons.length -= added;
+        }
+    });
+});
 
 describe('thunk stub emitters — byte-identity snapshots', () => {
     for (const [name, run] of Object.entries(cases)) {

@@ -2,7 +2,8 @@
 // Portably parses Win32 PE files and loads them into emulator memory
 
 import { ThunkGenerator } from './thunking/thunk-generator';
-import { hleImageExportAddress, markHleModuleLoaded } from './hle-module-images';
+import { markHleModuleLoaded } from './hle-module-images';
+import { hleExportBindingAddress } from './thunking/export-resolver';
 import { deriveStackCleanupFromMangledName } from './thunking/msvc-mangling';
 import { APIRegistry } from './api-registry';
 import { System } from './system';
@@ -22,6 +23,10 @@ import { installCw3220Stdio } from '../modules/cw3220/cw3220-stdio';
 import { writeHeapSlabStubs } from '../modules/kernel32/heap-slab-stubs';
 import { writeCrtSlabStubs, writeCaseFoldStubs } from '../modules/crt-slab-stubs';
 import { writeCrtMathStubs, type CrtMathStubs, type CrtMathStubName } from '../modules/crt-math-stubs';
+import { writeLocaleStubs, resetLocaleInlineStubs, type LocaleInlineStubs } from '../modules/kernel32/locale-stubs';
+import { serializeLocaleStubTable, writeLocaleStubDestLimit } from '../modules/kernel32/locale-data';
+import { writeMbwcStubs, resetMbwcInlineStubs, type MbwcInlineStubs } from '../modules/kernel32/mbwc-stubs';
+import { serializeMbwcStubTable, writeMbwcStubDestLimit } from '../modules/kernel32/codepage-lut';
 import { loadDiagnostics } from './diagnostics/load-diagnostics';
 import { writeGuestCode, invalidateGuestCode } from './memory/guest-code';
 
@@ -219,6 +224,18 @@ export class PELoader {
     private crtInlineStubs: { mallocStub: number; freeStub: number; regionBase: number; regionEnd: number } | null = null;
     private caseFoldInlineStubs: { tolowerStub: number; toupperStub: number; regionBase: number; regionEnd: number } | null = null;
 
+    /** Trap-free inline kernel32!GetLocaleInfoW. Emitted on the first kernel32 import;
+     *  see kernel32/locale-stubs writeLocaleStubs. */
+    private localeInlineStubs: LocaleInlineStubs | null = null;
+
+    /** Trap-free inline kernel32!MultiByteToWideChar + WideCharToMultiByte. Emitted on
+     *  the first kernel32 import; see kernel32/mbwc-stubs writeMbwcStubs. */
+    private mbwcInlineStubs: MbwcInlineStubs | null = null;
+    /** The stubs are not emittable for this bundle (multi-byte ANSI page, or the emitter
+     *  refused). Latched so the 128KB table build is attempted ONCE, not per kernel32
+     *  importer — every DLL in the process comes back through that import path. */
+    private mbwcStubsDeclined = false;
+
     /**
      * Cached addresses of the native x86 micro-thunks for the pure-compute CRT math
      * imports. Generated on the first CRT-module import; reused for later CRT modules'
@@ -290,6 +307,11 @@ export class PELoader {
         this.heapInlineStubs = null;
         this.crtInlineStubs = null;
         this.caseFoldInlineStubs = null;
+        this.localeInlineStubs = null;
+        resetLocaleInlineStubs();
+        this.mbwcInlineStubs = null;
+        this.mbwcStubsDeclined = false;
+        resetMbwcInlineStubs();
         this.mathInlineStubs = null;
     }
 
@@ -1446,6 +1468,78 @@ export class PELoader {
                     }
                 }
 
+                // One-time trap-free inline stub for kernel32!GetLocaleInfoW. The MSVC CRT
+                // rebuilds lconv on every setlocale(), so a title that switches locale per
+                // string compare issues millions of these; the JS fast path already answers
+                // them, and what is left to remove is the OUT trap. DEFAULT-ON; set
+                // window.__noLocaleStubs=true BEFORE loading a game for the A/B.
+                if (dllName === 'kernel32' && !this.localeInlineStubs
+                    && !(globalThis as { __noLocaleStubs?: boolean }).__noLocaleStubs) {
+                    const glinfoTrap = stubDll.exportTable.get('getlocaleinfow');
+                    try {
+                        const sys = System.getInstance();
+                        const tmm = sys.process?.thunkMemoryManager;
+                        if (tmm && glinfoTrap && sys.process?.memory) {
+                            // Serialised FROM the JS answer cache, so the two tiers cannot
+                            // disagree by construction (locale-data serializeLocaleStubTable).
+                            const table = serializeLocaleStubTable();
+                            const tableAddr = sys.process.memory.alloc(table.length, 'THUNK_DATA', 'rw');
+                            this.memory.set(table, tableAddr);
+                            writeLocaleStubDestLimit(this.memory, tableAddr, this.memory.length);
+                            this.localeInlineStubs = writeLocaleStubs(
+                                tmm.stubAllocator, this.getMemory, tableAddr, glinfoTrap);
+                        } else {
+                            Logger.warn(LogCategory.SYSTEM,
+                                `[PE] Inline locale stub skipped: tmm=${!!tmm} trap=${glinfoTrap ?? 0}`);
+                        }
+                    } catch (e) {
+                        Logger.warn(LogCategory.SYSTEM, `[PE] Inline locale stub unavailable: ${e}`);
+                    }
+                }
+
+                // One-time trap-free inline stubs for kernel32!MultiByteToWideChar and
+                // WideCharToMultiByte. The CRT converts ANSI<->UTF-16 around every
+                // locale-aware string operation, so the same titles that storm
+                // GetLocaleInfoW storm these; the JS fast paths already answer them, and
+                // what is left to remove is the OUT trap. DEFAULT-ON; set
+                // window.__noMbwcStubs=true BEFORE loading a game for the A/B.
+                if (dllName === 'kernel32' && !this.mbwcInlineStubs && !this.mbwcStubsDeclined
+                    && !(globalThis as { __noMbwcStubs?: boolean }).__noMbwcStubs) {
+                    const mbToWcTrap = stubDll.exportTable.get('multibytetowidechar');
+                    const wcToMbTrap = stubDll.exportTable.get('widechartomultibyte');
+                    try {
+                        const sys = System.getInstance();
+                        const tmm = sys.process?.thunkMemoryManager;
+                        if (tmm && mbToWcTrap && wcToMbTrap && sys.process?.memory) {
+                            // Serialised FROM the same LUTs locale.ts's fast paths index, so
+                            // the two tiers cannot translate a byte differently (codepage-lut).
+                            // Built INSIDE the guard: it is a 128KB allocation plus a 65536-entry
+                            // fill, and every DLL that imports kernel32 comes back through here.
+                            const table = serializeMbwcStubTable(this.memory.length);
+                            if (table) {
+                                const tableAddr = sys.process.memory.alloc(table.bytes.length, 'THUNK_DATA', 'rw');
+                                this.memory.set(table.bytes, tableAddr);
+                                writeMbwcStubDestLimit(this.memory, tableAddr, this.memory.length);
+                                this.mbwcInlineStubs = writeMbwcStubs(
+                                    tmm.stubAllocator, this.getMemory, tableAddr,
+                                    table.codePage, table.alsoOem, mbToWcTrap, wcToMbTrap);
+                            } else {
+                                // A multi-byte ANSI page has no 1:1 table to emit, and that is a
+                                // property of the bundle, not of this import — never retry it.
+                                this.mbwcStubsDeclined = true;
+                                Logger.warn(LogCategory.SYSTEM,
+                                    `[PE] Inline mbwc stubs skipped: multi-byte ANSI code page`);
+                            }
+                        } else {
+                            Logger.warn(LogCategory.SYSTEM,
+                                `[PE] Inline mbwc stubs skipped: tmm=${!!tmm} traps=${mbToWcTrap ?? 0}/${wcToMbTrap ?? 0}`);
+                        }
+                    } catch (e) {
+                        this.mbwcStubsDeclined = true;
+                        Logger.warn(LogCategory.SYSTEM, `[PE] Inline mbwc stubs unavailable: ${e}`);
+                    }
+                }
+
                 // One-time inline x86 stub generation for the msvcrt cdecl CRT
                 // allocator pair (malloc/operator new + free/operator delete). Rides
                 // the same WASM slab arena as the kernel32 heap stubs. Generated on the
@@ -1546,11 +1640,14 @@ export class PELoader {
                         // Wrappers the games in this era ship (ASI/mod loaders, ddraw and
                         // d3d shims) hook by scanning the IAT for the value GetProcAddress
                         // gave them, so a second address for one export makes them install
-                        // nothing at all — silently. Bind to the in-image body wherever the
-                        // HLE module has one; the arena stub stays the fallback for exports
-                        // no image could hold.
-                        const imageExport = hleImageExportAddress(dllName, funcKey);
-                        if (imageExport !== undefined && !(globalThis as any).__noImageIatBinding) stubAddress = imageExport;
+                        // nothing at all — silently. hleExportBindingAddress is the single
+                        // owner of that one address: the in-image body where the module has
+                        // one, a registered data export ahead of it, the arena stub as the
+                        // fallback.
+                        const bound = hleExportBindingAddress(
+                            this.thunkGenerator, dllName, funcKey,
+                            !(globalThis as { __noImageIatBinding?: boolean }).__noImageIatBinding);
+                        if (bound !== undefined) stubAddress = bound;
                         // The kernel32/CRT heap-slab fast path is DEFAULT-ON. The slab control block
                         // lives in guest RAM so it is reachable from guest code; RMW atomicity vs
                         // thread switch is covered by the non-preemptible stub region.
@@ -1564,6 +1661,21 @@ export class PELoader {
                         } else if (slabOn && this.crtInlineStubs && PELoader.CRT_SLAB_MODULES.has(dllName)) {
                             if (PELoader.CRT_MALLOC_KEYS.includes(funcKey)) stubAddress = this.crtInlineStubs.mallocStub;
                             else if (PELoader.CRT_FREE_KEYS.includes(funcKey)) stubAddress = this.crtInlineStubs.freeStub;
+                        }
+                        // Trap-free GetLocaleInfoW: answers inside guest code, bails to this
+                        // same trap stub for RETURN_NUMBER / unknown type / bad buffer.
+                        if (this.localeInlineStubs && dllName === 'kernel32'
+                            && funcKey === 'getlocaleinfow'
+                            && !(globalThis as { __noLocaleStubs?: boolean }).__noLocaleStubs) {
+                            stubAddress = this.localeInlineStubs.getLocaleInfoWStub;
+                        }
+                        // Trap-free ANSI<->UTF-16 conversion: answers inside guest code for
+                        // the ANSI code page, bails to this same trap stub for any other
+                        // page, any flag, a default char, or a buffer it cannot fill.
+                        if (this.mbwcInlineStubs && dllName === 'kernel32'
+                            && !(globalThis as { __noMbwcStubs?: boolean }).__noMbwcStubs) {
+                            if (funcKey === 'multibytetowidechar') stubAddress = this.mbwcInlineStubs.mbToWcStub;
+                            else if (funcKey === 'widechartomultibyte') stubAddress = this.mbwcInlineStubs.wcToMbStub;
                         }
                         // Trap-free tolower/toupper (any CRT module exporting them).
                         if (this.caseFoldInlineStubs && PELoader.CRT_SLAB_MODULES.has(dllName)) {
