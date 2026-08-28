@@ -12,6 +12,8 @@
 import { Mem } from "../core/memory/mem-accessor";
 import { fpuPush } from "../core/fpu-helper";
 import { TimeService } from "../runtime/time";
+import { System } from "../core/system";
+import { WAIT_BLOCKED_NO_SWITCH } from "../core/scheduler/types";
 import type { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 import type { Process } from "../core/process";
 
@@ -74,10 +76,22 @@ export function registerCrtTimeExports(exports: Record<string, ThunkImplementati
     // Must advance with guest virtual time (same source as GetTickCount).
     exports["clock"] = () => TimeService.getInstance().nowMs() | 0;
 
-    exports["_sleep"] = (_c, _m, a) => {
-        const seconds = (a[0] ?? 0) >>> 0;
-        if (seconds > 0) {
-            TimeService.getInstance().advanceVirtualTime(seconds * 1000);
+    // _sleep(duration) — the CRT's alias for Sleep, and its argument is MILLISECONDS
+    // (msvcrt.spec: `cdecl _sleep(long)`; the CRT maps 0 to 1 so it always yields).
+    // cdecl, so the caller pops the argument: the resume ESP pops the return address only.
+    exports["_sleep"] = (ctx, mem, a) => {
+        const ms = ((a[0] ?? 0) >>> 0) || 1;
+        const sched = System.getInstance().scheduler;
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const returnAddr = view.getUint32(ctx.esp, true);
+        const blocked = sched.sleepWithContext(
+            ms,
+            returnAddr,
+            ctx.esp + 4,
+            { ecx: ctx.ecx, edx: ctx.edx, ebx: ctx.ebx, ebp: ctx.ebp, esi: ctx.esi, edi: ctx.edi, eflags: ctx.eflags },
+        );
+        if (blocked === WAIT_BLOCKED_NO_SWITCH) {
+            return { value: 0, blockedNoSwitch: true };
         }
         return 0;
     };
