@@ -12,6 +12,13 @@ export const enum RenderCommandType {
     DrawIndexed = 5,
     BindProgrammable = 6,
     BindFfp = 7,
+    SetScissor = 8,
+    BeginOcclusionQuery = 9,
+    EndOcclusionQuery = 10,
+    TimestampQuery = 11,
+    SetStencilReference = 12,
+    SetBlendConstant = 13,
+    SetViewport = 14,
 }
 
 /** Per-draw fixed-function state: a snapshot of the FFP uniform block (the guest
@@ -31,8 +38,40 @@ export interface FfpDrawState {
 export type RenderClear = {
     color: GPUColor;
     depth: number;
+    stencil: number;
     flags: number;
 };
+
+/**
+ * Link between a WASM-arena draw and the already-resolved RenderFrame draw.
+ *
+ * The arena deliberately stores only compact numeric state.  GPU object identity,
+ * generation-safe buffer references, samplers and the complete programmable constant
+ * snapshot remain owned by RenderFrame.  This link lets the executor use the arena's
+ * pipeline identity/command arguments without reconstructing resources from stale store
+ * indices.
+ */
+export interface ArenaDrawBinding {
+    /** Index of the corresponding Draw/DrawIndexed command in this frame. */
+    frameDrawCommand: number;
+    /** Arena command index containing CMD_DRAW(_UP/_INDEXED[_UP]). */
+    arenaDrawCommand: number;
+    /** Compact arena pipeline bucket captured for diagnostics/identity selection. */
+    arenaPipelineKey: number;
+    /** Bump-arena offset of the corresponding CMD_SET_PIPELINE state capture. */
+    arenaStateOffset: number;
+    /** The exact 16-word identity written before recordDraw*. */
+    /** Captured arena ABI identity; typed as ArrayLike so Uint32Array is zero-copy. */
+    pipelineIdentity?: ArrayLike<number>;
+    /** Collision-safe canonical identity used by the executor's pipeline registry. */
+    pipelineIdentityKey?: string;
+    /** Real executor pipeline id resolved from the full canonical identity. */
+    pipelineId: number;
+    /** RenderFrame programmable state slot for this draw. */
+    bindStateIndex?: number;
+    /** Arena command kind; executor uses arena arguments only for non-UP rows. */
+    arenaCommandType: number;
+}
 
 /**
  * Per-draw uniform + texture snapshot for the programmable (VS/PS) path.
@@ -61,13 +100,23 @@ export interface ProgrammableDrawState {
     sampler: GPUSampler | null;
     /** Per-stage samplers for the programmable-VS / fixed-function-pixel hybrid path. */
     samplers: (GPUSampler | null)[];
+    /** D3DVERTEXTEXTURESAMPLER0..3 views, mapped from API stages 257..260. */
+    vertexTextures: (GPUTextureView | null)[];
+    /** Resolved sampler state for API stages 257..260. */
+    vertexSamplers: (GPUSampler | null)[];
     /** Bitmask of cube-sampler stages for this draw (matches the pipeline's bind-group layout). */
     cubeMask: number;
+    /** Bitmask of fragment stages bound as 3-D volume textures. */
+    volumeMask: number;
+    /** Bitmask of vertex-texture stages bound as 3-D volume textures. */
+    vertexVolumeMask: number;
+    /** Bitmask of depth-texture stages using sampler_comparison. */
+    comparisonMask: number;
 }
 
 export class RenderFrame {
     hasClear = false;
-    clear: RenderClear = { color: { r: 0, g: 0, b: 0, a: 1 }, depth: 1.0, flags: 0 };
+    clear: RenderClear = { color: { r: 0, g: 0, b: 0, a: 1 }, depth: 1.0, stencil: 0, flags: 0 };
 
     commandTypes: number[] = [];
     commandA: number[] = [];
@@ -95,9 +144,16 @@ export class RenderFrame {
     /** Pooled per-draw FFP state slots (same lifetime discipline as drawStates). */
     ffpStates: FfpDrawState[] = [];
     ffpStateCount = 0;
+    /** Arena links for programmable draws recorded in this frame. */
+    arenaDrawBindings: ArenaDrawBinding[] = [];
+    /** Flat x,y,width,height,minZ,maxZ per SetViewport command; commandA holds the base index. */
+    viewportData: number[] = [];
 
     reset(): void {
         this.hasClear = false;
+        // A clear descriptor belongs to the submitted frame; do not carry its plane mask into
+        // the next pooled RenderFrame.
+        this.clear.flags = 0;
         this.commandTypes.length = 0;
         this.commandA.length = 0;
         this.commandB.length = 0;
@@ -114,12 +170,20 @@ export class RenderFrame {
         // slots beyond drawStateCount are overwritten on reuse by nextDrawState's filler.
         this.drawStateCount = 0;
         this.ffpStateCount = 0;
+        this.arenaDrawBindings.length = 0;
+        this.viewportData.length = 0;
     }
 
-    setClear(color: GPUColor, depth: number, flags: number): void {
+    setClear(color: GPUColor, depth: number, stencil: number, flags: number): void {
         this.clear.color = color;
         this.clear.depth = depth;
-        this.clear.flags = flags;
+        this.clear.stencil = stencil >>> 0;
+        // A frame carries the clear for ONE submission. Do not merge this with an earlier clear:
+        // if a draw was recorded between the two API calls, OR-ing the flags would move the
+        // later clear before that draw when the frame's hoisted loadOps are consumed. The D3D9
+        // device flushes the pending frame before recording the next Clear; this assignment keeps
+        // the descriptor faithful to that submission boundary.
+        this.clear.flags = flags >>> 0;
         this.hasClear = true;
     }
 
@@ -144,12 +208,64 @@ export class RenderFrame {
     /** commandC carries the guest's SetStreamSource stride for slot 0 — diagnostic only, but
      *  it is the one number the encoder cannot recover, and a refused draw needs BOTH it and
      *  the pipeline's arrayStride to say which of the two is wrong. */
-    pushDraw(vertexCount: number, startVertex: number, guestStride = 0): void {
+    pushDraw(vertexCount: number, startVertex: number, guestStride = 0, instanceCount = 1): void {
         this.commandTypes.push(RenderCommandType.Draw);
         this.commandA.push(vertexCount);
         this.commandB.push(startVertex);
         this.commandC.push(guestStride);
-        this.commandD.push(0);
+        this.commandD.push(Math.max(0, instanceCount | 0));
+    }
+
+    /** Set the raster scissor for the following draw. Coordinates are already clamped to the
+     * active render target by the D3D9 device; keeping them in the compact command lanes avoids
+     * allocating a per-draw object in the frame recorder. */
+    pushSetScissor(left: number, top: number, width: number, height: number): void {
+        this.commandTypes.push(RenderCommandType.SetScissor);
+        this.commandA.push(left | 0);
+        this.commandB.push(top | 0);
+        this.commandC.push(width | 0);
+        this.commandD.push(height | 0);
+    }
+
+    /** Set the viewport for the following draws. D3D9 viewport is per-draw state while a
+     * WebGPU pass carries one default, so a guest change inside a pass has to be a command:
+     * a pass-level snapshot takes whatever the viewport happened to be at flush time. */
+    pushSetViewport(x: number, y: number, width: number, height: number, minZ: number, maxZ: number): void {
+        const base = this.viewportData.length;
+        this.viewportData.push(x, y, width, height, minZ, maxZ);
+        this.commandTypes.push(RenderCommandType.SetViewport);
+        this.commandA.push(base);
+        this.commandB.push(0); this.commandC.push(0); this.commandD.push(0);
+    }
+
+    pushBeginOcclusionQuery(queryPtr: number): void {
+        this.commandTypes.push(RenderCommandType.BeginOcclusionQuery);
+        this.commandA.push(queryPtr >>> 0);
+        this.commandB.push(0); this.commandC.push(0); this.commandD.push(0);
+    }
+
+    pushEndOcclusionQuery(queryPtr: number): void {
+        this.commandTypes.push(RenderCommandType.EndOcclusionQuery);
+        this.commandA.push(queryPtr >>> 0);
+        this.commandB.push(0); this.commandC.push(0); this.commandD.push(0);
+    }
+
+    pushTimestampQuery(queryPtr: number): void {
+        this.commandTypes.push(RenderCommandType.TimestampQuery);
+        this.commandA.push(queryPtr >>> 0);
+        this.commandB.push(0); this.commandC.push(0); this.commandD.push(0);
+    }
+
+    pushSetStencilReference(reference: number): void {
+        this.commandTypes.push(RenderCommandType.SetStencilReference);
+        this.commandA.push(reference & 0xff);
+        this.commandB.push(0); this.commandC.push(0); this.commandD.push(0);
+    }
+
+    pushSetBlendConstant(color: number): void {
+        this.commandTypes.push(RenderCommandType.SetBlendConstant);
+        this.commandA.push(color >>> 0);
+        this.commandB.push(0); this.commandC.push(0); this.commandD.push(0);
     }
 
     pushSetIndexBuffer(buffer: GPUBuffer, format: "uint16" | "uint32"): void {
@@ -162,12 +278,13 @@ export class RenderFrame {
         this.commandD.push(0);
     }
 
-    pushDrawIndexed(indexCount: number, startIndex: number, baseVertex: number): void {
+    /** `instanceCount` is D3D9 hardware instancing (SetStreamSourceFreq); 1 = ordinary draw. */
+    pushDrawIndexed(indexCount: number, startIndex: number, baseVertex: number, instanceCount = 1): void {
         this.commandTypes.push(RenderCommandType.DrawIndexed);
         this.commandA.push(indexCount);
         this.commandB.push(startIndex);
         this.commandC.push(baseVertex);
-        this.commandD.push(0);
+        this.commandD.push(instanceCount);
     }
 
     /**
@@ -195,7 +312,12 @@ export class RenderFrame {
                 textures: new Array(PROG_BIND.MAX_TEX).fill(null),
                 sampler: null,
                 samplers: new Array(PROG_BIND.MAX_TEX).fill(null),
+                vertexTextures: new Array(4).fill(null),
+                vertexSamplers: new Array(4).fill(null),
                 cubeMask: 0,
+                volumeMask: 0,
+                vertexVolumeMask: 0,
+                comparisonMask: 0,
             };
             this.drawStates[this.drawStateCount] = s;
         }

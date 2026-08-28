@@ -40,6 +40,10 @@ export class StreamBindingTable {
     readonly offsetBytes = new Uint32Array(MAX_VERTEX_STREAMS);
     /** Stride — how far apart vertices are. 0 means the guest bound none. */
     readonly strideBytes = new Uint32Array(MAX_VERTEX_STREAMS);
+    /** The raw SetStreamSourceFreq divider: 1 (per-vertex, the default), or
+     *  D3DSTREAMSOURCE_INDEXEDDATA|count, or D3DSTREAMSOURCE_INSTANCEDATA|count. Kept raw
+     *  because GetStreamSourceFreq must answer with exactly what was set. */
+    readonly freq = new Uint32Array(MAX_VERTEX_STREAMS).fill(1);
 
     /** Returns true when the slot's state actually changed (callers use it to skip work). */
     set(slot: number, ptr: number, bufferIndex: number, offsetBytes: number, strideBytes: number): boolean {
@@ -115,6 +119,13 @@ export class StreamBindingPlan {
  */
 export function slotArrayStride(boundStride: number, packedSize: number): number {
     return boundStride > 0 ? boundStride : packedSize;
+}
+
+/** WebGPU requires arrayStride to be a four-byte multiple. D3D9 declarations may legally
+ * describe packed 16-bit data with an odd byte stride, so callers must refuse that layout
+ * before createRenderPipeline rather than poisoning the command buffer with validation. */
+export function isWebGpuArrayStrideAligned(stride: number): boolean {
+    return Number.isSafeInteger(stride) && stride > 0 && (stride % 4) === 0;
 }
 
 /**
@@ -278,4 +289,143 @@ export function zeroStreamBuffer(device: GPUDevice, minSize: number): GPUBuffer 
     const buffer = device.createBuffer({ size, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
     zeroBuffers.set(device, { buffer, size });
     return buffer;
+}
+
+/** SetStreamSourceFreq flag halves (d3d9types.h). */
+export const D3DSTREAMSOURCE_INDEXEDDATA = 0x40000000;
+export const D3DSTREAMSOURCE_INSTANCEDATA = 0x80000000;
+
+/**
+ * The step mode one slot's divider asks for.
+ *
+ * INSTANCEDATA|D advances the stream once per D instances. INDEXEDDATA|N is the other half of
+ * the pair and carries the draw's instance COUNT, not a divisor — its stream stays vertex-rate,
+ * which is why the count has to be read separately (planInstancing).
+ */
+export function stepModeFromFreq(freq: number): { stepMode: GPUVertexStepMode; stepRateDivisor: number } {
+    if ((freq & D3DSTREAMSOURCE_INSTANCEDATA) !== 0) {
+        return { stepMode: "instance", stepRateDivisor: Math.max(1, freq & ~D3DSTREAMSOURCE_INSTANCEDATA) };
+    }
+    return { stepMode: "vertex", stepRateDivisor: 1 };
+}
+
+/** Decode the D3D9 INSTANCEDATA rate for one stream. Vertex-rate streams return one. */
+export function streamInstanceDivisor(freq: number): number {
+    return (freq & D3DSTREAMSOURCE_INSTANCEDATA) !== 0
+        ? Math.max(1, freq & ~D3DSTREAMSOURCE_INSTANCEDATA)
+        : 1;
+}
+
+/**
+ * The WebGPU vertex-state ABI has an instance step mode but no instance-rate divisor.
+ * Expand one D3D9 instance stream into the sequence WebGPU will fetch: each source record
+ * is repeated `divisor` times.  Missing source records are left zero-filled, matching the
+ * robust vertex-fetch behaviour used by the normal stream path rather than reading past the
+ * guest allocation.
+ *
+ * The result comes from a shared scratch allocation because the D3D9 resolver consumes it
+ * immediately in queue.writeBuffer. A bounded allocation is a safety requirement: a corrupt
+ * guest divider must not turn one draw into an unbounded worker allocation. Callers must finish
+ * consuming the returned view before invoking this helper again.
+ */
+export const MAX_INSTANCE_EXPANSION_BYTES = 64 * 1024 * 1024;
+
+let instanceExpansionScratch = new Uint8Array(0);
+
+export function expandInstanceRateData(
+    source: Uint8Array,
+    sourceOffset: number,
+    stride: number,
+    instanceCount: number,
+    divisor: number,
+): Uint8Array | null {
+    const count = Math.max(0, Math.trunc(instanceCount));
+    const step = Math.max(1, Math.trunc(divisor));
+    const width = Math.max(0, Math.trunc(stride));
+    if (count === 0 || width === 0) return new Uint8Array(0);
+    const bytes = count * width;
+    if (!Number.isSafeInteger(bytes) || bytes > MAX_INSTANCE_EXPANSION_BYTES) return null;
+    if (instanceExpansionScratch.byteLength < bytes) {
+        instanceExpansionScratch = new Uint8Array(bytes);
+    }
+    const out = instanceExpansionScratch.subarray(0, bytes);
+    out.fill(0);
+    const base = Math.max(0, Math.trunc(sourceOffset));
+    for (let instance = 0; instance < count; instance++) {
+        const src = base + Math.floor(instance / step) * width;
+        if (src >= source.length) break;
+        const available = Math.min(width, source.length - src);
+        out.set(source.subarray(src, src + available), instance * width);
+    }
+    return out;
+}
+
+/** What a draw's dividers ask for, once the slots it actually fetches from are known. */
+export interface InstancingPlan {
+    /** Instances to issue — the INDEXEDDATA count, or 1 when the draw is not instanced. */
+    instanceCount: number;
+    /** True when any used slot carries a non-default divider — i.e. this is an instanced draw. */
+    instanced: boolean;
+    /** Non-null = the draw cannot be issued; the string is its d3d9DropDraw reason. */
+    refuse: string | null;
+}
+
+const NOT_INSTANCED: InstancingPlan = { instanceCount: 1, instanced: false, refuse: null };
+
+/**
+ * Decode the per-slot dividers of ONE draw.
+ *
+ * Scoped to `slotMask` — the slots this draw's declaration reads. A divider left behind on a
+ * slot nothing fetches from is not this draw's instancing, and hardware would not treat it as
+ * such either.
+ *
+ * WebGPU's vertex state has a step mode but NO step-rate divisor. The device expands an
+ * INSTANCEDATA stream whose divisor is above one into a transient repeated-record buffer;
+ * keeping that lowering outside this pure plan prevents the divisor from being collapsed to
+ * one (which would draw every instance with the first one's data).
+ */
+export function planInstancing(freq: ArrayLike<number>, slotMask: number): InstancingPlan {
+    let count = -1;
+    let instanced = false;
+    for (let s = 0; s < MAX_VERTEX_STREAMS; s++) {
+        if (((slotMask >>> s) & 1) === 0) continue;
+        const value = freq[s]! >>> 0;
+        if (value === 1) continue;
+        if ((value & D3DSTREAMSOURCE_INSTANCEDATA) !== 0) {
+            instanced = true;
+            if ((value & ~D3DSTREAMSOURCE_INSTANCEDATA) === 0) {
+                return { instanceCount: 1, instanced: true, refuse: "instanceDivisorUnsupported" };
+            }
+        } else if ((value & D3DSTREAMSOURCE_INDEXEDDATA) !== 0) {
+            count = value & ~D3DSTREAMSOURCE_INDEXEDDATA;
+        }
+    }
+    if (count < 0 && !instanced) return NOT_INSTANCED;
+
+    // The pair is not optional: without the INDEXEDDATA stream there is no instance count to
+    // draw, and an instance-rate slot with nothing to pair against would step off its buffer.
+    if (count < 0) return { instanceCount: 1, instanced: true, refuse: "instancingNoIndexedStream" };
+    return { instanceCount: count, instanced: true, refuse: null };
+}
+
+/**
+ * Stamp each slot's step mode onto the layouts a pipeline is built from.
+ *
+ * One post-pass over the finished layouts rather than a divider argument threaded through both
+ * layout builders (the linker's and the fixed function's): the two build their layouts by
+ * different routes, and a rule spelled once here cannot drift between them. The array index is
+ * the D3D stream number in both, which is what makes the single pass possible.
+ *
+ * Returns fresh layout objects — this runs at pipeline build, never per draw.
+ */
+export function applyStepModes(
+    buffers: (GPUVertexBufferLayout | null)[],
+    freq: ArrayLike<number> | null,
+): (GPUVertexBufferLayout | null)[] {
+    if (!freq) return buffers;
+    return buffers.map((layout, slot) => {
+        if (!layout) return null;
+        const { stepMode } = stepModeFromFreq((freq[slot] ?? 1) >>> 0);
+        return stepMode === "vertex" ? layout : { ...layout, stepMode };
+    });
 }

@@ -5,6 +5,11 @@ import { gpuDeviceLifecycle } from "../../core/gpu/gpu-device-lifecycle";
 import { EmulatorConfig } from "../../core/emulator-config-manager";
 import { PostFxChain } from "./postfx/post-fx-chain";
 import { desktopBackground } from "../../runtime/desktop-background";
+import { probeD3D9WebGpuCapabilities } from "./shared/capability-probe";
+import { setD3D9FloatCapabilityContract } from "./shared/float-format-policy";
+import { setD3D9VolumeCapabilityContract } from "./shared/volume-policy";
+import { setD3D9MsaaCapabilityContract } from "./d3d9/multisample";
+import { setD3D9WebGpuCapabilityLimits } from "./shared/webgpu-capability-limits";
 
 /** Backoff between requestDevice attempts while recovering, in ms. The list also fixes how
  *  many attempts there are: a GPU that has not come back by ~4s is gone, and retrying past
@@ -67,7 +72,7 @@ export class WebGPUBackend implements RenderBackend {
             throw new Error("WebGPU unavailable: navigator.gpu is absent — this browser/worker does not expose the WebGPU API.");
         }
         const device = await this.requestDevice();
-        this.adoptDevice(device);
+        await this.adoptDevice(device);
 
         this.context = canvas.getContext("webgpu") as GPUCanvasContext | null;
         if (!this.context) {
@@ -98,10 +103,22 @@ export class WebGPUBackend implements RenderBackend {
     }
 
     /** Take ownership of a device: capabilities, queue, and the two error channels. */
-    private adoptDevice(device: GPUDevice): void {
+    private async adoptDevice(device: GPUDevice): Promise<void> {
         this.device = device;
         this.bcSupported = device.features.has("texture-compression-bc");
         this.queue = device.queue;
+
+        // Capability answers start conservative for every new device.  The
+        // asynchronous probe publishes a contract only after the actual
+        // texture/upload/readback operations succeed; bind the identity so a
+        // late result from a lost device cannot bless its replacement.
+        setD3D9MsaaCapabilityContract(null);
+        setD3D9FloatCapabilityContract(null);
+        setD3D9VolumeCapabilityContract(null);
+        setD3D9WebGpuCapabilityLimits({
+            maxTextureDimension2D: device.limits.maxTextureDimension2D,
+            maxTextureDimension3D: device.limits.maxTextureDimension3D,
+        });
 
         // `lost` resolves once per device and never rejects. Bind the device it belongs to so
         // a late resolution from a PREVIOUS device cannot tear down the current one.
@@ -115,6 +132,11 @@ export class WebGPUBackend implements RenderBackend {
             Logger.error(LogCategory.DDRAW,
                 `[WEBGPU] Uncaptured error: ${event.error.message}`);
         };
+
+        // Do not expose D3D9 creation/caps entry points until the device-specific
+        // contracts have been measured. Before this await the only honest answer
+        // is refusal, which would make a title cache a permanently false result.
+        await probeD3D9WebGpuCapabilities(device, () => this.device === device);
     }
 
     private configureContext(): void {
@@ -167,6 +189,10 @@ export class WebGPUBackend implements RenderBackend {
         this.rgb565Pipeline = null;
         this.rgb565BindGroupCache = new WeakMap();
         this.postFx = null;
+        setD3D9MsaaCapabilityContract(null);
+        setD3D9FloatCapabilityContract(null);
+        setD3D9VolumeCapabilityContract(null);
+        setD3D9WebGpuCapabilityLimits(null);
     }
 
     /**
@@ -203,7 +229,7 @@ export class WebGPUBackend implements RenderBackend {
                 if (wait > 0) await new Promise((r) => setTimeout(r, wait));
                 try {
                     const device = await this.requestDevice();
-                    this.adoptDevice(device);
+                    await this.adoptDevice(device);
                     // The canvas configuration belongs to the OLD device; a swap chain is not
                     // transferable, so it has to be configured again before getCurrentTexture.
                     this.configureContext();

@@ -1,6 +1,9 @@
 /**
  * Capped CheckDeviceFormat logging — boot-time caps probes (e.g. RenderWare / GTA III
  * CAPS.DAT) without a per-call firehose.
+ *
+ * The capability fast paths answer memo HITS without reaching here, so a repeated identical
+ * query logs once per distinct key by design; the call count lives in getDxFormatSupportCensus.
  */
 
 import { Logger, LogCategory } from "../../../core/logger";

@@ -59,6 +59,7 @@ export const D3DFMT_R5G6B5       = 23;
 export const D3DFMT_X1R5G5B5     = 24;
 export const D3DFMT_A1R5G5B5     = 25;
 export const D3DFMT_A4R4G4B4     = 26;
+export const D3DFMT_R3G3B2       = 27;
 export const D3DFMT_A8           = 28;
 export const D3DFMT_A8R3G3B2     = 29;
 export const D3DFMT_X4R4G4B4     = 30;
@@ -73,6 +74,7 @@ export const D3DFMT_P8           = 41;
 export const D3DFMT_L8           = 50;
 export const D3DFMT_A8L8         = 51;
 export const D3DFMT_A4L4         = 52;
+export const D3DFMT_L16          = 81;
 export const D3DFMT_V8U8         = 60;
 export const D3DFMT_L6V5U5       = 61;
 export const D3DFMT_X8L8V8U8     = 62;
@@ -80,6 +82,21 @@ export const D3DFMT_Q8W8V8U8     = 63;
 export const D3DFMT_V16U16       = 64;
 export const D3DFMT_W11V11U10    = 65;
 export const D3DFMT_A2W10V10U10  = 67;
+/** 64-bit signed bump-map format; components are stored U,V,W,Q (16 bits each). */
+export const D3DFMT_Q16W16V16U16 = 110;
+/** NVIDIA-only normal-compression format. Named so the capability layer can refuse it
+ *  by name; DXVK and wined3d expose no format mapping for it either. */
+export const D3DFMT_CxV8U8         = 117;
+
+// D3D9 floating-point texel formats.  These stay out of the public WebGPU
+// capability set until a native float texture/RT path is wired, but the CPU
+// shadow and readback codecs still need to understand their exact byte layout.
+export const D3DFMT_R16F               = 111;
+export const D3DFMT_G16R16F            = 112;
+export const D3DFMT_A16B16G16R16F      = 113;
+export const D3DFMT_R32F               = 114;
+export const D3DFMT_G32R32F            = 115;
+export const D3DFMT_A32B32G32R32F      = 116;
 
 export const D3DFMT_ATI1         = 0x31495441; // 'ATI1' / BC4_UNORM
 export const D3DFMT_ATI2         = 0x32495441; // 'ATI2' / BC5_UNORM
@@ -121,6 +138,85 @@ export interface DecodeD3DTextureOptions {
     surfaceFormat?: FormatInfo;
 }
 
+/** Return the number of channels and bytes per channel in a D3D9 float texel. */
+export function d3dFloatFormatInfo(format: number): { channels: 1 | 2 | 4; bytesPerChannel: 2 | 4 } | null {
+    switch (format >>> 0) {
+        case D3DFMT_R16F: return { channels: 1, bytesPerChannel: 2 };
+        case D3DFMT_G16R16F: return { channels: 2, bytesPerChannel: 2 };
+        case D3DFMT_A16B16G16R16F: return { channels: 4, bytesPerChannel: 2 };
+        case D3DFMT_R32F: return { channels: 1, bytesPerChannel: 4 };
+        case D3DFMT_G32R32F: return { channels: 2, bytesPerChannel: 4 };
+        case D3DFMT_A32B32G32R32F: return { channels: 4, bytesPerChannel: 4 };
+        default: return null;
+    }
+}
+
+export function isD3DFloatFormat(format: number): boolean {
+    return d3dFloatFormatInfo(format) !== null;
+}
+
+/** Decode an IEEE-754 binary16 word without relying on Float16Array, which is not
+ * present in all browsers supported by the worker. */
+export function float16BitsToFloat32(bits: number): number {
+    const raw = bits & 0xffff;
+    const sign = (raw & 0x8000) !== 0 ? -1 : 1;
+    const exponent = (raw >>> 10) & 0x1f;
+    const fraction = raw & 0x03ff;
+    if (exponent === 0) {
+        if (fraction === 0) return sign < 0 ? -0 : 0;
+        return sign * fraction * 2 ** -24;
+    }
+    if (exponent === 0x1f) {
+        return fraction === 0 ? (sign < 0 ? -Infinity : Infinity) : NaN;
+    }
+    return sign * (1 + fraction / 1024) * 2 ** (exponent - 15);
+}
+
+function roundToNearestEven(value: number, shift: number): number {
+    if (shift <= 0) return value << -shift;
+    const base = value >>> shift;
+    const remainder = value & ((1 << shift) - 1);
+    const halfway = 1 << (shift - 1);
+    return base + (remainder > halfway || (remainder === halfway && (base & 1) !== 0) ? 1 : 0);
+}
+
+// The codec is synchronous and these views never escape, so reusing one pair
+// avoids allocating typed arrays for every converted channel.
+const FLOAT32_SCRATCH = new Float32Array(1);
+const FLOAT32_BITS = new Uint32Array(FLOAT32_SCRATCH.buffer);
+
+/** Encode a number using the D3D9 binary16 (IEEE-754 half) representation.
+ * Input is first rounded to binary32, matching a Float32 texture upload. */
+export function float32ToFloat16Bits(value: number): number {
+    FLOAT32_SCRATCH[0] = value;
+
+    const sign = (FLOAT32_BITS[0]! >>> 16) & 0x8000;
+    const exponent = (FLOAT32_BITS[0]! >>> 23) & 0xff;
+    const fraction = FLOAT32_BITS[0]! & 0x007fffff;
+    if (exponent === 0xff) {
+        // Preserve infinity and make every NaN a quiet half NaN.  Payloads are
+        // intentionally not retained: D3D only promises the NaN classification.
+        return sign | (fraction === 0 ? 0x7c00 : 0x7e00);
+    }
+
+    const halfExponent = exponent - 127 + 15;
+    if (halfExponent >= 0x1f) return sign | 0x7c00;
+    if (halfExponent <= 0) {
+        if (halfExponent < -10) return sign;
+        const rounded = roundToNearestEven(fraction | 0x00800000, 14 - halfExponent);
+        return sign | Math.min(0x03ff + 1, rounded);
+    }
+
+    let rounded = roundToNearestEven(fraction, 13);
+    let e = halfExponent;
+    if (rounded >= 0x400) {
+        rounded = 0;
+        e++;
+        if (e >= 0x1f) return sign | 0x7c00;
+    }
+    return sign | (e << 10) | rounded;
+}
+
 function bytesPerPixelFromBpp(bpp: number): number {
     return Math.max(1, Math.floor(bpp / 8));
 }
@@ -160,6 +256,29 @@ export function blockCompressedSurfaceBytes(format: number, width: number, heigh
 }
 
 /**
+ * Copy extent for one dimension of a miplevel: for a block-compressed format the logical size
+ * rounded UP to whole 4x4 blocks, for any other format the logical size unchanged.
+ *
+ * WebGPU validates a compressed copy against the PHYSICAL miplevel extent and requires the
+ * copy size to be a multiple of the block size — unlike Vulkan/D3D, which let the extent stop
+ * at the image edge. So a 2x2 or 1x1 mip tail must be copied as the single block that backs
+ * it; passing the logical 2 or 1 makes the copy invalid, which invalidates the command buffer
+ * and silently drops EVERY draw in the frame (a black screen, reported only in the GPU error
+ * scope). The block that backs the tail is already present in the source: the row pitch is
+ * block-based, so the bytes are there.
+ *
+ * The format argument is what keeps this safe to reach for from any upload loop: rounding is
+ * only ever legal for a block-compressed target, and an uncompressed copy rounded up to 4 is
+ * the same class of silently-invalid copy in the other direction. Deciding from the format
+ * the caller already used to create the texture makes both mistakes unreachable.
+ * Scalar (not an extent object) so upload loops stay allocation-free.
+ */
+export function blockCompressedCopyDim(format: number, dim: number): number {
+    const d = Math.max(1, dim | 0);
+    return isBlockCompressedFormat(format) ? ((d + 3) & ~3) : d;
+}
+
+/**
  * Convert a D3DFORMAT FourCC/enum to the SurfaceFormat shape consumed by the
  * DDraw converter. Block-compressed formats keep a 32bpp fallback only for old
  * callers that still ask for bytes-per-pixel; actual storage is owned by
@@ -182,6 +301,8 @@ export function d3dFormatToSurfaceFormat(fmt: number): SurfaceFormat {
             return { flags: DDPF_RGB | DDPF_ALPHAPIXELS, bpp: 16, rMask: 0x0F00, gMask: 0x00F0, bMask: 0x000F, aMask: 0xF000 };
         case D3DFMT_X4R4G4B4:
             return { flags: DDPF_RGB, bpp: 16, rMask: 0x0F00, gMask: 0x00F0, bMask: 0x000F, aMask: 0 };
+        case D3DFMT_R3G3B2:
+            return { flags: DDPF_RGB, bpp: 8, rMask: 0xE0, gMask: 0x1C, bMask: 0x03, aMask: 0 };
         case D3DFMT_A8R3G3B2:
             return { flags: DDPF_RGB | DDPF_ALPHAPIXELS, bpp: 16, rMask: 0x00E0, gMask: 0x001C, bMask: 0x0003, aMask: 0xFF00 };
         case D3DFMT_R8G8B8:
@@ -198,6 +319,18 @@ export function d3dFormatToSurfaceFormat(fmt: number): SurfaceFormat {
             return { flags: DDPF_RGB, bpp: 32, rMask: 0x0000FFFF, gMask: 0xFFFF0000, bMask: 0, aMask: 0 };
         case D3DFMT_A16B16G16R16:
             return { flags: DDPF_RGB | DDPF_ALPHAPIXELS, bpp: 64, rMask: 0, gMask: 0, bMask: 0, aMask: 0 };
+        case D3DFMT_R16F:
+            return { flags: DDPF_RGB, bpp: 16, rMask: 0, gMask: 0, bMask: 0, aMask: 0 };
+        case D3DFMT_G16R16F:
+            return { flags: DDPF_RGB, bpp: 32, rMask: 0, gMask: 0, bMask: 0, aMask: 0 };
+        case D3DFMT_A16B16G16R16F:
+            return { flags: DDPF_RGB | DDPF_ALPHAPIXELS, bpp: 64, rMask: 0, gMask: 0, bMask: 0, aMask: 0 };
+        case D3DFMT_R32F:
+            return { flags: DDPF_RGB, bpp: 32, rMask: 0, gMask: 0, bMask: 0, aMask: 0 };
+        case D3DFMT_G32R32F:
+            return { flags: DDPF_RGB, bpp: 64, rMask: 0, gMask: 0, bMask: 0, aMask: 0 };
+        case D3DFMT_A32B32G32R32F:
+            return { flags: DDPF_RGB | DDPF_ALPHAPIXELS, bpp: 128, rMask: 0, gMask: 0, bMask: 0, aMask: 0 };
         case D3DFMT_A8:
             return { flags: DDPF_ALPHAPIXELS, bpp: 8, rMask: 0, gMask: 0, bMask: 0, aMask: 0xFF };
         case D3DFMT_A8P8:
@@ -208,6 +341,11 @@ export function d3dFormatToSurfaceFormat(fmt: number): SurfaceFormat {
             return { flags: 0, bpp: 8, rMask: 0, gMask: 0, bMask: 0, aMask: 0 };
         case D3DFMT_A8L8:
             return { flags: DDPF_ALPHAPIXELS, bpp: 16, rMask: 0, gMask: 0, bMask: 0, aMask: 0xFF00 };
+        case D3DFMT_L16:
+            // D3DFMT_L16 is a single unsigned-normalized luminance channel.
+            // Keep the channel masks empty; the explicit decoder below expands it
+            // to RGB and avoids treating the two bytes as an RGB565 pixel.
+            return { flags: 0, bpp: 16, rMask: 0, gMask: 0, bMask: 0, aMask: 0 };
         case D3DFMT_A4L4:
             return { flags: DDPF_ALPHAPIXELS, bpp: 8, rMask: 0, gMask: 0, bMask: 0, aMask: 0xF0 };
         case D3DFMT_V8U8:
@@ -219,6 +357,8 @@ export function d3dFormatToSurfaceFormat(fmt: number): SurfaceFormat {
         case D3DFMT_W11V11U10:
         case D3DFMT_A2W10V10U10:
             return { flags: 0, bpp: 32, rMask: 0, gMask: 0, bMask: 0, aMask: 0 };
+        case D3DFMT_Q16W16V16U16:
+            return { flags: 0, bpp: 64, rMask: 0, gMask: 0, bMask: 0, aMask: 0 };
         case D3DFMT_DXT1:
         case D3DFMT_DXT2:
         case D3DFMT_DXT3:
@@ -252,7 +392,20 @@ export function d3dFormatBpp(fmt: number): number {
         case D3DFMT_A2W10V10U10:
             return 32;
         case D3DFMT_A16B16G16R16:
+        case D3DFMT_Q16W16V16U16:
             return 64;
+        case D3DFMT_R16F:
+            return 16;
+        case D3DFMT_G16R16F:
+            return 32;
+        case D3DFMT_A16B16G16R16F:
+            return 64;
+        case D3DFMT_R32F:
+            return 32;
+        case D3DFMT_G32R32F:
+            return 64;
+        case D3DFMT_A32B32G32R32F:
+            return 128;
         case D3DFMT_R5G6B5:
         case D3DFMT_A1R5G5B5:
         case D3DFMT_X1R5G5B5:
@@ -261,9 +414,12 @@ export function d3dFormatBpp(fmt: number): number {
         case D3DFMT_A8R3G3B2:
         case D3DFMT_A8L8:
         case D3DFMT_A8P8:
+        case D3DFMT_L16:
         case D3DFMT_V8U8:
         case D3DFMT_L6V5U5:
             return 16;
+        case D3DFMT_R3G3B2:
+            return 8;
         case D3DFMT_R8G8B8:
             return 24;
         case D3DFMT_A8:
@@ -452,6 +608,69 @@ function decodeBc45ToRgba(
     }
 }
 
+function floatToRgba8(value: number): number {
+    // Float render/texture data can be outside the UNORM range.  D3D's fixed
+    // byte shadow is clamped; NaN is not a useful colour and is treated as zero.
+    if (Number.isNaN(value) || value === -Infinity) return 0;
+    if (value === Infinity) return 255;
+    return Math.round(Math.max(0, Math.min(1, value)) * 255);
+}
+
+/** Decode D3D9 R/G/RGBA float texels to the canonical RGBA8 shadow used by
+ * the CPU copy/readback path.  This is intentionally a CPU codec only: the
+ * D3D9 capability layer continues to refuse these formats until a real GPU
+ * float-storage path exists. */
+function decodeFloatD3DTextureToRgba8(
+    src: Uint8Array,
+    srcPtr: number,
+    width: number,
+    height: number,
+    format: number,
+    pitch: number,
+    out: Uint8Array,
+): boolean {
+    const info = d3dFloatFormatInfo(format);
+    if (!info) return false;
+    const view = new DataView(src.buffer, src.byteOffset, src.byteLength);
+    const bytesPerPixel = info.channels * info.bytesPerChannel;
+    let dst = 0;
+    for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+            const offset = srcPtr + y * pitch + x * bytesPerPixel;
+            let r = 0;
+            let g = 0;
+            let b = 0;
+            let a = 1;
+            let valid = true;
+            for (let channel = 0; channel < info.channels; channel++) {
+                const channelOffset = offset + channel * info.bytesPerChannel;
+                if (channelOffset < 0 || channelOffset + info.bytesPerChannel > src.byteLength) {
+                    valid = false;
+                    break;
+                }
+                const value = info.bytesPerChannel === 2
+                    ? float16BitsToFloat32(view.getUint16(channelOffset, true))
+                    : view.getFloat32(channelOffset, true);
+                if (channel === 0) r = value;
+                else if (channel === 1) g = value;
+                else if (channel === 2) b = value;
+                else a = value;
+            }
+            // A truncated source must not throw or leave a partially written
+            // destination texel.  Use a deterministic black/opaque texel.
+            if (!valid) {
+                r = g = b = 0;
+                a = 1;
+            }
+            out[dst++] = floatToRgba8(r);
+            out[dst++] = info.channels >= 2 ? floatToRgba8(g) : 0;
+            out[dst++] = info.channels >= 4 ? floatToRgba8(b) : 0;
+            out[dst++] = info.channels >= 4 ? floatToRgba8(a) : 255;
+        }
+    }
+    return true;
+}
+
 /**
  * Convert a packed (non-block-compressed) D3D surface to RGBA8, returning false
  * for a format this decoder does not know so the caller can fall back to the
@@ -494,6 +713,20 @@ function decodePackedD3DTextureToRgba8(
                 }
             }
             return true;
+
+        case D3DFMT_L16: {
+            const view = new DataView(src.buffer, src.byteOffset, src.byteLength);
+            for (let y = 0; y < height; y++) {
+                let off = srcPtr + y * pitch;
+                for (let x = 0; x < width; x++, off += 2) {
+                    // D3D's L16 is UNORM luminance; the RGBA8 shadow keeps the
+                    // high byte (the same quantisation used by A16B16G16R16).
+                    const l = view.getUint16(off, true) >>> 8;
+                    out[dst++] = l; out[dst++] = l; out[dst++] = l; out[dst++] = 255;
+                }
+            }
+            return true;
+        }
 
         case D3DFMT_A4L4:
             for (let y = 0; y < height; y++) {
@@ -603,6 +836,23 @@ function decodePackedD3DTextureToRgba8(
             return true;
         }
 
+        case D3DFMT_Q16W16V16U16: {
+            const view = new DataView(src.buffer, src.byteOffset, src.byteLength);
+            for (let y = 0; y < height; y++) {
+                let off = srcPtr + y * pitch;
+                for (let x = 0; x < width; x++, off += 8) {
+                    // D3DFMT_Q16W16V16U16 is laid out least-significant component
+                    // first (U,V,W,Q), just like Q8W8V8U8. The RGBA8 shadow keeps
+                    // the same component order used by the existing bump decoders.
+                    out[dst++] = signedNToByte(view.getUint16(off, true), 16);
+                    out[dst++] = signedNToByte(view.getUint16(off + 2, true), 16);
+                    out[dst++] = signedNToByte(view.getUint16(off + 4, true), 16);
+                    out[dst++] = signedNToByte(view.getUint16(off + 6, true), 16);
+                }
+            }
+            return true;
+        }
+
         case D3DFMT_W11V11U10: {
             const view = new DataView(src.buffer, src.byteOffset, src.byteLength);
             for (let y = 0; y < height; y++) {
@@ -668,12 +918,20 @@ export function decodeD3DTextureToRgba8(
     }
 
     if (format === D3DFMT_A8 || format === D3DFMT_A8L8 || format === D3DFMT_A4L4 ||
-        format === D3DFMT_A8P8 || format === D3DFMT_A16B16G16R16 ||
+        format === D3DFMT_A8P8 || format === D3DFMT_A16B16G16R16 || format === D3DFMT_L16 ||
         format === D3DFMT_V8U8 || format === D3DFMT_L6V5U5 || format === D3DFMT_X8L8V8U8 ||
-        format === D3DFMT_Q8W8V8U8 || format === D3DFMT_V16U16 || format === D3DFMT_W11V11U10 ||
+        format === D3DFMT_Q8W8V8U8 || format === D3DFMT_V16U16 || format === D3DFMT_Q16W16V16U16 ||
+        format === D3DFMT_W11V11U10 ||
         format === D3DFMT_A2W10V10U10) {
         const pitch = options.pitch ?? getD3DTextureLayout(format, width, height).pitch;
         if (decodePackedD3DTextureToRgba8(src, srcPtr, width, height, format, pitch, out, options.palette)) {
+            return out;
+        }
+    }
+
+    if (isD3DFloatFormat(format)) {
+        const pitch = options.pitch ?? getD3DTextureLayout(format, width, height).pitch;
+        if (decodeFloatD3DTextureToRgba8(src, srcPtr, width, height, format, pitch, out)) {
             return out;
         }
     }
@@ -751,7 +1009,7 @@ export function decodeOpenGLPixelsToRgba8(
     }
 
     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-    let srcBpp = 0;
+    let srcBpp: number;
     switch (format) {
         case GL_RGBA:
         case GL_BGRA:

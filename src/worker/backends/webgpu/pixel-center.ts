@@ -35,6 +35,39 @@ export function pixelCenterOffsetPx(): number {
         : D3D_PIXEL_CENTER_OFFSET_PX;
 }
 
+/** Convert the legacy pixel-centre offset to the clip-space delta used by a
+ * programmable vertex epilogue. */
+export function pixelCenterClipOffset(
+    viewportWidth: number,
+    viewportHeight: number,
+): { dx: number; dy: number } {
+    const px = pixelCenterOffsetPx();
+    return {
+        dx: px > 0 && viewportWidth > 0 ? (2 * px) / viewportWidth : 0,
+        dy: px > 0 && viewportHeight > 0 ? -(2 * px) / viewportHeight : 0,
+    };
+}
+
+const pixelCentreVersionF32 = new Float32Array(1);
+const pixelCentreVersionU32 = new Uint32Array(pixelCentreVersionF32.buffer);
+
+/** Mix runtime pixel-centre values into a programmable constant-bank cache key. */
+export function withPixelCenterVersion(
+    baseVersion: number | undefined,
+    dx: number,
+    dy: number,
+): number {
+    let h1 = Math.floor((baseVersion ?? 0) / 0x100000000) >>> 0;
+    let h2 = (baseVersion ?? 0) >>> 0;
+    for (const value of [dx, dy]) {
+        pixelCentreVersionF32[0] = value;
+        const bits = pixelCentreVersionU32[0]!;
+        h1 = Math.imul(h1 ^ bits, 0x01000193) >>> 0;
+        h2 = (Math.imul(h2 ^ bits, 0x85ebca6b) + 0x9e3779b9) >>> 0;
+    }
+    return ((h1 & 0x1fffff) * 0x100000000) + h2;
+}
+
 /**
  * Copy a 16-float D3D row-major MVP into `dst` at `dstFloatOffset`, folding in the
  * pixel-centre shift for the viewport it will be rasterized into (see the header for the
@@ -48,9 +81,7 @@ export function writeMvpWithPixelCenter(
     viewportWidth: number,
     viewportHeight: number
 ): void {
-    const px = pixelCenterOffsetPx();
-    const dx = px > 0 && viewportWidth > 0 ? (2 * px) / viewportWidth : 0;
-    const dy = px > 0 && viewportHeight > 0 ? -(2 * px) / viewportHeight : 0;
+    const { dx, dy } = pixelCenterClipOffset(viewportWidth, viewportHeight);
 
     for (let row = 0; row < 4; row++) {
         const i = row * 4;

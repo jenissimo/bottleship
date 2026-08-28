@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { mipLevelCountFor, mipExtent, effectiveMipLevels } from "../../src/worker/backends/webgpu/shared/mip-utils";
+import {
+    d3dTextureMipUploadPlan,
+    mipLevelCountFor,
+    mipExtent,
+    effectiveMipLevels,
+    effectiveCubeMipLevels,
+} from "../../src/worker/backends/webgpu/shared/mip-utils";
 
 describe("mipLevelCountFor", () => {
     test("full chain down to 1x1 for power-of-two", () => {
@@ -48,5 +54,34 @@ describe("effectiveMipLevels — conservative authored-only policy", () => {
     });
     test("declared count is clamped to the valid maximum", () => {
         expect(effectiveMipLevels(999, 4, 4, all)).toBe(3); // 4x4 → 3 levels max (4,2,1)
+    });
+});
+
+describe("d3dTextureMipUploadPlan", () => {
+    test("returns contiguous authored extents and stops at the first missing level", () => {
+        const plan = d3dTextureMipUploadPlan(8, 4, 0, (level) => level === 1 || level === 2);
+        expect(plan).toEqual([
+            { level: 0, width: 8, height: 4 },
+            { level: 1, width: 4, height: 2 },
+            { level: 2, width: 2, height: 1 },
+        ]);
+    });
+
+    test("declared level count caps the upload plan", () => {
+        const plan = d3dTextureMipUploadPlan(16, 16, 2, () => true);
+        expect(plan).toEqual([
+            { level: 0, width: 16, height: 16 },
+            { level: 1, width: 8, height: 8 },
+        ]);
+    });
+});
+
+describe("effectiveCubeMipLevels", () => {
+    test("requires all six faces before exposing a cube mip", () => {
+        const authored = new Set<string>();
+        for (let face = 0; face < 5; face++) authored.add(`${face}:1`);
+        expect(effectiveCubeMipLevels(0, 8, 8, (face, level) => authored.has(`${face}:${level}`))).toBe(1);
+        authored.add("5:1");
+        expect(effectiveCubeMipLevels(0, 8, 8, (face, level) => authored.has(`${face}:${level}`))).toBe(2);
     });
 });
