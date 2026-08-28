@@ -8,6 +8,7 @@ import { FastPathImplementation, ThunkImplementation, type X86Context } from '..
 import type { ThunkMemoryRegions } from '../../core/thunking/thunk-memory-manager';
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
+import { MemoryManager } from '../../core/process';
 import type { PESection } from '../../core/module-registry';
 import { type RegionPerms } from '../../core/memory/address-space';
 import { Mem } from '../../core/memory/mem-accessor';
@@ -570,7 +571,18 @@ export function resetHeapSlab(): void {
 (globalThis as any).largeAllocHistory = (addr: number, radius?: number) => {
     const process = System.getInstance().process;
     if (!process) return null;
-    return process.memory.getLargeAllocHistory?.(addr >>> 0, radius ?? 0x20000) ?? null;
+    const events = process.memory.getLargeAllocHistory?.(addr >>> 0, radius ?? 0x20000) ?? null;
+    if (!events) return null;
+    // Say WHY every `bt` is empty when attribution is off — an unlabelled event list
+    // otherwise reads as "the caller could not be reconstructed".
+    return { backtraces: MemoryManager.largeAllocBacktraces, events };
+};
+
+/** Turn per-event caller attribution in the large-alloc ring on/off (off by default:
+ *  the stack scan costs more than the ring for a guest that VirtualAllocs per frame). */
+(globalThis as any).largeAllocBacktraces = (on = true) => {
+    MemoryManager.largeAllocBacktraces = !!on;
+    return { backtraces: MemoryManager.largeAllocBacktraces };
 };
 
 export function slabReport() {
@@ -753,6 +765,52 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 
     // Track reserved pages (address -> size in bytes)
     const reservedPages: Map<number, number> = new Map();
+
+    // ── VirtualAlloc block recycler ──────────────────────────────────────────────
+    // A guest that allocates and releases one allocation-granularity block per frame
+    // (UE1's FMallocWindows does exactly that) makes us commit, then un-protect, the same
+    // pages forever — and BOTH ends flush the WHOLE software TLB. v86's full_clear_tlb
+    // also drops the per-page dispatch metadata and bumps the RET-cache epoch, so twice a
+    // frame the entire return-target memo dies and can never amortise. The compiled code
+    // survives, which is why this is invisible to every "is the JIT alive" check.
+    //
+    // Recycle the block instead: a released RESERVE|COMMIT / PAGE_READWRITE block whose
+    // pages are still exactly as we committed them goes on an exact-size LIFO, and the
+    // next identical request takes it back with its PTEs untouched — no commit, no
+    // protection change, no flush. Windows' own low-fragmentation front end recycles VA
+    // the same way, and a released range is never promised a fresh address.
+    //
+    // The guest-visible contract that must NOT move: the block still reads as all zeroes
+    // (we fill it on handout, exactly as commit does), and anything that could have
+    // changed the page state — a VirtualProtect, a MEM_DECOMMIT, a non-RW protection,
+    // MEM_TOP_DOWN, a size that is not the block's own — refuses the cache outright and
+    // falls through to the real free. What it DOES give up is the stale-touch #PF on a
+    // use-after-free of these blocks; that is the price of any pooled allocator, and it is
+    // bounded to RW heap blocks the guest itself released.
+    const VA_CACHE_MAX_BLOCK = 0x100000;        // 1 MB — beyond this one flush is amortised
+    const VA_CACHE_MAX_PER_SIZE = 8;
+    const VA_CACHE_MAX_BYTES = 4 * 0x100000;    // total parked bytes
+    const vaFreeCache: Map<number, number[]> = new Map();
+    let vaCacheBytes = 0;
+    /** Bases whose page state we can no longer vouch for (VirtualProtect / MEM_DECOMMIT). */
+    const vaProtectionTouched: Set<number> = new Set();
+    const vaCacheShapes: Map<string, number> = new Map();
+    const vaCacheStats = { hits: 0, misses: 0, parked: 0, dropped: 0, refusedTouched: 0, refusedFull: 0, refusedShape: 0 };
+    // Runtime switch so the A/B runs in ONE session on ONE scene: a frame-time
+    // comparison across two boots of a cutscene is scene drift, not a measurement.
+    let vaCacheEnabled = true;
+    (globalThis as any).vaCacheEnable = (on = true) => {
+        vaCacheEnabled = !!on;
+        if (!vaCacheEnabled) { vaFreeCache.clear(); vaCacheBytes = 0; }   // parked blocks would leak
+        return { enabled: vaCacheEnabled };
+    };
+    (globalThis as any).vaCacheReport = () => ({
+        enabled: vaCacheEnabled,
+        ...vaCacheStats,
+        parkedBytes: vaCacheBytes,
+        shapes: [...vaCacheShapes].sort((a, b) => b[1] - a[1]).slice(0, 12),
+        sizes: [...vaFreeCache].map(([size, list]) => ({ size, count: list.length })).filter((r) => r.count > 0),
+    });
 
     // virtualAllocRegions / decommittedPages are module-scoped: the fast-path tier
     // and HeapWalk/HeapSize read the same interval indexes.
@@ -2158,6 +2216,51 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             return fail(`MEM_COMMIT not within reserved region`);
         }
 
+        // Which call shapes actually arrive — a recycler with zero hits and zero misses is
+        // a recycler whose gate never ran, and only the shape census can say which clause
+        // rejected them.
+        {
+            const k = `${address === 0 ? 'anon' : 'fixed'}/type0x${(flAllocationType >>> 0).toString(16)}/prot0x${(flProtect >>> 0).toString(16)}`;
+            vaCacheShapes.set(k, (vaCacheShapes.get(k) ?? 0) + 1);
+        }
+
+        // Recycled block? Only for the exact shape we parked (see the recycler comment):
+        // an anonymous RESERVE|COMMIT of plain read-write memory, bottom-up.
+        const vaCacheKey = Math.ceil(alignedSize / ALLOC_GRANULARITY) * ALLOC_GRANULARITY;
+        // lpAddress === 0 with MEM_COMMIT is an IMPLICIT reserve+commit on Windows, and that
+        // is the shape UE1 actually uses (MEM_RESERVE is not set) — demanding the flag here
+        // is what made the recycler park blocks it could never hand back.
+        if (vaCacheEnabled && address === 0
+            && (flAllocationType & MEM_COMMIT)
+            && !(flAllocationType & MEM_TOP_DOWN)
+            && flProtect === PAGE_READWRITE
+            && vaCacheKey <= VA_CACHE_MAX_BLOCK) {
+            const bucket = vaFreeCache.get(vaCacheKey);
+            // Only a block the CURRENT MemoryManager still owns may be handed back. The
+            // cache is module state and outlives a process teardown (a game switch, a
+            // launcher re-exec in the same worker), so without this it would eventually
+            // return an address belonging to a dead allocator — one whose size no longer
+            // resolves, which is exactly what the heap fast tier reads to decide capacity.
+            let reuse: number | undefined;
+            while (bucket && bucket.length > 0) {
+                const cand = bucket.pop()!;
+                vaCacheBytes -= vaCacheKey;
+                if (process.memory.getSize(cand) === vaCacheKey) { reuse = cand; break; }
+                vaCacheStats.dropped++;
+            }
+            if (reuse !== undefined) {
+                vaCacheStats.hits++;
+                // Win32 hands out zeroed pages on commit. With the PTEs already present
+                // and RW this native fill is the entire cost of the reuse.
+                process.addressSpace.fill(reuse, vaCacheKey, 0);
+                reservedPages.set(reuse, vaCacheKey);
+                virtualAllocRegions.set(reuse, vaCacheKey);
+                Logger.verbose(LogCategory.KERNEL32, `VirtualAlloc -> 0x${reuse.toString(16)} (recycled, size=${vaCacheKey})`);
+                return reuse;
+            }
+            vaCacheStats.misses++;
+        }
+
         profiler.start("VirtualAlloc:alloc");
         try {
             if (address === 0) {
@@ -2281,9 +2384,43 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 return 0; // FALSE
             }
 
+            // Asked BEFORE clearDecommittedRange wipes the evidence: a block any part of
+            // which was decommitted has page state we did not put there, so it can never
+            // be recycled with its PTEs left alone.
+            const hadDecommitted = (() => {
+                const end = lpAddress + trackedSize;
+                for (const [dcBase, dcSize] of decommittedPages) {
+                    if (dcBase < end && dcBase + dcSize > lpAddress) return true;
+                }
+                return false;
+            })();
+
             clearDecommittedRange(lpAddress, trackedSize);
             reservedPages.delete(lpAddress);
             virtualAllocRegions.delete(lpAddress);
+            // Park it instead of freeing it, when its pages are still exactly what we
+            // committed — then neither this release nor the next allocation of the same
+            // size touches the page tables (see the recycler comment above).
+            const blockSize = process.memory.getSize(lpAddress);
+            const touched = vaProtectionTouched.delete(lpAddress);
+            if (vaCacheEnabled && blockSize !== undefined && blockSize === trackedSize && blockSize <= VA_CACHE_MAX_BLOCK
+                && !hadDecommitted && !touched) {
+                let bucket = vaFreeCache.get(blockSize);
+                if (!bucket) { bucket = []; vaFreeCache.set(blockSize, bucket); }
+                if (bucket.length < VA_CACHE_MAX_PER_SIZE && vaCacheBytes + blockSize <= VA_CACHE_MAX_BYTES) {
+                    bucket.push(lpAddress);
+                    vaCacheBytes += blockSize;
+                    vaCacheStats.parked++;
+                    Logger.verbose(LogCategory.KERNEL32, `VirtualFree: parked 0x${lpAddress.toString(16)} (${blockSize} bytes)`);
+                    return 1; // TRUE
+                }
+                vaCacheStats.refusedFull++;
+            } else if (touched || hadDecommitted) {
+                vaCacheStats.refusedTouched++;
+            } else {
+                vaCacheStats.refusedShape++;
+            }
+
             // Released VA goes back to the allocator, so any protection the app applied
             // to it dies with the reservation. Leaving a PAGE_READONLY page behind hands
             // the next owner memory it cannot write — and the recommit-on-handout path
@@ -2293,7 +2430,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 if (ptm?.isPagingEnabled()) ptm.setProtection(lpAddress, trackedSize, PAGE_READWRITE);
             }
 
-            const allocSize = process.memory.getSize(lpAddress);
+            const allocSize = blockSize;
             if (allocSize === undefined) {
                 Logger.warn(LogCategory.KERNEL32,
                     `VirtualFree(MEM_RELEASE): 0x${lpAddress.toString(16)} missing from allocations map`);
@@ -2373,6 +2510,14 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 
         // Map new protect to perms using existing helper
         const newPerms = mapProtectToPerms(flNewProtect);
+
+        // The recycler may only hand a block back with its PTEs untouched, so a block the
+        // app has re-protected is disqualified for good — recorded here rather than
+        // re-derived at release, where the original protection is no longer visible.
+        {
+            const owner = virtualAllocRegions.find(alignedAddr);
+            if (owner) vaProtectionTouched.add(owner.base);
+        }
 
         // Apply protection. protect() requires exact (base, size) match; PE sub-pages
         // (e.g. 0x41f000 inside module at 0x400000) don't match, so it fails.

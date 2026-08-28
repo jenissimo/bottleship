@@ -109,6 +109,8 @@ export class MemoryManager {
     // are served from fresh bump space, never from the free list (see allocateInBucket).
     private static readonly LARGE_ALLOC_FRESH_THRESHOLD = 0x80000;
     private static readonly LARGE_ALLOC_LOG_SIZE = 4096;
+    /** Attribute each large block to its guest caller. Opt-in: see logLargeEvent. */
+    public static largeAllocBacktraces = false;
     private largeAllocLog: Array<{ op: 'alloc' | 'free' | 'alias'; addr: number; size: number; time: number; bt: string }> = [];
     private largeAllocLogIdx = 0;
 
@@ -151,8 +153,15 @@ export class MemoryManager {
     /** Record a ≥64KB block lifecycle event with a lightweight caller backtrace. */
     private logLargeEvent(op: 'alloc' | 'free' | 'alias', addr: number, size: number): void {
         if (size < MemoryManager.LARGE_ALLOC_THRESHOLD) return;
+        // The ring is cheap and always on; the per-entry backtrace is not — it scans the
+        // guest stack and labels every plausible frame. A title that VirtualAllocs one
+        // 64 KB block per frame (UE1 does) pays that twice a frame for a diagnostic
+        // nobody is reading, so the attribution is opt-in. `largeAllocHistory` reports
+        // when it is off, so an empty `bt` cannot be misread as "no caller found".
         let bt = '';
-        try { bt = (globalThis as any).__guestBtLite?.() ?? ''; } catch { /* best-effort */ }
+        if (MemoryManager.largeAllocBacktraces) {
+            try { bt = (globalThis as any).__guestBtLite?.() ?? ''; } catch { /* best-effort */ }
+        }
         const entry = { op, addr: addr >>> 0, size, time: performance.now(), bt };
         if (this.largeAllocLog.length < MemoryManager.LARGE_ALLOC_LOG_SIZE) {
             this.largeAllocLog.push(entry);

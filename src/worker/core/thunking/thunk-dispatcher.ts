@@ -541,7 +541,7 @@ export class ThunkDispatcher {
         // caller module (Storm/Fog/CRT) without importing the dispatcher.
         (globalThis as any).__guestBtLite = (): string => {
             try {
-                const bt = this.getGuestCallStack(undefined, 0x200, 6);
+                const bt = this.getGuestCallStack(undefined, 0x200, 6, { recent: false });
                 return bt.frames.slice(0, 6)
                     .map(f => f.moduleName ? `${f.moduleName}+0x${f.moduleOffset.toString(16)}` : `0x${f.retAddr.toString(16)}`)
                     .join(' <- ');
@@ -870,7 +870,7 @@ export class ThunkDispatcher {
      * Reuses reconstructCallStack (module-labelled, deep scan). `esp` defaults to
      * the live cached CPU esp. Pure read; safe to call any time.
      */
-    public getGuestCallStack(esp?: number, scanBytes: number = 0x800, maxFrames: number = 48): {
+    public getGuestCallStack(esp?: number, scanBytes: number = 0x800, maxFrames: number = 48, opts?: { recent?: boolean }): {
         esp: number;
         lastThunk: string;
         recent: string[];
@@ -878,7 +878,9 @@ export class ThunkDispatcher {
     } {
         const espVal = (esp ?? this.cachedReg32?.[4] ?? 0) >>> 0;
         const lastThunk = this.lastThunkName || '';
-        const recent = this.getLastWinApiCalls(48, { includeNoisy: true });
+        // `recent` costs 48 template literals per call. The frames-only callers
+        // (__guestBtLite) discard it, and one of them runs on an allocator path.
+        const recent = opts?.recent === false ? [] : this.getLastWinApiCalls(48, { includeNoisy: true });
         const mem8 = this.cachedMem8;
         if (!mem8 || !espVal) return { esp: espVal, lastThunk, recent, frames: [] };
         const view = (this.isDataViewValid() && this.cachedDataView)
