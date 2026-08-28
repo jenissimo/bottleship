@@ -45,6 +45,13 @@ let ownerGeneration = -1;
  * Populated by the name -> base handouts, which is what "the process asked for it" means.
  */
 let loadedNames = new Set<string>();
+/**
+ * Image export address -> the inline stub its body now JMPs to. An export served by a
+ * trap-free inline stub keeps its ONE address (the image body); only the bytes there
+ * change. Diagnostics that name those bytes read this, or they name the OUT-trap stub
+ * that no longer runs.
+ */
+let redirectByAddress = new Map<number, number>();
 
 /** Canonical module key: what LoadLibrary("DDRAW.DLL") and the slot table agree on. */
 export function canonicalHleModuleName(dllName: string): string {
@@ -117,6 +124,79 @@ export function hleImageExportAddress(dllName: string, exportName: string): numb
     return exportsByLowerName.get(canonicalHleModuleName(dllName))?.get(exportName.toLowerCase());
 }
 
+/**
+ * Point an export's in-image body at a trap-free inline stub, keeping the export's ONE
+ * address: the 16-byte slot is overwritten with a 5-byte `JMP rel32` to `target`.
+ *
+ * Binding the IAT straight to the inline stub is what gives an export a second address —
+ * GetProcAddress and an export-directory walk both name the image body, so an ASI/mod
+ * loader scanning the IAT for that value finds no slot and installs nothing, silently.
+ * One direct jump buys the guest-visible shape Windows has.
+ *
+ * `boundAddress` is the caller's own single-owner answer (hleExportBindingAddress): the
+ * redirect only applies when the export's one address IS its image body, so a data export
+ * that outranks the image — an address holding a variable, not code — is never patched.
+ *
+ * Returns the image address to bind, or undefined when there is no such body (no image:
+ * arena full, size overflow, export not stubbable; or a data export won) — callers must
+ * then keep their own fallback, or the fast path is lost along with the address.
+ */
+export function redirectHleImageExport(
+    thunkGenerator: { markStubRedirected?: (address: number, target: number) => boolean } | undefined,
+    dllName: string,
+    exportName: string,
+    target: number,
+    boundAddress: number | undefined,
+): number | undefined {
+    const address = hleImageExportAddress(dllName, exportName);
+    if (address === undefined || address !== boundAddress) return undefined;
+    const to = target >>> 0;
+    // The same export is resolved by every importer that links it; re-publishing the same
+    // jump would dirty the JIT's blocks for a live code page on each one.
+    if (redirectByAddress.get(address) === to) return address;
+
+    const mem = Mem.getView();
+    if (!mem) return undefined;
+    const rel = (to - ((address + 5) >>> 0)) | 0;
+    const jmp = new Uint8Array([0xe9, rel & 0xff, (rel >> 8) & 0xff, (rel >> 16) & 0xff, (rel >> 24) & 0xff]);
+    // Executable bytes the guest already reaches through its IAT, so the write and its JIT
+    // invalidation must be one turn (CLAUDE.md §3.1) — writeGuestCode is that pair.
+    if (!writeGuestCode(mem, jmp, address)) {
+        Logger.warn(LogCategory.SYSTEM,
+            `[HleImages] ${dllName}:${exportName}: redirect write rejected at 0x${address.toString(16)}`);
+        return undefined;
+    }
+    redirectByAddress.set(address, to);
+    // The OUT-trap stub registered at this address no longer runs; a backtrace naming the
+    // bytes must say where they go now.
+    thunkGenerator?.markStubRedirected?.(address, to);
+    Logger.log(LogCategory.SYSTEM,
+        `[HleImages] ${dllName}:${exportName} body 0x${address.toString(16)} -> inline stub 0x${to.toString(16)}`);
+    return address;
+}
+
+/**
+ * Drop every materialized image. The maps are module-scoped, so a test that builds images
+ * leaves them answering for whatever runs next in the same process — and an export that
+ * resolves to an image body instead of the arena stub is a different, order-dependent
+ * answer. Production never calls this: a reset re-materializes through the owner guard.
+ */
+export function resetHleModuleImages(): void {
+    slotByName = new Map();
+    exportsByName = new Map();
+    exportsByLowerName = new Map();
+    ordinalsByName = new Map();
+    loadedNames = new Set();
+    redirectByAddress = new Map();
+    owner = null;
+    ownerGeneration = -1;
+}
+
+/** Where an image export body was redirected to, or undefined when it still traps. */
+export function hleImageRedirectTarget(address: number): number | undefined {
+    return redirectByAddress.get(address >>> 0);
+}
+
 export function hleImageOrdinalExports(dllName: string): Map<number, number> {
     return ordinalsByName.get(canonicalHleModuleName(dllName)) ?? new Map();
 }
@@ -156,6 +236,7 @@ export function materializeHleModuleImages(process: any): void {
     exportsByLowerName = new Map();
     ordinalsByName = new Map();
     loadedNames = new Set();
+    redirectByAddress = new Map();
 
     // Pinned names first, then everything else the APIRegistry knows, sorted so the
     // assignment does not depend on descriptor load order.

@@ -11,14 +11,15 @@
  * worth a verb.
  *
  * Expected comes from hleExportBindingAddress, the single owner of that address
- * (core/thunking/export-resolver.ts). NOTE it is not yet what GetProcAddress-BY-NAME
- * answers for an HLE module: that path still resolves to the arena stub, so the two
- * agree only for a data export. This audit measures the IAT against the image, which
- * is what an export-directory-walking wrapper compares against.
+ * (core/thunking/export-resolver.ts), which is also what GetProcAddress-by-name answers,
+ * so a wrapper finds the same pointer however it asks. An export served by a trap-free
+ * inline stub keeps that one address too: its in-image body is patched to jump there.
  *
  * The audit classifies each thunked import instead of just counting mismatches:
- * a guest hook is a mismatch we WANT (the wrapper is doing its job), and our own
- * inline fast paths (heap slab, CRT math, case fold) are deliberate. `diverged`
+ * a guest hook is a mismatch we WANT (the wrapper is doing its job). Our own inline
+ * fast paths (heap slab, CRT math, case fold) are NOT mismatches any more — the
+ * export's image body jumps to them — so `inlineFastPath` counts them out of
+ * `matching`, and is a subset of it wherever the module has an image. `diverged`
  * is the bug class only: our stub for the export in the IAT, our OTHER stub for
  * the same export everywhere else.
  */
@@ -28,6 +29,7 @@ import { sys } from "../serialize";
 import { hleExportBindingAddress, resolveHleExportAddress } from "../../core/thunking/export-resolver";
 import { APIRegistry } from "../../core/api-registry";
 import { resolveThunkedDllAlias } from "../../core/dll-aliases";
+import { hleImageRedirectTarget } from "../../core/hle-module-images";
 
 interface ImportRow {
     module: string;
@@ -112,7 +114,14 @@ export function registerImportCommands(svc: HarnessService): void {
                 const expected = hleExportBindingAddress(generator, dll, name)
                     ?? (resolveHleExportAddress(dispatcher, dll, name) || undefined);
                 if (expected === undefined) return;
-                if (iatValue === expected) { matching++; return; }
+                if (iatValue === expected) {
+                    matching++;
+                    // An inline fast path is now reached THROUGH the one address (the image
+                    // body JMPs to it), so it no longer shows up as a mismatch. Without this
+                    // the audit would read as if the fast paths had been removed.
+                    if (hleImageRedirectTarget(iatValue) !== undefined) inlineFastPath++;
+                    return;
+                }
                 const stub = generator?.getStubByAddress?.(iatValue);
                 if (!stub) {
                     // Either the guest hooked the slot (the point of the exercise) or one

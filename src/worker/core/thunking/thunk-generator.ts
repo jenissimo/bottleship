@@ -19,6 +19,13 @@ export interface ThunkStub {
      * ImmWrapper kept 50 as its CImmDevice* and dereferenced it).
      */
     absentDll?: boolean;
+    /**
+     * The bytes at `address` were overwritten with a JMP to this address (an in-image
+     * export body pointed at a trap-free inline stub). The stub's identity — which export
+     * this address IS — does not change; what changes is that executing it no longer traps
+     * on `functionId`, so anything naming the BODY must say so.
+     */
+    redirectedTo?: number;
 }
 
 /** Size of the shared "missing import" trap stub (UD2) – must be 16-byte aligned like other stubs */
@@ -446,6 +453,19 @@ export class ThunkGenerator {
 
     getStubByAddress(address: number): ThunkStub | undefined {
         return this.addressToStub.get(address);
+    }
+
+    /**
+     * Record that a registered stub's bytes were replaced by a JMP to `target`. The
+     * registration stays — the address is still that export's entry point — but a
+     * diagnostic that reads the stub to explain the bytes would otherwise name an OUT trap
+     * that no longer runs there.
+     */
+    markStubRedirected(address: number, target: number): boolean {
+        const stub = this.addressToStub.get(address >>> 0);
+        if (!stub) return false;
+        stub.redirectedTo = target >>> 0;
+        return true;
     }
 
     /**

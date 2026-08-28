@@ -2,7 +2,7 @@
 // Portably parses Win32 PE files and loads them into emulator memory
 
 import { ThunkGenerator } from './thunking/thunk-generator';
-import { markHleModuleLoaded } from './hle-module-images';
+import { markHleModuleLoaded, redirectHleImageExport } from './hle-module-images';
 import { hleExportBindingAddress } from './thunking/export-resolver';
 import { deriveStackCleanupFromMangledName } from './thunking/msvc-mangling';
 import { APIRegistry } from './api-registry';
@@ -1654,40 +1654,49 @@ export class PELoader {
                         // Set window.__noHeapSlab=true BEFORE loading a game to force it OFF (the JS
                         // process.memory + lookaside path). Global toggle, NOT a per-game branch.
                         const slabOn = !(globalThis as any).__noHeapSlab;
-                        const inlineBefore = stubAddress;
+                        let inlineTarget: number | undefined;
                         if (slabOn && dllName === 'kernel32' && this.heapInlineStubs) {
-                            if (funcKey === 'heapalloc') stubAddress = this.heapInlineStubs.heapAllocStub;
-                            else if (funcKey === 'heapfree') stubAddress = this.heapInlineStubs.heapFreeStub;
+                            if (funcKey === 'heapalloc') inlineTarget = this.heapInlineStubs.heapAllocStub;
+                            else if (funcKey === 'heapfree') inlineTarget = this.heapInlineStubs.heapFreeStub;
                         } else if (slabOn && this.crtInlineStubs && PELoader.CRT_SLAB_MODULES.has(dllName)) {
-                            if (PELoader.CRT_MALLOC_KEYS.includes(funcKey)) stubAddress = this.crtInlineStubs.mallocStub;
-                            else if (PELoader.CRT_FREE_KEYS.includes(funcKey)) stubAddress = this.crtInlineStubs.freeStub;
+                            if (PELoader.CRT_MALLOC_KEYS.includes(funcKey)) inlineTarget = this.crtInlineStubs.mallocStub;
+                            else if (PELoader.CRT_FREE_KEYS.includes(funcKey)) inlineTarget = this.crtInlineStubs.freeStub;
                         }
                         // Trap-free GetLocaleInfoW: answers inside guest code, bails to this
                         // same trap stub for RETURN_NUMBER / unknown type / bad buffer.
                         if (this.localeInlineStubs && dllName === 'kernel32'
                             && funcKey === 'getlocaleinfow'
                             && !(globalThis as { __noLocaleStubs?: boolean }).__noLocaleStubs) {
-                            stubAddress = this.localeInlineStubs.getLocaleInfoWStub;
+                            inlineTarget = this.localeInlineStubs.getLocaleInfoWStub;
                         }
                         // Trap-free ANSI<->UTF-16 conversion: answers inside guest code for
                         // the ANSI code page, bails to this same trap stub for any other
                         // page, any flag, a default char, or a buffer it cannot fill.
                         if (this.mbwcInlineStubs && dllName === 'kernel32'
                             && !(globalThis as { __noMbwcStubs?: boolean }).__noMbwcStubs) {
-                            if (funcKey === 'multibytetowidechar') stubAddress = this.mbwcInlineStubs.mbToWcStub;
-                            else if (funcKey === 'widechartomultibyte') stubAddress = this.mbwcInlineStubs.wcToMbStub;
+                            if (funcKey === 'multibytetowidechar') inlineTarget = this.mbwcInlineStubs.mbToWcStub;
+                            else if (funcKey === 'widechartomultibyte') inlineTarget = this.mbwcInlineStubs.wcToMbStub;
                         }
                         // Trap-free tolower/toupper (any CRT module exporting them).
                         if (this.caseFoldInlineStubs && PELoader.CRT_SLAB_MODULES.has(dllName)) {
-                            if (funcKey === 'tolower') stubAddress = this.caseFoldInlineStubs.tolowerStub;
-                            else if (funcKey === 'toupper') stubAddress = this.caseFoldInlineStubs.toupperStub;
+                            if (funcKey === 'tolower') inlineTarget = this.caseFoldInlineStubs.tolowerStub;
+                            else if (funcKey === 'toupper') inlineTarget = this.caseFoldInlineStubs.toupperStub;
                         }
                         // Pure-compute math: real x86 in guest memory, no trap at all.
                         if (this.mathInlineStubs && PELoader.CRT_MATH_MODULES.has(dllName)) {
                             const field = PELoader.CRT_MATH_KEYS[funcKey];
-                            if (field) stubAddress = this.mathInlineStubs[field];
+                            if (field) inlineTarget = this.mathInlineStubs[field];
                         }
-                        if (stubAddress !== inlineBefore) inlinePatched.push(funcKey);
+                        // An inline fast path must not become a SECOND address for the export
+                        // (see the binding comment above): the export's body inside the image
+                        // is patched to JMP there instead, so the IAT still holds the one
+                        // address. A module with no image has no such body — bind the stub
+                        // directly rather than lose the fast path.
+                        if (inlineTarget !== undefined) {
+                            stubAddress = redirectHleImageExport(
+                                this.thunkGenerator, dllName, funcKey, inlineTarget, bound) ?? inlineTarget;
+                            inlinePatched.push(funcKey);
+                        }
                         if (stubAddress) {
                             this.view.setUint32(iatAddr, stubAddress, true);
                         } else {
@@ -1701,7 +1710,7 @@ export class PELoader {
                 // like a slow guest.
                 if (inlinePatched.length > 0) {
                     Logger.log(LogCategory.SYSTEM,
-                        `[PE] Inline stubs patched into ${dllNameRaw} IAT: ${inlinePatched.join(', ')}`);
+                        `[PE] Inline stubs bound for ${dllNameRaw}: ${inlinePatched.join(', ')}`);
                 }
 
                 // Load stub code into memory (skip if all stubs were reused)

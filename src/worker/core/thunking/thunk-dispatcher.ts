@@ -1463,7 +1463,9 @@ export class ThunkDispatcher {
             const stub = this.thunkGenerator.getStubByAddress(aligned);
             if (stub) {
                 const offset = eipValue - stub.address;
-                Logger.error(LogCategory.SYSTEM, `   Faulting EIP is inside thunk stub ${stub.dllName}:${stub.functionName} +0x${offset.toString(16)}`);
+                const redirect = stub.redirectedTo === undefined
+                    ? '' : ` (body redirected to inline stub 0x${stub.redirectedTo.toString(16)})`;
+                Logger.error(LogCategory.SYSTEM, `   Faulting EIP is inside thunk stub ${stub.dllName}:${stub.functionName} +0x${offset.toString(16)}${redirect}`);
             } else {
                 if (eipValue >= 0x80000 && eipValue < 0x100000) {
                     Logger.error(LogCategory.SYSTEM, `Execution escaped to STACK at 0x${eipValue.toString(16)}!`);

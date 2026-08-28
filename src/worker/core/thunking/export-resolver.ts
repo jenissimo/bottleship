@@ -40,8 +40,14 @@ export function resolveHleExportAddress(
         return 0;
     }
 
-    const dataAddr = tg.getDataExportAddress(dllName, exportName);
-    if (dataAddr !== undefined) return dataAddr >>> 0;
+    // The IAT and GetProcAddress must hand out the SAME address, or a wrapper that scans
+    // the import table for the pointer it was given finds nothing and installs no hook.
+    // hleExportBindingAddress is that one decision; the arena stub below is only for an
+    // export it does not cover (no image, or a name only the on-demand path can build).
+    const bound = hleExportBindingAddress(
+        tg, dllName, exportName,
+        !(globalThis as { __noImageIatBinding?: boolean }).__noImageIatBinding);
+    if (bound !== undefined) return bound >>> 0;
 
     const byQualifiedName = tg.getExportAddress(`${dllName}:${exportName}`);
     if (byQualifiedName !== undefined) return byQualifiedName >>> 0;
