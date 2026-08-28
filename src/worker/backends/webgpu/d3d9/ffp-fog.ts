@@ -12,7 +12,8 @@
  *   0.5   = the app supplies the factor in specular alpha (pre-transformed vertices, or
  *           both fog modes NONE — DXVK d3d9_fixed_function_vert.vert calculateFog)
  *   1..3  = table (pixel) fog EXP / EXP2 / LINEAR over CLIP Z
- *   5..7  = T&L vertex fog EXP / EXP2 / LINEAR over view-space depth (clip W)
+ *   5..7  = T&L vertex fog EXP / EXP2 / LINEAR over absolute view-space Z
+ *   9..11 = T&L vertex range fog EXP / EXP2 / LINEAR over eye-space distance
  *
  * Table fog is W-fog (D3DPRASTERCAPS_WFOG is advertised), so its depth is CLIP Z —
  * device_z × clip_w, linear in eye depth. That is exactly DXVK's fragment-shader
@@ -21,11 +22,25 @@
  * units. The [0,1] DEVICE z would instead be compared against FOGSTART/FOGEND expressed
  * in eye units, saturating the ratio to a constant over the primitive.
  *
- * NOT implemented: D3DRS_RANGEFOGENABLE (vertex fog over length(viewPos) rather than
- * depth) — see DXVK's rangeFog() branch.
+ * Range fog uses the same vertex-fog equations, but substitutes the Euclidean eye-space
+ * distance for clip W. The FFP vertex stage computes that distance before interpolation, so the
+ * feature does not depend on a depth-buffer read or a perspective divide in the fragment stage.
  */
 
 export const D3DFOG_NONE = 0;
+
+/**
+ * Resolve fog for the post-transform programmable pixel path. A programmable VS owns the
+ * vertex fog factor (oFog), so FOGVERTEXMODE's formula is not evaluated by fixed function.
+ * Table fog still wins and is evaluated per pixel from raster depth.
+ */
+export function resolveProgrammablePixelFogMode(
+    fogEnable: number,
+    fogTableMode: number,
+): number {
+    if (!fogEnable) return D3DFOG_NONE;
+    return fogTableMode !== D3DFOG_NONE ? fogTableMode : 0.5;
+}
 
 /**
  * Resolve D3DRS_FOGTABLEMODE / D3DRS_FOGVERTEXMODE into the shader's mode encoding.
@@ -48,26 +63,28 @@ export function resolveFfpFogMode(
     fogVertexMode: number,
     isRHW: boolean,
     hasSpecular: boolean,
+    rangeFog = false,
 ): number {
     if (!fogEnable) return D3DFOG_NONE;
     if (fogTableMode !== D3DFOG_NONE) return fogTableMode;
     if (isRHW || fogVertexMode === D3DFOG_NONE) return hasSpecular ? 0.5 : D3DFOG_NONE;
-    return fogVertexMode + 4;
+    return fogVertexMode + 4 + (rangeFog ? 4 : 0);
 }
 
 /**
- * `ffpFogFactor(mode, start, end, density, clipZ, clipW, specularAlpha) -> f32`
+ * `ffpFogFactor(mode, start, end, density, clipZ, eyeDepth, specularAlpha, eyeDistance) -> f32`
  *
  * 0 = fully unfogged, 1 = fully fog colour. The caller applies it as
  * `mix(color.rgb, fogColor.rgb, factor)` — fog never touches alpha.
  */
 export const FFP_FOG_WGSL = `
-fn ffpFogFactor(modeIn: f32, start: f32, end: f32, density: f32, clipZ: f32, clipW: f32, specularAlpha: f32) -> f32 {
+fn ffpFogFactor(modeIn: f32, start: f32, end: f32, density: f32, clipZ: f32, eyeDepth: f32, specularAlpha: f32, eyeDistance: f32) -> f32 {
     if (modeIn > 0.25 && modeIn < 0.75) { return clamp(1.0 - specularAlpha, 0.0, 1.0); }
     if (modeIn < 1.0) { return 0.0; }
     var mode = modeIn;
     var depth = clipZ;
-    if (mode >= 4.5) { mode = mode - 4.0; depth = clipW; }
+    if (mode >= 8.5) { mode = mode - 8.0; depth = eyeDistance; }
+    else if (mode >= 4.5) { mode = mode - 4.0; depth = eyeDepth; }
     var factor: f32;
     if (mode <= 1.5) {
         factor = 1.0 - exp(-density * depth);

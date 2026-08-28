@@ -15,10 +15,12 @@
  * cascade handles before it gets here.
  */
 export const FFP_IMPLEMENTED_OPS: ReadonlySet<number> = new Set([
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20, 21, 24, 25, 26,
+    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20, 21, 24, 25, 26,
 ]);
 
 /**
+ * `FFP_IMPLEMENTED_OPS` lists the operations that have a real `ffpStageOp` branch. DISABLE is
+ * handled by the stage cascade before this function, so it is intentionally not advertised.
  * `unhandledExpr` is what an op outside FFP_IMPLEMENTED_OPS evaluates to. The caller passes
  * either `dst` (leave the destination register alone — the only answer that cannot invent
  * pixels) or a loud colour when the operator wants to SEE which pixels depend on the gap.
@@ -26,10 +28,10 @@ export const FFP_IMPLEMENTED_OPS: ReadonlySet<number> = new Set([
 export function emitFfpCombinerWgsl(unhandledExpr: string): string {
     return `
 fn ffpStageArg(sel: u32, texC: vec4<f32>, cur: vec4<f32>, diff: vec4<f32>,
-               spec: vec4<f32>, tmp: vec4<f32>, tf: vec4<f32>) -> vec4<f32> {
+               spec: vec4<f32>, tmp: vec4<f32>, tf: vec4<f32>, stageConstant: vec4<f32>) -> vec4<f32> {
     // D3DTA base selector (modifier bits D3DTA_COMPLEMENT/ALPHAREPLICATE handled below).
-    // An unlisted base (6 = D3DTA_CONSTANT, which needs a per-stage D3DTSS_CONSTANT we do not
-    // carry) reads white so it is inert under MODULATE rather than doubling some other register.
+    // Base 6 is the per-stage D3DTSS_CONSTANT colour. The uniform carries one value for every
+    // stage, including the D3D default (0,0,0,0).
     let base = sel & 0xfu;
     var c = vec4<f32>(1.0);
     if (base == 0u) { c = diff; }          // 0 = DIFFUSE
@@ -38,6 +40,7 @@ fn ffpStageArg(sel: u32, texC: vec4<f32>, cur: vec4<f32>, diff: vec4<f32>,
     if (base == 3u) { c = tf; }            // 3 = TFACTOR
     if (base == 4u) { c = spec; }          // 4 = SPECULAR (vertex colour 1)
     if (base == 5u) { c = tmp; }           // 5 = TEMP (the D3DTSS_RESULTARG scratch register)
+    if (base == 6u) { c = stageConstant; } // 6 = CONSTANT (D3DTSS_CONSTANT)
     if ((sel & 0x10u) != 0u) { c = vec4<f32>(1.0) - c; }         // D3DTA_COMPLEMENT
     if ((sel & 0x20u) != 0u) { c = vec4<f32>(c.a, c.a, c.a, c.a); } // D3DTA_ALPHAREPLICATE
     return c;
@@ -48,8 +51,9 @@ fn ffpStageArg(sel: u32, texC: vec4<f32>, cur: vec4<f32>, diff: vec4<f32>,
  * alpha path keeps .a — because D3D defines every op over all four components and the channels
  * differ only in which arguments they were handed.
  *
- * Each op saturates its own result: D3D clamps at the end of every stage, so a MODULATE4X
- * feeding a later ADD must contribute at most 1.0, not its unclamped product.
+ * The scale variants and composite ops clamp their own result. Plain MODULATE is deliberately
+ * left unclamped: DXVK's FFP lowering preserves the product here, while the stage's destination
+ * write applies the fixed-function channel clamp.
  */
 fn ffpStageOp(op: u32, a0: vec4<f32>, a1: vec4<f32>, a2: vec4<f32>,
               texC: vec4<f32>, cur: vec4<f32>, diff: vec4<f32>, tf: vec4<f32>,
@@ -58,7 +62,7 @@ fn ffpStageOp(op: u32, a0: vec4<f32>, a1: vec4<f32>, a2: vec4<f32>,
     let zero = vec4<f32>(0.0);
     if (op == 2u) { return a1; }                                        // SELECTARG1
     if (op == 3u) { return a2; }                                        // SELECTARG2
-    if (op == 4u) { return clamp(a1 * a2, zero, one); }                 // MODULATE
+    if (op == 4u) { return a1 * a2; }                                   // MODULATE
     if (op == 5u) { return clamp(a1 * a2 * 2.0, zero, one); }           // MODULATE2X
     if (op == 6u) { return clamp(a1 * a2 * 4.0, zero, one); }           // MODULATE4X
     if (op == 7u) { return clamp(a1 + a2, zero, one); }                 // ADD

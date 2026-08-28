@@ -24,6 +24,31 @@ export const D3DLIGHT_POINT = 1;
 export const D3DLIGHT_SPOT = 2;
 export const D3DLIGHT_DIRECTIONAL = 3;
 
+/** D3DFORMATs with NO alpha channel — sampling one returns alpha 1.0 on real D3D, so the
+ *  stage's texture alpha must be forced to 1 rather than read off our RGBA copy. Shared by
+ *  the D3D9 and D3D8 hybrid (VS + fixed-function pixel) draw-state gathers, so a format's
+ *  alpha-less-ness cannot drift between the two backends.
+ *
+ *  D3DFMT_P8 (41) is NOT here: an 8-bit palettized texture carries alpha through
+ *  PALETTEENTRY.peFlags, and masking it makes every palettized texel opaque. */
+export const D3D_ALPHALESS_FORMATS = new Set([
+    20,  // R8G8B8
+    22,  // X8R8G8B8
+    23,  // R5G6B5
+    24,  // X1R5G5B5
+    27,  // R3G3B2
+    30,  // X4R4G4B4
+    33,  // X8B8G8R8
+    34,  // G16R16
+    50,  // L8
+    62,  // X8L8V8U8
+    81,  // L16
+    111, // R16F
+    112, // G16R16F
+    114, // R32F
+    115, // G32R32F
+]);
+
 // D3DMATERIALCOLORSOURCE
 export const D3DMCS_MATERIAL = 0;
 export const D3DMCS_COLOR1 = 1; // vertex diffuse
@@ -87,14 +112,27 @@ const TEXGEN_FLOATS = 4;
  */
 export const FFP_MAX_TEX_MATRICES = FFP_MAX_STAGES;
 const OFF_TEX_MATRICES = OFF_TEXGEN + FFP_MAX_STAGES * TEXGEN_FLOATS; // 456
+const OFF_STAGE_CONSTANTS = OFF_TEX_MATRICES + FFP_MAX_TEX_MATRICES * 16;
+export const FFP_STAGE_CONSTANT_FLOATS = FFP_MAX_STAGES * 4;
+/** World-matrix palette used by D3DRS_VERTEXBLEND / D3DRS_INDEXEDVERTEXBLENDENABLE. */
+export const FFP_MAX_BLEND_MATRICES = 8;
+const OFF_BLEND_MATRICES = OFF_STAGE_CONSTANTS + FFP_STAGE_CONSTANT_FLOATS;
+/** x = D3DRS_VERTEXBLEND, y = indexed-enable, z = D3DRS_TWEENFACTOR, w = matrix count. */
+const OFF_BLEND_CONTROL = OFF_BLEND_MATRICES + FFP_MAX_BLEND_MATRICES * 16;
 // Both totals are derived; ffp-lighting.test.ts pins them against the WGSL struct's own
 // layout, which is the check a written-down number here would only pretend to be.
-export const FFP_UNIFORM_FLOATS = OFF_TEX_MATRICES + FFP_MAX_TEX_MATRICES * 16;
+export const FFP_UNIFORM_FLOATS = OFF_BLEND_CONTROL + 4;
 
 /** Float index of stage `s`'s texgen vec4 (rawTexCoordIndex, textureTransformFlags, 0, 0). */
 export const ffpTexGenOffset = (stage: number): number => OFF_TEXGEN + stage * TEXGEN_FLOATS;
 /** Float index of stage `s`'s 4×4 texture matrix. */
 export const ffpTexMatrixOffset = (stage: number): number => OFF_TEX_MATRICES + stage * 16;
+/** Float index of stage `s`'s D3DTSS_CONSTANT colour. */
+export const ffpStageConstantOffset = (stage: number): number => OFF_STAGE_CONSTANTS + stage * 4;
+/** Float offset of world-matrix palette entry `index` (D3DTS_WORLDMATRIX(index)). */
+export const ffpBlendMatrixOffset = (index: number): number => OFF_BLEND_MATRICES + index * 16;
+/** Float offset of the vertex-blend control vec4. */
+export const ffpBlendControlOffset = (): number => OFF_BLEND_CONTROL;
 export const FFP_UNIFORM_BYTES = FFP_UNIFORM_FLOATS * 4;
 
 const OFF_VIEWPORT = 0;        // vec4: w, h, pixelCentreOffsetPx, 0
@@ -218,6 +256,8 @@ export interface FfpUniformParams {
         /** D3DTSS_RESULTARG: D3DTA_CURRENT (default) or D3DTA_TEMP. */
         resultArg: number;
         texCoordIndex: number; texTransformFlags: number;
+        /** D3DTSS_CONSTANT, selected by D3DTA_CONSTANT (base selector 6). */
+        constant?: FfpColor;
     }>;
     /** D3DTS_TEXTURE0..7 as one flat run of FFP_MAX_TEX_MATRICES × 16 floats (D3D row-major). */
     texMatrices: Float32Array;
@@ -230,12 +270,24 @@ export interface FfpUniformParams {
     fogEnd: number;
     fogDensity: number;
     fogMode: number;
+    /** D3DTS_WORLDMATRIX(0..7), row-major. Optional until the draw enables vertex blending. */
+    blendMatrices?: Float32Array;
+    /** D3DRS_VERTEXBLEND (x), indexed-enable (y), TWEENFACTOR (z), active matrix count (w). */
+    blendVertexMode?: number;
+    blendIndexed?: boolean;
+    blendTweenFactor?: number;
+    blendMatrixCount?: number;
 }
 
 /** A params record with every field present, for the per-draw gather to overwrite in place.
  *  Every value here is replaced before packFfpUniforms sees it. */
 export function makeFfpParams(): FfpUniformParams {
     const m = new Float32Array(16);
+    const blendMatrices = new Float32Array(FFP_MAX_BLEND_MATRICES * 16);
+    for (let i = 0; i < FFP_MAX_BLEND_MATRICES; i++) {
+        const b = i * 16;
+        blendMatrices[b] = blendMatrices[b + 5] = blendMatrices[b + 10] = blendMatrices[b + 15] = 1;
+    }
     return {
         viewportW: 0, viewportH: 0,
         mvp: m, worldView: m, normalMatrix: m, view: m, world: m,
@@ -249,6 +301,8 @@ export function makeFfpParams(): FfpUniformParams {
         texMatrices: new Float32Array(FFP_MAX_TEX_MATRICES * 16),
         tfactor: newFfpColor(), fogColor: newFfpColor(),
         fogStart: 0, fogEnd: 0, fogDensity: 0, fogMode: 0,
+        blendMatrices,
+        blendVertexMode: 0, blendIndexed: false, blendTweenFactor: 0, blendMatrixCount: 1,
     };
 }
 
@@ -331,6 +385,14 @@ export function packFfpUniforms(out: Float32Array, p: FfpUniformParams): void {
     out.set(p.normalMatrix.subarray(0, 16), OFF_NORMAL_MATRIX);
     out.set(p.texMatrices.subarray(0, FFP_MAX_TEX_MATRICES * 16), OFF_TEX_MATRICES);
 
+    // D3DTSS_CONSTANT is a per-stage D3DCOLOR. Keep this after the historical
+    // matrix tail so ffpStageOffset and all existing frame snapshots remain stable.
+    const defaultConstant = { r: 0, g: 0, b: 0, a: 0 };
+    for (let s = 0; s < FFP_MAX_STAGES; s++) {
+        const c = p.stages[s]?.constant ?? defaultConstant;
+        writeColor(out, ffpStageConstantOffset(s), c);
+    }
+
     // Texture blend stages (the .z of each b — the alpha-less-format flag — is set by the
     // per-draw writer, which is the only place that knows the bound texture's D3D format).
     const n = Math.min(p.stages.length, FFP_MAX_STAGES);
@@ -351,6 +413,16 @@ export function packFfpUniforms(out: Float32Array, p: FfpUniformParams): void {
         out[g] = st.texCoordIndex;
         out[g + 1] = st.texTransformFlags;
     }
+
+    // Keep palette data after all historical members so existing offsets remain stable. The
+    // zero/identity default is intentionally harmless when the blend control is disabled.
+    if (p.blendMatrices) {
+        out.set(p.blendMatrices.subarray(0, FFP_MAX_BLEND_MATRICES * 16), OFF_BLEND_MATRICES);
+    }
+    out[OFF_BLEND_CONTROL] = p.blendVertexMode ?? 0;
+    out[OFF_BLEND_CONTROL + 1] = p.blendIndexed ? 1 : 0;
+    out[OFF_BLEND_CONTROL + 2] = p.blendTweenFactor ?? 0;
+    out[OFF_BLEND_CONTROL + 3] = p.blendMatrixCount ?? 1;
 }
 
 const IDENTITY4 = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
@@ -470,6 +542,9 @@ struct Uniforms {
     normalMatrix: mat4x4<f32>, // inverse-transpose of worldView (3×3 part), for normals
     texGen: array<vec4<f32>, ${FFP_MAX_STAGES}>,          // raw TEXCOORDINDEX, raw TEXTURETRANSFORMFLAGS
     texMatrices: array<mat4x4<f32>, ${FFP_MAX_TEX_MATRICES}>, // D3DTS_TEXTURE0..7
+    stageConstants: array<vec4<f32>, ${FFP_MAX_STAGES}>, // D3DTSS_CONSTANT per stage
+    blendMatrices: array<mat4x4<f32>, ${FFP_MAX_BLEND_MATRICES}>, // D3DTS_WORLDMATRIX(0..7)
+    blendCtrl: vec4<f32>, // vertex blend mode, indexed enable, tween factor, matrix count
 }
 `;
 
@@ -477,7 +552,8 @@ struct Uniforms {
  * Fixed-function texture-coordinate generation + transform, evaluated in the vertex stage.
  *
  * `ffpTexCoordSrc` picks a stage's PRE-matrix coordinate from the raw D3DTSS_TEXCOORDINDEX:
- * the high 16 bits are a D3DTSS_TCI_* generator, the low 16 pick a vertex UV set otherwise.
+ * the high 16 bits are a D3DTSS_TCI_* generator, the low 16 pick one of the eight vertex UV
+ * sets otherwise. The FFP declaration path supplies absent sets as zero vectors.
  *   0 PASSTHRU               → vertex UV as (u, v, 1, 0)
  *   1 CAMERASPACENORMAL      → view-space normal,             (x, y, z, 1)
  *   2 CAMERASPACEPOSITION    → view-space position,           (x, y, z, 1)
@@ -493,12 +569,15 @@ struct Uniforms {
  * mat4x4 uniforms hold the D3D row-major bytes read column-major by WGSL, so `m * v` is exactly
  * the row-vector product D3D specifies, same convention as `mvp`.
  *
- * D3DTTFF_PROJECTED divides by output component `count-1`. Our varyings are vec2, so the divide
- * happens per VERTEX here while real hardware interpolates the full coordinate and divides per
- * pixel — the same approximation the DDraw backend documents, exact only for affine cases.
+ * D3DTTFF_PROJECTED marks the transformed coordinate as projective. Keep all four components
+ * in the varying: the FFP fragment path performs the divide after interpolation, which is the
+ * point at which fixed-function hardware applies it. Cube/volume sampling is refused by the
+ * D3D9 device until the corresponding sampler ABI exists.
  */
 export const FFP_TEXGEN_WGSL = `
-fn ffpTexCoordSrc(raw: u32, uv0: vec2<f32>, uv1: vec2<f32>,
+fn ffpTexCoordSrc(raw: u32,
+                  uv0: vec4<f32>, uv1: vec4<f32>, uv2: vec4<f32>, uv3: vec4<f32>,
+                  uv4: vec4<f32>, uv5: vec4<f32>, uv6: vec4<f32>, uv7: vec4<f32>,
                   ecPos: vec3<f32>, ecNormal: vec3<f32>) -> vec4<f32> {
     let mode = (raw >> 16u) & 0xffffu;
     if (mode == 1u) { return vec4<f32>(ecNormal, 1.0); }
@@ -509,21 +588,42 @@ fn ffpTexCoordSrc(raw: u32, uv0: vec2<f32>, uv1: vec2<f32>,
         let m = length(r + vec3<f32>(0.0, 0.0, 1.0)) * 2.0;
         return vec4<f32>(r.x / m + 0.5, r.y / m + 0.5, 0.0, 1.0);
     }
-    // Only UV sets 0 and 1 are carried as vertex attributes; a stage naming any other set
-    // falls back to set 0. Real D3D hands a stage an absent set as zeros; which of the two
-    // this shader does is decided by what the caller passes as uv1.
-    return vec4<f32>(select(uv0, uv1, (raw & 0xffffu) == 1u), 1.0, 0.0);
+    // D3D9 exposes eight independent FFP coordinate sets. The old path carried only sets
+    // zero and one and silently aliased higher TEXCOORDINDEX values to set zero. Keep the
+    // selection explicit so declaration-based FFP draws can bind every set; absent sets are
+    // supplied as zero vectors by the layout builder, matching D3D's missing-stream value.
+    // NOT named 'set': that is a RESERVED WORD in WGSL, and using it makes the whole
+    // shader module invalid — which invalidates its pipeline, its command buffer, and so
+    // every draw in the frame. The only report is the GPU error scope; the screen just
+    // goes black.
+    let uvSet = raw & 0xffffu;
+    if (uvSet == 1u) { return uv1; }
+    if (uvSet == 2u) { return uv2; }
+    if (uvSet == 3u) { return uv3; }
+    if (uvSet == 4u) { return uv4; }
+    if (uvSet == 5u) { return uv5; }
+    if (uvSet == 6u) { return uv6; }
+    if (uvSet == 7u) { return uv7; }
+    return uv0;
 }
 
-fn ffpTexTransform(src: vec4<f32>, m: mat4x4<f32>, flags: u32) -> vec2<f32> {
+fn ffpTexTransform(src: vec4<f32>, m: mat4x4<f32>, flags: u32) -> vec4<f32> {
     let count = flags & 0x7u;
-    if (count < 2u || count > 4u) { return src.xy; }
+    if (count < 2u || count > 4u) { return src; }
     let v = m * src;
-    if ((flags & 256u) != 0u) {
-        let p = v[count - 1u];
-        if (abs(p) > 1e-6) { return v.xy / p; }
-    }
-    return v.xy;
+    return v;
+}
+
+// D3DTTFF_PROJECTED divides by the LAST component of the D3DTTFF_COUNT, not always by w
+// (wined3d compute_texture_matrix copies column COUNT into column 4 for exactly this).
+// COUNT2 -> y, COUNT3 -> z, COUNT4 (and a disabled/COUNT1 transform) -> w.
+fn ffpProjectTexcoord(tc: vec4<f32>, flags: u32) -> vec2<f32> {
+    if ((flags & 256u) == 0u) { return tc.xy; }
+    let count = flags & 0x7u;
+    var q = tc.w;
+    if (count == 2u) { q = tc.y; }
+    else if (count == 3u) { q = tc.z; }
+    return tc.xy / select(1.0, q, abs(q) > 1e-6);
 }`;
 
 /**

@@ -119,9 +119,10 @@ describe("D3D9 FFP stage combiner", () => {
     const envs = environments();
 
     test("the shader implements exactly the ops FFP_IMPLEMENTED_OPS advertises", () => {
-        // DISABLE (1) never reaches ffpStageOp — the cascade handles it — so it has no branch.
-        const advertised = [...FFP_IMPLEMENTED_OPS].filter((op) => op !== 1).sort((a, b) => a - b);
+        // DISABLE (1) never reaches ffpStageOp — the cascade handles it — so it is not advertised.
+        const advertised = [...FFP_IMPLEMENTED_OPS].sort((a, b) => a - b);
         expect([...exprs.keys()].sort((a, b) => a - b)).toEqual(advertised);
+        expect(FFP_IMPLEMENTED_OPS.has(1)).toBe(false);
     });
 
     test("every advertised op is covered by a reference formula", () => {
