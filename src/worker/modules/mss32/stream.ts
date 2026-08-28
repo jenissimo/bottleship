@@ -3,7 +3,7 @@ import { Logger, LogCategory } from "../../core/logger";
 import { Marshaler } from "../../core/memory/marshaler";
 import { Mem } from "../../core/memory/mem-accessor";
 import { isValidAddress } from "../../core/memory/address-guard";
-import { MSSContext, SMP_DONE, SMP_PLAYING } from "./context";
+import { MSSContext, SMP_DONE, SMP_PLAYING, SMP_STOPPED } from "./context";
 import { MSSStream } from "./types";
 import { System } from "../../core/system";
 import {
@@ -267,10 +267,14 @@ export function createStreamExports(ctx: MSSContext): Record<string, ThunkImplem
     };
 
     // _AIL_stream_status@4
+    /** A PAUSED stream is SMP_STOPPED, not SMP_PLAYING — same as the sample side
+     *  (_AIL_stop_sample stamps SMP_STOPPED). Apps use "pause, then wait for the
+     *  stream to stop being SMP_PLAYING" to hand the audio device over; answering
+     *  PLAYING makes that wait unsatisfiable and the handover never happens. */
     exports["_AIL_stream_status@4"] = (ctxThunk, mem, args) => {
         const stream = ctx.streams.get(args[0]);
         if (!stream) return SMP_DONE;
-        if (stream.isPaused) return SMP_PLAYING;
+        if (stream.isPaused) return SMP_STOPPED;
         return stream.isPlaying ? SMP_PLAYING : SMP_DONE;
     };
 
@@ -623,6 +627,7 @@ function pauseStream(ctx: MSSContext, stream: MSSStream): void {
         self.postMessage({ type: "audio_pause", payload: { id: stream.id } });
     }
     stream.isPaused = true;
+    setStreamStatus(ctx, stream, SMP_STOPPED);
     Logger.log(LogCategory.SYSTEM, `MSS32: Stream paused (id=${stream.id})`);
 }
 
@@ -639,6 +644,7 @@ function unpauseStream(ctx: MSSContext, stream: MSSStream): void {
         self.postMessage({ type: "audio_resume", payload: { id: stream.id } });
     }
     stream.isPaused = false;
+    setStreamStatus(ctx, stream, SMP_PLAYING);
     Logger.log(LogCategory.SYSTEM, `MSS32: Stream resumed (id=${stream.id})`);
 }
 

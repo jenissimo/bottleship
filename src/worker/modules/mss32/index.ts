@@ -24,6 +24,7 @@ import { createFileIOExports } from "./file-io";
 import { createWavInfoExports } from "./wav-info";
 import { createSequenceExports } from "./sequence";
 import { createMidiDriverExports } from "./midi-driver";
+import { mssCensus, type MssCensus } from "./census";
 
 /**
  * Bytes each export pops on return, read from the SAME descriptor the guest stub's
@@ -230,9 +231,10 @@ export class MSS32 implements IModule {
             return;
         }
 
-        // Check if it's a stream
+        // Check if it's a stream (a paused one keeps isPlaying; a late position report
+        // must not stamp SMP_PLAYING back over the SMP_STOPPED pause published for it)
         const stream = ctx.streamsById.get(id);
-        if (stream && stream.isPlaying) {
+        if (stream && stream.isPlaying && !stream.isPaused) {
             const channels = Math.max(1, stream.channels || 1);
             const bytesPerSample = Math.max(1, (stream.bitsPerSample || 16) >> 3);
             const blockAlign = stream.blockAlign || channels * bytesPerSample;
@@ -290,6 +292,11 @@ export class MSS32 implements IModule {
         } else {
             appendDecodedChunk(this.ctx, sample, chunk);
         }
+    }
+
+    /** Live Miles state for the harness (`mssAudio`) — see census.ts. */
+    dbgMssCensus(): MssCensus {
+        return mssCensus(this.ctx);
     }
 
     /**
