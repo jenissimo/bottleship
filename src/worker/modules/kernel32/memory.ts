@@ -872,6 +872,8 @@ export const exports: Record<string, ThunkImplementation> = (() => {
     const ERROR_INVALID_HANDLE = 6;
     const ERROR_INVALID_ADDRESS = 487;
     const THUNK_GENERATOR_REGION_SIZE = 1024 * 1024;
+    /** Highest user-mode address + 1 on 32-bit Windows: above it VirtualQuery fails. */
+    const USER_SPACE_LIMIT = 0x7FFF0000;
     const PAGE_NOACCESS = 0x01;
     const PAGE_READONLY = 0x02;
     const PAGE_READWRITE = 0x04;
@@ -1306,7 +1308,25 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 
             const pageBase = (lpAddress & ~0xFFF) >>> 0;
             if (pageBase >= memLen) {
-                return 0;
+                // Above backed RAM the address space still EXISTS as far as a Win32 process
+                // is concerned, and Wine describes exactly this case (fill_basic_memory_info's
+                // fake_reserved): MEM_RESERVE | PAGE_NOACCESS. Both other answers break a
+                // caller. MEM_FREE invites an allocator to take the whole remnant, which is
+                // how SmartHeap's MemPoolPreAllocate came to VirtualAlloc ~800MB it cannot
+                // have and MessageBox OOM. A hard failure gives the canonical walk
+                // (p = BaseAddress + RegionSize) no size to advance by, so it re-asks the same
+                // address for ever — Blade of Darkness spun 33.8M times on 0x60000000, the
+                // first page past 1.5GB of RAM. Only above the user-space limit does
+                // VirtualQuery fail, which is where Windows fails too.
+                if (pageBase >= USER_SPACE_LIMIT) return 0;
+                view.setUint32(lpBuffer, pageBase, true);                          // BaseAddress
+                view.setUint32(lpBuffer + 4, memLen, true);                        // AllocationBase
+                view.setUint32(lpBuffer + 8, PAGE_NOACCESS, true);                 // AllocationProtect
+                view.setUint32(lpBuffer + 12, USER_SPACE_LIMIT - pageBase, true);  // RegionSize
+                view.setUint32(lpBuffer + 16, MEM_RESERVE, true);                  // State
+                view.setUint32(lpBuffer + 20, PAGE_NOACCESS, true);                // Protect
+                view.setUint32(lpBuffer + 24, MEM_PRIVATE, true);                  // Type
+                return 28;
             }
 
             let baseAddress = pageBase;

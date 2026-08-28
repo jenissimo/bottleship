@@ -213,9 +213,24 @@ describe("VirtualQuery fast path == full body", () => {
         expect(r.slow[6]).toBe(0x01000000);
     });
 
-    test("an address past backed guest RAM defers, and the body refuses it", () => {
-        expect(callFast(MEM_SIZE + 0x1000, FAST_BUF)).toBeNull();
-        expect(callSlow(MEM_SIZE + 0x1000, SLOW_BUF)).toBe(0);
+    test("past backed RAM the body reports the tail RESERVED, so a walk can step over it", () => {
+        // Wine's fill_basic_memory_info answers fake_reserved space with
+        // MEM_RESERVE|PAGE_NOACCESS. The canonical walk is p = BaseAddress + RegionSize, so a
+        // refusal here hands it no size to advance by and it re-asks the same address for
+        // ever; MEM_FREE would instead invite an allocator to take a remnant it cannot have.
+        const addr = MEM_SIZE + 0x1000;
+        expect(callFast(addr, FAST_BUF)).toBeNull();
+        expect(callSlow(addr, SLOW_BUF)).toBe(28);
+        const info = mbi(SLOW_BUF);
+        expect(info[0]).toBe(addr);            // BaseAddress
+        expect(info[1]).toBe(MEM_SIZE);        // AllocationBase — the tail starts at backed RAM
+        expect(info[3]).toBe(0x7FFF0000 - addr); // RegionSize reaches the user-space limit
+        expect(info[4]).toBe(0x2000);          // MEM_RESERVE
+        expect(info[5]).toBe(0x01);            // PAGE_NOACCESS
+        expect(info[6]).toBe(0x20000);         // MEM_PRIVATE
+        // The walk terminates where Windows terminates it, and not before.
+        expect(callSlow(0x7FFF0000, SLOW_BUF)).toBe(0);
+        expect(callSlow(0x7FFEF000, SLOW_BUF)).toBe(28);
     });
 
     test("a too-small output buffer defers to the body's own refusal", () => {
