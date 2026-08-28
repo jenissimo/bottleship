@@ -95,6 +95,13 @@ export interface DebugFlags {
      *  that first covers a region — the only way to find which draw wrote the depth (or the
      *  pixels) that hides everything issued after it. */
     drawScrubMax: number;
+    /** DIAG: render every draw EXCEPT [drawSkipFrom, drawSkipTo] (-1 = off). The complement
+     *  of drawScrubMax: a prefix cut also removes the post-process blit a render-to-texture
+     *  title presents with, so the screen goes black for every cut and the bisect measures
+     *  nothing. Skipping a WINDOW keeps the blit and answers the question the cut cannot:
+     *  does removing exactly this draw remove the artifact? */
+    drawSkipFrom: number;
+    drawSkipTo: number;
 }
 
 /**
@@ -126,6 +133,8 @@ export const DEFAULT_DEBUG_FLAGS: DebugFlags = {
     forceColorWriteMask: -1,
     disableRhwDepthClamp: false,
     drawScrubMax: -1,
+    drawSkipFrom: -1,
+    drawSkipTo: -1,
 };
 
 /**
@@ -396,6 +405,7 @@ export interface PipelineKeyConfig {
     forceDisableZTest: boolean;
     forceDisableZWrite: boolean;
     debugView: "normal" | "uv" | "vertexcolor" | "alpha" | "solid"; // Affects shader: output mode
+    forceWireColor: boolean; // Affects shader: flat diagnostic colour override
     flatShading: boolean; // D3DSHADE_FLAT: flat @interpolate on color/specular varyings (affects shader)
     // NOTE: colorOp, alphaOp, lightingEnabled, fogMode, colorOp1, alphaOp1 are NOT in key
     // because they are handled via uniforms in universal shader, not shader code generation
@@ -415,7 +425,7 @@ export function makeEmptyPipelineKeyConfig(): PipelineKeyConfig {
         stencilEnable: 0, stencilFunc: 0, stencilFail: 0, stencilZFail: 0, stencilPass: 0,
         stencilRef: 0, stencilMask: 0, stencilWriteMask: 0,
         forceZMidpoint: false, forceCullNone: false, forceDisableZTest: false, forceDisableZWrite: false,
-        debugView: "normal", flatShading: false,
+        debugView: "normal", forceWireColor: false, flatShading: false,
     };
 }
 
@@ -456,6 +466,7 @@ export function generatePipelineKey(config: PipelineKeyConfig): string {
         `fzt:${config.forceDisableZTest ? 1 : 0}`,
         `fzw:${config.forceDisableZWrite ? 1 : 0}`,
         `dv:${config.debugView}`,
+        `fwc:${config.forceWireColor ? 1 : 0}`,
         `flat:${config.flatShading ? 1 : 0}`,
     ].join("|");
 }
@@ -498,6 +509,7 @@ export function generateMegaBatchPipelineKey(config: PipelineKeyConfig): string 
         `fzt:${config.forceDisableZTest ? 1 : 0}`,
         `fzw:${config.forceDisableZWrite ? 1 : 0}`,
         `dv:${config.debugView}`,
+        `fwc:${config.forceWireColor ? 1 : 0}`,
         `flat:${config.flatShading ? 1 : 0}`,
     ].join("|");
 }
@@ -539,6 +551,7 @@ export function pipelineKeyConfigsEqual(a: PipelineKeyConfig, b: PipelineKeyConf
         a.forceDisableZTest === b.forceDisableZTest &&
         a.forceDisableZWrite === b.forceDisableZWrite &&
         a.debugView === b.debugView &&
+        a.forceWireColor === b.forceWireColor &&
         a.flatShading === b.flatShading;
 }
 
@@ -576,6 +589,7 @@ export function megaBatchPipelineKeyConfigsEqual(a: PipelineKeyConfig, b: Pipeli
         a.forceDisableZTest === b.forceDisableZTest &&
         a.forceDisableZWrite === b.forceDisableZWrite &&
         a.debugView === b.debugView &&
+        a.forceWireColor === b.forceWireColor &&
         a.flatShading === b.flatShading;
 }
 

@@ -360,14 +360,6 @@ export const DDPIXELFORMAT_Z_OFFSETS = {
     stencilBitMask: DDPIXELFORMAT_OFFSETS.bMask,
 };
 
-export {
-    COM_OBJECT_SIZE,
-    COM_GUARD_SIZE,
-    COM_GUARD_VALUE,
-    allocateComObject,
-    checkComGuard
-} from '../../core/com/com-memory';
-
 export const D3DRENDERSTATE_TEXTUREHANDLE = 1;
 export const D3DRENDERSTATE_ZENABLE = 7;
 export const D3DRENDERSTATE_FILLMODE = 8;
@@ -643,10 +635,17 @@ export const D3DTOP_SUBTRACT = 10;    // Output = arg1 - arg2
 // They were previously mis-numbered (TEXTUREALPHA=11/FACTORALPHA=12/DIFFUSEALPHA=13), so a game sending
 // 13 (BLENDTEXTUREALPHA) was rendered as BLENDDIFFUSEALPHA. The shader-generator keys off the symbolic
 // names, so correcting the values here fixes the WGSL combine automatically.
-export const D3DTOP_ADDSMOOTH = 11;          // Output = arg1 + arg2 - arg1*arg2 (no WGSL impl yet → MODULATE fallback)
+export const D3DTOP_ADDSMOOTH = 11;          // Output = arg1 + arg2*(1 - arg1)
 export const D3DTOP_BLENDDIFFUSEALPHA = 12;  // Output = arg1 * diffuse.a + arg2 * (1 - diffuse.a)
 export const D3DTOP_BLENDTEXTUREALPHA = 13;  // Output = arg1 * tex.a     + arg2 * (1 - tex.a)
 export const D3DTOP_BLENDFACTORALPHA = 14;   // Output = arg1 * factor.a  + arg2 * (1 - factor.a)
+export const D3DTOP_BLENDTEXTUREALPHAPM = 15; // Output = arg1 + arg2 * (1 - tex.a); arg1 is premultiplied
+export const D3DTOP_BLENDCURRENTALPHA = 16;  // Output = arg1 * current.a + arg2 * (1 - current.a)
+export const D3DTOP_MODULATEALPHA_ADDCOLOR = 18;    // Output = arg1 + arg1.a * arg2
+export const D3DTOP_MODULATECOLOR_ADDALPHA = 19;    // Output = arg1 * arg2 + arg1.a
+export const D3DTOP_MODULATEINVALPHA_ADDCOLOR = 20; // Output = arg1 + (1 - arg1.a) * arg2
+export const D3DTOP_MODULATEINVCOLOR_ADDALPHA = 21; // Output = (1 - arg1) * arg2 + arg1.a
+export const D3DTOP_DOTPRODUCT3 = 24;        // Output = 4 * dot(arg1.rgb - 0.5, arg2.rgb - 0.5), replicated
 export const D3DTOP_MULTIPLYADD = 25;        // Output = arg1 * arg2 + arg0
 export const D3DTOP_LERP = 26;               // Output = arg1 * arg0 + arg2 * (1 - arg0)
 
@@ -656,8 +655,20 @@ export const D3DTA_DIFFUSE = 0x00000000;     // Use diffuse color
 export const D3DTA_CURRENT = 0x00000001;     // Use current stage output
 export const D3DTA_TEXTURE = 0x00000002;    // Use texture color
 export const D3DTA_TFACTOR = 0x00000003;     // Use texture factor (D3DRENDERSTATE_TEXTUREFACTOR)
+export const D3DTA_SPECULAR = 0x00000004;    // Use vertex specular color (COLOR1)
+export const D3DTA_TEMP = 0x00000005;        // Use the D3DTSS_RESULTARG scratch register
 export const D3DTA_COMPLEMENT = 0x00000010;  // Complement modifier (1.0 - value)
 export const D3DTA_ALPHAREPLICATE = 0x00000020; // Replicate alpha channel to RGB
+
+// D3DTSS_RESULTARG: selects D3DTA_CURRENT (default) or D3DTA_TEMP as the stage's write target.
+// Captured generically by the device layer (stage*32+type) but not yet threaded through
+// ffp-stages.ts's per-stage packing, so D3DTA_TEMP currently reads its D3D-documented
+// (0,0,0,0) initial value for the whole cascade rather than a stage's actual RESULTARG write.
+export const D3DTSS_RESULTARG = 28;
+
+// D3DRENDERSTATE_RANGEFOGENABLE: exists identically from D3D3 through D3D9 (same value, 48),
+// not a D3D9-only addition.
+export const D3DRENDERSTATE_RANGEFOGENABLE = 48;
 
 // Clear flags
 export const D3DCLEAR_TARGET = 1;

@@ -8,7 +8,8 @@ import { DDrawContext } from "../context";
 import { bytesToGuid } from "../helpers";
 import { isValidAddress } from "../../../core/memory/address-guard";
 import type { RegionPerms } from "../../../core/memory/address-space";
-import { COM_OBJECT_SIZE, IID_IDirect3DViewport3, allocateComObject, E_FAIL, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, DDERR_INVALIDPARAMS } from "../constants";
+import { IID_IDirect3DViewport3, E_FAIL, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, DDERR_INVALIDPARAMS } from "../constants";
+import { COM_OBJECT_SIZE, allocateComObject } from "../../../core/com/com-memory";
 import {
     Direct3DViewport3Object,
     Direct3DViewport2Object,

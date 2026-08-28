@@ -262,7 +262,9 @@ describe("shader generation (stage-generic WGSL)", () => {
         for (const s of [0, 1, 2, 3]) expect(code).toContain(`uniforms.stages[${s}]`);
         expect(code).toContain(`stages: array<vec4u, ${MAX_FFP_STAGES}>`);
         expect(code).toContain("var tex2Color = vec4f(0.0, 0.0, 0.0, 1.0)");
-        expect(code).toContain("arg0 + arg1 * arg2");
+        // MULTIPLYADD (D3DTOP 25): Output = arg0 + arg1 * arg2, expressed over the resolved
+        // vec4 registers (see applyStageOp in shader-generator.ts / d3d8-ffp-combiner.test.ts).
+        expect(code).toContain("a0 + a1 * a2");
     });
 
     test("legacy shader: untextured stage 0 falls back to diffuse", () => {

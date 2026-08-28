@@ -29,6 +29,41 @@ const KNOWN_NON_LUT_FORMATS: PixelFormat[] = [
 ];
 const warnedUnknownFormats = new Set<PixelFormat>();
 
+/** CPU mirror of the debugMode branch in the WGSL converter shaders above (modes 1 and 3;
+ *  2/"raw" is a no-op here — the CPU path already holds decoded RGBA, so there is no rawer
+ *  byte to show). The GPU compute shader only runs for a whole-surface upload with no live
+ *  rgbaScratch cache; a BitmapTexture (D3D8 CreateTexture+LockRect, most Blt-updated ddraw
+ *  textures) takes the CPU rgbaScratch/convertSync path instead and never reaches the WGSL
+ *  branch — textureConverterDebugMode applied to the executor and changed nothing on
+ *  screen. Call on a COPY, never the cached rgbaScratch buffer itself: that buffer is the
+ *  authoritative CPU pixel source for readback/colorkey and must not be overwritten with
+ *  debug paint. */
+export function applyTextureConverterDebugPaintCPU(
+    rgba: Uint8Array, width: number, height: number, debugMode: number, srcBpp: number,
+): void {
+    if (debugMode !== 1 && debugMode !== 3) return;
+    for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+            const i = (y * width + x) * 4;
+            if (debugMode === 1) {
+                // Show format detection: red = 32-bit, green = 16-bit, blue = 8-bit.
+                if (srcBpp >= 32) { rgba[i] = 255; rgba[i + 1] = 0; rgba[i + 2] = 0; }
+                else if (srcBpp >= 16) { rgba[i] = 0; rgba[i + 1] = 255; rgba[i + 2] = 0; }
+                else { rgba[i] = 0; rgba[i + 1] = 0; rgba[i + 2] = 255; }
+                rgba[i + 3] = 255;
+            } else {
+                // UV grid: a checker pattern plus an X/Y gradient, so a texel's screen
+                // position can be read back off its own colour.
+                const grid = ((x >> 4) + (y >> 4)) & 1;
+                rgba[i] = (x * 255 / width) & 0xff;
+                rgba[i + 1] = (y * 255 / height) & 0xff;
+                rgba[i + 2] = grid === 0 ? 0x33 : 0xcc;
+                rgba[i + 3] = 255;
+            }
+        }
+    }
+}
+
 // Workgroup size for compute shader
 const WORKGROUP_SIZE_X = 16;
 const WORKGROUP_SIZE_Y = 16;

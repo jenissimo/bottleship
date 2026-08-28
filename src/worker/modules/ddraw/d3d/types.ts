@@ -1,8 +1,8 @@
 /**
  * Shared types for D3D module
  */
-import { ThunkImplementation } from "../../../core/thunking/thunk-dispatcher";
-import { DDrawContext } from "../context";
+import type { ThunkImplementation } from "../../../core/thunking/thunk-dispatcher";
+import type { DDrawContext } from "../context";
 import type { DirectDrawSurfaceObject, DirectDrawSurfaceState } from "../com-objects";
 
 export type D3DExports = Record<string, ThunkImplementation>;
@@ -61,12 +61,19 @@ export interface D3DLight7Data {
 }
 
 /**
- * Create default material (white diffuse, no specular, no emissive)
+ * Create default material — all-zero. Real D3D has no non-zero material default: the device's
+ * material struct is zero-initialized (wined3d's `state` is calloc'd and `state_init_default`
+ * never touches `state->material`; the D3D9 path here independently gets this right because
+ * `materialData` is a zero-filled Uint8Array only ever written by SetMaterial). A white default
+ * would be pixel-visible only once a title turns D3DRENDERSTATE_LIGHTING on without having
+ * called SetMaterial yet — the D3D8/D3D7 paths default LIGHTING to FALSE (see that seed's own
+ * comment), so this mainly fixes what GetMaterial/state-block capture report before the app's
+ * first SetMaterial.
  */
 export function createDefaultMaterial(): D3DMaterial7Data {
     return {
-        diffuse: { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
-        ambient: { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+        diffuse: { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
+        ambient: { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
         specular: { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
         emissive: { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
         power: 0.0,
@@ -196,6 +203,14 @@ import {
     D3DRENDERSTATE_FOGDENSITY,
     D3DRENDERSTATE_SPECULARENABLE,
     D3DRENDERSTATE_COLORKEYENABLE,
+    D3DRENDERSTATE_STENCILENABLE,
+    D3DRENDERSTATE_STENCILFAIL,
+    D3DRENDERSTATE_STENCILZFAIL,
+    D3DRENDERSTATE_STENCILPASS,
+    D3DRENDERSTATE_STENCILFUNC,
+    D3DRENDERSTATE_STENCILREF,
+    D3DSTENCILOP_KEEP,
+    D3DRENDERSTATE_POINTSCALE_A,
     D3DRENDERSTATE_LIGHTING,
     D3DRENDERSTATE_AMBIENT,
     D3DRENDERSTATE_TEXTUREFACTOR,
@@ -338,6 +353,24 @@ function createDefaultRenderStates(): Int32Array {
     const D3DRS_STENCILMASK = 58, D3DRS_STENCILWRITEMASK = 59, ALL_STENCIL_BITS = 0xff;
     rs[D3DRS_STENCILMASK] = ALL_STENCIL_BITS;
     rs[D3DRS_STENCILWRITEMASK] = ALL_STENCIL_BITS;
+
+    // ...and the same trap once more for the stencil OPS and the compare, where 0 is not even a
+    // legal D3DSTENCILOP/D3DCMP — both enumerations start at 1. A title that enables stencil
+    // without setting them reads back nonsense from GetRenderState and captures nonsense into a
+    // state block; the draw path's own fallbacks keep pixels correct today, so this only fixes
+    // what the game can OBSERVE. Defaults per wined3d stateblock.c (KEEP/KEEP/KEEP/ALWAYS/0).
+    rs[D3DRENDERSTATE_STENCILENABLE] = 0;
+    rs[D3DRENDERSTATE_STENCILFAIL] = D3DSTENCILOP_KEEP;
+    rs[D3DRENDERSTATE_STENCILZFAIL] = D3DSTENCILOP_KEEP;
+    rs[D3DRENDERSTATE_STENCILPASS] = D3DSTENCILOP_KEEP;
+    rs[D3DRENDERSTATE_STENCILFUNC] = D3DCMP_ALWAYS;
+    rs[D3DRENDERSTATE_STENCILREF] = 0;
+
+    // D3DRENDERSTATE_POINTSCALE_A defaults to 1.0f (B/C default to 0.0f, which an unseeded
+    // slot already gives correctly). Left at 0.0f, the shared attenuation formula
+    // size/sqrt(A+B·De+C·De²) divides by zero the moment a title enables
+    // POINTSCALEENABLE without setting all three constants.
+    rs[D3DRENDERSTATE_POINTSCALE_A] = 0x3F800000; // 1.0f
 
     return rs;
 }

@@ -41,9 +41,28 @@ import {
     D3DTSS_ADDRESSV,
     D3DTADDRESS_WRAP,
     D3DTFP_NONE,
+    D3DTFP_POINT,
+    D3DTFP_LINEAR,
     D3DTOP_MULTIPLYADD,
     D3DTOP_LERP,
 } from "../../../modules/ddraw/constants";
+// Not re-exported by the barrel above — imported straight from the leaf constants module
+// (see CLAUDE.md file-ownership notes: modules/ddraw/constants.ts itself is out of scope).
+import {
+    D3DTSS_MIPMAPLODBIAS,
+    D3DTSS_MAXMIPLEVEL,
+    D3DTSS_BORDERCOLOR,
+} from "../../../modules/ddraw/d3d/sampler-constants";
+// D3D8/D3D9 D3DTEXTUREFILTERTYPE numbering (NONE=0/POINT=1/LINEAR=2/ANISOTROPIC=3) — the
+// vocabulary D3D8 titles actually write via SetTextureStageState (see decodeD3d8TssSampler's
+// header comment). Only the MIPFILTER encoding disagrees with D3D7's D3DTFP_* (NONE=1/POINT=2/
+// LINEAR=3); MIN/MAGFILTER happen to share bit patterns with D3D7's D3DTFN_*/D3DTFG_* already.
+import {
+    D3DTEXF_NONE,
+    D3DTEXF_POINT,
+    D3DTEXF_LINEAR,
+    D3DTEXF_ANISOTROPIC,
+} from "../d3d8/d3d8-sampler";
 
 /** Cascade depth we implement — matches the advertised MaxTextureBlendStages. */
 export const MAX_FFP_STAGES = 8;
@@ -62,7 +81,33 @@ export const MAX_FFP_TEX_MATRICES = 3;
 export const FFP_STAGE_PACK_BYTES = MAX_FFP_STAGES * 16;
 export const FFP_STAGE_PACK_WORDS = MAX_FFP_STAGES * 4;
 
-/** Per-stage sampler parameters (D3D7 enums), consumed by BindGroupManager. */
+/**
+ * Which D3D version's D3DTSS_MIPFILTER numbering the texture-stage state array was written
+ * in. This decoder is SHARED by genuine DDraw/D3D7 callers and D3D8's fixed-function draws —
+ * D3D7 titles write D3DTFP_* (NONE=1/POINT=2/LINEAR=3), D3D8 titles write D3DTEXF_* (D3D9's
+ * NONE=0/POINT=1/LINEAR=2), and the two are NOT numerically compatible for mip filtering (see
+ * docs/d3d8-parity/02-samplers.md F1). Defaults to "d3d7" so every existing DDraw/D3D7 call
+ * site is byte-for-byte unaffected unless a D3D8 caller explicitly opts in via
+ * setFilterVocabulary().
+ */
+export type FfpFilterVocabulary = "d3d7" | "d3d9";
+
+/** Translate a D3D8/D3D9-numbered D3DTEXF_* mip filter into the D3D7 D3DTFP_* encoding this
+ *  module and its consumers (BindGroupManager) store/decode internally. ANISOTROPIC has no
+ *  distinct D3D7 mip encoding; real drivers treat it as trilinear, so it maps to LINEAR. */
+function d3d9MipFilterToD3d7(v: number): number {
+    switch (v) {
+        case D3DTEXF_POINT: return D3DTFP_POINT;
+        case D3DTEXF_LINEAR:
+        case D3DTEXF_ANISOTROPIC: return D3DTFP_LINEAR;
+        case D3DTEXF_NONE:
+        default: return D3DTFP_NONE;
+    }
+}
+
+/** Per-stage sampler parameters (D3D7 enums — see FfpFilterVocabulary), consumed by
+ *  BindGroupManager. mipLodBiasBits/maxMipLevel/borderColor are optional so existing default-
+ *  state construction that doesn't know about them still type-checks (they read as unset). */
 export interface StageSamplerState {
     minFilter: number;
     magFilter: number;
@@ -70,6 +115,12 @@ export interface StageSamplerState {
     maxAnisotropy: number;
     addressU: number;
     addressV: number;
+    /** D3DTSS_MIPMAPLODBIAS raw DWORD (IEEE-754 float bits). */
+    mipLodBiasBits?: number;
+    /** D3DTSS_MAXMIPLEVEL raw DWORD. */
+    maxMipLevel?: number;
+    /** D3DTSS_BORDERCOLOR raw packed ARGB DWORD. */
+    borderColor?: number;
 }
 
 /**
@@ -94,6 +145,28 @@ export class FfpStagesState {
     readonly maxAnisotropy = new Int32Array(MAX_FFP_STAGES);
     readonly addressU = new Int32Array(MAX_FFP_STAGES);
     readonly addressV = new Int32Array(MAX_FFP_STAGES);
+    /** D3DTSS_MIPMAPLODBIAS raw DWORD per stage (IEEE-754 float bits; decoded at sampler build). */
+    readonly mipLodBiasBits = new Int32Array(MAX_FFP_STAGES);
+    /** D3DTSS_MAXMIPLEVEL raw DWORD per stage. */
+    readonly maxMipLevel = new Int32Array(MAX_FFP_STAGES);
+    /** D3DTSS_BORDERCOLOR raw packed ARGB DWORD per stage. */
+    readonly borderColor = new Int32Array(MAX_FFP_STAGES);
+
+    /** D3DTSS_MIPFILTER vocabulary for this executor's draws. See FfpFilterVocabulary. */
+    private filterVocabulary: FfpFilterVocabulary = "d3d7";
+
+    /**
+     * Set which D3DTSS_MIPFILTER numbering subsequent resolve() calls decode with. Call once
+     * from the D3D8 device adapter (D3D9-numbered TSS) — never from DDraw/D3D7 setup, whose
+     * D3D7-numbered state is already the default and must stay untouched.
+     */
+    setFilterVocabulary(vocabulary: FfpFilterVocabulary): void {
+        this.filterVocabulary = vocabulary;
+    }
+
+    getFilterVocabulary(): FfpFilterVocabulary {
+        return this.filterVocabulary;
+    }
 
     /** Stage N's cascade block runs (op/args applied). Bit 0 is always set. */
     enabledMask = 1;
@@ -267,12 +340,21 @@ export class FfpStagesState {
             this.tci[s] = tci;
             this.texXformFlags[s] = 0; // filled by the executor's texture-transform resolver
 
+            // MIN/MAGFILTER: D3D7's D3DTFN_*/D3DTFG_* and D3D8/9's D3DTEXF_* share bit patterns
+            // for POINT/LINEAR/ANISOTROPIC, so no vocabulary-dependent translation is needed here
+            // (see docs/d3d8-parity/02-samplers.md — only MIPFILTER genuinely diverges).
             this.minFilter[s] = textureStates[base + D3DTSS_MINFILTER] || 0;
             this.magFilter[s] = textureStates[base + D3DTSS_MAGFILTER] || 0;
-            this.mipFilter[s] = textureStates[base + D3DTSS_MIPFILTER] || D3DTFP_NONE;
+            const rawMip = textureStates[base + D3DTSS_MIPFILTER];
+            this.mipFilter[s] = this.filterVocabulary === "d3d9"
+                ? d3d9MipFilterToD3d7(rawMip)
+                : (rawMip || D3DTFP_NONE);
             this.maxAnisotropy[s] = textureStates[base + D3DTSS_MAXANISOTROPY] || 1;
             this.addressU[s] = textureStates[base + D3DTSS_ADDRESSU] || D3DTADDRESS_WRAP;
             this.addressV[s] = textureStates[base + D3DTSS_ADDRESSV] || D3DTADDRESS_WRAP;
+            this.mipLodBiasBits[s] = textureStates[base + D3DTSS_MIPMAPLODBIAS] | 0;
+            this.maxMipLevel[s] = textureStates[base + D3DTSS_MAXMIPLEVEL] | 0;
+            this.borderColor[s] = textureStates[base + D3DTSS_BORDERCOLOR] | 0;
 
             prevEnabled = enabled;
         }

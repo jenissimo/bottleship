@@ -14,8 +14,8 @@ import {
     IID_IDirect3DMaterial,
     IID_IDirect3DMaterial2,
     IID_IDirect3DMaterial3,
-    allocateComObject,
 } from "../constants";
+import { allocateComObject } from "../../../core/com/com-memory";
 import { D3DExports, D3D_OK, D3DERR_INVALIDCALL } from "./types";
 import { D3DLight7Data, D3DMaterial7Data, D3DColorValue, D3DVector } from "./types";
 

@@ -3,6 +3,7 @@ import { Logger, LogCategory } from "../../core/logger";
 import { assignStubsOnce } from "../../core/thunking/stub-merge";
 import { Marshaler } from "../../core/memory/marshaler";
 import { ComObjectFactory } from "../../core/com/base-com-object";
+import { allocateComObject, checkComGuard, COM_OBJECT_SIZE } from "../../core/com/com-memory";
 import { System } from "../../core/system";
 import { DDrawContext } from "./context";
 import { memoryWatch } from "../../core/memory/memory-watch";
@@ -24,9 +25,6 @@ import {
     DEFAULT_DRIVER_DLL,
 } from "../../backends/webgpu/shared/dx-adapter-identifier";
 import {
-    allocateComObject,
-    checkComGuard,
-    COM_OBJECT_SIZE,
     DD_OK,
     DDBD_16,
     DDBD_32,

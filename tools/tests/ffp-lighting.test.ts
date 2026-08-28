@@ -14,10 +14,16 @@ import {
     FFP_MAX_LIGHTS,
     FFP_MAX_STAGES,
     FFP_MAX_TEX_MATRICES,
+    FFP_MAX_BLEND_MATRICES,
     FFP_TEXGEN_WGSL,
+    D3D_ALPHALESS_FORMATS,
     ffpStageOffset,
     ffpTexGenOffset,
     ffpTexMatrixOffset,
+    ffpStageConstantOffset,
+    ffpBlendMatrixOffset,
+    ffpBlendControlOffset,
+    makeFfpParams,
     packFfpUniforms,
     emitFfpComputeLighting,
     D3DLIGHT_DIRECTIONAL,
@@ -99,6 +105,7 @@ function probeParams(): FfpUniformParams {
             colorArg0: 0x23, alphaArg0: 0x11, resultArg: 5,
             // D3DTSS_TCI_CAMERASPACEREFLECTIONVECTOR | UV set 1, and COUNT2 | PROJECTED.
             texCoordIndex: 0x00030001, texTransformFlags: 0x102,
+            constant: { r: 0.61, g: 0.62, b: 0.63, a: 0.64 },
         }],
         texMatrices: Float32Array.from({ length: FFP_MAX_TEX_MATRICES * 16 }, (_u, i) => 7000 + i),
         tfactor: { r: 0.41, g: 0.42, b: 0.43, a: 0.44 },
@@ -172,6 +179,8 @@ describe("FFP uniform block ↔ WGSL struct", () => {
         expect(out[ffpTexMatrixOffset(0)]).toBe(7000);
         expect(out[ffpTexMatrixOffset(FFP_MAX_TEX_MATRICES - 1) + 15])
             .toBe(7000 + FFP_MAX_TEX_MATRICES * 16 - 1);
+        expect(out[ffpStageConstantOffset(0)]).toBeCloseTo(0.61);
+        expect(out[ffpStageConstantOffset(0) + 3]).toBeCloseTo(0.64);
 
         // ctrl words: power/lighting/specular/localViewer, the four colour sources,
         // then numLights/hasNormal/clipPlaneEnable/normalizeNormals.
@@ -195,6 +204,22 @@ describe("FFP uniform block ↔ WGSL struct", () => {
         // The slot past the last one belongs to the next member, not to a 9th light.
         expect(off.get("world")).toBe(off.get("lights")! + FFP_MAX_LIGHTS * 28);
     });
+
+    test("packs the world-matrix palette and vertex-blend controls after legacy fields", () => {
+        const p = makeFfpParams();
+        p.blendMatrices = Float32Array.from({ length: FFP_MAX_BLEND_MATRICES * 16 }, (_u, i) => 8000 + i);
+        p.blendVertexMode = 3;
+        p.blendIndexed = true;
+        p.blendTweenFactor = 0.375;
+        p.blendMatrixCount = 4;
+        const out = new Float32Array(FFP_UNIFORM_FLOATS);
+        packFfpUniforms(out, p);
+        expect(off.get("blendMatrices")).toBe(ffpBlendMatrixOffset(0));
+        expect(ffpBlendMatrixOffset(FFP_MAX_BLEND_MATRICES - 1) + 15).toBe(off.get("blendCtrl")! - 1);
+        expect(out[ffpBlendMatrixOffset(0)]).toBe(8000);
+        expect(out[ffpBlendMatrixOffset(FFP_MAX_BLEND_MATRICES - 1) + 15]).toBe(8000 + FFP_MAX_BLEND_MATRICES * 16 - 1);
+        expect(Array.from(out.slice(ffpBlendControlOffset(), ffpBlendControlOffset() + 4))).toEqual([3, 1, 0.375, 4]);
+    });
 });
 
 describe("ffpTexCoordSrc / ffpTexTransform WGSL", () => {
@@ -209,11 +234,20 @@ describe("ffpTexCoordSrc / ffpTexTransform WGSL", () => {
     test("applies the texture matrix only for D3DTTFF_COUNT2..COUNT4", () => {
         // DXVK: applyTransform = flags > D3DTTFF_COUNT1 && flags <= D3DTTFF_COUNT4. Passing
         // COUNT1 (or DISABLE) through untransformed is the part that is easy to get wrong.
-        expect(FFP_TEXGEN_WGSL).toContain("if (count < 2u || count > 4u) { return src.xy; }");
+        expect(FFP_TEXGEN_WGSL).toContain("if (count < 2u || count > 4u) { return src; }");
+        expect(FFP_TEXGEN_WGSL).toContain("fn ffpTexTransform(src: vec4<f32>, m: mat4x4<f32>, flags: u32) -> vec4<f32>");
     });
 
-    test("divides by the D3DTTFF_PROJECTED component, not blindly by w", () => {
-        expect(FFP_TEXGEN_WGSL).toContain("v[count - 1u]");
+    test("keeps the transformed vec4 for the fragment-stage projected divide", () => {
+        expect(FFP_TEXGEN_WGSL).toContain("return v;");
+        expect(FFP_TEXGEN_WGSL).not.toContain("v[count - 1u]");
+    });
+
+    test("keeps all eight D3D9 vertex coordinate sets independently addressable", () => {
+        for (let set = 0; set < 8; set++) {
+            expect(FFP_TEXGEN_WGSL).toContain(`uv${set}: vec4<f32>`);
+        }
+        expect(FFP_TEXGEN_WGSL).toContain("if (uvSet == 7u) { return uv7; }");
     });
 });
 
@@ -232,5 +266,56 @@ describe("ffpComputeLighting WGSL", () => {
     test("does not gate specular on a non-zero material power", () => {
         // D3DMATERIAL9.Power == 0 means pow(x, 0) == 1, not "no specular".
         expect(wgsl).not.toContain("power > 0.0");
+    });
+});
+
+describe("D3DTTFF_PROJECTED divides by the count's last component", () => {
+    test("COUNT2/COUNT3 project by y/z, COUNT4 and a disabled transform by w", () => {
+        // wined3d compute_texture_matrix copies column COUNT into column 4 and then samples
+        // projectively, i.e. divides by component COUNT-1. Always dividing by w smears or
+        // vanishes a projected spotlight / planar reflection whose 4th row is unused.
+        expect(FFP_TEXGEN_WGSL).toContain("fn ffpProjectTexcoord(tc: vec4<f32>, flags: u32) -> vec2<f32>");
+        expect(FFP_TEXGEN_WGSL).toContain("if (count == 2u) { q = tc.y; }");
+        expect(FFP_TEXGEN_WGSL).toContain("else if (count == 3u) { q = tc.z; }");
+        expect(FFP_TEXGEN_WGSL).toContain("var q = tc.w;");
+    });
+
+    test("a stage without D3DTTFF_PROJECTED is not divided at all", () => {
+        expect(FFP_TEXGEN_WGSL).toContain("if ((flags & 256u) == 0u) { return tc.xy; }");
+    });
+});
+
+describe("D3D_ALPHALESS_FORMATS", () => {
+    test("covers every alpha-less D3DFORMAT this backend can create", () => {
+        // Sampling one of these with D3DTA_TEXTURE must read alpha 1.0. Missing a format
+        // yields alpha 0 from our RGBA copy — fully transparent, silently.
+        for (const format of [
+            20,  // R8G8B8
+            22,  // X8R8G8B8
+            23,  // R5G6B5
+            24,  // X1R5G5B5
+            27,  // R3G3B2
+            30,  // X4R4G4B4
+            33,  // X8B8G8R8
+            34,  // G16R16
+            50,  // L8
+            62,  // X8L8V8U8
+            81,  // L16
+            111, // R16F
+            112, // G16R16F
+            114, // R32F
+            115, // G32R32F
+        ]) {
+            expect(D3D_ALPHALESS_FORMATS.has(format)).toBe(true);
+        }
+    });
+
+    test("does not mask formats that carry alpha", () => {
+        // P8 carries alpha through PALETTEENTRY.peFlags — masking it makes every palettized
+        // texel opaque.
+        for (const format of [21 /* A8R8G8B8 */, 25 /* A1R5G5B5 */, 26 /* A4R4G4B4 */,
+            28 /* A8 */, 41 /* P8 */, 113 /* A16B16G16R16F */, 116 /* A32B32G32R32F */]) {
+            expect(D3D_ALPHALESS_FORMATS.has(format)).toBe(false);
+        }
     });
 });

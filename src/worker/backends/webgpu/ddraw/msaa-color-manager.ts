@@ -17,6 +17,7 @@
  */
 
 import { DirectDrawSurfaceState } from "../../../modules/ddraw/com-objects";
+import { normalizePortableWebGpuSampleCount } from "../shared/msaa-policy";
 
 interface ColorEntry {
     tex: GPUTexture;
@@ -36,7 +37,7 @@ export class MsaaColorManager {
     // Textures to destroy after queue.submit() (same deferral discipline as DepthManager).
     private garbageList: GPUTexture[] = [];
 
-    // Active sample count (1 = MSAA off). Set from EmulatorConfig.quality.msaa; clamped {1,2,4}.
+    // Active sample count (1 = MSAA off). WebGPU's portable set is {1,4}.
     private sampleCount = 1;
 
     constructor(device: GPUDevice) {
@@ -53,12 +54,12 @@ export class MsaaColorManager {
     }
 
     /**
-     * Set the active sample count (from quality.msaa). Clamps to {1,2,4}. On change, all existing
+     * Set the active sample count (from quality.msaa). Clamps to {1,4}. On change, all existing
      * multisample textures are retired (they carry the old sampleCount) so the next
      * ensureForTarget rebuilds them. Returns true if the count actually changed.
      */
     setSampleCount(n: number): boolean {
-        const clamped = n >= 4 ? 4 : n >= 2 ? 2 : 1;
+        const clamped = normalizePortableWebGpuSampleCount(n);
         if (clamped === this.sampleCount) return false;
         this.sampleCount = clamped;
         for (const entry of this.bySurface.values()) {

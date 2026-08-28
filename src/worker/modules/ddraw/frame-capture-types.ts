@@ -45,6 +45,15 @@ export type CapturedDrawCall = {
     // distinct indices. This is what reveals whether indexed geometry is in
     // screen space (valid XYZRHW: 0<=z<=1, w>0) or object/view space (the bug).
     indexedVertices?: Array<{idx: number; x: number; y: number; z: number; w?: number; u?: number; v?: number; diffuse?: number}>;
+    /** Why `indexedVertices` is absent for an INDEXED draw — no VB/IB bound, an index or
+     *  vertex address out of range, or an unsupported stride. Mirrors
+     *  `firstVerticesUnavailable`; unset for a non-indexed draw. */
+    indexedVerticesUnavailable?: string;
+    /** The distinct-vertex sample size actually used to build `indexedVertices` this
+     *  capture (`captureFrame({maxIndexedVerts})`, default 6). Sampled positions spread
+     *  across the whole index range, not just the first few — report it so a caller can
+     *  tell "this mesh has fewer than N distinct vertices" from "the option was ignored". */
+    indexedVertexSampleN?: number;
     // Render target
     rtSurfacePtr: number;
     rtWidth: number;
@@ -208,4 +217,8 @@ export type CapturedFrame = {
     skippedEmptyFrameEnds?: number;
     drawCalls: CapturedDrawCall[];
     clears: CapturedClear[];
+    /** The `firstVertices`/`indexedVertices` sample sizes armed for this capture
+     *  (`captureFrame({maxVerts, maxIndexedVerts})`, defaults 4/6). Reported so a caller
+     *  can tell an intentionally small sample from the option being silently ignored. */
+    captureConfig?: { maxVerts: number; maxIndexedVerts: number };
 };

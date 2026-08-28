@@ -47,9 +47,9 @@ import {
     D3DVIEWPORT7_SIZE,
     D3DVIEWPORT7_OFFSETS,
     E_INVALIDARG,
-    allocateComObject,
 } from "../constants";
 import { ComObjectFactory } from "../../../core/com/base-com-object";
+import { allocateComObject } from "../../../core/com/com-memory";
 import {
     DirectDrawSurfaceObject,
     DirectDrawSurfaceState,

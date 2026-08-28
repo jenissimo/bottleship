@@ -6,6 +6,7 @@
 import { Logger, LogCategory } from "../../../core/logger";
 import { System } from "../../../core/system";
 import { isBitmapTexture } from "../../../modules/ddraw/com-objects";
+import { normalizePortableWebGpuSampleCount } from "../shared/msaa-policy";
 import {
     D3DRENDERSTATE_CULLMODE,
     D3DRENDERSTATE_SHADEMODE,
@@ -65,28 +66,12 @@ import { BindGroupManager } from "./bind-group-manager";
 import { DirectDrawSurfaceState } from "../../../modules/ddraw/com-objects";
 import { FfpStagesState, MAX_FFP_SAMPLED_STAGES } from "./ffp-stages";
 import { dwordToUnsignedLong } from "../shared/dword";
-
-/**
- * Maps D3D blend factor to WebGPU blend factor
- */
-function mapBlendFactor(blend: number): GPUBlendFactor {
-    // D3DBLEND_*: 1=ZERO, 2=ONE, 3=SRCCOLOR, 4=INVSRCCOLOR, 5=SRCALPHA, 6=INVSRCALPHA,
-    // 7=DESTALPHA, 8=INVDESTALPHA, 9=DESTCOLOR, 10=INVDESTCOLOR, 11=SRCALPHASAT
-    switch (blend | 0) {
-        case 1: return "zero";
-        case 2: return "one";
-        case 3: return "src";
-        case 4: return "one-minus-src";
-        case 5: return "src-alpha";
-        case 6: return "one-minus-src-alpha";
-        case 7: return "dst-alpha";
-        case 8: return "one-minus-dst-alpha";
-        case 9: return "dst";
-        case 10: return "one-minus-dst";
-        case 11: return "src-alpha-saturated";
-        default: return "src-alpha";
-    }
-}
+import {
+    mapBlendFactor as sharedMapBlendFactor, mapBlendOp as sharedMapBlendOp, fixupBoth,
+    isKnownBlendFactor, isKnownBlendOperation, hasDualSourceBlendFactor,
+    D3DBLEND_ZERO, D3DBLEND_SRCCOLOR, D3DBLEND_INVSRCCOLOR,
+    D3DBLEND_SRCCOLOR2, D3DBLEND_INVSRCCOLOR2, D3DBLENDOP_ADD,
+} from "../shared/d3d-blend-factor";
 
 /** D3DRS_COLORWRITEENABLE / D3DRS_BLENDOP (d3d8types.h). D3D7's render-state enum stops at
  *  152 and has neither, so on the DDraw/D3D7 half of this shared factory the seeded
@@ -98,17 +83,84 @@ const D3DRENDERSTATE_BLENDOP = 171;
 const COLOR_WRITE_ALL = 0xf;
 
 /**
- * Maps D3DBLENDOP to a WebGPU blend operation. Anything outside 1..5 — including the 0 the
- * key carries while blending is off — is ADD, the state's D3D default.
+ * Maps a D3DBLEND factor to WebGPU, applying the DirectX-6 BOTH*SRCALPHA legacy fixup
+ * (D3DBLEND_BOTHSRCALPHA/BOTHINVSRCALPHA imply BOTH factors and DESTBLEND is ignored —
+ * see shared/d3d-blend-factor.ts `fixupBoth`, the same rule d3d9-blend.ts applies). An
+ * out-of-range or dual-source enum is refused rather than silently mapped to a plausible
+ * default — that silent-default was exactly F1's failure mode (docs/d3d8-parity/07-unification-map.md §2.1).
+ * The refusal is an INTERNAL invariant: every per-draw caller passes a value that already
+ * went through `sanitizeBlendFactor`, so guest state can never reach the throw.
  */
-function mapBlendOperation(d3dBlendOp: number): GPUBlendOperation {
-    switch (d3dBlendOp | 0) {
-        case 2: return "subtract";          // D3DBLENDOP_SUBTRACT
-        case 3: return "reverse-subtract";  // D3DBLENDOP_REVSUBTRACT
-        case 4: return "min";               // D3DBLENDOP_MIN
-        case 5: return "max";               // D3DBLENDOP_MAX
-        default: return "add";              // D3DBLENDOP_ADD (1) and the unwritten default
+export function mapBlendFactor(blend: number): GPUBlendFactor {
+    const normalized = blend >>> 0;
+    if (!isKnownBlendFactor(normalized) || hasDualSourceBlendFactor(normalized)) {
+        throw new Error(`PipelineFactory: unrepresentable D3DBLEND factor ${blend}`);
     }
+    return sharedMapBlendFactor(normalized);
+}
+
+/**
+ * Maps D3DBLENDOP to a WebGPU blend operation. An out-of-range enum is refused rather
+ * than silently defaulted to ADD (see mapBlendFactor above).
+ */
+export function mapBlendOperation(d3dBlendOp: number): GPUBlendOperation {
+    const normalized = d3dBlendOp >>> 0;
+    if (!isKnownBlendOperation(normalized)) {
+        throw new Error(`PipelineFactory: unrepresentable D3DBLENDOP ${d3dBlendOp}`);
+    }
+    return sharedMapBlendOp(normalized);
+}
+
+/**
+ * Reduce a guest D3DBLEND word to one this backend can build a pipeline from. Render state
+ * reaches a draw unvalidated, and `getOrCreatePipeline` runs INSIDE an open render pass: an
+ * exception escaping it unwinds past `currentRenderPass.end()` and loses the whole frame's
+ * command buffer — every draw AND every upload recorded on that encoder. Real drivers decode
+ * instead of failing (DXVK d3d9_util.cpp DecodeBlendFactor falls through to ZERO), so an
+ * unknown enum degrades to ZERO and dual-source — which needs a WebGPU feature this backend
+ * does not enable — degrades to its single-source counterpart.
+ */
+export function sanitizeBlendFactor(blend: number): number {
+    const normalized = blend >>> 0;
+    if (normalized === D3DBLEND_SRCCOLOR2) return D3DBLEND_SRCCOLOR;
+    if (normalized === D3DBLEND_INVSRCCOLOR2) return D3DBLEND_INVSRCCOLOR;
+    if (isKnownBlendFactor(normalized)) return normalized;
+    reportDegradedBlendState("D3DBLEND factor", normalized, D3DBLEND_ZERO);
+    return D3DBLEND_ZERO;
+}
+
+/** D3DBLENDOP counterpart of sanitizeBlendFactor (DXVK's DecodeBlendOp defaults to ADD). */
+export function sanitizeBlendOperation(d3dBlendOp: number): number {
+    const normalized = d3dBlendOp >>> 0;
+    if (isKnownBlendOperation(normalized)) return normalized;
+    reportDegradedBlendState("D3DBLENDOP", normalized, D3DBLENDOP_ADD);
+    return D3DBLENDOP_ADD;
+}
+
+/** Census for the degradation above: one line per distinct bad value, bounded so a state word
+ *  that is garbage every draw cannot drown the log. */
+const degradedBlendStatesSeen = new Set<string>();
+function reportDegradedBlendState(what: string, value: number, replacement: number): void {
+    if (degradedBlendStatesSeen.size >= 32) return;
+    const key = `${what}:${value}`;
+    if (degradedBlendStatesSeen.has(key)) return;
+    degradedBlendStatesSeen.add(key);
+    Logger.warn(
+        LogCategory.SYSTEM,
+        `PipelineFactory: unrepresentable ${what} ${value} — drawing with ${replacement} instead`
+    );
+}
+
+/**
+ * Resolve the (src, dst) blend-factor pair actually in effect: apply the D3D "unwritten
+ * state" defaults, then the BOTH*SRCALPHA fixup (which makes DESTBLEND's value moot when
+ * SRCBLEND names one of the legacy BOTH* factors). Callers key their pipeline cache on
+ * this resolved pair, not the raw render-state DWORDs, so a game that only ever writes
+ * SRCBLEND=BOTHSRCALPHA still gets a cache hit regardless of DESTBLEND's stale value.
+ */
+export function resolveBlendFactors(srcBlend: number, dstBlend: number, defaultSrc: number, defaultDst: number): [number, number] {
+    const [src, dst] = fixupBoth(srcBlend || defaultSrc, dstBlend || defaultDst);
+    return [sanitizeBlendFactor(src), sanitizeBlendFactor(dst)];
 }
 
 /**
@@ -261,13 +313,13 @@ export class PipelineFactory {
     }
 
     /**
-     * Set the MSAA sample count (from quality.msaa). Clamps to {1,2,4}. On change, ALL cached
+     * Set the MSAA sample count (from quality.msaa). Clamps to {1,4}. On change, ALL cached
      * pipelines are invalidated (they baked the old sampleCount into multisample.count) and the
      * fast-path configs cleared. Returns true if the count actually changed. sampleCount===1 is
      * the default and produces `multisample.count:1` — WebGPU's default → byte-identical output.
      */
     setSampleCount(n: number): boolean {
-        const clamped = n >= 4 ? 4 : n >= 2 ? 2 : 1;
+        const clamped = normalizePortableWebGpuSampleCount(n);
         if (clamped === this.sampleCount) return false;
         this.sampleCount = clamped;
         this.invalidateCache();
@@ -325,7 +377,7 @@ export class PipelineFactory {
         const alphaFunc = renderStates[D3DRENDERSTATE_ALPHAFUNC];
         const colorKeyEnabled = renderStates[D3DRENDERSTATE_COLORKEYENABLE] || 0;
         const colorWriteMask = this.colorWriteMask(renderStates);
-        const blendOp = renderStates[D3DRENDERSTATE_BLENDOP];
+        const blendOp = sanitizeBlendOperation(renderStates[D3DRENDERSTATE_BLENDOP]);
         const colorKeyActive = useTexture && !!texture?.srcColorKey && colorKeyEnabled !== 0;
 
         // Read stencil states
@@ -341,8 +393,11 @@ export class PipelineFactory {
         const stencilWriteMask = dwordToUnsignedLong(renderStates[D3DRENDERSTATE_STENCILWRITEMASK]);
 
         const effectiveAlphaBlend = alphaBlend ? 1 : 0;
-        const effectiveSrcBlend = effectiveAlphaBlend ? (srcBlend || 2) : 0;
-        const effectiveDstBlend = effectiveAlphaBlend ? (dstBlend || 1) : 0;
+        // D3D7 unwritten-state defaults are ONE/ZERO; BOTH*SRCALPHA as SRCBLEND forces its
+        // implied dst and makes DESTBLEND's value moot (see resolveBlendFactors).
+        const [effectiveSrcBlend, effectiveDstBlend] = effectiveAlphaBlend
+            ? resolveBlendFactors(srcBlend, dstBlend, 2, 1)
+            : [0, 0];
         // EQUAL + depth-writes-off is a coplanar overlay pass (decal / detail / lightmap). It
         // relies on both passes interpolating identical depth, which differing triangulation
         // breaks into a crawling dither. LESSEQUAL asks the same question robustly — nearer
@@ -354,7 +409,7 @@ export class PipelineFactory {
         const effectiveZFunc = zEnable ? (zFuncCoplanar || D3DCMP_LESSEQUAL) : 0;
         const effectiveZWrite = zEnable ? (zWrite ? 1 : 0) : 0;
         const keyAlphaBlend = (effectiveAlphaBlend && !this.debugFlags.forceDisableAlphaBlend) ? 1 : 0;
-        
+
         const hasDiffuse = (vertexType & D3DFVF_DIFFUSE) !== 0;
         const isRHWVertex = (vertexType & D3DFVF_XYZRHW) !== 0;
         // UI detection: XYZRHW (pre-transformed) + no texture + diffuse only + fan/strip
@@ -401,6 +456,7 @@ export class PipelineFactory {
         keyConfig.forceDisableZTest = this.debugFlags.forceDisableZTest;
         keyConfig.forceDisableZWrite = this.debugFlags.forceDisableZWrite;
         keyConfig.debugView = this.debugFlags.debugView;
+        keyConfig.forceWireColor = this.debugFlags.forceWireColor;
         keyConfig.flatShading = renderStates[D3DRENDERSTATE_SHADEMODE] === D3DSHADE_FLAT;
 
         // Fast path: same config as last call → return cached pipeline without string alloc
@@ -455,8 +511,8 @@ export class PipelineFactory {
             coplanarPass,
             effectiveAlphaBlend, // Use normalized value
             alphaTest,
-            srcBlend,
-            dstBlend,
+            effectiveSrcBlend,
+            effectiveDstBlend,
             alphaFunc,
             colorKeyEnabled > 0 ? 1 : 0,
             stencilEnable > 0 ? 1 : 0,
@@ -511,7 +567,7 @@ export class PipelineFactory {
         const alphaFunc = renderStates[D3DRENDERSTATE_ALPHAFUNC];
         const colorKeyEnabled = renderStates[D3DRENDERSTATE_COLORKEYENABLE] || 0;
         const colorWriteMask = this.colorWriteMask(renderStates);
-        const blendOp = renderStates[D3DRENDERSTATE_BLENDOP];
+        const blendOp = sanitizeBlendOperation(renderStates[D3DRENDERSTATE_BLENDOP]);
         const colorKeyActive = useTexture && !!texture?.srcColorKey && colorKeyEnabled !== 0;
         const stencilEnable = renderStates[D3DRENDERSTATE_STENCILENABLE] || 0;
         const stencilFunc = renderStates[D3DRENDERSTATE_STENCILFUNC] || D3DCMP_ALWAYS;
@@ -524,8 +580,11 @@ export class PipelineFactory {
         const stencilWriteMask = dwordToUnsignedLong(renderStates[D3DRENDERSTATE_STENCILWRITEMASK]);
 
         const effectiveAlphaBlend = alphaBlend ? 1 : 0;
-        const effectiveSrcBlend = effectiveAlphaBlend ? (srcBlend || 2) : 0;
-        const effectiveDstBlend = effectiveAlphaBlend ? (dstBlend || 1) : 0;
+        // D3D7 unwritten-state defaults are ONE/ZERO; BOTH*SRCALPHA as SRCBLEND forces its
+        // implied dst and makes DESTBLEND's value moot (see resolveBlendFactors).
+        const [effectiveSrcBlend, effectiveDstBlend] = effectiveAlphaBlend
+            ? resolveBlendFactors(srcBlend, dstBlend, 2, 1)
+            : [0, 0];
         // EQUAL + depth-writes-off is a coplanar overlay pass (decal / detail / lightmap). It
         // relies on both passes interpolating identical depth, which differing triangulation
         // breaks into a crawling dither. LESSEQUAL asks the same question robustly — nearer
@@ -584,6 +643,7 @@ export class PipelineFactory {
         keyConfig.forceDisableZTest = this.debugFlags.forceDisableZTest;
         keyConfig.forceDisableZWrite = this.debugFlags.forceDisableZWrite;
         keyConfig.debugView = this.debugFlags.debugView;
+        keyConfig.forceWireColor = this.debugFlags.forceWireColor;
         keyConfig.flatShading = renderStates[D3DRENDERSTATE_SHADEMODE] === D3DSHADE_FLAT;
 
         // Fast path: same config as last call → return cached pipeline without string alloc
@@ -625,8 +685,8 @@ export class PipelineFactory {
             coplanarPass,
             effectiveAlphaBlend,
             alphaTest,
-            srcBlend,
-            dstBlend,
+            effectiveSrcBlend,
+            effectiveDstBlend,
             alphaFunc,
             colorKeyEnabled > 0 ? 1 : 0,
             stencilEnable > 0 ? 1 : 0,
@@ -740,18 +800,18 @@ export class PipelineFactory {
         };
         const shader = this.shaderGenerator.getOrCreateMegaBatchShader(shaderConfig);
 
-        const effectiveSrcBlend = srcBlend || 2;
-        const effectiveDstBlend = dstBlend || 1;
+        // srcBlend/dstBlend arrive already resolved (unwritten-state defaults applied, and
+        // the BOTH*SRCALPHA legacy fixup expanded) — see resolveBlendFactors in the caller.
         const blendState: GPUBlendState | undefined = shouldEnableBlending
             ? {
                   color: {
-                      srcFactor: mapBlendFactor(effectiveSrcBlend),
-                      dstFactor: mapBlendFactor(effectiveDstBlend),
+                      srcFactor: mapBlendFactor(srcBlend),
+                      dstFactor: mapBlendFactor(dstBlend),
                       operation: mapBlendOperation(blendOp),
                   },
                   alpha: {
-                      srcFactor: mapBlendFactor(effectiveSrcBlend),
-                      dstFactor: mapBlendFactor(effectiveDstBlend),
+                      srcFactor: mapBlendFactor(srcBlend),
+                      dstFactor: mapBlendFactor(dstBlend),
                       operation: mapBlendOperation(blendOp),
                   },
               }
@@ -851,8 +911,8 @@ export class PipelineFactory {
         coplanarPass: number, // draw asked for EQUAL with depth writes off
         effectiveAlphaBlend: number, // Already normalized (0 or 1)
         alphaTest: number,
-        srcBlend: number,
-        dstBlend: number,
+        srcBlend: number, // Already resolved: defaults applied, BOTH*SRCALPHA fixup expanded
+        dstBlend: number, // Already resolved: defaults applied, BOTH*SRCALPHA fixup expanded
         alphaFunc: number,
         colorKeyEnabled: number,
         stencilEnable: number,
@@ -936,25 +996,25 @@ export class PipelineFactory {
         };
         const shader = this.shaderGenerator.getOrCreateShader(shaderConfig);
 
-        const effectiveSrcBlend = srcBlend || 2; // D3D7 default: ONE
-        const effectiveDstBlend = dstBlend || 1; // D3D7 default: ZERO
+        // srcBlend/dstBlend arrive already resolved (unwritten-state defaults applied, and
+        // the BOTH*SRCALPHA legacy fixup expanded) — see resolveBlendFactors in the caller.
         const blendState: GPUBlendState | undefined = shouldEnableBlending
             ? {
                   color: {
-                      srcFactor: mapBlendFactor(effectiveSrcBlend),
-                      dstFactor: mapBlendFactor(effectiveDstBlend),
+                      srcFactor: mapBlendFactor(srcBlend),
+                      dstFactor: mapBlendFactor(dstBlend),
                       operation: mapBlendOperation(blendOp),
                   },
                   alpha: {
-                      srcFactor: mapBlendFactor(effectiveSrcBlend),
-                      dstFactor: mapBlendFactor(effectiveDstBlend),
+                      srcFactor: mapBlendFactor(srcBlend),
+                      dstFactor: mapBlendFactor(dstBlend),
                       operation: mapBlendOperation(blendOp),
                   },
               }
             : undefined;
 
         // Diagnostic: Log shadow-style blending (ZERO/INVSRCCOLOR for multiplicative darkening)
-        if (shouldEnableBlending && effectiveSrcBlend === 1 && effectiveDstBlend === 4) {
+        if (shouldEnableBlending && srcBlend === 1 && dstBlend === 4) {
             Logger.log(LogCategory.DDRAW,
                 `PipelineFactory: Shadow blend mode (ZERO/INVSRCCOLOR) - tex=${useTexture} cull=${cullMode} zWrite=${zWrite !== 0}`);
         }

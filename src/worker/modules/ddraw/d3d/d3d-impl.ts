@@ -3,6 +3,7 @@
  */
 import { Logger, LogCategory } from "../../../core/logger";
 import { ComObjectFactory } from "../../../core/com/base-com-object";
+import { allocateComObject, COM_OBJECT_SIZE } from "../../../core/com/com-memory";
 import { Marshaler } from "../../../core/memory/marshaler";
 import { DDrawContext } from "../context";
 import { bytesToGuid } from "../helpers";
@@ -15,8 +16,6 @@ import {
     IID_IDirect3DLight,
     IID_IDirect3DMaterial3,
     IID_IDirect3DVertexBuffer,
-    allocateComObject,
-    COM_OBJECT_SIZE,
     DDPF_ZBUFFER,
     DDPF_STENCILBUFFER,
     DDPIXELFORMAT_Z_OFFSETS,

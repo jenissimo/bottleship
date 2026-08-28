@@ -30,6 +30,7 @@ import {
     decodeSurfaceFormatToRgba8,
     getSurfaceFormatLayout,
 } from "../shared/texture-formats";
+import { fixupBoth } from "../shared/d3d-blend-factor";
 import {
     markGpuSyncedFromCpu,
     setAuthorityCpu,
@@ -168,7 +169,7 @@ import { MsaaColorManager } from "./msaa-color-manager";
 import { ColorKeyBlitPipeline } from "./colorkey-blit-pipeline";
 import { VertexConverter, GPU_VERTEX_THRESHOLD, GpuVertexConversionResult, computeFvfStride, OUTPUT_VERTEX_BYTES, OUTPUT_VERTEX_U32S } from "./compute/vertex-converter";
 import type { VertexBlendInput } from "./compute/vertex-converter";
-import { TextureConverter } from "./compute/texture-converter";
+import { TextureConverter, applyTextureConverterDebugPaintCPU } from "./compute/texture-converter";
 import { FFPLightingState } from "../../../modules/ddraw/d3d/ffp-lighting";
 import { createDefaultMaterial } from "../../../modules/ddraw/d3d/types";
 
@@ -180,8 +181,10 @@ import { dwordToFloat } from './dword-float';
 import { dwordToUnsignedLong } from '../shared/dword';
 import { resolveFfpFogMode } from '../d3d9/ffp-fog';
 import { maybeClampContainedUv, applySamplerDebugOverrides, updateLastDrawDiagnostics } from './executor-draw-debug';
+import { normalizePortableWebGpuSampleCount } from '../shared/msaa-policy';
 import {
     FfpStagesState,
+    type FfpFilterVocabulary,
     MAX_FFP_STAGES,
     MAX_FFP_SAMPLED_STAGES,
     MAX_FFP_TEX_MATRICES,
@@ -198,6 +201,40 @@ import {
  */
 function surfaceContentVersion(tex: DirectDrawSurfaceState): number {
     return isRenderSurface(tex) ? tex.version : (tex.contentVersion ?? 0);
+}
+
+/** D3DTSS_TCI_* (d3d8types.h/d3d9types.h): the texgen mode occupies the high half of
+ *  D3DTSS_TEXCOORDINDEX. SPHEREMAP (0x40000, D3D9-only) is deliberately absent — the
+ *  shader generates only these three. */
+const D3DTSS_TCI_CAMERASPACENORMAL = 0x10000;
+const D3DTSS_TCI_CAMERASPACEPOSITION = 0x20000;
+const D3DTSS_TCI_CAMERASPACEREFLECTIONVECTOR = 0x30000;
+
+/** Lanes per stage in the sampler-identity scratch below. */
+export const STAGE_SAMPLER_KEY_LANES = 4;
+
+/**
+ * Write one stage's sampler identity for the bind-group fast paths. EVERY field
+ * getOrCreateStageSampler forwards takes part, or a draw that changes only LOD bias / max mip
+ * level / border colour reuses the previous bind group. Lanes rather than one packed word
+ * because three of the fields are raw DWORDs: a hash would let two distinct samplers collide
+ * on one key, which is the failure this exists to prevent. Lane 0 is -1 for an unsampled stage.
+ */
+export function writeStageSamplerKey(out: Int32Array, stage: number, sp: StageSamplerState | null): void {
+    const base = stage * STAGE_SAMPLER_KEY_LANES;
+    if (!sp) {
+        out[base] = -1;
+        out[base + 1] = 0;
+        out[base + 2] = 0;
+        out[base + 3] = 0;
+        return;
+    }
+    out[base] = (sp.minFilter & 0x3) | ((sp.magFilter & 0x3) << 2) | ((sp.mipFilter & 0x3) << 4) |
+        ((sp.addressU & 0x7) << 6) | ((sp.addressV & 0x7) << 9) |
+        ((Math.min(15, sp.maxAnisotropy) & 0xF) << 12);
+    out[base + 1] = (sp.mipLodBiasBits ?? 0) | 0;
+    out[base + 2] = (sp.maxMipLevel ?? 0) | 0;
+    out[base + 3] = (sp.borderColor ?? 0) | 0;
 }
 
 function createDefaultStageSamplers(): StageSamplerState[] {
@@ -326,26 +363,25 @@ export class DDrawWebGPUExecutor {
     // start of the NEXT frame and no straddling frame ever mixes sample counts.
     private lastAppliedMsaa = -1;
 
-    // Guest-requested MSAA from the D3D8 present-params MultiSampleType (1 = NONE; 2 or 4 supported).
-    // Folded into the effective count so a game enabling its in-engine 2×/4× AA gets it even when
+    // Guest-requested MSAA from the D3D8 present-params MultiSampleType (1 = NONE; 4 supported).
+    // Folded into the effective count so a game enabling its in-engine 4× AA gets it even when
     // quality.msaa is 1. Default 1 keeps the guest-NONE path byte-identical to the pre-MSAA path.
     private guestRequestedMsaa = 1;
 
     /**
      * Record the guest's requested MSAA (D3D8 CreateDevice/Reset present-params MultiSampleType,
-     * mapped to a sample count: NONE/other→1, 2_SAMPLES→2, 4_SAMPLES→4). Device-global — folded
-     * into the effective count at the next frame boundary. Does NOT change the count mid-frame.
+     * mapped to a sample count: NONE/unsupported→1, 4_SAMPLES→4). Device-global — folded into
+     * the effective count at the next frame boundary. Does NOT change the count mid-frame.
      */
     setGuestRequestedMsaa(count: number): void {
-        this.guestRequestedMsaa = count >= 4 ? 4 : count >= 2 ? 2 : 1;
+        this.guestRequestedMsaa = normalizePortableWebGpuSampleCount(count);
     }
 
-    /** Effective sample count for the frame = max(quality.msaa, guest-requested), clamped {1,2,4}. */
+    /** Effective sample count for the frame = max(quality.msaa, guest-requested), clamped {1,4}. */
     private effectiveMsaa(): number {
         const q = EmulatorConfig.getInstance().quality.msaa | 0;
         const g = this.guestRequestedMsaa | 0;
-        const m = q >= g ? q : g;
-        return m >= 4 ? 4 : m >= 2 ? 2 : 1;
+        return normalizePortableWebGpuSampleCount(q >= g ? q : g);
     }
 
     /**
@@ -384,6 +420,8 @@ export class DDrawWebGPUExecutor {
     private sampleViewCache = new WeakMap<GPUTexture, GPUTextureView>();
     private textureUploadDiagCount = 0;
     private textureDrawDiagCount = 0;
+    /** Draws whose stage-0 texture was ready but not sampled — see SOLID-FILL-RISK. */
+    droppedTextureDraws = 0;
     /** Log-once keys for TEXCOORDINDEX quirks (texgen flags / UV set >2) and stage>=3 use. */
     private loggedTexCoordQuirks = new Set<number>();
     private loggedStage3Plus = false;
@@ -462,9 +500,17 @@ export class DDrawWebGPUExecutor {
 
     // Resolved FFP stage cascade for the current draw (reused, zero-alloc).
     private readonly ffpStages = new FfpStagesState();
+
+    /** Which D3DTEXF_* vocabulary this device's TSS filter values are written in.
+     *  D3D7 and D3D8 disagree on MIPFILTER's numbering, so the decode is a property of the
+     *  API the device was created through, not something to infer from a value. Default stays
+     *  D3D7 — a DDraw/D3D7 title that never calls this keeps its existing decode exactly. */
+    setFfpFilterVocabulary(vocabulary: FfpFilterVocabulary): void {
+        this.ffpStages.setFilterVocabulary(vocabulary);
+    }
     // Per-stage batch-compatibility keys for the current draw (reused, zero-alloc).
     private readonly stageVersionsScratch = new Int32Array(MAX_FFP_SAMPLED_STAGES);
-    private readonly stageSamplerKeysScratch = new Int32Array(MAX_FFP_SAMPLED_STAGES);
+    private readonly stageSamplerKeysScratch = new Int32Array(MAX_FFP_SAMPLED_STAGES * STAGE_SAMPLER_KEY_LANES);
 
     // ===== FFP user clip planes (binding 6) =====
     // Device-global: one persistent 6×vec4f buffer, always bound so every FFP bind group
@@ -618,12 +664,20 @@ export class DDrawWebGPUExecutor {
             usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
         });
         this.dummyTextureView = this.dummyTexture.createView();
+        this.writeDummyTexturePixel();
+    }
 
-        // DIAGNOSTIC: Use bright magenta instead of white to detect dummy texture usage
-        const magentaPixel = new Uint8Array([255, 0, 255, 255]);
+    /** The dummy 1x1 sampled when a draw asks for a texture and none is bound. Rewritten
+     *  (not just set once at init) so `forceMissingTextureMagenta` bites on toggle — the
+     *  texture is created once at device init, long before any draw could observe it. */
+    private writeDummyTexturePixel(): void {
+        if (!this.dummyTexture) return;
+        const pixel = this.debugFlags.forceMissingTextureMagenta
+            ? new Uint8Array([255, 0, 255, 255])
+            : new Uint8Array([255, 255, 255, 255]);
         this.queue.writeTexture(
             { texture: this.dummyTexture },
-            magentaPixel,
+            pixel,
             { bytesPerRow: 4 },
             { width: 1, height: 1, depthOrArrayLayers: 1 }
         );
@@ -924,10 +978,26 @@ export class DDrawWebGPUExecutor {
         return { ...this.debugFlags, scrubLastFrameDraws: this.scrubLastFrameDraws };
     }
 
-    setDebugToggle(toggle: string, enabled: boolean, value?: number): void {
+    setDebugToggle(toggle: string, enabled: boolean, rawValue?: number | string): void {
+        // debugView is the only flag whose value is a NAME, not a number. It had no case at all
+        // below, so the switch fell through silently while gpuToggle still reported "applied" —
+        // the flag IS a key of DebugFlags, so the name check upstream passed. An unknown mode is
+        // an error here, never a quiet fall-back to "normal".
+        if (toggle === "debugView") {
+            const modes = ["normal", "uv", "vertexcolor", "alpha", "solid"] as const;
+            const wanted = enabled ? String(rawValue ?? "normal") : "normal";
+            if (!(modes as readonly string[]).includes(wanted)) {
+                throw new Error(`debugView: unknown mode '${wanted}'. Modes: ${modes.join(", ")}`);
+            }
+            this.debugFlags.debugView = wanted as (typeof modes)[number];
+            this.pipelineFactory.setDebugFlags(this.debugFlags);
+            return;
+        }
+        const value = typeof rawValue === "number" ? rawValue : undefined;
         switch (toggle) {
             case "forceMissingTextureMagenta":
                 this.debugFlags.forceMissingTextureMagenta = enabled;
+                this.writeDummyTexturePixel();
                 break;
             case "forceDisableAlphaBlend":
                 this.debugFlags.forceDisableAlphaBlend = enabled;
@@ -1000,6 +1070,12 @@ export class DDrawWebGPUExecutor {
                 // Bisect lever: render only draws 0..value of each frame. Off (-1) when
                 // disabled, so a bare `gpuToggle('drawScrubMax', false)` restores the frame.
                 this.debugFlags.drawScrubMax = enabled ? ((value ?? 0) | 0) : -1;
+                break;
+            case "drawSkipFrom":
+                this.debugFlags.drawSkipFrom = enabled ? ((value ?? 0) | 0) : -1;
+                break;
+            case "drawSkipTo":
+                this.debugFlags.drawSkipTo = enabled ? ((value ?? 0) | 0) : -1;
                 break;
             case "textureConverterDebugMode":
                 // For numeric values, use 'value' parameter if provided, otherwise use 'enabled' as number
@@ -1717,7 +1793,18 @@ export class DDrawWebGPUExecutor {
                         `targetFmt=${targetFormat}`);
                 }
                 const region = isRenderSurface(state) ? state.dirtyRegion : undefined;
-                uploadToGPUTexture(queue, texture, rgbaData, width, height, scratch, targetFormat, region);
+                // The GPU compute-shader debug paint (textureConverterDebugMode) only runs
+                // for the whole-surface upload branch above; this CPU path is taken for
+                // BitmapTexture fast uploads (D3D8's normal route) and must honour the same
+                // flag, on a copy — rgbaData may alias the cached rgbaScratch (readback/
+                // colorkey source), which must stay the real pixels.
+                if (this.debugFlags.textureConverterDebugMode !== 0) {
+                    const painted = rgbaData.slice();
+                    applyTextureConverterDebugPaintCPU(painted, width, height, this.debugFlags.textureConverterDebugMode, state.format.bpp);
+                    uploadToGPUTexture(queue, texture, painted, width, height, scratch, targetFormat, region);
+                } else {
+                    uploadToGPUTexture(queue, texture, rgbaData, width, height, scratch, targetFormat, region);
+                }
                 if (isRenderSurface(state)) {
                     state.dirtyRegion = undefined;
                 }
@@ -2215,14 +2302,20 @@ export class DDrawWebGPUExecutor {
     }
 
     /**
-     * True if any sampling stage (0..2) uses D3DTSS_TCI_CAMERASPACE* texgen (high bits of
-     * TEXCOORDINDEX set). Camera-space texgen needs the World×View matrix, which lives only
-     * in the legacy uniform slot — the MegaBatch storage slot has no room for it — so a
-     * texgen draw must take the legacy path even when it carries no texture matrix.
+     * True if any sampling stage uses one of the three D3DTSS_TCI_CAMERASPACE* texgen modes.
+     * Tested against the KNOWN values, not "any high bit set": SPHEREMAP and stale garbage in
+     * the high half are not camera-space texgen, and this predicate also widens `hasTexCoords`
+     * on the shared DDraw/D3D7 path — a legacy title with junk there would otherwise sample a
+     * stage whose vertices carry no UVs. Camera-space texgen needs the World×View matrix,
+     * which lives only in the legacy uniform slot — the MegaBatch storage slot has no room for
+     * it — so such a draw must take the legacy path even with no texture matrix.
      */
     private hasCameraSpaceTexgen(textureStates: Int32Array): boolean {
         for (let stage = 0; stage < MAX_FFP_SAMPLED_STAGES; stage++) {
-            if ((textureStates[stage * 32 + D3DTSS_TEXCOORDINDEX] & ~0xffff) !== 0) return true;
+            const tci = textureStates[stage * 32 + D3DTSS_TEXCOORDINDEX] & ~0xffff;
+            if (tci === D3DTSS_TCI_CAMERASPACENORMAL ||
+                tci === D3DTSS_TCI_CAMERASPACEPOSITION ||
+                tci === D3DTSS_TCI_CAMERASPACEREFLECTIONVECTOR) return true;
         }
         return false;
     }
@@ -3583,6 +3676,15 @@ export class DDrawWebGPUExecutor {
         this.applyMsaaAtFrameBoundary();
     }
 
+    /** Public face of the draw-scrub gate, for draws that do NOT go through this executor's
+     *  own drawPrimitive/drawIndexedPrimitive — the D3D8 programmable (vertex-shader) path
+     *  submits through the D3D9 executor instead. Without this the scrub silently cut nothing
+     *  for those draws while still reporting a cut, and the per-frame counter drifted out of
+     *  step with the frame capture's draw indices. */
+    scrubDraw(): boolean {
+        return this.scrubbedOut();
+    }
+
     /** drawScrubMax bisect: count this draw and report whether it is past the cut.
      *  Counted BEFORE the cut test so the numbering matches the frame capture's `index`
      *  (which counts every draw the guest issued, kept or not).
@@ -3595,14 +3697,20 @@ export class DDrawWebGPUExecutor {
      *  advances it independently, resetting the counter mid-frame). All three failure modes
      *  read as "the flag does nothing", which is why the counter reports scrubLastFrameDraws. */
     private scrubbedOut(): boolean {
-        if (this.debugFlags.drawScrubMax < 0) return false;
+        const max = this.debugFlags.drawScrubMax;
+        const skipFrom = this.debugFlags.drawSkipFrom;
+        if (max < 0 && skipFrom < 0) return false;
         const serial = frameCapture.getFrameBoundarySerial();
         if (serial !== this.scrubFrameSerial) {
             this.scrubFrameSerial = serial;
             this.scrubLastFrameDraws = this.frameDrawIndex;
             this.frameDrawIndex = 0;
         }
-        return this.frameDrawIndex++ > this.debugFlags.drawScrubMax;
+        const idx = this.frameDrawIndex++;
+        if (max >= 0 && idx > max) return true;
+        if (skipFrom < 0) return false;
+        const skipTo = this.debugFlags.drawSkipTo;
+        return idx >= skipFrom && idx <= (skipTo < 0 ? skipFrom : skipTo);
     }
 
     /**
@@ -3668,7 +3776,7 @@ export class DDrawWebGPUExecutor {
             if (Logger.isEnabled(LogCategory.DDRAW, LogLevel.NORMAL)) {
                 Logger.log(
                     LogCategory.DDRAW,
-                    `ensureSurfaceGPUResources: format decision for 0x${state.surfacePtr.toString(16)} ` +
+                    `ensureSurfaceGPUResources: format decision for 0x${(state.surfacePtr ?? 0).toString(16)} ` +
                     `isTexture=${isTexture} isRenderTarget=${isRenderTarget} format=${format} ` +
                     `caps=0x${state.caps.toString(16)}`
                 );
@@ -4292,6 +4400,9 @@ export class DDrawWebGPUExecutor {
                 sp.maxAnisotropy = 1;
                 sp.addressU = D3DTADDRESS_WRAP;
                 sp.addressV = D3DTADDRESS_WRAP;
+                sp.mipLodBiasBits = 0;
+                sp.maxMipLevel = 0;
+                sp.borderColor = 0;
             }
             pr.stencilRef = dwordToUnsignedLong(renderStates[D3DRENDERSTATE_STENCILREF]);
             applySamplerDebugOverrides(this, pr);
@@ -4378,7 +4489,13 @@ export class DDrawWebGPUExecutor {
             }
         }
         
-        const hasTexCoords = (vertexType & 0xf00) !== 0;
+        // A stage with D3DTSS_TCI_CAMERASPACE* texgen GENERATES its coordinates from the
+        // camera-space position/normal/reflection, so the vertex format carries no UV set at
+        // all — deriving "has texcoords" from the FVF alone dropped the texture, D3DTA_TEXTURE
+        // then resolved to white, and the surrounding blend turned that into a solid fill:
+        // SRCALPHA/INVSRCALPHA painted it white, ZERO/INVSRCCOLOR painted it black. That is
+        // what XIII's projected shadows and decals look like when this is wrong.
+        const hasTexCoords = (vertexType & 0xf00) !== 0 || this.hasCameraSpaceTexgen(textureStates);
         const stages = this.ffpStages;
         stages.resolve(textureStates, realTexMask, hasTexCoords, !!this.dummyTextureView);
 
@@ -4403,6 +4520,25 @@ export class DDrawWebGPUExecutor {
                 `after ensureSurfaceGPUResources! ${texture.width}x${texture.height} ` +
                 `caps=0x${texture.caps.toString(16)} type=${texture.surfaceType} ` +
                 `gpuTexture=${!!texture.gpuTexture}`);
+        }
+
+        // DIAGNOSTIC: the complement of the check above — the texture IS ready on the GPU and
+        // stage 0 asks for it, yet the cascade resolved to "not sampled". The stage then reads
+        // D3DTA_TEXTURE as white and the surrounding blend turns that into a SOLID FILL:
+        // SRCALPHA/INVSRCALPHA paints it white, ZERO/INVSRCCOLOR paints it black. This is the
+        // shape a texgen-only draw took before hasTexCoords accounted for texgen; it is worth a
+        // standing alarm because the picture alone reads as "that surface is just white".
+        if (texture?.gpuTextureView && !useTexture && stages.colorOp[0] !== D3DTOP_DISABLE) {
+            this.droppedTextureDraws++;
+            if (this.droppedTextureDraws <= 8) {
+                Logger.warn(LogCategory.DDRAW,
+                    `⚠️ SOLID-FILL-RISK: stage 0 wants a texture but the cascade dropped it — ` +
+                    `tex 0x${(texture.surfacePtr ?? 0).toString(16)} ${texture.width}x${texture.height} ` +
+                    `fvfTexSets=${(vertexType >>> 8) & 0xf} ` +
+                    `colorOp=${stages.colorOp[0]} arg1=0x${stages.colorArg1[0].toString(16)} ` +
+                    `tci=0x${(textureStates[D3DTSS_TEXCOORDINDEX] >>> 0).toString(16)} ` +
+                    `hasTexCoords=${hasTexCoords}`);
+            }
         }
 
         if (this.shouldTraceLargeTexture(texture) && this.textureDrawDiagCount < 256) {
@@ -4576,8 +4712,11 @@ export class DDrawWebGPUExecutor {
         const alphaBlend = renderStates[D3DRENDERSTATE_ALPHABLENDENABLE] || 0;
         const srcBlend = renderStates[D3DRENDERSTATE_SRCBLEND] || 0;
         const dstBlend = renderStates[D3DRENDERSTATE_DESTBLEND] || 0;
-        const effectiveSrcBlend = alphaBlend ? (srcBlend || 2) : 0; // Default to ONE (2) if unset
-        const effectiveDstBlend = alphaBlend ? (dstBlend || 1) : 0; // Default to ZERO (1) if unset
+        // Same resolution PipelineFactory applies: unwritten-state defaults, then the
+        // BOTH*SRCALPHA legacy fixup (DESTBLEND is moot once SRCBLEND names one of those).
+        const [effectiveSrcBlend, effectiveDstBlend] = alphaBlend
+            ? fixupBoth(srcBlend || 2, dstBlend || 1) // Defaults: ONE(2)/ZERO(1)
+            : [0, 0];
 
         // Premultiply is required when blend state is ONE/INVSRCALPHA (premultiplied alpha blending)
         const premultiplyOutput = (alphaBlend && effectiveSrcBlend === D3DBLEND_ONE && effectiveDstBlend === D3DBLEND_INVSRCALPHA) ? 1 : 0;
@@ -4716,7 +4855,7 @@ export class DDrawWebGPUExecutor {
                 const hasTex = !!texture;
                 const hasGpuTex = !!texture?.gpuTexture;
                 Logger.warn(LogCategory.DDRAW,
-                    `[DUMMY-TEX #${(this as any)._dummyDiagN}] fell back to 1×1 magenta: useTexture=true but ` +
+                    `[DUMMY-TEX #${(this as any)._dummyDiagN}] fell back to the 1×1 dummy texture: useTexture=true but ` +
                     `gpuTextureView missing. surfaceAddr=${surfAddr} size=${size} hasTexture=${hasTex} ` +
                     `hasGpuTexture=${hasGpuTex} gpuTextureFormat=${texture?.gpuTextureFormat} ` +
                     `caps=0x${(texture?.caps ?? 0).toString(16)} mode=${(texture as any)?.mode ?? "?"}`);
@@ -4862,6 +5001,13 @@ export class DDrawWebGPUExecutor {
             sp.maxAnisotropy = stages.maxAnisotropy[s] || 1;
             sp.addressU = stages.addressU[s];
             sp.addressV = stages.addressV[s];
+            // D3DTSS_MIPMAPLODBIAS / MAXMIPLEVEL / BORDERCOLOR: resolve() decodes them and
+            // getOrCreateStageSampler consumes them, so they must be carried here too — a stage
+            // left at the default reads them as 0, which is exactly "no bias, full mip chain,
+            // transparent border".
+            sp.mipLodBiasBits = stages.mipLodBiasBits[s];
+            sp.maxMipLevel = stages.maxMipLevel[s];
+            sp.borderColor = stages.borderColor[s];
         }
         // Force point filtering on stage 0 when color key is enabled (must match the
         // pointSample bias decision in the pipeline factory).
@@ -5021,7 +5167,10 @@ export class DDrawWebGPUExecutor {
     private lastPipeline: GPURenderPipeline | null = null;
     private readonly lastStageViews: (GPUTextureView | null)[] =
         new Array<GPUTextureView | null>(MAX_FFP_SAMPLED_STAGES).fill(null);
-    private readonly lastStageSamplerKeys = new Int32Array(MAX_FFP_SAMPLED_STAGES).fill(-1);
+    private readonly lastStageSamplerKeys = new Int32Array(MAX_FFP_SAMPLED_STAGES * STAGE_SAMPLER_KEY_LANES).fill(-1);
+    /** Scratch for the bind fast path's comparison — distinct from the batch-compatibility
+     *  scratch above, whose contents stay live until the batch flushes. */
+    private readonly stageSamplerKeyScratch = new Int32Array(MAX_FFP_SAMPLED_STAGES * STAGE_SAMPLER_KEY_LANES);
 
     /** Invalidate the setupPipelineAndBindings fast-path cache. */
     private resetBindFastPath(): void {
@@ -5047,12 +5196,7 @@ export class DDrawWebGPUExecutor {
             const sampled = (pr.sampledMask & (1 << s)) !== 0;
             const tex = s === 0 ? texture : stageTextures?.[s] ?? null;
             this.stageVersionsScratch[s] = sampled && tex ? surfaceContentVersion(tex) : -1;
-            const sp = pr.stageSamplers[s];
-            this.stageSamplerKeysScratch[s] = sampled
-                ? ((sp.minFilter & 0x3) | ((sp.magFilter & 0x3) << 2) | ((sp.mipFilter & 0x3) << 4) |
-                   ((sp.addressU & 0x7) << 6) | ((sp.addressV & 0x7) << 9) |
-                   ((Math.min(15, sp.maxAnisotropy) & 0xF) << 12))
-                : -1;
+            writeStageSamplerKey(this.stageSamplerKeysScratch, s, sampled ? pr.stageSamplers[s] : null);
         }
     }
 
@@ -5065,7 +5209,10 @@ export class DDrawWebGPUExecutor {
         for (let s = 0; s < MAX_FFP_SAMPLED_STAGES; s++) {
             if (batch.stageVersions[s] !== this.stageVersionsScratch[s]) return false;
             if (batch.stageViews[s] !== pr.stageViews[s]) return false;
-            if (batch.stageSamplerKeys[s] !== this.stageSamplerKeysScratch[s]) return false;
+            for (let lane = 0; lane < STAGE_SAMPLER_KEY_LANES; lane++) {
+                const i = s * STAGE_SAMPLER_KEY_LANES + lane;
+                if (batch.stageSamplerKeys[i] !== this.stageSamplerKeysScratch[i]) return false;
+            }
         }
         return true;
     }
@@ -5338,16 +5485,22 @@ export class DDrawWebGPUExecutor {
         // Sampler keys must match the BindGroupManager cache key format.
         let bindInputsChanged = !this.lastBindGroup || pipeline !== this.lastPipeline;
         for (let s = 0; s < MAX_FFP_SAMPLED_STAGES; s++) {
-            const sp = pr.stageSamplers[s];
-            const key = (pr.sampledMask & (1 << s)) !== 0
-                ? ((sp.minFilter & 0x3) | ((sp.magFilter & 0x3) << 2) | ((sp.mipFilter & 0x3) << 4) |
-                   ((sp.addressU & 0x7) << 6) | ((sp.addressV & 0x7) << 9) |
-                   ((Math.min(15, sp.maxAnisotropy) & 0xF) << 12))
-                : -1;
-            if (pr.stageViews[s] !== this.lastStageViews[s] || key !== this.lastStageSamplerKeys[s]) {
+            writeStageSamplerKey(
+                this.stageSamplerKeyScratch, s,
+                (pr.sampledMask & (1 << s)) !== 0 ? pr.stageSamplers[s] : null,
+            );
+            let sameSampler = true;
+            for (let lane = 0; lane < STAGE_SAMPLER_KEY_LANES; lane++) {
+                const i = s * STAGE_SAMPLER_KEY_LANES + lane;
+                if (this.stageSamplerKeyScratch[i] !== this.lastStageSamplerKeys[i]) { sameSampler = false; break; }
+            }
+            if (pr.stageViews[s] !== this.lastStageViews[s] || !sameSampler) {
                 bindInputsChanged = true;
                 this.lastStageViews[s] = pr.stageViews[s];
-                this.lastStageSamplerKeys[s] = key;
+                for (let lane = 0; lane < STAGE_SAMPLER_KEY_LANES; lane++) {
+                    const i = s * STAGE_SAMPLER_KEY_LANES + lane;
+                    this.lastStageSamplerKeys[i] = this.stageSamplerKeyScratch[i];
+                }
             }
         }
 

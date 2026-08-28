@@ -18,8 +18,9 @@ import type { ThunkImplementation } from "../../../core/thunking/thunk-dispatche
 import type { DDrawContext } from "../context";
 import { Logger, LogCategory } from "../../../core/logger";
 import { ComObjectFactory } from "../../../core/com/base-com-object";
+import { allocateComObject } from "../../../core/com/com-memory";
 import type { Direct3DExecuteBufferObject } from "../com-objects";
-import { allocateComObject, IID_IDirect3DExecuteBuffer } from "../constants";
+import { IID_IDirect3DExecuteBuffer } from "../constants";
 import type { createDrawHandler } from "./draw-handler";
 import { readGuidFromMem } from "../../../core/com/typelib/typelib-types";
 import { isValidAddress } from "../../../core/memory/address-guard";

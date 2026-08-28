@@ -149,6 +149,12 @@ let captureNeedsFrameBoundary = false;
 let captureSkippedEmpty = 0;
 /** How many empty frame ends to wait through before giving up and reporting one. */
 const MAX_EMPTY_FRAME_ENDS = 8;
+/** The `firstVertices`/`indexedVertices` sample sizes armed for the in-progress capture,
+ *  and what to restore the ambient `__captureVertsMax`/`__captureIndexedVertsMax` globals to
+ *  when it ends — so a `captureFrame({maxIndexedVerts})` call cannot leak its override into
+ *  the next, unrelated capture. */
+let captureConfig: { maxVerts: number; maxIndexedVerts: number } | undefined;
+let captureConfigRestore: { maxVerts: number | undefined; maxIndexedVerts: number | undefined } | undefined;
 
 export function isCapturing(): boolean {
     return captureActive;
@@ -160,8 +166,12 @@ export function isCapturing(): boolean {
  * first boundary to fire wins, and a frame from the OTHER path resolves with zero draws —
  * indistinguishable from "nothing drew". An unrestricted capture also waits through empty
  * boundaries rather than reporting the first one.
+ *
+ * `maxVerts`/`maxIndexedVerts` size the per-draw vertex sample (defaults 4 / 6, see
+ * `recordDrawCall`) — configurable because a mesh smaller than the default sample makes
+ * "sampled N of N" and "the option did nothing" look identical without a knob to check it.
  */
-export function startCapture(backend?: string): Promise<CapturedFrame> {
+export function startCapture(backend?: string, opts?: { maxVerts?: number; maxIndexedVerts?: number }): Promise<CapturedFrame> {
     // Settle a still-armed prior capture so its caller doesn't hang until its own
     // timeout (two overlapping captureFrame calls, or capture + dbg.frame()).
     if (captureReject) captureReject(new Error("capture superseded by a new startCapture"));
@@ -172,10 +182,25 @@ export function startCapture(backend?: string): Promise<CapturedFrame> {
     captureSkippedEmpty = 0;
     captureNeedsFrameBoundary = true;
     captureActive = true;
+    const g = globalThis as unknown as Record<string, unknown>;
+    captureConfigRestore = { maxVerts: g.__captureVertsMax as number | undefined, maxIndexedVerts: g.__captureIndexedVertsMax as number | undefined };
+    const maxVerts = opts?.maxVerts && opts.maxVerts > 0 ? opts.maxVerts | 0 : 4;
+    const maxIndexedVerts = opts?.maxIndexedVerts && opts.maxIndexedVerts > 0 ? opts.maxIndexedVerts | 0 : 6;
+    captureConfig = { maxVerts, maxIndexedVerts };
+    g.__captureVertsMax = maxVerts;
+    g.__captureIndexedVertsMax = maxIndexedVerts;
     return new Promise<CapturedFrame>((resolve, reject) => {
         captureResolve = resolve;
         captureReject = reject;
     });
+}
+
+function restoreCaptureConfig(): void {
+    if (!captureConfigRestore) return;
+    const g = globalThis as unknown as Record<string, unknown>;
+    g.__captureVertsMax = captureConfigRestore.maxVerts;
+    g.__captureIndexedVertsMax = captureConfigRestore.maxIndexedVerts;
+    captureConfigRestore = undefined;
 }
 
 /** Disarm a capture whose consumer timed out or was aborted. Without this the hot
@@ -190,6 +215,7 @@ export function cancelCapture(reason = new Error("capture cancelled")): void {
     captureWantBackend = undefined;
     captureSkippedEmpty = 0;
     captureNeedsFrameBoundary = false;
+    restoreCaptureConfig();
     const reject = captureReject;
     captureResolve = null;
     captureReject = null;
@@ -275,6 +301,7 @@ export function onFrameEnd(producer = "ddraw"): void {
         skippedEmptyFrameEnds: captureSkippedEmpty,
         drawCalls: captureBuffer,
         clears: clearBuffer,
+        captureConfig,
     };
     captureBuffer = [];
     clearBuffer = [];
@@ -282,6 +309,7 @@ export function onFrameEnd(producer = "ddraw"): void {
     captureWantBackend = undefined;
     captureSkippedEmpty = 0;
     captureNeedsFrameBoundary = false;
+    restoreCaptureConfig();
     const resolve = captureResolve;
     captureResolve = null;
     captureReject = null;
@@ -358,6 +386,12 @@ export type RecordDrawCallParams = {
     iCount: number;
     mem: Uint8Array;
     isIndexed: boolean;
+    /** Whether `lpVertices`/`mem` actually describe a vertex source. Defaults to
+     *  `lpVertices > 0` (a guest pointer never legitimately sits at NULL), but a producer
+     *  that hands `mem` a LOCAL scratch buffer (D3D8's decl-interleave path) has vertices
+     *  legitimately starting at offset 0 and must say so explicitly, or the capture reads
+     *  a real draw as "no vertex buffer bound". */
+    vertexSourceValid?: boolean;
     rtState: DirectDrawSurfaceState;
     texStateObj: DirectDrawSurfaceState | null;
     texStateObj1: DirectDrawSurfaceState | null;
@@ -439,40 +473,76 @@ export function recordDrawCall(p: RecordDrawCallParams): void {
     const memLen = p.mem.length;
     const dv = new DataView(p.mem.buffer, p.mem.byteOffset, p.mem.byteLength);
 
+    // A producer's `mem` is not always guest memory — D3D8's decl-interleave path hands
+    // a LOCAL scratch buffer with vertices legitimately starting at offset 0, so "no
+    // vertex source" must come from the producer, not from `lpVertices > 0`.
+    const vertexSourceValid = p.vertexSourceValid ?? (p.lpVertices > 0);
+
     // Sequential first vertices from the start of the buffer (buffer[0..3]).
     // __captureVertsMax (setWorkerFlag) widens the sample for full-mesh dumps —
     // e.g. reading a CPU-skinned character VB tail to spot stale/displaced bones.
     const firstVertices: CapturedDrawCall["firstVertices"] = [];
-    if (p.lpVertices > 0 && stride > 0) {
+    let firstVerticesUnavailable: string | undefined;
+    if (!vertexSourceValid) {
+        firstVerticesUnavailable = "no vertex source (lpVertices/mem invalid, or no VB bound)";
+    } else if (stride <= 0) {
+        firstVerticesUnavailable = `unsupported stride ${stride} for FVF 0x${p.vertexType.toString(16)}`;
+    } else {
         const cfgMax = ((globalThis as unknown as Record<string, unknown>).__captureVertsMax as number) >>> 0;
         const maxV = Math.min(p.count, cfgMax > 0 ? cfgMax : 4);
         for (let i = 0; i < maxV; i++) {
             const v = readSrcVertex(dv, memLen, p.lpVertices + i * stride, L);
-            if (!v) break;
+            if (!v) { firstVerticesUnavailable = `vertex ${i} out of range (base 0x${(p.lpVertices + i * stride).toString(16)} + 12 > mem.length ${memLen})`; break; }
             firstVertices.push(v);
         }
     }
 
-    // For indexed draws, dereference the vertices the draw ACTUALLY references via
-    // its first few distinct (16-bit) indices — this, not buffer[0..3], reveals
-    // whether the geometry is screen-space (valid XYZRHW) or object/view space.
+    // For indexed draws, dereference the vertices the draw ACTUALLY references —
+    // this, not buffer[0..3], reveals whether the geometry is screen-space (valid
+    // XYZRHW) or object/view space. Sampled at evenly-spaced INDEX POSITIONS across
+    // the whole draw (not just the first few), because a bad transform on one mesh
+    // chunk can leave its early indices looking fine. `indexedVertexSampleN` is the
+    // configured N (`captureFrame({maxIndexedVerts})`), reported so a caller can tell
+    // "sampled fewer than N" (small mesh) from "the option wasn't honoured".
     let firstIndices: number[] | undefined;
     let indexedVertices: CapturedDrawCall["indexedVertices"];
-    if (p.isIndexed && p.lpIndices > 0 && p.iCount > 0 && p.lpVertices > 0 && stride > 0) {
-        firstIndices = [];
-        const nIdx = Math.min(12, p.iCount);
-        for (let i = 0; i < nIdx; i++) {
-            const io = p.lpIndices + i * 2;
-            if (io + 2 > memLen) break;
-            firstIndices.push(dv.getUint16(io, true));
-        }
-        indexedVertices = [];
-        const seen = new Set<number>();
-        for (const idx of firstIndices) {
-            if (seen.has(idx) || indexedVertices.length >= 6) continue;
-            seen.add(idx);
-            const v = readSrcVertex(dv, memLen, p.lpVertices + idx * stride, L);
-            if (v) indexedVertices.push({ idx, ...v });
+    let indexedVerticesUnavailable: string | undefined;
+    let indexedVertexSampleN: number | undefined;
+    if (p.isIndexed) {
+        if (!p.lpIndices || p.iCount <= 0) {
+            indexedVerticesUnavailable = "no index source (lpIndices=0 or iCount=0)";
+        } else if (!vertexSourceValid) {
+            indexedVerticesUnavailable = "no vertex source to dereference indices into";
+        } else if (stride <= 0) {
+            indexedVerticesUnavailable = `unsupported stride ${stride} for FVF 0x${p.vertexType.toString(16)}`;
+        } else {
+            firstIndices = [];
+            const nIdx = Math.min(12, p.iCount);
+            for (let i = 0; i < nIdx; i++) {
+                const io = p.lpIndices + i * 2;
+                if (io + 2 > memLen) break;
+                firstIndices.push(dv.getUint16(io, true));
+            }
+            const cfgIdxMax = ((globalThis as unknown as Record<string, unknown>).__captureIndexedVertsMax as number) >>> 0;
+            const maxIdxV = cfgIdxMax > 0 ? cfgIdxMax : 6;
+            indexedVertexSampleN = maxIdxV;
+            const positions = Math.max(1, Math.min(maxIdxV * 4, p.iCount));
+            indexedVertices = [];
+            const seen = new Set<number>();
+            for (let k = 0; k < positions && indexedVertices.length < maxIdxV; k++) {
+                const pos = positions > 1 ? Math.floor(k * (p.iCount - 1) / (positions - 1)) : 0;
+                const io = p.lpIndices + pos * 2;
+                if (io + 2 > memLen) continue;
+                const idx = dv.getUint16(io, true);
+                if (seen.has(idx)) continue;
+                seen.add(idx);
+                const v = readSrcVertex(dv, memLen, p.lpVertices + idx * stride, L);
+                if (v) indexedVertices.push({ idx, ...v });
+            }
+            if (indexedVertices.length === 0) {
+                indexedVerticesUnavailable = `sampled ${positions} index position(s) across ${p.iCount} indices, none dereferenced to a readable vertex`;
+                indexedVertices = undefined;
+            }
         }
     }
 
@@ -638,8 +708,11 @@ export function recordDrawCall(p: RecordDrawCallParams): void {
         hasSpecular: L.hasSpecular,
         texCount: L.texCount,
         firstVertices,
+        firstVerticesUnavailable,
         firstIndices,
         indexedVertices,
+        indexedVerticesUnavailable,
+        indexedVertexSampleN,
         rtSurfacePtr: p.rtState.surfacePtr,
         rtWidth: p.rtState.width,
         rtHeight: p.rtState.height,

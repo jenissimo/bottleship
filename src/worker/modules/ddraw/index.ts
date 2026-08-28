@@ -8,6 +8,7 @@ import { createVTablesFromDescriptor, VTableInfo } from '../../api/adapters/modu
 import { ddrawModule } from '../../api/ddraw.api';
 import { InterfaceRegistry } from '../../core/com/interface-registry';
 import { ComObjectFactory } from '../../core/com/base-com-object';
+import { allocateComObject } from '../../core/com/com-memory';
 import { SystemResourceProvider } from '../../core/resources/system-resource-provider';
 import { System } from '../../core/system';
 import { DDrawContext } from './context';
@@ -53,7 +54,6 @@ import {
     IID_IDirect3DMaterial,
     IID_IDirect3DMaterial3,
     IID_IDirect3DVertexBuffer,
-    allocateComObject,
 } from './constants';
 import {
     Direct3DObject,

@@ -28,6 +28,8 @@ export type { LockRect };
 export const D3DLOCK_READONLY = 0x00000010;
 export const D3DLOCK_NOOVERWRITE = 0x00001000;
 export const D3DLOCK_DISCARD = 0x00002000;
+/** Do not add the unlocked writes to the resource's dirty tracking. */
+export const D3DLOCK_NO_DIRTY_UPDATE = 0x00008000;
 export const D3DLOCK_DONOTWAIT = 0x20000000;
 
 /** True when the rect names every pixel — the only extent DISCARD may be honoured at. */
@@ -44,6 +46,8 @@ export interface LockFlagDecision {
     write: boolean;
     /** READONLY as the app passed it — the flag that also means "do not accumulate a dirty box". */
     readOnly: boolean;
+    /** NO_DIRTY_UPDATE suppresses dirty tracking, but does not suppress the guest write-back. */
+    noDirtyUpdate: boolean;
     /** DISCARD survived the strip rules: the old contents need not be produced at all. */
     discard: boolean;
     /** DISCARD was asked for and stripped — the census distinguishes this from never asking. */
@@ -68,6 +72,7 @@ export function decideLockFlags(
     poolDefault: boolean,
 ): LockFlagDecision {
     const readOnly = (flags & D3DLOCK_READONLY) !== 0;
+    const noDirtyUpdate = (flags & D3DLOCK_NO_DIRTY_UPDATE) !== 0;
     const requestedDiscard = (flags & D3DLOCK_DISCARD) !== 0;
     const fullResource = locksFullResource(rect, width, height);
 
@@ -79,6 +84,7 @@ export function decideLockFlags(
     return {
         write: !readOnly,
         readOnly,
+        noDirtyUpdate,
         discard,
         discardStripped: requestedDiscard && !discard,
         box: clipLockRect(rect, width, height),

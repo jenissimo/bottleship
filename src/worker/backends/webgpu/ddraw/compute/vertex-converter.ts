@@ -1247,7 +1247,7 @@ export class VertexConverter {
 
             // Update frame snapshot counters
             const system = (globalThis as any).System?.getInstance?.();
-            const ddraw = system?.process?.getModule("ddraw") as any;
+            const ddraw = system?.process?.getModule?.("ddraw") as any;
             if (ddraw?.incrementFrameCounter) {
                 ddraw.incrementFrameCounter("vertexBytes", dstSize);
             }
@@ -1635,7 +1635,7 @@ export class VertexConverter {
             
             // Update frame snapshot counters
             const system = (globalThis as any).System?.getInstance?.();
-            const ddraw = system?.process?.getModule("ddraw") as any;
+            const ddraw = system?.process?.getModule?.("ddraw") as any;
             if (ddraw?.incrementFrameCounter) {
                 ddraw.incrementFrameCounter("vertexBytes", dstSize);
             }

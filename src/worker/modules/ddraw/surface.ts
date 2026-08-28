@@ -25,8 +25,6 @@ import {
     DDSCAPS_ZBUFFER,
     DDSCAPS_MIPMAP,
     DDSD_LPSURFACE,
-    allocateComObject,
-    checkComGuard,
     D3DCLEAR_TARGET,
     DDSURFACEDESC2_OFFSETS,
     DDSURFACEDESC_OFFSETS,
@@ -59,6 +57,7 @@ import { DirectDrawSurfaceObject, DirectDrawSurfaceState, Direct3DTextureObject,
 import { writePixelFormat, writeSurfaceDesc } from "./structs";
 import { isValidAddress, isSafeSurfaceAddress, overlapsThunkCode } from "../../core/memory/address-guard";
 import { ComObjectFactory } from "../../core/com/base-com-object";
+import { allocateComObject, checkComGuard } from "../../core/com/com-memory";
 
 import { convertRGBAToSurface, uploadToGPUTexture, convertSurfaceToRGBA } from "./gpu-texture-utils";
 import { setAuthorityCpu, setAuthorityGpu, markCpuSyncedFromGpu, invalidateCpuSyncedVersion, syncActiveGdiContext, surfaceSyncManager, logSurfaceState, demoteSurfaceToCpu } from "./surface-sync";
