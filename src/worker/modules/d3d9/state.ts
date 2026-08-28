@@ -19,6 +19,9 @@ import {
     stateBlocks,
 } from './shared-state';
 import { surfaceMeta, textureMeta, vertexBufferMeta } from './resource-registry';
+import {
+    beginStateBlockShadowWindow, endStateBlockShadowWindow,
+} from './state-block-shadow-window';
 import { stubRegistry } from '../../core/diagnostics/stub-registry';
 import { RawVertexElement } from '../../backends/webgpu/d3d9/shader';
 import { fvfToRawElements } from '../../backends/webgpu/d3d9/swvp';
@@ -1055,6 +1058,9 @@ export function createStateExports(): Record<string, ThunkImplementation> {
         const hr = normalizeStateBlockHr(device.beginStateBlock());
         if (hr === D3D_OK) {
             recordingDevices.add(args[0] >>> 0);
+            // A recording device journals setters instead of applying them, so a guest-side
+            // shadow skip would drop the entry from the BLOCK, not just from the device.
+            beginStateBlockShadowWindow(args[0] >>> 0);
             Logger.verbose(LogCategory.D3D9, 'BeginStateBlock');
         }
         return hr;
@@ -1073,6 +1079,9 @@ export function createStateExports(): Record<string, ThunkImplementation> {
         const result = device.endStateBlock();
         const endHr = normalizeStateBlockHr(result.hr);
         if (endHr !== D3D_OK) return endHr;
+        // The device is applying setters again as of this line; a later failure here does not
+        // put it back to recording, so the gate is re-armed now rather than at the export's end.
+        endStateBlockShadowWindow(pDevice >>> 0);
 
         const sbPtr = createStateBlockComObject(pDevice, {
             devicePtr: pDevice,
