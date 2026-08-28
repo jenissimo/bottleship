@@ -1,0 +1,4188 @@
+{
+  "schema": 1,
+  "module": "d3d9",
+  "descriptorVersion": "9.0c",
+  "methods": [
+    {
+      "interface": "IDirect3D9",
+      "name": "IDirect3D9_QueryInterface",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9",
+      "name": "IDirect3D9_AddRef",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9",
+      "name": "IDirect3D9_Release",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9",
+      "name": "IDirect3D9_RegisterSoftwareDevice",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9",
+      "name": "IDirect3D9_GetAdapterCount",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9",
+      "name": "IDirect3D9_GetAdapterIdentifier",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9",
+      "name": "IDirect3D9_GetAdapterModeCount",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9",
+      "name": "IDirect3D9_EnumAdapterModes",
+      "argCount": 5,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9",
+      "name": "IDirect3D9_GetAdapterDisplayMode",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9",
+      "name": "IDirect3D9_CheckDeviceType",
+      "argCount": 6,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9",
+      "name": "IDirect3D9_CheckDeviceFormat",
+      "argCount": 7,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9",
+      "name": "IDirect3D9_CheckDeviceMultiSampleType",
+      "argCount": 7,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9",
+      "name": "IDirect3D9_CheckDepthStencilMatch",
+      "argCount": 6,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9",
+      "name": "IDirect3D9_CheckDeviceFormatConversion",
+      "argCount": 5,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9",
+      "name": "IDirect3D9_GetDeviceCaps",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9",
+      "name": "IDirect3D9_GetAdapterMonitor",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9",
+      "name": "IDirect3D9_CreateDevice",
+      "argCount": 7,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9Ex",
+      "name": "IDirect3D9Ex_QueryInterface",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9Ex",
+      "name": "IDirect3D9Ex_AddRef",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9Ex",
+      "name": "IDirect3D9Ex_Release",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9Ex",
+      "name": "IDirect3D9Ex_RegisterSoftwareDevice",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9Ex",
+      "name": "IDirect3D9Ex_GetAdapterCount",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9Ex",
+      "name": "IDirect3D9Ex_GetAdapterIdentifier",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9Ex",
+      "name": "IDirect3D9Ex_GetAdapterModeCount",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9Ex",
+      "name": "IDirect3D9Ex_EnumAdapterModes",
+      "argCount": 5,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9Ex",
+      "name": "IDirect3D9Ex_GetAdapterDisplayMode",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9Ex",
+      "name": "IDirect3D9Ex_CheckDeviceType",
+      "argCount": 6,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9Ex",
+      "name": "IDirect3D9Ex_CheckDeviceFormat",
+      "argCount": 7,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9Ex",
+      "name": "IDirect3D9Ex_CheckDeviceMultiSampleType",
+      "argCount": 7,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9Ex",
+      "name": "IDirect3D9Ex_CheckDepthStencilMatch",
+      "argCount": 6,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9Ex",
+      "name": "IDirect3D9Ex_CheckDeviceFormatConversion",
+      "argCount": 5,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9Ex",
+      "name": "IDirect3D9Ex_GetDeviceCaps",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9Ex",
+      "name": "IDirect3D9Ex_GetAdapterMonitor",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9Ex",
+      "name": "IDirect3D9Ex_CreateDevice",
+      "argCount": 7,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9Ex",
+      "name": "IDirect3D9Ex_GetAdapterModeCountEx",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9Ex",
+      "name": "IDirect3D9Ex_EnumAdapterModesEx",
+      "argCount": 5,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9Ex",
+      "name": "IDirect3D9Ex_GetAdapterDisplayModeEx",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9Ex",
+      "name": "IDirect3D9Ex_CreateDeviceEx",
+      "argCount": 8,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3D9Ex",
+      "name": "IDirect3D9Ex_GetAdapterLUID",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_QueryInterface",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_AddRef",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_Release",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_TestCooperativeLevel",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetAvailableTextureMem",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_EvictManagedResources",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetDirect3D",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetDeviceCaps",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetDisplayMode",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetCreationParameters",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetCursorProperties",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetCursorPosition",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_ShowCursor",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_CreateAdditionalSwapChain",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetSwapChain",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetNumberOfSwapChains",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_Reset",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_Present",
+      "argCount": 5,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetBackBuffer",
+      "argCount": 5,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetRasterStatus",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetDialogBoxMode",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetGammaRamp",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetGammaRamp",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_CreateTexture",
+      "argCount": 9,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_CreateVolumeTexture",
+      "argCount": 10,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_CreateCubeTexture",
+      "argCount": 8,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_CreateVertexBuffer",
+      "argCount": 7,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_CreateIndexBuffer",
+      "argCount": 7,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_CreateRenderTarget",
+      "argCount": 9,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_CreateDepthStencilSurface",
+      "argCount": 9,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_UpdateSurface",
+      "argCount": 5,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_UpdateTexture",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetRenderTargetData",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetFrontBufferData",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_StretchRect",
+      "argCount": 6,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_ColorFill",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_CreateOffscreenPlainSurface",
+      "argCount": 7,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetRenderTarget",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetRenderTarget",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetDepthStencilSurface",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetDepthStencilSurface",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_BeginScene",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_EndScene",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_Clear",
+      "argCount": 7,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetTransform",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetTransform",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_MultiplyTransform",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetViewport",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetViewport",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetMaterial",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetMaterial",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetLight",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetLight",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_LightEnable",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetLightEnable",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetClipPlane",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetClipPlane",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetRenderState",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetRenderState",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_CreateStateBlock",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_BeginStateBlock",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_EndStateBlock",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetClipStatus",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetClipStatus",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetTexture",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetTexture",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetTextureStageState",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetTextureStageState",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetSamplerState",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetSamplerState",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_ValidateDevice",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetPaletteEntries",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetPaletteEntries",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetCurrentTexturePalette",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetCurrentTexturePalette",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetScissorRect",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetScissorRect",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetSoftwareVertexProcessing",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetSoftwareVertexProcessing",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetNPatchMode",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetNPatchMode",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_DrawPrimitive",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_DrawIndexedPrimitive",
+      "argCount": 7,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_DrawPrimitiveUP",
+      "argCount": 5,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_DrawIndexedPrimitiveUP",
+      "argCount": 9,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_ProcessVertices",
+      "argCount": 7,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_CreateVertexDeclaration",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetVertexDeclaration",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetVertexDeclaration",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetFVF",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetFVF",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_CreateVertexShader",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetVertexShader",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetVertexShader",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetVertexShaderConstantF",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetVertexShaderConstantF",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetVertexShaderConstantI",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetVertexShaderConstantI",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetVertexShaderConstantB",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetVertexShaderConstantB",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetStreamSource",
+      "argCount": 5,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetStreamSource",
+      "argCount": 5,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetStreamSourceFreq",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetStreamSourceFreq",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetIndices",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetIndices",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_CreatePixelShader",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetPixelShader",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetPixelShader",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetPixelShaderConstantF",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetPixelShaderConstantF",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetPixelShaderConstantI",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetPixelShaderConstantI",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_SetPixelShaderConstantB",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_GetPixelShaderConstantB",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_DrawRectPatch",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_DrawTriPatch",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_DeletePatch",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9",
+      "name": "IDirect3DDevice9_CreateQuery",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_QueryInterface",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_AddRef",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_Release",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_TestCooperativeLevel",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetAvailableTextureMem",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_EvictManagedResources",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetDirect3D",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetDeviceCaps",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetDisplayMode",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetCreationParameters",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetCursorProperties",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetCursorPosition",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_ShowCursor",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_CreateAdditionalSwapChain",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetSwapChain",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetNumberOfSwapChains",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_Reset",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_Present",
+      "argCount": 5,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetBackBuffer",
+      "argCount": 5,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetRasterStatus",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetDialogBoxMode",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetGammaRamp",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetGammaRamp",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_CreateTexture",
+      "argCount": 9,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_CreateVolumeTexture",
+      "argCount": 10,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_CreateCubeTexture",
+      "argCount": 8,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_CreateVertexBuffer",
+      "argCount": 7,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_CreateIndexBuffer",
+      "argCount": 7,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_CreateRenderTarget",
+      "argCount": 9,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_CreateDepthStencilSurface",
+      "argCount": 9,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_UpdateSurface",
+      "argCount": 5,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_UpdateTexture",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetRenderTargetData",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetFrontBufferData",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_StretchRect",
+      "argCount": 6,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_ColorFill",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_CreateOffscreenPlainSurface",
+      "argCount": 7,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetRenderTarget",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetRenderTarget",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetDepthStencilSurface",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetDepthStencilSurface",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_BeginScene",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_EndScene",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_Clear",
+      "argCount": 7,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetTransform",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetTransform",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_MultiplyTransform",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetViewport",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetViewport",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetMaterial",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetMaterial",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetLight",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetLight",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_LightEnable",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetLightEnable",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetClipPlane",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetClipPlane",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetRenderState",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetRenderState",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_CreateStateBlock",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_BeginStateBlock",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_EndStateBlock",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetClipStatus",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetClipStatus",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetTexture",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetTexture",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetTextureStageState",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetTextureStageState",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetSamplerState",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetSamplerState",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_ValidateDevice",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetPaletteEntries",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetPaletteEntries",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetCurrentTexturePalette",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetCurrentTexturePalette",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetScissorRect",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetScissorRect",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetSoftwareVertexProcessing",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetSoftwareVertexProcessing",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetNPatchMode",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetNPatchMode",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_DrawPrimitive",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_DrawIndexedPrimitive",
+      "argCount": 7,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_DrawPrimitiveUP",
+      "argCount": 5,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_DrawIndexedPrimitiveUP",
+      "argCount": 9,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_ProcessVertices",
+      "argCount": 7,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_CreateVertexDeclaration",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetVertexDeclaration",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetVertexDeclaration",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetFVF",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetFVF",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_CreateVertexShader",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetVertexShader",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetVertexShader",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetVertexShaderConstantF",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetVertexShaderConstantF",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetVertexShaderConstantI",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetVertexShaderConstantI",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetVertexShaderConstantB",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetVertexShaderConstantB",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetStreamSource",
+      "argCount": 5,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetStreamSource",
+      "argCount": 5,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetStreamSourceFreq",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetStreamSourceFreq",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetIndices",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetIndices",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_CreatePixelShader",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetPixelShader",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetPixelShader",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetPixelShaderConstantF",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetPixelShaderConstantF",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetPixelShaderConstantI",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetPixelShaderConstantI",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetPixelShaderConstantB",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetPixelShaderConstantB",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_DrawRectPatch",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_DrawTriPatch",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_DeletePatch",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_CreateQuery",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetConvolutionMonoKernel",
+      "argCount": 5,
+      "status": "refused",
+      "refusalHresult": 2289436780,
+      "evidence": "src/worker/modules/d3d9/ex.ts:SetConvolutionMonoKernel-invalidcall"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_ComposeRects",
+      "argCount": 9,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_PresentEx",
+      "argCount": 6,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetGPUThreadPriority",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetGPUThreadPriority",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_WaitForVBlank",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_CheckResourceResidency",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_SetMaximumFrameLatency",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetMaximumFrameLatency",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_CheckDeviceState",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_CreateRenderTargetEx",
+      "argCount": 10,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_CreateOffscreenPlainSurfaceEx",
+      "argCount": 8,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_CreateDepthStencilSurfaceEx",
+      "argCount": 10,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_ResetEx",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DDevice9Ex",
+      "name": "IDirect3DDevice9Ex_GetDisplayModeEx",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVertexBuffer9",
+      "name": "IDirect3DVertexBuffer9_QueryInterface",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVertexBuffer9",
+      "name": "IDirect3DVertexBuffer9_AddRef",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVertexBuffer9",
+      "name": "IDirect3DVertexBuffer9_Release",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVertexBuffer9",
+      "name": "IDirect3DVertexBuffer9_GetDevice",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVertexBuffer9",
+      "name": "IDirect3DVertexBuffer9_SetPrivateData",
+      "argCount": 5,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVertexBuffer9",
+      "name": "IDirect3DVertexBuffer9_GetPrivateData",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVertexBuffer9",
+      "name": "IDirect3DVertexBuffer9_FreePrivateData",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVertexBuffer9",
+      "name": "IDirect3DVertexBuffer9_SetPriority",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVertexBuffer9",
+      "name": "IDirect3DVertexBuffer9_GetPriority",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVertexBuffer9",
+      "name": "IDirect3DVertexBuffer9_PreLoad",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVertexBuffer9",
+      "name": "IDirect3DVertexBuffer9_GetType",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVertexBuffer9",
+      "name": "IDirect3DVertexBuffer9_Lock",
+      "argCount": 5,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVertexBuffer9",
+      "name": "IDirect3DVertexBuffer9_Unlock",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVertexBuffer9",
+      "name": "IDirect3DVertexBuffer9_GetDesc",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DIndexBuffer9",
+      "name": "IDirect3DIndexBuffer9_QueryInterface",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DIndexBuffer9",
+      "name": "IDirect3DIndexBuffer9_AddRef",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DIndexBuffer9",
+      "name": "IDirect3DIndexBuffer9_Release",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DIndexBuffer9",
+      "name": "IDirect3DIndexBuffer9_GetDevice",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DIndexBuffer9",
+      "name": "IDirect3DIndexBuffer9_SetPrivateData",
+      "argCount": 5,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DIndexBuffer9",
+      "name": "IDirect3DIndexBuffer9_GetPrivateData",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DIndexBuffer9",
+      "name": "IDirect3DIndexBuffer9_FreePrivateData",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DIndexBuffer9",
+      "name": "IDirect3DIndexBuffer9_SetPriority",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DIndexBuffer9",
+      "name": "IDirect3DIndexBuffer9_GetPriority",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DIndexBuffer9",
+      "name": "IDirect3DIndexBuffer9_PreLoad",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DIndexBuffer9",
+      "name": "IDirect3DIndexBuffer9_GetType",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DIndexBuffer9",
+      "name": "IDirect3DIndexBuffer9_Lock",
+      "argCount": 5,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DIndexBuffer9",
+      "name": "IDirect3DIndexBuffer9_Unlock",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DIndexBuffer9",
+      "name": "IDirect3DIndexBuffer9_GetDesc",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DTexture9",
+      "name": "IDirect3DTexture9_QueryInterface",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DTexture9",
+      "name": "IDirect3DTexture9_AddRef",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DTexture9",
+      "name": "IDirect3DTexture9_Release",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DTexture9",
+      "name": "IDirect3DTexture9_GetDevice",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DTexture9",
+      "name": "IDirect3DTexture9_SetPrivateData",
+      "argCount": 5,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DTexture9",
+      "name": "IDirect3DTexture9_GetPrivateData",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DTexture9",
+      "name": "IDirect3DTexture9_FreePrivateData",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DTexture9",
+      "name": "IDirect3DTexture9_SetPriority",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DTexture9",
+      "name": "IDirect3DTexture9_GetPriority",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DTexture9",
+      "name": "IDirect3DTexture9_PreLoad",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DTexture9",
+      "name": "IDirect3DTexture9_GetType",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DTexture9",
+      "name": "IDirect3DTexture9_SetLOD",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DTexture9",
+      "name": "IDirect3DTexture9_GetLOD",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DTexture9",
+      "name": "IDirect3DTexture9_GetLevelCount",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DTexture9",
+      "name": "IDirect3DTexture9_SetAutoGenFilterType",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DTexture9",
+      "name": "IDirect3DTexture9_GetAutoGenFilterType",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DTexture9",
+      "name": "IDirect3DTexture9_GenerateMipSubLevels",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DTexture9",
+      "name": "IDirect3DTexture9_GetLevelDesc",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DTexture9",
+      "name": "IDirect3DTexture9_GetSurfaceLevel",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DTexture9",
+      "name": "IDirect3DTexture9_LockRect",
+      "argCount": 5,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DTexture9",
+      "name": "IDirect3DTexture9_UnlockRect",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DTexture9",
+      "name": "IDirect3DTexture9_AddDirtyRect",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DCubeTexture9",
+      "name": "IDirect3DCubeTexture9_QueryInterface",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DCubeTexture9",
+      "name": "IDirect3DCubeTexture9_AddRef",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DCubeTexture9",
+      "name": "IDirect3DCubeTexture9_Release",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DCubeTexture9",
+      "name": "IDirect3DCubeTexture9_GetDevice",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DCubeTexture9",
+      "name": "IDirect3DCubeTexture9_SetPrivateData",
+      "argCount": 5,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DCubeTexture9",
+      "name": "IDirect3DCubeTexture9_GetPrivateData",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DCubeTexture9",
+      "name": "IDirect3DCubeTexture9_FreePrivateData",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DCubeTexture9",
+      "name": "IDirect3DCubeTexture9_SetPriority",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DCubeTexture9",
+      "name": "IDirect3DCubeTexture9_GetPriority",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DCubeTexture9",
+      "name": "IDirect3DCubeTexture9_PreLoad",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DCubeTexture9",
+      "name": "IDirect3DCubeTexture9_GetType",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DCubeTexture9",
+      "name": "IDirect3DCubeTexture9_SetLOD",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DCubeTexture9",
+      "name": "IDirect3DCubeTexture9_GetLOD",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DCubeTexture9",
+      "name": "IDirect3DCubeTexture9_GetLevelCount",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DCubeTexture9",
+      "name": "IDirect3DCubeTexture9_SetAutoGenFilterType",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DCubeTexture9",
+      "name": "IDirect3DCubeTexture9_GetAutoGenFilterType",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DCubeTexture9",
+      "name": "IDirect3DCubeTexture9_GenerateMipSubLevels",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DCubeTexture9",
+      "name": "IDirect3DCubeTexture9_GetLevelDesc",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DCubeTexture9",
+      "name": "IDirect3DCubeTexture9_GetCubeMapSurface",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DCubeTexture9",
+      "name": "IDirect3DCubeTexture9_LockRect",
+      "argCount": 6,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DCubeTexture9",
+      "name": "IDirect3DCubeTexture9_UnlockRect",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DCubeTexture9",
+      "name": "IDirect3DCubeTexture9_AddDirtyRect",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolumeTexture9",
+      "name": "IDirect3DVolumeTexture9_QueryInterface",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolumeTexture9",
+      "name": "IDirect3DVolumeTexture9_AddRef",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolumeTexture9",
+      "name": "IDirect3DVolumeTexture9_Release",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolumeTexture9",
+      "name": "IDirect3DVolumeTexture9_GetDevice",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolumeTexture9",
+      "name": "IDirect3DVolumeTexture9_SetPrivateData",
+      "argCount": 5,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolumeTexture9",
+      "name": "IDirect3DVolumeTexture9_GetPrivateData",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolumeTexture9",
+      "name": "IDirect3DVolumeTexture9_FreePrivateData",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolumeTexture9",
+      "name": "IDirect3DVolumeTexture9_SetPriority",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolumeTexture9",
+      "name": "IDirect3DVolumeTexture9_GetPriority",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolumeTexture9",
+      "name": "IDirect3DVolumeTexture9_PreLoad",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolumeTexture9",
+      "name": "IDirect3DVolumeTexture9_GetType",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolumeTexture9",
+      "name": "IDirect3DVolumeTexture9_SetLOD",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolumeTexture9",
+      "name": "IDirect3DVolumeTexture9_GetLOD",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolumeTexture9",
+      "name": "IDirect3DVolumeTexture9_GetLevelCount",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolumeTexture9",
+      "name": "IDirect3DVolumeTexture9_SetAutoGenFilterType",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolumeTexture9",
+      "name": "IDirect3DVolumeTexture9_GetAutoGenFilterType",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolumeTexture9",
+      "name": "IDirect3DVolumeTexture9_GenerateMipSubLevels",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolumeTexture9",
+      "name": "IDirect3DVolumeTexture9_GetLevelDesc",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolumeTexture9",
+      "name": "IDirect3DVolumeTexture9_GetVolumeLevel",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolumeTexture9",
+      "name": "IDirect3DVolumeTexture9_LockBox",
+      "argCount": 5,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolumeTexture9",
+      "name": "IDirect3DVolumeTexture9_UnlockBox",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolumeTexture9",
+      "name": "IDirect3DVolumeTexture9_AddDirtyBox",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolume9",
+      "name": "IDirect3DVolume9_QueryInterface",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolume9",
+      "name": "IDirect3DVolume9_AddRef",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolume9",
+      "name": "IDirect3DVolume9_Release",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolume9",
+      "name": "IDirect3DVolume9_GetDevice",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolume9",
+      "name": "IDirect3DVolume9_SetPrivateData",
+      "argCount": 5,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolume9",
+      "name": "IDirect3DVolume9_GetPrivateData",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolume9",
+      "name": "IDirect3DVolume9_FreePrivateData",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolume9",
+      "name": "IDirect3DVolume9_GetContainer",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolume9",
+      "name": "IDirect3DVolume9_GetDesc",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolume9",
+      "name": "IDirect3DVolume9_LockBox",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVolume9",
+      "name": "IDirect3DVolume9_UnlockBox",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DSurface9",
+      "name": "IDirect3DSurface9_QueryInterface",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DSurface9",
+      "name": "IDirect3DSurface9_AddRef",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DSurface9",
+      "name": "IDirect3DSurface9_Release",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DSurface9",
+      "name": "IDirect3DSurface9_GetDevice",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DSurface9",
+      "name": "IDirect3DSurface9_SetPrivateData",
+      "argCount": 5,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DSurface9",
+      "name": "IDirect3DSurface9_GetPrivateData",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DSurface9",
+      "name": "IDirect3DSurface9_FreePrivateData",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DSurface9",
+      "name": "IDirect3DSurface9_SetPriority",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DSurface9",
+      "name": "IDirect3DSurface9_GetPriority",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DSurface9",
+      "name": "IDirect3DSurface9_PreLoad",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DSurface9",
+      "name": "IDirect3DSurface9_GetType",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DSurface9",
+      "name": "IDirect3DSurface9_GetContainer",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DSurface9",
+      "name": "IDirect3DSurface9_GetDesc",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DSurface9",
+      "name": "IDirect3DSurface9_LockRect",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DSurface9",
+      "name": "IDirect3DSurface9_UnlockRect",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DSurface9",
+      "name": "IDirect3DSurface9_GetDC",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DSurface9",
+      "name": "IDirect3DSurface9_ReleaseDC",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DSwapChain9",
+      "name": "IDirect3DSwapChain9_QueryInterface",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DSwapChain9",
+      "name": "IDirect3DSwapChain9_AddRef",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DSwapChain9",
+      "name": "IDirect3DSwapChain9_Release",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DSwapChain9",
+      "name": "IDirect3DSwapChain9_Present",
+      "argCount": 6,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DSwapChain9",
+      "name": "IDirect3DSwapChain9_GetFrontBufferData",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DSwapChain9",
+      "name": "IDirect3DSwapChain9_GetBackBuffer",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DSwapChain9",
+      "name": "IDirect3DSwapChain9_GetRasterStatus",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DSwapChain9",
+      "name": "IDirect3DSwapChain9_GetDisplayMode",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DSwapChain9",
+      "name": "IDirect3DSwapChain9_GetDevice",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DSwapChain9",
+      "name": "IDirect3DSwapChain9_GetPresentParameters",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DStateBlock9",
+      "name": "IDirect3DStateBlock9_QueryInterface",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DStateBlock9",
+      "name": "IDirect3DStateBlock9_AddRef",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DStateBlock9",
+      "name": "IDirect3DStateBlock9_Release",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DStateBlock9",
+      "name": "IDirect3DStateBlock9_GetDevice",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DStateBlock9",
+      "name": "IDirect3DStateBlock9_Capture",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DStateBlock9",
+      "name": "IDirect3DStateBlock9_Apply",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVertexDeclaration9",
+      "name": "IDirect3DVertexDeclaration9_QueryInterface",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVertexDeclaration9",
+      "name": "IDirect3DVertexDeclaration9_AddRef",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVertexDeclaration9",
+      "name": "IDirect3DVertexDeclaration9_Release",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVertexDeclaration9",
+      "name": "IDirect3DVertexDeclaration9_GetDevice",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVertexDeclaration9",
+      "name": "IDirect3DVertexDeclaration9_GetDeclaration",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVertexShader9",
+      "name": "IDirect3DVertexShader9_QueryInterface",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVertexShader9",
+      "name": "IDirect3DVertexShader9_AddRef",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVertexShader9",
+      "name": "IDirect3DVertexShader9_Release",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVertexShader9",
+      "name": "IDirect3DVertexShader9_GetDevice",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DVertexShader9",
+      "name": "IDirect3DVertexShader9_GetFunction",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DPixelShader9",
+      "name": "IDirect3DPixelShader9_QueryInterface",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DPixelShader9",
+      "name": "IDirect3DPixelShader9_AddRef",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DPixelShader9",
+      "name": "IDirect3DPixelShader9_Release",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DPixelShader9",
+      "name": "IDirect3DPixelShader9_GetDevice",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DPixelShader9",
+      "name": "IDirect3DPixelShader9_GetFunction",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DQuery9",
+      "name": "IDirect3DQuery9_QueryInterface",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DQuery9",
+      "name": "IDirect3DQuery9_AddRef",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DQuery9",
+      "name": "IDirect3DQuery9_Release",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DQuery9",
+      "name": "IDirect3DQuery9_GetDevice",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DQuery9",
+      "name": "IDirect3DQuery9_GetType",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DQuery9",
+      "name": "IDirect3DQuery9_GetDataSize",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DQuery9",
+      "name": "IDirect3DQuery9_Issue",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DQuery9",
+      "name": "IDirect3DQuery9_GetData",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DShaderValidator9",
+      "name": "IDirect3DShaderValidator9_QueryInterface",
+      "argCount": 3,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DShaderValidator9",
+      "name": "IDirect3DShaderValidator9_AddRef",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DShaderValidator9",
+      "name": "IDirect3DShaderValidator9_Release",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DShaderValidator9",
+      "name": "IDirect3DShaderValidator9_Begin",
+      "argCount": 4,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DShaderValidator9",
+      "name": "IDirect3DShaderValidator9_Instruction",
+      "argCount": 5,
+      "status": "implemented"
+    },
+    {
+      "interface": "IDirect3DShaderValidator9",
+      "name": "IDirect3DShaderValidator9_End",
+      "argCount": 1,
+      "status": "implemented"
+    }
+  ],
+  "functions": [
+    {
+      "name": "Direct3DCreate9",
+      "argCount": 1,
+      "status": "implemented"
+    },
+    {
+      "name": "Direct3DCreate9Ex",
+      "argCount": 2,
+      "status": "implemented"
+    },
+    {
+      "name": "Direct3DShaderValidatorCreate9",
+      "argCount": 0,
+      "status": "implemented"
+    },
+    {
+      "name": "DebugSetMute",
+      "argCount": 1,
+      "status": "implemented"
+    }
+  ],
+  "counts": {
+    "interfaces": 18,
+    "methods": 459,
+    "implemented": 462,
+    "refused": 1,
+    "dispatcherFallback": 0
+  },
+  "parity": {
+    "schema": 1,
+    "oracle": "d3d9-parity-v1",
+    "captureSchema": 1,
+    "probes": [
+      {
+        "schema": 1,
+        "id": "caps-layout-and-evidence",
+        "domain": "caps",
+        "operation": "writeDeviceCaps9",
+        "input": {
+          "size": 304,
+          "layout": "D3DCAPS9"
+        },
+        "externalTargets": [
+          "native-d3d9",
+          "dxvk"
+        ],
+        "owner": "FP0/FP17",
+        "evidence": [
+          "tools/d3d9-parity/caps-profile.ts",
+          "tools/tests/d3d9-capability-profile.test.ts"
+        ],
+        "captureCommand": "bun tools/d3d9-parity/compare-capture.ts <capture.json> (native: dotnet run --project tools/d3d9-parity/native-probe/NativeD3D9Probe.csproj -- > <capture.json>)",
+        "gap": "Reference-only non-zero caps still need native and DXVK captures; zero refusals must remain explicit.",
+        "localExpected": {
+          "hresult": 0,
+          "caps": {
+            "size": 304,
+            "fields": [
+              {
+                "name": "DeviceType",
+                "offset": 0,
+                "kind": "scalar",
+                "value": 1,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "AdapterOrdinal",
+                "offset": 4,
+                "kind": "scalar",
+                "value": 0,
+                "advertised": false,
+                "setBits": []
+              },
+              {
+                "name": "Caps",
+                "offset": 8,
+                "kind": "bitmask",
+                "value": 131072,
+                "advertised": true,
+                "setBits": [
+                  17
+                ]
+              },
+              {
+                "name": "Caps2",
+                "offset": 12,
+                "kind": "bitmask",
+                "value": 2684485632,
+                "advertised": true,
+                "setBits": [
+                  17,
+                  29,
+                  31
+                ]
+              },
+              {
+                "name": "Caps3",
+                "offset": 16,
+                "kind": "bitmask",
+                "value": 928,
+                "advertised": true,
+                "setBits": [
+                  5,
+                  7,
+                  8,
+                  9
+                ]
+              },
+              {
+                "name": "PresentationIntervals",
+                "offset": 20,
+                "kind": "bitmask",
+                "value": 2147483663,
+                "advertised": true,
+                "setBits": [
+                  0,
+                  1,
+                  2,
+                  3,
+                  31
+                ]
+              },
+              {
+                "name": "CursorCaps",
+                "offset": 24,
+                "kind": "bitmask",
+                "value": 1,
+                "advertised": true,
+                "setBits": [
+                  0
+                ]
+              },
+              {
+                "name": "DevCaps",
+                "offset": 28,
+                "kind": "bitmask",
+                "value": 1818352,
+                "advertised": true,
+                "setBits": [
+                  4,
+                  5,
+                  6,
+                  7,
+                  9,
+                  10,
+                  11,
+                  12,
+                  13,
+                  15,
+                  16,
+                  17,
+                  19,
+                  20
+                ]
+              },
+              {
+                "name": "PrimitiveMiscCaps",
+                "offset": 32,
+                "kind": "bitmask",
+                "value": 2871026,
+                "advertised": true,
+                "setBits": [
+                  1,
+                  4,
+                  5,
+                  6,
+                  7,
+                  9,
+                  10,
+                  11,
+                  14,
+                  15,
+                  16,
+                  17,
+                  19,
+                  21
+                ]
+              },
+              {
+                "name": "RasterCaps",
+                "offset": 36,
+                "kind": "bitmask",
+                "value": 124985745,
+                "advertised": true,
+                "setBits": [
+                  0,
+                  4,
+                  7,
+                  8,
+                  13,
+                  16,
+                  17,
+                  20,
+                  21,
+                  22,
+                  24,
+                  25,
+                  26
+                ]
+              },
+              {
+                "name": "ZCmpCaps",
+                "offset": 40,
+                "kind": "bitmask",
+                "value": 255,
+                "advertised": true,
+                "setBits": [
+                  0,
+                  1,
+                  2,
+                  3,
+                  4,
+                  5,
+                  6,
+                  7
+                ]
+              },
+              {
+                "name": "SrcBlendCaps",
+                "offset": 44,
+                "kind": "bitmask",
+                "value": 16383,
+                "advertised": true,
+                "setBits": [
+                  0,
+                  1,
+                  2,
+                  3,
+                  4,
+                  5,
+                  6,
+                  7,
+                  8,
+                  9,
+                  10,
+                  11,
+                  12,
+                  13
+                ]
+              },
+              {
+                "name": "DestBlendCaps",
+                "offset": 48,
+                "kind": "bitmask",
+                "value": 16383,
+                "advertised": true,
+                "setBits": [
+                  0,
+                  1,
+                  2,
+                  3,
+                  4,
+                  5,
+                  6,
+                  7,
+                  8,
+                  9,
+                  10,
+                  11,
+                  12,
+                  13
+                ]
+              },
+              {
+                "name": "AlphaCmpCaps",
+                "offset": 52,
+                "kind": "bitmask",
+                "value": 255,
+                "advertised": true,
+                "setBits": [
+                  0,
+                  1,
+                  2,
+                  3,
+                  4,
+                  5,
+                  6,
+                  7
+                ]
+              },
+              {
+                "name": "ShadeCaps",
+                "offset": 56,
+                "kind": "bitmask",
+                "value": 541192,
+                "advertised": true,
+                "setBits": [
+                  3,
+                  9,
+                  14,
+                  19
+                ]
+              },
+              {
+                "name": "TextureCaps",
+                "offset": 60,
+                "kind": "bitmask",
+                "value": 85189,
+                "advertised": true,
+                "setBits": [
+                  0,
+                  2,
+                  6,
+                  7,
+                  10,
+                  11,
+                  14,
+                  16
+                ]
+              },
+              {
+                "name": "TextureFilterCaps",
+                "offset": 64,
+                "kind": "bitmask",
+                "value": 50530048,
+                "advertised": true,
+                "setBits": [
+                  8,
+                  9,
+                  10,
+                  16,
+                  17,
+                  24,
+                  25
+                ]
+              },
+              {
+                "name": "CubeTextureFilterCaps",
+                "offset": 68,
+                "kind": "bitmask",
+                "value": 50529024,
+                "advertised": true,
+                "setBits": [
+                  8,
+                  9,
+                  16,
+                  17,
+                  24,
+                  25
+                ]
+              },
+              {
+                "name": "VolumeTextureFilterCaps",
+                "offset": 72,
+                "kind": "bitmask",
+                "value": 0,
+                "advertised": false,
+                "setBits": []
+              },
+              {
+                "name": "TextureAddressCaps",
+                "offset": 76,
+                "kind": "bitmask",
+                "value": 63,
+                "advertised": true,
+                "setBits": [
+                  0,
+                  1,
+                  2,
+                  3,
+                  4,
+                  5
+                ]
+              },
+              {
+                "name": "VolumeTextureAddressCaps",
+                "offset": 80,
+                "kind": "bitmask",
+                "value": 0,
+                "advertised": false,
+                "setBits": []
+              },
+              {
+                "name": "LineCaps",
+                "offset": 84,
+                "kind": "bitmask",
+                "value": 31,
+                "advertised": true,
+                "setBits": [
+                  0,
+                  1,
+                  2,
+                  3,
+                  4
+                ]
+              },
+              {
+                "name": "MaxTextureWidth",
+                "offset": 88,
+                "kind": "scalar",
+                "value": 4096,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "MaxTextureHeight",
+                "offset": 92,
+                "kind": "scalar",
+                "value": 4096,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "MaxVolumeExtent",
+                "offset": 96,
+                "kind": "scalar",
+                "value": 0,
+                "advertised": false,
+                "setBits": []
+              },
+              {
+                "name": "MaxTextureRepeat",
+                "offset": 100,
+                "kind": "scalar",
+                "value": 8192,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "MaxTextureAspectRatio",
+                "offset": 104,
+                "kind": "scalar",
+                "value": 4096,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "MaxAnisotropy",
+                "offset": 108,
+                "kind": "scalar",
+                "value": 16,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "MaxVertexW",
+                "offset": 112,
+                "kind": "float",
+                "value": 10000000000,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "GuardBandLeft",
+                "offset": 116,
+                "kind": "float",
+                "value": -32768,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "GuardBandTop",
+                "offset": 120,
+                "kind": "float",
+                "value": -32768,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "GuardBandRight",
+                "offset": 124,
+                "kind": "float",
+                "value": 32768,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "GuardBandBottom",
+                "offset": 128,
+                "kind": "float",
+                "value": 32768,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "ExtentsAdjust",
+                "offset": 132,
+                "kind": "float",
+                "value": 0,
+                "advertised": false,
+                "setBits": []
+              },
+              {
+                "name": "StencilCaps",
+                "offset": 136,
+                "kind": "bitmask",
+                "value": 511,
+                "advertised": true,
+                "setBits": [
+                  0,
+                  1,
+                  2,
+                  3,
+                  4,
+                  5,
+                  6,
+                  7,
+                  8
+                ]
+              },
+              {
+                "name": "FVFCaps",
+                "offset": 140,
+                "kind": "bitmask",
+                "value": 1572872,
+                "advertised": true,
+                "setBits": [
+                  3,
+                  19,
+                  20
+                ]
+              },
+              {
+                "name": "TextureOpCaps",
+                "offset": 144,
+                "kind": "bitmask",
+                "value": 60751871,
+                "advertised": true,
+                "setBits": [
+                  0,
+                  1,
+                  2,
+                  3,
+                  4,
+                  5,
+                  6,
+                  7,
+                  8,
+                  9,
+                  10,
+                  11,
+                  12,
+                  13,
+                  14,
+                  15,
+                  17,
+                  18,
+                  19,
+                  20,
+                  23,
+                  24,
+                  25
+                ]
+              },
+              {
+                "name": "MaxTextureBlendStages",
+                "offset": 148,
+                "kind": "scalar",
+                "value": 8,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "MaxSimultaneousTextures",
+                "offset": 152,
+                "kind": "scalar",
+                "value": 8,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "VertexProcessingCaps",
+                "offset": 156,
+                "kind": "bitmask",
+                "value": 379,
+                "advertised": true,
+                "setBits": [
+                  0,
+                  1,
+                  3,
+                  4,
+                  5,
+                  6,
+                  8
+                ]
+              },
+              {
+                "name": "MaxActiveLights",
+                "offset": 160,
+                "kind": "scalar",
+                "value": 8,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "MaxUserClipPlanes",
+                "offset": 164,
+                "kind": "scalar",
+                "value": 6,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "MaxVertexBlendMatrices",
+                "offset": 168,
+                "kind": "scalar",
+                "value": 4,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "MaxVertexBlendMatrixIndex",
+                "offset": 172,
+                "kind": "scalar",
+                "value": 7,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "MaxPointSize",
+                "offset": 176,
+                "kind": "float",
+                "value": 8192,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "MaxPrimitiveCount",
+                "offset": 180,
+                "kind": "scalar",
+                "value": 16777215,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "MaxVertexIndex",
+                "offset": 184,
+                "kind": "scalar",
+                "value": 16777215,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "MaxStreams",
+                "offset": 188,
+                "kind": "scalar",
+                "value": 16,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "MaxStreamStride",
+                "offset": 192,
+                "kind": "scalar",
+                "value": 255,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "VertexShaderVersion",
+                "offset": 196,
+                "kind": "version",
+                "value": 4294836992,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "MaxVertexShaderConst",
+                "offset": 200,
+                "kind": "scalar",
+                "value": 256,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "PixelShaderVersion",
+                "offset": 204,
+                "kind": "version",
+                "value": 4294902528,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "PixelShader1xMaxValue",
+                "offset": 208,
+                "kind": "float",
+                "value": 65504,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "DevCaps2",
+                "offset": 212,
+                "kind": "bitmask",
+                "value": 81,
+                "advertised": true,
+                "setBits": [
+                  0,
+                  4,
+                  6
+                ]
+              },
+              {
+                "name": "MaxNpatchTessellationLevel",
+                "offset": 216,
+                "kind": "float",
+                "value": 0,
+                "advertised": false,
+                "setBits": []
+              },
+              {
+                "name": "Reserved5",
+                "offset": 220,
+                "kind": "scalar",
+                "value": 0,
+                "advertised": false,
+                "setBits": []
+              },
+              {
+                "name": "MasterAdapterOrdinal",
+                "offset": 224,
+                "kind": "scalar",
+                "value": 0,
+                "advertised": false,
+                "setBits": []
+              },
+              {
+                "name": "AdapterOrdinalInGroup",
+                "offset": 228,
+                "kind": "scalar",
+                "value": 0,
+                "advertised": false,
+                "setBits": []
+              },
+              {
+                "name": "NumberOfAdaptersInGroup",
+                "offset": 232,
+                "kind": "scalar",
+                "value": 1,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "DeclTypes",
+                "offset": 236,
+                "kind": "bitmask",
+                "value": 831,
+                "advertised": true,
+                "setBits": [
+                  0,
+                  1,
+                  2,
+                  3,
+                  4,
+                  5,
+                  8,
+                  9
+                ]
+              },
+              {
+                "name": "NumSimultaneousRTs",
+                "offset": 240,
+                "kind": "scalar",
+                "value": 4,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "StretchRectFilterCaps",
+                "offset": 244,
+                "kind": "bitmask",
+                "value": 50332416,
+                "advertised": true,
+                "setBits": [
+                  8,
+                  9,
+                  24,
+                  25
+                ]
+              },
+              {
+                "name": "VS20Caps.Caps",
+                "offset": 248,
+                "kind": "bitmask",
+                "value": 1,
+                "advertised": true,
+                "setBits": [
+                  0
+                ]
+              },
+              {
+                "name": "VS20Caps.DynamicFlowControlDepth",
+                "offset": 252,
+                "kind": "scalar",
+                "value": 24,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "VS20Caps.NumTemps",
+                "offset": 256,
+                "kind": "scalar",
+                "value": 32,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "VS20Caps.StaticFlowControlDepth",
+                "offset": 260,
+                "kind": "scalar",
+                "value": 4,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "PS20Caps.Caps",
+                "offset": 264,
+                "kind": "bitmask",
+                "value": 29,
+                "advertised": true,
+                "setBits": [
+                  0,
+                  2,
+                  3,
+                  4
+                ]
+              },
+              {
+                "name": "PS20Caps.DynamicFlowControlDepth",
+                "offset": 268,
+                "kind": "scalar",
+                "value": 24,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "PS20Caps.NumTemps",
+                "offset": 272,
+                "kind": "scalar",
+                "value": 32,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "PS20Caps.StaticFlowControlDepth",
+                "offset": 276,
+                "kind": "scalar",
+                "value": 4,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "PS20Caps.NumInstructionSlots",
+                "offset": 280,
+                "kind": "scalar",
+                "value": 512,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "VertexTextureFilterCaps",
+                "offset": 284,
+                "kind": "bitmask",
+                "value": 50332416,
+                "advertised": true,
+                "setBits": [
+                  8,
+                  9,
+                  24,
+                  25
+                ]
+              },
+              {
+                "name": "MaxVShaderInstructionsExecuted",
+                "offset": 288,
+                "kind": "scalar",
+                "value": 4294967295,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "MaxPShaderInstructionsExecuted",
+                "offset": 292,
+                "kind": "scalar",
+                "value": 65535,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "MaxVertexShader30InstructionSlots",
+                "offset": 296,
+                "kind": "scalar",
+                "value": 32768,
+                "advertised": true,
+                "setBits": []
+              },
+              {
+                "name": "MaxPixelShader30InstructionSlots",
+                "offset": 300,
+                "kind": "scalar",
+                "value": 4096,
+                "advertised": true,
+                "setBits": []
+              }
+            ]
+          }
+        },
+        "localStatus": "covered",
+        "externalStatus": "partially-captured",
+        "capturedTargets": [
+          "native-d3d9"
+        ]
+      },
+      {
+        "schema": 1,
+        "id": "caps-volume-filter-refusal",
+        "domain": "caps",
+        "operation": "writeDeviceCaps9.VolumeTextureFilterCaps",
+        "input": {
+          "size": 304,
+          "field": "VolumeTextureFilterCaps",
+          "expectedValue": 0
+        },
+        "externalTargets": [
+          "native-d3d9",
+          "dxvk"
+        ],
+        "owner": "FP17",
+        "evidence": [
+          "tools/d3d9-parity/caps-profile.ts:VolumeTextureFilterCaps-refusal",
+          "tools/tests/d3d9-capability-profile.test.ts"
+        ],
+        "captureCommand": "bun tools/d3d9-parity/compare-capture.ts <capture.json> (native: dotnet run --project tools/d3d9-parity/native-probe/NativeD3D9Probe.csproj -- > <capture.json>)",
+        "gap": "Volume filtering remains deliberately advertised as zero until a live 3-D WebGPU capability contract and image conformance path exist; native/DXVK caps extraction records the intentional divergence.",
+        "localExpected": 0,
+        "localStatus": "covered",
+        "externalStatus": "partially-captured",
+        "capturedTargets": [
+          "native-d3d9"
+        ]
+      },
+      {
+        "schema": 1,
+        "id": "check-device-format-cross-bpp",
+        "domain": "format",
+        "operation": "CheckDeviceFormat",
+        "input": {
+          "version": 9,
+          "adapterFormat": 23,
+          "usage": 0,
+          "resourceType": 3,
+          "format": 21
+        },
+        "externalTargets": [
+          "native-d3d9",
+          "dxvk"
+        ],
+        "owner": "FP17",
+        "evidence": [
+          "src/worker/backends/webgpu/shared/dx-format-support.ts",
+          "tools/tests/dx-format-support.test.ts"
+        ],
+        "captureCommand": "bun tools/d3d9-parity/compare-capture.ts <capture.json> (native: dotnet run --project tools/d3d9-parity/native-probe/NativeD3D9Probe.csproj -- > <capture.json>)",
+        "gap": "The cross-bpp adapter matrix is based on documented/observed D3D9 behavior but has no checked-in native/DXVK capture.",
+        "localExpected": {
+          "supported": true,
+          "qualityLevels": 0
+        },
+        "localStatus": "covered",
+        "externalStatus": "partially-captured",
+        "capturedTargets": [
+          "native-d3d9"
+        ]
+      },
+      {
+        "schema": 1,
+        "id": "check-device-format-unsupported-float-rt",
+        "domain": "format",
+        "operation": "CheckDeviceFormat",
+        "input": {
+          "version": 9,
+          "adapterFormat": 22,
+          "usage": 1,
+          "resourceType": 3,
+          "format": 111
+        },
+        "externalTargets": [
+          "native-d3d9",
+          "dxvk"
+        ],
+        "owner": "FP17",
+        "evidence": [
+          "src/worker/backends/webgpu/shared/dx-format-support.ts",
+          "tools/tests/dx-format-support.test.ts"
+        ],
+        "captureCommand": "bun tools/d3d9-parity/compare-capture.ts <capture.json> (native: dotnet run --project tools/d3d9-parity/native-probe/NativeD3D9Probe.csproj -- > <capture.json>)",
+        "gap": "16-bit-float render targets are intentionally refused until a faithful storage/readback path exists; verify the HRESULT against both targets.",
+        "localExpected": {
+          "supported": false,
+          "qualityLevels": 0
+        },
+        "localStatus": "covered",
+        "externalStatus": "partially-captured",
+        "capturedTargets": [
+          "native-d3d9"
+        ]
+      },
+      {
+        "schema": 1,
+        "id": "check-device-format-r16f-texture",
+        "domain": "format",
+        "operation": "CheckDeviceFormat",
+        "input": {
+          "version": 9,
+          "adapterFormat": 22,
+          "usage": 0,
+          "resourceType": 3,
+          "format": 111
+        },
+        "externalTargets": [
+          "native-d3d9",
+          "dxvk"
+        ],
+        "owner": "FP2/FP18",
+        "evidence": [
+          "src/worker/backends/webgpu/shared/float-format-policy.ts",
+          "tools/tests/d3d9-float-policy.test.ts"
+        ],
+        "captureCommand": "bun tools/d3d9-parity/compare-capture.ts <capture.json> (native: dotnet run --project tools/d3d9-parity/native-probe/NativeD3D9Probe.csproj -- > <capture.json>)",
+        "gap": "R16F sampled storage is opt-in behind a host allocation/upload/sampling/readback contract; compare the native/DXVK texture-format answer before enabling it by default.",
+        "localExpected": {
+          "supported": false,
+          "qualityLevels": 0
+        },
+        "localStatus": "covered",
+        "externalStatus": "partially-captured",
+        "capturedTargets": [
+          "native-d3d9"
+        ]
+      },
+      {
+        "schema": 1,
+        "id": "check-device-format-g16r16f-texture",
+        "domain": "format",
+        "operation": "CheckDeviceFormat",
+        "input": {
+          "version": 9,
+          "adapterFormat": 22,
+          "usage": 0,
+          "resourceType": 3,
+          "format": 112
+        },
+        "externalTargets": [
+          "native-d3d9",
+          "dxvk"
+        ],
+        "owner": "FP2/FP18",
+        "evidence": [
+          "src/worker/backends/webgpu/shared/float-format-policy.ts",
+          "tools/tests/d3d9-float-policy.test.ts"
+        ],
+        "captureCommand": "bun tools/d3d9-parity/compare-capture.ts <capture.json> (native: dotnet run --project tools/d3d9-parity/native-probe/NativeD3D9Probe.csproj -- > <capture.json>)",
+        "gap": "G16R16F sampled storage is opt-in behind the same four-probe host contract; compare native/DXVK format acceptance before enabling it by default.",
+        "localExpected": {
+          "supported": false,
+          "qualityLevels": 0
+        },
+        "localStatus": "covered",
+        "externalStatus": "partially-captured",
+        "capturedTargets": [
+          "native-d3d9"
+        ]
+      },
+      {
+        "schema": 1,
+        "id": "check-device-format-a16b16g16r16f-texture",
+        "domain": "format",
+        "operation": "CheckDeviceFormat",
+        "input": {
+          "version": 9,
+          "adapterFormat": 22,
+          "usage": 0,
+          "resourceType": 3,
+          "format": 113
+        },
+        "externalTargets": [
+          "native-d3d9",
+          "dxvk"
+        ],
+        "owner": "FP2/FP18",
+        "evidence": [
+          "src/worker/backends/webgpu/shared/float-format-policy.ts",
+          "tools/tests/d3d9-float-policy.test.ts"
+        ],
+        "captureCommand": "bun tools/d3d9-parity/compare-capture.ts <capture.json> (native: dotnet run --project tools/d3d9-parity/native-probe/NativeD3D9Probe.csproj -- > <capture.json>)",
+        "gap": "A16B16G16R16F sampled storage is opt-in behind the same four-probe host contract; compare native/DXVK format acceptance before enabling it by default.",
+        "localExpected": {
+          "supported": false,
+          "qualityLevels": 0
+        },
+        "localStatus": "covered",
+        "externalStatus": "partially-captured",
+        "capturedTargets": [
+          "native-d3d9"
+        ]
+      },
+      {
+        "schema": 1,
+        "id": "d3d9-msaa-none",
+        "domain": "msaa",
+        "operation": "CheckDeviceMultiSampleType",
+        "input": {
+          "version": 9,
+          "surfaceFormat": 22,
+          "windowed": true,
+          "multiSampleType": 0
+        },
+        "externalTargets": [
+          "native-d3d9",
+          "dxvk"
+        ],
+        "owner": "FP17",
+        "evidence": [
+          "src/worker/backends/webgpu/shared/msaa-policy.ts",
+          "tools/tests/d3d9-msaa-policy.test.ts"
+        ],
+        "captureCommand": "bun tools/d3d9-parity/compare-capture.ts <capture.json> (native: dotnet run --project tools/d3d9-parity/native-probe/NativeD3D9Probe.csproj -- > <capture.json>)",
+        "gap": "The single-sample D3D9 path is covered locally; external captures guard against a driver-specific quality-level drift.",
+        "localExpected": {
+          "supported": true,
+          "qualityLevels": 1
+        },
+        "localStatus": "covered",
+        "externalStatus": "partially-captured",
+        "capturedTargets": [
+          "native-d3d9"
+        ]
+      },
+      {
+        "schema": 1,
+        "id": "d3d9-msaa-2x-refusal",
+        "domain": "msaa",
+        "operation": "CheckDeviceMultiSampleType",
+        "input": {
+          "version": 9,
+          "surfaceFormat": 22,
+          "windowed": true,
+          "multiSampleType": 2
+        },
+        "externalTargets": [
+          "native-d3d9",
+          "dxvk"
+        ],
+        "owner": "FP17",
+        "evidence": [
+          "src/worker/backends/webgpu/shared/msaa-policy.ts",
+          "tools/tests/d3d9-msaa-policy.test.ts"
+        ],
+        "captureCommand": "bun tools/d3d9-parity/compare-capture.ts <capture.json> (native: dotnet run --project tools/d3d9-parity/native-probe/NativeD3D9Probe.csproj -- > <capture.json>)",
+        "gap": "D3D9 2x is accepted only under an explicit host sample-capability contract; the default path remains a strict refusal and native/DXVK evidence is required before broad advertisement.",
+        "localExpected": {
+          "supported": false,
+          "qualityLevels": 0
+        },
+        "localStatus": "covered",
+        "externalStatus": "partially-captured",
+        "capturedTargets": [
+          "native-d3d9"
+        ]
+      },
+      {
+        "schema": 1,
+        "id": "sampler-border-and-mirror-once",
+        "domain": "sampler",
+        "operation": "ResolveSamplerDescriptor",
+        "input": {
+          "min": "linear",
+          "mag": "linear",
+          "mip": "linear",
+          "mipNone": false,
+          "addressU": "d3d9-border",
+          "addressV": "d3d9-mirror-once",
+          "addressW": "clamp-to-edge",
+          "gameAnisotropy": 4,
+          "maxMipLevel": 2,
+          "borderColor": 2151686160,
+          "mipLodBiasBits": 1065353216,
+          "quality": {
+            "anisotropy": 1,
+            "forceTrilinear": false
+          }
+        },
+        "externalTargets": [
+          "native-d3d9",
+          "dxvk"
+        ],
+        "owner": "FP17",
+        "evidence": [
+          "src/worker/backends/webgpu/shared/dx-sampler.ts",
+          "tools/tests/dx-sampler.test.ts"
+        ],
+        "captureCommand": "bun tools/d3d9-parity/compare-capture.ts <capture.json> (native: dotnet run --project tools/d3d9-parity/native-probe/NativeD3D9Probe.csproj -- > <capture.json>)",
+        "gap": "Border and mirror-once are shader-emulated because WebGPU has no matching native sampler modes; compare observable texels on both targets.",
+        "localExpected": {
+          "minFilter": "linear",
+          "magFilter": "linear",
+          "mipmapFilter": "linear",
+          "addressModeU": "clamp-to-edge",
+          "addressModeV": "clamp-to-edge",
+          "addressModeW": "clamp-to-edge",
+          "maxAnisotropy": 4,
+          "lodMinClamp": 2
+        },
+        "localStatus": "covered",
+        "externalStatus": "awaiting-capture",
+        "capturedTargets": []
+      },
+      {
+        "schema": 1,
+        "id": "sampler-anisotropic-mip-filter",
+        "domain": "sampler",
+        "operation": "ResolveSamplerDescriptor",
+        "input": {
+          "mipFilter": 3,
+          "filterName": "D3DTEXF_ANISOTROPIC"
+        },
+        "externalTargets": [
+          "native-d3d9",
+          "dxvk"
+        ],
+        "owner": "FP5/FP17",
+        "evidence": [
+          "src/worker/backends/webgpu/d3d9/d3d9-sampler.ts:mip-filter",
+          "G:/sources/dxvk/src/d3d9/d3d9_util.h:175-176",
+          "tools/tests/d3d9-sampler.test.ts"
+        ],
+        "captureCommand": "bun tools/d3d9-parity/compare-capture.ts <capture.json> (native: dotnet run --project tools/d3d9-parity/native-probe/NativeD3D9Probe.csproj -- > <capture.json>)",
+        "gap": "The local decoder now maps ANISOTROPIC mip filtering to linear mip selection like DXVK; a created-device sampler-state capture is still required, and no unavailable hardware result is synthesized.",
+        "localExpected": {
+          "mip": "linear",
+          "mipNone": false
+        },
+        "localStatus": "covered",
+        "externalStatus": "awaiting-capture",
+        "capturedTargets": []
+      },
+      {
+        "schema": 1,
+        "id": "resource-stretchrect-rt-to-offscreen-stretch",
+        "domain": "resource",
+        "operation": "StretchRect",
+        "input": {
+          "source": {
+            "format": 21,
+            "usage": 1,
+            "pool": 0,
+            "width": 2,
+            "height": 2,
+            "multiSampleType": 0,
+            "texturePtr": 257
+          },
+          "destination": {
+            "format": 21,
+            "usage": 0,
+            "pool": 0,
+            "width": 4,
+            "height": 4,
+            "multiSampleType": 0,
+            "texturePtr": 514,
+            "offscreenPlain": true
+          },
+          "filter": 2
+        },
+        "externalTargets": [
+          "native-d3d9",
+          "dxvk"
+        ],
+        "owner": "FP8/FP17",
+        "evidence": [
+          "src/worker/backends/webgpu/d3d9/copy-policy.ts:offscreen-readback",
+          "src/worker/backends/webgpu/d3d9/d3d9-device.ts:stretchRect",
+          "tools/tests/d3d9-copy-policy.test.ts",
+          "G:/sources/dxvk/src/d3d9/d3d9_device.cpp:1360-1364"
+        ],
+        "captureCommand": "bun tools/d3d9-parity/compare-capture.ts <capture.json> (native: dotnet run --project tools/d3d9-parity/native-probe/NativeD3D9Probe.csproj -- > <capture.json>)",
+        "gap": "The single-sample local seam now performs GPU readback plus CPU scale/encode for DEFAULT offscreen-plain destinations; MSAA/depth/compressed and native/DXVK byte-level differentials still require created-resource captures.",
+        "localExpected": {
+          "supported": true,
+          "requiresResolve": false,
+          "cpuPath": true,
+          "stretch": true,
+          "reason": null
+        },
+        "localStatus": "covered",
+        "externalStatus": "awaiting-capture",
+        "capturedTargets": []
+      },
+      {
+        "schema": 1,
+        "id": "ex-convolution-invalidcall",
+        "domain": "ex",
+        "operation": "IDirect3DDevice9Ex_SetConvolutionMonoKernel",
+        "input": {
+          "device": 0,
+          "width": 3,
+          "height": 3,
+          "rows": null,
+          "columns": null
+        },
+        "externalTargets": [
+          "native-d3d9",
+          "dxvk"
+        ],
+        "owner": "FP17",
+        "evidence": [
+          "src/worker/modules/d3d9/ex.ts:SetConvolutionMonoKernel-invalidcall",
+          "tools/tests/d3d9-ex-lifecycle.test.ts",
+          "tools/d3d9-parity/native-probe/Program.cs:Ex-probes",
+          "G:/sources/dxvk/src/d3d9/d3d9_device.cpp:4114-4121"
+        ],
+        "captureCommand": "bun tools/d3d9-parity/compare-capture.ts <capture.json> (native: dotnet run --project tools/d3d9-parity/native-probe/NativeD3D9Probe.csproj -- > <capture.json>)",
+        "gap": "The unsupported Ex operation has an explicit INVALIDCALL contract; capture the native/DXVK HRESULT before changing it.",
+        "localExpected": 2289436780,
+        "localStatus": "covered",
+        "externalStatus": "partially-captured",
+        "capturedTargets": [
+          "native-d3d9"
+        ]
+      },
+      {
+        "schema": 1,
+        "id": "ex-compose-rects-compat-stub",
+        "domain": "ex",
+        "operation": "IDirect3DDevice9Ex_ComposeRects",
+        "input": {
+          "device": 0,
+          "src": null,
+          "dst": null,
+          "srcRectDescs": null,
+          "numRects": 0,
+          "dstRectDescs": null,
+          "operation": "D3DCOMPOSERECTS_COPY",
+          "xOffset": 0,
+          "yOffset": 0
+        },
+        "externalTargets": [
+          "native-d3d9",
+          "dxvk"
+        ],
+        "owner": "FP17",
+        "evidence": [
+          "src/worker/modules/d3d9/ex.ts:ComposeRects-compat-stub",
+          "tools/tests/d3d9-ex-lifecycle.test.ts",
+          "tools/d3d9-parity/native-probe/Program.cs:Ex-probes",
+          "G:/sources/dxvk/src/d3d9/d3d9_device.cpp:4124-4139"
+        ],
+        "captureCommand": "bun tools/d3d9-parity/compare-capture.ts <capture.json> (native: dotnet run --project tools/d3d9-parity/native-probe/NativeD3D9Probe.csproj -- > <capture.json>)",
+        "gap": "ComposeRects is a compatibility stub returning success; the oracle must not mislabel this as E_NOTIMPL.",
+        "localExpected": 0,
+        "localStatus": "covered",
+        "externalStatus": "partially-captured",
+        "capturedTargets": [
+          "native-d3d9"
+        ]
+      },
+      {
+        "schema": 1,
+        "id": "ex-check-resource-residency-stub",
+        "domain": "ex",
+        "operation": "IDirect3DDevice9Ex_CheckResourceResidency",
+        "input": {
+          "device": "created-device",
+          "resources": null,
+          "count": 0
+        },
+        "externalTargets": [
+          "native-d3d9",
+          "dxvk"
+        ],
+        "owner": "FP17",
+        "evidence": [
+          "src/worker/modules/d3d9/ex.ts:CheckResourceResidency-stub",
+          "tools/tests/d3d9-ex-lifecycle.test.ts",
+          "tools/d3d9-parity/native-probe/Program.cs:Ex-probes",
+          "G:/sources/dxvk/src/d3d9/d3d9_device.cpp:4175-4181"
+        ],
+        "captureCommand": "bun tools/d3d9-parity/compare-capture.ts <capture.json> (native: dotnet run --project tools/d3d9-parity/native-probe/NativeD3D9Probe.csproj -- > <capture.json>)",
+        "gap": "The local Ex stub returns D3D_OK for a null resource array with count zero; the executable probe records the native invalid-input HRESULT instead of treating the stub as differential parity.",
+        "localExpected": 0,
+        "localStatus": "covered",
+        "externalStatus": "partially-captured",
+        "capturedTargets": [
+          "native-d3d9"
+        ]
+      },
+      {
+        "schema": 1,
+        "id": "ex-check-device-state-stub",
+        "domain": "ex",
+        "operation": "IDirect3DDevice9Ex_CheckDeviceState",
+        "input": {
+          "device": "created-device",
+          "destinationWindow": 0
+        },
+        "externalTargets": [
+          "native-d3d9",
+          "dxvk"
+        ],
+        "owner": "FP17",
+        "evidence": [
+          "src/worker/modules/d3d9/ex.ts:CheckDeviceState-stub",
+          "tools/tests/d3d9-ex-lifecycle.test.ts",
+          "tools/d3d9-parity/native-probe/Program.cs:Ex-probes",
+          "G:/sources/dxvk/src/d3d9/d3d9_device.cpp:4217-4223"
+        ],
+        "captureCommand": "bun tools/d3d9-parity/compare-capture.ts <capture.json> (native: dotnet run --project tools/d3d9-parity/native-probe/NativeD3D9Probe.csproj -- > <capture.json>)",
+        "gap": "The local Ex stub returns D3D_OK for a valid device; the native/DXVK runner needs a created device and window-state vector, so no unavailable result is fabricated here.",
+        "localExpected": 0,
+        "localStatus": "covered",
+        "externalStatus": "partially-captured",
+        "capturedTargets": [
+          "native-d3d9"
+        ]
+      }
+    ],
+    "counts": {
+      "total": 16,
+      "localCovered": 16,
+      "awaitingCapture": 16,
+      "nativePending": 3,
+      "dxvkPending": 16
+    }
+  }
+}

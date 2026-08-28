@@ -1,0 +1,20 @@
+{
+  "note": "Intentional D3D9 native-capture divergences (plan/dx9c-review-findings-2026-08-26.md B2). A vector NOT listed here fails the gate; remove rows as they converge.",
+  "missing": [
+    "resource-stretchrect-rt-to-offscreen-stretch",
+    "sampler-anisotropic-mip-filter",
+    "sampler-border-and-mirror-once"
+  ],
+  "mismatches": [
+    "caps-layout-and-evidence",
+    "caps-volume-filter-refusal",
+    "check-device-format-a16b16g16r16f-texture",
+    "check-device-format-g16r16f-texture",
+    "check-device-format-r16f-texture",
+    "check-device-format-unsupported-float-rt",
+    "d3d9-msaa-2x-refusal",
+    "ex-check-device-state-stub",
+    "ex-check-resource-residency-stub",
+    "ex-compose-rects-compat-stub"
+  ]
+}

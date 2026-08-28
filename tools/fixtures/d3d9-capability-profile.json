@@ -1,0 +1,1318 @@
+{
+  "schema": 1,
+  "source": "src/worker/modules/d3d9/caps.ts",
+  "size": 304,
+  "fields": [
+    {
+      "name": "DeviceType",
+      "offset": 0,
+      "kind": "scalar",
+      "value": 1,
+      "advertised": true,
+      "setBits": [],
+      "status": "implemented",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/modules/d3d9/factory.ts:HAL-device"
+      ]
+    },
+    {
+      "name": "AdapterOrdinal",
+      "offset": 4,
+      "kind": "scalar",
+      "value": 0,
+      "advertised": false,
+      "setBits": [],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "Caps",
+      "offset": 8,
+      "kind": "bitmask",
+      "value": 131072,
+      "advertised": true,
+      "setBits": [
+        17
+      ],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "Caps2",
+      "offset": 12,
+      "kind": "bitmask",
+      "value": 2684485632,
+      "advertised": true,
+      "setBits": [
+        17,
+        29,
+        31
+      ],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "Caps3",
+      "offset": 16,
+      "kind": "bitmask",
+      "value": 928,
+      "advertised": true,
+      "setBits": [
+        5,
+        7,
+        8,
+        9
+      ],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "PresentationIntervals",
+      "offset": 20,
+      "kind": "bitmask",
+      "value": 2147483663,
+      "advertised": true,
+      "setBits": [
+        0,
+        1,
+        2,
+        3,
+        31
+      ],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/modules/d3d9/device.ts:Present-interval-state",
+        "tools/tests/d3d9-swapchain.test.ts"
+      ]
+    },
+    {
+      "name": "CursorCaps",
+      "offset": 24,
+      "kind": "bitmask",
+      "value": 1,
+      "advertised": true,
+      "setBits": [
+        0
+      ],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "DevCaps",
+      "offset": 28,
+      "kind": "bitmask",
+      "value": 1818352,
+      "advertised": true,
+      "setBits": [
+        4,
+        5,
+        6,
+        7,
+        9,
+        10,
+        11,
+        12,
+        13,
+        15,
+        16,
+        17,
+        19,
+        20
+      ],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "PrimitiveMiscCaps",
+      "offset": 32,
+      "kind": "bitmask",
+      "value": 2871026,
+      "advertised": true,
+      "setBits": [
+        1,
+        4,
+        5,
+        6,
+        7,
+        9,
+        10,
+        11,
+        14,
+        15,
+        16,
+        17,
+        19,
+        21
+      ],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/d3d9/d3d9-blend.ts",
+        "tools/tests/d3d9-blend.test.ts",
+        "tools/tests/d3d9-mrt.test.ts"
+      ]
+    },
+    {
+      "name": "RasterCaps",
+      "offset": 36,
+      "kind": "bitmask",
+      "value": 124985745,
+      "advertised": true,
+      "setBits": [
+        0,
+        4,
+        7,
+        8,
+        13,
+        16,
+        17,
+        20,
+        21,
+        22,
+        24,
+        25,
+        26
+      ],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "ZCmpCaps",
+      "offset": 40,
+      "kind": "bitmask",
+      "value": 255,
+      "advertised": true,
+      "setBits": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/d3d9/d3d9-device.ts:depth-state",
+        "tools/tests/d3d9-caps.test.ts"
+      ]
+    },
+    {
+      "name": "SrcBlendCaps",
+      "offset": 44,
+      "kind": "bitmask",
+      "value": 16383,
+      "advertised": true,
+      "setBits": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13
+      ],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/d3d9/d3d9-blend.ts",
+        "tools/tests/d3d9-blend.test.ts"
+      ]
+    },
+    {
+      "name": "DestBlendCaps",
+      "offset": 48,
+      "kind": "bitmask",
+      "value": 16383,
+      "advertised": true,
+      "setBits": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13
+      ],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/d3d9/d3d9-blend.ts",
+        "tools/tests/d3d9-blend.test.ts"
+      ]
+    },
+    {
+      "name": "AlphaCmpCaps",
+      "offset": 52,
+      "kind": "bitmask",
+      "value": 255,
+      "advertised": true,
+      "setBits": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/d3d9/d3d9-device.ts:alpha-test",
+        "tools/tests/d3d9-blend.test.ts"
+      ]
+    },
+    {
+      "name": "ShadeCaps",
+      "offset": 56,
+      "kind": "bitmask",
+      "value": 541192,
+      "advertised": true,
+      "setBits": [
+        3,
+        9,
+        14,
+        19
+      ],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "TextureCaps",
+      "offset": 60,
+      "kind": "bitmask",
+      "value": 85189,
+      "advertised": true,
+      "setBits": [
+        0,
+        2,
+        6,
+        7,
+        10,
+        11,
+        14,
+        16
+      ],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/shared/dx-format-support.ts",
+        "tools/tests/dx-format-support.test.ts"
+      ]
+    },
+    {
+      "name": "TextureFilterCaps",
+      "offset": 64,
+      "kind": "bitmask",
+      "value": 50530048,
+      "advertised": true,
+      "setBits": [
+        8,
+        9,
+        10,
+        16,
+        17,
+        24,
+        25
+      ],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/shared/dx-sampler.ts",
+        "tools/tests/dx-sampler.test.ts"
+      ]
+    },
+    {
+      "name": "CubeTextureFilterCaps",
+      "offset": 68,
+      "kind": "bitmask",
+      "value": 50529024,
+      "advertised": true,
+      "setBits": [
+        8,
+        9,
+        16,
+        17,
+        24,
+        25
+      ],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/d3d9/d3d9-device.ts:cube-view",
+        "tools/tests/d3d9-sm3-texture.test.ts"
+      ]
+    },
+    {
+      "name": "VolumeTextureFilterCaps",
+      "offset": 72,
+      "kind": "bitmask",
+      "value": 0,
+      "advertised": false,
+      "setBits": [],
+      "status": "refused",
+      "evidenceKind": "refusal",
+      "evidence": [
+        "src/worker/backends/webgpu/shared/dx-format-support.ts:volume-query-refusal",
+        "tools/tests/d3d9-caps.test.ts:volume caps remain zero"
+      ],
+      "gap": "Public volume filtering caps stay zero until an adapter-backed conformance probe exists."
+    },
+    {
+      "name": "TextureAddressCaps",
+      "offset": 76,
+      "kind": "bitmask",
+      "value": 63,
+      "advertised": true,
+      "setBits": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/shared/dx-sampler.ts",
+        "tools/tests/dx-sampler.test.ts"
+      ]
+    },
+    {
+      "name": "VolumeTextureAddressCaps",
+      "offset": 80,
+      "kind": "bitmask",
+      "value": 0,
+      "advertised": false,
+      "setBits": [],
+      "status": "refused",
+      "evidenceKind": "refusal",
+      "evidence": [
+        "src/worker/backends/webgpu/shared/dx-format-support.ts:volume-query-refusal",
+        "tools/tests/d3d9-caps.test.ts:volume caps remain zero"
+      ],
+      "gap": "Public volume addressing caps stay zero until an adapter-backed conformance probe exists."
+    },
+    {
+      "name": "LineCaps",
+      "offset": 84,
+      "kind": "bitmask",
+      "value": 31,
+      "advertised": true,
+      "setBits": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "MaxTextureWidth",
+      "offset": 88,
+      "kind": "scalar",
+      "value": 4096,
+      "advertised": true,
+      "setBits": [],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "MaxTextureHeight",
+      "offset": 92,
+      "kind": "scalar",
+      "value": 4096,
+      "advertised": true,
+      "setBits": [],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "MaxVolumeExtent",
+      "offset": 96,
+      "kind": "scalar",
+      "value": 0,
+      "advertised": false,
+      "setBits": [],
+      "status": "refused",
+      "evidenceKind": "refusal",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:MaxVolumeExtent-zero",
+        "tools/tests/d3d9-caps.test.ts:volume caps remain zero"
+      ],
+      "gap": "The programmable internal 3-D path is not a public CheckDeviceFormat/caps contract."
+    },
+    {
+      "name": "MaxTextureRepeat",
+      "offset": 100,
+      "kind": "scalar",
+      "value": 8192,
+      "advertised": true,
+      "setBits": [],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "MaxTextureAspectRatio",
+      "offset": 104,
+      "kind": "scalar",
+      "value": 4096,
+      "advertised": true,
+      "setBits": [],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "MaxAnisotropy",
+      "offset": 108,
+      "kind": "scalar",
+      "value": 16,
+      "advertised": true,
+      "setBits": [],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/d3d9/d3d9-sampler.ts",
+        "tools/tests/d3d9-sampler.test.ts"
+      ]
+    },
+    {
+      "name": "MaxVertexW",
+      "offset": 112,
+      "kind": "float",
+      "value": 10000000000,
+      "advertised": true,
+      "setBits": [],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "GuardBandLeft",
+      "offset": 116,
+      "kind": "float",
+      "value": -32768,
+      "advertised": true,
+      "setBits": [],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "GuardBandTop",
+      "offset": 120,
+      "kind": "float",
+      "value": -32768,
+      "advertised": true,
+      "setBits": [],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "GuardBandRight",
+      "offset": 124,
+      "kind": "float",
+      "value": 32768,
+      "advertised": true,
+      "setBits": [],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "GuardBandBottom",
+      "offset": 128,
+      "kind": "float",
+      "value": 32768,
+      "advertised": true,
+      "setBits": [],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "ExtentsAdjust",
+      "offset": 132,
+      "kind": "float",
+      "value": 0,
+      "advertised": false,
+      "setBits": [],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "StencilCaps",
+      "offset": 136,
+      "kind": "bitmask",
+      "value": 511,
+      "advertised": true,
+      "setBits": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:StencilCaps-depth24plus-stencil8",
+        "src/worker/backends/webgpu/d3d9/d3d9-backend-executor.ts:stencil-state",
+        "tools/tests/d3d9-caps.test.ts:stencil operations"
+      ]
+    },
+    {
+      "name": "FVFCaps",
+      "offset": 140,
+      "kind": "bitmask",
+      "value": 1572872,
+      "advertised": true,
+      "setBits": [
+        3,
+        19,
+        20
+      ],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/d3d9/shader/fvf-layout.ts",
+        "tools/tests/d3d9-vertex-input.test.ts"
+      ]
+    },
+    {
+      "name": "TextureOpCaps",
+      "offset": 144,
+      "kind": "bitmask",
+      "value": 60751871,
+      "advertised": true,
+      "setBits": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        17,
+        18,
+        19,
+        20,
+        23,
+        24,
+        25
+      ],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/d3d9/ffp-combiner.ts",
+        "tools/tests/ffp-lighting.test.ts"
+      ]
+    },
+    {
+      "name": "MaxTextureBlendStages",
+      "offset": 148,
+      "kind": "scalar",
+      "value": 8,
+      "advertised": true,
+      "setBits": [],
+      "status": "implemented",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/d3d9/ffp-lighting.ts",
+        "tools/tests/ffp-lighting.test.ts"
+      ]
+    },
+    {
+      "name": "MaxSimultaneousTextures",
+      "offset": 152,
+      "kind": "scalar",
+      "value": 8,
+      "advertised": true,
+      "setBits": [],
+      "status": "implemented",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/d3d9/ffp-lighting.ts",
+        "tools/tests/ffp-lighting.test.ts"
+      ]
+    },
+    {
+      "name": "VertexProcessingCaps",
+      "offset": 156,
+      "kind": "bitmask",
+      "value": 379,
+      "advertised": true,
+      "setBits": [
+        0,
+        1,
+        3,
+        4,
+        5,
+        6,
+        8
+      ],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/d3d9/ffp-lighting.ts",
+        "tools/tests/ffp-lighting.test.ts"
+      ]
+    },
+    {
+      "name": "MaxActiveLights",
+      "offset": 160,
+      "kind": "scalar",
+      "value": 8,
+      "advertised": true,
+      "setBits": [],
+      "status": "implemented",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/d3d9/ffp-lighting.ts",
+        "tools/tests/ffp-lighting.test.ts"
+      ]
+    },
+    {
+      "name": "MaxUserClipPlanes",
+      "offset": 164,
+      "kind": "scalar",
+      "value": 6,
+      "advertised": true,
+      "setBits": [],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/d3d9/shader/emit/vs.ts",
+        "tools/tests/d3d9-shader.test.ts"
+      ]
+    },
+    {
+      "name": "MaxVertexBlendMatrices",
+      "offset": 168,
+      "kind": "scalar",
+      "value": 4,
+      "advertised": true,
+      "setBits": [],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/d3d9/ffp-vertex-blend.ts",
+        "tools/tests/d3d9-ffp-vertex-blend.test.ts"
+      ]
+    },
+    {
+      "name": "MaxVertexBlendMatrixIndex",
+      "offset": 172,
+      "kind": "scalar",
+      "value": 7,
+      "advertised": true,
+      "setBits": [],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/d3d9/ffp-vertex-blend.ts",
+        "tools/tests/d3d9-ffp-vertex-blend.test.ts"
+      ]
+    },
+    {
+      "name": "MaxPointSize",
+      "offset": 176,
+      "kind": "float",
+      "value": 8192,
+      "advertised": true,
+      "setBits": [],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "MaxPrimitiveCount",
+      "offset": 180,
+      "kind": "scalar",
+      "value": 16777215,
+      "advertised": true,
+      "setBits": [],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "MaxVertexIndex",
+      "offset": 184,
+      "kind": "scalar",
+      "value": 16777215,
+      "advertised": true,
+      "setBits": [],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "MaxStreams",
+      "offset": 188,
+      "kind": "scalar",
+      "value": 16,
+      "advertised": true,
+      "setBits": [],
+      "status": "implemented",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/shared/vertex-streams.ts",
+        "tools/tests/d3d9-decl-stride.test.ts"
+      ]
+    },
+    {
+      "name": "MaxStreamStride",
+      "offset": 192,
+      "kind": "scalar",
+      "value": 255,
+      "advertised": true,
+      "setBits": [],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/shared/vertex-streams.ts",
+        "tools/tests/d3d9-decl-stride.test.ts"
+      ]
+    },
+    {
+      "name": "VertexShaderVersion",
+      "offset": 196,
+      "kind": "version",
+      "value": 4294836992,
+      "advertised": true,
+      "setBits": [],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/d3d9/shader/sm-parser.ts",
+        "tools/tests/d3d9-sm3-parser.test.ts"
+      ]
+    },
+    {
+      "name": "MaxVertexShaderConst",
+      "offset": 200,
+      "kind": "scalar",
+      "value": 256,
+      "advertised": true,
+      "setBits": [],
+      "status": "implemented",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/d3d9/shader/emit/vs.ts",
+        "tools/tests/d3d9-caps.test.ts"
+      ]
+    },
+    {
+      "name": "PixelShaderVersion",
+      "offset": 204,
+      "kind": "version",
+      "value": 4294902528,
+      "advertised": true,
+      "setBits": [],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/d3d9/shader/sm-parser.ts",
+        "tools/tests/d3d9-sm3-parser.test.ts"
+      ]
+    },
+    {
+      "name": "PixelShader1xMaxValue",
+      "offset": 208,
+      "kind": "float",
+      "value": 65504,
+      "advertised": true,
+      "setBits": [],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "DevCaps2",
+      "offset": 212,
+      "kind": "bitmask",
+      "value": 81,
+      "advertised": true,
+      "setBits": [
+        0,
+        4,
+        6
+      ],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "MaxNpatchTessellationLevel",
+      "offset": 216,
+      "kind": "float",
+      "value": 0,
+      "advertised": false,
+      "setBits": [],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "Reserved5",
+      "offset": 220,
+      "kind": "scalar",
+      "value": 0,
+      "advertised": false,
+      "setBits": [],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "MasterAdapterOrdinal",
+      "offset": 224,
+      "kind": "scalar",
+      "value": 0,
+      "advertised": false,
+      "setBits": [],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "AdapterOrdinalInGroup",
+      "offset": 228,
+      "kind": "scalar",
+      "value": 0,
+      "advertised": false,
+      "setBits": [],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "NumberOfAdaptersInGroup",
+      "offset": 232,
+      "kind": "scalar",
+      "value": 1,
+      "advertised": true,
+      "setBits": [],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "DeclTypes",
+      "offset": 236,
+      "kind": "bitmask",
+      "value": 831,
+      "advertised": true,
+      "setBits": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        8,
+        9
+      ],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/d3d9/shader/fvf-layout.ts",
+        "tools/tests/d3d9-declaration-buffer-desc.test.ts"
+      ]
+    },
+    {
+      "name": "NumSimultaneousRTs",
+      "offset": 240,
+      "kind": "scalar",
+      "value": 4,
+      "advertised": true,
+      "setBits": [],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/d3d9/d3d9-device.ts:MRT",
+        "tools/tests/d3d9-mrt.test.ts"
+      ]
+    },
+    {
+      "name": "StretchRectFilterCaps",
+      "offset": 244,
+      "kind": "bitmask",
+      "value": 50332416,
+      "advertised": true,
+      "setBits": [
+        8,
+        9,
+        24,
+        25
+      ],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "VS20Caps.Caps",
+      "offset": 248,
+      "kind": "bitmask",
+      "value": 1,
+      "advertised": true,
+      "setBits": [
+        0
+      ],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/d3d9/shader/passes/structure.ts",
+        "tools/tests/d3d9-sm3-flow.test.ts"
+      ]
+    },
+    {
+      "name": "VS20Caps.DynamicFlowControlDepth",
+      "offset": 252,
+      "kind": "scalar",
+      "value": 24,
+      "advertised": true,
+      "setBits": [],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/d3d9/shader/passes/structure.ts",
+        "tools/tests/d3d9-sm3-flow.test.ts"
+      ]
+    },
+    {
+      "name": "VS20Caps.NumTemps",
+      "offset": 256,
+      "kind": "scalar",
+      "value": 32,
+      "advertised": true,
+      "setBits": [],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/d3d9/shader/passes/structure.ts",
+        "tools/tests/d3d9-sm3-flow.test.ts"
+      ]
+    },
+    {
+      "name": "VS20Caps.StaticFlowControlDepth",
+      "offset": 260,
+      "kind": "scalar",
+      "value": 4,
+      "advertised": true,
+      "setBits": [],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/d3d9/shader/passes/structure.ts",
+        "tools/tests/d3d9-sm3-flow.test.ts"
+      ]
+    },
+    {
+      "name": "PS20Caps.Caps",
+      "offset": 264,
+      "kind": "bitmask",
+      "value": 29,
+      "advertised": true,
+      "setBits": [
+        0,
+        2,
+        3,
+        4
+      ],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/d3d9/shader/passes/structure.ts",
+        "tools/tests/d3d9-sm3-flow.test.ts",
+        "tools/tests/d3d9-caps.test.ts"
+      ]
+    },
+    {
+      "name": "PS20Caps.DynamicFlowControlDepth",
+      "offset": 268,
+      "kind": "scalar",
+      "value": 24,
+      "advertised": true,
+      "setBits": [],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/d3d9/shader/passes/structure.ts",
+        "tools/tests/d3d9-sm3-flow.test.ts",
+        "tools/tests/d3d9-caps.test.ts"
+      ]
+    },
+    {
+      "name": "PS20Caps.NumTemps",
+      "offset": 272,
+      "kind": "scalar",
+      "value": 32,
+      "advertised": true,
+      "setBits": [],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/d3d9/shader/passes/structure.ts",
+        "tools/tests/d3d9-sm3-flow.test.ts",
+        "tools/tests/d3d9-caps.test.ts"
+      ]
+    },
+    {
+      "name": "PS20Caps.StaticFlowControlDepth",
+      "offset": 276,
+      "kind": "scalar",
+      "value": 4,
+      "advertised": true,
+      "setBits": [],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/d3d9/shader/passes/structure.ts",
+        "tools/tests/d3d9-sm3-flow.test.ts",
+        "tools/tests/d3d9-caps.test.ts"
+      ]
+    },
+    {
+      "name": "PS20Caps.NumInstructionSlots",
+      "offset": 280,
+      "kind": "scalar",
+      "value": 512,
+      "advertised": true,
+      "setBits": [],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/d3d9/shader/passes/structure.ts",
+        "tools/tests/d3d9-sm3-flow.test.ts",
+        "tools/tests/d3d9-caps.test.ts"
+      ]
+    },
+    {
+      "name": "VertexTextureFilterCaps",
+      "offset": 284,
+      "kind": "bitmask",
+      "value": 50332416,
+      "advertised": true,
+      "setBits": [
+        8,
+        9,
+        24,
+        25
+      ],
+      "status": "emulated",
+      "evidenceKind": "implementation",
+      "evidence": [
+        "src/worker/backends/webgpu/d3d9/d3d9-device.ts:vertex-texture-window",
+        "tools/tests/d3d9-caps.test.ts"
+      ]
+    },
+    {
+      "name": "MaxVShaderInstructionsExecuted",
+      "offset": 288,
+      "kind": "scalar",
+      "value": 4294967295,
+      "advertised": true,
+      "setBits": [],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "MaxPShaderInstructionsExecuted",
+      "offset": 292,
+      "kind": "scalar",
+      "value": 65535,
+      "advertised": true,
+      "setBits": [],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "MaxVertexShader30InstructionSlots",
+      "offset": 296,
+      "kind": "scalar",
+      "value": 32768,
+      "advertised": true,
+      "setBits": [],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    },
+    {
+      "name": "MaxPixelShader30InstructionSlots",
+      "offset": 300,
+      "kind": "scalar",
+      "value": 4096,
+      "advertised": true,
+      "setBits": [],
+      "status": "reference-only",
+      "evidenceKind": "reference",
+      "evidence": [
+        "src/worker/modules/d3d9/caps.ts:REAL_CAPS9_HEX"
+      ],
+      "gap": "Advertised by the reference blob; no deterministic local implementation/refusal proof is registered yet."
+    }
+  ],
+  "counts": {
+    "fields": 76,
+    "advertised": 67,
+    "implemented": 6,
+    "emulated": 33,
+    "refused": 3,
+    "referenceOnly": 34,
+    "advertisedWithoutProof": 28
+  }
+}
