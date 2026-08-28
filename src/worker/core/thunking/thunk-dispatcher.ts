@@ -1312,6 +1312,15 @@ export class ThunkDispatcher {
                 // Use cached reg32 reference to avoid repeated property lookup on every thunk
                 const reg32 = this.cachedReg32Raw ?? this.cachedReg32 ?? cpu.reg32;
                 const espAtEntry = reg32[4];
+
+                // Harness API breakpoints, on THIS tier too. The check lived only in
+                // _handlePortWriteSlow, so breakOnApi was blind to every fast-pathed export —
+                // and those are precisely the hot ones worth breaking on. Gated on one
+                // boolean, as on the slow path.
+                if (harnessApiBreaks.active) {
+                    const eipNow = (this.cachedIpRaw ? this.cachedIpRaw[0] : (cpu.instruction_pointer?.[0] ?? 0)) >>> 0;
+                    harnessApiBreaks.check(this.namesTable[functionId] || "unknown", eipNow, espAtEntry);
+                }
                 this.fastPathCallCount++;
                 const doProfile = (this.fastPathCallCount & 0x1F) === 0; // Sample 1/32
 
@@ -2676,7 +2685,7 @@ export class ThunkDispatcher {
         // The owner was readied when the completion was deferred; bring it fully RUNNING
         // before its registers are rewritten, mirroring the async-restore resume phase.
         scheduler.wakeThreadForAsyncCompletion(tid);
-        (scheduler as any).markThreadRunningAfterAsyncWake?.(tid);
+        (scheduler as any).markThreadRunningAfterAsyncWake?.(tid, cpu);
         return cbMgr.tryApplyDeferredCompletion(tid, cpu);
     }
 
@@ -2779,7 +2788,7 @@ export class ThunkDispatcher {
             if (idx >= 0 && this.canApplyCurrentThreadRestore(cpu, this.pendingAsyncRestores[idx])) {
                 const pending = this.pendingAsyncRestores[idx];
                 scheduler.wakeThreadForAsyncCompletion(currentTid);     // WAITING→READY (idempotent)
-                scheduler.markThreadRunningAfterAsyncWake(currentTid);  // READY→RUNNING; regs are live, no performSwitch
+                scheduler.markThreadRunningAfterAsyncWake(currentTid, cpu);  // READY→RUNNING + restore this thread's own register file
                 this.applyPendingAsyncRestoreAtSafePoint(pending, cpu);
                 this.pendingAsyncRestores.splice(idx, 1);
                 (scheduler as any).traceTimerEvent?.(currentTid,
@@ -3916,24 +3925,37 @@ export class ThunkDispatcher {
     registerConstantReturnStub(dllName: string, funcName: string, value: number, popBytes: number): void {
         const key = `${dllName}:${funcName}`.toLowerCase();
         this.pendingConstStubRegistrations.set(key, { dllName, functionName: funcName, value, popBytes });
-        const stub = this.findStubsByName(dllName, funcName)[0];
-        if (!stub) return;
+        // EVERY stub for the name: an export reached through both an import table and
+        // GetProcAddress owns two stubs with different functionIds, and patching only [0]
+        // leaves the on-demand entry point trapping (mirrors registerFastPath / WBUF).
+        const stubs = this.findStubsByName(dllName, funcName);
+        if (stubs.length === 0) return;
         let mem8 = this.cachedMem8;
         if (!mem8 || mem8.byteLength === 0) { this.updateMemoryCache(); mem8 = this.cachedMem8; }
         if (!mem8 || mem8.byteLength === 0) return;
-        const a = stub.address;
-        mem8[a] = 0xB8;                                   // mov eax, imm32
-        mem8[a + 1] = value & 0xFF;
-        mem8[a + 2] = (value >> 8) & 0xFF;
-        mem8[a + 3] = (value >> 16) & 0xFF;
-        mem8[a + 4] = (value >> 24) & 0xFF;
-        mem8[a + 5] = 0xC2;                               // ret imm16
-        mem8[a + 6] = popBytes & 0xFF;
-        mem8[a + 7] = (popBytes >> 8) & 0xFF;
-        for (let i = 8; i < 16; i++) mem8[a + i] = 0x90;
-        invalidateGuestCode(a, 16);
-        Logger.log(LogCategory.THUNK,
-            `[WBUF] Constant-return stub [${stub.functionId}] ${dllName}:${funcName} = ${value} (ret ${popBytes}, stub=0x${a.toString(16)})`);
+        for (const stub of stubs) {
+            // `ret popBytes` is the caller's stack cleanup; a stub declaring a different
+            // arity would return on the wrong depth and skew its caller's frame.
+            if (typeof stub.argCount === "number" && stub.argCount * 4 !== popBytes && popBytes !== 0) {
+                Logger.warn(LogCategory.THUNK,
+                    `registerConstantReturnStub: skipping ${dllName}:${funcName} stub id=${stub.functionId} ` +
+                    `(argCount=${stub.argCount}, registered popBytes=${popBytes})`);
+                continue;
+            }
+            const a = stub.address;
+            mem8[a] = 0xB8;                                   // mov eax, imm32
+            mem8[a + 1] = value & 0xFF;
+            mem8[a + 2] = (value >> 8) & 0xFF;
+            mem8[a + 3] = (value >> 16) & 0xFF;
+            mem8[a + 4] = (value >> 24) & 0xFF;
+            mem8[a + 5] = 0xC2;                               // ret imm16
+            mem8[a + 6] = popBytes & 0xFF;
+            mem8[a + 7] = (popBytes >> 8) & 0xFF;
+            for (let i = 8; i < 16; i++) mem8[a + i] = 0x90;
+            invalidateGuestCode(a, 16);
+            Logger.log(LogCategory.THUNK,
+                `[WBUF] Constant-return stub [${stub.functionId}] ${dllName}:${funcName} = ${value} (ret ${popBytes}, stub=0x${a.toString(16)})`);
+        }
     }
 
     registerModule(moduleName: string, exports: Record<string, ThunkImplementation>): void {
@@ -6767,6 +6789,16 @@ export class ThunkDispatcher {
         if (pending.trivial) this.trivialFastPathTable[functionId] = 1;
     }
 
+    private applyPendingConstStubForStub(stub: ThunkStub): void {
+        const exactKey = `${stub.dllName}:${stub.functionName}`.toLowerCase();
+        const normalizedKey = `${stub.dllName}:${normalizeApiName(stub.functionName)}`.toLowerCase();
+        const pending =
+            this.pendingConstStubRegistrations.get(exactKey) ??
+            (normalizedKey !== exactKey ? this.pendingConstStubRegistrations.get(normalizedKey) : undefined);
+        if (!pending) return;
+        this.registerConstantReturnStub(pending.dllName, pending.functionName, pending.value, pending.popBytes);
+    }
+
     private applyPendingWriteBufferForStub(stub: ThunkStub): void {
         const exactKey = `${stub.dllName}:${stub.functionName}`.toLowerCase();
         const normalizedKey = `${stub.dllName}:${normalizeApiName(stub.functionName)}`.toLowerCase();
@@ -6853,6 +6885,7 @@ export class ThunkDispatcher {
             const impl = this.bindPendingImplementation(functionId, stub, pending);
             this.applyPendingFastPathForStub(functionId, stub);
             this.applyPendingWriteBufferForStub(stub);
+            this.applyPendingConstStubForStub(stub);
 
             Logger.info(LogCategory.THUNK,
                 `Late pending registration: ${stub.dllName}:${stub.functionName} id=${functionId}`);
@@ -6869,6 +6902,7 @@ export class ThunkDispatcher {
                     const impl = this.bindPendingImplementation(functionId, stub, pVal);
                     this.applyPendingFastPathForStub(functionId, stub);
                     this.applyPendingWriteBufferForStub(stub);
+                    this.applyPendingConstStubForStub(stub);
                     Logger.info(LogCategory.THUNK,
                         `Late pending registration (normalized): ${stub.dllName}:${stub.functionName} id=${functionId}`);
                     return impl;

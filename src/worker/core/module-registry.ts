@@ -73,6 +73,11 @@ const DLL_BASE_ALIGNMENT = 0x10000; // 64KB alignment (Windows standard)
 export class ModuleRegistry {
     private modules = new Map<string, LoadedPEModule>();
     private byBase = new Map<number, LoadedPEModule>();
+    /** Image spans sorted by base; rebuilt lazily after any membership change.
+     *  getModuleContainingAddress is on the VirtualQuery path, which a pointer-validity
+     *  probe loop drives hundreds of thousands of times per boot — a sweep there is
+     *  O(modules) per probe. Images never overlap, so "last base <= addr" decides it. */
+    private spanIndex: Array<{ base: number; end: number; mod: LoadedPEModule }> | null = null;
     private nextDllBase = DLL_BASE_START;
     /** VA returned by unregister(), first-fit reusable. See allocateBase. */
     private freeDllRanges: Array<{ base: number; size: number }> = [];
@@ -107,6 +112,7 @@ export class ModuleRegistry {
 
         this.modules.set(nameLower, mod);
         this.byBase.set(mod.baseAddress, mod);
+        this.spanIndex = null;
 
         Logger.log(LogCategory.SYSTEM,
             `[ModuleRegistry] Registered "${mod.name}" at 0x${mod.baseAddress.toString(16)}, ` +
@@ -123,6 +129,7 @@ export class ModuleRegistry {
 
         this.modules.delete(nameLower);
         this.byBase.delete(mod.baseAddress);
+        this.spanIndex = null;
         this.releaseBase(mod.baseAddress, mod.size);
         return true;
     }
@@ -182,12 +189,23 @@ export class ModuleRegistry {
      * Get module containing a given address (for GetModuleHandleEx with FROM_ADDRESS)
      */
     getModuleContainingAddress(addr: number): LoadedPEModule | undefined {
-        for (const mod of this.modules.values()) {
-            if (addr >= mod.baseAddress && addr < mod.baseAddress + mod.size) {
-                return mod;
+        let spans = this.spanIndex;
+        if (!spans) {
+            spans = [];
+            for (const mod of this.modules.values()) {
+                if (mod.size > 0) spans.push({ base: mod.baseAddress, end: mod.baseAddress + mod.size, mod });
             }
+            spans.sort((a, b) => a.base - b.base);
+            this.spanIndex = spans;
         }
-        return undefined;
+        let lo = 0, hi = spans.length - 1, last = -1;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            if (spans[mid]!.base <= addr) { last = mid; lo = mid + 1; } else { hi = mid - 1; }
+        }
+        if (last < 0) return undefined;
+        const s = spans[last]!;
+        return addr < s.end ? s.mod : undefined;
     }
 
     /** True when addr lies in a PE section marked IMAGE_SCN_MEM_WRITE (e.g. .data), not .text. */
@@ -355,6 +373,7 @@ export class ModuleRegistry {
     reset(): void {
         this.modules.clear();
         this.byBase.clear();
+        this.spanIndex = null;
         this.nextDllBase = DLL_BASE_START;
         this.freeDllRanges = [];
         Logger.log(LogCategory.SYSTEM, '[ModuleRegistry] Reset');

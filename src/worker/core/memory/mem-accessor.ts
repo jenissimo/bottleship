@@ -1,6 +1,5 @@
 import { Logger, LogCategory } from "../logger";
 import { reportMemoryFault, MemoryAccessType } from "./memory-fault";
-import { System } from "../system";
 import { borrowGuestMemory } from "./guest-memory";
 import type { RegionEntry } from "./address-space";
 import { jsWriteTrap } from "./js-write-trap";

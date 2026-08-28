@@ -85,6 +85,8 @@ export interface CallbackForensicRecord {
 export interface CallbackForensicState {
     pendingCount: number;
     thunkContextDepth: number;
+    /** Number of direct callback-return restores that repaired callee-saved GPRs. */
+    calleeSavedRepairs: number;
     lastInvoke: CallbackForensicRecord | null;
     lastReturn: CallbackForensicRecord | null;
     suspendedFrames: SuspendedThunkFrame[];
@@ -187,9 +189,11 @@ export class CallbackManager {
      * EBX/ESI/EDI/EBP as the SUSPENDED THUNK's caller left them. A guest callback must give
      * these back untouched (stdcall/cdecl both make them callee-saved), so a difference at
      * the direct restore is OUR bug, not the game's — and the symptom lands far away, at the
-     * caller's next use of the register. Nothing consumes this but the check below.
+     * caller's next use of the register. The restore below enforces that ABI boundary.
      */
     private frameCalleeSaved = new Uint32Array(SUSPENDED_FRAME_RING_SIZE * 4);
+    /** 1 when this slot contains a capture from a live CPU register file. */
+    private frameCalleeSavedValid = new Uint8Array(SUSPENDED_FRAME_RING_SIZE);
     private frameExpectedPostEsp = new Uint32Array(SUSPENDED_FRAME_RING_SIZE);
     private frameCallbackId = new Uint32Array(SUSPENDED_FRAME_RING_SIZE);
     private frameSource: string[] = new Array(SUSPENDED_FRAME_RING_SIZE).fill('');
@@ -706,7 +710,7 @@ export class CallbackManager {
 
             const preWriteEsp = cpu.reg32[4];
             const preWriteEip = cpu.instruction_pointer?.[0] ?? 0;
-            this.checkCalleeSavedAcrossCallback(frameIndex, frameId, this.frameSource[frameIndex] ?? '');
+            this.restoreCalleeSavedAcrossCallback(frameIndex, frameId, this.frameSource[frameIndex] ?? '');
 
             // Direct-restore: do not resume the callback return stub (mid-stub OUT trap).
             // [frameEsp] may still hold spinLoopAddress from redirectStackToSpinLoop.
@@ -895,7 +899,7 @@ export class CallbackManager {
             return false;
         }
 
-        this.checkCalleeSavedAcrossCallback(frameIndex, deferred.frameId, deferred.source ?? '');
+        this.restoreCalleeSavedAcrossCallback(frameIndex, deferred.frameId, deferred.source ?? '');
         cpu.reg32[0] = deferred.finalValue >>> 0;
         cpu.reg32[4] = targetEsp >>> 0;
         if (cpu.is_jumping !== undefined) cpu.is_jumping = true;
@@ -966,14 +970,17 @@ export class CallbackManager {
         this.frameExpectedPostEsp[slot] = (espEntry + 4 + thunkCleanup) >>> 0;
         this.frameCallbackId[slot] = 0;
         this.frameSource[slot] = source;
-        if (this.checkCalleeSaved) {
-            const reg = this.guestRegFile();
-            if (reg) {
-                this.frameCalleeSaved[slot * 4] = reg[3]!;
-                this.frameCalleeSaved[slot * 4 + 1] = reg[6]!;
-                this.frameCalleeSaved[slot * 4 + 2] = reg[7]!;
-                this.frameCalleeSaved[slot * 4 + 3] = reg[5]!;
-            }
+        // Clear validity before capture: ring slots are recycled, and early-boot frames can
+        // be allocated before v86 exposes a register file. In that case the old slot values
+        // are diagnostic garbage and must never be restored into a later callback.
+        this.frameCalleeSavedValid[slot] = 0;
+        const reg = this.guestRegFile();
+        if (reg) {
+            this.frameCalleeSaved[slot * 4] = reg[3]!;
+            this.frameCalleeSaved[slot * 4 + 1] = reg[6]!;
+            this.frameCalleeSaved[slot * 4 + 2] = reg[7]!;
+            this.frameCalleeSaved[slot * 4 + 3] = reg[5]!;
+            this.frameCalleeSavedValid[slot] = 1;
         }
 
         this.frameStack[this.frameStackDepth++] = slot;
@@ -989,9 +996,7 @@ export class CallbackManager {
         return frameId;
     }
 
-    /** Same `__checkCalleeSaved` switch the dispatcher's sibling check uses: this sits on the
-     *  guest-callback path (WndProc dispatch, enum callbacks, timer procs), so it is off by
-     *  default and allocates nothing when on. */
+    /** Optional verbose logging switch shared with the dispatcher's callee-saved diagnostics. */
     private get checkCalleeSaved(): boolean {
         return !!(globalThis as { __checkCalleeSaved?: boolean }).__checkCalleeSaved;
     }
@@ -1002,13 +1007,14 @@ export class CallbackManager {
         return cpu?.reg32 ?? null;
     }
 
-    /**
-     * Loud on the ONE thing the direct restore cannot fix: it writes EAX/ESP/EIP, so a
-     * callee-saved register the callback did not give back stays wrong all the way to the
-     * caller's next instruction that reads it.
-     */
-    private checkCalleeSavedAcrossCallback(slot: number, frameId: number, source: string): void {
-        if (!this.checkCalleeSaved) return;
+    /** Callbacks that came back with a callee-saved register the direct restore had to put
+     *  back. Non-zero means our re-entry lost what a real CALL/RET would have preserved. */
+    public calleeSavedRepairs = 0;
+    private lastCalleeSavedWarnMs = 0;
+
+    /** Win32 callback ABI preserves these lanes; restore them from the validated frame capture. */
+    private restoreCalleeSavedAcrossCallback(slot: number, frameId: number, source: string): void {
+        if (this.frameCalleeSavedValid[slot] !== 1) return;
         const reg = this.guestRegFile();
         if (!reg) return;
         const order = [3, 6, 7, 5];
@@ -1017,14 +1023,18 @@ export class CallbackManager {
         for (let i = 0; i < 4; i++) {
             const before = this.frameCalleeSaved[slot * 4 + i] >>> 0;
             const now = reg[order[i]!]! >>> 0;
-            if (before !== now) {
-                diff += ` ${names[i]}: 0x${before.toString(16)} -> 0x${now.toString(16)}`;
-            }
+            if (before === now) continue;
+            diff += ` ${names[i]}: 0x${now.toString(16)} -> 0x${before.toString(16)}`;
+            reg[order[i]!] = before | 0;
         }
-        if (diff) {
+        if (!diff) return;
+        this.calleeSavedRepairs++;
+        const now = performance.now();
+        if (this.checkCalleeSaved || now - this.lastCalleeSavedWarnMs > 1000) {
+            this.lastCalleeSavedWarnMs = now;
             Logger.warn(LogCategory.CALLBACK,
-                `Callee-saved register(s) CLOBBERED across callback (frameId=${frameId}, ` +
-                `thunk=${source}):${diff}`);
+                `Callee-saved register(s) restored across callback (frameId=${frameId}, ` +
+                `thunk=${source}):${diff} (${this.calleeSavedRepairs} so far)`);
         }
     }
 
@@ -1053,6 +1063,7 @@ export class CallbackManager {
         this.frameExpectedPostEsp[slot] = 0;
         this.frameCallbackId[slot] = 0;
         this.frameSource[slot] = '';
+        this.frameCalleeSavedValid[slot] = 0;
 
         // Unpin the thread that took the pin in allocateSuspendedFrame — NOT whoever is
         // current now. A pinned thread that blocks does switch away, so releasing the frame
@@ -1085,6 +1096,7 @@ export class CallbackManager {
         this.frameExpectedPostEsp.fill(0);
         this.frameCallbackId.fill(0);
         this.frameSource.fill('');
+        this.frameCalleeSavedValid.fill(0);
         this.frameWriteIdx = 0;
         this.nextFrameId = 1;
         this.frameStackDepth = 0;
@@ -1557,6 +1569,8 @@ export class CallbackManager {
         this.pendingCallbacks.clear();
         this.resetPendingSlots();
         this.nextCallbackId = 1;
+        this.calleeSavedRepairs = 0;
+        this.lastCalleeSavedWarnMs = 0;
         this.resetSuspendedFrames();
         // Re-initialize stubs in memory just in case
         this.initialize();
@@ -1632,6 +1646,7 @@ export class CallbackManager {
         return {
             pendingCount: this.pendingSlotCount,
             thunkContextDepth: this.frameStackDepth,
+            calleeSavedRepairs: this.calleeSavedRepairs,
             lastInvoke: copy(this.lastInvokeForensics),
             lastReturn: copy(this.lastReturnForensics),
             suspendedFrames: this.snapshotSuspendedFrames(),

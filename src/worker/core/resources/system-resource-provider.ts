@@ -11,8 +11,9 @@
 import { ResourceTable } from '../resource-table';
 import { BaseComObject } from '../com/base-com-object';
 import { Logger, LogCategory } from '../logger';
-import { checkComGuard } from '../../modules/ddraw/constants';
-import { freeComObject } from '../com/com-memory';
+// Import from core directly: routing this through ddraw/constants would re-enter the
+// constants module while COM memory is initializing.
+import { checkComGuard, freeComObject } from '../com/com-memory';
 import { System } from '../system';
 
 export enum ResourceType {

@@ -569,8 +569,15 @@ class FramePacerImpl {
             }
         }
 
-        // Poll debug session memory watches (~60Hz, zero-cost when disabled)
-        debugSession.pollMemWatches();
+        // Poll debug session memory watches (~60Hz, zero-cost when disabled).
+        // A debug watch is user-provided code and must not be able to strand the
+        // pacer with `running === true`; scheduleNext() is the one re-arm point.
+        try {
+            debugSession.pollMemWatches();
+        } catch (e) {
+            recordGpuError("callback", "framePacer.pollMemWatches", String(e));
+            Logger.error(LogCategory.SYSTEM, `[FRAME-PACER] memory watch threw: ${e}`);
+        }
 
         this.scheduleNext();
     }

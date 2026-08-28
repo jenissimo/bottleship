@@ -15,6 +15,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { Scheduler } from "../../src/worker/core/scheduler/scheduler";
+import { CallbackManager } from "../../src/worker/core/thunking/callback-manager";
 import {
     ThreadState,
     THREAD_STATE_NAMES,
@@ -336,6 +337,145 @@ describe("scheduler/markThreadRunningAfterAsyncWake — READY(current) -> RUNNIN
         inject(s, mkThread(2, ThreadState.RUNNING), { current: true });
         expect(s.markThreadRunningAfterAsyncWake(1)).toBe(false);
         expect((s as any).threads.get(1).state).toBe(ThreadState.READY);
+    });
+
+    test("repairs divergent callee-saved registers and increments the repair counter", () => {
+        const s = new Scheduler();
+        const t = inject(s, mkThread(1, ThreadState.READY), { runnable: true, current: true });
+        t.context = {
+            eax: 0x11111111, ecx: 0x22222222, edx: 0x33333333, ebx: 0x44444444,
+            esp: 0x0028aa00, ebp: 0x55555555, esi: 0x66666666, edi: 0x77777777,
+            eip: 0x00401000, eflags: 0x246, domain: "spin",
+        };
+        const cpu = fakeCpu({ eax: 0xaaaaaaaa, esp: 0x0028bb00, ebp: 0xbbbbbbbb, eip: 0x00402000, eflags: 0x202 });
+        cpu.reg32[1] = 0xbbbbbbbb;
+        cpu.reg32[2] = 0xcccccccc;
+        cpu.reg32[3] = 0xdddddddd;
+        cpu.reg32[6] = 0xeeeeeeee;
+        cpu.reg32[7] = 0xffffffff;
+
+        expect(s.markThreadRunningAfterAsyncWake(1, cpu)).toBe(true);
+        expect(Array.from(cpu.reg32)).toEqual([
+            0x11111111, 0x22222222, 0x33333333, 0x44444444,
+            0x0028aa00, 0x55555555, 0x66666666, 0x77777777,
+        ].map(value => value | 0));
+        expect(cpu.flags[0] >>> 0).toBe(0x246);
+        expect(s.asyncWakeRegisterRepairs).toBe(1);
+    });
+
+    test("restores the parked x87 FPU and SSE state before async completion", () => {
+        const s = new Scheduler();
+        const t = inject(s, mkThread(1, ThreadState.READY), { runnable: true, current: true });
+        const parkedFpu = new Uint8Array(134);
+        parkedFpu[0] = 0x47;
+        parkedFpu[128] = 0x03;
+        const parkedSimd = new Uint8Array(132);
+        parkedSimd[0] = 0xc0; // MXCSR low byte
+        parkedSimd[4] = 0x58; // XMM0 byte 0
+        t.context = {
+            eax: 0, ecx: 0, edx: 0, ebx: 0, esp: 0x0028aa00, ebp: 0, esi: 0, edi: 0,
+            eip: 0x00401000, eflags: 0x202, domain: "spin", fpu: parkedFpu, simd: parkedSimd,
+        };
+        const cpu = fakeCpuWithWasm();
+        const wasm = new Uint8Array((cpu as any).wasm_memory.buffer);
+        wasm[FPU_ST_WASM_OFFSET] = 0x11;
+        wasm[MXCSR_WASM_OFFSET] = 0x80;
+        wasm[REG_XMM_WASM_OFFSET] = 0x22;
+        (cpu as any).fpu_simd_dirty[0] = 1;
+
+        expect(s.markThreadRunningAfterAsyncWake(1, cpu)).toBe(true);
+        expect(wasm[FPU_ST_WASM_OFFSET]).toBe(0x47);
+        expect(wasm[FPU_SIMD_DIRTY_WASM_OFFSET]).toBe(0);
+        expect(wasm[MXCSR_WASM_OFFSET]).toBe(0xc0);
+        expect(wasm[REG_XMM_WASM_OFFSET]).toBe(0x58);
+    });
+
+    // `thread.context` is non-null exactly while the thread is NOT live in the CPU. The
+    // async-wake restore consumes the parked snapshot, so it must leave the invariant the
+    // way the switch path does — otherwise a SECOND wake at the spin loop re-applies the
+    // FIRST park's registers over correct live ones, and reports it as a repair.
+    test("the parked context is consumed, not left for the next wake to re-apply", () => {
+        const s = new Scheduler();
+        const t = inject(s, mkThread(1, ThreadState.READY), { runnable: true, current: true });
+        t.context = {
+            eax: 0, ecx: 0, edx: 0, ebx: 0x44444444, esp: 0x0028aa00, ebp: 0x55555555,
+            esi: 0x66666666, edi: 0x77777777, eip: 0x00401000, eflags: 0x246, domain: "spin",
+        };
+        const cpu = fakeCpu({ esp: 0x0028bb00, eip: 0x00402000 });
+        expect(s.markThreadRunningAfterAsyncWake(1, cpu)).toBe(true);
+        expect(t.context).toBeNull();
+        const repairsAfterFirst = s.asyncWakeRegisterRepairs;
+
+        // Second wake, no intervening park: the live register file is this thread's own,
+        // so the first park's snapshot must not be written over it — nor counted a repair.
+        t.state = ThreadState.READY;
+        cpu.reg32[3] = 0x0badf00d;
+        cpu.reg32[4] = 0x0028cc00;
+        expect(s.markThreadRunningAfterAsyncWake(1, cpu)).toBe(true);
+        expect(cpu.reg32[3] >>> 0).toBe(0x0badf00d);
+        expect(cpu.reg32[4] >>> 0).toBe(0x0028cc00);
+        expect(s.asyncWakeRegisterRepairs).toBe(repairsAfterFirst);
+    });
+
+    for (const consumer of ["startCallbackChain", "dllInits"] as const) {
+        test(`restores parked ESP before the ${consumer} async-wake branch`, () => {
+            const s = new Scheduler();
+            const t = inject(s, mkThread(1, ThreadState.READY), { runnable: true, current: true });
+            t.context = {
+                eax: 0, ecx: 0, edx: 0, ebx: 0, esp: 0x0028aa00, ebp: 0, esi: 0, edi: 0,
+                eip: 0x00401000, eflags: 0x202, domain: "spin",
+            };
+            const cpu = fakeCpu({ esp: 0x0028bb00, eip: 0x00402000 });
+
+            expect(s.markThreadRunningAfterAsyncWake(1, cpu)).toBe(true);
+            // Both branches hand the live CPU directly to their callback-chain consumer;
+            // neither calls applyAsyncRestoreCpuState afterwards to repair the stack.
+            expect(cpu.reg32[4] >>> 0).toBe(0x0028aa00);
+        });
+    }
+});
+
+describe("callback-manager/callee-saved frame validity", () => {
+    test("does not restore stale ring values after a pre-boot capture skipped the registers", () => {
+        const captured = new Int32Array(8);
+        captured[3] = 0x11111111;
+        captured[5] = 0x22222222;
+        captured[6] = 0x33333333;
+        captured[7] = 0x44444444;
+        const manager = new CallbackManager(
+            { cpu: { reg32: captured } },
+            {} as any,
+            () => new Uint8Array(0x4000),
+        );
+
+        const first = (manager as any).allocateSuspendedFrame(1, 0x100, 0x200, 0, "first");
+        const firstSlot = (manager as any).findFrameIndexById(first);
+        const live = (manager as any).v86.cpu.reg32 as Int32Array;
+        live[3] = 0xaaaaaaa1;
+        (manager as any).restoreCalleeSavedAcrossCallback(firstSlot, first, "first");
+        expect(live[3] >>> 0).toBe(0x11111111);
+        expect(manager.calleeSavedRepairs).toBe(1);
+        expect(manager.getForensicState().calleeSavedRepairs).toBe(1);
+        (manager as any).releaseFrame(firstSlot);
+
+        // Force the ring allocator to reuse the old slot while v86 is still pre-boot.
+        (manager as any).frameWriteIdx = firstSlot;
+        (manager as any).v86.cpu = undefined;
+        const second = (manager as any).allocateSuspendedFrame(1, 0x300, 0x400, 0, "preboot");
+        const secondSlot = (manager as any).findFrameIndexById(second);
+        const postBootRegs = new Int32Array(8);
+        postBootRegs[3] = 0xdeadbeef;
+        postBootRegs[5] = 0xcafebabe;
+        postBootRegs[6] = 0x0badf00d;
+        postBootRegs[7] = 0xfeedface;
+        (manager as any).v86.cpu = { reg32: postBootRegs };
+
+        (manager as any).restoreCalleeSavedAcrossCallback(secondSlot, second, "preboot");
+        expect(Array.from(postBootRegs)).toEqual([
+            0, 0, 0, 0xdeadbeef, 0, 0xcafebabe, 0x0badf00d, 0xfeedface,
+        ].map(value => value | 0));
+        expect(manager.calleeSavedRepairs).toBe(1);
+        expect(manager.getForensicState().calleeSavedRepairs).toBe(1);
     });
 });
 

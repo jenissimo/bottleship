@@ -133,7 +133,7 @@ import { registerFastPathFileIOFunctions } from "./modules/kernel32/file-io";
 import { registerFastPathSyncFunctions } from "./modules/kernel32/sync";
 import { registerFastPathTimeFunctions } from "./modules/kernel32/time/time";
 import { registerFastPathLocaleFunctions } from "./modules/kernel32/locale";
-import { registerFastPathHeapFunctions, allocateHeapSlab, resetHeapSlab } from "./modules/kernel32/memory";
+import { registerFastPathHeapFunctions, registerFastPathVirtualQuery, allocateHeapSlab, resetHeapSlab } from "./modules/kernel32/memory";
 import { registerFastPathMsvcrtFunctions } from "./modules/msvcrt";
 import { registerFastPathPointerFunctions } from "./modules/kernel32/exception";
 import { registerFastPathProcessFunctions } from "./modules/kernel32/process/process";
@@ -337,6 +337,15 @@ let registrySaveGeneration = 0;
 let tickBeforeCount = 0;
 /** Count of cycle-budget self-heals (RUNNING thread found with cycle_limit===0 and re-armed). */
 let tickHealCount = 0;
+// Dead-tick-loop watchdog state (see the scheduler interval): the window is in scheduler
+// intervals, long enough that a normal tick boundary never trips it.
+let lastLoopTick = -1;
+let lastLoopInsn = -1;
+let loopStallTicks = 0;
+let lastMainLoopDelay = -1;
+/** When that delay was observed, so the watchdog can tell "still asleep" from "stale". */
+let lastMainLoopDelayAtMs = 0;
+const DEAD_TICK_LOOP_TICKS = 64;
 
 // (Adaptive scheduler state removed — tick-boundary preemption handles context switching)
 
@@ -914,6 +923,46 @@ const startScheduler = (v86: any) => {
     // sound loop after a sibling thread exited). A RUNNING current thread with cycle_limit===0
     // is ALWAYS wrong (0 is valid only while the current thread is WAITING/async-parked), so
     // re-arm the budget and kick. Runs every ~1ms → near-instant recovery; no false positives.
+    // Dead-tick-loop self-heal. The two kicks above cover "v86 stopped" (is_running() false)
+    // and "budget stuck at 0". A third state exists and the watchdog already names it
+    // (tickDelta≈0): do_tick stopped rescheduling next_tick while is_running() stays true and
+    // the budget is healthy — the guest then retires NOTHING while the worker keeps servicing
+    // timers, so nothing here notices. Kick run() (idempotent, and it reschedules next_tick)
+    // once tick_counter AND instruction_counter have both stood still across the window while
+    // a thread is RUNNING; either counter moving resets it, so this cannot fire on a guest
+    // that is merely slow.
+    if (!system.scheduler.intentionalYield) {
+      const v86c = system.process.v86 as any;
+      const inner = v86c?.v86 ?? v86c;
+      const cpuC = v86c?.cpu ?? inner?.cpu;
+      const tickNow = (inner?.tick_counter ?? 0) >>> 0;
+      const insnNow = (cpuC?.instruction_counter?.[0] ?? 0) >>> 0;
+      const cur = system.scheduler.getCurrentThread?.();
+      if (tickNow !== lastLoopTick || insnNow !== lastLoopInsn) {
+        lastLoopTick = tickNow; lastLoopInsn = insnNow; loopStallTicks = 0;
+      } else if (cur && cur.state === ThreadState.RUNNING && (v86c?.is_running?.() ?? false)
+        // next_tick(t) parks the loop for t ms ON PURPOSE. Until that sleep is due, a
+        // frozen tick/instruction counter is the guest idling, not a lost callback —
+        // healing it converts an idle guest into a busy DEAD_TICK_LOOP_TICKS kick loop.
+        && !(lastMainLoopDelay > 0 && (performance.now() - lastMainLoopDelayAtMs) < lastMainLoopDelay)) {
+        if (++loopStallTicks >= DEAD_TICK_LOOP_TICKS) {
+          loopStallTicks = 0;
+          tickHealCount++;
+          const dispHeal = system.process.dispatcher as unknown as
+            { hasPendingAsyncRestores?: () => boolean } | undefined;
+          Logger.warn(LogCategory.SYSTEM,
+            `[TICK-LOOP HEAL] do_tick stopped while is_running() stayed true ` +
+            `(tick=${tickNow}, insn=${insnNow}, T${cur.id} RUNNING, eip=0x${((cpuC?.instruction_pointer?.[0] ?? 0) >>> 0).toString(16)}) ` +
+            `mainLoopDelay=${lastMainLoopDelay} runnable=${system.scheduler.hasRunnableThread()} ` +
+            `runningWork=${system.scheduler.hasRunningThread((cpuC?.instruction_pointer?.[0] ?? 0) >>> 0)} ` +
+            `pendingAsync=${dispHeal?.hasPendingAsyncRestores?.() ?? "n/a"} — restarting v86`);
+          v86c?.run?.();
+        }
+      } else {
+        loopStallTicks = 0;
+      }
+    }
+
     if (!system.scheduler.intentionalYield && preemptionManager.isInitialized()) {
       const cur = system.scheduler.getCurrentThread?.();
       if (cur && cur.state === ThreadState.RUNNING && preemptionManager.getCycleLimit() === 0) {
@@ -1512,8 +1561,11 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
       // `preload` (catalog entry) opts a deployment out of on-demand streaming: one
       // sequential download into OPFS beats hundreds of range round-trips wherever
       // per-request latency is the cost (self-hosted stand behind a reverse proxy).
+      // `__noSabIo` forces the OPFS-staged path so the streaming transport can be A/B'd
+      // against a local synchronous pread — the ceiling for any transport change.
       const streamCapable = (globalThis as unknown as { crossOriginIsolated?: boolean }).crossOriginIsolated === true
-        && payload.preload !== true;
+        && payload.preload !== true
+        && (globalThis as Record<string, unknown>).__noSabIo !== true;
       if (streamCapable) {
         try {
           // Preferred: serve the guest's synchronous reads from a dedicated I/O
@@ -1815,13 +1867,20 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
     // read these via GetPrivateProfileString / msvcrt fgetc, which can't await a
     // CachedSource fault-in (see VirtualFileSystem.romPinned). E.g. Morrowind
     // aborts with "Font 0 not found in Morrowind.ini" if its INI reads as empty.
+    //
+    // Only the entries that need it: one the archive can already range-read
+    // synchronously is sync-readable WITHOUT a RAM copy, and pinning it just moves the
+    // whole file up front — on Far Cry's thousands of text files that was most of the
+    // mount, paid before the CPU is allowed to run.
     {
         const configExts = new Set(['ini', 'cfg', 'conf', 'txt', 'cnt', 'inf', 'reg', 'lst']);
         const configRels: string[] = [];
         for (const [rel, entry] of romIndex) {
             if (entry.isDirectory) continue;
             const ext = rel.split('.').pop()?.toLowerCase() ?? '';
-            if (configExts.has(ext)) configRels.push(rel);
+            if (!configExts.has(ext)) continue;
+            if (bundle.archive.canRangeReadSync(entry)) continue;
+            configRels.push(rel);
         }
         if (configRels.length > 0) {
             await system.fileSystem.pinRomFiles(configRels, 8);
@@ -1836,10 +1895,22 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
         const criticalRels: string[] = [];
         const seen = new Set<string>();
 
+        // The image class (DLL/EXE) is here for LATENCY BATCHING: the PE loader reads each
+        // import serially, so pulling them in one parallel burst removes a chain of cold
+        // round trips from the critical path — a win that has nothing to do with caching.
+        //
+        // The "any small file" clause was a romCache warm-up, and it rests on a premise
+        // that does not hold: an entry the archive can already range-read synchronously
+        // gains no capability from being copied into romCache, so the burst just moves
+        // the file for reads the game may never make. Keep the ones that genuinely
+        // cannot be served synchronously.
+        const smallCap = (globalThis as Record<string, unknown>).__legacyRomPrefetch1 === true ? 256 * 1024 : 0;
         for (const [rel, entry] of romIndex) {
             if (entry.isDirectory) continue;
             const ext = rel.split('.').pop()?.toLowerCase() ?? '';
-            if (criticalExts.has(ext) || entry.uncompressedSize < 256 * 1024) {
+            const small = entry.uncompressedSize < smallCap
+                || (entry.uncompressedSize < 256 * 1024 && !bundle.archive.canRangeReadSync(entry));
+            if (criticalExts.has(ext) || small) {
                 if (!seen.has(rel)) { seen.add(rel); criticalRels.push(rel); }
             }
         }
@@ -2807,6 +2878,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       registerFastPathFileIOFunctions(process.dispatcher);
       registerFastPathLocaleFunctions(process.dispatcher);
       registerFastPathHeapFunctions(process.dispatcher);
+      registerFastPathVirtualQuery(process.dispatcher);
       registerFastPathMsvcrtFunctions(process.dispatcher);
       registerFastPathPointerFunctions(process.dispatcher);
       registerFastPathProcessFunctions(process.dispatcher);
@@ -2922,7 +2994,12 @@ const initV86 = async (canvas: OffscreenCanvas) => {
         });
         let heapSlabAllocated = false;
         let ticksSinceStart = 0;
-        v86Inner["tick_hooks_after"] = () => guardTickHook("after", () => {
+        v86Inner["tick_hooks_after"] = (t?: number) => guardTickHook("after", () => {
+          // v86 passes main_loop()'s return: the delay next_tick() will arm its yield
+          // with. A long one is the loop going to sleep on purpose, which the freeze
+          // diagnostics below cannot otherwise distinguish from a lost callback.
+          lastMainLoopDelay = typeof t === "number" ? t : -1;
+          lastMainLoopDelayAtMs = performance.now();
           // JIT-on guest-EIP sampler (opt-in via __eipSamp). Runs between v86 JIT
           // batches (~1ms) so it observes real full-speed behavior with no starvation;
           // streams the cumulative 4KB-page histogram to the main thread (the reliable

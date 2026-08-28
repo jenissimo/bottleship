@@ -265,13 +265,22 @@ class MemWriteTrap {
             return true;
         }
 
-        if (a < this.base || a >= this.end) return false;
+        // Page-scoped, exactly like watch mode above, and for the same reason: BOTH
+        // remaining modes protect whole PAGES, so every access to any OTHER byte on them
+        // faults too. Rejecting those faults hands the guest a spurious #PF on its own
+        // live data — fatal when the trapped field shares a page with a hot object — and
+        // because a rejected fault is never counted, report() then says "NO FAULT AT ALL"
+        // while the guest is dying of the trap. Serve every fault on the armed pages;
+        // record only the ones inside the requested byte window.
+        if (page < this.pageBase || page >= this.pageEnd) return false;
+        const inWindow = a >= this.base && a < this.end;
 
         if (this.trace) {
             this.faults++;
             this.faultedPages.add(page);
+            if (!inWindow) this.unwatchedFaults++;
             this._openWindow(ptm, page, PAGE_NOACCESS, faultingEip, cpu);
-            if (this.hits.length < MAX_HITS) {
+            if (inWindow && this.hits.length < MAX_HITS) {
                 const hit = this._buildHit(a, page, faultingEip, thunk, cpu, isWrite ? "W" : "R");
                 this.hits.push(hit);
             }
@@ -279,6 +288,15 @@ class MemWriteTrap {
         }
 
         if (!isWrite || !isPresent) return false;
+        if (!inWindow) {
+            // Out-of-window store on an armed page: let it through on a TRANSIENT window
+            // (re-protected at the next tick boundary) instead of un-protecting for good,
+            // so the one write this mode exists to catch is still trapped afterwards.
+            this.faults++;
+            this.unwatchedFaults++;
+            this._openWindow(ptm, page, PAGE_READONLY, faultingEip, cpu);
+            return true;
+        }
         this.faults++;
         this.faultedPages.add(page);
         // Single-shot mode: un-protect for good so the whole fill lands. The blind
@@ -567,8 +585,9 @@ class MemWriteTrap {
                 "the page: everything after the first fault ran with the page writable. (Guest code driven from " +
                 "inside a JS turn — run_guest_until — bypasses the tick hooks entirely.)";
         } else if (this.faults === 0) {
-            verdict = "NO FAULT AT ALL — nothing wrote to these PAGES while armed. Check the trap was armed on the " +
-                "right address (and that the page was not re-committed under it); a guest store here would have faulted.";
+            verdict = `NO FAULT AT ALL — nothing ${this.trace ? "read or wrote" : "wrote to"} these PAGES while armed. ` +
+                "Check the trap was armed on the right address (and that the page was not re-committed under it); " +
+                `a guest ${this.trace ? "access" : "store"} here would have faulted.`;
         } else if (blindOpen) {
             verdict = `NO WRITE OBSERVED, NOT PROOF — ${this.faults} fault(s) on these pages, ${blindNote}; ` +
                 "a store to the watched bytes inside one of those is unseen. The sampled bytes did not change, " +

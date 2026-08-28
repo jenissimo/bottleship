@@ -124,6 +124,9 @@ export class Scheduler {
 
     // Thread storage
     private threads = new Map<number, Thread>();
+    /** Sorted [stackBase, stackTop) spans; null = rebuild on next query. Nulled at every
+     *  site that adds or removes a thread, so it cannot answer from a stale membership. */
+    private stackSpanIndex: Array<{ base: number; top: number }> | null = null;
     private currentThreadId: number | null = null;
     private nextThreadId = 1;
     private runQueue: number[] = [];
@@ -673,6 +676,7 @@ export class Scheduler {
         this.waitEngine.reset();
         this.callbackCoord.reset();
         this.threads.clear();
+        this.stackSpanIndex = null;
         this.runQueue = [];
         this.currentThreadId = null;
         this.mainThreadId = 0;
@@ -1031,11 +1035,11 @@ export class Scheduler {
             // A non-RUNNING current has yielded the CPU and retires 0 instructions at the spin
             // loop, so the retired-instruction quantum below never expires — switch unconditionally
             // (peers are runnable, the parked thread's context is already saved). WAITING: async-
-            // parked / blocked (NFS Porsche: T-main in async GetMessageA starved READY peers).
+            // parked / blocked: a non-running current must not retain the CPU.
             // READY: the SOLE thread woken WAITING→READY via the wait-engine/timer-wheel path (no
             // async restore) is re-queued but still currentThreadId; with no peer, wakeThread skips
             // requestSwitch() and it's never promoted → frozen at the spin loop with is_running()
-            // stuck true (HoMM3-demo Sleep boot freeze). Async-restore wakes are handled at step 1.
+            // stuck true. Async-restore wakes are handled at step 1.
             // SUSPENDED: same reasoning — a suspended thread must not be on the CPU at all, and
             // whatever suspended it (a self-suspend, or a peer that suspended it between
             // boundaries) has no other way to take it off.
@@ -1774,6 +1778,7 @@ export class Scheduler {
         };
 
         this.threads.set(threadId, thread);
+        this.stackSpanIndex = null;
         this.publishSuspendCount(thread);
         if (!isSuspended) this.runQueue.push(threadId);
 
@@ -1925,6 +1930,7 @@ export class Scheduler {
             const thread = this.threads.get(entry.threadId);
             if (thread && thread.state === ThreadState.TERMINATED) {
                 this.threads.delete(entry.threadId);
+                this.stackSpanIndex = null;
             }
             this.reapHead++;
         }
@@ -2476,10 +2482,9 @@ export class Scheduler {
         // the in-flight callback — not for new timer work. Do not dispatch a new callback
         // on top of the parked frame, and above all do not re-block on the wake event:
         // that strands the restore — every thread goes WAITING, virtual time freezes, the
-        // next timer tick never fires, the wake event is never signaled again → permanent
-        // boot deadlock (e.g. intro splash freeze, T1 blocked on a mixer CS that the
-        // abandoned callback still owns). Reachable via the post-performSwitch dispatch
-        // call sites (5b/7b), which run before the next boundary's onPollAsyncRestores.
+        // next timer tick never fires, and the wake event is never signaled again. Reachable via
+        // the post-performSwitch dispatch call sites, before the next boundary's
+        // onPollAsyncRestores.
         // Returning false lets that step-1 apply the restore at the very next boundary —
         // canApply is unconditionally true at the spin loop, so unlike a reverted in-flight
         // guard this defer is bounded and cannot deadlock the timer subsystem.
@@ -3420,9 +3425,8 @@ export class Scheduler {
     /**
      * Queue a FILE_IO_COMPLETION_ROUTINE on the thread that issued the overlapped read.
      * Windows runs it only while that thread is in an ALERTABLE wait, which is exactly
-     * where the caller then drains it — the routine is what tells the issuer the request
-     * finished, so a queue nobody drains is indistinguishable from a read that never
-     * completed (CryEngine's streaming engine then waits for a completion for ever).
+     * where the caller then drains it. The routine carries the completion status and byte count
+     * back to the issuing code.
      */
     queueIoCompletionApc(threadId: number, routine: number, errorCode: number, bytes: number, lpOverlapped: number): boolean {
         const thread = this.threads.get(threadId >>> 0);
@@ -3578,15 +3582,6 @@ export class Scheduler {
     }
 
     /**
-     * Same-thread fast path for async restore. `wakeThreadForAsyncCompletion`
-     * flips WAITING → READY (adds to runQueue), but when the current thread
-     * is also the target, we don't want to go through performSwitch because
-     * CPU registers are already live and `applyAsyncRestoreCpuState` will
-     * overwrite EIP/ESP/EAX immediately. This brings the thread to RUNNING
-     * without a context restore, preserving the "RUNNING ⇔ context in CPU"
-     * invariant.
-     */
-    /**
      * Wake the current thread from a pump park (spin-loop safety net parked it WAITING
      * while its suspended-thunk frame idled) so a callback can be dispatched onto its
      * live registers. WAITING(ASYNC_THUNK) → READY → RUNNING with no context restore —
@@ -3610,12 +3605,53 @@ export class Scheduler {
         return true;
     }
 
-    markThreadRunningAfterAsyncWake(threadId: number): boolean {
+    /** Times the async-wake resume found the live register file was NOT the resuming
+     *  thread's own — i.e. the "registers are still live" assumption had been violated and
+     *  the parked context repaired it. Stays 0 on a run where nothing ran in between. */
+    public asyncWakeRegisterRepairs = 0;
+    private lastAsyncWakeRepairWarnMs = 0;
+
+    /**
+     * Same-thread fast path for async restore. `wakeThreadForAsyncCompletion` first
+     * flips WAITING → READY; this brings the current thread to RUNNING and, when a
+     * CPU is supplied, restores its parked GPR/EFLAGS/FPU/SIMD state before the
+     * completion path overwrites EIP/ESP/EAX. Callback-chain and DllMain-chain
+     * consumers therefore start from the parked caller context, not from residue
+     * left in the shared CPU register file.
+     */
+    markThreadRunningAfterAsyncWake(threadId: number, cpu?: V86Cpu): boolean {
         const thread = this.threads.get(threadId);
         if (!thread) return false;
         if (thread.state !== ThreadState.READY) return false;
         if (this.currentThreadId !== thread.id) return false;
+        // Restore the parked context before patching completion registers; callee-saved lanes
+        // must match the waking thread rather than stale shared-CPU state.
+        const parked = thread.context;
         const result = this.transitionTo(thread, ThreadState.RUNNING, null, null);
+        if (result.success && cpu && parked) {
+            const reg = cpu.reg32;
+            const live = {
+                ebx: reg[3] >>> 0,
+                ebp: reg[5] >>> 0,
+                esi: reg[6] >>> 0,
+                edi: reg[7] >>> 0,
+            };
+            const diverged = live.ebx !== (parked.ebx >>> 0) || live.ebp !== (parked.ebp >>> 0)
+                || live.esi !== (parked.esi >>> 0) || live.edi !== (parked.edi >>> 0);
+            this.applyContextState(cpu, parked, parked.esp, thread.id);
+            if (diverged) {
+                this.asyncWakeRegisterRepairs++;
+                const now = performance.now();
+                if (now - this.lastAsyncWakeRepairWarnMs > 1000) {
+                    this.lastAsyncWakeRepairWarnMs = now;
+                    Logger.warn(LogCategory.THREAD,
+                        `async wake T${thread.id}: live registers were not this thread's ` +
+                        `(ebx/ebp/esi/edi ${hx(live.ebx)}/${hx(live.ebp)}/${hx(live.esi)}/${hx(live.edi)} ` +
+                        `→ ${hx(parked.ebx)}/${hx(parked.ebp)}/${hx(parked.esi)}/${hx(parked.edi)}); ` +
+                        `restored from the parked context (${this.asyncWakeRegisterRepairs} so far)`);
+                }
+            }
+        }
         return result.success;
     }
 
@@ -3951,16 +3987,29 @@ export class Scheduler {
     /** The thread-stack reservation containing `addr`, or null. VirtualQuery needs this:
      *  Win32 reports a stack as ONE region whose AllocationBase is the reservation base,
      *  and stack-bounds helpers (Delphi's, a scanning GC's, a guard-page grower's) derive
-     *  their bounds from exactly those two fields. Called from a query storm, so it stays a
-     *  plain scan over the (small) thread map. */
+     *  their bounds from exactly those two fields. Called from a VirtualQuery storm, so it
+     *  answers from a sorted span index (reservations are disjoint) rather than a sweep. */
     findStackReservation(addr: number): { base: number; top: number } | null {
         const a = addr >>> 0;
-        for (const t of this.threads.values()) {
-            const base = t.stackBase >>> 0;
-            const top = t.stackTop >>> 0;
-            if (top > base && a >= base && a < top) return { base, top };
+        let spans = this.stackSpanIndex;
+        if (!spans) {
+            spans = [];
+            for (const t of this.threads.values()) {
+                const base = t.stackBase >>> 0;
+                const top = t.stackTop >>> 0;
+                if (top > base) spans.push({ base, top });
+            }
+            spans.sort((x, y) => x.base - y.base);
+            this.stackSpanIndex = spans;
         }
-        return null;
+        let lo = 0, hi = spans.length - 1, last = -1;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            if (spans[mid]!.base <= a) { last = mid; lo = mid + 1; } else { hi = mid - 1; }
+        }
+        if (last < 0) return null;
+        const s = spans[last]!;
+        return a < s.top ? s : null;
     }
 
     getDetailedThreadInfo(): string {
@@ -4398,7 +4447,7 @@ export class Scheduler {
         if (this.runQueue.length === 0) return null;
 
         // Bootstrap threads must reach their first wait before the creator can monopolize CPU
-        // during long thunks (e.g. MCI intro decode).
+        // during a long initialization thunk.
         for (const id of this.bootstrapUntilFirstWait) {
             if (id !== excludeId) {
                 const t = this.threads.get(id);
@@ -4683,6 +4732,7 @@ export class Scheduler {
         };
 
         this.threads.set(threadId, thread);
+        this.stackSpanIndex = null;
         this.currentThreadId = threadId;
         this.mainThreadId = threadId;
 
