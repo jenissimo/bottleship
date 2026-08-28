@@ -10,9 +10,12 @@ import { d3d9Module } from '../../api/d3d9.api';
 import type { D3D9Device } from '../../backends/webgpu/d3d9/d3d9-device';
 import { Logger, LogCategory } from '../../core/logger';
 import { clearResourceRegistry } from './resource-registry';
+import { clearVolumeResources } from './volume-resources';
+import { resetResourceContract } from './resource-contract';
 import type { D3D9StateBlockData } from '../../backends/webgpu/d3d9/d3d9-state-block';
 import { clearD3D9ComObjectRegistries } from '../../backends/webgpu/d3d9/d3d9-com-objects';
 import { resetShaderValidators } from './shader-validator';
+import { resetQueryState } from './query';
 import { resetD3D9Perf } from './d3d9-perf';
 import { d3d9WasmArena } from '../../backends/webgpu/d3d9/d3d9-wasm-arena';
 import { allocateComObject, freeComObject } from '../../core/com/com-memory';
@@ -123,7 +126,10 @@ export function getVTables(): Record<string, VTableInfo> {
  */
 export function resetD3D9SharedState(): void {
     for (const dev of devices.values()) {
-        dev.resetSubsystemPerf();
+        // Test doubles and older device shims may not expose the optional
+        // performance-reset hook; shared-state teardown must remain safe for
+        // those callers while real devices still clear their counters.
+        dev.resetSubsystemPerf?.();
     }
     // Before the registries the finalizers read are torn down: they own the GPU
     // textures, VB/IB and WASM block slots a reused WebGPU device would inherit.
@@ -140,7 +146,10 @@ export function resetD3D9SharedState(): void {
     d3d9WasmArena.resetBlockSlots(); // every block ptr just dropped — slot ownership resets with them
     clearD3D9ComObjectRegistries();
     clearResourceRegistry();
+    clearVolumeResources();
+    resetResourceContract();
     resetShaderValidators();
+    resetQueryState();
     Logger.log(LogCategory.D3D9, 'D3D9 shared state reset');
 }
 
@@ -152,6 +161,27 @@ export function resetD3D9SharedState(): void {
  * buffer is exactly that case — UnlockRect uploads it — so the video must go INTO it
  * and be composited by the game, not onto a video overlay that hides the game's own UI.
  */
+/**
+ * Monotonic count of level-0 texture write-backs (UnlockRect that publishes bytes).
+ *
+ * A video sink uses this to tell two shapes apart that look identical from the codec side:
+ * an app that uploads the movie into its OWN texture every frame (so the movie is already
+ * in the frame it presents), and one that leaves the movie stranded in a CPU buffer (where
+ * the overlay is the only way it reaches the screen). The pointer-based test cannot see the
+ * first shape when the app copies into a private buffer and locks the texture afterwards —
+ * the two never coincide — but the upload itself is observable, and needs to know nothing
+ * about the game.
+ */
+let d3d9TextureUploads = 0;
+
+export function noteD3D9TextureUpload(): void {
+    d3d9TextureUploads = (d3d9TextureUploads + 1) >>> 0;
+}
+
+export function d3d9TextureUploadSeq(): number {
+    return d3d9TextureUploads;
+}
+
 export function resolveD3D9LockedTextureTarget(
     addr: number,
 ): { pitch: number; width: number; height: number } | null {

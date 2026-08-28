@@ -2,6 +2,10 @@
  * D3D9 API call-mix + skip counters for dbg.d3d9Perf().
  * Zero-alloc hot path: plain number fields, no Maps on the setter path.
  */
+import {
+    getDxFormatSupportCensus,
+    resetDxFormatSupportCensus,
+} from "../../backends/webgpu/shared/dx-format-support";
 
 export interface D3D9PerfSnapshot {
     api: Record<string, number>;
@@ -10,8 +14,23 @@ export interface D3D9PerfSnapshot {
     stateTracker: Record<string, number>;
     /** Draws the device dropped, keyed by reason. Empty is the healthy state. */
     droppedDraws: Record<string, number>;
+    /**
+     * Reset refusals, keyed by the exact precondition that failed (with its counts spelled
+     * into the key). A refused Reset is INVISIBLE otherwise: the app latches "device lost",
+     * every later frame is discarded before a single draw, and the screen simply holds the
+     * last image — no GPU error, no dropped draw, nothing in the frame log. Empty is the
+     * healthy state.
+     */
+    resetRefusals: Record<string, number>;
     /** FFP state a draw needed and the shader does not implement. Empty is the healthy state. */
     ffpUnimplemented: Record<string, number>;
+    /** FFP state the shader lowers deliberately but without a native WebGPU equivalent. */
+    approximated: Record<string, number>;
+    /** FourCC capability probes refused because no decoder/storage path is shipped. */
+    formatSupport: {
+        refusedFormat: Record<string, number>;
+        refusedFourCC: Record<string, number>;
+    };
     /** Full D3DTSS_COLOROP/ALPHAOP distribution — the context ffpUnimplemented needs. */
     ffpOps: Record<string, number>;
     /** Has SetMaterial ever been called? If not, the default material is what lit every draw. */
@@ -215,6 +234,13 @@ export function d3d9PerfFfpUnimplemented(feature: string): void {
     ffpUnimplemented[feature] = (ffpUnimplemented[feature] ?? 0) + 1;
 }
 
+/** Record shader-side semantic lowerings whose result is intentionally approximate. */
+const approximated: Record<string, number> = {};
+
+export function d3d9PerfApproximation(feature: string): void {
+    approximated[feature] = (approximated[feature] ?? 0) + 1;
+}
+
 /**
  * D3DTSS_COLOROP/ALPHAOP histogram over EVERY draw, not just the ops we cannot do: an
  * "unimplemented" count of zero only means something next to the distribution it was read
@@ -344,6 +370,14 @@ export function d3d9PerfSkip(key: SkipKey): void {
  * Returns 0 so a call site reads `return d3d9DropDraw("reason")` and cannot count and return
  * as two separable steps that drift apart.
  */
+/** Record why a Reset was refused. The reason string carries the failing numbers, because
+ *  "some precondition" is not actionable and this path is exercised once per game. */
+const resetRefusals: Record<string, number> = {};
+
+export function d3d9NoteResetRefusal(reason: string): void {
+    resetRefusals[reason] = (resetRefusals[reason] ?? 0) + 1;
+}
+
 export function d3d9DropDraw(reason: string): number {
     droppedDraws[reason] = (droppedDraws[reason] ?? 0) + 1;
     return 0;
@@ -413,7 +447,10 @@ export function resetD3D9Perf(): void {
     for (const k of BACKEND_KEYS) backend[k] = 0;
     for (const k in stateBlock) (stateBlock as Record<string, number>)[k] = 0;
     for (const k in droppedDraws) delete droppedDraws[k];
+    for (const k in resetRefusals) delete resetRefusals[k];
     for (const k in ffpUnimplemented) delete ffpUnimplemented[k];
+    for (const k in approximated) delete approximated[k];
+    resetDxFormatSupportCensus();
     ffpColorOps.fill(0);
     ffpAlphaOps.fill(0);
     materialEverSet = false;
@@ -435,7 +472,10 @@ export function getD3D9PerfSnapshot(): D3D9PerfSnapshot {
         backend: pickRecord(backend, BACKEND_KEYS),
         stateTracker: {},
         droppedDraws: { ...droppedDraws },
+        resetRefusals: { ...resetRefusals },
         ffpUnimplemented: { ...ffpUnimplemented },
+        approximated: { ...approximated },
+        formatSupport: getDxFormatSupportCensus(),
         ffpOps: ffpOpsSnapshot(),
         materialEverSet,
         wbuf: null,

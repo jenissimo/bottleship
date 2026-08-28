@@ -6,7 +6,8 @@
  */
 import { describe, expect, test } from "bun:test";
 import {
-    planFvf, D3DFVF_XYZ, D3DFVF_XYZRHW, D3DFVF_NORMAL, D3DFVF_DIFFUSE, D3DFVF_SPECULAR, D3DFVF_TEX1,
+    parseFvf, planFvf, makeFvfDeclaration, D3DFVF_XYZ, D3DFVF_XYZRHW, D3DFVF_NORMAL, D3DFVF_DIFFUSE, D3DFVF_SPECULAR, D3DFVF_TEX1,
+    D3DFVF_LASTBETA_UBYTE4,
 } from "../../src/worker/backends/webgpu/d3d9/shader/fvf-layout";
 
 /** The rule under test, in the shape buildShaderFromDecl applies it. */
@@ -121,5 +122,74 @@ describe("FVF stride", () => {
         expect(short.hasSpecular).toBe(true);
         expect(short.hasTex).toBe(false);
         expect(locOf(short, 3)!.offset).toBe(28);
+    });
+
+    test("keeps all eight FVF coordinate sets with their declared dimensions", () => {
+        // TEXCOUNT=8; set 1 FLOAT3, set 2 FLOAT4, set 3 FLOAT1, remaining sets FLOAT2.
+        const fvf = D3DFVF_XYZ | (8 << 8) | (1 << 18) | (2 << 20) | (3 << 22);
+        const p = planFvf(fvf);
+        expect(p.hasTex).toBe(true);
+        expect(p.hasTexSets).toEqual([true, true, true, true, true, true, true, true]);
+        expect(p.texDims).toEqual([2, 3, 4, 1, 2, 2, 2, 2]);
+        expect(p.attributes.slice(1).map(a => a.format)).toEqual([
+            "float32x2", "float32x3", "float32x4", "float32",
+            "float32x2", "float32x2", "float32x2", "float32x2",
+        ]);
+        expect(p.texOffsets).toEqual([12, 20, 32, 48, 52, 60, 68, 76]);
+        expect(p.arrayStride).toBe(84);
+    });
+
+    test("does not mistake XYZB1 for pre-transformed XYZRHW", () => {
+        const f = parseFvf(0x0006); // D3DFVF_XYZB1
+        expect(f.hasRhw).toBe(false);
+        expect(f.posOff).toBe(0);
+        expect(f.stride).toBe(16);
+    });
+
+    test("exposes XYZBn beta weights without renumbering legacy attributes", () => {
+        const f = parseFvf(0x0008 | D3DFVF_NORMAL | D3DFVF_TEX1); // XYZB2 + NORMAL + TEX1
+        expect(f.blendWeightCount).toBe(2);
+        expect(f.blendWeightOff).toBe(12);
+        expect(f.blendWeightDims).toBe(2);
+        expect(f.blendIndexLoc).toBe(-1);
+        expect(f.normalOff).toBe(20);
+        expect(f.texOffs[0]).toBe(32);
+        expect(f.stride).toBe(40);
+        expect(planFvf(0x0008 | D3DFVF_NORMAL | D3DFVF_TEX1).attributes.map(a => a.shaderLocation)).toEqual([0, 1, 2, 3]);
+    });
+
+    test("maps LASTBETA_UBYTE4 to a four-byte index attribute", () => {
+        const f = parseFvf(0x000c | 0x1000); // XYZB4 + LASTBETA_UBYTE4
+        expect(f.blendWeightCount).toBe(3);
+        expect(f.blendWeightOff).toBe(12);
+        expect(f.blendWeightDims).toBe(3);
+        expect(f.blendIndexOff).toBe(24);
+        expect(f.blendIndexFormat).toBe("uint8x4");
+        const p = planFvf(0x000c | 0x1000);
+        expect(p.attributes.map(a => a.format)).toEqual(["float32x3", "float32x3", "uint8x4"]);
+        expect(p.arrayStride).toBe(28);
+    });
+});
+
+describe("FVF programmable declaration", () => {
+    test("preserves FLOAT1 and D3DCOLOR formats for a programmable VS", () => {
+        // TEXCOORDSIZE1 is encoded as 3 in the first two-bit size field.
+        const fvf = D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | (3 << 16);
+        const decl = makeFvfDeclaration(fvf)!;
+        expect(decl).toEqual([
+            { stream: 0, offset: 0, type: 2, usage: 0, usageIndex: 0, reg: 0 },
+            { stream: 0, offset: 12, type: 4, usage: 10, usageIndex: 0, reg: 1 },
+            { stream: 0, offset: 16, type: 0, usage: 5, usageIndex: 0, reg: 2 },
+        ]);
+    });
+
+    test("maps XYZBn last beta to BLENDWEIGHT + BLENDINDICES without losing offsets", () => {
+        const decl = makeFvfDeclaration(0x000a | D3DFVF_LASTBETA_UBYTE4)!;
+        expect(decl).toContainEqual({ stream: 0, offset: 12, type: 1, usage: 1, usageIndex: 0, reg: 1 });
+        expect(decl).toContainEqual({ stream: 0, offset: 20, type: 5, usage: 2, usageIndex: 0, reg: 2 });
+    });
+
+    test("refuses five independent beta floats instead of fabricating a truncated element", () => {
+        expect(makeFvfDeclaration(0x000e)).toBeNull();
     });
 });

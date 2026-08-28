@@ -10,9 +10,11 @@ import { System } from '../../core/system';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { Mem } from '../../core/memory/mem-accessor';
 import { writeDeviceCaps9 } from './caps';
-import { createComObject, getVTables } from './shared-state';
+import { addComRef, createComObject, getComRefCount, getVTables, releaseComRef } from './shared-state';
+import { readD3D9GuidKey } from './object-contracts';
 import {
     checkDxDeviceFormat,
+    checkDxDeviceFormatConversion,
     checkDxDeviceMultiSampleType,
     checkDxDeviceType,
     checkDxDepthStencilMatch,
@@ -104,6 +106,38 @@ export function createFactoryExports(): Record<string, ThunkImplementation> {
 
     const D3D_OK = 0;
     const D3DERR_INVALIDCALL = 0x8876086c;
+    const E_NOINTERFACE = 0x80004002;
+    const E_POINTER = 0x80004003;
+    const IID_IUNKNOWN = '0000000000000000c000000000000046';
+    const IID_IDIRECT3D9 = 'cacbbd81d4646d42ae8dad0147f4275c';
+
+    // IDirect3D9 is a COM object too.  Keep its lifetime and QI behavior
+    // explicit; an unregistered IUnknown prefix is especially dangerous for
+    // Ex callers because they probe the base interface before CreateDeviceEx.
+    exports['IDirect3D9_QueryInterface'] = (_ctx, mem, args) => {
+        const thisPtr = args[0] >>> 0;
+        const riid = args[1] >>> 0;
+        const ppvObject = args[2] >>> 0;
+        if (!ppvObject) return E_POINTER;
+        // QI on a stale/released object must not resurrect a COM pointer.  The
+        // generic object handlers enforce the same live-reference rule; keeping
+        // the factory prefix strict prevents a released IDirect3D9 from handing
+        // out a pointer that the caller will immediately dispatch through.
+        if (!getComRefCount(thisPtr)) {
+            Mem.writeUint32(ppvObject, 0);
+            return E_NOINTERFACE;
+        }
+        const key = readD3D9GuidKey(mem, riid);
+        if (key !== IID_IUNKNOWN && key !== IID_IDIRECT3D9) {
+            Mem.writeUint32(ppvObject, 0);
+            return E_NOINTERFACE;
+        }
+        if (!Mem.writeUint32(ppvObject, thisPtr)) return E_POINTER;
+        addComRef(thisPtr);
+        return D3D_OK;
+    };
+    exports['IDirect3D9_AddRef'] = (_ctx, _mem, args) => addComRef(args[0] >>> 0) ?? 0;
+    exports['IDirect3D9_Release'] = (_ctx, _mem, args) => releaseComRef(args[0] >>> 0) ?? 0;
 
     exports['IDirect3D9_RegisterSoftwareDevice'] = () => D3D_OK;
 
@@ -201,17 +235,18 @@ export function createFactoryExports(): Record<string, ThunkImplementation> {
         return hr;
     };
     exports['IDirect3D9_CheckDeviceMultiSampleType'] = (_ctx, _mem, args) => {
-        const hr = checkDxDeviceMultiSampleType(9, args[1], args[2], args[3], args[4], args[5]);
-        // pQualityLevels (out, optional): we expose a single quality level for NONE.
+        const hr = checkDxDeviceMultiSampleType(9, args[1], args[2], args[3], args[4], args[5] >>> 0);
+        // pQualityLevels (out, optional): one quality level per explicitly accepted count.
         const pQualityLevels = args[6] >>> 0;
         if (pQualityLevels) Mem.writeUint32(pQualityLevels, hr === D3D_OK ? 1 : 0);
         return hr;
     };
     exports['IDirect3D9_CheckDepthStencilMatch'] = (_ctx, _mem, args) =>
         checkDxDepthStencilMatch(9, args[1], args[2], args[3], args[4], args[5]);
-    // StretchRect-style format conversion: our blit path converts freely; report support.
-    exports['IDirect3D9_CheckDeviceFormatConversion'] = () => D3D_OK;
-    exports['IDirect3D9_GetAdapterMonitor'] = () => 0x10001;
+    exports['IDirect3D9_CheckDeviceFormatConversion'] = (_ctx, _mem, args) =>
+        checkDxDeviceFormatConversion(9, args[1], args[2], args[3], args[4]);
+    exports['IDirect3D9_GetAdapterMonitor'] = (_ctx, _mem, args) =>
+        (args[1] >>> 0) === D3DADAPTER_DEFAULT ? 0x10001 : 0;
     exports['DebugSetMute'] = (_ctx, _mem, _args) => 0;
 
     exports['Direct3DCreate9'] = (ctx, mem, args) => {

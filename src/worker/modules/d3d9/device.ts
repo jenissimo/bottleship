@@ -8,14 +8,25 @@ import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { Mem } from '../../core/memory/mem-accessor';
+import { isValidAddress } from '../../core/memory/address-guard';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { gammaService } from '../../core/gamma-service';
 import { D3D9Device } from '../../backends/webgpu/d3d9/d3d9-device';
 import {
     PP_BACKBUFFER_WIDTH, PP_BACKBUFFER_HEIGHT, PP_BACKBUFFER_FORMAT,
+    PP_MULTISAMPLE_TYPE, PP_MULTISAMPLE_QUALITY,
     PP_WINDOWED, PP_ENABLE_AUTO_DEPTHSTENCIL,
     PP_AUTO_DEPTHSTENCIL_FORMAT, PP_PRESENTATION_INTERVAL, readD3d9SwapEffect,
 } from './presentation-params';
+import {
+    defaultPresentationParameters9,
+    parsePresentationParameters9,
+    validatePresentationParameters9,
+} from '../../backends/webgpu/d3d9/presentation';
+import {
+    getD3D9MsaaCapabilityContract,
+} from '../../backends/webgpu/d3d9/multisample';
+import { resolveD3D9StretchRectPolicy } from '../../backends/webgpu/d3d9/copy-policy';
 import { WebGPUBackend } from '../../backends/webgpu/webgpu-backend';
 import { resizeFullscreenWindowToMode } from '../../runtime/windowing/fullscreen-window';
 import {
@@ -25,6 +36,10 @@ import {
     registerLossTrackedDevice,
 } from '../../core/gpu/gpu-device-loss-contract';
 import { writeDeviceCaps9 } from './caps';
+import { d3d9NoteResetRefusal } from './d3d9-perf';
+
+/** Per-reason log budget for refused Resets — see the `refuse` helper below. */
+const resetRefusalLogged = new Map<string, number>();
 import {
     addComRef, getVTables, devices, createComObject, registerComFinalizer,
     releaseComRef, resourceToDevice, deviceToD3D9, deviceCreationParams,
@@ -45,11 +60,25 @@ import {
     takeAllDeviceSlotRefs,
     takeDeviceBackBufferSurfaces,
     takeDeviceSlotRef,
+    summarizeDefaultPoolResources,
+    describeDefaultPoolResources,
+    defaultPoolBufferTally,
 } from './resource-registry';
 import {
     isHardwareDeviceCursor, releaseDeviceCursor, setDeviceCursorImage,
     setDeviceCursorPosition, showDeviceCursor,
 } from '../../core/device-cursor';
+import {
+    getDeviceSwapChain,
+    invalidateDeviceSwapChains,
+    registerImplicitSwapChain,
+    resetDeviceSwapChains,
+    getSwapChainFrontBufferData,
+    recordDevicePresent,
+    validateDevicePresent,
+} from './swapchain';
+import { notifyDeviceSubmission } from './query';
+import { initReturnPtr } from '../../backends/webgpu/shared/dx-com-helpers';
 
 const D3DFMT_X8R8G8B8 = 22;
 const D3DFMT_R5G6B5 = 23;
@@ -65,6 +94,8 @@ const D3DDEVTYPE_HAL = 1;
 const D3D9_MAX_RENDER_TARGETS = 4;
 const D3DBACKBUFFER_TYPE_MONO = 0;
 const D3DERR_NOTFOUND = 0x88760866;
+const D3DCLEAR_ZBUFFER = 0x2;
+const D3DCLEAR_STENCIL = 0x4;
 
 function formatForBpp(bpp: number): number {
     return bpp <= 16 ? D3DFMT_R5G6B5 : D3DFMT_X8R8G8B8;
@@ -75,15 +106,17 @@ function formatForBpp(bpp: number): number {
  *  SetRenderTarget resolves texturePtr 0 to the swap-chain. */
 function registerImplicitBackbufferMeta(surfacePtr: number, devicePtr: number): void {
     const bb = resolveBackBufferGeometry(devicePtr);
+    const device = devices.get(devicePtr >>> 0);
     surfaceMeta.set(surfacePtr, {
         format: bb.format,
         type: D3DRTYPE_SURFACE,
         usage: D3DUSAGE_RENDERTARGET,
         pool: D3DPOOL_DEFAULT,
-        multiSampleType: 0,
+        multiSampleType: device?.getD3D9MultisampleSampleCount() ?? 0,
         multiSampleQuality: 0,
         width: bb.width,
         height: bb.height,
+        implicitBackBuffer: true,
     });
 }
 
@@ -121,9 +154,18 @@ function renderTargetSlot(index: number): string {
     return `rt${index >>> 0}`;
 }
 
-/** Drop every reference this device's bindings and implicit surfaces hold. */
-function releaseDeviceSurfaceRefs(devicePtr: number): void {
+/** Drop the references this device's BINDINGS hold (render targets, depth-stencil,
+ *  textures). Deliberately does NOT touch the implicit back-buffer registry: those objects
+ *  are device-owned, exempt from Reset's DEFAULT-pool precondition, and dropping their
+ *  identity before the census makes an app that merely kept its GetBackBuffer pointer look
+ *  like it leaked a render target. */
+function releaseDeviceBindingRefs(devicePtr: number): void {
     for (const held of takeAllDeviceSlotRefs(devicePtr)) releaseComRef(held);
+}
+
+/** The above plus the implicit back buffers — device teardown, or a Reset that succeeded. */
+function releaseDeviceSurfaceRefs(devicePtr: number): void {
+    releaseDeviceBindingRefs(devicePtr);
     for (const surfacePtr of takeDeviceBackBufferSurfaces(devicePtr)) releaseComRef(surfacePtr);
 }
 
@@ -188,6 +230,8 @@ function bindAutoDepthStencil(device: D3D9Device, devicePtr: number, mem: Uint8A
     const w = Math.max(1, view.getUint32(pPresentationParameters + PP_BACKBUFFER_WIDTH, true) || 800);
     const h = Math.max(1, view.getUint32(pPresentationParameters + PP_BACKBUFFER_HEIGHT, true) || 600);
     const format = view.getUint32(pPresentationParameters + PP_AUTO_DEPTHSTENCIL_FORMAT, true) || D3DFMT_D24S8;
+    const multiSampleType = view.getUint32(pPresentationParameters + PP_MULTISAMPLE_TYPE, true) >>> 0;
+    const multiSampleQuality = view.getUint32(pPresentationParameters + PP_MULTISAMPLE_QUALITY, true) >>> 0;
 
     const surfacePtr = createComObject(vtableAddr);
     resourceToDevice.set(surfacePtr, device);
@@ -196,10 +240,11 @@ function bindAutoDepthStencil(device: D3D9Device, devicePtr: number, mem: Uint8A
         type: D3DRTYPE_SURFACE,
         usage: D3DUSAGE_DEPTHSTENCIL,
         pool: D3DPOOL_DEFAULT,
-        multiSampleType: 0,
-        multiSampleQuality: 0,
+        multiSampleType,
+        multiSampleQuality,
         width: w,
         height: h,
+        standalone: true,
     });
     registerComFinalizer(surfacePtr, () => releaseSurfaceMetadata(surfacePtr));
     deviceBoundDepthStencil.set(devicePtr, surfacePtr);
@@ -216,6 +261,13 @@ function bindAutoDepthStencil(device: D3D9Device, devicePtr: number, mem: Uint8A
  * the device dies or a Reset re-declares the geometry.
  */
 function ensureImplicitBackBuffer(devicePtr: number, device: D3D9Device, iSwapChain: number, iBackBuffer: number): number {
+    // The implicit chain is registered during CreateDevice.  Reuse its stable
+    // backbuffer object so GetBackBuffer/GetRenderTarget compare equal and the
+    // chain owns the underlying COM reference for the device lifetime.
+    const registered = getDeviceSwapChain(devicePtr, iSwapChain);
+    if (registered?.backBuffers[iBackBuffer] !== undefined) {
+        return registered.backBuffers[iBackBuffer]!;
+    }
     const key = `${iSwapChain >>> 0}:${iBackBuffer >>> 0}`;
     const cached = getDeviceBackBufferSurface(devicePtr, key);
     if (cached) return cached;
@@ -252,23 +304,34 @@ function bgraToRgba(src: Uint8Array, width: number, height: number, pitch: numbe
     return out;
 }
 
+/** Per-device GPU-resource generation the redundant-SetRenderTarget fast path was validated
+ *  against. Keyed by device COM pointer, cleared with the rest of the device state. */
+const rtFastPathGeneration = new Map<number, number>();
+
 export function createDeviceExports(): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
 
     const D3D_OK = 0;
     const D3DERR_INVALIDCALL = 0x8876086c;
+    const D3DERR_NOTAVAILABLE = 0x8876086a;
     const D3DERR_DEVICELOST = 0x88760868;
     const D3DERR_DEVICENOTRESET = 0x88760869;
 
     // Gamma — SetGammaRamp(iSwapChain, Flags, pRamp); GetGammaRamp(iSwapChain, pRamp).
     // Routed to the shared RAMDAC LUT sink so the D3D9 brightness slider actually works.
+    // Validate the device/chain and the 1536-byte guest payload before reporting success;
+    // otherwise a bad pointer would be indistinguishable from a successfully applied ramp.
     exports['IDirect3DDevice9_SetGammaRamp'] = (_ctx, mem, args) => {
-        gammaService.applyFromGuest(mem, args[3]);
-        return D3D_OK;
+        const devicePtr = args[0] >>> 0;
+        const swapChain = args[1] >>> 0;
+        if (!devices.has(devicePtr) || !getDeviceSwapChain(devicePtr, swapChain)) return D3DERR_INVALIDCALL;
+        return gammaService.applyFromGuest(mem, args[3]) ? D3D_OK : D3DERR_INVALIDCALL;
     };
     exports['IDirect3DDevice9_GetGammaRamp'] = (_ctx, mem, args) => {
-        gammaService.writeToGuest(mem, args[2]);
-        return D3D_OK;
+        const devicePtr = args[0] >>> 0;
+        const swapChain = args[1] >>> 0;
+        if (!devices.has(devicePtr) || !getDeviceSwapChain(devicePtr, swapChain)) return D3DERR_INVALIDCALL;
+        return gammaService.writeToGuest(mem, args[2]) ? D3D_OK : D3DERR_INVALIDCALL;
     };
 
     // Cursor — SetCursorProperties(XHotSpot, YHotSpot, pCursorBitmap). The bitmap contract is
@@ -292,16 +355,20 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         // Snapshot the pixels for the host pointer: real D3D does not addref the
         // surface, so the app may release or reuse it as soon as this returns.
         const resolved = resolveSurfaceInfo(pCursorBitmap);
-        const pixels = resolved?.device.getTextureLevelPixels(resolved.texturePtr, resolved.level);
+        if (!resolved || resolved.device !== devices.get(pDevice)) return D3DERR_INVALIDCALL;
+        const pixels = resolved.device.getTextureLevelPixels(resolved.texturePtr, resolved.level);
+        // Do not claim success with an empty cursor image when the backing texture
+        // is not readable yet (for example after device loss or an unsupported pool).
+        if (!pixels || pixels.data.byteLength < pixels.pitch * meta.height) return D3DERR_NOTAVAILABLE;
         const windowed = resolveBackBufferGeometry(pDevice).windowed;
-        setDeviceCursorImage(pDevice, pixels ? {
+        setDeviceCursorImage(pDevice, {
             width: meta.width,
             height: meta.height,
             // Format is A8R8G8B8 (validated above) = B,G,R,A bytes little-endian.
             pixels: bgraToRgba(pixels.data, meta.width, meta.height, pixels.pitch),
             hotspotX: xHotSpot,
             hotspotY: yHotSpot,
-        } : null, windowed);
+        }, windowed);
         Logger.log(LogCategory.D3D9,
             `SetCursorProperties(${meta.width}x${meta.height}, hotspot ${xHotSpot},${yHotSpot}) surface=0x${pCursorBitmap.toString(16)} ` +
             `kind=${isHardwareDeviceCursor(meta.width, meta.height, windowed) ? 'hardware' : 'software'} windowed=${windowed}`);
@@ -314,6 +381,12 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         const pDevice = args[0] >>> 0;
         if (!devices.has(pDevice)) return 0;
         return showDeviceCursor(pDevice, !!args[1]) ? 1 : 0;
+    };
+
+    exports['IDirect3DDevice9_SetDialogBoxMode'] = (_ctx, _mem, args) => {
+        const device = devices.get(args[0] >>> 0);
+        if (!device) return D3DERR_INVALIDCALL;
+        return device.setDialogBoxMode((args[1] >>> 0) !== 0);
     };
 
     // SetCursorPosition(X, Y, Flags) is STDMETHOD_(void, ...) — the guest ignores the return
@@ -333,12 +406,20 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
     exports['IDirect3DDevice9_GetRasterStatus'] = (_ctx, _mem, args) => {
         const pRasterStatus = args[2] >>> 0;
         if (!devices.has(args[0] >>> 0)) return D3DERR_INVALIDCALL;
-        if ((args[1] >>> 0) !== 0 || !pRasterStatus) return D3DERR_INVALIDCALL;
+        if (!pRasterStatus) return D3DERR_INVALIDCALL;
+        // D3D9 exposes raster status only for the implicit swap chain.  Do not
+        // accidentally report synthetic timing for an additional chain.
+        if ((args[1] >>> 0) !== 0) return D3DERR_INVALIDCALL;
+        const chain = getDeviceSwapChain(args[0] >>> 0, args[1] >>> 0);
+        if (!chain) return D3DERR_INVALIDCALL;
 
+        // Raster timing belongs to the selected chain.  Additional chains may
+        // have a different back-buffer size/refresh rate than the emulator's
+        // primary screen configuration.
         const cfg = EmulatorConfig.getInstance().screenResolution;
-        const visibleLines = Math.max(1, cfg.height >>> 0);
+        const visibleLines = Math.max(1, chain.params.backBufferHeight >>> 0);
         const totalLines = visibleLines + VBLANK_LINES;
-        const framePeriodMs = 1000 / (cfg.refreshRate || 60);
+        const framePeriodMs = 1000 / (chain.params.fullScreenRefreshRate || cfg.refreshRate || 60);
         const phase = (System.getInstance().services.time.nowMs() % framePeriodMs) / framePeriodMs;
         const line = Math.min(totalLines - 1, Math.floor(phase * totalLines));
         const inVBlank = line >= visibleLines;
@@ -349,6 +430,14 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         return ok ? D3D_OK : D3DERR_INVALIDCALL;
     };
 
+    exports['IDirect3DDevice9_GetFrontBufferData'] = (_ctx, _mem, args) => {
+        const devicePtr = args[0] >>> 0;
+        const swapChain = args[1] >>> 0;
+        const destination = args[2] >>> 0;
+        if (swapChain !== 0 || !devices.has(devicePtr) || !destination) return D3DERR_INVALIDCALL;
+        return getSwapChainFrontBufferData(devicePtr, destination);
+    };
+
     exports['IDirect3DDevice9_TestCooperativeLevel'] = (_ctx, _mem, args) => {
         const pDevice = args[0];
         if (!devices.has(pDevice)) return D3DERR_INVALIDCALL;
@@ -356,7 +445,9 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         // DEVICELOST while there is nothing to reset onto, DEVICENOTRESET once there is.
         // Answering an error before the backend could recreate a device would be worse than
         // the old unconditional D3D_OK — the app would spin in a Reset that cannot succeed.
-        switch (deviceCooperativeLevel(pDevice)) {
+        const cooperative = deviceCooperativeLevel(pDevice);
+        if (cooperative === "lost") invalidateDeviceSwapChains(pDevice >>> 0);
+        switch (cooperative) {
             case "lost": return D3DERR_DEVICELOST;
             case "notreset": return D3DERR_DEVICENOTRESET;
             default: return D3D_OK;
@@ -383,8 +474,28 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         const BehaviorFlags = args[4];
         const pPresentationParameters = args[5];
         const ppReturnedDeviceInterface = args[6];
+        // Ex wrappers append this private marker when forwarding into the base
+        // implementation.  The public COM ABI has only seven arguments.
+        const isExtended = args[7] === 1;
 
         Logger.log(LogCategory.D3D9, `IDirect3D9_CreateDevice(Adapter=${Adapter}, DeviceType=${DeviceType})`);
+
+        // The out interface is mandatory.  Validate and clear it before any
+        // asynchronous backend initialization so an invalid destination cannot
+        // leave behind a fully-created device that the guest cannot release.
+        if (!ppReturnedDeviceInterface || !Mem.writeUint32(ppReturnedDeviceInterface, 0)) {
+            return D3DERR_INVALIDCALL;
+        }
+
+        // This backend has a CPU ProcessVertices implementation and mirrors constants for the
+        // mixed mode, but it does not implement the complete D3DCREATE_SOFTWARE_VERTEXPROCESSING
+        // draw path. Refuse the creation flag instead of creating a device that advertises SWVP
+        // and silently renders through the hardware-only WebGPU path.
+        if ((BehaviorFlags & 0x20) !== 0) {
+            Logger.warn(LogCategory.D3D9,
+                'CreateDevice refused: full D3DCREATE_SOFTWARE_VERTEXPROCESSING is not implemented; use mixed mode');
+            return D3DERR_NOTAVAILABLE;
+        }
 
         try {
             const system = System.getInstance();
@@ -403,7 +514,11 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
             }
 
             // Create D3D9Device instance
-            const device = new D3D9Device(backend);
+            const device = new D3D9Device(backend, getD3D9MsaaCapabilityContract());
+            device.isExtended = isExtended;
+            // D3DCREATE_SOFTWARE_VERTEXPROCESSING selects the initial VP mode. Mixed VP starts
+            // in hardware mode and can be switched explicitly with SetSoftwareVertexProcessing.
+            device.setSoftwareVertexProcessing((BehaviorFlags & 0x20) !== 0);
 
             // Establish backbuffer size from present params (single source of truth
             // for resolution: host canvas + viewport + XYZRHW NDC divisor must agree).
@@ -411,6 +526,23 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
             // 800x600 default while the canvas was sized elsewhere -> 2D squish.
             if (pPresentationParameters) {
                 const ppView = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+                const parsed = parsePresentationParameters9(mem, pPresentationParameters);
+                if (!parsed) return D3DERR_INVALIDCALL;
+                const presentationHr = validatePresentationParameters9(parsed, isExtended);
+                if (presentationHr !== D3D_OK) return presentationHr;
+                const multiSampleType = ppView.getUint32(pPresentationParameters + PP_MULTISAMPLE_TYPE, true) >>> 0;
+                const multiSampleQuality = ppView.getUint32(pPresentationParameters + PP_MULTISAMPLE_QUALITY, true) >>> 0;
+                if (multiSampleQuality !== 0) {
+                    Logger.warn(LogCategory.D3D9,
+                        `CreateDevice: multisample quality ${multiSampleQuality} is not advertised by the backend`);
+                    return D3DERR_NOTAVAILABLE;
+                }
+                if (!device.supportsD3D9MultisampleType(multiSampleType)) {
+                    Logger.warn(LogCategory.D3D9,
+                        `CreateDevice: multisample type ${multiSampleType} is not backed by the D3D9 executor`);
+                    return D3DERR_NOTAVAILABLE;
+                }
+                if (!device.configureD3D9MultisampleType(multiSampleType)) return D3DERR_NOTAVAILABLE;
                 const bbWidth = ppView.getUint32(pPresentationParameters + 0, true);
                 const bbHeight = ppView.getUint32(pPresentationParameters + 4, true);
                 // D3DPRESENT_PARAMETERS.Windowed @ +32 (d3d9); 0 = fullscreen, i.e. a mode-set.
@@ -458,10 +590,15 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
             // The app's own backbuffer geometry, recorded before anything can query it
             // back out (GetBackBuffer/GetRenderTarget descs, GetDisplayMode).
             recordBackBufferInfo(devicePtr, pPresentationParameters, mem);
+            // D3D9 always exposes one implicit swap chain.  Register it before
+            // any child surface can be queried so the stable chain backbuffers
+            // are also the objects returned by GetRenderTarget/GetBackBuffer.
+            const implicitSwapChain = registerImplicitSwapChain(devicePtr, mem, pPresentationParameters, isExtended);
             addComRef(pD3D9);
             registerComFinalizer(devicePtr, () => {
                 device.releaseComBindings();
                 releaseDeviceSurfaceRefs(devicePtr);
+                if (implicitSwapChain) releaseComRef(implicitSwapChain);
                 devices.delete(devicePtr);
                 forgetLossTrackedDevice(devicePtr);
                 releaseComRef(pD3D9);
@@ -485,12 +622,15 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
                 disp?.setShadowOwner?.(devicePtr);
                 disp?.resetShadow?.('d3d9', 'IDirect3DDevice9_SetRenderState');
                 disp?.resetShadow?.('d3d9', 'IDirect3DDevice9_SetSamplerState');
+                disp?.resetShadow?.('d3d9', 'IDirect3DDevice9_SetTexture');
+                disp?.resetShadow?.('d3d9', 'IDirect3DDevice9_SetVertexShader');
+                disp?.resetShadow?.('d3d9', 'IDirect3DDevice9_SetPixelShader');
             } catch { /* non-fatal */ }
 
             // Return device interface pointer
-            if (ppReturnedDeviceInterface) {
-                const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-                view.setUint32(ppReturnedDeviceInterface, devicePtr, true);
+            if (!Mem.writeUint32(ppReturnedDeviceInterface, devicePtr)) {
+                releaseComRef(devicePtr);
+                return D3DERR_INVALIDCALL;
             }
 
             // Implicit depth-stencil (EnableAutoDepthStencil) — see bindAutoDepthStencil.
@@ -508,35 +648,100 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         const pDevice = args[0];
         const pPresentationParameters = args[1];
 
+        // A refused Reset is the quietest catastrophic answer this module can give: the app
+        // latches "device lost", discards every frame before the first draw, and the screen
+        // holds its last image forever — no GPU error, no dropped draw, nothing in the frame
+        // log, and the one log line can be lost in a firehose. So every refusal is COUNTED
+        // (dbgCall d3d9Perf -> resetRefusals) as well as logged.
+        // The count is unconditional; the LOG is bounded, because an app that retries Reset
+        // every frame would otherwise bury the rest of the run in one repeated line.
+        const refuse = (reason: string, hr: number): number => {
+            d3d9NoteResetRefusal(reason);
+            if ((resetRefusalLogged.get(reason) ?? 0) < 3) {
+                resetRefusalLogged.set(reason, (resetRefusalLogged.get(reason) ?? 0) + 1);
+                Logger.warn(LogCategory.D3D9, `Reset REFUSED (${reason}) -> 0x${(hr >>> 0).toString(16)}`);
+            }
+            return hr;
+        };
+
         const device = devices.get(pDevice);
         if (!device) {
             Logger.error(LogCategory.D3D9, `Reset: invalid device ${pDevice}`);
-            return D3DERR_INVALIDCALL;
+            return refuse("invalidDevice", D3DERR_INVALIDCALL);
+        }
+
+        if (pPresentationParameters) {
+            const ppView = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            const parsed = parsePresentationParameters9(mem, pPresentationParameters);
+            if (!parsed) return refuse("unreadablePresentParams", D3DERR_INVALIDCALL);
+            const presentationHr = validatePresentationParameters9(parsed, device.isExtended);
+            if (presentationHr !== D3D_OK) {
+                return refuse(
+                    `presentParams:swapEffect=${parsed.swapEffect},backBufferCount=${parsed.backBufferCount},` +
+                    `windowed=${parsed.windowed ? 1 : 0},interval=0x${(parsed.presentationInterval >>> 0).toString(16)},` +
+                    `w=${parsed.backBufferWidth},h=${parsed.backBufferHeight},` +
+                    `refresh=${parsed.fullScreenRefreshRate},msQuality=${parsed.multiSampleQuality}`,
+                    presentationHr);
+            }
+            const multiSampleType = ppView.getUint32(pPresentationParameters + PP_MULTISAMPLE_TYPE, true) >>> 0;
+            const multiSampleQuality = ppView.getUint32(pPresentationParameters + PP_MULTISAMPLE_QUALITY, true) >>> 0;
+            if (multiSampleQuality !== 0) {
+                return refuse(`multiSampleQuality=${multiSampleQuality}`, D3DERR_NOTAVAILABLE);
+            }
+            if (!device.supportsD3D9MultisampleType(multiSampleType)) {
+                return refuse(`multiSampleType=${multiSampleType}`, D3DERR_NOTAVAILABLE);
+            }
+        }
+
+        // ORDER IS THE CONTRACT. Real D3D9 drops the references the DEVICE ITSELF holds —
+        // bound textures, stream sources, indices, shaders, declarations, render targets,
+        // depth-stencil, cursor — BEFORE it decides whether an application-owned
+        // D3DPOOL_DEFAULT resource is still alive, and it drops them whether or not the Reset
+        // then succeeds. Counting first charges the app for every resource it merely left
+        // BOUND, which is normal: an engine resets with its dynamic vertex buffer still on
+        // stream 0. The refusal that follows is not recoverable from the app's side — it
+        // latches "device lost" and every later frame is discarded before the first draw.
+        deviceBoundDepthStencil.delete(pDevice);
+        releaseDeviceBindingRefs(pDevice);
+        clearDeviceRenderTargets(pDevice);
+        // The device cursor does not survive Reset either (wined3d_device_reset drops
+        // cursor_texture) — the app must re-SetCursorProperties.
+        releaseDeviceCursor(pDevice);
+        device.releaseComBindings();
+
+        // Base D3D9 requires application-created DEFAULT resources to be released before
+        // Reset. D3D9Ex deliberately lifts that precondition; ResetEx detaches the bindings
+        // and recreates the presentation state.
+        if (!device.isExtended) {
+            const liveDefault = summarizeDefaultPoolResources(device);
+            if (liveDefault.total !== 0) {
+                return refuse(
+                    `defaultPoolLive:total=${liveDefault.total},tex=${liveDefault.textures},` +
+                    `volume=${liveDefault.volumes},vb=${liveDefault.vertexBuffers},` +
+                    `ib=${liveDefault.indexBuffers},surface=${liveDefault.surfaces} ` +
+                    `[${describeDefaultPoolResources(device).join(" ")}] ` +
+                    `tally(created=${defaultPoolBufferTally.created},entered=${defaultPoolBufferTally.entered},` +
+                    `finalized=${defaultPoolBufferTally.finalized})`,
+                    D3DERR_INVALIDCALL);
+            }
         }
 
         // A Reset while the backend still has no device cannot succeed. Real D3D9 answers
         // D3DERR_DEVICELOST here, which is what keeps a correct app in its poll loop instead
         // of proceeding as if the reset had worked.
         if (!acknowledgeDeviceReset(pDevice)) {
-            Logger.warn(LogCategory.D3D9, `Reset refused — no GPU device yet (still recovering)`);
-            return D3DERR_DEVICELOST;
+            return refuse("noGpuDeviceYet", D3DERR_DEVICELOST);
         }
 
-        // Reset destroys the implicit depth-stencil, the implicit backbuffer surfaces and
-        // every render-target binding, then re-creates the depth-stencil from the new
-        // present parameters (when EnableAutoDepthStencil is still set).
-        deviceBoundDepthStencil.delete(pDevice);
-        releaseDeviceSurfaceRefs(pDevice);
-        clearDeviceRenderTargets(pDevice);
-        // The device cursor does not survive a Reset either (wined3d_device_reset drops
-        // cursor_texture) — the app must re-SetCursorProperties. Dropped before the new
-        // present parameters land, so a re-upload sees the new windowed state.
-        releaseDeviceCursor(pDevice);
         const hr = device.reset(pPresentationParameters, mem);
+        if (hr !== D3D_OK) return refuse(`backendReset=0x${(hr >>> 0).toString(16)}`, hr);
+        // The implicit back buffers ARE redeclared by a successful Reset; drop the old
+        // objects now that the precondition is behind us.
+        releaseDeviceSurfaceRefs(pDevice);
         // An in-game resolution switch IS a Reset, and a fullscreen one re-sizes the window
         // to the new mode just as CreateDevice did — an engine that re-creates its render
         // targets from GetClientRect otherwise builds them for the mode it just left.
-        if (pPresentationParameters) {
+        if (hr === D3D_OK && pPresentationParameters) {
             const ppView = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
             if (ppView.getUint32(pPresentationParameters + 32, true) === 0) {
                 const hwnd = (ppView.getUint32(pPresentationParameters + 28, true)
@@ -548,6 +753,12 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
                     "D3D9 Reset");
             }
         }
+        if (pPresentationParameters) {
+            const ppView = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            if (!device.configureD3D9MultisampleType(ppView.getUint32(pPresentationParameters + 16, true))) {
+                return refuse("configureMultisample", D3DERR_NOTAVAILABLE);
+            }
+        }
         bindAutoDepthStencil(device, pDevice, mem, pPresentationParameters);
         // A Reset re-declares the backbuffer (this is how in-game resolution switchers
         // work), so the recorded geometry must follow it or every later GetDesc /
@@ -555,6 +766,11 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         // backbuffer/render-target surfaces cached their extents from the OLD geometry —
         // drop them so the next Get* re-registers against the new one.
         recordBackBufferInfo(pDevice, pPresentationParameters, mem);
+        if (pPresentationParameters) {
+            const parsed = parsePresentationParameters9(mem, pPresentationParameters) ?? defaultPresentationParameters9();
+            const swapChainHr = resetDeviceSwapChains(pDevice, parsed);
+            if (swapChainHr !== D3D_OK) return refuse(`swapChainReset=0x${(swapChainHr >>> 0).toString(16)}`, swapChainHr);
+        }
         return hr;
     };
 
@@ -592,9 +808,23 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         // GetBackBuffer / a NULL restore) → texturePtr 0 = render to the swap-chain.
         if (surfacePtr === 0) {
             if (renderTargetIndex === 0) return D3DERR_INVALIDCALL;
+            const result = device.setRenderTarget(renderTargetIndex, 0, -1, 0);
+            if (result !== D3D_OK) return result;
             setDeviceRenderTarget(devicePtr, renderTargetIndex, 0);
             releaseSurfaceSlot(devicePtr, renderTargetSlot(renderTargetIndex));
             Logger.verbose(LogCategory.D3D9, `SetRenderTarget(index=${renderTargetIndex}, surface=NULL)`);
+            return D3D_OK;
+        }
+
+        // Re-binding the surface that is already bound is the common case in a title with
+        // render-to-texture passes (NFS Underground does ~150 SetRenderTarget a frame at max
+        // detail, and it was the single most expensive thunk at 4 ms/frame). D3D9 owes only
+        // the viewport reset for it, so answer that without re-validating the surface, the
+        // multisample type, the standalone-depth policy and the GPU texture. The generation
+        // guard is what keeps a rebind from skipping an ensureTexture the device now needs.
+        if (getDeviceRenderTarget(devicePtr, renderTargetIndex) === surfacePtr
+            && device.redundantRenderTargetOk(renderTargetIndex, rtFastPathGeneration.get(devicePtr) ?? -1)) {
+            device.noteRedundantRenderTarget(renderTargetIndex);
             return D3D_OK;
         }
 
@@ -607,13 +837,15 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         const face = meta?.face ?? -1;
         device.noteRtResolve(surfacePtr, true, texturePtr);
         Logger.verboseLazy(LogCategory.D3D9, () => `SetRenderTarget(index=${renderTargetIndex}, surface=0x${surfacePtr.toString(16)} -> tex=0x${texturePtr.toString(16)} face=${face})`);
+        const result = device.setRenderTarget(renderTargetIndex, texturePtr >>> 0, face, meta.multiSampleType);
+        if (result !== D3D_OK) return result;
         if (getDeviceRenderTarget(devicePtr, renderTargetIndex) !== surfacePtr) {
             rebindSurfaceSlot(devicePtr, renderTargetSlot(renderTargetIndex), surfacePtr);
             setDeviceRenderTarget(devicePtr, renderTargetIndex, surfacePtr);
         }
-        if (renderTargetIndex === 0) {
-            device.setRenderTarget(0, texturePtr >>> 0, face);
-        }
+        // The generation this binding was validated against; the fast path above only trusts
+        // itself while the device still reports the same one.
+        rtFastPathGeneration.set(devicePtr, device.getGpuResourceGeneration());
         return D3D_OK;
     };
 
@@ -677,9 +909,9 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
 
     exports['IDirect3DDevice9_Clear'] = (ctx, mem, args) => {
         const pDevice = args[0];
-        const Count = args[1];
-        const pRects = args[2];
-        const Flags = args[3];
+        const Count = args[1] >>> 0;
+        const pRects = args[2] >>> 0;
+        const Flags = args[3] >>> 0;
         const Color = args[4];
         
         // Bitcast u32 to f32 for the Z parameter
@@ -697,19 +929,47 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
 
         Logger.verbose(LogCategory.D3D9, `Clear(Count=${Count}, Flags=0x${Flags.toString(16)}, Color=0x${Color.toString(16)}, Z=${Z}, Stencil=${Stencil})`);
 
-        // A rect list makes Clear a SCISSORED clear: only those rectangles are touched, and
-        // everything already drawn outside them survives. We clear the whole attachment
-        // (WebGPU's loadOp has no sub-rect form; a scissored clear has to be a draw), so a
-        // guest that fills one UI panel this way has its entire frame wiped instead — the
-        // screen becomes one flat fill in this call's colour with only later draws on it.
-        // Say so: the wipe is invisible in every other instrument, and D3D_OK is the answer
-        // either way. `colorFillSurface` refuses its twin case for the same reason.
+        // Count 0 with a non-NULL rect array is an explicit "nothing to clear", not a
+        // whole-target clear: an engine that computed no dirty rect still passes its array.
+        if (Count === 0 && pRects) return D3D_OK;
+
+        // D3DCLEAR_ZBUFFER/STENCIL without a bound depth-stencil (implicit auto-DS included)
+        // is an invalid call, not a silently-successful colour-only clear.
+        if ((Flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL)) !== 0
+            && !(deviceBoundDepthStencil.get(pDevice) ?? 0)) {
+            return D3DERR_INVALIDCALL;
+        }
+
+        // A rect list makes Clear a scissored clear. The backend lowers color with a solid-fill
+        // pass and depth/stencil with an attachment-only load/store pass. Never fall back to the
+        // frame-level loadOp path here: loadOp ignores scissor and would clear the whole target.
         if (Count > 0 && pRects) {
-            const first = Mem.readInt32(pRects) ?? 0;
+            // Count is guest-supplied: validate the whole array extent before iterating it,
+            // so a garbage count cannot spin the worker through gigabytes of reads.
+            const rectBytes = Count * 16;
+            if (pRects + rectBytes > mem.byteLength || !isValidAddress(mem, pRects, rectBytes, 'r')) {
+                return D3DERR_INVALIDCALL;
+            }
+            const rects: Array<{ left: number; top: number; right: number; bottom: number }> = [];
+            for (let i = 0; i < Count; i++) {
+                const p = pRects + i * 16;
+                const left = Mem.readInt32(p);
+                const top = Mem.readInt32(p + 4);
+                const right = Mem.readInt32(p + 8);
+                const bottom = Mem.readInt32(p + 12);
+                if (left === null || top === null || right === null || bottom === null) {
+                    return D3DERR_INVALIDCALL;
+                }
+                // An empty rect clears nothing and must not fail the rects that follow it.
+                if (right <= left || bottom <= top) continue;
+                rects.push({ left, top, right, bottom });
+            }
+            if (rects.length === 0) return D3D_OK;
+            if (device.clearTargetRects(rects, Color, Flags, Z, Stencil)) return D3D_OK;
             Logger.warn(LogCategory.D3D9,
-                `Clear: ${Count} rect(s) IGNORED — clearing the whole target instead ` +
-                `(flags=0x${Flags.toString(16)}, first.x1=${first}); anything drawn outside ` +
-                `those rects this frame is being wiped`);
+                `Clear: ${Count} rect(s) cannot be lowered for attachment flags ` +
+                `(flags=0x${Flags.toString(16)}); refusing rather than issuing a full clear`);
+            return D3DERR_NOTAVAILABLE;
         }
 
         // Clear expects ARGB color as single number
@@ -736,11 +996,6 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         if (resourceToDevice.get(pSrcSurface) !== device || resourceToDevice.get(pDstSurface) !== device) {
             return D3DERR_INVALIDCALL;
         }
-        if ((srcMeta.usage & D3DUSAGE_DEPTHSTENCIL) !== 0 ||
-            (dstMeta.usage & D3DUSAGE_RENDERTARGET) === 0) {
-            return D3DERR_INVALIDCALL;
-        }
-
         const readRect = (ptr: number, width: number, height: number) => {
             const rect = ptr ? {
                 left: Mem.readInt32(ptr) ?? 0,
@@ -755,16 +1010,32 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         const srcRect = readRect(pSrcRect, srcMeta.width, srcMeta.height);
         const dstRect = readRect(pDstRect, dstMeta.width, dstMeta.height);
         if (!srcRect || !dstRect) return D3DERR_INVALIDCALL;
+        const copyPolicy = resolveD3D9StretchRectPolicy(
+            srcMeta,
+            dstMeta,
+            filter,
+            srcRect,
+            dstRect,
+        );
+        if (!copyPolicy.supported) return D3DERR_INVALIDCALL;
 
         const endpoint = (meta: typeof srcMeta) => meta.texturePtr ? {
             texturePtr: meta.texturePtr,
             face: meta.face ?? -1,
             width: meta.width,
             height: meta.height,
+            multiSampleType: meta.multiSampleType,
+            offscreenPlain: meta.offscreenPlain === true,
         } : null;
-        if (device.stretchRect(endpoint(srcMeta), endpoint(dstMeta), srcRect, dstRect, filter === 2)) {
-            return D3D_OK;
+        const result = device.stretchRect(endpoint(srcMeta), endpoint(dstMeta), srcRect, dstRect, filter === 2);
+        // RT→offscreen readback is asynchronous on WebGPU (copyTextureToBuffer
+        // + mapAsync), while D3D9's thunk may still return a Promise to the
+        // dispatcher.  Do not report success before the destination bytes have
+        // actually been written.
+        if (result && typeof (result as Promise<boolean>).then === 'function') {
+            return ((result as Promise<boolean>).then((ok): number => ok ? D3D_OK : D3DERR_INVALIDCALL) as Promise<number>);
         }
+        if (result) return D3D_OK;
         if ((stretchRectFailures++ & 0xff) === 0) {
             Logger.warn(LogCategory.D3D9,
                 `StretchRect failed src=0x${pSrcSurface.toString(16)}(tex=0x${(srcMeta.texturePtr ?? 0).toString(16)}) ` +
@@ -779,8 +1050,8 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
     //  - an OFFSCREEN surface → the backend fills that texture. This is how an engine that
     //    composes its 2D layer into a render target erases the layer between frames, and
     //    dropping it makes every frame's UI accumulate on top of the last.
-    // What is still not expressible is a SUB-RECT of a render target (no scissored fill
-    // pipeline); that one is reported, not silently swallowed.
+    // Both implicit-backbuffer and single-sample render-target sub-rects use the executor's
+    // load/scissor solid-fill pass; unsupported targets are still reported, not swallowed.
     let colorFillDropped = 0;
     exports['IDirect3DDevice9_ColorFill'] = (_ctx, _mem, args) => {
         const device = devices.get(args[0]);
@@ -812,7 +1083,7 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
             device.clear(D3DCLEAR_TARGET, color, 1, 0);
             return D3D_OK;
         }
-        if (!isBackbuffer && device.colorFillSurface(texturePtr, rect, color)) {
+        if (device.colorFillSurface(texturePtr, rect, color)) {
             return D3D_OK;
         }
         // Rate-limited by COUNT, not by a once-per-session latch: a latch fires during the
@@ -824,7 +1095,10 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
                 `backbuffer=${isBackbuffer}, fullRect=${fullRect}, pendingWork=${device.hasPendingWork()}) — ` +
                 `fill dropped (${colorFillDropped} so far)`);
         }
-        return D3D_OK;
+        // Do not report success after dropping a fill. ColorFill has no useful
+        // fallback for an unsupported target/rect, and callers commonly use the
+        // HRESULT to decide whether the surface contents are now authoritative.
+        return D3DERR_NOTAVAILABLE;
     };
 
     exports['IDirect3DDevice9_SetScissorRect'] = (_ctx, _mem, args) => {
@@ -866,9 +1140,34 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
             return D3DERR_INVALIDCALL;
         }
 
+        const validated = validateDevicePresent(
+            pDevice >>> 0,
+            mem,
+            pSourceRect >>> 0,
+            pDestRect >>> 0,
+            hDestWindowOverride >>> 0,
+            pDirtyRegion >>> 0,
+            0,
+        );
+        if (validated !== D3D_OK) return validated;
+
         Logger.verbose(LogCategory.D3D9, 'Present');
         // Return Promise so dispatcher awaits → guest blocks during throttle wait (no "infinite FPS" spin).
-        return device.present();
+        return device.present().then((hr) => {
+            if (hr !== D3D_OK) return hr;
+            const recorded = recordDevicePresent(
+                pDevice >>> 0,
+                mem,
+                pSourceRect >>> 0,
+                pDestRect >>> 0,
+                hDestWindowOverride >>> 0,
+                pDirtyRegion >>> 0,
+                0,
+            );
+            if (recorded !== D3D_OK) return recorded;
+            notifyDeviceSubmission(pDevice >>> 0);
+            return hr;
+        }) as any;
     };
 
     exports['IDirect3DDevice9_DrawPrimitive'] = (ctx, mem, args) => {
@@ -954,6 +1253,16 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         return D3D_OK;
     };
 
+    // Patch/tessellation is not advertised by our D3DCAPS9 contract. Keep the
+    // handlers explicit so an unsupported call cannot fall through the generic
+    // thunk and be mistaken for a successful draw.
+    exports['IDirect3DDevice9_DrawRectPatch'] = (_ctx, _mem, args) =>
+        devices.has(args[0] >>> 0) ? D3DERR_NOTAVAILABLE : D3DERR_INVALIDCALL;
+    exports['IDirect3DDevice9_DrawTriPatch'] = (_ctx, _mem, args) =>
+        devices.has(args[0] >>> 0) ? D3DERR_NOTAVAILABLE : D3DERR_INVALIDCALL;
+    exports['IDirect3DDevice9_DeletePatch'] = (_ctx, _mem, args) =>
+        devices.has(args[0] >>> 0) ? D3DERR_NOTAVAILABLE : D3DERR_INVALIDCALL;
+
     exports['IDirect3DDevice9_GetDeviceCaps'] = (_ctx, _mem, args) => {
         const pDevice = args[0];
         const pCaps = args[1];
@@ -996,12 +1305,15 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
 
     exports['IDirect3DDevice9_GetDisplayMode'] = (_ctx, _mem, args) => {
         const pDevice = args[0];
-        const _iSwapChain = args[1];
+        const iSwapChain = args[1] >>> 0;
         const pMode = args[2];
         const device = devices.get(pDevice);
         if (!device || !pMode) {
             return D3DERR_INVALIDCALL;
         }
+        if (iSwapChain !== 0) return D3DERR_INVALIDCALL;
+        const chain = getDeviceSwapChain(pDevice >>> 0, iSwapChain);
+        if (!chain) return D3DERR_INVALIDCALL;
 
         // A FULLSCREEN device mode-set the display to its own backbuffer, so that is the
         // display mode; a WINDOWED one is a guest of the desktop mode. Answering the
@@ -1049,15 +1361,18 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         const type = args[3] >>> 0;
         const ppBackBuffer = args[4];
 
+        initReturnPtr(ppBackBuffer);
         const device = devices.get(pDevice);
         if (!device || !ppBackBuffer) {
             Logger.error(LogCategory.D3D9, `GetBackBuffer: invalid args device=${pDevice} pp=0x${(ppBackBuffer ?? 0).toString(16)}`);
             return D3DERR_INVALIDCALL;
         }
-        // One implicit swap chain; D3DBACKBUFFER_TYPE_MONO is the only legal type.
-        if (iSwapChain !== 0 || type !== D3DBACKBUFFER_TYPE_MONO) return D3DERR_INVALIDCALL;
-
-        const surfacePtr = ensureImplicitBackBuffer(pDevice, device, iSwapChain, iBackBuffer);
+        // D3DBACKBUFFER_TYPE_MONO is the only legal type.  Additional chains
+        // are intentionally rejected here, matching DXVK's device contract.
+        if (type !== D3DBACKBUFFER_TYPE_MONO || iSwapChain !== 0) return D3DERR_INVALIDCALL;
+        const chain = getDeviceSwapChain(pDevice, 0);
+        if (!chain || iBackBuffer >= chain.backBuffers.length) return D3DERR_INVALIDCALL;
+        const surfacePtr = chain.backBuffers[iBackBuffer];
         if (!surfacePtr) return D3DERR_INVALIDCALL;
         addComRef(surfacePtr);
         if (!Mem.writeUint32(ppBackBuffer, surfacePtr)) {
@@ -1084,8 +1399,22 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
             }
         }
 
+        const depthMeta = pNewZStencil ? surfaceMeta.get(pNewZStencil) : null;
+        const bindResult = depthMeta && depthMeta.texturePtr
+            ? device.setDepthStencilTexture(depthMeta.texturePtr)
+            : depthMeta
+                ? device.setDepthStencilSurface(
+                    pNewZStencil,
+                    depthMeta.width,
+                    depthMeta.height,
+                    depthMeta.format,
+                    depthMeta.multiSampleType,
+                )
+                : device.setDepthStencilTexture(0);
+        if (bindResult !== 0) return bindResult;
         const previous = deviceBoundDepthStencil.get(pDevice) ?? 0;
         if (previous !== pNewZStencil) {
+            // Backend flushes the old attachment before this releases its owning COM ref.
             rebindSurfaceSlot(pDevice, 'ds', pNewZStencil);
             if (pNewZStencil) deviceBoundDepthStencil.set(pDevice, pNewZStencil);
             else deviceBoundDepthStencil.delete(pDevice);

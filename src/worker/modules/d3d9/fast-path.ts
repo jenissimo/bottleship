@@ -28,8 +28,23 @@
  */
 
 import { Logger, LogCategory } from '../../core/logger';
-import { devices, stateBlocks, resourceToDevice } from './shared-state';
+import { isValidAddress } from '../../core/memory/address-guard';
+import { Mem } from '../../core/memory/mem-accessor';
+import { devices, stateBlocks, resourceToDevice, addComRef } from './shared-state';
 import { addD3D9ComRef, releaseD3D9ComRef } from './state';
+import { tryFastGetData } from './query';
+import {
+    D3DSURFACE_DESC_SIZE,
+    ensureTextureLevelSurface,
+    packSurfaceDesc,
+    surfaceMeta,
+    textureMeta,
+} from './resource-registry';
+import {
+    peekDxDepthStencilMatch,
+    peekDxDeviceFormat,
+    peekDxDeviceMultiSampleType,
+} from '../../backends/webgpu/shared/dx-format-support';
 import {
     resolveVertexShaderComPtr,
     resolvePixelShaderComPtr,
@@ -52,6 +67,95 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
         return;
     }
 
+    // DebugSetMute is a debug no-op the D3D9 debug runtime uses to silence its own
+    // spew; the retail runtime does nothing with it. Far Cry calls it ~80K times over a
+    // level load. A constant-return stub answers it in guest code, so it costs no trap
+    // at all. cdecl => the caller cleans the stack, so popBytes is 0.
+    if (typeof dispatcher.registerConstantReturnStub === 'function') {
+        dispatcher.registerConstantReturnStub('d3d9', 'DebugSetMute', 0, 0);
+    }
+
+    // ── Capability queries (memo hits only) ──────────────────────────────────
+    // CheckDeviceFormat/MultiSampleType/DepthStencilMatch are pure in their args and the
+    // runtime capability contracts, and engines re-ask them per texture (Far Cry: ~94K over
+    // one level load). A hit is a Map get; a MISS returns null so the first call for each
+    // key still takes the full thunk — which is what logs it. Kill-switch (A/B, boot-time):
+    // globalThis.__noCapsMemo, which also stops dx-format-support filling the memo.
+    if (!(globalThis as any).__noCapsMemo) {
+        // CheckDeviceFormat(this, Adapter, DeviceType, AdapterFormat, Usage, RType, CheckFormat)
+        dispatcher.registerFastPath('d3d9', 'IDirect3D9_CheckDeviceFormat', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number | null => {
+            const esp = cpu.reg32[4];
+            return peekDxDeviceFormat(9,
+                view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 16, true),
+                view.getUint32(esp + 20, true), view.getUint32(esp + 24, true), view.getUint32(esp + 28, true));
+        }, { trivial: true });
+
+        // CheckDeviceMultiSampleType(this, Adapter, DeviceType, SurfaceFormat, Windowed,
+        //                            MultiSampleType, pQualityLevels)
+        dispatcher.registerFastPath('d3d9', 'IDirect3D9_CheckDeviceMultiSampleType', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number | null => {
+            const esp = cpu.reg32[4];
+            const hr = peekDxDeviceMultiSampleType(9,
+                view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 16, true),
+                view.getUint32(esp + 20, true), view.getUint32(esp + 24, true));
+            if (hr === null) return null;
+            // Out-param write comes after the answer, so a deferral touches nothing. Mem
+            // validates it against the region map, exactly as the thunk does.
+            const pQualityLevels = view.getUint32(esp + 28, true) >>> 0;
+            if (pQualityLevels) Mem.writeUint32(pQualityLevels, hr === D3D_OK ? 1 : 0);
+            return hr;
+        }, { trivial: true });
+
+        // CheckDepthStencilMatch(this, Adapter, DeviceType, AdapterFormat, RTFormat, DSFormat)
+        dispatcher.registerFastPath('d3d9', 'IDirect3D9_CheckDepthStencilMatch', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number | null => {
+            const esp = cpu.reg32[4];
+            return peekDxDepthStencilMatch(9,
+                view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 16, true),
+                view.getUint32(esp + 20, true), view.getUint32(esp + 24, true));
+        }, { trivial: true });
+    }
+
+    // ── The level-load census: the three highest-count d3d9 reads ────────────
+    // IDirect3DQuery9_GetData(this, pData, dwSize, dwGetDataFlags) — 298K calls over one
+    // Far Cry level load, almost all of them one turn of the guest's poll loop. The
+    // ANSWER is unchanged (query.ts owns it); only the dispatch cost goes away.
+    dispatcher.registerFastPath('d3d9', 'IDirect3DQuery9_GetData', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number | null => {
+        const esp = cpu.reg32[4];
+        return tryFastGetData(
+            view.getUint32(esp + 4, true), view.getUint32(esp + 8, true),
+            view.getUint32(esp + 12, true), view.getUint32(esp + 16, true));
+    }, { trivial: true });
+
+    // IDirect3DSurface9_GetDesc(this, pDesc) — a pure read of the surface registry.
+    dispatcher.registerFastPath('d3d9', 'IDirect3DSurface9_GetDesc', (cpu: any, mem: Uint8Array, _mem32: Uint32Array, view: DataView): number | null => {
+        const esp = cpu.reg32[4];
+        const meta = surfaceMeta.get(view.getUint32(esp + 4, true));
+        if (!meta) return null;
+        const pDesc = view.getUint32(esp + 8, true) >>> 0;
+        // Validate the WHOLE extent against the region map once, then write through the
+        // hoisted view: a bounds test alone cannot see that pDesc is THUNK_CODE or read-only.
+        if (!pDesc || !isValidAddress(mem, pDesc, D3DSURFACE_DESC_SIZE, "rw")) return null;
+        const words = packSurfaceDesc(meta);
+        for (let i = 0; i < words.length; i++) view.setUint32(pDesc + i * 4, words[i]!, true);
+        return D3D_OK;
+    }, { trivial: true });
+
+    // IDirect3DTexture9_GetSurfaceLevel(this, Level, ppSurfaceLevel) — two Map gets plus an
+    // AddRef of the TEXTURE (D3D9 subresource surfaces have no refcount of their own).
+    dispatcher.registerFastPath('d3d9', 'IDirect3DTexture9_GetSurfaceLevel', (cpu: any, mem: Uint8Array, _mem32: Uint32Array, view: DataView): number | null => {
+        const esp = cpu.reg32[4];
+        const pTexture = view.getUint32(esp + 4, true);
+        const level = view.getUint32(esp + 8, true) >>> 0;
+        const ppSurfaceLevel = view.getUint32(esp + 12, true) >>> 0;
+        if (!ppSurfaceLevel || !isValidAddress(mem, ppSurfaceLevel, 4, "rw")) return null;
+        const meta = textureMeta.get(pTexture);
+        if (!meta || meta.isCube || level >= meta.levels) return null;
+        const surfacePtr = ensureTextureLevelSurface(pTexture, level);
+        if (!surfacePtr) return null;
+        view.setUint32(ppSurfaceLevel, surfacePtr >>> 0, true);
+        addComRef(pTexture);
+        return D3D_OK;
+    }, { trivial: true });
+
     // ========================================================================
     // FastPath registrations (OUT-trap path: ring-overflow fallback + the only
     // path for the capture-at-call shader-constant setters).
@@ -64,8 +168,12 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
     dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetRenderState', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
         const esp = cpu.reg32[4];
         const device = devices.get(view.getUint32(esp + 4, true));
-        if (device) device.setRenderState(view.getUint32(esp + 8, true), view.getUint32(esp + 12, true));
-        return D3D_OK;
+        if (!device) return D3DERR_INVALIDCALL;
+        const state = view.getUint32(esp + 8, true);
+        // Same contract as the thunk: a selector outside the D3D9 table is a
+        // successful no-op, so both paths answer one guest call identically.
+        if (state >= 256) return D3D_OK;
+        return device.setRenderState(state, view.getUint32(esp + 12, true));
     }, { trivial: true });
 
     // IDirect3DDevice9_SetTransform(thisPtr, State, pMatrix)
@@ -96,8 +204,8 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
     dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetSamplerState', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
         const esp = cpu.reg32[4];
         const device = devices.get(view.getUint32(esp + 4, true));
-        if (device) device.setSamplerState(view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 16, true));
-        return D3D_OK;
+        if (!device) return D3DERR_INVALIDCALL;
+        return device.setSamplerState(view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 16, true));
     }, { trivial: true });
 
     // IDirect3DDevice9_SetTexture(thisPtr, Stage, pTexture)
@@ -432,27 +540,63 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
             if (device) device.setFVF(mem32[(ptr + 4) >> 2]);
         }, true, 0x1);
 
-    // SetVertexShader (2 args) — resolve COM ptr → internal handle at drain.
-    dispatcher.registerWriteBufferFunction('d3d9', 'IDirect3DDevice9_SetVertexShader', 2,
-        (_mem8: Uint8Array, mem32: Uint32Array, ptr: number) => {
-            const device = devices.get(mem32[ptr >> 2]);
-            if (!device) return;
-            const pShader = mem32[(ptr + 4) >> 2];
-            if (pShader === 0) { device.setVertexShader(0, 0); return; }
-            const meta = resolveVertexShaderComPtr(pShader);
-            if (meta) device.setVertexShader(meta.internalHandle, pShader);
-        }, true, 0x1);
+    // SetVertexShader / SetPixelShader (2 args) — resolve COM ptr → internal handle at drain.
+    // Guest-side value shadow, single slot: the whole setter is one piece of state. A title
+    // sets a shader per DRAW from its material table and almost never changes it (NFS
+    // Underground: 3.5M calls, 38 real changes), so without the shadow every one of those is
+    // an OUT trap that resolves to "unchanged". Coherence comes from the device mirroring
+    // every real change back (d3d9-device.syncSetterShadow), which also covers the paths that
+    // bypass the trampoline — state-block Apply above all.
+    const vsHandler = (_mem8: Uint8Array, mem32: Uint32Array, ptr: number) => {
+        const device = devices.get(mem32[ptr >> 2]);
+        if (!device) return;
+        const pShader = mem32[(ptr + 4) >> 2];
+        if (pShader === 0) { device.setVertexShader(0, 0); return; }
+        const meta = resolveVertexShaderComPtr(pShader);
+        if (meta) device.setVertexShader(meta.internalHandle, pShader);
+        else device.resyncVertexShaderShadow();
+    };
+    const psHandler = (_mem8: Uint8Array, mem32: Uint32Array, ptr: number) => {
+        const device = devices.get(mem32[ptr >> 2]);
+        if (!device) return;
+        const pShader = mem32[(ptr + 4) >> 2];
+        if (pShader === 0) { device.setPixelShader(0, 0); return; }
+        const meta = resolvePixelShaderComPtr(pShader);
+        if (meta) device.setPixelShader(meta.internalHandle, pShader);
+        else device.resyncPixelShaderShadow();
+    };
+    const singleSlotShadow = { argCount: 2, valueArgIndex: 1, slotCount: 1, keyParts: [] };
+    // The three COM-pointer setters shadow only under an explicit opt-in. They are inert on
+    // the EAGL path (that HLE writes the ring itself and carries shadow tables for the scalar
+    // setters only), and registering them changes when d3d9 stubs are (re)patched relative to
+    // the EAGL token-dispatch config that caches funcIds — which is where NFSU now takes a
+    // guest OOB inside apply_reg_int. Off by default until that interaction is understood.
+    const ptrShadow = regShadowed && !!(globalThis as { __d3d9PtrShadow?: boolean }).__d3d9PtrShadow;
+    if (ptrShadow) {
+        dispatcher.registerShadowedWriteBufferFunction('d3d9', 'IDirect3DDevice9_SetVertexShader', 2,
+            vsHandler, 0x1, singleSlotShadow);
+        dispatcher.registerShadowedWriteBufferFunction('d3d9', 'IDirect3DDevice9_SetPixelShader', 2,
+            psHandler, 0x1, singleSlotShadow);
+    } else {
+        dispatcher.registerWriteBufferFunction('d3d9', 'IDirect3DDevice9_SetVertexShader', 2, vsHandler, true, 0x1);
+        dispatcher.registerWriteBufferFunction('d3d9', 'IDirect3DDevice9_SetPixelShader', 2, psHandler, true, 0x1);
+    }
 
-    // SetPixelShader (2 args)
-    dispatcher.registerWriteBufferFunction('d3d9', 'IDirect3DDevice9_SetPixelShader', 2,
-        (_mem8: Uint8Array, mem32: Uint32Array, ptr: number) => {
-            const device = devices.get(mem32[ptr >> 2]);
-            if (!device) return;
-            const pShader = mem32[(ptr + 4) >> 2];
-            if (pShader === 0) { device.setPixelShader(0, 0); return; }
-            const meta = resolvePixelShaderComPtr(pShader);
-            if (meta) device.setPixelShader(meta.internalHandle, pShader);
-        }, true, 0x1);
+    // SetTexture (3 args) — slot = Stage. The pixel stages 0..15 shadow; the vertex-texture
+    // window (257+) is out of the guarded range and falls through to the ring by construction.
+    // Three quarters of a title's SetTexture calls re-bind what is already bound.
+    const setTextureHandler = (_mem8: Uint8Array, mem32: Uint32Array, ptr: number) => {
+        const device = devices.get(mem32[ptr >> 2]);
+        if (device) device.setTexture(mem32[(ptr + 4) >> 2], mem32[(ptr + 8) >> 2]);
+    };
+    if (ptrShadow) {
+        dispatcher.registerShadowedWriteBufferFunction('d3d9', 'IDirect3DDevice9_SetTexture', 3,
+            setTextureHandler, 0x3,
+            { argCount: 3, valueArgIndex: 2, slotCount: 16, keyParts: [{ argIndex: 1, shift: 0, max: 16 }] });
+    } else {
+        dispatcher.registerWriteBufferFunction('d3d9', 'IDirect3DDevice9_SetTexture', 3,
+            setTextureHandler, true, 0x3);
+    }
 
     // SetTextureStageState (4 args) — scalar FFP setter, same shape as SetSamplerState.
     dispatcher.registerWriteBufferFunction('d3d9', 'IDirect3DDevice9_SetTextureStageState', 4,

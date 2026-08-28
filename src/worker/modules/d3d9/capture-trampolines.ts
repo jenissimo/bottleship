@@ -121,6 +121,10 @@ export function writeShadowTrampoline(
     }
 
     // Compute shadow slot into EDX = OR over keyParts of (arg[part] range-guarded) << shift.
+    // A spec with no key parts is a SINGLE-slot shadow (the whole setter is one piece of
+    // state, e.g. SetVertexShader): EDX must still be zeroed — it holds the caller's value
+    // at this point, and the compare below indexes the table with it.
+    if (keyParts.length === 0) { w8(0x31); w8(0xD2); }  // xor edx, edx
     for (let pi = 0; pi < keyParts.length; pi++) {
         const part = keyParts[pi];
         if (pi === 0) {

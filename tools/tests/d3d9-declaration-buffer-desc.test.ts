@@ -25,6 +25,7 @@ import { devices } from "../../src/worker/modules/d3d9/shared-state";
 
 const D3D_OK = 0;
 const D3DERR_INVALIDCALL = 0x8876086c;
+const D3DERR_NOTAVAILABLE = 0x8876086a;
 const ELEMENT_SIZE = 8;
 const POISON = 0xdeadbeef;
 
@@ -139,6 +140,17 @@ describe("IDirect3DVertexDeclaration9::GetDeclaration", () => {
 });
 
 describe("buffer descriptors and the ProcessVertices destination check", () => {
+    test("buffer creation rejects zero byte stores and non-index formats atomically", () => {
+        poison(OUT_BUF, 1);
+        expect(call(resources, "IDirect3DDevice9_CreateVertexBuffer", DEVICE_PTR, 0, 0, 0, 0, OUT_BUF))
+            .toBe(D3DERR_INVALIDCALL);
+        expect(view.getUint32(OUT_BUF, true)).toBe(0);
+        poison(OUT_BUF, 1);
+        expect(call(resources, "IDirect3DDevice9_CreateIndexBuffer", DEVICE_PTR, 4, 0, 21, 0, OUT_BUF))
+            .toBe(D3DERR_INVALIDCALL);
+        expect(view.getUint32(OUT_BUF, true)).toBe(0);
+    });
+
     test("IDirect3DVertexBuffer9::GetDesc reports what CreateVertexBuffer was given", () => {
         vertexBufferMeta.set(VB_PTR, { size: 4096, usage: 0x200, pool: 1, fvf: 0x112 });
         expect(call(resources, "IDirect3DVertexBuffer9_GetDesc", VB_PTR, OUT_BUF)).toBe(D3D_OK);
@@ -165,9 +177,9 @@ describe("buffer descriptors and the ProcessVertices destination check", () => {
         expect(call(resources, "IDirect3DIndexBuffer9_GetDesc", 0x9999, OUT_BUF)).toBe(D3DERR_INVALIDCALL);
     });
 
-    test("ProcessVertices accepts a registered destination and rejects an unknown one", () => {
+    test("ProcessVertices refuses until the CPU vertex pipeline is available", () => {
         vertexBufferMeta.set(VB_PTR, { size: 4096, usage: 0, pool: 0, fvf: 0 });
-        expect(call(state, "IDirect3DDevice9_ProcessVertices", DEVICE_PTR, 0, 0, 8, VB_PTR, 0, 0)).toBe(D3D_OK);
+        expect(call(state, "IDirect3DDevice9_ProcessVertices", DEVICE_PTR, 0, 0, 8, VB_PTR, 0, 0)).toBe(D3DERR_NOTAVAILABLE);
         expect(call(state, "IDirect3DDevice9_ProcessVertices", DEVICE_PTR, 0, 0, 8, 0x9999, 0, 0))
             .toBe(D3DERR_INVALIDCALL);
     });

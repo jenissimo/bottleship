@@ -4,6 +4,7 @@
 
 import { Mem } from '../../core/memory/mem-accessor';
 import { Logger, LogCategory } from '../../core/logger';
+import { System } from '../../core/system';
 import {
     devices,
     getVTables,
@@ -12,11 +13,14 @@ import {
     registerDeviceChildFinalizer,
     releaseComRef,
     resourceToDevice,
+    getComRefCount,
 } from './shared-state';
 import { D3D9Device } from '../../backends/webgpu/d3d9/d3d9-device';
 import { initReturnPtr, D3DFMT_UNKNOWN, normalizePalettizedTexturePool } from '../../backends/webgpu/shared/dx-com-helpers';
 import { isDxExclusiveFormat } from '../../backends/webgpu/shared/dx-format-support';
 import { resetDeviceCursor } from '../../core/device-cursor';
+import { clearResourceContract, resetResourceContract } from './resource-contract';
+import { volumeTextureResources } from './volume-resources';
 
 export type TextureMeta = {
     width: number;
@@ -35,6 +39,10 @@ export type BufferMeta = {
     pool: number;
     fvf?: number;
     format?: number;
+    /** Guest return address of the CreateXxx call — who owns this resource. */
+    createdBy?: number;
+    /** Creation order among DEFAULT-pool buffers — pins WHEN a survivor was made. */
+    seq?: number;
 };
 
 export type SurfaceMeta = {
@@ -51,7 +59,41 @@ export type SurfaceMeta = {
     /** Cube-face index (0..5, D3DCUBEMAP_FACES order) when this surface is a cube map face.
      *  Disambiguates a cube face from a plain 2D mip surface (which uses texturePtr+level only). */
     face?: number;
+    /** Semantic owner for StretchRect legality; true only for an offscreen plain surface. */
+    offscreenPlain?: boolean;
+    /** One of the DEVICE's implicit swap-chain back buffers. Reset redeclares these, so they
+     *  can never be what blocks it — and the identity has to live on the surface, because the
+     *  device-side registry that used to answer this is itself torn down across a Reset. */
+    implicitBackBuffer?: boolean;
+    /** Surface was created by a device Create*Surface call and has no D3D9
+     * resource parent, even if the implementation uses a hidden texture for
+     * CPU/GPU storage. */
+    standalone?: boolean;
+    /** Whether the surface was explicitly created with CPU lockability. */
+    lockable?: boolean;
 };
+
+/** sizeof(D3DSURFACE_DESC) — eight DWORDs. */
+export const D3DSURFACE_DESC_SIZE = 32;
+
+const surfaceDescWords = new Uint32Array(8);
+
+/**
+ * The D3DSURFACE_DESC field order, in one place: the thunk writes these words through Mem
+ * and the fast path through a DataView, and neither may spell the layout itself. The
+ * returned view is reused, so consume it before the next call.
+ */
+export function packSurfaceDesc(meta: SurfaceMeta): Uint32Array {
+    surfaceDescWords[0] = meta.format >>> 0;
+    surfaceDescWords[1] = meta.type >>> 0;
+    surfaceDescWords[2] = meta.usage >>> 0;
+    surfaceDescWords[3] = meta.pool >>> 0;
+    surfaceDescWords[4] = meta.multiSampleType >>> 0;
+    surfaceDescWords[5] = meta.multiSampleQuality >>> 0;
+    surfaceDescWords[6] = meta.width >>> 0;
+    surfaceDescWords[7] = meta.height >>> 0;
+    return surfaceDescWords;
+}
 
 export const textureMeta: Map<number, TextureMeta> = new Map();
 export const surfaceMeta: Map<number, SurfaceMeta> = new Map();
@@ -107,8 +149,140 @@ export function takeAllDeviceSlotRefs(devicePtr: number): number[] {
  */
 const deviceBackBufferSurfaces: Map<number, Map<string, number>> = new Map();
 
+/** True for the implicit swap-chain surfaces owned by the device.  They are recreated by
+ * Reset and therefore must not make an otherwise clean device look like it still owns an
+ * application-created D3DPOOL_DEFAULT resource. */
+function isImplicitBackBufferSurface(surfacePtr: number): boolean {
+    const ptr = surfacePtr >>> 0;
+    for (const surfaces of deviceBackBufferSurfaces.values()) {
+        for (const candidate of surfaces.values()) if ((candidate >>> 0) === ptr) return true;
+    }
+    return false;
+}
+
+export interface DefaultPoolResourceSummary {
+    textures: number;
+    volumes: number;
+    vertexBuffers: number;
+    indexBuffers: number;
+    surfaces: number;
+    total: number;
+}
+
+/**
+ * Enumerate application-owned DEFAULT-pool resources for Reset's precondition.
+ *
+ * D3D9 Reset is not a convenient GPU-loss recovery shortcut: every DEFAULT resource
+ * (apart from the implicit swap-chain attachments) must have been released first.  The
+ * old path reset the presentation state while silently retaining those objects, so a
+ * title that correctly waited for INVALIDCALL could never diagnose the real ownership
+ * error.  Keep this census in the metadata authority rather than trying to infer pool
+ * from the backend's CPU shadows.
+ */
+export function summarizeDefaultPoolResources(device: D3D9Device): DefaultPoolResourceSummary {
+    const out: DefaultPoolResourceSummary = {
+        textures: 0, volumes: 0, vertexBuffers: 0, indexBuffers: 0, surfaces: 0, total: 0,
+    };
+    for (const [ptr, meta] of textureMeta) {
+        if (meta.pool === 0 && resourceToDevice.get(ptr) === device) out.textures++;
+    }
+    for (const [ptr, meta] of volumeTextureResources) {
+        if (meta.pool === 0 && resourceToDevice.get(ptr) === device) out.volumes++;
+    }
+    for (const [ptr, meta] of vertexBufferMeta) {
+        if (meta.pool === 0 && resourceToDevice.get(ptr) === device) out.vertexBuffers++;
+    }
+    for (const [ptr, meta] of indexBufferMeta) {
+        if (meta.pool === 0 && resourceToDevice.get(ptr) === device) out.indexBuffers++;
+    }
+    const bound = new Set<number>();
+    for (const ptr of deviceBoundDepthStencil.values()) bound.add(ptr >>> 0);
+    for (const targets of deviceBoundRenderTarget.values()) {
+        for (const ptr of targets.values()) bound.add(ptr >>> 0);
+    }
+    for (const [ptr, meta] of surfaceMeta) {
+        if (meta.pool !== 0 || meta.texturePtr !== undefined || meta.implicitBackBuffer
+            || isImplicitBackBufferSurface(ptr)) continue;
+        if (bound.has(ptr >>> 0)) continue;
+        if (resourceToDevice.get(ptr) === device) out.surfaces++;
+    }
+    out.total = out.textures + out.volumes + out.vertexBuffers + out.indexBuffers + out.surfaces;
+    return out;
+}
+
+/**
+ * Name the DEFAULT-pool resources that are blocking a Reset, not just how many.
+ *
+ * "1 vertex buffer is still live" is not actionable — WHICH buffer, created with what usage,
+ * and how many references are still on it is what separates "the app really holds it" (real
+ * D3D9 refuses too) from "our COM refcount never reached zero" (only we refuse). Capped,
+ * because this runs on a failure path and the first few offenders are the diagnosis.
+ */
+/**
+ * Lifetime tally for DEFAULT-pool buffers. A refused Reset needs to separate "the guest never
+ * released this one" (created > finalized by the number still live) from "our Release did not
+ * destroy it" — the live count alone reads the same either way.
+ */
+export const defaultPoolBufferTally = { created: 0, entered: 0, finalized: 0 };
+
+export function describeDefaultPoolResources(device: D3D9Device, limit = 6): string[] {
+    const out: string[] = [];
+    const registry = (System.getInstance().process as { moduleRegistry?: { resolveAddress?(a: number): string | null } } | undefined)?.moduleRegistry;
+    const who = (addr: number | undefined): string =>
+        addr ? `,by=${registry?.resolveAddress?.(addr >>> 0) ?? `0x${(addr >>> 0).toString(16)}`}` : "";
+    const push = (kind: string, ptr: number, extra: string): void => {
+        if (out.length >= limit) return;
+        out.push(`${kind}@0x${(ptr >>> 0).toString(16)}{${extra},refs=${getComRefCount(ptr) ?? "?"}}`);
+    };
+    for (const [ptr, meta] of vertexBufferMeta) {
+        if (meta.pool === 0 && resourceToDevice.get(ptr) === device) {
+            push("vb", ptr, `size=${meta.size},usage=0x${(meta.usage >>> 0).toString(16)},fvf=0x${((meta.fvf ?? 0) >>> 0).toString(16)},seq=${meta.seq ?? -1}${who(meta.createdBy)}`);
+        }
+    }
+    for (const [ptr, meta] of indexBufferMeta) {
+        if (meta.pool === 0 && resourceToDevice.get(ptr) === device) {
+            push("ib", ptr, `size=${meta.size},usage=0x${(meta.usage >>> 0).toString(16)}${who(meta.createdBy)}`);
+        }
+    }
+    for (const [ptr, meta] of textureMeta) {
+        if (meta.pool === 0 && resourceToDevice.get(ptr) === device) {
+            push("tex", ptr, `${meta.width}x${meta.height},levels=${meta.levels},usage=0x${(meta.usage >>> 0).toString(16)},fmt=${meta.format}`);
+        }
+    }
+    // Surfaces use the SAME exemptions as the census above — a listing that showed the ones
+    // the census already forgives would send the reader after the wrong object.
+    const bound = new Set<number>();
+    for (const p of deviceBoundDepthStencil.values()) bound.add(p >>> 0);
+    for (const targets of deviceBoundRenderTarget.values()) for (const p of targets.values()) bound.add(p >>> 0);
+    for (const [ptr, meta] of surfaceMeta) {
+        if (meta.pool !== 0 || meta.texturePtr !== undefined || meta.implicitBackBuffer
+            || isImplicitBackBufferSurface(ptr)) continue;
+        if (bound.has(ptr >>> 0) || resourceToDevice.get(ptr) !== device) continue;
+        push("surface", ptr, `${meta.width ?? "?"}x${meta.height ?? "?"},usage=0x${((meta.usage ?? 0) >>> 0).toString(16)},` +
+            `fmt=${meta.format},standalone=${meta.standalone ? 1 : 0}`);
+    }
+    return out;
+}
+
 export function getDeviceBackBufferSurface(devicePtr: number, key: string): number {
     return deviceBackBufferSurfaces.get(devicePtr >>> 0)?.get(key) ?? 0;
+}
+
+/**
+ * Is this surface one of the device's IMPLICIT back buffers?
+ *
+ * Those have no owning texture — they name the swap chain's own image, which lives in the
+ * backend rather than the texture table. Anything that wants their pixels therefore cannot
+ * go through the texture path and has to ask the presenter instead, and this is the test
+ * that tells the two apart.
+ */
+export function isDeviceBackBufferSurface(devicePtr: number, surfacePtr: number): boolean {
+    const ptr = surfacePtr >>> 0;
+    if (!ptr) return false;
+    const cache = deviceBackBufferSurfaces.get(devicePtr >>> 0);
+    if (!cache) return false;
+    for (const registered of cache.values()) if (registered === ptr) return true;
+    return false;
 }
 
 export function setDeviceBackBufferSurface(devicePtr: number, key: string, surfacePtr: number): void {
@@ -154,6 +328,7 @@ const D3DMULTISAMPLE_NONE = 0;
 
 export function releaseSurfaceMetadata(surfacePtr: number): void {
     const pSurf = surfacePtr >>> 0;
+    clearResourceContract(pSurf);
     for (const [devicePtr, surfPtr] of deviceBoundDepthStencil) {
         if ((surfPtr >>> 0) === pSurf) deviceBoundDepthStencil.delete(devicePtr);
     }
@@ -228,7 +403,7 @@ export function ensureTextureLevelSurface(pTexture: number, level: number): numb
 
     const device = resourceToDevice.get(pTex);
     const meta = textureMeta.get(pTex);
-    if (!device || !meta || meta.isCube || level >= meta.levels) return null;
+    if (!device || !meta || meta.isCube || !Number.isInteger(level) || level < 0 || level >= meta.levels) return null;
 
     const vtableAddr = getVTables()['IDirect3DSurface9']?.address;
     if (!vtableAddr) return null;
@@ -265,7 +440,8 @@ export function ensureCubeFaceSurface(pCube: number, face: number, level: number
 
     const device = resourceToDevice.get(pTex);
     const meta = textureMeta.get(pTex);
-    if (!device || !meta || !meta.isCube || face > 5 || level >= meta.levels) return null;
+    if (!device || !meta || !meta.isCube || !Number.isInteger(face) || face < 0 || face > 5
+        || !Number.isInteger(level) || level < 0 || level >= meta.levels) return null;
 
     const vtableAddr = getVTables()['IDirect3DSurface9']?.address;
     if (!vtableAddr) return null;
@@ -307,6 +483,11 @@ export function precreateCubeFaceSurfaces(pCube: number, levelCount: number): bo
 }
 
 export function clearResourceRegistry(): void {
+    // Any private-data entry that belonged to a synthetic resource without a
+    // registered child finalizer must still release an IUnknown reference on
+    // module reset.  Normal resources clear this during their finalizer; this
+    // is the defensive sweep for test/failure paths.
+    resetResourceContract();
     textureMeta.clear();
     surfaceMeta.clear();
     vertexBufferMeta.clear();
@@ -323,6 +504,22 @@ export function clearResourceRegistry(): void {
 export function computeMipLevelCount(width: number, height: number): number {
     const maxDim = Math.max(1, width >>> 0, height >>> 0);
     return Math.floor(Math.log2(maxDim)) + 1;
+}
+
+/**
+ * Validate the D3D9 `Levels` creation argument without manufacturing repeated
+ * 1x1 subresources.  Zero requests the complete chain; an explicit value may
+ * stop early, but cannot exceed the number of distinct dimensions in the
+ * resource.  Callers use `null` as D3DERR_INVALIDCALL.
+ */
+export function resolveRequestedMipLevels(width: number, height: number, requestedLevels: number): number | null {
+    const w = width >>> 0;
+    const h = height >>> 0;
+    const requested = requestedLevels >>> 0;
+    if (w === 0 || h === 0) return null;
+    const full = computeMipLevelCount(w, h);
+    if (requested === 0) return full;
+    return requested <= full ? requested : null;
 }
 
 export function getTextureLevelDims(width: number, height: number, level: number): { width: number; height: number } {
@@ -342,8 +539,9 @@ export function resolveSurfaceInfo(surfacePtr: number): {
     /** -1 for a plain 2D mip surface; 0..5 for a cube-map face. */
     face: number;
 } | null {
-    const meta = surfaceMeta.get(surfacePtr);
-    const device = resourceToDevice.get(surfacePtr);
+    const pSurface = surfacePtr >>> 0;
+    const meta = surfaceMeta.get(pSurface);
+    const device = resourceToDevice.get(pSurface);
     if (!meta || !device || !meta.texturePtr) return null;
     const level = meta.level ?? 0;
     return {
@@ -360,8 +558,9 @@ export function resolveTextureInfo(texturePtr: number): {
     device: D3D9Device;
     meta: TextureMeta;
 } | null {
-    const meta = textureMeta.get(texturePtr);
-    const device = resourceToDevice.get(texturePtr);
+    const pTexture = texturePtr >>> 0;
+    const meta = textureMeta.get(pTexture);
+    const device = resourceToDevice.get(pTexture);
     if (!meta || !device) return null;
     return { device, meta };
 }
@@ -398,7 +597,7 @@ export function createGuestTexture(
     const levelCount = levels !== 0 ? (levels >>> 0) : computeMipLevelCount(w, h);
     const normalizedPool = normalizePalettizedTexturePool(fmt, pool);
 
-    const guestPtr = device.createTexture(texPtr, w, h, levelCount, fmt, usage >>> 0);
+    const guestPtr = device.createTexture(texPtr, w, h, levelCount, fmt, usage >>> 0, normalizedPool);
     if (guestPtr === 0) {
         releaseComRef(texPtr);
         if (ppTexture) initReturnPtr(ppTexture);
@@ -415,6 +614,7 @@ export function createGuestTexture(
         format: fmt,
     });
     registerDeviceChildFinalizer(texPtr, devicePtr, () => {
+        clearResourceContract(texPtr);
         clearTextureSubresourceSurfaces(texPtr);
         device.releaseTexture(texPtr);
         textureMeta.delete(texPtr);
