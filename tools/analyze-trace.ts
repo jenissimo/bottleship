@@ -125,9 +125,13 @@ const V86_ANNOTATIONS: Array<[string, string]> = [
   ["io_port_write8", "OUT8 instruction"],
   ["io_port_read32", "IN instruction"],
   ["interpreter", "Interpreter fallback (non-JIT page)"],
-  ["safe_read32s", "Guest memory read (TLB miss path)"],
-  ["safe_write32", "Guest memory write (TLB miss path)"],
-  ["safe_read_write32", "RMW memory op"],
+  // NOT the JIT's TLB-miss path: the JIT inlines its read (codegen.rs gen_safe_read) and
+  // its miss calls safe_read*_slow_jit -> safe_read_slow_jit, which never enters these.
+  // A sample here is the interpreter, a jit_instructions helper, or a hypercall reading
+  // guest memory. Which one it is needs a counter, not this table.
+  ["safe_read32s", "Guest read from a helper (interp / jit-helper / hypercall)"],
+  ["safe_write32", "Guest write from a helper (interp / jit-helper / hypercall)"],
+  ["safe_read_write32", "Guest RMW from a helper (interp / jit-helper / hypercall)"],
   ["tlb_set_entry", "TLB entry fill"],
   ["do_task_switch", "x86 task switch"],
   ["hypercall", "WASM hypercall dispatch"],
@@ -962,8 +966,8 @@ function diagnoseThread(analysis: ThreadAnalysis): Warning[] {
   if (safePct > 5) {
     warnings.push({
       severity: safePct > 10 ? "high" : "med",
-      title: `Safe memory accessors: ${safePct.toFixed(1)}%`,
-      detail: "safe_read/write hot → TLB miss path. May indicate fragmented working set or repeated cross-page access.",
+      title: `Guest access helpers: ${safePct.toFixed(1)}%`,
+      detail: "safe_read/write hot. NOT the JIT fast path (inlined) and NOT its miss path (safe_read*_slow_jit) — this is the interpreter, a jit_instructions helper, or a hypercall reading guest memory. Attribute it before optimising it.",
     });
   }
 
