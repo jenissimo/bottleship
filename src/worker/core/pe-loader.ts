@@ -9,6 +9,7 @@ import { APIRegistry } from './api-registry';
 import { System } from './system';
 import { Logger, LogCategory } from './logger';
 import { ModuleRegistry, LoadedPEModule } from './module-registry';
+import type { AddressSpace } from './memory/address-space';
 import { VirtualFileSystem } from '../runtime/filesystem/vfs';
 import { EMU_NATIVE_VIDEO_DLLS, VIDEO_DLL_NAMES } from './cpu/emulator-config';
 import { hypercallDataManager } from './cpu/hypercall-data';
@@ -440,7 +441,7 @@ export class PELoader {
         const system = System.getInstance();
         const addressSpace = system.process?.addressSpace;
         if (addressSpace) {
-            addressSpace.releaseRegion(baseAddress);
+            this.dropStaleImageRegions(addressSpace, baseAddress, sizeOfImage, 'EXE');
             addressSpace.mapRegion(baseAddress, sizeOfImage, "rwx", "ROM", "PELoader", "image");
         }
 
@@ -755,9 +756,9 @@ export class PELoader {
             const addressSpace = system.process?.addressSpace;
             if (addressSpace) {
                 // FreeLibrary hands the VA back to the registry's pool but leaves the image
-                // mapped, so a reload of the same DLL is handed the identical base with the
-                // previous region record still registered — drop it, exactly as the EXE path does.
-                addressSpace.releaseRegion(baseAddress);
+                // mapped, so whatever the pool hands out next can still be covered by the
+                // records of images nobody has loaded for a while — drop those first.
+                this.dropStaleImageRegions(addressSpace, baseAddress, sizeOfImage, dllPath);
                 addressSpace.mapRegion(baseAddress, sizeOfImage, "rwx", "ROM", "PELoader", "dll");
             }
 
@@ -880,14 +881,53 @@ export class PELoader {
      * a stale pointer far from the loader. Hitman's system.dll has no relocation for the
      * `call [__imp__GetCurrentThreadId]` in its CRT and calls through 0 anywhere else.
      */
+    /**
+     * Drop the region records of images that are no longer loaded but overlap the span a
+     * new image is about to occupy.
+     *
+     * FreeLibrary leaves the image mapped on purpose (a stale pointer into an unloaded
+     * DLL reads its old bytes instead of faulting), so ModuleRegistry can hand the VA out
+     * again while AddressSpace still holds the old record. Dropping only the record at the
+     * exact base covers the reload-in-place case alone: recycled VA is coalesced, so the
+     * next image can start BELOW a leftover record and cover it, and registerRegion then
+     * refuses the whole mapping.
+     *
+     * A region whose base still names a LIVE module is never dropped — that would map a
+     * new image over a loaded one. It is left to fail the overlap check, which names both
+     * spans, because the allocator handing out live VA is a different bug.
+     */
+    private dropStaleImageRegions(
+        addressSpace: AddressSpace,
+        base: number,
+        size: number,
+        label: string,
+    ): void {
+        for (const region of addressSpace.findRegionsIntersecting(base, size)) {
+            if (region.kind !== "ROM" || region.owner !== "PELoader") continue;
+            if (this.moduleRegistry?.getByBase(region.base)) {
+                Logger.error(LogCategory.SYSTEM,
+                    `[PE] ${label}: image span 0x${base.toString(16)}..0x${(base + size).toString(16)} ` +
+                    `overlaps LIVE module region 0x${region.base.toString(16)}..` +
+                    `0x${(region.base + region.size).toString(16)} — not releasing it`);
+                continue;
+            }
+            addressSpace.releaseRegion(region.base);
+            Logger.log(LogCategory.SYSTEM,
+                `[PE] ${label}: released stale image region 0x${region.base.toString(16)}..` +
+                `0x${(region.base + region.size).toString(16)} covered by the new image`);
+        }
+    }
+
     private chooseDllBase(preferredBase: number, sizeOfImage: number, dllPath: string): number {
         const registry = this.moduleRegistry!;
         const system = System.getInstance();
         const memory = system.process?.memory;
         const addressSpace = system.process?.addressSpace;
         if (memory && addressSpace && preferredBase) {
-            // A mapping an unloaded image left behind must not block its own reload.
-            if (!registry.getByBase(preferredBase)) addressSpace.releaseRegion(preferredBase);
+            // Mappings unloaded images left behind must not block a placement: the
+            // preferred base is tested with a SPAN check (findBlockingRegion), so a stale
+            // record anywhere inside the image would otherwise force a needless rebase.
+            this.dropStaleImageRegions(addressSpace, preferredBase, sizeOfImage, dllPath);
             if (memory.canPlaceImageAt(preferredBase, sizeOfImage)) {
                 Logger.log(LogCategory.SYSTEM,
                     `[PE] ${dllPath}: mapped at its preferred base 0x${preferredBase.toString(16)} ` +

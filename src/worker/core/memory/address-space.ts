@@ -171,6 +171,20 @@ export class AddressSpace {
         return false;
     }
 
+    /**
+     * Non-Layout regions that intersect [base, base+size).
+     *
+     * `releaseRegion` keys on an EXACT base, which is only the reload-in-place case. A
+     * PE image whose VA the module registry has recycled can be handed a base BELOW a
+     * record an unloaded image left behind, so the stale region sits INSIDE the new
+     * span and the exact-base drop misses it — the mapping then fails the overlap check
+     * and LoadLibrary answers ERROR_MOD_NOT_FOUND for a DLL that is present.
+     */
+    findRegionsIntersecting(base: number, size: number): RegionEntry[] {
+        return this.regions.filter(r =>
+            r.owner !== "Layout" && this.overlaps(r.base, r.size, base, size));
+    }
+
     mapRegion(base: number, size: number, perms: RegionPerms, kind: RegionKind, owner?: string, tag?: string): number {
         return this.registerRegion({ base, size, perms, kind, owner, tag });
     }
