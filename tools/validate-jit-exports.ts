@@ -102,14 +102,56 @@ if (!(await wasmFile.exists())) {
     console.error(`[validate-jit-exports] FAIL: ${WASM} not found — run vendor/v86/build-wasm.sh`);
     process.exit(1);
 }
-// A binary older than the sources certifies the PREVIOUS build — exactly the state in which a
-// just-introduced missing export would pass. Refuse rather than reassure.
-let newestRust = 0;
-for (const dir of RUST_DIRS) {
-    for (const f of await rustFiles(dir)) newestRust = Math.max(newestRust, Bun.file(f).lastModified);
+/**
+ * A binary older than the sources certifies the PREVIOUS build — exactly the state in which a
+ * just-introduced missing export would pass. Refuse rather than reassure.
+ *
+ * "Older" cannot be a file mtime in a checkout: git stamps every file with the time it was
+ * written and in no guaranteed order, so on CI the comparison decides by coin toss (it failed
+ * there for the first time the day CI started running the whole gate, on an artifact that was
+ * committed together with its sources). Ask git instead — which is also the stronger question,
+ * because it catches a source commit that never got its rebuild, not just an unsaved editor
+ * buffer. Uncommitted edits still fall back to mtimes, which is what they have.
+ */
+/** Trimmed stdout of a git command, or null when git could not answer. */
+function git(repo: string, args: string[]): string | null {
+    const r = Bun.spawnSync(["git", "-C", repo, ...args], { stdout: "pipe", stderr: "ignore" });
+    if (r.exitCode !== 0) return null;
+    return new TextDecoder().decode(r.stdout).trim();
 }
-if (wasmFile.lastModified < newestRust) {
+
+function commitTime(repo: string, path: string): number {
+    const out = git(repo, ["log", "-1", "--format=%ct", "--", path]);
+    const t = Number(out ?? "");
+    return Number.isFinite(t) && t > 0 ? t : 0;
+}
+
+const wasmRepo = WASM.startsWith("vendor/v86/") ? "vendor/v86" : ".";
+const strip = (p: string) => p.replace(/^vendor\/v86\//, "");
+const wasmRel = strip(WASM);
+const rustRel = RUST_DIRS.map(strip);
+
+const status = git(wasmRepo, ["status", "--porcelain", "--", wasmRel, ...rustRel]);
+const trackedAndClean = status !== null && status.length === 0;
+
+let stale = false;
+let how = "";
+if (trackedAndClean) {
+    const wasmCommit = commitTime(wasmRepo, wasmRel);
+    const rustCommit = Math.max(...rustRel.map(d => commitTime(wasmRepo, d)));
+    stale = wasmCommit > 0 && rustCommit > wasmCommit;
+    how = `the artifact's commit predates the Rust sources' (${wasmCommit} < ${rustCommit})`;
+} else {
+    let newestRust = 0;
+    for (const dir of RUST_DIRS) {
+        for (const f of await rustFiles(dir)) newestRust = Math.max(newestRust, Bun.file(f).lastModified);
+    }
+    stale = wasmFile.lastModified < newestRust;
+    how = "an edited Rust source is newer than the built artifact";
+}
+if (stale) {
     console.error(`[validate-jit-exports] FAIL: ${WASM} is older than the Rust sources — rebuild first (vendor/v86/build-wasm.sh).`);
+    console.error(`  ${how}.`);
     console.error("  Validating a stale binary would pass a missing export that the next build introduces.");
     process.exit(1);
 }
