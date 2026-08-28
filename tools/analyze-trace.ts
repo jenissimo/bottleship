@@ -336,6 +336,17 @@ function findJitBlockMapSidecar(tracePath: string): string | null {
   return null;
 }
 
+/** v86's named JIT block: `g<entry addr, 8 hex>@t<wasm table index>` (jit.rs, emitted when
+ *  JIT_FUNCTION_NAMES is on). The ADDRESS is authoritative — table slots get recycled. */
+const NAMED_JIT_BLOCK = /^g([0-9a-f]{8})@t(\d+)$/;
+/** True for a compiled guest block under EITHER naming — anonymous `wasm-function[N]` from an
+ *  artifact built without JIT_FUNCTION_NAMES, or the named form above. Every classifier that
+ *  means "this frame is guest code" must go through here: matching one spelling made the other
+ *  fall through to "other v86 core", which reads as a plausible number under the wrong label. */
+function isJitBlockName(name: string): boolean {
+  return /^wasm-function\[\d+\]$/.test(name) || NAMED_JIT_BLOCK.test(name);
+}
+
 function annotateWasm(name: string | undefined): string {
   if (!name) return "";
   for (const [pattern, label] of V86_ANNOTATIONS) {
@@ -349,6 +360,14 @@ function annotateWasm(name: string | undefined): string {
     return mapped
       ? `JIT block (v86 compiled code) → ${mapped}`
       : "JIT block (v86 compiled code)";
+  }
+  // Named block: the guest entry address rides in the name, so it needs no sidecar map.
+  const named = name.match(NAMED_JIT_BLOCK);
+  if (named) {
+    const mapped = JIT_BLOCK_MAP?.get(parseInt(named[2]!, 10));
+    return mapped
+      ? `JIT block (v86 compiled code) → ${mapped}`
+      : `JIT block (v86 compiled code) @ guest 0x${named[1]}`;
   }
   return "";
 }
@@ -1544,7 +1563,12 @@ function optBucket(frame: CallFrame): OptBucket {
     name.includes("translate_address")
   )
     return "mmu / decode / irq";
-  if (/^wasm-function\[/.test(name)) return "GAME CODE (jit blocks)";
+  // A compiled guest block under BOTH namings: the anonymous `wasm-function[N]` of an
+  // artifact built without JIT_FUNCTION_NAMES, and the named `g<entry addr>@t<table idx>`
+  // v86 emits with it (jit.rs). Matching only the former silently reclassified every
+  // guest block as "other v86 core" — the roll-up then blamed the emulator core for the
+  // game's own scene traversal and pointed the reader at the opposite of the answer.
+  if (isJitBlockName(name)) return "GAME CODE (jit blocks)";
   if (name.startsWith("_ZN3v86")) return "other v86 core";
   // Everything else: lean on classifyFrame for the js / idle / native split.
   const cat = classifyFrame(frame);
