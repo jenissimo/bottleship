@@ -16,6 +16,8 @@ import { Marshaler } from "../core/memory/marshaler";
 import { VaListReader, ArrayVaListReader, encodeAnsi, formatCLazy } from "./crt-format";
 import { scanfCore } from "./crt-scanf";
 import { getCodePageDecoder } from "./codepage-utils";
+import { invalidateLocaleCache, retireLocaleStubTable } from "./kernel32/locale-data";
+import { retireMbwcStubTable } from "./kernel32/codepage-lut";
 import { EmulatorConfig } from "../core/emulator-config-manager";
 import { hypercallDataManager } from "../core/cpu/hypercall-data";
 import { asBufferSource } from "../../dom-buffer";
@@ -1037,6 +1039,18 @@ export class Msvcrt implements IModule {
         if (resolved <= 0 || !Msvcrt.VALID_MB_CODE_PAGES.has(resolved)) {
             this.setErrno(22); // EINVAL
             return -1;
+        }
+
+        // The trap-free locale/MBWC stubs and the JS answer cache were built from the page
+        // that was current when kernel32 was loaded. Retire both before the config moves, or
+        // the guest-side tier keeps translating with the old LUT while JS uses the new one.
+        if (resolved !== config.ansiCodePage) {
+            const mem = getMemory(this.process.v86);
+            if (mem) {
+                retireLocaleStubTable(mem);
+                retireMbwcStubTable(mem);
+            }
+            invalidateLocaleCache();
         }
 
         config.ansiCodePage = resolved;
