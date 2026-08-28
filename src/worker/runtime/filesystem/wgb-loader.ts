@@ -62,10 +62,11 @@ function withBlockCache(source: ZipSource): ZipSource {
     // only one that speculates: the I/O worker below reads ahead only inside the entry
     // the hint names.
     const overSabIo = source instanceof SabIoSource;
-    const dev = (globalThis as unknown as { __wgbTune?: { depth?: number; readahead?: number; budgetMB?: number } }).__wgbTune;
+    const dev = (globalThis as unknown as { __wgbTune?: { depth?: number; readahead?: number; budgetMB?: number; blockKB?: number } }).__wgbTune;
     const cache = new CachedSource(source, {
         maxBytes: dev?.budgetMB ? dev.budgetMB * 1024 * 1024 : maxBytes,
         name,
+        blockSize: dev?.blockKB ? dev.blockKB * 1024 : undefined,
         syncReadaheadBlocks: dev?.readahead ?? (overSabIo ? SAB_BLOCKS_PER_CHUNK : 32),
         prefetchAheadBlocks: overSabIo ? SAB_BLOCKS_PER_CHUNK * 2 : 32,
         prefetchDepthRuns: overSabIo ? 2 : (dev?.depth ?? 4),

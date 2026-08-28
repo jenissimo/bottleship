@@ -96,6 +96,10 @@ export interface CachedSourceOptions {
 
 export class CachedSource implements ZipSource {
     readonly size: number;
+    /** This cache's `readRangeSync` can only answer a cold block when the inner source
+     *  can be read synchronously; over an async-only transport it returns null and the
+     *  caller must await. See ZipSource.syncFaultCapable. */
+    readonly syncFaultCapable: boolean;
 
     private readonly inner: ZipSource;
     private readonly blockSize: number;
@@ -165,6 +169,24 @@ export class CachedSource implements ZipSource {
     private readonly prefetchedUnread = new Set<number>();
     private _prefetchEvictedUnreadBytes = 0;
 
+    /** The BLOCKING readahead's own accounting — the async prefetch above is a
+     *  separate mechanism and its numbers say nothing about this one. A blocking
+     *  fault of N blocks makes the guest wait for N × blockSize of transfer; if the
+     *  N-1 blocks past the one it asked for are never read, that wait and those bytes
+     *  bought nothing. `readaheadUnread` holds exactly those blocks (a block leaves it
+     *  the moment any read covers it), so `readaheadEvictedUnreadBytes` is what the
+     *  readahead demonstrably wasted rather than what it might have. */
+    private readonly readaheadUnread = new Set<number>();
+    private _readaheadEvictedUnreadBytes = 0;
+    /** Blocks pulled by blocking faults: the one that was asked for vs the run past it. */
+    private _faultBlocksAsked = 0;
+    private _faultBlocksReadahead = 0;
+    /** Blocking faults split by what the caller said about its own read pattern. A
+     *  source nobody hints (plain Blob/OPFS) lands in `unhinted`. */
+    private _faultsSequential = 0;
+    private _faultsRandom = 0;
+    private _faultsUnhinted = 0;
+
     constructor(inner: ZipSource, opts: CachedSourceOptions = {}) {
         this.inner = inner;
         this.size = inner.size;
@@ -174,6 +196,7 @@ export class CachedSource implements ZipSource {
         this.prefetchAhead = Math.max(0, Math.floor(opts.prefetchAheadBlocks ?? 0));
         this.prefetchDepthRuns = Math.max(1, Math.floor(opts.prefetchDepthRuns ?? 1));
         this.name = opts.name ?? "cached";
+        this.syncFaultCapable = typeof inner.readRangeSync === "function";
         this.touched = new Uint8Array(Math.ceil(Math.max(1, this.size) / TOUCH_GRANULE / 8));
     }
 
@@ -210,6 +233,7 @@ export class CachedSource implements ZipSource {
                 data = buf;
             }
             this.prefetchedUnread.delete(b);
+            this.readaheadUnread.delete(b);
             datas.push(data);
         }
 
@@ -240,6 +264,7 @@ export class CachedSource implements ZipSource {
         for (let b = first; b <= last; b++) {
             datas.push(await this.ensureBlock(b, hint));
             this.prefetchedUnread.delete(b);
+            this.readaheadUnread.delete(b);
         }
 
         this.markTouched(s, e);
@@ -256,12 +281,17 @@ export class CachedSource implements ZipSource {
         this.lru.length = 0;
         this.residentBytes = 0;
         this.prefetchedUnread.clear();
+        this.readaheadUnread.clear();
     }
 
     stats(): {
         syncHits: number; syncMisses: number; faults: number; blockingFaults: number;
         prefetchRuns: number; residentBytes: number; blocks: number;
         uniqueTouchedBytes: number; touchGranuleBytes: number; prefetchEvictedUnreadBytes: number;
+        blockSize: number;
+        faultBlocksAsked: number; faultBlocksReadahead: number;
+        readaheadEvictedUnreadBytes: number;
+        faultsSequential: number; faultsRandom: number; faultsUnhinted: number;
     } {
         return {
             syncHits: this._syncHits,
@@ -277,6 +307,17 @@ export class CachedSource implements ZipSource {
             uniqueTouchedBytes: this._touchedGranules * TOUCH_GRANULE,
             touchGranuleBytes: TOUCH_GRANULE,
             prefetchEvictedUnreadBytes: this._prefetchEvictedUnreadBytes,
+            blockSize: this.blockSize,
+            /** Blocks a BLOCKING fault pulled: the one asked for, and the run past it.
+             *  The ratio is the readahead's cost multiplier on every guest stall. */
+            faultBlocksAsked: this._faultBlocksAsked,
+            faultBlocksReadahead: this._faultBlocksReadahead,
+            /** Readahead blocks evicted having never been read — the wait and the
+             *  bytes that demonstrably bought nothing. */
+            readaheadEvictedUnreadBytes: this._readaheadEvictedUnreadBytes,
+            faultsSequential: this._faultsSequential,
+            faultsRandom: this._faultsRandom,
+            faultsUnhinted: this._faultsUnhinted,
         };
     }
 
@@ -393,6 +434,12 @@ export class CachedSource implements ZipSource {
         if (!buf) return null;
         this._faults++;
         this._blockingFaults++;
+        this._faultBlocksAsked++;
+        this._faultBlocksReadahead += endBlock - b;
+        for (let rb = b + 1; rb <= endBlock; rb++) this.readaheadUnread.add(rb);
+        if (hint === undefined) this._faultsUnhinted++;
+        else if (hint.sequential) this._faultsSequential++;
+        else this._faultsRandom++;
 
         // Re-anchor the prefetch frontier past this run. A cold sync fault means
         // the guest is reading HERE now (a forward seek / new file the prefetch
@@ -568,6 +615,7 @@ export class CachedSource implements ZipSource {
                 this.residentBytes -= data.byteLength;
                 this.blocks.delete(victim);
                 if (this.prefetchedUnread.delete(victim)) this._prefetchEvictedUnreadBytes += data.byteLength;
+                if (this.readaheadUnread.delete(victim)) this._readaheadEvictedUnreadBytes += data.byteLength;
             }
         }
     }
