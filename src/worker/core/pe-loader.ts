@@ -9,7 +9,7 @@ import { APIRegistry } from './api-registry';
 import { System } from './system';
 import { Logger, LogCategory } from './logger';
 import { ModuleRegistry, LoadedPEModule } from './module-registry';
-import type { AddressSpace } from './memory/address-space';
+import type { AddressSpace, RegionEntry } from './memory/address-space';
 import { VirtualFileSystem } from '../runtime/filesystem/vfs';
 import { EMU_NATIVE_VIDEO_DLLS, VIDEO_DLL_NAMES } from './cpu/emulator-config';
 import { hypercallDataManager } from './cpu/hypercall-data';
@@ -874,14 +874,6 @@ export class PELoader {
     }
 
     /**
-     * Load address for a DLL: its own ImageBase when that VA is free, the rebase bucket
-     * otherwise — the Windows rule. Honouring it is a correctness requirement, not a
-     * preference: a .reloc table that does not cover every absolute operand still loads
-     * (and still relocates most of the image), so the gap only shows up as a call through
-     * a stale pointer far from the loader. Hitman's system.dll has no relocation for the
-     * `call [__imp__GetCurrentThreadId]` in its CRT and calls through 0 anywhere else.
-     */
-    /**
      * Drop the region records of images that are no longer loaded but overlap the span a
      * new image is about to occupy.
      *
@@ -901,7 +893,8 @@ export class PELoader {
         base: number,
         size: number,
         label: string,
-    ): void {
+    ): RegionEntry[] {
+        const dropped: RegionEntry[] = [];
         for (const region of addressSpace.findRegionsIntersecting(base, size)) {
             if (region.kind !== "ROM" || region.owner !== "PELoader") continue;
             if (this.moduleRegistry?.getByBase(region.base)) {
@@ -912,12 +905,22 @@ export class PELoader {
                 continue;
             }
             addressSpace.releaseRegion(region.base);
+            dropped.push(region);
             Logger.log(LogCategory.SYSTEM,
                 `[PE] ${label}: released stale image region 0x${region.base.toString(16)}..` +
                 `0x${(region.base + region.size).toString(16)} covered by the new image`);
         }
+        return dropped;
     }
 
+    /**
+     * Load address for a DLL: its own ImageBase when that VA is free, the rebase bucket
+     * otherwise — the Windows rule. Honouring it is a correctness requirement, not a
+     * preference: a .reloc table that does not cover every absolute operand still loads
+     * (and still relocates most of the image), so the gap only shows up as a call through
+     * a stale pointer far from the loader. Hitman's system.dll has no relocation for the
+     * `call [__imp__GetCurrentThreadId]` in its CRT and calls through 0 anywhere else.
+     */
     private chooseDllBase(preferredBase: number, sizeOfImage: number, dllPath: string): number {
         const registry = this.moduleRegistry!;
         const system = System.getInstance();
@@ -927,8 +930,18 @@ export class PELoader {
             // Mappings unloaded images left behind must not block a placement: the
             // preferred base is tested with a SPAN check (findBlockingRegion), so a stale
             // record anywhere inside the image would otherwise force a needless rebase.
-            this.dropStaleImageRegions(addressSpace, preferredBase, sizeOfImage, dllPath);
-            if (memory.canPlaceImageAt(preferredBase, sizeOfImage)) {
+            const dropped = this.dropStaleImageRegions(addressSpace, preferredBase, sizeOfImage, dllPath);
+            if (!memory.canPlaceImageAt(preferredBase, sizeOfImage)) {
+                // Nothing will be mapped over them, and their VAs would otherwise fall back
+                // to the ROM layout bucket's read-only perms — a pointer into a freed DLL's
+                // data would start failing a write validation it used to pass.
+                for (const r of dropped) {
+                    addressSpace.registerRegion({
+                        base: r.base, size: r.size, perms: r.perms, kind: r.kind,
+                        owner: r.owner, tag: r.tag,
+                    });
+                }
+            } else {
                 Logger.log(LogCategory.SYSTEM,
                     `[PE] ${dllPath}: mapped at its preferred base 0x${preferredBase.toString(16)} ` +
                     `(size=0x${sizeOfImage.toString(16)}, no relocation)`);

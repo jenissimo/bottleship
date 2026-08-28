@@ -70,7 +70,7 @@ function blockAfter(text: string, from: number): string {
     return text.slice(open);
 }
 
-interface Site { key: string; file: string; line: number; }
+interface Site { key: string; file: string; line: number; factory?: string; }
 
 const allFiles = [...walk(MODULES)];
 
@@ -105,7 +105,12 @@ for (const indexFile of allFiles) {
         const source = base.endsWith(".ts") ? base : `${base}.ts`;
         if (!existsSync(source)) continue;
         const imported = match[1]!.split(",").map((n) => n.trim().split(/\s+as\s+/).pop()!.trim());
-        if (imported.some((n) => stubMergedNames.has(n))) stubMergedInScope.add(`${scope}|${rel(source)}`);
+        // Per-FACTORY, not per-file: a file can export both a stub table and real handler
+        // factories (d3d8/state.ts does), and exempting the whole file would silence the
+        // order check for every real handler beside the stub one.
+        for (const n of imported) {
+            if (stubMergedNames.has(n)) stubMergedInScope.add(`${scope}|${rel(source)}|${n}`);
+        }
         const scopes = factoryScopesByFile.get(source) ?? [];
         scopes.push(scope);
         factoryScopesByFile.set(source, scopes);
@@ -125,7 +130,14 @@ const lineOf = (text: string, index: number) => text.slice(0, index).split(/\r?\
  * the loop variable can supply the METHOD (`IDirect3DDevice7_${method}`) or the INTERFACE
  * (`${prefix}_QueryInterface`, how d3d9 registers the real COM triple).
  */
-function templatedKeys(text: string, file: string): Site[] {
+/** `exports[A] = exports[B]` mirrors a key somebody else owns — a vtable alias, not an
+ *  independent registration. Counting it as one invents duplicates: ddraw's Device1 loop
+ *  aliases each Device3 method IF it exists, so an unimplemented one registers nothing. */
+function isAlias(text: string, afterAssign: number): boolean {
+    return /^\s*(?:exports|acc)\s*\[/.test(text.slice(afterAssign, afterAssign + 40));
+}
+
+function templatedKeys(text: string, file: string, factoryAt: (i: number) => string): Site[] {
     const out: Site[] = [];
     const arrays = new Map<string, { names: string[]; line: number }>();
     for (const arr of text.matchAll(NAME_ARRAY)) {
@@ -142,10 +154,12 @@ function templatedKeys(text: string, file: string): Site[] {
         const prefixRe = new RegExp(`\\b${ACC}\\[\\s*\`([A-Za-z_][A-Za-z0-9_]*_)\\$\\{\\s*${loopVar}\\s*\\}\`\\s*\\]\\s*=`, "g");
         const suffixRe = new RegExp(`\\b${ACC}\\[\\s*\`\\$\\{\\s*${loopVar}\\s*\\}(_[A-Za-z_][A-Za-z0-9_]*)\`\\s*\\]\\s*=`, "g");
         for (const m of body.matchAll(prefixRe)) {
-            for (const name of arr.names) out.push({ key: m[1]! + name, file, line: arr.line });
+            if (isAlias(body, m.index! + m[0].length)) continue;
+            for (const name of arr.names) out.push({ key: m[1]! + name, file, line: arr.line, factory: factoryAt(loop.index!) });
         }
         for (const m of body.matchAll(suffixRe)) {
-            for (const name of arr.names) out.push({ key: name + m[1]!, file, line: arr.line });
+            if (isAlias(body, m.index! + m[0].length)) continue;
+            for (const name of arr.names) out.push({ key: name + m[1]!, file, line: arr.line, factory: factoryAt(loop.index!) });
         }
     }
     return out;
@@ -156,10 +170,23 @@ for (const file of allFiles) {
     const isStubFile = /-stubs\.ts$/.test(file);
     const here = rel(file);
 
+    /** Offsets of the exported factories, so each registration can name the one it sits in.
+     *  A registration outside any of them keeps `factory: ""`, which no exemption matches. */
+    const factorySpans = [...text.matchAll(/export\s+function\s+([A-Za-z_$][\w$]*)/g)]
+        .map((m) => ({ name: m[1]!, at: m.index! }));
+    const factoryAt = (index: number): string => {
+        let name = "";
+        for (const span of factorySpans) {
+            if (span.at > index) break;
+            name = span.name;
+        }
+        return name;
+    };
+
     const sites: Site[] = [...text.matchAll(LITERAL_KEY)].map((m) => ({
-        key: m[1]!, file: here, line: lineOf(text, m.index!),
+        key: m[1]!, file: here, line: lineOf(text, m.index!), factory: factoryAt(m.index!),
     }));
-    sites.push(...templatedKeys(text, here));
+    sites.push(...templatedKeys(text, here, factoryAt));
 
     for (const site of sites) {
         if (isStubFile) { stubSites.push(site); continue; }
@@ -196,7 +223,8 @@ for (const [scope, sites] of realSitesByScope) {
         // A factory the scope merges via `assignStubsOnce` cannot shadow anybody: the winner
         // is decided by the mechanism, not by `Object.assign` order. Only registrations whose
         // precedence IS the merge order can collide.
-        const ordered = registrations.filter((site) => !stubMergedInScope.has(`${scope}|${site.file}`));
+        const ordered = registrations.filter(
+            (site) => !stubMergedInScope.has(`${scope}|${site.file}|${site.factory ?? ""}`));
         const files = new Set(ordered.map(site => site.file));
         if (files.size < 2) continue;
         duplicateFactories.push(
