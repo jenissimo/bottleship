@@ -19,6 +19,11 @@ import { System } from "../../core/system";
 import { getSehUnwindTrace } from "../../core/seh-dispatch";
 import { guestCodeInvalidationStats, takeGuestCodeAuditPages } from "../../core/memory/guest-code";
 import { localeFastPathStats } from "../../modules/kernel32/locale";
+import { d3d9RefcountStorageStats } from "../../modules/d3d9/com-refs";
+import { d3d9GuestAddRefStats } from "../../modules/d3d9/guest-addref-stub";
+import { d3d9StateBlockShadowStats } from "../../modules/d3d9/state-block-shadow-window";
+import { d3d9GuestReleaseStats } from "../../modules/d3d9/guest-release-stub";
+import { d3d9PipelineMemoProfileStats, d3d9PipelineMemoStats } from "../../backends/webgpu/d3d9/d3d9-pipeline-memo";
 import type { RegionKind } from "../../core/memory/address-space";
 
 /** Decode a generated thunk stub (`B8 <id32> BA 77 B0 00 00 EF C2 <cleanup16>`). */
@@ -275,6 +280,243 @@ export function registerDbgCommands(svc: HarnessService): void {
      *  `globalThis.__no*` A/B flags like __noDrawWbuf / __noSetterShadow /
      *  __noStateBlockWbuf). Must run BEFORE the game load that registers the affected
      *  path (registration reads the flag once). Returns the previous value. */
+    /** guestAccessCensus({reset?, arm?}) — WHO makes the host-side guest memory accesses
+     *  that show up as `cpu::safe_read32s` / `safe_write32` in a profile.
+     *
+     *  A JIT block never enters those: its read is inlined and its miss calls
+     *  safe_read*_slow_jit, a different function. So the profile alone cannot name the
+     *  owner, and `analyze-trace`'s old "(TLB miss path)" label asserted one it could not
+     *  know. The classes are interpreter / hypercall / eagl-hypercall, and the residual
+     *  `other` is the answer that matters: an instruction helper called BY a JIT block.
+     *
+     *  Counting is OFF until armed (`{arm:true}`), so the tracked path costs one
+     *  predictable branch when nobody is measuring — and a window nobody armed reports
+     *  `armed:false` rather than a plausible zero. Counts, not time: every class pays the
+     *  same page translation per access, so the shares are comparable, but a class doing
+     *  wider accesses will be understated. */
+    svc.register("guestAccessCensus", (args) => {
+        const opts = (args[0] ?? {}) as { reset?: boolean; arm?: boolean };
+        const ex = (globalThis as any).preemption?.getWasmExports?.();
+        if (!ex?.guest_access_reads) {
+            throw new Error("guest_access_* exports missing — rebuild vendor/v86 (build-wasm.sh)");
+        }
+        if (opts.arm !== undefined) ex.guest_access_set_tracking(opts.arm ? 1 : 0);
+        const names = ["other(jit-called helper)", "interpreter", "hypercall", "hypercall-eagl"];
+        const classes = names.map((name, i) => ({
+            name,
+            reads: ex.guest_access_reads(i) >>> 0,
+            writes: ex.guest_access_writes(i) >>> 0,
+        }));
+        const reads = classes.reduce((a, c) => a + c.reads, 0);
+        const writes = classes.reduce((a, c) => a + c.writes, 0);
+        const out = {
+            armed: (ex.guest_access_get_tracking?.() ?? 1) !== 0,
+            totalReads: reads,
+            totalWrites: writes,
+            classes: classes.map((c) => ({
+                ...c,
+                readPct: reads > 0 ? +((100 * c.reads) / reads).toFixed(2) : null,
+                writePct: writes > 0 ? +((100 * c.writes) / writes).toFixed(2) : null,
+            })),
+        };
+        if (opts.reset) ex.guest_access_reset();
+        return out;
+    });
+
+    /** eaglReadCursor({on?, policy?, verify?, reset?}) — the EAGL hypercall's one-entry read TLB.
+     *
+     *  `guestAccessCensus` measured 97.7 % of all host-side guest READS coming from this one
+     *  hypercall, each paying a full address translation per dword. The cursor re-translates
+     *  only on a page change. `on:false` is the kill switch (every read falls back), so an
+     *  A/B compares both paths on ONE build.
+     *
+     *  `verify:true` runs BOTH paths per read and counts disagreements — a memory-path change
+     *  believed rather than checked is the failure this project keeps paying for. A run is
+     *  only evidence when `checked` is large AND `mismatch` is 0; `checked: 0` means the
+     *  oracle never ran, not that it passed.
+     *
+     *  `policy` picks the cursor's LIFETIME: "dispatch" (default, the entry is dropped at
+     *  every hypercall entry) or "tlb" (dropped only where v86 drops its own TLB —
+     *  full_clear_tlb / clear_tlb / invlpg / trigger_pagefault). Both live in one build, so
+     *  the A/B is a call. `invalidations` counts the TLB-site drops: under "tlb" a count in
+     *  the same order as the dispatch count means the entry is NOT surviving across
+     *  dispatches, which is the other explanation for a null result. */
+    svc.register("eaglReadCursor", (args) => {
+        const opts = (args[0] ?? {}) as {
+            on?: boolean;
+            policy?: "dispatch" | "tlb";
+            verify?: boolean;
+            reset?: boolean;
+        };
+        const ex = (globalThis as any).preemption?.getWasmExports?.();
+        if (!ex?.eagl_read_cursor_get) {
+            throw new Error("eagl_read_cursor_* exports missing — rebuild vendor/v86 (build-wasm.sh)");
+        }
+        if (!ex.eagl_read_cursor_get_policy) {
+            throw new Error("eagl_read_cursor_*_policy missing — stale v86.wasm, rebuild vendor/v86");
+        }
+        if (opts.reset) ex.eagl_read_cursor_reset_stats();
+        if (opts.on !== undefined) ex.eagl_read_cursor_set(opts.on ? 1 : 0);
+        if (opts.policy !== undefined) {
+            if (opts.policy !== "dispatch" && opts.policy !== "tlb") {
+                throw new Error(`eaglReadCursor: policy must be "dispatch" or "tlb"`);
+            }
+            ex.eagl_read_cursor_set_policy(opts.policy === "tlb" ? 1 : 0);
+        }
+        if (opts.verify !== undefined) {
+            if (!ex.eagl_read_cursor_set_verify) {
+                throw new Error("eagl_read_cursor_set_verify missing — stale v86.wasm, rebuild vendor/v86");
+            }
+            ex.eagl_read_cursor_set_verify(opts.verify ? 1 : 0);
+        }
+        const checked = ex.eagl_read_cursor_checked() >>> 0;
+        const mismatch = ex.eagl_read_cursor_mismatch() >>> 0;
+        return {
+            on: ex.eagl_read_cursor_get() !== 0,
+            policy: ex.eagl_read_cursor_get_policy() !== 0 ? "tlb" : "dispatch",
+            invalidations: ex.eagl_read_cursor_invalidations() >>> 0,
+            checked,
+            mismatch,
+            verdict: checked === 0 ? "oracle did not run" : (mismatch === 0 ? "agree" : "DISAGREE"),
+        };
+    });
+
+    /** d3d9GuestRefcount({on?, verify?, reset?}) — where a D3D9 COM object's refcount lives.
+     *
+     *  `on` moves the count of record into the guest COM block (real COM's own layout, and the
+     *  prerequisite for making AddRef/Release no-trap guest stubs); `verify` maintains BOTH the
+     *  guest word and the JS mirror per call and counts disagreements. Both are read live, so an
+     *  A/B compares the two storages on ONE boot.
+     *
+     *  A run is evidence only when `checked` is large AND `mismatch` is 0; `checked: 0` reports
+     *  "oracle did not run", never a pass. */
+    svc.register("d3d9GuestRefcount", (args) => {
+        const opts = (args[0] ?? {}) as { on?: boolean; verify?: boolean; reset?: boolean };
+        const g = globalThis as Record<string, unknown>;
+        if (opts.on !== undefined) g.__d3d9GuestRefcount = !!opts.on;
+        if (opts.verify !== undefined) g.__d3d9RefcountVerify = !!opts.verify;
+        return d3d9RefcountStorageStats(!!opts.reset);
+    });
+
+    /** d3d9StateBlockShadow({reset?}) — did a recorded state block lose setters?
+     *
+     *  A shadowed setter skips in GUEST code, so a setter elided while BeginStateBlock was
+     *  active never reaches the device and never reaches the BLOCK either. Real D3D9 records
+     *  every Set* issued while recording; the damage from dropping one surfaces much later, as
+     *  an Apply that fails to restore a state, with nothing logged. `elided` is the guest skip
+     *  counters' delta across each Begin..End window — the same words the trampolines and the
+     *  EAGL WASM path bump — and it can only be non-zero if the owner gate was left armed
+     *  during recording, which is the bug this counter exists to see coming back.
+     *
+     *  `windows: 0` means no block was recorded while you were watching; it is not a pass. */
+    svc.register("d3d9StateBlockShadow", (args) => {
+        const opts = (args[0] ?? {}) as { reset?: boolean };
+        return d3d9StateBlockShadowStats(!!opts.reset);
+    });
+
+    /** d3d9GuestAddRef({on?, verify?, reset?}) — IDirect3DTexture9::AddRef answered in guest code.
+     *
+     *  40.4 % of every WASM→JS crossing an in-game D3D9 title makes is this one method, whose
+     *  JS body is an increment. With the count of record in the guest COM block the whole thing
+     *  is `inc [this+4]; mov eax,[this+4]; ret 4` and costs no crossing at all.
+     *
+     *  BOOT-TIME, unlike the storage flags: installing patches a guest stub and there is no
+     *  unpatch path. `on`/`verify` therefore set the flag for the NEXT boot and the returned
+     *  `mode` reports what is actually installed RIGHT NOW — the two disagreeing is the normal
+     *  state immediately after a call, not a bug.
+     *
+     *  `verify` installs the non-mutating oracle instead of the stub: guest code predicts the
+     *  value the stub would return, still traps, and the JS handler compares. A run is evidence
+     *  only when `checked` is large AND `mismatch` is 0; `checked: 0` says the oracle never ran.
+     *  `unpredicted` counts calls the trampoline declined (null `this`, vtable gate closed) —
+     *  the stub abstaining, not a disagreement. */
+    svc.register("d3d9GuestAddRef", (args) => {
+        const opts = (args[0] ?? {}) as { on?: boolean; verify?: boolean; reset?: boolean };
+        const g = globalThis as Record<string, unknown>;
+        if (opts.on !== undefined) g.__d3d9GuestAddRefStub = !!opts.on;
+        if (opts.verify !== undefined) g.__d3d9AddRefStubVerify = !!opts.verify;
+        return {
+            ...d3d9GuestAddRefStats(!!opts.reset),
+            requestedOn: !!g.__d3d9GuestAddRefStub,
+            requestedVerify: !!g.__d3d9AddRefStubVerify,
+            guestRefcount: !!g.__d3d9GuestRefcount,
+            appliesAt: "next boot (the stub patch has no unpatch path)",
+        };
+    });
+
+    /** d3d9GuestRelease({on?, verify?, reset?}) — IDirect3DTexture9::Release answered in guest code.
+     *
+     *  The other 40.4 % of the crossings, with one difference that shapes everything: the 1→0
+     *  transition runs the finalizer and the disposer, so the emitted body tests BEFORE it
+     *  decrements and hands a count of 1 (or a bogus 0) back to the OUT trap untouched. Only the
+     *  above-zero decrements are removed.
+     *
+     *  BOOT-TIME, like d3d9GuestAddRef: installing patches a guest stub and there is no unpatch
+     *  path, so `on`/`verify` set the flag for the NEXT boot while `mode` reports what is
+     *  installed right now.
+     *
+     *  `verify` installs the non-mutating oracle. It checks BOTH prediction kinds: the value the
+     *  stub would have answered, and — separately counted as `zeroChecked` — the count it read
+     *  when it decided to decline, against the answer JS produced. `checked: 0` says the oracle
+     *  never ran; `zeroChecked: 0` says it never covered a destruction, and the verdict says so
+     *  rather than reading as a clean pass. */
+    svc.register("d3d9GuestRelease", (args) => {
+        const opts = (args[0] ?? {}) as { on?: boolean; verify?: boolean; reset?: boolean };
+        const g = globalThis as Record<string, unknown>;
+        if (opts.on !== undefined) g.__d3d9GuestReleaseStub = !!opts.on;
+        if (opts.verify !== undefined) g.__d3d9ReleaseStubVerify = !!opts.verify;
+        return {
+            ...d3d9GuestReleaseStats(!!opts.reset),
+            requestedOn: !!g.__d3d9GuestReleaseStub,
+            requestedVerify: !!g.__d3d9ReleaseStubVerify,
+            guestRefcount: !!g.__d3d9GuestRefcount,
+            streamRing: !!g.__d3d9StreamRing,
+            appliesAt: "next boot (the stub patch has no unpatch path)",
+        };
+    });
+
+    /** d3d9PipelineMemo({on?, verify?, reset?}) — prologue memo for resolveProgrammablePipeline.
+     *
+     *  The function already ends in a numeric last-resolve compare that reuses the previous
+     *  draw's pipeline, but ~2 us of derived state is rebuilt before that compare can run.
+     *  `on` short-circuits straight to the shared reuse tail when no input to any of those
+     *  derived values moved; `verify` runs the full prologue anyway and checks the prediction.
+     *  Both live-read, so an A/B runs in one boot.
+     *
+     *  `hits` counts short-circuits taken (0 while verifying — verify deliberately runs the
+     *  long path). A run is evidence only when `checked` is large AND `mismatch` is 0;
+     *  `checked: 0` reports "oracle did not run", never a pass.
+     *
+     *  `profile` splits a HIT into guard / tail / whole-call microseconds, with `clockUs` (two
+     *  adjacent clock reads) as the instrument's own floor. Read it with
+     *  `d3d9PipelineMemoProfile`. */
+    svc.register("d3d9PipelineMemo", (args) => {
+        const opts = (args[0] ?? {}) as {
+            on?: boolean; verify?: boolean; reset?: boolean; profile?: boolean;
+        };
+        const g = globalThis as Record<string, unknown>;
+        if (opts.on !== undefined) g.__d3d9PipelineMemo = !!opts.on;
+        if (opts.verify !== undefined) g.__d3d9PipelineMemoVerify = !!opts.verify;
+        if (opts.profile !== undefined) g.__d3d9PipelineMemoProfile = !!opts.profile;
+        return d3d9PipelineMemoStats(!!opts.reset);
+    });
+
+    /** d3d9PipelineMemoProfile({reset?}) — where a memo HIT's microseconds go.
+     *
+     *  `guardUs` is the match test, `hashUs` the marginal cost of the streamHash inside it,
+     *  `tailUs` the shared reuse work a memo hit and a last-resolve hit both do — that tail is
+     *  NOT overhead, it is the floor under any memo and no guard change can remove it.
+     *  `clockUs` is the measurement floor; the verdict says so when a bucket sits on it.
+     *  Requires `d3d9PipelineMemo({profile: true})`, or every bucket reads "did not run".
+     *
+     *  Measured in-race on NFSU (188,041 hits): guard 0.237 us against a 0.158 us floor —
+     *  the guard is not the cost. tail 0.622 us, of which `noteDrawUs` 0.324 us is shader
+     *  attribution, which is what `__d3d9FastDrawAttribution` removes. */
+    svc.register("d3d9PipelineMemoProfile", (args) => {
+        const opts = (args[0] ?? {}) as { reset?: boolean };
+        return d3d9PipelineMemoProfileStats(!!opts.reset);
+    });
+
     svc.register("setWorkerFlag", (args) => {
         const [name, value] = args as [string, unknown];
         if (typeof name !== "string" || !name.startsWith("__")) {

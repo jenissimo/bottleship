@@ -141,6 +141,21 @@ import {
     arenaSupportsFragmentSamplerBank, arenaSupportsVertexSamplerBank, D3D9_ARENA_FRAGMENT_STAGE_COUNT, ArenaCommandType,
 } from "./d3d9-wasm-arena";
 import {
+    notePipelineMemoAgree,
+    notePipelineMemoHit,
+    notePipelineMemoMismatch,
+    notePipelineMemoProf,
+    pipelineMemoEnabled,
+    pipelineMemoProfiling,
+    pipelineMemoVerifying,
+    PROF_CLOCK,
+    PROF_GUARD,
+    PROF_HASH,
+    PROF_NOTE,
+    PROF_HIT,
+    PROF_TAIL,
+} from "./d3d9-pipeline-memo";
+import {
     arenaPipelineCacheBucket, buildArenaPipelineIdentity,
     type ArenaPipelineIdentitySnapshot,
 } from "./arena-pipeline-identity";
@@ -237,6 +252,21 @@ interface ShaderPairDiagnosticRecord {
     error: string | null;
     pipelineId: number | null;
     drawsIssued: number;
+    /** The two stage records this pair attributes its draws to, resolved once and revalidated
+     *  by `epoch` — the draw path runs on every programmable draw and must not look them up. */
+    vsDiag: ShaderDiagnosticRecord | null;
+    psDiag: ShaderDiagnosticRecord | null;
+    diagEpoch: number;
+}
+
+/**
+ * Live-read, default off. Attribute a programmable draw to its two stage records through the
+ * numeric index and a reference cached on the pair, instead of building `vs:<h>` and `ps:<h>`
+ * to reach the string-keyed map. Same records, same counters — the two routes are compared by
+ * `shaderInstrumentationSnapshot`, which reports `indexMismatch`.
+ */
+function fastDrawAttribution(): boolean {
+    return (globalThis as { __d3d9FastDrawAttribution?: boolean }).__d3d9FastDrawAttribution === true;
 }
 
 function opcodeHistogram(program: { instructions: Array<{ opcode: number }> }): Record<string, number> {
@@ -658,6 +688,11 @@ export class D3D9Device {
     /** HARNESS passCensus verb: what each recently submitted render pass was opened with. */
     getPassDebug(): ReturnType<D3D9BackendExecutor["getPassDebug"]> {
         return this.backendExecutor.getPassDebug();
+    }
+
+    /** [diag] The executor, for harness censuses (submitCensus). */
+    getBackendExecutor(): D3D9BackendExecutor {
+        return this.backendExecutor;
     }
 
     /** The attachment formats used by both the render pass and every pipeline variant.
@@ -1298,6 +1333,11 @@ export class D3D9Device {
     private swvpVsIntegerConstants = new Int32Array(2048 * 4);
     private swvpVsBooleanConstants = new Uint8Array(2048);
     private vsConstantBits = new Uint32Array(this.vsConstants.buffer);
+    /** Bit view of the SWVP bank. Its own field, not a slice of vsConstantBits: the two banks
+     *  are separate allocations (c0-c255 vs c0-c8191). Neither Float32Array is ever
+     *  reallocated — no assignment to either exists — so the view is bound once, per §3.1.
+     *  A reallocation of the bank would have to rebuild this. */
+    private swvpVsConstantBits = new Uint32Array(this.swvpVsConstants.buffer);
     private vsIntegerConstants = new Int32Array(SHADER_INTEGER_REGISTER_COUNT * 4); // i0-i15
     private vsIntegerBits = new Uint32Array(this.vsIntegerConstants.buffer);
     private vsBooleanMask = 0; // b0-b15, normalized to one bit per register
@@ -1321,6 +1361,15 @@ export class D3D9Device {
      * every emitter dispatch records status directly. */
     private shaderDiagnosticNextPair = 1;
     private shaderDiagnostics = new Map<string, ShaderDiagnosticRecord>();
+    /** A second INDEX over the very same records, keyed by the numeric handle the draw path
+     *  already has. It exists because `shaderDiagnostics` can only be reached by building a
+     *  `stage:handle` string, and the draw path would allocate two of them per draw. Written in
+     *  exactly one place, beside the map it indexes, so the two cannot drift. */
+    private vsDiagnosticsByHandle = new Map<number, ShaderDiagnosticRecord>();
+    private psDiagnosticsByHandle = new Map<number, ShaderDiagnosticRecord>();
+    /** Bumped whenever a record is (re)published, so a reference cached on a shader pair can
+     *  tell it is still the record that handle names. */
+    private shaderDiagnosticEpoch = 0;
     private shaderPairDiagnostics = new Map<number, ShaderPairDiagnosticRecord>();
     private shaderPipelinePairs = new Map<number, number>();
     private shaderBuildFailures = 0;
@@ -1386,9 +1435,33 @@ export class D3D9Device {
 
     private invalidateLastResolve(): void {
         this._lrValid = false;
+        this._pmValid = false;
         this.pipelineStateGeneration++;
         this.attachmentGeneration++;
     }
+
+    // ── Programmable-pipeline PROLOGUE memo (see d3d9-pipeline-memo.ts) ───────
+    // The inputs to every derived value the last-resolve compare needs. A hit asserts
+    // that compare would have succeeded, so the ~25 derived values need not be rebuilt
+    // to discover it. Everything here is either an explicit argument, a bound-object
+    // handle, or one of the four generations the derived values are already memoised
+    // on — no value read here lacks a generation behind it.
+    private _pmValid = false;
+    private _pmTopo = "";
+    private _pmForceCull = false;
+    private _pmStrideOverride = -1;
+    private _pmSlotMask = 0;
+    private _pmPointExp = false;
+    private _pmVs = 0; private _pmPs = 0; private _pmDecl = 0; private _pmFvf = 0;
+    private _pmStride: number | null = null;
+    private _pmStreamHash = 0;
+    private _pmGenPipeline = -1;
+    private _pmGenSampler = -1;
+    private _pmGenBank = -1;
+    private _pmGenAttach = -1;
+    /** Whether the memoised call had a pixel shader — the one input to arenaBaseEligible
+     *  the reuse tail cannot cheaply re-derive without getActivePsShader(). */
+    private _pmPsNonNull = false;
     /** Index of the most recent captured draw-state slot THIS frame
      *  (identical-consecutive-state elision); -1 = none. Reset at submitFrame. */
     private lastCaptureIndex = -1;
@@ -1892,7 +1965,7 @@ export class D3D9Device {
     }
 
     private rememberShaderDiagnostic(stage: ShaderDiagnosticStage, handle: number, compiled: CompiledVs | CompiledPs): void {
-        this.shaderDiagnostics.set(`${stage}:${handle}`, {
+        const record: ShaderDiagnosticRecord = {
             handle,
             stage,
             version: `${stage}_${compiled.prog.major}_${compiled.prog.minor}`,
@@ -1901,7 +1974,10 @@ export class D3D9Device {
             approximated: new Set(),
             dispatched: 0,
             drawsIssued: 0,
-        });
+        };
+        this.shaderDiagnostics.set(`${stage}:${handle}`, record);
+        (stage === "vs" ? this.vsDiagnosticsByHandle : this.psDiagnosticsByHandle).set(handle, record);
+        this.shaderDiagnosticEpoch++;
     }
 
     /** WebGPU shader and pipeline validation is asynchronous; retain its result instead of
@@ -1966,6 +2042,9 @@ export class D3D9Device {
             error: null,
             pipelineId: null,
             drawsIssued: 0,
+            vsDiag: null,
+            psDiag: null,
+            diagEpoch: -1,
         };
         this.shaderPairDiagnostics.set(handle, pair);
         return pair;
@@ -2007,13 +2086,30 @@ export class D3D9Device {
         // of replaying a pipeline that the device has already rejected.
         if (pair.build === "failed") return -1;
         pair.drawsIssued++;
-        const vs = this.shaderDiagnostics.get(`vs:${pair.vsHandle}`);
-        if (vs) vs.drawsIssued++;
-        if (pair.psHandle !== null) {
-            const ps = this.shaderDiagnostics.get(`ps:${pair.psHandle}`);
-            if (ps) ps.drawsIssued++;
+        if (!fastDrawAttribution()) {
+            const vs = this.shaderDiagnostics.get(`vs:${pair.vsHandle}`);
+            if (vs) vs.drawsIssued++;
+            if (pair.psHandle !== null) {
+                const ps = this.shaderDiagnostics.get(`ps:${pair.psHandle}`);
+                if (ps) ps.drawsIssued++;
+            }
+            return pipelineId;
         }
+        if (pair.diagEpoch !== this.shaderDiagnosticEpoch) this.resolvePairDiagnostics(pair);
+        if (pair.vsDiag) pair.vsDiag.drawsIssued++;
+        if (pair.psDiag) pair.psDiag.drawsIssued++;
         return pipelineId;
+    }
+
+    /** Re-point a pair at the records its handles name now. Off the draw path: a shader is
+     *  created a few hundred times in a session, and a draw happens tens of thousands of times
+     *  a second. */
+    private resolvePairDiagnostics(pair: ShaderPairDiagnosticRecord): void {
+        pair.vsDiag = this.vsDiagnosticsByHandle.get(pair.vsHandle) ?? null;
+        pair.psDiag = pair.psHandle !== null
+            ? (this.psDiagnosticsByHandle.get(pair.psHandle) ?? null)
+            : null;
+        pair.diagEpoch = this.shaderDiagnosticEpoch;
     }
 
     /** Read-only harness seam for the shaderOps command. `complete:false` is intentional:
@@ -2049,6 +2145,16 @@ export class D3D9Device {
             pipelineId: pair.pipelineId,
             drawsIssued: pair.drawsIssued,
         }));
+        // The numeric index the fast attribution path reads must name the RECORDS the
+        // string-keyed map names. Checked at read time, where it costs nothing: a drift would
+        // otherwise show up only as draw counts attributed to a record nobody reports.
+        let indexChecked = 0;
+        let indexMismatch = 0;
+        for (const [key, record] of this.shaderDiagnostics) {
+            indexChecked++;
+            const index = key.startsWith("vs:") ? this.vsDiagnosticsByHandle : this.psDiagnosticsByHandle;
+            if (index.get(record.handle) !== record) indexMismatch++;
+        }
         return {
             instrumentationVersion: 2,
             shaderBuildFailures: this.shaderBuildFailures,
@@ -2064,6 +2170,12 @@ export class D3D9Device {
             attribution: {
                 programmableDraws: this.progDrawsSeen,
                 unattributed: this.progDrawsUnattributed,
+                fastPath: fastDrawAttribution(),
+                indexChecked,
+                indexMismatch,
+                indexVerdict: indexChecked === 0
+                    ? "no shader records — the index check did not run"
+                    : (indexMismatch === 0 ? "agree" : "DISAGREE"),
             },
         };
     }
@@ -2292,9 +2404,7 @@ export class D3D9Device {
         d3d9PerfInc("setVertexShaderConstantF");
         const baseIdx = startRegister * 4;
         const swvp = this.softwareVertexProcessing;
-        const target = swvp ? this.swvpVsConstants : this.vsConstants;
-        const targetBits = new Uint32Array(target.buffer, target.byteOffset, target.length);
-        const max = target.length;
+        const max = (swvp ? this.swvpVsConstants : this.vsConstants).length;
         const n = vector4fCount * 4;
         if (this.recordingStateBlock) {
             const data = this.readGuestConstantsForRecording(pConstantData, Math.min(n, max - baseIdx), mem);
@@ -2315,7 +2425,7 @@ export class D3D9Device {
         let changedSwvp = false;
         if (swvp) {
             changedSwvp = this.copyShaderConstantsFromGuest(
-                new Uint32Array(this.swvpVsConstants.buffer), startRegister, pConstantData, vector4fCount, mem,
+                this.swvpVsConstantBits, startRegister, pConstantData, vector4fCount, mem,
             );
         } else if (changedHw) {
             this.swvpBankStale = true;
@@ -2598,7 +2708,7 @@ export class D3D9Device {
         const changedHw = hwCount > 0
             && this.copyShaderConstantBitsFromMem32(this.vsConstantBits, baseIdx, mem32, srcIdx, hwCount);
         const changedSwvp = this.copyShaderConstantBitsFromMem32(
-            new Uint32Array(this.swvpVsConstants.buffer), baseIdx, mem32, srcIdx, swvpCount,
+            this.swvpVsConstantBits, baseIdx, mem32, srcIdx, swvpCount,
         );
         if (changedHw || changedSwvp) this.vsConstantsVersion++;
         else d3d9PerfSkip("vsConstantUnchanged");
@@ -4568,8 +4678,7 @@ export class D3D9Device {
     private ensureSwvpBankSynced(): void {
         if (!this.swvpBankStale) return;
         this.swvpBankStale = false;
-        const mirror = new Uint32Array(this.swvpVsConstants.buffer, this.swvpVsConstants.byteOffset,
-            this.swvpVsConstants.length);
+        const mirror = this.swvpVsConstantBits;
         mirror.set(this.vsConstantBits.subarray(0, Math.min(this.vsConstantBits.length, mirror.length)));
     }
 
@@ -8389,6 +8498,103 @@ export class D3D9Device {
      * +render-state, build using the executor's shared explicit layout.
      * Returns -1 on shader-compile failure (the draw is then skipped).
      */
+    /**
+     * The reuse tail: what a resolve does once it knows the previous draw's pipeline is
+     * the right one. ONE definition, reached both by the last-resolve compare and by the
+     * prologue memo, so the memo cannot skip a side effect (the arena record, the
+     * counters, noteProgrammableDraw) the compare would have performed.
+     *
+     * arenaSpec is per-draw and is deliberately NOT memoised — recordArenaSpec runs on
+     * every call and is what republishes pendingArenaRecord.
+     */
+    private _programmablePipelineReuse(arenaSpec: ArenaRecordSpec | undefined, psNonNull: boolean): number {
+        let arenaKey: number | undefined;
+        let arenaIdentity: string | undefined;
+        // The representability probe is itself memoised, but still belongs after the cheap
+        // numeric comparison: a non-arena draw must not pay even its closure or sampler-bank
+        // walk merely because a programmable shader is active.
+        const arenaEligible = !!arenaSpec && psNonNull && isWasmPathEnabled()
+            && d3d9WasmArena.isInitialized() && this.arenaCanRepresentCurrentSamplerBank();
+        // No sampler-generation gate: the published identity is a pure function of the
+        // compared fields and carries no texture state, so a SetTexture between two draws of
+        // the same state run leaves it valid. Rust compares the bind-group key itself.
+        // Gating here made the arena record only the FIRST draw of every run.
+        if (arenaEligible && arenaSpec && this._lrArenaIdentity !== undefined
+            && this._lrArenaIdentityWords !== undefined) {
+            const identity = this.lastResolveIdentityScratch;
+            identity.key = this._lrArenaIdentity;
+            identity.words = this._lrArenaIdentityWords;
+            arenaKey = this.recordArenaSpec(arenaSpec, identity, true);
+            if (arenaKey !== undefined) arenaIdentity = identity.key;
+        }
+        d3d9PerfBackendInc("progPipelineCacheHits");
+        if (this.frameSnapshot.frameCounters) this.frameSnapshot.frameCounters.cacheHits++;
+        if (arenaKey !== undefined && arenaIdentity !== undefined) {
+            this.backendExecutor.registerArenaPipelineIdentity(arenaIdentity, this._lrPipelineId);
+        }
+        if (this._lrPipelineId < 0) return this._lrPipelineId;
+        if (!pipelineMemoProfiling()) return this.noteProgrammableDraw(this._lrPipelineId);
+        const t0 = performance.now();
+        const noted = this.noteProgrammableDraw(this._lrPipelineId);
+        notePipelineMemoProf(PROF_NOTE, performance.now() - t0);
+        return noted;
+    }
+
+    /**
+     * Does the armed prologue memo describe THIS call? Every input to the derived values
+     * the last-resolve compare needs is either compared here directly or is a pure
+     * function of one of the four generations compared here — that equivalence is the
+     * whole safety argument, so a field added to the resolve body without a generation
+     * behind it must be added here explicitly or the memo must be left disarmed.
+     */
+    private _pipelineMemoMatches(
+        topology: string, forceCullNone: boolean, strideOverride: number | undefined,
+        slotMask: number, pointExpansion: boolean,
+    ): boolean {
+        if (!this._pmValid) return false;
+        if (this._pmTopo !== topology || this._pmForceCull !== forceCullNone) return false;
+        if (this._pmStrideOverride !== (strideOverride ?? -1)) return false;
+        if (this._pmSlotMask !== slotMask || this._pmPointExp !== pointExpansion) return false;
+        if (this._pmVs !== this.activeVertexShader || this._pmPs !== this.activePixelShader) return false;
+        if (this._pmDecl !== this.activeVertexDecl) return false;
+        if (this._pmFvf !== (this.stateTracker.getFVF() >>> 0)) return false;
+        if (this._pmGenPipeline !== this.pipelineStateGeneration) return false;
+        if (this._pmGenSampler !== this.samplerStateGeneration) return false;
+        if (this._pmGenBank !== this.arenaSamplerBankGeneration) return false;
+        if (this._pmGenAttach !== this.attachmentGeneration) return false;
+        const stride = strideOverride ?? this.stateTracker.getStreamSource()?.stride ?? null;
+        if (this._pmStride !== stride) return false;
+        return this._pmStreamHash === this.streamHash(slotMask, stride ?? 0);
+    }
+
+    /** Arm the prologue memo. Callers MUST already have established the three conditions
+     *  the last-resolve compare itself requires — no pointExpansion, no pre-transformed
+     *  viewport bake, no programmable clip planes — because the reduced `_lr*` fields do
+     *  not carry them. */
+    private _armPipelineMemo(
+        topology: string, forceCullNone: boolean, strideOverride: number | undefined,
+        slotMask: number, pointExpansion: boolean, stride: number | null,
+        streamHash: number, psNonNull: boolean,
+    ): void {
+        this._pmTopo = topology;
+        this._pmForceCull = forceCullNone;
+        this._pmStrideOverride = strideOverride ?? -1;
+        this._pmSlotMask = slotMask;
+        this._pmPointExp = pointExpansion;
+        this._pmVs = this.activeVertexShader;
+        this._pmPs = this.activePixelShader;
+        this._pmDecl = this.activeVertexDecl;
+        this._pmFvf = this.stateTracker.getFVF() >>> 0;
+        this._pmStride = stride;
+        this._pmStreamHash = streamHash;
+        this._pmGenPipeline = this.pipelineStateGeneration;
+        this._pmGenSampler = this.samplerStateGeneration;
+        this._pmGenBank = this.arenaSamplerBankGeneration;
+        this._pmGenAttach = this.attachmentGeneration;
+        this._pmPsNonNull = psNonNull;
+        this._pmValid = true;
+    }
+
     private resolveProgrammablePipeline(
         topology: "triangle-list" | "line-list",
         forceCullNone: boolean,
@@ -8398,21 +8604,67 @@ export class D3D9Device {
         arenaSpec?: ArenaRecordSpec,
     ): number {
         this.pendingArenaRecord = null;
-        if (!this.rasterStateSupported(topology)) return -1;
+        // See resolvePipelineId: cull rides the numeric key, so the toggle joins here.
+        forceCullNone = forceCullNone || this.debugFlags.forceCullNone;
+
+        // ── Prologue memo ────────────────────────────────────────────────────
+        // Everything from here to the last-resolve compare is derived state; when none
+        // of its inputs moved, that compare's answer cannot have changed either. Both
+        // the memo hit and the compare hit return through _programmablePipelineReuse,
+        // so the shortcut cannot skip a side effect the compare would have run.
+        // Stage profile (default off): where a HIT's time goes, split into the guard, the
+        // marginal cost of the streamHash inside it, and the shared reuse tail.
+        const prof = pipelineMemoProfiling();
+        let tEntry = 0;
+        if (prof) {
+            const c0 = performance.now();
+            const c1 = performance.now();
+            notePipelineMemoProf(PROF_CLOCK, c1 - c0);
+            tEntry = performance.now();
+        }
+        const memoKeyMatches = this._pipelineMemoMatches(
+            topology, forceCullNone, strideOverride, slotMask, pointExpansion);
+        if (prof) notePipelineMemoProf(PROF_GUARD, performance.now() - tEntry);
+        const memoVerify = memoKeyMatches && pipelineMemoVerifying();
+        if (memoKeyMatches && !memoVerify && pipelineMemoEnabled()) {
+            notePipelineMemoHit();
+            if (!prof) return this._programmablePipelineReuse(arenaSpec, this._pmPsNonNull);
+            const t0 = performance.now();
+            const reused = this._programmablePipelineReuse(arenaSpec, this._pmPsNonNull);
+            const t1 = performance.now();
+            notePipelineMemoProf(PROF_TAIL, t1 - t0);
+            // guard + tail as one span. It carries the two probe clock reads between them —
+            // bounded by the reported clockUs, and the probes below are outside it entirely.
+            notePipelineMemoProf(PROF_HIT, t1 - tEntry);
+            // streamHash is pure: an extra call after the timed span measures its marginal
+            // cost without perturbing either of the numbers it is meant to explain.
+            const h0 = performance.now();
+            this.streamHash(slotMask, strideOverride ?? 0);
+            notePipelineMemoProf(PROF_HASH, performance.now() - h0);
+            return reused;
+        }
+
+        if (!this.rasterStateSupported(topology)) {
+            if (memoVerify) notePipelineMemoMismatch("bail:rasterStateSupported");
+            return -1;
+        }
         const unsupportedSampler = this.firstUnsupportedSamplerStage(true);
         if (unsupportedSampler !== null) {
+            if (memoVerify) notePipelineMemoMismatch("bail:unsupportedSamplerStage");
             Logger.error(LogCategory.D3D9,
                 `[D3D9] sampler stage ${unsupportedSampler.stage} uses unsupported feature ` +
                 `${unsupportedSampler.reason}; refusing draw`);
             return -1;
         }
-        // See resolvePipelineId: cull rides the numeric key, so the toggle joins here.
-        forceCullNone = forceCullNone || this.debugFlags.forceCullNone;
         const vs = this.getActiveVsShader();
-        if (!vs) return -1;
+        if (!vs) {
+            if (memoVerify) notePipelineMemoMismatch("bail:noVertexShader");
+            return -1;
+        }
         const ps = this.getActivePsShader();
         const hybridStages = ps ? 0 : this.activeStageCount();
         if (!ps && this.boundVolumeMask() !== 0) {
+            if (memoVerify) notePipelineMemoMismatch("bail:volumeWithoutPs");
             Logger.error(LogCategory.D3D9, "[D3D9] pixel volume texture requires a programmable pixel shader; refusing hybrid FFP draw");
             return -1;
         }
@@ -8428,7 +8680,10 @@ export class D3D9Device {
         // A programmable VS still consumes the active FVF declaration. Refuse an
         // unrepresentable weighted format instead of silently falling back to a tight FLOAT4
         // layout that would read the wrong bytes for every vertex.
-        if (activeFvf !== 0 && this.activeVertexDecl === 0 && declElements === null) return -1;
+        if (activeFvf !== 0 && this.activeVertexDecl === 0 && declElements === null) {
+            if (memoVerify) notePipelineMemoMismatch("bail:unrepresentableFvfDecl");
+            return -1;
+        }
         const streamSource = this.stateTracker.getStreamSource();
         const stride = strideOverride ?? streamSource?.stride ?? null;
         const stateBits = this.stateTracker.computePipelineKey() & 0x7FF0000;
@@ -8436,6 +8691,7 @@ export class D3D9Device {
         // is part of the pipeline identity — not just slot 0's. One hash over the used slots.
         const multiSlot = !!declElements && declElements.length > 0 && (slotMask & ~1) !== 0;
         if (multiSlot && slotMaskExceedsLimit(slotMask, this.maxVertexBufferSlots())) {
+            if (memoVerify) notePipelineMemoMismatch("bail:streamSlotOverLimit");
             d3d9DropDraw("pipeline:streamSlotOverLimit");
             return -1;
         }
@@ -8481,10 +8737,14 @@ export class D3D9Device {
         const alphaKey = this.stateKeyAlpha;
         const depthKey = this.stateKeyDepth;
         const targetKey = this.stateKeyTarget;
-        if (targetKey === "invalid") return -1;
+        if (targetKey === "invalid") {
+            if (memoVerify) notePipelineMemoMismatch("bail:invalidTarget");
+            return -1;
+        }
         const writesColor = ps?.analysis.writesColor ?? [true, false, false, false];
         for (let i = 1; i < writesColor.length; i++) {
             if (writesColor[i] && this.renderTargetIndices[i] === null) {
+                if (memoVerify) notePipelineMemoMismatch("bail:mrtTargetUnbound");
                 Logger.error(LogCategory.D3D9,
                     `[D3D9] MRT: pixel shader writes oC${i}, but render target ${i} is not bound`);
                 return -1;
@@ -8515,32 +8775,12 @@ export class D3D9Device {
             && this._lrStreamHash === streamHash
             && this._lrTarget === targetKey;
         if (lastResolveMatches) {
-            // The representability probe is itself memoised, but still belongs after the cheap
-            // numeric last-resolve comparison: a non-arena draw must not pay even its closure or
-            // sampler-bank walk merely because a programmable shader is active.
-            const arenaEligible = arenaBaseEligible && this.arenaCanRepresentCurrentSamplerBank();
-            // No sampler-generation gate: the published identity is a pure function of the
-            // fields compared above and carries no texture state, so a SetTexture between two
-            // draws of the same state run leaves it valid. Rust compares the bind-group key
-            // itself. Gating here made the arena record only the FIRST draw of every run.
-            if (arenaEligible && arenaSpec && this._lrArenaIdentity !== undefined
-                && this._lrArenaIdentityWords !== undefined) {
-                const identity = this.lastResolveIdentityScratch;
-                identity.key = this._lrArenaIdentity;
-                identity.words = this._lrArenaIdentityWords;
-                arenaKey = this.recordArenaSpec(arenaSpec, identity, true);
-                if (arenaKey !== undefined) {
-                    arenaIdentity = identity.key;
-                    arenaIdentityWords = identity.words;
-                }
-            }
-            d3d9PerfBackendInc("progPipelineCacheHits");
-            if (this.frameSnapshot.frameCounters) this.frameSnapshot.frameCounters.cacheHits++;
-            if (arenaKey !== undefined && arenaIdentity !== undefined) {
-                this.backendExecutor.registerArenaPipelineIdentity(arenaIdentity, this._lrPipelineId);
-            }
-            return this._lrPipelineId < 0 ? this._lrPipelineId : this.noteProgrammableDraw(this._lrPipelineId);
+            if (memoVerify) notePipelineMemoAgree();
+            this._armPipelineMemo(topology, forceCullNone, strideOverride, slotMask, pointExpansion,
+                stride, streamHash, ps !== null);
+            return this._programmablePipelineReuse(arenaSpec, ps !== null);
         }
+        if (memoVerify) notePipelineMemoMismatch("lastResolveMatches:false");
 
         // We only assemble/hash the canonical identity after the numeric memo misses. The
         // compact Rust hash remains a bucket; the full readable key prevents omitted-field and
@@ -8564,6 +8804,9 @@ export class D3D9Device {
                 if (this.frameSnapshot.frameCounters) this.frameSnapshot.frameCounters.cacheHits++;
                 if (!preTransformed) {
                     this._storeLastResolve(stride, stateBits, topology, forceCullNone, blendKey, alphaKey, depthKey, cubeMask, comparisonMask, comparisonKey, volumeMask, vertexVolumeMask, projKey, hybridStages, samplerKey, streamHash, targetKey, cachedViaArena, arenaIdentity, arenaIdentityWords);
+                    if (!pointExpansion && !programmableClipPlanes) {
+                        this._armPipelineMemo(topology, forceCullNone, strideOverride, slotMask, pointExpansion, stride, streamHash, ps !== null);
+                    }
                 }
                 if (arenaIdentity !== undefined) this.backendExecutor.registerArenaPipelineIdentity(arenaIdentity, cachedViaArena);
                 return cachedViaArena < 0 ? cachedViaArena : this.noteProgrammableDraw(cachedViaArena);
@@ -8577,6 +8820,9 @@ export class D3D9Device {
             if (this.frameSnapshot.frameCounters) this.frameSnapshot.frameCounters.cacheHits++;
             if (!preTransformed) {
                 this._storeLastResolve(stride, stateBits, topology, forceCullNone, blendKey, alphaKey, depthKey, cubeMask, comparisonMask, comparisonKey, volumeMask, vertexVolumeMask, projKey, hybridStages, samplerKey, streamHash, targetKey, cached, arenaIdentity, arenaIdentityWords);
+                if (!pointExpansion && !programmableClipPlanes) {
+                    this._armPipelineMemo(topology, forceCullNone, strideOverride, slotMask, pointExpansion, stride, streamHash, ps !== null);
+                }
             }
             if (arenaIdentity !== undefined) this.backendExecutor.registerArenaPipelineIdentity(arenaIdentity, cached);
             if (isWasmPathEnabled() && arenaCacheKey !== null) this.cacheArenaPipeline(arenaCacheKey, cached);
@@ -8590,6 +8836,9 @@ export class D3D9Device {
         if (isWasmPathEnabled() && arenaCacheKey !== null) this.cacheArenaPipeline(arenaCacheKey, pipelineId);
         if (!preTransformed) {
             this._storeLastResolve(stride, stateBits, topology, forceCullNone, blendKey, alphaKey, depthKey, cubeMask, comparisonMask, comparisonKey, volumeMask, vertexVolumeMask, projKey, hybridStages, samplerKey, streamHash, targetKey, pipelineId, arenaIdentity, arenaIdentityWords);
+            if (!pointExpansion && !programmableClipPlanes) {
+                this._armPipelineMemo(topology, forceCullNone, strideOverride, slotMask, pointExpansion, stride, streamHash, ps !== null);
+            }
         }
         return pipelineId < 0 ? pipelineId : this.noteProgrammableDraw(pipelineId);
     }
@@ -9069,6 +9318,13 @@ export class D3D9Device {
      * two bank generations. The frame serial is in the signature because the slot pool is
      * reset per frame, so an index from a previous frame is not reusable.
      */
+    /**
+     * Bumped whenever the stage window below is actually re-resolved. Two draws stamped with
+     * the same value hold the SAME texture/sampler objects — not merely equal state — because
+     * the memo branch copies the previous resolution's references verbatim. That is the
+     * property the executor's bind-group front memo rests on.
+     */
+    private stageWindowEpoch = 0;
     private stageWindowBankGen = -1;
     private stageWindowSamplerGen = -1;
     private stageWindowCube = -1;
@@ -9288,6 +9544,7 @@ export class D3D9Device {
                 state.vertexSamplers[n] = this.stageWindowVertexSamplers[n] ?? null;
             }
             state.sampler = this.stageWindowSampler0;
+            state.stageEpoch = this.stageWindowEpoch;
             return this.finishCaptureDrawState(state, index, frame, vs, ps);
         }
 
@@ -9380,6 +9637,7 @@ export class D3D9Device {
         this.stageWindowVertexVolume = vertexVolumeMask;
         this.stageWindowHasPs = ps !== null;
         this.stageWindowRtGuard = this.attachmentGeneration;
+        state.stageEpoch = ++this.stageWindowEpoch;
 
         return this.finishCaptureDrawState(state, index, frame, vs, ps);
     }

@@ -103,6 +103,9 @@ const FFP_CACHE_N = 256;          // (sampler, texture) pairs — an FFP frame's
 const FFP_AUTO_CACHE_N = 1024;
 /** Verify-only fingerprints are diagnostics, not a process-lifetime cache. */
 const ARENA_SEEN_PIPELINE_KEYS_MAX = 4096;
+/** Bind-group census: distinct programmable keys remembered, so "this material came back"
+ *  is answerable without an unbounded set. */
+const CENSUS_SEEN_HASH_MAX = 65536;
 
 /** A growable per-frame uniform ring written at 256-aligned offsets. */
 class UniformArena {
@@ -177,6 +180,95 @@ export class D3D9BackendExecutor {
     /** Query manager currently attached to the D3D9 device. Helper submits share its serial
      * domain with execute() so SetRenderTarget/Clear/StretchRect cannot strand an open query. */
     private activeQueryManager: D3D9QueryManager | null = null;
+
+    /** [diag] queue.submit census (harness submitCensus verb). Measures the SUBMIT, not the
+     *  frame: `nfsu-submit-cost` times the whole `submitFrame()` (finalize + execute + submit)
+     *  and its 166 us/call was read as the submit's price — it is ~13 us. A lever sized off
+     *  the wrong one of those is 35x out. */
+    private submitCount = 0;
+    private presentCount = 0;
+    private submitMs = 0;
+
+    getSubmitStats(reset = false): {
+        submits: number; presents: number; submitsPerPresent: number | null;
+        submitMsPerPresent: number | null; usPerSubmit: number | null;
+    } {
+        const out = {
+            submits: this.submitCount,
+            presents: this.presentCount,
+            submitsPerPresent: this.presentCount > 0 ? this.submitCount / this.presentCount : null,
+            submitMsPerPresent: this.presentCount > 0 ? this.submitMs / this.presentCount : null,
+            usPerSubmit: this.submitCount > 0 ? (this.submitMs * 1000) / this.submitCount : null,
+        };
+        if (reset) { this.submitCount = 0; this.presentCount = 0; this.submitMs = 0; }
+        return out;
+    }
+
+    /**
+     * [diag] Bind-group census (harness `d3d9BindGroupCensus`). Answers per cache: how often it
+     * was asked, how often it answered, and — for the programmable one, the only one a
+     * VS+PS title uses — whether a build was a returning material (capacity) or a new one.
+     *
+     * `presents` is in the same window, so every rate here is per FRAME without a second
+     * snapshot from a different clock. `perFrameBuilds: null` means no frame was presented in
+     * the window: no denominator, so no rate, rather than a number divided by zero draws.
+     */
+    getBindGroupCensus(reset = false): Record<string, number | string | null | boolean> {
+        const c = this.census;
+        // The census owns its own frame counter: `presentCount` belongs to submitCensus, and a
+        // probe that resets that one would silently leave this rate dividing by the wrong window.
+        const frames = this.censusPresents;
+        const progAsked = c.progAcquires;
+        const builds = c.progBuilds + c.ffpAutoBuilds + c.ffpSharedBuilds + c.frameLevelBuilds;
+        const out: Record<string, number | string | null | boolean> = {
+            frames,
+            ...c,
+            progHitRate: progAsked > 0 ? c.progHits / progAsked : null,
+            perFrameProgBuilds: frames > 0 ? c.progBuilds / frames : null,
+            perFrameBuilds: frames > 0 ? builds / frames : null,
+            // Distinct GPU objects the programmable key has ever had to name. In a steady scene
+            // this must be flat; growth in step with progBuilds means the views/samplers are
+            // being recreated upstream and the cache cannot be the fix.
+            gpuIdsAssigned: this.nextGpuId - 1,
+            progCacheLen: this.progCacheLen,
+            progCacheN: this.progCacheN,
+            ffpAutoLen: this.ffpAutoLen,
+            ffpAutoCacheN: this.ffpAutoCacheN,
+            seenHashes: this.censusSeenProgHashes.size,
+            seenSaturated: this.censusSeenSaturated,
+            bindGroupSets: this.metrics.bindGroupSets,
+            bindGroupSetSkips: this.metrics.bindGroupSetSkips,
+            drawCalls: this.metrics.drawCalls,
+            // us/call for acquireProgBindGroup, by outcome. null = the profile never ran
+            // (`__d3d9BindGroupProfile`), which is not the same as "it was free".
+            profiling: this.bgProfiling(),
+            // Front-memo oracle. `fastKeyChecked: 0` says it never ran, not that it agreed.
+            fastKeyOn: this.fastKeyEnabled(),
+            fastKeyVerify: this.fastKeyVerifying(),
+            fastKeyChecked: this.fastKeyChecked,
+            fastKeyUnsafe: this.fastKeyUnsafe,
+            fastKeyConservative: this.fastKeyConservative,
+            fastKeyVerdict: this.fastKeyChecked === 0
+                ? "front-memo oracle did not run"
+                : (this.fastKeyUnsafe === 0 ? "safe" : "UNSAFE"),
+            hitUs: this.bgProfN[0]! > 0 ? (this.bgProfMs[0]! * 1000) / this.bgProfN[0]! : null,
+            missUs: this.bgProfN[1]! > 0 ? (this.bgProfMs[1]! * 1000) / this.bgProfN[1]! : null,
+            clockUs: this.bgProfN[2]! > 0 ? (this.bgProfMs[2]! * 1000) / this.bgProfN[2]! : null,
+            // us/call for a front-memo hit — the same span as `hitUs`, so the two are directly
+            // comparable and the saving is (hitUs - fastUs) x progFastKeyHits.
+            fastUs: this.bgProfN[3]! > 0 ? (this.bgProfMs[3]! * 1000) / this.bgProfN[3]! : null,
+        };
+        if (reset) {
+            c.progAcquires = 0; c.progHits = 0; c.progBuilds = 0; c.progRebuiltHash = 0;
+            c.progEvictLive = 0; c.progFastKeyHits = 0; c.ffpAutoAcquires = 0; c.ffpAutoHits = 0; c.ffpAutoBuilds = 0;
+            c.ffpAutoEvictLive = 0; c.ffpSharedBuilds = 0; c.frameLevelBuilds = 0;
+            this.censusPresents = 0;
+            this.fastKeyChecked = 0; this.fastKeyUnsafe = 0; this.fastKeyConservative = 0;
+            for (let i = 0; i < this.bgProfMs.length; i++) { this.bgProfMs[i] = 0; this.bgProfN[i] = 0; }
+            // drawCalls/bindGroupSets are shared with other verbs; leave them to their owners.
+        }
+        return out;
+    }
 
     // Optimization caches
     private currentPipelineId: number | null = null;
@@ -259,6 +351,111 @@ export class D3D9BackendExecutor {
         progConstReuseHits: 0,
     };
 
+    /**
+     * [diag] Why a bind-group build happened — the question `bindGroupBuilds` alone cannot
+     * answer, and the one a fix has to be sized off.
+     *
+     * `rebuiltHash` is a key that HAS been built before: the material came back and the cache
+     * no longer had it, i.e. capacity/eviction. `evictLive` is the ring overwriting an occupied
+     * slot, the mechanism behind that. `gpuIdsAssigned` is the count of distinct GPU objects the
+     * key has ever seen — if it climbs in step with the builds in a steady scene, the views and
+     * samplers themselves are being recreated upstream and no cache sizing can help.
+     *
+     * A build that is neither a rebuiltHash nor accompanied by gpuId growth is a genuinely new
+     * material, which is the case where the cache is simply right.
+     */
+    private census = {
+        progAcquires: 0, progHits: 0, progBuilds: 0, progRebuiltHash: 0, progEvictLive: 0,
+        progFastKeyHits: 0,
+        ffpAutoAcquires: 0, ffpAutoHits: 0, ffpAutoBuilds: 0, ffpAutoEvictLive: 0,
+        ffpSharedBuilds: 0, frameLevelBuilds: 0,
+    };
+    /** Hashes ever built, so a returning material is distinguishable from a new one. Bounded:
+     *  a diagnostic must not be able to grow without limit in a long session. */
+    private censusSeenProgHashes = new Set<number>();
+    private censusSeenSaturated = false;
+    private censusPresents = 0;
+
+    /**
+     * [diag] What `acquireProgBindGroup` costs, split by outcome. Default off (live flag
+     * `__d3d9BindGroupProfile`), because the clock reads it needs are comparable to what it
+     * measures — `clockMs/clockN` is that floor and the verb reports it beside the buckets.
+     *
+     * The split matters because the two answers point at opposite fixes: if the HIT is
+     * expensive the lever is the key (41 WeakMap lookups and 40 identity compares per draw,
+     * paid whether or not the group is found), if the MISS is the lever is the cache.
+     */
+    private bgProfMs = [0, 0, 0, 0];
+    private bgProfN = [0, 0, 0, 0];
+    private bgProfiling(): boolean {
+        return (globalThis as { __d3d9BindGroupProfile?: boolean }).__d3d9BindGroupProfile === true;
+    }
+
+    /**
+     * Front memo for `acquireProgBindGroup`, default OFF (live `__d3d9ProgBindFastKey`).
+     *
+     * The full key names 41 GPU objects through a WeakMap and verifies up to 40 of them by
+     * identity, on EVERY draw — and the census says the cache never misses in a steady scene,
+     * so that is the whole cost. The device stamps each draw state with the epoch of the stage
+     * window that filled it; equal epochs mean the SAME view and sampler objects, not merely
+     * equal ones, so with the sampler and the four masks the group is decided. Anything that
+     * moves the window bumps the epoch, and a miss falls through to the full path unchanged —
+     * this can only skip re-deriving a key, never invent a group.
+     *
+     * It is a front memo, not a replacement cache: it never inserts, so it cannot spray
+     * duplicate groups into the ring the way a widened cache key would.
+     */
+    private fastKeyEpoch = -1;
+    private fastKeySampler: GPUSampler | null = null;
+    private fastKeyCube = -1;
+    private fastKeyComparison = -1;
+    private fastKeyVolume = -1;
+    private fastKeyVertexVolume = -1;
+    private fastKeyGroup: GPUBindGroup | null = null;
+    private fastKeyChecked = 0;
+    private fastKeyUnsafe = 0;
+    private fastKeyConservative = 0;
+    private fastKeyEnabled(): boolean {
+        return (globalThis as { __d3d9ProgBindFastKey?: boolean }).__d3d9ProgBindFastKey === true;
+    }
+    private fastKeyVerifying(): boolean {
+        return (globalThis as { __d3d9ProgBindFastKeyVerify?: boolean }).__d3d9ProgBindFastKeyVerify === true;
+    }
+    /** Invalidate the front memo. Anything that can retire a cached group must call this. */
+    private dropProgBindFastKey(): void {
+        this.fastKeyEpoch = -1;
+        this.fastKeySampler = null;
+        this.fastKeyGroup = null;
+    }
+    /**
+     * Publish the front memo and, while verifying, compare its prediction against the group the
+     * full path actually returned. `unsafe` is a predicted group the full path disagrees with
+     * and must stay 0; `conservative` is a prediction declined where the full path returned the
+     * same group anyway — a lost skip, a cost rather than a bug.
+     */
+    private finishProgAcquire(
+        group: GPUBindGroup, armed: boolean, verifying: boolean,
+        predicted: boolean, stageEpoch: number, sampler: GPUSampler,
+        cubeMask: number, comparisonMask: number, volumeMask: number, vertexVolumeMask: number,
+    ): GPUBindGroup {
+        // Publish nothing while disarmed: the OFF arm of an A/B must be the code that shipped
+        // before the flag existed, or the comparison quietly favours the change.
+        if (!armed) return group;
+        if (verifying) {
+            this.fastKeyChecked++;
+            if (predicted) { if (group !== this.fastKeyGroup) this.fastKeyUnsafe++; }
+            else if (this.fastKeyGroup !== null && group === this.fastKeyGroup) this.fastKeyConservative++;
+        }
+        this.fastKeyEpoch = stageEpoch;
+        this.fastKeySampler = sampler;
+        this.fastKeyCube = cubeMask;
+        this.fastKeyComparison = comparisonMask;
+        this.fastKeyVolume = volumeMask;
+        this.fastKeyVertexVolume = vertexVolumeMask;
+        this.fastKeyGroup = group;
+        return group;
+    }
+
     constructor(backend: WebGPUBackend) {
         this.backend = backend;
     }
@@ -335,6 +532,7 @@ export class D3D9BackendExecutor {
         this.comparisonSampler = null;
         this.progLayouts.clear();
         this.progCacheSampler = [];
+        this.dropProgBindFastKey();
         this.progCacheViews = new Array(this.progCacheN * PROG_BIND.MAX_TEX).fill(null);
         this.progCacheStageSamplers = new Array(this.progCacheN * PROG_BIND.MAX_TEX).fill(null);
         this.progCacheVertexViews = new Array(this.progCacheN * VERTEX_TEXTURE_SAMPLER_COUNT).fill(null);
@@ -881,6 +1079,7 @@ export class D3D9BackendExecutor {
         }
         const bindGroup = device.createBindGroup({ layout: this.getFfpLayout().bindGroupLayout, entries });
         this.metrics.bindGroupBuilds++;
+        this.census.ffpSharedBuilds++;
         const slot = this.ffpCacheLen < FFP_CACHE_N
             ? this.ffpCacheLen++
             : (this.ffpCacheCursor = (this.ffpCacheCursor + 1) % FFP_CACHE_N);
@@ -1209,6 +1408,7 @@ export class D3D9BackendExecutor {
                 // Cached programmable bind groups bind the arena buffers; if begin()
                 // recreated either buffer, the cache is stale → drop it.
                 if (this.vsArena.buffer !== this.progCacheVsBuffer || this.psArena.buffer !== this.progCachePsBuffer) {
+                    this.dropProgBindFastKey();
                     this.progCacheLen = 0;
                     this.progCacheCursor = 0;
                     this.progCacheIndex.clear();
@@ -1750,7 +1950,11 @@ export class D3D9BackendExecutor {
             }
 
             const submitStart = frameProfiler.startTimer();
+            this.submitCount++;
+            if (present) { this.presentCount++; this.censusPresents++; }
+            const submitT0 = performance.now();
             queue.submit([encoder.finish()]);
+            this.submitMs += performance.now() - submitT0;
             if (queryManager && queryBatch?.status === "encoded") {
                 queryManager.markSubmitted(queryBatch);
             } else if (queryManager && querySubmissionSerial !== undefined) {
@@ -2480,6 +2684,7 @@ struct VsOut { @builtin(position) position: vec4<f32> };
 
             bindGroup = device.createBindGroup({ layout, entries });
             this.metrics.bindGroupBuilds++;
+            this.census.frameLevelBuilds++;
             this.bindGroupCache.set(cacheKey, { bindGroup, textureView });
         }
 
@@ -2564,6 +2769,7 @@ struct VsOut { @builtin(position) position: vec4<f32> };
         fallbackView: GPUTextureView,
     ): GPUBindGroup {
         // FNV-1a over the identity ids; collisions are fine, the bucket is verified below.
+        this.census.ffpAutoAcquires++;
         let hash = 0x811c9dc5;
         hash = Math.imul(hash ^ pipelineId, 0x01000193);
         hash = Math.imul(hash ^ offset, 0x01000193);
@@ -2587,7 +2793,7 @@ struct VsOut { @builtin(position) position: vec4<f32> };
                     if (this.ffpAutoSampler[base + n] !== this.stageSampler(fs, n, fallbackSampler)
                         || this.ffpAutoView[base + n] !== this.stageView(fs, n, fallbackView)) { match = false; break; }
                 }
-                if (match) { this.metrics.bindGroupCacheHits++; return this.ffpAutoGroup[s]!; }
+                if (match) { this.metrics.bindGroupCacheHits++; this.census.ffpAutoHits++; return this.ffpAutoGroup[s]!; }
             }
         }
 
@@ -2607,6 +2813,8 @@ struct VsOut { @builtin(position) position: vec4<f32> };
         this.ffpAutoDesc.layout = this.getAutoLayout(pipelineId);
         const bindGroup = device.createBindGroup(this.ffpAutoDesc);
         this.metrics.bindGroupBuilds++;
+        this.census.ffpAutoBuilds++;
+        if (this.ffpAutoLen >= this.ffpAutoCacheN) this.census.ffpAutoEvictLive++;
 
         const slot = this.ffpAutoLen < this.ffpAutoCacheN
             ? this.ffpAutoLen++
@@ -2722,7 +2930,7 @@ struct VsOut { @builtin(position) position: vec4<f32> };
             ? this.getComparisonSampler() : this.getSampler());
         const bindGroup = this.acquireProgBindGroup(
             sampler, ds.textures, ds.samplers, ds.vertexTextures, ds.vertexSamplers,
-            ds.cubeMask, ds.comparisonMask, ds.volumeMask, ds.vertexVolumeMask,
+            ds.cubeMask, ds.comparisonMask, ds.volumeMask, ds.vertexVolumeMask, ds.stageEpoch,
         );
 
         this.setBindGroup0(renderPass, bindGroup, vsOff, psOff);
@@ -2902,8 +3110,32 @@ struct VsOut { @builtin(position) position: vec4<f32> };
         comparisonMask: number = 0,
         volumeMask: number = 0,
         vertexVolumeMask: number = 0,
+        stageEpoch = -1,
     ): GPUBindGroup {
         const MAX = PROG_BIND.MAX_TEX;
+        this.census.progAcquires++;
+        const prof = this.bgProfiling();
+        let t0 = 0;
+        if (prof) {
+            const c0 = performance.now();
+            const c1 = performance.now();
+            this.bgProfMs[2]! += c1 - c0; this.bgProfN[2]! += 1;
+            t0 = performance.now();
+        }
+        const fastVerify = this.fastKeyVerifying();
+        const fastArmed = this.fastKeyEnabled() || fastVerify;
+        const predicted = fastArmed
+            && stageEpoch > 0 && stageEpoch === this.fastKeyEpoch
+            && sampler === this.fastKeySampler && cubeMask === this.fastKeyCube
+            && comparisonMask === this.fastKeyComparison && volumeMask === this.fastKeyVolume
+            && vertexVolumeMask === this.fastKeyVertexVolume && this.fastKeyGroup !== null;
+        if (predicted && !fastVerify) {
+            this.metrics.bindGroupCacheHits++;
+            this.census.progHits++;
+            this.census.progFastKeyHits++;
+            if (prof) { this.bgProfMs[3]! += performance.now() - t0; this.bgProfN[3]! += 1; }
+            return this.fastKeyGroup!;
+        }
         const hash = this.progKeyHash(sampler, textures, samplers, vertexTextures, vertexSamplers, cubeMask, comparisonMask, volumeMask, vertexVolumeMask);
         const bucket = this.progCacheIndex.get(hash);
         if (bucket !== undefined) {
@@ -2929,7 +3161,14 @@ struct VsOut { @builtin(position) position: vec4<f32> };
                         }
                     }
                 }
-                if (match) { this.metrics.bindGroupCacheHits++; return this.progCacheGroup[s]; }
+                if (match) {
+                    this.metrics.bindGroupCacheHits++;
+                    this.census.progHits++;
+                    if (prof) { this.bgProfMs[0]! += performance.now() - t0; this.bgProfN[0]! += 1; }
+                    return this.finishProgAcquire(this.progCacheGroup[s], fastArmed, fastVerify,
+                        predicted, stageEpoch, sampler, cubeMask, comparisonMask, volumeMask,
+                        vertexVolumeMask);
+                }
             }
         }
 
@@ -2965,7 +3204,13 @@ struct VsOut { @builtin(position) position: vec4<f32> };
         }
         const bindGroup = device.createBindGroup({ layout: bindGroupLayout, entries });
         this.metrics.bindGroupBuilds++;
+        this.census.progBuilds++;
+        if (this.censusSeenProgHashes.has(hash)) this.census.progRebuiltHash++;
+        else if (this.censusSeenProgHashes.size < CENSUS_SEEN_HASH_MAX) this.censusSeenProgHashes.add(hash);
+        else this.censusSeenSaturated = true;
 
+        const evicting = this.progCacheLen >= this.progCacheN;
+        if (evicting) this.census.progEvictLive++;
         const slot = this.progCacheLen < this.progCacheN
             ? this.progCacheLen++
             : (this.progCacheCursor = (this.progCacheCursor + 1) % this.progCacheN);
@@ -2991,7 +3236,9 @@ struct VsOut { @builtin(position) position: vec4<f32> };
             this.progCacheVertexSamplers[vertexBase + n] = vertexSamplers[n] ?? null;
         }
         this.progCacheGroup[slot] = bindGroup;
-        return bindGroup;
+        if (prof) { this.bgProfMs[1]! += performance.now() - t0; this.bgProfN[1]! += 1; }
+        return this.finishProgAcquire(bindGroup, fastArmed, fastVerify, predicted, stageEpoch,
+            sampler, cubeMask, comparisonMask, volumeMask, vertexVolumeMask);
     }
 
     /** Fallback sampler for draws without resolved per-draw sampler state (e.g. the non-programmable

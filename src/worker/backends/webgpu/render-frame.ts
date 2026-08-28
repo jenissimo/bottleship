@@ -112,6 +112,13 @@ export interface ProgrammableDrawState {
     vertexVolumeMask: number;
     /** Bitmask of depth-texture stages using sampler_comparison. */
     comparisonMask: number;
+    /**
+     * Which resolution of the device's stage window filled `textures`/`samplers`/`sampler`.
+     * Two draws sharing it hold the SAME view and sampler objects by construction, which is
+     * what lets the executor skip re-deriving a 41-object bind-group key. -1 means "not
+     * stamped": a consumer must fall back to comparing the objects themselves.
+     */
+    stageEpoch: number;
 }
 
 export class RenderFrame {
@@ -318,6 +325,7 @@ export class RenderFrame {
                 volumeMask: 0,
                 vertexVolumeMask: 0,
                 comparisonMask: 0,
+                stageEpoch: -1,
             };
             this.drawStates[this.drawStateCount] = s;
         }

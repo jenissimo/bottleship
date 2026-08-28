@@ -450,6 +450,54 @@ export function registerScreenCommands(svc: HarnessService): void {
         return active.getPassDebug();
     });
 
+    /** submitCensus({reset?}) — what the D3D9 frame's queue.submit calls actually cost:
+     *  count, ms/frame, and us/submit.
+     *
+     *  Measured in-race on NFSU: 9.0 submits/frame at ~13 us = 0.12 ms/frame. Collapsing
+     *  them into one command buffer per frame therefore buys ~0.08 ms (0.12 % of a 70 ms
+     *  frame) — NOT the 3-4 % a plan sized off `nfsu-submit-cost`, which times the whole
+     *  `submitFrame()` (finalize + execute + submit) and whose 166 us/call is dominated by
+     *  execute() recording the draws. Price a lever against THIS verb, not that one.
+     *  Rate: submitCensus({reset:true}) -> tickFrames(N) -> submitCensus(). */
+    svc.register("submitCensus", (args) => {
+        const opts = (args[0] ?? {}) as { reset?: boolean };
+        const active: any = sys().services?.render?.getActive?.();
+        const executor = active?.backendExecutor ?? active?.getBackendExecutor?.();
+        if (!executor?.getSubmitStats) throw new HarnessError("active presenter has no submit census (not D3D9)", HarnessErrorCode.UNSUPPORTED);
+        return executor.getSubmitStats(opts.reset === true);
+    });
+
+    /** d3d9BindGroupCensus({reset?}) — why the D3D9 bind-group caches build.
+     *
+     *  The number this replaces was `bindGroupCacheHits / bindGroupSets` (E6, "81.6 % hits").
+     *  Those are two different populations: `bindGroupSets` counts setBindGroup calls that
+     *  survived the redundancy filter, `bindGroupCacheHits` counts get-or-build hits across
+     *  FOUR caches. Their ratio is not a hit rate and the builds it implies are not builds.
+     *  `progBuilds` and friends here are counted where createBindGroup is called.
+     *
+     *  `setWorkerFlag('__d3d9BindGroupProfile', true)` also prices the acquire itself, split by
+     *  outcome: `hitUs` is paid on EVERY draw (the key is 41 WeakMap lookups and 40 identity
+     *  compares wide), `missUs` only on a build. Which of the two is larger in total decides
+     *  whether the lever is the key or the cache. Measured in-race on NFSU over 40 frames:
+     *  78,720 acquires, 78,720 hits, ZERO builds, 0.458 us per hit — so it is the key.
+     *
+     *  `__d3d9ProgBindFastKey` (live, default off) is that lever: a front memo keyed on the
+     *  draw state's stage epoch, the sampler and the four masks. `__d3d9ProgBindFastKeyVerify`
+     *  runs the full key anyway and compares — `fastKeyUnsafe` must be 0, `fastKeyConservative`
+     *  is a skip declined (a cost), and `fastKeyChecked: 0` says the oracle never ran.
+     *
+     *  Read `perFrameProgBuilds` for the cost, then `progRebuiltHash` / `progEvictLive` /
+     *  `gpuIdsAssigned` for the cause: a returning material means capacity, a growing gpuId
+     *  count means the views themselves are new and no cache can hold them.
+     *  Rate: d3d9BindGroupCensus({reset:true}) -> tickFrames(N) -> d3d9BindGroupCensus(). */
+    svc.register("d3d9BindGroupCensus", (args) => {
+        const opts = (args[0] ?? {}) as { reset?: boolean };
+        const active: any = sys().services?.render?.getActive?.();
+        const executor = active?.backendExecutor ?? active?.getBackendExecutor?.();
+        if (!executor?.getBindGroupCensus) throw new HarnessError("active presenter has no bind-group census (not D3D9)", HarnessErrorCode.UNSUPPORTED);
+        return executor.getBindGroupCensus(opts.reset === true);
+    });
+
     /** declCensus({reset?}) — D3D9 vertex declarations the game draws with, the streams each
      *  spans, and per declaration the FFP semantics we DROP because the fixed-function
      *  shader/layout is built from stream 0 only. `drawsDropping` vs `drawsTotal` prices it:
