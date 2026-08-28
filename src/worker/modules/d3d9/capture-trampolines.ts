@@ -207,6 +207,193 @@ export function writeShadowTrampoline(
 }
 
 /**
+ * GENERIC guest-side INC-AND-RETURN trampoline for a COM AddRef whose refcount lives in the
+ * object itself (`this[fieldOffset]`), the layout real COM uses. The whole method becomes
+ * `inc [this+off]; mov eax,[this+off]; ret 4` in guest code — no OUT trap, no JS at all —
+ * which is the point: a trivial crossing costs microseconds and this one is 40% of every
+ * WASM exit an in-game D3D9 title makes.
+ *
+ * VALIDITY. `this` is only trusted when its vptr still equals the dword at
+ * `expectVtableAddr` (the module publishes the interface's installed vtable address there,
+ * and 0 while none is published, which routes everything to the OUT trap). That is what
+ * keeps a stale pointer from silently incrementing a recycled block: a block recycled into
+ * a DIFFERENT interface no longer carries this vtable, and a poisoned one carries the
+ * released-COM trap's. A block recycled into the SAME interface is not a new hazard — the
+ * JS handler's address-keyed registry increments the new object there too — and a freed
+ * block not yet recycled takes a write that allocateComObject's zero-fill erases.
+ *
+ * VERIFY MODE (`predictAddr !== 0`) mutates NOTHING: it computes the value the real stub
+ * WOULD have returned, stores it at `predictAddr` (with a validity byte at `predictAddr+4`),
+ * and falls through to the OUT trap so the JS handler still does the work and can compare.
+ * That runs both paths on every real call, which is the only honest evidence.
+ */
+export function writeIncRefStubTrampoline(
+    allocator: StubAllocator,
+    getMemory: () => Uint8Array,
+    spec: {
+        fieldOffset: number;
+        popBytes: number;
+        expectVtableAddr: number;
+        /** 0 = live stub; non-zero = non-mutating oracle writing its prediction here. */
+        predictAddr?: number;
+    },
+): { trampAddr: number; codeRegionBase: number; codeRegionEnd: number } {
+    const { fieldOffset, popBytes, expectVtableAddr } = spec;
+    const predictAddr = spec.predictAddr ?? 0;
+    if (fieldOffset < 0 || fieldOffset > 0x7f) {
+        throw new Error(`writeIncRefStubTrampoline: fieldOffset ${fieldOffset} needs a disp8`);
+    }
+    const CODE_SIZE = 96;
+    const codeRegionBase = allocator.alloc(CODE_SIZE, 'THUNK_CODE', 'rx');
+    const mem = getMemory();
+    const dv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+    let off = codeRegionBase;
+    const w8 = (v: number) => { mem[off++] = v & 0xFF; };
+    const w32 = (v: number) => { dv.setUint32(off, v >>> 0, true); off += 4; };
+    const outPatch: number[] = [];
+
+    const trampAddr = off;
+    // pushfd; push ecx; push edx — 3 pushes + retAddr, so `this` sits at [esp+16].
+    w8(0x9C); w8(0x51); w8(0x52);
+    if (predictAddr) {
+        w8(0xC6); w8(0x05); w32(predictAddr + 4); w8(0x00);   // mov byte [predict+4], 0
+    }
+    w8(0x8B); w8(0x4C); w8(0x24); w8(16);                     // mov ecx, [esp+16]
+    w8(0x85); w8(0xC9);                                       // test ecx, ecx
+    w8(0x0F); w8(0x84); outPatch.push(off); w32(0);           // jz .out
+    w8(0x8B); w8(0x11);                                       // mov edx, [ecx]
+    w8(0x3B); w8(0x15); w32(expectVtableAddr);                // cmp edx, [expectVtableAddr]
+    w8(0x0F); w8(0x85); outPatch.push(off); w32(0);           // jne .out
+    if (predictAddr) {
+        w8(0x8B); w8(0x51); w8(fieldOffset);                  // mov edx, [ecx+off]
+        w8(0x42);                                             // inc edx
+        w8(0x89); w8(0x15); w32(predictAddr);                 // mov [predict], edx
+        w8(0xC6); w8(0x05); w32(predictAddr + 4); w8(0x01);   // mov byte [predict+4], 1
+        // fall through to .out — the JS handler stays the one that mutates.
+    } else {
+        w8(0xFF); w8(0x41); w8(fieldOffset);                  // inc dword [ecx+off]
+        w8(0x8B); w8(0x41); w8(fieldOffset);                  // mov eax, [ecx+off]
+        w8(0x5A); w8(0x59); w8(0x9D);                         // pop edx; pop ecx; popfd
+        w8(0xC2); w8(popBytes & 0xFF); w8((popBytes >> 8) & 0xFF);
+    }
+
+    const outAddr = off;                                      // .out: original OUT-trap tail
+    w8(0x5A); w8(0x59); w8(0x9D);                             // pop edx; pop ecx; popfd
+    w8(0xBA); w32(0xB077);                                    // mov edx, 0xB077
+    w8(0xEF);                                                 // out dx, eax  (EAX = funcId)
+    w8(0xC2); w8(popBytes & 0xFF); w8((popBytes >> 8) & 0xFF);
+    for (const p of outPatch) dv.setInt32(p, outAddr - (p + 4), true);
+
+    if (off > codeRegionBase + CODE_SIZE) throw new Error('writeIncRefStubTrampoline: code overflow');
+    Logger.log(LogCategory.SYSTEM,
+        `IncRef stub trampoline: 0x${trampAddr.toString(16)} (field=+${fieldOffset} ret ${popBytes}` +
+        `${predictAddr ? ` VERIFY predict@0x${predictAddr.toString(16)}` : ''})`);
+    return { trampAddr, codeRegionBase, codeRegionEnd: codeRegionBase + CODE_SIZE };
+}
+
+/**
+ * GENERIC guest-side DEC-AND-RETURN trampoline for a COM Release whose refcount lives in the
+ * object itself (`this[fieldOffset]`) — the Release counterpart of
+ * {@link writeIncRefStubTrampoline}, and the other half of the same 40 %-of-all-WASM-exits pair.
+ *
+ * THE ZERO TRANSITION MUST REACH JS: at 1→0 the JS handler runs the finalizer and the disposer.
+ * So the body TESTS BEFORE IT DECREMENTS — `cmp edx,1; jbe .out` — and falls through to the
+ * ordinary OUT trap with the count UNTOUCHED whenever it is 1 or less. The alternative
+ * (decrement, then decide to trap) would need JS to know the guest already decremented: a
+ * second contract, invisible at the trap, that turns any route reaching the handler another way
+ * into a double decrement. Testing first has no such secret, and it is `jbe` rather than `je`
+ * so a count that is already 0 — a block freed but still carrying this vtable — traps instead
+ * of wrapping to 0xFFFFFFFF.
+ *
+ * It also preserves, for free, the ordering the WBUF ring depends on: destruction still happens
+ * at an OUT trap, and handlePortWrite drains the ring before dispatching one, so anything the
+ * ring has buffered against the object is applied before the object dies.
+ *
+ * VALIDITY: identical gate to the inc-ref stub — `this` is touched only while its vptr equals
+ * the dword at `expectVtableAddr` (0 while none is published ⇒ everything traps).
+ *
+ * VERIFY MODE (`predictAddr !== 0`) mutates NOTHING and always traps. It publishes
+ * `[predictAddr] = value` and a CODE byte at `predictAddr+4`:
+ *   0 — no prediction (null `this`, or the vtable gate refused)
+ *   1 — the live stub would have answered `value` in guest code (count-1)
+ *   2 — the live stub would have DECLINED and let JS run; `value` is the count it read.
+ * Code 2 is the whole point: it is how the oracle gets to check the zero transition, which is
+ * the one place a wrong answer destroys a live object.
+ */
+export function writeDecRefStubTrampoline(
+    allocator: StubAllocator,
+    getMemory: () => Uint8Array,
+    spec: {
+        fieldOffset: number;
+        popBytes: number;
+        expectVtableAddr: number;
+        /** 0 = live stub; non-zero = non-mutating oracle writing its prediction here. */
+        predictAddr?: number;
+    },
+): { trampAddr: number; codeRegionBase: number; codeRegionEnd: number } {
+    const { fieldOffset, popBytes, expectVtableAddr } = spec;
+    const predictAddr = spec.predictAddr ?? 0;
+    if (fieldOffset < 0 || fieldOffset > 0x7f) {
+        throw new Error(`writeDecRefStubTrampoline: fieldOffset ${fieldOffset} needs a disp8`);
+    }
+    const CODE_SIZE = 96;
+    const codeRegionBase = allocator.alloc(CODE_SIZE, 'THUNK_CODE', 'rx');
+    const mem = getMemory();
+    const dv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+    let off = codeRegionBase;
+    const w8 = (v: number) => { mem[off++] = v & 0xFF; };
+    const w32 = (v: number) => { dv.setUint32(off, v >>> 0, true); off += 4; };
+    const outPatch: number[] = [];
+
+    const trampAddr = off;
+    // pushfd; push ecx; push edx — 3 pushes + retAddr, so `this` sits at [esp+16].
+    w8(0x9C); w8(0x51); w8(0x52);
+    if (predictAddr) {
+        w8(0xC6); w8(0x05); w32(predictAddr + 4); w8(0x00);   // mov byte [predict+4], 0
+    }
+    w8(0x8B); w8(0x4C); w8(0x24); w8(16);                     // mov ecx, [esp+16]
+    w8(0x85); w8(0xC9);                                       // test ecx, ecx
+    w8(0x0F); w8(0x84); outPatch.push(off); w32(0);           // jz .out
+    w8(0x8B); w8(0x11);                                       // mov edx, [ecx]
+    w8(0x3B); w8(0x15); w32(expectVtableAddr);                // cmp edx, [expectVtableAddr]
+    w8(0x0F); w8(0x85); outPatch.push(off); w32(0);           // jne .out
+    w8(0x8B); w8(0x51); w8(fieldOffset);                      // mov edx, [ecx+off]
+    if (predictAddr) {
+        w8(0x89); w8(0x15); w32(predictAddr);                 // mov [predict], edx (the raw count)
+        w8(0x83); w8(0xFA); w8(0x01);                         // cmp edx, 1
+        w8(0x76); const declineRel8 = off; w8(0);             // jbe .decline
+        w8(0x4A);                                             // dec edx
+        w8(0x89); w8(0x15); w32(predictAddr);                 // mov [predict], edx (guest answer)
+        w8(0xC6); w8(0x05); w32(predictAddr + 4); w8(0x01);   // mov byte [predict+4], 1
+        w8(0xEB); const skipDecline = off; w8(0);             // jmp .out
+        mem[declineRel8] = off - (declineRel8 + 1);           // .decline:
+        w8(0xC6); w8(0x05); w32(predictAddr + 4); w8(0x02);   // mov byte [predict+4], 2
+        mem[skipDecline] = off - (skipDecline + 1);
+        // fall through to .out — the JS handler stays the one that mutates.
+    } else {
+        w8(0x83); w8(0xFA); w8(0x01);                         // cmp edx, 1
+        w8(0x0F); w8(0x86); outPatch.push(off); w32(0);       // jbe .out  (the 1→0, and a bogus 0)
+        w8(0xFF); w8(0x49); w8(fieldOffset);                  // dec dword [ecx+off]
+        w8(0x8B); w8(0x41); w8(fieldOffset);                  // mov eax, [ecx+off]
+        w8(0x5A); w8(0x59); w8(0x9D);                         // pop edx; pop ecx; popfd
+        w8(0xC2); w8(popBytes & 0xFF); w8((popBytes >> 8) & 0xFF);
+    }
+
+    const outAddr = off;                                      // .out: original OUT-trap tail
+    w8(0x5A); w8(0x59); w8(0x9D);                             // pop edx; pop ecx; popfd
+    w8(0xBA); w32(0xB077);                                    // mov edx, 0xB077
+    w8(0xEF);                                                 // out dx, eax  (EAX = funcId)
+    w8(0xC2); w8(popBytes & 0xFF); w8((popBytes >> 8) & 0xFF);
+    for (const p of outPatch) dv.setInt32(p, outAddr - (p + 4), true);
+
+    if (off > codeRegionBase + CODE_SIZE) throw new Error('writeDecRefStubTrampoline: code overflow');
+    Logger.log(LogCategory.SYSTEM,
+        `DecRef stub trampoline: 0x${trampAddr.toString(16)} (field=+${fieldOffset} ret ${popBytes}` +
+        `${predictAddr ? ` VERIFY predict@0x${predictAddr.toString(16)}` : ''})`);
+    return { trampAddr, codeRegionBase, codeRegionEnd: codeRegionBase + CODE_SIZE };
+}
+
+/**
  * GENERIC scalar WBUF trampoline that additionally DISARMS the setter-shadow owner gate
  * (one `mov dword [ownerGlobal], 0`) before writing its ring entry. For ring-deferred
  * operations that WRITE state the shadow tables mirror (the canonical case: D3D9

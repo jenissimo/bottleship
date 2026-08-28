@@ -10,6 +10,8 @@ import {
     writeOwnerDisarmScalarTrampoline,
     writeStructCaptureTrampoline,
     writeUpDrawCaptureTrampoline,
+    writeIncRefStubTrampoline,
+    writeDecRefStubTrampoline,
 } from '../../modules/d3d9/capture-trampolines';
 import type { ShadowTrampolineSpec } from '../../modules/d3d9/capture-trampolines';
 import { sehOnCatchCompletion, dispatchCxxException } from '../seh-dispatch';
@@ -79,6 +81,24 @@ export type WriteBufHandler = (mem8: Uint8Array, mem32: Uint32Array, dataPtr: nu
 
 /** writeBufArgCountTable sentinel: ring entry stride = (4 + vec4Count×4) × 4 bytes. */
 export const WBUF_ARG_SHADER_CONSTANT = 255;
+
+/**
+ * A COM AddRef whose refcount is a dword INSIDE the guest object, answered entirely in guest
+ * code (see registerGuestIncRefStub / writeIncRefStubTrampoline).
+ */
+export interface IncRefStubSpec {
+    /** Byte offset of the refcount dword within the object. */
+    fieldOffset: number;
+    /** stdcall cleanup, i.e. 4 for a one-arg `AddRef(this)`. */
+    popBytes: number;
+    /** Non-mutating differential oracle: predict, publish, and still take the trap. */
+    verify?: boolean;
+    /**
+     * 'inc' (default) answers AddRef outright. 'dec' answers Release only while the count stays
+     * above zero — the 1→0 transition traps, because that is where JS runs the finalizer.
+     */
+    kind?: 'inc' | 'dec';
+}
 
 /** writeBufArgCountTable sentinel for captured UP draws: ring entry =
  *  [funcId][this][primType][primCount][stride][byteCount][payload…], stride = 24 + byteCount. */
@@ -363,6 +383,13 @@ export class ThunkDispatcher {
     private pendingFastPathRegistrations: Map<string, { impl: FastPathImplementation; dllName: string; functionName: string; trivial?: boolean }> = new Map();
     private pendingWriteBufRegistrations: Map<string, { handler: WriteBufHandler; dllName: string; functionName: string; argCount: number; isStdcall: boolean; ptrDeref?: boolean; floatCount?: number; shaderConstant?: boolean; coalesceArgMask?: number; shadowSpec?: ShadowTrampolineSpec; barrier?: boolean; structCapture?: { ptrArgIndex: number; payloadDwords: number }; upDraw?: boolean; ownerDisarm?: boolean }> = new Map();
     private pendingConstStubRegistrations: Map<string, { dllName: string; functionName: string; value: number; popBytes: number }> = new Map();
+    private pendingIncRefStubRegistrations: Map<string, { dllName: string; functionName: string; spec: IncRefStubSpec }> = new Map();
+
+    /** Per-(dll:func) guest refcount stub handles (inc and dec), for status/oracle readout. */
+    private incRefStubHandles = new Map<string, {
+        trampAddr: number; verify: boolean; kind: 'inc' | 'dec';
+        predictAddr: number; expectVtableAddr: number;
+    }>();
 
     /** Shared "active owner" pointer (guest RAM) for setter-shadow trampolines (the bound COM
      *  device `this`). Allocated lazily on first shadowed registration; seeded via setShadowOwner. */
@@ -3960,6 +3987,153 @@ export class ThunkDispatcher {
         }
     }
 
+    /**
+     * Answer a COM AddRef in GUEST CODE: `inc [this+off]; mov eax,[this+off]; ret N`, gated on
+     * the object's vptr still being the interface's live vtable (spec.expectVtableAddr names a
+     * guest dword the module publishes; anything else falls back to the OUT trap, which is
+     * today's behaviour). Unlike registerConstantReturnStub this returns the REAL new count,
+     * which is what makes it usable once the count of record lives in the object.
+     *
+     * `spec.kind === 'dec'` emits the Release counterpart instead: same gate, but it answers
+     * only while the count stays above zero and lets the 1→0 transition trap, because that is
+     * where JS runs the finalizer and the disposer.
+     *
+     * `spec.verify` installs the non-mutating oracle instead: it predicts the value the live
+     * stub would return, publishes it, and still traps so the JS handler can compare.
+     *
+     * Boot-time by nature: patching a stub has no unpatch path. Survives Process.reset() via
+     * pendingIncRefStubRegistrations.
+     */
+    registerGuestIncRefStub(dllName: string, funcName: string, spec: IncRefStubSpec): void {
+        const key = `${dllName}:${funcName}`.toLowerCase();
+        this.pendingIncRefStubRegistrations.set(key, { dllName, functionName: funcName, spec });
+        if (!this.thunkMemoryManager || !this.getMemory) return;
+
+        const kind: 'inc' | 'dec' = spec.kind === 'dec' ? 'dec' : 'inc';
+        let handle = this.incRefStubHandles.get(key);
+        if (!handle || handle.verify !== !!spec.verify || handle.kind !== kind) {
+            // The gate word is allocated here and starts at 0 — "no live vtable published" —
+            // so a stub emitted before the module knows its vtable traps exactly as before.
+            const expectVtableAddr = handle?.expectVtableAddr
+                || this.thunkMemoryManager.stubAllocator.alloc(4, 'THUNK_DATA', 'rw');
+            if (!handle) {
+                const m = this.getMemory();
+                new DataView(m.buffer, m.byteOffset, m.byteLength).setUint32(expectVtableAddr, 0, true);
+            }
+            const emit = kind === 'dec' ? writeDecRefStubTrampoline : writeIncRefStubTrampoline;
+            const predictAddr = spec.verify ? this.ensureRefStubPredictSlot(key) : 0;
+            const h = emit(this.thunkMemoryManager.stubAllocator, this.getMemory, {
+                fieldOffset: spec.fieldOffset,
+                popBytes: spec.popBytes,
+                expectVtableAddr,
+                predictAddr,
+            });
+            // The read-modify-write of the guest refcount must not interleave a quantum switch
+            // (same rule as the shadow/heap inline stubs).
+            try { System.getInstance().scheduler?.registerNonPreemptibleRange(h.codeRegionBase, h.codeRegionEnd); } catch { /* non-fatal */ }
+            handle = {
+                trampAddr: h.trampAddr,
+                verify: !!spec.verify,
+                kind,
+                predictAddr,
+                expectVtableAddr,
+            };
+            this.incRefStubHandles.set(key, handle);
+        }
+
+        // EVERY stub for the name (import table + GetProcAddress own different ids), and only
+        // where the declared arity matches the cleanup this body performs.
+        const stubs = this.findStubsByName(dllName, funcName);
+        if (stubs.length === 0) {
+            Logger.verbose(LogCategory.THUNK, `IncRef stub not found for ${dllName}:${funcName}, registration deferred`);
+            return;
+        }
+        let mem8 = this.cachedMem8;
+        if (!mem8 || mem8.byteLength === 0) { this.updateMemoryCache(); mem8 = this.cachedMem8; }
+        if (!mem8 || mem8.byteLength === 0) return;
+        for (const stub of stubs) {
+            if (typeof stub.argCount === 'number' && stub.argCount * 4 !== spec.popBytes) {
+                Logger.warn(LogCategory.THUNK,
+                    `registerGuestIncRefStub: skipping ${dllName}:${funcName} stub id=${stub.functionId} ` +
+                    `(argCount=${stub.argCount}, registered popBytes=${spec.popBytes})`);
+                continue;
+            }
+            const a = stub.address;
+            const rel32 = (handle.trampAddr - (a + 10)) | 0;
+            mem8[a + 5] = 0xE9;
+            mem8[a + 6] = rel32 & 0xFF;
+            mem8[a + 7] = (rel32 >> 8) & 0xFF;
+            mem8[a + 8] = (rel32 >> 16) & 0xFF;
+            mem8[a + 9] = (rel32 >> 24) & 0xFF;
+            // Bytes 10..15 (OUT + RET N) deliberately preserved — see registerWriteBufferFunction.
+            invalidateGuestCode(a, 16);
+            Logger.log(LogCategory.THUNK,
+                `[WBUF] Guest IncRef stub [${stub.functionId}] ${dllName}:${funcName} ` +
+                `-> 0x${handle.trampAddr.toString(16)}${spec.verify ? ' (VERIFY)' : ''} stub=0x${a.toString(16)}`);
+        }
+    }
+
+    /**
+     * Guest dword pair each refcount oracle publishes through ([+0] value, [+4] code). One slot
+     * PER stub: AddRef's and Release's oracles can run in the same boot, and a shared slot would
+     * let one method's prediction be read as the other's verdict.
+     */
+    private refStubPredictSlots = new Map<string, number>();
+    private ensureRefStubPredictSlot(key: string): number {
+        let slot = this.refStubPredictSlots.get(key) ?? 0;
+        if (slot === 0 && this.thunkMemoryManager) {
+            slot = this.thunkMemoryManager.stubAllocator.alloc(8, 'THUNK_DATA', 'rw');
+            const mem = this.getMemory?.();
+            if (mem) mem.fill(0, slot, slot + 8);
+            this.refStubPredictSlots.set(key, slot);
+        }
+        return slot;
+    }
+
+    /**
+     * Take a guest refcount stub's last prediction and CLEAR its code byte. Consuming is the
+     * point: the slot is one word, so a call that reached the JS handler without passing through
+     * the trampoline would otherwise read the previous call's prediction — belonging to another
+     * object — as its own, and score a disagreement that never happened.
+     *
+     * `code` is 0 (the trampoline declined to predict), 1 (it would have answered `value` in
+     * guest code) or 2 (it would have deliberately let JS run; `value` is the count it read).
+     * `valid` is the code-1 case, which is what an inc-ref oracle wants.
+     */
+    consumeIncRefPrediction(dllName: string, funcName: string): { value: number; valid: boolean; code: number } | null {
+        const slot = this.refStubPredictSlots.get(`${dllName}:${funcName}`.toLowerCase()) ?? 0;
+        if (slot === 0 || !this.getMemory) return null;
+        const mem = this.getMemory();
+        const dv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const code = mem[slot + 4]!;
+        const out = { value: dv.getUint32(slot, true) >>> 0, valid: code === 1, code };
+        mem[slot + 4] = 0;
+        return out;
+    }
+
+    /** Is a guest refcount stub installed (and is it the oracle or the live one)? */
+    incRefStubStatus(dllName: string, funcName: string): { installed: boolean; verify: boolean; vtable: number; kind: string } {
+        const h = this.incRefStubHandles.get(`${dllName}:${funcName}`.toLowerCase());
+        let vtable = 0;
+        if (h && this.getMemory) {
+            const m = this.getMemory();
+            vtable = new DataView(m.buffer, m.byteOffset, m.byteLength).getUint32(h.expectVtableAddr, true) >>> 0;
+        }
+        return { installed: !!h, verify: !!h?.verify, vtable, kind: h?.kind ?? 'none' };
+    }
+
+    /**
+     * Publish the interface vtable a guest inc-ref stub will accept as proof that `this` is
+     * still a live object of that interface. 0 disables the stub (everything traps), which is
+     * what the module must publish whenever the vtables are torn down.
+     */
+    setIncRefExpectedVtable(dllName: string, funcName: string, vtableAddr: number): void {
+        const h = this.incRefStubHandles.get(`${dllName}:${funcName}`.toLowerCase());
+        if (!h || !this.getMemory) return;
+        const m = this.getMemory();
+        new DataView(m.buffer, m.byteOffset, m.byteLength).setUint32(h.expectVtableAddr, vtableAddr >>> 0, true);
+    }
+
     registerModule(moduleName: string, exports: Record<string, ThunkImplementation>): void {
         for (const [name, impl] of Object.entries(exports)) {
             this.register(moduleName, name, impl);
@@ -6801,6 +6975,16 @@ export class ThunkDispatcher {
         this.registerConstantReturnStub(pending.dllName, pending.functionName, pending.value, pending.popBytes);
     }
 
+    private applyPendingIncRefStubForStub(stub: ThunkStub): void {
+        const exactKey = `${stub.dllName}:${stub.functionName}`.toLowerCase();
+        const normalizedKey = `${stub.dllName}:${normalizeApiName(stub.functionName)}`.toLowerCase();
+        const pending =
+            this.pendingIncRefStubRegistrations.get(exactKey) ??
+            (normalizedKey !== exactKey ? this.pendingIncRefStubRegistrations.get(normalizedKey) : undefined);
+        if (!pending) return;
+        this.registerGuestIncRefStub(pending.dllName, pending.functionName, pending.spec);
+    }
+
     private applyPendingWriteBufferForStub(stub: ThunkStub): void {
         const exactKey = `${stub.dllName}:${stub.functionName}`.toLowerCase();
         const normalizedKey = `${stub.dllName}:${normalizeApiName(stub.functionName)}`.toLowerCase();
@@ -6888,6 +7072,7 @@ export class ThunkDispatcher {
             this.applyPendingFastPathForStub(functionId, stub);
             this.applyPendingWriteBufferForStub(stub);
             this.applyPendingConstStubForStub(stub);
+            this.applyPendingIncRefStubForStub(stub);
 
             Logger.info(LogCategory.THUNK,
                 `Late pending registration: ${stub.dllName}:${stub.functionName} id=${functionId}`);
@@ -6905,6 +7090,7 @@ export class ThunkDispatcher {
                     this.applyPendingFastPathForStub(functionId, stub);
                     this.applyPendingWriteBufferForStub(stub);
                     this.applyPendingConstStubForStub(stub);
+            this.applyPendingIncRefStubForStub(stub);
                     Logger.info(LogCategory.THUNK,
                         `Late pending registration (normalized): ${stub.dllName}:${stub.functionName} id=${functionId}`);
                     return impl;
@@ -7139,6 +7325,14 @@ export class ThunkDispatcher {
             }
         }
 
+        // Apply pending guest inc-refcount stubs — same reason: new stubs, new addresses.
+        for (const [, pending] of this.pendingIncRefStubRegistrations.entries()) {
+            if (this.findStubsByName(pending.dllName, pending.functionName)[0]) {
+                this.registerGuestIncRefStub(pending.dllName, pending.functionName, pending.spec);
+                applied++;
+            }
+        }
+
         // Apply pending write-buffer registrations (standard + PtrDeref) — re-patches the new stubs.
         for (const [, pending] of this.pendingWriteBufRegistrations.entries()) {
             const stub = this.findStubsByName(pending.dllName, pending.functionName)[0];
@@ -7327,6 +7521,11 @@ export class ThunkDispatcher {
         this.writeBufArgCountTable.fill(0);
         this.writeBufCoalesceMaskTable.fill(0);
         this.wbufCoalescingEnabled = false;
+        // Emitted-code handles name addresses in the OLD thunk arena. The pending
+        // registrations survive (above) and re-emit against the new one; keeping the handles
+        // would point a stub JMP at whatever the new layout put there.
+        this.incRefStubHandles.clear();
+        this.refStubPredictSlots.clear();
         this.argCountsTable.fill(-1);
         this.unimplementedReturnCache.clear();
         this.namesTable.fill(null);

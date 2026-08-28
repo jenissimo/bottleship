@@ -10,6 +10,8 @@ import { d3d9Module } from '../../api/d3d9.api';
 import type { D3D9Device } from '../../backends/webgpu/d3d9/d3d9-device';
 import { Logger, LogCategory } from '../../core/logger';
 import { clearResourceRegistry } from './resource-registry';
+import { publishTexture9Vtable } from './guest-addref-stub';
+import { publishTexture9ReleaseVtable } from './guest-release-stub';
 import { clearVolumeResources } from './volume-resources';
 import { resetResourceContract } from './resource-contract';
 import type { D3D9StateBlockData } from '../../backends/webgpu/d3d9/d3d9-state-block';
@@ -115,6 +117,11 @@ export function getVTables(): Record<string, VTableInfo> {
             throw new Error('Process not initialized');
         }
         vtables = createVTablesFromDescriptor(process, d3d9Module);
+        // The guest-side AddRef/Release stubs only trust a `this` whose vptr is this exact vtable;
+        // publishing it here is what turns the stub on, and clearing it (below, on reset) is
+        // what turns it off — a stub with no published vtable simply traps as it always did.
+        publishTexture9Vtable(vtables['IDirect3DTexture9']?.address ?? 0);
+        publishTexture9ReleaseVtable(vtables['IDirect3DTexture9']?.address ?? 0);
         Logger.verbose(LogCategory.D3D9, 'Created D3D9 vtables (shared)');
     }
     return vtables;
@@ -136,6 +143,8 @@ export function resetD3D9SharedState(): void {
     drainComFinalizers();
     resetD3D9Perf();
     vtables = null;
+    publishTexture9Vtable(0);
+    publishTexture9ReleaseVtable(0);
     devices.clear();
     deviceToD3D9.clear();
     deviceCreationParams.clear();

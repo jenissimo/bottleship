@@ -50,6 +50,8 @@ import {
     resolvePixelShaderComPtr,
     resolveVertexDeclComPtr,
 } from '../../backends/webgpu/d3d9/d3d9-com-objects';
+import { registerGuestAddRefStub, guestAddRefOracleActive, noteGuestAddRefOracle } from './guest-addref-stub';
+import { registerGuestReleaseStub, guestReleaseOracleActive, noteGuestReleaseOracle } from './guest-release-stub';
 
 const D3D_OK = 0;
 const D3DERR_INVALIDCALL = 0x8876086c;
@@ -472,17 +474,35 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
     // (Per-frame texture/surface churn puts ~100K of each through here per interval;
     // they can no longer be constant-return stubs now that the counts are real.)
     for (const prefix of ['IDirect3DTexture9', 'IDirect3DCubeTexture9', 'IDirect3DSurface9', 'IDirect3DVertexBuffer9', 'IDirect3DIndexBuffer9']) {
+        const oracled = prefix === 'IDirect3DTexture9';
         dispatcher.registerFastPath('d3d9', `${prefix}_AddRef`,
-            (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number =>
-                addD3D9ComRef(prefix, view.getUint32(cpu.reg32[4] + 4, true)),
+            (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
+                const answer = addD3D9ComRef(prefix, view.getUint32(cpu.reg32[4] + 4, true));
+                // Oracle only: with the live stub installed this handler is not reached at all.
+                if (oracled && guestAddRefOracleActive()) noteGuestAddRefOracle(answer);
+                return answer;
+            },
             { trivial: true });
         dispatcher.registerFastPath('d3d9', `${prefix}_Release`,
-            (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number =>
-                releaseD3D9ComRef(prefix, view.getUint32(cpu.reg32[4] + 4, true)),
+            (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
+                const answer = releaseD3D9ComRef(prefix, view.getUint32(cpu.reg32[4] + 4, true));
+                // With the live stub installed this handler still runs — for the 1→0 transition,
+                // which the stub deliberately hands back.
+                if (oracled && guestReleaseOracleActive()) noteGuestReleaseOracle(answer);
+                return answer;
+            },
             { trivial: true });
     }
 
     Logger.log(LogCategory.D3D9, 'Registered FastPath for hot D3D9 state setters, shader constants, draw calls, and resource AddRef/Release');
+
+    // Texture9::AddRef answered in guest code — 40 % of every WASM exit this title makes.
+    // Opt-in and self-refusing; see guest-addref-stub.ts for the preconditions.
+    registerGuestAddRefStub(dispatcher);
+
+    // Texture9::Release, the other 40 %. Answers only above zero — the 1→0 transition keeps
+    // trapping, because that is where the finalizer and disposer run.
+    registerGuestReleaseStub(dispatcher);
 
     // ========================================================================
     // Tier-0 Write-Buffer registrations (the no-trap hot path).
@@ -622,6 +642,47 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
             const meta = resolveVertexDeclComPtr(pDecl);
             if (meta) device.setVertexDeclaration(meta.internalHandle, pDecl);
         }, true, 0x1);
+
+    // ── SetStreamSource / SetIndices on the ring ─────────────────────────────
+    // OPT-IN: globalThis.__d3d9StreamRing (default off). Registration patches a guest
+    // stub, so unlike the storage flags this one is read once, at boot — there is no
+    // unpatch path, which is why every WBUF kill-switch in this file is boot-time.
+    //
+    // ORDER: both are stable-pointer scalar setters, so deref-at-drain reads what a
+    // call-time deref would, and the ring drains at the start of EVERY OUT trap with
+    // draws as barrier entries — a stream binding buffered before a buffered draw is
+    // applied before it, and one buffered before a TRAPPED draw is applied by that
+    // trap's own drain. Coalescing keys on (this, StreamNumber) / (this): a dropped
+    // earlier set never took a reference, and the later one's replaceHeldComRef still
+    // releases whatever the device actually holds, so refcounts stay balanced.
+    //
+    // COM LIFETIME: the deferral window must not contain the buffer's own destruction.
+    // It cannot today — IDirect3D*Buffer9_Release is an OUT trap (FastPath, above), and
+    // handlePortWrite drains the ring BEFORE dispatching it, so a Release that would
+    // take a buffer to zero is always preceded by the drain that binds it. THIS IS THE
+    // LOAD-BEARING PRECONDITION: if Release ever becomes a no-trap guest stub (the
+    // __d3d9GuestRefcount follow-up), the two features must not be enabled together
+    // until ordering is re-established by some other means.
+    //
+    // Cost: a deferred setter answers D3D_OK unconditionally, so a guest that checks
+    // the HRESULT no longer sees D3DERR_INVALIDCALL for an unknown buffer pointer —
+    // the same trade already accepted for SetTexture and SetVertexDeclaration.
+    if ((globalThis as { __d3d9StreamRing?: boolean }).__d3d9StreamRing) {
+        // SetStreamSource(this, StreamNumber, pStreamData, OffsetInBytes, Stride)
+        dispatcher.registerWriteBufferFunction('d3d9', 'IDirect3DDevice9_SetStreamSource', 5,
+            (_mem8: Uint8Array, mem32: Uint32Array, ptr: number) => {
+                const device = devices.get(mem32[ptr >> 2]);
+                if (device) device.setStreamSource(
+                    mem32[(ptr + 4) >> 2], mem32[(ptr + 8) >> 2], mem32[(ptr + 12) >> 2], mem32[(ptr + 16) >> 2]);
+            }, true, 0x3);
+
+        // SetIndices(this, pIndexData)
+        dispatcher.registerWriteBufferFunction('d3d9', 'IDirect3DDevice9_SetIndices', 2,
+            (_mem8: Uint8Array, mem32: Uint32Array, ptr: number) => {
+                const device = devices.get(mem32[ptr >> 2]);
+                if (device) device.setIndices(mem32[(ptr + 4) >> 2]);
+            }, true, 0x1);
+    }
 
     // ── Draw calls on the ring (kill the per-draw OUT trap) ──────────────────
     // A draw does NOT need to be the trap that drains the ring: the ring drains at

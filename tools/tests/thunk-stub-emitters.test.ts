@@ -21,6 +21,8 @@ import {
     writeOwnerDisarmScalarTrampoline,
     writeStructCaptureTrampoline,
     writeUpDrawCaptureTrampoline,
+    writeIncRefStubTrampoline,
+    writeDecRefStubTrampoline,
 } from '../../src/worker/modules/d3d9/capture-trampolines';
 import type { ShadowTrampolineSpec } from '../../src/worker/modules/d3d9/capture-trampolines';
 import type { StubAllocator } from '../../src/worker/core/thunking/thunk-memory-manager';
@@ -156,6 +158,28 @@ const cases: Record<string, (ctx: Ctx) => Snapshot> = {
         const r = writeUpDrawCaptureTrampoline(ctx.allocator, ctx.getMemory, RING_CTRL, RING_DATA, RING_CAP);
         return { result: r, hashes: { code: sha(ctx.mem, r.codeRegionBase, r.codeRegionEnd) } };
     },
+    incRefStubTrampoline: (ctx) => {
+        // Texture9::AddRef shape: count at +4, stdcall ret 4, vtable gate word at OWNER_GLOBAL.
+        const r = writeIncRefStubTrampoline(ctx.allocator, ctx.getMemory,
+            { fieldOffset: 4, popBytes: 4, expectVtableAddr: OWNER_GLOBAL });
+        return { result: r, hashes: { code: sha(ctx.mem, r.codeRegionBase, r.codeRegionEnd) } };
+    },
+    incRefStubTrampolineVerify: (ctx) => {
+        const r = writeIncRefStubTrampoline(ctx.allocator, ctx.getMemory,
+            { fieldOffset: 4, popBytes: 4, expectVtableAddr: OWNER_GLOBAL, predictAddr: LUT });
+        return { result: r, hashes: { code: sha(ctx.mem, r.codeRegionBase, r.codeRegionEnd) } };
+    },
+    decRefStubTrampoline: (ctx) => {
+        // Texture9::Release shape: count at +4, stdcall ret 4, vtable gate word at OWNER_GLOBAL.
+        const r = writeDecRefStubTrampoline(ctx.allocator, ctx.getMemory,
+            { fieldOffset: 4, popBytes: 4, expectVtableAddr: OWNER_GLOBAL });
+        return { result: r, hashes: { code: sha(ctx.mem, r.codeRegionBase, r.codeRegionEnd) } };
+    },
+    decRefStubTrampolineVerify: (ctx) => {
+        const r = writeDecRefStubTrampoline(ctx.allocator, ctx.getMemory,
+            { fieldOffset: 4, popBytes: 4, expectVtableAddr: OWNER_GLOBAL, predictAddr: LUT });
+        return { result: r, hashes: { code: sha(ctx.mem, r.codeRegionBase, r.codeRegionEnd) } };
+    },
 };
 
 // Frozen snapshots (generated on the pre-move code; MUST NOT change across the move).
@@ -171,6 +195,10 @@ const EXPECTED: Record<string, Snapshot> = {
     ownerDisarmScalarTrampoline: {"result":{"trampAddr":4096,"codeRegionBase":4096,"codeRegionEnd":4224},"hashes":{"code":"3872c71deed97fde2196b52379f1d1aa7abdf8847b81c6ffa488340c96ccc8c6"}},
     structCaptureTrampoline: {"result":{"trampAddr":4096,"codeRegionBase":4096,"codeRegionEnd":4320},"hashes":{"code":"5ce49653ab8f3fa8c1218565df2c2234c05169a2d00d54a57c64d1602f2fbbed"}},
     upDrawCaptureTrampoline: {"result":{"trampAddr":4096,"codeRegionBase":4096,"codeRegionEnd":4480},"hashes":{"code":"b4d6979e6cae69666eaacb40eb06265e73b17a766266b692442734350baf3642"}},
+    incRefStubTrampoline: {"result":{"trampAddr":4096,"codeRegionBase":4096,"codeRegionEnd":4192},"hashes":{"code":"9a7faaaa8ece73ed7a2d8da15e1c93afec0e2f0c1157decf7705e9eb9f10a64a"}},
+    incRefStubTrampolineVerify: {"result":{"trampAddr":4096,"codeRegionBase":4096,"codeRegionEnd":4192},"hashes":{"code":"ec3199f214397cfd2569bdcf846eba58dfe76c51bc8781066c83bf8ef223c553"}},
+    decRefStubTrampoline: {"result":{"trampAddr":4096,"codeRegionBase":4096,"codeRegionEnd":4192},"hashes":{"code":"b491b6114215578d3ea5aacbcd6b156b40be93580cf72fbd291fcc3496c6e035"}},
+    decRefStubTrampolineVerify: {"result":{"trampAddr":4096,"codeRegionBase":4096,"codeRegionEnd":4192},"hashes":{"code":"1cea723cfceb0950f34efc38d5d4aa823bbb07e815100b0b59f2f54e359e15e3"}},
 };
 
 describe('an emitter that outgrows its region writes nothing outside it', () => {
