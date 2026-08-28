@@ -9,6 +9,7 @@ import {
     getD3DTextureLayout,
 } from "../shared/texture-formats";
 import { noteGuestBufferWrite, writeDirtyRange } from "../buffer-upload";
+import { d3d9WasmArena } from "./d3d9-wasm-arena";
 
 /**
  * `[dirtyStart, dirtyEnd)` accumulates the union of the locked ranges since the last upload
@@ -28,6 +29,7 @@ export class VertexBufferStore {
     // SoA arrays
     private sizes: Uint32Array;
     private fvfs: Uint32Array;
+    private pools: Uint32Array;
     private data: (Uint8Array | undefined)[];
     private gpuBuffers: (GPUBuffer | null)[];
     private lockedPtrs: Int32Array;    // -1 = not locked
@@ -46,6 +48,7 @@ export class VertexBufferStore {
         this.capacity = initialCapacity;
         this.sizes = new Uint32Array(initialCapacity);
         this.fvfs = new Uint32Array(initialCapacity);
+        this.pools = new Uint32Array(initialCapacity);
         this.data = new Array(initialCapacity);
         this.gpuBuffers = new Array(initialCapacity).fill(null);
         this.lockedPtrs = new Int32Array(initialCapacity).fill(-1);
@@ -58,7 +61,7 @@ export class VertexBufferStore {
         this.generations = new Uint16Array(initialCapacity);
     }
 
-    create(handle: number, size: number, fvf: number, guestPtr: number): number {
+    create(handle: number, size: number, fvf: number, guestPtr: number, pool = 0): number {
         let index: number;
         if (this.freeList.length > 0) {
             index = this.freeList.pop()!;
@@ -71,6 +74,7 @@ export class VertexBufferStore {
 
         this.sizes[index] = size;
         this.fvfs[index] = fvf;
+        this.pools[index] = pool >>> 0;
         this.data[index] = new Uint8Array(size);
         this.gpuBuffers[index] = null;
         this.lockedPtrs[index] = -1;
@@ -123,6 +127,7 @@ export class VertexBufferStore {
 
     // Getters for individual fields
     getSize(index: number): number { return this.sizes[index]; }
+    getPool(index: number): number { return this.pools[index]; }
     getFvf(index: number): number { return this.fvfs[index]; }
     getData(index: number): Uint8Array | undefined { return this.data[index]; }
     getGpuBuffer(index: number): GPUBuffer | null { return this.gpuBuffers[index]; }
@@ -151,6 +156,9 @@ export class VertexBufferStore {
         let n = 0;
         for (let i = 0; i < this.count; i++) {
             if (this.gpuBuffers[i]) { this.gpuBuffers[i] = null; n++; }
+            // D3DPOOL_DEFAULT bytes are lost with the device.  MANAGED/SYSTEMMEM
+            // retain their CPU shadow and are uploaded again normally.
+            if (this.pools[i] === 0) this.data[i]?.fill(0);
             this.setDirty(i, true);
         }
         return n;
@@ -226,6 +234,10 @@ export class VertexBufferStore {
         const newFvfs = new Uint32Array(newCapacity);
         newFvfs.set(this.fvfs);
         this.fvfs = newFvfs;
+
+        const newPools = new Uint32Array(newCapacity);
+        newPools.set(this.pools);
+        this.pools = newPools;
 
         const newData = new Array(newCapacity);
         for (let i = 0; i < this.data.length; i++) newData[i] = this.data[i];
@@ -316,6 +328,7 @@ export class IndexBufferStore {
 
     private sizes: Uint32Array;
     private formats: Uint32Array;
+    private pools: Uint32Array;
     private data: (Uint8Array | undefined)[];
     private gpuBuffers: (GPUBuffer | null)[];
     private lockedPtrs: Int32Array;
@@ -333,6 +346,7 @@ export class IndexBufferStore {
         this.capacity = initialCapacity;
         this.sizes = new Uint32Array(initialCapacity);
         this.formats = new Uint32Array(initialCapacity);
+        this.pools = new Uint32Array(initialCapacity);
         this.data = new Array(initialCapacity);
         this.gpuBuffers = new Array(initialCapacity).fill(null);
         this.lockedPtrs = new Int32Array(initialCapacity).fill(-1);
@@ -345,7 +359,7 @@ export class IndexBufferStore {
         this.generations = new Uint16Array(initialCapacity);
     }
 
-    create(handle: number, size: number, format: number, guestPtr: number): number {
+    create(handle: number, size: number, format: number, guestPtr: number, pool = 0): number {
         let index: number;
         if (this.freeList.length > 0) {
             index = this.freeList.pop()!;
@@ -358,6 +372,7 @@ export class IndexBufferStore {
 
         this.sizes[index] = size;
         this.formats[index] = format;
+        this.pools[index] = pool >>> 0;
         this.data[index] = new Uint8Array(size);
         this.gpuBuffers[index] = null;
         this.lockedPtrs[index] = -1;
@@ -409,6 +424,7 @@ export class IndexBufferStore {
     }
 
     getSize(index: number): number { return this.sizes[index]; }
+    getPool(index: number): number { return this.pools[index]; }
     getFormat(index: number): number { return this.formats[index]; }
     getData(index: number): Uint8Array | undefined { return this.data[index]; }
     getGpuBuffer(index: number): GPUBuffer | null { return this.gpuBuffers[index]; }
@@ -430,6 +446,7 @@ export class IndexBufferStore {
         let n = 0;
         for (let i = 0; i < this.count; i++) {
             if (this.gpuBuffers[i]) { this.gpuBuffers[i] = null; n++; }
+            if (this.pools[i] === 0) this.data[i]?.fill(0);
             this.setDirty(i, true);
         }
         return n;
@@ -499,6 +516,10 @@ export class IndexBufferStore {
         const newFormats = new Uint32Array(newCapacity);
         newFormats.set(this.formats);
         this.formats = newFormats;
+
+        const newPools = new Uint32Array(newCapacity);
+        newPools.set(this.pools);
+        this.pools = newPools;
 
         const newData = new Array(newCapacity);
         for (let i = 0; i < this.data.length; i++) newData[i] = this.data[i];
@@ -590,6 +611,8 @@ export class TextureStore {
     private widths: Uint32Array;
     private heights: Uint32Array;
     private levels: Uint32Array;
+    /** D3DPOOL for each guest texture: DEFAULT contents are not recoverable after loss. */
+    private pools: Uint32Array;
     // Reverse map (index → handle/texPtr) so upload paths that only hold an index can find the
     // device-side mip data, which is keyed by texPtr. Overwritten on every create() of an index.
     private handles: number[] = [];
@@ -617,6 +640,7 @@ export class TextureStore {
         this.widths = new Uint32Array(initialCapacity);
         this.heights = new Uint32Array(initialCapacity);
         this.levels = new Uint32Array(initialCapacity);
+        this.pools = new Uint32Array(initialCapacity);
         this.formats = new Uint32Array(initialCapacity);
         this.data = new Array(initialCapacity);
         this.gpuTextures = new Array(initialCapacity).fill(null);
@@ -632,7 +656,7 @@ export class TextureStore {
         this.cubeFlags = new Uint8Array(initialCapacity);
     }
 
-    create(handle: number, width: number, height: number, levels: number, format: number, guestPtr: number): number {
+    create(handle: number, width: number, height: number, levels: number, format: number, guestPtr: number, pool = 0): number {
         let index: number;
         if (this.freeList.length > 0) {
             index = this.freeList.pop()!;
@@ -650,6 +674,7 @@ export class TextureStore {
         this.widths[index] = width;
         this.heights[index] = height;
         this.levels[index] = levels;
+        this.pools[index] = pool >>> 0;
         this.handles[index] = handle;
         this.formats[index] = format;
         const layout = getD3DTextureLayout(format, width, height);
@@ -666,6 +691,9 @@ export class TextureStore {
         this.guestSerials[index] = 0;
         this.rtFlags[index] = 0;
         this.cubeFlags[index] = 0;
+        // The arena keeps cube metadata in a separate id-indexed table. A recycled
+        // TextureStore slot must clear that table before the id can denote a 2-D texture.
+        d3d9WasmArena.markTextureCube(index + 1, false);
 
         const gen = this.generations[index];
         const packed = (gen << 16) | index;
@@ -701,6 +729,10 @@ export class TextureStore {
         this.gpuTextures[index] = null;
         this.views[index] = null;
         this.guestPtrs[index] = -1;
+        // Clear the arena's one-based cube flag at destruction as well as on reuse. This
+        // prevents a released cube id from remaining cube-shaped while still bound in a
+        // later draw before the guest replaces the sampler binding.
+        d3d9WasmArena.markTextureCube(index + 1, false);
         this.generations[index] = (this.generations[index] + 1) & 0xFFFF;
         this.freeList.push(index);
         this.handleToIndex.delete(handle);
@@ -711,6 +743,7 @@ export class TextureStore {
     getWidth(index: number): number { return this.widths[index]; }
     getHeight(index: number): number { return this.heights[index]; }
     getLevels(index: number): number { return this.levels[index]; }
+    getPool(index: number): number { return this.pools[index]; }
     getHandle(index: number): number { return this.handles[index]; }
     getFormat(index: number): number { return this.formats[index]; }
     getData(index: number): Uint8Array | undefined { return this.data[index]; }
@@ -785,16 +818,29 @@ export class TextureStore {
      * re-uploaded from a buffer that holds nothing.
      * Returns `{dropped, contentLost}` so the loss report can say what did NOT come back.
      */
-    dropGpuResources(): { dropped: number; contentLost: number } {
+    dropGpuResources(): { dropped: number; contentLost: number; contentLostHandles: number[] } {
         let dropped = 0, contentLost = 0;
+        const contentLostHandles: number[] = [];
         for (let i = 0; i < this.count; i++) {
             if (this.gpuTextures[i]) { dropped++; }
             this.gpuTextures[i] = null;
             this.views[i] = null;
-            if (this.rtFlags[i]) contentLost++;
-            else this.dirtyFlags[i] = 1;
+            const lost = this.rtFlags[i] !== 0 || this.pools[i] === 0;
+            if (lost) {
+                contentLost++;
+                contentLostHandles.push(this.handles[i] ?? 0);
+                // DEFAULT and render-target contents are not preserved by D3D9 device
+                // loss.  Clear the CPU shadow too, so a later Lock cannot publish stale
+                // pre-loss pixels back to the guest.
+                this.data[i]?.fill(0);
+                this.dataSerials[i] = (this.dataSerials[i] + 1) >>> 0;
+                this.dirtyFlags[i] = 0;
+            } else {
+                // MANAGED/SYSTEMMEM can be restored from their CPU shadow.
+                this.dirtyFlags[i] = 1;
+            }
         }
-        return { dropped, contentLost };
+        return { dropped, contentLost, contentLostHandles };
     }
 
     markRenderTarget(index: number): void { this.rtFlags[index] = 1; }
@@ -853,7 +899,11 @@ export class TextureStore {
      * next Lock republishes. DXVK gates its dirty-box accumulation the same way
      * (d3d9_device.cpp:5157-5173).
      */
-    unlock(index: number, memory: Uint8Array, opts: { readOnly?: boolean } = {}): void {
+    unlock(
+        index: number,
+        memory: Uint8Array,
+        opts: { readOnly?: boolean; noDirtyUpdate?: boolean } = {},
+    ): void {
         const guestBase = this.guestPtrs[index];
         if (guestBase < 0 || this.lockedPtrs[index] === -1) return;
         this.lockedPtrs[index] = -1;
@@ -868,7 +918,7 @@ export class TextureStore {
             const bytes = this.levelBytes(index);
             data.set(memory.subarray(guestBase, guestBase + bytes));
         }
-        this.setDirty(index, true);
+        if (!opts.noDirtyUpdate) this.setDirty(index, true);
         // The guest buffer IS what `data` was just set from, so it is in sync by construction.
         this.guestSerials[index] = this.dataSerials[index];
     }
@@ -887,6 +937,10 @@ export class TextureStore {
         const newLevels = new Uint32Array(newCapacity);
         newLevels.set(this.levels);
         this.levels = newLevels;
+
+        const newPools = new Uint32Array(newCapacity);
+        newPools.set(this.pools);
+        this.pools = newPools;
 
         const newFormats = new Uint32Array(newCapacity);
         newFormats.set(this.formats);

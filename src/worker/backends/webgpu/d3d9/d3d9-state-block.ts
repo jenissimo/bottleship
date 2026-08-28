@@ -15,6 +15,11 @@ import { KeyedStateBlockRecorder } from "../shared/state-block-recorder";
 import { MAX_VERTEX_STREAMS } from "../shared/vertex-streams";
 import { d3d9WasmArena, isWasmBlocksEnabled } from "./d3d9-wasm-arena";
 import { addComRef, releaseComRef } from "../../../modules/d3d9/com-refs";
+import {
+    D3D9_PIXEL_TEXTURE_STAGE_COUNT,
+    D3D9_VERTEX_TEXTURE_SAMPLER_BASE,
+    D3D9_VERTEX_TEXTURE_SAMPLER_COUNT,
+} from "./d3d9-state-tracker";
 
 export const D3DSBT_ALL = 1;
 export const D3DSBT_PIXELSTATE = 2;
@@ -26,6 +31,7 @@ export type StateBlockEntry =
     | { op: "samplerState"; sampler: number; type: number; value: number }
     | { op: "texture"; stage: number; texPtr: number }
     | { op: "transform"; state: number; matrix: Float32Array }
+    | { op: "npatchMode"; segments: number }
     | { op: "material"; data: Uint8Array }
     | { op: "light"; index: number; data: Uint8Array }
     | { op: "lightEnable"; index: number; enable: number }
@@ -35,10 +41,44 @@ export type StateBlockEntry =
     | { op: "pixelShader"; handle: number }
     | { op: "vertexDeclaration"; handle: number }
     | { op: "vertexShaderConstantF"; start: number; data: Float32Array }
+    | { op: "vertexShaderConstantI"; start: number; data: Int32Array }
+    | { op: "vertexShaderConstantB"; start: number; data: Int32Array }
     | { op: "pixelShaderConstantF"; start: number; data: Float32Array }
+    | { op: "pixelShaderConstantI"; start: number; data: Int32Array }
     | { op: "pixelShaderConstantB"; start: number; data: Int32Array }
     | { op: "streamSource"; stream: number; vbPtr: number; offset: number; stride: number }
-    | { op: "indices"; ibPtr: number };
+    | { op: "streamSourceFreq"; stream: number; setting: number }
+    | { op: "indices"; ibPtr: number }
+    | { op: "viewport"; x: number; y: number; width: number; height: number; minZ: number; maxZ: number }
+    | { op: "scissorRect"; left: number; top: number; right: number; bottom: number };
+
+/** D3D9's CapturePixelRenderStates list from DXVK d3d9_stateblock.cpp. The API's
+ * 256-slot render-state storage is not itself the state-block membership list. */
+export const D3D9_PIXEL_RENDER_STATES = [
+    7, 8, 9, 14, 15, 16, 19, 20, 23, 24, 25, 26, 36, 37, 38, 27, 195,
+    52, 53, 54, 55, 56, 57, 58, 59, 60,
+    128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143,
+    168, 171, 174, 175, 176, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194,
+    206, 207, 208, 209,
+] as const;
+
+/** D3D9's CaptureVertexRenderStates list (DXVK d3d9_stateblock.cpp). Keep this as data so
+ * membership changes are reviewable and cannot accidentally become a broad state split. */
+export const D3D9_VERTEX_RENDER_STATES = [
+    22, 28, 34, 35, 36, 37, 38, 48, 139, 141, 140, 136, 137, 142, 148, 147, 145, 146,
+    151, 152, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 166, 167, 170, 172, 173,
+    178, 179, 180, 181, 182, 183, 184, 143, 29, 9,
+] as const;
+
+function renderStateMembership(blockType: number): ReadonlySet<number> {
+    if (blockType === D3DSBT_PIXELSTATE) return new Set(D3D9_PIXEL_RENDER_STATES);
+    if (blockType === D3DSBT_VERTEXSTATE) return new Set(D3D9_VERTEX_RENDER_STATES);
+    return new Set([...D3D9_PIXEL_RENDER_STATES, ...D3D9_VERTEX_RENDER_STATES]);
+}
+
+const D3DSAMP_DMAPOFFSET = 13;
+const D3D9_PIXEL_SAMPLER_TYPES = 12;
+const D3D9_FFP_TSS_TYPES = 32;
 
 /**
  * Which blocks own the vertex-stream BINDINGS (SetStreamSource) and the index buffer.
@@ -48,15 +88,11 @@ export type StateBlockEntry =
  * IDirect3DDevice9::SetStreamSource, and the divider (if any) from SetStreamSourceFreq" and "A
  * pointer to the index buffer".
  *
- * D3DSBT_VERTEXSTATE deliberately does NOT: its list ("Saving Vertex States With a StateBlock")
- * is the vertex render/sampler/texture states, NPatch mode, lights + enables, the vertex shader
- * and its constants, the SetStreamSourceFreq DIVIDERS, and the vertex declaration — the divider
- * is vertex state, the binding it divides is not. Capturing bindings into a vertex-state block
- * would be as wrong as omitting them from an ALL block: Apply would then overwrite the buffers
- * the app bound after the capture and expected to survive.
+ * D3DSBT_VERTEXSTATE deliberately does NOT capture transforms, material, lights, clip planes,
+ * viewport, scissor, textures, or stream/index bindings. Its list is the vertex render/sampler
+ * states, vertex shader/constants, stream-frequency dividers, and vertex declaration. The
+ * divider is vertex state, while the binding it divides is not.
  *
- * (The dividers themselves are not captured because SetStreamSourceFreq is not implemented;
- * capturing state we cannot set would restore nothing.)
  */
 export function stateBlockCapturesStreamBindings(blockType: number): boolean {
     return blockType === D3DSBT_ALL;
@@ -88,6 +124,47 @@ export function captureStreamBindingEntries(device: StreamStateDevice, entries: 
     entries.push({ op: "indices", ibPtr: device.getBoundIndexBufferPtr() >>> 0 });
 }
 
+export interface VertexTextureStateDevice {
+    getAllSamplerStates(): Array<{ sampler: number; type: number; value: number }>;
+    getSamplerState?(sampler: number, type: number): number;
+    getBoundTexturePtr(stage: number): number;
+}
+
+/** Capture only the vertex sampler state in the D3D9 vertex-state list. Texture bindings are
+ * ALL-only; vertex-texture sampler state is the single D3DSAMP_DMAPOFFSET entry. */
+export function captureVertexTextureEntries(device: VertexTextureStateDevice, entries: StateBlockEntry[]): void {
+    for (let n = 0; n < D3D9_VERTEX_TEXTURE_SAMPLER_COUNT; n++) {
+        const sampler = D3D9_VERTEX_TEXTURE_SAMPLER_BASE + n;
+        const value = device.getSamplerState
+            ? device.getSamplerState(sampler, D3DSAMP_DMAPOFFSET)
+            : device.getAllSamplerStates().find(s => s.sampler === sampler && s.type === D3DSAMP_DMAPOFFSET)?.value ?? 0;
+        entries.push({ op: "samplerState", sampler, type: D3DSAMP_DMAPOFFSET, value });
+    }
+}
+
+function capturePixelSamplerEntries(device: VertexTextureStateDevice, entries: StateBlockEntry[]): void {
+    for (let sampler = 0; sampler < D3D9_PIXEL_TEXTURE_STAGE_COUNT; sampler++) {
+        for (let type = 1; type <= D3D9_PIXEL_SAMPLER_TYPES; type++) {
+            const value = device.getSamplerState
+                ? device.getSamplerState(sampler, type)
+                : device.getAllSamplerStates().find(s => s.sampler === sampler && s.type === type)?.value ?? 0;
+            entries.push({ op: "samplerState", sampler, type, value });
+        }
+    }
+}
+
+function captureAllTextureEntries(device: VertexTextureStateDevice, entries: StateBlockEntry[]): void {
+    // D3D9's texture bindings are an ALL-only group. Include NULL slots so Apply can unbind a
+    // texture installed after capture; the vertex-texture slots are sparse in the public ABI.
+    for (let stage = 0; stage < D3D9_PIXEL_TEXTURE_STAGE_COUNT; stage++) {
+        entries.push({ op: "texture", stage, texPtr: device.getBoundTexturePtr(stage) });
+    }
+    for (let n = 0; n < D3D9_VERTEX_TEXTURE_SAMPLER_COUNT; n++) {
+        const stage = D3D9_VERTEX_TEXTURE_SAMPLER_BASE + n;
+        entries.push({ op: "texture", stage, texPtr: device.getBoundTexturePtr(stage) });
+    }
+}
+
 export interface D3D9StateBlockData {
     devicePtr: number;
     blockType: number;
@@ -95,7 +172,7 @@ export interface D3D9StateBlockData {
     /**
      * True when every entry is representable in the WASM arena mirror (see
      * classifyStateBlockCoverage). Computed once at End/CreateStateBlock; blocks with
-     * beyond-mirror ops (transforms, TSS, materials, lights, clip planes, stage>0
+     * beyond-mirror ops (transforms, NPatch mode, TSS, materials, lights, clip planes, stage>0
      * samplers, stream/index bindings) stay on the JS apply/capture path.
      */
     coverable?: boolean;
@@ -173,6 +250,8 @@ function entryKey(entry: StateBlockEntry): string {
             return `tex:${entry.stage}`;
         case "transform":
             return `xf:${entry.state}`;
+        case "npatchMode":
+            return "npatch";
         case "material":
             return "mat";
         case "light":
@@ -191,14 +270,26 @@ function entryKey(entry: StateBlockEntry): string {
             return "vd";
         case "vertexShaderConstantF":
             return `vsc:${entry.start}:${entry.data.length}`;
+        case "vertexShaderConstantI":
+            return `vsci:${entry.start}:${entry.data.length}`;
+        case "vertexShaderConstantB":
+            return `vscb:${entry.start}:${entry.data.length}`;
         case "pixelShaderConstantF":
             return `psc:${entry.start}:${entry.data.length}`;
+        case "pixelShaderConstantI":
+            return `psci:${entry.start}:${entry.data.length}`;
         case "pixelShaderConstantB":
             return `pscb:${entry.start}:${entry.data.length}`;
         case "streamSource":
             return `stream:${entry.stream}`;
+        case "streamSourceFreq":
+            return `streamFreq:${entry.stream}`;
         case "indices":
             return "ib";
+        case "viewport":
+            return "viewport";
+        case "scissorRect":
+            return "scissorRect";
     }
 }
 
@@ -382,6 +473,9 @@ export function applyStateBlockEntries(device: D3D9Device, entries: StateBlockEn
             case "transform":
                 device.setTransform(entry.state, entry.matrix);
                 break;
+            case "npatchMode":
+                device.setNPatchMode(entry.segments);
+                break;
             case "material":
                 device.setMaterial(entry.data);
                 break;
@@ -415,15 +509,33 @@ export function applyStateBlockEntries(device: D3D9Device, entries: StateBlockEn
             case "vertexShaderConstantF":
                 device.setVertexShaderConstantFFromArray(entry.start, entry.data, mem);
                 break;
+            case "vertexShaderConstantI":
+                device.setVertexShaderConstantIFromArray(entry.start, entry.data);
+                break;
+            case "vertexShaderConstantB":
+                device.setVertexShaderConstantBFromArray(entry.start, entry.data);
+                break;
             case "pixelShaderConstantF":
                 device.setPixelShaderConstantFFromArray(entry.start, entry.data, mem);
+                break;
+            case "pixelShaderConstantI":
+                device.setPixelShaderConstantIFromArray(entry.start, entry.data);
                 break;
             case "pixelShaderConstantB":
                 device.setPixelShaderConstantBFromArray(entry.start, entry.data);
                 break;
+            case "streamSourceFreq":
+                device.setStreamSourceFreq(entry.stream, entry.setting);
+                break;
             case "streamSource":
             case "indices":
                 applyStreamStateEntry(device, entry);
+                break;
+            case "viewport":
+                device.setViewportValues(entry);
+                break;
+            case "scissorRect":
+                device.setScissorRect(entry.left, entry.top, entry.right, entry.bottom);
                 break;
         }
     }
@@ -462,6 +574,9 @@ export function refreshCapturedEntries(device: D3D9Device, entries: StateBlockEn
                 }
                 break;
             }
+            case "npatchMode":
+                entries[i] = { op: "npatchMode", segments: device.getNPatchMode() };
+                break;
             case "material":
                 entries[i] = { op: "material", data: new Uint8Array(device.getMaterial()) };
                 break;
@@ -499,9 +614,24 @@ export function refreshCapturedEntries(device: D3D9Device, entries: StateBlockEn
                 entries[i] = { op: "vertexShaderConstantF", start: entry.start, data };
                 break;
             }
+            case "vertexShaderConstantI": {
+                const data = device.getVertexShaderConstantsI(entry.start, entry.data.length / 4);
+                entries[i] = { op: "vertexShaderConstantI", start: entry.start, data };
+                break;
+            }
+            case "vertexShaderConstantB": {
+                const data = device.getVertexShaderConstantsB(entry.start, entry.data.length);
+                entries[i] = { op: "vertexShaderConstantB", start: entry.start, data };
+                break;
+            }
             case "pixelShaderConstantF": {
                 const data = device.getPixelShaderConstants(entry.start, entry.data.length / 4);
                 entries[i] = { op: "pixelShaderConstantF", start: entry.start, data };
+                break;
+            }
+            case "pixelShaderConstantI": {
+                const data = device.getPixelShaderConstantsI(entry.start, entry.data.length / 4);
+                entries[i] = { op: "pixelShaderConstantI", start: entry.start, data };
                 break;
             }
             case "pixelShaderConstantB": {
@@ -509,10 +639,25 @@ export function refreshCapturedEntries(device: D3D9Device, entries: StateBlockEn
                 entries[i] = { op: "pixelShaderConstantB", start: entry.start, data };
                 break;
             }
+            case "streamSourceFreq": {
+                const setting = device.getStreamSourceFreq(entry.stream);
+                if (setting !== null) entries[i] = { op: "streamSourceFreq", stream: entry.stream, setting };
+                break;
+            }
             case "streamSource":
             case "indices":
                 refreshStreamStateEntry(device, entry);
                 break;
+            case "viewport": {
+                const viewport = device.getViewport();
+                entries[i] = { op: "viewport", ...viewport };
+                break;
+            }
+            case "scissorRect": {
+                const rect = device.getScissorRect();
+                entries[i] = { op: "scissorRect", ...rect };
+                break;
+            }
         }
     }
 }
@@ -524,29 +669,63 @@ export function captureStateToEntries(device: D3D9Device, blockType: number): St
     const includeVertex = blockType === D3DSBT_ALL || blockType === D3DSBT_VERTEXSTATE;
 
     if (includePixel) {
+        const renderStates = renderStateMembership(blockType);
         for (const { state, value } of device.getAllRenderStates()) {
-            entries.push({ op: "renderState", state, value });
+            if (renderStates.has(state)) entries.push({ op: "renderState", state, value });
         }
         for (const { stage, type, value } of device.getAllTextureStageStates()) {
             entries.push({ op: "textureStageState", stage, type, value });
         }
-        for (const { sampler, type, value } of device.getAllSamplerStates()) {
-            entries.push({ op: "samplerState", sampler, type, value });
-        }
-        for (let stage = 0; stage < 8; stage++) {
-            const texPtr = device.getBoundTexturePtr(stage);
-            if (texPtr !== 0) {
-                entries.push({ op: "texture", stage, texPtr });
-            }
-        }
+        capturePixelSamplerEntries(device, entries);
+        // A state block captures the selected shader even when it is NULL: a
+        // block made while fixed-function rendering is active must be able to
+        // unbind a shader installed after the capture.
         entries.push({ op: "pixelShader", handle: device.getPixelShaderComPtr() });
         const psConsts = device.getAllPixelShaderConstants();
-        if (psConsts.length > 0) {
-            entries.push({ op: "pixelShaderConstantF", start: 0, data: psConsts });
-        }
+        entries.push({ op: "pixelShaderConstantF", start: 0, data: psConsts });
+        const psInts = device.getAllPixelShaderConstantsI();
+        entries.push({ op: "pixelShaderConstantI", start: 0, data: psInts });
+        const psBools = device.getAllPixelShaderConstantsB();
+        entries.push({ op: "pixelShaderConstantB", start: 0, data: psBools });
     }
 
     if (includeVertex) {
+        captureVertexTextureEntries(device, entries);
+        if (blockType === D3DSBT_VERTEXSTATE) {
+            const renderStates = renderStateMembership(blockType);
+            for (const { state, value } of device.getAllRenderStates()) {
+                if (renderStates.has(state)) entries.push({ op: "renderState", state, value });
+            }
+        }
+        entries.push({ op: "vertexShader", handle: device.getVertexShaderComPtr() });
+        // FVF and the vertex declaration share one slot in D3D9: whichever was set last wins.
+        // Capture BOTH, FVF first, so Apply ends on the declaration — a block captured with a
+        // declaration current still restores it. Without the FVF entry a block applied under a
+        // different FVF leaves the new stride against the old everything-else.
+        entries.push({ op: "fvf", value: device.getFVF() });
+        entries.push({ op: "vertexDeclaration", handle: device.getVertexDeclarationComPtr() });
+        // D3D9's documented vertex-state list includes NPatchMode.
+        entries.push({ op: "npatchMode", segments: device.getNPatchMode() });
+        const vsConsts = device.getAllVertexShaderConstants();
+        entries.push({ op: "vertexShaderConstantF", start: 0, data: vsConsts });
+        const vsInts = device.getAllVertexShaderConstantsI();
+        entries.push({ op: "vertexShaderConstantI", start: 0, data: vsInts });
+        const vsBools = device.getAllVertexShaderConstantsB();
+        entries.push({ op: "vertexShaderConstantB", start: 0, data: vsBools });
+        // The dividers are vertex state (see stateBlockCapturesStreamBindings) — captured by
+        // VERTEXSTATE and ALL, unlike the bindings they divide.
+        for (let stream = 0; stream < MAX_VERTEX_STREAMS; stream++) {
+            const setting = device.getStreamSourceFreq(stream);
+            if (setting !== null) entries.push({ op: "streamSourceFreq", stream, setting });
+        }
+    }
+
+    if (stateBlockCapturesStreamBindings(blockType)) {
+        captureStreamBindingEntries(device, entries);
+    }
+
+    if (blockType === D3DSBT_ALL) {
+        captureAllTextureEntries(device, entries);
         for (const { state, matrix } of device.getAllTransforms()) {
             entries.push({ op: "transform", state, matrix: new Float32Array(matrix) });
         }
@@ -560,26 +739,9 @@ export function captureStateToEntries(device: D3D9Device, blockType: number): St
         for (const { index, plane } of device.getAllClipPlanes()) {
             entries.push({ op: "clipPlane", index, plane: new Float32Array(plane) });
         }
-        const fvf = device.getFVF();
-        if (fvf !== 0) {
-            entries.push({ op: "fvf", value: fvf });
-        }
-        const vs = device.getVertexShaderComPtr();
-        if (vs !== 0) {
-            entries.push({ op: "vertexShader", handle: vs });
-        }
-        const vd = device.getVertexDeclarationComPtr();
-        if (vd !== 0) {
-            entries.push({ op: "vertexDeclaration", handle: vd });
-        }
-        const vsConsts = device.getAllVertexShaderConstants();
-        if (vsConsts.length > 0) {
-            entries.push({ op: "vertexShaderConstantF", start: 0, data: vsConsts });
-        }
-    }
-
-    if (stateBlockCapturesStreamBindings(blockType)) {
-        captureStreamBindingEntries(device, entries);
+        const viewport = device.getViewport();
+        entries.push({ op: "viewport", ...viewport });
+        entries.push({ op: "scissorRect", ...device.getScissorRect() });
     }
 
     return entries;

@@ -7,98 +7,88 @@
  * render pipeline's color-target descriptor, so the blend state is part of the
  * pipeline cache key (see d3d9-device.ts).
  *
- * Reference: DXVK src/d3d9/d3d9_util.cpp DecodeBlendFactor / DecodeBlendOp and
- * d3d9_util.h FixupBlendState (the DirectX-6 BOTH*SRCALPHA legacy fixup).
+ * The D3DBLEND/D3DBLENDOP → WebGPU mapping and the BOTH*SRCALPHA fixup live in
+ * shared/d3d-blend-factor.ts — DirectDraw/D3D3-8 FFP (ddraw/pipeline-factory.ts)
+ * shares the identical enum values and legacy rule.
  */
+import {
+    mapBlendFactor, mapBlendOp, fixupBoth, isKnownBlendFactor, isKnownBlendOperation,
+    hasDualSourceBlendFactor,
+} from "../shared/d3d-blend-factor";
 
 /** Reads a D3D9 render-state value (index → DWORD). */
 export type GetRenderState = (state: number) => number;
+
+/**
+ * D3DCOLOR (0xAARRGGBB) → GPUColor. Shared by the clear path and the render-pass
+ * blend constant (D3DRS_BLENDFACTOR) so the channel order cannot drift between them.
+ */
+export function d3dColorToGpu(color: number): GPUColor {
+    const c = color >>> 0;
+    return {
+        r: ((c >>> 16) & 0xff) / 255,
+        g: ((c >>> 8) & 0xff) / 255,
+        b: (c & 0xff) / 255,
+        a: ((c >>> 24) & 0xff) / 255,
+    };
+}
 
 // ── Render-state indices ──────────────────────────────────────────────────
 export const D3DRS_SRCBLEND = 19;
 export const D3DRS_DESTBLEND = 20;
 export const D3DRS_ALPHABLENDENABLE = 27;
 export const D3DRS_BLENDOP = 171;
+/** D3DBLENDFACTOR render state (DWORD A8R8G8B8). The executor applies it with
+ * GPURenderPassEncoder.setBlendConstant before each draw. */
+export const D3DRS_BLENDFACTOR = 193;
 export const D3DRS_COLORWRITEENABLE = 168;
+export const D3DRS_COLORWRITEENABLE1 = 190;
+export const D3DRS_COLORWRITEENABLE2 = 191;
+export const D3DRS_COLORWRITEENABLE3 = 192;
 export const D3DRS_SEPARATEALPHABLENDENABLE = 206;
 export const D3DRS_SRCBLENDALPHA = 207;
 export const D3DRS_DESTBLENDALPHA = 208;
 export const D3DRS_BLENDOPALPHA = 209;
 
-// ── D3DBLEND ──────────────────────────────────────────────────────────────
-const D3DBLEND_ZERO = 1;
-const D3DBLEND_ONE = 2;
-const D3DBLEND_SRCCOLOR = 3;
-const D3DBLEND_INVSRCCOLOR = 4;
-const D3DBLEND_SRCALPHA = 5;
-const D3DBLEND_INVSRCALPHA = 6;
-const D3DBLEND_DESTALPHA = 7;
-const D3DBLEND_INVDESTALPHA = 8;
-const D3DBLEND_DESTCOLOR = 9;
-const D3DBLEND_INVDESTCOLOR = 10;
-const D3DBLEND_SRCALPHASAT = 11;
-const D3DBLEND_BOTHSRCALPHA = 12;
-const D3DBLEND_BOTHINVSRCALPHA = 13;
-const D3DBLEND_BLENDFACTOR = 14;
-const D3DBLEND_INVBLENDFACTOR = 15;
-const D3DBLEND_SRCCOLOR2 = 16;
-const D3DBLEND_INVSRCCOLOR2 = 17;
+const COLOR_WRITE_STATES = [
+    D3DRS_COLORWRITEENABLE,
+    D3DRS_COLORWRITEENABLE1,
+    D3DRS_COLORWRITEENABLE2,
+    D3DRS_COLORWRITEENABLE3,
+] as const;
 
-// ── D3DBLENDOP ────────────────────────────────────────────────────────────
-const D3DBLENDOP_ADD = 1;
-const D3DBLENDOP_SUBTRACT = 2;
-const D3DBLENDOP_REVSUBTRACT = 3;
-const D3DBLENDOP_MIN = 4;
-const D3DBLENDOP_MAX = 5;
-
-/**
- * Map a D3DBLEND factor to its WebGPU equivalent. Unlike Vulkan, WebGPU has a
- * single CONSTANT factor (no separate constant-alpha), so the `isAlpha` hint is
- * only used to keep parity with the reference; both collapse to "constant".
- * Dual-source (SRCCOLOR2/INVSRCCOLOR2) needs the dual-source-blending feature we
- * do not enable — fall back to the single-source colour factor.
- */
-function mapBlendFactor(factor: number): GPUBlendFactor {
-    switch (factor) {
-        case D3DBLEND_ZERO: return "zero";
-        case D3DBLEND_ONE: return "one";
-        case D3DBLEND_SRCCOLOR: return "src";
-        case D3DBLEND_INVSRCCOLOR: return "one-minus-src";
-        case D3DBLEND_SRCALPHA: return "src-alpha";
-        case D3DBLEND_INVSRCALPHA: return "one-minus-src-alpha";
-        case D3DBLEND_DESTALPHA: return "dst-alpha";
-        case D3DBLEND_INVDESTALPHA: return "one-minus-dst-alpha";
-        case D3DBLEND_DESTCOLOR: return "dst";
-        case D3DBLEND_INVDESTCOLOR: return "one-minus-dst";
-        case D3DBLEND_SRCALPHASAT: return "src-alpha-saturated";
-        case D3DBLEND_BLENDFACTOR: return "constant";
-        case D3DBLEND_INVBLENDFACTOR: return "one-minus-constant";
-        case D3DBLEND_SRCCOLOR2: return "src";            // dual-source unsupported
-        case D3DBLEND_INVSRCCOLOR2: return "one-minus-src";
-        default: return "one";
+function colorWriteMask(getRS: GetRenderState, targetIndex: number): number {
+    const state = COLOR_WRITE_STATES[targetIndex];
+    if (state === undefined) {
+        throw new RangeError(`D3D9 color-target index ${targetIndex} is outside 0..3`);
     }
-}
-
-function mapBlendOp(op: number): GPUBlendOperation {
-    switch (op) {
-        case D3DBLENDOP_ADD: return "add";
-        case D3DBLENDOP_SUBTRACT: return "subtract";
-        case D3DBLENDOP_REVSUBTRACT: return "reverse-subtract";
-        case D3DBLENDOP_MIN: return "min";
-        case D3DBLENDOP_MAX: return "max";
-        default: return "add";
-    }
+    return getRS(state) & 0xf;
 }
 
 /**
- * Apply the DirectX-6 legacy fixup: D3DBLEND_BOTH*SRCALPHA as the source factor
- * implicitly forces the destination factor (it predates separate src/dst).
- * Returns the effective [src, dst] pair.
+ * Validate the blend state before it reaches a WebGPU pipeline descriptor.
+ * D3D9's BOTH*SRCALPHA values are valid legacy inputs and are normalized by
+ * `fixupBoth`; dual-source factors remain an explicit backend refusal.
+ * Disabled blending does not consume the factor/op states, matching D3D9.
  */
-function fixupBoth(src: number, dst: number): [number, number] {
-    if (src === D3DBLEND_BOTHSRCALPHA) return [D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA];
-    if (src === D3DBLEND_BOTHINVSRCALPHA) return [D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA];
-    return [src, dst];
+export function isD3D9BlendStateRepresentable(getRS: GetRenderState): boolean {
+    if (getRS(D3DRS_ALPHABLENDENABLE) === 0) return true;
+
+    const [cSrc, cDst] = fixupBoth(getRS(D3DRS_SRCBLEND), getRS(D3DRS_DESTBLEND));
+    const cOp = getRS(D3DRS_BLENDOP);
+    let aSrc = cSrc, aDst = cDst, aOp = cOp;
+    if (getRS(D3DRS_SEPARATEALPHABLENDENABLE) !== 0) {
+        [aSrc, aDst] = fixupBoth(getRS(D3DRS_SRCBLENDALPHA), getRS(D3DRS_DESTBLENDALPHA));
+        aOp = getRS(D3DRS_BLENDOPALPHA);
+    }
+
+    return representableFactor(cSrc) && representableFactor(cDst)
+        && representableFactor(aSrc) && representableFactor(aDst)
+        && isKnownBlendOperation(cOp) && isKnownBlendOperation(aOp);
+}
+
+function representableFactor(factor: number): boolean {
+    return isKnownBlendFactor(factor) && !hasDualSourceBlendFactor(factor);
 }
 
 /**
@@ -106,8 +96,12 @@ function fixupBoth(src: number, dst: number): [number, number] {
  * blend) for the current render state. When D3DRS_ALPHABLENDENABLE is FALSE no
  * blend object is attached (fully opaque, the WebGPU default).
  */
-export function buildColorTargetState(format: GPUTextureFormat, getRS: GetRenderState): GPUColorTargetState {
-    const writeMask = getRS(D3DRS_COLORWRITEENABLE) & 0xf;
+export function buildColorTargetState(
+    format: GPUTextureFormat,
+    getRS: GetRenderState,
+    targetIndex: number = 0,
+): GPUColorTargetState {
+    const writeMask = colorWriteMask(getRS, targetIndex);
     if (getRS(D3DRS_ALPHABLENDENABLE) === 0) {
         return { format, writeMask };
     }
@@ -119,6 +113,17 @@ export function buildColorTargetState(format: GPUTextureFormat, getRS: GetRender
     if (getRS(D3DRS_SEPARATEALPHABLENDENABLE) !== 0) {
         [aSrc, aDst] = fixupBoth(getRS(D3DRS_SRCBLENDALPHA), getRS(D3DRS_DESTBLENDALPHA));
         aOp = getRS(D3DRS_BLENDOPALPHA);
+    }
+    // The factors/ops resolved above are exactly what isD3D9BlendStateRepresentable would
+    // re-derive; check them directly rather than walking the render states a second time.
+    if (hasUnsupportedBlendFactor(cSrc) || hasUnsupportedBlendFactor(cDst)
+        || hasUnsupportedBlendFactor(aSrc) || hasUnsupportedBlendFactor(aDst)) {
+        throw new Error("D3D9 dual-source blending is not representable by WebGPU");
+    }
+    if (!isKnownBlendFactor(cSrc) || !isKnownBlendFactor(cDst)
+        || !isKnownBlendFactor(aSrc) || !isKnownBlendFactor(aDst)
+        || !isKnownBlendOperation(cOp) || !isKnownBlendOperation(aOp)) {
+        throw new Error("D3D9 blend state contains an invalid factor or operation");
     }
 
     return {
@@ -136,17 +141,45 @@ export function buildColorTargetState(format: GPUTextureFormat, getRS: GetRender
  * into the pipeline cache keys so a blend-mode change forces a fresh pipeline.
  */
 export function computeBlendKey(getRS: GetRenderState): string {
-    const writeMask = getRS(D3DRS_COLORWRITEENABLE) & 0xf;
-    if (getRS(D3DRS_ALPHABLENDENABLE) === 0) return `n${writeMask}`;
+    // D3D9's blend equation is shared by all render targets, but each target has
+    // an independent write mask. Key all four even when only a subset is bound:
+    // callers can use this fragment without separately reasoning about MRT state.
+    const writeMasks = COLOR_WRITE_STATES.map(state => getRS(state) & 0xf).join(",");
+    if (getRS(D3DRS_ALPHABLENDENABLE) === 0) return `n${writeMasks}`;
     const sep = getRS(D3DRS_SEPARATEALPHABLENDENABLE) !== 0 ? 1 : 0;
+    // D3DRS_BLENDFACTOR is dynamic render-pass state and is applied with setBlendConstant
+    // before each draw; changing it must reuse the same pipeline.
     return `b${getRS(D3DRS_SRCBLEND)},${getRS(D3DRS_DESTBLEND)},${getRS(D3DRS_BLENDOP)},${sep},`
-        + `${getRS(D3DRS_SRCBLENDALPHA)},${getRS(D3DRS_DESTBLENDALPHA)},${getRS(D3DRS_BLENDOPALPHA)},${writeMask}`;
+        + `${getRS(D3DRS_SRCBLENDALPHA)},${getRS(D3DRS_DESTBLENDALPHA)},${getRS(D3DRS_BLENDOPALPHA)},`
+        + `${writeMasks}`;
+}
+
+/** WebGPU has no second-source blend factor. Constant factors are lowered by the
+ * render-pass blend-constant command. */
+export function hasUnsupportedBlendFactor(factor: number): boolean {
+    return hasDualSourceBlendFactor(factor);
 }
 
 // ── Depth state ───────────────────────────────────────────────────────────
 export const D3DRS_ZENABLE = 7;
 export const D3DRS_ZWRITEENABLE = 14;
 export const D3DRS_ZFUNC = 23;
+export const D3DRS_CULLMODE = 22;
+/** D3D9 stencil states.  The executor uses depth24plus-stencil8 for the default and D24S8
+ * paths, so the complete single- and two-sided state can be lowered here. */
+export const D3DRS_STENCILENABLE = 52;
+export const D3DRS_STENCILFAIL = 53;
+export const D3DRS_STENCILZFAIL = 54;
+export const D3DRS_STENCILPASS = 55;
+export const D3DRS_STENCILFUNC = 56;
+export const D3DRS_STENCILREF = 57;
+export const D3DRS_STENCILMASK = 58;
+export const D3DRS_STENCILWRITEMASK = 59;
+export const D3DRS_TWOSIDEDSTENCILMODE = 185;
+export const D3DRS_CCW_STENCILFAIL = 186;
+export const D3DRS_CCW_STENCILZFAIL = 187;
+export const D3DRS_CCW_STENCILPASS = 188;
+export const D3DRS_CCW_STENCILFUNC = 189;
 // Both are FLOATS bit-cast into the render-state DWORD, and both default to 0.0f.
 export const D3DRS_SLOPESCALEDEPTHBIAS = 175;
 export const D3DRS_DEPTHBIAS = 195;
@@ -175,6 +208,58 @@ const D3DCMP_TO_GPU: readonly GPUCompareFunction[] = [
     "never", "less", "equal", "less-equal", "greater", "not-equal", "greater-equal", "always",
 ];
 
+const D3DSTENCILOP_TO_GPU: readonly GPUStencilOperation[] = [
+    "keep", // 0 — invalid in D3D9; retain a safe default
+    "keep", "zero", "replace", "increment-clamp", "decrement-clamp", "invert",
+    "increment-wrap", "decrement-wrap",
+];
+
+function stencilOp(raw: number): GPUStencilOperation {
+    return D3DSTENCILOP_TO_GPU[raw >>> 0] ?? "keep";
+}
+
+function stencilCompare(raw: number): GPUCompareFunction {
+    return D3DCMP_TO_GPU[raw >>> 0] ?? "always";
+}
+
+function isD3D9CompareFunction(raw: number): boolean {
+    const value = raw >>> 0;
+    return value >= 1 && value <= 8;
+}
+
+function isD3D9StencilOperation(raw: number): boolean {
+    const value = raw >>> 0;
+    return value >= 1 && value <= 8;
+}
+
+/**
+ * Validate depth/stencil and cull enums before a pipeline is built.  The descriptor builders
+ * retain defensive fallbacks for callers that need a descriptor, but a D3D9 draw must not
+ * silently turn an invalid active state into a different comparison or stencil operation.
+ * States that D3D9 ignores while their feature is disabled are deliberately not inspected.
+ */
+export function isD3D9DepthStencilStateRepresentable(getRS: GetRenderState): boolean {
+    const cull = getRS(D3DRS_CULLMODE) >>> 0;
+    if (cull < 1 || cull > 3) return false; // NONE/CW/CCW
+
+    const zEnable = getRS(D3DRS_ZENABLE) >>> 0;
+    if (zEnable > 2) return false; // FALSE/TRUE/USEW (USEW is refused by the device policy)
+    if (zEnable !== 0 && !isD3D9CompareFunction(getRS(D3DRS_ZFUNC))) return false;
+
+    if (getRS(D3DRS_STENCILENABLE) === 0) return true;
+    if (!isD3D9CompareFunction(getRS(D3DRS_STENCILFUNC))
+        || !isD3D9StencilOperation(getRS(D3DRS_STENCILFAIL))
+        || !isD3D9StencilOperation(getRS(D3DRS_STENCILZFAIL))
+        || !isD3D9StencilOperation(getRS(D3DRS_STENCILPASS))) return false;
+    if (getRS(D3DRS_TWOSIDEDSTENCILMODE) !== 0) {
+        if (!isD3D9CompareFunction(getRS(D3DRS_CCW_STENCILFUNC))
+            || !isD3D9StencilOperation(getRS(D3DRS_CCW_STENCILFAIL))
+            || !isD3D9StencilOperation(getRS(D3DRS_CCW_STENCILZFAIL))
+            || !isD3D9StencilOperation(getRS(D3DRS_CCW_STENCILPASS))) return false;
+    }
+    return true;
+}
+
 /**
  * Build the WebGPU depth-stencil descriptor for the current render state.
  *
@@ -192,6 +277,20 @@ const D3DCMP_TO_GPU: readonly GPUCompareFunction[] = [
 export function buildDepthStencilState(format: GPUTextureFormat, getRS: GetRenderState): GPUDepthStencilState {
     const zEnable = getRS(D3DRS_ZENABLE) !== 0; // D3DZB_TRUE(1) and D3DZB_USEW(2) both test
     const func = getRS(D3DRS_ZFUNC);
+    const stencilEnabled = getRS(D3DRS_STENCILENABLE) !== 0;
+    const twoSided = getRS(D3DRS_TWOSIDEDSTENCILMODE) !== 0;
+    const front: GPUStencilFaceState = {
+        compare: stencilCompare(getRS(D3DRS_STENCILFUNC)),
+        failOp: stencilOp(getRS(D3DRS_STENCILFAIL)),
+        depthFailOp: stencilOp(getRS(D3DRS_STENCILZFAIL)),
+        passOp: stencilOp(getRS(D3DRS_STENCILPASS)),
+    };
+    const back: GPUStencilFaceState = twoSided ? {
+        compare: stencilCompare(getRS(D3DRS_CCW_STENCILFUNC)),
+        failOp: stencilOp(getRS(D3DRS_CCW_STENCILFAIL)),
+        depthFailOp: stencilOp(getRS(D3DRS_CCW_STENCILZFAIL)),
+        passOp: stencilOp(getRS(D3DRS_CCW_STENCILPASS)),
+    } : front;
     return {
         format,
         depthWriteEnabled: zEnable && getRS(D3DRS_ZWRITEENABLE) !== 0,
@@ -206,6 +305,12 @@ export function buildDepthStencilState(format: GPUTextureFormat, getRS: GetRende
             Math.round(rsAsFloat(getRS(D3DRS_DEPTHBIAS)) * DEPTH_BIAS_UNITS_PER_UNORM24))),
         depthBiasSlopeScale: rsAsFloat(getRS(D3DRS_SLOPESCALEDEPTHBIAS)),
         depthBiasClamp: 0,
+        stencilFront: stencilEnabled ? front : { compare: "always", failOp: "keep", depthFailOp: "keep", passOp: "keep" },
+        // D3D9's single-sided stencil state applies to both winding directions.  `back` is
+        // already the front state when TWOSIDEDSTENCILMODE is disabled.
+        stencilBack: stencilEnabled ? back : { compare: "always", failOp: "keep", depthFailOp: "keep", passOp: "keep" },
+        stencilReadMask: getRS(D3DRS_STENCILMASK) & 0xff,
+        stencilWriteMask: getRS(D3DRS_STENCILWRITEMASK) & 0xff,
     };
 }
 
@@ -214,6 +319,19 @@ export function computeDepthKey(getRS: GetRenderState): string {
     // The bias states key the cache whether or not the z-buffer is on: they live in the
     // pipeline, so a game that biases with ZENABLE off would otherwise reuse an unbiased one.
     const bias = `${getRS(D3DRS_DEPTHBIAS) >>> 0}.${getRS(D3DRS_SLOPESCALEDEPTHBIAS) >>> 0}`;
-    if (getRS(D3DRS_ZENABLE) === 0) return `z0!${bias}`;
-    return `z${getRS(D3DRS_ZWRITEENABLE) !== 0 ? 1 : 0}.${getRS(D3DRS_ZFUNC)}!${bias}`;
+    const stencil = `${getRS(D3DRS_STENCILENABLE) !== 0 ? 1 : 0}.${getRS(D3DRS_TWOSIDEDSTENCILMODE) !== 0 ? 1 : 0}` +
+        `.${getRS(D3DRS_STENCILFAIL)}.${getRS(D3DRS_STENCILZFAIL)}.${getRS(D3DRS_STENCILPASS)}.${getRS(D3DRS_STENCILFUNC)}` +
+        `.${getRS(D3DRS_CCW_STENCILFAIL)}.${getRS(D3DRS_CCW_STENCILZFAIL)}.${getRS(D3DRS_CCW_STENCILPASS)}.${getRS(D3DRS_CCW_STENCILFUNC)}` +
+        `.${getRS(D3DRS_STENCILMASK) >>> 0}.${getRS(D3DRS_STENCILWRITEMASK) >>> 0}`;
+    if (getRS(D3DRS_ZENABLE) === 0) return `z0!${bias}!s${stencil}`;
+    return `z${getRS(D3DRS_ZWRITEENABLE) !== 0 ? 1 : 0}.${getRS(D3DRS_ZFUNC)}!${bias}!s${stencil}`;
+}
+
+/** True when the requested raster state needs a stencil attachment we do not own. */
+export function hasUnsupportedStencilState(getRS: GetRenderState, format?: GPUTextureFormat): boolean {
+    const enabled = getRS(D3DRS_STENCILENABLE) !== 0 || getRS(D3DRS_TWOSIDEDSTENCILMODE) !== 0;
+    if (!enabled) return false;
+    // Callers without format information retain the historical conservative answer.  Device
+    // callers pass the active attachment format and can use D24S8/depth24plus-stencil8.
+    return format === undefined ? true : format !== "depth24plus-stencil8";
 }

@@ -11,7 +11,8 @@
  */
 import { describe, expect, test } from "bun:test";
 import {
-    bindingSize, padRegion, slotArrayStride, vertexRangeEndBytes,
+    D3DSTREAMSOURCE_INDEXEDDATA, D3DSTREAMSOURCE_INSTANCEDATA,
+    bindingSize, isWebGpuArrayStrideAligned, padRegion, slotArrayStride, stepModeFromFreq, vertexRangeEndBytes,
 } from "../../src/worker/backends/webgpu/shared/vertex-streams";
 
 // ── The contract, in the shape the backend applies it ──────────────────────
@@ -67,18 +68,6 @@ function steppedAddress(
         ? Math.floor(instanceIndex / Math.max(1, binding.stepRateDivisor))
         : vertexIndex;
     return binding.bufferOffset + step * binding.arrayStride;
-}
-
-/** D3D9 SetStreamSourceFreq encoding → a per-binding step mode. */
-const D3DSTREAMSOURCE_INDEXEDDATA = 0x40000000;
-const D3DSTREAMSOURCE_INSTANCEDATA = 0x80000000;
-
-function stepModeFromFreq(freq: number): { stepMode: "vertex" | "instance"; stepRateDivisor: number } {
-    if ((freq & D3DSTREAMSOURCE_INSTANCEDATA) !== 0) {
-        return { stepMode: "instance", stepRateDivisor: Math.max(1, freq & ~D3DSTREAMSOURCE_INSTANCEDATA) };
-    }
-    // INDEXEDDATA carries the instance COUNT, not a vertex divisor: still vertex-rate data.
-    return { stepMode: "vertex", stepRateDivisor: 1 };
 }
 
 /**
@@ -348,5 +337,22 @@ describe("rule 8 — SetStreamSourceFreq is a per-binding step mode", () => {
         const [b] = buildBindings([0], new Map([[0, 32]]), new Map([[0, src(8192, 128, 32)]]));
         expect(steppedAddress(b!, 5, 0)).toBe(128 + 5 * 32);
         expect(steppedAddress(b!, 5, 77)).toBe(128 + 5 * 32);
+    });
+});
+
+describe("rule 9 — WebGPU array strides are explicitly aligned or refused", () => {
+    test("rejects an odd declaration/bound stride before pipeline creation", () => {
+        expect(isWebGpuArrayStrideAligned(18)).toBe(false);
+        expect(isWebGpuArrayStrideAligned(22)).toBe(false);
+    });
+
+    test("accepts positive four-byte strides", () => {
+        expect(isWebGpuArrayStrideAligned(4)).toBe(true);
+        expect(isWebGpuArrayStrideAligned(20)).toBe(true);
+    });
+
+    test("rejects zero and non-integral values", () => {
+        expect(isWebGpuArrayStrideAligned(0)).toBe(false);
+        expect(isWebGpuArrayStrideAligned(4.5)).toBe(false);
     });
 });

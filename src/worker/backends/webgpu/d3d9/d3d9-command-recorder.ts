@@ -5,7 +5,7 @@
  * multi-threading preparation, and cleaner separation of concerns.
  */
 
-import { RenderFrame, RenderFramePool } from "../render-frame";
+import { RenderFrame, RenderFramePool, RenderCommandType, type ArenaDrawBinding } from "../render-frame";
 import type { StreamBindingPlan, StreamVertexBinding } from "../shared/vertex-streams";
 
 export type { StreamVertexBinding };
@@ -26,6 +26,22 @@ export interface PlannedVertexBindings {
     streams: StreamBindingPlan;
 }
 
+export interface DrawViewport {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    minZ: number;
+    maxZ: number;
+}
+
+export interface DrawScissorRect {
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+}
+
 export interface Slot0VertexBindings {
     gpuBuffer: GPUBuffer;
     bufferOffset: number;
@@ -44,6 +60,17 @@ interface DrawCommandBase {
     ffpStateIndex?: number;
     /** The guest's own stream-0 stride (diagnostic — see RenderFrame.pushDraw). */
     guestStride?: number;
+    /** D3D9 hardware instancing count for non-indexed draws; 1 is ordinary rendering. */
+    instanceCount?: number;
+    /** Raster scissor snapshot for this draw. D3D9Device supplies a full-target rectangle when
+     * SCISSORTESTENABLE is disabled so a prior enabled draw cannot leak its state. */
+    scissorRect?: DrawScissorRect;
+    /** Viewport snapshot for this draw. Per-draw state in D3D9, pass-level in WebGPU. */
+    viewport?: DrawViewport;
+    /** D3DRS_STENCILREF is dynamic render-pass state rather than pipeline state. */
+    stencilReference?: number;
+    /** D3DRS_BLENDFACTOR is dynamic render-pass state rather than pipeline state. */
+    blendConstant?: number;
 }
 
 export type DrawCommand = DrawCommandBase & (PlannedVertexBindings | Slot0VertexBindings);
@@ -63,8 +90,14 @@ interface DrawIndexedCommandBase {
     indexCount: number;
     startIndex: number;
     baseVertex: number;
+    /** D3D9 hardware instancing (SetStreamSourceFreq); 1 = an ordinary draw. */
+    instanceCount?: number;
     bindStateIndex?: number;
     ffpStateIndex?: number;
+    scissorRect?: DrawScissorRect;
+    viewport?: DrawViewport;
+    stencilReference?: number;
+    blendConstant?: number;
 }
 
 export type DrawIndexedCommand =
@@ -78,6 +111,16 @@ export class D3D9CommandRecorder {
      *  redundant re-bind command is skipped. Reset on pipeline change (bind-group layout may
      *  differ per pipeline) and at finalize (executor bind caches reset per pass/frame). */
     private currentBindStateIndex: number | null = null;
+    /** Dynamic render-pass state is emitted only when its value changes. These keys live for
+     * the current frame because the executor keeps the same render pass state between draws. */
+    /** Last recorded scissor, compared field-wise: building a `l|t|w|h` string to compare
+     *  allocated one throwaway per DRAW (the viewport check right beside it already avoids
+     *  exactly that). `width < 0` means "none recorded yet". */
+    private currentScissor = { left: 0, top: 0, width: -1, height: 0 };
+    /** Last viewport recorded into the current frame; width -1 means "none recorded yet". */
+    private currentViewport = { x: 0, y: 0, width: -1, height: 0, minZ: 0, maxZ: 0 };
+    private currentStencilReference: number | null = null;
+    private currentBlendConstant: number | null = null;
     private drawCount = 0;
 
     constructor(private framePool: RenderFramePool) {
@@ -87,8 +130,20 @@ export class D3D9CommandRecorder {
     /**
      * Set clear color for the frame
      */
-    setClear(color: GPUColor, depth: number, flags: number): void {
-        this.frame.setClear(color, depth, flags);
+    setClear(color: GPUColor, depth: number, stencil: number, flags: number): void {
+        this.frame.setClear(color, depth, stencil, flags);
+    }
+
+    recordBeginOcclusionQuery(queryPtr: number): void {
+        this.frame.pushBeginOcclusionQuery(queryPtr);
+    }
+
+    recordEndOcclusionQuery(queryPtr: number): void {
+        this.frame.pushEndOcclusionQuery(queryPtr);
+    }
+
+    recordTimestampQuery(queryPtr: number): void {
+        this.frame.pushTimestampQuery(queryPtr);
     }
 
     /**
@@ -97,6 +152,17 @@ export class D3D9CommandRecorder {
      */
     queueUpload(buffer: GPUBuffer, data: Uint8Array, dstOffset = 0): void {
         this.frame.queueUpload(buffer, data, dstOffset);
+    }
+
+    /** Emit a SetViewport command when this draw's viewport differs from the one already
+     *  recorded. Compared field-wise so the per-draw check allocates nothing. */
+    private recordViewport(v: DrawViewport | undefined): void {
+        if (!v) return;
+        const c = this.currentViewport;
+        if (c.width === v.width && c.height === v.height && c.x === v.x && c.y === v.y
+            && c.minZ === v.minZ && c.maxZ === v.maxZ) return;
+        this.frame.pushSetViewport(v.x, v.y, v.width, v.height, v.minZ, v.maxZ);
+        c.x = v.x; c.y = v.y; c.width = v.width; c.height = v.height; c.minZ = v.minZ; c.maxZ = v.maxZ;
     }
 
     /**
@@ -116,8 +182,25 @@ export class D3D9CommandRecorder {
         if (cmd.ffpStateIndex !== undefined) {
             this.frame.pushBindFfp(cmd.ffpStateIndex);
         }
+        this.recordViewport(cmd.viewport);
+        if (cmd.scissorRect) {
+            const r = cmd.scissorRect;
+            const c = this.currentScissor;
+            if (c.width !== r.width || c.height !== r.height || c.left !== r.left || c.top !== r.top) {
+                this.frame.pushSetScissor(r.left, r.top, r.width, r.height);
+                c.left = r.left; c.top = r.top; c.width = r.width; c.height = r.height;
+            }
+        }
+        if (cmd.stencilReference !== undefined && cmd.stencilReference !== this.currentStencilReference) {
+            this.frame.pushSetStencilReference(cmd.stencilReference);
+            this.currentStencilReference = cmd.stencilReference;
+        }
+        if (cmd.blendConstant !== undefined && cmd.blendConstant !== this.currentBlendConstant) {
+            this.frame.pushSetBlendConstant(cmd.blendConstant);
+            this.currentBlendConstant = cmd.blendConstant;
+        }
         this.bindVertexBuffers(cmd);
-        this.frame.pushDraw(cmd.vertexCount, cmd.startVertex, cmd.guestStride ?? 0);
+        this.frame.pushDraw(cmd.vertexCount, cmd.startVertex, cmd.guestStride ?? 0, cmd.instanceCount ?? 1);
         this.drawCount++;
     }
 
@@ -156,6 +239,23 @@ export class D3D9CommandRecorder {
         if (cmd.ffpStateIndex !== undefined) {
             this.frame.pushBindFfp(cmd.ffpStateIndex);
         }
+        this.recordViewport(cmd.viewport);
+        if (cmd.scissorRect) {
+            const r = cmd.scissorRect;
+            const c = this.currentScissor;
+            if (c.width !== r.width || c.height !== r.height || c.left !== r.left || c.top !== r.top) {
+                this.frame.pushSetScissor(r.left, r.top, r.width, r.height);
+                c.left = r.left; c.top = r.top; c.width = r.width; c.height = r.height;
+            }
+        }
+        if (cmd.stencilReference !== undefined && cmd.stencilReference !== this.currentStencilReference) {
+            this.frame.pushSetStencilReference(cmd.stencilReference);
+            this.currentStencilReference = cmd.stencilReference;
+        }
+        if (cmd.blendConstant !== undefined && cmd.blendConstant !== this.currentBlendConstant) {
+            this.frame.pushSetBlendConstant(cmd.blendConstant);
+            this.currentBlendConstant = cmd.blendConstant;
+        }
         if ("streams" in cmd) this.bindVertexBuffers(cmd);
         else {
             this.frame.pushSetVertexBuffer(cmd.vbGpuBuffer, cmd.vbOffset, cmd.vbSize);
@@ -166,8 +266,16 @@ export class D3D9CommandRecorder {
             }
         }
         this.frame.pushSetIndexBuffer(cmd.ibGpuBuffer, cmd.ibFormat);
-        this.frame.pushDrawIndexed(cmd.indexCount, cmd.startIndex, cmd.baseVertex);
+        this.frame.pushDrawIndexed(cmd.indexCount, cmd.startIndex, cmd.baseVertex, cmd.instanceCount ?? 1);
         this.drawCount++;
+    }
+
+    /** Associate the just-recorded RenderFrame draw with its WASM-arena command. */
+    recordArenaBinding(binding: Omit<ArenaDrawBinding, "frameDrawCommand">): void {
+        const drawCommand = this.frame.commandTypes.length - 1;
+        if (drawCommand < 0 || (this.frame.commandTypes[drawCommand] !== RenderCommandType.Draw
+            && this.frame.commandTypes[drawCommand] !== RenderCommandType.DrawIndexed)) return;
+        this.frame.arenaDrawBindings.push({ ...binding, frameDrawCommand: drawCommand });
     }
 
     /**
@@ -178,6 +286,10 @@ export class D3D9CommandRecorder {
         this.frame = this.framePool.acquire();
         this.currentPipelineId = null;
         this.currentBindStateIndex = null;
+        this.currentScissor.width = -1;
+        this.currentViewport.width = -1;
+        this.currentStencilReference = null;
+        this.currentBlendConstant = null;
         return completedFrame;
     }
 

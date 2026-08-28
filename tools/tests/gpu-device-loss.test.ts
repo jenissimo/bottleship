@@ -146,7 +146,8 @@ describe("d3d9 resource stores restore from their CPU shadow", () => {
 
     test("vertex buffers drop their GPU side and come back dirty", () => {
         const store = new VertexBufferStore(4);
-        const i = store.create(0x10, 256, 0, 0x40000);
+        const i = store.create(0x10, 256, 0, 0x40000, 1 /* D3DPOOL_MANAGED */);
+        store.getData(i)![0] = 0x52;
         store.setGpuBuffer(i, FAKE_BUFFER);
         store.setDirty(i, false);
 
@@ -155,28 +156,35 @@ describe("d3d9 resource stores restore from their CPU shadow", () => {
         // Dirty is the re-upload trigger: without it the buffer is silently never restored.
         expect(store.isDirty(i)).toBe(true);
         expect(store.getData(i)).toBeDefined();
+        expect(store.getData(i)![0]).toBe(0x52);
     });
 
     test("index buffers behave the same", () => {
         const store = new IndexBufferStore(4);
         const i = store.create(0x11, 128, 101 /* D3DFMT_INDEX16 */, 0x50000);
+        store.getData(i)![0] = 0x63;
         store.setGpuBuffer(i, FAKE_BUFFER);
         store.setDirty(i, false);
 
         expect(store.dropGpuResources()).toBe(1);
         expect(store.getGpuBuffer(i)).toBeNull();
         expect(store.isDirty(i)).toBe(true);
+        expect(store.getData(i)![0]).toBe(0);
     });
 
     test("a sampled texture is restorable; a render target's contents are gone", () => {
         const store = new TextureStore(4);
-        const sampled = store.create(0x20, 16, 16, 1, 21 /* D3DFMT_A8R8G8B8 */, 0x60000);
-        const rt = store.create(0x21, 16, 16, 1, 21, -1);
+        // A managed resource keeps its CPU shadow across a device loss.  The render
+        // target is explicitly DEFAULT, so only that entry is reported as lost.
+        const sampled = store.create(0x20, 16, 16, 1, 21 /* D3DFMT_A8R8G8B8 */, 0x60000, 1 /* D3DPOOL_MANAGED */);
+        const rt = store.create(0x21, 16, 16, 1, 21, -1, 0 /* D3DPOOL_DEFAULT */);
         store.markRenderTarget(rt);
         store.setGpuTexture(sampled, FAKE_TEXTURE, FAKE_VIEW);
         store.setGpuTexture(rt, FAKE_TEXTURE, FAKE_VIEW);
         store.setDirty(sampled, false);
         store.setDirty(rt, false);
+        store.getData(sampled)![0] = 0x42;
+        store.getData(rt)![0] = 0x24;
 
         const tally = store.dropGpuResources();
         expect(tally.dropped).toBe(2);
@@ -185,10 +193,12 @@ describe("d3d9 resource stores restore from their CPU shadow", () => {
         expect(store.getGpuTexture(sampled)).toBeNull();
         expect(store.getView(sampled)).toBeNull();
         expect(store.isDirty(sampled)).toBe(true);
+        expect(store.getData(sampled)![0]).toBe(0x42);
 
         // A render target has no CPU shadow to restore FROM — re-raising dirty would upload an
         // empty buffer over content the app is about to redraw itself.
         expect(store.getGpuTexture(rt)).toBeNull();
         expect(store.isDirty(rt)).toBe(false);
+        expect(store.getData(rt)![0]).toBe(0);
     });
 });

@@ -38,8 +38,8 @@ describe("D3D9 hybrid VS + fixed-function pixel coordinates", () => {
             },
         } as unknown as CompiledVs;
         const wgsl = linkProgram({ vs, ps: null, declElements: null, streamStride: 16, ffpStageCount: 2 }).wgsl;
-        expect(wgsl).toContain("textureSample(tex1, ffpSamp1, in.tex1.xy)");
+        expect(wgsl).toContain("textureSample(tex1, samp1, in.tex1.xy)");
         // Stage 1's coordinate is oT1 and nothing else — a TCI-driven variant would sample t0.
-        expect(wgsl).not.toContain("textureSample(tex1, ffpSamp1, in.tex0.xy)");
+        expect(wgsl).not.toContain("textureSample(tex1, samp1, in.tex0.xy)");
     });
 });
