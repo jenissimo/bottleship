@@ -34,6 +34,9 @@ export const enum Op {
 
 // ── Register types (5-bit field split across token bits 28-30 + 11-12) ─────────
 
+// ADDR/TEXTURE and TEXCRDOUT/OUTPUT are intentional D3D9 aliases: the same
+// numeric register class has stage-specific names in the bytecode ABI.
+/* eslint-disable @typescript-eslint/no-duplicate-enum-values */
 export const enum RegType {
     TEMP = 0,        // r#
     INPUT = 1,       // v#  (vertex input / PS color iterator)
@@ -58,6 +61,7 @@ export const enum RegType {
     LABEL = 18,
     PREDICATE = 19,  // p0
 }
+/* eslint-enable @typescript-eslint/no-duplicate-enum-values */
 
 // RASTOUT sub-indices
 export const RASTOUT_POS = 0;
@@ -69,6 +73,23 @@ export const RASTOUT_PTS = 2;
 export const enum SrcMod {
     NONE = 0, NEG = 1, BIAS = 2, BIASNEG = 3, SIGN = 4, SIGNNEG = 5,
     COMP = 6, X2 = 7, X2NEG = 8, DZ = 9, DW = 10, ABS = 11, ABSNEG = 12, NOT = 13,
+}
+
+/** D3DSHADER_COMPARISON values carried by IFC, BREAKC and SETP. */
+export type CmpOp = "gt" | "eq" | "ge" | "lt" | "ne" | "le";
+
+/** Raw D3DSHADER_COMPARISON code to its typed assembly comparison suffix. */
+export const CMP_OP_BY_CODE: Readonly<Partial<Record<number, CmpOp>>> = {
+    1: "gt",
+    2: "eq",
+    3: "ge",
+    4: "lt",
+    5: "ne",
+    6: "le",
+};
+
+export function cmpOpFromCode(code: number): CmpOp | undefined {
+    return CMP_OP_BY_CODE[code];
 }
 
 // ── D3DDECLUSAGE (dcl usage + vertex declaration usage) ───────────────────────

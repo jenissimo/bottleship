@@ -1,0 +1,56 @@
+{
+  "cases": [
+    {
+      "name": "ps_1_3_legacy_texreg2",
+      "asm": "ps_1_3\ntex t0\ntexreg2ar t1, t0\ntexreg2gb t2, t0\ntexreg2rgb t3, t0\nmov r0, t3\n",
+      "tokens": [
+        "0xffff0103", "0x00000042", "0xb00f0000", "0x00000045", "0xb00f0001", "0xb0e40000",
+        "0x00000046", "0xb00f0002", "0xb0e40000", "0x00000052", "0xb00f0003", "0xb0e40000",
+        "0x00000001", "0x800f0000", "0xb0e40003", "0x0000ffff"
+      ]
+    },
+    {
+      "name": "ps_1_3_legacy_texm3x2",
+      "asm": "ps_1_3\ntex t0\ntexm3x2pad t1, t0\ntexm3x2tex t2, t0\nmov r0, t2\n",
+      "tokens": [
+        "0xffff0103", "0x00000042", "0xb00f0000", "0x00000047", "0xb00f0001", "0xb0e40000",
+        "0x00000048", "0xb00f0002", "0xb0e40000", "0x00000001", "0x800f0000", "0xb0e40002",
+        "0x0000ffff"
+      ]
+    },
+    {
+      "name": "ps_1_3_legacy_texm3x3vspec",
+      "asm": "ps_1_3\ntex t0\ntexm3x3pad t1, t0\ntexm3x3pad t2, t0\ntexm3x3vspec t3, t0\nmov r0, t3\n",
+      "tokens": [
+        "0xffff0103", "0x00000042", "0xb00f0000", "0x00000049", "0xb00f0001", "0xb0e40000",
+        "0x00000049", "0xb00f0002", "0xb0e40000", "0x0000004d", "0xb00f0003", "0xb0e40000",
+        "0x00000001", "0x800f0000", "0xb0e40003", "0x0000ffff"
+      ]
+    },
+    {
+      "name": "ps_1_3_legacy_texm3x3tex",
+      "asm": "ps_1_3\ntex t0\ntexm3x3pad t1, t0\ntexm3x3pad t2, t0\ntexm3x3tex t3, t0\nmov r0, t3\n",
+      "tokens": [
+        "0xffff0103", "0x00000042", "0xb00f0000", "0x00000049", "0xb00f0001", "0xb0e40000",
+        "0x00000049", "0xb00f0002", "0xb0e40000", "0x0000004a", "0xb00f0003", "0xb0e40000",
+        "0x00000001", "0x800f0000", "0xb0e40003", "0x0000ffff"
+      ]
+    },
+    {
+      "name": "ps_1_3_legacy_texbem",
+      "asm": "ps_1_3\ntex t0\ntexbem t1, t0\nmov r0, t1\n",
+      "tokens": [
+        "0xffff0103", "0x00000042", "0xb00f0000", "0x00000043", "0xb00f0001", "0xb0e40000",
+        "0x00000001", "0x800f0000", "0xb0e40001", "0x0000ffff"
+      ]
+    },
+    {
+      "name": "ps_1_4_texdepth",
+      "asm": "ps_1_4\ntexcrd r5.xyz, t0\nphase\ntexdepth r5\nmov r0, c0\n",
+      "tokens": [
+        "0xffff0104", "0x00000040", "0x80070005", "0xb0e40000", "0x0000fffd", "0x00000057",
+        "0x800f0005", "0x00000001", "0x800f0000", "0xa0e40000", "0x0000ffff"
+      ]
+    }
+  ]
+}

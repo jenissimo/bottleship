@@ -5,12 +5,115 @@
  * comment block fxc emits after the version token — the original NFS Underground
  * `Unknown VS opcode 0xfffe` crash) and verifies parsing + WGSL codegen.
  */
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { parseShader } from "../../src/worker/backends/webgpu/d3d9/shader/sm-parser";
 import {
     compileVertexShader, compilePixelShader, linkProgram, RawVertexElement,
 } from "../../src/worker/backends/webgpu/d3d9/shader/index";
 import { Op, RegType } from "../../src/worker/backends/webgpu/d3d9/shader/sm-enums";
+import { pixelCenterClipOffset } from "../../src/worker/backends/webgpu/pixel-center";
+import { emitTextureSample } from "../../src/worker/backends/webgpu/d3d9/shader/emit/tex";
+import type { SamplerSpec } from "../../src/worker/backends/webgpu/shared/dx-sampler";
+import legacyTextureOracle from "./fixtures/d3d9-legacy-texture-oracle.json";
+
+const PIXEL_CENTRE_KILL_SWITCH = "__d3dNoPixelCentre";
+afterEach(() => delete (globalThis as Record<string, unknown>)[PIXEL_CENTRE_KILL_SWITCH]);
+
+const sampleSpec = (over: Partial<SamplerSpec> = {}): SamplerSpec => ({
+    min: "linear",
+    mag: "linear",
+    mip: "linear",
+    mipNone: false,
+    addressU: "repeat",
+    addressV: "repeat",
+    addressW: "repeat",
+    ...over,
+});
+
+describe("shader-side D3D9 sampler semantics", () => {
+    test("emits BORDER selection and preserves the packed ARGB colour", () => {
+        const expr = emitTextureSample({
+            stage: 0,
+            coordinate: "uv",
+            samplerSpec: sampleSpec({ addressU: "d3d9-border", borderColor: 0x80402010 }),
+        });
+        expect(expr).toContain("clamp((uv).x, 0.0, 1.0)");
+        expect(expr).toContain("select(textureSample(tex0, samp");
+        expect(expr).toContain("0.25098039215686274");
+        expect(expr).toContain("0.5019607843137255");
+    });
+
+    test("emits MIRRORONCE independently per coordinate axis", () => {
+        const expr = emitTextureSample({
+            stage: 1,
+            coordinate: "uvw",
+            dimensions: 3,
+            samplerSpec: sampleSpec({
+                addressV: "d3d9-mirror-once",
+                addressW: "d3d9-border",
+            }),
+        });
+        expect(expr).toContain("clamp(abs((uvw).y), 0.0, 1.0)");
+        expect(expr).toContain("clamp((uvw).z, 0.0, 1.0)");
+        expect(expr).toContain("(uvw).z < 0.0 || (uvw).z > 1.0");
+    });
+
+    test("applies LOD bias to explicit level and explicit gradients", () => {
+        const spec = sampleSpec({ mipLodBias: 1 });
+        const level = emitTextureSample({ stage: 0, coordinate: "uv", mode: "level", level: "lod", samplerSpec: spec });
+        const implicit = emitTextureSample({ stage: 0, coordinate: "uv", samplerSpec: spec });
+        const grad = emitTextureSample({
+            stage: 0,
+            coordinate: "uv",
+            mode: "grad",
+            samplerSpec: spec,
+            sampler: "samp0",
+            texture: "tex0",
+        }, { ddx: "dx", ddy: "dy" });
+        expect(level).toContain("textureSampleLevel(tex0, samp, uv, ((lod) + 1.0))");
+        expect(implicit).toContain("textureSampleBias(tex0, samp, uv, 1.0)");
+        expect(grad).toContain("exp2(1.0)");
+        expect(grad).toContain("textureSampleGrad(tex0, samp0, uv");
+    });
+
+    test("lowers comparison-sampler bias and explicit gradients to compare-level", () => {
+        const spec = sampleSpec({ mipLodBias: 1 });
+        const biased = emitTextureSample({
+            stage: 0,
+            coordinate: "uv",
+            depthCoordinate: "uvz",
+            comparison: true,
+            samplerSpec: spec,
+        });
+        const grad = emitTextureSample({
+            stage: 0,
+            coordinate: "uv",
+            depthCoordinate: "uvz",
+            comparison: true,
+            mode: "grad",
+            samplerSpec: sampleSpec(),
+        }, { ddx: "dx", ddy: "dy" });
+        expect(biased).toContain("textureSampleCompareLevel(tex0, samp, uv, ((uvz).z)");
+        expect(biased).toContain("textureDimensions(tex0)");
+        expect(biased).toContain("textureNumLevels(tex0)");
+        expect(biased).not.toContain("textureSampleCompare(tex0, samp");
+        expect(grad).toContain("textureSampleCompareLevel(tex0, samp, uv, ((uvz).z)");
+        expect(grad).toContain("(dx)");
+        expect(grad).toContain("(dy)");
+    });
+
+    test("does not alter cube direction coordinates for custom address modes", () => {
+        const expr = emitTextureSample({
+            stage: 0,
+            coordinate: "dir",
+            dimensions: 3,
+            cube: true,
+            samplerSpec: sampleSpec({ addressU: "d3d9-border", addressV: "d3d9-mirror-once" }),
+        });
+        expect(expr).toBe("textureSample(tex0, samp, dir)");
+        expect(expr).not.toContain("clamp");
+    });
+});
 
 // ── Token encoders (mirror the decoder in sm-parser.ts) ───────────────────────
 
@@ -40,7 +143,8 @@ function dcl(usage: number, usageIndex: number, num: number): number[] {
     return [instr(Op.DCL), (usage | (usageIndex << 16)) >>> 0, regBits(RegType.INPUT, num)];
 }
 function dclReg(usage: number, usageIndex: number, type: number, num: number): number[] {
-    return [instr(Op.DCL), (usage | (usageIndex << 16)) >>> 0, regBits(type, num)];
+    // SM2+ carries the two operand DWORDs in the instruction length nibble.
+    return [(Op.DCL | (2 << 24)) >>> 0, (usage | (usageIndex << 16)) >>> 0, regBits(type, num)];
 }
 function def(num: number, x: number, y: number, z: number, w: number): number[] {
     const f = new Float32Array([x, y, z, w]);
@@ -48,6 +152,49 @@ function def(num: number, x: number, y: number, z: number, w: number): number[] 
     return [instr(Op.DEF), regBits(RegType.CONST, num), u[0], u[1], u[2], u[3]];
 }
 const END = 0x0000FFFF;
+
+describe("shader destination and declaration refusal", () => {
+    test("records an invalid ALU destination as unsupported instead of a successful no-op", () => {
+        const invalidDestination = compileVertexShader(new Uint32Array([
+            version(false, 3, 0),
+            (2 << 24) | Op.MOV,
+            dst(RegType.CONST, 0),
+            src(RegType.INPUT, 0),
+            END,
+        ]));
+        expect(() => linkProgram({
+            vs: invalidDestination,
+            ps: null,
+            declElements: [{ stream: 0, offset: 0, type: 3, usage: 0, usageIndex: 0 }],
+            streamStride: 16,
+        })).toThrow(/Unsupported .* opcode mov/);
+    });
+
+    test("refuses packed 10-bit declaration types instead of fabricating float32x4", () => {
+        const vs = compileVertexShader(buildVs());
+        expect(() => linkProgram({
+            vs,
+            ps: null,
+            declElements: [
+                { stream: 0, offset: 0, type: 13, usage: 0, usageIndex: 0 }, // UDEC3
+                { stream: 0, offset: 4, type: 1, usage: 5, usageIndex: 0 },
+            ],
+            streamStride: 12,
+        })).toThrow(/unsupported D3DDECLTYPE 13/);
+    });
+
+    test("does not invent an attribute for a declared input missing from the vertex declaration", () => {
+        const vs = compileVertexShader(buildVs());
+        const linked = linkProgram({
+            vs,
+            ps: null,
+            declElements: [{ stream: 0, offset: 0, type: 3, usage: 0, usageIndex: 0 }],
+            streamStride: 16,
+        });
+        expect(linked.vertexAttributes).toHaveLength(1);
+        expect(linked.wgsl).toContain("vec4<f32>(0.0)");
+    });
+});
 
 // A minimal world-transform vs_1_1 with a CTAB comment, a dcl, a def and a m4x4.
 function buildVs(): Uint32Array {
@@ -116,6 +263,12 @@ describe("sm-parser", () => {
         expect(() => parseShader(new Uint32Array([0x12345678, END]))).toThrow();
     });
 
+    test("rejects shader-model versions outside the D3D9 1.x-3.x range", () => {
+        expect(() => parseShader(new Uint32Array([
+            version(false, 4, 0), END,
+        ]))).toThrow(/unsupported shader model/);
+    });
+
     test("decodes dst write mask, shift and saturate", () => {
         const prog = parseShader(new Uint32Array([
             version(true, 1, 1),
@@ -126,6 +279,44 @@ describe("sm-parser", () => {
         expect(d.writeMask).toBe(0x3);
         expect(d.shift).toBe(1);
         expect(d.saturate).toBe(true);
+    });
+
+    test("rejects a predicated instruction whose predicate token is not p0", () => {
+        // SM3 length counts destination + predicate + source.  A TEMP token in
+        // the predicate slot must not be accepted as an arbitrary boolean source.
+        const predicatedMov = (Op.MOV | (3 << 24) | 0x10000000) >>> 0;
+        expect(() => parseShader(new Uint32Array([
+            version(false, 3, 0),
+            predicatedMov,
+            dst(RegType.TEMP, 0),
+            src(RegType.TEMP, 1), // invalid predicate; p0 has RegType.PREDICATE
+            src(RegType.INPUT, 0),
+            END,
+        ]))).toThrow(/predicate must be p0/);
+    });
+
+    test("rejects miscellaneous registers in vertex shaders", () => {
+        expect(() => parseShader(new Uint32Array([
+            version(false, 3, 0),
+            (Op.MOV | (2 << 24)) >>> 0, dst(RegType.TEMP, 0), src(RegType.MISCTYPE, 0),
+            END,
+        ]))).toThrow(/invalid in a vertex shader/);
+    });
+
+    test("rejects pixel miscellaneous registers beyond vPos/vFace", () => {
+        expect(() => parseShader(new Uint32Array([
+            version(true, 3, 0),
+            (Op.MOV | (2 << 24)) >>> 0, dst(RegType.TEMP, 0), src(RegType.MISCTYPE, 2),
+            END,
+        ]))).toThrow(/outside the vPos\/vFace range/);
+    });
+
+    test("rejects vertex generic output registers in pixel shaders", () => {
+        expect(() => parseShader(new Uint32Array([
+            version(true, 3, 0),
+            (Op.MOV | (2 << 24)) >>> 0, dst(RegType.OUTPUT, 0), src(RegType.INPUT, 0),
+            END,
+        ]))).toThrow(/generic output register/);
     });
 });
 
@@ -187,8 +378,8 @@ describe("vs codegen", () => {
         // matrix-palette index past its end to one fixed bone instead of failing.
         expect(vs.analysis.constantCount).toBe(256);
         const res = linkProgram({ vs, ps: null, declElements: decl, streamStride: 20 });
-        expect(res.wgsl).toContain("array<vec4<f32>, 256>");
-        expect(res.wgsl).toContain("clamp(a0 + 0, 0, 255)");
+        expect(res.wgsl).toContain("array<vec4<f32>, 258>");
+        expect(res.wgsl).toContain("clamp(a0.x + 0, 0, 255)");
     });
 
     test("links a VS-only program to a complete WGSL module", () => {
@@ -197,14 +388,37 @@ describe("vs codegen", () => {
         expect(res.wgsl).toContain("@vertex");
         expect(res.wgsl).toContain("fn vs_main");
         expect(res.wgsl).toContain("@fragment");
-        expect(res.wgsl).toContain("out.pos = oPos;");
+        expect(res.wgsl).toContain("out.pos = vec4<f32>(oPos.x + oPos.w * vsc.c[5].x");
         // dp4 into oPos uses the constant array.
         expect(res.wgsl).toContain("vsc.c[0]");
         // def c4 baked.
         expect(res.wgsl).toContain("dc4");
         // input expansion: FLOAT3 position → vec4(in.v0, 1.0).
         expect(res.wgsl).toContain("vec4<f32>(in.v0, 1.0)");
+        expect(res.wgsl).toContain(
+            "out.col0 = min(max(oD0, vec4<f32>(0.0)), vec4<f32>(1.0));",
+        );
+        // The hidden c[] vec4 is internal; LinkResult keeps the guest-visible count.
         expect(res.vsConstantCount).toBe(5);
+    });
+
+    test("generated VS applies half-pixel dx/dy, preserves z/w, and marks position invariant", () => {
+        const vs = compileVertexShader(buildVs());
+        const link = linkProgram({ vs, ps: null, declElements: decl, streamStride: 20 });
+
+        expect(link.wgsl).toContain(
+            "oPos.x + oPos.w * vsc.c[5].x, oPos.y + oPos.w * vsc.c[5].y, oPos.z, oPos.w",
+        );
+        expect(link.wgsl).toContain("@builtin(position) @invariant pos: vec4<f32>");
+        expect(link.wgsl).not.toContain("640.0");
+        expect(link.wgsl).not.toContain("480.0");
+
+        expect(pixelCenterClipOffset(640, 480)).toEqual({ dx: 1 / 640, dy: -1 / 480 });
+        (globalThis as Record<string, unknown>)[PIXEL_CENTRE_KILL_SWITCH] = true;
+        expect(pixelCenterClipOffset(640, 480)).toEqual({ dx: 0, dy: 0 });
+        // The kill-switch is runtime uniform state; generated source stays cacheable.
+        const killSwitchLink = linkProgram({ vs, ps: null, declElements: decl, streamStride: 20 });
+        expect(killSwitchLink.wgsl).toBe(link.wgsl);
     });
 
     test("uses the FFP texture-stage cascade for programmable VS + NULL PS", () => {
@@ -212,15 +426,18 @@ describe("vs codegen", () => {
         const res = linkProgram({
             vs, ps: null, declElements: decl, streamStride: 20, ffpStageCount: 2,
             projectedStages: 1 << 1,
+            samplerStates: new Map([[0, sampleSpec({ addressU: "d3d9-border", borderColor: 0x80402010 })]]),
         });
         // A hybrid draw declares both textures and their independently configured samplers;
         // stage 1 combines CURRENT with its own texel rather than falling back to white.
         expect(res.hasTexture).toBe(true);
         expect(res.wgsl).toContain("var<uniform> psc: PsUniforms");
-        expect(res.wgsl).toContain("var ffpSamp0: sampler");
-        expect(res.wgsl).toContain("var ffpSamp1: sampler");
-        expect(res.wgsl).toContain("textureSample(tex0, ffpSamp0");
-        expect(res.wgsl).toContain("textureSample(tex1, ffpSamp1");
+        expect(res.wgsl).toContain("var samp: sampler");
+        expect(res.wgsl).toContain("var samp1: sampler");
+        expect(res.wgsl).toContain("textureSample(tex0, samp");
+        expect(res.wgsl).toContain("textureSample(tex1, samp1");
+        expect(res.wgsl).toContain("clamp((in.tex0.xy).x, 0.0, 1.0)");
+        expect(res.wgsl).toContain("0.25098039215686274");
         expect(res.wgsl).toContain("psc.stages[0].a.x");
         expect(res.wgsl).toContain("psc.stages[1].a.x");
         expect(res.wgsl).toContain("psc.tfactor");
@@ -246,8 +463,8 @@ describe("vs codegen", () => {
         expect(res.wgsl).toContain("@location(4) tex2: vec4<f32>");
         // Stage 0 consumes oT0 directly. oT2 must remain linked for stage 2, but a
         // captured TCI value may not redirect stage 0 to it.
-        expect(res.wgsl).toContain("textureSample(tex0, ffpSamp0, in.tex0.xy)");
-        expect(res.wgsl).not.toContain("textureSample(tex0, ffpSamp0, in.tex2.xy)");
+        expect(res.wgsl).toContain("textureSample(tex0, samp, in.tex0.xy)");
+        expect(res.wgsl).not.toContain("textureSample(tex0, samp, in.tex2.xy)");
     });
 
     test("builds vertex attributes from the declaration", () => {
@@ -280,9 +497,11 @@ describe("vs codegen", () => {
         ]));
         const res = linkProgram({ vs, ps, declElements: decl, streamStride: 20 });
         expect(res.wgsl).toContain("oPos.x =");
-        expect(res.wgsl).toContain("oT2.x =");
-        expect(res.wgsl).toContain("out.tex2 = oT2;");
-        expect(res.wgsl).toContain("in.tex2");
+        // Internal fields are compacted, but the VS TEXCOORD2 declaration and the
+        // PS TEXCOORD2 declaration must resolve to that same compacted lane.
+        expect(res.wgsl).toContain("oT0.x =");
+        expect(res.wgsl).toContain("out.tex0 = oT0;");
+        expect(res.wgsl).toContain("in.tex0");
         expect(res.wgsl).not.toContain("in.col5");
     });
 });
@@ -305,6 +524,43 @@ describe("ps codegen", () => {
         expect(res.wgsl).toContain("var t0: vec4<f32> = in.tex0;");
     });
 
+    test("declares a texture register the shader only writes", () => {
+        // texreg2ar's destination stage is never read afterwards, but
+        // writeRegName spells it `t1` regardless, so the variable must exist.
+        const psTokens = new Uint32Array([
+            version(true, 1, 3),
+            instr(Op.TEX), dst(RegType.TEXTURE, 0),
+            instr(Op.TEXREG2AR), dst(RegType.TEXTURE, 1), src(RegType.TEXTURE, 0),
+            instr(Op.MOV), dst(RegType.TEMP, 0), src(RegType.TEXTURE, 0),
+            END,
+        ]);
+        const res = linkProgram({
+            vs: compileVertexShader(buildVs()), ps: compilePixelShader(psTokens),
+            declElements: decl, streamStride: 20,
+        });
+        expect(res.wgsl).toContain("t1.x = ");
+        expect(res.wgsl).toContain("var t1: vec4<f32>");
+    });
+
+    test("texbeml luminance scales all four sampled components", () => {
+        // The SM1 reference is `t(m)RGBA *= t(n)B * LSCALE + LOFFSET`; Wine
+        // applies it over the whole destination mask and DXVK over the whole
+        // vector. Alpha is NOT exempt.
+        const psTokens = new Uint32Array([
+            version(true, 1, 1),
+            instr(Op.TEX), dst(RegType.TEXTURE, 0),
+            instr(Op.TEXBEML), dst(RegType.TEXTURE, 1), src(RegType.TEXTURE, 0),
+            instr(Op.MOV), dst(RegType.TEMP, 0), src(RegType.TEXTURE, 1),
+            END,
+        ]);
+        const res = linkProgram({
+            vs: compileVertexShader(buildVs()), ps: compilePixelShader(psTokens),
+            declElements: decl, streamStride: 20,
+        });
+        expect(res.wgsl).toContain("psc.bump[1].lum.x + psc.bump[1].lum.y))");
+        expect(res.wgsl).not.toMatch(/\.rgb \* \(\(t0\)\.z \* psc\.bump/);
+    });
+
     test("packs b# constants and emits structured if/else flow", () => {
         const i2 = (op: number, operands: number) => (op | (operands << 24)) >>> 0;
         const psTokens = new Uint32Array([
@@ -320,8 +576,8 @@ describe("ps codegen", () => {
         const ps = compilePixelShader(psTokens);
         const res = linkProgram({ vs, ps, declElements: decl, streamStride: 20 });
         expect(ps.prog.maxBool).toBe(0);
-        expect(res.psConstantCount).toBe(225);
-        expect(res.wgsl).toContain("if ((psc.c[224]).x != 0.0) {");
+        expect(res.psConstantCount).toBe(2);
+        expect(res.wgsl).toContain("psBool(0u)");
         expect(res.wgsl).toContain("} else {");
     });
 
@@ -336,17 +592,18 @@ describe("ps codegen", () => {
     });
 
     test("exotic tex ops declare their sampled texture", () => {
-        // texm3x3tex t1 samples stage 1 — texture binding must be declared.
+        // texm3x3tex t2 samples stage 2 after consuming the three preceding rows —
+        // texture binding must be declared.
         const psTokens = new Uint32Array([
             version(true, 1, 1),
-            instr(Op.TEXM3x3TEX), dst(RegType.TEXTURE, 1), src(RegType.TEXTURE, 0),
-            instr(Op.MOV), dst(RegType.TEMP, 0), src(RegType.TEXTURE, 1),
+            instr(Op.TEXM3x3TEX), dst(RegType.TEXTURE, 2), src(RegType.TEXTURE, 0),
+            instr(Op.MOV), dst(RegType.TEMP, 0), src(RegType.TEXTURE, 2),
             END,
         ]);
         const vs = compileVertexShader(buildVs());
         const ps = compilePixelShader(psTokens);
         const res = linkProgram({ vs, ps, declElements: decl, streamStride: 20 });
-        expect(res.wgsl).toContain("var tex1: texture_2d<f32>");
+        expect(res.wgsl).toContain("var tex2: texture_2d<f32>");
         assertAllSampledTexturesDeclared(res.wgsl);
     });
 
@@ -375,6 +632,24 @@ describe("ps codegen", () => {
         assertAllSampledTexturesDeclared(res.wgsl);
     });
 
+    test("texbem projects before applying the bump offset", () => {
+        const psTokens = new Uint32Array([
+            version(true, 1, 1),
+            instr(Op.TEX), dst(RegType.TEXTURE, 0),
+            instr(Op.TEXBEM), dst(RegType.TEXTURE, 1), src(RegType.TEXTURE, 0),
+            instr(Op.MOV), dst(RegType.TEMP, 0), src(RegType.TEXTURE, 1),
+            END,
+        ]);
+        const vs = compileVertexShader(buildVs());
+        const ps = compilePixelShader(psTokens);
+        const res = linkProgram({
+            vs, ps, declElements: decl, streamStride: 20, projectedStages: 1 << 1,
+        });
+        expect(res.wgsl).toContain("let _bemBase1 = ((in.tex1) / ((in.tex1)).w);");
+        expect(res.wgsl).toContain("_bemBase1.x + psc.bump[1].mat.x");
+        expect(res.wgsl).not.toContain("(in.tex1).x + psc.bump[1].mat.x");
+    });
+
     test("texm3x3pad to texm3x3vspec preserves matrix rows and per-stage eye ray", () => {
         const psTokens = new Uint32Array([
             version(true, 1, 1),
@@ -388,15 +663,94 @@ describe("ps codegen", () => {
         const vs = compileVertexShader(buildVs());
         const ps = compilePixelShader(psTokens);
         const res = linkProgram({ vs, ps, declElements: decl, streamStride: 20, cubeMask: 1 << 3 });
-        // PAD stages are matrix rows, not texture samples; only the final stage is sampled.
-        expect(res.wgsl).toContain("_m3x3r0_t0 = dot((in.tex1).xyz");
-        expect(res.wgsl).toContain("_m3x3r1_t0 = dot((in.tex2).xyz");
-        expect(res.wgsl).toContain("vec3<f32>((in.tex1).w, (in.tex2).w, (in.tex3).w)");
-        expect(res.wgsl).toContain("2.0 * (dot(_m3N");
-        expect(res.wgsl).toContain("textureSample(tex3, samp, _m3R");
-        expect(res.wgsl).not.toContain("textureSample(tex1, samp");
-        expect(res.wgsl).not.toContain("textureSample(tex2, samp");
+        // DXVK treats PAD as an instruction-stream marker; the final op re-reads all rows.
+        expect(res.wgsl).toContain("// texm3x3pad (no-op)");
+        expect(res.wgsl).not.toContain("_m3x3r0_t0 = dot");
+        expect(res.wgsl).toContain("dot((in.tex1).xyz, (t0).xyz)");
+        expect(res.wgsl).toContain("dot((in.tex2).xyz, (t0).xyz)");
+        expect(res.wgsl).toContain("dot((in.tex3).xyz, (t0).xyz)");
+        expect(res.wgsl).toContain("normalize((_m3Tc3).xyz)");
+        expect(res.wgsl).toContain("normalize(vec3<f32>((in.tex1).w, (in.tex2).w, (in.tex3).w))");
+        // WGSL reflect() is defined over the operands as given, so the normalize
+        // calls above are what makes it the D3D result rather than the old
+        // unnormalized `2 * dot(n,e) / dot(n,n) * n - e` approximation.
+        expect(res.wgsl).toContain("-reflect(_m3Eye3, _m3Normal3)");
+        expect(res.wgsl).not.toContain("2.0 * (dot(_m3");
+        expect(res.wgsl).toContain("textureSample(tex3, samp3, (vec4<f32>(_m3Reflect3, 0.0)).xyz)");
+        expect(res.wgsl).not.toContain("textureSample(tex1, samp1");
+        expect(res.wgsl).not.toContain("textureSample(tex2, samp2");
         assertAllSampledTexturesDeclared(res.wgsl);
+    });
+
+    test("oracle legacy streams lower swizzles and matrix texture ops without approximations", () => {
+        const tokensOf = (tokens: string[]) => new Uint32Array(tokens.map((token) => Number(token) >>> 0));
+        const oracle = legacyTextureOracle.cases;
+        const oracleCase = (name: string) => oracle.find((candidate) => candidate.name === name)!;
+        const swizzles = compilePixelShader(tokensOf(oracleCase("ps_1_3_legacy_texreg2").tokens));
+        const swizzleLink = linkProgram({
+            vs: compileVertexShader(buildVs()), ps: swizzles,
+            declElements: decl, streamStride: 20,
+        });
+        const swizzleWgsl = swizzleLink.wgsl;
+        expect(swizzleWgsl).toContain("let _texreg21 = (t0).wxxx;");
+        expect(swizzleWgsl).toContain("let _texreg22 = (t0).yzzz;");
+        expect(swizzleWgsl).toContain("let _texreg23 = (t0).xyzz;");
+        expect(swizzleLink.census.ps?.unsupportedOps).toEqual([]);
+
+        const matrix = compilePixelShader(tokensOf(oracleCase("ps_1_3_legacy_texm3x2").tokens));
+        const matrixLink = linkProgram({
+            vs: compileVertexShader(buildVs()), ps: matrix,
+            declElements: decl, streamStride: 20,
+        });
+        const matrixWgsl = matrixLink.wgsl;
+        expect(matrixWgsl).toContain("// texm3x2pad (no-op)");
+        expect(matrixWgsl).toContain("dot((in.tex1).xyz, (t0).xyz)");
+        expect(matrixWgsl).toContain("dot((in.tex2).xyz, (t0).xyz)");
+        expect(matrixLink.census.ps?.unsupportedOps).toEqual([]);
+
+        const matrix3 = compilePixelShader(tokensOf(oracleCase("ps_1_3_legacy_texm3x3tex").tokens));
+        const matrix3Link = linkProgram({
+            vs: compileVertexShader(buildVs()), ps: matrix3,
+            declElements: decl, streamStride: 20,
+        });
+        const matrix3Wgsl = matrix3Link.wgsl;
+        expect(matrix3Wgsl).toContain("dot((in.tex1).xyz, (t0).xyz)");
+        expect(matrix3Wgsl).toContain("dot((in.tex3).xyz, (t0).xyz)");
+        expect(matrix3Link.census.ps?.unsupportedOps).toEqual([]);
+    });
+
+    test("texm3x3spec normalizes the explicit eye ray before reflect", () => {
+        const psTokens = new Uint32Array([
+            version(true, 1, 1),
+            instr(Op.TEX), dst(RegType.TEXTURE, 0),
+            instr(Op.TEXM3x3SPEC), dst(RegType.TEXTURE, 3),
+                src(RegType.TEXTURE, 0), src(RegType.TEXTURE, 1),
+            instr(Op.MOV), dst(RegType.TEMP, 0), src(RegType.TEXTURE, 3),
+            END,
+        ]);
+        const res = linkProgram({
+            vs: compileVertexShader(buildVs()), ps: compilePixelShader(psTokens),
+            declElements: decl, streamStride: 20, cubeMask: 1 << 3,
+        });
+        expect(res.wgsl).toContain("let _m3Normal1 = normalize((_m3Tc1).xyz);");
+        expect(res.wgsl).toContain("let _m3Eye1 = normalize((t1).xyz);");
+        expect(res.wgsl).toContain("let _m3Reflect1 = -reflect(_m3Eye1, _m3Normal1);");
+        expect(res.wgsl).not.toContain("2.0 * (dot(_m3");
+    });
+
+    test("texdepth uses the fragment-depth ABI rather than a color approximation", () => {
+        const texdepth = compilePixelShader(new Uint32Array(
+            legacyTextureOracle.cases.find((candidate) => candidate.name === "ps_1_4_texdepth")!.tokens
+                .map((token) => Number(token) >>> 0),
+        ));
+        const res = linkProgram({
+            vs: compileVertexShader(buildVs()), ps: texdepth,
+            declElements: decl, streamStride: 20,
+        });
+        expect(res.wgsl).toContain("@builtin(frag_depth) depth: f32");
+        expect(res.wgsl).toContain("oDepth = select(_legacyDepthZ");
+        expect(res.census.ps?.unsupportedOps).toEqual([]);
+        expect(res.wgsl).not.toContain("textureSample(tex5");
     });
 
     test("ps constants are clamped to [-1,1]", () => {

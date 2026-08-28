@@ -1,0 +1,69 @@
+{
+  "cases": [
+    {
+      "name": "vs_3_0_predicated_mad",
+      "source": "vs_3_0\n(p0) mad r0, r1, r2, r3\n",
+      "tokens": [
+        "0xfffe0300",
+        "0x15000004",
+        "0x800f0000",
+        "0xb0e41000",
+        "0x80e40001",
+        "0x80e40002",
+        "0x80e40003",
+        "0x0000ffff"
+      ]
+    },
+    {
+      "name": "vs_3_0_destination_relative_output",
+      "source": "vs_3_0\ndefi i0, 1, 0, 0, 0\nloop aL, i0\nmov o[aL+1], r0\nendloop\n",
+      "tokens": [
+        "0xfffe0300",
+        "0x05000030",
+        "0xf00f0000",
+        "0x00000001",
+        "0x00000000",
+        "0x00000000",
+        "0x00000000",
+        "0x0200001b",
+        "0xf0e40800",
+        "0xf0e40000",
+        "0x03000001",
+        "0xe00f2001",
+        "0xf0e40800",
+        "0x80e40000",
+        "0x0000001d",
+        "0x0000ffff"
+      ]
+    },
+    {
+      "name": "vs_3_0_typed_comparisons",
+      "source": "vs_3_0\ndefi i0, 1, 0, 0, 0\nloop aL, i0\nif_gt r0.x, c0.x\nbreak_lt r1.x, c1.x\nendif\nendloop\nsetp_gt p0, r2.x, c2.x\n",
+      "tokens": [
+        "0xfffe0300",
+        "0x05000030",
+        "0xf00f0000",
+        "0x00000001",
+        "0x00000000",
+        "0x00000000",
+        "0x00000000",
+        "0x0200001b",
+        "0xf0e40800",
+        "0xf0e40000",
+        "0x02010029",
+        "0x80000000",
+        "0xa0000000",
+        "0x0204002d",
+        "0x80000001",
+        "0xa0000001",
+        "0x0000002b",
+        "0x0000001d",
+        "0x0301005e",
+        "0xb00f1000",
+        "0x80000002",
+        "0xa0000002",
+        "0x0000ffff"
+      ]
+    }
+  ]
+}

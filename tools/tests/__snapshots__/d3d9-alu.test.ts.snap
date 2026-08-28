@@ -1,0 +1,52 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`d3d9 ALU float contract safe multiply helper is used by mul/mad/dot variants 1`] = `
+{
+  "dot3": "dot(((select((a), vec4<f32>(0.0), (b) == vec4<f32>(0.0)) * select((b), vec4<f32>(0.0), (a) == vec4<f32>(0.0)))).xyz, vec3<f32>(1.0))",
+  "dp2add": "vec4<f32>(dot(((select((a), vec4<f32>(0.0), (b) == vec4<f32>(0.0)) * select((b), vec4<f32>(0.0), (a) == vec4<f32>(0.0)))).xy, vec2<f32>(1.0)) + (c).x)",
+  "dp3": "vec4<f32>(dot(((select((a), vec4<f32>(0.0), (b) == vec4<f32>(0.0)) * select((b), vec4<f32>(0.0), (a) == vec4<f32>(0.0)))).xyz, vec3<f32>(1.0)))",
+  "dp4": "vec4<f32>(dot(((select((a), vec4<f32>(0.0), (b) == vec4<f32>(0.0)) * select((b), vec4<f32>(0.0), (a) == vec4<f32>(0.0)))).xyzw, vec4<f32>(1.0)))",
+  "mad": "((select((a), vec4<f32>(0.0), (b) == vec4<f32>(0.0)) * select((b), vec4<f32>(0.0), (a) == vec4<f32>(0.0))) + c)",
+  "mul": "(select((a), vec4<f32>(0.0), (b) == vec4<f32>(0.0)) * select((b), vec4<f32>(0.0), (a) == vec4<f32>(0.0)))",
+  "operand": "select((a), vec4<f32>(0.0), (b) == vec4<f32>(0.0))",
+  "product": "(select((a), vec4<f32>(0.0), (b) == vec4<f32>(0.0)) * select((b), vec4<f32>(0.0), (a) == vec4<f32>(0.0)))",
+}
+`;
+
+exports[`d3d9 ALU float contract rsq clamps its infinite zero-input result 1`] = `"vec4<f32>(min((inverseSqrt(abs((a).x))), 3.4028234663852886e+38))"`;
+
+exports[`d3d9 ALU float contract log and logp clamp zero to the finite lower bound 1`] = `
+{
+  "log": "vec4<f32>(max((log2(abs((a).x))), -3.4028234663852886e+38))",
+  "logp": "vec4<f32>(max((log2(abs((a).x))), -3.4028234663852886e+38))",
+  "lower": "max((value), vec4<f32>(-3.4028234663852886e+38))",
+}
+`;
+
+exports[`d3d9 ALU float contract exp and expp clamp overflow to the finite upper bound 1`] = `
+{
+  "exp": "vec4<f32>(min((exp2((a).x)), 3.4028234663852886e+38))",
+  "expp": "vec4<f32>(min((exp2((a).x)), 3.4028234663852886e+38))",
+}
+`;
+
+exports[`d3d9 ALU float contract pow has an exact zero-exponent result 1`] = `
+{
+  "helper": "select(pow(abs((a).x), (b).x), 1.0, (b).x == 0.0)",
+  "opcode": "vec4<f32>(select(pow(abs((a).x), (b).x), 1.0, (b).x == 0.0))",
+}
+`;
+
+exports[`d3d9 ALU float contract lit clamps power and uses both positive predicates 1`] = `
+{
+  "helper": "vec4<f32>(1.0, select(0.0, (a).x, ((a).x > 0.0)), select(0.0, pow(max((a).y, 0.0), min(max((a).w, -127.9961), 127.9961)), ((a).x > 0.0) && ((a).y > 0.0)), 1.0)",
+  "opcode": "vec4<f32>(1.0, select(0.0, (a).x, ((a).x > 0.0)), select(0.0, pow(max((a).y, 0.0), min(max((a).w, -127.9961), 127.9961)), ((a).x > 0.0) && ((a).y > 0.0)), 1.0)",
+}
+`;
+
+exports[`d3d9 ALU float contract rcp(0) is the finite positive maximum for both zero signs 1`] = `
+{
+  "max": "min((value), vec4<f32>(3.4028234663852886e+38))",
+  "rcp": "vec4<f32>(select(max((min((1.0 / (a).x), 3.4028234663852886e+38)), -3.4028234663852886e+38), 3.4028234663852886e+38, (a).x == 0.0))",
+}
+`;
