@@ -25,7 +25,11 @@ import {
     MAX_ALLOC_BYTES,
 } from '../../core/cpu/emulator-config';
 const HEAP_ZERO_MEMORY_FLAG = 0x00000008;
+const HEAP_REALLOC_IN_PLACE_ONLY = 0x00000010;
 const HEAP_OOM_ERROR = 8;
+const ERR_INVALID_PARAMETER = 87;
+/** HeapSize's (SIZE_T)-1: "not a heap block", which is NOT the same as a zero-sized one. */
+const HEAP_SIZE_INVALID = 0xFFFFFFFF;
 const HEAP_FAST_PATH_MAX_ALLOC = 0x20000000;
 const DEBUG_FORCE_ZERO_HEAP_FAST_PATH = false;
 export const HEAP_SMALL_ALLOC_MAX = 0x1000; // 4KB — the slab fast path covers blocks up to this
@@ -143,23 +147,74 @@ let totalSlabBytes = 0;
 let nextSlabSize = HEAP_SLAB_INITIAL_SIZE;
 let slabGrowLastAttempt = 0; // performance.now() of last grow attempt (throttle)
 
+/**
+ * base -> size, plus a sorted stabbing index over the same entries.
+ *
+ * VirtualQuery and HeapSize both ask "which interval contains this address?" — a
+ * pointer-validity probe loop asks it hundreds of thousands of times per boot, while the
+ * intervals themselves change only on VirtualAlloc/VirtualFree/decommit. Owning the
+ * mutations here is what keeps the index from answering out of a stale membership: there
+ * is no separate invalidation call to forget.
+ */
+class IntervalMap {
+    private readonly map = new Map<number, number>();
+    private sorted: Array<{ base: number; size: number }> | null = null;
+
+    get size(): number { return this.map.size; }
+    has(base: number): boolean { return this.map.has(base >>> 0); }
+    get(base: number): number | undefined { return this.map.get(base >>> 0); }
+    set(base: number, size: number): void { this.map.set(base >>> 0, size); this.sorted = null; }
+    delete(base: number): boolean {
+        const removed = this.map.delete(base >>> 0);
+        if (removed) this.sorted = null;
+        return removed;
+    }
+    clear(): void { this.map.clear(); this.sorted = null; }
+    [Symbol.iterator](): IterableIterator<[number, number]> { return this.map[Symbol.iterator](); }
+
+    /** The interval containing `addr`, or null. Entries are disjoint by construction. */
+    find(addr: number): { base: number; size: number } | null {
+        const a = addr >>> 0;
+        let spans = this.sorted;
+        if (!spans) {
+            spans = [];
+            for (const [base, size] of this.map) if (size > 0) spans.push({ base, size });
+            spans.sort((x, y) => x.base - y.base);
+            this.sorted = spans;
+        }
+        let lo = 0, hi = spans.length - 1, last = -1;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            if (spans[mid]!.base <= a) { last = mid; lo = mid + 1; } else { hi = mid - 1; }
+        }
+        if (last < 0) return null;
+        const s = spans[last]!;
+        return a < s.base + s.size ? s : null;
+    }
+}
+
 // VirtualAlloc roots (base -> size). Same MemoryManager bucket as HeapAlloc, but they
 // are NOT heap blocks: HeapSize must return (SIZE_T)-1 and HeapWalk must omit them,
 // or third-party heaps (SmartHeap) treat a VirtualAlloc pool as HeapAlloc memory,
 // HeapFree the pool base, and reuse sub-allocations still held by the CRT (_piob UAF).
-const virtualAllocRegions: Map<number, number> = new Map();
+const virtualAllocRegions = new IntervalMap();
+
+// Decommitted page ranges within reserved regions.
+// Storm.dll's SBH allocator depends on the decommit/recommit cycle:
+//   1. VirtualAlloc(MEM_RESERVE) — reserve 64KB block
+//   2. VirtualAlloc(MEM_COMMIT) — commit pages on demand (zeroed)
+//   3. VirtualFree(MEM_DECOMMIT) — decommit freed pages
+//   4. VirtualAlloc(MEM_COMMIT) — recommit = re-zero pages
+// Without tracking, decommit is a no-op and recommit skips zeroing, leaving stale
+// heap metadata that causes heap corruption. VirtualQuery reports these MEM_RESERVE.
+const decommittedPages = new IntervalMap();
 
 function isVirtualAllocBase(ptr: number): boolean {
     return virtualAllocRegions.has(ptr >>> 0);
 }
 
 function isInVirtualAllocRegion(ptr: number): boolean {
-    const p = ptr >>> 0;
-    if (virtualAllocRegions.has(p)) return true;
-    for (const [base, size] of virtualAllocRegions) {
-        if (p >= base && p < base + size) return true;
-    }
-    return false;
+    return virtualAllocRegions.find(ptr) !== null;
 }
 
 /** Low-level: allocate one slab of `size` bytes and install it as the active one. */
@@ -372,6 +427,8 @@ export function resetHeapSlab(): void {
     nextCreatedHeapHandle = HEAP_CREATE_HANDLE_BASE;
     heapWalkState = null;
     heapManagerOwnerProcess = null;
+    // The audit's scratch block belongs to the process that is going away.
+    vqAuditBuf = 0;
 }
 
 /**
@@ -543,31 +600,42 @@ export function slabReport() {
 
 (globalThis as any).getSlabReport = slabReport;
 
+/** True if ptr addresses a sub-allocation inside some slab generation. */
+function inSlabRange(ptr: number): boolean {
+    for (const range of slabRanges) {
+        if (ptr >= range.base + 16 && ptr < range.end) return true;
+    }
+    return false;
+}
+
 /** If ptr is within a slab, return its size class. Used by HeapSize/HeapReAlloc. */
 export function getSlabSizeForPtr(ptr: number): number | undefined {
-    for (const range of slabRanges) {
-        if (ptr >= range.base + 16 && ptr < range.end) {
-            const mem = System.getInstance().process?.getCurrentMemory();
-            if (!mem) return undefined;
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            const header = view.getUint32(ptr - 4, true) >>> 0;
-            // Accept ONLY BUSY (0x534C41xx). A FREE-marked block (0x534C46xx) is currently
-            // on a per-bin free list — NOT a live allocation: every alloc-pop path (WASM
-            // handle_heap_alloc, inline writeHeapSlabStubs / writeCrtSlabStubs) re-stamps BUSY,
-            // so no live block ever carries the FREE marker. Reporting a free-listed block as a
-            // sized, live allocation made HeapSize/HeapReAlloc-in-place/realloc/_msize hand the
-            // SAME free-listed block back to its old owner while the next malloc popped it for a
-            // new owner → two owners, one block (D2: a Storm MPQ handle stomped the Fog region
-            // table → elemSize=0 → 0/0 #DE). isSlabHeader (BUSY|FREE) stays correct for the
-            // linear header-WALK consumers (buildHeapWalkEntries / analyzeSlabFreelist), which
-            // legitimately traverse free blocks.
-            if ((header & 0xFFFFFF00) !== SLAB_MAGIC) return undefined;
-            const bin = header & 0x0F;
-            if (bin > 8) return undefined;
-            return SLAB_BIN_SIZES[bin];
-        }
-    }
-    return undefined;
+    if (!inSlabRange(ptr)) return undefined;
+    const mem = System.getInstance().process?.getCurrentMemory();
+    if (!mem) return undefined;
+    return slabSizeFromHeader(ptr, new DataView(mem.buffer, mem.byteOffset, mem.byteLength));
+}
+
+/**
+ * The size class of a slab block, read from its header through a caller-supplied view —
+ * the fast-path tier already holds one over guest memory and must not build another.
+ */
+function slabSizeFromHeader(ptr: number, view: DataView): number | undefined {
+    const header = view.getUint32(ptr - 4, true) >>> 0;
+    // Accept ONLY BUSY (0x534C41xx). A FREE-marked block (0x534C46xx) is currently
+    // on a per-bin free list — NOT a live allocation: every alloc-pop path (WASM
+    // handle_heap_alloc, inline writeHeapSlabStubs / writeCrtSlabStubs) re-stamps BUSY,
+    // so no live block ever carries the FREE marker. Reporting a free-listed block as a
+    // sized, live allocation made HeapSize/HeapReAlloc-in-place/realloc/_msize hand the
+    // SAME free-listed block back to its old owner while the next malloc popped it for a
+    // new owner → two owners, one block (D2: a Storm MPQ handle stomped the Fog region
+    // table → elemSize=0 → 0/0 #DE). isSlabHeader (BUSY|FREE) stays correct for the
+    // linear header-WALK consumers (buildHeapWalkEntries / analyzeSlabFreelist), which
+    // legitimately traverse free blocks.
+    if ((header & 0xFFFFFF00) !== SLAB_MAGIC) return undefined;
+    const bin = header & 0x0F;
+    if (bin > 8) return undefined;
+    return SLAB_BIN_SIZES[bin];
 }
 
 const formatCallSite = (
@@ -686,18 +754,8 @@ export const exports: Record<string, ThunkImplementation> = (() => {
     // Track reserved pages (address -> size in bytes)
     const reservedPages: Map<number, number> = new Map();
 
-    // virtualAllocRegions is module-scoped (shared with HeapWalk/HeapSize).
-
-    // Track decommitted page ranges within reserved regions.
-    // Key = page-aligned address, Value = size in bytes.
-    // Storm.dll SBH allocator depends on decommit/recommit cycle:
-    //   1. VirtualAlloc(MEM_RESERVE) — reserve 64KB block
-    //   2. VirtualAlloc(MEM_COMMIT) — commit pages on demand (zeroed)
-    //   3. VirtualFree(MEM_DECOMMIT) — decommit freed pages
-    //   4. VirtualAlloc(MEM_COMMIT) — recommit = re-zero pages
-    // Without tracking, decommit is a no-op and recommit skips zeroing,
-    // leaving stale heap metadata that causes heap corruption.
-    const decommittedPages: Map<number, number> = new Map();
+    // virtualAllocRegions / decommittedPages are module-scoped: the fast-path tier
+    // and HeapWalk/HeapSize read the same interval indexes.
 
     // Remove a committed range from decommittedPages, handling partial overlaps.
     // Storm often decommits a multi-page range then recommits individual pages.
@@ -1166,6 +1224,9 @@ export const exports: Record<string, ThunkImplementation> = (() => {
     // IMAGE_SCN_MEM_{EXECUTE,READ,WRITE}
     const SCN_EXECUTE = 0x20000000, SCN_READ = 0x40000000, SCN_WRITE = 0x80000000;
 
+    type ImageSpan = { start: number; end: number; protect: number };
+    const imageSpanCache = new WeakMap<object, ImageSpan[]>();
+
     function sectionProtect(characteristics: number): number {
         const x = (characteristics & SCN_EXECUTE) !== 0;
         const w = (characteristics & SCN_WRITE) !== 0;
@@ -1189,13 +1250,20 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         if (!sections?.length) return { end: imageEnd, protect: PAGE_EXECUTE_READ };
 
         // Section bounds in ascending address order, page-aligned as the loader mapped them.
-        const spans = sections
-            .map((s) => ({
-                start: (mod.baseAddress + s.virtualAddress) & ~0xFFF,
-                end: (mod.baseAddress + s.virtualAddress + Math.max(s.virtualSize, s.rawSize) + 0xFFF) & ~0xFFF,
-                protect: sectionProtect(s.characteristics),
-            }))
-            .sort((a, b) => a.start - b.start);
+        // A module's sections and base are fixed at load, so the derived spans are cached
+        // against the module object itself — a query storm otherwise re-maps and re-sorts
+        // the whole section array per call. The entry dies with the module.
+        let spans = imageSpanCache.get(mod);
+        if (!spans) {
+            spans = sections
+                .map((s) => ({
+                    start: (mod.baseAddress + s.virtualAddress) & ~0xFFF,
+                    end: (mod.baseAddress + s.virtualAddress + Math.max(s.virtualSize, s.rawSize) + 0xFFF) & ~0xFFF,
+                    protect: sectionProtect(s.characteristics),
+                }))
+                .sort((a, b) => a.start - b.start);
+            imageSpanCache.set(mod, spans);
+        }
 
         const first = spans[0]!;
         if (pageBase < first.start) return { end: first.start, protect: PAGE_READONLY }; // PE headers
@@ -1329,19 +1397,11 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 // original VirtualAlloc base for every page in the reservation.
                 // SmartHeap/Shw32 validates interior pointers against that base; page-
                 // granular AllocationBase made every sub-page look like its own alloc.
-                let vaBase = 0;
-                let vaSize = 0;
-                for (const [base, size] of virtualAllocRegions) {
-                    if (pageBase >= base && pageBase < base + size) {
-                        vaBase = base;
-                        vaSize = size;
-                        break;
-                    }
-                }
+                const va = virtualAllocRegions.find(pageBase);
 
-                if (vaSize !== 0) {
-                    allocationBase = vaBase;
-                    regionSize = vaBase + vaSize - pageBase;
+                if (va) {
+                    allocationBase = va.base;
+                    regionSize = va.base + va.size - pageBase;
                     memType = MEM_PRIVATE;
                     protect = PAGE_READWRITE;
                     state = MEM_COMMIT;
@@ -1373,13 +1433,11 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 
             // Decommitted pages within a reserved/committed region read back as MEM_RESERVE.
             if (state === MEM_COMMIT) {
-                for (const [dcBase, dcSize] of decommittedPages) {
-                    if (pageBase >= dcBase && pageBase < dcBase + dcSize) {
-                        state = MEM_RESERVE;
-                        // Clip region to the decommitted run so the walker sees the boundary.
-                        regionSize = Math.min(regionSize, dcBase + dcSize - pageBase);
-                        break;
-                    }
+                const dc = decommittedPages.find(pageBase);
+                if (dc) {
+                    state = MEM_RESERVE;
+                    // Clip region to the decommitted run so the walker sees the boundary.
+                    regionSize = Math.min(regionSize, dc.base + dc.size - pageBase);
                 }
             }
 
@@ -1392,9 +1450,10 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             view.setUint32(lpBuffer + 20, reportProtect, true);       // Protect
             view.setUint32(lpBuffer + 24, memType, true);             // Type
 
-            const stateName = state === MEM_FREE ? 'FREE' : state === MEM_RESERVE ? 'RESERVE' : 'COMMIT';
-            Logger.verbose(LogCategory.KERNEL32,
-                `VirtualQuery(0x${lpAddress.toString(16)}) -> base=0x${baseAddress.toString(16)} alloc=0x${allocationBase.toString(16)} size=0x${regionSize.toString(16)} state=${stateName} type=0x${memType.toString(16)}`);
+            Logger.verboseLazy(LogCategory.KERNEL32, () => {
+                const stateName = state === MEM_FREE ? 'FREE' : state === MEM_RESERVE ? 'RESERVE' : 'COMMIT';
+                return `VirtualQuery(0x${lpAddress.toString(16)}) -> base=0x${baseAddress.toString(16)} alloc=0x${allocationBase.toString(16)} size=0x${regionSize.toString(16)} state=${stateName} type=0x${memType.toString(16)}`;
+            });
 
             return 28; // sizeof(MEMORY_BASIC_INFORMATION)
         }
@@ -1818,7 +1877,8 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         const lpMem = args[2];
         const dwBytes = args[3] >>> 0;
 
-        Logger.verbose(LogCategory.KERNEL32, `HeapReAlloc(0x${hHeap.toString(16)}, 0x${dwFlags.toString(16)}, 0x${lpMem.toString(16)}, ${dwBytes})`);
+        Logger.verboseLazy(LogCategory.KERNEL32,
+            () => `HeapReAlloc(0x${hHeap.toString(16)}, 0x${dwFlags.toString(16)}, 0x${lpMem.toString(16)}, ${dwBytes})`);
 
         // Simplified implementation - allocate new memory and copy
         const system = System.getInstance();
@@ -1863,6 +1923,10 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             // tracked allocation size. process.memory rounds every alloc up to >=8 and
             // HeapAlloc pre-rounds small sizes to 16, so getSize() IS the usable
             // capacity — dwBytes <= capacity is safe to satisfy in place.
+            // HEAP_ZERO_MEMORY is this tier's alone: the fast path declines it, because
+            // honouring it means zeroing the grown tail on the relocation below and that is
+            // machinery the fast tier does not carry.
+            const zeroMemory = (dwFlags & HEAP_ZERO_MEMORY_FLAG) !== 0;
             if (lpMem) {
                 let capacity = getSlabSizeForPtr(lpMem);
                 if (capacity === undefined) capacity = process.memory.getSize(lpMem);
@@ -1872,9 +1936,9 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                         () => `HeapReAlloc in-place 0x${lpMem.toString(16)} (size=${dwBytes} <= cap=${capacity})`);
                     return lpMem >>> 0;
                 }
-                // HEAP_REALLOC_IN_PLACE_ONLY (0x10): caller forbids relocation. If we
-                // know the block can't grow in place, fail rather than move it.
-                if ((dwFlags & 0x10) && capacity !== undefined) {
+                // HEAP_REALLOC_IN_PLACE_ONLY: caller forbids relocation. If we know the
+                // block can't grow in place, fail rather than move it.
+                if ((dwFlags & HEAP_REALLOC_IN_PLACE_ONLY) && capacity !== undefined) {
                     system.scheduler.setLastError(ERROR_INVALID_PARAMETER);
                     Logger.verbose(LogCategory.KERNEL32,
                         `HeapReAlloc IN_PLACE_ONLY can't grow 0x${lpMem.toString(16)} (size=${dwBytes} > cap=${capacity})`);
@@ -1906,6 +1970,11 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                     if (copySize > 0) {
                         mem.copyWithin(newAddress, lpMem, lpMem + copySize);
                     }
+                    // The grown tail. MemoryManager already hands out zeroed memory, but the
+                    // HEAP_ZERO_MEMORY guarantee is this call's, not the allocator's.
+                    if (zeroMemory && dwBytes > copySize) {
+                        mem.fill(0, newAddress + copySize, newAddress + dwBytes);
+                    }
 
                     // HEAP_REALLOC_IN_PLACE_ONLY = 0x00000010
                     // If not in-place only, we just allocated a new block, so free the old one.
@@ -1934,10 +2003,11 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         const dwFlags = args[1];
         const lpMem = args[2] >>> 0;
 
-        Logger.verbose(LogCategory.KERNEL32, `HeapSize(0x${hHeap.toString(16)}, 0x${dwFlags.toString(16)}, 0x${lpMem.toString(16)})`);
+        Logger.verboseLazy(LogCategory.KERNEL32,
+            () => `HeapSize(0x${hHeap.toString(16)}, 0x${dwFlags.toString(16)}, 0x${lpMem.toString(16)})`);
 
         // VirtualAlloc memory is not a heap block — Win32 returns (SIZE_T)-1.
-        if (!lpMem || isInVirtualAllocRegion(lpMem)) return 0xFFFFFFFF;
+        if (!lpMem || isInVirtualAllocRegion(lpMem)) return HEAP_SIZE_INVALID;
 
         // Check WASM slab first (most common for small allocations)
         const slabSize = getSlabSizeForPtr(lpMem);
@@ -1952,7 +2022,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         // Exact HeapAlloc base only. Layout-bucket / dummy sizes lied to SmartHeap:
         // a VirtualAlloc pool base looked like a live HeapAlloc block → HeapFree of the
         // pool while CRT still held interior pointers (_piob).
-        return 0xFFFFFFFF;
+        return HEAP_SIZE_INVALID;
     };
 
     // UINT HeapCompact(HANDLE hHeap, DWORD dwFlags)
@@ -3041,6 +3111,69 @@ export function queryVirtualMemory(addr: number): Record<string, unknown> | null
     }
 };
 
+// HeapSize mirrors exports['HeapSize'] in full: every branch it has is a constant
+// compare, an O(log n) interval probe or a Map get, and none of them has a side
+// effect, so there is nothing left for the slow tier to own.
+export const heapSizeFastPath: FastPathImplementation = (cpu, mem8, _mem32, view) => {
+    const esp = cpu.reg32[4] >>> 0;
+    if (esp + 16 > mem8.length) return null;
+    const lpMem = view.getUint32(esp + 12, true) >>> 0;
+
+    // VirtualAlloc memory is not a heap block — Win32 returns (SIZE_T)-1.
+    if (!lpMem || isInVirtualAllocRegion(lpMem)) return HEAP_SIZE_INVALID;
+
+    if (inSlabRange(lpMem)) {
+        const slabSize = slabSizeFromHeader(lpMem, view);
+        if (slabSize !== undefined) return slabSize;
+    }
+    const process = System.getInstance().process;
+    if (!process) return null;
+    const size = process.memory.getSize(lpMem);
+    return size !== undefined ? size : HEAP_SIZE_INVALID;
+};
+
+// HeapReAlloc serves only the cases that keep the block put. A grow that must move
+// is a real allocation, and a refusal (size 0 / oversize) is what the guest turns
+// into bad_alloc — both stay on the slow tier, which owns the copy, the free funnel
+// and the call-site diagnostics that name the caller.
+export const heapReAllocFastPath: FastPathImplementation = (cpu, mem8, _mem32, view) => {
+    const esp = cpu.reg32[4] >>> 0;
+    if (esp + 20 > mem8.length) return null;
+    const dwFlags = view.getUint32(esp + 8, true) >>> 0;
+    const lpMem = view.getUint32(esp + 12, true) >>> 0;
+    const dwBytes = view.getUint32(esp + 16, true) >>> 0;
+
+    const system = System.getInstance();
+    const process = system.process;
+    if (!process || !lpMem) return null;
+    if (dwBytes === 0 || dwBytes > mem8.length || dwBytes > HEAP_FAST_PATH_MAX_ALLOC) return null;
+
+    let capacity = inSlabRange(lpMem) ? slabSizeFromHeader(lpMem, view) : undefined;
+    if (capacity === undefined) capacity = process.memory.getSize(lpMem);
+    if (capacity === undefined) return null;
+
+    // The zeroing contract needs the caller's PREVIOUS requested size, which no tier here
+    // holds — `capacity` is the rounded allocation. A tier that cannot honour it must not
+    // answer: the slow tier relocates and zeroes the tail explicitly.
+    if (dwFlags & HEAP_ZERO_MEMORY_FLAG) return null;
+
+    if (dwBytes <= capacity) {
+        if ((globalThis as any).__heapWatch) {
+            heapWatch('realloc-inplace', { esp }, mem8, [lpMem], `size=${dwBytes} cap=${capacity}`);
+        }
+        Logger.verboseLazy(LogCategory.KERNEL32,
+            () => `HeapReAlloc in-place 0x${lpMem.toString(16)} (size=${dwBytes} <= cap=${capacity})`);
+        return lpMem;
+    }
+    if (dwFlags & HEAP_REALLOC_IN_PLACE_ONLY) {
+        system.scheduler.setLastError(ERR_INVALID_PARAMETER);
+        Logger.verboseLazy(LogCategory.KERNEL32,
+            () => `HeapReAlloc IN_PLACE_ONLY can't grow 0x${lpMem.toString(16)} (size=${dwBytes} > cap=${capacity})`);
+        return 0;
+    }
+    return null;
+};
+
 /**
  * Register fast-path implementations for high-frequency heap operations.
  * Keeps heap bookkeeping in JS AddressSpace/MemoryManager, but bypasses full thunk marshalling.
@@ -3153,6 +3286,143 @@ export function registerFastPathHeapFunctions(dispatcher: any): void {
 
     dispatcher.registerFastPath('kernel32', 'HeapAlloc', heapAllocFastPath, { trivial: true });
     dispatcher.registerFastPath('kernel32', 'HeapFree', heapFreeFastPath, { trivial: true });
+    dispatcher.registerFastPath('kernel32', 'HeapSize', heapSizeFastPath, { trivial: true });
+    dispatcher.registerFastPath('kernel32', 'HeapReAlloc', heapReAllocFastPath, { trivial: true });
     Logger.log(LogCategory.KERNEL32, 'Registered fast path for heap functions');
 }
 
+// ---------------------------------------------------------------------------
+// VirtualQuery fast path.
+//
+// A pointer-validity probe loop asks VirtualQuery hundreds of thousands of times per
+// boot, and every one of those answers is the same shape: a committed, page-granular
+// private page inside the HEAP/THUNK_DATA span (branch 4b of exports['VirtualQuery']).
+// Windows answers from a VAD tree; we answer that ONE branch here.
+//
+// Serving a branch means PROVING no earlier branch would have claimed the page and that
+// no later step would have altered the record — so this tier is a chain of negative
+// checks, each of which must be a constant compare or an O(log n) index probe. Re-running
+// the branch's own sweeps here would relocate the cost, not remove it:
+//   - being inside [HEAP, THUNK_DATA end) already rules out the EXE range (below it) and
+//     the ROM / SURFACE-reserve branches (above it), at no cost at all;
+//   - thread stacks and PE images answer from the sorted span indexes their owners keep;
+//   - VirtualAlloc roots and decommitted runs answer from IntervalMap's stabbing index.
+// Anything not proven defers to the full body, which stays the single definition of what
+// the other branches mean.
+// ---------------------------------------------------------------------------
+const MBI_MEM_COMMIT = 0x1000;
+const MBI_MEM_PRIVATE = 0x20000;
+const MBI_PAGE_READWRITE = 0x04;
+const MBI_SIZE = 28;
+const BACKED_HEAP_SPAN_END = MEM_THUNK_DATA_BASE + MEM_THUNK_DATA_SIZE;
+
+let vqFastHits = 0;
+let vqFastDefers = 0;
+let vqAuditChecked = 0;
+let vqAuditMismatches = 0;
+let vqAuditWarnBudget = 20;
+let vqAuditBuf = 0;
+const vqAuditCtx: X86Context = {
+    eax: 0, ecx: 0, edx: 0, ebx: 0, esp: 0, ebp: 0, esi: 0, edi: 0, eip: 0, eflags: 0,
+};
+
+/**
+ * Differential check for the fast path, armed with
+ * `setWorkerFlag('__virtualQueryFastAudit', true)`.
+ *
+ * A fast path that silently answers a case it was not entitled to is exactly the class of
+ * bug that reads as a plausible number for the whole session, so the audit runs the FULL
+ * body over the same address and compares all seven MEMORY_BASIC_INFORMATION fields.
+ */
+function auditVirtualQueryFast(lpAddress: number, lpBuffer: number, mem: Uint8Array, view: DataView): void {
+    const process = System.getInstance().process;
+    const slow = exports['VirtualQuery'];
+    if (!process || typeof slow !== 'function') return;
+    if (!vqAuditBuf) {
+        try { vqAuditBuf = process.memory.alloc(0x1000) >>> 0; } catch { return; }
+    }
+    const rc = slow(vqAuditCtx, mem, [lpAddress, vqAuditBuf, MBI_SIZE]) as number;
+    vqAuditChecked++;
+    let bad = rc !== MBI_SIZE;
+    for (let off = 0; !bad && off < MBI_SIZE; off += 4) {
+        if (view.getUint32(lpBuffer + off, true) !== view.getUint32(vqAuditBuf + off, true)) bad = true;
+    }
+    if (!bad) return;
+    vqAuditMismatches++;
+    if (vqAuditWarnBudget-- <= 0) return;
+    const dump = (base: number): string => {
+        const w: string[] = [];
+        for (let off = 0; off < MBI_SIZE; off += 4) w.push(`0x${(view.getUint32(base + off, true) >>> 0).toString(16)}`);
+        return `[${w.join(', ')}]`;
+    };
+    Logger.warn(LogCategory.KERNEL32,
+        `[VQ-AUDIT] MISMATCH at 0x${lpAddress.toString(16)} (rc=${rc}): ` +
+        `fast=${dump(lpBuffer)} slow=${dump(vqAuditBuf)} ` +
+        `(Base, AllocationBase, AllocationProtect, RegionSize, State, Protect, Type)`);
+}
+
+const virtualQueryFastPath: FastPathImplementation = (cpu, mem8, _mem32, view) => {
+    const esp = cpu.reg32[4] >>> 0;
+    if (esp + 16 > mem8.length) { vqFastDefers++; return null; }
+
+    const lpAddress = view.getUint32(esp + 4, true) >>> 0;
+    const lpBuffer = view.getUint32(esp + 8, true) >>> 0;
+    const dwLength = view.getUint32(esp + 12, true) >>> 0;
+    if (!lpBuffer || dwLength < MBI_SIZE || lpBuffer + MBI_SIZE > mem8.length) { vqFastDefers++; return null; }
+
+    const pageBase = (lpAddress & ~0xFFF) >>> 0;
+    if (pageBase < MEM_HEAP_BASE || pageBase >= BACKED_HEAP_SPAN_END) { vqFastDefers++; return null; }
+    if (pageBase >= mem8.length) { vqFastDefers++; return null; }
+
+    const system = System.getInstance();
+    const process = system.process;
+    if (!process) { vqFastDefers++; return null; }
+    if (system.scheduler?.findStackReservation(pageBase)) { vqFastDefers++; return null; }
+    if (process.moduleRegistry?.getModuleContainingAddress(lpAddress)) { vqFastDefers++; return null; }
+    if (virtualAllocRegions.find(pageBase)) { vqFastDefers++; return null; }
+    if (decommittedPages.find(pageBase)) { vqFastDefers++; return null; }
+
+    view.setUint32(lpBuffer, pageBase, true);                     // BaseAddress
+    view.setUint32(lpBuffer + 4, pageBase, true);                 // AllocationBase
+    view.setUint32(lpBuffer + 8, MBI_PAGE_READWRITE, true);       // AllocationProtect
+    view.setUint32(lpBuffer + 12, 0x1000, true);                  // RegionSize
+    view.setUint32(lpBuffer + 16, MBI_MEM_COMMIT, true);          // State
+    view.setUint32(lpBuffer + 20, MBI_PAGE_READWRITE, true);      // Protect
+    view.setUint32(lpBuffer + 24, MBI_MEM_PRIVATE, true);         // Type
+
+    vqFastHits++;
+    if ((globalThis as { __virtualQueryFastAudit?: boolean }).__virtualQueryFastAudit) {
+        auditVirtualQueryFast(lpAddress, lpBuffer, mem8, view);
+    }
+    return MBI_SIZE;
+};
+
+/** Harness: did the fast tier actually serve the calls, and does the audit agree? */
+export function virtualQueryFastStats(): Record<string, unknown> {
+    return {
+        hits: vqFastHits,
+        defers: vqFastDefers,
+        hitPct: vqFastHits + vqFastDefers > 0
+            ? +((100 * vqFastHits) / (vqFastHits + vqFastDefers)).toFixed(1) : 0,
+        auditArmed: Boolean((globalThis as { __virtualQueryFastAudit?: boolean }).__virtualQueryFastAudit),
+        auditChecked: vqAuditChecked,
+        auditMismatches: vqAuditMismatches,
+    };
+}
+
+export function resetVirtualQueryFastStats(): void {
+    vqFastHits = 0;
+    vqFastDefers = 0;
+    vqAuditChecked = 0;
+    vqAuditMismatches = 0;
+    vqAuditWarnBudget = 20;
+}
+
+/** Test seam: the fast-path implementation, so a differential test can drive it directly. */
+export const __virtualQueryFastPathForTests = virtualQueryFastPath;
+
+export function registerFastPathVirtualQuery(dispatcher: any): void {
+    if (!dispatcher || typeof dispatcher.registerFastPath !== 'function') return;
+    dispatcher.registerFastPath('kernel32', 'VirtualQuery', virtualQueryFastPath, { trivial: true });
+    Logger.log(LogCategory.KERNEL32, 'Registered fast path for VirtualQuery');
+}
