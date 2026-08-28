@@ -472,24 +472,15 @@ export class PELoader {
         // a previous tenant's compiled blocks in that tail would otherwise survive the zeroing.
         invalidateGuestCode(baseAddress, clearedBytes);
 
-        // Process Imports (now async to support real DLL loading)
-        const importDirRVA = peView.getUint32(optHeaderPtr + 104, true);
-        if (importDirRVA !== 0) {
-            await this.processImports(baseAddress, importDirRVA);
-        }
-
-        // Process TLS directory (implicit __declspec(thread) variables)
-        // Must be after sections+relocations so guest memory has correct VAs.
-        {
-            const exeName = system.executableName.toLowerCase().replace(/\.exe$/, '');
-            this.processTlsDirectory(peView, optHeaderPtr, baseAddress, exeName);
-        }
-
-        // Register main executable in module registry.
-        // Parse the EXE's export table too: engine-style games (e.g. Blade of Darkness)
-        // export an API from the main EXE that their own DLLs import back
-        // (Bladex.dll/netgame.dll import Blade.exe!GetStringValue etc.). Without these,
-        // processImports patches those IAT slots with the missing-import trap.
+        // Registered BEFORE its imports are resolved, the order Windows uses. An import whose
+        // preferred ImageBase is the EXE's own (cw3220, like every Watcom runtime, prefers
+        // 0x400000) asks chooseDllBase whether that VA is free, and an unregistered EXE reads
+        // there as a mapping some unloaded image left behind — so its live region is released
+        // and the DLL is mapped over the sections just written.
+        //
+        // The export table is parsed for the same ordering reason: engine-style games export
+        // an API from the EXE that their own DLLs import back (Bladex.dll/netgame.dll import
+        // Blade.exe!GetStringValue), and an unregistered EXE gets those slots trapped.
         let exeModuleForHle: LoadedPEModule | null = null;
         if (this.moduleRegistry) {
             const exeName = system.executableName.toLowerCase().replace(/\.exe$/, '');
@@ -514,6 +505,20 @@ export class PELoader {
             this.moduleRegistry.register(exeModule);
             exeModuleForHle = exeModule;
         }
+
+        // Process Imports (now async to support real DLL loading)
+        const importDirRVA = peView.getUint32(optHeaderPtr + 104, true);
+        if (importDirRVA !== 0) {
+            await this.processImports(baseAddress, importDirRVA);
+        }
+
+        // Process TLS directory (implicit __declspec(thread) variables)
+        // Must be after sections+relocations so guest memory has correct VAs.
+        {
+            const exeName = system.executableName.toLowerCase().replace(/\.exe$/, '');
+            this.processTlsDirectory(peView, optHeaderPtr, baseAddress, exeName);
+        }
+
 
         // Static Library HLE detection: scan the freshly-loaded image for
         // signatures of zlib/libpng/etc and hook any matches. Must run AFTER
