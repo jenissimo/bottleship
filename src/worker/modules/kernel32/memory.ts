@@ -2154,7 +2154,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             return 0;
         };
 
-        Logger.verbose(LogCategory.KERNEL32, `VirtualAlloc(lpAddr=0x${lpAddress.toString(16)}, size=${dwSize}, type=0x${flAllocationType.toString(16)}, prot=0x${flProtect.toString(16)})`);
+        Logger.verboseLazy(LogCategory.KERNEL32, () => `VirtualAlloc(lpAddr=0x${lpAddress.toString(16)}, size=${dwSize}, type=0x${flAllocationType.toString(16)}, prot=0x${flProtect.toString(16)})`);
 
         const MEM_COMMIT = 0x1000;
         const MEM_RESERVE = 0x2000;
@@ -2200,7 +2200,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 commitPreservingCommitted(effectiveAddress, alignedSize);
                 clearDecommittedRange(effectiveAddress, alignedSize);
                 profiler.end("VirtualAlloc:commitInReserved");
-                Logger.verbose(LogCategory.KERNEL32, `VirtualAlloc -> 0x${effectiveAddress.toString(16)} (COMMIT in reserved, size=${alignedSize})`);
+                Logger.verboseLazy(LogCategory.KERNEL32, () => `VirtualAlloc -> 0x${effectiveAddress.toString(16)} (COMMIT in reserved, size=${alignedSize})`);
                 return effectiveAddress;
             }
             // Fallback: region may already be mapped by a prior RESERVE|COMMIT (reservedPages can be out of sync).
@@ -2208,7 +2208,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             if (region && (region.kind === 'HEAP' || region.kind === 'HEAP_HIGH') && effectiveAddress + alignedSize <= region.base + region.size) {
                 commitPreservingCommitted(effectiveAddress, alignedSize);
                 clearDecommittedRange(effectiveAddress, alignedSize);
-                Logger.verbose(LogCategory.KERNEL32, `VirtualAlloc -> 0x${effectiveAddress.toString(16)} (COMMIT in HEAP, size=${alignedSize})`);
+                Logger.verboseLazy(LogCategory.KERNEL32, () => `VirtualAlloc -> 0x${effectiveAddress.toString(16)} (COMMIT in HEAP, size=${alignedSize})`);
                 return effectiveAddress;
             }
             // Committing without prior reserve is invalid
@@ -2255,7 +2255,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 process.addressSpace.fill(reuse, vaCacheKey, 0);
                 reservedPages.set(reuse, vaCacheKey);
                 virtualAllocRegions.set(reuse, vaCacheKey);
-                Logger.verbose(LogCategory.KERNEL32, `VirtualAlloc -> 0x${reuse.toString(16)} (recycled, size=${vaCacheKey})`);
+                Logger.verboseLazy(LogCategory.KERNEL32, () => `VirtualAlloc -> 0x${reuse.toString(16)} (recycled, size=${vaCacheKey})`);
                 return reuse;
             }
             vaCacheStats.misses++;
@@ -2304,7 +2304,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             // page from the access-violation filter) never fault, so the app reads zeros
             // where it expected the bytes its handler would have paged in.
             if (!(flAllocationType & MEM_COMMIT)) markDecommitted(address, committedSize);
-            Logger.verbose(LogCategory.KERNEL32, `VirtualAlloc: Reserved ${committedSize} bytes at 0x${address.toString(16)}`);
+            Logger.verboseLazy(LogCategory.KERNEL32, () => `VirtualAlloc: Reserved ${committedSize} bytes at 0x${address.toString(16)}`);
         }
 
         const trackedSize = virtualAllocRegions.get(address) ?? 0;
@@ -2321,10 +2321,10 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 process.addressSpace.fill(address, alignedSize, 0);
             }
             profiler.end("VirtualAlloc:commit");
-            Logger.verbose(LogCategory.KERNEL32, `VirtualAlloc: Committed ${alignedSize} bytes at 0x${address.toString(16)} perms=${perms}`);
+            Logger.verboseLazy(LogCategory.KERNEL32, () => `VirtualAlloc: Committed ${alignedSize} bytes at 0x${address.toString(16)} perms=${perms}`);
         }
 
-        Logger.verbose(LogCategory.KERNEL32, `VirtualAlloc -> 0x${address.toString(16)} (size=${alignedSize})`);
+        Logger.verboseLazy(LogCategory.KERNEL32, () => `VirtualAlloc -> 0x${address.toString(16)} (size=${alignedSize})`);
         return address;
     };
 
@@ -2343,7 +2343,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         const dwSize = args[1];
         const dwFreeType = args[2];
 
-        Logger.verbose(LogCategory.KERNEL32, `VirtualFree(0x${lpAddress.toString(16)}, ${dwSize}, 0x${dwFreeType.toString(16)})`);
+        Logger.verboseLazy(LogCategory.KERNEL32, () => `VirtualFree(0x${lpAddress.toString(16)}, ${dwSize}, 0x${dwFreeType.toString(16)})`);
 
         const MEM_RELEASE = 0x8000;
         const MEM_DECOMMIT = 0x4000;
@@ -2411,7 +2411,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                     bucket.push(lpAddress);
                     vaCacheBytes += blockSize;
                     vaCacheStats.parked++;
-                    Logger.verbose(LogCategory.KERNEL32, `VirtualFree: parked 0x${lpAddress.toString(16)} (${blockSize} bytes)`);
+                    Logger.verboseLazy(LogCategory.KERNEL32, () => `VirtualFree: parked 0x${lpAddress.toString(16)} (${blockSize} bytes)`);
                     return 1; // TRUE
                 }
                 vaCacheStats.refusedFull++;

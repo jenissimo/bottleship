@@ -672,8 +672,10 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
         }
         obj.beginLock();
 
-        Logger.verbose(LogCategory.SYSTEM,
-            `IDirect3DVertexBuffer_Lock: this=0x${thisPtr.toString(16)} -> data=0x${obj.getDataPtr().toString(16)}`);
+        // Eager template + two toString(16) allocations, ~91x per frame, for a message that
+        // is almost never emitted. verboseLazy defers the whole thing behind the level check.
+        Logger.verboseLazy(LogCategory.SYSTEM,
+            () => `IDirect3DVertexBuffer_Lock: this=0x${thisPtr.toString(16)} -> data=0x${obj.getDataPtr().toString(16)}`);
         return D3D_OK;
     };
 

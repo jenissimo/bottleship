@@ -8,8 +8,9 @@ import { ThunkImplementation } from "../../../core/thunking/thunk-dispatcher";
 import { assignStubsOnce } from "../../../core/thunking/stub-merge";
 import { DDrawContext } from "../context";
 import { Logger, LogCategory } from "../../../core/logger";
-import { Direct3DDevice3Object, Direct3DDevice7Object } from "../com-objects";
+import { Direct3DDevice3Object, Direct3DDevice7Object, Direct3DVertexBufferObject } from "../com-objects";
 import { lostSurfaceCount } from "../../../core/gpu/gpu-device-loss-contract";
+import { isValidAddress } from "../../../core/memory/address-guard";
 
 import { createTextureManager } from "./texture-manager";
 import { createDrawHandler } from "./draw-handler";
@@ -537,6 +538,47 @@ export function registerFastPathD3DFunctions(dispatcher: any, context: DDrawCont
                 if (lastD3D7Obj.getTexture(stage) !== texture) lastD3D7Obj.setTexture(stage, texture);
             }
         }, true);
+
+    // ============================================================================
+    // IDirect3DVertexBuffer_Lock / _Unlock — one PAIR per draw on the D3D7 dynamic-VB
+    // idiom (UE1: ~91 of each per frame). The bodies are a pointer write plus lock
+    // bookkeeping with no scheduler interaction, so every one of them was paying the
+    // whole slow-dispatch prologue for nothing. A bad pointer or a missing object
+    // returns null and falls through to the thunk, which keeps the diagnostics.
+    // ============================================================================
+    // Both interface generations share one body (d3d-impl aliases the v7 names onto the v6
+    // ones), but a fast path is bound per EXPORT NAME — registering only the v6 spelling
+    // left the v7 one, which is the generation a D3D7 title actually uses, on the slow tier.
+    const vbLockFast =
+        (cpu: any, mem: Uint8Array, _mem32: Uint32Array, view: DataView): number | null => {
+            const esp = cpu.reg32[4] >>> 0;
+            if (esp + 20 > mem.length) return null;
+            const thisPtr = view.getUint32(esp + 4, true);
+            const lplpData = view.getUint32(esp + 12, true);
+            const lpdwSize = view.getUint32(esp + 16, true);
+            if (!lplpData) return null;
+            const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DVertexBufferObject | null;
+            if (!obj) return null;
+            if (!isValidAddress(mem, lplpData, 4, "rw")) return null;
+            if (lpdwSize && !isValidAddress(mem, lpdwSize, 4, "rw")) return null;
+            view.setUint32(lplpData, obj.getDataPtr(), true);
+            if (lpdwSize) view.setUint32(lpdwSize, obj.getNumVertices() * obj.getVertexSize(), true);
+            obj.beginLock();
+            return D3D_OK;
+        };
+    const vbUnlockFast =
+        (cpu: any, mem: Uint8Array, _mem32: Uint32Array, view: DataView): number | null => {
+            const esp = cpu.reg32[4] >>> 0;
+            if (esp + 8 > mem.length) return null;
+            const obj = resourceProvider.getComObjectByAddress(view.getUint32(esp + 4, true)) as Direct3DVertexBufferObject | null;
+            if (!obj) return null;   // a foreign/double Unlock must reach the thunk that reports it
+            obj.endLock();
+            return D3D_OK;
+        };
+    for (const iface of ['IDirect3DVertexBuffer', 'IDirect3DVertexBuffer7']) {
+        dispatcher.registerFastPath('ddraw', `${iface}_Lock`, vbLockFast);
+        dispatcher.registerFastPath('ddraw', `${iface}_Unlock`, vbUnlockFast);
+    }
 
     Logger.log(LogCategory.DDRAW, 'Registered Tier-0 write-buffer stubs for D3D SetRenderState/SetTextureStageState/SetTexture');
 }
