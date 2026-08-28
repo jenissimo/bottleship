@@ -11,6 +11,7 @@ import { BaseComObject, ComObjectFactory } from "../../core/com/base-com-object"
 import { SystemResourceProvider } from "../../core/resources/system-resource-provider";
 import { Mem } from "../../core/memory/mem-accessor";
 import { Marshaler } from "../../core/memory/marshaler";
+import { isValidAddress } from "../../core/memory/address-guard";
 
 import { allocateComObject } from "../../core/com/com-memory";
 import { encodeAnsi } from "../codepage-utils";
@@ -25,7 +26,7 @@ import { DIK_TO_VK, vkToDik } from "./dinput-vk-dik";
 import { resetLosableDevices, trackLosableDevice, untrackLosableDevice } from "./device-presence";
 import { clearExclusiveMouseOwners, setExclusiveMouseOwner } from "../../core/pointer-policy";
 import { GUEST_INPUT_FLAG } from "../../../input/sab-layout";
-import { DInputNotifyRegistry, DI_OK, DIERR_INVALIDPARAM } from "./dinput-notify";
+import { DInputNotifyRegistry, DI_OK, DIERR_INVALIDPARAM, DI_NOEFFECT } from "./dinput-notify";
 import { GAMEPAD_BUTTONS, POV_CENTERED, gamepadPovAngle } from "./emulated-gamepad";
 
 // DirectInput error codes (HRESULT = MAKE_HRESULT(ERROR, FACILITY_WIN32, win32err))
@@ -943,6 +944,20 @@ export class DInput implements IModule {
 
         this.exports["IDirectInputDeviceA_Acquire"] = (ctx, mem, args) => {
             const device = this.getDevice(args[0]);
+            // Already acquired: answer DI_NOEFFECT (Wine: dinput_device_Acquire) and skip the
+            // acquisition side effects below — re-running them per call is NOT a no-op, since
+            // the mouse re-baseline discards the motion accumulated since the last frame and a
+            // guest that re-Acquires before each read loses that movement.
+            //
+            // The host-side exclusive claim is the exception and is re-asserted: real
+            // DirectInput needs no repeat because nothing revokes the claim behind its back,
+            // whereas ours can be dropped by a host focus change — so a guest's repeated
+            // Acquire was silently keeping it alive, and skipping it took the cursor with it.
+            // Idempotent, so re-asserting costs nothing.
+            if (device?.acquired && !device.inputLost) {
+                if (device.deviceType === "mouse") setExclusiveMouseOwner(device, device.exclusive);
+                return DI_NOEFFECT;
+            }
             if (device) {
                 device.acquired = true;
                 device.inputLost = false; // re-Acquire is how an app clears DIERR_INPUTLOST
@@ -1119,127 +1134,8 @@ export class DInput implements IModule {
             return DI_OK;
         };
 
-        this.exports["IDirectInputDeviceA_GetDeviceState"] = (ctx, mem, args) => {
-            const thisPtr = args[0];
-            const cbData = args[1];
-            const lpvData = args[2];
-            if (!lpvData || cbData === 0) return DIERR_INVALIDPARAM;
-
-            const device = this.getDevice(thisPtr);
-            if (device && !device.acquired) {
-                Logger.warn(LogCategory.SYSTEM, `IDirectInputDeviceA_GetDeviceState: not acquired this=0x${thisPtr.toString(16)}`);
-                return DIERR_NOTACQUIRED;
-            }
-            if (device?.inputLost) return DIERR_INPUTLOST;
-
-            const inputManager = System.getInstance().inputManager;
-            const format = device?.dataFormat ?? device?.deviceType ?? "unknown";
-            Logger.verbose(LogCategory.SYSTEM, `IDirectInputDeviceA_GetDeviceState: this=0x${thisPtr.toString(16)} cbData=${cbData} format=${format}`);
-
-            if (format === "keyboard" || cbData === DIKEYBOARDSTATE_SIZE) {
-                inputManager.noteGuestInputFlag(GUEST_INPUT_FLAG.dinputKeyboard);
-                const keyStates = inputManager.getKeyboardStateVk();
-                mem.fill(0, lpvData, lpvData + Math.min(cbData, DIKEYBOARDSTATE_SIZE));
-                for (let vk = 0; vk < keyStates.length; vk++) {
-                    if (!keyStates[vk]) continue;
-                    const dik = vkToDik(vk);
-                    if (dik !== null && dik < cbData) {
-                        mem[lpvData + dik] = keyStates[vk];
-                    }
-                }
-                return DI_OK;
-            }
-
-            if (format === "mouse" || cbData === DIMOUSESTATE_SIZE || cbData === DIMOUSESTATE2_SIZE) {
-                if (cbData < DIMOUSESTATE_SIZE) return DIERR_INVALIDPARAM;
-
-                const freshMem = this.getMemory();
-                const view = new DataView(freshMem.buffer, freshMem.byteOffset, freshMem.byteLength);
-                const mouse = inputManager.getMouseState();
-                let dx = 0;
-                let dy = 0;
-
-                if (device) {
-                    // Use a running signed accumulator (SAB slots 14/15) populated by
-                    // App.tsx on every pointermove event (both pointer-lock and absolute).
-                    // Delta = (currentAccum - lastSeenAccum) | 0  handles Int32 wrap.
-                    // This avoids the edge-clamping bug of (mouse.x - lastMouseX) where
-                    // mouse.x saturates at [0, width-1] in pointer-lock mode.
-                    const accum = inputManager.getDInputAccum();
-                    inputManager.noteGuestRelativeMouseRead();
-                    if (device.mouseInitialized) {
-                        dx = (accum.x - device.lastDInputAccumX) | 0;
-                        dy = (accum.y - device.lastDInputAccumY) | 0;
-                    }
-                    device.lastDInputAccumX = accum.x;
-                    device.lastDInputAccumY = accum.y;
-                    device.lastMouseX = mouse.x;
-                    device.lastMouseY = mouse.y;
-                    device.mouseInitialized = true;
-                }
-
-                // Write DIMOUSESTATE into guest memory (use fresh mem — v86 may reallocate)
-                const curMem = this.getMemory();
-                const curView = new DataView(curMem.buffer, curMem.byteOffset, curMem.byteLength);
-                curView.setInt32(lpvData, dx, true);      // lX
-                curView.setInt32(lpvData + 4, dy, true);   // lY
-                curView.setInt32(lpvData + 8, inputManager.consumeDInputWheel(), true); // lZ
-
-                // Browser buttons bitmask: 1=L, 2=R, 4=M, 8=X1(back), 16=X2(forward).
-                // Immediate mode reports the LEVEL — but a press the host published and
-                // released between two of these calls never had a level for us to report,
-                // so the latch carries that edge in for exactly one read PER DEVICE
-                // (readMouseButtons). A press held across calls is unaffected.
-                const buttons = this.readMouseButtons(device);
-                curMem[lpvData + 12] = (buttons & 1) ? 0x80 : 0x00;  // Left
-                curMem[lpvData + 13] = (buttons & 2) ? 0x80 : 0x00;  // Right
-                curMem[lpvData + 14] = (buttons & 4) ? 0x80 : 0x00;  // Middle
-                curMem[lpvData + 15] = (buttons & 8) ? 0x80 : 0x00;  // X1
-
-                // DIMOUSESTATE2 — 4 extra buttons
-                if (cbData >= DIMOUSESTATE2_SIZE) {
-                    curMem[lpvData + 16] = (buttons & 16) ? 0x80 : 0x00; // X2
-                    curMem[lpvData + 17] = 0x00;
-                    curMem[lpvData + 18] = 0x00;
-                    curMem[lpvData + 19] = 0x00;
-                }
-
-                return DI_OK;
-            }
-
-            if (format === "gamepad" || format === "joystick" || cbData >= DIJOYSTATE_SIZE) {
-                if (cbData < DIJOYSTATE_SIZE) return DIERR_INVALIDPARAM;
-                const freshMem = this.getMemory();
-                const view = new DataView(freshMem.buffer, freshMem.byteOffset, freshMem.byteLength);
-                mem.fill(0, lpvData, lpvData + DIJOYSTATE_SIZE);
-                inputManager.noteGuestGamepadRead();
-                const gamepad = inputManager.getGamepadState();
-                const axes = gamepad.axes;
-                view.setInt32(lpvData, axes[0], true);
-                view.setInt32(lpvData + 4, axes[1], true);
-                view.setInt32(lpvData + 8, 0, true);
-                view.setInt32(lpvData + 12, axes[2], true);
-                view.setInt32(lpvData + 16, axes[3], true);
-                view.setInt32(lpvData + 20, 0, true);
-                view.setUint32(lpvData + 24, 0, true);
-                view.setUint32(lpvData + 28, 0, true);
-                const buttonsMask = gamepad.connected ? gamepad.buttons : 0;
-                // rgdwPOV[0] is the d-pad; the pad has one hat, so the other three stay
-                // centred (DIDEVCAPS.dwPOVs says one, and the two must agree).
-                view.setUint32(lpvData + 32, gamepadPovAngle(buttonsMask), true);
-                view.setUint32(lpvData + 36, POV_CENTERED, true);
-                view.setUint32(lpvData + 40, POV_CENTERED, true);
-                view.setUint32(lpvData + 44, POV_CENTERED, true);
-
-                for (let i = 0; i < GAMEPAD_BUTTONS; i++) {
-                    mem[lpvData + 48 + i] = (buttonsMask & (1 << i)) ? 0x80 : 0x00;
-                }
-                return DI_OK;
-            }
-
-            mem.fill(0, lpvData, lpvData + cbData);
-            return DI_OK;
-        };
+        this.exports["IDirectInputDeviceA_GetDeviceState"] = (ctx, mem, args) =>
+            this.getDeviceStateImpl(mem, args[0], args[1], args[2]);
 
         // IDirectInputDeviceA IUnknown methods
         this.exports["IDirectInputDeviceA_QueryInterface"] = (ctx, mem, args) => {
@@ -1858,6 +1754,8 @@ export class DInput implements IModule {
         this.exports["IDirectInputDevice8W_BuildActionMap"] = this.exports["IDirectInputDevice8A_BuildActionMap"];
         this.exports["IDirectInputDevice8W_SetActionMap"] = this.exports["IDirectInputDevice8A_SetActionMap"];
         this.exports["IDirectInputDevice8W_GetImageInfo"] = this.exports["IDirectInputDevice8A_GetImageInfo"];
+
+        this.registerFastPaths(process.dispatcher);
     }
 
     // Create an IDirectInputDevice8A/W COM object of the given type, mapped into guest memory.
@@ -2271,6 +2169,154 @@ export class DInput implements IModule {
 
     private getMemory(): Uint8Array {
         return this.process.getCurrentMemory();
+    }
+
+    /**
+     * IDirectInputDevice*::GetDeviceState — immediate-mode device state.
+     *
+     * The body lives here rather than in the export because it is one of the hottest
+     * thunks a title issues and therefore also has a fast path; both tiers call this so
+     * they cannot answer differently.
+     */
+    private getDeviceStateImpl(mem: Uint8Array, thisPtr: number, cbData: number, lpvData: number): number {
+        if (!lpvData || cbData === 0) return DIERR_INVALIDPARAM;
+
+        const device = this.getDevice(thisPtr);
+        if (device && !device.acquired) {
+            Logger.warn(LogCategory.SYSTEM, `IDirectInputDeviceA_GetDeviceState: not acquired this=0x${thisPtr.toString(16)}`);
+            return DIERR_NOTACQUIRED;
+        }
+        if (device?.inputLost) return DIERR_INPUTLOST;
+
+        const inputManager = System.getInstance().inputManager;
+        const format = device?.dataFormat ?? device?.deviceType ?? "unknown";
+        Logger.verboseLazy(LogCategory.SYSTEM, () => `IDirectInputDeviceA_GetDeviceState: this=0x${thisPtr.toString(16)} cbData=${cbData} format=${format}`);
+
+        if (format === "keyboard" || cbData === DIKEYBOARDSTATE_SIZE) {
+            inputManager.noteGuestInputFlag(GUEST_INPUT_FLAG.dinputKeyboard);
+            const keyStates = inputManager.getKeyboardStateVk();
+            mem.fill(0, lpvData, lpvData + Math.min(cbData, DIKEYBOARDSTATE_SIZE));
+            for (let vk = 0; vk < keyStates.length; vk++) {
+                if (!keyStates[vk]) continue;
+                const dik = vkToDik(vk);
+                if (dik !== null && dik < cbData) {
+                    mem[lpvData + dik] = keyStates[vk];
+                }
+            }
+            return DI_OK;
+        }
+
+        if (format === "mouse" || cbData === DIMOUSESTATE_SIZE || cbData === DIMOUSESTATE2_SIZE) {
+            if (cbData < DIMOUSESTATE_SIZE) return DIERR_INVALIDPARAM;
+
+            const mouse = inputManager.getMouseState();
+            let dx = 0;
+            let dy = 0;
+
+            if (device) {
+                // Use a running signed accumulator (SAB slots 14/15) populated by
+                // App.tsx on every pointermove event (both pointer-lock and absolute).
+                // Delta = (currentAccum - lastSeenAccum) | 0  handles Int32 wrap.
+                // This avoids the edge-clamping bug of (mouse.x - lastMouseX) where
+                // mouse.x saturates at [0, width-1] in pointer-lock mode.
+                const accum = inputManager.getDInputAccum();
+                if (device.mouseInitialized) {
+                    dx = (accum.x - device.lastDInputAccumX) | 0;
+                    dy = (accum.y - device.lastDInputAccumY) | 0;
+                }
+                inputManager.noteGuestRelativeMouseRead(dx, dy);
+                device.lastDInputAccumX = accum.x;
+                device.lastDInputAccumY = accum.y;
+                device.lastMouseX = mouse.x;
+                device.lastMouseY = mouse.y;
+                device.mouseInitialized = true;
+            }
+
+            // Write DIMOUSESTATE into guest memory (use fresh mem — v86 may reallocate)
+            const curMem = this.getMemory();
+            const curView = new DataView(curMem.buffer, curMem.byteOffset, curMem.byteLength);
+            curView.setInt32(lpvData, dx, true);      // lX
+            curView.setInt32(lpvData + 4, dy, true);   // lY
+            curView.setInt32(lpvData + 8, inputManager.consumeDInputWheel(), true); // lZ
+
+            // Browser buttons bitmask: 1=L, 2=R, 4=M, 8=X1(back), 16=X2(forward).
+            // Immediate mode reports the LEVEL — but a press the host published and
+            // released between two of these calls never had a level for us to report,
+            // so the latch carries that edge in for exactly one read PER DEVICE
+            // (readMouseButtons). A press held across calls is unaffected.
+            const buttons = this.readMouseButtons(device);
+            curMem[lpvData + 12] = (buttons & 1) ? 0x80 : 0x00;  // Left
+            curMem[lpvData + 13] = (buttons & 2) ? 0x80 : 0x00;  // Right
+            curMem[lpvData + 14] = (buttons & 4) ? 0x80 : 0x00;  // Middle
+            curMem[lpvData + 15] = (buttons & 8) ? 0x80 : 0x00;  // X1
+
+            // DIMOUSESTATE2 — 4 extra buttons
+            if (cbData >= DIMOUSESTATE2_SIZE) {
+                curMem[lpvData + 16] = (buttons & 16) ? 0x80 : 0x00; // X2
+                curMem[lpvData + 17] = 0x00;
+                curMem[lpvData + 18] = 0x00;
+                curMem[lpvData + 19] = 0x00;
+            }
+
+            return DI_OK;
+        }
+
+        if (format === "gamepad" || format === "joystick" || cbData >= DIJOYSTATE_SIZE) {
+            if (cbData < DIJOYSTATE_SIZE) return DIERR_INVALIDPARAM;
+            const freshMem = this.getMemory();
+            const view = new DataView(freshMem.buffer, freshMem.byteOffset, freshMem.byteLength);
+            mem.fill(0, lpvData, lpvData + DIJOYSTATE_SIZE);
+            inputManager.noteGuestGamepadRead();
+            const gamepad = inputManager.getGamepadState();
+            const axes = gamepad.axes;
+            view.setInt32(lpvData, axes[0], true);
+            view.setInt32(lpvData + 4, axes[1], true);
+            view.setInt32(lpvData + 8, 0, true);
+            view.setInt32(lpvData + 12, axes[2], true);
+            view.setInt32(lpvData + 16, axes[3], true);
+            view.setInt32(lpvData + 20, 0, true);
+            view.setUint32(lpvData + 24, 0, true);
+            view.setUint32(lpvData + 28, 0, true);
+            const buttonsMask = gamepad.connected ? gamepad.buttons : 0;
+            // rgdwPOV[0] is the d-pad; the pad has one hat, so the other three stay
+            // centred (DIDEVCAPS.dwPOVs says one, and the two must agree).
+            view.setUint32(lpvData + 32, gamepadPovAngle(buttonsMask), true);
+            view.setUint32(lpvData + 36, POV_CENTERED, true);
+            view.setUint32(lpvData + 40, POV_CENTERED, true);
+            view.setUint32(lpvData + 44, POV_CENTERED, true);
+
+            for (let i = 0; i < GAMEPAD_BUTTONS; i++) {
+                mem[lpvData + 48 + i] = (buttonsMask & (1 << i)) ? 0x80 : 0x00;
+            }
+            return DI_OK;
+        }
+
+        mem.fill(0, lpvData, lpvData + cbData);
+        return DI_OK;
+    }
+
+    /**
+     * GetDeviceState is a per-frame poll on every interface variant, so it gets the
+     * fast-path tier. The handler only reads input state and writes the caller's own
+     * buffer — it cannot park or switch a thread — hence `trivial`.
+     */
+    private registerFastPaths(dispatcher: any): void {
+        if (!dispatcher || typeof dispatcher.registerFastPath !== 'function') return;
+        const getDeviceState = (cpu: any, mem8: Uint8Array, _mem32: Uint32Array, view: DataView): number | null => {
+            const esp = cpu.reg32[4] >>> 0;
+            if (esp + 16 > mem8.length) return null;
+            const thisPtr = view.getUint32(esp + 4, true) >>> 0;
+            const cbData = view.getUint32(esp + 8, true) >>> 0;
+            const lpvData = view.getUint32(esp + 12, true) >>> 0;
+            // Decline before any side effect unless the WHOLE destination is a writable
+            // guest region — every branch below writes inside [lpvData, lpvData+cbData).
+            // The slow path is then free to answer exactly as it always has.
+            if (lpvData && cbData && !isValidAddress(mem8, lpvData, cbData, "rw")) return null;
+            return this.getDeviceStateImpl(mem8, thisPtr, cbData, lpvData);
+        };
+        for (const iface of ["IDirectInputDeviceA", "IDirectInputDevice2A", "IDirectInputDevice8A", "IDirectInputDevice8W"]) {
+            dispatcher.registerFastPath("dinput", `${iface}_GetDeviceState`, getDeviceState, { trivial: true });
+        }
     }
 
 

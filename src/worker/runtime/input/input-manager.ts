@@ -1240,6 +1240,11 @@ export class InputManager {
             },
             cursor: { x: this.currentMouseX, y: this.currentMouseY, buttons: this.currentButtons },
             relativeMouse: this.relativeMousePosture(),
+            immediateMouse: {
+                reads: this.guestRelativeMouseReads,
+                deltaDelivered: this.guestRelativeMouseDelta,
+                lastDelta: { ...this.guestRelativeMouseLast },
+            },
             trail: this.dinputTrail.slice(),
         };
     }
@@ -1414,8 +1419,21 @@ export class InputManager {
 
     /** A guest read of the relative axes (dinput GetDeviceState / action-map poll).
      *  Stamped by the GUEST paths only — our own buffering calls getDInputAccum too. */
-    noteGuestRelativeMouseRead(): void {
+    /** Total |dx|+|dy| actually HANDED to the guest through the immediate DI mouse state,
+     *  and the last non-zero pair. A snapshot of the guest's own DIMOUSESTATE cannot answer
+     *  "did the delta arrive": the guest polls at frame rate and takes the motion on the
+     *  first read, so every later look sees the zeros that follow. This counts the handoff
+     *  itself, which is not a race. */
+    private guestRelativeMouseDelta = 0;
+    private guestRelativeMouseLast: { dx: number; dy: number } = { dx: 0, dy: 0 };
+
+    noteGuestRelativeMouseRead(dx = 0, dy = 0): void {
         this.guestRelativeMouseReads++;
+        const moved = Math.abs(dx) + Math.abs(dy);
+        if (moved > 0) {
+            this.guestRelativeMouseDelta += moved;
+            this.guestRelativeMouseLast = { dx, dy };
+        }
     }
 
     /**

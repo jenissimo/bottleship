@@ -9,6 +9,12 @@
  */
 
 export const DI_OK = 0x00000000;
+/** S_FALSE. Acquire() on an ALREADY-acquired device answers this and does nothing else
+ *  (Wine dinput_device_Acquire; dinput.h DI_NOEFFECT). It is a SUCCESS code, so a caller
+ *  that only checks FAILED() is unaffected — but one that re-Acquires every frame (CryEngine's
+ *  CryInput does, right before each GetDeviceState) uses it to tell "still mine" from
+ *  "just re-taken", and answering DI_OK makes every frame look like a fresh acquisition. */
+export const DI_NOEFFECT = 0x00000001;
 export const DIERR_INVALIDPARAM = 0x80070057;
 /** MAKE_HRESULT(SEVERITY_ERROR, FACILITY_WIN32, ERROR_BUSY) — dinput.h DIERR_ACQUIRED. */
 export const DIERR_ACQUIRED = 0x800700aa;

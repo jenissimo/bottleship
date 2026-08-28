@@ -15,6 +15,48 @@ import {
 } from './shared-state';
 import { GUEST_INPUT_FLAG } from '../../../input/sab-layout';
 
+// The three polled key readers are the hottest thunks any title issues (a per-frame
+// input poll, millions of calls over a session), so each has a fast path. The bodies
+// live here, once, so the two tiers cannot answer differently.
+
+/** GetAsyncKeyState: SAB level + the poll()-maintained pressed-since edge bit. */
+function readAsyncKeyState(vKey: number): number {
+    const inputManager = System.getInstance().inputManager;
+    // Level read straight from the SAB bitfield (fresh-at-call, no poll() lag);
+    // the pressed-since edge bit stays poll()-maintained.
+    const isPressed = inputManager.readKeyLevelFromSab(vKey);
+    const wasPressedSince = inputManager.consumeKeyPressedSince(vKey);
+    const result = (isPressed ? 0x8000 : 0) | (wasPressedSince ? 0x0001 : 0);
+
+    inputManager.noteGuestKeyRead(vKey, isPressed);
+    return result;
+}
+
+/** GetKeyState: synchronous level + toggle bit. */
+function readKeyState(nVirtKey: number): number {
+    const inputManager = System.getInstance().inputManager;
+    const result = inputManager.getKeyState(nVirtKey);
+    inputManager.noteGuestKeyRead(nVirtKey, (result & 0x8000) !== 0);
+    return result;
+}
+
+// Reused across calls: the packed table is host-side scratch handed straight to
+// Mem.writeBytes, never retained by anyone.
+const packedKeyboardState = new Uint8Array(256);
+
+/** GetKeyboardState: 256 packed VK bytes into a guest buffer. Returns BOOL. */
+function readKeyboardState(lpKeyState: number): number {
+    const inputManager = System.getInstance().inputManager;
+    for (let vk = 0; vk < 256; vk++) {
+        const state = inputManager.getKeyState(vk);
+        packedKeyboardState[vk] = ((state & 0x8000) ? 0x80 : 0) | (state & 0x01);
+    }
+
+    inputManager.noteGuestInputFlag(GUEST_INPUT_FLAG.bulkKeyboard);
+    const written = Mem.writeBytes(lpKeyState, packedKeyboardState);
+    return written === packedKeyboardState.length ? 1 : 0;
+}
+
 export function createInputExports(): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
     const ERROR_INVALID_WINDOW_HANDLE = 1400;
@@ -54,49 +96,24 @@ export function createInputExports(): Record<string, ThunkImplementation> {
 
     exports['GetAsyncKeyState'] = (ctx, mem, args) => {
         const vKey = args[0] & 0xFF;
-
-        Logger.verbose(LogCategory.USER32, `GetAsyncKeyState(${vKey})`);
-
-        const inputManager = System.getInstance().inputManager;
-        // Level read straight from the SAB bitfield (fresh-at-call, no poll() lag);
-        // the pressed-since edge bit stays poll()-maintained.
-        const isPressed = inputManager.readKeyLevelFromSab(vKey);
-        const wasPressedSince = inputManager.consumeKeyPressedSince(vKey);
-        const result = (isPressed ? 0x8000 : 0) | (wasPressedSince ? 0x0001 : 0);
-
-        inputManager.noteGuestKeyRead(vKey, isPressed);
-        return result;
+        Logger.verboseLazy(LogCategory.USER32, () => `GetAsyncKeyState(${vKey})`);
+        return readAsyncKeyState(vKey);
     };
 
     exports['GetKeyState'] = (ctx, mem, args) => {
         const nVirtKey = args[0] & 0xFF;
-
-        Logger.verbose(LogCategory.USER32, `GetKeyState(${nVirtKey})`);
-
-        const inputManager = System.getInstance().inputManager;
-        const result = inputManager.getKeyState(nVirtKey);
-        inputManager.noteGuestKeyRead(nVirtKey, (result & 0x8000) !== 0);
-        return result;
+        Logger.verboseLazy(LogCategory.USER32, () => `GetKeyState(${nVirtKey})`);
+        return readKeyState(nVirtKey);
     };
 
     exports['GetKeyboardState'] = (_ctx, _mem, args) => {
         const lpKeyState = args[0] >>> 0;
-        Logger.verbose(LogCategory.USER32, `GetKeyboardState(0x${lpKeyState.toString(16)})`);
+        Logger.verboseLazy(LogCategory.USER32, () => `GetKeyboardState(0x${lpKeyState.toString(16)})`);
 
         if (!lpKeyState) {
             return 0;
         }
-
-        const inputManager = System.getInstance().inputManager;
-        const packed = new Uint8Array(256);
-        for (let vk = 0; vk < 256; vk++) {
-            const state = inputManager.getKeyState(vk);
-            packed[vk] = ((state & 0x8000) ? 0x80 : 0) | (state & 0x01);
-        }
-
-        inputManager.noteGuestInputFlag(GUEST_INPUT_FLAG.bulkKeyboard);
-        const written = Mem.writeBytes(lpKeyState, packed);
-        return written === packed.length ? 1 : 0;
+        return readKeyboardState(lpKeyState);
     };
 
     exports['SetKeyboardState'] = (_ctx, mem, args) => {
@@ -688,4 +705,35 @@ export function registerFastPathInputFunctions(dispatcher: any): void {
             && current.right === next.right && current.bottom === next.bottom ? 1 : null;
     };
     dispatcher.registerFastPath('user32', 'ClipCursor', clipCursorNoop, { trivial: true });
+
+    // The polled key readers. `trivial` is safe for all three: they only read the input
+    // SAB and OR bookkeeping bits into it — no wait, no acquire, no path that can park or
+    // switch a thread — and the busy-wait detector they skip tracks only the three time
+    // thunks, so no yield decision is lost.
+    const asyncKeyState: FastPathImplementation = (cpu: any, mem8: Uint8Array, _mem32: Uint32Array, view: DataView) => {
+        const esp = cpu.reg32[4] >>> 0;
+        if (esp + 8 > mem8.length) return null;
+        return readAsyncKeyState(view.getUint32(esp + 4, true) & 0xFF);
+    };
+    dispatcher.registerFastPath('user32', 'GetAsyncKeyState', asyncKeyState, { trivial: true });
+
+    const keyState: FastPathImplementation = (cpu: any, mem8: Uint8Array, _mem32: Uint32Array, view: DataView) => {
+        const esp = cpu.reg32[4] >>> 0;
+        if (esp + 8 > mem8.length) return null;
+        return readKeyState(view.getUint32(esp + 4, true) & 0xFF);
+    };
+    dispatcher.registerFastPath('user32', 'GetKeyState', keyState, { trivial: true });
+
+    const keyboardState: FastPathImplementation = (cpu: any, mem8: Uint8Array, _mem32: Uint32Array, view: DataView) => {
+        const esp = cpu.reg32[4] >>> 0;
+        if (esp + 8 > mem8.length) return null;
+        const lpKeyState = view.getUint32(esp + 4, true) >>> 0;
+        if (!lpKeyState) return 0;
+        // The whole 256-byte extent must fit before anything is observed: declining has
+        // to happen ahead of the bookkeeping bit readKeyboardState sets, or the slow path
+        // would set it a second time. The write itself is region-validated by Mem.
+        if (lpKeyState + 256 > mem8.length) return null;
+        return readKeyboardState(lpKeyState);
+    };
+    dispatcher.registerFastPath('user32', 'GetKeyboardState', keyboardState, { trivial: true });
 }
