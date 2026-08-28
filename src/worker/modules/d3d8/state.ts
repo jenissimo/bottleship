@@ -135,6 +135,12 @@ export function readD3DLight8(view: DataView, pLight: number): D3DLight7Data {
     return light;
 }
 
+/** One-shot: SetViewport now faithfully rejects a viewport that doesn't fit the active
+ *  render target (see the handler below) instead of silently clamping it. That can newly
+ *  surface a guest-side assert that expected native's D3DERR_INVALIDCALL here — this flag
+ *  makes sure the FIRST occurrence is loud instead of the guest just asserting cold. */
+let loggedViewportOverflow = false;
+
 export function createStateExports(): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
 
@@ -369,14 +375,32 @@ export function createStateExports(): Record<string, ThunkImplementation> {
 
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         const rt = device.activeRenderTarget;
-        const vp = sanitizeViewport({
+        const raw = {
             x: view.getUint32(pVP + 0, true),
             y: view.getUint32(pVP + 4, true),
             width: view.getUint32(pVP + 8, true),
             height: view.getUint32(pVP + 12, true),
             minZ: view.getFloat32(pVP + 16, true),
             maxZ: view.getFloat32(pVP + 20, true),
-        }, rt.width, rt.height);
+        };
+
+        // Wine dlls/d3d8/device.c:1782-1807 — a viewport that doesn't fit the active
+        // render target is D3DERR_INVALIDCALL on real D3D8, not silently clamped onto it
+        // (sanitizeViewport below is for internal callers — BeginScene/Reset/render-target
+        // switch — that legitimately want a forced-valid viewport, not this guest call).
+        if (raw.x > rt.width || raw.width > rt.width - raw.x ||
+            raw.y > rt.height || raw.height > rt.height - raw.y) {
+            if (!loggedViewportOverflow) {
+                loggedViewportOverflow = true;
+                Logger.error(LogCategory.SYSTEM,
+                    `D3D8 SetViewport(${raw.x},${raw.y} ${raw.width}x${raw.height}) does not fit ` +
+                    `render target ${rt.width}x${rt.height} -> D3DERR_INVALIDCALL ` +
+                    `(further occurrences of this diagnostic are suppressed)`);
+            }
+            return D3DERR_INVALIDCALL;
+        }
+
+        const vp = sanitizeViewport(raw, rt.width, rt.height);
         if (device.recordingStateBlock) {
             device.recordStateBlock({ op: 'viewport', vp });
             return D3D_OK;
@@ -766,6 +790,25 @@ export function createStateExports(): Record<string, ThunkImplementation> {
 
         const pRenderTarget = args[1] >>> 0;
         const pZStencil = args[2] >>> 0;
+
+        // Wine dlls/d3d8/device.c:1531-1609 — a depth-stencil smaller than the render
+        // target it will be paired with is rejected before either is bound. Resolve the
+        // target dims BEFORE the RT switch below: pRenderTarget==0 means the color target
+        // is left unchanged, so the check must run against whichever RT is about to be live.
+        if (pZStencil !== 0) {
+            const dsInfo = surfaceInfo.get(pZStencil);
+            if (!dsInfo) return D3DERR_INVALIDCALL;
+            const rtDims = pRenderTarget !== 0
+                ? (surfaceInfo.get(pRenderTarget)?.surface ?? device.activeRenderTarget)
+                : device.activeRenderTarget;
+            if (dsInfo.surface.width < rtDims.width || dsInfo.surface.height < rtDims.height) {
+                Logger.warn(LogCategory.SYSTEM,
+                    `D3D8 SetRenderTarget: depth-stencil 0x${pZStencil.toString(16)} ` +
+                    `${dsInfo.surface.width}x${dsInfo.surface.height} is smaller than render ` +
+                    `target ${rtDims.width}x${rtDims.height} -> D3DERR_INVALIDCALL`);
+                return D3DERR_INVALIDCALL;
+            }
+        }
 
         if (pRenderTarget !== 0) {
             const info = surfaceInfo.get(pRenderTarget);

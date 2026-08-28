@@ -55,6 +55,11 @@ export interface D3D8SurfaceInfo {
     d3dFormat: number;
     /** When set, resolveLockSurface() follows the live device back buffer. */
     role?: D3D8SurfaceRole;
+    /** D3DPOOL for a standalone surface (texturePtr==0) that isn't the back buffer —
+     *  e.g. CreateImageSurface's D3DPOOL_SYSTEMMEM. Texture-owned surfaces get their
+     *  pool from textureMeta instead; GetDesc falls back to this only when there's no
+     *  owning texture. */
+    pool?: number;
 }
 
 /** Device COM ptr -> cached IDirect3DSurface8 back-buffer wrapper. */

@@ -1,5 +1,9 @@
 import { Mem } from '../../core/memory/mem-accessor';
 import { D3D8_VS_VERSION, D3D8_PS_VERSION, D3D8_MAX_VS_CONST } from '../../backends/webgpu/d3d8/vsd-constants';
+import { getD3D9WebGpuCapabilityLimits } from '../../backends/webgpu/shared/webgpu-capability-limits';
+import { FFP_D3D8_IMPLEMENTED_OPS } from '../../backends/webgpu/ddraw/shader-generator';
+import { MAX_FFP_STAGES, MAX_FFP_SAMPLED_STAGES } from '../../backends/webgpu/ddraw/ffp-stages';
+import { D3DTOP_DISABLE } from '../ddraw/constants';
 
 // ============================================================================
 // Single source of truth for D3DCAPS8 (212 bytes — NOT D3DCAPS9's 304/332).
@@ -37,6 +41,22 @@ import { D3D8_VS_VERSION, D3D8_PS_VERSION, D3D8_MAX_VS_CONST } from '../../backe
 // ============================================================================
 
 const D3DCAPS8_SIZE = 212;
+const CONSERVATIVE_MAX_TEXTURE_DIMENSION_2D = 4096;
+
+/**
+ * TextureOpCaps, derived from `FFP_D3D8_IMPLEMENTED_OPS` (shader-generator.ts) instead of a
+ * hand-maintained hex literal — the bug this closes: the old `0x03FEFFFF & ~(...)` literal was
+ * copy-pasted from d3d9/caps.ts (where every one of those ops really is implemented) and
+ * advertised 8 D3D8 ops the shared DDraw/D3D8 combiner silently substituted with MODULATE.
+ * D3DTEXOPCAPS_<op> == 1 << (op - 1) (d3d8caps.h); DISABLE is handled by the stage cascade
+ * before the combiner runs (see FFP_D3D8_IMPLEMENTED_OPS's own comment) but is trivially
+ * "supported", so it is OR'd in separately rather than added to that set.
+ */
+function computeTextureOpCaps(implementedOps: ReadonlySet<number>): number {
+    let caps = 1 << (D3DTOP_DISABLE - 1);
+    for (const op of implementedOps) caps |= 1 << (op - 1);
+    return caps >>> 0;
+}
 
 export function writeDeviceCaps8(pCaps: number, mem: Uint8Array): boolean {
     if (!pCaps) return false;
@@ -44,6 +64,10 @@ export function writeDeviceCaps8(pCaps: number, mem: Uint8Array): boolean {
     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
     const u32 = (off: number, v: number) => view.setUint32(pCaps + off, v >>> 0, true);
     const f32 = (off: number, v: number) => view.setFloat32(pCaps + off, v, true);
+    const maxTextureDimension2D = Math.min(
+        CONSERVATIVE_MAX_TEXTURE_DIMENSION_2D,
+        getD3D9WebGpuCapabilityLimits()?.maxTextureDimension2D ?? CONSERVATIVE_MAX_TEXTURE_DIMENSION_2D,
+    );
 
     // A/B kill switch: revert to the pre-2026-07-08 minimal caps (most fields 0).
     // Set via harness `setWorkerFlag('__caps8Legacy', true)` BEFORE the game load —
@@ -59,8 +83,8 @@ export function writeDeviceCaps8(pCaps: number, mem: Uint8Array): boolean {
         u32(48, 0x00001FFF);
         u32(60, 0x0001FFD3);
         u32(64, 0x07070700);
-        u32(88, 4096);
-        u32(92, 4096);
+        u32(88, maxTextureDimension2D);
+        u32(92, maxTextureDimension2D);
         u32(108, 16);
         u32(148, 8);
         u32(152, 8);
@@ -127,11 +151,13 @@ export function writeDeviceCaps8(pCaps: number, mem: Uint8Array): boolean {
     u32(76, 0x0000003F);    // TextureAddressCaps: WRAP|MIRROR|CLAMP|BORDER|INDEPENDENTUV|MIRRORONCE
     u32(80, 0x00000000);    // VolumeTextureAddressCaps: no volume textures
     u32(84, 0x0000001F);    // LineCaps: TEXTURE|ZTEST|BLEND|ALPHACMP|FOG
-    u32(88, 4096);          // MaxTextureWidth
-    u32(92, 4096);          // MaxTextureHeight
+    u32(88, maxTextureDimension2D); // MaxTextureWidth: live WebGPU limit or conservative pre-device bound
+    u32(92, maxTextureDimension2D); // MaxTextureHeight
     u32(96, 0);             // MaxVolumeExtent: no volume textures (see TextureCaps)
     u32(100, 8192);         // MaxTextureRepeat
-    u32(104, 8192);         // MaxTextureAspectRatio
+    // MaxTextureAspectRatio is a RATIO (width:height), not a dimension — no WebGPU limit
+    // constrains it, and DX8-era hardware reported the same large bound as MaxTextureRepeat.
+    u32(104, 8192);
     u32(108, 16);           // MaxAnisotropy
     f32(112, 1e10);         // MaxVertexW
     f32(116, -32768.0);     // GuardBandLeft
@@ -140,11 +166,23 @@ export function writeDeviceCaps8(pCaps: number, mem: Uint8Array): boolean {
     f32(128, 32768.0);      // GuardBandBottom
     u32(136, 0x000000FF);   // StencilCaps: KEEP|ZERO|REPLACE|INCRSAT|DECRSAT|INVERT|INCR|DECR
     u32(140, 0x00100008);   // FVFCaps: 8 texcoord sets | PSIZE
-    // TextureOpCaps: full GeForce-class op set minus PREMODULATE (matches the
-    // real-hardware d3d9 dump; our shared FFP stage resolver implements these).
-    u32(144, 0x03FEFFFF);
-    u32(148, 8);            // MaxTextureBlendStages
-    u32(152, 8);            // MaxSimultaneousTextures
+    // TextureOpCaps: computed from what the shader actually implements (see
+    // computeTextureOpCaps above) — PREMODULATE and the two bump operators are the only
+    // gaps left (the shared FFP stage resolver has no bump-env coordinate plumbing, and
+    // PREMODULATE needs the NEXT stage's texture, which a stage-local combiner can't reach).
+    u32(144, computeTextureOpCaps(FFP_D3D8_IMPLEMENTED_OPS));
+    // MaxTextureBlendStages (cascade depth, incl. pure-arithmetic CURRENT/TFACTOR/DIFFUSE
+    // stages) and MaxSimultaneousTextures (stages that can bind+sample a texture) are
+    // DELIBERATELY different caps here, sourced from the same constants the FFP stage
+    // resolver enforces (ffp-stages.ts) so they cannot drift back into a false-capability
+    // pair: a stage >= MAX_FFP_SAMPLED_STAGES that references D3DTA_TEXTURE terminates the
+    // whole cascade (ffp-stages.ts's cascade-termination rule), so advertising more
+    // simultaneous textures than the resolver can actually sample let a >=4-texture-stage
+    // engine silently lose every stage above the cap with no error. A stage that stays pure
+    // arithmetic (CURRENT/TFACTOR/DIFFUSE only) genuinely keeps running up to
+    // MAX_FFP_STAGES, so that half of the old "8" was true and is kept.
+    u32(148, MAX_FFP_STAGES);          // MaxTextureBlendStages
+    u32(152, MAX_FFP_SAMPLED_STAGES);  // MaxSimultaneousTextures
     u32(156, 0x0000003B);   // VertexProcessingCaps: TEXGEN|MATERIALSOURCE7|DIR|POS lights|LOCALVIEWER
     u32(160, 8);            // MaxActiveLights (FFP supports 8)
     u32(164, 0);            // MaxUserClipPlanes: not implemented in WGSL — honest 0

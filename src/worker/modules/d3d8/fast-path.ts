@@ -26,6 +26,11 @@ import { devices, resourceToDevice } from './shared-state';
 import { validateLockRange } from './resources';
 import { readD3DLight8 } from './state';
 import { D3D8_MAX_STREAMS } from '../../backends/webgpu/d3d8/vsd-constants';
+import {
+    peekDxDepthStencilMatch,
+    peekDxDeviceFormat,
+    peekDxDeviceMultiSampleType,
+} from '../../backends/webgpu/shared/dx-format-support';
 
 const D3D_OK = 0;
 const D3DERR_INVALIDCALL = 0x8876086c;
@@ -33,6 +38,46 @@ const D3DLIGHT8_SIZE = 104;
 
 export function registerFastPathD3D8Functions(dispatcher: any): void {
     if (!dispatcher || typeof dispatcher.registerFastPath !== 'function') return;
+
+    // Debug no-op of the D3D8 debug runtime; retail does nothing with it. A constant-return
+    // stub answers it in guest code with no trap at all. cdecl => the caller cleans the stack.
+    if (typeof dispatcher.registerConstantReturnStub === 'function') {
+        dispatcher.registerConstantReturnStub('d3d8', 'DebugSetMute', 0, 0);
+    }
+
+    // ── Capability queries (memo hits only) ──────────────────────────────────
+    // Pure in their args and the runtime capability contracts; Max Payne re-asks them ~5K
+    // times at boot. A MISS returns null so the first call for each key still takes the full
+    // thunk (which logs it). Kill-switch (A/B, boot-time): globalThis.__noCapsMemo.
+    if (!(globalThis as any).__noCapsMemo) {
+        // CheckDeviceFormat(this, Adapter, DeviceType, AdapterFormat, Usage, RType, CheckFormat)
+        dispatcher.registerFastPath('d3d8', 'IDirect3D8_CheckDeviceFormat',
+            (cpu: any, _mem: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
+                const esp = cpu.reg32[4];
+                return peekDxDeviceFormat(8,
+                    view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 16, true),
+                    view.getUint32(esp + 20, true), view.getUint32(esp + 24, true), view.getUint32(esp + 28, true));
+            }, { trivial: true });
+
+        // CheckDeviceMultiSampleType(this, Adapter, DeviceType, SurfaceFormat, Windowed,
+        //                            MultiSampleType) — D3D8 has no pQualityLevels out-param.
+        dispatcher.registerFastPath('d3d8', 'IDirect3D8_CheckDeviceMultiSampleType',
+            (cpu: any, _mem: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
+                const esp = cpu.reg32[4];
+                return peekDxDeviceMultiSampleType(8,
+                    view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 16, true),
+                    view.getUint32(esp + 20, true), view.getUint32(esp + 24, true));
+            }, { trivial: true });
+
+        // CheckDepthStencilMatch(this, Adapter, DeviceType, AdapterFormat, RTFormat, DSFormat)
+        dispatcher.registerFastPath('d3d8', 'IDirect3D8_CheckDepthStencilMatch',
+            (cpu: any, _mem: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
+                const esp = cpu.reg32[4];
+                return peekDxDepthStencilMatch(8,
+                    view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 16, true),
+                    view.getUint32(esp + 20, true), view.getUint32(esp + 24, true));
+            }, { trivial: true });
+    }
 
     // IDirect3DDevice8_SetRenderState(this, State, Value)
     dispatcher.registerFastPath('d3d8', 'IDirect3DDevice8_SetRenderState',

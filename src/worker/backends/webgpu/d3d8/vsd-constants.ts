@@ -34,6 +34,14 @@ export const D3DVSD_SKIPCOUNTMASK = 0xf << D3DVSD_SKIPCOUNTSHIFT;
 export const D3DVSD_VERTEXREGSHIFT = 0;
 export const D3DVSD_VERTEXREGMASK = 0x1f << D3DVSD_VERTEXREGSHIFT;
 
+/** D3DVSD_CONSTMEM token fields (d3d8types.h): D3DVSD_CONST(ConstantAddress, Count) =
+ *  MAKETOKENTYPE(CONSTMEM) | (Count << CONSTCOUNTSHIFT) | ConstantAddress. Each of the
+ *  `Count` constants is 4 DWORDs (a vec4) immediately following the token in the stream. */
+export const D3DVSD_CONSTADDRESSSHIFT = 0;
+export const D3DVSD_CONSTADDRESSMASK = 0x7f << D3DVSD_CONSTADDRESSSHIFT;
+export const D3DVSD_CONSTCOUNTSHIFT = 25;
+export const D3DVSD_CONSTCOUNTMASK = 0xf << D3DVSD_CONSTCOUNTSHIFT;
+
 export const D3DVSD_END = 0xffffffff;
 export const D3DVSD_NOP = 0x00000000;
 
@@ -47,6 +55,11 @@ export const D3DVSDE_DIFFUSE = 5;
 export const D3DVSDE_SPECULAR = 6;
 export const D3DVSDE_TEXCOORD0 = 7;
 export const D3DVSDE_TEXCOORD7 = 14;
+/** v15/v16 — dxvk d3d8_shader.cpp D3D8_VERTEX_INPUT_REGISTERS maps these to a SECOND
+ *  position/normal stream (D3DDECLUSAGE_POSITION/NORMAL, usageIndex 1), used by
+ *  N-Patch / continuous-tessellation content, not a distinct D3DVSDE_* usage of their own. */
+export const D3DVSDE_POSITION2 = 15;
+export const D3DVSDE_NORMAL2 = 16;
 
 /** D3DVSDT_* data types (0-based; matches D3DDECLTYPE_FLOAT1..SHORT4) */
 export const D3DVSDT_FLOAT1 = 0x00;

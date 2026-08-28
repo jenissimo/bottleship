@@ -118,11 +118,14 @@ describe("d3d8-decl-to-ffp", () => {
         expect(mapped.faithful).toBe(true);
         expect(mapped.fvf).toBe(0x242); // XYZ | DIFFUSE | TEX2
         expect(mapped.stride).toBe(32); // 12 pos + 4 diffuse + 8 tex0 + 8 tex1
+        // slotSize is the canonical slot width: equal to `size` for every element here, and
+        // the interleaver zeroes [size, slotSize) so a degraded element cannot inherit the
+        // previous draw's bytes out of the reused scratch.
         expect(mapped.interleave).toEqual([
-            { stream: 0, srcOffset: 0, dstOffset: 0, size: 12 },
-            { stream: 0, srcOffset: 12, dstOffset: 12, size: 4 },
-            { stream: 0, srcOffset: 16, dstOffset: 16, size: 8 },
-            { stream: 1, srcOffset: 0, dstOffset: 24, size: 8 },
+            { stream: 0, srcOffset: 0, dstOffset: 0, size: 12, slotSize: 12, swizzleColorBytes: undefined },
+            { stream: 0, srcOffset: 12, dstOffset: 12, size: 4, slotSize: 4, swizzleColorBytes: undefined },
+            { stream: 0, srcOffset: 16, dstOffset: 16, size: 8, slotSize: 8, swizzleColorBytes: undefined },
+            { stream: 1, srcOffset: 0, dstOffset: 24, size: 8, slotSize: 8, swizzleColorBytes: undefined },
         ]);
     });
 });
@@ -137,7 +140,7 @@ describe("d3d8-shader-compile", () => {
     test("linkProgram accepts VSD-derived decl with SM1 bytecode", () => {
         const vsTokens = new Uint32Array([
             ver(false, 1, 1),
-            0xfffe0001, 0x42415443, 0, 1, 2,
+            0x0004fffe, 0x42415443, 0, 1, 2,
             ins(Op.DCL), 0, reg(RegType.INPUT, 0),
             ins(Op.DCL), 5, reg(RegType.INPUT, 1),
             ins(Op.DEF), reg(RegType.CONST, 4), 0x3f800000, 0x3f800000, 0x3f800000, 0x3f800000,
@@ -147,7 +150,7 @@ describe("d3d8-shader-compile", () => {
         ]);
         const psTokens = new Uint32Array([
             ver(true, 1, 1),
-            0xfffe0001, 0xcafe,
+            0x0001fffe, 0xcafe,
             ins(Op.TEX), dst(RegType.TEXTURE, 0),
             ins(Op.MUL), dst(RegType.TEMP, 0), src(RegType.TEXTURE, 0), src(RegType.INPUT, 0),
             0xffff,
@@ -215,7 +218,7 @@ describe("d3d8-shader-compile", () => {
     test("accepts vs_1_0 bytecode version token", () => {
         const vs10 = new Uint32Array([
             ver(false, 1, 0),
-            0xfffe0001, 0x42415443, 0, 1, 2,
+            0x0004fffe, 0x42415443, 0, 1, 2,
             ins(Op.DCL), 0, reg(RegType.INPUT, 0),
             ins(Op.DEF), reg(RegType.CONST, 0), 0x3f800000, 0, 0, 0x3f800000,
             ins(Op.DP4), dst(RegType.RASTOUT, 0, 1), src(RegType.INPUT, 0), src(RegType.CONST, 0),

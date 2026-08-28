@@ -53,6 +53,7 @@ const D3DERR_INVALIDCALL = 0x8876086c;
 
 const D3DERR_OUTOFVIDEOMEMORY = 0x8876017c;
 const D3DFMT_X8R8G8B8 = 22;
+const D3DFMT_R5G6B5 = 23;
 const D3DFMT_VERTEXDATA = 100;
 const D3DRTYPE_UNKNOWN = 0;
 const D3DRTYPE_SURFACE = 1;
@@ -60,16 +61,36 @@ const D3DRTYPE_TEXTURE = 3;
 const D3DRTYPE_VERTEXBUFFER = 6;
 const D3DRTYPE_INDEXBUFFER = 7;
 const D3DPOOL_DEFAULT = 0;
+const D3DPOOL_SYSTEMMEM = 2;
 const D3DMULTISAMPLE_NONE = 0;
-// MultiSample types our WebGPU backend can resolve (MsaaColorManager/DepthManager: 2× and 4×).
+// MultiSample types our WebGPU backend can resolve. WebGPU's portable set is 1× and 4×;
+// a guest 2× RT/DS must be refused rather than creating a descriptor that loses the frame.
 // A guest RT/DS created with one of these is accepted; the effective device-global sample count
 // is driven by the present-params MultiSampleType (see D3D8DeviceAdapter.reset / CreateDevice)
-// folded with quality.msaa. Others (3/5/6/7/8/16) remain rejected, matching CheckDeviceMultiSampleType.
+// folded with quality.msaa. Others (2/3/5/6/7/8/16) remain rejected, matching CheckDeviceMultiSampleType.
 const isSupportedD3D8MultiSample = (t: number): boolean =>
-    t === D3DMULTISAMPLE_NONE || t === 2 || t === 4;
+    t === D3DMULTISAMPLE_NONE || t === 4;
 const D3DLOCK_DISCARD = 0x00002000;
 const D3DLOCK_READONLY = 0x00000010;
 const D3DUSAGE_RENDERTARGET = 0x00000001;
+
+/**
+ * The D3D format a surface wrapper's pixels actually carry. Wine reads it from the resource
+ * itself (d3d8/device.c CopyRects → wined3d_texture_get_sub_resource_desc), never from the
+ * wrapper, and so does this: the surface's own bookkeeping wins, the wrapper's recorded
+ * `d3dFormat` is the fallback, and a wrapper built from a live render target (back buffer,
+ * GetRenderTarget) that records nothing resolves by pixel width instead of comparing as
+ * "different from everything" — which would fail the backbuffer→SYSTEMMEM screenshot copy
+ * silently, writing no pixels.
+ */
+export function resolveSurfaceD3DFormat(info: { surface: DirectDrawSurfaceState; d3dFormat?: number }): number {
+    const surface = info.surface as Partial<BitmapTextureSurface> & DirectDrawSurfaceState;
+    const fromSurface = (surface.d3dFormat ?? surface.dxtFormat ?? 0) >>> 0;
+    if (fromSurface) return fromSurface;
+    const recorded = (info.d3dFormat ?? 0) >>> 0;
+    if (recorded) return recorded;
+    return surface.format?.bpp === 16 ? D3DFMT_R5G6B5 : D3DFMT_X8R8G8B8;
+}
 
 export function validateLockRange(totalSize: number, offset: number, requestedSize: number): number | null {
     if (offset < 0 || offset > totalSize) return null;
@@ -659,7 +680,7 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         const Offset = args[1];
         const Size = args[2];
         const ppData = args[3];
-        // const Flags = args[4];
+        const Flags = args[4] >>> 0;
 
         const device = resourceToDevice.get(pVB);
         if (!device || !ppData) return D3DERR_INVALIDCALL;
@@ -673,7 +694,12 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         }
 
         if (!Mem.writeUint32(ppData, vb.guestPtr + Offset)) return D3DERR_INVALIDCALL;
-        device.markBufferDirty("vb", pVB, Offset, lockSize, vb.size);
+        // D3DLOCK_READONLY is unambiguous: the caller promised not to write, so the next
+        // draw's upload can be skipped. Any other flags (or none) take the conservative,
+        // always-dirty path — a wrongly-skipped upload is silent corruption.
+        if ((Flags & D3DLOCK_READONLY) === 0) {
+            device.markBufferDirty("vb", pVB, Offset, lockSize, vb.size);
+        }
         return D3D_OK;
     };
 
@@ -704,6 +730,7 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         const Offset = args[1];
         const Size = args[2];
         const ppData = args[3];
+        const Flags = args[4] >>> 0;
 
         const device = resourceToDevice.get(pIB);
         if (!device || !ppData) return D3DERR_INVALIDCALL;
@@ -717,7 +744,10 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         }
 
         if (!Mem.writeUint32(ppData, ib.guestPtr + Offset)) return D3DERR_INVALIDCALL;
-        device.markBufferDirty("ib", pIB, Offset, lockSize, ib.size);
+        // See VB Lock above: D3DLOCK_READONLY is the one unambiguous "skip the upload" case.
+        if ((Flags & D3DLOCK_READONLY) === 0) {
+            device.markBufferDirty("ib", pIB, Offset, lockSize, ib.size);
+        }
         return D3D_OK;
     };
 
@@ -747,6 +777,13 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
     // Scratch buffers for mip levels > 0 to prevent overwriting level 0 data.
     // Key: `${pTex}_${level}` → guest memory pointer
     const mipScratchBuffers = new Map<string, { ptr: number; pitch: number }>();
+
+    // A plain-texture/image-surface Lock has no lease-style state to hang the flag on
+    // (unlike RenderSurface.lastLockReadOnly) — BitmapTextureSurface is shared with ddraw
+    // and out of scope here, so the flag is tracked keyed by the surface COM ptr instead.
+    // Missing entry (no Lock recorded, or a non-bitmap surface) means "not read-only" —
+    // the conservative choice, since a wrongly-skipped upload is silent corruption.
+    const bitmapLockReadOnly = new Map<number, boolean>();
 
     exports['IDirect3DTexture8_LockRect'] = (ctx, mem, args) => {
         const pTex = args[0];
@@ -879,7 +916,7 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
             surface.height,
             bytesPerPixel,
             meta?.usage ?? 0,
-            info.role === 'backbuffer' ? D3DPOOL_DEFAULT : (meta?.pool ?? D3DPOOL_DEFAULT)
+            info.role === 'backbuffer' ? D3DPOOL_DEFAULT : (meta?.pool ?? info.pool ?? D3DPOOL_DEFAULT)
         );
         return D3D_OK;
     };
@@ -906,6 +943,7 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         const offset = lockRectOffsetBits(surface, info.d3dFormat, surface.surfacePtr, pRect, mem);
         if (!offset) return D3DERR_INVALIDCALL;
         writeLockedRect(mem, pLockedRect, offset.pitch, offset.pBits);
+        bitmapLockReadOnly.set(pSurf, (Flags & D3DLOCK_READONLY) !== 0);
         return D3D_OK;
     };
 
@@ -916,7 +954,14 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         const adapter = resourceToDevice.get(args[0]);
         const surface = resolveLockSurface(info, adapter);
         if (isBitmapTexture(surface)) {
-            syncBitmapSurfaceFromGuest(surface);
+            const wasReadOnly = bitmapLockReadOnly.get(args[0]) === true;
+            bitmapLockReadOnly.delete(args[0]);
+            // A read-only Unlock modifies nothing — re-decoding and re-uploading it every
+            // frame (the old unconditional behaviour) is pure waste (CLAUDE.md §3.0:
+            // performance is part of faithfulness).
+            if (!wasReadOnly) {
+                syncBitmapSurfaceFromGuest(surface);
+            }
         } else if (isRenderSurface(surface)) {
             const wasReadOnly = surface.lastLockReadOnly === true;
             const lcState = lockCostProfiler.now();
@@ -1037,6 +1082,7 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         clearRenderTargetOverrideForSurface(pSurf);
         surfaceInfo.delete(pSurf);
         resourceToDevice.delete(pSurf);
+        bitmapLockReadOnly.delete(pSurf);
 
         return 0;
     };
@@ -1142,11 +1188,17 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         const pDevice = args[0];
         const Width = args[1];
         const Height = args[2];
-        const Format = args[3];
+        const Format = args[3] >>> 0;
         const ppSurface = args[4];
 
         if (!ppSurface) return D3DERR_INVALIDCALL;
         initReturnPtr(ppSurface);
+
+        // Wine/DXVK (d3d8_device.cpp:516-534): D3DFMT_UNKNOWN and any D3D9-exclusive
+        // format are rejected before *ppSurface is touched — mirrors CreateTexture's guard.
+        if (Format === D3DFMT_UNKNOWN || isD3D8ExclusiveFormat(Format)) {
+            return D3DERR_INVALIDCALL;
+        }
 
         const device = devices.get(pDevice);
         if (!device) return D3DERR_INVALIDCALL;
@@ -1168,6 +1220,11 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
             level: 0,
             surface,
             d3dFormat: Format,
+            // CreateImageSurface always allocates D3DPOOL_SYSTEMMEM (dxvk
+            // d3d8_device.cpp:536-537) — GetDesc must answer that, not fall through to
+            // D3DPOOL_DEFAULT, or an engine that branches on Pool to decide what survives
+            // Reset gets the wrong answer for every image surface it creates.
+            pool: D3DPOOL_SYSTEMMEM,
         });
 
         Mem.writeUint32(ppSurface, surfPtr);
@@ -1183,6 +1240,20 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         const srcInfo = surfaceInfo.get(pSrc);
         const dstInfo = surfaceInfo.get(pDst);
         if (!srcInfo || !dstInfo) return D3DERR_INVALIDCALL;
+
+        // dxvk d3d8_device.cpp:663-687 — reject before touching any memory: a copy onto
+        // itself, a format mismatch (bpp equality is NOT format equality — R5G6B5 and
+        // X1R5G5B5 are both 16bpp but reinterpret the bits differently), or either surface
+        // being depth-stencil.
+        if (pSrc === pDst) return D3DERR_INVALIDCALL;
+        // Both sides go through ONE resolver so the comparison is between two surfaces'
+        // actual formats, never between a recorded field and an unrecorded one.
+        const srcFormat = resolveSurfaceD3DFormat(srcInfo);
+        const dstFormat = resolveSurfaceD3DFormat(dstInfo);
+        if (srcFormat !== dstFormat) return D3DERR_INVALIDCALL;
+        if (isD3D8DepthStencilFormat(srcFormat) || isD3D8DepthStencilFormat(dstFormat)) {
+            return D3DERR_INVALIDCALL;
+        }
 
         const srcSurface = srcInfo.surface;
         const dstSurface = dstInfo.surface;
@@ -1206,16 +1277,16 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         const guestMem = process.getCurrentMemory();
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
 
+        // Format equality (checked above) already implies bpp equality.
         const srcBytesPerPixel = bytesPerPixelFromBpp(srcSurface.format.bpp);
         const dstBytesPerPixel = bytesPerPixelFromBpp(dstSurface.format.bpp);
-        if (srcBytesPerPixel !== dstBytesPerPixel) return D3DERR_INVALIDCALL;
         const copyBytesPerPixel = srcBytesPerPixel;
 
         // Block-compressed (DXT/BC) surfaces are laid out as 4×4 blocks, not linear
         // pixels — copying them per-pixel at the fallback 32bpp overruns the source
         // by ~block-size× and corrupts neighbouring guest heap. Detect and copy blocks.
-        const srcLayout = getD3DTextureLayout(srcInfo.d3dFormat, srcSurface.width, srcSurface.height);
-        const dstLayout = getD3DTextureLayout(dstInfo.d3dFormat, dstSurface.width, dstSurface.height);
+        const srcLayout = getD3DTextureLayout(srcFormat, srcSurface.width, srcSurface.height);
+        const dstLayout = getD3DTextureLayout(dstFormat, dstSurface.width, dstSurface.height);
         const compressed = srcLayout.compressed || dstLayout.compressed;
         if (compressed && (!srcLayout.compressed || !dstLayout.compressed ||
             srcLayout.blockBytes !== dstLayout.blockBytes)) {
@@ -1328,73 +1399,94 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
 
         const srcDevice = resourceToDevice.get(pSrcTexture);
         const dstDevice = resourceToDevice.get(pDstTexture);
-        const srcSurface = srcDevice?.texSurfaces.get(pSrcTexture);
-        const dstSurface = dstDevice?.texSurfaces.get(pDstTexture);
-        if (!srcSurface || !dstSurface) return D3DERR_INVALIDCALL;
-        if (srcSurface.surfaceType !== 'bitmap_texture' || dstSurface.surfaceType !== 'bitmap_texture') {
+        const srcParent = srcDevice?.texSurfaces.get(pSrcTexture);
+        const dstParent = dstDevice?.texSurfaces.get(pDstTexture);
+        if (!srcDevice || !dstDevice || !srcParent || !dstParent) return D3DERR_INVALIDCALL;
+        if (srcParent.surfaceType !== 'bitmap_texture' || dstParent.surfaceType !== 'bitmap_texture') {
             return D3DERR_INVALIDCALL;
         }
-        if (!srcSurface.surfacePtr || !dstSurface.surfacePtr) return D3DERR_INVALIDCALL;
 
         const process = System.getInstance().process;
         if (!process) return D3DERR_INVALIDCALL;
         const guestMem = process.getCurrentMemory();
 
-        const srcFmt = srcSurface.d3dFormat ?? srcSurface.dxtFormat ?? D3DFMT_X8R8G8B8;
-        const dstFmt = dstSurface.d3dFormat ?? dstSurface.dxtFormat ?? D3DFMT_X8R8G8B8;
-        const srcLayout = getD3DTextureLayout(srcFmt, srcSurface.width, srcSurface.height);
-        const dstLayout = getD3DTextureLayout(dstFmt, dstSurface.width, dstSurface.height);
+        // Real D3D8/D3D9 UpdateTexture walks every mip level, not just level 0 (the
+        // canonical SYSTEMMEM-mipchain → UpdateTexture streaming pattern depends on this).
+        // Its documented contract requires levels(src) <= levels(dst); copy min() of the
+        // two so a caller-side mismatch degrades to "coarsest dst mips stale" rather than
+        // touching memory neither surface owns.
+        const srcLevels = textureMeta.get(pSrcTexture)?.levels ?? computeMipLevelCount(srcParent.width, srcParent.height);
+        const dstLevels = textureMeta.get(pDstTexture)?.levels ?? computeMipLevelCount(dstParent.width, dstParent.height);
+        const levelCount = Math.min(srcLevels, dstLevels);
 
-        // Block-compressed (DXT/BC) textures are laid out as 4×4 blocks, not linear
-        // pixels — copying them per-pixel at the fallback 32bpp over-reads the source
-        // by ~block-size× and corrupts neighbouring guest heap. Copy whole block rows.
-        if (srcLayout.compressed || dstLayout.compressed) {
-            if (!srcLayout.compressed || !dstLayout.compressed ||
-                srcLayout.blockBytes !== dstLayout.blockBytes) {
+        for (let level = 0; level < levelCount; level++) {
+            const srcSurfPtr = ensureTextureLevelSurface(pSrcTexture, level, srcDevice, srcParent);
+            const dstSurfPtr = ensureTextureLevelSurface(pDstTexture, level, dstDevice, dstParent);
+            if (!srcSurfPtr || !dstSurfPtr) return D3DERR_INVALIDCALL;
+
+            const srcInfo = surfaceInfo.get(srcSurfPtr);
+            const dstInfo = surfaceInfo.get(dstSurfPtr);
+            if (!srcInfo || !dstInfo) return D3DERR_INVALIDCALL;
+
+            const srcSurface = srcInfo.surface;
+            const dstSurface = dstInfo.surface;
+            if (srcSurface.surfaceType !== 'bitmap_texture' || dstSurface.surfaceType !== 'bitmap_texture') {
                 return D3DERR_INVALIDCALL;
             }
-            const srcPitch = srcSurface.pitch || srcLayout.pitch;
-            const dstPitch = dstSurface.pitch || dstLayout.pitch;
-            const blockRows = Math.min(srcLayout.rows, dstLayout.rows);
-            const rowBytes = Math.min(srcLayout.pitch, dstLayout.pitch);
-            for (let row = 0; row < blockRows; row++) {
-                const srcRow = srcSurface.surfacePtr + row * srcPitch;
-                const dstRow = dstSurface.surfacePtr + row * dstPitch;
-                if (
-                    srcRow < 0 || dstRow < 0 ||
-                    srcRow + rowBytes > guestMem.length ||
-                    dstRow + rowBytes > guestMem.length
-                ) {
+            if (!srcSurface.surfacePtr || !dstSurface.surfacePtr) return D3DERR_INVALIDCALL;
+
+            const srcLayout = getD3DTextureLayout(srcInfo.d3dFormat, srcSurface.width, srcSurface.height);
+            const dstLayout = getD3DTextureLayout(dstInfo.d3dFormat, dstSurface.width, dstSurface.height);
+
+            // Block-compressed (DXT/BC) textures are laid out as 4×4 blocks, not linear
+            // pixels — copying them per-pixel at the fallback 32bpp over-reads the source
+            // by ~block-size× and corrupts neighbouring guest heap. Copy whole block rows.
+            if (srcLayout.compressed || dstLayout.compressed) {
+                if (!srcLayout.compressed || !dstLayout.compressed ||
+                    srcLayout.blockBytes !== dstLayout.blockBytes) {
                     return D3DERR_INVALIDCALL;
                 }
-                guestMem.set(guestMem.subarray(srcRow, srcRow + rowBytes), dstRow);
+                const srcPitch = srcSurface.pitch || srcLayout.pitch;
+                const dstPitch = dstSurface.pitch || dstLayout.pitch;
+                const blockRows = Math.min(srcLayout.rows, dstLayout.rows);
+                const rowBytes = Math.min(srcLayout.pitch, dstLayout.pitch);
+                for (let row = 0; row < blockRows; row++) {
+                    const srcRow = srcSurface.surfacePtr + row * srcPitch;
+                    const dstRow = dstSurface.surfacePtr + row * dstPitch;
+                    if (
+                        srcRow < 0 || dstRow < 0 ||
+                        srcRow + rowBytes > guestMem.length ||
+                        dstRow + rowBytes > guestMem.length
+                    ) {
+                        return D3DERR_INVALIDCALL;
+                    }
+                    guestMem.set(guestMem.subarray(srcRow, srcRow + rowBytes), dstRow);
+                }
+            } else {
+                const srcBytesPerPixel = bytesPerPixelFromBpp(srcSurface.format.bpp);
+                const dstBytesPerPixel = bytesPerPixelFromBpp(dstSurface.format.bpp);
+                if (srcBytesPerPixel !== dstBytesPerPixel) return D3DERR_INVALIDCALL;
+                const copyWidth = Math.min(srcSurface.width, dstSurface.width);
+                const copyHeight = Math.min(srcSurface.height, dstSurface.height);
+                const rowBytes = copyWidth * srcBytesPerPixel;
+
+                for (let row = 0; row < copyHeight; row++) {
+                    const srcRow = srcSurface.surfacePtr + row * srcSurface.pitch;
+                    const dstRow = dstSurface.surfacePtr + row * dstSurface.pitch;
+                    if (
+                        srcRow < 0 || dstRow < 0 ||
+                        srcRow + rowBytes > guestMem.length ||
+                        dstRow + rowBytes > guestMem.length
+                    ) {
+                        return D3DERR_INVALIDCALL;
+                    }
+                    guestMem.set(guestMem.subarray(srcRow, srcRow + rowBytes), dstRow);
+                }
             }
+
             syncBitmapSurfaceFromGuest(dstSurface);
-            return D3D_OK;
         }
 
-        const srcBytesPerPixel = bytesPerPixelFromBpp(srcSurface.format.bpp);
-        const dstBytesPerPixel = bytesPerPixelFromBpp(dstSurface.format.bpp);
-        if (srcBytesPerPixel !== dstBytesPerPixel) return D3DERR_INVALIDCALL;
-        const copyBytesPerPixel = srcBytesPerPixel;
-        const copyWidth = Math.min(srcSurface.width, dstSurface.width);
-        const copyHeight = Math.min(srcSurface.height, dstSurface.height);
-        const rowBytes = copyWidth * copyBytesPerPixel;
-
-        for (let row = 0; row < copyHeight; row++) {
-            const srcRow = srcSurface.surfacePtr + row * srcSurface.pitch;
-            const dstRow = dstSurface.surfacePtr + row * dstSurface.pitch;
-            if (
-                srcRow < 0 || dstRow < 0 ||
-                srcRow + rowBytes > guestMem.length ||
-                dstRow + rowBytes > guestMem.length
-            ) {
-                return D3DERR_INVALIDCALL;
-            }
-            guestMem.set(guestMem.subarray(srcRow, srcRow + rowBytes), dstRow);
-        }
-
-        syncBitmapSurfaceFromGuest(dstSurface);
         return D3D_OK;
     };
 

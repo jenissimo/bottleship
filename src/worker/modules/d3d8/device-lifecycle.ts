@@ -92,6 +92,32 @@ export function resizeFullscreenDeviceWindow(hwnd: number, width: number, height
     resizeFullscreenWindowToMode(hwnd, width, height, "D3D8");
 }
 
+// BeginScene/EndScene pairing (wined3d dlls/wined3d/device.c:3718-3743): real D3D8
+// rejects a second BeginScene without an intervening EndScene, and an EndScene with no
+// open scene, both with D3DERR_INVALIDCALL. The actual thunk handlers live in device.ts
+// (owned by another agent for this pass) — these helpers are the complete mechanism;
+// device.ts's BeginScene/EndScene need a two-line call into them (see the parity report).
+const deviceInScene = new Map<number, boolean>();
+
+/** Returns false (D3DERR_INVALIDCALL) if a scene is already open for this device. */
+export function tryBeginScene(devicePtr: number): boolean {
+    if (deviceInScene.get(devicePtr) === true) return false;
+    deviceInScene.set(devicePtr, true);
+    return true;
+}
+
+/** Returns false (D3DERR_INVALIDCALL) if no scene is open for this device. */
+export function tryEndScene(devicePtr: number): boolean {
+    if (deviceInScene.get(devicePtr) !== true) return false;
+    deviceInScene.set(devicePtr, false);
+    return true;
+}
+
+/** Device teardown: drop tracked scene state so a recycled COM pointer starts clean. */
+export function clearSceneState(devicePtr: number): void {
+    deviceInScene.delete(devicePtr);
+}
+
 /** Bind the implicit depth-stencil surface when EnableAutoDepthStencil is set. */
 export function bindAutoDepthStencil(devicePtr: number, mem: Uint8Array, pPresentationParameters: number): void {
     if (!pPresentationParameters) return;

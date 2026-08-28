@@ -6,14 +6,26 @@
  * with the D3D7 numbering silently downgrades every LINEAR request to nearest.
  */
 
-import type { SamplerSpec } from "../shared/dx-sampler";
+import type { DxSamplerAddressMode, DxSamplerUnsupportedFeature, SamplerSpec } from "../shared/dx-sampler";
 import {
     D3DTSS_ADDRESSU,
     D3DTSS_ADDRESSV,
     D3DTSS_MAGFILTER,
     D3DTSS_MINFILTER,
     D3DTSS_MIPFILTER,
+    D3DTSS_MAXANISOTROPY,
 } from "../../../modules/ddraw/constants";
+// Not re-exported by the barrel above — imported straight from the leaf constants module.
+import {
+    D3DTSS_MIPMAPLODBIAS,
+    D3DTSS_MAXMIPLEVEL,
+    D3DTSS_BORDERCOLOR,
+} from "../../../modules/ddraw/d3d/sampler-constants";
+
+// D3DTSS_MIPMAPLODBIAS is a DWORD carrying IEEE-754 float bits (same bit-cast d3d9-sampler.ts
+// uses). This decode runs once per stage per draw, not per-vertex/pixel.
+const lodBiasBitsScratch = new Uint32Array(1);
+const lodBiasFloatScratch = new Float32Array(lodBiasBitsScratch.buffer);
 
 // D3DTEXTUREFILTERTYPE — D3D8/D3D9 numbering (D3D7 is NONE=1/POINT=2/LINEAR=3; see
 // d3d9-sampler.ts). These are also the D3D8 defaults' vocabulary: MIN/MAG default to
@@ -37,14 +49,19 @@ function mipFilter(v: number): GPUMipmapFilterMode {
     return v === D3DTEXF_LINEAR ? "linear" : "nearest";
 }
 
-function addressMode(v: number): GPUAddressMode {
+function addressMode(v: number): DxSamplerAddressMode {
     switch (v) {
         case D3DTADDRESS_MIRROR:
         case D3DTADDRESS_MIRRORONCE:
             return "mirror-repeat";
         case D3DTADDRESS_CLAMP:
-        case D3DTADDRESS_BORDER:
             return "clamp-to-edge";
+        case D3DTADDRESS_BORDER:
+            // WebGPU has no clamp-to-border. Preserve the mode explicitly (as d3d9-sampler.ts
+            // does) so the shader emitter — already generic over SamplerSpec for this
+            // programmable draw path (see d3d9/shader/emit/tex.ts) — substitutes the real
+            // border colour instead of silently collapsing to clamp-to-edge.
+            return "d3d9-border";
         default:
             return "repeat";
     }
@@ -61,6 +78,19 @@ export function decodeD3d8TssSampler(
     const magV = get(D3DTSS_MAGFILTER);
     const mipV = get(D3DTSS_MIPFILTER);
     const anisoRequested = minV === D3DTEXF_ANISOTROPIC || magV === D3DTEXF_ANISOTROPIC;
+    // D3DTSS_MAXANISOTROPY is a plain DWORD (DXVK forwards TSS 1:1 to D3D9's SetSamplerState) —
+    // read the game's real request instead of forcing a fixed 16x whenever ANISOTROPIC is merely
+    // selected as the filter mode (docs/d3d8-parity/02-samplers.md F3).
+    const maxAnisotropy = Math.max(1, get(D3DTSS_MAXANISOTROPY) >>> 0);
+    const unsupportedFeatures: DxSamplerUnsupportedFeature[] = [];
+    // A request above the advertised MaxAnisotropy=16 is CLAMPED, not refused: engines write
+    // their config value straight through, and the D3D9 runtime and DXVK both clamp to the
+    // cap. Dropping the draw instead loses every primitive on the stage.
+    const mipLodBiasBits = get(D3DTSS_MIPMAPLODBIAS) >>> 0;
+    lodBiasBitsScratch[0] = mipLodBiasBits;
+    const mipLodBias = lodBiasFloatScratch[0];
+    const maxMipLevel = get(D3DTSS_MAXMIPLEVEL) >>> 0;
+    const borderColor = get(D3DTSS_BORDERCOLOR) >>> 0;
     return {
         min: minMagFilter(minV),
         mag: minMagFilter(magV),
@@ -71,7 +101,11 @@ export function decodeD3d8TssSampler(
         addressU: addressMode(get(D3DTSS_ADDRESSU) || D3DTADDRESS_WRAP),
         addressV: addressMode(get(D3DTSS_ADDRESSV) || D3DTADDRESS_WRAP),
         addressW: addressMode(D3DTADDRESS_WRAP),
-        gameAnisotropy: anisoRequested ? 16 : 1,
-        maxMipLevel: 0,
+        gameAnisotropy: anisoRequested ? maxAnisotropy : 1,
+        maxMipLevel,
+        borderColor,
+        mipLodBias,
+        mipLodBiasBits,
+        unsupportedFeatures: unsupportedFeatures.length > 0 ? unsupportedFeatures : undefined,
     };
 }

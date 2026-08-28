@@ -26,6 +26,7 @@ import {
     writeAdapterIdentifier8,
 } from '../../backends/webgpu/shared/dx-adapter-identifier';
 import { registerLossTrackedDevice } from '../../core/gpu/gpu-device-loss-contract';
+import { D3DERR_NOTAVAILABLE } from '../../backends/webgpu/shared/dx-format-support';
 
 const D3D_OK = 0;
 const D3DERR_INVALIDCALL = 0x8876086c;
@@ -287,7 +288,10 @@ export function createFactoryExports(): Record<string, ThunkImplementation> {
 
             // Honor the requested back-buffer MSAA (D3DPRESENT_PARAMETERS.MultiSampleType @ +16):
             // fold it into the executor's effective sample count so in-engine AA works.
-            device.applyPresentMultiSampleType(view.getUint32(pPresParams + 16, true));
+            if (!device.applyPresentMultiSampleType(view.getUint32(pPresParams + 16, true))) {
+                Logger.warn(LogCategory.SYSTEM, 'D3D8 CreateDevice: requested multisample type is not backed by WebGPU');
+                return D3DERR_NOTAVAILABLE;
+            }
 
             // The swap interval the app asked for (FullScreen_PresentationInterval @ +48).
             // D3DCAPS8.PresentationIntervals advertises IMMEDIATE|ONE, so Present must honor it.

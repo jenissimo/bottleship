@@ -321,6 +321,9 @@ export function buildD3D8PipelineKey(
     blendKey: string,
     alphaTestKey: string,
     cubeMask: number,
+    /** Fixed-function cascade shape for a draw with no pixel shader (stage count + projected
+     *  mask). Appended last so purgeShaderPipelines' leading-field parse stays valid. */
+    ffpKey = "",
 ): string {
     const cullMode = renderStates[RS_CULLMODE] ?? 0;
     const zEnable = renderStates[RS_ZENABLE] ?? 1;
@@ -330,5 +333,5 @@ export function buildD3D8PipelineKey(
         ((zEnable !== 0 ? 1 : 0) << 25) |
         ((zWrite !== 0 ? 1 : 0) << 26)
     ) >>> 0;
-    return `${vsHandle}:${psHandle}:${declStride}:${stride}:${stateBits}:${topology}:${forceCullNone ? 1 : 0}:${blendKey}:${alphaTestKey}:cm${cubeMask}`;
+    return `${vsHandle}:${psHandle}:${declStride}:${stride}:${stateBits}:${topology}:${forceCullNone ? 1 : 0}:${blendKey}:${alphaTestKey}:cm${cubeMask}${ffpKey ? ":" + ffpKey : ""}`;
 }
