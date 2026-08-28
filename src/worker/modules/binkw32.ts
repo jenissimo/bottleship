@@ -26,7 +26,7 @@ import { CTRL_PLAY_CURSOR, CTRL_BUFFER_BYTES, CTRL_BLOCK_ALIGN, CTRL_SAMPLE_RATE
 import { DirectDrawSurfaceObject, DirectDrawSurfaceState, isRenderSurface, type BitmapTextureSurface } from "./ddraw/com-objects";
 import { setAuthorityCpu } from "./ddraw/surface-sync";
 import { resolveD3D8TextureSurface } from "./d3d8/shared-state";
-import { resolveD3D9LockedTextureTarget } from "./d3d9/shared-state";
+import { resolveD3D9LockedTextureTarget, d3d9TextureUploadSeq } from "./d3d9/shared-state";
 import { readAnsiFromGuest } from "./codepage-utils";
 import { Mem } from "../core/memory/mem-accessor";
 import { overlapsThunkCode } from "../core/memory/address-guard";
@@ -40,6 +40,10 @@ import { BinkStructLayout, BINK_LAYOUT_DEFAULT, binkLayoutFor, selectBinkLayout 
 // populated header.  Allocate generously and zero-fill so all pointer fields
 // are NULL and all counts are 0 — prevents games from dereferencing garbage.
 const BINK_HANDLE_SIZE = 2048;
+/** Bink container header: 'BIK'+version, size, frames, …, width@20, height@24, fps@28/32. */
+const BINK_HEADER_BYTES = 44;
+/** Copy→upload has to be one frame apart to be evidence the upload took those pixels. */
+const SAME_FRAME_MS = 34;
 
 /**
  * BINKSURFACE* — the destination pixel format, named by the GAME in the low nibble
@@ -258,6 +262,14 @@ interface BinkSession {
      *  Sampled at COPY time — the guest unlocks right after, and by the time the sink is
      *  chosen the lock is gone. */
     d3d9LockTarget: { pitch: number; width: number; height: number } | null;
+    /** Last observed value of the global D3D9 texture-upload counter, sampled per copy.
+     *  -1 until the first sample: the first observation establishes a baseline and cannot
+     *  itself be a change. */
+    lastTextureUploadSeq: number;
+    /** The app was SEEN uploading a texture between two of its own BinkCopyToBuffer calls.
+     *  That is the only observation that catches an app which copies into a private buffer
+     *  and locks its texture afterwards — the pointer tests never see the two coincide. */
+    appUploadsItsOwnFrames: boolean;
     lastCopyAtMs: number;
     hasBufferApiHint: boolean;
     hasPointerFault: boolean;
@@ -455,6 +467,12 @@ export class BinkW32 implements IModule {
         if (s.destPtr || s.hasBufferApiHint) {
             const gpuPresenter = isGpuVideoPresenterActive();
             const resolvedSurface = s.destPtr ? this.resolveBitmapTextureTarget(s.destPtr) : null;
+            // Real Bink presents NOTHING: BinkCopyToBuffer fills the app's buffer and stops
+            // there. Our video overlay exists only for the shape where the app's own upload
+            // path loses those pixels (Morrowind's D3D8 custom upload) — so the moment we can
+            // see that path running, the overlay is wrong: it composites the movie OVER the
+            // frame the app just drew, hiding the UI on top of it (Far Cry's menu, whose
+            // backdrop loop is copied into the game's own texture every frame).
             // A D3D9 LockRect staging buffer is uploaded by the guest's own UnlockRect, so
             // it stays visible under a GPU presenter — without this the sink falls back to
             // the video overlay, which presents the movie OVER the game's own frame and
@@ -462,9 +480,22 @@ export class BinkW32 implements IModule {
             const lockedTexture = resolvedSurface
                 ? null
                 : (s.destPtr ? resolveD3D9LockedTextureTarget(s.destPtr) : null) ?? s.d3d9LockTarget;
+            // The upload counter is PROCESS-WIDE: on its own it says an upload happened,
+            // never that it consumed THIS session's pixels, and one unrelated texture
+            // upload would otherwise latch the flag and kill the overlay for the session.
+            // Only count it as evidence when this session's destination is a D3D9 lock
+            // staging buffer (the shape the pointer tests cannot see) and the upload
+            // landed in the same frame as the copy that filled it.
+            const uploadSeq = d3d9TextureUploadSeq();
+            const uploadedSinceLastFrame = s.lastTextureUploadSeq !== -1 && s.lastTextureUploadSeq !== uploadSeq;
+            s.lastTextureUploadSeq = uploadSeq;
+            if (uploadedSinceLastFrame && lockedTexture
+                && (performance.now() - s.lastCopyAtMs) <= SAME_FRAME_MS) {
+                s.appUploadsItsOwnFrames = true;
+            }
             return {
                 kind: "app_buffer",
-                valid: !gpuPresenter || !!resolvedSurface || !!lockedTexture,
+                valid: !gpuPresenter || !!resolvedSurface || !!lockedTexture || s.appUploadsItsOwnFrames,
                 surfacePtr: s.destPtr || undefined,
                 pitch: s.destPitch || lockedTexture?.pitch || undefined,
                 width: resolvedSurface?.width ?? lockedTexture?.width ?? s.width,
@@ -555,6 +586,7 @@ export class BinkW32 implements IModule {
      * DDraw Blt/BltFast handles all presentation — game controls position and order.
      */
     private _decodeFrame(s: BinkSession, bink: number): void {
+        if (s.engineHandle < 0) return;
         const ok = videoEngine.doFrame(s.engineHandle);
         s.lastFrameMs = performance.now();
         s.frameDecodeCount++;
@@ -650,6 +682,111 @@ export class BinkW32 implements IModule {
             Logger.error(LogCategory.SYSTEM, `[BinkW32] readVfsFile("${path}") error: ${e}`);
             return null;
         }
+    }
+
+    /**
+     * Read the first `count` bytes of a VFS file — enough for a container header, without
+     * pulling a 100 MB clip into memory to learn its dimensions.
+     */
+    private async readVfsHeader(path: string, count: number): Promise<Uint8Array | null> {
+        try {
+            const vfs = System.getInstance().fileSystem;
+            if (vfs.getFileSize(path) < count) return null;
+            const handle = await vfs.open(path, 0x80000000 /* GENERIC_READ */, 3 /* OPEN_EXISTING */);
+            if (!handle) return null;
+            const data = await vfs.read(handle, count);
+            return data.length >= count ? data : null;
+        } catch (e) {
+            Logger.error(LogCategory.SYSTEM, `[BinkW32] readVfsHeader("${path}") error: ${e}`);
+            return null;
+        }
+    }
+
+    /**
+     * skipVideo's BinkOpen: a real, already-finished stream.
+     *
+     * The file still has to EXIST and still has to be Bink — skipping playback is not a
+     * licence to answer for a clip the bundle does not carry, and a guest that handles a
+     * genuinely missing video must keep seeing that. What it gets instead of decoded
+     * frames is an HBINK whose FrameNum already equals Frames, so the guest's own loop
+     * observes end-of-stream on its next poll and completes normally.
+     *
+     * Dimensions come from the 44-byte Bink header rather than being invented: a guest
+     * sizes its video panel from HBINK before the first frame.
+     */
+    private async openSkippedBink(mem: Uint8Array, namePtr: number, flags: number): Promise<number> {
+        await this.ensureLayout();
+        const isFileHandle = !!(flags & 0x00800000);
+
+        let header: Uint8Array | null = null;
+        let label: string;
+        if (isFileHandle) {
+            const sys = System.getInstance();
+            const wrapper = sys.resourceProvider.getFileHandle(namePtr);
+            if (!wrapper || !wrapper.vfsHandle) return 0;
+            label = `HANDLE=0x${namePtr.toString(16)} (${wrapper.vfsHandle.path})`;
+            const vfs = sys.fileSystem;
+            // Duplicate the actual VFS handle rather than reopening by path. The path can
+            // resolve to a different overlay/archive member after the guest has advanced the
+            // original handle, while Win32 DuplicateHandle preserves the backing object and
+            // starts the duplicate at the requested cursor.
+            const temp = vfs.duplicateHandle(wrapper.vfsHandle, wrapper.position);
+            const data = await vfs.read(temp, BINK_HEADER_BYTES);
+            header = data.length >= BINK_HEADER_BYTES ? data : null;
+        } else {
+            const rawName = this.readCString(mem, namePtr);
+            if (!rawName) return 0;
+            label = `"${rawName}"`;
+            header = await this.readVfsHeader(rawName, BINK_HEADER_BYTES);
+        }
+
+        if (!header || header[0] !== 0x42 /* 'B' */ || header[1] !== 0x49 /* 'I' */ || header[2] !== 0x4B /* 'K' */) {
+            Logger.warn(LogCategory.SYSTEM,
+                `BinkOpen(${label}): skipVideo, but the file is missing or not Bink — failing the open honestly`);
+            return 0;
+        }
+
+        const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
+        const frames = view.getUint32(8, true);
+        const width = view.getUint32(20, true);
+        const height = view.getUint32(24, true);
+        const fpsDividend = view.getUint32(28, true);
+        const fpsDivisor = view.getUint32(32, true) || 1;
+        const fps = fpsDividend / fpsDivisor;
+
+        const L = this.layout;
+        const guestPtr = this.process.memory.alloc(BINK_HANDLE_SIZE);
+        const m = this.getMemory();
+        m.fill(0, guestPtr, guestPtr + BINK_HANDLE_SIZE);
+        this.writeU32(m, guestPtr + L.width, width);
+        this.writeU32(m, guestPtr + L.height, height);
+        if (L.widthAlt !== null) this.writeU32(m, guestPtr + L.widthAlt, width);
+        if (L.heightAlt !== null) this.writeU32(m, guestPtr + L.heightAlt, height);
+        this.writeU32(m, guestPtr + L.frames, frames);
+        // Already at the end — this is what makes the skip a COMPLETION, not a failure.
+        this.writeU32(m, guestPtr + L.frameNum, frames);
+        if (L.lastFrameNum !== null) this.writeU32(m, guestPtr + L.lastFrameNum, frames);
+        this.writeU32(m, guestPtr + L.frameRate, Math.round(fps) || 1);
+        this.writeU32(m, guestPtr + L.frameRateDiv, 1);
+
+        this.sessions.set(guestPtr, {
+            guestPtr, engineHandle: -1,
+            width, height, frameCount: frames, fps,
+            lastFrameMs: 0, paused: false, loggedCopy: false, eof: true,
+            audioCtrl: null, lastPlayCursor: 0,
+            audioWrapCount: 0, audioBaselineMs: -1,
+            frameDecodeCount: 0,
+            destPtr: 0, destPitch: 0, destHeight: 0, destX: 0, destY: 0, destBpp: 0,
+            explicitDdrawSurface: null, explicitGlideSurfacePtr: 0,
+            d3d9LockTarget: null, lastTextureUploadSeq: -1, appUploadsItsOwnFrames: false, lastCopyAtMs: 0,
+            hasBufferApiHint: false, hasPointerFault: false,
+            videoOn: false,
+            ioSize: this.pendingIoSize,
+        });
+        Logger.log(LogCategory.SYSTEM,
+            `BinkOpen(${label}) → 0x${guestPtr.toString(16)} SKIPPED as a finished stream ` +
+            `(${width}×${height} ${frames}f)`);
+        return guestPtr;
     }
 
     /**
@@ -764,7 +901,7 @@ export class BinkW32 implements IModule {
         // single-variant base-name fallback sizes the other from it, and the stub's
         // RET N then differs from what the caller pushed. A 4-byte ESP drift moves every
         // local in the caller's frame, so the fault lands far away with nothing pointing
-        // back here (Gothic's Bink intro: a stack-local zFILE read as a NULL vtable).
+        // back here; matching the decorated ABI keeps the caller's stack frame intact.
         this.exports["_BinkSetVolume@12"] = (_ctx, _mem, args) => {
             console.log(`[BINK] BinkSetVolume(bink=0x${args[0].toString(16)}, track=${args[1]}, vol=${args[2]})`);
             return 0;
@@ -846,20 +983,17 @@ export class BinkW32 implements IModule {
             const namePtr = args[0];
             const flags   = args[1];
 
-            // skipVideo: return 0 (stub) to skip video playback entirely
+            // skipVideo must preserve the successful-open contract: a NULL HBINK would route
+            // the guest through an error path, while an already-complete stream lets normal
+            // completion handling run without exposing a decodable video frame.
             if (EmulatorConfig.getInstance().skipVideo) {
-                console.log(`[BINK] BinkOpen: SKIPPED (skipVideo=true)`);
-                return 0;
+                return await this.openSkippedBink(mem, namePtr, flags);
             }
 
             await this.ensureLayout();
 
-            // BINKFILEHANDLE: arg0 is a Win32 HANDLE, not a string pointer. It is ONE bit —
-            // 0x08000000 is its NEIGHBOUR, BINKNOTHREADEDIO, which says nothing about arg0
-            // and which titles pass with an ordinary filename (the rest of the block, in
-            // ascending order: BINKIOSIZE 0x01000000, BINKIOPROCESSOR 0x02000000,
-            // BINKFROMMEMORY 0x04000000). Reading a filename pointer as a handle fails the
-            // open, and a game that never checks HBINK dereferences NULL a frame later.
+            // BINKFILEHANDLE is the only flag that changes arg0 from a filename pointer to a
+            // Win32 HANDLE; the neighbouring I/O flags do not change its argument type.
             const isFileHandle = !!(flags & 0x00800000);
 
             let bytes: Uint8Array | null = null;
@@ -988,6 +1122,8 @@ export class BinkW32 implements IModule {
                     explicitDdrawSurface: null,
                     explicitGlideSurfacePtr: 0,
                     d3d9LockTarget: null,
+                    lastTextureUploadSeq: -1,
+                    appUploadsItsOwnFrames: false,
                     lastCopyAtMs: 0,
                     hasBufferApiHint: false,
                     hasPointerFault: false,
@@ -1033,7 +1169,7 @@ export class BinkW32 implements IModule {
         this.exports["_BinkDoFrame@4"] = (_ctx, _mem, args) => {
             const bink = args[0];
             const s = this.sessions.get(bink);
-            if (!s) return 0;
+            if (!s || s.engineHandle < 0) return 0;
             this._logApi(bink, "DoFrame", `paused=${s.paused} eof=${s.eof}`);
 
             if (s.paused || s.eof) return 0;
@@ -1065,7 +1201,7 @@ export class BinkW32 implements IModule {
             const rawFlags = args[6];
 
             const s = this.sessions.get(bink);
-            if (!s || !destPtr) return 0;
+            if (!s || s.engineHandle < 0 || !destPtr) return 0;
             this._logApi(bink, "CopyToBuffer", `dest=0x${destPtr.toString(16)} pitch=${pitch}`);
 
             const { surf, destBpp, copyWidth, rows, destSurface } = this.getCopyGeometry(
@@ -1194,7 +1330,7 @@ export class BinkW32 implements IModule {
             const rawFlags = args[10];
 
             const s = this.sessions.get(bink);
-            if (!s || !destPtr) return 0;
+            if (!s || s.engineHandle < 0 || !destPtr) return 0;
             this._logApi(bink, "CopyToBufferRect", `dest=0x${destPtr.toString(16)} pitch=${pitch}`);
 
             const clipH = Math.min(srcH2, destH - destY, s.height - srcT);
@@ -1280,7 +1416,7 @@ export class BinkW32 implements IModule {
         this.exports["_BinkNextFrame@4"] = (_ctx, _mem, args) => {
             const bink = args[0];
             const s = this.sessions.get(bink);
-            if (!s) return 0;
+            if (!s || s.engineHandle < 0) return 0;
             this._logApi(bink, "NextFrame");
             if (!s.paused && !s.eof) {
                 System.getInstance().videoRouting.onFrameFinalize({
@@ -1295,6 +1431,11 @@ export class BinkW32 implements IModule {
             }
             const m0 = this.getMemory();
             const prevFrame = this.readU32(m0, bink + this.layout.frameNum);
+            // Advance UNCONDITIONALLY: `eof` means the decoder reported end-of-stream, not
+            // that the stream is over for the guest — Bink wraps and a game's backdrop loop
+            // keeps running off exactly this call. A skipped video is already excluded by the
+            // engineHandle guard above, so gating this on `eof` only pins FrameNum at the last
+            // frame forever and the loop never restarts.
             videoEngine.nextFrame(s.engineHandle);
             /* Update FrameNum / LastFrameNum in guest struct */
             const info = videoEngine.getInfo(s.engineHandle);
@@ -1309,13 +1450,8 @@ export class BinkW32 implements IModule {
         };
 
         // в”Ђв”Ђ BinkWait(HBINK) → 0 = ready, 1 = not ready в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
-        // MUST be sync — games poll BinkWait in their own event loop:
-        //   while (bink_open) { pump_messages(); if (!BinkWait(h)) { DoFrame(); CopyToBuffer(); render(); } }
-        // HoMM3 decompilation (FUN_0044dd20) confirms: BinkWait is called inside
-        // FUN_0044daa0, result stored in DAT_00694ce0, then the OUTER loop calls
-        // FUN_005979d0 (DDraw Unlock→Blt→Lock) only when DAT_00694ce0==1.
-        // An async BinkWait would block FUN_0044daa0, preventing the outer loop
-        // from ever reaching the DDraw render call.
+        // MUST be synchronous: callers poll BinkWait from their own event loop and use the
+        // result to decide whether to decode/copy/render the next frame.
         this.exports["_BinkWait@4"] = (ctx, mem, args) => {
             const bink = args[0];
             const s = this.sessions.get(bink);
@@ -1326,13 +1462,8 @@ export class BinkW32 implements IModule {
 
             const msPerFrame = 1000 / s.fps;
 
-            // Audio-synced pacing (preferred): pace frames to the audio clock via
-            // a fixed-timestep target (baseline + frameCount*msPerFrame) instead of
-            // re-anchoring to now() each frame, so decode time doesn't leak in and
-            // video stays locked to audio over long clips. The 3x-wall-clock safety
-            // valve forces ready if the audio clock stalls/lags — this is the guard
-            // the earlier wall-clock-only version lacked (which is why a naive
-            // audio-sync attempt could throttle to ~5fps permanently).
+            // Anchor to the audio baseline and decoded-frame count; a bounded wall-clock
+            // fallback prevents a stalled audio clock from blocking playback.
             if (s.audioBaselineMs >= 0 && s.audioCtrl) {
                 const targetAudioMs = s.audioBaselineMs + s.frameDecodeCount * msPerFrame;
                 const audioMs = this._getAudioTimeMs(s);
@@ -1360,7 +1491,7 @@ export class BinkW32 implements IModule {
             const bink  = args[0];
             const frame = args[1];
             const s = this.sessions.get(bink);
-            if (!s) return 0;
+            if (!s || s.engineHandle < 0) return 0;
             videoEngine.gotoFrame(s.engineHandle, frame);
             s.eof = false; // seeking resets EOF state
             const m = this.getMemory();

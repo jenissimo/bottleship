@@ -14,7 +14,7 @@ import { toPlainGuestMemory } from '../../core/memory/guest-memory';
 import type { LoadedPEModule } from '../../core/module-registry';
 import type { Process } from '../../core/process';
 import { VideoEngine } from '../../../video/video-engine';
-import { measureAvcodecAbi } from './avcodec-abi';
+import { lastAbiRefusal, measureAvcodecAbi } from './avcodec-abi';
 import {
     declineToOriginal, makeDecodeVideo2Handler, onCodecClose, onFlushBuffers, probeCodecSupport,
     type DecodeHleState,
@@ -42,12 +42,20 @@ export function getFfmpegHleStats(): unknown {
     // The registry contents come first: "no patcher registered" and "registered but declined"
     // are different failures and look identical from `active: false` alone.
     const registered = nativeModulePatcherIds();
-    if (!state) return { active: false, registered, dispatched: nativeModulePatcherDispatches() };
+    if (!state) {
+        return {
+            active: false, registered, dispatched: nativeModulePatcherDispatches(),
+            // Why we are not serving. Without it `active:false` cannot distinguish "never asked"
+            // from "asked and refused this build".
+            abiRefusal: lastAbiRefusal(),
+        };
+    }
     return {
         active: !state.degraded,
         degraded: state.degraded,
         registered,
         abi: state.abi.version,
+        avutil: state.abi.avutilName,
         sessions: state.sessions.size,
         refused: state.refused.size,
         support: Object.fromEntries(state.support),
@@ -87,9 +95,9 @@ export function patchAvcodecModule(process: Process, module: LoadedPEModule): bo
     }
     const mem = toPlainGuestMemory(rawMem);
 
-    const avutil = process.moduleRegistry.getAllModules()
-        .find((m) => /^avutil-\d+$/.test(m.name.toLowerCase()));
-    const abi = measureAvcodecAbi(module, avutil, mem);
+    const avutils = process.moduleRegistry.getAllModules()
+        .filter((m) => /^avutil-\d+$/.test(m.name.toLowerCase()));
+    const abi = measureAvcodecAbi(module, avutils, mem);
     if (!abi) return false;
 
     const next: DecodeHleState = {

@@ -48,6 +48,11 @@ export interface ZipSource {
      * never return null, so this widening is behavior-preserving for them.
      */
     readRangeSync?(start: number, end: number, hint?: ReadHint): Uint8Array | null;
+    /** False when `readRangeSync` exists but cannot fault a cold range in — a block
+     *  cache over an async-only transport. Absent/true means a sync read can always be
+     *  satisfied. Callers deciding whether an entry needs a RAM copy to be readable
+     *  without awaiting must consult this, not the method's presence. */
+    syncFaultCapable?: boolean;
 }
 
 export interface ZipEntry {
@@ -391,6 +396,25 @@ export class ZipArchive {
 
             offset += 46 + nameLen + extraLen + commentLen;
         }
+    }
+
+    /**
+     * Can this entry be served at any offset by {@link readEntryRangeSync}? True only
+     * for a STORED entry over a source with a synchronous range read.
+     *
+     * The distinction a speculative caller needs: such an entry is ALREADY
+     * sync-readable, so pulling its whole body into a second RAM cache buys no
+     * capability — it only duplicates bytes and forces the transport to move the
+     * entire file for reads the caller may never make.
+     */
+    canRangeReadSync(entry: ZipEntry): boolean {
+        if (entry.compression !== 0) return false;
+        if (typeof this.source.readRangeSync !== "function") return false;
+        // A decorator can EXPOSE readRangeSync and still fail it: a block cache over an
+        // async-only transport answers null for a block it has not faulted. Taking the
+        // method's presence as the answer would tell a caller a cold entry is
+        // sync-readable when the first read of it returns null, which reads as EOF.
+        return this.source.syncFaultCapable !== false;
     }
 
     async readEntry(entry: ZipEntry): Promise<Uint8Array> {

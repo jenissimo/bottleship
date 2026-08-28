@@ -20,11 +20,26 @@ const ANCHORS: [string, number][] = [
     ["refcounted_frames", 0x1e8], ["lowres", 0x320], ["threads", 0x328],
 ];
 
+/** Offsets the shipped avutil-54 MAKE_ACCESSORS bodies really report (both 54.7 and 54.31). */
+const FRAME_ACCESSORS: [string, number][] = [
+    ["av_frame_get_sample_rate", 0x158], ["av_frame_get_channel_layout", 0x160],
+    ["av_frame_get_color_range", 0x19c], ["av_frame_get_colorspace", 0x1a8],
+    ["av_frame_get_best_effort_timestamp", 0x1b0], ["av_frame_get_pkt_pos", 0x1b8],
+    ["av_frame_get_pkt_duration", 0x1c0], ["av_frame_get_metadata", 0x1c8],
+    ["av_frame_get_decode_error_flags", 0x1cc], ["av_frame_get_channels", 0x1d0],
+    ["av_frame_get_pkt_size", 0x1d4],
+];
+
 interface Build {
     versionInt?: number;
     frameSizeof?: number;
     anchorOverride?: [string, number];
     dropOptionTable?: boolean;
+    /** Option rows this build's table does not carry (2.8 dropped `extradata_size`). */
+    dropOptions?: string[];
+    /** Accessors this build does not export. */
+    dropAccessors?: string[];
+    accessorOverride?: [string, number];
 }
 
 /** Synthesize the two images the measurement reads: an avcodec and an avutil. */
@@ -52,6 +67,7 @@ function makeImages(b: Build = {}) {
     if (!b.dropOptionTable) {
         let row = BASE + 0x1000;
         for (const [name, off] of ANCHORS) {
+            if (b.dropOptions?.includes(name)) continue;
             const value = b.anchorOverride && b.anchorOverride[0] === name ? b.anchorOverride[1] : off;
             put32(row, strAddr.get(name)!);
             put32(row + 8, value);
@@ -71,6 +87,21 @@ function makeImages(b: Build = {}) {
     mem[allocBody + 1] = 0x68;
     put32(allocBody + 2, b.frameSizeof ?? 0x1e0);
 
+    // MAKE_ACCESSORS: push ebp; mov ebp,esp; mov eax,[ebp+8]; mov eax,[eax+off]; pop ebp; ret
+    const avutilExports = new Map<string, number>([["av_frame_alloc", allocBody]]);
+    let body = avutilBase + 0x100;
+    for (const [name, off] of FRAME_ACCESSORS) {
+        if (b.dropAccessors?.includes(name)) continue;
+        const value = b.accessorOverride && b.accessorOverride[0] === name ? b.accessorOverride[1] : off;
+        mem[body] = 0x55; mem[body + 1] = 0x8b; mem[body + 2] = 0xec;
+        mem[body + 3] = 0x8b; mem[body + 4] = 0x45; mem[body + 5] = 0x08;
+        mem[body + 6] = 0x8b; mem[body + 7] = 0x80;
+        put32(body + 8, value);
+        mem[body + 12] = 0x5d; mem[body + 13] = 0xc3;
+        avutilExports.set(name, body);
+        body += 0x20;
+    }
+
     const avcodec: LoadedPEModule = {
         name: "avcodec-56", path: "c:\\avcodec-56.dll", baseAddress: BASE, size: 0x8000,
         entryPoint: 0, exports: new Map([["avcodec_version", versionBody]]),
@@ -79,7 +110,7 @@ function makeImages(b: Build = {}) {
     };
     const avutil: LoadedPEModule = {
         name: "avutil-54", path: "c:\\avutil-54.dll", baseAddress: avutilBase, size: 0x1000,
-        entryPoint: 0, exports: new Map([["av_frame_alloc", allocBody]]),
+        entryPoint: 0, exports: avutilExports,
         ordinalExports: new Map(), isRealDll: true, initialized: true,
         sections: [{ name: ".text", virtualAddress: 0, virtualSize: 0x1000, rawSize: 0x1000, characteristics: 0 }],
     };
@@ -89,7 +120,7 @@ function makeImages(b: Build = {}) {
 describe("avcodec ABI measurement", () => {
     test("accepts the shipped Lavc 56.1.100 build and reports its offsets", () => {
         const { mem, avcodec, avutil } = makeImages();
-        const abi = measureAvcodecAbi(avcodec, avutil, mem);
+        const abi = measureAvcodecAbi(avcodec, [avutil], mem);
         expect(abi).not.toBeNull();
         expect(abi!.version).toBe("56.1.100");
         expect(abi!.ctxPixFmt).toBe(0x8c);
@@ -100,36 +131,88 @@ describe("avcodec ABI measurement", () => {
 
     test("refuses a major version we have no pinned layout for", () => {
         const { mem, avcodec, avutil } = makeImages({ versionInt: (58 << 16) | (18 << 8) | 100 });
-        expect(measureAvcodecAbi(avcodec, avutil, mem)).toBeNull();
+        expect(measureAvcodecAbi(avcodec, [avutil], mem)).toBeNull();
     });
 
     test("refuses when one AVOption offsetof disagrees with the pinned layout", () => {
         // A single shifted field is exactly the silent-corruption case: everything else lines
         // up, and pix_fmt would be written into whatever moved into 0x8c.
         const { mem, avcodec, avutil } = makeImages({ anchorOverride: ["g", 0x84] });
-        expect(measureAvcodecAbi(avcodec, avutil, mem)).toBeNull();
+        expect(measureAvcodecAbi(avcodec, [avutil], mem)).toBeNull();
     });
 
     test("refuses when sizeof(AVFrame) is not the one we lay out", () => {
         const { mem, avcodec, avutil } = makeImages({ frameSizeof: 0x250 });
-        expect(measureAvcodecAbi(avcodec, avutil, mem)).toBeNull();
+        expect(measureAvcodecAbi(avcodec, [avutil], mem)).toBeNull();
     });
 
     test("refuses when the option table cannot be found at all", () => {
         const { mem, avcodec, avutil } = makeImages({ dropOptionTable: true });
-        expect(measureAvcodecAbi(avcodec, avutil, mem)).toBeNull();
+        expect(measureAvcodecAbi(avcodec, [avutil], mem)).toBeNull();
+    });
+
+    test("accepts a build whose table dropped an anchor that present anchors bracket", () => {
+        // Lavc 56.41.100 (Deponia) carries no `extradata_size` row while 56.1.100 (Satinav)
+        // does. The struct did not move — `flags` at 0x58 and `time_base` at 0x68 still sit on
+        // either side of it — so the row's absence must not cost the whole build.
+        const { mem, avcodec, avutil } = makeImages({ dropOptions: ["extradata_size"] });
+        expect(measureAvcodecAbi(avcodec, [avutil], mem)).not.toBeNull();
+    });
+
+    test("refuses an absent anchor with nothing above it to bracket against", () => {
+        // `threads` is the highest anchor: drop it and the layout above 0x320 is unwitnessed,
+        // which is the case the bracket rule must NOT wave through.
+        const { mem, avcodec, avutil } = makeImages({ dropOptions: ["threads"] });
+        expect(measureAvcodecAbi(avcodec, [avutil], mem)).toBeNull();
+    });
+
+    test("refuses when an AVFrame accessor reports a different offsetof", () => {
+        // The AVFrame head holds every field we write and no accessor reads it; a head that
+        // moved shows up here, in the tail. `pkt_pos` shifting by 8 is that signature.
+        const { mem, avcodec, avutil } = makeImages({ accessorOverride: ["av_frame_get_pkt_pos", 0x1c0] });
+        expect(measureAvcodecAbi(avcodec, [avutil], mem)).toBeNull();
+    });
+
+    test("refuses when best_effort_timestamp is not directly measurable", () => {
+        // It is the one field we WRITE that an accessor measures; the neighbours bracketing it
+        // would otherwise let the whole set pass with that offset still a guess.
+        const { mem, avcodec, avutil } = makeImages({ dropAccessors: ["av_frame_get_best_effort_timestamp"] });
+        expect(measureAvcodecAbi(avcodec, [avutil], mem)).toBeNull();
+    });
+
+    test("picks the avutil whose AVFrame agrees, not the first one loaded", () => {
+        // Deponia loads avutil-54 AND avutil-55. Nothing we parse says which one avcodec-56
+        // links against, so the measurement has to choose — and a foreign major cannot agree.
+        const { mem, avcodec, avutil } = makeImages();
+        // A second, REAL image in the same memory: its own av_frame_alloc reports ffmpeg 3.x's
+        // sizeof, so picking it would fail the gate the run must pass.
+        const foreignBase = BASE + 0xc000;
+        const foreignAlloc = foreignBase + 0x40;
+        mem[foreignAlloc] = 0x56;
+        mem[foreignAlloc + 1] = 0x68;
+        for (let i = 0; i < 4; i++) mem[foreignAlloc + 2 + i] = (0x250 >>> (i * 8)) & 0xff;
+        const foreign: LoadedPEModule = {
+            name: "avutil-55", path: "c:\avutil-55.dll", baseAddress: foreignBase, size: 0x1000,
+            entryPoint: 0, exports: new Map([["av_frame_alloc", foreignAlloc]]),
+            ordinalExports: new Map(), isRealDll: true, initialized: true,
+            sections: [{ name: ".text", virtualAddress: 0, virtualSize: 0x1000, rawSize: 0x1000, characteristics: 0 }],
+        };
+        // Positive control: taken alone, that image is refused — so passing below is the
+        // picker working, not the gate being blind.
+        expect(measureAvcodecAbi(avcodec, [foreign], mem)).toBeNull();
+        expect(measureAvcodecAbi(avcodec, [foreign, avutil], mem)).not.toBeNull();
     });
 
     test("refuses when avutil is not loaded, rather than trusting sizeof(AVFrame)", () => {
         const { mem, avcodec } = makeImages();
-        expect(measureAvcodecAbi(avcodec, undefined, mem)).toBeNull();
+        expect(measureAvcodecAbi(avcodec, [], mem)).toBeNull();
     });
 });
 
 describe("AVFrame freshness gate", () => {
     const abiOf = () => {
         const { mem, avcodec, avutil } = makeImages();
-        return { abi: measureAvcodecAbi(avcodec, avutil, mem)!, mem };
+        return { abi: measureAvcodecAbi(avcodec, [avutil], mem)!, mem };
     };
     /** get_frame_defaults leaves format -1, best_effort AV_NOPTS_VALUE, every buf[] NULL. */
     const freshFrame = (mem: Uint8Array, at: number, abi: { frameFormat: number; frameBestEffort: number }) => {
