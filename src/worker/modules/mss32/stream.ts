@@ -275,7 +275,12 @@ export function createStreamExports(ctx: MSSContext): Record<string, ThunkImplem
         const stream = ctx.streams.get(args[0]);
         if (!stream) return SMP_DONE;
         if (stream.isPaused) return SMP_STOPPED;
-        return stream.isPlaying ? SMP_PLAYING : SMP_DONE;
+        // A start deferred for want of data already publishes SMP_PLAYING to the guest's
+        // own status word, and the sample path counts pendingStart as playing for the same
+        // reason: the track has begun as far as the caller is concerned. Answering DONE
+        // here made the API contradict the word beside it and told a title polling right
+        // after AIL_start_stream that its track had already finished.
+        return (stream.isPlaying || stream.pendingStart) ? SMP_PLAYING : SMP_DONE;
     };
 
     // _AIL_stream_position@4
