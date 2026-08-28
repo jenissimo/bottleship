@@ -11,6 +11,7 @@ import { System } from '../system';
 import { APIRegistry } from '../api-registry';
 import { Logger, LogCategory } from '../logger';
 import { writeGuestCode } from '../memory/guest-code';
+import { hleImageExportAddress } from '../hle-module-images';
 
 /**
  * Resolve a thunked DLL export by name, creating an on-demand stub when needed.
@@ -102,4 +103,37 @@ export function resolveHleExportAddress(
         Logger.warn(LogCategory.KERNEL32, `resolveHleExport: stub creation failed for ${dllName}:${exportName}: ${e}`);
     }
     return 0;
+}
+
+/**
+ * The ONE address an HLE export has: what the PE loader writes into an importer's IAT
+ * and what GetProcAddress hands back. Single owner of the precedence, so the two cannot
+ * be decided differently in two places — that divergence is the whole bug class this
+ * exists for (tools/validate-data-export-binding.ts keeps hleImageExportAddress private
+ * to this decision).
+ *
+ * A data export wins over the in-image body. An export declared BOTH in the module's API
+ * table and through registerDataExport gets a call stub in the image, and for a name that
+ * is not a plain call that stub is wrong, not merely a second address: msvcrt's _EH_prolog
+ * rewrites its CALLER's frame (links FS:[0], moves EBP, returns through an address it
+ * placed on the stack), so a stub that returns normally leaves the SEH chain and EBP
+ * broken and the epilogue unwinds into nothing. qsort/bsearch are native x86 for the same
+ * reason — they call back into guest code. The registered address is the real body.
+ *
+ * `allowImage` is the PE loader's A/B switch (__noImageIatBinding) and nothing else: it
+ * takes the image body out of the answer, restoring the pre-image binding. A data export
+ * is not part of that experiment — it has always won — and an instrument asking what the
+ * one address IS must not pass it, or it stops being able to see the experiment.
+ *
+ * Returns undefined when neither exists, so callers keep their own fallback.
+ */
+export function hleExportBindingAddress(
+    thunkGenerator: any,
+    dllName: string,
+    exportName: string,
+    allowImage = true,
+): number | undefined {
+    const dataAddr = thunkGenerator?.getDataExportAddress?.(dllName, exportName);
+    if (dataAddr !== undefined) return dataAddr >>> 0;
+    return allowImage ? hleImageExportAddress(dllName, exportName) : undefined;
 }
