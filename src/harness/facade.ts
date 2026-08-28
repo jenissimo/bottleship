@@ -52,7 +52,7 @@ export interface HarnessFacade {
     /** Execute a serialized step list (CLI/MCP entry); returns one POJO. */
     __runSteps(steps: HarnessStep[]): Promise<HarnessRunResult>;
     // Browser-only verbs:
-    openWgb(idOrUrl: string, opts?: { hle?: boolean; logOnly?: boolean }): Promise<unknown>;
+    openWgb(idOrUrl: string, opts?: { hle?: boolean; logOnly?: boolean; args?: string }): Promise<unknown>;
     loadPe(url: string): Promise<unknown>;
     audioGesture(): Promise<unknown>;
     /** Host-side snapshot of the published input record + touch transport state. */
@@ -347,7 +347,7 @@ export function installHarnessFacade(worker: Worker, getInputView?: () => Int32A
         return `/apps/${idOrUrl}.wgb`;
     }
 
-    async function openWgb(idOrUrl: string, opts?: { hle?: boolean; logOnly?: boolean; reload?: boolean }): Promise<unknown> {
+    async function openWgb(idOrUrl: string, opts?: { hle?: boolean; logOnly?: boolean; reload?: boolean; args?: string }): Promise<unknown> {
         const path = await resolveBundlePath(idOrUrl);
         const w = window as any;
         // The worker reports a failed load as {type:"error"}, never as a "done" phase, so
@@ -365,7 +365,9 @@ export function installHarnessFacade(worker: Worker, getInputView?: () => Int32A
         if (opts?.hle && typeof w.enableHleAndLoad === "function") {
             await w.enableHleAndLoad(path, !!opts.logOnly);
         } else if (typeof w.loadApp === "function") {
-            await w.loadApp(path);
+            // `args` boots straight into the scene a front-end would otherwise gate behind
+            // menu clicks — the command line the game's own re-exec would have used.
+            await w.loadApp(path, opts?.args !== undefined ? { args: opts.args } : undefined);
         } else {
             throw new Error("window.loadApp not available (open ?game=dev)");
         }

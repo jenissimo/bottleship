@@ -2071,7 +2071,7 @@ export default function App() {
 
     // opts.preload: download the whole bundle to OPFS before starting instead of
     // streaming it on demand (catalog entry `preload`) — see the worker's URL path.
-    (window as any).loadApp = async (path: string, opts?: { preload?: boolean }) => {
+    (window as any).loadApp = async (path: string, opts?: { preload?: boolean; args?: string }) => {
       console.log(`BottleShip: Loading App from ${path}`);
       rotateLogFile(bundleLogName(path));
       ensurePersistentStorageRequested();
@@ -2096,7 +2096,7 @@ export default function App() {
       const lower = path.toLowerCase();
       if (lower.endsWith(".wgb")) {
         setLoadingProgress({ phase: "loading", percent: 0, label: "" });
-        globalWorker.postMessage({ type: "load_bundle", url: path, preload: opts?.preload === true });
+        globalWorker.postMessage({ type: "load_bundle", url: path, preload: opts?.preload === true, args: opts?.args });
         return;
       }
       try {

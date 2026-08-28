@@ -52,7 +52,7 @@ interface InFlight {
  * logs, fs*, break*, textures, …), which is the whole point of stopping here.
  */
 const NEEDS_LIVE_GUEST = new Set([
-    "tickFrames", "watchFrames", "waitUntil", "waitForEvent", "waitForControl", "sleep",
+    "tickFrames", "stepFrames", "watchFrames", "waitUntil", "waitForEvent", "waitForControl", "sleep",
     "click", "clickAt", "clickHold", "clickHere", "key", "keyHold", "type",
     "move", "moveRelative", "drag", "wheel", "inputSab", "padPlug",
     "tap", "touchDrag", "longPress", "twoFingerTap", "pinch",

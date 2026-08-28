@@ -314,6 +314,9 @@ let gameSessionActive = false;
 let lastBundlePayload: { data?: Uint8Array; url?: string; blob?: Blob; blobs?: File[]; preload?: boolean } | null = null;
 /** Command line the next boot must use instead of the manifest's `args` (self re-exec). */
 let pendingReExecArgs: string | null = null;
+/** Harness boot-args override (load_bundle `args`): replaces the manifest's args for one
+ *  load, so a diagnostic run can start at the scene instead of clicking through a menu. */
+let bootArgsOverride: string | null = null;
 /** VFS path of the image the next boot must run instead of the manifest's `entrypoint`
  *  (a launcher starting the game — see requestSelfReExec). */
 let pendingReExecImage: string | null = null;
@@ -2138,8 +2141,9 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
     system.executablePath = executablePath;
     // A self re-exec supplies the command line the LAUNCHER chose; it outranks the
     // manifest's boot args for exactly one boot, then the manifest applies again.
-    system.executableArgs = pendingReExecArgs ?? bundle.manifest.args ?? "";
+    system.executableArgs = pendingReExecArgs ?? bootArgsOverride ?? bundle.manifest.args ?? "";
     pendingReExecArgs = null;
+    bootArgsOverride = null;
     // The launcher that started this image is, on real Windows, still running — republish the
     // names it holds so the game's "was I started by the launcher?" check sees them.
     if (pendingInheritedObjects?.length) {
@@ -3377,6 +3381,10 @@ self.onmessage = (event: MessageEvent) => {
       cfg.logOnly = !!message.hleLogOnly;
       Logger.log(LogCategory.SYSTEM, `[HLE-lib] enabled via load_bundle (logOnly=${cfg.logOnly})`);
     }
+    // Boot straight into the scene a front-end would otherwise gate behind menu clicks.
+    // The launcher's own re-exec still outranks this (it is what the guest asked for);
+    // this only replaces the manifest's boot args, and only for this load.
+    bootArgsOverride = typeof message.args === "string" ? message.args : null;
     loadBundle({ data: message.data, url: message.url, blob: message.blob, blobs: message.blobs, preload: message.preload });
   }
 

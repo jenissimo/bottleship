@@ -19,6 +19,7 @@ import { HarnessError, HarnessErrorCode } from "../rpc";
 import { sys, cpu, guestMem, proc } from "../serialize";
 import { TimeService } from "../../runtime/time";
 import { harnessBus } from "../event-bus";
+import { cancelCapture as frameCaptureCancel, startCapture as frameCaptureStart } from "../../modules/ddraw/frame-capture";
 
 function delay(ms: number, signal: AbortSignal): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -142,6 +143,79 @@ export function registerTimeCommands(svc: HarnessService): void {
             if (fn) { fn(); parked = true; } else { try { await v86?.stop?.(); parked = true; } catch { /* */ } }
         }
         return { frames: n, startSerial: start, endSerial: render.getPresentSerial() >>> 0, ms: performance.now() - t0, presenter: render.getLastPresenterKind?.() ?? null, parked };
+    });
+
+    /** stepFrames(n=1, {capture?, backend?, timeoutMs?}) — advance EXACTLY n presents from a
+     *  parked guest and park again, inside ONE rpc.
+     *
+     *  `tickFrames(n,{park:true})` already resumes-waits-parks, but a paused inspection
+     *  session also wants the frame's per-draw capture, and arming that from a second CLI
+     *  round-trip lets the guest run free in between — the frame you inspect is then not the
+     *  frame you stepped. `capture:true` arms the CaptureBus BEFORE the resume; the capture
+     *  discards the in-progress frame and records the next, so it may consume one present
+     *  beyond `n` (reported as `endSerial`, never hidden).
+     *
+     *  Reports the present serial on both sides and the paused state afterwards: a step that
+     *  did not step (present serial unchanged, or the guest left running) reads as such
+     *  instead of as success. */
+    svc.register("stepFrames", async (args, ctx: HarnessCtx) => {
+        const n = Math.max(1, Number(args[0] ?? 1) | 0);
+        const opts = (args[1] ?? {}) as { capture?: boolean; backend?: string; timeoutMs?: number };
+        const render: any = sys().services?.render;
+        if (!render?.getPresentSerial) throw new HarnessError("render service unavailable", HarnessErrorCode.NO_PROCESS);
+        const v86: any = proc()?.v86;
+        const wasRunning = !!v86?.is_running?.();
+        const timeoutMs = opts.timeoutMs ?? 30_000;
+        const t0 = performance.now();
+
+        // Arm the capture while the guest is still parked, so no frame can slip past it.
+        let capPromise: Promise<unknown> | null = null;
+        if (opts.capture) capPromise = frameCaptureStart(opts.backend);
+
+        const start = render.getPresentSerial() >>> 0;
+        if (!wasRunning) (globalThis as any).__harnessResume?.();
+
+        let timedOut = false;
+        const target = start + n;
+        while ((render.getPresentSerial() >>> 0) < target) {
+            if (ctx.signal.aborted) throw ctx.signal.reason ?? new HarnessError("aborted", HarnessErrorCode.CANCELLED);
+            if (performance.now() - t0 > timeoutMs) { timedOut = true; break; }
+            await delay(4, ctx.signal);
+        }
+
+        let capture: unknown = null;
+        let captureError: string | null = null;
+        if (capPromise) {
+            try {
+                capture = await Promise.race([
+                    capPromise,
+                    (async () => {
+                        while (performance.now() - t0 <= timeoutMs) await delay(4, ctx.signal);
+                        throw new HarnessError(`capture did not complete within ${timeoutMs}ms`, HarnessErrorCode.TIMEOUT);
+                    })(),
+                ]);
+            } catch (e) {
+                captureError = (e as Error).message;
+                frameCaptureCancel(e instanceof Error ? e : new Error(String(e)));
+            }
+        }
+
+        const fn = (globalThis as any).__harnessPause;
+        if (fn) fn(); else { try { await v86?.stop?.(); } catch { /* park is best-effort without the hook */ } }
+        const endSerial = render.getPresentSerial() >>> 0;
+        return {
+            requested: n,
+            startSerial: start,
+            endSerial,
+            advanced: (endSerial - start) >>> 0,
+            wasRunning,
+            paused: !!sys().isPaused,
+            timedOut,
+            ms: performance.now() - t0,
+            presenter: render.getLastPresenterKind?.() ?? null,
+            capture,
+            captureError,
+        };
     });
 
     svc.register("waitUntil", async (args, ctx: HarnessCtx) => {

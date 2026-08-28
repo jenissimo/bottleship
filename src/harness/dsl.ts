@@ -62,7 +62,7 @@ export class HarnessChain {
      *  need the composited canvas itself — `shot` hands back a PNG, not pixels. */
     evalPage(expr: string, timeoutMs?: number): this { return this.push("evalPage", [expr, timeoutMs]); }
     /** Load a WGB. By default reloads the page first (fresh worker + code); pass `{ reload: false }` to skip. */
-    openWgb(idOrUrl: string, opts?: { hle?: boolean; logOnly?: boolean; reload?: boolean }): this {
+    openWgb(idOrUrl: string, opts?: { hle?: boolean; logOnly?: boolean; reload?: boolean; args?: string }): this {
         const reload = opts?.reload !== false;
         if (reload) this.push("reload", []);
         return this.push("openWgb", [idOrUrl, { ...opts, reload: false }]);
@@ -104,6 +104,12 @@ export class HarnessChain {
     waitUntil(predicate: () => boolean, opts?: { timeoutMs?: number; pollMs?: number }): this { return this.pushTimed("waitUntil", [predicate, opts], (opts?.timeoutMs ?? 30_000) + 5_000); }
     tickFrames(n: number, opts?: { timeoutMs?: number; park?: boolean }): this { return this.pushTimed("tickFrames", [n, { park: opts?.park }], opts?.timeoutMs ?? 120_000); }
     watchFrames(on = true): this { return this.push("watchFrames", [on]); }
+    /** Advance a PARKED guest by exactly n presents and park again, in one RPC — the
+     *  frame-by-frame stepper for inspecting a scene. `capture` arms the per-draw capture
+     *  before the resume, so the frame you inspect is the frame you stepped. */
+    stepFrames(n = 1, opts?: { capture?: boolean; backend?: "ddraw" | "d3d8" | "d3d9"; timeoutMs?: number }): this {
+        return this.pushTimed("stepFrames", [n, opts], (opts?.timeoutMs ?? 30_000) + 5_000);
+    }
     sleep(ms: number): this { return this.pushTimed("sleep", [ms], ms + 5_000); }
 
     // ── input ──
@@ -250,6 +256,11 @@ export class HarnessChain {
     textures(): this { return this.push("textures", []); }
     dumpTexture(sel: string | { stage: number }): this { return this.push("dumpTexture", [sel]); }
     dumpSurface(sel: string): this { return this.push("dumpSurface", [sel]); }
+    /** DDraw composition-op ring: `{arm:N}` to record the next N Blt/BltFast/Flip/Load/fill ops,
+     *  then call again with no argument to take them. `alpha:true` adds a per-op ARGB1555
+     *  alpha-bit census of source and destination — that pair is what names the op that
+     *  dropped a masked texture's transparency. `alphaLostOnly` returns just those ops. */
+    surfaceOps(opts?: { arm?: number; alpha?: boolean; alphaLostOnly?: boolean }): this { return this.push("surfaceOps", [opts]); }
     /** One COMPLETED GL frame, decoded per draw: drawable size, the viewport/scissor that
      *  were active, and each draw's NDC + resulting screen box. Separates "wrong quad" from
      *  "wrong viewport/render target" without guessing. */

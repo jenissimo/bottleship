@@ -106,12 +106,30 @@ export function registerTextureCommands(svc: HarnessService): void {
      *  but half of it is black" — the missing rects are the ones whose op never ran, or
      *  ran into the representation the next Flip did not read. */
     svc.register("surfaceOps", (args) => {
-        const opts = (args[0] ?? {}) as { arm?: number };
-        if (typeof opts.arm === "number") return armSurfaceOps(opts.arm);
+        const opts = (args[0] ?? {}) as { arm?: number; alpha?: boolean; alphaLostOnly?: boolean };
+        if (typeof opts.arm === "number") return armSurfaceOps(opts.arm, { alpha: opts.alpha });
         const ops = takeSurfaceOps();
         const byPath: Record<string, number> = {};
         for (const o of ops) byPath[`${o.op}:${o.path}`] = (byPath[`${o.op}:${o.path}`] ?? 0) + 1;
-        return { count: ops.length, byPath, ops };
+        // The signature of a dropped mask: the source carried transparent texels, the
+        // destination has none afterwards. Filtering here (not in the caller) keeps a
+        // level-load-sized ring from having to cross the RPC to answer one question.
+        const alphaLost = ops.filter((o) => o.srcAlpha && o.dstAlpha && o.srcAlpha.clear > 0 && o.dstAlpha.clear === 0);
+        // The four-way tally is the load-bearing part: "no ops lost alpha" is only meaningful
+        // next to how many ops carried a measurable alpha channel at all, and how many arrived
+        // already opaque (which points upstream, at the guest, not at us).
+        const t = { measured: 0, srcClearDstClear: 0, srcClearDstOpaque: 0, srcOpaqueDstOpaque: 0, srcOpaqueDstClear: 0 };
+        for (const o of ops) {
+            if (!o.srcAlpha || !o.dstAlpha) continue;
+            t.measured++;
+            const s = o.srcAlpha.clear > 0, d = o.dstAlpha.clear > 0;
+            if (s && d) t.srcClearDstClear++;
+            else if (s && !d) t.srcClearDstOpaque++;
+            else if (!s && !d) t.srcOpaqueDstOpaque++;
+            else t.srcOpaqueDstClear++;
+        }
+        if (opts.alphaLostOnly) return { count: ops.length, byPath, alphaTally: t, alphaLost: alphaLost.length, ops: alphaLost };
+        return { count: ops.length, byPath, alphaTally: t, alphaLost: alphaLost.length, ops };
     });
 
     /** dumpSurface(sel, {save?, from?}) — DDraw surface -> PNG.

@@ -25,6 +25,7 @@ import {
     getSurfaceFormatLayout,
     isBlockCompressedFormat,
 } from "../../../backends/webgpu/shared/texture-formats";
+import { recordSurfaceOp, surfaceOpsArmed } from "../surface-op-log";
 
 export const createTextureExports = (
     context: DDrawContext,
@@ -446,6 +447,7 @@ export const createTextureExports = (
         // Load() calls, causing "textures swap to foreign ones" artifacts.
 
         const markDirtyAndFinish = (): number => {
+            if (surfaceOpsArmed()) recordSurfaceOp("load", "v1", dstState, srcState, null, null);
             // Mark destination as dirty so GPU upload will happen.
             if (isRenderSurface(dstState)) {
                 // Load() replaced the CONTENT, so the content version must move with the dirty
@@ -662,6 +664,10 @@ export const createTextureExports = (
         }
 
         const runLoadTail = (): number => {
+            // Load is how a D3D6/7 title publishes texture pixels without ever Locking the
+            // video surface, so it is invisible to the Blt/Lock ring — and a masked texture
+            // that arrives transparent and leaves opaque has exactly one suspect.
+            if (surfaceOpsArmed()) recordSurfaceOp("load", loadBranch, dstState, srcState, null, null);
             propagateSurfaceStateToRegistry(context, dstState);
             if (dstState.gpuTexture && dstState.surfacePtr > 0) {
                 const gpuTex = dstState.gpuTexture;
