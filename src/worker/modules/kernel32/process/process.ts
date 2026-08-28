@@ -19,6 +19,7 @@ import { encodeAnsi } from '../../codepage-utils';
 import { applyShellExecFake, hasShellExecFakeMatch, isDifferentCommandLine } from '../../shell32';
 import { isUe1RenderProbeCommandLine } from '../../../runtime/filesystem/ue1-firstrun';
 import { getVirtualProcessManager, VIRTUAL_CURRENT_PROCESS_ID } from './virtual-process-manager';
+import { hostToolsEnabled, runHostTool, type HostToolFile } from '../../../core/host-tool-bridge';
 import { createActCtxExports } from './actctx';
 import { versionVerifyExports } from './version-verify';
 import { GUEST_COMPUTER_NAME } from '../../../core/guest-identity';
@@ -380,6 +381,67 @@ export const stripFirstCommandLineToken = (commandLine: string): string => {
     return sp < 0 ? '' : s.slice(sp).trimStart();
 };
 
+/** Split a Win32 command line the way CommandLineToArgvW does for the simple cases a
+ *  console tool is spawned with: whitespace-separated, double quotes group. */
+const commandLineToArgv = (commandLine: string): string[] => {
+    const out: string[] = [];
+    let cur = "";
+    let inQuote = false;
+    for (const ch of commandLine) {
+        if (ch === '"') { inQuote = !inQuote; continue; }
+        if (!inQuote && /\s/.test(ch)) {
+            if (cur) { out.push(cur); cur = ""; }
+            continue;
+        }
+        cur += ch;
+    }
+    if (cur) out.push(cur);
+    return out;
+};
+
+/**
+ * Forward a console tool the guest spawned to the dev host (see core/host-tool-bridge.ts).
+ *
+ * The tool is run in a scratch directory seeded with every argument that names a file the
+ * guest actually has, and everything it produces there is written back under the same bare
+ * name — so this needs no knowledge of one tool's flags (which argument is the input, which
+ * `/Fc` names an output). Returns the child's exit code, or null when the bridge declined,
+ * in which case the caller keeps refusing the spawn honestly.
+ */
+const runGuestToolOnHost = async (imagePath: string, commandLine: string): Promise<number | null> => {
+    const argv = commandLineToArgv(commandLine);
+    const tool = (imagePath.split(/[\\/]/).pop() ?? "").replace(/\.exe$/i, "").toLowerCase();
+    if (!tool) return null;
+
+    const vfs = System.getInstance().fileSystem;
+    const inputs: HostToolFile[] = [];
+    // The sidecar deliberately accepts bare-name argv only. Copying VFS inputs and returned
+    // outputs by basename preserves that contract; path-bearing arguments are refused there.
+    for (const arg of argv.slice(1)) {
+        if (arg.startsWith("/") || arg.startsWith("-")) continue;
+        const size = vfs.getFileSize(arg);
+        if (!size || size <= 0) continue;
+        const h = await vfs.open(arg, GENERIC_READ, OPEN_EXISTING);
+        if (!h) continue;
+        const bytes = await vfs.read(h, size);
+        if (bytes) inputs.push({ name: arg.split(/[\\/]/).pop() ?? arg, bytes });
+    }
+
+    const result = await runHostTool(tool, argv.slice(1), inputs);
+    if (!result) return null;
+
+    for (const out of result.outputs) {
+        const h = await vfs.open(out.name, 0x40000000, 2); // GENERIC_WRITE, CREATE_ALWAYS
+        if (!h) continue;
+        await vfs.write(h, out.bytes);
+        await vfs.flushFile(h.path);
+    }
+    Logger.log(LogCategory.SYSTEM,
+        `[KERNEL32] host tool "${tool}" ${argv.slice(1).join(" ")} -> exit=${result.exitCode} ` +
+        `in=[${inputs.map(f => f.name).join(",")}] out=[${result.outputs.map(f => f.name).join(",")}]`);
+    return result.exitCode;
+};
+
 const isCurrentProcessHandle = (handle: number): boolean => {
     if ((handle >>> 0) === CURRENT_PROCESS_PSEUDO_HANDLE) {
         return true;
@@ -672,7 +734,11 @@ const finishVirtualProcess = (
     dwCreationFlags: number,
     isWide: boolean,
     noOpProbe: boolean,
-    deferredExec?: { imagePath: string; commandLine: string }
+    deferredExec?: { imagePath: string; commandLine: string },
+    /** Present when the child has ALREADY run to completion (host-tool bridge): the handle
+     *  must be signalled before we return, or the parent's WaitForSingleObject never
+     *  completes and it spins on a child that will never exist. */
+    exitCode?: number,
 ): ThunkResult => {
     const manager = getVirtualProcessManager();
     const proc = manager.createProcess({
@@ -705,6 +771,8 @@ const finishVirtualProcess = (
         `${noOpProbe ? ' no-op-probe=1 sync=1' : ''}` +
         `${deferredExec ? ` suspended-exec="${deferredExec.imagePath}"` : ''}`
     );
+
+    if (exitCode !== undefined) manager.terminateProcess(proc.processHandle, exitCode);
 
     System.getInstance().scheduler.setLastError(0);
     return { value: 1, stackCleanup: 40 };
@@ -769,7 +837,20 @@ const createVirtualProcess = (memory: Uint8Array, args: number[], isWide: boolea
         const deferExec = (dwCreationFlags & CREATE_SUSPENDED) !== 0
             || !!(globalThis as { __noSuspendedChildExec?: boolean }).__noSuspendedChildExec;
         // A console tool is never a session host: the parent spawned it to WAIT on it.
-        const execCandidate = !!imagePath && isBundledImage(imagePath) && !isConsoleSubsystemImage(imagePath);
+        const isConsoleTool = !!imagePath && isBundledImage(imagePath) && isConsoleSubsystemImage(imagePath);
+        const execCandidate = !!imagePath && isBundledImage(imagePath) && !isConsoleTool;
+        // ...but on a dev box that tool can actually be run (host-tool bridge), which is how a
+        // game that compiles its own shaders at run time gets to fill its on-disk cache once.
+        if (isConsoleTool && hostToolsEnabled()) {
+            return runGuestToolOnHost(imagePath, commandLine || applicationName).then((exitCode) =>
+                exitCode === null
+                    ? failVirtualProcess(lpProcessInformation, applicationName, commandLine, currentDirectory, isWide)
+                    : finishVirtualProcess(
+                        lpProcessInformation, applicationName, commandLine,
+                        currentDirectory, dwCreationFlags, isWide, false, undefined, exitCode,
+                    )
+            );
+        }
         if (execCandidate && deferExec) {
             return finishVirtualProcess(
                 lpProcessInformation, applicationName, commandLine,
@@ -2429,4 +2510,3 @@ export function registerFastPathProcessFunctions(dispatcher: any): void {
         return prev === null ? null : (prev >>> 0);
     }, { trivial: true });
 }
-
