@@ -46,7 +46,11 @@ describe("D3D9 raster emulation policy", () => {
         expect(set.getTextureStageState.call(fake, 8, 1)).toBe(0);
     });
 
-    test("does not accept light indices beyond the advertised active-light bank", () => {
+    test("accepts a sparse light index; the bank cap is on how many are ENABLED", () => {
+        // D3D9 light indices are an unbounded sparse DWORD space (DXVK resizes its vector to
+        // Index + 1); MaxActiveLights caps only the simultaneously enabled set, which is
+        // enforced where the FFP bank is built. An engine that gives each scene light its own
+        // slot and enables a subset is doing the documented thing.
         const set = (D3D9Device.prototype as unknown as {
             setLight: (index: number, data: Uint8Array) => number;
             getLight: (index: number) => Uint8Array | null;
@@ -54,9 +58,12 @@ describe("D3D9 raster emulation policy", () => {
         });
         const fake = { lights: new Map<number, Uint8Array>(), lightEnables: new Map<number, number>(), recordingStateBlock: false } as any;
         expect(FFP_MAX_LIGHTS).toBe(8);
-        expect(set.setLight.call(fake, 8, new Uint8Array(64))).not.toBe(0);
-        expect(set.getLight.call(fake, 8)).toBeNull();
-        expect(set.lightEnable.call(fake, 8, 1)).not.toBe(0);
+        expect(set.setLight.call(fake, 12, new Uint8Array(64))).toBe(0);
+        expect(set.getLight.call(fake, 12)).not.toBeNull();
+        expect(set.lightEnable.call(fake, 12, 1)).toBe(0);
+        // A negative index is not a sparse one — it is a malformed call.
+        expect(set.setLight.call(fake, -1, new Uint8Array(64))).not.toBe(0);
+        expect(set.getLight.call(fake, -1)).toBeNull();
     });
     test("classifies D3D9 homogeneous clip planes without a perspective divide", () => {
         expect(d3d9HomogeneousClipCode([0, 0, 0.5, 1])).toBe(0);
