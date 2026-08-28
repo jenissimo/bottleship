@@ -415,10 +415,21 @@ const MAX_AHEAD_MS = TimeService.MAX_AHEAD_MS;
  *  dominated by the microsecond quantization, not by how fast the guest is running.
  *  Accumulated across publishes — one publish is far shorter than this. */
 const MIPS_SAMPLE_MIN_US = 2000;
-/** How far above TARGET_MIPS_PER_US the slope may be pushed. Reached when the clock is being
- *  held back (MAX_AHEAD_MS) while the guest keeps retiring: interpolation then contributes
- *  almost nothing, which is the correct answer — a stalled clock must not invent time. */
-const MIPS_CEILING = TARGET_MIPS_PER_US * 16;
+/** Hard bound on the published slope, and ONLY a bound — never a value the estimator is
+ *  expected to sit at. handle_get_tick_count computes `delta_insn / (mips * 1000)` with a u32
+ *  multiply, so `mips * 1000` must stay inside u32 (mips < 4_294_967); this keeps an order of
+ *  magnitude clear of that wrap. A slope ABOVE the true retire rate only costs sub-publish
+ *  resolution (monotonic, harmless); a slope BELOW it forces every publish to correct
+ *  downwards, and the correction is credited into virtual time — so a ceiling the host can
+ *  actually reach turns into a permanent, self-sustaining fast-forward. Hence a wrap guard,
+ *  not a tuning knob. */
+const MIPS_CEILING = 400_000;
+/** The slope to assume when the clock is not advancing AT ALL (held at MAX_AHEAD_MS while the
+ *  guest keeps retiring). No rate is measurable then; a steep slope makes the interpolation
+ *  contribute almost nothing, which is the correct answer — a stalled clock must not invent
+ *  time. Deliberately modest: the estimator decays back down over ~1 s, so parking it at the
+ *  wrap-guard ceiling would blind the interpolation long after the stall cleared. */
+const MIPS_STALLED_CLOCK = TARGET_MIPS_PER_US * 16;
 
 /**
  * The largest clock value the guest can already have read since the last publish.
@@ -478,6 +489,10 @@ export class HypercallDataManager {
     private clockMonotonicFixups = 0;
     private clockMonotonicMaxUs = 0;
     private clockMonotonicExcessUs = 0;
+    /** Diagnostics: samples where the slope hit MIPS_CEILING. Pinned there means the estimator
+     *  is no longer measuring the host, so every publish under-interpolates and the floor pays
+     *  the difference — pinned WITH climbing fixups is the signature, either alone is not. */
+    private mipsCeilingHits = 0;
 
     // FLS mirror used by WASM FlsGetValue hypercall. Allocation bitmap is
     // process-global (indices are), but VALUES are per-thread (fiber-local ==
@@ -636,6 +651,7 @@ export class HypercallDataManager {
 
         this.writeFlsSharedState();
         this.writeEventMirrorState(true); // preserve WASM-set signal bits across buffer-change resync
+        this.resyncPublishedClockAfterBufferChange();
 
         // Re-set hc_enabled if we were enabled before buffer change
         if (this.enabled) {
@@ -643,7 +659,6 @@ export class HypercallDataManager {
             // Re-snapshot instruction counter and wall-clock — it may also have been reset
             this.lastInsnSnapshot = this.cpu?.instruction_counter?.[0] ?? 0;
             this.lastWallSnapshot = performance.now();
-            this.resetPublishedClock();
             Logger.log(LogCategory.SYSTEM,
                 `[HYPERCALL] Re-synced state after buffer change ` +
                 `(${this.registeredEntries.size} handlers, enabled=true)`);
@@ -1261,10 +1276,9 @@ export class HypercallDataManager {
      * wants to install, and the guest's clock steps BACKWARDS.
      *
      * Windows guarantees QPC, GetTickCount and the TSC are monotonic, and a guest computing an
-     * UNSIGNED delta across the step gets ~2^32 ticks, not a small negative. Nothing downstream
-     * can defend against that — the value is indistinguishable from an enormous elapsed time.
-     * (Measured: a 3.1 ms backwards QPC step handed GTA III's cutscene camera 2147 SECONDS of
-     * frame delta in one frame and teleported it to the end of its flyby spline.)
+     * UNSIGNED delta across the step reads ~2^32 ticks, not a small negative — a millisecond of
+     * regression becomes an enormous elapsed time that nothing downstream can distinguish from
+     * a real one.
      *
      * So a publish never lowers the clock: the floor is exactly the largest value the guest
      * could already have read. When that floor bites, the excess is pushed INTO virtual time
@@ -1292,12 +1306,13 @@ export class HypercallDataManager {
             // microsecond quantization, which is why a per-publish test never moved the slope.
             // The insn escape hatch covers a clock that is not advancing at all: instructions
             // still pile up, and the slope must go to the ceiling rather than sit stale.
-            if (this.slopeUsAcc >= MIPS_SAMPLE_MIN_US || this.slopeInsnAcc >= MIPS_SAMPLE_MIN_US * MIPS_CEILING) {
-                const observed = this.slopeUsAcc > 0 ? this.slopeInsnAcc / this.slopeUsAcc : MIPS_CEILING;
+            if (this.slopeUsAcc >= MIPS_SAMPLE_MIN_US || this.slopeInsnAcc >= MIPS_SAMPLE_MIN_US * MIPS_STALLED_CLOCK) {
+                const observed = this.slopeUsAcc > 0 ? this.slopeInsnAcc / this.slopeUsAcc : MIPS_STALLED_CLOCK;
                 this.mipsEstimate = observed > this.mipsEstimate
                     ? observed
                     : this.mipsEstimate + (observed - this.mipsEstimate) * Math.min(1, this.slopeUsAcc / 1_000_000);
                 this.mipsEstimate = Math.min(MIPS_CEILING, Math.max(TARGET_MIPS_PER_US, this.mipsEstimate));
+                if (this.mipsEstimate >= MIPS_CEILING) this.mipsCeilingHits++;
                 this.slopeInsnAcc = 0;
                 this.slopeUsAcc = 0;
             }
@@ -1314,6 +1329,9 @@ export class HypercallDataManager {
                 nowMicros = ceilingUs;
                 // Push it into virtual time too: the page and TimeService must stay ONE clock,
                 // or the next publish recomputes the same regression from a stale TimeService.
+                // The raw primitive is required here (not creditIdleMs): this amount has
+                // ALREADY been served to the guest, so clamping it to the wall leash would
+                // re-open the backwards step. See advanceVirtualTime's carve-out.
                 timeService.advanceVirtualTime(excessUs / 1000);
                 nowMs = timeService.nowMs();
             }
@@ -1342,21 +1360,54 @@ export class HypercallDataManager {
 
     /** Diagnostics: how often a publish had to be raised to keep the guest clock monotonic,
      *  and the largest backwards step that was suppressed. A non-zero `maxUs` here is the
-     *  amount a guest would otherwise have read as a ~2^32-tick jump. */
-    getClockMonotonicStats(): { fixups: number; maxSuppressedUs: number; totalSuppressedMs: number; mipsEstimate: number } {
+     *  amount a guest would otherwise have read as a ~2^32-tick jump.
+     *  `mipsPinned` with `fixups` climbing means the slope has stopped tracking the host and
+     *  the floor has become the clock's only advance path — see MIPS_CEILING. */
+    getClockMonotonicStats(): {
+        fixups: number; maxSuppressedUs: number; totalSuppressedMs: number;
+        mipsEstimate: number; mipsCeiling: number; mipsPinned: boolean; mipsCeilingHits: number;
+    } {
         return {
             fixups: this.clockMonotonicFixups,
             maxSuppressedUs: this.clockMonotonicMaxUs,
             totalSuppressedMs: +(this.clockMonotonicExcessUs / 1000).toFixed(1),
             mipsEstimate: +this.mipsEstimate.toFixed(1),
+            mipsCeiling: MIPS_CEILING,
+            mipsPinned: this.mipsEstimate >= MIPS_CEILING,
+            mipsCeilingHits: this.mipsCeilingHits,
         };
     }
 
-    /** Drop the published-clock anchor (buffer change / pause-resume / game switch): the
-     *  instruction counter it refers to is no longer meaningful, and a stale anchor would
-     *  compute a bogus interpolation ceiling. */
+    /** Drop the published-clock anchor (pause/resume, game switch): the instruction counter it
+     *  refers to is no longer meaningful, and a stale anchor would compute a bogus
+     *  interpolation ceiling. NOT for a WASM buffer change — see
+     *  resyncPublishedClockAfterBufferChange, which keeps the anchor when it is still live. */
     resetPublishedClock(): void {
         this.publishedValid = false;
+    }
+
+    /**
+     * Decide whether the published-clock anchor survived a WASM buffer change.
+     *
+     * The two causes look identical from JS and are opposite here. A `memory.grow` preserves
+     * page contents and does not touch instruction_counter: WASM keeps interpolating from the
+     * anchor we published, so dropping it would let the next publish skip the monotonicity
+     * floor and install a value BELOW one the guest has already read — the exact hole
+     * publishClock exists to close, re-opened by any mid-gameplay allocation that grows memory.
+     * A v86.restart() zeroes HYPERCALL_PAGE (a Rust static) and restarts the counter, so the
+     * anchor is meaningless and must go. The page itself is the discriminator: only the grow
+     * still carries the values we last wrote.
+     */
+    private resyncPublishedClockAfterBufferChange(): void {
+        if (!this.publishedValid) return;
+        if (!this.view) { this.publishedValid = false; return; }
+        const baseLo = this.view.getUint32(this.hpBase + OFF_HC_PERF_COUNTER_LO, true);
+        const baseHi = this.view.getUint32(this.hpBase + OFF_HC_PERF_COUNTER_HI, true);
+        const pageBaseUs = baseHi * 0x100000000 + baseLo;
+        const intact = pageBaseUs === this.publishedBaseUs
+            && this.view.getUint32(this.hpBase + OFF_HC_INSN_AT_TIME_UPDATE, true) === this.publishedInsn
+            && this.view.getUint32(this.hpBase + OFF_HC_MIPS_ESTIMATE, true) === this.publishedMips;
+        if (!intact) this.publishedValid = false;
     }
 
     /**
@@ -1373,8 +1424,8 @@ export class HypercallDataManager {
         if (!this.view) return;
 
         // Same publish primitive as updateTimeData: this is a re-anchor of the very same
-        // interpolation, so it carries the same monotonicity obligation. Writing the fields
-        // by hand here is what made the backwards step reachable from two places.
+        // interpolation, so it carries the same monotonicity obligation. One publisher is the
+        // invariant — a second one writing the fields directly bypasses the floor.
         this.publishClock(TimeService.getInstance(), (cpu?.instruction_counter?.[0] ?? 0) >>> 0);
     }
 

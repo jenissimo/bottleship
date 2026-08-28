@@ -23,6 +23,9 @@ import { hypercallDataManager } from "../../core/cpu/hypercall-data";
 import { harnessBus } from "../event-bus";
 import { cancelCapture as frameCaptureCancel, startCapture as frameCaptureStart } from "../../modules/ddraw/frame-capture";
 
+/** virtualTimeSources patches the shared TimeService prototype; only one window at a time. */
+let virtualTimeSourcesBusy = false;
+
 function delay(ms: number, signal: AbortSignal): Promise<void> {
     return new Promise((resolve, reject) => {
         const t = setTimeout(resolve, ms);
@@ -106,24 +109,41 @@ export function registerTimeCommands(svc: HarnessService): void {
         };
     });
 
-    /** virtualTimeSources({sampleMs}) — WHO advanced the guest clock during the window,
-     *  and by how much. `guestTime` says the rate is wrong; this says which of the seven
-     *  advance paths (plan/virtual-time.md §1.2) spent the milliseconds, keyed by the JS
-     *  caller frame. That is the difference between "the clock runs 45x" and "msvcrt
-     *  `_sleep` credits its argument as seconds".
+    /** virtualTimeSources({sampleMs, stackEveryNth}) — WHO advanced the guest clock during the
+     *  window, and by how much. `guestTime` says the rate is wrong; this says which of the
+     *  seven advance paths (plan/virtual-time.md §1.2) spent the milliseconds, so a wrong rate
+     *  becomes a named entry point rather than a number to reason about.
      *
      *  Self-checking: `creditedMs` (what the wrapped entry points were asked for) is
      *  reported next to `virtualDeltaMs` (what the clock actually did). A large residual
      *  means an advance path this wrapper does not cover wrote `virtualTimeMs` directly —
-     *  reported as `unattributedMs`, never silently folded into the rows. */
+     *  reported as `unattributedMs`, never silently folded into the rows.
+     *
+     *  The MS ARE COMPLETE, the CALLERS ARE SAMPLED. Every credit is tallied per kind, but the
+     *  caller frame needs `new Error().stack`, and the heaviest advance path is the post-sync-thunk
+     *  credit — hundreds of calls per frame (CLAUDE.md §3.5). Materializing a stack string on
+     *  that path slows the worker enough to depress the very rate this verb reports, and to make
+     *  it incomparable with `guestTime`'s. So the stack is taken once per `stackEveryNth` credit;
+     *  the residual per-credit cost is an increment, a modulo and one Map lookup. `rows` is
+     *  therefore the sampled subset and says so — `byKind` is the complete accounting. */
     svc.register("virtualTimeSources", async (args, ctx: HarnessCtx) => {
-        const sampleMs = Math.max(1, Number((args[0] as { sampleMs?: number } | undefined)?.sampleMs ?? 2000));
+        const o = (args[0] ?? {}) as { sampleMs?: number; stackEveryNth?: number };
+        const sampleMs = Math.max(1, Number(o.sampleMs ?? 2000));
+        const stackEveryNth = Math.max(1, Math.floor(Number(o.stackEveryNth ?? 64)));
         const ts = TimeService.getInstance();
         if (!ts.isVirtualTimeActive()) {
             return { virtualTimeActive: false, note: "virtual time is off — nothing advances the guest clock" };
         }
+        // The wrappers live on the shared prototype, so two overlapping windows would save each
+        // other's wrappers as "orig" and leave one installed for the life of the worker.
+        if (virtualTimeSourcesBusy) {
+            return { error: "virtualTimeSources is already sampling — it patches TimeService.prototype and cannot nest" };
+        }
+        virtualTimeSourcesBusy = true;
         const proto = TimeService.prototype as unknown as Record<string, (...a: never[]) => unknown>;
+        const byKind = new Map<string, { calls: number; ms: number }>();
         const tally = new Map<string, { calls: number; ms: number }>();
+        let credits = 0, stacksTaken = 0;
         const callerKey = (): string => {
             const stack = (new Error().stack ?? "").split("\n");
             // 0 = "Error", 1 = this helper, 2 = the wrapper — 3.. is the real caller.
@@ -131,6 +151,11 @@ export function registerTimeCommands(svc: HarnessService): void {
         };
         const bump = (kind: string, ms: number): void => {
             if (!ms) return;
+            const total = byKind.get(kind) ?? { calls: 0, ms: 0 };
+            total.calls++; total.ms += ms;
+            byKind.set(kind, total);
+            if (++credits % stackEveryNth !== 0) return;
+            stacksTaken++;
             const key = `${kind} ${callerKey()}`;
             const row = tally.get(key) ?? { calls: 0, ms: 0 };
             row.calls++; row.ms += ms;
@@ -171,20 +196,28 @@ export function registerTimeCommands(svc: HarnessService): void {
             proto.creditIdleMs = origCredit;
             proto.reanchorToWallClock = origReanchor;
             proto.notifyPauseResume = origPauseResume;
+            virtualTimeSourcesBusy = false;
         }
         const v1 = ts.nowMs(), w1 = performance.now();
         const dv = v1 - v0, dw = w1 - w0;
-        const rows = [...tally.entries()]
-            .map(([caller, r]) => ({ caller, calls: r.calls, ms: +r.ms.toFixed(1) }))
+        const kinds = [...byKind.entries()]
+            .map(([kind, r]) => ({ kind, calls: r.calls, ms: +r.ms.toFixed(1) }))
             .sort((a, b) => b.ms - a.ms);
-        const creditedMs = rows.reduce((s, r) => s + r.ms, 0);
+        const rows = [...tally.entries()]
+            .map(([caller, r]) => ({ caller, sampledCalls: r.calls, sampledMs: +r.ms.toFixed(1) }))
+            .sort((a, b) => b.sampledMs - a.sampledMs);
+        const creditedMs = kinds.reduce((s, r) => s + r.ms, 0);
         return {
             virtualTimeActive: true,
             sampleMs: +dw.toFixed(1),
             virtualDeltaMs: +dv.toFixed(1),
             rate: +(dv / dw).toFixed(3),
+            // Complete: every credit in the window, by entry point.
             creditedMs: +creditedMs.toFixed(1),
             unattributedMs: +(dv - creditedMs).toFixed(1),
+            byKind: kinds,
+            // Sampled: caller frames for one credit in `stackEveryNth`. Rank them, don't sum them.
+            stackSampling: { everyNth: stackEveryNth, credits, stacksTaken },
             rows: rows.slice(0, 20),
         };
     });

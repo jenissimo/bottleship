@@ -358,10 +358,15 @@ export class HarnessChain {
     time(action: "freeze" | "advance" | "realtime", ms?: number): this { return this.push("time", [action, ms]); }
     /** Sample the guest clock against wall clock — `rate` <1 means game time is losing. */
     guestTime(opts?: { sampleMs?: number }): this { return this.pushTimed("guestTime", [opts], (opts?.sampleMs ?? 1000) + 5_000); }
-    /** WHICH advance path spent the guest clock's milliseconds, keyed by JS caller — the
-     *  follow-up to a `guestTime` rate that is not ~1.0. `unattributedMs` reports what no
-     *  wrapped entry point accounts for rather than hiding it in the rows. */
-    virtualTimeSources(opts?: { sampleMs?: number }): this { return this.pushTimed("virtualTimeSources", [opts], (opts?.sampleMs ?? 2000) + 10_000); }
+    /** WHICH advance path spent the guest clock's milliseconds — the follow-up to a `guestTime`
+     *  rate that is not ~1.0. `unattributedMs` reports what no wrapped entry point accounts for
+     *  rather than hiding it in the rows. `byKind` is complete; `rows` (caller frames) is
+     *  sampled one credit in `stackEveryNth`, so the stack capture cannot depress the rate. */
+    virtualTimeSources(opts?: { sampleMs?: number; stackEveryNth?: number }): this { return this.pushTimed("virtualTimeSources", [opts], (opts?.sampleMs ?? 2000) + 10_000); }
+    /** The dt the GUEST observes per frame, and above all its MAXIMUM — a rate is a mean and
+     *  reads 1.000 while one multi-second delta goes through. Arm before the phase, read after,
+     *  or pass `sampleMs` for a self-contained window. */
+    guestSteps(opts?: { arm?: boolean; disarm?: boolean; reset?: boolean; budgetMs?: number; maxBuckets?: number; sampleMs?: number }): this { return this.pushTimed("guestSteps", [opts], (opts?.sampleMs ?? 0) + 10_000); }
 
     // ── breakpoints / exec control ──
     // Breakpoints block until hit — unbounded RPC envelope (the CLI's CDP budget /
