@@ -442,6 +442,15 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
             sampleObj.fileDataAddress = filePtr;
             updateSampleMemory(ctx, sampleObj, filePtr, detectedSize);
             decodeAudioFile(ctx, sampleObj);
+            // "0 if the file format is not supported" (mss.h). Answering 1 over an image we
+            // could not parse is a false success the caller cannot detect: it starts the voice
+            // and then polls a sample that will never leave SMP_PLAYING, because there is no
+            // data to reach the end of. A honest 0 lets it pick its own fallback.
+            if (sampleObj.fileFormat === "unknown") {
+                Logger.warn(LogCategory.SYSTEM,
+                    `MSS32: _AIL_set_sample_file@12: unsupported image at 0x${filePtr.toString(16)} → 0`);
+                return 0;
+            }
         }
         return 1;
     };
