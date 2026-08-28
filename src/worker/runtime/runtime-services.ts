@@ -2,6 +2,7 @@ import { TimeService } from "./time";
 import { Logger, LogCategory } from "../core/logger";
 import { harnessBus } from "../harness/event-bus";
 import { frameProfiler } from "../core/frame-profiler";
+import { guestTimeSteps } from "../core/guest-time-steps";
 
 export interface RenderBackend {
     readonly kind: string;
@@ -226,6 +227,9 @@ export class RenderService {
         // mark below, so the live tail, getFlipCadence and analyze-trace cannot disagree by
         // construction — only because the world disagreed. Zero-cost while disarmed.
         frameProfiler.markPresent();
+        // Same boundary, the OTHER clock: how much GUEST time this frame delivered. Inert while
+        // disarmed; see guest-time-steps.ts for why a rate cannot answer this question.
+        guestTimeSteps.markPresent(this.presentSerial);
         this.emitFlipTraceMark();
         // Harness frameRendered event — gated so the perf-critical present path
         // stays zero-cost until a script opts in (watchFrames).

@@ -358,6 +358,10 @@ export class HarnessChain {
     time(action: "freeze" | "advance" | "realtime", ms?: number): this { return this.push("time", [action, ms]); }
     /** Sample the guest clock against wall clock — `rate` <1 means game time is losing. */
     guestTime(opts?: { sampleMs?: number }): this { return this.pushTimed("guestTime", [opts], (opts?.sampleMs ?? 1000) + 5_000); }
+    /** WHICH advance path spent the guest clock's milliseconds, keyed by JS caller — the
+     *  follow-up to a `guestTime` rate that is not ~1.0. `unattributedMs` reports what no
+     *  wrapped entry point accounts for rather than hiding it in the rows. */
+    virtualTimeSources(opts?: { sampleMs?: number }): this { return this.pushTimed("virtualTimeSources", [opts], (opts?.sampleMs ?? 2000) + 10_000); }
 
     // ── breakpoints / exec control ──
     // Breakpoints block until hit — unbounded RPC envelope (the CLI's CDP budget /

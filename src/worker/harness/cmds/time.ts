@@ -18,6 +18,8 @@ import type { HarnessCtx } from "../service";
 import { HarnessError, HarnessErrorCode } from "../rpc";
 import { sys, cpu, guestMem, proc } from "../serialize";
 import { TimeService } from "../../runtime/time";
+import { guestTimeSteps } from "../../core/guest-time-steps";
+import { hypercallDataManager } from "../../core/cpu/hypercall-data";
 import { harnessBus } from "../event-bus";
 import { cancelCapture as frameCaptureCancel, startCapture as frameCaptureStart } from "../../modules/ddraw/frame-capture";
 
@@ -96,7 +98,122 @@ export function registerTimeCommands(svc: HarnessService): void {
             virtualDeltaMs: +dv.toFixed(1),
             rate: +(dv / dw).toFixed(3),
             behindMs: +(w1 - v1).toFixed(1),
+            // Session-wide, not window-scoped: how many publishes of the guest clock had to be
+            // raised to keep QPC/GetTickCount/TSC monotonic (see publishClock). Non-zero is not
+            // an error — it is the count of backwards steps a guest would otherwise have read as
+            // a ~2^32-tick elapsed time.
+            clockMonotonic: hypercallDataManager.getClockMonotonicStats(),
         };
+    });
+
+    /** virtualTimeSources({sampleMs}) — WHO advanced the guest clock during the window,
+     *  and by how much. `guestTime` says the rate is wrong; this says which of the seven
+     *  advance paths (plan/virtual-time.md §1.2) spent the milliseconds, keyed by the JS
+     *  caller frame. That is the difference between "the clock runs 45x" and "msvcrt
+     *  `_sleep` credits its argument as seconds".
+     *
+     *  Self-checking: `creditedMs` (what the wrapped entry points were asked for) is
+     *  reported next to `virtualDeltaMs` (what the clock actually did). A large residual
+     *  means an advance path this wrapper does not cover wrote `virtualTimeMs` directly —
+     *  reported as `unattributedMs`, never silently folded into the rows. */
+    svc.register("virtualTimeSources", async (args, ctx: HarnessCtx) => {
+        const sampleMs = Math.max(1, Number((args[0] as { sampleMs?: number } | undefined)?.sampleMs ?? 2000));
+        const ts = TimeService.getInstance();
+        if (!ts.isVirtualTimeActive()) {
+            return { virtualTimeActive: false, note: "virtual time is off — nothing advances the guest clock" };
+        }
+        const proto = TimeService.prototype as unknown as Record<string, (...a: never[]) => unknown>;
+        const tally = new Map<string, { calls: number; ms: number }>();
+        const callerKey = (): string => {
+            const stack = (new Error().stack ?? "").split("\n");
+            // 0 = "Error", 1 = this helper, 2 = the wrapper — 3.. is the real caller.
+            return stack.slice(3, 6).map((s) => s.trim()).join(" <- ").slice(0, 300) || "unknown";
+        };
+        const bump = (kind: string, ms: number): void => {
+            if (!ms) return;
+            const key = `${kind} ${callerKey()}`;
+            const row = tally.get(key) ?? { calls: 0, ms: 0 };
+            row.calls++; row.ms += ms;
+            tally.set(key, row);
+        };
+        const origAdvance = proto.advanceVirtualTime;
+        const origCredit = proto.creditIdleMs;
+        const origReanchor = proto.reanchorToWallClock;
+        const origPauseResume = proto.notifyPauseResume;
+        const before = (self: unknown): number => (self as { virtualTimeMs: number }).virtualTimeMs;
+        proto.advanceVirtualTime = function (this: TimeService, d: number) {
+            bump("advanceVirtualTime", d);
+            return (origAdvance as (this: TimeService, d: number) => void).call(this, d);
+        } as never;
+        proto.creditIdleMs = function (this: TimeService, d: number) {
+            const r = (origCredit as (this: TimeService, d: number) => number).call(this, d);
+            bump("creditIdleMs", r);
+            return r;
+        } as never;
+        proto.reanchorToWallClock = function (this: TimeService) {
+            const b = before(this);
+            const r = (origReanchor as (this: TimeService) => void).call(this);
+            bump("reanchorToWallClock", before(this) - b);
+            return r;
+        } as never;
+        proto.notifyPauseResume = function (this: TimeService) {
+            const b = before(this);
+            const r = (origPauseResume as (this: TimeService) => void).call(this);
+            bump("notifyPauseResume", before(this) - b);
+            return r;
+        } as never;
+
+        const v0 = ts.nowMs(), w0 = performance.now();
+        try {
+            await delay(sampleMs, ctx.signal);
+        } finally {
+            proto.advanceVirtualTime = origAdvance;
+            proto.creditIdleMs = origCredit;
+            proto.reanchorToWallClock = origReanchor;
+            proto.notifyPauseResume = origPauseResume;
+        }
+        const v1 = ts.nowMs(), w1 = performance.now();
+        const dv = v1 - v0, dw = w1 - w0;
+        const rows = [...tally.entries()]
+            .map(([caller, r]) => ({ caller, calls: r.calls, ms: +r.ms.toFixed(1) }))
+            .sort((a, b) => b.ms - a.ms);
+        const creditedMs = rows.reduce((s, r) => s + r.ms, 0);
+        return {
+            virtualTimeActive: true,
+            sampleMs: +dw.toFixed(1),
+            virtualDeltaMs: +dv.toFixed(1),
+            rate: +(dv / dw).toFixed(3),
+            creditedMs: +creditedMs.toFixed(1),
+            unattributedMs: +(dv - creditedMs).toFixed(1),
+            rows: rows.slice(0, 20),
+        };
+    });
+
+    /** guestSteps({arm,reset,disarm,budgetMs,maxBuckets,sampleMs}) — the dt the GUEST observes
+     *  per frame, and above all its MAXIMUM.
+     *
+     *  `guestTime`/`virtualTimeSources` report a rate, and a rate is a mean: a stall shows up
+     *  there as a perfectly healthy 1.000 while the guest is handed one multi-second delta
+     *  (CLAUDE.md §3.5 — the credit cap bounds ONE credit, not the delta between two clock
+     *  reads). A dt-driven animation/cutscene/physics step skips by exactly that delta.
+     *
+     *  Each step carries its wall twin, so "we stalled honestly" (guestMs ~= wallMs) and "we
+     *  fabricated time" (guestMs >> wallMs) are told apart from one window.
+     *
+     *  Arm it BEFORE the phase you care about and read it after — `sampleMs` is the
+     *  self-contained variant (arm, wait, read) for a short window. */
+    svc.register("guestSteps", async (args, ctx: HarnessCtx) => {
+        const o = (args[0] ?? {}) as {
+            arm?: boolean; disarm?: boolean; reset?: boolean;
+            budgetMs?: number; maxBuckets?: number; sampleMs?: number;
+        };
+        if (o.disarm) {
+            guestTimeSteps.disarm();
+            return { armed: false };
+        }
+        if (o.arm || o.reset || o.sampleMs !== undefined) guestTimeSteps.arm(o.budgetMs);
+        if (o.sampleMs !== undefined) await delay(Math.max(1, Number(o.sampleMs)), ctx.signal);
+        return { armed: guestTimeSteps.isArmed(), ...guestTimeSteps.report(o.maxBuckets) };
     });
 
     /** watchFrames(on?) — enable/disable the per-present frameRendered event

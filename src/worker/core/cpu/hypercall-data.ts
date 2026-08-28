@@ -411,6 +411,30 @@ const MAX_VIRTUAL_DELTA_MS = 4; // safety cap per tick
 // scheduler's Sleep-credit path (creditIdleMs) via TimeService — single source of truth
 // so no advance path can violate the ceiling the other paths assume.
 const MAX_AHEAD_MS = TimeService.MAX_AHEAD_MS;
+/** Shortest clock advance worth deriving an instruction rate from — below this the divide is
+ *  dominated by the microsecond quantization, not by how fast the guest is running.
+ *  Accumulated across publishes — one publish is far shorter than this. */
+const MIPS_SAMPLE_MIN_US = 2000;
+/** How far above TARGET_MIPS_PER_US the slope may be pushed. Reached when the clock is being
+ *  held back (MAX_AHEAD_MS) while the guest keeps retiring: interpolation then contributes
+ *  almost nothing, which is the correct answer — a stalled clock must not invent time. */
+const MIPS_CEILING = TARGET_MIPS_PER_US * 16;
+
+/**
+ * The largest clock value the guest can already have read since the last publish.
+ *
+ * WASM serves `base + (insn_now - insn_at_update) / mips` (hypercall.rs handle_qpc /
+ * handle_get_tick_count / virtual_time_us), so this reproduces that formula in the SAME
+ * integer arithmetic — a u32 wrapping subtract and a truncating divide. Publishing below
+ * this hands the guest a backwards clock; see HypercallDataManager.publishClock.
+ */
+export function interpolatedClockCeilingUs(
+    publishedBaseUs: number, publishedInsn: number, insnNow: number, mips: number,
+): number {
+    if (mips <= 0) return publishedBaseUs;
+    const deltaInsn = (insnNow - publishedInsn) >>> 0;
+    return publishedBaseUs + Math.floor(deltaInsn / mips);
+}
 
 export class HypercallDataManager {
     private hpBase = 0;
@@ -436,6 +460,24 @@ export class HypercallDataManager {
     // Instruction counter baseline (set when virtual time is enabled)
     private lastInsnSnapshot = 0;
     private lastWallSnapshot = 0;
+    /** The clock we last PUBLISHED, and the instruction count it was anchored to. The guest
+     *  reads `base + (insn_now - insn_at_update)/mips`, so these two are what let us compute
+     *  how far it may already have interpolated — see publishClock(). */
+    private publishedBaseUs = 0;
+    private publishedInsn = 0;
+    private publishedMips = TARGET_MIPS_PER_US;
+    private publishedValid = false;
+    /** Instructions per microsecond the interpolation is allowed to assume. TARGET_MIPS_PER_US
+     *  is a floor, not the value: it is a fixed guess that this machine beats, and an
+     *  interpolation slope steeper than reality is exactly what makes a publish have to correct
+     *  DOWNWARDS. Tracked as an upper bound of the observed rate — see publishClock. */
+    private mipsEstimate = TARGET_MIPS_PER_US;
+    private slopeInsnAcc = 0;
+    private slopeUsAcc = 0;
+    /** Diagnostics: how often, and by how much, a publish had to be raised to stay monotonic. */
+    private clockMonotonicFixups = 0;
+    private clockMonotonicMaxUs = 0;
+    private clockMonotonicExcessUs = 0;
 
     // FLS mirror used by WASM FlsGetValue hypercall. Allocation bitmap is
     // process-global (indices are), but VALUES are per-thread (fiber-local ==
@@ -601,6 +643,7 @@ export class HypercallDataManager {
             // Re-snapshot instruction counter and wall-clock — it may also have been reset
             this.lastInsnSnapshot = this.cpu?.instruction_counter?.[0] ?? 0;
             this.lastWallSnapshot = performance.now();
+            this.resetPublishedClock();
             Logger.log(LogCategory.SYSTEM,
                 `[HYPERCALL] Re-synced state after buffer change ` +
                 `(${this.registeredEntries.size} handlers, enabled=true)`);
@@ -1144,6 +1187,7 @@ export class HypercallDataManager {
     resetInsnBaseline(): void {
         this.lastInsnSnapshot = this.cpu?.instruction_counter?.[0] ?? 0;
         this.lastWallSnapshot = performance.now();
+        this.resetPublishedClock();
     }
 
     /**
@@ -1198,27 +1242,121 @@ export class HypercallDataManager {
         timeService.advanceVirtualTime(virtualDeltaMs);
 
         // --- Write to HYPERCALL_PAGE ---
-        const nowMs = timeService.nowMs();
-        const nowMicros = Math.floor(nowMs * 1000);
+        this.publishClock(timeService, insnNow);
 
-        // Tick count (truncated to 32-bit ms)
-        this.view.setUint32(this.hpBase + OFF_HC_TICK_COUNT, nowMs >>> 0, true);
+        this.lastInsnSnapshot = insnNow;
+        this.lastWallSnapshot = wallNow;
+    }
 
-        // Performance counter = microseconds
+    /**
+     * Publish the guest clock (tick count / QPC / the base RDTSC derives from) and re-anchor
+     * the WASM interpolation, MONOTONICALLY.
+     *
+     * WASM serves every clock read as `base + (insn_now - insn_at_update) / mips`
+     * (hypercall.rs handle_qpc / handle_get_tick_count / virtual_time_us). That is monotonic
+     * only BETWEEN publishes: the instruction counter climbs while `base` stands still. Across
+     * a publish it is not, because the interpolation is unbounded while the new base is
+     * clamped (MAX_AHEAD_MS, the catch-up limiter, MAX_VIRTUAL_DELTA_MS). Whenever the guest
+     * out-runs TARGET_MIPS_PER_US the interpolated value passes the value the next publish
+     * wants to install, and the guest's clock steps BACKWARDS.
+     *
+     * Windows guarantees QPC, GetTickCount and the TSC are monotonic, and a guest computing an
+     * UNSIGNED delta across the step gets ~2^32 ticks, not a small negative. Nothing downstream
+     * can defend against that — the value is indistinguishable from an enormous elapsed time.
+     * (Measured: a 3.1 ms backwards QPC step handed GTA III's cutscene camera 2147 SECONDS of
+     * frame delta in one frame and teleported it to the end of its flyby spline.)
+     *
+     * So a publish never lowers the clock: the floor is exactly the largest value the guest
+     * could already have read. When that floor bites, the excess is pushed INTO virtual time
+     * as well — otherwise the page and TimeService drift apart and the next publish reproduces
+     * the same step. That is self-limiting rather than a ratchet: virtual time now leads wall,
+     * so updateTimeData's `maxAllowed` clamp holds the clock still until wall catches up.
+     */
+    private publishClock(timeService: TimeService, insnNow: number): void {
+        if (!this.view) return;
+        let nowMs = timeService.nowMs();
+        let nowMicros = Math.floor(nowMs * 1000);
+
+        if (this.publishedValid) {
+            const deltaInsn = (insnNow - this.publishedInsn) >>> 0;
+            const clockDeltaUs = nowMicros - this.publishedBaseUs;
+
+            // Keep the slope an UPPER bound of what the guest actually retires: rise to a faster
+            // observed rate at once, fall back towards it with a ~1 s time constant. Too steep
+            // and the publish has to correct downwards (the bug); too shallow only costs
+            // sub-publish resolution, which is monotonic and harmless.
+            this.slopeInsnAcc += deltaInsn;
+            this.slopeUsAcc += Math.max(0, clockDeltaUs);
+            // Publishes land far below the sampling window (a tick is well under a millisecond),
+            // so the rate has to be ACCUMULATED. Measuring one publish at a time only ever sees
+            // microsecond quantization, which is why a per-publish test never moved the slope.
+            // The insn escape hatch covers a clock that is not advancing at all: instructions
+            // still pile up, and the slope must go to the ceiling rather than sit stale.
+            if (this.slopeUsAcc >= MIPS_SAMPLE_MIN_US || this.slopeInsnAcc >= MIPS_SAMPLE_MIN_US * MIPS_CEILING) {
+                const observed = this.slopeUsAcc > 0 ? this.slopeInsnAcc / this.slopeUsAcc : MIPS_CEILING;
+                this.mipsEstimate = observed > this.mipsEstimate
+                    ? observed
+                    : this.mipsEstimate + (observed - this.mipsEstimate) * Math.min(1, this.slopeUsAcc / 1_000_000);
+                this.mipsEstimate = Math.min(MIPS_CEILING, Math.max(TARGET_MIPS_PER_US, this.mipsEstimate));
+                this.slopeInsnAcc = 0;
+                this.slopeUsAcc = 0;
+            }
+
+            // Floor: the largest value the guest can already have read, computed with the slope
+            // WASM was actually serving (publishedMips), not the one we are about to install.
+            const ceilingUs = interpolatedClockCeilingUs(
+                this.publishedBaseUs, this.publishedInsn, insnNow, this.publishedMips);
+            if (nowMicros < ceilingUs) {
+                const excessUs = ceilingUs - nowMicros;
+                this.clockMonotonicFixups++;
+                this.clockMonotonicExcessUs += excessUs;
+                if (excessUs > this.clockMonotonicMaxUs) this.clockMonotonicMaxUs = excessUs;
+                nowMicros = ceilingUs;
+                // Push it into virtual time too: the page and TimeService must stay ONE clock,
+                // or the next publish recomputes the same regression from a stale TimeService.
+                timeService.advanceVirtualTime(excessUs / 1000);
+                nowMs = timeService.nowMs();
+            }
+        }
+        const mips = Math.max(1, Math.round(this.mipsEstimate));
+
+        // Tick count (truncated to 32-bit ms) — derived from the SAME microseconds as QPC, so
+        // the two clocks cannot disagree about whether time went backwards.
+        this.view.setUint32(this.hpBase + OFF_HC_TICK_COUNT, Math.floor(nowMicros / 1000) >>> 0, true);
         this.view.setUint32(this.hpBase + OFF_HC_PERF_COUNTER_LO, nowMicros & 0xFFFFFFFF, true);
         this.view.setUint32(this.hpBase + OFF_HC_PERF_COUNTER_HI,
             Math.floor(nowMicros / 0x100000000), true);
 
-        // WASM interpolation: constant MIPS since time is instruction-based.
-        // WASM formula: interpolated = base + (insn_now - insn_at_update) / mips
+        // WASM interpolation anchor + slope.
         // (This drives QPC/GetTickCount AND RDTSC — v86 read_tsc derives the TSC from this
         // same interpolated base ×4294.967296 ticks/µs, so their ratio is constant and guest
         // cross-clock calibration (UE1 GSecondsPerCycle) is exact by construction.)
         this.view.setUint32(this.hpBase + OFF_HC_INSN_AT_TIME_UPDATE, insnNow >>> 0, true);
-        this.view.setUint32(this.hpBase + OFF_HC_MIPS_ESTIMATE, TARGET_MIPS_PER_US, true);
+        this.view.setUint32(this.hpBase + OFF_HC_MIPS_ESTIMATE, mips, true);
 
-        this.lastInsnSnapshot = insnNow;
-        this.lastWallSnapshot = wallNow;
+        this.publishedBaseUs = nowMicros;
+        this.publishedInsn = insnNow >>> 0;
+        this.publishedMips = mips;
+        this.publishedValid = true;
+    }
+
+    /** Diagnostics: how often a publish had to be raised to keep the guest clock monotonic,
+     *  and the largest backwards step that was suppressed. A non-zero `maxUs` here is the
+     *  amount a guest would otherwise have read as a ~2^32-tick jump. */
+    getClockMonotonicStats(): { fixups: number; maxSuppressedUs: number; totalSuppressedMs: number; mipsEstimate: number } {
+        return {
+            fixups: this.clockMonotonicFixups,
+            maxSuppressedUs: this.clockMonotonicMaxUs,
+            totalSuppressedMs: +(this.clockMonotonicExcessUs / 1000).toFixed(1),
+            mipsEstimate: +this.mipsEstimate.toFixed(1),
+        };
+    }
+
+    /** Drop the published-clock anchor (buffer change / pause-resume / game switch): the
+     *  instruction counter it refers to is no longer meaningful, and a stale anchor would
+     *  compute a bogus interpolation ceiling. */
+    resetPublishedClock(): void {
+        this.publishedValid = false;
     }
 
     /**
@@ -1234,15 +1372,10 @@ export class HypercallDataManager {
         this.refreshViews();
         if (!this.view) return;
 
-        const nowMs = TimeService.getInstance().nowMs();
-        const nowMicros = Math.floor(nowMs * 1000);
-        const insnNow = (cpu?.instruction_counter?.[0] ?? 0) >>> 0;
-
-        this.view.setUint32(this.hpBase + OFF_HC_TICK_COUNT, nowMs >>> 0, true);
-        this.view.setUint32(this.hpBase + OFF_HC_PERF_COUNTER_LO, nowMicros & 0xFFFFFFFF, true);
-        this.view.setUint32(this.hpBase + OFF_HC_PERF_COUNTER_HI,
-            Math.floor(nowMicros / 0x100000000), true);
-        this.view.setUint32(this.hpBase + OFF_HC_INSN_AT_TIME_UPDATE, insnNow, true);
+        // Same publish primitive as updateTimeData: this is a re-anchor of the very same
+        // interpolation, so it carries the same monotonicity obligation. Writing the fields
+        // by hand here is what made the backwards step reachable from two places.
+        this.publishClock(TimeService.getInstance(), (cpu?.instruction_counter?.[0] ?? 0) >>> 0);
     }
 
     /**
