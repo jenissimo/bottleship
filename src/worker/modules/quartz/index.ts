@@ -58,6 +58,38 @@ type DetectedAudio = {
     duration: number;
 };
 
+const MIME_BY_CONTAINER: Record<AudioContainer, string> = {
+    wav: "audio/wav",
+    mp3: "audio/mpeg",
+    ogg: "audio/ogg",
+    flac: "audio/flac",
+};
+
+/**
+ * What RenderFile hands to the audio path, or null to let the video path try. Null is
+ * the only route to markCompleted() on undecodable bytes, so an answer here must be one
+ * the host can actually play: a RIFF whose header states no rate is not, and a `.wav`
+ * whose header we cannot read at all has no rate to fall back on — claiming 44100 for
+ * either leaves a game waiting on EC_COMPLETE forever.
+ */
+export function detectRenderFileAudio(fileBytes: Uint8Array, path: string): DetectedAudio | null {
+    const probe = probeAudio(new BufferSource(fileBytes));
+    if (probe && (probe.format !== "wav" || probe.sampleRate > 0)) {
+        return {
+            mimeType: MIME_BY_CONTAINER[probe.format],
+            sampleRate: probe.sampleRate,
+            duration: probe.durationMs / 1000,
+        };
+    }
+
+    // Header unreadable: the extension still names the decoder to hand it to, and
+    // DirectShow answers "duration unknown" (0) rather than refusing to build a graph.
+    const ext = path.split("?")[0].split(".").pop()?.toLowerCase();
+    if (ext === "mp3") return { mimeType: "audio/mpeg", sampleRate: 44100, duration: 0 };
+    if (ext === "ogg") return { mimeType: "audio/ogg", sampleRate: 44100, duration: 0 };
+    return null;
+}
+
 export class Quartz implements IModule {
     name = "quartz";
     exports: Record<string, ThunkImplementation> = {};
@@ -157,35 +189,13 @@ export class Quartz implements IModule {
         }
     }
 
-    private static readonly MIME_BY_CONTAINER: Record<AudioContainer, string> = {
-        wav: "audio/wav",
-        mp3: "audio/mpeg",
-        ogg: "audio/ogg",
-        flac: "audio/flac",
-    };
-
     private isAudioPath(path: string): boolean {
         const ext = path.split("?")[0].split(".").pop()?.toLowerCase();
         return ext === "mp3" || ext === "ogg" || ext === "wav";
     }
 
     private detectAudio(fileBytes: Uint8Array, path: string): DetectedAudio | null {
-        const probe = probeAudio(new BufferSource(fileBytes));
-        if (probe) {
-            return {
-                mimeType: Quartz.MIME_BY_CONTAINER[probe.format],
-                sampleRate: probe.sampleRate || 44100,
-                duration: probe.durationMs / 1000,
-            };
-        }
-
-        // Header unreadable: the extension still names the decoder to hand it to, and
-        // DirectShow answers "duration unknown" (0) rather than refusing to build a graph.
-        const ext = path.split("?")[0].split(".").pop()?.toLowerCase();
-        if (ext === "mp3") return { mimeType: "audio/mpeg", sampleRate: 44100, duration: 0 };
-        if (ext === "ogg") return { mimeType: "audio/ogg", sampleRate: 44100, duration: 0 };
-        if (ext === "wav") return { mimeType: "audio/wav", sampleRate: 44100, duration: 0 };
-        return null;
+        return detectRenderFileAudio(fileBytes, path);
     }
 
     // ── IGraphBuilder methods ────────────────────────────────────────────────

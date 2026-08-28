@@ -48,17 +48,18 @@ export function probeOgg(src: RandomAccessSource): AudioProbe | null {
     const codec = identifyCodec(head, first);
     if (!codec) return null;
 
+    // A tail granule is optional: trailing padding past the scan window, a truncated or
+    // CRC-bad final page, and a chained stream whose tail carries another serial all hide
+    // it. Rate and channels come from the head and stay exact, so the file is still a
+    // usable Ogg — refusing it would make the caller guess its rate for want of a length.
     const last = findLastGranule(src, first.serial);
-    if (last == null) return null;
-
-    const samples = last - startGranule(head, codec.headerPackets) - codec.preSkip;
-    if (samples < 0) return null;
+    const samples = last == null ? 0 : last - startGranule(head, codec.headerPackets) - codec.preSkip;
     return {
         format: "ogg",
         sampleRate: codec.sampleRate,
         channels: codec.channels,
         bitsPerSample: codec.bitsPerSample,
-        durationMs: samplesToMs(samples, codec.sampleRate),
+        durationMs: samples > 0 ? samplesToMs(samples, codec.sampleRate) : 0,
         // Ogg interleaves headers and audio into pages; the payload is the whole file.
         dataStart: 0,
         dataEnd: src.size,

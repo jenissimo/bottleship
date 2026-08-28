@@ -364,6 +364,22 @@ describe("probeAudioStream / ogg", () => {
         expect(streamInfo(new BufferSource(file.subarray(0, 20)))).toBeNull();
     });
 
+    it("reports rate and channels when no tail granule is findable", () => {
+        // Trailing padding past both scan windows; a chained tail of another serial and a
+        // truncated final page look the same from the back of the file. Refusing the whole
+        // stream would hand the caller nothing and it would guess a rate for the file.
+        const file = concat(
+            vorbisStream({ channels: 1, sampleRate: 22050, granules: [22050 * 4] }),
+            new Uint8Array(200 * 1024).fill(0x5a),
+        );
+        expect(streamInfo(new BufferSource(file))).toEqual({
+            durationMs: 0,
+            sampleRate: 22050,
+            channels: 1,
+            format: "ogg",
+        });
+    });
+
     it("probes a multi-MB stream from a few KB at each end", () => {
         const serial = 0x5150;
         const pages: Uint8Array[] = [vorbisStream({ granules: [], serial })];
@@ -562,8 +578,30 @@ describe("probeAudioStream / wav", () => {
         expect(streamInfo(new BufferSource(file))!.durationMs).toBe(500);
     });
 
-    it("returns null without a data chunk", () => {
-        expect(streamInfo(new BufferSource(riff(fmtChunk({ channels: 2, sampleRate: 44100, bits: 16 }))))).toBeNull();
+    it("reports the rate of a fmt-only image, with no length", () => {
+        const file = riff(fmtChunk({ channels: 2, sampleRate: 22050, bits: 16 }));
+        expect(streamInfo(new BufferSource(file))).toEqual({
+            durationMs: 0,
+            sampleRate: 22050,
+            channels: 2,
+            format: "wav",
+        });
+        expect(probeAudio(new BufferSource(file))).toMatchObject({ dataStart: 0, dataEnd: 0 });
+    });
+
+    it("describes a wrapper whose fmt is missing from its data chunk alone", () => {
+        // A RIFF around an encoded payload: no rate to report, but the payload extent is
+        // what a caller needs to play the inner stream.
+        const inner = vorbisStream({ granules: [44100] });
+        const file = riff(chunk("data", inner));
+        expect(probeAudio(new BufferSource(file))).toMatchObject({
+            format: "wav",
+            sampleRate: 0,
+            channels: 0,
+            durationMs: 0,
+            dataStart: 20,
+            dataEnd: 20 + inner.length, // the payload, not the RIFF's word-alignment pad
+        });
     });
 });
 

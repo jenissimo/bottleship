@@ -264,12 +264,12 @@ export interface WavChunkInfo {
 
 /**
  * Miles view of a RIFF/WAVE image: the shared probe's fields under the names the
- * ADPCM/PCM decode paths use. A zero format tag is rejected here and not in the
- * probe — the tag selects the decoder, so "WAVE with no usable fmt" is not a WAV
- * this module can do anything with.
+ * ADPCM/PCM decode paths use. A zero format tag and a missing data chunk are
+ * rejected here and not in the probe — the tag selects the decoder and the decode
+ * paths read samples, so half a header is not a WAV this module can use.
  */
 function toWavChunkInfo(probe: AudioProbe | null): WavChunkInfo | null {
-    if (!probe || probe.format !== "wav" || !probe.formatTag) return null;
+    if (!probe || probe.format !== "wav" || !probe.formatTag || !probe.dataStart) return null;
     return {
         formatTag: probe.formatTag,
         channels: probe.channels,

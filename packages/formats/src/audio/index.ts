@@ -35,7 +35,7 @@ export interface AudioProbe {
     bitsPerSample: number;
     /** 0 when the container carries no derivable length. */
     durationMs: number;
-    /** Audio payload extent, clamped to the source; end is exclusive. */
+    /** Audio payload extent, clamped to the source; end is exclusive. Both 0 when the container names no payload chunk. */
     dataStart: number;
     dataEnd: number;
     /** RIFF WAVE_FORMAT_* tag; 0 for non-RIFF containers. */

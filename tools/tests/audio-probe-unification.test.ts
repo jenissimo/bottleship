@@ -14,7 +14,7 @@
 // synthesized fixtures reproduce their exact header shapes and always run.
 
 import { describe, it, expect } from "bun:test";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -22,7 +22,10 @@ import { join } from "node:path";
 import { BufferSource, WindowSource } from "@bottleship/formats/unpack/source";
 import { probeAudio, sniffAudioContainer, buildPcmWavImage } from "@bottleship/formats/audio";
 import { scanWavChunks, parseWav } from "../../src/worker/modules/mss32/audio-decode";
-import { inspectEncodedAudio, isMp3, isOgg } from "../../src/worker/modules/mss32/helpers";
+import { getBytesPerSecond, inspectEncodedAudio, isMp3, isOgg } from "../../src/worker/modules/mss32/helpers";
+import type { MSSSample } from "../../src/worker/modules/mss32/types";
+import { detectAudioPayload } from "../../src/worker/modules/bass";
+import { detectRenderFileAudio } from "../../src/worker/modules/quartz/index";
 
 // --- fixtures ---------------------------------------------------------------
 
@@ -230,6 +233,220 @@ describe("consumers agree with the shared probe", () => {
         expect(isOgg(mp3.subarray(0, 16))).toBe(false);
         expect(isOgg(new Uint8Array([0x4f, 0x67, 0x67, 0x53]))).toBe(true);
         expect(isMp3(gta3ShapedWav(1024))).toBe(false);
+    });
+});
+
+// --- an Ogg whose length cannot be measured ----------------------------------
+
+const oggCrc = (() => {
+    const t = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+        let r = i << 24;
+        for (let k = 0; k < 8; k++) r = r & 0x80000000 ? (r << 1) ^ 0x04c11db7 : r << 1;
+        t[i] = r >>> 0;
+    }
+    return (page: Uint8Array) => {
+        let crc = 0;
+        for (let i = 0; i < page.length; i++) crc = ((crc << 8) ^ t[((crc >>> 24) ^ page[i]!) & 0xff]!) >>> 0;
+        return crc >>> 0;
+    };
+})();
+
+function oggPage(body: Uint8Array, flags: number, seq: number): Uint8Array {
+    const laces: number[] = [];
+    for (let left = body.length; ; ) {
+        laces.push(Math.min(255, left));
+        if (left < 255) break;
+        left -= 255;
+    }
+    const page = new Uint8Array(27 + laces.length + body.length);
+    const view = new DataView(page.buffer);
+    ascii(page, 0, "OggS");
+    page[5] = flags;
+    view.setUint32(14, 0x5150, true); // serial
+    view.setUint32(18, seq, true);
+    page[26] = laces.length;
+    page.set(laces, 27);
+    page.set(body, 27 + laces.length);
+    view.setUint32(22, oggCrc(page), true);
+    return page;
+}
+
+/**
+ * A Vorbis stream whose tail is unreachable: the audio pages sit behind more padding
+ * than the tail scan looks at. A chained stream and a truncated final page present the
+ * same way — no granule, but a perfectly readable identification header.
+ */
+function oggWithUnreachableTail(sampleRate: number, channels: number): Uint8Array {
+    const id = new Uint8Array(30);
+    id[0] = 0x01;
+    ascii(id, 1, "vorbis");
+    id[11] = channels;
+    new DataView(id.buffer).setUint32(12, sampleRate, true);
+    id[29] = 0x01; // framing bit
+    const head = oggPage(id, 0x02, 0);
+    const out = new Uint8Array(head.length + 200 * 1024);
+    out.set(head, 0);
+    out.fill(0x5a, head.length);
+    return out;
+}
+
+// --- half-headers the pre-unification sniffers accepted ----------------------
+
+/**
+ * A RIFF/WAVE wrapping an already-encoded stream, the shape Miles/BASS-era titles
+ * ship: the `fmt ` chunk is a stub of zeros, or absent entirely, and the real
+ * format lives in the `data` chunk.
+ */
+function riffWrapped(inner: Uint8Array, withStubFmt: boolean): Uint8Array {
+    const fmtLen = withStubFmt ? 24 : 0;
+    const buf = new Uint8Array(20 + fmtLen + inner.length);
+    const view = new DataView(buf.buffer);
+    ascii(buf, 0, "RIFF");
+    view.setUint32(4, buf.length - 8, true);
+    ascii(buf, 8, "WAVE");
+    if (withStubFmt) {
+        ascii(buf, 12, "fmt ");
+        view.setUint32(16, 16, true); // 16 zero bytes: no tag, no channels, no rate
+    }
+    ascii(buf, 12 + fmtLen, "data");
+    view.setUint32(16 + fmtLen, inner.length, true);
+    buf.set(inner, 20 + fmtLen);
+    return buf;
+}
+
+/** A `fmt `-only RIFF: a rate and nothing to measure a length from. */
+function fmtOnlyWav(sampleRate: number, channels: number): Uint8Array {
+    const buf = new Uint8Array(36);
+    const view = new DataView(buf.buffer);
+    ascii(buf, 0, "RIFF");
+    view.setUint32(4, buf.length - 8, true);
+    ascii(buf, 8, "WAVE");
+    ascii(buf, 12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, channels, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * channels * 2, true);
+    view.setUint16(32, channels * 2, true);
+    view.setUint16(34, 16, true);
+    return buf;
+}
+
+describe("half a WAV header is still an answer", () => {
+    it("reports the real rate of a fmt-only image, with no length", () => {
+        // quartz's old parseWav read the rate here and reported duration 0; reporting a
+        // fabricated 44100 for a 22050 voice scales everything keyed to its position.
+        expect(probeAudio(new BufferSource(fmtOnlyWav(22050, 1)))).toMatchObject({
+            format: "wav",
+            sampleRate: 22050,
+            channels: 1,
+            durationMs: 0,
+            dataStart: 0,
+            dataEnd: 0,
+        });
+    });
+
+    it("locates the payload of a wrapper whose fmt is a stub or missing", () => {
+        const inner = taggedXingMp3(64, 13907, 576, 1191);
+        for (const withStubFmt of [true, false]) {
+            const probe = probeAudio(new BufferSource(riffWrapped(inner, withStubFmt)))!;
+            expect(probe.format).toBe("wav");
+            expect(probe.dataEnd - probe.dataStart).toBe(inner.length);
+        }
+    });
+
+    it("MSS32 still refuses both halves — its decode paths need tag AND samples", () => {
+        expect(scanWavChunks(fmtOnlyWav(22050, 1))).toBeNull();
+        expect(scanWavChunks(riffWrapped(taggedXingMp3(8, 13907, 576, 1191), true))).toBeNull();
+    });
+});
+
+describe("an unmeasurable Ogg still states its rate", () => {
+    it("reports rate and channels with no duration", () => {
+        expect(probeAudio(new BufferSource(oggWithUnreachableTail(22050, 1)))).toMatchObject({
+            format: "ogg",
+            sampleRate: 22050,
+            channels: 1,
+            durationMs: 0,
+        });
+    });
+
+    it("MSS32 derives the guest's bytes-per-second from it, not from a device default", () => {
+        // This is where a fabricated 44100/2 becomes a 4x error in every length and
+        // position word Miles reports for a 22050 mono voice.
+        const info = inspectEncodedAudio(oggWithUnreachableTail(22050, 1), "ogg");
+        const item = {
+            sampleRate: info.sampleRate ?? 44100,
+            channels: info.channels ?? 2,
+            bitsPerSample: 16,
+        } as MSSSample;
+        expect(getBytesPerSecond(item)).toBe(22050 * 1 * 2);
+    });
+});
+
+describe("BASS keeps the inner stream of a RIFF wrapper", () => {
+    const detect = (data: Uint8Array, path?: string) => detectAudioPayload(data, path, 44100);
+
+    it("plays the wrapped MP3, at the rate the MP3 itself states", () => {
+        const inner = taggedXingMp3(1416, 13907, 576, 1191);
+        for (const withStubFmt of [true, false]) {
+            const detected = detect(riffWrapped(inner, withStubFmt), "music.wav");
+            expect(detected.mimeType).toBe("audio/mpeg");
+            expect(detected.sampleRate).toBe(44100);
+            expect(detected.payload.length).toBe(inner.length);
+            expect(detected.payload[0]).toBe(inner[0]);
+        }
+    });
+
+    it("routes a wrapped Ogg by the inner magic, not the wrapper", () => {
+        const detected = detect(riffWrapped(new Uint8Array([0x4f, 0x67, 0x67, 0x53, 0, 0, 0, 0]), true));
+        expect(detected.mimeType).toBe("audio/ogg");
+        expect(detected.payload.length).toBe(8);
+    });
+
+    it("hands a real WAV over whole, at its own rate", () => {
+        const detected = detect(gta3ShapedWav(4096), "speech.wav");
+        expect(detected.mimeType).toBe("audio/wav");
+        expect(detected.sampleRate).toBe(44100);
+        expect(detected.payload.length).toBe(gta3ShapedWav(4096).length);
+    });
+});
+
+describe("quartz answers only for audio the host can play", () => {
+    it("refuses a .wav it cannot parse, so RenderFile can complete the graph", () => {
+        // Non-null here skips the videoEngine branch and its markCompleted(), and a game
+        // waiting on EC_COMPLETE then waits forever.
+        expect(detectRenderFileAudio(new Uint8Array(64), "/audio/broken.wav")).toBeNull();
+        expect(detectRenderFileAudio(new TextEncoder().encode("RIFFxxxxWAVEjunk"), "/audio/broken.wav")).toBeNull();
+    });
+
+    it("reports a fmt-only WAV at its real rate with an unknown duration", () => {
+        expect(detectRenderFileAudio(fmtOnlyWav(22050, 1), "/audio/voice.wav")).toEqual({
+            mimeType: "audio/wav",
+            sampleRate: 22050,
+            duration: 0,
+        });
+    });
+
+    it("still falls back to the extension for mp3/ogg", () => {
+        expect(detectRenderFileAudio(new Uint8Array(64), "/audio/track.mp3")).toEqual({
+            mimeType: "audio/mpeg",
+            sampleRate: 44100,
+            duration: 0,
+        });
+        expect(detectRenderFileAudio(new Uint8Array(64), "/audio/track.ogg")?.mimeType).toBe("audio/ogg");
+    });
+});
+
+describe("tools/audio-probe.ts", () => {
+    it("runs — it is the only instrument over this probe, and nothing else imports it", () => {
+        const dir = mkdtempSync(join(tmpdir(), "bs-audio-tool-"));
+        const file = join(dir, "probe.wav");
+        writeFileSync(file, gta3ShapedWav(153398));
+        const out = execFileSync("bun", ["tools/audio-probe.ts", file], { encoding: "utf8" });
+        expect(out).toContain("wav");
+        expect(out).toContain("44100 Hz");
     });
 });
 

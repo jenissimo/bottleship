@@ -17,7 +17,7 @@
 import { openSync, readSync, closeSync, statSync, readdirSync, readFileSync } from "fs";
 import { join, basename } from "path";
 import type { RandomAccessSource } from "@bottleship/formats/unpack/source";
-import { probeAudioStream } from "@bottleship/formats/audio";
+import { probeAudio } from "@bottleship/formats/audio";
 
 const AUDIO_EXT = /\.(ogg|oga|opus|mp3|mp2|flac|wav)$/i;
 
@@ -107,7 +107,7 @@ if (args.length === 0) {
 let failures = 0;
 for (const path of args.flatMap(expand)) {
     const src = new FileSource(path);
-    const info = probeAudioStream(src);
+    const info = probeAudio(src);
     src.close();
     if (!info) {
         failures++;

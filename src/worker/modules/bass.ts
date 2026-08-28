@@ -68,6 +68,52 @@ interface DetectedAudioPayload {
     sampleRate: number;
 }
 
+/** What BASS hands the host for a loaded file: the bytes to decode, their MIME type and the rate they play at. */
+export function detectAudioPayload(fileData: Uint8Array, sourcePath: string | undefined, defaultFreq: number): DetectedAudioPayload {
+    const probe = probeAudio(new BufferSource(fileData));
+
+    // A RIFF wrapper around an encoded payload: BASS plays the inner stream, and the
+    // inner stream's own header is the only honest source of its rate. Miles/BASS-era
+    // wrappers often carry a stub `fmt ` or none at all, which is why the probe describes
+    // a WAVE from its `data` chunk alone rather than refusing it.
+    if (probe?.format === "wav") {
+        const dataChunk = fileData.subarray(probe.dataStart, probe.dataEnd);
+        const innerSource = new BufferSource(dataChunk);
+        const innerFormat = sniffAudioContainer(innerSource);
+        if (innerFormat === "ogg" || innerFormat === "mp3") {
+            return {
+                payload: dataChunk.slice(),
+                mimeType: innerFormat === "ogg" ? "audio/ogg" : "audio/mpeg",
+                sampleRate: probeAudio(innerSource)?.sampleRate || probe.sampleRate || defaultFreq,
+            };
+        }
+        return { payload: fileData, mimeType: "audio/wav", sampleRate: probe.sampleRate || defaultFreq };
+    }
+
+    if (probe?.format === "ogg") {
+        return { payload: fileData, mimeType: "audio/ogg", sampleRate: probe.sampleRate || defaultFreq };
+    }
+    if (probe?.format === "mp3") {
+        return { payload: fileData, mimeType: "audio/mpeg", sampleRate: probe.sampleRate || defaultFreq };
+    }
+
+    // Nothing parsed. Magic bytes outrank the filename deliberately — a container the
+    // probe could not measure still names its own decoder, and a name does not — and the
+    // extension answers only for bytes with no recognizable magic at all.
+    const ext = sniffAudioContainer(new BufferSource(fileData)) ?? sourcePath?.split(".").pop()?.toLowerCase();
+    if (ext === "wav") {
+        return { payload: fileData, mimeType: "audio/wav", sampleRate: defaultFreq };
+    }
+    if (ext === "mp3") {
+        return { payload: fileData, mimeType: "audio/mpeg", sampleRate: defaultFreq };
+    }
+    if (ext === "ogg") {
+        return { payload: fileData, mimeType: "audio/ogg", sampleRate: defaultFreq };
+    }
+
+    return { payload: fileData, mimeType: "application/octet-stream", sampleRate: defaultFreq };
+}
+
 // BASS_SAMPLE struct layout (for GetInfo/SetInfo) — 36 bytes
 const BSI_FREQ    = 0;   // DWORD freq
 const BSI_VOLUME  = 4;   // DWORD volume (0-100)
@@ -673,45 +719,7 @@ export class Bass implements IModule {
         fileData: Uint8Array,
         sourcePath?: string
     ): DetectedAudioPayload {
-        const probe = probeAudio(new BufferSource(fileData));
-
-        // A RIFF wrapper around an encoded payload: BASS plays the inner stream, and
-        // the inner stream's own header is the only honest source of its rate.
-        if (probe?.format === "wav") {
-            const dataChunk = fileData.subarray(probe.dataStart, probe.dataEnd);
-            const innerSource = new BufferSource(dataChunk);
-            const innerFormat = sniffAudioContainer(innerSource);
-            if (innerFormat === "ogg" || innerFormat === "mp3") {
-                return {
-                    payload: dataChunk.slice(),
-                    mimeType: innerFormat === "ogg" ? "audio/ogg" : "audio/mpeg",
-                    sampleRate: probeAudio(innerSource)?.sampleRate || probe.sampleRate || this.defaultFreq,
-                };
-            }
-            return { payload: fileData, mimeType: "audio/wav", sampleRate: probe.sampleRate || this.defaultFreq };
-        }
-
-        if (probe?.format === "ogg") {
-            return { payload: fileData, mimeType: "audio/ogg", sampleRate: probe.sampleRate || this.defaultFreq };
-        }
-        if (probe?.format === "mp3") {
-            return { payload: fileData, mimeType: "audio/mpeg", sampleRate: probe.sampleRate || this.defaultFreq };
-        }
-
-        // Recognized magic but unparseable headers still names the decoder to hand it to;
-        // a bare extension is the last resort, for a file whose header we cannot read at all.
-        const ext = sniffAudioContainer(new BufferSource(fileData)) ?? sourcePath?.split(".").pop()?.toLowerCase();
-        if (ext === "wav") {
-            return { payload: fileData, mimeType: "audio/wav", sampleRate: this.defaultFreq };
-        }
-        if (ext === "mp3") {
-            return { payload: fileData, mimeType: "audio/mpeg", sampleRate: this.defaultFreq };
-        }
-        if (ext === "ogg") {
-            return { payload: fileData, mimeType: "audio/ogg", sampleRate: this.defaultFreq };
-        }
-
-        return { payload: fileData, mimeType: "application/octet-stream", sampleRate: this.defaultFreq };
+        return detectAudioPayload(fileData, sourcePath, this.defaultFreq);
     }
 
     // -----------------------------------------------------------------------

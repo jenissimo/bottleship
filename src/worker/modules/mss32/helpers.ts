@@ -783,8 +783,8 @@ export function inspectEncodedAudio(data: Uint8Array, format?: "mp3" | "ogg"): E
 
 // AILFILETYPE_* — Miles Sound System file sniffing (see tools/reference/mss32/mss.h).
 // Deliberately NOT the shared probe: AIL_file_type classifies MIDI/XMIDI/DLS/VOC/BinkA
-// too, and must still name a WAV variant for an image with no fmt or no data chunk —
-// a partial header Miles types and the stream probe rightly refuses.
+// too, and must name a WAV variant from the format tag alone, for an image the decode
+// paths cannot take.
 export const AILFILETYPE_UNKNOWN = 0;
 export const AILFILETYPE_PCM_WAV = 1;
 export const AILFILETYPE_ADPCM_WAV = 2;

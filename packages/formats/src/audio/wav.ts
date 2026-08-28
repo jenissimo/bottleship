@@ -61,22 +61,27 @@ export function probeWav(src: RandomAccessSource): AudioProbe | null {
         off = body + size + (size & 1); // chunks are word-aligned; odd sizes carry a pad byte
     }
 
-    if (!fmt || !fmt.channels || !fmt.sampleRate || dataOffset < 0) return null;
+    // Either half of the header alone is still a WAV its readers accept: a `fmt `-only
+    // image states the real rate (with no derivable length), and a RIFF whose `fmt ` is a
+    // stub or missing wraps an encoded `data` chunk a caller plays as its own stream.
+    // Refusing either makes that caller substitute a device default for the whole file.
+    const format = fmt && fmt.channels && fmt.sampleRate ? fmt : null;
+    if (!format && dataOffset < 0) return null;
 
     // A declared size past EOF (streamed/truncated writers use 0xFFFFFFFF) means "to the end".
-    const available = src.size - dataOffset;
+    const available = dataOffset < 0 ? 0 : src.size - dataOffset;
     const audioBytes = dataSize < 0 || dataSize > available ? available : dataSize;
 
     return {
         format: "wav",
-        sampleRate: fmt.sampleRate,
-        channels: fmt.channels,
-        bitsPerSample: fmt.bitsPerSample,
-        durationMs: durationMs(fmt, audioBytes, factSamples),
-        dataStart: dataOffset,
-        dataEnd: dataOffset + audioBytes,
-        formatTag: fmt.formatTag,
-        blockAlign: fmt.blockAlign,
+        sampleRate: format?.sampleRate ?? 0,
+        channels: format?.channels ?? 0,
+        bitsPerSample: format?.bitsPerSample ?? 0,
+        durationMs: format ? durationMs(format, audioBytes, factSamples) : 0,
+        dataStart: dataOffset < 0 ? 0 : dataOffset,
+        dataEnd: dataOffset < 0 ? 0 : dataOffset + audioBytes,
+        formatTag: format?.formatTag ?? 0,
+        blockAlign: format?.blockAlign ?? 0,
         mpegLayer: 0,
     };
 }
