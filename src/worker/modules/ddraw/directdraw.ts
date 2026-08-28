@@ -374,7 +374,31 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         let vidMemSize = 0;
         if (isVideoMemory && (isTexture || isPrimary || isBackBuffer || isD3dRenderTarget)) {
             const bytesPerPixel = Math.max(1, Math.floor((rawDesc.pixelFormat?.bpp || context.display.bpp) / 8));
-            const vramSurfaceSize = rawDesc.width * rawDesc.height * bytesPerPixel;
+            // A complex mipmap chain occupies the WHOLE chain in video memory, not just
+            // level 0 (base + 1/4 + 1/16 + … ≈ 1.333x the base). Charging only the base let
+            // the texture pool grow ~a third past what the advertised card could hold — and a
+            // guest that sizes its cache by CreateSurface FAILING (UE1's precache does exactly
+            // that) then never backs off where the hardware would. The implicit sublevels are
+            // created below without going through this entry point, so this is the only place
+            // that can charge them; the release path refunds the same recorded total.
+            let vramSurfaceSize = rawDesc.width * rawDesc.height * bytesPerPixel;
+            // Same omission, other implicit chain: a flip chain's back buffers are created
+            // below without passing through here, and on the card they are as real as the
+            // front buffer. (Wine subtracts the framebuffer from BOTH total and free in
+            // ddraw7_GetAvailableVidMem for the same reason.)
+            if ((rawDesc.backBufferCount ?? 0) > 0) {
+                vramSurfaceSize += rawDesc.backBufferCount * rawDesc.width * rawDesc.height * bytesPerPixel;
+            }
+            const chainLevels = rawDesc.mipMapCount ?? 0;
+            if (isTexture && chainLevels > 1
+                && (rawDesc.caps & DDSCAPS_MIPMAP) !== 0 && (rawDesc.caps & DDSCAPS_COMPLEX) !== 0) {
+                let w = rawDesc.width, h = rawDesc.height;
+                for (let level = 1; level < chainLevels; level++) {
+                    w = Math.max(1, w >> 1);
+                    h = Math.max(1, h >> 1);
+                    vramSurfaceSize += w * h * bytesPerPixel;
+                }
+            }
             const vidMemTotal = EmulatorConfig.getInstance().ddrawCaps.dwVidMemTotal;
 
             if (context.usedVidMem + vramSurfaceSize > vidMemTotal) {
