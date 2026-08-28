@@ -8,7 +8,7 @@
  */
 
 import type { RandomAccessSource } from "../unpack/source";
-import type { AudioStreamInfo } from "./index";
+import type { AudioProbe } from "./index";
 import { id3v2Size, readAt, readTail, samplesToMs, tagAt, u32be, u32le } from "./bytes";
 
 const SEARCH_WINDOW = 8 * 1024;
@@ -42,17 +42,29 @@ interface FrameHeader {
     frameSize: number;
 }
 
-export function probeMp3(src: RandomAccessSource): AudioStreamInfo | null {
+export function probeMp3(src: RandomAccessSource): AudioProbe | null {
     const tagSize = id3v2Size(readAt(src, 0, 10), 0);
     const window = readAt(src, tagSize, SEARCH_WINDOW);
     const frame = findFrame(window, tagSize);
     if (!frame) return null;
 
     const samples = samplesFromVbrHeader(window, frame, tagSize);
-    const durationMs = samples != null ? samplesToMs(samples, frame.sampleRate) : cbrDurationMs(src, frame);
-    if (durationMs == null) return null;
+    const dataEnd = Math.max(frame.offset, src.size - trailerSize(src));
 
-    return { durationMs, sampleRate: frame.sampleRate, channels: frame.channels, format: "mp3" };
+    return {
+        format: "mp3",
+        sampleRate: frame.sampleRate,
+        channels: frame.channels,
+        bitsPerSample: 0,
+        durationMs: samples != null
+            ? samplesToMs(samples, frame.sampleRate)
+            : Math.round(((dataEnd - frame.offset) * 8000) / frame.bitrate),
+        dataStart: frame.offset,
+        dataEnd,
+        formatTag: 0,
+        blockAlign: 0,
+        mpegLayer: frame.layer,
+    };
 }
 
 /** First frame whose successor lands exactly where its own size says it should. */
@@ -147,13 +159,6 @@ function samplesFromVbrHeader(window: Uint8Array, frame: FrameHeader, windowBase
         if (delay + padding < samples) samples -= delay + padding;
     }
     return samples;
-}
-
-/** Bitrate over the audio byte range, with head/tail metadata excluded. */
-function cbrDurationMs(src: RandomAccessSource, frame: FrameHeader): number | null {
-    const audioBytes = src.size - frame.offset - trailerSize(src);
-    if (audioBytes <= 0) return null;
-    return Math.round((audioBytes * 8000) / frame.bitrate);
 }
 
 /** Bytes of appended metadata (ID3v1, APEv2) that are not MPEG frames. */

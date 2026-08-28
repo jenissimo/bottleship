@@ -12,6 +12,7 @@ import { Mem } from "../core/memory/mem-accessor";
 import { Marshaler } from "../core/memory/marshaler";
 import { TimerKind } from "../core/scheduler/types";
 import { findResourceInPE } from "./kernel32/resource";
+import { probeAudioAt } from "@bottleship/formats/audio";
 import {
     createAudioRingBuffer,
     writeRingData,
@@ -988,63 +989,32 @@ export class WinMM implements IModule {
     }
 
     /**
-     * Parse a RIFF/WAV header from guest memory.
-     * Returns format info and data offset/size, or null on failure.
+     * Parse a RIFF/WAV header from guest memory. Returns null for anything the
+     * PlaySound path cannot feed the device directly — it hands raw samples to the
+     * ring, so a non-PCM payload must be refused rather than played as noise.
      */
     private parseWavFromMemory(mem: Uint8Array, ptr: number, maxLen: number): {
         channels: number; sampleRate: number; bitsPerSample: number; blockAlign: number;
         dataOffset: number; dataSize: number;
     } | null {
-        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         if (maxLen < 44) return null;
-
-        // RIFF header
-        const riffId = (view.getUint8(ptr) << 24) | (view.getUint8(ptr + 1) << 16) |
-                       (view.getUint8(ptr + 2) << 8) | view.getUint8(ptr + 3);
-        if (riffId !== 0x52494646) return null; // "RIFF"
-
-        const waveId = (view.getUint8(ptr + 8) << 24) | (view.getUint8(ptr + 9) << 16) |
-                       (view.getUint8(ptr + 10) << 8) | view.getUint8(ptr + 11);
-        if (waveId !== 0x57415645) return null; // "WAVE"
-
-        // Walk chunks starting at offset 12
-        let off = ptr + 12;
-        const end = ptr + maxLen;
-        let channels = 0, sampleRate = 0, bitsPerSample = 0, blockAlign = 0;
-        let dataOffset = 0, dataSize = 0;
-        let foundFmt = false;
-
-        while (off + 8 <= end) {
-            const chunkId = (view.getUint8(off) << 24) | (view.getUint8(off + 1) << 16) |
-                            (view.getUint8(off + 2) << 8) | view.getUint8(off + 3);
-            const chunkSize = view.getUint32(off + 4, true);
-
-            if (chunkId === 0x666D7420) { // "fmt "
-                if (chunkSize < 16 || off + 8 + 16 > end) return null;
-                const format = view.getUint16(off + 8, true);
-                if (format !== WAVE_FORMAT_PCM) {
-                    Logger.warn(LogCategory.SYSTEM, `PlaySound: unsupported WAV format ${format} (only PCM)`);
-                    return null;
-                }
-                channels = view.getUint16(off + 10, true);
-                sampleRate = view.getUint32(off + 12, true);
-                blockAlign = view.getUint16(off + 20, true);
-                bitsPerSample = view.getUint16(off + 22, true);
-                foundFmt = true;
-            } else if (chunkId === 0x64617461) { // "data"
-                dataOffset = off + 8;
-                dataSize = chunkSize;
-            }
-
-            // Advance to next chunk (pad to even boundary)
-            off += 8 + ((chunkSize + 1) & ~1);
+        const probe = probeAudioAt(mem, ptr, maxLen);
+        if (!probe || probe.format !== "wav") return null;
+        if (probe.formatTag !== WAVE_FORMAT_PCM) {
+            Logger.warn(LogCategory.SYSTEM, `PlaySound: unsupported WAV format ${probe.formatTag} (only PCM)`);
+            return null;
         }
+        const dataSize = probe.dataEnd - probe.dataStart;
+        if (dataSize === 0) return null;
 
-        if (!foundFmt || dataSize === 0 || dataOffset === 0) return null;
-        // Clamp data to available memory
-        if (dataOffset + dataSize > end) dataSize = end - dataOffset;
-
-        return { channels, sampleRate, bitsPerSample, blockAlign, dataOffset, dataSize };
+        return {
+            channels: probe.channels,
+            sampleRate: probe.sampleRate,
+            bitsPerSample: probe.bitsPerSample,
+            blockAlign: probe.blockAlign,
+            dataOffset: ptr + probe.dataStart,
+            dataSize,
+        };
     }
 
     /**

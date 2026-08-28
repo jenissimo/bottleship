@@ -1,5 +1,7 @@
 import { Logger, LogCategory } from "../../core/logger";
 import { MemoryGuard } from "../../core/memory/mem-guard";
+import { BufferSource } from "@bottleship/formats/unpack/source";
+import { probeAudio, probeAudioAt, type AudioProbe } from "@bottleship/formats/audio";
 import { MSSContext } from "./context";
 import { MSSSample, MSSStream } from "./types";
 import { applyEncodedPcmLength, inspectEncodedAudio, isMp3, isOgg, refreshSampleLenDone, refreshStreamLenDone } from "./helpers";
@@ -260,45 +262,27 @@ export interface WavChunkInfo {
     dataChunkSize: number;
 }
 
+/**
+ * Miles view of a RIFF/WAVE image: the shared probe's fields under the names the
+ * ADPCM/PCM decode paths use. A zero format tag is rejected here and not in the
+ * probe — the tag selects the decoder, so "WAVE with no usable fmt" is not a WAV
+ * this module can do anything with.
+ */
+function toWavChunkInfo(probe: AudioProbe | null): WavChunkInfo | null {
+    if (!probe || probe.format !== "wav" || !probe.formatTag) return null;
+    return {
+        formatTag: probe.formatTag,
+        channels: probe.channels,
+        sampleRate: probe.sampleRate,
+        bitsPerSample: probe.bitsPerSample,
+        blockAlign: probe.blockAlign,
+        dataChunkOffset: probe.dataStart,
+        dataChunkSize: probe.dataEnd - probe.dataStart,
+    };
+}
+
 export function scanWavChunks(data: Uint8Array): WavChunkInfo | null {
-    if (data.length < 12) return null;
-
-    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-    const riff = String.fromCharCode(data[0], data[1], data[2], data[3]);
-    const wave = String.fromCharCode(data[8], data[9], data[10], data[11]);
-    if (riff !== "RIFF" || wave !== "WAVE") return null;
-
-    let formatTag = 0;
-    let channels = 0;
-    let sampleRate = 0;
-    let bitsPerSample = 0;
-    let blockAlign = 0;
-    let dataChunkOffset = 0;
-    let dataChunkSize = 0;
-
-    let offset = 12;
-    while (offset + 8 <= data.length) {
-        const chunkId = String.fromCharCode(data[offset], data[offset + 1], data[offset + 2], data[offset + 3]);
-        const chunkSize = view.getUint32(offset + 4, true);
-        const chunkDataOffset = offset + 8;
-
-        if (chunkId === "fmt " && chunkSize >= 16 && chunkDataOffset + chunkSize <= data.length) {
-            formatTag = view.getUint16(chunkDataOffset, true);
-            channels = view.getUint16(chunkDataOffset + 2, true);
-            sampleRate = view.getUint32(chunkDataOffset + 4, true);
-            blockAlign = view.getUint16(chunkDataOffset + 12, true);
-            bitsPerSample = view.getUint16(chunkDataOffset + 14, true);
-        } else if (chunkId === "data" && chunkDataOffset <= data.length) {
-            dataChunkOffset = chunkDataOffset;
-            dataChunkSize = Math.min(chunkSize, data.length - chunkDataOffset);
-        }
-
-        const padded = chunkSize + (chunkSize & 1);
-        offset = chunkDataOffset + padded;
-    }
-
-    if (!formatTag || !channels || !sampleRate || !dataChunkOffset) return null;
-    return { formatTag, channels, sampleRate, bitsPerSample, blockAlign, dataChunkOffset, dataChunkSize };
+    return toWavChunkInfo(probeAudio(new BufferSource(data)));
 }
 
 export function inspectWavImage(mem: Uint8Array, wavPtr: number): (WavChunkInfo & { wavPtr: number; dataGuestPtr: number }) | null {
@@ -307,7 +291,7 @@ export function inspectWavImage(mem: Uint8Array, wavPtr: number): (WavChunkInfo 
     const riffSize = view.getUint32(wavPtr + 4, true) + 8;
     const scanLen = Math.min(riffSize, mem.length - wavPtr);
     if (scanLen < 44) return null;
-    const info = scanWavChunks(mem.subarray(wavPtr, wavPtr + scanLen));
+    const info = toWavChunkInfo(probeAudioAt(mem, wavPtr, scanLen));
     if (!info) return null;
     return {
         ...info,
@@ -513,69 +497,40 @@ export function readAilSoundInfo(mem: Uint8Array, infoPtr: number): {
 }
 
 export function parseWav(data: Uint8Array): { data: Uint8Array; channels: number; sampleRate: number; bitsPerSample: number; formatTag: number; blockAlign: number } | null {
-    if (data.length < 12) {
-        Logger.warn(LogCategory.SYSTEM, "MSS32: WAV header too small");
+    const info = scanWavChunks(data);
+    if (!info) {
+        // Name what we actually saw: "not a WAV" over a buffer whose first bytes are a WAV
+        // header means the caller handed us the wrong pointer, and over zeros it means the
+        // producer never filled it — two different bugs that read identically without this.
+        let head = "";
+        for (let i = 0; i < Math.min(12, data.length); i++) head += data[i]!.toString(16).padStart(2, "0");
+        Logger.warn(LogCategory.SYSTEM, `MSS32: not a decodable RIFF/WAVE file (${data.length}B, head=${head})`);
         return null;
     }
 
-    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-    const riff = String.fromCharCode(view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3));
-    const wave = String.fromCharCode(view.getUint8(8), view.getUint8(9), view.getUint8(10), view.getUint8(11));
-    if (riff !== "RIFF" || wave !== "WAVE") {
-        Logger.warn(LogCategory.SYSTEM, "MSS32: Not a RIFF/WAVE file");
-        return null;
-    }
-
-    let formatTag = 0;
-    let channels = 0;
-    let sampleRate = 0;
-    let bitsPerSample = 0;
-    let blockAlign = 0;
-    let dataChunkOffset = 0;
-    let dataChunkSize = 0;
-
-    let offset = 12;
-    while (offset + 8 <= data.length) {
-        const chunkId = String.fromCharCode(
-            view.getUint8(offset),
-            view.getUint8(offset + 1),
-            view.getUint8(offset + 2),
-            view.getUint8(offset + 3)
-        );
-        const chunkSize = view.getUint32(offset + 4, true);
-        const chunkDataOffset = offset + 8;
-
-        if (chunkId === "fmt " && chunkSize >= 16 && chunkDataOffset + chunkSize <= data.length) {
-            formatTag = view.getUint16(chunkDataOffset, true);
-            channels = view.getUint16(chunkDataOffset + 2, true);
-            sampleRate = view.getUint32(chunkDataOffset + 4, true);
-            blockAlign = view.getUint16(chunkDataOffset + 12, true);
-            bitsPerSample = view.getUint16(chunkDataOffset + 14, true);
-        } else if (chunkId === "data" && chunkDataOffset <= data.length) {
-            dataChunkOffset = chunkDataOffset;
-            dataChunkSize = Math.min(chunkSize, data.length - chunkDataOffset);
-        }
-
-        const padded = chunkSize + (chunkSize % 2);
-        offset = chunkDataOffset + padded;
-    }
-
-    if (!formatTag || !channels || !sampleRate || !bitsPerSample || !dataChunkOffset) {
+    if (!info.bitsPerSample) {
         Logger.warn(LogCategory.SYSTEM, "MSS32: WAV missing required chunks");
         return null;
     }
 
-    if (formatTag !== 1 && formatTag !== 17 && !(formatTag === 3 && bitsPerSample === 32)) {
-        Logger.warn(LogCategory.SYSTEM, `MSS32: Unsupported WAV format tag ${formatTag}`);
+    if (info.formatTag !== 1 && info.formatTag !== 17 && !(info.formatTag === 3 && info.bitsPerSample === 32)) {
+        Logger.warn(LogCategory.SYSTEM, `MSS32: Unsupported WAV format tag ${info.formatTag}`);
         return null;
     }
 
-    if (formatTag === 17) {
+    if (info.formatTag === 17) {
         Logger.log(LogCategory.SYSTEM, `MSS32: IMA ADPCM detected (tag 17) - attempting decode`);
     }
 
-    const audioData = data.slice(dataChunkOffset, dataChunkOffset + dataChunkSize);
-    return { data: audioData, channels, sampleRate, bitsPerSample, formatTag, blockAlign };
+    const audioData = data.slice(info.dataChunkOffset, info.dataChunkOffset + info.dataChunkSize);
+    return {
+        data: audioData,
+        channels: info.channels,
+        sampleRate: info.sampleRate,
+        bitsPerSample: info.bitsPerSample,
+        formatTag: info.formatTag,
+        blockAlign: info.blockAlign,
+    };
 }
 
 /**

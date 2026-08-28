@@ -13,6 +13,8 @@ import { System } from "../core/system";
 import { Logger, LogCategory, LogLevel } from "../core/logger";
 import { fpuPush } from "../core/fpu-helper";
 import { getCPU } from "../core/thunking/thunk-utils";
+import { BufferSource } from "@bottleship/formats/unpack/source";
+import { probeAudio, sniffAudioContainer } from "@bottleship/formats/audio";
 
 // BASS_ACTIVE constants
 const BASS_ACTIVE_STOPPED  = 0;
@@ -671,51 +673,34 @@ export class Bass implements IModule {
         fileData: Uint8Array,
         sourcePath?: string
     ): DetectedAudioPayload {
-        const wav = this.parseWav(fileData);
-        if (wav) {
-            const dataEnd = Math.min(fileData.byteLength, wav.dataOffset + wav.dataSize);
-            const dataChunk = fileData.subarray(wav.dataOffset, dataEnd);
+        const probe = probeAudio(new BufferSource(fileData));
 
-            if (this.isOgg(dataChunk)) {
+        // A RIFF wrapper around an encoded payload: BASS plays the inner stream, and
+        // the inner stream's own header is the only honest source of its rate.
+        if (probe?.format === "wav") {
+            const dataChunk = fileData.subarray(probe.dataStart, probe.dataEnd);
+            const innerSource = new BufferSource(dataChunk);
+            const innerFormat = sniffAudioContainer(innerSource);
+            if (innerFormat === "ogg" || innerFormat === "mp3") {
                 return {
                     payload: dataChunk.slice(),
-                    mimeType: "audio/ogg",
-                    sampleRate: this.getOggSampleRate(dataChunk) || wav.sampleRate || this.defaultFreq,
+                    mimeType: innerFormat === "ogg" ? "audio/ogg" : "audio/mpeg",
+                    sampleRate: probeAudio(innerSource)?.sampleRate || probe.sampleRate || this.defaultFreq,
                 };
             }
-
-            if (this.isMp3(dataChunk)) {
-                return {
-                    payload: dataChunk.slice(),
-                    mimeType: "audio/mpeg",
-                    sampleRate: this.getMp3SampleRate(dataChunk) || wav.sampleRate || this.defaultFreq,
-                };
-            }
-
-            return {
-                payload: fileData,
-                mimeType: "audio/wav",
-                sampleRate: wav.sampleRate || this.defaultFreq,
-            };
+            return { payload: fileData, mimeType: "audio/wav", sampleRate: probe.sampleRate || this.defaultFreq };
         }
 
-        if (this.isOgg(fileData)) {
-            return {
-                payload: fileData,
-                mimeType: "audio/ogg",
-                sampleRate: this.getOggSampleRate(fileData) || this.defaultFreq,
-            };
+        if (probe?.format === "ogg") {
+            return { payload: fileData, mimeType: "audio/ogg", sampleRate: probe.sampleRate || this.defaultFreq };
+        }
+        if (probe?.format === "mp3") {
+            return { payload: fileData, mimeType: "audio/mpeg", sampleRate: probe.sampleRate || this.defaultFreq };
         }
 
-        if (this.isMp3(fileData)) {
-            return {
-                payload: fileData,
-                mimeType: "audio/mpeg",
-                sampleRate: this.getMp3SampleRate(fileData) || this.defaultFreq,
-            };
-        }
-
-        const ext = sourcePath?.split(".").pop()?.toLowerCase();
+        // Recognized magic but unparseable headers still names the decoder to hand it to;
+        // a bare extension is the last resort, for a file whose header we cannot read at all.
+        const ext = sniffAudioContainer(new BufferSource(fileData)) ?? sourcePath?.split(".").pop()?.toLowerCase();
         if (ext === "wav") {
             return { payload: fileData, mimeType: "audio/wav", sampleRate: this.defaultFreq };
         }
@@ -727,98 +712,6 @@ export class Bass implements IModule {
         }
 
         return { payload: fileData, mimeType: "application/octet-stream", sampleRate: this.defaultFreq };
-    }
-
-    private parseWav(data: Uint8Array): { sampleRate: number; dataOffset: number; dataSize: number } | null {
-        if (data.byteLength < 44) return null;
-        const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-
-        // "RIFF" .... "WAVE"
-        if (view.getUint32(0, false) !== 0x52494646 || view.getUint32(8, false) !== 0x57415645) {
-            return null;
-        }
-
-        let sampleRate = 0;
-        let dataOffset = 0;
-        let dataSize = 0;
-        let offset = 12;
-
-        while (offset + 8 <= data.byteLength) {
-            const chunkId = view.getUint32(offset, false);
-            const chunkSize = view.getUint32(offset + 4, true);
-            const chunkDataOffset = offset + 8;
-            if (chunkDataOffset > data.byteLength) break;
-
-            if (chunkId === 0x666d7420 && chunkSize >= 16 && chunkDataOffset + 8 <= data.byteLength) {
-                sampleRate = view.getUint32(chunkDataOffset + 4, true);
-            } else if (chunkId === 0x64617461) {
-                dataOffset = chunkDataOffset;
-                dataSize = Math.min(chunkSize, data.byteLength - chunkDataOffset);
-                if (dataSize > 0) break;
-            }
-
-            const paddedChunkSize = chunkSize + (chunkSize & 1);
-            offset = chunkDataOffset + paddedChunkSize;
-        }
-
-        if (!dataOffset || dataSize <= 0) return null;
-        return { sampleRate, dataOffset, dataSize };
-    }
-
-    private isOgg(data: Uint8Array): boolean {
-        return data.length >= 4 &&
-            data[0] === 0x4f &&
-            data[1] === 0x67 &&
-            data[2] === 0x67 &&
-            data[3] === 0x53;
-    }
-
-    private isMp3(data: Uint8Array): boolean {
-        if (data.length < 3) return false;
-        if (data[0] === 0x49 && data[1] === 0x44 && data[2] === 0x33) return true; // ID3
-        return data.length >= 2 && data[0] === 0xff && (data[1] & 0xe0) === 0xe0; // frame sync
-    }
-
-    private getMp3SampleRate(data: Uint8Array): number | null {
-        const maxScan = Math.min(data.length - 4, 4096);
-        for (let i = 0; i < maxScan; i++) {
-            const b0 = data[i];
-            const b1 = data[i + 1];
-            if (b0 !== 0xff || (b1 & 0xe0) !== 0xe0) continue;
-
-            const b2 = data[i + 2];
-            const versionId = (b1 >> 3) & 0x03;
-            const sampleRateIndex = (b2 >> 2) & 0x03;
-            if (sampleRateIndex === 3 || versionId === 1) return null;
-
-            const rates = [44100, 48000, 32000];
-            let baseRate = rates[sampleRateIndex];
-            if (versionId === 2) baseRate = baseRate / 2;
-            else if (versionId === 0) baseRate = baseRate / 4;
-            return baseRate;
-        }
-        return null;
-    }
-
-    private getOggSampleRate(data: Uint8Array): number | null {
-        const maxScan = Math.min(data.length - 16, 8192);
-        for (let i = 0; i < maxScan; i++) {
-            if (data[i] !== 0x01) continue;
-            if (
-                data[i + 1] === 0x76 && // v
-                data[i + 2] === 0x6f && // o
-                data[i + 3] === 0x72 && // r
-                data[i + 4] === 0x62 && // b
-                data[i + 5] === 0x69 && // i
-                data[i + 6] === 0x73    // s
-            ) {
-                const rateOffset = i + 12;
-                if (rateOffset + 4 > data.length) return null;
-                const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-                return view.getUint32(rateOffset, true);
-            }
-        }
-        return null;
     }
 
     // -----------------------------------------------------------------------

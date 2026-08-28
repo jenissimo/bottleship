@@ -6,7 +6,13 @@
 
 import { describe, it, expect } from "bun:test";
 import { BufferSource, type RandomAccessSource } from "@bottleship/formats/unpack/source";
-import { probeAudioStream } from "@bottleship/formats/audio";
+import { probeAudio } from "@bottleship/formats/audio";
+
+/** The narrow view the MCI/virtual-CD caller consumes; these cases are about length. */
+function streamInfo(src: RandomAccessSource) {
+    const p = probeAudio(src);
+    return p && { durationMs: p.durationMs, sampleRate: p.sampleRate, channels: p.channels, format: p.format };
+}
 
 // --- helpers ----------------------------------------------------------------
 
@@ -238,7 +244,7 @@ function riff(...chunks: Uint8Array[]): Uint8Array {
 describe("probeAudioStream / ogg", () => {
     it("derives duration from the last page's granulepos", () => {
         const file = vorbisStream({ granules: [44100, 88200, 132300, 176400] });
-        expect(probeAudioStream(new BufferSource(file))).toEqual({
+        expect(streamInfo(new BufferSource(file))).toEqual({
             durationMs: 4000,
             sampleRate: 44100,
             channels: 2,
@@ -249,14 +255,14 @@ describe("probeAudioStream / ogg", () => {
     it("reads granulepos as 64-bit (a 32-bit read wraps past ~27 h)", () => {
         // 0x1_0000_2710 samples @ 44100 — the low word alone would report 250 ms.
         const file = vorbisStream({ granules: [0x100002710] });
-        const info = probeAudioStream(new BufferSource(file))!;
+        const info = streamInfo(new BufferSource(file))!;
         expect(info.durationMs).toBe(Math.round((0x100002710 * 1000) / 44100));
         expect(info.durationMs).toBeGreaterThan(97_000_000);
     });
 
     it("subtracts a non-zero start granule", () => {
         const file = vorbisStream({ headerGranule: 44100, granules: [44100 * 5] });
-        expect(probeAudioStream(new BufferSource(file))!.durationMs).toBe(4000);
+        expect(streamInfo(new BufferSource(file))!.durationMs).toBe(4000);
     });
 
     it("ignores an 'OggS' that is really audio payload", () => {
@@ -273,7 +279,7 @@ describe("probeAudioStream / ogg", () => {
             vorbisStream({ granules: [44100], serial }),
             oggPage({ packets: [body], granule: 88200, serial, seq: 99, flags: 0x04 }),
         );
-        expect(probeAudioStream(new BufferSource(file))!.durationMs).toBe(2000);
+        expect(streamInfo(new BufferSource(file))!.durationMs).toBe(2000);
     });
 
     it("skips a trailing page that completes no packet (granule -1)", () => {
@@ -282,7 +288,7 @@ describe("probeAudioStream / ogg", () => {
             vorbisStream({ granules: [44100, 88200], serial }),
             oggPage({ packets: [new Uint8Array(300).fill(7)], granule: -1, serial, seq: 50, flags: 0x04 }),
         );
-        expect(probeAudioStream(new BufferSource(file))!.durationMs).toBe(2000);
+        expect(streamInfo(new BufferSource(file))!.durationMs).toBe(2000);
     });
 
     it("ignores pages of a foreign serial number", () => {
@@ -290,12 +296,12 @@ describe("probeAudioStream / ogg", () => {
             vorbisStream({ granules: [44100 * 3], serial: 0xaaaa }),
             oggPage({ packets: [new Uint8Array(120).fill(3)], granule: 99999999, serial: 0xbbbb, seq: 0, flags: 0x04 }),
         );
-        expect(probeAudioStream(new BufferSource(file))!.durationMs).toBe(3000);
+        expect(streamInfo(new BufferSource(file))!.durationMs).toBe(3000);
     });
 
     it("reports mono and non-CD sample rates", () => {
         const file = vorbisStream({ channels: 1, sampleRate: 22050, granules: [22050 * 7] });
-        expect(probeAudioStream(new BufferSource(file))).toMatchObject({ durationMs: 7000, sampleRate: 22050, channels: 1 });
+        expect(streamInfo(new BufferSource(file))).toMatchObject({ durationMs: 7000, sampleRate: 22050, channels: 1 });
     });
 
     it("handles Opus (48 kHz granules, pre-skip removed)", () => {
@@ -311,7 +317,7 @@ describe("probeAudioStream / ogg", () => {
             oggPage({ packets: [concat(ascii("OpusTags"), new Uint8Array(8))], granule: 0, serial, seq: 1 }),
             oggPage({ packets: [new Uint8Array(200)], granule: 48000 * 3 + 312, serial, seq: 2, flags: 0x04 }),
         );
-        expect(probeAudioStream(new BufferSource(file))).toEqual({
+        expect(streamInfo(new BufferSource(file))).toEqual({
             durationMs: 3000,
             sampleRate: 48000,
             channels: 2,
@@ -334,7 +340,7 @@ describe("probeAudioStream / ogg", () => {
             oggPage({ packets: [new Uint8Array(64)], granule: 0, serial, seq: 1 }),
             oggPage({ packets: [new Uint8Array(128)], granule: 48000 * 5, serial, seq: 2, flags: 0x04 }),
         );
-        expect(probeAudioStream(new BufferSource(file))).toEqual({
+        expect(streamInfo(new BufferSource(file))).toEqual({
             durationMs: 5000,
             sampleRate: 48000,
             channels: 2,
@@ -349,13 +355,13 @@ describe("probeAudioStream / ogg", () => {
             oggPage({ packets: [speex], granule: 0, serial, seq: 0, flags: 0x02 }),
             oggPage({ packets: [new Uint8Array(100)], granule: 100000, serial, seq: 1, flags: 0x04 }),
         );
-        expect(probeAudioStream(new BufferSource(file))).toBeNull();
+        expect(streamInfo(new BufferSource(file))).toBeNull();
     });
 
     it("measures up to the last intact page when the file is cut short", () => {
         const file = vorbisStream({ granules: [44100, 88200] });
-        expect(probeAudioStream(new BufferSource(file.subarray(0, file.length - 40)))!.durationMs).toBe(1000);
-        expect(probeAudioStream(new BufferSource(file.subarray(0, 20)))).toBeNull();
+        expect(streamInfo(new BufferSource(file.subarray(0, file.length - 40)))!.durationMs).toBe(1000);
+        expect(streamInfo(new BufferSource(file.subarray(0, 20)))).toBeNull();
     });
 
     it("probes a multi-MB stream from a few KB at each end", () => {
@@ -376,7 +382,7 @@ describe("probeAudioStream / ogg", () => {
         expect(file.length).toBeGreaterThan(1_600_000);
 
         const src = new CountingSource(file);
-        expect(probeAudioStream(src)!.durationMs).toBe(200_000);
+        expect(streamInfo(src)!.durationMs).toBe(200_000);
         expect(src.bytesRead).toBeLessThan(64 * 1024);
     });
 });
@@ -384,7 +390,7 @@ describe("probeAudioStream / ogg", () => {
 describe("probeAudioStream / mp3", () => {
     it("uses the Xing frame count", () => {
         const file = concat(xingFrame(1000), mp3Frame(1), mp3Frame(2));
-        expect(probeAudioStream(new BufferSource(file))).toEqual({
+        expect(streamInfo(new BufferSource(file))).toEqual({
             durationMs: Math.round((1000 * 1152 * 1000) / 44100),
             sampleRate: 44100,
             channels: 2,
@@ -394,7 +400,7 @@ describe("probeAudioStream / mp3", () => {
 
     it("applies the LAME encoder delay/padding trim", () => {
         const file = concat(xingFrame(1000, { delay: 576, padding: 1000 }), mp3Frame(1), mp3Frame(2));
-        expect(probeAudioStream(new BufferSource(file))!.durationMs).toBe(Math.round(((1000 * 1152 - 1576) * 1000) / 44100));
+        expect(streamInfo(new BufferSource(file))!.durationMs).toBe(Math.round(((1000 * 1152 - 1576) * 1000) / 44100));
     });
 
     it("uses a VBRI frame count", () => {
@@ -402,7 +408,7 @@ describe("probeAudioStream / mp3", () => {
         f.set(ascii("VBRI"), 36);
         f.set(u32beBytes(500), 36 + 14);
         const file = concat(f, mp3Frame(1), mp3Frame(2));
-        expect(probeAudioStream(new BufferSource(file))!.durationMs).toBe(Math.round((500 * 1152 * 1000) / 44100));
+        expect(streamInfo(new BufferSource(file))!.durationMs).toBe(Math.round((500 * 1152 * 1000) / 44100));
     });
 
     it("falls back to CBR estimation, skipping ID3v2 and ID3v1", () => {
@@ -411,7 +417,7 @@ describe("probeAudioStream / mp3", () => {
         const id3v1 = new Uint8Array(128);
         id3v1.set(ascii("TAG"), 0);
         const file = concat(id3v2(2048), ...frames, id3v1);
-        expect(probeAudioStream(new BufferSource(file))!.durationMs).toBe(Math.round((100 * 417 * 8000) / 128000));
+        expect(streamInfo(new BufferSource(file))!.durationMs).toBe(Math.round((100 * 417 * 8000) / 128000));
     });
 
     // APEv2 footer: magic(8) version(8) size(12) item count(16) FLAGS(20) reserved(24). Both
@@ -433,7 +439,7 @@ describe("probeAudioStream / mp3", () => {
         for (let i = 0; i < 50; i++) frames.push(mp3Frame(i & 0xff));
         const apeItems = new Uint8Array(64);
         const file = concat(...frames, apeItems, apeTag(apeItems.length, 0));
-        expect(probeAudioStream(new BufferSource(file))!.durationMs).toBe(Math.round((50 * 417 * 8000) / 128000));
+        expect(streamInfo(new BufferSource(file))!.durationMs).toBe(Math.round((50 * 417 * 8000) / 128000));
     });
 
     it("excludes the 32-byte APEv2 HEADER too when the flags say there is one", () => {
@@ -442,7 +448,7 @@ describe("probeAudioStream / mp3", () => {
         const apeHeader = new Uint8Array(32);
         const apeItems = new Uint8Array(64);
         const file = concat(...frames, apeHeader, apeItems, apeTag(apeItems.length, 0x80000000));
-        expect(probeAudioStream(new BufferSource(file))!.durationMs).toBe(Math.round((50 * 417 * 8000) / 128000));
+        expect(streamInfo(new BufferSource(file))!.durationMs).toBe(Math.round((50 * 417 * 8000) / 128000));
     });
 
     it("falls back to the CBR estimate when Xing declares zero frames", () => {
@@ -454,7 +460,7 @@ describe("probeAudioStream / mp3", () => {
         frames[0]!.set(u32beBytes(0x0001), xing + 4);
         frames[0]!.set(u32beBytes(0), xing + 8);
         const file = concat(...frames);
-        expect(probeAudioStream(new BufferSource(file))!.durationMs).toBe(Math.round((50 * 417 * 8000) / 128000));
+        expect(streamInfo(new BufferSource(file))!.durationMs).toBe(Math.round((50 * 417 * 8000) / 128000));
     });
 
     it("reads MPEG-2 sample rate and samples-per-frame", () => {
@@ -467,20 +473,20 @@ describe("probeAudioStream / mp3", () => {
         f.set(ascii("Xing"), xing);
         f.set(u32beBytes(0x0001), xing + 4);
         f.set(u32beBytes(300), xing + 8);
-        const info = probeAudioStream(new BufferSource(f))!;
+        const info = streamInfo(new BufferSource(f))!;
         expect(info.sampleRate).toBe(22050);
         expect(info.channels).toBe(1);
         expect(info.durationMs).toBe(Math.round((300 * 576 * 1000) / 22050));
     });
 
     it("returns null when no valid frame is present", () => {
-        expect(probeAudioStream(new BufferSource(concat(new Uint8Array([0xff, 0xe0]), new Uint8Array(4096))))).toBeNull();
+        expect(streamInfo(new BufferSource(concat(new Uint8Array([0xff, 0xe0]), new Uint8Array(4096))))).toBeNull();
     });
 });
 
 describe("probeAudioStream / flac", () => {
     it("uses STREAMINFO total samples", () => {
-        expect(probeAudioStream(new BufferSource(flacFile(44100, 2, 4_410_000)))).toEqual({
+        expect(streamInfo(new BufferSource(flacFile(44100, 2, 4_410_000)))).toEqual({
             durationMs: 100_000,
             sampleRate: 44100,
             channels: 2,
@@ -490,25 +496,32 @@ describe("probeAudioStream / flac", () => {
 
     it("reads the 36-bit sample count past 2^32", () => {
         const samples = 0x1_0000_0000 + 44100;
-        expect(probeAudioStream(new BufferSource(flacFile(44100, 2, samples)))!.durationMs).toBe(
+        expect(streamInfo(new BufferSource(flacFile(44100, 2, samples)))!.durationMs).toBe(
             Math.round((samples * 1000) / 44100),
         );
     });
 
     it("sees past a prepended ID3v2 tag", () => {
-        const info = probeAudioStream(new BufferSource(flacFile(48000, 1, 96000, id3v2(30))))!;
+        const info = streamInfo(new BufferSource(flacFile(48000, 1, 96000, id3v2(30))))!;
         expect(info).toMatchObject({ durationMs: 2000, sampleRate: 48000, channels: 1, format: "flac" });
     });
 
-    it("returns null when the total sample count is unknown", () => {
-        expect(probeAudioStream(new BufferSource(flacFile(44100, 2, 0)))).toBeNull();
+    it("reports duration 0 when the total sample count is unknown", () => {
+        // The stream is still describable — rate and channels are real; only the
+        // length is not, and a caller that needs one checks for 0 rather than null.
+        expect(streamInfo(new BufferSource(flacFile(44100, 2, 0)))).toEqual({
+            durationMs: 0,
+            sampleRate: 44100,
+            channels: 2,
+            format: "flac",
+        });
     });
 });
 
 describe("probeAudioStream / wav", () => {
     it("derives duration from data size over byte rate", () => {
         const file = riff(fmtChunk({ channels: 2, sampleRate: 44100, bits: 16 }), chunk("data", new Uint8Array(176400)));
-        expect(probeAudioStream(new BufferSource(file))).toEqual({
+        expect(streamInfo(new BufferSource(file))).toEqual({
             durationMs: 1000,
             sampleRate: 44100,
             channels: 2,
@@ -522,7 +535,7 @@ describe("probeAudioStream / wav", () => {
             fmtChunk({ channels: 1, sampleRate: 22050, bits: 8 }),
             chunk("data", new Uint8Array(11025)),
         );
-        expect(probeAudioStream(new BufferSource(file))!.durationMs).toBe(500);
+        expect(streamInfo(new BufferSource(file))!.durationMs).toBe(500);
     });
 
     it("resolves WAVE_FORMAT_EXTENSIBLE to its SubFormat tag", () => {
@@ -530,7 +543,7 @@ describe("probeAudioStream / wav", () => {
             fmtChunk({ channels: 2, sampleRate: 48000, bits: 24, extensible: true }),
             chunk("data", new Uint8Array(48000 * 6)),
         );
-        expect(probeAudioStream(new BufferSource(file))).toMatchObject({ durationMs: 1000, sampleRate: 48000, channels: 2 });
+        expect(streamInfo(new BufferSource(file))).toMatchObject({ durationMs: 1000, sampleRate: 48000, channels: 2 });
     });
 
     it("prefers the fact chunk for compressed payloads", () => {
@@ -539,36 +552,36 @@ describe("probeAudioStream / wav", () => {
             chunk("fact", u32leBytes(44100)),
             chunk("data", new Uint8Array(5000)),
         );
-        expect(probeAudioStream(new BufferSource(file))!.durationMs).toBe(2000);
+        expect(streamInfo(new BufferSource(file))!.durationMs).toBe(2000);
     });
 
     it("clamps a data size that runs past EOF", () => {
         const file = riff(fmtChunk({ channels: 2, sampleRate: 44100, bits: 16 }), chunk("data", new Uint8Array(88200)));
         const dataSizeField = file.length - 88200 - 4;
         file.set(new Uint8Array([0xff, 0xff, 0xff, 0xff]), dataSizeField);
-        expect(probeAudioStream(new BufferSource(file))!.durationMs).toBe(500);
+        expect(streamInfo(new BufferSource(file))!.durationMs).toBe(500);
     });
 
     it("returns null without a data chunk", () => {
-        expect(probeAudioStream(new BufferSource(riff(fmtChunk({ channels: 2, sampleRate: 44100, bits: 16 }))))).toBeNull();
+        expect(streamInfo(new BufferSource(riff(fmtChunk({ channels: 2, sampleRate: 44100, bits: 16 }))))).toBeNull();
     });
 });
 
 describe("probeAudioStream / dispatch", () => {
     it("returns null instead of throwing on junk, empty and truncated input", () => {
-        expect(probeAudioStream(new BufferSource(new Uint8Array(0)))).toBeNull();
-        expect(probeAudioStream(new BufferSource(new Uint8Array(4)))).toBeNull();
-        expect(probeAudioStream(new BufferSource(ascii("not audio at all, just text")))).toBeNull();
-        expect(probeAudioStream(new BufferSource(ascii("OggS")))).toBeNull();
-        expect(probeAudioStream(new BufferSource(concat(ascii("RIFF"), new Uint8Array(8))))).toBeNull();
+        expect(streamInfo(new BufferSource(new Uint8Array(0)))).toBeNull();
+        expect(streamInfo(new BufferSource(new Uint8Array(4)))).toBeNull();
+        expect(streamInfo(new BufferSource(ascii("not audio at all, just text")))).toBeNull();
+        expect(streamInfo(new BufferSource(ascii("OggS")))).toBeNull();
+        expect(streamInfo(new BufferSource(concat(ascii("RIFF"), new Uint8Array(8))))).toBeNull();
         const noise = new Uint8Array(4096);
         for (let i = 0; i < noise.length; i++) noise[i] = (i * 37 + 11) & 0xff;
-        expect(() => probeAudioStream(new BufferSource(noise))).not.toThrow();
+        expect(() => streamInfo(new BufferSource(noise))).not.toThrow();
     });
 
     it("sniffs the container rather than trusting an extension", () => {
-        expect(probeAudioStream(new BufferSource(flacFile(44100, 2, 44100)))!.format).toBe("flac");
-        expect(probeAudioStream(new BufferSource(vorbisStream({ granules: [44100] })))!.format).toBe("ogg");
-        expect(probeAudioStream(new BufferSource(concat(xingFrame(10), mp3Frame(1))))!.format).toBe("mp3");
+        expect(streamInfo(new BufferSource(flacFile(44100, 2, 44100)))!.format).toBe("flac");
+        expect(streamInfo(new BufferSource(vorbisStream({ granules: [44100] })))!.format).toBe("ogg");
+        expect(streamInfo(new BufferSource(concat(xingFrame(10), mp3Frame(1))))!.format).toBe("mp3");
     });
 });

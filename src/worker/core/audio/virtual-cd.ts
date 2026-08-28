@@ -11,7 +11,7 @@
  * convention and its variants). File number == CD track number, so a game's own
  * track remap table indexes exactly what it would on real hardware.
  */
-import { probeAudioStream } from "@bottleship/formats/audio";
+import { probeAudio } from "@bottleship/formats/audio";
 import { Logger, LogCategory } from "../logger";
 import { System } from "../system";
 import { VfsAudioSource } from "./vfs-audio-source";
@@ -748,7 +748,7 @@ export class VirtualCdAudio {
         try {
             const size = System.getInstance().fileSystem.getFileSize(file);
             if (size <= 0) return 0;
-            const info = probeAudioStream(new VfsAudioSource(file, size));
+            const info = probeAudio(new VfsAudioSource(file, size));
             return info && info.durationMs > 0 ? Math.round(info.durationMs) : 0;
         } catch (e) {
             Logger.warn(LogCategory.SYSTEM, `VirtualCd: probe "${file}" failed: ${e}`);
@@ -777,7 +777,7 @@ export class VirtualCdAudio {
                 if (size <= 0) continue;
                 const source = new VfsAudioSource(t.file, size);
                 await source.prime();
-                const info = probeAudioStream(source);
+                const info = probeAudio(source);
                 if (!info || info.durationMs <= 0) continue;
                 t.lengthMs = Math.round(info.durationMs);
                 t.lengthKnown = true;

@@ -1,3 +1,6 @@
+import { BufferSource } from "@bottleship/formats/unpack/source";
+import { probeAudio, sniffAudioContainer } from "@bottleship/formats/audio";
+
 export type AudioPlayPayload = {
   id: number;
   data: Float32Array;
@@ -668,9 +671,8 @@ export class AudioEngine {
     if (mime.includes("audio/ogg") || mime.includes("audio/vorbis")) {
       return true;
     }
-    if (this.isMp3(payload.data)) return true;
-    if (this.isOgg(payload.data)) return true;
-    return false;
+    const container = sniffAudioContainer(new BufferSource(payload.data));
+    return container === "mp3" || container === "ogg";
   }
 
   private async playEncodedStreaming(payload: AudioPlayEncodedPayload): Promise<void> {
@@ -702,7 +704,7 @@ export class AudioEngine {
     const loopsRemaining = loopCount <= 0 ? Infinity : Math.max(1, loopCount);
     element.loop = loopsRemaining === Infinity;
 
-    const sampleRate = this.getMp3SampleRate(payload.data);
+    const sampleRate = this.encodedSampleRate(payload.data);
     if (payload.playbackRateHz && sampleRate) {
       element.playbackRate = payload.playbackRateHz / sampleRate;
     } else {
@@ -923,46 +925,9 @@ export class AudioEngine {
     return (hash >>> 0).toString(16);
   }
 
-  private isOgg(data: Uint8Array): boolean {
-    if (data.length < 4) return false;
-    // OggS magic bytes
-    return data[0] === 0x4f && data[1] === 0x67 && data[2] === 0x67 && data[3] === 0x53;
-  }
-
-  private isMp3(data: Uint8Array): boolean {
-    if (data.length < 3) return false;
-    if (data[0] === 0x49 && data[1] === 0x44 && data[2] === 0x33) {
-      return true;
-    }
-    if (data[0] === 0xff && (data[1] & 0xe0) === 0xe0) {
-      return true;
-    }
-    return false;
-  }
-
-  private getMp3SampleRate(data: Uint8Array): number | null {
-    const maxScan = Math.min(data.length - 4, 4096);
-    for (let i = 0; i < maxScan; i++) {
-      const b0 = data[i];
-      const b1 = data[i + 1];
-      if (b0 !== 0xff || (b1 & 0xe0) !== 0xe0) {
-        continue;
-      }
-      const b2 = data[i + 2];
-      const versionId = (b1 >> 3) & 0x03;
-      const sampleRateIndex = (b2 >> 2) & 0x03;
-      if (sampleRateIndex === 3 || versionId === 1) {
-        return null;
-      }
-      const rates = [44100, 48000, 32000];
-      let baseRate = rates[sampleRateIndex];
-      if (versionId === 2) {
-        baseRate = baseRate / 2;
-      } else if (versionId === 0) {
-        baseRate = baseRate / 4;
-      }
-      return baseRate;
-    }
-    return null;
+  /** Source rate from the stream's own headers — never the device's; a position
+   *  reported against the wrong rate drifts by exactly their ratio. */
+  private encodedSampleRate(data: Uint8Array): number | null {
+    return probeAudio(new BufferSource(data))?.sampleRate || null;
   }
 }

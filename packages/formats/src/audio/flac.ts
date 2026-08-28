@@ -6,7 +6,7 @@
  */
 
 import type { RandomAccessSource } from "../unpack/source";
-import type { AudioStreamInfo } from "./index";
+import type { AudioProbe } from "./index";
 import { id3v2Size, readAt, samplesToMs, tagAt, u32be } from "./bytes";
 
 export const STREAMINFO_SIZE = 34;
@@ -20,7 +20,7 @@ export interface FlacStreamInfo {
     totalSamples: number;
 }
 
-export function probeFlac(src: RandomAccessSource): AudioStreamInfo | null {
+export function probeFlac(src: RandomAccessSource): AudioProbe | null {
     const head = readAt(src, 0, HEAD_WINDOW);
     const start = id3v2Size(head, 0); // taggers happily prepend ID3v2 to FLAC
     if (!tagAt(head, start, "fLaC")) return null;
@@ -32,12 +32,20 @@ export function probeFlac(src: RandomAccessSource): AudioStreamInfo | null {
     if ((head[blockHeader]! & 0x7f) !== 0) return null;
 
     const info = parseStreamInfo(head, blockHeader + 4);
-    if (!info || info.totalSamples === 0) return null; // unknown length: nothing to report honestly
+    if (!info) return null;
     return {
-        durationMs: samplesToMs(info.totalSamples, info.sampleRate),
+        format: "flac",
         sampleRate: info.sampleRate,
         channels: info.channels,
-        format: "flac",
+        bitsPerSample: info.bitsPerSample,
+        // totalSamples 0 means a stream written without a known length.
+        durationMs: info.totalSamples === 0 ? 0 : samplesToMs(info.totalSamples, info.sampleRate),
+        // Frames follow the metadata blocks, whose walk the probe deliberately skips.
+        dataStart: 0,
+        dataEnd: src.size,
+        formatTag: 0,
+        blockAlign: 0,
+        mpegLayer: 0,
     };
 }
 

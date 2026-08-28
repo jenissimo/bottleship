@@ -7,7 +7,7 @@
  */
 
 import type { RandomAccessSource } from "../unpack/source";
-import type { AudioStreamInfo } from "./index";
+import type { AudioProbe } from "./index";
 import { readAt, readTail, samplesToMs, tagAt, u16be, u16le, u32le } from "./bytes";
 import { parseStreamInfo, STREAMINFO_SIZE } from "./flac";
 
@@ -32,13 +32,15 @@ interface OggPage {
 interface CodecInfo {
     sampleRate: number;
     channels: number;
+    /** Only FLAC-in-Ogg states one; 0 for Vorbis/Opus. */
+    bitsPerSample: number;
     /** Packets belonging to the header; the page they finish on carries the stream's start granule. */
     headerPackets: number;
     /** Samples the decoder discards at the start (Opus); already counted in granulepos. */
     preSkip: number;
 }
 
-export function probeOgg(src: RandomAccessSource): AudioStreamInfo | null {
+export function probeOgg(src: RandomAccessSource): AudioProbe | null {
     const head = readAt(src, 0, HEAD_WINDOW);
     const first = parsePage(head, 0);
     if (!first || first.headerType & 0x01 || first.bodySize === 0) return null;
@@ -52,10 +54,17 @@ export function probeOgg(src: RandomAccessSource): AudioStreamInfo | null {
     const samples = last - startGranule(head, codec.headerPackets) - codec.preSkip;
     if (samples < 0) return null;
     return {
-        durationMs: samplesToMs(samples, codec.sampleRate),
+        format: "ogg",
         sampleRate: codec.sampleRate,
         channels: codec.channels,
-        format: "ogg",
+        bitsPerSample: codec.bitsPerSample,
+        durationMs: samplesToMs(samples, codec.sampleRate),
+        // Ogg interleaves headers and audio into pages; the payload is the whole file.
+        dataStart: 0,
+        dataEnd: src.size,
+        formatTag: 0,
+        blockAlign: 0,
+        mpegLayer: 0,
     };
 }
 
@@ -68,7 +77,7 @@ function identifyCodec(head: Uint8Array, first: OggPage): CodecInfo | null {
         const channels = head[b + 11]!;
         const sampleRate = u32le(head, b + 12);
         if (!channels || !sampleRate) return null;
-        return { sampleRate, channels, headerPackets: 3, preSkip: 0 };
+        return { sampleRate, channels, bitsPerSample: 0, headerPackets: 3, preSkip: 0 };
     }
 
     // Opus always decodes at 48 kHz and its granulepos counts 48 kHz samples,
@@ -76,7 +85,7 @@ function identifyCodec(head: Uint8Array, first: OggPage): CodecInfo | null {
     if (n >= 19 && tagAt(head, b, "OpusHead")) {
         const channels = head[b + 9]!;
         if (!channels) return null;
-        return { sampleRate: 48000, channels, headerPackets: 2, preSkip: u16le(head, b + 10) };
+        return { sampleRate: 48000, channels, bitsPerSample: 0, headerPackets: 2, preSkip: u16le(head, b + 10) };
     }
 
     // FLAC-in-Ogg mapping: 0x7F "FLAC" major minor, u16be header-packet count, then the
@@ -84,7 +93,7 @@ function identifyCodec(head: Uint8Array, first: OggPage): CodecInfo | null {
     if (n >= 13 + 4 + STREAMINFO_SIZE && head[b] === 0x7f && tagAt(head, b + 1, "FLAC") && tagAt(head, b + 9, "fLaC")) {
         const info = parseStreamInfo(head, b + 13 + 4);
         if (!info) return null;
-        return { sampleRate: info.sampleRate, channels: info.channels, headerPackets: 1 + u16be(head, b + 7), preSkip: 0 };
+        return { sampleRate: info.sampleRate, channels: info.channels, bitsPerSample: info.bitsPerSample, headerPackets: 1 + u16be(head, b + 7), preSkip: 0 };
     }
 
     return null; // Speex/Theora/unknown mapping — reporting Vorbis-shaped info would be a lie.

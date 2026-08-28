@@ -18,6 +18,8 @@ import { SystemResourceProvider } from "../../core/resources/system-resource-pro
 import { System } from "../../core/system";
 import { EmulatorConfig } from "../../core/emulator-config-manager";
 import { videoEngine } from "../../../video/video-engine";
+import { BufferSource } from "@bottleship/formats/unpack/source";
+import { probeAudio, type AudioContainer } from "@bottleship/formats/audio";
 import { FilterGraphObject } from "./com-objects";
 import {
     IID_IGraphBuilder,
@@ -155,204 +157,34 @@ export class Quartz implements IModule {
         }
     }
 
+    private static readonly MIME_BY_CONTAINER: Record<AudioContainer, string> = {
+        wav: "audio/wav",
+        mp3: "audio/mpeg",
+        ogg: "audio/ogg",
+        flac: "audio/flac",
+    };
+
     private isAudioPath(path: string): boolean {
         const ext = path.split("?")[0].split(".").pop()?.toLowerCase();
         return ext === "mp3" || ext === "ogg" || ext === "wav";
     }
 
     private detectAudio(fileBytes: Uint8Array, path: string): DetectedAudio | null {
-        const wav = this.parseWav(fileBytes);
-        if (wav) {
+        const probe = probeAudio(new BufferSource(fileBytes));
+        if (probe) {
             return {
-                mimeType: "audio/wav",
-                sampleRate: wav.sampleRate || 44100,
-                duration: wav.duration,
+                mimeType: Quartz.MIME_BY_CONTAINER[probe.format],
+                sampleRate: probe.sampleRate || 44100,
+                duration: probe.durationMs / 1000,
             };
         }
 
-        if (this.isMp3(fileBytes) || path.toLowerCase().endsWith(".mp3")) {
-            const mp3 = this.parseMp3Info(fileBytes);
-            return {
-                mimeType: "audio/mpeg",
-                sampleRate: mp3?.sampleRate || 44100,
-                duration: mp3?.duration || 0,
-            };
-        }
-
-        if (this.isOgg(fileBytes) || path.toLowerCase().endsWith(".ogg")) {
-            return {
-                mimeType: "audio/ogg",
-                sampleRate: this.getOggSampleRate(fileBytes) || 44100,
-                duration: 0,
-            };
-        }
-
-        return null;
-    }
-
-    private parseWav(data: Uint8Array): { sampleRate: number; duration: number } | null {
-        if (data.byteLength < 44) return null;
-        const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-        if (view.getUint32(0, false) !== 0x52494646 || view.getUint32(8, false) !== 0x57415645) {
-            return null;
-        }
-
-        let sampleRate = 0;
-        let avgBytesPerSec = 0;
-        let dataSize = 0;
-        let offset = 12;
-
-        while (offset + 8 <= data.byteLength) {
-            const chunkId = view.getUint32(offset, false);
-            const chunkSize = view.getUint32(offset + 4, true);
-            const chunkDataOffset = offset + 8;
-            if (chunkDataOffset > data.byteLength) break;
-
-            if (chunkId === 0x666d7420 && chunkSize >= 16 && chunkDataOffset + 12 <= data.byteLength) {
-                sampleRate = view.getUint32(chunkDataOffset + 4, true);
-                avgBytesPerSec = view.getUint32(chunkDataOffset + 8, true);
-            } else if (chunkId === 0x64617461) {
-                dataSize = Math.min(chunkSize, data.byteLength - chunkDataOffset);
-            }
-
-            offset = chunkDataOffset + chunkSize + (chunkSize & 1);
-        }
-
-        if (!sampleRate) return null;
-        const duration = avgBytesPerSec > 0 && dataSize > 0 ? dataSize / avgBytesPerSec : 0;
-        return { sampleRate, duration };
-    }
-
-    private isMp3(data: Uint8Array): boolean {
-        if (data.length < 3) return false;
-        if (data[0] === 0x49 && data[1] === 0x44 && data[2] === 0x33) return true;
-        return data.length >= 2 && data[0] === 0xff && (data[1] & 0xe0) === 0xe0;
-    }
-
-    private isOgg(data: Uint8Array): boolean {
-        return data.length >= 4 &&
-            data[0] === 0x4f &&
-            data[1] === 0x67 &&
-            data[2] === 0x67 &&
-            data[3] === 0x53;
-    }
-
-    private parseMp3Info(data: Uint8Array): { sampleRate: number; duration: number } | null {
-        const start = this.skipId3v2(data);
-        let offset = start;
-        let frames = 0;
-        let totalSamples = 0;
-        let sampleRate = 0;
-        let scanned = 0;
-
-        while (offset + 4 <= data.length && scanned < data.length) {
-            scanned++;
-            const frame = this.parseMp3FrameHeader(data, offset);
-            if (!frame || frame.frameSize <= 0) {
-                offset++;
-                continue;
-            }
-
-            frames++;
-            totalSamples += frame.samplesPerFrame;
-            sampleRate = frame.sampleRate;
-            offset += frame.frameSize;
-        }
-
-        if (frames === 0 || sampleRate <= 0 || totalSamples <= 0) return null;
-        return { sampleRate, duration: totalSamples / sampleRate };
-    }
-
-    private skipId3v2(data: Uint8Array): number {
-        if (data.length < 10 || data[0] !== 0x49 || data[1] !== 0x44 || data[2] !== 0x33) return 0;
-        const size =
-            ((data[6] & 0x7f) << 21) |
-            ((data[7] & 0x7f) << 14) |
-            ((data[8] & 0x7f) << 7) |
-            (data[9] & 0x7f);
-        return Math.min(data.length, 10 + size);
-    }
-
-    private parseMp3FrameHeader(data: Uint8Array, offset: number): {
-        frameSize: number;
-        sampleRate: number;
-        samplesPerFrame: number;
-    } | null {
-        if (offset + 4 > data.length) return null;
-        const b0 = data[offset];
-        const b1 = data[offset + 1];
-        const b2 = data[offset + 2];
-        if (b0 !== 0xff || (b1 & 0xe0) !== 0xe0) return null;
-
-        const versionId = (b1 >> 3) & 0x03;
-        const layerBits = (b1 >> 1) & 0x03;
-        const bitrateIndex = (b2 >> 4) & 0x0f;
-        const sampleRateIndex = (b2 >> 2) & 0x03;
-        const padding = (b2 >> 1) & 0x01;
-        if (versionId === 1 || layerBits === 0 || bitrateIndex === 0 || bitrateIndex === 0x0f || sampleRateIndex === 3) {
-            return null;
-        }
-
-        const baseRates = [44100, 48000, 32000];
-        let sampleRate = baseRates[sampleRateIndex];
-        if (versionId === 2) sampleRate /= 2;
-        else if (versionId === 0) sampleRate /= 4;
-
-        const bitrate = this.mp3BitrateKbps(versionId, layerBits, bitrateIndex);
-        if (!bitrate || !sampleRate) return null;
-
-        let frameSize: number;
-        let samplesPerFrame: number;
-        if (layerBits === 3) {
-            frameSize = Math.floor(((12 * bitrate * 1000) / sampleRate + padding) * 4);
-            samplesPerFrame = 384;
-        } else if (layerBits === 2) {
-            frameSize = Math.floor((144 * bitrate * 1000) / sampleRate + padding);
-            samplesPerFrame = 1152;
-        } else {
-            const isMpeg1 = versionId === 3;
-            frameSize = Math.floor(((isMpeg1 ? 144 : 72) * bitrate * 1000) / sampleRate + padding);
-            samplesPerFrame = isMpeg1 ? 1152 : 576;
-        }
-
-        if (frameSize < 4 || offset + frameSize > data.length + 1024) return null;
-        return { frameSize, sampleRate, samplesPerFrame };
-    }
-
-    private mp3BitrateKbps(versionId: number, layerBits: number, bitrateIndex: number): number {
-        const mpeg1 = versionId === 3;
-        const table = mpeg1
-            ? {
-                3: [0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448],
-                2: [0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384],
-                1: [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320],
-            }
-            : {
-                3: [0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256],
-                2: [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
-                1: [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
-            };
-        return table[layerBits as 1 | 2 | 3]?.[bitrateIndex] ?? 0;
-    }
-
-    private getOggSampleRate(data: Uint8Array): number | null {
-        const maxScan = Math.min(data.length - 16, 8192);
-        for (let i = 0; i < maxScan; i++) {
-            if (data[i] !== 0x01) continue;
-            if (
-                data[i + 1] === 0x76 &&
-                data[i + 2] === 0x6f &&
-                data[i + 3] === 0x72 &&
-                data[i + 4] === 0x62 &&
-                data[i + 5] === 0x69 &&
-                data[i + 6] === 0x73
-            ) {
-                const rateOffset = i + 12;
-                if (rateOffset + 4 > data.length) return null;
-                const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-                return view.getUint32(rateOffset, true);
-            }
-        }
+        // Header unreadable: the extension still names the decoder to hand it to, and
+        // DirectShow answers "duration unknown" (0) rather than refusing to build a graph.
+        const ext = path.split("?")[0].split(".").pop()?.toLowerCase();
+        if (ext === "mp3") return { mimeType: "audio/mpeg", sampleRate: 44100, duration: 0 };
+        if (ext === "ogg") return { mimeType: "audio/ogg", sampleRate: 44100, duration: 0 };
+        if (ext === "wav") return { mimeType: "audio/wav", sampleRate: 44100, duration: 0 };
         return null;
     }
 

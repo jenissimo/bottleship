@@ -1,5 +1,5 @@
 /**
- * RIFF/WAVE container probe.
+ * RIFF/WAVE container probe and writer.
  *
  * Duration comes from the `data` chunk size over the format's byte rate (PCM), or
  * from the `fact` chunk's sample count for compressed payloads where bytes and
@@ -7,7 +7,7 @@
  */
 
 import type { RandomAccessSource } from "../unpack/source";
-import type { AudioStreamInfo } from "./index";
+import type { AudioProbe } from "./index";
 import { readAt, samplesToMs, tagAt, u16le, u32le } from "./bytes";
 
 const WAVE_FORMAT_PCM = 0x0001;
@@ -21,10 +21,11 @@ interface WavFormat {
     channels: number;
     sampleRate: number;
     byteRate: number;
+    blockAlign: number;
     bitsPerSample: number;
 }
 
-export function probeWav(src: RandomAccessSource): AudioStreamInfo | null {
+export function probeWav(src: RandomAccessSource): AudioProbe | null {
     const head = readAt(src, 0, 12);
     if (head.length < 12 || !tagAt(head, 8, "WAVE")) return null;
     const rf64 = tagAt(head, 0, "RF64");
@@ -66,18 +67,28 @@ export function probeWav(src: RandomAccessSource): AudioStreamInfo | null {
     const available = src.size - dataOffset;
     const audioBytes = dataSize < 0 || dataSize > available ? available : dataSize;
 
-    const compressed = fmt.formatTag !== WAVE_FORMAT_PCM && fmt.formatTag !== WAVE_FORMAT_FLOAT;
-    if (compressed && factSamples > 0) {
-        return info(samplesToMs(factSamples, fmt.sampleRate), fmt);
-    }
-
-    const byteRate = fmt.byteRate > 0 ? fmt.byteRate : (fmt.sampleRate * fmt.channels * fmt.bitsPerSample) / 8;
-    if (byteRate <= 0) return null;
-    return info(Math.round((audioBytes * 1000) / byteRate), fmt);
+    return {
+        format: "wav",
+        sampleRate: fmt.sampleRate,
+        channels: fmt.channels,
+        bitsPerSample: fmt.bitsPerSample,
+        durationMs: durationMs(fmt, audioBytes, factSamples),
+        dataStart: dataOffset,
+        dataEnd: dataOffset + audioBytes,
+        formatTag: fmt.formatTag,
+        blockAlign: fmt.blockAlign,
+        mpegLayer: 0,
+    };
 }
 
-function info(durationMs: number, fmt: WavFormat): AudioStreamInfo {
-    return { durationMs, sampleRate: fmt.sampleRate, channels: fmt.channels, format: "wav" };
+/** 0 when the header states nothing a length can be derived from. */
+function durationMs(fmt: WavFormat, audioBytes: number, factSamples: number): number {
+    const compressed = fmt.formatTag !== WAVE_FORMAT_PCM && fmt.formatTag !== WAVE_FORMAT_FLOAT;
+    if (compressed && factSamples > 0) return samplesToMs(factSamples, fmt.sampleRate);
+
+    const byteRate = fmt.byteRate > 0 ? fmt.byteRate : (fmt.sampleRate * fmt.channels * fmt.bitsPerSample) / 8;
+    if (byteRate <= 0) return 0;
+    return Math.round((audioBytes * 1000) / byteRate);
 }
 
 function parseFormat(b: Uint8Array): WavFormat | null {
@@ -90,6 +101,38 @@ function parseFormat(b: Uint8Array): WavFormat | null {
         channels: u16le(b, 2),
         sampleRate: u32le(b, 4),
         byteRate: u32le(b, 8),
+        blockAlign: u16le(b, 12),
         bitsPerSample: u16le(b, 14),
     };
+}
+
+/**
+ * Canonical 44-byte-header PCM RIFF/WAVE wrapper around already-decoded 16-bit
+ * samples. Lives beside the probe so the two directions of the format share one
+ * definition of where every field sits — and so a round trip is one test.
+ */
+export function buildPcmWavImage(pcm: Uint8Array, channels: number, sampleRate: number): Uint8Array {
+    const ch = Math.max(1, channels | 0);
+    const rate = Math.max(1, sampleRate | 0);
+    const blockAlign = ch * 2;
+    const image = new Uint8Array(44 + pcm.byteLength);
+    const view = new DataView(image.buffer);
+    const tag = (offset: number, text: string) => {
+        for (let i = 0; i < 4; i++) image[offset + i] = text.charCodeAt(i);
+    };
+    tag(0, "RIFF");
+    view.setUint32(4, 36 + pcm.byteLength, true);
+    tag(8, "WAVE");
+    tag(12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, WAVE_FORMAT_PCM, true);
+    view.setUint16(22, ch, true);
+    view.setUint32(24, rate, true);
+    view.setUint32(28, rate * blockAlign, true);
+    view.setUint16(32, blockAlign, true);
+    view.setUint16(34, 16, true);
+    tag(36, "data");
+    view.setUint32(40, pcm.byteLength, true);
+    image.set(pcm, 44);
+    return image;
 }
