@@ -80,6 +80,12 @@ export const GR_VERTEX_OOW_OFFSET = 0x20;
 export const GR_VERTEX_SOW_OFFSET = 0x24;
 export const GR_VERTEX_TOW_OFFSET = 0x28;
 export const GR_VERTEX_TMU0_OOW_OFFSET = 0x2c;
+// grHints(GR_HINT_STWHINT, mask) — which per-TMU s/t/w the app actually supplies.
+export const GR_HINT_STWHINT = 0;
+export const GR_STWHINT_W_DIFF_FBI = 1 << 0;
+export const GR_STWHINT_W_DIFF_TMU0 = 1 << 1;
+export const GR_STWHINT_ST_DIFF_TMU0 = 1 << 2;
+
 export const GR_VERTEX_SIZE = 0x24 + (GLIDE_TMU_COUNT * 0x0c);
 
 export const GR_BUFFER_FRONTBUFFER = 0;

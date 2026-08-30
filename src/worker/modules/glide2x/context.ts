@@ -24,8 +24,22 @@ export type GlideTextureRecord = {
     height: number;
     format: number;
     bytes: number;
+    /** GrTexInfo as the guest declared it — the only record of what we were TOLD the
+     *  texture is, as opposed to what we decided its dimensions are. */
+    smallLod: number;
+    largeLod: number;
+    aspectRatio: number;
+    /** grTexDownloadMipMap's GR_MIPMAPLEVELMASK_* (which LODs the download carries). */
+    evenOdd: number;
     uploadedAt: number;
     lastUsedFrame: number;
+    /**
+     * Copy of the guest bytes this texture was decoded FROM, kept for diagnostics.
+     * `dataPtr` is a guest scratch buffer the title reuses, so re-reading it later
+     * decodes SOME OTHER texture and the dump lies without saying so. Bounded by
+     * the TMU memory these records mirror.
+     */
+    sourceBytes: Uint8Array | null;
 };
 
 export type GlideTMUState = {
@@ -83,6 +97,9 @@ export type GlideFrameSnapshot = {
     drawCalls: number;
     presents: number;
     lfbLocks: number;
+    /** Locks that asked to READ the buffer (GR_LFB_READ_ONLY) — a post-process reading
+     *  back the rendered scene, which a write-only LFB mirror cannot answer. */
+    lfbReadLocks: number;
     lfbUnlocks: number;
     lfbReads: number;
     lfbWrites: number;
@@ -128,7 +145,7 @@ export type GlideDebugInfo = {
         colorFormat: number;
         origin: number;
     };
-    textures: GlideTextureRecord[];
+    textures: Array<Omit<GlideTextureRecord, "sourceBytes"> & { sourceBytes: number }>;
     lfbSurfaces: Array<{
         buffer: number;
         address: number;
@@ -140,6 +157,16 @@ export type GlideDebugInfo = {
         dirty: boolean;
         activeLeaseId: number;
     }>;
+    /** The live render state a screenshot cannot show: clip window, viewport, cull,
+     *  fog and the TMU filter/mip modes. */
+    runtime: {
+        clipWindow: { minX: number; minY: number; maxX: number; maxY: number };
+        viewport: { x: number; y: number; width: number; height: number };
+        cullMode: number;
+        fogMode: number;
+        stwHint: number;
+        tmu0: { minFilter: number; magFilter: number; mipMapMode: number; lodBias: number; clampS: number; clampT: number };
+    };
     ringEvents: Array<{ id: number; type: string; timestamp: number; detail?: string }>;
     frameSnapshot: GlideFrameSnapshot;
     pipelineCache?: { hits: number; misses: number; size: number };
@@ -171,6 +198,8 @@ export type GlideRuntimeState = {
     chromaKeyValue: number;
     constantColorValue: number;
     gammaValue: number;
+    /** grHints(GR_HINT_STWHINT) mask — decides whether tmuvtx[].oow is even valid. */
+    stwHint: number;
 };
 
 export type GlideContext = {
@@ -196,6 +225,31 @@ export type GlideContext = {
     lfbWriteColorSwizzleBytes: boolean;
     lfbWriteColorSwizzleWords: boolean;
     stream: Legacy3DCommandStream;
+    /**
+     * Command-stream length at the last guest LFB write. A write recorded after every
+     * draw of the frame composites over the finished picture; one recorded before them
+     * is a background. The two composite in opposite orders, and only the stream
+     * position tells them apart.
+     */
+    lfbWriteMark: number;
+    /**
+     * The guest READ the frame buffer during this frame. Only then is a later LFB write
+     * a post-process: its content is derived from the frame, so the pixels it did not
+     * change already equal the frame. A write with no read before it is a background —
+     * and a late write with no read (a cursor, an overlay) must stay a background, or
+     * it buries everything drawn before it.
+     */
+    lfbReadThisFrame: boolean;
+    /** frameId at which the LFB surface was last refreshed from the rendered frame. */
+    lfbSyncedFrame: number;
+    /** Reused RGBA staging for the per-present LFB conversion (see presenter.ts). */
+    lfbRgbaScratch: Uint8Array | null;
+    /** Which surface + dataPtr lfbRgbaScratch currently holds, so an unchanged
+     *  frame can reuse it instead of re-running 307k pixel conversions. */
+    lfbRgbaSource: number;
+    /** Bumped whenever the LFB surface's pixels change, so the presenter's upload
+     *  can skip re-converting an image the GPU already holds. */
+    lfbContentVersion: number;
     ffpState: Legacy3DFFPState;
     runtime: GlideRuntimeState;
     tmus: GlideTMUState[];
@@ -243,6 +297,7 @@ function createDefaultRuntimeState(): GlideRuntimeState {
         constantColorValue: 0xffffffff,
         // CVG GLIDE_DEFAULT_GAMMA; real drivers call grGammaCorrectionValue on init.
         gammaValue: 1.3,
+        stwHint: 0,
     };
 }
 
@@ -298,6 +353,12 @@ export function createGlideContext(process: Process): GlideContext {
         lfbWriteColorSwizzleBytes: false,
         lfbWriteColorSwizzleWords: false,
         stream: new Legacy3DCommandStream(),
+        lfbWriteMark: -1,
+        lfbReadThisFrame: false,
+        lfbSyncedFrame: -1,
+        lfbRgbaScratch: null,
+        lfbRgbaSource: 0,
+        lfbContentVersion: 1,
         ffpState: new Legacy3DFFPState(),
         runtime: createDefaultRuntimeState(),
         tmus,
@@ -309,6 +370,7 @@ export function createGlideContext(process: Process): GlideContext {
             drawCalls: 0,
             presents: 0,
             lfbLocks: 0,
+            lfbReadLocks: 0,
             lfbUnlocks: 0,
             lfbReads: 0,
             lfbWrites: 0,
@@ -347,6 +409,7 @@ export function applySstBoardDefaults(context: GlideContext): void {
     context.runtime.fogMode = 0;
     context.runtime.constantColorValue = 0xffffffff;
     context.runtime.gammaValue = 1.3;
+    context.runtime.stwHint = 0;
     context.ffpState.setBlend(false);
     context.ffpState.setFog(false);
 }

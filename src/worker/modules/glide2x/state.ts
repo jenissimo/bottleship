@@ -2,7 +2,7 @@ import { Mem } from "../../core/memory/mem-accessor";
 import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../../core/logger";
 import { GlideContext } from "./context";
-import { GR_CMP_ALWAYS, GR_DEPTHBUFFER_DISABLE } from "./constants";
+import { GR_CMP_ALWAYS, GR_DEPTHBUFFER_DISABLE, GR_HINT_STWHINT } from "./constants";
 
 function shouldLogStateEntry(context: GlideContext): boolean {
     const fid = context.frameSnapshot.frameId;
@@ -562,6 +562,9 @@ export function createStateExports(context: GlideContext): Record<string, ThunkI
         "_grHints@8": (_ctx, _mem, args) => {
             context.apiState.lastHintType = args[0] | 0;
             context.apiState.lastHintMask = args[1] >>> 0;
+            if ((args[0] | 0) === GR_HINT_STWHINT) {
+                context.runtime.stwHint = args[1] >>> 0;
+            }
             context.apiState.glideStateVersion = (context.apiState.glideStateVersion + 1) >>> 0;
             return 0;
         },

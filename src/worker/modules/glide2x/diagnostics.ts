@@ -10,6 +10,7 @@ export type GlideEventType =
     | "swap"
     | "texdownload"
     | "texsource"
+    | "texevict"
     | "lfb_lock"
     | "lfb_unlock"
     | "lfb_read"
@@ -87,9 +88,10 @@ export function buildGlideDebugInfo(
     const textures = context.tmus.flatMap((tmu, idx) =>
         Array.from(tmu.texturesByAddress.values())
             .filter(tex => !onlyActive || tex.lastUsedFrame + 1 >= context.frameSnapshot.frameId)
-            .map(tex => ({
+            .map(({ sourceBytes, ...tex }) => ({
                 ...tex,
                 tmu: idx,
+                sourceBytes: sourceBytes ? sourceBytes.length : 0,
             })),
     );
 
@@ -132,6 +134,21 @@ export function buildGlideDebugInfo(
         },
         textures,
         lfbSurfaces,
+        runtime: {
+            clipWindow: { ...context.runtime.clipWindow },
+            viewport: { ...context.runtime.viewport },
+            cullMode: context.runtime.cullMode,
+            fogMode: context.runtime.fogMode,
+            stwHint: context.runtime.stwHint,
+            tmu0: {
+                minFilter: context.tmus[0]?.minFilter ?? -1,
+                magFilter: context.tmus[0]?.magFilter ?? -1,
+                mipMapMode: context.tmus[0]?.mipMapMode ?? -1,
+                lodBias: context.tmus[0]?.lodBias ?? 0,
+                clampS: context.tmus[0]?.clampS ?? -1,
+                clampT: context.tmus[0]?.clampT ?? -1,
+            },
+        },
         ringEvents,
         frameSnapshot: cloneFrameSnapshot(context.frameSnapshot),
         pipelineCache: pipelineCache ?? undefined,

@@ -81,6 +81,9 @@ export class GlidePipelineFactory {
     constructor(
         private readonly device: GPUDevice,
         private readonly colorFormat: GPUTextureFormat,
+        // Explicit layout so group 0 binding 0 can carry a DYNAMIC offset: every draw
+        // needs its own uniform slice, and "auto" layouts cannot express that.
+        private readonly pipelineLayout: GPUPipelineLayout,
     ) {}
 
     getOrCreate(config: GlidePipelineConfig): GPURenderPipeline {
@@ -97,7 +100,7 @@ export class GlidePipelineFactory {
         });
 
         const pipeline = this.device.createRenderPipeline({
-            layout: "auto",
+            layout: this.pipelineLayout,
             vertex: {
                 module: shader,
                 entryPoint: "vs_main",

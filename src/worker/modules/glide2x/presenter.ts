@@ -24,62 +24,52 @@ import {
 } from "./constants";
 import { GlideContext, GlideLfbSurfaceState } from "./context";
 import { getOverlayCompositePlan } from "../user32/dialog-overlay";
+import { captureGlideFrame } from "./frame-capture";
 
-function packRgb565ToRgba(raw: number): [number, number, number, number] {
-    const r = ((raw >>> 11) & 0x1f) * 255 / 31;
-    const g = ((raw >>> 5) & 0x3f) * 255 / 63;
-    const b = (raw & 0x1f) * 255 / 31;
-    return [r | 0, g | 0, b | 0, 255];
-}
-
-function packRgb555ToRgba(raw: number): [number, number, number, number] {
-    const r = ((raw >>> 10) & 0x1f) * 255 / 31;
-    const g = ((raw >>> 5) & 0x1f) * 255 / 31;
-    const b = (raw & 0x1f) * 255 / 31;
-    return [r | 0, g | 0, b | 0, 255];
-}
-
-function packArgb1555ToRgba(raw: number): [number, number, number, number] {
-    const r = ((raw >>> 10) & 0x1f) * 255 / 31;
-    const g = ((raw >>> 5) & 0x1f) * 255 / 31;
-    const b = (raw & 0x1f) * 255 / 31;
-    const a = (raw & 0x8000) ? 255 : 0;
-    return [r | 0, g | 0, b | 0, a];
-}
-
-function decodeLfb8888Pixel(raw32: number, colorFormat: number): [number, number, number, number] {
+/**
+ * LFB -> RGBA8, written straight into a caller-owned buffer.
+ *
+ * This runs over every pixel of every presented frame. The obvious shape — a
+ * helper per format returning [r,g,b,a] — allocates one array PER PIXEL, which
+ * at 640x480 is 307k short-lived arrays a frame; the cost lands in GC, far from
+ * the present that caused it. Decode inline, write four bytes, allocate nothing.
+ */
+function decodeLfb8888Pixel(raw32: number, colorFormat: number, out: Uint8Array, o: number): void {
     switch (colorFormat | 0) {
         case GR_COLORFORMAT_ABGR:
-            return [
-                raw32 & 0xff,
-                (raw32 >>> 8) & 0xff,
-                (raw32 >>> 16) & 0xff,
-                (raw32 >>> 24) & 0xff,
-            ];
+            out[o] = raw32 & 0xff;
+            out[o + 1] = (raw32 >>> 8) & 0xff;
+            out[o + 2] = (raw32 >>> 16) & 0xff;
+            out[o + 3] = (raw32 >>> 24) & 0xff;
+            return;
         case GR_COLORFORMAT_RGBA:
-            return [
-                (raw32 >>> 24) & 0xff,
-                (raw32 >>> 16) & 0xff,
-                (raw32 >>> 8) & 0xff,
-                raw32 & 0xff,
-            ];
+            out[o] = (raw32 >>> 24) & 0xff;
+            out[o + 1] = (raw32 >>> 16) & 0xff;
+            out[o + 2] = (raw32 >>> 8) & 0xff;
+            out[o + 3] = raw32 & 0xff;
+            return;
         case GR_COLORFORMAT_BGRA:
-            return [
-                (raw32 >>> 8) & 0xff,
-                (raw32 >>> 16) & 0xff,
-                (raw32 >>> 24) & 0xff,
-                raw32 & 0xff,
-            ];
+            out[o] = (raw32 >>> 8) & 0xff;
+            out[o + 1] = (raw32 >>> 16) & 0xff;
+            out[o + 2] = (raw32 >>> 24) & 0xff;
+            out[o + 3] = raw32 & 0xff;
+            return;
         case GR_COLORFORMAT_ARGB:
         default:
-            return [
-                (raw32 >>> 16) & 0xff,
-                (raw32 >>> 8) & 0xff,
-                raw32 & 0xff,
-                (raw32 >>> 24) & 0xff,
-            ];
+            out[o] = (raw32 >>> 16) & 0xff;
+            out[o + 1] = (raw32 >>> 8) & 0xff;
+            out[o + 2] = raw32 & 0xff;
+            out[o + 3] = (raw32 >>> 24) & 0xff;
+            return;
     }
 }
+
+// 5- and 6-bit channel expansion, exact (v * 255 / 31 and v * 255 / 63) via a table
+// so the per-pixel loop does one indexed load instead of a multiply and a divide.
+const EXPAND_5 = new Uint8Array(32);
+for (let i = 0; i < 32; i++) EXPAND_5[i] = Math.round(i * 255 / 31);
+const EXPAND_6 = new Uint8Array(64);
+for (let i = 0; i < 64; i++) EXPAND_6[i] = Math.round(i * 255 / 63);
 
 type SurfaceRgbaResult = {
     pixels: Uint8Array;
@@ -90,8 +80,12 @@ function surfaceToRgba(context: GlideContext): SurfaceRgbaResult | null {
     const activeSurface = context.lfbSurfaces.get(context.renderBuffer);
     const backSurface = context.lfbSurfaces.get(GR_BUFFER_BACKBUFFER);
     const frontSurface = context.lfbSurfaces.get(GR_BUFFER_FRONTBUFFER);
-    const anyDirtySurface = Array.from(context.lfbSurfaces.values()).find((s) => s.dirty) ?? null;
-    const anySurface = anyDirtySurface ?? (context.lfbSurfaces.values().next().value ?? null);
+    let anyDirtySurface: GlideLfbSurfaceState | null = null;
+    let anySurface: GlideLfbSurfaceState | null = null;
+    for (const s of context.lfbSurfaces.values()) {
+        anySurface ??= s;
+        if (s.dirty && !anyDirtySurface) anyDirtySurface = s;
+    }
     const surface =
         (activeSurface?.dirty ? activeSurface : null) ??
         (backSurface?.dirty ? backSurface : null) ??
@@ -107,77 +101,110 @@ function surfaceToRgba(context: GlideContext): SurfaceRgbaResult | null {
     if (!src) return null;
     const lfbColorFormat = context.lfbWriteColorFormat | 0;
 
-    if (surface.bytesPerPixel === 4 || bytesPerPixelForLfbWriteMode(surface.writeMode) === 4) {
-        const rgba = new Uint8Array(context.width * context.height * 4);
-        for (let y = 0; y < context.height; y++) {
-            const rowBase = y * surface.pitch;
-            for (let x = 0; x < context.width; x++) {
-                const srcOffset = rowBase + x * 4;
+    const width = context.width;
+    const height = context.height;
+    const needed = width * height * 4;
+    let rgba = context.lfbRgbaScratch;
+    const cacheValid = !!rgba && rgba.length === needed && context.lfbRgbaSource === surface.dataPtr;
+    // `dirty` is cleared at every present, so a surface the guest did not write
+    // since then holds byte-identical pixels — the conversion would reproduce what
+    // the scratch already has. Exact, not a heuristic.
+    if (cacheValid && !surface.dirty) {
+        return { pixels: rgba!, surface };
+    }
+    if (!rgba || rgba.length !== needed) {
+        rgba = new Uint8Array(needed);
+        context.lfbRgbaScratch = rgba;
+    }
+    context.lfbRgbaSource = surface.dataPtr;
+
+    const fourByte = surface.bytesPerPixel === 4 || bytesPerPixelForLfbWriteMode(surface.writeMode) === 4;
+    const mode = surface.writeMode | 0;
+
+    for (let y = 0; y < height; y++) {
+        const rowBase = y * surface.pitch;
+        let dst = y * width * 4;
+        if (fourByte) {
+            for (let x = 0; x < width; x++, dst += 4) {
+                const s = rowBase + x * 4;
                 const raw32 = (
-                    (src[srcOffset] ?? 0) |
-                    ((src[srcOffset + 1] ?? 0) << 8) |
-                    ((src[srcOffset + 2] ?? 0) << 16) |
-                    ((src[srcOffset + 3] ?? 0) << 24)
+                    (src[s] ?? 0) | ((src[s + 1] ?? 0) << 8) |
+                    ((src[s + 2] ?? 0) << 16) | ((src[s + 3] ?? 0) << 24)
                 ) >>> 0;
-                let c: [number, number, number, number];
-                switch (surface.writeMode | 0) {
-                    case GR_LFBWRITEMODE_8888:
-                        c = decodeLfb8888Pixel(raw32, lfbColorFormat);
+                switch (mode) {
+                    case GR_LFBWRITEMODE_565_DEPTH: {
+                        const raw = raw32 & 0xffff;
+                        rgba[dst] = EXPAND_5[(raw >>> 11) & 0x1f]!;
+                        rgba[dst + 1] = EXPAND_6[(raw >>> 5) & 0x3f]!;
+                        rgba[dst + 2] = EXPAND_5[raw & 0x1f]!;
+                        rgba[dst + 3] = 255;
                         break;
+                    }
+                    case GR_LFBWRITEMODE_555_DEPTH: {
+                        const raw = raw32 & 0xffff;
+                        rgba[dst] = EXPAND_5[(raw >>> 10) & 0x1f]!;
+                        rgba[dst + 1] = EXPAND_5[(raw >>> 5) & 0x1f]!;
+                        rgba[dst + 2] = EXPAND_5[raw & 0x1f]!;
+                        rgba[dst + 3] = 255;
+                        break;
+                    }
+                    case GR_LFBWRITEMODE_1555_DEPTH: {
+                        const raw = raw32 & 0xffff;
+                        rgba[dst] = EXPAND_5[(raw >>> 10) & 0x1f]!;
+                        rgba[dst + 1] = EXPAND_5[(raw >>> 5) & 0x1f]!;
+                        rgba[dst + 2] = EXPAND_5[raw & 0x1f]!;
+                        rgba[dst + 3] = (raw & 0x8000) ? 255 : 0;
+                        break;
+                    }
                     case GR_LFBWRITEMODE_888:
-                        c = decodeLfb8888Pixel(raw32, lfbColorFormat);
-                        c[3] = 255;
-                        break;
-                    case GR_LFBWRITEMODE_565_DEPTH:
-                        c = packRgb565ToRgba(raw32 & 0xffff);
-                        break;
-                    case GR_LFBWRITEMODE_555_DEPTH:
-                        c = packRgb555ToRgba(raw32 & 0xffff);
-                        break;
-                    case GR_LFBWRITEMODE_1555_DEPTH:
-                        c = packArgb1555ToRgba(raw32 & 0xffff);
+                        decodeLfb8888Pixel(raw32, lfbColorFormat, rgba, dst);
+                        rgba[dst + 3] = 255;
                         break;
                     default:
-                        c = decodeLfb8888Pixel(raw32, lfbColorFormat);
+                        decodeLfb8888Pixel(raw32, lfbColorFormat, rgba, dst);
                         break;
                 }
-                const dstOffset = (y * context.width + x) * 4;
-                rgba[dstOffset + 0] = c[0];
-                rgba[dstOffset + 1] = c[1];
-                rgba[dstOffset + 2] = c[2];
-                rgba[dstOffset + 3] = c[3];
             }
+            continue;
         }
-        return { pixels: rgba, surface };
-    }
 
-    const rgba = new Uint8Array(context.width * context.height * 4);
-    for (let y = 0; y < context.height; y++) {
-        const rowBase = y * surface.pitch;
-        for (let x = 0; x < context.width; x++) {
-            const srcOffset = rowBase + x * 2;
-            const raw = (src[srcOffset] ?? 0) | ((src[srcOffset + 1] ?? 0) << 8);
-            let c: [number, number, number, number];
-            if (surface.writeMode === GR_LFBWRITEMODE_565) {
-                c = packRgb565ToRgba(raw);
-            } else if (surface.writeMode === GR_LFBWRITEMODE_555) {
-                c = packRgb555ToRgba(raw);
-            } else if (surface.writeMode === GR_LFBWRITEMODE_1555) {
-                c = packArgb1555ToRgba(raw);
-            } else if (surface.writeMode === GR_LFBWRITEMODE_ZA16) {
-                c = [0, 0, 0, 255];
-            } else {
-                c = packRgb565ToRgba(raw);
+        for (let x = 0; x < width; x++, dst += 4) {
+            const s = rowBase + x * 2;
+            const raw = (src[s] ?? 0) | ((src[s + 1] ?? 0) << 8);
+            switch (mode) {
+                case GR_LFBWRITEMODE_555:
+                    rgba[dst] = EXPAND_5[(raw >>> 10) & 0x1f]!;
+                    rgba[dst + 1] = EXPAND_5[(raw >>> 5) & 0x1f]!;
+                    rgba[dst + 2] = EXPAND_5[raw & 0x1f]!;
+                    rgba[dst + 3] = 255;
+                    break;
+                case GR_LFBWRITEMODE_1555:
+                    rgba[dst] = EXPAND_5[(raw >>> 10) & 0x1f]!;
+                    rgba[dst + 1] = EXPAND_5[(raw >>> 5) & 0x1f]!;
+                    rgba[dst + 2] = EXPAND_5[raw & 0x1f]!;
+                    rgba[dst + 3] = (raw & 0x8000) ? 255 : 0;
+                    break;
+                case GR_LFBWRITEMODE_ZA16:
+                    rgba[dst] = 0; rgba[dst + 1] = 0; rgba[dst + 2] = 0; rgba[dst + 3] = 255;
+                    break;
+                default: // 565 — the Voodoo's natural 16-bit colour buffer
+                    rgba[dst] = EXPAND_5[(raw >>> 11) & 0x1f]!;
+                    rgba[dst + 1] = EXPAND_6[(raw >>> 5) & 0x3f]!;
+                    rgba[dst + 2] = EXPAND_5[raw & 0x1f]!;
+                    rgba[dst + 3] = 255;
+                    break;
             }
-            const dstOffset = (y * context.width + x) * 4;
-            rgba[dstOffset + 0] = c[0];
-            rgba[dstOffset + 1] = c[1];
-            rgba[dstOffset + 2] = c[2];
-            rgba[dstOffset + 3] = c[3];
         }
     }
 
     return { pixels: rgba, surface };
+}
+
+/** The LFB surface the next present would upload, as RGBA — diagnostics only. */
+export function debugLfbRgba(context: GlideContext): { width: number; height: number; rgba: Uint8Array } | null {
+    const r = surfaceToRgba(context);
+    if (!r) return null;
+    return { width: context.width, height: context.height, rgba: r.pixels };
 }
 
 export class GlidePresenter implements RenderActive {
@@ -225,26 +252,10 @@ export class GlidePresenter implements RenderActive {
         const lfb = surfaceToRgba(this.context);
         const lfbPixels = lfb?.pixels;
         const vertexCount = this.context.stream.getVertexCount();
-        const commandCount = this.context.stream.commandTypes.length;
-        const hasOnlyClearCommands =
-            commandCount > 0 && this.context.stream.commandTypes.every((t) => t === 1 /* Legacy3DCommandType.Clear */);
+        const commandCount = this.context.stream.commandCount;
+        const hasOnlyClearCommands = this.context.stream.onlyClears();
 
-        if (lfb && (this.context.frameSnapshot.frameId < 240 || ((this.context.frameSnapshot.frameId & 63) === 0))) {
-            const samplePixels = Math.min(1024, Math.floor(lfb.pixels.length / 4));
-            let nonBlack = 0;
-            for (let i = 0; i < samplePixels; i++) {
-                const p = i * 4;
-                if ((lfb.pixels[p] | lfb.pixels[p + 1] | lfb.pixels[p + 2]) !== 0) nonBlack++;
-            }
-            Logger.log(
-                LogCategory.SYSTEM,
-                `[Glide] present frame=${this.context.frameSnapshot.frameId} swap=${swapInterval} ` +
-                `renderBuf=${this.context.renderBuffer} lfbBuf=${lfb.surface.buffer} ` +
-                `mode=${lfb.surface.writeMode} bpp=${lfb.surface.bytesPerPixel} ` +
-                `dirty=${lfb.surface.dirty ? 1 : 0} sampleNonBlack=${nonBlack}/${samplePixels} ` +
-                `cmds=${commandCount} verts=${vertexCount}`
-            );
-        } else if (!lfb && (this.context.frameSnapshot.frameId < 60 || ((this.context.frameSnapshot.frameId & 31) === 0))) {
+        if (!lfb && (this.context.frameSnapshot.frameId < 60 || ((this.context.frameSnapshot.frameId & 31) === 0))) {
             Logger.warn(
                 LogCategory.SYSTEM,
                 `[Glide] present frame=${this.context.frameSnapshot.frameId}: no LFB surface selected ` +
@@ -264,6 +275,8 @@ export class GlidePresenter implements RenderActive {
             }
 
             this.context.stream.reset();
+            this.context.lfbWriteMark = -1;
+            this.context.lfbReadThisFrame = false;
             for (const surface of this.context.lfbSurfaces.values()) {
                 surface.dirty = false;
             }
@@ -299,7 +312,7 @@ export class GlidePresenter implements RenderActive {
             else if (plan.mode === 'none') gdiOverlayRects = [];
         }
 
-        this.context.executor.executeFrame({
+        const frameInput = {
             stream: this.context.stream,
             width: this.context.width,
             height: this.context.height,
@@ -313,10 +326,19 @@ export class GlidePresenter implements RenderActive {
             gammaCorrection: this.context.runtime.gammaValue,
             lfbPixels,
             lfbPitch: this.context.width * 4,
+            lfbVersion: this.context.lfbContentVersion,
+            // A write that landed after the last draw is a post-process over the finished
+            // frame, not the background it started from.
+            lfbAfterDraws:
+                this.context.lfbReadThisFrame &&
+                this.context.lfbWriteMark >= 0 &&
+                this.context.lfbWriteMark >= this.context.stream.commandCount,
             videoOverlayCanvas,
             gdiOverlayCanvas,
             gdiOverlayRects,
-        });
+        };
+        captureGlideFrame(this.context.frameSnapshot.frameId, frameInput);
+        this.context.executor.executeFrame(frameInput);
 
         if (videoOverlayCanvas) {
             videoOverlayService.consumeDirty();
@@ -331,6 +353,8 @@ export class GlidePresenter implements RenderActive {
         this.context.frameSnapshot.frameCounters.cacheMisses = pipelineStats.misses;
 
         this.context.stream.reset();
+        this.context.lfbWriteMark = -1;
+        this.context.lfbReadThisFrame = false;
         for (const surface of this.context.lfbSurfaces.values()) {
             surface.dirty = false;
         }

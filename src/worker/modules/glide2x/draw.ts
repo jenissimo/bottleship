@@ -1,8 +1,12 @@
 import { Mem } from "../../core/memory/mem-accessor";
 import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
-import { Logger, LogCategory } from "../../core/logger";
 import { GlideContext } from "./context";
-import { GR_CMP_ALWAYS, GR_VERTEX_SOW_OFFSET, GR_VERTEX_TOW_OFFSET } from "./constants";
+import {
+    GR_CMP_ALWAYS,
+    GR_VERTEX_SIZE,
+    GR_STWHINT_W_DIFF_TMU0,
+    GR_VERTEX_X_OFFSET,
+} from "./constants";
 import {
     blendIsOpaque,
     combineReferencesTexture,
@@ -10,16 +14,13 @@ import {
     packCombine,
 } from "../../backends/webgpu/glide/glide-combine";
 
-let vertexSampleBudget = 30;
-// Second sampling wave: capture menu draws (post-intro, small textured quads)
-let menuSampleBudget = 40;
-let menuSamplesDoneForFrame = -1;
 
 type DecodedVertex = {
     x: number;
     y: number;
     ooz: number;
     oow: number;
+    tmu0oow: number;
     r: number;
     g: number;
     b: number;
@@ -68,149 +69,50 @@ function drawUsesTexture(context: GlideContext): boolean {
     );
 }
 
-function readF32(ptr: number, offset: number, fallback: number): number {
-    const v = Mem.readFloat32((ptr + offset) >>> 0);
-    return v === null ? fallback : v;
-}
+// One bulk read of x..oow plus tmuvtx[0] — 12 consecutive floats from GR_VERTEX_X_OFFSET,
+// i.e. through tmuvtx[0].oow at 0x2c, the last field a draw reads. Reading them field by
+// field costs a DataView per field, which at three vertices per triangle is the whole
+// per-triangle budget. Do NOT round this up: readFloat32Into validates the WHOLE extent
+// and refuses the read if any of it is unmapped, so an over-read turns the last vertex of
+// an array that ends at the requirement boundary into a white degenerate triangle.
+const GR_VERTEX_FLOATS = 12;
+const vertexFloats = new Float32Array(GR_VERTEX_FLOATS);
+const F_X = 0, F_Y = 1, F_Z = 2, F_R = 3, F_G = 4, F_B = 5, F_OOZ = 6, F_A = 7, F_OOW = 8;
+const F_SOW = 9, F_TOW = 10, F_TMU0_OOW = 11;
 
-function scoreColorValue(v: number): number {
-    if (!Number.isFinite(v)) return 1000;
-    if (v < -32 || v > 1024) return 200;
-    return 0;
-}
-
-function scoreDepthValue(v: number): number {
-    if (!Number.isFinite(v)) return 1000;
-    if (Math.abs(v) > 1e7) return 200;
-    return 0;
-}
+// The single decoded vertex, reused per call: the only consumer is pushVertexFromPtr,
+// which reads it and does not retain it. Three per triangle otherwise means 3600 short-
+// lived objects a frame in the hottest function of the module.
+const decodedVertex: DecodedVertex = {
+    x: 0, y: 0, ooz: 0, oow: 0, tmu0oow: 0, r: 0, g: 0, b: 0, a: 0, sow: 0, tow: 0,
+};
 
 function decodeVertexForDraw(ptr: number): DecodedVertex {
-    const x = readF32(ptr, 0x00, 0);
-    const y = readF32(ptr, 0x04, 0);
-    const a = readF32(ptr, 0x1c, 255);
-    const sow = readF32(ptr, GR_VERTEX_SOW_OFFSET, 0);
-    const tow = readF32(ptr, GR_VERTEX_TOW_OFFSET, 0);
-
-    // Legacy Glide2 layout:
-    // x y z r g b ooz a oow ...
-    const legacy = {
-        r: readF32(ptr, 0x0c, 255),
-        g: readF32(ptr, 0x10, 255),
-        b: readF32(ptr, 0x14, 255),
-        ooz: readF32(ptr, 0x18, 0),
-        oow: readF32(ptr, 0x20, 1),
-    };
-
-    // GLIDE3-style layout used by some Glide2 builds:
-    // x y ooz oow r g b a z ...
-    const glide3 = {
-        ooz: readF32(ptr, 0x08, 0),
-        oow: readF32(ptr, 0x0c, 1),
-        r: readF32(ptr, 0x10, 255),
-        g: readF32(ptr, 0x14, 255),
-        b: readF32(ptr, 0x18, 255),
-    };
-
-    const legacyScore =
-        scoreColorValue(legacy.r) +
-        scoreColorValue(legacy.g) +
-        scoreColorValue(legacy.b) +
-        scoreDepthValue(legacy.ooz) +
-        scoreDepthValue(legacy.oow);
-
-    const glide3Score =
-        scoreColorValue(glide3.r) +
-        scoreColorValue(glide3.g) +
-        scoreColorValue(glide3.b) +
-        scoreDepthValue(glide3.ooz) +
-        scoreDepthValue(glide3.oow);
-
-    const pickLegacy = legacyScore <= glide3Score;
-    return {
-        x,
-        y,
-        ooz: pickLegacy ? legacy.ooz : glide3.ooz,
-        oow: pickLegacy ? legacy.oow : glide3.oow,
-        r: pickLegacy ? legacy.r : glide3.r,
-        g: pickLegacy ? legacy.g : glide3.g,
-        b: pickLegacy ? legacy.b : glide3.b,
-        a,
-        sow,
-        tow,
-    };
+    // glide2x has exactly ONE GrVertex layout (glide.h: the GLIDE3 one is behind
+    // #ifdef GLIDE3). Scoring the fields to pick a layout per vertex is not a
+    // fallback, it is a coin flip that lands differently inside one frame — the
+    // symptom is a handful of triangles a frame with garbage s/t and depth.
+    const f = vertexFloats;
+    if (!Mem.readFloat32Into(ptr, GR_VERTEX_FLOATS, f)) {
+        f.fill(0);
+        f[F_OOW] = 1;
+        f[F_R] = f[F_G] = f[F_B] = f[F_A] = 255;
+    }
+    const v = decodedVertex;
+    v.x = f[F_X]!; v.y = f[F_Y]!; v.ooz = f[F_OOZ]!; v.oow = f[F_OOW]!;
+    v.tmu0oow = f[F_TMU0_OOW]!;
+    v.r = f[F_R]!; v.g = f[F_G]!; v.b = f[F_B]!; v.a = f[F_A]!;
+    v.sow = f[F_SOW]!; v.tow = f[F_TOW]!;
+    return v;
 }
 
-type IndexedVertexListMode =
-    | { kind: "contiguous"; stride: number }
-    | { kind: "pointer-table" };
-
-function scoreVertexPtr(ptr: number): number {
-    const x = Mem.readFloat32(ptr + 0x00);
-    const y = Mem.readFloat32(ptr + 0x04);
-    const sow = Mem.readFloat32(ptr + GR_VERTEX_SOW_OFFSET);
-    const tow = Mem.readFloat32(ptr + GR_VERTEX_TOW_OFFSET);
-    if (x === null || y === null || !Number.isFinite(x) || !Number.isFinite(y)) {
-        return 1_000_000;
-    }
-
-    let penalty = 0;
-    if (Math.abs(x) > 65536) penalty += 100;
-    if (Math.abs(y) > 65536) penalty += 100;
-    if (sow === null || !Number.isFinite(sow)) penalty += 20;
-    if (tow === null || !Number.isFinite(tow)) penalty += 20;
-    return penalty;
-}
-
-function resolveIndexedVertexPtr(basePtr: number, index: number, mode: IndexedVertexListMode): number {
-    if (mode.kind === "pointer-table") {
-        return Mem.readUint32((basePtr + index * 4) >>> 0) ?? 0;
-    }
-    return (basePtr + index * mode.stride) >>> 0;
-}
-
-function scoreIndexedMode(basePtr: number, indices: readonly number[], mode: IndexedVertexListMode): number {
-    let score = 0;
-    for (const index of indices) {
-        const ptr = resolveIndexedVertexPtr(basePtr, index, mode);
-        if (!ptr) {
-            score += 10_000;
-            continue;
-        }
-        score += scoreVertexPtr(ptr);
-    }
-    return score;
-}
-
-function chooseIndexedVertexListMode(basePtr: number, nVerts: number, indexList: readonly number[]): IndexedVertexListMode {
-    const candidateIndices: number[] = [];
-    for (let i = 0; i < indexList.length && candidateIndices.length < 8; i++) {
-        const idx = indexList[i] ?? 0;
-        if (idx < 0 || idx >= nVerts) continue;
-        if (!candidateIndices.includes(idx)) candidateIndices.push(idx);
-    }
-    if (candidateIndices.length === 0) {
-        const max = Math.min(nVerts, 8);
-        for (let i = 0; i < max; i++) candidateIndices.push(i);
-    }
-
-    // Glide2 titles in the wild use both layouts: with 1 TMU (0x30) and with 2 TMUs (0x3c).
-    const modes: IndexedVertexListMode[] = [
-        { kind: "contiguous", stride: 0x30 },
-        { kind: "contiguous", stride: 0x3c },
-        { kind: "pointer-table" },
-    ];
-
-    let best = modes[0];
-    let bestScore = Number.POSITIVE_INFINITY;
-    for (const mode of modes) {
-        const score = scoreIndexedMode(basePtr, candidateIndices, mode);
-        if (score < bestScore) {
-            bestScore = score;
-            best = mode;
-        }
-    }
-    return best;
+/**
+ * grDrawPolygon/…VertexList take a CONTIGUOUS GrVertex[] (glide.h), never a table
+ * of pointers. The only compile-time variable is GLIDE_NUM_TMU, which the SDK
+ * defaults to 2 (glidesys.h) — that is the stride, not something to guess per call.
+ */
+function vertexPtrAt(basePtr: number, index: number): number {
+    return (basePtr + index * GR_VERTEX_SIZE) >>> 0;
 }
 
 function pushVertexFromPtr(context: GlideContext, ptr: number): number {
@@ -218,45 +120,19 @@ function pushVertexFromPtr(context: GlideContext, ptr: number): number {
     const x = v.x;
     const y = v.y;
     const z = clamp01(v.ooz / 65535.0);
-    const tmu0oow = readF32(ptr >>> 0, 0x2c, 0);
-    const qRaw = tmu0oow || v.oow;
+    // tmuvtx[0].oow is only supplied when the app said so via
+    // grHints(GR_HINT_STWHINT, GR_STWHINT_W_DIFF_TMU0); otherwise the field holds
+    // whatever the app's vertex struct was last left with, and the vertex's own
+    // oow is the perspective divisor.
+    const perTmuW = (context.runtime.stwHint & GR_STWHINT_W_DIFF_TMU0) !== 0;
+    const qRaw = perTmuW ? v.tmu0oow : v.oow;
     const q = Number.isFinite(qRaw) && Math.abs(qRaw) > 1e-8 ? qRaw : 1.0;
     const u = v.sow;
     const vTex = v.tow;
     // Raw iterated color — the WGSL combine unit selects which inputs to use.
     const color = packRgba(v.r, v.g, v.b, v.a);
-    const fid = context.frameSnapshot.frameId;
-    if (vertexSampleBudget > 0 && fid <= 10) {
-        vertexSampleBudget--;
-        Logger.log(
-            LogCategory.SYSTEM,
-            `[Glide] pushVertex ptr=0x${ptr.toString(16)} xy=(${x.toFixed(3)},${y.toFixed(3)}) ` +
-            `z=${z.toFixed(4)} sow=${v.sow.toFixed(2)} tow=${v.tow.toFixed(2)} ` +
-            `oow=${v.oow.toFixed(4)} tmu0oow=${tmu0oow.toFixed(4)} q=${q.toFixed(4)} ` +
-            `rgb=(${v.r.toFixed(1)},${v.g.toFixed(1)},${v.b.toFixed(1)}) a=${v.a.toFixed(1)} ` +
-            `packed=0x${color.toString(16)} useTex=${drawUsesTexture(context)}`,
-        );
-    }
-    // Menu-window sample: once post-intro (frameId > 200), capture up to menuSampleBudget
-    // vertices spread across a few frames so we can see UV/XY for font glyphs.
-    if (menuSampleBudget > 0 && fid > 200 && fid % 50 === 0) {
-        if (menuSamplesDoneForFrame !== fid) {
-            menuSamplesDoneForFrame = fid;
-        }
-        menuSampleBudget--;
-        Logger.log(
-            LogCategory.SYSTEM,
-            `[Glide] menuVtx fid=${fid} ptr=0x${ptr.toString(16)} xy=(${x.toFixed(3)},${y.toFixed(3)}) ` +
-            `sow=${v.sow.toFixed(2)} tow=${v.tow.toFixed(2)} oow=${v.oow.toFixed(4)} ` +
-            `tmu0oow=${tmu0oow.toFixed(4)} q=${q.toFixed(4)} ` +
-            `rgb=(${v.r.toFixed(1)},${v.g.toFixed(1)},${v.b.toFixed(1)}) a=${v.a.toFixed(1)} ` +
-            `tex=${drawUsesTexture(context)}`,
-        );
-    }
     return context.stream.pushVertex(x, y, z, u, vTex, q, color);
 }
-
-let drawStateSampleBudget = 10;
 
 function pushDraw(
     context: GlideContext,
@@ -301,29 +177,13 @@ function pushDraw(
         alphaTestFunc,
         fogMode: rt.fogMode | 0,
         fogColor: rt.fogColor >>> 0,
+        // GR_MIPMAP_DISABLE (0) means the TMU samples the largest LOD only.
+        mipMapEnabled: ((tmu0?.mipMapMode | 0) !== 0),
+        clipX0: rt.clipWindow.minX | 0,
+        clipY0: rt.clipWindow.minY | 0,
+        clipX1: rt.clipWindow.maxX | 0,
+        clipY1: rt.clipWindow.maxY | 0,
     };
-    const fidForLog = context.frameSnapshot.frameId;
-    const shouldLogDraw = (drawStateSampleBudget > 0 && fidForLog <= 8)
-        || (fidForLog > 100 && fidForLog <= 110 && drawStateSampleBudget > -20);
-    if (shouldLogDraw) {
-        drawStateSampleBudget--;
-        const cc = context.runtime.colorCombine;
-        const ac = context.runtime.alphaCombine;
-        Logger.log(
-            LogCategory.SYSTEM,
-            `[Glide] pushDraw fid=${fidForLog} ${topology} verts=${vertexCount} useTex=${draw.useTexture} ` +
-            `texHandle=${draw.textureHandle} blend=${draw.blendEnabled} depth=${draw.depthTestEnabled} ` +
-            `alphaTest=${draw.alphaTestEnabled}(fn=${draw.alphaTestFunc}) alphaRef=${draw.alphaRef} ` +
-            `clampST=${draw.clampS ? 1 : 0}${draw.clampT ? 1 : 0} ` +
-            `filterLinear=${draw.filterLinear} ` +
-            `constColor=0x${draw.constantColor.toString(16)} ` +
-            `blend=0x${draw.blend.toString(16)}(en=${draw.blendEnabled ? 1 : 0}) ` +
-            `fog(mode=${draw.fogMode}) ` +
-            `cc(fn=${cc.function},fac=${cc.factor},loc=${cc.local},oth=${cc.other},inv=${cc.invert}) ` +
-            `ac(fn=${ac.function},fac=${ac.factor},loc=${ac.local},oth=${ac.other},inv=${ac.invert}) ` +
-            `chroma(mode=${context.runtime.chromaKeyMode},val=0x${context.runtime.chromaKeyValue.toString(16)})`,
-        );
-    }
     context.stream.pushDraw(draw);
     context.frameSnapshot.drawCalls++;
     context.frameSnapshot.frameCounters.vertexBytes += vertexCount * 28;
@@ -350,15 +210,14 @@ function drawIndexedPolygon(context: GlideContext, nVerts: number, indexListPtr:
         }
     }
 
-    const listMode = chooseIndexedVertexListMode(vertexListPtr, nVerts, indexList);
     const first = context.stream.getVertexCount();
     for (let i = 1; i < nVerts - 1; i++) {
         const i0 = indexList[0] ?? 0;
         const i1 = indexList[i] ?? i;
         const i2 = indexList[i + 1] ?? (i + 1);
-        pushVertexFromPtr(context, resolveIndexedVertexPtr(vertexListPtr, i0, listMode));
-        pushVertexFromPtr(context, resolveIndexedVertexPtr(vertexListPtr, i1, listMode));
-        pushVertexFromPtr(context, resolveIndexedVertexPtr(vertexListPtr, i2, listMode));
+        pushVertexFromPtr(context, vertexPtrAt(vertexListPtr, i0));
+        pushVertexFromPtr(context, vertexPtrAt(vertexListPtr, i1));
+        pushVertexFromPtr(context, vertexPtrAt(vertexListPtr, i2));
     }
 
     const vertexCount = (nVerts - 2) * 3;

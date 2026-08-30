@@ -8,10 +8,12 @@ import { cloneFrameSnapshot, buildGlideDebugInfo } from "./diagnostics";
 import { createHardwareExports } from "./hardware";
 import { createStateExports } from "./state";
 import { createTextureExports } from "./texture";
-import { createLfbExports, destroyLfbSurfaces, revokeAllLfbLeases } from "./lfb";
+import { createLfbExports, destroyLfbSurfaces, revokeAllLfbLeases, syncSurfaceFromRenderedFrame } from "./lfb";
 import { createDrawExports } from "./draw";
-import { GlidePresenter } from "./presenter";
+import { GlidePresenter, debugLfbRgba } from "./presenter";
+import { registerGlideWriteBufferFunctions } from "./fast-path";
 import { GlideLfbSurfaceState } from "./context";
+import { decodeTextureRecordToRgba } from "./texture";
 
 export class Glide2x implements IModule {
     name = "glide2x";
@@ -27,6 +29,9 @@ export class Glide2x implements IModule {
         Object.assign(this.exports, createTextureExports(this.context));
         Object.assign(this.exports, createLfbExports(this.context));
         Object.assign(this.exports, createDrawExports(this.context));
+
+        // Move the per-triangle state setters off the OUT trap (see fast-path.ts).
+        registerGlideWriteBufferFunctions(process.dispatcher, this.exports);
 
         // Device loss invalidates exactly what a backend swap does: the executor and every
         // uploaded TMU texture. The texture records keep the guest `dataPtr` they were
@@ -59,6 +64,7 @@ export class Glide2x implements IModule {
                 drawCalls: 0,
                 presents: 0,
                 lfbLocks: 0,
+                lfbReadLocks: 0,
                 lfbUnlocks: 0,
                 lfbReads: 0,
                 lfbWrites: 0,
@@ -93,11 +99,65 @@ export class Glide2x implements IModule {
                 },
                 textures: [],
                 lfbSurfaces: [],
+                runtime: {
+                    clipWindow: { minX: 0, minY: 0, maxX: 0, maxY: 0 },
+                    viewport: { x: 0, y: 0, width: 0, height: 0 },
+                    cullMode: 0,
+                    fogMode: 0,
+                    stwHint: 0,
+                    tmu0: { minFilter: -1, magFilter: -1, mipMapMode: -1, lodBias: 0, clampS: -1, clampT: -1 },
+                },
                 ringEvents: [],
                 frameSnapshot: this.getFrameSnapshot(),
             };
         }
         return buildGlideDebugInfo(this.context, scope, onlyActive);
+    }
+
+    /**
+     * The linear frame buffer as the presenter would upload it. `syncFromFrame` runs
+     * the exact path a guest READ lock takes, so the dump is the positive control for
+     * LFB read-back: it fails visibly (black) when the mirror is not reaching the LFB.
+     */
+    lfbRgbaForDebug(syncFromFrame = false): { width: number; height: number; rgba: Uint8Array } | null {
+        if (!this.context) return null;
+        if (syncFromFrame) {
+            const surface = this.context.lfbSurfaces.get(this.context.renderBuffer)
+                ?? this.context.lfbSurfaces.values().next().value;
+            if (surface) {
+                this.context.lfbSyncedFrame = -1;
+                syncSurfaceFromRenderedFrame(this.context, surface, false);
+            }
+        }
+        return debugLfbRgba(this.context);
+    }
+
+    /** The raw guest bytes the texture was decoded from, as captured at upload. */
+    textureSourceBytesForDebug(handle: number): Uint8Array | null {
+        if (!this.context) return null;
+        for (const tmu of this.context.tmus) {
+            for (const record of tmu.texturesByAddress.values()) {
+                if (record.handle === handle) return record.sourceBytes;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Re-decode one uploaded texture from the guest bytes it was decoded from,
+     * exactly the way the upload path decodes it — so a texture dump answers
+     * "what did the TMU actually see", not "what do we think we sent".
+     */
+    decodeTextureForDebug(handle: number): { width: number; height: number; rgba: Uint8Array } | null {
+        if (!this.context) return null;
+        for (const tmu of this.context.tmus) {
+            for (const record of tmu.texturesByAddress.values()) {
+                if (record.handle !== handle) continue;
+                const rgba = decodeTextureRecordToRgba(this.context, record);
+                return rgba ? { width: record.width, height: record.height, rgba } : null;
+            }
+        }
+        return null;
     }
 
     findLfbSurfaceByDataPtr(dataPtr: number): GlideLfbSurfaceState | null {
