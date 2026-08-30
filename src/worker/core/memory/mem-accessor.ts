@@ -207,11 +207,47 @@ export class Mem {
         return value & 0x8000 ? value - 0x10000 : value;
     }
 
+    /**
+     * Cached DataView over the CURRENT guest view.
+     *
+     * Every scalar accessor below builds a DataView per call, which is fine at one
+     * read but not at ten per vertex. Keyed on the VIEW, not its ArrayBuffer: the
+     * view carries the base this DataView is built at, so two sub-views over one
+     * buffer must not share an entry — a buffer-only key would silently displace
+     * every read by the difference. Growth replaces the view too, which is what
+     * makes holding this across turns legal where holding a Uint8Array is not.
+     */
+    private static cachedFloatView: DataView | null = null;
+    private static cachedFloatMem: Uint8Array | null = null;
+
+    private static floatView(mem: Uint8Array): DataView {
+        if (this.cachedFloatMem !== mem || !this.cachedFloatView) {
+            this.cachedFloatView = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            this.cachedFloatMem = mem;
+        }
+        return this.cachedFloatView;
+    }
+
+    /**
+     * Read `count` consecutive little-endian floats into `out`, validating the whole
+     * extent once — the boundary-validate-then-hoist shape, at accessor granularity.
+     * Returns false (leaving `out` untouched) when the extent is not readable.
+     */
+    static readFloat32Into(address: number, count: number, out: Float32Array): boolean {
+        if (out.length < count) return false;
+        const mem = this.ensure(address, count * 4, "r", "Mem.readFloat32Into", "read");
+        if (!mem) return false;
+        const view = this.floatView(mem);
+        for (let i = 0; i < count; i++) {
+            out[i] = view.getFloat32(address + i * 4, true);
+        }
+        return true;
+    }
+
     static readFloat32(address: number): number | null {
         const mem = this.ensure(address, 4, "r", "Mem.readFloat32", "read");
         if (!mem) return null;
-        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-        return view.getFloat32(address, true);
+        return this.floatView(mem).getFloat32(address, true);
     }
 
     static readFloat64(address: number): number | null {
