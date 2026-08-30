@@ -337,3 +337,77 @@ export function computeTextureDimensions(lod: number, aspectRatio: number): { wi
     }
     return { width: base, height: base };
 }
+
+/**
+ * s/t -> normalized uv scale for one texture.
+ *
+ * Glide's texture coordinates span 0..255 across the LONGER axis whatever the LOD,
+ * and the shorter axis is scaled by the aspect ratio — the 3dfx SDK's view3df.c
+ * multiplies its 255.0 by a factor that depends on aspect and NOT on size. So a
+ * 64x16 texture is addressed with s in 0..255 and t in only 0..63; dividing both by
+ * 256 stretches every non-square texture by its aspect ratio.
+ */
+export function glideTexCoordScale(width: number, height: number): { x: number; y: number } {
+    const w = Math.max(1, width | 0);
+    const h = Math.max(1, height | 0);
+    const longAxis = Math.max(w, h);
+    return { x: longAxis / (256 * w), y: longAxis / (256 * h) };
+}
+
+export const GR_MIPMAPLEVELMASK_EVEN = 1;
+export const GR_MIPMAPLEVELMASK_ODD = 2;
+export const GR_MIPMAPLEVELMASK_BOTH = GR_MIPMAPLEVELMASK_EVEN | GR_MIPMAPLEVELMASK_ODD;
+
+export function glideIncludesMipLevel(evenOdd: number, lod: number): boolean {
+    if (evenOdd === GR_MIPMAPLEVELMASK_BOTH) return true;
+    if (evenOdd === GR_MIPMAPLEVELMASK_EVEN) return (lod & 1) === 0;
+    if (evenOdd === GR_MIPMAPLEVELMASK_ODD) return (lod & 1) !== 0;
+    return false;
+}
+
+export interface GlideMipLevel {
+    lod: number;
+    width: number;
+    height: number;
+    byteOffset: number;
+    byteSize: number;
+}
+
+/**
+ * Where each downloaded LOD sits in the guest buffer grTexDownloadMipMap was given.
+ *
+ * Glide numbers LODs largest-first (GR_LOD_256 = 0) and lays the selected levels out
+ * in that order, so the offsets are a running sum. The returned run stops at the first
+ * level that is not exactly half the previous one: WebGPU mip levels must halve, and an
+ * EVEN/ODD mask produces a chain that skips levels, which no GPU mip chain can express.
+ */
+export function glideMipLevelPlan(
+    largeLod: number,
+    smallLod: number,
+    evenOdd: number,
+    aspectRatio: number,
+    sizeOf: (width: number, height: number) => number,
+): GlideMipLevel[] {
+    const out: GlideMipLevel[] = [];
+    if (largeLod < 0 || smallLod < largeLod) return out;
+
+    let offset = 0;
+    let expected: { width: number; height: number } | null = null;
+    for (let lod = largeLod; lod <= smallLod; lod++) {
+        const dims = computeTextureDimensions(lod, aspectRatio);
+        const size = sizeOf(dims.width, dims.height);
+        if (!glideIncludesMipLevel(evenOdd, lod)) {
+            // Not downloaded: it occupies no bytes, and it breaks the halving chain a GPU
+            // mip chain has to be. Everything past the gap is unreachable as a mip level.
+            if (out.length > 0) break;
+            continue;
+        }
+        if (expected && (dims.width !== expected.width || dims.height !== expected.height)) {
+            break;
+        }
+        out.push({ lod, width: dims.width, height: dims.height, byteOffset: offset, byteSize: size });
+        offset += size;
+        expected = { width: Math.max(1, dims.width >> 1), height: Math.max(1, dims.height >> 1) };
+    }
+    return out;
+}
