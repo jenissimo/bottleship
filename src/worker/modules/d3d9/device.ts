@@ -11,6 +11,7 @@ import { Mem } from '../../core/memory/mem-accessor';
 import { isValidAddress } from '../../core/memory/address-guard';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { gammaService } from '../../core/gamma-service';
+import { applyD3dCreateDeviceFpuMode } from '../../core/fpu-helper';
 import { D3D9Device } from '../../backends/webgpu/d3d9/d3d9-device';
 import {
     PP_BACKBUFFER_WIDTH, PP_BACKBUFFER_HEIGHT, PP_BACKBUFFER_FORMAT,
@@ -479,6 +480,16 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         const isExtended = args[7] === 1;
 
         Logger.log(LogCategory.D3D9, `IDirect3D9_CreateDevice(Adapter=${Adapter}, DeviceType=${DeviceType})`);
+
+        // Real D3D switches the x87 to single precision with exceptions masked
+        // here unless the caller asked to preserve it. Applied before anything
+        // else so every float the guest computes after this call rounds the way
+        // it does on Windows.
+        const fpuControlWord = applyD3dCreateDeviceFpuMode(System.getInstance().process?.v86, BehaviorFlags);
+        if (fpuControlWord !== null) {
+            Logger.log(LogCategory.D3D9,
+                `CreateDevice: x87 control word -> 0x${fpuControlWord.toString(16)} (single precision)`);
+        }
 
         // The out interface is mandatory.  Validate and clear it before any
         // asynchronous backend initialization so an invalid destination cannot

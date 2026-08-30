@@ -27,6 +27,7 @@ import {
 } from '../../backends/webgpu/shared/dx-adapter-identifier';
 import { registerLossTrackedDevice } from '../../core/gpu/gpu-device-loss-contract';
 import { D3DERR_NOTAVAILABLE } from '../../backends/webgpu/shared/dx-format-support';
+import { applyD3dCreateDeviceFpuMode } from '../../core/fpu-helper';
 
 const D3D_OK = 0;
 const D3DERR_INVALIDCALL = 0x8876086c;
@@ -249,6 +250,14 @@ export function createFactoryExports(): Record<string, ThunkImplementation> {
         try {
             const system = System.getInstance();
             const process = system.process;
+
+            // Same documented side effect as D3D9: single precision, exceptions
+            // masked, unless D3DCREATE_FPU_PRESERVE was passed.
+            const fpuControlWord = applyD3dCreateDeviceFpuMode(process?.v86, BehaviorFlags);
+            if (fpuControlWord !== null) {
+                Logger.log(LogCategory.SYSTEM,
+                    `CreateDevice: x87 control word -> 0x${fpuControlWord.toString(16)} (single precision)`);
+            }
             if (!process || !process.canvas) {
                 Logger.error(LogCategory.SYSTEM, 'D3D8 CreateDevice: no process/canvas');
                 return D3DERR_INVALIDCALL;

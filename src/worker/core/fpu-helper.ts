@@ -15,10 +15,10 @@ const FPU_STACK_EMPTY_OFFSET = 816;   // u8
 const FPU_STACK_PTR_OFFSET = 1032;    // u8
 const FPU_SIMD_DIRTY_OFFSET = 632;    // u8
 const FPU_RELAXED_TAG = 0x7FFE;
-const FPU_ST_OFFSET = 1152;           // 8 × F80 (mantissa: u64 + sign_exponent: u16, padded to 16 bytes)
+export const FPU_ST_OFFSET = 1152;           // 8 × F80 (mantissa: u64 + sign_exponent: u16, padded to 16 bytes)
 
 // F80 struct size in WASM: mantissa(8) + sign_exponent(2) + padding(6) = 16 bytes
-const F80_SIZE = 16;
+export const F80_SIZE = 16;
 
 // Reusable buffer for double ↔ u32 pair conversion (avoids allocation)
 const _cvtBuf = new ArrayBuffer(8);
@@ -79,8 +79,10 @@ export function clearFpuSimdDirty(v86: any): void {
  * Get a DataView over WASM linear memory.
  * Creates a fresh DataView each time since the underlying ArrayBuffer can detach.
  */
-function getWasmView(v86: any): DataView | null {
-    const cpu = getCPU(v86);
+export function getWasmView(v86OrCpu: any): DataView | null {
+    // Accepts either the v86 instance or a bare CPU — callers on the harness side
+    // already hold the CPU, and making them re-wrap it invites a silent null.
+    const cpu = getCPU(v86OrCpu) ?? v86OrCpu;
     const wasmMem = cpu?.wasm_memory;
     if (!wasmMem?.buffer || wasmMem.buffer.byteLength === 0) return null;
     return new DataView(wasmMem.buffer);
@@ -94,7 +96,7 @@ function writeFpuByte(dv: DataView, offset: number, value: number): void {
     dv.setUint8(offset, value & 0xFF);
 }
 
-function isRelaxedFpu(v86: any): boolean {
+export function isRelaxedFpu(v86: any): boolean {
     const cpu = getCPU(v86);
     const getRelaxed = cpu?.wm?.exports?.get_relaxed_fpu;
     return typeof getRelaxed === 'function' && (getRelaxed() >>> 0) !== 0;
@@ -237,6 +239,87 @@ export function fpuSnapshot(v86: any, target?: Uint8Array): Uint8Array | null {
     out[132] = src[FPU_STATUS_WORD_OFFSET];
     out[133] = src[FPU_STATUS_WORD_OFFSET + 1];
     return out;
+}
+
+/** D3DCREATE_FPU_PRESERVE. */
+const D3DCREATE_FPU_PRESERVE = 0x2;
+
+/** Read the live x87 control word, or null when WASM memory is unavailable. */
+export function getFpuControlWord(v86: any): number | null {
+    const dv = getWasmView(v86);
+    return dv ? dv.getUint16(FPU_CONTROL_WORD_OFFSET, true) : null;
+}
+
+/**
+ * Write the live x87 control word.
+ *
+ * Goes through WASM memory rather than `cpu.fpu_control_word[0]`: v86's JS layer
+ * can replace that property with a plain number, in which case the store shadows a
+ * JS field and the guest's arithmetic never changes. Returns the value read back,
+ * so a caller can tell a real write from a silent one.
+ */
+export function setFpuControlWord(v86: any, value: number): number | null {
+    const dv = getWasmView(v86);
+    if (!dv) return null;
+    dv.setUint16(FPU_CONTROL_WORD_OFFSET, value & 0xFFFF, true);
+    return dv.getUint16(FPU_CONTROL_WORD_OFFSET, true);
+}
+
+/**
+ * Decode one x87 F80 (mantissa u64 + sign/exponent u16) to a double.
+ *
+ * The single decoder: the layout is pinned to v86's `global_pointers.rs`, so a
+ * second copy is a place for a future bump to be missed.
+ */
+export function decodeF80(mantLo: number, mantHi: number, signExp: number): number {
+    const sign = (signExp & 0x8000) ? -1 : 1;
+    const exponent = signExp & 0x7FFF;
+    const mantissa = mantHi * 4294967296 + mantLo;
+    if (exponent === 0 && mantissa === 0) return sign * 0;
+    if (exponent === 0x7FFF) return mantissa === 0 ? sign * Infinity : NaN;
+    // An exponent of 0 is a DENORMAL, whose scale is 2^(1-16383-63) — the biased
+    // exponent is clamped to 1, it is not literally zero.
+    const e = exponent === 0 ? 1 : exponent;
+    return sign * mantissa * Math.pow(2, e - 16383 - 63);
+}
+
+/**
+ * Apply Direct3D's CreateDevice side effect on the x87 control word.
+ *
+ * Real Direct3D (D3D7 through D3D9) switches the FPU to SINGLE precision with all
+ * exceptions masked at device creation unless the caller passes D3DCREATE_FPU_PRESERVE.
+ * A title that never touches the control word itself therefore runs every float op at
+ * 24-bit precision on Windows, and leaving the CRT default (0x037F, extended) computes
+ * the same expression one precision step wider — invisible in a rendered frame, decisive
+ * wherever a result is compared exactly, hashed, or used as an array index.
+ *
+ * The write targets the LIVE control word, i.e. the calling thread's, which is the
+ * faithful scope: the setting is per-thread on Windows too, so a thread created later
+ * gets the ordinary default. `createDefaultFpuSnapshot` stays at 0x037F for that reason,
+ * and the per-thread snapshot (§3.6) carries this word across context switches.
+ *
+ * Kill switch: `globalThis.__noD3dFpuSingle`.
+ */
+export function applyD3dCreateDeviceFpuMode(v86: any, behaviorFlags: number): number | null {
+    // Last outcome, for A/B and for answering "did it fire?" without log plumbing.
+    const trace = (why: string, extra?: Record<string, unknown>) => {
+        (globalThis as any).__d3dFpuLast = { why, behaviorFlags, ...extra };
+    };
+    if ((globalThis as any).__noD3dFpuSingle) { trace("disabled-by-flag"); return null; }
+    if ((behaviorFlags & D3DCREATE_FPU_PRESERVE) !== 0) { trace("fpu-preserve"); return null; }
+    const before = getFpuControlWord(v86);
+    if (before === null) { trace("no-wasm-memory", { hasCpu: !!getCPU(v86) }); return null; }
+    // Clear the precision-control field (bits 8-9 -> 00 = single) and the reserved
+    // bit 6, and mask all six exceptions. From the 0x037F default this yields 0x003F,
+    // the value real D3D leaves behind.
+    const after = ((before & ~0x0340) | 0x003F) & 0xFFFF;
+    const readBack = after !== before ? setFpuControlWord(v86, after) : before;
+    if (readBack !== after) { trace("write-did-not-stick", { before, after, readBack }); return null; }
+    // Relaxed FPU deliberately ignores precision control, so the word is now correct
+    // but the arithmetic is unchanged. Say so — a probe reading __d3dFpuLast must not
+    // read "applied" as "the guest now rounds to 24 bits".
+    trace(isRelaxedFpu(v86) ? "applied-but-relaxed-fpu-ignores-pc" : "applied", { before, after });
+    return after;
 }
 
 /** Write a previously captured x87 snapshot back into WASM memory. */
