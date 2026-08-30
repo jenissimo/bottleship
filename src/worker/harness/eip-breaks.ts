@@ -34,6 +34,7 @@ import { harnessBus } from "./event-bus";
 import { faultSnapshot, proc, cpu, guestMem, symbolize } from "./serialize";
 import { breakEvents } from "./break-events";
 import { dbg } from "../core/debug/dbg-commands";
+import { getWasmView, getFpuControlWord, decodeF80, FPU_ST_OFFSET, F80_SIZE } from "../core/fpu-helper";
 
 /**
  * Optional arg/stack predicate for a conditional breakpoint. Evaluated at the armed eip — which the
@@ -62,11 +63,54 @@ export interface BreakCapture {
      *  The minimal answer to "record [esi+0x0c] on every hit" — deliberately not an
      *  expression language. An unknown register is an ERROR entry, never a zero. */
     reads?: Array<{ reg: string; offset?: number; size?: number; deref?: boolean; label?: string }>;
+    /** Snapshot the x87 stack top at the hit. A guest function that returns a
+     *  float returns it in ST(0), and register-relative reads cannot see it, so
+     *  such a function was previously half-observable: its inputs were readable
+     *  and its answer was not. Set this on a breakpoint armed at the RETURN site
+     *  to capture what the callee returned. */
+    fpu?: boolean;
     /** Frames of module-labelled guest call stack (default 12). `false`/0 opts out — the only
      *  reason to is a very hot continuous bp, where the stack scan runs per hit. */
     backtrace?: boolean | number;
     /** Raw dwords from [ESP] upward (default 8). */
     stack?: number;
+}
+
+/** x87 stack top at the hit, decoded from v86's F80 register file.
+ *
+ *  ST(0) is physical register `fpu_stack_ptr`. Both the decoded value and its f32
+ *  bit pattern are reported, since a float-returning contract delivers the latter
+ *  once the caller stores it. */
+function readFpuTop(cpu: any): Record<string, unknown> | null {
+    try {
+        // Offset 1152 is meaningful in v86's WASM linear memory and nowhere else, so
+        // there is no fallback buffer to try: a different backing store would decode
+        // to a confident number that is noise.
+        const view = getWasmView(cpu);
+        if (!view) return { error: "no wasm memory" };
+        const top = (cpu.fpu_stack_ptr?.[0] ?? 0) & 7;
+        const empty = cpu.fpu_stack_empty?.[0] ?? 0xff;
+        const isEmpty = !!((empty >> top) & 1);
+        const base = FPU_ST_OFFSET + top * F80_SIZE;
+        const mantLo = view.getUint32(base, true);
+        const mantHi = view.getUint32(base + 4, true);
+        const signExponent = view.getUint16(base + 8, true);
+        const value = decodeF80(mantLo, mantHi, signExponent);
+        const scratch = new DataView(new ArrayBuffer(4));
+        scratch.setFloat32(0, value, true);
+        return {
+            // An empty register holds whatever the last pop left behind; reporting it
+            // as a value invites reading a stale number as this call's answer.
+            st0: isEmpty ? null : value,
+            st0_f32_bits: isEmpty ? null : scratch.getUint32(0, true),
+            empty: isEmpty,
+            control_word: getFpuControlWord(cpu),
+            stack_top: top,
+        };
+    } catch (e) {
+        // "decode threw" and "no x87 state" are different answers; null conflates them.
+        return { error: String(e) };
+    }
 }
 
 /** Register file order in v86's reg32. */
@@ -348,6 +392,7 @@ class EipBreakRegistry {
             // stack. Everything above is from the hit instant; nothing read later is.
             note: "read AT the hit. `pause` is not instruction-precise — a backtrace()/readBytes issued after the break describes a LATER moment, not this one.",
             ...(reads.length ? { reads } : {}),
+            ...(capture?.fpu ? { fpu: readFpuTop(c) } : {}),
         };
     }
 

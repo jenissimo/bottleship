@@ -29,6 +29,10 @@ export interface BreakCaptureSpec {
     /** Register-relative reads settled at the hit: `{reg:'esi', offset:12, size:4}` reads 4 bytes
      *  at ESI+0xc; `deref:true` reads at *(ESI+0xc). */
     reads?: Array<{ reg: string; offset?: number; size?: number; deref?: boolean; label?: string }>;
+    /** Snapshot the x87 stack top at the hit. Arm it at a RETURN site to capture
+     *  what a float-returning guest function returned: the value comes back in
+     *  ST(0), which register-relative `reads` cannot see. */
+    fpu?: boolean;
     /** Backtrace frames (default 12); `false` opts out for a very hot continuous bp. */
     backtrace?: boolean | number;
     /** Raw dwords from [ESP] up (default 8). */
@@ -267,6 +271,31 @@ export class HarnessChain {
     glFrame(opts?: { timeoutMs?: number }): this { return this.push("glFrame", [opts]); }
     glTextures(): this { return this.push("glTextures", []); }
     glDumpTexture(id: number): this { return this.push("glDumpTexture", [id]); }
+
+    // ── Glide (3dfx) ──
+    /** Live Glide render state: the combine units, the resident TMU textures and the
+     *  frame counters, i.e. what the next draw would be issued with. */
+    glideState(opts?: { onlyActive?: boolean }): this { return this.push("glideState", [opts]); }
+    /** One COMPLETED Glide frame, decoded per draw — the Glide twin of `glFrame()`. */
+    glideFrame(opts?: { timeoutMs?: number; maxDraws?: number }): this { return this.push("glideFrame", [opts]); }
+    /** Every texture resident in a TMU, with its handle, address, size and format. */
+    glideTextures(opts?: { onlyActive?: boolean }): this { return this.push("glideTextures", [opts]); }
+    /** The raw guest bytes a texture was decoded FROM — needs `__glideKeepTexSource`. */
+    glideTextureBytes(handle: number): this { return this.push("glideTextureBytes", [handle]); }
+    /** The linear frame buffer as a PNG. `syncFromFrame` runs the guest read-lock path,
+     *  which is the positive control for LFB read-back: it goes black when the mirror
+     *  is not reaching the LFB. */
+    glideDumpLfb(opts?: { syncFromFrame?: boolean }): this { return this.push("glideDumpLfb", [opts]); }
+    /** One resident texture as a PNG, re-decoded exactly the way the upload path decodes it. */
+    glideDumpTexture(handle: number): this { return this.push("glideDumpTexture", [handle]); }
+
+    // ── x87 ──
+    /** Control/status words and the eight x87 registers in stack order — the answer of a
+     *  float-returning guest function lives in ST(0), which register reads cannot see. */
+    fpuState(): this { return this.push("fpuState", []); }
+    /** Read or set the x87 precision-control field (`single`|`double`|`extended`). Per-thread,
+     *  so it lands on the RUNNING thread only. */
+    fpuPrecision(mode?: "single" | "double" | "extended"): this { return this.push("fpuPrecision", [mode]); }
 
     // ── GPU device loss ──
     /** Destroy the live GPUDevice on purpose — the same path a real `deviceLost` takes.
