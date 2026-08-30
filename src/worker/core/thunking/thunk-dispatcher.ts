@@ -3362,16 +3362,16 @@ export class ThunkDispatcher {
         isStdcall: boolean = true,
         coalesceArgMask: number = 0,
         opts?: { trampolineOverride?: number; shadowSpec?: ShadowTrampolineSpec; barrier?: boolean; ownerDisarm?: boolean },
-    ): void {
+    ): boolean {
         if (this.writeBufControlAddr === 0) {
             Logger.warn(LogCategory.THUNK,
                 `registerWriteBufferFunction: write-buffer not initialised, skipping ${dllName}:${funcName}`);
-            return;
+            return false;
         }
         if (argCount < 1 || argCount > 8) {
             Logger.warn(LogCategory.THUNK,
                 `registerWriteBufferFunction: argCount ${argCount} out of range 1-8 for ${dllName}:${funcName}`);
-            return;
+            return false;
         }
 
         // Always record in pendingWriteBufRegistrations so applyPendingRegistrations can
@@ -3395,7 +3395,7 @@ export class ThunkDispatcher {
         if (stubs.length === 0) {
             Logger.verbose(LogCategory.THUNK,
                 `Write-buffer stub not found for ${dllName}:${funcName}, registration deferred`);
-            return;
+            return false;
         }
 
         // Look up trampoline address for (argCount, convention) — or use a caller-supplied
@@ -3405,7 +3405,7 @@ export class ThunkDispatcher {
         if (!trampolineAddr) {
             Logger.warn(LogCategory.THUNK,
                 `registerWriteBufferFunction: no trampoline for argCount=${argCount} isStdcall=${isStdcall}`);
-            return;
+            return false;
         }
 
         // Patch the 16-byte stub in guest memory:
@@ -3421,7 +3421,7 @@ export class ThunkDispatcher {
         if (!mem8 || mem8.byteLength === 0) {
             Logger.warn(LogCategory.THUNK,
                 `registerWriteBufferFunction: mem8 not ready, cannot patch stub for ${dllName}:${funcName}`);
-            return;
+            return false;
         }
         for (let si = 0; si < stubs.length; si++) {
             const stub = stubs[si];
@@ -3491,6 +3491,9 @@ export class ThunkDispatcher {
                 `jit_dirty=${jitDirtied}, deferred=${!jitDirtied}, readback=${patchOk?'OK':'FAIL'}, freshMem=${freshMatch?'OK':'STALE'}) ` +
                 `bytes=[${readBack}]`);
         }
+        // Reports whether the patch actually landed: a caller counting ATTEMPTS would
+        // announce a fast path that is still entirely on the OUT trap.
+        return true;
     }
 
     /**
