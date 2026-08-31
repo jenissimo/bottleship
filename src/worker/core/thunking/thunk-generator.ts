@@ -394,22 +394,35 @@ export class ThunkGenerator {
      * Publish a second entry point for an existing thunk without consuming another
      * function ID. Synthetic HLE PE images need export bodies inside their own .text,
      * while dispatch identity belongs to the API, not to the address used to enter it.
+     *
+     * `exportName` is the name the body is published under, which is not always the
+     * target's: `findStubsByName` bridges the undecorated/decorated spelling gap on
+     * purpose. Returns null when the two do not agree on the stack contract — a module
+     * that declares several decorations of one base name (`_AIL_file_read@8` takes two
+     * arguments, `@12` takes three) matches the undecorated name against all of them,
+     * and aliasing across that gap publishes one contract's RET N under the other's name
+     * on the other's functionId. The caller must fall back to its own stub; refusing
+     * here rather than throwing keeps that a decision, not a lost export.
      */
     allocateAliasStubAt(
         address: number,
         target: ThunkStub,
+        exportName: string,
         argCount?: number,
         callingConvention?: string,
         stackCleanupBytes?: number
-    ): { address: number; code: Uint8Array } {
+    ): { address: number; code: Uint8Array } | null {
         const isStdcall = !callingConvention || callingConvention === 'stdcall';
-        const bytesToPop = this.resolveBytesToPop(target.functionName, isStdcall, argCount, stackCleanupBytes);
+        const bytesToPop = this.resolveBytesToPop(exportName, isStdcall, argCount, stackCleanupBytes);
         if (isStdcall && bytesToPop === undefined) {
             throw new Error(
                 `[ThunkGenerator] allocateAliasStubAt requires argCount or stackCleanupBytes for stdcall: ` +
-                `${target.dllName}:${target.functionName}`
+                `${target.dllName}:${exportName}`
             );
         }
+        // An alias shares the target's functionId, so a disagreement here is not a
+        // cleanup detail — it means the two names are different functions.
+        if ((isStdcall ? bytesToPop ?? 0 : 0) !== (target.stackCleanupBytes ?? 0)) return null;
 
         const functionId = target.functionId;
         const codeChunks: number[] = [
@@ -427,7 +440,10 @@ export class ThunkGenerator {
         const alias: ThunkStub = {
             address: address >>> 0,
             dllName: target.dllName,
-            functionName: target.functionName,
+            // The name this body is REACHED by. Recording the target's instead makes every
+            // name-based reading of this address (the stub audits, a crash's ESP check)
+            // answer with an export that does not live here.
+            functionName: exportName,
             functionId,
             argCount,
             stackCleanupBytes: isStdcall ? bytesToPop : 0,

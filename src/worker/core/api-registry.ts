@@ -222,6 +222,28 @@ export class APIRegistry {
     }
 
     /**
+     * Re-point one export's RET N at what the DLL the BUNDLE SHIPS actually pops.
+     *
+     * A static descriptor cannot decide an ABI that differs per shipped build — Bink's
+     * `_BinkSetVolume@8` pops 8 up to SDK 1.0 and 12 from 1.5, under the one name — so
+     * the owning module reads the real DLL and reports it here. Must land BEFORE any
+     * stub for that export is generated: the RET N is emitted into guest code, so a
+     * later correction cannot reach a stub the guest already holds.
+     *
+     * Argument count moves with it. `cacheFunction` derives BOTH from one number
+     * (`dwordSlots = stackBytes >> 2`), so they are one fact in two spellings — and the
+     * readers that consume them together would otherwise disagree with themselves:
+     * `exception-context-dumper` computes `stackCleanupBytes ?? argCount * 4` to decide
+     * whether a stub's RET N is wrong, and would call the corrected stub the broken one.
+     */
+    public overrideStackCleanupBytes(dllName: string, functionName: string, stackBytes: number): void {
+        const dll = dllName.toLowerCase().replace(/\.dll$/, "");
+        const key = `${dll}:${functionName.toLowerCase()}`;
+        this.stackCleanupCache.set(key, stackBytes);
+        this.argCountCache.set(key, stackBytes >> 2);
+    }
+
+    /**
      * Returns stack cleanup bytes (for RET N) for a function. Use this for stub generation and ESP checks.
      * Default: argCount * 4. Override with stackCleanupBytes when decoration is wrong (e.g. _AIL_file_read@8).
      */

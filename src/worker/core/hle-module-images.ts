@@ -283,14 +283,26 @@ export function materializeHleModuleImages(process: any): void {
             try {
                 const address = (base + 0x1000 + exports.length * 16) >>> 0;
                 const args = fn.params ? calculateStackCleanup(fn.params) >> 2 : undefined;
+                // Ask the registry, not the descriptor: an ABI that depends on WHICH build
+                // the bundle ships is settled there before the images are published, and a
+                // stub that read the static field would emit a RET N the other two stub
+                // paths (pe-loader, export-resolver) disagree with — one export, two answers.
+                const cleanup = APIRegistry.getInstance().getStackCleanupBytes(name, fn.name)
+                    ?? fn.stackCleanupBytes;
+                // An alias only stands in for the SAME function; findStubsByName bridges the
+                // undecorated/decorated spelling gap, and a module declaring several
+                // decorations of one base name matches all of them. allocateAliasStubAt
+                // refuses a target with a different stack contract, and this export then
+                // gets its own stub — its own functionId, its own RET N.
                 const existing = generator.findStubsByName(name, fn.name)[0];
-                const { code } = existing
+                const alias = existing
                     ? generator.allocateAliasStubAt(
-                        address, existing, args, fn.callingConvention, fn.stackCleanupBytes,
+                        address, existing, fn.name, args, fn.callingConvention, cleanup,
                     )
-                    : generator.allocateStubAt(
-                        address, name, fn.name, args, fn.callingConvention, fn.stackCleanupBytes,
-                    );
+                    : null;
+                const { code } = alias ?? generator.allocateStubAt(
+                    address, name, fn.name, args, fn.callingConvention, cleanup,
+                );
                 exports.push({ name: fn.name, code });
             } catch (e) {
                 Logger.verbose(LogCategory.SYSTEM, `[HleImages] ${name}:${fn.name} not stubbable — ${e}`);

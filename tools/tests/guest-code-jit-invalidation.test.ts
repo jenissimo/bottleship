@@ -195,7 +195,8 @@ describe("ThunkGenerator hands out no executable space without invalidating it",
         const canonical = gen.allocateOneStub("kernel32", "QueryPerformanceCounter", 1, "stdcall");
         const target = gen.getStubByAddress(canonical.address)!;
 
-        const alias = gen.allocateAliasStubAt(0x2a001000, target, 1, "stdcall");
+        const alias = gen.allocateAliasStubAt(
+            0x2a001000, target, "QueryPerformanceCounter", 1, "stdcall")!;
         const next = gen.allocateOneStub("kernel32", "QueryPerformanceFrequency", 1, "stdcall");
 
         const aliasId = new DataView(alias.code.buffer).getUint32(1, true);
