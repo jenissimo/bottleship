@@ -1031,6 +1031,19 @@ const loadPeData = async (peData: Uint8Array, skipReset: boolean = false) => {
     await prepareFullGameSwitch();
   }
 
+  // Let every HLE module settle what depends on WHICH build of its DLL the bundle ships,
+  // before ANY stub for it exists: a stub's RET N is emitted into guest code, and the
+  // synthetic images published below already carry those bytes, so an answer that arrives
+  // later cannot reach a stub the guest holds. One module failing must not stop the load.
+  for (const module of system.process.modules.values()) {
+    if (!module?.prepareForBundle) continue;
+    try {
+      await module.prepareForBundle();
+    } catch (e) {
+      Logger.warn(LogCategory.SYSTEM, `prepareForBundle failed for module ${module.name}: ${e}`);
+    }
+  }
+
   // Imports mark HLE modules as loaded while loadExecutable walks the import table.
   // Publish the synthetic images first so those marks have process-local slots to target.
   materializeHleModuleImages(system.process);

@@ -33,7 +33,15 @@ import { overlapsThunkCode } from "../core/memory/address-guard";
 import { Glide2x } from "./glide2x";
 import { VideoFrameViews } from "../video/video-routing-types";
 import { readPeVersionString, readPeFixedFileVersion } from "../core/pe-version";
-import { BinkStructLayout, BINK_LAYOUT_DEFAULT, binkLayoutFor, selectBinkLayout } from "./bink-struct";
+import { readStdcallRetBytes } from "@bottleship/formats/pe";
+import { APIRegistry } from "../core/api-registry";
+import {
+    BinkStructLayout, BINK_LAYOUT_DEFAULT, BINK_SET_VOLUME_DECORATED_POPS,
+    binkBuildFor, selectBinkBuild,
+} from "./bink-struct";
+
+/** The one export whose argument list RAD changed without changing its decorated name. */
+const BINK_SET_VOLUME_EXPORT = "_BinkSetVolume@8";
 
 // Real HBINK structs are 300-500+ bytes depending on SDK version.  Games read
 // internal fields (rect pointers, frame buffer ptrs) at offsets well beyond our
@@ -301,7 +309,10 @@ export class BinkW32 implements IModule {
 
     /** HBINK field offsets for the binkw32.dll this title ships (see bink-struct.ts). */
     private layout: BinkStructLayout = BINK_LAYOUT_DEFAULT;
-    private layoutResolved = false;
+    /** In-flight or completed build resolution; null before the first load. A boolean
+     *  flag set at entry would let a BinkOpen arriving during the file read see
+     *  "resolved" and use the PREVIOUS game's layout. */
+    private buildResolution: Promise<void> | null = null;
     private nextBufferHandle = 0x7800;
     private binkBuffers = new Map<number, BinkBufferSession>();
 
@@ -790,18 +801,40 @@ export class BinkW32 implements IModule {
     }
 
     /**
-     * Resolve the HBINK ABI from the binkw32.dll the bundle ships. We stand in for that
-     * DLL, so its SDK release — not the .bik file — decides where the guest looks for
-     * Frames/FrameNum/dirty rects. Resolved once per session, before the first HBINK is
-     * built; a missing/unreadable DLL keeps the default layout.
+     * Resolve everything that depends on WHICH binkw32.dll the bundle ships, before the
+     * guest can observe any of it.
+     *
+     * Must be awaited before the executable's imports are bound: {@link resolveCallAbi}
+     * fixes a RET N that gets emitted into guest code at stub-generation time, and a
+     * correction after that cannot reach a stub the guest already holds. The struct
+     * layout would tolerate being late; keeping both on one read of one file is what
+     * stops the two answers coming from different sources.
+     */
+    async prepareForBundle(): Promise<void> {
+        // Re-resolve per load: this module instance outlives a game switch, and carrying
+        // one title's Bink generation into the next is the same wrong answer, silently.
+        this.buildResolution = null;
+        await this.ensureLayout();
+    }
+
+    /**
+     * Resolve the SDK release the bundle ships, and with it everything the guest can
+     * observe about Bink: where it reads Frames/FrameNum/dirty rects, and how many bytes
+     * `_BinkSetVolume@8` pops. We stand in for that DLL, so its release — not the .bik
+     * file — decides both.
      */
     private async ensureLayout(): Promise<void> {
-        if (this.layoutResolved) return;
-        this.layoutResolved = true;
+        if (!this.buildResolution) this.buildResolution = this.resolveBuild();
+        await this.buildResolution;
+    }
+
+    private async resolveBuild(): Promise<void> {
         const path = System.getInstance().process?.loader?.findDllPath("binkw32");
         if (!path) {
             Logger.warn(LogCategory.SYSTEM,
-                `[BinkW32] binkw32.dll not found in the bundle — assuming Bink ${this.layout.id} struct layout`);
+                `[BinkW32] binkw32.dll not found in the bundle — assuming Bink ${this.layout.id} struct ` +
+                `layout and the decorated ${BINK_SET_VOLUME_DECORATED_POPS}-byte BinkSetVolume cleanup. ` +
+                `A title on the 1.5+ ABI drifts its stack by 4 bytes per call.`);
             return;
         }
         const image = await this.readVfsFile(path);
@@ -809,22 +842,65 @@ export class BinkW32 implements IModule {
         // StringFileInfo is localizable text a build may omit; VS_FIXEDFILEINFO is the
         // binary version every versioned image carries.
         const fixed = image ? readPeFixedFileVersion(image) : null;
-        const resolved = selectBinkLayout(version)
-            ?? (fixed ? binkLayoutFor(fixed.major, fixed.minor) : null);
-        if (!resolved) {
+        const build = selectBinkBuild(version)
+            ?? (fixed ? binkBuildFor(fixed.major, fixed.minor) : null);
+        // The export's own RET is evidence about THIS build, independent of the table.
+        const observedPops = image
+            ? readStdcallRetBytes(image, BINK_SET_VOLUME_EXPORT)
+            : null;
+
+        if (!build) {
             Logger.error(LogCategory.SYSTEM,
                 `[BinkW32] ${path}: no readable version (FileVersion="${version ?? ""}", no VS_FIXEDFILEINFO) — ` +
                 `GUESSING HBINK layout ${this.layout.id}. If this DLL is 0.8x, Frames/FrameNum land 8 bytes ` +
                 `off and the guest's "video finished" test never fires.`);
+            // The body read is the only evidence left, so it decides the ABI alone.
+            this.applySetVolumePops(observedPops, path, "the export's own RET (no version)");
             return;
         }
-        this.layout = resolved;
+        this.layout = build.layout;
         Logger.log(LogCategory.SYSTEM,
             `[BinkW32] ${path}: FileVersion="${version ?? "?"}"` +
             `${fixed ? ` fixed=${fixed.major}.${fixed.minor}.${fixed.build}.${fixed.revision}` : ""}` +
-            ` → HBINK layout ${this.layout.id} ` +
-            `(Frames@0x${this.layout.frames.toString(16)} FrameNum@0x${this.layout.frameNum.toString(16)} ` +
-            `rects@0x${this.layout.frameRects.toString(16)})`);
+            ` → Bink ${build.id} (Frames@0x${this.layout.frames.toString(16)} ` +
+            `FrameNum@0x${this.layout.frameNum.toString(16)} rects@0x${this.layout.frameRects.toString(16)})`);
+
+        // The table decides for a release we have disassembled; the body read is the
+        // cross-check, and a disagreement means one of the two is wrong about a real DLL
+        // — it must never pass quietly. Outside the measured releases the table is
+        // interpolation, so the evidence wins and says that it did.
+        if (build.measured) {
+            if (observedPops !== null && observedPops !== build.setVolumePops) {
+                Logger.error(LogCategory.SYSTEM,
+                    `[BinkW32] ${path}: ${BINK_SET_VOLUME_EXPORT} RET ${observedPops}, but Bink ${build.id} ` +
+                    `is recorded as popping ${build.setVolumePops} — the table is wrong about a shipped DLL, ` +
+                    `or the return was misread. Using the table; fix bink-struct.ts.`);
+            }
+            this.applySetVolumePops(build.setVolumePops, path, `the Bink ${build.id} table`);
+            return;
+        }
+        Logger.warn(LogCategory.SYSTEM,
+            `[BinkW32] ${path}: Bink ${build.id} is outside the releases we have disassembled — ` +
+            `${observedPops !== null
+                ? `taking ${BINK_SET_VOLUME_EXPORT}'s own RET ${observedPops}`
+                : `and its RET is unreadable, so falling back to ${build.setVolumePops}`}.`);
+        this.applySetVolumePops(observedPops ?? build.setVolumePops, path,
+            observedPops !== null ? "the export's own RET (unmeasured release)" : "an unmeasured table entry");
+    }
+
+    /** Publish the BinkSetVolume cleanup, unless it is what the descriptor already declares. */
+    private applySetVolumePops(pops: number | null, path: string, source: string): void {
+        if (pops === null) {
+            Logger.warn(LogCategory.SYSTEM,
+                `[BinkW32] ${path}: ${BINK_SET_VOLUME_EXPORT}'s cleanup is unknown — keeping the decorated ` +
+                `${BINK_SET_VOLUME_DECORATED_POPS} bytes. A 1.5+ caller pushes 12 and drifts by 4.`);
+            return;
+        }
+        if (pops === BINK_SET_VOLUME_DECORATED_POPS) return;
+        APIRegistry.getInstance().overrideStackCleanupBytes("binkw32", BINK_SET_VOLUME_EXPORT, pops);
+        Logger.log(LogCategory.SYSTEM,
+            `[BinkW32] ${path}: ${BINK_SET_VOLUME_EXPORT} pops ${pops} (not the decorated ` +
+            `${BINK_SET_VOLUME_DECORATED_POPS}), per ${source} — stub cleanup overridden`);
     }
 
     initialize(process: Process): void {
@@ -906,11 +982,9 @@ export class BinkW32 implements IModule {
             console.log(`[BINK] BinkSetVolume(bink=0x${args[0].toString(16)}, track=${args[1]}, vol=${args[2]})`);
             return 0;
         };
-        // Same handler shape as @12: the `@8` decoration is stale, the caller passes
-        // (handle, trackid, volume) — see the descriptor note in binkw32.api.ts.
         this.exports["_BinkSetVolume@8"] = (_ctx, _mem, args) => {
             Logger.verbose(LogCategory.SYSTEM,
-                `[BINK] BinkSetVolume(bink=0x${args[0].toString(16)}, track=${args[1]}, vol=${args[2]})`);
+                `[BINK] BinkSetVolume(bink=0x${args[0].toString(16)}, vol=${args[1]})`);
             return 0;
         };
 
@@ -1631,7 +1705,7 @@ export class BinkW32 implements IModule {
         this.apiCallLog.clear();
         this.lastSurfaceBpp = 0;
         this.layout = BINK_LAYOUT_DEFAULT;
-        this.layoutResolved = false;
+        this.buildResolution = null;
         this.nextBufferHandle = 0x7800;
         this.pendingIoSize = 0;
     }

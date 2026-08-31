@@ -98,3 +98,56 @@ export function selectBinkLayout(fileVersion: string | null | undefined): BinkSt
     if (!m) return null;
     return binkLayoutFor(Number(m[1]), Number(m[2]));
 }
+
+/**
+ * Everything about the SDK release the bundle ships that the guest can observe — the
+ * struct it reads and the call ABI it uses. One question, one answer: resolving the
+ * layout from the version and the ABI from somewhere else lets the two disagree with
+ * nothing noticing.
+ */
+export interface BinkBuild {
+    /** SDK generation label for diagnostics. */
+    id: string;
+    layout: BinkStructLayout;
+    /**
+     * Bytes `_BinkSetVolume@8` pops. RAD changed the signature without changing the
+     * decorated name: `(HBINK, volume)` / RET 8 up to 1.0, `(HBINK, trackid, volume)` /
+     * RET 12 from 1.5. Binding a caller of one generation to a stub built for the other
+     * drifts its ESP by 4 and its next RET lands in whatever dword that exposed.
+     */
+    setVolumePops: number;
+    /**
+     * False when this release is OUTSIDE the builds we have disassembled, so
+     * `setVolumePops` is interpolation rather than measurement. The caller must prefer
+     * evidence read from the shipped DLL over an unmeasured entry, and say which it used.
+     */
+    measured: boolean;
+}
+
+/**
+ * Build description for a major/minor pair.
+ *
+ * `setVolumePops` measured by reading the export's own RET out of shipped DLLs:
+ *   0.8i (The Longest Journey)  RET 8
+ *   1.0v (Gothic, pre-Union)    RET 8
+ *   1.5v (Gothic, Union)        RET 12
+ * 0.5x and 1.1–1.4 are unmeasured and say so; 2.x is Bink 2, a different DLL entirely.
+ */
+export function binkBuildFor(major: number, minor: number): BinkBuild {
+    const layout = binkLayoutFor(major, minor);
+    if (major === 0) return { id: layout.id, layout, setVolumePops: 8, measured: minor >= 8 };
+    if (major === 1 && minor <= 0) return { id: layout.id, layout, setVolumePops: 8, measured: true };
+    if (major === 1 && minor >= 5) return { id: layout.id, layout, setVolumePops: 12, measured: true };
+    // 1.1–1.4 sit between two measured points, and 2.x is past the last one.
+    return { id: layout.id, layout, setVolumePops: 12, measured: false };
+}
+
+/** {@link binkBuildFor} keyed by a FileVersion string; null when it is unreadable. */
+export function selectBinkBuild(fileVersion: string | null | undefined): BinkBuild | null {
+    const m = BINK_VERSION_RE.exec(fileVersion ?? '');
+    if (!m) return null;
+    return binkBuildFor(Number(m[1]), Number(m[2]));
+}
+
+/** What the `@8` decoration promises, and what our descriptor declares. */
+export const BINK_SET_VOLUME_DECORATED_POPS = 8;

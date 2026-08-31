@@ -51,14 +51,14 @@ export const binkw32Module: ModuleDescriptor = {
 
         // Sound control
         makeFunc("_BinkOpenMiles@4", 1),          // HDIGDRIVER
+        // Bink >= 1.9 gave BinkSetVolume a track parameter, and BOTH generations ship. The
+        // decoration is the contract either way — a stdcall export pops exactly what its
+        // `@N` says, and every real binkw32 we have (0.8i, 1.0v, 1.5v) exports `@8` and
+        // RET 8s. Overriding `@8` to pop 12 drifts ESP by 4 in a caller that pushed 8, and
+        // the caller's own RET then jumps into whatever dword the drift exposed: TLJ's
+        // dx_module landed in its heap data and died with no trace back to here.
         makeFunc("_BinkSetVolume@12", 3),         // 1.9+: handle, trackid, volume
-        // Bink >= 1.9 gave BinkSetVolume a track parameter (handle, trackid, volume) but
-        // import tables built against older headers still carry the `@8` decoration, so the
-        // name and the real ABI disagree — the case stackCleanupBytes exists for. Gothic's
-        // SystemPack/Union detours the call site (0x43A942) to push the extra dword and jump
-        // back, so the caller pushes 12 and a RET 8 leaves 4 bytes behind: every local in the
-        // caller's frame then shifts and the fault lands in unrelated code.
-        makeFunc("_BinkSetVolume@8", 3, { stackCleanupBytes: 12 }),
+        makeFunc("_BinkSetVolume@8", 2),          // pre-1.9: handle, volume
         makeFunc("_BinkSetPan@12", 3),            // handle, trackid, pan
         makeFunc("_BinkSetSoundOnOff@8", 2),      // handle, onoff
         makeFunc("_BinkSetSoundTrack@8", 2),      // tracks, trackIds
