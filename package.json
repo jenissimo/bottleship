@@ -4,6 +4,7 @@
   "type": "module",
   "workspaces": ["packages/*"],
   "scripts": {
+    "prepare": "git config core.hooksPath .githooks 2>/dev/null || true",
     "prebuild": "bun run generate-reference-argcounts && bun run generate-indexes",
     "predev": "bun run generate-reference-argcounts && bun run generate-indexes",
     "dev": "bunx --bun vite",

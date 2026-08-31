@@ -1,0 +1,66 @@
+#!/bin/sh
+#
+# Refuse a push whose submodule gitlinks are not on the submodule's remote yet.
+#
+# Pushing the parent before the submodule leaves a gitlink no clone can resolve: CI's checkout
+# fetches the submodule, does not find the commit, asks for the bare SHA and is refused
+# ("remote error: upload-pack: not our ref"), and every job dies before its first real step.
+# The evidence points at CI, but the cause is here — an ordering mistake made at push time.
+#
+# Bypass with `git push --no-verify` when that is genuinely what you mean.
+
+set -u
+
+fail=0
+zero=$(git hash-object --stdin </dev/null | tr '0-9a-f' '0')
+
+# Commits this push would publish (skip branch deletions).
+pushed=$(while read -r _local_ref local_sha _remote_ref _remote_sha; do
+    [ "$local_sha" = "$zero" ] || printf '%s\n' "$local_sha"
+done)
+[ -n "$pushed" ] || exit 0
+
+# Every submodule this repo declares, not a hardcoded vendor/v86.
+paths=$(git config -f .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null | cut -d' ' -f2-)
+[ -n "$paths" ] || exit 0
+
+for path in $paths; do
+    links=$(for sha in $pushed; do
+        git ls-tree "$sha" -- "$path" 2>/dev/null | awk '$2 == "commit" { print $3 }'
+    done | sort -u)
+    [ -n "$links" ] || continue
+
+    if [ ! -e "$path/.git" ]; then
+        echo "pre-push: $path is not checked out — cannot verify its gitlink is pushed." >&2
+        continue
+    fi
+
+    if ! git -C "$path" fetch --quiet origin 2>/dev/null; then
+        echo "pre-push: could not reach $path's remote — gitlink NOT verified." >&2
+        continue
+    fi
+
+    refs=$(git -C "$path" for-each-ref --format='%(refname)' refs/remotes/origin)
+    for link in $links; do
+        found=0
+        for ref in $refs; do
+            if git -C "$path" merge-base --is-ancestor "$link" "$ref" 2>/dev/null; then
+                found=1
+                break
+            fi
+        done
+        if [ "$found" = 0 ]; then
+            echo "pre-push: $path gitlink $link is not on its remote." >&2
+            echo "          Push the submodule first:  git -C $path push" >&2
+            fail=1
+        fi
+    done
+done
+
+[ "$fail" = 0 ] || {
+    echo "" >&2
+    echo "Refusing the push: a clone of this commit could not resolve the submodule above," >&2
+    echo "and CI would fail at checkout before running anything." >&2
+    exit 1
+}
+exit 0

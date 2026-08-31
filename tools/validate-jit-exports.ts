@@ -139,7 +139,21 @@ let how = "";
 if (trackedAndClean) {
     const wasmCommit = commitTime(wasmRepo, wasmRel);
     const rustCommit = Math.max(...rustRel.map(d => commitTime(wasmRepo, d)));
-    stale = wasmCommit > 0 && rustCommit > wasmCommit;
+    // Commit order is only a question a FULL history can answer. In a shallow clone the tip
+    // has no parent, so `git log -1 -- <path>` dates EVERY path to that one commit: both sides
+    // read the same number, `rust > wasm` is false for any input, and the check reports OK
+    // without being able to report anything else. (A commit-less path reads 0 for the same
+    // reason.) Refuse rather than reassure — the rule this whole block exists for.
+    const shallow = git(wasmRepo, ["rev-parse", "--is-shallow-repository"]) === "true";
+    if (shallow || wasmCommit === 0 || rustCommit === 0) {
+        console.error(`[validate-jit-exports] FAIL: cannot date ${WASM} against its sources.`);
+        console.error(`  ${wasmRepo} is ${shallow ? "a SHALLOW clone — every path dates to the tip commit" : "reporting no commit for one of these paths"}`
+            + ` (artifact=${wasmCommit}, sources=${rustCommit}).`);
+        console.error("  Fetch the submodule at full depth (CI: fetch-depth: 0). Under a truncated");
+        console.error("  history this comparison cannot fail, which is worse than not running it.");
+        process.exit(1);
+    }
+    stale = rustCommit > wasmCommit;
     how = `the artifact's commit predates the Rust sources' (${wasmCommit} < ${rustCommit})`;
 } else {
     let newestRust = 0;

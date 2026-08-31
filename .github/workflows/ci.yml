@@ -22,11 +22,18 @@ jobs:
       # cache key below is meaningful.
       NAGA_VERSION: "30.0.1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # vendor/v86 is a file: dependency of package.json — bun install needs
           # the submodule checked out even though the gate never builds it.
           submodules: true
+          # NOT the default depth of 1. checkout passes fetch-depth straight through as
+          # `git submodule update --depth=N`, and a shallow submodule fetch brings only the
+          # submodule's DEFAULT branch (master); our gitlink lives on `bottleship`, so checkout
+          # falls back to asking for the bare SHA and the server refuses it ("not our ref").
+          # Full depth also gives validate-jit-exports the submodule history its staleness
+          # check reads — shallow, that check finds no commits and passes vacuously.
+          fetch-depth: 0
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -37,7 +44,7 @@ jobs:
 
       - name: Cache offline WGSL validator
         id: naga-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/naga
           key: naga-cli-${{ env.NAGA_VERSION }}-${{ runner.os }}
@@ -60,9 +67,11 @@ jobs:
     # Advisory only — findings are triage input (release-triage §11.1), not a gate.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
+          # Same submodule contract as the gate job above.
           submodules: true
+          fetch-depth: 0
 
       - uses: oven-sh/setup-bun@v2
         with:
