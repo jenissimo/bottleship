@@ -484,7 +484,9 @@ export class PELoader {
         // Blade.exe!GetStringValue), and an unregistered EXE gets those slots trapped.
         let exeModuleForHle: LoadedPEModule | null = null;
         if (this.moduleRegistry) {
-            const exeName = system.executableName.toLowerCase().replace(/\.exe$/, '');
+            // Registered under the file name it maps, extension included: the registry keys
+            // on that, and a game that ships XIII.exe next to Xiii.dll has two modules.
+            const exeName = system.executableName.toLowerCase();
             const { exports: exeExports, ordinals: exeOrdinals } = this.parseExportTable(peData, baseAddress);
             if (exeExports.size > 0 || exeOrdinals.size > 0) {
                 Logger.log(LogCategory.SYSTEM,

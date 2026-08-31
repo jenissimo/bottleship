@@ -82,15 +82,24 @@ export class ModuleRegistry {
     /** VA returned by unregister(), first-fit reusable. See allocateBase. */
     private freeDllRanges: Array<{ base: number; size: number }> = [];
 
-    /** A module is identified by the FILE it maps, so the key is the basename — a load
-     *  through a full path and a later import of the bare name are the same module.
-     *  Keying on the caller's spelling instead loads a second copy of the image, and the
-     *  two copies then have separate statics: Hitman's gsc.dll registered its script host
-     *  in "c:\gsc" while hitmandlc.dlc called getHostInterface() on "gsc" and got NULL. */
+    /** A module is identified by the FILE it maps, so the key is the basename WITH its
+     *  extension — a load through a full path and a later import of the bare name are the
+     *  same module, but XIII.exe and Xiii.dll are two. Keying on the caller's spelling
+     *  instead loads a second copy of the image, and the two copies then have separate
+     *  statics: Hitman's gsc.dll registered its script host in "c:\gsc" while
+     *  hitmandlc.dlc called getHostInterface() on "gsc" and got NULL. Dropping the
+     *  extension collides an EXE with a DLL of the same name, which is the other half:
+     *  the import of `Xiii.dll` resolved to XIII.exe and every slot got the trap stub.
+     *
+     *  An extensionless name means ".dll" — the rule LoadLibrary/GetModuleHandle
+     *  document, and the one findDllPath already applies to the VFS lookup. */
     private normalizeModuleLookupKey(name: string): string {
         const lower = name.toLowerCase();
         const cut = Math.max(lower.lastIndexOf('/'), lower.lastIndexOf('\\'));
-        return (cut >= 0 ? lower.slice(cut + 1) : lower).replace(/\.(dll|exe)$/i, '');
+        const base = cut >= 0 ? lower.slice(cut + 1) : lower;
+        // A trailing "." is Win32's "this name has no extension, do not append one".
+        if (base.endsWith('.')) return base.slice(0, -1);
+        return /\.\w+$/.test(base) ? base : `${base}.dll`;
     }
 
     /**
@@ -138,18 +147,10 @@ export class ModuleRegistry {
      * Get module by name (case-insensitive, handles .dll extension)
      */
     getByName(name: string): LoadedPEModule | undefined {
-        const nameLower = name.toLowerCase();
-        // A ".dll" request must not resolve to the main EXE. The EXE is keyed by its
-        // bare basename (e.g. "hl" from hl.exe), which collides with a game DLL of the
-        // same basename ("hl.dll" → "hl"). Without this guard, LoadLibrary("…\hl.dll")
-        // returned the exe at 0x400000 and GetProcAddress("GiveFnptrsToDll") failed.
-        const wantsDll = /\.dll$/i.test(nameLower);
-        const acceptable = (m: LoadedPEModule | undefined): LoadedPEModule | undefined =>
-            (m && !(wantsDll && m.isExecutable)) ? m : undefined;
-
-        // The key is already the basename, so a full-path request ("c:\system\engine.dll")
-        // and an import-table one ("engine.dll") land on the same entry.
-        return acceptable(this.modules.get(this.normalizeModuleLookupKey(nameLower)));
+        // The key is the basename with its extension, so a full-path request
+        // ("c:\system\engine.dll") and an import-table one ("engine.dll") land on the same
+        // entry, while "hl.dll" / "xiii.dll" cannot reach the hl.exe / XIII.exe module.
+        return this.modules.get(this.normalizeModuleLookupKey(name));
     }
 
     /**
