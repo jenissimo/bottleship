@@ -315,6 +315,8 @@ export interface PeExports {
     ordinals: Map<number, string | null>;
     /** Export name → forwarder string ("NTDLL.RtlAllocateHeap") for forwarded exports. */
     forwarders: Map<string, string>;
+    /** Export name → the RVA of its body. Empty for a forwarder (there is no local body). */
+    addresses: Map<string, number>;
     /** A declared table ran past the image or past the 16-bit ordinal space and was clamped. */
     truncated?: boolean;
 }
@@ -325,7 +327,9 @@ const MAX_EXPORT_ENTRIES = 0x10000;
 /** Parse the export directory of an on-disk image (names, ordinals, forwarders). */
 export function parsePeExports(image: Uint8Array, headers?: PeHeaders | null): PeExports {
     const h = headers ?? readPeHeaders(image);
-    const out: PeExports = { dllName: "", names: new Set(), ordinals: new Map(), forwarders: new Map() };
+    const out: PeExports = {
+        dllName: "", names: new Set(), ordinals: new Map(), forwarders: new Map(), addresses: new Map(),
+    };
     if (!h) return out;
     const dir = h.dataDirectories[DIR_EXPORT];
     if (!dir || !dir.rva) return out;
@@ -383,6 +387,8 @@ export function parsePeExports(image: Uint8Array, headers?: PeHeaders | null): P
             if (inExportDir(target)) {
                 const fwdOff = rvaToFileOffset(h, target);
                 if (fwdOff !== null) out.forwarders.set(name, readCString(image, fwdOff));
+            } else if (target !== 0) {
+                out.addresses.set(name, target);
             }
         }
     }
@@ -476,3 +482,268 @@ export const PE_DATA_DIRECTORY = {
     IAT: DIR_IAT,
     DELAY_IMPORT: DIR_DELAY_IMPORT,
 } as const;
+
+/** Prefix bytes that may precede an opcode: operand/address size, lock, rep, segment. */
+const X86_PREFIXES = new Set([0x66, 0x67, 0xf0, 0xf2, 0xf3, 0x2e, 0x36, 0x3e, 0x26, 0x64, 0x65]);
+
+/** Immediate shapes, sized against the operand/address-size prefixes at decode time. */
+const IMM_NONE = 0;
+const IMM_B = 1;      // imm8
+const IMM_W = 2;      // imm16 — RET/RETF only
+const IMM_Z = 3;      // imm32, imm16 under 0x66
+const IMM_PTR = 4;    // ptr16:32 far target
+const IMM_MOFFS = 5;  // absolute address, address-size wide
+const IMM_ENTER = 6;  // imm16 + imm8
+const IMM_GRP3 = 7;   // F6/F7: an immediate only for the two TEST forms
+
+interface OpTraits { modrm: boolean; imm: number }
+
+function opTraits(modrm: boolean, imm: number): OpTraits {
+    return { modrm, imm };
+}
+
+/** One-byte opcodes. Null = not modelled, which the walk must treat as "stop". */
+function traitsOneByte(code: number): OpTraits | null {
+    if (code < 0x40) {
+        // ALU block; the segment-override bytes and 0x0F never reach here.
+        const lo = code & 7;
+        if (lo <= 3) return opTraits(true, IMM_NONE);
+        if (lo === 4) return opTraits(false, IMM_B);
+        if (lo === 5) return opTraits(false, IMM_Z);
+        return opTraits(false, IMM_NONE);                             // push/pop seg, daa/das/aaa/aas
+    }
+    if (code <= 0x61) return opTraits(false, IMM_NONE);               // inc/dec, push/pop r32, pusha/popa
+    if (code === 0x62 || code === 0x63) return opTraits(true, IMM_NONE);
+    if (code === 0x68) return opTraits(false, IMM_Z);
+    if (code === 0x69) return opTraits(true, IMM_Z);
+    if (code === 0x6a) return opTraits(false, IMM_B);
+    if (code === 0x6b) return opTraits(true, IMM_B);
+    if (code <= 0x6f) return opTraits(false, IMM_NONE);               // ins/outs
+    if (code <= 0x7f) return opTraits(false, IMM_B);                  // jcc rel8
+    if (code === 0x81) return opTraits(true, IMM_Z);
+    if (code <= 0x83) return opTraits(true, IMM_B);                   // 80/82/83 grp1 Ib
+    if (code <= 0x8f) return opTraits(true, IMM_NONE);                // test/xchg/mov/lea/pop Ev
+    if (code === 0x9a) return opTraits(false, IMM_PTR);
+    if (code <= 0x9f) return opTraits(false, IMM_NONE);               // xchg eAX, cwde/cdq, pushf/popf
+    if (code <= 0xa3) return opTraits(false, IMM_MOFFS);
+    if (code <= 0xa7) return opTraits(false, IMM_NONE);               // movs/cmps
+    if (code === 0xa8) return opTraits(false, IMM_B);
+    if (code === 0xa9) return opTraits(false, IMM_Z);
+    if (code <= 0xaf) return opTraits(false, IMM_NONE);               // stos/lods/scas
+    if (code <= 0xb7) return opTraits(false, IMM_B);                  // mov r8, Ib
+    if (code <= 0xbf) return opTraits(false, IMM_Z);                  // mov r32, Iv
+    if (code <= 0xc1) return opTraits(true, IMM_B);                   // shift grp2, Ib
+    if (code === 0xc2 || code === 0xca) return opTraits(false, IMM_W);
+    if (code === 0xc3 || code === 0xcb) return opTraits(false, IMM_NONE);
+    if (code === 0xc4 || code === 0xc5) return opTraits(true, IMM_NONE);   // les/lds
+    if (code === 0xc6) return opTraits(true, IMM_B);
+    if (code === 0xc7) return opTraits(true, IMM_Z);
+    if (code === 0xc8) return opTraits(false, IMM_ENTER);
+    if (code === 0xcd) return opTraits(false, IMM_B);                 // int Ib
+    if (code === 0xc9 || code === 0xcc || code === 0xce || code === 0xcf) return opTraits(false, IMM_NONE);
+    if (code <= 0xd3) return opTraits(true, IMM_NONE);                // shift grp2, 1/CL
+    if (code === 0xd4 || code === 0xd5) return opTraits(false, IMM_B);     // aam/aad
+    if (code === 0xd7) return opTraits(false, IMM_NONE);              // xlat
+    if (code >= 0xd8 && code <= 0xdf) return opTraits(true, IMM_NONE);     // x87 escapes
+    if (code >= 0xe0 && code <= 0xe7) return opTraits(false, IMM_B);  // loop/jecxz, in/out Ib
+    if (code === 0xe8 || code === 0xe9) return opTraits(false, IMM_Z);     // call/jmp rel32
+    if (code === 0xea) return opTraits(false, IMM_PTR);
+    if (code === 0xeb) return opTraits(false, IMM_B);                 // jmp rel8
+    if (code >= 0xec && code <= 0xef) return opTraits(false, IMM_NONE);    // in/out DX
+    if (code === 0xf1 || code === 0xf4 || code === 0xf5) return opTraits(false, IMM_NONE);
+    if (code === 0xf6 || code === 0xf7) return opTraits(true, IMM_GRP3);
+    if (code >= 0xf8 && code <= 0xfd) return opTraits(false, IMM_NONE);    // flag setters
+    if (code === 0xfe || code === 0xff) return opTraits(true, IMM_NONE);   // grp4/grp5
+    return null;                                                      // 0xd6 (SALC) and any gap
+}
+
+/** Two-byte opcodes (after 0x0F). The 0x38/0x3A three-byte escapes are the caller's. */
+function traitsTwoByte(code: number): OpTraits | null {
+    if (code <= 0x03) return opTraits(true, IMM_NONE);                // grp6/grp7, lar/lsl
+    if (code >= 0x05 && code <= 0x09) return opTraits(false, IMM_NONE);
+    if (code === 0x0b || code === 0x0e) return opTraits(false, IMM_NONE);  // ud2, femms
+    if (code === 0x0d) return opTraits(true, IMM_NONE);               // prefetch
+    if (code >= 0x10 && code <= 0x2f) return opTraits(true, IMM_NONE);     // SSE moves, hints, cr/dr
+    if (code >= 0x30 && code <= 0x37) return opTraits(false, IMM_NONE);    // rdtsc/rdmsr/cpuid-adjacent
+    if (code >= 0x40 && code <= 0x6f) return opTraits(true, IMM_NONE);     // cmovcc, MMX/SSE
+    if (code >= 0x70 && code <= 0x73) return opTraits(true, IMM_B);   // pshuf*, shift-imm groups
+    if (code >= 0x74 && code <= 0x76) return opTraits(true, IMM_NONE);
+    if (code === 0x77) return opTraits(false, IMM_NONE);              // emms
+    if (code === 0x78 || code === 0x79) return opTraits(true, IMM_NONE);
+    if (code >= 0x7c && code <= 0x7f) return opTraits(true, IMM_NONE);
+    if (code >= 0x80 && code <= 0x8f) return opTraits(false, IMM_Z);  // jcc rel32
+    if (code >= 0x90 && code <= 0x9f) return opTraits(true, IMM_NONE);     // setcc
+    if (code === 0xa4 || code === 0xac) return opTraits(true, IMM_B);      // shld/shrd Ib
+    if (code === 0xba) return opTraits(true, IMM_B);                  // grp8 bt* Ib
+    if (code === 0xc2) return opTraits(true, IMM_B);                  // cmpps
+    if (code >= 0xc4 && code <= 0xc6) return opTraits(true, IMM_B);   // pinsrw/pextrw/shufps
+    if (code >= 0xa0 && code <= 0xa2) return opTraits(false, IMM_NONE);    // push/pop fs, cpuid
+    if (code === 0xa8 || code === 0xa9 || code === 0xaa) return opTraits(false, IMM_NONE);
+    if (code >= 0xa3 && code <= 0xc1) return opTraits(true, IMM_NONE);     // bt*, imul, xadd, movzx
+    if (code === 0xc3 || code === 0xc7) return opTraits(true, IMM_NONE);   // movnti, grp9
+    if (code >= 0xc8 && code <= 0xcf) return opTraits(false, IMM_NONE);    // bswap
+    if (code >= 0xd0) return opTraits(true, IMM_NONE);                // MMX/SSE arithmetic
+    return null;
+}
+
+/**
+ * Length of a ModRM byte plus its SIB and displacement.
+ *
+ * 16-bit addressing (a 0x67 prefix) uses a different table entirely; refusing it keeps one
+ * encoding model rather than a second, never-exercised one.
+ */
+function modrmLength(image: Uint8Array, at: number, limit: number, addr16: boolean): number | null {
+    if (at >= limit || addr16) return null;
+    const modrm = image[at];
+    const mod = modrm >> 6;
+    const rm = modrm & 7;
+    if (mod === 3) return 1;
+    let len = 1;
+    let base = rm;
+    if (rm === 4) {
+        if (at + 1 >= limit) return null;
+        base = image[at + 1] & 7;
+        len += 1;
+    }
+    if (mod === 1) return len + 1;
+    if (mod === 2) return len + 4;
+    return base === 5 ? len + 4 : len;   // mod=00 with base/rm=101 → disp32 supplies the base
+}
+
+/**
+ * Decode one instruction's LENGTH, and whether it is a near return.
+ *
+ * Length is the whole point: it keeps the walk on instruction boundaries, so a `C2`/`C3`
+ * that is really an immediate, a displacement or a ModRM byte is never mistaken for a
+ * return. An unrecognised opcode returns null — guessing a length would resynchronise the
+ * stream onto whatever byte followed, which is the failure this decoder exists to avoid.
+ */
+function decodeInstruction(image: Uint8Array, start: number): { len: number; retPops: number | null } | null {
+    const limit = image.length;
+    let p = start;
+    let opsize16 = false;
+    let addr16 = false;
+    for (let seen = 0; p < limit && X86_PREFIXES.has(image[p]); seen++) {
+        if (seen >= 4) return null;      // more prefixes than any real encoding carries
+        if (image[p] === 0x66) opsize16 = true;
+        else if (image[p] === 0x67) addr16 = true;
+        p++;
+    }
+    if (p >= limit) return null;
+    const code = image[p++];
+    let traits: OpTraits | null;
+    if (code === 0x0f) {
+        if (p >= limit) return null;
+        const code2 = image[p++];
+        if (code2 === 0x38 || code2 === 0x3a) {
+            if (p >= limit) return null;
+            p++;                          // three-byte escape carries one more opcode byte
+            traits = opTraits(true, code2 === 0x3a ? IMM_B : IMM_NONE);
+        } else {
+            traits = traitsTwoByte(code2);
+        }
+    } else {
+        traits = traitsOneByte(code);
+    }
+    if (!traits) return null;
+
+    let regField = 0;
+    if (traits.modrm) {
+        if (p >= limit) return null;
+        regField = (image[p] >> 3) & 7;
+        const mlen = modrmLength(image, p, limit, addr16);
+        if (mlen === null) return null;
+        p += mlen;
+    }
+
+    let immLen: number;
+    switch (traits.imm) {
+        case IMM_NONE: immLen = 0; break;
+        case IMM_B: immLen = 1; break;
+        case IMM_W: immLen = 2; break;
+        case IMM_Z: immLen = opsize16 ? 2 : 4; break;
+        case IMM_PTR: immLen = (opsize16 ? 2 : 4) + 2; break;
+        case IMM_MOFFS: immLen = addr16 ? 2 : 4; break;
+        case IMM_ENTER: immLen = 3; break;
+        // F6/F7 reg=0/1 are TEST Eb,Ib / TEST Ev,Iz; the other six forms carry no immediate.
+        case IMM_GRP3: immLen = regField <= 1 ? (code === 0xf6 ? 1 : (opsize16 ? 2 : 4)) : 0; break;
+        default: return null;
+    }
+    p += immLen;
+    if (p > limit) return null;
+
+    const retPops = code === 0xc3 ? 0
+        : code === 0xc2 ? (image[p - 2] | (image[p - 1] << 8))
+        : null;
+    return { len: p - start, retPops };
+}
+
+/**
+ * File offset of an export's real body, following at most one entry jump thunk.
+ *
+ * A hot-patched or shimmed export starts with a jump to the code that answers for it, so
+ * one hop is followed — exactly one, since a chain would be an unbounded walk. `FF 25`
+ * (jmp [abs32]) reads a slot the loader fills, which a file image cannot resolve; it is
+ * refused rather than decoded as the zeroes on disk.
+ */
+function exportBodyOffset(image: Uint8Array, headers: PeHeaders, rva: number): number | null {
+    const off = rvaToFileOffset(headers, rva);
+    if (off === null || off >= image.length) return null;
+    const view = viewOf(image);
+    if (image[off] === 0xff && off + 1 < image.length && image[off + 1] === 0x25) return null;
+    let target: number | null = null;
+    if (image[off] === 0xe9 && off + 5 <= image.length) {
+        target = (rva + 5 + view.getInt32(off + 1, true)) >>> 0;
+    } else if (image[off] === 0xeb && off + 2 <= image.length) {
+        target = (rva + 2 + ((image[off + 1] << 24) >> 24)) >>> 0;
+    }
+    return target === null ? off : rvaToFileOffset(headers, target);
+}
+
+/** Bound on the walk alongside `scanBytes`, so a mis-sized instruction cannot become a
+ *  long spin over a large image. */
+const MAX_DECODED_INSNS = 512;
+
+/**
+ * How many argument bytes does a stdcall export ACTUALLY pop?
+ *
+ * The `@N` in a decorated export name is what the header said when the DLL was built, and
+ * vendors have shipped a changed ABI under the old name: Bink's `_BinkSetVolume@8` is
+ * `(HBINK, volume)` and RET 8 in 0.8i and 1.0v, then `(HBINK, trackid, volume)` and RET 12
+ * in 1.5v — same name, one more argument. Binding a caller of one generation to a stub
+ * built for the other drifts ESP by 4, and the caller's own RET then jumps to whatever
+ * dword the drift exposed, far from anything Bink-shaped.
+ *
+ * The body settles it: every return in a stdcall function pops the same N, so the first one
+ * reached is the whole answer, and an early-out return in the same function carries the
+ * same immediate. Finding it requires DECODING — a byte scan for `C2`/`C3` also matches an
+ * immediate (`mov eax,0xC3`), a displacement (`add edx,imm32`, `call rel32`) or a ModRM
+ * byte, and answers confidently wrong.
+ *
+ * Returns the byte count, 0 for a plain `RET` (nothing popped), or null when the export is
+ * absent or forwarded, its entry is an unresolvable import thunk, an opcode is not
+ * modelled, or no return was reached inside `scanBytes`. Callers must treat null as
+ * "unknown" and say so out loud rather than fall back on the decoration silently.
+ */
+export function readStdcallRetBytes(
+    image: Uint8Array,
+    exportName: string,
+    headers?: PeHeaders | null,
+    scanBytes = 512,
+): number | null {
+    const h = headers ?? readPeHeaders(image);
+    if (!h) return null;
+    const rva = parsePeExports(image, h).addresses.get(exportName);
+    if (rva === undefined) return null;
+    const entry = exportBodyOffset(image, h, rva);
+    if (entry === null) return null;
+    const end = Math.min(entry + scanBytes, image.length);
+    let p = entry;
+    for (let n = 0; p < end && n < MAX_DECODED_INSNS; n++) {
+        const insn = decodeInstruction(image, p);
+        if (!insn || insn.len <= 0) return null;
+        if (insn.retPops !== null) return insn.retPops;
+        p += insn.len;
+    }
+    return null;
+}
