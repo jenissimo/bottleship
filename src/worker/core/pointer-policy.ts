@@ -134,6 +134,16 @@ export function clearExclusiveMouseOwners(): void {
     publish();
 }
 
+/**
+ * Is at least one exclusive-mode DirectInput mouse acquired right now?
+ *
+ * Exclusive acquisition takes the device away from the window: while it is held, Windows
+ * delivers no device-derived WM_MOUSE* to the app (the input path reads this).
+ */
+export function isExclusiveMouseAcquired(): boolean {
+    return facts.exclusiveMouse;
+}
+
 /** Harness readout: the facts and what they derive to, in one place. */
 export function describePointerPolicy(): { facts: PointerFacts; outputs: PointerOutputs; exclusiveMouseOwners: number } {
     return { facts: { ...facts }, outputs: derivePointerOutputs(facts), exclusiveMouseOwners: exclusiveMouseOwners.size };
