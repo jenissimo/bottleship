@@ -33,6 +33,7 @@ import {
     D3DCLEAR_STENCIL,
     DDBLT_DEPTHFILL,
     DDCKEY_COLORSPACE,
+    DDERR_NOCOLORKEYHW,
     DDCKEY_SRCBLT,
     DDCKEY_DESTBLT,
     DDBLT_KEYSRC,
@@ -647,9 +648,22 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
 
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         const low = view.getUint32(lpColorKey, true);
-        // Without DDCKEY_COLORSPACE the key is a single color: dwColorSpaceHighValue
-        // is ignored by DirectDraw (games routinely leave it as stack garbage).
-        const high = (dwFlags & DDCKEY_COLORSPACE) !== 0 ? view.getUint32(lpColorKey + 4, true) : low;
+        // A DirectDraw colour key is ALWAYS a single value. No hardware implemented the
+        // range form: with DDCKEY_COLORSPACE and low != high the call fails outright, and
+        // without the flag dwColorSpaceHighValue is ignored and the key collapses to low
+        // (games routinely leave it as stack garbage). Pinned by Wine's conformance tests
+        // (dlls/ddraw/tests/ddraw1.c) for both src and dest keys.
+        //
+        // Honouring a range instead is not a harmless extra: a title that asked for one
+        // got a refusal on hardware and took another path, while here it silently gets a
+        // key that rejects a whole band of colours.
+        if ((dwFlags & DDCKEY_COLORSPACE) !== 0 && view.getUint32(lpColorKey + 4, true) !== low) {
+            Logger.log(LogCategory.DDRAW,
+                `SetColorKey: range key 0x${low.toString(16)}-0x${view.getUint32(lpColorKey + 4, true).toString(16)} ` +
+                `refused (DDERR_NOCOLORKEYHW) — no DirectDraw hardware supports one`);
+            return DDERR_NOCOLORKEYHW;
+        }
+        const high = low;
 
         if (dwFlags & DDCKEY_SRCBLT) {
             state.srcColorKey = { low, high };

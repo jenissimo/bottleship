@@ -58,6 +58,7 @@ import {
     DDERR_SURFACEBUSY,
     DDSCL_NORMAL,
     DDSD_CAPS, DDSD_WIDTH, DDSD_HEIGHT, DDSD_PIXELFORMAT, DDSD_BACKBUFFERCOUNT,
+    DDSD_CKSRCBLT, DDCKEY_SRCBLT, DDCKEY_DESTBLT, DDCKEY_COLORSPACE, DDERR_NOCOLORKEYHW,
     DDSCAPS_3DDEVICE, DDSCAPS_FLIP, DDSCAPS_COMPLEX, DDSCAPS_SYSTEMMEMORY,
     DDSURFACEDESC2_SIZE, DDSURFACEDESC2_OFFSETS,
     DDPIXELFORMAT_OFFSETS, DDPF_RGB,
@@ -190,6 +191,8 @@ class Scene {
     }
 
     /** X8R8G8B8 in the descriptor's DDPIXELFORMAT slot. */
+    writeKeyDescPixelFormat(descPtr: number): void { this.writeX8R8G8B8(descPtr); }
+
     private writeX8R8G8B8(descPtr: number): void {
         const pf = descPtr + DDSURFACEDESC2_OFFSETS.pixelFormat;
         this.setU32(pf + DDPIXELFORMAT_OFFSETS.size, 32);
@@ -330,6 +333,100 @@ const setupFailure = (name: string, wine: string, e: unknown): ConformanceCheck 
     name, wine, "the assertion runs", `setup failed: ${e instanceof Error ? e.message : String(e)}`, false,
     "the statement was never reached — fix the setup before reading this row as a conformance failure",
 );
+
+/**
+ * A DirectDraw colour key is a single value, never a range — no hardware implemented the
+ * range form. Getting this wrong is invisible from the outside: a title that asked for a
+ * range was REFUSED on the machine it was written for and took another path, while a
+ * permissive implementation hands it a key that silently rejects a whole band of colours.
+ */
+async function assertColorKeyRange(s: Scene, ddraw: number, out: ConformanceCheck[]): Promise<void> {
+    const WINE = "ddraw1.c:10532-10604 test_colorkey_range";
+    const CAPS = DDSCAPS_OFFSCREENPLAIN;
+    /** A create whose desc declares ddckCKSrcBlt low..high; returns the HRESULT. */
+    const createWithKey = async (low: number, high: number): Promise<number> => {
+        const d = s.desc();
+        s.setU32(d + DDSURFACEDESC2_OFFSETS.width, 1);
+        s.setU32(d + DDSURFACEDESC2_OFFSETS.height, 1);
+        s.setU32(d + DDSURFACEDESC2_OFFSETS.caps, CAPS);
+        s.writeKeyDescPixelFormat(d);
+        s.setU32(d + DDSURFACEDESC2_OFFSETS.ddckCKSrcBlt, low);
+        s.setU32(d + DDSURFACEDESC2_OFFSETS.ddckCKSrcBlt + 4, high);
+        s.setU32(d + DDSURFACEDESC2_OFFSETS.flags,
+            DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT | DDSD_PIXELFORMAT | DDSD_CKSRCBLT);
+        const outPtr = s.alloc(4);
+        s.setU32(outPtr, 0);
+        return s.call("IDirectDraw7_CreateSurface", [ddraw, d, outPtr, 0]);
+    };
+
+    try {
+        const ranged = await createWithKey(0x00000000, 0x00000001);
+        out.push(check(
+            "colorKey.createRangeRefused", WINE, hex(DDERR_NOCOLORKEYHW), hex(ranged >>> 0),
+            (ranged >>> 0) === DDERR_NOCOLORKEYHW,
+            "CreateSurface with DDSD_CKSRCBLT and low != high must fail — no surface is created",
+        ));
+
+        const single = await createWithKey(0x00000000, 0x00000000);
+        out.push(check(
+            "colorKey.createSingleAccepted", WINE, hex(DD_OK), hex(single >>> 0),
+            (single >>> 0) === DD_OK,
+            "the control: the same create with low == high must still succeed",
+        ));
+
+        const surface = await s.createSurface(ddraw, CAPS, 1, 1);
+        const key = s.alloc(8);
+
+        // Without DDCKEY_COLORSPACE the high dword is IGNORED, not honoured: the key
+        // collapses to low and the call succeeds.
+        s.setU32(key, 0x00000000);
+        s.setU32(key + 4, 0x00000001);
+        const collapsed = await s.call("IDirectDrawSurface7_SetColorKey", [surface, DDCKEY_SRCBLT, key]);
+        s.setU32(key, 0xdeadbeef);
+        s.setU32(key + 4, 0xdeadbeef);
+        await s.call("IDirectDrawSurface7_GetColorKey", [surface, DDCKEY_SRCBLT, key]);
+        const readLow = s.u32(key), readHigh = s.u32(key + 4);
+        out.push(check(
+            "colorKey.setRangeCollapses", WINE, `${hex(DD_OK)} then 0x0-0x0`,
+            `${hex(collapsed >>> 0)} then ${hex(readLow)}-${hex(readHigh)}`,
+            (collapsed >>> 0) === DD_OK && readLow === 0 && readHigh === 0,
+            "a range passed WITHOUT DDCKEY_COLORSPACE is accepted and collapsed to low",
+        ));
+
+        // With the flag, the same range is refused — for src and for dest alike.
+        s.setU32(key, 0x00000001);
+        s.setU32(key + 4, 0x00000000);
+        const srcRanged = await s.call(
+            "IDirectDrawSurface7_SetColorKey", [surface, DDCKEY_SRCBLT | DDCKEY_COLORSPACE, key]);
+        out.push(check(
+            "colorKey.srcColorspaceRangeRefused", WINE, hex(DDERR_NOCOLORKEYHW), hex(srcRanged >>> 0),
+            (srcRanged >>> 0) === DDERR_NOCOLORKEYHW,
+            "DDCKEY_SRCBLT|DDCKEY_COLORSPACE with low != high has no hardware behind it",
+        ));
+
+        const destRanged = await s.call(
+            "IDirectDrawSurface7_SetColorKey", [surface, DDCKEY_DESTBLT | DDCKEY_COLORSPACE, key]);
+        out.push(check(
+            "colorKey.destColorspaceRangeRefused", WINE, hex(DDERR_NOCOLORKEYHW), hex(destRanged >>> 0),
+            (destRanged >>> 0) === DDERR_NOCOLORKEYHW,
+            "range DESTINATION keys do not work either",
+        ));
+
+        // The flag on a SINGLE value is simply ignored — the refusal is about the range,
+        // not about the flag, and a check that cannot tell those apart proves nothing.
+        s.setU32(key, 0x00000000);
+        s.setU32(key + 4, 0x00000000);
+        const singleWithFlag = await s.call(
+            "IDirectDrawSurface7_SetColorKey", [surface, DDCKEY_SRCBLT | DDCKEY_COLORSPACE, key]);
+        out.push(check(
+            "colorKey.colorspaceSingleAccepted", WINE, hex(DD_OK), hex(singleWithFlag >>> 0),
+            (singleWithFlag >>> 0) === DD_OK,
+            "DDCKEY_COLORSPACE is ignored when the key is a single value",
+        ));
+    } catch (e) {
+        out.push(setupFailure("colorKey.createRangeRefused", WINE, e));
+    }
+}
 
 async function assertFlip3d(s: Scene, ddraw: number, d3d: number, out: ConformanceCheck[]): Promise<void> {
     const WINE = "ddraw7.c:20301-20347 test_flip_3d";
@@ -522,6 +619,7 @@ export async function runDDrawConformance(opts: { mutate?: Mutation | null } = {
         await assertSubRect1x1(s, ddraw, checks);
         await assertColorfillFullLock(s, ddraw, checks);
         await assertLockExclusivity(s, ddraw, checks);
+        await assertColorKeyRange(s, ddraw, checks);
 
         const failed = checks.filter((c) => !c.pass).length;
         // Whether a mutation was CAUGHT is a two-run question (clean vs mutated) and is

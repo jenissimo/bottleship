@@ -48,6 +48,9 @@ export type SurfaceDesc = {
     surfacePtr: number;
     pixelFormat: SurfaceFormat | null;
     srcColorKey?: { low: number; high: number };  // ddckCKSrcBlt from DDSURFACEDESC2
+    /** The caller set DDSD_CK*BLT with low != high. No DirectDraw hardware supports a
+     *  range key, so CreateSurface must answer DDERR_NOCOLORKEYHW rather than create it. */
+    colorKeyRangeDeclared?: boolean;
     destColorKey?: { low: number; high: number }; // ddckCKDestBlt from DDSURFACEDESC2
     mipMapCount?: number;      // dwMipMapCount (for textures with mipmaps)
     textureStage?: number;     // dwTextureStage (for multi-texture rendering)
@@ -278,6 +281,9 @@ export const readSurfaceDesc = (mem: Uint8Array, address: number): SurfaceDesc |
     // Read colorkey fields if structure is large enough (DDCOLORKEY = 8 bytes each)
     let srcColorKey: { low: number; high: number } | undefined;
     let destColorKey: { low: number; high: number } | undefined;
+    /** The caller DECLARED a range key. Hardware fails the create; see below. */
+    let srcColorKeyRange = false;
+    let destColorKeyRange = false;
     // DDSD_CK*BLT is what makes the field valid — and it is the ONLY way to state a
     // BLACK key, which is the era's default for sprite sheets. Falling back to
     // "nonzero means present" alone silently drops key=0x0, so a DX2/3 title that
@@ -288,7 +294,13 @@ export const readSurfaceDesc = (mem: Uint8Array, address: number): SurfaceDesc |
         const srcLow = view.getUint32(address + DDSURFACEDESC2_OFFSETS.ddckCKSrcBlt, true);
         const srcHigh = view.getUint32(address + DDSURFACEDESC2_OFFSETS.ddckCKSrcBlt + 4, true);
         if ((flags & DDSD_CKSRCBLT) !== 0 || srcLow !== 0 || srcHigh !== 0) {
-            srcColorKey = { low: srcLow, high: srcHigh };
+            // A colour key is a single value on every DirectDraw implementation, so the
+            // key we carry is always degenerate — see the range note in SetColorKey. The
+            // DECLARED range is kept separately because CreateSurface must refuse it, and
+            // only when the caller actually set the flag: the nonzero fallback above reads
+            // a field the caller never claimed, and stack garbage must not fail a create.
+            srcColorKey = { low: srcLow, high: srcHigh === srcLow ? srcHigh : srcLow };
+            if ((flags & DDSD_CKSRCBLT) !== 0 && srcHigh !== srcLow) srcColorKeyRange = true;
             Logger.verbose(LogCategory.DDRAW,
                 `readSurfaceDesc: Found srcColorKey 0x${srcLow.toString(16)}-0x${srcHigh.toString(16)}`
             );
@@ -298,7 +310,8 @@ export const readSurfaceDesc = (mem: Uint8Array, address: number): SurfaceDesc |
         const destLow = view.getUint32(address + DDSURFACEDESC2_OFFSETS.ddckCKDestBlt, true);
         const destHigh = view.getUint32(address + DDSURFACEDESC2_OFFSETS.ddckCKDestBlt + 4, true);
         if ((flags & DDSD_CKDESTBLT) !== 0 || destLow !== 0 || destHigh !== 0) {
-            destColorKey = { low: destLow, high: destHigh };
+            destColorKey = { low: destLow, high: destHigh === destLow ? destHigh : destLow };
+            if ((flags & DDSD_CKDESTBLT) !== 0 && destHigh !== destLow) destColorKeyRange = true;
             Logger.verbose(LogCategory.DDRAW,
                 `readSurfaceDesc: Found destColorKey 0x${destLow.toString(16)}-0x${destHigh.toString(16)}`
             );
@@ -320,6 +333,7 @@ export const readSurfaceDesc = (mem: Uint8Array, address: number): SurfaceDesc |
         pixelFormat,
         srcColorKey,
         destColorKey,
+        colorKeyRangeDeclared: srcColorKeyRange || destColorKeyRange ? true : undefined,
         mipMapCount: mipMapCount !== undefined && mipMapCount !== 0 ? mipMapCount : undefined,
         textureStage: textureStage !== undefined ? textureStage : undefined,
         alphaBitDepth: alphaBitDepth !== undefined && alphaBitDepth !== 0 ? alphaBitDepth : undefined,

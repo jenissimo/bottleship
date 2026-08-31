@@ -92,6 +92,7 @@ import {
     DDSCAPS_OFFSCREENPLAIN,
     DDSCAPS_LOCALVIDMEM,
     DDSCAPS_FRONTBUFFER,
+    DDERR_NOCOLORKEYHW,
 } from "./constants";
 import { bytesToGuid, surfaceAt } from "./helpers";
 import { resolveDDrawTearOff } from "./com-tearoff";
@@ -336,6 +337,19 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         if (!rawDesc) {
             view.setUint32(lplpSurf, 0, true);
             return E_INVALIDARG;
+        }
+
+        // A range colour key fails the CREATE on hardware — no surface, no handle — and a
+        // caller that asked for one has already been told to take another path. Answering
+        // DD_OK with a collapsed key hands it a surface it never got on the machine it was
+        // written for. (Wine dlls/ddraw/tests/ddraw1.c pins this for DDSCAPS_TEXTURE and
+        // DDSCAPS_OFFSCREENPLAIN alike.)
+        if (rawDesc.colorKeyRangeDeclared) {
+            Logger.log(LogCategory.DDRAW,
+                `CreateSurface: refused — DDSD_CK*BLT declared a range colour key ` +
+                `(DDERR_NOCOLORKEYHW); no DirectDraw hardware supports one`);
+            view.setUint32(lplpSurf, 0, true);
+            return DDERR_NOCOLORKEYHW;
         }
 
         if (lpDesc && (rawDesc.flags & DDSD_PIXELFORMAT) !== 0) {
