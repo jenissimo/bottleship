@@ -39,11 +39,11 @@ interface ImportRow {
     expected: string;
 }
 
-/** Walk one image's import table, calling `visit` per named import. */
+/** Walk one image's import table, calling `visit` per import (`ord_N` when by ordinal). */
 function walkImports(
     view: DataView,
     base: number,
-    visit: (dll: string, name: string, iatAddr: number) => void,
+    visit: (dll: string, name: string, iatAddr: number, byOrdinal: boolean) => void,
 ): boolean {
     const at = (a: number): number => view.getUint32(a, true) >>> 0;
     const str = (a: number): string => {
@@ -73,8 +73,8 @@ function walkImports(
         for (; ; ilt += 4, iat += 4) {
             const entry = at(ilt);
             if (!entry) break;
-            if (entry & 0x80000000) continue; // by ordinal — no name to compare on
-            visit(dll, str(base + entry + 2), iat);
+            if (entry & 0x80000000) visit(dll, `ord_${entry & 0xffff}`, iat, true);
+            else visit(dll, str(base + entry + 2), iat, false);
         }
     }
     return true;
@@ -101,7 +101,8 @@ export function registerImportCommands(svc: HarnessService): void {
         const diverged: ImportRow[] = [];
 
         for (const image of images) {
-            const ok = walkImports(view, image.base, (rawDll, name, iatAddr) => {
+            const ok = walkImports(view, image.base, (rawDll, name, iatAddr, byOrdinal) => {
+                if (byOrdinal) return; // no name to compare an address against
                 const dll = resolveThunkedDllAlias(rawDll.toLowerCase().replace(/\.dll$/i, ""));
                 if (!api.hasModule(dll)) return; // a real DLL's import — not ours to compare
                 imports++;
@@ -153,6 +154,200 @@ export function registerImportCommands(svc: HarnessService): void {
                 ? "every thunked import points at the one address its export has — an IAT-hooking wrapper can find its slot"
                 : "these imports are bound to a DIFFERENT stub of the same export than the export itself has; "
                     + "an IAT hook that matches by address installs nothing and says nothing",
+        };
+    });
+}
+
+export function registerTrapImportCommand(svc: HarnessService): void {
+    /**
+     * trapImports() — which imports resolved to NOTHING?
+     *
+     * The loader binds an import it could not resolve to one shared UD2 stub, so the
+     * failure is silent until the guest calls the slot — and then it is an illegal
+     * instruction in whatever ran first, typically a static constructor, with the
+     * unresolved name nowhere in the crash. XIII bound every `Xiii.dll` import that way
+     * (the EXE owned its registry key) and died in xidpawn.dll's ctors.
+     *
+     * Bundle-agnostic, and cheap: one walk of every loaded image's import table. A
+     * shipped title should read 0 — a real export the game imports and never gets is a
+     * bug on OUR side of the loader, not a licence for the game to be careful.
+     */
+    svc.register("trapImports", (args) => {
+        const limit = typeof args[0] === "number" ? Math.max(1, args[0] as number) : 40;
+        const process = sys().process;
+        const mem = process?.getCurrentMemory?.();
+        const registry = process?.moduleRegistry;
+        if (!mem || !registry) return { error: "no process" };
+        const generator = (process!.dispatcher as any)?.thunkGenerator;
+        const trap = generator?.getTrapStubAddress?.() >>> 0;
+        // Without the trap address every slot compares unequal and the audit reads clean
+        // for the one reason it cannot see anything.
+        if (!trap) return { error: "no trap stub address — the audit would report 0 either way" };
+
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const images = (registry.getAllModules?.() ?? [])
+            .map((m: any) => ({ name: m.name as string, base: m.baseAddress >>> 0 }));
+
+        let imports = 0, trapped = 0, unreadable = 0;
+        const byDll = new Map<string, number>();
+        const rows: Array<{ module: string; dll: string; name: string }> = [];
+        for (const image of images) {
+            const ok = walkImports(view, image.base, (dll, name, iatAddr) => {
+                imports++;
+                if ((view.getUint32(iatAddr, true) >>> 0) !== trap) return;
+                trapped++;
+                byDll.set(dll, (byDll.get(dll) ?? 0) + 1);
+                if (rows.length < limit) rows.push({ module: image.name, dll, name });
+            });
+            if (!ok) unreadable++;
+        }
+
+        return {
+            trapStub: "0x" + trap.toString(16),
+            modules: images.length,
+            unreadable,
+            imports,
+            trapped,
+            byDll: [...byDll].sort((a, b) => b[1] - a[1]),
+            rows,
+            note: trapped === 0
+                ? "every import is bound to something — no slot answers with an illegal instruction"
+                : "these slots hold the shared UD2 trap: calling one is an illegal instruction in the caller, "
+                    + "with the unresolved name nowhere in the crash",
+        };
+    });
+}
+
+export function registerStubCleanupAuditCommand(svc: HarnessService): void {
+    /**
+     * stubCleanupAudit() — does every stub's BAKED `RET N` agree with what the registry
+     * says its export pops, and do the stubs for one export agree with EACH OTHER?
+     *
+     * Three paths emit a stub for the same export (pe-loader's `generateStubDll`,
+     * `export-resolver`'s on-demand allocation, and the synthetic HLE images), each
+     * deciding the RET N independently. A path that reads a different source than the
+     * others bakes a different number into guest code, and nothing downstream can see
+     * it: the guest's ESP just drifts by the difference and its own RET lands on
+     * whatever dword the drift exposed, arbitrarily far from the export involved.
+     * `hle-module-images` read the static descriptor while the other two read the
+     * registry, so a per-shipped-build ABI correction was invisible on exactly the path
+     * a statically-imported DLL uses.
+     *
+     * `disagreeWithRegistry` is the whole-population check. `splitExports` is the one
+     * that names the bug class directly — one `dll:export` whose stubs do not even pop
+     * the same number of bytes as each other — and it is the number that would have
+     * caught this without knowing which path was wrong.
+     *
+     * A `cdecl` stub bakes `C3` and pops nothing by design, so it is counted separately
+     * rather than reported as a disagreement with the registry's argument-byte total.
+     */
+    svc.register("stubCleanupAudit", (args) => {
+        const limit = typeof args[0] === "number" ? Math.max(1, args[0] as number) : 40;
+        const process = sys().process;
+        const mem = process?.getCurrentMemory?.();
+        if (!mem) return { error: "no process" };
+        const generator = (process!.dispatcher as unknown as { thunkGenerator?: unknown })?.thunkGenerator as {
+            addressToStub?: Map<number, { address: number; dllName: string; functionName: string; stackCleanupBytes?: number; redirectedTo?: number }>;
+        } | undefined;
+        // Enumerated by ADDRESS, not by functionId: an alias stub (what the HLE images
+        // publish) reuses its target's id and never enters the id map, so `getAllStubs()`
+        // cannot see the very stubs this audit exists to compare. Refuse rather than
+        // report a clean population that excluded them.
+        const byAddress = generator?.addressToStub;
+        if (!(byAddress instanceof Map)) {
+            return { error: "thunk generator exposes no address→stub map — the alias stubs would be invisible, so 0 findings would not be evidence" };
+        }
+        const api = APIRegistry.getInstance();
+        const hex = (v: number): string => "0x" + (v >>> 0).toString(16);
+
+        interface Row { dll: string; name: string; baked: number | null; registry: number | null; stub: string }
+        const disagree: Row[] = [];
+        const redirected: Row[] = [];
+        // Every stub lands in exactly one bucket, and the buckets sum to `examined` — a
+        // population that does not add up is a population this audit did not fully see.
+        let examined = 0, outOfRange = 0, notAStub = 0, agreeing = 0, cdecl = 0, noRegistryAnswer = 0;
+        let disagreeCount = 0, redirectedCount = 0;
+        /** `dll:export` -> the distinct baked RET values seen for it. */
+        const bakedByExport = new Map<string, Map<number, string[]>>();
+        // Counted from EVERY disagreement, not from the capped sample — a per-dll tally
+        // that stops at `limit` silently under-reports exactly when it matters most.
+        const byDll = new Map<string, number>();
+
+        for (const stub of byAddress.values()) {
+            const addr = stub.address >>> 0;
+            // The stub is 16 bytes: MOV EAX,id (5) + MOV EDX,port (5) + OUT (1) + RET.
+            if (addr === 0 || addr + 16 > mem.length) { outOfRange++; continue; }
+            examined++;
+            const opcode = mem[addr + 11];
+            let baked: number | null = null;
+            if (opcode === 0xc3) baked = 0;
+            else if (opcode === 0xc2) baked = mem[addr + 12] | (mem[addr + 13] << 8);
+            const row: Row = {
+                dll: stub.dllName, name: stub.functionName, baked,
+                registry: api.getStackCleanupBytes(stub.dllName, stub.functionName) ?? null,
+                stub: hex(addr),
+            };
+            // A redirected stub's bytes are a JMP to a trap-free implementation, so there
+            // is no RET N there to compare — reporting it as a mismatch would be noise.
+            if (stub.redirectedTo !== undefined) {
+                redirectedCount++;
+                if (redirected.length < limit) redirected.push(row);
+                continue;
+            }
+            // Byte 11 is neither RET nor RET N: not the stub shape this audit decodes.
+            if (baked === null) { notAStub++; continue; }
+
+            const key = `${stub.dllName.toLowerCase()}:${stub.functionName.toLowerCase()}`;
+            let seen = bakedByExport.get(key);
+            if (!seen) { seen = new Map<number, string[]>(); bakedByExport.set(key, seen); }
+            const sites = seen.get(baked);
+            if (sites) sites.push(hex(addr));
+            else seen.set(baked, [hex(addr)]);
+
+            if (row.registry === null) { noRegistryAnswer++; continue; }
+            if (baked === 0 && row.registry > 0) { cdecl++; continue; }
+            if (baked === row.registry) { agreeing++; continue; }
+            disagreeCount++;
+            byDll.set(row.dll, (byDll.get(row.dll) ?? 0) + 1);
+            if (disagree.length < limit) disagree.push(row);
+        }
+
+        const split: Array<{ export: string; baked: Array<{ pops: number; stubs: string[] }> }> = [];
+        for (const [name, seen] of bakedByExport) {
+            if (seen.size < 2) continue;
+            if (split.length < limit) {
+                split.push({
+                    export: name,
+                    baked: [...seen].map(([pops, stubs]) => ({ pops, stubs: stubs.slice(0, 8) })),
+                });
+            }
+        }
+        const splitCount = [...bakedByExport.values()].filter((m) => m.size > 1).length;
+
+        const classified = agreeing + cdecl + noRegistryAnswer + redirectedCount + notAStub + disagreeCount;
+        return {
+            stubs: byAddress.size,
+            examined,
+            outOfRange,
+            notAStub,
+            agreeing,
+            cdecl,
+            noRegistryAnswer,
+            /** examined minus every bucket — must be 0, or the audit lost stubs it counted. */
+            unclassified: examined - classified,
+            redirectedCount,
+            redirected,
+            disagreeCount,
+            disagree,
+            byDll: [...byDll].sort((a, b) => b[1] - a[1]),
+            splitCount,
+            splitExports: split,
+            note: splitCount > 0
+                ? "one export has stubs that pop DIFFERENT numbers of bytes: whichever the guest reaches decides "
+                    + "how far its ESP drifts, and the crash lands nowhere near this export"
+                : disagreeCount > 0
+                    ? "these stubs bake a RET N the registry disagrees with — the caller's stack drifts by the difference"
+                    : "every stub pops what the registry says its export pops, and no export has two answers",
         };
     });
 }
