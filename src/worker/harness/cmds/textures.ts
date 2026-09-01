@@ -689,4 +689,45 @@ export function registerTextureCommands(svc: HarnessService): void {
         }
         return out;
     });
+
+    /** vertexConverterCensus({windowMs}) — is the XYZRHW vertex-converter pin holding?
+     *
+     *  Two converters compute the clip-space position of a pre-transformed vertex (a WGSL
+     *  compute shader and a JS mirror of it), and they disagree in the last bits, so a
+     *  coplanar overlay pass that picks the other one z-fights its own base pass. The pin
+     *  keeps every XYZRHW draw on one of them.
+     *
+     *  `rhwGpuConversions` is the invariant: pre-transformed draws that reached the GPU
+     *  converter anyway. It must be 0, and it stays meaningful on a title whose geometry is
+     *  only partly pre-transformed — an ordinary transformed draw taking the GPU path is not
+     *  a defect. `rhwPinnedDraws` is the coverage that makes a zero mean something: a scene
+     *  whose draws all sit below the threshold reports 0 either way. Reports `armed:false`
+     *  rather than a plausible zero when no DDraw executor is live.
+     *
+     *  `gpuConversions` is the converter's own all-FVF total, for context only.
+     *  `gpuToggle('disableRhwCpuPin', true)` lifts the pin and both numbers must move. */
+    svc.register("vertexConverterCensus", async (args) => {
+        const opts = (args[0] ?? {}) as { windowMs?: number };
+        const windowMs = Math.max(0, opts.windowMs ?? 2000);
+        const exec = ddraw()?.context?.executor;
+        if (!exec?.getRhwConverterCounts || !exec?.getVertexScratchStats) {
+            return { armed: false, note: "no live DDraw executor — this census measured nothing" };
+        }
+        const rhwBefore = exec.getRhwConverterCounts();
+        const before = { ...exec.getVertexScratchStats() };
+        if (windowMs > 0) await new Promise((res) => setTimeout(res, windowMs));
+        const rhwAfter = exec.getRhwConverterCounts();
+        const after = { ...exec.getVertexScratchStats() };
+        return {
+            armed: true,
+            windowMs,
+            rhwGpuConversions: rhwAfter.gpuConversions - rhwBefore.gpuConversions,
+            rhwPinnedDraws: rhwAfter.pinnedDraws - rhwBefore.pinnedDraws,
+            gpuConversions: after.conversions - before.conversions,
+            pooledStagings: after.pooled - before.pooled,
+            perDrawStagings: after.perDraw - before.perDraw,
+            note: "rhwGpuConversions must be 0, with rhwPinnedDraws > 0 to show the case was reached. "
+                + "gpuToggle('disableRhwCpuPin', true) lifts the pin and both must move.",
+        };
+    });
 }

@@ -1449,8 +1449,7 @@ export class VertexConverter {
 
                         if (config.hasXYZRHW) {
                             // f32 at every step and in the WGSL's operation order — see the
-                            // matching branch below for why bit-equality with the GPU converter
-                            // is load-bearing (D3DCMP_EQUAL second passes).
+                            // matching branch below.
                             const rhw = memF32[srcIndex + 3];
                             const w = rhw !== 0 ? Math.fround(1.0 / rhw) : 1.0;
                             // +0.5: D3D integer pixel centers -> WebGPU half-integer centers (see WGSL above)
@@ -1525,13 +1524,13 @@ export class VertexConverter {
                 let bnx = 0.0, bny = 0.0, bnz = 0.0;
 
                 if (config.hasXYZRHW) {
-                    // Round after EVERY step, exactly as the WGSL above does. JS arithmetic is
-                    // f64 and would round only once on the store, so the same vertex converted
-                    // here and on the GPU lands on different f32 bits. Depth is then unequal
-                    // between a base pass and a coplanar second pass whose vertex counts put
-                    // them on opposite sides of GPU_VERTEX_THRESHOLD — and D3DCMP_EQUAL, which
-                    // is exactly how a decal/lightmap pass asks "same surface", fails on a
-                    // pixel-dependent subset: a dither grid that crawls as the camera moves.
+                    // Round after EVERY step, exactly as the WGSL above does: f64 arithmetic
+                    // rounding once on the store computes a different f32, and D3D's own
+                    // rasteriser worked in f32 throughout. This does NOT buy bit-equality with
+                    // the GPU converter — WGSL specifies f32 division to 2.5 ULP, so `1/rhw`
+                    // alone puts the two apart — which is why a pre-transformed draw is pinned
+                    // to one converter (ddraw-backend-executor, rhwPinnedDraws) rather than
+                    // left to whichever the vertex count picks.
                     const rhw = srcView.getFloat32(srcBase + 12, true);
                     const w = rhw !== 0 ? Math.fround(1.0 / rhw) : 1.0;
                     // +0.5: D3D integer pixel centers -> WebGPU half-integer centers (see WGSL above)

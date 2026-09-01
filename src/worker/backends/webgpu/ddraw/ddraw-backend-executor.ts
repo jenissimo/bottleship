@@ -937,6 +937,24 @@ export class DDrawWebGPUExecutor {
      *  immediate draws, batch flushes and clears. Armed via armOpLog(); zero overhead
      *  when disarmed (single counter check). Read via dbg.gpuops(). */
     private opLogEntries: string[] = [];
+    /** THE XYZRHW CONVERTER PIN, and the two counters that make it checkable.
+     *
+     *  Only for a pre-transformed position does the vertex converter itself compute the
+     *  clip-space position (screen -> NDC -> * w), and there are two converters — a WGSL
+     *  compute shader and a JS mirror of it — picked per draw by vertex count. They cannot
+     *  agree bit-for-bit however carefully the JS follows the WGSL's operation order: WGSL
+     *  specifies f32 division to 2.5 ULP, and the `* 2 - 1` after it cancels. A title that
+     *  overlays a lightmap/decal pass on the SAME triangles with depth writes off then gets
+     *  unequal depth wherever a base pass and its overlay straddle the threshold, and half
+     *  the pixels fail the test. Transformed and XYZW positions are immune (both converters
+     *  copy them), so the pin is confined to XYZRHW.
+     *
+     *  `rhwPinnedDraws` is COVERAGE: draws the pin actually diverted, so a zero violation
+     *  count can be told apart from a scene that never reached the case. `rhwGpuConversions`
+     *  is the VIOLATION: pre-transformed draws that reached the GPU converter anyway, which
+     *  is the invariant itself and stays meaningful on a title that is not all XYZRHW. */
+    private rhwPinnedDraws = 0;
+    private rhwGpuConversions = 0;
     private opLogArmed = 0;
     private opLogViewIds = new WeakMap<object, number>();
     private opLogViewIdNext = 1;
@@ -948,6 +966,11 @@ export class DDrawWebGPUExecutor {
 
     getOpLog(): string[] {
         return this.opLogEntries;
+    }
+
+    /** Coverage + violation counts for the XYZRHW converter pin (see the fields). */
+    getRhwConverterCounts(): { pinnedDraws: number; gpuConversions: number } {
+        return { pinnedDraws: this.rhwPinnedDraws, gpuConversions: this.rhwGpuConversions };
     }
 
     /** Per-draw call sites MUST test `opLogArmed` themselves before calling: the cost of
@@ -1016,6 +1039,9 @@ export class DDrawWebGPUExecutor {
                 break;
             case "disableRhwDepthClamp":
                 this.debugFlags.disableRhwDepthClamp = enabled;
+                break;
+            case "disableRhwCpuPin":
+                this.debugFlags.disableRhwCpuPin = enabled;
                 break;
             case "forceCullNone":
                 this.debugFlags.forceCullNone = enabled;
@@ -2448,7 +2474,12 @@ export class DDrawWebGPUExecutor {
         // Vertex-blend draws MUST use the CPU converter (the GPU compute shader has no palette);
         // force the threshold to +∞ so the count-based branch below always picks the CPU path.
         const blendActive = !!vertexBlend && vertexBlend.count >= (vertexBlend.indexed ? 1 : 2);
-        const gpuVertexThreshold = (this.debugFlags.forceCpuVertexPath || blendActive) ? Number.MAX_SAFE_INTEGER : GPU_VERTEX_THRESHOLD;
+        // So must a PRE-TRANSFORMED draw, for its own reason — see rhwPinnedDraws.
+        const rhwPosition = (vertexType & D3DFVF_POSITION_MASK) === D3DFVF_XYZRHW;
+        const preTransformed = !this.debugFlags.disableRhwCpuPin && rhwPosition;
+        const gpuVertexThreshold = (this.debugFlags.forceCpuVertexPath || blendActive || preTransformed)
+            ? Number.MAX_SAFE_INTEGER : GPU_VERTEX_THRESHOLD;
+
 
         // Calculate required buffer sizes
         const packedStride = computeFvfStride(vertexType);
@@ -2465,6 +2496,9 @@ export class DDrawWebGPUExecutor {
         // GPU-path draws (count >= GPU_VERTEX_THRESHOLD, non-fan) go to globalVertexBuffer.
         // TriangleFan always uses CPU path (needs expansion).
         const willUseCpuPath = isTriangleFan || count < gpuVertexThreshold;
+        // Coverage: only a draw the pin actually diverted. A fan is CPU-converted on this path
+        // whatever its count, so the pin changed nothing there.
+        if (preTransformed && !isTriangleFan && count >= GPU_VERTEX_THRESHOLD) this.rhwPinnedDraws++;
         const ringVertexBytes = willUseCpuPath ? requiredVertexBytes : 0;
         const storageBytes = megaBatchEnabled ? DEFAULT_STORAGE_BUFFER_CONFIG.slotSize : 0;
 
@@ -2585,6 +2619,9 @@ export class DDrawWebGPUExecutor {
             }
             convertedData = expanded;
         } else if (count >= gpuVertexThreshold) {
+            // A pre-transformed draw reaching the GPU converter IS the defect the pin exists
+            // to prevent; count it whatever put it here, kill switch included.
+            if (rhwPosition) this.rhwGpuConversions++;
             this.ensureGpuVertexConversionBudget(count * OUTPUT_VERTEX_BYTES);
             // The compute converter cannot run inside a render pass, so the pass has to end
             // here — and a batch must not outlive the pass it was opened for. Its draws are
@@ -2912,7 +2949,12 @@ export class DDrawWebGPUExecutor {
         // Vertex-blend draws MUST use the CPU converter (the GPU compute shader has no palette);
         // force the threshold to +∞ so the count-based branch below always picks the CPU path.
         const blendActive = !!vertexBlend && vertexBlend.count >= (vertexBlend.indexed ? 1 : 2);
-        const gpuVertexThreshold = (this.debugFlags.forceCpuVertexPath || blendActive) ? Number.MAX_SAFE_INTEGER : GPU_VERTEX_THRESHOLD;
+        // So must a PRE-TRANSFORMED draw, for its own reason — see rhwPinnedDraws.
+        const rhwPosition = (vertexType & D3DFVF_POSITION_MASK) === D3DFVF_XYZRHW;
+        const preTransformed = !this.debugFlags.disableRhwCpuPin && rhwPosition;
+        const gpuVertexThreshold = (this.debugFlags.forceCpuVertexPath || blendActive || preTransformed)
+            ? Number.MAX_SAFE_INTEGER : GPU_VERTEX_THRESHOLD;
+
 
         const _tIScan = drawCostProfiler.now();
         const packedStride = computeFvfStride(vertexType);
@@ -3000,6 +3042,9 @@ export class DDrawWebGPUExecutor {
             ? Math.min(availableVertexCount, effectiveMaxIdx + 1)
             : availableVertexCount;
         const effectiveVertexBytes = effectiveVCount * OUTPUT_VERTEX_BYTES;
+        // Coverage, against the count the choice is actually made on: vCount is the whole VB
+        // capacity here, while the indices typically reference a small window of it.
+        if (preTransformed && effectiveVCount >= GPU_VERTEX_THRESHOLD) this.rhwPinnedDraws++;
 
         const requiredUniformBytes = this.ringBufferManager.getUniformAlignment();
 
@@ -3085,6 +3130,7 @@ export class DDrawWebGPUExecutor {
         let gpuConversionResult: GpuVertexConversionResult | null = null;
 
         if (effectiveVCount >= gpuVertexThreshold) {
+            if (rhwPosition) this.rhwGpuConversions++;
             this.ensureGpuVertexConversionBudget(effectiveVCount * OUTPUT_VERTEX_BYTES);
             // GPU path requires ending current render pass
             if (this.currentRenderPass) {

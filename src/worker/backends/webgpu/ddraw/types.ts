@@ -90,6 +90,13 @@ export interface DebugFlags {
      *  straddle the plane loses the far half. Takes effect on the next draw — the bit rides
      *  a uniform, so no pipeline or shader is rebuilt. */
     disableRhwDepthClamp: boolean;
+    /** DIAG: let a PRE-TRANSFORMED (XYZRHW) draw pick its vertex converter by count again,
+     *  the way every other draw does. Off by default because the two converters compute the
+     *  clip-space position differently in the last bits, so a base pass and its coplanar
+     *  overlay landing on opposite sides of the threshold disagree on depth. This is the
+     *  positive control for that pin: with it on, the dither grid comes back and the
+     *  converter's GPU conversion counter starts moving again. */
+    disableRhwCpuPin: boolean;
     /** DIAG: render only the first N+1 draws of every frame (-1 = off, render all).
      *  The frame capture numbers draws in the same order, so bisecting this NAMES the draw
      *  that first covers a region — the only way to find which draw wrote the depth (or the
@@ -132,6 +139,7 @@ export const DEFAULT_DEBUG_FLAGS: DebugFlags = {
     forceCpuVertexPath: false,
     forceColorWriteMask: -1,
     disableRhwDepthClamp: false,
+    disableRhwCpuPin: false,
     drawScrubMax: -1,
     drawSkipFrom: -1,
     drawSkipTo: -1,
