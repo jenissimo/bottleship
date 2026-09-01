@@ -78,7 +78,7 @@ Legacy Graphics (DirectDraw, D3D3-9). You bridge x86 Windows internals with mode
     there is no host mechanism that can (no MMU, and the one trapping Proxy we had cost ~50x).
     Do not design as if there were.
   - guest-code.ts is the SINGLE OWNER of cpu["jit_dirty_cache"] — never call it directly;
-    validate-guest-code-writes.ts (gate step 4) enforces that ownership, which is what stops the
+    validate-guest-code-writes.ts (validate-guest-code-writes) enforces that ownership, which is what stops the
     chokepoint eroding back into scattered copies. It checks ownership, not coverage: deciding
     whether `mem[addr+i] = b` targets executable memory needs dataflow, so coverage is enforced
     structurally instead — the two allocators that hand out executable guest memory
@@ -103,7 +103,7 @@ Legacy Graphics (DirectDraw, D3D3-9). You bridge x86 Windows internals with mode
     and plain indexing silently reads nothing, both far from the store. Never keep one in a
     field, hand it to a constructor, or pass it to a `create*` factory; re-derive per use. v86's
     raw Proxy is the growth-transparent one, which is why a thunk's `mem` parameter may be held.
-    `tools/validate-guest-memory-views.ts` (gate step 10) enforces all three shapes — the
+    `tools/validate-guest-memory-views.ts` (validate-guest-memory-views) enforces all three shapes — the
     accessor's own comment asserted this invariant while two modules were violating it.
   - All HLE modules must use Mem.read*/write* instead of direct mem8[...] access in new/changed code.
   - Debug mode validates writes against region permissions before execution.
@@ -113,7 +113,7 @@ Legacy Graphics (DirectDraw, D3D3-9). You bridge x86 Windows internals with mode
     a per-access accessor inside a per-pixel/per-vertex loop fights the zero-alloc rule above.
     A bounds test (`ptr + size <= mem.length`) is NOT validation: only the region map knows the
     target is not THUNK_CODE, a red zone or read-only. `tools/validate-guest-pointer-guards.ts`
-    (gate step 8) enforces this for writes in ddraw, so the convention cannot erode silently
+    (validate-guest-pointer-guards) enforces this for writes in ddraw, so the convention cannot erode silently
     again — it had, in the whole `ddraw/d3d/` subtree.
 - Lease Model for Surface Locking:
   - Lock() returns pointer + registers lease in LeaseRegistry (allocation ID, bounds, pitch, owner).
@@ -134,7 +134,7 @@ Legacy Graphics (DirectDraw, D3D3-9). You bridge x86 Windows internals with mode
   `() => S_OK`, and the guest then reads an untouched out-param — which, on an
   identity-mapped address space, dereferences linear 0 without a #PF and jumps into
   garbage. Merge with `assignStubsOnce` (core/thunking/stub-merge.ts) so the real
-  implementation wins regardless of order; `tools/validate-stub-tables.ts` (gate step 5)
+  implementation wins regardless of order; `tools/validate-stub-tables.ts` (validate-stub-tables)
   fails on a stub name that is also implemented.
 - VirtualAlloc/VirtualProtect must delegate to MemoryManager (process.memory) for allocation and
   AddressSpace.protect for perm changes.
@@ -144,7 +144,7 @@ Legacy Graphics (DirectDraw, D3D3-9). You bridge x86 Windows internals with mode
   because Win32 mapping calls do not touch the file pointer and a save/restore across an await
   silently reverts a seek the guest made during the yield. `position +=` is banned outright
   (read-modify-write across a yield = double advance, served silently at full length); advances
-  go through the single named mutation. `tools/validate-file-cursor.ts` (gate step 6) enforces
+  go through the single named mutation. `tools/validate-file-cursor.ts` (validate-file-cursor) enforces
   both — and pins the NUMBER of cursor-mutation sites per owner, in any spelling, because a ban
   on `+=` alone is a ban on a spelling that the sanctioned advance itself sidesteps.
 
@@ -360,41 +360,45 @@ Quality Gate (mandatory order):
   6. bun tools/validate-data-export-binding.ts   (one address per HLE export: `hleImageExportAddress`
      stays private to the precedence owner, plus a pinned census of API-descriptor/registerDataExport
      doubles)
-  7. bun tools/validate-d3d9-export-collisions.ts   (the hand-composed d3d9 tables: a resource
+  7. bun tools/validate-api-export-uniqueness.ts   (a module descriptor declares each export
+     name ONCE — a name declared twice lays two stub bodies at two addresses under one name,
+     so the PE walk and `exportAddresses` can answer with different ones, and a title that
+     compares GetProcAddress against its own IAT reads that as a hooked API)
+  8. bun tools/validate-d3d9-export-collisions.ts   (the hand-composed d3d9 tables: a resource
      constructor has ONE owner, so merge order cannot pick the fallback)
-  8. bun tools/validate-unimplemented-returns.ts  (a declared export with no handler must answer
+  9. bun tools/validate-unimplemented-returns.ts  (a declared export with no handler must answer
      FAILURE — the default "zero" is SUCCESS under HRESULT/MMSYSERR/MCI/LSTATUS, so those
      descriptors must carry onUnimplemented, and a makeFunc factory must spread its overrides)
-  9. bun tools/validate-file-cursor.ts
- 10. bun tools/validate-jit-exports.ts   (checks the BUILT v86 artifact — skips cleanly if absent)
- 11. bun tools/validate-guest-pointer-guards.ts   (ddraw + d3d9 HANDLER tables. It models
+ 10. bun tools/validate-file-cursor.ts
+ 11. bun tools/validate-jit-exports.ts   (checks the BUILT v86 artifact — skips cleanly if absent)
+ 12. bun tools/validate-guest-pointer-guards.ts   (ddraw + d3d9 HANDLER tables. It models
      `Iface_Method: (ctx, mem, args) => …`; the d3d9 backend draw paths take guest pointers
      too and are outside that model — a code-shape gap, not a scope one)
- 12. bun tools/validate-guest-memory-borrow.ts   (raw guest-memory Proxy access confined to its owners)
- 13. bun tools/validate-guest-memory-views.ts    (no PLAIN guest view stored past the turn that derived it)
- 14. bun tools/validate-hypercall-abi.ts         (Rust/TS hypercall page offsets + handler ids agree)
- 15. bun tools/validate-wgsl-calls.ts            (every call to a WGSL helper we wrote passes the
+ 13. bun tools/validate-guest-memory-borrow.ts   (raw guest-memory Proxy access confined to its owners)
+ 14. bun tools/validate-guest-memory-views.ts    (no PLAIN guest view stored past the turn that derived it)
+ 15. bun tools/validate-hypercall-abi.ts         (Rust/TS hypercall page offsets + handler ids agree)
+ 16. bun tools/validate-wgsl-calls.ts            (every call to a WGSL helper we wrote passes the
      arity that helper declares — our shaders are template strings, invisible to the typechecker,
      and one bad call blackens a whole pass)
- 16. bun tools/validate-d3d9-arena-abi.ts        (LayoutIdx order/length matches arena.rs
+ 17. bun tools/validate-d3d9-arena-abi.ts        (LayoutIdx order/length matches arena.rs
      LAYOUT_TABLE, and the arena exports in public/v86.wasm match the ones arena.rs declares —
      missing AND stale extras, so a not-rebuilt artifact cannot silently disable the arena)
- 17. bun tools/validate-d3d9-capability-contracts.ts   (the MSAA/float/volume contracts are measured
+ 18. bun tools/validate-d3d9-capability-contracts.ts   (the MSAA/float/volume contracts are measured
      from the live device, not read off globalThis, and the probe is AWAITED as an unconditional
      statement before the device is published)
- 18. bun tools/d3d9-parity/validate-caps.ts      (`bun run validate-d3d9-caps` — the name no longer
+ 19. bun tools/d3d9-parity/validate-caps.ts      (`bun run validate-d3d9-caps` — the name no longer
      predicts the path: the checked-in reference D3DCAPS9 blob AND the caps we answer with)
- 19. bun tools/validate-snapshots.ts             (every toMatchSnapshot() has a TRACKED .snap: bun
+ 20. bun tools/validate-snapshots.ts             (every toMatchSnapshot() has a TRACKED .snap: bun
      writes a missing snapshot and exits 0, so without the file the assertion asserts nothing)
- 20. bun run gate:d3d9-capture                   (differential native-D3D9 capture. `report:d3d9-capture`
+ 21. bun run gate:d3d9-capture                   (differential native-D3D9 capture. `report:d3d9-capture`
      is reporting-only and exits 0 for everything; this wrapper fails on an unreadable/invalid
      capture and on any divergence NOT recorded in tools/d3d9-capture-expected.json — the
      intentional ones of plan/dx9c-review-findings-2026-08-26.md §B2. Record a new intentional
      one with `--update-baseline`)
- 21. bun run report:d3d9-wgsl-validator          (with BS_REQUIRE_WGSL_VALIDATOR=1, so a missing
+ 22. bun run report:d3d9-wgsl-validator          (with BS_REQUIRE_WGSL_VALIDATOR=1, so a missing
      naga is an error instead of a silent skip)
- 22. bun run typecheck
- 23. bun test                                    (also with BS_REQUIRE_WGSL_VALIDATOR=1 — otherwise
+ 23. bun run typecheck
+ 24. bun test                                    (also with BS_REQUIRE_WGSL_VALIDATOR=1 — otherwise
      every describe.skipIf in wgsl-smoke.test.ts vanishes and the suite is green without it)
 
 `bun run gate` runs all of it in order — including the test suite as the final step. CI runs

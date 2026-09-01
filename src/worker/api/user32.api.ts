@@ -546,8 +546,6 @@ export const user32Module: ModuleDescriptor = {
         makeFunc("LoadKeyboardLayoutW", 2),
         makeFunc("LoadMenuIndirectA", 1),
         makeFunc("LoadMenuIndirectW", 1),
-        makeFunc("MapVirtualKeyExA", 3),
-        makeFunc("MapVirtualKeyExW", 3),
         makeFunc("RegisterDeviceNotificationA", 3),
         makeFunc("RegisterDeviceNotificationW", 3),
         makeFunc("UnregisterDeviceNotification", 1),

@@ -277,7 +277,23 @@ export function materializeHleModuleImages(process: any): void {
         }
 
         const exports: HleImageExport[] = [];
+        // An export name is unique in a real DLL: one name, one address. A descriptor that
+        // declares the same name twice would otherwise get two stubs at two addresses, and the
+        // export directory's name array — sorted for binary search — would carry the name
+        // twice, so the PE path and `exportAddresses` can resolve it to DIFFERENT bodies. An
+        // app that compares GetProcAddress against its own IAT slot reads that as a hooked API.
+        // Keyed lower-case, like the image's own `exportsByLowerName` lookup. The gate check
+        // (validate-api-export-uniqueness) rejects the declaration itself; this keeps the
+        // runtime correct for a descriptor the gate never saw, and says so once when it fires.
+        const emitted = new Set<string>();
         for (const fn of descriptor?.functions ?? []) {
+            const emitKey = fn.name.toLowerCase();
+            if (emitted.has(emitKey)) {
+                Logger.warn(LogCategory.SYSTEM,
+                    `[HleImages] ${name}: duplicate export declaration "${fn.name}" — keeping the first`);
+                continue;
+            }
+            emitted.add(emitKey);
             // A stdcall export we cannot size would throw here and take the whole arena
             // with it; skipping keeps it resolvable through the on-demand path instead.
             try {
