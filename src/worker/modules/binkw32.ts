@@ -52,6 +52,87 @@ const BINK_HANDLE_SIZE = 2048;
 const BINK_HEADER_BYTES = 44;
 /** Copy→upload has to be one frame apart to be evidence the upload took those pixels. */
 const SAME_FRAME_MS = 34;
+/** Consecutive same-frame uploads before an app is believed to publish the movie itself.
+ *  One coincidence is not cadence; a real per-frame upload path clears this immediately. */
+const UPLOAD_CADENCE_FRAMES = 3;
+/** …and how many frames without one before the belief expires. A clip that stops feeding
+ *  the app's own upload path (a seek, a second clip on the same handle) must get the
+ *  overlay back; a latch with no way down is a permanent decision from a transient one. */
+const UPLOAD_LATCH_DECAY_FRAMES = 30;
+
+/** What the "the app publishes these pixels itself" latch reads, and what it carries. */
+export interface UploadLatchState {
+    latched: boolean;
+    inStep: number;
+    framesWithoutMatch: number;
+    lastUploadSeq: number;
+}
+
+/**
+ * One frame's step of the latch that suppresses our video overlay.
+ *
+ * The upload counter is PROCESS-WIDE, so "an upload happened" is not evidence on its own —
+ * a HUD atlas upload mid-clip would latch it for the session. Evidence is CAUSAL: this
+ * session's copy went into a D3D9 lock staging buffer AND an upload landed in the same
+ * frame, repeatedly. Pure so the cadence and the decay are testable without a device.
+ */
+export function stepUploadLatch(prev: UploadLatchState, obs: {
+    uploadSeq: number;
+    /** This session's copy destination resolved to a D3D9 texture lock — the causal link. */
+    hasLockTarget: boolean;
+    msSinceCopy: number;
+}): UploadLatchState {
+    // The first sample only establishes a baseline; it cannot itself be a change.
+    const uploaded = prev.lastUploadSeq !== -1 && prev.lastUploadSeq !== obs.uploadSeq;
+    const matched = uploaded && obs.hasLockTarget && obs.msSinceCopy <= SAME_FRAME_MS;
+    if (matched) {
+        const inStep = prev.inStep + 1;
+        return {
+            latched: prev.latched || inStep >= UPLOAD_CADENCE_FRAMES,
+            inStep,
+            framesWithoutMatch: 0,
+            lastUploadSeq: obs.uploadSeq,
+        };
+    }
+    const framesWithoutMatch = prev.framesWithoutMatch + 1;
+    return {
+        latched: prev.latched && framesWithoutMatch < UPLOAD_LATCH_DECAY_FRAMES,
+        inStep: 0,
+        framesWithoutMatch,
+        lastUploadSeq: obs.uploadSeq,
+    };
+}
+
+/** The anchors BinkWait paces against. */
+export interface BinkPacingState {
+    audioBaselineMs: number;
+    frameDecodeCount: number;
+    lastPlayCursor: number;
+    audioWrapCount: number;
+    lastFrameMs: number;
+}
+
+/** Where BinkWait expects the audio clock to be before frame `frameDecodeCount` may run. */
+export function binkWaitTargetMs(s: BinkPacingState, msPerFrame: number): number {
+    return s.audioBaselineMs + s.frameDecodeCount * msPerFrame;
+}
+
+/**
+ * Put the pacing anchors back where a clip that just started has them.
+ *
+ * A loop wrap or a BinkGoto moves the video timeline but not these, so every frame after
+ * one is paced against a baseline taken at frame 0 of the previous pass — the target sits
+ * far in the past and BinkWait answers "ready" for every frame. The audio ring's own
+ * wrap accounting has to go with it, or the re-established baseline lands in a clock the
+ * following reads do not use.
+ */
+export function rebaseBinkPacing(s: BinkPacingState): void {
+    s.audioBaselineMs = -1;   // re-sampled by the next decode with active audio
+    s.frameDecodeCount = 0;
+    s.lastPlayCursor = 0;
+    s.audioWrapCount = 0;
+    s.lastFrameMs = 0;
+}
 
 /**
  * BINKSURFACE* — the destination pixel format, named by the GAME in the low nibble
@@ -278,6 +359,13 @@ interface BinkSession {
      *  That is the only observation that catches an app which copies into a private buffer
      *  and locks its texture afterwards — the pointer tests never see the two coincide. */
     appUploadsItsOwnFrames: boolean;
+    /** How many consecutive copies were followed by a texture upload in the same frame. */
+    uploadsInStepWithCopy: number;
+    /** Consecutive latch steps with no matching upload; the latch decays after this many. */
+    framesWithoutMatchingUpload: number;
+    /** frameDecodeCount the latch was last stepped for — the hint is asked twice per frame
+     *  (DoFrame and NextFrame) and a per-frame observation must not be counted twice. */
+    latchSteppedForFrame: number;
     lastCopyAtMs: number;
     hasBufferApiHint: boolean;
     hasPointerFault: boolean;
@@ -454,7 +542,7 @@ export class BinkW32 implements IModule {
         return true;
     }
 
-    private getRoutingTargetHint(s: BinkSession): { kind: "none" | "ddraw_surface" | "glide_lfb" | "app_buffer"; valid: boolean; surfacePtr?: number; pitch?: number; width?: number; height?: number } {
+    private getRoutingTargetHint(s: BinkSession): { kind: "none" | "ddraw_surface" | "glide_lfb" | "app_buffer"; valid: boolean; surfacePtr?: number; pitch?: number; width?: number; height?: number; note?: string } {
         if (s.explicitDdrawSurface?.surfacePtr) {
             return {
                 kind: "ddraw_surface",
@@ -491,22 +579,35 @@ export class BinkW32 implements IModule {
             const lockedTexture = resolvedSurface
                 ? null
                 : (s.destPtr ? resolveD3D9LockedTextureTarget(s.destPtr) : null) ?? s.d3d9LockTarget;
-            // The upload counter is PROCESS-WIDE: on its own it says an upload happened,
-            // never that it consumed THIS session's pixels, and one unrelated texture
-            // upload would otherwise latch the flag and kill the overlay for the session.
-            // Only count it as evidence when this session's destination is a D3D9 lock
-            // staging buffer (the shape the pointer tests cannot see) and the upload
-            // landed in the same frame as the copy that filled it.
-            const uploadSeq = d3d9TextureUploadSeq();
-            const uploadedSinceLastFrame = s.lastTextureUploadSeq !== -1 && s.lastTextureUploadSeq !== uploadSeq;
-            s.lastTextureUploadSeq = uploadSeq;
-            if (uploadedSinceLastFrame && lockedTexture
-                && (performance.now() - s.lastCopyAtMs) <= SAME_FRAME_MS) {
-                s.appUploadsItsOwnFrames = true;
+            // Asked twice per frame (DoFrame and NextFrame); the observation is per-frame.
+            if (s.latchSteppedForFrame !== s.frameDecodeCount) {
+                s.latchSteppedForFrame = s.frameDecodeCount;
+                const next = stepUploadLatch({
+                    latched: s.appUploadsItsOwnFrames,
+                    inStep: s.uploadsInStepWithCopy,
+                    framesWithoutMatch: s.framesWithoutMatchingUpload,
+                    lastUploadSeq: s.lastTextureUploadSeq,
+                }, {
+                    uploadSeq: d3d9TextureUploadSeq(),
+                    hasLockTarget: !!lockedTexture,
+                    msSinceCopy: performance.now() - s.lastCopyAtMs,
+                });
+                s.appUploadsItsOwnFrames = next.latched;
+                s.uploadsInStepWithCopy = next.inStep;
+                s.framesWithoutMatchingUpload = next.framesWithoutMatch;
+                s.lastTextureUploadSeq = next.lastUploadSeq;
             }
             return {
                 kind: "app_buffer",
                 valid: !gpuPresenter || !!resolvedSurface || !!lockedTexture || s.appUploadsItsOwnFrames,
+                // ALWAYS a string: the hint is merged field-by-field into the session, so an
+                // absent note leaves the previous one standing and the state then explains
+                // this decision with the reason for an older one.
+                note: !gpuPresenter ? "no gpu presenter"
+                    : resolvedSurface ? "resolved bitmap texture"
+                    : lockedTexture ? "d3d9 lock staging buffer"
+                    : s.appUploadsItsOwnFrames ? "app uploads in step with the copy"
+                    : `no resolvable sink: uploadsInStep=${s.uploadsInStepWithCopy}/${UPLOAD_CADENCE_FRAMES}`,
                 surfacePtr: s.destPtr || undefined,
                 pitch: s.destPitch || lockedTexture?.pitch || undefined,
                 width: resolvedSurface?.width ?? lockedTexture?.width ?? s.width,
@@ -789,7 +890,9 @@ export class BinkW32 implements IModule {
             frameDecodeCount: 0,
             destPtr: 0, destPitch: 0, destHeight: 0, destX: 0, destY: 0, destBpp: 0,
             explicitDdrawSurface: null, explicitGlideSurfacePtr: 0,
-            d3d9LockTarget: null, lastTextureUploadSeq: -1, appUploadsItsOwnFrames: false, lastCopyAtMs: 0,
+            d3d9LockTarget: null, lastTextureUploadSeq: -1, appUploadsItsOwnFrames: false,
+            uploadsInStepWithCopy: 0, framesWithoutMatchingUpload: 0, latchSteppedForFrame: -1,
+            lastCopyAtMs: 0,
             hasBufferApiHint: false, hasPointerFault: false,
             videoOn: false,
             ioSize: this.pendingIoSize,
@@ -1198,6 +1301,9 @@ export class BinkW32 implements IModule {
                     d3d9LockTarget: null,
                     lastTextureUploadSeq: -1,
                     appUploadsItsOwnFrames: false,
+                    uploadsInStepWithCopy: 0,
+                    framesWithoutMatchingUpload: 0,
+                    latchSteppedForFrame: -1,
                     lastCopyAtMs: 0,
                     hasBufferApiHint: false,
                     hasPointerFault: false,
@@ -1505,11 +1611,24 @@ export class BinkW32 implements IModule {
             }
             const m0 = this.getMemory();
             const prevFrame = this.readU32(m0, bink + this.layout.frameNum);
-            // Advance UNCONDITIONALLY: `eof` means the decoder reported end-of-stream, not
-            // that the stream is over for the guest — Bink wraps and a game's backdrop loop
-            // keeps running off exactly this call. A skipped video is already excluded by the
-            // engineHandle guard above, so gating this on `eof` only pins FrameNum at the last
-            // frame forever and the loop never restarts.
+            const frames = this.readU32(m0, bink + this.layout.frames);
+            // Bink LOOPS: BinkNextFrame on the last frame returns to frame 1. A backdrop loop
+            // is written as decode → copy → BinkNextFrame with no seek of its own, so the wrap
+            // has to happen here or the menu freezes on the closing frame for ever. Advancing
+            // the guest counter alone is not the wrap: the DECODER stays parked at EOF, and
+            // `eof` then makes BinkDoFrame return before decoding anything again.
+            if (s.eof || (frames > 0 && prevFrame >= frames)) {
+                videoEngine.gotoFrame(s.engineHandle, 0);
+                s.eof = false;
+                rebaseBinkPacing(s);
+                Logger.log(LogCategory.SYSTEM,
+                    `[BinkW32] BinkNextFrame(0x${bink.toString(16)}): wrap ${prevFrame}/${frames} -> 1`);
+                this.writeU32(m0, bink + this.layout.frameNum, 1);
+                if (this.layout.lastFrameNum !== null) {
+                    this.writeU32(m0, bink + this.layout.lastFrameNum, prevFrame);
+                }
+                return 0;
+            }
             videoEngine.nextFrame(s.engineHandle);
             /* Update FrameNum / LastFrameNum in guest struct */
             const info = videoEngine.getInfo(s.engineHandle);
@@ -1539,7 +1658,7 @@ export class BinkW32 implements IModule {
             // Anchor to the audio baseline and decoded-frame count; a bounded wall-clock
             // fallback prevents a stalled audio clock from blocking playback.
             if (s.audioBaselineMs >= 0 && s.audioCtrl) {
-                const targetAudioMs = s.audioBaselineMs + s.frameDecodeCount * msPerFrame;
+                const targetAudioMs = binkWaitTargetMs(s, msPerFrame);
                 const audioMs = this._getAudioTimeMs(s);
                 if (audioMs >= 0 && audioMs < targetAudioMs) {
                     const wallElapsed = performance.now() - s.lastFrameMs;
@@ -1566,8 +1685,12 @@ export class BinkW32 implements IModule {
             const frame = args[1];
             const s = this.sessions.get(bink);
             if (!s || s.engineHandle < 0) return 0;
-            videoEngine.gotoFrame(s.engineHandle, frame);
+            // Bink numbers frames from 1; the decoder indexes from 0 (its `current_frame`
+            // becomes 1 only after the first frame is decoded). Passing the guest's number
+            // through unconverted seeks one frame past the requested one.
+            videoEngine.gotoFrame(s.engineHandle, Math.max(0, frame - 1));
             s.eof = false; // seeking resets EOF state
+            rebaseBinkPacing(s); // the timeline moved; BinkWait's anchors must move with it
             const m = this.getMemory();
             this.writeU32(m, bink + this.layout.frameNum, frame);
             return 0;

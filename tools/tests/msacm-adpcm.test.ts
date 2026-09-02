@@ -34,6 +34,9 @@ const acm = new Msacm32();
 acm.initialize({} as never);
 const call = (name: string, ...args: number[]): number =>
     (acm.exports[name] as ThunkImplementation)({} as never, mem, args) as number;
+/** Same call, but through a caller-supplied memory view (used by the Proxy test below). */
+const callOn = (view8: Uint8Array, name: string, ...args: number[]): number =>
+    (acm.exports[name] as ThunkImplementation)({} as never, view8, args) as number;
 
 // One flat guest-memory stand-in; no AddressSpace is registered, so isValidAddress
 // passes everything and the offsets below are the only layout that matters.
@@ -156,5 +159,94 @@ describe("msacm32 ADPCM decode", () => {
         view.setUint32(HAS_PTR, 0xdeadbeef, true);
         expect(call("acmStreamOpen", HAS_PTR, 0, SRC_FMT, DST_FMT, 0, 0, 0, 0)).not.toBe(MMSYSERR_NOERROR);
         expect(view.getUint32(HAS_PTR, true)).toBe(0);
+    });
+});
+
+/**
+ * The two defects roadmap 09.1 measured in the Far Cry trace: the decoder indexing v86's
+ * guest-memory Proxy per nibble, and four fresh arrays per block landing in front of the
+ * mixer on the audio deadline.
+ *
+ * The Proxy assertion is the exact one: a counting trap makes "does this leaf loop touch
+ * the Proxy" a number rather than a claim, and it fails loudly if the borrow is ever
+ * removed. The throughput bound is deliberately loose — a wall-clock threshold that is
+ * tight enough to catch a 2x regression is also tight enough to fail on a shared CI box —
+ * so it is sized to catch the shape of the defect (per-element trap, per-block garbage),
+ * not to police a few percent.
+ */
+describe("msacm32 ADPCM decode does not pay per-nibble costs", () => {
+    function armFixture(name: string): { has: number; wav: WavFile; dstBytes: number } {
+        const wav = readWav(name);
+        mem.set(wav.fmt, SRC_FMT);
+        writePcmFormat(DST_FMT, wav.channels, wav.rate);
+        mem.set(wav.data, SRC_DATA);
+        expect(call("acmStreamOpen", HAS_PTR, 0, SRC_FMT, DST_FMT, 0, 0, 0, 0)).toBe(MMSYSERR_NOERROR);
+        const has = view.getUint32(HAS_PTR, true);
+        expect(call("acmStreamSize", has, wav.data.length, SIZE_OUT, ACM_STREAMSIZEF_SOURCE)).toBe(MMSYSERR_NOERROR);
+        const dstBytes = view.getUint32(SIZE_OUT, true);
+        mem.fill(0, HDR, HDR + ACMSTREAMHEADER_SIZE);
+        view.setUint32(HDR + 0, ACMSTREAMHEADER_SIZE, true);
+        view.setUint32(HDR + 12, SRC_DATA, true);
+        view.setUint32(HDR + 16, wav.data.length, true);
+        view.setUint32(HDR + 28, DST_DATA, true);
+        view.setUint32(HDR + 32, dstBytes, true);
+        expect(call("acmStreamPrepareHeader", has, HDR, 0)).toBe(MMSYSERR_NOERROR);
+        return { has, wav, dstBytes };
+    }
+
+    test("the decode loop does not index the guest-memory Proxy", () => {
+        const { has, wav } = armFixture("ms_st.wav");
+        const blocks = Math.floor(wav.data.length / wav.blockAlign);
+        expect(blocks).toBeGreaterThanOrEqual(2);
+
+        // Shaped exactly like v86's own guest-memory view (vendor/v86/src/lib.js): the
+        // target is a bare object, and a function property comes back BOUND — which is
+        // what makes `raw.constructor === Uint8Array` false and sends toPlainGuestMemory
+        // down its unwrapping path. A transparent proxy over the array would return the
+        // real constructor, take the "already canonical" fast path, and quietly test
+        // nothing.
+        let gets = 0;
+        const proxied = new Proxy({}, {
+            get(_t, k) {
+                gets++;
+                const x = (mem as unknown as Record<string | symbol, unknown>)[k];
+                return typeof x === "function" ? (x as Function).bind(mem) : x;
+            },
+            set(_t, k, v) {
+                gets++;
+                (mem as unknown as Record<string | symbol, unknown>)[k] = v;
+                return true;
+            },
+        }) as unknown as Uint8Array;
+
+        expect(callOn(proxied, "acmStreamConvert", has, HDR, 0)).toBe(MMSYSERR_NOERROR);
+        const decodedSamples = view.getUint32(HDR + 36, true) / 2;
+        expect(decodedSamples).toBeGreaterThan(500);
+
+        // The handler legitimately touches the proxy a handful of times at its boundary
+        // (buffer/byteOffset/byteLength for the header DataView, the validity checks).
+        // What it must NOT do is reach through it per nibble and per output sample: that
+        // is the ~25x path, and on this fixture it would be tens of thousands of traps.
+        expect(gets).toBeLessThan(64);
+        expect(gets * 10).toBeLessThan(decodedSamples);
+        expect(call("acmStreamClose", has, 0)).toBe(MMSYSERR_NOERROR);
+    });
+
+    test("throughput stays in the shape of an allocation-free decoder", () => {
+        const { has, wav } = armFixture("ms_st.wav");
+        const blocksPerCall = Math.floor(wav.data.length / wav.blockAlign);
+        const ITERATIONS = Math.max(1, Math.ceil(10_000 / blocksPerCall));
+
+        for (let i = 0; i < 20; i++) call("acmStreamConvert", has, HDR, 0);   // warm the JIT
+        const t0 = performance.now();
+        for (let i = 0; i < ITERATIONS; i++) call("acmStreamConvert", has, HDR, 0);
+        const nsPerBlock = ((performance.now() - t0) * 1e6) / (ITERATIONS * blocksPerCall);
+
+        // Measured around 1-3 us/block for a 2-channel 1012-byte block on a laptop; the
+        // per-nibble Proxy path and the four-arrays-per-block path each cost more than an
+        // order of magnitude. 200 us/block is therefore a bound that only a defect of that
+        // shape can cross, on any machine this suite runs on.
+        expect(nsPerBlock).toBeLessThan(200_000);
+        expect(call("acmStreamClose", has, 0)).toBe(MMSYSERR_NOERROR);
     });
 });

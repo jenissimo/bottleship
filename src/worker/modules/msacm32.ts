@@ -23,6 +23,7 @@ import { ThunkImplementation, ThunkResult } from "../core/thunking/thunk-dispatc
 import { Logger, LogCategory } from "../core/logger";
 import { System } from "../core/system";
 import { isValidAddress } from "../core/memory/address-guard";
+import { borrowGuestMemory } from "../core/memory/guest-memory";
 import { encodeAnsi } from "./codepage-utils";
 
 // mmsystem.h
@@ -183,6 +184,24 @@ const IMA_STEP_TABLE = [
 
 const clampS16 = (v: number): number => (v < -32768 ? -32768 : v > 32767 ? 32767 : v);
 
+/**
+ * Per-channel decoder state, allocated once instead of per block.
+ *
+ * A 22 kHz stereo stream is ~40 blocks per acmStreamConvert and a game calls that on the
+ * audio deadline; four fresh arrays per block put the codec's own garbage in front of the
+ * mixer. Decoding is synchronous on the worker thread with no await inside it, so one
+ * module-level set of buffers cannot be re-entered.
+ */
+const MAX_ADPCM_CHANNELS = 8;
+const st = {
+    predictor: new Int32Array(MAX_ADPCM_CHANNELS),
+    delta: new Int32Array(MAX_ADPCM_CHANNELS),
+    samp1: new Int32Array(MAX_ADPCM_CHANNELS),
+    samp2: new Int32Array(MAX_ADPCM_CHANNELS),
+    index: new Int32Array(MAX_ADPCM_CHANNELS),
+    group: new Int32Array(MAX_ADPCM_CHANNELS),
+};
+
 /** Samples per channel in one block, as each codec's block layout defines it. */
 function adpcmSamplesPerBlock(f: WaveFormat): number {
     if (f.samplesPerBlock > 0) return f.samplesPerBlock;
@@ -204,23 +223,23 @@ function decodeMsAdpcmBlock(
     src: Uint8Array, at: number, blockSize: number, channels: number,
     coefs: Int16Array, samplesPerBlock: number, out: Int16Array, outAt: number,
 ): number {
-    if (blockSize < 7 * channels) return 0;
+    if (blockSize < 7 * channels || channels > MAX_ADPCM_CHANNELS) return 0;
     const nCoefs = coefs.length >> 1;
-    const predictor: number[] = [], delta: number[] = [], samp1: number[] = [], samp2: number[] = [];
+    const { predictor, delta, samp1, samp2 } = st;
     let p = at;
     for (let c = 0; c < channels; c++) {
         const idx = src[p++]!;
         if (idx >= nCoefs) return 0;
-        predictor.push(idx);
+        predictor[c] = idx;
     }
     const rd16 = (): number => {
         const v = src[p]! | (src[p + 1]! << 8);
         p += 2;
         return v >= 0x8000 ? v - 0x10000 : v;
     };
-    for (let c = 0; c < channels; c++) delta.push(rd16());
-    for (let c = 0; c < channels; c++) samp1.push(rd16());
-    for (let c = 0; c < channels; c++) samp2.push(rd16());
+    for (let c = 0; c < channels; c++) delta[c] = rd16();
+    for (let c = 0; c < channels; c++) samp1[c] = rd16();
+    for (let c = 0; c < channels; c++) samp2[c] = rd16();
 
     // The block header carries the first two samples, oldest first.
     let written = 0;
@@ -262,15 +281,15 @@ function decodeImaAdpcmBlock(
     src: Uint8Array, at: number, blockSize: number, channels: number,
     samplesPerBlock: number, out: Int16Array, outAt: number,
 ): number {
-    if (blockSize < 4 * channels) return 0;
-    const predictor: number[] = [], index: number[] = [];
+    if (blockSize < 4 * channels || channels > MAX_ADPCM_CHANNELS) return 0;
+    const { predictor, index } = st;
     let p = at;
     for (let c = 0; c < channels; c++) {
         const raw = src[p]! | (src[p + 1]! << 8);
-        predictor.push(raw >= 0x8000 ? raw - 0x10000 : raw);
+        predictor[c] = raw >= 0x8000 ? raw - 0x10000 : raw;
         const idx = src[p + 2]!;
         if (idx > 88) return 0;
-        index.push(idx);
+        index[c] = idx;
         p += 4; // the fourth byte is reserved
     }
     for (let c = 0; c < channels; c++) out[outAt + c] = predictor[c]!;
@@ -291,7 +310,7 @@ function decodeImaAdpcmBlock(
 
     // Data is grouped in 4-byte (8-sample) runs per channel, channels round-robin.
     const end = at + blockSize;
-    const group = new Array<number>(channels);
+    const group = st.group;
     while (written < samplesPerBlock && p + 4 * channels <= end) {
         for (let c = 0; c < channels; c++) group[c] = p + c * 4;
         p += 4 * channels;
@@ -1058,9 +1077,14 @@ export class Msacm32 implements IModule {
             const dstFramesRoom = Math.floor(cbDstLength / dstFrameBytes);
             const dstFrames = Math.min(this.dstFramesForSrc(stream, srcFramesAvailable), dstFramesRoom);
 
+            // Thunk dispatch deliberately keeps v86's growth-transparent Proxy at its
+            // outer boundary. ADPCM indexes tens of thousands of bytes synchronously,
+            // so borrow one fresh plain view for this leaf loop instead of paying the
+            // Proxy get/set trap per nibble and output sample.
+            const convertMem = borrowGuestMemory(mem);
             const done = this.isBlockSource(stream)
-                ? this.convertFromBlocks(mem, stream, pbSrc, cbSrcLength, pbDst, dstFrames)
-                : this.convertPcm(mem, stream, pbSrc, srcFramesAvailable, pbDst, dstFrames);
+                ? this.convertFromBlocks(convertMem, stream, pbSrc, cbSrcLength, pbDst, dstFrames)
+                : this.convertPcm(convertMem, stream, pbSrc, srcFramesAvailable, pbDst, dstFrames);
 
             v.setUint32(pash + ASH.cbSrcLengthUsed, this.srcBytesForFrames(stream, done.srcFrames), true);
             v.setUint32(pash + ASH.cbDstLengthUsed, done.dstFrames * dstFrameBytes, true);
