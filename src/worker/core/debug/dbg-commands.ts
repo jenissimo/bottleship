@@ -29,8 +29,10 @@ import { TimeService } from '../../runtime/time';
 import { Logger } from '../logger';
 import { EmulatorConfig } from '../emulator-config-manager';
 import type { QualityConfig } from '../quality-config';
-import { getD3D9PerfSnapshot, resetD3D9Perf } from '../../modules/d3d9/d3d9-perf';
+import { getD3D9PerfSnapshot, reconcileD3D9ArenaRuns, resetD3D9Perf } from '../../modules/d3d9/d3d9-perf';
 import { devices, stateBlocks } from '../../modules/d3d9/shared-state';
+import { getD3D9QueryLedger, resetD3D9QueryLedger } from '../../modules/d3d9/query';
+import type { QueryManagerCounters } from '../../modules/d3d9/query-manager';
 import { d3d9WasmArena, isWasmPathEnabled, setWasmPathEnabled, setArenaVerifyDrainEnabled, setWasmBlocksEnabled } from '../../backends/webgpu/d3d9/d3d9-wasm-arena';
 import { windows, getAbsoluteWindowPosition, controlImageHandles, WindowInfo } from '../../modules/user32/shared-state';
 import { resolveBitmapRgba } from '../../modules/gdi32/bitmap-resolve';
@@ -41,6 +43,17 @@ import { hpFreezeWatchdog } from './hp-freeze-watchdog';
 import { setGuestMemoryStaleGuard, isGuestMemoryStaleGuardEnabled, setGuestMemoryBorrowBypass, isGuestMemoryBorrowBypassed } from '../memory/guest-memory';
 import { MEM_GUARD_BASE, MEM_GUARD_SIZE } from '../cpu/emulator-config';
 import { aotCache } from '../cpu/aot-cache';
+
+type QueryManagerCounterSeam = {
+    getCounters?: () => QueryManagerCounters;
+    resetCounters?: () => void;
+};
+
+/** The device's live query manager, or null on a device that never made one. */
+function queryManagerOf(device: unknown): QueryManagerCounterSeam | null {
+    return (device as { getQueryManager?: () => QueryManagerCounterSeam | null })
+        .getQueryManager?.() ?? null;
+}
 
 /** Namespaced gameId the registry persists under — the same key AOT units are stored by,
  *  so a unit can never be read back for a different game. */
@@ -136,6 +149,34 @@ export function applyDbgConfig(w: any): void {
     const jitDisabled = w.get_jit_config ? (w.get_jit_config(0) >>> 0) : -1;
     console.log(`[dbg] re-applied config on v86 init/restart: ${cfg.bps.length} bp, ${cfg.watches.length} watch, stepOnBp=${cfg.stepOnBp}, maxDumps=${cfg.maxDumps}, JIT_DISABLED=${jitDisabled}`);
 }
+
+/** Fastmem-write map population. `acceptPages` is the only one the JIT actually tests. */
+export interface FastmemWriteMap {
+    acceptPages: number; basePages: number; codePages: number; watchPages: number; maxPage: number;
+}
+
+/** DOD dispatch SoA slab-pool health. `overflows > 0` = pages left unpublished. */
+export interface FastmemDispatchSlabs { highWater: number; overflows: number }
+
+/**
+ * What `dbg.fastmemStats()` answers. Typed rather than `any` because its consumers project
+ * fields out of it: a field that stops existing must fail the typecheck, not be published
+ * as NaN under its name.
+ */
+export interface FastmemStats {
+    /** Read-side fastmem (former config slot 9) is gone from the engine, not merely off. */
+    readsStatus: "retired";
+    writesEnabled: boolean;
+    speculatedStoresCompiled: number;
+    writeMap: FastmemWriteMap | null;
+    dispatchSlabs: FastmemDispatchSlabs | null;
+}
+
+/** Wasm-tier shares. `null` when the accounting that feeds them is inactive — see `shareReason`. */
+export interface JitTierShare { liftoff: number; turbofan: number; unknown: number }
+
+/** Window baseline for the read-microTLB census; cleared whenever its configuration changes. */
+let readTlbMark: { hit: number; fill: number; atMs: number; mode: number; codePage: number } | null = null;
 
 export const dbg = {
     /** Enable the debugger. Turns JIT OFF (required) and clears the JIT cache. */
@@ -346,8 +387,8 @@ export const dbg = {
         console.log("[dbg] JIT cache cleared (JIT state unchanged)");
     },
     /** Generic set_jit_config(index,value) + clear cache, for bisecting JIT knobs.
-     *  The current ABI supports 0-3, 5-8, 10-17, 19, and 21-23; retired slots
-     *  4, 9, and 18 are explicitly rejected when the ABI mask is available.
+     *  The current ABI supports 0-8, 10-17, and 19-31; retired slots 9 and 18
+     *  are explicitly rejected when the ABI mask is available.
      *  Then reads the active knobs back. */
     jitcfg(index: number, value: number): void {
         const w = wasm(); if (!w) return;
@@ -367,7 +408,7 @@ export const dbg = {
         }
         if (w.jit_clear_cache_js) w.jit_clear_cache_js();
         const g = (i: number) => (w.get_jit_config ? (w.get_jit_config(i) >>> 0) : -1);
-        console.log(`[dbg] set_jit_config(${requested},${value}) + clear. now: DISABLED=${g(0)} MAX_PAGES=${g(1)} LOOP_SAFETY=${g(2)} MAX_EXTRA_BB=${g(3)} DEAD_FLAG_ELISION=${g(5)} INDIRECT_REGIONS=${g(6)} REGION_PAGES=${g(8)} X87_LOCALS=${g(10)} PUSH_RUN=${g(11)}`);
+        console.log(`[dbg] set_jit_config(${requested},${value}) + clear. now: DISABLED=${g(0)} MAX_PAGES=${g(1)} LOOP_SAFETY=${g(2)} MAX_EXTRA_BB=${g(3)} BLOCK_CHAINING=${g(4)} DEAD_FLAG_ELISION=${g(5)} INDIRECT_REGIONS=${g(6)} REGION_PAGES=${g(8)} X87_LOCALS=${g(10)} PUSH_RUN=${g(11)} X87_PC_LOCAL=${g(31)}`);
     },
     /** Dead-flag elision compile-time census (profiler slots 8/9, always-on — unlike the
      *  dispatch counters these need no dispatchStatsEnable). candidate = instructions that
@@ -393,12 +434,17 @@ export const dbg = {
         const w = wasm(); if (!w?.get_jit_config) return {};
         const names: Array<[string, number]> = [
             ["jitDisabled", 0], ["maxPages", 1], ["loopSafety", 2], ["maxExtraBasicBlocks", 3],
+            ["blockChaining", 4],
             ["deadFlagElision", 5], ["indirectRegions", 6], ["regionMinSharePct", 7],
             ["regionMaxPages", 8], ["x87Locals", 10],
             ["pushRunCoalescing", 11], ["retChaining", 12], ["retSpeculation", 13],
             ["retSpecMaxInstr", 14], ["tier2Threshold", 15], ["tier2RetSpecMaxInstr", 16],
             ["tier2MaxPages", 17], ["fastmemWrites", 19],
-            ["flagLocals", 21], ["branchHints", 22], ["branchHintOffsetFuzz", 23],
+            ["chainTier2Accounting", 20], ["flagLocals", 21], ["branchHints", 22],
+            ["branchHintOffsetFuzz", 23], ["wrongEntryRefuse", 24],
+            ["retCacheBits", 25], ["retCacheHashMix", 26], ["chainNoteSlots", 27],
+            ["functionNames", 28], ["readTlbCacheMode", 29], ["readTlbCachePage", 30],
+            ["x87PcLocal", 31],
         ];
         const out: Record<string, number> = {};
         for (const [name, idx] of names) out[name] = w.get_jit_config(idx) >>> 0;
@@ -417,15 +463,13 @@ export const dbg = {
         const g = w.get_jit_config ? (w.get_jit_config(12) >>> 0) : -1;
         console.log(`[dbg] JIT_RET_CHAINING=${g} (authoritative — survives reload) + cache cleared`);
     },
-    /** Count CHAINED module entries toward tier-2 hotness (set_jit_config idx 20, default ON).
+    /** Count CHAINED module entries in the V8-tier census (set_jit_config idx 20, default ON).
      *  A chained edge jumps module→module without passing through cycle_internal, so without
-     *  this a large share of entries is invisible to hotness and promotions arrive late.
+     *  this a large share of entries is invisible to entry-weighted diagnostics. Promotion
+     *  itself is retired-instruction weighted and is unaffected by this switch.
      *
      *  Changes NO emitted code (unlike idx 12), so arms are directly comparable and no cache
-     *  clear is needed — that is what separates idx 12's CODE effect from its COUNTER effect.
-     *  Read the census with dbg.tier2Stats(). The tier-2 page set is insert-only and saturates
-     *  at 256, so a STEADY-STATE promotion rate is cap-limited, not counter-limited; the
-     *  counter effect is only visible from a cold JIT. */
+     *  clear is needed. Read the census with dbg.tier2Stats(). */
     chainTier2Accounting(on = true): void {
         const w = wasm(); if (!w?.set_jit_config) return;
         w.set_jit_config(20, on ? 1 : 0);
@@ -444,23 +488,33 @@ export const dbg = {
         const g = (i: number) => (w.get_jit_config ? (w.get_jit_config(i) >>> 0) : -1);
         console.log(`[dbg] JIT_RET_SPECULATION=${g(13)} maxInstr=${g(14)} (authoritative — survives reload) + cache cleared`);
     },
-    /** Hotness tiering (set_jit_config idx 15 = per-module re-entry threshold, 0=off;
-     *  idx 16 = tier-2 RET-spec budget; idx 17 = tier-2 module page budget). Default ON
-     *  (300K) via the Rust static — the promotion invalidation bug (ret-memo/dispatch
+    /** Experimental hotness tiering (set_jit_config idx 15 = per-module retired-instruction
+     *  threshold, 0=off; idx 16 = tier-2 RET-spec budget; idx 17 = tier-2 module page budget).
+     *  Shipping defaults OFF after representative host-timed A/B; calling this command with
+     *  no arguments opts into 19.2M retired instructions. The invalidation bug (ret-memo/dispatch
      *  pointing at freed entries → "null function" trap) is
      *  fixed in the fork (flush in free_wasm_table_index + epoch key). Routed through
      *  the PreemptionManager when it exposes setTier2Threshold so the choice survives a
-     *  game reload. Pure runtime knob: changing it needs NO cache clear (promotion
-     *  happens organically as modules cross the threshold). */
-    jitTier2(threshold = 300000, specBudget = 0, maxPages = 0): void {
+     *  game reload. Crossing zero in either direction clears compiled JIT state because OFF
+     *  modules omit accounting calls; changing a nonzero threshold is policy-only. Changing budgets
+     *  16/17 clears the cache so existing promoted modules cannot retain old budgets. */
+    jitTier2(threshold = 19200000, specBudget = 0, maxPages = 0): void {
         const w = wasm(); if (!w?.set_jit_config) return;
-        if (specBudget > 0) w.set_jit_config(16, specBudget >>> 0);
-        if (maxPages > 0) w.set_jit_config(17, maxPages >>> 0); // tier-2 module page budget (idx 17)
+        {
+            let changed = false;
+            if (specBudget > 0 && (!w.get_jit_config || (w.get_jit_config(16) >>> 0) !== (specBudget >>> 0))) {
+                w.set_jit_config(16, specBudget >>> 0); changed = true;
+            }
+            if (maxPages > 0 && (!w.get_jit_config || (w.get_jit_config(17) >>> 0) !== (maxPages >>> 0))) {
+                w.set_jit_config(17, maxPages >>> 0); changed = true;
+            }
+            if (changed && w.jit_clear_cache_js) w.jit_clear_cache_js();
+        }
         const pm = (globalThis as any).preemption;
         if (pm?.setTier2Threshold) pm.setTier2Threshold(threshold);
         else w.set_jit_config(15, threshold >>> 0);
         const g = (i: number) => (w.get_jit_config ? (w.get_jit_config(i) >>> 0) : -1);
-        console.log(`[dbg] JIT_TIER2_THRESHOLD=${g(15)} tier2SpecBudget=${g(16)} tier2MaxPages=${g(17)} (runtime knob, no cache clear)`);
+        console.log(`[dbg] JIT_TIER2_RETIRED_THRESHOLD=${g(15)} tier2SpecBudget=${g(16)} tier2MaxPages=${g(17)} (0=off+clear; codegen budget changes clear)`);
     },
     /** JIT bookkeeping health — the counters that catch slot-recycling/stale-dispatch
      *  corruption (the silent wrong-entry class). doubleFreeSkipped > 0 means a wasm
@@ -700,11 +754,14 @@ export const dbg = {
         console.log(`[dbg] jitStaticsMap ${JSON.stringify(r)}`);
         return r;
     },
-    /** Hotness-tiering observability: pages currently tier-2-marked, successful promotions,
-     *  and promotions REFUSED because the page-set cap (256) was full. blockedByCap > 0
-     *  with a saturated pageCount means the hot set outgrew the cap — the exact failure
-     *  mode that makes threshold changes read as "no effect" (see the in-race NFSU A/B). */
-    tier2Stats(): { pageCount: number; promotions: number; blockedByCap: number; threshold: number } | null {
+    /** Hotness-tiering observability. The 256-page active set is retired-instruction
+     *  weighted and uses hysteretic coarse-LRU replacement. blockedByCap counts admission
+     *  deferrals while candidates gather enough evidence to displace active pages. */
+    tier2Stats(): {
+        pageCount: number; promotions: number; blockedByCap: number; evictions: number;
+        threshold: number; chainEntries: number; directEntries: number; chainShare: number;
+        chainAccounting: number; pendingDropped: number;
+    } | null {
         const w = wasm(); if (!w?.jit_get_tier2_page_count) {
             console.warn("[dbg] jit_get_tier2_page_count missing — rebuild vendor/v86 (build-wasm.sh)");
             return null;
@@ -718,6 +775,7 @@ export const dbg = {
             pageCount: w.jit_get_tier2_page_count() >>> 0,
             promotions: w.jit_get_tier2_promotions() >>> 0,
             blockedByCap: w.jit_get_tier2_blocked_by_cap() >>> 0,
+            evictions: w.jit_get_tier2_evictions ? (w.jit_get_tier2_evictions() >>> 0) : -1,
             threshold: w.get_jit_config ? (w.get_jit_config(15) >>> 0) : -1,
             chainEntries: chain,
             directEntries: direct,
@@ -725,7 +783,7 @@ export const dbg = {
             chainAccounting: w.get_jit_config ? (w.get_jit_config(20) >>> 0) : -1,
             pendingDropped: w.jit_get_tier2_pending_dropped ? (w.jit_get_tier2_pending_dropped() >>> 0) : -1,
         };
-        console.log(`[dbg] tier2: pages=${s.pageCount}/256 promotions=${s.promotions} blockedByCap=${s.blockedByCap} threshold=${s.threshold} chainShare=${(100 * s.chainShare).toFixed(1)}% (accounting=${s.chainAccounting}, droppedPending=${s.pendingDropped})`);
+        console.log(`[dbg] tier2: pages=${s.pageCount}/256 promotions=${s.promotions} evictions=${s.evictions} blockedByCap=${s.blockedByCap} retiredThreshold=${s.threshold} chainShare=${(100 * s.chainShare).toFixed(1)}% (entryCensus=${s.chainAccounting}, droppedPending=${s.pendingDropped})`);
         return s;
     },
     /**
@@ -733,14 +791,14 @@ export const dbg = {
      *
      * Module counts answer "how many modules sit in baseline"; the question that gates
      * the branch-hint and module-churn tracks is "what share of EXECUTION never reaches
-     * the optimizing tier" — hints are only read by the optimizing tier. So each live
-     * slot's entry delta (jit_get_module_entry_total) is attributed to the tier observed
-     * for that slot, and the shares are over entries, not modules.
+     * the optimizing tier". The primary share is therefore retired-instruction weighted;
+     * entry-weighted shares remain alongside it to expose dispatch-heavy code.
      *
      * Each call reports the delta since the PREVIOUS call, so the usage is:
-     * jitTierStats() → let the game run → jitTierStats(). A negative per-slot delta means
-     * the slot was recycled (free zeroes the counter); its entries are attributed to the
-     * new occupant and counted in `recycled`.
+     * jitTierStats() → let the game run → jitTierStats(). Function identity detects slot
+     * recycling. A monotonic Rust-side retired total catches work from modules freed between
+     * samples; that work is reported as `unknown`, never silently dropped or credited to the
+     * replacement occupant.
      *
      * The tier probe needs Chrome launched with --js-flags=--allow-natives-syntax
      * (BS_CHROME_FLAGS in cdp-core). Without it tiers read `unknown` and only the churn
@@ -767,19 +825,34 @@ export const dbg = {
         const probe: ((f: any) => number) | null = g.__jitTierProbe;
 
         const prev: Map<number, number> = g.__jitTierPrev ?? new Map<number, number>();
+        const prevRetired: Map<number, number> = g.__jitTierRetiredPrev ?? new Map<number, number>();
+        const prevFunctions: Map<number, unknown> = g.__jitTierFunctionPrev ?? new Map<number, unknown>();
+        const hadBaseline = g.__jitTierPrev instanceof Map;
         const cur = new Map<number, number>();
+        const curRetired = new Map<number, number>();
+        const curFunctions = new Map<number, unknown>();
         const entries = { liftoff: 0, turbofan: 0, unknown: 0 };
+        const retired = { liftoff: 0, turbofan: 0, unknown: 0 };
         const modules = { liftoff: 0, turbofan: 0, unknown: 0, empty: 0 };
         let recycled = 0;
 
         for (let i = 0; i < WASM_TABLE_SIZE; i++) {
             const f = table.get(i + WASM_TABLE_OFFSET);
             if (!f) { modules.empty++; continue; }
+            curFunctions.set(i, f);
             const total = w.jit_get_module_entry_total(i) >>> 0;
             cur.set(i, total);
-            const before = prev.get(i) ?? 0;
-            let delta = total - before;
-            if (delta < 0) { delta = total; recycled++; }   // slot recycled since last call
+            const sameOccupant = hadBaseline && prevFunctions.get(i) === f;
+            const before = sameOccupant ? (prev.get(i) ?? total) : total;
+            let delta = hadBaseline ? total - before : 0;
+            if (!sameOccupant && hadBaseline) { delta = total; if (prevFunctions.has(i)) recycled++; }
+            else if (delta < 0) delta = (total - before) >>> 0; // u32 census wrap
+            const retiredTotal = w.jit_get_module_retired_total ? Number(w.jit_get_module_retired_total(i)) : 0;
+            curRetired.set(i, retiredTotal);
+            const retiredBefore = sameOccupant ? (prevRetired.get(i) ?? retiredTotal) : retiredTotal;
+            let retiredDelta = hadBaseline ? retiredTotal - retiredBefore : 0;
+            if (!sameOccupant && hadBaseline) retiredDelta = retiredTotal;
+            else if (retiredDelta < 0) retiredDelta = retiredTotal;
 
             let tier: keyof typeof entries = "unknown";
             if (probe) {
@@ -789,30 +862,60 @@ export const dbg = {
                 } catch { /* not a wasm function / probe unavailable */ }
             }
             entries[tier] += delta;
+            retired[tier] += retiredDelta;
             modules[tier]++;
         }
         g.__jitTierPrev = cur;
+        g.__jitTierRetiredPrev = curRetired;
+        g.__jitTierFunctionPrev = curFunctions;
+
+        const globalRetired = w.jit_get_tier2_retired_total ? Number(w.jit_get_tier2_retired_total()) : 0;
+        const globalBefore = hadBaseline ? Number(g.__jitTierGlobalRetiredPrev ?? globalRetired) : globalRetired;
+        const globalRetiredDelta = Math.max(0, globalRetired - globalBefore);
+        g.__jitTierGlobalRetiredPrev = globalRetired;
+        const observedRetired = retired.liftoff + retired.turbofan + retired.unknown;
+        const unobservedRetired = Math.max(0, globalRetiredDelta - observedRetired);
+        retired.unknown += unobservedRetired;
 
         const totalEntries = entries.liftoff + entries.turbofan + entries.unknown;
-        const pct = (n: number) => totalEntries ? +(100 * n / totalEntries).toFixed(2) : 0;
+        const totalRetired = retired.liftoff + retired.turbofan + retired.unknown;
+        const entryPct = (n: number) => totalEntries ? +(100 * n / totalEntries).toFixed(2) : 0;
+        const retiredPct = (n: number) => totalRetired ? +(100 * n / totalRetired).toFixed(2) : 0;
+        // Retired accounting is compiled INTO the modules, and only while tiering is on
+        // (jit.rs:6248 — an OFF module omits the calls). With idx 15 at its shipping 0 the
+        // split is structurally empty, and "L=0% T=0% (n=0)" reads as a measured answer to
+        // the question the caller asked. `null` + a reason is the answer; `entryShare` is
+        // the field that stays valid either way.
+        const tier2Threshold = w.get_jit_config ? (w.get_jit_config(15) >>> 0) : null;
+        const shareReason = tier2Threshold === null ? "tier2-threshold-unreadable"
+            : tier2Threshold === 0 ? "tier2-off"
+                : totalRetired === 0 ? "no-retired-instructions" : null;
         const churn = {
             promotions: w.jit_get_tier2_promotions ? w.jit_get_tier2_promotions() >>> 0 : -1,
             blockedByCap: w.jit_get_tier2_blocked_by_cap ? w.jit_get_tier2_blocked_by_cap() >>> 0 : -1,
+            evictions: w.jit_get_tier2_evictions ? w.jit_get_tier2_evictions() >>> 0 : -1,
             doubleFreeSkipped: w.jit_get_double_free_skipped ? w.jit_get_double_free_skipped() >>> 0 : -1,
             freeListCount: w.jit_get_wasm_table_index_free_list_count ? w.jit_get_wasm_table_index_free_list_count() >>> 0 : -1,
             cacheSize: w.jit_get_cache_size ? w.jit_get_cache_size() >>> 0 : -1,
             tier2Pages: w.jit_get_tier2_page_count ? w.jit_get_tier2_page_count() >>> 0 : -1,
-            // blockedByCap counts ATTEMPTS; this counts distinct starved pages. The two
-            // together say whether the cap needs raising or the policy needs eviction.
+            // blockedByCap counts admission deferrals; this counts distinct probationary
+            // pages. Together they show whether contention is narrow/repeated or broad.
             blockedDistinct: w.jit_get_tier2_blocked_distinct ? w.jit_get_tier2_blocked_distinct() >>> 0 : -1,
         };
+        const share: JitTierShare | null = shareReason ? null
+            : { liftoff: retiredPct(retired.liftoff), turbofan: retiredPct(retired.turbofan), unknown: retiredPct(retired.unknown) };
         const out = {
             nativesSyntax: !!probe,
-            entries, modules, recycled, totalEntries,
-            share: { liftoff: pct(entries.liftoff), turbofan: pct(entries.turbofan), unknown: pct(entries.unknown) },
+            entries, retired, modules, recycled, unobservedRetired, globalRetiredDelta,
+            totalEntries, totalRetired, tier2Threshold,
+            entryShare: { liftoff: entryPct(entries.liftoff), turbofan: entryPct(entries.turbofan), unknown: entryPct(entries.unknown) },
+            share, shareReason,
             churn,
         };
-        console.log(`[dbg][jittier] natives=${out.nativesSyntax} entries L=${out.share.liftoff}% T=${out.share.turbofan}% ?=${out.share.unknown}% (n=${totalEntries}) modules L=${modules.liftoff} T=${modules.turbofan} ?=${modules.unknown} empty=${modules.empty} recycled=${recycled} promotions=${churn.promotions} blockedByCap=${churn.blockedByCap}`);
+        const retiredText = share
+            ? `retired L=${share.liftoff}% T=${share.turbofan}% ?=${share.unknown}% (n=${totalRetired})`
+            : `retired UNAVAILABLE (${shareReason})`;
+        console.log(`[dbg][jittier] natives=${out.nativesSyntax} ${retiredText} entries L=${out.entryShare.liftoff}% T=${out.entryShare.turbofan}% ?=${out.entryShare.unknown}% (n=${totalEntries}) modules L=${modules.liftoff} T=${modules.turbofan} ?=${modules.unknown} empty=${modules.empty} recycled=${recycled} promotions=${churn.promotions} evictions=${churn.evictions}`);
         return out;
     },
     /** Retired read-fastmem configuration (ABI slot 9), kept for debugger API compatibility. */
@@ -864,18 +967,6 @@ export const dbg = {
         if (r.danger > 0) console.error(`[dbg][fastmem][audit][JSON] ${JSON.stringify(r.samples)}`);
         return r;
     },
-    /** Read-map safety net: `danger` means a raw load could bypass a required
-     * translation/#PF; `missing` is safe but leaves performance on the slow path. */
-    fastmemReadAudit(maxReport = 32): any {
-        const ptm: any = System.getInstance().process?.pageTableManager;
-        if (!ptm?.auditReadMap) { console.warn('[dbg][fastmem] read audit unavailable (process/wasm not ready)'); return null; }
-        const r = ptm.auditReadMap(maxReport);
-        if (!r) { console.warn('[dbg][fastmem] read audit: wasm export missing'); return null; }
-        const level = r.danger > 0 || r.missing > 0 ? 'error' : 'log';
-        (console as any)[level](`[dbg][fastmem][read-audit] readable=${r.readablePages} danger=${r.danger} missing=${r.missing}${r.danger ? ' ⚠ CORRECTNESS BLOCKER' : r.missing ? ' ⚠ map incomplete' : ' ✓ clean'}`);
-        if (r.danger > 0 || r.missing > 0) console.error(`[dbg][fastmem][read-audit][JSON] ${JSON.stringify(r.samples)}`);
-        return r;
-    },
     /** Lazy-flag tuple in wasm locals (idx 21). Default OFF. Kills per-ALU-op flag stores +
      *  their TurboFan aliasing barriers. Clears the JIT cache — toggle PARKED only. */
     flagLocals(on = true): void {
@@ -901,6 +992,8 @@ export const dbg = {
         const w = wasm();
         switch (action) {
             case "arm": return aotCache.arm(pages);
+            case "armAll": return aotCache.armAll(pages && pages.length ? pages[0] : undefined);
+            case "recording": return aotCache.recordingStats();
             case "disarm": aotCache.disarm(); return { disarmed: true };
             case "snapshot": return aotCache.snapshot();
             case "replay": return aotCache.replay();
@@ -931,6 +1024,50 @@ export const dbg = {
                         bytes: u.bytes.length,
                     })),
                     registered: w?.jit_aot_registered_count ? w.jit_aot_registered_count() >>> 0 : -1,
+                };
+        }
+    },
+    /**
+     * The whole recording flow as two calls, because a play session is not a place to
+     * remember an eight-step sequence.
+     *
+     *   dbg.aotRecord("start")  — capture EVERY module compiled from now on, and arm the
+     *                             next boot to load what this session saves.
+     *   ...play...
+     *   dbg.aotRecord("stop")   — pair the bytes with the engine's publication records and
+     *                             persist them under the game's container.
+     *
+     * `start` deliberately does NOT clear the JIT cache: the point is to record what the
+     * game actually compiles while it is played, warm-up included, since that warm-up is
+     * exactly the cost the next boot gets to skip.
+     */
+    async aotRecord(action = "status", maxPages?: number): Promise<any> {
+        switch (action) {
+            case "start": {
+                const armed = aotCache.armAll(maxPages);
+                // Nothing to arm for the next boot: it loads whatever this game has saved
+                // (emulator.worker.ts), so a recording is picked up by existing, not by a
+                // flag a reload would have dropped.
+                delete (globalThis as Record<string, unknown>).__aotNoAutoLoad;
+                console.log("[dbg] aotRecord START — play the game, then dbg.aotRecord('stop')");
+                return { ...armed, autoLoadNextBoot: true, recording: aotCache.recordingStats() };
+            }
+            case "stop": {
+                const recording = aotCache.recordingStats();
+                const snap = await aotCache.snapshot();
+                aotCache.disarm();
+                const saved = await aotCache.save(aotGameId());
+                const out = { recording, snapshot: snap, saved, gameId: aotGameId() };
+                console.log(`[dbg] aotRecord STOP ${JSON.stringify(out)}`);
+                return out;
+            }
+            case "status":
+            default:
+                return {
+                    recording: aotCache.recordingStats(),
+                    autoLoadNextBoot: !(globalThis as Record<string, unknown>).__aotNoAutoLoad,
+                    units: aotCache.getUnits().length,
+                    boot: (globalThis as Record<string, unknown>).__aotBoot ?? null,
                 };
         }
     },
@@ -991,14 +1128,11 @@ export const dbg = {
         const g = w.get_jit_config ? (w.get_jit_config(22) >>> 0) : -1;
         console.log(`[dbg][branchhints] mask=${g} (authoritative - survives reload) + cache cleared`);
     },
-    /** Fastmem counters and the current read/write map population. */
-    fastmemStats(): any {
+    /** Fastmem counters and the current write-map population. */
+    fastmemStats(): FastmemStats | null {
         const w = wasm(); if (!w?.get_jit_config) return null;
-        const s = {
-            enabled: null,
+        const s: FastmemStats = {
             readsStatus: "retired",
-            speculatedLoadsCompiled: w.fastmem_get_speculated_loads_compiled ? (w.fastmem_get_speculated_loads_compiled() >>> 0) : 0,
-            readMapPages: w.fastmem_read_map_count ? (w.fastmem_read_map_count() >>> 0) : 0,
             // Fastmem-write map (bit0 base, bit1 code, bit2 watch; accept = byte==1).
             writesEnabled: w.get_jit_config ? !!(w.get_jit_config(19) >>> 0) : false,
             speculatedStoresCompiled: w.fastmem_get_speculated_stores_compiled ? (w.fastmem_get_speculated_stores_compiled() >>> 0) : 0,
@@ -1079,6 +1213,80 @@ export const dbg = {
         console.log(`[dbg][pushrun][JSON] ${JSON.stringify(s)}`);
         return s;
     },
+    /**
+     * Configure the targeted block-local read micro-TLB. Mode 2 emits hit/fill census
+     * traffic, mode 1 is the production perf arm, mode 0 is byte-shape OFF.
+     *
+     * MUTATION ONLY, and destructive to the measurement it precedes: the JIT cache is
+     * cleared, so blocks compiled before this call carry neither the shape nor the census.
+     * It returns the applied configuration READ BACK, never counters — the counters are
+     * cumulative since boot, and handing them back under a label just set is how a total
+     * from the previous configuration gets read as this one's result.
+     */
+    setReadTlbCache(mode = 1, codePage = 0x401): Record<string, unknown> | null {
+        const w = wasm(); if (!w?.set_jit_config) return null;
+        w.set_jit_config(30, codePage >>> 0);
+        w.set_jit_config(29, Math.min(2, Math.max(0, mode | 0)));
+        if (w.jit_clear_cache_js) w.jit_clear_cache_js();
+        readTlbMark = null;
+        const applied = {
+            mode: w.get_jit_config ? w.get_jit_config(29) >>> 0 : -1,
+            codePage: w.get_jit_config ? w.get_jit_config(30) >>> 0 : -1,
+            cacheCleared: true,
+            warning: "JIT cache cleared. Warm the workload up, then call readTlbCacheStats() to MARK "
+                + "and again after the window to read it.",
+        };
+        console.log(`[dbg][read-tlb] ${JSON.stringify(applied)}`);
+        return applied;
+    },
+    /**
+     * Read micro-TLB census over the WINDOW since the previous call (the dispatchMark /
+     * dispatchReport shape: a difference of two snapshots, never a total).
+     *
+     * `profiler_dispatch_stat_get(23/24)` is cumulative since boot, so the first call after a
+     * configuration change can only mark. A window is refused — with the reason — when
+     * nothing was counting (DISPATCH_STATS off), when the mode emits no census traffic, or
+     * when the configuration changed inside it; `sinceMark: false` asks for the cumulative
+     * total explicitly, labelled as such.
+     */
+    readTlbCacheStats(sinceMark = true): Record<string, unknown> | null {
+        const w = wasm(); if (!w) return null;
+        const dget = w["profiler_dispatch_stat_get"];
+        const available = typeof dget === "function";
+        const hit = available ? Number(dget(23)) : 0;
+        const fill = available ? Number(dget(24)) : 0;
+        const mode = w.get_jit_config ? w.get_jit_config(29) >>> 0 : -1;
+        const codePage = w.get_jit_config ? w.get_jit_config(30) >>> 0 : -1;
+        const statsGetter = w["get_dispatch_stats"];
+        const statsEnabled = typeof statsGetter === "function" ? statsGetter() >>> 0 : -1;
+        const pct = (h: number, f: number) => (h + f > 0 ? +(100 * h / (h + f)).toFixed(2) : null);
+
+        const prev = readTlbMark;
+        const now = { hit, fill, atMs: Date.now(), mode, codePage };
+        readTlbMark = now;
+
+        const blocked = !available ? "profiler_dispatch_stat_get missing — rebuild vendor/v86 (build-wasm.sh)"
+            : statsEnabled === 0 ? "DISPATCH_STATS is off, so nothing was counting — dbg.dispatchStatsEnable(true) first"
+                : mode !== 2 ? `mode ${mode} emits no census traffic; only mode 2 does`
+                    : !sinceMark ? "cumulative requested (sinceMark: false)"
+                        : !prev ? "first call since the last configuration change: this one MARKS the window"
+                            : prev.mode !== mode || prev.codePage !== codePage
+                                ? "the read-microTLB configuration changed inside the window"
+                                : null;
+        const s = {
+            mode, codePage, statsEnabled,
+            // Since boot, and labelled so. It spans every configuration this process has run.
+            cumulative: { hit, fill, hitPct: pct(hit, fill) },
+            window: blocked ? null : {
+                hit: hit - prev!.hit, fill: fill - prev!.fill,
+                hitPct: pct(hit - prev!.hit, fill - prev!.fill),
+                windowMs: now.atMs - prev!.atMs,
+            },
+            windowReason: blocked,
+        };
+        console.log(`[dbg][read-tlb][JSON] ${JSON.stringify(s)}`);
+        return s;
+    },
     /** Bisection control: toggle dead-flag elision. Routes through PreemptionManager
      *  so the choice survives game reload. Clears JIT cache. */
     deadFlagElision(on = true): void {
@@ -1141,17 +1349,156 @@ export const dbg = {
         console.log(`[dbg] fpu relaxed=${relaxed} statsEnabled=${statsEnabled} hit=${hit} fallback=${fallback} total=${total} hitRate=${(hitRate * 100).toFixed(1)}%${hint}`);
         return stats;
     },
+    /** Snapshot the profiler build's guest-opcode census. The first call establishes a
+     * baseline; later calls return deltas, so the harness can exclude warmup without adding
+     * counters to generated code. Reading happens outside the timed frame window. */
+    opStatsSnapshot(): any {
+        const w = wasm();
+        const get = w?.["get_opstats_buffer"];
+        const g = globalThis as any;
+        const unavailable = (reason: string, details: Record<string, unknown> = {}) => {
+            delete g.__jitOpStatsPrevious;
+            const result = {
+                kind: "jit-opstats", phase: "unavailable", available: false, reason,
+                provenance: { export: "get_opstats_buffer", ...details },
+            };
+            console.warn(`[dbg][opstats] unavailable: ${reason}`);
+            return result;
+        };
+        if (typeof get !== "function") return unavailable("export-missing");
+        // A pre-runtime-switch build exported a zero-argument, always-zero compatibility
+        // stub. Arity still identifies that build, but it no longer says anything about
+        // whether the census RAN: since the census became a runtime switch, the shipping
+        // artifact carries the real reader and `get_opstats()` is the provenance bit.
+        if (get.length < 8) return unavailable("legacy-stub-build", { arity: get.length });
+        const censusOn = w?.["get_opstats"];
+        if (typeof censusOn === "function" && (censusOn() >>> 0) === 0) {
+            return unavailable("census-switch-off", {
+                arity: get.length,
+                hint: "call dbg.opStatsEnable() (or the harness opcodeCensusArm) BEFORE the workload; it clears the "
+                    + "JIT cache so hot code recompiles with the counters, and only then does a table mean anything",
+            });
+        }
+        const current = new Float64Array(0x2000);
+        const rows: Array<{ opcode: number; is0f: boolean; isMem: boolean; fixedG: number; count: number }> = [];
+        const prefixes = new Set([0x26, 0x2e, 0x36, 0x3e, 0x64, 0x65, 0x66, 0x67, 0xf0, 0xf2, 0xf3]);
+        let censusTotal = 0, compiledTotal = 0;
+        let total = 0, memory = 0, x87 = 0, branches = 0, calls = 0, returns = 0;
+        for (let opcode = 0; opcode < 0x100; opcode++) {
+            for (let is0f = 0; is0f < 2; is0f++) {
+                for (let isMem = 0; isMem < 2; isMem++) {
+                    for (let fixedG = 0; fixedG < 8; fixedG++) {
+                        const index = (is0f << 12) | (opcode << 4) | (isMem << 3) | fixedG;
+                        const count = Number(get(false, false, false, false, opcode, !!is0f, !!isMem, fixedG));
+                        const compiled = Number(get(true, false, false, false, opcode, !!is0f, !!isMem, fixedG));
+                        if (!Number.isFinite(count) || !Number.isFinite(compiled)) {
+                            return unavailable("invalid-profiler-census", { arity: get.length });
+                        }
+                        current[index] = count;
+                        censusTotal += count;
+                        compiledTotal += compiled;
+                    }
+                }
+            }
+        }
+        if (censusTotal === 0 && compiledTotal === 0) {
+            return unavailable("empty-profiler-census", { arity: get.length, censusTotal, compiledTotal });
+        }
+        const provenance = {
+            export: "get_opstats_buffer", profilerSignature: true, arity: get.length,
+            censusTotal, compiledTotal,
+        };
+        const previous: Float64Array | undefined = g.__jitOpStatsPrevious;
+        g.__jitOpStatsPrevious = current;
+        if (!previous) {
+            return { kind: "jit-opstats", phase: "baseline", available: true, provenance, total: 0, memory: 0, x87: 0, branches: 0, calls: 0, returns: 0, top: [] };
+        }
+        for (let opcode = 0; opcode < 0x100; opcode++) {
+            for (let is0f = 0; is0f < 2; is0f++) {
+                for (let isMem = 0; isMem < 2; isMem++) {
+                    for (let fixedG = 0; fixedG < 8; fixedG++) {
+                        const index = (is0f << 12) | (opcode << 4) | (isMem << 3) | fixedG;
+                        const count = Math.max(0, current[index] - previous[index]);
+                        if (count === 0 || (!is0f && prefixes.has(opcode))) continue;
+                        const row = { opcode, is0f: !!is0f, isMem: !!isMem, fixedG, count };
+                        rows.push(row);
+                        total += count;
+                        if (isMem) memory += count;
+                        if (!is0f && opcode >= 0xd8 && opcode <= 0xdf) x87 += count;
+                        if ((!is0f && opcode >= 0x70 && opcode <= 0x7f) || (is0f && opcode >= 0x80 && opcode <= 0x8f)) branches += count;
+                        if ((!is0f && opcode === 0xe8) || (!is0f && opcode === 0xff && (fixedG === 2 || fixedG === 3))) calls += count;
+                        if (!is0f && (opcode === 0xc2 || opcode === 0xc3 || opcode === 0xca || opcode === 0xcb)) returns += count;
+                    }
+                }
+            }
+        }
+        rows.sort((a, b) => b.count - a.count);
+        const pct = (count: number) => total > 0 ? +(100 * count / total).toFixed(2) : 0;
+        const result = {
+            kind: "jit-opstats", phase: "delta", available: true, provenance, total,
+            memory, memoryPct: pct(memory), x87, x87Pct: pct(x87),
+            branches, branchesPct: pct(branches), calls, callsPct: pct(calls),
+            returns, returnsPct: pct(returns),
+            top: rows.slice(0, 32).map(row => ({
+                opcode: `${row.is0f ? "0f" : ""}${row.opcode.toString(16).padStart(2, "0")}`,
+                mem: row.isMem, fixedG: row.fixedG, count: row.count, pct: pct(row.count),
+            })),
+        };
+        console.log(`[dbg][opstats][JSON] ${JSON.stringify(result)}`);
+        return result;
+    },
     /** Dispatch-characterisation counters: toggle them
      *  and clear the JIT cache so hot modules recompile WITH the counter increments. OFF by default
      *  (zero cost on the production path). The codegen-emitted counters only land in blocks compiled
      *  while this was ON — so enable it BEFORE driving the workload, then read dbg.dispatchStats(). */
+    /** Permission-bitmap read path (roadmap 03). Clears the JIT cache: only blocks compiled
+     *  while this is on carry the probe, so hot code must recompile and the scene must warm
+     *  up again before any window is marked. Default off. */
+    permMapReads(on = true): { enabled: number; hit: number; miss: number } | null {
+        const w = wasm(); if (!w) return null;
+        const setter = w["set_perm_map_reads"];
+        if (typeof setter !== "function") {
+            console.warn("[dbg] set_perm_map_reads missing — rebuild vendor/v86 (build-wasm.sh)");
+            return null;
+        }
+        setter(on ? 1 : 0);
+        if (w.jit_clear_cache_js) w.jit_clear_cache_js();
+        const dget = w["profiler_dispatch_stat_get"];
+        const out = {
+            enabled: (w["get_perm_map_reads"]?.() ?? -1) >>> 0,
+            hit: typeof dget === "function" ? Number(dget(25)) : -1,
+            miss: typeof dget === "function" ? Number(dget(26)) : -1,
+        };
+        console.log(`[dbg] permMapReads=${out.enabled} (JIT cache cleared). Warm up, then read hit/miss.`);
+        return out;
+    },
+    /** Turn the guest opcode/addressing census on and clear the JIT cache so hot code
+     *  recompiles WITH the per-instruction counters. Costs an increment per retired
+     *  instruction while on, so it measures SHARES, never the FPS of the same window. */
+    opStatsEnable(on = true): void {
+        const w = wasm(); if (!w) return;
+        const setter = w["set_opstats"];
+        if (typeof setter !== "function") {
+            console.warn("[dbg] set_opstats missing — rebuild vendor/v86 (build-wasm.sh)");
+            return;
+        }
+        setter(on ? 1 : 0);
+        if (w["opstats_reset"]) w["opstats_reset"]();
+        if (w.jit_clear_cache_js) w.jit_clear_cache_js();
+        const g = globalThis as any;
+        delete g.__jitOpStatsPrevious;
+        console.log(`[dbg] opStatsEnable=${on ? 1 : 0} (census zeroed + JIT cache cleared). Warm the workload up, then dbg.opStatsSnapshot().`);
+    },
     dispatchStatsEnable(on = true): void {
         const w = wasm(); if (!w) return;
         const setter = w["set_dispatch_stats"];
         if (typeof setter === "function") setter(on ? 1 : 0);
         if (w["profiler_init"]) w["profiler_init"]();
+        // The entry-EIP table is a separate buffer from the stat array; leaving it live
+        // across an arm would blend two workloads' addresses into one ranking.
+        if (w["entry_eip_census_reset"]) w["entry_eip_census_reset"]();
         if (w.jit_clear_cache_js) w.jit_clear_cache_js();
-        console.log(`[dbg] dispatchStatsEnable=${on ? 1 : 0} (counters reset + JIT cache cleared). Drive the workload, then dbg.dispatchStats().`);
+        console.log(`[dbg] dispatchStatsEnable=${on ? 1 : 0} (counters + entry-EIP census reset, JIT cache cleared). Drive the workload, then dbg.dispatchStats().`);
     },
     /** Read the block-chaining dispatch counters. CHAINABLE FRACTION = chainable/reentry is
      *  the go/no-go number: the share of the per-module dispatch tax a WASM tail-call could
@@ -1836,6 +2183,8 @@ export const dbg = {
                 for (const dev of devices.values()) dev.resetSubsystemPerf();
                 const dispatcher = System.getInstance().process?.dispatcher as { resetWbufStats?: () => void } | undefined;
                 dispatcher?.resetWbufStats?.();
+                resetD3D9QueryLedger();
+                for (const dev of devices.values()) queryManagerOf(dev)?.resetCounters?.();
             }
             const snap = getD3D9PerfSnapshot();
             const stateTracker: Record<string, number> = {};
@@ -1856,13 +2205,32 @@ export const dbg = {
             snap.stateBlocks.liveBlocks = stateBlocks.size;
             snap.devices = devices.size;
             const d = System.getInstance().process?.dispatcher as {
-                getWbufStats?: () => { hits: number; outTrapHits: number; coalescedSkips: number; registered: number };
+                getWbufStats?: () => {
+                    hits: number; outTrapHits: number; coalescedSkips: number; barrierEntries: number;
+                    pairRuns: number; pairs: number; pairFallbacks: number; registered: number;
+                };
                 getShadowStats?: () => Record<string, number>;
             } | undefined;
             snap.wbuf = d?.getWbufStats?.() ?? null;
+            if (snap.wbuf) {
+                snap.arenaRunReconcile = reconcileD3D9ArenaRuns(snap.wbuf, snap.api, snap.backend);
+            } else {
+                snap.arenaRunReconcile = null;
+            }
             // Guest-side setter-shadow skip counters (redundant SetRenderState/SetSamplerState
             // short-circuited in guest code — invisible to the api/skip counters above).
             snap.setterShadow = d?.getShadowStats?.() ?? null;
+            // Query lifecycle: the D3D9-side ledger plus each live manager's own counters.
+            // A query that stopped resolving is invisible in every counter above it.
+            const queryLedger: Record<string, number> = { ...getD3D9QueryLedger() };
+            for (const dev of devices.values()) {
+                const counters = queryManagerOf(dev)?.getCounters?.();
+                if (!counters) continue;
+                for (const [k, v] of Object.entries(counters)) {
+                    queryLedger[k] = (queryLedger[k] ?? 0) + v;
+                }
+            }
+            snap.queries = queryLedger;
             console.log(`[dbg][d3d9Perf][JSON] ${JSON.stringify(snap)}`);
             return snap;
         } catch (e) { console.warn('[dbg] d3d9Perf err', e); return null; }
@@ -1980,7 +2348,7 @@ export const dbg = {
         }
     },
     /** Watch the tier-2-promoted pages (known-hot by construction — they crossed the
-     *  re-entry threshold) under trace2, up to the 64-page watch cap. This is the
+     *  retired-instruction threshold) under trace2, up to the 64-page watch cap. This is the
      *  page-selection answer for the region-recompiler flow when no hot-page list is known a
      *  priori: EIP sampling can't see inside cycle slices (JS timers only fire at
      *  yield points → 100% idle-EIP samples). Flow: trace2WatchTier2() → play ~10s →
@@ -2690,7 +3058,19 @@ export const dbg = {
 export function handleDbgCommand(cmd: string, args: any[]): void {
     const fn = (dbg as any)[cmd];
     if (typeof fn === "function") {
-        try { fn(...(args || [])); } catch (e) { console.warn(`[dbg] error in ${cmd}:`, e); }
+        try {
+            const r = fn(...(args || []));
+            // `window.dbg` is a postMessage proxy — nothing is returned to the caller, so a
+            // command's answer, and an async rejection, is only ever visible if logged HERE.
+            if (r && typeof r.then === "function") {
+                r.then(
+                    (v: unknown) => { if (v !== undefined) console.log(`[dbg] ${cmd} ->`, v); },
+                    (e: unknown) => console.warn(`[dbg] error in ${cmd}:`, e),
+                );
+            } else if (r !== undefined) {
+                console.log(`[dbg] ${cmd} ->`, r);
+            }
+        } catch (e) { console.warn(`[dbg] error in ${cmd}:`, e); }
     } else {
         console.warn(`[dbg] unknown command: ${cmd}`);
     }

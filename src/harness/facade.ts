@@ -416,6 +416,34 @@ export function installHarnessFacade(worker: Worker, getInputView?: () => Int32A
         return { ...(live as object), persisted, survivesReload: persisted, store };
     }
 
+    /** Remove the complete session-scoped worker-flag envelope before a clean benchmark.
+     *  Clearing a hand-maintained flag list is not sufficient: a retired experiment can
+     *  remain in localStorage and silently make an otherwise empty arm non-reproducible.
+     *  The envelope alone is not sufficient either — the LIVE worker keeps every flag it
+     *  already applied — so the flags are dropped there too, and the result says which of
+     *  the two actually happened rather than claiming both. */
+    async function resetWorkerFlags(): Promise<unknown> {
+        const session = sessionFromLocation(window.location.search);
+        const store = session ? `bs_debug_flags:${session}` : "bs_debug_flags";
+        try {
+            localStorage.removeItem(store);
+        } catch (e) {
+            throw new Error(`resetWorkerFlags: could not clear localStorage ` +
+                `(${(e as Error).message}); refusing a contaminated clean arm`);
+        }
+        let clearedLive = false;
+        let liveCleared: string[] = [];
+        let liveError: string | null = null;
+        try {
+            const live = await rpc("resetWorkerFlags", [], { timeoutMs: 3000 }) as { cleared?: string[] };
+            liveCleared = Array.isArray(live?.cleared) ? live.cleared : [];
+            clearedLive = true;
+        } catch (e) {
+            liveError = (e as Error).message;
+        }
+        return { clearedStorage: true, clearedLive, liveCleared, liveError, survivesReload: true, store };
+    }
+
     async function loadPe(url: string): Promise<unknown> {
         const w = window as any;
         if (typeof w.loadApp !== "function") throw new Error("window.loadApp not available");
@@ -521,6 +549,7 @@ export function installHarnessFacade(worker: Worker, getInputView?: () => Int32A
 
     async function runOneStep(step: HarnessStep): Promise<unknown> {
         if (step.cmd === "setWorkerFlag") return setWorkerFlag(step.args[0] as string, step.args[1]);
+        if (step.cmd === "resetWorkerFlags") return resetWorkerFlags();
         if (step.cmd === "openWgb") return openWgb(step.args[0] as string, step.args[1] as any);
         if (step.cmd === "loadPe") return loadPe(step.args[0] as string);
         if (step.cmd === "audioGesture") return audioGesture();

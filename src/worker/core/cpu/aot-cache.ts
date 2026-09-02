@@ -139,15 +139,31 @@ interface AotVersion {
     jitCodegenFingerprintLo: number;
     jitCodegenFingerprintHi: number;
     ramSize: number;
+    /**
+     * Base of guest RAM inside the wasm linear memory.
+     *
+     * The JIT bakes this as an i32.const into every module (the TLB entry carries
+     * `high + mem8`), and it is an `alloc::alloc` result — nothing else in this tuple
+     * covers it. Without it a session whose allocator returned a different base would
+     * replay modules that read the WRONG MEMORY: not a refusal, a silent corruption, which
+     * is the one failure class content binding cannot catch (it hashes guest pages, not the
+     * wasm heap layout). plan/aot-compiler-design.md names this and says Stage A should be
+     * same-session capture->publish; persisting across sessions is only safe with the base
+     * in the key.
+     */
+    mem8Base: number;
 }
 
-const AOT_ABI = 5;
+const AOT_ABI = 6;
 
 export class AotCache {
     private units: AotUnit[] = [];
     private live: LiveUnit[] = [];
     private engineSha: string | null = null;
     private loadedVersion: AotVersion | null = null;
+    /** True once `load()` has read the persisted set in THIS session. `save()` may only
+     *  prune the store when this holds — see the pruning branch there. */
+    private loadedFromStore = false;
 
     private cpu(): any {
         const sys = (globalThis as any).System?.getInstance?.() ?? null;
@@ -179,6 +195,41 @@ export class AotCache {
         // every tier-2 promotion, and only the newest module describes the live page anyway.
         (globalThis as any).__wasmDump = { pages: new Set(list), out: [], keepLatestPerPage: true };
         return { armed: list.length, pages: list };
+    }
+
+    /**
+     * Arm capture for EVERY module the engine compiles from now on.
+     *
+     * `arm()` can only name pages that are already hot, which over a play session is the
+     * warm-up rather than the game: the pages that matter become hot progressively, and a
+     * set fixed at the start records none of them. A recording session wants the opposite
+     * default — take everything, and bound it explicitly.
+     *
+     * `maxPages` is that bound. Past it records are dropped and COUNTED, so a truncated
+     * capture reads as a number in `recordingStats()` instead of a quietly short unit list.
+     */
+    armAll(maxPages = 4096): { armed: "all"; maxPages: number } {
+        (globalThis as any).__wasmDump = {
+            out: [], keepLatestPerPage: true, maxPages, dropped: 0,
+        };
+        return { armed: "all", maxPages };
+    }
+
+    /** What the live capture holds right now — including what it had to drop. */
+    recordingStats(): { armed: boolean; mode: "all" | "pages" | null; modules: number; bytes: number; dropped: number; maxPages: number | null } {
+        const dump = (globalThis as any).__wasmDump;
+        if (!dump) return { armed: false, mode: null, modules: 0, bytes: 0, dropped: 0, maxPages: null };
+        const out: WasmDumpRecord[] = dump.out ?? [];
+        let bytes = 0;
+        for (const r of out) bytes += r.len >>> 0;
+        return {
+            armed: true,
+            mode: dump.pages ? "pages" : "all",
+            modules: out.length,
+            bytes,
+            dropped: dump.dropped | 0,
+            maxPages: dump.maxPages ?? null,
+        };
     }
 
     disarm(): void { (globalThis as any).__wasmDump = undefined; }
@@ -272,7 +323,21 @@ export class AotCache {
                 Logger.warn(LogCategory.SYSTEM, "[AOT] snapshot refused: JIT version identity changed while hashing");
                 return { units: 0, skipped: skipped + captured.length };
             }
-            this.units.push(...snapshotUnits);
+            // A newly captured unit SUPERSEDES a loaded one covering the same page rather
+            // than joining it. Both describe the same guest code, only one can own the page
+            // at replay, and the loser is refused as a duplicate — so keeping both would
+            // grow the persisted set every generation while the useful half stayed constant.
+            // The fresh capture wins because its page bytes were hashed from the live guest
+            // just now, and the stale one may predate a patch.
+            const supersededPages = new Set<number>();
+            for (const u of snapshotUnits) for (const p of u.pages) supersededPages.add(p.physPage);
+            const kept = this.units.filter((u) => !u.pages.some((p) => supersededPages.has(p.physPage)));
+            const dropped = this.units.length - kept.length;
+            this.units = kept.concat(snapshotUnits);
+            if (dropped > 0) {
+                Logger.log(LogCategory.SYSTEM,
+                    `[AOT] snapshot superseded ${dropped} earlier unit(s) covering the same pages`);
+            }
             this.loadedVersion = sourceVersion;
         } catch {
             Logger.warn(LogCategory.SYSTEM, "[AOT] snapshot refused: cannot recheck JIT version identity");
@@ -311,6 +376,10 @@ export class AotCache {
         this.units = [];
         this.live = [];
         this.loadedVersion = null;
+        // Forgetting the units means no longer knowing what the store holds, so a later
+        // save() must not prune it either — otherwise `clear()` followed by a short
+        // recording deletes every unit an earlier session saved.
+        this.loadedFromStore = false;
     }
 
     /** SHA-256 of the engine binary. Fetched once — the browser already has it cached, and
@@ -347,6 +416,9 @@ export class AotCache {
         const jitCodegenFingerprintLo = w.jit_codegen_fingerprint_lo() >>> 0;
         const jitCodegenFingerprintHi = w.jit_codegen_fingerprint_hi() >>> 0;
         const ramSize = cpu?.memory_size ? cpu.memory_size[0] >>> 0 : -1;
+        // -1 when the engine predates the export: a distinct value from any real base, so
+        // an old artifact keys differently rather than colliding with a real one.
+        const mem8Base = typeof w.get_mem8_base === "function" ? w.get_mem8_base() >>> 0 : -1;
         const engine = await this.engineFingerprint();
         return {
             abi: AOT_ABI,
@@ -356,6 +428,7 @@ export class AotCache {
             jitCodegenFingerprintLo,
             jitCodegenFingerprintHi,
             ramSize,
+            mem8Base,
         };
     }
 
@@ -393,12 +466,25 @@ export class AotCache {
 
         // Every engine rebuild or codegen-flag flip mints a NEW versionKey directory, and the
         // old one is dead the moment it does — nothing will ever match its key again. Drop the
-        // siblings, and the unit files this save did not produce, or the game's OPFS container
-        // accumulates megabytes per rebuild forever.
-        const wanted = new Set(this.units.map(u => `${u.entryPage.toString(16)}.wasm`));
-        wanted.add("index.json");
+        // siblings, or the game's OPFS container accumulates megabytes per rebuild forever.
         await pruneDirectory(aot, (name) => name === key, "aot");
-        await pruneDirectory(dir, (name) => wanted.has(name), `aot/${key}`);
+
+        // Pruning unit files INSIDE the live key is only safe when `this.units` is the whole
+        // picture — i.e. when this session actually loaded what was already there. A session
+        // that booted with auto-load off (an A/B arm, and `__aotNoAutoLoad` persists in
+        // localStorage across reloads) starts with an empty set and would otherwise DELETE
+        // every unit an earlier recording saved. Recording is meant to accumulate over
+        // several play sessions; silently replacing the set with a subset is the opposite.
+        if (this.loadedFromStore) {
+            const wanted = new Set(this.units.map(u => `${u.entryPage.toString(16)}.wasm`));
+            wanted.add("index.json");
+            await pruneDirectory(dir, (name) => wanted.has(name), `aot/${key}`);
+        } else {
+            Logger.warn(LogCategory.SYSTEM,
+                "[AOT] save: this session did not load the store, so earlier unit files are left on "
+                + "disk but index.json now names only this session's units — the next boot loads ONLY "
+                + "these. Re-record from a session that loads the cache to keep the earlier ones.");
+        }
 
         for (const u of this.units) {
             const h = await dir.getFileHandle(`${u.entryPage.toString(16)}.wasm`, { create: true });
@@ -443,6 +529,8 @@ export class AotCache {
             }
             this.units = loaded;
             this.loadedVersion = index.version;
+            // Only now may save() prune: this session has seen the whole store.
+            this.loadedFromStore = true;
             Logger.log(LogCategory.SYSTEM, `[AOT] loaded ${loaded.length} units from aot/${key}`);
             return { loaded: loaded.length, key };
         } catch {
@@ -466,6 +554,11 @@ export class AotCache {
         }));
         return r;
     }
+
+    // Some pages hold code WE patch after the boot replay (thunk prologues, hle-lib JMP
+    // patches), so a unit that fails its content check at boot may match later in the same
+    // session. A retry of such units must publish INCREMENTALLY: `replay()` rebuilds
+    // `this.live`, so re-running it drops the registrations the first pass made.
 
     /**
      * Per-unit liveness. `jit_aot_page_table_index(page) === idx` alone is not evidence: a
@@ -494,7 +587,7 @@ export class AotCache {
      * Publish the captured units. Refusal is always safe — the page keeps the ordinary JIT
      * path — so every failure mode here degrades performance, never correctness.
      */
-    async replay(): Promise<{ registered: number; refused: Record<string, number> }> {
+    async replay(): Promise<{ registered: number; refused: Record<string, number>; refusedUnits?: Array<{ entry: string; pages: string[]; bytes: number; entries: number; why: string }> }> {
         if (this.loadedVersion) {
             let liveVersion: AotVersion;
             try {
@@ -514,7 +607,23 @@ export class AotCache {
         const imports = cpu?.["jit_imports"];
         const mem: Uint8Array | undefined = cpu?.mem8;
         const refused: Record<string, number> = {};
-        const no = (why: string) => { refused[why] = (refused[why] ?? 0) + 1; };
+        // A reason histogram says HOW MANY were refused, never WHICH — and the units differ by
+        // two orders of magnitude in size and entry count, so "1 refused" can mean a 10 KB
+        // stub or the 375 KB unit that carries almost all the value. Name them.
+        const refusedUnits: Array<{ entry: string; pages: string[]; bytes: number; entries: number; why: string }> = [];
+        let noUnit: AotUnit | null = null;
+        const no = (why: string) => {
+            refused[why] = (refused[why] ?? 0) + 1;
+            if (noUnit) {
+                refusedUnits.push({
+                    entry: `0x${noUnit.entryPage.toString(16)}`,
+                    pages: noUnit.pages?.map((p) => `0x${p.physPage.toString(16)}`) ?? [],
+                    bytes: noUnit.bytes?.length ?? 0,
+                    entries: noUnit.pages?.reduce((a, p) => a + p.entries.length, 0) ?? 0,
+                    why,
+                });
+            }
+        };
         const txExports = [
             "jit_aot_tx_begin", "jit_aot_tx_page_begin", "jit_aot_tx_entry_push",
             "jit_aot_tx_page_finish", "jit_aot_tx_prepare_finish", "jit_aot_tx_commit",
@@ -530,6 +639,7 @@ export class AotCache {
         // sha256 awaits, and the guest must not run in the middle of the second pass.
         const candidates: Array<{ unit: AotUnit; fn: unknown }> = [];
         for (const u of this.units) {
+            noUnit = u;
             // With no pages the publication loop would publish nothing and still count as a
             // success. snapshot() never produces that; a truncated index.json could.
             if (!u.pages?.length) { no("no-pages"); continue; }
@@ -622,7 +732,7 @@ export class AotCache {
         }
         if (registered > 0 && w.jit_aot_flush_tlb) w.jit_aot_flush_tlb();
         Logger.log(LogCategory.SYSTEM, `[AOT] replay: registered=${registered} refused=${JSON.stringify(refused)}`);
-        return { registered, refused };
+        return { registered, refused, ...(refusedUnits.length ? { refusedUnits } : {}) };
     }
 }
 

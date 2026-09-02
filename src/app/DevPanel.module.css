@@ -20,7 +20,19 @@
   margin: 0 4px;
 }
 
+/* The AOT recording state, next to its buttons: the ritual's failure mode is silent, so
+   its state has to be readable without opening a console. */
+.status-text {
+  font-size: 11px;
+  opacity: 0.75;
+  white-space: nowrap;
+  max-width: 34ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 @media (max-width: 720px) {
   .button-group { gap: 6px; }
   .divider { display: none; }
+  .status-text { display: none; }
 }

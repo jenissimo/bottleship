@@ -22,6 +22,13 @@ interface DevPanelProps {
   onToggleFpuStrict: (strict: boolean) => void;
   loggingEnabled: boolean;
   onToggleLogging: () => void;
+  /** AOT code cache — see docs/performance/sota-roadmap/05-A0-play-and-record.md. */
+  aotRecording: boolean;
+  aotAutoLoad: boolean;
+  aotStatus: string;
+  onAotRecord: () => void;
+  onAotAutoLoad: () => void;
+  onAotStatus: () => void;
 }
 
 export default function DevPanel(props: DevPanelProps) {
@@ -79,6 +86,29 @@ export default function DevPanel(props: DevPanelProps) {
         >
           {props.fpuStrictEnabled ? "FPU: Strict" : "FPU: Relaxed"}
         </ActionButton>
+        <div className={s["divider"]} />
+        <ActionButton
+          variant="secondary"
+          active={props.aotRecording}
+          onClick={props.onAotRecord}
+          title={props.aotRecording
+            ? "Stop and SAVE the recording. Nothing is kept until you press this — closing the tab loses the session."
+            : "Record every module the JIT compiles from now on. Play the parts that stutter, then press again to save; the next load of this game reuses them."}
+        >
+          {props.aotRecording ? "⏹ AOT: Save" : "⏺ AOT: Record"}
+        </ActionButton>
+        <ActionButton
+          variant="secondary"
+          toggledOff={!props.aotAutoLoad}
+          onClick={props.onAotAutoLoad}
+          title="Load this game's recorded code cache on start. Off is the A/B arm — and a recording made while off REPLACES the saved set rather than adding to it."
+        >
+          {props.aotAutoLoad ? "AOT: Auto" : "AOT: Off"}
+        </ActionButton>
+        <ActionButton variant="secondary" onClick={props.onAotStatus} title="Loaded / entered units, and what the live recording holds">
+          AOT: Status
+        </ActionButton>
+        {props.aotStatus && <span className={s["status-text"]}>{props.aotStatus}</span>}
         <div className={s["divider"]} />
         <ActionButton
           variant="secondary"

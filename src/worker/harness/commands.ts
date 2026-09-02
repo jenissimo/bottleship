@@ -22,12 +22,17 @@ import {
 } from "./cmds/imports";
 import { registerLogCommands } from "./cmds/logs";
 import { registerScreenCommands } from "./cmds/screen";
+import { registerSceneCommands } from "./cmds/scene";
+import { registerCodeSceneCommands } from "./cmds/code-scene";
 import { registerBreakpointCommands } from "./cmds/breakpoints";
 import { registerTextureCommands } from "./cmds/textures";
 import { registerGlCommands } from "./cmds/gl";
 import { registerGlideCommands } from "./cmds/glide";
 import { registerFsCommands } from "./cmds/fs";
 import { registerIoCommands } from "./cmds/io";
+import { registerIdleCommands } from "./cmds/idle";
+import { registerDispatchCommands } from "./cmds/dispatch";
+import { registerCensusCommands } from "./cmds/census";
 import { registerPacingCommands } from "./cmds/pacing";
 import { registerFixtureCommands } from "./cmds/fixture";
 import { registerRegistryCommands } from "./cmds/reg";
@@ -66,6 +71,8 @@ export function installHarnessCommands(): void {
     registerStubCleanupAuditCommand(harnessService);
     registerLogCommands(harnessService);
     registerScreenCommands(harnessService);
+    registerSceneCommands(harnessService);
+    registerCodeSceneCommands(harnessService);
     registerBreakpointCommands(harnessService);
     registerTextureCommands(harnessService);
     registerGlCommands(harnessService);
@@ -73,6 +80,9 @@ export function installHarnessCommands(): void {
     registerGpuCommands(harnessService);
     registerFsCommands(harnessService);
     registerIoCommands(harnessService);
+    registerIdleCommands(harnessService);
+    registerDispatchCommands(harnessService);
+    registerCensusCommands(harnessService);
     registerPacingCommands(harnessService);
     registerFixtureCommands(harnessService);
     registerRegistryCommands(harnessService);

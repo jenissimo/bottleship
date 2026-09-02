@@ -333,6 +333,12 @@ export default function App() {
   const [frameAnalysisOpen, setFrameAnalysisOpen] = useState(false);
   const [statsOverlayEnabled, setStatsOverlayEnabled] = useState(false);
   const [fpuStrictEnabled, setFpuStrictEnabled] = useState(false);
+  // AOT code cache (docs/performance/sota-roadmap/05-A0-play-and-record.md). Recording is a
+  // two-step ritual whose failure mode is silent — a `stop` that never ran keeps nothing —
+  // so the panel shows the state rather than expecting it to be remembered.
+  const [aotRecording, setAotRecording] = useState(false);
+  const [aotAutoLoad, setAotAutoLoad] = useState(true);
+  const [aotStatus, setAotStatus] = useState<string>("");
   const [messageBox, setMessageBox] = useState<MessageBoxRequest | null>(null);
 
   // Publish a dismisser for the prompt that is on screen. The harness's auto-answer is
@@ -2529,8 +2535,14 @@ export default function App() {
       const doc = document as Document & { webkitFullscreenElement?: Element | null };
       const fs = Boolean(doc.fullscreenElement || doc.webkitFullscreenElement);
       setIsFullscreen(fs);
-      // Unsupported / not granted → ESC keeps exiting fullscreen, same as before.
-      if (fs) kb?.lock?.(["Escape"]).catch(() => { /* best-effort */ });
+      // Lock the WHOLE keyboard, not a key list. A guest binds what it likes — Far Cry's
+      // crouch-walk is Ctrl+W, which is also "close tab" — and a UA shortcut cannot be
+      // preventDefault'ed, so an un-locked combination takes the tab down mid-game. Naming
+      // keys here would mean enumerating every combination every game might bind.
+      // The user is not trapped: with the keyboard locked the UA still exits fullscreen on
+      // a HELD Escape, and a short Escape reaches the guest as its menu key.
+      // Unsupported / not granted → unchanged behaviour, the reserved keys stay the UA's.
+      if (fs) kb?.lock?.().catch(() => { /* best-effort */ });
       else kb?.unlock?.();
     };
 
@@ -2706,6 +2718,58 @@ export default function App() {
       void (window as any).loadApp?.(url); // sessionStorage unavailable — load in place
     }
   }, []);
+
+  /** One request/reply round-trip to the worker's aot_cmd channel. */
+  const aotCmd = useCallback((cmd: string, extra: Record<string, unknown> = {}) => {
+    return new Promise<any>((resolve) => {
+      if (!globalWorker) { resolve(null); return; }
+      const handler = (e: MessageEvent) => {
+        if (e.data?.type !== "aot_result" || e.data.cmd !== cmd) return;
+        globalWorker!.removeEventListener("message", handler);
+        resolve(e.data);
+      };
+      globalWorker.addEventListener("message", handler);
+      globalWorker.postMessage({ type: "aot_cmd", cmd, ...extra });
+    });
+  }, []);
+
+  const describeAot = useCallback((r: any): string => {
+    if (!r) return "no worker";
+    if (!r.ok) return `error: ${r.result}`;
+    const s = r.result ?? {};
+    if (s.saved) {
+      const saved = s.saved?.saved ?? s.saved?.error ?? "?";
+      return `saved ${saved} unit(s) from ${s.captured?.modules ?? 0} module(s)`;
+    }
+    const e = s.entered;
+    const rec = s.recording;
+    const parts: string[] = [];
+    if (rec?.armed) parts.push(`recording ${rec.modules} module(s)${rec.dropped ? `, ${rec.dropped} dropped` : ""}`);
+    if (s.units) parts.push(`${s.units} unit(s) loaded`);
+    if (e && e.units) parts.push(`${e.enteredUnits}/${e.alive} entered`);
+    return parts.join(" · ") || "idle";
+  }, []);
+
+  const handleAotRecord = useCallback(async () => {
+    const next = !aotRecording;
+    const r = await aotCmd(next ? "start" : "stop");
+    setAotRecording(next && !!r?.ok);
+    setAotStatus(describeAot(r));
+    // A stop that failed must not leave the button reading "recording": the whole point of
+    // showing state is that the ritual's silent failure becomes visible.
+    if (!next && r?.ok) setAotRecording(false);
+  }, [aotRecording, aotCmd, describeAot]);
+
+  const handleAotAutoLoad = useCallback(async () => {
+    const next = !aotAutoLoad;
+    const r = await aotCmd("autoload", { enabled: next });
+    setAotAutoLoad(next);
+    setAotStatus(describeAot(r));
+  }, [aotAutoLoad, aotCmd, describeAot]);
+
+  const handleAotStatus = useCallback(async () => {
+    setAotStatus(describeAot(await aotCmd("status")));
+  }, [aotCmd, describeAot]);
 
   const handleToggleFpuStrict = useCallback((strict: boolean) => {
     setFpuStrictEnabled(strict);
@@ -3020,6 +3084,12 @@ export default function App() {
           onOpenRegistryTool={() => setRegistryToolOpen(true)}
           fpuStrictEnabled={fpuStrictEnabled}
           onToggleFpuStrict={handleToggleFpuStrict}
+          aotRecording={aotRecording}
+          aotAutoLoad={aotAutoLoad}
+          aotStatus={aotStatus}
+          onAotRecord={handleAotRecord}
+          onAotAutoLoad={handleAotAutoLoad}
+          onAotStatus={handleAotStatus}
           loggingEnabled={loggingEnabled}
           onToggleLogging={toggleLogging}
         />

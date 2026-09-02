@@ -120,6 +120,7 @@ import { videoEngine } from "../video/video-engine";
 import { preemptionManager } from "./core/cpu/preemption-manager";
 import { writeGuestCode } from "./core/memory/guest-code";
 import { statsOverlay } from "./core/stats-overlay";
+import { workerTime } from "./core/worker-time-accounting";
 import { hypercallDataManager } from "./core/cpu/hypercall-data";
 import { d3d9WasmArena } from "./backends/webgpu/d3d9/d3d9-wasm-arena";
 import { bootMark, dumpBootTimeline } from "./core/boot-timer";
@@ -147,6 +148,7 @@ import { debugSession } from "./core/debug/debug-session";
 import { harnessService } from "./harness/service";
 import { HARNESS_RPC, HARNESS_CANCEL } from "./harness/rpc";
 import "./harness/commands"; // side-effect: register all harness commands
+import { noteAppliedWorkerFlag } from "./harness/cmds/dbg";
 // onmessage handler families (static imports — worker bundled with inlineDynamicImports).
 import { handleAudioBridgeMessage } from "./worker-handlers/audio-bridge";
 import { handleLoggingMessage } from "./worker-handlers/logging";
@@ -517,7 +519,7 @@ const gdiPresentLoop = () => {
   }
 
   try {
-    gdiPresentOnce();
+    workerTime.measure("present", gdiPresentOnce);
   } catch (e) {
     recordGpuError("throw", "gdiPresentLoop", String(e));
     Logger.error(LogCategory.SYSTEM, `[GDI-PRESENT] present loop threw — frame skipped: ${e}`);
@@ -2054,9 +2056,15 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
     emulatorConfig.applyFromManifest(bundle.manifest);
     // The AOT cache key includes manifest-controlled CPU flags such as relaxed FPU,
     // so prepare only after the current bundle config has been applied.
-    aotPrepared = (globalThis as Record<string, unknown>).__aotAutoLoad
-      ? aotCache.prepare(gameId).catch((e) => ({ error: String(e) }))
-      : null;
+    //
+    // The gate is "this game HAS saved units", not "a debug flag is set". A worker-local
+    // flag cannot survive the reload that starts the next session, so a recording made
+    // under one would have been loaded by nothing — the capture would look successful and
+    // never be used. `prepare` refuses on a version/engine mismatch anyway, so presence is
+    // the honest condition; `__aotNoAutoLoad` remains as the off switch for an A/B arm.
+    aotPrepared = (globalThis as Record<string, unknown>).__aotNoAutoLoad
+      ? null
+      : aotCache.prepare(gameId).catch((e) => ({ error: String(e) }));
 
     // Delete crash-sentinel and other stale files from CoW overlay before game starts
     if (emulatorConfig.deleteOnBoot.length > 0) {
@@ -2200,6 +2208,7 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
         // firehose and streaming does not reliably survive the reload that precedes it.
         (globalThis as Record<string, unknown>).__aotBoot = { loaded, replayed, ms };
         Logger.log(LogCategory.SYSTEM, `[AOT] boot: ${JSON.stringify(loaded)} ${JSON.stringify(replayed)} in ${ms}ms`);
+
       } catch (e) {
         Logger.warn(LogCategory.SYSTEM, `[AOT] boot load failed (falling back to JIT): ${e}`);
       } finally {
@@ -2970,7 +2979,10 @@ const initV86 = async (canvas: OffscreenCanvas) => {
           }
         };
 
-        v86Inner["tick_hooks_before"] = () => guardTickHook("before", () => {
+        // The tick bracket sits OUTSIDE guardTickHook so a throwing hook body still
+        // closes the interval — an unbalanced bracket would silently move a whole tick
+        // into the "idle" residual, which is exactly the number being measured.
+        v86Inner["tick_hooks_before"] = () => { workerTime.noteTickEnter(); guardTickHook("before", () => {
           // If the current guest thread is WAITING (async thunk parked at
           // spinLoopAddress), don't grant a full quantum — v86 would honestly
           // JIT-execute JMP $ for ~5 ms before tick_hooks_after can yield.
@@ -3008,10 +3020,10 @@ const initV86 = async (canvas: OffscreenCanvas) => {
           hypercallDataManager.updateCursorData(mouseState.x, mouseState.y);
           // Sync message queue flag for WASM PeekMessage fast path
           hypercallDataManager.updateMessageQueueFlag(system.windowManager.hasMessages());
-        });
+        }); };
         let heapSlabAllocated = false;
         let ticksSinceStart = 0;
-        v86Inner["tick_hooks_after"] = (t?: number) => guardTickHook("after", () => {
+        v86Inner["tick_hooks_after"] = (t?: number) => { guardTickHook("after", () => {
           // v86 passes main_loop()'s return: the delay next_tick() will arm its yield
           // with. A long one is the loop going to sleep on purpose, which the freeze
           // diagnostics below cannot otherwise distinguish from a lost callback.
@@ -3048,7 +3060,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
               allocateHeapSlab();
             }
           }
-        });
+        }); workerTime.noteTickExit(typeof t === "number" ? t : 0); };
 
         // Replace yield-Worker with same-thread MessageChannel to eliminate cross-Worker
         // postMessage overhead (~14% CPU for Re-Volt at 1000 ticks/sec).
@@ -3177,7 +3189,7 @@ function resumeEmulator(): void {
 (globalThis as any).__harnessPause = pauseEmulator;
 (globalThis as any).__harnessResume = resumeEmulator;
 
-self.onmessage = (event: MessageEvent) => {
+const handleWorkerMessage = (event: MessageEvent): void => {
   const message = event.data;
 
   if (message?.type === "dbg") {
@@ -3190,7 +3202,11 @@ self.onmessage = (event: MessageEvent) => {
     // Persisted debug toggles seeded from the host (localStorage) BEFORE a game loads —
     // e.g. __noHeapSlab to A/B the WASM heap slab. Survives page F5 because the host
     // replays it on every worker init. Must arrive before load_bundle (PE-load reads it).
-    if (typeof message.key === "string") (globalThis as any)[message.key] = message.value;
+    if (typeof message.key === "string") {
+      (globalThis as any)[message.key] = message.value;
+      // Recorded so harness resetWorkerFlags can drop exactly the flags this session applied.
+      noteAppliedWorkerFlag(message.key);
+    }
     // The log ring is normally armed by a harness call, which a page reload wipes — and a
     // re-exec IS a page reload, so the boot that follows one is the single window the
     // 50-entry default cannot cover. As a flag it is replayed before any bundle loads.
@@ -3675,3 +3691,7 @@ self.onmessage = (event: MessageEvent) => {
   // registry_clear also cancels the worker-owned debounced autosave via the context.
   if (handleRegistryMessage(message, { cancelRegistryAutosave })) return;
 };
+
+// Host messages run BETWEEN v86 ticks like the present chain does, so they are named
+// rather than left to swell the idle residual (idleReport, roadmap 08).
+self.onmessage = (event: MessageEvent) => { workerTime.measure("message", () => handleWorkerMessage(event)); };

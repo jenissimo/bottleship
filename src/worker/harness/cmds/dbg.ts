@@ -26,6 +26,16 @@ import { d3d9GuestReleaseStats } from "../../modules/d3d9/guest-release-stub";
 import { d3d9PipelineMemoProfileStats, d3d9PipelineMemoStats } from "../../backends/webgpu/d3d9/d3d9-pipeline-memo";
 import type { RegionKind } from "../../core/memory/address-space";
 
+/** Names applied through either flag door — this RPC and emulator.worker.ts's
+ *  `set_debug_flag` — so resetWorkerFlags clears exactly those and never a same-shaped
+ *  global the worker installed itself. */
+const APPLIED_WORKER_FLAGS = "__appliedWorkerFlags";
+
+export function noteAppliedWorkerFlag(name: string): void {
+    const g = globalThis as Record<string, unknown>;
+    ((g[APPLIED_WORKER_FLAGS] ??= new Set<string>()) as Set<string>).add(name);
+}
+
 /** Decode a generated thunk stub (`B8 <id32> BA 77 B0 00 00 EF C2 <cleanup16>`). */
 function decodeStub(mem: Uint8Array, addr: number, names: Record<number, string> | undefined) {
     if (addr < 0 || addr + 12 > mem.length) return { valid: false as const, reason: "out of range" };
@@ -525,6 +535,22 @@ export function registerDbgCommands(svc: HarnessService): void {
         const g = globalThis as Record<string, unknown>;
         const prev = g[name];
         g[name] = value;
+        noteAppliedWorkerFlag(name);
         return { name, value, prev: prev ?? null };
+    });
+
+    /** resetWorkerFlags() — drop every flag applied to the LIVE worker this session.
+     *
+     *  The host clears the localStorage envelope, which only decides what the NEXT worker
+     *  sees; without this the current one keeps running the old arm. Deleting in one
+     *  synchronous turn is atomic against the guest (§3.6, shared worker thread), so no
+     *  flag is read half-cleared. Boot-time flags are not undone — only re-read on load. */
+    svc.register("resetWorkerFlags", () => {
+        const g = globalThis as Record<string, unknown>;
+        const applied = g[APPLIED_WORKER_FLAGS] as Set<string> | undefined;
+        const cleared = applied ? Array.from(applied) : [];
+        for (const name of cleared) delete g[name];
+        applied?.clear();
+        return { cleared, count: cleared.length };
     });
 }
