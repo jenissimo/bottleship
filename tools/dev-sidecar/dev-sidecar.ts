@@ -552,8 +552,15 @@ async function runHostTool(req: Request): Promise<Response> {
       { status: 403, headers: cors });
   }
   const args = Array.isArray(body.args) ? body.args.map(String) : [];
-  const unsafeArg = args.find((arg) =>
-    arg.includes("/") || arg.includes("\\") || arg.includes("..") || /[A-Za-z]:/.test(arg));
+  // Every file a tool touches must be a BARE name in the scratch dir. A leading `/` or `-`
+  // is a SWITCH, not a path — `fxc /T ps_2_0 /Zpr /Fc out.cg in.cg` is the whole workload,
+  // and rejecting it on the switch's own slash refuses every request this route exists for.
+  // The remainder after that prefix is held to the same bare-name rule as a plain argument.
+  const namesAPath = (arg: string) => {
+    const bare = /^[/-]+/.test(arg) ? arg.replace(/^[/-]+/, "") : arg;
+    return bare.includes("/") || bare.includes("\\") || bare.includes("..") || /[A-Za-z]:/.test(bare);
+  };
+  const unsafeArg = args.find(namesAPath);
   if (unsafeArg !== undefined) {
     return Response.json({ ok: false, error: `path-bearing tool argument is not allowed: '${unsafeArg}'` },
       { status: 400, headers: cors });

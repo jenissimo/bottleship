@@ -165,6 +165,22 @@ Legacy Graphics (DirectDraw, D3D3-9). You bridge x86 Windows internals with mode
 - Ring Buffers: Capture last N WinAPI calls (IDs + timestamps) and memory events (alloc/free, Lock/Unlock, Blt/Flip).
 - Corruption Protocol: On fault, log: EIP, fault address, last N calls, ring buffer, full memory map.
 - Invariants: No region overlaps; borrowed pointers never point into THUNK_CODE/RESERVED.
+- FAST-PATH LEDGER RULE — a checksum proves only that the work which reached it was correct; it
+  cannot prove that all promised work ran. Every new fast path must update the same logical
+  counters/ledgers as the slow path, and a differential test must run both paths and compare those
+  ledgers. That is necessary but not sufficient: both paths can copy the same expected count. Also
+  gate absolute counts from an independent canonical workload/transcript oracle. Track submitted,
+  encoded and consumed draws, query boundaries, present serials and rollback/decline positions as
+  applicable; a visually plausible frame is not evidence of complete work. A counter incremented
+  from `expectedCount` is intention accounting and must never be labelled "executed".
+- PERF EVIDENCE RULE — applies to every performance change, not only emitter/codegen. Accept on
+  measured same-workload evidence, never emitted instruction count or IR aesthetics. Every arm uses
+  a fresh load after atomic `resetWorkerFlags`, exact workload/runtime/WASM/config hashes, balanced
+  paired order, exact present serial and the independent correctness oracles above. Short smoke runs
+  establish correctness only, not performance. Record all raw values, N, median/spread, environment
+  and a mode/window-specific noise floor. A disabled path must reproduce the pre-feature baseline;
+  any disabled-path regression or same-work violation invalidates the A/B. Keeping correct code and
+  attributing a causal speedup are separate decisions; a delta inside noise is directional only.
 
 3.5 Thunk System Invariants
 
@@ -318,6 +334,13 @@ facts the harness encodes (and the manual `dbg.*` fallback still needs):
     labelled as such; `bun tools/harness.ts shot --verify` cross-checks every route against the
     browser's own capture. A specific guest surface/texture: `dumpSurface`/`textures` (or
     `__gdibDumpName` → GetDIBits PNG → `debug_png_dump` → sidecar `logs/debug/`).
+  - KNOW WHICH SCENE you measured, before quoting a number from it: `sceneProbe` returns how
+    much the frame is MOVING (mean luma delta on a coarse grid) plus what the D3D9 backend
+    submitted, and `sceneCompare(a,b)` says whether two runs were looking at the same thing.
+    An A/B whose arms sat on different screens produces perfectly plausible percentiles that
+    mean nothing side by side, and nothing else in a run notices — this verb exists because a
+    frame tail was once reported as "in a race" when the screenshot was the track-selection
+    menu. `motion` near 0 is a static screen (a menu or a load), whatever the game.
   - Intros: a bundle's `skipVideo` makes MCI/Bink/Smack complete instantly.
   - ANY non-standard situation (froze / vanished / black frame / unexpected exit / wild EIP) → FIRST
     pull `report()` (CLI: `bun tools/harness.ts report`). One firehose-immune POJO with: CPU regs, the
@@ -377,32 +400,40 @@ Quality Gate (mandatory order):
  13. bun tools/validate-guest-memory-borrow.ts   (raw guest-memory Proxy access confined to its owners)
  14. bun tools/validate-guest-memory-views.ts    (no PLAIN guest view stored past the turn that derived it)
  15. bun tools/validate-hypercall-abi.ts         (Rust/TS hypercall page offsets + handler ids agree)
- 16. bun tools/validate-wgsl-calls.ts            (every call to a WGSL helper we wrote passes the
+ 16. bun tools/validate-jit-shipping-config.ts   (the ONE shipping JIT envelope, tools/jit-config/shipping.mjs,
+     is what PreemptionManager applies and what every offline arm calls "shipping")
+ 17. bun tools/validate-census-abi.ts            (opcode-census key layout agrees between opstats.rs and
+     guest-opcode-classes.ts)
+ 18. bun tools/validate-tlb-mirror.mjs           (`tlb_data` has ONE writer, cpu::set_tlb_entry, in any
+     assignment spelling — the permission bitmap is a mirror of it)
+ 19. bun tools/validate-wgsl-calls.ts            (every call to a WGSL helper we wrote passes the
      arity that helper declares — our shaders are template strings, invisible to the typechecker,
      and one bad call blackens a whole pass)
- 17. bun tools/validate-d3d9-arena-abi.ts        (LayoutIdx order/length matches arena.rs
+ 20. bun tools/validate-d3d9-arena-abi.ts        (LayoutIdx order/length matches arena.rs
      LAYOUT_TABLE, and the arena exports in public/v86.wasm match the ones arena.rs declares —
      missing AND stale extras, so a not-rebuilt artifact cannot silently disable the arena)
- 18. bun tools/validate-d3d9-capability-contracts.ts   (the MSAA/float/volume contracts are measured
+ 21. bun tools/validate-d3d9-capability-contracts.ts   (the MSAA/float/volume contracts are measured
      from the live device, not read off globalThis, and the probe is AWAITED as an unconditional
      statement before the device is published)
- 19. bun tools/d3d9-parity/validate-caps.ts      (`bun run validate-d3d9-caps` — the name no longer
+ 22. bun tools/d3d9-parity/validate-caps.ts      (`bun run validate-d3d9-caps` — the name no longer
      predicts the path: the checked-in reference D3DCAPS9 blob AND the caps we answer with)
- 20. bun tools/validate-snapshots.ts             (every toMatchSnapshot() has a TRACKED .snap: bun
+ 23. bun tools/validate-snapshots.ts             (every toMatchSnapshot() has a TRACKED .snap: bun
      writes a missing snapshot and exits 0, so without the file the assertion asserts nothing)
- 21. bun run gate:d3d9-capture                   (differential native-D3D9 capture. `report:d3d9-capture`
+ 24. bun run gate:d3d9-capture                   (differential native-D3D9 capture. `report:d3d9-capture`
      is reporting-only and exits 0 for everything; this wrapper fails on an unreadable/invalid
      capture and on any divergence NOT recorded in tools/d3d9-capture-expected.json — the
      intentional ones of plan/dx9c-review-findings-2026-08-26.md §B2. Record a new intentional
      one with `--update-baseline`)
- 22. bun run report:d3d9-wgsl-validator          (with BS_REQUIRE_WGSL_VALIDATOR=1, so a missing
+ 25. bun run report:d3d9-wgsl-validator          (with BS_REQUIRE_WGSL_VALIDATOR=1, so a missing
      naga is an error instead of a silent skip)
- 23. bun run typecheck
- 24. bun test                                    (also with BS_REQUIRE_WGSL_VALIDATOR=1 — otherwise
+ 26. bun run typecheck
+ 27. bun test                                    (also with BS_REQUIRE_WGSL_VALIDATOR=1 — otherwise
      every describe.skipIf in wgsl-smoke.test.ts vanishes and the suite is green without it)
 
 `bun run gate` runs all of it in order — including the test suite as the final step. CI runs
 that same script, not a hand-copied subset (.github/workflows/ci.yml), so the two cannot drift.
+`census-selftest` and `perm-map-differential` are NOT in it: they need the vendor build
+(vendor/v86/build/libv86.mjs) and SKIP without it, so they are run by hand after a v86 rebuild.
 
 A validator that cannot fail is worse than no validator: it converts an unchecked invariant
 into a false assurance. When one of these passes, confirm it CAN fail — feed it the bypass it

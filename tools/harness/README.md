@@ -13,8 +13,8 @@ one-off investigation probes never land here — see "Admission rule" below.
   `bun tools/harness.ts regress`. Each one throws (or sets `process.exitCode`) with
   a stated reason on failure and prints `OK — ...` on success; none of them ask a
   human to eyeball a screenshot.
-- **perf/** — production A/B measurement instruments (e.g. `fastmem-reads-hpcos-ab`)
-  that compute their own pass/fail gate from repeated boots. Not part of `regress` —
+- **perf/** — production A/B measurement instruments that compute their own
+  pass/fail gate from repeated boots. Not part of `regress` —
   they run a multi-boot campaign and write a JSON report, not a single quick verdict.
 
 Throwaway bring-up/debug probes (a one-off script written to answer a single question

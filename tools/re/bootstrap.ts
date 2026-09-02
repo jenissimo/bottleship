@@ -9,8 +9,11 @@
  * darwin/linux/win.
  */
 
-import { existsSync, readdirSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readdirSync, statSync, mkdirSync, writeFileSync, chmodSync } from "node:fs";
+import { join, dirname, basename } from "node:path";
+import { ZipArchive } from "@bottleship/formats/zip";
+import { FileSource } from "../internal/file-source";
+import { tryResolveArchiveExtractPath } from "../internal/archive-extract-path";
 
 const REPO = join(import.meta.dir, "..", "..");
 const GHIDRA_DIR = join(REPO, ".ghidra");        // gitignored
@@ -39,6 +42,34 @@ function javaMajor(javaBin: string): number {
         const first = parseInt(m[1], 10);
         return first === 1 ? parseInt(m[2] ?? "0", 10) : first; // "1.8" → 8
     } catch { return 0; }
+}
+
+/**
+ * Unpack a `.zip` with the repo's own reader — a bootstrap must not depend on a system
+ * `unzip` (absent on stock Windows, and on a bare CI image). Every entry name goes through
+ * the shared containment guard; ZIP mode bits are outside ZipEntry, so the POSIX launchers
+ * (extensionless / `.sh`) get +x back explicitly or `analyzeHeadless` cannot run.
+ */
+async function unzipInto(zipPath: string, destDir: string): Promise<void> {
+    const file = new FileSource(zipPath);
+    const archive = new ZipArchive({
+        size: file.size,
+        readRange: async (start, end) => file.readRangeSync(start, end),
+        readRangeSync: (start, end) => file.readRangeSync(start, end),
+    });
+    await archive.init();
+    mkdirSync(destDir, { recursive: true });
+    for (const entry of archive.listEntries()) {
+        const resolved = tryResolveArchiveExtractPath(destDir, entry.name);
+        if (!resolved.ok) {
+            if (resolved.reason !== "empty") log(`skipping ${entry.name} (${resolved.reason})`);
+            continue;
+        }
+        if (entry.isDirectory) { mkdirSync(resolved.path, { recursive: true }); continue; }
+        mkdirSync(dirname(resolved.path), { recursive: true });
+        writeFileSync(resolved.path, await archive.readEntry(entry));
+        if (!IS_WIN && /^[^.]+$|\.sh$/.test(basename(resolved.path))) chmodSync(resolved.path, 0o755);
+    }
 }
 
 function isValidGhidra(dir: string): boolean {
@@ -84,7 +115,7 @@ async function ensureGhidra(): Promise<string> {
         await Bun.$`curl -sL -o ${zip} ${asset.browser_download_url}`;
     }
     log(`unpacking ${zip}…`);
-    await Bun.$`unzip -q -o ${zip} -d ${GHIDRA_DIR}`;
+    await unzipInto(zip, GHIDRA_DIR);
     const extracted = findChild(GHIDRA_DIR, /^ghidra_.*_PUBLIC$/);
     if (!extracted || !isValidGhidra(extracted)) throw new Error(`Ghidra unpack failed under ${GHIDRA_DIR}`);
     return extracted;
@@ -125,7 +156,7 @@ async function ensureJdk(): Promise<string> {
         await Bun.$`curl -sL -o ${tar} ${`https://api.adoptium.net/v3/binary/latest/21/ga/${os}/${arch}/jdk/hotspot/normal/eclipse`}`;
     }
     log(`unpacking ${tar}…`);
-    if (tar.endsWith(".zip")) await Bun.$`unzip -q -o ${tar} -d ${HOME_DIR}`;
+    if (tar.endsWith(".zip")) await unzipInto(tar, HOME_DIR);
     else await Bun.$`tar -xzf ${tar} -C ${HOME_DIR}`;
     home = findHome();
     if (!home || !isValidJavaHome(home)) throw new Error(`JDK 21 unpack failed under ${HOME_DIR}`);
