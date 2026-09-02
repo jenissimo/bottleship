@@ -76,6 +76,29 @@ export interface VfsFindHandle {
 const GENERIC_READ = 0x80000000;
 const GENERIC_WRITE = 0x40000000;
 
+/** Grow the logical length of a byte view geometrically while keeping the exposed view
+ * exact-length. Repeated append-only guest writes then copy once per capacity growth,
+ * not once per WriteFile; callers still see `.length` as the real EOF/run length.
+ *
+ * GROW ONLY: the spare capacity past `.length` holds stale bytes, so a shrink must
+ * REALLOCATE (as truncateFileAt does) — re-`subarray`ing a shorter view over the same
+ * buffer would resurrect them on the next grow. */
+function growByteView(view: Uint8Array, length: number, maxCapacity = Number.MAX_SAFE_INTEGER): Uint8Array {
+    if (length <= view.length) return view;
+    const available = view.buffer.byteLength - view.byteOffset;
+    if (length <= available) return new Uint8Array(view.buffer, view.byteOffset, length);
+    // Silently returning a shorter view makes the caller record a length it never wrote.
+    if (length > maxCapacity) {
+        throw new RangeError(`growByteView: ${length} bytes requested past the ${maxCapacity}-byte cap`);
+    }
+
+    const floor = Math.max(4096, available);
+    const capacity = Math.min(maxCapacity, Math.max(length, Math.min(floor * 2, floor + 256 * 1024)));
+    const storage = new Uint8Array(capacity);
+    storage.set(view);
+    return storage.subarray(0, length);
+}
+
 const vfsTraceRecords: string[] = [];
 (globalThis as { getVfsTrace?: () => string[] }).getVfsTrace = () => vfsTraceRecords.slice();
 function vfsTrace(path: string, pos: number, len: number): void {
@@ -2344,7 +2367,7 @@ class OpfsOverlay {
     private ephemeralWrite(key: string, path: string, offset: number, data: Uint8Array): number {
         let buf = this.ephemeralFiles.get(key) ?? new Uint8Array(0);
         const end = offset + data.length;
-        if (buf.length < end) { const grown = new Uint8Array(end); grown.set(buf, 0); buf = grown; }
+        if (buf.length < end) buf = growByteView(buf, end);
         buf.set(data, offset);
         this.ephemeralFiles.set(key, buf);
         const existing = this.entries.get(key);
@@ -2377,9 +2400,7 @@ class OpfsOverlay {
             return;
         }
         if (buf.length < end) {
-            const grown = new Uint8Array(end);
-            grown.set(buf, 0);
-            buf = grown;
+            buf = growByteView(buf, end, this.CONTENT_CACHE_MAX_FILE);
             this.contentCache.set(key, buf);
         }
         buf.set(data, offset);
@@ -2580,10 +2601,13 @@ class OpfsOverlay {
 
         const isSequential = offset === cacheEntry.bufferOffset + cacheEntry.memoryBuffer.length;
         if (isSequential && cacheEntry.memoryBuffer.length + data.length < this.WRITE_BUFFER_THRESHOLD) {
-            const newBuffer = new Uint8Array(cacheEntry.memoryBuffer.length + data.length);
-            newBuffer.set(cacheEntry.memoryBuffer, 0);
-            newBuffer.set(data, cacheEntry.memoryBuffer.length);
-            cacheEntry.memoryBuffer = newBuffer;
+            const oldLength = cacheEntry.memoryBuffer.length;
+            cacheEntry.memoryBuffer = growByteView(
+                cacheEntry.memoryBuffer,
+                oldLength + data.length,
+                this.WRITE_BUFFER_THRESHOLD,
+            );
+            cacheEntry.memoryBuffer.set(data, oldLength);
             cacheEntry.lastUsed = performance.now();
             this.scheduleBufferFlush(cacheEntry, key);
 
@@ -2765,7 +2789,9 @@ class OpfsOverlay {
             }
             this.closeSyncHandle(path);
             const handle = await this.getFileHandle(path, true);
-            const writer = await handle.createWritable();
+            // SetEndOfFile keeps everything below the new end; createWritable defaults to an
+            // EMPTY stage, so without this the truncate would commit `size` zero bytes.
+            const writer = await handle.createWritable({ keepExistingData: true });
             await writer.truncate(size);
             await writer.close();
             this.entries.set(toKey(path), { size, kind: "file", path: normalizePath(path) });
@@ -3049,10 +3075,13 @@ class OpfsOverlay {
             const isSequential = offset === cacheEntry.bufferOffset + cacheEntry.memoryBuffer.length;
 
             if (isSequential && cacheEntry.memoryBuffer.length + data.length < this.WRITE_BUFFER_THRESHOLD) {
-                const newBuffer = new Uint8Array(cacheEntry.memoryBuffer.length + data.length);
-                newBuffer.set(cacheEntry.memoryBuffer, 0);
-                newBuffer.set(data, cacheEntry.memoryBuffer.length);
-                cacheEntry.memoryBuffer = newBuffer;
+                const oldLength = cacheEntry.memoryBuffer.length;
+                cacheEntry.memoryBuffer = growByteView(
+                    cacheEntry.memoryBuffer,
+                    oldLength + data.length,
+                    this.WRITE_BUFFER_THRESHOLD,
+                );
+                cacheEntry.memoryBuffer.set(data, oldLength);
                 cacheEntry.lastUsed = performance.now();
                 this.scheduleBufferFlush(cacheEntry, key);
 
@@ -3201,7 +3230,13 @@ class OpfsOverlay {
             }
             const doFlush = async () => {
                 await entry.writer!.seek(offsetToWrite);
-                await entry.writer!.write(asArrayBuffer(bufferToWrite.buffer));
+                // growByteView hands back a subarray, so the buffer is the RIGHT one only when
+                // the view spans it exactly — byteOffset included, or a shifted view persists
+                // the wrong bytes at the wrong length.
+                const exact = bufferToWrite.byteOffset === 0 && bufferToWrite.length === bufferToWrite.buffer.byteLength
+                    ? bufferToWrite.buffer
+                    : new Uint8Array(bufferToWrite).buffer;
+                await entry.writer!.write(asArrayBuffer(exact));
                 entry.lastUsed = performance.now();
             };
             entry.queue = entry.queue.then(doFlush, doFlush);
@@ -3279,7 +3314,10 @@ class OpfsOverlay {
                     if (pending.length > 0) {
                         await cacheEntry.writer.seek(pendingOffset);
                         // SAB-backed: cast at DOM boundary
-                        await cacheEntry.writer.write((pending.length === pending.buffer.byteLength ? pending.buffer : new Uint8Array(pending)) as unknown as FileSystemWriteChunkType);
+                        const exact = pending.byteOffset === 0 && pending.length === pending.buffer.byteLength
+                            ? pending.buffer
+                            : new Uint8Array(pending);
+                        await cacheEntry.writer.write(exact as unknown as FileSystemWriteChunkType);
                     }
                     await cacheEntry.queue;
                     await cacheEntry.writer.close();

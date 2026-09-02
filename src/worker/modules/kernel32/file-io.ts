@@ -5,7 +5,7 @@
  */
 
 import { ThunkImplementation, ThunkResult, DeferredWrite } from '../../core/thunking/thunk-dispatcher';
-import { Logger, LogCategory } from '../../core/logger';
+import { Logger, LogCategory, LogLevel } from '../../core/logger';
 import { registerFileIoCommExports } from './file-io-comm';
 import { registerFileIoConsoleExports, ConsoleDeviceHandle, isConsoleDeviceHandle, isWindowsDevice } from './file-io-console';
 import { registerFileIoFindExports } from './file-io-find';
@@ -86,6 +86,32 @@ function logCapsDatDwords(tag: string, mem: Uint8Array, bufOffset: number, byteL
         parts.push(`0x${v.toString(16)}(${rw})`);
     }
     Logger.log(LogCategory.KERNEL32, `CAPS.DAT ${tag}: [${parts.join(", ")}] (bake ref: 0x500, 0x600, 0x100, 0x500)`);
+}
+
+/**
+ * Mirror the CONTENT of a guest write to a log/error file into our own log.
+ *
+ * Gated on `isConsoleEnabled`, NOT `isEnabled`: the latter answers true whenever a log
+ * stream is attached, which the harness does for a whole session — so the slice + codepage
+ * decode would run per WriteFile in exactly the windows where the frame tail is measured
+ * (Far Cry appends Log.txt continuously). Explicit error files stay loud at NORMAL, routine
+ * .log/.txt content is VERBOSE.
+ */
+export function logGuestWriteContent(filename: string, mem: Uint8Array, lpBuffer: number, byteCount: number): void {
+    if (byteCount <= 0 || byteCount >= 32768) return;
+    const fnLower = filename.toLowerCase();
+    const isErrorText = fnLower.endsWith('.err') || fnLower.includes('blizzarderror');
+    if (!isErrorText && !fnLower.endsWith('.log') && !fnLower.endsWith('.txt')) return;
+    const contentLevel = isErrorText ? LogLevel.NORMAL : LogLevel.VERBOSE;
+    if (!Logger.isConsoleEnabled(LogCategory.KERNEL32, contentLevel)) return;
+    try {
+        const logData = mem.slice(lpBuffer, lpBuffer + byteCount);
+        const logText = getCodePageDecoder(EmulatorConfig.getInstance().ansiCodePage).decode(logData);
+        const label = fnLower.endsWith('.log') ? 'LOG' : fnLower.endsWith('.err') ? 'ERR' : 'TXT';
+        const message = `WriteFile ${label} content: "${logText.trimEnd()}"`;
+        if (isErrorText) Logger.log(LogCategory.KERNEL32, message);
+        else Logger.verbose(LogCategory.KERNEL32, message);
+    } catch { /* ignore decode errors */ }
 }
 
 /**
@@ -1666,16 +1692,7 @@ const fileIoModule = (() => {
             Logger.verbose(LogCategory.KERNEL32, `WriteFile(0x${hFile.toString(16)}, ${nNumberOfBytesToWrite} bytes)`);
         }
 
-        // Dump text content for log/error files to help diagnose game errors
-        const fnLower = filename.toLowerCase();
-        if ((fnLower.endsWith('.log') || fnLower.endsWith('.err') || fnLower.includes('blizzarderror') || fnLower.endsWith('.txt')) && nNumberOfBytesToWrite > 0 && nNumberOfBytesToWrite < 32768) {
-            try {
-                const logData = mem.slice(lpBuffer, lpBuffer + nNumberOfBytesToWrite);
-                const logText = getCodePageDecoder(EmulatorConfig.getInstance().ansiCodePage).decode(logData);
-                const label = fnLower.endsWith('.log') ? 'LOG' : fnLower.endsWith('.err') ? 'ERR' : 'TXT';
-                Logger.log(LogCategory.KERNEL32, `WriteFile ${label} content: "${logText.trimEnd()}"`);
-            } catch { /* ignore decode errors */ }
-        }
+        logGuestWriteContent(filename, mem, lpBuffer, nNumberOfBytesToWrite);
 
         const capturedLpNumberOfBytesWritten = lpNumberOfBytesWritten;
         const data = mem.slice(lpBuffer, lpBuffer + nNumberOfBytesToWrite);

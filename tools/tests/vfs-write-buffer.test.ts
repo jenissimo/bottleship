@@ -12,8 +12,11 @@ import { VirtualFileSystem } from "../../src/worker/runtime/filesystem/vfs";
 import type { ZipArchive } from "@bottleship/formats/zip";
 import { installFakeOpfs, findFakeByName, type FakeDirHandle } from "./fixtures/fake-opfs";
 
+const GENERIC_READ = 0x80000000;
 const GENERIC_WRITE = 0x40000000;
 const CREATE_ALWAYS = 2;
+const OPEN_EXISTING = 3;
+const FILE_BEGIN = 0;
 
 const origNavigator = (globalThis as unknown as { navigator: unknown }).navigator;
 afterAll(() => { (globalThis as unknown as { navigator: unknown }).navigator = origNavigator; });
@@ -41,6 +44,107 @@ function writerEntry(vfs: VirtualFileSystem, path: string): {
 }
 
 describe("F6 — writeFileSync does not drop a buffered run behind an in-flight flush", () => {
+    test("many tiny sequential writes grow geometrically without exposing spare capacity as file data", async () => {
+        const { vfs, root } = await freshVfs();
+        const path = "C:\\Log.txt";
+        const h = vfs.openSync(path, GENERIC_WRITE, CREATE_ALWAYS)!;
+        const buffers = new Set<ArrayBufferLike>();
+        const cacheBuffers = new Set<ArrayBufferLike>();
+
+        for (let i = 0; i < 128; i++) {
+            expect(vfs.writeSync(h, new Uint8Array(64).fill(i))).toBe(64);
+            const entry = writerEntry(vfs, path)!;
+            buffers.add(entry.memoryBuffer.buffer);
+            const overlay = (vfs as unknown as {
+                overlay: { contentCache: Map<string, Uint8Array> };
+            }).overlay;
+            cacheBuffers.add(overlay.contentCache.get(path.toLowerCase())!.buffer);
+        }
+
+        const entry = writerEntry(vfs, path)!;
+        expect(entry.memoryBuffer.length).toBe(128 * 64);
+        expect(buffers.size).toBeLessThan(8);
+        expect(cacheBuffers.size).toBeLessThan(8);
+        await vfs.flushAll();
+
+        const fake = findFakeByName(root, "Log.txt");
+        expect(fake).not.toBeNull();
+        expect(fake!.data.length).toBe(128 * 64);
+        expect(Array.from(fake!.data.subarray(0, 64))).toEqual(new Array(64).fill(0));
+        expect(Array.from(fake!.data.subarray(fake!.data.length - 64))).toEqual(new Array(64).fill(127));
+    });
+
+    test("a run that stops short of the capacity step persists its logical length, not its capacity", async () => {
+        const { vfs, root } = await freshVfs();
+        const path = "C:\\Short.txt";
+        const h = vfs.openSync(path, GENERIC_WRITE, CREATE_ALWAYS)!;
+
+        // 100*64 = 6400 sits inside the 8192-byte capacity step; the 128*64 case above lands
+        // ON it, so only this one can tell a view-length write from a whole-buffer one.
+        for (let i = 0; i < 100; i++) vfs.writeSync(h, new Uint8Array(64).fill(i));
+        const entry = writerEntry(vfs, path)!;
+        expect(entry.memoryBuffer.length).toBe(6400);
+        expect(entry.memoryBuffer.buffer.byteLength).toBeGreaterThan(6400);
+
+        await vfs.flushAll();
+        const fake = findFakeByName(root, "Short.txt");
+        expect(fake!.data.length).toBe(6400);
+        expect(Array.from(fake!.data.subarray(6400 - 64))).toEqual(new Array(64).fill(99));
+    });
+
+    test("a read past the logical end is clamped, never served out of spare capacity", async () => {
+        const { vfs } = await freshVfs();
+        const path = "C:\\Clamp.bin";
+        const h = vfs.openSync(path, GENERIC_WRITE, CREATE_ALWAYS)!;
+        for (let i = 0; i < 100; i++) vfs.writeSync(h, new Uint8Array(64).fill(0xab));
+        expect(writerEntry(vfs, path)!.memoryBuffer.buffer.byteLength).toBeGreaterThan(6400);
+
+        const r = vfs.openSync(path, GENERIC_READ, OPEN_EXISTING)!;
+        vfs.setPosition(r, 6400 - 32, FILE_BEGIN);
+        // 1024 requested, 32 real bytes left: the rest is stale capacity, not file data.
+        expect(vfs.readSync(r, 1024)!.length).toBe(32);
+        vfs.setPosition(r, 6400, FILE_BEGIN);
+        expect(vfs.readSync(r, 1024)!.length).toBe(0);
+        expect(vfs.getFileSize(path)).toBe(6400);
+    });
+
+    test("a write past EOF leaves a sparse gap that reads back as zeros", async () => {
+        const { vfs, root } = await freshVfs();
+        const path = "C:\\Sparse.bin";
+        const h = vfs.openSync(path, GENERIC_WRITE, CREATE_ALWAYS)!;
+        vfs.writeSync(h, new Uint8Array([1, 2, 3, 4]));
+        vfs.setPosition(h, 4096, FILE_BEGIN);
+        vfs.writeSync(h, new Uint8Array([9]));
+        await vfs.flushAll();
+
+        const fake = findFakeByName(root, "Sparse.bin");
+        expect(fake!.data.length).toBe(4097);
+        expect(Array.from(fake!.data.subarray(0, 4))).toEqual([1, 2, 3, 4]);
+        expect(fake!.data.subarray(4, 4096).every((b) => b === 0)).toBe(true);
+        expect(fake!.data[4096]).toBe(9);
+    });
+
+    test("SetEndOfFile shrink then grow does not resurrect the truncated bytes", async () => {
+        const { vfs, root } = await freshVfs();
+        const path = "C:\\Trunc.bin";
+        const h = vfs.openSync(path, GENERIC_WRITE, CREATE_ALWAYS)!;
+        vfs.writeSync(h, new Uint8Array(512).fill(0xee));
+        await vfs.flushAll();
+
+        await vfs.truncateAt(path, 16);
+        expect(vfs.getFileSize(path)).toBe(16);
+
+        const h2 = vfs.openSync(path, GENERIC_WRITE, OPEN_EXISTING)!;
+        vfs.setPosition(h2, 16, FILE_BEGIN);
+        vfs.writeSync(h2, new Uint8Array(16).fill(0x11));
+        await vfs.flushAll();
+
+        const fake = findFakeByName(root, "Trunc.bin");
+        expect(fake!.data.length).toBe(32);
+        expect(Array.from(fake!.data.subarray(0, 16))).toEqual(new Array(16).fill(0xee));
+        expect(Array.from(fake!.data.subarray(16))).toEqual(new Array(16).fill(0x11));
+    });
+
     test("a scattered write while a flush is in flight keeps the earlier run", async () => {
         const { vfs, root } = await freshVfs();
         const h = vfs.openSync("C:\\out.bin", GENERIC_WRITE, CREATE_ALWAYS)!;
