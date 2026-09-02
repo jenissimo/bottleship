@@ -28,6 +28,7 @@ import { readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { createHash } from 'crypto';
 import { inflateRawSync } from 'zlib';
 import { dirname, join, basename } from 'path';
+import { resolveArchiveExtractPath } from './internal/archive-extract-path';
 import {
   parseInstallShieldHeader,
   fileRelPath,
@@ -194,7 +195,7 @@ for (const fd of files) {
       for (let i = 0; eq && i < sum.length; i++) if (sum[i] !== fd.md5[i]) eq = false;
       if (!eq) { console.error(`MD5 FAIL ${fileRelPath(fd)}`); md5fail++; }
     }
-    const dest = join(outDir, fileRelPath(fd));
+    const dest = resolveArchiveExtractPath(outDir, fileRelPath(fd));
     mkdirSync(dirname(dest), { recursive: true });
     writeFileSync(dest, data);
     ok++;

@@ -9,6 +9,7 @@
 
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join, sep } from "node:path";
+import { resolveArchiveExtractPath } from "./internal/archive-extract-path";
 import { MpqArchive } from "../packages/formats/src/mpq";
 
 const [input, outDir] = process.argv.slice(2).filter((a) => !a.startsWith("--"));
@@ -70,8 +71,9 @@ if (listOnly) {
 let written = 0;
 let failed = 0;
 for (const e of entries) {
-    const target = join(outDir, ...e.name.split(/[\\/]/));
+    let target: string;
     try {
+        target = resolveArchiveExtractPath(outDir, e.name);
         const bytes = archive.readFile(e.name);
         await mkdir(dirname(target), { recursive: true });
         await writeFile(target, bytes);

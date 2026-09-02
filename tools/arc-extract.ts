@@ -17,7 +17,8 @@
  */
 
 import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, resolve } from "node:path";
+import { resolveArchiveExtractPath } from "./internal/archive-extract-path";
 import { UnpackDecoder } from "@bottleship/formats/unpack";
 import { readFreeArcListing, extractFreeArc, detectFreeArc } from "@bottleship/formats/freearc";
 import { FileSource } from "./internal/file-source";
@@ -75,7 +76,7 @@ async function main(): Promise<void> {
     const root = resolve(outDir!);
     let n = 0;
     extractFreeArc(src, lzma, (path, data) => {
-        const dest = join(root, path.replace(/\\/g, "/"));
+        const dest = resolveArchiveExtractPath(root, path);
         mkdirSync(dirname(dest), { recursive: true });
         writeFileSync(dest, data);
         n++;

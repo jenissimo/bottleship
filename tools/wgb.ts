@@ -6,6 +6,7 @@
  *   bun tools/wgb.ts list     <archive.wgb>                        — list all entries
  *   bun tools/wgb.ts cat      <archive.wgb> <entry>                — print entry to stdout
  *   bun tools/wgb.ts extract  <archive.wgb> <entry> <output-path>  — extract entry to file
+ *   bun tools/wgb.ts extract-dir <archive.wgb> <prefix> <out-dir>   — extract a whole tree in one pass
  *   bun tools/wgb.ts replace  <archive.wgb> <entry> <input-path>   — replace entry from file
  *   bun tools/wgb.ts add-dir  <archive.wgb> <prefix> <local-dir>   — add/overwrite a tree in one rewrite
  *   bun tools/wgb.ts manifest <archive.wgb>                        — pretty-print manifest.json
@@ -23,8 +24,10 @@
  * to unsigned integer" — a >2GB Buffer length overflow).
  */
 
-import { openSync, readSync, writeSync, closeSync, fstatSync, renameSync, unlinkSync, readdirSync } from "fs";
+import { openSync, readSync, writeSync, closeSync, fstatSync, renameSync, unlinkSync, readdirSync, mkdirSync } from "fs";
+import { join, dirname } from "path";
 import { inflateRawSync } from "zlib";
+import { tryResolveArchiveExtractPath } from "./internal/archive-extract-path";
 import {
     crc32, lfhFor, cdhFor, type OutEntry,
     LFH_SIG, CDH_SIG, EOCD_SIG, EOCD64_SIG, EOCD64_LOC_SIG, U32_MAX, U16_MAX, COPY_CHUNK,
@@ -304,6 +307,50 @@ function cmdExtract(wgbPath: string, entryName: string, outputPath: string) {
     });
 }
 
+/**
+ * Extract every entry under `prefix` in ONE pass over the central directory. The
+ * per-entry `extract` is a whole process launch per entry, for what is a single sequential
+ * read here.
+ */
+function cmdExtractDir(wgbPath: string, prefix: string, outDir: string) {
+    const norm = prefix.replace(/\\/g, "/").replace(/\/+$/, "");
+    withArchive(wgbPath, (fd, _size, entries) => {
+        let count = 0, bytes = 0, rejected = 0;
+        const warned = new Set<string>();
+        for (const entry of entries) {
+            if (norm && entry.name !== norm && !entry.name.startsWith(norm + "/")) continue;
+            // Strip EVERY separator the prefix left behind: `rom//a` would otherwise become
+            // "/a" and be refused as an absolute path for a spelling that is merely Unix.
+            const rel = !norm ? entry.name
+                : entry.name === norm ? norm.slice(norm.lastIndexOf("/") + 1)   // the prefix names a file
+                : entry.name.slice(norm.length).replace(/^\/+/, "");
+            const resolved = tryResolveArchiveExtractPath(outDir, rel);
+            // One bad name must not abandon the other entries; the directory entry that
+            // IS the prefix has nothing to write and is not worth a line.
+            if (!resolved.ok) {
+                if (resolved.reason === "empty") continue;
+                rejected++;
+                if (!warned.has(resolved.reason)) {
+                    warned.add(resolved.reason);
+                    console.warn(`  skipping entries rejected as ${resolved.reason} (first: ${entry.name})`);
+                }
+                continue;
+            }
+            const outPath = resolved.path;
+            if (entry.name.endsWith("/")) { mkdirSync(outPath, { recursive: true }); continue; }
+            mkdirSync(dirname(outPath), { recursive: true });
+            const outFd = openSync(outPath, "w");
+            try {
+                if (entry.compression === 0) streamStoreData(fd, entry, (c) => writeSync(outFd, c, 0, c.length));
+                else { const d = readEntryData(fd, entry); writeSync(outFd, d, 0, d.length); }
+            } finally { closeSync(outFd); }
+            count++; bytes += entry.size;
+        }
+        console.log(`Extracted ${count} entries (${bytes} bytes) under "${norm}" -> ${outDir}`
+            + (rejected ? `, ${rejected} rejected` : ""));
+    });
+}
+
 /** Rebuild `wgbPath` with `entryName` replaced/added by `newData`, streaming via a temp file. */
 function writeOverride(wgbPath: string, entryName: string, newData: Buffer, outputPath?: string, label = "Replaced") {
     const dest = outputPath ?? wgbPath;
@@ -445,6 +492,7 @@ Usage:
   bun tools/wgb.ts cat           <archive.wgb> <entry>
   bun tools/wgb.ts extract       <archive.wgb> <entry> <output>
   bun tools/wgb.ts replace       <archive.wgb> <entry> <input> [output]
+  bun tools/wgb.ts extract-dir   <archive.wgb> <prefix> <out-dir>          — extract a whole tree in one pass
   bun tools/wgb.ts add-dir       <archive.wgb> <entry-prefix> <local-dir>  — add/overwrite a whole tree in one rewrite
   bun tools/wgb.ts repack        <archive.wgb>                    — rewrite as Store-only (decompress Deflate entries)
   bun tools/wgb.ts manifest      <archive.wgb>
@@ -470,6 +518,11 @@ switch (cmd) {
     case "x":
         if (!args[0] || !args[1] || !args[2]) { console.error("Usage: wgb.ts extract <archive> <entry> <output>"); process.exit(1); }
         cmdExtract(args[0], args[1], args[2]);
+        break;
+    case "extract-dir":
+    case "xd":
+        if (!args[0] || args[1] === undefined || !args[2]) { console.error("Usage: wgb.ts extract-dir <archive> <prefix> <out-dir>"); process.exit(1); }
+        cmdExtractDir(args[0], args[1], args[2]);
         break;
     case "replace":
         if (!args[0] || !args[1] || !args[2]) { console.error("Usage: wgb.ts replace <archive> <entry> <input> [output]"); process.exit(1); }

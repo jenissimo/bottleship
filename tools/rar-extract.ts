@@ -12,7 +12,8 @@
  *   bun tools/rar-extract.ts <archive.rar> <out-dir> [--list] [--quiet] [--no-verify]
  */
 import { openSync, writeSync, closeSync, mkdirSync, existsSync } from "node:fs";
-import { dirname, join, resolve, sep } from "node:path";
+import { dirname, resolve } from "node:path";
+import { tryResolveArchiveExtractPath } from "./internal/archive-extract-path";
 import { parseRar, assertExtractable, volumeName, RarError, type RarEntry } from "@bottleship/formats/rar";
 import { Crc32 } from "@bottleship/formats/unpack";
 import { FileSource } from "./internal/file-source";
@@ -148,11 +149,9 @@ if (listOnly) {
 
 /** Reject an entry name that would escape the output directory (`..`, absolute, drive). */
 function safeJoin(base: string, name: string): string {
-    const target = resolve(base, name.replace(/\\/g, "/"));
-    if (target !== base && !target.startsWith(base + sep)) {
-        throw new RarError(`entry "${name}" escapes the output directory`);
-    }
-    return target;
+    const resolved = tryResolveArchiveExtractPath(base, name);
+    if (!resolved.ok) throw new RarError(`entry "${name}" escapes the output directory (${resolved.reason})`);
+    return resolved.path;
 }
 
 mkdirSync(outDir, { recursive: true });

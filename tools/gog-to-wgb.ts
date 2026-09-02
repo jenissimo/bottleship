@@ -33,6 +33,7 @@ import {
 } from "@bottleship/formats/inno";
 import { UnpackDecoder } from "@bottleship/formats/unpack";
 import { FileSource } from "./internal/file-source";
+import { resolveArchiveExtractPath } from "./internal/archive-extract-path";
 import { isGogJunk, SKIP_DIRS, detectExeFromPaths } from "@bottleship/repack/gog-filter";
 import { buildZip } from "@bottleship/formats/wgb/zip-build";
 import { OS_PRESETS } from "@bottleship/repack/manifest-synth";
@@ -224,7 +225,7 @@ async function extractNative(
             onProgress: (done, total) => { progress(`  ${progressBar(done, total)} extracting`); },
             language,
         }, (relPath) => {
-            const dest = join(appDir, relPath.replace(/\//g, "\\"));
+            const dest = resolveArchiveExtractPath(appDir, relPath);
             return {
                 begin() {
                     mkdirSync(dirname(dest), { recursive: true });
