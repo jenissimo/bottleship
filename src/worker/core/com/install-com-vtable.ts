@@ -44,24 +44,32 @@ export function installComVtable(process: Process, options: InstallComVtableOpti
         }))
     );
 
-    if (stubDll.stubCode.length === 0) {
+    // Emptiness is measured on what RESOLVED, not on what was emitted. generateStubDll serves
+    // a method that already has a stub from its reuse cache without emitting a byte for it, so
+    // re-installing an interface yields a complete exportTable and zero code. Reading that as
+    // failure is worse than doing nothing: the caller leaves the vtable uninstalled while the
+    // release path has already zeroed its slots, and the next dispatch is `call 0`.
+    if (stubDll.exportTable.size === 0) {
         Logger.error(LogCategory.COM, `${logLabel}: stub batch empty`);
         return null;
     }
 
     const stubBase = stubDll.baseAddress;
-    try {
-        process.memory.allocAt(stubBase, stubDll.stubCode.length, "THUNK_CODE", "rx");
-    } catch {
-        // Already reserved — PE loader or prior batch
-    }
-
     let mem = process.getCurrentMemory();
-    if (stubBase + stubDll.stubCode.length > mem.length) {
-        Logger.error(LogCategory.COM, `${logLabel}: stub write OOB stubBase=0x${stubBase.toString(16)} len=${stubDll.stubCode.length}`);
-        return null;
+    if (stubDll.stubCode.length > 0) {
+        try {
+            process.memory.allocAt(stubBase, stubDll.stubCode.length, "THUNK_CODE", "rx");
+        } catch {
+            // Already reserved — PE loader or prior batch
+        }
+
+        mem = process.getCurrentMemory();
+        if (stubBase + stubDll.stubCode.length > mem.length) {
+            Logger.error(LogCategory.COM, `${logLabel}: stub write OOB stubBase=0x${stubBase.toString(16)} len=${stubDll.stubCode.length}`);
+            return null;
+        }
+        writeGuestCode(mem, stubDll.stubCode, stubBase);
     }
-    writeGuestCode(mem, stubDll.stubCode, stubBase);
 
     const vtableAddr = process.memory.alloc(methods.length * 4, "THUNK_DATA", "rw");
     mem = process.getCurrentMemory();
