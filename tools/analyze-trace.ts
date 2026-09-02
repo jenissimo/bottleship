@@ -377,7 +377,12 @@ function annotateWasm(name: string | undefined): string {
 function classifyFrame(frame: CallFrame): Category {
   const url = frame.url ?? "";
   const name = frame.functionName ?? "";
-  if (url.includes("wasm")) return "wasm";
+  // A SOURCE file whose name merely contains "wasm" is not wasm. `d3d9-wasm-arena.ts` is
+  // TypeScript that writes into a wasm arena, and calling it wasm moved its whole cost out
+  // of the JS bucket and into the emulator's — the roll-up then blamed v86 for our own
+  // recorder. Only a real wasm module (no source extension, or an actual .wasm url) counts.
+  const isSourceFile = /\.(ts|tsx|js|mjs|cjs|jsx)(\?|$)/.test(url);
+  if (!isSourceFile && url.includes("wasm")) return "wasm";
   if (!name && !url) return "native";
   if (name === "(idle)" || name === "(root)" || name === "(program)") return "idle";
   return "js";
@@ -1506,6 +1511,8 @@ function reportWasm(analysis: ThreadAnalysis, topN: number): string {
 
 type OptBucket =
   | "GAME CODE (jit blocks)"
+  | "OUT trap (our HLE boundary)"
+  | "our HLE (wasm hypercalls)"
   | "dispatch (main_loop)"
   | "indirect-jump (jit cache)"
   | "interpreter (non-JIT)"
@@ -1515,6 +1522,16 @@ type OptBucket =
   | "other v86 core"
   | "JS HLE + glue"
   | "idle";
+
+/** Ours, wherever it runs. Separated from the v86 tax because the LEVER is different: our
+ *  code is removable by us, the emulator's tax is not. Lumping the two told a reader of the
+ *  NFSU race to "target v86 core first" when ~80% of that bucket was our own hypercalls,
+ *  our own OUT trap and our own arena recorder. */
+const OPT_OURS_BUCKETS = new Set<OptBucket>([
+  "OUT trap (our HLE boundary)",
+  "our HLE (wasm hypercalls)",
+  "JS HLE + glue",
+]);
 
 const OPT_TAX_BUCKETS = new Set<OptBucket>([
   "dispatch (main_loop)",
@@ -1553,10 +1570,29 @@ function optBucket(frame: CallFrame): OptBucket {
       || (op >= 0xc2 && op <= 0xc6) || (op >= 0xd0 && op <= 0xff);
     if (isVector) return "sse primitives";
   }
+  // OUR OWN WinAPI boundary, not the emulator's cost. Every guest call into an HLE module
+  // leaves the JIT through `OUT dx,eax`; measured on NFSU that is ~30k traps per frame and
+  // 4.9% of busy. Bucketed apart because the lever is ours (a guest-side stub removes the
+  // crossing entirely) and because leaving it under "v86 core" told the reader to optimise
+  // the emulator for a cost the emulator does not impose.
+  if (name === "instr32_EF" || name === "instr16_EF"
+    || name.includes("io_port_write") || name.includes("io_port_read")
+    || name.includes("test_privileges_for_io")) {
+    return "OUT trap (our HLE boundary)";
+  }
+  // OUR HLE running inside the engine: the hypercall tiers (CLAUDE.md 3.7) and the EAGL
+  // token layer. These are v86-hosted but they are our code and our lever.
+  if (name.includes("hypercall")) return "our HLE (wasm hypercalls)";
+
+  // Rust name mangling: v0 (`_RNvNt…`) length-prefixes each path segment, so a helper reads
+  // as `…12safe_write32`, and the `startsWith` these tests used matched NONE of them. On the
+  // NFSU race that silently moved every guest read/write helper into "other v86 core".
   if (
     name.includes("tlb_") ||
-    name.startsWith("safe_read") ||
-    name.startsWith("safe_write") ||
+    name.includes("safe_read") ||
+    name.includes("safe_write") ||
+    name.includes("write32_no_mmap") ||
+    name.includes("read32s") ||
     name.includes("do_task_switch") ||
     name.includes("call_interrupt") ||
     name.includes("modrm_resolve") ||
@@ -1569,7 +1605,9 @@ function optBucket(frame: CallFrame): OptBucket {
   // guest block as "other v86 core" — the roll-up then blamed the emulator core for the
   // game's own scene traversal and pointed the reader at the opposite of the answer.
   if (isJitBlockName(name)) return "GAME CODE (jit blocks)";
-  if (name.startsWith("_ZN3v86")) return "other v86 core";
+  // Both manglings: v0 (`_RNvNt…`, current rustc) and the legacy v86 `_ZN3v86…`. Matching
+  // only the legacy one left every current Rust frame to fall through to classifyFrame.
+  if (name.startsWith("_ZN3v86") || name.startsWith("_RNv")) return "other v86 core";
   // Everything else: lean on classifyFrame for the js / idle / native split.
   const cat = classifyFrame(frame);
   if (cat === "wasm") return "other v86 core";
@@ -1607,7 +1645,9 @@ function reportOptimizationBuckets(analysis: ThreadAnalysis): string {
   let tax = 0;
   let game = 0;
   let hle = 0;
+  let ours = 0;
   for (const [b, us] of buckets) {
+    if (OPT_OURS_BUCKETS.has(b)) ours += us;
     if (OPT_TAX_BUCKETS.has(b)) tax += us;
     else if (b === "GAME CODE (jit blocks)") game += us;
     else if (b === "JS HLE + glue") hle += us;
@@ -1628,6 +1668,13 @@ function reportOptimizationBuckets(analysis: ThreadAnalysis): string {
     : "relaxed-FPU / block-chaining / v86 JIT tuning";
   lines.push(`  v86 full-system tax  ${pad(pct(tax, busy), 7, true)}  → ${taxHint}`);
   lines.push(`  JS HLE + glue        ${pad(pct(hle, busy), 7, true)}  → WASM hypercall tiers`);
+  // The headline the other three rows do not give: how much of the frame is OURS at all —
+  // JS glue plus the wasm hypercalls plus the OUT trap. On a heavily-thunked title this is
+  // the majority of busy time, and it is the only part we can REMOVE rather than merely make
+  // faster. Reading the three rows above without it once produced "target v86 core first"
+  // on a frame where our own code was 56%.
+  lines.push(`  ── OURS in total      ${pad(pct(ours, busy), 7, true)}  → removable by us (JS glue + hypercalls + OUT trap),`
+    + ` unlike the game's own code`);
   return lines.join("\n");
 }
 
