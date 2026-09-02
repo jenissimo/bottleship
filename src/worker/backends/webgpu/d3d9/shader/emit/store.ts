@@ -33,15 +33,22 @@ export function emitStore(
     }
     const tmp = emitter.tmp("st");
     emitter.line(`let ${tmp} = ${value};`);
-    for (const [lane, component] of COMPONENTS.entries()) {
-        if ((dst.writeMask & (1 << lane)) === 0) continue;
+    // Assign the complete vector once. A component l-value write such as `r0.x = ...` is a
+    // writable "swizzle view" inside Tint, which fails to lower some valid shaders of that
+    // shape ("swizzle view instruction still has usages after lowering") and invalidates
+    // the whole pipeline. `tmp` snapshots the source before the destination changes, so the
+    // rebuilt vec4 keeps D3D's read-before-write for aliasing swizzles; unwritten and
+    // predicate-false lanes retain the old destination value.
+    const lanes = COMPONENTS.map((component, lane) => {
+        if ((dst.writeMask & (1 << lane)) === 0) return `${name}[${lane}]`;
         const predicate = ctx.activePredicate
             ? predicateLaneExpr(ctx.activePredicate, lane, ctx)
             : null;
-        emitter.line(`${name}.${component} = ${predicate
-            ? `select(${name}.${component}, ${tmp}.${component}, ${predicate})`
-            : `${tmp}.${component}`};`);
-    }
+        return predicate
+            ? `select(${name}[${lane}], ${tmp}[${lane}], ${predicate})`
+            : `${tmp}[${lane}]`;
+    });
+    emitter.line(`${name} = vec4<f32>(${lanes.join(", ")});`);
     return true;
 }
 
@@ -79,12 +86,13 @@ export function emitPredicateStore(
         // read and write the same register through a non-identity swizzle.
         emitter.line(`let ${predicateTmp} = ${predicateExpr(ctx.activePredicate, ctx)};`);
     }
-    for (const [lane, component] of COMPONENTS.entries()) {
-        if ((dst.writeMask & (1 << lane)) === 0) continue;
-        emitter.line(`${name}.${component} = ${predicateTmp
-            ? `select(${name}.${component}, ${resultTmp}.${component}, ${predicateTmp}.${component})`
-            : `${resultTmp}.${component}`};`);
-    }
+    const lanes = COMPONENTS.map((component, lane) => {
+        if ((dst.writeMask & (1 << lane)) === 0) return `${name}[${lane}]`;
+        return predicateTmp
+            ? `select(${name}[${lane}], ${resultTmp}[${lane}], ${predicateTmp}[${lane}])`
+            : `${resultTmp}[${lane}]`;
+    });
+    emitter.line(`${name} = vec4<bool>(${lanes.join(", ")});`);
     return true;
 }
 

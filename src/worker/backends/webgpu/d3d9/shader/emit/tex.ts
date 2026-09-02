@@ -600,7 +600,7 @@ export function emitTexOp(
         }
         case Op.TEXDEPTH: {
             if (!d || !a.isPs14 || d.reg.type !== RegType.TEMP || d.reg.num !== 5) return false;
-            emitLegacyDepth(body, `(r5).x`, `(r5).y`, uid);
+            emitLegacyDepth(body, `r5[0]`, `r5[1]`, uid);
             return true;
         }
         case Op.TEXM3x2DEPTH: {

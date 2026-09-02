@@ -154,8 +154,8 @@ describe.skipIf(!d3dxOracleAvailable())("D3D9 SM3 relative source acceptance", (
 
         expect(linked.vsConstantCount).toBe(256);
         expect(linked.wgsl).toContain("var a0: vec4<i32>");
-        expect(linked.wgsl).toContain("clamp(a0.y + 1, 0, 255)");
-        expect(linked.wgsl).toContain("clamp(i32(select(ceil(((vec4<f32>(f32(aL))).x) - 0.5)");
+        expect(linked.wgsl).toContain("clamp(a0[1] + 1, 0, 255)");
+        expect(linked.wgsl).toContain("clamp(i32(select(ceil(((vec4<f32>(f32(aL)))[0]) - 0.5)");
     });
 });
 
@@ -164,7 +164,7 @@ test("PS relative constant indexing keeps the parsed loop register and full regi
     const wgsl = emitPsMain(program, analyzePs(program));
 
     expect(analyzePs(program).constantCount).toBe(224);
-    expect(wgsl).toContain("psc.c[clamp(i32(select(ceil(((vec4<f32>(f32(aL))).x) - 0.5)");
+    expect(wgsl).toContain("psc.c[clamp(i32(select(ceil(((vec4<f32>(f32(aL)))[0]) - 0.5)");
     expect(wgsl).not.toContain("psc.c[1]");
 });
 
@@ -179,6 +179,6 @@ test("VS3 relative output destinations route through the declared semantic regis
 
     expect(linked.census.vs.unsupported).toBe(0);
     expect(linked.wgsl).toContain("var oReg: array<vec4<f32>, 16>");
-    expect(linked.wgsl).toContain("oReg[clamp(i32(select(ceil(((vec4<f32>(f32(aL))).x) - 0.5)");
+    expect(linked.wgsl).toContain("oReg[clamp(i32(select(ceil(((vec4<f32>(f32(aL)))[0]) - 0.5)");
     expect(linked.wgsl).toContain("out.col0 = oReg[1]");
 });

@@ -121,4 +121,18 @@ describe("d3d9 ALU float contract", () => {
         // become three textureSample calls, so the value is bound exactly once.
         expect(wgsl.split("value").length - 1).toBe(1);
     });
+
+    test("masked stores rebuild one vec4 without writable swizzle views", () => {
+        const emitter = new Emitter();
+        emitStore({
+            reg: { type: RegType.TEMP, num: 0, relative: false },
+            writeMask: 0x5,
+            shift: 0,
+            saturate: false,
+        }, "source", ctx, emitter, 0);
+
+        const wgsl = emitter.toString();
+        expect(wgsl).toContain("r0 = vec4<f32>(_st0[0], r0[1], _st0[2], r0[3]);");
+        expect(wgsl).not.toMatch(/r0\.[xyzw]\s*=/);
+    });
 });

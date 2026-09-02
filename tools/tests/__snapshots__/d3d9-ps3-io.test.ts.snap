@@ -9,17 +9,11 @@ fn fs_main(in: PsInput) -> PsOutput {
     
     // add
     let _st0 = (vec4<f32>((in.pos).xy - vec2<f32>(0.5), (in.pos).zw) + select(vec4<f32>(-1.0), vec4<f32>(1.0), in.frontFacing));
-    r0.x = _st0.x;
-    r0.y = _st0.y;
-    r0.z = _st0.z;
-    r0.w = _st0.w;
+    r0 = vec4<f32>(_st0[0], _st0[1], _st0[2], _st0[3]);
     // mov
-    let _st1 = r0;
-    oC0.x = _st1.x;
-    oC0.y = _st1.y;
-    oC0.z = _st1.z;
-    oC0.w = _st1.w;
-    oDepth = min(max((r0).x, 0.0), 1.0);
+    let _st1 = vec4<f32>(r0);
+    oC0 = vec4<f32>(_st1[0], _st1[1], _st1[2], _st1[3]);
+    oDepth = min(max((vec4<f32>(r0)).x, 0.0), 1.0);
     
     var out: PsOutput;
     out.color = oC0;

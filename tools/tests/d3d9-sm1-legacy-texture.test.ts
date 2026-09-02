@@ -57,8 +57,8 @@ describe("exact ps_1_x legacy texture/depth operations", () => {
         expect(ps.analysis.writesDepth).toBe(true);
         expect(wgsl).toContain("@builtin(frag_depth) depth: f32");
         expect(wgsl).toContain("oDepth = select(_legacyDepthZ");
-        expect(wgsl).toContain("(r5).x");
-        expect(wgsl).toContain("(r5).y");
+        expect(wgsl).toContain("r5[0]");
+        expect(wgsl).toContain("r5[1]");
         expect(census.ps?.unsupportedOps).toEqual([]);
     });
 
@@ -66,8 +66,8 @@ describe("exact ps_1_x legacy texture/depth operations", () => {
         const { ps, wgsl, census } = linked("ps_1_3_texm3x2depth");
         expect(ps.analysis.writesDepth).toBe(true);
         expect(ps.analysis.readsTexcoord).toEqual(new Set([0, 1, 2]));
-        expect(wgsl).toContain("dot((in.tex1).xyz, (t0).xyz)");
-        expect(wgsl).toContain("dot((in.tex2).xyz, (t0).xyz)");
+        expect(wgsl).toContain("dot((in.tex1).xyz, (vec4<f32>(t0)).xyz)");
+        expect(wgsl).toContain("dot((in.tex2).xyz, (vec4<f32>(t0)).xyz)");
         expect(wgsl).toContain("@builtin(frag_depth) depth: f32");
         expect(census.ps?.unsupportedOps).toEqual([]);
     });
@@ -75,8 +75,8 @@ describe("exact ps_1_x legacy texture/depth operations", () => {
     test("texm3x3 stores the matrix result without sampling", () => {
         const { ps, wgsl, census } = linked("ps_1_3_texm3x3");
         expect(ps.analysis.readsTexcoord).toEqual(new Set([0, 1, 2, 3]));
-        expect(wgsl).toContain("dot((in.tex1).xyz, (t0).xyz)");
-        expect(wgsl).toContain("dot((in.tex3).xyz, (t0).xyz)");
+        expect(wgsl).toContain("dot((in.tex1).xyz, (vec4<f32>(t0)).xyz)");
+        expect(wgsl).toContain("dot((in.tex3).xyz, (vec4<f32>(t0)).xyz)");
         expect(wgsl).toContain("let _m3Tc");
         expect(wgsl).not.toContain("textureSample(tex3");
         expect(census.ps?.unsupportedOps).toEqual([]);
@@ -85,10 +85,10 @@ describe("exact ps_1_x legacy texture/depth operations", () => {
     test("ps_1_4 bem applies the destination-stage matrix as arithmetic", () => {
         const { ps, wgsl, census } = linked("ps_1_4_bem");
         expect(ps.analysis.usesLegacyBumpEnv).toBe(true);
-        expect(wgsl).toContain("psc.bump[3].mat.x * (r2).x");
-        expect(wgsl).toContain("psc.bump[3].mat.z * (r2).y");
-        expect(wgsl).toContain("psc.bump[3].mat.y * (r2).x");
-        expect(wgsl).toContain("psc.bump[3].mat.w * (r2).y");
+        expect(wgsl).toContain("psc.bump[3].mat.x * (vec4<f32>(r2)).x");
+        expect(wgsl).toContain("psc.bump[3].mat.z * (vec4<f32>(r2)).y");
+        expect(wgsl).toContain("psc.bump[3].mat.y * (vec4<f32>(r2)).x");
+        expect(wgsl).toContain("psc.bump[3].mat.w * (vec4<f32>(r2)).y");
         expect(wgsl).not.toContain("* 2.0 - vec2<f32>(1.0)");
         expect(census.ps?.unsupportedOps).toEqual([]);
     });

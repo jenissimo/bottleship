@@ -87,7 +87,7 @@ describe("D3D9 programmable point size", () => {
             expect(linked.wgsl).toContain("@location(4) v4: f32");
             expect(linked.wgsl).toContain("vec4<f32>(in.v4, 0.0, 0.0, 1.0)");
             expect(linked.wgsl).toContain("@builtin(vertex_index) vertexIndex: u32");
-            expect(linked.wgsl).toContain("let _pointSize = clamp(oPts.x");
+            expect(linked.wgsl).toContain("let _pointSize = clamp(oPts[0]");
             expect(linked.wgsl).toContain("let _pointHalfSize = max(_pointSize, 0.0) * 0.5;");
             expect(linked.census.vs.unsupported).toBe(0);
             expect(linked.census.vs.unsupportedOps).toEqual([]);

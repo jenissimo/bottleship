@@ -108,13 +108,13 @@ describe("D3D9 SM3 W14 predicate and centroid seams", () => {
         expect(wgsl).toContain("// setp_gt");
         expect(wgsl).toContain("var p0: vec4<bool> = vec4<bool>(false);");
         expect(wgsl).toContain("let _setp");
-        expect(wgsl).toContain("((r0) > (r1))");
-        expect(wgsl).toContain("p0.x = _setp");
-        expect(wgsl).toContain("p0.y = _setp");
-        expect(wgsl).not.toContain("p0.z = _setp");
-        expect(wgsl).toContain("select(r0.x, _st");
-        expect(wgsl).toContain(", (p0).x);");
-        expect(wgsl).toContain(", (p0).y);");
+        expect(wgsl).toContain("((vec4<f32>(r0)) > (vec4<f32>(r1)))");
+        expect(wgsl).toContain("p0 = vec4<bool>(_setp");
+        expect(wgsl).toContain("p0[2], p0[3]);");
+        expect(wgsl).not.toMatch(/p0\.[xyzw]\s*=/);
+        expect(wgsl).toContain("select(r0[0], _st");
+        expect(wgsl).toContain(", (vec4<bool>(p0))[0])");
+        expect(wgsl).toContain(", (vec4<bool>(p0))[1])");
         expect(census.summary().unsupportedOps).toEqual([]);
     });
 
@@ -131,10 +131,10 @@ describe("D3D9 SM3 W14 predicate and centroid seams", () => {
             pixelCentreSlot: 0,
         });
 
-        expect(wgsl).toContain("select(r0.x, _st");
-        expect(wgsl).toContain(", (!((p0).yxwz)).x);");
-        expect(wgsl).toContain(", (!((p0).yxwz)).y);");
-        expect(wgsl).not.toContain("r0.x = _st");
+        expect(wgsl).toContain("r0 = vec4<f32>(select(r0[0], _st");
+        expect(wgsl).toContain(", (!(vec4<bool>(p0).yxwz))[0])");
+        expect(wgsl).toContain(", (!(vec4<bool>(p0).yxwz))[1])");
+        expect(wgsl).not.toMatch(/r0\.[xyzw]\s*=/);
     });
 
     test("uses the destination x predicate lane for depth and lane-wise predicates for texkill", () => {
@@ -145,7 +145,7 @@ describe("D3D9 SM3 W14 predicate and centroid seams", () => {
         ]);
         const depthWgsl = emitPsMain(depthProgram, analyzePs(depthProgram));
         expect(depthWgsl).toContain("select(oDepth,");
-        expect(depthWgsl).toContain(", ((p0).yyyy).x)");
+        expect(depthWgsl).toContain(", (vec4<bool>(p0).yyyy)[0])");
 
         const killProgram = pixelProgram([
             instruction(Op.TEXKILL, [], destination(RegType.TEMP, 0, 0x3), undefined, true,
@@ -153,9 +153,9 @@ describe("D3D9 SM3 W14 predicate and centroid seams", () => {
             instruction(Op.MOV, [source(RegType.TEMP, 0)], destination(RegType.COLOROUT, 0)),
         ]);
         const killWgsl = emitPsMain(killProgram, analyzePs(killProgram));
-        expect(killWgsl).toContain("(p0).x && ((r0).x < 0.0)");
-        expect(killWgsl).toContain("(p0).y && ((r0).y < 0.0)");
-        expect(killWgsl).not.toContain("(p0).z &&");
+        expect(killWgsl).toContain("(vec4<bool>(p0))[0] && ((r0)[0] < 0.0)");
+        expect(killWgsl).toContain("(vec4<bool>(p0))[1] && ((r0)[1] < 0.0)");
+        expect(killWgsl).not.toContain("(vec4<bool>(p0))[2] &&");
     });
 
     test("decodes dcl_centroid and emits a valid centroid fragment input qualifier", () => {

@@ -164,21 +164,33 @@ export function generateAlphaTestExpr(alphaFunc: number): string {
  *  leave that field stale in the vertex buffer they reuse for HUD sprites. Pulling z inside the
  *  volume is what unclippedDepth would do, minus the feature dependency; nothing reads the
  *  result, since ZENABLE=FALSE forces the compare to ALWAYS and depth writes off. */
-const RHW_DEPTH_CLAMP_WGSL = `let zw = out.position.w;
-                        let zNdc = select(0.0, out.position.z / zw, zw != 0.0);
-                        out.position.z = clamp(zNdc, 0.0, 1.0) * zw;`;
+const RHW_DEPTH_CLAMP_WGSL = `let clipPos = out.position;
+                        let zw = clipPos.w;
+                        let zNdc = select(0.0, clipPos.z / zw, zw != 0.0);
+                        out.position = vec4f(clipPos.xy, clamp(zNdc, 0.0, 1.0) * zw, zw);`;
 
 /**
- * Generate WGSL code for Z transformation block
+ * Generate WGSL code for Z transformation block.
+ *
+ * `out` is a `var`, so `out.position.z = …` is a writable component swizzle — the construct
+ * Dawn/Tint currently fails to lower ("swizzle view instruction still has usages after
+ * lowering"), taking the whole pipeline with it. Read the position into a `let` and assign
+ * the complete vec4 instead; the same discipline the D3D9 emitter uses for its registers.
  */
-function generateZBlock(forceZMidpoint: boolean): string {
+function generateZBlock(
+    forceZMidpoint: boolean,
+    minZ = "uniforms.minZ",
+    maxZ = "uniforms.maxZ",
+): string {
     if (forceZMidpoint) {
         return `// Debug: force Z = 0.5*w to isolate NDC/projection issues
-                    out.position.z = 0.5 * out.position.w;`;
+                    let zMidPos = out.position;
+                    out.position = vec4f(zMidPos.xy, 0.5 * zMidPos.w, zMidPos.w);`;
     }
-    return `let z_ndc = out.position.z / out.position.w;
-                    let z_ndc2 = z_ndc * (uniforms.maxZ - uniforms.minZ) + uniforms.minZ;
-                    out.position.z = z_ndc2 * out.position.w;`;
+    return `let zRemapPos = out.position;
+                    let z_ndc = zRemapPos.z / zRemapPos.w;
+                    let z_ndc2 = z_ndc * (${maxZ} - ${minZ}) + ${minZ};
+                    out.position = vec4f(zRemapPos.xy, z_ndc2 * zRemapPos.w, zRemapPos.w);`;
 }
 
 /** debugView/forceWireColor are the last word on the fragment's colour: emitted right
@@ -529,9 +541,9 @@ export function generateShaderCode(config: ShaderConfig): string {
 
                 // Apply UV flip if needed (for bottom-up BMP files); only ever the
                 // passthrough UV set — BMP-loaded textures are never texgen-sourced.
-                var src0 = genTexCoordSrc(uniforms.stages[0].z, uv, uv1, uv2, tcCamPos, tcCamNormal, tcCamReflect);
-                ${needsUVFlip ? 'src0 = vec4f(src0.x, 1.0 - src0.y, src0.z, src0.w);' : ''}
-                var adjustedUV = applyTexXform(src0, uniforms.texMat0, uniforms.stages[0].w);
+                let src0Raw = genTexCoordSrc(uniforms.stages[0].z, uv, uv1, uv2, tcCamPos, tcCamNormal, tcCamReflect);
+                let src0 = ${needsUVFlip ? 'vec4f(src0Raw.x, 1.0 - src0Raw.y, src0Raw.z, src0Raw.w)' : 'src0Raw'};
+                let adjustedUV = applyTexXform(src0, uniforms.texMat0, uniforms.stages[0].w);
 
                 if ((uniforms.isRHW & 1u) != 0u) {
                     out.position = pos;
@@ -826,8 +838,8 @@ export function generateMegaBatchShaderCode(config: ShaderConfig): string {
                 out.drawIndex = drawId;
 
                 // Apply UV flip if needed
-                var adjustedUV = selectTexCoord(draw.stages[0].z, uv, uv1, uv2);
-                ${needsUVFlip ? 'adjustedUV.y = 1.0 - adjustedUV.y;' : ''}
+                let adjustedUVRaw = selectTexCoord(draw.stages[0].z, uv, uv1, uv2);
+                let adjustedUV = ${needsUVFlip ? 'vec2f(adjustedUVRaw.x, 1.0 - adjustedUVRaw.y)' : 'adjustedUVRaw'};
 
                 if ((draw.misc.y & 1u) != 0u) { // isRHW
                     out.position = pos;
@@ -837,14 +849,7 @@ export function generateMegaBatchShaderCode(config: ShaderConfig): string {
                 } else {
                     out.position = draw.mvp * vec4f(pos.xyz, 1.0);
                     // Z remap
-                    let minZ = draw.viewport.z;
-                    let maxZ = draw.viewport.w;
-                    ${debugFlags.forceZMidpoint
-                        ? 'out.position.z = 0.5 * out.position.w;'
-                        : `let z_ndc = out.position.z / out.position.w;
-                    let z_ndc2 = z_ndc * (maxZ - minZ) + minZ;
-                    out.position.z = z_ndc2 * out.position.w;`
-                    }
+                    ${generateZBlock(debugFlags.forceZMidpoint, "draw.viewport.z", "draw.viewport.w")}
                 }
 
                 // Swizzle BGRA -> RGBA

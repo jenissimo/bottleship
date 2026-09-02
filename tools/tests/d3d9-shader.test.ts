@@ -379,7 +379,7 @@ describe("vs codegen", () => {
         expect(vs.analysis.constantCount).toBe(256);
         const res = linkProgram({ vs, ps: null, declElements: decl, streamStride: 20 });
         expect(res.wgsl).toContain("array<vec4<f32>, 258>");
-        expect(res.wgsl).toContain("clamp(a0.x + 0, 0, 255)");
+        expect(res.wgsl).toContain("clamp(a0[0] + 0, 0, 255)");
     });
 
     test("links a VS-only program to a complete WGSL module", () => {
@@ -388,7 +388,7 @@ describe("vs codegen", () => {
         expect(res.wgsl).toContain("@vertex");
         expect(res.wgsl).toContain("fn vs_main");
         expect(res.wgsl).toContain("@fragment");
-        expect(res.wgsl).toContain("out.pos = vec4<f32>(oPos.x + oPos.w * vsc.c[5].x");
+        expect(res.wgsl).toContain("out.pos = vec4<f32>(oPos[0] + oPos[3] * vsc.c[5].x");
         // dp4 into oPos uses the constant array.
         expect(res.wgsl).toContain("vsc.c[0]");
         // def c4 baked.
@@ -407,7 +407,7 @@ describe("vs codegen", () => {
         const link = linkProgram({ vs, ps: null, declElements: decl, streamStride: 20 });
 
         expect(link.wgsl).toContain(
-            "oPos.x + oPos.w * vsc.c[5].x, oPos.y + oPos.w * vsc.c[5].y, oPos.z, oPos.w",
+            "oPos[0] + oPos[3] * vsc.c[5].x, oPos[1] + oPos[3] * vsc.c[5].y, oPos[2], oPos[3]",
         );
         expect(link.wgsl).toContain("@builtin(position) @invariant pos: vec4<f32>");
         expect(link.wgsl).not.toContain("640.0");
@@ -496,10 +496,12 @@ describe("vs codegen", () => {
             END,
         ]));
         const res = linkProgram({ vs, ps, declElements: decl, streamStride: 20 });
-        expect(res.wgsl).toContain("oPos.x =");
+        expect(res.wgsl).toContain("oPos = vec4<f32>(");
+        expect(res.wgsl).not.toMatch(/oPos\.[xyzw]\s*=/);
         // Internal fields are compacted, but the VS TEXCOORD2 declaration and the
         // PS TEXCOORD2 declaration must resolve to that same compacted lane.
-        expect(res.wgsl).toContain("oT0.x =");
+        expect(res.wgsl).toContain("oT0 = vec4<f32>(");
+        expect(res.wgsl).not.toMatch(/oT0\.[xyzw]\s*=/);
         expect(res.wgsl).toContain("out.tex0 = oT0;");
         expect(res.wgsl).toContain("in.tex0");
         expect(res.wgsl).not.toContain("in.col5");
@@ -538,7 +540,8 @@ describe("ps codegen", () => {
             vs: compileVertexShader(buildVs()), ps: compilePixelShader(psTokens),
             declElements: decl, streamStride: 20,
         });
-        expect(res.wgsl).toContain("t1.x = ");
+        expect(res.wgsl).toContain("t1 = vec4<f32>(");
+        expect(res.wgsl).not.toMatch(/t1\.[xyzw]\s*=/);
         expect(res.wgsl).toContain("var t1: vec4<f32>");
     });
 
@@ -626,8 +629,8 @@ describe("ps codegen", () => {
         expect(res.wgsl).toContain("psc.bump[1].mat.z");
         expect(res.wgsl).toContain("psc.bump[1].mat.y");
         expect(res.wgsl).toContain("psc.bump[1].mat.w");
-        expect(res.wgsl).toContain("_bemDuDv1 = (t0).xy * 2.0 - vec2<f32>(1.0)");
-        expect(res.wgsl).toContain(".z * psc.bump[1].lum.x + psc.bump[1].lum.y");
+        expect(res.wgsl).toContain("_bemDuDv1 = (vec4<f32>(t0)).xy * 2.0 - vec2<f32>(1.0)");
+        expect(res.wgsl).toContain("(vec4<f32>(t0)).z * psc.bump[1].lum.x + psc.bump[1].lum.y");
         expect(res.wgsl).toContain("in.tex1");
         assertAllSampledTexturesDeclared(res.wgsl);
     });
@@ -666,9 +669,9 @@ describe("ps codegen", () => {
         // DXVK treats PAD as an instruction-stream marker; the final op re-reads all rows.
         expect(res.wgsl).toContain("// texm3x3pad (no-op)");
         expect(res.wgsl).not.toContain("_m3x3r0_t0 = dot");
-        expect(res.wgsl).toContain("dot((in.tex1).xyz, (t0).xyz)");
-        expect(res.wgsl).toContain("dot((in.tex2).xyz, (t0).xyz)");
-        expect(res.wgsl).toContain("dot((in.tex3).xyz, (t0).xyz)");
+        expect(res.wgsl).toContain("dot((in.tex1).xyz, (vec4<f32>(t0)).xyz)");
+        expect(res.wgsl).toContain("dot((in.tex2).xyz, (vec4<f32>(t0)).xyz)");
+        expect(res.wgsl).toContain("dot((in.tex3).xyz, (vec4<f32>(t0)).xyz)");
         expect(res.wgsl).toContain("normalize((_m3Tc3).xyz)");
         expect(res.wgsl).toContain("normalize(vec3<f32>((in.tex1).w, (in.tex2).w, (in.tex3).w))");
         // WGSL reflect() is defined over the operands as given, so the normalize
@@ -692,9 +695,9 @@ describe("ps codegen", () => {
             declElements: decl, streamStride: 20,
         });
         const swizzleWgsl = swizzleLink.wgsl;
-        expect(swizzleWgsl).toContain("let _texreg21 = (t0).wxxx;");
-        expect(swizzleWgsl).toContain("let _texreg22 = (t0).yzzz;");
-        expect(swizzleWgsl).toContain("let _texreg23 = (t0).xyzz;");
+        expect(swizzleWgsl).toContain("let _texreg21 = (vec4<f32>(t0)).wxxx;");
+        expect(swizzleWgsl).toContain("let _texreg22 = (vec4<f32>(t0)).yzzz;");
+        expect(swizzleWgsl).toContain("let _texreg23 = (vec4<f32>(t0)).xyzz;");
         expect(swizzleLink.census.ps?.unsupportedOps).toEqual([]);
 
         const matrix = compilePixelShader(tokensOf(oracleCase("ps_1_3_legacy_texm3x2").tokens));
@@ -704,8 +707,8 @@ describe("ps codegen", () => {
         });
         const matrixWgsl = matrixLink.wgsl;
         expect(matrixWgsl).toContain("// texm3x2pad (no-op)");
-        expect(matrixWgsl).toContain("dot((in.tex1).xyz, (t0).xyz)");
-        expect(matrixWgsl).toContain("dot((in.tex2).xyz, (t0).xyz)");
+        expect(matrixWgsl).toContain("dot((in.tex1).xyz, (vec4<f32>(t0)).xyz)");
+        expect(matrixWgsl).toContain("dot((in.tex2).xyz, (vec4<f32>(t0)).xyz)");
         expect(matrixLink.census.ps?.unsupportedOps).toEqual([]);
 
         const matrix3 = compilePixelShader(tokensOf(oracleCase("ps_1_3_legacy_texm3x3tex").tokens));
@@ -714,8 +717,8 @@ describe("ps codegen", () => {
             declElements: decl, streamStride: 20,
         });
         const matrix3Wgsl = matrix3Link.wgsl;
-        expect(matrix3Wgsl).toContain("dot((in.tex1).xyz, (t0).xyz)");
-        expect(matrix3Wgsl).toContain("dot((in.tex3).xyz, (t0).xyz)");
+        expect(matrix3Wgsl).toContain("dot((in.tex1).xyz, (vec4<f32>(t0)).xyz)");
+        expect(matrix3Wgsl).toContain("dot((in.tex3).xyz, (vec4<f32>(t0)).xyz)");
         expect(matrix3Link.census.ps?.unsupportedOps).toEqual([]);
     });
 
@@ -733,7 +736,7 @@ describe("ps codegen", () => {
             declElements: decl, streamStride: 20, cubeMask: 1 << 3,
         });
         expect(res.wgsl).toContain("let _m3Normal1 = normalize((_m3Tc1).xyz);");
-        expect(res.wgsl).toContain("let _m3Eye1 = normalize((t1).xyz);");
+        expect(res.wgsl).toContain("let _m3Eye1 = normalize((vec4<f32>(t1)).xyz);");
         expect(res.wgsl).toContain("let _m3Reflect1 = -reflect(_m3Eye1, _m3Normal1);");
         expect(res.wgsl).not.toContain("2.0 * (dot(_m3");
     });
@@ -780,7 +783,7 @@ describe("alpha test", () => {
     test("GREATEREQUAL discards on the ps output alpha with the 16-bit-replicated ref", () => {
         // func 7 = D3DCMP_GREATEREQUAL, ref 128 → refInt = (128<<8)|128 = 32896.
         const res = linkWith({ func: 7, ref: 128 });
-        expect(res.wgsl).toContain("round((r0.a) * 65535.0)");
+        expect(res.wgsl).toContain("round((r0[3]) * 65535.0)");
         expect(res.wgsl).toContain(">= 32896.0");
         expect(res.wgsl).toContain("discard");
     });

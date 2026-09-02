@@ -59,8 +59,9 @@ describe("D3D9 SM3 MRT (W11)", () => {
         expect(wgsl).toContain("@location(1) color1: vec4<f32>");
         expect(wgsl).toContain("out.color = oC0;");
         expect(wgsl).toContain("out.color1 = oC1;");
-        expect(wgsl).toContain("oC0.x =");
-        expect(wgsl).toContain("oC1.x =");
+        expect(wgsl).toContain("oC0 = vec4<f32>(");
+        expect(wgsl).toContain("oC1 = vec4<f32>(");
+        expect(wgsl).not.toMatch(/oC[01]\.[xyzw]\s*=/);
     });
 
     test("an undeclared oC1 is not emitted as a WGSL symbol", () => {

@@ -550,7 +550,8 @@ export function emitPsMain(
 
     body.line("");
     const outVar = ps1x ? "r0" : "oC0";
-    const atest = alphaTestSnippet(alphaTest, `${outVar}.a`);
+    // outVar is a mutable var; `oC0.a` is a swizzle view, `oC0[3]` is a plain lane load.
+    const atest = alphaTestSnippet(alphaTest, `${outVar}[3]`);
     if (atest) body.line(atest);
     const fog = emitPsPixelFog(prog.major, outVar, pixelFog);
     if (fog) body.line(fog);
@@ -643,7 +644,7 @@ export function emitPsPixelFog(
     return [
         `if (${fog.enabled}) {`,
         `    let _psFogFactor = ffpFogFactor(${fog.mode}, ${fog.start}, ${fog.end}, ${fog.density}, ${clipZ}, ${clipW}, ${specularAlpha}, ${eyeDistance});`,
-        `    ${colorVar} = vec4<f32>(mix((${colorVar}).rgb, (${fog.color}).rgb, _psFogFactor), (${colorVar}).a);`,
+        `    ${colorVar} = vec4<f32>(mix(vec3<f32>(${colorVar}[0], ${colorVar}[1], ${colorVar}[2]), (${fog.color}).rgb, _psFogFactor), ${colorVar}[3]);`,
         `}`,
     ].join("\n");
 }
@@ -732,10 +733,12 @@ function emitTexKill(
     const coord = ps1x13 ? `in.${texField(dst.reg.num)}` : ctx.readReg(dst.reg);
     const mask = ps1x13 ? 0x7 : dst.writeMask & 0xF;
     const terms = COMPONENTS
-        .map((component, lane) => ({ component, lane }))
-        .filter(({ lane }) => (mask & (1 << lane)) !== 0)
-        .map(({ component, lane }) => {
-            const kill = `(${coord}).${component} < 0.0`;
+        .map((_component, lane) => lane)
+        .filter(lane => (mask & (1 << lane)) !== 0)
+        .map(lane => {
+            // `coord` is r# or a t#-style interpolant register: index the lane instead of
+            // swizzling a mutable var (Tint SwizzleView).
+            const kill = `(${coord})[${lane}] < 0.0`;
             return ctx.activePredicate
                 ? `${predicateLaneExpr(ctx.activePredicate, lane, ctx)} && (${kill})`
                 : kill;

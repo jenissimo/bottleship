@@ -17,6 +17,10 @@ export const VS_HIDDEN_VEC4_COUNT = 8;
 export const VS_PROGRAMMABLE_BIND_BYTES = 256 * 16 + SHADER_INTEGER_BANK_BYTES + SHADER_BOOLEAN_BANK_BYTES;
 export const PS_PROGRAMMABLE_BIND_BYTES = 224 * 16 + SHADER_INTEGER_BANK_BYTES + SHADER_BOOLEAN_BANK_BYTES + 8 * 2 * 16 + 2 * 16;
 
+/** Programmable VS constant transport. The storage variant is used only by the
+ * exact D3D9 MegaBatch path, where instance_index selects one captured draw. */
+export type VsConstantMode = "uniform" | "instance-storage";
+
 export interface UniformEmitOptions {
     vsBinding: number;
     psBinding: number;
@@ -25,6 +29,7 @@ export interface UniformEmitOptions {
     hasPixelShader: boolean;
     usesLegacyBumpEnv: boolean;
     ffpStages: number;
+    vsConstantMode?: VsConstantMode;
 }
 
 function emitConstantBanks(stage: "vs" | "ps", constantCount: number, tail = ""): string {
@@ -38,8 +43,17 @@ function emitConstantBanks(stage: "vs" | "ps", constantCount: number, tail = "")
 }
 
 export function emitUniformDeclarations(emitter: Emitter, opts: UniformEmitOptions): void {
-    emitter.line(emitConstantBanks("vs", opts.vsConstantCount));
-    emitter.line(`@group(0) @binding(${opts.vsBinding}) var<uniform> vsc: VsUniforms;`);
+    const storageVs = opts.vsConstantMode === "instance-storage";
+    if (storageVs) {
+        // WBUF MegaBatch eligibility excludes VS integer/boolean-bank consumers, so a slot
+        // carries only the float bank; the other banks would inflate every slot without
+        // being observable to the generated shader.
+        emitter.line(`struct VsUniforms { c: array<vec4<f32>, ${Math.max(1, opts.vsConstantCount)}>, }`);
+        emitter.line(`@group(0) @binding(${opts.vsBinding}) var<storage, read> vscSlots: array<VsUniforms>;`);
+    } else {
+        emitter.line(emitConstantBanks("vs", opts.vsConstantCount));
+        emitter.line(`@group(0) @binding(${opts.vsBinding}) var<uniform> vsc: VsUniforms;`);
+    }
     if (opts.hasPixelShader) {
         if (opts.usesLegacyBumpEnv) {
             emitter.line("struct LegacyBumpStage { mat: vec4<f32>, lum: vec4<f32>, }");

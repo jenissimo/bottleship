@@ -109,7 +109,7 @@ describe("D3D9 PS3 I/O (W6)", () => {
             declElements: positionDecl,
             streamStride: 12,
         }).wgsl;
-        expect(ps2Wgsl).toContain("if ((r0).x < 0.0) { discard; }");
+        expect(ps2Wgsl).toContain("if ((r0)[0] < 0.0) { discard; }");
         expect(ps2Wgsl).not.toContain("(r0).y < 0.0");
         expect(ps2Wgsl).not.toContain("(r0).z < 0.0");
 
@@ -124,10 +124,10 @@ describe("D3D9 PS3 I/O (W6)", () => {
             declElements: null,
             streamStride: null,
         }).wgsl;
-        expect(ps11Wgsl).toContain("(in.tex0).x < 0.0");
-        expect(ps11Wgsl).toContain("(in.tex0).y < 0.0");
-        expect(ps11Wgsl).toContain("(in.tex0).z < 0.0");
-        expect(ps11Wgsl).not.toContain("(in.tex0).w < 0.0");
+        expect(ps11Wgsl).toContain("(in.tex0)[0] < 0.0");
+        expect(ps11Wgsl).toContain("(in.tex0)[1] < 0.0");
+        expect(ps11Wgsl).toContain("(in.tex0)[2] < 0.0");
+        expect(ps11Wgsl).not.toContain("(in.tex0)[3] < 0.0");
     });
 
     test("declared non-color semantic links through a named interpolant", () => {

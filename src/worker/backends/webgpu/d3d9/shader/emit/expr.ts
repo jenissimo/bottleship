@@ -32,17 +32,37 @@ export const COMPONENTS = ["x", "y", "z", "w"] as const;
 export type Component = typeof COMPONENTS[number];
 const CMP_OP: Record<number, string> = { 2: "<", 3: "==", 4: "<=", 5: ">", 6: "!=", 7: ">=" };
 
+/**
+ * Is `expr` certainly a WGSL VALUE — a constructor/builtin result, a `let`, or a member of
+ * the entry point's `in` parameter — rather than a reference into a `var`/uniform?
+ *
+ * Only a reference turns a swizzle into Tint's SwizzleView, so only a reference needs the
+ * materializing constructor below. The test is a prefix match against the shapes readReg
+ * itself produces, so it can answer "value" only for expressions we built; anything else
+ * (r0, t0, p0, oC0, psc.c[n]) falls through to the safe side.
+ */
+function isMaterializedValue(expr: string): boolean {
+    return /^(?:vec[234]<[^>]*>|select|clamp)\(/.test(expr)
+        || /^in\.[A-Za-z_]\w*$/.test(expr)
+        || /^dc\d+$/.test(expr);
+}
+
+/** Load `expr` as a value, so every later component selection stays in SSA value space. */
+function materialize(expr: string, scalarType: "f32" | "bool" = "f32"): string {
+    return isMaterializedValue(expr) ? expr : `vec4<${scalarType}>(${expr})`;
+}
+
 /** DCL write masks describe which lanes of an input/output register exist. */
 export function maskVec4(expr: string, writeMask = 0xF): string {
     const mask = writeMask & 0xF;
-    if (mask === 0xF) return expr;
+    if (mask === 0xF) return materialize(expr);
     return `vec4<f32>(${COMPONENTS.map((component, lane) =>
-        (mask & (1 << lane)) !== 0 ? `(${expr}).${component}` : "0.0").join(", ")})`;
+        (mask & (1 << lane)) !== 0 ? `(${expr})[${lane}]` : "0.0").join(", ")})`;
 }
 
-/** Select the component encoded by a relative-addressing token. */
-export function relativeComponent(swizzle: number | undefined): string {
-    return COMPONENTS[(swizzle ?? 0xE4) & 3]!;
+/** Lane index encoded by a relative-addressing token. */
+export function relativeLane(swizzle: number | undefined): number {
+    return (swizzle ?? 0xE4) & 3;
 }
 
 /** D3D's round-to-nearest with half values away from zero. WGSL round() uses the
@@ -75,13 +95,13 @@ export function relativeIndexExpr(
         throw new Error(`pixel relative addressing cannot use register type ${indexReg.type}`);
     }
 
-    const component = relativeComponent(relSwizzle);
+    const lane = relativeLane(relSwizzle);
     // a0 is an integer vector in the VS emitter.  Preserve that type directly;
     // in particular, do not round the already-converted MOVA result again.
-    if (!ctx.isPs && indexReg.type === RegType.ADDR) return `a0.${component}`;
+    if (!ctx.isPs && indexReg.type === RegType.ADDR) return `a0[${lane}]`;
 
     const value = ctx.readReg(indexReg);
-    return `i32(${roundD3dExpr(`(${value}).${component}`)})`;
+    return `i32(${roundD3dExpr(`(${value})[${lane}]`)})`;
 }
 
 export function alphaTestSnippet(at: AlphaTest | null, alphaExpr: string): string {
@@ -95,21 +115,26 @@ export function alphaTestSnippet(at: AlphaTest | null, alphaExpr: string): strin
     return `{ let _atA = round((${alphaExpr}) * 65535.0); if (!(_atA ${op} ${refInt}.0)) { discard; } }`;
 }
 
-function applySwizzle(expr: string, sw: number): string {
-    const c0 = COMPONENTS[sw & 3];
-    const c1 = COMPONENTS[(sw >>> 2) & 3];
-    const c2 = COMPONENTS[(sw >>> 4) & 3];
-    const c3 = COMPONENTS[(sw >>> 6) & 3];
-    if (c0 === "x" && c1 === "y" && c2 === "z" && c3 === "w") return expr;
-    return `(${expr}).${c0}${c1}${c2}${c3}`;
+function applySwizzle(expr: string, sw: number, scalarType: "f32" | "bool" = "f32"): string {
+    const lanes = [sw & 3, (sw >>> 2) & 3, (sw >>> 4) & 3, (sw >>> 6) & 3];
+    // A swizzle applied directly to a mutable WGSL var becomes Tint's pointer-like
+    // SwizzleView, which Dawn currently fails to lower on some legal shaders. Materialize
+    // the operand ONCE and swizzle the value: the constructor is the whole safety, so the
+    // operand text is never repeated per lane and callers may keep appending components.
+    const value = materialize(expr, scalarType);
+    if (lanes[0] === 0 && lanes[1] === 1 && lanes[2] === 2 && lanes[3] === 3) return value;
+    const letters = lanes.map(lane => COMPONENTS[lane]).join("");
+    // A materialized value that came back unwrapped needs its own parentheses; a wrapping
+    // constructor call is already atomic.
+    return value === expr ? `(${value}).${letters}` : `${value}.${letters}`;
 }
 
 /** Build a vec4<f32> WGSL expression for a source operand. */
 export function srcExpr(src: SmSource, ctx: ShaderCtx): string {
     let e = ctx.readReg(src.reg, src.reg.relative ? src : undefined);
     const m = src.modifier;
-    if (m === SrcMod.DZ) e = `((${e}) / (${e}).z)`;
-    else if (m === SrcMod.DW) e = `((${e}) / (${e}).w)`;
+    if (m === SrcMod.DZ) e = `((${e}) / (${e})[2])`;
+    else if (m === SrcMod.DW) e = `((${e}) / (${e})[3])`;
     e = applySwizzle(e, src.swizzle);
     switch (m) {
         case SrcMod.NEG: e = `(-(${e}))`; break;
@@ -134,7 +159,7 @@ export function srcExpr(src: SmSource, ctx: ShaderCtx): string {
 /** Build the four lane conditions carried by an instruction predicate token. */
 export function predicateExpr(src: SmSource, ctx: ShaderCtx): string {
     if (src.reg.type === RegType.PREDICATE) {
-        const value = applySwizzle(`p${src.reg.num}`, src.swizzle);
+        const value = applySwizzle(`p${src.reg.num}`, src.swizzle, "bool");
         return src.modifier === SrcMod.NOT ? `!(${value})` : value;
     }
     // SrcMod.NOT is a modifier on the predicate token itself. Strip it before
@@ -152,7 +177,7 @@ export function predicateLaneExpr(src: SmSource, lane: number, ctx: ShaderCtx): 
     if (!Number.isInteger(lane) || lane < 0 || lane >= COMPONENTS.length) {
         throw new Error(`invalid scalar predicate lane ${lane}`);
     }
-    return `(${predicateExpr(src, ctx)}).${COMPONENTS[lane]}`;
+    return `(${predicateExpr(src, ctx)})[${lane}]`;
 }
 
 /** Scalar control operations explicitly consume their x destination lane. */

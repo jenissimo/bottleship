@@ -15,11 +15,14 @@ import { parseShader, SmProgram } from "../sm-parser";
 import { analyzeVs, emitVsMain, VsAnalysis } from "../emit/vs";
 import { analyzePs, emitPsMain, PsAnalysis, type PsInputBinding } from "../emit/ps";
 import { colField, texField, AlphaTest, alphaTestSnippet } from "../emit/expr";
-import { TexType, Usage } from "../sm-enums";
+import { RegType, TexType, Usage } from "../sm-enums";
 import { emitFfpCombinerWgsl } from "../../ffp-combiner";
 import { Emitter } from "../emitter";
 import { emitInterpStruct, clipPlaneLocations, interpLocationLayout } from "./interp";
-import { emitUniformDeclarations } from "./uniforms";
+import {
+    emitUniformDeclarations,
+    type VsConstantMode,
+} from "./uniforms";
 import { emitBindLayout } from "./bind-layout";
 import { Logger, LogCategory } from "../../../../../core/logger";
 import { mapPsInputSemantic } from "../emit/ps";
@@ -123,7 +126,20 @@ export function computeVertexVolumeMask(vs: CompiledVs | null): number {
     return mask;
 }
 
+/** Why a requested link variant could not be generated. */
+export interface LinkRefusal {
+    reason: "vs-integer-boolean-in-instance-storage";
+    detail: string;
+}
+
+/** A refused link carries no usable module: `wgsl` is a comment and every size is zero. */
+export function isLinkRefused(link: LinkResult): boolean {
+    return link.refused !== null;
+}
+
 export interface LinkResult {
+    /** Non-null when the requested variant was refused; nothing else in the result is usable. */
+    refused: LinkRefusal | null;
     wgsl: string;
     vertexAttributes: GPUVertexAttribute[];
     arrayStride: number;          // fallback when SetStreamSource stride is 0
@@ -146,6 +162,8 @@ export interface LinkResult {
     comparisonMask: number;
     /** True when the generated interface exceeds WebGPU's portable inter-stage budget. */
     interpolantBudgetExceeded: boolean;
+    /** Exact byte stride of one VsUniforms storage element; zero on the uniform path. */
+    vsStorageSlotBytes: number;
 }
 
 export interface LinkOptions {
@@ -190,6 +208,8 @@ export interface LinkOptions {
     pointSpriteEnable?: boolean;
     /** Lower enabled D3D9 user clip planes from hidden VS constants to fragment discard. */
     clipPlanes?: boolean;
+    /** Instance-indexed VS constant transport used by the exact MegaBatch variant. */
+    vsConstantMode?: VsConstantMode;
 }
 
 /** WGSL locations for the pre-transformed passthrough vertex stage. Fixed, because there is
@@ -450,8 +470,53 @@ function emitPreTransformedVsMain(
     return emitter.toString();
 }
 
+/** A program's own use of the D3D9 integer (i#) and boolean (b#) constant files. */
+function usesIntegerOrBooleanConstants(prog: SmProgram): boolean {
+    const isIntBool = (type: number): boolean =>
+        type === RegType.CONSTINT || type === RegType.CONSTBOOL;
+    for (const def of prog.definitions) if (isIntBool(def.reg.type)) return true;
+    for (const ins of prog.instructions) {
+        if (ins.dst && isIntBool(ins.dst.reg.type)) return true;
+        for (const source of ins.src) if (isIntBool(source.reg.type)) return true;
+    }
+    return false;
+}
+
+/** The result shape for a variant that cannot be generated: inert, and loud if built anyway. */
+function refuseLink(refused: LinkRefusal): LinkResult {
+    return {
+        refused,
+        wgsl: `// link refused: ${refused.reason} — ${refused.detail}`,
+        vertexAttributes: [],
+        arrayStride: 0,
+        vertexBuffers: [],
+        vsConstantCount: 0,
+        psConstantCount: 0,
+        hasTexture: false,
+        cubeMask: 0,
+        volumeMask: 0,
+        vertexVolumeMask: 0,
+        census: { vs: new Census().summary(), ps: null },
+        comparisonMask: 0,
+        interpolantBudgetExceeded: false,
+        vsStorageSlotBytes: 0,
+    };
+}
+
 export function linkProgram(opts: LinkOptions): LinkResult {
     const { vs, ps, declElements, streamStride, alphaTest = null } = opts;
+    // The instance-storage VsUniforms carries the float bank only — the integer and boolean
+    // banks would multiply every instance slot by ~4x for values the eligible programs never
+    // read. Refuse such a program HERE, so the emitter can never reference a bank the linker
+    // did not declare; the device's own MegaBatch eligibility test is then a second line
+    // rather than the only one. `vsStorageSlotBytes: 0` also declines the variant for a
+    // caller that only reads that field.
+    if (opts.vsConstantMode === "instance-storage" && usesIntegerOrBooleanConstants(vs.prog)) {
+        return refuseLink({
+            reason: "vs-integer-boolean-in-instance-storage",
+            detail: "the vertex shader reads i#/b# constants, which the instance-storage bank omits",
+        });
+    }
     const cubeMaskOverride = opts.cubeMask;
     const projectedStages = opts.projectedStages ?? 0;
     const comparisonSamplers = opts.comparisonSamplers;
@@ -539,6 +604,7 @@ export function linkProgram(opts: LinkOptions): LinkResult {
         hasPixelShader: ps !== null,
         usesLegacyBumpEnv: psA?.usesLegacyBumpEnv ?? false,
         ffpStages: FFP_MAX_STAGES,
+        vsConstantMode: opts.vsConstantMode,
     });
     // Per-stage cube-sampler mask: a cube sampler declares texture_cube<f32> + samples with a
     // 3-component direction (ps-codegen). The bind-group layout's viewDimension must match. The
@@ -596,6 +662,7 @@ export function linkProgram(opts: LinkOptions): LinkResult {
             pointSpriteEnable: opts.pointSpriteEnable === true,
             clipPlanes,
             clipPlaneSlot: vsConstantCount + 2,
+            instanceStorage: opts.vsConstantMode === "instance-storage",
         }));
     emitter.line("");
 
@@ -621,6 +688,7 @@ export function linkProgram(opts: LinkOptions): LinkResult {
     }
 
     return {
+        refused: null,
         wgsl: emitter.toString(),
         vertexAttributes: attributes,
         arrayStride: stride,
@@ -636,6 +704,9 @@ export function linkProgram(opts: LinkOptions): LinkResult {
         census: { vs: vsCensus.summary(), ps: psCensus?.summary() ?? null },
         comparisonMask,
         interpolantBudgetExceeded,
+        vsStorageSlotBytes: opts.vsConstantMode === "instance-storage"
+            ? (vsConstantCount + 2 + (clipPlanes ? 6 : 0)) * 16
+            : 0,
     };
 }
 
@@ -711,7 +782,7 @@ function emitHybridFixedFunctionFragment(
         var _t = ${sample};
         // Alpha-less D3D formats read alpha as 1.0 on real hardware; our GPU copies carry a
         // live alpha channel that must be masked.
-        if (psc.stages[${s}].b.z > 0.5) { _t = vec4<f32>(_t.rgb, 1.0); }
+        if (psc.stages[${s}].b.z > 0.5) { _t = vec4<f32>(_t[0], _t[1], _t[2], 1.0); }
         let _cur = _c;
         // COLORARG0 | ALPHAARG0<<8 | resultIsTemp<<16 (see FfpStage in ffp-lighting.ts).
         let _x = u32(psc.stages[${s}].b.w);

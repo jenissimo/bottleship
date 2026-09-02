@@ -81,7 +81,8 @@ describe("D3D9 VS3 vertex texture fetch (W16)", () => {
         expect(wgsl).toContain(").xxxx");
         expect(census.summary().unsupportedOps).toEqual([]);
         // The sampled result is observable through the vertex colour output, not just a dead load.
-        expect(wgsl).toContain("oD0.x = _st");
+        expect(wgsl).toContain("oD0 = vec4<f32>(_st");
+        expect(wgsl).not.toMatch(/oD0\.[xyzw]\s*=/);
     });
 
     test("vertex bind declarations reserve four 257..260 sampler pairs", () => {

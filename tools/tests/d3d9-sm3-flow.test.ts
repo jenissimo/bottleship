@@ -106,7 +106,7 @@ describe("D3D9 SM3 structured flow lowering", () => {
         const ps2Wgsl = emitPsMain(ps2, analyzePs(ps2), { func: 7, ref: 128 }, 0, 0, fog);
         expect(ps2Wgsl).toContain("fn ffpFogFactor(");
         expect(ps2Wgsl).toContain("if (fogParams.w > 0.0) {");
-        expect(ps2Wgsl).toContain("mix((oC0).rgb, (fogColor).rgb, _psFogFactor)");
+        expect(ps2Wgsl).toContain("mix(vec3<f32>(oC0[0], oC0[1], oC0[2]), (fogColor).rgb, _psFogFactor)");
         expect(ps2Wgsl.indexOf("discard;")).toBeLessThan(ps2Wgsl.indexOf("_psFogFactor"));
 
         const fogOff = emitPsMain(ps2, analyzePs(ps2));
@@ -117,7 +117,7 @@ describe("D3D9 SM3 structured flow lowering", () => {
             instruction(Op.MOV, [source(RegType.CONST, 0)], destination(RegType.TEMP, 0)),
         ]);
         const ps1Wgsl = emitPsMain(ps1, analyzePs(ps1), null, 0, 0, fog);
-        expect(ps1Wgsl).toContain("mix((r0).rgb, (fogColor).rgb, _psFogFactor)");
+        expect(ps1Wgsl).toContain("mix(vec3<f32>(r0[0], r0[1], r0[2]), (fogColor).rgb, _psFogFactor)");
 
         const ps3 = pixelProgramAt(3, [
             instruction(Op.MOV, [source(RegType.CONST, 0)], destination(RegType.COLOROUT, 0)),
@@ -141,7 +141,7 @@ describe("D3D9 SM3 structured flow lowering", () => {
 
         expect(wgsl).toContain("if (vsBool(0u)) {");
         expect(wgsl).toContain("} else {");
-        expect(wgsl).toContain("if (((r0).x > (vsc.c[1]).x)) {");
+        expect(wgsl).toContain("if (((vec4<f32>(r0)).x > (vec4<f32>(vsc.c[1])).x)) {");
         expect(census.unsupportedOps).toEqual([]);
     });
 
@@ -154,7 +154,8 @@ describe("D3D9 SM3 structured flow lowering", () => {
 
         expect(wgsl).toContain("for (var _repI");
         expect(wgsl).toContain("clamp(i32(select(ceil(((vec4<f32>(vsc.i[0])).x) - 0.5)");
-        expect(wgsl).toContain("r0.x = _st");
+        expect(wgsl).toContain("r0 = vec4<f32>(_st");
+        expect(wgsl).not.toMatch(/r0\.[xyzw]\s*=/);
         expect(census.unsupportedOps).toEqual([]);
     });
 
@@ -184,10 +185,10 @@ describe("D3D9 SM3 structured flow lowering", () => {
         ]);
 
         expect(wgsl).toContain("break;");
-        expect(wgsl).toContain("if (((r0).x < (vsc.c[1]).x))");
+        expect(wgsl).toContain("if (((vec4<f32>(r0)).x < (vec4<f32>(vsc.c[1])).x))");
         // Scalar control flow consumes the predicate's x lane; arithmetic
         // predication keeps the full four-lane register.
-        expect(wgsl).toContain("if ((p0).x)");
+        expect(wgsl).toContain("if ((vec4<bool>(p0))[0])");
         expect(wgsl).toContain("var p0: vec4<bool> = vec4<bool>(false);");
     });
 
@@ -232,7 +233,7 @@ describe("D3D9 SM3 structured flow lowering", () => {
         ])));
 
         const derivative = wgsl.indexOf("let _ddx");
-        const branch = wgsl.indexOf("if (((r1).x != 0.0))");
+        const branch = wgsl.indexOf("if (((vec4<f32>(r1)).x != 0.0))");
         expect(derivative).toBeGreaterThanOrEqual(0);
         expect(branch).toBeGreaterThan(derivative);
         expect(wgsl).toContain("textureSampleGrad(tex0, samp");
@@ -255,7 +256,7 @@ describe("D3D9 SM3 structured flow lowering", () => {
         const wgsl = emitPsMain(ps, analyzePs(ps));
 
         const derivative = wgsl.indexOf("let _ddx");
-        const branch = wgsl.indexOf("if (((r7).x != 0.0))");
+        const branch = wgsl.indexOf("if (((vec4<f32>(r7)).x != 0.0))");
         expect(derivative).toBeGreaterThanOrEqual(0);
         expect(branch).toBeGreaterThan(derivative);
         expect(wgsl).toContain("dpdx((in.tex1).xy)");

@@ -214,9 +214,16 @@ export interface VsEmitOptions {
     clipPlanes?: boolean;
     /** First hidden c[] slot containing clip plane 0 (after pixel-centre c[]). */
     clipPlaneSlot?: number;
+    /** Read the VS bank from vscSlots[instance_index] instead of a dynamic uniform. */
+    instanceStorage?: boolean;
 }
 
 export function emitVsMain(prog: SmProgram, a: VsAnalysis, opts: VsEmitOptions): string {
+    const vsc = opts.instanceStorage ? "vscSlots[_bsInstance]" : "vsc";
+    // ONE spelling of the boolean-bank accessor for both the source-operand and the flow
+    // condition seam. The storage variant carries no boolean bank at all — linkProgram
+    // refuses such a program — so the declared `fn vsBool(n: u32)` is the only signature.
+    const vsBoolCall = (num: number): string => `vsBool(${num}u)`;
     const maxConstIdx = Math.max(0, opts.constantCount - 1);
     const blocks = structureProgram(prog);
     const census = opts.census ?? new Census();
@@ -234,7 +241,7 @@ export function emitVsMain(prog: SmProgram, a: VsAnalysis, opts: VsEmitOptions):
         `vec4<f32>(${fmt(values[0])}, ${fmt(values[1])}, ${fmt(values[2])}, ${fmt(values[3])})`;
     const relativeConstExpr = (index: string): string => {
         const bounded = `clamp(${index}, 0, ${maxConstIdx})`;
-        let result = `vsc.c[${bounded}]`;
+        let result = `${vsc}.c[${bounded}]`;
         // Relative reads must see shader-local def c# values even though their
         // index is dynamic.  Keep the runtime uniform bank as the fallback.
         for (const [num, values] of [...a.defConsts].reverse()) {
@@ -281,16 +288,16 @@ export function emitVsMain(prog: SmProgram, a: VsAnalysis, opts: VsEmitOptions):
                     }
                     if (!prog.usesRelativeConst && a.defConsts.has(reg.num)) return `dc${reg.num}`;
                     if (prog.usesRelativeConst) return relativeConstExpr(`${reg.num}`);
-                    return `vsc.c[${Math.min(Math.max(0, reg.num), maxConstIdx)}]`;
+                    return `${vsc}.c[${Math.min(Math.max(0, reg.num), maxConstIdx)}]`;
                 case RegType.CONSTINT: {
                     const def = a.defInts.get(reg.num);
                     if (def) return `vec4<f32>(${def[0]}, ${def[1]}, ${def[2]}, ${def[3]})`;
-                    return `vec4<f32>(vsc.i[${reg.num}])`;
+                    return `vec4<f32>(${vsc}.i[${reg.num}])`;
                 }
                 case RegType.CONSTBOOL:
                     if (a.defBools.has(reg.num)) return a.defBools.get(reg.num) ? `vec4<f32>(1.0)` : `vec4<f32>(0.0)`;
-                    return `select(vec4<f32>(0.0), vec4<f32>(1.0), vsBool(${reg.num}u))`;
-                case RegType.ADDR: return `vec4<f32>(f32(a0.x), f32(a0.y), f32(a0.z), f32(a0.w))`;
+                    return `select(vec4<f32>(0.0), vec4<f32>(1.0), ${vsBoolCall(reg.num)})`;
+                case RegType.ADDR: return `vec4<f32>(f32(a0[0]), f32(a0[1]), f32(a0[2]), f32(a0[3]))`;
                 case RegType.LOOP: return `vec4<f32>(f32(${activeLoopLocal ?? "0"}))`;
                 case RegType.PREDICATE: return `select(vec4<f32>(0.0), vec4<f32>(1.0), p${reg.num})`;
                 default: return `vec4<f32>(0.0)`;
@@ -342,7 +349,7 @@ export function emitVsMain(prog: SmProgram, a: VsAnalysis, opts: VsEmitOptions):
     const predicateRegisters = collectPredicateRegisters(blocks);
     for (const predicate of predicateRegisters) body.line(`var p${predicate}: vec4<bool> = vec4<bool>(false);`);
     body.line(`var oPos: vec4<f32> = vec4<f32>(0.0, 0.0, 0.0, 1.0);`);
-    if (opts.pointExpansion) body.line(`var oPts: vec4<f32> = vec4<f32>(vsc.c[${pointSizeSlot}].x, 0.0, 0.0, 0.0);`);
+    if (opts.pointExpansion) body.line(`var oPts: vec4<f32> = vec4<f32>(${vsc}.c[${pointSizeSlot}].x, 0.0, 0.0, 0.0);`);
     if (a.writesColor[0]) body.line(`var oD0: vec4<f32> = vec4<f32>(1.0);`);
     if (a.writesColor[1]) body.line(`var oD1: vec4<f32> = vec4<f32>(0.0, 0.0, 0.0, 1.0);`);
     for (const n of a.writesTexcoord) body.line(`var oT${n}: vec4<f32> = vec4<f32>(0.0);`);
@@ -383,7 +390,7 @@ export function emitVsMain(prog: SmProgram, a: VsAnalysis, opts: VsEmitOptions):
             activeLoopLocal = lexical.loopLocal;
             if (source.reg.type === RegType.CONSTBOOL) {
                 if (a.defBools.has(source.reg.num)) return a.defBools.get(source.reg.num) ? "true" : "false";
-                return `vsBool(${source.reg.num}u)`;
+                return vsBoolCall(source.reg.num);
             }
             if (source.reg.type === RegType.PREDICATE) {
                 return scalarPredicateExpr(source, ctx);
@@ -426,29 +433,27 @@ export function emitVsMain(prog: SmProgram, a: VsAnalysis, opts: VsEmitOptions):
                 }
             }
             if (d && d.reg.type === RegType.ADDR) {
-                // vs_1_1 floors when loading a0; vs_2_0+ (mova) rounds.
-                const rnd = (prog.major >= 2 || prog.minor >= 2) ? "d3dRound" : "floor";
-                const value = srcExpr(ins.src[0]!, ctx);
-                if (ins.predicated && ins.predicate) {
-                    for (const [bit, component] of COMPONENTS.entries()) {
-                        if ((d.writeMask & (1 << bit)) === 0) continue;
-                        const converted = rnd === "d3dRound"
-                            ? `i32(${roundD3dExpr(`(${value}).${component}`)})`
-                            : `i32(floor((${value}).${component}))`;
-                        const predicate = predicateLaneExpr(ins.predicate, bit, ctx);
-                        body.line(`a0.${component} = select(a0.${component}, ${converted}, ${predicate});`);
-                    }
-                } else if (ins.predicated) {
+                if (ins.predicated && !ins.predicate) {
                     census.record(ins.opcode, "unsupported");
                     return;
-                } else {
-                    for (const [bit, component] of COMPONENTS.entries()) {
-                        if ((d.writeMask & (1 << bit)) === 0) continue;
-                        body.line(rnd === "d3dRound"
-                            ? `a0.${component} = i32(${roundD3dExpr(`(${value}).${component}`)});`
-                            : `a0.${component} = i32(floor((${value}).${component}));`);
-                    }
                 }
+                // vs_1_1 floors when loading a0; vs_2_0+ (mova) rounds.
+                const rounds = prog.major >= 2 || prog.minor >= 2;
+                const predicate = ins.predicated ? ins.predicate : undefined;
+                const source = body.tmp("mova");
+                body.line(`let ${source} = ${srcExpr(ins.src[0]!, ctx)};`);
+                // Same whole-vector store discipline as emitStore: `a0.x = …` is a writable
+                // swizzle view. Unwritten and predicate-false lanes read the old a0 back.
+                const lanes = COMPONENTS.map((component, bit) => {
+                    if ((d.writeMask & (1 << bit)) === 0) return `a0[${bit}]`;
+                    const converted = rounds
+                        ? `i32(${roundD3dExpr(`${source}[${bit}]`)})`
+                        : `i32(floor(${source}[${bit}]))`;
+                    return predicate
+                        ? `select(a0[${bit}], ${converted}, ${predicateLaneExpr(predicate, bit, ctx)})`
+                        : converted;
+                });
+                body.line(`a0 = vec4<i32>(${lanes.join(", ")});`);
                 census.record(ins.opcode, "ok");
                 return;
             }
@@ -502,19 +507,21 @@ export function emitVsMain(prog: SmProgram, a: VsAnalysis, opts: VsEmitOptions):
         return fallback;
     };
     const position = semanticOutput("position", 0, "oPos");
-    body.line(a.usesRelativeOutput
-        ? `out.pos = vec4<f32>((${position}).x + (${position}).w * vsc.c[${pixelCentreSlot}].x, (${position}).y + (${position}).w * vsc.c[${pixelCentreSlot}].y, (${position}).z, (${position}).w);`
-        : `out.pos = vec4<f32>(oPos.x + oPos.w * vsc.c[${pixelCentreSlot}].x, oPos.y + oPos.w * vsc.c[${pixelCentreSlot}].y, oPos.z, oPos.w);`);
+    // `oPos` and `oReg[n]` are both mutable vars; index their lanes rather than swizzling,
+    // and the relative-output and ordinary spellings become the same one expression.
+    const positionLane = (lane: number): string => `${position}[${lane}]`;
+    const correctedPosition = `vec4<f32>(`
+        + `${positionLane(0)} + ${positionLane(3)} * ${vsc}.c[${pixelCentreSlot}].x, `
+        + `${positionLane(1)} + ${positionLane(3)} * ${vsc}.c[${pixelCentreSlot}].y, `
+        + `${positionLane(2)}, ${positionLane(3)})`;
+    body.line(`out.pos = ${correctedPosition};`);
     if (opts.clipPlanes) body.line(`let _clipBasePos = out.pos;`);
     if (opts.pointExpansion) {
         // The CPU expansion duplicates each source point six times in triangle-list order
         // [0,1,2,2,1,3].  Keep the original position/outputs intact and offset only the
         // position in clip space.  The hidden c[] tail carries the active viewport dimensions
         // in z/w; x/y continue to carry the normal D3D↔WebGPU pixel-centre correction.
-        const basePosition = a.usesRelativeOutput
-            ? `vec4<f32>((${position}).x + (${position}).w * vsc.c[${pixelCentreSlot}].x, (${position}).y + (${position}).w * vsc.c[${pixelCentreSlot}].y, (${position}).z, (${position}).w)`
-            : `vec4<f32>(oPos.x + oPos.w * vsc.c[${pixelCentreSlot}].x, oPos.y + oPos.w * vsc.c[${pixelCentreSlot}].y, oPos.z, oPos.w)`;
-        body.line(`let _pointBasePos = ${basePosition};`);
+        body.line(`let _pointBasePos = ${correctedPosition};`);
         // recordConvertedDraw always starts the expanded triangle list at vertex 0; retaining
         // that invariant makes the six-corner lookup independent of the guest firstVertex.
         body.line(`let _pointCorner = vertexIndex % 6u;`);
@@ -526,10 +533,10 @@ export function emitVsMain(prog: SmProgram, a: VsAnalysis, opts: VsEmitOptions):
         body.line(`var _pointCornerYTable = array<f32, 6>(-1.0, -1.0, 1.0, 1.0, -1.0, 1.0);`);
         body.line(`let _pointCornerX = _pointCornerXTable[_pointCorner];`);
         body.line(`let _pointCornerY = _pointCornerYTable[_pointCorner];`);
-        body.line(`let _pointSize = clamp(oPts.x, vsc.c[${pointSizeSlot}].y, vsc.c[${pointSizeSlot}].z);`);
+        body.line(`let _pointSize = clamp(oPts[0], ${vsc}.c[${pointSizeSlot}].y, ${vsc}.c[${pointSizeSlot}].z);`);
         body.line(`let _pointHalfSize = max(_pointSize, 0.0) * 0.5;`);
-        body.line(`let _pointViewportW = max(vsc.c[${pixelCentreSlot}].z, 1.0);`);
-        body.line(`let _pointViewportH = max(vsc.c[${pixelCentreSlot}].w, 1.0);`);
+        body.line(`let _pointViewportW = max(${vsc}.c[${pixelCentreSlot}].z, 1.0);`);
+        body.line(`let _pointViewportH = max(${vsc}.c[${pixelCentreSlot}].w, 1.0);`);
         body.line(`out.pos = vec4<f32>(_pointBasePos.x + _pointBasePos.w * _pointCornerX * _pointHalfSize * 2.0 / _pointViewportW, _pointBasePos.y - _pointBasePos.w * _pointCornerY * _pointHalfSize * 2.0 / _pointViewportH, _pointBasePos.z, _pointBasePos.w);`);
     }
     if (opts.clipPlanes) {
@@ -539,9 +546,9 @@ export function emitVsMain(prog: SmProgram, a: VsAnalysis, opts: VsEmitOptions):
         // Disabled planes are represented by zero vectors in the hidden uniform tail
         // and therefore never kill pixels.
         const clipSlot = opts.clipPlaneSlot ?? pointSizeSlot + 1;
-        body.line(`let _clipPlanePos = vec4<f32>(_clipBasePos.x - _clipBasePos.w * vsc.c[${pixelCentreSlot}].x, _clipBasePos.y - _clipBasePos.w * vsc.c[${pixelCentreSlot}].y, _clipBasePos.z, _clipBasePos.w);`);
-        body.line(`out.clipA = vec4<f32>(dot(_clipPlanePos, vsc.c[${clipSlot}]), dot(_clipPlanePos, vsc.c[${clipSlot + 1}]), dot(_clipPlanePos, vsc.c[${clipSlot + 2}]), dot(_clipPlanePos, vsc.c[${clipSlot + 3}]));`);
-        body.line(`out.clipB = vec2<f32>(dot(_clipPlanePos, vsc.c[${clipSlot + 4}]), dot(_clipPlanePos, vsc.c[${clipSlot + 5}]));`);
+        body.line(`let _clipPlanePos = vec4<f32>(_clipBasePos.x - _clipBasePos.w * ${vsc}.c[${pixelCentreSlot}].x, _clipBasePos.y - _clipBasePos.w * ${vsc}.c[${pixelCentreSlot}].y, _clipBasePos.z, _clipBasePos.w);`);
+        body.line(`out.clipA = vec4<f32>(dot(_clipPlanePos, ${vsc}.c[${clipSlot}]), dot(_clipPlanePos, ${vsc}.c[${clipSlot + 1}]), dot(_clipPlanePos, ${vsc}.c[${clipSlot + 2}]), dot(_clipPlanePos, ${vsc}.c[${clipSlot + 3}]));`);
+        body.line(`out.clipB = vec2<f32>(dot(_clipPlanePos, ${vsc}.c[${clipSlot + 4}]), dot(_clipPlanePos, ${vsc}.c[${clipSlot + 5}]));`);
     }
     const colorOutput = (name: string): string => prog.major < 3
         ? `min(max(${name}, vec4<f32>(0.0)), vec4<f32>(1.0))`
@@ -556,15 +563,19 @@ export function emitVsMain(prog: SmProgram, a: VsAnalysis, opts: VsEmitOptions):
         // interpolation preserves the sprite orientation.  Preserve z/w from the shader's
         // varying for shaders that use 3-D/projective coordinates while replacing x/y.
         body.line(opts.pointExpansion && opts.pointSpriteEnable
-            ? `out.${texField(n)} = vec4<f32>(select(1.0, 0.0, ((_pointCorner == 0u) || (_pointCorner == 2u) || (_pointCorner == 3u))), select(1.0, 0.0, ((_pointCorner == 0u) || (_pointCorner == 1u) || (_pointCorner == 4u))), (${texcoord}).z, (${texcoord}).w);`
+            ? `out.${texField(n)} = vec4<f32>(select(1.0, 0.0, ((_pointCorner == 0u) || (_pointCorner == 2u) || (_pointCorner == 3u))), select(1.0, 0.0, ((_pointCorner == 0u) || (_pointCorner == 1u) || (_pointCorner == 4u))), (${texcoord})[2], (${texcoord})[3]);`
             : `out.${texField(n)} = ${texcoord};`);
     }
     if (opts.interpFog) {
-        body.line(`out.fog = ${a.writesFog ? `clamp((${semanticOutput("fog", 0, "oFog")}).x, 0.0, 1.0)` : "1.0"};`);
+        body.line(`out.fog = ${a.writesFog ? `clamp((${semanticOutput("fog", 0, "oFog")})[0], 0.0, 1.0)` : "1.0"};`);
     }
     body.line("return out;");
 
-    return `@vertex\nfn vs_main(in: VsInput${opts.pointExpansion ? ", @builtin(vertex_index) vertexIndex: u32" : ""}) -> Interp {\n    var out: Interp;\n    ${body.toString().replace(/\n/g, "\n    ")}\n}`;
+    const builtins = [
+        opts.pointExpansion ? "@builtin(vertex_index) vertexIndex: u32" : "",
+        opts.instanceStorage ? "@builtin(instance_index) _bsInstance: u32" : "",
+    ].filter(Boolean).join(", ");
+    return `@vertex\nfn vs_main(in: VsInput${builtins ? `, ${builtins}` : ""}) -> Interp {\n    var out: Interp;\n    ${body.toString().replace(/\n/g, "\n    ")}\n}`;
 }
 
 /**

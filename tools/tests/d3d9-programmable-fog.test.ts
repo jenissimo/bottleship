@@ -91,11 +91,11 @@ describe("D3D9 programmable fixed-function fog (W10)", () => {
         const wgsl = link(compiledVs(true), compiledPs(2));
         expect(wgsl).toContain("fogColor: vec4<f32>, fogParams: vec4<f32>");
         expect(wgsl).toContain("@location(10) fog: f32");
-        expect(wgsl).toContain("out.fog = clamp((oFog).x, 0.0, 1.0)");
+        expect(wgsl).toContain("out.fog = clamp((oFog)[0], 0.0, 1.0)");
         expect(wgsl).toContain("if (psc.fogParams.w > 0.0)");
         expect(wgsl).toContain("((in.pos).z / max((in.pos).w, 1e-8))");
         expect(wgsl).toContain("in.fog, 0.0);");
-        expect(wgsl).toContain("vec4<f32>(mix((oC0).rgb, (psc.fogColor).rgb, _psFogFactor), (oC0).a)");
+        expect(wgsl).toContain("vec4<f32>(mix(vec3<f32>(oC0[0], oC0[1], oC0[2]), (psc.fogColor).rgb, _psFogFactor), oC0[3])");
     });
 
     test("defaults an unwritten programmable oFog to fully unfogged", () => {
@@ -119,7 +119,7 @@ describe("D3D9 programmable fixed-function fog (W10)", () => {
             pointExpansion: true,
         }).wgsl;
         expect(wgsl).toContain("var oPts: vec4<f32> = vec4<f32>(vsc.c[2].x, 0.0, 0.0, 0.0)");
-        expect(wgsl).toContain("let _pointSize = clamp(oPts.x, vsc.c[2].y, vsc.c[2].z)");
+        expect(wgsl).toContain("let _pointSize = clamp(oPts[0], vsc.c[2].y, vsc.c[2].z)");
         expect(wgsl).toContain("let _pointCorner = vertexIndex % 6u");
     });
 
@@ -148,7 +148,7 @@ describe("D3D9 programmable fixed-function fog (W10)", () => {
         prog.maxConst = 1;
         const wgsl = link({ prog, analysis: analyzeVs(prog) }, compiledPs(2));
         expect(wgsl).toContain("// add");
-        expect(wgsl).toContain("let _sat1 = (vsc.c[0] + vsc.c[1]);");
+        expect(wgsl).toContain("let _sat1 = (vec4<f32>(vsc.c[0]) + vec4<f32>(vsc.c[1]));");
         expect(wgsl).toContain("min(max(_sat1, vec4<f32>(0.0)), vec4<f32>(1.0))");
         expect(wgsl).not.toContain("let _st1 = min(max(vsc.c[0],");
     });

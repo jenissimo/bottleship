@@ -12,9 +12,15 @@
  * parameter and the ddraw generator kept calling it with seven.
  *
  * The check is deliberately narrow so it cannot cry wolf: only names declared as `fn` in
- * our own sources are considered, a name declared with two different arities is reported
- * as ambiguous rather than guessed at, and `${...}` interpolations are treated as one
- * argument each (they are an expression, commas inside them are not separators).
+ * our own sources are considered, and a name declared with two different arities is
+ * reported as ambiguous rather than guessed at.
+ *
+ * A `${...}` argument is an expression, so its commas are not separators — but it can also
+ * expand to text that CONTAINS a separator (`vsBool(${storage ? "_bsInstance, " : ""}${n}u)`
+ * calls a one-parameter helper with two arguments in one branch). An interpolation is
+ * therefore EXPANDED when its expansions are knowable — a body with no comma-bearing literal
+ * is one argument, and a conditional between string literals is checked once per branch —
+ * and only a genuinely unknowable one is skipped.
  *
  * Usage: bun tools/validate-wgsl-calls.ts [--json]
  * Exits 1 on any mismatch.
@@ -63,30 +69,41 @@ function blankComments(src: string): string {
     return out.join("");
 }
 
+interface ArgList {
+    count: number;
+    end: number;
+    interpolated: boolean;
+    /** Absolute [start, endExclusive) of every `${...}` inside the list. */
+    spans: Array<[number, number]>;
+}
+
 /**
  * Split an argument list into top-level arguments. `${...}` is one argument piece however
  * many commas it hides, and nested (), [], <> keep their commas to themselves.
  */
-function countArgs(src: string, open: number): { count: number; end: number; interpolated: boolean } | null {
+function countArgs(src: string, open: number): ArgList | null {
     // `segment` is "something has appeared since the last top-level comma", which is what
     // separates a real final argument from WGSL's permitted trailing comma — counting the
     // latter reports every helper declared that way as one parameter too wide.
     let depth = 0, commas = 0, segment = false, interpolated = false;
+    const spans: Array<[number, number]> = [];
     for (let i = open; i < src.length; i++) {
         const c = src[i]!;
         if (c === "$" && src[i + 1] === "{") {
+            const start = i;
             let braces = 1; i += 2;
             while (i < src.length && braces > 0) {
                 if (src[i] === "{") braces++;
                 else if (src[i] === "}") braces--;
                 i++;
             }
+            spans.push([start, i]);
             i--; segment = true; interpolated = true; continue;
         }
         if (c === "(" || c === "[") { depth++; if (depth === 1) continue; }
         else if (c === ")" || c === "]") {
             depth--;
-            if (depth === 0) return { count: segment ? commas + 1 : commas, end: i, interpolated };
+            if (depth === 0) return { count: segment ? commas + 1 : commas, end: i, interpolated, spans };
             continue;
         }
         if (depth === 1 && c === ",") { commas++; segment = false; continue; }
@@ -94,6 +111,72 @@ function countArgs(src: string, open: number): { count: number; end: number; int
         if (c === "\n" && depth === 0) return null; // not a call after all
     }
     return null;
+}
+
+const STRING_LITERAL = /(["'`])((?:\\.|(?!\1)[^\\])*)\1/g;
+const TERNARY_OF_LITERALS =
+    /^[^?]*\?\s*(["'`])((?:\\.|(?!\1)[^\\])*)\1\s*:\s*(["'`])((?:\\.|(?!\3)[^\\])*)\3\s*$/;
+
+/**
+ * The texts one `${...}` body can expand to, or null when that set is not knowable.
+ *
+ * A conditional between two string literals has exactly two expansions and is checked as
+ * both — that is the shape that hides an arity defect. Otherwise the interpolation counts
+ * as ONE value only when it is glued into a surrounding token (`vsBool(${n}u)`,
+ * `stages[${s}].x`), where a comma-separated expansion could not be valid WGSL at all. A
+ * standalone `${x}` argument stays unknowable: `x` may well be a joined argument list.
+ */
+function interpolationExpansions(body: string, glued: boolean): string[] | null {
+    const ternary = body.match(TERNARY_OF_LITERALS);
+    if (ternary) return [ternary[2]!, ternary[4]!];
+    const literals = [...body.matchAll(STRING_LITERAL)];
+    if (glued && !literals.some(literal => /[,()[\]{}]/.test(literal[2]!))) return ["_"];
+    return null;
+}
+
+/** An interpolation whose neighbours make it part of one WGSL token, not a whole argument. */
+function isGlued(text: string, start: number, end: number): boolean {
+    const before = text.slice(0, start).replace(/\s+$/, "").slice(-1);
+    const after = text.slice(end).replace(/^\s+/, "").slice(0, 1);
+    const separator = (c: string): boolean => c === "" || c === "," || c === "(" || c === ")" || c === "$";
+    return !separator(before) || !separator(after);
+}
+
+/** Every literal argument list `text` can expand to, or null when one part is unknowable. */
+function expandArgList(text: string, spans: Array<[number, number]>): string[] | null {
+    const options: string[][] = [];
+    for (const [start, end] of spans) {
+        const expansions = interpolationExpansions(
+            text.slice(start + 2, end - 1), isGlued(text, start, end));
+        if (!expansions) return null;
+        options.push(expansions);
+    }
+    if (options.reduce((total, o) => total * o.length, 1) > 16) return null;
+    const results: string[] = [];
+    const build = (index: number, cursor: number, acc: string): void => {
+        if (index === spans.length) { results.push(acc + text.slice(cursor)); return; }
+        const [start, end] = spans[index]!;
+        for (const choice of options[index]!) build(index + 1, end, acc + text.slice(cursor, start) + choice);
+    };
+    build(0, 0, "");
+    return results;
+}
+
+/**
+ * The names a `fn ${...}(` declaration can declare. The vs/ps constant banks are emitted from
+ * ONE template whose helper name is interpolated; without this `vsBool` has no declaration
+ * and none of its calls is compared against one.
+ */
+function declaredNameExpansions(src: string, body: string): string[] | null {
+    const direct = body.match(TERNARY_OF_LITERALS);
+    if (direct) return [direct[2]!, direct[4]!];
+    const identifier = body.trim().match(/^[A-Za-z_]\w*$/);
+    if (!identifier) return null;
+    const bound = src.match(new RegExp(`\\bconst\\s+${identifier[0]}\\s*=\\s*([^;\\n]+)`));
+    const initializer = bound?.[1]?.trim();
+    if (!initializer) return null;
+    const ternary = initializer.match(TERNARY_OF_LITERALS);
+    return ternary ? [ternary[2]!, ternary[4]!] : null;
 }
 
 const files = SCAN_DIRS.flatMap((d) => walk(join(ROOT, d)));
@@ -104,22 +187,30 @@ const entryPoints = new Set<string>();
 const sources = new Map<string, string>(files.map((f) => [f, blankComments(readFileSync(f, "utf8"))]));
 
 const declSpans = new Map<string, Array<[number, number]>>();
+/** `fn ${...}(` declarations whose name could not be resolved — reported, never silent. */
+let undeclarableNames = 0;
 
 for (const file of files) {
     const src = sources.get(file)!;
-    for (const m of src.matchAll(/\bfn\s+([A-Za-z_]\w*)\s*\(/g)) {
-        const name = m[1]!;
+    for (const m of src.matchAll(/\bfn\s+(?:([A-Za-z_]\w*)|\$\{([^{}]*)\})\s*\(/g)) {
+        const names = m[1] ? [m[1]] : declaredNameExpansions(src, m[2]!);
+        if (!names) { undeclarableNames++; continue; }
         // Entry points are called by the pipeline, never from WGSL, and each generator
         // declares its own with whatever inputs that shader needs — comparing those across
         // files reports an arity conflict that means nothing.
         const before = src.slice(Math.max(0, m.index! - 120), m.index!);
-        if (/@(?:fragment|vertex|compute)\s*$/.test(before)) { entryPoints.add(name); continue; }
+        if (/@(?:fragment|vertex|compute)\s*$/.test(before)) {
+            for (const name of names) entryPoints.add(name);
+            continue;
+        }
         // A parameter list is counted the same way an argument list is: `@location(0)`
         // and `array<f32, 4>` both carry parens/commas that are not separators.
-        const parsed = countArgs(src, src.indexOf("(", m.index!));
+        const parsed = countArgs(src, m.index! + m[0]!.length - 1);
         if (!parsed) continue;
-        decls.set(name, [...(decls.get(name) ?? []), { name, arity: parsed.count, file, line: lineOf(src, m.index!) }]);
-        declSpans.set(`${file}:${name}`, [...(declSpans.get(`${file}:${name}`) ?? []), [m.index!, parsed.end]]);
+        for (const name of names) {
+            decls.set(name, [...(decls.get(name) ?? []), { name, arity: parsed.count, file, line: lineOf(src, m.index!) }]);
+            declSpans.set(`${file}:${name}`, [...(declSpans.get(`${file}:${name}`) ?? []), [m.index!, parsed.end]]);
+        }
     }
     // A TypeScript function of the same name would make every JS call site look like a
     // shader call; those names are excluded rather than reported wrongly.
@@ -129,6 +220,7 @@ for (const file of files) {
 const mismatches: Mismatch[] = [];
 const ambiguous: string[] = [];
 let interpolatedCalls = 0;
+let expandedCalls = 0;
 let checkedCalls = 0;
 
 for (const [name, list] of decls) {
@@ -148,26 +240,44 @@ for (const [name, list] of decls) {
             const open = src.indexOf("(", m.index!);
             const parsed = countArgs(src, open);
             if (!parsed) continue;
-            // A `${...}` argument is one expression that may expand to any number of
-            // arguments, so its call cannot be counted. Counted out loud rather than
-            // silently skipped: an unchecked call is a hole in the check, not a pass.
-            if (parsed.interpolated) { interpolatedCalls++; continue; }
+            const snippet = (): string =>
+                src.slice(m.index!, Math.min(parsed.end + 1, m.index! + 120)).replace(/\s+/g, " ");
+            if (!parsed.interpolated) {
+                checkedCalls++;
+                if (parsed.count !== want) {
+                    mismatches.push({ name, file: relative(ROOT, file), line, got: parsed.count, want, snippet: snippet() });
+                }
+                continue;
+            }
+            // An interpolated argument list is checked once per KNOWN expansion. Only a
+            // list with an unknowable part is skipped, and that is counted out loud: an
+            // unchecked call is a hole in the check, not a pass.
+            const text = src.slice(open, parsed.end + 1);
+            const candidates = expandArgList(
+                text, parsed.spans.map(([a, b]) => [a - open, b - open] as [number, number]));
+            if (!candidates) { interpolatedCalls++; continue; }
             checkedCalls++;
-            if (parsed.count !== want) {
+            expandedCalls++;
+            for (const candidate of candidates) {
+                const expansion = countArgs(candidate, 0);
+                if (!expansion || expansion.count === want) continue;
                 mismatches.push({
-                    name, file: relative(ROOT, file), line, got: parsed.count, want,
-                    snippet: src.slice(m.index!, Math.min(parsed.end + 1, m.index! + 120)).replace(/\s+/g, " "),
+                    name, file: relative(ROOT, file), line, got: expansion.count, want,
+                    snippet: `${snippet()}   [expansion: ${name}${candidate.replace(/\s+/g, " ")}]`,
                 });
+                break;
             }
         }
     }
 }
 
 if (process.argv.includes("--json")) {
-    console.log(JSON.stringify({ mismatches, ambiguous, helpers: decls.size, checkedCalls, interpolatedCalls }, null, 2));
+    console.log(JSON.stringify({ mismatches, ambiguous, helpers: decls.size, checkedCalls, expandedCalls, interpolatedCalls, undeclarableNames }, null, 2));
 } else {
-    console.log(`[wgsl-calls] ${decls.size} shader helpers, ${checkedCalls} calls checked, `
-        + `${interpolatedCalls} skipped (an interpolated argument can expand to any count)`);
+    console.log(`[wgsl-calls] ${decls.size} shader helpers, ${checkedCalls} calls checked `
+        + `(${expandedCalls} by expanding an interpolated argument list), `
+        + `${interpolatedCalls} skipped (an unknowable interpolation can expand to any count), `
+        + `${undeclarableNames} declarations with an unresolvable interpolated name`);
     for (const a of ambiguous) console.log(`  ambiguous (not checked): ${a}`);
     for (const m of mismatches) {
         console.log(`  MISMATCH ${m.file}:${m.line}  ${m.name} called with ${m.got}, declared with ${m.want}`);
