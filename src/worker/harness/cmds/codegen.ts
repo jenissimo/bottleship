@@ -9,7 +9,7 @@
  *
  * Capture reuses the `__wasmDump` hook in codegen_finalize (one falsy check in
  * production). Arms default to the engine's own tier-2 page set: those pages crossed the
- * re-entry threshold, so they are hot by the engine's measure, not by a guess.
+ * retired-instruction threshold, so they are hot by the engine's measure, not by a guess.
  *
  * Method note: a flag toggle clears the JIT cache, so the ONLY sound comparison is
  * label-vs-label from captures taken after equal re-warm, and an A/B/A rotation is what

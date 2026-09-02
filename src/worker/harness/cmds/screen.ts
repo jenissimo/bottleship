@@ -481,10 +481,11 @@ export function registerScreenCommands(svc: HarnessService): void {
      *  whether the lever is the key or the cache. Measured in-race on NFSU over 40 frames:
      *  78,720 acquires, 78,720 hits, ZERO builds, 0.458 us per hit — so it is the key.
      *
-     *  `__d3d9ProgBindFastKey` (live, default off) is that lever: a front memo keyed on the
-     *  draw state's stage epoch, the sampler and the four masks. `__d3d9ProgBindFastKeyVerify`
-     *  runs the full key anyway and compares — `fastKeyUnsafe` must be 0, `fastKeyConservative`
-     *  is a skip declined (a cost), and `fastKeyChecked: 0` says the oracle never ran.
+     *  `__d3d9ProgBindFastKey` (live, default ON — set it to false to disarm) is that lever: a
+     *  front memo keyed on the draw state's stage epoch, the sampler and the four masks. It
+     *  carries its own oracle: `__d3d9ProgBindFastKeyVerify` runs the full key anyway and
+     *  compares — `fastKeyUnsafe` must be 0, `fastKeyConservative` is a skip declined (a cost),
+     *  and `fastKeyChecked: 0` says the oracle never ran.
      *
      *  Read `perFrameProgBuilds` for the cost, then `progRebuiltHash` / `progEvictLive` /
      *  `gpuIdsAssigned` for the cause: a returning material means capacity, a growing gpuId

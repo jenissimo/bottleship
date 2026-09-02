@@ -70,15 +70,15 @@ export class PreemptionManager {
     private retChainingEnabled = true;          // config idx 12
     private retSpeculationEnabled = true;       // config idx 13
 
-    /** Hotness tiering (config idx 15 = per-module re-entry promotion threshold,
-     *  0 = OFF). Default ON after the null-function root cause was fixed in the
-     *  fork: the ret-memo outlived table-slot frees on the module-overwrite path
-     *  (ret_cache invalidation moved into free_wasm_table_index + epoch-keyed memo).
-     *  Kill-switch: dbg.jitTier2(0) — routed through
-     *  setTier2Threshold so the choice survives a game reload. Known perf-quality
-     *  caveat (not correctness): chained edges bypass cycle_internal, so heavily
-     *  chained modules accumulate re-entries slower and promote late. */
-    private tier2Threshold = 300_000;           // config idx 15 (0 = tier-2 OFF)
+    /** Experimental hotness tiering (config idx 15 = per-module retired-instruction
+     *  threshold, 0 = OFF). The retired-instruction census and bounded replacement
+     *  policy are available for workload A/Bs, but expanded modules regressed the
+     *  corrected mixed RE benchmark, so production defaults to OFF. Enable with
+     *  dbg.jitTier2(19200000); disable with dbg.jitTier2(0) — both are routed through
+     *  setTier2Threshold so the choice survives a game reload. Generated modules
+     *  account before exits and chained tail calls, so long loops and fragmented
+     *  code compete in the same unit. */
+    private tier2Threshold = 0;                 // config idx 15 (experimental, opt-in)
 
     /** Walks every PARKED thread's saved x87 snapshot. Registered by the Scheduler
      *  (which owns the thread table and already depends on this module), same provider
@@ -212,8 +212,8 @@ export class PreemptionManager {
     }
     isRetSpeculationEnabled(): boolean { return this.retSpeculationEnabled; }
 
-    /** Hotness-tiering authoritative toggle (survives game reload). Pure runtime knob —
-     *  promotion happens organically past the threshold, so no cache clear needed. */
+    /** Hotness-tiering authoritative toggle (survives game reload). Nonzero threshold changes
+     *  apply to future crossings; zero is a real kill switch and clears compiled JIT state. */
     setTier2Threshold(threshold: number): void {
         this.tier2Threshold = threshold >>> 0;
         const ex = this.wasmExports;
@@ -288,7 +288,7 @@ export class PreemptionManager {
             // Hotness tiering (idx 15) — re-applied every init; the TS field is the
             // authority (wasm statics reset per game load).
             this.applyJitConfig(this.wasmExports, 15, this.tier2Threshold);
-            console.log(`[PERF] B3 tiering: threshold=${this.tier2Threshold || "OFF"}`);
+            console.log(`[PERF] B3 tiering: retiredThreshold=${this.tier2Threshold || "OFF"}`);
         }
 
         // Re-apply any active guest-debugger config onto this (fresh) wasm instance.

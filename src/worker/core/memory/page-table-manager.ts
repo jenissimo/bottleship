@@ -51,28 +51,6 @@ export class PageTableManager {
         this.getWasmExports = getWasmExports;
     }
 
-    /** Update READ_OK for a page range. The Rust setter repeats the RAM/guard clamp,
-     * so a stale or over-broad TS range can only make reads slower, never unsafe. */
-    private setReadMap(baseAddr: number, sizeBytes: number, readable: boolean): void {
-        if (sizeBytes <= 0) return;
-        const fn = this.getWasmExports()?.fastmem_read_map_set;
-        if (!fn) return;
-        const startPage = baseAddr >>> 12;
-        const endPage = (baseAddr + sizeBytes + PAGE_SIZE - 1) >>> 12;
-        if (endPage > startPage) fn(startPage >>> 0, (endPage - startPage) >>> 0, readable ? 1 : 0);
-    }
-
-    private isReadMapEligible(page: number, pte: number): boolean {
-        const base = page * PAGE_SIZE;
-        const end = base + PAGE_SIZE;
-        const guardEnd = MEM_GUARD_BASE + MEM_GUARD_SIZE;
-        return (pte & PTE_PRESENT) !== 0
-            && (pte & 0xFFFFF000) === (base >>> 0)
-            && base >= 0x00100000
-            && end <= this.totalMemoryBytes
-            && (end <= MEM_GUARD_BASE || base >= guardEnd);
-    }
-
     /**
      * Write page directory + page tables into guest memory.
      * Identity-maps ALL 4GB as Present + RW + User so that only explicitly
@@ -152,15 +130,12 @@ export class PageTableManager {
         // Set CR0.PG (paging) + CR0.WP (write protect for ring 0)
         cpu.cr[0] = (cpu.cr[0] | CR0_PG | CR0_WP) >>> 0;
 
-        // The read map is rebuilt from the PTEs after paging is live. No JIT cache
-        // invalidation is needed: each fast read checks its page byte at runtime.
         const exports = this.getWasmExports();
         if (exports?.full_clear_tlb) {
             exports.full_clear_tlb();
         }
 
         this.pagingEnabled = true;
-        this.rebuildReadMap();
 
         Logger.log(LogCategory.SYSTEM,
             `[PageTableManager] Paging enabled: CR3=0x${PAGE_DIR_ADDR.toString(16)}, ` +
@@ -184,10 +159,7 @@ export class PageTableManager {
             view.setUint32(pteOffset, pte & ~PTE_PRESENT, true);
         }
 
-        // Drop READ_OK before the TLB flush: a compiled load must immediately take
-        // the universal accessor and raise #PF for this now-absent page.
         const exports = this.getWasmExports();
-        this.setReadMap(baseAddr, sizeBytes, false);
         if (exports?.full_clear_tlb) {
             exports.full_clear_tlb();
         }
@@ -240,7 +212,6 @@ export class PageTableManager {
         // Track 2b Phase W: committed pages are present + RW → mark base-writable (Rust
         // clamps to the identity-RAM envelope and skips the THUNK_CODE exclusion band).
         setWriteMapBase(baseAddr, sizeBytes, true);
-        this.setReadMap(baseAddr, sizeBytes, true);
 
         // Zero memory — Windows guarantees clean pages on recommit
         mem.fill(0, baseAddr, baseAddr + sizeBytes);
@@ -276,7 +247,6 @@ export class PageTableManager {
             // Track 2b Phase W: only the pages actually (re)committed here become RW —
             // present pages (possibly RO) are skipped, so mark bit0 per recommitted page.
             setWriteMapBase(physAddr, PAGE_SIZE, true);
-            this.setReadMap(physAddr, PAGE_SIZE, true);
             recommitted++;
         }
 
@@ -331,7 +301,6 @@ export class PageTableManager {
             }
         }
 
-        // No global generation exists: the read-map is the per-page validity check.
         const exports = this.getWasmExports();
         if (exports?.full_clear_tlb) {
             exports.full_clear_tlb();
@@ -341,66 +310,10 @@ export class PageTableManager {
         // an over-broad range safe (this is the sole maintainer for PE sub-page protects,
         // where the AddressSpace exact-match protect() misses and only PTM runs).
         setWriteMapBase(baseAddr, sizeBytes, flags === PTE_DEFAULT);
-        this.setReadMap(baseAddr, sizeBytes, flags !== 0);
     }
 
     isPagingEnabled(): boolean {
         return this.pagingEnabled;
-    }
-
-    /** Rebuild the complete READ_OK view from the page tables. This is used after
-     * paging enable and is intentionally independent of AddressSpace bookkeeping:
-     * freed-but-still-present memory is readable on real hardware as well. */
-    rebuildReadMap(): void {
-        const exports = this.getWasmExports();
-        const reset = exports?.fastmem_read_map_reset;
-        const set = exports?.fastmem_read_map_set;
-        if (!reset || !set || !this.pagingEnabled) return;
-        reset();
-        const mem = this.getMemory();
-        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-        const pageCount = Math.ceil(this.totalMemoryBytes / PAGE_SIZE);
-        let runStart = -1;
-        const flush = (endPage: number) => {
-            if (runStart >= 0) {
-                set(runStart >>> 0, (endPage - runStart) >>> 0, 1);
-                runStart = -1;
-            }
-        };
-        for (let page = 0; page < pageCount; page++) {
-            const pte = view.getUint32(this._getPteOffset(page), true);
-            if (this.isReadMapEligible(page, pte)) {
-                if (runStart < 0) runStart = page;
-            } else {
-                flush(page);
-            }
-        }
-        flush(pageCount);
-    }
-
-    /** Compare the map byte-for-byte with the PTE-derived identity-map contract.
-     * `danger` is a correctness failure (fast read accepted where it must fault or
-     * translate); `missing` is conservative and affects performance only. */
-    auditReadMap(maxReport = 32): {
-        readablePages: number; danger: number; missing: number; samples: Array<{ page: number; pte: number; map: number; expected: boolean }>;
-    } | null {
-        const exports = this.getWasmExports();
-        if (!exports?.fastmem_read_map_get || !this.pagingEnabled) return null;
-        const mem = this.getMemory();
-        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-        const pageCount = Math.ceil(this.totalMemoryBytes / PAGE_SIZE);
-        let readablePages = 0, danger = 0, missing = 0;
-        const samples: Array<{ page: number; pte: number; map: number; expected: boolean }> = [];
-        for (let page = 0; page < pageCount; page++) {
-            const pte = view.getUint32(this._getPteOffset(page), true);
-            const expected = this.isReadMapEligible(page, pte);
-            const map = exports.fastmem_read_map_get(page) >>> 0;
-            if (expected) readablePages++;
-            if (map === 1 && !expected) danger++;
-            if (map !== 1 && expected) missing++;
-            if ((map === 1) !== expected && samples.length < maxReport) samples.push({ page, pte, map, expected });
-        }
-        return { readablePages, danger, missing, samples };
     }
 
     /**

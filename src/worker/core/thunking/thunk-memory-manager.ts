@@ -652,6 +652,7 @@ export class ThunkMemoryManager {
         const dv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         const addrs: number[] = new Array(21);  // 16 standard + 4 PtrDeref + 1 shader-constant
         let off = base;
+        const lean = (globalThis as { __wbufLeanTrampolines?: boolean }).__wbufLeanTrampolines === true;
 
         // The trampoline's capacity check is `cmp head, LIMIT; jge overflow` BEFORE
         // writing the entry — it must leave room for the LARGEST entry (funcId + 8
@@ -666,6 +667,39 @@ export class ThunkMemoryManager {
                 const isStdcall = isStdcallInt === 0;
                 const idx = (argCount - 1) * 2 + isStdcallInt;
                 addrs[idx] = off;
+
+                if (lean) {
+                    // EAX/ECX/EDX and EFLAGS are caller-saved in the 32-bit Windows ABI.
+                    // Keep every callee-saved register untouched and use no stack frame:
+                    // EDX=head, ECX=&ring[head], EAX=funcId then argument scratch.
+                    w8(0x8B); w8(0x15); w32(ctrlAddr); // mov edx, [ctrlAddr]
+                    w8(0x81); w8(0xFA); w32(capacityLimit); // cmp edx, limit
+                    w8(0x0F); w8(0x8D); // jge .overflow
+                    const leanJgePatchOff = off; w32(0);
+                    w8(0xB9); w32(dataBase); // mov ecx, dataBase
+                    w8(0x01); w8(0xD1); // add ecx, edx
+                    w8(0x89); w8(0x01); // mov [ecx], eax
+                    for (let i = 0; i < argCount; i++) {
+                        const stackOff = 4 + i * 4;
+                        const bufOff = (i + 1) * 4;
+                        w8(0x8B); w8(0x44); w8(0x24); w8(stackOff); // mov eax,[esp+off]
+                        w8(0x89); w8(0x41); w8(bufOff); // mov [ecx+off],eax
+                    }
+                    w8(0x83); w8(0x05); w32(ctrlAddr); w8((argCount + 1) * 4);
+                    w8(0xBA); w32(0xB077); // preserve the canonical thunk EDX result
+                    w8(0x31); w8(0xC0); // xor eax,eax
+                    const bytesToPop = argCount * 4;
+                    if (isStdcall) { w8(0xC2); w8(bytesToPop & 0xFF); w8((bytesToPop >> 8) & 0xFF); }
+                    else           { w8(0xC3); }
+
+                    const leanOverflowAddr = off;
+                    w8(0xBA); w32(0xB077);
+                    w8(0xEF); // EAX is still funcId: capacity check precedes all argument loads
+                    if (isStdcall) { w8(0xC2); w8(bytesToPop & 0xFF); w8((bytesToPop >> 8) & 0xFF); }
+                    else           { w8(0xC3); }
+                    dv.setInt32(leanJgePatchOff, leanOverflowAddr - (leanJgePatchOff + 4), true);
+                    continue;
+                }
 
                 // pushfd (save EFLAGS — trampoline must not clobber flags, matching OUT-trap behavior)
                 w8(0x9C);
@@ -826,6 +860,77 @@ export class ThunkMemoryManager {
             const maxVec4 = 256;
             addrs[idx] = off;
 
+            if (lean) {
+                // Preserve only ESI/EDI (callee-saved) plus funcId. ECX/EDX/EFLAGS are
+                // caller-saved, while EBX is not touched. Stack after the three pushes:
+                // [0]=funcId [4]=old EDI [8]=old ESI [12]=ret [16]=this [20]=start
+                // [24]=pData [28]=vec4Count.
+                w8(0x56); // push esi
+                w8(0x57); // push edi
+                w8(0x50); // push eax
+                w8(0x8B); w8(0x15); w32(ctrlAddr); // mov edx,[ctrlAddr]
+                w8(0x8B); w8(0x4C); w8(0x24); w8(28); // mov ecx,[esp+28]
+                w8(0x85); w8(0xC9); // test ecx,ecx
+                w8(0x0F); w8(0x84); const leanJzOverflowOff = off; w32(0);
+                w8(0x81); w8(0xF9); w32(maxVec4); // cmp ecx,maxVec4
+                w8(0x0F); w8(0x87); const leanJaOverflowOff = off; w32(0);
+                w8(0x89); w8(0xC8); // mov eax,ecx
+                w8(0xC1); w8(0xE0); w8(4); // shl eax,4
+                w8(0x83); w8(0xC0); w8(16); // add eax,16
+                w8(0x01); w8(0xD0); // add eax,edx
+                w8(0x3D); w32(capacity); // cmp eax,capacity
+                w8(0x0F); w8(0x87); const leanJaCapOverflowOff = off; w32(0);
+
+                w8(0xBF); w32(dataBase); // mov edi,dataBase
+                w8(0x01); w8(0xD7); // add edi,edx
+                w8(0x8B); w8(0x04); w8(0x24); // mov eax,[esp]
+                w8(0x89); w8(0x07); // mov [edi],eax
+                w8(0x8B); w8(0x44); w8(0x24); w8(16); // this
+                w8(0x89); w8(0x47); w8(4);
+                w8(0x8B); w8(0x44); w8(0x24); w8(20); // startReg
+                w8(0x89); w8(0x47); w8(8);
+                w8(0x8B); w8(0x4C); w8(0x24); w8(28); // vec4Count
+                w8(0x89); w8(0x4F); w8(12);
+                w8(0x8B); w8(0x74); w8(0x24); w8(24); // esi=pData
+                w8(0x83); w8(0xC7); w8(16); // edi=float destination
+                w8(0xC1); w8(0xE1); w8(2); // ecx=dword count
+
+                const leanCopyLoopAddr = off;
+                w8(0x85); w8(0xC9);
+                w8(0x74); const leanJzCopyDoneOff = off; w8(0);
+                w8(0x8B); w8(0x06);
+                w8(0x89); w8(0x07);
+                w8(0x83); w8(0xC6); w8(4);
+                w8(0x83); w8(0xC7); w8(4);
+                w8(0x49);
+                w8(0xEB); const leanJmpCopyOff = off; w8(0);
+                mem[leanJmpCopyOff] = leanCopyLoopAddr - (leanJmpCopyOff + 1);
+                const leanCopyDoneAddr = off;
+                mem[leanJzCopyDoneOff] = leanCopyDoneAddr - (leanJzCopyDoneOff + 1);
+
+                w8(0x8B); w8(0x44); w8(0x24); w8(28);
+                w8(0xC1); w8(0xE0); w8(4);
+                w8(0x83); w8(0xC0); w8(16);
+                w8(0x01); w8(0x05); w32(ctrlAddr);
+                w8(0x83); w8(0xC4); w8(4); // discard saved funcId
+                w8(0x5F); // pop edi
+                w8(0x5E); // pop esi
+                w8(0xBA); w32(0xB077);
+                w8(0x31); w8(0xC0);
+                w8(0xC2); w8(16); w8(0);
+
+                const leanOverflowAddr = off;
+                dv.setInt32(leanJzOverflowOff, leanOverflowAddr - (leanJzOverflowOff + 4), true);
+                dv.setInt32(leanJaOverflowOff, leanOverflowAddr - (leanJaOverflowOff + 4), true);
+                dv.setInt32(leanJaCapOverflowOff, leanOverflowAddr - (leanJaCapOverflowOff + 4), true);
+                w8(0x58); // pop eax: restore funcId for OUT fallback
+                w8(0x5F);
+                w8(0x5E);
+                w8(0xBA); w32(0xB077);
+                w8(0xEF);
+                w8(0xC2); w8(16); w8(0);
+            } else {
+
             w8(0x9C); // pushfd
             w8(0x52); // push edx
             w8(0x53); // push ebx
@@ -912,6 +1017,7 @@ export class ThunkMemoryManager {
             w8(0xBA); w32(0xB077); // mov edx, 0xB077
             w8(0xEF); // out dx, eax
             w8(0xC2); w8(16); w8(0); // ret 16
+            }
         }
 
         Logger.log(LogCategory.SYSTEM,

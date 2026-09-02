@@ -84,7 +84,7 @@ export function invalidateGuestCode(address: number, length: number): boolean {
     // behind on the SAME page — the only two things it adds are (a) pages nobody named and
     // (b) a JIT that never stays warm. (b) is not a coherence property: a title that
     // survives only under this flag may simply be one whose hot modules never reach the
-    // tier-2 re-entry threshold, and free-running tiering is what actually breaks it.
+    // tier-2 retired-instruction threshold, and free-running tiering is what actually breaks it.
     // Before concluding "a call site is missing", confirm with `codeAudit` (which names the
     // page and the writer) and rule out tiering with `dbgCall('jitTier2', 0)` — JIT ON,
     // invalidation unchanged, no cache clear, promotion off. Two titles read as a missing

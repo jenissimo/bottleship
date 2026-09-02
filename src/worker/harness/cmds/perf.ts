@@ -28,7 +28,7 @@ import { getBufferUploadCensus, resetBufferUploadCensus } from "../../backends/w
 import { cpu, sys, symbolize, proc } from "../serialize";
 import { HarnessError, HarnessErrorCode } from "../rpc";
 import { type FrameTail } from "../../core/frame-time-distribution";
-import { dbg } from "../../core/debug/dbg-commands";
+import { dbg, type FastmemStats } from "../../core/debug/dbg-commands";
 import { guestCodeInvalidationStats } from "../../core/memory/guest-code";
 import { hypercallDataManager } from "../../core/cpu/hypercall-data";
 
@@ -92,11 +92,34 @@ const LIVE_BLIND_SPOTS: string[] = [
     "thunk time is summed ACROSS guest threads into the frame it landed in, so a parked audio thread inflates a frame's thunk category (park thunks are excluded from blame, not from the category).",
 ];
 
+/**
+ * The fastmem fields the frame window reports, projected out of `dbg.fastmemStats()`.
+ *
+ * Exported and typed so the projection is checked rather than cast: a field the engine no
+ * longer exports must fail the typecheck, not be published as `NaN` under its name.
+ */
+export type FastmemCounters = {
+    writesEnabled: boolean;
+    /** Compile-site count, cumulative since boot: differenced over the window. */
+    speculatedStoresCompiled: number;
+    /** Pages the JIT will take the fast store path on; a level, not a rate. */
+    writeMapAcceptPages: number | null;
+};
+
+export function projectFastmem(f: FastmemStats | null): FastmemCounters | null {
+    if (!f) return null;
+    return {
+        writesEnabled: f.writesEnabled,
+        speculatedStoresCompiled: f.speculatedStoresCompiled,
+        writeMapAcceptPages: f.writeMap?.acceptPages ?? null,
+    };
+}
+
 type CounterSnapshot = {
     atMs: number;
     presentSerial: number | null;
     sched: Record<string, number> | null;
-    fastmem: { enabled: boolean; speculatedLoadsCompiled: number; readMapPages: number } | null;
+    fastmem: FastmemCounters | null;
     tier2: Record<string, number> | null;
     codeInvalidations: { wired: boolean; ranges: number; bytes: number; deferred: number };
     hypercalls: number;
@@ -112,8 +135,7 @@ function snapshotCounters(render: RenderLike | undefined): CounterSnapshot {
     let fastmem: CounterSnapshot["fastmem"] = null;
     let tier2: CounterSnapshot["tier2"] = null;
     try {
-        const f = dbg.fastmemStats?.() as CounterSnapshot["fastmem"] | null;
-        if (f) fastmem = { enabled: f.enabled, speculatedLoadsCompiled: f.speculatedLoadsCompiled, readMapPages: f.readMapPages };
+        fastmem = projectFastmem(dbg.fastmemStats?.() ?? null);
     } catch { /* wasm debug exports absent in this build */ }
     try {
         tier2 = (dbg.tier2Stats?.() as unknown as Record<string, number> | null) ?? null;
@@ -163,7 +185,7 @@ function counterDelta(base: CounterSnapshot | null, now: CounterSnapshot) {
         return {
             available: false as const,
             note: "no baseline — call frameReport({reset:true}) to arm one; a delta over an unknown window is not a measurement",
-            current: { fastmemReadMapPages: now.fastmem?.readMapPages ?? null },
+            current: { fastmemWriteMapAcceptPages: now.fastmem?.writeMapAcceptPages ?? null },
         };
     }
     const notes: string[] = [];
@@ -180,8 +202,12 @@ function counterDelta(base: CounterSnapshot | null, now: CounterSnapshot) {
         presents: now.presentSerial !== null && base.presentSerial !== null ? now.presentSerial - base.presentSerial : null,
         sched,
         fastmem: {
-            speculatedLoadsCompiled: now.fastmem && base.fastmem ? now.fastmem.speculatedLoadsCompiled - base.fastmem.speculatedLoadsCompiled : null,
-            readMapPages: now.fastmem?.readMapPages ?? null,
+            writesEnabled: now.fastmem?.writesEnabled ?? null,
+            speculatedStoresCompiled: now.fastmem && base.fastmem
+                ? now.fastmem.speculatedStoresCompiled - base.fastmem.speculatedStoresCompiled : null,
+            // A level, not a delta: the map is rebuilt wholesale, so a difference of two
+            // populations describes nothing.
+            writeMapAcceptPages: now.fastmem?.writeMapAcceptPages ?? null,
         },
         tier2: diffNumbers(base.tier2, now.tier2),
         codeInvalidations: {
@@ -402,11 +428,10 @@ type ArmResult = { ok: true; window: CountedWindow } | { ok: false; reason: stri
  * ENABLED — so arming after resetting is the only order that yields a known-empty,
  * known-recording census.
  *
- * `requested` pages are armed FIRST so a named suspect is never crowded out. That matters
- * because of the selection defect documented on `coverage` below: v86's watch table holds
- * 64 pages, `tier2_pages` is a HashSet, and `jit_get_tier2_page_at` walks it with
- * `.iter().nth(i)` — hash order. Once the tier-2 set exceeds 64 the census therefore
- * instruments an ARBITRARY quarter that changes from boot to boot.
+ * `requested` pages are armed FIRST so a named suspect is never crowded out. The remaining
+ * pages come from `jit_get_tier2_page_at`, which is address-sorted for reproducibility. With
+ * more than 64 active pages the census is therefore deterministic but biased toward lower
+ * addresses, not a frequency-ranked sample; `coverage` reports that limitation.
  */
 function armCountedRecorder(render: RenderLike | undefined, maxPages: number, requested: number[]): ArmResult {
     const w = traceExports();
@@ -683,17 +708,15 @@ function countedGuestBlocks(top: number, window: CountedWindow | null, render: R
         coverage: `only the ${window.watchedPages} armed page(s) are counted; guest work anywhere else (interpreted code, `
             + "tier-1-only pages, pages promoted DURING the window) is absent, not zero. Shares are of the COUNTED total, "
             + "never of all guest instructions.",
-        // The single most misread property of this channel. v86's watch table is 64 entries
-        // and `tier2_pages` is a HashSet walked with .iter().nth(i), so past 64 tier-2 pages
-        // the sample is arbitrary AND differs per boot. A share is then a share of a random
-        // quarter, and an absent block may simply never have been instrumented.
+        // The recorder holds 64 pages. Enumeration is address-sorted and reproducible, but
+        // past 64 pages the selected prefix is not a hotness sample; absence still says only
+        // "not armed", never "cold".
         ...(uncovered > 0
             ? {
                 selectionWarning:
                     `${uncovered} of ${window.tier2Total} tier-2 pages could NOT be armed (v86's watch table holds 64). `
-                    + "The unarmed ones are not the cold ones: jit_get_tier2_page_at walks a HashSet in HASH order, so which "
-                    + "pages get in is arbitrary and changes between boots. Consequences: (1) a `sharePct` here is a share of "
-                    + "this arbitrary subset, so it can be several times the block's share of all guest work; (2) a block's "
+                    + "The armed automatic subset is the lowest-address prefix, not the hottest pages. Consequences: "
+                    + "(1) a `sharePct` here is a share of this address-selected subset, so it can be several times the block's share of all guest work; (2) a block's "
                     + "ABSENCE is not evidence that it is cold; (3) the ranking is not reproducible across boots. To ask about "
                     + "specific code, name it: guestBlocks({pages:[0x…]}) arms those pages first and lists them in "
                     + "armedRequestedPages.",
