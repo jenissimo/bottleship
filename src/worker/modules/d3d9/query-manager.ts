@@ -99,6 +99,23 @@ type SlotPool = {
     free: number[];
 };
 
+/**
+ * Manager-side half of the query lifecycle ledger (query.ts owns the D3D9 half). Every
+ * counter here names a query that silently stopped being measured — the failure mode a
+ * pixel count cannot express, because a stale or synthesized answer looks exactly like a
+ * measured one to the app.
+ */
+export type QueryManagerCounters = {
+    /** Re-arms demoted to fallback because the displaced generation's pool was full. */
+    poolExhaustedFallbacks: number;
+    /** Queries demoted so one render pass keeps a single occlusion set. */
+    passSplitFallbacks: number;
+    /** Generations displaced by a re-arm while their readback was still in flight. */
+    displacedGenerations: number;
+    /** Displaced generations retired by device loss or manager destruction. */
+    displacedLost: number;
+};
+
 type RecordState = {
     id: QueryId;
     key: string;
@@ -151,6 +168,13 @@ export const QUERY_MANAGER_BUFFER_USAGE = {
 const MAP_MODE_READ = 0x0001;
 const RESULT_BYTES = 8;
 
+/** Demotions caused by slot pressure rather than by a missing capability: a later re-arm
+ *  may put the query back on the GPU path once its pool has free slots again. */
+const TRANSIENT_FALLBACK_REASONS = new Set([
+    'query-pool-exhausted-in-pass',
+    'occlusion-pass-pool-split',
+]);
+
 function keyOf(id: QueryId): string {
     return `${typeof id}:${String(id)}`;
 }
@@ -186,7 +210,15 @@ export class D3D9QueryManager {
     private readonly fallback: QueryFallbackContext | undefined;
     private readonly pools = new Map<QueryKind, SlotPool[]>();
     private readonly records = new Map<string, RecordState>();
+    /** A displaced generation is no longer reachable from `records`, but still owns its
+     *  slot until its batch retires; every walk over the live records must also walk this
+     *  set or the generation is invisible to device loss and destruction. */
+    private readonly displaced = new Set<RecordState>();
     private readonly capabilityFailures = new Map<QueryKind, string>();
+    private readonly counters: QueryManagerCounters = {
+        poolExhaustedFallbacks: 0, passSplitFallbacks: 0,
+        displacedGenerations: 0, displacedLost: 0,
+    };
     private submittedSerial = 0;
     private reservedSerial = 0;
     private deviceLost = false;
@@ -326,13 +358,61 @@ export class D3D9QueryManager {
         return this.handleFor(state);
     }
 
-    /** Re-arm a completed query object for a fresh D3D9 BEGIN/END interval. In-flight
-     * readbacks are intentionally not recycled: callers must keep polling the old interval
-     * until it is available, matching native query lifetime rules. */
+    /** Re-arm a D3D9 query object for a fresh BEGIN/END interval. A guest may issue a
+     * new interval before the previous GPU readback retires. In that case the logical
+     * query advances to a fresh slot while the old generation remains owned by its
+     * resolve batch; completing that batch must not overwrite or reclaim the new state. */
     rearm(id: QueryId, record: QueryRecordContract): QueryHandle | null {
-        const state = this.records.get(keyOf(id));
+        const key = keyOf(id);
+        const state = this.records.get(key);
         if (!state) return this.acquire(id, record);
-        if (state.mode === 'gpu' && (state.encoded || state.submitted)) return null;
+        // The same gate acquire() applies: device loss makes every kind unsupported, and a
+        // GPU slot handed out past it can only pend forever.
+        const capability = this.getCapability(state.kind);
+        if (state.mode === 'gpu' && !capability.supported) {
+            return this.replaceWithFallback(id, key, state, record, capability.reason!);
+        }
+        if (state.mode === 'gpu' && (state.encoded || state.submitted)) {
+            // WebGPU binds ONE occlusion set per render pass, so a generation that lands in
+            // a different pool would cost the whole pass its queries. Prefer the displaced
+            // generation's own pool and, when it is full, demote this one query instead.
+            const slot = state.kind === 'occlusion' && state.pool
+                ? (state.pool.free.length > 0 ? state.pool : null)
+                : this.allocateSlot(state.kind);
+            if (!slot) {
+                this.counters.poolExhaustedFallbacks++;
+                return this.replaceWithFallback(id, key, state, record, 'query-pool-exhausted-in-pass');
+            }
+            const index = slot.free.pop()!;
+
+            // The old state is still referenced by its BatchEntry. Retire that
+            // generation after readback, while making the replacement immediately
+            // visible to BEGIN/END and GetData through the records map.
+            state.releaseRequested = true;
+            this.displaced.add(state);
+            this.counters.displacedGenerations++;
+            const replacement: RecordState = {
+                id, key, kind: state.kind, record,
+                mode: 'gpu', pool: slot, index,
+                began: false, recorded: false, encoded: false, submitted: false,
+                releaseRequested: false,
+            };
+            this.records.set(key, replacement);
+            return this.handleFor(replacement);
+        }
+        // Slot pressure is transient: without this retry the one query demoted for a full
+        // pool or a split pass would stay on the CPU path for the life of the object.
+        if (state.mode === 'fallback' && capability.supported
+            && state.reason !== undefined && TRANSIENT_FALLBACK_REASONS.has(state.reason)) {
+            const slot = this.allocateSlot(state.kind);
+            if (slot) {
+                state.mode = 'gpu';
+                state.pool = slot;
+                state.index = slot.free.pop()!;
+                state.reason = undefined;
+                state.fallbackValue = undefined;
+            }
+        }
         state.record = record;
         state.began = false;
         state.recorded = false;
@@ -346,23 +426,60 @@ export class D3D9QueryManager {
         return this.handleFor(state);
     }
 
+    /** Replace the current generation with a fallback one. An in-flight generation keeps
+     *  its slot until its batch retires, so it is displaced rather than reclaimed. */
+    private replaceWithFallback(
+        id: QueryId,
+        key: string,
+        state: RecordState,
+        record: QueryRecordContract,
+        reason: string,
+    ): QueryHandle {
+        if (state.mode === 'gpu' && (state.encoded || state.submitted)) {
+            state.releaseRequested = true;
+            this.displaced.add(state);
+            this.counters.displacedGenerations++;
+        } else {
+            this.reclaim(state);
+        }
+        const replacement = this.createFallbackState(id, key, state.kind, record, reason);
+        this.records.set(key, replacement);
+        return this.handleFor(replacement);
+    }
+
     /**
-     * Return the occlusion query set required by the active render pass. WebGPU
-     * allows only one set per pass, so a frame that spans pools is refused by
-     * returning null; the low-level begin/end hooks then turn that validation
-     * failure into an explicit unavailable result instead of a stuck pending query.
+     * Return the occlusion query set required by the active render pass. WebGPU allows only
+     * one set per pass, so the queries that live in another pool are demoted to their
+     * explicit fallback here — refusing the set instead would cost EVERY occlusion query in
+     * the pass its measurement, and the caller resolves this before the pass is opened, so
+     * nothing has been begun against the losing pool yet.
      */
     getOcclusionQuerySet(ids: readonly QueryId[]): GPUQuerySet | null {
         let querySet: GPUQuerySet | undefined;
+        let split: RecordState[] | undefined;
         for (const id of ids) {
             const state = this.records.get(keyOf(id));
             if (!state || state.kind !== 'occlusion' || state.mode !== 'gpu') continue;
             const candidate = state.pool?.querySet;
-            if (!candidate) return null;
+            if (!candidate) { (split ??= []).push(state); continue; }
             if (!querySet) querySet = candidate;
-            else if (querySet !== candidate) return null;
+            else if (querySet !== candidate) (split ??= []).push(state);
         }
+        if (split) for (const state of split) this.demoteToFallback(state, 'occlusion-pass-pool-split');
         return querySet ?? null;
+    }
+
+    /** Lifecycle counters for dbg.d3d9Perf(); every one names a query that stopped being
+     *  measured, which no pixel count can express on its own. */
+    getCounters(): QueryManagerCounters {
+        return { ...this.counters };
+    }
+
+    resetCounters(): void {
+        this.counters.poolExhaustedFallbacks = 0;
+        this.counters.passSplitFallbacks = 0;
+        this.counters.displacedGenerations = 0;
+        this.counters.displacedLost = 0;
     }
 
     /** Begin an occlusion query in the caller's active render pass. */
@@ -628,6 +745,11 @@ export class D3D9QueryManager {
         }
         this.pools.clear();
         for (const state of this.records.values()) state.error = 'query-manager-destroyed';
+        for (const state of this.displaced) {
+            state.error = 'query-manager-destroyed';
+            this.counters.displacedLost++;
+        }
+        this.displaced.clear();
         this.records.clear();
         this.deviceLost = true;
         this.deviceLossReason = 'query-manager-destroyed';
@@ -646,6 +768,25 @@ export class D3D9QueryManager {
             ...(value === null ? {} : { fallbackValue: value }),
             began: false, recorded: false, encoded: false, submitted: false, releaseRequested: false,
         };
+    }
+
+    /** Move one live query off the GPU path in place, keeping its identity in `records`. */
+    private demoteToFallback(state: RecordState, reason: string): void {
+        this.counters.passSplitFallbacks++;
+        state.mode = 'fallback';
+        state.reason = reason;
+        state.began = false;
+        state.recorded = false;
+        const value = this.fallback?.value?.(state.kind, state.record) ?? null;
+        if (value !== null) state.fallbackValue = value;
+        // An in-flight slot belongs to its batch; only an idle one can be freed here.
+        if (state.encoded || state.submitted) {
+            state.releaseRequested = true;
+        } else if (state.pool && state.index !== undefined) {
+            state.pool.free.push(state.index);
+            state.index = undefined;
+            state.pool = undefined;
+        }
     }
 
     private fallbackResult(state: RecordState, record?: QueryRecordContract): QueryOperationResult {
@@ -809,6 +950,15 @@ export class D3D9QueryManager {
             state.submitted = false;
             if (state.releaseRequested) this.reclaim(state);
         }
+        for (const state of [...this.displaced]) {
+            state.error = reason;
+            state.began = false;
+            state.recorded = false;
+            state.encoded = false;
+            state.submitted = false;
+            this.counters.displacedLost++;
+            this.reclaim(state);
+        }
         for (const pools of this.pools.values()) {
             for (const pool of pools) destroyGpuObject(pool.querySet);
         }
@@ -820,6 +970,7 @@ export class D3D9QueryManager {
      * would hand two future queries the same query-set slot. */
     private reclaim(state: RecordState): void {
         state.releaseRequested = false;
+        this.displaced.delete(state);
         if (state.pool && state.index !== undefined) {
             state.pool.free.push(state.index);
             state.index = undefined;

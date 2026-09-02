@@ -102,10 +102,72 @@ type QueryRecord = {
     /** Timestamp-disjoint interval bookkeeping. */
     disjointBeginTime: bigint | null;
     disjointEndTime: bigint | null;
+    /** An END was issued whose result nobody has observed yet. Drives the `missing`
+     *  ledger counter: a query that dies in this state was measured for nothing. */
+    awaitingResult: boolean;
+    /** Device loss is counted once per query, not once per poll. */
+    lostNoted: boolean;
     /** Real WebGPU query-set path when the owning device has a live adapter. */
     gpuManager?: D3D9QueryManager;
     gpuMode: boolean;
 };
+
+/**
+ * Query lifecycle ledger. A query that stops resolving is otherwise INVISIBLE: GetData
+ * keeps answering S_FALSE (or the viewport upper bound) and the app culls against a
+ * number that was never measured, with no error, no dropped draw and no log line.
+ *
+ * `missing` and `error` are what make this able to fail; `measured` vs `synthesized` says
+ * which arm produced the counts a checksum was taken over.
+ */
+export interface D3D9QueryLedger {
+    /** CreateQuery handed out a query object. */
+    created: number;
+    /** Issue(BEGIN) accepted on a beginnable query. */
+    begin: number;
+    /** An END record was completed (explicit, implicit or via GetData). */
+    end: number;
+    /** GetData answered with data. */
+    ready: number;
+    /** GetData answered S_FALSE — the fast path and the thunk count into the same field. */
+    pending: number;
+    /** GetData/Issue answered D3DERR_NOTAVAILABLE. */
+    notAvailable: number;
+    /** A re-arm that could not reserve a generation, or a failed data write. */
+    error: number;
+    /** An issued interval that was released/destroyed/re-armed before it ever resolved. */
+    missing: number;
+    /** A COM pointer recycled while its previous query record was still live. */
+    lostOnRecycle: number;
+    /** Queries whose result was abandoned to device loss (counted once each). */
+    lostOnDeviceLoss: number;
+    /** Occlusion answers passed through from a backend that really counts samples. */
+    measured: number;
+    /** Occlusion answers synthesized as the viewport-area upper bound (see below). */
+    synthesized: number;
+}
+
+const ledger: D3D9QueryLedger = {
+    created: 0, begin: 0, end: 0, ready: 0, pending: 0, notAvailable: 0,
+    error: 0, missing: 0, lostOnRecycle: 0, lostOnDeviceLoss: 0,
+    measured: 0, synthesized: 0,
+};
+
+export function getD3D9QueryLedger(): D3D9QueryLedger {
+    return { ...ledger };
+}
+
+export function resetD3D9QueryLedger(): void {
+    for (const key in ledger) (ledger as unknown as Record<string, number>)[key] = 0;
+}
+
+/** An interval that never resolved is a lost measurement wherever it is retired. */
+function noteRetired(query: QueryRecord): void {
+    if (query.awaitingResult) {
+        query.awaitingResult = false;
+        ledger.missing++;
+    }
+}
 
 const queries: Map<number, QueryRecord> = new Map();
 /** Adapter-free fallback serials. A live query manager owns the only submission domain for
@@ -132,6 +194,7 @@ export function notifyDeviceSubmission(devicePtr: number): void {
 /** Reset submission/query state when a D3D9 process is torn down or a device pointer is
  * recycled. Kept in this module so the device lifecycle has one explicit seam to call. */
 export function resetQueryState(): void {
+    for (const query of queries.values()) noteRetired(query);
     queries.clear();
     deviceSubmissionSerial.clear();
 }
@@ -169,6 +232,33 @@ function hasManagerSubmissionDomain(manager: D3D9QueryManager | undefined): bool
 function managerNeedsRebegin(manager: D3D9QueryManager | undefined, id: number): boolean {
     const hook = manager as unknown as { needsRebegin?: (queryId: number) => boolean } | undefined;
     return typeof hook?.needsRebegin === 'function' && hook.needsRebegin(id);
+}
+
+/**
+ * WebGPU's occlusion result is a PREDICATE; D3D9's is a visible-PIXEL COUNT.
+ *
+ * `GPUQueryType "occlusion"` only reports whether any fragment sample passed, and Dawn
+ * answers 1. D3D9 apps do not read that as a boolean: CryEngine's hardware occlusion culling
+ * compares the count against a coverage threshold, so a constant 1 reads as "one pixel of
+ * this object is visible" and the object is culled — large distant geometry vanishes.
+ *
+ * A non-zero predicate is therefore converted to the only count we can stand behind: an
+ * UPPER bound, the viewport's pixel area. The two ways to be wrong are not symmetric —
+ * over-reporting draws something the app would have culled (a little wasted fill), while
+ * under-reporting deletes geometry and warns nobody. A backend that does return a real
+ * sample count (> 1) is trusted and passes through untouched.
+ */
+function occlusionPixelsFromGpu(query: QueryRecord, raw: bigint): number {
+    // The ledger distinguishes the two arms because they are indistinguishable downstream:
+    // both answer a plausible pixel count and only one of them was measured.
+    if (raw <= 0n) { ledger.measured++; return 0; }
+    const override = (globalThis as { __occlusionPixels?: unknown }).__occlusionPixels;
+    if (typeof override === 'number') { ledger.synthesized++; return override >>> 0; }
+    if (raw > 1n) { ledger.measured++; return Number(raw & 0xffff_ffffn) >>> 0; }
+    ledger.synthesized++;
+    const vp = devices.get(query.devicePtr)?.getViewport?.();
+    const pixels = vp ? (vp.width >>> 0) * (vp.height >>> 0) : 0;
+    return pixels > 0 ? pixels >>> 0 : 1;
 }
 
 /**
@@ -244,7 +334,13 @@ export function tryFastGetData(queryPtr: number, pData: number, size: number, fl
     const observedSerial = hasManagerSubmissionDomain(query.gpuManager)
         ? query.gpuManager!.getSubmittedSerial()
         : (deviceSubmissionSerial.get(query.devicePtr) ?? 0);
-    return query.issueSerial > observedSerial ? S_FALSE : null;
+    if (query.issueSerial > observedSerial) {
+        // Same counter the thunk's S_FALSE uses: a fast path that skips the ledger makes
+        // the poll census disagree with the work it stands for.
+        ledger.pending++;
+        return S_FALSE;
+    }
+    return null;
 }
 
 function queryCanBegin(type: number): boolean {
@@ -267,6 +363,9 @@ function completeQueryEnd(query: QueryRecord): void {
     const hadOpenInterval = query.begun;
     query.begun = false;
     query.issued = true;
+    ledger.end++;
+    query.awaitingResult = true;
+    query.lostNoted = false;
     query.issueTime = nowD3dTicks();
     // A live query manager observes every command-buffer submission, including
     // non-present flushes. Use that same domain for the query's fence; mixing it
@@ -312,6 +411,27 @@ function writeQueryData(pData: number, count: number, value: number): boolean {
         if (!Mem.writeUint8(pData + i, (value >>> (i * 8)) & 0xff)) return false;
     }
     return true;
+}
+
+/**
+ * One place decides what a GetData answer MEANS for the ledger, so the counters cannot
+ * drift from the HRESULTs the guest actually saw. DEVICELOST is counted at the loss
+ * branch instead — once per abandoned interval rather than once per poll.
+ */
+function noteGetData(queryPtr: number, hr: number): number {
+    const query = queries.get(queryPtr);
+    if (hr === S_FALSE) {
+        ledger.pending++;
+    } else if (hr === D3D_OK) {
+        ledger.ready++;
+        if (query) query.awaitingResult = false;
+    } else if (hr === D3DERR_NOTAVAILABLE) {
+        ledger.notAvailable++;
+        if (query) query.awaitingResult = false;
+    } else if (hr !== D3DERR_DEVICELOST) {
+        ledger.error++;
+    }
+    return hr;
 }
 
 export function createQueryExports(): Record<string, ThunkImplementation> {
@@ -362,6 +482,8 @@ export function createQueryExports(): Record<string, ThunkImplementation> {
             occlusionEndDraws: null,
             disjointBeginTime: null,
             disjointEndTime: null,
+            awaitingResult: false,
+            lostNoted: false,
             gpuMode: false,
         };
         if (manager) {
@@ -369,10 +491,21 @@ export function createQueryExports(): Record<string, ThunkImplementation> {
             record.gpuManager = manager;
             record.gpuMode = handle.mode === 'gpu';
         }
+        const stale = queries.get(queryPtr);
+        if (stale) {
+            // The COM block was recycled under a still-live record: whatever that query
+            // measured can never be read, and the manager already refuses to reuse its slot.
+            ledger.lostOnRecycle++;
+            noteRetired(stale);
+        }
         queries.set(queryPtr, record);
+        ledger.created++;
         registerDeviceChildFinalizer(queryPtr, pDevice, () => {
-            const current = queries.get(queryPtr);
-            current?.gpuManager?.release(queryPtr, current);
+            // A recycled COM pointer hands this finalizer the NEXT object's record; passing
+            // our own lets the manager's guard — and the identity check — keep to our generation.
+            record.gpuManager?.release(queryPtr, record);
+            if (queries.get(queryPtr) !== record) return;
+            noteRetired(record);
             queries.delete(queryPtr);
         });
 
@@ -454,11 +587,15 @@ export function createQueryExports(): Record<string, ThunkImplementation> {
                     // mutate this record into a new interval when the manager could
                     // not reserve a generation-safe slot; the caller can keep
                     // polling the old result and retry later.
-                    if (!handle) return D3DERR_NOTAVAILABLE;
+                    if (!handle) { ledger.error++; return D3DERR_NOTAVAILABLE; }
                     query.gpuMode = handle.mode === 'gpu';
                 }
                 // BEGIN starts a new interval. Reusing a query without END is legal state
                 // replacement in the native runtime; clear the prior completion record.
+                ledger.begin++;
+                // The interval being replaced never reported a result to anyone.
+                noteRetired(query);
+                query.lostNoted = false;
                 query.begun = true;
                 query.issued = false;
                 query.issueTime = 0n;
@@ -480,7 +617,7 @@ export function createQueryExports(): Record<string, ThunkImplementation> {
                 const split = managerNeedsRebegin(query.gpuManager, args[0] >>> 0);
                 if (query.gpuManager && (query.issued || split)) {
                     const handle = query.gpuManager.rearm(args[0] >>> 0, query);
-                    if (!handle) return D3DERR_NOTAVAILABLE;
+                    if (!handle) { ledger.error++; return D3DERR_NOTAVAILABLE; }
                     query.gpuMode = handle.mode === 'gpu';
                 }
                 queryDeviceHooks(query.devicePtr)?.recordQueryBegin?.(args[0] >>> 0);
@@ -489,7 +626,7 @@ export function createQueryExports(): Record<string, ThunkImplementation> {
                 // A prior BEGIN was submitted in another command buffer. Re-arm before
                 // recording END so the next pass contains a valid local BEGIN/END pair.
                 const handle = query.gpuManager!.rearm(args[0] >>> 0, query);
-                if (!handle) return D3DERR_NOTAVAILABLE;
+                if (!handle) { ledger.error++; return D3DERR_NOTAVAILABLE; }
                 query.gpuMode = handle.mode === 'gpu';
                 query.begun = false;
                 queryDeviceHooks(query.devicePtr)?.recordQueryBegin?.(args[0] >>> 0);
@@ -516,7 +653,7 @@ export function createQueryExports(): Record<string, ThunkImplementation> {
      * initial-state transition. It still remains S_FALSE until the submission serial for
      * that synthetic END is observed (or an explicit D3DGETDATA_FLUSH advances it).
      */
-    exports['IDirect3DQuery9_GetData'] = (_ctx, _mem, args) => {
+    const getData = (args: number[]): number => {
         const query = queries.get(args[0] >>> 0);
         if (!query) return D3DERR_INVALIDCALL;
         // A lost device answers DEVICELOST only to a caller that asked for a FLUSH;
@@ -526,6 +663,11 @@ export function createQueryExports(): Record<string, ThunkImplementation> {
         const lost = (query.gpuManager?.isDeviceLost?.() ?? false)
             || deviceCooperativeLevel(query.devicePtr) !== 'ok';
         if (lost) {
+            // Once per abandoned interval, not once per poll: the guest spins on GetData.
+            if (!query.lostNoted && (query.awaitingResult || query.begun)) {
+                query.lostNoted = true;
+                ledger.lostOnDeviceLoss++;
+            }
             const flush = ((args[3] >>> 0) & D3DGETDATA_FLUSH) !== 0;
             const extended = (devices.get(query.devicePtr >>> 0) as { isExtended?: boolean } | undefined)?.isExtended === true;
             return flush && !extended ? D3DERR_DEVICELOST : S_FALSE;
@@ -587,7 +729,7 @@ export function createQueryExports(): Record<string, ThunkImplementation> {
                     return writeQueryUint64(pData, Math.min(count, 8), gpu.value)
                         ? D3D_OK : D3DERR_INVALIDCALL;
                 }
-                return writeQueryData(pData, count, Number(gpu.value & 0xffff_ffffn) >>> 0)
+                return writeQueryData(pData, count, occlusionPixelsFromGpu(query, gpu.value))
                     ? D3D_OK : D3DERR_INVALIDCALL;
             }
             if (gpu.state === 'fallback') {
@@ -600,7 +742,7 @@ export function createQueryExports(): Record<string, ThunkImplementation> {
                     return writeQueryUint64(pData, Math.min(count, 8), gpu.value)
                         ? D3D_OK : D3DERR_INVALIDCALL;
                 }
-                return writeQueryData(pData, count, Number(gpu.value & 0xffff_ffffn) >>> 0)
+                return writeQueryData(pData, count, occlusionPixelsFromGpu(query, gpu.value))
                     ? D3D_OK : D3DERR_INVALIDCALL;
             }
             // A failed GPU readback is not silently converted into the old viewport-sized
@@ -635,6 +777,9 @@ export function createQueryExports(): Record<string, ThunkImplementation> {
         const value = issuedQueryValue(query);
         return writeQueryData(pData, count, value) ? D3D_OK : D3DERR_INVALIDCALL;
     };
+
+    exports['IDirect3DQuery9_GetData'] = (_ctx, _mem, args) =>
+        noteGetData(args[0] >>> 0, getData(args));
 
     return exports;
 }

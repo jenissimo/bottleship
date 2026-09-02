@@ -2,8 +2,15 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { ThunkGenerator } from "../../src/worker/core/thunking/thunk-generator";
 import { System } from "../../src/worker/core/system";
 import { Mem } from "../../src/worker/core/memory/mem-accessor";
-import { createQueryExports, notifyDeviceSubmission, tryFastGetData } from "../../src/worker/modules/d3d9/query";
+import {
+    createQueryExports,
+    getD3D9QueryLedger,
+    notifyDeviceSubmission,
+    resetD3D9QueryLedger,
+    tryFastGetData,
+} from "../../src/worker/modules/d3d9/query";
 import { devices, resetD3D9SharedState } from "../../src/worker/modules/d3d9/shared-state";
+import { d3d9PerfAdd, getD3D9PerfSnapshot, resetD3D9Perf } from "../../src/worker/modules/d3d9/d3d9-perf";
 import { gpuDeviceLifecycle } from "../../src/worker/core/gpu/gpu-device-lifecycle";
 import { forgetLossTrackedDevice, registerLossTrackedDevice } from "../../src/worker/core/gpu/gpu-device-loss-contract";
 
@@ -78,6 +85,7 @@ beforeEach(() => {
         resetSubsystemPerf: () => undefined,
     } as any);
     queryExports = createQueryExports();
+    resetD3D9QueryLedger();
 });
 
 afterEach(() => {
@@ -324,6 +332,53 @@ describe("D3D9 query submission readiness", () => {
         expect(Mem.readUint32(DATA_OUT)).toBe(0);
     });
 
+    test("a WebGPU occlusion PREDICATE is reported as a pixel count, not as 1", () => {
+        // WebGPU's occlusion query answers "did any sample pass" and Dawn spells that 1.
+        // D3D9 promises a visible-pixel COUNT, and engines compare it against a coverage
+        // threshold — passing the 1 through culls almost everything that is actually on
+        // screen (Far Cry's ocean surface, and most distant geometry with it).
+        let managerSerial = 0;
+        let gpuValue = 1n;
+        const manager = {
+            acquire: () => ({ mode: "gpu", index: 0, querySet: {} }),
+            release: () => undefined,
+            getSubmittedSerial: () => managerSerial,
+            notifySubmitted: (serial: number) => { managerSerial = Math.max(managerSerial, serial); },
+            needsRebegin: () => false,
+            rearm: () => ({ mode: "gpu", index: 0, querySet: {} }),
+            poll: () => ({ state: "ready", submissionSerial: managerSerial, value: gpuValue }),
+        };
+        devices.set(DEVICE, {
+            getViewport: () => ({ width: 64, height: 32 }),
+            getDrawCount: () => drawCount,
+            getQueryManager: () => manager,
+            recordQueryBegin: () => undefined,
+            recordQueryEnd: () => undefined,
+            resetSubsystemPerf: () => undefined,
+        } as any);
+
+        const runQuery = (): number => {
+            expect(call("IDirect3DDevice9_CreateQuery", DEVICE, D3DQUERYTYPE_OCCLUSION, QUERY_OUT)).toBe(D3D_OK);
+            const query = Mem.readUint32(QUERY_OUT)!;
+            expect(call("IDirect3DQuery9_Issue", query, D3DISSUE_BEGIN)).toBe(D3D_OK);
+            drawCount++;
+            expect(call("IDirect3DQuery9_Issue", query, D3DISSUE_END)).toBe(D3D_OK);
+            managerSerial++;
+            expect(call("IDirect3DQuery9_GetData", query, DATA_OUT, 4, 0)).toBe(D3D_OK);
+            return Mem.readUint32(DATA_OUT)!;
+        };
+
+        // The predicate becomes the upper bound we can stand behind: the viewport's area.
+        gpuValue = 1n;
+        expect(runQuery()).toBe(64 * 32);
+        // "Nothing passed" stays exactly zero — the one answer the predicate states outright.
+        gpuValue = 0n;
+        expect(runQuery()).toBe(0);
+        // A backend that really counts samples is trusted and passes through untouched.
+        gpuValue = 4321n;
+        expect(runQuery()).toBe(4321);
+    });
+
     test("timestamp-family payloads use the D3D9 uint64 layout and stable frequency", () => {
         expect(call("IDirect3DDevice9_CreateQuery", DEVICE, D3DQUERYTYPE_TIMESTAMP, QUERY_OUT)).toBe(D3D_OK);
         const timestamp = Mem.readUint32(QUERY_OUT)!;
@@ -503,5 +558,151 @@ describe("GetData fast path defers unless the answer is the free S_FALSE", () =>
         devices.set(DEVICE, { getQueryManager: () => manager, resetSubsystemPerf: () => undefined } as any);
         const query = makeIssuedEventQuery();
         expect(tryFastGetData(query, DATA_OUT, 4, 0)).toBe(null);
+    });
+});
+
+/**
+ * A query that stops resolving is invisible in every other counter: GetData keeps
+ * answering S_FALSE (or a viewport-sized upper bound) and the app culls against it.
+ */
+describe("D3D9 query lifecycle ledger", () => {
+    function gpuManagerStub(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+        let managerSerial = 0;
+        return {
+            acquire: () => ({ mode: "gpu", index: 0, querySet: {} }),
+            release: () => undefined,
+            getCapability: () => ({ kind: "occlusion", supported: true }),
+            getSubmittedSerial: () => managerSerial,
+            notifySubmitted: (serial: number) => { managerSerial = Math.max(managerSerial, serial); },
+            needsRebegin: () => false,
+            rearm: () => ({ mode: "gpu", index: 0, querySet: {} }),
+            poll: () => ({ state: "ready", submissionSerial: managerSerial, value: 1n }),
+            ...overrides,
+        };
+    }
+
+    test("an issued interval released before it resolves is counted as missing", () => {
+        expect(call("IDirect3DDevice9_CreateQuery", DEVICE, D3DQUERYTYPE_OCCLUSION, QUERY_OUT)).toBe(D3D_OK);
+        const query = Mem.readUint32(QUERY_OUT)!;
+        expect(call("IDirect3DQuery9_Issue", query, D3DISSUE_BEGIN)).toBe(D3D_OK);
+        expect(call("IDirect3DQuery9_Issue", query, D3DISSUE_END)).toBe(D3D_OK);
+        expect(getD3D9QueryLedger()).toMatchObject({ created: 1, begin: 1, end: 1, missing: 0 });
+
+        expect(call("IDirect3DQuery9_Release", query)).toBe(0);
+        expect(getD3D9QueryLedger().missing).toBe(1);
+    });
+
+    test("a result the guest actually read is not counted as missing", () => {
+        expect(call("IDirect3DDevice9_CreateQuery", DEVICE, D3DQUERYTYPE_OCCLUSION, QUERY_OUT)).toBe(D3D_OK);
+        const query = Mem.readUint32(QUERY_OUT)!;
+        expect(call("IDirect3DQuery9_Issue", query, D3DISSUE_BEGIN)).toBe(D3D_OK);
+        drawCount = 1;
+        expect(call("IDirect3DQuery9_Issue", query, D3DISSUE_END)).toBe(D3D_OK);
+        expect(call("IDirect3DQuery9_GetData", query, DATA_OUT, 4, 0)).toBe(S_FALSE);
+        notifyDeviceSubmission(DEVICE);
+        expect(call("IDirect3DQuery9_GetData", query, DATA_OUT, 4, 0)).toBe(D3D_OK);
+        expect(call("IDirect3DQuery9_Release", query)).toBe(0);
+        expect(getD3D9QueryLedger()).toMatchObject({ ready: 1, pending: 1, missing: 0 });
+    });
+
+    test("a synthesized occlusion upper bound is never counted as a measurement", () => {
+        let gpuValue = 1n;
+        const manager = gpuManagerStub({
+            poll: () => ({ state: "ready", submissionSerial: 99, value: gpuValue }),
+        });
+        devices.set(DEVICE, {
+            getViewport: () => ({ width: 64, height: 32 }),
+            getDrawCount: () => drawCount,
+            getQueryManager: () => manager,
+            recordQueryBegin: () => undefined,
+            recordQueryEnd: () => undefined,
+            resetSubsystemPerf: () => undefined,
+        } as any);
+
+        const runQuery = (): number => {
+            expect(call("IDirect3DDevice9_CreateQuery", DEVICE, D3DQUERYTYPE_OCCLUSION, QUERY_OUT)).toBe(D3D_OK);
+            const query = Mem.readUint32(QUERY_OUT)!;
+            expect(call("IDirect3DQuery9_Issue", query, D3DISSUE_BEGIN)).toBe(D3D_OK);
+            drawCount++;
+            expect(call("IDirect3DQuery9_Issue", query, D3DISSUE_END)).toBe(D3D_OK);
+            (manager as any).notifySubmitted((manager as any).getSubmittedSerial() + 1);
+            expect(call("IDirect3DQuery9_GetData", query, DATA_OUT, 4, 0)).toBe(D3D_OK);
+            return Mem.readUint32(DATA_OUT)!;
+        };
+
+        // The predicate is widened to the viewport area — a number nobody measured.
+        expect(runQuery()).toBe(64 * 32);
+        expect(getD3D9QueryLedger()).toMatchObject({ synthesized: 1, measured: 0 });
+        // A backend that really counts samples passes through, and says so.
+        gpuValue = 4321n;
+        expect(runQuery()).toBe(4321);
+        expect(getD3D9QueryLedger()).toMatchObject({ synthesized: 1, measured: 1 });
+    });
+
+    test("a re-arm that cannot reserve a generation is counted as an error", () => {
+        const manager = gpuManagerStub({ rearm: () => null });
+        devices.set(DEVICE, {
+            getViewport: () => ({ width: 64, height: 32 }),
+            getDrawCount: () => drawCount,
+            getQueryManager: () => manager,
+            recordQueryBegin: () => undefined,
+            recordQueryEnd: () => undefined,
+            resetSubsystemPerf: () => undefined,
+        } as any);
+
+        expect(call("IDirect3DDevice9_CreateQuery", DEVICE, D3DQUERYTYPE_OCCLUSION, QUERY_OUT)).toBe(D3D_OK);
+        const query = Mem.readUint32(QUERY_OUT)!;
+        expect(call("IDirect3DQuery9_Issue", query, D3DISSUE_BEGIN)).toBe(D3D_OK);
+        expect(call("IDirect3DQuery9_Issue", query, D3DISSUE_END)).toBe(D3D_OK);
+        expect(getD3D9QueryLedger().error).toBe(0);
+        // The second interval needs a fresh generation; the manager cannot supply one.
+        expect(call("IDirect3DQuery9_Issue", query, D3DISSUE_BEGIN)).toBe(0x8876086a);
+        expect(getD3D9QueryLedger().error).toBe(1);
+    });
+
+    test("the GetData fast path counts its S_FALSE into the same field as the thunk", () => {
+        expect(call("IDirect3DDevice9_CreateQuery", DEVICE, D3DQUERYTYPE_EVENT, QUERY_OUT)).toBe(D3D_OK);
+        const query = Mem.readUint32(QUERY_OUT)!;
+        expect(call("IDirect3DQuery9_Issue", query, D3DISSUE_END)).toBe(D3D_OK);
+        expect(tryFastGetData(query, DATA_OUT, 4, 0)).toBe(S_FALSE);
+        expect(getD3D9QueryLedger().pending).toBe(1);
+        expect(call("IDirect3DQuery9_GetData", query, DATA_OUT, 4, 0)).toBe(S_FALSE);
+        expect(getD3D9QueryLedger().pending).toBe(2);
+    });
+
+    test("an interval abandoned to device loss is counted once, not once per poll", () => {
+        const manager = gpuManagerStub({
+            isDeviceLost: () => true,
+            acquire: () => ({ mode: "fallback", reason: "device-lost" }),
+        });
+        devices.set(DEVICE, {
+            getQueryManager: () => manager,
+            resetSubsystemPerf: () => undefined,
+        } as any);
+        expect(call("IDirect3DDevice9_CreateQuery", DEVICE, D3DQUERYTYPE_EVENT, QUERY_OUT)).toBe(D3D_OK);
+        const query = Mem.readUint32(QUERY_OUT)!;
+        expect(call("IDirect3DQuery9_Issue", query, D3DISSUE_END)).toBe(D3D_OK);
+        expect(call("IDirect3DQuery9_GetData", query, DATA_OUT, 4, 0)).toBe(S_FALSE);
+        expect(call("IDirect3DQuery9_GetData", query, DATA_OUT, 4, 0)).toBe(S_FALSE);
+        expect(getD3D9QueryLedger().lostOnDeviceLoss).toBe(1);
+    });
+});
+
+/** d3d9-perf.ts has no test file of its own; the guard is pinned here beside the ledger
+ *  work that motivated it. */
+describe("D3D9 batched counter domain guard", () => {
+    test("d3d9PerfAdd refuses a count that is not a non-negative integer", () => {
+        resetD3D9Perf();
+        d3d9PerfAdd("drawPrimitive", 3);
+        d3d9PerfAdd("drawPrimitive", Number.NaN);
+        d3d9PerfAdd("drawPrimitive", -5);
+        d3d9PerfAdd("drawPrimitive", 1.5);
+        d3d9PerfAdd("drawPrimitive", Number.POSITIVE_INFINITY);
+        const snap = getD3D9PerfSnapshot();
+        // A poisoned counter is worse than a missing one: the reconcile still reads healthy.
+        expect(snap.api.drawPrimitive).toBe(3);
+        expect(snap.counterRejections.drawPrimitive).toBe(4);
+        resetD3D9Perf();
+        expect(getD3D9PerfSnapshot().counterRejections).toEqual({});
     });
 });

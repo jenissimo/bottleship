@@ -333,16 +333,23 @@ describe("D3D9 WebGPU query manager", () => {
         expect(pass.calls.map((call) => call.name)).toEqual(["beginOcclusionQuery", "endOcclusionQuery"]);
     });
 
-    test("exposes one render-pass occlusion set and refuses pool mixing", () => {
+    test("exposes one render-pass occlusion set and demotes only the queries in another pool", () => {
         const device = new FakeDevice();
         const { manager } = makeManager(device, new FakeQueue(), 1);
         const first = { type: D3D9_QUERYTYPE_OCCLUSION, begun: false, issued: true, issueSerial: 1 };
         const second = { type: D3D9_QUERYTYPE_OCCLUSION, begun: false, issued: true, issueSerial: 1 };
         const firstHandle = manager.acquire("pass-first", first);
         const secondHandle = manager.acquire("pass-second", second);
-        expect(manager.getOcclusionQuerySet(["pass-first"])).toBe(firstHandle.querySet!);
-        expect(manager.getOcclusionQuerySet(["pass-first", "pass-second"])).toBeNull();
         expect(secondHandle.querySet).not.toBe(firstHandle.querySet);
+        expect(manager.getOcclusionQuerySet(["pass-first"])).toBe(firstHandle.querySet!);
+
+        // One pass binds one set: the outlier loses its measurement, the pass does not.
+        expect(manager.getOcclusionQuerySet(["pass-first", "pass-second"])).toBe(firstHandle.querySet!);
+        expect(manager.poll("pass-first")).toMatchObject({ state: "pending" });
+        expect(manager.poll("pass-second")).toEqual({
+            state: "fallback", reason: "occlusion-pass-pool-split",
+        });
+        expect(manager.getCounters().passSplitFallbacks).toBe(1);
     });
 
     test("validation error scopes retire a non-throwing begin failure", async () => {
@@ -451,6 +458,41 @@ describe("D3D9 WebGPU query manager", () => {
             state: "fallback", reason: "query-id-reused-before-retire",
         });
     });
+
+    test("rearms an issued query into a fresh generation while its old readback is in flight", async () => {
+        const device = new FakeDevice();
+        const queue = new FakeQueue();
+        const { manager } = makeManager(device, queue, 2);
+        const firstRecord = { type: D3D9_QUERYTYPE_OCCLUSION, begun: true, issued: true, issueSerial: 3 };
+        const first = manager.acquire("ring-query", firstRecord);
+        const pass = new FakePassEncoder();
+        expect(manager.beginOcclusion("ring-query", pass as unknown as QueryPassEncoder, firstRecord).ok).toBe(true);
+        expect(manager.endOcclusion("ring-query", pass as unknown as QueryPassEncoder, firstRecord).ok).toBe(true);
+        const encoder = new FakeCommandEncoder();
+        const oldBatch = manager.encodeResolves(encoder as unknown as QueryCommandEncoder, ["ring-query"], 3);
+        expect(oldBatch.status).toBe("encoded");
+        manager.markSubmitted(oldBatch);
+
+        const secondRecord = { type: D3D9_QUERYTYPE_OCCLUSION, begun: false, issued: false, issueSerial: 4 };
+        const second = manager.rearm("ring-query", secondRecord);
+        // A fresh SLOT, deliberately in the same pool: one render pass binds one query set.
+        expect(second).toMatchObject({ mode: "gpu", index: 1 });
+        expect(second!.querySet).toBe(first.querySet);
+        expect(device.querySets).toHaveLength(1);
+        expect(manager.poll("ring-query")).toEqual({ state: "pending", submissionSerial: 4 });
+
+        queue.complete();
+        await manager.waitForBatch(oldBatch);
+
+        // The old batch retires only its own generation. The replacement remains
+        // current, and the released slot is available to a different logical query.
+        expect(manager.poll("ring-query")).toEqual({ state: "pending", submissionSerial: 4 });
+        const thirdRecord = { type: D3D9_QUERYTYPE_OCCLUSION, begun: false, issued: false, issueSerial: 5 };
+        const third = manager.acquire("other-query", thirdRecord);
+        expect(third).toMatchObject({ mode: "gpu", index: 0 });
+        expect(third.querySet).toBe(first.querySet);
+    });
+
     test("reclaim is idempotent: a late scope failure cannot free a slot twice", async () => {
         const device = new FakeDevice() as FakeDevice & {
             pushErrorScope: (filter: "validation") => void;
@@ -486,5 +528,101 @@ describe("D3D9 WebGPU query manager", () => {
         expect(a.mode).toBe("gpu");
         expect(b.mode).toBe("gpu");
         expect(a.querySet === b.querySet && a.index === b.index).toBe(false);
+    });
+    test("re-arm applies the same capability gate as acquire once the device is lost", async () => {
+        const device = new FakeDevice() as FakeDevice & { lost?: Promise<{ reason?: string }> };
+        let lose: (info: { reason?: string }) => void = () => undefined;
+        device.lost = new Promise((resolve) => { lose = resolve; });
+        const { manager } = makeManager(device);
+        const record = { type: D3D9_QUERYTYPE_OCCLUSION, begun: false, issued: true, issueSerial: 1 };
+        expect(manager.acquire("lost-rearm", record).mode).toBe("gpu");
+
+        lose({ reason: "destroyed" });
+        await device.lost;
+        await Promise.resolve();
+        expect(manager.isDeviceLost()).toBe(true);
+
+        // A GPU slot handed out past the loss gate can only pend forever.
+        const second = { type: D3D9_QUERYTYPE_OCCLUSION, begun: false, issued: false, issueSerial: 2 };
+        expect(manager.rearm("lost-rearm", second)).toMatchObject({
+            mode: "fallback", reason: "device-lost:destroyed",
+        });
+        expect(manager.poll("lost-rearm")).toEqual({
+            state: "fallback", reason: "device-lost:destroyed",
+        });
+    });
+
+    test("device loss reaches a generation displaced by a re-arm", async () => {
+        const device = new FakeDevice() as FakeDevice & { lost?: Promise<{ reason?: string }> };
+        let lose: (info: { reason?: string }) => void = () => undefined;
+        device.lost = new Promise((resolve) => { lose = resolve; });
+        const queue = new FakeQueue();
+        const { manager } = makeManager(device, queue, 2);
+        const firstRecord = { type: D3D9_QUERYTYPE_OCCLUSION, begun: true, issued: true, issueSerial: 1 };
+        manager.acquire("displaced", firstRecord);
+        const pass = new FakePassEncoder();
+        expect(manager.beginOcclusion("displaced", pass as unknown as QueryPassEncoder, firstRecord).ok).toBe(true);
+        expect(manager.endOcclusion("displaced", pass as unknown as QueryPassEncoder, firstRecord).ok).toBe(true);
+        const encoder = new FakeCommandEncoder();
+        const batch = manager.encodeResolves(encoder as unknown as QueryCommandEncoder, ["displaced"], 1);
+        expect(batch.status).toBe("encoded");
+        manager.markSubmitted(batch);
+
+        const secondRecord = { type: D3D9_QUERYTYPE_OCCLUSION, begun: false, issued: false, issueSerial: 2 };
+        expect(manager.rearm("displaced", secondRecord)).toMatchObject({ mode: "gpu" });
+        const old = (batch.entries[0] as unknown as { state: {
+            error?: string; index?: number; pool?: { free: number[] };
+        } }).state;
+        const oldPool = old.pool!;
+        const oldIndex = old.index!;
+        expect(oldPool.free).not.toContain(oldIndex);
+
+        lose({ reason: "crash" });
+        await device.lost;
+        await Promise.resolve();
+        // The old generation is no longer in `records`; only the displaced walk reaches it.
+        expect(old.error).toBe("device-lost:crash");
+        expect(old.index).toBeUndefined();
+        expect(oldPool.free.filter((slot) => slot === oldIndex)).toHaveLength(1);
+        expect(manager.getCounters().displacedLost).toBe(1);
+
+        // The batch retires afterwards and must not free the same slot a second time.
+        queue.complete();
+        await manager.waitForBatch(batch);
+        expect(oldPool.free.filter((slot) => slot === oldIndex)).toHaveLength(1);
+    });
+
+    test("a re-arm across a full pool falls back for that one query, not for the pass", () => {
+        const device = new FakeDevice();
+        const queue = new FakeQueue();
+        // Capacity 2: one slot for the query that stays, one for the boundary query.
+        const { manager } = makeManager(device, queue, 2);
+        const keepRecord = { type: D3D9_QUERYTYPE_OCCLUSION, begun: false, issued: true, issueSerial: 1 };
+        const keep = manager.acquire("keep", keepRecord);
+        const boundaryRecord = { type: D3D9_QUERYTYPE_OCCLUSION, begun: true, issued: true, issueSerial: 1 };
+        const boundary = manager.acquire("boundary", boundaryRecord);
+        expect(boundary.querySet).toBe(keep.querySet!);
+        expect(device.querySets).toHaveLength(1);
+
+        const pass = new FakePassEncoder();
+        expect(manager.beginOcclusion("boundary", pass as unknown as QueryPassEncoder, boundaryRecord).ok).toBe(true);
+        expect(manager.endOcclusion("boundary", pass as unknown as QueryPassEncoder, boundaryRecord).ok).toBe(true);
+        const encoder = new FakeCommandEncoder();
+        const batch = manager.encodeResolves(encoder as unknown as QueryCommandEncoder, ["boundary"], 1);
+        manager.markSubmitted(batch);
+
+        // The pool is now full, so a second query set would split the pass in two.
+        const rearmed = { type: D3D9_QUERYTYPE_OCCLUSION, begun: false, issued: false, issueSerial: 2 };
+        expect(manager.rearm("boundary", rearmed)).toMatchObject({
+            mode: "fallback", reason: "query-pool-exhausted-in-pass",
+        });
+        expect(device.querySets).toHaveLength(1);
+        expect(manager.getCounters().poolExhaustedFallbacks).toBe(1);
+        expect(manager.getCounters().displacedGenerations).toBe(1);
+
+        // Only the boundary query lost its measurement; the pass keeps its set.
+        expect(manager.getOcclusionQuerySet(["keep", "boundary"])).toBe(keep.querySet!);
+        expect(manager.poll("keep")).toMatchObject({ state: "pending" });
+        expect(manager.getCounters().passSplitFallbacks).toBe(0);
     });
 });
