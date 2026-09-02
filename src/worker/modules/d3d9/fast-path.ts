@@ -842,5 +842,24 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
             });
     }
 
+    // Arena-authoritative hot shape: exact alternating
+    // SetVertexShaderConstantF -> DrawIndexedPrimitive runs. The dispatcher invokes this
+    // transaction before either ordinary handler; false replays both entries unchanged.
+    // Default on, with a live explicit kill switch for immediate A/B and recovery.
+    if (typeof dispatcher.registerWriteBufferPairRun === 'function') {
+        dispatcher.registerWriteBufferPairRun(
+            'd3d9', 'IDirect3DDevice9_SetVertexShaderConstantF',
+            'd3d9', 'IDirect3DDevice9_DrawIndexedPrimitive',
+            (_mem8: Uint8Array, mem32: Uint32Array, startPtr: number, endPtr: number, pairCount: number,
+                prefixConstantPtr?: number, prefixDrawPtr?: number): boolean => {
+                if ((globalThis as { __noD3D9ArenaRuns?: boolean }).__noD3D9ArenaRuns === true) return false;
+                const device = devices.get(mem32[(startPtr + 4) >> 2] >>> 0);
+                return device?.tryDrawIndexedWbufRun(
+                    mem32, startPtr, endPtr, pairCount, prefixConstantPtr, prefixDrawPtr,
+                ) === true;
+            },
+        );
+    }
+
     Logger.log(LogCategory.D3D9, 'Registered Tier-0 write-buffer stubs for scalar/stable-pointer D3D9 state setters and shader constants');
 }

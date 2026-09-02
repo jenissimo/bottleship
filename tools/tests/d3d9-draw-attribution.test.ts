@@ -29,11 +29,12 @@ type Probe = Record<string, unknown> & {
 
 const proto = D3D9Device.prototype as unknown as {
     noteProgrammableDraw: (this: Probe, pipelineId: number) => number;
+    programmablePipelineResult: (this: Probe, pipelineId: number, attributeDraw: boolean) => number;
     resolvePairDiagnostics: (this: Probe, pair: Pair) => void;
 };
 
 const flags = globalThis as { __d3d9FastDrawAttribution?: boolean };
-afterEach(() => { flags.__d3d9FastDrawAttribution = false; });
+afterEach(() => { delete flags.__d3d9FastDrawAttribution; });
 
 function makeProbe(): Probe {
     const vs: Rec = { handle: 3, stage: "vs", drawsIssued: 0 };
@@ -67,7 +68,29 @@ function counts(p: Probe): Record<string, number> {
 }
 
 describe("programmable draw attribution", () => {
+    test("speculative pipeline validation leaves attribution untouched until commit", () => {
+        const p = makeProbe();
+        expect(proto.programmablePipelineResult.call(p, 42, false)).toBe(42);
+        expect(counts(p)).toEqual({ vs: 0, ps: 0, pair: 0, seen: 0, unattributed: 0 });
+
+        p.shaderPairDiagnostics.get(1)!.build = "failed";
+        expect(proto.programmablePipelineResult.call(p, 42, false)).toBe(-1);
+        expect(counts(p)).toEqual({ vs: 0, ps: 0, pair: 0, seen: 0, unattributed: 0 });
+    });
+
+    test("the fast route is default-on and explicit false is its kill switch", () => {
+        const armed = makeProbe();
+        proto.noteProgrammableDraw.call(armed, 42);
+        expect(armed.shaderPairDiagnostics.get(1)!.vsDiag).toBe(armed.vsDiagnosticsByHandle.get(3)!);
+
+        flags.__d3d9FastDrawAttribution = false;
+        const killed = makeProbe();
+        proto.noteProgrammableDraw.call(killed, 42);
+        expect(killed.shaderPairDiagnostics.get(1)!.vsDiag).toBeNull();
+    });
+
     test("the fast route leaves exactly the counters the slow route leaves", () => {
+        flags.__d3d9FastDrawAttribution = false;
         const slow = makeProbe();
         for (let i = 0; i < 100; i++) proto.noteProgrammableDraw.call(slow, 42);
 

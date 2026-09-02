@@ -7,6 +7,7 @@
 
 import { describe, it, expect } from 'bun:test';
 import { ThunkDispatcher } from '../../src/worker/core/thunking/thunk-dispatcher';
+import { preemptionManager } from '../../src/worker/core/cpu/preemption-manager';
 
 const SPIN_ADDR = 0xdead0000;
 
@@ -29,6 +30,72 @@ function bindMemory(d: any, size = 0x10000): { mem: Uint8Array; dv: DataView } {
 describe('ThunkDispatcher — instantiation', () => {
     it('constructs in isolation with a fake v86 (no WASM/DOM)', () => {
         expect(mkDispatcher()).toBeTruthy();
+    });
+});
+
+describe('ThunkDispatcher — WBUF dynarec lifecycle', () => {
+    it('clears stale descriptors on reset and re-registers VS/PS/barrier hot slots', () => {
+        let generation = 0;
+        const names = [
+            'IDirect3DDevice9_SetVertexShaderConstantF',
+            'IDirect3DDevice9_SetPixelShaderConstantF',
+            'IDirect3DDevice9_DrawIndexedPrimitive',
+        ];
+        const makeStubs = () => names.map((functionName, i) => ({
+            dllName: 'd3d9', functionName,
+            functionId: 100 + generation * 10 + i,
+            address: 0x1000 + generation * 0x300 + i * 0x20,
+            argCount: i < 2 ? 4 : 7,
+            stackCleanupBytes: i < 2 ? 16 : 28,
+        }));
+        let stubs = makeStubs();
+        const generator = {
+            findStubsByName: (dll: string, fn: string) => stubs.filter(s =>
+                s.dllName.toLowerCase() === dll.toLowerCase() && s.functionName.toLowerCase() === fn.toLowerCase()),
+            getAllStubs: () => stubs,
+            getStubById: (id: number) => stubs.find(s => s.functionId === id),
+        };
+        const registrations: number[][] = [];
+        const hot: number[][] = [];
+        let clears = 0;
+        const exports = {
+            jit_dirty_cache: () => {},
+            jit_wbuf_intrinsic_set_enabled: () => {},
+            jit_wbuf_intrinsic_register: (...args: number[]) => { registrations.push(args); return 1; },
+            jit_wbuf_intrinsic_mark_hot: (...args: number[]) => { hot.push(args); return 1; },
+            jit_wbuf_intrinsic_clear_registry: () => { clears++; },
+        };
+        const pm = preemptionManager as any;
+        const oldExports = pm.wasmExports;
+        pm.wasmExports = exports;
+        try {
+            const d = new ThunkDispatcher({ add_listener: () => {} } as any, generator as any) as any;
+            bindMemory(d, 0x10000);
+            d.writeBufControlAddr = 0x3000;
+            d.writeBufDataBase = 0x4000;
+            d.writeBufCapacity = 0x2000;
+            d.writeBufTrampolineAddrs[12] = 0x2800; // seven-arg stdcall barrier
+            d.writeBufTrampolineAddrs[20] = 0x2900; // shader constants
+            const handler = () => {};
+
+            d.registerShaderConstantWriteBufferFunction('d3d9', names[0], handler);
+            d.registerShaderConstantWriteBufferFunction('d3d9', names[1], handler);
+            d.registerWriteBufferFunction('d3d9', names[2], 7, handler, true, 0, { barrier: true });
+            expect(hot.map(args => args[0])).toEqual([0, 1, 2]);
+
+            d.reset();
+            expect(clears).toBe(1);
+            generation++;
+            stubs = makeStubs();
+            d.applyPendingRegistrations();
+
+            expect(registrations.slice(-3).map(args => [args[0], args[1]])).toEqual(
+                stubs.map(s => [s.address, s.functionId]),
+            );
+            expect(hot.slice(-3).map(args => args[0])).toEqual([0, 1, 2]);
+        } finally {
+            pm.wasmExports = oldExports;
+        }
     });
 });
 
@@ -367,5 +434,92 @@ describe('ThunkDispatcher.checkEbpSanity (frame-pointer tripwire)', () => {
         expect(d.getLastWildEbpNote()).toBeNull();
         d.checkEbpSanity(0x21047930, 'd3d8:IDirect3DSurface8_Release');
         expect(d.getLastWildEbpNote()).toBeNull();
+    });
+});
+
+describe('ThunkDispatcher.drainWriteBuffer — prefix-fusion consumer that throws', () => {
+    const F = 10;   // first-constant id that opens a pair run
+    const M = 11;   // ordinary setter between the constant and the prefix draw
+    const D = 12;   // draw id (the pair run's second half, and the prefix draw)
+    const CONTROL = 0x3000;
+    const DATA = 0x4000;
+
+    /** Ring: F, M, D(prefix draw), then the exact F/D pair run the consumer is offered. */
+    function layout(mem32: Uint32Array): number {
+        const at = (offset: number) => (DATA + offset) >> 2;
+        const ids = [F, M, D, F, D, F, D];
+        ids.forEach((id, i) => { mem32[at(i * 8)] = id; });
+        return ids.length * 8;
+    }
+
+    function setup(pairRunHandler: any) {
+        const d = mkDispatcher();
+        const mem = new Uint8Array(0x10000);
+        const mem32 = new Uint32Array(mem.buffer);
+        d.cachedMem8 = mem;
+        d.cachedMem32 = mem32;
+        d.memLength = mem.length;
+        d.writeBufControlAddr = CONTROL;
+        d.writeBufDataBase = DATA;
+        d.writeBufCapacity = 0x2000;
+
+        const calls: Array<{ id: number; offset: number }> = [];
+        for (const id of [F, M, D]) {
+            d.writeBufArgCountTable[id] = 1;
+            d.writeBufHandlerTable[id] = (_m8: Uint8Array, _m32: Uint32Array, addr: number) => {
+                calls.push({ id, offset: addr - 4 - DATA });
+            };
+        }
+        d.writeBufBarrierTable[D] = 1;
+        d.writeBufPairRunByFirst[F] = [{ secondIds: new Set([D]), handler: pairRunHandler }];
+
+        const head = layout(mem32);
+        mem32[CONTROL >> 2] = head;
+        return { d, mem32, calls, head };
+    }
+
+    it('declines to the ordinary path instead of replaying the applied prefix entries', () => {
+        // The consumer is offered the fused run first (7 args) and throws; the constant and the
+        // middle setter it has already applied must not be applied a second time.
+        const offers: number[] = [];
+        const { d, mem32, calls, head } = setup((...args: any[]) => {
+            offers.push(args.length);
+            if (args.length > 5) throw new Error('consumer blew up mid-run');
+            return false;
+        });
+
+        d.drainWriteBuffer();
+
+        expect(offers[0]).toBe(7);
+        // Every ring entry applied exactly once, in ring order.
+        expect(calls).toEqual([
+            { id: F, offset: 0 },
+            { id: M, offset: 8 },
+            { id: D, offset: 16 },
+            { id: F, offset: 24 },
+            { id: D, offset: 32 },
+            { id: F, offset: 40 },
+            { id: D, offset: 48 },
+        ]);
+        // Fully drained: the head reset only fires when wbufTail reached the segment end.
+        expect(mem32[CONTROL >> 2]).toBe(0);
+        expect(d.wbufTail).toBe(0);
+        expect(d.getWbufStats().fusedConsumerThrows).toBe(1);
+        expect(head).toBe(56);
+    });
+
+    it('consumes the fused run when the consumer accepts it', () => {
+        const { d, mem32, calls } = setup(() => true);
+
+        d.drainWriteBuffer();
+
+        // The consumer owns the prefix draw and the whole tail run; only the constant and the
+        // middle setter reach ordinary handlers.
+        expect(calls).toEqual([
+            { id: F, offset: 0 },
+            { id: M, offset: 8 },
+        ]);
+        expect(mem32[CONTROL >> 2]).toBe(0);
+        expect(d.getWbufStats().fusedConsumerThrows).toBe(0);
     });
 });

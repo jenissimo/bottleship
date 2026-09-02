@@ -24,6 +24,7 @@ type CensusHost = {
         cubeMask: number, comparisonMask: number, volumeMask: number, vertexVolumeMask: number,
     ) => GPUBindGroup;
     getBindGroupCensus: (reset?: boolean) => Record<string, number | string | null | boolean>;
+    fastKeyEnabled: () => boolean;
 };
 
 function makeExecutor(): CensusHost {
@@ -32,6 +33,16 @@ function makeExecutor(): CensusHost {
 }
 
 describe("d3d9 bind-group census", () => {
+    test("the programmable front memo is default-on with an explicit false kill switch", () => {
+        const flags = globalThis as { __d3d9ProgBindFastKey?: boolean };
+        delete flags.__d3d9ProgBindFastKey;
+        const e = makeExecutor();
+        expect(e.fastKeyEnabled()).toBe(true);
+        flags.__d3d9ProgBindFastKey = false;
+        expect(e.fastKeyEnabled()).toBe(false);
+        delete flags.__d3d9ProgBindFastKey;
+    });
+
     test("an empty window reports no rate rather than zero", () => {
         const e = makeExecutor();
         const s = e.getBindGroupCensus();

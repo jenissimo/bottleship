@@ -7,6 +7,46 @@ import {
     resetDxFormatSupportCensus,
 } from "../../backends/webgpu/shared/dx-format-support";
 
+export interface D3D9ArenaRunReconcile {
+    producerRuns: number;
+    executorCommands: number;
+    runDelta: number;
+    producerPairs: number;
+    executorExpectedPairs: number;
+    executorExecutedPairs: number;
+    expectedDelta: number;
+    executedDelta: number;
+    apiDrawIndexed: number;
+    backendDrawIndexed: number;
+    apiDrawDelta: number;
+    healthy: boolean;
+}
+
+export function reconcileD3D9ArenaRuns(
+    wbuf: { pairRuns: number; pairs: number },
+    api: Record<string, number>,
+    backend: Record<string, number>,
+): D3D9ArenaRunReconcile {
+    const producerRuns = wbuf.pairRuns;
+    const executorCommands = backend.arenaRunCommands ?? 0;
+    const producerPairs = wbuf.pairs;
+    const executorExpectedPairs = backend.arenaRunExpectedPairs ?? 0;
+    const executorExecutedPairs = backend.arenaRunExecutedPairs ?? 0;
+    const apiDrawIndexed = api.drawIndexedPrimitive ?? 0;
+    const backendDrawIndexed = backend.drawIndexedCalls ?? 0;
+    const runDelta = executorCommands - producerRuns;
+    const expectedDelta = executorExpectedPairs - producerPairs;
+    const executedDelta = executorExecutedPairs - executorExpectedPairs;
+    const apiDrawDelta = backendDrawIndexed - apiDrawIndexed;
+    return {
+        producerRuns, executorCommands, runDelta,
+        producerPairs, executorExpectedPairs, executorExecutedPairs,
+        expectedDelta, executedDelta,
+        apiDrawIndexed, backendDrawIndexed, apiDrawDelta,
+        healthy: runDelta === 0 && expectedDelta === 0 && executedDelta === 0 && apiDrawDelta === 0,
+    };
+}
+
 export interface D3D9PerfSnapshot {
     api: Record<string, number>;
     skip: Record<string, number>;
@@ -14,6 +54,10 @@ export interface D3D9PerfSnapshot {
     stateTracker: Record<string, number>;
     /** Draws the device dropped, keyed by reason. Empty is the healthy state. */
     droppedDraws: Record<string, number>;
+    /** Batched counter increments refused as out-of-domain. Empty is the healthy state. */
+    counterRejections: Record<string, number>;
+    /** Query lifecycle ledger; filled by dbg.d3d9Perf from the query module + managers. */
+    queries?: Record<string, number> | null;
     /**
      * Reset refusals, keyed by the exact precondition that failed (with its counts spelled
      * into the key). A refused Reset is INVISIBLE otherwise: the app latches "device lost",
@@ -35,7 +79,12 @@ export interface D3D9PerfSnapshot {
     ffpOps: Record<string, number>;
     /** Has SetMaterial ever been called? If not, the default material is what lit every draw. */
     materialEverSet: boolean;
-    wbuf: { hits: number; outTrapHits: number; coalescedSkips: number; registered: number } | null;
+    wbuf: {
+        hits: number; outTrapHits: number; coalescedSkips: number; barrierEntries: number;
+        pairRuns: number; pairs: number; pairFallbacks: number; registered: number;
+    } | null;
+    /** Same-window producer/executor reconciliation for arena-authoritative indexed runs. */
+    arenaRunReconcile?: D3D9ArenaRunReconcile | null;
     /** Guest-side setter-shadow skip counters per shadowed setter (filled by dbg.d3d9Perf). */
     setterShadow?: Record<string, number> | null;
     /** State-block type/coverage distribution. liveBlocks filled by dbg.d3d9Perf. */
@@ -222,6 +271,9 @@ const skip: Record<SkipKey, number> = {
 /** reason -> count; keys are free-form so a new early-out needs no schema edit. */
 const droppedDraws: Record<string, number> = {};
 
+/** API key -> refused batched increments (non-integer/negative counts). Empty is healthy. */
+const counterRejections: Record<string, number> = {};
+
 /**
  * FFP state a draw ASKED for that the D3D9 fixed-function shader does not implement.
  * `stubs()` names an unimplemented ENTRY POINT; this names unimplemented fixed-function
@@ -354,6 +406,20 @@ export function d3d9PerfInc(key: ApiKey): void {
     api[key]++;
 }
 
+/** Account for an already-validated fused API run without replaying the hot counter
+ *  function once per logical call. The caller still publishes the exact logical count. */
+export function d3d9PerfAdd(key: ApiKey, count: number): void {
+    // A fused run's count comes from guest-supplied arena data. A NaN poisons the counter
+    // for the whole session and a negative one hides work that really happened — both make
+    // the reconcile read healthy while the ledger is wrong. Refusing silently would do the
+    // same, so the refusal is itself counted.
+    if (!Number.isSafeInteger(count) || count < 0) {
+        counterRejections[key] = (counterRejections[key] ?? 0) + 1;
+        return;
+    }
+    api[key] += count;
+}
+
 export function d3d9PerfSkip(key: SkipKey): void {
     skip[key]++;
 }
@@ -447,6 +513,7 @@ export function resetD3D9Perf(): void {
     for (const k of BACKEND_KEYS) backend[k] = 0;
     for (const k in stateBlock) (stateBlock as Record<string, number>)[k] = 0;
     for (const k in droppedDraws) delete droppedDraws[k];
+    for (const k in counterRejections) delete counterRejections[k];
     for (const k in resetRefusals) delete resetRefusals[k];
     for (const k in ffpUnimplemented) delete ffpUnimplemented[k];
     for (const k in approximated) delete approximated[k];
@@ -472,6 +539,7 @@ export function getD3D9PerfSnapshot(): D3D9PerfSnapshot {
         backend: pickRecord(backend, BACKEND_KEYS),
         stateTracker: {},
         droppedDraws: { ...droppedDraws },
+        counterRejections: { ...counterRejections },
         resetRefusals: { ...resetRefusals },
         ffpUnimplemented: { ...ffpUnimplemented },
         approximated: { ...approximated },

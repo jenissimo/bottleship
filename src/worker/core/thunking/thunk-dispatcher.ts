@@ -79,6 +79,32 @@ export type FastPathImplementation = (
  */
 export type WriteBufHandler = (mem8: Uint8Array, mem32: Uint32Array, dataPtr: number) => void;
 
+/**
+ * Optional drain-time fusion for an exact alternating pair run. `startPtr` points at the
+ * first entry's funcId and `endPtr` is exclusive. Returning false is a transaction decline:
+ * the ordinary entry handlers are then invoked in order, exactly once each.
+ */
+export type WriteBufPairRunHandler = (
+    mem8: Uint8Array, mem32: Uint32Array,
+    startPtr: number, endPtr: number, pairCount: number,
+    /** Optional already-applied prefix constant/draw packets. The dispatcher executes
+     * intervening non-barrier setters in original order before offering this extension. */
+    prefixConstantPtr?: number, prefixDrawPtr?: number,
+) => boolean;
+
+interface WriteBufPairRunRegistration {
+    firstDll: string;
+    firstName: string;
+    secondDll: string;
+    secondName: string;
+    handler: WriteBufPairRunHandler;
+}
+
+interface WriteBufPairRunBinding {
+    secondIds: Set<number>;
+    handler: WriteBufPairRunHandler;
+}
+
 /** writeBufArgCountTable sentinel: ring entry stride = (4 + vec4Count×4) × 4 bytes. */
 export const WBUF_ARG_SHADER_CONSTANT = 255;
 
@@ -289,6 +315,8 @@ export class ThunkDispatcher {
     // Ring entries that OBSERVE buffered state (draw calls): the coalescer must not
     // apply a later same-key setter across one — it splits the ring into segments.
     private writeBufBarrierTable: Uint8Array = new Uint8Array(MAX_THUNK_ID);
+    private writeBufPairRuns: WriteBufPairRunRegistration[] = [];
+    private writeBufPairRunByFirst: Array<WriteBufPairRunBinding[] | null> = new Array(MAX_THUNK_ID).fill(null);
     // Write-buffer ring addresses (populated from thunkMemoryManager regions)
     private writeBufControlAddr = 0;
     private writeBufDataBase = 0;
@@ -926,6 +954,11 @@ export class ThunkDispatcher {
     private wbufOutTrapHitsTotal = 0;  // WBUF-registered funcIds that still hit handlePortWrite
     private wbufCoalescedSkipsTotal = 0; // WBUF entries superseded within the same drain
     private wbufBarrierEntriesTotal = 0; // barrier (draw) entries drained from the ring
+    private wbufPairRunsTotal = 0;
+    private wbufPairsTotal = 0;
+    private wbufPairFallbacksTotal = 0;
+    /** Fused prefix-run consumers that threw; each one cost a decline, never a replay. */
+    private wbufFusedConsumerThrows = 0;
     /** Drained-up-to watermark (byte offset into the ring). Entries in [wbufTail, head)
      *  are pending; [0, wbufTail) have been applied. The guest head is only reset to 0
      *  when the ring is fully drained AND no preempted thread sits inside a trampoline
@@ -1035,6 +1068,51 @@ export class ThunkDispatcher {
         return (argCount + 1) * 4;
     }
 
+    /** Rebind durable name-based pair registrations after stub regeneration. */
+    private bindWriteBufferPairRuns(): void {
+        this.writeBufPairRunByFirst.fill(null);
+        for (const registration of this.writeBufPairRuns) {
+            const first = this.findStubsByName(registration.firstDll, registration.firstName)
+                .filter(stub => stub.functionId > 0 && stub.functionId < MAX_THUNK_ID);
+            const secondIds = new Set(this.findStubsByName(registration.secondDll, registration.secondName)
+                .map(stub => stub.functionId)
+                .filter(id => id > 0 && id < MAX_THUNK_ID));
+            if (secondIds.size === 0) continue;
+            for (const stub of first) {
+                const id = stub.functionId;
+                const bindings = this.writeBufPairRunByFirst[id] ?? [];
+                bindings.push({ secondIds, handler: registration.handler });
+                this.writeBufPairRunByFirst[id] = bindings;
+            }
+        }
+    }
+
+    /** Return an exclusive end offset for an exact first/second alternating run. */
+    private findWriteBufferPairRunEnd(
+        mem32: Uint32Array, dataBase: number, start: number, head: number,
+        firstId: number, secondIds: Set<number>,
+    ): { end: number; pairs: number } {
+        let offset = start;
+        let pairs = 0;
+        while (offset < head) {
+            if ((mem32[(dataBase + offset) >> 2] >>> 0) !== firstId) break;
+            const firstStride = this.getWbufEntryStride(
+                mem32, dataBase, offset, this.writeBufArgCountTable[firstId],
+            );
+            if (firstStride <= 0 || offset + firstStride >= head) break;
+            const secondOffset = offset + firstStride;
+            const secondId = mem32[(dataBase + secondOffset) >> 2] >>> 0;
+            if (!secondIds.has(secondId) || !this.writeBufHandlerTable[secondId]) break;
+            const secondStride = this.getWbufEntryStride(
+                mem32, dataBase, secondOffset, this.writeBufArgCountTable[secondId],
+            );
+            if (secondStride <= 0 || secondOffset + secondStride > head) break;
+            offset = secondOffset + secondStride;
+            pairs++;
+        }
+        return { end: offset, pairs };
+    }
+
     private buildWbufCoalesceIndex(mem32: Uint32Array, dataBase: number, start: number, head: number): boolean {
         this.beginWbufCoalesce(Math.max(1, (head - start) >>> 3));
         let offset = start;
@@ -1102,8 +1180,131 @@ export class ThunkDispatcher {
         let segment = 0; // barrier (draw) count — must mirror buildWbufCoalesceIndex's walk
         const coalescing = this.wbufCoalescingEnabled && this.buildWbufCoalesceIndex(mem32, dataBase, offset, head);
         while (offset < head) {
-            const funcId = mem32[(dataBase + offset) >> 2];
+            const funcId: number = mem32[(dataBase + offset) >> 2] >>> 0;
             if (funcId > 0 && funcId < MAX_THUNK_ID) {
+                // Exact pair fusion is attempted before either ordinary handler mutates state.
+                // A decline is therefore a strict rollback point: resume at the same offset.
+                const pairBindings: WriteBufPairRunBinding[] | null = this.writeBufPairRunByFirst[funcId];
+                if (pairBindings && !coalescing) {
+                    let consumed = false;
+                    for (const binding of pairBindings as WriteBufPairRunBinding[]) {
+                        const run = this.findWriteBufferPairRunEnd(mem32, dataBase, offset, head, funcId, binding.secondIds);
+                        // Default-on prefix extension (false is the benchmark/debug kill switch):
+                        // first-constant, a short run of ordinary non-barrier
+                        // setters, first-draw, then the established alternating pair run. Apply
+                        // constant/setters in original order, then let the consumer prepend the
+                        // first draw as instance zero. On a decline only that first draw is
+                        // replayed here; the following exact run remains at tailStart and is
+                        // offered normally on the next loop iteration.
+                        if (run.pairs < 2 && run.pairs === 0
+                            && (globalThis as { __d3d9PrefixMegaRun?: boolean })
+                                .__d3d9PrefixMegaRun !== false) {
+                            const firstStride = this.getWbufEntryStride(
+                                mem32, dataBase, offset, this.writeBufArgCountTable[funcId],
+                            );
+                            let cursor = offset + firstStride;
+                            const middle: Array<{ offset: number; id: number }> = [];
+                            let prefixDrawOffset = -1;
+                            for (let n = 0; firstStride > 0 && cursor < head && n < 4; n++) {
+                                const id = mem32[(dataBase + cursor) >> 2] >>> 0;
+                                if (binding.secondIds.has(id) && this.writeBufHandlerTable[id]) {
+                                    prefixDrawOffset = cursor;
+                                    break;
+                                }
+                                if (!(id > 0 && id < MAX_THUNK_ID) || id === funcId
+                                    || this.writeBufBarrierTable[id] || !this.writeBufHandlerTable[id]
+                                    || this.writeBufArgCountTable[id] <= 0) break;
+                                const stride = this.getWbufEntryStride(
+                                    mem32, dataBase, cursor, this.writeBufArgCountTable[id],
+                                );
+                                if (stride <= 0 || cursor + stride > head) break;
+                                middle.push({ offset: cursor, id });
+                                cursor += stride;
+                            }
+                            if (prefixDrawOffset >= 0 && middle.length > 0) {
+                                const prefixDrawId = mem32[(dataBase + prefixDrawOffset) >> 2] >>> 0;
+                                const drawStride = this.getWbufEntryStride(
+                                    mem32, dataBase, prefixDrawOffset,
+                                    this.writeBufArgCountTable[prefixDrawId],
+                                );
+                                const tailStart = prefixDrawOffset + drawStride;
+                                if (drawStride > 0 && tailStart < head
+                                    && (mem32[(dataBase + tailStart) >> 2] >>> 0) === funcId) {
+                                    const tailRun = this.findWriteBufferPairRunEnd(
+                                        mem32, dataBase, tailStart, head, funcId, binding.secondIds,
+                                    );
+                                    if (tailRun.pairs >= 2) {
+                                        this.writeBufHandlerTable[funcId]!(
+                                            mem8, mem32, dataBase + offset + 4,
+                                        );
+                                        this.wbufHitsTotal++;
+                                        for (const item of middle) {
+                                            this.writeBufHandlerTable[item.id]!(
+                                                mem8, mem32, dataBase + item.offset + 4,
+                                            );
+                                            this.wbufHitsTotal++;
+                                        }
+                                        // The first constant and the middle setters are already
+                                        // applied. Letting a throw unwind the drain would leave
+                                        // wbufTail at the run start and apply them a second time,
+                                        // so a throwing consumer takes the decline path instead.
+                                        let fused: boolean;
+                                        try {
+                                            fused = binding.handler(
+                                                mem8, mem32,
+                                                dataBase + tailStart, dataBase + tailRun.end,
+                                                tailRun.pairs,
+                                                dataBase + offset, dataBase + prefixDrawOffset,
+                                            );
+                                        } catch (e) {
+                                            fused = false;
+                                            if (this.wbufFusedConsumerThrows++ === 0) {
+                                                Logger.error(LogCategory.THUNK,
+                                                    `drainWriteBuffer: fused pair-run consumer for funcId `
+                                                    + `${funcId} threw; declining to the ordinary path: ${e}`);
+                                            }
+                                        }
+                                        if (fused) {
+                                            offset = tailRun.end;
+                                            segment += tailRun.pairs + 1;
+                                            this.wbufBarrierEntriesTotal += tailRun.pairs + 1;
+                                            this.wbufHitsTotal += tailRun.pairs * 2 + 1;
+                                            this.wbufPairRunsTotal++;
+                                            this.wbufPairsTotal += tailRun.pairs;
+                                        } else {
+                                            this.writeBufHandlerTable[prefixDrawId]!(
+                                                mem8, mem32, dataBase + prefixDrawOffset + 4,
+                                            );
+                                            offset = tailStart;
+                                            segment++;
+                                            this.wbufBarrierEntriesTotal++;
+                                            this.wbufHitsTotal++;
+                                            this.wbufPairFallbacksTotal++;
+                                        }
+                                        consumed = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if (consumed) break;
+                        // One pair rarely amortises the cross-language setup; leave it on the
+                        // established path. Runs of two or more are the useful workload shape.
+                        if (run.pairs < 2) continue;
+                        if (binding.handler(mem8, mem32, dataBase + offset, dataBase + run.end, run.pairs)) {
+                            offset = run.end;
+                            segment += run.pairs;
+                            this.wbufBarrierEntriesTotal += run.pairs;
+                            this.wbufHitsTotal += run.pairs * 2;
+                            this.wbufPairRunsTotal++;
+                            this.wbufPairsTotal += run.pairs;
+                            consumed = true;
+                            break;
+                        }
+                        this.wbufPairFallbacksTotal++;
+                    }
+                    if (consumed) continue;
+                }
                 const handler = this.writeBufHandlerTable[funcId];
                 const argCount = this.writeBufArgCountTable[funcId];
                 if (handler && argCount > 0) {
@@ -3457,6 +3658,15 @@ export class ThunkDispatcher {
             this.writeBufArgCountTable[id] = argCount;
             this.writeBufCoalesceMaskTable[id] = coalesceArgMask & 0x7;
             this.writeBufBarrierTable[id] = opts?.barrier ? 1 : 0;
+            // Only plain ring trampolines are semantically interchangeable with the
+            // dynarec intrinsic. Shadow/owner-disarm overrides contain extra guest-side
+            // state transitions and must continue through their specialized code.
+            if (!opts?.trampolineOverride && !opts?.shadowSpec && !opts?.ownerDisarm) {
+                this.registerWbufDynarecIntrinsic(
+                    stubAddr, id, 0, argCount, isStdcall,
+                    opts?.barrier && si === 0 ? 2 : undefined,
+                );
+            }
             // Ring-level coalescing is DEFAULT-OFF: the guest-side setter
             // shadow already kills ~97% of redundant setters before they reach the ring, and
             // draws-on-ring barrier segments split what's left — measured NFSU in-race skip
@@ -3494,6 +3704,69 @@ export class ThunkDispatcher {
         // Reports whether the patch actually landed: a caller counting ATTEMPTS would
         // announce a fast path that is still entirely on the OUT trap.
         return true;
+    }
+
+    /** Publish one patched WBUF stub to v86's default-on indirect-CALL intrinsic.
+     *  Registration is harmless while disabled; the boot kill switch controls execution so the
+     *  exact same bundle can run mirrored A/Bs without changing the guest patch layout. */
+    private registerWbufDynarecIntrinsic(
+        stubAddr: number,
+        functionId: number,
+        kind: 0 | 1,
+        argCount: number,
+        isStdcall: boolean,
+        hotSlot?: 0 | 1 | 2,
+    ): void {
+        const ex = preemptionManager.getWasmExports?.();
+        const register = ex?.['jit_wbuf_intrinsic_register'];
+        const setEnabled = ex?.['jit_wbuf_intrinsic_set_enabled'];
+        if (typeof register !== 'function' || typeof setEnabled !== 'function') return;
+
+        const enabled = (globalThis as { __wbufDynarecIntrinsic?: boolean })
+            .__wbufDynarecIntrinsic !== false;
+        setEnabled(enabled ? 1 : 0);
+        const ok = register(
+            stubAddr >>> 0,
+            functionId >>> 0,
+            kind,
+            argCount >>> 0,
+            isStdcall ? 1 : 0,
+            this.writeBufControlAddr >>> 0,
+            this.writeBufDataBase >>> 0,
+            this.writeBufCapacity >>> 0,
+        ) >>> 0;
+        if (!ok) {
+            Logger.warn(LogCategory.THUNK,
+                `[WBUF] dynarec intrinsic registration rejected for stub=0x${stubAddr.toString(16)} id=${functionId}`);
+        } else {
+            const markHot = ex?.['jit_wbuf_intrinsic_mark_hot'];
+            if (hotSlot === undefined || typeof markHot !== 'function') return;
+            const hotOk = markHot(hotSlot, stubAddr >>> 0) >>> 0;
+            if (!hotOk) {
+                Logger.warn(LogCategory.THUNK,
+                    `[WBUF] dynarec hot-slot ${hotSlot} rejected for stub=0x${stubAddr.toString(16)} id=${functionId}`);
+            }
+        }
+    }
+
+    /** Drop descriptors that name the previous process' thunk arena. Older wasm builds do not
+     * expose the lifecycle hook, so reset remains compatible while never calling a stale export. */
+    private clearWbufDynarecIntrinsicRegistry(): boolean {
+        const ex = preemptionManager.getWasmExports?.();
+        const clear = ex?.['jit_wbuf_intrinsic_clear_registry'];
+        if (typeof clear !== 'function') return false;
+        clear();
+        return true;
+    }
+
+    /** Register a durable exact-pair drain fusion. Name-based bindings survive Process.reset(). */
+    registerWriteBufferPairRun(
+        firstDll: string, firstName: string,
+        secondDll: string, secondName: string,
+        handler: WriteBufPairRunHandler,
+    ): void {
+        this.writeBufPairRuns.push({ firstDll, firstName, secondDll, secondName, handler });
+        this.bindWriteBufferPairRuns();
     }
 
     /**
@@ -3853,6 +4126,9 @@ export class ThunkDispatcher {
         this.writeBufArgCountTable[id] = WBUF_ARG_SHADER_CONSTANT;
         this.writeBufCoalesceMaskTable[id] = 0;
         this.writeBufBarrierTable[id] = 0;
+        // Direct slots are ABI-stable: 0=VS constants, 1=PS constants, 2=draw barrier.
+        const hotSlot = /SetPixelShaderConstantF$/i.test(funcName) ? 1 : 0;
+        this.registerWbufDynarecIntrinsic(stubAddr, id, 1, 4, true, hotSlot);
 
         Logger.log(LogCategory.THUNK,
             `[WBUF] Registered ShaderConstant [${id}] ${dllName}:${funcName} ` +
@@ -7377,6 +7653,8 @@ export class ThunkDispatcher {
             }
         }
 
+        this.bindWriteBufferPairRuns();
+
         if (applied > 0) {
             Logger.verbose(LogCategory.THUNK, `Applied ${applied} pending registrations`);
         }
@@ -7474,17 +7752,38 @@ export class ThunkDispatcher {
      *   - outTrapHits > hits          → JIT invalidation race
      *   - hits >> outTrapHits         → WBUF working; investigate unregistered thunks elsewhere
      */
-    getWbufStats(): { hits: number; outTrapHits: number; coalescedSkips: number; barrierEntries: number; registered: number } {
+    getWbufStats(): { hits: number; outTrapHits: number; coalescedSkips: number; barrierEntries: number; pairRuns: number; pairs: number; pairFallbacks: number; fusedConsumerThrows: number; registered: number; dynarecIntrinsicHits: number; dynarecIntrinsicFallbacks: number; dynarecIntrinsicEnabled: number; dynarecIntrinsicRegistered: number; dynarecIntrinsicMinTarget: number; dynarecIntrinsicMaxTarget: number; dynarecIntrinsicCodegenCall32: number; dynarecIntrinsicCodegenSs32: number } {
         let registered = 0;
         for (let i = 0; i < this.writeBufHandlerTable.length; i++) {
             if (this.writeBufHandlerTable[i]) registered++;
         }
+        const ex = preemptionManager.getWasmExports?.();
         return {
             hits: this.wbufHitsTotal,
             outTrapHits: this.wbufOutTrapHitsTotal,
             coalescedSkips: this.wbufCoalescedSkipsTotal,
             barrierEntries: this.wbufBarrierEntriesTotal,
+            pairRuns: this.wbufPairRunsTotal,
+            pairs: this.wbufPairsTotal,
+            pairFallbacks: this.wbufPairFallbacksTotal,
+            fusedConsumerThrows: this.wbufFusedConsumerThrows,
             registered,
+            dynarecIntrinsicHits: typeof ex?.jit_wbuf_intrinsic_get_hits === 'function'
+                ? ex.jit_wbuf_intrinsic_get_hits() >>> 0 : 0,
+            dynarecIntrinsicFallbacks: typeof ex?.jit_wbuf_intrinsic_get_fallbacks === 'function'
+                ? ex.jit_wbuf_intrinsic_get_fallbacks() >>> 0 : 0,
+            dynarecIntrinsicEnabled: typeof ex?.jit_wbuf_intrinsic_get_enabled === 'function'
+                ? ex.jit_wbuf_intrinsic_get_enabled() >>> 0 : 0,
+            dynarecIntrinsicRegistered: typeof ex?.jit_wbuf_intrinsic_get_registered === 'function'
+                ? ex.jit_wbuf_intrinsic_get_registered() >>> 0 : 0,
+            dynarecIntrinsicMinTarget: typeof ex?.jit_wbuf_intrinsic_get_min_target === 'function'
+                ? ex.jit_wbuf_intrinsic_get_min_target() >>> 0 : 0,
+            dynarecIntrinsicMaxTarget: typeof ex?.jit_wbuf_intrinsic_get_max_target === 'function'
+                ? ex.jit_wbuf_intrinsic_get_max_target() >>> 0 : 0,
+            dynarecIntrinsicCodegenCall32: typeof ex?.jit_wbuf_intrinsic_get_codegen_call32 === 'function'
+                ? ex.jit_wbuf_intrinsic_get_codegen_call32() >>> 0 : 0,
+            dynarecIntrinsicCodegenSs32: typeof ex?.jit_wbuf_intrinsic_get_codegen_ss32 === 'function'
+                ? ex.jit_wbuf_intrinsic_get_codegen_ss32() >>> 0 : 0,
         };
     }
 
@@ -7493,6 +7792,14 @@ export class ThunkDispatcher {
         this.wbufOutTrapHitsTotal = 0;
         this.wbufCoalescedSkipsTotal = 0;
         this.wbufBarrierEntriesTotal = 0;
+        this.wbufPairRunsTotal = 0;
+        this.wbufPairsTotal = 0;
+        this.wbufPairFallbacksTotal = 0;
+        this.wbufFusedConsumerThrows = 0;
+        const ex = preemptionManager.getWasmExports?.();
+        if (typeof ex?.jit_wbuf_intrinsic_reset_stats === 'function') {
+            ex.jit_wbuf_intrinsic_reset_stats();
+        }
     }
 
     /** Disable slow-path hit counting. Existing counts remain accessible via getSlowPathReport(). */
@@ -7508,6 +7815,9 @@ export class ThunkDispatcher {
     }
 
     reset(): void {
+        // The pending registrations below intentionally survive reset and will publish the
+        // regenerated stub addresses. First remove descriptors for the old thunk arena.
+        this.clearWbufDynarecIntrinsicRegistry();
         this.isWaitingForEipDump = false;
         this.activeAsyncThunks.clear();
         this.pendingAsyncRestores.length = 0;
@@ -7525,6 +7835,7 @@ export class ThunkDispatcher {
         this.writeBufHandlerTable.fill(null);
         this.writeBufArgCountTable.fill(0);
         this.writeBufCoalesceMaskTable.fill(0);
+        this.writeBufPairRunByFirst.fill(null);
         this.wbufCoalescingEnabled = false;
         // Emitted-code handles name addresses in the OLD thunk arena. The pending
         // registrations survive (above) and re-emit against the new one; keeping the handles

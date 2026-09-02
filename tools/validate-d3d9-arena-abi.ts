@@ -141,9 +141,26 @@ function findConstant(text: string, pattern: RegExp, label: string): number {
     return value;
 }
 
-/** The three capacity/version constants the TS wrapper hand-mirrors from arena.rs. Nothing
- *  at runtime reads BUMP_CAP or the ABI version off the layout table, so a drift here is
- *  invisible until an overflow check silently uses the wrong bound. */
+/** Resolve the small acyclic Rust const expressions used by the descriptor/header ABI. */
+function findRustConstant(text: string, name: string, seen = new Set<string>()): number {
+    if (seen.has(name)) throw new AbiFailure(`arena.rs const cycle while resolving ${name}`);
+    seen.add(name);
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const raw = new RegExp(`\\b(?:pub\\s+)?const\\s+${escaped}:\\s*[^=]+?=\\s*([^;]+);`)
+        .exec(text)?.[1];
+    if (raw === undefined) throw new AbiFailure(`arena.rs ${name} not found`);
+    const expanded = raw.replace(/\b[A-Z][A-Z0-9_]*\b/g, dependency =>
+        String(findRustConstant(text, dependency, new Set(seen))));
+    const value = evalIntExpression(expanded);
+    if (value === null) {
+        throw new AbiFailure(`arena.rs ${name} is not a supported integer expression: ${raw}`);
+    }
+    return value;
+}
+
+/** Capacity/version/descriptor constants the TS wrapper hand-mirrors from arena.rs. Nothing
+ * at runtime reads these off the layout table, so drift is otherwise invisible until a decoder
+ * silently reads a different header or accepts a payload beyond Rust's bank. */
 function checkMirroredConstants(tsText: string, rustText: string): string[] {
     const pairs: Array<[string, RegExp, RegExp]> = [
         ["BUMP_CAP", /export\s+const\s+D3D9_ARENA_BUMP_CAP\s*=\s*([^;]+);/,
@@ -157,6 +174,25 @@ function checkMirroredConstants(tsText: string, rustText: string): string[] {
     for (const [label, tsPattern, rustPattern] of pairs) {
         const tsValue = findConstant(tsText, tsPattern, `TS ${label}`);
         const rustValue = findConstant(rustText, rustPattern, `arena.rs ${label}`);
+        if (tsValue !== rustValue) {
+            failures.push(`${label} mismatch: d3d9-wasm-arena.ts=${tsValue}, arena.rs=${rustValue}`);
+        }
+    }
+    const descriptorPairs: Array<[string, RegExp, string]> = [
+        ["SHADER_HANDLE_SLOTS", /export\s+const\s+D3D9_ARENA_SHADER_HANDLE_SLOTS\s*=\s*([^;]+);/,
+            "SHADER_HANDLE_SLOTS"],
+        ["VS_CONST_FLOATS", /export\s+const\s+D3D9_ARENA_VS_CONST_FLOATS\s*=\s*([^;]+);/,
+            "VS_CONST_FLOATS"],
+        ["PS_CONST_FLOATS", /export\s+const\s+D3D9_ARENA_PS_CONST_FLOATS\s*=\s*([^;]+);/,
+            "PS_CONST_FLOATS"],
+        ["DRAW_STATE_HEADER_LEN", /export\s+const\s+D3D9_ARENA_DRAW_STATE_HEADER_BYTES\s*=\s*([^;]+);/,
+            "DRAW_STATE_HEADER_LEN"],
+        ["COMPACT_RUN_HEADER_WORDS", /export\s+const\s+D3D9_ARENA_COMPACT_RUN_HEADER_WORDS\s*=\s*([^;]+);/,
+            "COMPACT_RUN_HEADER_WORDS"],
+    ];
+    for (const [label, tsPattern, rustName] of descriptorPairs) {
+        const tsValue = findConstant(tsText, tsPattern, `TS ${label}`);
+        const rustValue = findRustConstant(rustText, rustName);
         if (tsValue !== rustValue) {
             failures.push(`${label} mismatch: d3d9-wasm-arena.ts=${tsValue}, arena.rs=${rustValue}`);
         }

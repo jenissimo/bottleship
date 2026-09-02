@@ -35,6 +35,13 @@ export interface ArenaPipelineIdentityFields {
     streams: string;
 }
 
+// Pipeline identities are deliberately content-addressed: a cache hit is only possible after
+// the complete canonical string compares equal.  Real D3D9 frames revisit a very small set of
+// blend/depth/shader variants thousands of times, while hashing one identity costs sixteen full
+// FNV passes in parallel.  Keep the cache bounded because shader/state churn is guest-controlled.
+const IDENTITY_WORD_CACHE_LIMIT = 4096;
+const identityWordCache = new Map<string, Uint32Array>();
+
 function fnvWord(hash: number, word: number): number {
     return Math.imul((hash ^ (word >>> 0)) >>> 0, FNV_PRIME) >>> 0;
 }
@@ -50,10 +57,9 @@ function seededIdentityWords(): Uint32Array {
 }
 
 /**
- * Incremental identity builder. The old implementation walked the complete key once per
- * lane (16 full string passes). Device code now appends each canonical fragment once and
- * updates all lanes in that same character walk; `finish()` returns the exact same fixed-width
- * ABI words while retaining the readable key for cache diagnostics.
+ * Incremental identity builder: each canonical fragment is appended once and every lane is
+ * updated in that same character walk; `finish()` returns the fixed-width ABI words while
+ * retaining the readable key for cache diagnostics.
  */
 export class ArenaPipelineIdentityBuilder {
     private readonly words = seededIdentityWords();
@@ -83,18 +89,19 @@ export class ArenaPipelineIdentityBuilder {
 
 /** Assemble the complete identity from semantically named cache fragments. */
 export function buildArenaPipelineIdentity(fields: ArenaPipelineIdentityFields): ArenaPipelineIdentitySnapshot {
-    return new ArenaPipelineIdentityBuilder()
-        .append(fields.shader)
-        .append(fields.fvf)
-        .append(fields.state)
-        .append(fields.point)
-        .append(fields.blend)
-        .append(fields.masks)
-        .append(fields.projection)
-        .append(fields.sampler)
-        .append(fields.target)
-        .append(fields.streams)
-        .finish();
+    const key = fields.shader + fields.fvf + fields.state + fields.point + fields.blend
+        + fields.masks + fields.projection + fields.sampler + fields.target + fields.streams;
+    const cached = identityWordCache.get(key);
+    if (cached !== undefined) {
+        // Preserve the builder's ownership contract: callers may retain or mutate their snapshot
+        // without corrupting a future cache hit.
+        return { key, words: new Uint32Array(cached) };
+    }
+
+    const words = new ArenaPipelineIdentityBuilder().append(key).finish().words;
+    if (identityWordCache.size >= IDENTITY_WORD_CACHE_LIMIT) identityWordCache.clear();
+    identityWordCache.set(key, words);
+    return { key, words: new Uint32Array(words) };
 }
 
 /** Stable FNV-1a lanes over a canonical string. */

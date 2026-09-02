@@ -12,6 +12,11 @@ import { StreamBindingPlan } from "../../src/worker/backends/webgpu/shared/verte
 import {
     arenaSupportsFragmentSamplerBank,
     arenaSupportsVertexSamplerBank,
+    D3D9_ARENA_COMPACT_RUN_HEADER_WORDS,
+    D3D9_ARENA_DRAW_STATE_HEADER_BYTES,
+    D3D9_ARENA_PS_CONST_FLOATS,
+    D3D9_ARENA_SHADER_HANDLE_SLOTS,
+    D3D9_ARENA_VS_CONST_FLOATS,
     d3d9WasmArena,
     isValidArenaTruncateTarget,
 } from "../../src/worker/backends/webgpu/d3d9/d3d9-wasm-arena";
@@ -20,6 +25,15 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 describe("D3D9 WASM arena pipeline identity", () => {
+    test("publishes the non-layout descriptor ABI as named constants", () => {
+        expect(D3D9_ARENA_SHADER_HANDLE_SLOTS).toBe(1024);
+        expect(D3D9_ARENA_VS_CONST_FLOATS).toBe(256 * 4);
+        expect(D3D9_ARENA_PS_CONST_FLOATS).toBe(224 * 4);
+        expect(D3D9_ARENA_DRAW_STATE_HEADER_BYTES).toBe(128);
+        expect(D3D9_ARENA_COMPACT_RUN_HEADER_WORDS).toBe(10);
+        expect(D3D9_ARENA_DRAW_STATE_HEADER_BYTES % 4).toBe(0);
+    });
+
     test("is fixed width and changes when any canonical cache field changes", () => {
         const fields = {
             shader: "vs7:ps11:decl3",
@@ -129,6 +143,38 @@ describe("D3D9 WASM arena pipeline identity", () => {
         }]);
         frame.reset();
         expect(frame.arenaDrawBindings).toHaveLength(0);
+    });
+
+    test("forces a normal programmable rebind after an opaque arena run", () => {
+        const recorder = new D3D9CommandRecorder(new RenderFramePool(2));
+        const streams = new StreamBindingPlan();
+        const buffer = {} as GPUBuffer;
+        streams.add(0, buffer, 0, 64);
+        recorder.recordDrawIndexedArenaRun({
+            pipelineId: 7,
+            streams,
+            ibGpuBuffer: buffer,
+            ibFormat: "uint16",
+            bindStateIndex: 2,
+            arenaCommandStart: 0,
+            arenaCommandEnd: 4,
+            pairCount: 2,
+        });
+        recorder.recordDrawIndexed({
+            pipelineId: 7,
+            streams,
+            ibGpuBuffer: buffer,
+            ibFormat: "uint16",
+            bindStateIndex: 2,
+            indexCount: 3,
+            startIndex: 0,
+            baseVertex: 0,
+        });
+
+        const frame = recorder.finalize();
+        const runAt = frame.commandTypes.indexOf(RenderCommandType.DrawIndexedArenaRun);
+        expect(runAt).toBeGreaterThanOrEqual(0);
+        expect(frame.commandTypes.slice(runAt + 1)).toContain(RenderCommandType.BindProgrammable);
     });
 
     test("clears cube metadata when a TextureStore slot is destroyed and recycled", () => {

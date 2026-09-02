@@ -28,7 +28,29 @@ export const D3D9_ARENA_BUMP_CAP = 16 * 1024 * 1024;
 /** Command capacity published by the Rust arena ABI (arena.rs::CMD_CAP). */
 export const D3D9_ARENA_CMD_CAP = 16384;
 /** Version of the shared layout + command ABI consumed by this wrapper. */
-export const D3D9_ARENA_ABI_VERSION = 2;
+export const D3D9_ARENA_ABI_VERSION = 4;
+/** Mirrored non-layout ABI constants. The build gate validates every value against arena.rs. */
+export const D3D9_ARENA_SHADER_HANDLE_SLOTS = 1024;
+export const D3D9_ARENA_VS_CONST_FLOATS = 256 * 4;
+export const D3D9_ARENA_PS_CONST_FLOATS = 224 * 4;
+export const D3D9_ARENA_DRAW_STATE_HEADER_BYTES = 128;
+export const D3D9_ARENA_COMPACT_RUN_HEADER_WORDS = 10;
+const COMPACT_RUN_MAGIC_SPARSE = 0x434d5201;
+const COMPACT_RUN_MAGIC_STORAGE = 0x434d5202;
+
+export interface CompactWbufRunDescriptor {
+    offset: number;
+    pairCount: number;
+    startRegister: number;
+    floatCount: number;
+    payloadOffset: number;
+    payloadBits: Uint32Array;
+    indexCount: number;
+    startIndex: number;
+    baseVertex: number;
+    payloadStrideWords: number;
+    storageReady: boolean;
+}
 
 /** High SM3 sampler stages must use the complete TypeScript snapshot/key path. */
 export function arenaSupportsFragmentSamplerBank(
@@ -125,7 +147,6 @@ const enum LayoutIdx {
 }
 
 const LAYOUT_LEN = 45;
-const DRAW_STATE_HEADER_BYTES = 128;
 
 // RenderCommandType — must match render-frame.ts's RenderCommandType for 1-6; 7 is the
 // arena-only addition for the non-indexed UP path. Indexed UP is CPU-deindexed before recording.
@@ -179,6 +200,10 @@ class D3D9WasmArena {
     private bindGroupKeys!: Uint32Array;
     private commandCountView!: Uint32Array; // [commandCount] — single word
     private bumpCursorView!: Uint32Array; // [bumpCursor] — single word
+    /** Word view of the bump arena, rebuilt only when Wasm memory grows. */
+    private bumpArenaWords!: Uint32Array;
+    private compactTemplateWords!: Uint32Array;
+    private compactTemplatePtr = 0;
     // [commandsEmitted, arenaHighWaterMark, overflowCount, ffpFallbackCount, mismatchCount]
     // NOTE: NOT contiguous with commandCountView — the 16MB bump arena sits between them
     // in the Rust layout (OFF_COMMAND_COUNT precedes the bump arena; these 5 counters
@@ -202,6 +227,10 @@ class D3D9WasmArena {
         return this.initialized;
     }
 
+    supportsWbufIndexedRuns(): boolean {
+        return this.initialized && typeof this.wasmExports?.d3d9_record_wbuf_indexed_run === "function";
+    }
+
     /** One line, once: a silent bail leaves the arena permanently off with no way to tell a
      *  deliberately-disabled build from a stale v86.wasm. */
     private declineLogged = false;
@@ -222,7 +251,10 @@ class D3D9WasmArena {
             || !this.wasmExports?.get_d3d9_arena_layout_ptr
             || !this.wasmExports?.get_d3d9_arena_abi_version
             || !this.wasmExports?.d3d9_clear_pipeline_identity
-            || !this.wasmExports?.d3d9_truncate_frame) {
+            || !this.wasmExports?.d3d9_truncate_frame
+            || !this.wasmExports?.d3d9_get_last_wbuf_compact_offset
+            || !this.wasmExports?.get_d3d9_compact_template_ptr
+            || !this.wasmExports?.d3d9_set_compact_template_words) {
             this.decline("v86.wasm predates the pipeline-identity arena ABI (missing exports)");
             return;
         }
@@ -242,6 +274,7 @@ class D3D9WasmArena {
             this.decline("no WebAssembly.Memory reachable from the CPU");
             return;
         }
+        this.compactTemplatePtr = Number(this.wasmExports.get_d3d9_compact_template_ptr());
 
         const layoutPtr = this.wasmExports.get_d3d9_arena_layout_ptr();
         const layout = new Uint32Array(this.wasmMemory, layoutPtr, LAYOUT_LEN);
@@ -289,10 +322,10 @@ class D3D9WasmArena {
         this.handles = new Uint32Array(buf, b + layout[LayoutIdx.VsHandle], 4); // vs,ps,decl,fvf are contiguous
         this.textureBoundIds = new Uint32Array(buf, b + layout[LayoutIdx.TextureBoundIds], 8);
         this.textureCubeFlags = new Uint8Array(buf, b + layout[LayoutIdx.TextureCubeFlags], 4096);
-        this.shaderConstLenVs = new Uint16Array(buf, b + layout[LayoutIdx.ShaderConstLenVs], 1024);
-        this.shaderConstLenPs = new Uint16Array(buf, b + layout[LayoutIdx.ShaderConstLenPs], 1024);
-        this.vsConstants = new Float32Array(buf, b + layout[LayoutIdx.VsConstants], 256 * 4);
-        this.psConstants = new Float32Array(buf, b + layout[LayoutIdx.PsConstants], 224 * 4);
+        this.shaderConstLenVs = new Uint16Array(buf, b + layout[LayoutIdx.ShaderConstLenVs], D3D9_ARENA_SHADER_HANDLE_SLOTS);
+        this.shaderConstLenPs = new Uint16Array(buf, b + layout[LayoutIdx.ShaderConstLenPs], D3D9_ARENA_SHADER_HANDLE_SLOTS);
+        this.vsConstants = new Float32Array(buf, b + layout[LayoutIdx.VsConstants], D3D9_ARENA_VS_CONST_FLOATS);
+        this.psConstants = new Float32Array(buf, b + layout[LayoutIdx.PsConstants], D3D9_ARENA_PS_CONST_FLOATS);
         this.constVersions = new Uint32Array(buf, b + layout[LayoutIdx.VsConstVersion], 2);
         this.pipelineIdentity = new Uint32Array(buf, b + layout[LayoutIdx.PipelineIdentity], 16);
         this.commandTypes = new Uint32Array(buf, b + layout[LayoutIdx.CmdTypes], cap);
@@ -307,6 +340,12 @@ class D3D9WasmArena {
         this.bumpCursorView = new Uint32Array(buf, b + layout[LayoutIdx.BumpCursor], 1);
         this.counters = new Uint32Array(buf, b + layout[LayoutIdx.CommandsEmitted], 5);
         this.bumpArenaBase = layout[LayoutIdx.BumpArena];
+        this.bumpArenaWords = new Uint32Array(
+            buf,
+            b + this.bumpArenaBase,
+            D3D9_ARENA_BUMP_CAP >>> 2,
+        );
+        this.compactTemplateWords = new Uint32Array(buf, this.compactTemplatePtr, D3D9_ARENA_VS_CONST_FLOATS);
 
         this.blockSlotsBase = layout[LayoutIdx.BlockSlots];
         this.blockSlotSize = layout[LayoutIdx.BlockSlotSize];
@@ -381,7 +420,9 @@ class D3D9WasmArena {
     setShaderConstLen(isVertexShader: boolean, handle: number, floatCount: number): void {
         this.ensureFresh();
         const table = isVertexShader ? this.shaderConstLenVs : this.shaderConstLenPs;
-        if (handle >= 0 && handle < 1024) table[handle % 1024] = Math.min(floatCount, 0xffff);
+        if (handle >= 0 && handle < D3D9_ARENA_SHADER_HANDLE_SLOTS) {
+            table[handle % D3D9_ARENA_SHADER_HANDLE_SLOTS] = Math.min(floatCount, 0xffff);
+        }
     }
 
     /** Writes `data` (float32 values) starting at register `startFloat` into the shared
@@ -417,6 +458,19 @@ class D3D9WasmArena {
         // on its own (arena.rs), which is what actually has to see a texture change.
     }
 
+    /** Publish one storage-VS template for the immediately following compact Rust call. */
+    setCompactRunTemplate(bits: Uint32Array, wordCount: number): boolean {
+        this.ensureFresh();
+        if (!Number.isSafeInteger(wordCount) || wordCount <= 0
+            || wordCount > this.compactTemplateWords.length || bits.length < wordCount) {
+            this.wasmExports.d3d9_set_compact_template_words(0);
+            return false;
+        }
+        this.compactTemplateWords.set(bits.subarray(0, wordCount), 0);
+        return Number(this.wasmExports.d3d9_set_compact_template_words(wordCount >>> 0))
+            === wordCount;
+    }
+
     clearPipelineIdentity(): void {
         this.ensureFresh();
         this.pipelineIdentity.fill(0);
@@ -443,6 +497,26 @@ class D3D9WasmArena {
 
     recordDrawIndexed(topology: number, indexCount: number, startIndex: number, baseVertex: number, stride: number, forceCullNone: boolean): number {
         return this.normalizeRecordKey(this.wasmExports.d3d9_record_draw_indexed(topology, indexCount >>> 0, startIndex >>> 0, baseVertex >>> 0, stride >>> 0, forceCullNone ? 1 : 0));
+    }
+
+    /** Atomically consume an exact alternating VS-constant/indexed-draw WBUF range. */
+    recordWbufIndexedRun(
+        guestStart: number, byteLen: number, vsFuncId: number, drawFuncId: number,
+        expectedDevice: number, stride: number, forceCullNone: boolean,
+        compactMode = 0, indexCapacity = 0,
+    ): number {
+        if (!this.supportsWbufIndexedRuns()) return -1;
+        this.ensureFresh();
+        return Number(this.wasmExports.d3d9_record_wbuf_indexed_run(
+            guestStart | 0, byteLen >>> 0, vsFuncId >>> 0, drawFuncId >>> 0,
+            expectedDevice >>> 0, stride >>> 0, forceCullNone ? 1 : 0,
+            compactMode >>> 0, indexCapacity >>> 0,
+        ));
+    }
+
+    getLastWbufCompactOffset(): number {
+        if (!this.initialized) return -1;
+        return Number(this.wasmExports.d3d9_get_last_wbuf_compact_offset());
     }
 
     /** `guestVertexPtr` must be the raw guest address — Rust copies `byteLen` bytes out
@@ -583,6 +657,61 @@ class D3D9WasmArena {
         return new Uint8Array(this.wasmMemory!, this.base + this.bumpArenaBase + offset, len);
     }
 
+    /** Decode the self-contained sparse-VS descriptor emitted beside a shadow WBUF run. */
+    readCompactWbufRun(offset: number): CompactWbufRunDescriptor {
+        this.ensureFresh();
+        const headerBytes = D3D9_ARENA_COMPACT_RUN_HEADER_WORDS * 4;
+        if (!Number.isSafeInteger(offset) || offset < 0 || (offset & 3) !== 0
+            || offset > D3D9_ARENA_BUMP_CAP - headerBytes) {
+            throw new RangeError("D3D9 compact-run header offset is invalid");
+        }
+        const cursor = this.bumpCursorView[0]! >>> 0;
+        if (cursor > D3D9_ARENA_BUMP_CAP || offset > cursor - headerBytes) {
+            throw new RangeError("D3D9 compact-run header is outside the bump cursor");
+        }
+        const word = offset >>> 2;
+        const magic = this.bumpArenaWords[word]! >>> 0;
+        if (magic !== COMPACT_RUN_MAGIC_SPARSE && magic !== COMPACT_RUN_MAGIC_STORAGE) {
+            throw new RangeError("D3D9 compact-run magic/version mismatch");
+        }
+        const pairCount = this.bumpArenaWords[word + 1]! >>> 0;
+        const startRegister = this.bumpArenaWords[word + 2]! >>> 0;
+        const floatCount = this.bumpArenaWords[word + 3]! >>> 0;
+        const payloadOffset = this.bumpArenaWords[word + 4]! >>> 0;
+        const payloadWords = this.bumpArenaWords[word + 5]! >>> 0;
+        const payloadStrideWords = this.bumpArenaWords[word + 9]! >>> 0;
+        const storageReady = magic === COMPACT_RUN_MAGIC_STORAGE;
+        const floatStart = startRegister * 4;
+        if (pairCount < 2 || floatCount === 0 || floatCount > D3D9_ARENA_VS_CONST_FLOATS
+            || payloadStrideWords === 0 || payloadStrideWords > D3D9_ARENA_VS_CONST_FLOATS
+            || payloadWords !== pairCount * payloadStrideWords
+            || (!storageReady && payloadStrideWords !== floatCount)
+            || (storageReady && (floatStart > payloadStrideWords
+                || floatCount > payloadStrideWords - floatStart))
+            || payloadOffset !== offset + headerBytes
+            || payloadOffset > cursor || payloadWords > (cursor - payloadOffset) / 4
+            || payloadOffset > D3D9_ARENA_BUMP_CAP - payloadWords * 4) {
+            throw new RangeError("D3D9 compact-run payload is malformed");
+        }
+        return {
+            offset,
+            pairCount,
+            startRegister,
+            floatCount,
+            payloadOffset,
+            payloadBits: new Uint32Array(
+                this.wasmMemory!,
+                this.base + this.bumpArenaBase + payloadOffset,
+                payloadWords,
+            ),
+            indexCount: this.bumpArenaWords[word + 6]! >>> 0,
+            startIndex: this.bumpArenaWords[word + 7]! >>> 0,
+            baseVertex: this.bumpArenaWords[word + 8]! | 0,
+            payloadStrideWords,
+            storageReady,
+        };
+    }
+
     /**
      * Decode a draw-state slot captured by d3d9_arena.rs's capture_draw_state (referenced
      * by CMD_SET_PIPELINE's commandB and CMD_BIND_PROGRAMMABLE's commandA). The executor
@@ -607,32 +736,37 @@ class D3D9WasmArena {
         declHandle: number;
         pipelineIdentity: Uint32Array;
         vsConstants: Float32Array;
+        /** Bit-exact alias of vsConstants for storage-buffer packing (preserves NaN/i#/b#). */
+        vsBits: Uint32Array;
         psConstants: Float32Array;
+        /** Bit-exact alias of psConstants for material-invariance checks. */
+        psBits: Uint32Array;
     } {
         this.ensureFresh();
         if (!Number.isSafeInteger(offset) || offset < 0 || (offset & 3) !== 0
-            || offset > D3D9_ARENA_BUMP_CAP - DRAW_STATE_HEADER_BYTES) {
+            || offset > D3D9_ARENA_BUMP_CAP - D3D9_ARENA_DRAW_STATE_HEADER_BYTES) {
             throw new RangeError("D3D9 arena draw-state offset is invalid");
         }
         const cursor = this.bumpCursorView[0]! >>> 0;
-        if (cursor > D3D9_ARENA_BUMP_CAP || offset > cursor - DRAW_STATE_HEADER_BYTES) {
+        if (cursor > D3D9_ARENA_BUMP_CAP || offset > cursor - D3D9_ARENA_DRAW_STATE_HEADER_BYTES) {
             throw new RangeError("D3D9 arena draw-state header is outside the bump cursor");
         }
         const buf = this.wasmMemory!;
         const base = this.base + this.bumpArenaBase + offset;
-        const head = new DataView(buf, base, DRAW_STATE_HEADER_BYTES);
+        const head = new DataView(buf, base, D3D9_ARENA_DRAW_STATE_HEADER_BYTES);
         const vsLen = head.getUint16(0, true);
         const psLen = head.getUint16(2, true);
-        if (vsLen > 1024 || psLen > 896) {
+        if (vsLen > D3D9_ARENA_VS_CONST_FLOATS || psLen > D3D9_ARENA_PS_CONST_FLOATS) {
             throw new RangeError("D3D9 arena draw-state constants exceed the ABI banks");
         }
         const payloadBytes = (vsLen + psLen) * 4;
-        const totalBytes = DRAW_STATE_HEADER_BYTES + payloadBytes;
+        const totalBytes = D3D9_ARENA_DRAW_STATE_HEADER_BYTES + payloadBytes;
         if (totalBytes > cursor - offset || offset > D3D9_ARENA_BUMP_CAP - totalBytes
             || base < 0 || base + totalBytes > buf.byteLength) {
             throw new RangeError("D3D9 arena draw-state payload is outside the bump cursor");
         }
         const renderBits0 = head.getUint32(44, true);
+        const vsByteOffset = base + D3D9_ARENA_DRAW_STATE_HEADER_BYTES;
         return {
             cubeMask: head.getUint32(4, true),
             bindGroupKey: head.getUint32(8, true),
@@ -647,9 +781,40 @@ class D3D9WasmArena {
             alphaKey: head.getUint32(56, true),
             declHandle: head.getUint32(60, true),
             pipelineIdentity: new Uint32Array(buf, base + 64, 16),
-            vsConstants: new Float32Array(buf, base + DRAW_STATE_HEADER_BYTES, vsLen),
-            psConstants: new Float32Array(buf, base + DRAW_STATE_HEADER_BYTES + vsLen * 4, psLen),
+            vsConstants: new Float32Array(buf, vsByteOffset, vsLen),
+            vsBits: new Uint32Array(buf, vsByteOffset, vsLen),
+            psConstants: new Float32Array(buf, vsByteOffset + vsLen * 4, psLen),
+            psBits: new Uint32Array(buf, vsByteOffset + vsLen * 4, psLen),
         };
+    }
+
+    /** Copy only the captured VS bank needed by MegaBatch. Returns the copied word count, or
+     * -1 for a malformed slot. This keeps the hot path free of decoded-object/view allocation. */
+    copyDrawStateVsBits(
+        offset: number,
+        dst: Uint32Array,
+        dstWordOffset: number,
+        maxWords: number,
+    ): number {
+        this.ensureFresh();
+        if (!Number.isSafeInteger(offset) || offset < 0 || (offset & 3) !== 0
+            || offset > D3D9_ARENA_BUMP_CAP - D3D9_ARENA_DRAW_STATE_HEADER_BYTES
+            || !Number.isSafeInteger(dstWordOffset) || dstWordOffset < 0
+            || !Number.isSafeInteger(maxWords) || maxWords < 0) return -1;
+        const cursor = this.bumpCursorView[0]! >>> 0;
+        if (cursor > D3D9_ARENA_BUMP_CAP || offset > cursor - D3D9_ARENA_DRAW_STATE_HEADER_BYTES) return -1;
+        const word = offset >>> 2;
+        const lengths = this.bumpArenaWords[word]! >>> 0;
+        const vsLen = lengths & 0xffff;
+        const psLen = lengths >>> 16;
+        if (vsLen === 0 || vsLen > D3D9_ARENA_VS_CONST_FLOATS
+            || psLen > D3D9_ARENA_PS_CONST_FLOATS || vsLen > maxWords
+            || dstWordOffset > dst.length - vsLen) return -1;
+        const totalBytes = D3D9_ARENA_DRAW_STATE_HEADER_BYTES + (vsLen + psLen) * 4;
+        if (totalBytes > cursor - offset || offset > D3D9_ARENA_BUMP_CAP - totalBytes) return -1;
+        const src = word + (D3D9_ARENA_DRAW_STATE_HEADER_BYTES >>> 2);
+        for (let i = 0; i < vsLen; i++) dst[dstWordOffset + i] = this.bumpArenaWords[src + i]!;
+        return vsLen;
     }
 }
 

@@ -103,6 +103,23 @@ interface DrawIndexedCommandBase {
 export type DrawIndexedCommand =
     DrawIndexedCommandBase & (PlannedVertexBindings | IndexedSlot0VertexBindings);
 
+export type DrawIndexedArenaRunCommand = {
+    pipelineId: number;
+    ibGpuBuffer: GPUBuffer;
+    ibFormat: "uint16" | "uint32";
+    bindStateIndex: number;
+    arenaCommandStart: number;
+    arenaCommandEnd: number;
+    pairCount: number;
+    compactDescriptorOffset?: number;
+    prefixVsBits?: Uint32Array;
+    prefixStartFloat?: number;
+    scissorRect?: DrawScissorRect;
+    viewport?: DrawViewport;
+    stencilReference?: number;
+    blendConstant?: number;
+} & (PlannedVertexBindings | IndexedSlot0VertexBindings);
+
 export class D3D9CommandRecorder {
     private frame: RenderFrame;
     private currentPipelineId: number | null = null;
@@ -268,6 +285,53 @@ export class D3D9CommandRecorder {
         this.frame.pushSetIndexBuffer(cmd.ibGpuBuffer, cmd.ibFormat);
         this.frame.pushDrawIndexed(cmd.indexCount, cmd.startIndex, cmd.baseVertex, cmd.instanceCount ?? 1);
         this.drawCount++;
+    }
+
+    /** Record one compact host command for an arena-authoritative indexed pair run. */
+    recordDrawIndexedArenaRun(cmd: DrawIndexedArenaRunCommand): void {
+        if (this.currentPipelineId !== cmd.pipelineId) {
+            this.frame.pushSetPipeline(cmd.pipelineId);
+            this.currentPipelineId = cmd.pipelineId;
+            this.currentBindStateIndex = null;
+        }
+        this.recordViewport(cmd.viewport);
+        if (cmd.scissorRect) {
+            const r = cmd.scissorRect;
+            const c = this.currentScissor;
+            if (c.width !== r.width || c.height !== r.height || c.left !== r.left || c.top !== r.top) {
+                this.frame.pushSetScissor(r.left, r.top, r.width, r.height);
+                c.left = r.left; c.top = r.top; c.width = r.width; c.height = r.height;
+            }
+        }
+        if (cmd.stencilReference !== undefined && cmd.stencilReference !== this.currentStencilReference) {
+            this.frame.pushSetStencilReference(cmd.stencilReference);
+            this.currentStencilReference = cmd.stencilReference;
+        }
+        if (cmd.blendConstant !== undefined && cmd.blendConstant !== this.currentBlendConstant) {
+            this.frame.pushSetBlendConstant(cmd.blendConstant);
+            this.currentBlendConstant = cmd.blendConstant;
+        }
+        if ("streams" in cmd) this.bindVertexBuffers(cmd);
+        else {
+            this.frame.pushSetVertexBuffer(cmd.vbGpuBuffer, cmd.vbOffset, cmd.vbSize);
+            if (cmd.extraStreams) {
+                for (const s of cmd.extraStreams) {
+                    this.frame.pushSetVertexBuffer(s.buffer, s.offset, s.size, s.slot);
+                }
+            }
+        }
+        this.frame.pushSetIndexBuffer(cmd.ibGpuBuffer, cmd.ibFormat);
+        this.frame.pushDrawIndexedArenaRun(
+            cmd.arenaCommandStart, cmd.arenaCommandEnd, cmd.bindStateIndex,
+            cmd.pipelineId, cmd.pairCount, cmd.compactDescriptorOffset ?? -1,
+            cmd.prefixVsBits, cmd.prefixStartFloat ?? 0,
+        );
+        // MegaBatch binds the storage-VS group, while the exact fallback repeatedly binds
+        // ordinary dynamic-offset groups.  Neither execution shape gives the recorder a
+        // normal-group invariant it may carry across this opaque command.  Force the next
+        // ordinary draw to publish BindProgrammable even when it reuses the same state slot.
+        this.currentBindStateIndex = null;
+        this.drawCount += cmd.pairCount + (cmd.prefixVsBits ? 1 : 0);
     }
 
     /** Associate the just-recorded RenderFrame draw with its WASM-arena command. */

@@ -19,6 +19,8 @@ export const enum RenderCommandType {
     SetStencilReference = 12,
     SetBlendConstant = 13,
     SetViewport = 14,
+    /** One host command replays an arena-resident alternating constant/indexed-draw run. */
+    DrawIndexedArenaRun = 15,
 }
 
 /** Per-draw fixed-function state: a snapshot of the FFP uniform block (the guest
@@ -71,6 +73,23 @@ export interface ArenaDrawBinding {
     bindStateIndex?: number;
     /** Arena command kind; executor uses arena arguments only for non-UP rows. */
     arenaCommandType: number;
+}
+
+export interface ArenaIndexedRun {
+    /** Inclusive/exclusive arena command-row range produced by one atomic Rust transaction. */
+    arenaCommandStart: number;
+    arenaCommandEnd: number;
+    /** Generation-safe resources and non-float-bank uniform tails shared by the run. */
+    bindStateIndex: number;
+    /** Resolved host pipeline; the run reasserts it instead of trusting recorder/executor memo parity. */
+    pipelineId: number;
+    expectedPairCount: number;
+    /** Sparse-VS Compact MegaRun descriptor in the WASM bump arena; -1 for legacy runs. */
+    compactDescriptorOffset: number;
+    /** Sparse VS constant payload for a first draw separated from the exact pair run by
+     * non-pipeline-breaking setters. It executes before descriptor instance zero. */
+    prefixVsBits?: Uint32Array;
+    prefixStartFloat: number;
 }
 
 /**
@@ -153,6 +172,7 @@ export class RenderFrame {
     ffpStateCount = 0;
     /** Arena links for programmable draws recorded in this frame. */
     arenaDrawBindings: ArenaDrawBinding[] = [];
+    arenaIndexedRuns: ArenaIndexedRun[] = [];
     /** Flat x,y,width,height,minZ,maxZ per SetViewport command; commandA holds the base index. */
     viewportData: number[] = [];
 
@@ -178,6 +198,7 @@ export class RenderFrame {
         this.drawStateCount = 0;
         this.ffpStateCount = 0;
         this.arenaDrawBindings.length = 0;
+        this.arenaIndexedRuns.length = 0;
         this.viewportData.length = 0;
     }
 
@@ -292,6 +313,23 @@ export class RenderFrame {
         this.commandB.push(startIndex);
         this.commandC.push(baseVertex);
         this.commandD.push(instanceCount);
+    }
+
+    pushDrawIndexedArenaRun(
+        arenaCommandStart: number, arenaCommandEnd: number, bindStateIndex: number,
+        pipelineId: number, expectedPairCount: number, compactDescriptorOffset = -1,
+        prefixVsBits?: Uint32Array, prefixStartFloat = 0,
+    ): void {
+        const runIndex = this.arenaIndexedRuns.length;
+        this.arenaIndexedRuns.push({
+            arenaCommandStart, arenaCommandEnd, bindStateIndex, pipelineId, expectedPairCount,
+            compactDescriptorOffset, prefixVsBits, prefixStartFloat,
+        });
+        this.commandTypes.push(RenderCommandType.DrawIndexedArenaRun);
+        this.commandA.push(runIndex);
+        this.commandB.push(0);
+        this.commandC.push(0);
+        this.commandD.push(0);
     }
 
     /**

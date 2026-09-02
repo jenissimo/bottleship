@@ -25,7 +25,7 @@
  */
 
 interface PipelineMemoFlags {
-    /** Take the prologue shortcut (default off). */
+    /** Take the prologue shortcut (default on; explicit false is the A/B kill switch). */
     __d3d9PipelineMemo?: boolean;
     /** Run the full prologue anyway and check the memo's prediction (default off). */
     __d3d9PipelineMemoVerify?: boolean;
@@ -40,7 +40,7 @@ const flags = globalThis as PipelineMemoFlags;
  *  disables the memo outright — that flag exists to make the derived-key memos
  *  recompute, and a memo that skips them would silently defeat it. */
 export function pipelineMemoEnabled(): boolean {
-    return !!flags.__d3d9PipelineMemo && !flags.__noD3D9KeyMemo;
+    return flags.__d3d9PipelineMemo !== false && !flags.__noD3D9KeyMemo;
 }
 
 export function pipelineMemoVerifying(): boolean {

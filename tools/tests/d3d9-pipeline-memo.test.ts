@@ -177,7 +177,7 @@ describe("pipeline memo oracle", () => {
     const flags = globalThis as { __d3d9PipelineMemo?: boolean; __noD3D9KeyMemo?: boolean };
 
     beforeEach(() => { d3d9PipelineMemoStats(true); });
-    afterEach(() => { flags.__d3d9PipelineMemo = false; flags.__noD3D9KeyMemo = false; d3d9PipelineMemoStats(true); });
+    afterEach(() => { delete flags.__d3d9PipelineMemo; flags.__noD3D9KeyMemo = false; d3d9PipelineMemoStats(true); });
 
     test("checked:0 reports 'oracle did not run' rather than passing", () => {
         notePipelineMemoHit();
@@ -205,10 +205,11 @@ describe("pipeline memo oracle", () => {
         expect(s.firstMismatch).toBe("bail:rasterStateSupported");
     });
 
-    test("the memo is off by default and __noD3D9KeyMemo overrides it on", () => {
+    test("the memo is on by default and both kill switches override it", () => {
+        expect(pipelineMemoEnabled()).toBe(true);
+        flags.__d3d9PipelineMemo = false;
         expect(pipelineMemoEnabled()).toBe(false);
         flags.__d3d9PipelineMemo = true;
-        expect(pipelineMemoEnabled()).toBe(true);
         flags.__noD3D9KeyMemo = true;
         expect(pipelineMemoEnabled()).toBe(false);
     });
