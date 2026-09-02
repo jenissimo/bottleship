@@ -85,8 +85,11 @@ const flagPairs = (args.flags || "").split(",").filter(Boolean).map(s => {
     const [i, v] = s.split("=");
     return [Number(i), Number(v)];
 });
+// Slot 9 (fastmem reads) is retired in the engine, and it could never have run here anyway:
+// the read shape loads `mem8 + LINEAR address`, which is sound only where VA == PA, and a
+// Linux guest does not identity-map.
 if (flagPairs.some(([i, v]) => i === 9 && v !== 0)) {
-    console.error("nbench boots Linux with non-identity paging; fastmem reads are intentionally unsupported here. Use tools/harness/perf/fastmem-reads-hpcos-ab.harness.ts.");
+    console.error("JIT config slot 9 (fastmem reads) is retired, and nbench boots Linux with non-identity paging.");
     process.exit(2);
 }
 
@@ -130,6 +133,7 @@ const result = {
     label,
     engine: engineRoot,
     flags: Object.fromEntries(flagPairs),
+    jit_config_provenance: null,
     relaxed: args.relaxed !== undefined ? Number(args.relaxed) : null,
     tests_selected: selectedTests || "all",
     node: process.version,
@@ -165,22 +169,42 @@ function applyEngineConfig() {
         exports.set_relaxed_fpu(Number(args.relaxed));
     }
     if (flagPairs.length) {
-        if (!exports?.set_jit_config) { console.error("--flags requested but set_jit_config export missing (stock engine?)"); process.exit(2); }
-        const supportedMask = typeof exports.jit_config_supported_mask === "function"
-            ? exports.jit_config_supported_mask() >>> 0 : null;
+        const setConfig = exports?.["set_jit_config"];
+        const getConfig = exports?.["get_jit_config"];
+        if (typeof setConfig !== "function" || typeof getConfig !== "function") {
+            console.error("--flags requested but set_jit_config/get_jit_config provenance exports are missing");
+            process.exit(2);
+        }
+        const maskGetter = exports?.["jit_config_supported_mask"];
+        const abiGetter = exports?.["jit_config_abi_version"];
+        const supportedMask = typeof maskGetter === "function" ? maskGetter() >>> 0 : null;
+        const abiVersion = typeof abiGetter === "function" ? abiGetter() >>> 0 : null;
+        const readback = {};
         for (const [i, v] of flagPairs) {
             if (supportedMask !== null && (i >= 32 || !(supportedMask & (1 << i)))) {
                 console.error(`JIT config index ${i} is unsupported by mask 0x${supportedMask.toString(16)}`);
                 process.exit(2);
             }
-            const status = exports.set_jit_config(i, v);
+            const status = setConfig(i, v);
             if (supportedMask !== null && status !== 0) {
                 console.error(`set_jit_config(${i}, ${v}) failed with status ${status}`);
                 process.exit(2);
             }
+            const actual = getConfig(i) >>> 0;
+            readback[i] = actual;
+            if (actual !== (v >>> 0)) {
+                console.error(`JIT config provenance mismatch at index ${i}: requested ${v >>> 0}, read back ${actual}`);
+                process.exit(2);
+            }
         }
-        const readback = flagPairs.map(([i]) => `${i}=${exports.get_jit_config ? exports.get_jit_config(i) : "?"}`).join(",");
-        console.error(`[bench] jit flags applied: ${readback}`);
+        result.jit_config_provenance = {
+            verified: true,
+            abiVersion,
+            supportedMask: supportedMask === null ? null : `0x${supportedMask.toString(16).padStart(8, "0")}`,
+            requested: Object.fromEntries(flagPairs),
+            readback,
+        };
+        console.error(`[bench] jit flags verified: ${Object.entries(readback).map(([i, v]) => `${i}=${v}`).join(",")}`);
     }
     if (exports?.get_relaxed_fpu) console.error(`[bench] relaxed_fpu=${exports.get_relaxed_fpu()}`);
 }
@@ -271,25 +295,55 @@ function onLine(l) {
  *
  * A flag readback only proves the flag was set; it does not prove the codegen ever emitted the
  * shape, so an ablation column can otherwise report a confident percentage for a feature that
- * never ran. `speculatedLoadsCompiled == 0` under `fastmemReads: 1` means exactly that.
- *
- * IDENTITY-MAP CAVEAT: the fastmem read shape loads `mem8 + LINEAR address` with no page
- * translation, which is sound only where VA == PA. BottleShip guarantees that; a Linux guest
- * does NOT, and the compile gate only tests protected-mode + PG. So a nonzero count here on a
- * Linux guest means the run executed an UNSOUND configuration and its scores describe nothing.
- * Recorded rather than judged — the summary reader needs to see which of the two it was.
+ * never ran. `tier2Threshold` is read from the engine rather than from `--flags`, because the
+ * engine is the only thing that knows what it ended up running.
  */
 function sampleEngineCounters() {
     const e = emulator?.v86?.cpu?.wm?.exports;
     if (!e) return null;
     const num = (fn) => (typeof e[fn] === "function" ? e[fn]() >>> 0 : null);
+    const getConfig = e["get_jit_config"];
     return {
-        fastmemReadsFlag: null,
-        fastmemReadsStatus: "retired",
-        speculatedLoadsCompiled: num("fastmem_get_speculated_loads_compiled"),
+        tier2Threshold: typeof getConfig === "function" ? getConfig(15) >>> 0 : null,
         speculatedStoresCompiled: num("fastmem_get_speculated_stores_compiled"),
-        readMapPages: num("fastmem_read_map_count"),
+        tier2Promotions: num("jit_get_tier2_promotions"),
+        tier2Pages: num("jit_get_tier2_page_count"),
+        tier2Evictions: num("jit_get_tier2_evictions"),
+        tier2BlockedByCap: num("jit_get_tier2_blocked_by_cap"),
+        tier2PendingDropped: num("jit_get_tier2_pending_dropped"),
     };
+}
+
+/**
+ * Judge — not merely report — what the counters say about the shape that ran.
+ *
+ * The tier-2 threshold is a two-sided claim and both sides can be wrong silently: on, with
+ * nothing promoted, means the column measured TIER-1 code under a tier-2 label; off, with
+ * promotions, means the engine promoted anyway and the "tier-2 off" reference is not one.
+ * Either way the scores describe a different experiment, so the run fails rather than
+ * publishing a number nobody can attribute.
+ * @returns {{id:string, ok:boolean, why:string}[]}
+ */
+function judgeEngineCounters(c) {
+    const out = [];
+    if (!c || c.tier2Threshold === null || c.tier2Promotions === null) {
+        // Stock upstream has neither the config ABI nor tiering, so there is no claim to
+        // check. A FORK run that asked for a shape and cannot report it is a different
+        // matter — applyEngineConfig already refuses that one before the guest boots.
+        out.push({ id: "tier2.observable", ok: flagPairs.length === 0,
+            why: "the engine exposes no get_jit_config/jit_get_tier2_promotions"
+                + (flagPairs.length === 0 ? " — no tier-2 claim to judge (stock upstream)"
+                    : " — this run cannot say which tier it measured") });
+        return out;
+    }
+    if (c.tier2Threshold > 0) {
+        out.push({ id: "tier2.promoted", ok: c.tier2Promotions > 0,
+            why: `threshold ${c.tier2Threshold} with ${c.tier2Promotions} promotions — 0 means TIER-1 code was measured under a tier-2 label` });
+    } else {
+        out.push({ id: "tier2.stayed_off", ok: c.tier2Promotions === 0,
+            why: `threshold 0 with ${c.tier2Promotions} promotions — a promotion with tiering off means this is not the tier-2-off reference it is labelled as` });
+    }
+    return out;
 }
 
 function finish() {
@@ -297,15 +351,16 @@ function finish() {
     result.wall_ms = Date.now() - benchStart;
     result.finished_at = new Date().toISOString();
     result.engine_counters = sampleEngineCounters();
+    result.judgements = judgeEngineCounters(result.engine_counters);
     if (result.engine_counters) {
         const c = result.engine_counters;
-        console.error(`[bench] engine counters: fastmemReads=${c.fastmemReadsStatus} `
-            + `speculatedLoads=${c.speculatedLoadsCompiled} readMapPages=${c.readMapPages}`);
-        if (c.fastmemReadsFlag && c.speculatedLoadsCompiled === 0) {
-            console.error("[bench] WARNING: fastmem reads enabled but ZERO speculated loads compiled — "
-                + "this column measures the flag, not the feature.");
-        }
+        console.error(`[bench] engine counters: tier2Threshold=${c.tier2Threshold} `
+            + `promotions=${c.tier2Promotions} pages=${c.tier2Pages} evictions=${c.tier2Evictions} `
+            + `blocked=${c.tier2BlockedByCap} pendingDropped=${c.tier2PendingDropped} `
+            + `speculatedStores=${c.speculatedStoresCompiled}`);
     }
+    const failed = result.judgements.filter((j) => !j.ok);
+    for (const j of failed) console.error(`[bench] INVALID (${j.id}): ${j.why}`);
     emulator.destroy();
 
     const outPath = path.resolve(args.out ||
@@ -315,7 +370,9 @@ function finish() {
 
     console.error(`\n[bench] done in ${(result.wall_ms / 1000).toFixed(0)}s — ${outPath}`);
     console.log(JSON.stringify(result));
-    process.exit(0);
+    // The JSON is written first: a refused run is evidence, and the exit code is what keeps
+    // bench-matrix from aggregating it into a median.
+    process.exit(failed.length ? 4 : 0);
 }
 
 emulator.add_listener("serial0-output-byte", (byte) => {

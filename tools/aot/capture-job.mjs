@@ -20,6 +20,7 @@ import { buildImage } from "../aot-oracle/corpus/image.mjs";
 import * as L from "../aot-oracle/corpus/layout.mjs";
 import { getCase } from "../aot-oracle/corpus/cases.mjs";
 import { findTlbDataBase, ORACLE_PROBE_PAGES } from "./lib/tlb-base.mjs";
+import { SHIPPING_JIT } from "../jit-config/shipping.mjs";
 
 const __dirname = url.fileURLToPath(new URL(".", import.meta.url));
 const REPO = path.resolve(__dirname, "../..");
@@ -38,7 +39,10 @@ const c = getCase(caseId);
 const warmup = Number(args.warmup || 20000);
 const outPath = path.resolve(args.out || path.join(__dirname, "jobs", `${caseId}.json`));
 
-const JIT_FLAGS = new Map([[5, 1], [10, 0], [11, 1], [12, 1], [13, 1], [19, 0], [21, 0], [15, 300000]]);
+// The same production envelope the oracle arms apply (tools/jit-config/shipping.mjs). A job
+// captured under a different shape than the one that replays it is a job that cannot be
+// replayed — the identity envelope below would refuse it, loudly but pointlessly.
+const JIT_FLAGS = new Map(SHIPPING_JIT);
 // The integrity gate supplies a disposable engine copy. Capture must use that same binary for
 // both its executable bytes and its identity envelope; falling back to the workspace here would
 // create a job whose measured state and claimed engine disagree.

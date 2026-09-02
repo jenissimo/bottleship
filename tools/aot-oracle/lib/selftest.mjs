@@ -183,10 +183,10 @@ export function runSelfTest() {
     // ── validity gates ──────────────────────────────────────────────────────
     const okRun = (over = {}) => ({
         phase_ns: { p1: 1000, p2: 2000 }, ns_per_outer: 100,
-        jit: { tier2Promotions: 3, fastmemLoadsCompiled: 12 },
+        jit: { tier2Promotions: 3, speculatedStoresCompiled: 12 },
         // The shape the arm READ BACK out of the engine; the shape gates compare this with what
         // the command line asked for, and with the other arm's.
-        jit_flags: { 5: 1, 9: 1, 19: 0, 21: 0 }, relaxed_fpu: 1,
+        jit_flags: { 5: 1, 9: 1, 15: 19200000, 19: 0, 21: 0 }, relaxed_fpu: 1,
         // A spilled register file: without one, "registers identical" is two zero blocks.
         regions: [{ name: "STATE", addr: L.STATE, len: L.STATE_LEN, hex: "01000000".repeat(9) }],
         aot: { registered: true, alive: true, entered: true }, ...over,
@@ -257,12 +257,44 @@ export function runSelfTest() {
         if (!gateIds(g).includes("timing_is_a_rate.candidate")) throw new Error(gateIds(g).join(","));
     });
     t("tier2Promotions == 0 fails the gate (tier-1 code was measured)", () => {
-        const g = gatesOf({ refRuns: [okRun({ jit: { tier2Promotions: 0, fastmemLoadsCompiled: 9 } })], candRuns: [okRun()], candClass: "raw", reportsNumber: true });
+        const g = gatesOf({ refRuns: [okRun({ jit: { tier2Promotions: 0, speculatedStoresCompiled: 9 } })], candRuns: [okRun()], candClass: "raw", reportsNumber: true });
         if (!gateIds(g).includes("tier2Promotions.reference")) throw new Error(gateIds(g).join(","));
     });
-    t("fastmemLoadsCompiled == 0 fails the gate (TLB shape, not production)", () => {
-        const g = gatesOf({ refRuns: [okRun({ jit: { tier2Promotions: 2, fastmemLoadsCompiled: 0 } })], candRuns: [okRun()], candClass: "raw", reportsNumber: true });
-        if (!gateIds(g).includes("fastmemLoadsCompiled.reference")) throw new Error(gateIds(g).join(","));
+    // The other direction of the same gate: shipping runs with tiering OFF, so "0 promotions"
+    // is the expected reading there and a promotion is the anomaly.
+    const tier2Off = (over = {}) => okRun({ jit_flags: { 5: 1, 15: 0, 19: 0, 21: 0 }, ...over });
+    t("tier-2 off with 0 promotions passes (the gate is not one-sided)", () => {
+        const run = tier2Off({ jit: { tier2Promotions: 0, speculatedStoresCompiled: 12 } });
+        const g = gatesOf({ refRuns: [run], candRuns: [run], candClass: "raw", reportsNumber: true });
+        eq(gateIds(g).length, 0, "failed gates");
+    });
+    t("tier-2 off with promotions > 0 fails the gate (not the tier-1 reference it claims)", () => {
+        const g = gatesOf({ refRuns: [tier2Off({ jit: { tier2Promotions: 4, speculatedStoresCompiled: 12 } })],
+            candRuns: [okRun()], candClass: "raw", reportsNumber: true });
+        if (!gateIds(g).includes("tier2Promotions.reference")) throw new Error(gateIds(g).join(","));
+    });
+    t("a rep with no tier-2 reading fails the gate rather than reading as 0 under threshold 0", () => {
+        for (const bad of [okRun({ jit: { error: "jitFacts threw", tier2Promotions: null } }),
+            okRun({ jit_flags: undefined })]) {
+            const g = gatesOf({ refRuns: [bad], candRuns: [okRun()], candClass: "raw", reportsNumber: true });
+            if (!gateIds(g).includes("tier2Promotions.reference")) throw new Error(gateIds(g).join(","));
+        }
+    });
+    t("one rep with tiering off does not disarm the gate for the others", () => {
+        const g = gatesOf({
+            refRuns: [okRun({ jit: { tier2Promotions: 0, speculatedStoresCompiled: 12 } }),
+                tier2Off({ jit: { tier2Promotions: 0, speculatedStoresCompiled: 12 } })],
+            candRuns: [okRun(), okRun()], candClass: "raw", reportsNumber: true,
+        });
+        if (!gateIds(g).includes("tier2Promotions.reference")) throw new Error(gateIds(g).join(","));
+        const v = g.gates.find((x) => x.id === "tier2Promotions.reference").value;
+        eq(v[0].threshold, 19200000, "rep 0 threshold");
+        return JSON.stringify(v);
+    });
+    t("a zero fastmem store count is NOT a gate failure (writes are off in shipping)", () => {
+        const g = gatesOf({ refRuns: [okRun({ jit: { tier2Promotions: 2, speculatedStoresCompiled: 0 } })],
+            candRuns: [okRun()], candClass: "raw", reportsNumber: true });
+        eq(gateIds(g).length, 0, "failed gates");
     });
     t("spread > 10% over reps fails the gate", () => {
         const g = gatesOf({ refRuns: [okRun(), okRun({ ns_per_outer: 130 })], candRuns: [okRun(), okRun()], candClass: "raw", reportsNumber: true });
@@ -294,7 +326,10 @@ export function runSelfTest() {
 
     // ── codegen shape (design F-d: an ablation that silently ran the default) ─
     t("a shape override the engine honoured passes", () => {
-        const ablated = okRun({ jit_flags: { 5: 0, 9: 1, 19: 0, 21: 0 } });
+        // The fixture states tiering off, so its promotion count must say so too — the tier-2
+        // gate reads both halves and a fixture that disagrees with itself is not a clean run.
+        const ablated = okRun({ jit_flags: { 5: 0, 15: 0, 19: 0, 21: 0 },
+            jit: { tier2Promotions: 0, speculatedStoresCompiled: 12 } });
         const g = gatesOf({ refRuns: [ablated], candRuns: [ablated], candClass: "unit",
             reportsNumber: true, requestedFlags: { 5: 0 } });
         eq(gateIds(g).length, 0, "failed gates");

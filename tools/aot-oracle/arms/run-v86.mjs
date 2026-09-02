@@ -26,6 +26,7 @@ import { getCase } from "../corpus/cases.mjs";
 import { readV86State } from "../lib/state.mjs";
 import { parseArgs, parseFlagOverrides, usageExit } from "../lib/args.mjs";
 import { findTlbDataBase, ORACLE_PROBE_PAGES } from "../../aot/lib/tlb-base.mjs";
+import { SHIPPING_JIT } from "../../jit-config/shipping.mjs";
 
 const __dirname = url.fileURLToPath(new URL(".", import.meta.url));
 const REPO = path.resolve(__dirname, "../../..");
@@ -44,13 +45,16 @@ const n2 = n1 * 2;
 const timeoutMs = Number(args.timeout || 600000);
 if (n1 < 1 || warmup < 1) { console.error("--outer/--warmup must be >= 1"); process.exit(2); }
 
-// BottleShip production codegen configuration (preemption-manager.ts defaults). `--flags
-// "10=0,5=0"` overrides individual entries; `--relaxed 0` switches x87 to strict F80. These
-// values are applied before capture; Rust exports the authoritative identity of their codegen
-// effect, which is what capture/replay compare.
-const JIT_FLAGS = new Map([
-    [5, 1], [10, 0], [11, 1], [12, 1], [13, 1], [19, 0], [21, 0], [15, 300000],
-]);
+// BottleShip's production codegen configuration, from the ONE list every offline tool shares
+// (tools/jit-config/shipping.mjs), so the arms measure the shape production runs. The WHOLE
+// envelope is applied, not just the indices PreemptionManager overrides, so a reused engine
+// cannot leak a diagnostic value into an arm.
+//
+// Tier-2 is intentionally OFF in shipping; pass `--flags "15=19200000"` for the separate
+// experimental tiering oracle. `--flags "10=0,5=0"` overrides individual entries; `--relaxed 0`
+// switches x87 to strict F80. These values are applied before capture; Rust exports the
+// authoritative identity of their codegen effect, which is what capture/replay compare.
+const JIT_FLAGS = new Map(SHIPPING_JIT);
 let FLAG_OVERRIDES;
 try { FLAG_OVERRIDES = parseFlagOverrides(args.flags); } catch (e) { usageExit(e); }
 for (const [i, v] of FLAG_OVERRIDES) JIT_FLAGS.set(i, v);
@@ -114,8 +118,8 @@ function jitIdentity(ex) {
         }
     }
     const abi = ex.jit_config_abi_version() >>> 0;
-    if (abi !== 1) {
-        console.error(`unsupported JIT config ABI ${abi}; expected 1`);
+    if (abi !== 4) {
+        console.error(`unsupported JIT config ABI ${abi}; expected 4`);
         process.exit(2);
     }
     return {
@@ -198,7 +202,7 @@ function applyShape(ex) {
 
 function jitFacts(cpu) {
     const ex = cpu.wm.exports;
-    const out = { pages: [], tier2Promotions: null, tier2Pages: null, fastmemLoadsCompiled: null };
+    const out = { pages: [], tier2Promotions: null, tier2Pages: null, speculatedStoresCompiled: null };
     try {
         const n = ex.jit_snapshot_cache();
         for (let i = 0; i < n; i++) {
@@ -209,9 +213,8 @@ function jitFacts(cpu) {
         }
         out.tier2Promotions = ex.jit_get_tier2_promotions ? ex.jit_get_tier2_promotions() : null;
         out.tier2Pages = ex.jit_get_tier2_page_count ? ex.jit_get_tier2_page_count() : null;
-        out.fastmemLoadsCompiled = ex.fastmem_get_speculated_loads_compiled
-            ? ex.fastmem_get_speculated_loads_compiled() : null;
-        out.fastmemReadMapPages = ex.fastmem_read_map_count ? ex.fastmem_read_map_count() : null;
+        out.speculatedStoresCompiled = ex.fastmem_get_speculated_stores_compiled
+            ? ex.fastmem_get_speculated_stores_compiled() : null;
     } catch (e) { out.error = String(e); }
     return out;
 }

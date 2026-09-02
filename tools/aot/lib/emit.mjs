@@ -110,6 +110,12 @@ class Emitter {
         mb.op(OP.I32ADD);
         mb.store(OP.I32STORE, ALIGN.B4, 0);
     }
+    /** Relocatable AOT units have no baked wasm-table slot. Credit the instance-lifetime
+     * retired denominator; runtime promotion remains unnecessary because this code is AOT. */
+    noteRetired() {
+        this.mb.getLocal(this.instrCounter);
+        this.mb.call("jit_tier2_note_aot_retired", "i_v");
+    }
 
     /**
      * jit.rs:3377-3389 (module top) and jit.rs:4137-4149 (single-entry loop head), both under
@@ -1690,11 +1696,13 @@ export function compileUnit(job) {
     E.flush();
     mb.call("trigger_fault_end_jit", "v_v");
     E.updateCounter();
+    E.noteRetired();
     mb.return_();
     mb.end();                                       // L_EXIT
     // exit epilogue (contract N16a)
     E.flush();
     E.updateCounter();
+    E.noteRetired();
 
     const built = mb.finish();
     return {

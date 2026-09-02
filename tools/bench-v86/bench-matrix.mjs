@@ -13,36 +13,46 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import url from "node:url";
+import {
+    SHIPPING_JIT, SUPPORTED_INDICES, REFERENCE_ALL_OFF, MIN_VALID, minValid,
+    formatFlags, parseFlags, shippingWith, referenceWith,
+} from "../jit-config/shipping.mjs";
 
 const __dirname = url.fileURLToPath(new URL(".", import.meta.url));
 const REPO = path.resolve(__dirname, "../..");
 
-// Supported production JIT indices only (vendor/v86 src/rust/jit.rs). Retired 4/9/18 must never
-// return here. This is the one shipping baseline: it mirrors PreemptionManager defaults, including
-// x87 locals OFF and branch-hint group 0 ON. `relaxed: 1` is explicit shipping policy too.
-const SHIPPING_JIT = new Map([
-    [5, 1], [10, 0], [11, 1], [12, 1], [13, 1], [15, 300000], [17, 8], [19, 0], [21, 0], [22, 1],
-]);
-const formatFlags = (flags) => [...flags.entries()].map(([index, value]) => `${index}=${value}`).join(",");
-const withShippingChange = (index, value) => {
-    const flags = new Map(SHIPPING_JIT);
-    flags.set(index, value);
-    return formatFlags(flags);
-};
+// The production envelope, the all-off reference and the minima all come from
+// tools/jit-config/shipping.mjs — the same list the AOT oracle arms and the AOT capture job
+// apply.
 const SHIPPING_FLAGS = formatFlags(SHIPPING_JIT);
-const REFERENCE_ALL_OFF = formatFlags(new Map([...SHIPPING_JIT.keys()].map(index => [index, 0])));
-const LOSSLESS = withShippingChange(15, 0);
-const OFF_ALL = REFERENCE_ALL_OFF; // legacy reference-ablation input, never a marginal baseline
+const REFERENCE_FLAGS = formatFlags(REFERENCE_ALL_OFF);
+const ship = (index) => SHIPPING_JIT.get(index);
 
 const FORK = path.resolve(process.env.V86_ENGINE_DIR || path.join(REPO, "vendor/v86"));
 const STOCK = path.join(__dirname, "engines/stock");
 
 const shippingMinus = (feature, index, value = 0) => ({
     engine: FORK,
-    flags: withShippingChange(index, value),
+    flags: formatFlags(shippingWith([index, value])),
     relaxed: 1,
     role: `shipping-minus-one: ${feature}`,
     marginal: { feature, index, value },
+});
+
+/**
+ * A reference add-one arm: the all-off reference plus the named feature.
+ *
+ * Every change is given explicitly, INCLUDING the feature's own budget indices at their
+ * shipping value. The reference floors a budget at the smallest value the engine can work
+ * with, and a feature switched on over a floored budget measures the flag rather than the
+ * feature — tier-2 with a one-page module cap was exactly that.
+ */
+const addOne = (feature, ...changes) => ({
+    engine: FORK,
+    flags: formatFlags(referenceWith(...changes)),
+    relaxed: 1,
+    role: `reference add-one (non-marginal): ${feature}`,
+    reference: true,
 });
 
 const CONFIGS = {
@@ -63,67 +73,125 @@ const CONFIGS = {
     "fork-wasmopt":   { engine: path.join(__dirname, "engines/fork-wasmopt") },
     "fork-tscfix-relaxed": { engine: path.join(__dirname, "engines/fork-tscfix"), relaxed: 1 },
     // Exact current BottleShip defaults; this is the only baseline for keep/drop percentage.
-    "shipping": { engine: FORK, flags: SHIPPING_FLAGS, relaxed: 1, role: "shipping baseline" },
-    // Diagnostic/reference only: all production-controlled JIT features off, but the shipping
-    // relaxed-FPU policy remains on. It is never a marginal comparison.
-    "reference-all-off": { engine: FORK, flags: REFERENCE_ALL_OFF, relaxed: 1, role: "reference all-off (non-marginal)" },
-    // Compatibility aliases retain existing CLI selections but carry the same reference semantics.
-    "fork-off": { engine: FORK, flags: REFERENCE_ALL_OFF, relaxed: 1, role: "reference all-off (non-marginal; legacy alias)" },
-    "fork-lossless": { engine: FORK, flags: LOSSLESS, relaxed: 0, role: "strict-FPU/tier-2-off reference (non-marginal)" },
-    "fork-prod-lossless": { engine: FORK, flags: SHIPPING_FLAGS, relaxed: 0, role: "strict-FPU shipping-JIT reference (non-marginal)" },
+    "shipping": { engine: FORK, flags: SHIPPING_FLAGS, relaxed: 1, role: "shipping baseline", reference: true },
+    // Diagnostic/reference only: all production-controlled JIT features off (each at the
+    // smallest value the engine still works at — see MIN_VALID), but the shipping relaxed-FPU
+    // policy remains on. It is never a marginal comparison.
+    "reference-all-off": { engine: FORK, flags: REFERENCE_FLAGS, relaxed: 1, role: "reference all-off (non-marginal)", reference: true },
+    // Compatibility aliases retain existing CLI selections. An alias is asserted to be the
+    // SAME command line as its target, so it can never quietly become a second data point.
+    "fork-off": { engine: FORK, flags: REFERENCE_FLAGS, relaxed: 1, role: "reference all-off (legacy alias)", reference: true, aliasOf: "reference-all-off" },
+    "fork-prod-lossless": { engine: FORK, flags: SHIPPING_FLAGS, relaxed: 0, role: "strict-FPU shipping-JIT reference (non-marginal)", reference: true },
+    "fork-lossless": { engine: FORK, flags: SHIPPING_FLAGS, relaxed: 0, role: "strict-FPU reference (legacy alias)", reference: true, aliasOf: "fork-prod-lossless" },
     // True marginal contours: each differs from `shipping` in exactly one active supported JIT
     // feature. All other production values, including x87Locals=0 and relaxed FPU, stay fixed.
     "shipping-minus-deadflag": shippingMinus("dead-flag elision", 5),
     "shipping-minus-pushrun": shippingMinus("push-run coalescing", 11),
     "shipping-minus-retchain": shippingMinus("RET dynamic chaining", 12),
     "shipping-minus-retspec": shippingMinus("RET-target speculation", 13),
-    "shipping-minus-tier2": shippingMinus("tier-2 hotness", 15),
-    "shipping-minus-tier2-page-cap": shippingMinus("tier-2 page cap", 17),
+    "shipping-plus-tier2": { engine: FORK, flags: formatFlags(shippingWith([15, 19200000])), relaxed: 1,
+        role: "shipping-plus-one: experimental tier-2", marginal: { feature: "tier-2 hotness", index: 15, value: 19200000 } },
+    // Tier-2 is off in shipping, so this arm changes a budget nothing reads. Kept as a
+    // marginal arm because that is what it structurally is (one index away from shipping),
+    // and the role says what to expect from it.
+    "shipping-minus-tier2-page-cap": {
+        ...shippingMinus("tier-2 page cap", 17, minValid(17)),
+        role: "shipping-minus-one: tier-2 page cap (inert while tier-2 is off)",
+    },
     "shipping-minus-branch-hints": shippingMinus("wasm branch-hint group 0", 22),
-    // ── reference-only add-one probes (not marginal) ───────────────────────
-    // Legacy add-one-to-all-off reference probes. They are retained for compatibility and
-    // diagnostics only; unlike `shipping-minus-*`, none is a marginal keep/drop measurement.
-    // ── per-flag ablation: add ONE feature to fork-off ──────────────────────
-    "abl-deadflag":   { engine: FORK, flags: OFF_ALL.replace("5=0", "5=1"), relaxed: 1, role: "reference add-one (non-marginal): dead-flag" },
-    "abl-x87locals":  { engine: FORK, flags: OFF_ALL.replace("10=0", "10=1"), relaxed: 1, role: "reference add-one (non-marginal): x87 locals" },
-    "abl-pushrun":    { engine: FORK, flags: OFF_ALL.replace("11=0", "11=1"), relaxed: 1, role: "reference add-one (non-marginal): push-run" },
-    "abl-retchain":   { engine: FORK, flags: OFF_ALL.replace("12=0", "12=1"), relaxed: 1, role: "reference add-one (non-marginal): RET chaining" },
-    "abl-retspec":    { engine: FORK, flags: OFF_ALL.replace("12=0", "12=1").replace("13=0", "13=1"), relaxed: 1, role: "reference add-one (non-marginal): RET chain/spec" },
-    // OFF-in-BottleShip features — different workload may disagree with our games verdict:
-    "abl-fastmem-w":  { engine: FORK, flags: OFF_ALL.replace("19=0", "19=1"), relaxed: 1, role: "reference add-one (non-marginal): fastmem writes" },
-    "abl-flaglocals": { engine: FORK, flags: OFF_ALL.replace("21=0", "21=1"), relaxed: 1, role: "reference add-one (non-marginal): flag locals" },
-    "abl-tier2":      { engine: FORK, flags: OFF_ALL.replace("15=0", "15=300000"), relaxed: 1, role: "reference add-one (non-marginal): tier-2" },
-    "abl-indirect":   { engine: FORK, flags: OFF_ALL + ",6=1", relaxed: 1, role: "reference add-one (non-marginal): indirect regions" },
+    "shipping-minus-x87-pc-local": shippingMinus("x87 precision-control local", 31),
+    // ── per-flag ablation: add ONE feature to the all-off reference ─────────
+    // Reference probes only. Unlike `shipping-minus-*`, none is a marginal keep/drop
+    // measurement: they answer "what does this feature do on its own", which a different
+    // workload may answer differently from our games.
+    "abl-deadflag":   addOne("dead-flag", [5, ship(5)]),
+    "abl-x87locals":  addOne("x87 locals", [10, 1]),
+    "abl-pushrun":    addOne("push-run", [11, ship(11)]),
+    "abl-retchain":   addOne("RET chaining", [12, ship(12)]),
+    "abl-retspec":    addOne("RET chain/spec", [12, ship(12)], [13, ship(13)], [14, ship(14)]),
+    // OFF-in-BottleShip features — a different workload may disagree with our games verdict:
+    "abl-fastmem-w":  addOne("fastmem writes", [19, 1]),
+    "abl-flaglocals": addOne("flag locals", [21, 1]),
+    "abl-tier2":      addOne("tier-2", [15, 19200000], [17, ship(17)]),
+    "abl-indirect":   addOne("indirect regions", [6, 1], [7, ship(7)], [8, ship(8)]),
     // the whole superblock family together (RET chain+spec, tier-2, indirect regions)
-    "abl-superblock": { engine: FORK, flags: OFF_ALL.replace("12=0", "12=1").replace("13=0", "13=1").replace("15=0", "15=300000") + ",6=1", relaxed: 1, role: "reference add-many (non-marginal): superblock family" },
+    "abl-superblock": {
+        ...addOne("superblock family", [12, ship(12)], [13, ship(13)], [14, ship(14)],
+            [15, 19200000], [16, ship(16)], [17, ship(17)], [6, 1], [7, ship(7)], [8, ship(8)]),
+        role: "reference add-many (non-marginal): superblock family",
+    },
     // ── track 2 flavor (accuracy tradeoff, NOT for the upstream comparison) ─
-    "fork-relaxed":   { engine: FORK, flags: LOSSLESS, relaxed: 1 },
+    "fork-relaxed":   { engine: FORK, flags: SHIPPING_FLAGS, relaxed: 1, role: "shipping baseline (legacy alias)", reference: true, aliasOf: "shipping" },
 };
 
 const DEFAULT_CONFIGS = [
     "stock", "shipping",
     "shipping-minus-deadflag", "shipping-minus-pushrun", "shipping-minus-retchain",
-    "shipping-minus-retspec", "shipping-minus-tier2", "shipping-minus-tier2-page-cap",
+    "shipping-minus-retspec", "shipping-plus-tier2",
     "shipping-minus-branch-hints",
+    "shipping-minus-x87-pc-local",
     "reference-all-off",
 ].join(",");
 
-const parseFlags = (text) => new Map(String(text || "").split(",").filter(Boolean).map(pair => {
-    const [index, value] = pair.split("=").map(Number);
-    return [index, value];
-}));
+/** The whole command line an arm runs, so two arms that differ in nothing are detectable. */
+const armIdentity = (cfg) => `${cfg.engine}|${cfg.flags ?? "-"}|${cfg.relaxed ?? "-"}`;
 
-// Fail at matrix construction time if someone accidentally turns a marginal arm back into an
-// add-one/all-off experiment, changes x87Locals, or slips an unsupported/retired index into it.
-for (const [name, cfg] of Object.entries(CONFIGS)) {
-    if (!cfg.marginal) continue;
-    const arm = parseFlags(cfg.flags);
-    const changed = [...SHIPPING_JIT.keys()].filter(index => arm.get(index) !== SHIPPING_JIT.get(index));
-    if (cfg.relaxed !== 1 || arm.size !== SHIPPING_JIT.size || changed.length !== 1
-        || changed[0] !== cfg.marginal.index || arm.get(changed[0]) !== cfg.marginal.value) {
-        throw new Error(`${name} is not a one-feature shipping-minus arm`);
+function validateMatrixConfigs() {
+    const shippingIndices = [...SHIPPING_JIT.keys()];
+    if (shippingIndices.length !== SUPPORTED_INDICES.length
+        || shippingIndices.some((index, i) => index !== SUPPORTED_INDICES[i])) {
+        throw new Error(`shipping JIT envelope does not match supported ABI indices: ${shippingIndices.join(",")}`);
     }
+    for (const [index, value] of REFERENCE_ALL_OFF) {
+        if (value < minValid(index)) throw new Error(`all-off reference index ${index}=${value} is below the engine minimum ${minValid(index)}`);
+    }
+    const checked = [];
+    for (const [name, cfg] of Object.entries(CONFIGS)) {
+        if (!cfg.flags) {
+            // An engine comparison carries no flag envelope, so it cannot be marginal in one.
+            if (cfg.marginal) throw new Error(`${name} declares a marginal feature but sets no flags`);
+            continue;
+        }
+        if (cfg.reference) {
+            if (cfg.marginal) throw new Error(`${name} is declared both reference and marginal`);
+            continue;
+        }
+        // Prove each marginal command line differs from the shipping command line in exactly
+        // the declared feature. An arm that declares nothing is refused rather than skipped:
+        // an arm this check cannot see is an inert arm in a benchmark run.
+        if (!cfg.marginal) {
+            throw new Error(`${name} sets JIT flags but declares neither \`marginal\` (a keep/drop arm) `
+                + "nor `reference: true` (a diagnostic) — an undeclared arm is not checked against shipping");
+        }
+        const arm = parseFlags(cfg.flags);
+        const changed = shippingIndices.filter(index => arm.get(index) !== SHIPPING_JIT.get(index));
+        if (cfg.relaxed !== 1 || arm.size !== SHIPPING_JIT.size || changed.length !== 1
+            || changed[0] !== cfg.marginal.index || arm.get(changed[0]) !== cfg.marginal.value) {
+            throw new Error(`${name} does not change exactly one declared shipping feature`);
+        }
+        checked.push({ name, index: changed[0], from: SHIPPING_JIT.get(changed[0]), to: arm.get(changed[0]) });
+    }
+    // Two arms with the same engine, flags and FPU policy are ONE data point wearing two
+    // names; averaging them reads as agreement between independent runs. An alias must say
+    // so, and is then asserted to be exactly what it claims to alias.
+    const byIdentity = new Map();
+    for (const [name, cfg] of Object.entries(CONFIGS)) {
+        if (cfg.aliasOf) {
+            const target = CONFIGS[cfg.aliasOf];
+            if (!target) throw new Error(`${name} aliases unknown config ${cfg.aliasOf}`);
+            if (armIdentity(cfg) !== armIdentity(target)) {
+                throw new Error(`${name} claims to alias ${cfg.aliasOf} but runs a different command line`);
+            }
+            continue;
+        }
+        const id = armIdentity(cfg);
+        const first = byIdentity.get(id);
+        if (first) throw new Error(`${name} and ${first} run identical command lines — declare one as \`aliasOf\` or delete it`);
+        byIdentity.set(id, name);
+    }
+    return checked;
 }
+const MARGINAL_SELF_TEST = validateMatrixConfigs();
 
 const args = {};
 for (let i = 2; i < process.argv.length; i++) {
@@ -136,8 +204,18 @@ for (let i = 2; i < process.argv.length; i++) {
 
 const runs = Number(args.runs) || 3;
 if (args.help) {
-    console.log("usage: node bench-matrix.mjs [--runs N] [--configs names] [--tests names] [--timeout seconds] [--dry|--list]");
+    console.log("usage: node bench-matrix.mjs [--runs N] [--configs names] [--tests names] [--timeout seconds] [--dry|--list|--self-test]");
     console.log(`default configs: ${DEFAULT_CONFIGS}`);
+    process.exit(0);
+}
+if (args["self-test"]) {
+    console.log(JSON.stringify({
+        ok: true,
+        shippingIndices: [...SHIPPING_JIT.keys()],
+        referenceMinima: Object.fromEntries(MIN_VALID),
+        aliases: Object.fromEntries(Object.entries(CONFIGS).filter(([, c]) => c.aliasOf).map(([n, c]) => [n, c.aliasOf])),
+        marginalArms: MARGINAL_SELF_TEST,
+    }));
     process.exit(0);
 }
 const names = (args.configs || DEFAULT_CONFIGS).split(",").map(s => s.trim());
@@ -147,7 +225,8 @@ if (args.list) {
     for (const name of names) {
         const cfg = CONFIGS[name];
         console.log(JSON.stringify({ name, role: cfg.role ?? "engine comparison", flags: cfg.flags ?? null,
-            relaxed: cfg.relaxed ?? null, marginal: cfg.marginal ?? null }));
+            relaxed: cfg.relaxed ?? null, marginal: cfg.marginal ?? null,
+            reference: cfg.reference ?? false, aliasOf: cfg.aliasOf ?? null }));
     }
     process.exit(0);
 }
@@ -234,6 +313,9 @@ for (const key of ["int_index", "fp_index"]) {
     md += `| **${key}** | ${row.join(" | ")} |\n`;
 }
 md += `| clock ratio | ${names.map(n => agg[n].clock?.toFixed(4) ?? "—").join(" | ")} |\n`;
+// A refused or failed run is dropped from the medians above; the count is the only thing
+// that distinguishes a one-survivor "median" from a real one.
+md += `| valid runs | ${names.map(n => agg[n].n < runs ? `**${agg[n].n}/${runs}**` : `${agg[n].n}/${runs}`).join(" | ")} |\n`;
 
 fs.writeFileSync(path.join(outDir, "summary.md"), md);
 console.log("\n" + md);

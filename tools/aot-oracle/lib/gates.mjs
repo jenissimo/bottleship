@@ -12,7 +12,7 @@
 //                  running the code, so the arms are the SAME implementation and identical
 //                  output means nothing. Enforced ALWAYS, including in --check: otherwise a
 //                  refused unit reports CORRECT off a JIT-vs-JIT comparison.
-//   measurement  — "is the ratio believable?" (steady state, spread, tier-2, fastmem). These
+//   measurement  — "is the ratio believable?" (steady state, spread, tier-2). These
 //                  are reported always and enforced only when a number is being claimed.
 
 /** phase2/phase1 wall ratio must sit near 2.0, or the slope is junk. */
@@ -217,12 +217,28 @@ export function evaluateGates({ refRuns, candRuns, candClass, reportsNumber, com
     // The JIT-side gates have a subject only on the reference arm (a raw candidate compiles
     // nothing). Both are about WHAT was measured on the reference side, so they gate the
     // ratio regardless of the candidate class.
-    const t2 = refRuns.map((r) => r.jit?.tier2Promotions ?? 0);
-    add("tier2Promotions.reference", "measurement", t2.every((n) => n > 0), t2,
-        "0 ⇒ the reference was measured as TIER-1 code; production hot pages reach tier-2");
-    const fm = refRuns.map((r) => r.jit?.fastmemLoadsCompiled ?? 0);
-    add("fastmemLoadsCompiled.reference", "measurement", fm.every((n) => n > 0), fm,
-        "0 ⇒ paging/RAM setup broke and the reference ran the TLB shape, not production's fastmem");
+    // Per REP, and symmetric: tiering-on with no promotion and tiering-off with a promotion
+    // both mean the reference is not the tier-1 reference it is labelled as, which
+    // invalidates the ratio. A rep whose reading is absent (no jit_flags, jitFacts threw)
+    // is unobservable and fails, not "0 under threshold 0".
+    const tier2 = refRuns.map((r, rep) => {
+        const flag = r.jit_flags?.[15] ?? r.jit_flags?.["15"];
+        const promotions = r.jit?.tier2Promotions;
+        return {
+            rep,
+            threshold: flag == null ? null : Number(flag),
+            promotions: promotions == null ? null : Number(promotions),
+        };
+    });
+    const tier2Bad = tier2.filter((x) => x.threshold == null || x.promotions == null
+        || (x.threshold > 0 ? x.promotions <= 0 : x.promotions !== 0));
+    add("tier2Promotions.reference", "measurement", tier2Bad.length === 0, tier2,
+        "flag 15 nonzero with 0 promotions ⇒ the reference was measured as TIER-1 code; flag 15 zero "
+        + "with promotions ⇒ the engine tiered anyway and this is not the tier-1 reference it is labelled as");
+    // There is no fastmem gate: read-side fastmem is retired from the engine, so production
+    // runs the TLB shape and a "did the fastmem shape compile" condition has no subject. The
+    // store-side count still rides along in each run's `jit` facts, ungated — fastmem writes
+    // are off in shipping, so zero is the expected reading there.
 
     const failed = gates.filter((g) => !g.ok);
     return {

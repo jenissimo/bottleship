@@ -113,8 +113,7 @@ never as a number.** Gates come in two classes and the difference is not cosmeti
 | `timing_is_a_rate.{reference,candidate}` | measurement | when a number is claimed | a phase wall time or `ns_per_outer` came back zero, negative or non-finite ⇒ the two-point slope is not a rate. Observed on `k6`: `ref -857 ns/outer`, i.e. phase 2 (twice the work) cost *less* than phase 1. That condition also fails `steady_state` arithmetically, so this gate adds no coverage — it adds the **statement**, and the right diagnosis: `steady_state`'s "raise `--warmup`" is the wrong remedy for a timer that went backwards |
 | `steady_state.{reference,candidate}` | measurement | when a number is claimed | phase2/phase1 outside 1.8–2.25 ⇒ still tiering/compiling; raise `--warmup` / `--warmup-calls` |
 | `spread_pct.{reference,candidate}` | measurement | when a number is claimed | median-relative spread over reps > 10% ⇒ noisy machine |
-| `tier2Promotions.reference` | measurement | when a number is claimed | 0 ⇒ the reference was measured as **tier-1** code |
-| `fastmemLoadsCompiled.reference` | measurement | when a number is claimed | 0 ⇒ paging/RAM setup broke and the reference ran the TLB shape, not production's fastmem |
+| `tier2Promotions` | measurement | when a number is claimed | per rep, both directions: threshold > 0 with 0 promotions ⇒ measured as **tier-1** code; threshold 0 with promotions > 0 ⇒ the arm ran a shape its flags do not describe |
 
 `evaluateGates()` **refuses to assemble a gate list without the comparator's result** — a caller
 that forgot to pass it would otherwise get an all-green list for a divergent run, which is the
@@ -156,7 +155,7 @@ JIT config ABI/mask/fingerprint, or exact slot before it stages any unit.
 ```json
 { "case": "k1", "engine_sha256": "...",
   "jit_identity": { "aot_abi": 5, "engine_sha256": "...", "ram_size": 16777216,
-                    "abi": 1, "supported_mask": 0, "fingerprint_lo": 0, "fingerprint_hi": 0 },
+                    "abi": 4, "supported_mask": 0, "fingerprint_lo": 0, "fingerprint_hi": 0 },
   "units": [{ "entryPage": 257, "tableIndex": 899, "file": "k1-unit.0.wasm",
               "pages": [{ "physPage": 257, "stateFlags": 5,
                           "entries": [[offset, initial_state], ...],
@@ -278,10 +277,10 @@ at all on the five hot pages. A retail corpus therefore cannot cover a slice.
   DIVERGENT k3 run published `gates_failed: ["steady_state.reference","tier2Promotions.reference"]`
   — a script gating on that array saw only warm-up noise. `output_identical` is now a differential
   gate, and `evaluateGates()` refuses a gate list assembled without the comparator's result.
-- **A registered AOT unit is evicted at the first tier-2 promotion** — `entries: 339718`, then
-  `ownsPage: true` / `sameFn: false`. Live confirmation of handoff §2.1(3) and of design §6
-  prerequisite 1 (`jit_aot_mark_tier2`): **until that lands, every steady-state AOT number
-  measures a corpse**, and this oracle refuses to print one.
+- **A registered AOT unit used to be evicted at the first tier-2 promotion** — `entries: 339718`,
+  then `ownsPage: true` / `sameFn: false`. Transaction begin now reserves capacity for the whole
+  unit and commit atomically marks its pages active without fallible allocation; the steady-state
+  gates still refuse any run in which ownership/function identity is lost.
 - **`oracle.mjs` accepted `--flags` and dropped it** (design F-d): `--flags "5=0"` ran with dead
   flag elision still ON in both arms and the report said `CORRECT`, with nothing in the JSON
   recording which shape had actually run. Closed by forwarding the shape, by the arms' readback

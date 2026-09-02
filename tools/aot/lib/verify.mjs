@@ -240,6 +240,7 @@ export function verifyUnit(bytes, unit, opts) {
     // targeting the outermost two blocks, plus every `return`.
     {
         const offenders = [];
+        const retiredIdx = fnImports.findIndex((i) => i.name === "jit_tier2_note_aot_retired");
         for (let i = 0; i < body.length; i++) {
             const x = body[i];
             const leaves =
@@ -248,9 +249,15 @@ export function verifyUnit(bytes, unit, opts) {
                 (x.op === OP_BR_TABLE && x.imm.some((t) => t === x.depth - 1));
             if (!leaves) continue;
             if (x.op === OP_RETURN) {
-                // a `return` must be preceded by flush + counter fold
+                // A return follows flush + counter fold and, in ABI 3, the accounting call.
                 const prev = body[i - 1];
-                if (!prev || prev.op !== OP_I32STORE || !counterFolds.some((k) => body[k + 5].offset === prev.offset)) {
+                const foldImmediatelyBefore = prev?.op === OP_I32STORE
+                    && counterFolds.some((k) => body[k + 5].offset === prev.offset);
+                const accountedAfterFold = prev?.op === OP_CALL && prev.imm === retiredIdx
+                    && body[i - 2]?.op === OP_LOCAL_GET && body[i - 2]?.imm === counterLocal
+                    && body[i - 3]?.op === OP_I32STORE
+                    && counterFolds.some((k) => body[k + 5].offset === body[i - 3].offset);
+                if (!foldImmediatelyBefore && !accountedAfterFold) {
                     offenders.push({ at: x.offset, why: "return without a counter fold" });
                 }
             }
@@ -267,7 +274,7 @@ export function verifyUnit(bytes, unit, opts) {
             const at = body.findIndex((x) => x.offset === calls[0].offset);
             const before = body[at - 1];
             check("B4b", flushEnds.has(before?.offset), "the fault epilogue flushes before trigger_fault_end_jit");
-            const after = body.slice(at + 1, at + 8).map((x) => x.op);
+            const after = body.slice(at + 1, at + 12).map((x) => x.op);
             check("B4c", after.includes(OP_RETURN), "the fault epilogue returns");
         }
     }
@@ -316,6 +323,13 @@ export function verifyUnit(bytes, unit, opts) {
     // C2: the exit epilogue folds the counter
     check("C2", counterFolds.length >= 2,
         `${counterFolds.length} instruction-counter folds (exit + fault epilogues)`);
+    {
+        const idx = fnImports.findIndex((i) => i.name === "jit_tier2_note_aot_retired");
+        const calls = body.map((x, i) => [x, i]).filter(([x]) => x.op === OP_CALL && x.imm === idx);
+        const badArgs = calls.filter(([, i]) => body[i - 1]?.op !== OP_LOCAL_GET || body[i - 1]?.imm !== counterLocal);
+        check("C2b", idx >= 0 && calls.length === 2 && badArgs.length === 0,
+            `${calls.length} retired-accounting calls (exit + fault), both fed by the instruction-counter local`);
+    }
     check("C1", flushEnds.size >= 2, `${flushEnds.size} register flushes (exit + fault epilogues)`);
 
     // C3 / N28-N30 / design H4a: the counter is credited on EVERY path out, and no path can

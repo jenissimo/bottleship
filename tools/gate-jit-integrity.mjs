@@ -62,7 +62,7 @@ try {
     // object explicitly rather than claiming an unlinked `cargo test` is coverage.
     await run("Rust wasm test-harness compile (no wasm runner)", "cargo", ["test", "--target", "wasm32-unknown-unknown", "--lib", "--no-run"],
         engine, { RUSTFLAGS: "-C link-arg=build/zstddeclib.o" });
-    for (const test of ["jit-alive-repro.mjs", "jit-recovery-repro.mjs", "fpu-absolute.mjs", "memory-oob-contract.mjs", "jit-aot-transaction-contract.mjs"])
+    for (const test of ["jit-alive-repro.mjs", "jit-recovery-repro.mjs", "jit-tier2-replacement-repro.mjs", "fpu-absolute.mjs", "memory-oob-contract.mjs", "jit-aot-transaction-contract.mjs"])
         await run(`runtime ${test}`, process.execPath, [path.join(engine, "tests", test)], engine, env);
     await run("AOT oracle self-test", process.execPath, ["tools/aot-oracle/oracle.mjs", "--self-test"], root, env);
     // This is the producer proof, intentionally separate from unit:auto below. Its job is

@@ -75,6 +75,7 @@ export const HELPERS = {
     safe_read_write16_slow_jit: "ii_i",
     safe_read_write32s_slow_jit: "ii_i",
     trigger_fault_end_jit: "v_v",
+    jit_tier2_note_aot_retired: "i_v",
     test_p: "v_v_ret",   // placeholder, unused in this slice
 };
 
@@ -96,6 +97,7 @@ export const HELPERS = {
  * silent wrong EIP in a guest exception frame months later.
  */
 export const HELPERS_NONFAULTING = {
+    jit_tier2_note_aot_retired: "accounting-only Rust helper; no guest memory or fault path",
     // 8-bit ALU/unary: pure arithmetic over i32 args + the lazy-flag globals (cpu/arith.rs).
     adc8: "no memory access", sbb8: "no memory access",
     inc8: "no memory access", dec8: "no memory access",
