@@ -295,10 +295,17 @@ export class EmulatorConfig {
 
     // Graphics quality enhancements (AF, gamma/brightness/contrast/sat, scaling, post-FX).
     // NEUTRAL by default — a fresh config reproduces exact pre-feature behavior.
-    // Treated as a GLOBAL user preference (like hleLibs): the host pushes the user's
-    // saved settings via set_quality, and a per-game manifest.emulator.quality layers
-    // on top at load. Intentionally NOT cleared by reset() (see note there).
+    //
+    // Two layers, kept SEPARATE and re-derived, never merged in place. The host treats its
+    // settings as a global user preference and re-sends the whole object after every load
+    // (App.tsx, on the load-"done" message), so a manifest override merged into one shared
+    // value is overwritten by the very next message — which is what made
+    // manifest.emulator.quality inert. Effective = user pref, then manifest on top.
     public quality: QualityConfig = { ...DEFAULT_QUALITY };
+    /** The global user preference (set_quality / dbg.quality). Survives reset(). */
+    private qualityUserPref: QualityConfig = { ...DEFAULT_QUALITY };
+    /** The current game's manifest override. Per-game, so reset() MUST drop it. */
+    private qualityManifest: Partial<QualityConfig> | null = null;
 
     // Skip video playback (BinkOpen/SmackOpen return stubs)
     private skipVideoRequested = false;
@@ -579,7 +586,8 @@ export class EmulatorConfig {
 
         // Apply per-game graphics quality override (layers on top of the global user pref)
         if (config.quality) {
-            this.quality = mergeQuality(this.quality, config.quality as Partial<QualityConfig>);
+            this.qualityManifest = config.quality as Partial<QualityConfig>;
+            this.recomputeQuality();
             Logger.log(
                 LogCategory.SYSTEM,
                 `EmulatorConfig: quality from manifest (aniso=${this.quality.anisotropy} bright=${this.quality.brightness} aspect=${this.quality.aspectMode})`
@@ -654,8 +662,16 @@ export class EmulatorConfig {
      * Validates + clamps + merges onto the current config. Returns the new effective config.
      */
     applyQuality(partial: Partial<QualityConfig> | null | undefined): QualityConfig {
-        this.quality = mergeQuality(this.quality, partial);
+        this.qualityUserPref = mergeQuality(this.qualityUserPref, partial);
+        this.recomputeQuality();
         return this.quality;
+    }
+
+    /** Effective config = the global user pref with the current game's manifest on top. */
+    private recomputeQuality(): void {
+        this.quality = this.qualityManifest
+            ? mergeQuality(this.qualityUserPref, this.qualityManifest)
+            : { ...this.qualityUserPref };
     }
 
     /**
@@ -690,8 +706,12 @@ export class EmulatorConfig {
         // hleLibs intentionally NOT reset — it's a dev/debug toggle that the
         // user flips once (hleEnable) and expects to persist across loadApp.
         // A per-game manifest could still opt-in via applyFromManifest later.
-        // quality intentionally NOT reset — global user preference (set via
-        // set_quality from host localStorage); manifest.quality layers on at load.
+        // The USER PREF layer is intentionally NOT reset — it is a global preference (set via
+        // set_quality from host localStorage). The MANIFEST layer is per-game and must go, or
+        // the previous title's override outlives it; reset() runs immediately before every
+        // applyFromManifest for exactly this reason.
+        this.qualityManifest = null;
+        this.recomputeQuality();
     }
 
     /**
