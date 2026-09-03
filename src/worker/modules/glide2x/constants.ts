@@ -164,3 +164,28 @@ export function bytesPerPixelForLfbWriteMode(writeMode: number): number {
             return 2;
     }
 }
+
+/**
+ * A packed GrColor_t is in the frame-buffer colour format the title opened the window
+ * with; the hardware normalises it to ARGB on the way in (_grSwizzleColor, diglide.c).
+ * Everything downstream of us — unpackColorU32, the WGSL combine — reads ARGB, so the
+ * swizzle has to happen here or an ABGR/RGBA title gets its channels transposed.
+ * Applies to the packed setters only: grConstantColorValue4 takes components, not a
+ * colour word, and grColorMask takes booleans (gglide.c: neither swizzles).
+ */
+export function swizzleGlideColor(color: number, colorFormat: number): number {
+    const c = color >>> 0;
+    switch (colorFormat | 0) {
+        case GR_COLORFORMAT_ARGB:
+            return c;
+        case GR_COLORFORMAT_ABGR:
+            return ((c & 0xff00ff00) | ((c & 0x000000ff) << 16) | ((c & 0x00ff0000) >>> 16)) >>> 0;
+        case GR_COLORFORMAT_RGBA:
+            return (((c & 0x000000ff) << 24) | ((c & 0xffffff00) >>> 8)) >>> 0;
+        case GR_COLORFORMAT_BGRA:
+            return (((c & 0x000000ff) << 24) | ((c & 0x0000ff00) << 8)
+                | ((c & 0x00ff0000) >>> 8) | ((c & 0xff000000) >>> 24)) >>> 0;
+        default:
+            return c;
+    }
+}

@@ -2,7 +2,12 @@ import { Mem } from "../../core/memory/mem-accessor";
 import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../../core/logger";
 import { GlideContext } from "./context";
-import { GR_CMP_ALWAYS, GR_DEPTHBUFFER_DISABLE, GR_HINT_STWHINT } from "./constants";
+import {
+    GR_CMP_ALWAYS,
+    GR_DEPTHBUFFER_DISABLE,
+    GR_HINT_STWHINT,
+    swizzleGlideColor,
+} from "./constants";
 
 function shouldLogStateEntry(context: GlideContext): boolean {
     const fid = context.frameSnapshot.frameId;
@@ -21,11 +26,14 @@ function clampToByte(value: number): number {
     return Math.max(0, Math.min(255, value | 0));
 }
 
+/**
+ * grConstantColorValue4 takes floats on ONE scale: [0..255.0] (glide.h — "R, G, B,
+ * ([0..255.0])"). Sniffing the scale per component instead reads a legitimately DARK
+ * value (1.0 is 1/255 of full) as a normalised one and returns 255 — a near-black
+ * constant comes back at full brightness.
+ */
 function normalizeFloatColorComponent(value: number): number {
     if (!Number.isFinite(value)) return 0;
-    if (value >= 0 && value <= 1.0) {
-        return clampToByte(Math.round(value * 255));
-    }
     return clampToByte(Math.round(value));
 }
 
@@ -353,7 +361,7 @@ export function createStateExports(context: GlideContext): Record<string, ThunkI
         },
 
         "_grFogColorValue@4": (_ctx, _mem, args) => {
-            context.runtime.fogColor = args[0] >>> 0;
+            context.runtime.fogColor = swizzleGlideColor(args[0] >>> 0, context.colorFormat);
             return 0;
         },
 
@@ -532,7 +540,7 @@ export function createStateExports(context: GlideContext): Record<string, ThunkI
         },
 
         "_grChromakeyValue@4": (_ctx, _mem, args) => {
-            const newVal = args[0] >>> 0;
+            const newVal = swizzleGlideColor(args[0] >>> 0, context.colorFormat);
             if (newVal !== context.runtime.chromaKeyValue || shouldLogStateEntry(context)) {
                 Logger.log(LogCategory.SYSTEM, `[Glide] grChromakeyValue value=0x${newVal.toString(16)}`);
             }
@@ -542,7 +550,7 @@ export function createStateExports(context: GlideContext): Record<string, ThunkI
         },
 
         "_grConstantColorValue@4": (_ctx, _mem, args) => {
-            context.runtime.constantColorValue = args[0] >>> 0;
+            context.runtime.constantColorValue = swizzleGlideColor(args[0] >>> 0, context.colorFormat);
             context.ffpState.setConstantColor(context.runtime.constantColorValue);
             return 0;
         },

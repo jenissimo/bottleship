@@ -11,6 +11,7 @@ import {
     GLIDE_FBRAM_MB,
     GLIDE_TMU_COUNT,
     GLIDE_TMU_MEMORY_BYTES,
+    swizzleGlideColor,
     GLIDE_TMU_REV,
     GLIDE_VERSION_STRING,
     GR_BUFFER_BACKBUFFER,
@@ -253,7 +254,7 @@ export function createHardwareExports(context: GlideContext): Record<string, Thu
         },
 
         "_grBufferClear@12": (_ctx, _mem, args) => {
-            const color = args[0] >>> 0;
+            const color = swizzleGlideColor(args[0] >>> 0, context.colorFormat);
             const depth = args[2] & 0xffff;
             context.pendingClearColor = color;
             context.pendingClearDepth = depth;
