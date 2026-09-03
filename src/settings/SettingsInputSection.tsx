@@ -13,19 +13,6 @@ export default function SettingsInputSection({
   return (
     <SettingsSection>
       <SectionHeading>Mouse</SectionHeading>
-      <SettingsRow
-        title="Mouse coordinates"
-        hint="How cursor positions are mapped into the guest. Guest resolution is correct for almost everything; render-target is a legacy fallback for games that misbehave."
-      >
-        <select
-          style={{ width: 220, padding: 8 }}
-          value={uiSettings.mouseCoordinateMode}
-          onChange={(e) => onUiChange({ mouseCoordinateMode: e.target.value as UiSettings["mouseCoordinateMode"] })}
-        >
-          <option value="guest">Guest resolution (recommended)</option>
-          <option value="render">Render target (legacy)</option>
-        </select>
-      </SettingsRow>
       <Hint style={{ marginTop: 4, marginBottom: 8 }}>
         Relative-look games capture the pointer when you click the canvas; press <code>Esc</code> to release.
       </Hint>

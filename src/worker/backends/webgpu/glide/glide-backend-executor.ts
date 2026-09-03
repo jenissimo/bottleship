@@ -14,6 +14,9 @@ import { GlideExecutorMetrics, GlideFrameInput, GlideGpuTexture, GlidePipelineCo
 import { glideTexCoordScale } from "./glide-texture-decoder";
 import { Logger, LogCategory } from "../../../core/logger";
 import { statsOverlay } from "../../../core/stats-overlay";
+import { EmulatorConfig } from "../../../core/emulator-config-manager";
+import { registerBackendQualitySupport } from "../shared/quality-capabilities";
+import { resolveInternalScaleFactor } from "../shared/internal-resolution";
 
 function unpackColorU32(color: number): { r: number; g: number; b: number; a: number } {
     const c = color >>> 0;
@@ -55,6 +58,25 @@ export class GlideBackendExecutor extends Legacy3DExecutor {
     private depthTexture: GPUTexture | null = null;
     private depthView: GPUTextureView | null = null;
     private offscreenSize: { width: number; height: number } | null = null;
+    /**
+     * Internal render scale — what nGlide's "screen resolution" setting is. A Glide
+     * title always asks grSstWinOpen for its own mode (Carmageddon 2: 640x480) and
+     * reads it back with grSstScreenWidth/Height, so the resolution is the WRAPPER's
+     * property, not the game's: render the same geometry into a larger target and the
+     * guest never notices. The vertex shader normalises by the LOGICAL size, so the
+     * geometry needs no change — only the target, the scissor and the LFB blit scale.
+     * Textures do not gain detail; edges and the triangle-drawn HUD do.
+     *
+     * Set every frame by resolveInternalScaleFactor() (shared/internal-resolution.ts):
+     * either the user's fixed 2x/4x multiplier, or — the default — a continuous "auto"
+     * factor that fits the offscreen to the canvas's own physical-pixel size, so the
+     * present pass (which blits offscreen -> canvas via the srcW/srcH/outW/outH it is
+     * now given) is close to 1:1 instead of permanently downsampling a fixed-size render.
+     */
+    private renderScale = 1;
+    private lfbScaleTexture: GPUTexture | null = null;
+    private lfbScaleView: GPUTextureView | null = null;
+    private lfbScaleSize: { width: number; height: number } | null = null;
 
     private vertexBuffer: GPUBuffer | null = null;
     private vertexBufferSize = 0;
@@ -122,6 +144,10 @@ export class GlideBackendExecutor extends Legacy3DExecutor {
 
     constructor(private readonly backend: WebGPUBackend) {
         super("glide");
+        // Glide has no sampler-state or MSAA knobs of its own (fixed-function combine,
+        // no D3D-style D3DSAMP_* — see glide2x); internalScale is the one GPU-resident
+        // quality key this backend implements.
+        registerBackendQualitySupport("glide", ["internalScale"]);
     }
 
     /** Start keeping a CPU copy of the rendered frame (first LFB read lock). */
@@ -259,7 +285,22 @@ export class GlideBackendExecutor extends Legacy3DExecutor {
         if (!device || !queue || !context) return;
         if (input.width <= 0 || input.height <= 0) return;
 
-        this.ensureTargets(device, input.width, input.height);
+        // Fetched once and reused for both sizing (below) and the present blit (end of this
+        // method) — getCurrentTexture() is meant to be called at most once per frame.
+        const currentTexture = context.getCurrentTexture();
+        const canvasW = currentTexture.width;
+        const canvasH = currentTexture.height;
+
+        this.renderScale = resolveInternalScaleFactor(
+            EmulatorConfig.getInstance().quality.internalScale,
+            input.width, input.height, canvasW, canvasH,
+        );
+        const scale = this.renderScale;
+        // Rounded to integers: WebGPU texture/scissor extents are integer coordinates, and
+        // "auto" (see resolveInternalScaleFactor) is a continuous best-fit, not a power of 2.
+        const targetW = Math.round(input.width * scale);
+        const targetH = Math.round(input.height * scale);
+        this.ensureTargets(device, targetW, targetH);
         this.ensureGlobals(device);
 
         if (!this.offscreenTexture || !this.offscreenView || !this.depthView || !this.uniformBuffer) {
@@ -278,7 +319,7 @@ export class GlideBackendExecutor extends Legacy3DExecutor {
         const lfbOverFrame = !!input.lfbPixels && !!input.lfbAfterDraws;
 
         if (input.lfbPixels && !lfbOverFrame) {
-            this.uploadLfbBackground(queue, input.lfbPixels, input.width, input.height, input.lfbVersion ?? -1);
+            this.uploadLfbBackground(device, queue, encoder, input.lfbPixels, input.width, input.height, input.lfbVersion ?? -1, scale, targetW, targetH);
             shouldClearColor = false;
         }
 
@@ -428,9 +469,14 @@ export class GlideBackendExecutor extends Legacy3DExecutor {
                     // default is the whole screen — fall back to it rather than refuse.
                     const w = clipX1 - clipX0, h = clipY1 - clipY0;
                     if (w > 0 && h > 0) {
-                        renderPass.setScissorRect(clipX0, clipY0, w, h);
+                        // Rounded independently per edge (not derived from a single rounded
+                        // w/h) — a non-integer "auto" scale can then leave neighbouring clip
+                        // rects up to 1px apart, an acceptable seam for a scissor edge.
+                        renderPass.setScissorRect(
+                            Math.round(clipX0 * scale), Math.round(clipY0 * scale),
+                            Math.round(w * scale), Math.round(h * scale));
                     } else {
-                        renderPass.setScissorRect(0, 0, input.width, input.height);
+                        renderPass.setScissorRect(0, 0, targetW, targetH);
                     }
                     curClipX0 = clipX0; curClipY0 = clipY0; curClipX1 = clipX1; curClipY1 = clipY1;
                 }
@@ -447,18 +493,28 @@ export class GlideBackendExecutor extends Legacy3DExecutor {
         renderPass.end();
 
         if (lfbOverFrame && input.lfbPixels) {
-            this.copyLfbOverFrame(device, queue, encoder, input.lfbPixels, input.width, input.height);
+            this.copyLfbOverFrame(device, queue, encoder, input.lfbPixels, input.width, input.height, scale, targetW, targetH);
         }
 
-        const targetView = context.getCurrentTexture().createView();
+        // currentTexture was fetched once at the top of this method (see there for why).
+        const targetView = currentTexture.createView();
+        // No explicit viewport: leaving it undefined makes WebGPU use the render target's
+        // own full extent (the canvas), matching the canonical present call every other
+        // backend uses (ddraw/presenter.ts) instead of clipping to the GUEST's logical size.
+        // `present:{srcW,srcH,outW,outH}` is what lets PostFxChain's aspectMode/integerScale
+        // (and FXAA texel sizing) do real work here — offscreen (targetW x targetH, which
+        // may now be supersampled) fit into the canvas (canvasW x canvasH), rather than
+        // src===out always making that scaling math a no-op.
         this.backend.drawTexture(
             this.offscreenView,
             targetView,
             encoder,
             true,
-            input.width,
-            input.height,
+            undefined,
+            undefined,
             { r: 0, g: 0, b: 0, a: 1 },
+            undefined,
+            { srcW: targetW, srcH: targetH, outW: canvasW, outH: canvasH },
         );
 
         if (input.videoOverlayCanvas) {
@@ -485,7 +541,9 @@ export class GlideBackendExecutor extends Legacy3DExecutor {
                     this.backend.updateStatsTexture(statsCanvas);
                     statsOverlay.clearDirty();
                 }
-                this.backend.renderStatsOverlay(targetView, encoder, input.width, input.height);
+                // targetView is the CANVAS texture (not the offscreen render target), so the
+                // overlay must be sized to the canvas too.
+                this.backend.renderStatsOverlay(targetView, encoder, canvasW, canvasH);
             }
         }
 
@@ -506,13 +564,23 @@ export class GlideBackendExecutor extends Legacy3DExecutor {
      * and re-swap only when the guest actually changed the image.
      */
     private uploadLfbBackground(
+        device: GPUDevice,
         queue: GPUQueue,
+        encoder: GPUCommandEncoder,
         pixels: Uint8Array,
         width: number,
         height: number,
         version: number,
+        scale: number,
+        targetW: number,
+        targetH: number,
     ): void {
         if (!this.offscreenTexture) return;
+        // At scale 1 the LFB IS the target's size, so it goes straight in — the byte
+        // path below is unchanged. Scaled, it must be resampled instead of landing in
+        // the target's top-left corner, so it lands in a guest-sized texture first.
+        const dest = scale === 1 ? this.offscreenTexture : this.ensureLfbScaleTexture(device, width, height);
+        if (!dest) return;
         const format = this.backend.getFormat() ?? "bgra8unorm";
         const bgra = format === "bgra8unorm";
         const unpaddedRow = width * 4;
@@ -520,9 +588,10 @@ export class GlideBackendExecutor extends Legacy3DExecutor {
         const needsPadding = paddedRow !== unpaddedRow && height > 1;
 
         if (!bgra && !needsPadding) {
-            queue.writeTexture({ texture: this.offscreenTexture }, pixels,
+            queue.writeTexture({ texture: dest }, pixels,
                 { bytesPerRow: unpaddedRow }, { width, height, depthOrArrayLayers: 1 });
             this.lfbUploadedVersion = -1; // nothing staged
+            this.blitLfbScaled(encoder, scale, targetW, targetH);
             return;
         }
 
@@ -564,9 +633,36 @@ export class GlideBackendExecutor extends Legacy3DExecutor {
             this.lfbStagedBgra = bgra;
         }
 
-        queue.writeTexture({ texture: this.offscreenTexture }, staged,
+        queue.writeTexture({ texture: dest }, staged,
             { bytesPerRow: needsPadding ? paddedRow : unpaddedRow },
             { width, height, depthOrArrayLayers: 1 });
+        this.blitLfbScaled(encoder, scale, targetW, targetH);
+    }
+
+    /** Guest-sized staging for a scaled LFB image; null when the device refuses it. */
+    private ensureLfbScaleTexture(device: GPUDevice, width: number, height: number): GPUTexture | null {
+        if (this.lfbScaleSize?.width === width && this.lfbScaleSize.height === height && this.lfbScaleTexture) {
+            return this.lfbScaleTexture;
+        }
+        this.lfbScaleTexture?.destroy();
+        this.lfbScaleTexture = device.createTexture({
+            size: { width, height, depthOrArrayLayers: 1 },
+            format: this.backend.getFormat() ?? "bgra8unorm",
+            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+        });
+        this.lfbScaleView = this.lfbScaleTexture.createView();
+        this.lfbScaleSize = { width, height };
+        return this.lfbScaleTexture;
+    }
+
+    /** Resample the staged LFB image over the whole target. No-op at scale 1, where the
+     *  image was written into the target directly. `targetW`/`targetH` are the SAME rounded
+     *  extent ensureTargets() sized the offscreen texture to (executeFrame's targetW/targetH)
+     *  — recomputing width*scale here instead would drift from that by a sub-pixel rounding
+     *  delta at non-integer "auto" factors and leave a seam along one edge. */
+    private blitLfbScaled(encoder: GPUCommandEncoder, scale: number, targetW: number, targetH: number): void {
+        if (scale === 1 || !this.lfbScaleView || !this.offscreenView) return;
+        this.backend.drawTexture(this.lfbScaleView, this.offscreenView, encoder, true, targetW, targetH);
     }
 
     /**
@@ -587,8 +683,13 @@ export class GlideBackendExecutor extends Legacy3DExecutor {
         pixels: Uint8Array,
         width: number,
         height: number,
+        scale: number,
+        targetW: number,
+        targetH: number,
     ): void {
         if (!this.offscreenTexture) return;
+        const dest = scale === 1 ? this.offscreenTexture : this.ensureLfbScaleTexture(device, width, height);
+        if (!dest) return;
         const paddedRow = Math.ceil(width * 4 / 256) * 256;
         const bytes = paddedRow * height;
         if (!this.lfbStagingBuffer || this.lfbStagingBytes < bytes) {
@@ -625,9 +726,10 @@ export class GlideBackendExecutor extends Legacy3DExecutor {
         queue.writeBuffer(this.lfbStagingBuffer, 0, staging, 0, bytes);
         encoder.copyBufferToTexture(
             { buffer: this.lfbStagingBuffer, bytesPerRow: paddedRow },
-            { texture: this.offscreenTexture },
+            { texture: dest },
             { width, height, depthOrArrayLayers: 1 },
         );
+        this.blitLfbScaled(encoder, scale, targetW, targetH);
     }
 
     private captureFramebufferMirror(device: GPUDevice, queue: GPUQueue): void {
@@ -792,6 +894,13 @@ export class GlideBackendExecutor extends Legacy3DExecutor {
             this.depthTexture.destroy();
             this.depthTexture = null;
             this.depthView = null;
+        }
+
+        if (this.lfbScaleTexture) {
+            this.lfbScaleTexture.destroy();
+            this.lfbScaleTexture = null;
+            this.lfbScaleView = null;
+            this.lfbScaleSize = null;
         }
 
         this.samplers.clear();

@@ -11,7 +11,9 @@ export default function SettingsGraphicsSection({
   quality,
   onChange,
   guestResolution,
+  renderSize,
   integerScale,
+  unsupportedQualityKeys,
 }: SettingsDrawerProps): React.ReactElement {
   return (
     <SettingsSection>
@@ -82,7 +84,13 @@ export default function SettingsGraphicsSection({
       <SectionHeading style={{ marginTop: 18 }}>
         Video / Quality
       </SectionHeading>
-      <QualityPanel quality={quality} onChange={onChange} />
+      <QualityPanel
+        quality={quality}
+        onChange={onChange}
+        unsupported={unsupportedQualityKeys}
+        guestResolution={guestResolution}
+        renderSize={renderSize}
+      />
       <Hint style={{ marginTop: 12 }}>
         Wired to the <code>QualityConfig</code> / <code>set_quality</code> pipeline — applied at the
         HLE → WebGPU seam. Defaults are neutral (a fresh config reproduces exact pre-feature behavior).

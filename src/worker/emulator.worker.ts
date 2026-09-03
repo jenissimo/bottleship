@@ -116,6 +116,7 @@ import { frameProfiler } from "./core/frame-profiler";
 import { frameVarianceDiagnostics } from "./core/frame-variance-diagnostics";
 import { framePacer } from "./core/frame-pacer";
 import { EmulatorConfig } from "./core/emulator-config-manager";
+import { logQualityGapsOnce, activeQualityBackend } from "./backends/webgpu/shared/quality-capabilities";
 import { videoEngine } from "../video/video-engine";
 import { preemptionManager } from "./core/cpu/preemption-manager";
 import { writeGuestCode } from "./core/memory/guest-code";
@@ -3318,7 +3319,10 @@ const handleWorkerMessage = (event: MessageEvent): void => {
     const q = EmulatorConfig.getInstance().applyQuality(message.quality);
     Logger.log(LogCategory.SYSTEM,
       `[QUALITY] applied (aniso=${q.anisotropy} bright=${q.brightness} contrast=${q.contrast} sat=${q.saturation} aspect=${q.aspectMode} postAA=${q.postAA})`);
-    self.postMessage({ type: "set_quality", ok: true, quality: q });
+    // A knob the active backend cannot honor must be visible, not silently swallowed
+    // (see shared/quality-capabilities.ts) — logged here AND relayed to the UI.
+    const gaps = logQualityGapsOnce(q);
+    self.postMessage({ type: "set_quality", ok: true, quality: q, unsupported: gaps, backend: activeQualityBackend() });
     return;
   }
 
@@ -3365,18 +3369,27 @@ const handleWorkerMessage = (event: MessageEvent): void => {
   if (message?.type === "resize") {
     state.width = message.width ?? state.width;
     state.height = message.height ?? state.height;
-    // NOTE: Do NOT reconfigure WebGPU here. The worker's hostResize callback is the
-    // authoritative source — it already called reconfigure(). Re-doing it from the
-    // main-thread round-trip clears the canvas AFTER frames have been rendered → black screen.
+    const system = System.getInstance();
+    // The guest's own hostResize callback (see setHostResizeCallback) is the OTHER writer
+    // of canvas.width/height, for guest-driven mode/backbuffer changes — it already
+    // reconfigures, so when this round-trip merely echoes a size it already applied, the
+    // dimension check below is false and this stays a no-op (no double reconfigure after
+    // frames have rendered → no black screen). But this message is also the ONLY thing
+    // that resizes the canvas for a plain HOST window resize (the guest never asked for a
+    // new size), and canvas.width/height writes unconfigure the WebGPU context — so a real
+    // change here must reconfigure too, or the backend renders into a detached swap chain.
     if (state.canvas && (state.canvas.width !== state.width || state.canvas.height !== state.height)) {
       state.canvas.width = state.width;
       state.canvas.height = state.height;
+      const backend = system.services.render.getBackend();
+      if (backend?.kind === "webgpu") {
+        (backend as WebGPUBackend).reconfigure();
+      }
     }
     // Also resize GDI overlay canvas
-    System.getInstance().gdiContext.resizeOverlay(state.width, state.height);
+    system.gdiContext.resizeOverlay(state.width, state.height);
 
     // Trigger repaint for all windows on resize
-    const system = System.getInstance();
     const WM_PAINT = 0x000F;
     for (const window of system.windowManager.getAllWindows()) {
       if (window.visible) {

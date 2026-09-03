@@ -39,7 +39,6 @@ import {
   loadUiSettings,
 } from "../ui-settings";
 import type {
-  MouseCoordinateMode,
   PresentMode,
   UiSettings,
 } from "../ui-settings";
@@ -318,7 +317,7 @@ export default function App() {
   /** Guest pixels per CSS pixel — the widget layer scales relative motion by it. */
   const guestPerCss = useCallback(() => {
     const rect = canvasRectRef.current;
-    const space = mouseCoordinateModeRef.current === "guest"
+    const space = guestResolutionKnownRef.current
       ? guestResolutionRef.current
       : resolutionRef.current;
     if (!rect || rect.width <= 0 || rect.height <= 0) return { x: 1, y: 1 };
@@ -362,7 +361,16 @@ export default function App() {
   const [uiSettings, setUiSettings] = useState<UiSettings>(() => loadUiSettings());
   const [quality, setQuality] = useState<QualityConfig>(() => loadQuality());
   const qualityRef = useRef<QualityConfig>(quality);
+  // Quality keys the ACTIVE graphics backend told us (via the set_quality ack) it does
+  // not implement — see shared/quality-capabilities.ts. Surfaced in QualityPanel so a
+  // knob that provably does nothing on this backend reads as such, not as "applied".
+  const [unsupportedQualityKeys, setUnsupportedQualityKeys] = useState<ReadonlySet<string>>(new Set());
   const [guestResolution, setGuestResolution] = useState({ width: 1024, height: 768 });
+  // Canvas physical-pixel backing size (clientWidth/Height × devicePixelRatio) — mirrors
+  // resolutionRef.current as React state so QualityPanel can show what "Internal
+  // resolution: Auto" is actually fitting to right now (resolveInternalScaleFactor takes
+  // the same two numbers the worker's own render path uses).
+  const [canvasRenderSize, setCanvasRenderSize] = useState({ width: 0, height: 0 });
   const [viewportSize, setViewportSize] = useState(() => ({
     width: typeof window !== "undefined" ? Math.max(1, window.innerWidth) : 1,
     height: typeof window !== "undefined" ? Math.max(1, window.innerHeight) : 1,
@@ -383,9 +391,14 @@ export default function App() {
     });
   }, []);
 
-  const mouseCoordinateModeRef = useRef<MouseCoordinateMode>(uiSettings.mouseCoordinateMode);
   const presentModeRef = useRef<PresentMode>(uiSettings.presentMode);
   const guestResolutionRef = useRef({ width: 1024, height: 768 });
+  // True once the guest has published its own resolution (the "app_resize" handler below).
+  // Pointer mapping is ALWAYS in guest-resolution space (SetCursorPos, GetCursorPos, DirectInput
+  // absolute axes are all guest-relative) — but guestResolutionRef starts at a 1024x768
+  // PLACEHOLDER indistinguishable from a real 1024x768 guest mode, so a boot-time pointer
+  // event before the first publish must fall back to the render size instead of trusting it.
+  const guestResolutionKnownRef = useRef(false);
   // Current UI settings, readable from non-React callbacks (e.g. the audio-engine
   // creation path, which may run after the settings-apply effect has fired).
   const uiSettingsRef = useRef<UiSettings>(uiSettings);
@@ -712,7 +725,6 @@ export default function App() {
 
   useEffect(() => {
     setHapticsEnabled(uiSettings.touchHaptics);
-    mouseCoordinateModeRef.current = uiSettings.mouseCoordinateMode;
     presentModeRef.current = uiSettings.presentMode;
     uiSettingsRef.current = uiSettings;
     // Apply audio output prefs live (the engine stores them even if its graph isn't built yet).
@@ -857,7 +869,7 @@ export default function App() {
         if (!rect || rect.width <= 0 || rect.height <= 0) return null;
         const origin = panelRectRef.current;
         const space =
-          mouseCoordinateModeRef.current === "guest"
+          guestResolutionKnownRef.current
             ? guestResolutionRef.current
             : resolutionRef.current;
         return {
@@ -926,7 +938,7 @@ export default function App() {
     // can arrive before the user has touched anything, and 1x1 bounds warp it to (0,0).
     const syncPointerBounds = () => {
       const space =
-        mouseCoordinateModeRef.current === "guest"
+        guestResolutionKnownRef.current
           ? guestResolutionRef.current
           : resolutionRef.current;
       inputDevice.setPointerBounds(Math.max(1, space.width), Math.max(1, space.height));
@@ -1175,13 +1187,17 @@ export default function App() {
       // Update ref for event calculations (cannot set canvas.width/height anymore)
       resolutionRef.current = { width: renderWidth, height: renderHeight };
       captureRects();
+      setCanvasRenderSize((prev) =>
+        prev.width === renderWidth && prev.height === renderHeight ? prev : { width: renderWidth, height: renderHeight });
 
-      const useGuestCoords = mouseCoordinateModeRef.current === "guest";
-      const target = useGuestCoords
-        ? guestResolutionRef.current
-        : { width: renderWidth, height: renderHeight };
-
-      worker.postMessage({ type: "resize", width: target.width, height: target.height });
+      // The canvas BACKING BUFFER always follows the display area, not the guest's
+      // logical resolution — pointer mapping (guestPerCss / syncPointerBounds / the
+      // pointer-event handlers below) is the ONLY thing addressed in guest space, and it
+      // reads guestResolutionRef directly. Conflating the two used to pin the backing
+      // buffer to the guest's resolution whenever "guest" pointer mode was selected,
+      // which made quality.internalScale's "Auto" fit a canvas that was already
+      // guest-sized — an unconditional no-op regardless of the setting.
+      worker.postMessage({ type: "resize", width: renderWidth, height: renderHeight });
     };
 
     // 3. Setup Worker Message Handling
@@ -1576,6 +1592,7 @@ export default function App() {
         const width = Math.max(1, Number(event.data.width) || 1);
         const height = Math.max(1, Number(event.data.height) || 1);
         guestResolutionRef.current = { width, height };
+        guestResolutionKnownRef.current = true;
         setGuestResolution({ width, height });
         // Expose for the harness UI-overlay tool (gridShot): maps guest pixels —
         // the space clickAt() injects into — onto the on-screen canvas rect.
@@ -1588,11 +1605,11 @@ export default function App() {
           canvas.style.width = "";
           canvas.style.height = "";
           captureRects();
-          if (mouseCoordinateModeRef.current === "guest") {
-            worker.postMessage({ type: "resize", width, height });
-          } else {
-            resize();
-          }
+          // The backing buffer follows the display area, not this guest resolution (see
+          // resize()) — but the CSS aspect-ratio just changed above, so the display area
+          // itself may now be a different size (e.g. a 4:3 guest mode in a fixed-height
+          // panel gets narrower). Recompute unconditionally.
+          resize();
           // The rect captured above is PRE-reflow: setGuestResolution() schedules a
           // React re-render that updates style.aspectRatio, and the flex-centered canvas
           // shifts position once that render + layout settles. A size-only ResizeObserver
@@ -1601,6 +1618,10 @@ export default function App() {
           // maps to clamped 0,0). Re-capture after layout settles (double rAF = after paint).
           requestAnimationFrame(() => requestAnimationFrame(captureRects));
         }
+      }
+      if (event.data?.type === "set_quality") {
+        const unsupported = Array.isArray(event.data.unsupported) ? event.data.unsupported : [];
+        setUnsupportedQualityKeys(new Set(unsupported));
       }
       if (event.data?.type === "window_title") {
         const title = String(event.data.title || "");
@@ -1683,7 +1704,7 @@ export default function App() {
       ? touchDriver.attach(panelRef.current, {
           getCanvasRect: () => canvasRectRef.current ?? canvas.getBoundingClientRect(),
           getPointerSpace: () =>
-            mouseCoordinateModeRef.current === "guest"
+            guestResolutionKnownRef.current
               ? guestResolutionRef.current
               : resolutionRef.current,
           getSettings: () => uiSettingsRef.current,
@@ -1718,7 +1739,7 @@ export default function App() {
       }
 
       const pointerSpace =
-        mouseCoordinateModeRef.current === "guest"
+        guestResolutionKnownRef.current
           ? guestResolutionRef.current
           : resolutionRef.current;
       const width  = Math.max(1, pointerSpace.width);
@@ -1954,7 +1975,7 @@ export default function App() {
       if (!insideCanvas) return;
 
       const pointerSpace =
-        mouseCoordinateModeRef.current === "guest"
+        guestResolutionKnownRef.current
           ? guestResolutionRef.current
           : resolutionRef.current;
       const width = Math.max(1, pointerSpace.width);
@@ -2788,6 +2809,7 @@ export default function App() {
       onClose={() => setMainSettingsOpen(false)}
       quality={quality}
       onChange={handleQualityChange}
+      unsupportedQualityKeys={unsupportedQualityKeys}
       uiSettings={uiSettings}
       onUiChange={handleUiChange}
       statsOverlay={statsOverlayEnabled}
@@ -2796,6 +2818,7 @@ export default function App() {
       onToggleLogStreaming={handleToggleLogStreaming}
       onResetDefaults={handleResetSettings}
       guestResolution={guestResolution}
+      renderSize={canvasRenderSize}
       integerScale={integerScaleSize.scale}
       onOpenDevConsole={() => {
         if (browserSupport.supported) window.location.assign("?game=dev");

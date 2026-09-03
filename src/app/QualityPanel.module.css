@@ -19,6 +19,19 @@
   color: #e6f0ff;
 }
 
+.quality-gap {
+  margin-left: 6px;
+  font-size: 0.78em;
+  font-weight: 600;
+  color: #ffb454;
+}
+
+.quality-resolved {
+  color: #94a4b8;
+  font-size: 12px;
+  font-style: italic;
+}
+
 .settings-row select {
   min-width: 240px;
   border-radius: 8px;

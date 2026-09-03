@@ -48,7 +48,13 @@ export interface QualityConfig {
     // --- GPU-resident precision / AA (config reserved, staged impl) ---
     /** Multi-sample AA for 3D geometry edges: 1/2/4. */
     msaa: number;
-    /** Internal-resolution supersample factor for GPU-resident 3D: 1/2/4. */
+    /**
+     * Internal-resolution factor for GPU-resident 3D: 0/1/2/4. 0 ("Auto", the default)
+     * tracks the canvas's own physical-pixel size; 1 ("Native") forces exactly the guest's
+     * own resolution (no supersample, the compatibility/low-power fallback); 2/4 are a
+     * fixed multiplier of the guest's resolution regardless of canvas size — see
+     * backends/webgpu/shared/internal-resolution.ts for the split.
+     */
     internalScale: number;
     /** Auto-generate mip chains on texture upload (prereq for trilinear/AF to bite). */
     autoMipmap: boolean;
@@ -70,7 +76,7 @@ export const DEFAULT_QUALITY: QualityConfig = {
     scanlines: false,
     crt: false,
     msaa: 1,
-    internalScale: 1,
+    internalScale: 0,
     autoMipmap: false,
     hdr: false,
 };
@@ -96,6 +102,8 @@ function snapTo(v: unknown, allowed: readonly number[], dflt: number): number {
 
 const ANISO_STEPS = [1, 2, 4, 8, 16] as const;
 const SAMPLE_STEPS = [1, 2, 4] as const;
+/** internalScale's own steps: 0 ("Auto") is a valid value here but never for msaa. */
+const INTERNAL_SCALE_STEPS = [0, 1, 2, 4] as const;
 const ASPECT_MODES: readonly AspectMode[] = ["stretch", "pillarbox", "integer"];
 const POST_AA: readonly PostAA[] = ["off", "fxaa"];
 const TONEMAPS: readonly ToneMap[] = ["off", "aces"];
@@ -122,7 +130,7 @@ export function mergeQuality(base: QualityConfig, partial: Partial<QualityConfig
     if ("scanlines" in partial) out.scanlines = !!partial.scanlines;
     if ("crt" in partial) out.crt = !!partial.crt;
     if ("msaa" in partial) out.msaa = snapTo(partial.msaa, SAMPLE_STEPS, base.msaa);
-    if ("internalScale" in partial) out.internalScale = snapTo(partial.internalScale, SAMPLE_STEPS, base.internalScale);
+    if ("internalScale" in partial) out.internalScale = snapTo(partial.internalScale, INTERNAL_SCALE_STEPS, base.internalScale);
     if ("autoMipmap" in partial) out.autoMipmap = !!partial.autoMipmap;
     if ("hdr" in partial) out.hdr = !!partial.hdr;
 

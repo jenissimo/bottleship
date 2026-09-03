@@ -3,7 +3,6 @@
 // wired settings — distinct from the per-game manifest and from QualityConfig (the
 // HLE→WebGPU quality knobs, persisted separately under its own key).
 
-export type MouseCoordinateMode = "guest" | "render";
 export type FullscreenAspectPreset = "4:3" | "16:9" | "16:10";
 export type CanvasFilteringMode = "smooth" | "pixelated";
 
@@ -30,7 +29,6 @@ export type UiSettings = {
   fullscreenAspectPreset: FullscreenAspectPreset;
   integerScaling: boolean;
   canvasFiltering: CanvasFilteringMode;
-  mouseCoordinateMode: MouseCoordinateMode;
   presentMode: PresentMode;
   /** Master output volume, linear 0..1 (applied at the AudioEngine master gain). */
   masterVolume: number;
@@ -56,7 +54,6 @@ export const DEFAULT_UI_SETTINGS: UiSettings = {
   fullscreenAspectPreset: "4:3",
   integerScaling: false,
   canvasFiltering: "smooth",
-  mouseCoordinateMode: "guest",
   presentMode: "off",
   masterVolume: 1,
   muted: false,
@@ -88,10 +85,6 @@ export function loadUiSettings(): UiSettings {
       parsed.canvasFiltering === "pixelated" || parsed.canvasFiltering === "smooth"
         ? parsed.canvasFiltering
         : DEFAULT_UI_SETTINGS.canvasFiltering;
-    const mouseCoordinateMode: MouseCoordinateMode =
-      parsed.mouseCoordinateMode === "render" || parsed.mouseCoordinateMode === "guest"
-        ? parsed.mouseCoordinateMode
-        : DEFAULT_UI_SETTINGS.mouseCoordinateMode;
     const presentMode: PresentMode =
       parsed.presentMode && PRESENT_MODES.includes(parsed.presentMode)
         ? parsed.presentMode
@@ -115,7 +108,6 @@ export function loadUiSettings(): UiSettings {
       fullscreenAspectPreset,
       integerScaling,
       canvasFiltering,
-      mouseCoordinateMode,
       presentMode,
       masterVolume,
       muted,
