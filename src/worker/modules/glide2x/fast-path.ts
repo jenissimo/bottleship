@@ -8,18 +8,22 @@
  * dereference no guest pointer, so they belong on the ring — they then run as
  * JIT'd guest trampolines and JS sees them once per drain.
  *
- * That is the admission test, and it is why only SCALAR setters are here. A call
- * whose work reads through a guest pointer cannot be deferred: the guest keeps
- * running between the call and the drain, so the bytes read are the bytes at
- * drain time, not at call time. Struct capture copies an argument struct into the
- * ring and fixes that for the struct itself, but not for anything the struct
- * POINTS at.
+ * That is the admission test for the SCALAR setters below. A call whose work reads
+ * through a guest pointer cannot simply be deferred: the guest keeps running between
+ * the call and the drain, so the bytes read are the bytes at drain time, not at call
+ * time. Capture-at-call answers that for a FIXED-size struct argument by copying it
+ * into the ring in guest code — but only for the struct itself, never for anything
+ * the struct POINTS at. grTexSource and grDrawTriangle qualify because the extent
+ * each one reads is fixed and known (a 5-dword GrTexInfo; the 12 floats of a
+ * GrVertex that a draw touches), and neither follows a pointer out of it.
  *
- * Ordering is preserved for free: grDrawTriangle stays a trapped call and the
- * dispatcher drains the ring before any trap, so a draw always observes every
- * setter that preceded it. That is also why per-funcId coalescing is safe — a
- * drain never spans two draws, so "last write wins within a drain" is exactly
- * "the state the next draw sees".
+ * ORDERING. The dispatcher drains the ring before any trap, so a trapped draw always
+ * observes every setter that preceded it, and per-funcId coalescing is safe because a
+ * drain cannot span two draws. grDrawTriangle on the ring ends that argument, so it
+ * is registered as a coalescer BARRIER: `segment` advances per draw and last-write-
+ * wins is scoped to the setter run before each triangle, which is the state that
+ * triangle must observe. Without the barrier the setters of consecutive triangles
+ * collapse into one — wrong colours and textures on some triangles, silently.
  *
  * Every handler here is the SAME implementation the trap path uses, adapted to
  * read its arguments from the ring. A second copy of the state machine would
@@ -33,6 +37,7 @@ import { Logger, LogCategory } from "../../core/logger";
 import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { GlideContext } from "./context";
 import { applyGrTexSource } from "./texture";
+import { applyGrDrawTriangle, GR_VERTEX_FLOATS } from "./draw";
 import { ParsedGrTexInfo } from "./structs";
 import { GR_TEXINFO_SIZE } from "./constants";
 
@@ -164,6 +169,56 @@ function registerGrTexSourceCapture(
     return true;
 }
 
+/**
+ * The three captured vertices, unpacked from the ring's dwords into floats.
+ *
+ * Deliberately NOT a Float32Array laid over guest memory: that is a plain guest view, and
+ * one kept across turns detaches the moment WASM memory grows (CLAUDE.md §3.1). Copying 36
+ * dwords into a scratch buffer costs a fraction of the draw it feeds and cannot detach.
+ */
+const triScratch = new ArrayBuffer(GR_VERTEX_FLOATS * 3 * 4);
+const triU32 = new Uint32Array(triScratch);
+const triF32 = new Float32Array(triScratch);
+
+/**
+ * grDrawTriangle(GrVertex*, GrVertex*, GrVertex*) — 3632 calls a frame in a race, and the
+ * single biggest remaining OUT-trap cost in the module. Three pointers, so the capture
+ * copies three structs; only the 12 floats a draw actually reads are captured, which is
+ * the same extent the trap path reads and keeps the ring entry at 160 bytes.
+ *
+ * BARRIER, and that is load-bearing. fast-path.ts's coalescing is safe only because "a
+ * drain never spans two draws" — true while the draw traps, since the dispatcher drains
+ * before every trap. On the ring that stops being true, and un-scoped coalescing would
+ * collapse the setter runs of consecutive triangles into one: wrong colours and textures
+ * on some triangles, no crash, nothing in a log. Registering as a barrier advances the
+ * dispatcher's `segment` per draw, so last-write-wins is scoped to the setters preceding
+ * each triangle — which is exactly the state that triangle must observe.
+ */
+function registerGrDrawTriangleCapture(
+    dispatcher: {
+        registerMultiStructCaptureWriteBufferFunction?: (
+            dll: string, func: string, argCount: number, ptrArgIndices: number[],
+            payloadDwords: number, handler: WriteBufHandler,
+        ) => void;
+    },
+    context: GlideContext,
+): boolean {
+    if (typeof dispatcher.registerMultiStructCaptureWriteBufferFunction !== "function") return false;
+    if ((globalThis as unknown as { __noStructCapture?: boolean }).__noStructCapture) return false;
+    if ((globalThis as unknown as { __noGlideDrawWbuf?: boolean }).__noGlideDrawWbuf) return false;
+
+    // Ring entry: [funcId][a][b][c][12 floats × 3].
+    dispatcher.registerMultiStructCaptureWriteBufferFunction(
+        "glide2x", "_grDrawTriangle@12", 3, [0, 1, 2], GR_VERTEX_FLOATS,
+        (_mem8: Uint8Array, mem32: Uint32Array, dataPtr: number) => {
+            const w = dataPtr >> 2;
+            for (let i = 0; i < GR_VERTEX_FLOATS * 3; i++) triU32[i] = mem32[w + 3 + i]!;
+            applyGrDrawTriangle(context, mem32[w]! >>> 0, mem32[w + 1]! >>> 0, mem32[w + 2]! >>> 0, triF32);
+        },
+    );
+    return true;
+}
+
 export function registerGlideWriteBufferFunctions(
     dispatcher: {
         registerWriteBufferFunction?: (
@@ -172,6 +227,10 @@ export function registerGlideWriteBufferFunctions(
         ) => boolean | void;
         registerStructCaptureWriteBufferFunction?: (
             dll: string, func: string, argCount: number, ptrArgIndex: number,
+            payloadDwords: number, handler: WriteBufHandler,
+        ) => void;
+        registerMultiStructCaptureWriteBufferFunction?: (
+            dll: string, func: string, argCount: number, ptrArgIndices: number[],
             payloadDwords: number, handler: WriteBufHandler,
         ) => void;
     },
@@ -198,8 +257,10 @@ export function registerGlideWriteBufferFunctions(
     }
 
     const texSource = registerGrTexSourceCapture(dispatcher, context);
+    const drawTriangle = registerGrDrawTriangleCapture(dispatcher, context);
     Logger.log(LogCategory.SYSTEM,
-        `[Glide] WBUF: grTexSource struct capture ${texSource ? "requested" : "unavailable"}`);
+        `[Glide] WBUF: grTexSource struct capture ${texSource ? "requested" : "unavailable"}, ` +
+        `grDrawTriangle multi-capture ${drawTriangle ? "requested" : "unavailable"}`);
 
     // Registration can decline (the WBUF control page is not up yet), and a count of
     // ATTEMPTS would report a win that never happened.

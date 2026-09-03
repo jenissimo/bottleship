@@ -75,35 +75,21 @@ function drawUsesTexture(context: GlideContext): boolean {
 // per-triangle budget. Do NOT round this up: readFloat32Into validates the WHOLE extent
 // and refuses the read if any of it is unmapped, so an over-read turns the last vertex of
 // an array that ends at the requirement boundary into a white degenerate triangle.
-const GR_VERTEX_FLOATS = 12;
+export const GR_VERTEX_FLOATS = 12;
 const vertexFloats = new Float32Array(GR_VERTEX_FLOATS);
 const F_X = 0, F_Y = 1, F_Z = 2, F_R = 3, F_G = 4, F_B = 5, F_OOZ = 6, F_A = 7, F_OOW = 8;
 const F_SOW = 9, F_TOW = 10, F_TMU0_OOW = 11;
 
-// The single decoded vertex, reused per call: the only consumer is pushVertexFromPtr,
-// which reads it and does not retain it. Three per triangle otherwise means 3600 short-
-// lived objects a frame in the hottest function of the module.
-const decodedVertex: DecodedVertex = {
-    x: 0, y: 0, ooz: 0, oow: 0, tmu0oow: 0, r: 0, g: 0, b: 0, a: 0, sow: 0, tow: 0,
-};
-
-function decodeVertexForDraw(ptr: number): DecodedVertex {
+function fillVertexFloats(ptr: number, out: Float32Array): void {
     // glide2x has exactly ONE GrVertex layout (glide.h: the GLIDE3 one is behind
     // #ifdef GLIDE3). Scoring the fields to pick a layout per vertex is not a
     // fallback, it is a coin flip that lands differently inside one frame — the
     // symptom is a handful of triangles a frame with garbage s/t and depth.
-    const f = vertexFloats;
-    if (!Mem.readFloat32Into(ptr, GR_VERTEX_FLOATS, f)) {
-        f.fill(0);
-        f[F_OOW] = 1;
-        f[F_R] = f[F_G] = f[F_B] = f[F_A] = 255;
+    if (!Mem.readFloat32Into(ptr, GR_VERTEX_FLOATS, out)) {
+        out.fill(0);
+        out[F_OOW] = 1;
+        out[F_R] = out[F_G] = out[F_B] = out[F_A] = 255;
     }
-    const v = decodedVertex;
-    v.x = f[F_X]!; v.y = f[F_Y]!; v.ooz = f[F_OOZ]!; v.oow = f[F_OOW]!;
-    v.tmu0oow = f[F_TMU0_OOW]!;
-    v.r = f[F_R]!; v.g = f[F_G]!; v.b = f[F_B]!; v.a = f[F_A]!;
-    v.sow = f[F_SOW]!; v.tow = f[F_TOW]!;
-    return v;
 }
 
 /**
@@ -145,20 +131,25 @@ function vertexPtrAt(basePtr: number, index: number): number {
     return (basePtr + index * GR_VERTEX_SIZE) >>> 0;
 }
 
-function pushVertexFromPtr(context: GlideContext, ptr: number): number {
-    const v = decodeVertexForDraw(ptr >>> 0);
-    const x = v.x;
-    const y = v.y;
-    const z = clamp01(v.ooz / 65535.0);
+/**
+ * The whole of a Glide vertex push, over the 12 floats a draw actually reads. Shared
+ * verbatim by the OUT-trap path (which reads them out of guest memory) and the
+ * write-buffer path (which reads them out of the ring copy taken at call time) — two
+ * copies of this would drift on whichever one someone edited, and only under load.
+ */
+export function pushVertexFloats(context: GlideContext, f: Float32Array, base: number): number {
+    const x = f[base + F_X]!;
+    const y = f[base + F_Y]!;
+    const z = clamp01(f[base + F_OOZ]! / 65535.0);
     // tmuvtx[0].oow is only supplied when the app said so via
     // grHints(GR_HINT_STWHINT, GR_STWHINT_W_DIFF_TMU0); otherwise the field holds
     // whatever the app's vertex struct was last left with, and the vertex's own
     // oow is the perspective divisor.
     const perTmuW = (context.runtime.stwHint & GR_STWHINT_W_DIFF_TMU0) !== 0;
-    const qRaw = perTmuW ? v.tmu0oow : v.oow;
+    const qRaw = perTmuW ? f[base + F_TMU0_OOW]! : f[base + F_OOW]!;
     const q = Number.isFinite(qRaw) && Math.abs(qRaw) > 1e-8 ? qRaw : 1.0;
-    const u = v.sow;
-    const vTex = v.tow;
+    const u = f[base + F_SOW]!;
+    const vTex = f[base + F_TOW]!;
     // In delta0 mode the RGB iterators carry zero slopes and are pinned to the
     // grConstantColorValue4 colour, so the hardware never reads the vertex r/g/b:
     // paramIndex drops STATE_REQUIRES_IT_DRGB (gglide.c:1999) and the data list then
@@ -168,10 +159,16 @@ function pushVertexFromPtr(context: GlideContext, ptr: number): number {
     // along every shared edge. Alpha is untouched by delta0 and still comes from the
     // vertex. Otherwise: raw iterated color, the WGSL combine unit picks the inputs.
     const rt = context.runtime;
+    const a = f[base + F_A]!;
     const color = rt.colorCombineDelta0
-        ? packRgba((rt.delta0Rgb >>> 16) & 0xff, (rt.delta0Rgb >>> 8) & 0xff, rt.delta0Rgb & 0xff, v.a)
-        : packRgba(v.r, v.g, v.b, v.a);
+        ? packRgba((rt.delta0Rgb >>> 16) & 0xff, (rt.delta0Rgb >>> 8) & 0xff, rt.delta0Rgb & 0xff, a)
+        : packRgba(f[base + F_R]!, f[base + F_G]!, f[base + F_B]!, a);
     return context.stream.pushVertex(x, y, z, u, vTex, q, color);
+}
+
+function pushVertexFromPtr(context: GlideContext, ptr: number): number {
+    fillVertexFloats(ptr >>> 0, vertexFloats);
+    return pushVertexFloats(context, vertexFloats, 0);
 }
 
 function pushDraw(
@@ -279,6 +276,37 @@ function drawSimpleRect(context: GlideContext, x: number, y: number, w: number, 
     pushDraw(context, "triangle-list", first, 6);
 }
 
+/**
+ * The whole of grDrawTriangle, shared by the OUT-trap path and the write-buffer drain.
+ *
+ * `captured`, when present, is the three vertices the WBUF trampoline copied into the ring
+ * at CALL time, laid out as GR_VERTEX_FLOATS floats each — which is the entire reason a
+ * call taking guest pointers can be deferred at all. The pointers are still passed so the
+ * diagnostic ring records what the guest actually handed us, not where we read it from.
+ */
+export function applyGrDrawTriangle(
+    context: GlideContext,
+    a: number,
+    b: number,
+    c: number,
+    captured: Float32Array | null,
+): number {
+    if (!a || !b || !c) return 0;
+    const first = context.stream.getVertexCount();
+    if (captured) {
+        pushVertexFloats(context, captured, 0);
+        pushVertexFloats(context, captured, GR_VERTEX_FLOATS);
+        pushVertexFloats(context, captured, GR_VERTEX_FLOATS * 2);
+    } else {
+        pushVertexFromPtr(context, a);
+        pushVertexFromPtr(context, b);
+        pushVertexFromPtr(context, c);
+    }
+    pushDraw(context, "triangle-list", first, 3);
+    recordTriangleSource(a, b, c);
+    return 0;
+}
+
 export function createDrawExports(context: GlideContext): Record<string, ThunkImplementation> {
     return {
         "_grDrawPoint@4": (_ctx, _mem, args) => {
@@ -301,19 +329,8 @@ export function createDrawExports(context: GlideContext): Record<string, ThunkIm
             return 0;
         },
 
-        "_grDrawTriangle@12": (_ctx, _mem, args) => {
-            const a = args[0] >>> 0;
-            const b = args[1] >>> 0;
-            const c = args[2] >>> 0;
-            if (!a || !b || !c) return 0;
-            const first = context.stream.getVertexCount();
-            pushVertexFromPtr(context, a);
-            pushVertexFromPtr(context, b);
-            pushVertexFromPtr(context, c);
-            pushDraw(context, "triangle-list", first, 3);
-            recordTriangleSource(a, b, c);
-            return 0;
-        },
+        "_grDrawTriangle@12": (_ctx, _mem, args) =>
+            applyGrDrawTriangle(context, args[0] >>> 0, args[1] >>> 0, args[2] >>> 0, null),
 
         "_grDrawPlanarPolygon@12": (_ctx, _mem, args) => {
             drawIndexedPolygon(context, args[0] | 0, args[1] >>> 0, args[2] >>> 0);

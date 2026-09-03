@@ -277,7 +277,9 @@ export type GlideContext = {
     };
 };
 
-function createDefaultRuntimeState(): GlideRuntimeState {
+/** Exported so a test can build a context over the REAL default render state;
+ *  a hand-rolled stand-in drifts from it silently. */
+export function createDefaultRuntimeState(): GlideRuntimeState {
     return {
         // Default to iterated-color passthrough (FUNCTION_LOCAL, LOCAL_ITERATED) so a
         // draw before the game sets a combine renders vertex color, not black.
