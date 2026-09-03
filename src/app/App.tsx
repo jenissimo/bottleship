@@ -1181,8 +1181,24 @@ export default function App() {
 
     const resize = () => {
       const devicePixelRatio = window.devicePixelRatio || 1;
-      const renderWidth = Math.max(1, Math.floor(canvas.clientWidth * devicePixelRatio));
-      const renderHeight = Math.max(1, Math.floor(canvas.clientHeight * devicePixelRatio));
+      // Measure the CONTAINER, never the canvas itself. The canvas is laid out
+      // `width/height: auto` (App.module.css), so its used CSS size IS its backing
+      // buffer's size: sizing the buffer from `canvas.clientWidth` feeds the element's
+      // own output back into its input and the pair collapses — observed settling at
+      // 300x225 for a 640x480 guest. The container's box is decided by the layout and
+      // owes nothing to the buffer, so it is the only stable input.
+      const box = canvas.parentElement ?? canvas;
+      const guest = guestResolutionRef.current;
+      const aspect = guest.height > 0 ? guest.width / guest.height : 4 / 3;
+      const availW = Math.max(1, box.clientWidth);
+      const availH = Math.max(1, box.clientHeight);
+      // Fit the guest's aspect inside the container, exactly as the CSS aspect-ratio
+      // box does, so the buffer matches what is actually painted — a mismatch would
+      // resample the frame a second time.
+      const fitW = Math.min(availW, availH * aspect);
+      const fitH = Math.min(availH, availW / aspect);
+      const renderWidth = Math.max(1, Math.floor(fitW * devicePixelRatio));
+      const renderHeight = Math.max(1, Math.floor(fitH * devicePixelRatio));
 
       // Update ref for event calculations (cannot set canvas.width/height anymore)
       resolutionRef.current = { width: renderWidth, height: renderHeight };
