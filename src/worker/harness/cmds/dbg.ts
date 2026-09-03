@@ -403,7 +403,7 @@ export function registerDbgCommands(svc: HarnessService): void {
     svc.register("d3d9GuestRefcount", (args) => {
         const opts = (args[0] ?? {}) as { on?: boolean; verify?: boolean; reset?: boolean };
         const g = globalThis as Record<string, unknown>;
-        if (opts.on !== undefined) g.__d3d9GuestRefcount = !!opts.on;
+        if (opts.on !== undefined) g.__d3d9MirrorRefcount = !opts.on;
         if (opts.verify !== undefined) g.__d3d9RefcountVerify = !!opts.verify;
         return d3d9RefcountStorageStats(!!opts.reset);
     });
@@ -443,13 +443,13 @@ export function registerDbgCommands(svc: HarnessService): void {
     svc.register("d3d9GuestAddRef", (args) => {
         const opts = (args[0] ?? {}) as { on?: boolean; verify?: boolean; reset?: boolean };
         const g = globalThis as Record<string, unknown>;
-        if (opts.on !== undefined) g.__d3d9GuestAddRefStub = !!opts.on;
+        if (opts.on !== undefined) g.__d3d9NoGuestComStubs = !opts.on;
         if (opts.verify !== undefined) g.__d3d9AddRefStubVerify = !!opts.verify;
         return {
             ...d3d9GuestAddRefStats(!!opts.reset),
-            requestedOn: !!g.__d3d9GuestAddRefStub,
+            requestedOn: !g.__d3d9NoGuestComStubs,
             requestedVerify: !!g.__d3d9AddRefStubVerify,
-            guestRefcount: !!g.__d3d9GuestRefcount,
+            guestRefcount: !g.__d3d9MirrorRefcount,
             appliesAt: "next boot (the stub patch has no unpatch path)",
         };
     });
@@ -473,15 +473,63 @@ export function registerDbgCommands(svc: HarnessService): void {
     svc.register("d3d9GuestRelease", (args) => {
         const opts = (args[0] ?? {}) as { on?: boolean; verify?: boolean; reset?: boolean };
         const g = globalThis as Record<string, unknown>;
-        if (opts.on !== undefined) g.__d3d9GuestReleaseStub = !!opts.on;
+        if (opts.on !== undefined) g.__d3d9NoGuestComStubs = !opts.on;
         if (opts.verify !== undefined) g.__d3d9ReleaseStubVerify = !!opts.verify;
         return {
             ...d3d9GuestReleaseStats(!!opts.reset),
-            requestedOn: !!g.__d3d9GuestReleaseStub,
+            requestedOn: !g.__d3d9NoGuestComStubs,
             requestedVerify: !!g.__d3d9ReleaseStubVerify,
-            guestRefcount: !!g.__d3d9GuestRefcount,
+            guestRefcount: !g.__d3d9MirrorRefcount,
             streamRing: !!g.__d3d9StreamRing,
             appliesAt: "next boot (the stub patch has no unpatch path)",
+        };
+    });
+
+    /** d3d9GuestComStubs({on?, verify?, reset?}) — BOTH halves of the AddRef/Release pair,
+     *  set coherently.
+     *
+     *  The pair is 80.8 % of every WASM→JS crossing an in-race D3D9 title makes, and it needs
+     *  three flags that are only correct together: the count of record must be in the guest COM
+     *  block BEFORE either stub is installed, or the stub's mutations are invisible to JS and an
+     *  object either never dies or dies while the guest still holds it. Setting them one at a
+     *  time is the footgun this verb removes.
+     *
+     *  IT ALSO NAMES THE TRADE. `__d3d9StreamRing` defers SetStreamSource/SetIndices onto the
+     *  WBUF ring and rides on Buffer9::Release being the OUT trap that drains it first; the two
+     *  cannot both be on. Measured, the stubs are worth ~5-6.5 ms a frame against the ring's
+     *  ~1.3, so `on` turns the ring OFF and says so rather than letting the Release stub refuse
+     *  itself at registration and leave half the pair installed.
+     *
+     *  BOOT-TIME: a patched stub has no unpatch path, so this sets the NEXT boot's state while
+     *  the returned `addRef`/`release` report what is installed right now. */
+    svc.register("d3d9GuestComStubs", (args) => {
+        const opts = (args[0] ?? {}) as { on?: boolean; verify?: boolean; reset?: boolean };
+        const g = globalThis as Record<string, unknown>;
+        let ringDisabled = false;
+        if (opts.on !== undefined) {
+            const on = !!opts.on;
+            if (on && g.__d3d9StreamRing) { g.__d3d9StreamRing = false; ringDisabled = true; }
+            g.__d3d9MirrorRefcount = !on;
+            g.__d3d9NoGuestComStubs = !on || !!opts.verify;
+            g.__d3d9AddRefStubVerify = on && !!opts.verify;
+            g.__d3d9ReleaseStubVerify = on && !!opts.verify;
+        } else if (opts.verify !== undefined) {
+            g.__d3d9AddRefStubVerify = !!opts.verify;
+            g.__d3d9ReleaseStubVerify = !!opts.verify;
+        }
+        return {
+            addRef: d3d9GuestAddRefStats(!!opts.reset),
+            release: d3d9GuestReleaseStats(!!opts.reset),
+            storage: d3d9RefcountStorageStats(!!opts.reset),
+            requested: {
+                guestRefcount: !g.__d3d9MirrorRefcount,
+                addRefStub: !g.__d3d9NoGuestComStubs,
+                releaseStub: !g.__d3d9NoGuestComStubs,
+                verify: !!g.__d3d9AddRefStubVerify || !!g.__d3d9ReleaseStubVerify,
+                streamRing: !!g.__d3d9StreamRing,
+            },
+            ringDisabled,
+            appliesAt: "next boot (a patched stub has no unpatch path)",
         };
     });
 

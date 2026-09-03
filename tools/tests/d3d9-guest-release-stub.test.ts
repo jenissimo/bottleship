@@ -54,9 +54,9 @@ const imm32 = (v: number): number[] => [v & 0xff, (v >> 8) & 0xff, (v >> 16) & 0
 
 const g = globalThis as Record<string, unknown>;
 function clearFlags(): void {
-    delete g.__d3d9GuestReleaseStub;
+    delete g.__d3d9NoGuestComStubs;
     delete g.__d3d9ReleaseStubVerify;
-    delete g.__d3d9GuestRefcount;
+    delete g.__d3d9MirrorRefcount;
     delete g.__d3d9StreamRing;
 }
 
@@ -159,17 +159,25 @@ describe('guest Release stub — installation refuses what it cannot make safe',
         };
     }
 
-    it('does nothing at all with both flags off', () => {
+    it('installs by default — the guest block is the count of record', () => {
+        const d = fakeDispatcher();
+        registerGuestReleaseStub(d);
+        expect(d.calls.length).toBe(1);
+        expect(d3d9GuestReleaseStats().mode).toBe('live');
+    });
+
+    it('does nothing at all when opted out', () => {
+        g.__d3d9NoGuestComStubs = true;
         const d = fakeDispatcher();
         registerGuestReleaseStub(d);
         expect(d.calls.length).toBe(0);
-        expect(d3d9GuestReleaseStats().verdict).toBe('stub not installed');
+        expect(d3d9GuestReleaseStats().mode).toBe('off');
     });
 
-    it('REFUSES while the JS mirror is still the count of record', () => {
+    it('REFUSES while the JS mirror is put back in charge', () => {
         // Decrements the guest word with no JS in the loop; with the Map authoritative the
         // count never reaches zero and nothing is ever destroyed.
-        g.__d3d9GuestReleaseStub = true;
+        g.__d3d9MirrorRefcount = true;
         const d = fakeDispatcher();
         registerGuestReleaseStub(d);
         expect(d.calls.length).toBe(0);
@@ -178,8 +186,8 @@ describe('guest Release stub — installation refuses what it cannot make safe',
 
     it('REFUSES a buffer interface while __d3d9StreamRing defers stream bindings', () => {
         // The ring is safe only because Buffer9::Release is the OUT trap that drains it first.
-        g.__d3d9GuestRefcount = true;
-        g.__d3d9GuestReleaseStub = true;
+        g.__d3d9MirrorRefcount = false;
+        g.__d3d9NoGuestComStubs = false;
         g.__d3d9StreamRing = true;
         const d = fakeDispatcher();
         registerGuestReleaseStub(d, 'IDirect3DVertexBuffer9');
@@ -188,8 +196,8 @@ describe('guest Release stub — installation refuses what it cannot make safe',
     });
 
     it('…and installs that same interface once the ring is off — the guard is the ring, not the name', () => {
-        g.__d3d9GuestRefcount = true;
-        g.__d3d9GuestReleaseStub = true;
+        g.__d3d9MirrorRefcount = false;
+        g.__d3d9NoGuestComStubs = false;
         const d = fakeDispatcher();
         registerGuestReleaseStub(d, 'IDirect3DVertexBuffer9');
         expect(d.calls.length).toBe(1);
@@ -197,8 +205,8 @@ describe('guest Release stub — installation refuses what it cannot make safe',
     });
 
     it('Texture9 installs WITH the ring on: patching is per function name, and buffers keep trapping', () => {
-        g.__d3d9GuestRefcount = true;
-        g.__d3d9GuestReleaseStub = true;
+        g.__d3d9MirrorRefcount = false;
+        g.__d3d9NoGuestComStubs = false;
         g.__d3d9StreamRing = true;
         const d = fakeDispatcher();
         registerGuestReleaseStub(d);
@@ -207,7 +215,7 @@ describe('guest Release stub — installation refuses what it cannot make safe',
     });
 
     it('installs the oracle when asked, and passes the dec kind and refcount offset through', () => {
-        g.__d3d9GuestRefcount = true;
+        g.__d3d9MirrorRefcount = false;
         g.__d3d9ReleaseStubVerify = true;
         const d = fakeDispatcher();
         registerGuestReleaseStub(d);
@@ -218,7 +226,7 @@ describe('guest Release stub — installation refuses what it cannot make safe',
 
 describe('guest Release oracle — it can fail, and says so', () => {
     function armOracle(prediction: { value: number; valid: boolean; code: number } | null) {
-        g.__d3d9GuestRefcount = true;
+        g.__d3d9MirrorRefcount = false;
         g.__d3d9ReleaseStubVerify = true;
         registerGuestReleaseStub({
             registerGuestIncRefStub() { },
@@ -230,26 +238,26 @@ describe('guest Release oracle — it can fail, and says so', () => {
 
     it('agrees when guest code and the JS handler answer the same', () => {
         armOracle({ value: 6, valid: true, code: 1 });
-        noteGuestReleaseOracle(6);
+        noteGuestReleaseOracle(6, -1);
         expect(d3d9GuestReleaseStats()).toMatchObject({ checked: 1, mismatch: 0, zeroChecked: 0 });
     });
 
     it('an above-zero agreement is NOT reported as a clean pass while no destruction was seen', () => {
         armOracle({ value: 6, valid: true, code: 1 });
-        noteGuestReleaseOracle(6);
+        noteGuestReleaseOracle(6, -1);
         expect(d3d9GuestReleaseStats().verdict).toBe('agree, but the 1->0 transition never ran');
     });
 
     it('DISAGREES the moment the above-zero prediction is wrong', () => {
         armOracle({ value: 8, valid: true, code: 1 });
-        noteGuestReleaseOracle(7);
+        noteGuestReleaseOracle(7, -1);
         const s = d3d9GuestReleaseStats();
-        expect(s).toMatchObject({ mismatch: 1, verdict: 'DISAGREE', firstMismatch: 'guest=8 js=7' });
+        expect(s).toMatchObject({ mismatch: 1, verdict: 'DISAGREE', firstMismatch: 'guest=8 js=7 jsWord=-1' });
     });
 
     it('checks the DECLINED path too: count 1 must be the answer 0 that destroyed the object', () => {
         armOracle({ value: 1, valid: false, code: 2 });
-        noteGuestReleaseOracle(0);
+        noteGuestReleaseOracle(0, -1);
         expect(d3d9GuestReleaseStats()).toMatchObject({
             checked: 1, zeroChecked: 1, mismatch: 0, verdict: 'agree',
         });
@@ -259,15 +267,46 @@ describe('guest Release oracle — it can fail, and says so', () => {
         // The stub read 1 (so it declined), JS answered 5: the guest word is not the count of
         // record for this object, and the live stub would have been decrementing the wrong dword.
         armOracle({ value: 1, valid: false, code: 2 });
-        noteGuestReleaseOracle(5);
+        noteGuestReleaseOracle(5, -1);
         const s = d3d9GuestReleaseStats();
         expect(s).toMatchObject({ mismatch: 1, zeroMismatch: 1, verdict: 'DISAGREE' });
-        expect(s.firstMismatch).toBe('zero-path guestCount=1 js=5');
+        expect(s.firstMismatch).toBe('zero-path guestCount=1 js=5 jsWord=-1');
+    });
+
+    it('a prediction displaced by the oracle own drain is named, not counted as a disagreement', () => {
+        // The trampoline read 6 (predicting 5); by the time JS ran, a WBUF drain had taken
+        // the count to 5, so JS answered 4. Both tiers did the same arithmetic on different
+        // counts. The live stub never traps, so this drain would not have run there.
+        armOracle({ value: 5, valid: true, code: 1 });
+        noteGuestReleaseOracle(4, 5);
+        const s = d3d9GuestReleaseStats();
+        expect(s.mismatch).toBe(0);
+        expect(s.displaced).toBe(1);
+        expect(s.firstDisplaced).toBe('guest=5 js=4 jsWord=5');
+        expect(s.verdict).toContain('displaced');
+    });
+
+    it('displacement never excuses a prediction the JS word cannot explain', () => {
+        // Same shape, but JS's answer is not `word - 1` for any word it saw: a real
+        // disagreement must not be laundered through the displacement branch.
+        armOracle({ value: 5, valid: true, code: 1 });
+        noteGuestReleaseOracle(9, 5);
+        const s = d3d9GuestReleaseStats();
+        expect(s.displaced).toBe(0);
+        expect(s).toMatchObject({ mismatch: 1, verdict: 'DISAGREE' });
+    });
+
+    it('an untracked object (word -1) can never be excused as displaced', () => {
+        armOracle({ value: 5, valid: true, code: 1 });
+        noteGuestReleaseOracle(0, -1);   // JS answers 0 for a pointer it does not track
+        const s = d3d9GuestReleaseStats();
+        expect(s.displaced).toBe(0);
+        expect(s.mismatch).toBe(1);
     });
 
     it('an unpredicted call is counted apart, and 0 checks is NOT a pass', () => {
         armOracle({ value: 0, valid: false, code: 0 });
-        noteGuestReleaseOracle(7);
+        noteGuestReleaseOracle(7, -1);
         const s = d3d9GuestReleaseStats();
         expect(s).toMatchObject({ checked: 0, unpredicted: 1, verdict: 'oracle did not run' });
     });
@@ -275,7 +314,7 @@ describe('guest Release oracle — it can fail, and says so', () => {
     it('reset clears the counters, and the vtable gate is reported', () => {
         armOracle({ value: 8, valid: true, code: 1 });
         publishTexture9ReleaseVtable(0x1234);
-        noteGuestReleaseOracle(7);
+        noteGuestReleaseOracle(7, -1);
         expect(d3d9GuestReleaseStats(true).mismatch).toBe(1);
         const after = d3d9GuestReleaseStats();
         expect(after.mismatch).toBe(0);
@@ -289,7 +328,7 @@ describe('guest Release oracle — it can fail, and says so', () => {
 describe('the Release oracle is actually wired into the handler that runs', () => {
     it('Texture9::Release fast path feeds the Release oracle', async () => {
         const { registerFastPathD3D9Functions } = await import('../../src/worker/modules/d3d9/fast-path');
-        g.__d3d9GuestRefcount = true;
+        g.__d3d9MirrorRefcount = false;
         g.__d3d9ReleaseStubVerify = true;
 
         const fastPaths = new Map<string, Function>();

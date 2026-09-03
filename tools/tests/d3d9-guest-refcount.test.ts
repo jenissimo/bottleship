@@ -1,6 +1,6 @@
 /**
  * D3D9 COM refcount storage: the guest block is authoritative under
- * __d3d9GuestRefcount, and the differential oracle can actually FAIL.
+ * the default guest storage (opt out with __d3d9MirrorRefcount), and the oracle can FAIL.
  *
  * The second half is the point. An oracle that only ever reports "agree" converts
  * an unchecked invariant into a false assurance, so this pins that a count
@@ -17,6 +17,7 @@ import {
     getComRefCount,
     releaseComRef,
     trackComObject,
+    unpinGuestRefcountStoreForTests,
 } from "../../src/worker/modules/d3d9/com-refs";
 
 const OBJ = 0x2000;
@@ -27,7 +28,7 @@ function guestWord(ptr: number): number {
         .getUint32(ptr + D3D9_COM_REFCOUNT_OFFSET, true);
 }
 
-const flags = globalThis as { __d3d9GuestRefcount?: boolean; __d3d9RefcountVerify?: boolean };
+const flags = globalThis as { __d3d9MirrorRefcount?: boolean; __d3d9RefcountVerify?: boolean };
 
 describe("d3d9 guest-memory COM refcount", () => {
     beforeEach(() => {
@@ -35,15 +36,20 @@ describe("d3d9 guest-memory COM refcount", () => {
         Mem.bind(() => mem);
         drainComFinalizers();
         d3d9RefcountStorageStats(true);
+        // A live stub in another file PINS the guest store for the process, and a pinned
+        // store makes this file's oracle answer "not applicable" instead of running.
+        unpinGuestRefcountStoreForTests();
+        flags.__d3d9MirrorRefcount = false;
     });
 
     afterEach(() => {
-        flags.__d3d9GuestRefcount = false;
+        flags.__d3d9MirrorRefcount = true;   // opt back into the JS mirror
         flags.__d3d9RefcountVerify = false;
         drainComFinalizers();
     });
 
-    test("default OFF leaves the guest block untouched", () => {
+    test("opting back into the JS mirror leaves the guest block untouched", () => {
+        flags.__d3d9MirrorRefcount = true;
         trackComObject(OBJ);
         addComRef(OBJ);
         expect(getComRefCount(OBJ)).toBe(2);
@@ -52,7 +58,7 @@ describe("d3d9 guest-memory COM refcount", () => {
     });
 
     test("guest block is the count of record when the flag is on", () => {
-        flags.__d3d9GuestRefcount = true;
+        flags.__d3d9MirrorRefcount = false;
         trackComObject(OBJ);
         expect(guestWord(OBJ)).toBe(1);
         addComRef(OBJ);
@@ -64,7 +70,7 @@ describe("d3d9 guest-memory COM refcount", () => {
     });
 
     test("the last release zeroes the word and runs the finalizer once", () => {
-        flags.__d3d9GuestRefcount = true;
+        flags.__d3d9MirrorRefcount = false;
         let disposed = 0;
         trackComObject(OBJ, () => { disposed++; });
         expect(releaseComRef(OBJ)).toBe(0);
@@ -74,10 +80,11 @@ describe("d3d9 guest-memory COM refcount", () => {
     });
 
     test("a flag flipped mid-run reseeds the guest words from the mirror", () => {
+        flags.__d3d9MirrorRefcount = true;
         trackComObject(OBJ);
         addComRef(OBJ);            // count 2, guest word still untouched
         expect(guestWord(OBJ)).toBe(0);
-        flags.__d3d9GuestRefcount = true;
+        flags.__d3d9MirrorRefcount = false;
         expect(getComRefCount(OBJ)).toBe(2);
         expect(guestWord(OBJ)).toBe(2);
     });
@@ -106,7 +113,7 @@ describe("d3d9 guest-memory COM refcount", () => {
     });
 
     test("checked:0 reports 'oracle did not run' rather than passing", () => {
-        flags.__d3d9GuestRefcount = true;   // guest storage on, verify off
+        flags.__d3d9MirrorRefcount = false;  // guest storage on, verify off
         trackComObject(OBJ);
         addComRef(OBJ);
         const s = d3d9RefcountStorageStats();

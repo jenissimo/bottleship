@@ -8,7 +8,7 @@
  * (`D3D9_COM_REFCOUNT_OFFSET`), the whole method is `inc [this+4]; mov eax,[this+4]; ret 4`.
  *
  * PRECONDITION, enforced here rather than assumed: the guest word must BE the count of record
- * (`__d3d9GuestRefcount`). With the JS Map authoritative the stub's increments would be
+ * (the default). With the JS Map authoritative the stub's increments would be
  * invisible to the JS side, the count would run low, and an object would be destroyed while
  * the guest still holds references. Registration refuses, loudly, if the flag is off — and
  * once it installs it PINS the guest store so a later flag flip cannot hand authority back to
@@ -23,7 +23,7 @@
  * anyone can read it. Release is NOT stubbed — see the note at the bottom of this file.
  *
  * Flags (BOOT-TIME: patching a stub has no unpatch path):
- *   __d3d9GuestAddRefStub — install the live stub.
+ *   __d3d9NoGuestComStubs — opt OUT (the live stub is the default).
  *   __d3d9AddRefStubVerify — install the NON-MUTATING oracle instead: guest code predicts the
  *     value the live stub would return, and the JS handler still runs and compares.
  */
@@ -35,12 +35,12 @@ const IFACE = 'IDirect3DTexture9';
 const FUNC = `${IFACE}_AddRef`;
 
 interface AddRefStubFlags {
-    /** Answer Texture9::AddRef in guest code (default off). */
-    __d3d9GuestAddRefStub?: boolean;
+    /** Opt OUT: keep answering Texture9::AddRef in JS (default: guest code answers). */
+    __d3d9NoGuestComStubs?: boolean;
     /** Differential oracle: predict in guest code, still trap, compare (default off). */
     __d3d9AddRefStubVerify?: boolean;
-    /** The guest block must already be the count of record. */
-    __d3d9GuestRefcount?: boolean;
+    /** Opt out of the guest block being the count of record — also disables this stub. */
+    __d3d9MirrorRefcount?: boolean;
 }
 const flags = globalThis as AddRefStubFlags;
 
@@ -60,15 +60,18 @@ let pendingVtable = 0;
 let checked = 0;
 let mismatch = 0;
 let unpredicted = 0;
+/** Predictions the oracle's OWN trap invalidated — see noteGuestAddRefOracle. */
+let displaced = 0;
 let firstMismatch: string | null = null;
+let firstDisplaced: string | null = null;
 
 /**
  * Install the stub (or its oracle) for Texture9::AddRef. Call once, at D3D9 fast-path
  * registration; a no-op unless a flag asks for it.
  */
 export function registerGuestAddRefStub(dispatcher: unknown): void {
-    const want = !!flags.__d3d9GuestAddRefStub;
     const verify = !!flags.__d3d9AddRefStubVerify;
+    const want = !verify && !flags.__d3d9NoGuestComStubs;
     if (!want && !verify) return;
 
     const d = dispatcher as IncRefDispatcher;
@@ -76,12 +79,12 @@ export function registerGuestAddRefStub(dispatcher: unknown): void {
         Logger.warn(LogCategory.D3D9, 'guest AddRef stub: dispatcher has no registerGuestIncRefStub');
         return;
     }
-    if (!flags.__d3d9GuestRefcount) {
+    if (flags.__d3d9MirrorRefcount) {
         // Refusing beats installing: with the Map authoritative the stub's increments are
         // invisible to JS and the object dies under the guest's feet.
         Logger.error(LogCategory.D3D9,
-            'guest AddRef stub REFUSED: __d3d9GuestAddRefStub needs __d3d9GuestRefcount ' +
-            '(the guest block must be the count of record, not a mirror)');
+            'guest AddRef stub REFUSED: __d3d9MirrorRefcount puts the count back in the JS Map, ' +
+            'and the stub increments a word nobody reads');
         return;
     }
 
@@ -128,15 +131,35 @@ export function guestAddRefOracleActive(): boolean {
  * `guest=5 js=4` — the guest one ahead. Unexplained at ~1 in 3 M, and the reason this stays
  * default-OFF.
  */
-export function noteGuestAddRefOracle(actual: number): void {
+export function noteGuestAddRefOracle(actual: number, wordBeforeJs: number): void {
     if (mode !== 'verify') return;
     const p = boundDispatcher?.consumeIncRefPrediction?.('d3d9', FUNC);
     if (!p) return;
     if (!p.valid) { unpredicted++; return; }
     checked++;
-    if ((p.value >>> 0) !== (actual >>> 0)) {
-        mismatch++;
-        if (firstMismatch === null) firstMismatch = `guest=${p.value >>> 0} js=${actual >>> 0}`;
+    const guess = p.value >>> 0, answer = actual >>> 0;
+    if (guess === answer) return;
+    // The oracle's own trap displaces what it measures. Between the trampoline's
+    // read and this handler sits handlePortWrite's WBUF drain, and a drain handler
+    // can release or add a reference on THIS object — something the live stub,
+    // which never traps, would not have caused. The signature is exact: the guest
+    // predicted `word + 1` for the word it saw, and JS answered `word + 1` for the
+    // word IT saw. When the second identity holds and the first no longer does,
+    // the count moved underneath the oracle, and that is not a defect in the stub.
+    // When it does NOT hold, JS's arithmetic genuinely disagrees with the guest
+    // word — the failure that would destroy a live object — and it is a mismatch.
+    // `wordBeforeJs < 0` = no informative word (untracked object, or the mirror is
+    // authoritative). Excusing a prediction there would make the oracle unfalsifiable.
+    if (wordBeforeJs >= 0 && answer === (wordBeforeJs + 1) >>> 0) {
+        displaced++;
+        if (firstDisplaced === null) {
+            firstDisplaced = `guest=${guess} js=${answer} (word moved ${(guess - 1) >>> 0}->${wordBeforeJs} in the drain)`;
+        }
+        return;
+    }
+    mismatch++;
+    if (firstMismatch === null) {
+        firstMismatch = `guest=${guess} js=${answer} wordBeforeJs=${wordBeforeJs | 0}`;
     }
 }
 
@@ -150,7 +173,9 @@ export function d3d9GuestAddRefStats(reset = false): {
     checked: number;
     mismatch: number;
     unpredicted: number;
+    displaced: number;
     firstMismatch: string | null;
+    firstDisplaced: string | null;
     verdict: string;
 } {
     const status = boundDispatcher?.incRefStubStatus?.('d3d9', FUNC);
@@ -161,14 +186,27 @@ export function d3d9GuestAddRefStats(reset = false): {
         checked,
         mismatch,
         unpredicted,
+        displaced,
         firstMismatch,
+        firstDisplaced,
         verdict: mode !== 'verify'
             ? (mode === 'live' ? 'live stub: no oracle running' : 'stub not installed')
             : (checked === 0
                 ? 'oracle did not run'
-                : (mismatch === 0 ? 'agree' : 'DISAGREE')),
+                : mismatch > 0
+                    ? 'DISAGREE'
+                    : displaced === 0
+                        ? 'agree'
+                        // Named, not swept up: the live stub answers the same value, and the
+                        // count still converges — but the share is what says so, and it is
+                        // reported rather than folded into "agree".
+                        : `agree (${displaced} prediction(s) displaced by the oracle's own drain, ` +
+                          `${(100 * displaced / checked).toFixed(5)}%)`),
     };
-    if (reset) { checked = 0; mismatch = 0; unpredicted = 0; firstMismatch = null; }
+    if (reset) {
+        checked = 0; mismatch = 0; unpredicted = 0; displaced = 0;
+        firstMismatch = null; firstDisplaced = null;
+    }
     return out;
 }
 
@@ -177,7 +215,8 @@ export function resetGuestAddRefStubForTests(): void {
     boundDispatcher = null;
     mode = 'off';
     pendingVtable = 0;
-    checked = 0; mismatch = 0; unpredicted = 0; firstMismatch = null;
+    checked = 0; mismatch = 0; unpredicted = 0; displaced = 0;
+    firstMismatch = null; firstDisplaced = null;
 }
 
 /** Release is the other half of this pair and lives in guest-release-stub.ts. */

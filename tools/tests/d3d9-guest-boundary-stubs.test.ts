@@ -48,9 +48,9 @@ const imm32 = (v: number): number[] => [v & 0xff, (v >> 8) & 0xff, (v >> 16) & 0
 
 const g = globalThis as Record<string, unknown>;
 function clearFlags(): void {
-    delete g.__d3d9GuestAddRefStub;
+    delete g.__d3d9NoGuestComStubs;
     delete g.__d3d9AddRefStubVerify;
-    delete g.__d3d9GuestRefcount;
+    delete g.__d3d9MirrorRefcount;
 }
 
 afterEach(() => {
@@ -115,17 +115,25 @@ describe('guest AddRef stub — installation refuses what it cannot make safe', 
         };
     }
 
-    it('does nothing at all with both flags off', () => {
+    it('installs by default — the guest block is the count of record', () => {
+        const d = fakeDispatcher();
+        registerGuestAddRefStub(d);
+        expect(d.calls.length).toBe(1);
+        expect(d3d9GuestAddRefStats().mode).toBe('live');
+    });
+
+    it('does nothing at all when opted out', () => {
+        g.__d3d9NoGuestComStubs = true;
         const d = fakeDispatcher();
         registerGuestAddRefStub(d);
         expect(d.calls.length).toBe(0);
         expect(d3d9GuestAddRefStats().verdict).toBe('stub not installed');
     });
 
-    it('REFUSES to install while the JS mirror is still the count of record', () => {
+    it('REFUSES to install while the JS mirror is put back in charge', () => {
         // The stub increments the guest word with no JS in the loop. With the Map
         // authoritative those increments are invisible and the object dies under the guest.
-        g.__d3d9GuestAddRefStub = true;
+        g.__d3d9MirrorRefcount = true;
         const d = fakeDispatcher();
         registerGuestAddRefStub(d);
         expect(d.calls.length).toBe(0);
@@ -133,7 +141,7 @@ describe('guest AddRef stub — installation refuses what it cannot make safe', 
     });
 
     it('installs the oracle when asked, and passes the refcount offset through', () => {
-        g.__d3d9GuestRefcount = true;
+        g.__d3d9MirrorRefcount = false;
         g.__d3d9AddRefStubVerify = true;
         const d = fakeDispatcher();
         registerGuestAddRefStub(d);
@@ -146,7 +154,7 @@ describe('guest AddRef stub — installation refuses what it cannot make safe', 
 
 describe('guest AddRef oracle — it can fail, and says so', () => {
     function armOracle(prediction: { value: number; valid: boolean } | null) {
-        g.__d3d9GuestRefcount = true;
+        g.__d3d9MirrorRefcount = false;
         g.__d3d9AddRefStubVerify = true;
         registerGuestAddRefStub({
             registerGuestIncRefStub() { /* installed */ },
@@ -158,24 +166,47 @@ describe('guest AddRef oracle — it can fail, and says so', () => {
 
     it('agrees when guest code and the JS handler answer the same', () => {
         armOracle({ value: 7, valid: true });
-        noteGuestAddRefOracle(7);
-        noteGuestAddRefOracle(7);
+        noteGuestAddRefOracle(7, -1);
+        noteGuestAddRefOracle(7, -1);
         const s = d3d9GuestAddRefStats();
         expect(s).toMatchObject({ checked: 2, mismatch: 0, verdict: 'agree' });
     });
 
     it('DISAGREES the moment the prediction is wrong', () => {
         armOracle({ value: 8, valid: true });
-        noteGuestAddRefOracle(7);
+        noteGuestAddRefOracle(7, -1);
         const s = d3d9GuestAddRefStats();
         expect(s.mismatch).toBe(1);
         expect(s.verdict).toBe('DISAGREE');
-        expect(s.firstMismatch).toBe('guest=8 js=7');
+        expect(s.firstMismatch).toBe('guest=8 js=7 wordBeforeJs=-1');
+    });
+
+    it('a prediction displaced by the oracle own drain is named, not counted as a disagreement', () => {
+        // The trampoline read 4 (predicting 5); by the time JS ran, the WBUF drain this
+        // very trap forced had released a reference, so JS answered 4 for a word of 3.
+        armOracle({ value: 5, valid: true });
+        noteGuestAddRefOracle(4, 3);
+        const s = d3d9GuestAddRefStats();
+        expect(s.mismatch).toBe(0);
+        expect(s.displaced).toBe(1);
+        expect(s.verdict).toContain('displaced');
+    });
+
+    it('displacement never excuses a prediction the JS word cannot explain', () => {
+        armOracle({ value: 5, valid: true });
+        noteGuestAddRefOracle(9, 3);
+        expect(d3d9GuestAddRefStats()).toMatchObject({ mismatch: 1, displaced: 0, verdict: 'DISAGREE' });
+    });
+
+    it('an untracked object (word -1) can never be excused as displaced', () => {
+        armOracle({ value: 5, valid: true });
+        noteGuestAddRefOracle(0, -1);
+        expect(d3d9GuestAddRefStats()).toMatchObject({ mismatch: 1, displaced: 0 });
     });
 
     it('an unpredicted call is counted apart, and 0 checks is NOT a pass', () => {
         armOracle({ value: 0, valid: false });
-        noteGuestAddRefOracle(7);
+        noteGuestAddRefOracle(7, -1);
         const s = d3d9GuestAddRefStats();
         expect(s.checked).toBe(0);
         expect(s.unpredicted).toBe(1);
@@ -185,7 +216,7 @@ describe('guest AddRef oracle — it can fail, and says so', () => {
     it('reset clears the counters, and the vtable gate is reported', () => {
         armOracle({ value: 8, valid: true });
         publishTexture9Vtable(0x1234);
-        noteGuestAddRefOracle(7);
+        noteGuestAddRefOracle(7, -1);
         expect(d3d9GuestAddRefStats(true).mismatch).toBe(1);
         const after = d3d9GuestAddRefStats();
         expect(after.mismatch).toBe(0);
@@ -201,7 +232,7 @@ describe('guest AddRef oracle — it can fail, and says so', () => {
 describe('the oracles are actually wired into the handlers that run', () => {
     it('Texture9::AddRef fast path feeds the AddRef oracle', async () => {
         const { registerFastPathD3D9Functions } = await import('../../src/worker/modules/d3d9/fast-path');
-        g.__d3d9GuestRefcount = true;
+        g.__d3d9MirrorRefcount = false;
         g.__d3d9AddRefStubVerify = true;
 
         const fastPaths = new Map<string, Function>();
@@ -238,7 +269,7 @@ describe('the prediction slot is consumed, not just read', () => {
     // `unpredicted`. This is also the cheapest test of the open `guest=5 js=4` question.
     it('a second read after one prediction is unpredicted, not a mismatch', () => {
         const slot = { value: 5, valid: true };
-        g.__d3d9GuestRefcount = true;
+        g.__d3d9MirrorRefcount = false;
         g.__d3d9AddRefStubVerify = true;
         registerGuestAddRefStub({
             registerGuestIncRefStub() { },
@@ -250,8 +281,8 @@ describe('the prediction slot is consumed, not just read', () => {
                 return out;
             },
         });
-        noteGuestAddRefOracle(5);
-        noteGuestAddRefOracle(4);
+        noteGuestAddRefOracle(5, -1);
+        noteGuestAddRefOracle(4, -1);
         const stats = d3d9GuestAddRefStats();
         expect(stats.checked).toBe(1);
         expect(stats.mismatch).toBe(0);

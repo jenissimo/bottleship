@@ -32,6 +32,7 @@ import { isValidAddress } from '../../core/memory/address-guard';
 import { Mem } from '../../core/memory/mem-accessor';
 import { devices, stateBlocks, resourceToDevice, addComRef } from './shared-state';
 import { addD3D9ComRef, releaseD3D9ComRef } from './state';
+import { readComRefGuestWord } from './com-refs';
 import { tryFastGetData } from './query';
 import {
     D3DSURFACE_DESC_SIZE,
@@ -477,18 +478,26 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
         const oracled = prefix === 'IDirect3DTexture9';
         dispatcher.registerFastPath('d3d9', `${prefix}_AddRef`,
             (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-                const answer = addD3D9ComRef(prefix, view.getUint32(cpu.reg32[4] + 4, true));
+                const ptr = view.getUint32(cpu.reg32[4] + 4, true);
+                // Read BEFORE the mutation: the oracle needs the count as JS found it to
+                // separate a real disagreement from one its own trap's drain created.
+                const oracle = oracled && guestAddRefOracleActive();
+                const before = oracle ? readComRefGuestWord(ptr) : 0;
+                const answer = addD3D9ComRef(prefix, ptr);
                 // Oracle only: with the live stub installed this handler is not reached at all.
-                if (oracled && guestAddRefOracleActive()) noteGuestAddRefOracle(answer);
+                if (oracle) noteGuestAddRefOracle(answer, before);
                 return answer;
             },
             { trivial: true });
         dispatcher.registerFastPath('d3d9', `${prefix}_Release`,
             (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-                const answer = releaseD3D9ComRef(prefix, view.getUint32(cpu.reg32[4] + 4, true));
+                const ptr = view.getUint32(cpu.reg32[4] + 4, true);
+                const oracle = oracled && guestReleaseOracleActive();
+                const before = oracle ? readComRefGuestWord(ptr) : 0;
+                const answer = releaseD3D9ComRef(prefix, ptr);
                 // With the live stub installed this handler still runs — for the 1→0 transition,
                 // which the stub deliberately hands back.
-                if (oracled && guestReleaseOracleActive()) noteGuestReleaseOracle(answer);
+                if (oracle) noteGuestReleaseOracle(answer, before);
                 return answer;
             },
             { trivial: true });
@@ -497,11 +506,11 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
     Logger.log(LogCategory.D3D9, 'Registered FastPath for hot D3D9 state setters, shader constants, draw calls, and resource AddRef/Release');
 
     // Texture9::AddRef answered in guest code — 40 % of every WASM exit this title makes.
-    // Opt-in and self-refusing; see guest-addref-stub.ts for the preconditions.
+    // Default ON, and self-refusing under its own preconditions; see guest-addref-stub.ts.
     registerGuestAddRefStub(dispatcher);
 
-    // Texture9::Release, the other 40 %. Answers only above zero — the 1→0 transition keeps
-    // trapping, because that is where the finalizer and disposer run.
+    // Texture9::Release, the other 40 %. Default ON; answers only above zero — the 1→0
+    // transition keeps trapping, because that is where the finalizer and disposer run.
     registerGuestReleaseStub(dispatcher);
 
     // ========================================================================
@@ -661,7 +670,7 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
     // handlePortWrite drains the ring BEFORE dispatching it, so a Release that would
     // take a buffer to zero is always preceded by the drain that binds it. THIS IS THE
     // LOAD-BEARING PRECONDITION: if Release ever becomes a no-trap guest stub (the
-    // __d3d9GuestRefcount follow-up), the two features must not be enabled together
+    // guest-refcount follow-up), the two features must not be enabled together
     // until ordering is re-established by some other means.
     //
     // Cost: a deferred setter answers D3D_OK unconditionally, so a guest that checks
