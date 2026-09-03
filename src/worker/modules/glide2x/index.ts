@@ -31,7 +31,7 @@ export class Glide2x implements IModule {
         Object.assign(this.exports, createDrawExports(this.context));
 
         // Move the per-triangle state setters off the OUT trap (see fast-path.ts).
-        registerGlideWriteBufferFunctions(process.dispatcher, this.exports);
+        registerGlideWriteBufferFunctions(process.dispatcher, this.exports, this.context);
 
         // Device loss invalidates exactly what a backend swap does: the executor and every
         // uploaded TMU texture. The texture records keep the guest `dataPtr` they were

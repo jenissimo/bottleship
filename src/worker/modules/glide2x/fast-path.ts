@@ -31,6 +31,10 @@
 
 import { Logger, LogCategory } from "../../core/logger";
 import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
+import { GlideContext } from "./context";
+import { applyGrTexSource } from "./texture";
+import { ParsedGrTexInfo } from "./structs";
+import { GR_TEXINFO_SIZE } from "./constants";
 
 type WriteBufHandler = (mem8: Uint8Array, mem32: Uint32Array, dataPtr: number) => void;
 
@@ -100,14 +104,79 @@ const WBUF_SETTERS: Array<[name: string, coalesceArgMask: number]> = [
 ];
 
 
+/**
+ * GrTexInfo is 5 dwords {smallLod, largeLod, aspectRatio, format, data} (glide.h) — the
+ * whole struct fits in the ring, so the drain never dereferences the guest pointer.
+ * Reused across drains: a drain is single-threaded and applyGrTexSource does not retain it.
+ */
+const capturedTexInfo: ParsedGrTexInfo = { smallLod: 0, largeLod: 0, aspectRatio: 0, format: 0, data: 0 };
+const GR_TEXINFO_DWORDS = GR_TEXINFO_SIZE / 4;
+
+/**
+ * grTexSource(tmu, startAddress, evenOdd, GrTexInfo*) — the only hot Glide entry point
+ * whose argument is a pointer, and the reason it stayed on the OUT trap while every
+ * scalar setter moved to the ring. Real grTexSource (gtex.c) reads exactly the five
+ * dwords of GrTexInfo and nothing they point at, so capture-at-call is not an
+ * approximation of the contract, it IS the contract: the trampoline copies the struct
+ * into the ring at call time and the drain reads it from there.
+ *
+ * Not a coalescer (the mask stays 0): consecutive grTexSource calls address different
+ * TMU start addresses and each one binds, so "last write wins" would drop binds that a
+ * later triangle depends on. Not a barrier either — it is a setter, and the draw that
+ * observes it (grDrawTriangle) is still a trap, which is what drains the ring.
+ */
+function registerGrTexSourceCapture(
+    dispatcher: {
+        registerStructCaptureWriteBufferFunction?: (
+            dll: string, func: string, argCount: number, ptrArgIndex: number,
+            payloadDwords: number, handler: WriteBufHandler,
+        ) => void;
+    },
+    context: GlideContext,
+): boolean {
+    if (typeof dispatcher.registerStructCaptureWriteBufferFunction !== "function") return false;
+    if ((globalThis as unknown as { __noStructCapture?: boolean }).__noStructCapture) return false;
+
+    // Ring entry: [funcId][tmu][startAddress][evenOdd][infoPtr][GrTexInfo × 5dw].
+    dispatcher.registerStructCaptureWriteBufferFunction(
+        "glide2x", "_grTexSource@16", 4, 3, GR_TEXINFO_DWORDS,
+        (_mem8: Uint8Array, mem32: Uint32Array, dataPtr: number) => {
+            const w = dataPtr >> 2;
+            // The trampoline OUT-traps on a null pointer rather than capturing, so a null
+            // infoPtr cannot reach here — but the capture must still mean "these are the
+            // bytes at *infoPtr", not "five zeroes", or the two paths diverge on it.
+            const infoPtr = mem32[w + 3]! >>> 0;
+            capturedTexInfo.smallLod = mem32[w + 4]! | 0;
+            capturedTexInfo.largeLod = mem32[w + 5]! | 0;
+            capturedTexInfo.aspectRatio = mem32[w + 6]! | 0;
+            capturedTexInfo.format = mem32[w + 7]! | 0;
+            capturedTexInfo.data = mem32[w + 8]! >>> 0;
+            applyGrTexSource(
+                context,
+                mem32[w]! | 0,
+                mem32[w + 1]! >>> 0,
+                mem32[w + 2]! | 0,
+                infoPtr,
+                infoPtr ? capturedTexInfo : null,
+            );
+        },
+    );
+    return true;
+}
+
 export function registerGlideWriteBufferFunctions(
     dispatcher: {
         registerWriteBufferFunction?: (
             dll: string, func: string, argCount: number, handler: WriteBufHandler,
             isStdcall?: boolean, coalesceArgMask?: number,
         ) => boolean | void;
+        registerStructCaptureWriteBufferFunction?: (
+            dll: string, func: string, argCount: number, ptrArgIndex: number,
+            payloadDwords: number, handler: WriteBufHandler,
+        ) => void;
     },
     exports: Record<string, ThunkImplementation>,
+    context: GlideContext,
 ): void {
     if (typeof dispatcher.registerWriteBufferFunction !== "function") return;
     if ((globalThis as unknown as { __noGlideWbuf?: boolean }).__noGlideWbuf) {
@@ -127,6 +196,10 @@ export function registerGlideWriteBufferFunctions(
         }
         registered++;
     }
+
+    const texSource = registerGrTexSourceCapture(dispatcher, context);
+    Logger.log(LogCategory.SYSTEM,
+        `[Glide] WBUF: grTexSource struct capture ${texSource ? "requested" : "unavailable"}`);
 
     // Registration can decline (the WBUF control page is not up yet), and a count of
     // ATTEMPTS would report a win that never happened.
