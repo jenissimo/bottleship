@@ -291,6 +291,35 @@ export class PreemptionManager {
             console.log(`[PERF] B3 tiering: retiredThreshold=${this.tier2Threshold || "OFF"}`);
         }
 
+        // EAGL read-cursor lifetime (cpu/hypercall_eagl.rs). The wasm default is the
+        // SAFE per-dispatch reset: correct, and it re-translates the page the previous
+        // dispatch just translated ~1.15M times a second, because the entry may not
+        // outlive one hypercall. The TLB-driven policy drops the entry exactly where
+        // v86 drops its own TLB entry for that page (full_clear_tlb / clear_tlb /
+        // invlpg / trigger_pagefault — the only four `set_tlb_entry(page, 0)` sites,
+        // pinned by tools/validate-eagl-read-cursor.mjs), so the cursor's lifetime is a
+        // subset of that entry's. TS owns the default because the wasm statics reset on
+        // every game load; `__eaglReadCursorDispatch` is the A/B arm, no rebuild needed.
+        //
+        // The structural self-test GATES the change: it drives the shipped rc_lookup
+        // (empty-tag sentinel, replacement, whole-cursor invalidation) rather than a
+        // copy of it, and a nonzero result leaves the safe policy in place.
+        if (this.wasmExports.eagl_read_cursor_set_policy) {
+            const fail = this.wasmExports.eagl_read_cursor_selftest
+                ? this.wasmExports.eagl_read_cursor_selftest() >>> 0 : -1;
+            const wantTlb = fail === 0 && !(globalThis as { __eaglReadCursorDispatch?: boolean }).__eaglReadCursorDispatch;
+            this.wasmExports.eagl_read_cursor_set_policy(wantTlb ? 1 : 0);
+            if (fail > 0) {
+                console.error(`[PERF] EAGL read-cursor selftest FAILED (mask=0x${fail.toString(16)}) — per-dispatch policy kept`);
+            } else if (fail < 0) {
+                console.warn("[PERF] eagl_read_cursor_selftest missing — per-dispatch policy kept (rebuild vendor/v86)");
+            } else {
+                console.log(`[PERF] EAGL read-cursor: policy=${wantTlb ? "tlb" : "dispatch"} (selftest ok)`);
+            }
+        } else {
+            console.warn("[PERF] eagl_read_cursor_set_policy missing — stale v86.wasm, cursor stays per-dispatch");
+        }
+
         // Re-apply any active guest-debugger config onto this (fresh) wasm instance.
         // v86 is re-created per game load, which clears the wasm dbg_* statics; the
         // debugger keeps its intended config in dbg-commands and re-applies it here.

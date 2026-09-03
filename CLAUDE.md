@@ -406,28 +406,33 @@ Quality Gate (mandatory order):
      guest-opcode-classes.ts)
  18. bun tools/validate-tlb-mirror.mjs           (`tlb_data` has ONE writer, cpu::set_tlb_entry, in any
      assignment spelling — the permission bitmap is a mirror of it)
- 19. bun tools/validate-wgsl-calls.ts            (every call to a WGSL helper we wrote passes the
+ 19. bun tools/validate-eagl-read-cursor.mjs     (every function that CLEARS a TLB entry
+     — `set_tlb_entry(page, 0)` — also drops the EAGL read cursor. That containment is the
+     whole safety argument for the cursor outliving a hypercall; a fifth clearing site
+     would otherwise let it answer from a page the CPU no longer maps, and the read would
+     succeed with the wrong bytes)
+ 20. bun tools/validate-wgsl-calls.ts            (every call to a WGSL helper we wrote passes the
      arity that helper declares — our shaders are template strings, invisible to the typechecker,
      and one bad call blackens a whole pass)
- 20. bun tools/validate-d3d9-arena-abi.ts        (LayoutIdx order/length matches arena.rs
+ 21. bun tools/validate-d3d9-arena-abi.ts        (LayoutIdx order/length matches arena.rs
      LAYOUT_TABLE, and the arena exports in public/v86.wasm match the ones arena.rs declares —
      missing AND stale extras, so a not-rebuilt artifact cannot silently disable the arena)
- 21. bun tools/validate-d3d9-capability-contracts.ts   (the MSAA/float/volume contracts are measured
+ 22. bun tools/validate-d3d9-capability-contracts.ts   (the MSAA/float/volume contracts are measured
      from the live device, not read off globalThis, and the probe is AWAITED as an unconditional
      statement before the device is published)
- 22. bun tools/d3d9-parity/validate-caps.ts      (`bun run validate-d3d9-caps` — the name no longer
+ 23. bun tools/d3d9-parity/validate-caps.ts      (`bun run validate-d3d9-caps` — the name no longer
      predicts the path: the checked-in reference D3DCAPS9 blob AND the caps we answer with)
- 23. bun tools/validate-snapshots.ts             (every toMatchSnapshot() has a TRACKED .snap: bun
+ 24. bun tools/validate-snapshots.ts             (every toMatchSnapshot() has a TRACKED .snap: bun
      writes a missing snapshot and exits 0, so without the file the assertion asserts nothing)
- 24. bun run gate:d3d9-capture                   (differential native-D3D9 capture. `report:d3d9-capture`
+ 25. bun run gate:d3d9-capture                   (differential native-D3D9 capture. `report:d3d9-capture`
      is reporting-only and exits 0 for everything; this wrapper fails on an unreadable/invalid
      capture and on any divergence NOT recorded in tools/d3d9-capture-expected.json — the
      intentional ones of plan/dx9c-review-findings-2026-08-26.md §B2. Record a new intentional
      one with `--update-baseline`)
- 25. bun run report:d3d9-wgsl-validator          (with BS_REQUIRE_WGSL_VALIDATOR=1, so a missing
+ 26. bun run report:d3d9-wgsl-validator          (with BS_REQUIRE_WGSL_VALIDATOR=1, so a missing
      naga is an error instead of a silent skip)
- 26. bun run typecheck
- 27. bun test                                    (also with BS_REQUIRE_WGSL_VALIDATOR=1 — otherwise
+ 27. bun run typecheck
+ 28. bun test                                    (also with BS_REQUIRE_WGSL_VALIDATOR=1 — otherwise
      every describe.skipIf in wgsl-smoke.test.ts vanishes and the suite is green without it)
 
 `bun run gate` runs all of it in order — including the test suite as the final step. CI runs
