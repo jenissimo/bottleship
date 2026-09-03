@@ -71,6 +71,7 @@ const MMIO_READ = 0x00000000;
 const MMIO_WRITE = 0x00000001;
 const MMIO_READWRITE = 0x00000002;
 const MMIO_ALLOCBUF = 0x00010000;
+const MMIO_CREATE = 0x00001000;
 const MMIOERR_FILENOTFOUND = 257;
 const MMIOERR_CANNOTOPEN = 259;
 const MMIOERR_CANNOTREAD = 260;
@@ -101,7 +102,22 @@ const MMIOINFO_SIZE       = 72;   // sizeof(MMIOINFO)
 // Windows uses an internal 8KB buffer; a larger window cuts mmioAdvance churn.
 const MMIO_GUEST_BUFSIZE  = 64 * 1024;
 const FCC_DOS = 0x20534f44; // 'DOS ' — fccIOProc for a plain disk file
-const FCC_MEM = 0x204d454d; // 'MEM ' — fccIOProc for a memory file (mmioOpen with a NULL name)
+const FCC_MEM = 0x204d454d; // 'MEM ' — fccIOProc for a memory file
+
+/**
+ * Does this mmioOpen select the MEMORY I/O proc? MMIOINFO decides: fccIOProc, else pIOProc,
+ * and ONLY when both are absent does mmioOpen parse the name (Wine MMIO_Open). So 'MEM ' is a
+ * memory file whatever szFilename says — mmioMemIOProc ignores the name — and a caller that
+ * passes the asset's own name alongside its buffer (THPS2 does, for every sound it has already
+ * read out of its .pkr) must not be sent to the disk path, where that name does not exist.
+ */
+export function mmioSelectsMemoryIoProc(
+    hasInfo: boolean, fccIOProc: number, pIOProc: number, filename: string,
+): boolean {
+    if (!hasInfo) return false;
+    if (fccIOProc === FCC_MEM) return true;
+    return !filename && !fccIOProc && !pIOProc;
+}
 
 /** The MMIO direct-I/O buffering state an MMIOHandle carries (subset used by the
  *  pure helpers below). Kept structural so it's testable without the WinMM class. */
@@ -1774,13 +1790,20 @@ export class WinMM implements IModule {
 
             Logger.verbose(LogCategory.SYSTEM, `mmioOpenA: file="${filename}", flags=0x${dwOpenFlags.toString(16)}`);
 
-            // MEMORY file: a NULL name means MMIOINFO describes a block of the CALLER's memory
-            // that is to be read as if it were a file. Engines that load a container themselves
-            // and then want mmio's RIFF walker over it (the Dark engine does this for its AVI
-            // cutscenes) open this way — refusing it makes the container look unreadable and the
-            // playback is skipped with no error the game can report.
-            if (!filename) {
-                if (!lpmmioinfo) return 0;
+            // MEMORY file: MMIOINFO describes a block of the CALLER's memory that is to be read
+            // as if it were a file. Engines that load a container themselves and then want mmio's
+            // RIFF walker over it open this way (the Dark engine for its AVI cutscenes; THPS2 for
+            // every sound it has already pulled out of its .pkr).
+            //
+            // The I/O proc is selected by the MMIOINFO — fccIOProc / pIOProc — and only falls back
+            // to parsing the name when BOTH are absent (Wine MMIO_Open). fccIOProc 'MEM ' is
+            // therefore a memory file whatever szFilename says, and mmioMemIOProc ignores the name
+            // outright. Reading the name instead sends a caller that passed both (the documented
+            // shape is a NULL name, but passing the asset's name is legal and common) down the disk
+            // path, where the file does not exist because the caller just read it out of an archive.
+            const fccIOProc = lpmmioinfo ? ((Mem.readUint32(lpmmioinfo + MMIOINFO_FCCIOPROC) ?? 0) >>> 0) : 0;
+            const pIOProc = lpmmioinfo ? ((Mem.readUint32(lpmmioinfo + MMIOINFO_PIOPROC) ?? 0) >>> 0) : 0;
+            if (mmioSelectsMemoryIoProc(!!lpmmioinfo, fccIOProc, pIOProc, filename)) {
                 const pchBuffer = (Mem.readUint32(lpmmioinfo + MMIOINFO_PCHBUFFER) ?? 0) >>> 0;
                 const cchBuffer = (Mem.readUint32(lpmmioinfo + MMIOINFO_CCHBUFFER) ?? 0) >>> 0;
                 if (!pchBuffer || !cchBuffer || pchBuffer + cchBuffer > mem.length) {
@@ -1791,7 +1814,7 @@ export class WinMM implements IModule {
                 // `data` is a VIEW on guest memory, not a copy: the block stays the guest's and
                 // anything it writes there is what the next mmioRead must see.
                 this.mmioHandles.set(handle, {
-                    filename: "", position: 0,
+                    filename, position: 0,
                     data: mem.subarray(pchBuffer, pchBuffer + cchBuffer),
                     memoryBase: pchBuffer,
                     guestBuffer: pchBuffer,
@@ -1806,27 +1829,47 @@ export class WinMM implements IModule {
                 return handle;
             }
 
-            const handle = this.nextMMIOHandle++;
-
             // Read the file synchronously from VFS so mmioDescend/mmioRead work correctly.
             let data: Uint8Array | null = null;
+            let failure = MMIOERR_FILENOTFOUND;
             try {
                 const vfs = System.getInstance().fileSystem;
-                const fileSize = vfs.getFileSize(filename);
-                if (fileSize > 0 && fileSize <= 32 * 1024 * 1024) {
-                    const GENERIC_READ = 0x80000000;
-                    const OPEN_EXISTING = 3;
-                    const fh = vfs.openSync(filename, GENERIC_READ, OPEN_EXISTING);
-                    if (fh) {
-                        data = vfs.readSync(fh, fileSize);
-                    }
+                const GENERIC_READ = 0x80000000;
+                const OPEN_EXISTING = 3;
+                const fh = vfs.openSync(filename, GENERIC_READ, OPEN_EXISTING);
+                if (fh) {
+                    const fileSize = vfs.getFileSize(filename);
+                    if (fileSize > 32 * 1024 * 1024) failure = MMIOERR_CANNOTREAD;
+                    else if (fileSize <= 0) data = new Uint8Array(0);
+                    else data = vfs.readSync(fh, fileSize);
+                    if (!data && failure === MMIOERR_FILENOTFOUND) failure = MMIOERR_CANNOTREAD;
                 }
             } catch (e) {
+                failure = MMIOERR_CANNOTREAD;
                 Logger.warn(LogCategory.SYSTEM, `mmioOpenA: failed to read "${filename}": ${e}`);
             }
 
+            // A file we cannot read is an OPEN FAILURE (Wine mmioDosIOProc MMIOM_OPEN →
+            // MMIOERR_FILENOTFOUND, MMIO_Open then returns a NULL handle). Handing back a
+            // live HMMIO over no bytes is a lie the caller cannot detect: mmioDescend finds
+            // no RIFF and the game reports its own "cannot load" instead of taking the
+            // fallback the failure was supposed to select — THPS2 loads every sound effect
+            // from its .pkr only after mmioOpen says the loose file is not there.
+            // MMIO_CREATE asks to create the file, which this read-only mmio cannot do.
+            if (!data) {
+                if (lpmmioinfo) Mem.writeUint32(lpmmioinfo + MMIOINFO_WERRORRET, failure);
+                Logger.verbose(LogCategory.SYSTEM,
+                    `mmioOpenA: "${filename}" not opened (err=${failure}${(dwOpenFlags & MMIO_CREATE) ? ", MMIO_CREATE unsupported" : ""})`);
+                return 0;
+            }
+
+            const handle = this.nextMMIOHandle++;
             this.mmioHandles.set(handle, { filename, position: 0, data });
-            Logger.verbose(LogCategory.SYSTEM, `mmioOpenA: opened "${filename}" as handle ${handle}, size=${data?.length ?? 0}`);
+            if (lpmmioinfo) {
+                Mem.writeUint32(lpmmioinfo + MMIOINFO_WERRORRET, 0);
+                Mem.writeUint32(lpmmioinfo + MMIOINFO_HMMIO, handle);
+            }
+            Logger.verbose(LogCategory.SYSTEM, `mmioOpenA: opened "${filename}" as handle ${handle}, size=${data.length}`);
             return handle;
         };
 
@@ -1860,7 +1903,7 @@ export class WinMM implements IModule {
 
             if (!pch || cch <= 0) return 0;
 
-            if (!mmio.data) return 0; // no data (file not found)
+            if (!mmio.data) return 0;
 
             const available = mmio.data.length - mmio.position;
             if (available <= 0) return 0;

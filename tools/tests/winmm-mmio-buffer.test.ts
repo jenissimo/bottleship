@@ -4,6 +4,7 @@ import {
     mmioFillGuestWindow,
     mmioWriteInfoStruct,
     mmioCommitInfoCursor,
+    mmioSelectsMemoryIoProc,
     type MmioBufState,
 } from "../../src/worker/modules/winmm";
 
@@ -122,5 +123,29 @@ describe("winmm MMIO direct-I/O buffering", () => {
         expect(readU32(INFO + PCHBUFFER)).toBe(GUEST_BUF);
         expect(readU32(INFO + PCHNEXT)).toBe(GUEST_BUF);
         expect(readU32(INFO + PCHENDREAD)).toBe(GUEST_BUF); // empty: next == endRead
+    });
+});
+
+describe("winmm mmioOpen I/O-proc selection", () => {
+    const FCC_MEM = 0x204d454d; // 'MEM '
+    const FCC_DOS = 0x20534f44; // 'DOS '
+
+    test("'MEM ' selects the memory proc even when szFilename names the asset", () => {
+        // THPS2's shape: it reads the WAV out of its .pkr, then hands mmio the buffer AND
+        // the asset name. Selecting on the name sends it to a disk file that does not exist,
+        // and every sound in the game fails to load.
+        expect(mmioSelectsMemoryIoProc(true, FCC_MEM, 0, "audio/selectD.wav")).toBe(true);
+    });
+
+    test("a NULL name with no proc at all is still a memory file", () => {
+        expect(mmioSelectsMemoryIoProc(true, 0, 0, "")).toBe(true);
+    });
+
+    test("a named file with no MMIOINFO, or an explicit non-MEM proc, goes to disk", () => {
+        expect(mmioSelectsMemoryIoProc(false, 0, 0, "C:\sound.wav")).toBe(false);
+        expect(mmioSelectsMemoryIoProc(true, 0, 0, "C:\sound.wav")).toBe(false);
+        expect(mmioSelectsMemoryIoProc(true, FCC_DOS, 0, "C:\sound.wav")).toBe(false);
+        // A custom pIOProc owns the open; the name must not steal it back.
+        expect(mmioSelectsMemoryIoProc(true, 0, 0x401000, "")).toBe(false);
     });
 });
