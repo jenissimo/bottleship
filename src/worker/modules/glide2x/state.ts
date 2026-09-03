@@ -69,6 +69,10 @@ const GR_COLORCOMBINE_DIFF_SPEC_B = 0x0f;
 const GR_COLORCOMBINE_ONE = 0x10;
 
 function applyGuColorCombineFunction(context: GlideContext, fn: number): void {
+    // gu.c — EVERY guColorCombineFunction clears delta0 first; only the two DELTA0
+    // entries re-arm it. A direct grColorCombine does not touch the mode, so it is
+    // cleared here and nowhere else.
+    context.runtime.colorCombineDelta0 = false;
     switch (fn | 0) {
         case GR_COLORCOMBINE_ZERO:
             context.runtime.colorCombine = {
@@ -88,8 +92,10 @@ function applyGuColorCombineFunction(context: GlideContext, fn: number): void {
                 invert: 0,
             };
             return;
-        case GR_COLORCOMBINE_ITRGB:
         case GR_COLORCOMBINE_ITRGB_DELTA0:
+            context.runtime.colorCombineDelta0 = true;
+        // falls through — gu.c sets the same combine as ITRGB
+        case GR_COLORCOMBINE_ITRGB:
             context.runtime.colorCombine = {
                 function: GR_COMBINE_FUNCTION_LOCAL,
                 factor: GR_COMBINE_FACTOR_NONE,
@@ -116,8 +122,10 @@ function applyGuColorCombineFunction(context: GlideContext, fn: number): void {
                 invert: 0,
             };
             return;
-        case GR_COLORCOMBINE_TEXTURE_TIMES_ITRGB:
         case GR_COLORCOMBINE_TEXTURE_TIMES_ITRGB_DELTA0:
+            context.runtime.colorCombineDelta0 = true;
+        // falls through — gu.c sets the same combine as TEXTURE_TIMES_ITRGB
+        case GR_COLORCOMBINE_TEXTURE_TIMES_ITRGB:
             context.runtime.colorCombine = {
                 function: GR_COMBINE_FUNCTION_SCALE_OTHER,
                 factor: GR_COMBINE_FACTOR_LOCAL,
@@ -551,6 +559,9 @@ export function createStateExports(context: GlideContext): Record<string, ThunkI
                 (b & 0xff)
             ) >>> 0;
             context.ffpState.setConstantColor(context.runtime.constantColorValue);
+            // gglide.c:1299 — this call is the ONLY writer of gc->state.r/g/b, which is
+            // what delta0 mode loads into the RGB iterators (gdraw.c).
+            context.runtime.delta0Rgb = (((r & 0xff) << 16) | ((g & 0xff) << 8) | (b & 0xff)) >>> 0;
             return 0;
         },
 

@@ -165,6 +165,8 @@ export type GlideDebugInfo = {
         cullMode: number;
         fogMode: number;
         stwHint: number;
+        colorCombineDelta0: boolean;
+        lastGuColorCombineFunction: number;
         tmu0: { minFilter: number; magFilter: number; mipMapMode: number; lodBias: number; clampS: number; clampT: number };
     };
     ringEvents: Array<{ id: number; type: string; timestamp: number; detail?: string }>;
@@ -200,6 +202,15 @@ export type GlideRuntimeState = {
     gammaValue: number;
     /** grHints(GR_HINT_STWHINT) mask — decides whether tmuvtx[].oow is even valid. */
     stwHint: number;
+    /** _grColorCombineDelta0Mode (gdraw.c): the RGB iterator slopes are pinned to 0 and
+     *  Fr/Fg/Fb to gc->state.r/g/b, so the iterated colour is FLAT and paramIndex drops
+     *  STATE_REQUIRES_IT_DRGB — the vertex r/g/b are then never read (gglide.c:1999, 2270).
+     *  Titles rely on that and leave those fields stale, so iterating them paints garbage. */
+    colorCombineDelta0: boolean;
+    /** gc->state.r/g/b as 0x00RRGGBB — the flat colour delta0 loads. Written ONLY by
+     *  grConstantColorValue4 (gglide.c:1299); the packed grConstantColorValue does not
+     *  touch it, so an unset value is the hardware default (black), not "unknown". */
+    delta0Rgb: number;
 };
 
 export type GlideContext = {
@@ -298,6 +309,8 @@ function createDefaultRuntimeState(): GlideRuntimeState {
         // CVG GLIDE_DEFAULT_GAMMA; real drivers call grGammaCorrectionValue on init.
         gammaValue: 1.3,
         stwHint: 0,
+        colorCombineDelta0: false,
+        delta0Rgb: 0,
     };
 }
 
@@ -410,6 +423,8 @@ export function applySstBoardDefaults(context: GlideContext): void {
     context.runtime.constantColorValue = 0xffffffff;
     context.runtime.gammaValue = 1.3;
     context.runtime.stwHint = 0;
+    // gsst.c — grSstWinOpen leaves delta0 mode off.
+    context.runtime.colorCombineDelta0 = false;
     context.ffpState.setBlend(false);
     context.ffpState.setFog(false);
 }

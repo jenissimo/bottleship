@@ -140,6 +140,8 @@ export function buildGlideDebugInfo(
             cullMode: context.runtime.cullMode,
             fogMode: context.runtime.fogMode,
             stwHint: context.runtime.stwHint,
+            colorCombineDelta0: context.runtime.colorCombineDelta0,
+            lastGuColorCombineFunction: context.apiState.lastGuColorCombineFunction,
             tmu0: {
                 minFilter: context.tmus[0]?.minFilter ?? -1,
                 magFilter: context.tmus[0]?.magFilter ?? -1,

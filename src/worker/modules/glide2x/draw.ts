@@ -107,6 +107,36 @@ function decodeVertexForDraw(ptr: number): DecodedVertex {
 }
 
 /**
+ * The last N grDrawTriangle vertex POINTERS, for `glideTriPtrs`.
+ *
+ * A frame capture shows the vertex we PUSHED; it cannot say whether a colour came
+ * from the guest or from our decode of it. Re-reading the source struct answers
+ * that — and, read a frame later, also says whether the guest rewrites the same
+ * scratch vertex between triangles. Off until the flag is set: this runs in the
+ * hottest handler in the module (22M calls a session in Carmageddon 2).
+ */
+const TRI_RING = 256;
+const triRing = new Uint32Array(TRI_RING * 3);
+let triRingCount = 0;
+
+function recordTriangleSource(a: number, b: number, c: number): void {
+    if (!(globalThis as { __glideTriPtrRing?: boolean }).__glideTriPtrRing) return;
+    const i = (triRingCount++ % TRI_RING) * 3;
+    triRing[i] = a; triRing[i + 1] = b; triRing[i + 2] = c;
+}
+
+/** [{k, ptrs:[a,b,c]}] newest last, at most TRI_RING entries. */
+export function glideTriangleSourceRing(): Array<{ k: number; ptrs: number[] }> {
+    const n = Math.min(triRingCount, TRI_RING);
+    const out: Array<{ k: number; ptrs: number[] }> = [];
+    for (let j = 0; j < n; j++) {
+        const idx = ((triRingCount - n + j) % TRI_RING) * 3;
+        out.push({ k: triRingCount - n + j, ptrs: [triRing[idx]!, triRing[idx + 1]!, triRing[idx + 2]!] });
+    }
+    return out;
+}
+
+/**
  * grDrawPolygon/…VertexList take a CONTIGUOUS GrVertex[] (glide.h), never a table
  * of pointers. The only compile-time variable is GLIDE_NUM_TMU, which the SDK
  * defaults to 2 (glidesys.h) — that is the stride, not something to guess per call.
@@ -129,8 +159,18 @@ function pushVertexFromPtr(context: GlideContext, ptr: number): number {
     const q = Number.isFinite(qRaw) && Math.abs(qRaw) > 1e-8 ? qRaw : 1.0;
     const u = v.sow;
     const vTex = v.tow;
-    // Raw iterated color — the WGSL combine unit selects which inputs to use.
-    const color = packRgba(v.r, v.g, v.b, v.a);
+    // In delta0 mode the RGB iterators carry zero slopes and are pinned to the
+    // grConstantColorValue4 colour, so the hardware never reads the vertex r/g/b:
+    // paramIndex drops STATE_REQUIRES_IT_DRGB (gglide.c:1999) and the data list then
+    // omits the R/G/B offsets (gglide.c:2270). Titles rely on that and leave those
+    // fields stale in a reused scratch vertex — Carmageddon 2 reuses ONE GrVertex[3]
+    // on the stack — so iterating them paints a garbage gradient with a hard seam
+    // along every shared edge. Alpha is untouched by delta0 and still comes from the
+    // vertex. Otherwise: raw iterated color, the WGSL combine unit picks the inputs.
+    const rt = context.runtime;
+    const color = rt.colorCombineDelta0
+        ? packRgba((rt.delta0Rgb >>> 16) & 0xff, (rt.delta0Rgb >>> 8) & 0xff, rt.delta0Rgb & 0xff, v.a)
+        : packRgba(v.r, v.g, v.b, v.a);
     return context.stream.pushVertex(x, y, z, u, vTex, q, color);
 }
 
@@ -271,6 +311,7 @@ export function createDrawExports(context: GlideContext): Record<string, ThunkIm
             pushVertexFromPtr(context, b);
             pushVertexFromPtr(context, c);
             pushDraw(context, "triangle-list", first, 3);
+            recordTriangleSource(a, b, c);
             return 0;
         },
 

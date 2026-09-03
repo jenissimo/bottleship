@@ -105,6 +105,8 @@ export class Glide2x implements IModule {
                     cullMode: 0,
                     fogMode: 0,
                     stwHint: 0,
+                    colorCombineDelta0: false,
+                    lastGuColorCombineFunction: -1,
                     tmu0: { minFilter: -1, magFilter: -1, mipMapMode: -1, lodBias: 0, clampS: -1, clampT: -1 },
                 },
                 ringEvents: [],
