@@ -277,11 +277,11 @@ export class HarnessChain {
      *  frame counters, i.e. what the next draw would be issued with. */
     glideState(opts?: { onlyActive?: boolean }): this { return this.push("glideState", [opts]); }
     /** One COMPLETED Glide frame, decoded per draw — the Glide twin of `glFrame()`. */
-    glideFrame(opts?: { timeoutMs?: number; maxDraws?: number }): this { return this.push("glideFrame", [opts]); }
+    glideFrame(opts?: { timeoutMs?: number; maxDraws?: number; vertices?: boolean }): this { return this.push("glideFrame", [opts]); }
     /** Every texture resident in a TMU, with its handle, address, size and format. */
     glideTextures(opts?: { onlyActive?: boolean }): this { return this.push("glideTextures", [opts]); }
     /** The raw guest bytes a texture was decoded FROM — needs `__glideKeepTexSource`. */
-    glideTextureBytes(handle: number): this { return this.push("glideTextureBytes", [handle]); }
+    glideTextureBytes(handle: number, count?: number): this { return this.push("glideTextureBytes", [handle, count]); }
     /** The linear frame buffer as a PNG. `syncFromFrame` runs the guest read-lock path,
      *  which is the positive control for LFB read-back: it goes black when the mirror
      *  is not reaching the LFB. */

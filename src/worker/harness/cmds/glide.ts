@@ -20,6 +20,8 @@ import { encodePngBase64 } from "./textures";
 import {
     armGlideFrameCapture, takeGlideFrameCapture, type GlideCapturedDraw,
 } from "../../modules/glide2x/frame-capture";
+import { glideTriangleSourceRing } from "../../modules/glide2x/draw";
+import { Mem } from "../../core/memory/mem-accessor";
 import { unpackCombine, unpackBlend } from "../../backends/webgpu/glide/glide-combine";
 
 interface GlideModuleLike {
@@ -103,6 +105,9 @@ function describeDraw(d: GlideCapturedDraw): unknown {
         fog: d.fogMode ? "mode=" + d.fogMode + " color=" + hex(d.fogColor ?? 0) : "off",
         cull: d.cullMode,
         colorMask: (d.colorMaskRgb ? "rgb" : "-") + (d.colorMaskAlpha ? "a" : "-"),
+        // Raw vertices when glideFrame({vertices:true}) armed them. NOT `verts` — that key
+        // is already the vertex COUNT, and a duplicate key silently wins/loses by order.
+        vtx: d.verts,
     };
 }
 
@@ -113,9 +118,9 @@ export function registerGlideCommands(svc: HarnessService): void {
     });
 
     svc.register("glideFrame", async (args) => {
-        const opts = (args[0] ?? {}) as { timeoutMs?: number; maxDraws?: number };
+        const opts = (args[0] ?? {}) as { timeoutMs?: number; maxDraws?: number; vertices?: boolean };
         glideMod(); // fail fast when the title is not Glide
-        armGlideFrameCapture();
+        armGlideFrameCapture({ vertices: opts.vertices });
         const deadline = Date.now() + (opts.timeoutMs ?? 5000);
         let cap = takeGlideFrameCapture();
         while (!cap && Date.now() < deadline) {
@@ -178,6 +183,37 @@ export function registerGlideCommands(svc: HarnessService): void {
             if ((lfb.rgba[i] | lfb.rgba[i + 1] | lfb.rgba[i + 2]) !== 0) nonBlack++;
         }
         return { width: lfb.width, height: lfb.height, nonBlackPixels: nonBlack, saved: debugDumpPath("glide-lfb") };
+    });
+
+    /** glideTriPtrs({limit}) — the guest GrVertex structs the last grDrawTriangle calls
+     *  pointed at, re-read from guest memory NOW. glideFrame shows the vertex we pushed;
+     *  this shows what we pushed it FROM, which is the only way to tell "the guest wrote
+     *  that colour" from "we decoded it wrong". Needs `__glideTriPtrRing`. */
+    svc.register("glideTriPtrs", (args) => {
+        const opts = (args[0] ?? {}) as { limit?: number };
+        const ring = glideTriangleSourceRing();
+        if (ring.length === 0) {
+            return { armed: !!(globalThis as { __glideTriPtrRing?: boolean }).__glideTriPtrRing, entries: [] };
+        }
+        const limit = Math.max(1, Math.min(opts.limit ?? 12, ring.length));
+        const f = new Float32Array(12);
+        return {
+            armed: true,
+            entries: ring.slice(-limit).map((e) => ({
+                k: e.k,
+                verts: e.ptrs.map((p) => {
+                    if (!Mem.readFloat32Into(p, 12, f)) return { ptr: hex(p), read: false };
+                    return {
+                        ptr: hex(p),
+                        xy: [f[0], f[1]],
+                        rgb: [f[3], f[4], f[5]],
+                        a: f[7],
+                        ooz: f[6],
+                        oow: f[8],
+                    };
+                }),
+            })),
+        };
     });
 
     svc.register("glideDumpTexture", async (args) => {

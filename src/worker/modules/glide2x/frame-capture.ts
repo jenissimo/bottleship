@@ -51,6 +51,11 @@ export interface GlideCapturedDraw {
     st?: [number, number, number, number];
     q?: [number, number];
     colors?: number[];
+    /** Raw vertices, opt-in: FLAT [x, y, z, s, t, q, color] per vertex (7 numbers each).
+     *  Flat, not nested, because the RPC serializer collapses an array of arrays to its
+     *  length — a nested shape comes back as a number and reads like "no vertices".
+     *  A bbox says WHERE a triangle is; only the vertices say what SHAPE it is. */
+    verts?: number[];
 }
 
 export interface GlideFrameCapture {
@@ -71,10 +76,12 @@ export interface GlideFrameCapture {
 }
 
 let armed = false;
+let withVertices = false;
 let pending: GlideFrameCapture | null = null;
 
-export function armGlideFrameCapture(): void {
+export function armGlideFrameCapture(opts?: { vertices?: boolean }): void {
     armed = true;
+    withVertices = !!opts?.vertices;
     pending = null;
 }
 
@@ -115,6 +122,7 @@ export function captureGlideFrame(frameId: number, input: GlideFrameInput): void
         let z0 = Infinity, z1 = -Infinity, q0 = Infinity, q1 = -Infinity;
         let s0 = Infinity, s1 = -Infinity, t0 = Infinity, t1 = -Infinity;
         const colors: number[] = [];
+        const verts: number[] | undefined = withVertices ? [] : undefined;
         for (let v = 0; v < d.vertexCount; v++) {
             stream.readVertex(d.firstVertex + v, vtx);
             const x = vtx.x, y = vtx.y, z = vtx.z;
@@ -126,6 +134,7 @@ export function captureGlideFrame(frameId: number, input: GlideFrameInput): void
             if (s < s0) s0 = s; if (s > s1) s1 = s;
             if (t < t0) t0 = t; if (t > t1) t1 = t;
             if (colors.length < 4) colors.push(vtx.color >>> 0);
+            if (verts) verts.push(round(x), round(y), round(z), round(s), round(t), round(q), vtx.color >>> 0);
         }
         const finite = d.vertexCount > 0;
         commands.push({
@@ -159,6 +168,7 @@ export function captureGlideFrame(frameId: number, input: GlideFrameInput): void
             st: finite ? [round(s0), round(s1), round(t0), round(t1)] : undefined,
             q: finite ? [round(q0), round(q1)] : undefined,
             colors,
+            verts,
         });
     }
 
