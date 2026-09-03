@@ -180,25 +180,40 @@ export function registerAudioCommands(svc: HarnessService): void {
      *  a host media element the worklet never mixes, so peakMilli stays 0 while the
      *  music is perfectly audible. Rising `positions`/`lastFrames` for an id is the only
      *  worker-side proof that such a stream is really decoding; `error` names a container
-     *  the browser refused. */
+     *  the browser refused.
+     *
+     *  `worklet.ring` is the DirectSound/waveOut mix ALONE, measured before it reaches
+     *  masterGain — informational (no limiter runs there any more). `worklet.master` is
+     *  measured AFTER ring + music/CD are summed and the one limiter has run: it is what
+     *  the user's ears actually receive, and the only group that answers "is the mix
+     *  clipping". A `master.clip/limited` count with `ring.clip/limited` at 0 is exactly
+     *  the bug this rework fixes (each branch clean alone, the sum clipping); both groups
+     *  clipping the same means the ring alone already oversums. */
     svc.register("audioSignal", async (args) => {
         const opts = (args[0] ?? {}) as { reset?: boolean };
         const ds: any = getModule("dsound");
 
-        const statsSab = (globalThis as any).__audioStatsSab as SharedArrayBuffer | undefined;
-        let worklet: Record<string, number> | null = null;
-        if (statsSab) {
-            const s = new Int32Array(statsSab, 0, 16);
-            worklet = {
+        const readStats = (sab: SharedArrayBuffer | undefined): Record<string, number> | null => {
+            if (!sab) return null;
+            const s = new Int32Array(sab, 0, 16);
+            const stats = {
                 proc: Atomics.load(s, 0), frames: Atomics.load(s, 1),
                 activeRing: Atomics.load(s, 2), activeLegacy: Atomics.load(s, 10),
                 clip: Atomics.load(s, 3), limited: Atomics.load(s, 4),
                 peakMilli: Atomics.load(s, 5),
                 disc: Atomics.load(s, 6), maxJumpMilli: Atomics.load(s, 7),
                 underrunMid: Atomics.load(s, 8), starvedBlocks: Atomics.load(s, 9),
+                topSourceId: Atomics.load(s, 11), topSourceMilli: Atomics.load(s, 12),
+                sumSourceMilli: Atomics.load(s, 13), maxConcurrent: Atomics.load(s, 14),
             };
             if (opts.reset) Atomics.store(s, 15, 1);
-        }
+            return stats;
+        };
+        const ringStats = readStats((globalThis as any).__audioStatsSab);
+        const masterStats = readStats((globalThis as any).__audioMasterStatsSab);
+        const worklet = ringStats || masterStats
+            ? { ring: ringStats, master: masterStats }
+            : null;
         if (opts.reset) {
             resetHostAudioStats();
         }

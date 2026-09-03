@@ -61,6 +61,19 @@ type DecodedAudio = {
 const MAX_CACHE_BYTES = 8 * 1024 * 1024;
 const STREAMING_THRESHOLD_BYTES = 512 * 1024;
 
+// Must match WORKLET_MODULE_VERSION in bottleship-audio-worklet.ts. Both the
+// cache-busting `?v=` query param AND the expected handshake version below are
+// derived from this ONE constant, so there is nothing left to drift WITHIN this
+// file; the remaining risk (this constant vs. the one baked into the worklet
+// source) is what verifyWorkletReady() checks at runtime instead of leaving it
+// to be discovered as "the counters are all zero for no visible reason" —
+// AudioContext caches a worklet module by exact URL, so an unbumped `v` after
+// an edit serves the OLD module (old code, old baked-in version) silently.
+const AUDIO_WORKLET_VERSION = 6;
+/** How long to wait for a worklet's "ready" handshake before treating a missing
+ *  one as a stale-module load worth a loud console.error rather than silence. */
+const WORKLET_READY_TIMEOUT_MS = 3000;
+
 type EncodedSource = {
   element: HTMLAudioElement;
   url: string;
@@ -115,6 +128,14 @@ export class AudioEngine {
    *  connects here, so a single gain controls overall volume / mute. Created lazily
    *  in ensureReady(); volume/mute set before that are stored and applied on creation. */
   private masterGain: GainNode | null = null;
+  /** The ONE limiter, downstream of masterGain: every source (DirectSound/waveOut
+   *  ring mix from `node`, plus music/CD tracks connected directly to masterGain)
+   *  is summed by the audio graph before it reaches this node's single input, so
+   *  it is the only place a limiter can see — and therefore bound — the full mix. */
+  private masterLimiterNode: AudioWorkletNode | null = null;
+  /** Which processors' "ready" handshake (see checkWorkletVersion) has arrived —
+   *  the set membership IS the check; armWorkletReadyTimeout reads absence from it. */
+  private workletReadyReceived: Set<"ring" | "master"> = new Set();
   private masterVolume = 1;
   private muted = false;
   private ready: Promise<void> | null = null;
@@ -188,14 +209,19 @@ export class AudioEngine {
     const context = this.ensureContext();
     this.ready = (async () => {
       const moduleUrl = new URL("./bottleship-audio-worklet.js", import.meta.url);
-      moduleUrl.searchParams.set("v", "5");
+      moduleUrl.searchParams.set("v", String(AUDIO_WORKLET_VERSION));
       await context.audioWorklet.addModule(moduleUrl);
+
       this.node = new AudioWorkletNode(context, "bottleship-audio", {
         numberOfInputs: 0,
         numberOfOutputs: 1,
         outputChannelCount: [2],
       });
       this.node.port.onmessage = (event) => {
+        if (event.data?.type === "ready") {
+          this.checkWorkletVersion("ring", event.data?.version);
+          return;
+        }
         if (event.data?.type === "ended") {
           const id = Number(event.data?.id ?? 0);
           if (id) {
@@ -214,12 +240,61 @@ export class AudioEngine {
           }
         }
       };
+      this.armWorkletReadyTimeout("ring");
+
+      // numberOfInputs:1 — this is the target every source sums into (see
+      // masterLimiterNode's field comment); it produces nothing of its own.
+      this.masterLimiterNode = new AudioWorkletNode(context, "bottleship-audio-master", {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [2],
+      });
+      this.masterLimiterNode.port.onmessage = (event) => {
+        if (event.data?.type === "ready") {
+          this.checkWorkletVersion("master", event.data?.version);
+        }
+      };
+      this.armWorkletReadyTimeout("master");
+
       this.masterGain = context.createGain();
       this.masterGain.gain.value = this.muted ? 0 : this.masterVolume;
-      this.masterGain.connect(context.destination);
+      // sources → masterGain (volume/mute) → masterLimiterNode (the one limiter,
+      // over the whole summed mix) → destination. Volume is applied BEFORE the
+      // limiter so turning the game down also relieves the limiter, matching how
+      // a hardware master fader sits upstream of a brickwall limiter.
       this.node.connect(this.masterGain);
+      this.masterGain.connect(this.masterLimiterNode);
+      this.masterLimiterNode.connect(context.destination);
     })();
     return this.ready;
+  }
+
+  /** Missing/mismatched "ready" handshake ⇒ the AudioContext served a STALE
+   *  cached worklet module (see AUDIO_WORKLET_VERSION above) rather than the one
+   *  on disk. Loud by design: the alternative is a worklet silently running old
+   *  code while every counter reads zero and nothing else in the app notices. */
+  private checkWorkletVersion(proc: "ring" | "master", version: unknown): void {
+    this.workletReadyReceived.add(proc);
+    if (version !== AUDIO_WORKLET_VERSION) {
+      console.error(
+        `BottleShip: audio worklet '${proc}' processor reported version ${JSON.stringify(version)}, ` +
+        `expected ${AUDIO_WORKLET_VERSION} — the browser is running a STALE cached ` +
+        `bottleship-audio-worklet.js. Bump AUDIO_WORKLET_VERSION (audio-engine.ts) and ` +
+        `WORKLET_MODULE_VERSION (bottleship-audio-worklet.ts) together and reload.`
+      );
+    }
+  }
+
+  private armWorkletReadyTimeout(proc: "ring" | "master"): void {
+    setTimeout(() => {
+      if (!this.workletReadyReceived.has(proc)) {
+        console.error(
+          `BottleShip: audio worklet '${proc}' processor never sent its "ready" handshake ` +
+          `within ${WORKLET_READY_TIMEOUT_MS}ms — the module likely failed to load or is ` +
+          `running code from before this build. Signal stats from it cannot be trusted.`
+        );
+      }
+    }, WORKLET_READY_TIMEOUT_MS);
   }
 
   /** Set the master output volume (linear 0..1). Stored even if the audio graph
@@ -457,10 +532,19 @@ export class AudioEngine {
     this.node.port.postMessage({ type: "register_listener", sab });
   }
 
+  /** Ring-stage stats (pre-mix; see bottleship-audio-worklet.ts's stats comment). */
   async registerStatsSab(sab: SharedArrayBuffer): Promise<void> {
     await this.ensureReady();
     if (!this.node) return;
     this.node.port.postMessage({ type: "register_stats", sab });
+  }
+
+  /** Master-stage stats — the numbers that describe what the user actually hears
+   *  (post-mix, post-limiter). See BottleShipMasterProcessor. */
+  async registerMasterStatsSab(sab: SharedArrayBuffer): Promise<void> {
+    await this.ensureReady();
+    if (!this.masterLimiterNode) return;
+    this.masterLimiterNode.port.postMessage({ type: "register_master_stats", sab });
   }
 
   stop(id: number): void {

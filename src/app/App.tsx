@@ -1484,6 +1484,10 @@ export default function App() {
         const sab = event.data?.payload?.sab as SharedArrayBuffer | undefined;
         if (sab) audioEngine?.registerStatsSab(sab);
       }
+      if (event.data?.type === "audio_master_stats_sab") {
+        const sab = event.data?.payload?.sab as SharedArrayBuffer | undefined;
+        if (sab) audioEngine?.registerMasterStatsSab(sab);
+      }
       // video_frame and video_end are handled in the worker via WebGPU compositor (smackw32.ts → backend.composite)
       if (event.data?.type === "cursor_visibility") {
         const visible = event.data?.visible !== false;

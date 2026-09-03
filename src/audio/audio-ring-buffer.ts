@@ -139,6 +139,14 @@ export const STATS_UNDERRUN_MID = 8;
 export const STATS_STARVED_BLOCKS = 9;
 /** Gauge: legacy chunk-based sources active during the last block */
 export const STATS_ACTIVE_LEGACY = 10;
+/** Ring-buffer id whose contribution had the highest per-block peak (ring stage only) */
+export const STATS_TOP_SOURCE_ID = 11;
+/** That source's peak for the block, stored as round(peak*1000), monotonic (ring stage only) */
+export const STATS_TOP_SOURCE_MILLI = 12;
+/** Sum of every active source's per-block peak, round(sum*1000), monotonic (ring stage only) */
+export const STATS_SUM_SOURCE_MILLI = 13;
+/** Gauge: most sources audible (peak > 0.01) in any one block (ring stage only) */
+export const STATS_MAX_CONCURRENT = 14;
 /** Worker sets 1 → worklet zeroes all counters and clears the flag */
 export const STATS_RESET = 15;
 
@@ -199,6 +207,16 @@ export function createListenerSab(): SharedArrayBuffer {
 export function createStatsSab(): SharedArrayBuffer {
     // All-zero initial state is the correct initial state for every field.
     return new SharedArrayBuffer(STATS_SAB_BYTES);
+}
+
+/** The same layout, instantiated a second time for the MASTER stage (post-mix,
+ *  where ring + encoded/media audio are actually summed — see the second
+ *  processor in bottleship-audio-worklet.ts). Fields that only make sense
+ *  per-ring (STATS_ACTIVE_RING, STATS_ACTIVE_LEGACY, STATS_TOP_SOURCE_*,
+ *  STATS_UNDERRUN_MID, STATS_STARVED_BLOCKS) stay 0 there — the master
+ *  processor has no notion of individual sources, only the final signal. */
+export function createMasterStatsSab(): SharedArrayBuffer {
+    return createStatsSab();
 }
 
 // ─── Audio format descriptor (passed to createAudioRingBuffer) ───────────────

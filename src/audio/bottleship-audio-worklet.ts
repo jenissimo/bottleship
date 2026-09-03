@@ -80,13 +80,35 @@ const STATS_MAX_JUMP_MILLI = 7;
 const STATS_UNDERRUN_MID = 8;
 const STATS_STARVED_BLOCKS = 9;
 const STATS_ACTIVE_LEGACY = 10;
+// Loudest single source of the window, and how much of the block's level the sources
+// account for. The block peak alone cannot say WHO is loud: it is a max over a window
+// while a buffer listing is an instantaneous snapshot, so a one-shot that starts and
+// ends inside the window is invisible in the listing and unattributable in the peak.
+const STATS_TOP_SOURCE_ID = 11;
+const STATS_TOP_SOURCE_MILLI = 12;
+const STATS_SUM_SOURCE_MILLI = 13;
+const STATS_MAX_CONCURRENT = 14;
 const STATS_RESET = 15;
 
 // Output limiter: transparent below LIMIT_T, soft knee above. A mixed signal
 // from a single int16 source can never exceed 1.0, so the limiter only engages
-// when multiple sources genuinely sum past the threshold.
+// when multiple sources genuinely sum past the threshold. Applied ONCE, at the
+// MASTER stage (BottleShipMasterProcessor below) — the point where ring audio
+// (this processor's output) and encoded/media audio (music, CD tracks; they
+// never pass through this processor at all) are actually summed on the way to
+// destination. Limiting at the ring stage alone cannot see the music, and
+// limiting in both places would double-shape whatever passes through the ring.
 const LIMIT_T = 0.95;
 const LIMIT_K = 1 - LIMIT_T;
+
+// Bumped whenever this module's audio-rate behavior changes. AudioContext caches
+// a worklet module by URL; audio-engine.ts appends this as a `?v=` query param so
+// a stale cached module (old code, silently zero counters) cannot be mistaken for
+// a loaded new one. Each processor echoes it back over its port on construction —
+// audio-engine.ts verifies the echo and logs loudly on a mismatch or timeout,
+// because a cache hit that silently skips this whole file is worse than a version
+// bump you forgot: the failure otherwise looks identical to "nothing is wrong".
+const WORKLET_MODULE_VERSION = 6;
 
 // Discontinuity detector threshold: |s[n]−s[n−1]| above this between adjacent
 // output samples counts as a click/splice candidate.
@@ -171,6 +193,7 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
 
   constructor() {
     super();
+    this.port.postMessage({ type: "ready", proc: "ring", version: WORKLET_MODULE_VERSION });
     this.port.onmessage = (event: MessageEvent) => {
       const msg = event.data;
       if (!msg || !msg.type) return;
@@ -409,6 +432,9 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
     let underrunMid = 0;
     let starvedBlocks = 0;
 
+    // Per-source contribution peaks for this block (see STATS_TOP_SOURCE_ID).
+    let blockTopId = 0, blockTopPeak = 0, blockSumPeak = 0, blockAudible = 0;
+
     // ─── Process SAB ring buffer sources ───
     for (const [id, rb] of this.ringBuffers.entries()) {
       const ctrl = rb.ctrl;
@@ -452,6 +478,7 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
       const state = Atomics.load(ctrl, CTRL_STATE);
       if (state !== STATE_PLAYING) continue;
       activeRing++;
+      let srcPeak = 0;
 
       const bufferBytes = Atomics.load(ctrl, CTRL_BUFFER_BYTES);
       const channels = Atomics.load(ctrl, CTRL_CHANNELS) || 1;
@@ -801,11 +828,19 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
             gain = (leftGain + rightGain) * 0.5;
           }
           const contrib = sample * gain;
+          const ca = contrib < 0 ? -contrib : contrib;
+          if (ca > srcPeak) srcPeak = ca;
           output[ch][i] += contrib;
           if (ch === 0) concealLast0 = contrib; else if (ch === 1) concealLast1 = contrib;
         }
 
         pos += rate;
+      }
+
+      if (srcPeak > 0) {
+        blockSumPeak += srcPeak;
+        if (srcPeak > 0.01) blockAudible++;
+        if (srcPeak > blockTopPeak) { blockTopPeak = srcPeak; blockTopId = id; }
       }
 
       rb.position = pos;
@@ -897,13 +932,20 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
       this.maybeReportPosition(id, source);
     }
 
-    // ─── Signal stats (pre-limiter) + output limiter ───
-    // The old always-on soft clip `s/(1+|s|)` waveshaped EVERY sample — constant
-    // harmonic distortion proportional to level (a 0.9 peak became 0.47). The
-    // limiter below is transparent up to LIMIT_T and only bends true oversums.
+    // ─── Signal stats (ring stage, pre-mix) — MEASUREMENT ONLY ───
+    // This is the DirectSound/waveOut ring mix alone, before it reaches masterGain
+    // and sums with encoded/media audio (music, CD tracks) that never passes
+    // through this processor. No limiting happens here any more — the old
+    // always-on soft clip `s/(1+|s|)` waveshaped EVERY sample (constant harmonic
+    // distortion proportional to level; a 0.9 peak became 0.47), and a per-ring
+    // limiter here could never see what the master stage sums it with anyway, so
+    // it protected against a clip that hadn't happened yet and missed the one
+    // that had. CLIP/LIMITED here name what this ring's own sum would have done
+    // to a limiter at ITS threshold — informational, not what the user hears;
+    // BottleShipMasterProcessor below is where the real limiter lives.
     const stats = this.statsCtrl;
     if (stats && Atomics.load(stats, STATS_RESET)) {
-      for (let f = 0; f <= 10; f++) Atomics.store(stats, f, 0);
+      for (let f = 0; f <= 14; f++) Atomics.store(stats, f, 0);
       Atomics.store(stats, STATS_RESET, 0);
       this.lastOut[0] = 0;
       this.lastOut[1] = 0;
@@ -927,9 +969,6 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
         if (a > LIMIT_T) {
           limitedCount++;
           if (a > 1) clipCount++;
-          // Soft knee approaching 1.0 asymptotically
-          const t = (a - LIMIT_T) / LIMIT_K;
-          channel[i] = (s < 0 ? -1 : 1) * (LIMIT_T + LIMIT_K * Math.tanh(t));
         }
       }
       if (ch < this.lastOut.length) this.lastOut[ch] = prev;
@@ -943,6 +982,18 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
       if (limitedCount) Atomics.add(stats, STATS_LIMITED, limitedCount);
       if (discCount) Atomics.add(stats, STATS_DISC, discCount);
       if (underrunMid) Atomics.add(stats, STATS_UNDERRUN_MID, underrunMid);
+      const topMilli = Math.round(blockTopPeak * 1000);
+      if (topMilli > Atomics.load(stats, STATS_TOP_SOURCE_MILLI)) {
+        Atomics.store(stats, STATS_TOP_SOURCE_MILLI, topMilli);
+        Atomics.store(stats, STATS_TOP_SOURCE_ID, blockTopId | 0);
+      }
+      const sumMilli = Math.round(blockSumPeak * 1000);
+      if (sumMilli > Atomics.load(stats, STATS_SUM_SOURCE_MILLI)) {
+        Atomics.store(stats, STATS_SUM_SOURCE_MILLI, sumMilli);
+      }
+      if (blockAudible > Atomics.load(stats, STATS_MAX_CONCURRENT)) {
+        Atomics.store(stats, STATS_MAX_CONCURRENT, blockAudible);
+      }
       if (starvedBlocks) Atomics.add(stats, STATS_STARVED_BLOCKS, starvedBlocks);
       const peakMilli = Math.round(peak * 1000);
       if (peakMilli > Atomics.load(stats, STATS_PEAK_MILLI)) {
@@ -957,4 +1008,101 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
   }
 }
 
+// ─── Master processor: the ONE limiter + the stats that mean "what the user
+// actually hears" ────────────────────────────────────────────────────────────
+//
+// Sits between masterGain and destination (audio-engine.ts). Its single input
+// is whatever the audio graph has summed into it — the ring mix from
+// BottleShipAudioProcessor above AND every encoded/media source (music, CD
+// tracks), which connect straight to masterGain and never pass through the ring
+// processor at all. Multiple connections into one AudioNode input sum by the
+// Web Audio spec, so no mixing code is needed here: this processor only needs
+// to limit and measure the samples it is handed, exactly once, at the one point
+// where the whole mix already exists.
+class BottleShipMasterProcessor extends AudioWorkletProcessor {
+  private statsCtrl: Int32Array | null = null;
+  private lastOut: number[] = [0, 0];
+
+  constructor() {
+    super();
+    this.port.postMessage({ type: "ready", proc: "master", version: WORKLET_MODULE_VERSION });
+    this.port.onmessage = (event: MessageEvent) => {
+      const msg = event.data;
+      if (msg?.type === "register_master_stats") {
+        this.statsCtrl = new Int32Array(msg.sab, 0, 16);
+      }
+    };
+  }
+
+  process(inputs: Float32Array[][], outputs: Float32Array[][]): boolean {
+    const input = inputs[0];
+    const output = outputs[0];
+    if (!output || output.length === 0) return true;
+
+    // No active connection (e.g. the very first block before any source has
+    // started) — pass through silence rather than reading past an empty input.
+    const hasInput = !!input && input.length > 0 && input[0]!.length > 0;
+
+    const stats = this.statsCtrl;
+    if (stats && Atomics.load(stats, STATS_RESET)) {
+      for (let f = 0; f <= 14; f++) Atomics.store(stats, f, 0);
+      Atomics.store(stats, STATS_RESET, 0);
+      this.lastOut[0] = 0;
+      this.lastOut[1] = 0;
+    }
+
+    let clipCount = 0;
+    let limitedCount = 0;
+    let discCount = 0;
+    let peak = 0;
+    let maxJump = 0;
+    let frames = 0;
+
+    for (let ch = 0; ch < output.length; ch++) {
+      const outCh = output[ch];
+      const inCh = hasInput ? (input![Math.min(ch, input!.length - 1)] ?? null) : null;
+      frames = outCh.length;
+      let prev = this.lastOut[ch] ?? 0;
+      for (let i = 0; i < outCh.length; i++) {
+        const s = inCh ? inCh[i] ?? 0 : 0;
+        const a = Math.abs(s);
+        if (a > peak) peak = a;
+        const jump = Math.abs(s - prev);
+        if (jump > maxJump) maxJump = jump;
+        if (jump > DISC_THRESHOLD) discCount++;
+        let out = s;
+        if (a > LIMIT_T) {
+          limitedCount++;
+          if (a > 1) clipCount++;
+          // Soft knee approaching 1.0 asymptotically — the single point where the
+          // whole audible mix (ring + music) is protected from summing past 1.0.
+          const t = (a - LIMIT_T) / LIMIT_K;
+          out = (s < 0 ? -1 : 1) * (LIMIT_T + LIMIT_K * Math.tanh(t));
+        }
+        outCh[i] = out;
+        prev = out;
+      }
+      this.lastOut[ch] = prev;
+    }
+
+    if (stats) {
+      Atomics.add(stats, STATS_PROC, 1);
+      Atomics.add(stats, STATS_FRAMES, frames);
+      if (clipCount) Atomics.add(stats, STATS_CLIP, clipCount);
+      if (limitedCount) Atomics.add(stats, STATS_LIMITED, limitedCount);
+      if (discCount) Atomics.add(stats, STATS_DISC, discCount);
+      const peakMilli = Math.round(peak * 1000);
+      if (peakMilli > Atomics.load(stats, STATS_PEAK_MILLI)) {
+        Atomics.store(stats, STATS_PEAK_MILLI, peakMilli);
+      }
+      const jumpMilli = Math.round(maxJump * 1000);
+      if (jumpMilli > Atomics.load(stats, STATS_MAX_JUMP_MILLI)) {
+        Atomics.store(stats, STATS_MAX_JUMP_MILLI, jumpMilli);
+      }
+    }
+    return true;
+  }
+}
+
 registerProcessor("bottleship-audio", BottleShipAudioProcessor);
+registerProcessor("bottleship-audio-master", BottleShipMasterProcessor);
