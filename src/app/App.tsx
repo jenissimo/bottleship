@@ -31,7 +31,7 @@ import { listAddedGames, removeAddedGame, type AddedGame } from "../wgb-library"
 import { ensurePersistentStorageRequested } from "../storage-manager";
 import { loadGamesCatalog } from "../games-catalog";
 import { browserPolicyBlock, loadDeploymentConfig } from "../deployment-config";
-import { DEFAULT_QUALITY, mergeQuality } from "../worker/core/quality-config";
+import { DEFAULT_QUALITY, mergeQuality, parseStoredQuality, serializeStoredQuality } from "../worker/core/quality-config";
 import type { QualityConfig } from "../worker/core/quality-config";
 import {
   DEFAULT_UI_SETTINGS,
@@ -143,12 +143,9 @@ const QUALITY_STORAGE_KEY = "bottleship.quality";
 function loadQuality(): QualityConfig {
   if (typeof window === "undefined") return { ...DEFAULT_QUALITY };
   try {
-    const raw = localStorage.getItem(QUALITY_STORAGE_KEY);
-    if (!raw) return { ...DEFAULT_QUALITY };
-    const parsed = JSON.parse(raw) as Partial<QualityConfig>;
-    // mergeQuality clamps/snaps every field onto DEFAULT_QUALITY → tolerant of stale/partial data.
-    return mergeQuality(DEFAULT_QUALITY, parsed);
+    return parseStoredQuality(localStorage.getItem(QUALITY_STORAGE_KEY));
   } catch {
+    // ignore localStorage errors in restricted contexts
     return { ...DEFAULT_QUALITY };
   }
 }
@@ -796,7 +793,7 @@ export default function App() {
   useEffect(() => {
     qualityRef.current = quality;
     try {
-      localStorage.setItem(QUALITY_STORAGE_KEY, JSON.stringify(quality));
+      localStorage.setItem(QUALITY_STORAGE_KEY, serializeStoredQuality(quality));
     } catch {
       // ignore localStorage errors in restricted contexts
     }

@@ -153,3 +153,36 @@ export function colorGradeActive(q: QualityConfig): boolean {
         || q.tonemap !== "off"
         || q.vignette > 0.0;
 }
+
+/** Bumped when a stored value's MEANING changes, not its range — see parseStoredQuality. */
+export const QUALITY_SCHEMA = 2;
+
+/** What the host writes to localStorage: the config plus the marker parseStoredQuality reads. */
+export function serializeStoredQuality(q: QualityConfig): string {
+    return JSON.stringify({ ...q, schema: QUALITY_SCHEMA });
+}
+
+/**
+ * Decode the host's persisted quality blob. Lives here, next to mergeQuality, so the
+ * meaning of a stored value is defined in ONE place and stays testable without the host.
+ *
+ * internalScale === 1 used to be the default and did nothing; it now means an explicit
+ * "Native, never upscale". Carrying the number forward would pin every existing user to
+ * the one value that opts OUT of the feature. A stored 1 written BEFORE this schema
+ * existed cannot have been a deliberate choice, so it is dropped back to the default;
+ * the marker is what distinguishes it from a Native chosen since.
+ */
+export function parseStoredQuality(raw: string | null | undefined): QualityConfig {
+    if (!raw) return { ...DEFAULT_QUALITY };
+    let parsed: (Partial<QualityConfig> & { schema?: unknown }) | null;
+    try {
+        parsed = JSON.parse(raw) as Partial<QualityConfig> & { schema?: unknown };
+    } catch {
+        return { ...DEFAULT_QUALITY };
+    }
+    if (!parsed || typeof parsed !== "object") return { ...DEFAULT_QUALITY };
+    if (parsed.schema !== QUALITY_SCHEMA && parsed.internalScale === 1) {
+        delete parsed.internalScale;
+    }
+    return mergeQuality(DEFAULT_QUALITY, parsed);
+}
