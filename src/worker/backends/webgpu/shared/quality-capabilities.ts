@@ -54,7 +54,22 @@ const warnedGaps = new Set<string>();
  * load, so this naturally tracks whichever backend is currently active).
  */
 export function registerBackendQualitySupport(backend: string, supports: readonly QualityKey[]): void {
+    const changed = active?.backend !== backend;
     active = { backend, supports: new Set(supports) };
+    // A backend registers when the GUEST opens its graphics API — long after the host's
+    // last set_quality. Gaps computed before that answered for a different backend (or for
+    // none at all), and nothing recomputed them, so the UI kept showing a stale verdict
+    // about a backend that was no longer running. Announce the change instead.
+    if (changed) for (const fn of backendListeners) fn(backend);
+}
+
+type BackendListener = (backend: string) => void;
+const backendListeners = new Set<BackendListener>();
+
+/** Notify when the backend driving the frame changes, so gap answers can be refreshed. */
+export function onQualityBackendChanged(fn: BackendListener): () => void {
+    backendListeners.add(fn);
+    return () => backendListeners.delete(fn);
 }
 
 /** The backend currently driving the frame, or null before any executor has registered. */
@@ -66,6 +81,7 @@ export function activeQualityBackend(): string | null {
 export function resetQualityCapabilitiesForTest(): void {
     active = null;
     warnedGaps.clear();
+    backendListeners.clear();
 }
 
 /**

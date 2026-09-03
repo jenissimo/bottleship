@@ -88,3 +88,10 @@
   font-variant-numeric: tabular-nums;
   font-size: 13px;
 }
+
+.quality-override {
+  margin-left: 6px;
+  font-size: 0.78em;
+  font-weight: 600;
+  color: #7fb3ff;
+}

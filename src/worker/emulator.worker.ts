@@ -116,7 +116,8 @@ import { frameProfiler } from "./core/frame-profiler";
 import { frameVarianceDiagnostics } from "./core/frame-variance-diagnostics";
 import { framePacer } from "./core/frame-pacer";
 import { EmulatorConfig } from "./core/emulator-config-manager";
-import { logQualityGapsOnce, activeQualityBackend } from "./backends/webgpu/shared/quality-capabilities";
+import { logQualityGapsOnce, activeQualityBackend, onQualityBackendChanged } from "./backends/webgpu/shared/quality-capabilities";
+import type { QualityConfig } from "./core/quality-config";
 import { videoEngine } from "../video/video-engine";
 import { preemptionManager } from "./core/cpu/preemption-manager";
 import { writeGuestCode } from "./core/memory/guest-code";
@@ -3210,6 +3211,19 @@ function resumeEmulator(): void {
 (globalThis as any).__harnessPause = pauseEmulator;
 (globalThis as any).__harnessResume = resumeEmulator;
 
+/**
+ * Tell the host the EFFECTIVE quality config and which of its keys the backend now driving
+ * the frame cannot honour. Sent on every set_quality AND whenever the active backend
+ * changes — the guest opens its graphics API long after the host's last set_quality, so a
+ * one-shot answer describes a backend that is no longer the one rendering.
+ */
+function postQualityState(q: QualityConfig): void {
+    const gaps = logQualityGapsOnce(q);
+    self.postMessage({ type: "set_quality", ok: true, quality: q, unsupported: gaps, backend: activeQualityBackend() });
+}
+
+onQualityBackendChanged(() => postQualityState(EmulatorConfig.getInstance().quality));
+
 const handleWorkerMessage = (event: MessageEvent): void => {
   const message = event.data;
 
@@ -3321,8 +3335,7 @@ const handleWorkerMessage = (event: MessageEvent): void => {
       `[QUALITY] applied (aniso=${q.anisotropy} bright=${q.brightness} contrast=${q.contrast} sat=${q.saturation} aspect=${q.aspectMode} postAA=${q.postAA})`);
     // A knob the active backend cannot honor must be visible, not silently swallowed
     // (see shared/quality-capabilities.ts) — logged here AND relayed to the UI.
-    const gaps = logQualityGapsOnce(q);
-    self.postMessage({ type: "set_quality", ok: true, quality: q, unsupported: gaps, backend: activeQualityBackend() });
+    postQualityState(q);
     return;
   }
 

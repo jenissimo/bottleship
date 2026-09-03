@@ -10,6 +10,10 @@ type QualityPanelProps = {
    *  webgpu/shared/quality-capabilities.ts) — the knob still moves, but nothing consumes
    *  it, so it is labelled rather than left to look like it silently worked. */
   unsupported?: ReadonlySet<string>;
+  /** Keys this game's manifest overrides. The control still edits the user's global
+   *  preference, but the game's value is what the frame uses, so the knob would otherwise
+   *  move with no visible effect — the same "silently did nothing" trap as `unsupported`. */
+  overridden?: ReadonlySet<string>;
   /** Guest's own logical resolution (App.tsx's guestResolution) — the base "internalScale"
    *  multiplies, and what "Native" pins to. */
   guestResolution: { width: number; height: number };
@@ -23,10 +27,19 @@ const SAMPLE_OPTIONS = [1, 2, 4] as const;
 /** quality-config.ts INTERNAL_SCALE_STEPS — 0 is a valid step only here, never for msaa. */
 const INTERNAL_SCALE_OPTIONS = [0, 1, 2, 4] as const;
 
-/** " — not supported by the active backend" suffix, only when this key is a live gap. */
-function GapNote({ unsupported, k }: { unsupported: ReadonlySet<string> | undefined; k: string }): React.ReactElement | null {
-  if (!unsupported?.has(k)) return null;
-  return <span className={s["quality-gap"]} title={`The active graphics backend does not implement "${k}" — this control has no effect right now.`}> ⚠ unsupported here</span>;
+/** Why this control may not be doing what it looks like it is doing. */
+function GapNote({ unsupported, overridden, k }: {
+  unsupported: ReadonlySet<string> | undefined;
+  overridden: ReadonlySet<string> | undefined;
+  k: string;
+}): React.ReactElement | null {
+  if (unsupported?.has(k)) {
+    return <span className={s["quality-gap"]} title={`The active graphics backend does not implement "${k}" — this control has no effect right now.`}> ⚠ unsupported here</span>;
+  }
+  if (overridden?.has(k)) {
+    return <span className={s["quality-override"]} title={`This game's bundle sets "${k}" itself, and the game's value wins. Your choice is kept and applies to games that do not set it.`}> set by this game</span>;
+  }
+  return null;
 }
 
 function SliderRow(props: {
@@ -56,7 +69,7 @@ function SliderRow(props: {
   );
 }
 
-export default function QualityPanel({ quality, onChange, unsupported, guestResolution, renderSize }: QualityPanelProps): React.ReactElement {
+export default function QualityPanel({ quality, onChange, unsupported, overridden, guestResolution, renderSize }: QualityPanelProps): React.ReactElement {
   const guestW = Math.max(1, Math.round(guestResolution.width));
   const guestH = Math.max(1, Math.round(guestResolution.height));
   const factor = resolveInternalScaleFactor(quality.internalScale, guestW, guestH, renderSize.width, renderSize.height);
@@ -73,7 +86,7 @@ export default function QualityPanel({ quality, onChange, unsupported, guestReso
       <h3 className={s["settings-subhead"]}>Display</h3>
       <div className={s["settings-grid"]}>
         <label className={s["settings-row"]}>
-          <span>Internal resolution<GapNote unsupported={unsupported} k="internalScale" /></span>
+          <span>Internal resolution<GapNote unsupported={unsupported} overridden={overridden} k="internalScale" /></span>
           <select
             value={quality.internalScale}
             onChange={(e) => onChange({ internalScale: Number(e.target.value) })}
@@ -108,7 +121,7 @@ export default function QualityPanel({ quality, onChange, unsupported, guestReso
           />
         </label>
         <label className={s["settings-row"]}>
-          <span>Anisotropic filtering<GapNote unsupported={unsupported} k="anisotropy" /></span>
+          <span>Anisotropic filtering<GapNote unsupported={unsupported} overridden={overridden} k="anisotropy" /></span>
           <select
             value={quality.anisotropy}
             onChange={(e) => onChange({ anisotropy: Number(e.target.value) })}
@@ -119,7 +132,7 @@ export default function QualityPanel({ quality, onChange, unsupported, guestReso
           </select>
         </label>
         <label className={s["settings-row"]}>
-          <span>Force trilinear<GapNote unsupported={unsupported} k="forceTrilinear" /></span>
+          <span>Force trilinear<GapNote unsupported={unsupported} overridden={overridden} k="forceTrilinear" /></span>
           <input
             type="checkbox"
             checked={quality.forceTrilinear}
@@ -186,7 +199,7 @@ export default function QualityPanel({ quality, onChange, unsupported, guestReso
       <h3 className={s["settings-subhead"]}>Advanced / experimental</h3>
       <div className={s["settings-grid"]}>
         <label className={s["settings-row"]}>
-          <span>MSAA (experimental)<GapNote unsupported={unsupported} k="msaa" /></span>
+          <span>MSAA (experimental)<GapNote unsupported={unsupported} overridden={overridden} k="msaa" /></span>
           <select
             value={quality.msaa}
             onChange={(e) => onChange({ msaa: Number(e.target.value) })}
@@ -197,7 +210,7 @@ export default function QualityPanel({ quality, onChange, unsupported, guestReso
           </select>
         </label>
         <label className={s["settings-row"]}>
-          <span>Auto mipmap (experimental)<GapNote unsupported={unsupported} k="autoMipmap" /></span>
+          <span>Auto mipmap (experimental)<GapNote unsupported={unsupported} overridden={overridden} k="autoMipmap" /></span>
           <input
             type="checkbox"
             checked={quality.autoMipmap}

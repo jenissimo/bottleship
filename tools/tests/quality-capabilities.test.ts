@@ -7,6 +7,7 @@ import {
     computeQualityGaps,
     logQualityGapsOnce,
     resetQualityCapabilitiesForTest,
+    onQualityBackendChanged,
 } from "../../src/worker/backends/webgpu/shared/quality-capabilities";
 
 function withOverride(patch: Partial<QualityConfig>): QualityConfig {
@@ -80,5 +81,49 @@ describe("quality-capabilities", () => {
         expect(gaps.has("autoMipmap")).toBe(true);
         expect(gaps.has("msaa")).toBe(true);
         expect(gaps.has("internalScale")).toBe(false);
+    });
+});
+
+describe("backend-change notification", () => {
+    beforeEach(() => resetQualityCapabilitiesForTest());
+
+    // The guest opens its graphics API long after the host's last set_quality, so gaps
+    // computed once describe a backend that is no longer rendering — which is exactly how
+    // the UI came to warn "unsupported" about a knob the live backend does support.
+    test("fires when the backend driving the frame changes", () => {
+        const seen: string[] = [];
+        onQualityBackendChanged((b) => seen.push(b));
+
+        registerBackendQualitySupport("ddraw", ["msaa"]);
+        registerBackendQualitySupport("glide", ["internalScale"]);
+        expect(seen).toEqual(["ddraw", "glide"]);
+    });
+
+    test("a re-registration of the SAME backend is not a change", () => {
+        const seen: string[] = [];
+        registerBackendQualitySupport("glide", ["internalScale"]);
+        onQualityBackendChanged((b) => seen.push(b));
+        registerBackendQualitySupport("glide", ["internalScale"]);
+        expect(seen).toEqual([]);
+    });
+
+    test("the gap answer follows the new backend, not the one that first registered", () => {
+        const q = withOverride({ internalScale: 4 });
+        registerBackendQualitySupport("ddraw", ["msaa"]);
+        expect(computeQualityGaps(q)).toContain("internalScale");
+
+        let refreshed: string[] = [];
+        onQualityBackendChanged(() => { refreshed = computeQualityGaps(q); });
+        registerBackendQualitySupport("glide", ["internalScale"]);
+        expect(refreshed).toEqual([]);
+    });
+
+    test("unsubscribing stops the notifications", () => {
+        const seen: string[] = [];
+        const off = onQualityBackendChanged((b) => seen.push(b));
+        registerBackendQualitySupport("ddraw", []);
+        off();
+        registerBackendQualitySupport("glide", []);
+        expect(seen).toEqual(["ddraw"]);
     });
 });

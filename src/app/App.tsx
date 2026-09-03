@@ -362,6 +362,11 @@ export default function App() {
   // not implement — see shared/quality-capabilities.ts. Surfaced in QualityPanel so a
   // knob that provably does nothing on this backend reads as such, not as "applied".
   const [unsupportedQualityKeys, setUnsupportedQualityKeys] = useState<ReadonlySet<string>>(new Set());
+  // Keys where the worker's EFFECTIVE config differs from the preference we sent — i.e. the
+  // loaded game's manifest is overriding them. Derived from the ack rather than asked for
+  // separately: the ack already carries the effective config, and anything else could drift
+  // from it. Cleared naturally on the next ack, so unloading a game clears it too.
+  const [overriddenQualityKeys, setOverriddenQualityKeys] = useState<ReadonlySet<string>>(new Set());
   const [guestResolution, setGuestResolution] = useState({ width: 1024, height: 768 });
   // Canvas physical-pixel backing size (clientWidth/Height × devicePixelRatio) — mirrors
   // resolutionRef.current as React state so QualityPanel can show what "Internal
@@ -1635,6 +1640,11 @@ export default function App() {
       if (event.data?.type === "set_quality") {
         const unsupported = Array.isArray(event.data.unsupported) ? event.data.unsupported : [];
         setUnsupportedQualityKeys(new Set(unsupported));
+        const effective = event.data.quality as Partial<QualityConfig> | undefined;
+        const pref = qualityRef.current as unknown as Record<string, unknown>;
+        setOverriddenQualityKeys(effective
+          ? new Set(Object.keys(effective).filter((k) => (effective as Record<string, unknown>)[k] !== pref[k]))
+          : new Set());
       }
       if (event.data?.type === "window_title") {
         const title = String(event.data.title || "");
@@ -2823,6 +2833,7 @@ export default function App() {
       quality={quality}
       onChange={handleQualityChange}
       unsupportedQualityKeys={unsupportedQualityKeys}
+      overriddenQualityKeys={overriddenQualityKeys}
       uiSettings={uiSettings}
       onUiChange={handleUiChange}
       statsOverlay={statsOverlayEnabled}

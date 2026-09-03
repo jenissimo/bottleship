@@ -10,6 +10,10 @@ export interface SettingsDrawerProps {
    *  worker/backends/webgpu/shared/quality-capabilities.ts) — empty until the worker's
    *  first set_quality ack arrives. */
   unsupportedQualityKeys?: ReadonlySet<string>;
+  /** Quality keys the loaded game's manifest overrides — the control edits the global
+   *  preference, but the game's value is what the frame uses. Also empty until the
+   *  worker's first set_quality ack arrives. */
+  overriddenQualityKeys?: ReadonlySet<string>;
   uiSettings: UiSettings;
   onUiChange: (patch: Partial<UiSettings>) => void;
   statsOverlay: boolean;
