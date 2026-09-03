@@ -24,6 +24,15 @@ function bindMemory(d: any, size = 0x10000): { mem: Uint8Array; dv: DataView } {
     d.cachedDataView = dv;
     d.memLength = mem.length;
     d.spinLoopAddress = SPIN_ADDR;
+    // The dispatcher's cache-validity test reads the CPU-state views, not the
+    // memory Proxy (isDataViewValid) — a fixture that binds only mem8/DataView
+    // models half a cache and reads back as detached.
+    d.cachedWasmBuffer = mem.buffer;
+    d.cachedReg32Raw = new Int32Array(mem.buffer, 64, 8);
+    d.cachedFlagsRaw = new Int32Array(mem.buffer, 120, 1);
+    d.cachedIpRaw = new Int32Array(mem.buffer, 556, 1);
+    d.cachedSegOffsetsRaw = new Int32Array(mem.buffer, 736, 8);
+    d.cachedMem32 = new Uint32Array(mem.buffer, 0, size >>> 2);
     return { mem, dv };
 }
 
@@ -96,6 +105,69 @@ describe('ThunkDispatcher — WBUF dynarec lifecycle', () => {
         } finally {
             pm.wasmExports = oldExports;
         }
+    });
+});
+
+describe('ThunkDispatcher — cache validity is Proxy-free', () => {
+    /** v86's memory view (vendor/v86/src/lib.js): every property read is a trap. */
+    function proxyMem(memory: WebAssembly.Memory): { view: Uint8Array; gets: () => number } {
+        let n = 0, cached: Uint8Array | null = null, cachedBuffer: ArrayBufferLike | null = null;
+        const resolve = () => {
+            if (cachedBuffer !== memory.buffer) {
+                cachedBuffer = memory.buffer;
+                cached = new Uint8Array(cachedBuffer);
+            }
+            return cached!;
+        };
+        const view = new Proxy({} as Uint8Array, {
+            get(_t, prop) {
+                n++;
+                const b = resolve();
+                const x = (b as any)[prop];
+                return typeof x === 'function' ? x.bind(b) : x;
+            },
+            set(_t, prop, value) { (resolve() as any)[prop] = value; return true; },
+        });
+        return { view, gets: () => n };
+    }
+
+    function bindWasm(d: any, memory: WebAssembly.Memory, view: Uint8Array): void {
+        const buf = memory.buffer;
+        d.cachedMem8 = view;
+        d.cachedDataView = new DataView(buf);
+        d.memLength = buf.byteLength;
+        d.cachedWasmBuffer = buf;
+        d.cachedReg32Raw = new Int32Array(buf, 64, 8);
+        d.cachedMem32 = new Uint32Array(buf, 0, buf.byteLength >>> 2);
+    }
+
+    it('answers without touching v86 memory Proxy', () => {
+        const memory = new WebAssembly.Memory({ initial: 2 });
+        const { view, gets } = proxyMem(memory);
+        const d = mkDispatcher() as any;
+        bindWasm(d, memory, view);
+        const before = gets();
+        for (let i = 0; i < 1000; i++) expect(d.isDataViewValid()).toBe(true);
+        expect(gets() - before).toBe(0);
+    });
+
+    it('reports invalid once a wasm grow detaches the cached buffer', () => {
+        const memory = new WebAssembly.Memory({ initial: 2 });
+        const { view } = proxyMem(memory);
+        const d = mkDispatcher() as any;
+        bindWasm(d, memory, view);
+        expect(d.isDataViewValid()).toBe(true);
+        memory.grow(1);                       // detaches the ArrayBuffer the views sit on
+        expect(d.isDataViewValid()).toBe(false);
+    });
+
+    it('reports invalid when the DataView and the CPU views disagree on a buffer', () => {
+        const memory = new WebAssembly.Memory({ initial: 2 });
+        const { view } = proxyMem(memory);
+        const d = mkDispatcher() as any;
+        bindWasm(d, memory, view);
+        d.cachedDataView = new DataView(new ArrayBuffer(0x1000)); // half-refreshed cache
+        expect(d.isDataViewValid()).toBe(false);
     });
 });
 

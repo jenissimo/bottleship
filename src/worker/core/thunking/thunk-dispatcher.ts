@@ -578,18 +578,28 @@ export class ThunkDispatcher {
     }
 
     /**
-     * Safely check if DataView is valid (not detached)
-     * We check through cachedMem8 to avoid accessing byteLength on detached DataView
+     * Are the cached views still usable? Asked on EVERY OUT trap (twice — the
+     * shadow-stack record asks again), so it must not touch `cachedMem8`: that is
+     * v86's memory Proxy, and each property read costs a `get` trap plus a
+     * `WebAssembly.Memory.buffer` read. At ~30K traps a frame those appear in the
+     * CDP trace under their own names (`get`, `get buffer`).
+     *
+     * Testing detachment instead is EQUIVALENT here, not merely cheaper. A
+     * dispatcher is constructed per v86 instance, so within its life `getMemory()`
+     * returns one stable Proxy whose buffer changes only when the wasm memory
+     * grows; that memory is not shared, so a grow DETACHES the old ArrayBuffer and
+     * every view on it — this Int32Array included — reports length 0. The second
+     * clause pins the DataView to the buffer the CPU-state views were built on, so
+     * a half-refreshed cache reads as invalid instead of as a short view.
+     *
+     * A null `cachedReg32Raw` (before setupPortHook, or a fixture that bound only
+     * mem8) answers "invalid", which sends every caller through
+     * updateMemoryCache() — the one place allowed to resolve the Proxy.
      */
     private isDataViewValid(): boolean {
-        if (!this.cachedDataView || !this.cachedMem8) return false;
-        // Check through cachedMem8, as reading byteLength on detached DataView throws error
-        try {
-            return this.cachedMem8.byteLength > 0 &&
-                this.cachedDataView.buffer === this.cachedMem8.buffer;
-        } catch {
-            return false; // Buffer is detached
-        }
+        const dv = this.cachedDataView, raw = this.cachedReg32Raw;
+        if (!dv || !this.cachedMem8 || raw === null) return false;
+        return raw.length !== 0 && dv.buffer === this.cachedWasmBuffer;
     }
 
     public clearStackCheck(): void {
@@ -797,10 +807,8 @@ export class ThunkDispatcher {
 
     /** Try to ensure cachedMem8 and cachedDataView are valid. Returns true if valid. */
     private ensureValidMemory(): boolean {
-        if (!this.cachedMem8 || this.cachedMem8.byteLength === 0 || !this.isDataViewValid()) {
-            this.updateMemoryCache();
-        }
-        return !!(this.cachedMem8 && this.cachedMem8.byteLength > 0 && this.isDataViewValid());
+        if (!this.isDataViewValid()) this.updateMemoryCache();
+        return this.isDataViewValid();
     }
 
     /** Common error-exit for suspended-thunk validation failures: zero EAX + THUNK_STUB boundary. */
@@ -1291,7 +1299,25 @@ export class ThunkDispatcher {
                         // One pair rarely amortises the cross-language setup; leave it on the
                         // established path. Runs of two or more are the useful workload shape.
                         if (run.pairs < 2) continue;
-                        if (binding.handler(mem8, mem32, dataBase + offset, dataBase + run.end, run.pairs)) {
+                        // A throwing consumer is a DECLINE, exactly as on the prefix branch
+                        // above. Nothing has been applied here yet, so falling through to the
+                        // ordinary handlers is the correct completion; letting the exception
+                        // escape instead unwinds out of the drain entirely, leaving wbufTail at
+                        // the run start with the ring un-drained — the whole batch is then
+                        // either replayed or lost, and nothing downstream notices.
+                        let fusedExact: boolean;
+                        try {
+                            fusedExact = binding.handler(
+                                mem8, mem32, dataBase + offset, dataBase + run.end, run.pairs);
+                        } catch (e) {
+                            fusedExact = false;
+                            if (this.wbufFusedConsumerThrows++ === 0) {
+                                Logger.error(LogCategory.THUNK,
+                                    `drainWriteBuffer: exact pair-run consumer for funcId ${funcId} threw; `
+                                    + `declining to the ordinary path: ${e}`);
+                            }
+                        }
+                        if (fusedExact) {
                             offset = run.end;
                             segment += run.pairs;
                             this.wbufBarrierEntriesTotal += run.pairs;
@@ -1531,8 +1557,8 @@ export class ThunkDispatcher {
                 // "never called". One array store keeps it off the Map that the fast path
                 // exists to avoid; names are resolved from namesTable at read time.
                 this.fastPathCounts[functionId]++;
-                // Ensure memory cache is valid
-                if (!this.cachedMem8 || this.cachedMem8.byteLength === 0) this.updateMemoryCache();
+                // Ensure memory cache is valid (detach test, not a Proxy read — see isDataViewValid)
+                if (!this.isDataViewValid()) this.updateMemoryCache();
                 const cpu = this.cachedCpu;
                 if (!cpu || !this.cachedMem8) return;
 
@@ -1669,8 +1695,8 @@ export class ThunkDispatcher {
             return;
         }
 
-        // Ensure memory cache is valid
-        if (!this.cachedMem8 || this.cachedMem8.byteLength === 0) this.updateMemoryCache();
+        // Ensure memory cache is valid (detach test — see isDataViewValid)
+        if (!this.isDataViewValid()) this.updateMemoryCache();
         if (!this.cachedMem8) return;
         const cpu = this.cachedCpu || (this.v86.cpu || (this.v86.v86 && this.v86.v86.cpu));
         if (!cpu) return;
