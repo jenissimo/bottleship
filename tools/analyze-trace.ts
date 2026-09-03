@@ -48,6 +48,10 @@ interface TraceEvent {
   pid: number;
   tid: number;
   ts: number;
+  /** Duration of a complete ("X") slice, microseconds. Absent on other phases. */
+  dur?: number;
+  /** Comma-separated category list Chrome recorded the event under. */
+  cat?: string;
   args?: {
     name?: string;
     data?: {
@@ -1071,6 +1075,80 @@ function diagnoseThread(analysis: ThreadAnalysis): Warning[] {
   }
 
   return warnings;
+}
+
+/**
+ * What the GPU PROCESS did, and — the part that matters more — whether the trace can say.
+ *
+ * A frame budget that blames "the GPU" needs two different things and they are not
+ * interchangeable:
+ *   - CPU time in the GPU process (CrGpuMain task durations). `toplevel` gives this, and it is
+ *     what "CrGpuMain costs 14.0 ms a frame" means: the GPU process was BUSY, on a CPU core.
+ *   - Hardware timings — what the device actually spent. Those live in `gpu` /
+ *     `disabled-by-default-gpu.dawn`, and a trace recorded without them is SILENT about the
+ *     hardware, not evidence that the hardware is idle.
+ *
+ * Conflating the two is how a plan gets sized off the wrong number, so this section reports
+ * them apart and prints an explicit UNAVAILABLE rather than an empty table when the categories
+ * were not recorded (tools/cdp-core.ts records them since 2026-09-02; older artifacts do not).
+ */
+function reportGpuProcess(events: TraceEvent[], threadNames: Map<string, string>, frames: number, scopedTo?: string): string {
+  const GPU_THREADS = /^(CrGpuMain|VizCompositorThread|CompositorTileWorker|DrmThread|GpuWatchdog)/;
+  const byThread = new Map<string, { name: string; busyUs: number; slices: number }>();
+  let gpuCatEvents = 0;
+  let dawnCatEvents = 0;
+  let spanLoUs = Infinity, spanHiUs = -Infinity;
+
+  for (const ev of events) {
+    const cat = ev.cat ?? "";
+    if (cat.includes("disabled-by-default-gpu.dawn")) dawnCatEvents++;
+    else if (/\bgpu\b/.test(cat)) gpuCatEvents++;
+    if (ev.ph !== "X" || typeof ev.dur !== "number") continue;
+    const key = `${ev.pid}:${ev.tid}`;
+    const name = threadNames.get(key);
+    if (!name || !GPU_THREADS.test(name)) continue;
+    const e = byThread.get(key) ?? { name, busyUs: 0, slices: 0 };
+    e.busyUs += ev.dur;
+    e.slices++;
+    byThread.set(key, e);
+    if (ev.ts < spanLoUs) spanLoUs = ev.ts;
+    if (ev.ts + ev.dur > spanHiUs) spanHiUs = ev.ts + ev.dur;
+  }
+
+  const lines: string[] = [];
+  lines.push(`\n${sep("═")}`);
+  lines.push("GPU PROCESS" + (scopedTo ? `  [scoped to --range ${scopedTo}]` : ""));
+  lines.push(sep("═"));
+
+  if (byThread.size === 0) {
+    lines.push("No GPU-process slices in this trace.");
+    lines.push("  A trace with no `toplevel` events from CrGpuMain cannot say anything about the");
+    lines.push("  GPU process at all — not even that it was idle. Re-record with tools/cdp-core.ts.");
+    return lines.join("\n");
+  }
+
+  const spanMs = spanHiUs > spanLoUs ? (spanHiUs - spanLoUs) / 1000 : 0;
+  lines.push(` ${pad("thread", 26)} ${pad("busy ms", 10, true)} ${pad("slices", 8, true)} ${pad("ms/frame", 10, true)}`);
+  lines.push(` ${"-".repeat(58)}`);
+  const ordered = [...byThread.values()].sort((a, b) => b.busyUs - a.busyUs);
+  for (const t of ordered) {
+    const perFrame = frames > 0 ? (t.busyUs / 1000 / frames).toFixed(2) : "n/a";
+    lines.push(` ${pad(t.name, 26)} ${pad((t.busyUs / 1000).toFixed(1), 10, true)} ${pad(String(t.slices), 8, true)} ${pad(perFrame, 10, true)}`);
+  }
+  if (spanMs > 0) lines.push(` window ${spanMs.toFixed(0)} ms${frames > 0 ? `, ${frames} frame(s) counted` : ""}`);
+  lines.push("");
+  lines.push(" This is CPU time IN the GPU process — how long it was busy, not what the hardware spent.");
+
+  lines.push("");
+  if (dawnCatEvents === 0) {
+    lines.push(" GPU HARDWARE TIMINGS: UNAVAILABLE — no `disabled-by-default-gpu.dawn` events.");
+    lines.push("   The trace was recorded without that category, so the hardware side is not absent,");
+    lines.push("   it is UNOBSERVED. Do not conclude anything about the device from the rows above.");
+    if (gpuCatEvents > 0) lines.push(`   (${gpuCatEvents} plain \`gpu\` event(s) present, which is not enough on their own.)`);
+  } else {
+    lines.push(` Dawn/WebGPU work items recorded: ${dawnCatEvents} (category present).`);
+  }
+  return lines.join("\n");
 }
 
 function reportWarnings(analyses: ThreadAnalysis[]): string {
@@ -2132,6 +2210,27 @@ async function main() {
       }
     }
   }
+
+  // ── GPU process (its own section: CPU-in-GPU-process and hardware are different claims) ──
+  // Frames come from the app's own flip marks so "ms/frame" here means the same thing it means
+  // everywhere else in this report; 0 when the trace has none, and the section says "n/a"
+  // rather than dividing by a guess.
+  //
+  // --range must scope this section too, the same way it scopes the frame tail above: the GPU
+  // process is a separate Chrome process with its own timeline, but its event `ts` shares the
+  // trace's absolute clock, so the same base+range window applies. Unscoped here would silently
+  // report a whole-trace GPU average next to range-scoped CPU numbers in the same output.
+  let gpuEvents = events;
+  if (range) {
+    const base = Array.from(profiles.values()).find((p) => Number.isFinite(p.startTs))?.startTs;
+    if (Number.isFinite(base)) {
+      const lo = (base as number) + range.startUs;
+      const hi = (base as number) + range.endUs;
+      gpuEvents = events.filter((ev) => ev.ts + (ev.dur ?? 0) >= lo && ev.ts < hi);
+    }
+  }
+  const framesForGpu = gpuEvents.filter(ev => (ev as any)?.name === "bottleship.flip").length;
+  console.log(reportGpuProcess(gpuEvents, threadNames, framesForGpu, range?.raw));
 
   // ── Warnings (always show — runs on all threads regardless of filter) ──
   console.log(reportWarnings(analyses));

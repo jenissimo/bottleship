@@ -316,9 +316,19 @@ export async function captureTrace(
     const port = opts.port ?? DEFAULT_CDP_PORT;
     const version = await fetchJson(port, "/json/version");
     const session = await CdpSession.connect(version.webSocketDebuggerUrl);
+    // The v8.cpu_profiler category is the load-bearing one for the JS/wasm side.
+    //
+    // The `gpu` pair is here because WITHOUT it a trace is silent about the GPU process and an
+    // analysis of it can only ever be a guess. `toplevel` alone gives CrGpuMain's task
+    // durations — i.e. how long the GPU process was BUSY on the CPU — and says nothing about
+    // what the hardware did. `disabled-by-default-gpu.dawn` is the one that carries the
+    // WebGPU/Dawn work items, which is the only place a "the GPU is the second wall" claim can
+    // come from. Recording them costs trace size, not runtime: they are emitted by the GPU
+    // process, not by the worker under measurement.
     const categories = opts.categories ?? [
         "disabled-by-default-v8.cpu_profiler",
         "v8", "v8.execute", "devtools.timeline", "blink.user_timing", "toplevel",
+        "gpu", "disabled-by-default-gpu.dawn",
     ];
     const events: any[] = [];
     // Not `push(...batch)`: the spread passes every element as an ARGUMENT, and Chrome sends

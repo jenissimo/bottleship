@@ -263,6 +263,16 @@ async function cmdRun(scriptPath: string): Promise<void> {
     if (!scriptPath) throw new Error("usage: harness run <script.harness.ts>");
     const abs = scriptPath.startsWith("/") || /^[A-Za-z]:/.test(scriptPath) ? scriptPath : `${process.cwd()}/${scriptPath}`;
     console.log(`[harness run] ${abs}`);
+    // An absolute self-import re-enters this file as the process entry (see the CLI guard at
+    // the bottom). The guard stops the recursion; naming it here is what stops the next
+    // half-hour of confusion.
+    try {
+        const src = await Bun.file(abs).text();
+        if (/from\s+["'][A-Za-z]:[\/][^"']*\/tools\/harness["']/.test(src) || /from\s+["']\/[^"']*\/tools\/harness["']/.test(src)) {
+            console.warn("[harness run] this script imports tools/harness by ABSOLUTE path — that "
+                + "re-evaluates the CLI module. Use a relative import, or `harness eval`.");
+        }
+    } catch { /* unreadable source is the import's problem, not ours */ }
     // The script imports { harness } from this module and runs its chain(s) at
     // import time; we just await the module evaluation.
     await import(abs);
@@ -800,9 +810,23 @@ async function main(): Promise<void> {
 }
 
 // Only run the CLI when invoked directly (not when imported by a .harness.ts script).
-if (import.meta.main) {
+//
+// The `once` guard is not belt-and-braces. `harness run <script>` imports the script, and a
+// script that imports THIS module by absolute path gets a second module record whose resolved
+// path still equals the process entry — so `import.meta.main` is true again, main() re-parses
+// the same argv, and the CLI re-enters `run` on the same script. That recursion looks like the
+// harness silently restarting. A module-instance-independent flag turns it into one line of
+// diagnosis.
+const HARNESS_CLI_ONCE = "__bsHarnessCliStarted";
+const cliGlobals = globalThis as Record<string, unknown>;
+if (import.meta.main && !cliGlobals[HARNESS_CLI_ONCE]) {
+    cliGlobals[HARNESS_CLI_ONCE] = true;
     // process.exitCode (set by e.g. blackwell-legacy.harness.ts's non-throwing
     // verdict, or cmdRegress on a failed scenario) must survive to the real exit —
     // a hardcoded exit(0) here silently discards it.
     main().then(() => process.exit(process.exitCode ?? 0)).catch((e) => { console.error(e); process.exit(1); });
+} else if (import.meta.main) {
+    console.warn("[harness] tools/harness.ts was evaluated a second time as the process entry — "
+        + "the CLI is NOT re-running. A script imported it by absolute path; import it relatively "
+        + "(`from \"../harness\"`) or drive the page with `harness eval` instead.");
 }

@@ -7,11 +7,22 @@
  * 4 KiB pages the guest is executing in is a fingerprint of the scene that needs no
  * thresholds about brightness and cannot be fooled by a spinning logo.
  *
+ * WHAT THE SAMPLER ACTUALLY RANKS, and why this verb is about identity and not about heat.
  * The sampler is the one v86's tick hook already runs (emulator.worker.ts, `__eipSampOn`):
- * it reads EIP once per do_tick, between JIT batches, so it observes full-speed behaviour
- * and adds nothing to the hot path. What is per-tick is a SAMPLE, not a census — a page
- * absent from the histogram is "not caught", not "not executed" — so the verb reports the
- * sample count next to the shares rather than presenting them as coverage.
+ * it reads EIP once per do_tick, BETWEEN JIT batches. That is a tick BOUNDARY, so the
+ * histogram ranks the places the guest is standing when a batch ends — its EXIT POINTS —
+ * not the places it spends cycles. The two can diverge sharply: a guest that traps often
+ * parks in a thunk stub often, so the stub arena's share of samples can dwarf its share of
+ * executed JIT time. Reading a share here as "hot code" is the exact trap this project keeps
+ * paying for — a high sample share has turned out to be a trap-heavy entry point, not work.
+ *
+ * So: use this to tell one SCENE from another — a front end and a race exit through
+ * different functions, which is a fingerprint and needs no thresholds. For where the time
+ * goes, use a CDP trace (`harness trace` + analyze-trace's GUEST ATTRIBUTION), which
+ * attributes executed JIT-block samples rather than boundary positions.
+ *
+ * `exitPoints` below makes the bias legible instead of documented: the share of samples that
+ * landed in OUR thunk/callback/spin regions is, by construction, parking and not work.
  *
  * Compare two windows with `codeSceneCompare`: overlap of the hot page sets, weighted by
  * how much time each page took. That is the question an A/B actually needs answered, and
@@ -22,6 +33,22 @@
 import type { HarnessService } from "../service";
 import { HarnessError, HarnessErrorCode } from "../rpc";
 import { symbolize } from "../serialize";
+import { System } from "../../core/system";
+import type { RegionKind } from "../../core/memory/address-space";
+
+/** Regions that are boundary parking, never guest work: a sample here is an exit point. */
+const EXIT_POINT_KINDS: ReadonlySet<RegionKind> = new Set<RegionKind>([
+    "THUNK_CODE", "CALLBACK_STUB", "SPIN_LOOP",
+]);
+
+/** Which region a code page belongs to, when the address space can say. */
+function pageKind(page: number): string | null {
+    try {
+        return System.getInstance().process?.addressSpace?.getRegion(page)?.kind ?? null;
+    } catch {
+        return null;
+    }
+}
 
 interface EipHist { hist: Record<string, number>; n: number }
 
@@ -65,12 +92,19 @@ export function registerCodeSceneCommands(svc: HarnessService): void {
         const pages = [...byPage.entries()]
             .sort((a, b) => b[1] - a[1])
             .slice(0, top)
-            .map(([page, hits]) => ({
-                page: `0x${page.toString(16)}`,
-                hits,
-                pct: +((hits / total) * 100).toFixed(2),
-                symbol: symbolize(page),
-            }));
+            .map(([page, hits]) => {
+                const kind = pageKind(page);
+                return {
+                    page: `0x${page.toString(16)}`,
+                    hits,
+                    pct: +((hits / total) * 100).toFixed(2),
+                    symbol: symbolize(page),
+                    kind,
+                    // Named per row so a big share cannot be read as a hot function by
+                    // someone skimming the table.
+                    exitPoint: kind !== null && EXIT_POINT_KINDS.has(kind as RegionKind),
+                };
+            });
 
         if (snap.n === 0) {
             throw new HarnessError(
@@ -78,14 +112,28 @@ export function registerCodeSceneCommands(svc: HarnessService): void {
                 + "tick died before the after-hook). An empty page set is not an empty scene.",
                 HarnessErrorCode.INTERNAL);
         }
+        let exitHits = 0;
+        for (const [page, hits] of byPage) {
+            const kind = pageKind(page);
+            if (kind !== null && EXIT_POINT_KINDS.has(kind as RegionKind)) exitHits += hits;
+        }
+        const exitPct = +((exitHits / total) * 100).toFixed(2);
         return {
             spanMs: +spanMs.toFixed(1),
             samples: snap.n,
             distinctPages: byPage.size,
             pages,
-            note: "one EIP sample per v86 tick, so this is a SAMPLE of where time goes, not a census: "
-                + "an absent page means 'not caught', never 'not executed'. Compare two windows with "
-                + "codeSceneCompare rather than reading a share as coverage.",
+            exitPoints: {
+                pct: exitPct,
+                note: "share of samples taken inside our thunk / callback-stub / spin-loop "
+                    + "regions. Parking, by construction — it measures how often the guest "
+                    + "TRAPS, never how much code there runs.",
+            },
+            note: "EIP is read at a TICK BOUNDARY, so this ranks EXIT POINTS, not hot code — a "
+                + "page's share says how often the guest was standing there when a JIT batch "
+                + "ended. Use it to tell one scene from another (codeSceneCompare); for where "
+                + "time actually goes use a CDP trace's guest attribution. It is also a SAMPLE, "
+                + "not a census: an absent page means 'not caught', never 'not executed'.",
         };
     });
 
