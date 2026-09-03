@@ -21,6 +21,7 @@ import {
     armGlideFrameCapture, takeGlideFrameCapture, type GlideCapturedDraw,
 } from "../../modules/glide2x/frame-capture";
 import { glideTriangleSourceRing } from "../../modules/glide2x/draw";
+import { guMmidResolveStats } from "../../modules/glide2x/texture";
 import { Mem } from "../../core/memory/mem-accessor";
 import { unpackCombine, unpackBlend } from "../../backends/webgpu/glide/glide-combine";
 
@@ -114,7 +115,11 @@ function describeDraw(d: GlideCapturedDraw): unknown {
 export function registerGlideCommands(svc: HarnessService): void {
     svc.register("glideState", (args) => {
         const opts = (args[0] ?? {}) as { scope?: "summary" | "full"; onlyActive?: boolean };
-        return glideMod().getDebugResourcesInfo!(opts.scope ?? "summary", opts.onlyActive ?? false);
+        const info = glideMod().getDebugResourcesInfo!(opts.scope ?? "summary", opts.onlyActive ?? false);
+        // How guTexSource's mmid resolved. A keyed hit is O(TMUs); every fallback walks all
+        // resident textures and sorts them, so a fallback-dominated ratio means the keyed
+        // path is decorative — invisible from the outside without this ledger.
+        return { ...(info as object), guMmidResolve: { ...guMmidResolveStats } };
     });
 
     svc.register("glideFrame", async (args) => {

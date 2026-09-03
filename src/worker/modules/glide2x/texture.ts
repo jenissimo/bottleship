@@ -246,6 +246,14 @@ function ensureTextureForSource(
  *  objects on the hot path for every one of them. */
 const guMmidResult: { tmuIndex: number; texture: GlideTextureRecord | null } = { tmuIndex: 0, texture: null };
 
+/**
+ * How guTexSource's mmid actually resolved. The keyed lookup is the whole point of this
+ * function's shape, and nothing outside could tell whether it HITS — a fallback walk on
+ * every call would look identical from the caller and cost O(textures) plus a sort.
+ * Surfaced by the `glideState` harness verb (FAST-PATH LEDGER RULE).
+ */
+export const guMmidResolveStats = { keyed: 0, ordinalFallback: 0, recentFallback: 0, miss: 0 };
+
 function resolveTextureByGuMmid(
     context: GlideContext,
     mmid: number,
@@ -268,6 +276,7 @@ function resolveTextureByGuMmid(
         }
     }
     if (best) {
+        guMmidResolveStats.keyed++;
         guMmidResult.tmuIndex = bestTmu;
         guMmidResult.texture = best;
         return guMmidResult as { tmuIndex: number; texture: GlideTextureRecord };
@@ -282,12 +291,14 @@ function resolveTextureByGuMmid(
         for (const texture of tmu.texturesByAddress.values()) allTextures.push({ tmuIndex, texture });
     }
     if (allTextures.length === 0) {
+        guMmidResolveStats.miss++;
         return null;
     }
 
     // Pragmatic fallback: legacy guTex* code often uses small sequential handles.
     // If mmid looks like a small positive handle, map it by allocation-like order.
     if (mmid > 0 && mmid <= allTextures.length) {
+        guMmidResolveStats.ordinalFallback++;
         allTextures.sort((a, b) => {
             if (a.tmuIndex !== b.tmuIndex) return a.tmuIndex - b.tmuIndex;
             return (a.texture.startAddress >>> 0) - (b.texture.startAddress >>> 0);
@@ -296,6 +307,7 @@ function resolveTextureByGuMmid(
     }
 
     // Last resort: keep rendering with the most recently uploaded texture.
+    guMmidResolveStats.recentFallback++;
     allTextures.sort((a, b) => b.texture.uploadedAt - a.texture.uploadedAt);
     return allTextures[0] ?? null;
 }
