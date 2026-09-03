@@ -13,7 +13,7 @@
  *
  * Two tiers of keys:
  *  - UNIVERSAL: the present-pass family (gamma/color-grade, FXAA, tonemap, vignette,
- *    aspect/integer-scale presentation, the example scanline/CRT effects, HDR output).
+ *    aspect/integer-scale presentation, the example scanline/CRT effects).
  *    Every backend's final "blit the frame to the canvas" call routes through the ONE
  *    PostFxChain (see post-fx-chain.ts), so these are supported by construction and no
  *    backend needs to declare them.
@@ -36,7 +36,7 @@ export type QualityKey = keyof QualityConfig;
 
 export const UNIVERSAL_QUALITY_KEYS: ReadonlySet<QualityKey> = new Set<QualityKey>([
     "brightness", "contrast", "saturation", "postAA", "tonemap", "vignette",
-    "integerScale", "aspectMode", "scanlines", "crt", "hdr",
+    "integerScale", "aspectMode", "scanlines", "crt",
 ]);
 
 interface RegisteredBackend {

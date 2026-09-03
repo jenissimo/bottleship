@@ -48,7 +48,7 @@ describe("quality-capabilities", () => {
         const q = withOverride({
             brightness: 1.5, contrast: 1.2, saturation: 0.5, postAA: "fxaa",
             tonemap: "aces", vignette: 0.4, integerScale: true, aspectMode: "pillarbox",
-            scanlines: true, crt: true, hdr: true,
+            scanlines: true, crt: true,
         });
         expect(computeQualityGaps(q)).toEqual([]);
         for (const key of UNIVERSAL_QUALITY_KEYS) {

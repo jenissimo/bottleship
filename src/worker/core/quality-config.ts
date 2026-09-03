@@ -58,8 +58,6 @@ export interface QualityConfig {
     internalScale: number;
     /** Auto-generate mip chains on texture upload (prereq for trilinear/AF to bite). */
     autoMipmap: boolean;
-    /** Map SDR → extended-range output on an HDR canvas. */
-    hdr: boolean;
 }
 
 export const DEFAULT_QUALITY: QualityConfig = {
@@ -78,7 +76,6 @@ export const DEFAULT_QUALITY: QualityConfig = {
     msaa: 1,
     internalScale: 0,
     autoMipmap: false,
-    hdr: false,
 };
 
 function clampNum(v: unknown, lo: number, hi: number, dflt: number): number {
@@ -132,7 +129,6 @@ export function mergeQuality(base: QualityConfig, partial: Partial<QualityConfig
     if ("msaa" in partial) out.msaa = snapTo(partial.msaa, SAMPLE_STEPS, base.msaa);
     if ("internalScale" in partial) out.internalScale = snapTo(partial.internalScale, INTERNAL_SCALE_STEPS, base.internalScale);
     if ("autoMipmap" in partial) out.autoMipmap = !!partial.autoMipmap;
-    if ("hdr" in partial) out.hdr = !!partial.hdr;
 
     // integerScale and aspectMode:'integer' are two spellings of the same intent — keep them coherent.
     if (out.aspectMode === "integer") out.integerScale = true;
