@@ -177,6 +177,11 @@ export interface JitTierShare { liftoff: number; turbofan: number; unknown: numb
 
 /** Window baseline for the read-microTLB census; cleared whenever its configuration changes. */
 let readTlbMark: { hit: number; fill: number; atMs: number; mode: number; codePage: number } | null = null;
+/** EAGL counter snapshot for eaglTokenCounts()'s window + Tier-0 oracle. `tier0Mode` is the
+ *  Tier-0 mode AT MARK TIME — eaglFilterSkip() resets the Tier-0 cells it also reads from, so a
+ *  mode change (or the reset alone) inside the window must invalidate it, the same way
+ *  setReadTlbCache() nulls readTlbMark on a configuration change. */
+let eaglTokenMarkState: { enter: number; handled: number; decline: number; skip: number; tier0: number; tier0Mode: number } | null = null;
 
 export const dbg = {
     /** Enable the debugger. Turns JIT OFF (required) and clears the JIT cache. */
@@ -1109,13 +1114,76 @@ export const dbg = {
         const w = wasm(); if (!w?.eagl_token_enter_count) return null;
         const enter = w.eagl_token_enter_count(), handled = w.eagl_token_handled_count();
         const decline = w.eagl_token_decline_count(), skip = w.eagl_token_skip_count();
+        const g = (globalThis as any).eaglFilterSkipCounters?.() ?? null;
+        const m = eaglTokenMarkState;
+        // eaglFilterSkip() zeroes the Tier-0 cfg cells on every mode set, so a mark taken before
+        // one is now a baseline for a counter that no longer exists — the subtraction would go
+        // negative rather than fail loudly. A mode change inside the window is the same hazard:
+        // "predicted and crossed" (mode 2) and "skipped without crossing" (mode 1) are different
+        // questions, so a window spanning both answers neither. Both refuse rather than guess.
+        const tier0Stale = !!m && (!g || g.mode !== m.tier0Mode);
+        const win = m ? {
+            enter: enter - m.enter, handled: handled - m.handled,
+            decline: decline - m.decline, skip: skip - m.skip,
+            tier0: tier0Stale ? null : (g ? (g.total - m.tier0) : null),
+        } : null;
+        // Tier-0 oracle. In mode 2 the guest filter predicts and crosses anyway,
+        // so over one window its count must EQUAL the handler's own skip delta:
+        // both tiers decided on the same calls with the same predicate. Nothing
+        // else in a run notices a wrong offset — a Tier-0 skip that should not
+        // have happened is a state set the device silently never receives.
+        let oracle = 'no mark (call eaglTokenMark first)';
+        if (win && tier0Stale) {
+            oracle = 'stale mark: Tier-0 mode/counters changed inside the window (call eaglTokenMark again)';
+        } else if (win && g) {
+            oracle = g.mode !== 2
+                ? `tier0 ${g.modeName}: no oracle running`
+                : win.tier0 === 0
+                    ? 'oracle did not run (no class-1/8 redundant set in the window)'
+                    : win.tier0 === win.skip
+                        ? `agree (${win.tier0} predictions)`
+                        : `DISAGREE: guest ${win.tier0} vs handler ${win.skip}`;
+        }
         const out = {
             enter, handled, decline, skip,
             handledPct: enter > 0 ? +(100 * handled / enter).toFixed(2) : 0,
             skipPct: enter > 0 ? +(100 * skip / enter).toFixed(2) : 0,
+            tier0: g, window: win, oracle,
         };
         console.log(`[dbg][eagl][JSON] ${JSON.stringify(out)}`);
         return out;
+    },
+    /** Snapshot the EAGL counters so the next eaglTokenCounts() reports a WINDOW.
+     *  Lifetime totals cannot express "since the flag flipped", which is the only
+     *  question either the A/B or the Tier-0 oracle is asking. */
+    eaglTokenMark(): any {
+        const w = wasm(); if (!w?.eagl_token_enter_count) return null;
+        const g = (globalThis as any).eaglFilterSkipCounters?.();
+        eaglTokenMarkState = {
+            enter: w.eagl_token_enter_count(), handled: w.eagl_token_handled_count(),
+            decline: w.eagl_token_decline_count(), skip: w.eagl_token_skip_count(),
+            tier0: g?.total ?? 0, tier0Mode: g?.mode ?? -1,
+        };
+        console.log(`[dbg][eagl] mark ${JSON.stringify(eaglTokenMarkState)}`);
+        return eaglTokenMarkState;
+    },
+    /**
+     * Tier-0 mode: 0 = off (every class-1/8 token crosses, the pre-feature arm),
+     * 1 = live (a redundant set is answered in guest code), 2 = oracle (predict,
+     * count, cross anyway). Live — unlike the AddRef/Release stubs, which patch
+     * a stub and cannot be undone — because the filter reads the mode cell on
+     * every dispatch, so a paired A/B needs no reload.
+     */
+    eaglFilterSkip(mode = 1): any {
+        const set = (globalThis as any).eaglSetFilterSkipMode?.(mode);
+        if (set === undefined || set < 0) return { error: 'eagl token-dispatch not armed' };
+        (globalThis as any).eaglResetFilterSkipCounters?.();
+        // Same rule as setReadTlbCache(): this resets the very cells eaglTokenMark() snapshotted,
+        // so a mark taken before this call is a baseline for a counter that no longer exists.
+        eaglTokenMarkState = null;
+        const g = (globalThis as any).eaglFilterSkipCounters?.();
+        console.log(`[dbg][eagl] tier0 mode=${g?.modeName} (counters reset)`);
+        return g;
     },
     /** Wasm branch hints on guard slow paths (idx 22). MASK, not a boolean:
      *  bit0 = memory/TLB guards, bit1 = x87 guards. Default 0 (off). Only the optimizing
