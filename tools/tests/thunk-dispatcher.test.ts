@@ -594,4 +594,57 @@ describe('ThunkDispatcher.drainWriteBuffer — prefix-fusion consumer that throw
         expect(mem32[CONTROL >> 2]).toBe(0);
         expect(d.getWbufStats().fusedConsumerThrows).toBe(0);
     });
+
+    // The census answers "what the guest called", so it must be independent of how the drain
+    // chose to consume the ring. The accepted-fusion case above runs 2 handlers for 7 entries:
+    // a census counted at the handlers would report 2, which is the whole failure it exists to
+    // avoid — a batched renderer's draws reading as "never called".
+    it('counts every ring entry whether or not fusion swallowed it', () => {
+        const names = { [F]: 'fake:First', [M]: 'fake:Middle', [D]: 'fake:Draw' };
+
+        const census = (accept: boolean) => {
+            const { d, calls } = setup(() => accept);
+            Object.assign(d.namesTable, names);
+            d.setWriteBufCensusEnabled(true);
+            d.drainWriteBuffer();
+            return { rows: d.getWriteBufCensus(), handlerCalls: calls.length };
+        };
+
+        const fused = census(true);
+        const declined = census(false);
+
+        // Identical ring ⇒ identical census, though the drain ran 2 handlers versus 7.
+        const expected = [
+            { name: 'fake:First', count: 3 },
+            { name: 'fake:Draw', count: 3 },
+            { name: 'fake:Middle', count: 1 },
+        ];
+        expect(fused.rows).toEqual(expected);
+        expect(declined.rows).toEqual(expected);
+        expect(fused.handlerCalls).toBe(2);
+        expect(declined.handlerCalls).toBe(7);
+    });
+
+    it('stays off — and reports nothing — until it is enabled', () => {
+        const { d } = setup(() => false);
+        d.drainWriteBuffer();
+        // An empty array, not zeros: a zeroed row would read exactly like "called zero times".
+        expect(d.getWriteBufCensus()).toEqual([]);
+    });
+
+    it('reset zeroes the counts without disabling the census', () => {
+        const { d, mem32, head } = setup(() => false);
+        d.setWriteBufCensusEnabled(true);
+        d.drainWriteBuffer();
+        expect(d.getWriteBufCensus().length).toBe(3);
+
+        d.resetWriteBufCensus();
+        expect(d.getWriteBufCensus()).toEqual([]);
+
+        // Still armed: a second drain of the same ring counts again.
+        d.wbufTail = 0;
+        mem32[CONTROL >> 2] = head;
+        d.drainWriteBuffer();
+        expect(d.getWriteBufCensus().length).toBe(3);
+    });
 });

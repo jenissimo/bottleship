@@ -269,6 +269,8 @@ export class ThunkDispatcher {
     private fastPathTable: Array<FastPathImplementation | null> = new Array(MAX_THUNK_ID).fill(null);
     /** Per-thunk fast-path hit counts — the census for the tier apiCensus cannot see. */
     private fastPathCounts = new Uint32Array(MAX_THUNK_ID);
+    /** Per-funcId WBUF ring census; null until opted into — see censusWriteBufRange. */
+    private wbufCallCounts: Uint32Array | null = null;
     /**
      * Thunks whose stub is used AS a window procedure. Such a stub is a callback
      * target, so [ESP] on entry is a callback return stub — the one shape the
@@ -1186,6 +1188,7 @@ export class ThunkDispatcher {
         const dataBase = this.writeBufDataBase;
         let offset = this.wbufTail;
         let segment = 0; // barrier (draw) count — must mirror buildWbufCoalesceIndex's walk
+        if (this.wbufCallCounts) this.censusWriteBufRange(mem32, dataBase, offset, head);
         const coalescing = this.wbufCoalescingEnabled && this.buildWbufCoalesceIndex(mem32, dataBase, offset, head);
         while (offset < head) {
             const funcId: number = mem32[(dataBase + offset) >> 2] >>> 0;
@@ -4466,6 +4469,57 @@ export class ThunkDispatcher {
 
     resetFastPathCensus(): void {
         this.fastPathCounts.fill(0);
+    }
+
+    /**
+     * Write-buffer call census: the THIRD dispatch tier, and the one that is invisible by
+     * construction — a WBUF-deferred call never reaches the OUT trap at all, so neither
+     * apiCensus (JS dispatch) nor fastPathCounts can see it. For a batched renderer that
+     * is most of the frame: grDrawTriangle and every render-state setter answer here.
+     *
+     * Counted by WALKING the ring, not at the handlers, because the drain deliberately does
+     * not run one handler per entry: coalescing drops superseded setters and pair-run fusion
+     * consumes a whole run in one call. Counting dispatches would answer "what we executed";
+     * this answers "what the GUEST called", which is what a census is for, and it stays
+     * correct however the drain's consumption strategy changes.
+     *
+     * Opt-in (`setWorkerFlag('__wbufCensus', true)`): a second walk of the ring is cheap but
+     * not free, and this is the hot path the ring exists to keep cheap.
+     */
+    private censusWriteBufRange(mem32: Uint32Array, dataBase: number, from: number, to: number): void {
+        const counts = this.wbufCallCounts;
+        if (!counts) return;
+        let offset = from;
+        while (offset < to) {
+            const funcId = mem32[(dataBase + offset) >> 2] >>> 0;
+            if (!(funcId > 0 && funcId < MAX_THUNK_ID)) break;
+            const argCount = this.writeBufArgCountTable[funcId];
+            if (argCount <= 0) break;
+            const stride = this.getWbufEntryStride(mem32, dataBase, offset, argCount);
+            // A non-advancing stride would spin forever; the drain proper reports the corruption.
+            if (stride <= 0 || offset + stride > to) break;
+            counts[funcId]++;
+            offset += stride;
+        }
+    }
+
+    setWriteBufCensusEnabled(on: boolean): void {
+        this.wbufCallCounts = on ? (this.wbufCallCounts ?? new Uint32Array(MAX_THUNK_ID)) : null;
+    }
+
+    getWriteBufCensus(): Array<{ name: string; count: number }> {
+        const counts = this.wbufCallCounts;
+        if (!counts) return [];
+        const out: Array<{ name: string; count: number }> = [];
+        for (let id = 0; id < counts.length; id++) {
+            const count = counts[id]!;
+            if (count) out.push({ name: this.namesTable[id] || `thunk#${id}`, count });
+        }
+        return out.sort((a, b) => b.count - a.count);
+    }
+
+    resetWriteBufCensus(): void {
+        this.wbufCallCounts?.fill(0);
     }
 
     /**

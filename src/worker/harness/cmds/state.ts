@@ -381,15 +381,18 @@ export function registerStateCommands(svc: HarnessService): void {
      * Pass true to get only the suspect-stub subset (== report().silentStubs).
      */
     /**
-     * apiCensus(sel?, {reset?}) — every API the guest actually called, across BOTH dispatch
-     * tiers.
+     * apiCensus(sel?, {reset?, wbuf?}) — every API the guest actually called, across the
+     * dispatch tiers.
      *
      * The JS-dispatch census alone is a trap: every d3d8/d3d9/ddraw draw and render-state
      * setter is served by the fast path, so asking this for a rendering question and reading
      * a zero says "the guest issued no draw calls" when it issued thousands. `fastPathCount`
      * is that tier, reported beside `count` rather than summed into it (a fast path that
-     * defers by returning null is counted on both). `tiersNotCovered` names what is still
-     * invisible, so a zero here can never again be read as "never called".
+     * defers by returning null is counted on both). `wbufCount` is the deferred write-buffer
+     * ring — a THIRD tier that reaches no trap at all and so reads as zero on both of the
+     * others; it is opt-in (`{wbuf:true}`) because counting costs a walk of the ring per
+     * drain. `tiersNotCovered` names what is still invisible — including WBUF while it is
+     * off — so a zero here can never be read as "never called".
      *
      * Counts are cumulative since load; pass `{reset:true}` to zero both tiers, or diff two
      * snapshots for a windowed answer. `module` filters by the `"<module>:"` prefix.
@@ -401,24 +404,38 @@ export function registerStateCommands(svc: HarnessService): void {
     svc.register("apiCensus", (args) => {
         const onlySuspect = args[0] === true || args[0] === "suspect";
         const moduleFilter = typeof args[0] === "string" && args[0] !== "suspect" ? args[0].toLowerCase() : null;
-        const opts = (args[1] ?? (typeof args[0] === "object" ? args[0] : {})) as { reset?: boolean };
+        const opts = (args[1] ?? (typeof args[0] === "object" ? args[0] : {})) as { reset?: boolean; wbuf?: boolean };
         const dispatcher = proc()?.dispatcher as {
             getFastPathCensus?: () => Array<{ name: string; count: number }>;
             resetFastPathCensus?: () => void;
+            getWriteBufCensus?: () => Array<{ name: string; count: number }>;
+            resetWriteBufCensus?: () => void;
+            setWriteBufCensusEnabled?: (on: boolean) => void;
         } | undefined;
 
         if (opts?.reset) {
             apiCensus.clear();
             dispatcher?.resetFastPathCensus?.();
+            dispatcher?.resetWriteBufCensus?.();
             return { reset: true };
+        }
+        // Opt-in third tier: counting costs a second walk of the ring per drain, so it is
+        // off until asked for. Counts therefore start HERE, not at load — which is why the
+        // enabling call answers with a marker instead of a zero that reads like "never called".
+        if (opts?.wbuf !== undefined) {
+            dispatcher?.setWriteBufCensusEnabled?.(!!opts.wbuf);
+            if (opts.wbuf) return { wbufCensus: "enabled", note: "counts start now; call again to read them" };
         }
 
         const fast = new Map((dispatcher?.getFastPathCensus?.() ?? []).map((r) => [r.name, r.count]));
+        const wbufRows = dispatcher?.getWriteBufCensus?.() ?? [];
+        const wbuf = new Map(wbufRows.map((r) => [r.name, r.count]));
         const rows = onlySuspect ? apiCensus.suspectStubs() : apiCensus.list();
         const out = rows.map((s) => ({
             api: s.name,
             count: s.count,
             fastPathCount: fast.get(s.name) ?? 0,
+            wbufCount: wbuf.get(s.name) ?? 0,
             arity: s.arity,
             suspect: s.suspectStub,
             lastCaller: "0x" + s.lastCaller.toString(16),
@@ -430,9 +447,20 @@ export function registerStateCommands(svc: HarnessService): void {
             const seen = new Set(rows.map((r) => r.name));
             for (const [name, count] of fast) {
                 if (!seen.has(name)) {
+                    seen.add(name);
                     out.push({
-                        api: name, count: 0, fastPathCount: count, arity: -1, suspect: false,
-                        lastCaller: "0x0", lastCallerSym: null,
+                        api: name, count: 0, fastPathCount: count, wbufCount: wbuf.get(name) ?? 0,
+                        arity: -1, suspect: false, lastCaller: "0x0", lastCallerSym: null,
+                    });
+                }
+            }
+            // A WBUF-only call reaches NEITHER of the other two tiers, so without this it has
+            // no row at all — the exact shape of the miss this verb keeps being caught by.
+            for (const [name, count] of wbuf) {
+                if (!seen.has(name)) {
+                    out.push({
+                        api: name, count: 0, fastPathCount: 0, wbufCount: count,
+                        arity: -1, suspect: false, lastCaller: "0x0", lastCallerSym: null,
                     });
                 }
             }
@@ -441,7 +469,14 @@ export function registerStateCommands(svc: HarnessService): void {
         return {
             calls,
             total: calls.length,
-            tiersNotCovered: ["wasm hypercall (io_port_write32 0xB077): time, sync, string/memory, FPU/math"],
+            tiersNotCovered: [
+                "wasm hypercall (io_port_write32 0xB077): time, sync, string/memory, FPU/math",
+                ...(wbufRows.length || opts?.wbuf
+                    ? []
+                    : ["write buffer (deferred ring): draws + render-state setters — a WBUF call "
+                       + "never hits the OUT trap, so it is 0 on BOTH tiers above. "
+                       + "Enable with apiCensus(null, {wbuf:true}), then re-read."]),
+            ],
         };
     });
 
