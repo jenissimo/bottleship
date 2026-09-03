@@ -67,6 +67,38 @@ describe('registerMultiStructCaptureWriteBufferFunction', () => {
         // A capture must never coalesce: two draws are two draws.
         expect(d.writeBufCoalesceMaskTable[DRAW.id]).toBe(0);
     });
+
+    // A registration made before its stub exists is replayed later. That replay had its own
+    // copy of the "what shape is this pending record" chain, and the copy did not know about
+    // multi-struct capture: grDrawTriangle came back as an ORDINARY ring function with
+    // argCount=3, so the stub wrote a 16-byte entry holding only the three pointers and the
+    // drain read "vertices" out of whatever followed. Every triangle came out degenerate —
+    // no error, no log line, just a menu with none of its panels. Degrading into a plausible
+    // wrong registration is the failure mode; refusing or replaying correctly are both fine.
+    it('survives being deferred until its stub exists', () => {
+        const mem = new Uint8Array(0x20000);
+        const d = mkDispatcher(mem);
+        let bump = 0x10000;
+        d.thunkMemoryManager = { stubAllocator: { alloc: (size: number) => { const a = bump; bump += size; return a; } } };
+        d.getMemory = () => mem;
+
+        // No stub yet: the registration can only be recorded as pending.
+        let stubs: unknown[] = [];
+        d.findStubsByName = () => stubs;
+        d.registerMultiStructCaptureWriteBufferFunction(
+            'fake', DRAW.name, DRAW.argCount, DRAW.ptrArgIndices, DRAW.payloadDwords, () => { });
+        expect(d.writeBufArgCountTable[DRAW.id] | 0).toBe(0);
+
+        // The stub arrives (a DLL loaded later) and the pending set is replayed.
+        stubs = [{ dllName: 'fake', functionName: DRAW.name, functionId: DRAW.id, stubAddress: 0x1000 }];
+        d.thunkGenerator = { getStubById: () => stubs[0], getAllStubs: () => stubs };
+        d.applyPendingRegistrations();
+
+        const expected = DRAW.argCount + DRAW.ptrArgIndices.length * DRAW.payloadDwords;
+        expect(d.writeBufArgCountTable[DRAW.id]).toBe(expected);
+        expect(d.writeBufArgCountTable[DRAW.id]).not.toBe(DRAW.argCount); // the degraded shape
+        expect(d.writeBufBarrierTable[DRAW.id]).toBe(1);
+    });
 });
 
 /**

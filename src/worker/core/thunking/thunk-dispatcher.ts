@@ -7452,6 +7452,13 @@ export class ThunkDispatcher {
             return;
         }
 
+        if (pending.shadowSpec) {
+            this.registerShadowedWriteBufferFunction(
+                pending.dllName, pending.functionName, pending.argCount,
+                pending.handler, pending.coalesceArgMask ?? 0, pending.shadowSpec);
+            return;
+        }
+
         if (pending.ownerDisarm) {
             this.registerOwnerDisarmWriteBufferFunction(
                 pending.dllName, pending.functionName, pending.argCount,
@@ -7758,41 +7765,20 @@ export class ThunkDispatcher {
             }
         }
 
-        // Apply pending write-buffer registrations (standard + PtrDeref) — re-patches the new stubs.
+        // Apply pending write-buffer registrations — re-patches the new stubs.
+        //
+        // ONE dispatcher for the pending record's shape, shared with the per-stub path. This
+        // loop used to carry its own copy of that if/else chain, and the copy did not know
+        // about multi-struct capture: a deferred grDrawTriangle fell through to the ordinary
+        // branch and was registered with argCount=3 instead of 3+3*12. The stub then wrote a
+        // 16-byte entry carrying only the three pointers, the drain read "vertices" out of
+        // whatever followed, and every triangle came out degenerate — no error anywhere,
+        // just a menu with no panels. A spec the replay does not understand must not be able
+        // to degrade into a plausible wrong registration.
         for (const [, pending] of this.pendingWriteBufRegistrations.entries()) {
             const stub = this.findStubsByName(pending.dllName, pending.functionName)[0];
             if (stub && stub.functionId < MAX_THUNK_ID) {
-                if (pending.ptrDeref && pending.floatCount) {
-                    this.registerPtrDerefWriteBufferFunction(
-                        pending.dllName, pending.functionName,
-                        pending.floatCount, pending.handler, pending.isStdcall);
-                } else if (pending.shaderConstant) {
-                    this.registerShaderConstantWriteBufferFunction(
-                        pending.dllName, pending.functionName, pending.handler);
-                } else if (pending.structCapture) {
-                    this.registerStructCaptureWriteBufferFunction(
-                        pending.dllName, pending.functionName, pending.argCount,
-                        pending.structCapture.ptrArgIndex, pending.structCapture.payloadDwords,
-                        pending.handler);
-                } else if (pending.upDraw) {
-                    this.registerUpDrawWriteBufferFunction(
-                        pending.dllName, pending.functionName, pending.handler);
-                } else if (pending.shadowSpec) {
-                    this.registerShadowedWriteBufferFunction(
-                        pending.dllName, pending.functionName, pending.argCount,
-                        pending.handler, pending.coalesceArgMask ?? 0, pending.shadowSpec);
-                } else if (pending.ownerDisarm) {
-                    this.registerOwnerDisarmWriteBufferFunction(
-                        pending.dllName, pending.functionName, pending.argCount,
-                        pending.handler, pending.coalesceArgMask ?? 0,
-                        pending.barrier ? { barrier: true } : undefined);
-                } else {
-                    this.registerWriteBufferFunction(
-                        pending.dllName, pending.functionName,
-                        pending.argCount, pending.handler, pending.isStdcall,
-                        pending.coalesceArgMask ?? 0,
-                        pending.barrier ? { barrier: true } : undefined);
-                }
+                this.applyPendingWriteBufferForStub(stub);
                 applied++;
             }
         }
