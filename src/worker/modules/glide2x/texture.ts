@@ -241,30 +241,46 @@ function ensureTextureForSource(
     );
 }
 
+/** Reused across calls — guTexSource is a per-draw call and the result is read and
+ *  dropped by the caller. Returning a fresh object per call is what put ~120 short-lived
+ *  objects on the hot path for every one of them. */
+const guMmidResult: { tmuIndex: number; texture: GlideTextureRecord | null } = { tmuIndex: 0, texture: null };
+
 function resolveTextureByGuMmid(
     context: GlideContext,
     mmid: number,
 ): { tmuIndex: number; texture: GlideTextureRecord } | null {
-    const exactMatches: Array<{ tmuIndex: number; texture: GlideTextureRecord }> = [];
-    const allTextures: Array<{ tmuIndex: number; texture: GlideTextureRecord }> = [];
+    // A guTex* mmid is normally the TMU address the texture was downloaded to, and
+    // texturesByAddress is keyed by exactly that — so the common case is a Map hit per
+    // TMU, not a walk. It used to materialise every resident texture into two arrays and
+    // sort them on EVERY call (~120 allocations plus a sort, thousands of objects a
+    // frame): O(textures) work and garbage for what the key already answers in O(TMUs).
+    const key = mmid >>> 0;
+    let bestTmu = -1;
+    let best: GlideTextureRecord | null = null;
+    for (let tmuIndex = 0; tmuIndex < context.tmus.length; tmuIndex++) {
+        const hit = context.tmus[tmuIndex]?.texturesByAddress.get(key);
+        // One record per address per TMU, so at most one candidate each: the tie between
+        // TMUs still goes to the most recently uploaded, as before.
+        if (hit && (!best || hit.uploadedAt > best.uploadedAt)) {
+            best = hit;
+            bestTmu = tmuIndex;
+        }
+    }
+    if (best) {
+        guMmidResult.tmuIndex = bestTmu;
+        guMmidResult.texture = best;
+        return guMmidResult as { tmuIndex: number; texture: GlideTextureRecord };
+    }
 
+    // Fallbacks only — a title whose mmid is NOT a TMU address. Rare enough to pay for
+    // the walk, and only reached once the keyed lookup has missed.
+    const allTextures: Array<{ tmuIndex: number; texture: GlideTextureRecord }> = [];
     for (let tmuIndex = 0; tmuIndex < context.tmus.length; tmuIndex++) {
         const tmu = context.tmus[tmuIndex];
         if (!tmu) continue;
-        for (const texture of tmu.texturesByAddress.values()) {
-            const entry = { tmuIndex, texture };
-            allTextures.push(entry);
-            if ((texture.startAddress >>> 0) === (mmid >>> 0)) {
-                exactMatches.push(entry);
-            }
-        }
+        for (const texture of tmu.texturesByAddress.values()) allTextures.push({ tmuIndex, texture });
     }
-
-    if (exactMatches.length > 0) {
-        exactMatches.sort((a, b) => b.texture.uploadedAt - a.texture.uploadedAt);
-        return exactMatches[0] ?? null;
-    }
-
     if (allTextures.length === 0) {
         return null;
     }
