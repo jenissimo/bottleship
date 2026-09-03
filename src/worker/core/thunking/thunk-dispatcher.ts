@@ -4507,6 +4507,11 @@ export class ThunkDispatcher {
         this.wbufCallCounts = on ? (this.wbufCallCounts ?? new Uint32Array(MAX_THUNK_ID)) : null;
     }
 
+    /** Whether the ring census is armed — a caller MUST distinguish "off" from "zero". */
+    isWriteBufCensusEnabled(): boolean {
+        return this.wbufCallCounts !== null;
+    }
+
     getWriteBufCensus(): Array<{ name: string; count: number }> {
         const counts = this.wbufCallCounts;
         if (!counts) return [];

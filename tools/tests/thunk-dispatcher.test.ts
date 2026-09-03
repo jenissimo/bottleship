@@ -630,6 +630,10 @@ describe('ThunkDispatcher.drainWriteBuffer — prefix-fusion consumer that throw
         d.drainWriteBuffer();
         // An empty array, not zeros: a zeroed row would read exactly like "called zero times".
         expect(d.getWriteBufCensus()).toEqual([]);
+        // And it must SAY it is off, so a reader cannot mistake the silence for a count.
+        expect(d.isWriteBufCensusEnabled()).toBe(false);
+        d.setWriteBufCensusEnabled(true);
+        expect(d.isWriteBufCensusEnabled()).toBe(true);
     });
 
     it('reset zeroes the counts without disabling the census', () => {

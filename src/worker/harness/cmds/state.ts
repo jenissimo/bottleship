@@ -411,6 +411,7 @@ export function registerStateCommands(svc: HarnessService): void {
             getWriteBufCensus?: () => Array<{ name: string; count: number }>;
             resetWriteBufCensus?: () => void;
             setWriteBufCensusEnabled?: (on: boolean) => void;
+            isWriteBufCensusEnabled?: () => boolean;
         } | undefined;
 
         if (opts?.reset) {
@@ -428,14 +429,19 @@ export function registerStateCommands(svc: HarnessService): void {
         }
 
         const fast = new Map((dispatcher?.getFastPathCensus?.() ?? []).map((r) => [r.name, r.count]));
-        const wbufRows = dispatcher?.getWriteBufCensus?.() ?? [];
+        // A DISABLED census must not answer 0 — that reads exactly like "never called", and
+        // it is how a disabled instrument gets quoted as evidence. null is the honest answer:
+        // unknown until armed. (This bit me and then a colleague, on the same day.)
+        const wbufArmed = dispatcher?.isWriteBufCensusEnabled?.() ?? false;
+        const wbufRows = wbufArmed ? (dispatcher?.getWriteBufCensus?.() ?? []) : [];
         const wbuf = new Map(wbufRows.map((r) => [r.name, r.count]));
+        const wbufCountFor = (name: string): number | null => (wbufArmed ? (wbuf.get(name) ?? 0) : null);
         const rows = onlySuspect ? apiCensus.suspectStubs() : apiCensus.list();
         const out = rows.map((s) => ({
             api: s.name,
             count: s.count,
             fastPathCount: fast.get(s.name) ?? 0,
-            wbufCount: wbuf.get(s.name) ?? 0,
+            wbufCount: wbufCountFor(s.name),
             arity: s.arity,
             suspect: s.suspectStub,
             lastCaller: "0x" + s.lastCaller.toString(16),
@@ -449,7 +455,7 @@ export function registerStateCommands(svc: HarnessService): void {
                 if (!seen.has(name)) {
                     seen.add(name);
                     out.push({
-                        api: name, count: 0, fastPathCount: count, wbufCount: wbuf.get(name) ?? 0,
+                        api: name, count: 0, fastPathCount: count, wbufCount: wbufCountFor(name),
                         arity: -1, suspect: false, lastCaller: "0x0", lastCallerSym: null,
                     });
                 }
@@ -471,7 +477,7 @@ export function registerStateCommands(svc: HarnessService): void {
             total: calls.length,
             tiersNotCovered: [
                 "wasm hypercall (io_port_write32 0xB077): time, sync, string/memory, FPU/math",
-                ...(wbufRows.length || opts?.wbuf
+                ...(wbufArmed
                     ? []
                     : ["write buffer (deferred ring): draws + render-state setters — a WBUF call "
                        + "never hits the OUT trap, so it is 0 on BOTH tiers above. "
