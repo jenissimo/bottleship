@@ -11,6 +11,7 @@
 import { OpenGLFrameInput } from "./opengl-types";
 import { OpenGLPipelineConfig, pipelineConfigKey } from "./opengl-pipeline-factory";
 import { EmulatorConfig } from "../../../core/emulator-config-manager";
+import { registerBackendQualitySupport } from "../shared/quality-capabilities";
 import { registerGpuDeviceObserver } from "../../../core/gpu/gpu-device-lifecycle";
 import {
     GLCommandStream, GLDrawCommandType, GLTextureObject, VERT_FLOATS,
@@ -183,6 +184,7 @@ export class OpenGLBackendExecutor {
 
     constructor(backend: WebGPUBackend) {
         this.backend = backend;
+        registerBackendQualitySupport("opengl", ["anisotropy", "forceTrilinear"]);
         // All of this is rebuilt lazily by ensureStaticResources/ensureTargets/resolveTexture
         // from the GL object state, which lives on the CPU side and outlives the device.
         registerGpuDeviceObserver("opengl-executor", {

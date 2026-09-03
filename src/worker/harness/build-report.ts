@@ -18,6 +18,8 @@ import { gpuDeviceLifecycle, type GpuDeviceLifecycleReport } from "../core/gpu/g
 import { pendingMessageBoxes } from "../runtime/dialog-bridge";
 import { getD3D9PerfSnapshot, type D3D9PerfSnapshot } from "../modules/d3d9/d3d9-perf";
 import { collectShaderCensus, censusComplete } from "./shader-census";
+import { EmulatorConfig } from "../core/emulator-config-manager";
+import { activeQualityBackend, computeQualityGaps } from "../backends/webgpu/shared/quality-capabilities";
 
 const hx = (v: number) => "0x" + (v >>> 0).toString(16);
 
@@ -141,6 +143,13 @@ export interface HarnessReport {
      * one that separates "the guest stopped drawing" from "the GPU stopped listening".
      */
     gpuDevice: GpuDeviceLifecycleReport;
+    /**
+     * Which quality-settings knobs the active graphics backend actually honors right now.
+     * `unsupported` lists non-default QualityConfig keys the backend has NOT declared —
+     * a knob the UI lets you move that provably does nothing on this backend (see
+     * backends/webgpu/shared/quality-capabilities.ts). Empty is the healthy state.
+     */
+    quality: { backend: string | null; unsupported: string[] };
     /** D3D9 drop-draw and feature census; empty droppedDraws is the healthy state. */
     d3d9: HarnessD3D9Report;
     /**
@@ -294,6 +303,10 @@ export function buildHarnessReport(esp?: number): HarnessReport {
         lastThunks: bt?.recent ?? [],
         gpuErrors: getGpuErrorReport(),
         gpuDevice: gpuDeviceLifecycle.report(),
+        quality: {
+            backend: activeQualityBackend(),
+            unsupported: computeQualityGaps(EmulatorConfig.getInstance().quality),
+        },
         d3d9: buildD3D9Report(),
         pendingModals: pendingMessageBoxes(),
         stubs: stubRegistry.list().map((s) => ({

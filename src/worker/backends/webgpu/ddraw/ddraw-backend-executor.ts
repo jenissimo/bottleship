@@ -182,6 +182,7 @@ import { dwordToUnsignedLong } from '../shared/dword';
 import { resolveFfpFogMode } from '../d3d9/ffp-fog';
 import { maybeClampContainedUv, applySamplerDebugOverrides, updateLastDrawDiagnostics } from './executor-draw-debug';
 import { normalizePortableWebGpuSampleCount } from '../shared/msaa-policy';
+import { registerBackendQualitySupport } from '../shared/quality-capabilities';
 import {
     FfpStagesState,
     type FfpFilterVocabulary,
@@ -529,6 +530,10 @@ export class DDrawWebGPUExecutor {
         // Debug handle: pure-D3D8 games have no ddraw module context to hang the
         // executor off, so dbg rstats/fstats fall back to this.
         (globalThis as unknown as Record<string, unknown>).__ddrawExecutor = this;
+
+        // This executor also backs D3D8 (D3D8DeviceAdapter.renderer IS this class), so the
+        // declaration covers both DirectDraw and D3D8 titles.
+        registerBackendQualitySupport("ddraw", ["anisotropy", "forceTrilinear", "autoMipmap", "msaa"]);
 
         // Every sub-manager below is built FROM the device, so a lost device makes all of
         // them dead references at once — they are rebuilt as a set, never patched.

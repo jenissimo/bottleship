@@ -938,6 +938,11 @@ export class D3D9BackendExecutor {
 
     constructor(backend: WebGPUBackend) {
         this.backend = backend;
+        // NOT registerBackendQualitySupport here: this class is also instantiated
+        // privately by D3D8ProgrammableRenderer (d3d8-programmable-draw.ts) to run D3D8's
+        // shader draws, so "this class exists" does not mean "the game is a D3D9 title".
+        // The real D3D9 device (d3d9-device.ts constructor) registers "d3d9"; D3D8's own
+        // top-level adapter registers "ddraw" via its DDrawWebGPUExecutor renderer.
     }
 
     /** Configure the implicit D3D9 backbuffer MSAA path from an explicit adapter probe. */

@@ -3,6 +3,7 @@ import { WebGPUBackend } from "../webgpu-backend";
 import { RenderFramePool, type ProgrammableDrawState, type RenderFrame } from "../render-frame";
 import { LruCache } from "../../../core/collections/lru-cache";
 import { registerGpuDeviceObserver } from "../../../core/gpu/gpu-device-lifecycle";
+import { registerBackendQualitySupport } from "../shared/quality-capabilities";
 // Side-effect import: the surface-side device-loss observer. A pure-d3d9 title never loads the
 // ddraw executor, but its render targets and the texture-handle registry are the same objects.
 import "../../../modules/ddraw/surface-device-loss";
@@ -1678,6 +1679,7 @@ export class D3D9Device {
         this.d3d9MsaaProbe = d3d9MsaaProbe;
 
         this.backendExecutor = new D3D9BackendExecutor(backend);
+        registerBackendQualitySupport("d3d9", ["anisotropy", "forceTrilinear", "msaa"]);
         this.pipelineCache = new LruCache<string, number>({
             maxEntries: this.pipelineCacheMaxSize,
             canEvict: (key) => key !== this.currentPipelineKey,
