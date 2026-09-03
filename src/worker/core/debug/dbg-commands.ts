@@ -2656,14 +2656,17 @@ export const dbg = {
         try {
             const sys = System.getInstance();
             const ds = sys.process?.getModule?.('dsound') as any;
-            // Worklet signal stats: SAB written by the AudioWorklet (clip/limited/
-            // discontinuity/underrun counters; see audio-ring-buffer.ts STATS_*).
-            // dbg.audio(1) → request a counter reset (worklet wipes on next block).
-            const statsSab = (globalThis as any).__audioStatsSab as SharedArrayBuffer | undefined;
-            let worklet: any = null;
-            if (statsSab) {
-                const s = new Int32Array(statsSab, 0, 16);
-                worklet = {
+            // Worklet signal stats: two SABs written by the two AudioWorklet processors
+            // (see bottleship-audio-worklet.ts). `ring` is the DirectSound/waveOut mix
+            // alone, pre-mix, informational only (no limiter runs there). `master` is
+            // measured AFTER ring + music/CD are summed and the one limiter has run —
+            // it is what the user actually hears, and the only group where clip/limited
+            // means the mix is really clipping. dbg.audio(1) → request a reset of both
+            // (each worklet wipes its own SAB on its next block).
+            const readStats = (sab: SharedArrayBuffer | undefined): any => {
+                if (!sab) return null;
+                const s = new Int32Array(sab, 0, 16);
+                const stats = {
                     proc: Atomics.load(s, 0), frames: Atomics.load(s, 1),
                     activeRing: Atomics.load(s, 2), activeLegacy: Atomics.load(s, 10),
                     clip: Atomics.load(s, 3), limited: Atomics.load(s, 4),
@@ -2672,7 +2675,12 @@ export const dbg = {
                     underrunMid: Atomics.load(s, 8), starvedBlocks: Atomics.load(s, 9),
                 };
                 if (resetStats) Atomics.store(s, 15, 1);
-            }
+                return stats;
+            };
+            const worklet = {
+                ring: readStats((globalThis as any).__audioStatsSab),
+                master: readStats((globalThis as any).__audioMasterStatsSab),
+            };
             const out = {
                 dsound: ds?.getAudioDebugState?.() ?? null,
                 postThread: (globalThis as any).__dbgPostThread ?? { count: 0 },
