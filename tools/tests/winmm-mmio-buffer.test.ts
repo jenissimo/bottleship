@@ -5,6 +5,7 @@ import {
     mmioWriteInfoStruct,
     mmioCommitInfoCursor,
     mmioSelectsMemoryIoProc,
+    mmioResolveBytes,
     type MmioBufState,
 } from "../../src/worker/modules/winmm";
 
@@ -147,5 +148,48 @@ describe("winmm mmioOpen I/O-proc selection", () => {
         expect(mmioSelectsMemoryIoProc(true, FCC_DOS, 0, "C:\sound.wav")).toBe(false);
         // A custom pIOProc owns the open; the name must not steal it back.
         expect(mmioSelectsMemoryIoProc(true, 0, 0x401000, "")).toBe(false);
+    });
+});
+
+describe("mmioResolveBytes — a memory file's bytes are the guest's, re-derived", () => {
+    const BASE = 0x400;
+    const SIZE = 8;
+    const memWith = (fill: number, length = 0x1000) => {
+        const m = new Uint8Array(length);
+        m.fill(fill, BASE, BASE + SIZE);
+        return m;
+    };
+    const memState = (): MmioBufState =>
+        ({ data: null, position: 0, memoryBase: BASE, guestBufferSize: SIZE });
+
+    test("reads through to whatever the guest wrote, without a stored view", () => {
+        const bytes = mmioResolveBytes(memState(), memWith(0xab));
+        expect(bytes).not.toBeNull();
+        expect(Array.from(bytes!)).toEqual(new Array(SIZE).fill(0xab));
+    });
+
+    // The point of re-deriving: WASM growth REPLACES the buffer, and a view captured at
+    // mmioOpen would be detached — length 0, so the file reports EOF and the audio just
+    // stops, with nothing logged. Resolving per use follows the memory that exists now.
+    test("follows guest memory across a growth that would have detached a stored view", () => {
+        const state = memState();
+        const before = mmioResolveBytes(state, memWith(0x11));
+        const after = mmioResolveBytes(state, memWith(0x22, 0x4000));
+        expect(Array.from(before!)).toEqual(new Array(SIZE).fill(0x11));
+        expect(Array.from(after!)).toEqual(new Array(SIZE).fill(0x22));
+        expect(after!.length).toBe(SIZE); // never the 0 a detached view answers
+    });
+
+    test("a disk file's own copy is returned unchanged, and needs no memory", () => {
+        const data = new Uint8Array([1, 2, 3]);
+        const state: MmioBufState = { data, position: 0 };
+        expect(mmioResolveBytes(state, null)).toBe(data);
+    });
+
+    test("refuses a block that does not fit the current memory instead of truncating", () => {
+        // A short read served silently is a wrong answer the caller cannot detect.
+        const state = memState();
+        expect(mmioResolveBytes(state, new Uint8Array(BASE + SIZE - 1))).toBeNull();
+        expect(mmioResolveBytes(state, null)).toBeNull();
     });
 });

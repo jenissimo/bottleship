@@ -154,6 +154,23 @@ export function mmioFillGuestWindow(state: MmioBufState): number {
  * Write the MMIOINFO direct-I/O fields (buffer pointers + offsets) for `state`, assuming
  * its guest buffer is currently filled starting at state.bufFileOffset.
  */
+/**
+ * The bytes an MMIO handle reads from, given the CURRENT guest memory.
+ *
+ * For a MEMORY file the bytes ARE the guest's block, so this must be re-derived on every
+ * use (§3.1): a plain view stored across turns detaches the instant WASM memory grows, and
+ * a detached view answers length 0 — the file would then report EOF instead of failing, and
+ * the caller's sound or video would simply go quiet with nothing logged. A disk file's
+ * `data` is a JS-owned copy and is safe to hold, so it is returned unchanged.
+ */
+export function mmioResolveBytes(state: MmioBufState, mem: Uint8Array | null): Uint8Array | null {
+    if (!state.memoryBase) return state.data;
+    if (!mem) return null;
+    const size = state.guestBufferSize ?? 0;
+    if (state.memoryBase + size > mem.length) return null;
+    return mem.subarray(state.memoryBase, state.memoryBase + size);
+}
+
 export function mmioWriteInfoStruct(lpmmioinfo: number, hmmio: number, state: MmioBufState): void {
     const base = state.guestBuffer ?? 0;
     const filled = state.bufFilled ?? 0;
@@ -391,11 +408,17 @@ export class WinMM implements IModule {
      * can read audio bytes directly via pchBuffer..pchEndRead (mmioGetInfo/mmioAdvance).
      * Returns the number of bytes loaded (0 at EOF / on failure).
      */
+    /** The handle's bytes, re-derived from the CURRENT guest memory — see mmioResolveBytes. */
+    private mmioBytes(mmio: MMIOHandle): Uint8Array | null {
+        return mmioResolveBytes(mmio, System.getInstance().process?.getCurrentMemory() ?? null);
+    }
+
     private mmioRefillGuestBuffer(mmio: MMIOHandle): number {
-        if (!mmio.data) return 0;
+        const bytes = this.mmioBytes(mmio);
+        if (!bytes) return 0;
         // A memory file has no window to slide: the caller's whole block is already the file,
         // and copying it over itself would be both pointless and destructive of guest writes.
-        if (mmio.memoryBase) return Math.max(0, mmio.data.length - mmio.position);
+        if (mmio.memoryBase) return Math.max(0, bytes.length - mmio.position);
         if (!mmio.guestBuffer) {
             const mem = System.getInstance().process?.memory;
             const cap = MMIO_GUEST_BUFSIZE;
@@ -1811,11 +1834,13 @@ export class WinMM implements IModule {
                     return 0;
                 }
                 const handle = this.nextMMIOHandle++;
-                // `data` is a VIEW on guest memory, not a copy: the block stays the guest's and
-                // anything it writes there is what the next mmioRead must see.
+                // The block stays the GUEST's and anything it writes there is what the next
+                // mmioRead must see, so this is a view — derived per use by mmioBytes() from
+                // memoryBase/guestBufferSize. Storing the view itself would detach it on the
+                // next WASM memory growth and turn the file into a silent EOF.
                 this.mmioHandles.set(handle, {
                     filename, position: 0,
-                    data: mem.subarray(pchBuffer, pchBuffer + cchBuffer),
+                    data: null,
                     memoryBase: pchBuffer,
                     guestBuffer: pchBuffer,
                     guestBufferSize: cchBuffer,
@@ -1903,12 +1928,13 @@ export class WinMM implements IModule {
 
             if (!pch || cch <= 0) return 0;
 
-            if (!mmio.data) return 0;
+            const bytes = this.mmioBytes(mmio);
+            if (!bytes) return 0;
 
-            const available = mmio.data.length - mmio.position;
+            const available = bytes.length - mmio.position;
             if (available <= 0) return 0;
             const toRead = Math.min(cch >>> 0, available);
-            Mem.writeBytes(pch, mmio.data.subarray(mmio.position, mmio.position + toRead));
+            Mem.writeBytes(pch, bytes.subarray(mmio.position, mmio.position + toRead));
             mmio.position += toRead;
             return toRead;
         };
@@ -1932,7 +1958,7 @@ export class WinMM implements IModule {
                     newPos = mmio.position + lOffset;
                     break;
                 case SEEK_END:
-                    newPos = (mmio.data?.length ?? 0) + lOffset;
+                    newPos = (this.mmioBytes(mmio)?.length ?? 0) + lOffset;
                     break;
                 default:
                     return -1;
@@ -2007,7 +2033,7 @@ export class WinMM implements IModule {
             const MMIO_FINDRIFF  = 0x0020;
             const MMIO_FINDLIST  = 0x0040;
 
-            const data = mmio.data;
+            const data = this.mmioBytes(mmio);
             if (!data) return MMIOERR_CANNOTOPEN;
 
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
