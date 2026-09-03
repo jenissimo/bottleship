@@ -9,6 +9,7 @@ import {
     writeShadowTrampoline,
     writeOwnerDisarmScalarTrampoline,
     writeStructCaptureTrampoline,
+    writeMultiStructCaptureTrampoline,
     writeUpDrawCaptureTrampoline,
     writeIncRefStubTrampoline,
     writeDecRefStubTrampoline,
@@ -411,7 +412,7 @@ export class ThunkDispatcher {
     // Pending registrations for stubs that aren't created yet
     private pendingRegistrations: Map<string, { impl: ThunkImplementation; dllName: string; functionName: string }> = new Map();
     private pendingFastPathRegistrations: Map<string, { impl: FastPathImplementation; dllName: string; functionName: string; trivial?: boolean }> = new Map();
-    private pendingWriteBufRegistrations: Map<string, { handler: WriteBufHandler; dllName: string; functionName: string; argCount: number; isStdcall: boolean; ptrDeref?: boolean; floatCount?: number; shaderConstant?: boolean; coalesceArgMask?: number; shadowSpec?: ShadowTrampolineSpec; barrier?: boolean; structCapture?: { ptrArgIndex: number; payloadDwords: number }; upDraw?: boolean; ownerDisarm?: boolean }> = new Map();
+    private pendingWriteBufRegistrations: Map<string, { handler: WriteBufHandler; dllName: string; functionName: string; argCount: number; isStdcall: boolean; ptrDeref?: boolean; floatCount?: number; shaderConstant?: boolean; coalesceArgMask?: number; shadowSpec?: ShadowTrampolineSpec; barrier?: boolean; structCapture?: { ptrArgIndex: number; payloadDwords: number }; multiStructCapture?: { ptrArgIndices: number[]; payloadDwords: number }; upDraw?: boolean; ownerDisarm?: boolean }> = new Map();
     private pendingConstStubRegistrations: Map<string, { dllName: string; functionName: string; value: number; popBytes: number }> = new Map();
     private pendingIncRefStubRegistrations: Map<string, { dllName: string; functionName: string; spec: IncRefStubSpec }> = new Map();
 
@@ -4226,6 +4227,56 @@ export class ThunkDispatcher {
     }
 
     /**
+     * Capture-at-call WBUF registration for a stdcall DRAW with several fixed-size struct
+     * pointers — grDrawTriangle(GrVertex*, GrVertex*, GrVertex*). The trampoline copies every
+     * struct into the ring at call time; the drain handler reads them from the RING, never
+     * from the guest pointers, which is what makes deferring a call that takes pointers sound.
+     *
+     * Registered as a coalescer BARRIER, and that is not optional. Per-funcId coalescing is
+     * only safe while "a drain never spans two draws" — true while the draw itself traps,
+     * because the dispatcher drains before every trap. Putting the draw on the ring ends that,
+     * and without a barrier the setters between two triangles would collapse to last-write-wins
+     * across both: wrong colours and textures on some triangles, silently, with no crash to
+     * find it by. The barrier makes `segment` advance per draw so coalescing scopes to the run
+     * of setters preceding each one, which is exactly the state that draw must observe.
+     *
+     * The ordinary handler must stay registered — it is the ring-overflow / bad-pointer path.
+     */
+    registerMultiStructCaptureWriteBufferFunction(
+        dllName: string,
+        funcName: string,
+        argCount: number,
+        ptrArgIndices: number[],
+        payloadDwords: number,
+        handler: WriteBufHandler,
+    ): void {
+        const key = `${dllName}:${funcName}`.toLowerCase();
+        this.pendingWriteBufRegistrations.set(key, {
+            handler, dllName, functionName: funcName, argCount, isStdcall: true,
+            multiStructCapture: { ptrArgIndices: [...ptrArgIndices], payloadDwords },
+        });
+        if (this.writeBufControlAddr === 0 || !this.thunkMemoryManager || !this.getMemory) return;
+        const h = writeMultiStructCaptureTrampoline(
+            this.thunkMemoryManager.stubAllocator,
+            this.getMemory, this.writeBufControlAddr, this.writeBufDataBase, this.writeBufCapacity,
+            { argCount, ptrArgIndices, payloadDwords });
+        try { System.getInstance().scheduler?.registerNonPreemptibleRange(h.codeRegionBase, h.codeRegionEnd); } catch { /* non-fatal */ }
+        const id = this.patchStubToTrampoline(dllName, funcName, h.trampAddr);
+        if (id < 0) {
+            Logger.verbose(LogCategory.THUNK, `MultiStructCapture stub not found for ${dllName}:${funcName}, registration deferred`);
+            return;
+        }
+        this.writeBufHandlerTable[id] = handler;
+        this.writeBufArgCountTable[id] = argCount + ptrArgIndices.length * payloadDwords;
+        this.writeBufCoalesceMaskTable[id] = 0;
+        this.writeBufBarrierTable[id] = 1;
+        Logger.log(LogCategory.THUNK,
+            `[WBUF] Registered MultiStructCapture [${id}] ${dllName}:${funcName} ` +
+            `(args=${argCount} ptrIdx=[${ptrArgIndices.join(',')}] payload=${payloadDwords}dw, ` +
+            `barrier, trampoline=0x${h.trampAddr.toString(16)})`);
+    }
+
+    /**
      * Capture-at-call WBUF registration for DrawPrimitiveUP. The trampoline copies the UP vertex
      * bytes into the ring at call time (guest may reuse the buffer immediately after RET); the
      * drain handler passes the ring address of the captured bytes to the device. Registered as a
@@ -7384,6 +7435,14 @@ export class ThunkDispatcher {
             this.registerStructCaptureWriteBufferFunction(
                 pending.dllName, pending.functionName, pending.argCount,
                 pending.structCapture.ptrArgIndex, pending.structCapture.payloadDwords,
+                pending.handler);
+            return;
+        }
+
+        if (pending.multiStructCapture) {
+            this.registerMultiStructCaptureWriteBufferFunction(
+                pending.dllName, pending.functionName, pending.argCount,
+                pending.multiStructCapture.ptrArgIndices, pending.multiStructCapture.payloadDwords,
                 pending.handler);
             return;
         }

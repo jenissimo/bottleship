@@ -20,6 +20,7 @@ import {
     writeShadowTrampoline,
     writeOwnerDisarmScalarTrampoline,
     writeStructCaptureTrampoline,
+    writeMultiStructCaptureTrampoline,
     writeUpDrawCaptureTrampoline,
     writeIncRefStubTrampoline,
     writeDecRefStubTrampoline,
@@ -154,6 +155,13 @@ const cases: Record<string, (ctx: Ctx) => Snapshot> = {
             { argCount: 2, ptrArgIndex: 1, payloadDwords: 16 });
         return { result: r, hashes: { code: sha(ctx.mem, r.codeRegionBase, r.codeRegionEnd) } };
     },
+    multiStructCaptureTrampoline: (ctx) => {
+        // grDrawTriangle-shaped: three GrVertex* and the 12 floats a draw reads from each.
+        const r = writeMultiStructCaptureTrampoline(
+            ctx.allocator, ctx.getMemory, RING_CTRL, RING_DATA, RING_CAP,
+            { argCount: 3, ptrArgIndices: [0, 1, 2], payloadDwords: 12 });
+        return { result: r, hashes: { code: sha(ctx.mem, r.codeRegionBase, r.codeRegionEnd) } };
+    },
     upDrawCaptureTrampoline: (ctx) => {
         const r = writeUpDrawCaptureTrampoline(ctx.allocator, ctx.getMemory, RING_CTRL, RING_DATA, RING_CAP);
         return { result: r, hashes: { code: sha(ctx.mem, r.codeRegionBase, r.codeRegionEnd) } };
@@ -194,6 +202,7 @@ const EXPECTED: Record<string, Snapshot> = {
     shadowTrampolineRenderStateNoOwner: {"result":{"trampAddr":5136,"shadowBase":4100,"slotCount":256,"sentinel":2147483648,"skipCounterAddr":4096,"dataRegionBase":4096,"dataRegionEnd":5124,"codeRegionBase":5136,"codeRegionEnd":5392},"hashes":{"code":"7a68f74852f7dd022d3f1da86a9ff701adc75aecd71a88664f10eb1a70b42d49","data":"496f0eda84c76c10945e95128f4f8b16a640633720f19ab135d044da70da04fc"}},
     ownerDisarmScalarTrampoline: {"result":{"trampAddr":4096,"codeRegionBase":4096,"codeRegionEnd":4224},"hashes":{"code":"3872c71deed97fde2196b52379f1d1aa7abdf8847b81c6ffa488340c96ccc8c6"}},
     structCaptureTrampoline: {"result":{"trampAddr":4096,"codeRegionBase":4096,"codeRegionEnd":4320},"hashes":{"code":"5ce49653ab8f3fa8c1218565df2c2234c05169a2d00d54a57c64d1602f2fbbed"}},
+    multiStructCaptureTrampoline: {"result":{"trampAddr":4096,"codeRegionBase":4096,"codeRegionEnd":4480},"hashes":{"code":"778d5a59c37081e22b58e08fa3cd1f46734670c403c3105f7567ec64ae8ec008"}},
     upDrawCaptureTrampoline: {"result":{"trampAddr":4096,"codeRegionBase":4096,"codeRegionEnd":4480},"hashes":{"code":"b4d6979e6cae69666eaacb40eb06265e73b17a766266b692442734350baf3642"}},
     incRefStubTrampoline: {"result":{"trampAddr":4096,"codeRegionBase":4096,"codeRegionEnd":4192},"hashes":{"code":"9a7faaaa8ece73ed7a2d8da15e1c93afec0e2f0c1157decf7705e9eb9f10a64a"}},
     incRefStubTrampolineVerify: {"result":{"trampAddr":4096,"codeRegionBase":4096,"codeRegionEnd":4192},"hashes":{"code":"ec3199f214397cfd2569bdcf846eba58dfe76c51bc8781066c83bf8ef223c553"}},

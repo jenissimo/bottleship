@@ -554,6 +554,112 @@ export function writeStructCaptureTrampoline(
 }
 
 /**
+ * GENERIC capture-at-call WBUF trampoline for a stdcall function with SEVERAL
+ * pointer-to-struct arguments of one fixed size — grDrawTriangle(GrVertex*, GrVertex*,
+ * GrVertex*) is the shape this exists for. Ring entry layout:
+ * [funcId][all scalar args verbatim, incl. the raw ptr slots][payloadDwords from *ptr, one
+ * block per pointer, in ptrArgIndices order] — so the drain-side stride is the ordinary
+ * (argCountTable+1)*4 with argCountTable = argCount + ptrCount*payloadDwords, and no new
+ * stride case is needed in the dispatcher.
+ *
+ * EVERY pointer is validated before any of them is copied, so a partially written entry
+ * can never be committed: the ring head is only bumped once all three blocks are in.
+ * Null/out-of-RAM pointers and ring-full fall back to the OUT trap (the ordinary handler
+ * stays registered and validates as before).
+ *
+ * The returned code region must be scheduler-registered non-preemptible by the caller —
+ * the head read→bump RMW plus the rep movsd runs must not interleave a quantum switch.
+ */
+export function writeMultiStructCaptureTrampoline(
+    allocator: StubAllocator,
+    getMemory: () => Uint8Array,
+    ctrlAddr: number,
+    dataBase: number,
+    capacity: number,
+    spec: { argCount: number; ptrArgIndices: number[]; payloadDwords: number },
+): { trampAddr: number; codeRegionBase: number; codeRegionEnd: number } {
+    const { argCount, ptrArgIndices, payloadDwords } = spec;
+    const ptrCount = ptrArgIndices.length;
+    if (argCount < 1 || argCount > 8 || ptrCount < 1 || ptrCount > 8 ||
+        payloadDwords < 1 || payloadDwords > 64 ||
+        ptrArgIndices.some(i => i < 0 || i >= argCount) ||
+        new Set(ptrArgIndices).size !== ptrCount) {
+        throw new Error(`writeMultiStructCaptureTrampoline: bad spec ${JSON.stringify(spec)}`);
+    }
+    const CODE_SIZE = 384;
+    const codeRegionBase = allocator.alloc(CODE_SIZE, 'THUNK_CODE', 'rx');
+    const mem = getMemory();
+    const dv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+    let off = codeRegionBase;
+    const w8 = (v: number) => { mem[off++] = v & 0xFF; };
+    const w32 = (v: number) => { dv.setUint32(off, v >>> 0, true); off += 4; };
+
+    const strideBytes = (1 + argCount + ptrCount * payloadDwords) * 4;
+    const payloadBytes = payloadDwords * 4;
+    const retPop = argCount * 4;
+    // 6 pushes (flags,edx,ebx,ecx,esi,edi) + retAddr → stdcall arg i at [esp+28+4i].
+    const argDisp = (i: number) => 28 + i * 4;
+    const ramLimit = mem.length >>> 0;
+    const ovfPatch: number[] = [];
+
+    const trampStart = off;
+    w8(0x9C); w8(0x52); w8(0x53); w8(0x51); w8(0x56); w8(0x57); // pushfd; push edx,ebx,ecx,esi,edi
+    w8(0x89); w8(0xC7);                                          // mov edi, eax (funcId)
+    // Validate EVERY pointer first — edi still carries funcId here, which is what .ovf
+    // hands back to the trap, and nothing has been written to the ring yet.
+    for (const p of ptrArgIndices) {
+        w8(0x8B); w8(0x74); w8(0x24); w8(argDisp(p));            // mov esi, [esp+ptrDisp]
+        w8(0x85); w8(0xF6);                                      // test esi, esi
+        w8(0x0F); w8(0x84); ovfPatch.push(off); w32(0);          // jz .ovf
+        w8(0x81); w8(0xFE); w32(ramLimit - payloadBytes);        // cmp esi, ramLimit-payload
+        w8(0x0F); w8(0x87); ovfPatch.push(off); w32(0);          // ja .ovf
+    }
+    w8(0x8B); w8(0x15); w32(ctrlAddr);                           // mov edx, [ctrlAddr]
+    w8(0x81); w8(0xFA); w32(capacity - strideBytes);             // cmp edx, capacity-stride
+    w8(0x0F); w8(0x8D); ovfPatch.push(off); w32(0);              // jge .ovf
+    w8(0xBB); w32(dataBase);                                     // mov ebx, dataBase
+    w8(0x03); w8(0xDA);                                          // add ebx, edx
+    w8(0x89); w8(0x3B);                                          // mov [ebx], edi (funcId)
+    for (let i = 0; i < argCount; i++) {
+        w8(0x8B); w8(0x44); w8(0x24); w8(argDisp(i));            // mov eax, [esp+disp]
+        w8(0x89); w8(0x43); w8((i + 1) * 4);                     // mov [ebx+(i+1)*4], eax
+    }
+    // rep movsd walks upward only with DF clear. The ABI guarantees that at a call
+    // boundary, but this trampoline runs guest code we emitted, so assert it rather than
+    // inherit it; popfd puts the caller's flags back either way.
+    w8(0xFC);                                                    // cld
+    w8(0x8D); w8(0x7B); w8((1 + argCount) * 4);                  // lea edi, [ebx+(1+argCount)*4]
+    for (const p of ptrArgIndices) {
+        // edi is left pointing at the next free dword by each rep movsd, so the payload
+        // blocks land back to back in ptrArgIndices order.
+        w8(0x8B); w8(0x74); w8(0x24); w8(argDisp(p));            // mov esi, [esp+ptrDisp]
+        w8(0xB9); w32(payloadDwords);                            // mov ecx, payloadDwords
+        w8(0xF3); w8(0xA5);                                      // rep movsd
+    }
+    w8(0x81); w8(0x05); w32(ctrlAddr); w32(strideBytes);         // add dword [ctrlAddr], stride
+    w8(0x5F); w8(0x5E); w8(0x59); w8(0x5B); w8(0x5A);            // pop edi,esi,ecx,ebx,edx
+    w8(0xBA); w32(0xB077);                                       // mov edx, 0xB077
+    w8(0x31); w8(0xC0);                                          // xor eax, eax
+    w8(0x9D);                                                    // popfd
+    w8(0xC2); w8(retPop & 0xFF); w8((retPop >> 8) & 0xFF);       // ret retPop
+
+    const ovfAddr = off;                                         // .ovf: OUT-trap fallback
+    w8(0x89); w8(0xF8);                                          // mov eax, edi (funcId)
+    w8(0x5F); w8(0x5E); w8(0x59); w8(0x5B); w8(0x5A);
+    w8(0x9D);                                                    // popfd
+    w8(0xBA); w32(0xB077);
+    w8(0xEF);                                                    // out dx, eax
+    w8(0xC2); w8(retPop & 0xFF); w8((retPop >> 8) & 0xFF);
+    for (const p of ovfPatch) dv.setInt32(p, ovfAddr - (p + 4), true);
+
+    if (off > codeRegionBase + CODE_SIZE) throw new Error('writeMultiStructCaptureTrampoline: code overflow');
+    Logger.log(LogCategory.SYSTEM,
+        `MultiStructCapture trampoline: 0x${trampStart.toString(16)} (args=${argCount} ` +
+        `ptrIdx=[${ptrArgIndices.join(',')}] payload=${payloadDwords}dw stride=${strideBytes})`);
+    return { trampAddr: trampStart, codeRegionBase, codeRegionEnd: codeRegionBase + CODE_SIZE };
+}
+
+/**
  * Capture-at-call WBUF trampoline for IDirect3DDevice9_DrawPrimitiveUP
  * (this, PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride).
  * Computes vertexCount from (PrimitiveType, PrimitiveCount) in x86, copies
