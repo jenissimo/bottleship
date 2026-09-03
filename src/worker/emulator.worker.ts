@@ -3161,6 +3161,16 @@ const initV86 = async (canvas: OffscreenCanvas) => {
  * v86.stop() is undone within ~1ms. The harness (tickFrames park, pause/resume,
  * breakpoint hits) routes through these via globalThis so a park/break actually holds.
  */
+/**
+ * The stop() a pauseEmulator() has asked for but not yet observed. v86.stop() settles a turn
+ * or more after pauseEmulator returns and is_running() stays TRUE for that whole window, so a
+ * resume landing inside it reads a running CPU, skips run(), and the late stop then leaves the
+ * guest halted with nothing to restart it: startScheduler's kick needs a runnable thread, and a
+ * guest stopped before its first instruction has none. resumeEmulator therefore re-kicks once
+ * the stop it raced settles.
+ */
+let pendingStop: Promise<void> | null = null;
+
 function pauseEmulator(): void {
   const system = System.getInstance();
   if (!system.process?.v86) return;
@@ -3170,8 +3180,11 @@ function pauseEmulator(): void {
   system.windowManager.wakeWaiters();
   const v86 = system.process.v86;
   if (v86.is_running?.() ?? false) {
-    v86.stop().then(() => Logger.log(LogCategory.SYSTEM, "[PAUSE] Emulator paused"))
+    const stop: Promise<void> = v86.stop()
+      .then(() => Logger.log(LogCategory.SYSTEM, "[PAUSE] Emulator paused"))
       .catch((err: unknown) => Logger.error(LogCategory.SYSTEM, `[PAUSE] Error pausing emulator: ${err}`));
+    pendingStop = stop;
+    void stop.then(() => { if (pendingStop === stop) pendingStop = null; });
   }
 }
 function resumeEmulator(): void {
@@ -3183,7 +3196,14 @@ function resumeEmulator(): void {
   TimeService.getInstance().notifyPauseResume();
   hypercallDataManager.resetInsnBaseline();
   const v86 = system.process.v86;
-  if (!(v86.is_running?.() ?? false)) { v86.run(); Logger.log(LogCategory.SYSTEM, "[RESUME] Emulator resumed"); }
+  const kick = (): void => {
+    if (isPaused) return;                                   // a newer pause owns the CPU now
+    if (System.getInstance().process?.v86 !== v86) return;   // process replaced under us
+    if (!(v86.is_running?.() ?? false)) { v86.run(); Logger.log(LogCategory.SYSTEM, "[RESUME] Emulator resumed"); }
+  };
+  const raced = pendingStop;
+  kick();
+  if (raced) void raced.then(kick, kick);
 }
 // Harness hooks (cmds/time.ts park, cmds/breakpoints.ts pause/resume, eip-breaks).
 (globalThis as any).__harnessPause = pauseEmulator;
