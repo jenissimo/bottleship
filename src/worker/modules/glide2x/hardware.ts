@@ -195,6 +195,18 @@ export function createHardwareExports(context: GlideContext): Record<string, Thu
                 System.getInstance().services.render.setActive(context.presenter);
             }
 
+            // A FULLSCREEN grSstWinOpen (hWnd == NULL) IS a mode set — the board takes the
+            // screen, so SM_CXSCREEN, window placement and the host's pointer mapping must
+            // follow it. With an hWnd the app is rendering into a window INSIDE the desktop,
+            // and publishing that as the mode would rewrite the desktop out from under it.
+            const sys = System.getInstance();
+            const fullscreen = (args[0] >>> 0) === 0;
+            if (fullscreen) {
+                const prev = sys.emulatedDisplayMode;
+                context.modeBeforeWinOpen = prev ? { ...prev } : null;
+            }
+            sys.requestHostResize(context.width, context.height, { modeSet: fullscreen });
+
             context.diagnostics.push("winopen", `${context.width}x${context.height} fmt=${context.colorFormat}`);
             Logger.log(
                 LogCategory.SYSTEM,
@@ -208,6 +220,15 @@ export function createHardwareExports(context: GlideContext): Record<string, Thu
             revokeAllLfbLeases(context);
             destroyLfbSurfaces(context);
             context.winOpen = false;
+            // The board releases the screen: the desktop mode it displaced comes back, or a
+            // launcher returning to DDraw/GDI inherits the Voodoo resolution as its desktop.
+            const prev = context.modeBeforeWinOpen;
+            context.modeBeforeWinOpen = null;
+            if (prev && prev.width > 0 && prev.height > 0) {
+                System.getInstance().requestHostResize(prev.width, prev.height, {
+                    modeSet: true, bpp: prev.bpp, refreshRate: prev.refreshRate,
+                });
+            }
             System.getInstance().services.render.setActive(null);
             context.stream.reset();
             context.diagnostics.push("winclose", "grSstWinClose");

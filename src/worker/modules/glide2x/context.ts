@@ -222,6 +222,9 @@ export type GlideContext = {
     errorCallback: number;
     initialized: boolean;
     winOpen: boolean;
+    /** Display mode in force before a fullscreen grSstWinOpen took the screen; grSstWinClose
+     *  puts it back, exactly as a real board hands the desktop mode back on shutdown. */
+    modeBeforeWinOpen: { width: number; height: number; bpp: number; refreshRate: number } | null;
     selectedSst: number;
     width: number;
     height: number;
@@ -355,6 +358,7 @@ export function createGlideContext(process: Process): GlideContext {
         errorCallback: 0,
         initialized: false,
         winOpen: false,
+        modeBeforeWinOpen: null,
         selectedSst: 0,
         width: GLIDE_DEFAULT_WIDTH,
         height: GLIDE_DEFAULT_HEIGHT,
