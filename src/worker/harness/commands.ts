@@ -42,6 +42,7 @@ import { registerAssertCommands } from "./cmds/assert";
 import { registerRecordCommands } from "./cmds/record";
 import { registerMemTrapCommands } from "./cmds/memtrap";
 import { registerPerfCommands } from "./cmds/perf";
+import { registerLfbUnpackCommands } from "./cmds/lfb-unpack";
 import { registerFadeProbeCommands } from "./cmds/fadeprobe";
 import { registerAudioCommands } from "./cmds/audio";
 import { registerDbgCommands } from "./cmds/dbg";
@@ -92,6 +93,7 @@ export function installHarnessCommands(): void {
     registerRecordCommands(harnessService);
     registerMemTrapCommands(harnessService);
     registerPerfCommands(harnessService);
+    registerLfbUnpackCommands(harnessService);
     registerFadeProbeCommands(harnessService);
     registerAudioCommands(harnessService);
     registerDbgCommands(harnessService);
