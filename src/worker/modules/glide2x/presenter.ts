@@ -27,49 +27,168 @@ import { getOverlayCompositePlan } from "../user32/dialog-overlay";
 import { captureGlideFrame } from "./frame-capture";
 
 /**
- * LFB -> RGBA8, written straight into a caller-owned buffer.
- *
- * This runs over every pixel of every presented frame. The obvious shape — a
- * helper per format returning [r,g,b,a] — allocates one array PER PIXEL, which
- * at 640x480 is 307k short-lived arrays a frame; the cost lands in GC, far from
- * the present that caused it. Decode inline, write four bytes, allocate nothing.
+ * One LFB pixel as an RGBA8 little-endian word (r | g<<8 | b<<16 | a<<24) — the
+ * memory order a Uint32Array store lays down over the Uint8Array the upload reads.
+ * A whole pixel per store is four times fewer memory operations than a byte each,
+ * over 307k pixels of every presented frame.
  */
-function decodeLfb8888Pixel(raw32: number, colorFormat: number, out: Uint8Array, o: number): void {
+function packRgba32(r: number, g: number, b: number, a: number): number {
+    return (r | (g << 8) | (b << 16) | (a << 24)) >>> 0;
+}
+
+/** 32-bit LFB word -> RGBA8 word, per the lane mapping grLfbWriteColorFormat set. */
+function swizzle8888(raw32: number, colorFormat: number): number {
     switch (colorFormat | 0) {
         case GR_COLORFORMAT_ABGR:
-            out[o] = raw32 & 0xff;
-            out[o + 1] = (raw32 >>> 8) & 0xff;
-            out[o + 2] = (raw32 >>> 16) & 0xff;
-            out[o + 3] = (raw32 >>> 24) & 0xff;
-            return;
+            return raw32 >>> 0;
         case GR_COLORFORMAT_RGBA:
-            out[o] = (raw32 >>> 24) & 0xff;
-            out[o + 1] = (raw32 >>> 16) & 0xff;
-            out[o + 2] = (raw32 >>> 8) & 0xff;
-            out[o + 3] = raw32 & 0xff;
-            return;
+            return (
+                ((raw32 >>> 24) & 0xff) | (((raw32 >>> 16) & 0xff) << 8) |
+                (((raw32 >>> 8) & 0xff) << 16) | ((raw32 & 0xff) << 24)
+            ) >>> 0;
         case GR_COLORFORMAT_BGRA:
-            out[o] = (raw32 >>> 8) & 0xff;
-            out[o + 1] = (raw32 >>> 16) & 0xff;
-            out[o + 2] = (raw32 >>> 24) & 0xff;
-            out[o + 3] = raw32 & 0xff;
-            return;
+            return ((raw32 >>> 8) | ((raw32 & 0xff) << 24)) >>> 0;
         case GR_COLORFORMAT_ARGB:
         default:
-            out[o] = (raw32 >>> 16) & 0xff;
-            out[o + 1] = (raw32 >>> 8) & 0xff;
-            out[o + 2] = raw32 & 0xff;
-            out[o + 3] = (raw32 >>> 24) & 0xff;
-            return;
+            return (((raw32 >>> 16) & 0xff) | (raw32 & 0xff00ff00) | ((raw32 & 0xff) << 16)) >>> 0;
     }
 }
 
 // 5- and 6-bit channel expansion, exact (v * 255 / 31 and v * 255 / 63) via a table
-// so the per-pixel loop does one indexed load instead of a multiply and a divide.
+// so the table build does one indexed load instead of a multiply and a divide.
 const EXPAND_5 = new Uint8Array(32);
 for (let i = 0; i < 32; i++) EXPAND_5[i] = Math.round(i * 255 / 31);
 const EXPAND_6 = new Uint8Array(64);
 for (let i = 0; i < 64; i++) EXPAND_6[i] = Math.round(i * 255 / 63);
+
+/**
+ * The 16-bit colour modes have only 65536 possible pixels, so the whole conversion
+ * collapses to one table lookup — no shifts, no per-pixel branch on the mode. Built
+ * once per mode (256 KB each, and a title uses one), amortised over every frame it
+ * ever presents.
+ */
+const lut16ByMode = new Map<number, Uint32Array>();
+
+/** The canonical 16-bit colour mode a raw u16 pixel is read as. The *_DEPTH modes
+ *  carry the same colour layout in their low half, and everything else is 565 — the
+ *  Voodoo's natural colour buffer. */
+export function canonical16BitMode(mode: number): number {
+    switch (mode | 0) {
+        case GR_LFBWRITEMODE_555:
+        case GR_LFBWRITEMODE_555_DEPTH:
+            return GR_LFBWRITEMODE_555;
+        case GR_LFBWRITEMODE_1555:
+        case GR_LFBWRITEMODE_1555_DEPTH:
+            return GR_LFBWRITEMODE_1555;
+        case GR_LFBWRITEMODE_ZA16:
+            return GR_LFBWRITEMODE_ZA16;
+        default:
+            return GR_LFBWRITEMODE_565;
+    }
+}
+
+function lut16For(canonicalMode: number): Uint32Array {
+    const cached = lut16ByMode.get(canonicalMode);
+    if (cached) return cached;
+    const table = new Uint32Array(65536);
+    for (let raw = 0; raw < 65536; raw++) {
+        switch (canonicalMode) {
+            case GR_LFBWRITEMODE_555:
+                table[raw] = packRgba32(
+                    EXPAND_5[(raw >>> 10) & 0x1f]!, EXPAND_5[(raw >>> 5) & 0x1f]!, EXPAND_5[raw & 0x1f]!, 255);
+                break;
+            case GR_LFBWRITEMODE_1555:
+                table[raw] = packRgba32(
+                    EXPAND_5[(raw >>> 10) & 0x1f]!, EXPAND_5[(raw >>> 5) & 0x1f]!, EXPAND_5[raw & 0x1f]!,
+                    (raw & 0x8000) ? 255 : 0);
+                break;
+            case GR_LFBWRITEMODE_ZA16:
+                table[raw] = packRgba32(0, 0, 0, 255);
+                break;
+            default:
+                table[raw] = packRgba32(
+                    EXPAND_5[(raw >>> 11) & 0x1f]!, EXPAND_6[(raw >>> 5) & 0x3f]!, EXPAND_5[raw & 0x1f]!, 255);
+                break;
+        }
+    }
+    lut16ByMode.set(canonicalMode, table);
+    return table;
+}
+
+/**
+ * LFB pixels -> RGBA8, written straight into a caller-owned word buffer.
+ *
+ * `out` must be a Uint32Array of width*height words; a word is one RGBA8 pixel in
+ * memory order. Exported so the differential test can hold it against a scalar
+ * reference — nothing else about the conversion is observable from outside.
+ */
+export function convertLfbToRgba(
+    src: Uint8Array,
+    pitch: number,
+    width: number,
+    height: number,
+    writeMode: number,
+    colorFormat: number,
+    fourByte: boolean,
+    out: Uint32Array,
+): void {
+    const mode = writeMode | 0;
+    const fmt = colorFormat | 0;
+
+    // A typed view over the source needs its element alignment; guest surfaces are
+    // allocated aligned, but a caller-supplied span need not be, so fall back to
+    // assembling the word from bytes rather than throwing.
+    const wordBytes = fourByte ? 4 : 2;
+    const aligned = (src.byteOffset % wordBytes) === 0 && (pitch % wordBytes) === 0;
+
+    if (!fourByte) {
+        const lut = lut16For(canonical16BitMode(mode));
+        const src16 = aligned
+            ? new Uint16Array(src.buffer, src.byteOffset, src.byteLength >>> 1)
+            : null;
+        for (let y = 0; y < height; y++) {
+            let dst = y * width;
+            if (src16) {
+                let s = (y * pitch) >>> 1;
+                for (let x = 0; x < width; x++, dst++, s++) out[dst] = lut[src16[s]!]!;
+            } else {
+                let s = y * pitch;
+                for (let x = 0; x < width; x++, dst++, s += 2) {
+                    out[dst] = lut[(src[s] ?? 0) | ((src[s + 1] ?? 0) << 8)]!;
+                }
+            }
+        }
+        return;
+    }
+
+    // 4-byte surfaces: the *_DEPTH modes still carry a 16-bit colour in the low half,
+    // everything else is a full 32-bit word in the configured lane order.
+    const depthLut =
+        (mode === GR_LFBWRITEMODE_565_DEPTH || mode === GR_LFBWRITEMODE_555_DEPTH ||
+         mode === GR_LFBWRITEMODE_1555_DEPTH)
+            ? lut16For(canonical16BitMode(mode))
+            : null;
+    const opaque = mode === GR_LFBWRITEMODE_888;
+    const src32 = aligned ? new Uint32Array(src.buffer, src.byteOffset, src.byteLength >>> 2) : null;
+
+    for (let y = 0; y < height; y++) {
+        let dst = y * width;
+        let s = src32 ? (y * pitch) >>> 2 : y * pitch;
+        for (let x = 0; x < width; x++, dst++) {
+            const raw32 = src32
+                ? src32[s]! >>> 0
+                : (((src[s] ?? 0) | ((src[s + 1] ?? 0) << 8) |
+                    ((src[s + 2] ?? 0) << 16) | ((src[s + 3] ?? 0) << 24)) >>> 0);
+            s += src32 ? 1 : 4;
+            if (depthLut) {
+                out[dst] = depthLut[raw32 & 0xffff]!;
+            } else {
+                const rgba = swizzle8888(raw32, fmt);
+                out[dst] = opaque ? ((rgba & 0x00ffffff) | 0xff000000) >>> 0 : rgba;
+            }
+        }
+    }
+}
 
 type SurfaceRgbaResult = {
     pixels: Uint8Array;
@@ -119,83 +238,10 @@ function surfaceToRgba(context: GlideContext): SurfaceRgbaResult | null {
     context.lfbRgbaSource = surface.dataPtr;
 
     const fourByte = surface.bytesPerPixel === 4 || bytesPerPixelForLfbWriteMode(surface.writeMode) === 4;
-    const mode = surface.writeMode | 0;
-
-    for (let y = 0; y < height; y++) {
-        const rowBase = y * surface.pitch;
-        let dst = y * width * 4;
-        if (fourByte) {
-            for (let x = 0; x < width; x++, dst += 4) {
-                const s = rowBase + x * 4;
-                const raw32 = (
-                    (src[s] ?? 0) | ((src[s + 1] ?? 0) << 8) |
-                    ((src[s + 2] ?? 0) << 16) | ((src[s + 3] ?? 0) << 24)
-                ) >>> 0;
-                switch (mode) {
-                    case GR_LFBWRITEMODE_565_DEPTH: {
-                        const raw = raw32 & 0xffff;
-                        rgba[dst] = EXPAND_5[(raw >>> 11) & 0x1f]!;
-                        rgba[dst + 1] = EXPAND_6[(raw >>> 5) & 0x3f]!;
-                        rgba[dst + 2] = EXPAND_5[raw & 0x1f]!;
-                        rgba[dst + 3] = 255;
-                        break;
-                    }
-                    case GR_LFBWRITEMODE_555_DEPTH: {
-                        const raw = raw32 & 0xffff;
-                        rgba[dst] = EXPAND_5[(raw >>> 10) & 0x1f]!;
-                        rgba[dst + 1] = EXPAND_5[(raw >>> 5) & 0x1f]!;
-                        rgba[dst + 2] = EXPAND_5[raw & 0x1f]!;
-                        rgba[dst + 3] = 255;
-                        break;
-                    }
-                    case GR_LFBWRITEMODE_1555_DEPTH: {
-                        const raw = raw32 & 0xffff;
-                        rgba[dst] = EXPAND_5[(raw >>> 10) & 0x1f]!;
-                        rgba[dst + 1] = EXPAND_5[(raw >>> 5) & 0x1f]!;
-                        rgba[dst + 2] = EXPAND_5[raw & 0x1f]!;
-                        rgba[dst + 3] = (raw & 0x8000) ? 255 : 0;
-                        break;
-                    }
-                    case GR_LFBWRITEMODE_888:
-                        decodeLfb8888Pixel(raw32, lfbColorFormat, rgba, dst);
-                        rgba[dst + 3] = 255;
-                        break;
-                    default:
-                        decodeLfb8888Pixel(raw32, lfbColorFormat, rgba, dst);
-                        break;
-                }
-            }
-            continue;
-        }
-
-        for (let x = 0; x < width; x++, dst += 4) {
-            const s = rowBase + x * 2;
-            const raw = (src[s] ?? 0) | ((src[s + 1] ?? 0) << 8);
-            switch (mode) {
-                case GR_LFBWRITEMODE_555:
-                    rgba[dst] = EXPAND_5[(raw >>> 10) & 0x1f]!;
-                    rgba[dst + 1] = EXPAND_5[(raw >>> 5) & 0x1f]!;
-                    rgba[dst + 2] = EXPAND_5[raw & 0x1f]!;
-                    rgba[dst + 3] = 255;
-                    break;
-                case GR_LFBWRITEMODE_1555:
-                    rgba[dst] = EXPAND_5[(raw >>> 10) & 0x1f]!;
-                    rgba[dst + 1] = EXPAND_5[(raw >>> 5) & 0x1f]!;
-                    rgba[dst + 2] = EXPAND_5[raw & 0x1f]!;
-                    rgba[dst + 3] = (raw & 0x8000) ? 255 : 0;
-                    break;
-                case GR_LFBWRITEMODE_ZA16:
-                    rgba[dst] = 0; rgba[dst + 1] = 0; rgba[dst + 2] = 0; rgba[dst + 3] = 255;
-                    break;
-                default: // 565 — the Voodoo's natural 16-bit colour buffer
-                    rgba[dst] = EXPAND_5[(raw >>> 11) & 0x1f]!;
-                    rgba[dst + 1] = EXPAND_6[(raw >>> 5) & 0x3f]!;
-                    rgba[dst + 2] = EXPAND_5[raw & 0x1f]!;
-                    rgba[dst + 3] = 255;
-                    break;
-            }
-        }
-    }
+    convertLfbToRgba(
+        src, surface.pitch, width, height, surface.writeMode, lfbColorFormat, fourByte,
+        new Uint32Array(rgba.buffer, rgba.byteOffset, needed >>> 2),
+    );
 
     return { pixels: rgba, surface };
 }

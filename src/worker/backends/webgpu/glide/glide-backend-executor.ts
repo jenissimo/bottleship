@@ -52,6 +52,42 @@ const TOPOLOGY_BY_ID: Record<number, LegacyPrimitiveTopology> = {
 const GLIDE_UNIFORM_FOGTABLE_OFFSET = 96;
 const GLIDE_UNIFORM_SIZE = GLIDE_UNIFORM_FOGTABLE_OFFSET + 64 * 4; // 352
 
+/**
+ * Copy the presenter's RGBA8 LFB image into the upload staging buffer, swapping
+ * R and B when the swap chain is BGRA and inserting the 256-byte row padding
+ * WebGPU demands.
+ *
+ * A whole pixel per load/store: the channel swap is one word permutation, and
+ * doing it a byte at a time is four times the memory traffic over 307k pixels of
+ * every present. Both buffers are our own allocations, so both are word-aligned;
+ * both row pitches are multiples of four (width*4, and paddedRow is 256-aligned).
+ */
+export function stageLfbRows(
+    pixels: Uint8Array,
+    staged: Uint8Array,
+    srcRowBytes: number,
+    dstRowBytes: number,
+    height: number,
+    bgra: boolean,
+): void {
+    const src32 = new Uint32Array(pixels.buffer, pixels.byteOffset, pixels.byteLength >>> 2);
+    const staged32 = new Uint32Array(staged.buffer, staged.byteOffset, staged.byteLength >>> 2);
+    const rowWords = srcRowBytes >>> 2;
+    const dstWords = dstRowBytes >>> 2;
+    for (let y = 0; y < height; y++) {
+        const src = y * rowWords;
+        const dst = y * dstWords;
+        if (!bgra) {
+            staged32.set(src32.subarray(src, src + rowWords), dst);
+            continue;
+        }
+        for (let x = 0; x < rowWords; x++) {
+            const v = src32[src + x]!;
+            staged32[dst + x] = (((v >>> 16) & 0xff) | (v & 0xff00ff00) | ((v & 0xff) << 16)) >>> 0;
+        }
+    }
+}
+
 export class GlideBackendExecutor extends Legacy3DExecutor {
     private offscreenTexture: GPUTexture | null = null;
     private offscreenView: GPUTextureView | null = null;
@@ -612,20 +648,7 @@ export class GlideBackendExecutor extends Legacy3DExecutor {
             || bgra !== this.lfbStagedBgra;
 
         if (version < 0 || layoutChanged || version !== this.lfbUploadedVersion) {
-            for (let y = 0; y < height; y++) {
-                const src = y * unpaddedRow;
-                const dst = needsPadding ? y * paddedRow : src;
-                if (!bgra) {
-                    staged.set(pixels.subarray(src, src + unpaddedRow), dst);
-                    continue;
-                }
-                for (let x = 0; x < unpaddedRow; x += 4) {
-                    staged[dst + x] = pixels[src + x + 2]!;
-                    staged[dst + x + 1] = pixels[src + x + 1]!;
-                    staged[dst + x + 2] = pixels[src + x]!;
-                    staged[dst + x + 3] = pixels[src + x + 3]!;
-                }
-            }
+            stageLfbRows(pixels, staged, unpaddedRow, needsPadding ? paddedRow : unpaddedRow, height, bgra);
             this.lfbUploadedVersion = version;
             this.lfbStagedWidth = width;
             this.lfbStagedHeight = height;
