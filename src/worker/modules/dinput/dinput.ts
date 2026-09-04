@@ -92,6 +92,11 @@ const DIKEYBOARDSTATE_SIZE = 256;
 const DIJOYSTATE_SIZE = 80;
 const DIDEVICEOBJECTDATA_SIZE = 16; // DI5/7: dwOfs + dwData + dwTimeStamp + dwSequence
 
+/** Bound on the action-map carry-over queue. Action-mapped titles here never set
+ *  DIPROP_BUFFERSIZE, so there is no guest-declared depth to honour; the queue only
+ *  grows when the guest reads fewer edges than one poll produced, which is transient. */
+const ACTION_MAP_BUFFER_SIZE = 64;
+
 // DIMOFS_* offsets within DIMOUSESTATE
 const DIMOFS_X = 0;
 const DIMOFS_Y = 4;
@@ -392,6 +397,12 @@ class DirectInputDeviceObject extends BaseComObject {
     public actionMapGuid = "";           // guidActionMap string for registry round-trip
     public seq = 0;                      // DIDEVICEOBJECTDATA dwSequence counter
     public mousePollPrevButtons = 0;     // for action-mapped mouse button edges
+    /** Action-map edges polled but not yet handed to the guest. The poll is destructive
+     *  (it advances every entry's lastValue), so anything the caller's array had no room
+     *  for — or a count-only/PEEK call — must be carried, not recomputed. */
+    public actionDataPending: Array<{ entry: ActionMapEntry; dwData: number }> = [];
+    /** Set when the carry-over queue had to refuse an edge; reported once, DI-style. */
+    public actionDataOverflowed = false;
     /** Latch epoch this device has already observed — see DInput.readMouseButtons. */
     public mouseLatchEpoch = -1;
 
@@ -971,8 +982,17 @@ export class DInput implements IModule {
                 System.getInstance().inputManager.noteGuestGamepadRead();
             }
             const im = System.getInstance().inputManager;
+            // DirectInput records into the buffer only while the device is acquired, so a
+            // fresh acquisition starts on an EMPTY one. Without this, whatever the producer
+            // queued while the guest was unacquired is delivered as the first batch after
+            // the re-Acquire — stale edges, and a queue already near its depth.
+            if (device) this.flushBufferedQueue(im, device.deviceType);
             if (device && device.deviceType === "keyboard" && im.getDInputKeyboardBufferSize() > 0) {
                 im.baselineDInputKeyboard();
+            }
+            if (device?.isActionMapped) {
+                device.actionDataPending.length = 0;
+                device.actionDataOverflowed = false;
             }
             if (device && (device.deviceType === "gamepad" || device.deviceType === "joystick")
                 && im.getDInputGamepadBufferSize() > 0) {
@@ -1481,19 +1501,23 @@ export class DInput implements IModule {
 
             let pending = 0;
             let drainFn: (maxItems: number) => ReturnType<typeof im.drainDInputMouseEvents>;
+            let takeOverflow: () => boolean;
             switch (device.deviceType) {
                 case "mouse":
                     pending = im.getDInputMouseEventCount();
                     drainFn = (n) => im.drainDInputMouseEvents(n);
+                    takeOverflow = () => im.takeDInputMouseOverflow();
                     break;
                 case "keyboard":
                     pending = im.getDInputKeyboardEventCount();
                     drainFn = (n) => im.drainDInputKeyboardEvents(n);
+                    takeOverflow = () => im.takeDInputKeyboardOverflow();
                     break;
                 case "gamepad":
                 case "joystick":
                     pending = im.getDInputGamepadEventCount();
                     drainFn = (n) => im.drainDInputGamepadEvents(n);
+                    takeOverflow = () => im.takeDInputGamepadOverflow();
                     break;
                 default:
                     if (pdwInOut) view.setUint32(pdwInOut, 0, true);
@@ -1522,7 +1546,12 @@ export class DInput implements IModule {
             }
 
             const events = drainFn(maxItems);
-            const overflow = pending > maxItems;
+            // Only a buffer that actually LOST events reports DI_BUFFEROVERFLOW. A backlog
+            // deeper than the caller's array is ordinary buffered use — the remainder stays
+            // queued for the next call. Reporting it as overflow makes the engine's own
+            // recovery (flush the input table and re-read) fire on every drain, which
+            // wipes a held key the moment anything else is producing events.
+            const overflow = takeOverflow();
 
             // Write DIDEVICEOBJECTDATA entries
             for (let i = 0; i < events.length; i++) {
@@ -2087,6 +2116,27 @@ export class DInput implements IModule {
     }
 
     // Buffered read for an action-mapped device (keyboard axes/hats, mouse, gamepad).
+    /** Drop whatever the producer queued for this device kind, overflow flag included. */
+    private flushBufferedQueue(im: ReturnType<typeof System.getInstance>["inputManager"], kind: DeviceKind): void {
+        switch (kind) {
+            case "mouse":
+                im.drainDInputMouseEvents(im.getDInputMouseEventCount());
+                im.takeDInputMouseOverflow();
+                break;
+            case "keyboard":
+                im.drainDInputKeyboardEvents(im.getDInputKeyboardEventCount());
+                im.takeDInputKeyboardOverflow();
+                break;
+            case "gamepad":
+            case "joystick":
+                im.drainDInputGamepadEvents(im.getDInputGamepadEventCount());
+                im.takeDInputGamepadOverflow();
+                break;
+            default:
+                break;
+        }
+    }
+
     private getActionMappedDeviceData(
         device: DirectInputDeviceObject, cbObjectData: number, rgdod: number,
         pdwInOut: number, dwFlags: number, view: DataView
@@ -2140,22 +2190,30 @@ export class DInput implements IModule {
             device.mousePollPrevButtons = mouseButtons;
         }
 
-        const pending = changed.length;
+        const queue = device.actionDataPending;
+        for (const edge of changed) {
+            if (queue.length >= ACTION_MAP_BUFFER_SIZE) { device.actionDataOverflowed = true; break; }
+            queue.push(edge);
+        }
+
+        const pending = queue.length;
         const peek = (dwFlags & DIGDD_PEEK) !== 0;
         const maxItems = pdwInOut ? view.getUint32(pdwInOut, true) : 0;
+        // A count-only or PEEK call consumes nothing, so it cannot have lost anything:
+        // a backlog deeper than the caller's array is ordinary buffered use.
         if (!rgdod || peek) {
             const reportable = !rgdod ? pending : Math.min(maxItems, pending);
             if (pdwInOut) view.setUint32(pdwInOut, reportable, true);
-            return pending > maxItems && rgdod ? DI_BUFFEROVERFLOW : DI_OK;
+            return DI_OK;
         }
         if (maxItems === 0) { if (pdwInOut) view.setUint32(pdwInOut, 0, true); return DI_OK; }
 
         const stride = Math.max(cbObjectData, DIDEVICEOBJECTDATA8_SIZE);
         const tick = (System.getInstance().services.time.nowMs() | 0) >>> 0;
-        const n = Math.min(changed.length, maxItems);
+        const n = Math.min(queue.length, maxItems);
         const wv = this.freshView();
         for (let i = 0; i < n; i++) {
-            const { entry: e, dwData } = changed[i];
+            const { entry: e, dwData } = queue[i];
             const addr = rgdod + i * stride;
             wv.setUint32(addr, e.dwOfs >>> 0, true);
             wv.setUint32(addr + 4, dwData >>> 0, true);
@@ -2163,8 +2221,11 @@ export class DInput implements IModule {
             wv.setUint32(addr + 12, (++device.seq) >>> 0, true);
             wv.setUint32(addr + 16, e.uAppData >>> 0, true);
         }
+        queue.splice(0, n);
         if (pdwInOut) view.setUint32(pdwInOut, n, true);
-        return changed.length > maxItems ? DI_BUFFEROVERFLOW : DI_OK;
+        const overflow = device.actionDataOverflowed;
+        device.actionDataOverflowed = false;
+        return overflow ? DI_BUFFEROVERFLOW : DI_OK;
     }
 
     private getMemory(): Uint8Array {

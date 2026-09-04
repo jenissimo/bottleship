@@ -331,6 +331,7 @@ export class InputManager {
     private dinputMouseEvents: DInputBufferedEvent[] = [];
     private dinputMouseBufferSize = 0; // 0 = buffered mode disabled
     private dinputMouseSeq = 0;
+    private dinputMouseOverflowed = false;
     /** Last SAB dinputDX/DY seen when buffering — same accum GetDeviceState uses.
      *  Position-derived Δ dies at canvas edges / under ClipCursor; raw accum does not. */
     private dinputPrevAccumX = 0;
@@ -343,11 +344,13 @@ export class InputManager {
     private dinputKeyboardEvents: DInputBufferedEvent[] = [];
     private dinputKeyboardBufferSize = 0;
     private dinputKeyboardSeq = 0;
+    private dinputKeyboardOverflowed = false;
     private dinputKeyboardPrevVk = new Uint8Array(256);
 
     private dinputGamepadEvents: DInputBufferedEvent[] = [];
     private dinputGamepadBufferSize = 0;
     private dinputGamepadSeq = 0;
+    private dinputGamepadOverflowed = false;
     private dinputGamepadPrevButtons = 0;
     private dinputGamepadPrevAxes: [number, number, number, number] = [0, 0, 0, 0];
 
@@ -1145,15 +1148,18 @@ export class InputManager {
         this.currentButtons = 0;
         this.dinputWheelAccum = 0;
         this.dinputMouseEvents.length = 0;
+        this.dinputMouseOverflowed = false;
         this.dinputMouseSeq = 0;
         this.dinputPrevAccumX = 0;
         this.dinputPrevAccumY = 0;
         this.dinputPrevButtons = 0;
         this.dinputKeyboardEvents.length = 0;
+        this.dinputKeyboardOverflowed = false;
         this.dinputKeyboardBufferSize = 0;
         this.dinputKeyboardSeq = 0;
         this.dinputKeyboardPrevVk.fill(0);
         this.dinputGamepadEvents.length = 0;
+        this.dinputGamepadOverflowed = false;
         this.dinputGamepadBufferSize = 0;
         this.dinputGamepadSeq = 0;
         this.dinputGamepadPrevButtons = 0;
@@ -1234,6 +1240,7 @@ export class InputManager {
                 bufferSize: this.dinputMouseBufferSize,
                 pending: this.dinputMouseEvents.length,
                 produced: this.dinputMouseSeq,
+                overflowed: this.dinputMouseOverflowed,
                 prevAccumX: this.dinputPrevAccumX,
                 prevAccumY: this.dinputPrevAccumY,
                 prevButtons: this.dinputPrevButtons,
@@ -1243,11 +1250,13 @@ export class InputManager {
                 bufferSize: this.dinputKeyboardBufferSize,
                 pending: this.dinputKeyboardEvents.length,
                 produced: this.dinputKeyboardSeq,
+                overflowed: this.dinputKeyboardOverflowed,
             },
             gamepad: {
                 bufferSize: this.dinputGamepadBufferSize,
                 pending: this.dinputGamepadEvents.length,
                 produced: this.dinputGamepadSeq,
+                overflowed: this.dinputGamepadOverflowed,
             },
             cursor: { x: this.currentMouseX, y: this.currentMouseY, buttons: this.currentButtons },
             relativeMouse: this.relativeMousePosture(),
@@ -1281,7 +1290,10 @@ export class InputManager {
         let produced = false;
 
         const pushEvent = (dwOfs: number, dwData: number): void => {
-            if (events.length >= maxBuf) events.shift(); // overflow: drop oldest
+            // A full DirectInput buffer stops accepting and reports the loss once, on the
+            // next read. Dropping the OLDEST instead would silently retire a DOWN whose UP
+            // is still queued, leaving the guest holding a key it never sees released.
+            if (events.length >= maxBuf) { this.dinputMouseOverflowed = true; return; }
             const seq = ++this.dinputMouseSeq;
             events.push({ dwOfs, dwData, dwTimeStamp: ts, dwSequence: seq });
             this._noteDInputTrail("mouse", dwOfs, dwData, seq);
@@ -1334,7 +1346,7 @@ export class InputManager {
         let produced = false;
 
         const pushEvent = (dwOfs: number, dwData: number): void => {
-            if (events.length >= maxBuf) events.shift();
+            if (events.length >= maxBuf) { this.dinputKeyboardOverflowed = true; return; }
             const seq = ++this.dinputKeyboardSeq;
             events.push({ dwOfs, dwData, dwTimeStamp: ts, dwSequence: seq });
             this._noteDInputTrail("keyboard", dwOfs, dwData, seq);
@@ -1364,7 +1376,7 @@ export class InputManager {
         let produced = false;
 
         const pushEvent = (dwOfs: number, dwData: number): void => {
-            if (events.length >= maxBuf) events.shift();
+            if (events.length >= maxBuf) { this.dinputGamepadOverflowed = true; return; }
             const seq = ++this.dinputGamepadSeq;
             events.push({ dwOfs, dwData, dwTimeStamp: ts, dwSequence: seq });
             this._noteDInputTrail("gamepad", dwOfs, dwData, seq);
@@ -1467,6 +1479,7 @@ export class InputManager {
     setDInputMouseBufferSize(size: number): void {
         this.dinputMouseBufferSize = size;
         this.dinputMouseEvents.length = 0;
+        this.dinputMouseOverflowed = false;
         this.baselineDInputMouse();
     }
 
@@ -1496,10 +1509,23 @@ export class InputManager {
         return this.dinputMouseEvents.length;
     }
 
+    /**
+     * Did the buffer actually LOSE events since the last report? DI_BUFFEROVERFLOW says
+     * "your device state may be inconsistent" and engines answer it by flushing their own
+     * input table, so it must never stand in for "more is queued than you asked for" — a
+     * one-event-per-call drain is normal DirectInput usage, not a loss. Report-once.
+     */
+    takeDInputMouseOverflow(): boolean {
+        const o = this.dinputMouseOverflowed;
+        this.dinputMouseOverflowed = false;
+        return o;
+    }
+
     /** Set DirectInput keyboard buffer size (DIPROP_BUFFERSIZE). 0 = unbuffered. */
     setDInputKeyboardBufferSize(size: number): void {
         this.dinputKeyboardBufferSize = size;
         this.dinputKeyboardEvents.length = 0;
+        this.dinputKeyboardOverflowed = false;
         this.baselineDInputKeyboard();
     }
 
@@ -1522,10 +1548,18 @@ export class InputManager {
         return this.dinputKeyboardEvents.length;
     }
 
+    /** See takeDInputMouseOverflow. */
+    takeDInputKeyboardOverflow(): boolean {
+        const o = this.dinputKeyboardOverflowed;
+        this.dinputKeyboardOverflowed = false;
+        return o;
+    }
+
     /** Set DirectInput gamepad/joystick buffer size (DIPROP_BUFFERSIZE). 0 = unbuffered. */
     setDInputGamepadBufferSize(size: number): void {
         this.dinputGamepadBufferSize = size;
         this.dinputGamepadEvents.length = 0;
+        this.dinputGamepadOverflowed = false;
         this.baselineDInputGamepad();
     }
 
@@ -1547,6 +1581,13 @@ export class InputManager {
 
     getDInputGamepadEventCount(): number {
         return this.dinputGamepadEvents.length;
+    }
+
+    /** See takeDInputMouseOverflow. */
+    takeDInputGamepadOverflow(): boolean {
+        const o = this.dinputGamepadOverflowed;
+        this.dinputGamepadOverflowed = false;
+        return o;
     }
 
     /** Place the pointer without generating a move — for synthetic-input paths that
