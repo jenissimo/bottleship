@@ -22,7 +22,10 @@ import type { VideoPlanePlan } from "./video-routing-types";
  *
  * Not a pure read: it is also where the plane's lifetime is enforced, so a plane whose
  * owner has gone away is CLEARED here rather than left to read as content for the next
- * caller. Idempotent, so every present path in a frame gets the same answer.
+ * caller. The VERDICT is idempotent — every present path in a frame gets the same
+ * `onScreen` — but the `reason` is latched at the transition: a clearing reason is reported
+ * once, and a second call in the same frame answers `no_content` for the plane it just
+ * dropped.
  */
 export function getVideoPlanePlan(): VideoPlanePlan {
     return System.getInstance().videoRouting.resolvePlanePlan();

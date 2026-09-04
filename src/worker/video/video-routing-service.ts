@@ -24,6 +24,10 @@ const PLANE_COVER_WARN_AT = 120;
  * of its own — a menu, a HUD — and the plane is a compensation layer for pixels that are not
  * missing. The plane covers the whole frame, so being wrong in that direction hides the UI;
  * being wrong the other way only shows the guest exactly what the guest drew.
+ *
+ * NOT a universal rule: only the D3D9 presenter reports a draw count, so on DDraw, Glide and
+ * D3D8 this threshold is never reached and the null-is-unknown fallback (the plane stays)
+ * IS the whole policy there.
  */
 const VIDEO_BLIT_MAX_DRAWS = 4;
 
@@ -99,6 +103,10 @@ export class VideoRoutingService {
      * Also the plane's lifetime: a reason that is not "live" and not merely "nothing here yet"
      * means the pixels have outlived their owner, and they are dropped HERE rather than left
      * to read as content for the next caller.
+     *
+     * That clear is what makes the REASON a one-shot: `onScreen` is stable across repeated
+     * calls in a frame, while a second call after a clearing reason reports `no_content`,
+     * the plane having no owner any more.
      */
     resolvePlanePlan(): VideoPlanePlan {
         const reason = this.evaluatePlane();
