@@ -15,7 +15,7 @@ import { readFileSync } from "fs";
 import { join } from "path";
 import { generateShaderCode, generateMegaBatchShaderCode, ShaderConfig } from "../../src/worker/backends/webgpu/ddraw/shader-generator";
 import { DebugFlags, DEFAULT_DEBUG_FLAGS } from "../../src/worker/backends/webgpu/ddraw/types";
-import { applyTextureConverterDebugPaintCPU } from "../../src/worker/backends/webgpu/ddraw/compute/texture-converter";
+import { applyTextureConverterDebugPaintCPU } from "../../src/worker/backends/webgpu/shared/texture-converter";
 
 function baseConfig(debugFlags: DebugFlags): ShaderConfig {
     return {

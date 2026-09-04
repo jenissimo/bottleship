@@ -17,7 +17,7 @@ import {
 } from "./gpu-texture-utils";
 import { overlapsThunkCode } from "../../core/memory/address-guard";
 import { gpuDeviceUsable } from "../../core/gpu/gpu-device-lifecycle";
-import type { TextureConverter } from "../../backends/webgpu/ddraw/compute/texture-converter";
+import type { TextureConverter } from "../../backends/webgpu/shared/texture-converter";
 import {
     decodeSurfaceFormatToRgba8,
     getSurfaceFormatLayout,

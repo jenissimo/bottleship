@@ -1,12 +1,23 @@
 /**
  * GPU Compute Shader for Texture Format Conversion
  *
- * Converts DirectDraw surface formats (RGB565, RGB555, ARGB1555) to RGBA8.
- * Uses compute shaders for large textures, CPU fallback for small ones.
+ * Unpacks a packed guest pixel buffer (RGB565, RGB555, ARGB1555, ARGB4444,
+ * ARGB8888, XRGB8888, PALETTE8) straight out of guest memory into a GPU texture,
+ * with the destination swizzle (rgba8unorm / bgra8unorm), source pitch and an
+ * optional colour key all handled on the GPU. CPU fallback for small textures and
+ * for the formats named UNKNOWN by detectPixelFormat.
+ *
+ * Backend-neutral by input: it takes a FormatInfo mask descriptor, a guest address
+ * and a GPUTexture, none of which are DirectDraw types. It lives in shared/ because
+ * every legacy backend has the same full-surface-per-frame CPU convert to avoid —
+ * ddraw for its surfaces, glide for the linear frame buffer — and a second
+ * mechanism for the same job would be two shaders to keep honest instead of one.
+ * A caller whose format this cannot express must DECLINE by name and keep its CPU
+ * path; silently producing the wrong colours is the failure mode that matters.
  */
 
-import { Logger, LogCategory } from "../../../../core/logger";
-import { profiler } from "../../../../core/profiler";
+import { Logger, LogCategory } from "../../../core/logger";
+import { profiler } from "../../../core/profiler";
 import {
     PixelFormat,
     detectPixelFormat,
@@ -14,7 +25,7 @@ import {
     RGB565_TO_RGBA,
     RGB555_TO_RGBA,
     ARGB1555_TO_RGBA,
-} from "../../../../modules/ddraw/gpu-texture-utils";
+} from "../../../modules/ddraw/gpu-texture-utils";
 
 // Threshold for using GPU compute vs CPU fallback (in pixels)
 const GPU_PIXEL_THRESHOLD = 64 * 64; // 4096 pixels

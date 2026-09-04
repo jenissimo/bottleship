@@ -169,7 +169,7 @@ import { MsaaColorManager } from "./msaa-color-manager";
 import { ColorKeyBlitPipeline } from "./colorkey-blit-pipeline";
 import { VertexConverter, GPU_VERTEX_THRESHOLD, GpuVertexConversionResult, computeFvfStride, OUTPUT_VERTEX_BYTES, OUTPUT_VERTEX_U32S } from "./compute/vertex-converter";
 import type { VertexBlendInput } from "./compute/vertex-converter";
-import { TextureConverter, applyTextureConverterDebugPaintCPU } from "./compute/texture-converter";
+import { TextureConverter, applyTextureConverterDebugPaintCPU } from "../shared/texture-converter";
 import { FFPLightingState } from "../../../modules/ddraw/d3d/ffp-lighting";
 import { createDefaultMaterial } from "../../../modules/ddraw/d3d/types";
 
