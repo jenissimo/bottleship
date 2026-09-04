@@ -263,7 +263,8 @@ export class Shell32 implements IModule {
             file: string,
             parameters: string,
             directory: string,
-            nShowCmd: number
+            nShowCmd: number,
+            allowImageExec = true,
         ): Promise<number> => {
             const launched = await applyShellExecFake(parameters, "SHELL32");
 
@@ -290,7 +291,7 @@ export class Shell32 implements IModule {
             // a file side effect is already served by those, and restarting for it makes the
             // probe BE the game — a `testrendev=` run inits the renderer, logs, and exits.
             const system = System.getInstance();
-            if (!launched && system.isSelfImage(file, directory)
+            if (!launched && allowImageExec && system.isSelfImage(file, directory)
                 && isDifferentCommandLine(parameters, system.executableArgs)
                 && system.requestReExec(parameters)) {
                 system.scheduler.setLastError(0);
@@ -298,6 +299,32 @@ export class Shell32 implements IModule {
                     LogCategory.SYSTEM,
                     `[SHELL32] ${apiName}("${operation}", "${file}", "${parameters}") -> re-exec ` +
                     `(launcher relaunching its own image; restarting with the new command line)`
+                );
+                return SHELL_EXEC_OK;
+            }
+
+            // A small launcher often hands off with ShellExecute rather than
+            // CreateProcess.  Cossacks' GOG video player is one example: after its
+            // AVI queue it ShellExecutes dmln.exe, which in turn starts the game.
+            //
+            // We still cannot promise to run an arbitrary host program.  The only
+            // successful non-self launch is a bundled DOS/Windows image that the VFS
+            // can prove exists.  It has the same one-process realization as the
+            // CreateProcess path: restart the guest on that image after this thunk
+            // returns, preserving the bundle's writable layer.
+            const imagePath = !launched ? system.resolveImagePath(file, directory) : "";
+            const bundledExecutable = !!imagePath
+                && /\.(?:exe|com)$/i.test(imagePath)
+                && system.fileSystem.fileExists(imagePath)
+                // The self-image branch above deliberately rejects identical args to
+                // avoid a restart loop; never re-admit that same request here.
+                && !system.isSelfImage(file, directory);
+            if (!launched && allowImageExec && bundledExecutable && system.requestReExec(parameters, imagePath)) {
+                system.scheduler.setLastError(0);
+                Logger.log(
+                    LogCategory.SYSTEM,
+                    `[SHELL32] ${apiName}("${operation}", "${file}", "${parameters}", dir="${directory}") ` +
+                    `-> exec "${imagePath}" (bundled child image)`
                 );
                 return SHELL_EXEC_OK;
             }
@@ -402,7 +429,10 @@ export class Shell32 implements IModule {
             const parameters = lpParameters ? readStrA(mem, lpParameters) : "";
             const directory = lpDirectory ? readStrA(mem, lpDirectory) : "";
 
-            const result = await executeShell("ShellExecuteExA", operation, file, parameters, directory, nShow);
+            const result = await executeShell(
+                "ShellExecuteExA", operation, file, parameters, directory, nShow,
+                (fMask & SEE_MASK_NOCLOSEPROCESS) === 0,
+            );
             return finishShellExecuteEx(pExecInfo, fMask, result);
         };
 
@@ -423,7 +453,10 @@ export class Shell32 implements IModule {
             const parameters = lpParameters ? readStrW(mem, lpParameters) : "";
             const directory = lpDirectory ? readStrW(mem, lpDirectory) : "";
 
-            const result = await executeShell("ShellExecuteExW", operation, file, parameters, directory, nShow);
+            const result = await executeShell(
+                "ShellExecuteExW", operation, file, parameters, directory, nShow,
+                (fMask & SEE_MASK_NOCLOSEPROCESS) === 0,
+            );
             return finishShellExecuteEx(pExecInfo, fMask, result);
         };
         this.exports["Shell_NotifyIconA"] = () => 1; // BOOL TRUE (tray icon ops accepted)

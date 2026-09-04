@@ -241,6 +241,26 @@ export function serializeWindows(): unknown {
             parent: w.parent ?? null,
             childCount: w.children?.length ?? 0,
             style: u32(w.style),
+            // VCL/MFC associate a native HWND with its component object through these
+            // fields. A window that paints but routes every message to the framework
+            // default is otherwise indistinguishable from one whose event bindings work.
+            userData: u32(w.userData),
+            userDataHex: "0x" + u32(w.userData).toString(16),
+            createParam: u32(w.createParam),
+            createParamHex: "0x" + u32(w.createParam).toString(16),
+            extraBytes: w.extraBytes ? Array.from(w.extraBytes, u32) : [],
+            // Keeping the address in the harness view makes a guest window that is
+            // idle in its message loop directly debuggable without reaching into
+            // private user32 state from the probe.
+            wndProc: u32(w.wndProc),
+            wndProcHex: "0x" + u32(w.wndProc).toString(16),
+            // A form can look active in the host model while its initial activation callback
+            // was deferred or lost during CreateWindowEx. Keep the delivery fact visible so
+            // an OnActivate-dependent launcher is diagnosable without inferred message order.
+            activationDelivered: !!w.activationDelivered,
+            createInProgress: !!w.createInProgress,
+            createSyncVisibleDelivered: !!w.createSyncVisibleDelivered,
+            createSyncActivationDelivered: !!w.createSyncActivationDelivered,
             customPaint: !!w.guestCustomPaint,
             // Which proc will see a message: a subclassed control's guest proc runs first
             // and reaches the class behaviour only through CallWindowProc.

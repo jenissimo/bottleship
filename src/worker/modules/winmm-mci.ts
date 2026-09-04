@@ -102,6 +102,7 @@ const MCI_GETDEVCAPS_CAN_SAVE = 0x00000009;
 // Time formats
 const MCI_FORMAT_MILLISECONDS = 0;
 const MCI_FORMAT_MSF = 2;
+const MCI_FORMAT_FRAMES = 3;
 const MCI_FORMAT_TMSF = 10;
 
 // CD-audio device constants (mmsystem.h: MCI_CD_OFFSET = 1088). Games compare the
@@ -111,6 +112,7 @@ const MCI_CD_OFFSET = 1088;
 const MCI_CDA_TRACK_AUDIO = MCI_CD_OFFSET + 0;
 const MCI_CDA_TRACK_OTHER = MCI_CD_OFFSET + 1;
 const MCI_DEVTYPE_CD_AUDIO = 516;
+const MCI_DEVTYPE_DIGITAL_VIDEO = 520;
 
 // MCI notification codes
 const MCI_NOTIFY_SUCCESSFUL = 1;
@@ -167,6 +169,7 @@ function msfToMs(msf: number): number {
 function timeFormatName(format: number): string {
     switch (format) {
         case MCI_FORMAT_MSF: return "msf";
+        case MCI_FORMAT_FRAMES: return "frames";
         case MCI_FORMAT_TMSF: return "tmsf";
         default: return "milliseconds";
     }
@@ -225,6 +228,10 @@ interface MCIDevice {
     videoFrameDurationMs?: number;
     videoWidth?: number;
     videoHeight?: number;
+    /** Stream metadata is retained after EOF for MCI_STATUS. */
+    videoFrameCount?: number;
+    /** MCI_SEEK target, expressed as a zero-based decoded frame index. */
+    videoSeekFrame?: number;
     videoNotifyRequested?: boolean;
     /** Preloaded AVI bytes (sync read on MCI open). */
     videoFileBytes?: Uint8Array;
@@ -850,8 +857,69 @@ export class WinmmMci {
 
     private isMciVideoReady(device: MCIDevice): boolean {
         if (!this.isMciVideoDevice(device)) return true;
-        if (device.videoStartInFlight) return false;
-        return (device.videoEngineHandle ?? 0) > 0;
+        // MCIAVI reports READY immediately after a successful open, before PLAY has
+        // allocated a decoder.  TMediaPlayer asks this during construction, so tying
+        // readiness to the lazy playback handle incorrectly tells it that a valid AVI
+        // is unavailable.
+        return !!device.videoFileBytes || !!this.resolveMciVideoVfsPath(device);
+    }
+
+    /** Convert the device's MCI time unit to a decoded-frame index. */
+    private mciVideoTimeToFrame(device: MCIDevice, value: number): number {
+        if (device.timeFormatId === MCI_FORMAT_FRAMES) return value >>> 0;
+        const frameMs = device.videoFrameDurationMs ?? 0;
+        return frameMs > 0 ? Math.floor(value / frameMs) : 0;
+    }
+
+    /** Convert a decoded-frame index to the device's selected MCI time unit. */
+    private mciVideoFrameToTime(device: MCIDevice, frame: number): number {
+        if (device.timeFormatId === MCI_FORMAT_FRAMES) return frame >>> 0;
+        const frameMs = device.videoFrameDurationMs ?? 0;
+        return frameMs > 0 ? Math.floor(frame * frameMs) >>> 0 : 0;
+    }
+
+    private mciVideoCurrentFrame(device: MCIDevice): number {
+        if (device.videoEngineHandle) {
+            const info = videoEngine.getInfo(device.videoEngineHandle);
+            if (info) return info.currentFrame >>> 0;
+        }
+        return device.videoSeekFrame ?? 0;
+    }
+
+    private mciVideoStatusItem(device: MCIDevice, item: number, start: boolean): [number, number] {
+        const frameCount = device.videoFrameCount ?? 0;
+        switch (item) {
+            case MCI_STATUS_CURRENT_TRACK: return [MMSYSERR_NOERROR, 1];
+            case MCI_STATUS_LENGTH: return [MMSYSERR_NOERROR, this.mciVideoFrameToTime(device, frameCount)];
+            case MCI_STATUS_MODE:
+                return [MMSYSERR_NOERROR, device.mode === "playing" ? MCI_MODE_PLAY
+                    : device.mode === "paused" ? MCI_MODE_PAUSE : MCI_MODE_STOP];
+            case MCI_STATUS_MEDIA_PRESENT: return [MMSYSERR_NOERROR, this.isMciVideoReady(device) ? 1 : 0];
+            case MCI_STATUS_NUMBER_OF_TRACKS: return [MMSYSERR_NOERROR, 1];
+            case MCI_STATUS_POSITION:
+                return [MMSYSERR_NOERROR, this.mciVideoFrameToTime(device, start ? 0 : this.mciVideoCurrentFrame(device))];
+            case MCI_STATUS_READY: return [MMSYSERR_NOERROR, this.isMciVideoReady(device) ? 1 : 0];
+            case MCI_STATUS_TIME_FORMAT: return [MMSYSERR_NOERROR, device.timeFormatId];
+            case MCI_ANIM_STATUS_HWND: return [MMSYSERR_NOERROR, device.hwndWindow ?? 0];
+            default: return [MCIERR_UNSUPPORTED_FUNCTION, 0];
+        }
+    }
+
+    private mciVideoGetDevCapsItem(item: number): [number, number] {
+        switch (item) {
+            case MCI_GETDEVCAPS_DEVICE_TYPE: return [MMSYSERR_NOERROR, MCI_DEVTYPE_DIGITAL_VIDEO];
+            case MCI_GETDEVCAPS_HAS_AUDIO:
+            case MCI_GETDEVCAPS_HAS_VIDEO:
+            case MCI_GETDEVCAPS_USES_FILES:
+            case MCI_GETDEVCAPS_COMPOUND_DEVICE:
+            case MCI_GETDEVCAPS_CAN_PLAY:
+                return [MMSYSERR_NOERROR, 1];
+            case MCI_GETDEVCAPS_CAN_RECORD:
+            case MCI_GETDEVCAPS_CAN_SAVE:
+            case MCI_GETDEVCAPS_CAN_EJECT:
+                return [MMSYSERR_NOERROR, 0];
+            default: return [MCIERR_UNSUPPORTED_FUNCTION, 0];
+        }
     }
 
     private async prepareMciVideoEngine(device: MCIDevice, source: string): Promise<boolean> {
@@ -902,7 +970,11 @@ export class WinmmMci {
         device.videoStartInFlight = false;
         device.videoWidth = info.width;
         device.videoHeight = info.height;
+        device.videoFrameCount = info.frameCount;
         device.videoFrameDurationMs = info.fps > 0 ? (1000 / info.fps) : 66;
+        const seekFrame = Math.min(device.videoSeekFrame ?? 0, Math.max(0, info.frameCount));
+        if (seekFrame > 0) videoEngine.gotoFrame(engineHandle, seekFrame);
+        device.videoSeekFrame = seekFrame;
         device.videoHasAudio = info.hasAudio;
         device.videoAudioSampleRate = info.hasAudio ? info.sampleRate : 0;
         device.videoAudioChannels = info.hasAudio ? info.channels : 0;
@@ -1171,6 +1243,7 @@ export class WinmmMci {
                 if (decodeElapsed > 1) {
                     TimeService.getInstance().advanceVirtualTime(decodeElapsed);
                 }
+                device.videoSeekFrame = device.videoFrameCount ?? this.mciVideoCurrentFrame(device);
                 this.completeMciVideoPlayback(device, "eof");
                 return;
             }
@@ -1620,6 +1693,13 @@ export class WinmmMci {
                 const resolvedType = this.normalizeMciText(deviceType)
                     || this.inferMciDeviceType(elementName)
                     || "avivideo";
+                // mciavi32 treats an element-less AVI open as an unsupported record
+                // request.  Returning success here makes TMediaPlayer believe it has
+                // a usable device and it then retries PLAY/NOTIFY forever after EOF.
+                if ((resolvedType === "avivideo" || resolvedType === "animation" || resolvedType === "digitalvideo")
+                    && (!(fdwCommand & MCI_OPEN_ELEMENT) || !elementName)) {
+                    return MCIERR_UNSUPPORTED_FUNCTION;
+                }
                 const openName = alias || resolvedType;
                 // Same one-device rule as the string interface: a simple device opened
                 // by type has nothing to distinguish a second instance from the first.
@@ -1633,6 +1713,12 @@ export class WinmmMci {
                 const device = this.createMciDevice(openName, openName);
                 device.elementName = elementName;
                 device.deviceType = resolvedType;
+                // mciavi32 opens AVI devices in frame time, not milliseconds.  This
+                // is observable through MCI_STATUS_TIME_FORMAT before the first PLAY.
+                if (this.isMciVideoDevice(device)) {
+                    device.timeFormatId = MCI_FORMAT_FRAMES;
+                    device.timeFormat = timeFormatName(MCI_FORMAT_FRAMES);
+                }
                 if (dwParam) {
                     view.setUint32(dwParam + 4, device.id, true);
                 }
@@ -1677,23 +1763,51 @@ export class WinmmMci {
             }
 
             if (uMsg === MCI_STATUS && device && dwParam) {
-                if (fdwCommand & MCI_STATUS_ITEM) {
-                    const item = view.getUint32(dwParam + 8, true);
-                    if (item === MCI_STATUS_READY) {
-                        const ready = this.isMciVideoReady(device) ? 1 : 0;
-                        view.setUint32(dwParam + 4, ready, true);
-                    } else if (item === MCI_STATUS_MODE) {
-                        const mode = device.mode === "playing"
-                            ? MCI_MODE_PLAY
-                            : device.mode === "paused"
-                                ? MCI_MODE_PAUSE
-                                : MCI_MODE_STOP;
-                        view.setUint32(dwParam + 4, mode, true);
-                    }
+                if (!(fdwCommand & MCI_STATUS_ITEM)) return MCIERR_MISSING_PARAMETER;
+                const item = view.getUint32(dwParam + 8, true) >>> 0;
+                const [err, value] = this.mciVideoStatusItem(device, item, (fdwCommand & MCI_STATUS_START) !== 0);
+                if (err === MMSYSERR_NOERROR) view.setUint32(dwParam + 4, value >>> 0, true);
+                Logger.verbose(LogCategory.SYSTEM,
+                    `MCI video status: ${this.describeMciDevice(device)} item=0x${item.toString(16)} -> err=${err} value=${value}`);
+                return err;
+            }
+
+            if (uMsg === MCI_GETDEVCAPS && device) {
+                if (!(fdwCommand & MCI_GETDEVCAPS_ITEM)) return MCIERR_MISSING_PARAMETER;
+                if (!dwParam) return MCIERR_NULL_PARAMETER_BLOCK;
+                const item = view.getUint32(dwParam + 8, true) >>> 0;
+                const [err, value] = this.mciVideoGetDevCapsItem(item);
+                if (err === MMSYSERR_NOERROR) view.setUint32(dwParam + 4, value >>> 0, true);
+                Logger.verbose(LogCategory.SYSTEM,
+                    `MCI video caps: ${this.describeMciDevice(device)} item=0x${item.toString(16)} -> err=${err} value=${value}`);
+                return err;
+            }
+
+            if (uMsg === MCI_SET && device) {
+                if (!(fdwCommand & MCI_SET_TIME_FORMAT)) return MMSYSERR_NOERROR;
+                if (!dwParam) return MCIERR_NULL_PARAMETER_BLOCK;
+                const format = view.getUint32(dwParam + 4, true) >>> 0;
+                if (format !== MCI_FORMAT_MILLISECONDS && format !== MCI_FORMAT_FRAMES) {
+                    return MCIERR_BAD_TIME_FORMAT;
                 }
-                if (fdwCommand & MCI_ANIM_STATUS_HWND && dwParam) {
-                    view.setUint32(dwParam + 4, device.hwndWindow ?? 0, true);
-                }
+                device.timeFormatId = format;
+                device.timeFormat = timeFormatName(format);
+                return MMSYSERR_NOERROR;
+            }
+
+            if (uMsg === MCI_SEEK && device) {
+                if (!dwParam) return MCIERR_NULL_PARAMETER_BLOCK;
+                const positionFlags = fdwCommand & (MCI_SEEK_TO_START | MCI_SEEK_TO_END | MCI_TO);
+                if (!positionFlags) return MCIERR_MISSING_PARAMETER;
+                if ((positionFlags & (positionFlags - 1)) !== 0) return MCIERR_UNSUPPORTED_FUNCTION;
+                const frameCount = device.videoFrameCount ?? Number.MAX_SAFE_INTEGER;
+                const target = (positionFlags & MCI_SEEK_TO_START) ? 0
+                    : (positionFlags & MCI_SEEK_TO_END) ? frameCount
+                        : this.mciVideoTimeToFrame(device, view.getUint32(dwParam + 4, true));
+                if (target > frameCount) return MCIERR_OUTOFRANGE;
+                this.abortMciVideoPlayback(device, "mciSendCommandA MCI_SEEK");
+                device.mode = "stopped";
+                device.videoSeekFrame = target;
                 return MMSYSERR_NOERROR;
             }
 

@@ -210,6 +210,8 @@ export interface VersionQueryResult {
     offset: number;
     /** What VerQueryValue reports in puLen: characters for a string, bytes for binary. */
     len: number;
+    /** String values are converted by VerQueryValueA; binary values stay in the source block. */
+    type: 0 | 1;
 }
 
 /**
@@ -236,7 +238,7 @@ export function queryVersionBlock(bytes: Uint8Array, subBlock: string, base = 0)
         node = found.node;
         off = found.off;
     }
-    return { offset: node.valueOff, len: node.valueLen };
+    return { offset: node.valueOff, len: node.valueLen, type: node.type === 1 ? 1 : 0 };
 }
 
 function toNode(bytes: Uint8Array, view: DataView, parsed: ParsedNode, off: number, charSize: number): Node {

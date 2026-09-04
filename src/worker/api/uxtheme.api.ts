@@ -24,6 +24,8 @@ const makeFunc = (name: string, argCount: number, overrides: Partial<FunctionDes
 export const uxthemeModule: ModuleDescriptor = {
     name: "uxtheme",
     functions: [
+        makeFunc("IsThemeActive", 0),
+        makeFunc("IsAppThemed", 0),
         makeFunc("SetThemeAppProperties", 1),
     ],
 };

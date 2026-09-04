@@ -31,6 +31,10 @@ const TRACED_MSG: Record<number, string> = {
     0x0086: "WM_NCACTIVATE",
     0x0020: "WM_SETCURSOR",
     0x004E: "WM_NOTIFY",
+    // Multimedia-device completion is delivered as an ordinary posted message.  Keep
+    // it visible alongside control notifications so media-player state transitions
+    // can be verified at the message boundary.
+    0x03B9: "MM_MCINOTIFY",
     0x0111: "WM_COMMAND",
     0x0112: "WM_SYSCOMMAND",
     0x0114: "WM_HSCROLL",
@@ -107,6 +111,23 @@ export function formatWmTraceEntry(e: WmTraceEntry): string {
 }
 
 export function registerWmTraceCommands(svc: HarnessService): void {
+    /**
+     * postMessage(hwnd, msg, wParam=0, lParam=0) — queue a diagnostic message through
+     * the same WindowManager path used by input and internal USER producers.  This is
+     * deliberately asynchronous (it is not SendMessage): it can therefore exercise a
+     * launcher that is parked in WaitMessage without inventing a callback stack.
+     */
+    svc.register("postMessage", (args) => {
+        const hwnd = Number(args[0] ?? 0) >>> 0;
+        const msg = Number(args[1] ?? 0) >>> 0;
+        const wParam = Number(args[2] ?? 0) >>> 0;
+        const lParam = Number(args[3] ?? 0) >>> 0;
+        if (!hwnd || !msg) throw new HarnessError("postMessage expects non-zero hwnd and msg", HarnessErrorCode.BAD_ARGS);
+        if (!sys().windowManager.getWindow(hwnd)) throw new HarnessError(`window 0x${hwnd.toString(16)} not found`, HarnessErrorCode.NOT_FOUND);
+        sys().windowManager.postMessage(hwnd, msg, wParam, lParam);
+        return { queued: true, hwnd, msg, wParam, lParam };
+    });
+
     svc.register("wmTrace", (args) => {
         const action = String(args[0] ?? "read");
         const w = wm();

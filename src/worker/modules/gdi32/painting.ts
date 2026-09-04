@@ -795,6 +795,24 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         return System.getInstance().gdiContext.createSolidBrush(color);
     };
 
+    // HBRUSH CreateBrushIndirect(const LOGBRUSH *lplb)
+    // LOGBRUSH is { UINT lbStyle; COLORREF lbColor; ULONG_PTR lbHatch } on Win32.
+    // The renderer supports solid brushes; return failure for patterns/hatches rather
+    // than pretending an unsupported brush can draw correctly.
+    exports['CreateBrushIndirect'] = (ctx, mem, args): number => {
+        const lplb = args[0] >>> 0;
+        if (!lplb || lplb + 12 > mem.byteLength) return 0;
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const style = view.getUint32(lplb, true);
+        const color = view.getUint32(lplb + 4, true);
+        if (style !== 0 /* BS_SOLID */) {
+            Logger.verbose(LogCategory.GDI32, `CreateBrushIndirect style=${style} unsupported`);
+            return 0;
+        }
+        Logger.verbose(LogCategory.GDI32, `CreateBrushIndirect solid color=0x${color.toString(16)}`);
+        return System.getInstance().gdiContext.createSolidBrush(color);
+    };
+
     exports['CreatePatternBrush'] = (ctx, mem, args): number => {
         const hBitmap = args[0] >>> 0;
         Logger.verbose(LogCategory.GDI32, `CreatePatternBrush(hBitmap=0x${hBitmap.toString(16)})`);
