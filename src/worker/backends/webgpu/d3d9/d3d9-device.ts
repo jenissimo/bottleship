@@ -80,6 +80,7 @@ import {
     d3d9PerfStateBlockWasmApply, d3d9PerfStateBlockWasmCapture,
     d3d9PerfBufferLock, d3d9PerfBufferUpload, d3d9PerfIndexRangeOOB,
     d3d9PerfFfpUnimplemented, d3d9PerfFfpOp, d3d9PerfApproximation, d3d9PerfMaterialSet,
+    d3d9ResetDropDrawWarnings,
 } from "../../../modules/d3d9/d3d9-perf";
 import { addComRef, releaseComRef } from "../../../modules/d3d9/com-refs";
 import { d3d9ReadbackCounters } from "../../../modules/d3d9/lock-stats";
@@ -8200,6 +8201,7 @@ export class D3D9Device {
             this.frameSnapshot.frameCounters.textureBytes = 0;
         }
         this.frameSnapshot.drawCalls = 0;
+        d3d9ResetDropDrawWarnings();
 
         frameProfiler.endTimer("present", presentStart);
         frameProfiler.markFrame("d3d9");
@@ -9043,7 +9045,14 @@ export class D3D9Device {
         // Appended only when texgen is on, so it multiplies pipelines for the draws that use
         // it and leaves every other key the shape it already had.
         const texGen = this.texGenActive(stages) ? "|tg" : "";
-        return `${numericKey}|${fvfHigh}|s${stages}${texGen}|rt${this.activeColorTargetKey()}`
+        // Sampling a cube or a volume where the shader declared a 2-D texture is a different
+        // pipeline (and, on the fixed function, a refused draw), and nothing else in this key
+        // says which DIMENSION each bound stage has. Restricted to the sampled cascade so an
+        // inert texture above it does not fragment the cache, and appended only when non-zero
+        // so the common key keeps the shape it had.
+        const dimMask = (this.boundCubeMask() | this.boundVolumeMask()) & ((1 << stages) - 1);
+        const dim = dimMask !== 0 ? `|dim${dimMask.toString(16)}` : "";
+        return `${numericKey}|${fvfHigh}|s${stages}${texGen}${dim}|rt${this.activeColorTargetKey()}`
             + `|${computeBlendKey(this.getRS)}|${this.alphaTestKey()}|${computeDepthKey(this.getRS)}`
             + `|df${this.activeDepthTargetFormat()}`
             + `|${this.rasterStateKey()}`
@@ -9089,8 +9098,18 @@ export class D3D9Device {
         const key = this.buildPipelineKey();
         const cacheKey = this.blendCacheKey(key, 0, slotMask);
         if (this.currentPipelineKey !== cacheKey || this.currentPipelineId === null) {
+            const id = this.resolvePipelineId(key, "triangle-list", false, undefined, 0, slotMask);
+            // A refusal depends on state this key does not carry in full, so remembering it
+            // would let whichever draw filled the one-entry memo first decide the fate of every
+            // later draw that hashes the same — the refusal outlives the binding that caused it.
+            // Only a real pipeline is memoized.
+            if (id < 0) {
+                this.currentPipelineKey = "";
+                this.currentPipelineId = null;
+                return id;
+            }
             this.currentPipelineKey = cacheKey;
-            this.currentPipelineId = this.resolvePipelineId(key, "triangle-list", false, undefined, 0, slotMask);
+            this.currentPipelineId = id;
         }
         return this.currentPipelineId ?? 0;
     }
@@ -9172,7 +9191,14 @@ export class D3D9Device {
                 return -1;
             }
         }
-        const unsupportedSampler = this.firstUnsupportedSamplerStage(false);
+        // What this pipeline's shader will actually sample. D3D's blend cascade terminates at
+        // the first stage whose COLOROP is D3DTOP_DISABLE, so a texture bound above it is inert:
+        // real hardware draws such a call, and refusing it here is us being stricter than the
+        // contract. Vertex samplers are not part of the fixed function at all — it has no
+        // vertex-texture fetch — so they cannot make an FFP draw unrepresentable either.
+        const ffpSampledStages = fvfOverride !== undefined ? 1 : this.activeStageCount();
+        const ffpSampledMask = (1 << ffpSampledStages) - 1;
+        const unsupportedSampler = this.firstUnsupportedSamplerStage(false, ffpSampledStages, false);
         if (unsupportedSampler !== null) {
             Logger.error(LogCategory.D3D9,
                 `[D3D9] sampler stage ${unsupportedSampler.stage} uses unsupported feature ` +
@@ -9182,11 +9208,11 @@ export class D3D9Device {
         // The fixed-function fragment ABI only declares 2-D textures. Programmable
         // dcl_volume draws take the path below; refuse a volume bound to FFP rather than
         // silently binding a dimension-mismatched fallback view.
-        if (this.boundVolumeMask() !== 0 || this.boundVertexVolumeMask() !== 0) {
+        if ((this.boundVolumeMask() & ffpSampledMask) !== 0) {
             Logger.error(LogCategory.D3D9, "[D3D9] volume texture requires the programmable 3-D shader path; refusing FFP draw");
             return -1;
         }
-        const cubeMask = this.boundCubeMask();
+        const cubeMask = this.boundCubeMask() & ffpSampledMask;
         if (cubeMask !== 0) {
             for (let stage = 0; stage < PROG_BIND.MAX_TEX; stage++) {
                 if (((cubeMask >>> stage) & 1) !== 0) d3d9PerfFfpUnimplemented(`cubeTextureStage${stage}`);
@@ -10101,7 +10127,11 @@ export class D3D9Device {
     /** Return a bound sampler stage whose D3D sampler semantics have no native WebGPU path.
      * Such a draw must be refused before bind-group construction; a null sampler would otherwise
      * select the executor fallback and silently change texels. */
-    private firstUnsupportedSamplerStage(_allowShaderEmulation = false): { stage: number; reason: string } | null {
+    private firstUnsupportedSamplerStage(
+        _allowShaderEmulation = false,
+        pixelStageLimit: number = PROG_BIND.MAX_TEX,
+        includeVertexSamplers = true,
+    ): { stage: number; reason: string } | null {
         const check = (stage: number): { stage: number; reason: string } | null => {
             const texture = this.stateTracker.getTexture(stage);
             if (texture === null) return null;
@@ -10115,10 +10145,14 @@ export class D3D9Device {
             // use textureSampleCompareLevel because WGSL has no compare-bias/compare-grad form.
             return null;
         };
-        for (let stage = 0; stage < PROG_BIND.MAX_TEX; stage++) {
+        // Callers that sample only part of the stage bank pass their own limit: a stage the
+        // draw never reads cannot make it unrepresentable.
+        const limit = Math.min(pixelStageLimit, PROG_BIND.MAX_TEX);
+        for (let stage = 0; stage < limit; stage++) {
             const unsupported = check(stage);
             if (unsupported !== null) return unsupported;
         }
+        if (!includeVertexSamplers) return null;
         for (let n = 0; n < D3D9_VERTEX_TEXTURE_SAMPLER_COUNT; n++) {
             const unsupported = check(D3D9_VERTEX_TEXTURE_SAMPLER_BASE + n);
             if (unsupported !== null) return unsupported;

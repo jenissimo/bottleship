@@ -6,6 +6,7 @@ import {
     getDxFormatSupportCensus,
     resetDxFormatSupportCensus,
 } from "../../backends/webgpu/shared/dx-format-support";
+import { Logger, LogCategory } from "../../core/logger";
 
 export interface D3D9ArenaRunReconcile {
     producerRuns: number;
@@ -444,9 +445,28 @@ export function d3d9NoteResetRefusal(reason: string): void {
     resetRefusals[reason] = (resetRefusals[reason] ?? 0) + 1;
 }
 
+/** Reasons already announced during the current frame. A counter nobody reads is not a
+ *  diagnostic: a whole set of geometry can go missing without a single log line, so the
+ *  FIRST drop of each new reason in a frame is announced. One line per reason per frame
+ *  keeps a per-draw failure out of the log firehose while still naming it every frame it
+ *  happens. */
+const warnedDropReasons = new Set<string>();
+
 export function d3d9DropDraw(reason: string): number {
-    droppedDraws[reason] = (droppedDraws[reason] ?? 0) + 1;
+    const seen = (droppedDraws[reason] ?? 0) + 1;
+    droppedDraws[reason] = seen;
+    if (!warnedDropReasons.has(reason)) {
+        warnedDropReasons.add(reason);
+        Logger.warn(LogCategory.D3D9,
+            `[D3D9] draw dropped: ${reason} (${seen} this session) — geometry is missing from this frame`);
+    }
     return 0;
+}
+
+/** Frame boundary for the drop announcer: a reason that persists frame after frame keeps
+ *  reporting itself once per frame rather than falling silent after the first one. */
+export function d3d9ResetDropDrawWarnings(): void {
+    warnedDropReasons.clear();
 }
 
 const buffers: D3D9BufferPerf = {
@@ -513,6 +533,7 @@ export function resetD3D9Perf(): void {
     for (const k of BACKEND_KEYS) backend[k] = 0;
     for (const k in stateBlock) (stateBlock as Record<string, number>)[k] = 0;
     for (const k in droppedDraws) delete droppedDraws[k];
+    warnedDropReasons.clear();
     for (const k in counterRejections) delete counterRejections[k];
     for (const k in resetRefusals) delete resetRefusals[k];
     for (const k in ffpUnimplemented) delete ffpUnimplemented[k];
