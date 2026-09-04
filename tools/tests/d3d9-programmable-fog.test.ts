@@ -126,8 +126,8 @@ describe("D3D9 programmable fixed-function fog (W10)", () => {
     test("POSITIONT preserves RHW, clamps z, and applies the D3D9 pixel center", () => {
         const wgsl = link(compiledVs(false), compiledPs(2), true);
         expect(wgsl).toContain("let _clipW = select(1.0, 1.0 / _rhw, _rhw != 0.0)");
-        expect(wgsl).toContain("((_p.x + 0.5) / 640.0)");
-        expect(wgsl).toContain("((_p.y + 0.5) / 480.0)");
+        expect(wgsl).toContain("((_p.x + 0.500000) / 640.0)");
+        expect(wgsl).toContain("((_p.y + 0.500000) / 480.0)");
         expect(wgsl).toContain("clamp(_p.z, 0.0, 1.0) * _clipW");
     });
 

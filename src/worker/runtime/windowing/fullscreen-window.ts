@@ -61,3 +61,30 @@ export function resizeFullscreenWindowToMode(
     Logger.log(LogCategory.SYSTEM,
         `${source}: fullscreen window resize hwnd=0x${hwnd.toString(16)} -> ${width}x${height}`);
 }
+
+/**
+ * The CLIENT extent a device window gives a WINDOWED device whose present parameters
+ * declare a zero back-buffer size.
+ *
+ * Zero is not "no size" in D3D9: it is legal only for a windowed device, and the runtime
+ * fills BackBufferWidth/Height from the client area of the device window (else the focus
+ * window) and writes the values back into the caller's struct. Reading zero as "the app
+ * declared nothing" leaves the GUEST space undefined for the entire windowed regime, and
+ * everything derived from it — the viewport, the XYZRHW divisor, the pointer inverse —
+ * then falls back to the host canvas, which is two coordinate spaces conflated again.
+ *
+ * Null when neither window map knows the handle: inventing an extent for a window we never
+ * tracked would be a guess, and the caller's own fallback is at least visible.
+ */
+export function deviceWindowClientExtent(hwnd: number): { width: number; height: number } | null {
+    if (!hwnd) return null;
+    const shared = sharedWindows.get(hwnd >>> 0);
+    if (shared && shared.width > 0 && shared.height > 0) {
+        return { width: shared.width | 0, height: shared.height | 0 };
+    }
+    const winObj = System.getInstance().windowManager?.getWindow(hwnd >>> 0);
+    if (winObj && winObj.rect.w > 0 && winObj.rect.h > 0) {
+        return { width: winObj.rect.w | 0, height: winObj.rect.h | 0 };
+    }
+    return null;
+}

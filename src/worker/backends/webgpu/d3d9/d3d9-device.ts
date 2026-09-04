@@ -4,6 +4,7 @@ import { RenderFramePool, type ProgrammableDrawState, type RenderFrame } from ".
 import { LruCache } from "../../../core/collections/lru-cache";
 import { registerGpuDeviceObserver } from "../../../core/gpu/gpu-device-lifecycle";
 import { registerBackendQualitySupport } from "../shared/quality-capabilities";
+import { EmulatorConfig } from "../../../core/emulator-config-manager";
 // Side-effect import: the surface-side device-loss observer. A pure-d3d9 title never loads the
 // ddraw executor, but its render targets and the texture-handle registry are the same objects.
 import "../../../modules/ddraw/surface-device-loss";
@@ -98,6 +99,10 @@ import {
 import type { CensusSummary } from "./shader/census";
 import { AlphaTest, alphaTestSnippet } from "./shader/sm-wgsl";
 import { noteD3D9TextureUpload } from "../../../modules/d3d9/shared-state";
+// renderSpace only: the windowed regime is exactly where the guest picture space and the
+// guest POINTER space stop coinciding, so the verb has to be able to print both.
+import { windows as sharedUserWindows, getVirtualScreenRect } from "../../../modules/user32/shared-state";
+import { getPresentRect } from "../shared/present-geometry";
 import { Op, opName } from "./shader/sm-enums";
 import { VS_FLOAT_REGISTER_COUNT } from "./shader/vs-codegen";
 import { SHADER_BOOLEAN_BANK_BYTES } from "./shader/link/uniforms";
@@ -744,6 +749,129 @@ export class D3D9Device {
             `surf=0x${surfacePtr.toString(16)} metaHit=${metaHit} tex=0x${texturePtr.toString(16)} idx=${idx} isRT=${isRT}`);
         if (this.rtResolveLog.length > 16) this.rtResolveLog.shift();
     }
+    /**
+     * HARNESS renderSpace verb — the guest logical space, the physical one it is rendered at,
+     * and the canvas it is presented onto, so the three can be told apart by measurement.
+     *
+     * `depth` is the same question for the bound depth/stencil surface, which is where the
+     * two spaces meet invisibly: a mismatched attachment does not throw, it makes WebGPU
+     * DROP the whole pass, and a screenshot of a black render target cannot say why.
+     * `lastDepthClear` is the other invisible one — a guest rect sent unscaled to a physical
+     * attachment clears a corner and leaves the rest holding last frame's Z.
+     */
+    getRenderSpace(): {
+        guest: { width: number; height: number };
+        physical: { width: number; height: number };
+        scale: number;
+        canvas: { width: number; height: number };
+        viewport: { x: number; y: number; width: number; height: number };
+        internalScaleSetting: number;
+        /** A windowed device's back buffer is its window's CLIENT area, and the guest pointer
+         *  space is still the DESKTOP; fullscreen the two coincide, which is how a wrong map
+         *  passes unnoticed. Printed together so the difference is readable. */
+        windowed: boolean;
+        deviceWindow: {
+            hwnd: number;
+            client: { width: number; height: number } | null;
+            origin: { x: number; y: number } | null;
+        };
+        desktop: { width: number; height: number };
+        emulatedDisplayMode: { width: number; height: number; bpp: number; refreshRate: number } | null;
+        publishedPresentRect: unknown;
+        depth: {
+            kind: "texture" | "standalone" | "none";
+            guest: { width: number; height: number } | null;
+            physical: { width: number; height: number } | null;
+            passScale: number;
+            /** Does that image match the extent the CURRENT pass needs? False = substituted. */
+            matchesPass: boolean | null;
+        };
+        lastDepthClear: {
+            guest: { left: number; top: number; right: number; bottom: number };
+            physical: { left: number; top: number; right: number; bottom: number };
+            attachment: { width: number; height: number };
+            coversAttachment: boolean;
+        } | null;
+    } {
+        const system = System.getInstance();
+        const win = this.deviceWindowHwnd ? sharedUserWindows.get(this.deviceWindowHwnd) : undefined;
+        const desktop = getVirtualScreenRect();
+        const publishedRect = getPresentRect();
+        return {
+            windowed: this.deviceIsWindowed,
+            deviceWindow: win
+                ? {
+                    hwnd: this.deviceWindowHwnd,
+                    client: { width: win.width, height: win.height },
+                    origin: { x: win.x, y: win.y },
+                }
+                : { hwnd: this.deviceWindowHwnd, client: null, origin: null },
+            desktop: { width: desktop.right - desktop.left, height: desktop.bottom - desktop.top },
+            emulatedDisplayMode: system.emulatedDisplayMode,
+            publishedPresentRect: publishedRect,
+            depth: this.depthRenderSpace(),
+            lastDepthClear: this.lastDepthClearSpace,
+            guest: this.backendExecutor.getGuestBackbufferSize(),
+            physical: this.backendExecutor.getPhysicalBackbufferSize(),
+            scale: this.backendExecutor.getBackbufferScale(),
+            canvas: this.backend.getCanvasSize(),
+            viewport: {
+                x: this.viewport.x, y: this.viewport.y,
+                width: this.viewport.width, height: this.viewport.height,
+            },
+            internalScaleSetting: EmulatorConfig.getInstance().quality.internalScale,
+        };
+    }
+
+    /** The device window a WINDOWED device draws into, and whether it is windowed at all.
+     *  The two spaces only coincide fullscreen, so the verb must be able to say which. */
+    private deviceWindowHwnd = 0;
+    private deviceIsWindowed = true;
+
+    /** The bound depth/stencil surface in both spaces, for the renderSpace verb. */
+    private depthRenderSpace(): {
+        kind: "texture" | "standalone" | "none";
+        guest: { width: number; height: number } | null;
+        physical: { width: number; height: number } | null;
+        passScale: number;
+        matchesPass: boolean | null;
+    } {
+        const passScale = this.activeRenderScale();
+        const size = this.getCurrentTargetSize();
+        const want = {
+            width: Math.max(1, Math.round(size.w * passScale)),
+            height: Math.max(1, Math.round(size.h * passScale)),
+        };
+        let kind: "texture" | "standalone" | "none" = "none";
+        let guest: { width: number; height: number } | null = null;
+        let physical: { width: number; height: number } | null = null;
+        if (this.depthTextureIndex !== null) {
+            kind = "texture";
+            guest = { width: this.textures.getWidth(this.depthTextureIndex), height: this.textures.getHeight(this.depthTextureIndex) };
+            const gpu = this.textures.getGpuTexture(this.depthTextureIndex);
+            if (gpu) physical = { width: gpu.width, height: gpu.height };
+        } else if (this.activeStandaloneDepthSurface !== null) {
+            kind = "standalone";
+            const binding = this.standaloneDepthBinding(this.activeStandaloneDepthSurface);
+            if (binding) {
+                guest = { width: binding.width, height: binding.height };
+                if (binding.texture) physical = { width: binding.texture.width, height: binding.texture.height };
+            }
+        }
+        return {
+            kind, guest, physical, passScale,
+            matchesPass: physical ? (physical.width === want.width && physical.height === want.height) : null,
+        };
+    }
+
+    /** Last depth/stencil rect clear, in both spaces — see getRenderSpace. */
+    private lastDepthClearSpace: {
+        guest: { left: number; top: number; right: number; bottom: number };
+        physical: { left: number; top: number; right: number; bottom: number };
+        attachment: { width: number; height: number };
+        coversAttachment: boolean;
+    } | null = null;
+
     /** HARNESS rtDebug verb: what SetRenderTarget saw + which textures were created as RTs. */
     getRtDebug(): { resolves: string[]; creates: string[]; currentRtIndex: number | null; targets: Array<number | null> } {
         return {
@@ -782,7 +910,7 @@ export class D3D9Device {
         }
         const rt0 = this.renderTargetIndices[0];
         const base = rt0 === null
-            ? this.backendExecutor.getCanvasSize()
+            ? this.backendExecutor.getGuestBackbufferSize()
             : { width: this.textures.getWidth(rt0), height: this.textures.getHeight(rt0) };
         let last = 0;
         for (let i = 1; i < this.renderTargetIndices.length; i++) {
@@ -1003,13 +1131,12 @@ export class D3D9Device {
             const width = this.textures.getWidth(newTarget);
             const height = this.textures.getHeight(newTarget);
             // When RT0 is the implicit backbuffer, there is no texture index to
-            // include in `peers`; use the actual canvas attachment as the MRT
-            // anchor instead of accepting an extent that beginRenderPass will
-            // reject later.
+            // include in `peers`; use the implicit back buffer's own guest extent as the
+            // MRT anchor instead of accepting an extent D3D9 itself would reject.
             if (index !== 0 && this.renderTargetIndices[0] === null) {
-                const canvas = this.backendExecutor.getCanvasSize();
+                const backbuffer = this.backendExecutor.getGuestBackbufferSize();
                 const compatibility = resolveD3D9MrtCompatibility(
-                    { sampleCount: this.d3d9MsaaSampleCount, width: canvas.width, height: canvas.height },
+                    { sampleCount: this.d3d9MsaaSampleCount, width: backbuffer.width, height: backbuffer.height },
                     { sampleCount: requestedSampleCount, width, height },
                 );
                 if (!compatibility.supported) return D3DERR_INVALIDCALL;
@@ -1120,6 +1247,12 @@ export class D3D9Device {
     } | null {
         const binding = this.standaloneDepthBinding(surfacePtr);
         if (!binding) return null;
+        const wanted = Math.max(1, Math.round(binding.width * this.depthSurfaceScale(binding.width, binding.height)));
+        if (binding.texture && binding.texture.width !== wanted) {
+            binding.texture.destroy();
+            binding.texture = null;
+            binding.view = null;
+        }
         if (binding.texture && binding.view) return binding as {
             width: number;
             height: number;
@@ -1130,8 +1263,13 @@ export class D3D9Device {
         };
         const device = this.backend.getDevice();
         if (!device) return null;
+        const scale = this.depthSurfaceScale(binding.width, binding.height);
         const texture = device.createTexture({
-            size: { width: binding.width, height: binding.height, depthOrArrayLayers: 1 },
+            size: {
+                width: Math.max(1, Math.round(binding.width * scale)),
+                height: Math.max(1, Math.round(binding.height * scale)),
+                depthOrArrayLayers: 1,
+            },
             format: binding.format,
             sampleCount: binding.sampleCount,
             usage: GPUTextureUsage.RENDER_ATTACHMENT,
@@ -1244,11 +1382,20 @@ export class D3D9Device {
     }
 
     private ensureDepthTexture(index: number, device: GPUDevice): void {
-        if (this.textures.getGpuTexture(index)) return;
+        const declaredW = this.textures.getWidth(index);
+        const declaredH = this.textures.getHeight(index);
+        const scale = this.depthSurfaceScale(declaredW, declaredH);
+        const physW = Math.max(1, Math.round(declaredW * scale));
+        const physH = Math.max(1, Math.round(declaredH * scale));
+        const existing = this.textures.getGpuTexture(index);
+        if (existing) {
+            if (existing.width === physW && existing.height === physH) return;
+            existing.destroy();
+        }
         const texture = device.createTexture({
             size: {
-                width: this.textures.getWidth(index),
-                height: this.textures.getHeight(index),
+                width: physW,
+                height: physH,
                 depthOrArrayLayers: 1,
             },
             format: this.depthTextureFormat(index),
@@ -1319,51 +1466,93 @@ export class D3D9Device {
      * the SAME format and sample count — the pipeline's depth format keeps agreeing with
      * the attachment, which a dropped depth attachment would not.
      */
-    private resolveDepthAttachment(renderW: number, renderH: number): {
+    private resolveDepthAttachment(renderW: number, renderH: number, physScale = 1): {
         view: GPUTextureView;
         format: GPUTextureFormat;
         width: number;
         height: number;
         substituted: boolean;
     } | null {
-        let bound: { view: GPUTextureView; format: GPUTextureFormat; width: number; height: number; sampleCount: number } | null = null;
+        let bound: {
+            view: GPUTextureView; format: GPUTextureFormat;
+            width: number; height: number; physW: number; physH: number; sampleCount: number;
+        } | null = null;
         if (this.depthTextureIndex !== null) {
             const device = this.backend.getDevice();
             if (device) this.ensureDepthTexture(this.depthTextureIndex, device);
             const view = this.textures.getView(this.depthTextureIndex);
-            if (!view) return null;
+            const gpu = this.textures.getGpuTexture(this.depthTextureIndex);
+            if (!view || !gpu) return null;
             bound = {
                 view,
                 format: this.depthTextureFormat(this.depthTextureIndex),
                 width: this.textures.getWidth(this.depthTextureIndex),
                 height: this.textures.getHeight(this.depthTextureIndex),
+                physW: gpu.width,
+                physH: gpu.height,
                 sampleCount: 1,
             };
         } else if (this.activeStandaloneDepthSurface !== null) {
             const depth = this.ensureStandaloneDepthSurface(this.activeStandaloneDepthSurface);
             if (!depth) return null;
-            bound = { view: depth.view, format: depth.format, width: depth.width, height: depth.height, sampleCount: depth.sampleCount };
+            bound = {
+                view: depth.view, format: depth.format,
+                width: depth.width, height: depth.height,
+                physW: depth.texture.width, physH: depth.texture.height,
+                sampleCount: depth.sampleCount,
+            };
         }
         if (!bound) return null;
-        if (bound.width === renderW && bound.height === renderH) {
-            return { view: bound.view, format: bound.format, width: bound.width, height: bound.height, substituted: false };
+        // The match that decides this is in PHYSICAL space, not guest space: a surface is
+        // allocated at the scale of the target it was declared against (depthSurfaceScale),
+        // and the pass here may be a different one. A backbuffer-sized depth surface bound
+        // while rendering into an equally-sized guest render target agrees in guest extent
+        // and disagrees in image size — which WebGPU rejects for the whole pass.
+        const scratchW = Math.max(1, Math.round(renderW * physScale));
+        const scratchH = Math.max(1, Math.round(renderH * physScale));
+        if (bound.physW === scratchW && bound.physH === scratchH) {
+            return { view: bound.view, format: bound.format, width: bound.physW, height: bound.physH, substituted: false };
         }
-        const key = `${bound.width}x${bound.height}->${renderW}x${renderH}`;
+        const key = `${bound.width}x${bound.height}(${bound.physW}x${bound.physH})->${renderW}x${renderH}(${scratchW}x${scratchH})`;
         if (!this.depthResizeWarned.has(key)) {
             this.depthResizeWarned.add(key);
             Logger.warn(
                 LogCategory.D3D9,
-                `[D3D9] depth surface ${bound.width}x${bound.height} does not match the ${renderW}x${renderH} render area; ` +
-                "rendering into a scratch depth of the render area (WebGPU requires equal attachment sizes)",
+                `[D3D9] depth surface ${bound.width}x${bound.height} (image ${bound.physW}x${bound.physH}) does not match the `
+                + `${renderW}x${renderH} render area (image ${scratchW}x${scratchH}); `
+                + "rendering into a scratch depth of the render area (WebGPU requires equal attachment sizes)",
             );
         }
         return {
-            view: this.getRtDepthView(renderW, renderH, bound.format, bound.sampleCount),
+            view: this.getRtDepthView(scratchW, scratchH, bound.format, bound.sampleCount),
             format: bound.format,
-            width: renderW,
-            height: renderH,
+            width: scratchW,
+            height: scratchH,
             substituted: true,
         };
+    }
+
+    /** Physical/guest for the target currently bound to slot 0. */
+    private activeRenderScale(): number {
+        return this.currentRtIndex === null ? this.backendExecutor.getBackbufferScale() : 1;
+    }
+
+    /**
+     * The internal scale a depth/stencil surface of this declared extent is allocated at.
+     *
+     * A surface declared at the back buffer's own extent is its companion and must be the
+     * same PHYSICAL image size as the supersampled color target, or WebGPU rejects the pass.
+     * That is invisible to the app: D3D9 depth formats are not lockable and we never read one
+     * back. Any other extent belongs to a guest render target, which is always 1:1.
+     *
+     * The scale therefore follows the DECLARED extent, not the pass. The residual: above
+     * Native, a back-buffer-sized depth surface bound while rendering into an equally-sized
+     * guest render target cannot be that pass's attachment, and resolveDepthAttachment
+     * substitutes a scratch depth — the pass keeps its Z, but not the surface's contents.
+     */
+    private depthSurfaceScale(width: number, height: number): number {
+        const bb = this.backendExecutor.getGuestBackbufferSize();
+        return (width === bb.width && height === bb.height) ? this.backendExecutor.getBackbufferScale() : 1;
     }
 
     /** Dedup for the depth-resize warning, keyed "boundWxH->renderWxH". */
@@ -1690,7 +1879,7 @@ export class D3D9Device {
         this.d3d9MsaaProbe = d3d9MsaaProbe;
 
         this.backendExecutor = new D3D9BackendExecutor(backend);
-        registerBackendQualitySupport("d3d9", ["anisotropy", "forceTrilinear", "msaa"]);
+        registerBackendQualitySupport("d3d9", ["anisotropy", "forceTrilinear", "msaa", "internalScale"]);
         this.pipelineCache = new LruCache<string, number>({
             maxEntries: this.pipelineCacheMaxSize,
             canEvict: (key) => key !== this.currentPipelineKey,
@@ -1877,19 +2066,21 @@ export class D3D9Device {
 
     /**
      * Establish the backbuffer size from present params at CreateDevice time.
-     * The D3D9 backbuffer is the single source of truth for resolution: the host
-     * canvas, the viewport, and the XYZRHW->NDC divisor (vs_main) must all agree.
-     * Without this the device kept its 800x600 default while the canvas/display
-     * was sized by a separate path (DDraw / ChangeDisplaySettings), so 2D quads
-     * were divided by 800x600 then stretched into a mismatched canvas (squish).
+     * The D3D9 backbuffer defines the GUEST's logical space: the viewport, the scissor box,
+     * the XYZRHW->NDC divisor (vs_main) and every readback extent are expressed in it. The
+     * host canvas is a separate space and only decides how many physical samples that logical
+     * frame is rendered with (internal-resolution.ts).
      * BackBufferWidth/Height of 0 means "use focus-window client area" (windowed)
      * in real D3D9 — only override host/viewport when an explicit size was given.
      */
-    setBackBufferSize(width: number, height: number, fullscreen = false): void {
+    setBackBufferSize(width: number, height: number, fullscreen = false, hwnd = 0): void {
+        this.deviceWindowHwnd = hwnd >>> 0;
+        this.deviceIsWindowed = !fullscreen;
         if (width > 0 && height > 0) {
             // Only a fullscreen device's backbuffer IS the display mode; a windowed one is a
             // size inside the desktop and must not be published as SM_CXSCREEN.
             System.getInstance().requestHostResize(width, height, { modeSet: fullscreen });
+            this.backendExecutor.setGuestBackbufferSize(width, height);
             this.viewport = { x: 0, y: 0, width, height, minZ: 0, maxZ: 1 };
         }
     }
@@ -5325,6 +5516,7 @@ export class D3D9Device {
         const params = (this.ffpParams ??= makeFfpParams());
         params.viewportW = vpW;
         params.viewportH = vpH;
+        params.renderScale = this.activeRenderScale();
         params.mvp = paletteBlend
             ? multiplyD3dMatrices(this.stateTracker.getViewMatrix(), this.stateTracker.getProjectionMatrix())
             : this.stateTracker.getMVP();
@@ -5433,6 +5625,39 @@ export class D3D9Device {
      *  per-frame path, so neither the array nor the rect is reallocated. */
     private readonly clearRegionRect = { left: 0, top: 0, right: 0, bottom: 0 };
     private readonly clearRegionRects = [this.clearRegionRect];
+    /** Scratch for the guest→physical conversion below; consumed before the next iteration. */
+    private readonly scaledClearRect = { left: 0, top: 0, right: 0, bottom: 0 };
+
+    /** Record a depth rect clear in both spaces for the renderSpace verb — the only place a
+     *  clear that covered a fraction of its attachment can be SEEN. */
+    private noteDepthClearSpace(
+        rect: { left: number; top: number; right: number; bottom: number },
+        scale: number, attachW: number, attachH: number,
+    ): void {
+        const p = this.scaleGuestRect(rect, scale);
+        const physical = { left: p.left, top: p.top, right: p.right, bottom: p.bottom };
+        this.lastDepthClearSpace = {
+            guest: { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom },
+            physical,
+            attachment: { width: attachW, height: attachH },
+            coversAttachment: physical.left <= 0 && physical.top <= 0
+                && physical.right >= attachW && physical.bottom >= attachH,
+        };
+    }
+
+    /** A guest-space rect in the PHYSICAL coordinates of an attachment rendered at `scale`. */
+    private scaleGuestRect(
+        rect: { left: number; top: number; right: number; bottom: number },
+        scale: number,
+    ): { left: number; top: number; right: number; bottom: number } {
+        if (scale === 1) return rect;
+        const out = this.scaledClearRect;
+        out.left = Math.round(rect.left * scale);
+        out.top = Math.round(rect.top * scale);
+        out.right = Math.round(rect.right * scale);
+        out.bottom = Math.round(rect.bottom * scale);
+        return out;
+    }
 
     /** Apply a D3D9 rectangle-list Clear without disturbing pixels outside the requested
      * attachment. Color uses a solid-fill pass; depth/stencil uses an attachment-only
@@ -5501,6 +5726,7 @@ export class D3D9Device {
         }
         if (ok && (clearPolicy.depth || clearPolicy.stencil)) {
             const size = this.getCurrentTargetSize();
+            let backbufferDepthHandled = false;
             let attachment: {
                 view: GPUTextureView;
                 format: GPUTextureFormat;
@@ -5508,10 +5734,14 @@ export class D3D9Device {
                 height: number;
             } | null = null;
             let attachmentSamples = 1;
+            // The rects arrive in GUEST coordinates; every attachment below is that target's
+            // PHYSICAL image, so the rect is scaled by whatever scale the attachment carries.
+            let rectScale = 1;
             if (this.depthTextureIndex !== null || this.activeStandaloneDepthSurface !== null) {
                 // Same resolution as the render pass, so a partial clear lands on the very
                 // attachment the following draws render into.
-                const resolved = this.resolveDepthAttachment(size.w, size.h);
+                rectScale = this.activeRenderScale();
+                const resolved = this.resolveDepthAttachment(size.w, size.h, rectScale);
                 if (resolved) {
                     attachment = {
                         view: resolved.view,
@@ -5529,18 +5759,31 @@ export class D3D9Device {
                     height: size.h,
                 };
             } else {
-                const backbufferDepth = this.backendExecutor.getBackbufferDepthAttachment();
-                attachment = backbufferDepth;
-                attachmentSamples = backbufferDepth?.sampleCount ?? 1;
+                // The implicit back buffer's depth image is PHYSICAL (guest extent x internal
+                // scale), so its rect clear takes the guest rect through the executor rather
+                // than an attachment the device would address in the wrong space.
+                const physical = this.backendExecutor.getPhysicalBackbufferSize();
+                for (const rect of rects) {
+                    this.noteDepthClearSpace(rect, this.backendExecutor.getBackbufferScale(),
+                        physical.width, physical.height);
+                    if (!this.backendExecutor.clearBackbufferDepthStencilRect(rect, z, stencil, flags)) {
+                        ok = false;
+                        break;
+                    }
+                }
+                attachment = null;
+                backbufferDepthHandled = true;
             }
-            if (!attachment) ok = false;
+            if (!attachment) ok = ok && backbufferDepthHandled;
             else {
                 // Each helper has its own ordered queue submission. submitFrame(false) above
                 // flushed all preceding draws, so a later draw is naturally after this clear.
                 for (const rect of rects) {
+                    this.noteDepthClearSpace(rect, rectScale, attachment.width, attachment.height);
                     if (!this.backendExecutor.clearDepthStencilRect(
                         attachment.view, attachment.format, attachment.width, attachment.height,
-                        rect, z, stencil, flags, attachmentSamples,
+                        this.scaleGuestRect(rect, rectScale), z, stencil, flags,
+                        attachmentSamples,
                     )) {
                         ok = false;
                         break;
@@ -5587,6 +5830,8 @@ export class D3D9Device {
         // Only a FULLSCREEN device sets the display mode. A windowed device's backbuffer is a
         // size inside the desktop; publishing it would make SM_CXSCREEN report the window.
         System.getInstance().requestHostResize(width, height, { modeSet: windowed === 0 });
+        this.deviceIsWindowed = windowed !== 0;
+        this.backendExecutor.setGuestBackbufferSize(width, height);
         this.viewport = { x: 0, y: 0, width, height, minZ: 0, maxZ: 1 };
         this.endScene();
         return 0; // D3D_OK
@@ -6112,11 +6357,17 @@ export class D3D9Device {
     /** Growable scratch for expanded point-sprite quad bytes (6 verts/point). */
     private psScratch: Uint8Array | null = null;
 
-    /** Effective render-target size the RHW FFP shader maps against (u.viewport). */
+    /**
+     * Effective render-target size the RHW FFP shader maps against (u.viewport).
+     *
+     * GUEST-SPACE, always: a guest render target is its own declared extent, and the implicit
+     * back buffer is the extent the guest asked for — never the host canvas, which is sized by
+     * the host container and only decides how many physical samples that logical frame gets.
+     */
     private getCurrentTargetSize(): { w: number; h: number } {
         const rt = this.currentRtIndex;
         if (rt !== null) return { w: this.textures.getWidth(rt), h: this.textures.getHeight(rt) };
-        const s = this.backendExecutor.getCanvasSize();
+        const s = this.backendExecutor.getGuestBackbufferSize();
         return { w: s.width, h: s.height };
     }
 
@@ -8253,7 +8504,7 @@ export class D3D9Device {
      */
     colorFillSurface(texturePtr: number, rect: { left: number; top: number; right: number; bottom: number } | null, color: number): boolean {
         if ((texturePtr >>> 0) === 0) {
-            const size = this.backendExecutor.getCanvasSize();
+            const size = this.backendExecutor.getGuestBackbufferSize();
             if (size.width <= 0 || size.height <= 0) return false;
             const effectiveRect = rect ?? { left: 0, top: 0, right: size.width, bottom: size.height };
             // Flush preceding draws before the direct offscreen fill, preserving command order
@@ -8583,7 +8834,7 @@ export class D3D9Device {
             ? {
                 viewportWidth: this.viewport.width || ptSize.w,
                 viewportHeight: this.viewport.height || ptSize.h,
-                pixelCenterOffset: pixelCenterOffsetPx(),
+                pixelCenterOffset: pixelCenterOffsetPx(this.activeRenderScale()),
             }
             : null;
         const programmableClipPlanes = this.getRS(D3DRS_CLIPPLANEENABLE) !== 0 && preTransformed === null;
@@ -9325,7 +9576,7 @@ export class D3D9Device {
             ? {
                 viewportWidth: this.viewport.width || ptSize.w,
                 viewportHeight: this.viewport.height || ptSize.h,
-                pixelCenterOffset: pixelCenterOffsetPx(),
+                pixelCenterOffset: pixelCenterOffsetPx(this.activeRenderScale()),
             }
             : null;
         const programmableClipPlanes = this.getRS(D3DRS_CLIPPLANEENABLE) !== 0 && preTransformed === null;
@@ -10086,7 +10337,8 @@ export class D3D9Device {
         const index = frame.drawStateCount;
         const state = frame.nextDrawState(vsLen, psLen);
 
-        const { dx, dy } = pixelCenterClipOffset(this.viewport.width, this.viewport.height);
+        const { dx, dy } = pixelCenterClipOffset(this.viewport.width, this.viewport.height,
+            this.activeRenderScale());
         // Only the hidden tail needs zeroing: the c# prefix below is overwritten wholesale by
         // the bank copy, and this slot is reused for every draw in the frame — clearing the
         // whole block first meant writing the constant bank twice on every draw.
@@ -10533,6 +10785,10 @@ export class D3D9Device {
             return;
         }
 
+        // Settle the backbuffer's physical extent BEFORE any attachment is sized from it: a
+        // host resize mid-frame would otherwise pair a depth image built at the old scale
+        // with a colour attachment at the new one, and WebGPU drops the whole pass.
+        this.backendExecutor.ensureBackbufferTarget();
         this.frameCount++;
         const frame = this.commandRecorder.finalize();
         // Read-only, default-OFF eligibility census. This is the one lifecycle point where
@@ -10566,7 +10822,7 @@ export class D3D9Device {
             this.rtSetsThisFrame = 0;
             this.rtNonBackThisFrame = 0;
         }
-        const size = this.backendExecutor.getCanvasSize();
+        const size = this.backendExecutor.getGuestBackbufferSize();
         // When a render target is active, the pass renders into that texture (its own size +
         // depth) instead of the swap-chain offscreen, and never composites overlays / presents.
         let target: {
@@ -10671,7 +10927,7 @@ export class D3D9Device {
                     return;
                 }
             }
-            const depthAttachment = this.resolveDepthAttachment(vpW, vpH);
+            const depthAttachment = this.resolveDepthAttachment(vpW, vpH, rt0 === null ? this.backendExecutor.getBackbufferScale() : 1);
             target = {
                 colorViews,
                 colorFormats: formats,
@@ -10691,7 +10947,7 @@ export class D3D9Device {
             target = {
                 colorViews: [null],
                 colorFormats: this.activeColorTargetFormats() ?? [this.backend.getFormat()!],
-                depthView: this.resolveDepthAttachment(vpW, vpH)?.view,
+                depthView: this.resolveDepthAttachment(vpW, vpH, this.backendExecutor.getBackbufferScale())?.view,
                 depthFormat: this.activeDepthTargetFormat(),
                 stencilReference: this.getRS(D3DRS_STENCILREF) & 0xff,
                 backbuffer: true,
@@ -10701,7 +10957,7 @@ export class D3D9Device {
             target = {
                 colorViews: [null],
                 colorFormats: this.activeColorTargetFormats() ?? [this.backend.getFormat()!],
-                depthView: this.resolveDepthAttachment(vpW, vpH)?.view,
+                depthView: this.resolveDepthAttachment(vpW, vpH, this.backendExecutor.getBackbufferScale())?.view,
                 depthFormat: standaloneDepth.format,
                 stencilReference: this.getRS(D3DRS_STENCILREF) & 0xff,
                 backbuffer: true,

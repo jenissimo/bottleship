@@ -208,6 +208,9 @@ export interface FfpLightInput {
 export interface FfpUniformParams {
     viewportW: number;
     viewportH: number;
+    /** Physical samples per guest pixel for the target this draw lands on; the pixel-centre
+     *  offset is half a PHYSICAL pixel and the viewport above is guest-space. */
+    renderScale?: number;
     /** world × view × projection (D3D row-major, as uploaded for the MVP). */
     mvp: Float32Array;
     /** world × view (D3D row-major). */
@@ -289,7 +292,7 @@ export function makeFfpParams(): FfpUniformParams {
         blendMatrices[b] = blendMatrices[b + 5] = blendMatrices[b + 10] = blendMatrices[b + 15] = 1;
     }
     return {
-        viewportW: 0, viewportH: 0,
+        viewportW: 0, viewportH: 0, renderScale: 1,
         mvp: m, worldView: m, normalMatrix: m, view: m, world: m,
         clipPlanes: new Float32Array(24), clipPlaneEnable: 0,
         material: { diffuse: newFfpColor(), ambient: newFfpColor(), specular: newFfpColor(), emissive: newFfpColor(), power: 0 },
@@ -337,8 +340,8 @@ export function packFfpUniforms(out: Float32Array, p: FfpUniformParams): void {
     // viewport.z carries the pixel-centre offset in PIXELS for the pre-transformed branch
     // of the FFP vertex shader; the transformed branch gets the same shift folded into the
     // matrix below. Both come from webgpu/pixel-center.ts — see it for the equivalence.
-    out[OFF_VIEWPORT + 2] = pixelCenterOffsetPx();
-    writeMvpWithPixelCenter(out, OFF_MVP, p.mvp, p.viewportW, p.viewportH);
+    out[OFF_VIEWPORT + 2] = pixelCenterOffsetPx(p.renderScale ?? 1);
+    writeMvpWithPixelCenter(out, OFF_MVP, p.mvp, p.viewportW, p.viewportH, p.renderScale ?? 1);
     out.set(p.worldView.subarray(0, 16), OFF_WORLDVIEW);
 
     const m = p.material;

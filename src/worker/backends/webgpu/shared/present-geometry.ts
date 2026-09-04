@@ -17,6 +17,14 @@ export interface PresentRect { x: number; y: number; w: number; h: number; }
  * The destination rect for a `srcW x srcH` picture inside a `outW x outH` target, or null
  * when the picture covers the whole target (plain stretch — the common case, and the one
  * that must stay allocation- and branch-free).
+ *
+ * `srcW/srcH` are the PRESENTED TEXTURE's extent, which is the guest's own only at
+ * internalScale Native — every backend that supersamples (Glide, D3D9) presents its
+ * physical offscreen. Aspect ratio is unaffected (the scale is uniform), but integer
+ * scaling is: an offscreen already fitted to the canvas floors to 1, so `integerScale`
+ * quietly does nothing above Native. One rule for both backends, deliberately — a second
+ * policy measuring the guest extent here would make the two disagree about where the same
+ * picture lands, and every overlay is placed in this rect.
  */
 export function computePresentDestRect(
     srcW: number, srcH: number, outW: number, outH: number, q: QualityConfig,

@@ -29,6 +29,8 @@ import {
 } from "./multisample";
 import { validateD3D9RasterDrawCommand } from "./raster-emulation";
 import { d3dColorToGpu } from "./d3d9-blend";
+import { resolveInternalScaleFactor } from "../shared/internal-resolution";
+import { EmulatorConfig } from "../../../core/emulator-config-manager";
 
 export interface PipelineInfo {
     pipeline: GPURenderPipeline;
@@ -650,13 +652,32 @@ export class D3D9BackendExecutor {
     private d3d9MsaaSampleCount = 1;
     private d3d9MsaaProbe: D3D9MsaaAdapterProbe | null = null;
     private offscreenSize: { width: number; height: number } | null = null;
+    /**
+     * The guest's own backbuffer extent — the LOGICAL space every guest-visible D3D9 quantity
+     * (viewport, scissor, the XYZRHW divisor, LockRect/GetRenderTargetData extents) lives in.
+     * The offscreen is that extent times ONE uniform internal-scale factor, which is the
+     * PHYSICAL space and is never a coordinate the guest can name. Null until a device
+     * declares a backbuffer size; the canvas then stands in, which is a 1:1 render.
+     */
+    private guestBackbufferSize: { width: number; height: number } | null = null;
+    /** The scale the CURRENTLY ALLOCATED offscreen was created at — always paired with
+     *  `offscreenSize`. Read it through getBackbufferScale(), never directly: one accessor
+     *  is what keeps the allocated image and every guest→physical conversion from drifting. */
+    private offscreenScale = 1;
+    /** Guest-sized resolve of a supersampled offscreen, for readback paths that owe the guest
+     *  exactly BackBufferWidth x BackBufferHeight pixels. */
+    private readbackResolveTexture: GPUTexture | null = null;
+    private readbackResolveView: GPUTextureView | null = null;
     // Snapshot of the last COMPLETE presented frame. The offscreen is rendered incrementally
     // across a game frame's multiple submitFrame() passes (a backbuffer clear flushes to it
     // before the scene is redrawn — e.g. when render-to-texture passes sit between the clear and
     // the scene), so mid-frame the offscreen is transiently black. repaintLastFrame() re-presents
     // THIS snapshot (updated only at actual present) instead of the work-in-progress offscreen, so
     // the canvas never flashes the black intermediate at the RAF rate. See NFSU cube-reflection flicker.
+    // It is the GUEST's frame, PRE-composite: the overlays go onto the canvas, so nothing we
+    // drew over the game can reach a guest readback (readPresentedRgba) through here.
     private presentedTexture: GPUTexture | null = null;
+    private presentedRepaintView: GPUTextureView | null = null;
     private hasPresented = false;
     /** Shared textured-quad copier used by D3D9 StretchRect. */
     private stretchRectPipeline: ColorKeyBlitPipeline | null = null;
@@ -993,7 +1014,10 @@ export class D3D9BackendExecutor {
         this.d3d9MsaaCache = null;
         this.d3d9MsaaTarget = null;
         this.presentedTexture = null;
+        this.presentedRepaintView = null;
         this.hasPresented = false;
+        this.readbackResolveTexture = null;
+        this.readbackResolveView = null;
         // Holds buffers created on the lost device — rebuilt lazily on the next StretchRect.
         this.stretchRectPipeline?.destroy();
         this.stretchRectPipeline = null;
@@ -3475,11 +3499,16 @@ export class D3D9BackendExecutor {
                      depthStencilAttachment,
                      ...(occlusionQuerySet ? { occlusionQuerySet } : {}),
                  });
+            // Guest-space → physical. Only the implicit backbuffer is supersampled; a
+            // guest-created render target is its own guest-sized texture and stays 1:1.
+            const passScale = (!target || target.backbuffer === true) ? this.getBackbufferScale() : 1;
+            // The render area every viewport/scissor in this pass must sit inside. Known only
+            // for the implicit backbuffer — an explicit render target is the guest's own
+            // texture and this encoder never learns its extent.
+            const passArea = (!target || target.colorViews[0] === null) ? this.offscreenSize : null;
             if (viewport && typeof renderPass.setViewport === "function") {
-                renderPass.setViewport(
-                    viewport.x, viewport.y, viewport.width, viewport.height,
-                    viewport.minZ, viewport.maxZ,
-                );
+                this.setScaledViewport(renderPass, viewport.x, viewport.y, viewport.width,
+                    viewport.height, viewport.minZ, viewport.maxZ, passScale, passArea);
             }
             if (hasStencil) renderPass.setStencilReference(target?.stencilReference ?? 0);
 
@@ -3547,7 +3576,9 @@ export class D3D9BackendExecutor {
                 switch (type) {
                     case RenderCommandType.BeginOcclusionQuery: {
                         const id = frame.commandA[i] >>> 0;
-                        if (queryManager) queryManager.beginOcclusion(id, renderPass);
+                        // passScale: the interval counts PHYSICAL samples, and D3D9 owes the
+                        // guest a count in its own pixels.
+                        if (queryManager) queryManager.beginOcclusion(id, renderPass, undefined, passScale);
                         queryIds.push(id);
                         break;
                     }
@@ -3643,16 +3674,18 @@ export class D3D9BackendExecutor {
                     case RenderCommandType.SetViewport: {
                         const base = frame.commandA[i];
                         const v = frame.viewportData;
-                        renderPass.setViewport(v[base], v[base + 1], v[base + 2], v[base + 3], v[base + 4], v[base + 5]);
+                        this.setScaledViewport(renderPass, v[base], v[base + 1], v[base + 2],
+                            v[base + 3], v[base + 4], v[base + 5], passScale, passArea);
                         break;
                     }
 
                     case RenderCommandType.SetScissor: {
-                        renderPass.setScissorRect(
+                        this.setScaledScissor(renderPass,
                             Math.max(0, frame.commandA[i] | 0),
                             Math.max(0, frame.commandB[i] | 0),
                             Math.max(0, frame.commandC[i] | 0),
                             Math.max(0, frame.commandD[i] | 0),
+                            passScale, passArea,
                         );
                         break;
                     }
@@ -4094,66 +4127,14 @@ export class D3D9BackendExecutor {
                 );
             }
 
-            // Composite overlays on top of the main scene: video plane first, then GDI.
-            // (Swap-chain path only — RT passes never composite overlays or present.)
             const rendersToBackbuffer = !target || target.backbuffer === true;
-            // This presenter copies its frame onto the canvas 1:1, so its picture IS the whole
-            // canvas. It has to say so before compositing: the overlays below place themselves
-            // in the published content rect, and a presenter that does not scale must not
-            // inherit the letterbox of whichever one ran before it.
-            if (present && rendersToBackbuffer) this.backend.publishFullCanvasPresentRect();
-            if (present && rendersToBackbuffer && overlays?.videoOverlayCanvas) {
-                this.backend.blit(overlays.videoOverlayCanvas, this.offscreenView!, encoder);
-            }
-            if (present && rendersToBackbuffer && overlays?.gdiOverlayCanvas) {
-                const rects = overlays.gdiOverlayRects;
-                if (rects) {
-                    // 3D renderer owns the screen: composite only live-dialog rects (never the
-                    // whole overlay). An empty list intentionally composites nothing.
-                    if (rects.length) this.backend.blitRects(overlays.gdiOverlayCanvas, this.offscreenView!, encoder, rects);
-                } else {
-                    this.backend.blit(overlays.gdiOverlayCanvas, this.offscreenView!, encoder);
-                }
-            }
 
             // Copy to canvas if presenting
             if (present && rendersToBackbuffer) {
-                const context = this.backend.getContext()!;
-                const currentTexture = context.getCurrentTexture();
-                const size = this.getCanvasSize();
-
-                // Stats overlay — composite onto the OFFSCREEN texture (before the canvas copy),
-                // exactly like the video/GDI overlays above. The GDI present loop re-presents the
-                // offscreen via repaintLastFrame() between actual presents; if we drew the overlay
-                // straight onto the canvas it would only appear on real presents and vanish on every
-                // repaint → visible flicker. Baking it into the offscreen makes it persist on both.
-                if (statsOverlay.isEnabled()) {
-                    const statsCanvas = statsOverlay.getCanvas();
-                    if (statsCanvas) {
-                        if (statsOverlay.isDirty()) {
-                            this.backend.updateStatsTexture(statsCanvas);
-                            statsOverlay.clearDirty();
-                        }
-                        this.backend.renderStatsOverlay(this.offscreenView!, encoder);
-                    }
-                }
-
-                // The canvas can be resized (async from the main thread) AFTER
-                // ensureOffscreenTarget sized the offscreen this frame, so copy at most
-                // what both textures hold — else copyTextureToTexture throws "touches
-                // outside" and the present (and guest) dies on a resolution change.
+                // Snapshot this COMPLETE frame BEFORE it reaches the canvas, so repaintLastFrame
+                // re-presents it (not the work-in-progress offscreen, which is transiently black
+                // mid-frame) through the very same present path.
                 const off = this.offscreenTexture!;
-                encoder.copyTextureToTexture(
-                    { texture: off },
-                    { texture: currentTexture },
-                    {
-                        width: Math.min(off.width, currentTexture.width),
-                        height: Math.min(off.height, currentTexture.height),
-                        depthOrArrayLayers: 1,
-                    }
-                );
-                // Snapshot this COMPLETE frame so repaintLastFrame re-presents it (not the
-                // work-in-progress offscreen, which is transiently black mid-frame).
                 if (this.presentedTexture) {
                     encoder.copyTextureToTexture(
                         { texture: off },
@@ -4166,6 +4147,7 @@ export class D3D9BackendExecutor {
                     );
                     this.hasPresented = true;
                 }
+                this.presentToCanvas(this.offscreenView!, off.width, off.height, encoder, overlays);
 
                 // The single offscreen texture otherwise has COPY semantics. DISCARD
                 // must not feed the previous presented image into the next frame.
@@ -4246,9 +4228,81 @@ export class D3D9BackendExecutor {
     }
 
     /**
+     * The ONE route from the physical backbuffer image to the canvas, shared by present and
+     * repaint so the two can never scale the same frame differently.
+     *
+     * It goes through PostFxChain (drawTexture opaque + `present:{…}`), which is what gives
+     * D3D9 gamma, colour grade, FXAA and — because src and out are genuinely different sizes —
+     * aspectMode/integerScale. The overlays follow it onto the CANVAS: they are guest-space
+     * planes placed in the published content rect, and blit/blitRects measure that rect
+     * against the canvas, not against a supersampled offscreen.
+     */
+    private presentToCanvas(
+        sourceView: GPUTextureView,
+        srcW: number,
+        srcH: number,
+        encoder: GPUCommandEncoder,
+        overlays?: {
+            videoOverlayCanvas?: OffscreenCanvas | null;
+            gdiOverlayCanvas?: OffscreenCanvas | null;
+            gdiOverlayRects?: Array<{ x: number; y: number; w: number; h: number }>;
+        },
+    ): void {
+        const context = this.backend.getContext();
+        if (!context) return;
+        const currentTexture = context.getCurrentTexture();
+        const targetView = currentTexture.createView();
+        this.backend.drawTexture(
+            sourceView,
+            targetView,
+            encoder,
+            true,
+            undefined,
+            undefined,
+            { r: 0, g: 0, b: 0, a: 1 },
+            undefined,
+            {
+                srcW, srcH,
+                outW: currentTexture.width, outH: currentTexture.height,
+                toCanvas: true,
+            },
+        );
+
+        // Video plane first, then GDI: a live dialog sits above a movie.
+        if (overlays?.videoOverlayCanvas) {
+            this.backend.blit(overlays.videoOverlayCanvas, targetView, encoder);
+        }
+        if (overlays?.gdiOverlayCanvas) {
+            const rects = overlays.gdiOverlayRects;
+            if (rects) {
+                // 3D renderer owns the screen: composite only live-dialog rects (never the
+                // whole overlay). An empty list intentionally composites nothing.
+                if (rects.length) this.backend.blitRects(overlays.gdiOverlayCanvas, targetView, encoder, rects);
+            } else {
+                this.backend.blit(overlays.gdiOverlayCanvas, targetView, encoder);
+            }
+        }
+
+        if (statsOverlay.isEnabled()) {
+            const statsCanvas = statsOverlay.getCanvas();
+            if (statsCanvas) {
+                if (statsOverlay.isDirty()) {
+                    this.backend.updateStatsTexture(statsCanvas);
+                    statsOverlay.clearDirty();
+                }
+                this.backend.renderStatsOverlay(targetView, encoder);
+            }
+        }
+    }
+
+    /**
      * Re-present the last rendered offscreen frame to the canvas without re-rendering.
      * Used by the GDI present loop when a hardware-3D presenter owns the screen: the
      * device presents at low fps, so the canvas would otherwise go black between presents.
+     *
+     * No guest overlays: the video plane and the live dialog rects are re-composited by that
+     * same loop straight after this call. The stats overlay is not, so presentToCanvas draws
+     * it on every route.
      */
     repaintLastFrame(): void {
         // Re-present the last COMPLETE frame, not the live offscreen (which is transiently black
@@ -4260,28 +4314,83 @@ export class D3D9BackendExecutor {
         const device = this.backend.getDevice();
         const context = this.backend.getContext();
         if (!device || !context) return;
-        const dest = context.getCurrentTexture();
+        this.presentedRepaintView ??= source.createView();
         const encoder = device.createCommandEncoder();
-        // Clamp to both textures — the canvas may have resized since `source` was
-        // captured (resolution change), and an oversized copy throws "touches outside".
-        encoder.copyTextureToTexture(
-            { texture: source },
-            { texture: dest },
-            {
-                width: Math.min(source.width, dest.width),
-                height: Math.min(source.height, dest.height),
-                depthOrArrayLayers: 1,
-            },
-        );
+        this.presentToCanvas(this.presentedRepaintView, source.width, source.height, encoder);
         device.queue.submit([encoder.finish()]);
         this.noteQuerySubmission();
     }
 
     /**
-     * Read the last completed presented image as tightly packed RGBA8 pixels.
+     * Downsample a supersampled backbuffer image to the guest's own extent, or null when the
+     * two already agree (internalScale Native, or no declared guest size) and the caller
+     * should read the source directly.
+     *
+     * The same textured-quad copier StretchRect uses, with linear filtering: that IS the
+     * resolve for a supersampled target, exactly as multisample.ts resolves a multisampled
+     * one, and it keeps one scaling blit in the backend instead of a second implementation.
+     */
+    private resolveToGuestSize(source: GPUTexture): GPUTexture | null {
+        const guest = this.getGuestBackbufferSize();
+        if (source.width === guest.width && source.height === guest.height) return null;
+        const device = this.backend.getDevice();
+        const queue = this.backend.getQueue();
+        const format = this.backend.getFormat();
+        if (!device || !queue || !format || guest.width <= 0 || guest.height <= 0) return null;
+
+        if (!this.readbackResolveTexture
+            || this.readbackResolveTexture.width !== guest.width
+            || this.readbackResolveTexture.height !== guest.height) {
+            this.readbackResolveTexture?.destroy();
+            this.readbackResolveTexture = device.createTexture({
+                size: { width: guest.width, height: guest.height, depthOrArrayLayers: 1 },
+                format,
+                usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
+                    | GPUTextureUsage.COPY_SRC,
+            });
+            this.readbackResolveView = this.readbackResolveTexture.createView();
+        }
+        this.stretchRectPipeline ??= new ColorKeyBlitPipeline(device, queue);
+        const zero = { r: 0, g: 0, b: 0, a: 0 };
+        const encoder = device.createCommandEncoder();
+        this.stretchRectPipeline.blit(encoder, {
+            srcView: source.createView(),
+            srcWidth: source.width,
+            srcHeight: source.height,
+            dstView: this.readbackResolveView!,
+            dstFormat: format,
+            dstWidth: guest.width,
+            dstHeight: guest.height,
+            srcRect: { left: 0, top: 0, right: source.width, bottom: source.height },
+            dstRect: { left: 0, top: 0, right: guest.width, bottom: guest.height },
+            colorKeyLow: zero,
+            colorKeyHigh: zero,
+            enableColorKey: false,
+            filter: "linear",
+        });
+        queue.submit([encoder.finish()]);
+        this.noteQuerySubmission();
+        return this.readbackResolveTexture;
+    }
+
+    /**
+     * Read the last completed presented image as tightly packed RGBA8 pixels, at the GUEST's
+     * own backbuffer extent.
+     *
      * Refuses instead of answering when no complete frame exists yet: with a DISCARD swap
      * chain the live offscreen is deliberately cleared after every present, so reading it
      * hands back a plausible black image that no caller can tell from a black game.
+     *
+     * This is the GUEST's frame, not the screen: the video plane, the live GDI dialog rects
+     * and the stats overlay are composited onto the CANVAS and are deliberately absent here,
+     * so nothing we drew over the game can enter guest memory or a guest-space capture. A
+     * screenshot of the screen is a different question with a different answer — the canvas
+     * mirror (RenderService.captureScreen, harness `shot`).
+     *
+     * Above internalScale Native the resolve is a linear DOWNSAMPLE (and Auto is a fractional
+     * factor, so even a configuration that looks 1:1 resamples): the guest cannot read back
+     * exactly the bytes it drew, and a title that reads the back buffer and re-uploads it
+     * accumulates that filtering.
      */
     async readPresentedRgba(
         opts?: { live?: boolean },
@@ -4296,16 +4405,20 @@ export class D3D9BackendExecutor {
         // has not presented yet, so answering with the last presented image is one frame
         // stale — invisible while consecutive frames are identical, and wrong the moment one
         // differs.
-        const captureSrc = opts?.live
+        const physicalSrc = opts?.live
             ? this.offscreenTexture
             : ((this.hasPresented && this.presentedTexture) ? this.presentedTexture : this.offscreenTexture);
-        if (!captureSrc) {
+        if (!physicalSrc) {
             throw new Error("d3d9 presenter has no frame to capture — nothing has been rendered yet");
         }
         if (!this.hasPresented && !opts?.live) {
             throw new Error("d3d9 presenter has not completed a frame yet — the live offscreen is"
                 + " cleared after a DISCARD present, so it would read black whatever the game drew");
         }
+        // Every reader of the back buffer — LockRect, GetRenderTargetData, GetFrontBufferData,
+        // a screenshot of the guest's frame — is owed BackBufferWidth x BackBufferHeight
+        // pixels of what the guest drew, so a supersampled image is resolved back down first.
+        const captureSrc = this.resolveToGuestSize(physicalSrc) ?? physicalSrc;
         // The SOURCE's extent, not the canvas's: a resize between the last present and this
         // readback leaves the two disagreeing, and a mismatched copyTextureToBuffer is a
         // WebGPU validation error — which never throws, it just leaves the buffer zeroed.
@@ -4412,12 +4525,121 @@ export class D3D9BackendExecutor {
     }
 
     /**
-     * Get the canvas size
+     * The host canvas backing size. PRESENT-PATH ONLY (and the internal-scale resolver that
+     * decides how many physical pixels the guest frame gets): it is sized by the host
+     * container, so deriving a guest-space quantity from it conflates two coordinate spaces.
+     * PRIVATE on purpose: a public accessor here is a laundering route for a caller outside
+     * the ownership census (tools/validate-render-space-ownership.ts), which cannot see
+     * through a method call.
      */
-    getCanvasSize(): { width: number; height: number } {
+    private getCanvasSize(): { width: number; height: number } {
         const context = this.backend.getContext()!;
         const canvas = context.canvas as OffscreenCanvas;
         return { width: canvas.width, height: canvas.height };
+    }
+
+    /** Declare the guest's backbuffer extent (CreateDevice / Reset present parameters). */
+    setGuestBackbufferSize(width: number, height: number): void {
+        if (width <= 0 || height <= 0) return;
+        if (this.guestBackbufferSize
+            && this.guestBackbufferSize.width === width
+            && this.guestBackbufferSize.height === height) {
+            return;
+        }
+        this.guestBackbufferSize = { width, height };
+    }
+
+    /** The guest logical backbuffer extent. Falls back to the canvas for a device that never
+     *  declared one (D3D9 windowed zero-size params), which renders 1:1 as it always did. */
+    getGuestBackbufferSize(): { width: number; height: number } {
+        return this.guestBackbufferSize ?? this.getCanvasSize();
+    }
+
+    /** The offscreen extent the implicit backbuffer is actually rasterized at. */
+    getPhysicalBackbufferSize(): { width: number; height: number } {
+        if (this.offscreenSize) return this.offscreenSize;
+        const device = this.backend.getDevice();
+        if (!device) return this.getGuestBackbufferSize();
+        const extent = this.resolveOffscreenExtent(device);
+        return { width: extent.width, height: extent.height };
+    }
+
+    /**
+     * Physical/guest for the implicit backbuffer; 1 for every guest-created render target.
+     * The ONE accessor for that scalar — viewport/scissor/rect scaling and every depth
+     * surface allocated to match the colour attachment all read it here.
+     *
+     * While an offscreen is allocated it IS that texture's scale; a re-resolve would answer
+     * for an extent nothing renders into yet. Before the first one it is resolved, so a depth
+     * surface the guest binds ahead of the first backbuffer pass is not allocated against a
+     * stale 1x and left unable to match the colour attachment it will be paired with.
+     */
+    getBackbufferScale(): number {
+        if (this.offscreenSize) return this.offscreenScale;
+        const device = this.backend.getDevice();
+        if (!device) return this.offscreenScale;
+        return this.resolveOffscreenExtent(device).scale;
+    }
+
+    /**
+     * A guest-space viewport applied to the pass, in the pass's PHYSICAL coordinates.
+     *
+     * `area` is the render area it must sit inside, and clamping is unconditional when it is
+     * known — not only when supersampling. The extent is a ROUNDED guest*scale, so guest*scale
+     * can land a fraction past it; and a HOST RESIZE between the frame's recording and its
+     * encode leaves a viewport/scissor recorded for the previous extent. Either one outside
+     * its attachment invalidates the whole command buffer rather than clipping, which drops
+     * the frame with nothing but a gpuErrors entry to show for it.
+     */
+    private setScaledViewport(
+        pass: GPURenderPassEncoder,
+        x: number, y: number, w: number, h: number, minZ: number, maxZ: number,
+        scale: number, area: { width: number; height: number } | null,
+    ): void {
+        if (!area) {
+            pass.setViewport(x * scale, y * scale, w * scale, h * scale, minZ, maxZ);
+            return;
+        }
+        const tw = area.width, th = area.height;
+        const sx = Math.min(Math.max(0, x * scale), tw);
+        const sy = Math.min(Math.max(0, y * scale), th);
+        pass.setViewport(sx, sy,
+            Math.max(0, Math.min(w * scale, tw - sx)),
+            Math.max(0, Math.min(h * scale, th - sy)),
+            minZ, maxZ);
+    }
+
+    /** As setScaledViewport, for the guest's scissor box (integer coordinates). */
+    private setScaledScissor(
+        pass: GPURenderPassEncoder,
+        x: number, y: number, w: number, h: number,
+        scale: number, area: { width: number; height: number } | null,
+    ): void {
+        if (!area) {
+            pass.setScissorRect(Math.round(x * scale), Math.round(y * scale),
+                Math.round(w * scale), Math.round(h * scale));
+            return;
+        }
+        const tw = area.width, th = area.height;
+        const sx = Math.min(Math.max(0, Math.round(x * scale)), tw);
+        const sy = Math.min(Math.max(0, Math.round(y * scale)), th);
+        pass.setScissorRect(sx, sy,
+            Math.max(0, Math.min(Math.round(w * scale), tw - sx)),
+            Math.max(0, Math.min(Math.round(h * scale), th - sy)));
+    }
+
+    /** A guest-space rect on the implicit backbuffer, in physical offscreen pixels. */
+    private scaleBackbufferRect(
+        rect: { left: number; top: number; right: number; bottom: number },
+    ): { left: number; top: number; right: number; bottom: number } {
+        const s = this.getBackbufferScale();
+        if (s === 1) return rect;
+        return {
+            left: Math.round(rect.left * s),
+            top: Math.round(rect.top * s),
+            right: Math.round(rect.right * s),
+            bottom: Math.round(rect.bottom * s),
+        };
     }
 
     /**
@@ -4449,6 +4671,10 @@ export class D3D9BackendExecutor {
             width: this.offscreenSize!.width,
             height: this.offscreenSize!.height,
         };
+        // The rects are GUEST coordinates on both endpoints; only an implicit-backbuffer
+        // endpoint is a physical image the guest cannot name.
+        if (!src) srcRect = this.scaleBackbufferRect(srcRect);
+        if (!dst) dstRect = this.scaleBackbufferRect(dstRect);
 
         if (!this.stretchRectPipeline) {
             this.stretchRectPipeline = new ColorKeyBlitPipeline(device, queue);
@@ -4560,19 +4786,36 @@ struct VsOut { @builtin(position) position: vec4<f32> };
         const size = this.offscreenSize;
         const format = this.backend.getFormat();
         if (!this.offscreenView || !size || !format) return false;
+        // The caller names a rect on the GUEST backbuffer; the attachment is its physical image.
+        const physical = this.scaleBackbufferRect(rect);
         this.ensureD3d9MsaaTarget();
         const msaa = this.d3d9MsaaTarget;
         if (msaa) {
             return this.colorFillRect(msaa.colorView, msaa.colorFormat, msaa.width, msaa.height,
-                rect, color, msaa.sampleCount);
+                physical, color, msaa.sampleCount);
         }
-        return this.colorFillRect(this.offscreenView, format, size.width, size.height, rect, color);
+        return this.colorFillRect(this.offscreenView, format, size.width, size.height, physical, color);
+    }
+
+    /** Depth/stencil rectangle clear on the implicit backbuffer, in GUEST coordinates. */
+    clearBackbufferDepthStencilRect(
+        rect: { left: number; top: number; right: number; bottom: number },
+        depth: number,
+        stencil: number,
+        flags: number,
+    ): boolean {
+        const attachment = this.getBackbufferDepthAttachment();
+        if (!attachment) return false;
+        return this.clearDepthStencilRect(
+            attachment.view, attachment.format, attachment.width, attachment.height,
+            this.scaleBackbufferRect(rect), depth, stencil, flags, attachment.sampleCount,
+        );
     }
 
     /** Depth attachment paired with the implicit backbuffer, and the sample count a
      *  rectangle-clear pipeline must be built at. Under backbuffer MSAA that is the
      *  multisample depth image the frame's passes actually use. */
-    getBackbufferDepthAttachment(): {
+    private getBackbufferDepthAttachment(): {
         view: GPUTextureView;
         format: GPUTextureFormat;
         width: number;
@@ -4730,10 +4973,51 @@ struct VsOut { @builtin(position) position: vec4<f32> };
         return true;
     }
 
+    /**
+     * The PHYSICAL extent the implicit backbuffer renders at: the guest's own extent times one
+     * uniform internal-scale factor, clamped to what the device can allocate. Never a fit of
+     * the canvas per axis — see internal-resolution.ts for why the scalar is single.
+     */
+    private resolveOffscreenExtent(device: GPUDevice): { width: number; height: number; scale: number } {
+        const guest = this.getGuestBackbufferSize();
+        const canvas = this.getCanvasSize();
+        const gw = Math.max(1, guest.width | 0);
+        const gh = Math.max(1, guest.height | 0);
+        let scale = resolveInternalScaleFactor(
+            EmulatorConfig.getInstance().quality.internalScale, gw, gh, canvas.width, canvas.height,
+        );
+        const maxDim = device.limits.maxTextureDimension2D;
+        // A high guest mode times the factor can exceed the device limit; texture creation
+        // would throw and take the whole frame with it.
+        scale = Math.max(1, Math.min(scale, maxDim / gw, maxDim / gh));
+        return {
+            width: Math.max(1, Math.min(maxDim, Math.round(gw * scale))),
+            height: Math.max(1, Math.min(maxDim, Math.round(gh * scale))),
+            scale,
+        };
+    }
+
+    /**
+     * Settle the backbuffer's PHYSICAL extent for this frame before anything derives from it.
+     *
+     * The device sizes its depth attachments from getBackbufferScale() while building the
+     * pass, and the offscreen is (re)allocated later, inside executeFrame. A host resize
+     * between the two leaves a depth image built for the previous extent paired with a colour
+     * attachment of the new one — WebGPU then rejects the whole pass, which drops the frame
+     * and reports nothing but a gpuErrors entry. Resolving once, first, is what makes the one
+     * scalar stable for the frame that reads it.
+     */
+    ensureBackbufferTarget(): void {
+        if (!this.backend.getDevice() || !this.backend.getFormat()) return;
+        this.ensureOffscreenTarget();
+    }
+
     private ensureOffscreenTarget(): void {
         const device = this.backend.getDevice()!;
         const format = this.backend.getFormat()!;
-        const size = this.getCanvasSize();
+        const extent = this.resolveOffscreenExtent(device);
+        const size = { width: extent.width, height: extent.height };
+        this.offscreenScale = extent.scale;
 
         if (this.offscreenTexture &&
             this.offscreenSize &&
@@ -4763,14 +5047,20 @@ struct VsOut { @builtin(position) position: vec4<f32> };
             ? this.offscreenTexture.createView({ format: srgbFormat })
             : null;
 
-        // Last-complete-frame snapshot for repaintLastFrame (see field comment).
+        // Last-complete-frame snapshot for repaintLastFrame (see field comment). TEXTURE_BINDING
+        // because a repaint presents it through the same post-fx pass a real present uses.
         this.presentedTexture?.destroy();
         this.presentedTexture = device.createTexture({
             size: { width: size.width, height: size.height, depthOrArrayLayers: 1 },
             format,
-            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST,
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
+                | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST,
         });
         this.hasPresented = false;
+        this.presentedRepaintView = null;
+        this.readbackResolveTexture?.destroy();
+        this.readbackResolveTexture = null;
+        this.readbackResolveView = null;
 
         this.depthTexture = device.createTexture({
             size: { width: size.width, height: size.height, depthOrArrayLayers: 1 },

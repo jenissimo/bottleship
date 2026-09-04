@@ -10,7 +10,7 @@ import { setD3D9FloatCapabilityContract } from "./shared/float-format-policy";
 import { setD3D9VolumeCapabilityContract } from "./shared/volume-policy";
 import { setD3D9MsaaCapabilityContract } from "./d3d9/multisample";
 import { setD3D9WebGpuCapabilityLimits } from "./shared/webgpu-capability-limits";
-import { coversTarget, overlayDestRect, publishComputedPresentRect, publishPresentRect } from "./shared/present-geometry";
+import { coversTarget, overlayDestRect, publishComputedPresentRect } from "./shared/present-geometry";
 
 /** Backoff between requestDevice attempts while recovering, in ms. The list also fixes how
  *  many attempts there are: a GPU that has not come back by ~4s is gone, and retrying past
@@ -664,17 +664,6 @@ export class WebGPUBackend implements RenderBackend {
         this.canvasSize.width = canvas?.width ?? 0;
         this.canvasSize.height = canvas?.height ?? 0;
         return this.canvasSize;
-    }
-
-    /**
-     * Publish a present that fills the whole canvas. A presenter that copies its frame 1:1
-     * (D3D9's copyTextureToTexture) still has to say so, or its overlays inherit whatever
-     * letterbox the previous presenter left published.
-     */
-    publishFullCanvasPresentRect(): void {
-        const { width, height } = this.getCanvasSize();
-        if (width <= 0 || height <= 0) return;
-        publishPresentRect(width, height, width, height, null);
     }
 
     /**

@@ -449,8 +449,10 @@ function emitPreTransformedVsMain(
     emitter.line(`    let _p = ${pos};`);
     emitter.line(`    let _rhw = _p.w;`);
     emitter.line(`    let _clipW = select(1.0, 1.0 / _rhw, _rhw != 0.0);`);
-    emitter.line(`    let _clipX = (((_p.x + ${pixelCenterOffset.toFixed(1)}) / ${vw.toFixed(1)}) * 2.0 - 1.0) * _clipW;`);
-    emitter.line(`    let _clipY = (1.0 - ((_p.y + ${pixelCenterOffset.toFixed(1)}) / ${vh.toFixed(1)}) * 2.0) * _clipW;`);
+    // 6 digits, not 1: under an internal scale the offset is half a PHYSICAL pixel expressed
+    // in guest pixels, so it is no longer the literal 0.5 a one-digit format can carry.
+    emitter.line(`    let _clipX = (((_p.x + ${pixelCenterOffset.toFixed(6)}) / ${vw.toFixed(1)}) * 2.0 - 1.0) * _clipW;`);
+    emitter.line(`    let _clipY = (1.0 - ((_p.y + ${pixelCenterOffset.toFixed(6)}) / ${vh.toFixed(1)}) * 2.0) * _clipW;`);
     emitter.line(`    out.pos = vec4<f32>(_clipX, _clipY, clamp(_p.z, 0.0, 1.0) * _clipW, _clipW);`);
     for (const i of [0, 1] as const) {
         if (!interpColors[i]) continue;

@@ -592,6 +592,48 @@ describe("D3D9 WebGPU query manager", () => {
         expect(oldPool.free.filter((slot) => slot === oldIndex)).toHaveLength(1);
     });
 
+    test("an occlusion result carries the pass scale its interval was measured at", async () => {
+        // A GPU occlusion query counts PHYSICAL samples. D3D9's answer is a count in the
+        // GUEST's pixels, so the only place that knows the conversion — the pass encode —
+        // records it here and poll() must hand it back, or the guest silently reads a
+        // count scale² too large under an internal render scale.
+        const device = new FakeDevice();
+        const queue = new FakeQueue();
+        const { manager } = makeManager(device, queue);
+        const pass = new FakePassEncoder();
+        const encoder = new FakeCommandEncoder();
+        const record = { type: D3D9_QUERYTYPE_OCCLUSION, begun: true, issued: true, issueSerial: 1 };
+        manager.acquire("scaled", record);
+        expect(manager.beginOcclusion("scaled", pass as unknown as QueryPassEncoder, record, 2.5).ok).toBe(true);
+        expect(manager.endOcclusion("scaled", pass as unknown as QueryPassEncoder, record).ok).toBe(true);
+        const batch = manager.encodeResolves(encoder as unknown as QueryCommandEncoder, ["scaled"], 1);
+        const readback = device.buffers[device.buffers.length - 1]!;
+        new DataView(readback.bytes).setBigUint64(0, 1000n, true);
+        manager.submit(encoder as unknown as QueryCommandEncoder, batch);
+        queue.complete();
+        await manager.waitForBatch(batch);
+        expect(manager.poll("scaled")).toMatchObject({
+            state: "ready", value: 1000n, sampleScale: 2.5,
+        });
+        expect((manager.poll("scaled") as { sampleScaleMixed?: boolean }).sampleScaleMixed).toBeUndefined();
+    });
+
+    test("a re-begun interval that spans two pass scales says the count is mixed", () => {
+        // One factor over a count accumulated at two scales is an approximation, and the
+        // only place that can say so is the record that saw both.
+        const device = new FakeDevice();
+        const { manager } = makeManager(device);
+        const pass = new FakePassEncoder();
+        const record = { type: D3D9_QUERYTYPE_OCCLUSION, begun: true, issued: false, issueSerial: 1 };
+        manager.acquire("mixed", record);
+        expect(manager.beginOcclusion("mixed", pass as unknown as QueryPassEncoder, record, 2).ok).toBe(true);
+        manager.notifySubmitted(1); // BEGIN encoded in a buffer submitted before END: re-begin.
+        expect(manager.beginOcclusion("mixed", pass as unknown as QueryPassEncoder, record, 1).ok).toBe(true);
+        expect(manager.endOcclusion("mixed", pass as unknown as QueryPassEncoder, record).ok).toBe(true);
+        expect((manager as unknown as { records: Map<string, { sampleScaleMixed?: boolean; sampleScale?: number }> })
+            .records.get("string:mixed")).toMatchObject({ sampleScaleMixed: true, sampleScale: 1 });
+    });
+
     test("a re-arm across a full pool falls back for that one query, not for the pass", () => {
         const device = new FakeDevice();
         const queue = new FakeQueue();

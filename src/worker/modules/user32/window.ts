@@ -920,6 +920,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             visible: (dwStyle & 0x10000000) !== 0,  // WS_VISIBLE
             wndProc: classInfo?.lpfnWndProc ?? 0,
             userData: 0,
+            createParam: lpParam >>> 0,
             cbWndExtra: classInfo?.cbWndExtra ?? 0,
             extraBytes: classInfo?.cbWndExtra ? new Uint32Array(Math.ceil(classInfo.cbWndExtra / 4)) : undefined,
             nativeClassName: resolvedClassName,

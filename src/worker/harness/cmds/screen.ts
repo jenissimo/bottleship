@@ -451,6 +451,23 @@ export function registerScreenCommands(svc: HarnessService): void {
         return active.getRtDebug();
     });
 
+    /** renderSpace() — the two coordinate spaces a 3D backend keeps, side by side: the GUEST
+     *  extent the app asked for (where the viewport, the scissor box, the XYZRHW divisor and
+     *  every readback extent live), the PHYSICAL extent it is rendered at, the one uniform
+     *  scalar between them, and the canvas the result is presented onto.
+     *
+     *  A screenshot cannot tell "the picture fills the canvas" from "the picture IS the canvas
+     *  and the guest is being handed canvas pixels as its own" — those are the two failure
+     *  modes, and only these numbers separate them. */
+    svc.register("renderSpace", () => {
+        const active: any = sys().services?.render?.getActive?.();
+        if (!active?.getRenderSpace) {
+            throw new HarnessError("active presenter has no render-space report (not D3D9)",
+                HarnessErrorCode.UNSUPPORTED);
+        }
+        return active.getRenderSpace();
+    });
+
     /** passCensus() — what each recently submitted D3D9 render pass was OPENED with:
      *  command/draw counts, the attachment kind, and the viewport applied to the whole pass.
      *

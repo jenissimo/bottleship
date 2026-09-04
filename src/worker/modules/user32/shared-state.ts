@@ -34,6 +34,9 @@ export interface WindowInfo {
     visible: boolean;
     wndProc: number;
     userData?: number;
+    /** lpParam from CreateWindowEx, retained for lifecycle diagnostics. Frameworks such as
+     * Delphi attach the owning object during WM_NCCREATE through this value. */
+    createParam?: number;
     cbWndExtra?: number;
     extraBytes?: Uint32Array;
     hMenu?: number;

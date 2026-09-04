@@ -10,7 +10,7 @@
  * whose x + width exceeds the attachment — so it is Wine's placement with DXVK's value.
  *
  * Both paths are made to agree in CLIP space by adding `w · (dx, dy)` to (x, y):
- *     dx = +2·0.5/vpWidth,  dy = -2·0.5/vpHeight
+ *     dx = +2·px/vpWidth,  dy = -2·px/vpHeight
  * which after the perspective divide is half a pixel of screen x and y (screen y grows
  * down, NDC y up — hence the sign). The pre-transformed path already does this on the
  * screen coordinate and is untouched here; the transformed path gets it post-multiplied
@@ -26,22 +26,27 @@
 export const D3D_PIXEL_CENTER_OFFSET_PX = 0.5;
 
 /**
- * The pixel-centre offset to apply to TRANSFORMED geometry, in pixels.
+ * The pixel-centre offset to apply to TRANSFORMED geometry, in GUEST pixels.
  * 0 until the convention is turned on (see the flag above); never negative.
+ *
+ * `renderScale` is physical samples per guest pixel. The correction is half a PHYSICAL
+ * pixel — a property of where the target samples — so a supersampled target owes half of
+ * a proportionally smaller guest pixel, not half of the guest's own.
  */
-export function pixelCenterOffsetPx(): number {
-    return (globalThis as { __d3dNoPixelCentre?: boolean }).__d3dNoPixelCentre === true
-        ? 0
-        : D3D_PIXEL_CENTER_OFFSET_PX;
+export function pixelCenterOffsetPx(renderScale = 1): number {
+    if ((globalThis as { __d3dNoPixelCentre?: boolean }).__d3dNoPixelCentre === true) return 0;
+    const scale = renderScale > 0 ? renderScale : 1;
+    return D3D_PIXEL_CENTER_OFFSET_PX / scale;
 }
 
 /** Convert the legacy pixel-centre offset to the clip-space delta used by a
- * programmable vertex epilogue. */
+ * programmable vertex epilogue. Viewport extents are guest-space, as is the offset. */
 export function pixelCenterClipOffset(
     viewportWidth: number,
     viewportHeight: number,
+    renderScale = 1,
 ): { dx: number; dy: number } {
-    const px = pixelCenterOffsetPx();
+    const px = pixelCenterOffsetPx(renderScale);
     return {
         dx: px > 0 && viewportWidth > 0 ? (2 * px) / viewportWidth : 0,
         dy: px > 0 && viewportHeight > 0 ? -(2 * px) / viewportHeight : 0,
@@ -79,9 +84,10 @@ export function writeMvpWithPixelCenter(
     dstFloatOffset: number,
     src: ArrayLike<number>,
     viewportWidth: number,
-    viewportHeight: number
+    viewportHeight: number,
+    renderScale = 1,
 ): void {
-    const { dx, dy } = pixelCenterClipOffset(viewportWidth, viewportHeight);
+    const { dx, dy } = pixelCenterClipOffset(viewportWidth, viewportHeight, renderScale);
 
     for (let row = 0; row < 4; row++) {
         const i = row * 4;

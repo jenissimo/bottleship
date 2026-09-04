@@ -145,12 +145,17 @@ export interface D3D9QueryLedger {
     measured: number;
     /** Occlusion answers synthesized as the viewport-area upper bound (see below). */
     synthesized: number;
+    /** Measured answers converted from PHYSICAL samples to guest pixels (internal scale > 1). */
+    sampleScaled: number;
+    /** ...of which the interval spanned passes of different scales, so the conversion is
+     *  one factor applied to a mixed count — an approximation, named rather than hidden. */
+    sampleScaleMixed: number;
 }
 
 const ledger: D3D9QueryLedger = {
     created: 0, begin: 0, end: 0, ready: 0, pending: 0, notAvailable: 0,
     error: 0, missing: 0, lostOnRecycle: 0, lostOnDeviceLoss: 0,
-    measured: 0, synthesized: 0,
+    measured: 0, synthesized: 0, sampleScaled: 0, sampleScaleMixed: 0,
 };
 
 export function getD3D9QueryLedger(): D3D9QueryLedger {
@@ -235,6 +240,25 @@ function managerNeedsRebegin(manager: D3D9QueryManager | undefined, id: number):
 }
 
 /**
+ * A GPU occlusion result counts PHYSICAL samples; D3D9's is a count in the guest's own
+ * pixels. Above internalScale Native those differ by scale² and nothing downstream can
+ * tell — an engine comparing the count against a precomputed screen-space area (lens
+ * flares, sun occlusion, LOD gating) simply mis-decides.
+ *
+ * Rounding is the residual and is deliberate in one direction: a non-zero sample count
+ * never becomes 0, because 0 is "fully occluded" and deletes geometry, while
+ * over-reporting only draws something that would have been culled. An interval that
+ * spanned passes of different scales is counted separately — one factor over a mixed
+ * count is an approximation, and a ledger entry is the only place that can say so.
+ */
+function guestPixelsFromSamples(samples: number, sampleScale: number, mixed: boolean): number {
+    if (!(sampleScale > 1)) return samples;
+    ledger.sampleScaled++;
+    if (mixed) ledger.sampleScaleMixed++;
+    return Math.max(1, Math.round(samples / (sampleScale * sampleScale))) >>> 0;
+}
+
+/**
  * WebGPU's occlusion result is a PREDICATE; D3D9's is a visible-PIXEL COUNT.
  *
  * `GPUQueryType "occlusion"` only reports whether any fragment sample passed, and Dawn
@@ -248,13 +272,18 @@ function managerNeedsRebegin(manager: D3D9QueryManager | undefined, id: number):
  * under-reporting deletes geometry and warns nobody. A backend that does return a real
  * sample count (> 1) is trusted and passes through untouched.
  */
-function occlusionPixelsFromGpu(query: QueryRecord, raw: bigint): number {
+function occlusionPixelsFromGpu(
+    query: QueryRecord, raw: bigint, sampleScale = 1, sampleScaleMixed = false,
+): number {
     // The ledger distinguishes the two arms because they are indistinguishable downstream:
     // both answer a plausible pixel count and only one of them was measured.
     if (raw <= 0n) { ledger.measured++; return 0; }
     const override = (globalThis as { __occlusionPixels?: unknown }).__occlusionPixels;
     if (typeof override === 'number') { ledger.synthesized++; return override >>> 0; }
-    if (raw > 1n) { ledger.measured++; return Number(raw & 0xffff_ffffn) >>> 0; }
+    if (raw > 1n) {
+        ledger.measured++;
+        return guestPixelsFromSamples(Number(raw & 0xffff_ffffn) >>> 0, sampleScale, sampleScaleMixed);
+    }
     ledger.synthesized++;
     const vp = devices.get(query.devicePtr)?.getViewport?.();
     const pixels = vp ? (vp.width >>> 0) * (vp.height >>> 0) : 0;
@@ -729,7 +758,9 @@ export function createQueryExports(): Record<string, ThunkImplementation> {
                     return writeQueryUint64(pData, Math.min(count, 8), gpu.value)
                         ? D3D_OK : D3DERR_INVALIDCALL;
                 }
-                return writeQueryData(pData, count, occlusionPixelsFromGpu(query, gpu.value))
+                return writeQueryData(pData, count, occlusionPixelsFromGpu(query, gpu.value,
+                    (gpu as { sampleScale?: number }).sampleScale,
+                    (gpu as { sampleScaleMixed?: boolean }).sampleScaleMixed))
                     ? D3D_OK : D3DERR_INVALIDCALL;
             }
             if (gpu.state === 'fallback') {
@@ -742,7 +773,9 @@ export function createQueryExports(): Record<string, ThunkImplementation> {
                     return writeQueryUint64(pData, Math.min(count, 8), gpu.value)
                         ? D3D_OK : D3DERR_INVALIDCALL;
                 }
-                return writeQueryData(pData, count, occlusionPixelsFromGpu(query, gpu.value))
+                return writeQueryData(pData, count, occlusionPixelsFromGpu(query, gpu.value,
+                    (gpu as { sampleScale?: number }).sampleScale,
+                    (gpu as { sampleScaleMixed?: boolean }).sampleScaleMixed))
                     ? D3D_OK : D3DERR_INVALIDCALL;
             }
             // A failed GPU readback is not silently converted into the old viewport-sized

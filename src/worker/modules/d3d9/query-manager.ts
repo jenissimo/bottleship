@@ -88,7 +88,14 @@ export type QueryOperationResult =
 
 export type QueryReadback =
     | { state: 'pending'; submissionSerial: number }
-    | { state: 'ready'; submissionSerial: number; value: bigint }
+    /** `sampleScale` is physical samples per guest pixel for the pass the interval was
+     *  recorded in — a GPU occlusion result counts SAMPLES, and D3D9's is a guest-pixel
+     *  count. `sampleScaleMixed` says the interval spanned passes of different scales, so
+     *  the division below is an approximation and the caller may not call it exact. */
+    | {
+        state: 'ready'; submissionSerial: number; value: bigint;
+        sampleScale?: number; sampleScaleMixed?: boolean;
+    }
     | { state: 'fallback'; reason: string; value?: bigint }
     | { state: 'unavailable'; reason: string };
 
@@ -136,6 +143,10 @@ type RecordState = {
     value?: bigint;
     error?: string;
     releaseRequested: boolean;
+    /** Physical samples per guest pixel of the pass BEGIN was recorded in. */
+    sampleScale?: number;
+    /** BEGIN was re-recorded in a pass of a different scale — the count mixes both. */
+    sampleScaleMixed?: boolean;
 };
 
 type BatchEntry = {
@@ -423,6 +434,8 @@ export class D3D9QueryManager {
         state.value = undefined;
         state.error = undefined;
         state.releaseRequested = false;
+        state.sampleScale = undefined;
+        state.sampleScaleMixed = undefined;
         return this.handleFor(state);
     }
 
@@ -482,8 +495,16 @@ export class D3D9QueryManager {
         this.counters.displacedLost = 0;
     }
 
-    /** Begin an occlusion query in the caller's active render pass. */
-    beginOcclusion(id: QueryId, pass: QueryPassEncoder, record?: QueryRecordContract): QueryOperationResult {
+    /**
+     * Begin an occlusion query in the caller's active render pass.
+     *
+     * `sampleScale` is the pass's physical samples per guest pixel. It is recorded here
+     * because this is the only point that knows which target the interval is measured on;
+     * poll() hands it back so a guest-visible pixel count can be expressed in guest pixels.
+     */
+    beginOcclusion(
+        id: QueryId, pass: QueryPassEncoder, record?: QueryRecordContract, sampleScale = 1,
+    ): QueryOperationResult {
         const state = this.records.get(keyOf(id));
         if (!state || state.kind !== 'occlusion') return { ok: false, reason: 'occlusion-query-not-acquired' };
         if (state.mode === 'fallback') return this.fallbackResult(state, record);
@@ -494,6 +515,9 @@ export class D3D9QueryManager {
             return { ok: false, reason };
         }
         state.began = true;
+        const scale = Number.isFinite(sampleScale) && sampleScale > 0 ? sampleScale : 1;
+        if (state.sampleScale !== undefined && state.sampleScale !== scale) state.sampleScaleMixed = true;
+        state.sampleScale = scale;
         return { ok: true, mode: 'gpu', index: state.index! };
     }
 
@@ -718,7 +742,11 @@ export class D3D9QueryManager {
         }
         if (state.error) return { state: 'fallback', reason: state.error };
         if (state.value !== undefined) {
-            return { state: 'ready', submissionSerial: state.submissionSerial!, value: state.value };
+            return {
+                state: 'ready', submissionSerial: state.submissionSerial!, value: state.value,
+                ...(state.sampleScale === undefined ? {} : { sampleScale: state.sampleScale }),
+                ...(state.sampleScaleMixed ? { sampleScaleMixed: true } : {}),
+            };
         }
         return { state: 'pending', submissionSerial: state.submissionSerial ?? state.record.issueSerial };
     }

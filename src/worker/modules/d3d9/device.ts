@@ -29,7 +29,7 @@ import {
 } from '../../backends/webgpu/d3d9/multisample';
 import { resolveD3D9StretchRectPolicy } from '../../backends/webgpu/d3d9/copy-policy';
 import { WebGPUBackend } from '../../backends/webgpu/webgpu-backend';
-import { resizeFullscreenWindowToMode } from '../../runtime/windowing/fullscreen-window';
+import { deviceWindowClientExtent, resizeFullscreenWindowToMode } from '../../runtime/windowing/fullscreen-window';
 import {
     acknowledgeDeviceReset,
     deviceCooperativeLevel,
@@ -309,6 +309,53 @@ function bgraToRgba(src: Uint8Array, width: number, height: number, pitch: numbe
  *  against. Keyed by device COM pointer, cleared with the rest of the device state. */
 const rtFastPathGeneration = new Map<number, number>();
 
+
+/**
+ * The back-buffer extent a D3DPRESENT_PARAMETERS actually declares, with a zero resolved
+ * the way the D3D9 runtime resolves it — and written BACK into the caller's struct.
+ *
+ * Zero is legal only for a windowed device and means "the device window's client area";
+ * the runtime then fills the struct, which is why an app may read BackBufferWidth back and
+ * why every later GetDesc/GetDisplayMode must agree with it. Left at zero it is not a
+ * missing number but a missing SPACE: the guest's logical extent is what the viewport, the
+ * XYZRHW divisor, every readback and the host's pointer inverse are expressed in, and a
+ * fallback to the host canvas conflates the two coordinate spaces again.
+ *
+ * A fullscreen device with a zero extent is malformed; it is left alone for the parameter
+ * validator to refuse rather than repaired into something plausible here.
+ */
+function resolvePresentBackBufferExtent(
+    mem: Uint8Array,
+    pPresentationParameters: number,
+    hwnd: number,
+    fullscreen: boolean,
+    source: string,
+): { width: number; height: number } {
+    const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+    let width = view.getUint32(pPresentationParameters + 0, true) >>> 0;
+    let height = view.getUint32(pPresentationParameters + 4, true) >>> 0;
+    if (fullscreen || (width > 0 && height > 0)) return { width, height };
+
+    const client = deviceWindowClientExtent(hwnd);
+    if (!client) {
+        Logger.warn(LogCategory.D3D9,
+            `${source}: windowed device declares a 0x0 back buffer and window 0x${hwnd.toString(16)} `
+            + "is not tracked — the guest render space stays undeclared");
+        return { width, height };
+    }
+    width = width || client.width;
+    height = height || client.height;
+    // The runtime writes the resolved values back; an app is entitled to read them.
+    if (isValidAddress(mem, pPresentationParameters, 8, "rw")) {
+        Mem.writeUint32(pPresentationParameters + 0, width);
+        Mem.writeUint32(pPresentationParameters + 4, height);
+    }
+    Logger.log(LogCategory.D3D9,
+        `${source}: windowed 0x0 back buffer resolved to the client area of `
+        + `hwnd=0x${hwnd.toString(16)} -> ${width}x${height}`);
+    return { width, height };
+}
+
 export function createDeviceExports(): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
 
@@ -554,12 +601,15 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
                     return D3DERR_NOTAVAILABLE;
                 }
                 if (!device.configureD3D9MultisampleType(multiSampleType)) return D3DERR_NOTAVAILABLE;
-                const bbWidth = ppView.getUint32(pPresentationParameters + 0, true);
-                const bbHeight = ppView.getUint32(pPresentationParameters + 4, true);
                 // D3DPRESENT_PARAMETERS.Windowed @ +32 (d3d9); 0 = fullscreen, i.e. a mode-set.
                 const fullscreen = ppView.getUint32(pPresentationParameters + 32, true) === 0;
+                const { width: bbWidth, height: bbHeight } = resolvePresentBackBufferExtent(
+                    mem, pPresentationParameters,
+                    (ppView.getUint32(pPresentationParameters + 28, true) || hFocusWindow) >>> 0,
+                    fullscreen, "CreateDevice");
                 Logger.log(LogCategory.D3D9, `CreateDevice backbuffer ${bbWidth}x${bbHeight} fullscreen=${fullscreen}`);
-                device.setBackBufferSize(bbWidth, bbHeight, fullscreen);
+                device.setBackBufferSize(bbWidth, bbHeight, fullscreen,
+                    (ppView.getUint32(pPresentationParameters + 28, true) || hFocusWindow) >>> 0);
                 // A FULLSCREEN device also puts its window INTO that mode, and engines size
                 // themselves from the window they get back (hDeviceWindow @ +28, else the
                 // focus window).
@@ -744,6 +794,16 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
             return refuse("noGpuDeviceYet", D3DERR_DEVICELOST);
         }
 
+        // Zero present-parameter extents are resolved BEFORE the backend reads them, so the
+        // device, recordBackBufferInfo and the swap chains all redeclare the same extent.
+        if (pPresentationParameters) {
+            const rv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            resolvePresentBackBufferExtent(
+                mem, pPresentationParameters,
+                (rv.getUint32(pPresentationParameters + 28, true)
+                    || deviceCreationParams.get(pDevice)?.hFocusWindow || 0) >>> 0,
+                rv.getUint32(pPresentationParameters + 32, true) === 0, "Reset");
+        }
         const hr = device.reset(pPresentationParameters, mem);
         if (hr !== D3D_OK) return refuse(`backendReset=0x${(hr >>> 0).toString(16)}`, hr);
         // The implicit back buffers ARE redeclared by a successful Reset; drop the old
