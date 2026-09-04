@@ -31,6 +31,19 @@ describe("normalizeInnoDestination", () => {
         expect(normalizeInnoDestination("{{app}}\\x.txt", bare)).toBe("{app}/x.txt");
     });
 
+    it("installs GOG's __support\\app tree into the app directory", () => {
+        // Far Cry's key-binding defaults; the installer copies this tree over {app}, and
+        // most of its entries carry no {app} constant at all — so the bare-relative gate
+        // must not decide them.
+        expect(normalizeInnoDestination("__support/app\\Profiles\\defaults\\english\\game.cfg"))
+            .toBe("Profiles/defaults/english/game.cfg");
+        expect(normalizeInnoDestination("{app}/__support/app\\Profiles\\server\\mapcycle.txt"))
+            .toBe("Profiles/server/mapcycle.txt");
+        // The rest of __support really is installer scaffolding.
+        expect(normalizeInnoDestination("__support\\gog_installer.dll", bare))
+            .toBe("__support/gog_installer.dll");
+    });
+
     it("rejects installer-runtime and unresolved constants", () => {
         expect(normalizeInnoDestination("{tmp}\\background.jpg", bare)).toBeNull();
         expect(normalizeInnoDestination("{commonappdata}\\GOG.com\\uninstall.dll", bare)).toBeNull();

@@ -61,17 +61,31 @@ function normalizeSafeRelativePath(path: string): string | null {
     return parts.join("/");
 }
 
+/**
+ * GOG stages part of the real install under `__support\app\…`, which its installer copies
+ * over the app directory. Those are the GAME's files, not installer scaffolding: Far Cry
+ * keeps `Profiles\defaults\<lang>\game.cfg` — the bindings "Restore Defaults" reloads —
+ * there, so dropping the tree with the rest of `__support` left the game nothing to restore
+ * and blanked every control. The prefix names the destination on its own, so it resolves
+ * ahead of the leading-constant rules; most such entries carry no `{app}` at all.
+ */
+const GOG_SUPPORT_APP = /^__support[\\/]app[\\/]/i;
+
 export function normalizeInnoDestination(
     dest: string,
     opts: NormalizeInnoDestinationOptions = {},
 ): string | null {
     if (!dest) return null;
     const { literal, leading, constants } = scanInnoText(dest.replace(/\//g, "\\"));
+    const rel = literal.startsWith("\\") ? literal.slice(1) : literal;
+
+    if (constants === 0 && (leading === null || leading === "{app}") && GOG_SUPPORT_APP.test(rel)) {
+        return normalizeSafeRelativePath(rel.replace(GOG_SUPPORT_APP, ""));
+    }
 
     if (leading === "{app}") {
         // A second constant inside the path ({app}\{sys}\x) is not something we can resolve.
         if (constants > 0) return null;
-        const rel = literal.startsWith("\\") ? literal.slice(1) : literal;
         return normalizeSafeRelativePath(rel);
     }
 
