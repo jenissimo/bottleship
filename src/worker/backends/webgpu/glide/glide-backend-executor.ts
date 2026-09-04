@@ -550,7 +550,7 @@ export class GlideBackendExecutor extends Legacy3DExecutor {
             undefined,
             { r: 0, g: 0, b: 0, a: 1 },
             undefined,
-            { srcW: targetW, srcH: targetH, outW: canvasW, outH: canvasH },
+            { srcW: targetW, srcH: targetH, outW: canvasW, outH: canvasH, toCanvas: true },
         );
 
         if (input.videoOverlayCanvas) {
@@ -577,9 +577,7 @@ export class GlideBackendExecutor extends Legacy3DExecutor {
                     this.backend.updateStatsTexture(statsCanvas);
                     statsOverlay.clearDirty();
                 }
-                // targetView is the CANVAS texture (not the offscreen render target), so the
-                // overlay must be sized to the canvas too.
-                this.backend.renderStatsOverlay(targetView, encoder, canvasW, canvasH);
+                this.backend.renderStatsOverlay(targetView, encoder);
             }
         }
 

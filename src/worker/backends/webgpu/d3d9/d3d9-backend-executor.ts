@@ -4097,6 +4097,11 @@ export class D3D9BackendExecutor {
             // Composite overlays on top of the main scene: video plane first, then GDI.
             // (Swap-chain path only — RT passes never composite overlays or present.)
             const rendersToBackbuffer = !target || target.backbuffer === true;
+            // This presenter copies its frame onto the canvas 1:1, so its picture IS the whole
+            // canvas. It has to say so before compositing: the overlays below place themselves
+            // in the published content rect, and a presenter that does not scale must not
+            // inherit the letterbox of whichever one ran before it.
+            if (present && rendersToBackbuffer) this.backend.publishFullCanvasPresentRect();
             if (present && rendersToBackbuffer && overlays?.videoOverlayCanvas) {
                 this.backend.blit(overlays.videoOverlayCanvas, this.offscreenView!, encoder);
             }
@@ -4129,7 +4134,7 @@ export class D3D9BackendExecutor {
                             this.backend.updateStatsTexture(statsCanvas);
                             statsOverlay.clearDirty();
                         }
-                        this.backend.renderStatsOverlay(this.offscreenView!, encoder, size.width, size.height);
+                        this.backend.renderStatsOverlay(this.offscreenView!, encoder);
                     }
                 }
 

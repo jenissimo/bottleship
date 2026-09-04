@@ -441,8 +441,10 @@ export class OpenGLBackendExecutor {
                     screenW,
                     screenH,
                     { r: 0, g: 0, b: 0, a: 1 },
+                    undefined,
+                    { srcW: fallbackTex.width, srcH: fallbackTex.height, outW: screenW, outH: screenH, toCanvas: true },
                 );
-                this.compositeStatsOverlay(targetView, encoder, screenW, screenH);
+                this.compositeStatsOverlay(targetView, encoder);
                 queue.submit([encoder.finish()]);
                 this.offscreenInitialized = false;
                 Logger.log(
@@ -476,7 +478,7 @@ export class OpenGLBackendExecutor {
 
         const targetView = context.getCurrentTexture().createView();
         this.blitOffscreenToCanvas(targetView, encoder, screenW, screenH);
-        this.compositeStatsOverlay(targetView, encoder, screenW, screenH);
+        this.compositeStatsOverlay(targetView, encoder);
         queue.submit([encoder.finish()]);
 
         Logger.verbose(
@@ -503,7 +505,7 @@ export class OpenGLBackendExecutor {
         const encoder = device.createCommandEncoder();
         const targetView = context.getCurrentTexture().createView();
         this.blitOffscreenToCanvas(targetView, encoder, screenW, screenH);
-        this.compositeStatsOverlay(targetView, encoder, screenW, screenH);
+        this.compositeStatsOverlay(targetView, encoder);
         queue.submit([encoder.finish()]);
     }
 
@@ -527,15 +529,11 @@ export class OpenGLBackendExecutor {
             screenH,
             { r: 0, g: 0, b: 0, a: 1 },
             upscale,
+            { srcW, srcH, outW: screenW, outH: screenH, toCanvas: true },
         );
     }
 
-    private compositeStatsOverlay(
-        targetView: GPUTextureView,
-        encoder: GPUCommandEncoder,
-        width: number,
-        height: number,
-    ): void {
+    private compositeStatsOverlay(targetView: GPUTextureView, encoder: GPUCommandEncoder): void {
         if (!statsOverlay.isEnabled()) return;
         const statsCanvas = statsOverlay.getCanvas();
         if (!statsCanvas) return;
@@ -543,7 +541,7 @@ export class OpenGLBackendExecutor {
             this.backend.updateStatsTexture(statsCanvas);
             statsOverlay.clearDirty();
         }
-        this.backend.renderStatsOverlay(targetView, encoder, width, height);
+        this.backend.renderStatsOverlay(targetView, encoder);
     }
 
     destroy(): void {

@@ -10,11 +10,15 @@ import { setD3D9FloatCapabilityContract } from "./shared/float-format-policy";
 import { setD3D9VolumeCapabilityContract } from "./shared/volume-policy";
 import { setD3D9MsaaCapabilityContract } from "./d3d9/multisample";
 import { setD3D9WebGpuCapabilityLimits } from "./shared/webgpu-capability-limits";
+import { coversTarget, overlayDestRect, publishComputedPresentRect, publishPresentRect } from "./shared/present-geometry";
 
 /** Backoff between requestDevice attempts while recovering, in ms. The list also fixes how
  *  many attempts there are: a GPU that has not come back by ~4s is gone, and retrying past
  *  that only keeps the guest polling a device that will never arrive. */
 const RECREATE_BACKOFF_MS = [0, 100, 250, 500, 1000, 2000];
+
+/** Reused scratch for the positioned overlay quad (6 verts x [x,y,u,v]). */
+const OVERLAY_DEST_SCRATCH = new Float32Array(24);
 
 export class WebGPUBackend implements RenderBackend {
     readonly kind = "webgpu";
@@ -36,9 +40,13 @@ export class WebGPUBackend implements RenderBackend {
     private overlayNearestSampler: GPUSampler | null = null;
     private overlayVertexBuffer: GPUBuffer | null = null;
     private overlayBindGroup: GPUBindGroup | null = null;
+    /** Positioned quad for an overlay plane that does not cover the whole target. */
+    private overlayDestVertexBuffer: GPUBuffer | null = null;
+    /** The rect the quad above currently holds — it only moves on a resize/mode change. */
+    private overlayDestVertexRect = { x: -1, y: -1, w: -1, h: -1, outW: -1, outH: -1 };
+    /** getCanvasSize result, reused: it is read several times per frame. */
+    private canvasSize = { width: 0, height: 0 };
     
-    // Rect compositing resources (positioned quad for video subregions)
-    private rectVertexBuffer: GPUBuffer | null = null;
     // Growable vertex buffer for blitRects (N sub-rect quads per call)
     private rectsVertexBuffer: GPUBuffer | null = null;
     private rectsVertexBufferCapacity = 0;
@@ -177,7 +185,8 @@ export class WebGPUBackend implements RenderBackend {
         this.overlayNearestSampler = null;
         this.overlayVertexBuffer = null;
         this.overlayBindGroup = null;
-        this.rectVertexBuffer = null;
+        this.overlayDestVertexBuffer = null;
+        this.overlayDestVertexRect = { x: -1, y: -1, w: -1, h: -1, outW: -1, outH: -1 };
         this.rectsVertexBuffer = null;
         this.rectsVertexBufferCapacity = 0;
         this.statsTexture = null;
@@ -486,101 +495,13 @@ export class WebGPUBackend implements RenderBackend {
     }
 
     /**
-     * Composite an overlay canvas into a specific pixel rect on screen.
-     * Converts pixel coordinates to NDC and renders a positioned quad.
-     */
-    compositeRect(
-        overlay: OffscreenCanvas,
-        dstX: number, dstY: number,
-        dstW: number, dstH: number,
-        screenW: number, screenH: number,
-        clearScreen: boolean = false,
-    ): void {
-        if (!this.device || !this.context || !this.queue || screenW <= 0 || screenH <= 0) return;
-
-        // Upload overlay to texture
-        this.updateOverlayTexture(overlay);
-        if (!this.overlayTextureView) return;
-
-        // Ensure pipeline exists
-        if (!this.overlayPipeline || this.overlayPipelineFormat !== this.format) {
-            this.createOverlayPipeline();
-            this.overlayPipelineFormat = this.format;
-            this.overlayBindGroup = null;
-        }
-
-        // Pixel rect → NDC
-        // NDC: x=-1 left, x=+1 right, y=-1 bottom, y=+1 top
-        // Pixel origin: top-left (0,0)
-        const x0 = (dstX / screenW) * 2 - 1;
-        const x1 = ((dstX + dstW) / screenW) * 2 - 1;
-        const y1 = 1 - (dstY / screenH) * 2;           // top edge
-        const y0 = 1 - ((dstY + dstH) / screenH) * 2;  // bottom edge
-
-        const vertices = new Float32Array([
-            x0, y0, 0, 1,   // bottom-left
-            x1, y0, 1, 1,   // bottom-right
-            x1, y1, 1, 0,   // top-right
-            x0, y0, 0, 1,   // bottom-left
-            x1, y1, 1, 0,   // top-right
-            x0, y1, 0, 0,   // top-left
-        ]);
-
-        if (!this.rectVertexBuffer) {
-            this.rectVertexBuffer = this.device.createBuffer({
-                size: vertices.byteLength,
-                usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-            });
-        }
-        this.queue.writeBuffer(this.rectVertexBuffer, 0, vertices);
-
-        const encoder = this.device.createCommandEncoder();
-        const targetView = this.context.getCurrentTexture().createView();
-
-        if (clearScreen) {
-            const clearPass = encoder.beginRenderPass({
-                colorAttachments: [{
-                    view: targetView,
-                    clearValue: desktopBackground.getClearColor(),
-                    loadOp: "clear",
-                    storeOp: "store",
-                }],
-            });
-            clearPass.end();
-        }
-
-        if (!this.overlayBindGroup) {
-            this.overlayBindGroup = this.device.createBindGroup({
-                layout: this.overlayPipeline!.getBindGroupLayout(0),
-                entries: [
-                    { binding: 0, resource: this.getSampler() },
-                    { binding: 1, resource: this.overlayTextureView },
-                ],
-            });
-        }
-
-        const renderPass = encoder.beginRenderPass({
-            colorAttachments: [{
-                view: targetView,
-                loadOp: "load",
-                storeOp: "store",
-            }],
-        });
-
-        renderPass.setPipeline(this.overlayPipeline!);
-        renderPass.setBindGroup(0, this.overlayBindGroup);
-        renderPass.setVertexBuffer(0, this.rectVertexBuffer);
-        renderPass.draw(6, 1, 0, 0);
-        renderPass.end();
-
-        this.queue.submit([encoder.finish()]);
-    }
-
-    /**
-     * Composite specific sub-rects of an overlay canvas onto a target, 1:1 in
-     * overlay pixel space (src rect == dst rect). Used for live native dialogs
-     * over a DDraw flip chain: only the dialog windows' rects are composited so
+     * Composite specific sub-rects of an overlay canvas onto a target. Used for live native
+     * dialogs over a DDraw flip chain: only the dialog windows' rects are composited so
      * stale GDI overlay content elsewhere never bleeds over the game frame.
+     *
+     * The rects arrive in GUEST window coordinates, which is also the overlay plane's own
+     * space — the DESTINATION is the content rect the frame was presented into, so a rect
+     * lands over the pixels it was drawn for whatever the host canvas size is.
      *
      * Appends to an existing encoder (presenter frame path).
      */
@@ -595,6 +516,12 @@ export class WebGPUBackend implements RenderBackend {
         const screenW = overlay.width;
         const screenH = overlay.height;
         if (screenW <= 0 || screenH <= 0) return;
+
+        const { width: outW, height: outH } = this.getCanvasSize();
+        if (outW <= 0 || outH <= 0) return;
+        const dest = overlayDestRect(outW, outH);
+        const sx = dest.w / screenW;
+        const sy = dest.h / screenH;
 
         this.updateOverlayTexture(overlay);
         if (!this.overlayTextureView) return;
@@ -615,10 +542,10 @@ export class WebGPUBackend implements RenderBackend {
             const y2 = Math.max(y, Math.min(r.y + r.h, screenH));
             if (x2 - x <= 0 || y2 - y <= 0) continue;
 
-            const nx0 = (x / screenW) * 2 - 1;
-            const nx1 = (x2 / screenW) * 2 - 1;
-            const ny1 = 1 - (y / screenH) * 2;   // top edge
-            const ny0 = 1 - (y2 / screenH) * 2;  // bottom edge
+            const nx0 = ((dest.x + x * sx) / outW) * 2 - 1;
+            const nx1 = ((dest.x + x2 * sx) / outW) * 2 - 1;
+            const ny1 = 1 - ((dest.y + y * sy) / outH) * 2;   // top edge
+            const ny0 = 1 - ((dest.y + y2 * sy) / outH) * 2;  // bottom edge
             const u0 = x / screenW;
             const u1 = x2 / screenW;
             const v0 = y / screenH;   // top
@@ -720,13 +647,52 @@ export class WebGPUBackend implements RenderBackend {
     }
 
     /**
+     * Publish where a `srcW x srcH` guest picture lands on the canvas. GDI-only titles never
+     * run a 3D present, so the window plane is the only thing that knows the guest size —
+     * every other backend publishes from PostFxChain.present.
+     */
+    publishGuestPresentRect(srcW: number, srcH: number): void {
+        const { width, height } = this.getCanvasSize();
+        if (width <= 0 || height <= 0) return;
+        publishComputedPresentRect(srcW, srcH, width, height, EmulatorConfig.getInstance().quality);
+    }
+
+    /** Backing-buffer size of the canvas this backend presents to. Callers must not retain
+     *  the object: it is one reused record (read several times per frame). */
+    getCanvasSize(): { width: number; height: number } {
+        const canvas = this.context?.canvas as OffscreenCanvas | undefined;
+        this.canvasSize.width = canvas?.width ?? 0;
+        this.canvasSize.height = canvas?.height ?? 0;
+        return this.canvasSize;
+    }
+
+    /**
+     * Publish a present that fills the whole canvas. A presenter that copies its frame 1:1
+     * (D3D9's copyTextureToTexture) still has to say so, or its overlays inherit whatever
+     * letterbox the previous presenter left published.
+     */
+    publishFullCanvasPresentRect(): void {
+        const { width, height } = this.getCanvasSize();
+        if (width <= 0 || height <= 0) return;
+        publishPresentRect(width, height, width, height, null);
+    }
+
+    /**
      * Render the overlay texture onto a target.
      * Should be called after updateOverlayTexture in the same frame.
+     *
+     * The overlay planes (GDI/window output, the video plane) are GUEST-space images, so they
+     * are placed in the same content rect the presented frame went to — not stretched over the
+     * whole host canvas, which is sized from the host container and is a different space.
      */
     renderOverlay(target: GPUTextureView, encoder: GPUCommandEncoder): void {
         if (!this.device || !this.overlayTextureView) {
             return;
         }
+
+        const { width: outW, height: outH } = this.getCanvasSize();
+        const dest = overlayDestRect(outW, outH);
+        const full = coversTarget(dest, outW, outH);
 
         // Ensure pipeline exists (recreate if format changed)
         if (!this.overlayPipeline || this.overlayPipelineFormat !== this.format) {
@@ -756,9 +722,40 @@ export class WebGPUBackend implements RenderBackend {
             });
         }
         renderPass.setBindGroup(0, this.overlayBindGroup);
-        renderPass.setVertexBuffer(0, this.getVertexBuffer());
+        renderPass.setVertexBuffer(0, full ? this.getVertexBuffer() : this.getOverlayDestVertexBuffer(dest, outW, outH));
         renderPass.draw(6, 1, 0, 0);
         renderPass.end();
+    }
+
+    /** A full-quad-UV quad positioned at `dest` (pixels) inside a `outW x outH` target. */
+    private getOverlayDestVertexBuffer(
+        dest: { x: number; y: number; w: number; h: number }, outW: number, outH: number,
+    ): GPUBuffer {
+        const x0 = (dest.x / outW) * 2 - 1;
+        const x1 = ((dest.x + dest.w) / outW) * 2 - 1;
+        const y1 = 1 - (dest.y / outH) * 2;
+        const y0 = 1 - ((dest.y + dest.h) / outH) * 2;
+        const c = this.overlayDestVertexRect;
+        if (this.overlayDestVertexBuffer && c.x === dest.x && c.y === dest.y &&
+            c.w === dest.w && c.h === dest.h && c.outW === outW && c.outH === outH) {
+            return this.overlayDestVertexBuffer;
+        }
+        const verts = OVERLAY_DEST_SCRATCH;
+        verts[0] = x0; verts[1] = y0; verts[2] = 0; verts[3] = 1;
+        verts[4] = x1; verts[5] = y0; verts[6] = 1; verts[7] = 1;
+        verts[8] = x1; verts[9] = y1; verts[10] = 1; verts[11] = 0;
+        verts[12] = x0; verts[13] = y0; verts[14] = 0; verts[15] = 1;
+        verts[16] = x1; verts[17] = y1; verts[18] = 1; verts[19] = 0;
+        verts[20] = x0; verts[21] = y1; verts[22] = 0; verts[23] = 0;
+        if (!this.overlayDestVertexBuffer) {
+            this.overlayDestVertexBuffer = this.device!.createBuffer({
+                size: verts.byteLength,
+                usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+            });
+        }
+        this.queue!.writeBuffer(this.overlayDestVertexBuffer, 0, verts);
+        this.overlayDestVertexRect = { x: dest.x, y: dest.y, w: dest.w, h: dest.h, outW, outH };
+        return this.overlayDestVertexBuffer;
     }
 
     /**
@@ -783,7 +780,7 @@ export class WebGPUBackend implements RenderBackend {
         viewportHeight?: number,
         clearColor?: GPUColor,
         useNearestFilter?: boolean,
-        present?: { srcW?: number; srcH?: number; outW?: number; outH?: number }
+        present?: { srcW?: number; srcH?: number; outW?: number; outH?: number; toCanvas?: boolean }
     ): void {
         if (!this.device || !this.format) return;
         Logger.verbose(LogCategory.SYSTEM, `WebGPUBackend: drawTexture opaque=${opaque}`);
@@ -795,6 +792,20 @@ export class WebGPUBackend implements RenderBackend {
         // a single passthrough pass, byte-identical to the legacy present. This is the one
         // present path shared by EVERY backend's "blit final frame" (ddraw/d3d8/opengl/glide).
         if (opaque && this.postFx) {
+            // Only THE CANVAS PRESENT defines where the guest picture landed. drawTexture(opaque)
+            // is also an off-canvas blit (readback capture, Glide's LFB upscale into its own
+            // offscreen), and publishing from those made the rect alternate between two spaces.
+            // Opt-in, and cross-checked against the canvas: a flag on a target that is not the
+            // canvas publishes nothing, which degrades to the full-canvas fallback.
+            if (present?.toCanvas) {
+                const canvas = this.getCanvasSize();
+                if (present.outW === canvas.width && present.outH === canvas.height) {
+                    publishComputedPresentRect(
+                        present.srcW ?? 0, present.srcH ?? 0, canvas.width, canvas.height,
+                        EmulatorConfig.getInstance().quality,
+                    );
+                }
+            }
             this.postFx.present(textureView, target, encoder, {
                 clearColor,
                 nearest: useNearestFilter,
@@ -885,12 +896,9 @@ export class WebGPUBackend implements RenderBackend {
     /**
      * Render the stats overlay at the top-right corner of the target.
      */
-    renderStatsOverlay(
-        target: GPUTextureView,
-        encoder: GPUCommandEncoder,
-        canvasWidth: number,
-        canvasHeight: number
-    ): void {
+    renderStatsOverlay(target: GPUTextureView, encoder: GPUCommandEncoder): void {
+        // Sized in HOST pixels: it is a debug HUD, not part of the guest picture.
+        const { width: canvasWidth, height: canvasHeight } = this.getCanvasSize();
         if (!this.device || !this.statsTextureView || !canvasWidth || !canvasHeight) return;
 
         if (!this.overlayPipeline || this.overlayPipelineFormat !== this.format) {

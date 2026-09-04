@@ -2344,7 +2344,8 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
 
             // Reuse the draw encoder if available, otherwise create a new one
             const encoder = drawEncoder ?? device.createCommandEncoder();
-            const targetView = context.getCurrentTexture().createView();
+            const canvasTex = context.getCurrentTexture();
+            const targetView = canvasTex.createView();
             const clearColor = EmulatorConfig.getInstance().screenBackgroundColor;
             webgpu.drawTexture(
                 sourceView,
@@ -2354,7 +2355,11 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
                 undefined,
                 undefined,
                 clearColor,
-                true // nearest-neighbor: pixel-perfect present (no bilinear stretch)
+                true, // nearest-neighbor: pixel-perfect present (no bilinear stretch)
+                // The render target is guest-sized and the canvas is host-sized; without both
+                // the post-fx chain reads src===out and aspect/integer scaling silently vanish.
+                { srcW: this.renderTarget.width, srcH: this.renderTarget.height,
+                  outW: canvasTex.width, outH: canvasTex.height, toCanvas: true },
             );
 
             // Composite GDI overlay (cursor / text / dialogs drawn via GDI on top of D3D8)
@@ -2392,7 +2397,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
                         webgpu.updateStatsTexture(statsCanvas);
                         statsOverlay.clearDirty();
                     }
-                    webgpu.renderStatsOverlay(targetView, encoder, this.renderTarget.width, this.renderTarget.height);
+                    webgpu.renderStatsOverlay(targetView, encoder);
                 }
             }
 

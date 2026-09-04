@@ -8,18 +8,13 @@ export interface RenderBackend {
     readonly kind: string;
     initialize(canvas: OffscreenCanvas): void | Promise<void>;
     composite(overlay: OffscreenCanvas, clearScreen?: boolean): void;
-    compositeRect?(
-        overlay: OffscreenCanvas,
-        dstX: number, dstY: number,
-        dstW: number, dstH: number,
-        screenW: number, screenH: number,
-        clearScreen?: boolean,
-    ): void;
-    /** Composite specific overlay sub-rects 1:1 (live dialogs over a flip chain). */
+    /** Composite specific overlay sub-rects, in guest coordinates (live dialogs over a flip chain). */
     compositeRects?(
         overlay: OffscreenCanvas,
         rects: Array<{ x: number; y: number; w: number; h: number }>,
     ): void;
+    /** Publish where a guest picture of this size lands on the canvas (see present-geometry). */
+    publishGuestPresentRect?(srcW: number, srcH: number): void;
     /**
      * Apply a per-channel gamma ramp (256 normalized entries each) as a final
      * RAMDAC-style LUT over the presented frame. Identity ramp = passthrough.

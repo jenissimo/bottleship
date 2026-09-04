@@ -480,7 +480,7 @@ export class DDrawPresenter implements RenderActive {
                         undefined,
                         // Source (guest) + output (canvas) dims → post-fx chain does
                         // integer/aspect scaling + FXAA texel sizing.
-                        { srcW: surface.width, srcH: surface.height, outW: canvasTex.width, outH: canvasTex.height }
+                        { srcW: surface.width, srcH: surface.height, outW: canvasTex.width, outH: canvasTex.height, toCanvas: true }
                     );
                     this.lastPresented = { view: presentTextureView, width: surface.width, height: surface.height };
 
@@ -578,20 +578,27 @@ export class DDrawPresenter implements RenderActive {
             this.ctx.putImageData(imageData, 0, 0);
 
             if (videoOverlay && videoOverlayService.hasContent()) {
-                this.ctx.drawImage(videoOverlay, 0, 0);
+                // The video plane covers the screen, same as on the GPU path — drawn 1:1 it
+                // would sit in a corner whenever the movie is smaller than the mode.
+                this.ctx.drawImage(videoOverlay, 0, 0, this.canvas!.width, this.canvas!.height);
                 videoOverlayService.consumeDirty();
             }
 
             if (overlay) {
+                // The overlay plane is guest-space and the scratch is the surface, so both
+                // branches place it the same way: scaled from plane space into the scratch.
+                const ox = this.canvas!.width / Math.max(1, overlay.width);
+                const oy = this.canvas!.height / Math.max(1, overlay.height);
                 if (dialogRects?.length) {
                     // Flip chain owns the screen: composite only live dialog rects.
                     for (const r of dialogRects) {
                         if (r.w > 0 && r.h > 0) {
-                            this.ctx.drawImage(overlay, r.x, r.y, r.w, r.h, r.x, r.y, r.w, r.h);
+                            this.ctx.drawImage(overlay, r.x, r.y, r.w, r.h,
+                                r.x * ox, r.y * oy, r.w * ox, r.h * oy);
                         }
                     }
                 } else {
-                    this.ctx.drawImage(overlay, 0, 0);
+                    this.ctx.drawImage(overlay, 0, 0, this.canvas!.width, this.canvas!.height);
                 }
                 if (system.gdiContext.isOverlayDirty()) {
                     system.gdiContext.clearOverlayDirty();
@@ -603,7 +610,10 @@ export class DDrawPresenter implements RenderActive {
             } else if (this.process.canvas) {
                 const screenCtx = this.process.canvas.getContext("2d");
                 if (screenCtx) {
-                    screenCtx.drawImage(this.canvas, 0, 0);
+                    // No WebGPU: this 2D path is the present, so it owes the same stretch the
+                    // GPU one does — the canvas is host-sized and the scratch is guest-sized.
+                    screenCtx.drawImage(
+                        this.canvas, 0, 0, this.process.canvas.width, this.process.canvas.height);
                 }
             }
 
@@ -700,7 +710,7 @@ export class DDrawPresenter implements RenderActive {
                     webgpu.updateStatsTexture(statsCanvas);
                     statsOverlay.clearDirty();
                 }
-                webgpu.renderStatsOverlay(targetView, encoder, width, height);
+                webgpu.renderStatsOverlay(targetView, encoder);
             }
         }
     }
