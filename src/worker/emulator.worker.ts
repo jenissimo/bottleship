@@ -25,6 +25,7 @@ import { Oleaut32 } from "./modules/oleaut32";
 import { Oledlg } from "./modules/oledlg";
 import { DDraw } from "./modules/ddraw";
 import { getOverlayCompositePlan } from "./modules/user32/dialog-overlay";
+import { dropVideoPlaneDirty, getVideoPlanePlan, isVideoPlaneDirty, notifyVideoPlaneComposited } from "./video/video-plane-policy";
 import { getVirtualScreenRect } from "./modules/user32/shared-state";
 import { setPresentRectListener } from "./backends/webgpu/shared/present-geometry";
 import { flushHeldWindowDCs } from "./modules/user32/window";
@@ -407,8 +408,6 @@ const syncOverlayToGuestScreen = () => {
 const gdiPresentOnce = () => {
   const system = System.getInstance();
   const gdi = system.gdiContext;
-  const videoOverlay = system.videoRouting.getOverlayService();
-
   // Composite GDI/video overlay to screen.
   // When a 3D renderer (OpenGL/Glide/D3D) is active, only composite if GDI
   // overlay has new content — this handles games that use GDI for video
@@ -416,7 +415,9 @@ const gdiPresentOnce = () => {
   const renderActive = system.services.render.getActive();
   const backend = system.services.render.getBackend();
   if (backend) {
-    const videoCanvas = videoOverlay.hasContent() ? videoOverlay.getCanvas() : null;
+    // The video plane's own single policy — see video/video-plane-policy.ts. Asked ONCE per
+    // composite so both branches below act on the same verdict.
+    const videoPlan = getVideoPlanePlan();
 
     // This rAF loop is one of several GDI-over-frame compositors (alongside the DDraw
     // presenter's drawFrame/2D/phase-blend paths and the D3D8/D3D9/Glide present paths).
@@ -445,7 +446,7 @@ const gdiPresentOnce = () => {
       // and re-presents each Flip, so this is a no-op there). The only GDI that overlays
       // the frame here is live modal dialog rects (plan.mode === 'rects').
       if (gdiDirty) gdi.clearOverlayDirty();
-      if (videoOverlay.isDirty()) videoOverlay.consumeDirty();
+      if (isVideoPlaneDirty()) dropVideoPlaneDirty();
 
       // Repaint only when the canvas would otherwise not hold a current frame. A repaint is
       // a full canvas presentation, and two presentations per refresh on one swap chain
@@ -453,7 +454,7 @@ const gdiPresentOnce = () => {
       // sparse-presenter case this loop exists for is untouched — that serial is unchanged
       // on nearly every animation frame. Video and dialog rects force it regardless: both
       // draw onto a fresh, blank swap texture and need the frame under them restored first.
-      const videoWillComposite = !!videoCanvas && system.videoRouting.isOverlayPlaybackLive();
+      const videoWillComposite = videoPlan.onScreen;
       const rectsWillComposite = plan.mode === 'rects' && !!backend.compositeRects;
       const guestPresentSerial = system.services.render.getGuestPresentSerial();
       const guestPresentedSinceLastFrame = guestPresentSerial !== gdiLastGuestPresentSerial;
@@ -469,7 +470,8 @@ const gdiPresentOnce = () => {
       // dirty: repaintLastFrame above would otherwise flip the screen back to the last game
       // frame on the animation frames a 15 fps movie does not update.
       if (videoWillComposite) {
-        backend.composite(videoCanvas!, false);
+        backend.composite(videoPlan.canvas!, false);
+        notifyVideoPlaneComposited(videoPlan);
         system.services.render.notifyPresent("video");
       }
 
@@ -493,7 +495,7 @@ const gdiPresentOnce = () => {
     // Include dirty clears (hasOverlayContent=false after clearOverlay) so the GPU
     // canvas is actually cleared instead of staying stale/black.
     const gdiCanvas = (gdi.hasOverlayContent() || gdiDirty) ? gdi.getOverlayCanvas() : null;
-    const videoDirty = videoOverlay.isDirty();
+    const videoDirty = isVideoPlaneDirty();
 
     // One-shot diagnostic for GDI present loop
     if (!gdiPresentDiagLogged && (gdiDirty || (gdiCanvas !== null))) {
@@ -511,9 +513,9 @@ const gdiPresentOnce = () => {
     if (shouldComposite) {
       let composedAny = false;
 
-      if (videoCanvas && (videoDirty || gdiDirty)) {
-        backend.composite(videoCanvas, shouldClear);
-        videoOverlay.consumeDirty();
+      if (videoPlan.onScreen && (videoDirty || gdiDirty)) {
+        backend.composite(videoPlan.canvas!, shouldClear);
+        notifyVideoPlaneComposited(videoPlan);
         composedAny = true;
       }
 

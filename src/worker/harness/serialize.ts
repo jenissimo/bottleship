@@ -308,9 +308,14 @@ export function serializeVideo(): unknown {
     // own size. Without it a mis-sized or mis-routed video looks identical to a
     // decode failure from the outside.
     const routing: any = sys().videoRouting;
+    const info = routing?.getDebugInfo?.() ?? null;
     return {
         loaded: !!videoEngine?.isLoaded?.(),
-        routing: routing?.getDebugInfo?.() ?? null,
+        // The composite verdict, hoisted out of `routing` because it is the first question
+        // asked when the screen is wrong: is the video plane on top of this frame, and why.
+        // `reason` names the rule (video/video-plane-policy.ts), never just "no".
+        plane: info ? { ...info.plane, overlay: info.overlay } : null,
+        routing: info,
         // Separates "we replaced the guest's ffmpeg decode" from "we declined and it is still
         // running its own": `served` counts frames we published, `declined` calls handed back.
         ffmpegHle: getFfmpegHleStats(),

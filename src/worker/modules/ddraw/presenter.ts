@@ -23,6 +23,7 @@ import {
 } from "../../backends/webgpu/shared/texture-formats";
 import { DDSCAPS_TEXTURE } from "./constants";
 import { getOverlayCompositePlan } from "../user32/dialog-overlay";
+import { getVideoPlanePlan, notifyVideoPlaneComposited } from "../../video/video-plane-policy";
 import { markGpuSyncedFromCpu, surfaceSyncManager } from "./surface-sync";
 import { EmulatorConfig } from "../../core/emulator-config-manager";
 import { onFrameEnd as frameCaptureOnFrameEnd } from "./frame-capture";
@@ -317,8 +318,6 @@ export class DDrawPresenter implements RenderActive {
 
             const system = System.getInstance();
             const backend = system.services.render.getBackend();
-            const videoOverlayService = system.videoRouting.getOverlayService();
-            const videoOverlay = videoOverlayService.getCanvas();
 
             // Exclusive-fullscreen screen ownership (real Windows): in DDSCL_EXCLUSIVE|
             // FULLSCREEN, DirectDraw owns the screen and GDI windows are NOT visible —
@@ -577,11 +576,15 @@ export class DDrawPresenter implements RenderActive {
             const imageData = this.surfaceToImageData(surface, mem);
             this.ctx.putImageData(imageData, 0, 0);
 
-            if (videoOverlay && videoOverlayService.hasContent()) {
+            // Asked HERE, not at the top of present(): the GPU path returns long before this
+            // and asks for itself, and a plan taken for a composite that never happens counts
+            // a frame the plane did not actually cover.
+            const videoPlan = getVideoPlanePlan();
+            if (videoPlan.onScreen) {
                 // The video plane covers the screen, same as on the GPU path — drawn 1:1 it
                 // would sit in a corner whenever the movie is smaller than the mode.
-                this.ctx.drawImage(videoOverlay, 0, 0, this.canvas!.width, this.canvas!.height);
-                videoOverlayService.consumeDirty();
+                this.ctx.drawImage(videoPlan.canvas!, 0, 0, this.canvas!.width, this.canvas!.height);
+                notifyVideoPlaneComposited(videoPlan);
             }
 
             if (overlay) {
@@ -678,16 +681,15 @@ export class DDrawPresenter implements RenderActive {
         height: number,
     ): void {
         const system = System.getInstance();
-        const videoOverlayService = system.videoRouting.getOverlayService();
-        const videoOverlay = videoOverlayService.getCanvas();
+        const videoPlan = getVideoPlanePlan();
         const plan = getOverlayCompositePlan(this);
         const dialogRects = plan.mode === 'rects' ? plan.rects : null;
         const overlay = plan.mode === 'none' ? null : system.gdiContext.getOverlayCanvas();
 
         // 1. Video overlay plane (fallback sink).
-        if (videoOverlay && videoOverlayService.hasContent()) {
-            webgpu.blit(videoOverlay, targetView, encoder);
-            videoOverlayService.consumeDirty();
+        if (videoPlan.onScreen) {
+            webgpu.blit(videoPlan.canvas!, targetView, encoder);
+            notifyVideoPlaneComposited(videoPlan);
         }
 
         // 2. GDI overlay on top (whole overlay, or only live dialog rects when the flip chain owns screen).

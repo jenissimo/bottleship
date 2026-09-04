@@ -79,6 +79,33 @@ export interface VideoRoutingEvent {
     detail?: string;
 }
 
+/**
+ * Why the video plane is, or is not, on screen this frame. Every value except "live" is a
+ * reason NOT to composite, so a plane that stops showing always names the rule that stopped it.
+ */
+export type VideoPlaneReason =
+    /** Nothing has ever decoded to the plane. */
+    | "no_canvas"
+    /** The plane was cleared and nothing has been submitted since. */
+    | "no_content"
+    /** The session that drew it has closed. */
+    | "owner_closed"
+    /** Its session is open but no longer routed here — the app publishes the movie itself. */
+    | "owner_not_routed"
+    /** It was composed against a screen that no longer exists (the presenter changed kind). */
+    | "presenter_changed"
+    /** The guest is rendering a scene of its own, which a full-screen rescue would hide. */
+    | "app_scene_observed"
+    | "live";
+
+export interface VideoPlanePlan {
+    onScreen: boolean;
+    reason: VideoPlaneReason;
+    /** Only non-null when `onScreen`; a caller has nothing to composite otherwise. */
+    canvas: OffscreenCanvas | null;
+    ownerSessionKey: string | null;
+}
+
 export interface VideoSinkAdapter {
     readonly name: string;
     readonly kind: VideoSinkKind;

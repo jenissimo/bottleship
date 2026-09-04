@@ -23,6 +23,7 @@ import {
 } from "./constants";
 import { GlideContext, GlideLfbSurfaceState } from "./context";
 import { getOverlayCompositePlan } from "../user32/dialog-overlay";
+import { getVideoPlanePlan, notifyVideoPlaneComposited } from "../../video/video-plane-policy";
 import { captureGlideFrame } from "./frame-capture";
 
 /**
@@ -342,8 +343,8 @@ export class GlidePresenter implements RenderActive {
         }
 
         const system = System.getInstance();
-        const videoOverlayService = system.videoRouting.getOverlayService();
-        const videoOverlayCanvas = videoOverlayService.hasContent() ? videoOverlayService.getCanvas() : null;
+        const videoPlan = getVideoPlanePlan();
+        const videoOverlayCanvas = videoPlan.onScreen ? videoPlan.canvas : null;
         const gdiOverlayCanvas = system.gdiContext.hasOverlayContent() ? system.gdiContext.getOverlayCanvas() : null;
 
         // GDI overlay follows the single shared policy (getOverlayCompositePlan). Glide always
@@ -386,7 +387,7 @@ export class GlidePresenter implements RenderActive {
         this.context.executor.executeFrame(frameInput);
 
         if (videoOverlayCanvas) {
-            videoOverlayService.consumeDirty();
+            notifyVideoPlaneComposited(videoPlan);
         }
         if (system.gdiContext.isOverlayDirty()) {
             system.gdiContext.clearOverlayDirty();

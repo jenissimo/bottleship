@@ -75,6 +75,11 @@ export interface UploadLatchState {
  * a HUD atlas upload mid-clip would latch it for the session. Evidence is CAUSAL: this
  * session's copy went into a D3D9 lock staging buffer AND an upload landed in the same
  * frame, repeatedly. Pure so the cadence and the decay are testable without a device.
+ *
+ * Deliberately conservative, and therefore NOT the whole answer: an app that copies into a
+ * private buffer and uploads FROM it offers no pointer link at all, so this can never speak
+ * for it. What keeps the plane off that app's UI is the composite policy, which declines to
+ * cover a frame the guest drew a scene into (video/video-plane-policy.ts).
  */
 export function stepUploadLatch(prev: UploadLatchState, obs: {
     uploadSeq: number;
@@ -607,7 +612,11 @@ export class BinkW32 implements IModule {
                     : resolvedSurface ? "resolved bitmap texture"
                     : lockedTexture ? "d3d9 lock staging buffer"
                     : s.appUploadsItsOwnFrames ? "app uploads in step with the copy"
-                    : `no resolvable sink: uploadsInStep=${s.uploadsInStepWithCopy}/${UPLOAD_CADENCE_FRAMES}`,
+                    // Both halves: how far the cadence got, and how long it has been getting
+                    // nowhere. A detector that has never once matched reads exactly like one
+                    // that is merely mid-cadence unless the second number is printed too.
+                    : `no resolvable sink: uploadsInStep=${s.uploadsInStepWithCopy}/${UPLOAD_CADENCE_FRAMES}`
+                        + ` framesWithoutMatch=${s.framesWithoutMatchingUpload}`,
                 surfacePtr: s.destPtr || undefined,
                 pitch: s.destPitch || lockedTexture?.pitch || undefined,
                 width: resolvedSurface?.width ?? lockedTexture?.width ?? s.width,

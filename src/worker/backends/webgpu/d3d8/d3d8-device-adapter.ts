@@ -30,6 +30,7 @@ import { WebGPUBackend } from '../webgpu-backend';
 import { alignUploadRange, noteBufferUpload, noteGuestBufferWrite } from '../buffer-upload';
 import { EmulatorConfig } from '../../../core/emulator-config-manager';
 import { getOverlayCompositePlan } from '../../../modules/user32/dialog-overlay';
+import { getVideoPlanePlan, notifyVideoPlaneComposited } from '../../../video/video-plane-policy';
 import {
     D3DRENDERSTATE_ALPHABLENDENABLE,
     D3DRENDERSTATE_ALPHAFUNC,
@@ -2381,12 +2382,11 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
                 }
             }
 
-            // Composite video overlay
-            const videoOverlayService = system.videoRouting.getOverlayService();
-            const videoOverlay = videoOverlayService.getCanvas();
-            if (videoOverlay && videoOverlayService.hasContent()) {
-                webgpu.blit(videoOverlay, targetView, encoder);
-                videoOverlayService.consumeDirty();
+            // Composite the video plane per its single shared policy (getVideoPlanePlan).
+            const videoPlan = getVideoPlanePlan();
+            if (videoPlan.onScreen) {
+                webgpu.blit(videoPlan.canvas!, targetView, encoder);
+                notifyVideoPlaneComposited(videoPlan);
             }
 
             // Composite stats overlay (worker-side FPS display)

@@ -309,6 +309,16 @@ export class RenderService {
         return this.lastPresenterKind;
     }
 
+    /**
+     * Draws in the guest's last present, or null when the active presenter cannot say.
+     * Null is "unknown" and must never be read as "few" — a policy that guesses low here
+     * would suppress a rescue on the presenters that do not report.
+     */
+    getLastPresentDrawCount(): number | null {
+        const active = this.active as { getLastPresentDrawCount?(): number | null } | null;
+        return active?.getLastPresentDrawCount?.() ?? null;
+    }
+
     reset(): void {
         this.active = null;
         this.presentSerial = 0;

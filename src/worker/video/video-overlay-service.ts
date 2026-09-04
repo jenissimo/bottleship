@@ -10,8 +10,19 @@ export class VideoOverlayService {
     private ownerSessionKey: string | null = null;
     private lastSubmitAtMs = 0;
     private rgbaScratch: Uint8Array | null = null;
+    /**
+     * The guest presenter the plane was last composed against. A plane drawn over a DDraw
+     * primary is not a plane over a later D3D9 device's back buffer: when the kind changes
+     * the pixels belong to a screen that no longer exists, which is one of the ways a plane
+     * outlives its content. Null until a guest presenter has been seen.
+     */
+    private submitPresenterKind: string | null = null;
+    private submits = 0;
+    private clears = 0;
+    private composites = 0;
+    private lastClearReason: string | null = null;
 
-    submitFrame(sessionKey: string, frame: VideoFrameViews): boolean {
+    submitFrame(sessionKey: string, frame: VideoFrameViews, presenterKind: string | null): boolean {
         if (frame.width <= 0 || frame.height <= 0) {
             return false;
         }
@@ -39,16 +50,31 @@ export class VideoOverlayService {
         this.hasAnyContent = true;
         this.dirty = true;
         this.lastSubmitAtMs = performance.now();
+        if (presenterKind) this.submitPresenterKind = presenterKind;
+        this.submits++;
         return true;
     }
 
-    clear(): void {
+    /** `reason` is what `state(["video"]).plane` reports for a plane that went dark. */
+    clear(reason: string): void {
         if (this.ctx && this.canvas) {
             this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
         }
         this.ownerSessionKey = null;
         this.hasAnyContent = false;
         this.dirty = true;
+        this.submitPresenterKind = null;
+        this.clears++;
+        this.lastClearReason = reason;
+    }
+
+    /** The guest presenter the current pixels were composed against, if one was known. */
+    getSubmitPresenterKind(): string | null {
+        return this.submitPresenterKind;
+    }
+
+    noteComposited(): void {
+        this.composites++;
     }
 
     resize(width: number, height: number): void {
@@ -63,6 +89,10 @@ export class VideoOverlayService {
         }
         this.ctx.imageSmoothingEnabled = false;
         this.hasAnyContent = false;
+        this.ownerSessionKey = null;
+        this.submitPresenterKind = null;
+        this.clears++;
+        this.lastClearReason = "resize";
         this.dirty = true;
     }
 
@@ -95,6 +125,11 @@ export class VideoOverlayService {
         width: number;
         height: number;
         lastSubmitAtMs: number;
+        submitPresenterKind: string | null;
+        submits: number;
+        clears: number;
+        composites: number;
+        lastClearReason: string | null;
     } {
         return {
             hasContent: this.hasAnyContent,
@@ -103,6 +138,14 @@ export class VideoOverlayService {
             width: this.canvas?.width ?? 0,
             height: this.canvas?.height ?? 0,
             lastSubmitAtMs: this.lastSubmitAtMs,
+            submitPresenterKind: this.submitPresenterKind,
+            // submits vs composites separates "the router published frames" from "a present
+            // path put them on screen" — a plane that is fed and never shown, and one that is
+            // shown long after it stopped being fed, are different bugs with one symptom.
+            submits: this.submits,
+            clears: this.clears,
+            composites: this.composites,
+            lastClearReason: this.lastClearReason,
         };
     }
 

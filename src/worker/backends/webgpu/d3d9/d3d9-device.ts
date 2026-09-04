@@ -71,6 +71,7 @@ import {
 } from "../../../modules/d3d9/volume-resources";
 import * as frameCapture from "../../../modules/ddraw/frame-capture";
 import { getOverlayCompositePlan } from "../../../modules/user32/dialog-overlay";
+import { getVideoPlanePlan, notifyVideoPlaneComposited } from "../../../video/video-plane-policy";
 import { Logger, LogCategory } from "../../../core/logger";
 import {
     d3d9PerfInc, d3d9PerfAdd, d3d9PerfSkip, d3d9PerfBackendInc, d3d9DropDraw,
@@ -919,6 +920,16 @@ export class D3D9Device {
         const type = this.renderTargetSampleTypes[0] ?? 0;
         if (this.renderTargetIndices[0] === null && type === 0) return this.d3d9MsaaSampleCount;
         return d3d9MsaaSampleCount(type) ?? 1;
+    }
+
+    /**
+     * Draws in the last present. The video plane's policy uses it to tell a guest that is
+     * BLITTING a movie (a fullscreen quad, maybe letterbox bars and a subtitle) from one that
+     * is rendering a scene of its own — covering the latter with a rescue plane hides its UI.
+     * Null before anything has been presented, which the policy reads as "unknown", not "few".
+     */
+    getLastPresentDrawCount(): number | null {
+        return this.frameLogRing.length ? this.frameLogRing[this.frameLogRing.length - 1]!.draws : null;
     }
 
     /** HARNESS: last `n` per-present summaries (newest last). See frameLog verb. */
@@ -10729,10 +10740,12 @@ export class D3D9Device {
         };
         const textureView = this.resolveCurrentTexture();
         const system = System.getInstance();
-        const videoOverlayService = system.videoRouting.getOverlayService();
         const gdiContext = this.getGdiContext();
         const composit = present && !hasExplicitTarget;
-        const videoOverlayCanvas = composit && videoOverlayService.hasContent() ? videoOverlayService.getCanvas() : null;
+        // The video plane's single shared policy (getVideoPlanePlan) — an explicit render
+        // target is not the screen, so nothing is composited over it either way.
+        const videoPlan = composit ? getVideoPlanePlan() : null;
+        const videoOverlayCanvas = videoPlan?.onScreen ? videoPlan.canvas : null;
         const gdiOverlayCanvas = composit && gdiContext?.hasOverlayContent() ? gdiContext.getOverlayCanvas() : null;
         // GDI overlay compositing follows the single shared policy (getOverlayCompositePlan):
         // when this 3D renderer owns the screen, GDI windows behind the opaque fullscreen
@@ -10775,8 +10788,8 @@ export class D3D9Device {
         releasePooledBuffers();
 
         if (present) {
-            if (videoOverlayCanvas) {
-                videoOverlayService.consumeDirty();
+            if (videoOverlayCanvas && videoPlan) {
+                notifyVideoPlaneComposited(videoPlan);
             }
             if (gdiContext?.isOverlayDirty()) {
                 gdiContext.clearOverlayDirty();
