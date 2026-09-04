@@ -18,6 +18,7 @@ import { sys } from "../serialize";
 import { sessionLogPath } from "../../../harness/session";
 import { getOverlayCompositePlan, isGameScreenOwned, isFlipScreenOwned, getLiveDialogOverlays } from "../../modules/user32/dialog-overlay";
 import { ddrawShowsContent } from "../../modules/ddraw/gdi-visibility";
+import { getPresentRect } from "../../backends/webgpu/shared/present-geometry";
 
 /** Where a `debug_png_dump` we post actually lands: the host writes it under its own
  *  session directory, so a `saved` path that ignored the session would point an agent
@@ -356,10 +357,22 @@ export function registerScreenCommands(svc: HarnessService): void {
                     if (r < y0) y0 = r; if (r > y1) y1 = r;
                 }
                 row.diffPct = Math.round((changed / (SW * SH)) * 1000) / 10;
-                // Where it changed, in screen pixels — that is what names the control.
+                // Where it changed, in GUEST screen pixels — the space clickAt() injects into.
+                // 'overlay' samples the guest-sized window plane directly; a 'screen' capture
+                // is the HOST canvas with the letterbox bars in it, so it has to come back
+                // through the published content rect before it can name a control.
                 if (x1 >= 0) {
-                    const sx = (overlayCanvas?.width ?? SW) / SW, sy = (overlayCanvas?.height ?? SH) / SH;
-                    row.bbox = [Math.round(x0 * sx), Math.round(y0 * sy), Math.round((x1 - x0 + 1) * sx), Math.round((y1 - y0 + 1) * sy)];
+                    const gw = overlayCanvas?.width ?? SW, gh = overlayCanvas?.height ?? SH;
+                    const p = source === "overlay" ? null : getPresentRect();
+                    const map = (cx: number, cy: number): [number, number] => {
+                        if (!p || p.w <= 0 || p.h <= 0) return [cx * (gw / SW), cy * (gh / SH)];
+                        return [((cx * p.outW) / SW - p.x) * (gw / p.w),
+                                ((cy * p.outH) / SH - p.y) * (gh / p.h)];
+                    };
+                    const [bx0, by0] = map(x0, y0);
+                    const [bx1, by1] = map(x1 + 1, y1 + 1);
+                    row.bbox = [Math.round(bx0), Math.round(by0),
+                                Math.round(bx1 - bx0), Math.round(by1 - by0)];
                 }
                 if (row.diffPct > maxDiff) { maxDiff = row.diffPct; flashIndex = i; }
             }
