@@ -31,6 +31,7 @@ import { type FrameTail } from "../../core/frame-time-distribution";
 import { dbg, type FastmemStats } from "../../core/debug/dbg-commands";
 import { guestCodeInvalidationStats } from "../../core/memory/guest-code";
 import { hypercallDataManager } from "../../core/cpu/hypercall-data";
+import { compareScenes, probeScene, type SceneProbe } from "./scene";
 
 /** Compact a category record to ms (drop zero buckets) for terse output. */
 function categoriesMs(categories: Record<string, number>): Record<string, number> {
@@ -810,6 +811,87 @@ function crossCheckGuestChannels(sampled: SampledBlocks, counted: CountedBlocks)
     };
 }
 
+type FrameWindowOptions = {
+    budgetMs?: number; refreshMs?: number; top?: number; maxBuckets?: number; captureOverMs?: number;
+};
+
+/**
+ * Arm a frame-timing window: frame profiler, flip cadence and the counter baseline all
+ * start here. Split out of `frameReport` because `measureWindow` must open and close the
+ * SAME window rather than a second definition of one.
+ */
+function armFrameWindow(opts: FrameWindowOptions): Record<string, unknown> {
+    const render = sys().services?.render as RenderLike | undefined;
+    // Arm the classifier at the budget so it sees EVERY over-budget frame, not just
+    // the ones past the (30fps-shaped) capture threshold.
+    //
+    // classifyOverMs alone only widens which captured frames get coalesced; a frame
+    // below captureThresholdMs is never captured, so it cannot be classified at any
+    // budget. That is what the coverage note means when it says to "re-arm with
+    // captureOverMs" — without this pass-through the report asks for something the
+    // harness could not do, and a title whose misses are all just over a 16.7ms
+    // budget reports 0 classes while losing seconds per minute.
+    if (opts.budgetMs && opts.budgetMs > 0) frameProfiler.configureCapture({ classifyOverMs: opts.budgetMs });
+    if (opts.captureOverMs && opts.captureOverMs > 0) {
+        frameProfiler.configureCapture({
+            captureOverMs: opts.captureOverMs,
+            classifyOverMs: opts.budgetMs && opts.budgetMs > 0 ? opts.budgetMs : opts.captureOverMs,
+        });
+    }
+    frameProfiler.setEnabled(true);
+    frameProfiler.reset();
+    profiler.setEnabled(true);
+    profiler.reset();
+    render?.resetFlipCadence?.();
+    windowBaseline = snapshotCounters(render);
+    mark(WINDOW_BEGIN_MARK);
+    return {
+        armed: true,
+        join: joinInfo(render, windowBaseline, null),
+        note: "window armed: frame profiler, flip cadence and counter baseline all start here. "
+            + "Take a Chrome trace across this window for the deep depth (GC / stacks / guest blocks).",
+    };
+}
+
+/** Close the window armed by `armFrameWindow` and report it. */
+function readFrameWindow(opts: FrameWindowOptions): Record<string, unknown> {
+    const render = sys().services?.render as RenderLike | undefined;
+    const tail = frameProfiler.getTail({ budgetMs: opts.budgetMs, maxBuckets: opts.maxBuckets });
+    const budgetMs = opts.budgetMs ?? (tail.ok && tail.budget ? tail.budget.ms : undefined);
+    const spikes = frameProfiler.getSpikeClasses({ budgetMs, top: opts.top ?? 8 });
+    const now = snapshotCounters(render);
+    mark(WINDOW_END_MARK);
+
+    const presentFrames = frameProfiler.getPresentFrameCount();
+    const markFrames = frameProfiler.getMarkFrameCount();
+    return {
+        boundary: {
+            tail: "present (RenderService.notifyPresent — the same event as the bottleship.flip trace mark and getFlipCadence)",
+            spikes: "markFrame (presenter-labelled; ddraw Flip's frameAlreadyMarked can skip it)",
+            presentFrames,
+            markFrames,
+            agree: boundariesAgree(presentFrames, markFrames),
+            note: boundariesAgree(presentFrames, markFrames)
+                ? undefined
+                : "the two frame boundaries saw different counts — spike-class coverage is relative to markFrame frames, "
+                  + "while the tail/budget verdict is relative to presents",
+        },
+        tail,
+        spikes: {
+            ...spikes,
+            drill: {
+                thunks: "perfThunks({filter}) — session-wide per-call cost; avgUs is the contention-robust figure, frame counts are not",
+                subPhases: "profilerStats({filter}) — named-bucket sub-phase timings (maxMs = worst single call)",
+                guestCode: "guestBlocks() — sampled (time-weighted) + trace2 (count-weighted) guest-block attribution",
+            },
+        },
+        counters: counterDelta(windowBaseline, now),
+        crossCheck: crossCheckFlipCadence(render, tail, opts.refreshMs ?? 16.67),
+        join: joinInfo(render, windowBaseline, now),
+        blindSpots: LIVE_BLIND_SPOTS,
+    };
+}
+
 export function registerPerfCommands(svc: HarnessService): void {
     /** perfProfile({enable?=true, reset?=false}) — arm/disarm + clear BOTH the frame
      *  profiler (worst-frames/thunk-level) and the named-bucket profiler (sub-phase
@@ -1149,75 +1231,68 @@ export function registerPerfCommands(svc: HarnessService): void {
      * Flow: frameReport({reset:true, budgetMs:33.34}) -> play/tickFrames -> frameReport().
      */
     svc.register("frameReport", (args) => {
-        const opts = (args[0] ?? {}) as {
-            budgetMs?: number; refreshMs?: number; top?: number; reset?: boolean; maxBuckets?: number;
-            captureOverMs?: number;
-        };
-        const render = sys().services?.render as RenderLike | undefined;
+        const opts = (args[0] ?? {}) as FrameWindowOptions & { reset?: boolean };
+        if (opts.reset) return armFrameWindow(opts);
+        return readFrameWindow(opts);
+    });
 
-        if (opts.reset) {
-            // Arm the classifier at the budget so it sees EVERY over-budget frame, not just
-            // the ones past the (30fps-shaped) capture threshold.
-            //
-            // classifyOverMs alone only widens which captured frames get coalesced; a frame
-            // below captureThresholdMs is never captured, so it cannot be classified at any
-            // budget. That is what the coverage note means when it says to "re-arm with
-            // captureOverMs" — without this pass-through the report asks for something the
-            // harness could not do, and a title whose misses are all just over a 16.7ms
-            // budget reports 0 classes while losing seconds per minute.
-            if (opts.budgetMs && opts.budgetMs > 0) frameProfiler.configureCapture({ classifyOverMs: opts.budgetMs });
-            if (opts.captureOverMs && opts.captureOverMs > 0) {
-                frameProfiler.configureCapture({
-                    captureOverMs: opts.captureOverMs,
-                    classifyOverMs: opts.budgetMs && opts.budgetMs > 0 ? opts.budgetMs : opts.captureOverMs,
-                });
-            }
-            frameProfiler.setEnabled(true);
-            frameProfiler.reset();
-            profiler.setEnabled(true);
-            profiler.reset();
-            render?.resetFlipCadence?.();
-            windowBaseline = snapshotCounters(render);
-            mark(WINDOW_BEGIN_MARK);
-            return {
-                armed: true,
-                join: joinInfo(render, windowBaseline, null),
-                note: "window armed: frame profiler, flip cadence and counter baseline all start here. "
-                    + "Take a Chrome trace across this window for the deep depth (GC / stacks / guest blocks).",
-            };
+    /**
+     * measureWindow({ms?=15000, budgetMs?, samples?, gapMs?}) — a frameReport window that
+     * brackets ITSELF with a scene probe.
+     *
+     * A timing window is void if the scene changed under it, and nothing inside the numbers
+     * says so: a race that ENDS mid-window leaves an animating results screen, so motion
+     * stays high and every percentile stays plausible. This verb probes before arming and
+     * again after reading, compares the two, and reports `usable:false` with the reason when
+     * they diverge — the report is still returned, labelled, rather than quietly quoted.
+     *
+     * The probes sit OUTSIDE the armed window (each is several screen captures), so they
+     * cost the measurement nothing.
+     */
+    svc.register("measureWindow", async (args) => {
+        const opts = (args[0] ?? {}) as {
+            ms?: number; budgetMs?: number; captureOverMs?: number; top?: number;
+            samples?: number; gapMs?: number;
+        };
+        const ms = Math.max(1000, Math.min(opts.ms ?? 15000, 120000));
+
+        let before: SceneProbe | null = null;
+        let after: SceneProbe | null = null;
+        let probeError: string | undefined;
+        try {
+            before = await probeScene({ samples: opts.samples, gapMs: opts.gapMs });
+        } catch (e) {
+            probeError = String((e as Error)?.message ?? e);
         }
 
-        const tail = frameProfiler.getTail({ budgetMs: opts.budgetMs, maxBuckets: opts.maxBuckets });
-        const budgetMs = opts.budgetMs ?? (tail.ok && tail.budget ? tail.budget.ms : undefined);
-        const spikes = frameProfiler.getSpikeClasses({ budgetMs, top: opts.top ?? 8 });
-        const now = snapshotCounters(render);
-        mark(WINDOW_END_MARK);
+        armFrameWindow(opts);
+        const t0 = performance.now();
+        await new Promise((r) => setTimeout(r, ms));
+        const elapsedMs = performance.now() - t0;
+        const report = readFrameWindow(opts);
 
+        if (before && !probeError) {
+            try {
+                after = await probeScene({ samples: opts.samples, gapMs: opts.gapMs });
+            } catch (e) {
+                probeError = String((e as Error)?.message ?? e);
+            }
+        }
+
+        const scene = before && after ? compareScenes(before, after) : null;
+        const usable = !!scene && scene.verdict !== "different-scene";
         return {
-            boundary: {
-                tail: "present (RenderService.notifyPresent — the same event as the bottleship.flip trace mark and getFlipCadence)",
-                spikes: "markFrame (presenter-labelled; ddraw Flip's frameAlreadyMarked can skip it)",
-                presentFrames: frameProfiler.getPresentFrameCount(),
-                markFrames: frameProfiler.getMarkFrameCount(),
-                agree: boundariesAgree(frameProfiler.getPresentFrameCount(), frameProfiler.getMarkFrameCount()),
-                note: boundariesAgree(frameProfiler.getPresentFrameCount(), frameProfiler.getMarkFrameCount())
-                    ? undefined
-                    : "the two frame boundaries saw different counts — spike-class coverage is relative to markFrame frames, "
-                      + "while the tail/budget verdict is relative to presents",
-            },
-            tail,
-            spikes: {
-                ...spikes,
-                drill: {
-                    thunks: "perfThunks({filter}) — session-wide per-call cost; avgUs is the contention-robust figure, frame counts are not",
-                    subPhases: "profilerStats({filter}) — named-bucket sub-phase timings (maxMs = worst single call)",
-                    guestCode: "guestBlocks() — sampled (time-weighted) + trace2 (count-weighted) guest-block attribution",
-                },
-            },
-            counters: counterDelta(windowBaseline, now),
-            crossCheck: crossCheckFlipCadence(render, tail, opts.refreshMs ?? 16.67),
-            join: joinInfo(render, windowBaseline, now),
-            blindSpots: LIVE_BLIND_SPOTS,
+            usable,
+            reason: usable
+                ? undefined
+                : scene
+                    ? `the scene changed under the window (${scene.verdict}, distance ${scene.distance}) — these percentiles compare two different workloads`
+                    : `no scene probe (${probeError ?? "unavailable"}), so nothing checked that the window measured one workload`,
+            elapsedMs: +elapsedMs.toFixed(1),
+            scene,
+            sceneBefore: before,
+            sceneAfter: after,
+            report,
         };
     });
 

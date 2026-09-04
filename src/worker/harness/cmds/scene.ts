@@ -58,6 +58,88 @@ const meanAbsDiff = (a: ArrayLike<number>, b: ArrayLike<number>): number => {
     return s / a.length;
 };
 
+export type SceneProbe = {
+    grid: number[];
+    motion: number;
+    motionPerSample: number[];
+    brightness: number;
+    fingerprint: number[];
+    [k: string]: unknown;
+};
+
+/** The body of `sceneProbe`, so a verb that must bracket its own window with one
+ *  (see `measureWindow`) takes the same measurement rather than a second definition. */
+export async function probeScene(opts: { samples?: number; gapMs?: number } = {}): Promise<SceneProbe> {
+    const samples = Math.max(2, Math.min(opts.samples ?? 4, 16));
+    const gapMs = Math.max(50, Math.min(opts.gapMs ?? 350, 5000));
+
+    const active = sys().services?.render?.getActive?.() as
+        { backendExecutor?: { getSubmitStats?: (r: boolean) => unknown }; getBackendExecutor?: () => { getSubmitStats?: (r: boolean) => unknown } } | undefined;
+    const executor = active?.backendExecutor ?? active?.getBackendExecutor?.();
+    const submitBefore = executor?.getSubmitStats ? executor.getSubmitStats(true) : null;
+
+    const frames: Float64Array[] = [];
+    for (let i = 0; i < samples; i++) {
+        frames.push(await grabLuma());
+        if (i < samples - 1) await new Promise((r) => setTimeout(r, gapMs));
+    }
+    const submitAfter = executor?.getSubmitStats ? executor.getSubmitStats(false) : null;
+
+    // Motion: consecutive differences, so a single flash does not read as constant motion.
+    const diffs: number[] = [];
+    for (let i = 1; i < frames.length; i++) diffs.push(meanAbsDiff(frames[i - 1]!, frames[i]!));
+    const motion = diffs.reduce((a, b) => a + b, 0) / diffs.length;
+
+    // The fingerprint is the AVERAGE frame: a scene that animates in place still has a
+    // stable average, so two runs of the same menu match while a different screen does not.
+    const avg = new Float64Array(GW * GH);
+    for (const f of frames) for (let i = 0; i < avg.length; i++) avg[i] += f[i]! / frames.length;
+
+    let sum = 0;
+    for (let i = 0; i < avg.length; i++) sum += avg[i]!;
+
+    return {
+        grid: [GW, GH],
+        samples, gapMs,
+        spanMs: gapMs * (samples - 1),
+        motion: +motion.toFixed(3),
+        motionPerSample: diffs.map((d) => +d.toFixed(3)),
+        brightness: +(sum / avg.length).toFixed(2),
+        // Rounded: the fingerprint is for comparison, and full precision would make two
+        // captures of the same static screen differ by encoder noise.
+        fingerprint: Array.from(avg, (v) => Math.round(v)),
+        submit: { before: submitBefore, after: submitAfter },
+        note: "motion is mean |luma delta| per cell between consecutive captures (0-255). "
+            + "A static screen sits near 0. Compare two probes with sceneCompare rather than "
+            + "against an absolute threshold — 'is this gameplay' is game-specific, 'is this "
+            + "the same scene as the other arm' is not.",
+    };
+}
+
+/** The body of `sceneCompare` — same reason as `probeScene`. */
+export function compareScenes(
+    a: { fingerprint?: number[]; motion?: number } | undefined,
+    b: { fingerprint?: number[]; motion?: number } | undefined,
+): { distance: number; motionA?: number; motionB?: number; verdict: string; note: string } {
+    if (!a?.fingerprint || !b?.fingerprint) {
+        throw new HarnessError("sceneCompare needs two sceneProbe results", HarnessErrorCode.BAD_ARGS);
+    }
+    if (a.fingerprint.length !== b.fingerprint.length) {
+        throw new HarnessError("fingerprints have different grids — probes from different builds", HarnessErrorCode.BAD_ARGS);
+    }
+    const distance = meanAbsDiff(a.fingerprint, b.fingerprint);
+    return {
+        distance: +distance.toFixed(3),
+        motionA: a.motion, motionB: b.motion,
+        // The scale is luma units per cell, so the bands below are readable rather than
+        // arbitrary: a few units is compression and animation, tens is a different image.
+        verdict: distance < 6 ? "same-scene" : distance < 20 ? "similar" : "different-scene",
+        note: "distance is mean |luma delta| per cell between the two average frames (0-255). "
+            + "'different-scene' means the two runs were NOT looking at the same thing and any "
+            + "side-by-side timing between them is void.",
+    };
+}
+
 export function registerSceneCommands(svc: HarnessService): void {
     /**
      * sceneProbe({ samples?, gapMs? }) — a fingerprint of the current scene plus how much it
@@ -67,54 +149,7 @@ export function registerSceneCommands(svc: HarnessService): void {
      * static and expensive, an animated menu moves and is cheap. One number alone names none
      * of them.
      */
-    svc.register("sceneProbe", async (args) => {
-        const opts = (args[0] ?? {}) as { samples?: number; gapMs?: number };
-        const samples = Math.max(2, Math.min(opts.samples ?? 4, 16));
-        const gapMs = Math.max(50, Math.min(opts.gapMs ?? 350, 5000));
-
-        const active = sys().services?.render?.getActive?.() as
-            { backendExecutor?: { getSubmitStats?: (r: boolean) => unknown }; getBackendExecutor?: () => { getSubmitStats?: (r: boolean) => unknown } } | undefined;
-        const executor = active?.backendExecutor ?? active?.getBackendExecutor?.();
-        const submitBefore = executor?.getSubmitStats ? executor.getSubmitStats(true) : null;
-
-        const frames: Float64Array[] = [];
-        for (let i = 0; i < samples; i++) {
-            frames.push(await grabLuma());
-            if (i < samples - 1) await new Promise((r) => setTimeout(r, gapMs));
-        }
-        const submitAfter = executor?.getSubmitStats ? executor.getSubmitStats(false) : null;
-
-        // Motion: consecutive differences, so a single flash does not read as constant motion.
-        const diffs: number[] = [];
-        for (let i = 1; i < frames.length; i++) diffs.push(meanAbsDiff(frames[i - 1]!, frames[i]!));
-        const motion = diffs.reduce((a, b) => a + b, 0) / diffs.length;
-
-        // The fingerprint is the AVERAGE frame: a scene that animates in place still has a
-        // stable average, so two runs of the same menu match while a different screen does not.
-        const avg = new Float64Array(GW * GH);
-        for (const f of frames) for (let i = 0; i < avg.length; i++) avg[i] += f[i]! / frames.length;
-
-        let sum = 0;
-        for (let i = 0; i < avg.length; i++) sum += avg[i]!;
-        const brightness = sum / avg.length;
-
-        return {
-            grid: [GW, GH],
-            samples, gapMs,
-            spanMs: gapMs * (samples - 1),
-            motion: +motion.toFixed(3),
-            motionPerSample: diffs.map((d) => +d.toFixed(3)),
-            brightness: +brightness.toFixed(2),
-            // Rounded: the fingerprint is for comparison, and full precision would make two
-            // captures of the same static screen differ by encoder noise.
-            fingerprint: Array.from(avg, (v) => Math.round(v)),
-            submit: { before: submitBefore, after: submitAfter },
-            note: "motion is mean |luma delta| per cell between consecutive captures (0-255). "
-                + "A static screen sits near 0. Compare two probes with sceneCompare rather than "
-                + "against an absolute threshold — 'is this gameplay' is game-specific, 'is this "
-                + "the same scene as the other arm' is not.",
-        };
-    });
+    svc.register("sceneProbe", async (args) => probeScene((args[0] ?? {}) as { samples?: number; gapMs?: number }));
 
     /**
      * sceneCompare(a, b) — are two `sceneProbe` results looking at the same thing?
@@ -123,25 +158,8 @@ export function registerSceneCommands(svc: HarnessService): void {
      * frame percentiles that mean nothing next to each other, and nothing else in a run
      * notices.
      */
-    svc.register("sceneCompare", (args) => {
-        const a = args[0] as { fingerprint?: number[]; motion?: number } | undefined;
-        const b = args[1] as { fingerprint?: number[]; motion?: number } | undefined;
-        if (!a?.fingerprint || !b?.fingerprint) {
-            throw new HarnessError("sceneCompare needs two sceneProbe results", HarnessErrorCode.BAD_ARGS);
-        }
-        if (a.fingerprint.length !== b.fingerprint.length) {
-            throw new HarnessError("fingerprints have different grids — probes from different builds", HarnessErrorCode.BAD_ARGS);
-        }
-        const distance = meanAbsDiff(a.fingerprint, b.fingerprint);
-        return {
-            distance: +distance.toFixed(3),
-            motionA: a.motion, motionB: b.motion,
-            // The scale is luma units per cell, so the bands below are readable rather than
-            // arbitrary: a few units is compression and animation, tens is a different image.
-            verdict: distance < 6 ? "same-scene" : distance < 20 ? "similar" : "different-scene",
-            note: "distance is mean |luma delta| per cell between the two average frames (0-255). "
-                + "'different-scene' means the two runs were NOT looking at the same thing and any "
-                + "side-by-side timing between them is void.",
-        };
-    });
+    svc.register("sceneCompare", (args) => compareScenes(
+        args[0] as { fingerprint?: number[]; motion?: number } | undefined,
+        args[1] as { fingerprint?: number[]; motion?: number } | undefined,
+    ));
 }
