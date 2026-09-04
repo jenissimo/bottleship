@@ -1,9 +1,13 @@
+/** A cache key may be a packed number where the identity fits one exactly — a
+ *  per-draw string join is an allocation the lookup does not need. */
+export type PipelineCacheKey = string | number;
+
 export class PipelineCache<T> {
-    private readonly map = new Map<string, T>();
+    private readonly map = new Map<PipelineCacheKey, T>();
     private hitsCount = 0;
     private missesCount = 0;
 
-    get(key: string): T | undefined {
+    get(key: PipelineCacheKey): T | undefined {
         const value = this.map.get(key);
         if (value !== undefined) {
             this.hitsCount++;
@@ -13,7 +17,7 @@ export class PipelineCache<T> {
         return value;
     }
 
-    set(key: string, value: T): void {
+    set(key: PipelineCacheKey, value: T): void {
         this.map.set(key, value);
     }
 

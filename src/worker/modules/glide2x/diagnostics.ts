@@ -24,44 +24,71 @@ type GlideEventEntry = {
     detail?: string;
 };
 
+/**
+ * A ring of the last N Glide events.
+ *
+ * Columns, not entry objects: `push` runs in the hottest handlers in the module
+ * (a draw event per triangle, 22M a session in Carmageddon 2), and an object plus
+ * a formatted string per call is allocation the reader almost never collects. The
+ * variable part of a hot event's detail is a NUMBER, so callers hand over an
+ * interned label and the number, and the text is composed at read time.
+ */
 export class GlideDiagnostics {
     private readonly capacity: number;
-    private readonly entries: Array<GlideEventEntry | null>;
+    private readonly types: Array<GlideEventType | null>;
+    private readonly details: Array<string | undefined>;
+    private readonly ids: Float64Array;
+    private readonly timestamps: Float64Array;
+    private readonly numbers: Float64Array;
     private cursor = 0;
     private count = 0;
     private nextId = 1;
 
     constructor(capacity: number) {
         this.capacity = Math.max(8, capacity | 0);
-        this.entries = new Array<GlideEventEntry | null>(this.capacity).fill(null);
+        this.types = new Array<GlideEventType | null>(this.capacity).fill(null);
+        this.details = new Array<string | undefined>(this.capacity).fill(undefined);
+        this.ids = new Float64Array(this.capacity);
+        this.timestamps = new Float64Array(this.capacity);
+        this.numbers = new Float64Array(this.capacity).fill(NaN);
     }
 
-    push(type: GlideEventType, detail?: string): void {
-        const entry: GlideEventEntry = {
-            id: this.nextId++,
-            type,
-            timestamp: performance.now(),
-            detail,
-        };
-        this.entries[this.cursor] = entry;
-        this.cursor = (this.cursor + 1) % this.capacity;
+    /** `detail` is rendered verbatim; `trailingNumber`, when given, is appended to it —
+     *  so a hot caller passes a constant label and a number instead of building a string. */
+    push(type: GlideEventType, detail?: string, trailingNumber: number = NaN): void {
+        const i = this.cursor;
+        this.types[i] = type;
+        this.details[i] = detail;
+        this.ids[i] = this.nextId++;
+        this.timestamps[i] = performance.now();
+        this.numbers[i] = trailingNumber;
+        this.cursor = (i + 1) % this.capacity;
         this.count = Math.min(this.count + 1, this.capacity);
     }
 
     getRecent(limit: number = 64): Array<GlideEventEntry> {
         const wanted = Math.max(0, Math.min(limit | 0, this.count));
         const out: GlideEventEntry[] = [];
-        for (let i = 0; i < wanted; i++) {
+        for (let i = wanted - 1; i >= 0; i--) {
             const idx = (this.cursor - 1 - i + this.capacity) % this.capacity;
-            const entry = this.entries[idx];
-            if (entry) out.push(entry);
+            const type = this.types[idx];
+            if (!type) continue;
+            const detail = this.details[idx];
+            const num = this.numbers[idx]!;
+            out.push({
+                id: this.ids[idx]!,
+                type,
+                timestamp: this.timestamps[idx]!,
+                detail: Number.isNaN(num) ? detail : `${detail ?? ""}${num}`,
+            });
         }
-        out.reverse();
         return out;
     }
 
     reset(): void {
-        this.entries.fill(null);
+        this.types.fill(null);
+        this.details.fill(undefined);
+        this.numbers.fill(NaN);
         this.cursor = 0;
         this.count = 0;
         this.nextId = 1;

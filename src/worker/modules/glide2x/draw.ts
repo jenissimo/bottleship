@@ -1,5 +1,6 @@
 import { Mem } from "../../core/memory/mem-accessor";
 import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
+import type { Legacy3DDrawCommand } from "../../backends/webgpu/legacy3d/types";
 import { GlideContext } from "./context";
 import {
     GR_CMP_ALWAYS,
@@ -171,6 +172,30 @@ function pushVertexFromPtr(context: GlideContext, ptr: number): number {
     return pushVertexFloats(context, vertexFloats, 0);
 }
 
+/**
+ * The command the stream is about to flatten into its Int32Array, and the
+ * `lastDraw` snapshot field, as reused flyweights.
+ *
+ * Both are consumed synchronously — pushDraw copies the command out field by
+ * field, and cloneFrameSnapshot spreads lastDraw for anyone who keeps it — so a
+ * fresh object per call would be two allocations per TRIANGLE for nothing.
+ */
+const drawCommand: Legacy3DDrawCommand = {
+    firstVertex: 0, vertexCount: 0, topology: "triangle-list", textureHandle: 0,
+    useTexture: false, blendEnabled: false, depthTestEnabled: false, depthWriteEnabled: false,
+    depthFunction: 0, alphaTestEnabled: false, alphaRef: 0, cullMode: 0, constantColor: 0,
+    clampS: false, clampT: false, filterLinear: false, colorCombine: 0, alphaCombine: 0,
+    blend: 0, colorMaskRgb: false, colorMaskAlpha: false, alphaTestFunc: 0, fogMode: 0,
+    fogColor: 0, mipMapEnabled: false, clipX0: 0, clipY0: 0, clipX1: 0, clipY1: 0,
+};
+
+/** The interned "<topology> vtx=" labels the diagnostics ring appends a count to. */
+const DRAW_EVENT_LABEL = {
+    "point-list": "point-list vtx=",
+    "line-list": "line-list vtx=",
+    "triangle-list": "triangle-list vtx=",
+} as const;
+
 function pushDraw(
     context: GlideContext,
     topology: "point-list" | "line-list" | "triangle-list",
@@ -188,52 +213,54 @@ function pushDraw(
     const blendEnabled = !blendIsOpaque(blend.rgbSf, blend.rgbDf, blend.alphaSf, blend.alphaDf);
     // alphaTestFunction is the GR_CMP_* the game set (default GR_CMP_ALWAYS = no test).
     const alphaTestFunc = rt.alphaTestFunction | 0;
-    const draw = {
-        firstVertex,
-        vertexCount,
-        topology,
-        textureHandle: context.ffpState.textureHandle,
-        useTexture: drawUsesTexture(context),
-        blendEnabled,
-        depthTestEnabled: context.ffpState.depthTestEnabled,
-        depthWriteEnabled: context.ffpState.depthWriteEnabled,
-        depthFunction: rt.depthFunction,
-        alphaTestEnabled: alphaTestFunc !== GR_CMP_ALWAYS,
-        alphaRef: rt.alphaReference,
-        cullMode: forceCullDisable ? 0 : rt.cullMode,
-        constantColor: rt.constantColorValue >>> 0,
-        clampS: (tmu0?.clampS | 0) !== 0,
-        clampT: (tmu0?.clampT | 0) !== 0,
-        filterLinear: filterLinear,
-        // Real combine / blend / fog state for the WGSL pipeline.
-        colorCombine: packCombine(rt.colorCombine),
-        alphaCombine: packCombine(rt.alphaCombine),
-        blend: packBlend(blend.rgbSf, blend.rgbDf, blend.alphaSf, blend.alphaDf),
-        colorMaskRgb: rt.colorMask.rgb,
-        colorMaskAlpha: rt.colorMask.alpha,
-        alphaTestFunc,
-        fogMode: rt.fogMode | 0,
-        fogColor: rt.fogColor >>> 0,
-        // GR_MIPMAP_DISABLE (0) means the TMU samples the largest LOD only.
-        mipMapEnabled: ((tmu0?.mipMapMode | 0) !== 0),
-        clipX0: rt.clipWindow.minX | 0,
-        clipY0: rt.clipWindow.minY | 0,
-        clipX1: rt.clipWindow.maxX | 0,
-        clipY1: rt.clipWindow.maxY | 0,
-    };
+    const draw = drawCommand;
+    draw.firstVertex = firstVertex;
+    draw.vertexCount = vertexCount;
+    draw.topology = topology;
+    draw.textureHandle = context.ffpState.textureHandle;
+    draw.useTexture = drawUsesTexture(context);
+    draw.blendEnabled = blendEnabled;
+    draw.depthTestEnabled = context.ffpState.depthTestEnabled;
+    draw.depthWriteEnabled = context.ffpState.depthWriteEnabled;
+    draw.depthFunction = rt.depthFunction;
+    draw.alphaTestEnabled = alphaTestFunc !== GR_CMP_ALWAYS;
+    draw.alphaRef = rt.alphaReference;
+    draw.cullMode = forceCullDisable ? 0 : rt.cullMode;
+    draw.constantColor = rt.constantColorValue >>> 0;
+    draw.clampS = (tmu0?.clampS | 0) !== 0;
+    draw.clampT = (tmu0?.clampT | 0) !== 0;
+    draw.filterLinear = filterLinear;
+    // Real combine / blend / fog state for the WGSL pipeline.
+    draw.colorCombine = packCombine(rt.colorCombine);
+    draw.alphaCombine = packCombine(rt.alphaCombine);
+    draw.blend = packBlend(blend.rgbSf, blend.rgbDf, blend.alphaSf, blend.alphaDf);
+    draw.colorMaskRgb = rt.colorMask.rgb;
+    draw.colorMaskAlpha = rt.colorMask.alpha;
+    draw.alphaTestFunc = alphaTestFunc;
+    draw.fogMode = rt.fogMode | 0;
+    draw.fogColor = rt.fogColor >>> 0;
+    // GR_MIPMAP_DISABLE (0) means the TMU samples the largest LOD only.
+    draw.mipMapEnabled = ((tmu0?.mipMapMode | 0) !== 0);
+    draw.clipX0 = rt.clipWindow.minX | 0;
+    draw.clipY0 = rt.clipWindow.minY | 0;
+    draw.clipX1 = rt.clipWindow.maxX | 0;
+    draw.clipY1 = rt.clipWindow.maxY | 0;
+
     context.stream.pushDraw(draw);
     context.frameSnapshot.drawCalls++;
     context.frameSnapshot.frameCounters.vertexBytes += vertexCount * 28;
-    context.frameSnapshot.lastDraw = {
-        topology,
-        vertexCount,
-        textured: draw.useTexture,
-        blend: draw.blendEnabled,
-        depthTest: draw.depthTestEnabled,
-        alphaTest: draw.alphaTestEnabled,
-        timestamp: performance.now(),
+    const last = context.frameSnapshot.lastDraw ??= {
+        topology, vertexCount, textured: false, blend: false,
+        depthTest: false, alphaTest: false, timestamp: 0,
     };
-    context.diagnostics.push("draw", `${topology} vtx=${vertexCount}`);
+    last.topology = topology;
+    last.vertexCount = vertexCount;
+    last.textured = draw.useTexture;
+    last.blend = draw.blendEnabled;
+    last.depthTest = draw.depthTestEnabled;
+    last.alphaTest = draw.alphaTestEnabled;
+    last.timestamp = performance.now();
+    context.diagnostics.push("draw", DRAW_EVENT_LABEL[topology], vertexCount);
 }
 
 function drawIndexedPolygon(context: GlideContext, nVerts: number, indexListPtr: number, vertexListPtr: number): void {
