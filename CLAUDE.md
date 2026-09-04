@@ -416,28 +416,34 @@ Quality Gate (mandatory order):
      itself from "the plane still holds a bitmap" they disagreed about when it STOPS being on
      screen, and a finished movie covered the menu. Nothing outside `src/worker/video/` may
      reach `getOverlayService()`)
- 21. bun tools/validate-wgsl-calls.ts            (every call to a WGSL helper we wrote passes the
+ 21. bun tools/validate-render-space-ownership.ts   (the host canvas size is not a guest-space
+     quantity. Guest space is the extent the app asked for — viewport, scissor, the XYZRHW
+     divisor, every readback extent; the canvas is the present target, sized by the host
+     container. D3D9 conflated them and rendered a 640x480 game into the top-left corner of a
+     1557x1168 canvas. Reading the canvas is a pinned census of file+member: the present pass
+     and the internal-scale resolver, nothing else)
+ 22. bun tools/validate-wgsl-calls.ts            (every call to a WGSL helper we wrote passes the
      arity that helper declares — our shaders are template strings, invisible to the typechecker,
      and one bad call blackens a whole pass)
- 22. bun tools/validate-d3d9-arena-abi.ts        (LayoutIdx order/length matches arena.rs
+ 23. bun tools/validate-d3d9-arena-abi.ts        (LayoutIdx order/length matches arena.rs
      LAYOUT_TABLE, and the arena exports in public/v86.wasm match the ones arena.rs declares —
      missing AND stale extras, so a not-rebuilt artifact cannot silently disable the arena)
- 23. bun tools/validate-d3d9-capability-contracts.ts   (the MSAA/float/volume contracts are measured
+ 24. bun tools/validate-d3d9-capability-contracts.ts   (the MSAA/float/volume contracts are measured
      from the live device, not read off globalThis, and the probe is AWAITED as an unconditional
      statement before the device is published)
- 24. bun tools/d3d9-parity/validate-caps.ts      (`bun run validate-d3d9-caps` — the name no longer
+ 25. bun tools/d3d9-parity/validate-caps.ts      (`bun run validate-d3d9-caps` — the name no longer
      predicts the path: the checked-in reference D3DCAPS9 blob AND the caps we answer with)
- 25. bun tools/validate-snapshots.ts             (every toMatchSnapshot() has a TRACKED .snap: bun
+ 26. bun tools/validate-snapshots.ts             (every toMatchSnapshot() has a TRACKED .snap: bun
      writes a missing snapshot and exits 0, so without the file the assertion asserts nothing)
- 26. bun run gate:d3d9-capture                   (differential native-D3D9 capture. `report:d3d9-capture`
+ 27. bun run gate:d3d9-capture                   (differential native-D3D9 capture. `report:d3d9-capture`
      is reporting-only and exits 0 for everything; this wrapper fails on an unreadable/invalid
      capture and on any divergence NOT recorded in tools/d3d9-capture-expected.json — the
      intentional ones of plan/dx9c-review-findings-2026-08-26.md §B2. Record a new intentional
      one with `--update-baseline`)
- 27. bun run report:d3d9-wgsl-validator          (with BS_REQUIRE_WGSL_VALIDATOR=1, so a missing
+ 28. bun run report:d3d9-wgsl-validator          (with BS_REQUIRE_WGSL_VALIDATOR=1, so a missing
      naga is an error instead of a silent skip)
- 28. bun run typecheck
- 29. bun test                                    (also with BS_REQUIRE_WGSL_VALIDATOR=1 — otherwise
+ 29. bun run typecheck
+ 30. bun test                                    (also with BS_REQUIRE_WGSL_VALIDATOR=1 — otherwise
      every describe.skipIf in wgsl-smoke.test.ts vanishes and the suite is green without it)
 
 `bun run gate` runs all of it in order — including the test suite as the final step. CI runs
