@@ -256,7 +256,8 @@ export class GDIContext {
 
     setCanvas(canvas: OffscreenCanvas) {
         this.screenCanvas = canvas;
-        // Create overlay canvas with same dimensions
+        // Placeholder size only — the overlay is a GUEST-space plane and the caller sizes it
+        // to the guest desktop right after (resizeOverlay); the host canvas is a different space.
         // Use willReadFrequently: true for optimized getImageData operations in ReleaseDC
         this.overlayCanvas = new OffscreenCanvas(canvas.width, canvas.height);
         // Explicitly request alpha support for proper text antialiasing transparency
@@ -651,8 +652,11 @@ export class GDIContext {
             this.overlayHasContent = true;
             this.overlayDirty = true;
         } else {
+            // Resizing an EMPTY plane yields an empty plane: there is nothing to publish, and
+            // a dirty-but-blank overlay makes the GDI loop clear the canvas to the desktop
+            // colour before any guest has painted. Only a plane that HAD art needs a repair.
+            this.overlayDirty = this.overlayHasContent;
             this.overlayHasContent = false;
-            this.overlayDirty = true;
         }
     }
 
@@ -741,18 +745,6 @@ export class GDIContext {
      */
     createOverlayDC(): number {
         if (!this.overlayCanvas || !this.overlayCtx) return 0;
-
-        // Ensure overlay matches screen canvas size
-        if (this.screenCanvas &&
-            (this.overlayCanvas.width !== this.screenCanvas.width ||
-             this.overlayCanvas.height !== this.screenCanvas.height)) {
-            // Changing canvas size resets the context state
-            this.overlayCanvas.width = this.screenCanvas.width;
-            this.overlayCanvas.height = this.screenCanvas.height;
-            // Re-acquire context with alpha support after resize
-            this.overlayCtx = this.overlayCanvas.getContext('2d', { alpha: true, willReadFrequently: true });
-            if (!this.overlayCtx) return 0;
-        }
 
         const hdc = this.nextHdc++;
         this.contexts.set(hdc, this.overlayCtx);

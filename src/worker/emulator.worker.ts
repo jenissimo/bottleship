@@ -25,6 +25,8 @@ import { Oleaut32 } from "./modules/oleaut32";
 import { Oledlg } from "./modules/oledlg";
 import { DDraw } from "./modules/ddraw";
 import { getOverlayCompositePlan } from "./modules/user32/dialog-overlay";
+import { getVirtualScreenRect } from "./modules/user32/shared-state";
+import { setPresentRectListener } from "./backends/webgpu/shared/present-geometry";
 import { flushHeldWindowDCs } from "./modules/user32/window";
 import { DInput } from "./modules/dinput";
 import { DPlayX } from "./modules/dplayx";
@@ -388,6 +390,18 @@ function installRegistryAutosave(gameId: string): void {
 }
 
 /**
+ * The GDI/window plane is a GUEST-space image, exactly like a DDraw primary surface: every
+ * paint into it uses raw guest screen coordinates. So it is sized by the guest DESKTOP mode
+ * and only ever re-sized when THAT changes, never by the host canvas.
+ */
+const syncOverlayToGuestScreen = () => {
+  const r = getVirtualScreenRect();
+  const w = Math.max(1, Math.round(r.right - r.left));
+  const h = Math.max(1, Math.round(r.bottom - r.top));
+  System.getInstance().gdiContext.resizeOverlay(w, h);
+};
+
+/**
  * GDI presentation loop - composites overlay to screen when dirty
  */
 const gdiPresentOnce = () => {
@@ -464,6 +478,16 @@ const gdiPresentOnce = () => {
         if (overlayCanvas) backend.compositeRects!(overlayCanvas, plan.rects);
       }
       return;
+    }
+
+    // GDI owns the screen: nothing else presents, so the guest DESKTOP MODE is what tells the
+    // compositors (and the host's pointer mapping) where the guest picture lands. Read from
+    // the same authority the plane itself is sized by — the plane's own dimensions are frozen
+    // for the duration of a held paint bracket and would answer for the previous mode.
+    if (backend.publishGuestPresentRect) {
+      const vs = getVirtualScreenRect();
+      backend.publishGuestPresentRect(
+        Math.max(1, Math.round(vs.right - vs.left)), Math.max(1, Math.round(vs.bottom - vs.top)));
     }
 
     // Include dirty clears (hasOverlayContent=false after clearOverlay) so the GPU
@@ -2484,27 +2508,28 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       }
 
       system.gdiContext.setCanvas(canvas);
+      syncOverlayToGuestScreen();
+      // The host maps every pointer coordinate into guest space, so it needs the same
+      // content rect the overlay compositors use — under pillarbox/integer the picture is
+      // a sub-rect of the canvas and a linear canvas->guest map is off by the bars.
+      // Only the GEOMETRY travels: the guest pointer space is published separately by
+      // "app_resize", and the rect's own source size is the PRESENTED TEXTURE's (a
+      // supersampled Glide offscreen, say), which is not a coordinate space at all.
+      setPresentRectListener((r) => {
+        self.postMessage({
+          type: "present_rect",
+          x: r.x, y: r.y, w: r.w, h: r.h, outW: r.outW, outH: r.outH,
+        });
+      });
       system.setHostResizeCallback((width, height) => {
-        // Resize worker-side canvas + overlay immediately
-        // (host may not send "resize" back, e.g. non-guest coordinate mode)
-        const prevW = state.canvas?.width ?? 0;
-        const prevH = state.canvas?.height ?? 0;
-        if (state.canvas && (state.canvas.width !== width || state.canvas.height !== height)) {
-          // Note: Setting canvas.width/height to the SAME value still resets the OffscreenCanvas
-          // and invalidates the WebGPU context. Only resize if dimensions actually change.
-          state.canvas.width = width;
-          state.canvas.height = height;
-          // Reconfigure WebGPU context — canvas resize unconfigures it
-          const backend = system.services.render.getBackend();
-          if (backend?.kind === "webgpu") {
-            (backend as WebGPUBackend).reconfigure();
-          }
-        }
+        // The canvas BACKING BUFFER is the host's to size — it follows the display area, not
+        // the guest mode (the picture is stretched into it at present time). The host echoes a
+        // "resize" with the display-fit size, and that is its single writer.
         state.width = width;
         state.height = height;
-        system.gdiContext.resizeOverlay(width, height);
-        Logger.log(LogCategory.SYSTEM, `hostResize: ${prevW}x${prevH} -> ${width}x${height} (canvas=${!!state.canvas})`);
-        // Notify host to resize CSS element
+        syncOverlayToGuestScreen();
+        Logger.log(LogCategory.SYSTEM,
+          `hostResize: guest mode ${width}x${height} (canvas=${state.canvas?.width ?? 0}x${state.canvas?.height ?? 0})`);
         self.postMessage({ type: "app_resize", width, height });
       });
       system.setHostCursorVisibilityCallback((visible) => {
@@ -3383,14 +3408,10 @@ const handleWorkerMessage = (event: MessageEvent): void => {
     state.width = message.width ?? state.width;
     state.height = message.height ?? state.height;
     const system = System.getInstance();
-    // The guest's own hostResize callback (see setHostResizeCallback) is the OTHER writer
-    // of canvas.width/height, for guest-driven mode/backbuffer changes — it already
-    // reconfigures, so when this round-trip merely echoes a size it already applied, the
-    // dimension check below is false and this stays a no-op (no double reconfigure after
-    // frames have rendered → no black screen). But this message is also the ONLY thing
-    // that resizes the canvas for a plain HOST window resize (the guest never asked for a
-    // new size), and canvas.width/height writes unconfigure the WebGPU context — so a real
-    // change here must reconfigure too, or the backend renders into a detached swap chain.
+    // The ONE writer of the canvas backing size: the host owns the display area, and the
+    // guest picture is stretched into it. canvas.width/height writes unconfigure the WebGPU
+    // context (even when written the same value), so a real change must reconfigure or the
+    // backend renders into a detached swap chain — hence the check.
     if (state.canvas && (state.canvas.width !== state.width || state.canvas.height !== state.height)) {
       state.canvas.width = state.width;
       state.canvas.height = state.height;
@@ -3399,8 +3420,8 @@ const handleWorkerMessage = (event: MessageEvent): void => {
         (backend as WebGPUBackend).reconfigure();
       }
     }
-    // Also resize GDI overlay canvas
-    system.gdiContext.resizeOverlay(state.width, state.height);
+    // The window plane is guest-space, so a HOST resize must not touch it.
+    syncOverlayToGuestScreen();
 
     // Trigger repaint for all windows on resize
     const WM_PAINT = 0x000F;
