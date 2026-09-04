@@ -36,7 +36,8 @@ export interface TouchSettings {
 
 export interface TouchDriverOptions {
     /** Live canvas rect in client coordinates (the letterboxed video area). */
-    getCanvasRect: () => DOMRect | null;
+    /** The presented picture's CSS rect (not necessarily the whole canvas element). */
+    getCanvasRect: () => { left: number; top: number; width: number; height: number; right: number; bottom: number } | null;
     /** Guest-space size the cursor is published in. */
     getPointerSpace: () => { width: number; height: number };
     getSettings: () => TouchSettings;

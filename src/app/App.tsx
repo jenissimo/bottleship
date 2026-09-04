@@ -34,6 +34,12 @@ import { browserPolicyBlock, loadDeploymentConfig } from "../deployment-config";
 import { DEFAULT_QUALITY, mergeQuality, parseStoredQuality, serializeStoredQuality } from "../worker/core/quality-config";
 import type { QualityConfig } from "../worker/core/quality-config";
 import {
+  clientToGuestPoint,
+  contentRectFromPresentRect,
+  type HostRect,
+  type PublishedPresentRect,
+} from "../worker/backends/webgpu/shared/present-geometry";
+import {
   DEFAULT_UI_SETTINGS,
   UI_SETTINGS_STORAGE_KEY,
   loadUiSettings,
@@ -233,6 +239,7 @@ function loadPhaseStatus(phase: string, gameName: string): string {
   }
 }
 
+
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const panelRef = useRef<HTMLElement | null>(null);
@@ -242,6 +249,9 @@ export default function App() {
     guestActive: false,
   });
   const canvasRectRef = useRef<DOMRect | null>(null);
+  /** canvasRectRef narrowed to the presented picture (see toContentRect). The ONE rect every
+   *  host<->guest mapping uses; canvasRectRef stays the element's own box. */
+  const contentRectRef = useRef<HostRect | null>(null);
   // The cursor element is positioned inside the panel, so its transforms are relative
   // to this rect; cached alongside the canvas rect and invalidated by the same events.
   const panelRectRef = useRef<DOMRect | null>(null);
@@ -313,7 +323,7 @@ export default function App() {
   const touchControlsRef = useRef<TouchControlsHandle | null>(null);
   /** Guest pixels per CSS pixel — the widget layer scales relative motion by it. */
   const guestPerCss = useCallback(() => {
-    const rect = canvasRectRef.current;
+    const rect = contentRectRef.current;
     const space = guestResolutionKnownRef.current
       ? guestResolutionRef.current
       : resolutionRef.current;
@@ -724,6 +734,19 @@ export default function App() {
   }, [browserSupport.supported, sabAvailable, isolated, workerStatus]);
 
   const resolutionRef = useRef({ width: 0, height: 0 });
+  /**
+   * Where the guest picture actually sits inside the canvas BACKING BUFFER, published by
+   * the worker (present-geometry). Under aspectMode pillarbox/integer the picture is a
+   * sub-rect with bars around it, so every host<->guest coordinate mapping has to go
+   * through this rather than assuming the buffer IS the guest screen.
+   */
+  const presentRectRef = useRef<PublishedPresentRect | null>(null);
+  /** The canvas element's CSS rect narrowed to the presented picture — the worker's own
+   *  inverse, measured against the backing size THIS side last asked for. */
+  const toContentRect = useCallback((rect: HostRect | null): HostRect | null => (
+    contentRectFromPresentRect(rect, presentRectRef.current,
+      resolutionRef.current.width, resolutionRef.current.height)
+  ), []);
 
   useEffect(() => {
     setHapticsEnabled(uiSettings.touchHaptics);
@@ -867,7 +890,7 @@ export default function App() {
         return view ? { x: view[INPUT_INDEX.mouseX]!, y: view[INPUT_INDEX.mouseY]! } : null;
       },
       getGeometry: () => {
-        const rect = liveCanvasRect();
+        const rect = liveContentRect();
         if (!rect || rect.width <= 0 || rect.height <= 0) return null;
         const origin = panelRectRef.current;
         const space =
@@ -918,6 +941,7 @@ export default function App() {
     // pan, fullscreen, the canvas ResizeObserver, and a guest resolution change.
     const measureRects = () => {
       canvasRectRef.current = canvas.getBoundingClientRect();
+      contentRectRef.current = toContentRect(canvasRectRef.current);
       panelRectRef.current = panelRef.current?.getBoundingClientRect() ?? null;
     };
     // Self-checking cache: a guest mode switch (800x600 → 640x480) resizes the canvas
@@ -934,6 +958,12 @@ export default function App() {
         return canvasRectRef.current;
       }
       return rect;
+    };
+    /** liveCanvasRect narrowed to the presented picture — the mapping space. */
+    const liveContentRect = () => {
+      const rect = liveCanvasRect();
+      if (!rect) return null;
+      return contentRectRef.current ?? rect;
     };
     // The guest is addressed in this space, and the device clamps every publication
     // against it. Established here, not on the first pointer event: a guest SetCursorPos
@@ -1606,6 +1636,17 @@ export default function App() {
           targetWorker.postMessage({ type: "message_box_result", id, result: 1 });
         }
       }
+      if (event.data?.type === "present_rect") {
+        const d = event.data;
+        presentRectRef.current = {
+          x: Number(d.x) || 0, y: Number(d.y) || 0,
+          w: Number(d.w) || 0, h: Number(d.h) || 0,
+          outW: Number(d.outW) || 0, outH: Number(d.outH) || 0,
+          srcW: 0, srcH: 0,
+        };
+        contentRectRef.current = toContentRect(canvasRectRef.current);
+        ((window as any).__BS__ ??= {}).presentRect = presentRectRef.current;
+      }
       if (event.data?.type === "app_resize") {
         const width = Math.max(1, Number(event.data.width) || 1);
         const height = Math.max(1, Number(event.data.height) || 1);
@@ -1725,7 +1766,7 @@ export default function App() {
 
     const detachTouch = panelRef.current
       ? touchDriver.attach(panelRef.current, {
-          getCanvasRect: () => canvasRectRef.current ?? canvas.getBoundingClientRect(),
+          getCanvasRect: () => contentRectRef.current ?? canvas.getBoundingClientRect(),
           getPointerSpace: () =>
             guestResolutionKnownRef.current
               ? guestResolutionRef.current
@@ -1768,7 +1809,7 @@ export default function App() {
       const width  = Math.max(1, pointerSpace.width);
       const height = Math.max(1, pointerSpace.height);
       inputDevice.setPointerBounds(width, height);
-      const rect = canvasRectRef.current ?? canvas.getBoundingClientRect();
+      const rect = contentRectRef.current ?? canvas.getBoundingClientRect();
 
       // --- Pointer Lock mode: use relative movementX/Y, skip canvas bounds check ---
       if (pointerLockedRef.current) {
@@ -1804,10 +1845,8 @@ export default function App() {
       // We map them to the virtual resolution [0..width/height]
       const scaleX = width / rect.width;
       const scaleY = height / rect.height;
-      inputDevice.setPointerAbsolute(
-        (event.clientX - rect.left) * scaleX,
-        (event.clientY - rect.top) * scaleY,
-      );
+      const guest = clientToGuestPoint(rect, event.clientX, event.clientY, width, height);
+      inputDevice.setPointerAbsolute(guest.x, guest.y);
       inputDevice.setButtonsMask(event.buttons, "hw-mouse");
       const dinputDX = Math.round(event.movementX * scaleX);
       const dinputDY = Math.round(event.movementY * scaleY);
@@ -1987,7 +2026,7 @@ export default function App() {
     panel?.addEventListener("pointerleave", handlePanelLeave);
     
     const handleWheel = (event: WheelEvent) => {
-      const rect = canvasRectRef.current ?? canvas.getBoundingClientRect();
+      const rect = contentRectRef.current ?? canvas.getBoundingClientRect();
       const inputView = globalInputView;
       if (!inputView) return;
 
