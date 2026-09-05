@@ -15,11 +15,16 @@ interface InnoText {
 /**
  * Split an Inno destination into its literal text and its constants.
  *
- * A literal brace is written doubled (`{{` for `{`; GOG's builder doubles the closing one
- * too), while a single `{…}` is a constant like `{app}` or `{tmp}`. Telling them apart is
- * load-bearing: treating a doubled brace as an unresolvable constant silently drops real
- * files — Worms Armageddon's 12 stock schemes are stored as `User\Schemes\{{01}} …` and
- * were lost that way, with no error anywhere.
+ * A doubled brace is LITERAL TEXT, kept verbatim — both characters; a single `{…}` is a
+ * constant like `{app}` or `{tmp}`. Telling them apart is load-bearing twice over, and
+ * Worms Armageddon is the case that pins both halves: its 12 stock schemes are installed
+ * as `User\Schemes\{{01}} …`, so reading the doubled brace as an unresolvable constant
+ * dropped the files outright, and COLLAPSING it to `{01}` kept them under a name the game
+ * never asks for. WA.exe opens `User\Schemes\{{%02d}} %s.wsc`, and GOG's own installed-file
+ * manifest (goggame-*.hashdb) lists `User\Schemes\{{01}} Beginner.wsc` — that is the name
+ * on disk. Under the collapsed name WA finds no scheme, rebuilds one from its resources,
+ * and plays with an all-0xFF rule block: 255 rounds to win, nonsense turn timers, no
+ * weapons, and terrain a rocket cannot crater.
  */
 function scanInnoText(dest: string): InnoText {
     let literal = "";
@@ -30,7 +35,7 @@ function scanInnoText(dest: string): InnoText {
         const c = dest[i];
         const next = dest[i + 1];
         if ((c === "{" && next === "{") || (c === "}" && next === "}")) {
-            literal += c;
+            literal += c + next;
             i += 2;
             continue;
         }

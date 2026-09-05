@@ -21,14 +21,19 @@ describe("normalizeInnoDestination", () => {
         expect(normalizeInnoDestination("Binds\\CFGB0000.BND")).toBeNull();
     });
 
-    it("unescapes a doubled brace into a literal brace in the filename", () => {
-        // Worms Armageddon's stock schemes; both braces are doubled by GOG's builder.
+    it("keeps a doubled brace verbatim — it is part of the name, not an escape", () => {
+        // Worms Armageddon's stock schemes. The doubled braces ARE the filename: GOG's
+        // installed-file manifest (goggame-*.hashdb) lists
+        // "User\Schemes\{{01}} Beginner.wsc", and WA.exe opens
+        // "User\Schemes\{{%02d}} %s.wsc". Collapsing them to {01} keeps the files under a
+        // name the game never asks for, which is indistinguishable from losing them.
         expect(normalizeInnoDestination("User\\Schemes\\{{01}} Beginner.wsc", bare))
-            .toBe("User/Schemes/{01} Beginner.wsc");
+            .toBe("User/Schemes/{{01}} Beginner.wsc");
         expect(normalizeInnoDestination("{app}\\User\\Schemes\\{{12}} Blast Zone.wsc"))
-            .toBe("User/Schemes/{12} Blast Zone.wsc");
-        // A doubled brace is a literal even in the leading component.
-        expect(normalizeInnoDestination("{{app}}\\x.txt", bare)).toBe("{app}/x.txt");
+            .toBe("User/Schemes/{{12}} Blast Zone.wsc");
+        // A doubled brace is literal in the leading component too — and is NOT the {app}
+        // constant, so it does not resolve the destination root away.
+        expect(normalizeInnoDestination("{{app}}\\x.txt", bare)).toBe("{{app}}/x.txt");
     });
 
     it("installs GOG's __support\\app tree into the app directory", () => {
