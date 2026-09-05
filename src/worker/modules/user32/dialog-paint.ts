@@ -142,6 +142,10 @@ function firstPaintCyclePending(win: WindowInfo): boolean {
  * it, so a title that lives on this fallback is visible rather than silently late.
  */
 const DEFAULT_CHROME_DEADLINE_MS = 250;
+/** A/B switch (`setWorkerFlag('__noChromeDeadlineStamp', true)`): drop the deadline
+ *  stamp entirely, so a control the guest paints OUTSIDE a WM_PAINT cycle keeps the
+ *  guest's pixels. What the stamp costs is otherwise invisible — it looks exactly
+ *  like a control the guest never drew. */
 const chromeDeadlines = new Map<number, ReturnType<typeof setTimeout>>();
 
 function stampDefaultChromeIfPaintNeverCame(hwnd: number): void {
@@ -149,7 +153,8 @@ function stampDefaultChromeIfPaintNeverCame(hwnd: number): void {
     const win = windows.get(hwnd);
     // A net that declines has to say so: "it never fired" and "it fired and found the
     // paint had landed" are the same silence otherwise, and only the second is healthy.
-    const reason = !win ? 'gone'
+    const reason = (globalThis as { __noChromeDeadlineStamp?: boolean }).__noChromeDeadlineStamp ? 'flag'
+        : !win ? 'gone'
         : win.pendingDestroy ? 'destroying'
         : !isEffectivelyVisible(win) ? 'not-visible'
         : win.guestCustomPaint ? 'guest-painted'

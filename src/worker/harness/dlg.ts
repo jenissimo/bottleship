@@ -18,6 +18,11 @@ export interface DlgControlInfo {
     cx: number; cy: number;
     visible: boolean;
     customPaint: boolean;
+    /** Raw WS_ / class style bits. An OWNERDRAW listbox/combobox/button looks exactly
+     *  like a plain one in every other field, and that difference decides whether the
+     *  PIXELS are ours to draw or the guest's — so it must be readable. */
+    style: number;
+    exStyle: number;
 }
 
 export function describeDlgControl(hwnd: number, w: WindowInfo): DlgControlInfo {
@@ -32,6 +37,8 @@ export function describeDlgControl(hwnd: number, w: WindowInfo): DlgControlInfo 
         cx: abs.x + (width >> 1), cy: abs.y + (height >> 1),
         visible: !!w.visible,
         customPaint: !!w.guestCustomPaint,
+        style: (w.style ?? 0) >>> 0,
+        exStyle: (w.exStyle ?? 0) >>> 0,
     };
 }
 
