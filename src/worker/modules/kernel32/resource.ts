@@ -651,9 +651,20 @@ export const exports: Record<string, ThunkImplementation> = {
 
     /**
      * LoadResource - Loads a resource into memory
+     *
+     * The returned HGLOBAL IS THE DATA POINTER. Win32 kept the 16-bit signature but not
+     * its meaning: resources live in the mapped image, so LoadResource hands back the
+     * address of the bytes and LockResource is documented as a no-op that returns its
+     * argument. Apps rely on that and skip LockResource — Worms Armageddon's built-in
+     * scheme loader reads the version at `[LoadResource(...) + 4]` and `rep movsd`s the
+     * body straight out of it. Returning an opaque HRSRC cookie instead makes that copy
+     * read whatever sits at the cookie address, which is how the game ended up running
+     * every match on an all-0xFF rule block: 255 rounds to win, nonsense turn timers, no
+     * weapons, and terrain no explosion could crater.
+     *
      * @param hModule - Handle to module containing resource
      * @param hResInfo - Handle to resource (from FindResource)
-     * @returns Global handle to resource data or NULL on error
+     * @returns Pointer to the resource bytes, or NULL on error
      */
     'LoadResource': (ctx, mem, args) => {
         const hModule = args[0];
@@ -674,13 +685,11 @@ export const exports: Record<string, ThunkImplementation> = {
             return 0;
         }
 
-        // LoadResource returns a handle that can be passed to LockResource
-        // In Win32, this is essentially the same as the HRSRC for memory-mapped resources
-        // We return the HRSRC itself since LockResource will look it up
+        const dataAddr = entry.moduleBase + entry.dataRVA;
         Logger.verbose(LogCategory.KERNEL32,
-            `LoadResource: Returning handle 0x${hResInfo.toString(16)} for resource at RVA 0x${entry.dataRVA.toString(16)}`);
+            `LoadResource: Returning pointer 0x${dataAddr.toString(16)} for resource at RVA 0x${entry.dataRVA.toString(16)}`);
 
-        return hResInfo;
+        return dataAddr;
     },
 
     /**
@@ -709,8 +718,14 @@ export const exports: Record<string, ThunkImplementation> = {
     },
 
     /**
-     * LockResource - Locks a resource in memory and returns a pointer
-     * @param hResData - Handle to resource (from LoadResource)
+     * LockResource - "locks" a resource and returns a pointer to its bytes.
+     *
+     * Win32 does not lock anything: the resource is already mapped, so this returns the
+     * HGLOBAL it was given. Ours is therefore the identity on a LoadResource result, and
+     * still resolves a raw HRSRC because callers that pass one (skipping LoadResource)
+     * are asking the same question.
+     *
+     * @param hResData - HGLOBAL from LoadResource (a data pointer), or an HRSRC
      * @returns Pointer to first byte of resource or NULL on error
      */
     'LockResource': (ctx, mem, args) => {
@@ -723,13 +738,12 @@ export const exports: Record<string, ThunkImplementation> = {
 
         const entry = resourceCache.get(hResData);
         if (!entry) {
-            Logger.warn(LogCategory.KERNEL32,
-                `LockResource: Invalid resource handle 0x${hResData.toString(16)}`);
-            return 0;
+            Logger.verbose(LogCategory.KERNEL32,
+                `LockResource: Returning pointer 0x${hResData.toString(16)} unchanged`);
+            return hResData;
         }
 
-        // Return absolute address of resource data in memory
-        // The resource data is at moduleBase + dataRVA
+        // An HRSRC: resolve it the way LoadResource would have.
         const dataAddr = entry.moduleBase + entry.dataRVA;
 
         Logger.verbose(LogCategory.KERNEL32,
