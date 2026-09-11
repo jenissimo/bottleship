@@ -33,6 +33,7 @@ interface RawNode {
   id: number;
   callFrame: CallFrame;
   children?: number[];
+  parent?: number;
 }
 
 interface CpuProfile {
@@ -368,10 +369,9 @@ function annotateWasm(name: string | undefined): string {
   // Named block: the guest entry address rides in the name, so it needs no sidecar map.
   const named = name.match(NAMED_JIT_BLOCK);
   if (named) {
-    const mapped = JIT_BLOCK_MAP?.get(parseInt(named[2]!, 10));
-    return mapped
-      ? `JIT block (v86 compiled code) → ${mapped}`
-      : `JIT block (v86 compiled code) @ guest 0x${named[1]}`;
+    // A sampled sidecar may describe a later occupant of this recycled table
+    // slot. Never replace the address embedded in this module's own name.
+    return `JIT block (v86 compiled code) @ guest 0x${named[1]}`;
   }
   return "";
 }
@@ -536,7 +536,7 @@ function extractThreadNames(events: TraceEvent[]): Map<string, string> {
  * Second pass accumulates ProfileChunk data keyed by (pid, id), then
  * re-maps to the named tid for display.
  */
-function mergeProfileChunks(events: TraceEvent[]): Map<string, MergedProfile> {
+export function mergeProfileChunks(events: TraceEvent[]): Map<string, MergedProfile> {
   // (pid:id) → named tid (from Profile events)
   const profileTidMap = new Map<string, number>();
   for (const ev of events) {
@@ -566,6 +566,12 @@ function mergeProfileChunks(events: TraceEvent[]): Map<string, MergedProfile> {
     // Use (pid:id) if available, else (pid:tid) as fallback
     const key = evAny.id ? `${ev.pid}:${evAny.id}` : `${ev.pid}:${ev.tid}`;
     const profile = getOrCreate(key);
+    if (ev.name === "Profile") {
+      // Sample deltas start at Profile.startTime, not at the later chunk delivery.
+      const start = (ev.args?.data as { startTime?: number } | undefined)?.startTime ?? ev.ts;
+      if (!profile.startTime) profile.startTime = start;
+      profile.startTs = Math.min(profile.startTs, start);
+    }
     const cpuProfile = ev.args?.data?.cpuProfile;
     if (!cpuProfile) continue;
 
@@ -614,12 +620,21 @@ function mergeProfileChunks(events: TraceEvent[]): Map<string, MergedProfile> {
 
 // ─── Parent Map ───────────────────────────────────────────────────────────────
 
-function buildParentMap(nodes: Map<number, RawNode>): Map<number, number> {
+export function buildParentMap(nodes: Map<number, RawNode>): Map<number, number> {
   const parentMap = new Map<number, number>();
+  const add = (child: number, parent: number): void => {
+    const previous = parentMap.get(child);
+    if (previous !== undefined && previous !== parent) {
+      throw new Error(`Conflicting profile parents for node ${child}: ${previous} and ${parent}`);
+    }
+    parentMap.set(child, parent);
+  };
   for (const node of nodes.values()) {
+    // Trace ProfileChunk uses parent; standalone CDP profiles use children.
+    if (node.parent !== undefined) add(node.id, node.parent);
     if (node.children) {
       for (const childId of node.children) {
-        parentMap.set(childId, node.id);
+        add(childId, node.id);
       }
     }
   }
@@ -628,7 +643,7 @@ function buildParentMap(nodes: Map<number, RawNode>): Map<number, number> {
 
 // ─── Stats Computation ────────────────────────────────────────────────────────
 
-function computeStats(
+export function computeStats(
   profile: MergedProfile
 ): Map<number, { selfUs: number; totalUs: number }> {
   const stats = new Map<number, { selfUs: number; totalUs: number }>();
@@ -1082,19 +1097,20 @@ function diagnoseThread(analysis: ThreadAnalysis): Warning[] {
  *
  * A frame budget that blames "the GPU" needs two different things and they are not
  * interchangeable:
- *   - CPU time in the GPU process (CrGpuMain task durations). `toplevel` gives this, and it is
- *     what "CrGpuMain costs 14.0 ms a frame" means: the GPU process was BUSY, on a CPU core.
+ *   - Wall-time coverage in the GPU process (union of instrumented thread intervals).
+ *     Scopes can contain waits or descheduling, so this does not measure scheduled CPU time.
  *   - Hardware timings — what the device actually spent. Those live in `gpu` /
  *     `disabled-by-default-gpu.dawn`, and a trace recorded without them is SILENT about the
- *     hardware, not evidence that the hardware is idle.
+ *     hardware, not evidence that the hardware is idle. Category presence alone is also
+ *     insufficient: hardware timings require decoding the recorded work and clock domains.
  *
  * Conflating the two is how a plan gets sized off the wrong number, so this section reports
  * them apart and prints an explicit UNAVAILABLE rather than an empty table when the categories
  * were not recorded (tools/cdp-core.ts records them since 2026-09-02; older artifacts do not).
  */
-function reportGpuProcess(events: TraceEvent[], threadNames: Map<string, string>, frames: number, scopedTo?: string): string {
+export function reportGpuProcess(events: TraceEvent[], threadNames: Map<string, string>, frames: number, scopedTo?: string): string {
   const GPU_THREADS = /^(CrGpuMain|VizCompositorThread|CompositorTileWorker|DrmThread|GpuWatchdog)/;
-  const byThread = new Map<string, { name: string; busyUs: number; slices: number }>();
+  const byThread = new Map<string, { name: string; busyUs: number; slices: number; intervals: Array<[number, number]> }>();
   let gpuCatEvents = 0;
   let dawnCatEvents = 0;
   let spanLoUs = Infinity, spanHiUs = -Infinity;
@@ -1107,8 +1123,8 @@ function reportGpuProcess(events: TraceEvent[], threadNames: Map<string, string>
     const key = `${ev.pid}:${ev.tid}`;
     const name = threadNames.get(key);
     if (!name || !GPU_THREADS.test(name)) continue;
-    const e = byThread.get(key) ?? { name, busyUs: 0, slices: 0 };
-    e.busyUs += ev.dur;
+    const e = byThread.get(key) ?? { name, busyUs: 0, slices: 0, intervals: [] };
+    if (ev.dur > 0) e.intervals.push([ev.ts, ev.ts + ev.dur]);
     e.slices++;
     byThread.set(key, e);
     if (ev.ts < spanLoUs) spanLoUs = ev.ts;
@@ -1128,7 +1144,16 @@ function reportGpuProcess(events: TraceEvent[], threadNames: Map<string, string>
   }
 
   const spanMs = spanHiUs > spanLoUs ? (spanHiUs - spanLoUs) / 1000 : 0;
-  lines.push(` ${pad("thread", 26)} ${pad("busy ms", 10, true)} ${pad("slices", 8, true)} ${pad("ms/frame", 10, true)}`);
+  for (const thread of byThread.values()) {
+    // Task and Dawn scopes overlap on the same thread; their sum double-counts work.
+    thread.intervals.sort((a, b) => a[0] - b[0]);
+    let end = -Infinity;
+    for (const [start, stop] of thread.intervals) {
+      thread.busyUs += Math.max(0, stop - Math.max(start, end));
+      end = Math.max(end, stop);
+    }
+  }
+  lines.push(` ${pad("thread", 26)} ${pad("covered ms", 10, true)} ${pad("slices", 8, true)} ${pad("ms/frame", 10, true)}`);
   lines.push(` ${"-".repeat(58)}`);
   const ordered = [...byThread.values()].sort((a, b) => b.busyUs - a.busyUs);
   for (const t of ordered) {
@@ -1137,7 +1162,8 @@ function reportGpuProcess(events: TraceEvent[], threadNames: Map<string, string>
   }
   if (spanMs > 0) lines.push(` window ${spanMs.toFixed(0)} ms${frames > 0 ? `, ${frames} frame(s) counted` : ""}`);
   lines.push("");
-  lines.push(" This is CPU time IN the GPU process — how long it was busy, not what the hardware spent.");
+  lines.push(" Union of instrumented wall-time intervals per GPU-process thread; nested scopes counted once.");
+  lines.push(" Includes waits/descheduling inside scopes. This is neither scheduled CPU time nor GPU hardware time.");
 
   lines.push("");
   if (dawnCatEvents === 0) {
@@ -1147,6 +1173,7 @@ function reportGpuProcess(events: TraceEvent[], threadNames: Map<string, string>
     if (gpuCatEvents > 0) lines.push(`   (${gpuCatEvents} plain \`gpu\` event(s) present, which is not enough on their own.)`);
   } else {
     lines.push(` Dawn/WebGPU work items recorded: ${dawnCatEvents} (category present).`);
+    lines.push(" GPU HARDWARE TIMINGS: NOT DECODED — Dawn category presence alone does not measure GPU execution.");
   }
   return lines.join("\n");
 }
