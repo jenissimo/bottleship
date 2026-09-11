@@ -20,13 +20,13 @@ export const crypt32Module: ModuleDescriptor = {
     name: "crypt32",
     functions: [
         makeFunc("CertFreeCertificateContext", 1),
-        makeFunc("CertFindCertificateInStore", 5),
+        makeFunc("CertFindCertificateInStore", 6),
         makeFunc("CryptMsgGetParam", 5),
         makeFunc("CryptQueryObject", 11),
         makeFunc("CertCloseStore", 2),
         makeFunc("CryptMsgClose", 1),
-        makeFunc("CertGetNameStringA", 5),
-        makeFunc("CertGetNameStringW", 5),
-        makeFunc("CertGetNameString", 5),
+        makeFunc("CertGetNameStringA", 6),
+        makeFunc("CertGetNameStringW", 6),
+        makeFunc("CertGetNameString", 6),
     ],
 };

@@ -1625,9 +1625,9 @@ const syncModule = (() => {
             { ecx: ctx.ecx, edx: ctx.edx, ebx: ctx.ebx, ebp: ctx.ebp, esi: ctx.esi, edi: ctx.edi, eflags: ctx.eflags },
         );
         if (waitResult === WAIT_BLOCKED_NO_SWITCH) {
-            return { value: 0, blockedNoSwitch: true, stackCleanup: 16 };
+            return { value: 0, blockedNoSwitch: true, stackCleanup: 12 };
         }
-        return { value: waitResult, stackCleanup: 16 };
+        return { value: waitResult, stackCleanup: 12 };
     };
 
     exports['CreateWaitableTimerA'] = (ctx, mem, args) => {

@@ -50,5 +50,9 @@ export const shlwapiModule: ModuleDescriptor = {
         makeFunc("UrlUnescapeA", 4, { onUnimplemented: "hresult" }),
         makeFunc("UrlUnescapeW", 4, { onUnimplemented: "hresult" }),
         makeFunc("SHDeleteKeyW", 2, { onUnimplemented: "win32Status" }),
+        makeFunc("PathMatchSpecA", 2), // pszFile, pszSpec -> BOOL
+        makeFunc("PathMatchSpecW", 2),
+        makeFunc("ColorHLSToRGB", 3),  // wHue, wLuminance, wSaturation -> COLORREF
+        makeFunc("ColorRGBToHLS", 4),  // clrRGB, pwHue, pwLuminance, pwSaturation -> void
     ],
 };

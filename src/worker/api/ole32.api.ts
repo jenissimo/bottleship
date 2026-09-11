@@ -35,6 +35,8 @@ export const ole32Module: ModuleDescriptor = {
         // OLE initialization
         makeFunc("OleInitialize", 1),
         makeFunc("OleUninitialize", 0),
+        makeFunc("OleFlushClipboard", 0),
+        makeFunc("OleIsCurrentClipboard", 1),
         makeFunc("RegisterDragDrop", 2, {
             params: [
                 { name: "hwnd", type: "handle", direction: "in" },

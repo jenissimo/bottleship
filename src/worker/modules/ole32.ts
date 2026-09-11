@@ -383,6 +383,23 @@ export class Ole32 implements IModule {
             return 0;
         };
 
+        // HRESULT OleFlushClipboard(void) — carries an OLE-clipboard data object to a
+        // static copy so it survives the source closing. We keep no OLE clipboard, so the
+        // faithful answer is S_OK (nothing to flush succeeds).
+        this.exports["OleFlushClipboard"] = () => {
+            Logger.verbose(LogCategory.COM, "OleFlushClipboard() - no OLE clipboard, S_OK");
+            return S_OK;
+        };
+
+        // HRESULT OleIsCurrentClipboard(IDataObject *pDataObject) — S_OK if pDataObject is
+        // the one currently on the OLE clipboard, S_FALSE otherwise. We never put a data
+        // object on the clipboard, so it is never current: S_FALSE (or E_INVALIDARG on NULL).
+        this.exports["OleIsCurrentClipboard"] = (ctx, mem, args) => {
+            const pDataObject = args[0] >>> 0;
+            if (pDataObject === 0) return 0x80070057; // E_INVALIDARG
+            return S_FALSE;
+        };
+
         // HRESULT RegisterDragDrop(HWND hwnd, LPDROPTARGET pDropTarget)
         this.exports["RegisterDragDrop"] = (ctx, mem, args) => {
             const hwnd = args[0] >>> 0;
