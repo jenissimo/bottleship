@@ -25,7 +25,7 @@ import { noteDialogOverlayCandidate, resolveMouseTargetHwnd, eraseDialogOverlay,
 import { paintDialogToOverlay, finalizeDialogPaint, repaintDialogOverlayIfVisible, repaintDialogAfterContentChange } from './dialog-paint';
 import { handleSystemControlMessage, applyStaticSetImageAutoSize, isContentChangingMessage } from './dialog-control-messages';
 import { getDefWindowProcAddress } from './system-classes';
-import { runDefaultWindowPaint } from './window';
+import { runDefaultWindowPaint, defaultWindowProc } from './window';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { emitDialogShow } from '../../core/debug/dbg-commands';
 import {
@@ -323,7 +323,31 @@ function resolveModalOwner(owner: number): number {
 /** Wine IsDialogMessage VK_RETURN / DM_GETDEFID path. */
 let pendingDialogCommand: { hwnd: number; wParam: number; lParam: number } | null = null;
 
+/**
+ * Where a dialog keypress ended up. Counters, not logs: this path is timing-sensitive
+ * enough that a log line's own cost changes the outcome, and the 50-entry log ring
+ * cannot hold a single event three seconds back under a repaint firehose. Read with
+ * the `dialogKeys` harness verb.
+ */
+export const dialogKeyLedger = {
+    keyDown: 0,        // WM_KEYDOWN offered to the dialog key handler
+    consumed: 0,       // ... that the handler claimed (Tab/Enter/Esc/arrows)
+    queued: 0,         // ... that produced a WM_COMMAND
+    sentSync: 0,       // delivered by re-entering the guest procedure
+    posted: 0,         // delivered by posting, because the re-entry could not be set up
+    noProc: 0,         // no procedure to deliver to at all
+    defDlgEnter: 0,    // DefDlgProc entered (a subclasser forwarded to us)
+    defDlgCommand: 0,  // ... with WM_COMMAND
+    dlgProcInvoked: 0, // ... and we re-entered the app's DWLP_DLGPROC
+    dlgProcSkipped: 0, // ... and we did NOT (same proc / sentinel / already in flight)
+};
+
+export function resetDialogKeyLedger(): void {
+    for (const k of Object.keys(dialogKeyLedger)) (dialogKeyLedger as Record<string, number>)[k] = 0;
+}
+
 function queueDialogCommand(hwnd: number, wParam: number, lParam: number): void {
+    dialogKeyLedger.queued++;
     pendingDialogCommand = { hwnd, wParam: wParam >>> 0, lParam: lParam >>> 0 };
 }
 
@@ -377,6 +401,7 @@ function wantsArrowKeys(hwnd: number): boolean {
  */
 function handleDialogKeyMessage(hDlg: number, message: number, wParam: number): boolean {
     if (message !== WM_KEYDOWN) return false;
+    dialogKeyLedger.keyDown++;
     const system = System.getInstance();
 
     if (wParam === VK_TAB) {
@@ -1804,6 +1829,7 @@ export function createDialogExports(): Record<string, ThunkImplementation> {
 
         // Keyboard navigation / default / cancel — consume (caller must not Dispatch).
         if (handleDialogKeyMessage(hDlg, message, wParam)) {
+            dialogKeyLedger.consumed++;
             const command = takePendingDialogCommand();
             const wndProc = windows.get(hDlg)?.wndProc ?? 0;
             const callbackManager = System.getInstance().process?.dispatcher?.callbackManager;
@@ -1822,6 +1848,7 @@ export function createDialogExports(): Record<string, ThunkImplementation> {
                         frameId,
                     );
                     if (invoked.callbackId) {
+                        dialogKeyLedger.sentSync++;
                         return {
                             value: 1,
                             suspendedForCallback: true,
@@ -1830,7 +1857,24 @@ export function createDialogExports(): Record<string, ThunkImplementation> {
                             skipStackCheck: true,
                         };
                     }
+                    callbackManager.abandonSuspendedFrame(frameId);
                 }
+            }
+            // We told the caller the key was CONSUMED, so nothing else will deliver it:
+            // dropping the command here loses Escape/Enter outright and looks exactly
+            // like a dialog that ignores the keyboard. Wine SENDs it (dialog.c
+            // DIALOG_IsAccelerator); when the synchronous re-entry cannot be set up, a
+            // POST is the honest remainder — same fallback DefDlgProc's WM_CLOSE uses.
+            if (command) {
+                if (!wndProc || isSentinelWndProc(wndProc)) dialogKeyLedger.noProc++;
+                dialogKeyLedger.posted++;
+                Logger.warn(LogCategory.USER32,
+                    `IsDialogMessage(0x${hDlg.toString(16)}): could not SEND WM_COMMAND ` +
+                    `wParam=0x${command.wParam.toString(16)} (wndProc=0x${wndProc.toString(16)}` +
+                    `${isSentinelWndProc(wndProc) ? ' sentinel' : ''}) - posting instead`);
+                System.getInstance().windowManager.postMessage(
+                    command.hwnd, WM_COMMAND, command.wParam, command.lParam);
+                System.getInstance().scheduler.wakeMessageWaiters();
             }
             return 1;
         }
@@ -1962,7 +2006,11 @@ export function createDialogExports(): Record<string, ThunkImplementation> {
             const id = windows.get(hDlg)?.dialogDefaultId ?? 0;
             return id ? ((0x534b << 16) | (id & 0xFFFF)) >>> 0 : 0;
         }
-        if (Msg === WM_ERASEBKGND && wParam) {
+        if (Msg === WM_ERASEBKGND) {
+            // The dialog manager owns the erase outright (Wine DEFDLG_Proc); with no DC
+            // there is nothing to fill, but it must not reach DefWindowProc's class-brush
+            // erase either — a #32770 has no class brush and would clear nothing.
+            if (!wParam) return 0;
             // Fill the dialog background with the system button face.
             const win = windows.get(hDlg);
             if (win) {
@@ -1976,7 +2024,12 @@ export function createDialogExports(): Record<string, ThunkImplementation> {
             return 1;
         }
 
-        return 0; // Default processing
+        // Wine defdlg.c DEFDLG_Proc: everything the dialog manager does not consume ends
+        // in DefWindowProc. WM_MOVE / WM_SIZE exist only on that path (DefWindowProc turns
+        // WM_WINDOWPOSCHANGED into them), so without this a dialog that is moved after
+        // creation — every centred dialog — is never told, and anything that caches its
+        // rect keeps the pre-move one.
+        return defaultWindowProc(ctx, mem, args);
     };
 
     /**
@@ -2014,6 +2067,8 @@ export function createDialogExports(): Record<string, ThunkImplementation> {
 
         const win = windows.get(hDlg);
         const dlgProc = (win?.extraBytes?.[1] ?? 0) >>> 0;
+        dialogKeyLedger.defDlgEnter++;
+        if (Msg === WM_COMMAND) dialogKeyLedger.defDlgCommand++;
         // NT clears DWLP_MSGRESULT before the dialog procedure runs; the epilogue reads
         // back whatever the procedure stored there.
         if (win?.extraBytes) win.extraBytes[0] = 0;
@@ -2038,12 +2093,15 @@ export function createDialogExports(): Record<string, ThunkImplementation> {
         // route to it — is called from here; otherwise every message would arrive twice.
         const callbackManager = System.getInstance().process?.dispatcher?.callbackManager;
         const key = `${hDlg}:${Msg}:${wParam}:${lParam}`;
-        if (dlgProc && dlgProc !== ((win?.wndProc ?? 0) >>> 0)
-            && !isSentinelWndProc(dlgProc) && callbackManager && !dlgProcInFlight.has(key)) {
+        const canReachDlgProc = !!dlgProc && dlgProc !== ((win?.wndProc ?? 0) >>> 0)
+            && !isSentinelWndProc(dlgProc) && !!callbackManager && !dlgProcInFlight.has(key);
+        if (Msg === WM_COMMAND && !canReachDlgProc) dialogKeyLedger.dlgProcSkipped++;
+        if (canReachDlgProc && callbackManager) {
             const stackCleanup = 16;
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
             const returnAddr = view.getUint32(ctx.esp, true) >>> 0;
             dlgProcInFlight.add(key);
+            if (Msg === WM_COMMAND) dialogKeyLedger.dlgProcInvoked++;
             const invoked = callbackManager.invokeCallback(
                 dlgProc, [hDlg, Msg, wParam, lParam], 0, undefined, false, 'DefDlgProc:DlgProc',
                 undefined,

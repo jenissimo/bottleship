@@ -32,7 +32,10 @@ import { registerWindowQueryExports } from './window-query';
 import { registerWindowPropExports } from './window-props';
 import { GDIContext } from '../gdi32/context';
 import { ensureAnimateControlClasses, clearAnimateState, onAnimateShowWindow, isAnimateControlWindow } from './animate-control';
-import { getBuiltinSystemClass, getDefWindowProcAddress } from './system-classes';
+import { getBuiltinSystemClass, getDefDlgProcAddress, getDefWindowProcAddress } from './system-classes';
+import {
+    getSystemCursorHandle, IDC_ARROW, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
+} from './system-cursors';
 import { invalidateControlColors } from './control-colors';
 import {
     applyScrollInfo,
@@ -45,7 +48,8 @@ import {
     setScrollPos as setScrollBarPos,
 } from './scroll-state';
 import { isSentinelWndProc } from './dialog';
-import { handleSystemControlMessage, isContentChangingMessage } from './dialog-control-messages';
+import { applyDefaultSetText, handleSystemControlMessage, isContentChangingMessage } from './dialog-control-messages';
+import { encodeAnsi, readAnsiOrWideFromGuest } from '../codepage-utils';
 import { noteDialogOverlayCandidate, eraseDialogOverlay, isWindowFullyCoveredByHigherTopLevel } from './dialog-overlay';
 import { eraseControlOverlayRect, eraseHiddenWindowPixels, repaintDialogOverlayIfVisible, repaintDialogAfterContentChange, requestGuestDialogPaint } from './dialog-paint';
 import {
@@ -192,7 +196,8 @@ function trySuspendForSyncWindowMessage(
     lParam: number,
     label: string,
     stackCleanup: number,
-    onComplete: () => number | null,
+    /** Receives the target WndProc's LRESULT; returns this thunk's value (null = chained). */
+    onComplete: (wndProcResult: number) => number | null,
     existingFrameId?: number,
     existingDirectReturn?: { returnAddr: number; postEsp: number },
 ): {
@@ -506,6 +511,38 @@ const WM_ERASEBKGND_PAINT = 0x0014;
  */
 const pendingEraseRects = new Map<number, ClientRect>();
 
+/**
+ * DefWindowProc's WM_SETTEXT / WM_GETTEXT / WM_GETTEXTLENGTH (Wine defwnd.c). This is
+ * the ONLY place a plain window's caption is stored or read on Win32: the API entry
+ * points just send the message, so a procedure that forwards what it does not handle
+ * has to land here or its window has no text at all.
+ */
+function defaultWindowText(
+    win: WindowInfo, msg: number, wParam: number, lParam: number, mem: Uint8Array, wide: boolean,
+): number {
+    const WM_SETTEXT = 0x000C;
+    const WM_GETTEXTLENGTH = 0x000E;
+    if (msg === WM_SETTEXT) {
+        if (lParam) {
+            applyDefaultSetText(win, wide
+                ? Marshaler.readWideString(mem, lParam)
+                : readAnsiOrWideFromGuest(mem, lParam, 'ansi'));
+        }
+        return 1;
+    }
+    if (msg === WM_GETTEXTLENGTH) return win.title.length;
+    if (!lParam || wParam <= 0) return 0;
+    if (wide) {
+        Marshaler.writeWideString(mem, lParam, win.title, wParam);
+        return Math.min(win.title.length, wParam - 1);
+    }
+    const encoded = encodeAnsi(win.title);
+    const writeLen = Math.min(encoded.length, wParam - 1);
+    if (writeLen > 0) Mem.writeBytes(lParam, encoded.subarray(0, writeLen));
+    Mem.writeBytes(lParam + writeLen, new Uint8Array([0]));
+    return writeLen;
+}
+
 function windowClientRect(window: WindowInfo): ClientRect {
     return { left: 0, top: 0, right: window.width, bottom: window.height };
 }
@@ -743,6 +780,149 @@ export function runDefaultWindowPaint(
         }
     }
     return endPaint();
+}
+
+/**
+ * DefWindowProc, reachable from the dialog manager. Wine's DEFDLG_Proc ends in
+ * DefWindowProc for every message it does not consume, and WM_MOVE / WM_SIZE are
+ * generated ONLY there (out of WM_WINDOWPOSCHANGED) — so a dialog that is
+ * repositioned after creation learns it moved by no other route.
+ */
+type SyncWndProcImpl = (ctx: X86Context, mem: Uint8Array, args: number[]) => number | ThunkResult;
+
+let defWindowProcImpl: SyncWndProcImpl | null = null;
+
+export function defaultWindowProc(
+    ctx: X86Context, mem: Uint8Array, args: number[],
+): number | ThunkResult {
+    return defWindowProcImpl ? defWindowProcImpl(ctx, mem, args) : 0;
+}
+
+// ---------------------------------------------------------------------------
+// DefWindowProc's WM_SETCURSOR (NT5 ntuser/kernel/dwp.c xxxDWP_SetCursor).
+//
+//   wParam        = the window the cursor is OVER (hwndHit) — not the receiver.
+//   LOWORD lParam = hit-test code, HIWORD lParam = the mouse message that provoked it.
+//
+// The order is load-bearing. A sizing border answers with its own cursor and stops. Every
+// other code offers the message to the PARENT first (children only, desktop excluded) and
+// stops if the parent claims it — that is how a dialog manages the pointer over its
+// controls. Only when the parent declines does the HIT window's class cursor apply, and a
+// NULL class cursor means DefWindowProc does nothing at all, never "hide the pointer".
+// The function returns FALSE in every case but those two claims.
+// ---------------------------------------------------------------------------
+
+const HTCLIENT_DWP = 1;
+const HTSIZEFIRST = 10; // HTLEFT
+const HTSIZELAST = 17;  // HTBOTTOMRIGHT
+
+/** IDC_* per sizing hit code, HTLEFT..HTBOTTOMRIGHT in order (dwp.c:433-450). */
+const SIZE_BORDER_CURSORS = [
+    IDC_SIZEWE,   // HTLEFT
+    IDC_SIZEWE,   // HTRIGHT
+    IDC_SIZENS,   // HTTOP
+    IDC_SIZENWSE, // HTTOPLEFT
+    IDC_SIZENESW, // HTTOPRIGHT
+    IDC_SIZENS,   // HTBOTTOM
+    IDC_SIZENESW, // HTBOTTOMLEFT
+    IDC_SIZENWSE, // HTBOTTOMRIGHT
+];
+
+/** Windows whose parent WM_SETCURSOR offer is out with the guest. */
+const setCursorForwardInFlight = new Set<number>();
+
+/** Bundle-switch reset: hwnds are recycled, so an unfinished offer must not outlive them. */
+export function resetWindowMessageForwardState(): void {
+    setCursorForwardInFlight.clear();
+}
+
+/** The parent send xxxDWP_SetCursor owes, and how to finish once it answers. */
+export interface SetCursorParentForward {
+    /** Parent hwnd that must receive WM_SETCURSOR before any class cursor applies. */
+    forwardTo: number;
+    /** Resume with the parent's LRESULT; the result is DefWindowProc's own. */
+    onParentResult: (lResult: number) => number;
+}
+
+/** The class cursor of the window the pointer is over, 0 when the class declares none. */
+function classCursorOf(win: WindowInfo): number {
+    const classInfo = win.classId !== undefined
+        ? getWindowClass(win.classId)
+        : (win.nativeClassName ? getWindowClassByName(win.nativeClassName) : undefined);
+    return (classInfo?.hCursor ?? 0) >>> 0;
+}
+
+/**
+ * A parent whose procedure is a guest address has to be SENT to for real; one running our
+ * own DefWindowProc/DefDlgProc thunk is walked here instead, because a round trip through
+ * the guest would only arrive back in this function.
+ */
+function parentNeedsGuestSend(win: WindowInfo): boolean {
+    const proc = (win.wndProc ?? 0) >>> 0;
+    if (!proc || isSentinelWndProc(proc)) return false;
+    if (proc === getDefWindowProcAddress() || proc === getDefDlgProcAddress()) return false;
+    return !(win.isSystemControl && !win.wndProcSubclassed);
+}
+
+/**
+ * DefWindowProc's WM_SETCURSOR. Returns the LRESULT, or the parent send the CALLER must
+ * perform — the caller owns its own stdcall cleanup, so the suspend cannot live here.
+ */
+export function defWindowProcSetCursor(
+    hWnd: number, wParam: number, lParam: number, depth = 0,
+): number | SetCursorParentForward {
+    const codeHT = (lParam << 16) >> 16;      // signed LOWORD (HTERROR/HTNOWHERE are < 0)
+    const trigger = (lParam >>> 16) & 0xFFFF;
+    const hwndHit = wParam >>> 0;
+
+    if (trigger !== 0 && codeHT >= HTSIZEFIRST && codeHT <= HTSIZELAST) {
+        installCursorAndUpdateHostVisibility(
+            getSystemCursorHandle(SIZE_BORDER_CURSORS[codeHT - HTSIZEFIRST]));
+        return 1;
+    }
+
+    /** What runs once no ancestor has claimed the message. Always answers FALSE. */
+    const applyDefault = (): number => {
+        if (trigger === 0) {
+            installCursorAndUpdateHostVisibility(getSystemCursorHandle(IDC_ARROW));
+            return 0;
+        }
+        const hit = windows.get(hwndHit);
+        if (!hit) return 0;
+        if (codeHT === HTCLIENT_DWP) {
+            const classCursor = classCursorOf(hit);
+            // A NULL class cursor is not an instruction to hide: DefWindowProc leaves the
+            // pointer exactly as it found it (dwp.c "if (pwndHit->pcls->spcur != NULL)").
+            if (classCursor !== 0) installCursorAndUpdateHostVisibility(classCursor);
+            return 0;
+        }
+        // Every non-client code the sizing branch did not take: the plain arrow.
+        installCursorAndUpdateHostVisibility(getSystemCursorHandle(IDC_ARROW));
+        return 0;
+    };
+
+    const win = windows.get(hWnd >>> 0);
+    const WS_CHILD_DWP = 0x40000000;
+    const parentHwnd = (win && (win.style & WS_CHILD_DWP) !== 0) ? ((win.parent ?? 0) >>> 0) : 0;
+    // GetChildParent is NULL for a non-child and the desktop is excluded by name; a
+    // self-parented window would spin the walk, and so would a tree cycle a SetParent
+    // built, which is what the depth bound is for.
+    if (!parentHwnd || parentHwnd === (hWnd >>> 0) || depth >= 32) return applyDefault();
+    const parentWin = windows.get(parentHwnd);
+    if (!parentWin) return applyDefault();
+
+    /** The parent claimed it (any nonzero) → TRUE and no class cursor. */
+    const afterParent = (lResult: number): number => (lResult !== 0 ? 1 : applyDefault());
+
+    if (parentNeedsGuestSend(parentWin)) {
+        return { forwardTo: parentHwnd, onParentResult: afterParent };
+    }
+    const inner = defWindowProcSetCursor(parentHwnd, wParam, lParam, depth + 1);
+    if (typeof inner === 'number') return afterParent(inner);
+    return {
+        forwardTo: inner.forwardTo,
+        onParentResult: (l) => afterParent(inner.onParentResult(l)),
+    };
 }
 
 export function createWindowExports(): Record<string, ThunkImplementation> {
@@ -1393,6 +1573,9 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
 
         Logger.verbose(LogCategory.USER32, `DefWindowProcA(0x${hWnd.toString(16)}, ${Msg}, 0x${wParam.toString(16)}, 0x${lParam.toString(16)})`);
 
+        const WM_SETTEXT_DEF = 0x000C;
+        const WM_GETTEXT_DEF = 0x000D;
+        const WM_GETTEXTLENGTH_DEF = 0x000E;
         const WM_CLOSE = 0x0010;
         const WM_DESTROY = 0x0002;
         const WM_SETCURSOR = 0x0020;
@@ -1446,6 +1629,40 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             }
             return 0;
         }
+
+        // Ahead of the control branch below: no control class procedure implements
+        // WM_SETCURSOR, they all reach it here — a subclassed BUTTON forwarding the
+        // message must get the parent offer and the class cursor, not the click path.
+        if (Msg === WM_SETCURSOR) {
+            const plan = defWindowProcSetCursor(hWnd, wParam, lParam);
+            if (typeof plan === 'number') return plan;
+            // A parent that answers by sending WM_SETCURSOR back down would otherwise
+            // recurse until the callback pool is gone (same hazard as DefDlgProc's
+            // dlgProcInFlight). Re-entering for this window means the offer was made.
+            if (setCursorForwardInFlight.has(hWnd)) return plan.onParentResult(0);
+            setCursorForwardInFlight.add(hWnd);
+            const sync = trySuspendForSyncWindowMessage(
+                ctx, plan.forwardTo, WM_SETCURSOR, wParam, lParam,
+                'DefWindowProc:WM_SETCURSOR', 16,
+                (parentResult: number) => {
+                    setCursorForwardInFlight.delete(hWnd);
+                    return plan.onParentResult(parentResult >>> 0) >>> 0;
+                },
+            );
+            if (!sync.suspended) {
+                setCursorForwardInFlight.delete(hWnd);
+                return plan.onParentResult(0);
+            }
+            return {
+                value: 0,
+                suspendedForCallback: true,
+                callbackId: sync.callbackId,
+                stackCleanup: 16,
+                skipStackCheck: true,
+                preserveCallbackReturnAddress: sync.reusedFrame,
+            };
+        }
+
         if (win?.isSystemControl) {
             // A system control's wndProc IS this thunk (createDialogChildren), so a guest
             // that subclasses the control and forwards what it doesn't handle lands here —
@@ -1479,9 +1696,23 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             }
             const result = handleSystemControlMessage(win, Msg, wParam, lParam, mem);
             if (isContentChangingMessage(win, Msg)) {
+                // A CAPTION alone needs the old pixels dropped: on a guest-painted parent
+                // a repaint can only STAMP the control, so the new text would land on top
+                // of the previous one and both stay readable. The other content messages
+                // restamp in place, and erasing for those widens the damage a control's
+                // own repaint is allowed to touch.
+                if (Msg === WM_SETTEXT_DEF) eraseControlOverlayRect(win);
                 repaintDialogAfterContentChange(win.parent ?? hWnd);
             }
             return result;
+        }
+
+        // The class procedure is what stores a window's text on Win32 — Set/GetWindowText
+        // only send these — so a guest procedure that forwards what it does not handle has
+        // to find the caption here. Without it a subclasser's forwarded WM_SETTEXT is
+        // dropped and WM_GETTEXT answers an empty string.
+        if (win && (Msg === WM_SETTEXT_DEF || Msg === WM_GETTEXT_DEF || Msg === WM_GETTEXTLENGTH_DEF)) {
+            return defaultWindowText(win, Msg, wParam, lParam, mem, false);
         }
 
         if (Msg === WM_PAINT_GEO) {
@@ -1515,26 +1746,24 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             return 1;
         }
 
-        if (Msg === WM_SETCURSOR) {
-            // Default WM_SETCURSOR: on HTCLIENT install the class cursor (hCursor from
-            // RegisterClass). This re-shows the pointer after SetCursor(NULL) — only
-            // SetCursor writes currentCursorHandle, so without it NULL sticks forever.
-            if ((lParam & 0xFFFF) === HTCLIENT) {
-                const classInfo = win?.classId !== undefined
-                    ? getWindowClass(win.classId)
-                    : (win?.nativeClassName ? getWindowClassByName(win.nativeClassName) : undefined);
-                const classCursor = (classInfo?.hCursor ?? 0) >>> 0;
-                if (classCursor !== 0) {
-                    installCursorAndUpdateHostVisibility(classCursor);
-                }
-            }
-            return 1;
-        }
-
         return 0; // 0 = processed
     };
 
-    exports['DefWindowProcW'] = exports['DefWindowProcA'];
+    // DefWindowProc never awaits, so the dialog manager can call it inline.
+    defWindowProcImpl = exports['DefWindowProcA'] as SyncWndProcImpl;
+
+    // The A and W procedures differ only in the charset of the text messages — a Unicode
+    // app that forwards WM_GETTEXT expects wide characters in its buffer, and answering
+    // ANSI there is a silent corruption rather than a visible failure.
+    exports['DefWindowProcW'] = (ctx, mem, args) => {
+        const win = windows.get(args[0]);
+        const Msg = args[1];
+        if (win && !win.isSystemControl
+            && (Msg === 0x000C || Msg === 0x000D || Msg === 0x000E)) {
+            return defaultWindowText(win, Msg, args[2], args[3], mem, true);
+        }
+        return exports['DefWindowProcA'](ctx, mem, args);
+    };
     exports['DefMDIChildProcA'] = exports['DefWindowProcA'];
     exports['DefMDIChildProcW'] = exports['DefWindowProcA'];
     exports['DefFrameProcA'] = (ctx, mem, args) =>
@@ -2297,26 +2526,11 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
     // CallWindowProcA/W — duplicate stub removed; proper callback implementation is above (line ~1005)
 
     // Focus / Active window management
-    const WS_POPUP = 0x80000000;
-
-    function recordLastActivePopup(hWnd: number): void {
-        const wnd = windows.get(hWnd);
-        if (!wnd) return;
-        if ((wnd.style >>> 0) & WS_POPUP) {
-            const ownerHwnd = wnd.parent;
-            if (ownerHwnd) {
-                const owner = windows.get(ownerHwnd);
-                if (owner) owner.lastActivePopupHwnd = hWnd;
-            }
-        }
-    }
 
     exports['SetActiveWindow'] = (ctx, mem, args) => {
         const hWnd = args[0];
         Logger.log(LogCategory.USER32, `SetActiveWindow(0x${hWnd.toString(16)})`);
-        const prevActive = activateTopLevelWindow(hWnd);
-        recordLastActivePopup(hWnd);
-        return prevActive;
+        return activateTopLevelWindow(hWnd);
     };
 
     exports['GetActiveWindow'] = (ctx, mem, args) => {
@@ -2363,9 +2577,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             const { topLevel } = resolveForegroundTargets(hWnd);
             if (topLevel && topLevel !== wm.getActiveHwnd()) activateTopLevelWindow(topLevel);
         }
-        const prevFocus = wm.setFocus(hWnd);
-        recordLastActivePopup(hWnd);
-        return prevFocus;
+        return wm.setFocus(hWnd);
     };
 
     exports['GetFocus'] = (ctx, mem, args) => {
@@ -2527,6 +2739,22 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         return firstSuspension ?? immediate ?? 1;
     };
 
+    /**
+     * WM_PAINT is not a queued message on Windows — USER GENERATES it while the update
+     * region is non-empty, so validating the region retracts it (Wine: NtUserValidateRect
+     * is redraw_window with RDW_VALIDATE). We materialise it into the queue, which means
+     * validation has to take it back out; otherwise PeekMessage never returns 0.
+     *
+     * A pump written as `while (PeekMessage(...)) {...}` then NEVER RETURNS, and the loop
+     * around it — the one that polls "is the dialog finished?" — is never reached again.
+     * Tiberian Sun's Select Campaign records the Cancel and stays on screen forever
+     * because of exactly that, and it looks like dead input rather than a paint bug.
+     */
+    const retractPaintIfValidated = (hWnd: number): void => {
+        if (!hWnd || hasPendingUpdate(hWnd)) return;
+        System.getInstance().windowManager.clearPaintMessage(hWnd);
+    };
+
     exports['ValidateRect'] = (ctx, mem, args) => {
         const hWnd = args[0];
         const lpRect = args[1];
@@ -2534,6 +2762,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         if (!hWnd) return 0;
         const rect = lpRect ? readClientRectFromMem(mem, lpRect) : null;
         validateWindow(hWnd, rect);
+        retractPaintIfValidated(hWnd);
         return 1; // TRUE
     };
 

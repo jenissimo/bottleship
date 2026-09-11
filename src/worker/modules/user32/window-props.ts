@@ -3,14 +3,13 @@
  * window text and the enable flag — plain reads/writes of WindowInfo fields on
  * the shared window map. Z-order / focus / capture core stays in window.ts.
  */
-import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
+import { ThunkImplementation, ThunkResult, X86Context } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
-import { System } from '../../core/system';
 import { Marshaler } from '../../core/memory/marshaler';
 import { Mem } from '../../core/memory/mem-accessor';
 import { windows, type WindowInfo } from './shared-state';
-import { eraseControlOverlayRect, repaintDialogAfterContentChange } from './dialog-paint';
-import { applyControlSetText } from './dialog-control-messages';
+import { applyDefaultSetText } from './dialog-control-messages';
+import { sendWindowGetText, sendWindowGetTextLength, sendWindowSetText } from './message';
 import { encodeAnsi } from '../codepage-utils';
 import { getDefDlgProcAddress } from './system-classes';
 
@@ -158,21 +157,32 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
         return 0;
     };
 
-    exports['GetWindowTextLengthA'] = (ctx, mem, args) => {
-        const hWnd = args[0];
+    // GetWindowText* SEND WM_GETTEXT/WM_GETTEXTLENGTH (Wine reads a window's stored text
+    // only when it belongs to another process). A subclass that keeps the string itself
+    // is the only thing that knows it, so asking our record instead answers stale.
+    const getWindowTextLengthImpl = (ctx: X86Context, mem: Uint8Array, args: number[], tag: string): number | ThunkResult => {
+        const hWnd = args[0] >>> 0;
+        const sent = sendWindowGetTextLength(ctx, mem, hWnd, 4, tag);
+        if (sent) return sent;
         const window = windows.get(hWnd);
         const length = window ? window.title.length : 0;
-        Logger.verbose(LogCategory.USER32, `GetWindowTextLengthA(0x${hWnd.toString(16)}) -> ${length}`);
+        Logger.verbose(LogCategory.USER32, `${tag}(0x${hWnd.toString(16)}) -> ${length}`);
         return length;
     };
 
-    exports['GetWindowTextLengthW'] = exports['GetWindowTextLengthA'];
+    exports['GetWindowTextLengthA'] = (ctx, mem, args) =>
+        getWindowTextLengthImpl(ctx, mem, args, 'GetWindowTextLengthA');
+    exports['GetWindowTextLengthW'] = (ctx, mem, args) =>
+        getWindowTextLengthImpl(ctx, mem, args, 'GetWindowTextLengthW');
 
     exports['GetWindowTextA'] = (ctx, mem, args) => {
         const hWnd = args[0] >>> 0;
         const lpString = args[1] >>> 0;
         const nMaxCount = args[2] | 0;
         if (!lpString || nMaxCount <= 0) return 0;
+
+        const sent = sendWindowGetText(ctx, mem, hWnd, nMaxCount, lpString, 12, 'GetWindowTextA');
+        if (sent) return sent;
 
         const window = windows.get(hWnd);
         if (!window) return 0;
@@ -195,6 +205,9 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
         const nMaxCount = args[2] | 0;
         if (!lpString || nMaxCount <= 0) return 0;
 
+        const sent = sendWindowGetText(ctx, mem, hWnd, nMaxCount, lpString, 12, 'GetWindowTextW');
+        if (sent) return sent;
+
         const window = windows.get(hWnd);
         if (!window) return 0;
 
@@ -206,47 +219,29 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
         return charCount;
     };
 
-    exports['SetWindowTextA'] = (ctx, mem, args) => {
+    // SetWindowText SENDS WM_SETTEXT (Wine: NtUserMessageCall), so a window whose
+    // procedure the guest owns hears about its own caption change; only the default
+    // handling stores the string.
+    const setWindowTextImpl = (
+        ctx: X86Context, mem: Uint8Array, args: number[], tag: string,
+        decode: (ptr: number) => string,
+    ): number | ThunkResult => {
         const hWnd = args[0];
         const lpString = args[1];
-        const text = lpString ? Marshaler.readString(mem, lpString) : '';
+        const sent = sendWindowSetText(ctx, mem, hWnd, lpString, 8, tag);
+        if (sent) return sent;
         const window = windows.get(hWnd);
-        if (window) {
-            // Win32 invalidates the window on a caption change and it repaints. Without
-            // that the control keeps its OLD pixels until something else happens to stamp
-            // it, and on a guest-painted parent the new caption then lands ON TOP of the
-            // old one (both strings readable). Erase first so the repair restores the
-            // background, then let the parent re-stamp its controls.
-            const changed = window.title !== text;
-            if (changed) eraseControlOverlayRect(window);
-            applyControlSetText(window, text);
-            if (!window.parent) System.getInstance().notifyWindowTitle(text, 'SetWindowText');
-            else if (changed) repaintDialogAfterContentChange(window.parent);
-        }
-        Logger.log(LogCategory.USER32, `SetWindowTextA(0x${hWnd.toString(16)}, "${text}")`);
+        const text = lpString ? decode(lpString) : '';
+        if (window) applyDefaultSetText(window, text);
+        Logger.log(LogCategory.USER32, `${tag}(0x${hWnd.toString(16)}, "${text}")`);
         return 1; // TRUE
     };
 
-    exports['SetWindowTextW'] = (ctx, mem, args) => {
-        const hWnd = args[0];
-        const lpString = args[1];
-        const text = lpString ? Marshaler.readWideString(mem, lpString) : '';
-        const window = windows.get(hWnd);
-        if (window) {
-            // Win32 invalidates the window on a caption change and it repaints. Without
-            // that the control keeps its OLD pixels until something else happens to stamp
-            // it, and on a guest-painted parent the new caption then lands ON TOP of the
-            // old one (both strings readable). Erase first so the repair restores the
-            // background, then let the parent re-stamp its controls.
-            const changed = window.title !== text;
-            if (changed) eraseControlOverlayRect(window);
-            applyControlSetText(window, text);
-            if (!window.parent) System.getInstance().notifyWindowTitle(text, 'SetWindowText');
-            else if (changed) repaintDialogAfterContentChange(window.parent);
-        }
-        Logger.log(LogCategory.USER32, `SetWindowTextW(0x${hWnd.toString(16)}, "${text}")`);
-        return 1; // TRUE
-    };
+    exports['SetWindowTextA'] = (ctx, mem, args) =>
+        setWindowTextImpl(ctx, mem, args, 'SetWindowTextA', (ptr) => Marshaler.readString(mem, ptr));
+
+    exports['SetWindowTextW'] = (ctx, mem, args) =>
+        setWindowTextImpl(ctx, mem, args, 'SetWindowTextW', (ptr) => Marshaler.readWideString(mem, ptr));
 
     exports['EnableWindow'] = (ctx, mem, args) => {
         const hWnd = args[0];

@@ -11,6 +11,7 @@
 import type { HarnessService } from "../service";
 import { HarnessError, HarnessErrorCode } from "../rpc";
 import { sys } from "../serialize";
+import { dialogKeyLedger, resetDialogKeyLedger } from "../../modules/user32/dialog";
 import { setControlNotifyObserver } from "../../modules/user32/control-interaction";
 
 const MAX_ENTRIES = 512;
@@ -126,6 +127,41 @@ export function registerWmTraceCommands(svc: HarnessService): void {
         if (!sys().windowManager.getWindow(hwnd)) throw new HarnessError(`window 0x${hwnd.toString(16)} not found`, HarnessErrorCode.NOT_FOUND);
         sys().windowManager.postMessage(hwnd, msg, wParam, lParam);
         return { queued: true, hwnd, msg, wParam, lParam };
+    });
+
+    /**
+     * msgQueue() — what is WAITING, per priority tier, plus the pumping thread.
+     * "The input was posted and the game never reacted" has two very different causes
+     * that look identical from wmTrace: the message was never queued, or it is queued
+     * and the pumping thread cannot see it (the target-thread filter). This says which.
+     */
+    /**
+     * dialogKeys() — where dialog keypresses ended up: offered / consumed / turned into a
+     * WM_COMMAND / delivered synchronously / delivered by posting / no procedure at all.
+     *
+     * Counters, because this path is timing-sensitive: a log line's own cost is enough to
+     * change the outcome, and the log ring cannot hold one event seconds back under a
+     * repaint firehose. `dialogKeys("reset")` zeroes them.
+     */
+    svc.register("dialogKeys", (args) => {
+        if (String(args[0] ?? "") === "reset") { resetDialogKeyLedger(); return { reset: true }; }
+        return { ...dialogKeyLedger };
+    });
+
+    svc.register("msgQueue", () => {
+        const snap = (wm() as any).messageQueueSnapshot?.() ?? {};
+        const named = (list: any[]) => list.map((m: any) => ({
+            ...m,
+            name: TRACED_MSG[m.message] ?? (m.message !== undefined ? `0x${(m.message >>> 0).toString(16)}` : undefined),
+            hwndHex: `0x${(m.hwnd >>> 0).toString(16)}`,
+        }));
+        return {
+            currentThreadId: sys().scheduler?.getCurrentThreadId?.() ?? 0,
+            input: named(snap.input ?? []),
+            mouseMove: named(snap.mouseMove ?? []),
+            paint: named(snap.paint ?? []),
+            timer: named(snap.timer ?? []),
+        };
     });
 
     svc.register("wmTrace", (args) => {

@@ -11,6 +11,13 @@ import { System } from '../../core/system';
 
 export const IDC_ARROW = 32512;
 export const IDC_IBEAM = 32513;
+// Sizing-border shapes. No raster of their own yet, so getSystemCursorHandle hands
+// back the arrow — the ids exist so the DefWindowProc rule can name what it asks for
+// instead of pretending a sizing border is a client area.
+export const IDC_SIZENWSE = 32642;
+export const IDC_SIZENESW = 32643;
+export const IDC_SIZEWE = 32644;
+export const IDC_SIZENS = 32645;
 
 // 'X' = black, '.' = white, ' ' = transparent.
 interface SystemCursorShape {

@@ -13,7 +13,8 @@ import { TimerKind } from '../../core/scheduler/types';
 import { hypercallDataManager } from '../../core/cpu/hypercall-data';
 import { installHook, uninstallHook, getHooksOfType, getNextHookInChain, hasHooksOfType, pushActiveHook, popActiveHook, currentActiveHook, WH_KEYBOARD, WH_GETMESSAGE, WH_CBT, HC_ACTION, HC_NOREMOVE } from './hooks';
 import { isSentinelWndProc } from './dialog';
-import { handleSystemControlMessage, isContentChangingMessage } from './dialog-control-messages';
+import { applyDefaultSetText, handleSystemControlMessage, isContentChangingMessage } from './dialog-control-messages';
+import { getDefDlgProcAddress, getDefWindowProcAddress } from './system-classes';
 import { tryRichEditStreamMessage } from './rich-edit-stream';
 import { eraseControlOverlayRect, repaintDialogAfterContentChange } from './dialog-paint';
 import { handleAnimateMessage } from './animate-control';
@@ -21,7 +22,7 @@ import { windows, buttonCheckStates, registerWindowTimerKiller, finalizeWindowDe
 import { validateWindow } from './paint-region';
 import { repaintChildControls, isButtonSystemControl, hitTestSystemControlAtClient } from './controls';
 import { isOwnerDrawButton } from './owner-draw';
-import { runOwnerDrawButtonPaint } from './window';
+import { defWindowProcSetCursor, runOwnerDrawButtonPaint } from './window';
 import {
     handleSystemControlMouseAtScreen,
     handleSystemControlWheel,
@@ -43,7 +44,11 @@ const WAIT_OBJECT_0 = 0;
 const ERROR_INVALID_PARAMETER = 87;
 
 const WM_TIMER = 0x0113;
+const WM_SETCURSOR_MSG = 0x0020;
 const WM_PAINT = 0x000F;
+const WM_SETTEXT_MSG = 0x000C;
+const WM_GETTEXT_MSG = 0x000D;
+const WM_GETTEXTLENGTH_MSG = 0x000E;
 const USER_TIMER_MINIMUM = 10;
 
 type TimerMessage = { hwnd: number; message: number; wParam: number; lParam: number };
@@ -138,6 +143,74 @@ export function invokeWindowMessageSync(
     return invokeGuestWndProcSync(
         ctx, mem, win.wndProc, hwnd, message, wParam, lParam,
         stackCleanup, tag, onReturn,
+    );
+}
+
+/**
+ * Get/SetWindowText, Get/SetDlgItemText and SendMessage(WM_SETTEXT/WM_GETTEXT) all SEND
+ * the message to the window procedure — Wine routes every one of them through
+ * NtUserMessageCall, and only reads a window's stored text when the window belongs to
+ * ANOTHER process. Answering from our own record instead is invisible to a control the
+ * guest has SUBCLASSED: it never learns its caption changed (a front-end that renders
+ * what its subclass proc saw draws an empty box forever), and a subclass that keeps the
+ * string itself and never forwards leaves that record permanently stale, so the two
+ * halves must go the same way or they disagree.
+ *
+ * Returns a suspended-thunk result when a guest procedure owns the window, else null:
+ * the caller then applies the default handling itself. Our own DefWindowProc/DefDlgProc
+ * thunk is not worth a round trip through the guest to arrive back in the same handler.
+ */
+function sendWindowTextMessage(
+    ctx: X86Context,
+    mem: Uint8Array,
+    hwnd: number,
+    message: number,
+    wParam: number,
+    lParam: number,
+    stackCleanup: number,
+    tag: string,
+    onReturn: (wndRet: number) => number | null,
+): ThunkResult | null {
+    const win = windows.get(hwnd);
+    if (!win) return null;
+    const wndProc = win.wndProc >>> 0;
+    if (wndProc === getDefWindowProcAddress() || wndProc === getDefDlgProcAddress()) return null;
+    return invokeWindowMessageSync(
+        ctx, mem, hwnd, message, wParam >>> 0, lParam >>> 0,
+        stackCleanup, tag, onReturn,
+    );
+}
+
+/** SetWindowText / SetDlgItemText: WM_SETTEXT with the caller's own string pointer. */
+export function sendWindowSetText(
+    ctx: X86Context, mem: Uint8Array, hwnd: number, lpString: number,
+    stackCleanup: number, tag: string,
+): ThunkResult | null {
+    return sendWindowTextMessage(
+        ctx, mem, hwnd, WM_SETTEXT_MSG, 0, lpString,
+        stackCleanup, tag, (wndRet) => (wndRet ? 1 : 0),
+    );
+}
+
+/** GetWindowText / GetDlgItemText: WM_GETTEXT fills the caller's buffer and answers
+ *  the character count. */
+export function sendWindowGetText(
+    ctx: X86Context, mem: Uint8Array, hwnd: number, cchMax: number, lpString: number,
+    stackCleanup: number, tag: string,
+): ThunkResult | null {
+    return sendWindowTextMessage(
+        ctx, mem, hwnd, WM_GETTEXT_MSG, cchMax, lpString,
+        stackCleanup, tag, (wndRet) => wndRet >>> 0,
+    );
+}
+
+/** GetWindowTextLength: WM_GETTEXTLENGTH. */
+export function sendWindowGetTextLength(
+    ctx: X86Context, mem: Uint8Array, hwnd: number, stackCleanup: number, tag: string,
+): ThunkResult | null {
+    return sendWindowTextMessage(
+        ctx, mem, hwnd, WM_GETTEXTLENGTH_MSG, 0, 0,
+        stackCleanup, tag, (wndRet) => wndRet >>> 0,
     );
 }
 
@@ -1182,10 +1255,17 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
                         && !!child.wndProcSubclassed && !!child.wndProc
                         && !isSentinelWndProc(child.wndProc);
                     if (isOwnerDrawBtn && child!.handle !== lastHoverChildHwnd) {
-                        // Coords are button-class-irrelevant (its move handler only arms a
-                        // timer); pass the parent lParam through unchanged.
+                        // lParam is CLIENT coordinates OF THE TARGET (Win32 contract), so a
+                        // message forwarded to a child must be re-expressed in the child's
+                        // space. Passing the parent's through unchanged shifts every read by
+                        // the child's own origin, which a guest that hit-tests its own
+                        // owner-draw button sees as a hot zone displaced further the further
+                        // the control sits from the parent's top-left.
+                        const childX = clientX - child!.x;
+                        const childY = clientY - child!.y;
+                        const childLParam = ((childY & 0xFFFF) << 16) | (childX & 0xFFFF);
                         System.getInstance().windowManager.postMessage(
-                            child!.handle, WM_MOUSEMOVE, wParam, lParam);
+                            child!.handle, WM_MOUSEMOVE, wParam, childLParam);
                         System.getInstance().scheduler.wakeMessageWaiters();
                         lastHoverChildHwnd = child!.handle;
                     } else if (!child) {
@@ -1217,6 +1297,22 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
                         `DispatchMessage owner-draw paint failed hwnd=0x${hwnd.toString(16)}: ${err}`);
                 }
                 return { value: 0, stackCleanup: 4 };
+            }
+            // WM_SETCURSOR is not a control-class message — no BUTTON/EDIT/LISTBOX
+            // procedure implements it, they all reach DefWindowProc, which offers the
+            // message to the parent and only then applies the class cursor. The control
+            // sink below has no DefWindowProc tail, so without this a control never
+            // restores the pointer and its dialog never gets the offer.
+            if (message === WM_SETCURSOR_MSG && window?.isSystemControl && !window.wndProcSubclassed) {
+                const plan = defWindowProcSetCursor(hwnd, wParam, lParam);
+                if (typeof plan === 'number') return { value: plan >>> 0, stackCleanup: 4 };
+                const sync = invokeWindowMessageSync(
+                    ctx, mem, plan.forwardTo, WM_SETCURSOR_MSG, wParam, lParam,
+                    4, 'DispatchMessageW:WM_SETCURSOR',
+                    (parentResult) => plan.onParentResult(parentResult >>> 0) >>> 0,
+                );
+                if (sync) return sync;
+                return { value: plan.onParentResult(0) >>> 0, stackCleanup: 4 };
             }
             if (window?.isSystemControl && !window.wndProcSubclassed) {
                 const result = handleSystemControlMessage(window, message, wParam, lParam, mem);
@@ -1494,23 +1590,17 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
 
             // Non-system windows: handle common messages in JS
             switch (msg) {
-                case WM_SETTEXT:
+                case WM_SETTEXT: {
+                    if (allowGuestDispatch) {
+                        const sent = sendWindowSetText(ctx, mem, hWnd, lParam, 16, 'SendMessage:WM_SETTEXT');
+                        if (sent) return sent;
+                    }
                     if (lParam) {
-                        targetWindow.title = readAnsiOrWideString(lParam);
+                        applyDefaultSetText(targetWindow, readAnsiOrWideString(lParam));
                         Logger.log(LogCategory.USER32, `SendMessage WM_SETTEXT hwnd=0x${hWnd.toString(16)} -> "${targetWindow.title}"`);
-                        // Sync tab title for top-level windows (matches SetWindowTextA/W behavior)
-                        if (!targetWindow.parent) {
-                            System.getInstance().notifyWindowTitle(targetWindow.title, 'WM_SETTEXT');
-                        } else {
-                            // A caption change invalidates the window on Win32. This branch also
-                            // serves SUBCLASSED system controls (UE1 wraps its statics), whose
-                            // pixels we still stamp — so without erasing first, the new caption
-                            // lands on top of the old one and both stay readable.
-                            eraseControlOverlayRect(targetWindow);
-                            repaintDialogAfterContentChange(targetWindow.parent);
-                        }
                     }
                     return 1;
+                }
                 case WM_GETTEXT:
                     if (lParam && wParam > 0) {
                         const text = targetWindow.title;

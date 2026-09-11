@@ -36,7 +36,7 @@ import {
     comboDropTopIndex,
     comboBoxItemHeight,
 } from './controls';
-import { repaintDialogAfterContentChange, restampOwnedPopupsAbove } from './dialog-paint';
+import { eraseControlOverlayRect, repaintDialogAfterContentChange, restampOwnedPopupsAbove } from './dialog-paint';
 import { closeOpenComboboxes } from './control-interaction';
 import { getBitmapObjectDimensions, getIconObjectDimensions } from '../gdi32/bitmap-resolve';
 import { encodeAnsi, readAnsiOrWideFromGuest } from '../codepage-utils';
@@ -148,6 +148,25 @@ export function applyControlSetText(win: WindowInfo, text: string): void {
     if (isRichEditControl(win)) setRichEditContent(win, text, []);
     else if (isEditControl(win)) setEditControlText(win, text);
     else win.title = text;
+}
+
+/**
+ * DefWindowProc's WM_SETTEXT: store the caption and repair the pixels it changes.
+ * The class procedure is the ONLY thing that stores a window's text on Win32 — the
+ * API entry points just send the message — so every path that reaches the default
+ * handling (DefWindowProc, and the entry points when no guest procedure owns the
+ * window) must land here and nowhere else.
+ *
+ * The erase drops the control's OLD pixels: on a guest-painted parent the repaint
+ * below can only STAMP the control, not restore what was under it, so without this a
+ * changed caption renders on top of the previous one and both stay readable.
+ */
+export function applyDefaultSetText(win: WindowInfo, text: string): void {
+    const changed = win.title !== text;
+    if (changed) eraseControlOverlayRect(win);
+    applyControlSetText(win, text);
+    if (!win.parent) System.getInstance().notifyWindowTitle(text, 'WM_SETTEXT');
+    else if (changed) repaintDialogAfterContentChange(win.parent);
 }
 
 /**
