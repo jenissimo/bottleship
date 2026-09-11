@@ -406,7 +406,7 @@ export type OverlayCompositePlan =
  */
 export function getOverlayCompositePlan(renderActive?: RenderActive | null): OverlayCompositePlan {
     if (isGameContentOnScreen(renderActive)) {
-        const rects = getLiveDialogOverlayRects();
+        const rects = getLiveDialogOverlayRects(renderActive);
         return rects.length ? { mode: 'rects', rects } : { mode: 'none' };
     }
     return { mode: 'full' };
@@ -467,8 +467,8 @@ function dialogGroupHasOverlayContent(root: number): boolean {
 /** What the composite decision needs to know about one live dialog group. */
 export interface DialogOverlayFacts {
     /**
-     * GDI window output reaches the display. False while a DirectDraw flip chain
-     * owns the screen — see isGdiOutputOnScreen.
+     * GDI window output reaches the display. False while a DirectDraw flip chain or
+     * an exclusive-fullscreen 3D device owns the screen — see isGdiOutputOnScreen.
      */
     gdiOutputOnScreen: boolean;
     /** This window is the DDSCL_EXCLUSIVE|FULLSCREEN cooperative-level window. */
@@ -490,6 +490,8 @@ export interface DialogOverlayFacts {
  *     / DDSCL_NORMAL. A single-buffered primary never Flips: there is no separate
  *     GDI surface, GDI paints land in the memory being displayed, so its output
  *     is on screen (TS shows its "Select Campaign" modal exactly this way).
+ *     A 3D device presenting in EXCLUSIVE FULLSCREEN takes the display the same
+ *     way; a WINDOWED one does not.
  *  2. The screen-owner window is never an overlay — in exclusive fullscreen its
  *     client area IS the primary, so it is the game, not a plane above it.
  *  3. Only the group ROOT contributes a rect; its visual bounds already cover
@@ -504,26 +506,56 @@ export function dialogOverlayComposites(f: DialogOverlayFacts): boolean {
 }
 
 /**
- * True while GDI window output reaches the display (rule 1 above). Reads the
- * DirectDraw cooperative level + `gdiSurfaceVisible`, which is cleared ONLY by a
- * primary-chain Flip and restored by FlipToGDISurface — so it doubles as the
- * "does this app have a flip chain on screen" test.
+ * True while GDI window output reaches the display (rule 1 above). Two ways an app
+ * can take the display away from GDI, and both must answer here or the rule is
+ * vacuously true for half the titles we run:
+ *
+ *  - DirectDraw: `gdiSurfaceVisible`, cleared ONLY by a primary-chain Flip and
+ *    restored by FlipToGDISurface (isFlipScreenOwned).
+ *  - A 3D device in EXCLUSIVE FULLSCREEN (Windowed=FALSE). That IS the same display
+ *    ownership — the swap chain is the front buffer and GDI paints into an off-screen
+ *    surface — so a dialog over it is as invisible as one behind a DDraw flip chain
+ *    (Worms World Party Remastered leaves a 640x480 #32770 of placeholder statics
+ *    visible over its D3D9 menu). A WINDOWED device does not: its present is clipped
+ *    to the window and a modal over it is genuinely on screen.
  */
-export function isGdiOutputOnScreen(): boolean {
-    return !isFlipScreenOwned();
+export function isGdiOutputOnScreen(renderActive?: RenderActive | null): boolean {
+    const active = renderActive ?? System.getInstance().services.render.getActive();
+    return gdiOutputReachesDisplay({
+        flipScreenOwned: isFlipScreenOwned(),
+        // Ownership first: a 3D presenter layered over a WINDOWED DDraw primary does not
+        // own the screen at all, whatever its own present mode says.
+        threeDOwnsScreen: shouldSuppress3DGdiOverlay(active, getDDrawContext()),
+        threeDExclusiveFullscreen: !!active?.presentsExclusiveFullscreen,
+    });
+}
+
+/** The display-ownership half of rule 1, as a truth table (see isGdiOutputOnScreen). */
+export interface GdiDisplayFacts {
+    /** A DirectDraw flip chain is the buffer on screen (gdiSurfaceVisible === false). */
+    flipScreenOwned: boolean;
+    /** A hardware-3D presenter owns the screen (shouldSuppress3DGdiOverlay). */
+    threeDOwnsScreen: boolean;
+    /** ...and holds it in exclusive fullscreen (D3DPRESENT_PARAMETERS.Windowed === FALSE). */
+    threeDExclusiveFullscreen: boolean;
+}
+
+export function gdiOutputReachesDisplay(f: GdiDisplayFacts): boolean {
+    if (f.flipScreenOwned) return false;
+    return !(f.threeDOwnsScreen && f.threeDExclusiveFullscreen);
 }
 
 /**
  * Visual-bounds rects of live overlay dialogs (composited from the GDI overlay
  * canvas onto a DDraw flip frame). Sorted back→front for correct stacking.
  */
-export function getLiveDialogOverlayRects(): DialogOverlayRect[] {
-    return getLiveDialogOverlays().map(e => e.rect);
+export function getLiveDialogOverlayRects(renderActive?: RenderActive | null): DialogOverlayRect[] {
+    return getLiveDialogOverlays(renderActive).map(e => e.rect);
 }
 
 /** getLiveDialogOverlayRects with the owning window — the diagnostic form (harness `overlay`). */
-export function getLiveDialogOverlays(): Array<{ hwnd: number; title: string; cls: string; rect: DialogOverlayRect }> {
-    const gdiOutputOnScreen = isGdiOutputOnScreen();
+export function getLiveDialogOverlays(renderActive?: RenderActive | null): Array<{ hwnd: number; title: string; cls: string; rect: DialogOverlayRect }> {
+    const gdiOutputOnScreen = isGdiOutputOnScreen(renderActive);
     const entries: Array<{ hwnd: number; title: string; cls: string; rect: DialogOverlayRect; rank: number }> = [];
     for (const win of windows.values()) {
         if (!win.overlayOnFlipScreen || !win.visible || win.pendingDestroy) continue;
@@ -553,10 +585,10 @@ export function getLiveDialogOverlays(): Array<{ hwnd: number; title: string; cl
  * True when this dialog needs point-based mouse routing (InputManager asks the
  * resolver instead of always posting to the active window).
  *
- * NOT every visible #32770 qualifies: a launcher menu left visible=true after
- * exclusive fullscreen (HP/UE1) is stale desktop state — routing clicks to it
- * breaks in-game mouse while the flip chain owns the screen. Only live UI the
- * player is interacting with should participate.
+ * Visibility is the whole test for a #32770: Win32 hit-tests the window tree, not
+ * the display owner, so being covered by an exclusive-fullscreen presenter does not
+ * withhold the mouse. A window still flagged visible after it left the screen is a
+ * bug in our own window bookkeeping, to be fixed there rather than compensated here.
  */
 export function dialogNeedsPointMouseRouting(win: WindowInfo): boolean {
     if (!win.visible || win.pendingDestroy) return false;
@@ -566,16 +598,12 @@ export function dialogNeedsPointMouseRouting(win: WindowInfo): boolean {
         return !!win.overlayOnFlipScreen && hasSystemControlChildren(win);
     }
 
-    if (win.overlayOnFlipScreen) return true;
-    if (win.dialogInitInProgress) return true;
-
-    const gdiHidden = isGdiSurfaceHidden(getDDrawContext());
-
-    // Non-launcher modals (TS "Select Campaign"): windowed GDI or live flip overlay.
-    if (!gdiHidden) return true;
-    if (isFlipScreenOwned()) return true;
-
-    return false;
+    // Every other visible #32770 point-routes. Being hidden behind an exclusive-fullscreen
+    // presenter is NOT a reason to withhold the mouse: Win32 hit-tests the window tree, not
+    // the display owner, and the guest's own dialog proc is what handles the click (measured
+    // on WWP Remastered — its title screen advances from a click delivered to the dialog
+    // that our composite rule correctly refuses to draw).
+    return true;
 }
 
 function hasPointRoutedDialog(): boolean {

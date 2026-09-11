@@ -16,7 +16,9 @@ import type { HarnessService } from "../service";
 import { HarnessError, HarnessErrorCode } from "../rpc";
 import { sys } from "../serialize";
 import { sessionLogPath } from "../../../harness/session";
-import { getOverlayCompositePlan, isGameScreenOwned, isFlipScreenOwned, getLiveDialogOverlays } from "../../modules/user32/dialog-overlay";
+import { getOverlayCompositePlan, isGameScreenOwned, isFlipScreenOwned, isGdiOutputOnScreen, getLiveDialogOverlays, repairOverlayWindowsOverlappingRect } from "../../modules/user32/dialog-overlay";
+import { windows as userWindows, getAbsoluteWindowPosition, isEffectivelyVisible } from "../../modules/user32/shared-state";
+import { controlTintColor, setControlTintArmed } from "../../modules/user32/control-tint";
 import { ddrawShowsContent } from "../../modules/ddraw/gdi-visibility";
 import { getPresentRect } from "../../backends/webgpu/shared/present-geometry";
 
@@ -199,6 +201,17 @@ export function registerScreenCommands(svc: HarnessService): void {
             // `expiries` is the proof the deadline is alive rather than merely written.
             publish: gdi?.overlayPublishStats?.() ?? null,
             gameOwnsScreen: isGameScreenOwned(),
+            // Rule 1 of dialogOverlayComposites, and the presenter state it is read from.
+            // A dialog that is flagged live but composites nothing is answered here: either
+            // a DDraw flip chain or an exclusive-fullscreen 3D device has the display.
+            gdiOutputOnScreen: isGdiOutputOnScreen(),
+            presenter: {
+                kind: sys().services.render.getLastPresenterKind?.() ?? null,
+                suppressGdiOverlay: !!(sys().services.render.getActive() as
+                    { suppressGdiOverlay?: boolean } | null)?.suppressGdiOverlay,
+                exclusiveFullscreen: !!(sys().services.render.getActive() as
+                    { presentsExclusiveFullscreen?: boolean } | null)?.presentsExclusiveFullscreen,
+            },
             screenOwner: {
                 coopHwnd: dd?.cooperative?.hwnd ?? 0,
                 coopFlags: `0x${((dd?.cooperative?.flags ?? 0) >>> 0).toString(16)}`,
@@ -226,6 +239,46 @@ export function registerScreenCommands(svc: HarnessService): void {
         });
         info.saved = debugDumpPath(name);
         return info;
+    });
+
+    /**
+     * controlTint(on?) — flood every system control with a per-hwnd colour on its next
+     * paint, and return the rect each one is EXPECTED to occupy.
+     *
+     * "The dialog sits crooked over the frame" has three candidate causes that a
+     * screenshot cannot separate: the control's own layout (our DLU→px), the group's
+     * visual bounds, and the composite's scale. This settles the first two by
+     * measurement — arm it, dump the overlay plane (`overlay({save})`, which is guest
+     * space, not host pixels), and read each colour's bounding box back against the
+     * `expected` rect returned here. A disagreement is a layout bug; agreement moves the
+     * question to the composite, where blitRects' one uniform scale is the only variable.
+     *
+     * Repaints the armed windows so the tint appears without waiting for guest damage.
+     */
+    svc.register("controlTint", (args) => {
+        const on = args[0] === undefined ? true : !!args[0];
+        setControlTintArmed(on);
+        const controls: Array<{
+            hwnd: number; cls: string; title: string; color: string;
+            expected: { x: number; y: number; w: number; h: number };
+        }> = [];
+        for (const win of userWindows.values()) {
+            if (!win.isSystemControl || !isEffectivelyVisible(win)) continue;
+            const { x, y } = getAbsoluteWindowPosition(win);
+            controls.push({
+                hwnd: win.handle,
+                cls: win.systemControlClass ?? "",
+                title: win.title ?? "",
+                color: controlTintColor(win.handle),
+                expected: { x, y, w: win.width, h: win.height },
+            });
+        }
+        // Repaint through the overlay's own repair path: same clipping and z-order the
+        // real paint uses, so the tint cannot land where a real paint would not.
+        const gdi: any = sys().gdiContext;
+        const canvas: OffscreenCanvas | null = gdi?.getOverlayCanvas?.() ?? null;
+        if (canvas) repairOverlayWindowsOverlappingRect({ x: 0, y: 0, w: canvas.width, h: canvas.height });
+        return { armed: on, overlay: canvas ? { width: canvas.width, height: canvas.height } : null, controls };
     });
 
     /**
