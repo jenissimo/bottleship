@@ -397,9 +397,13 @@ export const d3d8Module: ModuleDescriptor = {
         },
         {
             name: "DebugSetMute",
-            params: [{ name: "bMute", type: "u32" }],
+            // The shipping export takes NOTHING (`void __stdcall DebugSetMute(void)`) —
+            // the BOOL belongs to d3dx8's inline D3DXDebugMute helper, which pushes it and
+            // cleans it up itself. RET 0 either way; declaring the real ABI keeps the
+            // reference cross-check meaningful.
+            params: [],
             returnType: "void",
-            callingConvention: "cdecl",
+            callingConvention: "stdcall",
         },
         // HRESULT WINAPI ValidateVertexShader(DWORD* pVertexShader, DWORD* pVertexDecl,
         //   const D3DCAPS8* pCaps, BOOL ReturnError, char** ppErrorString)

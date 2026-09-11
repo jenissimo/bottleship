@@ -1502,9 +1502,12 @@ export const d3d9Module: ModuleDescriptor = {
         },
         {
             name: "DebugSetMute",
-            params: [{ name: "Mute", type: "u32" }],
+            // `void __stdcall DebugSetMute(void)` in the shipping runtime; the BOOL a
+            // caller pushes belongs to d3dx9's inline helper and is cleaned by it. RET 0
+            // either way, so the constant-return stub's popBytes 0 is unchanged.
+            params: [],
             returnType: "u32",
-            callingConvention: "cdecl",
+            callingConvention: "stdcall",
             description: "Mute D3D debug spew (undocumented export, used via GetProcAddress)"
         }
     ],

@@ -281,6 +281,13 @@ export function createD3D8DefaultTextureStates(): Int32Array {
 
 export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
     readonly suppressGdiOverlay = true;
+
+    /** D3DPRESENT_PARAMETERS.Windowed, from CreateDevice and every Reset. */
+    private deviceIsWindowed = true;
+    setWindowed(windowed: boolean): void { this.deviceIsWindowed = windowed; }
+    /** RenderActive: a fullscreen device owns the display like a DDraw flip chain. */
+    get presentsExclusiveFullscreen(): boolean { return !this.deviceIsWindowed; }
+
     // State arrays — passed to FFPRenderer per draw call
     readonly renderStates = new Int32Array(256);
     readonly textureStates = new Int32Array(256); // 8 stages × 32 TSS types
@@ -962,8 +969,9 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
 
         this.flushProgrammablePending();
         // Windowed @ +28 (d3d8): only a fullscreen Reset sets the display mode.
+        this.setWindowed(view.getUint32(pPresentationParameters + 28, true) !== 0);
         System.getInstance().requestHostResize(width, height, {
-            modeSet: view.getUint32(pPresentationParameters + 28, true) === 0,
+            modeSet: this.presentsExclusiveFullscreen,
         });
         this.renderTarget = createRenderTarget(width, height);
         this.rtOverride = null;

@@ -338,6 +338,7 @@ export function createFactoryExports(): Record<string, ThunkImplementation> {
             // The cursor kind depends on it, and a device that never Resets would otherwise
             // be read as fullscreen.
             deviceWindowed.set(devicePtr, !!windowedFlag);
+            device.setWindowed(!!windowedFlag);
             // Remembered for GetCreationParameters (faithful echo of the game's own flags).
             deviceCreationParams.set(devicePtr, {
                 adapter: Adapter,

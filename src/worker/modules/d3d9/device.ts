@@ -97,6 +97,9 @@ const D3DBACKBUFFER_TYPE_MONO = 0;
 const D3DERR_NOTFOUND = 0x88760866;
 const D3DCLEAR_ZBUFFER = 0x2;
 const D3DCLEAR_STENCIL = 0x4;
+const D3DCREATE_SOFTWARE_VERTEXPROCESSING = 0x20;
+const D3DCREATE_HARDWARE_VERTEXPROCESSING = 0x40;
+const D3DCREATE_MIXED_VERTEXPROCESSING = 0x80;
 
 function formatForBpp(bpp: number): number {
     return bpp <= 16 ? D3DFMT_R5G6B5 : D3DFMT_X8R8G8B8;
@@ -545,14 +548,20 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
             return D3DERR_INVALIDCALL;
         }
 
-        // This backend has a CPU ProcessVertices implementation and mirrors constants for the
-        // mixed mode, but it does not implement the complete D3DCREATE_SOFTWARE_VERTEXPROCESSING
-        // draw path. Refuse the creation flag instead of creating a device that advertises SWVP
-        // and silently renders through the hardware-only WebGPU path.
-        if ((BehaviorFlags & 0x20) !== 0) {
+        // SOFTWARE / HARDWARE / MIXED vertex processing are mutually exclusive and one of
+        // them is mandatory — D3D9 fails the call outright otherwise, and a device created
+        // from a flag word we quietly ignored would render with the wrong constant limits.
+        // (Real drivers support all three; the vertex work lands in our WGSL either way,
+        // and the observable difference — the wider SWVP constant files — is honoured by
+        // Set*ShaderConstant*. SetSoftwareVertexProcessing already reaches this same state
+        // on a mixed device, so refusing it here only at creation was inconsistent.)
+        const vpFlags = BehaviorFlags & (D3DCREATE_SOFTWARE_VERTEXPROCESSING
+            | D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MIXED_VERTEXPROCESSING);
+        if (vpFlags === 0 || (vpFlags & (vpFlags - 1)) !== 0) {
             Logger.warn(LogCategory.D3D9,
-                'CreateDevice refused: full D3DCREATE_SOFTWARE_VERTEXPROCESSING is not implemented; use mixed mode');
-            return D3DERR_NOTAVAILABLE;
+                `CreateDevice refused: BehaviorFlags 0x${BehaviorFlags.toString(16)} must name exactly one of ` +
+                'SOFTWARE/HARDWARE/MIXED vertex processing');
+            return D3DERR_INVALIDCALL;
         }
 
         try {
@@ -576,7 +585,7 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
             device.isExtended = isExtended;
             // D3DCREATE_SOFTWARE_VERTEXPROCESSING selects the initial VP mode. Mixed VP starts
             // in hardware mode and can be switched explicitly with SetSoftwareVertexProcessing.
-            device.setSoftwareVertexProcessing((BehaviorFlags & 0x20) !== 0);
+            device.setSoftwareVertexProcessing((BehaviorFlags & D3DCREATE_SOFTWARE_VERTEXPROCESSING) !== 0);
 
             // Establish backbuffer size from present params (single source of truth
             // for resolution: host canvas + viewport + XYZRHW NDC divisor must agree).
