@@ -60,6 +60,16 @@ const PROCESS_HEAP_HANDLE_CONST = 0x12345678;
 const HEAP_CREATE_HANDLE_BASE = 0x12345679;
 const createdHeaps = new Set<number>();
 let nextCreatedHeapHandle = HEAP_CREATE_HANDLE_BASE;
+/**
+ * HeapCompatibilityInformation per heap handle: 0 standard, 1 lookaside, 2 LFH. Ours is
+ * one allocator whichever is selected — the class is a Windows-internal front end, not a
+ * contract about behaviour — but the value must be REMEMBERED, because HeapQueryInformation
+ * is documented to read back what HeapSetInformation accepted and a CRT that sets LFH and
+ * then verifies it reads a mismatch as a hooked/corrupted heap.
+ */
+const heapCompatibility = new Map<number, number>();
+/** HeapEnableTerminationOnCorruption, once set, cannot be turned off (documented). */
+let terminationOnCorruption = false;
 let heapManagerOwnerProcess: any = null;
 
 // HeapWalk is stateful: the caller zeroes the entry, calls once to get the first
@@ -78,6 +88,8 @@ const ensureHeapManagerProcess = (): void => {
     if (currentProcess === heapManagerOwnerProcess) return;
     heapManagerOwnerProcess = currentProcess;
     createdHeaps.clear();
+    heapCompatibility.clear();
+    terminationOnCorruption = false;
     nextCreatedHeapHandle = HEAP_CREATE_HANDLE_BASE;
     heapWalkState = null;
 };
@@ -345,16 +357,19 @@ function isInAnySlab(ptr: number): boolean {
 // handle_heap_alloc: a block is [16-byte header zone][size_class data]; the user
 // pointer is blockStart+16, the magic header (SLAB_MAGIC|bin) sits at user-4
 // (= blockStart+12), and the bump advances by 16+size_class. handle_heap_free
-// links the per-bin free list through the freed block's first DATA word (at the
-// user pointer). The inline free stub flips the header's busy/free byte
+// links the per-bin free list through the header zone at user-8 (SLAB_LINK):
+// a freed block's user data stays intact, as under the real heap's LFH — a title
+// that touches a freed object before its owner forgets it reads what it wrote,
+// not our link. The inline free stub flips the header's busy/free byte
 // ('A'->'F') but keeps the bin nibble, so a linear header walk (via isSlabHeader,
 // which accepts BUSY and FREE) still traverses every block with no chain breaks.
 const SLAB_HEADER_ZONE = 16;
+const SLAB_LINK = 8;
 
 interface HeapBlock { addr: number; size: number; busy: boolean; }
 
 /** Gather currently-free slab user-pointers by following the 9 per-bin free
- *  lists (each linked through the freed block's first data word). */
+ *  lists (each linked through the freed block's header zone at user-SLAB_LINK). */
 function collectSlabFreeSet(view: DataView): Set<number> {
     const free = new Set<number>();
     const heads = hypercallDataManager.getSlabFreelistHeads();
@@ -364,7 +379,7 @@ function collectSlabFreeSet(view: DataView): Set<number> {
         for (let guard = 0; p !== 0 && guard < (1 << 21); guard++) {
             if (free.has(p) || p + 4 > view.byteLength) break;
             free.add(p);
-            p = view.getUint32(p, true) >>> 0; // next link lives in the freed block's data
+            p = view.getUint32(p - SLAB_LINK, true) >>> 0;
         }
     }
     return free;
@@ -425,6 +440,8 @@ export function resetHeapSlab(): void {
     virtualAllocRegions.clear();
     hypercallDataManager.resetHeapSlab();
     createdHeaps.clear();
+    heapCompatibility.clear();
+    terminationOnCorruption = false;
     nextCreatedHeapHandle = HEAP_CREATE_HANDLE_BASE;
     heapWalkState = null;
     heapManagerOwnerProcess = null;
@@ -474,15 +491,11 @@ export function resetHeapSlab(): void {
  * DevTools diagnostic: audit the 9 per-bin slab free-lists for corruption.
  * Call from the worker console as `slabFreelistAudit()`.
  *
- * The slab free-list is INTRUSIVE (a freed block's first user word = next free
- * pointer; see handle_heap_free in hypercall.rs) and UNGUARDED — there is no
- * per-block FREE bit, so a double-free (or an app UAF write into a still-free
- * block's word0) silently poisons the list. The classic failure is a double-free
- * of the current head H: `write32(H, old_head=H)` makes `H.next == H` (a 1-cycle),
- * after which every alloc of that bin returns H forever, and once H's owner writes
- * its word0 (e.g. a list node's `next = some LIVE node`) the free list inherits a
- * pointer to a LIVE allocation → that live block gets handed out again → corruption
- * of a still-live object (NFSU audio callback-list crash, 2026-06-22).
+ * The slab free-list is INTRUSIVE (the link sits in the freed block's header zone
+ * at user-SLAB_LINK; see handle_heap_free in hypercall.rs). A double-free of the
+ * current head H makes `H.next == H` (a 1-cycle), after which every alloc of that
+ * bin returns H forever and the same block is handed to two owners; a guest
+ * buffer underflow into the header zone poisons the link the same way.
  *
  * This walks each bin's chain and flags the independent corruption signatures
  * (no busy-set needed — they're all header/topology based):
@@ -516,7 +529,7 @@ export function resetHeapSlab(): void {
             const hdrBin = header & 0x0F;
             const bad = !validMagic || hdrBin !== bin;
             if (bad) badHeader++;
-            const next = p + 4 <= mem.length ? (view.getUint32(p, true) >>> 0) : 0;
+            const next = p + 4 <= mem.length ? (view.getUint32(p - SLAB_LINK, true) >>> 0) : 0;
             const self = next === p;
             if (self) selfPtr = true;
             const outOfBounds = next !== 0 && !inSlab(next);
@@ -929,6 +942,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
     const ERROR_INVALID_PARAMETER = 87;
     const ERROR_INVALID_HANDLE = 6;
     const ERROR_INVALID_ADDRESS = 487;
+    const ERROR_GEN_FAILURE = 31;
     const THUNK_GENERATOR_REGION_SIZE = 1024 * 1024;
     /** Highest user-mode address + 1 on 32-bit Windows: above it VirtualQuery fails. */
     const USER_SPACE_LIMIT = 0x7FFF0000;
@@ -2129,9 +2143,11 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         const returnLength = args[4];
 
         if (heapInfoClass === 0 && heapInfo && heapInfoLength >= 4) {
-            // HeapCompatibilityInformation: return 0 (standard heap)
+            // HeapCompatibilityInformation — whatever HeapSetInformation last accepted for
+            // this heap, defaulting to 0 (standard). Answering a constant would contradict
+            // a successful set, which a heap-integrity check reads as tampering.
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            view.setUint32(heapInfo, 0, true);
+            view.setUint32(heapInfo, heapCompatibility.get(args[0] >>> 0) ?? 0, true);
             if (returnLength) view.setUint32(returnLength, 4, true);
             return 1; // TRUE
         }
@@ -2139,6 +2155,63 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         // Unsupported class — return FALSE, set ERROR_INSUFFICIENT_BUFFER
         System.getInstance().scheduler.setLastError(122);
         return 0;
+    };
+
+    /**
+     * BOOL HeapSetInformation(HANDLE HeapHandle, HEAP_INFORMATION_CLASS HeapInformationClass,
+     *                         PVOID HeapInformation, SIZE_T HeapInformationLength)
+     *
+     * Two classes exist on the Windows versions we present, and both are settings a heap
+     * ACCEPTS rather than work it performs:
+     *   0 HeapCompatibilityInformation      — front-end selection (standard/lookaside/LFH)
+     *   1 HeapEnableTerminationOnCorruption — abort instead of limping on a bad block
+     * Ours is one allocator, so accepting either changes nothing observable except what
+     * HeapQueryInformation reads back — which is exactly what the caller checks.
+     *
+     * Anything else must FAIL. A CRT that probes an unknown class and is told TRUE
+     * concludes the feature is armed, and the "heap is hardened" branch it then takes is
+     * one we never implemented.
+     */
+    exports['HeapSetInformation'] = (ctx, mem, args) => {
+        const hHeap = args[0] >>> 0;
+        const heapInfoClass = args[1] >>> 0;
+        const heapInfo = args[2] >>> 0;
+        const heapInfoLength = args[3] >>> 0;
+        const fail = (code: number): number => {
+            System.getInstance().scheduler.setLastError(code);
+            return 0;
+        };
+
+        if (heapInfoClass === 0) {
+            // Per-heap, so a heap handle is required and must be one we handed out.
+            if (!isRecognizedHeapHandle(hHeap)) return fail(ERROR_INVALID_PARAMETER);
+            if (!heapInfo || heapInfoLength < 4) return fail(ERROR_INVALID_PARAMETER);
+            const value = Mem.readUint32(heapInfo);
+            if (value === null || value > 2) return fail(ERROR_INVALID_PARAMETER);
+            const current = heapCompatibility.get(hHeap) ?? 0;
+            // Documented: once a heap is LFH it cannot be moved back off it.
+            if (current === 2 && value !== 2) return fail(ERROR_GEN_FAILURE);
+            heapCompatibility.set(hHeap, value);
+            Logger.verbose(LogCategory.KERNEL32,
+                `HeapSetInformation(0x${hHeap.toString(16)}, HeapCompatibilityInformation, ${value})`);
+            return 1;
+        }
+
+        if (heapInfoClass === 1) {
+            // Process-wide: HeapHandle must be NULL and there is no payload.
+            if (hHeap !== 0) return fail(ERROR_INVALID_PARAMETER);
+            if (heapInfo !== 0 || heapInfoLength !== 0) return fail(ERROR_INVALID_PARAMETER);
+            if (!terminationOnCorruption) {
+                terminationOnCorruption = true;
+                Logger.log(LogCategory.KERNEL32,
+                    'HeapSetInformation: termination-on-corruption enabled (our allocator already refuses a corrupt free)');
+            }
+            return 1;
+        }
+
+        Logger.warn(LogCategory.KERNEL32,
+            `HeapSetInformation: unsupported class ${heapInfoClass} — FALSE/ERROR_INVALID_PARAMETER`);
+        return fail(ERROR_INVALID_PARAMETER);
     };
 
     // VirtualAlloc - allocate virtual memory

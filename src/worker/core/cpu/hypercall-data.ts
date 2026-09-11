@@ -191,6 +191,13 @@ export const OFF_HC_SLAB_ALLOC_COUNT = 0x1410;
 export const OFF_HC_SLAB_FREE_COUNT = 0x1414;
 const OFF_HC_SLAB_FALLBACK_COUNT = 0x1418;
 export const OFF_HC_SLAB_FREELIST = 0x1420; // 9 × u32
+// Byte gap from the free-list HEAD array to the large-bin FIFO TAIL array within the
+// guest-RAM control block (heads at rel 0x20, tails at rel 0x48; hypercall.rs
+// SLAB_REL_FREELIST_TAIL=0x48). NOT a hypercall-page field — it exists ONLY in the
+// 128-byte guest-RAM control block, so it is written as (…+OFF_HC_SLAB_FREELIST+gap),
+// never at page 0x1448 (which is hc_event_table). The WASM slab handler declines when
+// ctl_ptr == 0, so the FIFO tail is never touched in legacy page mode.
+const SLAB_FREELIST_TAIL_GAP = 0x48 - 0x20; // 0x28
 // Guest address of the slab control block (0 = legacy page mode). The WASM heap handler reads
 // this to find the guest-RAM control block; JS writes it in setSlabControlAddr / rewriteState.
 const OFF_HC_SLAB_CTL_PTR = 0x1444;
@@ -1494,7 +1501,8 @@ export class HypercallDataManager {
     /** Point the JS/inline-stub slab control block at a guest-RAM address. When set,
      * all slab field reads/writes target guest RAM (so the inline x86 stub, which can
      * only address guest RAM, shares one physical control block with JS). Must be a
-     * zero-initialised THUNK_DATA block ≥ (OFF_HC_SLAB_FREELIST-OFF_HC_SLAB_BASE)+36 B. */
+     * zero-initialised THUNK_DATA block ≥ (OFF_HC_SLAB_FREELIST_TAIL-OFF_HC_SLAB_BASE)+36 B
+     * = 0x6C B (heads at 0x20, large-bin FIFO tails at 0x48, each 9×u32). */
     setSlabControlAddr(guestAddr: number): void {
         this.slabControlAddr = guestAddr >>> 0;
         // Publish the guest address into the page so the WASM heap handler can find the
@@ -1538,6 +1546,14 @@ export class HypercallDataManager {
         this.view.setUint32(B + OFF_HC_SLAB_FALLBACK_COUNT, 0, true);
         for (let i = 0; i < 9; i++) {
             this.view.setUint32(B + OFF_HC_SLAB_FREELIST + i * 4, 0, true);
+        }
+        // Clear the large-bin FIFO tails alongside the heads — only in guest-RAM mode,
+        // where the tail lives in the control block (in the legacy page 0x1448 is the
+        // event table; the WASM handler never runs the FIFO there — see the constant).
+        if (this.slabControlAddr !== 0) {
+            for (let i = 0; i < 9; i++) {
+                this.view.setUint32(B + OFF_HC_SLAB_FREELIST + SLAB_FREELIST_TAIL_GAP + i * 4, 0, true);
+            }
         }
         const gen = this.view.getUint32(B + OFF_HC_SLAB_GENERATION, true);
         this.view.setUint32(B + OFF_HC_SLAB_GENERATION, gen + 1, true);

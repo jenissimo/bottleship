@@ -198,6 +198,36 @@ if (errors.length > 0) {
     process.exit(1);
 }
 
+// Rule 5: the slab free-list link lives in the block's HEADER ZONE, at one offset below
+// the user pointer, and four writers must agree on it — the Rust hypercall, the two inline
+// x86 stubs (encoded as a disp8 in `[EAX-8]`), and the TS free-list walkers. A drift
+// here is not a crash: one tier links through user data again, and a title that reads a
+// freed object's first word (an idle widget still on its parent's list) gets our link —
+// zero, for an empty bin — where a real heap left its vtable.
+{
+    const rustLink = rust.match(/const\s+SLAB_LINK\s*:\s*u32\s*=\s*(\d+)\s*;/);
+    const memTs = readFileSync(resolve(REPO, "src/worker/modules/kernel32/memory.ts"), "utf8");
+    const tsLink = memTs.match(/const\s+SLAB_LINK\s*=\s*(\d+)\s*;/);
+    if (!rustLink || !tsLink) {
+        console.error("SLAB_LINK not declared on both sides (hypercall.rs / kernel32/memory.ts) — the free-list link offset is unpinned.");
+        process.exit(1);
+    }
+    if (rustLink[1] !== tsLink[1]) {
+        console.error(`SLAB_LINK drift: Rust ${rustLink[1]} vs TS ${tsLink[1]} — the walkers follow a different word than the allocator writes.`);
+        process.exit(1);
+    }
+    const disp8 = (0x100 - Number(rustLink[1])).toString(16).toUpperCase();
+    for (const stub of ["src/worker/modules/kernel32/heap-slab-stubs.ts", "src/worker/modules/crt-slab-stubs.ts"]) {
+        const src = readFileSync(resolve(REPO, stub), "utf8");
+        const pop = src.includes(`w8(0x8B); w8(0x50); w8(0x${disp8});`);
+        const push = src.includes(`w8(0x89); w8(0x50); w8(0x${disp8});`);
+        if (!pop || !push) {
+            console.error(`${stub}: inline free-list ${!pop ? "pop" : "push"} does not address [EAX-${rustLink[1]}] (SLAB_LINK) — the stub links through a different word than hypercall.rs.`);
+            process.exit(1);
+        }
+    }
+}
+
 const rustOnly = [...rOff.keys()].filter(n => !tOff.has(n));
 const tsOnly = [...tOff.keys()].filter(n => !rOff.has(n));
 console.log(

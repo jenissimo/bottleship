@@ -93,6 +93,13 @@ export function writeCrtSlabStubs(
     // MOVZX ECX, byte [EAX + lutAddr]  ; 0F B6 88 disp32
     w8(0x0F); w8(0xB6); w8(0x88); w32(lutAddr);
 
+    // Large bins (>= 6) use the hypercall's FIFO free list (no inline tail); route large
+    // allocs to the OUT-trap. See hypercall.rs SLAB_LARGE_BIN_MIN.
+    // CMP ECX, 6          ; 83 F9 06
+    w8(0x83); w8(0xF9); w8(0x06);
+    // JAE .slow           ; 0F 83 rel32
+    w8(0x0F); w8(0x83); slowAllocPatches.push(off); w32(0);
+
     // Try freelist pop
     // MOV EAX, [ECX*4 + FREELIST_ABS]  ; 8B 04 8D disp32
     w8(0x8B); w8(0x04); w8(0x8D); w32(FREELIST_ABS);
@@ -102,8 +109,8 @@ export function writeCrtSlabStubs(
     w8(0x0F); w8(0x84); bumpPatches.push(off); w32(0);
 
     // freelist hit:
-    // MOV EDX, [EAX]      ; 8B 10
-    w8(0x8B); w8(0x10);
+    // MOV EDX, [EAX-8]    ; 8B 50 F8   (link lives in the header zone, user data untouched)
+    w8(0x8B); w8(0x50); w8(0xF8);
     // MOV [ECX*4 + FREELIST_ABS], EDX  ; 89 14 8D disp32
     w8(0x89); w8(0x14); w8(0x8D); w32(FREELIST_ABS);
     // Busy/free bit: restore BUSY marker on the popped block (free flipped it to 'F').
@@ -202,10 +209,12 @@ export function writeCrtSlabStubs(
     w8(0x0F); w8(0x85); slowFreePatches.push(off); w32(0);
     // AND ECX, 0x0F       ; 83 E1 0F
     w8(0x83); w8(0xE1); w8(0x0F);
-    // CMP ECX, 8          ; 83 F9 08
-    w8(0x83); w8(0xF9); w8(0x08);
-    // JA .slow            ; 0F 87 rel32
-    w8(0x0F); w8(0x87); slowFreePatches.push(off); w32(0);
+    // Large bins (>= 6) FIFO-free via the hypercall (tail-append); invalid bins (> 8)
+    // also go slow. CMP ECX, 6 ; JAE covers both. See hypercall.rs SLAB_LARGE_BIN_MIN.
+    // CMP ECX, 6          ; 83 F9 06
+    w8(0x83); w8(0xF9); w8(0x06);
+    // JAE .slow           ; 0F 83 rel32
+    w8(0x0F); w8(0x83); slowFreePatches.push(off); w32(0);
 
     // Busy/free bit (see writeHeapSlabStubs): flip BUSY 'A'(0x41)→FREE 'F'(0x46) so any
     // re-free fails the CMP SLAB_MAGIC above → .slow → JS free no-ops the slab pointer.
@@ -215,8 +224,8 @@ export function writeCrtSlabStubs(
     // Push to freelist[bin]
     // MOV EDX, [ECX*4 + FREELIST_ABS]  ; 8B 14 8D disp32   (EDX = current head)
     w8(0x8B); w8(0x14); w8(0x8D); w32(FREELIST_ABS);
-    // MOV [EAX], EDX      ; 89 10
-    w8(0x89); w8(0x10);
+    // MOV [EAX-8], EDX    ; 89 50 F8   (see handle_heap_free: never clobber user data)
+    w8(0x89); w8(0x50); w8(0xF8);
     // MOV [ECX*4 + FREELIST_ABS], EAX  ; 89 04 8D disp32
     w8(0x89); w8(0x04); w8(0x8D); w32(FREELIST_ABS);
     // INC dword [FREE_CNT_ABS]  ; FF 05 disp32
