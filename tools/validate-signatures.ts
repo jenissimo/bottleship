@@ -90,7 +90,12 @@ function loadTrustedReference(referenceDir: string): Map<string, Map<string, Ref
         for (const file of fs.readdirSync(path.join(win32Dir, dir.name))) {
             if (!file.endsWith('.sig.json')) continue;
             const doc = JSON.parse(fs.readFileSync(path.join(win32Dir, dir.name, file), 'utf-8'));
-            const moduleName = String(doc.module ?? dir.name).toLowerCase().replace(/\.dll$/, '');
+            // A module extension is not part of the module's identity: Windows loads
+            // winspool.drv and the import table names WINSPOOL.DRV, but the descriptor is
+            // winspool.api.ts. Stripping only .dll left that reference filed under a name no
+            // module lookup could ever produce, so 11 exports were cross-checked by nothing
+            // while the run stayed green.
+            const moduleName = String(doc.module ?? dir.name).toLowerCase().replace(/\.(dll|drv)$/, '');
             if (!Array.isArray(doc.functions)) continue;
             let table = byModule.get(moduleName);
             if (!table) byModule.set(moduleName, (table = new Map()));
@@ -180,6 +185,22 @@ function validateArgCounts(apiDir: string, referenceDir: string, only: string | 
         // decoration, so folding them in would only dilute the coverage number.
         const functions = validator.extractApiFunctions(apiFile, apiText, { modulesOnly: true });
         const reference = trusted.get(moduleName);
+        // A reference that exists on disk but resolves to nothing is the failure that
+        // hides: the module just reports low coverage, which reads like "Wine has no spec
+        // for this one" rather than "our two sides spell the name differently". Ask the
+        // directory directly, so a future extension or rename cannot go quiet the way
+        // winspool.drv did.
+        const win32ReferenceDir = path.join(referenceDir, 'win32');
+        if (!reference && fs.existsSync(win32ReferenceDir)) {
+            const onDisk = fs.readdirSync(win32ReferenceDir, { withFileTypes: true })
+                .filter(d => d.isDirectory())
+                .map(d => d.name.toLowerCase().replace(/\.(dll|drv)$/, ''));
+            if (onDisk.includes(moduleName)) {
+                errors.push({ module: moduleName, func: '(reference)',
+                    message: `a reference exists under ${win32ReferenceDir} but no entry resolved for this module `
+                        + `— the two sides normalize its name differently, so every arity here is unchecked` });
+            }
+        }
         const explicitCleanup = namesWithExplicitCleanup(apiText);
         // Arities the module's own DECORATED spellings claim, per base name. A descriptor
         // that declares both `AIL_stream_info` and `_AIL_stream_info@20` is describing a
