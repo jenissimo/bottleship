@@ -8,6 +8,8 @@ import { createGalaxyHandlers } from './handlers';
 import { patchGalaxyNativeModule, shouldPatchGalaxyNative } from './native-patch';
 import { handleAudioEnded, resetGalaxyPlayback } from './playback';
 import { probeGalaxyMixerKernels } from './mixer-probe';
+import { createGogGalaxyExports, resetGogGalaxyState } from './gog-sdk';
+import { assignStubsOnce } from '../../core/thunking/stub-merge';
 
 export class Galaxy implements IModule {
     name = 'galaxy';
@@ -21,11 +23,16 @@ export class Galaxy implements IModule {
     initialize(process: Process): void {
         this.ctx = createGalaxyContext(process);
         this.exports = createGalaxyHandlers(this.ctx);
+        // GOG's Galaxy.dll shares this basename with Unreal's audio Galaxy.dll. The two
+        // export sets are disjoint (mangled MSVC names vs plain C), and this merge is what
+        // KEEPS that true: a name claimed twice is reported instead of silently overwritten.
+        assignStubsOnce(this.exports, createGogGalaxyExports(process), 'galaxy(gog-sdk)');
         Logger.log(LogCategory.SYSTEM, `[Galaxy] module initialized (${Object.keys(this.exports).length} handlers)`);
     }
 
     reset(): void {
         resetGalaxyPlayback();
+        resetGogGalaxyState();
         // Handlers close over the ctx object — mutate in place, do not replace.
         const process = this.ctx.process;
         Object.assign(this.ctx, createGalaxyContext(process));
