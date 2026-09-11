@@ -1,0 +1,11 @@
+{
+  "container": "app-nfs-underground",
+  "files": [
+    "/registry-access.log",
+    "/overlay/C/NFS Underground/Rage_autosave.ugd",
+    "/overlay/C/NFS Underground/Rage0.ugd",
+    "/overlay/C/NFS Underground/Rage.opt",
+    "/overlay/C/NFS Underground/Rage.cfg",
+    "/overlay/C/NFS Underground/Profiles.usr"
+  ]
+}
