@@ -1,0 +1,15 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.934Z",
+  "module": "riched32",
+  "functions": [
+    {
+      "name": "DllGetVersion",
+      "argCount": 1
+    },
+    {
+      "name": "ord_2",
+      "argCount": 1
+    }
+  ]
+}

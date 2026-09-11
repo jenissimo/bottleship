@@ -4,6 +4,7 @@ import { hidModule } from "../api/hid.api";
 import { lgvidModule } from "../api/lgvid.api";
 import { oledlgModule } from "../api/oledlg.api";
 import { msiModule } from "../api/msi.api";
+import { xinput1_3Module } from "../api/xinput1_3.api";
 import { kernel32VistaSupplement } from "../api/kernel32-vista-supplement";
 import { REFERENCE_ARG_COUNTS } from "../reference-argcounts.generated";
 import { Logger, LogCategory } from "./logger";
@@ -83,6 +84,7 @@ export class APIRegistry {
         this.registerModule(lgvidModule);
         this.registerModule(oledlgModule);
         this.registerModule(msiModule);
+        this.registerModule(xinput1_3Module);
 
         try {
             const apiModules = import.meta.glob('../api/*.api.ts', { eager: true });
@@ -331,23 +333,26 @@ export class APIRegistry {
      */
     public getArgCountByOrdinal(dllName: string, ordinal: number): number | undefined {
         const dll = dllName.toLowerCase().replace(/\.dll$/, "");
+        const ordName = `ord_${ordinal}`.toLowerCase();
         const module = this.modules.get(dll);
-        if (!module) return undefined;
 
         // First try to find by ordinal
-        const func = module.functions.find(f => f.ordinal === ordinal);
+        const func = module?.functions.find(f => f.ordinal === ordinal);
         if (func) {
             return calculateStackCleanup(func.params) >> 2;
         }
 
         // Fallback: try to find by name "ord_${ordinal}"
-        const ordName = `ord_${ordinal}`.toLowerCase();
-        const funcByName = module.functions.find(f => f.name.toLowerCase() === ordName);
+        const funcByName = module?.functions.find(f => f.name.toLowerCase() === ordName);
         if (funcByName) {
             return calculateStackCleanup(funcByName.params) >> 2;
         }
 
-        return undefined;
+        // The win32 reference, which the descriptor sweep above cannot see. An import
+        // table that names nothing but ordinals (oleaut32, shlwapi, mfc) otherwise binds
+        // only the slots a descriptor happens to spell out, and one unlisted ordinal
+        // fails the whole PE load — the reference knows the arity for all of them.
+        return this.argCountCache.get(`${dll}:${ordName}`);
     }
 
     /** Resolve an imported ordinal to its canonical exported name, if declared. */

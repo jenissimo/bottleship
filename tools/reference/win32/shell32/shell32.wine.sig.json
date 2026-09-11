@@ -1,0 +1,2487 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.939Z",
+  "module": "shell32",
+  "functions": [
+    {
+      "name": "@",
+      "argCount": 2
+    },
+    {
+      "name": "@",
+      "argCount": 2
+    },
+    {
+      "name": "ArrangeWindows",
+      "argCount": 5
+    },
+    {
+      "name": "CallCPLEntry16",
+      "argCount": 6
+    },
+    {
+      "name": "CDefFolderMenu_Create2",
+      "argCount": 9
+    },
+    {
+      "name": "CheckEscapesA",
+      "argCount": 2
+    },
+    {
+      "name": "CheckEscapesW",
+      "argCount": 2
+    },
+    {
+      "name": "CIDLData_CreateFromIDArray",
+      "argCount": 4
+    },
+    {
+      "name": "CommandLineToArgvW",
+      "argCount": 2
+    },
+    {
+      "name": "Control_FillCache_RunDLL",
+      "argCount": 4
+    },
+    {
+      "name": "Control_FillCache_RunDLLA",
+      "argCount": 4
+    },
+    {
+      "name": "Control_FillCache_RunDLLW",
+      "argCount": 4
+    },
+    {
+      "name": "Control_RunDLL",
+      "argCount": 4
+    },
+    {
+      "name": "Control_RunDLLA",
+      "argCount": 4
+    },
+    {
+      "name": "Control_RunDLLW",
+      "argCount": 4
+    },
+    {
+      "name": "DAD_AutoScroll",
+      "argCount": 3
+    },
+    {
+      "name": "DAD_DragEnter",
+      "argCount": 1
+    },
+    {
+      "name": "DAD_DragEnterEx",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "DAD_DragLeave",
+      "argCount": 0
+    },
+    {
+      "name": "DAD_DragMove",
+      "argCount": 2,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "DAD_SetDragImage",
+      "argCount": 2
+    },
+    {
+      "name": "DAD_ShowDragImage",
+      "argCount": 1
+    },
+    {
+      "name": "DllCanUnloadNow",
+      "argCount": 0
+    },
+    {
+      "name": "DllGetClassObject",
+      "argCount": 3
+    },
+    {
+      "name": "DllGetVersion",
+      "argCount": 1
+    },
+    {
+      "name": "DllInstall",
+      "argCount": 2
+    },
+    {
+      "name": "DllRegisterServer",
+      "argCount": 0
+    },
+    {
+      "name": "DllUnregisterServer",
+      "argCount": 0
+    },
+    {
+      "name": "DoEnvironmentSubst",
+      "argCount": 2
+    },
+    {
+      "name": "DoEnvironmentSubstA",
+      "argCount": 2
+    },
+    {
+      "name": "DoEnvironmentSubstW",
+      "argCount": 2
+    },
+    {
+      "name": "DragAcceptFiles",
+      "argCount": 2
+    },
+    {
+      "name": "DragFinish",
+      "argCount": 1
+    },
+    {
+      "name": "DragQueryFile",
+      "argCount": 4
+    },
+    {
+      "name": "DragQueryFileA",
+      "argCount": 4
+    },
+    {
+      "name": "DragQueryFileW",
+      "argCount": 4
+    },
+    {
+      "name": "DragQueryPoint",
+      "argCount": 2
+    },
+    {
+      "name": "DriveType",
+      "argCount": 1
+    },
+    {
+      "name": "DuplicateIcon",
+      "argCount": 2
+    },
+    {
+      "name": "ExitWindowsDialog",
+      "argCount": 1
+    },
+    {
+      "name": "ExtractAssociatedIconA",
+      "argCount": 3
+    },
+    {
+      "name": "ExtractAssociatedIconExA",
+      "argCount": 4
+    },
+    {
+      "name": "ExtractAssociatedIconExW",
+      "argCount": 4
+    },
+    {
+      "name": "ExtractAssociatedIconW",
+      "argCount": 3
+    },
+    {
+      "name": "ExtractIconA",
+      "argCount": 3
+    },
+    {
+      "name": "ExtractIconEx",
+      "argCount": 5
+    },
+    {
+      "name": "ExtractIconExA",
+      "argCount": 5
+    },
+    {
+      "name": "ExtractIconExW",
+      "argCount": 5
+    },
+    {
+      "name": "ExtractIconW",
+      "argCount": 3
+    },
+    {
+      "name": "ExtractVersionResource16W",
+      "argCount": 2
+    },
+    {
+      "name": "FileIconInit",
+      "argCount": 1
+    },
+    {
+      "name": "FileMenu_AbortInitMenu",
+      "argCount": 0
+    },
+    {
+      "name": "FileMenu_AddFilesForPidl",
+      "argCount": 7
+    },
+    {
+      "name": "FileMenu_AppendFilesForPidl",
+      "argCount": 3
+    },
+    {
+      "name": "FileMenu_AppendItem",
+      "argCount": 6
+    },
+    {
+      "name": "FileMenu_Create",
+      "argCount": 5
+    },
+    {
+      "name": "FileMenu_DeleteAllItems",
+      "argCount": 1
+    },
+    {
+      "name": "FileMenu_DeleteItemByCmd",
+      "argCount": 2
+    },
+    {
+      "name": "FileMenu_DeleteItemByFirstID",
+      "argCount": 2
+    },
+    {
+      "name": "FileMenu_DeleteItemByIndex",
+      "argCount": 2
+    },
+    {
+      "name": "FileMenu_DeleteSeparator",
+      "argCount": 1
+    },
+    {
+      "name": "FileMenu_Destroy",
+      "argCount": 1
+    },
+    {
+      "name": "FileMenu_DrawItem",
+      "argCount": 2
+    },
+    {
+      "name": "FileMenu_EnableItemByCmd",
+      "argCount": 3
+    },
+    {
+      "name": "FileMenu_FindSubMenuByPidl",
+      "argCount": 2
+    },
+    {
+      "name": "FileMenu_GetItemExtent",
+      "argCount": 2
+    },
+    {
+      "name": "FileMenu_GetLastSelectedItemPidls",
+      "argCount": 3
+    },
+    {
+      "name": "FileMenu_HandleMenuChar",
+      "argCount": 2
+    },
+    {
+      "name": "FileMenu_InitMenuPopup",
+      "argCount": 1
+    },
+    {
+      "name": "FileMenu_InsertUsingPidl",
+      "argCount": 6
+    },
+    {
+      "name": "FileMenu_Invalidate",
+      "argCount": 1
+    },
+    {
+      "name": "FileMenu_MeasureItem",
+      "argCount": 2
+    },
+    {
+      "name": "FileMenu_ReplaceUsingPidl",
+      "argCount": 5
+    },
+    {
+      "name": "FileMenu_TrackPopupMenuEx",
+      "argCount": 6
+    },
+    {
+      "name": "FindExecutableA",
+      "argCount": 3
+    },
+    {
+      "name": "FindExecutableW",
+      "argCount": 3
+    },
+    {
+      "name": "FreeIconList",
+      "argCount": 1
+    },
+    {
+      "name": "GetCurrentProcessExplicitAppUserModelID",
+      "argCount": 1
+    },
+    {
+      "name": "GetFileNameFromBrowse",
+      "argCount": 7
+    },
+    {
+      "name": "GUIDFromStringW",
+      "argCount": 2
+    },
+    {
+      "name": "ILAppendID",
+      "argCount": 3
+    },
+    {
+      "name": "ILClone",
+      "argCount": 1
+    },
+    {
+      "name": "ILCloneFirst",
+      "argCount": 1
+    },
+    {
+      "name": "ILCombine",
+      "argCount": 2
+    },
+    {
+      "name": "ILCreateFromPath",
+      "argCount": 1
+    },
+    {
+      "name": "ILCreateFromPathA",
+      "argCount": 1
+    },
+    {
+      "name": "ILCreateFromPathW",
+      "argCount": 1
+    },
+    {
+      "name": "ILFindChild",
+      "argCount": 2
+    },
+    {
+      "name": "ILFindLastID",
+      "argCount": 1
+    },
+    {
+      "name": "ILFree",
+      "argCount": 1
+    },
+    {
+      "name": "ILGetDisplayName",
+      "argCount": 2
+    },
+    {
+      "name": "ILGetDisplayNameEx",
+      "argCount": 4
+    },
+    {
+      "name": "ILGetNext",
+      "argCount": 1
+    },
+    {
+      "name": "ILGetSize",
+      "argCount": 1
+    },
+    {
+      "name": "ILGlobalClone",
+      "argCount": 1
+    },
+    {
+      "name": "ILGlobalFree",
+      "argCount": 1
+    },
+    {
+      "name": "ILIsEqual",
+      "argCount": 2
+    },
+    {
+      "name": "ILIsParent",
+      "argCount": 3
+    },
+    {
+      "name": "ILLoadFromStream",
+      "argCount": 2
+    },
+    {
+      "name": "ILRemoveLastID",
+      "argCount": 1
+    },
+    {
+      "name": "ILSaveToStream",
+      "argCount": 2
+    },
+    {
+      "name": "InitNetworkAddressControl",
+      "argCount": 0
+    },
+    {
+      "name": "InvalidateDriveType",
+      "argCount": 1
+    },
+    {
+      "name": "IsLFNDrive",
+      "argCount": 1
+    },
+    {
+      "name": "IsLFNDriveA",
+      "argCount": 1
+    },
+    {
+      "name": "IsLFNDriveW",
+      "argCount": 1
+    },
+    {
+      "name": "IsNetDrive",
+      "argCount": 1
+    },
+    {
+      "name": "IsUserAnAdmin",
+      "argCount": 0
+    },
+    {
+      "name": "LinkWindow_RegisterClass",
+      "argCount": 0
+    },
+    {
+      "name": "LinkWindow_UnregisterClass",
+      "argCount": 0
+    },
+    {
+      "name": "NTSHChangeNotifyDeregister",
+      "argCount": 1
+    },
+    {
+      "name": "NTSHChangeNotifyRegister",
+      "argCount": 6
+    },
+    {
+      "name": "OleStrToStrN",
+      "argCount": 4
+    },
+    {
+      "name": "OpenAs_RunDLL",
+      "argCount": 4
+    },
+    {
+      "name": "OpenAs_RunDLLA",
+      "argCount": 4
+    },
+    {
+      "name": "OpenAs_RunDLLW",
+      "argCount": 4
+    },
+    {
+      "name": "OpenRegStream",
+      "argCount": 4
+    },
+    {
+      "name": "ord_100",
+      "argCount": 1
+    },
+    {
+      "name": "ord_102",
+      "argCount": 5
+    },
+    {
+      "name": "ord_103",
+      "argCount": 1
+    },
+    {
+      "name": "ord_104",
+      "argCount": 1
+    },
+    {
+      "name": "ord_105",
+      "argCount": 2
+    },
+    {
+      "name": "ord_106",
+      "argCount": 2
+    },
+    {
+      "name": "ord_107",
+      "argCount": 3
+    },
+    {
+      "name": "ord_108",
+      "argCount": 2
+    },
+    {
+      "name": "ord_109",
+      "argCount": 1
+    },
+    {
+      "name": "ord_110",
+      "argCount": 6
+    },
+    {
+      "name": "ord_111",
+      "argCount": 1
+    },
+    {
+      "name": "ord_112",
+      "argCount": 2
+    },
+    {
+      "name": "ord_113",
+      "argCount": 5
+    },
+    {
+      "name": "ord_114",
+      "argCount": 5
+    },
+    {
+      "name": "ord_115",
+      "argCount": 6
+    },
+    {
+      "name": "ord_116",
+      "argCount": 6
+    },
+    {
+      "name": "ord_117",
+      "argCount": 2
+    },
+    {
+      "name": "ord_118",
+      "argCount": 1
+    },
+    {
+      "name": "ord_119",
+      "argCount": 1
+    },
+    {
+      "name": "ord_120",
+      "argCount": 0
+    },
+    {
+      "name": "ord_121",
+      "argCount": 0
+    },
+    {
+      "name": "ord_122",
+      "argCount": 5
+    },
+    {
+      "name": "ord_123",
+      "argCount": 0
+    },
+    {
+      "name": "ord_124",
+      "argCount": 3
+    },
+    {
+      "name": "ord_125",
+      "argCount": 7
+    },
+    {
+      "name": "ord_126",
+      "argCount": 3
+    },
+    {
+      "name": "ord_127",
+      "argCount": 4
+    },
+    {
+      "name": "ord_128",
+      "argCount": 3
+    },
+    {
+      "name": "ord_129",
+      "argCount": 3
+    },
+    {
+      "name": "ord_130",
+      "argCount": 1
+    },
+    {
+      "name": "ord_131",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_132",
+      "argCount": 0
+    },
+    {
+      "name": "ord_134",
+      "argCount": 2,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_136",
+      "argCount": 2
+    },
+    {
+      "name": "ord_137",
+      "argCount": 1
+    },
+    {
+      "name": "ord_140",
+      "argCount": 2
+    },
+    {
+      "name": "ord_141",
+      "argCount": 2
+    },
+    {
+      "name": "ord_142",
+      "argCount": 1
+    },
+    {
+      "name": "ord_143",
+      "argCount": 3
+    },
+    {
+      "name": "ord_144",
+      "argCount": 2
+    },
+    {
+      "name": "ord_145",
+      "argCount": 2
+    },
+    {
+      "name": "ord_146",
+      "argCount": 0
+    },
+    {
+      "name": "ord_147",
+      "argCount": 2
+    },
+    {
+      "name": "ord_148",
+      "argCount": 9
+    },
+    {
+      "name": "ord_149",
+      "argCount": 4
+    },
+    {
+      "name": "ord_15",
+      "argCount": 2
+    },
+    {
+      "name": "ord_151",
+      "argCount": 1
+    },
+    {
+      "name": "ord_152",
+      "argCount": 1
+    },
+    {
+      "name": "ord_153",
+      "argCount": 1
+    },
+    {
+      "name": "ord_154",
+      "argCount": 3
+    },
+    {
+      "name": "ord_155",
+      "argCount": 1
+    },
+    {
+      "name": "ord_156",
+      "argCount": 1
+    },
+    {
+      "name": "ord_157",
+      "argCount": 1
+    },
+    {
+      "name": "ord_158",
+      "argCount": 3
+    },
+    {
+      "name": "ord_159",
+      "argCount": 1
+    },
+    {
+      "name": "ord_16",
+      "argCount": 1
+    },
+    {
+      "name": "ord_161",
+      "argCount": 2
+    },
+    {
+      "name": "ord_162",
+      "argCount": 1
+    },
+    {
+      "name": "ord_163",
+      "argCount": 2
+    },
+    {
+      "name": "ord_164",
+      "argCount": 1
+    },
+    {
+      "name": "ord_165",
+      "argCount": 2
+    },
+    {
+      "name": "ord_166",
+      "argCount": 6
+    },
+    {
+      "name": "ord_167",
+      "argCount": 3
+    },
+    {
+      "name": "ord_168",
+      "argCount": 3
+    },
+    {
+      "name": "ord_169",
+      "argCount": 1
+    },
+    {
+      "name": "ord_17",
+      "argCount": 1
+    },
+    {
+      "name": "ord_170",
+      "argCount": 4
+    },
+    {
+      "name": "ord_171",
+      "argCount": 2
+    },
+    {
+      "name": "ord_172",
+      "argCount": 5
+    },
+    {
+      "name": "ord_173",
+      "argCount": 3
+    },
+    {
+      "name": "ord_174",
+      "argCount": 2
+    },
+    {
+      "name": "ord_175",
+      "argCount": 4
+    },
+    {
+      "name": "ord_176",
+      "argCount": 1
+    },
+    {
+      "name": "ord_178",
+      "argCount": 4
+    },
+    {
+      "name": "ord_179",
+      "argCount": 5
+    },
+    {
+      "name": "ord_18",
+      "argCount": 1
+    },
+    {
+      "name": "ord_180",
+      "argCount": 5
+    },
+    {
+      "name": "ord_181",
+      "argCount": 2
+    },
+    {
+      "name": "ord_184",
+      "argCount": 5
+    },
+    {
+      "name": "ord_186",
+      "argCount": 4
+    },
+    {
+      "name": "ord_188",
+      "argCount": 1
+    },
+    {
+      "name": "ord_189",
+      "argCount": 1
+    },
+    {
+      "name": "ord_19",
+      "argCount": 1
+    },
+    {
+      "name": "ord_190",
+      "argCount": 1
+    },
+    {
+      "name": "ord_191",
+      "argCount": 4
+    },
+    {
+      "name": "ord_192",
+      "argCount": 4
+    },
+    {
+      "name": "ord_193",
+      "argCount": 1
+    },
+    {
+      "name": "ord_194",
+      "argCount": 4
+    },
+    {
+      "name": "ord_195",
+      "argCount": 1
+    },
+    {
+      "name": "ord_196",
+      "argCount": 1
+    },
+    {
+      "name": "ord_198",
+      "argCount": 0
+    },
+    {
+      "name": "ord_2",
+      "argCount": 6
+    },
+    {
+      "name": "ord_20",
+      "argCount": 1
+    },
+    {
+      "name": "ord_205",
+      "argCount": 3
+    },
+    {
+      "name": "ord_21",
+      "argCount": 2
+    },
+    {
+      "name": "ord_213",
+      "argCount": 4
+    },
+    {
+      "name": "ord_214",
+      "argCount": 2
+    },
+    {
+      "name": "ord_215",
+      "argCount": 3
+    },
+    {
+      "name": "ord_23",
+      "argCount": 3
+    },
+    {
+      "name": "ord_24",
+      "argCount": 2
+    },
+    {
+      "name": "ord_243",
+      "argCount": 2
+    },
+    {
+      "name": "ord_244",
+      "argCount": 2
+    },
+    {
+      "name": "ord_249",
+      "argCount": 1
+    },
+    {
+      "name": "ord_25",
+      "argCount": 2
+    },
+    {
+      "name": "ord_250",
+      "argCount": 1
+    },
+    {
+      "name": "ord_251",
+      "argCount": 1
+    },
+    {
+      "name": "ord_256",
+      "argCount": 2
+    },
+    {
+      "name": "ord_258",
+      "argCount": 0
+    },
+    {
+      "name": "ord_259",
+      "argCount": 0
+    },
+    {
+      "name": "ord_26",
+      "argCount": 2
+    },
+    {
+      "name": "ord_27",
+      "argCount": 2
+    },
+    {
+      "name": "ord_28",
+      "argCount": 3
+    },
+    {
+      "name": "ord_29",
+      "argCount": 1
+    },
+    {
+      "name": "ord_3",
+      "argCount": 6
+    },
+    {
+      "name": "ord_30",
+      "argCount": 2
+    },
+    {
+      "name": "ord_31",
+      "argCount": 1
+    },
+    {
+      "name": "ord_32",
+      "argCount": 1
+    },
+    {
+      "name": "ord_33",
+      "argCount": 1
+    },
+    {
+      "name": "ord_34",
+      "argCount": 1
+    },
+    {
+      "name": "ord_35",
+      "argCount": 1
+    },
+    {
+      "name": "ord_36",
+      "argCount": 2
+    },
+    {
+      "name": "ord_37",
+      "argCount": 3
+    },
+    {
+      "name": "ord_38",
+      "argCount": 1
+    },
+    {
+      "name": "ord_39",
+      "argCount": 1
+    },
+    {
+      "name": "ord_4",
+      "argCount": 1
+    },
+    {
+      "name": "ord_40",
+      "argCount": 1
+    },
+    {
+      "name": "ord_41",
+      "argCount": 1
+    },
+    {
+      "name": "ord_42",
+      "argCount": 1
+    },
+    {
+      "name": "ord_43",
+      "argCount": 1
+    },
+    {
+      "name": "ord_45",
+      "argCount": 1
+    },
+    {
+      "name": "ord_46",
+      "argCount": 2
+    },
+    {
+      "name": "ord_47",
+      "argCount": 5
+    },
+    {
+      "name": "ord_48",
+      "argCount": 3
+    },
+    {
+      "name": "ord_49",
+      "argCount": 1
+    },
+    {
+      "name": "ord_5",
+      "argCount": 4
+    },
+    {
+      "name": "ord_50",
+      "argCount": 1
+    },
+    {
+      "name": "ord_505",
+      "argCount": 1
+    },
+    {
+      "name": "ord_506",
+      "argCount": 3
+    },
+    {
+      "name": "ord_507",
+      "argCount": 3
+    },
+    {
+      "name": "ord_508",
+      "argCount": 4
+    },
+    {
+      "name": "ord_509",
+      "argCount": 6
+    },
+    {
+      "name": "ord_51",
+      "argCount": 3
+    },
+    {
+      "name": "ord_510",
+      "argCount": 4
+    },
+    {
+      "name": "ord_511",
+      "argCount": 6
+    },
+    {
+      "name": "ord_512",
+      "argCount": 2
+    },
+    {
+      "name": "ord_52",
+      "argCount": 1
+    },
+    {
+      "name": "ord_520",
+      "argCount": 3
+    },
+    {
+      "name": "ord_521",
+      "argCount": 2
+    },
+    {
+      "name": "ord_522",
+      "argCount": 1
+    },
+    {
+      "name": "ord_523",
+      "argCount": 2
+    },
+    {
+      "name": "ord_524",
+      "argCount": 2
+    },
+    {
+      "name": "ord_526",
+      "argCount": 0
+    },
+    {
+      "name": "ord_53",
+      "argCount": 2
+    },
+    {
+      "name": "ord_55",
+      "argCount": 1
+    },
+    {
+      "name": "ord_56",
+      "argCount": 1
+    },
+    {
+      "name": "ord_57",
+      "argCount": 1
+    },
+    {
+      "name": "ord_58",
+      "argCount": 4
+    },
+    {
+      "name": "ord_59",
+      "argCount": 3
+    },
+    {
+      "name": "ord_6",
+      "argCount": 6
+    },
+    {
+      "name": "ord_60",
+      "argCount": 1
+    },
+    {
+      "name": "ord_61",
+      "argCount": 6
+    },
+    {
+      "name": "ord_62",
+      "argCount": 4
+    },
+    {
+      "name": "ord_63",
+      "argCount": 7
+    },
+    {
+      "name": "ord_64",
+      "argCount": 1
+    },
+    {
+      "name": "ord_640",
+      "argCount": 6
+    },
+    {
+      "name": "ord_641",
+      "argCount": 1
+    },
+    {
+      "name": "ord_644",
+      "argCount": 4
+    },
+    {
+      "name": "ord_645",
+      "argCount": 1
+    },
+    {
+      "name": "ord_65",
+      "argCount": 1
+    },
+    {
+      "name": "ord_650",
+      "argCount": 2
+    },
+    {
+      "name": "ord_651",
+      "argCount": 2
+    },
+    {
+      "name": "ord_652",
+      "argCount": 1
+    },
+    {
+      "name": "ord_653",
+      "argCount": 4
+    },
+    {
+      "name": "ord_654",
+      "argCount": 2
+    },
+    {
+      "name": "ord_66",
+      "argCount": 1
+    },
+    {
+      "name": "ord_660",
+      "argCount": 1
+    },
+    {
+      "name": "ord_67",
+      "argCount": 6
+    },
+    {
+      "name": "ord_68",
+      "argCount": 3
+    },
+    {
+      "name": "ord_680",
+      "argCount": 0
+    },
+    {
+      "name": "ord_685",
+      "argCount": 8
+    },
+    {
+      "name": "ord_688",
+      "argCount": 5
+    },
+    {
+      "name": "ord_689",
+      "argCount": 6
+    },
+    {
+      "name": "ord_70",
+      "argCount": 5
+    },
+    {
+      "name": "ord_701",
+      "argCount": 9
+    },
+    {
+      "name": "ord_704",
+      "argCount": 2
+    },
+    {
+      "name": "ord_709",
+      "argCount": 3
+    },
+    {
+      "name": "ord_71",
+      "argCount": 2
+    },
+    {
+      "name": "ord_714",
+      "argCount": 1
+    },
+    {
+      "name": "ord_716",
+      "argCount": 2
+    },
+    {
+      "name": "ord_72",
+      "argCount": 3
+    },
+    {
+      "name": "ord_723",
+      "argCount": 2
+    },
+    {
+      "name": "ord_727",
+      "argCount": 3
+    },
+    {
+      "name": "ord_73",
+      "argCount": 3
+    },
+    {
+      "name": "ord_730",
+      "argCount": 4
+    },
+    {
+      "name": "ord_74",
+      "argCount": 3
+    },
+    {
+      "name": "ord_743",
+      "argCount": 4
+    },
+    {
+      "name": "ord_747",
+      "argCount": 2
+    },
+    {
+      "name": "ord_75",
+      "argCount": 4
+    },
+    {
+      "name": "ord_77",
+      "argCount": 3
+    },
+    {
+      "name": "ord_78",
+      "argCount": 4
+    },
+    {
+      "name": "ord_79",
+      "argCount": 4
+    },
+    {
+      "name": "ord_83",
+      "argCount": 4
+    },
+    {
+      "name": "ord_85",
+      "argCount": 4
+    },
+    {
+      "name": "ord_86",
+      "argCount": 2
+    },
+    {
+      "name": "ord_87",
+      "argCount": 1
+    },
+    {
+      "name": "ord_88",
+      "argCount": 5
+    },
+    {
+      "name": "ord_89",
+      "argCount": 3
+    },
+    {
+      "name": "ord_90",
+      "argCount": 2
+    },
+    {
+      "name": "ord_92",
+      "argCount": 1
+    },
+    {
+      "name": "ord_93",
+      "argCount": 2
+    },
+    {
+      "name": "ord_94",
+      "argCount": 1
+    },
+    {
+      "name": "ord_95",
+      "argCount": 1
+    },
+    {
+      "name": "ord_96",
+      "argCount": 4
+    },
+    {
+      "name": "ord_97",
+      "argCount": 3
+    },
+    {
+      "name": "ord_98",
+      "argCount": 3
+    },
+    {
+      "name": "ord_99",
+      "argCount": 2
+    },
+    {
+      "name": "ParseField",
+      "argCount": 4
+    },
+    {
+      "name": "PathAddBackslash",
+      "argCount": 1
+    },
+    {
+      "name": "PathAppend",
+      "argCount": 2
+    },
+    {
+      "name": "PathBuildRoot",
+      "argCount": 2
+    },
+    {
+      "name": "PathCleanupSpec",
+      "argCount": 2
+    },
+    {
+      "name": "PathCombine",
+      "argCount": 3
+    },
+    {
+      "name": "PathFileExists",
+      "argCount": 1
+    },
+    {
+      "name": "PathFindExtension",
+      "argCount": 1
+    },
+    {
+      "name": "PathFindFileName",
+      "argCount": 1
+    },
+    {
+      "name": "PathFindOnPath",
+      "argCount": 2
+    },
+    {
+      "name": "PathGetArgs",
+      "argCount": 1
+    },
+    {
+      "name": "PathGetDriveNumber",
+      "argCount": 1
+    },
+    {
+      "name": "PathGetExtension",
+      "argCount": 3
+    },
+    {
+      "name": "PathGetShortPath",
+      "argCount": 1
+    },
+    {
+      "name": "PathIsDirectory",
+      "argCount": 1
+    },
+    {
+      "name": "PathIsExe",
+      "argCount": 1
+    },
+    {
+      "name": "PathIsRelative",
+      "argCount": 1
+    },
+    {
+      "name": "PathIsRoot",
+      "argCount": 1
+    },
+    {
+      "name": "PathIsSameRoot",
+      "argCount": 2
+    },
+    {
+      "name": "PathIsTemporaryW",
+      "argCount": 1
+    },
+    {
+      "name": "PathIsUNC",
+      "argCount": 1
+    },
+    {
+      "name": "PathMakeUniqueName",
+      "argCount": 5
+    },
+    {
+      "name": "PathMatchSpec",
+      "argCount": 2
+    },
+    {
+      "name": "PathParseIconLocation",
+      "argCount": 1
+    },
+    {
+      "name": "PathProcessCommand",
+      "argCount": 4
+    },
+    {
+      "name": "PathQualify",
+      "argCount": 1
+    },
+    {
+      "name": "PathQuoteSpaces",
+      "argCount": 1
+    },
+    {
+      "name": "PathRemoveArgs",
+      "argCount": 1
+    },
+    {
+      "name": "PathRemoveBlanks",
+      "argCount": 1
+    },
+    {
+      "name": "PathRemoveExtension",
+      "argCount": 1
+    },
+    {
+      "name": "PathRemoveFileSpec",
+      "argCount": 1
+    },
+    {
+      "name": "PathResolve",
+      "argCount": 3
+    },
+    {
+      "name": "PathSetDlgItemPath",
+      "argCount": 3
+    },
+    {
+      "name": "PathStripPath",
+      "argCount": 1
+    },
+    {
+      "name": "PathStripToRoot",
+      "argCount": 1
+    },
+    {
+      "name": "PathUnquoteSpaces",
+      "argCount": 1
+    },
+    {
+      "name": "PathYetAnotherMakeUniqueName",
+      "argCount": 4
+    },
+    {
+      "name": "PickIconDlg",
+      "argCount": 4
+    },
+    {
+      "name": "Printer_LoadIconsW",
+      "argCount": 3
+    },
+    {
+      "name": "Printers_RegisterWindowW",
+      "argCount": 4
+    },
+    {
+      "name": "Printers_UnregisterWindow",
+      "argCount": 2
+    },
+    {
+      "name": "ReadCabinetState",
+      "argCount": 2
+    },
+    {
+      "name": "RealDriveType",
+      "argCount": 2
+    },
+    {
+      "name": "RegenerateUserEnvironment",
+      "argCount": 2
+    },
+    {
+      "name": "RegisterShellHook",
+      "argCount": 2
+    },
+    {
+      "name": "RestartDialog",
+      "argCount": 3
+    },
+    {
+      "name": "RestartDialogEx",
+      "argCount": 4
+    },
+    {
+      "name": "RLBuildListOfPaths",
+      "argCount": 0
+    },
+    {
+      "name": "RunDLL_CallEntry16",
+      "argCount": 5
+    },
+    {
+      "name": "RunFileDlg",
+      "argCount": 6
+    },
+    {
+      "name": "SetAppStartingCursor",
+      "argCount": 2
+    },
+    {
+      "name": "SetCurrentProcessExplicitAppUserModelID",
+      "argCount": 1
+    },
+    {
+      "name": "SHAbortInvokeCommand",
+      "argCount": 0
+    },
+    {
+      "name": "SHAddFromPropSheetExtArray",
+      "argCount": 3
+    },
+    {
+      "name": "SHAddToRecentDocs",
+      "argCount": 2
+    },
+    {
+      "name": "SHAlloc",
+      "argCount": 1
+    },
+    {
+      "name": "SHAllocShared",
+      "argCount": 3
+    },
+    {
+      "name": "SHAppBarMessage",
+      "argCount": 2
+    },
+    {
+      "name": "SHAssocEnumHandlers",
+      "argCount": 3
+    },
+    {
+      "name": "SHAssocEnumHandlersForProtocolByApplication",
+      "argCount": 3
+    },
+    {
+      "name": "SHBindToFolderIDListParent",
+      "argCount": 5
+    },
+    {
+      "name": "SHBindToObject",
+      "argCount": 5
+    },
+    {
+      "name": "SHBindToParent",
+      "argCount": 4
+    },
+    {
+      "name": "SHBrowseForFolder",
+      "argCount": 1
+    },
+    {
+      "name": "SHBrowseForFolderA",
+      "argCount": 1
+    },
+    {
+      "name": "SHBrowseForFolderW",
+      "argCount": 1
+    },
+    {
+      "name": "SHChangeNotification_Lock",
+      "argCount": 4
+    },
+    {
+      "name": "SHChangeNotification_Unlock",
+      "argCount": 1
+    },
+    {
+      "name": "SHChangeNotify",
+      "argCount": 4
+    },
+    {
+      "name": "SHChangeNotifyDeregister",
+      "argCount": 1
+    },
+    {
+      "name": "SHChangeNotifyRegister",
+      "argCount": 6
+    },
+    {
+      "name": "SHChangeNotifyUpdateEntryList",
+      "argCount": 4
+    },
+    {
+      "name": "SHCloneSpecialIDList",
+      "argCount": 3
+    },
+    {
+      "name": "SHCLSIDFromString",
+      "argCount": 2
+    },
+    {
+      "name": "SHCoCreateInstance",
+      "argCount": 5
+    },
+    {
+      "name": "SHCreateAssociationRegistration",
+      "argCount": 2
+    },
+    {
+      "name": "SHCreateDataObject",
+      "argCount": 6
+    },
+    {
+      "name": "SHCreateDefaultContextMenu",
+      "argCount": 3
+    },
+    {
+      "name": "SHCreateDefClassObject",
+      "argCount": 5
+    },
+    {
+      "name": "SHCreateDirectory",
+      "argCount": 2
+    },
+    {
+      "name": "SHCreateDirectoryExA",
+      "argCount": 3
+    },
+    {
+      "name": "SHCreateDirectoryExW",
+      "argCount": 3
+    },
+    {
+      "name": "SHCreateFileExtractIconW",
+      "argCount": 4
+    },
+    {
+      "name": "SHCreateItemFromIDList",
+      "argCount": 3
+    },
+    {
+      "name": "SHCreateItemFromParsingName",
+      "argCount": 4
+    },
+    {
+      "name": "SHCreateItemFromRelativeName",
+      "argCount": 5
+    },
+    {
+      "name": "SHCreateItemInKnownFolder",
+      "argCount": 5
+    },
+    {
+      "name": "SHCreateItemWithParent",
+      "argCount": 5
+    },
+    {
+      "name": "SHCreateLinks",
+      "argCount": 5
+    },
+    {
+      "name": "SHCreatePropSheetExtArray",
+      "argCount": 3
+    },
+    {
+      "name": "SHCreatePropSheetExtArrayEx",
+      "argCount": 4
+    },
+    {
+      "name": "SHCreateQueryCancelAutoPlayMoniker",
+      "argCount": 1
+    },
+    {
+      "name": "SHCreateSessionKey",
+      "argCount": 2
+    },
+    {
+      "name": "SHCreateShellFolderView",
+      "argCount": 2
+    },
+    {
+      "name": "SHCreateShellFolderViewEx",
+      "argCount": 2
+    },
+    {
+      "name": "SHCreateShellItem",
+      "argCount": 4
+    },
+    {
+      "name": "SHCreateShellItemArray",
+      "argCount": 5
+    },
+    {
+      "name": "SHCreateShellItemArrayFromDataObject",
+      "argCount": 3
+    },
+    {
+      "name": "SHCreateShellItemArrayFromIDLists",
+      "argCount": 3
+    },
+    {
+      "name": "SHCreateShellItemArrayFromShellItem",
+      "argCount": 3
+    },
+    {
+      "name": "SHCreateStdEnumFmtEtc",
+      "argCount": 3
+    },
+    {
+      "name": "SHDefExtractIconA",
+      "argCount": 6
+    },
+    {
+      "name": "SHDefExtractIconW",
+      "argCount": 6
+    },
+    {
+      "name": "SHDestroyPropSheetExtArray",
+      "argCount": 1
+    },
+    {
+      "name": "SHDllGetClassObject",
+      "argCount": 3
+    },
+    {
+      "name": "SHDoDragDrop",
+      "argCount": 5
+    },
+    {
+      "name": "SheChangeDirA",
+      "argCount": 1
+    },
+    {
+      "name": "SheChangeDirW",
+      "argCount": 1
+    },
+    {
+      "name": "SheGetDirA",
+      "argCount": 2
+    },
+    {
+      "name": "SheGetDirW",
+      "argCount": 2
+    },
+    {
+      "name": "Shell_GetCachedImageIndex",
+      "argCount": 3
+    },
+    {
+      "name": "Shell_GetCachedImageIndexA",
+      "argCount": 3
+    },
+    {
+      "name": "Shell_GetCachedImageIndexW",
+      "argCount": 3
+    },
+    {
+      "name": "Shell_GetImageLists",
+      "argCount": 2
+    },
+    {
+      "name": "Shell_MergeMenus",
+      "argCount": 6
+    },
+    {
+      "name": "Shell_NotifyIcon",
+      "argCount": 2
+    },
+    {
+      "name": "Shell_NotifyIconA",
+      "argCount": 2
+    },
+    {
+      "name": "Shell_NotifyIconGetRect",
+      "argCount": 2
+    },
+    {
+      "name": "Shell_NotifyIconW",
+      "argCount": 2
+    },
+    {
+      "name": "ShellAboutA",
+      "argCount": 4
+    },
+    {
+      "name": "ShellAboutW",
+      "argCount": 4
+    },
+    {
+      "name": "ShellDDEInit",
+      "argCount": 1
+    },
+    {
+      "name": "ShellExec_RunDLL",
+      "argCount": 4
+    },
+    {
+      "name": "ShellExec_RunDLLA",
+      "argCount": 4
+    },
+    {
+      "name": "ShellExec_RunDLLW",
+      "argCount": 4
+    },
+    {
+      "name": "ShellExecuteA",
+      "argCount": 6
+    },
+    {
+      "name": "ShellExecuteEx",
+      "argCount": 1
+    },
+    {
+      "name": "ShellExecuteExA",
+      "argCount": 1
+    },
+    {
+      "name": "ShellExecuteExW",
+      "argCount": 1
+    },
+    {
+      "name": "ShellExecuteW",
+      "argCount": 6
+    },
+    {
+      "name": "ShellHookProc",
+      "argCount": 3
+    },
+    {
+      "name": "SHEmptyRecycleBinA",
+      "argCount": 3
+    },
+    {
+      "name": "SHEmptyRecycleBinW",
+      "argCount": 3
+    },
+    {
+      "name": "SHEnumerateUnreadMailAccountsW",
+      "argCount": 4
+    },
+    {
+      "name": "SHEvaluateSystemCommandTemplate",
+      "argCount": 4
+    },
+    {
+      "name": "SHExtractIconsW",
+      "argCount": 8
+    },
+    {
+      "name": "SHFileOperation",
+      "argCount": 1
+    },
+    {
+      "name": "SHFileOperationA",
+      "argCount": 1
+    },
+    {
+      "name": "SHFileOperationW",
+      "argCount": 1
+    },
+    {
+      "name": "SHFind_InitMenuPopup",
+      "argCount": 4
+    },
+    {
+      "name": "SHFindFiles",
+      "argCount": 2
+    },
+    {
+      "name": "SHFlushClipboard",
+      "argCount": 0
+    },
+    {
+      "name": "SHFlushSFCache",
+      "argCount": 0
+    },
+    {
+      "name": "SHFormatDrive",
+      "argCount": 4
+    },
+    {
+      "name": "SHFree",
+      "argCount": 1
+    },
+    {
+      "name": "SHFreeNameMappings",
+      "argCount": 1
+    },
+    {
+      "name": "SHFreeShared",
+      "argCount": 2
+    },
+    {
+      "name": "SHFreeUnusedLibraries",
+      "argCount": 0
+    },
+    {
+      "name": "SHGetDataFromIDListA",
+      "argCount": 5
+    },
+    {
+      "name": "SHGetDataFromIDListW",
+      "argCount": 5
+    },
+    {
+      "name": "SHGetDesktopFolder",
+      "argCount": 1
+    },
+    {
+      "name": "SHGetDiskFreeSpaceA",
+      "argCount": 4
+    },
+    {
+      "name": "SHGetDiskFreeSpaceExA",
+      "argCount": 4
+    },
+    {
+      "name": "SHGetDiskFreeSpaceExW",
+      "argCount": 4
+    },
+    {
+      "name": "SHGetFileInfo",
+      "argCount": 5
+    },
+    {
+      "name": "SHGetFileInfoA",
+      "argCount": 5
+    },
+    {
+      "name": "SHGetFileInfoW",
+      "argCount": 5
+    },
+    {
+      "name": "SHGetFolderLocation",
+      "argCount": 5
+    },
+    {
+      "name": "SHGetFolderPathA",
+      "argCount": 5
+    },
+    {
+      "name": "SHGetFolderPathAndSubDirA",
+      "argCount": 6
+    },
+    {
+      "name": "SHGetFolderPathAndSubDirW",
+      "argCount": 6
+    },
+    {
+      "name": "SHGetFolderPathEx",
+      "argCount": 5
+    },
+    {
+      "name": "SHGetFolderPathW",
+      "argCount": 5
+    },
+    {
+      "name": "SHGetIconOverlayIndexA",
+      "argCount": 2
+    },
+    {
+      "name": "SHGetIconOverlayIndexW",
+      "argCount": 2
+    },
+    {
+      "name": "SHGetIDListFromObject",
+      "argCount": 2
+    },
+    {
+      "name": "SHGetImageList",
+      "argCount": 3
+    },
+    {
+      "name": "SHGetInstanceExplorer",
+      "argCount": 1
+    },
+    {
+      "name": "SHGetItemFromDataObject",
+      "argCount": 4
+    },
+    {
+      "name": "SHGetItemFromObject",
+      "argCount": 3
+    },
+    {
+      "name": "SHGetKnownFolderIDList",
+      "argCount": 4
+    },
+    {
+      "name": "SHGetKnownFolderItem",
+      "argCount": 5
+    },
+    {
+      "name": "SHGetKnownFolderPath",
+      "argCount": 4
+    },
+    {
+      "name": "SHGetLocalizedName",
+      "argCount": 4
+    },
+    {
+      "name": "SHGetMalloc",
+      "argCount": 1
+    },
+    {
+      "name": "SHGetNameFromIDList",
+      "argCount": 3
+    },
+    {
+      "name": "SHGetNewLinkInfo",
+      "argCount": 5
+    },
+    {
+      "name": "SHGetNewLinkInfoA",
+      "argCount": 5
+    },
+    {
+      "name": "SHGetNewLinkInfoW",
+      "argCount": 5
+    },
+    {
+      "name": "SHGetPathFromIDList",
+      "argCount": 2
+    },
+    {
+      "name": "SHGetPathFromIDListA",
+      "argCount": 2
+    },
+    {
+      "name": "SHGetPathFromIDListEx",
+      "argCount": 4
+    },
+    {
+      "name": "SHGetPathFromIDListW",
+      "argCount": 2
+    },
+    {
+      "name": "SHGetPropertyStoreForWindow",
+      "argCount": 3
+    },
+    {
+      "name": "SHGetPropertyStoreFromParsingName",
+      "argCount": 5
+    },
+    {
+      "name": "SHGetRealIDL",
+      "argCount": 3
+    },
+    {
+      "name": "SHGetSetFolderCustomSettings",
+      "argCount": 3
+    },
+    {
+      "name": "SHGetSetSettings",
+      "argCount": 3
+    },
+    {
+      "name": "SHGetSettings",
+      "argCount": 2
+    },
+    {
+      "name": "SHGetSpecialFolderLocation",
+      "argCount": 3
+    },
+    {
+      "name": "SHGetSpecialFolderPath",
+      "argCount": 4
+    },
+    {
+      "name": "SHGetSpecialFolderPathA",
+      "argCount": 4
+    },
+    {
+      "name": "SHGetSpecialFolderPathW",
+      "argCount": 4
+    },
+    {
+      "name": "SHGetStockIconInfo",
+      "argCount": 3
+    },
+    {
+      "name": "SHHandleUpdateImage",
+      "argCount": 1
+    },
+    {
+      "name": "SHHelpShortcuts_RunDLL",
+      "argCount": 4
+    },
+    {
+      "name": "SHHelpShortcuts_RunDLLA",
+      "argCount": 4
+    },
+    {
+      "name": "SHHelpShortcuts_RunDLLW",
+      "argCount": 4
+    },
+    {
+      "name": "SHILCreateFromPath",
+      "argCount": 3
+    },
+    {
+      "name": "SHInitRestricted",
+      "argCount": 2
+    },
+    {
+      "name": "SHIsFileAvailableOffline",
+      "argCount": 2
+    },
+    {
+      "name": "SHLimitInputEdit",
+      "argCount": 2
+    },
+    {
+      "name": "SHLoadInProc",
+      "argCount": 1
+    },
+    {
+      "name": "SHLoadNonloadedIconOverlayIdentifiers",
+      "argCount": 0
+    },
+    {
+      "name": "SHLoadOLE",
+      "argCount": 1
+    },
+    {
+      "name": "SHLockShared",
+      "argCount": 2
+    },
+    {
+      "name": "SHLogILFromFSIL",
+      "argCount": 1
+    },
+    {
+      "name": "SHMapIDListToImageListIndexAsync",
+      "argCount": 9
+    },
+    {
+      "name": "SHMapPIDLToSystemImageListIndex",
+      "argCount": 3
+    },
+    {
+      "name": "SHMultiFileProperties",
+      "argCount": 2
+    },
+    {
+      "name": "SHObjectProperties",
+      "argCount": 4
+    },
+    {
+      "name": "SHOpenFolderAndSelectItems",
+      "argCount": 4
+    },
+    {
+      "name": "SHOpenWithDialog",
+      "argCount": 2
+    },
+    {
+      "name": "SHOutOfMemoryMessageBox",
+      "argCount": 3
+    },
+    {
+      "name": "SHParseDisplayName",
+      "argCount": 5
+    },
+    {
+      "name": "SHPathPrepareForWriteA",
+      "argCount": 4
+    },
+    {
+      "name": "SHPathPrepareForWriteW",
+      "argCount": 4
+    },
+    {
+      "name": "SHPropStgCreate",
+      "argCount": 8
+    },
+    {
+      "name": "SHPropStgReadMultiple",
+      "argCount": 5
+    },
+    {
+      "name": "SHPropStgWriteMultiple",
+      "argCount": 6
+    },
+    {
+      "name": "SHQueryRecycleBinA",
+      "argCount": 2
+    },
+    {
+      "name": "SHQueryRecycleBinW",
+      "argCount": 2
+    },
+    {
+      "name": "SHQueryUserNotificationState",
+      "argCount": 1
+    },
+    {
+      "name": "SHRegCloseKey",
+      "argCount": 1
+    },
+    {
+      "name": "SHRegDeleteKeyW",
+      "argCount": 2
+    },
+    {
+      "name": "SHRegisterDragDrop",
+      "argCount": 2
+    },
+    {
+      "name": "SHRegOpenKeyA",
+      "argCount": 3
+    },
+    {
+      "name": "SHRegOpenKeyW",
+      "argCount": 3
+    },
+    {
+      "name": "SHRegQueryValueA",
+      "argCount": 4
+    },
+    {
+      "name": "SHRegQueryValueExA",
+      "argCount": 6
+    },
+    {
+      "name": "SHRegQueryValueExW",
+      "argCount": 6
+    },
+    {
+      "name": "SHRegQueryValueW",
+      "argCount": 4
+    },
+    {
+      "name": "SHRemoveLocalizedName",
+      "argCount": 1
+    },
+    {
+      "name": "SHReplaceFromPropSheetExtArray",
+      "argCount": 4
+    },
+    {
+      "name": "SHRestricted",
+      "argCount": 1
+    },
+    {
+      "name": "SHRevokeDragDrop",
+      "argCount": 1
+    },
+    {
+      "name": "SHRunControlPanel",
+      "argCount": 2
+    },
+    {
+      "name": "SHSetInstanceExplorer",
+      "argCount": 1
+    },
+    {
+      "name": "SHSetLocalizedName",
+      "argCount": 3
+    },
+    {
+      "name": "SHSetTemporaryPropertyForItem",
+      "argCount": 3
+    },
+    {
+      "name": "SHSetUnreadMailCountW",
+      "argCount": 3
+    },
+    {
+      "name": "SHShellFolderView_Message",
+      "argCount": 3
+    },
+    {
+      "name": "SHSimpleIDListFromPath",
+      "argCount": 1
+    },
+    {
+      "name": "SHStartNetConnectionDialog",
+      "argCount": 3
+    },
+    {
+      "name": "SHUnlockShared",
+      "argCount": 1
+    },
+    {
+      "name": "SHUpdateImageA",
+      "argCount": 4
+    },
+    {
+      "name": "SHUpdateImageW",
+      "argCount": 4
+    },
+    {
+      "name": "SHUpdateRecycleBinIcon",
+      "argCount": 0
+    },
+    {
+      "name": "SHValidateUNC",
+      "argCount": 3
+    },
+    {
+      "name": "SHWaitForFileToOpen",
+      "argCount": 3
+    },
+    {
+      "name": "SHWinHelp",
+      "argCount": 4
+    },
+    {
+      "name": "SignalFileOpen",
+      "argCount": 1
+    },
+    {
+      "name": "StrChrA",
+      "argCount": 2
+    },
+    {
+      "name": "StrChrIA",
+      "argCount": 2
+    },
+    {
+      "name": "StrChrIW",
+      "argCount": 2
+    },
+    {
+      "name": "StrChrW",
+      "argCount": 2
+    },
+    {
+      "name": "StrCmpNA",
+      "argCount": 3
+    },
+    {
+      "name": "StrCmpNIA",
+      "argCount": 3
+    },
+    {
+      "name": "StrCmpNIW",
+      "argCount": 3
+    },
+    {
+      "name": "StrCmpNW",
+      "argCount": 3
+    },
+    {
+      "name": "StrCpyNA",
+      "argCount": 3
+    },
+    {
+      "name": "StrCpyNW",
+      "argCount": 3
+    },
+    {
+      "name": "StrNCmpA",
+      "argCount": 3
+    },
+    {
+      "name": "StrNCmpIA",
+      "argCount": 3
+    },
+    {
+      "name": "StrNCmpIW",
+      "argCount": 3
+    },
+    {
+      "name": "StrNCmpW",
+      "argCount": 3
+    },
+    {
+      "name": "StrNCpyA",
+      "argCount": 3
+    },
+    {
+      "name": "StrNCpyW",
+      "argCount": 3
+    },
+    {
+      "name": "StrRChrA",
+      "argCount": 3
+    },
+    {
+      "name": "StrRChrIA",
+      "argCount": 3
+    },
+    {
+      "name": "StrRChrIW",
+      "argCount": 3
+    },
+    {
+      "name": "StrRChrW",
+      "argCount": 3
+    },
+    {
+      "name": "StrRetToStrN",
+      "argCount": 4
+    },
+    {
+      "name": "StrRStrIA",
+      "argCount": 3
+    },
+    {
+      "name": "StrRStrIW",
+      "argCount": 3
+    },
+    {
+      "name": "StrStrA",
+      "argCount": 2
+    },
+    {
+      "name": "StrStrIA",
+      "argCount": 2
+    },
+    {
+      "name": "StrStrIW",
+      "argCount": 2
+    },
+    {
+      "name": "StrStrW",
+      "argCount": 2
+    },
+    {
+      "name": "StrToOleStr",
+      "argCount": 2
+    },
+    {
+      "name": "StrToOleStrN",
+      "argCount": 4
+    },
+    {
+      "name": "Win32CreateDirectory",
+      "argCount": 2
+    },
+    {
+      "name": "Win32DeleteFile",
+      "argCount": 1
+    },
+    {
+      "name": "Win32RemoveDirectory",
+      "argCount": 1
+    },
+    {
+      "name": "WOWShellExecute",
+      "argCount": 7
+    },
+    {
+      "name": "WriteCabinetState",
+      "argCount": 1
+    }
+  ]
+}

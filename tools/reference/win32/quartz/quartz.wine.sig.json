@@ -1,0 +1,39 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.933Z",
+  "module": "quartz",
+  "functions": [
+    {
+      "name": "AMGetErrorTextA",
+      "argCount": 3
+    },
+    {
+      "name": "AMGetErrorTextW",
+      "argCount": 3
+    },
+    {
+      "name": "AmpFactorToDB",
+      "argCount": 1
+    },
+    {
+      "name": "DBToAmpFactor",
+      "argCount": 1
+    },
+    {
+      "name": "DllCanUnloadNow",
+      "argCount": 0
+    },
+    {
+      "name": "DllGetClassObject",
+      "argCount": 3
+    },
+    {
+      "name": "DllRegisterServer",
+      "argCount": 0
+    },
+    {
+      "name": "DllUnregisterServer",
+      "argCount": 0
+    }
+  ]
+}

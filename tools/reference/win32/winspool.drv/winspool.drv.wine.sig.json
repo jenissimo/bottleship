@@ -1,0 +1,576 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.953Z",
+  "module": "winspool.drv",
+  "functions": [
+    {
+      "name": "AbortPrinter",
+      "argCount": 1
+    },
+    {
+      "name": "AddFormA",
+      "argCount": 3
+    },
+    {
+      "name": "AddFormW",
+      "argCount": 3
+    },
+    {
+      "name": "AddJobA",
+      "argCount": 5
+    },
+    {
+      "name": "AddJobW",
+      "argCount": 5
+    },
+    {
+      "name": "AddMonitorA",
+      "argCount": 3
+    },
+    {
+      "name": "AddMonitorW",
+      "argCount": 3
+    },
+    {
+      "name": "AddPortA",
+      "argCount": 3
+    },
+    {
+      "name": "AddPortExA",
+      "argCount": 4
+    },
+    {
+      "name": "AddPortExW",
+      "argCount": 4
+    },
+    {
+      "name": "AddPortW",
+      "argCount": 3
+    },
+    {
+      "name": "AddPrinterA",
+      "argCount": 3
+    },
+    {
+      "name": "AddPrinterConnectionA",
+      "argCount": 1
+    },
+    {
+      "name": "AddPrinterConnectionW",
+      "argCount": 1
+    },
+    {
+      "name": "AddPrinterDriverA",
+      "argCount": 3
+    },
+    {
+      "name": "AddPrinterDriverExA",
+      "argCount": 4
+    },
+    {
+      "name": "AddPrinterDriverExW",
+      "argCount": 4
+    },
+    {
+      "name": "AddPrinterDriverW",
+      "argCount": 3
+    },
+    {
+      "name": "AddPrinterW",
+      "argCount": 3
+    },
+    {
+      "name": "AddPrintProcessorA",
+      "argCount": 4
+    },
+    {
+      "name": "AddPrintProcessorW",
+      "argCount": 4
+    },
+    {
+      "name": "AddPrintProvidorA",
+      "argCount": 3
+    },
+    {
+      "name": "AddPrintProvidorW",
+      "argCount": 3
+    },
+    {
+      "name": "AdvancedDocumentPropertiesA",
+      "argCount": 5
+    },
+    {
+      "name": "AdvancedDocumentPropertiesW",
+      "argCount": 5
+    },
+    {
+      "name": "ClosePrinter",
+      "argCount": 1
+    },
+    {
+      "name": "ConfigurePortA",
+      "argCount": 3
+    },
+    {
+      "name": "ConfigurePortW",
+      "argCount": 3
+    },
+    {
+      "name": "ConnectToPrinterDlg",
+      "argCount": 2
+    },
+    {
+      "name": "DeleteFormA",
+      "argCount": 2
+    },
+    {
+      "name": "DeleteFormW",
+      "argCount": 2
+    },
+    {
+      "name": "DeleteMonitorA",
+      "argCount": 3
+    },
+    {
+      "name": "DeleteMonitorW",
+      "argCount": 3
+    },
+    {
+      "name": "DeletePortA",
+      "argCount": 3
+    },
+    {
+      "name": "DeletePortW",
+      "argCount": 3
+    },
+    {
+      "name": "DeletePrinter",
+      "argCount": 1
+    },
+    {
+      "name": "DeletePrinterConnectionA",
+      "argCount": 1
+    },
+    {
+      "name": "DeletePrinterConnectionW",
+      "argCount": 1
+    },
+    {
+      "name": "DeletePrinterDataExA",
+      "argCount": 3
+    },
+    {
+      "name": "DeletePrinterDataExW",
+      "argCount": 3
+    },
+    {
+      "name": "DeletePrinterDriverA",
+      "argCount": 3
+    },
+    {
+      "name": "DeletePrinterDriverExA",
+      "argCount": 5
+    },
+    {
+      "name": "DeletePrinterDriverExW",
+      "argCount": 5
+    },
+    {
+      "name": "DeletePrinterDriverW",
+      "argCount": 3
+    },
+    {
+      "name": "DeletePrintProcessorA",
+      "argCount": 3
+    },
+    {
+      "name": "DeletePrintProcessorW",
+      "argCount": 3
+    },
+    {
+      "name": "DeletePrintProvidorA",
+      "argCount": 3
+    },
+    {
+      "name": "DeletePrintProvidorW",
+      "argCount": 3
+    },
+    {
+      "name": "DeviceCapabilities",
+      "argCount": 5
+    },
+    {
+      "name": "DeviceCapabilitiesA",
+      "argCount": 5
+    },
+    {
+      "name": "DeviceCapabilitiesW",
+      "argCount": 5
+    },
+    {
+      "name": "DocumentPropertiesA",
+      "argCount": 6
+    },
+    {
+      "name": "DocumentPropertiesW",
+      "argCount": 6
+    },
+    {
+      "name": "EndDocPrinter",
+      "argCount": 1
+    },
+    {
+      "name": "EndPagePrinter",
+      "argCount": 1
+    },
+    {
+      "name": "EnumFormsA",
+      "argCount": 6
+    },
+    {
+      "name": "EnumFormsW",
+      "argCount": 6
+    },
+    {
+      "name": "EnumJobsA",
+      "argCount": 8
+    },
+    {
+      "name": "EnumJobsW",
+      "argCount": 8
+    },
+    {
+      "name": "EnumMonitorsA",
+      "argCount": 6
+    },
+    {
+      "name": "EnumMonitorsW",
+      "argCount": 6
+    },
+    {
+      "name": "EnumPortsA",
+      "argCount": 6
+    },
+    {
+      "name": "EnumPortsW",
+      "argCount": 6
+    },
+    {
+      "name": "EnumPrinterDataA",
+      "argCount": 9
+    },
+    {
+      "name": "EnumPrinterDataExA",
+      "argCount": 6
+    },
+    {
+      "name": "EnumPrinterDataExW",
+      "argCount": 6
+    },
+    {
+      "name": "EnumPrinterDataW",
+      "argCount": 9
+    },
+    {
+      "name": "EnumPrinterDriversA",
+      "argCount": 7
+    },
+    {
+      "name": "EnumPrinterDriversW",
+      "argCount": 7
+    },
+    {
+      "name": "EnumPrinterKeyA",
+      "argCount": 5
+    },
+    {
+      "name": "EnumPrinterKeyW",
+      "argCount": 5
+    },
+    {
+      "name": "EnumPrintersA",
+      "argCount": 7
+    },
+    {
+      "name": "EnumPrintersW",
+      "argCount": 7
+    },
+    {
+      "name": "EnumPrintProcessorDatatypesA",
+      "argCount": 7
+    },
+    {
+      "name": "EnumPrintProcessorDatatypesW",
+      "argCount": 7
+    },
+    {
+      "name": "EnumPrintProcessorsA",
+      "argCount": 7
+    },
+    {
+      "name": "EnumPrintProcessorsW",
+      "argCount": 7
+    },
+    {
+      "name": "ExtDeviceMode",
+      "argCount": 8
+    },
+    {
+      "name": "FindClosePrinterChangeNotification",
+      "argCount": 1
+    },
+    {
+      "name": "FindFirstPrinterChangeNotification",
+      "argCount": 4
+    },
+    {
+      "name": "FindNextPrinterChangeNotification",
+      "argCount": 4
+    },
+    {
+      "name": "FreePrinterNotifyInfo",
+      "argCount": 1
+    },
+    {
+      "name": "GetDefaultPrinterA",
+      "argCount": 2
+    },
+    {
+      "name": "GetDefaultPrinterW",
+      "argCount": 2
+    },
+    {
+      "name": "GetFormA",
+      "argCount": 6
+    },
+    {
+      "name": "GetFormW",
+      "argCount": 6
+    },
+    {
+      "name": "GetJobA",
+      "argCount": 6
+    },
+    {
+      "name": "GetJobW",
+      "argCount": 6
+    },
+    {
+      "name": "GetPrinterA",
+      "argCount": 5
+    },
+    {
+      "name": "GetPrinterDataA",
+      "argCount": 6
+    },
+    {
+      "name": "GetPrinterDataExA",
+      "argCount": 7
+    },
+    {
+      "name": "GetPrinterDataExW",
+      "argCount": 7
+    },
+    {
+      "name": "GetPrinterDataW",
+      "argCount": 6
+    },
+    {
+      "name": "GetPrinterDriverA",
+      "argCount": 6
+    },
+    {
+      "name": "GetPrinterDriverDirectoryA",
+      "argCount": 6
+    },
+    {
+      "name": "GetPrinterDriverDirectoryW",
+      "argCount": 6
+    },
+    {
+      "name": "GetPrinterDriverW",
+      "argCount": 6
+    },
+    {
+      "name": "GetPrinterW",
+      "argCount": 5
+    },
+    {
+      "name": "GetPrintProcessorDirectoryA",
+      "argCount": 6
+    },
+    {
+      "name": "GetPrintProcessorDirectoryW",
+      "argCount": 6
+    },
+    {
+      "name": "GetSpoolFileHandle",
+      "argCount": 1
+    },
+    {
+      "name": "IsValidDevmodeA",
+      "argCount": 2
+    },
+    {
+      "name": "IsValidDevmodeW",
+      "argCount": 2
+    },
+    {
+      "name": "OpenPrinter2A",
+      "argCount": 4
+    },
+    {
+      "name": "OpenPrinter2W",
+      "argCount": 4
+    },
+    {
+      "name": "OpenPrinterA",
+      "argCount": 3
+    },
+    {
+      "name": "OpenPrinterW",
+      "argCount": 3
+    },
+    {
+      "name": "ord_201",
+      "argCount": 2
+    },
+    {
+      "name": "ord_202",
+      "argCount": 1
+    },
+    {
+      "name": "ord_203",
+      "argCount": 2
+    },
+    {
+      "name": "ord_204",
+      "argCount": 1
+    },
+    {
+      "name": "PerfClose",
+      "argCount": 0
+    },
+    {
+      "name": "PerfCollect",
+      "argCount": 4
+    },
+    {
+      "name": "PerfOpen",
+      "argCount": 1
+    },
+    {
+      "name": "PrinterProperties",
+      "argCount": 2
+    },
+    {
+      "name": "ReadPrinter",
+      "argCount": 4
+    },
+    {
+      "name": "ResetPrinterA",
+      "argCount": 2
+    },
+    {
+      "name": "ResetPrinterW",
+      "argCount": 2
+    },
+    {
+      "name": "ScheduleJob",
+      "argCount": 2
+    },
+    {
+      "name": "SeekPrinter",
+      "argCount": 6,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SetDefaultPrinterA",
+      "argCount": 1
+    },
+    {
+      "name": "SetDefaultPrinterW",
+      "argCount": 1
+    },
+    {
+      "name": "SetFormA",
+      "argCount": 4
+    },
+    {
+      "name": "SetFormW",
+      "argCount": 4
+    },
+    {
+      "name": "SetJobA",
+      "argCount": 5
+    },
+    {
+      "name": "SetJobW",
+      "argCount": 5
+    },
+    {
+      "name": "SetPrinterA",
+      "argCount": 4
+    },
+    {
+      "name": "SetPrinterDataA",
+      "argCount": 5
+    },
+    {
+      "name": "SetPrinterDataExA",
+      "argCount": 6
+    },
+    {
+      "name": "SetPrinterDataExW",
+      "argCount": 6
+    },
+    {
+      "name": "SetPrinterDataW",
+      "argCount": 5
+    },
+    {
+      "name": "SetPrinterW",
+      "argCount": 4
+    },
+    {
+      "name": "SpoolerInit",
+      "argCount": 0
+    },
+    {
+      "name": "StartDocDlgA",
+      "argCount": 2
+    },
+    {
+      "name": "StartDocDlgW",
+      "argCount": 2
+    },
+    {
+      "name": "StartDocPrinterA",
+      "argCount": 3
+    },
+    {
+      "name": "StartDocPrinterW",
+      "argCount": 3
+    },
+    {
+      "name": "StartPagePrinter",
+      "argCount": 1
+    },
+    {
+      "name": "UploadPrinterDriverPackageA",
+      "argCount": 7
+    },
+    {
+      "name": "UploadPrinterDriverPackageW",
+      "argCount": 7
+    },
+    {
+      "name": "WritePrinter",
+      "argCount": 4
+    },
+    {
+      "name": "XcvDataW",
+      "argCount": 8
+    }
+  ]
+}

@@ -1,0 +1,55 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.885Z",
+  "module": "ddraw",
+  "functions": [
+    {
+      "name": "DirectDrawCreate",
+      "argCount": 3
+    },
+    {
+      "name": "DirectDrawCreateClipper",
+      "argCount": 3
+    },
+    {
+      "name": "DirectDrawCreateEx",
+      "argCount": 4
+    },
+    {
+      "name": "DirectDrawEnumerateA",
+      "argCount": 2
+    },
+    {
+      "name": "DirectDrawEnumerateExA",
+      "argCount": 3
+    },
+    {
+      "name": "DirectDrawEnumerateExW",
+      "argCount": 3
+    },
+    {
+      "name": "DirectDrawEnumerateW",
+      "argCount": 2
+    },
+    {
+      "name": "DllCanUnloadNow",
+      "argCount": 0
+    },
+    {
+      "name": "DllGetClassObject",
+      "argCount": 3
+    },
+    {
+      "name": "DllRegisterServer",
+      "argCount": 0
+    },
+    {
+      "name": "DllUnregisterServer",
+      "argCount": 0
+    },
+    {
+      "name": "GetSurfaceFromDC",
+      "argCount": 3
+    }
+  ]
+}

@@ -1,0 +1,103 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.947Z",
+  "module": "userenv",
+  "functions": [
+    {
+      "name": "@",
+      "argCount": 12
+    },
+    {
+      "name": "CreateAppContainerProfile",
+      "argCount": 6
+    },
+    {
+      "name": "CreateEnvironmentBlock",
+      "argCount": 3
+    },
+    {
+      "name": "DestroyEnvironmentBlock",
+      "argCount": 1
+    },
+    {
+      "name": "EnterCriticalPolicySection",
+      "argCount": 1
+    },
+    {
+      "name": "ExpandEnvironmentStringsForUserA",
+      "argCount": 4
+    },
+    {
+      "name": "ExpandEnvironmentStringsForUserW",
+      "argCount": 4
+    },
+    {
+      "name": "GetAllUsersProfileDirectoryA",
+      "argCount": 2
+    },
+    {
+      "name": "GetAllUsersProfileDirectoryW",
+      "argCount": 2
+    },
+    {
+      "name": "GetAppliedGPOListW",
+      "argCount": 5
+    },
+    {
+      "name": "GetDefaultUserProfileDirectoryA",
+      "argCount": 2
+    },
+    {
+      "name": "GetDefaultUserProfileDirectoryW",
+      "argCount": 2
+    },
+    {
+      "name": "GetProfilesDirectoryA",
+      "argCount": 2
+    },
+    {
+      "name": "GetProfilesDirectoryW",
+      "argCount": 2
+    },
+    {
+      "name": "GetProfileType",
+      "argCount": 1
+    },
+    {
+      "name": "GetUserProfileDirectoryA",
+      "argCount": 3
+    },
+    {
+      "name": "GetUserProfileDirectoryW",
+      "argCount": 3
+    },
+    {
+      "name": "LeaveCriticalPolicySection",
+      "argCount": 1
+    },
+    {
+      "name": "LoadUserProfileA",
+      "argCount": 2
+    },
+    {
+      "name": "LoadUserProfileW",
+      "argCount": 2
+    },
+    {
+      "name": "ord_138",
+      "argCount": 12
+    },
+    {
+      "name": "RegisterGPNotification",
+      "argCount": 2
+    },
+    {
+      "name": "UnloadUserProfile",
+      "argCount": 2
+    },
+    {
+      "name": "UnregisterGPNotification",
+      "argCount": 1
+    }
+  ]
+}

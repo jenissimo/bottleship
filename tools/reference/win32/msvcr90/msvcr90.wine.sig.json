@@ -1,0 +1,57 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.917Z",
+  "module": "msvcr90",
+  "functions": [
+    {
+      "name": "__CxxLongjmpUnwind",
+      "argCount": 1
+    },
+    {
+      "name": "_adj_fdiv_m16i",
+      "argCount": 1
+    },
+    {
+      "name": "_adj_fdiv_m32",
+      "argCount": 1
+    },
+    {
+      "name": "_adj_fdiv_m32i",
+      "argCount": 1
+    },
+    {
+      "name": "_adj_fdiv_m64",
+      "argCount": 2,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "_adj_fdivr_m16i",
+      "argCount": 1
+    },
+    {
+      "name": "_adj_fdivr_m32",
+      "argCount": 1
+    },
+    {
+      "name": "_adj_fdivr_m32i",
+      "argCount": 1
+    },
+    {
+      "name": "_adj_fdivr_m64",
+      "argCount": 2,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "_CxxThrowException",
+      "argCount": 2
+    },
+    {
+      "name": "_seh_longjmp_unwind",
+      "argCount": 1
+    },
+    {
+      "name": "_seh_longjmp_unwind4",
+      "argCount": 1
+    }
+  ]
+}

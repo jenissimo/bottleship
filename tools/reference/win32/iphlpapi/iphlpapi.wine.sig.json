@@ -1,0 +1,487 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.898Z",
+  "module": "iphlpapi",
+  "functions": [
+    {
+      "name": "_PfBindInterfaceToIPAddress@12",
+      "argCount": 3
+    },
+    {
+      "name": "_PfCreateInterface@24",
+      "argCount": 6
+    },
+    {
+      "name": "_PfDeleteInterface@4",
+      "argCount": 1
+    },
+    {
+      "name": "_PfUnBindInterface@4",
+      "argCount": 1
+    },
+    {
+      "name": "AddIPAddress",
+      "argCount": 5
+    },
+    {
+      "name": "AllocateAndGetIfTableFromStack",
+      "argCount": 4
+    },
+    {
+      "name": "AllocateAndGetIpAddrTableFromStack",
+      "argCount": 4
+    },
+    {
+      "name": "AllocateAndGetIpForwardTableFromStack",
+      "argCount": 4
+    },
+    {
+      "name": "AllocateAndGetIpNetTableFromStack",
+      "argCount": 4
+    },
+    {
+      "name": "AllocateAndGetTcpExTableFromStack",
+      "argCount": 5
+    },
+    {
+      "name": "AllocateAndGetTcpTableFromStack",
+      "argCount": 4
+    },
+    {
+      "name": "AllocateAndGetUdpTableFromStack",
+      "argCount": 4
+    },
+    {
+      "name": "CancelIPChangeNotify",
+      "argCount": 1
+    },
+    {
+      "name": "CancelMibChangeNotify2",
+      "argCount": 1
+    },
+    {
+      "name": "ConvertGuidToStringA",
+      "argCount": 3
+    },
+    {
+      "name": "ConvertGuidToStringW",
+      "argCount": 3
+    },
+    {
+      "name": "ConvertInterfaceAliasToLuid",
+      "argCount": 2
+    },
+    {
+      "name": "ConvertInterfaceGuidToLuid",
+      "argCount": 2
+    },
+    {
+      "name": "ConvertInterfaceIndexToLuid",
+      "argCount": 2
+    },
+    {
+      "name": "ConvertInterfaceLuidToAlias",
+      "argCount": 3
+    },
+    {
+      "name": "ConvertInterfaceLuidToGuid",
+      "argCount": 2
+    },
+    {
+      "name": "ConvertInterfaceLuidToIndex",
+      "argCount": 2
+    },
+    {
+      "name": "ConvertInterfaceLuidToNameA",
+      "argCount": 3
+    },
+    {
+      "name": "ConvertInterfaceLuidToNameW",
+      "argCount": 3
+    },
+    {
+      "name": "ConvertInterfaceNameToLuidA",
+      "argCount": 2
+    },
+    {
+      "name": "ConvertInterfaceNameToLuidW",
+      "argCount": 2
+    },
+    {
+      "name": "ConvertLengthToIpv4Mask",
+      "argCount": 2
+    },
+    {
+      "name": "ConvertStringToGuidW",
+      "argCount": 2
+    },
+    {
+      "name": "CreateIpForwardEntry",
+      "argCount": 1
+    },
+    {
+      "name": "CreateIpNetEntry",
+      "argCount": 1
+    },
+    {
+      "name": "CreateProxyArpEntry",
+      "argCount": 3
+    },
+    {
+      "name": "CreateSortedAddressPairs",
+      "argCount": 7
+    },
+    {
+      "name": "DeleteIPAddress",
+      "argCount": 1
+    },
+    {
+      "name": "DeleteIpForwardEntry",
+      "argCount": 1
+    },
+    {
+      "name": "DeleteIpNetEntry",
+      "argCount": 1
+    },
+    {
+      "name": "DeleteProxyArpEntry",
+      "argCount": 3
+    },
+    {
+      "name": "EnableRouter",
+      "argCount": 2
+    },
+    {
+      "name": "FlushIpNetTable",
+      "argCount": 1
+    },
+    {
+      "name": "FreeMibTable",
+      "argCount": 1
+    },
+    {
+      "name": "GetAdapterIndex",
+      "argCount": 2
+    },
+    {
+      "name": "GetAdaptersAddresses",
+      "argCount": 5
+    },
+    {
+      "name": "GetAdaptersInfo",
+      "argCount": 2
+    },
+    {
+      "name": "GetAnycastIpAddressTable",
+      "argCount": 2
+    },
+    {
+      "name": "GetBestInterface",
+      "argCount": 2
+    },
+    {
+      "name": "GetBestInterfaceEx",
+      "argCount": 2
+    },
+    {
+      "name": "GetBestRoute",
+      "argCount": 3
+    },
+    {
+      "name": "GetBestRoute2",
+      "argCount": 7
+    },
+    {
+      "name": "GetCurrentThreadCompartmentId",
+      "argCount": 0
+    },
+    {
+      "name": "GetExtendedTcpTable",
+      "argCount": 6
+    },
+    {
+      "name": "GetExtendedUdpTable",
+      "argCount": 6
+    },
+    {
+      "name": "GetFriendlyIfIndex",
+      "argCount": 1
+    },
+    {
+      "name": "GetIcmpStatistics",
+      "argCount": 1
+    },
+    {
+      "name": "GetIcmpStatisticsEx",
+      "argCount": 2
+    },
+    {
+      "name": "GetIfEntry",
+      "argCount": 1
+    },
+    {
+      "name": "GetIfEntry2",
+      "argCount": 1
+    },
+    {
+      "name": "GetIfEntry2Ex",
+      "argCount": 2
+    },
+    {
+      "name": "GetIfTable",
+      "argCount": 3
+    },
+    {
+      "name": "GetIfTable2",
+      "argCount": 1
+    },
+    {
+      "name": "GetIfTable2Ex",
+      "argCount": 2
+    },
+    {
+      "name": "GetInterfaceInfo",
+      "argCount": 2
+    },
+    {
+      "name": "GetIpAddrTable",
+      "argCount": 3
+    },
+    {
+      "name": "GetIpForwardTable",
+      "argCount": 3
+    },
+    {
+      "name": "GetIpForwardTable2",
+      "argCount": 2
+    },
+    {
+      "name": "GetIpInterfaceEntry",
+      "argCount": 1
+    },
+    {
+      "name": "GetIpInterfaceTable",
+      "argCount": 2
+    },
+    {
+      "name": "GetIpNetTable",
+      "argCount": 3
+    },
+    {
+      "name": "GetIpNetTable2",
+      "argCount": 2
+    },
+    {
+      "name": "GetIpStatistics",
+      "argCount": 1
+    },
+    {
+      "name": "GetIpStatisticsEx",
+      "argCount": 2
+    },
+    {
+      "name": "GetNetworkParams",
+      "argCount": 2
+    },
+    {
+      "name": "GetNumberOfInterfaces",
+      "argCount": 1
+    },
+    {
+      "name": "GetOwnerModuleFromTcp6Entry",
+      "argCount": 4
+    },
+    {
+      "name": "GetOwnerModuleFromTcpEntry",
+      "argCount": 4
+    },
+    {
+      "name": "GetPerAdapterInfo",
+      "argCount": 3
+    },
+    {
+      "name": "GetPerTcp6ConnectionEStats",
+      "argCount": 11
+    },
+    {
+      "name": "GetPerTcpConnectionEStats",
+      "argCount": 11
+    },
+    {
+      "name": "GetRTTAndHopCount",
+      "argCount": 4
+    },
+    {
+      "name": "GetTcp6Table",
+      "argCount": 3
+    },
+    {
+      "name": "GetTcp6Table2",
+      "argCount": 3
+    },
+    {
+      "name": "GetTcpStatistics",
+      "argCount": 1
+    },
+    {
+      "name": "GetTcpStatisticsEx",
+      "argCount": 2
+    },
+    {
+      "name": "GetTcpTable",
+      "argCount": 3
+    },
+    {
+      "name": "GetTcpTable2",
+      "argCount": 3
+    },
+    {
+      "name": "GetUdp6Table",
+      "argCount": 3
+    },
+    {
+      "name": "GetUdpStatistics",
+      "argCount": 1
+    },
+    {
+      "name": "GetUdpStatisticsEx",
+      "argCount": 2
+    },
+    {
+      "name": "GetUdpTable",
+      "argCount": 3
+    },
+    {
+      "name": "GetUnicastIpAddressEntry",
+      "argCount": 1
+    },
+    {
+      "name": "GetUnicastIpAddressTable",
+      "argCount": 2
+    },
+    {
+      "name": "GetUniDirectionalAdapterInfo",
+      "argCount": 2
+    },
+    {
+      "name": "Icmp6CreateFile",
+      "argCount": 0
+    },
+    {
+      "name": "Icmp6ParseReplies",
+      "argCount": 2
+    },
+    {
+      "name": "Icmp6SendEcho2",
+      "argCount": 12
+    },
+    {
+      "name": "IcmpCloseHandle",
+      "argCount": 1
+    },
+    {
+      "name": "IcmpCreateFile",
+      "argCount": 0
+    },
+    {
+      "name": "IcmpParseReplies",
+      "argCount": 2
+    },
+    {
+      "name": "IcmpSendEcho",
+      "argCount": 8
+    },
+    {
+      "name": "IcmpSendEcho2",
+      "argCount": 11
+    },
+    {
+      "name": "IcmpSendEcho2Ex",
+      "argCount": 12
+    },
+    {
+      "name": "if_indextoname",
+      "argCount": 2
+    },
+    {
+      "name": "if_nametoindex",
+      "argCount": 1
+    },
+    {
+      "name": "IpReleaseAddress",
+      "argCount": 1
+    },
+    {
+      "name": "IpRenewAddress",
+      "argCount": 1
+    },
+    {
+      "name": "NotifyAddrChange",
+      "argCount": 2
+    },
+    {
+      "name": "NotifyIpInterfaceChange",
+      "argCount": 5
+    },
+    {
+      "name": "NotifyRouteChange",
+      "argCount": 2
+    },
+    {
+      "name": "NotifyRouteChange2",
+      "argCount": 5
+    },
+    {
+      "name": "NotifyUnicastIpAddressChange",
+      "argCount": 5
+    },
+    {
+      "name": "ParseNetworkString",
+      "argCount": 5
+    },
+    {
+      "name": "SendARP",
+      "argCount": 4
+    },
+    {
+      "name": "SetCurrentThreadCompartmentId",
+      "argCount": 1
+    },
+    {
+      "name": "SetIfEntry",
+      "argCount": 1
+    },
+    {
+      "name": "SetIpForwardEntry",
+      "argCount": 1
+    },
+    {
+      "name": "SetIpNetEntry",
+      "argCount": 1
+    },
+    {
+      "name": "SetIpStatistics",
+      "argCount": 1
+    },
+    {
+      "name": "SetIpTTL",
+      "argCount": 1
+    },
+    {
+      "name": "SetPerTcp6ConnectionEStats",
+      "argCount": 6
+    },
+    {
+      "name": "SetPerTcpConnectionEStats",
+      "argCount": 6
+    },
+    {
+      "name": "SetTcpEntry",
+      "argCount": 1
+    },
+    {
+      "name": "UnenableRouter",
+      "argCount": 2
+    }
+  ]
+}

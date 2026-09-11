@@ -1,0 +1,1251 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.935Z",
+  "module": "rpcrt4",
+  "functions": [
+    {
+      "name": "CreateProxyFromTypeInfo",
+      "argCount": 5
+    },
+    {
+      "name": "CreateStubFromTypeInfo",
+      "argCount": 4
+    },
+    {
+      "name": "CStdStubBuffer_AddRef",
+      "argCount": 1
+    },
+    {
+      "name": "CStdStubBuffer_Connect",
+      "argCount": 2
+    },
+    {
+      "name": "CStdStubBuffer_CountRefs",
+      "argCount": 1
+    },
+    {
+      "name": "CStdStubBuffer_DebugServerQueryInterface",
+      "argCount": 2
+    },
+    {
+      "name": "CStdStubBuffer_DebugServerRelease",
+      "argCount": 2
+    },
+    {
+      "name": "CStdStubBuffer_Disconnect",
+      "argCount": 1
+    },
+    {
+      "name": "CStdStubBuffer_Invoke",
+      "argCount": 3
+    },
+    {
+      "name": "CStdStubBuffer_IsIIDSupported",
+      "argCount": 2
+    },
+    {
+      "name": "CStdStubBuffer_QueryInterface",
+      "argCount": 3
+    },
+    {
+      "name": "DceErrorInqTextA",
+      "argCount": 2
+    },
+    {
+      "name": "DceErrorInqTextW",
+      "argCount": 2
+    },
+    {
+      "name": "DllRegisterServer",
+      "argCount": 0
+    },
+    {
+      "name": "I_RpcAbortAsyncCall",
+      "argCount": 2
+    },
+    {
+      "name": "I_RpcAllocate",
+      "argCount": 1
+    },
+    {
+      "name": "I_RpcAsyncAbortCall",
+      "argCount": 2
+    },
+    {
+      "name": "I_RpcAsyncSetHandle",
+      "argCount": 2
+    },
+    {
+      "name": "I_RpcBindingInqLocalClientPID",
+      "argCount": 2
+    },
+    {
+      "name": "I_RpcBindingInqTransportType",
+      "argCount": 2
+    },
+    {
+      "name": "I_RpcBindingSetAsync",
+      "argCount": 2
+    },
+    {
+      "name": "I_RpcExceptionFilter",
+      "argCount": 1
+    },
+    {
+      "name": "I_RpcFree",
+      "argCount": 1
+    },
+    {
+      "name": "I_RpcFreeBuffer",
+      "argCount": 1
+    },
+    {
+      "name": "I_RpcGetBuffer",
+      "argCount": 1
+    },
+    {
+      "name": "I_RpcGetCurrentCallHandle",
+      "argCount": 0
+    },
+    {
+      "name": "I_RpcMapWin32Status",
+      "argCount": 1
+    },
+    {
+      "name": "I_RpcNegotiateTransferSyntax",
+      "argCount": 1
+    },
+    {
+      "name": "I_RpcReceive",
+      "argCount": 1
+    },
+    {
+      "name": "I_RpcSend",
+      "argCount": 1
+    },
+    {
+      "name": "I_RpcSendReceive",
+      "argCount": 1
+    },
+    {
+      "name": "I_RpcServerStartListening",
+      "argCount": 1
+    },
+    {
+      "name": "I_RpcServerStopListening",
+      "argCount": 0
+    },
+    {
+      "name": "I_RpcWindowProc",
+      "argCount": 4
+    },
+    {
+      "name": "I_UuidCreate",
+      "argCount": 1
+    },
+    {
+      "name": "IUnknown_AddRef_Proxy",
+      "argCount": 1
+    },
+    {
+      "name": "IUnknown_QueryInterface_Proxy",
+      "argCount": 3
+    },
+    {
+      "name": "IUnknown_Release_Proxy",
+      "argCount": 1
+    },
+    {
+      "name": "MesBufferHandleReset",
+      "argCount": 6
+    },
+    {
+      "name": "MesDecodeBufferHandleCreate",
+      "argCount": 3
+    },
+    {
+      "name": "MesDecodeIncrementalHandleCreate",
+      "argCount": 3
+    },
+    {
+      "name": "MesEncodeDynBufferHandleCreate",
+      "argCount": 3
+    },
+    {
+      "name": "MesEncodeFixedBufferHandleCreate",
+      "argCount": 4
+    },
+    {
+      "name": "MesEncodeIncrementalHandleCreate",
+      "argCount": 4
+    },
+    {
+      "name": "MesHandleFree",
+      "argCount": 1
+    },
+    {
+      "name": "MesIncrementalHandleReset",
+      "argCount": 6
+    },
+    {
+      "name": "NdrAllocate",
+      "argCount": 2
+    },
+    {
+      "name": "NdrAsyncServerCall",
+      "argCount": 1
+    },
+    {
+      "name": "NdrAsyncStubCall",
+      "argCount": 4
+    },
+    {
+      "name": "NdrByteCountPointerBufferSize",
+      "argCount": 3
+    },
+    {
+      "name": "NdrByteCountPointerFree",
+      "argCount": 3
+    },
+    {
+      "name": "NdrByteCountPointerMarshall",
+      "argCount": 3
+    },
+    {
+      "name": "NdrByteCountPointerUnmarshall",
+      "argCount": 4
+    },
+    {
+      "name": "NDRCContextBinding",
+      "argCount": 1
+    },
+    {
+      "name": "NDRCContextMarshall",
+      "argCount": 2
+    },
+    {
+      "name": "NDRCContextUnmarshall",
+      "argCount": 4
+    },
+    {
+      "name": "NdrClearOutParameters",
+      "argCount": 3
+    },
+    {
+      "name": "NdrClientContextMarshall",
+      "argCount": 3
+    },
+    {
+      "name": "NdrClientContextUnmarshall",
+      "argCount": 3
+    },
+    {
+      "name": "NdrClientInitializeNew",
+      "argCount": 4
+    },
+    {
+      "name": "NdrComplexArrayBufferSize",
+      "argCount": 3
+    },
+    {
+      "name": "NdrComplexArrayFree",
+      "argCount": 3
+    },
+    {
+      "name": "NdrComplexArrayMarshall",
+      "argCount": 3
+    },
+    {
+      "name": "NdrComplexArrayMemorySize",
+      "argCount": 2
+    },
+    {
+      "name": "NdrComplexArrayUnmarshall",
+      "argCount": 4
+    },
+    {
+      "name": "NdrComplexStructBufferSize",
+      "argCount": 3
+    },
+    {
+      "name": "NdrComplexStructFree",
+      "argCount": 3
+    },
+    {
+      "name": "NdrComplexStructMarshall",
+      "argCount": 3
+    },
+    {
+      "name": "NdrComplexStructMemorySize",
+      "argCount": 2
+    },
+    {
+      "name": "NdrComplexStructUnmarshall",
+      "argCount": 4
+    },
+    {
+      "name": "NdrConformantArrayBufferSize",
+      "argCount": 3
+    },
+    {
+      "name": "NdrConformantArrayFree",
+      "argCount": 3
+    },
+    {
+      "name": "NdrConformantArrayMarshall",
+      "argCount": 3
+    },
+    {
+      "name": "NdrConformantArrayMemorySize",
+      "argCount": 2
+    },
+    {
+      "name": "NdrConformantArrayUnmarshall",
+      "argCount": 4
+    },
+    {
+      "name": "NdrConformantStringBufferSize",
+      "argCount": 3
+    },
+    {
+      "name": "NdrConformantStringMarshall",
+      "argCount": 3
+    },
+    {
+      "name": "NdrConformantStringMemorySize",
+      "argCount": 2
+    },
+    {
+      "name": "NdrConformantStringUnmarshall",
+      "argCount": 4
+    },
+    {
+      "name": "NdrConformantStructBufferSize",
+      "argCount": 3
+    },
+    {
+      "name": "NdrConformantStructFree",
+      "argCount": 3
+    },
+    {
+      "name": "NdrConformantStructMarshall",
+      "argCount": 3
+    },
+    {
+      "name": "NdrConformantStructMemorySize",
+      "argCount": 2
+    },
+    {
+      "name": "NdrConformantStructUnmarshall",
+      "argCount": 4
+    },
+    {
+      "name": "NdrConformantVaryingArrayBufferSize",
+      "argCount": 3
+    },
+    {
+      "name": "NdrConformantVaryingArrayFree",
+      "argCount": 3
+    },
+    {
+      "name": "NdrConformantVaryingArrayMarshall",
+      "argCount": 3
+    },
+    {
+      "name": "NdrConformantVaryingArrayMemorySize",
+      "argCount": 2
+    },
+    {
+      "name": "NdrConformantVaryingArrayUnmarshall",
+      "argCount": 4
+    },
+    {
+      "name": "NdrConformantVaryingStructBufferSize",
+      "argCount": 3
+    },
+    {
+      "name": "NdrConformantVaryingStructFree",
+      "argCount": 3
+    },
+    {
+      "name": "NdrConformantVaryingStructMarshall",
+      "argCount": 3
+    },
+    {
+      "name": "NdrConformantVaryingStructMemorySize",
+      "argCount": 2
+    },
+    {
+      "name": "NdrConformantVaryingStructUnmarshall",
+      "argCount": 4
+    },
+    {
+      "name": "NdrContextHandleInitialize",
+      "argCount": 2
+    },
+    {
+      "name": "NdrContextHandleSize",
+      "argCount": 3
+    },
+    {
+      "name": "NdrConvert",
+      "argCount": 2
+    },
+    {
+      "name": "NdrConvert2",
+      "argCount": 3
+    },
+    {
+      "name": "NdrCorrelationFree",
+      "argCount": 1
+    },
+    {
+      "name": "NdrCorrelationInitialize",
+      "argCount": 4
+    },
+    {
+      "name": "NdrCorrelationPass",
+      "argCount": 1
+    },
+    {
+      "name": "NdrCStdStubBuffer_Release",
+      "argCount": 2
+    },
+    {
+      "name": "NdrCStdStubBuffer2_Release",
+      "argCount": 2
+    },
+    {
+      "name": "NdrDllCanUnloadNow",
+      "argCount": 1
+    },
+    {
+      "name": "NdrDllGetClassObject",
+      "argCount": 6
+    },
+    {
+      "name": "NdrDllRegisterProxy",
+      "argCount": 3
+    },
+    {
+      "name": "NdrDllUnregisterProxy",
+      "argCount": 3
+    },
+    {
+      "name": "NdrEncapsulatedUnionBufferSize",
+      "argCount": 3
+    },
+    {
+      "name": "NdrEncapsulatedUnionFree",
+      "argCount": 3
+    },
+    {
+      "name": "NdrEncapsulatedUnionMarshall",
+      "argCount": 3
+    },
+    {
+      "name": "NdrEncapsulatedUnionMemorySize",
+      "argCount": 2
+    },
+    {
+      "name": "NdrEncapsulatedUnionUnmarshall",
+      "argCount": 4
+    },
+    {
+      "name": "NdrFixedArrayBufferSize",
+      "argCount": 3
+    },
+    {
+      "name": "NdrFixedArrayFree",
+      "argCount": 3
+    },
+    {
+      "name": "NdrFixedArrayMarshall",
+      "argCount": 3
+    },
+    {
+      "name": "NdrFixedArrayMemorySize",
+      "argCount": 2
+    },
+    {
+      "name": "NdrFixedArrayUnmarshall",
+      "argCount": 4
+    },
+    {
+      "name": "NdrFreeBuffer",
+      "argCount": 1
+    },
+    {
+      "name": "NdrFullPointerFree",
+      "argCount": 2
+    },
+    {
+      "name": "NdrFullPointerInsertRefId",
+      "argCount": 3
+    },
+    {
+      "name": "NdrFullPointerQueryPointer",
+      "argCount": 4
+    },
+    {
+      "name": "NdrFullPointerQueryRefId",
+      "argCount": 4
+    },
+    {
+      "name": "NdrFullPointerXlatFree",
+      "argCount": 1
+    },
+    {
+      "name": "NdrFullPointerXlatInit",
+      "argCount": 2
+    },
+    {
+      "name": "NdrGetBuffer",
+      "argCount": 3
+    },
+    {
+      "name": "NdrGetUserMarshalInfo",
+      "argCount": 3
+    },
+    {
+      "name": "NdrInterfacePointerBufferSize",
+      "argCount": 3
+    },
+    {
+      "name": "NdrInterfacePointerFree",
+      "argCount": 3
+    },
+    {
+      "name": "NdrInterfacePointerMarshall",
+      "argCount": 3
+    },
+    {
+      "name": "NdrInterfacePointerMemorySize",
+      "argCount": 2
+    },
+    {
+      "name": "NdrInterfacePointerUnmarshall",
+      "argCount": 4
+    },
+    {
+      "name": "NdrMapCommAndFaultStatus",
+      "argCount": 4
+    },
+    {
+      "name": "NdrMesTypeDecode2",
+      "argCount": 5
+    },
+    {
+      "name": "NdrMesTypeEncode2",
+      "argCount": 5
+    },
+    {
+      "name": "NdrMesTypeFree2",
+      "argCount": 5
+    },
+    {
+      "name": "NdrNonConformantStringBufferSize",
+      "argCount": 3
+    },
+    {
+      "name": "NdrNonConformantStringMarshall",
+      "argCount": 3
+    },
+    {
+      "name": "NdrNonConformantStringMemorySize",
+      "argCount": 2
+    },
+    {
+      "name": "NdrNonConformantStringUnmarshall",
+      "argCount": 4
+    },
+    {
+      "name": "NdrNonEncapsulatedUnionBufferSize",
+      "argCount": 3
+    },
+    {
+      "name": "NdrNonEncapsulatedUnionFree",
+      "argCount": 3
+    },
+    {
+      "name": "NdrNonEncapsulatedUnionMarshall",
+      "argCount": 3
+    },
+    {
+      "name": "NdrNonEncapsulatedUnionMemorySize",
+      "argCount": 2
+    },
+    {
+      "name": "NdrNonEncapsulatedUnionUnmarshall",
+      "argCount": 4
+    },
+    {
+      "name": "NdrOleAllocate",
+      "argCount": 1
+    },
+    {
+      "name": "NdrOleFree",
+      "argCount": 1
+    },
+    {
+      "name": "NdrPointerBufferSize",
+      "argCount": 3
+    },
+    {
+      "name": "NdrPointerFree",
+      "argCount": 3
+    },
+    {
+      "name": "NdrPointerMarshall",
+      "argCount": 3
+    },
+    {
+      "name": "NdrPointerMemorySize",
+      "argCount": 2
+    },
+    {
+      "name": "NdrPointerUnmarshall",
+      "argCount": 4
+    },
+    {
+      "name": "NdrProxyErrorHandler",
+      "argCount": 1
+    },
+    {
+      "name": "NdrProxyFreeBuffer",
+      "argCount": 2
+    },
+    {
+      "name": "NdrProxyGetBuffer",
+      "argCount": 2
+    },
+    {
+      "name": "NdrProxyInitialize",
+      "argCount": 5
+    },
+    {
+      "name": "NdrProxySendReceive",
+      "argCount": 2
+    },
+    {
+      "name": "NdrRangeUnmarshall",
+      "argCount": 4
+    },
+    {
+      "name": "NDRSContextMarshall",
+      "argCount": 3
+    },
+    {
+      "name": "NDRSContextMarshall2",
+      "argCount": 6
+    },
+    {
+      "name": "NDRSContextMarshallEx",
+      "argCount": 4
+    },
+    {
+      "name": "NDRSContextUnmarshall",
+      "argCount": 2
+    },
+    {
+      "name": "NDRSContextUnmarshall2",
+      "argCount": 5
+    },
+    {
+      "name": "NDRSContextUnmarshallEx",
+      "argCount": 3
+    },
+    {
+      "name": "NdrSendReceive",
+      "argCount": 2
+    },
+    {
+      "name": "NdrServerCall",
+      "argCount": 1
+    },
+    {
+      "name": "NdrServerCall2",
+      "argCount": 1
+    },
+    {
+      "name": "NdrServerCallAll",
+      "argCount": 1
+    },
+    {
+      "name": "NdrServerContextMarshall",
+      "argCount": 3
+    },
+    {
+      "name": "NdrServerContextNewMarshall",
+      "argCount": 4
+    },
+    {
+      "name": "NdrServerContextNewUnmarshall",
+      "argCount": 2
+    },
+    {
+      "name": "NdrServerContextUnmarshall",
+      "argCount": 1
+    },
+    {
+      "name": "NdrServerInitializeNew",
+      "argCount": 3
+    },
+    {
+      "name": "NdrSimpleStructBufferSize",
+      "argCount": 3
+    },
+    {
+      "name": "NdrSimpleStructFree",
+      "argCount": 3
+    },
+    {
+      "name": "NdrSimpleStructMarshall",
+      "argCount": 3
+    },
+    {
+      "name": "NdrSimpleStructMemorySize",
+      "argCount": 2
+    },
+    {
+      "name": "NdrSimpleStructUnmarshall",
+      "argCount": 4
+    },
+    {
+      "name": "NdrSimpleTypeMarshall",
+      "argCount": 3
+    },
+    {
+      "name": "NdrSimpleTypeUnmarshall",
+      "argCount": 3
+    },
+    {
+      "name": "NdrStubCall",
+      "argCount": 4
+    },
+    {
+      "name": "NdrStubCall2",
+      "argCount": 4
+    },
+    {
+      "name": "NdrStubForwardingFunction",
+      "argCount": 4
+    },
+    {
+      "name": "NdrStubGetBuffer",
+      "argCount": 3
+    },
+    {
+      "name": "NdrStubInitialize",
+      "argCount": 4
+    },
+    {
+      "name": "NdrUserMarshalBufferSize",
+      "argCount": 3
+    },
+    {
+      "name": "NdrUserMarshalFree",
+      "argCount": 3
+    },
+    {
+      "name": "NdrUserMarshalMarshall",
+      "argCount": 3
+    },
+    {
+      "name": "NdrUserMarshalMemorySize",
+      "argCount": 2
+    },
+    {
+      "name": "NdrUserMarshalUnmarshall",
+      "argCount": 4
+    },
+    {
+      "name": "NdrVaryingArrayBufferSize",
+      "argCount": 3
+    },
+    {
+      "name": "NdrVaryingArrayFree",
+      "argCount": 3
+    },
+    {
+      "name": "NdrVaryingArrayMarshall",
+      "argCount": 3
+    },
+    {
+      "name": "NdrVaryingArrayMemorySize",
+      "argCount": 2
+    },
+    {
+      "name": "NdrVaryingArrayUnmarshall",
+      "argCount": 4
+    },
+    {
+      "name": "NdrXmitOrRepAsBufferSize",
+      "argCount": 3
+    },
+    {
+      "name": "NdrXmitOrRepAsFree",
+      "argCount": 3
+    },
+    {
+      "name": "NdrXmitOrRepAsMarshall",
+      "argCount": 3
+    },
+    {
+      "name": "NdrXmitOrRepAsMemorySize",
+      "argCount": 2
+    },
+    {
+      "name": "NdrXmitOrRepAsUnmarshall",
+      "argCount": 4
+    },
+    {
+      "name": "RpcAbortAsyncCall",
+      "argCount": 2
+    },
+    {
+      "name": "RpcAsyncAbortCall",
+      "argCount": 2
+    },
+    {
+      "name": "RpcAsyncCancelCall",
+      "argCount": 2
+    },
+    {
+      "name": "RpcAsyncCompleteCall",
+      "argCount": 2
+    },
+    {
+      "name": "RpcAsyncGetCallStatus",
+      "argCount": 1
+    },
+    {
+      "name": "RpcAsyncInitializeHandle",
+      "argCount": 2
+    },
+    {
+      "name": "RpcBindingCopy",
+      "argCount": 2
+    },
+    {
+      "name": "RpcBindingFree",
+      "argCount": 1
+    },
+    {
+      "name": "RpcBindingFromStringBindingA",
+      "argCount": 2
+    },
+    {
+      "name": "RpcBindingFromStringBindingW",
+      "argCount": 2
+    },
+    {
+      "name": "RpcBindingInqAuthClientA",
+      "argCount": 6
+    },
+    {
+      "name": "RpcBindingInqAuthClientExA",
+      "argCount": 7
+    },
+    {
+      "name": "RpcBindingInqAuthClientExW",
+      "argCount": 7
+    },
+    {
+      "name": "RpcBindingInqAuthClientW",
+      "argCount": 6
+    },
+    {
+      "name": "RpcBindingInqAuthInfoA",
+      "argCount": 6
+    },
+    {
+      "name": "RpcBindingInqAuthInfoExA",
+      "argCount": 8
+    },
+    {
+      "name": "RpcBindingInqAuthInfoExW",
+      "argCount": 8
+    },
+    {
+      "name": "RpcBindingInqAuthInfoW",
+      "argCount": 6
+    },
+    {
+      "name": "RpcBindingInqObject",
+      "argCount": 2
+    },
+    {
+      "name": "RpcBindingReset",
+      "argCount": 1
+    },
+    {
+      "name": "RpcBindingServerFromClient",
+      "argCount": 2
+    },
+    {
+      "name": "RpcBindingSetAuthInfoA",
+      "argCount": 6
+    },
+    {
+      "name": "RpcBindingSetAuthInfoExA",
+      "argCount": 7
+    },
+    {
+      "name": "RpcBindingSetAuthInfoExW",
+      "argCount": 7
+    },
+    {
+      "name": "RpcBindingSetAuthInfoW",
+      "argCount": 6
+    },
+    {
+      "name": "RpcBindingSetObject",
+      "argCount": 2
+    },
+    {
+      "name": "RpcBindingSetOption",
+      "argCount": 3
+    },
+    {
+      "name": "RpcBindingToStringBindingA",
+      "argCount": 2
+    },
+    {
+      "name": "RpcBindingToStringBindingW",
+      "argCount": 2
+    },
+    {
+      "name": "RpcBindingVectorFree",
+      "argCount": 1
+    },
+    {
+      "name": "RpcCancelAsyncCall",
+      "argCount": 2
+    },
+    {
+      "name": "RpcCancelThread",
+      "argCount": 1
+    },
+    {
+      "name": "RpcCancelThreadEx",
+      "argCount": 2
+    },
+    {
+      "name": "RpcCompleteAsyncCall",
+      "argCount": 2
+    },
+    {
+      "name": "RpcEpRegisterA",
+      "argCount": 4
+    },
+    {
+      "name": "RpcEpRegisterNoReplaceA",
+      "argCount": 4
+    },
+    {
+      "name": "RpcEpRegisterNoReplaceW",
+      "argCount": 4
+    },
+    {
+      "name": "RpcEpRegisterW",
+      "argCount": 4
+    },
+    {
+      "name": "RpcEpResolveBinding",
+      "argCount": 2
+    },
+    {
+      "name": "RpcEpUnregister",
+      "argCount": 3
+    },
+    {
+      "name": "RpcErrorEndEnumeration",
+      "argCount": 1
+    },
+    {
+      "name": "RpcErrorGetNextRecord",
+      "argCount": 3
+    },
+    {
+      "name": "RpcErrorLoadErrorInfo",
+      "argCount": 3
+    },
+    {
+      "name": "RpcErrorSaveErrorInfo",
+      "argCount": 3
+    },
+    {
+      "name": "RpcErrorStartEnumeration",
+      "argCount": 1
+    },
+    {
+      "name": "RpcExceptionFilter",
+      "argCount": 1
+    },
+    {
+      "name": "RpcGetAsyncCallStatus",
+      "argCount": 1
+    },
+    {
+      "name": "RpcIfInqId",
+      "argCount": 2
+    },
+    {
+      "name": "RpcImpersonateClient",
+      "argCount": 1
+    },
+    {
+      "name": "RpcInitializeAsyncHandle",
+      "argCount": 2
+    },
+    {
+      "name": "RpcMgmtEnableIdleCleanup",
+      "argCount": 0
+    },
+    {
+      "name": "RpcMgmtEpEltInqBegin",
+      "argCount": 6
+    },
+    {
+      "name": "RpcMgmtInqIfIds",
+      "argCount": 2
+    },
+    {
+      "name": "RpcMgmtInqStats",
+      "argCount": 2
+    },
+    {
+      "name": "RpcMgmtIsServerListening",
+      "argCount": 1
+    },
+    {
+      "name": "RpcMgmtSetAuthorizationFn",
+      "argCount": 1
+    },
+    {
+      "name": "RpcMgmtSetCancelTimeout",
+      "argCount": 1
+    },
+    {
+      "name": "RpcMgmtSetComTimeout",
+      "argCount": 2
+    },
+    {
+      "name": "RpcMgmtSetServerStackSize",
+      "argCount": 1
+    },
+    {
+      "name": "RpcMgmtStatsVectorFree",
+      "argCount": 1
+    },
+    {
+      "name": "RpcMgmtStopServerListening",
+      "argCount": 1
+    },
+    {
+      "name": "RpcMgmtWaitServerListen",
+      "argCount": 0
+    },
+    {
+      "name": "RpcNetworkInqProtseqsA",
+      "argCount": 1
+    },
+    {
+      "name": "RpcNetworkInqProtseqsW",
+      "argCount": 1
+    },
+    {
+      "name": "RpcNetworkIsProtseqValidA",
+      "argCount": 1
+    },
+    {
+      "name": "RpcNetworkIsProtseqValidW",
+      "argCount": 1
+    },
+    {
+      "name": "RpcObjectSetType",
+      "argCount": 2
+    },
+    {
+      "name": "RpcProtseqVectorFreeA",
+      "argCount": 1
+    },
+    {
+      "name": "RpcProtseqVectorFreeW",
+      "argCount": 1
+    },
+    {
+      "name": "RpcRaiseException",
+      "argCount": 1
+    },
+    {
+      "name": "RpcRevertToSelf",
+      "argCount": 0
+    },
+    {
+      "name": "RpcRevertToSelfEx",
+      "argCount": 1
+    },
+    {
+      "name": "RpcServerInqBindings",
+      "argCount": 1
+    },
+    {
+      "name": "RpcServerInqDefaultPrincNameA",
+      "argCount": 2
+    },
+    {
+      "name": "RpcServerInqDefaultPrincNameW",
+      "argCount": 2
+    },
+    {
+      "name": "RpcServerListen",
+      "argCount": 3
+    },
+    {
+      "name": "RpcServerRegisterAuthInfoA",
+      "argCount": 4
+    },
+    {
+      "name": "RpcServerRegisterAuthInfoW",
+      "argCount": 4
+    },
+    {
+      "name": "RpcServerRegisterIf",
+      "argCount": 3
+    },
+    {
+      "name": "RpcServerRegisterIf2",
+      "argCount": 7
+    },
+    {
+      "name": "RpcServerRegisterIf3",
+      "argCount": 8
+    },
+    {
+      "name": "RpcServerRegisterIfEx",
+      "argCount": 6
+    },
+    {
+      "name": "RpcServerUnregisterIf",
+      "argCount": 3
+    },
+    {
+      "name": "RpcServerUnregisterIfEx",
+      "argCount": 3
+    },
+    {
+      "name": "RpcServerUseProtseqA",
+      "argCount": 3
+    },
+    {
+      "name": "RpcServerUseProtseqEpA",
+      "argCount": 4
+    },
+    {
+      "name": "RpcServerUseProtseqEpExA",
+      "argCount": 5
+    },
+    {
+      "name": "RpcServerUseProtseqEpExW",
+      "argCount": 5
+    },
+    {
+      "name": "RpcServerUseProtseqEpW",
+      "argCount": 4
+    },
+    {
+      "name": "RpcServerUseProtseqW",
+      "argCount": 3
+    },
+    {
+      "name": "RpcSmDestroyClientContext",
+      "argCount": 1
+    },
+    {
+      "name": "RpcSsDestroyClientContext",
+      "argCount": 1
+    },
+    {
+      "name": "RpcSsDontSerializeContext",
+      "argCount": 0
+    },
+    {
+      "name": "RpcStringBindingComposeA",
+      "argCount": 6
+    },
+    {
+      "name": "RpcStringBindingComposeW",
+      "argCount": 6
+    },
+    {
+      "name": "RpcStringBindingParseA",
+      "argCount": 6
+    },
+    {
+      "name": "RpcStringBindingParseW",
+      "argCount": 6
+    },
+    {
+      "name": "RpcStringFreeA",
+      "argCount": 1
+    },
+    {
+      "name": "RpcStringFreeW",
+      "argCount": 1
+    },
+    {
+      "name": "TowerConstruct",
+      "argCount": 6
+    },
+    {
+      "name": "TowerExplode",
+      "argCount": 6
+    },
+    {
+      "name": "UuidCompare",
+      "argCount": 3
+    },
+    {
+      "name": "UuidCreate",
+      "argCount": 1
+    },
+    {
+      "name": "UuidCreateNil",
+      "argCount": 1
+    },
+    {
+      "name": "UuidCreateSequential",
+      "argCount": 1
+    },
+    {
+      "name": "UuidEqual",
+      "argCount": 3
+    },
+    {
+      "name": "UuidFromStringA",
+      "argCount": 2
+    },
+    {
+      "name": "UuidFromStringW",
+      "argCount": 2
+    },
+    {
+      "name": "UuidHash",
+      "argCount": 2
+    },
+    {
+      "name": "UuidIsNil",
+      "argCount": 2
+    },
+    {
+      "name": "UuidToStringA",
+      "argCount": 2
+    },
+    {
+      "name": "UuidToStringW",
+      "argCount": 2
+    }
+  ]
+}

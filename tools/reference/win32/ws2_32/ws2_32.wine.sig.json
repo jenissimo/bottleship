@@ -1,0 +1,723 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.955Z",
+  "module": "ws2_32",
+  "functions": [
+    {
+      "name": "__WSAFDIsSet",
+      "argCount": 2
+    },
+    {
+      "name": "accept",
+      "argCount": 3
+    },
+    {
+      "name": "bind",
+      "argCount": 3
+    },
+    {
+      "name": "closesocket",
+      "argCount": 1
+    },
+    {
+      "name": "connect",
+      "argCount": 3
+    },
+    {
+      "name": "freeaddrinfo",
+      "argCount": 1
+    },
+    {
+      "name": "FreeAddrInfoEx",
+      "argCount": 1
+    },
+    {
+      "name": "FreeAddrInfoExW",
+      "argCount": 1
+    },
+    {
+      "name": "FreeAddrInfoW",
+      "argCount": 1
+    },
+    {
+      "name": "getaddrinfo",
+      "argCount": 4
+    },
+    {
+      "name": "GetAddrInfoExCancel",
+      "argCount": 1
+    },
+    {
+      "name": "GetAddrInfoExOverlappedResult",
+      "argCount": 1
+    },
+    {
+      "name": "GetAddrInfoExW",
+      "argCount": 10
+    },
+    {
+      "name": "GetAddrInfoW",
+      "argCount": 4
+    },
+    {
+      "name": "gethostbyaddr",
+      "argCount": 3
+    },
+    {
+      "name": "gethostbyname",
+      "argCount": 1
+    },
+    {
+      "name": "gethostname",
+      "argCount": 2
+    },
+    {
+      "name": "GetHostNameW",
+      "argCount": 2
+    },
+    {
+      "name": "getnameinfo",
+      "argCount": 7
+    },
+    {
+      "name": "GetNameInfoW",
+      "argCount": 7
+    },
+    {
+      "name": "getpeername",
+      "argCount": 3
+    },
+    {
+      "name": "getprotobyname",
+      "argCount": 1
+    },
+    {
+      "name": "getprotobynumber",
+      "argCount": 1
+    },
+    {
+      "name": "getservbyname",
+      "argCount": 2
+    },
+    {
+      "name": "getservbyport",
+      "argCount": 2
+    },
+    {
+      "name": "getsockname",
+      "argCount": 3
+    },
+    {
+      "name": "getsockopt",
+      "argCount": 5
+    },
+    {
+      "name": "htonl",
+      "argCount": 1
+    },
+    {
+      "name": "htons",
+      "argCount": 1
+    },
+    {
+      "name": "inet_addr",
+      "argCount": 1
+    },
+    {
+      "name": "inet_ntoa",
+      "argCount": 1
+    },
+    {
+      "name": "inet_ntop",
+      "argCount": 4
+    },
+    {
+      "name": "inet_pton",
+      "argCount": 3
+    },
+    {
+      "name": "InetNtopW",
+      "argCount": 4
+    },
+    {
+      "name": "InetPtonW",
+      "argCount": 3
+    },
+    {
+      "name": "ioctlsocket",
+      "argCount": 3
+    },
+    {
+      "name": "listen",
+      "argCount": 2
+    },
+    {
+      "name": "ntohl",
+      "argCount": 1
+    },
+    {
+      "name": "ntohs",
+      "argCount": 1
+    },
+    {
+      "name": "ord_1",
+      "argCount": 3
+    },
+    {
+      "name": "ord_10",
+      "argCount": 3
+    },
+    {
+      "name": "ord_101",
+      "argCount": 4
+    },
+    {
+      "name": "ord_102",
+      "argCount": 7
+    },
+    {
+      "name": "ord_103",
+      "argCount": 5
+    },
+    {
+      "name": "ord_104",
+      "argCount": 5
+    },
+    {
+      "name": "ord_105",
+      "argCount": 5
+    },
+    {
+      "name": "ord_106",
+      "argCount": 6
+    },
+    {
+      "name": "ord_107",
+      "argCount": 6
+    },
+    {
+      "name": "ord_108",
+      "argCount": 1
+    },
+    {
+      "name": "ord_109",
+      "argCount": 1
+    },
+    {
+      "name": "ord_11",
+      "argCount": 1
+    },
+    {
+      "name": "ord_110",
+      "argCount": 0
+    },
+    {
+      "name": "ord_111",
+      "argCount": 0
+    },
+    {
+      "name": "ord_112",
+      "argCount": 1
+    },
+    {
+      "name": "ord_113",
+      "argCount": 0
+    },
+    {
+      "name": "ord_114",
+      "argCount": 0
+    },
+    {
+      "name": "ord_115",
+      "argCount": 2
+    },
+    {
+      "name": "ord_116",
+      "argCount": 0
+    },
+    {
+      "name": "ord_12",
+      "argCount": 1
+    },
+    {
+      "name": "ord_13",
+      "argCount": 2
+    },
+    {
+      "name": "ord_14",
+      "argCount": 1
+    },
+    {
+      "name": "ord_15",
+      "argCount": 1
+    },
+    {
+      "name": "ord_151",
+      "argCount": 2
+    },
+    {
+      "name": "ord_16",
+      "argCount": 4
+    },
+    {
+      "name": "ord_17",
+      "argCount": 6
+    },
+    {
+      "name": "ord_18",
+      "argCount": 5
+    },
+    {
+      "name": "ord_19",
+      "argCount": 4
+    },
+    {
+      "name": "ord_2",
+      "argCount": 3
+    },
+    {
+      "name": "ord_20",
+      "argCount": 6
+    },
+    {
+      "name": "ord_21",
+      "argCount": 5
+    },
+    {
+      "name": "ord_22",
+      "argCount": 2
+    },
+    {
+      "name": "ord_23",
+      "argCount": 3
+    },
+    {
+      "name": "ord_3",
+      "argCount": 1
+    },
+    {
+      "name": "ord_4",
+      "argCount": 3
+    },
+    {
+      "name": "ord_5",
+      "argCount": 3
+    },
+    {
+      "name": "ord_51",
+      "argCount": 3
+    },
+    {
+      "name": "ord_52",
+      "argCount": 1
+    },
+    {
+      "name": "ord_53",
+      "argCount": 1
+    },
+    {
+      "name": "ord_54",
+      "argCount": 1
+    },
+    {
+      "name": "ord_55",
+      "argCount": 2
+    },
+    {
+      "name": "ord_56",
+      "argCount": 2
+    },
+    {
+      "name": "ord_57",
+      "argCount": 2
+    },
+    {
+      "name": "ord_6",
+      "argCount": 3
+    },
+    {
+      "name": "ord_7",
+      "argCount": 5
+    },
+    {
+      "name": "ord_8",
+      "argCount": 1
+    },
+    {
+      "name": "ord_9",
+      "argCount": 1
+    },
+    {
+      "name": "recv",
+      "argCount": 4
+    },
+    {
+      "name": "recvfrom",
+      "argCount": 6
+    },
+    {
+      "name": "select",
+      "argCount": 5
+    },
+    {
+      "name": "send",
+      "argCount": 4
+    },
+    {
+      "name": "sendto",
+      "argCount": 6
+    },
+    {
+      "name": "setsockopt",
+      "argCount": 5
+    },
+    {
+      "name": "shutdown",
+      "argCount": 2
+    },
+    {
+      "name": "socket",
+      "argCount": 3
+    },
+    {
+      "name": "WPUCompleteOverlappedRequest",
+      "argCount": 5
+    },
+    {
+      "name": "WSAAccept",
+      "argCount": 5
+    },
+    {
+      "name": "WSAAddressToStringA",
+      "argCount": 5
+    },
+    {
+      "name": "WSAAddressToStringW",
+      "argCount": 5
+    },
+    {
+      "name": "WSAAsyncGetHostByAddr",
+      "argCount": 7
+    },
+    {
+      "name": "WSAAsyncGetHostByName",
+      "argCount": 5
+    },
+    {
+      "name": "WSAAsyncGetProtoByName",
+      "argCount": 5
+    },
+    {
+      "name": "WSAAsyncGetProtoByNumber",
+      "argCount": 5
+    },
+    {
+      "name": "WSAAsyncGetServByName",
+      "argCount": 6
+    },
+    {
+      "name": "WSAAsyncGetServByPort",
+      "argCount": 6
+    },
+    {
+      "name": "WSAAsyncSelect",
+      "argCount": 4
+    },
+    {
+      "name": "WSACancelAsyncRequest",
+      "argCount": 1
+    },
+    {
+      "name": "WSACancelBlockingCall",
+      "argCount": 0
+    },
+    {
+      "name": "WSACleanup",
+      "argCount": 0
+    },
+    {
+      "name": "WSACloseEvent",
+      "argCount": 1
+    },
+    {
+      "name": "WSAConnect",
+      "argCount": 7
+    },
+    {
+      "name": "WSAConnectByNameA",
+      "argCount": 9
+    },
+    {
+      "name": "WSAConnectByNameW",
+      "argCount": 9
+    },
+    {
+      "name": "WSACreateEvent",
+      "argCount": 0
+    },
+    {
+      "name": "WSADuplicateSocketA",
+      "argCount": 3
+    },
+    {
+      "name": "WSADuplicateSocketW",
+      "argCount": 3
+    },
+    {
+      "name": "WSAEnumNameSpaceProvidersA",
+      "argCount": 2
+    },
+    {
+      "name": "WSAEnumNameSpaceProvidersW",
+      "argCount": 2
+    },
+    {
+      "name": "WSAEnumNetworkEvents",
+      "argCount": 3
+    },
+    {
+      "name": "WSAEnumProtocolsA",
+      "argCount": 3
+    },
+    {
+      "name": "WSAEnumProtocolsW",
+      "argCount": 3
+    },
+    {
+      "name": "WSAEventSelect",
+      "argCount": 3
+    },
+    {
+      "name": "WSAGetLastError",
+      "argCount": 0
+    },
+    {
+      "name": "WSAGetOverlappedResult",
+      "argCount": 5
+    },
+    {
+      "name": "WSAGetQOSByName",
+      "argCount": 3
+    },
+    {
+      "name": "WSAGetServiceClassInfoA",
+      "argCount": 4
+    },
+    {
+      "name": "WSAGetServiceClassInfoW",
+      "argCount": 4
+    },
+    {
+      "name": "WSAGetServiceClassNameByClassIdA",
+      "argCount": 3
+    },
+    {
+      "name": "WSAGetServiceClassNameByClassIdW",
+      "argCount": 3
+    },
+    {
+      "name": "WSAHtonl",
+      "argCount": 3
+    },
+    {
+      "name": "WSAHtons",
+      "argCount": 3
+    },
+    {
+      "name": "WSAInstallServiceClassA",
+      "argCount": 1
+    },
+    {
+      "name": "WSAInstallServiceClassW",
+      "argCount": 1
+    },
+    {
+      "name": "WSAIoctl",
+      "argCount": 9
+    },
+    {
+      "name": "WSAIsBlocking",
+      "argCount": 0
+    },
+    {
+      "name": "WSAJoinLeaf",
+      "argCount": 8
+    },
+    {
+      "name": "WSALookupServiceBeginA",
+      "argCount": 3
+    },
+    {
+      "name": "WSALookupServiceBeginW",
+      "argCount": 3
+    },
+    {
+      "name": "WSALookupServiceEnd",
+      "argCount": 1
+    },
+    {
+      "name": "WSALookupServiceNextA",
+      "argCount": 4
+    },
+    {
+      "name": "WSALookupServiceNextW",
+      "argCount": 4
+    },
+    {
+      "name": "WSANSPIoctl",
+      "argCount": 8
+    },
+    {
+      "name": "WSANtohl",
+      "argCount": 3
+    },
+    {
+      "name": "WSANtohs",
+      "argCount": 3
+    },
+    {
+      "name": "WSAPoll",
+      "argCount": 3
+    },
+    {
+      "name": "WSAProviderConfigChange",
+      "argCount": 3
+    },
+    {
+      "name": "WSApSetPostRoutine",
+      "argCount": 1
+    },
+    {
+      "name": "WSARecv",
+      "argCount": 7
+    },
+    {
+      "name": "WSARecvDisconnect",
+      "argCount": 2
+    },
+    {
+      "name": "WSARecvFrom",
+      "argCount": 9
+    },
+    {
+      "name": "WSARemoveServiceClass",
+      "argCount": 1
+    },
+    {
+      "name": "WSAResetEvent",
+      "argCount": 1
+    },
+    {
+      "name": "WSASend",
+      "argCount": 7
+    },
+    {
+      "name": "WSASendDisconnect",
+      "argCount": 2
+    },
+    {
+      "name": "WSASendMsg",
+      "argCount": 6
+    },
+    {
+      "name": "WSASendTo",
+      "argCount": 9
+    },
+    {
+      "name": "WSASetBlockingHook",
+      "argCount": 1
+    },
+    {
+      "name": "WSASetEvent",
+      "argCount": 1
+    },
+    {
+      "name": "WSASetLastError",
+      "argCount": 1
+    },
+    {
+      "name": "WSASetServiceA",
+      "argCount": 3
+    },
+    {
+      "name": "WSASetServiceW",
+      "argCount": 3
+    },
+    {
+      "name": "WSASocketA",
+      "argCount": 6
+    },
+    {
+      "name": "WSASocketW",
+      "argCount": 6
+    },
+    {
+      "name": "WSAStartup",
+      "argCount": 2
+    },
+    {
+      "name": "WSAStringToAddressA",
+      "argCount": 5
+    },
+    {
+      "name": "WSAStringToAddressW",
+      "argCount": 5
+    },
+    {
+      "name": "WSAUnhookBlockingHook",
+      "argCount": 0
+    },
+    {
+      "name": "WSAWaitForMultipleEvents",
+      "argCount": 5
+    },
+    {
+      "name": "WSCDeinstallProvider",
+      "argCount": 2
+    },
+    {
+      "name": "WSCEnableNSProvider",
+      "argCount": 2
+    },
+    {
+      "name": "WSCEnumProtocols",
+      "argCount": 4
+    },
+    {
+      "name": "WSCGetApplicationCategory",
+      "argCount": 6
+    },
+    {
+      "name": "WSCGetProviderInfo",
+      "argCount": 6
+    },
+    {
+      "name": "WSCGetProviderPath",
+      "argCount": 4
+    },
+    {
+      "name": "WSCInstallNameSpace",
+      "argCount": 5
+    },
+    {
+      "name": "WSCInstallProvider",
+      "argCount": 5
+    },
+    {
+      "name": "WSCInstallProvider64_32",
+      "argCount": 5
+    },
+    {
+      "name": "WSCSetApplicationCategory",
+      "argCount": 7
+    },
+    {
+      "name": "WSCUnInstallNameSpace",
+      "argCount": 1
+    },
+    {
+      "name": "WSCWriteProviderOrder",
+      "argCount": 2
+    }
+  ]
+}

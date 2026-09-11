@@ -1,0 +1,31 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.907Z",
+  "module": "msimg32",
+  "functions": [
+    {
+      "name": "AlphaBlend",
+      "argCount": 11
+    },
+    {
+      "name": "DllInitialize",
+      "argCount": 3
+    },
+    {
+      "name": "GradientFill",
+      "argCount": 6
+    },
+    {
+      "name": "ord_1",
+      "argCount": 0
+    },
+    {
+      "name": "TransparentBlt",
+      "argCount": 11
+    },
+    {
+      "name": "vSetDdrawflag",
+      "argCount": 0
+    }
+  ]
+}

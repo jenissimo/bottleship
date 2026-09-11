@@ -20,10 +20,31 @@
  * DLLs we have no HLE module for are skipped: those load from the VFS as real code,
  * so their imports are the guest's problem, not ours.
  *
+ * TWO DIFFERENT QUESTIONS, reported separately — conflating them is what made a clean
+ * preflight read as "this bundle will not log a single Unimplemented":
+ *
+ *   1. BINDABLE?    can ThunkGenerator emit a stack-correct stub for this name? That is
+ *                   purely an ARITY question, answered by any of the descriptor tables,
+ *                   the win32 reference, or the `@N` decoration. A "no" is fatal at LOAD:
+ *                   the importing PE does not map at all. This is the only thing that
+ *                   sets a non-zero exit.
+ *   2. IMPLEMENTED? is there a JS HANDLER behind the stub? A name can be perfectly
+ *                   bindable — a curated arity in tools/reference/win32 is enough — and
+ *                   still have nothing behind it, in which case the guest gets the
+ *                   declared failure value and the console gets
+ *                   `BottleShip: Unimplemented: <dll>!<name>`. The image loads; the
+ *                   feature does not work. Reported, never fatal.
+ *
+ * Question 2 is answered by ApiCoverageIndex — the same scan `validate-signatures` and
+ * the api-census use — so this tool cannot drift from the repo's own idea of what is
+ * implemented. Where that scan could not follow a module's export-table merge it says
+ * so, and the affected verdicts are printed as UNCERTAIN rather than as fact.
+ *
  * Usage:
  *   bun tools/preflight-imports.ts <bundle.wgb | directory> [--json] [--dll kernel32]
  *
- * Exit 1 when anything is unbindable, so it can gate a bring-up attempt.
+ * Exit 1 when anything is unbindable, so it can gate a bring-up attempt. An unimplemented
+ * (but bindable) import does NOT fail the run — it is a bring-up work list, not a gate.
  */
 
 import { readdirSync, readFileSync, statSync } from "fs";
@@ -32,6 +53,7 @@ import { pathToFileURL } from "url";
 import { spawnSync } from "child_process";
 import { parsePeImports, isPeImage } from "../packages/formats/src/pe";
 import { resolveThunkedDllAlias } from "../src/worker/core/dll-aliases";
+import { ApiCoverageIndex } from "../src/worker/tools/api-coverage";
 
 const REPO = resolve(import.meta.dir, "..");
 
@@ -41,6 +63,21 @@ interface Finding {
     importers: Set<string>;
     /** Set when the name binds, but to a DIFFERENT @N than the import carries. */
     wrongArity?: string;
+}
+
+/** A name that BINDS but has no handler behind it — question 2 in the header. */
+interface Unimplemented {
+    dll: string;
+    /** Canonical HLE module the import resolves to (post-alias), when there is one. */
+    module: string;
+    func: string;
+    importers: Set<string>;
+    /**
+     * True when this module has export-table merges the coverage scan could not follow,
+     * so "no handler" is a GUESS. Printed as UNCERTAIN — a confident wrong answer here
+     * sends someone implementing an API that already exists.
+     */
+    uncertain: boolean;
 }
 
 interface ArityTables {
@@ -208,9 +245,15 @@ function isBindable(tables: ArityTables, dll: string, name: string): boolean {
     const func = name.toLowerCase();
     const table = tables.byDll.get(dll);
     const decorated = /@\d+$/.test(func);
+    // `ord_N` is a POSITION, not a name. Every fallback below asks "is this name known
+    // somewhere else" — and `ord_8` is known in a dozen modules, meaning something
+    // different in each. Only this module's own table can answer for an ordinal, which
+    // is also all the runtime consults (APIRegistry.getArgCountByOrdinal).
+    const ordinal = /^ord_\d+$/.test(func);
 
     // 1. exact
     if (table?.has(func)) return true;
+    if (ordinal) return false;
     // 2. without the A/W suffix
     if (table?.has(func.replace(/[wa]$/, ""))) return true;
 
@@ -309,6 +352,42 @@ function* peFilesFromDir(dir: string): Generator<[string, Uint8Array]> {
     }
 }
 
+/**
+ * Record an import that binds but has no handler. The verdict comes from
+ * ApiCoverageIndex, so it is the same "implemented" the census and validate-signatures
+ * use; a module whose export-table merges could not be followed is marked UNCERTAIN
+ * rather than reported as a hole.
+ */
+function noteUnimplemented(
+    coverage: ApiCoverageIndex,
+    out: Map<string, Unimplemented>,
+    importedMod: string,
+    mod: string,
+    func: string,
+    importer: string,
+): void {
+    const ordinal = /^ord_(\d+)$/.exec(func);
+    const module = coverage.getModule(mod);
+    const cov = ordinal
+        ? coverage.lookupOrdinal(mod, parseInt(ordinal[1], 10))
+        : coverage.lookup(mod, func);
+    // `implemented` and `silent-stub` both have a handler the dispatcher reaches; only a
+    // declared-stub (or nothing at all) produces "BottleShip: Unimplemented".
+    if (cov && cov.status !== "declared-stub") return;
+    const key = `${importedMod}!${func}`;
+    let row = out.get(key);
+    if (!row) {
+        out.set(key, (row = {
+            dll: importedMod,
+            module: module?.module ?? mod,
+            func,
+            importers: new Set(),
+            uncertain: (module?.unresolvedMerges.length ?? 0) > 0,
+        }));
+    }
+    row.importers.add(importer);
+}
+
 async function main(): Promise<void> {
     const args = process.argv.slice(2);
     const positional: string[] = [];
@@ -343,7 +422,10 @@ async function main(): Promise<void> {
     const asJson = args.includes("--json");
 
     const tables = await loadKnownNames();
+    // The repo's own answer to "is there a handler", not a second opinion about it.
+    const coverage = ApiCoverageIndex.load(REPO);
     const findings = new Map<string, Finding>();
+    const unimplemented = new Map<string, Unimplemented>();
     let scanned = 0;
 
     const isArchive = statSync(target).isFile();
@@ -383,7 +465,17 @@ async function main(): Promise<void> {
                 const func = entry.name ?? (entry.ordinal === undefined ? undefined : `ord_${entry.ordinal}`);
                 if (!func) continue;
                 const mismatch = hasDescriptor ? wrongArityVariant(tables, mod, func) : null;
-                if (!mismatch && hasDescriptor && isBindable(tables, mod, func)) continue;
+                if (!mismatch && hasDescriptor && isBindable(tables, mod, func)) {
+                    noteUnimplemented(coverage, unimplemented, importedMod, mod, func, name);
+                    continue;
+                }
+                if (!mismatch && !hasDescriptor && isBindable(tables, mod, func)) {
+                    // Bindable through the win32 reference alone: there is no HLE module at
+                    // all, so the loader synthesizes a stub and nothing answers it. This is
+                    // exactly the shape (xinput imported by ordinal) that read as "clean".
+                    noteUnimplemented(coverage, unimplemented, importedMod, mod, func, name);
+                    continue;
+                }
                 const key = `${importedMod}!${func}`;
                 let f = findings.get(key);
                 if (!f) {
@@ -399,12 +491,19 @@ async function main(): Promise<void> {
 
     const rows = [...findings.values()].sort((a, b) =>
         a.dll === b.dll ? a.func.localeCompare(b.func) : a.dll.localeCompare(b.dll));
+    const unimplRows = [...unimplemented.values()].sort((a, b) =>
+        a.dll === b.dll ? a.func.localeCompare(b.func) : a.dll.localeCompare(b.dll));
 
     if (asJson) {
         console.log(JSON.stringify({
             scanned,
             missing: rows.map(r => ({
                 dll: r.dll, func: r.func, wrongArity: r.wrongArity ?? null,
+                importers: [...r.importers].sort(),
+            })),
+            unimplemented: unimplRows.map(r => ({
+                dll: r.dll, module: r.module, func: r.func,
+                implemented: false, uncertain: r.uncertain,
                 importers: [...r.importers].sort(),
             })),
         }, null, 2));
@@ -430,6 +529,33 @@ async function main(): Promise<void> {
             if (skewed) {
                 console.log(`${skewed} arity mismatch(es) — these DO bind, with the wrong RET N. The`
                     + ` caller's stack drifts and the fault surfaces in unrelated code.`);
+            }
+        }
+
+        // Second report: BINDS, but nothing answers it. Not a load failure — a work list.
+        console.log("");
+        if (unimplRows.length === 0) {
+            console.log("implemented: yes — every bindable import has a handler behind it");
+        } else {
+            console.log(`implemented: no — ${unimplRows.length} bindable import(s) reach a stub with no`
+                + ` handler. These LOAD fine and log \`BottleShip: Unimplemented: <dll>!<name>\` at the`
+                + ` first call; the guest gets the declared failure value.`);
+            let current = "";
+            for (const r of unimplRows) {
+                if (r.dll !== current) {
+                    current = r.dll;
+                    const mod = unimplRows.find(x => x.dll === current)!.module;
+                    console.log(`
+${current}${mod !== current ? ` (-> ${mod})` : ""}:`);
+                }
+                const mark = r.uncertain ? "UNCERTAIN: unfollowed export merge" : "no handler";
+                console.log(`  ${r.func.padEnd(38)} ${mark.padEnd(36)} <- ${[...r.importers].sort().join(", ")}`);
+            }
+            const uncertain = unimplRows.filter(r => r.uncertain).length;
+            if (uncertain) {
+                console.log(`
+${uncertain} of these sit in a module whose export table this scan could not`
+                    + ` fully follow — confirm with the running emulator's report().stubs before implementing.`);
             }
         }
     }

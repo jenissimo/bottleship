@@ -1,0 +1,76 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.926Z",
+  "module": "oleacc",
+  "functions": [
+    {
+      "name": "AccessibleChildren",
+      "argCount": 5
+    },
+    {
+      "name": "AccessibleObjectFromEvent",
+      "argCount": 5
+    },
+    {
+      "name": "AccessibleObjectFromPoint",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "AccessibleObjectFromWindow",
+      "argCount": 4
+    },
+    {
+      "name": "CreateStdAccessibleObject",
+      "argCount": 4
+    },
+    {
+      "name": "DllGetClassObject",
+      "argCount": 3
+    },
+    {
+      "name": "DllRegisterServer",
+      "argCount": 0
+    },
+    {
+      "name": "DllUnregisterServer",
+      "argCount": 0
+    },
+    {
+      "name": "GetOleaccVersionInfo",
+      "argCount": 2
+    },
+    {
+      "name": "GetProcessHandleFromHwnd",
+      "argCount": 1
+    },
+    {
+      "name": "GetRoleTextA",
+      "argCount": 3
+    },
+    {
+      "name": "GetRoleTextW",
+      "argCount": 3
+    },
+    {
+      "name": "GetStateTextA",
+      "argCount": 3
+    },
+    {
+      "name": "GetStateTextW",
+      "argCount": 3
+    },
+    {
+      "name": "LresultFromObject",
+      "argCount": 3
+    },
+    {
+      "name": "ObjectFromLresult",
+      "argCount": 4
+    },
+    {
+      "name": "WindowFromAccessibleObject",
+      "argCount": 2
+    }
+  ]
+}

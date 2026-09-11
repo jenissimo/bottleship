@@ -1,0 +1,103 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.887Z",
+  "module": "dsound",
+  "functions": [
+    {
+      "name": "DirectSoundCaptureCreate",
+      "argCount": 3
+    },
+    {
+      "name": "DirectSoundCaptureCreate8",
+      "argCount": 3
+    },
+    {
+      "name": "DirectSoundCaptureEnumerateA",
+      "argCount": 2
+    },
+    {
+      "name": "DirectSoundCaptureEnumerateW",
+      "argCount": 2
+    },
+    {
+      "name": "DirectSoundCreate",
+      "argCount": 3
+    },
+    {
+      "name": "DirectSoundCreate8",
+      "argCount": 3
+    },
+    {
+      "name": "DirectSoundEnumerateA",
+      "argCount": 2
+    },
+    {
+      "name": "DirectSoundEnumerateW",
+      "argCount": 2
+    },
+    {
+      "name": "DirectSoundFullDuplexCreate",
+      "argCount": 10
+    },
+    {
+      "name": "DllCanUnloadNow",
+      "argCount": 0
+    },
+    {
+      "name": "DllGetClassObject",
+      "argCount": 3
+    },
+    {
+      "name": "DllRegisterServer",
+      "argCount": 0
+    },
+    {
+      "name": "DllUnregisterServer",
+      "argCount": 0
+    },
+    {
+      "name": "GetDeviceID",
+      "argCount": 2
+    },
+    {
+      "name": "ord_1",
+      "argCount": 3
+    },
+    {
+      "name": "ord_10",
+      "argCount": 10
+    },
+    {
+      "name": "ord_11",
+      "argCount": 3
+    },
+    {
+      "name": "ord_12",
+      "argCount": 3
+    },
+    {
+      "name": "ord_2",
+      "argCount": 2
+    },
+    {
+      "name": "ord_3",
+      "argCount": 2
+    },
+    {
+      "name": "ord_6",
+      "argCount": 3
+    },
+    {
+      "name": "ord_7",
+      "argCount": 2
+    },
+    {
+      "name": "ord_8",
+      "argCount": 2
+    },
+    {
+      "name": "ord_9",
+      "argCount": 2
+    }
+  ]
+}

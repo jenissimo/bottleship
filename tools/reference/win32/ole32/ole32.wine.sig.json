@@ -1,0 +1,1092 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.925Z",
+  "module": "ole32",
+  "functions": [
+    {
+      "name": "BindMoniker",
+      "argCount": 4
+    },
+    {
+      "name": "CLIPFORMAT_UserFree",
+      "argCount": 2
+    },
+    {
+      "name": "CLIPFORMAT_UserMarshal",
+      "argCount": 3
+    },
+    {
+      "name": "CLIPFORMAT_UserSize",
+      "argCount": 3
+    },
+    {
+      "name": "CLIPFORMAT_UserUnmarshal",
+      "argCount": 3
+    },
+    {
+      "name": "CLSIDFromProgID",
+      "argCount": 2
+    },
+    {
+      "name": "CLSIDFromProgIDEx",
+      "argCount": 2
+    },
+    {
+      "name": "CLSIDFromString",
+      "argCount": 2
+    },
+    {
+      "name": "CoAddRefServerProcess",
+      "argCount": 0
+    },
+    {
+      "name": "CoAllowSetForegroundWindow",
+      "argCount": 2
+    },
+    {
+      "name": "CoBuildVersion",
+      "argCount": 0
+    },
+    {
+      "name": "CoCopyProxy",
+      "argCount": 2
+    },
+    {
+      "name": "CoCreateFreeThreadedMarshaler",
+      "argCount": 2
+    },
+    {
+      "name": "CoCreateGuid",
+      "argCount": 1
+    },
+    {
+      "name": "CoCreateInstance",
+      "argCount": 5
+    },
+    {
+      "name": "CoCreateInstanceEx",
+      "argCount": 6
+    },
+    {
+      "name": "CoCreateInstanceFromApp",
+      "argCount": 6
+    },
+    {
+      "name": "CoDecrementMTAUsage",
+      "argCount": 1
+    },
+    {
+      "name": "CoDisableCallCancellation",
+      "argCount": 1
+    },
+    {
+      "name": "CoDisconnectObject",
+      "argCount": 2
+    },
+    {
+      "name": "CoDosDateTimeToFileTime",
+      "argCount": 3
+    },
+    {
+      "name": "CoEnableCallCancellation",
+      "argCount": 1
+    },
+    {
+      "name": "CoFileTimeNow",
+      "argCount": 1
+    },
+    {
+      "name": "CoFileTimeToDosDateTime",
+      "argCount": 3
+    },
+    {
+      "name": "CoFreeAllLibraries",
+      "argCount": 0
+    },
+    {
+      "name": "CoFreeLibrary",
+      "argCount": 1
+    },
+    {
+      "name": "CoFreeUnusedLibraries",
+      "argCount": 0
+    },
+    {
+      "name": "CoFreeUnusedLibrariesEx",
+      "argCount": 2
+    },
+    {
+      "name": "CoGetActivationState",
+      "argCount": 3
+    },
+    {
+      "name": "CoGetApartmentType",
+      "argCount": 2
+    },
+    {
+      "name": "CoGetCallContext",
+      "argCount": 2
+    },
+    {
+      "name": "CoGetCallerTID",
+      "argCount": 1
+    },
+    {
+      "name": "CoGetCallState",
+      "argCount": 2
+    },
+    {
+      "name": "CoGetClassObject",
+      "argCount": 5
+    },
+    {
+      "name": "CoGetContextToken",
+      "argCount": 1
+    },
+    {
+      "name": "CoGetCurrentLogicalThreadId",
+      "argCount": 1
+    },
+    {
+      "name": "CoGetCurrentProcess",
+      "argCount": 0
+    },
+    {
+      "name": "CoGetDefaultContext",
+      "argCount": 3
+    },
+    {
+      "name": "CoGetInstanceFromFile",
+      "argCount": 8
+    },
+    {
+      "name": "CoGetInstanceFromIStorage",
+      "argCount": 7
+    },
+    {
+      "name": "CoGetInterfaceAndReleaseStream",
+      "argCount": 3
+    },
+    {
+      "name": "CoGetMalloc",
+      "argCount": 2
+    },
+    {
+      "name": "CoGetMarshalSizeMax",
+      "argCount": 6
+    },
+    {
+      "name": "CoGetObject",
+      "argCount": 4
+    },
+    {
+      "name": "CoGetObjectContext",
+      "argCount": 2
+    },
+    {
+      "name": "CoGetPSClsid",
+      "argCount": 2
+    },
+    {
+      "name": "CoGetStandardMarshal",
+      "argCount": 6
+    },
+    {
+      "name": "CoGetState",
+      "argCount": 1
+    },
+    {
+      "name": "CoGetTreatAsClass",
+      "argCount": 2
+    },
+    {
+      "name": "CoImpersonateClient",
+      "argCount": 0
+    },
+    {
+      "name": "CoIncrementMTAUsage",
+      "argCount": 1
+    },
+    {
+      "name": "CoInitialize",
+      "argCount": 1
+    },
+    {
+      "name": "CoInitializeEx",
+      "argCount": 2
+    },
+    {
+      "name": "CoInitializeSecurity",
+      "argCount": 9
+    },
+    {
+      "name": "CoInitializeWOW",
+      "argCount": 2
+    },
+    {
+      "name": "CoIsHandlerConnected",
+      "argCount": 1
+    },
+    {
+      "name": "CoIsOle1Class",
+      "argCount": 1
+    },
+    {
+      "name": "CoLoadLibrary",
+      "argCount": 2
+    },
+    {
+      "name": "CoLockObjectExternal",
+      "argCount": 3
+    },
+    {
+      "name": "CoMarshalHresult",
+      "argCount": 2
+    },
+    {
+      "name": "CoMarshalInterface",
+      "argCount": 6
+    },
+    {
+      "name": "CoMarshalInterThreadInterfaceInStream",
+      "argCount": 3
+    },
+    {
+      "name": "CoQueryClientBlanket",
+      "argCount": 7
+    },
+    {
+      "name": "CoQueryProxyBlanket",
+      "argCount": 8
+    },
+    {
+      "name": "CoRegisterActivationFilter",
+      "argCount": 1
+    },
+    {
+      "name": "CoRegisterChannelHook",
+      "argCount": 2
+    },
+    {
+      "name": "CoRegisterClassObject",
+      "argCount": 5
+    },
+    {
+      "name": "CoRegisterInitializeSpy",
+      "argCount": 2
+    },
+    {
+      "name": "CoRegisterMallocSpy",
+      "argCount": 1
+    },
+    {
+      "name": "CoRegisterMessageFilter",
+      "argCount": 2
+    },
+    {
+      "name": "CoRegisterPSClsid",
+      "argCount": 2
+    },
+    {
+      "name": "CoRegisterSurrogate",
+      "argCount": 1
+    },
+    {
+      "name": "CoRegisterSurrogateEx",
+      "argCount": 2
+    },
+    {
+      "name": "CoReleaseMarshalData",
+      "argCount": 1
+    },
+    {
+      "name": "CoReleaseServerProcess",
+      "argCount": 0
+    },
+    {
+      "name": "CoResumeClassObjects",
+      "argCount": 0
+    },
+    {
+      "name": "CoRevertToSelf",
+      "argCount": 0
+    },
+    {
+      "name": "CoRevokeClassObject",
+      "argCount": 1
+    },
+    {
+      "name": "CoRevokeInitializeSpy",
+      "argCount": 2,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "CoRevokeMallocSpy",
+      "argCount": 0
+    },
+    {
+      "name": "CoSetProxyBlanket",
+      "argCount": 8
+    },
+    {
+      "name": "CoSetState",
+      "argCount": 1
+    },
+    {
+      "name": "CoSuspendClassObjects",
+      "argCount": 0
+    },
+    {
+      "name": "CoSwitchCallContext",
+      "argCount": 2
+    },
+    {
+      "name": "CoTaskMemAlloc",
+      "argCount": 1
+    },
+    {
+      "name": "CoTaskMemFree",
+      "argCount": 1
+    },
+    {
+      "name": "CoTaskMemRealloc",
+      "argCount": 2
+    },
+    {
+      "name": "CoTreatAsClass",
+      "argCount": 2
+    },
+    {
+      "name": "CoUninitialize",
+      "argCount": 0
+    },
+    {
+      "name": "CoUnmarshalHresult",
+      "argCount": 2
+    },
+    {
+      "name": "CoUnmarshalInterface",
+      "argCount": 3
+    },
+    {
+      "name": "CoWaitForMultipleHandles",
+      "argCount": 5
+    },
+    {
+      "name": "CreateAntiMoniker",
+      "argCount": 1
+    },
+    {
+      "name": "CreateBindCtx",
+      "argCount": 2
+    },
+    {
+      "name": "CreateClassMoniker",
+      "argCount": 2
+    },
+    {
+      "name": "CreateDataAdviseHolder",
+      "argCount": 1
+    },
+    {
+      "name": "CreateDataCache",
+      "argCount": 4
+    },
+    {
+      "name": "CreateErrorInfo",
+      "argCount": 1
+    },
+    {
+      "name": "CreateFileMoniker",
+      "argCount": 2
+    },
+    {
+      "name": "CreateGenericComposite",
+      "argCount": 3
+    },
+    {
+      "name": "CreateILockBytesOnHGlobal",
+      "argCount": 3
+    },
+    {
+      "name": "CreateItemMoniker",
+      "argCount": 3
+    },
+    {
+      "name": "CreateObjrefMoniker",
+      "argCount": 2
+    },
+    {
+      "name": "CreateOleAdviseHolder",
+      "argCount": 1
+    },
+    {
+      "name": "CreatePointerMoniker",
+      "argCount": 2
+    },
+    {
+      "name": "CreateStreamOnHGlobal",
+      "argCount": 3
+    },
+    {
+      "name": "DestroyRunningObjectTable",
+      "argCount": 0
+    },
+    {
+      "name": "DllDebugObjectRPCHook",
+      "argCount": 2
+    },
+    {
+      "name": "DllGetClassObject",
+      "argCount": 3
+    },
+    {
+      "name": "DllRegisterServer",
+      "argCount": 0
+    },
+    {
+      "name": "DllUnregisterServer",
+      "argCount": 0
+    },
+    {
+      "name": "DoDragDrop",
+      "argCount": 4
+    },
+    {
+      "name": "FmtIdToPropStgName",
+      "argCount": 2
+    },
+    {
+      "name": "FreePropVariantArray",
+      "argCount": 2
+    },
+    {
+      "name": "GetClassFile",
+      "argCount": 2
+    },
+    {
+      "name": "GetConvertStg",
+      "argCount": 1
+    },
+    {
+      "name": "GetErrorInfo",
+      "argCount": 2
+    },
+    {
+      "name": "GetHGlobalFromILockBytes",
+      "argCount": 2
+    },
+    {
+      "name": "GetHGlobalFromStream",
+      "argCount": 2
+    },
+    {
+      "name": "GetRunningObjectTable",
+      "argCount": 2
+    },
+    {
+      "name": "HACCEL_UserFree",
+      "argCount": 2
+    },
+    {
+      "name": "HACCEL_UserMarshal",
+      "argCount": 3
+    },
+    {
+      "name": "HACCEL_UserSize",
+      "argCount": 3
+    },
+    {
+      "name": "HACCEL_UserUnmarshal",
+      "argCount": 3
+    },
+    {
+      "name": "HBITMAP_UserFree",
+      "argCount": 2
+    },
+    {
+      "name": "HBITMAP_UserMarshal",
+      "argCount": 3
+    },
+    {
+      "name": "HBITMAP_UserSize",
+      "argCount": 3
+    },
+    {
+      "name": "HBITMAP_UserUnmarshal",
+      "argCount": 3
+    },
+    {
+      "name": "HBRUSH_UserFree",
+      "argCount": 2
+    },
+    {
+      "name": "HBRUSH_UserMarshal",
+      "argCount": 3
+    },
+    {
+      "name": "HBRUSH_UserSize",
+      "argCount": 3
+    },
+    {
+      "name": "HBRUSH_UserUnmarshal",
+      "argCount": 3
+    },
+    {
+      "name": "HDC_UserFree",
+      "argCount": 2
+    },
+    {
+      "name": "HDC_UserMarshal",
+      "argCount": 3
+    },
+    {
+      "name": "HDC_UserSize",
+      "argCount": 3
+    },
+    {
+      "name": "HDC_UserUnmarshal",
+      "argCount": 3
+    },
+    {
+      "name": "HENHMETAFILE_UserFree",
+      "argCount": 2
+    },
+    {
+      "name": "HENHMETAFILE_UserMarshal",
+      "argCount": 3
+    },
+    {
+      "name": "HENHMETAFILE_UserSize",
+      "argCount": 3
+    },
+    {
+      "name": "HENHMETAFILE_UserUnmarshal",
+      "argCount": 3
+    },
+    {
+      "name": "HGLOBAL_UserFree",
+      "argCount": 2
+    },
+    {
+      "name": "HGLOBAL_UserMarshal",
+      "argCount": 3
+    },
+    {
+      "name": "HGLOBAL_UserSize",
+      "argCount": 3
+    },
+    {
+      "name": "HGLOBAL_UserUnmarshal",
+      "argCount": 3
+    },
+    {
+      "name": "HICON_UserFree",
+      "argCount": 2
+    },
+    {
+      "name": "HICON_UserMarshal",
+      "argCount": 3
+    },
+    {
+      "name": "HICON_UserSize",
+      "argCount": 3
+    },
+    {
+      "name": "HICON_UserUnmarshal",
+      "argCount": 3
+    },
+    {
+      "name": "HMENU_UserFree",
+      "argCount": 2
+    },
+    {
+      "name": "HMENU_UserMarshal",
+      "argCount": 3
+    },
+    {
+      "name": "HMENU_UserSize",
+      "argCount": 3
+    },
+    {
+      "name": "HMENU_UserUnmarshal",
+      "argCount": 3
+    },
+    {
+      "name": "HMETAFILE_UserFree",
+      "argCount": 2
+    },
+    {
+      "name": "HMETAFILE_UserMarshal",
+      "argCount": 3
+    },
+    {
+      "name": "HMETAFILE_UserSize",
+      "argCount": 3
+    },
+    {
+      "name": "HMETAFILE_UserUnmarshal",
+      "argCount": 3
+    },
+    {
+      "name": "HMETAFILEPICT_UserFree",
+      "argCount": 2
+    },
+    {
+      "name": "HMETAFILEPICT_UserMarshal",
+      "argCount": 3
+    },
+    {
+      "name": "HMETAFILEPICT_UserSize",
+      "argCount": 3
+    },
+    {
+      "name": "HMETAFILEPICT_UserUnmarshal",
+      "argCount": 3
+    },
+    {
+      "name": "HPALETTE_UserFree",
+      "argCount": 2
+    },
+    {
+      "name": "HPALETTE_UserMarshal",
+      "argCount": 3
+    },
+    {
+      "name": "HPALETTE_UserSize",
+      "argCount": 3
+    },
+    {
+      "name": "HPALETTE_UserUnmarshal",
+      "argCount": 3
+    },
+    {
+      "name": "HWND_UserFree",
+      "argCount": 2
+    },
+    {
+      "name": "HWND_UserMarshal",
+      "argCount": 3
+    },
+    {
+      "name": "HWND_UserSize",
+      "argCount": 3
+    },
+    {
+      "name": "HWND_UserUnmarshal",
+      "argCount": 3
+    },
+    {
+      "name": "IIDFromString",
+      "argCount": 2
+    },
+    {
+      "name": "IsAccelerator",
+      "argCount": 4
+    },
+    {
+      "name": "IsEqualGUID",
+      "argCount": 2
+    },
+    {
+      "name": "IsValidInterface",
+      "argCount": 1
+    },
+    {
+      "name": "MkParseDisplayName",
+      "argCount": 4
+    },
+    {
+      "name": "MonikerCommonPrefixWith",
+      "argCount": 3
+    },
+    {
+      "name": "Ole32DllGetClassObject",
+      "argCount": 3
+    },
+    {
+      "name": "OleBuildVersion",
+      "argCount": 0
+    },
+    {
+      "name": "OleConvertIStorageToOLESTREAM",
+      "argCount": 2
+    },
+    {
+      "name": "OleConvertIStorageToOLESTREAMEx",
+      "argCount": 7
+    },
+    {
+      "name": "OleConvertOLESTREAMToIStorage",
+      "argCount": 3
+    },
+    {
+      "name": "OleCreate",
+      "argCount": 7
+    },
+    {
+      "name": "OleCreateDefaultHandler",
+      "argCount": 4
+    },
+    {
+      "name": "OleCreateEmbeddingHelper",
+      "argCount": 6
+    },
+    {
+      "name": "OleCreateFromData",
+      "argCount": 7
+    },
+    {
+      "name": "OleCreateFromDataEx",
+      "argCount": 12
+    },
+    {
+      "name": "OleCreateFromFile",
+      "argCount": 8
+    },
+    {
+      "name": "OleCreateFromFileEx",
+      "argCount": 13
+    },
+    {
+      "name": "OleCreateLink",
+      "argCount": 7
+    },
+    {
+      "name": "OleCreateLinkFromData",
+      "argCount": 7
+    },
+    {
+      "name": "OleCreateLinkToFile",
+      "argCount": 7
+    },
+    {
+      "name": "OleCreateMenuDescriptor",
+      "argCount": 2
+    },
+    {
+      "name": "OleCreateStaticFromData",
+      "argCount": 7
+    },
+    {
+      "name": "OleDestroyMenuDescriptor",
+      "argCount": 1
+    },
+    {
+      "name": "OleDoAutoConvert",
+      "argCount": 2
+    },
+    {
+      "name": "OleDraw",
+      "argCount": 4
+    },
+    {
+      "name": "OleDuplicateData",
+      "argCount": 3
+    },
+    {
+      "name": "OleFlushClipboard",
+      "argCount": 0
+    },
+    {
+      "name": "OleGetAutoConvert",
+      "argCount": 2
+    },
+    {
+      "name": "OleGetClipboard",
+      "argCount": 1
+    },
+    {
+      "name": "OleGetIconOfClass",
+      "argCount": 3
+    },
+    {
+      "name": "OleGetIconOfFile",
+      "argCount": 2
+    },
+    {
+      "name": "OleInitialize",
+      "argCount": 1
+    },
+    {
+      "name": "OleInitializeWOW",
+      "argCount": 2
+    },
+    {
+      "name": "OleIsCurrentClipboard",
+      "argCount": 1
+    },
+    {
+      "name": "OleIsRunning",
+      "argCount": 1
+    },
+    {
+      "name": "OleLoad",
+      "argCount": 4
+    },
+    {
+      "name": "OleLoadFromStream",
+      "argCount": 3
+    },
+    {
+      "name": "OleLockRunning",
+      "argCount": 3
+    },
+    {
+      "name": "OleMetafilePictFromIconAndLabel",
+      "argCount": 4
+    },
+    {
+      "name": "OleNoteObjectVisible",
+      "argCount": 2
+    },
+    {
+      "name": "OleQueryCreateFromData",
+      "argCount": 1
+    },
+    {
+      "name": "OleQueryLinkFromData",
+      "argCount": 1
+    },
+    {
+      "name": "OleRegEnumFormatEtc",
+      "argCount": 3
+    },
+    {
+      "name": "OleRegEnumVerbs",
+      "argCount": 2
+    },
+    {
+      "name": "OleRegGetMiscStatus",
+      "argCount": 3
+    },
+    {
+      "name": "OleRegGetUserType",
+      "argCount": 3
+    },
+    {
+      "name": "OleRun",
+      "argCount": 1
+    },
+    {
+      "name": "OleSave",
+      "argCount": 3
+    },
+    {
+      "name": "OleSaveToStream",
+      "argCount": 2
+    },
+    {
+      "name": "OleSetAutoConvert",
+      "argCount": 2
+    },
+    {
+      "name": "OleSetClipboard",
+      "argCount": 1
+    },
+    {
+      "name": "OleSetContainedObject",
+      "argCount": 2
+    },
+    {
+      "name": "OleSetMenuDescriptor",
+      "argCount": 5
+    },
+    {
+      "name": "OleTranslateAccelerator",
+      "argCount": 3
+    },
+    {
+      "name": "OleUninitialize",
+      "argCount": 0
+    },
+    {
+      "name": "ProgIDFromCLSID",
+      "argCount": 2
+    },
+    {
+      "name": "PropStgNameToFmtId",
+      "argCount": 2
+    },
+    {
+      "name": "PropSysAllocString",
+      "argCount": 1
+    },
+    {
+      "name": "PropSysFreeString",
+      "argCount": 1
+    },
+    {
+      "name": "PropVariantClear",
+      "argCount": 1
+    },
+    {
+      "name": "PropVariantCopy",
+      "argCount": 2
+    },
+    {
+      "name": "ReadClassStg",
+      "argCount": 2
+    },
+    {
+      "name": "ReadClassStm",
+      "argCount": 2
+    },
+    {
+      "name": "ReadFmtUserTypeStg",
+      "argCount": 3
+    },
+    {
+      "name": "RegisterDragDrop",
+      "argCount": 2
+    },
+    {
+      "name": "ReleaseStgMedium",
+      "argCount": 1
+    },
+    {
+      "name": "RevokeDragDrop",
+      "argCount": 1
+    },
+    {
+      "name": "RoGetAgileReference",
+      "argCount": 4
+    },
+    {
+      "name": "SetConvertStg",
+      "argCount": 2
+    },
+    {
+      "name": "SetErrorInfo",
+      "argCount": 2
+    },
+    {
+      "name": "SNB_UserFree",
+      "argCount": 2
+    },
+    {
+      "name": "SNB_UserMarshal",
+      "argCount": 3
+    },
+    {
+      "name": "SNB_UserSize",
+      "argCount": 3
+    },
+    {
+      "name": "SNB_UserUnmarshal",
+      "argCount": 3
+    },
+    {
+      "name": "StgConvertPropertyToVariant",
+      "argCount": 4
+    },
+    {
+      "name": "StgConvertVariantToProperty",
+      "argCount": 7
+    },
+    {
+      "name": "StgCreateDocfile",
+      "argCount": 4
+    },
+    {
+      "name": "StgCreateDocfileOnILockBytes",
+      "argCount": 4
+    },
+    {
+      "name": "StgCreatePropSetStg",
+      "argCount": 3
+    },
+    {
+      "name": "StgCreatePropStg",
+      "argCount": 6
+    },
+    {
+      "name": "StgCreateStorageEx",
+      "argCount": 8
+    },
+    {
+      "name": "StgIsStorageFile",
+      "argCount": 1
+    },
+    {
+      "name": "StgIsStorageILockBytes",
+      "argCount": 1
+    },
+    {
+      "name": "STGMEDIUM_UserFree",
+      "argCount": 2
+    },
+    {
+      "name": "STGMEDIUM_UserMarshal",
+      "argCount": 3
+    },
+    {
+      "name": "STGMEDIUM_UserSize",
+      "argCount": 3
+    },
+    {
+      "name": "STGMEDIUM_UserUnmarshal",
+      "argCount": 3
+    },
+    {
+      "name": "StgOpenPropStg",
+      "argCount": 5
+    },
+    {
+      "name": "StgOpenStorage",
+      "argCount": 6
+    },
+    {
+      "name": "StgOpenStorageEx",
+      "argCount": 8
+    },
+    {
+      "name": "StgOpenStorageOnILockBytes",
+      "argCount": 6
+    },
+    {
+      "name": "StgSetTimes",
+      "argCount": 4
+    },
+    {
+      "name": "StringFromCLSID",
+      "argCount": 2
+    },
+    {
+      "name": "StringFromGUID2",
+      "argCount": 3
+    },
+    {
+      "name": "StringFromIID",
+      "argCount": 2
+    },
+    {
+      "name": "WdtpInterfacePointer_UserFree",
+      "argCount": 1
+    },
+    {
+      "name": "WdtpInterfacePointer_UserMarshal",
+      "argCount": 5
+    },
+    {
+      "name": "WdtpInterfacePointer_UserSize",
+      "argCount": 5
+    },
+    {
+      "name": "WdtpInterfacePointer_UserUnmarshal",
+      "argCount": 4
+    },
+    {
+      "name": "WriteClassStg",
+      "argCount": 2
+    },
+    {
+      "name": "WriteClassStm",
+      "argCount": 2
+    },
+    {
+      "name": "WriteFmtUserTypeStg",
+      "argCount": 3
+    }
+  ]
+}

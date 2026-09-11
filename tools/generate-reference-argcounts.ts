@@ -23,7 +23,12 @@ function collect(): RefMap {
     const dirs = fs.readdirSync(REFERENCE_DIR, { withFileTypes: true }).filter((d) => d.isDirectory());
     for (const dir of dirs) {
         const subPath = path.join(REFERENCE_DIR, dir.name);
-        const files = fs.readdirSync(subPath).filter((f) => f.endsWith(".sig.json"));
+        // `*.wine.sig.json` is the bulk-derived floor; a curated sig.json is hand-checked
+        // and must win where the two disagree, so it is applied LAST. Without the explicit
+        // order this is readdir order — i.e. which one wins depends on the filesystem.
+        const files = fs.readdirSync(subPath)
+            .filter((f) => f.endsWith(".sig.json"))
+            .sort((a, b) => Number(b.endsWith(".wine.sig.json")) - Number(a.endsWith(".wine.sig.json")) || a.localeCompare(b));
         for (const file of files) {
             const fullPath = path.join(subPath, file);
             const data = JSON.parse(fs.readFileSync(fullPath, "utf-8"));

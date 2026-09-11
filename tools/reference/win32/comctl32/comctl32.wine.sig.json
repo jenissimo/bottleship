@@ -1,0 +1,1133 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.876Z",
+  "module": "comctl32",
+  "functions": [
+    {
+      "name": "_TrackMouseEvent",
+      "argCount": 1
+    },
+    {
+      "name": "AddMRUData",
+      "argCount": 3
+    },
+    {
+      "name": "AddMRUStringA",
+      "argCount": 2
+    },
+    {
+      "name": "AddMRUStringW",
+      "argCount": 2
+    },
+    {
+      "name": "Alloc",
+      "argCount": 1
+    },
+    {
+      "name": "CreateMappedBitmap",
+      "argCount": 5
+    },
+    {
+      "name": "CreateMRUListA",
+      "argCount": 1
+    },
+    {
+      "name": "CreateMRUListLazyA",
+      "argCount": 4
+    },
+    {
+      "name": "CreateMRUListLazyW",
+      "argCount": 4
+    },
+    {
+      "name": "CreateMRUListW",
+      "argCount": 1
+    },
+    {
+      "name": "CreatePropertySheetPage",
+      "argCount": 1
+    },
+    {
+      "name": "CreatePropertySheetPageA",
+      "argCount": 1
+    },
+    {
+      "name": "CreatePropertySheetPageW",
+      "argCount": 1
+    },
+    {
+      "name": "CreateStatusWindow",
+      "argCount": 4
+    },
+    {
+      "name": "CreateStatusWindowA",
+      "argCount": 4
+    },
+    {
+      "name": "CreateStatusWindowW",
+      "argCount": 4
+    },
+    {
+      "name": "CreateToolbar",
+      "argCount": 8
+    },
+    {
+      "name": "CreateToolbarEx",
+      "argCount": 13
+    },
+    {
+      "name": "CreateUpDownControl",
+      "argCount": 12
+    },
+    {
+      "name": "DefSubclassProc",
+      "argCount": 4
+    },
+    {
+      "name": "DelMRUString",
+      "argCount": 2
+    },
+    {
+      "name": "DestroyPropertySheetPage",
+      "argCount": 1
+    },
+    {
+      "name": "DllGetVersion",
+      "argCount": 1
+    },
+    {
+      "name": "DPA_Clone",
+      "argCount": 2
+    },
+    {
+      "name": "DPA_Create",
+      "argCount": 1
+    },
+    {
+      "name": "DPA_CreateEx",
+      "argCount": 2
+    },
+    {
+      "name": "DPA_DeleteAllPtrs",
+      "argCount": 1
+    },
+    {
+      "name": "DPA_DeletePtr",
+      "argCount": 2
+    },
+    {
+      "name": "DPA_Destroy",
+      "argCount": 1
+    },
+    {
+      "name": "DPA_DestroyCallback",
+      "argCount": 3
+    },
+    {
+      "name": "DPA_EnumCallback",
+      "argCount": 3
+    },
+    {
+      "name": "DPA_GetPtr",
+      "argCount": 2
+    },
+    {
+      "name": "DPA_GetPtrIndex",
+      "argCount": 2
+    },
+    {
+      "name": "DPA_Grow",
+      "argCount": 2
+    },
+    {
+      "name": "DPA_InsertPtr",
+      "argCount": 3
+    },
+    {
+      "name": "DPA_LoadStream",
+      "argCount": 4
+    },
+    {
+      "name": "DPA_Merge",
+      "argCount": 6
+    },
+    {
+      "name": "DPA_SaveStream",
+      "argCount": 4
+    },
+    {
+      "name": "DPA_Search",
+      "argCount": 6
+    },
+    {
+      "name": "DPA_SetPtr",
+      "argCount": 3
+    },
+    {
+      "name": "DPA_Sort",
+      "argCount": 3
+    },
+    {
+      "name": "DrawInsert",
+      "argCount": 3
+    },
+    {
+      "name": "DrawStatusText",
+      "argCount": 4
+    },
+    {
+      "name": "DrawStatusTextA",
+      "argCount": 4
+    },
+    {
+      "name": "DrawStatusTextW",
+      "argCount": 4
+    },
+    {
+      "name": "DrawTextExPrivWrap",
+      "argCount": 6
+    },
+    {
+      "name": "DrawTextWrap",
+      "argCount": 5
+    },
+    {
+      "name": "DSA_Create",
+      "argCount": 2
+    },
+    {
+      "name": "DSA_DeleteAllItems",
+      "argCount": 1
+    },
+    {
+      "name": "DSA_DeleteItem",
+      "argCount": 2
+    },
+    {
+      "name": "DSA_Destroy",
+      "argCount": 1
+    },
+    {
+      "name": "DSA_DestroyCallback",
+      "argCount": 3
+    },
+    {
+      "name": "DSA_EnumCallback",
+      "argCount": 3
+    },
+    {
+      "name": "DSA_GetItem",
+      "argCount": 3
+    },
+    {
+      "name": "DSA_GetItemPtr",
+      "argCount": 2
+    },
+    {
+      "name": "DSA_InsertItem",
+      "argCount": 3
+    },
+    {
+      "name": "DSA_SetItem",
+      "argCount": 3
+    },
+    {
+      "name": "EnumMRUListA",
+      "argCount": 4
+    },
+    {
+      "name": "EnumMRUListW",
+      "argCount": 4
+    },
+    {
+      "name": "ExtTextOutWrap",
+      "argCount": 8
+    },
+    {
+      "name": "FindMRUData",
+      "argCount": 4
+    },
+    {
+      "name": "FindMRUStringA",
+      "argCount": 3
+    },
+    {
+      "name": "FindMRUStringW",
+      "argCount": 3
+    },
+    {
+      "name": "FlatSB_EnableScrollBar",
+      "argCount": 3
+    },
+    {
+      "name": "FlatSB_GetScrollInfo",
+      "argCount": 3
+    },
+    {
+      "name": "FlatSB_GetScrollPos",
+      "argCount": 2
+    },
+    {
+      "name": "FlatSB_GetScrollProp",
+      "argCount": 3
+    },
+    {
+      "name": "FlatSB_GetScrollRange",
+      "argCount": 4
+    },
+    {
+      "name": "FlatSB_SetScrollInfo",
+      "argCount": 4
+    },
+    {
+      "name": "FlatSB_SetScrollPos",
+      "argCount": 4
+    },
+    {
+      "name": "FlatSB_SetScrollProp",
+      "argCount": 4
+    },
+    {
+      "name": "FlatSB_SetScrollRange",
+      "argCount": 5
+    },
+    {
+      "name": "FlatSB_ShowScrollBar",
+      "argCount": 3
+    },
+    {
+      "name": "Free",
+      "argCount": 1
+    },
+    {
+      "name": "FreeMRUList",
+      "argCount": 1
+    },
+    {
+      "name": "GetCharWidthWrap",
+      "argCount": 4
+    },
+    {
+      "name": "GetEffectiveClientRect",
+      "argCount": 3
+    },
+    {
+      "name": "GetMUILanguage",
+      "argCount": 0
+    },
+    {
+      "name": "GetSize",
+      "argCount": 1
+    },
+    {
+      "name": "GetTextExtentPoint32Wrap",
+      "argCount": 4
+    },
+    {
+      "name": "GetTextExtentPointWrap",
+      "argCount": 4
+    },
+    {
+      "name": "GetWindowSubclass",
+      "argCount": 4
+    },
+    {
+      "name": "HIMAGELIST_QueryInterface",
+      "argCount": 3
+    },
+    {
+      "name": "ImageList_Add",
+      "argCount": 3
+    },
+    {
+      "name": "ImageList_AddIcon",
+      "argCount": 2
+    },
+    {
+      "name": "ImageList_AddMasked",
+      "argCount": 3
+    },
+    {
+      "name": "ImageList_BeginDrag",
+      "argCount": 4
+    },
+    {
+      "name": "ImageList_Copy",
+      "argCount": 5
+    },
+    {
+      "name": "ImageList_Create",
+      "argCount": 5
+    },
+    {
+      "name": "ImageList_Destroy",
+      "argCount": 1
+    },
+    {
+      "name": "ImageList_DragEnter",
+      "argCount": 3
+    },
+    {
+      "name": "ImageList_DragLeave",
+      "argCount": 1
+    },
+    {
+      "name": "ImageList_DragMove",
+      "argCount": 2
+    },
+    {
+      "name": "ImageList_DragShowNolock",
+      "argCount": 1
+    },
+    {
+      "name": "ImageList_Draw",
+      "argCount": 6
+    },
+    {
+      "name": "ImageList_DrawEx",
+      "argCount": 10
+    },
+    {
+      "name": "ImageList_DrawIndirect",
+      "argCount": 1
+    },
+    {
+      "name": "ImageList_Duplicate",
+      "argCount": 1
+    },
+    {
+      "name": "ImageList_EndDrag",
+      "argCount": 0
+    },
+    {
+      "name": "ImageList_GetBkColor",
+      "argCount": 1
+    },
+    {
+      "name": "ImageList_GetDragImage",
+      "argCount": 2
+    },
+    {
+      "name": "ImageList_GetFlags",
+      "argCount": 1
+    },
+    {
+      "name": "ImageList_GetIcon",
+      "argCount": 3
+    },
+    {
+      "name": "ImageList_GetIconSize",
+      "argCount": 3
+    },
+    {
+      "name": "ImageList_GetImageCount",
+      "argCount": 1
+    },
+    {
+      "name": "ImageList_GetImageInfo",
+      "argCount": 3
+    },
+    {
+      "name": "ImageList_GetImageRect",
+      "argCount": 3
+    },
+    {
+      "name": "ImageList_LoadImage",
+      "argCount": 7
+    },
+    {
+      "name": "ImageList_LoadImageA",
+      "argCount": 7
+    },
+    {
+      "name": "ImageList_LoadImageW",
+      "argCount": 7
+    },
+    {
+      "name": "ImageList_Merge",
+      "argCount": 6
+    },
+    {
+      "name": "ImageList_Read",
+      "argCount": 1
+    },
+    {
+      "name": "ImageList_Remove",
+      "argCount": 2
+    },
+    {
+      "name": "ImageList_Replace",
+      "argCount": 4
+    },
+    {
+      "name": "ImageList_ReplaceIcon",
+      "argCount": 3
+    },
+    {
+      "name": "ImageList_SetBkColor",
+      "argCount": 2
+    },
+    {
+      "name": "ImageList_SetColorTable",
+      "argCount": 4
+    },
+    {
+      "name": "ImageList_SetDragCursorImage",
+      "argCount": 4
+    },
+    {
+      "name": "ImageList_SetFilter",
+      "argCount": 3
+    },
+    {
+      "name": "ImageList_SetFlags",
+      "argCount": 2
+    },
+    {
+      "name": "ImageList_SetIconSize",
+      "argCount": 3
+    },
+    {
+      "name": "ImageList_SetImageCount",
+      "argCount": 2
+    },
+    {
+      "name": "ImageList_SetOverlayImage",
+      "argCount": 3
+    },
+    {
+      "name": "ImageList_Write",
+      "argCount": 2
+    },
+    {
+      "name": "InitCommonControls",
+      "argCount": 0
+    },
+    {
+      "name": "InitCommonControlsEx",
+      "argCount": 1
+    },
+    {
+      "name": "InitializeFlatSB",
+      "argCount": 1
+    },
+    {
+      "name": "InitMUILanguage",
+      "argCount": 1
+    },
+    {
+      "name": "IntlStrEqWorkerA",
+      "argCount": 4
+    },
+    {
+      "name": "IntlStrEqWorkerW",
+      "argCount": 4
+    },
+    {
+      "name": "LBItemFromPt",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "MakeDragList",
+      "argCount": 1
+    },
+    {
+      "name": "MenuHelp",
+      "argCount": 7
+    },
+    {
+      "name": "MirrorIcon",
+      "argCount": 2
+    },
+    {
+      "name": "ord_10",
+      "argCount": 4
+    },
+    {
+      "name": "ord_11",
+      "argCount": 6
+    },
+    {
+      "name": "ord_13",
+      "argCount": 1
+    },
+    {
+      "name": "ord_14",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_15",
+      "argCount": 3
+    },
+    {
+      "name": "ord_151",
+      "argCount": 1
+    },
+    {
+      "name": "ord_152",
+      "argCount": 1
+    },
+    {
+      "name": "ord_153",
+      "argCount": 2
+    },
+    {
+      "name": "ord_154",
+      "argCount": 4
+    },
+    {
+      "name": "ord_155",
+      "argCount": 3
+    },
+    {
+      "name": "ord_156",
+      "argCount": 2
+    },
+    {
+      "name": "ord_157",
+      "argCount": 4
+    },
+    {
+      "name": "ord_16",
+      "argCount": 12
+    },
+    {
+      "name": "ord_167",
+      "argCount": 3
+    },
+    {
+      "name": "ord_169",
+      "argCount": 4
+    },
+    {
+      "name": "ord_17",
+      "argCount": 0
+    },
+    {
+      "name": "ord_2",
+      "argCount": 7
+    },
+    {
+      "name": "ord_233",
+      "argCount": 3
+    },
+    {
+      "name": "ord_234",
+      "argCount": 2
+    },
+    {
+      "name": "ord_235",
+      "argCount": 3
+    },
+    {
+      "name": "ord_236",
+      "argCount": 2
+    },
+    {
+      "name": "ord_3",
+      "argCount": 3
+    },
+    {
+      "name": "ord_320",
+      "argCount": 2
+    },
+    {
+      "name": "ord_321",
+      "argCount": 1
+    },
+    {
+      "name": "ord_322",
+      "argCount": 3
+    },
+    {
+      "name": "ord_323",
+      "argCount": 2
+    },
+    {
+      "name": "ord_324",
+      "argCount": 3
+    },
+    {
+      "name": "ord_325",
+      "argCount": 3
+    },
+    {
+      "name": "ord_326",
+      "argCount": 2
+    },
+    {
+      "name": "ord_327",
+      "argCount": 1
+    },
+    {
+      "name": "ord_328",
+      "argCount": 1
+    },
+    {
+      "name": "ord_329",
+      "argCount": 1
+    },
+    {
+      "name": "ord_330",
+      "argCount": 2
+    },
+    {
+      "name": "ord_331",
+      "argCount": 2
+    },
+    {
+      "name": "ord_332",
+      "argCount": 2
+    },
+    {
+      "name": "ord_333",
+      "argCount": 2
+    },
+    {
+      "name": "ord_334",
+      "argCount": 3
+    },
+    {
+      "name": "ord_335",
+      "argCount": 3
+    },
+    {
+      "name": "ord_336",
+      "argCount": 2
+    },
+    {
+      "name": "ord_337",
+      "argCount": 1
+    },
+    {
+      "name": "ord_338",
+      "argCount": 3
+    },
+    {
+      "name": "ord_339",
+      "argCount": 6
+    },
+    {
+      "name": "ord_340",
+      "argCount": 2
+    },
+    {
+      "name": "ord_341",
+      "argCount": 4
+    },
+    {
+      "name": "ord_342",
+      "argCount": 5
+    },
+    {
+      "name": "ord_350",
+      "argCount": 2
+    },
+    {
+      "name": "ord_351",
+      "argCount": 3
+    },
+    {
+      "name": "ord_352",
+      "argCount": 3
+    },
+    {
+      "name": "ord_353",
+      "argCount": 3
+    },
+    {
+      "name": "ord_354",
+      "argCount": 2
+    },
+    {
+      "name": "ord_355",
+      "argCount": 2
+    },
+    {
+      "name": "ord_356",
+      "argCount": 2
+    },
+    {
+      "name": "ord_357",
+      "argCount": 1
+    },
+    {
+      "name": "ord_358",
+      "argCount": 2
+    },
+    {
+      "name": "ord_359",
+      "argCount": 3
+    },
+    {
+      "name": "ord_360",
+      "argCount": 3
+    },
+    {
+      "name": "ord_361",
+      "argCount": 3
+    },
+    {
+      "name": "ord_362",
+      "argCount": 2
+    },
+    {
+      "name": "ord_363",
+      "argCount": 2
+    },
+    {
+      "name": "ord_364",
+      "argCount": 2
+    },
+    {
+      "name": "ord_365",
+      "argCount": 1
+    },
+    {
+      "name": "ord_366",
+      "argCount": 2
+    },
+    {
+      "name": "ord_367",
+      "argCount": 2
+    },
+    {
+      "name": "ord_368",
+      "argCount": 3
+    },
+    {
+      "name": "ord_369",
+      "argCount": 3
+    },
+    {
+      "name": "ord_372",
+      "argCount": 3
+    },
+    {
+      "name": "ord_373",
+      "argCount": 3
+    },
+    {
+      "name": "ord_374",
+      "argCount": 2
+    },
+    {
+      "name": "ord_375",
+      "argCount": 2
+    },
+    {
+      "name": "ord_376",
+      "argCount": 4
+    },
+    {
+      "name": "ord_377",
+      "argCount": 4
+    },
+    {
+      "name": "ord_382",
+      "argCount": 1
+    },
+    {
+      "name": "ord_384",
+      "argCount": 2
+    },
+    {
+      "name": "ord_385",
+      "argCount": 3
+    },
+    {
+      "name": "ord_386",
+      "argCount": 3
+    },
+    {
+      "name": "ord_387",
+      "argCount": 3
+    },
+    {
+      "name": "ord_388",
+      "argCount": 3
+    },
+    {
+      "name": "ord_390",
+      "argCount": 4
+    },
+    {
+      "name": "ord_4",
+      "argCount": 3
+    },
+    {
+      "name": "ord_400",
+      "argCount": 1
+    },
+    {
+      "name": "ord_401",
+      "argCount": 2
+    },
+    {
+      "name": "ord_402",
+      "argCount": 3
+    },
+    {
+      "name": "ord_403",
+      "argCount": 4
+    },
+    {
+      "name": "ord_404",
+      "argCount": 4
+    },
+    {
+      "name": "ord_410",
+      "argCount": 4
+    },
+    {
+      "name": "ord_411",
+      "argCount": 4
+    },
+    {
+      "name": "ord_412",
+      "argCount": 3
+    },
+    {
+      "name": "ord_413",
+      "argCount": 4
+    },
+    {
+      "name": "ord_414",
+      "argCount": 2
+    },
+    {
+      "name": "ord_415",
+      "argCount": 5
+    },
+    {
+      "name": "ord_416",
+      "argCount": 6
+    },
+    {
+      "name": "ord_417",
+      "argCount": 8
+    },
+    {
+      "name": "ord_418",
+      "argCount": 4
+    },
+    {
+      "name": "ord_419",
+      "argCount": 4
+    },
+    {
+      "name": "ord_420",
+      "argCount": 4
+    },
+    {
+      "name": "ord_421",
+      "argCount": 5
+    },
+    {
+      "name": "ord_5",
+      "argCount": 4
+    },
+    {
+      "name": "ord_6",
+      "argCount": 4
+    },
+    {
+      "name": "ord_7",
+      "argCount": 8
+    },
+    {
+      "name": "ord_71",
+      "argCount": 1
+    },
+    {
+      "name": "ord_72",
+      "argCount": 2
+    },
+    {
+      "name": "ord_73",
+      "argCount": 1
+    },
+    {
+      "name": "ord_74",
+      "argCount": 1
+    },
+    {
+      "name": "ord_8",
+      "argCount": 5
+    },
+    {
+      "name": "ord_9",
+      "argCount": 4
+    },
+    {
+      "name": "PropertySheet",
+      "argCount": 1
+    },
+    {
+      "name": "PropertySheetA",
+      "argCount": 1
+    },
+    {
+      "name": "PropertySheetW",
+      "argCount": 1
+    },
+    {
+      "name": "ReAlloc",
+      "argCount": 2
+    },
+    {
+      "name": "RegisterClassNameW",
+      "argCount": 1
+    },
+    {
+      "name": "RemoveWindowSubclass",
+      "argCount": 3
+    },
+    {
+      "name": "SendNotify",
+      "argCount": 4
+    },
+    {
+      "name": "SendNotifyEx",
+      "argCount": 5
+    },
+    {
+      "name": "SetPathWordBreakProc",
+      "argCount": 2
+    },
+    {
+      "name": "SetWindowSubclass",
+      "argCount": 4
+    },
+    {
+      "name": "ShowHideMenuCtl",
+      "argCount": 3
+    },
+    {
+      "name": "SmoothScrollWindow",
+      "argCount": 1
+    },
+    {
+      "name": "Str_GetPtrA",
+      "argCount": 3
+    },
+    {
+      "name": "Str_GetPtrW",
+      "argCount": 3
+    },
+    {
+      "name": "Str_SetPtrA",
+      "argCount": 2
+    },
+    {
+      "name": "Str_SetPtrW",
+      "argCount": 2
+    },
+    {
+      "name": "StrChrA",
+      "argCount": 2
+    },
+    {
+      "name": "StrChrIA",
+      "argCount": 2
+    },
+    {
+      "name": "StrChrIW",
+      "argCount": 2
+    },
+    {
+      "name": "StrChrW",
+      "argCount": 2
+    },
+    {
+      "name": "StrCmpNA",
+      "argCount": 3
+    },
+    {
+      "name": "StrCmpNIA",
+      "argCount": 3
+    },
+    {
+      "name": "StrCmpNIW",
+      "argCount": 3
+    },
+    {
+      "name": "StrCmpNW",
+      "argCount": 3
+    },
+    {
+      "name": "StrCSpnA",
+      "argCount": 2
+    },
+    {
+      "name": "StrCSpnIA",
+      "argCount": 2
+    },
+    {
+      "name": "StrCSpnIW",
+      "argCount": 2
+    },
+    {
+      "name": "StrCSpnW",
+      "argCount": 2
+    },
+    {
+      "name": "StrRChrA",
+      "argCount": 3
+    },
+    {
+      "name": "StrRChrIA",
+      "argCount": 3
+    },
+    {
+      "name": "StrRChrIW",
+      "argCount": 3
+    },
+    {
+      "name": "StrRChrW",
+      "argCount": 3
+    },
+    {
+      "name": "StrRStrIA",
+      "argCount": 3
+    },
+    {
+      "name": "StrRStrIW",
+      "argCount": 3
+    },
+    {
+      "name": "StrStrA",
+      "argCount": 2
+    },
+    {
+      "name": "StrStrIA",
+      "argCount": 2
+    },
+    {
+      "name": "StrStrIW",
+      "argCount": 2
+    },
+    {
+      "name": "StrStrW",
+      "argCount": 2
+    },
+    {
+      "name": "StrToIntA",
+      "argCount": 1
+    },
+    {
+      "name": "StrToIntW",
+      "argCount": 1
+    },
+    {
+      "name": "TextOutWrap",
+      "argCount": 5
+    },
+    {
+      "name": "UninitializeFlatSB",
+      "argCount": 1
+    }
+  ]
+}

@@ -1,0 +1,851 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.951Z",
+  "module": "wininet",
+  "functions": [
+    {
+      "name": "CommitUrlCacheEntryA",
+      "argCount": 11,
+      "note": "slot count exceeds parameter count (int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "CommitUrlCacheEntryW",
+      "argCount": 11,
+      "note": "slot count exceeds parameter count (int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "CreateMD5SSOHash",
+      "argCount": 4
+    },
+    {
+      "name": "CreateUrlCacheContainerA",
+      "argCount": 8
+    },
+    {
+      "name": "CreateUrlCacheContainerW",
+      "argCount": 8
+    },
+    {
+      "name": "CreateUrlCacheEntryA",
+      "argCount": 5
+    },
+    {
+      "name": "CreateUrlCacheEntryW",
+      "argCount": 5
+    },
+    {
+      "name": "CreateUrlCacheGroup",
+      "argCount": 2
+    },
+    {
+      "name": "DeleteIE3Cache",
+      "argCount": 4
+    },
+    {
+      "name": "DeleteUrlCacheContainerA",
+      "argCount": 2
+    },
+    {
+      "name": "DeleteUrlCacheContainerW",
+      "argCount": 2
+    },
+    {
+      "name": "DeleteUrlCacheEntry",
+      "argCount": 1
+    },
+    {
+      "name": "DeleteUrlCacheEntryA",
+      "argCount": 1
+    },
+    {
+      "name": "DeleteUrlCacheEntryW",
+      "argCount": 1
+    },
+    {
+      "name": "DeleteUrlCacheGroup",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "DeleteWpadCacheForNetworks",
+      "argCount": 1
+    },
+    {
+      "name": "DetectAutoProxyUrl",
+      "argCount": 3
+    },
+    {
+      "name": "DllInstall",
+      "argCount": 2
+    },
+    {
+      "name": "FindCloseUrlCache",
+      "argCount": 1
+    },
+    {
+      "name": "FindFirstUrlCacheContainerA",
+      "argCount": 4
+    },
+    {
+      "name": "FindFirstUrlCacheContainerW",
+      "argCount": 4
+    },
+    {
+      "name": "FindFirstUrlCacheEntryA",
+      "argCount": 3
+    },
+    {
+      "name": "FindFirstUrlCacheEntryExA",
+      "argCount": 10,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "FindFirstUrlCacheEntryExW",
+      "argCount": 10,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "FindFirstUrlCacheEntryW",
+      "argCount": 3
+    },
+    {
+      "name": "FindFirstUrlCacheGroup",
+      "argCount": 6
+    },
+    {
+      "name": "FindNextUrlCacheContainerA",
+      "argCount": 3
+    },
+    {
+      "name": "FindNextUrlCacheContainerW",
+      "argCount": 3
+    },
+    {
+      "name": "FindNextUrlCacheEntryA",
+      "argCount": 3
+    },
+    {
+      "name": "FindNextUrlCacheEntryExA",
+      "argCount": 6
+    },
+    {
+      "name": "FindNextUrlCacheEntryExW",
+      "argCount": 6
+    },
+    {
+      "name": "FindNextUrlCacheEntryW",
+      "argCount": 3
+    },
+    {
+      "name": "FindNextUrlCacheGroup",
+      "argCount": 3
+    },
+    {
+      "name": "FreeUrlCacheSpaceA",
+      "argCount": 3
+    },
+    {
+      "name": "FreeUrlCacheSpaceW",
+      "argCount": 3
+    },
+    {
+      "name": "FtpCommandA",
+      "argCount": 6
+    },
+    {
+      "name": "FtpCommandW",
+      "argCount": 6
+    },
+    {
+      "name": "FtpCreateDirectoryA",
+      "argCount": 2
+    },
+    {
+      "name": "FtpCreateDirectoryW",
+      "argCount": 2
+    },
+    {
+      "name": "FtpDeleteFileA",
+      "argCount": 2
+    },
+    {
+      "name": "FtpDeleteFileW",
+      "argCount": 2
+    },
+    {
+      "name": "FtpFindFirstFileA",
+      "argCount": 5
+    },
+    {
+      "name": "FtpFindFirstFileW",
+      "argCount": 5
+    },
+    {
+      "name": "FtpGetCurrentDirectoryA",
+      "argCount": 3
+    },
+    {
+      "name": "FtpGetCurrentDirectoryW",
+      "argCount": 3
+    },
+    {
+      "name": "FtpGetFileA",
+      "argCount": 7
+    },
+    {
+      "name": "FtpGetFileSize",
+      "argCount": 2
+    },
+    {
+      "name": "FtpGetFileW",
+      "argCount": 7
+    },
+    {
+      "name": "FtpOpenFileA",
+      "argCount": 5
+    },
+    {
+      "name": "FtpOpenFileW",
+      "argCount": 5
+    },
+    {
+      "name": "FtpPutFileA",
+      "argCount": 5
+    },
+    {
+      "name": "FtpPutFileW",
+      "argCount": 5
+    },
+    {
+      "name": "FtpRemoveDirectoryA",
+      "argCount": 2
+    },
+    {
+      "name": "FtpRemoveDirectoryW",
+      "argCount": 2
+    },
+    {
+      "name": "FtpRenameFileA",
+      "argCount": 3
+    },
+    {
+      "name": "FtpRenameFileW",
+      "argCount": 3
+    },
+    {
+      "name": "FtpSetCurrentDirectoryA",
+      "argCount": 2
+    },
+    {
+      "name": "FtpSetCurrentDirectoryW",
+      "argCount": 2
+    },
+    {
+      "name": "GetDiskInfoA",
+      "argCount": 4
+    },
+    {
+      "name": "GetUrlCacheConfigInfoA",
+      "argCount": 3
+    },
+    {
+      "name": "GetUrlCacheConfigInfoW",
+      "argCount": 3
+    },
+    {
+      "name": "GetUrlCacheEntryInfoA",
+      "argCount": 3
+    },
+    {
+      "name": "GetUrlCacheEntryInfoExA",
+      "argCount": 7
+    },
+    {
+      "name": "GetUrlCacheEntryInfoExW",
+      "argCount": 7
+    },
+    {
+      "name": "GetUrlCacheEntryInfoW",
+      "argCount": 3
+    },
+    {
+      "name": "GetUrlCacheGroupAttributeA",
+      "argCount": 7,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "GetUrlCacheGroupAttributeW",
+      "argCount": 7,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "GopherCreateLocatorA",
+      "argCount": 7
+    },
+    {
+      "name": "GopherCreateLocatorW",
+      "argCount": 7
+    },
+    {
+      "name": "GopherFindFirstFileA",
+      "argCount": 6
+    },
+    {
+      "name": "GopherFindFirstFileW",
+      "argCount": 6
+    },
+    {
+      "name": "GopherGetAttributeA",
+      "argCount": 8
+    },
+    {
+      "name": "GopherGetAttributeW",
+      "argCount": 8
+    },
+    {
+      "name": "GopherGetLocatorTypeA",
+      "argCount": 2
+    },
+    {
+      "name": "GopherGetLocatorTypeW",
+      "argCount": 2
+    },
+    {
+      "name": "GopherOpenFileA",
+      "argCount": 5
+    },
+    {
+      "name": "GopherOpenFileW",
+      "argCount": 5
+    },
+    {
+      "name": "HttpAddRequestHeadersA",
+      "argCount": 4
+    },
+    {
+      "name": "HttpAddRequestHeadersW",
+      "argCount": 4
+    },
+    {
+      "name": "HttpEndRequestA",
+      "argCount": 4
+    },
+    {
+      "name": "HttpEndRequestW",
+      "argCount": 4
+    },
+    {
+      "name": "HttpOpenRequestA",
+      "argCount": 8
+    },
+    {
+      "name": "HttpOpenRequestW",
+      "argCount": 8
+    },
+    {
+      "name": "HttpQueryInfoA",
+      "argCount": 5
+    },
+    {
+      "name": "HttpQueryInfoW",
+      "argCount": 5
+    },
+    {
+      "name": "HttpSendRequestA",
+      "argCount": 5
+    },
+    {
+      "name": "HttpSendRequestExA",
+      "argCount": 5
+    },
+    {
+      "name": "HttpSendRequestExW",
+      "argCount": 5
+    },
+    {
+      "name": "HttpSendRequestW",
+      "argCount": 5
+    },
+    {
+      "name": "IncrementUrlCacheHeaderData",
+      "argCount": 2
+    },
+    {
+      "name": "InternetAttemptConnect",
+      "argCount": 1
+    },
+    {
+      "name": "InternetAutodial",
+      "argCount": 2
+    },
+    {
+      "name": "InternetAutodialHangup",
+      "argCount": 1
+    },
+    {
+      "name": "InternetCanonicalizeUrlA",
+      "argCount": 4
+    },
+    {
+      "name": "InternetCanonicalizeUrlW",
+      "argCount": 4
+    },
+    {
+      "name": "InternetCheckConnectionA",
+      "argCount": 3
+    },
+    {
+      "name": "InternetCheckConnectionW",
+      "argCount": 3
+    },
+    {
+      "name": "InternetClearAllPerSiteCookieDecisions",
+      "argCount": 0
+    },
+    {
+      "name": "InternetCloseHandle",
+      "argCount": 1
+    },
+    {
+      "name": "InternetCombineUrlA",
+      "argCount": 5
+    },
+    {
+      "name": "InternetCombineUrlW",
+      "argCount": 5
+    },
+    {
+      "name": "InternetConfirmZoneCrossing",
+      "argCount": 4
+    },
+    {
+      "name": "InternetConfirmZoneCrossingA",
+      "argCount": 4
+    },
+    {
+      "name": "InternetConfirmZoneCrossingW",
+      "argCount": 4
+    },
+    {
+      "name": "InternetConnectA",
+      "argCount": 8
+    },
+    {
+      "name": "InternetConnectW",
+      "argCount": 8
+    },
+    {
+      "name": "InternetCrackUrlA",
+      "argCount": 4
+    },
+    {
+      "name": "InternetCrackUrlW",
+      "argCount": 4
+    },
+    {
+      "name": "InternetCreateUrlA",
+      "argCount": 4
+    },
+    {
+      "name": "InternetCreateUrlW",
+      "argCount": 4
+    },
+    {
+      "name": "InternetDial",
+      "argCount": 5
+    },
+    {
+      "name": "InternetDialA",
+      "argCount": 5
+    },
+    {
+      "name": "InternetDialW",
+      "argCount": 5
+    },
+    {
+      "name": "InternetEnumPerSiteCookieDecisionA",
+      "argCount": 4
+    },
+    {
+      "name": "InternetEnumPerSiteCookieDecisionW",
+      "argCount": 4
+    },
+    {
+      "name": "InternetErrorDlg",
+      "argCount": 5
+    },
+    {
+      "name": "InternetFindNextFileA",
+      "argCount": 2
+    },
+    {
+      "name": "InternetFindNextFileW",
+      "argCount": 2
+    },
+    {
+      "name": "InternetGetConnectedState",
+      "argCount": 2
+    },
+    {
+      "name": "InternetGetConnectedStateEx",
+      "argCount": 4
+    },
+    {
+      "name": "InternetGetConnectedStateExA",
+      "argCount": 4
+    },
+    {
+      "name": "InternetGetConnectedStateExW",
+      "argCount": 4
+    },
+    {
+      "name": "InternetGetCookieA",
+      "argCount": 4
+    },
+    {
+      "name": "InternetGetCookieExA",
+      "argCount": 6
+    },
+    {
+      "name": "InternetGetCookieExW",
+      "argCount": 6
+    },
+    {
+      "name": "InternetGetCookieW",
+      "argCount": 4
+    },
+    {
+      "name": "InternetGetLastResponseInfoA",
+      "argCount": 3
+    },
+    {
+      "name": "InternetGetLastResponseInfoW",
+      "argCount": 3
+    },
+    {
+      "name": "InternetGetPerSiteCookieDecisionA",
+      "argCount": 2
+    },
+    {
+      "name": "InternetGetPerSiteCookieDecisionW",
+      "argCount": 2
+    },
+    {
+      "name": "InternetGetSecurityInfoByURL",
+      "argCount": 3
+    },
+    {
+      "name": "InternetGetSecurityInfoByURLA",
+      "argCount": 3
+    },
+    {
+      "name": "InternetGetSecurityInfoByURLW",
+      "argCount": 3
+    },
+    {
+      "name": "InternetGoOnline",
+      "argCount": 3
+    },
+    {
+      "name": "InternetGoOnlineA",
+      "argCount": 3
+    },
+    {
+      "name": "InternetGoOnlineW",
+      "argCount": 3
+    },
+    {
+      "name": "InternetHangUp",
+      "argCount": 2
+    },
+    {
+      "name": "InternetInitializeAutoProxyDll",
+      "argCount": 1
+    },
+    {
+      "name": "InternetLockRequestFile",
+      "argCount": 2
+    },
+    {
+      "name": "InternetOpenA",
+      "argCount": 5
+    },
+    {
+      "name": "InternetOpenUrlA",
+      "argCount": 6
+    },
+    {
+      "name": "InternetOpenUrlW",
+      "argCount": 6
+    },
+    {
+      "name": "InternetOpenW",
+      "argCount": 5
+    },
+    {
+      "name": "InternetQueryDataAvailable",
+      "argCount": 4
+    },
+    {
+      "name": "InternetQueryFortezzaStatus",
+      "argCount": 2
+    },
+    {
+      "name": "InternetQueryOptionA",
+      "argCount": 4
+    },
+    {
+      "name": "InternetQueryOptionW",
+      "argCount": 4
+    },
+    {
+      "name": "InternetReadFile",
+      "argCount": 4
+    },
+    {
+      "name": "InternetReadFileExA",
+      "argCount": 4
+    },
+    {
+      "name": "InternetReadFileExW",
+      "argCount": 4
+    },
+    {
+      "name": "InternetSetCookieA",
+      "argCount": 3
+    },
+    {
+      "name": "InternetSetCookieExA",
+      "argCount": 5
+    },
+    {
+      "name": "InternetSetCookieExW",
+      "argCount": 5
+    },
+    {
+      "name": "InternetSetCookieW",
+      "argCount": 3
+    },
+    {
+      "name": "InternetSetFilePointer",
+      "argCount": 5
+    },
+    {
+      "name": "InternetSetOptionA",
+      "argCount": 4
+    },
+    {
+      "name": "InternetSetOptionExA",
+      "argCount": 5
+    },
+    {
+      "name": "InternetSetOptionExW",
+      "argCount": 5
+    },
+    {
+      "name": "InternetSetOptionW",
+      "argCount": 4
+    },
+    {
+      "name": "InternetSetPerSiteCookieDecisionA",
+      "argCount": 2
+    },
+    {
+      "name": "InternetSetPerSiteCookieDecisionW",
+      "argCount": 2
+    },
+    {
+      "name": "InternetSetStatusCallback",
+      "argCount": 2
+    },
+    {
+      "name": "InternetSetStatusCallbackA",
+      "argCount": 2
+    },
+    {
+      "name": "InternetSetStatusCallbackW",
+      "argCount": 2
+    },
+    {
+      "name": "InternetShowSecurityInfoByURL",
+      "argCount": 2
+    },
+    {
+      "name": "InternetShowSecurityInfoByURLA",
+      "argCount": 2
+    },
+    {
+      "name": "InternetShowSecurityInfoByURLW",
+      "argCount": 2
+    },
+    {
+      "name": "InternetTimeFromSystemTime",
+      "argCount": 4
+    },
+    {
+      "name": "InternetTimeFromSystemTimeA",
+      "argCount": 4
+    },
+    {
+      "name": "InternetTimeFromSystemTimeW",
+      "argCount": 4
+    },
+    {
+      "name": "InternetTimeToSystemTime",
+      "argCount": 3
+    },
+    {
+      "name": "InternetTimeToSystemTimeA",
+      "argCount": 3
+    },
+    {
+      "name": "InternetTimeToSystemTimeW",
+      "argCount": 3
+    },
+    {
+      "name": "InternetUnlockRequestFile",
+      "argCount": 1
+    },
+    {
+      "name": "InternetWriteFile",
+      "argCount": 4
+    },
+    {
+      "name": "IsDomainLegalCookieDomainW",
+      "argCount": 2
+    },
+    {
+      "name": "IsHostInProxyBypassList",
+      "argCount": 3
+    },
+    {
+      "name": "IsUrlCacheEntryExpiredA",
+      "argCount": 3
+    },
+    {
+      "name": "IsUrlCacheEntryExpiredW",
+      "argCount": 3
+    },
+    {
+      "name": "LoadUrlCacheContent",
+      "argCount": 0
+    },
+    {
+      "name": "ord_102",
+      "argCount": 4
+    },
+    {
+      "name": "ord_117",
+      "argCount": 2
+    },
+    {
+      "name": "ParseX509EncodedCertificateForListBoxEntry",
+      "argCount": 4
+    },
+    {
+      "name": "PrivacyGetZonePreferenceW",
+      "argCount": 5
+    },
+    {
+      "name": "PrivacySetZonePreferenceW",
+      "argCount": 4
+    },
+    {
+      "name": "ReadUrlCacheEntryStream",
+      "argCount": 5
+    },
+    {
+      "name": "RegisterUrlCacheNotification",
+      "argCount": 6
+    },
+    {
+      "name": "ResumeSuspendedDownload",
+      "argCount": 2
+    },
+    {
+      "name": "RetrieveUrlCacheEntryFileA",
+      "argCount": 4
+    },
+    {
+      "name": "RetrieveUrlCacheEntryFileW",
+      "argCount": 4
+    },
+    {
+      "name": "RetrieveUrlCacheEntryStreamA",
+      "argCount": 5
+    },
+    {
+      "name": "RetrieveUrlCacheEntryStreamW",
+      "argCount": 5
+    },
+    {
+      "name": "RunOnceUrlCache",
+      "argCount": 4
+    },
+    {
+      "name": "SetUrlCacheConfigInfoA",
+      "argCount": 2
+    },
+    {
+      "name": "SetUrlCacheConfigInfoW",
+      "argCount": 2
+    },
+    {
+      "name": "SetUrlCacheEntryGroup",
+      "argCount": 7,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SetUrlCacheEntryGroupA",
+      "argCount": 7,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SetUrlCacheEntryGroupW",
+      "argCount": 7,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SetUrlCacheEntryInfoA",
+      "argCount": 3
+    },
+    {
+      "name": "SetUrlCacheEntryInfoW",
+      "argCount": 3
+    },
+    {
+      "name": "SetUrlCacheGroupAttributeA",
+      "argCount": 6,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SetUrlCacheGroupAttributeW",
+      "argCount": 6,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ShowClientAuthCerts",
+      "argCount": 1
+    },
+    {
+      "name": "ShowX509EncodedCertificate",
+      "argCount": 3
+    },
+    {
+      "name": "UnlockUrlCacheEntryFile",
+      "argCount": 2
+    },
+    {
+      "name": "UnlockUrlCacheEntryFileA",
+      "argCount": 2
+    },
+    {
+      "name": "UnlockUrlCacheEntryFileW",
+      "argCount": 2
+    },
+    {
+      "name": "UnlockUrlCacheEntryStream",
+      "argCount": 2
+    }
+  ]
+}

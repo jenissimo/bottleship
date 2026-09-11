@@ -1,0 +1,4560 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.942Z",
+  "module": "shlwapi",
+  "functions": [
+    {
+      "name": "_SHGetInstanceExplorer",
+      "argCount": 1
+    },
+    {
+      "name": "AppendMenuWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "AssocCreate",
+      "argCount": 3
+    },
+    {
+      "name": "AssocGetPerceivedType",
+      "argCount": 4
+    },
+    {
+      "name": "AssocIsDangerous",
+      "argCount": 1
+    },
+    {
+      "name": "AssocQueryKeyA",
+      "argCount": 5
+    },
+    {
+      "name": "AssocQueryKeyW",
+      "argCount": 5
+    },
+    {
+      "name": "AssocQueryStringA",
+      "argCount": 6
+    },
+    {
+      "name": "AssocQueryStringByKeyA",
+      "argCount": 6
+    },
+    {
+      "name": "AssocQueryStringByKeyW",
+      "argCount": 6
+    },
+    {
+      "name": "AssocQueryStringW",
+      "argCount": 6
+    },
+    {
+      "name": "CallMsgFilterWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "CallWindowProcWrapW",
+      "argCount": 5
+    },
+    {
+      "name": "CharLowerBuffWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "CharLowerWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "CharNextWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "CharPrevWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "CharToOemWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "CharUpperBuffWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "CharUpperWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "ChrCmpIA",
+      "argCount": 2
+    },
+    {
+      "name": "ChrCmpIW",
+      "argCount": 2
+    },
+    {
+      "name": "CLSIDFromProgIDWrap",
+      "argCount": 2
+    },
+    {
+      "name": "CLSIDFromStringWrap",
+      "argCount": 2
+    },
+    {
+      "name": "ColorAdjustLuma",
+      "argCount": 3
+    },
+    {
+      "name": "ColorHLSToRGB",
+      "argCount": 3
+    },
+    {
+      "name": "ColorRGBToHLS",
+      "argCount": 4
+    },
+    {
+      "name": "CompareStringAltW",
+      "argCount": 6
+    },
+    {
+      "name": "CompareStringWrapW",
+      "argCount": 6
+    },
+    {
+      "name": "ConnectToConnectionPoint",
+      "argCount": 6
+    },
+    {
+      "name": "CopyAcceleratorTableWrapW",
+      "argCount": 3
+    },
+    {
+      "name": "CopyFileWrapW",
+      "argCount": 3
+    },
+    {
+      "name": "CreateAcceleratorTableWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "CreateAllAccessSecurityAttributes",
+      "argCount": 3
+    },
+    {
+      "name": "CreateColorSpaceWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "CreateDCWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "CreateDialogIndirectParamWrapW",
+      "argCount": 5
+    },
+    {
+      "name": "CreateDialogParamWrapW",
+      "argCount": 5
+    },
+    {
+      "name": "CreateDirectoryWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "CreateEventWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "CreateFileWrapW",
+      "argCount": 7
+    },
+    {
+      "name": "CreateFontIndirectWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "CreateFontWrapW",
+      "argCount": 14
+    },
+    {
+      "name": "CreateICWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "CreateMetaFileWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "CreateMutexWrapW",
+      "argCount": 3
+    },
+    {
+      "name": "CreateProcessWrapW",
+      "argCount": 10
+    },
+    {
+      "name": "CreateSemaphoreWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "CreateWindowExWrapW",
+      "argCount": 12
+    },
+    {
+      "name": "DdeCreateStringHandleWrapW",
+      "argCount": 3
+    },
+    {
+      "name": "DdeInitializeWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "DdeQueryStringWrapW",
+      "argCount": 5
+    },
+    {
+      "name": "DefWindowProcWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "DelayLoadFailureHook",
+      "argCount": 2
+    },
+    {
+      "name": "DeleteFileWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "DeleteMenuWrap",
+      "argCount": 3
+    },
+    {
+      "name": "DestroyMenuWrap",
+      "argCount": 1
+    },
+    {
+      "name": "DialogBoxIndirectParamWrapW",
+      "argCount": 5
+    },
+    {
+      "name": "DialogBoxParamWrapW",
+      "argCount": 5
+    },
+    {
+      "name": "DispatchMessageWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "DllGetVersion",
+      "argCount": 1
+    },
+    {
+      "name": "DoesStringRoundTripA",
+      "argCount": 3
+    },
+    {
+      "name": "DoesStringRoundTripW",
+      "argCount": 3
+    },
+    {
+      "name": "DragQueryFileWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "DrawTextExWrapW",
+      "argCount": 6
+    },
+    {
+      "name": "DrawTextWrapW",
+      "argCount": 5
+    },
+    {
+      "name": "EndDialogWrap",
+      "argCount": 2
+    },
+    {
+      "name": "EnumFontFamiliesExWrapW",
+      "argCount": 5
+    },
+    {
+      "name": "EnumFontFamiliesWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "EnumResourceNamesWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "ExpandEnvironmentStringsWrapW",
+      "argCount": 3
+    },
+    {
+      "name": "ExtractIconExWrapW",
+      "argCount": 5
+    },
+    {
+      "name": "ExtractIconWrapW",
+      "argCount": 3
+    },
+    {
+      "name": "ExtTextOutWrapW",
+      "argCount": 8
+    },
+    {
+      "name": "FDSA_DeleteItem",
+      "argCount": 2
+    },
+    {
+      "name": "FDSA_Destroy",
+      "argCount": 1
+    },
+    {
+      "name": "FDSA_Initialize",
+      "argCount": 5
+    },
+    {
+      "name": "FDSA_InsertItem",
+      "argCount": 3
+    },
+    {
+      "name": "FindFirstFileWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "FindNextFileWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "FindResourceWrapW",
+      "argCount": 3
+    },
+    {
+      "name": "FindWindowExWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "FindWindowWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "FixSlashesAndColonW",
+      "argCount": 1
+    },
+    {
+      "name": "FormatMessageWrapW",
+      "argCount": 7
+    },
+    {
+      "name": "GetAcceptLanguagesA",
+      "argCount": 2
+    },
+    {
+      "name": "GetAcceptLanguagesW",
+      "argCount": 2
+    },
+    {
+      "name": "GetCharacterPlacementWrapW",
+      "argCount": 6
+    },
+    {
+      "name": "GetCharWidth32WrapW",
+      "argCount": 4
+    },
+    {
+      "name": "GetClassInfoExWrapW",
+      "argCount": 3
+    },
+    {
+      "name": "GetClassInfoWrapW",
+      "argCount": 3
+    },
+    {
+      "name": "GetClassLongWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "GetClassNameWrapW",
+      "argCount": 3
+    },
+    {
+      "name": "GetClipboardFormatNameWrapW",
+      "argCount": 3
+    },
+    {
+      "name": "GetCurrentDirectoryWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "GetDateFormatWrapW",
+      "argCount": 6
+    },
+    {
+      "name": "GetDlgItemTextWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "GetEnvironmentVariableWrapW",
+      "argCount": 3
+    },
+    {
+      "name": "GetFileAttributesWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "GetFileVersionInfoSizeWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "GetFileVersionInfoWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "GetFullPathNameWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "GetLocaleInfoWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "GetLongPathNameWrapA",
+      "argCount": 3
+    },
+    {
+      "name": "GetLongPathNameWrapW",
+      "argCount": 3
+    },
+    {
+      "name": "GetMenuItemInfoWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "GetMenuPosFromID",
+      "argCount": 2
+    },
+    {
+      "name": "GetMenuStringWrapW",
+      "argCount": 5
+    },
+    {
+      "name": "GetMessageWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "GetMIMETypeSubKeyA",
+      "argCount": 3
+    },
+    {
+      "name": "GetMIMETypeSubKeyW",
+      "argCount": 3
+    },
+    {
+      "name": "GetModuleFileNameWrapW",
+      "argCount": 3
+    },
+    {
+      "name": "GetModuleHandleWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "GetNumberFormatWrapW",
+      "argCount": 6
+    },
+    {
+      "name": "GetObjectWrapW",
+      "argCount": 3
+    },
+    {
+      "name": "GetOpenFileNameWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "GetPerfTime",
+      "argCount": 0
+    },
+    {
+      "name": "GetPrivateProfileIntWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "GetPrivateProfileStringWrapW",
+      "argCount": 6
+    },
+    {
+      "name": "GetPrivateProfileStructWrapW",
+      "argCount": 5
+    },
+    {
+      "name": "GetProfileStringWrapW",
+      "argCount": 5
+    },
+    {
+      "name": "GetPropWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "GetSaveFileNameWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "GetShellSecurityDescriptor",
+      "argCount": 2
+    },
+    {
+      "name": "GetShortPathNameWrapW",
+      "argCount": 3
+    },
+    {
+      "name": "GetStringType3ExW",
+      "argCount": 3
+    },
+    {
+      "name": "GetStringTypeExWrapW",
+      "argCount": 5
+    },
+    {
+      "name": "GetSystemDirectoryWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "GetTempFileNameWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "GetTempPathWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "GetTextExtentPoint32WrapW",
+      "argCount": 4
+    },
+    {
+      "name": "GetTextFaceWrapW",
+      "argCount": 3
+    },
+    {
+      "name": "GetTextMetricsWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "GetTimeFormatWrapW",
+      "argCount": 6
+    },
+    {
+      "name": "GetUIVersion",
+      "argCount": 0
+    },
+    {
+      "name": "GetUserNameWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "GetWindowLongWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "GetWindowsDirectoryWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "GetWindowTextLengthWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "GetWindowTextWrapW",
+      "argCount": 3
+    },
+    {
+      "name": "GlobalAddAtomWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "GlobalFindAtomWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "GUIDFromStringA",
+      "argCount": 2
+    },
+    {
+      "name": "GUIDFromStringW",
+      "argCount": 2
+    },
+    {
+      "name": "HashData",
+      "argCount": 4
+    },
+    {
+      "name": "IConnectionPoint_InvokeWithCancel",
+      "argCount": 5
+    },
+    {
+      "name": "IConnectionPoint_OnChanged",
+      "argCount": 2
+    },
+    {
+      "name": "IConnectionPoint_SimpleInvoke",
+      "argCount": 3
+    },
+    {
+      "name": "InsertMenuItemWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "InsertMenuWrapW",
+      "argCount": 5
+    },
+    {
+      "name": "IntlStrEqWorkerA",
+      "argCount": 4
+    },
+    {
+      "name": "IntlStrEqWorkerW",
+      "argCount": 4
+    },
+    {
+      "name": "IsBadStringPtrWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "IsCharAlphaNumericWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "IsCharAlphaWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "IsCharBlankW",
+      "argCount": 1
+    },
+    {
+      "name": "IsCharCntrlW",
+      "argCount": 1
+    },
+    {
+      "name": "IsCharDigitW",
+      "argCount": 1
+    },
+    {
+      "name": "IsCharLowerWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "IsCharPunctW",
+      "argCount": 1
+    },
+    {
+      "name": "IsCharSpaceA",
+      "argCount": 1
+    },
+    {
+      "name": "IsCharSpaceW",
+      "argCount": 1
+    },
+    {
+      "name": "IsCharUpperWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "IsCharXDigitW",
+      "argCount": 1
+    },
+    {
+      "name": "IsDialogMessageWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "IShellFolder_EnumObjects",
+      "argCount": 4
+    },
+    {
+      "name": "IsInternetESCEnabled",
+      "argCount": 0
+    },
+    {
+      "name": "IsOS",
+      "argCount": 1
+    },
+    {
+      "name": "IsQSForward",
+      "argCount": 3
+    },
+    {
+      "name": "IStream_Read",
+      "argCount": 3
+    },
+    {
+      "name": "IStream_Reset",
+      "argCount": 1
+    },
+    {
+      "name": "IStream_Size",
+      "argCount": 2
+    },
+    {
+      "name": "IStream_Write",
+      "argCount": 3
+    },
+    {
+      "name": "IUnknown_AtomicRelease",
+      "argCount": 1
+    },
+    {
+      "name": "IUnknown_CPContainerOnChanged",
+      "argCount": 2
+    },
+    {
+      "name": "IUnknown_EnableModeless",
+      "argCount": 2
+    },
+    {
+      "name": "IUnknown_Exec",
+      "argCount": 6
+    },
+    {
+      "name": "IUnknown_GetClassID",
+      "argCount": 2
+    },
+    {
+      "name": "IUnknown_GetSite",
+      "argCount": 3
+    },
+    {
+      "name": "IUnknown_GetWindow",
+      "argCount": 2
+    },
+    {
+      "name": "IUnknown_HandleIRestrict",
+      "argCount": 5
+    },
+    {
+      "name": "IUnknown_HasFocusIO",
+      "argCount": 1
+    },
+    {
+      "name": "IUnknown_OnFocusChangeIS",
+      "argCount": 3
+    },
+    {
+      "name": "IUnknown_OnFocusOCS",
+      "argCount": 2
+    },
+    {
+      "name": "IUnknown_ProfferService",
+      "argCount": 4
+    },
+    {
+      "name": "IUnknown_QueryService",
+      "argCount": 4
+    },
+    {
+      "name": "IUnknown_QueryServiceExec",
+      "argCount": 7
+    },
+    {
+      "name": "IUnknown_QueryServiceForWebBrowserApp",
+      "argCount": 3
+    },
+    {
+      "name": "IUnknown_QueryStatus",
+      "argCount": 5
+    },
+    {
+      "name": "IUnknown_Set",
+      "argCount": 2
+    },
+    {
+      "name": "IUnknown_SetOwner",
+      "argCount": 2
+    },
+    {
+      "name": "IUnknown_SetSite",
+      "argCount": 2
+    },
+    {
+      "name": "IUnknown_TranslateAcceleratorIO",
+      "argCount": 2
+    },
+    {
+      "name": "IUnknown_TranslateAcceleratorOCS",
+      "argCount": 3
+    },
+    {
+      "name": "IUnknown_UIActivateIO",
+      "argCount": 3
+    },
+    {
+      "name": "LoadAcceleratorsWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "LoadBitmapWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "LoadCursorWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "LoadIconWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "LoadImageWrapW",
+      "argCount": 6
+    },
+    {
+      "name": "LoadLibraryExWrapW",
+      "argCount": 3
+    },
+    {
+      "name": "LoadLibraryWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "LoadMenuWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "LoadStringWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "MayExecForward",
+      "argCount": 7
+    },
+    {
+      "name": "MayQSForward",
+      "argCount": 6
+    },
+    {
+      "name": "MessageBoxIndirectWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "MessageBoxWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "MIME_GetExtensionA",
+      "argCount": 3
+    },
+    {
+      "name": "MIME_GetExtensionW",
+      "argCount": 3
+    },
+    {
+      "name": "MLBuildResURLA",
+      "argCount": 6
+    },
+    {
+      "name": "MLBuildResURLW",
+      "argCount": 6
+    },
+    {
+      "name": "MLClearMLHInstance",
+      "argCount": 1
+    },
+    {
+      "name": "MLFreeLibrary",
+      "argCount": 1
+    },
+    {
+      "name": "MLGetUILanguage",
+      "argCount": 0
+    },
+    {
+      "name": "MLIsMLHInstance",
+      "argCount": 1
+    },
+    {
+      "name": "MLLoadLibraryA",
+      "argCount": 3
+    },
+    {
+      "name": "MLLoadLibraryW",
+      "argCount": 3
+    },
+    {
+      "name": "MLSetMLHInstance",
+      "argCount": 2
+    },
+    {
+      "name": "ModifyMenuWrapW",
+      "argCount": 5
+    },
+    {
+      "name": "MoveFileWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "OemToCharWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "OpenEventWrapW",
+      "argCount": 3
+    },
+    {
+      "name": "ord_1",
+      "argCount": 2
+    },
+    {
+      "name": "ord_10",
+      "argCount": 2
+    },
+    {
+      "name": "ord_100",
+      "argCount": 2
+    },
+    {
+      "name": "ord_101",
+      "argCount": 2
+    },
+    {
+      "name": "ord_102",
+      "argCount": 2
+    },
+    {
+      "name": "ord_103",
+      "argCount": 2
+    },
+    {
+      "name": "ord_104",
+      "argCount": 6
+    },
+    {
+      "name": "ord_105",
+      "argCount": 3
+    },
+    {
+      "name": "ord_106",
+      "argCount": 2
+    },
+    {
+      "name": "ord_107",
+      "argCount": 4
+    },
+    {
+      "name": "ord_108",
+      "argCount": 1
+    },
+    {
+      "name": "ord_109",
+      "argCount": 5
+    },
+    {
+      "name": "ord_11",
+      "argCount": 5
+    },
+    {
+      "name": "ord_110",
+      "argCount": 4
+    },
+    {
+      "name": "ord_111",
+      "argCount": 6
+    },
+    {
+      "name": "ord_112",
+      "argCount": 3
+    },
+    {
+      "name": "ord_113",
+      "argCount": 2
+    },
+    {
+      "name": "ord_114",
+      "argCount": 2
+    },
+    {
+      "name": "ord_115",
+      "argCount": 1
+    },
+    {
+      "name": "ord_116",
+      "argCount": 5
+    },
+    {
+      "name": "ord_117",
+      "argCount": 4
+    },
+    {
+      "name": "ord_118",
+      "argCount": 4
+    },
+    {
+      "name": "ord_119",
+      "argCount": 3
+    },
+    {
+      "name": "ord_12",
+      "argCount": 2
+    },
+    {
+      "name": "ord_120",
+      "argCount": 9
+    },
+    {
+      "name": "ord_121",
+      "argCount": 2
+    },
+    {
+      "name": "ord_122",
+      "argCount": 4
+    },
+    {
+      "name": "ord_123",
+      "argCount": 8
+    },
+    {
+      "name": "ord_124",
+      "argCount": 3
+    },
+    {
+      "name": "ord_125",
+      "argCount": 5
+    },
+    {
+      "name": "ord_126",
+      "argCount": 12
+    },
+    {
+      "name": "ord_127",
+      "argCount": 4
+    },
+    {
+      "name": "ord_128",
+      "argCount": 6
+    },
+    {
+      "name": "ord_129",
+      "argCount": 5
+    },
+    {
+      "name": "ord_13",
+      "argCount": 2
+    },
+    {
+      "name": "ord_130",
+      "argCount": 6
+    },
+    {
+      "name": "ord_131",
+      "argCount": 1
+    },
+    {
+      "name": "ord_132",
+      "argCount": 1
+    },
+    {
+      "name": "ord_133",
+      "argCount": 1
+    },
+    {
+      "name": "ord_134",
+      "argCount": 2
+    },
+    {
+      "name": "ord_135",
+      "argCount": 5
+    },
+    {
+      "name": "ord_136",
+      "argCount": 4
+    },
+    {
+      "name": "ord_137",
+      "argCount": 1
+    },
+    {
+      "name": "ord_138",
+      "argCount": 3
+    },
+    {
+      "name": "ord_139",
+      "argCount": 4
+    },
+    {
+      "name": "ord_14",
+      "argCount": 2
+    },
+    {
+      "name": "ord_140",
+      "argCount": 3
+    },
+    {
+      "name": "ord_141",
+      "argCount": 3
+    },
+    {
+      "name": "ord_142",
+      "argCount": 4
+    },
+    {
+      "name": "ord_143",
+      "argCount": 2
+    },
+    {
+      "name": "ord_144",
+      "argCount": 2
+    },
+    {
+      "name": "ord_145",
+      "argCount": 4
+    },
+    {
+      "name": "ord_146",
+      "argCount": 3
+    },
+    {
+      "name": "ord_147",
+      "argCount": 2
+    },
+    {
+      "name": "ord_148",
+      "argCount": 1
+    },
+    {
+      "name": "ord_149",
+      "argCount": 4
+    },
+    {
+      "name": "ord_15",
+      "argCount": 2
+    },
+    {
+      "name": "ord_150",
+      "argCount": 3
+    },
+    {
+      "name": "ord_151",
+      "argCount": 3
+    },
+    {
+      "name": "ord_152",
+      "argCount": 3
+    },
+    {
+      "name": "ord_153",
+      "argCount": 3
+    },
+    {
+      "name": "ord_154",
+      "argCount": 3
+    },
+    {
+      "name": "ord_155",
+      "argCount": 2
+    },
+    {
+      "name": "ord_156",
+      "argCount": 2
+    },
+    {
+      "name": "ord_157",
+      "argCount": 2
+    },
+    {
+      "name": "ord_158",
+      "argCount": 2
+    },
+    {
+      "name": "ord_159",
+      "argCount": 6
+    },
+    {
+      "name": "ord_16",
+      "argCount": 4
+    },
+    {
+      "name": "ord_160",
+      "argCount": 2
+    },
+    {
+      "name": "ord_161",
+      "argCount": 2
+    },
+    {
+      "name": "ord_162",
+      "argCount": 2
+    },
+    {
+      "name": "ord_163",
+      "argCount": 5
+    },
+    {
+      "name": "ord_164",
+      "argCount": 6
+    },
+    {
+      "name": "ord_165",
+      "argCount": 4
+    },
+    {
+      "name": "ord_166",
+      "argCount": 1
+    },
+    {
+      "name": "ord_167",
+      "argCount": 2
+    },
+    {
+      "name": "ord_168",
+      "argCount": 6
+    },
+    {
+      "name": "ord_169",
+      "argCount": 1
+    },
+    {
+      "name": "ord_17",
+      "argCount": 2
+    },
+    {
+      "name": "ord_170",
+      "argCount": 1
+    },
+    {
+      "name": "ord_171",
+      "argCount": 2
+    },
+    {
+      "name": "ord_172",
+      "argCount": 2
+    },
+    {
+      "name": "ord_173",
+      "argCount": 2
+    },
+    {
+      "name": "ord_174",
+      "argCount": 2
+    },
+    {
+      "name": "ord_175",
+      "argCount": 2
+    },
+    {
+      "name": "ord_176",
+      "argCount": 4
+    },
+    {
+      "name": "ord_177",
+      "argCount": 2
+    },
+    {
+      "name": "ord_178",
+      "argCount": 5
+    },
+    {
+      "name": "ord_179",
+      "argCount": 2
+    },
+    {
+      "name": "ord_18",
+      "argCount": 2
+    },
+    {
+      "name": "ord_180",
+      "argCount": 1
+    },
+    {
+      "name": "ord_181",
+      "argCount": 3
+    },
+    {
+      "name": "ord_182",
+      "argCount": 3
+    },
+    {
+      "name": "ord_183",
+      "argCount": 1
+    },
+    {
+      "name": "ord_184",
+      "argCount": 3
+    },
+    {
+      "name": "ord_185",
+      "argCount": 6
+    },
+    {
+      "name": "ord_186",
+      "argCount": 5
+    },
+    {
+      "name": "ord_187",
+      "argCount": 2
+    },
+    {
+      "name": "ord_188",
+      "argCount": 3
+    },
+    {
+      "name": "ord_189",
+      "argCount": 2
+    },
+    {
+      "name": "ord_19",
+      "argCount": 1
+    },
+    {
+      "name": "ord_190",
+      "argCount": 5
+    },
+    {
+      "name": "ord_191",
+      "argCount": 6
+    },
+    {
+      "name": "ord_192",
+      "argCount": 2
+    },
+    {
+      "name": "ord_193",
+      "argCount": 0
+    },
+    {
+      "name": "ord_194",
+      "argCount": 2
+    },
+    {
+      "name": "ord_195",
+      "argCount": 2
+    },
+    {
+      "name": "ord_196",
+      "argCount": 4
+    },
+    {
+      "name": "ord_197",
+      "argCount": 3
+    },
+    {
+      "name": "ord_198",
+      "argCount": 4
+    },
+    {
+      "name": "ord_199",
+      "argCount": 2
+    },
+    {
+      "name": "ord_2",
+      "argCount": 2
+    },
+    {
+      "name": "ord_20",
+      "argCount": 2
+    },
+    {
+      "name": "ord_200",
+      "argCount": 6
+    },
+    {
+      "name": "ord_201",
+      "argCount": 7
+    },
+    {
+      "name": "ord_202",
+      "argCount": 3
+    },
+    {
+      "name": "ord_203",
+      "argCount": 1
+    },
+    {
+      "name": "ord_204",
+      "argCount": 2
+    },
+    {
+      "name": "ord_205",
+      "argCount": 6
+    },
+    {
+      "name": "ord_206",
+      "argCount": 6
+    },
+    {
+      "name": "ord_208",
+      "argCount": 5
+    },
+    {
+      "name": "ord_209",
+      "argCount": 1
+    },
+    {
+      "name": "ord_21",
+      "argCount": 2
+    },
+    {
+      "name": "ord_210",
+      "argCount": 3
+    },
+    {
+      "name": "ord_211",
+      "argCount": 2
+    },
+    {
+      "name": "ord_212",
+      "argCount": 3
+    },
+    {
+      "name": "ord_213",
+      "argCount": 1
+    },
+    {
+      "name": "ord_214",
+      "argCount": 2
+    },
+    {
+      "name": "ord_215",
+      "argCount": 3
+    },
+    {
+      "name": "ord_216",
+      "argCount": 4
+    },
+    {
+      "name": "ord_217",
+      "argCount": 3
+    },
+    {
+      "name": "ord_218",
+      "argCount": 4
+    },
+    {
+      "name": "ord_219",
+      "argCount": 4
+    },
+    {
+      "name": "ord_22",
+      "argCount": 2
+    },
+    {
+      "name": "ord_220",
+      "argCount": 2
+    },
+    {
+      "name": "ord_221",
+      "argCount": 1
+    },
+    {
+      "name": "ord_222",
+      "argCount": 1
+    },
+    {
+      "name": "ord_223",
+      "argCount": 1
+    },
+    {
+      "name": "ord_224",
+      "argCount": 1
+    },
+    {
+      "name": "ord_225",
+      "argCount": 1
+    },
+    {
+      "name": "ord_23",
+      "argCount": 3
+    },
+    {
+      "name": "ord_231",
+      "argCount": 8
+    },
+    {
+      "name": "ord_236",
+      "argCount": 1
+    },
+    {
+      "name": "ord_237",
+      "argCount": 1
+    },
+    {
+      "name": "ord_238",
+      "argCount": 3
+    },
+    {
+      "name": "ord_239",
+      "argCount": 3
+    },
+    {
+      "name": "ord_24",
+      "argCount": 3
+    },
+    {
+      "name": "ord_240",
+      "argCount": 4
+    },
+    {
+      "name": "ord_241",
+      "argCount": 0
+    },
+    {
+      "name": "ord_242",
+      "argCount": 0
+    },
+    {
+      "name": "ord_243",
+      "argCount": 5
+    },
+    {
+      "name": "ord_244",
+      "argCount": 5
+    },
+    {
+      "name": "ord_245",
+      "argCount": 4
+    },
+    {
+      "name": "ord_247",
+      "argCount": 1
+    },
+    {
+      "name": "ord_249",
+      "argCount": 3
+    },
+    {
+      "name": "ord_25",
+      "argCount": 1
+    },
+    {
+      "name": "ord_250",
+      "argCount": 0
+    },
+    {
+      "name": "ord_252",
+      "argCount": 1
+    },
+    {
+      "name": "ord_256",
+      "argCount": 3
+    },
+    {
+      "name": "ord_257",
+      "argCount": 6
+    },
+    {
+      "name": "ord_26",
+      "argCount": 1
+    },
+    {
+      "name": "ord_260",
+      "argCount": 7
+    },
+    {
+      "name": "ord_263",
+      "argCount": 7
+    },
+    {
+      "name": "ord_266",
+      "argCount": 4
+    },
+    {
+      "name": "ord_267",
+      "argCount": 4
+    },
+    {
+      "name": "ord_268",
+      "argCount": 2
+    },
+    {
+      "name": "ord_269",
+      "argCount": 2
+    },
+    {
+      "name": "ord_27",
+      "argCount": 1
+    },
+    {
+      "name": "ord_270",
+      "argCount": 2
+    },
+    {
+      "name": "ord_271",
+      "argCount": 3
+    },
+    {
+      "name": "ord_276",
+      "argCount": 0
+    },
+    {
+      "name": "ord_278",
+      "argCount": 6
+    },
+    {
+      "name": "ord_279",
+      "argCount": 3
+    },
+    {
+      "name": "ord_28",
+      "argCount": 1
+    },
+    {
+      "name": "ord_280",
+      "argCount": 3
+    },
+    {
+      "name": "ord_281",
+      "argCount": 4
+    },
+    {
+      "name": "ord_283",
+      "argCount": 5
+    },
+    {
+      "name": "ord_284",
+      "argCount": 3
+    },
+    {
+      "name": "ord_285",
+      "argCount": 2
+    },
+    {
+      "name": "ord_287",
+      "argCount": 2
+    },
+    {
+      "name": "ord_289",
+      "argCount": 3
+    },
+    {
+      "name": "ord_29",
+      "argCount": 1
+    },
+    {
+      "name": "ord_291",
+      "argCount": 7
+    },
+    {
+      "name": "ord_292",
+      "argCount": 7
+    },
+    {
+      "name": "ord_294",
+      "argCount": 5
+    },
+    {
+      "name": "ord_295",
+      "argCount": 4
+    },
+    {
+      "name": "ord_298",
+      "argCount": 4
+    },
+    {
+      "name": "ord_299",
+      "argCount": 8
+    },
+    {
+      "name": "ord_3",
+      "argCount": 2
+    },
+    {
+      "name": "ord_30",
+      "argCount": 1
+    },
+    {
+      "name": "ord_300",
+      "argCount": 14
+    },
+    {
+      "name": "ord_301",
+      "argCount": 6
+    },
+    {
+      "name": "ord_302",
+      "argCount": 4
+    },
+    {
+      "name": "ord_303",
+      "argCount": 4
+    },
+    {
+      "name": "ord_304",
+      "argCount": 1
+    },
+    {
+      "name": "ord_305",
+      "argCount": 3
+    },
+    {
+      "name": "ord_306",
+      "argCount": 3
+    },
+    {
+      "name": "ord_307",
+      "argCount": 4
+    },
+    {
+      "name": "ord_308",
+      "argCount": 2
+    },
+    {
+      "name": "ord_309",
+      "argCount": 1
+    },
+    {
+      "name": "ord_31",
+      "argCount": 1
+    },
+    {
+      "name": "ord_310",
+      "argCount": 6
+    },
+    {
+      "name": "ord_311",
+      "argCount": 6
+    },
+    {
+      "name": "ord_312",
+      "argCount": 6
+    },
+    {
+      "name": "ord_313",
+      "argCount": 5
+    },
+    {
+      "name": "ord_314",
+      "argCount": 1
+    },
+    {
+      "name": "ord_315",
+      "argCount": 3
+    },
+    {
+      "name": "ord_318",
+      "argCount": 4
+    },
+    {
+      "name": "ord_319",
+      "argCount": 4
+    },
+    {
+      "name": "ord_32",
+      "argCount": 1
+    },
+    {
+      "name": "ord_320",
+      "argCount": 2
+    },
+    {
+      "name": "ord_321",
+      "argCount": 2
+    },
+    {
+      "name": "ord_322",
+      "argCount": 1
+    },
+    {
+      "name": "ord_323",
+      "argCount": 1
+    },
+    {
+      "name": "ord_324",
+      "argCount": 2
+    },
+    {
+      "name": "ord_325",
+      "argCount": 2
+    },
+    {
+      "name": "ord_326",
+      "argCount": 1
+    },
+    {
+      "name": "ord_327",
+      "argCount": 1
+    },
+    {
+      "name": "ord_328",
+      "argCount": 3
+    },
+    {
+      "name": "ord_329",
+      "argCount": 3
+    },
+    {
+      "name": "ord_33",
+      "argCount": 1
+    },
+    {
+      "name": "ord_330",
+      "argCount": 3
+    },
+    {
+      "name": "ord_331",
+      "argCount": 3
+    },
+    {
+      "name": "ord_332",
+      "argCount": 2
+    },
+    {
+      "name": "ord_333",
+      "argCount": 1
+    },
+    {
+      "name": "ord_334",
+      "argCount": 2
+    },
+    {
+      "name": "ord_335",
+      "argCount": 1
+    },
+    {
+      "name": "ord_336",
+      "argCount": 1
+    },
+    {
+      "name": "ord_337",
+      "argCount": 5
+    },
+    {
+      "name": "ord_338",
+      "argCount": 2
+    },
+    {
+      "name": "ord_339",
+      "argCount": 6
+    },
+    {
+      "name": "ord_34",
+      "argCount": 1
+    },
+    {
+      "name": "ord_340",
+      "argCount": 4
+    },
+    {
+      "name": "ord_341",
+      "argCount": 2
+    },
+    {
+      "name": "ord_342",
+      "argCount": 3
+    },
+    {
+      "name": "ord_343",
+      "argCount": 5
+    },
+    {
+      "name": "ord_344",
+      "argCount": 5
+    },
+    {
+      "name": "ord_345",
+      "argCount": 3
+    },
+    {
+      "name": "ord_346",
+      "argCount": 3
+    },
+    {
+      "name": "ord_347",
+      "argCount": 2
+    },
+    {
+      "name": "ord_35",
+      "argCount": 3
+    },
+    {
+      "name": "ord_350",
+      "argCount": 2
+    },
+    {
+      "name": "ord_351",
+      "argCount": 4
+    },
+    {
+      "name": "ord_352",
+      "argCount": 4
+    },
+    {
+      "name": "ord_353",
+      "argCount": 4
+    },
+    {
+      "name": "ord_354",
+      "argCount": 4
+    },
+    {
+      "name": "ord_355",
+      "argCount": 2
+    },
+    {
+      "name": "ord_356",
+      "argCount": 3
+    },
+    {
+      "name": "ord_357",
+      "argCount": 5
+    },
+    {
+      "name": "ord_358",
+      "argCount": 6
+    },
+    {
+      "name": "ord_359",
+      "argCount": 3
+    },
+    {
+      "name": "ord_36",
+      "argCount": 4
+    },
+    {
+      "name": "ord_360",
+      "argCount": 1
+    },
+    {
+      "name": "ord_361",
+      "argCount": 3
+    },
+    {
+      "name": "ord_362",
+      "argCount": 2
+    },
+    {
+      "name": "ord_363",
+      "argCount": 4
+    },
+    {
+      "name": "ord_364",
+      "argCount": 3
+    },
+    {
+      "name": "ord_365",
+      "argCount": 3
+    },
+    {
+      "name": "ord_366",
+      "argCount": 8
+    },
+    {
+      "name": "ord_367",
+      "argCount": 5
+    },
+    {
+      "name": "ord_368",
+      "argCount": 5
+    },
+    {
+      "name": "ord_369",
+      "argCount": 10
+    },
+    {
+      "name": "ord_37",
+      "argCount": 5
+    },
+    {
+      "name": "ord_370",
+      "argCount": 3
+    },
+    {
+      "name": "ord_371",
+      "argCount": 4
+    },
+    {
+      "name": "ord_372",
+      "argCount": 3
+    },
+    {
+      "name": "ord_373",
+      "argCount": 5
+    },
+    {
+      "name": "ord_376",
+      "argCount": 0
+    },
+    {
+      "name": "ord_377",
+      "argCount": 3
+    },
+    {
+      "name": "ord_378",
+      "argCount": 3
+    },
+    {
+      "name": "ord_38",
+      "argCount": 1
+    },
+    {
+      "name": "ord_382",
+      "argCount": 1
+    },
+    {
+      "name": "ord_389",
+      "argCount": 1
+    },
+    {
+      "name": "ord_39",
+      "argCount": 2
+    },
+    {
+      "name": "ord_390",
+      "argCount": 2
+    },
+    {
+      "name": "ord_391",
+      "argCount": 5
+    },
+    {
+      "name": "ord_392",
+      "argCount": 2
+    },
+    {
+      "name": "ord_393",
+      "argCount": 5
+    },
+    {
+      "name": "ord_394",
+      "argCount": 4
+    },
+    {
+      "name": "ord_399",
+      "argCount": 3
+    },
+    {
+      "name": "ord_4",
+      "argCount": 2
+    },
+    {
+      "name": "ord_40",
+      "argCount": 1
+    },
+    {
+      "name": "ord_400",
+      "argCount": 3
+    },
+    {
+      "name": "ord_401",
+      "argCount": 1
+    },
+    {
+      "name": "ord_402",
+      "argCount": 1
+    },
+    {
+      "name": "ord_403",
+      "argCount": 1
+    },
+    {
+      "name": "ord_404",
+      "argCount": 4
+    },
+    {
+      "name": "ord_405",
+      "argCount": 6
+    },
+    {
+      "name": "ord_406",
+      "argCount": 6
+    },
+    {
+      "name": "ord_41",
+      "argCount": 2
+    },
+    {
+      "name": "ord_413",
+      "argCount": 1
+    },
+    {
+      "name": "ord_416",
+      "argCount": 5
+    },
+    {
+      "name": "ord_417",
+      "argCount": 5
+    },
+    {
+      "name": "ord_418",
+      "argCount": 1
+    },
+    {
+      "name": "ord_419",
+      "argCount": 0
+    },
+    {
+      "name": "ord_42",
+      "argCount": 1
+    },
+    {
+      "name": "ord_422",
+      "argCount": 2
+    },
+    {
+      "name": "ord_423",
+      "argCount": 2
+    },
+    {
+      "name": "ord_424",
+      "argCount": 1
+    },
+    {
+      "name": "ord_425",
+      "argCount": 3
+    },
+    {
+      "name": "ord_426",
+      "argCount": 1
+    },
+    {
+      "name": "ord_427",
+      "argCount": 7
+    },
+    {
+      "name": "ord_428",
+      "argCount": 6
+    },
+    {
+      "name": "ord_429",
+      "argCount": 1
+    },
+    {
+      "name": "ord_43",
+      "argCount": 1
+    },
+    {
+      "name": "ord_430",
+      "argCount": 2
+    },
+    {
+      "name": "ord_431",
+      "argCount": 1
+    },
+    {
+      "name": "ord_432",
+      "argCount": 3
+    },
+    {
+      "name": "ord_433",
+      "argCount": 3
+    },
+    {
+      "name": "ord_434",
+      "argCount": 7
+    },
+    {
+      "name": "ord_435",
+      "argCount": 2
+    },
+    {
+      "name": "ord_436",
+      "argCount": 2
+    },
+    {
+      "name": "ord_437",
+      "argCount": 1
+    },
+    {
+      "name": "ord_439",
+      "argCount": 4
+    },
+    {
+      "name": "ord_44",
+      "argCount": 2
+    },
+    {
+      "name": "ord_440",
+      "argCount": 3
+    },
+    {
+      "name": "ord_441",
+      "argCount": 3
+    },
+    {
+      "name": "ord_442",
+      "argCount": 3
+    },
+    {
+      "name": "ord_443",
+      "argCount": 2
+    },
+    {
+      "name": "ord_444",
+      "argCount": 2
+    },
+    {
+      "name": "ord_445",
+      "argCount": 2
+    },
+    {
+      "name": "ord_446",
+      "argCount": 2
+    },
+    {
+      "name": "ord_448",
+      "argCount": 1
+    },
+    {
+      "name": "ord_45",
+      "argCount": 6
+    },
+    {
+      "name": "ord_455",
+      "argCount": 2
+    },
+    {
+      "name": "ord_456",
+      "argCount": 2
+    },
+    {
+      "name": "ord_457",
+      "argCount": 3
+    },
+    {
+      "name": "ord_458",
+      "argCount": 3
+    },
+    {
+      "name": "ord_459",
+      "argCount": 3
+    },
+    {
+      "name": "ord_46",
+      "argCount": 3
+    },
+    {
+      "name": "ord_460",
+      "argCount": 3
+    },
+    {
+      "name": "ord_461",
+      "argCount": 1
+    },
+    {
+      "name": "ord_462",
+      "argCount": 3
+    },
+    {
+      "name": "ord_463",
+      "argCount": 4
+    },
+    {
+      "name": "ord_464",
+      "argCount": 4
+    },
+    {
+      "name": "ord_47",
+      "argCount": 2
+    },
+    {
+      "name": "ord_471",
+      "argCount": 5
+    },
+    {
+      "name": "ord_475",
+      "argCount": 2
+    },
+    {
+      "name": "ord_476",
+      "argCount": 2
+    },
+    {
+      "name": "ord_478",
+      "argCount": 2
+    },
+    {
+      "name": "ord_479",
+      "argCount": 3
+    },
+    {
+      "name": "ord_48",
+      "argCount": 4
+    },
+    {
+      "name": "ord_480",
+      "argCount": 4
+    },
+    {
+      "name": "ord_481",
+      "argCount": 1
+    },
+    {
+      "name": "ord_484",
+      "argCount": 7
+    },
+    {
+      "name": "ord_487",
+      "argCount": 4
+    },
+    {
+      "name": "ord_489",
+      "argCount": 1
+    },
+    {
+      "name": "ord_49",
+      "argCount": 5
+    },
+    {
+      "name": "ord_490",
+      "argCount": 1
+    },
+    {
+      "name": "ord_491",
+      "argCount": 3
+    },
+    {
+      "name": "ord_496",
+      "argCount": 3
+    },
+    {
+      "name": "ord_5",
+      "argCount": 3
+    },
+    {
+      "name": "ord_50",
+      "argCount": 2
+    },
+    {
+      "name": "ord_509",
+      "argCount": 3
+    },
+    {
+      "name": "ord_51",
+      "argCount": 4
+    },
+    {
+      "name": "ord_514",
+      "argCount": 4
+    },
+    {
+      "name": "ord_515",
+      "argCount": 5
+    },
+    {
+      "name": "ord_516",
+      "argCount": 6
+    },
+    {
+      "name": "ord_517",
+      "argCount": 6
+    },
+    {
+      "name": "ord_518",
+      "argCount": 3
+    },
+    {
+      "name": "ord_519",
+      "argCount": 6
+    },
+    {
+      "name": "ord_52",
+      "argCount": 7
+    },
+    {
+      "name": "ord_53",
+      "argCount": 1
+    },
+    {
+      "name": "ord_538",
+      "argCount": 3
+    },
+    {
+      "name": "ord_54",
+      "argCount": 4
+    },
+    {
+      "name": "ord_542",
+      "argCount": 0
+    },
+    {
+      "name": "ord_543",
+      "argCount": 1
+    },
+    {
+      "name": "ord_549",
+      "argCount": 5
+    },
+    {
+      "name": "ord_55",
+      "argCount": 12
+    },
+    {
+      "name": "ord_56",
+      "argCount": 4
+    },
+    {
+      "name": "ord_57",
+      "argCount": 1
+    },
+    {
+      "name": "ord_58",
+      "argCount": 5
+    },
+    {
+      "name": "ord_59",
+      "argCount": 5
+    },
+    {
+      "name": "ord_6",
+      "argCount": 3
+    },
+    {
+      "name": "ord_60",
+      "argCount": 1
+    },
+    {
+      "name": "ord_61",
+      "argCount": 5
+    },
+    {
+      "name": "ord_62",
+      "argCount": 4
+    },
+    {
+      "name": "ord_63",
+      "argCount": 5
+    },
+    {
+      "name": "ord_64",
+      "argCount": 4
+    },
+    {
+      "name": "ord_65",
+      "argCount": 2
+    },
+    {
+      "name": "ord_66",
+      "argCount": 3
+    },
+    {
+      "name": "ord_67",
+      "argCount": 2
+    },
+    {
+      "name": "ord_68",
+      "argCount": 7
+    },
+    {
+      "name": "ord_69",
+      "argCount": 3
+    },
+    {
+      "name": "ord_7",
+      "argCount": 3
+    },
+    {
+      "name": "ord_70",
+      "argCount": 2
+    },
+    {
+      "name": "ord_71",
+      "argCount": 3
+    },
+    {
+      "name": "ord_72",
+      "argCount": 3
+    },
+    {
+      "name": "ord_73",
+      "argCount": 2
+    },
+    {
+      "name": "ord_74",
+      "argCount": 4
+    },
+    {
+      "name": "ord_75",
+      "argCount": 1
+    },
+    {
+      "name": "ord_76",
+      "argCount": 4
+    },
+    {
+      "name": "ord_77",
+      "argCount": 4
+    },
+    {
+      "name": "ord_78",
+      "argCount": 5
+    },
+    {
+      "name": "ord_79",
+      "argCount": 4
+    },
+    {
+      "name": "ord_8",
+      "argCount": 2
+    },
+    {
+      "name": "ord_80",
+      "argCount": 3
+    },
+    {
+      "name": "ord_81",
+      "argCount": 2
+    },
+    {
+      "name": "ord_82",
+      "argCount": 6
+    },
+    {
+      "name": "ord_83",
+      "argCount": 1
+    },
+    {
+      "name": "ord_84",
+      "argCount": 3
+    },
+    {
+      "name": "ord_85",
+      "argCount": 4
+    },
+    {
+      "name": "ord_86",
+      "argCount": 5
+    },
+    {
+      "name": "ord_87",
+      "argCount": 2
+    },
+    {
+      "name": "ord_88",
+      "argCount": 5
+    },
+    {
+      "name": "ord_89",
+      "argCount": 4
+    },
+    {
+      "name": "ord_9",
+      "argCount": 1
+    },
+    {
+      "name": "ord_90",
+      "argCount": 2
+    },
+    {
+      "name": "ord_91",
+      "argCount": 4
+    },
+    {
+      "name": "ord_92",
+      "argCount": 3
+    },
+    {
+      "name": "ord_93",
+      "argCount": 2
+    },
+    {
+      "name": "ord_94",
+      "argCount": 2
+    },
+    {
+      "name": "ord_95",
+      "argCount": 3
+    },
+    {
+      "name": "ord_96",
+      "argCount": 1
+    },
+    {
+      "name": "ord_97",
+      "argCount": 2
+    },
+    {
+      "name": "ord_98",
+      "argCount": 5
+    },
+    {
+      "name": "ord_99",
+      "argCount": 2
+    },
+    {
+      "name": "OutputDebugStringWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "PageSetupDlgWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "ParseURLA",
+      "argCount": 2
+    },
+    {
+      "name": "ParseURLW",
+      "argCount": 2
+    },
+    {
+      "name": "PathAddBackslashA",
+      "argCount": 1
+    },
+    {
+      "name": "PathAddBackslashW",
+      "argCount": 1
+    },
+    {
+      "name": "PathAddExtensionA",
+      "argCount": 2
+    },
+    {
+      "name": "PathAddExtensionW",
+      "argCount": 2
+    },
+    {
+      "name": "PathAppendA",
+      "argCount": 2
+    },
+    {
+      "name": "PathAppendW",
+      "argCount": 2
+    },
+    {
+      "name": "PathBuildRootA",
+      "argCount": 2
+    },
+    {
+      "name": "PathBuildRootW",
+      "argCount": 2
+    },
+    {
+      "name": "PathCanonicalizeA",
+      "argCount": 2
+    },
+    {
+      "name": "PathCanonicalizeW",
+      "argCount": 2
+    },
+    {
+      "name": "PathCombineA",
+      "argCount": 3
+    },
+    {
+      "name": "PathCombineW",
+      "argCount": 3
+    },
+    {
+      "name": "PathCommonPrefixA",
+      "argCount": 3
+    },
+    {
+      "name": "PathCommonPrefixW",
+      "argCount": 3
+    },
+    {
+      "name": "PathCompactPathA",
+      "argCount": 3
+    },
+    {
+      "name": "PathCompactPathExA",
+      "argCount": 4
+    },
+    {
+      "name": "PathCompactPathExW",
+      "argCount": 4
+    },
+    {
+      "name": "PathCompactPathW",
+      "argCount": 3
+    },
+    {
+      "name": "PathCreateFromUrlA",
+      "argCount": 4
+    },
+    {
+      "name": "PathCreateFromUrlAlloc",
+      "argCount": 3
+    },
+    {
+      "name": "PathCreateFromUrlW",
+      "argCount": 4
+    },
+    {
+      "name": "PathFileExistsA",
+      "argCount": 1
+    },
+    {
+      "name": "PathFileExistsAndAttributesA",
+      "argCount": 2
+    },
+    {
+      "name": "PathFileExistsAndAttributesW",
+      "argCount": 2
+    },
+    {
+      "name": "PathFileExistsDefExtA",
+      "argCount": 2
+    },
+    {
+      "name": "PathFileExistsDefExtW",
+      "argCount": 2
+    },
+    {
+      "name": "PathFileExistsW",
+      "argCount": 1
+    },
+    {
+      "name": "PathFindExtensionA",
+      "argCount": 1
+    },
+    {
+      "name": "PathFindExtensionW",
+      "argCount": 1
+    },
+    {
+      "name": "PathFindFileNameA",
+      "argCount": 1
+    },
+    {
+      "name": "PathFindFileNameW",
+      "argCount": 1
+    },
+    {
+      "name": "PathFindNextComponentA",
+      "argCount": 1
+    },
+    {
+      "name": "PathFindNextComponentW",
+      "argCount": 1
+    },
+    {
+      "name": "PathFindOnPathA",
+      "argCount": 2
+    },
+    {
+      "name": "PathFindOnPathExA",
+      "argCount": 3
+    },
+    {
+      "name": "PathFindOnPathExW",
+      "argCount": 3
+    },
+    {
+      "name": "PathFindOnPathW",
+      "argCount": 2
+    },
+    {
+      "name": "PathFindSuffixArrayA",
+      "argCount": 3
+    },
+    {
+      "name": "PathFindSuffixArrayW",
+      "argCount": 3
+    },
+    {
+      "name": "PathGetArgsA",
+      "argCount": 1
+    },
+    {
+      "name": "PathGetArgsW",
+      "argCount": 1
+    },
+    {
+      "name": "PathGetCharTypeA",
+      "argCount": 1
+    },
+    {
+      "name": "PathGetCharTypeW",
+      "argCount": 1
+    },
+    {
+      "name": "PathGetDriveNumberA",
+      "argCount": 1
+    },
+    {
+      "name": "PathGetDriveNumberW",
+      "argCount": 1
+    },
+    {
+      "name": "PathIsContentTypeA",
+      "argCount": 2
+    },
+    {
+      "name": "PathIsContentTypeW",
+      "argCount": 2
+    },
+    {
+      "name": "PathIsDirectoryA",
+      "argCount": 1
+    },
+    {
+      "name": "PathIsDirectoryEmptyA",
+      "argCount": 1
+    },
+    {
+      "name": "PathIsDirectoryEmptyW",
+      "argCount": 1
+    },
+    {
+      "name": "PathIsDirectoryW",
+      "argCount": 1
+    },
+    {
+      "name": "PathIsFileSpecA",
+      "argCount": 1
+    },
+    {
+      "name": "PathIsFileSpecW",
+      "argCount": 1
+    },
+    {
+      "name": "PathIsLFNFileSpecA",
+      "argCount": 1
+    },
+    {
+      "name": "PathIsLFNFileSpecW",
+      "argCount": 1
+    },
+    {
+      "name": "PathIsNetworkPathA",
+      "argCount": 1
+    },
+    {
+      "name": "PathIsNetworkPathW",
+      "argCount": 1
+    },
+    {
+      "name": "PathIsPrefixA",
+      "argCount": 2
+    },
+    {
+      "name": "PathIsPrefixW",
+      "argCount": 2
+    },
+    {
+      "name": "PathIsRelativeA",
+      "argCount": 1
+    },
+    {
+      "name": "PathIsRelativeW",
+      "argCount": 1
+    },
+    {
+      "name": "PathIsRootA",
+      "argCount": 1
+    },
+    {
+      "name": "PathIsRootW",
+      "argCount": 1
+    },
+    {
+      "name": "PathIsSameRootA",
+      "argCount": 2
+    },
+    {
+      "name": "PathIsSameRootW",
+      "argCount": 2
+    },
+    {
+      "name": "PathIsSystemFolderA",
+      "argCount": 2
+    },
+    {
+      "name": "PathIsSystemFolderW",
+      "argCount": 2
+    },
+    {
+      "name": "PathIsUNCA",
+      "argCount": 1
+    },
+    {
+      "name": "PathIsUNCServerA",
+      "argCount": 1
+    },
+    {
+      "name": "PathIsUNCServerShareA",
+      "argCount": 1
+    },
+    {
+      "name": "PathIsUNCServerShareW",
+      "argCount": 1
+    },
+    {
+      "name": "PathIsUNCServerW",
+      "argCount": 1
+    },
+    {
+      "name": "PathIsUNCW",
+      "argCount": 1
+    },
+    {
+      "name": "PathIsURLA",
+      "argCount": 1
+    },
+    {
+      "name": "PathIsURLW",
+      "argCount": 1
+    },
+    {
+      "name": "PathIsValidCharA",
+      "argCount": 2
+    },
+    {
+      "name": "PathIsValidCharW",
+      "argCount": 2
+    },
+    {
+      "name": "PathMakePrettyA",
+      "argCount": 1
+    },
+    {
+      "name": "PathMakePrettyW",
+      "argCount": 1
+    },
+    {
+      "name": "PathMakeSystemFolderA",
+      "argCount": 1
+    },
+    {
+      "name": "PathMakeSystemFolderW",
+      "argCount": 1
+    },
+    {
+      "name": "PathMatchSpecA",
+      "argCount": 2
+    },
+    {
+      "name": "PathMatchSpecExA",
+      "argCount": 3
+    },
+    {
+      "name": "PathMatchSpecExW",
+      "argCount": 3
+    },
+    {
+      "name": "PathMatchSpecW",
+      "argCount": 2
+    },
+    {
+      "name": "PathParseIconLocationA",
+      "argCount": 1
+    },
+    {
+      "name": "PathParseIconLocationW",
+      "argCount": 1
+    },
+    {
+      "name": "PathQuoteSpacesA",
+      "argCount": 1
+    },
+    {
+      "name": "PathQuoteSpacesW",
+      "argCount": 1
+    },
+    {
+      "name": "PathRelativePathToA",
+      "argCount": 5
+    },
+    {
+      "name": "PathRelativePathToW",
+      "argCount": 5
+    },
+    {
+      "name": "PathRemoveArgsA",
+      "argCount": 1
+    },
+    {
+      "name": "PathRemoveArgsW",
+      "argCount": 1
+    },
+    {
+      "name": "PathRemoveBackslashA",
+      "argCount": 1
+    },
+    {
+      "name": "PathRemoveBackslashW",
+      "argCount": 1
+    },
+    {
+      "name": "PathRemoveBlanksA",
+      "argCount": 1
+    },
+    {
+      "name": "PathRemoveBlanksW",
+      "argCount": 1
+    },
+    {
+      "name": "PathRemoveExtensionA",
+      "argCount": 1
+    },
+    {
+      "name": "PathRemoveExtensionW",
+      "argCount": 1
+    },
+    {
+      "name": "PathRemoveFileSpecA",
+      "argCount": 1
+    },
+    {
+      "name": "PathRemoveFileSpecW",
+      "argCount": 1
+    },
+    {
+      "name": "PathRenameExtensionA",
+      "argCount": 2
+    },
+    {
+      "name": "PathRenameExtensionW",
+      "argCount": 2
+    },
+    {
+      "name": "PathSearchAndQualifyA",
+      "argCount": 3
+    },
+    {
+      "name": "PathSearchAndQualifyW",
+      "argCount": 3
+    },
+    {
+      "name": "PathSetDlgItemPathA",
+      "argCount": 3
+    },
+    {
+      "name": "PathSetDlgItemPathW",
+      "argCount": 3
+    },
+    {
+      "name": "PathSkipLeadingSlashesA",
+      "argCount": 1
+    },
+    {
+      "name": "PathSkipRootA",
+      "argCount": 1
+    },
+    {
+      "name": "PathSkipRootW",
+      "argCount": 1
+    },
+    {
+      "name": "PathStripPathA",
+      "argCount": 1
+    },
+    {
+      "name": "PathStripPathW",
+      "argCount": 1
+    },
+    {
+      "name": "PathStripToRootA",
+      "argCount": 1
+    },
+    {
+      "name": "PathStripToRootW",
+      "argCount": 1
+    },
+    {
+      "name": "PathUndecorateA",
+      "argCount": 1
+    },
+    {
+      "name": "PathUndecorateW",
+      "argCount": 1
+    },
+    {
+      "name": "PathUnExpandEnvStringsA",
+      "argCount": 3
+    },
+    {
+      "name": "PathUnExpandEnvStringsW",
+      "argCount": 3
+    },
+    {
+      "name": "PathUnmakeSystemFolderA",
+      "argCount": 1
+    },
+    {
+      "name": "PathUnmakeSystemFolderW",
+      "argCount": 1
+    },
+    {
+      "name": "PathUnquoteSpacesA",
+      "argCount": 1
+    },
+    {
+      "name": "PathUnquoteSpacesW",
+      "argCount": 1
+    },
+    {
+      "name": "PeekMessageWrapW",
+      "argCount": 5
+    },
+    {
+      "name": "PlaySoundWrapW",
+      "argCount": 3
+    },
+    {
+      "name": "PostMessageWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "PostThreadMessageWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "PrintDlgWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "QISearch",
+      "argCount": 4
+    },
+    {
+      "name": "RegCreateKeyExWrapW",
+      "argCount": 9
+    },
+    {
+      "name": "RegCreateKeyWrapW",
+      "argCount": 3
+    },
+    {
+      "name": "RegDeleteKeyWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "RegDeleteValueWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "RegEnumKeyExWrapW",
+      "argCount": 8
+    },
+    {
+      "name": "RegEnumKeyWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "RegEnumValueWrapW",
+      "argCount": 8
+    },
+    {
+      "name": "RegisterClassExWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "RegisterClassWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "RegisterClipboardFormatWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "RegisterDefaultAcceptHeaders",
+      "argCount": 2
+    },
+    {
+      "name": "RegisterExtensionForMIMETypeA",
+      "argCount": 2
+    },
+    {
+      "name": "RegisterExtensionForMIMETypeW",
+      "argCount": 2
+    },
+    {
+      "name": "RegisterMIMETypeForExtensionA",
+      "argCount": 2
+    },
+    {
+      "name": "RegisterMIMETypeForExtensionW",
+      "argCount": 2
+    },
+    {
+      "name": "RegisterWindowMessageWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "RegOpenKeyExWrapW",
+      "argCount": 5
+    },
+    {
+      "name": "RegOpenKeyWrapW",
+      "argCount": 3
+    },
+    {
+      "name": "RegQueryInfoKeyWrapW",
+      "argCount": 12
+    },
+    {
+      "name": "RegQueryValueExWrapW",
+      "argCount": 6
+    },
+    {
+      "name": "RegQueryValueWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "RegSetValueExWrapW",
+      "argCount": 6
+    },
+    {
+      "name": "RegSetValueWrapW",
+      "argCount": 5
+    },
+    {
+      "name": "RemoveDirectoryWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "RemovePropWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "SearchPathWrapW",
+      "argCount": 6
+    },
+    {
+      "name": "SendDlgItemMessageWrapW",
+      "argCount": 5
+    },
+    {
+      "name": "SendMessageTimeoutWrapW",
+      "argCount": 7
+    },
+    {
+      "name": "SendMessageWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "SetCurrentDirectoryWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "SetDlgItemTextWrapW",
+      "argCount": 3
+    },
+    {
+      "name": "SetFileAttributesWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "SetMenuItemInfoWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "SetPropWrapW",
+      "argCount": 3
+    },
+    {
+      "name": "SetWindowLongWrapW",
+      "argCount": 3
+    },
+    {
+      "name": "SetWindowsHookExWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "SetWindowTextWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "SHAboutInfoA",
+      "argCount": 2
+    },
+    {
+      "name": "SHAboutInfoW",
+      "argCount": 2
+    },
+    {
+      "name": "SHAddDataBlock",
+      "argCount": 2
+    },
+    {
+      "name": "SHAllocShared",
+      "argCount": 3
+    },
+    {
+      "name": "SHAnsiToAnsi",
+      "argCount": 3
+    },
+    {
+      "name": "SHAnsiToUnicode",
+      "argCount": 3
+    },
+    {
+      "name": "SHAnsiToUnicodeCP",
+      "argCount": 4
+    },
+    {
+      "name": "SHAutoComplete",
+      "argCount": 2
+    },
+    {
+      "name": "SHBrowseForFolderWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "SHChangeNotifyWrap",
+      "argCount": 4
+    },
+    {
+      "name": "SHCheckMenuItem",
+      "argCount": 3
+    },
+    {
+      "name": "SHCoCreateInstanceAC",
+      "argCount": 5
+    },
+    {
+      "name": "SHCopyKeyA",
+      "argCount": 4
+    },
+    {
+      "name": "SHCopyKeyW",
+      "argCount": 4
+    },
+    {
+      "name": "SHCreateMemStream",
+      "argCount": 2
+    },
+    {
+      "name": "SHCreatePropertyBagOnRegKey",
+      "argCount": 5
+    },
+    {
+      "name": "SHCreateShellPalette",
+      "argCount": 1
+    },
+    {
+      "name": "SHCreateStreamOnFileA",
+      "argCount": 3
+    },
+    {
+      "name": "SHCreateStreamOnFileEx",
+      "argCount": 6
+    },
+    {
+      "name": "SHCreateStreamOnFileW",
+      "argCount": 3
+    },
+    {
+      "name": "SHCreateStreamWrapper",
+      "argCount": 4
+    },
+    {
+      "name": "SHCreateThread",
+      "argCount": 4
+    },
+    {
+      "name": "SHCreateThreadRef",
+      "argCount": 2
+    },
+    {
+      "name": "SHCreateWorkerWindowA",
+      "argCount": 6
+    },
+    {
+      "name": "SHCreateWorkerWindowW",
+      "argCount": 6
+    },
+    {
+      "name": "SHDefExtractIconWrapW",
+      "argCount": 6
+    },
+    {
+      "name": "SHDefWindowProc",
+      "argCount": 4
+    },
+    {
+      "name": "SHDeleteEmptyKeyA",
+      "argCount": 2
+    },
+    {
+      "name": "SHDeleteEmptyKeyW",
+      "argCount": 2
+    },
+    {
+      "name": "SHDeleteKeyA",
+      "argCount": 2
+    },
+    {
+      "name": "SHDeleteKeyW",
+      "argCount": 2
+    },
+    {
+      "name": "SHDeleteOrphanKeyA",
+      "argCount": 2
+    },
+    {
+      "name": "SHDeleteOrphanKeyW",
+      "argCount": 2
+    },
+    {
+      "name": "SHDeleteValueA",
+      "argCount": 3
+    },
+    {
+      "name": "SHDeleteValueW",
+      "argCount": 3
+    },
+    {
+      "name": "ShellExecuteExWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "SHEnableMenuItem",
+      "argCount": 3
+    },
+    {
+      "name": "SHEnumKeyExA",
+      "argCount": 4
+    },
+    {
+      "name": "SHEnumKeyExW",
+      "argCount": 4
+    },
+    {
+      "name": "SHEnumValueA",
+      "argCount": 7
+    },
+    {
+      "name": "SHEnumValueW",
+      "argCount": 7
+    },
+    {
+      "name": "SHExpandEnvironmentStringsA",
+      "argCount": 3
+    },
+    {
+      "name": "SHExpandEnvironmentStringsForUserA",
+      "argCount": 4
+    },
+    {
+      "name": "SHExpandEnvironmentStringsForUserW",
+      "argCount": 4
+    },
+    {
+      "name": "SHExpandEnvironmentStringsW",
+      "argCount": 3
+    },
+    {
+      "name": "SHFileOperationWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "SHFillRectClr",
+      "argCount": 3
+    },
+    {
+      "name": "SHFindDataBlock",
+      "argCount": 2
+    },
+    {
+      "name": "SHFlushSFCacheWrap",
+      "argCount": 0
+    },
+    {
+      "name": "SHFormatDateTimeA",
+      "argCount": 4
+    },
+    {
+      "name": "SHFormatDateTimeW",
+      "argCount": 4
+    },
+    {
+      "name": "SHFreeDataBlockList",
+      "argCount": 1
+    },
+    {
+      "name": "SHFreeShared",
+      "argCount": 2
+    },
+    {
+      "name": "SHGetAppCompatFlags",
+      "argCount": 1
+    },
+    {
+      "name": "SHGetCurColorRes",
+      "argCount": 0
+    },
+    {
+      "name": "SHGetFileInfoWrapW",
+      "argCount": 5
+    },
+    {
+      "name": "SHGetIniStringW",
+      "argCount": 5
+    },
+    {
+      "name": "SHGetInverseCMAP",
+      "argCount": 2
+    },
+    {
+      "name": "SHGetMachineInfo",
+      "argCount": 1
+    },
+    {
+      "name": "SHGetMenuFromID",
+      "argCount": 2
+    },
+    {
+      "name": "SHGetNewLinkInfoWrapW",
+      "argCount": 5
+    },
+    {
+      "name": "SHGetObjectCompatFlags",
+      "argCount": 2
+    },
+    {
+      "name": "SHGetPathFromIDListWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "SHGetRestriction",
+      "argCount": 3
+    },
+    {
+      "name": "SHGetShellKey",
+      "argCount": 3
+    },
+    {
+      "name": "SHGetSystemWindowsDirectoryA",
+      "argCount": 2
+    },
+    {
+      "name": "SHGetSystemWindowsDirectoryW",
+      "argCount": 2
+    },
+    {
+      "name": "SHGetThreadRef",
+      "argCount": 1
+    },
+    {
+      "name": "SHGetValueA",
+      "argCount": 6
+    },
+    {
+      "name": "SHGetValueGoodBootA",
+      "argCount": 6
+    },
+    {
+      "name": "SHGetValueGoodBootW",
+      "argCount": 6
+    },
+    {
+      "name": "SHGetValueW",
+      "argCount": 6
+    },
+    {
+      "name": "SHGetViewStatePropertyBag",
+      "argCount": 5
+    },
+    {
+      "name": "SHGetWebFolderFilePathA",
+      "argCount": 3
+    },
+    {
+      "name": "SHGetWebFolderFilePathW",
+      "argCount": 3
+    },
+    {
+      "name": "SHGlobalCounterCreate",
+      "argCount": 1
+    },
+    {
+      "name": "SHGlobalCounterCreateNamedA",
+      "argCount": 2
+    },
+    {
+      "name": "SHGlobalCounterCreateNamedW",
+      "argCount": 2
+    },
+    {
+      "name": "SHGlobalCounterDecrement",
+      "argCount": 1
+    },
+    {
+      "name": "SHGlobalCounterGetValue",
+      "argCount": 1
+    },
+    {
+      "name": "SHGlobalCounterIncrement",
+      "argCount": 1
+    },
+    {
+      "name": "SHInterlockedCompareExchange",
+      "argCount": 3
+    },
+    {
+      "name": "SHInvokeCommand",
+      "argCount": 4
+    },
+    {
+      "name": "SHInvokeDefaultCommand",
+      "argCount": 3
+    },
+    {
+      "name": "SHIsChildOrSelf",
+      "argCount": 2
+    },
+    {
+      "name": "SHIsEmptyStream",
+      "argCount": 1
+    },
+    {
+      "name": "SHIsExpandableFolder",
+      "argCount": 2
+    },
+    {
+      "name": "SHIsLowMemoryMachine",
+      "argCount": 1
+    },
+    {
+      "name": "SHIsSameObject",
+      "argCount": 2
+    },
+    {
+      "name": "SHLoadFromPropertyBag",
+      "argCount": 2
+    },
+    {
+      "name": "SHLoadIndirectString",
+      "argCount": 4
+    },
+    {
+      "name": "SHLoadMenuPopup",
+      "argCount": 2
+    },
+    {
+      "name": "SHLoadRegUIStringW",
+      "argCount": 4
+    },
+    {
+      "name": "SHLockShared",
+      "argCount": 2
+    },
+    {
+      "name": "SHMapHandle",
+      "argCount": 5
+    },
+    {
+      "name": "SHMenuIndexFromID",
+      "argCount": 2
+    },
+    {
+      "name": "SHMessageBoxCheckA",
+      "argCount": 6
+    },
+    {
+      "name": "SHMessageBoxCheckExA",
+      "argCount": 7
+    },
+    {
+      "name": "SHMessageBoxCheckExW",
+      "argCount": 7
+    },
+    {
+      "name": "SHMessageBoxCheckW",
+      "argCount": 6
+    },
+    {
+      "name": "SHOpenRegStream2A",
+      "argCount": 4
+    },
+    {
+      "name": "SHOpenRegStream2W",
+      "argCount": 4
+    },
+    {
+      "name": "SHOpenRegStreamA",
+      "argCount": 4
+    },
+    {
+      "name": "SHOpenRegStreamW",
+      "argCount": 4
+    },
+    {
+      "name": "SHPackDispParamsV",
+      "argCount": 4
+    },
+    {
+      "name": "SHPinDllOfCLSID",
+      "argCount": 1
+    },
+    {
+      "name": "SHPropagateMessage",
+      "argCount": 5
+    },
+    {
+      "name": "SHPropertyBag_ReadLONG",
+      "argCount": 3
+    },
+    {
+      "name": "SHQueryInfoKeyA",
+      "argCount": 5
+    },
+    {
+      "name": "SHQueryInfoKeyW",
+      "argCount": 5
+    },
+    {
+      "name": "SHQueryValueExA",
+      "argCount": 6
+    },
+    {
+      "name": "SHQueryValueExW",
+      "argCount": 6
+    },
+    {
+      "name": "SHQueueUserWorkItem",
+      "argCount": 7
+    },
+    {
+      "name": "SHReadDataBlockList",
+      "argCount": 2
+    },
+    {
+      "name": "SHRegCloseUSKey",
+      "argCount": 1
+    },
+    {
+      "name": "SHRegCreateUSKeyA",
+      "argCount": 5
+    },
+    {
+      "name": "SHRegCreateUSKeyW",
+      "argCount": 5
+    },
+    {
+      "name": "SHRegDeleteEmptyUSKeyA",
+      "argCount": 3
+    },
+    {
+      "name": "SHRegDeleteEmptyUSKeyW",
+      "argCount": 3
+    },
+    {
+      "name": "SHRegDeleteUSValueA",
+      "argCount": 3
+    },
+    {
+      "name": "SHRegDeleteUSValueW",
+      "argCount": 3
+    },
+    {
+      "name": "SHRegDuplicateHKey",
+      "argCount": 1
+    },
+    {
+      "name": "SHRegEnumUSKeyA",
+      "argCount": 5
+    },
+    {
+      "name": "SHRegEnumUSKeyW",
+      "argCount": 5
+    },
+    {
+      "name": "SHRegEnumUSValueA",
+      "argCount": 8
+    },
+    {
+      "name": "SHRegEnumUSValueW",
+      "argCount": 8
+    },
+    {
+      "name": "SHRegGetBoolUSValueA",
+      "argCount": 4
+    },
+    {
+      "name": "SHRegGetBoolUSValueW",
+      "argCount": 4
+    },
+    {
+      "name": "SHRegGetCLSIDKeyA",
+      "argCount": 5
+    },
+    {
+      "name": "SHRegGetCLSIDKeyW",
+      "argCount": 5
+    },
+    {
+      "name": "SHRegGetIntW",
+      "argCount": 3
+    },
+    {
+      "name": "SHRegGetPathA",
+      "argCount": 5
+    },
+    {
+      "name": "SHRegGetPathW",
+      "argCount": 5
+    },
+    {
+      "name": "SHRegGetUSValueA",
+      "argCount": 8
+    },
+    {
+      "name": "SHRegGetUSValueW",
+      "argCount": 8
+    },
+    {
+      "name": "SHRegGetValueA",
+      "argCount": 7
+    },
+    {
+      "name": "SHRegGetValueW",
+      "argCount": 7
+    },
+    {
+      "name": "SHRegisterClassA",
+      "argCount": 1
+    },
+    {
+      "name": "SHRegisterClassW",
+      "argCount": 1
+    },
+    {
+      "name": "SHRegisterValidateTemplate",
+      "argCount": 2
+    },
+    {
+      "name": "SHRegOpenUSKeyA",
+      "argCount": 5
+    },
+    {
+      "name": "SHRegOpenUSKeyW",
+      "argCount": 5
+    },
+    {
+      "name": "SHRegQueryInfoUSKeyA",
+      "argCount": 6
+    },
+    {
+      "name": "SHRegQueryInfoUSKeyW",
+      "argCount": 6
+    },
+    {
+      "name": "SHRegQueryUSValueA",
+      "argCount": 8
+    },
+    {
+      "name": "SHRegQueryUSValueW",
+      "argCount": 8
+    },
+    {
+      "name": "SHRegSetPathA",
+      "argCount": 5
+    },
+    {
+      "name": "SHRegSetPathW",
+      "argCount": 5
+    },
+    {
+      "name": "SHRegSetUSValueA",
+      "argCount": 6
+    },
+    {
+      "name": "SHRegSetUSValueW",
+      "argCount": 6
+    },
+    {
+      "name": "SHRegWriteUSValueA",
+      "argCount": 6
+    },
+    {
+      "name": "SHRegWriteUSValueW",
+      "argCount": 6
+    },
+    {
+      "name": "SHReleaseThreadRef",
+      "argCount": 0
+    },
+    {
+      "name": "SHRemoveAllSubMenus",
+      "argCount": 1
+    },
+    {
+      "name": "SHRemoveDataBlock",
+      "argCount": 2
+    },
+    {
+      "name": "SHRemoveDefaultDialogFont",
+      "argCount": 1
+    },
+    {
+      "name": "SHRestrictionLookup",
+      "argCount": 4
+    },
+    {
+      "name": "SHSearchMapInt",
+      "argCount": 4
+    },
+    {
+      "name": "SHSendMessageBroadcastA",
+      "argCount": 3
+    },
+    {
+      "name": "SHSendMessageBroadcastW",
+      "argCount": 3
+    },
+    {
+      "name": "SHSetDefaultDialogFont",
+      "argCount": 2
+    },
+    {
+      "name": "SHSetIniStringW",
+      "argCount": 4
+    },
+    {
+      "name": "SHSetParentHwnd",
+      "argCount": 2
+    },
+    {
+      "name": "SHSetThreadRef",
+      "argCount": 1
+    },
+    {
+      "name": "SHSetTimerQueueTimer",
+      "argCount": 7
+    },
+    {
+      "name": "SHSetValueA",
+      "argCount": 6
+    },
+    {
+      "name": "SHSetValueW",
+      "argCount": 6
+    },
+    {
+      "name": "SHSetWindowBits",
+      "argCount": 4
+    },
+    {
+      "name": "SHSimulateDrop",
+      "argCount": 5
+    },
+    {
+      "name": "SHSkipJunction",
+      "argCount": 2
+    },
+    {
+      "name": "SHStrDupA",
+      "argCount": 2
+    },
+    {
+      "name": "SHStrDupW",
+      "argCount": 2
+    },
+    {
+      "name": "SHStringFromGUIDA",
+      "argCount": 3
+    },
+    {
+      "name": "SHStringFromGUIDW",
+      "argCount": 3
+    },
+    {
+      "name": "SHStripMneumonicA",
+      "argCount": 1
+    },
+    {
+      "name": "SHStripMneumonicW",
+      "argCount": 1
+    },
+    {
+      "name": "SHTruncateString",
+      "argCount": 2
+    },
+    {
+      "name": "SHUnicodeToAnsi",
+      "argCount": 3
+    },
+    {
+      "name": "SHUnicodeToAnsiCP",
+      "argCount": 4
+    },
+    {
+      "name": "SHUnicodeToUnicode",
+      "argCount": 3
+    },
+    {
+      "name": "SHUnlockShared",
+      "argCount": 1
+    },
+    {
+      "name": "SHUnregisterClassesA",
+      "argCount": 3
+    },
+    {
+      "name": "SHUnregisterClassesW",
+      "argCount": 3
+    },
+    {
+      "name": "SHVerbExistsNA",
+      "argCount": 4
+    },
+    {
+      "name": "SHWaitForSendMessageThread",
+      "argCount": 2
+    },
+    {
+      "name": "SHWeakQueryInterface",
+      "argCount": 4
+    },
+    {
+      "name": "SHWeakReleaseInterface",
+      "argCount": 2
+    },
+    {
+      "name": "SHWinHelpOnDemandA",
+      "argCount": 5
+    },
+    {
+      "name": "SHWinHelpOnDemandW",
+      "argCount": 5
+    },
+    {
+      "name": "SHWriteDataBlockList",
+      "argCount": 2
+    },
+    {
+      "name": "SKAllocValueW",
+      "argCount": 6
+    },
+    {
+      "name": "SKDeleteValueW",
+      "argCount": 3
+    },
+    {
+      "name": "SKGetValueW",
+      "argCount": 6
+    },
+    {
+      "name": "SKSetValueW",
+      "argCount": 6
+    },
+    {
+      "name": "StartDocWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "StopWatch_MarkFrameStart",
+      "argCount": 1
+    },
+    {
+      "name": "StopWatch_MarkJavaStop",
+      "argCount": 3
+    },
+    {
+      "name": "StopWatch_SetMsgLastLocation",
+      "argCount": 1
+    },
+    {
+      "name": "StopWatch_TimerHandler",
+      "argCount": 4
+    },
+    {
+      "name": "StopWatchA",
+      "argCount": 5
+    },
+    {
+      "name": "StopWatchFlush",
+      "argCount": 0
+    },
+    {
+      "name": "StopWatchMode",
+      "argCount": 0
+    },
+    {
+      "name": "StopWatchW",
+      "argCount": 5
+    },
+    {
+      "name": "StrCatBuffA",
+      "argCount": 3
+    },
+    {
+      "name": "StrCatBuffW",
+      "argCount": 3
+    },
+    {
+      "name": "StrCatChainW",
+      "argCount": 4
+    },
+    {
+      "name": "StrCatW",
+      "argCount": 2
+    },
+    {
+      "name": "StrChrA",
+      "argCount": 2
+    },
+    {
+      "name": "StrChrIA",
+      "argCount": 2
+    },
+    {
+      "name": "StrChrIW",
+      "argCount": 2
+    },
+    {
+      "name": "StrChrNW",
+      "argCount": 3
+    },
+    {
+      "name": "StrChrW",
+      "argCount": 2
+    },
+    {
+      "name": "StrCmpCA",
+      "argCount": 2
+    },
+    {
+      "name": "StrCmpCW",
+      "argCount": 2
+    },
+    {
+      "name": "StrCmpICA",
+      "argCount": 2
+    },
+    {
+      "name": "StrCmpICW",
+      "argCount": 2
+    },
+    {
+      "name": "StrCmpIW",
+      "argCount": 2
+    },
+    {
+      "name": "StrCmpLogicalW",
+      "argCount": 2
+    },
+    {
+      "name": "StrCmpNA",
+      "argCount": 3
+    },
+    {
+      "name": "StrCmpNCA",
+      "argCount": 3
+    },
+    {
+      "name": "StrCmpNCW",
+      "argCount": 3
+    },
+    {
+      "name": "StrCmpNIA",
+      "argCount": 3
+    },
+    {
+      "name": "StrCmpNICA",
+      "argCount": 3
+    },
+    {
+      "name": "StrCmpNICW",
+      "argCount": 3
+    },
+    {
+      "name": "StrCmpNIW",
+      "argCount": 3
+    },
+    {
+      "name": "StrCmpNW",
+      "argCount": 3
+    },
+    {
+      "name": "StrCmpW",
+      "argCount": 2
+    },
+    {
+      "name": "StrCpyNW",
+      "argCount": 3
+    },
+    {
+      "name": "StrCpyNXA",
+      "argCount": 3
+    },
+    {
+      "name": "StrCpyNXW",
+      "argCount": 3
+    },
+    {
+      "name": "StrCpyW",
+      "argCount": 2
+    },
+    {
+      "name": "StrCSpnA",
+      "argCount": 2
+    },
+    {
+      "name": "StrCSpnIA",
+      "argCount": 2
+    },
+    {
+      "name": "StrCSpnIW",
+      "argCount": 2
+    },
+    {
+      "name": "StrCSpnW",
+      "argCount": 2
+    },
+    {
+      "name": "StrDupA",
+      "argCount": 1
+    },
+    {
+      "name": "StrDupW",
+      "argCount": 1
+    },
+    {
+      "name": "StrFormatByteSize64A",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "StrFormatByteSizeA",
+      "argCount": 3
+    },
+    {
+      "name": "StrFormatByteSizeEx",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "StrFormatByteSizeW",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "StrFormatKBSizeA",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "StrFormatKBSizeW",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "StrFromTimeIntervalA",
+      "argCount": 4
+    },
+    {
+      "name": "StrFromTimeIntervalW",
+      "argCount": 4
+    },
+    {
+      "name": "StrIsIntlEqualA",
+      "argCount": 4
+    },
+    {
+      "name": "StrIsIntlEqualW",
+      "argCount": 4
+    },
+    {
+      "name": "StrNCatA",
+      "argCount": 3
+    },
+    {
+      "name": "StrNCatW",
+      "argCount": 3
+    },
+    {
+      "name": "StrPBrkA",
+      "argCount": 2
+    },
+    {
+      "name": "StrPBrkW",
+      "argCount": 2
+    },
+    {
+      "name": "StrRChrA",
+      "argCount": 3
+    },
+    {
+      "name": "StrRChrIA",
+      "argCount": 3
+    },
+    {
+      "name": "StrRChrIW",
+      "argCount": 3
+    },
+    {
+      "name": "StrRChrW",
+      "argCount": 3
+    },
+    {
+      "name": "StrRetToBSTR",
+      "argCount": 3
+    },
+    {
+      "name": "StrRetToBufA",
+      "argCount": 4
+    },
+    {
+      "name": "StrRetToBufW",
+      "argCount": 4
+    },
+    {
+      "name": "StrRetToStrA",
+      "argCount": 3
+    },
+    {
+      "name": "StrRetToStrW",
+      "argCount": 3
+    },
+    {
+      "name": "StrRStrIA",
+      "argCount": 3
+    },
+    {
+      "name": "StrRStrIW",
+      "argCount": 3
+    },
+    {
+      "name": "StrSpnA",
+      "argCount": 2
+    },
+    {
+      "name": "StrSpnW",
+      "argCount": 2
+    },
+    {
+      "name": "StrStrA",
+      "argCount": 2
+    },
+    {
+      "name": "StrStrIA",
+      "argCount": 2
+    },
+    {
+      "name": "StrStrIW",
+      "argCount": 2
+    },
+    {
+      "name": "StrStrNIW",
+      "argCount": 3
+    },
+    {
+      "name": "StrStrNW",
+      "argCount": 3
+    },
+    {
+      "name": "StrStrW",
+      "argCount": 2
+    },
+    {
+      "name": "StrToInt64ExA",
+      "argCount": 3
+    },
+    {
+      "name": "StrToInt64ExW",
+      "argCount": 3
+    },
+    {
+      "name": "StrToIntA",
+      "argCount": 1
+    },
+    {
+      "name": "StrToIntExA",
+      "argCount": 3
+    },
+    {
+      "name": "StrToIntExW",
+      "argCount": 3
+    },
+    {
+      "name": "StrToIntW",
+      "argCount": 1
+    },
+    {
+      "name": "StrTrimA",
+      "argCount": 2
+    },
+    {
+      "name": "StrTrimW",
+      "argCount": 2
+    },
+    {
+      "name": "SystemParametersInfoWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "TrackPopupMenuExWrap",
+      "argCount": 6
+    },
+    {
+      "name": "TrackPopupMenuWrap",
+      "argCount": 7
+    },
+    {
+      "name": "TranslateAcceleratorWrapW",
+      "argCount": 3
+    },
+    {
+      "name": "UnregisterClassWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "UnregisterExtensionForMIMETypeA",
+      "argCount": 1
+    },
+    {
+      "name": "UnregisterExtensionForMIMETypeW",
+      "argCount": 1
+    },
+    {
+      "name": "UnregisterMIMETypeForExtensionA",
+      "argCount": 1
+    },
+    {
+      "name": "UnregisterMIMETypeForExtensionW",
+      "argCount": 1
+    },
+    {
+      "name": "UrlApplySchemeA",
+      "argCount": 4
+    },
+    {
+      "name": "UrlApplySchemeW",
+      "argCount": 4
+    },
+    {
+      "name": "UrlCanonicalizeA",
+      "argCount": 4
+    },
+    {
+      "name": "UrlCanonicalizeW",
+      "argCount": 4
+    },
+    {
+      "name": "UrlCombineA",
+      "argCount": 5
+    },
+    {
+      "name": "UrlCombineW",
+      "argCount": 5
+    },
+    {
+      "name": "UrlCompareA",
+      "argCount": 3
+    },
+    {
+      "name": "UrlCompareW",
+      "argCount": 3
+    },
+    {
+      "name": "UrlCrackW",
+      "argCount": 4
+    },
+    {
+      "name": "UrlCreateFromPathA",
+      "argCount": 4
+    },
+    {
+      "name": "UrlCreateFromPathW",
+      "argCount": 4
+    },
+    {
+      "name": "UrlEscapeA",
+      "argCount": 4
+    },
+    {
+      "name": "UrlEscapeW",
+      "argCount": 4
+    },
+    {
+      "name": "UrlFixupW",
+      "argCount": 3
+    },
+    {
+      "name": "UrlGetLocationA",
+      "argCount": 1
+    },
+    {
+      "name": "UrlGetLocationW",
+      "argCount": 1
+    },
+    {
+      "name": "UrlGetPartA",
+      "argCount": 5
+    },
+    {
+      "name": "UrlGetPartW",
+      "argCount": 5
+    },
+    {
+      "name": "UrlHashA",
+      "argCount": 3
+    },
+    {
+      "name": "UrlHashW",
+      "argCount": 3
+    },
+    {
+      "name": "UrlIsA",
+      "argCount": 2
+    },
+    {
+      "name": "UrlIsNoHistoryA",
+      "argCount": 1
+    },
+    {
+      "name": "UrlIsNoHistoryW",
+      "argCount": 1
+    },
+    {
+      "name": "UrlIsOpaqueA",
+      "argCount": 1
+    },
+    {
+      "name": "UrlIsOpaqueW",
+      "argCount": 1
+    },
+    {
+      "name": "UrlIsW",
+      "argCount": 2
+    },
+    {
+      "name": "UrlUnescapeA",
+      "argCount": 4
+    },
+    {
+      "name": "UrlUnescapeW",
+      "argCount": 4
+    },
+    {
+      "name": "VerQueryValueWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "VkKeyScanWrapW",
+      "argCount": 1
+    },
+    {
+      "name": "WhichPlatform",
+      "argCount": 0
+    },
+    {
+      "name": "WinHelpWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "WNetGetLastErrorWrapW",
+      "argCount": 5
+    },
+    {
+      "name": "WNetRestoreConnectionWrapW",
+      "argCount": 2
+    },
+    {
+      "name": "WritePrivateProfileStringWrapW",
+      "argCount": 4
+    },
+    {
+      "name": "WritePrivateProfileStructWrapW",
+      "argCount": 5
+    },
+    {
+      "name": "wvnsprintfA",
+      "argCount": 4
+    },
+    {
+      "name": "wvnsprintfW",
+      "argCount": 4
+    },
+    {
+      "name": "wvsprintfWrapW",
+      "argCount": 3
+    },
+    {
+      "name": "ZoneCheckUrlExW",
+      "argCount": 8
+    },
+    {
+      "name": "ZoneComputePaneSize",
+      "argCount": 1
+    }
+  ]
+}

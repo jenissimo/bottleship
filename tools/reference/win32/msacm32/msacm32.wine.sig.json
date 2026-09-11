@@ -1,0 +1,179 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.904Z",
+  "module": "msacm32",
+  "functions": [
+    {
+      "name": "acmDriverAddA",
+      "argCount": 5
+    },
+    {
+      "name": "acmDriverAddW",
+      "argCount": 5
+    },
+    {
+      "name": "acmDriverClose",
+      "argCount": 2
+    },
+    {
+      "name": "acmDriverDetailsA",
+      "argCount": 3
+    },
+    {
+      "name": "acmDriverDetailsW",
+      "argCount": 3
+    },
+    {
+      "name": "acmDriverEnum",
+      "argCount": 3
+    },
+    {
+      "name": "acmDriverID",
+      "argCount": 3
+    },
+    {
+      "name": "acmDriverMessage",
+      "argCount": 4
+    },
+    {
+      "name": "acmDriverOpen",
+      "argCount": 3
+    },
+    {
+      "name": "acmDriverPriority",
+      "argCount": 3
+    },
+    {
+      "name": "acmDriverRemove",
+      "argCount": 2
+    },
+    {
+      "name": "acmFilterChooseA",
+      "argCount": 1
+    },
+    {
+      "name": "acmFilterChooseW",
+      "argCount": 1
+    },
+    {
+      "name": "acmFilterDetailsA",
+      "argCount": 3
+    },
+    {
+      "name": "acmFilterDetailsW",
+      "argCount": 3
+    },
+    {
+      "name": "acmFilterEnumA",
+      "argCount": 5
+    },
+    {
+      "name": "acmFilterEnumW",
+      "argCount": 5
+    },
+    {
+      "name": "acmFilterTagDetailsA",
+      "argCount": 3
+    },
+    {
+      "name": "acmFilterTagDetailsW",
+      "argCount": 3
+    },
+    {
+      "name": "acmFilterTagEnumA",
+      "argCount": 5
+    },
+    {
+      "name": "acmFilterTagEnumW",
+      "argCount": 5
+    },
+    {
+      "name": "acmFormatChooseA",
+      "argCount": 1
+    },
+    {
+      "name": "acmFormatChooseW",
+      "argCount": 1
+    },
+    {
+      "name": "acmFormatDetailsA",
+      "argCount": 3
+    },
+    {
+      "name": "acmFormatDetailsW",
+      "argCount": 3
+    },
+    {
+      "name": "acmFormatEnumA",
+      "argCount": 5
+    },
+    {
+      "name": "acmFormatEnumW",
+      "argCount": 5
+    },
+    {
+      "name": "acmFormatSuggest",
+      "argCount": 5
+    },
+    {
+      "name": "acmFormatTagDetailsA",
+      "argCount": 3
+    },
+    {
+      "name": "acmFormatTagDetailsW",
+      "argCount": 3
+    },
+    {
+      "name": "acmFormatTagEnumA",
+      "argCount": 5
+    },
+    {
+      "name": "acmFormatTagEnumW",
+      "argCount": 5
+    },
+    {
+      "name": "acmGetVersion",
+      "argCount": 0
+    },
+    {
+      "name": "acmMetrics",
+      "argCount": 3
+    },
+    {
+      "name": "acmStreamClose",
+      "argCount": 2
+    },
+    {
+      "name": "acmStreamConvert",
+      "argCount": 3
+    },
+    {
+      "name": "acmStreamMessage",
+      "argCount": 4
+    },
+    {
+      "name": "acmStreamOpen",
+      "argCount": 8
+    },
+    {
+      "name": "acmStreamPrepareHeader",
+      "argCount": 3
+    },
+    {
+      "name": "acmStreamReset",
+      "argCount": 2
+    },
+    {
+      "name": "acmStreamSize",
+      "argCount": 4
+    },
+    {
+      "name": "acmStreamUnprepareHeader",
+      "argCount": 3
+    },
+    {
+      "name": "DriverProc",
+      "argCount": 5
+    }
+  ]
+}

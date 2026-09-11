@@ -1,0 +1,231 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.894Z",
+  "module": "glu32",
+  "functions": [
+    {
+      "name": "gluBeginCurve",
+      "argCount": 1
+    },
+    {
+      "name": "gluBeginPolygon",
+      "argCount": 1
+    },
+    {
+      "name": "gluBeginSurface",
+      "argCount": 1
+    },
+    {
+      "name": "gluBeginTrim",
+      "argCount": 1
+    },
+    {
+      "name": "gluBuild1DMipmaps",
+      "argCount": 6
+    },
+    {
+      "name": "gluBuild2DMipmaps",
+      "argCount": 7
+    },
+    {
+      "name": "gluCheckExtension",
+      "argCount": 2
+    },
+    {
+      "name": "gluCylinder",
+      "argCount": 9,
+      "note": "slot count exceeds parameter count (double, double, double occupy two slots each)"
+    },
+    {
+      "name": "gluDeleteNurbsRenderer",
+      "argCount": 1
+    },
+    {
+      "name": "gluDeleteQuadric",
+      "argCount": 1
+    },
+    {
+      "name": "gluDeleteTess",
+      "argCount": 1
+    },
+    {
+      "name": "gluDisk",
+      "argCount": 7,
+      "note": "slot count exceeds parameter count (double, double occupy two slots each)"
+    },
+    {
+      "name": "gluEndCurve",
+      "argCount": 1
+    },
+    {
+      "name": "gluEndPolygon",
+      "argCount": 1
+    },
+    {
+      "name": "gluEndSurface",
+      "argCount": 1
+    },
+    {
+      "name": "gluEndTrim",
+      "argCount": 1
+    },
+    {
+      "name": "gluErrorString",
+      "argCount": 1
+    },
+    {
+      "name": "gluErrorUnicodeStringEXT",
+      "argCount": 1
+    },
+    {
+      "name": "gluGetNurbsProperty",
+      "argCount": 3
+    },
+    {
+      "name": "gluGetString",
+      "argCount": 1
+    },
+    {
+      "name": "gluGetTessProperty",
+      "argCount": 3
+    },
+    {
+      "name": "gluLoadSamplingMatrices",
+      "argCount": 4
+    },
+    {
+      "name": "gluLookAt",
+      "argCount": 18,
+      "note": "slot count exceeds parameter count (double, double, double, double, double, double, double, double, double occupy two slots each)"
+    },
+    {
+      "name": "gluNewNurbsRenderer",
+      "argCount": 0
+    },
+    {
+      "name": "gluNewQuadric",
+      "argCount": 0
+    },
+    {
+      "name": "gluNewTess",
+      "argCount": 0
+    },
+    {
+      "name": "gluNextContour",
+      "argCount": 2
+    },
+    {
+      "name": "gluNurbsCallback",
+      "argCount": 3
+    },
+    {
+      "name": "gluNurbsCurve",
+      "argCount": 7
+    },
+    {
+      "name": "gluNurbsProperty",
+      "argCount": 3
+    },
+    {
+      "name": "gluNurbsSurface",
+      "argCount": 11
+    },
+    {
+      "name": "gluOrtho2D",
+      "argCount": 8,
+      "note": "slot count exceeds parameter count (double, double, double, double occupy two slots each)"
+    },
+    {
+      "name": "gluPartialDisk",
+      "argCount": 11,
+      "note": "slot count exceeds parameter count (double, double, double, double occupy two slots each)"
+    },
+    {
+      "name": "gluPerspective",
+      "argCount": 8,
+      "note": "slot count exceeds parameter count (double, double, double, double occupy two slots each)"
+    },
+    {
+      "name": "gluPickMatrix",
+      "argCount": 9,
+      "note": "slot count exceeds parameter count (double, double, double, double occupy two slots each)"
+    },
+    {
+      "name": "gluProject",
+      "argCount": 12,
+      "note": "slot count exceeds parameter count (double, double, double occupy two slots each)"
+    },
+    {
+      "name": "gluPwlCurve",
+      "argCount": 5
+    },
+    {
+      "name": "gluQuadricCallback",
+      "argCount": 3
+    },
+    {
+      "name": "gluQuadricDrawStyle",
+      "argCount": 2
+    },
+    {
+      "name": "gluQuadricNormals",
+      "argCount": 2
+    },
+    {
+      "name": "gluQuadricOrientation",
+      "argCount": 2
+    },
+    {
+      "name": "gluQuadricTexture",
+      "argCount": 2
+    },
+    {
+      "name": "gluScaleImage",
+      "argCount": 9
+    },
+    {
+      "name": "gluSphere",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "gluTessBeginContour",
+      "argCount": 1
+    },
+    {
+      "name": "gluTessBeginPolygon",
+      "argCount": 2
+    },
+    {
+      "name": "gluTessCallback",
+      "argCount": 3
+    },
+    {
+      "name": "gluTessEndContour",
+      "argCount": 1
+    },
+    {
+      "name": "gluTessEndPolygon",
+      "argCount": 1
+    },
+    {
+      "name": "gluTessNormal",
+      "argCount": 7,
+      "note": "slot count exceeds parameter count (double, double, double occupy two slots each)"
+    },
+    {
+      "name": "gluTessProperty",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "gluTessVertex",
+      "argCount": 3
+    },
+    {
+      "name": "gluUnProject",
+      "argCount": 12,
+      "note": "slot count exceeds parameter count (double, double, double occupy two slots each)"
+    }
+  ]
+}

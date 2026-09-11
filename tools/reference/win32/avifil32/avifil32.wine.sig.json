@@ -1,0 +1,291 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.874Z",
+  "module": "avifil32",
+  "functions": [
+    {
+      "name": "AVIBuildFilter",
+      "argCount": 3
+    },
+    {
+      "name": "AVIBuildFilterA",
+      "argCount": 3
+    },
+    {
+      "name": "AVIBuildFilterW",
+      "argCount": 3
+    },
+    {
+      "name": "AVIClearClipboard",
+      "argCount": 0
+    },
+    {
+      "name": "AVIFileAddRef",
+      "argCount": 1
+    },
+    {
+      "name": "AVIFileCreateStream",
+      "argCount": 3
+    },
+    {
+      "name": "AVIFileCreateStreamA",
+      "argCount": 3
+    },
+    {
+      "name": "AVIFileCreateStreamW",
+      "argCount": 3
+    },
+    {
+      "name": "AVIFileEndRecord",
+      "argCount": 1
+    },
+    {
+      "name": "AVIFileExit",
+      "argCount": 0
+    },
+    {
+      "name": "AVIFileGetStream",
+      "argCount": 4
+    },
+    {
+      "name": "AVIFileInfo",
+      "argCount": 3
+    },
+    {
+      "name": "AVIFileInfoA",
+      "argCount": 3
+    },
+    {
+      "name": "AVIFileInfoW",
+      "argCount": 3
+    },
+    {
+      "name": "AVIFileInit",
+      "argCount": 0
+    },
+    {
+      "name": "AVIFileOpen",
+      "argCount": 4
+    },
+    {
+      "name": "AVIFileOpenA",
+      "argCount": 4
+    },
+    {
+      "name": "AVIFileOpenW",
+      "argCount": 4
+    },
+    {
+      "name": "AVIFileReadData",
+      "argCount": 4
+    },
+    {
+      "name": "AVIFileRelease",
+      "argCount": 1
+    },
+    {
+      "name": "AVIFileWriteData",
+      "argCount": 4
+    },
+    {
+      "name": "AVIGetFromClipboard",
+      "argCount": 1
+    },
+    {
+      "name": "AVIMakeCompressedStream",
+      "argCount": 4
+    },
+    {
+      "name": "AVIMakeFileFromStreams",
+      "argCount": 3
+    },
+    {
+      "name": "AVIMakeStreamFromClipboard",
+      "argCount": 3
+    },
+    {
+      "name": "AVIPutFileOnClipboard",
+      "argCount": 1
+    },
+    {
+      "name": "AVISaveOptions",
+      "argCount": 5
+    },
+    {
+      "name": "AVISaveOptionsFree",
+      "argCount": 2
+    },
+    {
+      "name": "AVISaveV",
+      "argCount": 6
+    },
+    {
+      "name": "AVISaveVA",
+      "argCount": 6
+    },
+    {
+      "name": "AVISaveVW",
+      "argCount": 6
+    },
+    {
+      "name": "AVIStreamAddRef",
+      "argCount": 1
+    },
+    {
+      "name": "AVIStreamBeginStreaming",
+      "argCount": 4
+    },
+    {
+      "name": "AVIStreamCreate",
+      "argCount": 4
+    },
+    {
+      "name": "AVIStreamEndStreaming",
+      "argCount": 1
+    },
+    {
+      "name": "AVIStreamFindSample",
+      "argCount": 3
+    },
+    {
+      "name": "AVIStreamGetFrame",
+      "argCount": 2
+    },
+    {
+      "name": "AVIStreamGetFrameClose",
+      "argCount": 1
+    },
+    {
+      "name": "AVIStreamGetFrameOpen",
+      "argCount": 2
+    },
+    {
+      "name": "AVIStreamInfo",
+      "argCount": 3
+    },
+    {
+      "name": "AVIStreamInfoA",
+      "argCount": 3
+    },
+    {
+      "name": "AVIStreamInfoW",
+      "argCount": 3
+    },
+    {
+      "name": "AVIStreamLength",
+      "argCount": 1
+    },
+    {
+      "name": "AVIStreamOpenFromFile",
+      "argCount": 6
+    },
+    {
+      "name": "AVIStreamOpenFromFileA",
+      "argCount": 6
+    },
+    {
+      "name": "AVIStreamOpenFromFileW",
+      "argCount": 6
+    },
+    {
+      "name": "AVIStreamRead",
+      "argCount": 7
+    },
+    {
+      "name": "AVIStreamReadData",
+      "argCount": 4
+    },
+    {
+      "name": "AVIStreamReadFormat",
+      "argCount": 4
+    },
+    {
+      "name": "AVIStreamRelease",
+      "argCount": 1
+    },
+    {
+      "name": "AVIStreamSampleToTime",
+      "argCount": 2
+    },
+    {
+      "name": "AVIStreamSetFormat",
+      "argCount": 4
+    },
+    {
+      "name": "AVIStreamStart",
+      "argCount": 1
+    },
+    {
+      "name": "AVIStreamTimeToSample",
+      "argCount": 2
+    },
+    {
+      "name": "AVIStreamWrite",
+      "argCount": 8
+    },
+    {
+      "name": "AVIStreamWriteData",
+      "argCount": 4
+    },
+    {
+      "name": "CreateEditableStream",
+      "argCount": 2
+    },
+    {
+      "name": "DllCanUnloadNow",
+      "argCount": 0
+    },
+    {
+      "name": "DllGetClassObject",
+      "argCount": 3
+    },
+    {
+      "name": "DllRegisterServer",
+      "argCount": 0
+    },
+    {
+      "name": "DllUnregisterServer",
+      "argCount": 0
+    },
+    {
+      "name": "EditStreamClone",
+      "argCount": 2
+    },
+    {
+      "name": "EditStreamCopy",
+      "argCount": 4
+    },
+    {
+      "name": "EditStreamCut",
+      "argCount": 4
+    },
+    {
+      "name": "EditStreamPaste",
+      "argCount": 6
+    },
+    {
+      "name": "EditStreamSetInfo",
+      "argCount": 3
+    },
+    {
+      "name": "EditStreamSetInfoA",
+      "argCount": 3
+    },
+    {
+      "name": "EditStreamSetInfoW",
+      "argCount": 3
+    },
+    {
+      "name": "EditStreamSetName",
+      "argCount": 2
+    },
+    {
+      "name": "EditStreamSetNameA",
+      "argCount": 2
+    },
+    {
+      "name": "EditStreamSetNameW",
+      "argCount": 2
+    }
+  ]
+}

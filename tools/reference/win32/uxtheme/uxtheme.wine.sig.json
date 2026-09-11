@@ -1,0 +1,448 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.949Z",
+  "module": "uxtheme",
+  "functions": [
+    {
+      "name": "AllowDarkModeForWindow",
+      "argCount": 2
+    },
+    {
+      "name": "ApplyTheme",
+      "argCount": 3
+    },
+    {
+      "name": "BeginBufferedAnimation",
+      "argCount": 8
+    },
+    {
+      "name": "BeginBufferedPaint",
+      "argCount": 5
+    },
+    {
+      "name": "BufferedPaintClear",
+      "argCount": 2
+    },
+    {
+      "name": "BufferedPaintInit",
+      "argCount": 0
+    },
+    {
+      "name": "BufferedPaintRenderAnimation",
+      "argCount": 2
+    },
+    {
+      "name": "BufferedPaintSetAlpha",
+      "argCount": 3
+    },
+    {
+      "name": "BufferedPaintStopAllAnimations",
+      "argCount": 1
+    },
+    {
+      "name": "BufferedPaintUnInit",
+      "argCount": 0
+    },
+    {
+      "name": "CheckThemeSignature",
+      "argCount": 1
+    },
+    {
+      "name": "CloseThemeData",
+      "argCount": 1
+    },
+    {
+      "name": "CloseThemeFile",
+      "argCount": 1
+    },
+    {
+      "name": "DrawThemeBackground",
+      "argCount": 6
+    },
+    {
+      "name": "DrawThemeBackgroundEx",
+      "argCount": 6
+    },
+    {
+      "name": "DrawThemeEdge",
+      "argCount": 8
+    },
+    {
+      "name": "DrawThemeIcon",
+      "argCount": 7
+    },
+    {
+      "name": "DrawThemeParentBackground",
+      "argCount": 3
+    },
+    {
+      "name": "DrawThemeText",
+      "argCount": 9
+    },
+    {
+      "name": "DrawThemeTextEx",
+      "argCount": 9
+    },
+    {
+      "name": "EnableThemeDialogTexture",
+      "argCount": 2
+    },
+    {
+      "name": "EnableTheming",
+      "argCount": 1
+    },
+    {
+      "name": "EndBufferedAnimation",
+      "argCount": 2
+    },
+    {
+      "name": "EndBufferedPaint",
+      "argCount": 2
+    },
+    {
+      "name": "EnumThemeColors",
+      "argCount": 4
+    },
+    {
+      "name": "EnumThemes",
+      "argCount": 3
+    },
+    {
+      "name": "EnumThemeSizes",
+      "argCount": 4
+    },
+    {
+      "name": "FlushMenuThemes",
+      "argCount": 0
+    },
+    {
+      "name": "GetBufferedPaintBits",
+      "argCount": 3
+    },
+    {
+      "name": "GetBufferedPaintDC",
+      "argCount": 1
+    },
+    {
+      "name": "GetBufferedPaintTargetDC",
+      "argCount": 1
+    },
+    {
+      "name": "GetBufferedPaintTargetRect",
+      "argCount": 2
+    },
+    {
+      "name": "GetCurrentThemeName",
+      "argCount": 6
+    },
+    {
+      "name": "GetThemeAppProperties",
+      "argCount": 0
+    },
+    {
+      "name": "GetThemeBackgroundContentRect",
+      "argCount": 6
+    },
+    {
+      "name": "GetThemeBackgroundExtent",
+      "argCount": 6
+    },
+    {
+      "name": "GetThemeBackgroundRegion",
+      "argCount": 6
+    },
+    {
+      "name": "GetThemeBitmap",
+      "argCount": 6
+    },
+    {
+      "name": "GetThemeBool",
+      "argCount": 5
+    },
+    {
+      "name": "GetThemeColor",
+      "argCount": 5
+    },
+    {
+      "name": "GetThemeDefaults",
+      "argCount": 5
+    },
+    {
+      "name": "GetThemeDocumentationProperty",
+      "argCount": 4
+    },
+    {
+      "name": "GetThemeEnumValue",
+      "argCount": 5
+    },
+    {
+      "name": "GetThemeFilename",
+      "argCount": 6
+    },
+    {
+      "name": "GetThemeFont",
+      "argCount": 6
+    },
+    {
+      "name": "GetThemeInt",
+      "argCount": 5
+    },
+    {
+      "name": "GetThemeIntList",
+      "argCount": 5
+    },
+    {
+      "name": "GetThemeMargins",
+      "argCount": 7
+    },
+    {
+      "name": "GetThemeMetric",
+      "argCount": 6
+    },
+    {
+      "name": "GetThemePartSize",
+      "argCount": 7
+    },
+    {
+      "name": "GetThemePosition",
+      "argCount": 5
+    },
+    {
+      "name": "GetThemePropertyOrigin",
+      "argCount": 5
+    },
+    {
+      "name": "GetThemeRect",
+      "argCount": 5
+    },
+    {
+      "name": "GetThemeStream",
+      "argCount": 7
+    },
+    {
+      "name": "GetThemeString",
+      "argCount": 6
+    },
+    {
+      "name": "GetThemeSysBool",
+      "argCount": 2
+    },
+    {
+      "name": "GetThemeSysColor",
+      "argCount": 2
+    },
+    {
+      "name": "GetThemeSysColorBrush",
+      "argCount": 2
+    },
+    {
+      "name": "GetThemeSysFont",
+      "argCount": 3
+    },
+    {
+      "name": "GetThemeSysInt",
+      "argCount": 3
+    },
+    {
+      "name": "GetThemeSysSize",
+      "argCount": 2
+    },
+    {
+      "name": "GetThemeSysString",
+      "argCount": 4
+    },
+    {
+      "name": "GetThemeTextExtent",
+      "argCount": 9
+    },
+    {
+      "name": "GetThemeTextMetrics",
+      "argCount": 5
+    },
+    {
+      "name": "GetThemeTransitionDuration",
+      "argCount": 6
+    },
+    {
+      "name": "GetWindowTheme",
+      "argCount": 1
+    },
+    {
+      "name": "HitTestThemeBackground",
+      "argCount": 10,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "IsAppThemed",
+      "argCount": 0
+    },
+    {
+      "name": "IsCompositionActive",
+      "argCount": 0
+    },
+    {
+      "name": "IsDarkModeAllowedForWindow",
+      "argCount": 1
+    },
+    {
+      "name": "IsThemeActive",
+      "argCount": 0
+    },
+    {
+      "name": "IsThemeBackgroundPartiallyTransparent",
+      "argCount": 3
+    },
+    {
+      "name": "IsThemeDialogTextureEnabled",
+      "argCount": 1
+    },
+    {
+      "name": "IsThemePartDefined",
+      "argCount": 3
+    },
+    {
+      "name": "OpenThemeData",
+      "argCount": 2
+    },
+    {
+      "name": "OpenThemeDataEx",
+      "argCount": 3
+    },
+    {
+      "name": "OpenThemeDataForDpi",
+      "argCount": 3
+    },
+    {
+      "name": "OpenThemeFile",
+      "argCount": 5
+    },
+    {
+      "name": "ord_1",
+      "argCount": 0
+    },
+    {
+      "name": "ord_10",
+      "argCount": 4
+    },
+    {
+      "name": "ord_104",
+      "argCount": 0
+    },
+    {
+      "name": "ord_11",
+      "argCount": 4
+    },
+    {
+      "name": "ord_132",
+      "argCount": 0
+    },
+    {
+      "name": "ord_133",
+      "argCount": 2
+    },
+    {
+      "name": "ord_135",
+      "argCount": 1
+    },
+    {
+      "name": "ord_136",
+      "argCount": 0
+    },
+    {
+      "name": "ord_137",
+      "argCount": 1
+    },
+    {
+      "name": "ord_138",
+      "argCount": 0
+    },
+    {
+      "name": "ord_2",
+      "argCount": 5
+    },
+    {
+      "name": "ord_29",
+      "argCount": 1
+    },
+    {
+      "name": "ord_3",
+      "argCount": 1
+    },
+    {
+      "name": "ord_34",
+      "argCount": 0
+    },
+    {
+      "name": "ord_35",
+      "argCount": 0
+    },
+    {
+      "name": "ord_4",
+      "argCount": 3
+    },
+    {
+      "name": "ord_47",
+      "argCount": 6
+    },
+    {
+      "name": "ord_61",
+      "argCount": 3
+    },
+    {
+      "name": "ord_7",
+      "argCount": 5
+    },
+    {
+      "name": "ord_8",
+      "argCount": 3
+    },
+    {
+      "name": "ord_9",
+      "argCount": 4
+    },
+    {
+      "name": "ParseThemeIniFile",
+      "argCount": 4
+    },
+    {
+      "name": "QueryThemeServices",
+      "argCount": 0
+    },
+    {
+      "name": "RefreshImmersiveColorPolicyState",
+      "argCount": 0
+    },
+    {
+      "name": "SetPreferredAppMode",
+      "argCount": 1
+    },
+    {
+      "name": "SetThemeAppProperties",
+      "argCount": 1
+    },
+    {
+      "name": "SetWindowTheme",
+      "argCount": 3
+    },
+    {
+      "name": "SetWindowThemeAttribute",
+      "argCount": 4
+    },
+    {
+      "name": "ShouldAppsUseDarkMode",
+      "argCount": 0
+    },
+    {
+      "name": "ShouldSystemUseDarkMode",
+      "argCount": 0
+    },
+    {
+      "name": "ThemeHooksInstall",
+      "argCount": 0
+    },
+    {
+      "name": "ThemeHooksRemove",
+      "argCount": 0
+    }
+  ]
+}

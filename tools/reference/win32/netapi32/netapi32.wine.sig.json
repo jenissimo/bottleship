@@ -1,0 +1,327 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.920Z",
+  "module": "netapi32",
+  "functions": [
+    {
+      "name": "DavGetHTTPFromUNCPath",
+      "argCount": 3
+    },
+    {
+      "name": "DavGetUNCFromHTTPPath",
+      "argCount": 3
+    },
+    {
+      "name": "DsEnumerateDomainTrustsA",
+      "argCount": 4
+    },
+    {
+      "name": "DsEnumerateDomainTrustsW",
+      "argCount": 4
+    },
+    {
+      "name": "DsGetDcNameA",
+      "argCount": 6
+    },
+    {
+      "name": "DsGetDcNameW",
+      "argCount": 6
+    },
+    {
+      "name": "DsGetDcOpenA",
+      "argCount": 7
+    },
+    {
+      "name": "DsGetDcOpenW",
+      "argCount": 7
+    },
+    {
+      "name": "DsGetSiteNameA",
+      "argCount": 2
+    },
+    {
+      "name": "DsGetSiteNameW",
+      "argCount": 2
+    },
+    {
+      "name": "DsRoleFreeMemory",
+      "argCount": 1
+    },
+    {
+      "name": "DsRoleGetPrimaryDomainInformation",
+      "argCount": 3
+    },
+    {
+      "name": "I_BrowserQueryEmulatedDomains",
+      "argCount": 3
+    },
+    {
+      "name": "I_BrowserSetNetlogonState",
+      "argCount": 4
+    },
+    {
+      "name": "I_NetNameCompare",
+      "argCount": 5
+    },
+    {
+      "name": "I_NetNameValidate",
+      "argCount": 4
+    },
+    {
+      "name": "NetApiBufferAllocate",
+      "argCount": 2
+    },
+    {
+      "name": "NetApiBufferFree",
+      "argCount": 1
+    },
+    {
+      "name": "NetApiBufferReallocate",
+      "argCount": 3
+    },
+    {
+      "name": "NetApiBufferSize",
+      "argCount": 2
+    },
+    {
+      "name": "NetapipBufferAllocate",
+      "argCount": 2
+    },
+    {
+      "name": "Netbios",
+      "argCount": 1
+    },
+    {
+      "name": "NetFileEnum",
+      "argCount": 9
+    },
+    {
+      "name": "NetFreeAadJoinInformation",
+      "argCount": 1
+    },
+    {
+      "name": "NetGetAadJoinInformation",
+      "argCount": 2
+    },
+    {
+      "name": "NetGetAnyDCName",
+      "argCount": 3
+    },
+    {
+      "name": "NetGetDCName",
+      "argCount": 3
+    },
+    {
+      "name": "NetGetJoinInformation",
+      "argCount": 3
+    },
+    {
+      "name": "NetGroupAddUser",
+      "argCount": 3
+    },
+    {
+      "name": "NetGroupEnum",
+      "argCount": 7
+    },
+    {
+      "name": "NetGroupGetInfo",
+      "argCount": 4
+    },
+    {
+      "name": "NetLocalGroupAdd",
+      "argCount": 4
+    },
+    {
+      "name": "NetLocalGroupAddMember",
+      "argCount": 3
+    },
+    {
+      "name": "NetLocalGroupAddMembers",
+      "argCount": 5
+    },
+    {
+      "name": "NetLocalGroupDel",
+      "argCount": 2
+    },
+    {
+      "name": "NetLocalGroupDelMember",
+      "argCount": 3
+    },
+    {
+      "name": "NetLocalGroupDelMembers",
+      "argCount": 5
+    },
+    {
+      "name": "NetLocalGroupEnum",
+      "argCount": 7
+    },
+    {
+      "name": "NetLocalGroupGetInfo",
+      "argCount": 4
+    },
+    {
+      "name": "NetLocalGroupGetMembers",
+      "argCount": 8
+    },
+    {
+      "name": "NetLocalGroupSetInfo",
+      "argCount": 5
+    },
+    {
+      "name": "NetLocalGroupSetMembers",
+      "argCount": 5
+    },
+    {
+      "name": "NetpDeleteSecurityObject",
+      "argCount": 1
+    },
+    {
+      "name": "NetpGetComputerName",
+      "argCount": 1
+    },
+    {
+      "name": "NetpInitOemString",
+      "argCount": 2
+    },
+    {
+      "name": "NetpNetBiosStatusToApiStatus",
+      "argCount": 1
+    },
+    {
+      "name": "NetQueryDisplayInformation",
+      "argCount": 7
+    },
+    {
+      "name": "NetRemoteTOD",
+      "argCount": 2
+    },
+    {
+      "name": "NetScheduleJobAdd",
+      "argCount": 3
+    },
+    {
+      "name": "NetScheduleJobDel",
+      "argCount": 3
+    },
+    {
+      "name": "NetScheduleJobEnum",
+      "argCount": 6
+    },
+    {
+      "name": "NetScheduleJobGetInfo",
+      "argCount": 3
+    },
+    {
+      "name": "NetServerDiskEnum",
+      "argCount": 7
+    },
+    {
+      "name": "NetServerEnum",
+      "argCount": 9
+    },
+    {
+      "name": "NetServerEnumEx",
+      "argCount": 9
+    },
+    {
+      "name": "NetServerGetInfo",
+      "argCount": 3
+    },
+    {
+      "name": "NetSessionEnum",
+      "argCount": 9
+    },
+    {
+      "name": "NetShareAdd",
+      "argCount": 4
+    },
+    {
+      "name": "NetShareDel",
+      "argCount": 3
+    },
+    {
+      "name": "NetShareEnum",
+      "argCount": 7
+    },
+    {
+      "name": "NetShareGetInfo",
+      "argCount": 4
+    },
+    {
+      "name": "NetStatisticsGet",
+      "argCount": 5
+    },
+    {
+      "name": "NetUseAdd",
+      "argCount": 4
+    },
+    {
+      "name": "NetUseDel",
+      "argCount": 3
+    },
+    {
+      "name": "NetUseEnum",
+      "argCount": 7
+    },
+    {
+      "name": "NetUseGetInfo",
+      "argCount": 4
+    },
+    {
+      "name": "NetUserAdd",
+      "argCount": 4
+    },
+    {
+      "name": "NetUserChangePassword",
+      "argCount": 4
+    },
+    {
+      "name": "NetUserDel",
+      "argCount": 2
+    },
+    {
+      "name": "NetUserEnum",
+      "argCount": 8
+    },
+    {
+      "name": "NetUserGetGroups",
+      "argCount": 7
+    },
+    {
+      "name": "NetUserGetInfo",
+      "argCount": 4
+    },
+    {
+      "name": "NetUserGetLocalGroups",
+      "argCount": 8
+    },
+    {
+      "name": "NetUserModalsGet",
+      "argCount": 3
+    },
+    {
+      "name": "NetValidatePasswordPolicy",
+      "argCount": 5
+    },
+    {
+      "name": "NetValidatePasswordPolicyFree",
+      "argCount": 1
+    },
+    {
+      "name": "NetWkstaGetInfo",
+      "argCount": 3
+    },
+    {
+      "name": "NetWkstaTransportEnum",
+      "argCount": 7
+    },
+    {
+      "name": "NetWkstaUserEnum",
+      "argCount": 7
+    },
+    {
+      "name": "NetWkstaUserGetInfo",
+      "argCount": 3
+    }
+  ]
+}

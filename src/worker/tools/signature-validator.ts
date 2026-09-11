@@ -815,6 +815,33 @@ export class SignatureValidator {
         const apiFunctions: Record<string, number> = {};
         const sourceFile = ts.createSourceFile(apiFile, apiContent, ts.ScriptTarget.Latest, true);
 
+        // Which POSITION carries the arity, per locally declared helper. The generic
+        // helper rule below reads argument 1, but a helper may take the ordinal there
+        // (`ordinal("MsiGetPropertyW", 74, 4)`) — and then the ordinal is read as an
+        // arity of 74. The helper's own parameter names say which slot is the arity.
+        const helperArityIndex: Map<string, number> = new Map();
+        const ARITY_PARAM = /^(argcount|argc|nargs|paramcount|numargs)$/i;
+
+        const collectHelperShapes = (node: ts.Node) => {
+            let name: string | null = null;
+            let params: readonly ts.ParameterDeclaration[] | null = null;
+            if (ts.isVariableDeclaration(node) && node.initializer
+                && (ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer))
+                && ts.isIdentifier(node.name)) {
+                name = node.name.text;
+                params = node.initializer.parameters;
+            } else if (ts.isFunctionDeclaration(node) && node.name) {
+                name = node.name.text;
+                params = node.parameters;
+            }
+            if (name && params) {
+                const at = params.findIndex((p) => ts.isIdentifier(p.name) && ARITY_PARAM.test(p.name.text));
+                if (at > 0) helperArityIndex.set(name, at);
+            }
+            ts.forEachChild(node, collectHelperShapes);
+        };
+        collectHelperShapes(sourceFile);
+
         // Collect ordinal arrays like WSOCK_ORDINALS: Array<{ name: string; ordinal: number; argCount: number }>
         const ordinalArrays: Map<string, Array<{ name: string; argCount: number }>> = new Map();
 
@@ -911,11 +938,12 @@ export class SignatureValidator {
                         // Generic helper pattern: anyHelper("funcName", [...params], ...)
                         // The second arg is a params array — count its elements
                         const funcName = getStringLiteral(element.arguments[0]);
-                        const paramsArg = element.arguments[1];
-                        if (funcName && ts.isArrayLiteralExpression(paramsArg)) {
+                        const arityAt = helperArityIndex.get(calleeName);
+                        const paramsArg = arityAt !== undefined ? element.arguments[arityAt] : element.arguments[1];
+                        if (funcName && paramsArg && ts.isArrayLiteralExpression(paramsArg)) {
                             addFunction(funcName, paramsArg.elements.length);
                         } else if (funcName) {
-                            const argCount = getNumberLiteral(element.arguments[1]);
+                            const argCount = getNumberLiteral(paramsArg);
                             if (argCount !== null) {
                                 addFunction(funcName, argCount);
                             }

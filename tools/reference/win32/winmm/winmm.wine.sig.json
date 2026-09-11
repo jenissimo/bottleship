@@ -1,0 +1,755 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.952Z",
+  "module": "winmm",
+  "functions": [
+    {
+      "name": "@",
+      "argCount": 3
+    },
+    {
+      "name": "auxGetDevCapsA",
+      "argCount": 3
+    },
+    {
+      "name": "auxGetDevCapsW",
+      "argCount": 3
+    },
+    {
+      "name": "auxGetNumDevs",
+      "argCount": 0
+    },
+    {
+      "name": "auxGetVolume",
+      "argCount": 2
+    },
+    {
+      "name": "auxOutMessage",
+      "argCount": 4
+    },
+    {
+      "name": "auxSetVolume",
+      "argCount": 2
+    },
+    {
+      "name": "CloseDriver",
+      "argCount": 3
+    },
+    {
+      "name": "DefDriverProc",
+      "argCount": 5
+    },
+    {
+      "name": "DriverCallback",
+      "argCount": 7
+    },
+    {
+      "name": "DrvClose",
+      "argCount": 3
+    },
+    {
+      "name": "DrvDefDriverProc",
+      "argCount": 5
+    },
+    {
+      "name": "DrvGetModuleHandle",
+      "argCount": 1
+    },
+    {
+      "name": "DrvOpen",
+      "argCount": 3
+    },
+    {
+      "name": "DrvOpenA",
+      "argCount": 3
+    },
+    {
+      "name": "DrvSendMessage",
+      "argCount": 4
+    },
+    {
+      "name": "GetDriverFlags",
+      "argCount": 1
+    },
+    {
+      "name": "GetDriverModuleHandle",
+      "argCount": 1
+    },
+    {
+      "name": "joyConfigChanged",
+      "argCount": 1
+    },
+    {
+      "name": "joyGetDevCapsA",
+      "argCount": 3
+    },
+    {
+      "name": "joyGetDevCapsW",
+      "argCount": 3
+    },
+    {
+      "name": "joyGetNumDevs",
+      "argCount": 0
+    },
+    {
+      "name": "joyGetPos",
+      "argCount": 2
+    },
+    {
+      "name": "joyGetPosEx",
+      "argCount": 2
+    },
+    {
+      "name": "joyGetThreshold",
+      "argCount": 2
+    },
+    {
+      "name": "joyReleaseCapture",
+      "argCount": 1
+    },
+    {
+      "name": "joySetCapture",
+      "argCount": 4
+    },
+    {
+      "name": "joySetThreshold",
+      "argCount": 2
+    },
+    {
+      "name": "mciDriverNotify",
+      "argCount": 3
+    },
+    {
+      "name": "mciDriverYield",
+      "argCount": 1
+    },
+    {
+      "name": "mciExecute",
+      "argCount": 1
+    },
+    {
+      "name": "mciFreeCommandResource",
+      "argCount": 1
+    },
+    {
+      "name": "mciGetCreatorTask",
+      "argCount": 1
+    },
+    {
+      "name": "mciGetDeviceIDA",
+      "argCount": 1
+    },
+    {
+      "name": "mciGetDeviceIDFromElementIDA",
+      "argCount": 2
+    },
+    {
+      "name": "mciGetDeviceIDFromElementIDW",
+      "argCount": 2
+    },
+    {
+      "name": "mciGetDeviceIDW",
+      "argCount": 1
+    },
+    {
+      "name": "mciGetDriverData",
+      "argCount": 1
+    },
+    {
+      "name": "mciGetErrorStringA",
+      "argCount": 3
+    },
+    {
+      "name": "mciGetErrorStringW",
+      "argCount": 3
+    },
+    {
+      "name": "mciGetYieldProc",
+      "argCount": 2
+    },
+    {
+      "name": "mciLoadCommandResource",
+      "argCount": 3
+    },
+    {
+      "name": "mciSendCommandA",
+      "argCount": 4
+    },
+    {
+      "name": "mciSendCommandW",
+      "argCount": 4
+    },
+    {
+      "name": "mciSendStringA",
+      "argCount": 4
+    },
+    {
+      "name": "mciSendStringW",
+      "argCount": 4
+    },
+    {
+      "name": "mciSetDriverData",
+      "argCount": 2
+    },
+    {
+      "name": "mciSetYieldProc",
+      "argCount": 3
+    },
+    {
+      "name": "midiConnect",
+      "argCount": 3
+    },
+    {
+      "name": "midiDisconnect",
+      "argCount": 3
+    },
+    {
+      "name": "midiInAddBuffer",
+      "argCount": 3
+    },
+    {
+      "name": "midiInClose",
+      "argCount": 1
+    },
+    {
+      "name": "midiInGetDevCapsA",
+      "argCount": 3
+    },
+    {
+      "name": "midiInGetDevCapsW",
+      "argCount": 3
+    },
+    {
+      "name": "midiInGetErrorTextA",
+      "argCount": 3
+    },
+    {
+      "name": "midiInGetErrorTextW",
+      "argCount": 3
+    },
+    {
+      "name": "midiInGetID",
+      "argCount": 2
+    },
+    {
+      "name": "midiInGetNumDevs",
+      "argCount": 0
+    },
+    {
+      "name": "midiInMessage",
+      "argCount": 4
+    },
+    {
+      "name": "midiInOpen",
+      "argCount": 5
+    },
+    {
+      "name": "midiInPrepareHeader",
+      "argCount": 3
+    },
+    {
+      "name": "midiInReset",
+      "argCount": 1
+    },
+    {
+      "name": "midiInStart",
+      "argCount": 1
+    },
+    {
+      "name": "midiInStop",
+      "argCount": 1
+    },
+    {
+      "name": "midiInUnprepareHeader",
+      "argCount": 3
+    },
+    {
+      "name": "midiOutCacheDrumPatches",
+      "argCount": 4
+    },
+    {
+      "name": "midiOutCachePatches",
+      "argCount": 4
+    },
+    {
+      "name": "midiOutClose",
+      "argCount": 1
+    },
+    {
+      "name": "midiOutGetDevCapsA",
+      "argCount": 3
+    },
+    {
+      "name": "midiOutGetDevCapsW",
+      "argCount": 3
+    },
+    {
+      "name": "midiOutGetErrorTextA",
+      "argCount": 3
+    },
+    {
+      "name": "midiOutGetErrorTextW",
+      "argCount": 3
+    },
+    {
+      "name": "midiOutGetID",
+      "argCount": 2
+    },
+    {
+      "name": "midiOutGetNumDevs",
+      "argCount": 0
+    },
+    {
+      "name": "midiOutGetVolume",
+      "argCount": 2
+    },
+    {
+      "name": "midiOutLongMsg",
+      "argCount": 3
+    },
+    {
+      "name": "midiOutMessage",
+      "argCount": 4
+    },
+    {
+      "name": "midiOutOpen",
+      "argCount": 5
+    },
+    {
+      "name": "midiOutPrepareHeader",
+      "argCount": 3
+    },
+    {
+      "name": "midiOutReset",
+      "argCount": 1
+    },
+    {
+      "name": "midiOutSetVolume",
+      "argCount": 2
+    },
+    {
+      "name": "midiOutShortMsg",
+      "argCount": 2
+    },
+    {
+      "name": "midiOutUnprepareHeader",
+      "argCount": 3
+    },
+    {
+      "name": "midiStreamClose",
+      "argCount": 1
+    },
+    {
+      "name": "midiStreamOpen",
+      "argCount": 6
+    },
+    {
+      "name": "midiStreamOut",
+      "argCount": 3
+    },
+    {
+      "name": "midiStreamPause",
+      "argCount": 1
+    },
+    {
+      "name": "midiStreamPosition",
+      "argCount": 3
+    },
+    {
+      "name": "midiStreamProperty",
+      "argCount": 3
+    },
+    {
+      "name": "midiStreamRestart",
+      "argCount": 1
+    },
+    {
+      "name": "midiStreamStop",
+      "argCount": 1
+    },
+    {
+      "name": "mixerClose",
+      "argCount": 1
+    },
+    {
+      "name": "mixerGetControlDetailsA",
+      "argCount": 3
+    },
+    {
+      "name": "mixerGetControlDetailsW",
+      "argCount": 3
+    },
+    {
+      "name": "mixerGetDevCapsA",
+      "argCount": 3
+    },
+    {
+      "name": "mixerGetDevCapsW",
+      "argCount": 3
+    },
+    {
+      "name": "mixerGetID",
+      "argCount": 3
+    },
+    {
+      "name": "mixerGetLineControlsA",
+      "argCount": 3
+    },
+    {
+      "name": "mixerGetLineControlsW",
+      "argCount": 3
+    },
+    {
+      "name": "mixerGetLineInfoA",
+      "argCount": 3
+    },
+    {
+      "name": "mixerGetLineInfoW",
+      "argCount": 3
+    },
+    {
+      "name": "mixerGetNumDevs",
+      "argCount": 0
+    },
+    {
+      "name": "mixerMessage",
+      "argCount": 4
+    },
+    {
+      "name": "mixerOpen",
+      "argCount": 5
+    },
+    {
+      "name": "mixerSetControlDetails",
+      "argCount": 3
+    },
+    {
+      "name": "mmGetCurrentTask",
+      "argCount": 0
+    },
+    {
+      "name": "mmioAdvance",
+      "argCount": 3
+    },
+    {
+      "name": "mmioAscend",
+      "argCount": 3
+    },
+    {
+      "name": "mmioClose",
+      "argCount": 2
+    },
+    {
+      "name": "mmioCreateChunk",
+      "argCount": 3
+    },
+    {
+      "name": "mmioDescend",
+      "argCount": 4
+    },
+    {
+      "name": "mmioFlush",
+      "argCount": 2
+    },
+    {
+      "name": "mmioGetInfo",
+      "argCount": 3
+    },
+    {
+      "name": "mmioInstallIOProcA",
+      "argCount": 3
+    },
+    {
+      "name": "mmioInstallIOProcW",
+      "argCount": 3
+    },
+    {
+      "name": "mmioOpenA",
+      "argCount": 3
+    },
+    {
+      "name": "mmioOpenW",
+      "argCount": 3
+    },
+    {
+      "name": "mmioRead",
+      "argCount": 3
+    },
+    {
+      "name": "mmioRenameA",
+      "argCount": 4
+    },
+    {
+      "name": "mmioRenameW",
+      "argCount": 4
+    },
+    {
+      "name": "mmioSeek",
+      "argCount": 3
+    },
+    {
+      "name": "mmioSendMessage",
+      "argCount": 4
+    },
+    {
+      "name": "mmioSetBuffer",
+      "argCount": 4
+    },
+    {
+      "name": "mmioSetInfo",
+      "argCount": 3
+    },
+    {
+      "name": "mmioStringToFOURCCA",
+      "argCount": 2
+    },
+    {
+      "name": "mmioStringToFOURCCW",
+      "argCount": 2
+    },
+    {
+      "name": "mmioWrite",
+      "argCount": 3
+    },
+    {
+      "name": "mmsystemGetVersion",
+      "argCount": 0
+    },
+    {
+      "name": "mmTaskBlock",
+      "argCount": 1
+    },
+    {
+      "name": "mmTaskCreate",
+      "argCount": 3
+    },
+    {
+      "name": "mmTaskSignal",
+      "argCount": 1
+    },
+    {
+      "name": "mmTaskYield",
+      "argCount": 0
+    },
+    {
+      "name": "OpenDriver",
+      "argCount": 3
+    },
+    {
+      "name": "OpenDriverA",
+      "argCount": 3
+    },
+    {
+      "name": "ord_2",
+      "argCount": 3
+    },
+    {
+      "name": "PlaySound",
+      "argCount": 3
+    },
+    {
+      "name": "PlaySoundA",
+      "argCount": 3
+    },
+    {
+      "name": "PlaySoundW",
+      "argCount": 3
+    },
+    {
+      "name": "SendDriverMessage",
+      "argCount": 4
+    },
+    {
+      "name": "sndPlaySoundA",
+      "argCount": 2
+    },
+    {
+      "name": "sndPlaySoundW",
+      "argCount": 2
+    },
+    {
+      "name": "timeBeginPeriod",
+      "argCount": 1
+    },
+    {
+      "name": "timeEndPeriod",
+      "argCount": 1
+    },
+    {
+      "name": "timeGetDevCaps",
+      "argCount": 2
+    },
+    {
+      "name": "timeGetSystemTime",
+      "argCount": 2
+    },
+    {
+      "name": "timeGetTime",
+      "argCount": 0
+    },
+    {
+      "name": "timeKillEvent",
+      "argCount": 1
+    },
+    {
+      "name": "timeSetEvent",
+      "argCount": 5
+    },
+    {
+      "name": "waveInAddBuffer",
+      "argCount": 3
+    },
+    {
+      "name": "waveInClose",
+      "argCount": 1
+    },
+    {
+      "name": "waveInGetDevCapsA",
+      "argCount": 3
+    },
+    {
+      "name": "waveInGetDevCapsW",
+      "argCount": 3
+    },
+    {
+      "name": "waveInGetErrorTextA",
+      "argCount": 3
+    },
+    {
+      "name": "waveInGetErrorTextW",
+      "argCount": 3
+    },
+    {
+      "name": "waveInGetID",
+      "argCount": 2
+    },
+    {
+      "name": "waveInGetNumDevs",
+      "argCount": 0
+    },
+    {
+      "name": "waveInGetPosition",
+      "argCount": 3
+    },
+    {
+      "name": "waveInMessage",
+      "argCount": 4
+    },
+    {
+      "name": "waveInOpen",
+      "argCount": 6
+    },
+    {
+      "name": "waveInPrepareHeader",
+      "argCount": 3
+    },
+    {
+      "name": "waveInReset",
+      "argCount": 1
+    },
+    {
+      "name": "waveInStart",
+      "argCount": 1
+    },
+    {
+      "name": "waveInStop",
+      "argCount": 1
+    },
+    {
+      "name": "waveInUnprepareHeader",
+      "argCount": 3
+    },
+    {
+      "name": "waveOutBreakLoop",
+      "argCount": 1
+    },
+    {
+      "name": "waveOutClose",
+      "argCount": 1
+    },
+    {
+      "name": "waveOutGetDevCapsA",
+      "argCount": 3
+    },
+    {
+      "name": "waveOutGetDevCapsW",
+      "argCount": 3
+    },
+    {
+      "name": "waveOutGetErrorTextA",
+      "argCount": 3
+    },
+    {
+      "name": "waveOutGetErrorTextW",
+      "argCount": 3
+    },
+    {
+      "name": "waveOutGetID",
+      "argCount": 2
+    },
+    {
+      "name": "waveOutGetNumDevs",
+      "argCount": 0
+    },
+    {
+      "name": "waveOutGetPitch",
+      "argCount": 2
+    },
+    {
+      "name": "waveOutGetPlaybackRate",
+      "argCount": 2
+    },
+    {
+      "name": "waveOutGetPosition",
+      "argCount": 3
+    },
+    {
+      "name": "waveOutGetVolume",
+      "argCount": 2
+    },
+    {
+      "name": "waveOutMessage",
+      "argCount": 4
+    },
+    {
+      "name": "waveOutOpen",
+      "argCount": 6
+    },
+    {
+      "name": "waveOutPause",
+      "argCount": 1
+    },
+    {
+      "name": "waveOutPrepareHeader",
+      "argCount": 3
+    },
+    {
+      "name": "waveOutReset",
+      "argCount": 1
+    },
+    {
+      "name": "waveOutRestart",
+      "argCount": 1
+    },
+    {
+      "name": "waveOutSetPitch",
+      "argCount": 2
+    },
+    {
+      "name": "waveOutSetPlaybackRate",
+      "argCount": 2
+    },
+    {
+      "name": "waveOutSetVolume",
+      "argCount": 2
+    },
+    {
+      "name": "waveOutUnprepareHeader",
+      "argCount": 3
+    },
+    {
+      "name": "waveOutWrite",
+      "argCount": 3
+    }
+  ]
+}

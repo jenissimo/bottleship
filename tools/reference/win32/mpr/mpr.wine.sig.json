@@ -1,0 +1,339 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.903Z",
+  "module": "mpr",
+  "functions": [
+    {
+      "name": "@",
+      "argCount": 1
+    },
+    {
+      "name": "@",
+      "argCount": 2
+    },
+    {
+      "name": "@",
+      "argCount": 1
+    },
+    {
+      "name": "@",
+      "argCount": 2
+    },
+    {
+      "name": "MultinetGetConnectionPerformanceA",
+      "argCount": 2
+    },
+    {
+      "name": "MultinetGetConnectionPerformanceW",
+      "argCount": 2
+    },
+    {
+      "name": "MultinetGetErrorTextA",
+      "argCount": 3
+    },
+    {
+      "name": "MultinetGetErrorTextW",
+      "argCount": 3
+    },
+    {
+      "name": "NPSAuthenticationDialogA",
+      "argCount": 1
+    },
+    {
+      "name": "NPSCopyStringA",
+      "argCount": 3
+    },
+    {
+      "name": "NPSDeviceGetNumberA",
+      "argCount": 3
+    },
+    {
+      "name": "NPSDeviceGetStringA",
+      "argCount": 4
+    },
+    {
+      "name": "NPSGetProviderHandleA",
+      "argCount": 1
+    },
+    {
+      "name": "NPSGetProviderNameA",
+      "argCount": 2
+    },
+    {
+      "name": "NPSGetSectionNameA",
+      "argCount": 2
+    },
+    {
+      "name": "NPSNotifyGetContextA",
+      "argCount": 1
+    },
+    {
+      "name": "NPSNotifyRegisterA",
+      "argCount": 2
+    },
+    {
+      "name": "NPSSetCustomTextA",
+      "argCount": 1
+    },
+    {
+      "name": "NPSSetExtendedErrorA",
+      "argCount": 2
+    },
+    {
+      "name": "ord_22",
+      "argCount": 1
+    },
+    {
+      "name": "ord_23",
+      "argCount": 2
+    },
+    {
+      "name": "ord_24",
+      "argCount": 1
+    },
+    {
+      "name": "ord_25",
+      "argCount": 2
+    },
+    {
+      "name": "PwdChangePasswordA",
+      "argCount": 4
+    },
+    {
+      "name": "PwdChangePasswordW",
+      "argCount": 4
+    },
+    {
+      "name": "PwdGetPasswordStatusA",
+      "argCount": 3
+    },
+    {
+      "name": "PwdGetPasswordStatusW",
+      "argCount": 3
+    },
+    {
+      "name": "PwdSetPasswordStatusA",
+      "argCount": 3
+    },
+    {
+      "name": "PwdSetPasswordStatusW",
+      "argCount": 3
+    },
+    {
+      "name": "WNetAddConnection2A",
+      "argCount": 4
+    },
+    {
+      "name": "WNetAddConnection2W",
+      "argCount": 4
+    },
+    {
+      "name": "WNetAddConnection3A",
+      "argCount": 5
+    },
+    {
+      "name": "WNetAddConnection3W",
+      "argCount": 5
+    },
+    {
+      "name": "WNetAddConnectionA",
+      "argCount": 3
+    },
+    {
+      "name": "WNetAddConnectionW",
+      "argCount": 3
+    },
+    {
+      "name": "WNetCachePassword",
+      "argCount": 6
+    },
+    {
+      "name": "WNetCancelConnection2A",
+      "argCount": 3
+    },
+    {
+      "name": "WNetCancelConnection2W",
+      "argCount": 3
+    },
+    {
+      "name": "WNetCancelConnectionA",
+      "argCount": 2
+    },
+    {
+      "name": "WNetCancelConnectionW",
+      "argCount": 2
+    },
+    {
+      "name": "WNetClearConnections",
+      "argCount": 1
+    },
+    {
+      "name": "WNetCloseEnum",
+      "argCount": 1
+    },
+    {
+      "name": "WNetConnectionDialog",
+      "argCount": 2
+    },
+    {
+      "name": "WNetConnectionDialog1A",
+      "argCount": 1
+    },
+    {
+      "name": "WNetConnectionDialog1W",
+      "argCount": 1
+    },
+    {
+      "name": "WNetDisconnectDialog",
+      "argCount": 2
+    },
+    {
+      "name": "WNetDisconnectDialog1A",
+      "argCount": 1
+    },
+    {
+      "name": "WNetDisconnectDialog1W",
+      "argCount": 1
+    },
+    {
+      "name": "WNetEnumCachedPasswords",
+      "argCount": 5
+    },
+    {
+      "name": "WNetEnumResourceA",
+      "argCount": 4
+    },
+    {
+      "name": "WNetEnumResourceW",
+      "argCount": 4
+    },
+    {
+      "name": "WNetGetCachedPassword",
+      "argCount": 5
+    },
+    {
+      "name": "WNetGetConnectionA",
+      "argCount": 3
+    },
+    {
+      "name": "WNetGetConnectionW",
+      "argCount": 3
+    },
+    {
+      "name": "WNetGetLastErrorA",
+      "argCount": 5
+    },
+    {
+      "name": "WNetGetLastErrorW",
+      "argCount": 5
+    },
+    {
+      "name": "WNetGetNetworkInformationA",
+      "argCount": 2
+    },
+    {
+      "name": "WNetGetNetworkInformationW",
+      "argCount": 2
+    },
+    {
+      "name": "WNetGetProviderNameA",
+      "argCount": 3
+    },
+    {
+      "name": "WNetGetProviderNameW",
+      "argCount": 3
+    },
+    {
+      "name": "WNetGetResourceInformationA",
+      "argCount": 4
+    },
+    {
+      "name": "WNetGetResourceInformationW",
+      "argCount": 4
+    },
+    {
+      "name": "WNetGetResourceParentA",
+      "argCount": 3
+    },
+    {
+      "name": "WNetGetResourceParentW",
+      "argCount": 3
+    },
+    {
+      "name": "WNetGetUniversalNameA",
+      "argCount": 4
+    },
+    {
+      "name": "WNetGetUniversalNameW",
+      "argCount": 4
+    },
+    {
+      "name": "WNetGetUserA",
+      "argCount": 3
+    },
+    {
+      "name": "WNetGetUserW",
+      "argCount": 3
+    },
+    {
+      "name": "WNetLogoffA",
+      "argCount": 2
+    },
+    {
+      "name": "WNetLogoffW",
+      "argCount": 2
+    },
+    {
+      "name": "WNetLogonA",
+      "argCount": 2
+    },
+    {
+      "name": "WNetLogonW",
+      "argCount": 2
+    },
+    {
+      "name": "WNetOpenEnumA",
+      "argCount": 5
+    },
+    {
+      "name": "WNetOpenEnumW",
+      "argCount": 5
+    },
+    {
+      "name": "WNetRemoveCachedPassword",
+      "argCount": 3
+    },
+    {
+      "name": "WNetRestoreConnectionA",
+      "argCount": 2
+    },
+    {
+      "name": "WNetRestoreConnectionW",
+      "argCount": 2
+    },
+    {
+      "name": "WNetSetConnectionA",
+      "argCount": 3
+    },
+    {
+      "name": "WNetSetConnectionW",
+      "argCount": 3
+    },
+    {
+      "name": "WNetUseConnectionA",
+      "argCount": 8
+    },
+    {
+      "name": "WNetUseConnectionW",
+      "argCount": 8
+    },
+    {
+      "name": "WNetVerifyPasswordA",
+      "argCount": 2
+    },
+    {
+      "name": "WNetVerifyPasswordW",
+      "argCount": 2
+    }
+  ]
+}

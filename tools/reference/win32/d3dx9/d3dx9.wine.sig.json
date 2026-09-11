@@ -1,0 +1,1068 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.882Z",
+  "module": "d3dx9",
+  "functions": [
+    {
+      "name": "D3DXAssembleShader",
+      "argCount": 7
+    },
+    {
+      "name": "D3DXAssembleShaderFromFileA",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXAssembleShaderFromFileW",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXAssembleShaderFromResourceA",
+      "argCount": 7
+    },
+    {
+      "name": "D3DXAssembleShaderFromResourceW",
+      "argCount": 7
+    },
+    {
+      "name": "D3DXBoxBoundProbe",
+      "argCount": 4
+    },
+    {
+      "name": "D3DXCheckCubeTextureRequirements",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXCheckTextureRequirements",
+      "argCount": 7
+    },
+    {
+      "name": "D3DXCheckVersion",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXCheckVolumeTextureRequirements",
+      "argCount": 8
+    },
+    {
+      "name": "D3DXCleanMesh",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXColorAdjustContrast",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXColorAdjustSaturation",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXCompileShader",
+      "argCount": 10
+    },
+    {
+      "name": "D3DXCompileShaderFromFileA",
+      "argCount": 9
+    },
+    {
+      "name": "D3DXCompileShaderFromFileW",
+      "argCount": 9
+    },
+    {
+      "name": "D3DXCompileShaderFromResourceA",
+      "argCount": 10
+    },
+    {
+      "name": "D3DXCompileShaderFromResourceW",
+      "argCount": 10
+    },
+    {
+      "name": "D3DXComputeBoundingBox",
+      "argCount": 5
+    },
+    {
+      "name": "D3DXComputeBoundingSphere",
+      "argCount": 5
+    },
+    {
+      "name": "D3DXComputeNormalMap",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXComputeNormals",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXComputeTangentFrameEx",
+      "argCount": 16
+    },
+    {
+      "name": "D3DXConvertMeshSubsetToSingleStrip",
+      "argCount": 5
+    },
+    {
+      "name": "D3DXCreateAnimationController",
+      "argCount": 5
+    },
+    {
+      "name": "D3DXCreateBox",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXCreateBuffer",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXCreateCubeTexture",
+      "argCount": 7
+    },
+    {
+      "name": "D3DXCreateCubeTextureFromFileA",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXCreateCubeTextureFromFileExA",
+      "argCount": 13
+    },
+    {
+      "name": "D3DXCreateCubeTextureFromFileExW",
+      "argCount": 13
+    },
+    {
+      "name": "D3DXCreateCubeTextureFromFileInMemory",
+      "argCount": 4
+    },
+    {
+      "name": "D3DXCreateCubeTextureFromFileInMemoryEx",
+      "argCount": 14
+    },
+    {
+      "name": "D3DXCreateCubeTextureFromFileW",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXCreateCylinder",
+      "argCount": 8
+    },
+    {
+      "name": "D3DXCreateEffect",
+      "argCount": 9
+    },
+    {
+      "name": "D3DXCreateEffectCompiler",
+      "argCount": 7
+    },
+    {
+      "name": "D3DXCreateEffectCompilerFromFileA",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXCreateEffectCompilerFromFileW",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXCreateEffectCompilerFromResourceA",
+      "argCount": 7
+    },
+    {
+      "name": "D3DXCreateEffectCompilerFromResourceW",
+      "argCount": 7
+    },
+    {
+      "name": "D3DXCreateEffectEx",
+      "argCount": 10
+    },
+    {
+      "name": "D3DXCreateEffectFromFileA",
+      "argCount": 8
+    },
+    {
+      "name": "D3DXCreateEffectFromFileExA",
+      "argCount": 9
+    },
+    {
+      "name": "D3DXCreateEffectFromFileExW",
+      "argCount": 9
+    },
+    {
+      "name": "D3DXCreateEffectFromFileW",
+      "argCount": 8
+    },
+    {
+      "name": "D3DXCreateEffectFromResourceA",
+      "argCount": 9
+    },
+    {
+      "name": "D3DXCreateEffectFromResourceExA",
+      "argCount": 10
+    },
+    {
+      "name": "D3DXCreateEffectFromResourceExW",
+      "argCount": 10
+    },
+    {
+      "name": "D3DXCreateEffectFromResourceW",
+      "argCount": 9
+    },
+    {
+      "name": "D3DXCreateEffectPool",
+      "argCount": 1
+    },
+    {
+      "name": "D3DXCreateFontA",
+      "argCount": 12
+    },
+    {
+      "name": "D3DXCreateFontIndirectA",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXCreateFontIndirectW",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXCreateFontW",
+      "argCount": 12
+    },
+    {
+      "name": "D3DXCreateKeyframedAnimationSet",
+      "argCount": 8,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "D3DXCreateLine",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXCreateMatrixStack",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXCreateMesh",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXCreateMeshFVF",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXCreatePolygon",
+      "argCount": 5
+    },
+    {
+      "name": "D3DXCreateRenderToEnvMap",
+      "argCount": 7
+    },
+    {
+      "name": "D3DXCreateRenderToSurface",
+      "argCount": 7
+    },
+    {
+      "name": "D3DXCreateSkinInfo",
+      "argCount": 4
+    },
+    {
+      "name": "D3DXCreateSkinInfoFVF",
+      "argCount": 4
+    },
+    {
+      "name": "D3DXCreateSphere",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXCreateSprite",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXCreateTeapot",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXCreateTextA",
+      "argCount": 8
+    },
+    {
+      "name": "D3DXCreateTexture",
+      "argCount": 8
+    },
+    {
+      "name": "D3DXCreateTextureFromFileA",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXCreateTextureFromFileExA",
+      "argCount": 14
+    },
+    {
+      "name": "D3DXCreateTextureFromFileExW",
+      "argCount": 14
+    },
+    {
+      "name": "D3DXCreateTextureFromFileInMemory",
+      "argCount": 4
+    },
+    {
+      "name": "D3DXCreateTextureFromFileInMemoryEx",
+      "argCount": 15
+    },
+    {
+      "name": "D3DXCreateTextureFromFileW",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXCreateTextureFromResourceA",
+      "argCount": 4
+    },
+    {
+      "name": "D3DXCreateTextureFromResourceExA",
+      "argCount": 15
+    },
+    {
+      "name": "D3DXCreateTextureFromResourceExW",
+      "argCount": 15
+    },
+    {
+      "name": "D3DXCreateTextureFromResourceW",
+      "argCount": 4
+    },
+    {
+      "name": "D3DXCreateTextureShader",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXCreateTextW",
+      "argCount": 8
+    },
+    {
+      "name": "D3DXCreateTorus",
+      "argCount": 7
+    },
+    {
+      "name": "D3DXCreateVolumeTexture",
+      "argCount": 9
+    },
+    {
+      "name": "D3DXCreateVolumeTextureFromFileA",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXCreateVolumeTextureFromFileExA",
+      "argCount": 15
+    },
+    {
+      "name": "D3DXCreateVolumeTextureFromFileExW",
+      "argCount": 15
+    },
+    {
+      "name": "D3DXCreateVolumeTextureFromFileInMemory",
+      "argCount": 4
+    },
+    {
+      "name": "D3DXCreateVolumeTextureFromFileInMemoryEx",
+      "argCount": 16
+    },
+    {
+      "name": "D3DXCreateVolumeTextureFromFileW",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXDebugMute",
+      "argCount": 1
+    },
+    {
+      "name": "D3DXDeclaratorFromFVF",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXDisassembleEffect",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXDisassembleShader",
+      "argCount": 4
+    },
+    {
+      "name": "D3DXFileCreate",
+      "argCount": 1
+    },
+    {
+      "name": "D3DXFillCubeTexture",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXFillCubeTextureTX",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXFillTexture",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXFillTextureTX",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXFillVolumeTexture",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXFillVolumeTextureTX",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXFilterTexture",
+      "argCount": 4
+    },
+    {
+      "name": "D3DXFindShaderComment",
+      "argCount": 4
+    },
+    {
+      "name": "D3DXFloat16To32Array",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXFloat32To16Array",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXFrameDestroy",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXFrameFind",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXFresnelTerm",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXFVFFromDeclarator",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXGetDeclLength",
+      "argCount": 1
+    },
+    {
+      "name": "D3DXGetDeclVertexSize",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXGetDriverLevel",
+      "argCount": 1
+    },
+    {
+      "name": "D3DXGetFVFVertexSize",
+      "argCount": 1
+    },
+    {
+      "name": "D3DXGetImageInfoFromFileA",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXGetImageInfoFromFileInMemory",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXGetImageInfoFromFileW",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXGetImageInfoFromResourceA",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXGetImageInfoFromResourceW",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXGetPixelShaderProfile",
+      "argCount": 1
+    },
+    {
+      "name": "D3DXGetShaderConstantTable",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXGetShaderConstantTableEx",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXGetShaderInputSemantics",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXGetShaderOutputSemantics",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXGetShaderSamplers",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXGetShaderSize",
+      "argCount": 1
+    },
+    {
+      "name": "D3DXGetShaderVersion",
+      "argCount": 1
+    },
+    {
+      "name": "D3DXGetVertexShaderProfile",
+      "argCount": 1
+    },
+    {
+      "name": "D3DXIntersect",
+      "argCount": 10
+    },
+    {
+      "name": "D3DXIntersectTri",
+      "argCount": 8
+    },
+    {
+      "name": "D3DXLoadMeshFromXA",
+      "argCount": 8
+    },
+    {
+      "name": "D3DXLoadMeshFromXInMemory",
+      "argCount": 9
+    },
+    {
+      "name": "D3DXLoadMeshFromXResource",
+      "argCount": 10
+    },
+    {
+      "name": "D3DXLoadMeshFromXW",
+      "argCount": 8
+    },
+    {
+      "name": "D3DXLoadMeshHierarchyFromXA",
+      "argCount": 7
+    },
+    {
+      "name": "D3DXLoadMeshHierarchyFromXInMemory",
+      "argCount": 8
+    },
+    {
+      "name": "D3DXLoadMeshHierarchyFromXW",
+      "argCount": 7
+    },
+    {
+      "name": "D3DXLoadSkinMeshFromXof",
+      "argCount": 9
+    },
+    {
+      "name": "D3DXLoadSurfaceFromFileA",
+      "argCount": 8
+    },
+    {
+      "name": "D3DXLoadSurfaceFromFileInMemory",
+      "argCount": 9
+    },
+    {
+      "name": "D3DXLoadSurfaceFromFileW",
+      "argCount": 8
+    },
+    {
+      "name": "D3DXLoadSurfaceFromMemory",
+      "argCount": 10
+    },
+    {
+      "name": "D3DXLoadSurfaceFromResourceA",
+      "argCount": 9
+    },
+    {
+      "name": "D3DXLoadSurfaceFromResourceW",
+      "argCount": 9
+    },
+    {
+      "name": "D3DXLoadSurfaceFromSurface",
+      "argCount": 8
+    },
+    {
+      "name": "D3DXLoadVolumeFromFileA",
+      "argCount": 8
+    },
+    {
+      "name": "D3DXLoadVolumeFromFileInMemory",
+      "argCount": 9
+    },
+    {
+      "name": "D3DXLoadVolumeFromFileW",
+      "argCount": 8
+    },
+    {
+      "name": "D3DXLoadVolumeFromMemory",
+      "argCount": 11
+    },
+    {
+      "name": "D3DXLoadVolumeFromVolume",
+      "argCount": 8
+    },
+    {
+      "name": "D3DXMatrixAffineTransformation",
+      "argCount": 5
+    },
+    {
+      "name": "D3DXMatrixAffineTransformation2D",
+      "argCount": 5
+    },
+    {
+      "name": "D3DXMatrixDecompose",
+      "argCount": 4
+    },
+    {
+      "name": "D3DXMatrixDeterminant",
+      "argCount": 1
+    },
+    {
+      "name": "D3DXMatrixInverse",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXMatrixLookAtLH",
+      "argCount": 4
+    },
+    {
+      "name": "D3DXMatrixLookAtRH",
+      "argCount": 4
+    },
+    {
+      "name": "D3DXMatrixMultiply",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXMatrixMultiplyTranspose",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXMatrixOrthoLH",
+      "argCount": 5
+    },
+    {
+      "name": "D3DXMatrixOrthoOffCenterLH",
+      "argCount": 7
+    },
+    {
+      "name": "D3DXMatrixOrthoOffCenterRH",
+      "argCount": 7
+    },
+    {
+      "name": "D3DXMatrixOrthoRH",
+      "argCount": 5
+    },
+    {
+      "name": "D3DXMatrixPerspectiveFovLH",
+      "argCount": 5
+    },
+    {
+      "name": "D3DXMatrixPerspectiveFovRH",
+      "argCount": 5
+    },
+    {
+      "name": "D3DXMatrixPerspectiveLH",
+      "argCount": 5
+    },
+    {
+      "name": "D3DXMatrixPerspectiveOffCenterLH",
+      "argCount": 7
+    },
+    {
+      "name": "D3DXMatrixPerspectiveOffCenterRH",
+      "argCount": 7
+    },
+    {
+      "name": "D3DXMatrixPerspectiveRH",
+      "argCount": 5
+    },
+    {
+      "name": "D3DXMatrixReflect",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXMatrixRotationAxis",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXMatrixRotationQuaternion",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXMatrixRotationX",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXMatrixRotationY",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXMatrixRotationYawPitchRoll",
+      "argCount": 4
+    },
+    {
+      "name": "D3DXMatrixRotationZ",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXMatrixScaling",
+      "argCount": 4
+    },
+    {
+      "name": "D3DXMatrixShadow",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXMatrixTransformation",
+      "argCount": 7
+    },
+    {
+      "name": "D3DXMatrixTransformation2D",
+      "argCount": 7
+    },
+    {
+      "name": "D3DXMatrixTranslation",
+      "argCount": 4
+    },
+    {
+      "name": "D3DXMatrixTranspose",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXOptimizeFaces",
+      "argCount": 5
+    },
+    {
+      "name": "D3DXOptimizeVertices",
+      "argCount": 5
+    },
+    {
+      "name": "D3DXPlaneFromPointNormal",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXPlaneFromPoints",
+      "argCount": 4
+    },
+    {
+      "name": "D3DXPlaneIntersectLine",
+      "argCount": 4
+    },
+    {
+      "name": "D3DXPlaneNormalize",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXPlaneTransform",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXPlaneTransformArray",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXPreprocessShader",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXPreprocessShaderFromFileA",
+      "argCount": 5
+    },
+    {
+      "name": "D3DXPreprocessShaderFromFileW",
+      "argCount": 5
+    },
+    {
+      "name": "D3DXPreprocessShaderFromResourceA",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXPreprocessShaderFromResourceW",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXQuaternionBaryCentric",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXQuaternionExp",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXQuaternionInverse",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXQuaternionLn",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXQuaternionMultiply",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXQuaternionNormalize",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXQuaternionRotationAxis",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXQuaternionRotationMatrix",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXQuaternionRotationYawPitchRoll",
+      "argCount": 4
+    },
+    {
+      "name": "D3DXQuaternionSlerp",
+      "argCount": 4
+    },
+    {
+      "name": "D3DXQuaternionSquad",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXQuaternionSquadSetup",
+      "argCount": 7
+    },
+    {
+      "name": "D3DXQuaternionToAxisAngle",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXSaveSurfaceToFileA",
+      "argCount": 5
+    },
+    {
+      "name": "D3DXSaveSurfaceToFileInMemory",
+      "argCount": 5
+    },
+    {
+      "name": "D3DXSaveSurfaceToFileW",
+      "argCount": 5
+    },
+    {
+      "name": "D3DXSaveTextureToFileA",
+      "argCount": 4
+    },
+    {
+      "name": "D3DXSaveTextureToFileInMemory",
+      "argCount": 4
+    },
+    {
+      "name": "D3DXSaveTextureToFileW",
+      "argCount": 4
+    },
+    {
+      "name": "D3DXSaveVolumeToFileA",
+      "argCount": 5
+    },
+    {
+      "name": "D3DXSaveVolumeToFileInMemory",
+      "argCount": 5
+    },
+    {
+      "name": "D3DXSaveVolumeToFileW",
+      "argCount": 5
+    },
+    {
+      "name": "D3DXSHAdd",
+      "argCount": 4
+    },
+    {
+      "name": "D3DXSHDot",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXSHEvalConeLight",
+      "argCount": 9
+    },
+    {
+      "name": "D3DXSHEvalDirection",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXSHEvalDirectionalLight",
+      "argCount": 8
+    },
+    {
+      "name": "D3DXSHEvalHemisphereLight",
+      "argCount": 7
+    },
+    {
+      "name": "D3DXSHEvalSphericalLight",
+      "argCount": 9
+    },
+    {
+      "name": "D3DXSHMultiply2",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXSHMultiply3",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXSHMultiply4",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXSHProjectCubeMap",
+      "argCount": 5
+    },
+    {
+      "name": "D3DXSHRotate",
+      "argCount": 4
+    },
+    {
+      "name": "D3DXSHRotateZ",
+      "argCount": 4
+    },
+    {
+      "name": "D3DXSHScale",
+      "argCount": 4
+    },
+    {
+      "name": "D3DXSphereBoundProbe",
+      "argCount": 4
+    },
+    {
+      "name": "D3DXTessellateNPatches",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXValidMesh",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXVec2BaryCentric",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXVec2CatmullRom",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXVec2Hermite",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXVec2Normalize",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXVec2Transform",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXVec2TransformArray",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXVec2TransformCoord",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXVec2TransformCoordArray",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXVec2TransformNormal",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXVec2TransformNormalArray",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXVec3BaryCentric",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXVec3CatmullRom",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXVec3Hermite",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXVec3Normalize",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXVec3Project",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXVec3ProjectArray",
+      "argCount": 9
+    },
+    {
+      "name": "D3DXVec3Transform",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXVec3TransformArray",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXVec3TransformCoord",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXVec3TransformCoordArray",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXVec3TransformNormal",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXVec3TransformNormalArray",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXVec3Unproject",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXVec3UnprojectArray",
+      "argCount": 9
+    },
+    {
+      "name": "D3DXVec4BaryCentric",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXVec4CatmullRom",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXVec4Cross",
+      "argCount": 4
+    },
+    {
+      "name": "D3DXVec4Hermite",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXVec4Normalize",
+      "argCount": 2
+    },
+    {
+      "name": "D3DXVec4Transform",
+      "argCount": 3
+    },
+    {
+      "name": "D3DXVec4TransformArray",
+      "argCount": 6
+    },
+    {
+      "name": "D3DXWeldVertices",
+      "argCount": 7
+    }
+  ]
+}

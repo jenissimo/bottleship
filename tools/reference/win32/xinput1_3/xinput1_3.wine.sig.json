@@ -1,0 +1,79 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.958Z",
+  "module": "xinput1_3",
+  "functions": [
+    {
+      "name": "DllMain",
+      "argCount": 3
+    },
+    {
+      "name": "ord_1",
+      "argCount": 3
+    },
+    {
+      "name": "ord_100",
+      "argCount": 2
+    },
+    {
+      "name": "ord_2",
+      "argCount": 2
+    },
+    {
+      "name": "ord_3",
+      "argCount": 2
+    },
+    {
+      "name": "ord_4",
+      "argCount": 3
+    },
+    {
+      "name": "ord_5",
+      "argCount": 1
+    },
+    {
+      "name": "ord_6",
+      "argCount": 3
+    },
+    {
+      "name": "ord_7",
+      "argCount": 3
+    },
+    {
+      "name": "ord_8",
+      "argCount": 3
+    },
+    {
+      "name": "XInputEnable",
+      "argCount": 1
+    },
+    {
+      "name": "XInputGetBatteryInformation",
+      "argCount": 3
+    },
+    {
+      "name": "XInputGetCapabilities",
+      "argCount": 3
+    },
+    {
+      "name": "XInputGetDSoundAudioDeviceGuids",
+      "argCount": 3
+    },
+    {
+      "name": "XInputGetKeystroke",
+      "argCount": 3
+    },
+    {
+      "name": "XInputGetState",
+      "argCount": 2
+    },
+    {
+      "name": "XInputGetStateEx",
+      "argCount": 2
+    },
+    {
+      "name": "XInputSetState",
+      "argCount": 2
+    }
+  ]
+}

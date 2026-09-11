@@ -1,8 +1,23 @@
 # WIN32 Reference Headers
 
-This directory holds the derived win32 `.sig.json` signature data. The raw `.h`
-headers are gitignored (local-only regeneration inputs, re-fetchable from ReactOS —
-see below); only the `.sig.json` are tracked and shipped.
+This directory holds the derived win32 `.sig.json` signature data. The raw inputs are
+gitignored (local-only regeneration inputs); only the `.sig.json` are tracked and shipped.
+
+Two generators write here, from two different ground truths:
+
+- `*.sig.json` — full signatures parsed from ReactOS PSDK headers (the sections below).
+- `*.wine.sig.json` — stdcall ARITIES ONLY, parsed from Wine `.spec` files by
+  `tools/generate-wine-argcounts.ts`. A `.spec` line states the exact stack size for
+  every export of every DLL, so it is the canonical, complete arity list; a header-derived
+  reference covers only the headers we happened to fetch, and one export we cannot size
+  fails the whole PE load at boot. Names and stack-slot counts are all that is read — no
+  code, no prose. Wine is not vendored: point `BS_WINE_DLLS` at a checkout (CLAUDE.md
+  names the ground-truth sources), regenerate, and commit the result.
+
+  ```bash
+  bun tools/generate-wine-argcounts.ts          # refresh *.wine.sig.json
+  bun tools/generate-reference-argcounts.ts     # rebuild the TS map from both
+  ```
 
 ## Source
 

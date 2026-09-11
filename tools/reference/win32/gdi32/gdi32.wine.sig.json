@@ -1,0 +1,1852 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.890Z",
+  "module": "gdi32",
+  "functions": [
+    {
+      "name": "AbortDoc",
+      "argCount": 1
+    },
+    {
+      "name": "AbortPath",
+      "argCount": 1
+    },
+    {
+      "name": "AddFontMemResourceEx",
+      "argCount": 4
+    },
+    {
+      "name": "AddFontResourceA",
+      "argCount": 1
+    },
+    {
+      "name": "AddFontResourceExA",
+      "argCount": 3
+    },
+    {
+      "name": "AddFontResourceExW",
+      "argCount": 3
+    },
+    {
+      "name": "AddFontResourceW",
+      "argCount": 1
+    },
+    {
+      "name": "AngleArc",
+      "argCount": 6
+    },
+    {
+      "name": "AnimatePalette",
+      "argCount": 4
+    },
+    {
+      "name": "Arc",
+      "argCount": 9
+    },
+    {
+      "name": "ArcTo",
+      "argCount": 9
+    },
+    {
+      "name": "BeginPath",
+      "argCount": 1
+    },
+    {
+      "name": "BitBlt",
+      "argCount": 9
+    },
+    {
+      "name": "CancelDC",
+      "argCount": 1
+    },
+    {
+      "name": "ChoosePixelFormat",
+      "argCount": 2
+    },
+    {
+      "name": "Chord",
+      "argCount": 9
+    },
+    {
+      "name": "CloseEnhMetaFile",
+      "argCount": 1
+    },
+    {
+      "name": "CloseFigure",
+      "argCount": 1
+    },
+    {
+      "name": "CloseMetaFile",
+      "argCount": 1
+    },
+    {
+      "name": "CombineRgn",
+      "argCount": 4
+    },
+    {
+      "name": "CombineTransform",
+      "argCount": 3
+    },
+    {
+      "name": "CopyEnhMetaFileA",
+      "argCount": 2
+    },
+    {
+      "name": "CopyEnhMetaFileW",
+      "argCount": 2
+    },
+    {
+      "name": "CopyMetaFileA",
+      "argCount": 2
+    },
+    {
+      "name": "CopyMetaFileW",
+      "argCount": 2
+    },
+    {
+      "name": "CreateBitmap",
+      "argCount": 5
+    },
+    {
+      "name": "CreateBitmapIndirect",
+      "argCount": 1
+    },
+    {
+      "name": "CreateBrushIndirect",
+      "argCount": 1
+    },
+    {
+      "name": "CreateColorSpaceA",
+      "argCount": 1
+    },
+    {
+      "name": "CreateColorSpaceW",
+      "argCount": 1
+    },
+    {
+      "name": "CreateCompatibleBitmap",
+      "argCount": 3
+    },
+    {
+      "name": "CreateCompatibleDC",
+      "argCount": 1
+    },
+    {
+      "name": "CreateDCA",
+      "argCount": 4
+    },
+    {
+      "name": "CreateDCW",
+      "argCount": 4
+    },
+    {
+      "name": "CreateDIBitmap",
+      "argCount": 6
+    },
+    {
+      "name": "CreateDIBPatternBrush",
+      "argCount": 2
+    },
+    {
+      "name": "CreateDIBPatternBrushPt",
+      "argCount": 2
+    },
+    {
+      "name": "CreateDIBSection",
+      "argCount": 6
+    },
+    {
+      "name": "CreateDiscardableBitmap",
+      "argCount": 3
+    },
+    {
+      "name": "CreateEllipticRgn",
+      "argCount": 4
+    },
+    {
+      "name": "CreateEllipticRgnIndirect",
+      "argCount": 1
+    },
+    {
+      "name": "CreateEnhMetaFileA",
+      "argCount": 4
+    },
+    {
+      "name": "CreateEnhMetaFileW",
+      "argCount": 4
+    },
+    {
+      "name": "CreateFontA",
+      "argCount": 14
+    },
+    {
+      "name": "CreateFontIndirectA",
+      "argCount": 1
+    },
+    {
+      "name": "CreateFontIndirectExA",
+      "argCount": 1
+    },
+    {
+      "name": "CreateFontIndirectExW",
+      "argCount": 1
+    },
+    {
+      "name": "CreateFontIndirectW",
+      "argCount": 1
+    },
+    {
+      "name": "CreateFontW",
+      "argCount": 14
+    },
+    {
+      "name": "CreateHalftonePalette",
+      "argCount": 1
+    },
+    {
+      "name": "CreateHatchBrush",
+      "argCount": 2
+    },
+    {
+      "name": "CreateICA",
+      "argCount": 4
+    },
+    {
+      "name": "CreateICW",
+      "argCount": 4
+    },
+    {
+      "name": "CreateMetaFileA",
+      "argCount": 1
+    },
+    {
+      "name": "CreateMetaFileW",
+      "argCount": 1
+    },
+    {
+      "name": "CreatePalette",
+      "argCount": 1
+    },
+    {
+      "name": "CreatePatternBrush",
+      "argCount": 1
+    },
+    {
+      "name": "CreatePen",
+      "argCount": 3
+    },
+    {
+      "name": "CreatePenIndirect",
+      "argCount": 1
+    },
+    {
+      "name": "CreatePolygonRgn",
+      "argCount": 3
+    },
+    {
+      "name": "CreatePolyPolygonRgn",
+      "argCount": 4
+    },
+    {
+      "name": "CreateRectRgn",
+      "argCount": 4
+    },
+    {
+      "name": "CreateRectRgnIndirect",
+      "argCount": 1
+    },
+    {
+      "name": "CreateRoundRectRgn",
+      "argCount": 6
+    },
+    {
+      "name": "CreateScalableFontResourceA",
+      "argCount": 4
+    },
+    {
+      "name": "CreateScalableFontResourceW",
+      "argCount": 4
+    },
+    {
+      "name": "CreateSolidBrush",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTAcquireKeyedMutex",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTAcquireKeyedMutex2",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTCheckOcclusion",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTCheckVidPnExclusiveOwnership",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTCloseAdapter",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTCreateAllocation",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTCreateAllocation2",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTCreateDCFromMemory",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTCreateDevice",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTCreateKeyedMutex",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTCreateKeyedMutex2",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTCreateSynchronizationObject",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTCreateSynchronizationObject2",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTDestroyAllocation",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTDestroyAllocation2",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTDestroyDCFromMemory",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTDestroyDevice",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTDestroyKeyedMutex",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTDestroySynchronizationObject",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTEnumAdapters",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTEnumAdapters2",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTEscape",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTOpenAdapterFromDeviceName",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTOpenAdapterFromGdiDisplayName",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTOpenAdapterFromHdc",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTOpenAdapterFromLuid",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTOpenKeyedMutex",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTOpenKeyedMutex2",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTOpenKeyedMutexFromNtHandle",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTOpenNtHandleFromName",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTOpenResource",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTOpenResource2",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTOpenResourceFromNtHandle",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTOpenSynchronizationObject",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTOpenSyncObjectFromNtHandle",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTOpenSyncObjectFromNtHandle2",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTOpenSyncObjectNtHandleFromName",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTQueryAdapterInfo",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTQueryResourceInfo",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTQueryResourceInfoFromNtHandle",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTQueryStatistics",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTQueryVideoMemoryInfo",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTReleaseKeyedMutex",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTReleaseKeyedMutex2",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTSetQueuedLimit",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTSetVidPnSourceOwner",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTShareObjects",
+      "argCount": 5
+    },
+    {
+      "name": "D3DKMTSignalSynchronizationObjectFromCpu",
+      "argCount": 1
+    },
+    {
+      "name": "D3DKMTWaitForSynchronizationObjectFromCpu",
+      "argCount": 1
+    },
+    {
+      "name": "DeleteColorSpace",
+      "argCount": 1
+    },
+    {
+      "name": "DeleteDC",
+      "argCount": 1
+    },
+    {
+      "name": "DeleteEnhMetaFile",
+      "argCount": 1
+    },
+    {
+      "name": "DeleteMetaFile",
+      "argCount": 1
+    },
+    {
+      "name": "DeleteObject",
+      "argCount": 1
+    },
+    {
+      "name": "DescribePixelFormat",
+      "argCount": 4
+    },
+    {
+      "name": "DPtoLP",
+      "argCount": 3
+    },
+    {
+      "name": "DrawEscape",
+      "argCount": 4
+    },
+    {
+      "name": "Ellipse",
+      "argCount": 5
+    },
+    {
+      "name": "EnableEUDC",
+      "argCount": 1
+    },
+    {
+      "name": "EndDoc",
+      "argCount": 1
+    },
+    {
+      "name": "EndPage",
+      "argCount": 1
+    },
+    {
+      "name": "EndPath",
+      "argCount": 1
+    },
+    {
+      "name": "EnumEnhMetaFile",
+      "argCount": 5
+    },
+    {
+      "name": "EnumFontFamiliesA",
+      "argCount": 4
+    },
+    {
+      "name": "EnumFontFamiliesExA",
+      "argCount": 5
+    },
+    {
+      "name": "EnumFontFamiliesExW",
+      "argCount": 5
+    },
+    {
+      "name": "EnumFontFamiliesW",
+      "argCount": 4
+    },
+    {
+      "name": "EnumFontsA",
+      "argCount": 4
+    },
+    {
+      "name": "EnumFontsW",
+      "argCount": 4
+    },
+    {
+      "name": "EnumICMProfilesA",
+      "argCount": 3
+    },
+    {
+      "name": "EnumICMProfilesW",
+      "argCount": 3
+    },
+    {
+      "name": "EnumMetaFile",
+      "argCount": 4
+    },
+    {
+      "name": "EnumObjects",
+      "argCount": 4
+    },
+    {
+      "name": "EqualRgn",
+      "argCount": 2
+    },
+    {
+      "name": "Escape",
+      "argCount": 5
+    },
+    {
+      "name": "ExcludeClipRect",
+      "argCount": 5
+    },
+    {
+      "name": "ExtCreatePen",
+      "argCount": 5
+    },
+    {
+      "name": "ExtCreateRegion",
+      "argCount": 3
+    },
+    {
+      "name": "ExtEscape",
+      "argCount": 6
+    },
+    {
+      "name": "ExtFloodFill",
+      "argCount": 5
+    },
+    {
+      "name": "ExtSelectClipRgn",
+      "argCount": 3
+    },
+    {
+      "name": "ExtTextOutA",
+      "argCount": 8
+    },
+    {
+      "name": "ExtTextOutW",
+      "argCount": 8
+    },
+    {
+      "name": "FillPath",
+      "argCount": 1
+    },
+    {
+      "name": "FillRgn",
+      "argCount": 3
+    },
+    {
+      "name": "FixBrushOrgEx",
+      "argCount": 4
+    },
+    {
+      "name": "FlattenPath",
+      "argCount": 1
+    },
+    {
+      "name": "FloodFill",
+      "argCount": 4
+    },
+    {
+      "name": "FontIsLinked",
+      "argCount": 1
+    },
+    {
+      "name": "FrameRgn",
+      "argCount": 5
+    },
+    {
+      "name": "GdiAlphaBlend",
+      "argCount": 11
+    },
+    {
+      "name": "GdiComment",
+      "argCount": 3
+    },
+    {
+      "name": "GdiConvertToDevmodeW",
+      "argCount": 1
+    },
+    {
+      "name": "GdiDeleteSpoolFileHandle",
+      "argCount": 1
+    },
+    {
+      "name": "GdiDescribePixelFormat",
+      "argCount": 4
+    },
+    {
+      "name": "GdiDllInitialize",
+      "argCount": 3
+    },
+    {
+      "name": "GdiDrawStream",
+      "argCount": 3
+    },
+    {
+      "name": "GdiEntry13",
+      "argCount": 0
+    },
+    {
+      "name": "GdiFlush",
+      "argCount": 0
+    },
+    {
+      "name": "GdiGetBatchLimit",
+      "argCount": 0
+    },
+    {
+      "name": "GdiGetCharDimensions",
+      "argCount": 3
+    },
+    {
+      "name": "GdiGetCodePage",
+      "argCount": 1
+    },
+    {
+      "name": "GdiGetDevmodeForPage",
+      "argCount": 4
+    },
+    {
+      "name": "GdiGetSpoolFileHandle",
+      "argCount": 3
+    },
+    {
+      "name": "GdiGetSpoolMessage",
+      "argCount": 4
+    },
+    {
+      "name": "GdiGradientFill",
+      "argCount": 6
+    },
+    {
+      "name": "GdiInitializeLanguagePack",
+      "argCount": 1
+    },
+    {
+      "name": "GdiInitSpool",
+      "argCount": 0
+    },
+    {
+      "name": "GdiIsMetaFileDC",
+      "argCount": 1
+    },
+    {
+      "name": "GdiIsMetaPrintDC",
+      "argCount": 1
+    },
+    {
+      "name": "GdiIsPlayMetafileDC",
+      "argCount": 1
+    },
+    {
+      "name": "GdiRealizationInfo",
+      "argCount": 2
+    },
+    {
+      "name": "GdiSetBatchLimit",
+      "argCount": 1
+    },
+    {
+      "name": "GdiSetPixelFormat",
+      "argCount": 3
+    },
+    {
+      "name": "GdiSwapBuffers",
+      "argCount": 1
+    },
+    {
+      "name": "GdiTransparentBlt",
+      "argCount": 11
+    },
+    {
+      "name": "GetArcDirection",
+      "argCount": 1
+    },
+    {
+      "name": "GetAspectRatioFilterEx",
+      "argCount": 2
+    },
+    {
+      "name": "GetBitmapBits",
+      "argCount": 3
+    },
+    {
+      "name": "GetBitmapDimensionEx",
+      "argCount": 2
+    },
+    {
+      "name": "GetBkColor",
+      "argCount": 1
+    },
+    {
+      "name": "GetBkMode",
+      "argCount": 1
+    },
+    {
+      "name": "GetBoundsRect",
+      "argCount": 3
+    },
+    {
+      "name": "GetBrushOrgEx",
+      "argCount": 2
+    },
+    {
+      "name": "GetCharABCWidthsA",
+      "argCount": 4
+    },
+    {
+      "name": "GetCharABCWidthsFloatA",
+      "argCount": 4
+    },
+    {
+      "name": "GetCharABCWidthsFloatW",
+      "argCount": 4
+    },
+    {
+      "name": "GetCharABCWidthsI",
+      "argCount": 5
+    },
+    {
+      "name": "GetCharABCWidthsW",
+      "argCount": 4
+    },
+    {
+      "name": "GetCharacterPlacementA",
+      "argCount": 6
+    },
+    {
+      "name": "GetCharacterPlacementW",
+      "argCount": 6
+    },
+    {
+      "name": "GetCharWidth32A",
+      "argCount": 4
+    },
+    {
+      "name": "GetCharWidth32W",
+      "argCount": 4
+    },
+    {
+      "name": "GetCharWidthA",
+      "argCount": 4
+    },
+    {
+      "name": "GetCharWidthFloatA",
+      "argCount": 4
+    },
+    {
+      "name": "GetCharWidthFloatW",
+      "argCount": 4
+    },
+    {
+      "name": "GetCharWidthI",
+      "argCount": 5
+    },
+    {
+      "name": "GetCharWidthInfo",
+      "argCount": 2
+    },
+    {
+      "name": "GetCharWidthW",
+      "argCount": 4
+    },
+    {
+      "name": "GetClipBox",
+      "argCount": 2
+    },
+    {
+      "name": "GetClipRgn",
+      "argCount": 2
+    },
+    {
+      "name": "GetColorAdjustment",
+      "argCount": 2
+    },
+    {
+      "name": "GetColorSpace",
+      "argCount": 1
+    },
+    {
+      "name": "GetCurrentObject",
+      "argCount": 2
+    },
+    {
+      "name": "GetCurrentPositionEx",
+      "argCount": 2
+    },
+    {
+      "name": "GetDCBrushColor",
+      "argCount": 1
+    },
+    {
+      "name": "GetDCOrgEx",
+      "argCount": 2
+    },
+    {
+      "name": "GetDCPenColor",
+      "argCount": 1
+    },
+    {
+      "name": "GetDeviceCaps",
+      "argCount": 2
+    },
+    {
+      "name": "GetDeviceGammaRamp",
+      "argCount": 2
+    },
+    {
+      "name": "GetDIBColorTable",
+      "argCount": 4
+    },
+    {
+      "name": "GetDIBits",
+      "argCount": 7
+    },
+    {
+      "name": "GetEnhMetaFileA",
+      "argCount": 1
+    },
+    {
+      "name": "GetEnhMetaFileBits",
+      "argCount": 3
+    },
+    {
+      "name": "GetEnhMetaFileDescriptionA",
+      "argCount": 3
+    },
+    {
+      "name": "GetEnhMetaFileDescriptionW",
+      "argCount": 3
+    },
+    {
+      "name": "GetEnhMetaFileHeader",
+      "argCount": 3
+    },
+    {
+      "name": "GetEnhMetaFilePaletteEntries",
+      "argCount": 3
+    },
+    {
+      "name": "GetEnhMetaFilePixelFormat",
+      "argCount": 3
+    },
+    {
+      "name": "GetEnhMetaFileW",
+      "argCount": 1
+    },
+    {
+      "name": "GetFontData",
+      "argCount": 5
+    },
+    {
+      "name": "GetFontFileData",
+      "argCount": 6,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "GetFontFileInfo",
+      "argCount": 5
+    },
+    {
+      "name": "GetFontLanguageInfo",
+      "argCount": 1
+    },
+    {
+      "name": "GetFontRealizationInfo",
+      "argCount": 2
+    },
+    {
+      "name": "GetFontResourceInfoW",
+      "argCount": 4
+    },
+    {
+      "name": "GetFontUnicodeRanges",
+      "argCount": 2
+    },
+    {
+      "name": "GetGlyphIndicesA",
+      "argCount": 5
+    },
+    {
+      "name": "GetGlyphIndicesW",
+      "argCount": 5
+    },
+    {
+      "name": "GetGlyphOutline",
+      "argCount": 7
+    },
+    {
+      "name": "GetGlyphOutlineA",
+      "argCount": 7
+    },
+    {
+      "name": "GetGlyphOutlineW",
+      "argCount": 7
+    },
+    {
+      "name": "GetGraphicsMode",
+      "argCount": 1
+    },
+    {
+      "name": "GetICMProfileA",
+      "argCount": 3
+    },
+    {
+      "name": "GetICMProfileW",
+      "argCount": 3
+    },
+    {
+      "name": "GetKerningPairs",
+      "argCount": 3
+    },
+    {
+      "name": "GetKerningPairsA",
+      "argCount": 3
+    },
+    {
+      "name": "GetKerningPairsW",
+      "argCount": 3
+    },
+    {
+      "name": "GetLayout",
+      "argCount": 1
+    },
+    {
+      "name": "GetLogColorSpaceA",
+      "argCount": 3
+    },
+    {
+      "name": "GetLogColorSpaceW",
+      "argCount": 3
+    },
+    {
+      "name": "GetMapMode",
+      "argCount": 1
+    },
+    {
+      "name": "GetMetaFileA",
+      "argCount": 1
+    },
+    {
+      "name": "GetMetaFileBitsEx",
+      "argCount": 3
+    },
+    {
+      "name": "GetMetaFileW",
+      "argCount": 1
+    },
+    {
+      "name": "GetMetaRgn",
+      "argCount": 2
+    },
+    {
+      "name": "GetMiterLimit",
+      "argCount": 2
+    },
+    {
+      "name": "GetNearestColor",
+      "argCount": 2
+    },
+    {
+      "name": "GetNearestPaletteIndex",
+      "argCount": 2
+    },
+    {
+      "name": "GetObjectA",
+      "argCount": 3
+    },
+    {
+      "name": "GetObjectType",
+      "argCount": 1
+    },
+    {
+      "name": "GetObjectW",
+      "argCount": 3
+    },
+    {
+      "name": "GetOutlineTextMetricsA",
+      "argCount": 3
+    },
+    {
+      "name": "GetOutlineTextMetricsW",
+      "argCount": 3
+    },
+    {
+      "name": "GetPaletteEntries",
+      "argCount": 4
+    },
+    {
+      "name": "GetPath",
+      "argCount": 4
+    },
+    {
+      "name": "GetPixel",
+      "argCount": 3
+    },
+    {
+      "name": "GetPixelFormat",
+      "argCount": 1
+    },
+    {
+      "name": "GetPolyFillMode",
+      "argCount": 1
+    },
+    {
+      "name": "GetRandomRgn",
+      "argCount": 3
+    },
+    {
+      "name": "GetRasterizerCaps",
+      "argCount": 2
+    },
+    {
+      "name": "GetRegionData",
+      "argCount": 3
+    },
+    {
+      "name": "GetRelAbs",
+      "argCount": 2
+    },
+    {
+      "name": "GetRgnBox",
+      "argCount": 2
+    },
+    {
+      "name": "GetROP2",
+      "argCount": 1
+    },
+    {
+      "name": "GetStockObject",
+      "argCount": 1
+    },
+    {
+      "name": "GetStretchBltMode",
+      "argCount": 1
+    },
+    {
+      "name": "GetSystemPaletteEntries",
+      "argCount": 4
+    },
+    {
+      "name": "GetSystemPaletteUse",
+      "argCount": 1
+    },
+    {
+      "name": "GetTextAlign",
+      "argCount": 1
+    },
+    {
+      "name": "GetTextCharacterExtra",
+      "argCount": 1
+    },
+    {
+      "name": "GetTextCharset",
+      "argCount": 1
+    },
+    {
+      "name": "GetTextCharsetInfo",
+      "argCount": 3
+    },
+    {
+      "name": "GetTextColor",
+      "argCount": 1
+    },
+    {
+      "name": "GetTextExtentExPointA",
+      "argCount": 7
+    },
+    {
+      "name": "GetTextExtentExPointI",
+      "argCount": 7
+    },
+    {
+      "name": "GetTextExtentExPointW",
+      "argCount": 7
+    },
+    {
+      "name": "GetTextExtentPoint32A",
+      "argCount": 4
+    },
+    {
+      "name": "GetTextExtentPoint32W",
+      "argCount": 4
+    },
+    {
+      "name": "GetTextExtentPointA",
+      "argCount": 4
+    },
+    {
+      "name": "GetTextExtentPointI",
+      "argCount": 4
+    },
+    {
+      "name": "GetTextExtentPointW",
+      "argCount": 4
+    },
+    {
+      "name": "GetTextFaceA",
+      "argCount": 3
+    },
+    {
+      "name": "GetTextFaceW",
+      "argCount": 3
+    },
+    {
+      "name": "GetTextMetricsA",
+      "argCount": 2
+    },
+    {
+      "name": "GetTextMetricsW",
+      "argCount": 2
+    },
+    {
+      "name": "GetTransform",
+      "argCount": 3
+    },
+    {
+      "name": "GetViewportExtEx",
+      "argCount": 2
+    },
+    {
+      "name": "GetViewportOrgEx",
+      "argCount": 2
+    },
+    {
+      "name": "GetWindowExtEx",
+      "argCount": 2
+    },
+    {
+      "name": "GetWindowOrgEx",
+      "argCount": 2
+    },
+    {
+      "name": "GetWinMetaFileBits",
+      "argCount": 5
+    },
+    {
+      "name": "GetWorldTransform",
+      "argCount": 2
+    },
+    {
+      "name": "IntersectClipRect",
+      "argCount": 5
+    },
+    {
+      "name": "InvertRgn",
+      "argCount": 2
+    },
+    {
+      "name": "LineDDA",
+      "argCount": 6
+    },
+    {
+      "name": "LineTo",
+      "argCount": 3
+    },
+    {
+      "name": "LPtoDP",
+      "argCount": 3
+    },
+    {
+      "name": "MaskBlt",
+      "argCount": 12
+    },
+    {
+      "name": "MirrorRgn",
+      "argCount": 2
+    },
+    {
+      "name": "ModifyWorldTransform",
+      "argCount": 3
+    },
+    {
+      "name": "MoveToEx",
+      "argCount": 4
+    },
+    {
+      "name": "NamedEscape",
+      "argCount": 7
+    },
+    {
+      "name": "OffsetClipRgn",
+      "argCount": 3
+    },
+    {
+      "name": "OffsetRgn",
+      "argCount": 3
+    },
+    {
+      "name": "OffsetViewportOrgEx",
+      "argCount": 4
+    },
+    {
+      "name": "OffsetWindowOrgEx",
+      "argCount": 4
+    },
+    {
+      "name": "PaintRgn",
+      "argCount": 2
+    },
+    {
+      "name": "PatBlt",
+      "argCount": 6
+    },
+    {
+      "name": "PathToRegion",
+      "argCount": 1
+    },
+    {
+      "name": "Pie",
+      "argCount": 9
+    },
+    {
+      "name": "PlayEnhMetaFile",
+      "argCount": 3
+    },
+    {
+      "name": "PlayEnhMetaFileRecord",
+      "argCount": 4
+    },
+    {
+      "name": "PlayMetaFile",
+      "argCount": 2
+    },
+    {
+      "name": "PlayMetaFileRecord",
+      "argCount": 4
+    },
+    {
+      "name": "PlgBlt",
+      "argCount": 10
+    },
+    {
+      "name": "PolyBezier",
+      "argCount": 3
+    },
+    {
+      "name": "PolyBezierTo",
+      "argCount": 3
+    },
+    {
+      "name": "PolyDraw",
+      "argCount": 4
+    },
+    {
+      "name": "Polygon",
+      "argCount": 3
+    },
+    {
+      "name": "Polyline",
+      "argCount": 3
+    },
+    {
+      "name": "PolylineTo",
+      "argCount": 3
+    },
+    {
+      "name": "PolyPolygon",
+      "argCount": 4
+    },
+    {
+      "name": "PolyPolyline",
+      "argCount": 4
+    },
+    {
+      "name": "PolyTextOutA",
+      "argCount": 3
+    },
+    {
+      "name": "PolyTextOutW",
+      "argCount": 3
+    },
+    {
+      "name": "PtInRegion",
+      "argCount": 3
+    },
+    {
+      "name": "PtVisible",
+      "argCount": 3
+    },
+    {
+      "name": "RealizePalette",
+      "argCount": 1
+    },
+    {
+      "name": "Rectangle",
+      "argCount": 5
+    },
+    {
+      "name": "RectInRegion",
+      "argCount": 2
+    },
+    {
+      "name": "RectVisible",
+      "argCount": 2
+    },
+    {
+      "name": "RemoveFontMemResourceEx",
+      "argCount": 1
+    },
+    {
+      "name": "RemoveFontResourceA",
+      "argCount": 1
+    },
+    {
+      "name": "RemoveFontResourceExA",
+      "argCount": 3
+    },
+    {
+      "name": "RemoveFontResourceExW",
+      "argCount": 3
+    },
+    {
+      "name": "RemoveFontResourceW",
+      "argCount": 1
+    },
+    {
+      "name": "ResetDCA",
+      "argCount": 2
+    },
+    {
+      "name": "ResetDCW",
+      "argCount": 2
+    },
+    {
+      "name": "ResizePalette",
+      "argCount": 2
+    },
+    {
+      "name": "RestoreDC",
+      "argCount": 2
+    },
+    {
+      "name": "RoundRect",
+      "argCount": 7
+    },
+    {
+      "name": "SaveDC",
+      "argCount": 1
+    },
+    {
+      "name": "ScaleViewportExtEx",
+      "argCount": 6
+    },
+    {
+      "name": "ScaleWindowExtEx",
+      "argCount": 6
+    },
+    {
+      "name": "ScriptApplyDigitSubstitution",
+      "argCount": 3
+    },
+    {
+      "name": "ScriptApplyLogicalWidth",
+      "argCount": 9
+    },
+    {
+      "name": "ScriptBreak",
+      "argCount": 4
+    },
+    {
+      "name": "ScriptCacheGetHeight",
+      "argCount": 3
+    },
+    {
+      "name": "ScriptCPtoX",
+      "argCount": 9
+    },
+    {
+      "name": "ScriptFreeCache",
+      "argCount": 1
+    },
+    {
+      "name": "ScriptGetCMap",
+      "argCount": 6
+    },
+    {
+      "name": "ScriptGetFontAlternateGlyphs",
+      "argCount": 10
+    },
+    {
+      "name": "ScriptGetFontFeatureTags",
+      "argCount": 8
+    },
+    {
+      "name": "ScriptGetFontLanguageTags",
+      "argCount": 7
+    },
+    {
+      "name": "ScriptGetFontProperties",
+      "argCount": 3
+    },
+    {
+      "name": "ScriptGetFontScriptTags",
+      "argCount": 6
+    },
+    {
+      "name": "ScriptGetGlyphABCWidth",
+      "argCount": 4
+    },
+    {
+      "name": "ScriptGetLogicalWidths",
+      "argCount": 7
+    },
+    {
+      "name": "ScriptGetProperties",
+      "argCount": 2
+    },
+    {
+      "name": "ScriptIsComplex",
+      "argCount": 3
+    },
+    {
+      "name": "ScriptItemize",
+      "argCount": 7
+    },
+    {
+      "name": "ScriptItemizeOpenType",
+      "argCount": 8
+    },
+    {
+      "name": "ScriptJustify",
+      "argCount": 6
+    },
+    {
+      "name": "ScriptLayout",
+      "argCount": 4
+    },
+    {
+      "name": "ScriptPlace",
+      "argCount": 9
+    },
+    {
+      "name": "ScriptPlaceOpenType",
+      "argCount": 18
+    },
+    {
+      "name": "ScriptRecordDigitSubstitution",
+      "argCount": 2
+    },
+    {
+      "name": "ScriptShape",
+      "argCount": 10
+    },
+    {
+      "name": "ScriptShapeOpenType",
+      "argCount": 16
+    },
+    {
+      "name": "ScriptString_pcOutChars",
+      "argCount": 1
+    },
+    {
+      "name": "ScriptString_pLogAttr",
+      "argCount": 1
+    },
+    {
+      "name": "ScriptString_pSize",
+      "argCount": 1
+    },
+    {
+      "name": "ScriptStringAnalyse",
+      "argCount": 13
+    },
+    {
+      "name": "ScriptStringCPtoX",
+      "argCount": 4
+    },
+    {
+      "name": "ScriptStringFree",
+      "argCount": 1
+    },
+    {
+      "name": "ScriptStringGetLogicalWidths",
+      "argCount": 2
+    },
+    {
+      "name": "ScriptStringGetOrder",
+      "argCount": 2
+    },
+    {
+      "name": "ScriptStringOut",
+      "argCount": 8
+    },
+    {
+      "name": "ScriptStringValidate",
+      "argCount": 1
+    },
+    {
+      "name": "ScriptStringXtoCP",
+      "argCount": 4
+    },
+    {
+      "name": "ScriptTextOut",
+      "argCount": 14
+    },
+    {
+      "name": "ScriptXtoCP",
+      "argCount": 9
+    },
+    {
+      "name": "SelectClipPath",
+      "argCount": 2
+    },
+    {
+      "name": "SelectClipRgn",
+      "argCount": 2
+    },
+    {
+      "name": "SelectObject",
+      "argCount": 2
+    },
+    {
+      "name": "SelectPalette",
+      "argCount": 3
+    },
+    {
+      "name": "SetAbortProc",
+      "argCount": 2
+    },
+    {
+      "name": "SetArcDirection",
+      "argCount": 2
+    },
+    {
+      "name": "SetBitmapBits",
+      "argCount": 3
+    },
+    {
+      "name": "SetBitmapDimensionEx",
+      "argCount": 4
+    },
+    {
+      "name": "SetBkColor",
+      "argCount": 2
+    },
+    {
+      "name": "SetBkMode",
+      "argCount": 2
+    },
+    {
+      "name": "SetBoundsRect",
+      "argCount": 3
+    },
+    {
+      "name": "SetBrushOrgEx",
+      "argCount": 4
+    },
+    {
+      "name": "SetColorAdjustment",
+      "argCount": 2
+    },
+    {
+      "name": "SetColorSpace",
+      "argCount": 2
+    },
+    {
+      "name": "SetDCBrushColor",
+      "argCount": 2
+    },
+    {
+      "name": "SetDCPenColor",
+      "argCount": 2
+    },
+    {
+      "name": "SetDeviceGammaRamp",
+      "argCount": 2
+    },
+    {
+      "name": "SetDIBColorTable",
+      "argCount": 4
+    },
+    {
+      "name": "SetDIBits",
+      "argCount": 7
+    },
+    {
+      "name": "SetDIBitsToDevice",
+      "argCount": 12
+    },
+    {
+      "name": "SetEnhMetaFileBits",
+      "argCount": 2
+    },
+    {
+      "name": "SetGraphicsMode",
+      "argCount": 2
+    },
+    {
+      "name": "SetICMMode",
+      "argCount": 2
+    },
+    {
+      "name": "SetICMProfileA",
+      "argCount": 2
+    },
+    {
+      "name": "SetICMProfileW",
+      "argCount": 2
+    },
+    {
+      "name": "SetLayout",
+      "argCount": 2
+    },
+    {
+      "name": "SetMagicColors",
+      "argCount": 3
+    },
+    {
+      "name": "SetMapMode",
+      "argCount": 2
+    },
+    {
+      "name": "SetMapperFlags",
+      "argCount": 2
+    },
+    {
+      "name": "SetMetaFileBitsEx",
+      "argCount": 2
+    },
+    {
+      "name": "SetMetaRgn",
+      "argCount": 1
+    },
+    {
+      "name": "SetMiterLimit",
+      "argCount": 3
+    },
+    {
+      "name": "SetObjectOwner",
+      "argCount": 2
+    },
+    {
+      "name": "SetPaletteEntries",
+      "argCount": 4
+    },
+    {
+      "name": "SetPixel",
+      "argCount": 4
+    },
+    {
+      "name": "SetPixelFormat",
+      "argCount": 3
+    },
+    {
+      "name": "SetPixelV",
+      "argCount": 4
+    },
+    {
+      "name": "SetPolyFillMode",
+      "argCount": 2
+    },
+    {
+      "name": "SetRectRgn",
+      "argCount": 5
+    },
+    {
+      "name": "SetRelAbs",
+      "argCount": 2
+    },
+    {
+      "name": "SetROP2",
+      "argCount": 2
+    },
+    {
+      "name": "SetStretchBltMode",
+      "argCount": 2
+    },
+    {
+      "name": "SetSystemPaletteUse",
+      "argCount": 2
+    },
+    {
+      "name": "SetTextAlign",
+      "argCount": 2
+    },
+    {
+      "name": "SetTextCharacterExtra",
+      "argCount": 2
+    },
+    {
+      "name": "SetTextColor",
+      "argCount": 2
+    },
+    {
+      "name": "SetTextJustification",
+      "argCount": 3
+    },
+    {
+      "name": "SetViewportExtEx",
+      "argCount": 4
+    },
+    {
+      "name": "SetViewportOrgEx",
+      "argCount": 4
+    },
+    {
+      "name": "SetVirtualResolution",
+      "argCount": 5
+    },
+    {
+      "name": "SetWindowExtEx",
+      "argCount": 4
+    },
+    {
+      "name": "SetWindowOrgEx",
+      "argCount": 4
+    },
+    {
+      "name": "SetWinMetaFileBits",
+      "argCount": 4
+    },
+    {
+      "name": "SetWorldTransform",
+      "argCount": 2
+    },
+    {
+      "name": "StartDocA",
+      "argCount": 2
+    },
+    {
+      "name": "StartDocW",
+      "argCount": 2
+    },
+    {
+      "name": "StartPage",
+      "argCount": 1
+    },
+    {
+      "name": "StretchBlt",
+      "argCount": 11
+    },
+    {
+      "name": "StretchDIBits",
+      "argCount": 13
+    },
+    {
+      "name": "StrokeAndFillPath",
+      "argCount": 1
+    },
+    {
+      "name": "StrokePath",
+      "argCount": 1
+    },
+    {
+      "name": "SwapBuffers",
+      "argCount": 1
+    },
+    {
+      "name": "TextOutA",
+      "argCount": 5
+    },
+    {
+      "name": "TextOutW",
+      "argCount": 5
+    },
+    {
+      "name": "TranslateCharsetInfo",
+      "argCount": 3
+    },
+    {
+      "name": "UnrealizeObject",
+      "argCount": 1
+    },
+    {
+      "name": "UpdateColors",
+      "argCount": 1
+    },
+    {
+      "name": "UpdateICMRegKey",
+      "argCount": 4
+    },
+    {
+      "name": "UpdateICMRegKeyA",
+      "argCount": 4
+    },
+    {
+      "name": "UpdateICMRegKeyW",
+      "argCount": 4
+    },
+    {
+      "name": "WidenPath",
+      "argCount": 1
+    }
+  ]
+}

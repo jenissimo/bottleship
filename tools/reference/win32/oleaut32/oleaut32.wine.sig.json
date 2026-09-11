@@ -1,0 +1,3297 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.928Z",
+  "module": "oleaut32",
+  "functions": [
+    {
+      "name": "BSTR_UserFree",
+      "argCount": 2
+    },
+    {
+      "name": "BSTR_UserMarshal",
+      "argCount": 3
+    },
+    {
+      "name": "BSTR_UserSize",
+      "argCount": 3
+    },
+    {
+      "name": "BSTR_UserUnmarshal",
+      "argCount": 3
+    },
+    {
+      "name": "BstrFromVector",
+      "argCount": 2
+    },
+    {
+      "name": "ClearCustData",
+      "argCount": 1
+    },
+    {
+      "name": "CreateDispTypeInfo",
+      "argCount": 3
+    },
+    {
+      "name": "CreateErrorInfo",
+      "argCount": 1
+    },
+    {
+      "name": "CreateStdDispatch",
+      "argCount": 4
+    },
+    {
+      "name": "CreateTypeLib",
+      "argCount": 3
+    },
+    {
+      "name": "CreateTypeLib2",
+      "argCount": 3
+    },
+    {
+      "name": "DispCallFunc",
+      "argCount": 8
+    },
+    {
+      "name": "DispGetIDsOfNames",
+      "argCount": 4
+    },
+    {
+      "name": "DispGetParam",
+      "argCount": 5
+    },
+    {
+      "name": "DispInvoke",
+      "argCount": 8
+    },
+    {
+      "name": "DllCanUnloadNow",
+      "argCount": 0
+    },
+    {
+      "name": "DllGetClassObject",
+      "argCount": 3
+    },
+    {
+      "name": "DllRegisterServer",
+      "argCount": 0
+    },
+    {
+      "name": "DllUnregisterServer",
+      "argCount": 0
+    },
+    {
+      "name": "DosDateTimeToVariantTime",
+      "argCount": 3
+    },
+    {
+      "name": "GetActiveObject",
+      "argCount": 3
+    },
+    {
+      "name": "GetAltMonthNames",
+      "argCount": 2
+    },
+    {
+      "name": "GetErrorInfo",
+      "argCount": 2
+    },
+    {
+      "name": "GetRecordInfoFromGuids",
+      "argCount": 6
+    },
+    {
+      "name": "GetRecordInfoFromTypeInfo",
+      "argCount": 2
+    },
+    {
+      "name": "LHashValOfNameSys",
+      "argCount": 3
+    },
+    {
+      "name": "LHashValOfNameSysA",
+      "argCount": 3
+    },
+    {
+      "name": "LoadRegTypeLib",
+      "argCount": 5
+    },
+    {
+      "name": "LoadTypeLib",
+      "argCount": 2
+    },
+    {
+      "name": "LoadTypeLibEx",
+      "argCount": 3
+    },
+    {
+      "name": "LPSAFEARRAY_UserFree",
+      "argCount": 2
+    },
+    {
+      "name": "LPSAFEARRAY_UserMarshal",
+      "argCount": 3
+    },
+    {
+      "name": "LPSAFEARRAY_UserSize",
+      "argCount": 3
+    },
+    {
+      "name": "LPSAFEARRAY_UserUnmarshal",
+      "argCount": 3
+    },
+    {
+      "name": "OaBuildVersion",
+      "argCount": 0
+    },
+    {
+      "name": "OleCreateFontIndirect",
+      "argCount": 3
+    },
+    {
+      "name": "OleCreatePictureIndirect",
+      "argCount": 4
+    },
+    {
+      "name": "OleCreatePropertyFrame",
+      "argCount": 11
+    },
+    {
+      "name": "OleCreatePropertyFrameIndirect",
+      "argCount": 1
+    },
+    {
+      "name": "OleIconToCursor",
+      "argCount": 2
+    },
+    {
+      "name": "OleLoadPicture",
+      "argCount": 5
+    },
+    {
+      "name": "OleLoadPictureEx",
+      "argCount": 8
+    },
+    {
+      "name": "OleLoadPictureFile",
+      "argCount": 2
+    },
+    {
+      "name": "OleLoadPicturePath",
+      "argCount": 6
+    },
+    {
+      "name": "OleSavePictureFile",
+      "argCount": 2
+    },
+    {
+      "name": "OleTranslateColor",
+      "argCount": 3
+    },
+    {
+      "name": "ord_10",
+      "argCount": 2
+    },
+    {
+      "name": "ord_100",
+      "argCount": 2
+    },
+    {
+      "name": "ord_101",
+      "argCount": 2
+    },
+    {
+      "name": "ord_102",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_103",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_104",
+      "argCount": 4
+    },
+    {
+      "name": "ord_105",
+      "argCount": 3
+    },
+    {
+      "name": "ord_106",
+      "argCount": 2
+    },
+    {
+      "name": "ord_107",
+      "argCount": 7
+    },
+    {
+      "name": "ord_108",
+      "argCount": 4
+    },
+    {
+      "name": "ord_109",
+      "argCount": 4
+    },
+    {
+      "name": "ord_11",
+      "argCount": 2
+    },
+    {
+      "name": "ord_110",
+      "argCount": 4
+    },
+    {
+      "name": "ord_111",
+      "argCount": 4
+    },
+    {
+      "name": "ord_112",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_113",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_114",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_115",
+      "argCount": 4
+    },
+    {
+      "name": "ord_116",
+      "argCount": 4
+    },
+    {
+      "name": "ord_117",
+      "argCount": 7
+    },
+    {
+      "name": "ord_118",
+      "argCount": 2
+    },
+    {
+      "name": "ord_119",
+      "argCount": 2
+    },
+    {
+      "name": "ord_12",
+      "argCount": 4
+    },
+    {
+      "name": "ord_120",
+      "argCount": 2
+    },
+    {
+      "name": "ord_121",
+      "argCount": 2
+    },
+    {
+      "name": "ord_122",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_123",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_124",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_125",
+      "argCount": 4
+    },
+    {
+      "name": "ord_126",
+      "argCount": 3
+    },
+    {
+      "name": "ord_127",
+      "argCount": 7
+    },
+    {
+      "name": "ord_128",
+      "argCount": 5
+    },
+    {
+      "name": "ord_129",
+      "argCount": 4
+    },
+    {
+      "name": "ord_13",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_130",
+      "argCount": 2
+    },
+    {
+      "name": "ord_131",
+      "argCount": 2
+    },
+    {
+      "name": "ord_132",
+      "argCount": 2
+    },
+    {
+      "name": "ord_133",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_134",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_135",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_136",
+      "argCount": 4
+    },
+    {
+      "name": "ord_137",
+      "argCount": 3
+    },
+    {
+      "name": "ord_138",
+      "argCount": 2
+    },
+    {
+      "name": "ord_139",
+      "argCount": 6
+    },
+    {
+      "name": "ord_14",
+      "argCount": 3
+    },
+    {
+      "name": "ord_140",
+      "argCount": 7
+    },
+    {
+      "name": "ord_141",
+      "argCount": 3
+    },
+    {
+      "name": "ord_142",
+      "argCount": 3
+    },
+    {
+      "name": "ord_143",
+      "argCount": 3
+    },
+    {
+      "name": "ord_146",
+      "argCount": 8
+    },
+    {
+      "name": "ord_147",
+      "argCount": 5
+    },
+    {
+      "name": "ord_148",
+      "argCount": 3
+    },
+    {
+      "name": "ord_149",
+      "argCount": 1
+    },
+    {
+      "name": "ord_15",
+      "argCount": 3
+    },
+    {
+      "name": "ord_150",
+      "argCount": 2
+    },
+    {
+      "name": "ord_152",
+      "argCount": 3
+    },
+    {
+      "name": "ord_153",
+      "argCount": 3
+    },
+    {
+      "name": "ord_154",
+      "argCount": 3
+    },
+    {
+      "name": "ord_155",
+      "argCount": 3
+    },
+    {
+      "name": "ord_156",
+      "argCount": 3
+    },
+    {
+      "name": "ord_157",
+      "argCount": 3
+    },
+    {
+      "name": "ord_158",
+      "argCount": 3
+    },
+    {
+      "name": "ord_159",
+      "argCount": 3
+    },
+    {
+      "name": "ord_16",
+      "argCount": 1
+    },
+    {
+      "name": "ord_160",
+      "argCount": 3
+    },
+    {
+      "name": "ord_161",
+      "argCount": 2
+    },
+    {
+      "name": "ord_162",
+      "argCount": 5
+    },
+    {
+      "name": "ord_163",
+      "argCount": 3
+    },
+    {
+      "name": "ord_164",
+      "argCount": 5
+    },
+    {
+      "name": "ord_165",
+      "argCount": 3
+    },
+    {
+      "name": "ord_166",
+      "argCount": 3
+    },
+    {
+      "name": "ord_167",
+      "argCount": 3
+    },
+    {
+      "name": "ord_168",
+      "argCount": 2
+    },
+    {
+      "name": "ord_169",
+      "argCount": 2
+    },
+    {
+      "name": "ord_17",
+      "argCount": 1
+    },
+    {
+      "name": "ord_170",
+      "argCount": 0
+    },
+    {
+      "name": "ord_171",
+      "argCount": 1
+    },
+    {
+      "name": "ord_172",
+      "argCount": 2
+    },
+    {
+      "name": "ord_173",
+      "argCount": 2
+    },
+    {
+      "name": "ord_174",
+      "argCount": 2
+    },
+    {
+      "name": "ord_175",
+      "argCount": 3
+    },
+    {
+      "name": "ord_176",
+      "argCount": 4
+    },
+    {
+      "name": "ord_177",
+      "argCount": 3
+    },
+    {
+      "name": "ord_178",
+      "argCount": 3
+    },
+    {
+      "name": "ord_179",
+      "argCount": 3
+    },
+    {
+      "name": "ord_18",
+      "argCount": 1
+    },
+    {
+      "name": "ord_180",
+      "argCount": 3
+    },
+    {
+      "name": "ord_181",
+      "argCount": 3
+    },
+    {
+      "name": "ord_182",
+      "argCount": 2
+    },
+    {
+      "name": "ord_183",
+      "argCount": 3
+    },
+    {
+      "name": "ord_184",
+      "argCount": 2
+    },
+    {
+      "name": "ord_185",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_186",
+      "argCount": 5
+    },
+    {
+      "name": "ord_187",
+      "argCount": 2
+    },
+    {
+      "name": "ord_188",
+      "argCount": 2
+    },
+    {
+      "name": "ord_189",
+      "argCount": 2
+    },
+    {
+      "name": "ord_19",
+      "argCount": 3
+    },
+    {
+      "name": "ord_190",
+      "argCount": 2
+    },
+    {
+      "name": "ord_191",
+      "argCount": 2
+    },
+    {
+      "name": "ord_192",
+      "argCount": 2
+    },
+    {
+      "name": "ord_193",
+      "argCount": 2
+    },
+    {
+      "name": "ord_194",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_195",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_196",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_197",
+      "argCount": 4
+    },
+    {
+      "name": "ord_198",
+      "argCount": 3
+    },
+    {
+      "name": "ord_199",
+      "argCount": 2
+    },
+    {
+      "name": "ord_2",
+      "argCount": 1
+    },
+    {
+      "name": "ord_20",
+      "argCount": 3
+    },
+    {
+      "name": "ord_200",
+      "argCount": 2
+    },
+    {
+      "name": "ord_201",
+      "argCount": 2
+    },
+    {
+      "name": "ord_202",
+      "argCount": 1
+    },
+    {
+      "name": "ord_203",
+      "argCount": 3
+    },
+    {
+      "name": "ord_204",
+      "argCount": 2
+    },
+    {
+      "name": "ord_205",
+      "argCount": 2
+    },
+    {
+      "name": "ord_206",
+      "argCount": 2
+    },
+    {
+      "name": "ord_207",
+      "argCount": 2
+    },
+    {
+      "name": "ord_208",
+      "argCount": 2
+    },
+    {
+      "name": "ord_209",
+      "argCount": 2
+    },
+    {
+      "name": "ord_21",
+      "argCount": 1
+    },
+    {
+      "name": "ord_210",
+      "argCount": 2
+    },
+    {
+      "name": "ord_211",
+      "argCount": 2
+    },
+    {
+      "name": "ord_212",
+      "argCount": 2
+    },
+    {
+      "name": "ord_213",
+      "argCount": 2
+    },
+    {
+      "name": "ord_214",
+      "argCount": 2
+    },
+    {
+      "name": "ord_215",
+      "argCount": 2
+    },
+    {
+      "name": "ord_216",
+      "argCount": 2
+    },
+    {
+      "name": "ord_217",
+      "argCount": 2
+    },
+    {
+      "name": "ord_218",
+      "argCount": 2
+    },
+    {
+      "name": "ord_219",
+      "argCount": 2
+    },
+    {
+      "name": "ord_22",
+      "argCount": 1
+    },
+    {
+      "name": "ord_220",
+      "argCount": 2
+    },
+    {
+      "name": "ord_221",
+      "argCount": 2
+    },
+    {
+      "name": "ord_222",
+      "argCount": 2
+    },
+    {
+      "name": "ord_223",
+      "argCount": 2
+    },
+    {
+      "name": "ord_224",
+      "argCount": 2
+    },
+    {
+      "name": "ord_225",
+      "argCount": 2
+    },
+    {
+      "name": "ord_226",
+      "argCount": 2
+    },
+    {
+      "name": "ord_227",
+      "argCount": 2
+    },
+    {
+      "name": "ord_228",
+      "argCount": 2
+    },
+    {
+      "name": "ord_229",
+      "argCount": 4
+    },
+    {
+      "name": "ord_23",
+      "argCount": 2
+    },
+    {
+      "name": "ord_230",
+      "argCount": 4
+    },
+    {
+      "name": "ord_231",
+      "argCount": 4
+    },
+    {
+      "name": "ord_232",
+      "argCount": 4
+    },
+    {
+      "name": "ord_233",
+      "argCount": 2
+    },
+    {
+      "name": "ord_234",
+      "argCount": 2
+    },
+    {
+      "name": "ord_235",
+      "argCount": 2
+    },
+    {
+      "name": "ord_236",
+      "argCount": 2
+    },
+    {
+      "name": "ord_237",
+      "argCount": 2
+    },
+    {
+      "name": "ord_238",
+      "argCount": 2
+    },
+    {
+      "name": "ord_239",
+      "argCount": 2
+    },
+    {
+      "name": "ord_24",
+      "argCount": 1
+    },
+    {
+      "name": "ord_240",
+      "argCount": 2
+    },
+    {
+      "name": "ord_241",
+      "argCount": 2
+    },
+    {
+      "name": "ord_242",
+      "argCount": 2
+    },
+    {
+      "name": "ord_243",
+      "argCount": 2
+    },
+    {
+      "name": "ord_244",
+      "argCount": 2
+    },
+    {
+      "name": "ord_245",
+      "argCount": 2
+    },
+    {
+      "name": "ord_246",
+      "argCount": 2
+    },
+    {
+      "name": "ord_247",
+      "argCount": 2
+    },
+    {
+      "name": "ord_248",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_249",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_25",
+      "argCount": 3
+    },
+    {
+      "name": "ord_250",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_251",
+      "argCount": 4
+    },
+    {
+      "name": "ord_252",
+      "argCount": 3
+    },
+    {
+      "name": "ord_253",
+      "argCount": 2
+    },
+    {
+      "name": "ord_254",
+      "argCount": 2
+    },
+    {
+      "name": "ord_255",
+      "argCount": 2
+    },
+    {
+      "name": "ord_256",
+      "argCount": 2
+    },
+    {
+      "name": "ord_257",
+      "argCount": 2
+    },
+    {
+      "name": "ord_258",
+      "argCount": 2
+    },
+    {
+      "name": "ord_259",
+      "argCount": 2
+    },
+    {
+      "name": "ord_26",
+      "argCount": 3
+    },
+    {
+      "name": "ord_260",
+      "argCount": 2
+    },
+    {
+      "name": "ord_261",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_262",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_263",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_264",
+      "argCount": 4
+    },
+    {
+      "name": "ord_265",
+      "argCount": 3
+    },
+    {
+      "name": "ord_266",
+      "argCount": 2
+    },
+    {
+      "name": "ord_267",
+      "argCount": 2
+    },
+    {
+      "name": "ord_268",
+      "argCount": 2
+    },
+    {
+      "name": "ord_269",
+      "argCount": 2
+    },
+    {
+      "name": "ord_27",
+      "argCount": 2
+    },
+    {
+      "name": "ord_270",
+      "argCount": 2
+    },
+    {
+      "name": "ord_271",
+      "argCount": 2
+    },
+    {
+      "name": "ord_272",
+      "argCount": 2
+    },
+    {
+      "name": "ord_273",
+      "argCount": 2
+    },
+    {
+      "name": "ord_274",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_275",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_276",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_277",
+      "argCount": 4
+    },
+    {
+      "name": "ord_278",
+      "argCount": 3
+    },
+    {
+      "name": "ord_279",
+      "argCount": 2
+    },
+    {
+      "name": "ord_28",
+      "argCount": 5
+    },
+    {
+      "name": "ord_280",
+      "argCount": 2
+    },
+    {
+      "name": "ord_281",
+      "argCount": 2
+    },
+    {
+      "name": "ord_282",
+      "argCount": 2
+    },
+    {
+      "name": "ord_283",
+      "argCount": 3
+    },
+    {
+      "name": "ord_284",
+      "argCount": 3
+    },
+    {
+      "name": "ord_285",
+      "argCount": 3
+    },
+    {
+      "name": "ord_286",
+      "argCount": 2
+    },
+    {
+      "name": "ord_287",
+      "argCount": 3
+    },
+    {
+      "name": "ord_288",
+      "argCount": 3
+    },
+    {
+      "name": "ord_289",
+      "argCount": 3
+    },
+    {
+      "name": "ord_29",
+      "argCount": 4
+    },
+    {
+      "name": "ord_290",
+      "argCount": 2
+    },
+    {
+      "name": "ord_291",
+      "argCount": 3
+    },
+    {
+      "name": "ord_292",
+      "argCount": 3
+    },
+    {
+      "name": "ord_293",
+      "argCount": 3
+    },
+    {
+      "name": "ord_294",
+      "argCount": 2
+    },
+    {
+      "name": "ord_298",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_299",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_3",
+      "argCount": 2
+    },
+    {
+      "name": "ord_30",
+      "argCount": 8
+    },
+    {
+      "name": "ord_303",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_304",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_305",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_306",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_307",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_308",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_309",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_31",
+      "argCount": 3
+    },
+    {
+      "name": "ord_310",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_311",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_312",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64, double occupy two slots each)"
+    },
+    {
+      "name": "ord_313",
+      "argCount": 3
+    },
+    {
+      "name": "ord_314",
+      "argCount": 4
+    },
+    {
+      "name": "ord_315",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (double, double occupy two slots each)"
+    },
+    {
+      "name": "ord_316",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_317",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_318",
+      "argCount": 3
+    },
+    {
+      "name": "ord_319",
+      "argCount": 4
+    },
+    {
+      "name": "ord_32",
+      "argCount": 4
+    },
+    {
+      "name": "ord_322",
+      "argCount": 6
+    },
+    {
+      "name": "ord_323",
+      "argCount": 2
+    },
+    {
+      "name": "ord_327",
+      "argCount": 0
+    },
+    {
+      "name": "ord_329",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_33",
+      "argCount": 4
+    },
+    {
+      "name": "ord_330",
+      "argCount": 3
+    },
+    {
+      "name": "ord_331",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_332",
+      "argCount": 2
+    },
+    {
+      "name": "ord_333",
+      "argCount": 2
+    },
+    {
+      "name": "ord_334",
+      "argCount": 2
+    },
+    {
+      "name": "ord_335",
+      "argCount": 2
+    },
+    {
+      "name": "ord_336",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_337",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_338",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_339",
+      "argCount": 4
+    },
+    {
+      "name": "ord_34",
+      "argCount": 2
+    },
+    {
+      "name": "ord_340",
+      "argCount": 3
+    },
+    {
+      "name": "ord_341",
+      "argCount": 2
+    },
+    {
+      "name": "ord_342",
+      "argCount": 2
+    },
+    {
+      "name": "ord_343",
+      "argCount": 2
+    },
+    {
+      "name": "ord_344",
+      "argCount": 2
+    },
+    {
+      "name": "ord_345",
+      "argCount": 2
+    },
+    {
+      "name": "ord_346",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_347",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_348",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_349",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_35",
+      "argCount": 3
+    },
+    {
+      "name": "ord_36",
+      "argCount": 2
+    },
+    {
+      "name": "ord_360",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_361",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_362",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_363",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_364",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_365",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_366",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_367",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_368",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_369",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_37",
+      "argCount": 1
+    },
+    {
+      "name": "ord_370",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_371",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_372",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_373",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_374",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_375",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_376",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_377",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_378",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_379",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_38",
+      "argCount": 1
+    },
+    {
+      "name": "ord_39",
+      "argCount": 1
+    },
+    {
+      "name": "ord_4",
+      "argCount": 2
+    },
+    {
+      "name": "ord_40",
+      "argCount": 2
+    },
+    {
+      "name": "ord_401",
+      "argCount": 8
+    },
+    {
+      "name": "ord_41",
+      "argCount": 3
+    },
+    {
+      "name": "ord_411",
+      "argCount": 3
+    },
+    {
+      "name": "ord_412",
+      "argCount": 2
+    },
+    {
+      "name": "ord_413",
+      "argCount": 2
+    },
+    {
+      "name": "ord_414",
+      "argCount": 2
+    },
+    {
+      "name": "ord_415",
+      "argCount": 2
+    },
+    {
+      "name": "ord_416",
+      "argCount": 1
+    },
+    {
+      "name": "ord_417",
+      "argCount": 11
+    },
+    {
+      "name": "ord_418",
+      "argCount": 5
+    },
+    {
+      "name": "ord_419",
+      "argCount": 4
+    },
+    {
+      "name": "ord_42",
+      "argCount": 4
+    },
+    {
+      "name": "ord_420",
+      "argCount": 3
+    },
+    {
+      "name": "ord_421",
+      "argCount": 3
+    },
+    {
+      "name": "ord_422",
+      "argCount": 2
+    },
+    {
+      "name": "ord_423",
+      "argCount": 2
+    },
+    {
+      "name": "ord_424",
+      "argCount": 6
+    },
+    {
+      "name": "ord_425",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_426",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_427",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_428",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_429",
+      "argCount": 2
+    },
+    {
+      "name": "ord_43",
+      "argCount": 4
+    },
+    {
+      "name": "ord_430",
+      "argCount": 2
+    },
+    {
+      "name": "ord_431",
+      "argCount": 2
+    },
+    {
+      "name": "ord_432",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_433",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_434",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_435",
+      "argCount": 4
+    },
+    {
+      "name": "ord_436",
+      "argCount": 3
+    },
+    {
+      "name": "ord_437",
+      "argCount": 2
+    },
+    {
+      "name": "ord_438",
+      "argCount": 2
+    },
+    {
+      "name": "ord_439",
+      "argCount": 2
+    },
+    {
+      "name": "ord_44",
+      "argCount": 2
+    },
+    {
+      "name": "ord_440",
+      "argCount": 2
+    },
+    {
+      "name": "ord_441",
+      "argCount": 2
+    },
+    {
+      "name": "ord_442",
+      "argCount": 3
+    },
+    {
+      "name": "ord_443",
+      "argCount": 5
+    },
+    {
+      "name": "ord_45",
+      "argCount": 2
+    },
+    {
+      "name": "ord_46",
+      "argCount": 5
+    },
+    {
+      "name": "ord_47",
+      "argCount": 4
+    },
+    {
+      "name": "ord_48",
+      "argCount": 2
+    },
+    {
+      "name": "ord_49",
+      "argCount": 2
+    },
+    {
+      "name": "ord_5",
+      "argCount": 3
+    },
+    {
+      "name": "ord_50",
+      "argCount": 2
+    },
+    {
+      "name": "ord_51",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_52",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_53",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_54",
+      "argCount": 4
+    },
+    {
+      "name": "ord_55",
+      "argCount": 3
+    },
+    {
+      "name": "ord_56",
+      "argCount": 2
+    },
+    {
+      "name": "ord_57",
+      "argCount": 2
+    },
+    {
+      "name": "ord_58",
+      "argCount": 2
+    },
+    {
+      "name": "ord_59",
+      "argCount": 2
+    },
+    {
+      "name": "ord_6",
+      "argCount": 1
+    },
+    {
+      "name": "ord_60",
+      "argCount": 2
+    },
+    {
+      "name": "ord_61",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_62",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_63",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_64",
+      "argCount": 4
+    },
+    {
+      "name": "ord_65",
+      "argCount": 3
+    },
+    {
+      "name": "ord_66",
+      "argCount": 2
+    },
+    {
+      "name": "ord_67",
+      "argCount": 2
+    },
+    {
+      "name": "ord_68",
+      "argCount": 2
+    },
+    {
+      "name": "ord_69",
+      "argCount": 2
+    },
+    {
+      "name": "ord_7",
+      "argCount": 1
+    },
+    {
+      "name": "ord_70",
+      "argCount": 2
+    },
+    {
+      "name": "ord_71",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_72",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_73",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_74",
+      "argCount": 4
+    },
+    {
+      "name": "ord_75",
+      "argCount": 3
+    },
+    {
+      "name": "ord_76",
+      "argCount": 2
+    },
+    {
+      "name": "ord_77",
+      "argCount": 2
+    },
+    {
+      "name": "ord_78",
+      "argCount": 2
+    },
+    {
+      "name": "ord_79",
+      "argCount": 2
+    },
+    {
+      "name": "ord_8",
+      "argCount": 1
+    },
+    {
+      "name": "ord_80",
+      "argCount": 2
+    },
+    {
+      "name": "ord_81",
+      "argCount": 2
+    },
+    {
+      "name": "ord_82",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_83",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_84",
+      "argCount": 4
+    },
+    {
+      "name": "ord_85",
+      "argCount": 3
+    },
+    {
+      "name": "ord_86",
+      "argCount": 2
+    },
+    {
+      "name": "ord_87",
+      "argCount": 6
+    },
+    {
+      "name": "ord_88",
+      "argCount": 2
+    },
+    {
+      "name": "ord_89",
+      "argCount": 2
+    },
+    {
+      "name": "ord_9",
+      "argCount": 1
+    },
+    {
+      "name": "ord_90",
+      "argCount": 2
+    },
+    {
+      "name": "ord_91",
+      "argCount": 2
+    },
+    {
+      "name": "ord_92",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "ord_93",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ord_94",
+      "argCount": 4
+    },
+    {
+      "name": "ord_95",
+      "argCount": 3
+    },
+    {
+      "name": "ord_96",
+      "argCount": 2
+    },
+    {
+      "name": "ord_97",
+      "argCount": 4
+    },
+    {
+      "name": "ord_98",
+      "argCount": 2
+    },
+    {
+      "name": "ord_99",
+      "argCount": 2
+    },
+    {
+      "name": "QueryPathOfRegTypeLib",
+      "argCount": 5
+    },
+    {
+      "name": "RegisterActiveObject",
+      "argCount": 4
+    },
+    {
+      "name": "RegisterTypeLib",
+      "argCount": 3
+    },
+    {
+      "name": "RegisterTypeLibForUser",
+      "argCount": 3
+    },
+    {
+      "name": "RevokeActiveObject",
+      "argCount": 2
+    },
+    {
+      "name": "SafeArrayAccessData",
+      "argCount": 2
+    },
+    {
+      "name": "SafeArrayAllocData",
+      "argCount": 1
+    },
+    {
+      "name": "SafeArrayAllocDescriptor",
+      "argCount": 2
+    },
+    {
+      "name": "SafeArrayAllocDescriptorEx",
+      "argCount": 3
+    },
+    {
+      "name": "SafeArrayCopy",
+      "argCount": 2
+    },
+    {
+      "name": "SafeArrayCopyData",
+      "argCount": 2
+    },
+    {
+      "name": "SafeArrayCreate",
+      "argCount": 3
+    },
+    {
+      "name": "SafeArrayCreateEx",
+      "argCount": 4
+    },
+    {
+      "name": "SafeArrayCreateVector",
+      "argCount": 3
+    },
+    {
+      "name": "SafeArrayCreateVectorEx",
+      "argCount": 4
+    },
+    {
+      "name": "SafeArrayDestroy",
+      "argCount": 1
+    },
+    {
+      "name": "SafeArrayDestroyData",
+      "argCount": 1
+    },
+    {
+      "name": "SafeArrayDestroyDescriptor",
+      "argCount": 1
+    },
+    {
+      "name": "SafeArrayGetDim",
+      "argCount": 1
+    },
+    {
+      "name": "SafeArrayGetElement",
+      "argCount": 3
+    },
+    {
+      "name": "SafeArrayGetElemsize",
+      "argCount": 1
+    },
+    {
+      "name": "SafeArrayGetIID",
+      "argCount": 2
+    },
+    {
+      "name": "SafeArrayGetLBound",
+      "argCount": 3
+    },
+    {
+      "name": "SafeArrayGetRecordInfo",
+      "argCount": 2
+    },
+    {
+      "name": "SafeArrayGetUBound",
+      "argCount": 3
+    },
+    {
+      "name": "SafeArrayGetVartype",
+      "argCount": 2
+    },
+    {
+      "name": "SafeArrayLock",
+      "argCount": 1
+    },
+    {
+      "name": "SafeArrayPtrOfIndex",
+      "argCount": 3
+    },
+    {
+      "name": "SafeArrayPutElement",
+      "argCount": 3
+    },
+    {
+      "name": "SafeArrayRedim",
+      "argCount": 2
+    },
+    {
+      "name": "SafeArraySetIID",
+      "argCount": 2
+    },
+    {
+      "name": "SafeArraySetRecordInfo",
+      "argCount": 2
+    },
+    {
+      "name": "SafeArrayUnaccessData",
+      "argCount": 1
+    },
+    {
+      "name": "SafeArrayUnlock",
+      "argCount": 1
+    },
+    {
+      "name": "SetErrorInfo",
+      "argCount": 2
+    },
+    {
+      "name": "SetOaNoCache",
+      "argCount": 0
+    },
+    {
+      "name": "SysAllocString",
+      "argCount": 1
+    },
+    {
+      "name": "SysAllocStringByteLen",
+      "argCount": 2
+    },
+    {
+      "name": "SysAllocStringLen",
+      "argCount": 2
+    },
+    {
+      "name": "SysFreeString",
+      "argCount": 1
+    },
+    {
+      "name": "SysReAllocString",
+      "argCount": 2
+    },
+    {
+      "name": "SysReAllocStringLen",
+      "argCount": 3
+    },
+    {
+      "name": "SysStringByteLen",
+      "argCount": 1
+    },
+    {
+      "name": "SysStringLen",
+      "argCount": 1
+    },
+    {
+      "name": "SystemTimeToVariantTime",
+      "argCount": 2
+    },
+    {
+      "name": "UnRegisterTypeLib",
+      "argCount": 5
+    },
+    {
+      "name": "UnRegisterTypeLibForUser",
+      "argCount": 5
+    },
+    {
+      "name": "VarAbs",
+      "argCount": 2
+    },
+    {
+      "name": "VarAdd",
+      "argCount": 3
+    },
+    {
+      "name": "VarAnd",
+      "argCount": 3
+    },
+    {
+      "name": "VarBoolFromCy",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarBoolFromDate",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarBoolFromDec",
+      "argCount": 2
+    },
+    {
+      "name": "VarBoolFromDisp",
+      "argCount": 3
+    },
+    {
+      "name": "VarBoolFromI1",
+      "argCount": 2
+    },
+    {
+      "name": "VarBoolFromI2",
+      "argCount": 2
+    },
+    {
+      "name": "VarBoolFromI4",
+      "argCount": 2
+    },
+    {
+      "name": "VarBoolFromI8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarBoolFromR4",
+      "argCount": 2
+    },
+    {
+      "name": "VarBoolFromR8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarBoolFromStr",
+      "argCount": 4
+    },
+    {
+      "name": "VarBoolFromUI1",
+      "argCount": 2
+    },
+    {
+      "name": "VarBoolFromUI2",
+      "argCount": 2
+    },
+    {
+      "name": "VarBoolFromUI4",
+      "argCount": 2
+    },
+    {
+      "name": "VarBoolFromUI8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarBstrCat",
+      "argCount": 3
+    },
+    {
+      "name": "VarBstrCmp",
+      "argCount": 4
+    },
+    {
+      "name": "VarBstrFromBool",
+      "argCount": 4
+    },
+    {
+      "name": "VarBstrFromCy",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarBstrFromDate",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarBstrFromDec",
+      "argCount": 4
+    },
+    {
+      "name": "VarBstrFromDisp",
+      "argCount": 4
+    },
+    {
+      "name": "VarBstrFromI1",
+      "argCount": 4
+    },
+    {
+      "name": "VarBstrFromI2",
+      "argCount": 4
+    },
+    {
+      "name": "VarBstrFromI4",
+      "argCount": 4
+    },
+    {
+      "name": "VarBstrFromI8",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarBstrFromR4",
+      "argCount": 4
+    },
+    {
+      "name": "VarBstrFromR8",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarBstrFromUI1",
+      "argCount": 4
+    },
+    {
+      "name": "VarBstrFromUI2",
+      "argCount": 4
+    },
+    {
+      "name": "VarBstrFromUI4",
+      "argCount": 4
+    },
+    {
+      "name": "VarBstrFromUI8",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarCat",
+      "argCount": 3
+    },
+    {
+      "name": "VarCmp",
+      "argCount": 4
+    },
+    {
+      "name": "VarCyAbs",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarCyAdd",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "VarCyCmp",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "VarCyCmpR8",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64, double occupy two slots each)"
+    },
+    {
+      "name": "VarCyFix",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarCyFromBool",
+      "argCount": 2
+    },
+    {
+      "name": "VarCyFromDate",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarCyFromDec",
+      "argCount": 2
+    },
+    {
+      "name": "VarCyFromDisp",
+      "argCount": 3
+    },
+    {
+      "name": "VarCyFromI1",
+      "argCount": 2
+    },
+    {
+      "name": "VarCyFromI2",
+      "argCount": 2
+    },
+    {
+      "name": "VarCyFromI4",
+      "argCount": 2
+    },
+    {
+      "name": "VarCyFromI8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarCyFromR4",
+      "argCount": 2
+    },
+    {
+      "name": "VarCyFromR8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarCyFromStr",
+      "argCount": 4
+    },
+    {
+      "name": "VarCyFromUI1",
+      "argCount": 2
+    },
+    {
+      "name": "VarCyFromUI2",
+      "argCount": 2
+    },
+    {
+      "name": "VarCyFromUI4",
+      "argCount": 2
+    },
+    {
+      "name": "VarCyFromUI8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarCyInt",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarCyMul",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "VarCyMulI4",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarCyMulI8",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "VarCyNeg",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarCyRound",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarCySub",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "VarDateFromBool",
+      "argCount": 2
+    },
+    {
+      "name": "VarDateFromCy",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarDateFromDec",
+      "argCount": 2
+    },
+    {
+      "name": "VarDateFromDisp",
+      "argCount": 3
+    },
+    {
+      "name": "VarDateFromI1",
+      "argCount": 2
+    },
+    {
+      "name": "VarDateFromI2",
+      "argCount": 2
+    },
+    {
+      "name": "VarDateFromI4",
+      "argCount": 2
+    },
+    {
+      "name": "VarDateFromI8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarDateFromR4",
+      "argCount": 2
+    },
+    {
+      "name": "VarDateFromR8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarDateFromStr",
+      "argCount": 4
+    },
+    {
+      "name": "VarDateFromUdate",
+      "argCount": 3
+    },
+    {
+      "name": "VarDateFromUdateEx",
+      "argCount": 4
+    },
+    {
+      "name": "VarDateFromUI1",
+      "argCount": 2
+    },
+    {
+      "name": "VarDateFromUI2",
+      "argCount": 2
+    },
+    {
+      "name": "VarDateFromUI4",
+      "argCount": 2
+    },
+    {
+      "name": "VarDateFromUI8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarDecAbs",
+      "argCount": 2
+    },
+    {
+      "name": "VarDecAdd",
+      "argCount": 3
+    },
+    {
+      "name": "VarDecCmp",
+      "argCount": 2
+    },
+    {
+      "name": "VarDecCmpR8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarDecDiv",
+      "argCount": 3
+    },
+    {
+      "name": "VarDecFix",
+      "argCount": 2
+    },
+    {
+      "name": "VarDecFromBool",
+      "argCount": 2
+    },
+    {
+      "name": "VarDecFromCy",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarDecFromDate",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarDecFromDisp",
+      "argCount": 3
+    },
+    {
+      "name": "VarDecFromI1",
+      "argCount": 2
+    },
+    {
+      "name": "VarDecFromI2",
+      "argCount": 2
+    },
+    {
+      "name": "VarDecFromI4",
+      "argCount": 2
+    },
+    {
+      "name": "VarDecFromI8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarDecFromR4",
+      "argCount": 2
+    },
+    {
+      "name": "VarDecFromR8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarDecFromStr",
+      "argCount": 4
+    },
+    {
+      "name": "VarDecFromUI1",
+      "argCount": 2
+    },
+    {
+      "name": "VarDecFromUI2",
+      "argCount": 2
+    },
+    {
+      "name": "VarDecFromUI4",
+      "argCount": 2
+    },
+    {
+      "name": "VarDecFromUI8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarDecInt",
+      "argCount": 2
+    },
+    {
+      "name": "VarDecMul",
+      "argCount": 3
+    },
+    {
+      "name": "VarDecNeg",
+      "argCount": 2
+    },
+    {
+      "name": "VarDecRound",
+      "argCount": 3
+    },
+    {
+      "name": "VarDecSub",
+      "argCount": 3
+    },
+    {
+      "name": "VarDiv",
+      "argCount": 3
+    },
+    {
+      "name": "VarEqv",
+      "argCount": 3
+    },
+    {
+      "name": "VarFix",
+      "argCount": 2
+    },
+    {
+      "name": "VarFormat",
+      "argCount": 6
+    },
+    {
+      "name": "VarFormatCurrency",
+      "argCount": 7
+    },
+    {
+      "name": "VarFormatDateTime",
+      "argCount": 4
+    },
+    {
+      "name": "VarFormatFromTokens",
+      "argCount": 6
+    },
+    {
+      "name": "VarFormatNumber",
+      "argCount": 7
+    },
+    {
+      "name": "VarFormatPercent",
+      "argCount": 7
+    },
+    {
+      "name": "VarI1FromBool",
+      "argCount": 2
+    },
+    {
+      "name": "VarI1FromCy",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarI1FromDate",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarI1FromDec",
+      "argCount": 2
+    },
+    {
+      "name": "VarI1FromDisp",
+      "argCount": 3
+    },
+    {
+      "name": "VarI1FromI2",
+      "argCount": 2
+    },
+    {
+      "name": "VarI1FromI4",
+      "argCount": 2
+    },
+    {
+      "name": "VarI1FromI8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarI1FromR4",
+      "argCount": 2
+    },
+    {
+      "name": "VarI1FromR8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarI1FromStr",
+      "argCount": 4
+    },
+    {
+      "name": "VarI1FromUI1",
+      "argCount": 2
+    },
+    {
+      "name": "VarI1FromUI2",
+      "argCount": 2
+    },
+    {
+      "name": "VarI1FromUI4",
+      "argCount": 2
+    },
+    {
+      "name": "VarI1FromUI8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarI2FromBool",
+      "argCount": 2
+    },
+    {
+      "name": "VarI2FromCy",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarI2FromDate",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarI2FromDec",
+      "argCount": 2
+    },
+    {
+      "name": "VarI2FromDisp",
+      "argCount": 3
+    },
+    {
+      "name": "VarI2FromI1",
+      "argCount": 2
+    },
+    {
+      "name": "VarI2FromI4",
+      "argCount": 2
+    },
+    {
+      "name": "VarI2FromI8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarI2FromR4",
+      "argCount": 2
+    },
+    {
+      "name": "VarI2FromR8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarI2FromStr",
+      "argCount": 4
+    },
+    {
+      "name": "VarI2FromUI1",
+      "argCount": 2
+    },
+    {
+      "name": "VarI2FromUI2",
+      "argCount": 2
+    },
+    {
+      "name": "VarI2FromUI4",
+      "argCount": 2
+    },
+    {
+      "name": "VarI2FromUI8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarI4FromBool",
+      "argCount": 2
+    },
+    {
+      "name": "VarI4FromCy",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarI4FromDate",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarI4FromDec",
+      "argCount": 2
+    },
+    {
+      "name": "VarI4FromDisp",
+      "argCount": 3
+    },
+    {
+      "name": "VarI4FromI1",
+      "argCount": 2
+    },
+    {
+      "name": "VarI4FromI2",
+      "argCount": 2
+    },
+    {
+      "name": "VarI4FromI8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarI4FromR4",
+      "argCount": 2
+    },
+    {
+      "name": "VarI4FromR8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarI4FromStr",
+      "argCount": 4
+    },
+    {
+      "name": "VarI4FromUI1",
+      "argCount": 2
+    },
+    {
+      "name": "VarI4FromUI2",
+      "argCount": 2
+    },
+    {
+      "name": "VarI4FromUI4",
+      "argCount": 2
+    },
+    {
+      "name": "VarI4FromUI8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarI8FromBool",
+      "argCount": 2
+    },
+    {
+      "name": "VarI8FromCy",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarI8FromDate",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarI8FromDec",
+      "argCount": 2
+    },
+    {
+      "name": "VarI8FromDisp",
+      "argCount": 3
+    },
+    {
+      "name": "VarI8FromI1",
+      "argCount": 2
+    },
+    {
+      "name": "VarI8FromI2",
+      "argCount": 2
+    },
+    {
+      "name": "VarI8FromR4",
+      "argCount": 2
+    },
+    {
+      "name": "VarI8FromR8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarI8FromStr",
+      "argCount": 4
+    },
+    {
+      "name": "VarI8FromUI1",
+      "argCount": 2
+    },
+    {
+      "name": "VarI8FromUI2",
+      "argCount": 2
+    },
+    {
+      "name": "VarI8FromUI4",
+      "argCount": 2
+    },
+    {
+      "name": "VarI8FromUI8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VARIANT_UserFree",
+      "argCount": 2
+    },
+    {
+      "name": "VARIANT_UserMarshal",
+      "argCount": 3
+    },
+    {
+      "name": "VARIANT_UserSize",
+      "argCount": 3
+    },
+    {
+      "name": "VARIANT_UserUnmarshal",
+      "argCount": 3
+    },
+    {
+      "name": "VariantChangeType",
+      "argCount": 4
+    },
+    {
+      "name": "VariantChangeTypeEx",
+      "argCount": 5
+    },
+    {
+      "name": "VariantClear",
+      "argCount": 1
+    },
+    {
+      "name": "VariantCopy",
+      "argCount": 2
+    },
+    {
+      "name": "VariantCopyInd",
+      "argCount": 2
+    },
+    {
+      "name": "VariantInit",
+      "argCount": 1
+    },
+    {
+      "name": "VariantTimeToDosDateTime",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VariantTimeToSystemTime",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarIdiv",
+      "argCount": 3
+    },
+    {
+      "name": "VarImp",
+      "argCount": 3
+    },
+    {
+      "name": "VarInt",
+      "argCount": 2
+    },
+    {
+      "name": "VarMod",
+      "argCount": 3
+    },
+    {
+      "name": "VarMonthName",
+      "argCount": 4
+    },
+    {
+      "name": "VarMul",
+      "argCount": 3
+    },
+    {
+      "name": "VarNeg",
+      "argCount": 2
+    },
+    {
+      "name": "VarNot",
+      "argCount": 2
+    },
+    {
+      "name": "VarNumFromParseNum",
+      "argCount": 4
+    },
+    {
+      "name": "VarOr",
+      "argCount": 3
+    },
+    {
+      "name": "VarParseNumFromStr",
+      "argCount": 5
+    },
+    {
+      "name": "VarPow",
+      "argCount": 3
+    },
+    {
+      "name": "VarR4CmpR8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarR4FromBool",
+      "argCount": 2
+    },
+    {
+      "name": "VarR4FromCy",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarR4FromDate",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarR4FromDec",
+      "argCount": 2
+    },
+    {
+      "name": "VarR4FromDisp",
+      "argCount": 3
+    },
+    {
+      "name": "VarR4FromI1",
+      "argCount": 2
+    },
+    {
+      "name": "VarR4FromI2",
+      "argCount": 2
+    },
+    {
+      "name": "VarR4FromI4",
+      "argCount": 2
+    },
+    {
+      "name": "VarR4FromI8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarR4FromR8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarR4FromStr",
+      "argCount": 4
+    },
+    {
+      "name": "VarR4FromUI1",
+      "argCount": 2
+    },
+    {
+      "name": "VarR4FromUI2",
+      "argCount": 2
+    },
+    {
+      "name": "VarR4FromUI4",
+      "argCount": 2
+    },
+    {
+      "name": "VarR4FromUI8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarR8FromBool",
+      "argCount": 2
+    },
+    {
+      "name": "VarR8FromCy",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarR8FromDate",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarR8FromDec",
+      "argCount": 2
+    },
+    {
+      "name": "VarR8FromDisp",
+      "argCount": 3
+    },
+    {
+      "name": "VarR8FromI1",
+      "argCount": 2
+    },
+    {
+      "name": "VarR8FromI2",
+      "argCount": 2
+    },
+    {
+      "name": "VarR8FromI4",
+      "argCount": 2
+    },
+    {
+      "name": "VarR8FromI8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarR8FromR4",
+      "argCount": 2
+    },
+    {
+      "name": "VarR8FromStr",
+      "argCount": 4
+    },
+    {
+      "name": "VarR8FromUI1",
+      "argCount": 2
+    },
+    {
+      "name": "VarR8FromUI2",
+      "argCount": 2
+    },
+    {
+      "name": "VarR8FromUI4",
+      "argCount": 2
+    },
+    {
+      "name": "VarR8FromUI8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarR8Pow",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (double, double occupy two slots each)"
+    },
+    {
+      "name": "VarR8Round",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarRound",
+      "argCount": 3
+    },
+    {
+      "name": "VarSub",
+      "argCount": 3
+    },
+    {
+      "name": "VarTokenizeFormatString",
+      "argCount": 7
+    },
+    {
+      "name": "VarUdateFromDate",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarUI1FromBool",
+      "argCount": 2
+    },
+    {
+      "name": "VarUI1FromCy",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarUI1FromDate",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarUI1FromDec",
+      "argCount": 2
+    },
+    {
+      "name": "VarUI1FromDisp",
+      "argCount": 3
+    },
+    {
+      "name": "VarUI1FromI1",
+      "argCount": 2
+    },
+    {
+      "name": "VarUI1FromI2",
+      "argCount": 2
+    },
+    {
+      "name": "VarUI1FromI4",
+      "argCount": 2
+    },
+    {
+      "name": "VarUI1FromI8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarUI1FromR4",
+      "argCount": 2
+    },
+    {
+      "name": "VarUI1FromR8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarUI1FromStr",
+      "argCount": 4
+    },
+    {
+      "name": "VarUI1FromUI2",
+      "argCount": 2
+    },
+    {
+      "name": "VarUI1FromUI4",
+      "argCount": 2
+    },
+    {
+      "name": "VarUI1FromUI8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarUI2FromBool",
+      "argCount": 2
+    },
+    {
+      "name": "VarUI2FromCy",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarUI2FromDate",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarUI2FromDec",
+      "argCount": 2
+    },
+    {
+      "name": "VarUI2FromDisp",
+      "argCount": 3
+    },
+    {
+      "name": "VarUI2FromI1",
+      "argCount": 2
+    },
+    {
+      "name": "VarUI2FromI2",
+      "argCount": 2
+    },
+    {
+      "name": "VarUI2FromI4",
+      "argCount": 2
+    },
+    {
+      "name": "VarUI2FromI8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarUI2FromR4",
+      "argCount": 2
+    },
+    {
+      "name": "VarUI2FromR8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarUI2FromStr",
+      "argCount": 4
+    },
+    {
+      "name": "VarUI2FromUI1",
+      "argCount": 2
+    },
+    {
+      "name": "VarUI2FromUI4",
+      "argCount": 2
+    },
+    {
+      "name": "VarUI2FromUI8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarUI4FromBool",
+      "argCount": 2
+    },
+    {
+      "name": "VarUI4FromCy",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarUI4FromDate",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarUI4FromDec",
+      "argCount": 2
+    },
+    {
+      "name": "VarUI4FromDisp",
+      "argCount": 3
+    },
+    {
+      "name": "VarUI4FromI1",
+      "argCount": 2
+    },
+    {
+      "name": "VarUI4FromI2",
+      "argCount": 2
+    },
+    {
+      "name": "VarUI4FromI4",
+      "argCount": 2
+    },
+    {
+      "name": "VarUI4FromI8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarUI4FromR4",
+      "argCount": 2
+    },
+    {
+      "name": "VarUI4FromR8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarUI4FromStr",
+      "argCount": 4
+    },
+    {
+      "name": "VarUI4FromUI1",
+      "argCount": 2
+    },
+    {
+      "name": "VarUI4FromUI2",
+      "argCount": 2
+    },
+    {
+      "name": "VarUI4FromUI8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarUI8FromBool",
+      "argCount": 2
+    },
+    {
+      "name": "VarUI8FromCy",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarUI8FromDate",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarUI8FromDec",
+      "argCount": 2
+    },
+    {
+      "name": "VarUI8FromDisp",
+      "argCount": 3
+    },
+    {
+      "name": "VarUI8FromI1",
+      "argCount": 2
+    },
+    {
+      "name": "VarUI8FromI2",
+      "argCount": 2
+    },
+    {
+      "name": "VarUI8FromI8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VarUI8FromR4",
+      "argCount": 2
+    },
+    {
+      "name": "VarUI8FromR8",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "VarUI8FromStr",
+      "argCount": 4
+    },
+    {
+      "name": "VarUI8FromUI1",
+      "argCount": 2
+    },
+    {
+      "name": "VarUI8FromUI2",
+      "argCount": 2
+    },
+    {
+      "name": "VarUI8FromUI4",
+      "argCount": 2
+    },
+    {
+      "name": "VarWeekdayName",
+      "argCount": 5
+    },
+    {
+      "name": "VarXor",
+      "argCount": 3
+    },
+    {
+      "name": "VectorFromBstr",
+      "argCount": 2
+    }
+  ]
+}
