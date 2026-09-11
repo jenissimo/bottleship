@@ -13,6 +13,7 @@
  *   bun tools/re/re.ts doctor                  backend availability; answers with the service down too
  *   bun tools/re/re.ts resolve <eip> [--base <liveModuleBase>]   wild-EIP -> func
  *   bun tools/re/re.ts exportSymbolMap [--out game.symbols.json] [--module name]
+ *   bun tools/re/re.ts vtable <binary> <Class@ns@@|0xVFTABLE>   slot order + measured arity
  *
  * The static<->dynamic bridge:
  *  - harness emits fault/breakHit with a live EIP -> `re resolve <eip> --base <liveBase>`
@@ -172,8 +173,26 @@ async function main(): Promise<void> {
             console.log(JSON.stringify(await call(cmd, [positional[0]]), null, 2)); break;
         case "symbols": case "strings": case "info":
             console.log(JSON.stringify(await call(cmd), null, 2)); break;
+        case "vtable": {
+            // Deliberately NOT a service command: it needs no Ghidra and no open project,
+            // so it answers for any DLL on disk while the service holds a different binary.
+            if (!positional[0] || !positional[1]) {
+                console.error("usage: bun tools/re/re.ts vtable <binary> <ClassName|0xVFTABLE> [--slots N]");
+                process.exit(1);
+            }
+            const script = join(HERE, "vtables.py");
+            const slots = flag("--slots");
+            const args = [script, positional[0], positional[1], ...(slots ? ["--slots", slots] : [])];
+            let code = -1;
+            for (const py of ["python", "python3"]) {
+                const r = Bun.spawnSync([py, ...args], { stdout: "inherit", stderr: "inherit" });
+                if (r.exitCode !== null) { code = r.exitCode; break; }
+            }
+            if (code === -1) { console.error("vtable: no python on PATH (needs capstone: pip install capstone)"); process.exit(1); }
+            process.exit(code);
+        }
         default:
-            console.log("usage: bun tools/re/re.ts <start|open|decompile|disasm|mkfunc|callers|xrefs|symbols|strings|resolve|exportSymbolMap|info|doctor> [args]");
+            console.log("usage: bun tools/re/re.ts <start|open|decompile|disasm|mkfunc|callers|xrefs|symbols|strings|resolve|exportSymbolMap|vtable|info|doctor> [args]");
             process.exit(cmd ? 1 : 0);
     }
 }
