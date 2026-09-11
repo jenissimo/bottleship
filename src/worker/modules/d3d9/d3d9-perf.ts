@@ -223,6 +223,32 @@ const BACKEND_KEYS = [
     "clearCalls",
     "progPipelineCacheHits",
     "progPipelineCacheMisses",
+    // Draw-state capture memo + the work its misses do. The constant-bank content hash is the
+    // hottest JS leaf in a race trace (4.7% of busy), and whether that is worth attacking
+    // depends on the MISS rate and on how many words a miss walks — neither was counted.
+    "captureMemoHits",
+    "captureMemoMisses",
+    "captureHashedWords",
+    // Non-zero means a constant-bank write bypassed the block-hash invalidation, i.e. a draw
+    // was keyed by a STALE content hash. Any non-zero value invalidates a timing arm.
+    "captureBankHashMismatch",
+    // Consecutive-draw runs sharing (pipeline, bindState): the upper bound on batching.
+    "batchRuns",
+    "batchRunDraws",
+    "batchRunsGe4",
+    // Draws where only the shader constants differ from the previous draw.
+    "captureConstOnly",
+    // Stage-window resolution: a miss re-resolves 16 texture views and 16 samplers for a bank
+    // in which typically one stage changed. Hits/misses size that loop independently of the
+    // constant copy the capture memo also covers.
+    "stageWindowHits",
+    "stageWindowMisses",
+    // Inside a stage-window miss: stages reused from their own cached inputs vs re-resolved.
+    "stageReuse",
+    "stageResolve",
+    // Non-zero means a reused stage view differs from the long resolution: a silent wrong
+    // texture. Any non-zero value invalidates a timing arm and the feature.
+    "stageReuseMismatch",
 ] as const;
 type ApiKey = typeof API_KEYS[number];
 type SkipKey = typeof SKIP_KEYS[number];
@@ -342,6 +368,19 @@ const backend: Record<BackendKey, number> = {
     clearCalls: 0,
     progPipelineCacheHits: 0,
     progPipelineCacheMisses: 0,
+    captureMemoHits: 0,
+    captureMemoMisses: 0,
+    captureHashedWords: 0,
+    captureBankHashMismatch: 0,
+    batchRuns: 0,
+    batchRunDraws: 0,
+    batchRunsGe4: 0,
+    captureConstOnly: 0,
+    stageWindowHits: 0,
+    stageWindowMisses: 0,
+    stageReuse: 0,
+    stageResolve: 0,
+    stageReuseMismatch: 0,
 };
 
 const stateBlock = {
@@ -525,6 +564,16 @@ export function d3d9PerfBufferUpload(
 
 export function d3d9PerfBackendInc(key: BackendKey): void {
     backend[key]++;
+}
+
+/** Bulk form for a counter that measures WORK rather than events (e.g. words walked). A NaN or
+ *  a negative would poison the counter for the session, so both are refused rather than added. */
+export function d3d9PerfBackendAdd(key: BackendKey, count: number): void {
+    if (!Number.isFinite(count) || count < 0) {
+        counterRejections[key] = (counterRejections[key] ?? 0) + 1;
+        return;
+    }
+    backend[key] += count;
 }
 
 export function resetD3D9Perf(): void {

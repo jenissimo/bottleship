@@ -6,6 +6,7 @@
  */
 
 import { RenderFrame, RenderFramePool, RenderCommandType, type ArenaDrawBinding } from "../render-frame";
+import { d3d9PerfBackendInc, d3d9PerfBackendAdd } from "../../../modules/d3d9/d3d9-perf";
 import type { StreamBindingPlan, StreamVertexBinding } from "../shared/vertex-streams";
 
 export type { StreamVertexBinding };
@@ -242,7 +243,26 @@ export class D3D9CommandRecorder {
     /**
      * Record an indexed draw call
      */
+    private batchProbePipeline = -1;
+    private batchProbeBindState = -1;
+    private batchProbeRun = 0;
+
     recordDrawIndexed(cmd: DrawIndexedCommand): void {
+        // Sizes the batching prize: how many CONSECUTIVE draws share pipeline AND bind state.
+        // 2066 draws/frame against 167 pipeline sets says the runs are long, but only the pair
+        // (pipeline, bindState) decides whether a batch is legal, and nothing counted it.
+        if (cmd.pipelineId === this.batchProbePipeline && cmd.bindStateIndex === this.batchProbeBindState) {
+            this.batchProbeRun++;
+        } else {
+            if (this.batchProbeRun > 0) {
+                d3d9PerfBackendInc("batchRuns");
+                d3d9PerfBackendAdd("batchRunDraws", this.batchProbeRun);
+                if (this.batchProbeRun >= 4) d3d9PerfBackendInc("batchRunsGe4");
+            }
+            this.batchProbePipeline = cmd.pipelineId;
+            this.batchProbeBindState = cmd.bindStateIndex ?? -1;
+            this.batchProbeRun = 1;
+        }
         if (this.currentPipelineId !== cmd.pipelineId) {
             this.frame.pushSetPipeline(cmd.pipelineId);
             this.currentPipelineId = cmd.pipelineId;

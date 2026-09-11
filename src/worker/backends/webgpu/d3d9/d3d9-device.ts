@@ -75,7 +75,7 @@ import { getOverlayCompositePlan } from "../../../modules/user32/dialog-overlay"
 import { getVideoPlanePlan, notifyVideoPlaneComposited } from "../../../video/video-plane-policy";
 import { Logger, LogCategory } from "../../../core/logger";
 import {
-    d3d9PerfInc, d3d9PerfAdd, d3d9PerfSkip, d3d9PerfBackendInc, d3d9DropDraw,
+    d3d9PerfInc, d3d9PerfAdd, d3d9PerfSkip, d3d9PerfBackendInc, d3d9PerfBackendAdd, d3d9DropDraw,
     d3d9PerfStateBlockApply, d3d9PerfStateBlockCapture,
     d3d9PerfStateBlockWasmApply, d3d9PerfStateBlockWasmCapture,
     d3d9PerfBufferLock, d3d9PerfBufferUpload, d3d9PerfIndexRangeOOB,
@@ -552,6 +552,23 @@ interface PendingArenaRecord {
 const PS_CAPTURE_REGISTERS = 8;
 const VS_CAPTURE_REGISTERS = 16;
 
+/** Words per cached hash block. 16 = four vec4 registers: small enough that a typical
+ *  SetVertexShaderConstantF (one to four registers) dirties a single block, large enough that a
+ *  173-word bank combines ~11 block hashes instead of walking 173 words. */
+const SHADER_BANK_BLOCK_WORDS = 16;
+
+interface ShaderBankHashCache {
+    h1: Uint32Array;
+    h2: Uint32Array;
+    /** 0 = the block's cached hash is stale and must be recomputed before use. */
+    valid: Uint8Array;
+}
+
+function makeShaderBankHashCache(words: number): ShaderBankHashCache {
+    const blocks = Math.ceil(words / SHADER_BANK_BLOCK_WORDS);
+    return { h1: new Uint32Array(blocks), h2: new Uint32Array(blocks), valid: new Uint8Array(blocks) };
+}
+
 export class D3D9Device {
     /** Set when the parent interface is IDirect3D9Ex; Ex reset/pool rules follow the parent. */
     public isExtended = false;
@@ -828,6 +845,9 @@ export class D3D9Device {
      *  The two spaces only coincide fullscreen, so the verb must be able to say which. */
     private deviceWindowHwnd = 0;
     private deviceIsWindowed = true;
+
+    /** RenderActive: a fullscreen device owns the display like a DDraw flip chain. */
+    get presentsExclusiveFullscreen(): boolean { return !this.deviceIsWindowed; }
 
     /** The bound depth/stencil surface in both spaces, for the renderSpace verb. */
     private depthRenderSpace(): {
@@ -1610,6 +1630,11 @@ export class D3D9Device {
     private vsIntegerConstants = new Int32Array(SHADER_INTEGER_REGISTER_COUNT * 4); // i0-i15
     private vsIntegerBits = new Uint32Array(this.vsIntegerConstants.buffer);
     private vsBooleanMask = 0; // b0-b15, normalized to one bit per register
+    /** Cached per-block hashes of a device float bank; `valid` is cleared by the write path. */
+    private vsBankHash: ShaderBankHashCache = makeShaderBankHashCache(VS_FLOAT_REGISTER_COUNT * 4);
+    private psBankHash: ShaderBankHashCache = makeShaderBankHashCache(PS_FLOAT_REGISTER_COUNT * 4);
+    private vsIntegerHash = { h1: 0, h2: 0, valid: false };
+    private psIntegerHash = { h1: 0, h2: 0, valid: false };
     private vsConstantsVersion = 0;
 
     private psShaderRegistry = new Map<number, CompiledPs>();
@@ -2665,6 +2690,7 @@ export class D3D9Device {
                 changed = true;
             }
         }
+        if (changed) this.invalidateBankBlocks(targetBits, baseIdx, count);
         return changed;
     }
 
@@ -2680,30 +2706,178 @@ export class D3D9Device {
         return ((h1 & 0x1fffff) * 0x100000000) + h2;
     }
 
-    /** Pack one programmable uniform block as c[] + i[] + b, preserving raw signed I lane bits. */
+    /** Pack one programmable uniform block as c[] + i[] + b, preserving raw signed I lane bits.
+     *
+     *  The content hash is a cache key for the uniform arena (74% of uniform writes are avoided
+     *  by it in a race), so it must stay a pure function of the bytes — but recomputing it word
+     *  by word per draw cost 336k words/frame in NFSU, the hottest JS leaf in a race trace. The
+     *  bank is therefore hashed in BLOCKS whose hashes are cached and invalidated by the single
+     *  write choke point; a draw combines block hashes instead of walking words. Identical
+     *  content still yields an identical key, because the combine is a pure function of the
+     *  same block hashes.
+     */
     private copyProgrammableBankWithKey(
         dstBits: Uint32Array,
         cBits: Uint32Array,
         cLen: number,
         iBits: Uint32Array,
         boolMask: number,
+        /** Device bank backing `cBits[0..prefixWords)`. The VS slot is the device bank followed
+         *  by a per-draw tail (pixel centre, viewport, point size, clip planes), so only the
+         *  prefix can be block-cached; the tail is walked. */
+        prefixBank?: Uint32Array,
+        prefixWords = 0,
     ): number {
-        let h1 = 0x811c9dc5;
-        // b is a vec4<u32>; only .x carries the packed mask, but the complete
-        // 16-byte member remains part of the fixed uniform layout and snapshot.
         const boolWords = SHADER_BOOLEAN_BANK_BYTES / 4;
-        let h2 = (0x9e3779b9 ^ (cLen + SHADER_INTEGER_REGISTER_COUNT * 4 + boolWords)) >>> 0;
-        let out = 0;
-        const add = (bits: number): void => {
-            dstBits[out++] = bits >>> 0;
-            h1 = Math.imul(h1 ^ bits, 0x01000193) >>> 0;
-            h2 = (Math.imul(h2 ^ bits, 0x85ebca6b) + 0x9e3779b9) >>> 0;
-        };
-        for (let i = 0; i < cLen; i++) add(cBits[i]!);
-        for (let i = 0; i < SHADER_INTEGER_REGISTER_COUNT * 4; i++) add(iBits[i]!);
-        add(boolMask);
-        for (let i = 1; i < boolWords; i++) add(0);
-        return ((h1 & 0x1fffff) * 0x100000000) + h2;
+        const intWords = SHADER_INTEGER_REGISTER_COUNT * 4;
+        // Bulk copies: the destination is a fresh pooled slot, and a typed-array set is what
+        // the old per-word loop was doing by hand while also hashing.
+        if (dstBits !== cBits) dstBits.set(cBits.subarray(0, cLen), 0);
+        dstBits.set(iBits.subarray(0, intWords), cLen);
+        dstBits[cLen + intWords] = boolMask >>> 0;
+        for (let i = 1; i < boolWords; i++) dstBits[cLen + intWords + i] = 0;
+
+        const cacheSource = prefixBank ?? cBits;
+        const cachedWords = prefixBank ? Math.min(prefixWords, cLen) : cLen;
+        const cache = this.bankHashCacheFor(cacheSource);
+        let h1 = 0x811c9dc5;
+        let h2 = (0x9e3779b9 ^ (cLen + intWords + boolWords)) >>> 0;
+        let walked = 0;
+        if (cache) {
+            const full = (cachedWords / SHADER_BANK_BLOCK_WORDS) | 0;
+            for (let b = 0; b < full; b++) {
+                if (!cache.valid[b]) {
+                    let b1 = 0x811c9dc5, b2 = 0x9e3779b9;
+                    const base = b * SHADER_BANK_BLOCK_WORDS;
+                    for (let i = 0; i < SHADER_BANK_BLOCK_WORDS; i++) {
+                        const bits = cacheSource[base + i]!;
+                        b1 = Math.imul(b1 ^ bits, 0x01000193) >>> 0;
+                        b2 = (Math.imul(b2 ^ bits, 0x85ebca6b) + 0x9e3779b9) >>> 0;
+                    }
+                    cache.h1[b] = b1;
+                    cache.h2[b] = b2;
+                    cache.valid[b] = 1;
+                    walked += SHADER_BANK_BLOCK_WORDS;
+                }
+                h1 = Math.imul(h1 ^ cache.h1[b]!, 0x01000193) >>> 0;
+                h2 = (Math.imul(h2 ^ cache.h2[b]!, 0x85ebca6b) + 0x9e3779b9) >>> 0;
+            }
+            for (let i = full * SHADER_BANK_BLOCK_WORDS; i < cLen; i++) {
+                const bits = cBits[i]!;
+                h1 = Math.imul(h1 ^ bits, 0x01000193) >>> 0;
+                h2 = (Math.imul(h2 ^ bits, 0x85ebca6b) + 0x9e3779b9) >>> 0;
+                walked++;
+            }
+        }
+        else {
+            // A bank with no cache (e.g. a per-draw slot used as its own source) is hashed
+            // whole: correctness never depends on the cache existing.
+            for (let i = 0; i < cLen; i++) {
+                const bits = cBits[i]!;
+                h1 = Math.imul(h1 ^ bits, 0x01000193) >>> 0;
+                h2 = (Math.imul(h2 ^ bits, 0x85ebca6b) + 0x9e3779b9) >>> 0;
+                walked++;
+            }
+        }
+        // The integer bank is 64 words hashed on EVERY draw while i# registers change almost
+        // never: 2069 draws/frame made it 132k words/frame on its own, 42% of all hashed words.
+        // Cache its pair and invalidate from the integer setters.
+        const iCache = this.integerHashCacheFor(iBits);
+        if (iCache) {
+            if (!iCache.valid) {
+                let i1 = 0x811c9dc5, i2 = 0x9e3779b9;
+                for (let i = 0; i < intWords; i++) {
+                    const bits = iBits[i]!;
+                    i1 = Math.imul(i1 ^ bits, 0x01000193) >>> 0;
+                    i2 = (Math.imul(i2 ^ bits, 0x85ebca6b) + 0x9e3779b9) >>> 0;
+                }
+                iCache.h1 = i1;
+                iCache.h2 = i2;
+                iCache.valid = true;
+                walked += intWords;
+            }
+            h1 = Math.imul(h1 ^ iCache.h1, 0x01000193) >>> 0;
+            h2 = (Math.imul(h2 ^ iCache.h2, 0x85ebca6b) + 0x9e3779b9) >>> 0;
+        }
+        else {
+            for (let i = 0; i < intWords; i++) {
+                const bits = iBits[i]!;
+                h1 = Math.imul(h1 ^ bits, 0x01000193) >>> 0;
+                h2 = (Math.imul(h2 ^ bits, 0x85ebca6b) + 0x9e3779b9) >>> 0;
+            }
+            walked += intWords;
+        }
+        h1 = Math.imul(h1 ^ boolMask, 0x01000193) >>> 0;
+        h2 = (Math.imul(h2 ^ boolMask, 0x85ebca6b) + 0x9e3779b9) >>> 0;
+        for (let i = 1; i < boolWords; i++) {
+            h1 = Math.imul(h1, 0x01000193) >>> 0;
+            h2 = (Math.imul(h2, 0x85ebca6b) + 0x9e3779b9) >>> 0;
+        }
+        d3d9PerfBackendAdd("captureHashedWords", walked + boolWords);
+        const key = ((h1 & 0x1fffff) * 0x100000000) + h2;
+        // A missed invalidation serves a STALE key for changed constants, and the frame that
+        // results is wrong in a way no counter notices. Under the flag the same key is derived
+        // again with every block forced stale; a disagreement is reported loudly, not summed.
+        if (cache && !this.verifyingBankHash
+            && (globalThis as { __d3d9VerifyBankHash?: boolean }).__d3d9VerifyBankHash) {
+            this.verifyingBankHash = true;
+            cache.valid.fill(0);
+            let fresh: number;
+            try {
+                fresh = this.copyProgrammableBankWithKey(
+                    dstBits, cBits, cLen, iBits, boolMask, prefixBank, prefixWords);
+            } finally {
+                this.verifyingBankHash = false;
+            }
+            if (fresh !== key) {
+                this.bankHashMismatches++;
+                d3d9PerfBackendInc("captureBankHashMismatch");
+                if (this.bankHashMismatches <= 4) {
+                    Logger.error(LogCategory.D3D9,
+                        `[D3D9] constant-bank hash cache STALE: cached ${key} vs recomputed ${fresh} `
+                        + `(cLen=${cLen} prefix=${prefixWords}) — a write path is not invalidating`);
+                }
+                return fresh;
+            }
+        }
+        return key;
+    }
+
+    /** Non-zero means a bank write bypassed invalidateBankBlocks. Reported by getCounters. */
+    private bankHashMismatches = 0;
+    /** Re-entrancy guard: the verify recomputes through the same function. */
+    private verifyingBankHash = false;
+
+    /** Block-hash cache for one of the two device float banks, or null for any other array. */
+    /** Cached hash of an integer bank, or null for any array that is not one of the two. */
+    private integerHashCacheFor(bank: Uint32Array): { h1: number; h2: number; valid: boolean } | null {
+        if ((globalThis as { __d3d9NoBankHashCache?: boolean }).__d3d9NoBankHashCache) return null;
+        if (bank === this.vsIntegerBits) return this.vsIntegerHash;
+        if (bank === this.psIntegerBits) return this.psIntegerHash;
+        return null;
+    }
+
+    private bankHashCacheFor(bank: Uint32Array): ShaderBankHashCache | null {
+        // By BUFFER, not by array identity: copyShaderConstantsFromArray builds a fresh view
+        // over the same storage, so an identity compare would silently skip its invalidation
+        // and serve a stale key for changed constants.
+        // Kill switch for a paired in-boot A/B: with no cache the function falls back to the
+        // word walk this replaced, which is the honest baseline arm.
+        if ((globalThis as { __d3d9NoBankHashCache?: boolean }).__d3d9NoBankHashCache) return null;
+        if (bank.byteOffset !== 0) return null;
+        if (bank.buffer === this.vsConstants.buffer) return this.vsBankHash;
+        if (bank.buffer === this.psConstants.buffer) return this.psBankHash;
+        return null;
+    }
+
+    /** The single invalidation point. Every float-bank write goes through
+     *  copyShaderConstantBitsFromMem32, so marking here cannot be bypassed by a new caller. */
+    private invalidateBankBlocks(bank: Uint32Array, baseIdx: number, count: number): void {
+        const cache = this.bankHashCacheFor(bank);
+        if (!cache || count <= 0) return;
+        const first = (baseIdx / SHADER_BANK_BLOCK_WORDS) | 0;
+        const last = ((baseIdx + count - 1) / SHADER_BANK_BLOCK_WORDS) | 0;
+        for (let b = first; b <= last && b < cache.valid.length; b++) cache.valid[b] = 0;
     }
 
     private copyShaderConstantsFromArray(target: Float32Array, startRegister: number, data: Float32Array): boolean {
@@ -2722,6 +2896,7 @@ export class D3D9Device {
                 changed = true;
             }
         }
+        if (changed) this.invalidateBankBlocks(targetBits, baseIdx, count);
         return changed;
     }
 
@@ -2874,6 +3049,7 @@ export class D3D9Device {
             const index = base + i;
             if (index < this.vsIntegerConstants.length && this.vsIntegerConstants[index] !== data[i]) {
                 this.vsIntegerConstants[index] = data[i]!;
+                this.vsIntegerHash.valid = false;
                 changed = true;
             }
             if (index < this.swvpVsIntegerConstants.length && this.swvpVsIntegerConstants[index] !== data[i]) {
@@ -2910,6 +3086,7 @@ export class D3D9Device {
         for (let i = 0; i < data.length; i++) {
             if (this.psIntegerConstants[base + i] !== data[i]) {
                 this.psIntegerConstants[base + i] = data[i]!;
+                this.psIntegerHash.valid = false;
                 changed = true;
             }
         }
@@ -6365,11 +6542,32 @@ export class D3D9Device {
      * back buffer is the extent the guest asked for — never the host canvas, which is sized by
      * the host container and only decides how many physical samples that logical frame gets.
      */
+    /** The object handed out while the target size is unchanged. Reused rather than rebuilt:
+     *  this is read several times per draw (scissor, viewport sidecar, point sizing), and a
+     *  fresh pair per call was the largest single JS leaf in a race trace. A CHANGE hands out a
+     *  NEW object instead of mutating this one, so a caller still holding an earlier result
+     *  keeps the extent it was actually given. */
+    private targetSizeCache: { w: number; h: number } = { w: -1, h: -1 };
+
     private getCurrentTargetSize(): { w: number; h: number } {
         const rt = this.currentRtIndex;
-        if (rt !== null) return { w: this.textures.getWidth(rt), h: this.textures.getHeight(rt) };
-        const s = this.backendExecutor.getGuestBackbufferSize();
-        return { w: s.width, h: s.height };
+        let w: number, h: number;
+        if (rt !== null) {
+            w = this.textures.getWidth(rt);
+            h = this.textures.getHeight(rt);
+        } else {
+            const s = this.backendExecutor.getGuestBackbufferSize();
+            w = s.width;
+            h = s.height;
+        }
+        const cached = this.targetSizeCache;
+        if (cached.w === w && cached.h === h
+            && !(globalThis as { __noD3D9TargetSizeCache?: boolean }).__noD3D9TargetSizeCache) {
+            return cached;
+        }
+        const fresh = { w, h };
+        this.targetSizeCache = fresh;
+        return fresh;
     }
 
     /**
@@ -8280,6 +8478,7 @@ export class D3D9Device {
             bindGroupSets: executorMetrics.bindGroupSets,
             bindGroupCacheHits: executorMetrics.bindGroupCacheHits,
             bindGroupBuilds: executorMetrics.bindGroupBuilds,
+            bankHashMismatches: this.bankHashMismatches,
         };
     }
 
@@ -10290,6 +10489,12 @@ export class D3D9Device {
     private stageWindowRtGuard = -1;
     private stageWindowSampler0: GPUSampler | null = null;
     private stageWindowTextures: (GPUTextureView | null)[] = new Array(PROG_BIND.MAX_TEX).fill(null);
+    /** Per fragment stage, the inputs the cached view was resolved FROM: the bound texture
+     *  index (-1 for none) and the store's view object for it. Identity of the view object is
+     *  what makes a recycled index safe to compare — the store reuses slot numbers, so the
+     *  index alone would answer "unchanged" for a different texture. */
+    private stageWindowSrcTex: Int32Array = new Int32Array(PROG_BIND.MAX_TEX).fill(-1);
+    private stageWindowSrcView: (GPUTextureView | null)[] = new Array(PROG_BIND.MAX_TEX).fill(null);
     private stageWindowSamplers: (GPUSampler | null)[] = new Array(PROG_BIND.MAX_TEX).fill(null);
     private stageWindowVertexTextures: (GPUTextureView | null)[] =
         new Array(D3D9_VERTEX_TEXTURE_SAMPLER_COUNT).fill(null);
@@ -10316,6 +10521,15 @@ export class D3D9Device {
         // Only the programmable-PS branch is memoised: the hybrid NULL-PS branch below reads
         // the fixed-function block (transforms, lights, material), which has no generation of
         // its own, and a memo without one would go stale invisibly.
+        // CEILING ABLATION (diagnostic only, renders wrong): force the memo to hit, so the whole
+        // per-draw state assembly is skipped. Every safe JS lever measured ~0 individually; this
+        // is what the entire capture path is worth, measured the same way the memory-guard
+        // ceiling was.
+        if (ps !== null && this.lastCaptureIndex >= 0
+            && (globalThis as { __d3d9ForceCaptureMemo?: boolean }).__d3d9ForceCaptureMemo) {
+            d3d9PerfBackendInc("captureMemoHits");
+            return this.lastCaptureIndex;
+        }
         if (ps !== null && !(globalThis as { __noD3D9KeyMemo?: boolean }).__noD3D9KeyMemo) {
             // lastCaptureIndex is reset to -1 at the frame boundary, which is what keeps an
             // index from a recycled slot pool out of this comparison.
@@ -10328,9 +10542,23 @@ export class D3D9Device {
                 && this.lastCaptureSamplerGen === this.samplerStateGeneration
                 && this.lastCaptureViewportW === this.viewport.width
                 && this.lastCaptureViewportH === this.viewport.height) {
+                d3d9PerfBackendInc("captureMemoHits");
                 return this.lastCaptureIndex;
             }
+            // Sizes the "same material, different constants" tier: everything the memo compares
+            // matches EXCEPT the constant versions. Those draws still redo pipeline resolution,
+            // bind-group lookup and sampler checks for state that provably did not change.
+            if (this.lastCaptureIndex >= 0
+                && this.lastCaptureVs === vs && this.lastCapturePs === ps
+                && this.lastCapturePipelineGen === this.pipelineStateGeneration
+                && this.lastCaptureBankGen === this.arenaSamplerBankGeneration
+                && this.lastCaptureSamplerGen === this.samplerStateGeneration
+                && this.lastCaptureViewportW === this.viewport.width
+                && this.lastCaptureViewportH === this.viewport.height) {
+                d3d9PerfBackendInc("captureConstOnly");
+            }
         }
+        d3d9PerfBackendInc("captureMemoMisses");
         const vsConstantLen = Math.min(vs ? vs.analysis.constantCount : 0, VS_FLOAT_REGISTER_COUNT) * 4;
         // Hidden c[] tail: pixel-centre correction, point-size/default/min/max sidecar, and
         // six programmable user clip-plane equations when enabled. All remain in c[] so the
@@ -10398,7 +10626,8 @@ export class D3D9Device {
             }
         }
         const constantsVersion = vs
-            ? this.copyProgrammableBankWithKey(state.vsBits, state.vsBits, vsCVecs * 4, this.vsIntegerBits, this.vsBooleanMask)
+            ? this.copyProgrammableBankWithKey(state.vsBits, state.vsBits, vsCVecs * 4,
+                this.vsIntegerBits, this.vsBooleanMask, this.vsConstantBits, vsConstantLen)
             : 0;
         state.vsVersion = vs ? withPixelCenterVersion(constantsVersion, dx, dy) : 0;
         if (ps) {
@@ -10485,7 +10714,14 @@ export class D3D9Device {
         // EVERY draw, which is why decodeD3d9Sampler and resolveTextureView stay hot even
         // when every draw binds the same material. Resolve once per (bank, sampler, mask)
         // combination and copy the references out.
-        const stageMemoValid = this.stageWindowBankGen === this.arenaSamplerBankGeneration
+        // CEILING ABLATION (diagnostic only, renders the wrong textures): force the stage
+        // window to hit, so the 16 view + 16 sampler resolutions are skipped while everything
+        // else in the capture still runs. This isolates the stage loop from the constant copy
+        // and from the downstream uniform dedup that __d3d9ForceCaptureMemo also captures.
+        const forceStageWindow = this.stageWindowEpoch > 0
+            && !!(globalThis as { __d3d9ForceStageWindow?: boolean }).__d3d9ForceStageWindow;
+        const stageMemoValid = forceStageWindow
+            || this.stageWindowBankGen === this.arenaSamplerBankGeneration
             && this.stageWindowSamplerGen === this.samplerStateGeneration
             && this.stageWindowCube === cubeMask && this.stageWindowVolume === volumeMask
             && this.stageWindowComparison === comparisonMask
@@ -10493,6 +10729,7 @@ export class D3D9Device {
             && this.stageWindowHasPs === (ps !== null)
             && this.stageWindowRtGuard === this.attachmentGeneration
             && !(globalThis as { __noD3D9KeyMemo?: boolean }).__noD3D9KeyMemo;
+        d3d9PerfBackendInc(stageMemoValid ? "stageWindowHits" : "stageWindowMisses");
         if (stageMemoValid) {
             for (let stage = 0; stage < PROG_BIND.MAX_TEX; stage++) {
                 state.textures[stage] = this.stageWindowTextures[stage] ?? null;
@@ -10507,43 +10744,39 @@ export class D3D9Device {
             return this.finishCaptureDrawState(state, index, frame, vs, ps);
         }
 
+        // The sampler bank's generation bumps on every SetTexture that really rebinds and on
+        // every texture-content change, so a title issuing ~2000 draws a frame misses the whole
+        // window on most of them — while typically ONE of the sixteen stages actually moved.
+        // When everything else the window depends on still matches, each stage is re-resolved
+        // only if its own inputs changed; the rest keep the view already resolved for them.
+        const stagePartialValid = this.stageWindowEpoch > 0
+            && this.stageWindowSamplerGen === this.samplerStateGeneration
+            && this.stageWindowCube === cubeMask && this.stageWindowVolume === volumeMask
+            && this.stageWindowComparison === comparisonMask
+            && this.stageWindowVertexVolume === vertexVolumeMask
+            && this.stageWindowHasPs === (ps !== null)
+            && this.stageWindowRtGuard === this.attachmentGeneration
+            && !(globalThis as { __noD3D9StagePartial?: boolean }).__noD3D9StagePartial;
         for (let stage = 0; stage < PROG_BIND.MAX_TEX; stage++) {
             const ti = this.stateTracker.getTexture(stage);
-            if (ti === null) { state.textures[stage] = null; continue; }
-            if (this.isTextureConflictingWithActiveRt(ti)) {
-                state.textures[stage] = null;
-                continue;
-            }
-            const stageIsVolume = ((volumeMask >> stage) & 1) !== 0;
-            if (stageIsVolume) {
-                if (ps === null || !this.isVolumeIndex(ti)) {
-                    state.textures[stage] = null;
-                    continue;
+            if (stagePartialValid && this.fragmentStageInputsUnchanged(stage, ti)) {
+                const reused = this.stageWindowTextures[stage] ?? null;
+                // Differential: resolve the stage the long way and compare. A reuse that answers
+                // with a different view is a silent wrong texture, which nothing downstream can
+                // see — the frame still submits and still looks like a frame.
+                if ((globalThis as { __d3d9VerifyStagePartial?: boolean }).__d3d9VerifyStagePartial
+                    && this.resolveFragmentStageView(stage, ps, cubeMask, volumeMask) !== reused) {
+                    d3d9PerfBackendInc("stageReuseMismatch");
                 }
-                state.textures[stage] = this.resolveVolumeTextureView(ti);
+                state.textures[stage] = reused;
+                d3d9PerfBackendInc("stageReuse");
                 continue;
             }
-            // A volume resource bound to a 2-D/cube shader must not be passed to WebGPU.
-            if (this.isVolumeIndex(ti)) {
-                state.textures[stage] = null;
-                continue;
-            }
-            // FFP/hybrid layouts expose ordinary float textures. A depth resource can only be
-            // bound through the comparison-sampler layout used by a programmable PS; leave it
-            // null here so the executor supplies the ordinary 2D fallback for the FFP layout.
-            if (ps === null && isDxDepthStencilFormat(this.textures.getFormat(ti), 9)) {
-                state.textures[stage] = null;
-                continue;
-            }
-            this.ensureTexture(ti);
-            // The bind-group layout slot for this stage is cube (cubeMask bit) or 2D, fixed by the
-            // shader. A bound view of the OTHER dimension (e.g. a cube RT still bound on a stage a
-            // 2D shader samples) makes the whole bind group invalid → the frame's submit is rejected
-            // (blank screen). Only bind the view when its dimension matches the slot; otherwise leave
-            // null so the executor supplies the correct-dimension fallback.
-            const stageIsCube = ((cubeMask >> stage) & 1) !== 0;
-            state.textures[stage] = (stageIsCube === this.textures.isCubeMap(ti))
-                ? this.resolveTextureView(stage, ti, stageIsCube)
+            d3d9PerfBackendInc("stageResolve");
+            state.textures[stage] = this.resolveFragmentStageView(stage, ps, cubeMask, volumeMask);
+            this.stageWindowSrcTex[stage] = ti ?? -1;
+            this.stageWindowSrcView[stage] = ti !== null && !this.isVolumeIndex(ti)
+                ? this.textures.getView(ti) ?? null
                 : null;
         }
 
@@ -10721,6 +10954,52 @@ export class D3D9Device {
      * spec/descriptor/key-string per call) only reruns when one of the descriptor's three input
      * groups actually moved — this stage's D3DSAMP_* block, the quality override, or the device.
      */
+    /** True when nothing this stage's resolved view depends on has moved since it was cached.
+     *  Everything else the view depends on (the sampler bank, the cube/volume/comparison masks,
+     *  the PS-ness of the draw and the active attachments) is checked once by the caller, so
+     *  what is left is the stage's own three inputs: which texture is bound, whether that is
+     *  still the same GPU object, and whether its content is waiting to be uploaded. Volume
+     *  stages are excluded outright — their index space is separate and its topology changes
+     *  without touching the store's views. */
+    private fragmentStageInputsUnchanged(stage: number, ti: number | null): boolean {
+        if ((ti ?? -1) !== this.stageWindowSrcTex[stage]) return false;
+        if (ti === null) return true;
+        if (this.isVolumeIndex(ti)) return false;
+        if ((this.textures.getView(ti) ?? null) !== this.stageWindowSrcView[stage]) return false;
+        return !this.textures.isDirty(ti);
+    }
+
+    /** One fragment stage's texture view, exactly as the full stage-window walk resolves it.
+     *  Shared by that walk and by the incremental path so the two cannot drift apart. */
+    private resolveFragmentStageView(
+        stage: number, ps: CompiledPs | null, cubeMask: number, volumeMask: number,
+    ): GPUTextureView | null {
+        const ti = this.stateTracker.getTexture(stage);
+        if (ti === null) return null;
+        if (this.isTextureConflictingWithActiveRt(ti)) return null;
+        const stageIsVolume = ((volumeMask >> stage) & 1) !== 0;
+        if (stageIsVolume) {
+            if (ps === null || !this.isVolumeIndex(ti)) return null;
+            return this.resolveVolumeTextureView(ti);
+        }
+        // A volume resource bound to a 2-D/cube shader must not be passed to WebGPU.
+        if (this.isVolumeIndex(ti)) return null;
+        // FFP/hybrid layouts expose ordinary float textures. A depth resource can only be
+        // bound through the comparison-sampler layout used by a programmable PS; leave it
+        // null here so the executor supplies the ordinary 2D fallback for the FFP layout.
+        if (ps === null && isDxDepthStencilFormat(this.textures.getFormat(ti), 9)) return null;
+        this.ensureTexture(ti);
+        // The bind-group layout slot for this stage is cube (cubeMask bit) or 2D, fixed by the
+        // shader. A bound view of the OTHER dimension (e.g. a cube RT still bound on a stage a
+        // 2D shader samples) makes the whole bind group invalid → the frame's submit is rejected
+        // (blank screen). Only bind the view when its dimension matches the slot; otherwise leave
+        // null so the executor supplies the correct-dimension fallback.
+        const stageIsCube = ((cubeMask >> stage) & 1) !== 0;
+        return (stageIsCube === this.textures.isCubeMap(ti))
+            ? this.resolveTextureView(stage, ti, stageIsCube)
+            : null;
+    }
+
     private resolveStageSampler(stage: number, comparison = false): GPUSampler | null {
         const device = this.backend.getDevice();
         if (!device) return null;
