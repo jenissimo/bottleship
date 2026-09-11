@@ -236,6 +236,68 @@ const STRUCT_SPECS: StructSpec[] = [
         source: { file: "worker/modules/gdi32/gdi-objects.ts", table: "LOGPEN_OFFSETS" },
         lastField: { name: "lopnColor", size: 4 },
     },
+    // shellapi.h wraps its whole body in pshpack1, so SHFILEOPSTRUCT is PACKED: the BOOL
+    // fAnyOperationsAborted lands at 18, unaligned, and reading it at a naturally-aligned
+    // 20 writes "aborted" into the caller's fFlags instead.
+    {
+        name: "SHFILEOPSTRUCTA/W",
+        expectedSize: 30,
+        packAlignment: 1,
+        source: { file: "worker/modules/shell32.ts", table: "SHFILEOPSTRUCT_OFFSETS" },
+        sizes: { fFlags: 2 },
+        lastField: { name: "lpszProgressTitle", size: 4 },
+    },
+    // XInput. XINPUT_GAMEPAD is embedded in both STATE and CAPABILITIES, so a drift in one
+    // field moves every stick reading a title polls sixty times a second.
+    {
+        name: "XINPUT_GAMEPAD",
+        expectedSize: 12,
+        packAlignment: 2,
+        source: { file: "worker/modules/xinput1_3.ts", table: "XINPUT_GAMEPAD_OFFSETS" },
+        sizes: {
+            wButtons: 2, bLeftTrigger: 1, bRightTrigger: 1,
+            sThumbLX: 2, sThumbLY: 2, sThumbRX: 2, sThumbRY: 2,
+        },
+        lastField: { name: "sThumbRY", size: 2 },
+    },
+    {
+        name: "XINPUT_STATE",
+        expectedSize: 16,
+        source: { file: "worker/modules/xinput1_3.ts", table: "XINPUT_STATE_OFFSETS" },
+        sizes: { Gamepad: 12 },
+        lastField: { name: "Gamepad", size: 12 },
+    },
+    {
+        name: "XINPUT_VIBRATION",
+        expectedSize: 4,
+        packAlignment: 2,
+        source: { file: "worker/modules/xinput1_3.ts", table: "XINPUT_VIBRATION_OFFSETS" },
+        sizes: { wLeftMotorSpeed: 2, wRightMotorSpeed: 2 },
+        lastField: { name: "wRightMotorSpeed", size: 2 },
+    },
+    {
+        name: "XINPUT_CAPABILITIES",
+        expectedSize: 20,
+        source: { file: "worker/modules/xinput1_3.ts", table: "XINPUT_CAPABILITIES_OFFSETS" },
+        sizes: { Type: 1, SubType: 1, Flags: 2, Gamepad: 12, Vibration: 4 },
+        lastField: { name: "Vibration", size: 4 },
+    },
+    {
+        name: "XINPUT_BATTERY_INFORMATION",
+        expectedSize: 2,
+        packAlignment: 1,
+        source: { file: "worker/modules/xinput1_3.ts", table: "XINPUT_BATTERY_INFORMATION_OFFSETS" },
+        sizes: { BatteryType: 1, BatteryLevel: 1 },
+        lastField: { name: "BatteryLevel", size: 1 },
+    },
+    {
+        name: "XINPUT_KEYSTROKE",
+        expectedSize: 8,
+        packAlignment: 2,
+        source: { file: "worker/modules/xinput1_3.ts", table: "XINPUT_KEYSTROKE_OFFSETS" },
+        sizes: { VirtualKey: 2, Unicode: 2, Flags: 2, UserIndex: 1, HidCode: 1 },
+        lastField: { name: "HidCode", size: 1 },
+    },
 ];
 
 /**
