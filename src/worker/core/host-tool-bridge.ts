@@ -63,11 +63,13 @@ export async function runHostTool(
     tool: string,
     args: string[],
     files: HostToolFile[],
+    signal?: AbortSignal,
 ): Promise<HostToolResult | null> {
     if (!hostToolsEnabled()) return null;
     try {
         const res = await fetch(`http://localhost:${SIDECAR_PORT}/tool/run`, {
             method: "POST",
+            signal,
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
                 tool,
@@ -91,6 +93,7 @@ export async function runHostTool(
             outputs: (body.outputs ?? []).map((o) => ({ name: o.name, bytes: fromBase64(o.base64) })),
         };
     } catch (e) {
+        if (signal?.aborted) throw e;
         Logger.warn(LogCategory.SYSTEM, `[HOSTTOOL] ${tool}: sidecar unreachable — ${(e as Error).message}`);
         return null;
     }

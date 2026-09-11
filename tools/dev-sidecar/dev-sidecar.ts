@@ -23,6 +23,7 @@ import { dirname, join, resolve, sep } from "node:path";
 import { existsSync } from "node:fs";
 import { normalizeSession, sessionLogDir } from "../../src/harness/session";
 import { isUnc, underAnyRoot, wgbRoots } from "../wgb-roots";
+import { runHostToolProcess } from './host-tool-process';
 
 const CONFIG = {
   // BS_SIDECAR_PORT lets a SECOND dev stack (an isolated worktree, a test) run without
@@ -584,12 +585,7 @@ async function runHostTool(req: Request): Promise<Response> {
     }
     const before = new Set(await readdir(dir));
 
-    const proc = Bun.spawn([exe, ...args], { cwd: dir, stdout: "pipe", stderr: "pipe" });
-    const timer = setTimeout(() => proc.kill(), TOOL_LIMITS.TIMEOUT_MS);
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited,
-    ]);
-    clearTimeout(timer);
+    const { stdout, stderr, exitCode } = await runHostToolProcess(exe, args, dir, req.signal, TOOL_LIMITS.TIMEOUT_MS);
 
     const outputs: Array<{ name: string; base64: string }> = [];
     for (const name of await readdir(dir)) {
