@@ -187,9 +187,7 @@ export class Ws2_32 implements IModule {
         this.exports["ord_114"] = ok;        // WSAIsBlocking
         this.exports["ord_115"] = this.exports["WSAStartup"]!;
         this.exports["ord_116"] = this.exports["WSACleanup"]!;
-        // ord_151 diverges from wsock32 here: real ws2_32.dll assigns 151 to WSASocketA,
-        // not __WSAFDIsSet (which ws2_32 only exports by name, no fixed ordinal).
-        this.exports["ord_151"] = socketExports.WSASocketA!;
+        this.exports["ord_151"] = fdIsSet;    // __WSAFDIsSet, same slot as wsock32
 
         this.exports["WSACreateEvent"] = () => {
             if (!requireStarted()) return WSA_INVALID_EVENT;

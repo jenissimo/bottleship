@@ -75,9 +75,9 @@ const WS2_ORDINALS: Array<{ name: string; ordinal: number; argCount: number }> =
     { name: "ord_114", ordinal: 114, argCount: 0 }, // WSAIsBlocking
     { name: "ord_115", ordinal: 115, argCount: 2 }, // WSAStartup
     { name: "ord_116", ordinal: 116, argCount: 0 }, // WSACleanup
-    // ord_151 diverges from wsock32.dll here: real ws2_32.dll assigns 151 to WSASocketA,
-    // not __WSAFDIsSet (which ws2_32 only exports by name, no fixed ordinal — see below).
-    { name: "ord_151", ordinal: 151, argCount: 6 }, // WSASocketA
+    // Same slot as wsock32.dll: XP's own ws2_32.src pins @151 to __WSAFDIsSet, and
+    // WSASocketA carries no fixed ordinal at all.
+    { name: "ord_151", ordinal: 151, argCount: 2 }, // __WSAFDIsSet
 ];
 
 export const ws2_32Module: ModuleDescriptor = {
