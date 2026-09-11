@@ -6,6 +6,7 @@
 import { Logger, LogCategory } from "../core/logger";
 import { registerBuiltinClass } from "./user32/class";
 import { ensureAnimateControlClasses } from "./user32/animate-control";
+import { getSystemCursorHandle, IDC_IBEAM } from "./user32/system-cursors";
 
 /** sizeof(INITCOMMONCONTROLSEX) - dwSize + dwICC */
 export const INITCOMMONCONTROLSEX_SIZE = 8;
@@ -38,8 +39,10 @@ function registerClass(
     className: string,
     cbWndExtra = DEFAULT_WND_EXTRA,
     controlClass?: string,
+    /** Class cursor; omit for comctl32's usual IDC_ARROW (registerBuiltinClass's default). */
+    hCursor?: number,
 ): void {
-    registerBuiltinClass(className, { cbWndExtra, controlClass });
+    registerBuiltinClass(className, { cbWndExtra, controlClass, hCursor });
 }
 
 function registerListViewClasses(): void {
@@ -79,7 +82,9 @@ function registerProgressClass(): void {
 }
 
 function registerHotKeyClass(): void {
-    registerClass("msctls_hotkey32", 4);
+    // comctl32 registers the hotkey class with a NULL cursor (hotkey.c), so
+    // DefWindowProc leaves whatever the pointer already is over one.
+    registerClass("msctls_hotkey32", 4, undefined, 0);
 }
 
 function registerAnimateClass(): void {
@@ -97,11 +102,14 @@ function registerUserExClasses(): void {
 }
 
 function registerCoolClasses(): void {
-    registerClass("ReBarWindow32", 4);
+    // NULL class cursor in comctl32 (rebar.c) — the band's own drag cursors are
+    // installed by the control, not by the class.
+    registerClass("ReBarWindow32", 4, undefined, 0);
 }
 
 function registerInternetClasses(): void {
-    registerClass("SysIPAddress32", 4);
+    // The IP-address control is a row of edit fields: IDC_IBEAM (ipaddress.c).
+    registerClass("SysIPAddress32", 4, undefined, getSystemCursorHandle(IDC_IBEAM));
 }
 
 function registerPagerClass(): void {

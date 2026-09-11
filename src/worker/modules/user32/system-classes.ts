@@ -21,6 +21,9 @@ const CS_DBLCLKS = 0x0008;
 const CS_PARENTDC = 0x0080;
 const CS_SAVEBITS = 0x0800;
 
+/** winuser.h DLGWINDOWEXTRA — the dialog manager's own per-window state. */
+const DLGWINDOWEXTRA = 30;
+
 export interface BuiltinSystemClass {
     /** Canonical mixed-case class name as real Windows reports it. */
     name: string;
@@ -29,6 +32,8 @@ export interface BuiltinSystemClass {
     idcCursor: number;
     /** systemControlClass for the JS control machinery; undefined = plain window. */
     controlClass?: string;
+    /** Class window procedure; DefWindowProc unless this names another. */
+    classProc?: 'DefDlgProcA';
 }
 
 const BUILTIN_SYSTEM_CLASSES: ReadonlyMap<string, BuiltinSystemClass> = new Map(
@@ -42,6 +47,13 @@ const BUILTIN_SYSTEM_CLASSES: ReadonlyMap<string, BuiltinSystemClass> = new Map(
         { name: 'ComboLBox', style: CS_DBLCLKS | CS_SAVEBITS, cbWndExtra: 4, idcCursor: IDC_ARROW, controlClass: 'ListBox' },
         { name: 'ScrollBar', style: CS_DBLCLKS | CS_VREDRAW | CS_HREDRAW | CS_PARENTDC, cbWndExtra: 4, idcCursor: IDC_ARROW, controlClass: 'ScrollBar' },
         { name: 'MDIClient', style: 0, cbWndExtra: 8, idcCursor: IDC_ARROW },
+        // The DIALOG class. Its windows are built by the dialog manager rather than by
+        // CreateWindowEx, but it is a pre-registered class like any other: GetClassInfo
+        // answers for it, and DefWindowProc's WM_SETCURSOR reads its cursor.
+        {
+            name: '#32770', style: CS_SAVEBITS | CS_DBLCLKS, cbWndExtra: DLGWINDOWEXTRA,
+            idcCursor: IDC_ARROW, classProc: 'DefDlgProcA',
+        },
     ] satisfies BuiltinSystemClass[]).map((d) => [d.name.toLowerCase(), d]),
 );
 

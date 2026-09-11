@@ -101,6 +101,7 @@ import {
     TCS_BOTTOM as TCS_BOTTOM_STYLE,
 } from './tab-control';
 import { restampOwnedPopups } from './paint-hooks';
+import { controlTintColor, isControlTintArmed } from './control-tint';
 import { paintTraceEnabled, logChromeStamp, logOverlayMutation } from './paint-trace';
 
 
@@ -459,10 +460,23 @@ export function paintSystemControl(
             break;
     }
 
+    stampControlTint(ctx, child.handle, absX, absY, w, h);
     if (clipped) ctx.restore();
     if (paintTraceEnabled) logChromeStamp(child.handle, `${controlClass} ${w}x${h}`);
     gdi.setOverlayDirty(true);
     return true;
+}
+
+/** Diagnostic overlay-geometry tint (see control-tint.ts); off in normal operation. */
+function stampControlTint(
+    ctx: OffscreenCanvasRenderingContext2D,
+    hwnd: number, x: number, y: number, w: number, h: number,
+): void {
+    if (!isControlTintArmed()) return;
+    const prev = ctx.fillStyle;
+    ctx.fillStyle = controlTintColor(hwnd);
+    ctx.fillRect(x, y, w, h);
+    ctx.fillStyle = prev;
 }
 
 export function isButtonSystemControl(win: WindowInfo | undefined): boolean {

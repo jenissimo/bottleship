@@ -11,8 +11,8 @@ import { Mem } from '../../core/memory/mem-accessor';
 import { System } from '../../core/system';
 import { getWindowByHandle } from './shared-state';
 import { encodeAnsi } from '../codepage-utils';
-import { getBuiltinSystemClass, getDefWindowProcAddress, resetDefWindowProcCache } from './system-classes';
-import { getSystemCursorHandle } from './system-cursors';
+import { getBuiltinSystemClass, getDefDlgProcAddress, getDefWindowProcAddress, resetDefWindowProcCache } from './system-classes';
+import { getSystemCursorHandle, IDC_ARROW } from './system-cursors';
 
 // Store for registered window classes
 const windowClasses: Map<number, any> = new Map();
@@ -74,7 +74,15 @@ function registerClassInternal(className: string, classInfo: any): number {
     return classId;
 }
 
-/** Register a built-in class if not already present (comctl32 common controls). */
+/**
+ * Register a built-in class if not already present (comctl32 common controls).
+ *
+ * hCursor defaults to IDC_ARROW because that is what the DLLs that own these classes
+ * pass to RegisterClass — every comctl32 class but the hotkey and rebar ones, which
+ * register a NULL cursor and must say so explicitly. A class cursor is not decoration:
+ * DefWindowProc's WM_SETCURSOR is the only thing that re-shows a pointer after an app
+ * SetCursor(NULL), and it does nothing at all when the class cursor is NULL.
+ */
 export function registerBuiltinClass(className: string, classInfo: Partial<{
     style: number;
     lpfnWndProc: number;
@@ -97,7 +105,7 @@ export function registerBuiltinClass(className: string, classInfo: Partial<{
         cbWndExtra: classInfo.cbWndExtra ?? 0,
         hInstance: classInfo.hInstance ?? 0,
         hIcon: 0,
-        hCursor: classInfo.hCursor ?? 0,
+        hCursor: classInfo.hCursor ?? getSystemCursorHandle(IDC_ARROW),
         hbrBackground: classInfo.hbrBackground ?? 0,
         lpszMenuName: 0,
         controlClass: classInfo.controlClass,
@@ -680,7 +688,9 @@ export function createClassExports(): Record<string, ThunkImplementation> {
         if (win.classId !== undefined) {
             return getWindowClass(win.classId) ?? null;
         }
-        return getWindowClassByName(win.title) ?? null;
+        // CreateWindowEx records classId only when the app passed an ATOM, so the name is
+        // the only key most windows have — and it is the class NAME, never the caption.
+        return getWindowClassByName(resolveWindowClassName(hWnd) ?? '') ?? null;
     }
 
     exports['GetClassLongA'] = (ctx, mem, args) => {
@@ -846,7 +856,9 @@ function getBuiltinClassInfo(nameLower: string): any | undefined {
     const info = {
         className: descr.name,
         style: descr.style,
-        lpfnWndProc: getDefWindowProcAddress(),
+        lpfnWndProc: descr.classProc === 'DefDlgProcA'
+            ? getDefDlgProcAddress()
+            : getDefWindowProcAddress(),
         cbClsExtra: 0,
         cbWndExtra: descr.cbWndExtra,
         hInstance: 0,
@@ -862,13 +874,27 @@ function getBuiltinClassInfo(nameLower: string): any | undefined {
     // so every class-style behaviour of a system control (CS_DBLCLKS, CS_VREDRAW,
     // CS_PARENTDC, CS_SAVEBITS) silently evaporated, and a listbox never produced a
     // double-click.
-    System.getInstance().windowManager.registerClass({
-        name: descr.name,
-        wndProc: info.lpfnWndProc,
-        hInstance: 0,
-        style: descr.style,
-        hbrBackground: 0,
-    });
+    //
+    // Correct that stub IN PLACE rather than replacing the map entry: a WindowObject
+    // captured the class object at creation, and the dialog manager creates a `#32770`
+    // straight through WindowManager.createWindow — long before anything asks user32
+    // for the class. A fresh registration would leave every existing dialog holding the
+    // style-0 stub, which is a half-registration with no symptom until someone
+    // double-clicks.
+    const wm = System.getInstance().windowManager;
+    const existing = wm.getClass(descr.name);
+    if (existing) {
+        existing.wndProc = info.lpfnWndProc;
+        existing.style = descr.style;
+    } else {
+        wm.registerClass({
+            name: descr.name,
+            wndProc: info.lpfnWndProc,
+            hInstance: 0,
+            style: descr.style,
+            hbrBackground: 0,
+        });
+    }
     return info;
 }
 

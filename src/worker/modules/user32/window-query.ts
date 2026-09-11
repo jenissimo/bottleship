@@ -9,6 +9,7 @@ import { Logger, LogCategory } from '../../core/logger';
 import { Marshaler } from '../../core/memory/marshaler';
 import { WindowInfo, windows, getChildZOrderSibling } from './shared-state';
 import { getWindowClass } from './class';
+import { System } from '../../core/system';
 
 export function registerWindowQueryExports(exports: Record<string, ThunkImplementation>): void {
     const getClassFilter = (memory: Uint8Array, ptr: number, isWide: boolean): string | number | null => {
@@ -108,14 +109,104 @@ export function registerWindowQueryExports(exports: Record<string, ThunkImplemen
         return hwnd;
     };
 
-    // EnumChildWindows - enumerates child windows of a parent
+    /**
+     * BOOL EnumChildWindows(HWND parent, WNDENUMPROC func, LPARAM lParam)
+     *
+     * Wine's enum_windows(children=TRUE): a flat depth-first list of every DESCENDANT,
+     * one call per handle, stopping at the first callback that answers FALSE, and FALSE
+     * for an empty list — the one enumerator whose "nothing to visit" answer is FALSE
+     * rather than TRUE.
+     *
+     * It must really re-enter the guest: a dialog framework iterates its controls through
+     * this and nothing else reports the omission. UE1's WDialog::LocalizeText looks up each
+     * control's placeholder text as an .int key from inside the enum proc, so a stub that
+     * returns without calling back leaves every static/checkbox showing its raw resource
+     * id ("IDC_All"), and no other API involved behaves any differently.
+     *
+     * WNDENUMPROC is stdcall, so the return stub already pops the proc's own two arguments
+     * and the CALLER-side cleanup is 0 — our own 12-byte frame is the SUSPENDED frame's
+     * cleanup, not the callback's. Passing it twice skews ESP by 8 on every callback
+     * return, and the frame then never completes.
+     */
     exports['EnumChildWindows'] = (ctx, mem, args) => {
-        const hWndParent = args[0];
-        const lpEnumFunc = args[1];
-        const lParam = args[2];
-        Logger.verbose(LogCategory.USER32, `EnumChildWindows(0x${hWndParent.toString(16)}, 0x${lpEnumFunc.toString(16)}, 0x${lParam.toString(16)})`);
-        // No child controls to enumerate — return 0
-        return 0;
+        const hWndParent = args[0] >>> 0;
+        const lpEnumFunc = args[1] >>> 0;
+        const lParam = args[2] >>> 0;
+        const STACK_CLEANUP = 12;
+
+        const callbackManager = System.getInstance().process?.dispatcher?.callbackManager;
+        if (!lpEnumFunc || !callbackManager) return 0;
+
+        // Snapshot the subtree up front; a callback may create or destroy windows, and a
+        // handle that goes away before its turn is skipped (Wine's IsWindow guard).
+        const order: number[] = [];
+        const collect = (h: number): void => {
+            const wi = windows.get(h);
+            if (!wi) return;
+            for (const c of [...(wi.children ?? [])]) {
+                order.push(c);
+                collect(c);
+            }
+        };
+        collect(hWndParent);
+        Logger.verbose(LogCategory.USER32,
+            `EnumChildWindows(0x${hWndParent.toString(16)}, 0x${lpEnumFunc.toString(16)}, 0x${lParam.toString(16)}) -> ${order.length} child(ren)`);
+        // Nothing to visit is answered synchronously: parking a frame and then invoking
+        // zero callbacks leaves the thread with no completion to wake it.
+        if (order.length === 0) return 0;
+
+        const frameId = callbackManager.saveSuspendedThunkContext(ctx, STACK_CLEANUP, 'EnumChildWindows');
+        if (frameId === 0) return 0;
+
+        let index = 0;
+        let firstCallbackId: number | null = null;
+        const nextLiveIndex = (from: number): number => {
+            let i = from;
+            while (i < order.length && !windows.has(order[i]!)) i++;
+            return i;
+        };
+
+        const invokeNext = (): void => {
+            index = nextLiveIndex(index);
+            if (index >= order.length) return;
+            const hwnd = order[index++]!;
+            const { callbackId } = callbackManager.invokeCallback(
+                lpEnumFunc,
+                [hwnd, lParam],
+                0,
+                (ret: number) => {
+                    // The callback's own answer IS the enumeration's return value.
+                    if ((ret >>> 0) === 0) return 0;
+                    // Only defer to continueEnumeration when there really is a next live
+                    // handle; otherwise the walk would end with the frame still pinned.
+                    return nextLiveIndex(index) >= order.length ? 1 : null;
+                },
+                false,
+                'EnumChildWindows',
+            );
+            if (firstCallbackId === null) firstCallbackId = callbackId;
+            const invocation = callbackManager.getPendingCallback(callbackId);
+            if (!invocation) return;
+            invocation.enumerationState = { continueEnumeration: invokeNext, finishEnumeration: () => {} };
+            if (callbackId !== firstCallbackId) {
+                const first = callbackManager.getPendingCallback(firstCallbackId);
+                if (first?.thunkContext) invocation.thunkContext = first.thunkContext;
+            }
+        };
+
+        invokeNext();
+        if (firstCallbackId === null) {
+            // Every handle went away between the snapshot and the first invoke: nothing
+            // will ever complete the frame, so release it here rather than pin the thread.
+            callbackManager.abandonSuspendedFrame(frameId);
+            return 0;
+        }
+        return {
+            value: 1,
+            suspendedForCallback: true,
+            callbackId: firstCallbackId,
+            stackCleanup: STACK_CLEANUP,
+        };
     };
 
     // EnumThreadWindows - enumerates the top-level windows owned by a thread.
@@ -125,9 +216,9 @@ export function registerWindowQueryExports(exports: Record<string, ThunkImplemen
     // call → desync → the caller's later RET pops garbage and execution escapes to the
     // bootloader (0x7c07). Watcom's CRT startup calls GetCurrentThreadId then
     // EnumThreadWindows(tid, cb, lp), which is what surfaced this (Discworld Noir boot).
-    // Like the sibling EnumWindows/EnumChildWindows, we do not re-enter the guest callback;
-    // we report success with no windows enumerated (vacuously TRUE), which is correct for
-    // the no-window state and keeps the stack balanced.
+    // Like the sibling EnumWindows, we do not re-enter the guest callback; we report
+    // success with no windows enumerated (vacuously TRUE), which is correct for the
+    // no-window state and keeps the stack balanced.
     exports['EnumThreadWindows'] = (ctx, mem, args) => {
         const dwThreadId = args[0] >>> 0;
         const lpfn = args[1] >>> 0;

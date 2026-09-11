@@ -128,6 +128,7 @@ function stopPlayback(hwnd: number, notifyStop: boolean, reason = 'unspecified')
     st.notifiedStart = false;
 
     if (st.engineHandle > 0) {
+        System.getInstance().videoRouting.closeSession("animate", hwnd);
         videoEngine.close(st.engineHandle);
         st.engineHandle = 0;
     }
@@ -270,6 +271,26 @@ function paintFrameToControl(hwnd: number, bgra: Uint8Array, width: number, heig
     const destW = win.width > 0 ? win.width : width;
     const destH = win.height > 0 ? win.height : height;
     System.getInstance().gdiContext.drawBgraToOverlayRect(x, y, destW, destH, bgra, width, height);
+    // An Animate control is the clearest case for the plane's dest rect: the movie belongs
+    // inside a dialog control, and a rescue that filled the screen with it would be worse
+    // than showing nothing.
+    System.getInstance().videoRouting.onFrameDecoded({
+        codec: "animate",
+        guestHandle: hwnd,
+        frame: {
+            width, height,
+            frameIndex: 0,
+            frameDurationMs: 66,
+            decodedAtMs: performance.now(),
+            bgra,
+        },
+        hasAppManagedSink: true,
+        playerOwnsPresentation: true,
+        targetHint: {
+            kind: "app_buffer", valid: true, note: "animate_control",
+            destRect: { x, y, w: destW, h: destH },
+        },
+    });
 }
 
 function scheduleNextFrame(hwnd: number, delayMs: number): void {
