@@ -1,8 +1,10 @@
 import { Logger, LogCategory } from "../core/logger";
 import { RenderService } from "../runtime/runtime-services";
+import { getVirtualScreenRect } from "../modules/user32/shared-state";
 import { VideoOverlayService } from "./video-overlay-service";
 import {
     VideoCodec,
+    VideoDestRect,
     VideoFrameViews,
     VideoPlanePlan,
     VideoPlaneReason,
@@ -45,6 +47,14 @@ export interface VideoFrameDecodedOptions {
     guestHandle: number;
     frame: VideoFrameViews;
     hasAppManagedSink: boolean;
+    /**
+     * This player delivers its own frames (MCI and the Animate control draw into the window
+     * plane; avifil32 hands the DIB to the guest, which blits it). The plane is not a
+     * candidate for them, and the fallback chain must never run — but the session still
+     * belongs in the router, which is the only place that answers "where did the frames go".
+     * Without this the sink would resolve to DROP, which says the opposite of the truth.
+     */
+    playerOwnsPresentation?: boolean;
     targetHint?: Partial<VideoTargetHint> | null;
     legacyPrimarySink?: (() => boolean) | null;
     explicitDdrawSink?: (() => boolean) | null;
@@ -266,6 +276,15 @@ export class VideoRoutingService {
         session.explicitDdrawSink = options.explicitDdrawSink ?? session.explicitDdrawSink;
         session.explicitGlideSink = options.explicitGlideSink ?? session.explicitGlideSink;
         this.applyTargetHint(session, options.targetHint);
+        if (options.playerOwnsPresentation) {
+            // Terminal for this session: no finalize, no miss counting, no fallback. The
+            // reason string is what keeps this distinguishable in the event log from a
+            // present we actually observed.
+            session.consecutiveMisses = 0;
+            session.lastObservedPresentAtMs = now;
+            this.updateSink(session, "APP_PRESENT_OBSERVED", "player_owns_presentation");
+            return session.sink;
+        }
         return session.sink;
     }
 
@@ -370,6 +389,8 @@ export class VideoRoutingService {
             sessionKey: string;
             codec: VideoCodec;
             guestHandle: number;
+            width: number;
+            height: number;
             sink: VideoSinkKind;
             sinkLockedToOverlay: boolean;
             misses: number;
@@ -388,6 +409,10 @@ export class VideoRoutingService {
             sessionKey: s.sessionKey,
             codec: s.codec,
             guestHandle: s.guestHandle,
+            // The movie's own size: the first thing asked of a session that looks wrong, and
+            // the number every consumer otherwise has to go find in a log line.
+            width: s.width,
+            height: s.height,
             sink: s.sink,
             sinkLockedToOverlay: s.sinkLockedToOverlay,
             misses: s.consecutiveMisses,
@@ -537,7 +562,27 @@ export class VideoRoutingService {
             return false;
         }
         const kind = this.render.getLastPresenterKind();
-        return this.overlay.submitFrame(session.sessionKey, frame, kind === "video" ? null : kind);
+        // The plane is a guest-space image: same authority the window plane is sized by, so
+        // the two cannot disagree about which screen they are drawn on.
+        const vs = getVirtualScreenRect();
+        const screenW = Math.max(1, Math.round(vs.right - vs.left));
+        const screenH = Math.max(1, Math.round(vs.bottom - vs.top));
+        return this.overlay.submitFrame(
+            session.sessionKey, frame, kind === "video" ? null : kind,
+            screenW, screenH, this.planeDestRect(session, screenW, screenH));
+    }
+
+    /**
+     * Where this session's movie goes on the guest screen. The app's own stated destination
+     * when there is one; otherwise null, which fills the screen — the compensation case.
+     * A rect that does not intersect the screen is treated as unknown rather than drawn
+     * off-screen: an invisible plane reads exactly like a decode that stopped.
+     */
+    private planeDestRect(session: VideoSessionState, screenW: number, screenH: number): VideoDestRect | null {
+        const r = session.targetHint.destRect;
+        if (!r || r.w <= 0 || r.h <= 0) return null;
+        if (r.x >= screenW || r.y >= screenH || r.x + r.w <= 0 || r.y + r.h <= 0) return null;
+        return r;
     }
 
     private applyTargetHint(session: VideoSessionState, hint?: Partial<VideoTargetHint> | null): void {
@@ -551,15 +596,22 @@ export class VideoRoutingService {
             pitch: hint.pitch ?? session.targetHint.pitch,
             width: hint.width ?? session.targetHint.width,
             height: hint.height ?? session.targetHint.height,
+            destRect: hint.destRect ?? session.targetHint.destRect,
             note: hint.note ?? session.targetHint.note,
         };
+        const prevRect = session.targetHint.destRect;
+        const nextRect = next.destRect;
+        const rectChanged = (!prevRect !== !nextRect) || (!!prevRect && !!nextRect && (
+            prevRect.x !== nextRect.x || prevRect.y !== nextRect.y ||
+            prevRect.w !== nextRect.w || prevRect.h !== nextRect.h));
         const changed =
             next.kind !== session.targetHint.kind ||
             next.valid !== session.targetHint.valid ||
             next.surfacePtr !== session.targetHint.surfacePtr ||
             next.pitch !== session.targetHint.pitch ||
             next.width !== session.targetHint.width ||
-            next.height !== session.targetHint.height;
+            next.height !== session.targetHint.height ||
+            rectChanged;
         session.targetHint = next;
         if (changed) {
             const detail = `${next.kind}:${next.valid ? "1" : "0"}${next.surfacePtr ? ` ptr=0x${next.surfacePtr.toString(16)}` : ""}`;

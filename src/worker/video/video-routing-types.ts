@@ -1,10 +1,18 @@
-export type VideoCodec = "smack" | "bink" | "avi" | "quartz";
+/**
+ * One tag per PLAYER, not per container: the session key is `codec:handle`, so two players
+ * that both open AVIs (avifil32 and the MCI avivideo device) need distinct tags or their
+ * independent handle spaces collide on one key.
+ */
+export type VideoCodec = "smack" | "bink" | "avi" | "quartz" | "mci" | "lgvid" | "animate";
 
 export type VideoTargetHintKind =
     | "none"
     | "ddraw_surface"
     | "glide_lfb"
     | "app_buffer";
+
+/** A rect in GUEST SCREEN space — the space the video plane and the window plane share. */
+export interface VideoDestRect { x: number; y: number; w: number; h: number }
 
 export interface VideoTargetHint {
     kind: VideoTargetHintKind;
@@ -14,6 +22,14 @@ export interface VideoTargetHint {
     pitch?: number;
     width?: number;
     height?: number;
+    /**
+     * Where on the guest screen the app puts this movie, when it said so (the MCI
+     * `put destination` rect, a codec's blit destination). The plane draws there instead of
+     * filling the screen — a movie the app plays in a sub-rect (an in-world monitor, a
+     * windowed cutscene) must not be blown up over the whole frame just because our
+     * compensation layer had to draw it. Absent means "unknown", and the plane fills.
+     */
+    destRect?: VideoDestRect;
     note?: string;
 }
 

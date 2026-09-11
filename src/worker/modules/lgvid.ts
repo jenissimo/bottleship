@@ -146,7 +146,10 @@ export class Lgvid implements IModule {
 
     reset(): void {
         for (const s of this.sessions.values()) {
-            if (s.engineHandle) videoEngine.close(s.engineHandle);
+            if (s.engineHandle) {
+                System.getInstance().videoRouting.closeSession("lgvid", s.engineHandle);
+                videoEngine.close(s.engineHandle);
+            }
         }
         this.sessions.clear();
         this.vtables = null;
@@ -285,7 +288,10 @@ export class Lgvid implements IModule {
     private destroy(objPtr: number): number {
         const s = this.session(objPtr);
         if (!s) return 0;
-        if (s.engineHandle) videoEngine.close(s.engineHandle);
+        if (s.engineHandle) {
+            System.getInstance().videoRouting.closeSession("lgvid", s.engineHandle);
+            videoEngine.close(s.engineHandle);
+        }
         this.sessions.delete(objPtr >>> 0);
         // Decode and scale are reported PER CALL, which equals per shown frame only while
         // we keep up. The scaler shares the worker with the guest and the audio ring, so a
@@ -448,6 +454,25 @@ export class Lgvid implements IModule {
             s.done = true;
             return false;
         }
+        // Visible to the router, which is what answers "where did the frames go". lgvid
+        // scales them into the host's own display-sized buffer (writeFrame), so the sink is
+        // app-managed and the plane must never rescue this session — but a player the router
+        // cannot see is a player whose failure has no diagnosis.
+        System.getInstance().videoRouting.onFrameDecoded({
+            codec: "lgvid",
+            guestHandle: s.engineHandle,
+            frame: {
+                width: s.width,
+                height: s.height,
+                frameIndex: s.shownFrames,
+                frameDurationMs: s.fps > 0 ? 1000 / s.fps : 66,
+                decodedAtMs: performance.now(),
+                bgra: videoEngine.getFrameBgra(s.engineHandle),
+            },
+            hasAppManagedSink: true,
+            playerOwnsPresentation: true,
+            targetHint: { kind: "app_buffer", valid: true, note: "lgvid_framebuffer" },
+        });
         return true;
     }
 

@@ -10,15 +10,23 @@
  */
 import { describe, expect, test } from "bun:test";
 import { VideoRoutingService } from "../../src/worker/video/video-routing-service";
-import type { VideoFrameViews } from "../../src/worker/video/video-routing-types";
+import type { VideoFrameViews, VideoTargetHint } from "../../src/worker/video/video-routing-types";
+import { getVirtualScreenRect } from "../../src/worker/modules/user32/shared-state";
 
 // Bun has no OffscreenCanvas. The policy is a decision about STATE — whose pixels these are
 // and whether the screen they were composed for still exists — so a canvas that only records
-// its size is the whole surface area the rules touch.
+// its size is the whole surface area the rules touch. It also records the ONE drawImage the
+// plane issues, because WHERE the movie lands is the other half of the plane's contract.
+interface DrawCall { sw: number; sh: number; dx: number; dy: number; dw: number; dh: number }
+let lastDraw: DrawCall | null = null;
 class StubContext {
     imageSmoothingEnabled = false;
     clearRect(): void { /* the plane's bytes are not what these rules read */ }
     putImageData(): void { /* ditto */ }
+    drawImage(_src: unknown, _sx: number, _sy: number, sw: number, sh: number,
+              dx: number, dy: number, dw: number, dh: number): void {
+        lastDraw = { sw, sh, dx, dy, dw, dh };
+    }
 }
 class StubOffscreenCanvas {
     constructor(public width: number, public height: number) {}
@@ -50,12 +58,19 @@ function frame(width = 4, height = 4): VideoFrameViews {
 }
 
 /** A session locked to the plane with one frame published — the state a rescue leaves behind. */
-function rescued(render: ReturnType<typeof fakeRender>) {
+function rescued(render: ReturnType<typeof fakeRender>, targetHint?: Partial<VideoTargetHint>) {
+    lastDraw = null;
     const router = new VideoRoutingService(render.service as never);
     router.openSession({ codec: "bink", guestHandle: 1, width: 4, height: 4, fps: 25 });
-    router.onFrameDecoded({ codec: "bink", guestHandle: 1, frame: frame(), hasAppManagedSink: false });
-    router.onFrameFinalize({ codec: "bink", guestHandle: 1, hasAppManagedSink: false });
+    router.onFrameDecoded({ codec: "bink", guestHandle: 1, frame: frame(), hasAppManagedSink: false, targetHint });
+    router.onFrameFinalize({ codec: "bink", guestHandle: 1, hasAppManagedSink: false, targetHint });
     return router;
+}
+
+/** The guest screen the plane must live in — read from the same authority the plane uses. */
+function guestScreen(): { w: number; h: number } {
+    const r = getVirtualScreenRect();
+    return { w: Math.round(r.right - r.left), h: Math.round(r.bottom - r.top) };
 }
 
 describe("video plane composite policy", () => {
@@ -134,5 +149,54 @@ describe("video plane composite policy", () => {
         expect(router.getDebugInfo().plane.reason).toBe("presenter_changed");
         // A debug read that cleared the plane it reports would destroy the evidence.
         expect(router.getDebugInfo().plane.reason).toBe("presenter_changed");
+    });
+});
+
+/**
+ * WHERE the plane draws. The plane is a guest-space image, so a movie the app placed in a
+ * sub-rect must be rescued INTO that rect: the compositors stretch the plane over the rect
+ * the frame under it landed in, so a frame-sized plane (or a fill with a known destination)
+ * blows a windowed movie up over the whole screen.
+ */
+describe("video plane placement", () => {
+    test("the plane is a GUEST-SCREEN image, not a frame-sized one", () => {
+        const render = fakeRender();
+        render.state.draws = 1;
+        const plan = rescued(render).resolvePlanePlan();
+        const screen = guestScreen();
+        expect(plan.canvas!.width).toBe(screen.w);
+        expect(plan.canvas!.height).toBe(screen.h);
+        // The pre-fix shape: a 4x4 canvas, which every present path then stretched fullscreen.
+        expect(plan.canvas!.width).not.toBe(4);
+    });
+
+    test("an unknown destination fills the guest screen — the compensation case", () => {
+        const render = fakeRender();
+        render.state.draws = 1;
+        rescued(render).resolvePlanePlan();
+        const screen = guestScreen();
+        expect(lastDraw).toEqual({ sw: 4, sh: 4, dx: 0, dy: 0, dw: screen.w, dh: screen.h });
+    });
+
+    test("a stated destination is honoured instead of filling the screen", () => {
+        const render = fakeRender();
+        render.state.draws = 1;
+        rescued(render, { destRect: { x: 40, y: 30, w: 160, h: 120 } }).resolvePlanePlan();
+        expect(lastDraw).toEqual({ sw: 4, sh: 4, dx: 40, dy: 30, dw: 160, dh: 120 });
+    });
+
+    test("a destination entirely off the screen is unknown, not drawn where nobody sees it", () => {
+        const render = fakeRender();
+        render.state.draws = 1;
+        const screen = guestScreen();
+        rescued(render, { destRect: { x: screen.w + 10, y: 0, w: 64, h: 64 } }).resolvePlanePlan();
+        expect(lastDraw).toEqual({ sw: 4, sh: 4, dx: 0, dy: 0, dw: screen.w, dh: screen.h });
+    });
+
+    test("the plane reports the rect it drew, so a mis-placed movie is visible in state()", () => {
+        const render = fakeRender();
+        render.state.draws = 1;
+        const router = rescued(render, { destRect: { x: 8, y: 9, w: 32, h: 24 } });
+        expect(router.getDebugInfo().overlay.destRect).toEqual({ x: 8, y: 9, w: 32, h: 24 });
     });
 });

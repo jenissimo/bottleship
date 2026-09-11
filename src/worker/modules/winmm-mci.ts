@@ -685,6 +685,7 @@ export class WinmmMci {
     private closeMciVideoHandle(device: MCIDevice): void {
         this.clearMciVideoTimer(device);
         if (device.videoEngineHandle && device.videoEngineHandle > 0) {
+            System.getInstance().videoRouting.closeSession("mci", device.id);
             videoEngine.close(device.videoEngineHandle);
         }
         device.videoEngineHandle = 0;
@@ -982,6 +983,17 @@ export class WinmmMci {
         device.videoSyncPresented = 0;
         device.videoPrerollComplete = !info.hasAudio;
         device.videoPlaybackStartMs = info.hasAudio ? 0 : performance.now();
+        // The router is the answer to "where did the frames go". MCI draws them itself (into
+        // the window plane, at its `put destination` rect), so it never wants the plane —
+        // but a player invisible to the router leaves that question unanswerable, which is
+        // exactly how an MCI title reads as a decode that produced nothing.
+        System.getInstance().videoRouting.openSession({
+            codec: "mci",
+            guestHandle: device.id,
+            width: info.width,
+            height: info.height,
+            fps: info.fps,
+        });
 
         Logger.log(LogCategory.SYSTEM,
             `${source} video decode started: ${this.describeMciDevice(device)} ` +
@@ -1258,6 +1270,24 @@ export class WinmmMci {
             if (bgra && srcW > 0 && srcH > 0) {
                 const rect = this.getMciVideoDestRect(device, srcW, srcH);
                 System.getInstance().gdiContext.drawBgraToOverlayRect(rect.x, rect.y, rect.w, rect.h, bgra, srcW, srcH);
+                // `destRect` is where the app put the movie, in guest screen space — the
+                // plane draws there instead of filling the screen if it ever has to rescue
+                // this session.
+                System.getInstance().videoRouting.onFrameDecoded({
+                    codec: "mci",
+                    guestHandle: device.id,
+                    frame: {
+                        width: srcW,
+                        height: srcH,
+                        frameIndex: frameIndex0,
+                        frameDurationMs: device.videoFrameDurationMs ?? 66,
+                        decodedAtMs: performance.now(),
+                        bgra,
+                    },
+                    hasAppManagedSink: true,
+                    playerOwnsPresentation: true,
+                    targetHint: { kind: "app_buffer", valid: true, destRect: rect, note: "mci_put" },
+                });
             }
 
             device.videoFramesPresented = frameIndex0 + 1;

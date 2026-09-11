@@ -57,6 +57,18 @@ export interface RenderActive {
      */
     readonly suppressGdiOverlay?: boolean;
     /**
+     * True while this presenter holds the display in EXCLUSIVE FULLSCREEN — a 3D device
+     * created (or Reset) with Windowed=FALSE. That is the same display ownership a
+     * DirectDraw flip chain has: GDI window output goes to an off-screen surface and NO
+     * window is visible over the frame until the mode is released, so no dialog composites
+     * over it (see isGdiOutputOnScreen). A WINDOWED device leaves GDI on screen — a modal
+     * over a windowed game is genuinely visible and must still composite.
+     *
+     * Absent means the presenter does not track the mode; it is read as windowed, which is
+     * the conservative answer (composite as before) rather than a claim of ownership.
+     */
+    readonly presentsExclusiveFullscreen?: boolean;
+    /**
      * Re-present the last rendered frame to the canvas without re-rendering. The GDI
      * present loop calls this every animation frame while a low-fps 3D renderer owns
      * the screen, so the WebGPU canvas keeps showing the last frame at the display

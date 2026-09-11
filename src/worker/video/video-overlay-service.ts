@@ -1,10 +1,24 @@
 import { Logger, LogCategory } from "../core/logger";
-import { VideoFrameViews } from "./video-routing-types";
+import { VideoDestRect, VideoFrameViews } from "./video-routing-types";
 import { asArrayBufferView } from "../../dom-buffer";
 
+/**
+ * The video plane.
+ *
+ * It is a GUEST-SPACE image, exactly like the GDI/window plane and a DDraw primary: its
+ * canvas is the guest screen, and the present stretches it onto the host canvas. Sizing it
+ * to the FRAME instead would make every present path scale a 320x240 movie over the whole
+ * screen, because the compositors place a plane in the rect the frame under it landed in —
+ * which is right for a guest-space image and wrong for a bare frame.
+ */
 export class VideoOverlayService {
     private canvas: OffscreenCanvas | null = null;
     private ctx: OffscreenCanvasRenderingContext2D | null = null;
+    /** Frame-sized staging surface: putImageData cannot scale, drawImage can. */
+    private frameCanvas: OffscreenCanvas | null = null;
+    private frameCtx: OffscreenCanvasRenderingContext2D | null = null;
+    /** Where the last frame was drawn, for `state(["video"]).plane`. */
+    private lastDestRect: VideoDestRect | null = null;
     private dirty = false;
     private hasAnyContent = false;
     private ownerSessionKey: string | null = null;
@@ -22,13 +36,23 @@ export class VideoOverlayService {
     private composites = 0;
     private lastClearReason: string | null = null;
 
-    submitFrame(sessionKey: string, frame: VideoFrameViews, presenterKind: string | null): boolean {
-        if (frame.width <= 0 || frame.height <= 0) {
+    /**
+     * `screenW/screenH` is the guest screen the plane lives in; `dest` is where on it this
+     * movie goes, or null for "unknown", which fills the screen — the compensation case the
+     * plane exists for, where the app's own upload path lost the pixels and never told us
+     * where they were going.
+     */
+    submitFrame(
+        sessionKey: string, frame: VideoFrameViews, presenterKind: string | null,
+        screenW: number, screenH: number, dest: VideoDestRect | null,
+    ): boolean {
+        if (frame.width <= 0 || frame.height <= 0 || screenW <= 0 || screenH <= 0) {
             return false;
         }
-        if (!this.ensureCanvas(frame.width, frame.height) || !this.ctx) {
+        if (!this.ensureCanvas(screenW, screenH) || !this.ctx) {
             return false;
         }
+        const rect = this.resolveDest(dest, screenW, screenH);
 
         const pixelCount = frame.width * frame.height;
         const byteCount = pixelCount * 4;
@@ -44,8 +68,15 @@ export class VideoOverlayService {
             return false;
         }
 
+        if (!this.ensureFrameCanvas(frame.width, frame.height) || !this.frameCtx) return false;
         const clamped = new Uint8ClampedArray(rgba.buffer, rgba.byteOffset, byteCount);
-        this.ctx.putImageData(new ImageData(asArrayBufferView(clamped), frame.width, frame.height), 0, 0);
+        this.frameCtx.putImageData(new ImageData(asArrayBufferView(clamped), frame.width, frame.height), 0, 0);
+        // The plane covers the whole guest screen, so a movie in a sub-rect must clear what
+        // it does not cover — otherwise the previous frame stays visible around it, and a
+        // movie that shrinks leaves a border of the one before.
+        this.ctx.clearRect(0, 0, this.canvas!.width, this.canvas!.height);
+        this.ctx.drawImage(this.frameCanvas!, 0, 0, frame.width, frame.height, rect.x, rect.y, rect.w, rect.h);
+        this.lastDestRect = rect;
         this.ownerSessionKey = sessionKey;
         this.hasAnyContent = true;
         this.dirty = true;
@@ -64,6 +95,7 @@ export class VideoOverlayService {
         this.hasAnyContent = false;
         this.dirty = true;
         this.submitPresenterKind = null;
+        this.lastDestRect = null;
         this.clears++;
         this.lastClearReason = reason;
     }
@@ -91,6 +123,7 @@ export class VideoOverlayService {
         this.hasAnyContent = false;
         this.ownerSessionKey = null;
         this.submitPresenterKind = null;
+        this.lastDestRect = null;
         this.clears++;
         this.lastClearReason = "resize";
         this.dirty = true;
@@ -130,13 +163,17 @@ export class VideoOverlayService {
         clears: number;
         composites: number;
         lastClearReason: string | null;
+        destRect: VideoDestRect | null;
     } {
         return {
             hasContent: this.hasAnyContent,
             dirty: this.dirty,
             ownerSessionKey: this.ownerSessionKey,
+            // The GUEST SCREEN the plane covers — not the movie's own size, which is
+            // `destRect`. A plane whose width is the frame width is the pre-guest-space bug.
             width: this.canvas?.width ?? 0,
             height: this.canvas?.height ?? 0,
+            destRect: this.lastDestRect ? { ...this.lastDestRect } : null,
             lastSubmitAtMs: this.lastSubmitAtMs,
             submitPresenterKind: this.submitPresenterKind,
             // submits vs composites separates "the router published frames" from "a present
@@ -149,6 +186,12 @@ export class VideoOverlayService {
         };
     }
 
+    /** Clamp a requested rect to something drawable; an unusable one falls back to full screen. */
+    private resolveDest(dest: VideoDestRect | null, screenW: number, screenH: number): VideoDestRect {
+        if (!dest || dest.w <= 0 || dest.h <= 0) return { x: 0, y: 0, w: screenW, h: screenH };
+        return { x: dest.x | 0, y: dest.y | 0, w: dest.w | 0, h: dest.h | 0 };
+    }
+
     private ensureCanvas(width: number, height: number): boolean {
         if (!this.canvas || this.canvas.width !== width || this.canvas.height !== height) {
             this.canvas = new OffscreenCanvas(width, height);
@@ -159,6 +202,20 @@ export class VideoOverlayService {
                 return false;
             }
             this.ctx.imageSmoothingEnabled = false;
+        }
+        return true;
+    }
+
+    private ensureFrameCanvas(width: number, height: number): boolean {
+        if (!this.frameCanvas || this.frameCanvas.width !== width || this.frameCanvas.height !== height) {
+            this.frameCanvas = new OffscreenCanvas(width, height);
+            this.frameCtx = this.frameCanvas.getContext("2d", { alpha: true });
+            if (!this.frameCtx) {
+                Logger.warn(LogCategory.SYSTEM, "[VideoOverlay] Failed to create the frame staging context");
+                this.frameCanvas = null;
+                return false;
+            }
+            this.frameCtx.imageSmoothingEnabled = false;
         }
         return true;
     }

@@ -199,6 +199,31 @@ export class Avifil32 implements IModule {
     }
 
     /** Create a stream session that owns its VideoEngine handle. */
+    /**
+     * Tell the router a frame was produced. AVIStreamRead/GetFrame hand the DIB to the GUEST,
+     * which blits it itself (its own StretchDIBits, at whatever rect it chose) — so the sink
+     * is app-managed and the plane must not rescue this session. Registering anyway is what
+     * makes the player visible to `state(["video"]).routing`: without it an AVI title looks
+     * to the router exactly like a decode that never happened.
+     */
+    private noteRoutedFrame(s: AviSession, bgra: Uint8Array): void {
+        System.getInstance().videoRouting.onFrameDecoded({
+            codec: "avi",
+            guestHandle: s.engineHandle,
+            frame: {
+                width: s.width,
+                height: s.height,
+                frameIndex: s.decodedFrame,
+                frameDurationMs: s.dwRate > 0 ? (1000 * s.dwScale) / s.dwRate : 66,
+                decodedAtMs: performance.now(),
+                bgra,
+            },
+            hasAppManagedSink: true,
+            playerOwnsPresentation: true,
+            targetHint: { kind: "app_buffer", valid: true, note: "avistream_dib" },
+        });
+    }
+
     private createOwnedStreamSession(
         engineHandle: number,
         width: number,
@@ -264,6 +289,7 @@ export class Avifil32 implements IModule {
                 file.refCount--;
             }
         } else {
+            System.getInstance().videoRouting.closeSession("avi", s.engineHandle);
             videoEngine.close(s.engineHandle);
         }
 
@@ -289,6 +315,7 @@ export class Avifil32 implements IModule {
         for (const streamHandle of file.streamHandles) {
             this.sessions.delete(streamHandle);
         }
+        System.getInstance().videoRouting.closeSession("avi", file.engineHandle);
         videoEngine.close(file.engineHandle);
         this.fileSessions.delete(handle);
         Logger.log(LogCategory.SYSTEM,
@@ -617,6 +644,7 @@ export class Avifil32 implements IModule {
 
                 const bgra = videoEngine.getFrameBgra(s.engineHandle);
                 if (bgra) {
+                    this.noteRoutedFrame(s, bgra);
                     const dstOff = lpBuffer + i * frameSize;
                     // Flip rows for bottom-up DIB (most games expect this via AVIStreamRead)
                     const rowBytes = s.width * 4;
@@ -743,6 +771,7 @@ export class Avifil32 implements IModule {
 
             const bgra = videoEngine.getFrameBgra(s.engineHandle);
             if (!bgra) return 0;
+            this.noteRoutedFrame(s, bgra);
 
             const shouldSample = s.diagSamples < 5 || (s.diagSamples < 20 && lPos % 30 === 0);
             if (shouldSample) {
