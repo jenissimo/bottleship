@@ -19,8 +19,18 @@ import { describeSyncRing, SYNC_RING_NOTE } from "../../core/scheduler/sync-obje
 import { stubRegistry } from "../../core/diagnostics/stub-registry";
 import { getProcAddressRegistry } from "../../core/diagnostics/get-proc-address-registry";
 import { apiCensus } from "../../core/diagnostics/api-census";
+import { childProcessHistory, runChildProcess } from "../../core/child-process";
 
 export function registerStateCommands(svc: HarnessService): void {
+    svc.register("childProcesses", () => ({ processes: childProcessHistory.map(record => ({ ...record })) }));
+    svc.register("runChildProcess", async args => {
+        const imagePath = sys().fileSystem.resolvePath(String(args[0]));
+        const exitCode = await runChildProcess(sys().fileSystem, {
+            imagePath, commandLine: String(args[1] ?? ''),
+            currentDirectory: String(args[2] ?? sys().fileSystem.currentDir),
+        });
+        return { exitCode };
+    });
     /** Health probe: confirms the worker harness is wired and a process is (or isn't) loaded. */
     svc.register("ping", () => ({
         ok: true,
@@ -404,13 +414,15 @@ export function registerStateCommands(svc: HarnessService): void {
     svc.register("apiCensus", (args) => {
         const onlySuspect = args[0] === true || args[0] === "suspect";
         const moduleFilter = typeof args[0] === "string" && args[0] !== "suspect" ? args[0].toLowerCase() : null;
-        const opts = (args[1] ?? (typeof args[0] === "object" ? args[0] : {})) as { reset?: boolean; wbuf?: boolean };
+        const opts = (args[1] ?? (typeof args[0] === "object" ? args[0] : {})) as { reset?: boolean; wbuf?: boolean; wbufSequence?: number };
         const dispatcher = proc()?.dispatcher as {
             getFastPathCensus?: () => Array<{ name: string; count: number }>;
             resetFastPathCensus?: () => void;
             getWriteBufCensus?: () => Array<{ name: string; count: number }>;
             resetWriteBufCensus?: () => void;
             setWriteBufCensusEnabled?: (on: boolean) => void;
+            armWriteBufSequence?: (want: number) => void;
+            getWriteBufSequence?: () => { armed: boolean; want: number; ids: string[] } | null;
             isWriteBufCensusEnabled?: () => boolean;
         } | undefined;
 
@@ -427,6 +439,15 @@ export function registerStateCommands(svc: HarnessService): void {
             dispatcher?.setWriteBufCensusEnabled?.(!!opts.wbuf);
             if (opts.wbuf) return { wbufCensus: "enabled", note: "counts start now; call again to read them" };
         }
+        // Order capture is its own tier: a run detector is matched on SEQUENCE, and totals
+        // cannot answer that. Arming returns a marker for the same reason the census does.
+        if (opts?.wbufSequence !== undefined) {
+            dispatcher?.armWriteBufSequence?.(opts.wbufSequence);
+            if (opts.wbufSequence > 0) {
+                return { wbufSequence: "armed", want: opts.wbufSequence, note: "call again to read the captured order" };
+            }
+        }
+        const wbufSequence = dispatcher?.getWriteBufSequence?.() ?? null;
 
         const fast = new Map((dispatcher?.getFastPathCensus?.() ?? []).map((r) => [r.name, r.count]));
         // A DISABLED census must not answer 0 — that reads exactly like "never called", and
@@ -475,6 +496,7 @@ export function registerStateCommands(svc: HarnessService): void {
         return {
             calls,
             total: calls.length,
+            wbufSequence,
             tiersNotCovered: [
                 "wasm hypercall (io_port_write32 0xB077): time, sync, string/memory, FPU/math",
                 ...(wbufArmed
@@ -586,6 +608,24 @@ export function registerStateCommands(svc: HarnessService): void {
      * zero-perturbation — the go-to verb when the emulator "froze": it shows where
      * a thread derailed (near-NULL deref / wild jump) instead of leaving a hang.
      */
+    /**
+     * cxxThrows({clear?}) — every C++ exception (RaiseException 0xe06d7363) the guest
+     * raised, newest last, with a heuristic (FPO-tolerant) guest backtrace snapshot at
+     * the raise site. breakOnApi/sehLog cannot see a C++ throw the app's own
+     * __CxxFrameHandler catches, and the throw stack is gone once a fatal MessageBox
+     * pauses the guest; this ring is captured at the raise and survives even the UEF's
+     * module-walk log flood. Use it to find WHICH guest code raised (e.g. a CRT
+     * _invalid_parameter behind an FPO frame) when a game dies with "encountered an error".
+     */
+    svc.register("cxxThrows", async (args) => {
+        const opts = (args[0] ?? {}) as { clear?: boolean };
+        const ex = await import("../../modules/kernel32/exception");
+        const ring = ex.getCxxThrowRing();
+        const out = ring.map((r) => ({ ...r, code: "0x" + r.code.toString(16), valuePtr: "0x" + r.valuePtr.toString(16), eip: "0x" + r.eip.toString(16) }));
+        if (opts.clear) ex.resetCxxThrowRing();
+        return { count: out.length, throws: out };
+    });
+
     svc.register("faults", (args) => {
         const n = typeof args[0] === "number" ? (args[0] as number) : 16;
         const hx = (v: number) => "0x" + (v >>> 0).toString(16);

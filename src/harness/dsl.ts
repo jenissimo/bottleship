@@ -192,6 +192,12 @@ export class HarnessChain {
     stubs(): this { return this.push("stubs", []); }
     /** Guest restart requests (image + command line + caller). Pair with setWorkerFlag('__noReExec', true) to stop a relaunch loop on its first iteration. */
     reExecs(): this { return this.push("reExecs", []); }
+    /** Child image, command line, completion and exit code without losing the parent session. */
+    childProcesses(): this { return this.push("childProcesses", []); }
+    fsHash(path: string, options?: { chunkBytes?: number }): this { return this.push("fsHash", [path, options]); }
+    runChildProcess(image: string, args = '', cwd?: string): this {
+        return this.push("runChildProcess", [image, args, cwd]);
+    }
     /** Runtime API coverage: GetProcAddress resolutions (and what each ACTUALLY resolved to),
      *  COM/vtable calls, silent stubs — the half `bun tools/api-census.ts` cannot see statically. */
     apiCoverage(limit?: number): this { return this.push("apiCoverage", [limit]); }
