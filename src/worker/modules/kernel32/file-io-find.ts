@@ -14,6 +14,11 @@ const ERROR_INVALID_HANDLE = 6;
 const ERROR_INVALID_PARAMETER = 87;
 const ERROR_NO_MORE_FILES = 18;
 
+/** FINDEX_INFO_LEVELS / FINDEX_SEARCH_OPS. */
+const FIND_EX_INFO_BASIC = 1;
+const FIND_EX_SEARCH_LIMIT_TO_DIRECTORIES = 1;
+const FIND_EX_SEARCH_LIMIT_TO_DEVICES = 2;
+
 const FILE_ATTRIBUTE_DIRECTORY = 0x10;
 const FILE_ATTRIBUTE_ARCHIVE = 0x20;
 const WIN32_FIND_DATAA_SIZE = 320;
@@ -220,18 +225,64 @@ export function registerFileIoFindExports(exports: Record<string, ThunkImplement
         return handleId;
     };
 
-    exports['FindFirstFileExW'] = (ctx, mem, args) => {
+    /**
+     * FindFirstFileEx adds an info level, a search op and a filter to FindFirstFile.
+     * The op is NOT decoration: FindExSearchLimitToDirectories makes the enumeration
+     * return directories only, and a caller that asked for it and got files back walks
+     * into every one of them. The unsupported values must fail rather than quietly
+     * degrade into a plain name match — a caller cannot tell the difference, and
+     * Windows itself refuses them.
+     */
+    const findFirstFileEx = (wide: boolean): ThunkImplementation => (ctx, mem, args) => {
         const lpFileName = args[0];
-        const fInfoLevelId = args[1];
+        const fInfoLevelId = args[1] >>> 0;
         const lpFindFileData = args[2];
-        const fSearchOp = args[3];
+        const fSearchOp = args[3] >>> 0;
+        const lpSearchFilter = args[4] >>> 0;
+        const name = wide ? 'FindFirstFileExW' : 'FindFirstFileExA';
+        const pattern = lpFileName ? (wide ? readStringW(mem, lpFileName) : readStringA(mem, lpFileName)) : '';
 
-        const pattern = lpFileName ? readStringW(mem, lpFileName) : '';
-        Logger.log(LogCategory.KERNEL32, `FindFirstFileExW("${pattern}")`);
+        const fail = (err: number, why: string): number => {
+            Logger.log(LogCategory.KERNEL32, `${name}("${pattern}") -> INVALID (${why})`);
+            System.getInstance().scheduler.setLastError(err);
+            return INVALID_HANDLE_VALUE;
+        };
 
-        // Redirect to FindFirstFileW for now
-        return exports['FindFirstFileW'](ctx, mem, [lpFileName, lpFindFileData]);
+        // FindExInfoStandard / FindExInfoBasic only. Basic just omits the short name,
+        // which our WIN32_FIND_DATA already leaves empty, so the two coincide here.
+        if (fInfoLevelId > FIND_EX_INFO_BASIC) return fail(ERROR_INVALID_PARAMETER, `info level ${fInfoLevelId}`);
+        // A filter is only meaningful for a search op that takes one, and none we
+        // support does — Windows requires NULL.
+        if (lpSearchFilter !== 0) return fail(ERROR_INVALID_PARAMETER, 'lpSearchFilter must be NULL');
+        if (fSearchOp === FIND_EX_SEARCH_LIMIT_TO_DEVICES) {
+            return fail(ERROR_INVALID_PARAMETER, 'FindExSearchLimitToDevices is not supported by Win32');
+        }
+        if (fSearchOp > FIND_EX_SEARCH_LIMIT_TO_DEVICES) return fail(ERROR_INVALID_PARAMETER, `search op ${fSearchOp}`);
+
+        const base = exports[wide ? 'FindFirstFileW' : 'FindFirstFileA'];
+        const handleId = base(ctx, mem, [lpFileName, lpFindFileData]) as number;
+        if (fSearchOp !== FIND_EX_SEARCH_LIMIT_TO_DIRECTORIES || handleId === INVALID_HANDLE_VALUE) {
+            return handleId;
+        }
+
+        // Directories only: drop the rest from the handle the base call registered and
+        // re-fill the caller's buffer from the first survivor, so FindNextFile continues
+        // the same filtered walk.
+        const findHandle = System.getInstance().resourceProvider.getKernelObject(handleId);
+        if (!findHandle || findHandle.kind !== 'find') return handleId;
+        findHandle.entries = findHandle.entries.filter((e: { kind: string }) => e.kind === 'dir');
+        findHandle.index = 1;
+        if (findHandle.entries.length === 0) {
+            System.getInstance().resourceProvider.unregisterKernelObject(handleId);
+            return fail(ERROR_FILE_NOT_FOUND, 'no directories match');
+        }
+        if (wide) fillFindDataW(mem, lpFindFileData, findHandle.entries[0]);
+        else fillFindDataA(mem, lpFindFileData, findHandle.entries[0]);
+        return handleId;
     };
+
+    exports['FindFirstFileExA'] = findFirstFileEx(false);
+    exports['FindFirstFileExW'] = findFirstFileEx(true);
 
     exports['FindNextFileA'] = (ctx, mem, args) => {
         const hFindFile = args[0];
