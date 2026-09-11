@@ -385,6 +385,10 @@ export class AotCache {
     /** SHA-256 of the engine binary. Fetched once — the browser already has it cached, and
      *  this only ever runs on a save/load, never on a hot path. */
     private async engineFingerprint(): Promise<string> {
+        // Lab engines run fresh JIT only until AOT identity is bound to loaded bytes.
+        if (import.meta.env?.DEV && (globalThis as { __v86LabWasmPath?: string }).__v86LabWasmPath) {
+            throw new Error('AOT save/load disabled for isolated lab engines');
+        }
         if (this.engineSha) return this.engineSha;
         // No fallback key on failure. A shared placeholder would make units captured under one
         // codegen loadable into another, and the dangerous case is silent: if the imports still

@@ -131,6 +131,20 @@ class RingBuffer {
         this.count++;
     }
 
+    /** Every entry in arrival order, with the thread filter that gates it. Diagnostic only. */
+    snapshot(): Array<{ hwnd: number; message: number; wParam: number; lParam: number; targetThreadId: number }> {
+        const out = [];
+        for (let i = 0; i < this.count; i++) {
+            const idx = (this.head + i) & this.mask;
+            out.push({
+                hwnd: this.hwnds[idx], message: this.messages[idx],
+                wParam: this.wParams[idx], lParam: this.lParams[idx],
+                targetThreadId: this.targetThreadIds[idx],
+            });
+        }
+        return out;
+    }
+
     dequeue(callerThreadId = 0): Message | null {
         if (this.count === 0) return null;
         // If callerThreadId specified, scan for matching message (target=0 or target=caller)
@@ -507,6 +521,21 @@ export class MessageQueue {
         }
         this.drainWaiters();
         return true;
+    }
+
+    /**
+     * What is actually waiting, per tier, with each entry's target thread — the one
+     * answer "posted but never retrieved" needs. A message can be in the queue and
+     * still be invisible to the pumping thread (the target-thread filter), and nothing
+     * else in a run reports that: the post looks perfect and the retrieval looks idle.
+     */
+    snapshot(): Record<string, unknown> {
+        return {
+            input: this.inputQueue.snapshot(),
+            mouseMove: [...this.lastMouseMove].map(([hwnd, p]) => ({ hwnd, targetThreadId: p.targetThreadId })),
+            paint: [...this.paintPending].map(([hwnd, p]) => ({ hwnd, targetThreadId: p.targetThreadId })),
+            timer: [...this.timerPending].map(([key, e]) => ({ key, hwnd: e.hwnd, targetThreadId: e.pending.targetThreadId })),
+        };
     }
 
     dequeue(msgMin = 0, msgMax = 0, callerThreadId = 0): Message | null {

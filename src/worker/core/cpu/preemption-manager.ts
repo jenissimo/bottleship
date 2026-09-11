@@ -49,10 +49,12 @@ export class PreemptionManager {
      *  setFastmemWrites(false) / dbg.fastmemWrites(false). */
     private fastmemWritesEnabled = false;       // config idx 19
 
-    /** Lazy-flag tuple in wasm locals (config idx 21). Default OFF — the gate has now RUN and
-     *  it is a LOSS on FP-heavy code: tools/bench-v86 nbench (relaxed FPU, prod flags) gives
-     *  FOURIER 5617 vs 6362 and LU 180.3 vs 199.4 with it on, i.e. −10…−12 %, far outside the
-     *  ~3.6 % noise floor. Don't re-flip it without an integer-workload case.
+    /** Lazy-flag tuple in wasm locals (config idx 21). Default OFF — it is still a LOSS on
+     *  FP-heavy code, though less of one since the spill learned to skip words nothing wrote:
+     *  nbench (relaxed FPU, prod flags) FOURIER 6011 vs 6354 and LU 201.0 vs 217.5, i.e. −5…−8 %.
+     *  The integer case it was missing now exists and is large (NUMERIC SORT +12.9 %, BITFIELD
+     *  +14.8 %), so what blocks the flip is only the FP side: the five RELOADS after every
+     *  non-whitelisted call, which dirty-tracking does not touch.
      *  Kill-switch: setFlagLocals(false) / dbg.flagLocals(false). Toggle clears the JIT cache
      *  (shape baked into modules). */
     private flagLocalsEnabled = false;          // config idx 21

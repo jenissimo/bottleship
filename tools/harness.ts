@@ -57,6 +57,12 @@ import { sessionArtifactPath } from "../src/harness/session";
 
 let _session: CdpSession | null = null;
 
+/** Release the CLI transport after an importing tool finishes its harness work. */
+export function closeHarnessConnection(): void {
+    _session?.close();
+    _session = null;
+}
+
 /** The tab this process drives (`BS_TAB`); "" = the default single-tab session. */
 const SESSION = cdpSession();
 

@@ -18,6 +18,9 @@
  */
 
 import type { HarnessService } from "../service";
+import { createJitPublicationCapture } from "../jit-publications";
+import { cpu } from "../serialize";
+import { aotCache } from "../../core/cpu/aot-cache";
 
 interface DumpRec { start: number; table_index: number; len: number; bytes: Uint8Array }
 
@@ -129,6 +132,62 @@ function tier2Pages(): number[] {
 }
 
 export function registerCodegenCommands(svc: HarnessService): void {
+    /** Offline AOT experiments: replace captured bytes before ordinary drop/replay.
+     * Publication, slot reservation, page/engine identity and invalidation stay owned
+     * by AotCache. Stage all modules before mutating the captured set. */
+    svc.register("aotArtifacts", async (args) => {
+        const version = await aotCache.version();
+        const units = aotCache.getUnits();
+        if (args[0] === "replace") {
+            const request = args[1] as { engine: string; units: Array<{ tableIndex: number; inputSha256: string; base64: string }> };
+            if (request?.engine !== version.engine || !Array.isArray(request.units)) throw new Error("AOT engine identity mismatch");
+            const seen = new Set<number>();
+            const staged = [];
+            for (const patch of request.units) {
+                if (seen.has(patch.tableIndex)) throw new Error("Duplicate AOT replacement");
+                seen.add(patch.tableIndex);
+                const unit = units.find(u => u.tableIndex === patch.tableIndex);
+                if (!unit || await sha256(unit.bytes) !== patch.inputSha256) throw new Error("AOT source bytes mismatch");
+                const bytes = Uint8Array.from(atob(patch.base64), c => c.charCodeAt(0));
+                const module = new WebAssembly.Module(bytes);
+                staged.push({ unit, bytes, module });
+            }
+            for (const { unit, bytes, module } of staged) { unit.bytes = bytes; unit.module = module; }
+            return { replaced: staged.length, version };
+        }
+        return { version, units: await Promise.all(units.map(async u => {
+            let binary = "";
+            for (const b of u.bytes) binary += String.fromCharCode(b);
+            return { entryPage: u.entryPage, tableIndex: u.tableIndex, pages: u.pages,
+                bytes: u.bytes.length, sha256: await sha256(u.bytes), base64: btoa(binary), file: `${u.entryPage.toString(16)}.wasm` };
+        })) };
+    });
+    let publications: ReturnType<typeof createJitPublicationCapture> | undefined;
+    svc.register("jitPublications", async (args) => {
+        const [action, options] = args;
+        const g = globalThis as any;
+        switch (action) {
+            case "arm":
+                if (cpu()?.["jit_publication_capture_version"] !== 1) throw new Error('Loaded v86 lacks publication hook; rebuild JS and reload worker');
+                if (publications || g.__jitPublicationCapture) throw new Error('Clear previous JIT capture first');
+                publications = createJitPublicationCapture((options ?? {}) as any);
+                g.__jitPublicationCapture = publications;
+                return publications.status();
+            case "seal":
+                publications?.seal();
+                if (g.__jitPublicationCapture === publications) g.__jitPublicationCapture = undefined;
+                return publications?.status() ?? null;
+            case "export":
+                if (!publications) throw new Error('No JIT capture');
+                return publications.export();
+            case "clear":
+                publications?.seal();
+                if (g.__jitPublicationCapture === publications) g.__jitPublicationCapture = undefined;
+                publications = undefined;
+                return { cleared: true };
+            default: return publications?.status() ?? null;
+        }
+    });
     /**
      * jitBytes(action, a, b) — module-byte capture/diff.
      *   arm [pages]        arm __wasmDump for pages (default: the tier-2 page set)
