@@ -924,13 +924,16 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
     exports['CreateFontW'] = (ctx, mem, args): number => {
         const height = args[0];
         const width = args[1];
+        const escapement = args[2];
         const weight = args[4];
         const italic = args[5];
+        const charSet = args[8] & 0xff;
+        const quality = args[11];
         const faceNamePtr = args[13];
 
         const faceName = Marshaler.readWideString(mem, faceNamePtr);
         const hFont = System.getInstance().gdiContext.createFont(
-            height, width, weight, italic !== 0, faceName
+            height, width, weight, italic !== 0, faceName, escapement, quality, charSet
         );
 
         Logger.verbose(LogCategory.GDI32, `CreateFontW height=${height} weight=${weight} face='${faceName}' -> 0x${hFont.toString(16)}`);
@@ -943,12 +946,13 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         const escapement = args[2];
         const weight = args[4];
         const italic = args[5];
+        const charSet = args[8] & 0xff;
         const quality = args[11];
         const faceNamePtr = args[13];
 
         const faceName = Marshaler.readString(mem, faceNamePtr);
         const hFont = System.getInstance().gdiContext.createFont(
-            height, width, weight, italic !== 0, faceName, escapement, quality
+            height, width, weight, italic !== 0, faceName, escapement, quality, charSet
         );
 
         Logger.verbose(LogCategory.GDI32, `CreateFontA height=${height} weight=${weight} face='${faceName}' -> 0x${hFont.toString(16)}`);
@@ -986,6 +990,7 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         const lfEscapement = view.getInt32(lplf + 8, true);
         const lfWeight = view.getInt32(lplf + 16, true);
         const lfItalic = mem[lplf + 20] !== 0;
+        const lfCharSet = mem[lplf + 23];
         const lfQuality = mem[lplf + 26];
         const lfFaceNamePtr = lplf + 28;
 
@@ -995,7 +1000,7 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         Logger.verbose(LogCategory.GDI32, `CreateFontIndirectW: height=${lfHeight} width=${lfWidth} weight=${lfWeight} italic=${lfItalic} escapement=${lfEscapement} face='${faceName}'`);
 
         const hFont = System.getInstance().gdiContext.createFont(
-            lfHeight, lfWidth, lfWeight, lfItalic, faceName, lfEscapement, lfQuality
+            lfHeight, lfWidth, lfWeight, lfItalic, faceName, lfEscapement, lfQuality, lfCharSet
         );
 
         return hFont;
@@ -1018,11 +1023,12 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         const lfEscapement = view.getInt32(lplf + 8, true);
         const lfWeight = view.getInt32(lplf + 16, true);
         const lfItalic = mem[lplf + 20] !== 0;
+        const lfCharSet = mem[lplf + 23];
         const lfQuality = mem[lplf + 26];
         const faceName = Marshaler.readString(mem, lplf + 28);
         Logger.verbose(LogCategory.GDI32, `CreateFontIndirectA: height=${lfHeight} width=${lfWidth} weight=${lfWeight} italic=${lfItalic} escapement=${lfEscapement} face='${faceName}'`);
         return System.getInstance().gdiContext.createFont(
-            lfHeight, lfWidth, lfWeight, lfItalic, faceName, lfEscapement, lfQuality
+            lfHeight, lfWidth, lfWeight, lfItalic, faceName, lfEscapement, lfQuality, lfCharSet
         );
     };
 

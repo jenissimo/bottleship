@@ -5,9 +5,11 @@ import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { Marshaler } from '../../core/memory/marshaler';
+import { Mem } from '../../core/memory/mem-accessor';
 import { encodeAnsi } from '../codepage-utils';
 import { addFontResource, removeFontResource } from './font-resource';
 import { PS_STYLE_MASK } from './gdi-objects';
+import { DEFAULT_CHARSET, fontSignature, systemDefaultCharset } from './font-charset';
 
 let nextMetafileHandle = 0x50000;
 
@@ -62,6 +64,41 @@ export function registerPaintingMiscExports(exports: Record<string, ThunkImpleme
     };
 
     // COLORREF GetNearestColor(HDC hdc, COLORREF crColor)
+    /**
+     * DWORD GetTextCharsetInfo(HDC hdc, LPFONTSIGNATURE lpSig, DWORD dwFlags)
+     *
+     * The charset of the font currently selected into hdc, plus — when asked — that
+     * charset's FONTSIGNATURE. This is how an app decides which code page to encode its
+     * own 8-bit strings in before handing them to TextOut, so a constant answer would
+     * silently re-encode every non-Latin build.
+     *
+     * DEFAULT_CHARSET is the DOCUMENTED FAILURE value, so it must never be returned for a
+     * font that realised: a DC whose font asked for DEFAULT_CHARSET reports the system
+     * charset it actually became (see font-charset.ts).
+     */
+    const textCharsetInfo = (hdc: number, lpSig: number): number => {
+        const charset = System.getInstance().gdiContext.getSelectedFontCharset(hdc);
+        if (charset === null) {
+            Logger.verbose(LogCategory.GDI32, `GetTextCharsetInfo: hdc=0x${hdc.toString(16)} has no font — DEFAULT_CHARSET`);
+            return DEFAULT_CHARSET;
+        }
+        const realised = charset === DEFAULT_CHARSET ? systemDefaultCharset() : charset;
+        if (lpSig) {
+            // FONTSIGNATURE { DWORD fsUsb[4]; DWORD fsCsb[2]; } — 24 bytes.
+            const sig = fontSignature(realised);
+            for (let i = 0; i < sig.length; i++) {
+                if (!Mem.writeUint32(lpSig + i * 4, sig[i]!)) return DEFAULT_CHARSET;
+            }
+        }
+        return realised;
+    };
+
+    exports['GetTextCharsetInfo'] = (ctx, mem, args): number =>
+        textCharsetInfo(args[0], args[1] >>> 0);
+
+    // GetTextCharset(hdc) is defined as GetTextCharsetInfo(hdc, NULL, 0).
+    exports['GetTextCharset'] = (ctx, mem, args): number => textCharsetInfo(args[0], 0);
+
     exports['GetNearestColor'] = (ctx, mem, args): number => {
         const hdc = args[0];
         const color = args[1] >>> 0;

@@ -9,6 +9,7 @@ import { Logger, LogCategory } from "../../core/logger";
 import { SystemResourceProvider } from "../../core/resources/system-resource-provider";
 import { System } from "../../core/system";
 import { resolveWindowsFontName } from './font-map';
+import { DEFAULT_CHARSET, resolveCharset } from './font-charset';
 import type { GDIContext, GDIObject } from './context';
 
 // Stock object IDs (Windows GDI constants)
@@ -379,7 +380,7 @@ export function getObject(gdi: GDIContext, hgdiobj: number, cbBuffer: number, lp
         mem[lpvObject + 20] = lfItalic;                       // +20 lfItalic
         mem[lpvObject + 21] = 0;                              // +21 lfUnderline
         mem[lpvObject + 22] = 0;                              // +22 lfStrikeOut
-        mem[lpvObject + 23] = 0;                              // +23 lfCharSet (DEFAULT_CHARSET=1, ANSI=0)
+        mem[lpvObject + 23] = (obj.lfCharSet ?? DEFAULT_CHARSET) & 0xff; // +23 lfCharSet
         mem[lpvObject + 24] = 0;                              // +24 lfOutPrecision
         mem[lpvObject + 25] = 0;                              // +25 lfClipPrecision
         mem[lpvObject + 26] = obj.lfQuality ?? 0;             // +26 lfQuality
@@ -634,14 +635,34 @@ export function getSelectedFontFace(gdi: GDIContext, hdc: number): string {
     return 'System';
 }
 
-export function createFont(gdi: GDIContext, height: number, width: number, weight: number, italic: boolean, faceName: string, escapement?: number, quality?: number): number {
+/**
+ * The REALISED charset of the font selected into hdc — what GetTextCharsetInfo reports.
+ * DEFAULT_CHARSET is resolved here, because that is what Windows does at realisation
+ * time: the query never answers "unspecified".
+ */
+export function getSelectedFontCharset(gdi: GDIContext, hdc: number): number | null {
+    const state = gdi.hdcStates.get(hdc);
+    if (!state) return null;
+    let obj = gdi.objects.get(state.hFont);
+    if (!obj && isStockObject(state.hFont)) {
+        obj = getStockObject(state.hFont) ?? undefined;
+    }
+    if (obj?.type !== 'FONT') return null;
+    return resolveCharset(obj.lfCharSet ?? DEFAULT_CHARSET);
+}
+
+export function createFont(gdi: GDIContext, height: number, width: number, weight: number, italic: boolean, faceName: string, escapement?: number, quality?: number, charSet?: number): number {
     // lfHeight/lfWidth are signed LONGs. CreateFontA/W pass the raw (unsigned) thunk
     // arg, so a negative em-height (e.g. -11) arrives as 0xFFFFFFF5 — coerce to signed
     // or `height < 0` fails and the size balloons to billions of px (off-canvas text).
     height = height | 0;
     width = width | 0;
     const resolvedName = resolveWindowsFontName(faceName);
-    const cacheKey = `${height}-${width}-${weight}-${italic}-${resolvedName}-${escapement || 0}-${quality || 0}`;
+    // lfCharSet is part of a font's identity, not a display attribute: two fonts that
+    // differ only in charset realise differently and GetTextCharsetInfo must be able to
+    // tell them apart, so it belongs in the key.
+    const lfCharSet = (charSet ?? DEFAULT_CHARSET) & 0xff;
+    const cacheKey = `${height}-${width}-${weight}-${italic}-${resolvedName}-${escapement || 0}-${quality || 0}-${lfCharSet}`;
 
     // Check cache with LRU tracking
     const cachedHandle = gdi.fontCache.get(cacheKey);
@@ -680,6 +701,7 @@ export function createFont(gdi: GDIContext, height: number, width: number, weigh
         lfWeight: weight,
         lfItalic: italic ? 1 : 0,
         lfQuality: quality ?? 0,
+        lfCharSet,
         faceName: resolvedName,
     });
 

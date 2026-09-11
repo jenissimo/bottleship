@@ -26,6 +26,7 @@ import {
     createPen as createPenImpl,
     getSelectedFontFace as getSelectedFontFaceImpl,
     createFont as createFontImpl,
+    getSelectedFontCharset as getSelectedFontCharsetImpl,
     getFontCss as getFontCssImpl,
 } from './gdi-objects';
 import { strokePolyline as strokePolylineImpl, lineTo as lineToImpl } from './gdi-lines';
@@ -68,6 +69,7 @@ export interface GDIObject {
     lfWeight?: number;
     lfItalic?: number;
     lfQuality?: number;
+    lfCharSet?: number;
     faceName?: string;
 }
 
@@ -268,6 +270,9 @@ export class GDIContext {
     getCanvas(): OffscreenCanvas | null {
         return this.screenCanvas;
     }
+
+    /** Promotion changes the output only; existing windows/DCs keep their overlay pixels. */
+    attachScreenCanvas(canvas: OffscreenCanvas): void { this.screenCanvas = canvas; }
 
     /**
      * The overlay plane as compositors must SEE it — the live canvas, except while a
@@ -1941,13 +1946,18 @@ export class GDIContext {
         return lineToImpl(this, hdc, x, y);
     }
 
+    /** Realised charset of the font selected into hdc (GetTextCharsetInfo). */
+    getSelectedFontCharset(hdc: number): number | null {
+        return getSelectedFontCharsetImpl(this, hdc);
+    }
+
     /** Face name of the font selected into hdc. */
     getSelectedFontFace(hdc: number): string {
         return getSelectedFontFaceImpl(this, hdc);
     }
 
-    createFont(height: number, width: number, weight: number, italic: boolean, faceName: string, escapement?: number, quality?: number): number {
-        return createFontImpl(this, height, width, weight, italic, faceName, escapement, quality);
+    createFont(height: number, width: number, weight: number, italic: boolean, faceName: string, escapement?: number, quality?: number, charSet?: number): number {
+        return createFontImpl(this, height, width, weight, italic, faceName, escapement, quality, charSet);
     }
 
     /** CSS font string for an HFONT. */
