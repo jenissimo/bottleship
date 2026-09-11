@@ -32,6 +32,10 @@
  *                         --reg-value "War3CD=D:\\" --reg-value "Program=C:\game.exe".
  *                         One InstallPath is not enough for an installer that wrote several.
  *                         Requires --reg-path; a duplicate value name is an error.
+ *   --reg-import <file>   Import a Windows .reg file (repeatable) — the keys an installer or
+ *                         a Wine prefix actually wrote. A WOW6432Node segment is folded out
+ *                         (the guest is 32-bit, so that IS the key the game reads). Combines
+ *                         with --reg-path, which wins on a value they both name.
  *   --reg-name <str>      Value NAME for it (default: InstallPath). Titles differ —
  *                         GTA III reads HKLM\SOFTWARE\Rockstar Games\GTA 3\InstallDir.
  *   --cd-path <str>       Guest path the CD-ROM drive (D:\) aliases to, for a title that
@@ -72,6 +76,7 @@ import { readdirSync, statSync, readFileSync, existsSync } from 'fs';
 import { join, basename, extname, resolve } from 'path';
 import { ZipStoreWriter } from './internal/zip-store-writer';
 import { isValidGameId, deriveGameId, KNOWN_GAME_ID_SCHEMES } from '@bottleship/formats/wgb/container-id';
+import { parseRegFile, mergeRegSeeds, type RegSeed } from '@bottleship/formats/reg';
 
 // ---------------------------------------------------------------------------
 // Argument parsing
@@ -314,6 +319,28 @@ const extraRegValues = getAll('--reg-value').map((pair) => {
     return { name: pair.slice(0, eq), type: 'REG_SZ', data: pair.slice(eq + 1) };
 });
 
+// A drop that came from an installer or a Wine prefix ships its keys as .reg text, which is
+// the authoritative record of what the installer wrote — parse it rather than retype it.
+// Repeatable; the guest is 32-bit, so a WOW6432Node segment folds out (that IS the key the
+// game reads). Imported keys come first so an explicit --reg-path/--reg-value still wins.
+const regImports = getAll('--reg-import');
+const importedSeeds: RegSeed[] = [];
+for (const file of regImports) {
+    if (!existsSync(file)) {
+        console.error(`Error: --reg-import "${file}" does not exist.`);
+        process.exit(1);
+    }
+    try {
+        importedSeeds.push(...parseRegFile(readFileSync(file), {
+            foldWow6432Node: true,
+            onSkip: (reason) => console.warn(`  ${basename(file)}: skipped ${reason}`),
+        }));
+    } catch (err) {
+        console.error(`Error: --reg-import "${file}": ${err}`);
+        process.exit(1);
+    }
+}
+
 let registry: unknown;
 if (regPath) {
     const values = [
@@ -331,18 +358,19 @@ if (regPath) {
         }
         seen.add(key);
     }
-    registry = {
+    const own = {
         root: regHive,
         path: regPath,          // JS string; JSON.stringify will escape \ → \\
         values,
     };
+    registry = importedSeeds.length > 0 ? mergeRegSeeds([...importedSeeds, own]) : own;
 } else {
     if (extraRegValues.length > 0) {
         console.error('Error: --reg-value needs --reg-path — there is no key to write it under.');
         process.exit(1);
     }
     // Minimal placeholder so the loader doesn't error on missing registry.json
-    registry = { root: 'HKLM', path: 'Software', values: [] };
+    registry = importedSeeds.length > 0 ? mergeRegSeeds(importedSeeds) : { root: 'HKLM', path: 'Software', values: [] };
 }
 
 // Stream the archive straight to disk: manifest + registry first (readability in
@@ -358,6 +386,9 @@ console.log(`  name:       ${name}`);
 console.log(`  entrypoint: rom/${exeName}`);
 console.log(`  resolution: ${width}x${height}x${bpp}`);
 console.log(`  os:         ${osKey} (${osVer.major}.${osVer.minor}.${osVer.build})`);
+for (const seed of importedSeeds) {
+    console.log(`  registry:   ${seed.root}\\${seed.path} (${seed.values.length} values, imported)`);
+}
 if (regPath) {
     console.log(`  registry:   ${regHive}\\${regPath}`);
     for (const v of extraRegValues) console.log(`              ${v.name} = ${v.data}`);
